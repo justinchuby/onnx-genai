@@ -38,3 +38,7 @@ Deckard's GPU EP, batched static-cache decode, and ORT checksum notes are now in
 - Deckard made all five ORT real-model comparison tests use `intra_op_threads=1` and a shared test `Environment`.
 - The rare ORT FP-tie active-compaction flake was eliminated: 20/20 `onnx-genai-ort` and 5/5 full-workspace runs stayed clean.
 - Future exact ORT comparisons should prefer single-threaded intra-op execution unless the assertion is tolerant to reduction-order differences.
+
+
+### 2026-07-12T14:50:00-07:00
+Published v0.1.0 release path is canonical: `.github/workflows/publish.yml` uses crates env, CARGO_REGISTRY_TOKEN, leaves-first order, idempotent skip-if-published checks with UA header. CI is live with fmt/build/test blocking and clippy non-blocking. Speculator discovery and MTP ORT execution are recorded.

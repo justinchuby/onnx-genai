@@ -8,3 +8,7 @@
 
 ## 2026-07-12T13:14:00-07:00 — Security audit merged
 Holden's unsafe/resource/supply-chain audit is now in decisions. Current unsafe invariants are documented and sound under today's constraints; cargo audit found 0 vulns and 2 unmaintained transitive tokenizers warnings.
+
+
+### 2026-07-12T14:50:00-07:00
+Recurring audit convention is canonical: `.github/workflows/audit.yml` runs weekly and on dependency changes; fresh cargo-audit found 0 vulnerabilities. Continue periodic security review passes.

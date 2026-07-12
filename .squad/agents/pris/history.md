@@ -28,3 +28,7 @@ Validated Qwen2.5-0.5B Mobius builds and coherent generation, HTTP tool use, Her
 
 ## 2026-07-12T13:14:00-07:00 — Harness hardening merged
 Pris's coding-agent harness sandbox is now in decisions: workspace path confinement, no shell execution, argv allow-list, guarded Python scripts, symlink/traversal rejection, and passing self-test.
+
+
+### 2026-07-12T14:50:00-07:00
+Advanced fixture work is canonical: builders use onnxscript/onnx-ir, `tiny-mtp-full` provides ignored greedy-equivalence e2e MTP coverage, `tiny-eagle3` exists for future proposer work, and paged attention remains blocked by Mobius support.

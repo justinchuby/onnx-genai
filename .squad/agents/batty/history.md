@@ -39,3 +39,7 @@ Batty's §24 sampler processors and §23 FIM APIs are now in decisions. Upcoming
 - Batty delivered behavior-preserving extensibility seams: `SpeculativeProposer`, `DraftModelProposer`, `Sampler` (`GreedySampler`/`CategoricalSampler`), and `ProcessorChain` builder/constraint registration APIs.
 - Batty also delivered prompt-lookup speculative decoding through `NgramProposer` and `SpeculativeMode::PromptLookup`, with greedy-equivalent output and multi-token accepts on repetitive input.
 - Remaining §27 advanced speculators (MTP/Medusa/EAGLE) need special models; coordinate future paths through the `SpeculativeProposer` verify/commit loop.
+
+
+### 2026-07-12T14:50:00-07:00
+Prompt-lookup speculation and `MtpProposer` are accepted canonical runtime milestones. MTP proposals go through shared greedy verification; future work is optimized hidden-output decode and EAGLE-3 proposer support.

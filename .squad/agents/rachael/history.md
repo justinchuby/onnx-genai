@@ -27,3 +27,7 @@ Rachael's server DoS/session hardening is now in decisions: max_output_tokens=40
 ## 2026-07-12T13:52:00-07:00 — §26 Stage C server complete
 - Rachael replaced the global generation mutex with a single engine driver thread and channels; concurrent STATIC-CACHE HTTP requests now share `ContinuousBatchManager` batched forward passes.
 - Server behavior preserves streaming, tool turns, caps, CSPRNG session ids, and past/present fallback; future tool-pause/resume work should extend the driver protocol rather than reintroduce shared Engine locking.
+
+
+### 2026-07-12T14:50:00-07:00
+Batched-driver DoS hardening is canonical: admission is bounded by `max_pending` with HTTP 429, and driver output delivery is non-blocking so slow or closed clients are dropped without stalling other rows.
