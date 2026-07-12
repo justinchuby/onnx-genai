@@ -6117,3 +6117,262 @@ preprocessing:
 ```
 
 The runtime detects this and skips native preprocessing. ORT Extensions DLL must be available. This is a **compatibility escape hatch**, not the recommended path.
+
+---
+
+## 36. Pipeline Backpressure & Model Lifecycle (Inspired by Triton)
+
+### 36.1 Problem: Pipeline Stage Imbalance
+
+In multi-model pipelines (VLM, TTS, ASR), stages have vastly different throughput:
+
+```
+Vision encoder: 50ms/image    ←── fast
+LLM decoder:    2000ms/seq    ←── slow (autoregressive)
+```
+
+Without flow control, the fast stage floods the slow stage's input buffer → OOM.
+
+Triton solves this with `max_inflight_requests` per ensemble step. We adopt the same pattern.
+
+### 36.2 Backpressure Design
+
+```rust
+/// Per-stage flow control in a pipeline.
+pub struct StageConfig {
+    /// Maximum concurrent requests at this stage.
+    /// When reached, upstream stages block (backpressure propagates up).
+    pub max_inflight: usize,
+    
+    /// Maximum buffered items waiting to enter this stage.
+    /// Beyond this, upstream producers get Pending::Full.
+    pub max_queue: usize,
+    
+    /// Timeout waiting for stage capacity (0 = no timeout).
+    pub queue_timeout_ms: u64,
+}
+
+/// Pipeline-level flow control.
+pub struct PipelineFlowControl {
+    stages: Vec<StageFlowState>,
+}
+
+struct StageFlowState {
+    config: StageConfig,
+    inflight: AtomicUsize,
+    queue: tokio::sync::Semaphore,
+}
+
+impl PipelineFlowControl {
+    /// Called before submitting work to a stage.
+    /// Returns when capacity is available (backpressure).
+    pub async fn acquire(&self, stage_idx: usize) -> Result<StagePermit> {
+        let stage = &self.stages[stage_idx];
+        let permit = tokio::time::timeout(
+            Duration::from_millis(stage.config.queue_timeout_ms),
+            stage.queue.acquire(),
+        ).await??;
+        stage.inflight.fetch_add(1, Ordering::Relaxed);
+        Ok(StagePermit { stage_idx, permit })
+    }
+    
+    /// Called when stage work completes.
+    pub fn release(&self, permit: StagePermit) {
+        self.stages[permit.stage_idx].inflight.fetch_sub(1, Ordering::Relaxed);
+        // Semaphore permit drops automatically, unblocking upstream
+    }
+}
+```
+
+### 36.3 Configuration
+
+```yaml
+# inference_metadata.yaml
+pipeline:
+  models:
+    vision_encoder:
+      filename: vision.onnx
+      flow_control:
+        max_inflight: 8      # can process 8 images concurrently
+        max_queue: 16
+    decoder:
+      filename: decoder.onnx
+      flow_control:
+        max_inflight: 1      # autoregressive, one active generation at a time per instance
+        max_queue: 32        # can buffer 32 waiting requests
+```
+
+### 36.4 Per-Stage Batching Policy
+
+Different pipeline stages benefit from different batching strategies:
+
+```rust
+pub enum BatchingPolicy {
+    /// Accumulate up to N items, wait up to T ms. (Vision encoder, embedding)
+    Dynamic { max_batch: usize, max_wait_ms: u64 },
+    
+    /// Route by session affinity, maintain state. (LLM decoder with KV cache)
+    Sequence { max_concurrent_sequences: usize },
+    
+    /// No batching, process immediately. (Preprocessing, postprocessing)
+    None,
+}
+```
+
+```yaml
+pipeline:
+  models:
+    vision_encoder:
+      batching:
+        policy: dynamic
+        max_batch: 8
+        max_wait_ms: 10       # wait up to 10ms to fill batch
+    decoder:
+      batching:
+        policy: sequence
+        max_concurrent_sequences: 32
+```
+
+---
+
+## 37. Model Lifecycle Management
+
+### 37.1 Problem
+
+Currently models are loaded at startup and never change. Production needs:
+- Hot-swap models without downtime (new quantization, fine-tuned version)
+- A/B testing between model versions
+- Graceful unload when memory is needed
+- Auto-discovery of new models
+
+### 37.2 Model Repository
+
+```
+models/
+├── phi-3-mini/
+│   ├── 1/                          # version 1
+│   │   ├── model.onnx
+│   │   └── inference_metadata.yaml
+│   ├── 2/                          # version 2 (e.g., new quantization)
+│   │   ├── model.onnx
+│   │   └── inference_metadata.yaml
+│   └── config.yaml                 # version policy
+├── gemma-4-9b/
+│   ├── 1/
+│   │   └── ...
+│   └── config.yaml
+```
+
+### 37.3 Version Policy
+
+```yaml
+# models/phi-3-mini/config.yaml
+versioning:
+  policy: latest          # latest | specific | all
+  # policy: specific
+  # versions: [1, 2]     # load specific versions
+  
+  # A/B traffic split (when multiple versions loaded)
+  traffic:
+    - version: 1
+      weight: 90          # 90% of requests
+    - version: 2
+      weight: 10          # 10% of requests (canary)
+```
+
+### 37.4 Model States
+
+```rust
+pub enum ModelState {
+    /// Discovered in repository but not loaded.
+    Available,
+    /// Currently loading (downloading weights, initializing ORT session).
+    Loading { progress: f32 },
+    /// Ready to serve inference requests.
+    Ready,
+    /// Draining: no new requests, waiting for inflight to complete.
+    Draining { inflight: usize },
+    /// Unloaded from memory.
+    Unloaded,
+    /// Failed to load (error preserved for diagnostics).
+    Failed { error: String },
+}
+```
+
+### 37.5 Lifecycle Operations
+
+```rust
+pub trait ModelManager {
+    /// Discover models from repository path.
+    async fn scan_repository(&mut self) -> Result<Vec<ModelInfo>>;
+    
+    /// Load a specific model version into memory.
+    async fn load(&mut self, model: &str, version: u32) -> Result<()>;
+    
+    /// Graceful unload: drain inflight, then release memory.
+    async fn unload(&mut self, model: &str, version: u32) -> Result<()>;
+    
+    /// Hot-swap: load new version, drain old, switch traffic, unload old.
+    async fn swap(&mut self, model: &str, from_version: u32, to_version: u32) -> Result<()>;
+    
+    /// Get current state of all models.
+    fn status(&self) -> Vec<ModelStatus>;
+}
+```
+
+### 37.6 Hot-Swap Sequence (Zero-Downtime)
+
+```
+1. Load new version (v2) alongside old (v1)     [both in memory]
+2. Health-check v2 (run test inference)           [v1 still serving 100%]
+3. Switch traffic: v1=0%, v2=100%                 [v2 now serving]
+4. Drain v1 (wait for inflight requests)          [v1 finishing last requests]
+5. Unload v1                                      [memory freed]
+```
+
+If step 2 fails → abort, unload v2, keep v1. No downtime in any case.
+
+### 37.7 API
+
+```
+# Model management endpoints
+GET    /v1/models                    → list all models + versions + states
+GET    /v1/models/{name}             → model detail (versions, traffic split)
+POST   /v1/models/{name}/load        → { "version": 2 }
+POST   /v1/models/{name}/unload      → { "version": 1 }
+POST   /v1/models/{name}/swap        → { "from": 1, "to": 2 }
+PUT    /v1/models/{name}/traffic     → { "splits": [{"version":1,"weight":90},{"version":2,"weight":10}] }
+
+# Repository management
+POST   /v1/repository/scan           → re-scan model directory
+```
+
+### 37.8 Auto-Discovery (Optional)
+
+```yaml
+# server config
+model_repository:
+  path: /models
+  watch: true                # inotify/kqueue watch for new files
+  auto_load: false           # true = auto-load newly discovered models
+  poll_interval_sec: 30      # fallback if watch unavailable (e.g., NFS)
+```
+
+When `watch: true` and a new version directory appears, the server detects it and transitions it to `Available`. If `auto_load: true`, it also loads automatically.
+
+### 37.9 Memory-Pressure Unload
+
+When KV cache or model memory is under pressure, the model manager can evict less-used models:
+
+```rust
+pub struct EvictionPolicy {
+    /// Unload models with zero requests in the last N seconds.
+    pub idle_timeout_sec: u64,
+    /// Keep at least this many models loaded (never evict below this).
+    pub min_loaded_models: usize,
+    /// Priority order for eviction (lowest priority evicted first).
+    pub priority: Vec<String>,  // model names in priority order
+}
+```
+
+This is particularly relevant for multi-model deployments (VLM with vision encoder + decoder + maybe a reranker) where not all models need to stay resident.
