@@ -6,6 +6,7 @@ use std::{
     net::SocketAddr,
     path::Path,
     sync::{Arc, Mutex},
+    thread,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -21,7 +22,7 @@ use onnx_genai::{
     Engine, EngineConfig, FinishReason, GenerateOptions, GeneratePrompt, GenerateRequest,
     GenerateResult, GenerateToken, SessionId, StopSequence,
 };
-use onnx_genai_engine::GenerateConstraint;
+use onnx_genai_engine::{ContinuousBatchEvent, ContinuousBatchManager, GenerateConstraint};
 use onnx_genai_ort::{ChatMessage as TemplateChatMessage, ChatTemplate, ModelDirectory, Tokenizer};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -30,12 +31,15 @@ use tokio_stream::wrappers::ReceiverStream;
 const SESSION_ID_HEADER: &str = "x-session-id";
 const DEFAULT_MAX_OUTPUT_TOKENS: usize = 4096;
 const DEFAULT_MAX_SESSIONS: usize = 256;
+const DEFAULT_MAX_BATCH: usize = 4;
 const MAX_SESSION_ID_LEN: usize = 128;
+const DRIVER_COMMAND_BUFFER: usize = 1024;
+const DRIVER_OUTPUT_BUFFER: usize = 16;
 
 #[derive(Clone)]
 pub struct AppState {
     model_id: String,
-    engine: SharedEngine,
+    engine: EngineDriver,
     tokenizer: Arc<Tokenizer>,
     chat_template: Option<Arc<ChatTemplate>>,
     sessions: SessionRegistry,
@@ -71,85 +75,300 @@ impl ServerConfig {
 }
 
 #[derive(Clone)]
-struct SharedEngine(Arc<Mutex<Engine>>);
+struct EngineDriver {
+    commands: mpsc::Sender<DriverCommand>,
+}
 
-// SAFETY: `SharedEngine` is an `Arc<Mutex<Engine>>`; every HTTP entry point
-// takes the mutex before touching `Engine`, so non-`Sync` internals such as decode
-// runners, ORT values, and KV/session state are never accessed concurrently. The
-// value moved between worker threads is only the mutex owner handle. This would
-// stop being sound if `Engine` access escaped the mutex, if generation moved to
-// true concurrent/batched mutation without structural `Send`/`Sync` bounds, or if
-// runners were stored in background tasks outside the locked engine owner.
-unsafe impl Send for SharedEngine {}
-// SAFETY: Shared references only clone/lock the `Arc<Mutex<_>>`; mutation remains
-// serialized by the mutex invariant described above.
-unsafe impl Sync for SharedEngine {}
-
-impl SharedEngine {
-    fn new(engine: Engine) -> Self {
-        Self(Arc::new(Mutex::new(engine)))
-    }
-
-    fn generate(&self, request: GenerateRequest) -> anyhow::Result<onnx_genai::GenerateResult> {
-        self.0
-            .lock()
-            .map_err(|_| anyhow::anyhow!("engine mutex poisoned"))?
-            .generate(request)
-    }
-
-    fn generate_with_callback(
-        &self,
-        request: GenerateRequest,
-        callback: &mut onnx_genai::GenerateTokenCallback<'_>,
-    ) -> anyhow::Result<onnx_genai::GenerateResult> {
-        self.0
-            .lock()
-            .map_err(|_| anyhow::anyhow!("engine mutex poisoned"))?
-            .generate_with_callback(request, Some(callback))
-    }
-
-    fn create_session(&self) -> anyhow::Result<SessionId> {
-        self.0
-            .lock()
-            .map_err(|_| anyhow::anyhow!("engine mutex poisoned"))?
-            .create_session()
-    }
-
-    fn close_session(&self, session_id: SessionId) -> anyhow::Result<()> {
-        self.0
-            .lock()
-            .map_err(|_| anyhow::anyhow!("engine mutex poisoned"))?
-            .close_session(session_id)
-    }
-
-    fn generate_in_session(
-        &self,
+enum DriverCommand {
+    CreateSession(tokio::sync::oneshot::Sender<anyhow::Result<SessionId>>),
+    CloseSession {
         session_id: SessionId,
-        request: GenerateRequest,
-    ) -> anyhow::Result<GenerateResult> {
-        self.0
-            .lock()
-            .map_err(|_| anyhow::anyhow!("engine mutex poisoned"))?
-            .generate_in_session(session_id, request)
-    }
-
-    fn generate_in_session_with_callback(
-        &self,
+        response: tokio::sync::oneshot::Sender<anyhow::Result<()>>,
+    },
+    SessionTokenCount {
         session_id: SessionId,
+        response: tokio::sync::oneshot::Sender<anyhow::Result<usize>>,
+    },
+    Generate {
+        session_id: Option<SessionId>,
         request: GenerateRequest,
-        callback: &mut onnx_genai::GenerateTokenCallback<'_>,
-    ) -> anyhow::Result<GenerateResult> {
-        self.0
-            .lock()
-            .map_err(|_| anyhow::anyhow!("engine mutex poisoned"))?
-            .generate_in_session_with_callback(session_id, request, Some(callback))
+        events: mpsc::Sender<DriverEvent>,
+    },
+}
+
+#[derive(Debug)]
+enum DriverEvent {
+    Token(GenerateToken),
+    Finished(GenerateResult),
+    Error(String),
+}
+
+struct EngineOwner(Engine);
+
+// SAFETY: The engine is moved exactly once into the dedicated driver thread.
+// All ORT runners, sessions, KV state, and the continuous batch manager stay
+// owned by that thread and are accessed only by processing channel commands.
+unsafe impl Send for EngineOwner {}
+
+impl EngineDriver {
+    fn start(engine: Engine, max_batch: usize) -> Self {
+        let (commands, rx) = mpsc::channel(DRIVER_COMMAND_BUFFER);
+        let owner = EngineOwner(engine);
+        thread::Builder::new()
+            .name("onnx-genai-batch-driver".to_string())
+            .spawn(move || run_engine_driver(owner, rx, max_batch))
+            .expect("failed to spawn onnx-genai engine driver");
+        Self { commands }
     }
 
-    fn session_token_count(&self, session_id: SessionId) -> anyhow::Result<usize> {
-        self.0
-            .lock()
-            .map_err(|_| anyhow::anyhow!("engine mutex poisoned"))?
-            .session_token_count(session_id)
+    async fn create_session(&self) -> anyhow::Result<SessionId> {
+        let (response, rx) = tokio::sync::oneshot::channel();
+        self.commands
+            .send(DriverCommand::CreateSession(response))
+            .await
+            .map_err(|_| anyhow::anyhow!("engine driver stopped"))?;
+        rx.await
+            .map_err(|_| anyhow::anyhow!("engine driver stopped"))?
+    }
+
+    async fn close_session(&self, session_id: SessionId) -> anyhow::Result<()> {
+        let (response, rx) = tokio::sync::oneshot::channel();
+        self.commands
+            .send(DriverCommand::CloseSession {
+                session_id,
+                response,
+            })
+            .await
+            .map_err(|_| anyhow::anyhow!("engine driver stopped"))?;
+        rx.await
+            .map_err(|_| anyhow::anyhow!("engine driver stopped"))?
+    }
+
+    async fn session_token_count(&self, session_id: SessionId) -> anyhow::Result<usize> {
+        let (response, rx) = tokio::sync::oneshot::channel();
+        self.commands
+            .send(DriverCommand::SessionTokenCount {
+                session_id,
+                response,
+            })
+            .await
+            .map_err(|_| anyhow::anyhow!("engine driver stopped"))?;
+        rx.await
+            .map_err(|_| anyhow::anyhow!("engine driver stopped"))?
+    }
+
+    async fn generate(
+        &self,
+        session_id: Option<SessionId>,
+        request: GenerateRequest,
+    ) -> anyhow::Result<mpsc::Receiver<DriverEvent>> {
+        let (events, rx) = mpsc::channel(DRIVER_OUTPUT_BUFFER);
+        self.commands
+            .send(DriverCommand::Generate {
+                session_id,
+                request,
+                events,
+            })
+            .await
+            .map_err(|_| anyhow::anyhow!("engine driver stopped"))?;
+        Ok(rx)
+    }
+}
+
+fn run_engine_driver(owner: EngineOwner, rx: mpsc::Receiver<DriverCommand>, max_batch: usize) {
+    let mut engine = owner.0;
+    let static_batch_supported = engine.continuous_batch_manager(max_batch).is_ok();
+    if static_batch_supported {
+        tracing::info!(max_batch, "static-cache continuous batch driver enabled");
+        run_static_engine_driver(&mut engine, rx, max_batch);
+    } else {
+        tracing::info!("continuous batch driver disabled; using per-request engine path");
+        run_fallback_engine_driver(&mut engine, rx);
+    }
+}
+
+fn run_fallback_engine_driver(engine: &mut Engine, mut rx: mpsc::Receiver<DriverCommand>) {
+    while let Some(command) = rx.blocking_recv() {
+        handle_driver_command(engine, command);
+    }
+}
+
+fn run_static_engine_driver(
+    engine: &mut Engine,
+    mut rx: mpsc::Receiver<DriverCommand>,
+    max_batch: usize,
+) {
+    // The current ContinuousBatchManager API accepts GenerateRequest only.
+    // X-Session-Id requests keep using the driver's per-request engine path so
+    // persistent engine KV/session semantics are preserved until the manager
+    // grows a SessionId-aware submit API.
+    let mut deferred = std::collections::VecDeque::new();
+    loop {
+        while let Ok(command) = rx.try_recv() {
+            match command {
+                command @ DriverCommand::Generate {
+                    session_id: None, ..
+                } => deferred.push_back(command),
+                command => deferred.push_back(command),
+            }
+        }
+
+        let Some(first) = deferred.pop_front().or_else(|| rx.blocking_recv()) else {
+            break;
+        };
+
+        match first {
+            DriverCommand::Generate {
+                session_id: None,
+                request,
+                events,
+            } => {
+                run_static_batch_until_idle(
+                    engine,
+                    &mut rx,
+                    &mut deferred,
+                    max_batch,
+                    request,
+                    events,
+                );
+            }
+            command => handle_driver_command(engine, command),
+        }
+    }
+}
+
+fn run_static_batch_until_idle(
+    engine: &Engine,
+    rx: &mut mpsc::Receiver<DriverCommand>,
+    deferred: &mut std::collections::VecDeque<DriverCommand>,
+    max_batch: usize,
+    first_request: GenerateRequest,
+    first_events: mpsc::Sender<DriverEvent>,
+) {
+    let mut manager = match engine.continuous_batch_manager(max_batch) {
+        Ok(manager) => manager,
+        Err(err) => {
+            let _ = first_events.blocking_send(DriverEvent::Error(format!(
+                "continuous batch setup failed: {err}"
+            )));
+            return;
+        }
+    };
+    let mut routes: HashMap<usize, mpsc::Sender<DriverEvent>> = HashMap::new();
+    submit_to_continuous_manager(&mut manager, &mut routes, first_request, first_events);
+
+    loop {
+        while let Ok(command) = rx.try_recv() {
+            match command {
+                DriverCommand::Generate {
+                    session_id: None,
+                    request,
+                    events,
+                } => submit_to_continuous_manager(&mut manager, &mut routes, request, events),
+                command => deferred.push_back(command),
+            }
+        }
+
+        if let Err(err) = manager.step() {
+            let message = format!("continuous batch generation failed: {err}");
+            for (_, events) in routes.drain() {
+                let _ = events.blocking_send(DriverEvent::Error(message.clone()));
+            }
+            break;
+        }
+        route_continuous_events(manager.poll(), &mut routes);
+        if manager.is_idle() {
+            break;
+        }
+    }
+}
+
+fn submit_to_continuous_manager(
+    manager: &mut ContinuousBatchManager<'_>,
+    routes: &mut HashMap<usize, mpsc::Sender<DriverEvent>>,
+    request: GenerateRequest,
+    events: mpsc::Sender<DriverEvent>,
+) {
+    match manager.submit(request) {
+        Ok(handle) => {
+            routes.insert(handle.id, events);
+            route_continuous_events(manager.poll(), routes);
+        }
+        Err(err) => {
+            let _ = events.blocking_send(DriverEvent::Error(err.to_string()));
+        }
+    }
+}
+
+fn route_continuous_events(
+    events: Vec<ContinuousBatchEvent>,
+    routes: &mut HashMap<usize, mpsc::Sender<DriverEvent>>,
+) {
+    for event in events {
+        match event {
+            ContinuousBatchEvent::Token { handle, token } => {
+                if let Some(events) = routes.get(&handle.id) {
+                    let _ = events.blocking_send(DriverEvent::Token(token));
+                }
+            }
+            ContinuousBatchEvent::Finished { handle, result } => {
+                if let Some(events) = routes.remove(&handle.id) {
+                    let _ = events.blocking_send(DriverEvent::Finished(result));
+                }
+            }
+        }
+    }
+}
+
+fn handle_driver_command(engine: &mut Engine, command: DriverCommand) {
+    match command {
+        DriverCommand::CreateSession(response) => {
+            let _ = response.send(engine.create_session());
+        }
+        DriverCommand::CloseSession {
+            session_id,
+            response,
+        } => {
+            let _ = response.send(engine.close_session(session_id));
+        }
+        DriverCommand::SessionTokenCount {
+            session_id,
+            response,
+        } => {
+            let _ = response.send(engine.session_token_count(session_id));
+        }
+        DriverCommand::Generate {
+            session_id,
+            request,
+            events,
+        } => run_fallback_generation(engine, session_id, request, events),
+    }
+}
+
+fn run_fallback_generation(
+    engine: &mut Engine,
+    session_id: Option<SessionId>,
+    request: GenerateRequest,
+    events: mpsc::Sender<DriverEvent>,
+) {
+    let mut callback = |token: GenerateToken| -> anyhow::Result<()> {
+        events
+            .blocking_send(DriverEvent::Token(token))
+            .context("stream receiver closed")
+    };
+    let result = match session_id {
+        Some(session_id) => {
+            engine.generate_in_session_with_callback(session_id, request, Some(&mut callback))
+        }
+        None => engine.generate_with_callback(request, Some(&mut callback)),
+    };
+    match result {
+        Ok(result) => {
+            let _ = events.blocking_send(DriverEvent::Finished(result));
+        }
+        Err(err) => {
+            let _ = events.blocking_send(DriverEvent::Error(err.to_string()));
+        }
     }
 }
 
@@ -313,7 +532,7 @@ impl AppState {
         let config = config.validate().expect("validated server config");
         Self {
             model_id,
-            engine: SharedEngine::new(engine),
+            engine: EngineDriver::start(engine, DEFAULT_MAX_BATCH),
             tokenizer: Arc::new(tokenizer),
             chat_template: chat_template.map(Arc::new),
             sessions: SessionRegistry::new(config.max_sessions),
@@ -730,17 +949,17 @@ async fn create_session(State(state): State<AppState>) -> Result<Json<SessionRes
         .sessions
         .next_client_id()
         .map_err(|err| ApiError::internal(format!("session id generation failed: {err}")))?;
-    let engine = state.engine.clone();
-    let engine_session_id = tokio::task::spawn_blocking(move || engine.create_session())
+    let engine_session_id = state
+        .engine
+        .create_session()
         .await
-        .map_err(|err| ApiError::internal(format!("session create task failed: {err}")))?
         .map_err(|err| ApiError::internal(format!("session create failed: {err}")))?;
 
-    state
+    let evicted = state
         .sessions
         .insert(client_id.clone(), engine_session_id)
-        .map_err(|err| ApiError::internal(format!("session registry failed: {err}")))
-        .and_then(|evicted| close_evicted_session(&state, evicted))?;
+        .map_err(|err| ApiError::internal(format!("session registry failed: {err}")))?;
+    close_evicted_session(&state, evicted).await?;
 
     Ok(Json(SessionResponse {
         id: client_id,
@@ -758,10 +977,10 @@ async fn delete_session(
         .map_err(|err| ApiError::internal(format!("session registry failed: {err}")))?
         .ok_or_else(|| ApiError::not_found(format!("session {client_id} not found")))?;
 
-    let engine = state.engine.clone();
-    tokio::task::spawn_blocking(move || engine.close_session(engine_session_id))
+    state
+        .engine
+        .close_session(engine_session_id)
         .await
-        .map_err(|err| ApiError::internal(format!("session close task failed: {err}")))?
         .map_err(|err| ApiError::internal(format!("session close failed: {err}")))?;
 
     Ok(StatusCode::NO_CONTENT)
@@ -775,7 +994,9 @@ async fn chat_completions(
     validate_request(&request, &state.config)?;
     let session_id = session_id_from_headers(&headers)?;
     if request.stream {
-        Ok(stream_chat_completion(state, request, session_id)?.into_response())
+        Ok(stream_chat_completion(state, request, session_id)
+            .await?
+            .into_response())
     } else {
         let response = run_chat_completion(state, request, session_id).await?;
         Ok(Json(response).into_response())
@@ -805,31 +1026,35 @@ async fn run_chat_completion(
     let prompt_tokens = prepared.prompt_tokens;
     let mut generation_request = prepared.request;
     generation_request.options.max_context = state.model_max_context;
-    let engine = state.engine.clone();
-    let session_lookup = client_session_id
-        .as_deref()
-        .map(|id| get_or_create_session(&state, id))
-        .transpose()?;
+    let session_lookup = if let Some(id) = client_session_id.as_deref() {
+        Some(get_or_create_session(&state, id).await?)
+    } else {
+        None
+    };
 
     let session_for_count = session_lookup;
     let wants_json_object = request.wants_json_object();
-    let result = tokio::task::spawn_blocking(move || match session_lookup {
-        Some(engine_session_id) => {
-            engine.generate_in_session(engine_session_id, generation_request)
-        }
-        None => engine.generate(generation_request),
-    })
+    let result = collect_generation_result(
+        state
+            .engine
+            .generate(session_lookup, generation_request)
+            .await
+            .map_err(|err| ApiError::internal(format!("generation submit failed: {err}")))?,
+    )
     .await
-    .map_err(|err| ApiError::internal(format!("generation task failed: {err}")))?;
+    .map_err(|err| ApiError::internal(format!("generation failed: {err}")));
 
-    let session_token_count = session_for_count
-        .map(|engine_session_id| {
+    let session_token_count = if let Some(engine_session_id) = session_for_count {
+        Some(
             state
                 .engine
                 .session_token_count(engine_session_id)
-                .map_err(|err| ApiError::internal(format!("session token count failed: {err}")))
-        })
-        .transpose()?;
+                .await
+                .map_err(|err| ApiError::internal(format!("session token count failed: {err}")))?,
+        )
+    } else {
+        None
+    };
 
     let (content, tool_calls, completion_tokens, finish_reason) = match result {
         Ok(result) => {
@@ -850,10 +1075,12 @@ async fn run_chat_completion(
                 parsed.finish_reason,
             )
         }
-        Err(err) if wants_json_object && json_constraint_stopped_incomplete(&err) => {
+        Err(err)
+            if wants_json_object && json_constraint_stopped_incomplete_message(&err.message) =>
+        {
             (Some("{}".to_string()), None, 0, "stop")
         }
-        Err(err) => return Err(ApiError::internal(format!("generation failed: {err}"))),
+        Err(err) => return Err(err),
     };
     let total_tokens = prompt_tokens + completion_tokens;
     Ok(ChatCompletionResponse {
@@ -881,7 +1108,7 @@ async fn run_chat_completion(
     })
 }
 
-fn stream_chat_completion(
+async fn stream_chat_completion(
     state: AppState,
     request: ChatCompletionRequest,
     client_session_id: Option<String>,
@@ -909,63 +1136,44 @@ fn stream_chat_completion(
     let wants_json_object = request.wants_json_object();
     let mut generation_request = prepared.request;
     generation_request.options.max_context = state.model_max_context;
-    let engine = state.engine.clone();
     let (tx, rx) = mpsc::channel(16);
-    let session_lookup = client_session_id
-        .as_deref()
-        .map(|id| get_or_create_session(&state, id));
+    let session_lookup = if let Some(id) = client_session_id.as_deref() {
+        Some(get_or_create_session(&state, id).await?)
+    } else {
+        None
+    };
+    let mut driver_rx = state
+        .engine
+        .generate(session_lookup, generation_request)
+        .await
+        .map_err(|err| ApiError::internal(format!("generation submit failed: {err}")))?;
 
-    tokio::task::spawn_blocking(move || {
-        let session_lookup = match session_lookup.transpose() {
-            Ok(value) => value,
-            Err(err) => {
-                tx.blocking_send(Ok(Event::default().event("error").data(
-                    serde_json::to_string(&ErrorResponse {
-                        error: ErrorBody {
-                            message: format!("session setup failed: {}", err.message),
-                            kind: "server_error",
-                        },
-                    })?,
-                )))
-                .context("stream receiver closed")?;
-                tx.blocking_send(Ok(Event::default().data("[DONE]")))
-                    .context("stream receiver closed")?;
-                return Ok::<(), anyhow::Error>(());
-            }
-        };
-
-        let send_chunk = |chunk: ChatCompletionChunk| -> anyhow::Result<()> {
-            tx.blocking_send(Ok(Event::default().data(serde_json::to_string(&chunk)?)))
-                .context("stream receiver closed")
-        };
-
-        send_chunk(role_chunk(&id, created, &model))?;
+    tokio::spawn(async move {
+        send_stream_chunk(&tx, role_chunk(&id, created, &model)).await?;
 
         let mut stop_buffer = StopBoundaryBuffer::new(user_stop_sequences);
         let mut buffered_text = String::new();
         let buffer_for_tool_detection =
             request.has_tool_context() && tools_parseable_from_output(&request);
-        let mut callback = |token: GenerateToken| -> anyhow::Result<()> {
-            let finish_reason = token.finish_reason.clone();
-            let content = stop_buffer.push(&token.text);
-            if buffer_for_tool_detection {
-                buffered_text.push_str(&content);
-            } else if !wants_json_object && !content.is_empty() {
-                send_chunk(content_chunk(&id, created, &model, content))?;
+        let result = loop {
+            match driver_rx.recv().await {
+                Some(DriverEvent::Token(token)) => {
+                    let finish_reason = token.finish_reason.clone();
+                    let content = stop_buffer.push(&token.text);
+                    if buffer_for_tool_detection {
+                        buffered_text.push_str(&content);
+                    } else if !wants_json_object && !content.is_empty() {
+                        send_stream_chunk(&tx, content_chunk(&id, created, &model, content))
+                            .await?;
+                    }
+                    if matches!(finish_reason, Some(FinishReason::StopSequence { .. })) {
+                        stop_buffer.pending.clear();
+                    }
+                }
+                Some(DriverEvent::Finished(result)) => break Ok(result),
+                Some(DriverEvent::Error(message)) => break Err(message),
+                None => break Err("generation stream ended before result".to_string()),
             }
-            if matches!(finish_reason, Some(FinishReason::StopSequence { .. })) {
-                stop_buffer.pending.clear();
-            }
-            Ok(())
-        };
-
-        let result = match session_lookup {
-            Some(engine_session_id) => engine.generate_in_session_with_callback(
-                engine_session_id,
-                generation_request,
-                &mut callback,
-            ),
-            None => engine.generate_with_callback(generation_request, &mut callback),
         };
 
         match result {
@@ -977,49 +1185,70 @@ fn stream_chat_completion(
                     let tool_calls = parse_tool_calls(&buffered_text);
                     if tool_calls.is_empty() {
                         if !buffered_text.is_empty() {
-                            send_chunk(content_chunk(&id, created, &model, buffered_text))?;
+                            send_stream_chunk(
+                                &tx,
+                                content_chunk(&id, created, &model, buffered_text),
+                            )
+                            .await?;
                         }
-                        send_chunk(done_chunk(
+                        send_stream_chunk(
+                            &tx,
+                            done_chunk(
+                                &id,
+                                created,
+                                &model,
+                                finish_reason_label(&result.finish_reason),
+                            ),
+                        )
+                        .await?;
+                    } else {
+                        send_stream_chunk(&tx, tool_calls_chunk(&id, created, &model, tool_calls))
+                            .await?;
+                        send_stream_chunk(&tx, done_chunk(&id, created, &model, "tool_calls"))
+                            .await?;
+                    }
+                } else if wants_json_object {
+                    if !result.text.is_empty() {
+                        send_stream_chunk(&tx, content_chunk(&id, created, &model, result.text))
+                            .await?;
+                    }
+                    send_stream_chunk(
+                        &tx,
+                        done_chunk(
                             &id,
                             created,
                             &model,
                             finish_reason_label(&result.finish_reason),
-                        ))?;
-                    } else {
-                        send_chunk(tool_calls_chunk(&id, created, &model, tool_calls))?;
-                        send_chunk(done_chunk(&id, created, &model, "tool_calls"))?;
-                    }
-                } else if wants_json_object {
-                    if !result.text.is_empty() {
-                        send_chunk(content_chunk(&id, created, &model, result.text))?;
-                    }
-                    send_chunk(done_chunk(
-                        &id,
-                        created,
-                        &model,
-                        finish_reason_label(&result.finish_reason),
-                    ))?;
+                        ),
+                    )
+                    .await?;
                 } else {
                     if !matches!(result.finish_reason, FinishReason::StopSequence { .. }) {
                         let content = stop_buffer.flush();
                         if !content.is_empty() {
-                            send_chunk(content_chunk(&id, created, &model, content))?;
+                            send_stream_chunk(&tx, content_chunk(&id, created, &model, content))
+                                .await?;
                         }
                     }
-                    send_chunk(done_chunk(
-                        &id,
-                        created,
-                        &model,
-                        finish_reason_label(&result.finish_reason),
-                    ))?;
+                    send_stream_chunk(
+                        &tx,
+                        done_chunk(
+                            &id,
+                            created,
+                            &model,
+                            finish_reason_label(&result.finish_reason),
+                        ),
+                    )
+                    .await?;
                 }
             }
-            Err(err) if wants_json_object && json_constraint_stopped_incomplete(&err) => {
-                send_chunk(content_chunk(&id, created, &model, "{}".to_string()))?;
-                send_chunk(done_chunk(&id, created, &model, "stop"))?;
+            Err(err) if wants_json_object && json_constraint_stopped_incomplete_message(&err) => {
+                send_stream_chunk(&tx, content_chunk(&id, created, &model, "{}".to_string()))
+                    .await?;
+                send_stream_chunk(&tx, done_chunk(&id, created, &model, "stop")).await?;
             }
             Err(err) => {
-                tx.blocking_send(Ok(Event::default().event("error").data(
+                tx.send(Ok(Event::default().event("error").data(
                     serde_json::to_string(&ErrorResponse {
                         error: ErrorBody {
                             message: format!("generation failed: {err}"),
@@ -1027,16 +1256,40 @@ fn stream_chat_completion(
                         },
                     })?,
                 )))
+                .await
                 .context("stream receiver closed")?;
             }
         }
 
-        tx.blocking_send(Ok(Event::default().data("[DONE]")))
+        tx.send(Ok(Event::default().data("[DONE]")))
+            .await
             .context("stream receiver closed")?;
         Ok::<(), anyhow::Error>(())
     });
 
     Ok(Sse::new(ReceiverStream::new(rx)))
+}
+
+async fn collect_generation_result(
+    mut rx: mpsc::Receiver<DriverEvent>,
+) -> Result<GenerateResult, String> {
+    while let Some(event) = rx.recv().await {
+        match event {
+            DriverEvent::Token(_) => {}
+            DriverEvent::Finished(result) => return Ok(result),
+            DriverEvent::Error(message) => return Err(message),
+        }
+    }
+    Err("generation stream ended before result".to_string())
+}
+
+async fn send_stream_chunk(
+    tx: &mpsc::Sender<Result<Event, Infallible>>,
+    chunk: ChatCompletionChunk,
+) -> anyhow::Result<()> {
+    tx.send(Ok(Event::default().data(serde_json::to_string(&chunk)?)))
+        .await
+        .context("stream receiver closed")
 }
 
 fn role_chunk(id: &str, created: u64, model: &str) -> ChatCompletionChunk {
@@ -1236,7 +1489,7 @@ fn session_id_from_headers(headers: &HeaderMap) -> Result<Option<String>, ApiErr
     Ok(Some(session_id.to_string()))
 }
 
-fn get_or_create_session(state: &AppState, client_id: &str) -> Result<SessionId, ApiError> {
+async fn get_or_create_session(state: &AppState, client_id: &str) -> Result<SessionId, ApiError> {
     if let Some(engine_session_id) = state
         .sessions
         .get(client_id)
@@ -1248,20 +1501,25 @@ fn get_or_create_session(state: &AppState, client_id: &str) -> Result<SessionId,
     let engine_session_id = state
         .engine
         .create_session()
+        .await
         .map_err(|err| ApiError::internal(format!("session create failed: {err}")))?;
-    state
+    let evicted = state
         .sessions
         .insert(client_id.to_string(), engine_session_id)
-        .map_err(|err| ApiError::internal(format!("session registry failed: {err}")))
-        .and_then(|evicted| close_evicted_session(state, evicted))?;
+        .map_err(|err| ApiError::internal(format!("session registry failed: {err}")))?;
+    close_evicted_session(state, evicted).await?;
     Ok(engine_session_id)
 }
 
-fn close_evicted_session(state: &AppState, evicted: Option<SessionId>) -> Result<(), ApiError> {
+async fn close_evicted_session(
+    state: &AppState,
+    evicted: Option<SessionId>,
+) -> Result<(), ApiError> {
     if let Some(evicted) = evicted {
         state
             .engine
             .close_session(evicted)
+            .await
             .map_err(|err| ApiError::internal(format!("evicted session close failed: {err}")))?;
     }
     Ok(())
@@ -1394,9 +1652,8 @@ fn build_generate_options_with_tokenizer(
     options
 }
 
-fn json_constraint_stopped_incomplete(err: &anyhow::Error) -> bool {
-    err.to_string()
-        .contains("JSON constrained decoding stopped before a complete JSON value")
+fn json_constraint_stopped_incomplete_message(message: &str) -> bool {
+    message.contains("JSON constrained decoding stopped before a complete JSON value")
 }
 
 fn tools_parseable_from_output(request: &ChatCompletionRequest) -> bool {
@@ -1534,6 +1791,9 @@ pub fn parse_assistant_output(
     output: String,
     default_finish_reason: &'static str,
 ) -> ParsedAssistantOutput {
+    // OpenAI tool calls end the assistant turn. The batch row finishes normally
+    // with finish_reason=tool_calls; role=tool follow-up messages are submitted
+    // as a new turn rather than pausing and resuming mid-token.
     let tool_calls = parse_tool_calls(&output);
     if tool_calls.is_empty() {
         ParsedAssistantOutput {

@@ -2,7 +2,7 @@ use axum::{
     body::{Body, to_bytes},
     http::{Request, StatusCode, header},
 };
-use onnx_genai::GeneratePrompt;
+use onnx_genai::{Engine, EngineConfig, GeneratePrompt};
 use onnx_genai_engine::GenerateConstraint;
 use onnx_genai_server::{
     AppState, ChatCompletionRequest, ServerConfig, app, build_generate_request,
@@ -16,8 +16,18 @@ fn fixture_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm")
 }
 
+fn static_fixture_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm-scatter")
+}
+
 async fn test_app() -> axum::Router {
     let state = AppState::load(&fixture_dir(), Some("tiny-llm".to_string())).unwrap();
+    app(state)
+}
+
+async fn static_test_app() -> axum::Router {
+    let state =
+        AppState::load(&static_fixture_dir(), Some("tiny-llm-scatter".to_string())).unwrap();
     app(state)
 }
 
@@ -62,6 +72,13 @@ async fn post_chat_json(app: axum::Router, body: Value) -> Value {
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
     serde_json::from_slice(&body).unwrap()
+}
+
+fn direct_static_completion(body: Value) -> String {
+    let request = chat_request(body);
+    let generate_request = build_generate_request(&request);
+    let mut engine = Engine::from_dir(&static_fixture_dir(), EngineConfig::default()).unwrap();
+    engine.generate(generate_request).unwrap().text
 }
 
 async fn create_http_session(app: axum::Router) -> String {
@@ -264,6 +281,41 @@ async fn chat_completions_returns_openai_shape() {
     assert!(prompt_tokens > 0);
     assert_eq!(total_tokens, prompt_tokens + completion_tokens);
     assert!(json.get("session_id").is_none());
+}
+
+#[tokio::test]
+async fn concurrent_static_cache_chat_completions_share_batched_driver() {
+    let app = static_test_app().await;
+    let requests = [
+        json!({"model": "tiny-llm-scatter", "messages": [{"role": "user", "content": "hello"}], "max_tokens": 2}),
+        json!({"model": "tiny-llm-scatter", "messages": [{"role": "user", "content": "world"}], "max_tokens": 3}),
+        json!({"model": "tiny-llm-scatter", "messages": [{"role": "user", "content": "tok16"}], "max_tokens": 1}),
+        json!({"model": "tiny-llm-scatter", "messages": [{"role": "user", "content": "tok17"}], "max_tokens": 4}),
+    ];
+    let expected = requests
+        .iter()
+        .cloned()
+        .map(direct_static_completion)
+        .collect::<Vec<_>>();
+
+    let (a, b, c, d) = tokio::join!(
+        post_chat_json(app.clone(), requests[0].clone()),
+        post_chat_json(app.clone(), requests[1].clone()),
+        post_chat_json(app.clone(), requests[2].clone()),
+        post_chat_json(app.clone(), requests[3].clone()),
+    );
+    let responses = [a, b, c, d];
+
+    for (response, expected_text) in responses.iter().zip(expected) {
+        assert_eq!(response["object"], "chat.completion");
+        assert_eq!(response["model"], "tiny-llm-scatter");
+        assert_eq!(
+            response["choices"][0]["message"]["content"]
+                .as_str()
+                .unwrap(),
+            expected_text
+        );
+    }
 }
 
 #[test]
