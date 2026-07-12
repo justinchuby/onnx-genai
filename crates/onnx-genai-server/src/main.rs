@@ -1,6 +1,6 @@
 //! OpenAI-compatible HTTP server.
 
-use axum::{Router, routing::post, Json};
+use axum::{Json, Router, routing::post};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 
@@ -36,10 +36,16 @@ struct Choice {
     finish_reason: String,
 }
 
-fn default_max_tokens() -> usize { 256 }
-fn default_temperature() -> f32 { 1.0 }
+fn default_max_tokens() -> usize {
+    256
+}
+fn default_temperature() -> f32 {
+    1.0
+}
 
-async fn chat_completions(Json(request): Json<ChatCompletionRequest>) -> Json<ChatCompletionResponse> {
+async fn chat_completions(
+    Json(request): Json<ChatCompletionRequest>,
+) -> Json<ChatCompletionResponse> {
     tracing::info!("Received request for model: {}", request.model);
 
     // TODO: Route to engine for actual generation
@@ -50,7 +56,8 @@ async fn chat_completions(Json(request): Json<ChatCompletionRequest>) -> Json<Ch
             index: 0,
             message: Message {
                 role: "assistant".to_string(),
-                content: "Hello! This is a placeholder response. Engine integration coming soon.".to_string(),
+                content: "Hello! This is a placeholder response. Engine integration coming soon."
+                    .to_string(),
             },
             finish_reason: "stop".to_string(),
         }],
@@ -63,8 +70,7 @@ async fn main() -> anyhow::Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
-    let app = Router::new()
-        .route("/v1/chat/completions", post(chat_completions));
+    let app = Router::new().route("/v1/chat/completions", post(chat_completions));
 
     let addr = SocketAddr::from(([127, 0, 0, 1], 8080));
     tracing::info!("Starting onnx-genai server on {}", addr);

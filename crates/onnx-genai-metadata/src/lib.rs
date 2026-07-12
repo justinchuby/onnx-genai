@@ -2,13 +2,13 @@
 //!
 //! Implements the spec from <https://github.com/onnx/onnx/issues/8184>
 
-pub mod schema;
 pub mod parser;
+pub mod schema;
 pub mod validation;
 
-pub use schema::*;
 pub use parser::load_metadata;
-pub use validation::{validate, RuntimeCapabilities};
+pub use schema::*;
+pub use validation::{RuntimeCapabilities, validate};
 
 /// Error type for metadata operations.
 #[derive(Debug, thiserror::Error)]

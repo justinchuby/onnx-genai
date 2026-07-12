@@ -1,0 +1,35 @@
+{
+  "required_capabilities": ["kv_cache", "grouped_query_attention"],
+  "model": {
+    "attention": {
+      "type": "grouped_query",
+      "num_kv_heads": 8,
+      "num_attention_heads": 32,
+      "head_dim": 128,
+      "sliding_window": null
+    },
+    "max_sequence_length": 131072,
+    "runtime_configurable": {
+      "kv_cache": { "dtype": ["fp16", "fp8_e5m2"] },
+      "prefix_cache": true,
+      "continuous_batching": true
+    }
+  },
+  "kv_cache": {
+    "native_dtype": "bf16",
+    "operations": {
+      "rewind_safe": true,
+      "fork_precision_policy": "inherit",
+      "checkpoint_serializable": true
+    }
+  },
+  "structured_output": {
+    "supported_formats": ["json_schema", "regex"],
+    "training_format": "chatml_tool_call",
+    "stop_sequences": ["</tool_call>"]
+  },
+  "hardware_requirements": {
+    "min_memory_gb": 4.2,
+    "required_dtypes": ["fp16"]
+  }
+}
