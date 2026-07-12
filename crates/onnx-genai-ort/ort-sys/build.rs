@@ -10,7 +10,7 @@
 use std::env;
 use std::path::{Path, PathBuf};
 
-const ORT_VERSION: &str = "1.22.0";
+const ORT_VERSION: &str = "1.27.0";
 const ORT_RELEASE_BASE: &str = "https://github.com/microsoft/onnxruntime/releases/download";
 
 fn main() {
