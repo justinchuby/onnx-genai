@@ -167,6 +167,118 @@ fn response_format_maps_to_generate_constraint_only_for_json_object() {
 }
 
 #[test]
+fn forced_specific_tool_choice_builds_lark_tool_call_constraint() {
+    let request = chat_request(json!({
+        "model": "tiny-llm",
+        "messages": [{"role": "user", "content": "weather?"}],
+        "tools": [{
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"location": {"type": "string"}},
+                    "required": ["location"]
+                }
+            }
+        }],
+        "tool_choice": {"type": "function", "function": {"name": "get_weather"}}
+    }));
+
+    let Some(GenerateConstraint::Lark(grammar)) =
+        build_generate_request(&request).options.constraint
+    else {
+        panic!("expected forced tool_choice to build a Lark constraint");
+    };
+    assert!(
+        grammar.contains("start: \"<tool_call>\\n\" tool \"\\n</tool_call>\""),
+        "{grammar}"
+    );
+    assert!(grammar.contains("tool: %json"), "{grammar}");
+    let schema_text = grammar.split_once("tool: %json ").unwrap().1.trim();
+    let schema: Value = serde_json::from_str(schema_text).unwrap();
+    assert_eq!(schema["properties"]["name"]["enum"][0], "get_weather");
+    assert_eq!(schema["properties"]["arguments"]["required"][0], "location");
+    assert_eq!(
+        schema["properties"]["arguments"]["properties"]["location"]["type"],
+        "string"
+    );
+}
+
+#[test]
+fn required_tool_choice_with_multiple_tools_allows_any_tool_schema() {
+    let request = chat_request(json!({
+        "model": "tiny-llm",
+        "messages": [{"role": "user", "content": "pick a tool"}],
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "parameters": {"type": "object", "properties": {"location": {"type": "string"}}, "required": ["location"]}
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_time",
+                    "parameters": {"type": "object", "properties": {"zone": {"type": "string"}}, "required": ["zone"]}
+                }
+            }
+        ],
+        "tool_choice": "required"
+    }));
+
+    let Some(GenerateConstraint::Lark(grammar)) =
+        build_generate_request(&request).options.constraint
+    else {
+        panic!("expected forced tool_choice to build a Lark constraint");
+    };
+    let schema_text = grammar.split_once("tool: %json ").unwrap().1.trim();
+    let schema: Value = serde_json::from_str(schema_text).unwrap();
+    let any_of = schema["anyOf"].as_array().unwrap();
+    assert_eq!(any_of.len(), 2);
+    assert_eq!(any_of[0]["properties"]["name"]["enum"][0], "get_weather");
+    assert_eq!(any_of[1]["properties"]["name"]["enum"][0], "get_time");
+}
+
+#[test]
+fn auto_and_none_tool_choice_do_not_constrain_generation() {
+    let tool = json!({
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "parameters": {"type": "object"}
+        }
+    });
+    let auto_request = chat_request(json!({
+        "model": "tiny-llm",
+        "messages": [{"role": "user", "content": "weather?"}],
+        "tools": [tool.clone()],
+        "tool_choice": "auto"
+    }));
+    let none_request = chat_request(json!({
+        "model": "tiny-llm",
+        "messages": [{"role": "user", "content": "weather?"}],
+        "tools": [tool],
+        "tool_choice": "none"
+    }));
+
+    assert_eq!(
+        build_generate_request(&auto_request).options.constraint,
+        None
+    );
+    assert_eq!(
+        build_generate_request(&none_request).options.constraint,
+        None
+    );
+    let GeneratePrompt::Text(prompt) = build_generate_request(&none_request).prompt else {
+        panic!("expected text prompt");
+    };
+    assert!(!prompt.contains("<|tools|>"), "{prompt}");
+}
+
+#[test]
 fn chat_request_with_tools_renders_tool_schema_in_prompt() {
     let request = chat_request(json!({
         "model": "tiny-llm",

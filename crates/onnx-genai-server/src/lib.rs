@@ -696,8 +696,16 @@ async fn run_chat_completion(
 
     let (content, tool_calls, completion_tokens, finish_reason) = match result {
         Ok(result) => {
-            let parsed =
-                parse_assistant_output(result.text, finish_reason_label(&result.finish_reason));
+            let default_finish_reason = finish_reason_label(&result.finish_reason);
+            let parsed = if tools_parseable_from_output(&request) {
+                parse_assistant_output(result.text, default_finish_reason)
+            } else {
+                ParsedAssistantOutput {
+                    content: Some(result.text),
+                    tool_calls: None,
+                    finish_reason: default_finish_reason,
+                }
+            };
             (
                 parsed.content,
                 parsed.tool_calls,
@@ -792,11 +800,8 @@ fn stream_chat_completion(
 
         let mut stop_buffer = StopBoundaryBuffer::new(user_stop_sequences);
         let mut buffered_text = String::new();
-        let buffer_for_tool_detection = request.has_tool_context()
-            && !matches!(
-                request.tool_choice,
-                Some(ToolChoice::Mode(ToolChoiceMode::None))
-            );
+        let buffer_for_tool_detection =
+            request.has_tool_context() && tools_parseable_from_output(&request);
         let mut callback = |token: GenerateToken| -> anyhow::Result<()> {
             let finish_reason = token.finish_reason.clone();
             let content = stop_buffer.push(&token.text);
@@ -999,6 +1004,45 @@ fn validate_request(request: &ChatCompletionRequest) -> Result<(), ApiError> {
             "top_p must be finite and non-negative",
         ));
     }
+    validate_tool_choice(request)?;
+    Ok(())
+}
+
+fn validate_tool_choice(request: &ChatCompletionRequest) -> Result<(), ApiError> {
+    let Some(tool_choice) = &request.tool_choice else {
+        return Ok(());
+    };
+    match tool_choice {
+        ToolChoice::Mode(ToolChoiceMode::Required) => {
+            if !request
+                .tools
+                .as_ref()
+                .is_some_and(|tools| tools.iter().any(|tool| tool.kind == "function"))
+            {
+                return Err(ApiError::bad_request(
+                    "tool_choice required requires at least one function tool",
+                ));
+            }
+        }
+        ToolChoice::Specific(choice) => {
+            if choice.kind != "function" {
+                return Err(ApiError::bad_request(
+                    "specific tool_choice type must be function",
+                ));
+            }
+            if !request.tools.as_ref().is_some_and(|tools| {
+                tools.iter().any(|tool| {
+                    tool.kind == "function" && tool.function.name == choice.function.name
+                })
+            }) {
+                return Err(ApiError::bad_request(format!(
+                    "tool_choice function '{}' was not provided in tools",
+                    choice.function.name
+                )));
+            }
+        }
+        ToolChoice::Mode(ToolChoiceMode::Auto | ToolChoiceMode::None) => {}
+    }
     Ok(())
 }
 
@@ -1080,7 +1124,63 @@ fn build_generate_options(request: &ChatCompletionRequest) -> GenerateOptions {
     if request.wants_json_object() {
         options.constraint = Some(GenerateConstraint::Json);
     }
+    if let Some(constraint) = forced_tool_choice_constraint(request) {
+        options.constraint = Some(constraint);
+    }
     options
+}
+
+fn forced_tool_choice_constraint(request: &ChatCompletionRequest) -> Option<GenerateConstraint> {
+    let schemas = forced_tool_choice_schemas(request)?;
+    let schema = if schemas.len() == 1 {
+        schemas.into_iter().next()?
+    } else {
+        serde_json::json!({ "anyOf": schemas })
+    };
+    let schema = serde_json::to_string(&schema).ok()?;
+    Some(GenerateConstraint::Lark(format!(
+        "start: \"<tool_call>\\n\" tool \"\\n</tool_call>\"\ntool: %json {schema}\n"
+    )))
+}
+
+fn forced_tool_choice_schemas(request: &ChatCompletionRequest) -> Option<Vec<serde_json::Value>> {
+    let tools = request
+        .tools
+        .as_ref()?
+        .iter()
+        .filter(|tool| tool.kind == "function");
+    let selected = match request.tool_choice.as_ref()? {
+        ToolChoice::Mode(ToolChoiceMode::Required) => tools.collect::<Vec<_>>(),
+        ToolChoice::Specific(choice) if choice.kind == "function" => tools
+            .filter(|tool| tool.function.name == choice.function.name)
+            .collect::<Vec<_>>(),
+        ToolChoice::Mode(ToolChoiceMode::Auto | ToolChoiceMode::None) | ToolChoice::Specific(_) => {
+            Vec::new()
+        }
+    };
+
+    let schemas = selected
+        .into_iter()
+        .map(tool_call_schema_for_tool)
+        .collect::<Vec<_>>();
+    (!schemas.is_empty()).then_some(schemas)
+}
+
+fn tool_call_schema_for_tool(tool: &ChatTool) -> serde_json::Value {
+    let arguments_schema = tool
+        .function
+        .parameters
+        .clone()
+        .unwrap_or_else(|| serde_json::json!({ "type": "object" }));
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "name": { "enum": [tool.function.name.clone()] },
+            "arguments": arguments_schema
+        },
+        "required": ["name", "arguments"],
+        "additionalProperties": false
+    })
 }
 
 fn build_generate_options_with_tokenizer(
@@ -1112,6 +1212,23 @@ fn json_constraint_stopped_incomplete(err: &anyhow::Error) -> bool {
         .contains("JSON constrained decoding stopped before a complete JSON value")
 }
 
+fn tools_parseable_from_output(request: &ChatCompletionRequest) -> bool {
+    !matches!(
+        request.tool_choice,
+        Some(ToolChoice::Mode(ToolChoiceMode::None))
+    )
+}
+
+fn tools_offered_to_model(request: &ChatCompletionRequest) -> Option<&Vec<ChatTool>> {
+    if matches!(
+        request.tool_choice,
+        Some(ToolChoice::Mode(ToolChoiceMode::None))
+    ) {
+        return None;
+    }
+    request.tools.as_ref().filter(|tools| !tools.is_empty())
+}
+
 fn build_session_prompt(messages: &[ChatMessage]) -> String {
     messages
         .last()
@@ -1139,9 +1256,7 @@ fn render_prompt(
                 Ok(template_message)
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
-        let tools_json = request
-            .tools
-            .as_ref()
+        let tools_json = tools_offered_to_model(request)
             .map(serde_json::to_string)
             .transpose()?;
         return chat_template
@@ -1156,7 +1271,7 @@ fn render_prompt(
 /// Model-specific templates will replace this once tokenizer chat templates are wired.
 pub fn build_prompt(request: &ChatCompletionRequest) -> String {
     let mut prompt = String::new();
-    if let Some(tools) = request.tools.as_ref().filter(|tools| !tools.is_empty()) {
+    if let Some(tools) = tools_offered_to_model(request) {
         prompt.push_str("<|tools|>\n");
         prompt.push_str(&serde_json::to_string(tools).unwrap_or_else(|_| "[]".to_string()));
         prompt.push('\n');
