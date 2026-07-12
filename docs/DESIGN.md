@@ -6943,3 +6943,400 @@ kv_cache:
 kv_cache:
   page_size: 8     # finer sharing granularity, more prefix cache hits
 ```
+
+---
+
+## 39. Radix-Tree Prefix Cache & ONNX Attention Compatibility
+
+### 39.1 What RadixAttention Solves
+
+Traditional prefix cache uses a hash map: `hash(token_ids[0..N]) → page_ids`. This requires:
+- Knowing the exact prefix length upfront
+- Prefix must align to page boundaries for sharing
+- Each unique prefix registered explicitly
+
+RadixAttention (SGLang) instead stores ALL computed KV in a radix tree indexed by token content. Any two requests that share any prefix automatically discover the shared portion by walking the tree — no pre-registration, no boundary alignment.
+
+### 39.2 Our Adaptation: Page-Granularity Radix Tree
+
+We don't need token-level granularity (SGLang's page_size=1). We use a radix tree where **each node represents one page (16 tokens)**:
+
+```rust
+/// Radix tree for KV cache prefix discovery.
+/// Each edge label is a page's worth of token IDs (16 tokens).
+/// Each node points to the physical KV page in the paged cache.
+pub struct RadixTree {
+    root: RadixNode,
+    /// Total pages stored (for memory accounting).
+    total_pages: usize,
+    /// Reference counting for shared pages.
+    ref_counts: HashMap<PageId, usize>,
+}
+
+struct RadixNode {
+    /// Edge label → child node.
+    /// Key: hash of 16 token IDs (compact representation).
+    /// In practice, we store the hash not the full tokens to save memory.
+    children: HashMap<u64, Box<RadixEdge>>,
+    /// Physical page storing this node's KV data (None for root).
+    page_id: Option<PageId>,
+    /// LRU timestamp for eviction.
+    last_access: Instant,
+    /// Number of active sequences using this node.
+    ref_count: u32,
+}
+
+struct RadixEdge {
+    /// Hash of the token page this edge represents.
+    token_hash: u64,
+    /// The child node.
+    node: RadixNode,
+}
+
+impl RadixTree {
+    /// Find the longest prefix match for a token sequence.
+    /// Returns: (matched_pages, remaining_tokens_to_compute).
+    pub fn match_prefix(&mut self, tokens: &[TokenId]) -> PrefixMatch {
+        let mut current = &mut self.root;
+        let mut matched_pages = Vec::new();
+        
+        for chunk in tokens.chunks(PAGE_SIZE) {
+            let hash = hash_page_tokens(chunk);
+            if let Some(edge) = current.children.get_mut(&hash) {
+                edge.node.last_access = Instant::now();
+                edge.node.ref_count += 1;
+                matched_pages.push(edge.node.page_id.unwrap());
+                current = &mut edge.node;
+            } else {
+                break;  // divergence point
+            }
+        }
+        
+        let matched_tokens = matched_pages.len() * PAGE_SIZE;
+        PrefixMatch {
+            pages: matched_pages,
+            matched_tokens,
+            remaining_tokens: &tokens[matched_tokens..],
+        }
+    }
+    
+    /// Insert new pages after computing KV for unmatched suffix.
+    pub fn insert(&mut self, tokens: &[TokenId], pages: &[PageId]) {
+        let mut current = &mut self.root;
+        
+        for (chunk, &page_id) in tokens.chunks(PAGE_SIZE).zip(pages) {
+            let hash = hash_page_tokens(chunk);
+            let edge = current.children.entry(hash).or_insert_with(|| {
+                Box::new(RadixEdge {
+                    token_hash: hash,
+                    node: RadixNode {
+                        children: HashMap::new(),
+                        page_id: Some(page_id),
+                        last_access: Instant::now(),
+                        ref_count: 1,
+                    },
+                })
+            });
+            current = &mut edge.node;
+        }
+    }
+    
+    /// Evict least-recently-used leaf nodes (ref_count == 0).
+    /// Returns freed page IDs.
+    pub fn evict_lru(&mut self, num_pages_needed: usize) -> Vec<PageId> {
+        // Walk tree, collect leaves with ref_count == 0, sort by last_access
+        // Remove oldest leaves until we have enough pages
+        // ...
+    }
+}
+
+pub struct PrefixMatch<'a> {
+    /// Pages that can be reused (KV already computed).
+    pub pages: Vec<PageId>,
+    /// Number of tokens covered by cached pages.
+    pub matched_tokens: usize,
+    /// Remaining tokens that need prefill computation.
+    pub remaining_tokens: &'a [TokenId],
+}
+```
+
+### 39.3 Why Page-Granularity Radix (Not Token-Granularity)
+
+| | Token-level (SGLang) | Page-level (ours) |
+|---|---|---|
+| Sharing precision | Exact token boundary | 16-token boundary |
+| Wasted compute on mismatch | 0 tokens | Up to 15 tokens |
+| Tree depth for 4K context | 4096 nodes | 256 nodes |
+| Memory per node | ~40 bytes × 4096 = 160KB | ~40 bytes × 256 = 10KB |
+| Lookup speed | 4096 hash lookups | 256 hash lookups |
+| Kernel compatibility | Needs per-token gather | Page-aligned gather (vectorized) |
+
+For our coding agent use case (system prompt 4K + tools 2K + conversation):
+- Shared prefix ~6K tokens = 384 pages → always page-aligned (no waste)
+- Divergence point is where conversation differs → at most 15 tokens recomputed extra
+- Net saving: massive. Net waste: negligible.
+
+### 39.4 ONNX Attention Op Compatibility
+
+**The core problem:** ONNX attention ops (and most ONNX models) expect KV cache as contiguous tensors:
+
+```
+Input:  past_key_values.N.key   shape [batch, heads, seq_len, head_dim]
+Output: present_key_values.N.key shape [batch, heads, seq_len+1, head_dim]
+```
+
+But our paged cache stores KV in non-contiguous pages scattered across GPU memory. How do we bridge this?
+
+#### Option A: Gather Before Forward, Scatter After (Current Design)
+
+```rust
+/// Before each forward pass: gather pages → contiguous tensor for ONNX model.
+/// After forward: scatter new KV back to page.
+pub fn prepare_kv_for_onnx(
+    page_table: &PageTable,
+    session_pages: &[PageId],
+    pool: &PagePool,
+) -> OrtValue {
+    // Allocate contiguous buffer: [1, heads, total_tokens, head_dim]
+    let total_tokens = session_pages.len() * PAGE_SIZE;
+    let mut buffer = allocate_tensor(total_tokens, num_heads, head_dim);
+    
+    // Gather: copy each page's data into the contiguous buffer
+    for (i, &page_id) in session_pages.iter().enumerate() {
+        let page_data = pool.get_page_data(page_id);
+        let offset = i * PAGE_SIZE;
+        buffer[offset..offset + PAGE_SIZE].copy_from(page_data);
+        // This is a GPU memcpy (device-to-device), fast for page_size=16
+    }
+    
+    buffer.into_ort_value()
+}
+
+/// After forward: only the NEW token's KV needs to be written back.
+pub fn scatter_new_kv(
+    output_kv: &OrtValue,  // [1, heads, seq_len+1, head_dim]
+    page_table: &mut PageTable,
+    pool: &mut PagePool,
+    new_token_position: usize,
+) {
+    // Extract only the last position (the newly generated token's KV)
+    let new_kv_slice = output_kv.slice(/*seq_pos=*/new_token_position);
+    
+    // Write to the appropriate page
+    let page_idx = new_token_position / PAGE_SIZE;
+    let offset_in_page = new_token_position % PAGE_SIZE;
+    pool.write_to_page(page_table.pages[page_idx], offset_in_page, new_kv_slice);
+}
+```
+
+**Compatibility:** ✅ Works with ANY ONNX model. No model changes needed.
+
+**Cost:** One gather per forward pass. For decode (1 new token), the gather copies all existing KV pages into a contiguous buffer. This is O(seq_len) memcpy per step.
+
+**Optimization — Incremental gather:**
+```rust
+/// Optimization: maintain a "shadow" contiguous buffer.
+/// Only copy new pages; existing pages already in buffer from last step.
+pub struct IncrementalKvBuffer {
+    /// Contiguous GPU buffer, grows as sequence grows.
+    buffer: GpuBuffer,
+    /// Pages already copied into buffer (no need to re-copy).
+    synced_pages: usize,
+}
+
+impl IncrementalKvBuffer {
+    /// Only copy pages added since last forward pass.
+    pub fn sync(&mut self, page_table: &PageTable, pool: &PagePool) {
+        for i in self.synced_pages..page_table.num_pages() {
+            let page_data = pool.get_page_data(page_table.pages[i]);
+            let offset = i * PAGE_SIZE * HEAD_DIM * NUM_HEADS * 2; // bytes
+            self.buffer.copy_from_device(page_data, offset);
+        }
+        self.synced_pages = page_table.num_pages();
+    }
+}
+```
+
+With incremental sync, decode steps only copy 1 page worth of data (16 tokens × head_dim × num_heads × 2 bytes ≈ a few KB). Negligible cost.
+
+#### Option B: IoBinding with Page Pointers (Advanced)
+
+ORT's IoBinding allows pre-binding GPU memory to inputs/outputs. We can bind our paged buffer directly:
+
+```rust
+/// Advanced: use IoBinding to point ORT directly at our page pool memory.
+/// Avoids the gather copy entirely for prefill.
+/// Only works if model's attention supports non-contiguous KV (custom op or Paged Attention).
+pub fn bind_paged_kv(
+    io_binding: &mut IoBinding,
+    page_table: &PageTable,
+    pool: &PagePool,
+) {
+    // Create a "view" tensor that maps to scattered pages
+    // This requires either:
+    // 1. A custom PagedAttention op in the ONNX model, OR
+    // 2. A GatherElements op in the model that takes page_table as input
+    
+    // For standard ONNX models: NOT POSSIBLE without model modification
+    // For custom models (Mobius-exported with paging support): POSSIBLE
+}
+```
+
+**Compatibility:** ❌ Requires model awareness of paging. Not compatible with vanilla ONNX models.
+
+#### Option C: ONNX Scatter/GatherElements in Graph (Hybrid)
+
+Mobius can export models with explicit paging support:
+
+```
+Model inputs:
+  - input_ids: [batch, 1]
+  - page_table: [batch, max_pages]           ← NEW: page indices
+  - kv_pool: [num_pages, heads, page_size, head_dim]  ← NEW: entire page pool
+  
+Inside model (attention layer):
+  1. GatherElements(kv_pool, page_table) → contiguous KV for this sequence
+  2. Attention(Q, K_gathered, V_gathered)
+  3. ScatterElements(new_kv, page_table, kv_pool) → write back to pool
+  
+Model outputs:
+  - logits: [batch, vocab]
+  - kv_pool: [num_pages, heads, page_size, head_dim]  ← updated pool
+```
+
+**Compatibility:** Requires Mobius to export in this format. Standard HuggingFace ONNX exports won't have this.
+
+**Benefit:** Zero-copy. The model operates directly on the page pool. No gather/scatter in the runtime.
+
+**ONNX ops used:**
+- `GatherElements` (opset 11+) — read from pool by page indices
+- `ScatterElements` (opset 16+, with reduction) — write back to pool
+
+Both are standard ONNX ops. No custom ops needed. The "paging" is expressed purely through standard ops.
+
+### 39.5 Recommended Strategy
+
+```
+Phase 1 (now):     Option A with incremental gather
+                   Works with ALL existing ONNX models
+                   Cost: ~1 page memcpy per decode step (negligible)
+                   
+Phase 2 (medium):  Option C for Mobius-exported models
+                   Zero-copy paged attention via GatherElements/ScatterElements
+                   Huge win for long contexts (no O(seq_len) gather)
+                   Falls back to Option A for non-Mobius models
+
+Phase 3 (future):  Custom PagedAttention ONNX op
+                   Like FlashAttention but paging-aware
+                   Maximum performance, requires ORT EP support
+```
+
+### 39.6 Scatter/Gather Cost Analysis
+
+For Option A (incremental gather), actual cost per decode step:
+
+```
+Copy size per step = page_size × head_dim × num_heads × 2(K+V) × dtype_bytes
+                   = 16 × 128 × 32 × 2 × 2 (FP16)
+                   = 262,144 bytes = 256 KB
+
+GPU memory bandwidth: ~2 TB/s (A100)
+Time: 256KB / 2TB/s = 0.000128 ms = 0.128 μs
+```
+
+**Essentially free.** Even for prefill (gathering all pages at once):
+```
+4096 tokens = 256 pages → 256 × 256KB = 64MB
+Time: 64MB / 2TB/s = 0.032 ms
+```
+
+Prefill compute for 4096 tokens takes ~50-200ms. The 0.032ms gather is 0.02% of prefill time. Not worth optimizing until contexts are 100K+ tokens.
+
+### 39.7 Radix Tree + Paged Cache Integration
+
+```
+┌─────────────────────────────────────────┐
+│              Radix Tree                   │
+│         (prefix discovery index)          │
+│                                           │
+│    [root]                                 │
+│     ├─[sys_prompt_page_0]──page#42       │
+│     │  ├─[sys_prompt_page_1]──page#43    │
+│     │  │  ├─...──page#44                 │
+│     │  │  │  ├─[agent_A_conv]──page#100  │  ← Agent A diverges here
+│     │  │  │  └─[agent_B_conv]──page#200  │  ← Agent B diverges here
+│     │  │  │                               │
+│                                           │
+│  Pages #42-#44 shared (ref_count=2)      │
+│  Page #100 owned by Agent A (ref_count=1)│
+│  Page #200 owned by Agent B (ref_count=1)│
+└─────────────────────────────────────────┘
+           │
+           ▼
+┌─────────────────────────────────────────┐
+│            Page Pool (GPU)               │
+│  [page#42][page#43][page#44]...[page#N] │
+│  Each page: [heads, 16, head_dim] FP16  │
+└─────────────────────────────────────────┘
+```
+
+Workflow for a new request:
+1. Tokenize prompt → `[t0, t1, ..., t4095]`
+2. Walk radix tree → match first 384 pages (6144 tokens of system prompt + tools)
+3. Only compute prefill for remaining tokens (the new conversation part)
+4. Insert new pages into radix tree for future sharing
+5. On decode: incremental gather (1 new page's worth of memcpy), run model, scatter back
+
+### 39.8 Eviction with Reference Counting
+
+```rust
+impl RadixTree {
+    /// Release a sequence's claim on its prefix path.
+    /// Decrements ref_count along the path. Leaves with ref_count=0 are eviction candidates.
+    pub fn release_sequence(&mut self, token_path: &[TokenId]) {
+        let mut current = &mut self.root;
+        for chunk in token_path.chunks(PAGE_SIZE) {
+            let hash = hash_page_tokens(chunk);
+            if let Some(edge) = current.children.get_mut(&hash) {
+                edge.node.ref_count = edge.node.ref_count.saturating_sub(1);
+                current = &mut edge.node;
+            } else {
+                break;
+            }
+        }
+    }
+    
+    /// Evict: remove leaf nodes with ref_count=0, LRU order.
+    /// Frees pages back to the page pool.
+    /// Never evicts internal nodes (they have children depending on them).
+    pub fn evict_leaves(&mut self, pages_needed: usize) -> Vec<PageId> {
+        let mut freed = Vec::new();
+        // BFS/DFS to find evictable leaves, sorted by last_access
+        // Remove from tree + return page_id to free pool
+        // Stop when enough pages freed
+        freed
+    }
+}
+```
+
+**Key invariant:** A node is only evictable if:
+1. `ref_count == 0` (no active sequence uses it)
+2. It's a leaf (no children depend on it)
+
+Internal nodes with ref_count=0 but with children are NOT evicted — their children still need the prefix path.
+
+### 39.9 Metrics
+
+```
+# Radix tree
+onnx_genai_radix_tree_nodes              gauge     # total nodes in tree
+onnx_genai_radix_tree_depth_max          gauge     # deepest path (longest cached sequence)
+onnx_genai_radix_tree_shared_pages       gauge     # pages with ref_count > 1
+onnx_genai_radix_tree_prefix_match_tokens histogram # tokens matched per lookup
+onnx_genai_radix_tree_evictions_total    counter   # leaf evictions
+
+# Gather/scatter cost
+onnx_genai_kv_gather_bytes_total         counter   # bytes gathered for model input
+onnx_genai_kv_gather_seconds             histogram # gather time per forward pass
+onnx_genai_kv_scatter_bytes_total        counter   # bytes scattered after forward
+```
