@@ -113,7 +113,7 @@ impl PipelineEngine {
     pub fn generate_with_callback(
         &mut self,
         pipeline_request: PipelineGenerateRequest,
-        mut callback: Option<&mut GenerateTokenCallback<'_>>,
+        callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
         let mut options = pipeline_request.request.options.clone();
         options.validate()?;
@@ -164,7 +164,7 @@ impl PipelineEngine {
             &chain,
             tokenizer,
             None,
-            callback.as_deref_mut(),
+            callback,
         )
     }
 
@@ -192,7 +192,7 @@ impl PipelineEngine {
             let outputs = session
                 .run(&refs)
                 .map_err(|e| anyhow::anyhow!("ORT pipeline component '{component}' failed: {e}"))?;
-            for (name, value) in session.output_names().iter().zip(outputs.into_iter()) {
+            for (name, value) in session.output_names().iter().zip(outputs) {
                 tensors.insert(format!("{component}.{name}"), value);
             }
         }

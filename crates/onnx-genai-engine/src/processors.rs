@@ -201,8 +201,8 @@ fn tokenizer_token_texts(tokenizer: &Tokenizer) -> Vec<Option<String>> {
     let vocab = tokenizer.inner().get_vocab(true);
     let max_id = vocab.values().copied().max().unwrap_or(0) as usize;
     let mut token_texts = vec![None; max_id + 1];
-    for id in 0..=max_id {
-        token_texts[id] = tokenizer.decode(&[id as TokenId]).ok();
+    for (id, token_text) in token_texts.iter_mut().enumerate() {
+        *token_text = tokenizer.decode(&[id as TokenId]).ok();
     }
     token_texts
 }

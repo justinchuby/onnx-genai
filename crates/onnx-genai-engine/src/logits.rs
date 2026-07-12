@@ -896,10 +896,10 @@ impl LogitProcessor for PresencePenaltyProcessor {
 
         let mut seen = HashSet::new();
         for &token_id in &context.generated_tokens {
-            if seen.insert(token_id) {
-                if let Some(logit) = logits.get_mut(token_id as usize) {
-                    *logit -= self.presence_penalty;
-                }
+            if seen.insert(token_id)
+                && let Some(logit) = logits.get_mut(token_id as usize)
+            {
+                *logit -= self.presence_penalty;
             }
         }
     }

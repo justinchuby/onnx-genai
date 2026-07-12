@@ -181,10 +181,10 @@ impl Engine {
             SpeculativeMode::None if draft.is_some() => SpeculativeMode::DraftModel,
             mode => mode,
         };
-        if let SpeculativeMode::PromptLookup { ngram, max_tokens } = &speculative_mode {
-            if *ngram == 0 || *max_tokens == 0 {
-                anyhow::bail!("prompt-lookup ngram and max_tokens must be greater than zero");
-            }
+        if let SpeculativeMode::PromptLookup { ngram, max_tokens } = &speculative_mode
+            && (*ngram == 0 || *max_tokens == 0)
+        {
+            anyhow::bail!("prompt-lookup ngram and max_tokens must be greater than zero");
         }
         let mtp = if let SpeculativeMode::Mtp(mtp_config) = &speculative_mode {
             crate::config::validate_mtp_config(mtp_config)?;
@@ -316,11 +316,10 @@ impl Engine {
     pub fn generate_with_callback(
         &mut self,
         request: GenerateRequest,
-        mut callback: Option<&mut GenerateTokenCallback<'_>>,
+        callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
         let session_id = self.create_session()?;
-        let result =
-            self.generate_in_session_with_callback(session_id, request, callback.as_deref_mut());
+        let result = self.generate_in_session_with_callback(session_id, request, callback);
         let close_result = self.close_session(session_id);
         match (result, close_result) {
             (Ok(result), Ok(())) => Ok(result),
@@ -353,13 +352,13 @@ impl Engine {
         &mut self,
         session_id: SessionId,
         request: GenerateRequest,
-        mut callback: Option<&mut GenerateTokenCallback<'_>>,
+        callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
         self.generate_in_session_with_priority_and_callback(
             session_id,
             request,
             Priority::Normal,
-            callback.as_deref_mut(),
+            callback,
         )
     }
 

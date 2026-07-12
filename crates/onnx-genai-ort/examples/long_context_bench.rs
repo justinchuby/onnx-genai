@@ -286,13 +286,13 @@ fn print_buckets(buckets: &[Bucket]) {
 }
 
 fn argmax(logits: &Value) -> onnx_genai_ort::Result<usize> {
-    Ok(logits
+    logits
         .to_vec_f32()?
         .iter()
         .enumerate()
         .max_by(|(_, left), (_, right)| left.total_cmp(right))
         .map(|(index, _)| index)
-        .ok_or_else(|| invalid("empty logits"))?)
+        .ok_or_else(|| invalid("empty logits"))
 }
 
 fn maybe_sample_rss(

@@ -34,9 +34,10 @@ pub struct MtpConfig {
 }
 
 /// Built-in speculative candidate source.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum SpeculativeMode {
     /// Disable speculative decoding.
+    #[default]
     None,
     /// Propose tokens with the configured draft model.
     DraftModel,
@@ -49,12 +50,6 @@ pub enum SpeculativeMode {
     },
     /// Propose from a target hidden state with an external MTP head.
     Mtp(MtpConfig),
-}
-
-impl Default for SpeculativeMode {
-    fn default() -> Self {
-        Self::None
-    }
 }
 
 /// Identifier for a persistent generation session.

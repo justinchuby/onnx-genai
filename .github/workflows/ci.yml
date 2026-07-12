@@ -27,8 +27,6 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Run clippy
-        # TODO: make blocking once the existing workspace clippy warnings are cleared.
-        continue-on-error: true
         run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Build workspace

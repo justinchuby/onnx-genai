@@ -121,7 +121,7 @@ pub(crate) fn commit_selected_token(
     options: &GenerateOptions,
     chain: &ProcessorChain,
     tokenizer: &Tokenizer,
-    mut callback: Option<&mut GenerateTokenCallback<'_>>,
+    callback: Option<&mut GenerateTokenCallback<'_>>,
 ) -> anyhow::Result<Option<FinishReason>> {
     state.generated_tokens.push(token_id);
     let token_text = tokenizer
@@ -135,7 +135,7 @@ pub(crate) fn commit_selected_token(
         step: state.step,
     };
     let finish_reason = finish_reason_after_token(token_id, options, chain, &context);
-    if let Some(callback) = callback.as_deref_mut() {
+    if let Some(callback) = callback {
         callback(GenerateToken {
             token_id,
             text: token_text,

@@ -99,7 +99,7 @@ enum DriverCommand {
     },
     Generate {
         session_id: Option<SessionId>,
-        request: GenerateRequest,
+        request: Box<GenerateRequest>,
         events: mpsc::Sender<DriverEvent>,
         permit: OwnedSemaphorePermit,
     },
@@ -195,7 +195,7 @@ impl EngineDriver {
         self.commands
             .send(DriverCommand::Generate {
                 session_id,
-                request,
+                request: Box::new(request),
                 events,
                 permit,
             })
@@ -259,7 +259,7 @@ fn run_static_engine_driver(
                     &mut rx,
                     &mut deferred,
                     max_batch,
-                    request,
+                    *request,
                     events,
                     permit,
                 );
@@ -310,7 +310,7 @@ fn run_static_batch_until_idle(
                     &mut manager,
                     &mut routes,
                     &mut abandoned,
-                    request,
+                    *request,
                     events,
                     permit,
                 ),
@@ -371,10 +371,8 @@ fn route_continuous_events(
                 let delivery_failed = routes
                     .get(&handle.id)
                     .is_some_and(|route| route.events.try_send(DriverEvent::Token(token)).is_err());
-                if delivery_failed {
-                    if let Some(route) = routes.remove(&handle.id) {
-                        abandoned.insert(handle.id, route._permit);
-                    }
+                if delivery_failed && let Some(route) = routes.remove(&handle.id) {
+                    abandoned.insert(handle.id, route._permit);
                 }
             }
             ContinuousBatchEvent::Finished { handle, result } => {
@@ -410,7 +408,7 @@ fn handle_driver_command(engine: &mut Engine, command: DriverCommand) {
             request,
             events,
             permit,
-        } => run_fallback_generation(engine, session_id, request, events, permit),
+        } => run_fallback_generation(engine, session_id, *request, events, permit),
     }
 }
 
@@ -2115,7 +2113,7 @@ mod tests {
             .commands
             .send(DriverCommand::Generate {
                 session_id: None,
-                request: build_generate_request(&slow_request),
+                request: Box::new(build_generate_request(&slow_request)),
                 events: slow_tx,
                 permit: slow_permit,
             })
