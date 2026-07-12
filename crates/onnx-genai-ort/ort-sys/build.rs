@@ -79,7 +79,11 @@ fn find_ort_root() -> PathBuf {
     // 2. ORT_ROOT — explicit installation root
     if let Ok(root) = env::var("ORT_ROOT") {
         let root_path = PathBuf::from(&root);
-        if root_path.join("include").join("onnxruntime_c_api.h").exists() {
+        if root_path
+            .join("include")
+            .join("onnxruntime_c_api.h")
+            .exists()
+        {
             return root_path;
         }
         panic!(
@@ -104,7 +108,11 @@ fn find_ort_root() -> PathBuf {
 
     // 4. Auto-download prebuilt
     let download_dir = PathBuf::from(env::var("OUT_DIR").unwrap()).join("ort-prebuilt");
-    if download_dir.join("include").join("onnxruntime_c_api.h").exists() {
+    if download_dir
+        .join("include")
+        .join("onnxruntime_c_api.h")
+        .exists()
+    {
         return download_dir;
     }
 
@@ -160,7 +168,10 @@ fn download_prebuilt(target_dir: &Path) {
             panic!("Failed to extract ORT archive");
         }
         // Rename extracted directory
-        let extracted = target_dir.parent().unwrap().join(format!("onnxruntime-{}-{}", os, ORT_VERSION));
+        let extracted = target_dir
+            .parent()
+            .unwrap()
+            .join(format!("onnxruntime-{}-{}", os, ORT_VERSION));
         if extracted.exists() {
             std::fs::rename(&extracted, target_dir).unwrap();
         }
@@ -175,7 +186,10 @@ fn download_prebuilt(target_dir: &Path) {
         if !status.success() {
             panic!("Failed to extract ORT archive");
         }
-        let extracted = target_dir.parent().unwrap().join(format!("onnxruntime-{}-{}", os, ORT_VERSION));
+        let extracted = target_dir
+            .parent()
+            .unwrap()
+            .join(format!("onnxruntime-{}-{}", os, ORT_VERSION));
         if extracted.exists() {
             std::fs::rename(&extracted, target_dir).unwrap();
         }
