@@ -1,0 +1,104 @@
+use axum::{
+    body::{Body, to_bytes},
+    http::{Request, StatusCode, header},
+};
+use onnx_genai_server::{AppState, app};
+use serde_json::{Value, json};
+use std::path::PathBuf;
+use tower::ServiceExt;
+
+fn fixture_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm")
+}
+
+async fn test_app() -> axum::Router {
+    let state = AppState::load(&fixture_dir(), Some("tiny-llm".to_string())).unwrap();
+    app(state)
+}
+
+#[tokio::test]
+async fn health_returns_loaded_model() {
+    let app = test_app().await;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/health")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["status"], "ok");
+    assert_eq!(json["model"], "tiny-llm");
+}
+
+#[tokio::test]
+async fn chat_completions_returns_openai_shape() {
+    let app = test_app().await;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "tiny-llm",
+                        "messages": [{"role": "user", "content": "hello"}],
+                        "max_tokens": 1
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["object"], "chat.completion");
+    assert_eq!(json["model"], "tiny-llm");
+    assert_eq!(json["choices"][0]["index"], 0);
+    assert_eq!(json["choices"][0]["message"]["role"], "assistant");
+    assert!(json["choices"][0]["message"]["content"].is_string());
+    assert!(json["choices"][0]["finish_reason"].is_string());
+}
+
+#[tokio::test]
+async fn streaming_chat_completions_returns_sse_chunks() {
+    let app = test_app().await;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "tiny-llm",
+                        "messages": [{"role": "user", "content": "hello"}],
+                        "max_tokens": 1,
+                        "stream": true
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get(header::CONTENT_TYPE).unwrap(),
+        "text/event-stream"
+    );
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let text = String::from_utf8(body.to_vec()).unwrap();
+    assert!(text.contains("chat.completion.chunk"), "{text}");
+    assert!(text.contains("[DONE]"), "{text}");
+}

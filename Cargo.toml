@@ -29,6 +29,7 @@ onnx-genai-ort = { path = "crates/onnx-genai-ort" }
 # External
 tokenizers = "0.21"
 tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
 axum = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -38,3 +39,4 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "2"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+tower = { version = "0.5", features = ["util"] }

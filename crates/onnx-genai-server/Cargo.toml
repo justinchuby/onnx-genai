@@ -15,3 +15,8 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
+clap = { workspace = true, features = ["env"] }
+tokio-stream = { workspace = true }
+
+[dev-dependencies]
+tower = { workspace = true }
