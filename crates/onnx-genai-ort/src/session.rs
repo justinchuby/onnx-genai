@@ -10,6 +10,7 @@ use crate::{Allocator, DataType, Environment, IoBinding, OrtError, Result, Value
 #[derive(Debug, Clone)]
 pub enum ExecutionProvider {
     Cpu,
+    WebGpu,
     Cuda { device_id: i32 },
     DirectML { device_id: i32 },
     CoreML,
@@ -32,6 +33,16 @@ pub struct SessionOptions {
 
 impl Default for SessionOptions {
     fn default() -> Self {
+        let mut options = Self::cpu();
+        if let Some(execution_providers) = execution_providers_from_env() {
+            options.execution_providers = execution_providers;
+        }
+        options
+    }
+}
+
+impl SessionOptions {
+    fn cpu() -> Self {
         Self {
             execution_providers: vec![ExecutionProvider::Cpu],
             optimization_level: 99,
@@ -39,6 +50,54 @@ impl Default for SessionOptions {
             inter_op_num_threads: 0,
         }
     }
+
+    /// Create default session options with a single explicit execution provider.
+    pub fn with_execution_provider(provider: ExecutionProvider) -> Self {
+        Self {
+            execution_providers: vec![provider],
+            ..Self::cpu()
+        }
+    }
+}
+
+/// Return the execution providers reported by the linked ONNX Runtime build.
+pub fn available_execution_providers() -> Result<Vec<String>> {
+    let api = crate::error::api()?;
+    let get_available = api
+        .GetAvailableProviders
+        .ok_or(OrtError::ApiUnavailable("GetAvailableProviders"))?;
+    let release_available = api
+        .ReleaseAvailableProviders
+        .ok_or(OrtError::ApiUnavailable("ReleaseAvailableProviders"))?;
+    let mut providers_ptr = std::ptr::null_mut();
+    let mut provider_count = 0;
+
+    // SAFETY: `providers_ptr` and `provider_count` are valid out-parameters.
+    crate::error::check_status(unsafe { get_available(&mut providers_ptr, &mut provider_count) })?;
+    if providers_ptr.is_null() {
+        return Ok(Vec::new());
+    }
+
+    let providers = (|| {
+        let mut providers = Vec::with_capacity(provider_count as usize);
+        for index in 0..provider_count as isize {
+            // SAFETY: ORT returned an array with `provider_count` C string entries.
+            let ptr = unsafe { *providers_ptr.offset(index) };
+            if !ptr.is_null() {
+                // SAFETY: ORT provider names are NUL-terminated strings.
+                providers.push(
+                    unsafe { CStr::from_ptr(ptr) }
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+            }
+        }
+        Ok(providers)
+    })();
+
+    // SAFETY: releases the array returned by `GetAvailableProviders` exactly once.
+    crate::error::check_status(unsafe { release_available(providers_ptr, provider_count) })?;
+    providers
 }
 
 /// Tensor metadata for a model input or output.
@@ -80,14 +139,35 @@ impl Session {
             .ok_or(OrtError::ApiUnavailable("CreateSession"))?;
         // SAFETY: `env` and `session_options` are valid ORT handles, `path_c` is
         // NUL-terminated for the duration of the call, and `ptr` is an out-param.
-        crate::error::check_status(unsafe {
+        let create_result = crate::error::check_status(unsafe {
             create(
                 env.as_ptr(),
                 path_c.as_ptr(),
                 session_options.as_ptr(),
                 &mut ptr,
             )
-        })?;
+        });
+        if let Err(err) = create_result {
+            if requested_non_cpu_provider(&options) {
+                tracing::warn!(
+                    "ORT session creation failed with requested execution provider(s): {err}; retrying with CPU"
+                );
+                let cpu_options = SessionOptions::cpu();
+                let cpu_session_options = RawSessionOptions::new(&cpu_options)?;
+                ptr = std::ptr::null_mut();
+                // SAFETY: same invariants as above, with fresh CPU-only options.
+                crate::error::check_status(unsafe {
+                    create(
+                        env.as_ptr(),
+                        path_c.as_ptr(),
+                        cpu_session_options.as_ptr(),
+                        &mut ptr,
+                    )
+                })?;
+            } else {
+                return Err(err);
+            }
+        }
         let ptr = NonNull::new(ptr).ok_or(OrtError::NullPointer)?;
         let inputs = query_io(ptr.as_ptr(), IoKind::Input)?;
         let outputs = query_io(ptr.as_ptr(), IoKind::Output)?;
@@ -283,16 +363,6 @@ struct RawSessionOptions {
 
 impl RawSessionOptions {
     fn new(options: &SessionOptions) -> Result<Self> {
-        if options
-            .execution_providers
-            .iter()
-            .any(|provider| !matches!(provider, ExecutionProvider::Cpu))
-        {
-            return Err(OrtError::InvalidArgument(
-                "only the CPU execution provider is wired in Phase 1".into(),
-            ));
-        }
-
         let api = crate::error::api()?;
         let create = api
             .CreateSessionOptions
@@ -331,12 +401,164 @@ impl RawSessionOptions {
             })?;
         }
 
+        append_execution_providers(this.ptr.as_ptr(), options)?;
+
         Ok(this)
     }
 
     fn as_ptr(&self) -> *const onnx_genai_ort_sys::OrtSessionOptions {
         self.ptr.as_ptr()
     }
+}
+
+fn execution_providers_from_env() -> Option<Vec<ExecutionProvider>> {
+    let value = std::env::var("ONNX_GENAI_EP").ok()?;
+    let provider = match value.trim().to_ascii_lowercase().as_str() {
+        "" | "cpu" => ExecutionProvider::Cpu,
+        "webgpu" | "web-gpu" | "web_gpu" => ExecutionProvider::WebGpu,
+        "coreml" | "core-ml" | "core_ml" => ExecutionProvider::CoreML,
+        other => {
+            tracing::warn!(
+                "Ignoring unsupported ONNX_GENAI_EP={other}; expected cpu, webgpu, or coreml"
+            );
+            ExecutionProvider::Cpu
+        }
+    };
+    Some(vec![provider])
+}
+
+fn requested_non_cpu_provider(options: &SessionOptions) -> bool {
+    options
+        .execution_providers
+        .iter()
+        .any(|provider| !matches!(provider, ExecutionProvider::Cpu))
+}
+
+fn append_execution_providers(
+    session_options: *mut onnx_genai_ort_sys::OrtSessionOptions,
+    options: &SessionOptions,
+) -> Result<()> {
+    let available = available_execution_providers().unwrap_or_else(|err| {
+        tracing::warn!("Could not query available ORT execution providers: {err}");
+        Vec::new()
+    });
+    for provider in &options.execution_providers {
+        append_execution_provider(session_options, provider, &available)?;
+    }
+    Ok(())
+}
+
+fn append_execution_provider(
+    session_options: *mut onnx_genai_ort_sys::OrtSessionOptions,
+    provider: &ExecutionProvider,
+    available: &[String],
+) -> Result<()> {
+    match provider {
+        ExecutionProvider::Cpu => Ok(()),
+        ExecutionProvider::WebGpu => append_named_execution_provider(
+            session_options,
+            "WebGPU",
+            "WebGpuExecutionProvider",
+            &[],
+            available,
+        ),
+        ExecutionProvider::CoreML => append_named_execution_provider(
+            session_options,
+            "CoreML",
+            "CoreMLExecutionProvider",
+            &[],
+            available,
+        ),
+        other => {
+            tracing::warn!(
+                "Execution provider {:?} is not wired in onnx-genai-ort; falling back to CPU",
+                other
+            );
+            Ok(())
+        }
+    }
+}
+
+fn append_named_execution_provider(
+    session_options: *mut onnx_genai_ort_sys::OrtSessionOptions,
+    api_name: &str,
+    provider_name: &str,
+    provider_options: &[(&str, &str)],
+    available: &[String],
+) -> Result<()> {
+    if !provider_is_available(provider_name, available) {
+        tracing::warn!(
+            "Requested ONNX Runtime execution provider {api_name} is unavailable in this build; falling back to CPU. Available providers: {:?}",
+            available
+        );
+        return Ok(());
+    }
+
+    let api = crate::error::api()?;
+    let append = api
+        .SessionOptionsAppendExecutionProvider
+        .ok_or(OrtError::ApiUnavailable(
+            "SessionOptionsAppendExecutionProvider",
+        ))?;
+    let api_name = CString::new(api_name)
+        .map_err(|_| OrtError::InvalidArgument("execution provider name contains NUL".into()))?;
+    let option_keys = provider_options
+        .iter()
+        .map(|(key, _)| {
+            CString::new(*key)
+                .map_err(|_| OrtError::InvalidArgument("provider option key contains NUL".into()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let option_values = provider_options
+        .iter()
+        .map(|(_, value)| {
+            CString::new(*value)
+                .map_err(|_| OrtError::InvalidArgument("provider option value contains NUL".into()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let option_key_ptrs = option_keys
+        .iter()
+        .map(|key| key.as_ptr())
+        .collect::<Vec<_>>();
+    let option_value_ptrs = option_values
+        .iter()
+        .map(|value| value.as_ptr())
+        .collect::<Vec<_>>();
+    // SAFETY: `session_options` is a valid mutable ORT session options handle,
+    // all C strings are NUL-terminated and live for the call, and the key/value
+    // arrays have `provider_options.len()` entries.
+    match crate::error::check_status(unsafe {
+        append(
+            session_options,
+            api_name.as_ptr(),
+            option_key_ptrs.as_ptr(),
+            option_value_ptrs.as_ptr(),
+            provider_options.len(),
+        )
+    }) {
+        Ok(()) => {
+            tracing::info!("Enabled ONNX Runtime execution provider {provider_name}");
+            Ok(())
+        }
+        Err(err) => {
+            tracing::warn!(
+                "Failed to enable ONNX Runtime execution provider {provider_name}: {err}; falling back to CPU"
+            );
+            Ok(())
+        }
+    }
+}
+
+fn provider_is_available(provider_name: &str, available: &[String]) -> bool {
+    available.iter().any(|provider| {
+        provider.eq_ignore_ascii_case(provider_name)
+            || provider
+                .strip_suffix("ExecutionProvider")
+                .is_some_and(|short| short.eq_ignore_ascii_case(provider_name))
+            || provider_name
+                .strip_suffix("ExecutionProvider")
+                .is_some_and(|short| short.eq_ignore_ascii_case(provider))
+    })
 }
 
 impl Drop for RawSessionOptions {

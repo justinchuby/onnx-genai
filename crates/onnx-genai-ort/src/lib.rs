@@ -29,6 +29,8 @@ pub use decode::{
 pub use env::Environment;
 pub use error::{OrtError, Result};
 pub use loader::{ModelDirectory, PipelineModelDirectory, PipelineModels, PipelineTokenizerPaths};
-pub use session::{Session, SessionOptions, TensorInfo};
+pub use session::{
+    ExecutionProvider, Session, SessionOptions, TensorInfo, available_execution_providers,
+};
 pub use tokenizer::Tokenizer;
 pub use value::{DataType, Value};
