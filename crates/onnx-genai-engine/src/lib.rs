@@ -21,6 +21,7 @@ pub mod sampling;
 pub(crate) mod session;
 pub mod speculative;
 
+pub use batched::{ContinuousBatchEvent, ContinuousBatchHandle, ContinuousBatchManager};
 pub use engine::{
     Engine, EngineConfig, FinishReason, GenerateConstraint, GenerateOptions, GeneratePrompt,
     GenerateRequest, GenerateResult, GenerateToken, GenerateTokenCallback,

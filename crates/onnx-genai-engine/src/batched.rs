@@ -12,6 +12,25 @@ use crate::logits::{ProcessorChain, ProcessorContext, TokenId};
 use crate::processors::{build_processor_chain, ensure_constrained_finish, select_next_token};
 use anyhow::Context;
 use onnx_genai_ort::{BatchedStaticCacheDecodeSession, StaticCacheDecodeOptions};
+use onnx_genai_ort::{Session, Tokenizer};
+use std::collections::VecDeque;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ContinuousBatchHandle {
+    pub id: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ContinuousBatchEvent {
+    Token {
+        handle: ContinuousBatchHandle,
+        token: crate::config::GenerateToken,
+    },
+    Finished {
+        handle: ContinuousBatchHandle,
+        result: GenerateResult,
+    },
+}
 
 struct BatchRow {
     result_index: usize,
@@ -33,6 +52,361 @@ impl BatchRow {
             generated_text: self.state.generated_text.clone(),
             step: self.state.step,
         }
+    }
+}
+
+struct PendingContinuousRequest {
+    handle: ContinuousBatchHandle,
+    prompt_tokens: Vec<TokenId>,
+    options: GenerateOptions,
+    chain: ProcessorChain,
+    max_context: Option<usize>,
+}
+
+struct ContinuousBatchRow {
+    handle: ContinuousBatchHandle,
+    physical_row: usize,
+    context_tokens: Vec<TokenId>,
+    options: GenerateOptions,
+    chain: ProcessorChain,
+    max_context: Option<usize>,
+    state: DecodeLoopState,
+    pending_logits: Option<Vec<f32>>,
+}
+
+impl ContinuousBatchRow {
+    fn processor_context(&self) -> ProcessorContext {
+        ProcessorContext {
+            prompt_tokens: self.context_tokens.clone(),
+            generated_tokens: self.state.generated_tokens.clone(),
+            generated_text: self.state.generated_text.clone(),
+            step: self.state.step,
+        }
+    }
+}
+
+/// Synchronous continuous-batch manager for STATIC-CACHE models.
+///
+/// Requests are submitted into a FIFO queue and admitted into a fixed number of
+/// physical decode rows. Each `step` samples one token for rows that have
+/// pending logits, emits token/result events, evicts finished rows, admits queued
+/// requests into freed slots, then prepares logits for the next step.
+pub struct ContinuousBatchManager<'a> {
+    decode: BatchedStaticCacheDecodeSession<'a>,
+    tokenizer: &'a Tokenizer,
+    metadata_max_context: Option<usize>,
+    static_max_len: usize,
+    queue: VecDeque<PendingContinuousRequest>,
+    rows: Vec<Option<ContinuousBatchRow>>,
+    events: VecDeque<ContinuousBatchEvent>,
+    next_handle: usize,
+}
+
+impl<'a> ContinuousBatchManager<'a> {
+    fn new(
+        session: &'a Session,
+        tokenizer: &'a Tokenizer,
+        metadata_max_context: Option<usize>,
+        max_batch: usize,
+    ) -> anyhow::Result<Self> {
+        if max_batch == 0 {
+            anyhow::bail!("continuous batch max_batch must be greater than zero");
+        }
+        let mut decode = BatchedStaticCacheDecodeSession::new(
+            session,
+            StaticCacheDecodeOptions {
+                batch_size: i64::try_from(max_batch).context("batch size exceeds i64")?,
+            },
+        )
+        .map_err(|e| anyhow::anyhow!("Failed to create continuous static-cache session: {}", e))?;
+        for row in 0..max_batch {
+            decode
+                .deactivate_row(row)
+                .map_err(|e| anyhow::anyhow!("Failed to initialize continuous row {row}: {e}"))?;
+        }
+        let static_max_len = decode.max_len();
+        Ok(Self {
+            decode,
+            tokenizer,
+            metadata_max_context,
+            static_max_len,
+            queue: VecDeque::new(),
+            rows: (0..max_batch).map(|_| None).collect(),
+            events: VecDeque::new(),
+            next_handle: 0,
+        })
+    }
+
+    /// Queue a request for the next available decode row.
+    pub fn submit(&mut self, request: GenerateRequest) -> anyhow::Result<ContinuousBatchHandle> {
+        let handle = ContinuousBatchHandle {
+            id: self.next_handle,
+        };
+        self.next_handle += 1;
+        request.options.validate()?;
+        let mut options = request.options;
+        if options.eos_token_id.is_none() {
+            options.eos_token_id = self.tokenizer.eos_token_id();
+        }
+        let prompt_tokens = match request.prompt {
+            GeneratePrompt::TokenIds(tokens) => tokens,
+            GeneratePrompt::Text(text) => self
+                .tokenizer
+                .encode(&text)
+                .map_err(|e| anyhow::anyhow!("Failed to tokenize prompt: {}", e))?,
+        };
+        if prompt_tokens.is_empty() {
+            anyhow::bail!("prompt must contain at least one token");
+        }
+        let max_context = self.max_context_for_request(&options);
+        let chain = build_processor_chain(&options, Some(self.tokenizer))?;
+        if reached_context_limit(prompt_tokens.len(), max_context) {
+            ensure_constrained_finish(&options, "", FinishReason::Length)?;
+            self.events.push_back(ContinuousBatchEvent::Finished {
+                handle,
+                result: finish_result(self.tokenizer, &[], FinishReason::Length, 0)?,
+            });
+            return Ok(handle);
+        }
+        self.queue.push_back(PendingContinuousRequest {
+            handle,
+            prompt_tokens,
+            options,
+            chain,
+            max_context,
+        });
+        Ok(handle)
+    }
+
+    /// Advance all rows with pending logits by one generated token.
+    pub fn step(&mut self) -> anyhow::Result<()> {
+        self.admit_available_rows()?;
+        let ready_rows = self
+            .rows
+            .iter()
+            .enumerate()
+            .filter_map(|(row_index, row)| {
+                row.as_ref()
+                    .and_then(|row| row.pending_logits.is_some().then_some(row_index))
+            })
+            .collect::<Vec<_>>();
+
+        for row_index in ready_rows {
+            let mut row = self.rows[row_index]
+                .take()
+                .context("ready continuous row disappeared")?;
+            let finished = self.advance_row(&mut row)?;
+            if finished {
+                self.decode
+                    .deactivate_row(row.physical_row)
+                    .map_err(|e| anyhow::anyhow!("Failed to deactivate continuous row: {}", e))?;
+            } else {
+                self.rows[row_index] = Some(row);
+            }
+        }
+
+        self.admit_available_rows()?;
+        self.decode_next_pending_rows()
+    }
+
+    /// Drain token/result events emitted by previous `submit` or `step` calls.
+    pub fn poll(&mut self) -> Vec<ContinuousBatchEvent> {
+        self.events.drain(..).collect()
+    }
+
+    pub fn max_batch(&self) -> usize {
+        self.rows.len()
+    }
+
+    pub fn pending_len(&self) -> usize {
+        self.queue.len()
+    }
+
+    pub fn active_len(&self) -> usize {
+        self.rows.iter().filter(|row| row.is_some()).count()
+    }
+
+    pub fn has_pending_work(&self) -> bool {
+        !self.queue.is_empty() || self.active_len() > 0
+    }
+
+    pub fn is_idle(&self) -> bool {
+        !self.has_pending_work() && self.events.is_empty()
+    }
+
+    fn max_context_for_request(&self, options: &GenerateOptions) -> Option<usize> {
+        let configured = self.metadata_max_context.or(options.max_context);
+        Some(configured.map_or(self.static_max_len, |limit| limit.min(self.static_max_len)))
+    }
+
+    fn admit_available_rows(&mut self) -> anyhow::Result<()> {
+        while !self.queue.is_empty() {
+            let Some(row_index) = self.rows.iter().position(|row| row.is_none()) else {
+                break;
+            };
+            let pending = self.queue.pop_front().expect("queue checked non-empty");
+            self.decode
+                .assign_row(row_index)
+                .map_err(|e| anyhow::anyhow!("Failed to assign continuous row: {}", e))?;
+            let mut row = ContinuousBatchRow {
+                handle: pending.handle,
+                physical_row: row_index,
+                context_tokens: pending.prompt_tokens,
+                options: pending.options,
+                chain: pending.chain,
+                max_context: pending.max_context,
+                state: DecodeLoopState::new(0),
+                pending_logits: None,
+            };
+            prefill_continuous_row(&mut self.decode, &mut row)?;
+            self.rows[row_index] = Some(row);
+        }
+        Ok(())
+    }
+
+    fn advance_row(&mut self, row: &mut ContinuousBatchRow) -> anyhow::Result<bool> {
+        let mut logits = row
+            .pending_logits
+            .take()
+            .context("active continuous row has no pending logits")?;
+        let token_id = select_next_token(
+            &mut logits,
+            &row.processor_context(),
+            &row.options,
+            &row.chain,
+            0.0,
+        );
+        row.context_tokens.push(token_id);
+
+        let mut emitted_token = None;
+        let mut callback = |token| {
+            emitted_token = Some(token);
+            Ok(())
+        };
+        let finish_reason = commit_selected_token(
+            &mut row.state,
+            row.context_tokens.clone(),
+            token_id,
+            &row.options,
+            &row.chain,
+            self.tokenizer,
+            Some(&mut callback),
+        )?;
+        if let Some(token) = emitted_token {
+            self.events.push_back(ContinuousBatchEvent::Token {
+                handle: row.handle,
+                token,
+            });
+        }
+
+        let finish_reason = match finish_reason {
+            Some(reason) => Some(reason),
+            None if row.state.generated_tokens.len() >= row.options.max_new_tokens => {
+                ensure_constrained_finish(
+                    &row.options,
+                    &row.state.generated_text,
+                    FinishReason::MaxTokens,
+                )?;
+                Some(FinishReason::MaxTokens)
+            }
+            None if reached_context_limit(row.context_tokens.len(), row.max_context) => {
+                ensure_constrained_finish(
+                    &row.options,
+                    &row.state.generated_text,
+                    FinishReason::Length,
+                )?;
+                Some(FinishReason::Length)
+            }
+            None => None,
+        };
+
+        if let Some(reason) = finish_reason {
+            self.events.push_back(ContinuousBatchEvent::Finished {
+                handle: row.handle,
+                result: finish_result(
+                    self.tokenizer,
+                    &row.state.generated_tokens,
+                    reason,
+                    row.state.prefix_cache_hit_len,
+                )?,
+            });
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    fn decode_next_pending_rows(&mut self) -> anyhow::Result<()> {
+        let advancing_rows = self
+            .rows
+            .iter()
+            .flatten()
+            .filter(|row| row.pending_logits.is_none())
+            .map(|row| row.physical_row)
+            .collect::<Vec<_>>();
+        if advancing_rows.is_empty() {
+            return Ok(());
+        }
+        let active_rows = self.decode.active_rows();
+        if advancing_rows.len() == active_rows.len() {
+            let mut input_ids = vec![0_i64; active_rows.len()];
+            let mut position_ids = vec![0_i64; active_rows.len()];
+            for (active_index, &logical_row) in active_rows.iter().enumerate() {
+                let row = self.rows[logical_row]
+                    .as_ref()
+                    .context("active continuous row is not assigned")?;
+                let token = *row
+                    .context_tokens
+                    .last()
+                    .context("continuous row has empty context")?;
+                input_ids[active_index] = i64::from(token);
+                position_ids[active_index] =
+                    self.decode.row_len(logical_row).map_err(|e| {
+                        anyhow::anyhow!("Failed to read continuous row length: {}", e)
+                    })? as i64;
+            }
+            let logits = self
+                .decode
+                .step_active(&input_ids, &position_ids)
+                .map_err(|e| {
+                    anyhow::anyhow!("Continuous active static-cache step failed: {}", e)
+                })?;
+            for (active_index, logical_row) in active_rows.into_iter().enumerate() {
+                let row = self.rows[logical_row]
+                    .as_mut()
+                    .context("active continuous row is not assigned")?;
+                row.pending_logits = Some(row_logits(&logits, active_index, 0)?);
+            }
+            return Ok(());
+        }
+
+        let mut input_ids = vec![0_i64; self.max_batch()];
+        let mut position_ids = vec![0_i64; self.max_batch()];
+        let mut advance_rows = vec![false; self.max_batch()];
+        for row in self.rows.iter().flatten() {
+            if row.pending_logits.is_none() {
+                let token = *row
+                    .context_tokens
+                    .last()
+                    .context("continuous row has empty context")?;
+                input_ids[row.physical_row] = i64::from(token);
+                position_ids[row.physical_row] =
+                    self.decode.row_len(row.physical_row).map_err(|e| {
+                        anyhow::anyhow!("Failed to read continuous row length: {}", e)
+                    })? as i64;
+                advance_rows[row.physical_row] = true;
+            }
+        }
+        let logits = self
+            .decode
+            .step_select(&input_ids, &position_ids, &advance_rows)
+            .map_err(|e| anyhow::anyhow!("Continuous static-cache decode step failed: {}", e))?;
+        for row in self.rows.iter_mut().flatten() {
+            if advance_rows[row.physical_row] {
+                row.pending_logits = Some(row_logits(&logits, row.physical_row, 0)?);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -184,6 +558,55 @@ impl Engine {
         collect_batch_results(results)
     }
 
+    /// Create a lower-level continuous-batch manager for incremental serving.
+    pub fn continuous_batch_manager(
+        &self,
+        max_batch: usize,
+    ) -> anyhow::Result<ContinuousBatchManager<'_>> {
+        if !matches!(self.decode_path, ModelDecodePath::StaticCache { .. }) {
+            anyhow::bail!(
+                "continuous batching requires a STATIC-CACHE model; past/present batching is deferred"
+            );
+        }
+        let metadata_max_context = self
+            .metadata
+            .model
+            .as_ref()
+            .and_then(|model| model.max_sequence_length);
+        ContinuousBatchManager::new(
+            &self.session,
+            &self.tokenizer,
+            metadata_max_context,
+            max_batch,
+        )
+    }
+
+    /// Run requests to completion through a dynamic continuous batch.
+    pub fn run_continuous_batch(
+        &mut self,
+        requests: Vec<GenerateRequest>,
+        max_batch: usize,
+    ) -> anyhow::Result<Vec<GenerateResult>> {
+        if requests.is_empty() {
+            return Ok(Vec::new());
+        }
+        let expected_results = requests.len();
+        let mut manager = self.continuous_batch_manager(max_batch)?;
+        let mut results = vec![None; expected_results];
+        for request in requests {
+            manager.submit(request)?;
+            collect_finished_events(manager.poll(), &mut results)?;
+        }
+        while results.iter().any(|result| result.is_none()) {
+            if !manager.has_pending_work() {
+                break;
+            }
+            manager.step()?;
+            collect_finished_events(manager.poll(), &mut results)?;
+        }
+        collect_batch_results(results)
+    }
+
     fn batched_max_context_for_request(&self, options: &GenerateOptions) -> Option<usize> {
         let configured = self
             .metadata
@@ -206,6 +629,43 @@ impl Engine {
             None => configured,
         }
     }
+}
+
+fn prefill_continuous_row(
+    decode: &mut BatchedStaticCacheDecodeSession<'_>,
+    row: &mut ContinuousBatchRow,
+) -> anyhow::Result<()> {
+    for offset in 0..row.context_tokens.len() {
+        let mut input_ids = vec![0_i64; decode.batch_size()];
+        let mut position_ids = vec![0_i64; decode.batch_size()];
+        let mut advance_rows = vec![false; decode.batch_size()];
+        input_ids[row.physical_row] = i64::from(row.context_tokens[offset]);
+        position_ids[row.physical_row] = decode
+            .row_len(row.physical_row)
+            .map_err(|e| anyhow::anyhow!("Failed to read continuous row length: {}", e))?
+            as i64;
+        advance_rows[row.physical_row] = true;
+        let logits = decode
+            .step_select(&input_ids, &position_ids, &advance_rows)
+            .map_err(|e| anyhow::anyhow!("Continuous static-cache prefill failed: {}", e))?;
+        row.pending_logits = Some(row_logits(&logits, row.physical_row, 0)?);
+    }
+    Ok(())
+}
+
+fn collect_finished_events(
+    events: Vec<ContinuousBatchEvent>,
+    results: &mut [Option<GenerateResult>],
+) -> anyhow::Result<()> {
+    for event in events {
+        if let ContinuousBatchEvent::Finished { handle, result } = event {
+            let slot = results
+                .get_mut(handle.id)
+                .with_context(|| format!("continuous handle {} is out of range", handle.id))?;
+            *slot = Some(result);
+        }
+    }
+    Ok(())
 }
 
 fn prefill_batched_rows(
