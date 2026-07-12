@@ -9,7 +9,10 @@ use crate::decode_loop::{
 };
 use crate::engine::Engine;
 use crate::logits::{ProcessorChain, ProcessorContext, TokenId};
-use crate::processors::{build_processor_chain, ensure_constrained_finish, select_next_token};
+use crate::processors::{
+    build_processor_chain, ensure_constrained_finish, select_next_token_with_rng,
+};
+use crate::sampling::SamplingRng;
 use anyhow::Context;
 use onnx_genai_ort::{BatchedStaticCacheDecodeSession, StaticCacheDecodeOptions};
 use onnx_genai_ort::{Session, Tokenizer};
@@ -248,6 +251,8 @@ impl<'a> ContinuousBatchManager<'a> {
             self.decode
                 .assign_row(row_index)
                 .map_err(|e| anyhow::anyhow!("Failed to assign continuous row: {}", e))?;
+            let rng = SamplingRng::for_row(pending.options.seed, row_index);
+            let loop_state = DecodeLoopState::with_rng(0, rng);
             let mut row = ContinuousBatchRow {
                 handle: pending.handle,
                 physical_row: row_index,
@@ -255,7 +260,7 @@ impl<'a> ContinuousBatchManager<'a> {
                 options: pending.options,
                 chain: pending.chain,
                 max_context: pending.max_context,
-                state: DecodeLoopState::new(0),
+                state: loop_state,
                 pending_logits: None,
             };
             prefill_continuous_row(&mut self.decode, &mut row)?;
@@ -269,12 +274,13 @@ impl<'a> ContinuousBatchManager<'a> {
             .pending_logits
             .take()
             .context("active continuous row has no pending logits")?;
-        let token_id = select_next_token(
+        let context = row.processor_context();
+        let token_id = select_next_token_with_rng(
             &mut logits,
-            &row.processor_context(),
+            &context,
             &row.options,
             &row.chain,
-            0.0,
+            &mut row.state.rng,
         );
         row.context_tokens.push(token_id);
 
@@ -462,14 +468,17 @@ impl Engine {
                 )?);
                 continue;
             }
+            let physical_row = rows.len();
+            let rng = SamplingRng::for_row(options.seed, physical_row);
+            let loop_state = DecodeLoopState::with_rng(0, rng);
             rows.push(BatchRow {
                 result_index,
-                physical_row: rows.len(),
+                physical_row,
                 context_tokens: prompt_tokens,
                 options,
                 chain,
                 max_context,
-                state: DecodeLoopState::new(0),
+                state: loop_state,
                 pending_logits: None,
                 active: true,
             });
@@ -495,12 +504,13 @@ impl Engine {
                     .pending_logits
                     .take()
                     .context("active batch row has no pending logits")?;
-                let token_id = select_next_token(
+                let context = row.processor_context();
+                let token_id = select_next_token_with_rng(
                     &mut logits,
-                    &row.processor_context(),
+                    &context,
                     &row.options,
                     &row.chain,
-                    0.0,
+                    &mut row.state.rng,
                 );
                 row.context_tokens.push(token_id);
 
@@ -768,4 +778,28 @@ fn collect_batch_results(
             result.with_context(|| format!("batch request {index} did not finish"))
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sampling::sample_categorical;
+
+    #[test]
+    fn per_row_sampling_is_seedable_and_independent() {
+        let options = GenerateOptions {
+            greedy: false,
+            ..Default::default()
+        };
+        let sequence = |row| {
+            let mut rng = SamplingRng::for_row(Some(99), row);
+            (0..32)
+                .map(|_| sample_categorical(&[0.0, 0.0, 0.0], rng.value_for(&options)))
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(sequence(0), sequence(0));
+        assert_eq!(sequence(1), sequence(1));
+        assert_ne!(sequence(0), sequence(1));
+    }
 }

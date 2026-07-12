@@ -16,6 +16,7 @@ use crate::processors::{
     build_processor_chain, ensure_constrained_finish, load_fim_config_from_model_dir,
     push_unique_stop_sequence,
 };
+use crate::sampling::SamplingRng;
 use crate::session::{ActiveGenerate, DraftModel, DraftSession, EngineSession};
 use anyhow::Context;
 use onnx_genai_kv::{KvCacheOps, PagedKvCache, PrefixCache};
@@ -411,7 +412,7 @@ impl Engine {
             .with_context(|| format!("session {session_id} not found"))?;
         let prefix_cache_hit_len =
             self.prepare_session_prefix(session_id, &mut state, &prompt_tokens)?;
-        let mut loop_state = DecodeLoopState::new(prefix_cache_hit_len);
+        let mut loop_state = DecodeLoopState::new(prefix_cache_hit_len, options.seed);
 
         let result = (|| -> anyhow::Result<GenerateResult> {
             if self.should_use_speculative(&options) {
@@ -424,6 +425,7 @@ impl Engine {
                     prefix_cache_hit_len,
                     &mut loop_state.generated_tokens,
                     &mut loop_state.generated_text,
+                    &mut loop_state.rng,
                     callback.as_deref_mut(),
                 );
             }
@@ -840,6 +842,7 @@ impl Engine {
             .with_context(|| format!("session {} not found", request.session_id))?;
         let prefix_cache_hit_len =
             self.prepare_session_prefix(request.session_id, &mut state, &prompt_tokens)?;
+        let rng = SamplingRng::new(options.seed);
         Ok(ActiveGenerate {
             session_id: request.session_id,
             state,
@@ -851,6 +854,7 @@ impl Engine {
             generated_tokens: Vec::new(),
             generated_text: String::new(),
             step: 0,
+            rng,
         })
     }
 
@@ -863,6 +867,7 @@ impl Engine {
             generated_text: std::mem::take(&mut active.generated_text),
             step: active.step,
             prefix_cache_hit_len: active.prefix_cache_hit_len,
+            rng: std::mem::replace(&mut active.rng, SamplingRng::new(Some(0))),
         };
         let step_result = {
             let mut backend = SessionDecodeLoopBackend {
@@ -886,6 +891,7 @@ impl Engine {
         active.generated_tokens = loop_state.generated_tokens;
         active.generated_text = loop_state.generated_text;
         active.step = loop_state.step;
+        active.rng = loop_state.rng;
         if step_result.is_some() {
             return Ok(step_result);
         }

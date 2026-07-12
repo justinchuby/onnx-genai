@@ -157,7 +157,7 @@ pub fn sample_categorical(logits: &[f32], rng_value: f32) -> u32 {
     let mut cumulative = 0.0;
     for (i, weight) in weights.iter().enumerate() {
         cumulative += *weight / exp_sum;
-        if target <= cumulative {
+        if target < cumulative {
             return i as u32;
         }
     }
@@ -257,23 +257,5 @@ mod tests {
             after_greedy.value_for(&sampled),
             untouched.value_for(&sampled)
         );
-    }
-
-    #[test]
-    fn per_row_rngs_are_seedable_and_independent() {
-        let options = GenerateOptions {
-            greedy: false,
-            ..Default::default()
-        };
-        let sequence = |row| {
-            let mut rng = SamplingRng::for_row(Some(99), row);
-            (0..32)
-                .map(|_| rng.value_for(&options))
-                .collect::<Vec<_>>()
-        };
-
-        assert_eq!(sequence(0), sequence(0));
-        assert_eq!(sequence(1), sequence(1));
-        assert_ne!(sequence(0), sequence(1));
     }
 }

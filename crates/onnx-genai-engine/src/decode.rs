@@ -11,7 +11,8 @@
 use crate::config::{GenerateOptions, SessionId};
 use crate::kv_bridge::{KvModelInfo, mirror_present_kv_to_pages};
 use crate::logits::{ProcessorChain, ProcessorContext, TokenId};
-use crate::processors::select_next_token;
+use crate::processors::select_next_token_with_rng;
+use crate::sampling::SamplingRng;
 use crate::session::{DraftModel, DraftSession, EngineSession};
 use anyhow::Context;
 use onnx_genai_kv::{KvCacheOps, PagedKvCache};
@@ -372,6 +373,7 @@ pub(crate) fn propose_draft_tokens(
     first_step: usize,
     options: &GenerateOptions,
     chain: &ProcessorChain,
+    rng: &mut SamplingRng,
 ) -> anyhow::Result<Vec<TokenId>> {
     let prompt_len = draft_state
         .tokens
@@ -389,7 +391,7 @@ pub(crate) fn propose_draft_tokens(
             generated_text: draft_text.clone(),
             step: first_step + offset,
         };
-        let token = select_next_token(&mut logits, &context, options, chain, 0.0);
+        let token = select_next_token_with_rng(&mut logits, &context, options, chain, rng);
         proposed.push(token);
         draft_generated.push(token);
         draft_state.tokens.push(token);

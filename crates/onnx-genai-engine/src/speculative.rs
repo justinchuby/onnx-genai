@@ -16,7 +16,8 @@ use crate::kv_bridge::{
     rewind_target_state_to_len, trim_overmaterialized_target_kv,
 };
 use crate::logits::{ProcessorChain, ProcessorContext};
-use crate::processors::{ensure_constrained_finish, select_next_token};
+use crate::processors::{ensure_constrained_finish, select_next_token_with_rng};
+use crate::sampling::SamplingRng;
 use crate::session::{DraftModel, DraftSession, EngineSession};
 use crate::{
     FinishReason, GenerateOptions, GenerateResult, GenerateTokenCallback, SessionId,
@@ -397,6 +398,7 @@ where
 pub(crate) struct DraftModelProposer<'a> {
     draft_model: &'a mut DraftModel,
     draft_state: &'a mut DraftSession,
+    rng: Option<&'a mut SamplingRng>,
 }
 
 impl<'a> DraftModelProposer<'a> {
@@ -404,6 +406,19 @@ impl<'a> DraftModelProposer<'a> {
         Self {
             draft_model,
             draft_state,
+            rng: None,
+        }
+    }
+
+    fn with_rng(
+        draft_model: &'a mut DraftModel,
+        draft_state: &'a mut DraftSession,
+        rng: &'a mut SamplingRng,
+    ) -> Self {
+        Self {
+            draft_model,
+            draft_state,
+            rng: Some(rng),
         }
     }
 
@@ -425,6 +440,8 @@ impl SpeculativeProposer for DraftModelProposer<'_> {
         &mut self,
         context: &SpeculativeProposerContext<'_>,
     ) -> anyhow::Result<SpeculativeProposal> {
+        let mut fallback_rng = SamplingRng::new(context.options.seed);
+        let rng = self.rng.as_deref_mut().unwrap_or(&mut fallback_rng);
         let tokens = propose_draft_tokens(
             self.draft_model,
             self.draft_state,
@@ -434,6 +451,7 @@ impl SpeculativeProposer for DraftModelProposer<'_> {
             context.first_step,
             context.options,
             context.chain,
+            rng,
         )?;
         Ok(SpeculativeProposal::linear(tokens))
     }
@@ -488,6 +506,7 @@ impl Engine {
         prefix_cache_hit_len: usize,
         generated_tokens: &mut Vec<TokenId>,
         generated_text: &mut String,
+        rng: &mut SamplingRng,
         mut callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
         let speculative_mode = self.speculative_mode(options);
@@ -599,7 +618,7 @@ impl Engine {
                         .draft
                         .as_mut()
                         .context("speculative session missing draft state")?;
-                    let mut proposer = DraftModelProposer::new(draft_model, draft_state);
+                    let mut proposer = DraftModelProposer::with_rng(draft_model, draft_state, rng);
                     proposer.align_to_target_prefix(&state.tokens, base_len)?;
                     proposer.propose(&proposer_context)?.tokens
                 }
@@ -700,8 +719,13 @@ impl Engine {
                         })?,
                     step: step + idx,
                 };
-                let target_token =
-                    select_next_token(&mut target_logits[idx], &context, options, chain, 0.0);
+                let target_token = select_next_token_with_rng(
+                    &mut target_logits[idx],
+                    &context,
+                    options,
+                    chain,
+                    rng,
+                );
                 if target_token == draft_tokens[idx] {
                     accepted += 1;
                 } else {
@@ -752,14 +776,14 @@ impl Engine {
                         })?,
                     step: step + draft_tokens.len(),
                 };
-                let token = select_next_token(
+                let token = select_next_token_with_rng(
                     target_logits
                         .last_mut()
                         .context("target verification did not produce next-token logits")?,
                     &context,
                     options,
                     chain,
-                    0.0,
+                    rng,
                 );
                 context.generated_tokens.push(token);
                 commit_tokens.push(token);
@@ -786,6 +810,7 @@ impl Engine {
                     generated_text: std::mem::take(generated_text),
                     step,
                     prefix_cache_hit_len,
+                    rng: SamplingRng::new(options.seed),
                 };
                 let finish_reason = commit_selected_token(
                     &mut commit_state,

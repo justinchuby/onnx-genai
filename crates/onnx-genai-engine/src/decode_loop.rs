@@ -20,12 +20,16 @@ pub(crate) struct DecodeLoopState {
 
 impl DecodeLoopState {
     pub(crate) fn new(prefix_cache_hit_len: usize, seed: Option<u64>) -> Self {
+        Self::with_rng(prefix_cache_hit_len, SamplingRng::new(seed))
+    }
+
+    pub(crate) fn with_rng(prefix_cache_hit_len: usize, rng: SamplingRng) -> Self {
         Self {
             generated_tokens: Vec::new(),
             generated_text: String::new(),
             step: 0,
             prefix_cache_hit_len,
-            rng: SamplingRng::new(seed),
+            rng,
         }
     }
 }
