@@ -12,8 +12,8 @@ pub mod paged_cache;
 pub mod prefix_cache;
 pub mod tiered;
 
-pub use page_table::{Page, PageId, PageTable};
-pub use paged_cache::PagedKvCache;
+pub use page_table::{KvDType, KvKind, Page, PageId, PageTable, PageTensorConfig};
+pub use paged_cache::{LayerKv, MaterializedKv, MaterializedLayerKv, PagedKvCache};
 pub use prefix_cache::PrefixCache;
 
 /// Sequence identifier.
@@ -81,4 +81,10 @@ pub enum KvError {
     OutOfMemory { needed: usize, available: usize },
     #[error("Invalid position {position} for sequence length {length}")]
     InvalidPosition { position: usize, length: usize },
+    #[error("Tensor storage is not configured for this cache")]
+    TensorStorageNotConfigured,
+    #[error("Invalid KV tensor shape: {0}")]
+    InvalidTensorShape(&'static str),
+    #[error("Page {0} not found")]
+    PageNotFound(PageId),
 }
