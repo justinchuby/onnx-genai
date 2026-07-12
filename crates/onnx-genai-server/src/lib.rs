@@ -1,14 +1,23 @@
 //! OpenAI-compatible HTTP server wiring for onnx-genai.
+//!
+//! The default-on `metrics` feature exposes the atomic registry at `GET /metrics`;
+//! disable it with `--no-default-features` when Prometheus exposition is not needed.
 
-use std::net::SocketAddr;
+use std::{net::SocketAddr, time::Instant};
 
 use axum::{
     Router,
+    extract::Request,
+    middleware,
+    middleware::Next,
+    response::Response,
     routing::{delete, get, post},
 };
+use tracing::Instrument;
 
 mod driver;
 mod image_input;
+mod metrics;
 mod routes;
 mod session;
 mod sse;
@@ -29,14 +38,44 @@ pub use types::{
 };
 
 pub fn app(state: AppState) -> Router {
-    Router::new()
+    let router = Router::new()
         .route("/health", get(routes::health))
         .route("/v1/models", get(routes::models))
+        .route("/v1/status", get(routes::status))
         .route("/v1/sessions", post(routes::create_session))
         .route("/v1/sessions/{id}", delete(routes::delete_session))
         .route("/v1/completions", post(routes::completions))
-        .route("/v1/chat/completions", post(routes::chat_completions))
+        .route("/v1/chat/completions", post(routes::chat_completions));
+    #[cfg(feature = "metrics")]
+    let router = router.route("/metrics", get(routes::prometheus_metrics));
+    router
         .with_state(state)
+        .layer(middleware::from_fn(trace_request))
+}
+
+async fn trace_request(request: Request, next: Next) -> Response {
+    let trace_id = metrics::request_started();
+    let method = request.method().clone();
+    let path = request.uri().path().to_string();
+    let started = Instant::now();
+    let span = tracing::info_span!(
+        "http.request",
+        trace_id = format_args!("{trace_id:016x}"),
+        method = %method,
+        path = %path,
+        status = tracing::field::Empty,
+        latency_ms = tracing::field::Empty,
+    );
+    async move {
+        let response = next.run(request).await;
+        let status = response.status();
+        metrics::request_finished(&path, status);
+        tracing::Span::current().record("status", status.as_u16());
+        tracing::Span::current().record("latency_ms", started.elapsed().as_millis() as u64);
+        response
+    }
+    .instrument(span)
+    .await
 }
 
 pub async fn serve(addr: SocketAddr, state: AppState) -> anyhow::Result<()> {

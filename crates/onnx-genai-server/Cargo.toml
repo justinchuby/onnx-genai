@@ -8,6 +8,11 @@ repository.workspace = true
 keywords = ["onnx", "llm", "inference", "server"]
 categories = ["web-programming::http-server", "science"]
 
+[features]
+default = ["metrics"]
+# Exposes the allocation-free atomic registry at GET /metrics in Prometheus format.
+metrics = []
+
 [dependencies]
 onnx-genai = { workspace = true }
 onnx-genai-engine = { workspace = true }

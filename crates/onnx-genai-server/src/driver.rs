@@ -12,6 +12,7 @@ use onnx_genai_ort::Value;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 
 use crate::image_input::ImageTensor;
+use crate::metrics::GenerationMetrics;
 
 const DRIVER_OUTPUT_BUFFER: usize = 16;
 
@@ -76,6 +77,7 @@ pub(crate) enum GenerateSubmitError {
 struct DriverRoute {
     events: mpsc::Sender<DriverEvent>,
     _permit: OwnedSemaphorePermit,
+    metrics: GenerationMetrics,
 }
 
 // SAFETY: The engine is moved exactly once into the dedicated driver thread.
@@ -159,7 +161,9 @@ impl EngineDriver {
             .try_acquire_owned()
             .map_err(|_| GenerateSubmitError::Overloaded)?;
         let (events, rx) = mpsc::channel(DRIVER_OUTPUT_BUFFER);
-        self.commands
+        crate::metrics::generation_queued();
+        if self
+            .commands
             .send(DriverCommand::Generate {
                 session_id,
                 request: Box::new(request),
@@ -167,7 +171,11 @@ impl EngineDriver {
                 permit,
             })
             .await
-            .map_err(|_| GenerateSubmitError::DriverStopped)?;
+            .is_err()
+        {
+            crate::metrics::generation_queue_cancelled();
+            return Err(GenerateSubmitError::DriverStopped);
+        }
         Ok(rx)
     }
 
@@ -182,7 +190,9 @@ impl EngineDriver {
             .try_acquire_owned()
             .map_err(|_| GenerateSubmitError::Overloaded)?;
         let (events, rx) = mpsc::channel(DRIVER_OUTPUT_BUFFER);
-        self.commands
+        crate::metrics::generation_queued();
+        if self
+            .commands
             .send(DriverCommand::GeneratePipeline {
                 request: Box::new(request),
                 image,
@@ -190,7 +200,11 @@ impl EngineDriver {
                 permit,
             })
             .await
-            .map_err(|_| GenerateSubmitError::DriverStopped)?;
+            .is_err()
+        {
+            crate::metrics::generation_queue_cancelled();
+            return Err(GenerateSubmitError::DriverStopped);
+        }
         Ok(rx)
     }
 
@@ -207,7 +221,9 @@ impl EngineDriver {
             .try_acquire_owned()
             .map_err(|_| GenerateSubmitError::Overloaded)?;
         let (events, rx) = mpsc::channel(DRIVER_OUTPUT_BUFFER);
-        self.commands
+        crate::metrics::generation_queued();
+        if self
+            .commands
             .send(DriverCommand::GenerateFim {
                 prefix,
                 suffix,
@@ -217,7 +233,11 @@ impl EngineDriver {
                 permit,
             })
             .await
-            .map_err(|_| GenerateSubmitError::DriverStopped)?;
+            .is_err()
+        {
+            crate::metrics::generation_queue_cancelled();
+            return Err(GenerateSubmitError::DriverStopped);
+        }
         Ok(rx)
     }
 }
@@ -265,6 +285,7 @@ fn run_pipeline_driver(engine: &mut PipelineEngine, mut rx: mpsc::Receiver<Drive
                 )));
             }
             DriverCommand::Generate { events, .. } | DriverCommand::GenerateFim { events, .. } => {
+                crate::metrics::generation_queue_cancelled();
                 let _ = events.try_send(DriverEvent::Error(
                     "invalid generation route for pipeline model".to_string(),
                 ));
@@ -337,6 +358,7 @@ fn run_static_batch_until_idle(
     let mut manager = match engine.continuous_batch_manager(max_batch) {
         Ok(manager) => manager,
         Err(err) => {
+            crate::metrics::generation_queue_cancelled();
             let _ = first_events.try_send(DriverEvent::Error(format!(
                 "continuous batch setup failed: {err}"
             )));
@@ -391,7 +413,7 @@ fn run_static_batch_until_idle(
 fn submit_to_continuous_manager(
     manager: &mut ContinuousBatchManager<'_>,
     routes: &mut HashMap<usize, DriverRoute>,
-    abandoned: &mut HashMap<usize, OwnedSemaphorePermit>,
+    abandoned: &mut HashMap<usize, DriverRoute>,
     request: GenerateRequest,
     events: mpsc::Sender<DriverEvent>,
     permit: OwnedSemaphorePermit,
@@ -403,11 +425,13 @@ fn submit_to_continuous_manager(
                 DriverRoute {
                     events,
                     _permit: permit,
+                    metrics: GenerationMetrics::start(),
                 },
             );
             route_continuous_events(manager.poll(), routes, abandoned);
         }
         Err(err) => {
+            crate::metrics::generation_queue_cancelled();
             let _ = events.try_send(DriverEvent::Error(err.to_string()));
         }
     }
@@ -416,7 +440,7 @@ fn submit_to_continuous_manager(
 fn route_continuous_events(
     events: Vec<ContinuousBatchEvent>,
     routes: &mut HashMap<usize, DriverRoute>,
-    abandoned: &mut HashMap<usize, OwnedSemaphorePermit>,
+    abandoned: &mut HashMap<usize, DriverRoute>,
 ) {
     for event in events {
         match event {
@@ -424,18 +448,26 @@ fn route_continuous_events(
                 // A slow or disconnected consumer loses its route immediately. The
                 // driver never waits for output capacity; it keeps stepping every
                 // other row while the manager retires the abandoned row.
-                let delivery_failed = routes
-                    .get(&handle.id)
-                    .is_some_and(|route| route.events.try_send(DriverEvent::Token(token)).is_err());
+                let delivery_failed = if let Some(route) = routes.get_mut(&handle.id) {
+                    route.metrics.token();
+                    route.events.try_send(DriverEvent::Token(token)).is_err()
+                } else {
+                    false
+                };
                 if delivery_failed && let Some(route) = routes.remove(&handle.id) {
-                    abandoned.insert(handle.id, route._permit);
+                    abandoned.insert(handle.id, route);
                 }
             }
             ContinuousBatchEvent::Finished { handle, result } => {
-                if let Some(route) = routes.remove(&handle.id) {
+                if let Some(mut route) = routes.remove(&handle.id) {
+                    route
+                        .metrics
+                        .result(result.token_ids.len(), result.prefix_cache_hit_len);
                     let _ = route.events.try_send(DriverEvent::Finished(result));
-                } else {
-                    abandoned.remove(&handle.id);
+                } else if let Some(mut route) = abandoned.remove(&handle.id) {
+                    route
+                        .metrics
+                        .result(result.token_ids.len(), result.prefix_cache_hit_len);
                 }
             }
         }
@@ -474,6 +506,7 @@ fn handle_driver_command(engine: &mut Engine, command: DriverCommand) {
             permit,
         } => run_fim_generation(engine, prefix, suffix, fim_config, *options, events, permit),
         DriverCommand::GeneratePipeline { events, .. } => {
+            crate::metrics::generation_queue_cancelled();
             let _ = events.try_send(DriverEvent::Error(
                 "invalid pipeline generation route for single model".to_string(),
             ));
@@ -488,6 +521,7 @@ fn run_pipeline_generation(
     events: mpsc::Sender<DriverEvent>,
     _permit: OwnedSemaphorePermit,
 ) {
+    let mut metrics = GenerationMetrics::start();
     let pipeline_request = match image {
         Some(image) => match Value::from_vec_f32(image.data, &image.shape) {
             Ok(value) => PipelineGenerateRequest::new(request).with_input(image.endpoint, value),
@@ -501,12 +535,14 @@ fn run_pipeline_generation(
         None => PipelineGenerateRequest::new(request),
     };
     let mut callback = |token: GenerateToken| -> anyhow::Result<()> {
+        metrics.token();
         events
             .try_send(DriverEvent::Token(token))
             .context("stream receiver closed")
     };
     match engine.generate_with_callback(pipeline_request, Some(&mut callback)) {
         Ok(result) => {
+            metrics.result(result.token_ids.len(), result.prefix_cache_hit_len);
             let _ = events.try_send(DriverEvent::Finished(result));
         }
         Err(err) => {
@@ -522,7 +558,9 @@ fn run_fallback_generation(
     events: mpsc::Sender<DriverEvent>,
     _permit: OwnedSemaphorePermit,
 ) {
+    let mut metrics = GenerationMetrics::start();
     let mut callback = |token: GenerateToken| -> anyhow::Result<()> {
+        metrics.token();
         events
             .try_send(DriverEvent::Token(token))
             .context("stream receiver closed")
@@ -535,6 +573,7 @@ fn run_fallback_generation(
     };
     match result {
         Ok(result) => {
+            metrics.result(result.token_ids.len(), result.prefix_cache_hit_len);
             let _ = events.try_send(DriverEvent::Finished(result));
         }
         Err(err) => {
@@ -552,8 +591,10 @@ fn run_fim_generation(
     events: mpsc::Sender<DriverEvent>,
     _permit: OwnedSemaphorePermit,
 ) {
+    let mut metrics = GenerationMetrics::start();
     match engine.generate_fim_with_config(prefix, suffix, options, &fim_config) {
         Ok(result) => {
+            metrics.result(result.token_ids.len(), result.prefix_cache_hit_len);
             let _ = events.try_send(DriverEvent::Finished(result));
         }
         Err(err) => {

@@ -44,7 +44,8 @@ impl SessionRegistry {
             .inner
             .lock()
             .map_err(|_| anyhow::anyhow!("session registry mutex poisoned"))?;
-        let evicted = if inner.sessions.len() >= self.max_sessions {
+        let previous_len = inner.sessions.len();
+        let evicted = if previous_len >= self.max_sessions {
             inner
                 .sessions
                 .iter()
@@ -68,6 +69,9 @@ impl SessionRegistry {
                 last_access,
             },
         );
+        if inner.sessions.len() > previous_len {
+            crate::metrics::active_sessions_added(1);
+        }
         Ok(evicted)
     }
 
@@ -90,19 +94,34 @@ impl SessionRegistry {
     }
 
     pub(crate) fn remove(&self, client_id: &str) -> anyhow::Result<Option<SessionId>> {
-        Ok(self
+        let mut inner = self
             .inner
             .lock()
-            .map_err(|_| anyhow::anyhow!("session registry mutex poisoned"))?
+            .map_err(|_| anyhow::anyhow!("session registry mutex poisoned"))?;
+        let removed = inner
             .sessions
             .remove(client_id)
-            .map(|entry| entry.engine_session_id))
+            .map(|entry| entry.engine_session_id);
+        if removed.is_some() {
+            crate::metrics::active_sessions_removed(1);
+        }
+        Ok(removed)
     }
 
     pub(crate) fn next_client_id(&self) -> anyhow::Result<String> {
         let mut bytes = [0_u8; 16];
         getrandom::fill(&mut bytes).context("OS CSPRNG failed")?;
         Ok(format!("sess-{}", hex_token(&bytes)))
+    }
+}
+
+impl Drop for SessionRegistry {
+    fn drop(&mut self) {
+        if Arc::strong_count(&self.inner) == 1
+            && let Ok(inner) = self.inner.lock()
+        {
+            crate::metrics::active_sessions_removed(inner.sessions.len());
+        }
     }
 }
 

@@ -59,6 +59,18 @@ pub(crate) struct HealthResponse {
 }
 
 #[derive(Debug, Serialize)]
+pub(crate) struct StatusResponse {
+    status: &'static str,
+    version: &'static str,
+    uptime_seconds: u64,
+    model_id: String,
+    active_sessions: u64,
+    pending_queue_depth: u64,
+    total_requests: u64,
+    total_tokens: u64,
+}
+
+#[derive(Debug, Serialize)]
 pub(crate) struct SessionResponse {
     id: String,
     object: &'static str,
@@ -182,6 +194,32 @@ pub(crate) async fn models(State(state): State<AppState>) -> Json<ModelsResponse
     })
 }
 
+pub(crate) async fn status(State(state): State<AppState>) -> Json<StatusResponse> {
+    let snapshot = crate::metrics::snapshot();
+    Json(StatusResponse {
+        status: "ready",
+        version: env!("CARGO_PKG_VERSION"),
+        uptime_seconds: state.started_at.elapsed().as_secs(),
+        model_id: state.model_id,
+        active_sessions: snapshot.active_sessions,
+        pending_queue_depth: snapshot.pending_requests,
+        total_requests: snapshot.total_requests,
+        total_tokens: snapshot.total_tokens,
+    })
+}
+
+#[cfg(feature = "metrics")]
+pub(crate) async fn prometheus_metrics() -> Response {
+    (
+        [(
+            header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        crate::metrics::encode_prometheus(),
+    )
+        .into_response()
+}
+
 pub(crate) async fn create_session(
     State(state): State<AppState>,
 ) -> Result<Json<SessionResponse>, ApiError> {
@@ -282,6 +320,7 @@ async fn run_completion(
     )
     .await
     .map_err(|err| ApiError::internal(format!("generation failed: {err}")))?;
+    crate::metrics::add_prompt_tokens(prepared.prompt_tokens);
     let completion_tokens = result.token_ids.len();
 
     Ok(CompletionResponse {
@@ -324,6 +363,7 @@ async fn stream_completion(
     )?;
     let mut driver_rx =
         submit_completion(&state, prepared.generation, client_session_id.as_deref()).await?;
+    crate::metrics::add_prompt_tokens(prepared.prompt_tokens);
     let (tx, rx) = mpsc::channel(16);
 
     tokio::spawn(async move {
@@ -501,6 +541,7 @@ async fn run_chat_completion(
     })
     .await
     .map_err(|err| ApiError::internal(format!("generation failed: {err}")));
+    crate::metrics::add_prompt_tokens(prompt_tokens);
 
     let session_token_count = if let Some(engine_session_id) = session_for_count {
         Some(
@@ -629,6 +670,7 @@ async fn stream_chat_completion(
             .await
             .map_err(map_generate_submit_error)?
     };
+    crate::metrics::add_prompt_tokens(prepared.prompt_tokens);
 
     tokio::spawn(async move {
         send_stream_chunk(&tx, role_chunk(&id, created, &model)).await?;

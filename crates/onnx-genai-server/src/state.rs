@@ -1,4 +1,4 @@
-use std::{path::Path, sync::Arc};
+use std::{path::Path, sync::Arc, time::Instant};
 
 use anyhow::Context;
 use onnx_genai::{Engine, EngineConfig};
@@ -26,6 +26,7 @@ pub struct AppState {
     pub(crate) fim_config: Option<FimConfig>,
     pub(crate) pipeline: bool,
     pub(crate) vision_input: Option<VisionInputSpec>,
+    pub(crate) started_at: Instant,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -168,6 +169,7 @@ impl AppState {
             fim_config: None,
             pipeline: true,
             vision_input,
+            started_at: Instant::now(),
         })
     }
 
@@ -212,6 +214,7 @@ impl AppState {
             fim_config,
             pipeline: false,
             vision_input: None,
+            started_at: Instant::now(),
         }
     }
 

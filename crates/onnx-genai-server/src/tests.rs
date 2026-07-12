@@ -14,6 +14,11 @@ use std::{io::Cursor, path::PathBuf, time::Duration};
 use tokio::{sync::mpsc, time::timeout};
 use tower::ServiceExt;
 
+fn tiny_state() -> AppState {
+    let model_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
+    AppState::load(&model_dir, Some("tiny-llm".to_string())).expect("load fixture")
+}
+
 fn tiny_png_data_uri() -> String {
     use base64::{Engine as _, engine::general_purpose::STANDARD};
     use image::{DynamicImage, ImageFormat, Rgb, RgbImage};
@@ -125,6 +130,107 @@ async fn vision_request_against_non_pipeline_model_returns_400() {
         body["error"]["message"],
         "this model does not support image input"
     );
+}
+
+#[tokio::test]
+async fn status_reports_sane_server_fields() {
+    let response = app(tiny_state())
+        .oneshot(
+            Request::builder()
+                .uri("/v1/status")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["status"], "ready");
+    assert_eq!(body["model_id"], "tiny-llm");
+    assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
+    assert!(body["uptime_seconds"].is_u64());
+    assert!(body["active_sessions"].is_u64());
+    assert!(body["pending_queue_depth"].is_u64());
+    assert!(body["total_requests"].is_u64());
+    assert!(body["total_tokens"].is_u64());
+}
+
+#[cfg(feature = "metrics")]
+#[tokio::test]
+async fn metrics_exposes_prometheus_families_and_request_counter_increments() {
+    let router = app(tiny_state());
+    let before = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/metrics")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let before = to_bytes(before.into_body(), usize::MAX).await.unwrap();
+    let before = String::from_utf8(before.to_vec()).unwrap();
+    let before_health = prometheus_sample(
+        &before,
+        "onnx_genai_requests_total{endpoint=\"/health\",status=\"200\"}",
+    );
+
+    for _ in 0..2 {
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .uri("/metrics")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()[header::CONTENT_TYPE],
+        "text/plain; version=0.0.4; charset=utf-8"
+    );
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body = String::from_utf8(body.to_vec()).unwrap();
+    assert!(body.contains("# TYPE onnx_genai_requests_total counter"));
+    assert!(body.contains("# TYPE onnx_genai_time_to_first_token_seconds histogram"));
+    assert!(body.contains("# TYPE onnx_genai_e2e_request_latency_seconds histogram"));
+    assert!(body.contains("onnx_genai_sessions_active"));
+    assert!(body.contains("onnx_genai_requests_waiting"));
+    assert!(body.contains("onnx_genai_batch_size_current"));
+    assert!(body.contains("onnx_genai_prefix_cache_hit_rate"));
+    assert!(body.contains("onnx_genai_rejections_total"));
+    let after_health = prometheus_sample(
+        &body,
+        "onnx_genai_requests_total{endpoint=\"/health\",status=\"200\"}",
+    );
+    assert!(after_health >= before_health + 2);
+}
+
+#[cfg(feature = "metrics")]
+fn prometheus_sample(body: &str, metric: &str) -> u64 {
+    body.lines()
+        .find_map(|line| {
+            line.strip_prefix(metric)
+                .and_then(|value| value.trim().parse().ok())
+        })
+        .unwrap_or(0)
 }
 
 #[tokio::test]
