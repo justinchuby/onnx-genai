@@ -87,10 +87,10 @@ fn find_ort_root() -> PathBuf {
     if let Ok(lib_dir) = env::var("ORT_LIB_DIR") {
         let lib_path = PathBuf::from(&lib_dir);
         // Assume root is parent of lib/
-        if let Some(root) = lib_path.parent() {
-            if root.join("include").join("onnxruntime_c_api.h").exists() {
-                return root.to_path_buf();
-            }
+        if let Some(root) = lib_path.parent()
+            && root.join("include").join("onnxruntime_c_api.h").exists()
+        {
+            return root.to_path_buf();
         }
         // Maybe lib_dir IS the root (flat layout)
         if lib_path.join("onnxruntime_c_api.h").exists() {
@@ -121,13 +121,12 @@ fn find_ort_root() -> PathBuf {
     if let Ok(output) = std::process::Command::new("pkg-config")
         .args(["--variable=libdir", "onnxruntime"])
         .output()
+        && output.status.success()
     {
-        if output.status.success() {
-            let lib_dir = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            let root = PathBuf::from(&lib_dir).parent().unwrap().to_path_buf();
-            if root.join("include").join("onnxruntime_c_api.h").exists() {
-                return root;
-            }
+        let lib_dir = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let root = PathBuf::from(&lib_dir).parent().unwrap().to_path_buf();
+        if root.join("include").join("onnxruntime_c_api.h").exists() {
+            return root;
         }
     }
 

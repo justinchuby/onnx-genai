@@ -1770,10 +1770,10 @@ pub fn parse_tool_calls(output: &str) -> Vec<ChatMessageToolCall> {
             break;
         };
         let body = rest[..end].trim();
-        if let Ok(value) = serde_json::from_str::<serde_json::Value>(body) {
-            if let Some(call) = parsed_tool_call_to_openai(calls.len(), value) {
-                calls.push(call);
-            }
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(body)
+            && let Some(call) = parsed_tool_call_to_openai(calls.len(), value)
+        {
+            calls.push(call);
         }
         rest = &rest[end + "</tool_call>".len()..];
     }

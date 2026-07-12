@@ -399,10 +399,9 @@ impl KvCacheOps for PagedKvCache {
         if position > 0 {
             let last_offset = (position - 1) % page_size + 1;
             if let Some(&last_page_id) = self.page_table.sequences.get(&seq).and_then(|p| p.last())
+                && let Some(page) = self.page_table.pages.get_mut(&last_page_id)
             {
-                if let Some(page) = self.page_table.pages.get_mut(&last_page_id) {
-                    page.filled = last_offset;
-                }
+                page.filled = last_offset;
             }
         }
         self.page_table.set_sequence_len(seq, position);

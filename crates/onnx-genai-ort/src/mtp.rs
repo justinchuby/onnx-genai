@@ -11,7 +11,7 @@
 //! [`MtpDecodeSession::propose`] via the [`TokenEmbedder`] and [`LmHead`]
 //! traits. This keeps the head session self-contained while letting the engine
 //! (Batty's `MtpProposer`) own the target embedding/LM head.
-//!
+
 //! ## Head I/O (fixture `tests/fixtures/tiny-qwen35-mtp/`)
 //!
 //! Inputs:
@@ -26,6 +26,10 @@
 //! - `mtp_hidden`            `f32 [B, T, H]`
 //! - `present.0.key`         `f32 [B, KVH, P+T, D]`
 //! - `present.0.value`       `f32 [B, KVH, P+T, D]`
+
+#![allow(clippy::arc_with_non_send_sync)]
+// ORT Values are session-owned handles. These Arcs provide shared ownership inside
+// one decode session; they are not used to move Values across threads.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -371,7 +375,7 @@ impl<'a> MtpDecodeSession<'a> {
         position_start: i64,
     ) -> Result<Vec<f32>> {
         let hidden = self.signature.hidden_size;
-        if inputs_embeds.is_empty() || inputs_embeds.len() % hidden != 0 {
+        if inputs_embeds.is_empty() || !inputs_embeds.len().is_multiple_of(hidden) {
             return Err(OrtError::InvalidArgument(format!(
                 "inputs_embeds length {} must be a non-zero multiple of hidden {hidden}",
                 inputs_embeds.len()
@@ -386,7 +390,8 @@ impl<'a> MtpDecodeSession<'a> {
         let seq_i64 = i64::try_from(seq_len)
             .map_err(|_| OrtError::InvalidArgument("seq_len exceeds i64".into()))?;
 
-        let embeds = Value::from_slice_f32(inputs_embeds, &[self.batch_size, seq_i64, hidden as i64])?;
+        let embeds =
+            Value::from_slice_f32(inputs_embeds, &[self.batch_size, seq_i64, hidden as i64])?;
         let hidden_value =
             Value::from_slice_f32(hidden_states, &[self.batch_size, seq_i64, hidden as i64])?;
 
@@ -454,9 +459,8 @@ impl<'a> MtpDecodeSession<'a> {
             self.current_kv = next_kv;
             self.kv_len = total;
         }
-        mtp_hidden.ok_or_else(|| {
-            OrtError::InvalidArgument("MTP head did not produce mtp_hidden".into())
-        })
+        mtp_hidden
+            .ok_or_else(|| OrtError::InvalidArgument("MTP head did not produce mtp_hidden".into()))
     }
 
     /// Propose `k` draft tokens from a target hidden state and committed token.
@@ -502,9 +506,9 @@ impl<'a> MtpDecodeSession<'a> {
                 .map_err(|_| OrtError::InvalidArgument("position exceeds i64".into()))?;
             let mtp_hidden = self.step(&embed_buf, &running_hidden, position)?;
             lm_head.logits(&mtp_hidden, &mut logits_buf)?;
-            let token = argmax(&logits_buf).ok_or_else(|| {
-                OrtError::InvalidArgument("lm-head produced empty logits".into())
-            })? as u32;
+            let token = argmax(&logits_buf)
+                .ok_or_else(|| OrtError::InvalidArgument("lm-head produced empty logits".into()))?
+                as u32;
             draft_tokens.push(token);
             draft_hiddens.push(mtp_hidden.clone());
             running_hidden = mtp_hidden;
@@ -541,9 +545,7 @@ struct MtpIo {
     hidden_output: String,
 }
 
-fn detect_mtp_head(
-    session: &Session,
-) -> Result<Option<(MtpHeadSignature, Vec<MtpKvPair>, MtpIo)>> {
+fn detect_mtp_head(session: &Session) -> Result<Option<(MtpHeadSignature, Vec<MtpKvPair>, MtpIo)>> {
     let embeds_input = session
         .inputs()
         .iter()

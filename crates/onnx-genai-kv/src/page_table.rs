@@ -223,17 +223,17 @@ impl PageTable {
             self.evict_lru_hot(None).ok()?;
         }
 
-        if let Some(free_list) = self.free_pages.get_mut(&device) {
-            if let Some(page_id) = free_list.pop() {
-                if let Some(page) = self.pages.get_mut(&page_id) {
-                    page.ref_count = 1;
-                    page.device = device;
-                    page.reset_storage(self.tensor_config);
-                    self.clock += 1;
-                    page.last_access = self.clock;
-                }
-                return Some(page_id);
+        if let Some(free_list) = self.free_pages.get_mut(&device)
+            && let Some(page_id) = free_list.pop()
+        {
+            if let Some(page) = self.pages.get_mut(&page_id) {
+                page.ref_count = 1;
+                page.device = device;
+                page.reset_storage(self.tensor_config);
+                self.clock += 1;
+                page.last_access = self.clock;
             }
+            return Some(page_id);
         }
         if matches!(device, Device::Gpu(_)) && self.hot_used_count() < self.hot_capacity {
             let page_id = self.next_page_id;
@@ -308,10 +308,10 @@ impl PageTable {
 
     /// Replace a sequence page at `logical_page_index`.
     pub fn replace_page(&mut self, seq: SequenceId, logical_page_index: usize, page_id: PageId) {
-        if let Some(pages) = self.sequences.get_mut(&seq) {
-            if let Some(slot) = pages.get_mut(logical_page_index) {
-                *slot = page_id;
-            }
+        if let Some(pages) = self.sequences.get_mut(&seq)
+            && let Some(slot) = pages.get_mut(logical_page_index)
+        {
+            *slot = page_id;
         }
     }
 

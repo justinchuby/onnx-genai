@@ -1,5 +1,9 @@
 //! Incremental decode helpers built on ORT IoBinding.
 
+#![allow(clippy::arc_with_non_send_sync)]
+// ORT Values are session-owned handles. These Arcs provide shared ownership inside
+// one decode session; they are not used to move Values across threads.
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -548,7 +552,7 @@ impl<'a> StaticCacheDecodeSession<'a> {
 
     fn seq_len_from_flat_input(&self, input_ids: &[i64]) -> Result<usize> {
         let batch = self.batch_size as usize;
-        if batch == 0 || input_ids.is_empty() || input_ids.len() % batch != 0 {
+        if batch == 0 || input_ids.is_empty() || !input_ids.len().is_multiple_of(batch) {
             return Err(OrtError::InvalidArgument(format!(
                 "input_ids length {} is not a non-empty multiple of batch {}",
                 input_ids.len(),
@@ -1033,7 +1037,7 @@ impl<'a> BatchedStaticCacheDecodeSession<'a> {
     }
 
     fn seq_len_from_flat_input(&self, input_ids: &[i64]) -> Result<usize> {
-        if input_ids.is_empty() || input_ids.len() % self.batch_size != 0 {
+        if input_ids.is_empty() || !input_ids.len().is_multiple_of(self.batch_size) {
             return Err(OrtError::InvalidArgument(format!(
                 "input_ids length {} is not a non-empty multiple of batch {}",
                 input_ids.len(),

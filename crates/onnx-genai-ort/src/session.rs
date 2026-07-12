@@ -86,7 +86,7 @@ pub fn available_execution_providers() -> Result<Vec<String>> {
         return Ok(Vec::new());
     }
 
-    let providers = (|| {
+    let providers = {
         let mut providers = Vec::with_capacity(provider_count as usize);
         for index in 0..provider_count as isize {
             // SAFETY: ORT returned an array with `provider_count` C string entries.
@@ -101,7 +101,7 @@ pub fn available_execution_providers() -> Result<Vec<String>> {
             }
         }
         Ok(providers)
-    })();
+    };
 
     // SAFETY: releases the array returned by `GetAvailableProviders` exactly once.
     crate::error::check_status(unsafe { release_available(providers_ptr, provider_count) })?;

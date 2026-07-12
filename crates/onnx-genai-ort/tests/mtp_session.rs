@@ -10,8 +10,7 @@ const HIDDEN: usize = 16;
 const VOCAB: usize = 32;
 
 fn tiny_mtp() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../tests/fixtures/tiny-qwen35-mtp/model.onnx")
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-qwen35-mtp/model.onnx")
 }
 
 fn deterministic_session_options() -> SessionOptions {
@@ -25,7 +24,12 @@ fn test_environment() -> &'static Environment {
 }
 
 fn load_head() -> Session {
-    Session::new(test_environment(), &tiny_mtp(), deterministic_session_options()).expect("session")
+    Session::new(
+        test_environment(),
+        &tiny_mtp(),
+        deterministic_session_options(),
+    )
+    .expect("session")
 }
 
 /// Deterministic pseudo-random f32 in roughly [-1, 1) from a linear-congruential seed.
@@ -33,7 +37,9 @@ fn lcg_weights(seed: u64, len: usize) -> Vec<f32> {
     let mut state = seed;
     let mut out = Vec::with_capacity(len);
     for _ in 0..len {
-        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let bits = (state >> 33) as u32;
         out.push((bits as f32 / u32::MAX as f32) * 2.0 - 1.0);
     }
@@ -138,7 +144,9 @@ fn manual_chain_matches_propose() {
     let hidden = target_hidden();
 
     let mut guaranteed_logits = vec![0.0f32; VOCAB];
-    lm_head.logits(&hidden, &mut guaranteed_logits).expect("logits");
+    lm_head
+        .logits(&hidden, &mut guaranteed_logits)
+        .expect("logits");
     let guaranteed = argmax(&guaranteed_logits).expect("argmax") as u32;
 
     let k = 3;
@@ -156,7 +164,9 @@ fn manual_chain_matches_propose() {
     for i in 0..k {
         embedder.embed(prev, &mut embed_buf).expect("embed");
         let mtp_hidden = mtp.step(&embed_buf, &running, i as i64).expect("step");
-        lm_head.logits(&mtp_hidden, &mut logits_buf).expect("logits");
+        lm_head
+            .logits(&mtp_hidden, &mut logits_buf)
+            .expect("logits");
         let token = argmax(&logits_buf).expect("argmax") as u32;
         expected.push(token);
         prev = token;
