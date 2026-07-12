@@ -5858,3 +5858,262 @@ onnx_genai_router_session_map_size            gauge    # entries in session → 
 onnx_genai_router_prefix_map_size             gauge    # entries in prefix → node map
 onnx_genai_router_poll_latency_seconds        histogram {node}
 ```
+
+---
+
+## 35. Native Preprocessing (No ORT Extensions)
+
+### 35.1 Design Principle
+
+**Preprocessing lives in Rust, not in the ONNX graph.**
+
+ONNX models expect normalized tensors as input — not raw bytes. The contract with Mobius (model export tool) is:
+
+- Image inputs: `[B, C, H, W]` normalized float tensor (or `[B, N_patches, patch_dim]` for encoder-free)
+- Audio inputs: `[B, T, n_mels]` log-mel spectrogram (or `[B, T]` raw waveform for encoder-free)
+- Text inputs: `[B, seq_len]` token IDs
+
+Preprocessing (decode, resize, tile, normalize, mel-spectrogram) is deterministic math that doesn't need a graph runtime or custom ops.
+
+### 35.2 Why Not ORT Extensions
+
+| Concern | Impact |
+|---|---|
+| Version coupling | Extensions must match exact ORT version |
+| Build complexity | Separate native build per platform, often breaks |
+| Cross-platform | Not all ops available on all EPs/platforms |
+| Debugging | Opaque custom ops, hard to inspect intermediate states |
+| Scalability | Each new model needs new custom op registration |
+| Binary size | Adds another DLL/so to deployment |
+
+### 35.3 The Reality: How Many Preprocessing Variants Exist?
+
+**Image — converges to ~3 resize modes × ~3 tiling modes:**
+
+| Parameter | Variants | Notes |
+|---|---|---|
+| Resize mode | `shortest_edge`, `fixed_size`, `longest_edge_pad` | 90% are shortest_edge or fixed |
+| Interpolation | `bicubic`, `bilinear` | Almost all bicubic |
+| Tiling | `none`, `fixed_grid`, `dynamic_anyres` | Encoder-free models use anyres |
+| Normalize | CLIP mean/std, 0.5/0.5, 0-1 | 3 sets of constants |
+| Output | `NCHW` tensor, `pixel_patches` (flattened) | Encoder-based vs encoder-free |
+
+**Audio — converges to 2 modes:**
+
+| Mode | Pipeline | Models |
+|---|---|---|
+| Log-mel spectrogram | resample → STFT → mel filterbank → log | Whisper, most ASR |
+| Raw waveform | resample → peak normalize → chunk | Gemma 4, encoder-free multimodal |
+
+### 35.4 Two Model Architectures
+
+| Architecture | Preprocessing Output | Example Models |
+|---|---|---|
+| **Encoder-based** | Normalized image/audio → separate encoder model → embedding → decoder | LLaVA, InternVL, Whisper, Phi-3-vision |
+| **Encoder-free** | Pixel patches / raw audio chunks → directly into decoder as virtual tokens | Gemma 4, Fuyu, Chameleon |
+
+Encoder-free is simpler for the runtime (no encoder model to manage) but means:
+- Preprocessing output shape directly determines sequence length
+- Tile count is dynamic → KV cache allocation must happen AFTER preprocessing
+- The decoder model is larger (learned projection from raw modality)
+
+### 35.5 Configuration-Driven Preprocessing
+
+```yaml
+# inference_metadata.yaml
+preprocessing:
+  image:
+    # Pipeline: decode → resize → tile → normalize → output
+    decode: rgb                          # rgb | bgr | grayscale
+    
+    resize:
+      mode: shortest_edge               # shortest_edge | fixed | longest_edge_pad
+      size: 336                          # target size (pixels)
+      interpolation: bicubic            # bicubic | bilinear
+      
+    tiling:
+      mode: dynamic_anyres              # none | fixed_grid | dynamic_anyres
+      tile_size: 336
+      max_tiles: 6
+      aspect_ratios: [[1,1],[1,2],[2,1],[1,3],[3,1],[2,2]]  # for anyres
+      
+    normalize:
+      mean: [0.48145466, 0.4578275, 0.40821073]
+      std: [0.26862954, 0.26130258, 0.27577711]
+      
+    output:
+      format: NCHW                      # NCHW | pixel_patches
+      dtype: fp16
+      patch_size: 14                    # for pixel_patches mode
+
+  audio:
+    mode: raw_waveform                  # log_mel | raw_waveform
+    sample_rate: 16000
+    
+    # For log_mel mode:
+    n_fft: 400
+    hop_length: 160
+    n_mels: 80
+    window: hann
+    normalize: per_utterance            # per_utterance | global | none
+    padding: 30s                        # fixed duration (Whisper) or "dynamic"
+    
+    # For raw_waveform mode (encoder-free like Gemma 4):
+    normalize: peak                     # peak ([-1,1]) | rms | none
+    chunk_length_ms: 2000
+    
+    output:
+      dtype: fp16
+```
+
+### 35.6 Rust Implementation
+
+```rust
+/// Preprocessing pipeline — pure Rust, no ORT dependency.
+/// Lives in a dedicated crate: `onnx-genai-preprocess`
+
+pub mod image {
+    pub struct ImagePreprocessor {
+        config: ImageConfig,
+    }
+    
+    impl ImagePreprocessor {
+        /// Raw bytes → model-ready tensor.
+        pub fn process(&self, bytes: &[u8]) -> Result<PreprocessedImage> {
+            let img = decode_image(bytes, self.config.decode)?;
+            let resized = resize(&img, &self.config.resize)?;
+            let tiles = tile(&resized, &self.config.tiling)?;
+            let normalized = normalize(&tiles, &self.config.normalize)?;
+            format_output(normalized, &self.config.output)
+        }
+    }
+    
+    /// Result carries tile count for KV cache allocation.
+    pub struct PreprocessedImage {
+        pub tensor: Tensor,            // ready for model input
+        pub num_tiles: usize,          // how many tiles were produced
+        pub num_patches: usize,        // total patches (for encoder-free)
+        pub original_size: (u32, u32), // for coordinate tasks
+    }
+}
+
+pub mod audio {
+    pub struct AudioPreprocessor {
+        config: AudioConfig,
+    }
+    
+    impl AudioPreprocessor {
+        /// PCM samples → model-ready tensor.
+        pub fn process(&self, samples: &[f32], sample_rate: u32) -> Result<PreprocessedAudio> {
+            let resampled = resample(samples, sample_rate, self.config.sample_rate)?;
+            match self.config.mode {
+                AudioMode::LogMel => {
+                    let stft = stft(&resampled, self.config.n_fft, self.config.hop_length)?;
+                    let mel = mel_filterbank(&stft, self.config.n_mels)?;
+                    Ok(log_mel(&mel, &self.config))
+                }
+                AudioMode::RawWaveform => {
+                    let normalized = normalize_waveform(&resampled, self.config.normalize)?;
+                    let chunks = chunk(&normalized, self.config.chunk_length_ms)?;
+                    Ok(PreprocessedAudio { tensor: chunks, num_chunks: chunks.len() })
+                }
+            }
+        }
+    }
+    
+    pub struct PreprocessedAudio {
+        pub tensor: Tensor,
+        pub num_chunks: usize,         // for encoder-free: determines token count
+    }
+}
+```
+
+### 35.7 Integration with Scheduler (Dynamic Sequence Length)
+
+For encoder-free models, preprocessing determines token count:
+
+```rust
+/// After preprocessing, we know the true sequence length.
+pub fn compute_multimodal_sequence_length(
+    text_tokens: &[TokenId],
+    images: &[PreprocessedImage],
+    audio: &[PreprocessedAudio],
+    config: &ModelConfig,
+) -> usize {
+    let text_len = text_tokens.len();
+    
+    // Each image tile → (tile_h / patch_size) * (tile_w / patch_size) virtual tokens
+    let image_tokens: usize = images.iter()
+        .map(|img| img.num_patches)
+        .sum();
+    
+    // Each audio chunk → chunk_samples / stride virtual tokens  
+    let audio_tokens: usize = audio.iter()
+        .map(|a| a.num_chunks * config.audio_tokens_per_chunk)
+        .sum();
+    
+    text_len + image_tokens + audio_tokens
+}
+```
+
+**Scheduler implication:** KV cache pages cannot be allocated at request arrival time for multimodal requests. The flow is:
+
+```
+Request arrives → preprocess images/audio → compute total tokens → allocate KV pages → schedule
+```
+
+This is different from text-only where token count is known after tokenization (nearly instant).
+
+### 35.8 Crate Structure
+
+```
+crates/onnx-genai-preprocess/
+├── Cargo.toml          # deps: image, rubato (audio resample), rustfft
+├── src/
+│   ├── lib.rs
+│   ├── config.rs       # PreprocessConfig parsed from inference_metadata.yaml
+│   ├── image/
+│   │   ├── mod.rs
+│   │   ├── decode.rs   # JPEG/PNG/WebP → RGB buffer (via `image` crate)
+│   │   ├── resize.rs   # 3 modes: shortest_edge, fixed, longest_edge_pad
+│   │   ├── tiling.rs   # 3 modes: none, fixed_grid, dynamic_anyres
+│   │   └── normalize.rs
+│   ├── audio/
+│   │   ├── mod.rs
+│   │   ├── resample.rs # via `rubato` crate (high quality sinc resampling)
+│   │   ├── stft.rs     # via `rustfft`
+│   │   ├── mel.rs      # mel filterbank (precomputed matrix)
+│   │   └── normalize.rs
+│   └── tensor.rs       # lightweight tensor type for preprocessed data
+```
+
+**Dependencies:**
+- `image` — decode JPEG/PNG/WebP, resize with various filters
+- `rubato` — high-quality audio resampling
+- `rustfft` — FFT for STFT/mel computation
+- No ORT dependency. No GPU dependency. Pure CPU, portable everywhere.
+
+### 35.9 Mobius Contract
+
+The model export tool (Mobius) is responsible for:
+
+1. **NOT baking preprocessing into the ONNX graph** — model input is normalized tensor
+2. **Emitting `preprocessing` section in `inference_metadata.yaml`** — extracted from HuggingFace's `preprocessor_config.json` during export
+3. **Validating that preprocessing config matches model input shapes** — if model expects `[B,3,336,336]` then config must produce that
+
+The conversion from HuggingFace's inconsistent `preprocessor_config.json` formats to our unified YAML schema happens **once at export time**, not at serving time. This keeps the runtime simple.
+
+### 35.10 Fallback: Legacy Models with Baked-In Preprocessing
+
+Some older ONNX models have preprocessing baked into the graph (requiring ORT Extensions custom ops). For these:
+
+```yaml
+preprocessing:
+  mode: in_graph           # preprocessing is inside the ONNX model
+  raw_input: true          # model accepts raw bytes/pixels
+  extensions_required:
+    - com.microsoft.extensions.DecodeImage
+    - com.microsoft.extensions.ResizeImage
+```
+
+The runtime detects this and skips native preprocessing. ORT Extensions DLL must be available. This is a **compatibility escape hatch**, not the recommended path.
