@@ -14,6 +14,7 @@ pub mod decode;
 pub mod env;
 pub mod error;
 pub mod loader;
+pub mod mtp;
 pub mod session;
 pub mod tokenizer;
 pub mod value;
@@ -29,6 +30,10 @@ pub use decode::{
 pub use env::Environment;
 pub use error::{OrtError, Result};
 pub use loader::{ModelDirectory, PipelineModelDirectory, PipelineModels, PipelineTokenizerPaths};
+pub use mtp::{
+    LinearEmbedder, LinearLmHead, LmHead, MtpDecodeOptions, MtpDecodeSession, MtpDraftKvMode,
+    MtpHeadSignature, MtpProposal, TokenEmbedder, argmax,
+};
 pub use onnx_genai_metadata::{
     ProposalType, SpeculatorConfig, SpeculatorConfigSource, SpeculatorDescriptor,
     SpeculatorProposerKind, SpeculatorProposerStatus, SpeculatorVerifier, detect_speculator,
