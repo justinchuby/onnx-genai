@@ -6,7 +6,9 @@ use crate::logits::{
 };
 use crate::sampling::{sample_categorical, sample_greedy};
 use anyhow::Context;
-use onnx_genai_kv::{KvCacheOps, PagedKvCache, SequenceId};
+use onnx_genai_kv::{
+    KvCacheOps, KvDType, LayerKv, PageId, PageTensorConfig, PagedKvCache, PrefixCache, SequenceId,
+};
 use onnx_genai_metadata::InferenceMetadata;
 use onnx_genai_ort::{
     DataType, Environment, ModelDirectory, Session, SessionOptions, TensorInfo, Tokenizer, Value,
@@ -161,6 +163,8 @@ pub struct GenerateResult {
     pub token_ids: Vec<TokenId>,
     /// Termination reason.
     pub finish_reason: FinishReason,
+    /// Number of prompt/context tokens whose KV state was reused from the prefix cache.
+    pub prefix_cache_hit_len: usize,
 }
 
 /// Per-token streaming event shape for future callback/iterator APIs.
@@ -180,6 +184,10 @@ pub struct Engine {
     metadata: InferenceMetadata,
     /// KV cache manager.
     kv_cache: PagedKvCache,
+    /// Shared-prefix cache for reusing paged KV across sessions.
+    prefix_cache: PrefixCache,
+    /// KV tensor layout inferred from model present/past TensorInfo.
+    kv_model: Option<KvModelInfo>,
     /// Batch scheduler.
     scheduler: Scheduler,
     /// Persistent multi-turn session state, keyed by session id.
@@ -222,9 +230,6 @@ impl Engine {
             anyhow::bail!("Unsupported capabilities: {:?}", unsupported);
         }
 
-        // Initialize KV cache
-        let kv_cache = PagedKvCache::new(config.page_size, config.num_gpu_pages);
-
         // Initialize scheduler
         let scheduler = Scheduler::new(config.scheduler);
 
@@ -238,10 +243,20 @@ impl Engine {
         .map_err(|e| anyhow::anyhow!("Failed to load ORT session: {}", e))?;
         let tokenizer = Tokenizer::from_file(&model_directory.tokenizer_path)
             .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {}", e))?;
+        let kv_model = infer_kv_model_info(&session, config.page_size)?;
+        let kv_cache = if let Some(kv_model) = &kv_model {
+            // The paged tensor layout is derived from present-KV outputs: each
+            // layer has key/value tensors shaped like [batch, kv_heads, seq, head_dim].
+            PagedKvCache::new_with_tensor_config(kv_model.tensor_config, config.num_gpu_pages)
+        } else {
+            PagedKvCache::new(config.page_size, config.num_gpu_pages)
+        };
 
         Ok(Self {
             metadata,
             kv_cache,
+            prefix_cache: PrefixCache::new(),
+            kv_model,
             scheduler,
             sessions: HashMap::new(),
             _environment: environment,
@@ -330,7 +345,8 @@ impl Engine {
             .sessions
             .remove(&session_id)
             .with_context(|| format!("session {session_id} not found"))?;
-        state.tokens.extend_from_slice(&prompt_tokens);
+        let prefix_cache_hit_len =
+            self.prepare_session_prefix(session_id, &mut state, &prompt_tokens)?;
 
         let result = (|| -> anyhow::Result<GenerateResult> {
             for step in 0..options.max_new_tokens {
@@ -341,7 +357,13 @@ impl Engine {
                     step,
                 };
 
-                let mut logits = next_session_token_logits(&self.session, &mut state)?;
+                let mut logits = next_session_token_logits(
+                    &self.session,
+                    self.kv_model.as_ref(),
+                    &mut self.kv_cache,
+                    session_id,
+                    &mut state,
+                )?;
                 let token_id = select_next_token(&mut logits, &context, &options, &chain, 0.0);
                 generated_tokens.push(token_id);
                 state.tokens.push(token_id);
@@ -371,6 +393,7 @@ impl Engine {
                         })?,
                         token_ids: generated_tokens,
                         finish_reason,
+                        prefix_cache_hit_len,
                     });
                 }
             }
@@ -382,8 +405,13 @@ impl Engine {
                     .map_err(|e| anyhow::anyhow!("Failed to detokenize generated tokens: {}", e))?,
                 token_ids: generated_tokens,
                 finish_reason: FinishReason::MaxTokens,
+                prefix_cache_hit_len,
             })
         })();
+        if result.is_ok() {
+            self.ensure_session_kv_current(session_id, &mut state)?;
+            self.insert_cached_prefixes(session_id, &state, prompt_tokens.len())?;
+        }
         self.sessions.insert(session_id, state);
         self.scheduler.complete(session_id);
         result
@@ -456,6 +484,135 @@ impl Engine {
                 .map_err(|e| anyhow::anyhow!("Failed to tokenize prompt: {}", e)),
         }
     }
+
+    fn prepare_session_prefix(
+        &mut self,
+        session_id: SessionId,
+        state: &mut EngineSession,
+        prompt_tokens: &[TokenId],
+    ) -> anyhow::Result<usize> {
+        let same_session_hit_len = if state.decode_state.use_kv {
+            state.kv_token_count.min(state.tokens.len())
+        } else {
+            0
+        };
+        let started_empty = state.tokens.is_empty();
+        let mut loaded_prompt_prefix = 0;
+        let mut cross_session_hit_len = 0;
+
+        if started_empty
+            && state.decode_state.use_kv
+            && self.kv_model.is_some()
+            && self.kv_cache.page_table.tensor_config.is_some()
+        {
+            let matched = self
+                .prefix_cache
+                .lookup_shared(prompt_tokens, &mut self.kv_cache.page_table);
+            if matched.matched_tokens > 0 {
+                cross_session_hit_len = matched.matched_tokens;
+                let materialized_len = if matched.matched_tokens == prompt_tokens.len() {
+                    matched.matched_tokens.saturating_sub(1)
+                } else {
+                    matched.matched_tokens
+                };
+                let page_ids = matched
+                    .page_ids
+                    .iter()
+                    .copied()
+                    .take(materialized_len.div_ceil(self.kv_cache.page_table.page_size))
+                    .collect::<Vec<_>>();
+                for &page_id in &page_ids {
+                    self.kv_cache.page_table.retain(page_id);
+                }
+                self.prefix_cache.release_shared(
+                    prompt_tokens,
+                    matched.matched_tokens,
+                    &mut self.kv_cache.page_table,
+                );
+                if materialized_len > 0 {
+                    attach_pages_to_sequence(
+                        &mut self.kv_cache,
+                        session_id,
+                        &page_ids,
+                        materialized_len,
+                    )?;
+                    let materialized = self
+                        .kv_cache
+                        .materialize_sequence(session_id)
+                        .map_err(|e| anyhow::anyhow!("Failed to materialize prefix KV: {}", e))?;
+                    load_materialized_past(
+                        &self.session,
+                        self.kv_model.as_ref().expect("checked above"),
+                        &mut state.decode_state,
+                        &materialized,
+                    )?;
+                    state.kv_token_count = materialized_len;
+                    state
+                        .tokens
+                        .extend_from_slice(&prompt_tokens[..materialized_len]);
+                    loaded_prompt_prefix = materialized_len;
+                }
+            }
+        }
+
+        if started_empty {
+            state
+                .tokens
+                .extend_from_slice(&prompt_tokens[loaded_prompt_prefix..]);
+        } else {
+            state.tokens.extend_from_slice(prompt_tokens);
+        }
+        Ok(same_session_hit_len.max(cross_session_hit_len))
+    }
+
+    fn ensure_session_kv_current(
+        &mut self,
+        session_id: SessionId,
+        state: &mut EngineSession,
+    ) -> anyhow::Result<()> {
+        while state.decode_state.use_kv && state.kv_token_count < state.tokens.len() {
+            let _ = next_session_token_logits(
+                &self.session,
+                self.kv_model.as_ref(),
+                &mut self.kv_cache,
+                session_id,
+                state,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn insert_cached_prefixes(
+        &mut self,
+        session_id: SessionId,
+        state: &EngineSession,
+        prompt_len: usize,
+    ) -> anyhow::Result<()> {
+        if self.kv_model.is_none() || state.kv_token_count == 0 {
+            return Ok(());
+        }
+        if prompt_len > 0 && prompt_len <= state.kv_token_count {
+            self.insert_cached_prefix(session_id, &state.tokens[..prompt_len])?;
+        }
+        if state.kv_token_count == state.tokens.len() {
+            self.insert_cached_prefix(session_id, &state.tokens)?;
+        }
+        Ok(())
+    }
+
+    fn insert_cached_prefix(
+        &mut self,
+        session_id: SessionId,
+        tokens: &[TokenId],
+    ) -> anyhow::Result<()> {
+        if tokens.is_empty() || self.prefix_cache.lookup(tokens).0 == tokens.len() {
+            return Ok(());
+        }
+        let page_ids = sequence_pages_for_len(&self.kv_cache, session_id, tokens.len())?;
+        self.prefix_cache
+            .insert_pages(tokens, &page_ids, &mut self.kv_cache.page_table);
+        Ok(())
+    }
 }
 
 struct EngineSession {
@@ -465,6 +622,20 @@ struct EngineSession {
     kv_token_count: usize,
     /// ORT-managed past tensors retained between calls.
     decode_state: DecodeState,
+}
+
+#[derive(Debug, Clone)]
+struct KvModelInfo {
+    tensor_config: PageTensorConfig,
+    layers: Vec<KvLayerIo>,
+}
+
+#[derive(Debug, Clone)]
+struct KvLayerIo {
+    key_present: String,
+    value_present: String,
+    key_past: String,
+    value_past: String,
 }
 
 struct DecodeState {
@@ -527,12 +698,24 @@ impl DecodeState {
 
 fn next_session_token_logits(
     session: &Session,
+    kv_model: Option<&KvModelInfo>,
+    kv_cache: &mut PagedKvCache,
+    seq: SessionId,
     state: &mut EngineSession,
 ) -> anyhow::Result<Vec<f32>> {
     let (input_tokens, past_len) = session_decode_input_tokens(state)?;
     let input_len = input_tokens.len();
     let outputs = run_decode_step(session, &mut state.decode_state, &input_tokens, past_len)?;
     if state.decode_state.use_kv {
+        if let Some(kv_model) = kv_model {
+            mirror_present_kv_to_pages(
+                session, kv_model, kv_cache, seq, &outputs, past_len, input_len,
+            )?;
+        } else {
+            kv_cache
+                .append(seq, input_len)
+                .map_err(|e| anyhow::anyhow!("Failed to advance KV sequence {seq}: {}", e))?;
+        }
         state.kv_token_count += input_len;
     }
     extract_next_token_logits(session, outputs)
@@ -640,6 +823,342 @@ fn run_decode_step(
     }
 
     Ok(outputs)
+}
+
+fn infer_kv_model_info(session: &Session, page_size: usize) -> anyhow::Result<Option<KvModelInfo>> {
+    let mut key_outputs = Vec::new();
+    let mut value_outputs = Vec::new();
+    for info in session
+        .outputs()
+        .iter()
+        .filter(|info| is_present_output(&info.name))
+    {
+        let lower = info.name.to_ascii_lowercase();
+        if lower.contains("key") {
+            key_outputs.push(info.clone());
+        } else if lower.contains("value") {
+            value_outputs.push(info.clone());
+        }
+    }
+
+    if key_outputs.is_empty() && value_outputs.is_empty() {
+        return Ok(None);
+    }
+    key_outputs.sort_by_key(|info| kv_layer_index(&info.name).unwrap_or(usize::MAX));
+    value_outputs.sort_by_key(|info| kv_layer_index(&info.name).unwrap_or(usize::MAX));
+    if key_outputs.len() != value_outputs.len() {
+        anyhow::bail!(
+            "model exposes mismatched present key/value outputs: {} keys, {} values",
+            key_outputs.len(),
+            value_outputs.len()
+        );
+    }
+
+    let (num_kv_heads, head_dim) = infer_kv_heads_and_head_dim(&key_outputs[0])?;
+    let config = PageTensorConfig {
+        num_layers: key_outputs.len(),
+        num_kv_heads,
+        head_dim,
+        page_size,
+        dtype: KvDType::F32,
+    };
+    let kv_inputs = session
+        .inputs()
+        .iter()
+        .filter(|info| is_kv_input(&info.name))
+        .map(|info| info.name.clone())
+        .collect::<Vec<_>>();
+    let mut layers = Vec::with_capacity(key_outputs.len());
+    for (key, value) in key_outputs.iter().zip(value_outputs.iter()) {
+        if key.dtype != DataType::Float32 || value.dtype != DataType::Float32 {
+            anyhow::bail!("KV present outputs must be Float32");
+        }
+        let key_past = matching_past_input(&key.name, &kv_inputs)
+            .with_context(|| format!("missing past input for present output '{}'", key.name))?
+            .clone();
+        let value_past = matching_past_input(&value.name, &kv_inputs)
+            .with_context(|| format!("missing past input for present output '{}'", value.name))?
+            .clone();
+        layers.push(KvLayerIo {
+            key_present: key.name.clone(),
+            value_present: value.name.clone(),
+            key_past,
+            value_past,
+        });
+    }
+
+    Ok(Some(KvModelInfo {
+        tensor_config: config,
+        layers,
+    }))
+}
+
+fn infer_kv_heads_and_head_dim(info: &TensorInfo) -> anyhow::Result<(usize, usize)> {
+    if info.dtype != DataType::Float32 || info.shape.len() < 3 {
+        anyhow::bail!(
+            "present KV output '{}' must be Float32 rank >= 3, got {:?} {:?}",
+            info.name,
+            info.dtype,
+            info.shape
+        );
+    }
+    let head_dim = *info
+        .shape
+        .last()
+        .filter(|dim| **dim > 0)
+        .with_context(|| format!("cannot infer KV head_dim from '{}'", info.name))?
+        as usize;
+    let num_kv_heads = info
+        .shape
+        .iter()
+        .enumerate()
+        .find_map(|(idx, &dim)| {
+            (idx != 0 && idx + 1 != info.shape.len() && dim > 0).then_some(dim as usize)
+        })
+        .with_context(|| format!("cannot infer KV heads from '{}'", info.name))?;
+    Ok((num_kv_heads, head_dim))
+}
+
+fn mirror_present_kv_to_pages(
+    session: &Session,
+    kv_model: &KvModelInfo,
+    kv_cache: &mut PagedKvCache,
+    seq: SessionId,
+    outputs: &[Value],
+    past_len: usize,
+    input_len: usize,
+) -> anyhow::Result<()> {
+    let output_lookup = session
+        .output_names()
+        .iter()
+        .enumerate()
+        .map(|(idx, name)| (name.as_str(), idx))
+        .collect::<HashMap<_, _>>();
+    let layer_data = kv_model
+        .layers
+        .iter()
+        .map(|layer| {
+            let key = outputs[*output_lookup
+                .get(layer.key_present.as_str())
+                .with_context(|| format!("missing output '{}'", layer.key_present))?]
+            .to_vec_f32()?;
+            let key_shape = outputs[*output_lookup
+                .get(layer.key_present.as_str())
+                .with_context(|| format!("missing output '{}'", layer.key_present))?]
+            .shape()
+            .to_vec();
+            let value = outputs[*output_lookup
+                .get(layer.value_present.as_str())
+                .with_context(|| format!("missing output '{}'", layer.value_present))?]
+            .to_vec_f32()?;
+            let value_shape = outputs[*output_lookup
+                .get(layer.value_present.as_str())
+                .with_context(|| format!("missing output '{}'", layer.value_present))?]
+            .shape()
+            .to_vec();
+            Ok((key, key_shape, value, value_shape))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+
+    for offset in 0..input_len {
+        let token_pos = past_len + offset;
+        let owned_layers = layer_data
+            .iter()
+            .map(|(key, key_shape, value, value_shape)| {
+                Ok((
+                    extract_present_token(key, key_shape, kv_model.tensor_config, token_pos)?,
+                    extract_present_token(value, value_shape, kv_model.tensor_config, token_pos)?,
+                ))
+            })
+            .collect::<anyhow::Result<Vec<(Vec<f32>, Vec<f32>)>>>()?;
+        let borrowed = owned_layers
+            .iter()
+            .map(|(key, value)| LayerKv {
+                key: key.as_slice(),
+                value: value.as_slice(),
+            })
+            .collect::<Vec<_>>();
+        kv_cache
+            .append_token_kv(seq, &borrowed)
+            .map_err(|e| anyhow::anyhow!("Failed to mirror present KV into pages: {}", e))?;
+    }
+    Ok(())
+}
+
+fn extract_present_token(
+    data: &[f32],
+    shape: &[i64],
+    config: PageTensorConfig,
+    token_pos: usize,
+) -> anyhow::Result<Vec<f32>> {
+    let axes = kv_tensor_axes(shape, config, token_pos)?;
+    let strides = row_major_strides(shape);
+    let mut token = Vec::with_capacity(config.num_kv_heads * config.head_dim);
+    for head in 0..config.num_kv_heads {
+        for dim in 0..config.head_dim {
+            let mut indices = vec![0_usize; shape.len()];
+            indices[axes.head] = head;
+            indices[axes.sequence] = token_pos;
+            indices[axes.head_dim] = dim;
+            let flat = indices
+                .iter()
+                .zip(strides.iter())
+                .map(|(idx, stride)| idx * stride)
+                .sum::<usize>();
+            token.push(
+                *data
+                    .get(flat)
+                    .context("present KV tensor index out of bounds")?,
+            );
+        }
+    }
+    Ok(token)
+}
+
+fn load_materialized_past(
+    session: &Session,
+    kv_model: &KvModelInfo,
+    decode_state: &mut DecodeState,
+    materialized: &onnx_genai_kv::MaterializedKv,
+) -> anyhow::Result<()> {
+    let input_shapes = session
+        .inputs()
+        .iter()
+        .map(|info| (info.name.as_str(), info.shape.as_slice()))
+        .collect::<HashMap<_, _>>();
+    decode_state.past.clear();
+    for (idx, layer) in kv_model.layers.iter().enumerate() {
+        let key_shape = past_shape(
+            input_shapes
+                .get(layer.key_past.as_str())
+                .copied()
+                .context("missing key past input shape")?,
+            materialized.sequence_len,
+        )?;
+        let value_shape = past_shape(
+            input_shapes
+                .get(layer.value_past.as_str())
+                .copied()
+                .context("missing value past input shape")?,
+            materialized.sequence_len,
+        )?;
+        decode_state.past.insert(
+            layer.key_past.clone(),
+            Value::from_vec_f32(materialized.layers[idx].key.clone(), &key_shape)?,
+        );
+        decode_state.past.insert(
+            layer.value_past.clone(),
+            Value::from_vec_f32(materialized.layers[idx].value.clone(), &value_shape)?,
+        );
+    }
+    Ok(())
+}
+
+fn past_shape(shape: &[i64], sequence_len: usize) -> anyhow::Result<Vec<i64>> {
+    if shape.len() < 3 {
+        anyhow::bail!("KV past shape rank must be >= 3, got {:?}", shape);
+    }
+    let seq_axis = shape.len() - 2;
+    Ok(shape
+        .iter()
+        .enumerate()
+        .map(|(axis, &dim)| {
+            if axis == 0 {
+                1
+            } else if axis == seq_axis {
+                sequence_len as i64
+            } else {
+                dim
+            }
+        })
+        .collect())
+}
+
+fn attach_pages_to_sequence(
+    kv_cache: &mut PagedKvCache,
+    seq: SessionId,
+    page_ids: &[PageId],
+    len: usize,
+) -> anyhow::Result<()> {
+    if !kv_cache
+        .page_table
+        .get_sequence(seq)
+        .context("sequence not found")?
+        .is_empty()
+    {
+        anyhow::bail!("cannot attach prefix pages to a non-empty sequence");
+    }
+    for &page_id in page_ids {
+        kv_cache.page_table.push_page(seq, page_id);
+    }
+    kv_cache.page_table.set_sequence_len(seq, len);
+    Ok(())
+}
+
+fn sequence_pages_for_len(
+    kv_cache: &PagedKvCache,
+    seq: SessionId,
+    len: usize,
+) -> anyhow::Result<Vec<PageId>> {
+    let pages_needed = len.div_ceil(kv_cache.page_table.page_size);
+    Ok(kv_cache
+        .page_table
+        .get_sequence(seq)
+        .with_context(|| format!("sequence {seq} not found"))?
+        .iter()
+        .copied()
+        .take(pages_needed)
+        .collect())
+}
+
+struct KvTensorAxes {
+    head: usize,
+    sequence: usize,
+    head_dim: usize,
+}
+
+fn kv_tensor_axes(
+    shape: &[i64],
+    config: PageTensorConfig,
+    token_pos: usize,
+) -> anyhow::Result<KvTensorAxes> {
+    let head_dim = shape
+        .iter()
+        .rposition(|&dim| dim == config.head_dim as i64)
+        .context("KV tensor head_dim axis not found")?;
+    let head = shape
+        .iter()
+        .enumerate()
+        .find_map(|(idx, &dim)| {
+            (idx != head_dim && dim == config.num_kv_heads as i64).then_some(idx)
+        })
+        .context("KV tensor head axis not found")?;
+    let sequence = shape
+        .iter()
+        .enumerate()
+        .find_map(|(idx, &dim)| {
+            (idx != head && idx != head_dim && dim as usize > token_pos).then_some(idx)
+        })
+        .context("KV tensor sequence axis not found")?;
+    Ok(KvTensorAxes {
+        head,
+        sequence,
+        head_dim,
+    })
+}
+
+fn row_major_strides(shape: &[i64]) -> Vec<usize> {
+    let mut strides = vec![1; shape.len()];
+    for idx in (0..shape.len().saturating_sub(1)).rev() {
+        strides[idx] = strides[idx + 1] * shape[idx + 1] as usize;
+    }
+    strides
+}
+
+fn kv_layer_index(name: &str) -> Option<usize> {
+    name.split(|ch: char| !ch.is_ascii_digit())
+        .find(|part| !part.is_empty())
+        .and_then(|part| part.parse().ok())
 }
 
 fn extract_next_token_logits(session: &Session, outputs: Vec<Value>) -> anyhow::Result<Vec<f32>> {
