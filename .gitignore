@@ -1,4 +1,5 @@
 /target
+models/
 *.onnx
 *.safetensors
 .DS_Store
