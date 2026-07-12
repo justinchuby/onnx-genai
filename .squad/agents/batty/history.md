@@ -34,3 +34,8 @@ Batty's §24 sampler processors and §23 FIM APIs are now in decisions. Upcoming
 ## 2026-07-12T13:52:00-07:00 — §26 engine refactor and batched serving complete
 - Batty's engine decomposition is now the foundation for batched serving: `DecodeBackend` and the shared decode loop are the stable seam for past/present, static-cache, and future speculative/paged-attention backends.
 - Coordinate future §27/§28 work with Sebastian's `ContinuousBatchManager`, Deckard's active-row API, and Rachael's single-owner server driver.
+
+## 2026-07-12T14:28:00-07:00 — §25 traits and §27 prompt-lookup complete
+- Batty delivered behavior-preserving extensibility seams: `SpeculativeProposer`, `DraftModelProposer`, `Sampler` (`GreedySampler`/`CategoricalSampler`), and `ProcessorChain` builder/constraint registration APIs.
+- Batty also delivered prompt-lookup speculative decoding through `NgramProposer` and `SpeculativeMode::PromptLookup`, with greedy-equivalent output and multi-token accepts on repetitive input.
+- Remaining §27 advanced speculators (MTP/Medusa/EAGLE) need special models; coordinate future paths through the `SpeculativeProposer` verify/commit loop.

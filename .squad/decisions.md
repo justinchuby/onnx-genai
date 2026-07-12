@@ -72,3 +72,60 @@ Canonical, append-only record of accepted team decisions. Only the Coordinator (
 **Why:** §26's serving contract is now explicit and complete: compatible static-cache requests batch through `DecodeBackend`/`BatchedStaticCacheDecodeSession` and `ContinuousBatchManager`, the server serializes unsafe runtime ownership in one driver while exposing concurrent HTTP behavior, and `cargo test --workspace` stayed green throughout. Remaining serving-related work moves to §27/§28 advanced speculative paths, paged attention, and extensibility traits rather than baseline batched serving.
 
 ---
+
+---
+
+### 2026-07-12T13:52:00-07:00: Extensibility traits for speculation, sampling, and processors
+**By:** Batty
+
+**What:** Added the remaining DESIGN §25 internal seams while preserving the public generate flow and default behavior.
+
+- `SpeculativeProposer` in `crates/onnx-genai-engine/src/speculative.rs` is the draft-source seam:
+  - `propose(&mut self, &SpeculativeProposerContext) -> anyhow::Result<SpeculativeProposal>` returns linear candidate tokens today, with optional `positions`/`tree` fields reserved for tree/speculator layouts.
+  - `accept(&mut self, &SpeculativeAcceptContext)` and `rewind(&mut self, target_tokens)` are lifecycle hooks for accepting/rewinding proposer state.
+  - The existing draft-model speculative path is now `DraftModelProposer`, mapping the old greedy autoregressive `propose_draft_tokens` behavior onto `SpeculativeProposer::propose`; draft KV synchronization maps onto `rewind`.
+- `Sampler` in `crates/onnx-genai-engine/src/sampling.rs` is the final token-selection seam:
+  - `sample(&mut self, logits: &[f32], context: &ProcessorContext) -> TokenId` plus `name()`.
+  - `GreedySampler` delegates to the existing argmax/tie-lowest `sample_greedy` behavior.
+  - `CategoricalSampler` delegates to the existing deterministic-`rng_value` `sample_categorical` behavior.
+  - Decode loops still select greedy vs categorical from unchanged `GenerateOptions`.
+- Processor/constraint registration is exposed through `ProcessorChain::builder()`, `ProcessorChainBuilder::register_processor`, `register_constraint`, and `ProcessorChain::add_constraint`. Built-in processor construction and ordering remain unchanged: repetition/frequency/presence, stop/constraint, temperature, top-k, top-p, min-p.
+
+**Why:** §27 MTP/Medusa/EAGLE/prompt-lookup proposers can now implement `SpeculativeProposer` and feed the same verify/commit loop without editing acceptance or target KV rewind logic. Custom samplers can implement `Sampler` and be wired into new decode paths without changing token commit behavior. Custom logit processors or constraints can be registered on a processor chain without forking built-ins, while the default chain remains byte-for-byte behavior-preserving.
+
+**Validation:** `cargo check --workspace` and `cargo test --workspace` passed. Existing tiny fixture assertions remain unchanged: `tiny-llm` greedy `[22, 22, 20]`, `tiny-llm-scatter` greedy `[23, 15, 28]`, and draft-model speculative tiny-llm equals baseline greedy.
+
+---
+
+### 2026-07-12T13:58:00-07:00: Deterministic ORT threading for batched-vs-individual tests
+**By:** Sebastian
+
+**What:** Added an opt-in `SessionOptions::with_intra_op_threads(n)` builder and `Engine::from_dir_with_session_options(...)` so tests can load decode sessions with explicit ORT options. The Stage A fixed-batch and continuous-batch batched-vs-individual tests now construct both individual and batched engines with `intra_op_threads=1`.
+
+**Why:** ORT CPU's default multi-threaded intra-op reductions can legitimately change floating-point reduction order between a batched forward and individual forwards. Near a logit tie, greedy argmax can pick a different token, making exact batched==individual assertions flaky under full parallel `cargo test --workspace`. Single-threaded ORT keeps reduction order deterministic for these correctness tests while leaving production defaults unchanged (`intra_op_threads=0`, ORT decides).
+
+**Validation:** `cargo test -p onnx-genai-engine --test batched_static_decode` passed once, then passed 20/20 looped runs with 0 failures. `cargo test --workspace --quiet` passed 3/3 looped runs with 0 failures.
+
+---
+
+### 2026-07-12T14:10:00-07:00: Deterministic ORT comparison tests
+**By:** Deckard
+**What:** The real-model comparison tests in `crates/onnx-genai-ort/tests/decode_session.rs` now create sessions with `SessionOptions::default().with_intra_op_threads(1)`: `bound_decode_logits_match_naive_repass`, `bound_decode_rewind_matches_replay`, `static_cache_decode_reuses_buffers_and_rewinds_deterministically`, `batched_static_cache_matches_unbatched_rows_and_reuses_slots`, and `batched_static_cache_active_compaction_skips_inactive_rows_and_admits_replacement`. The test binary also shares one ORT `Environment`, matching ORT's one-environment-per-process guidance and avoiding concurrent environment initialization races.
+**Why:** Single-threaded intra-op execution fixes ORT's floating-point reduction order so exact greedy-token comparisons across naive, bound, batched, unbatched, full-reference, and compacted forwards remain strong and deterministic. This setting is test-only; production session defaults remain multi-threaded/ORT-selected for performance. Validation completed with 20/20 consecutive `cargo test -p onnx-genai-ort` runs and 5/5 consecutive `cargo test --workspace` runs, with zero failures including the previously flaky active-compaction test.
+
+---
+
+### 2026-07-12T14:20:00-07:00: Model-free prompt-lookup speculative decoding
+**By:** Batty
+
+**What:** Added `NgramProposer`, a `SpeculativeProposer` that takes the last configured `ngram` tokens, searches backward for the most recent earlier occurrence, and proposes up to `max_tokens` from the continuation after that match. No match returns an empty proposal, so the shared greedy-speculative loop performs one normal target step. Added additive `SpeculativeMode::{None, DraftModel, PromptLookup { ngram, max_tokens }}` selection to `EngineConfig` and an optional per-request override in `GenerateOptions`; legacy `draft_model` configuration still selects `DraftModel`.
+
+**Why:** Prompt lookup accelerates repetitive and structured generation without loading a draft model while retaining the existing target verification, correction-token, and KV rewind correctness path. Deterministic `tiny-llm` tests showed prompt-lookup output exactly equals plain greedy token-for-token. On repeated token context `[3,26,11,9,29,3,26,11,9,29]`, output matched baseline and recorded 2 accepted speculative tokens in one multi-token acceptance. `cargo check --workspace` and `cargo test --workspace` passed.
+
+---
+
+### 2026-07-12T14:28:00-07:00: §25/§27 extensibility, deterministic tests, and prompt-lookup milestone
+**By:** Scribe
+**What:** Recorded the current milestone set: Batty completed §25 extensibility seams (`SpeculativeProposer`, `DraftModelProposer`, `Sampler` with `GreedySampler`/`CategoricalSampler`, `ProcessorChain::builder`, `register_processor`, `register_constraint`, and `ProcessorChain::add_constraint`) while preserving facade behavior; Sebastian and Deckard made exact real-model comparison tests deterministic by running ORT test sessions with `intra_op_threads=1` and preserving production defaults; Batty added §27 model-free prompt-lookup speculative decoding through `NgramProposer` and `SpeculativeMode::{None, DraftModel, PromptLookup { ngram, max_tokens }}`.
+**Why:** DESIGN §1-27 is now substantially implemented without changing default generation behavior. The deterministic-test convention keeps exact-equality real-model tests strong while avoiding ORT floating-point tie flakes: real-model exact-equality tests must set ORT `intra_op_threads=1`. Remaining §27 work requires special MTP/Medusa/EAGLE models, and §28 speculators/paged attention plus fixture/doc refresh remain open.
+**Model policy:** Spawned agents should use task-appropriate models, with `gpt-5.5` as the floor and `gpt-5.6`/`opus-4.8` for harder work, per user direction.

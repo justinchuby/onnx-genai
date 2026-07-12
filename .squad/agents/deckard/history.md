@@ -33,3 +33,8 @@ Deckard's GPU EP, batched static-cache decode, and ORT checksum notes are now in
 ## 2026-07-12T13:52:00-07:00 — §26 active-row compaction complete
 - Deckard's `BatchedStaticCacheDecodeSession` active-row API is now part of the serving contract: `set_active_rows`, `compact`, `admit_row`, `deactivate_row`, `step_active`, and slot diagnostics back Sebastian/Rachael continuous batching.
 - Future paged-attention and ORT work should keep logical row ids stable while allowing packed physical execution.
+
+## 2026-07-12T14:28:00-07:00 — ORT comparison suite deterministic
+- Deckard made all five ORT real-model comparison tests use `intra_op_threads=1` and a shared test `Environment`.
+- The rare ORT FP-tie active-compaction flake was eliminated: 20/20 `onnx-genai-ort` and 5/5 full-workspace runs stayed clean.
+- Future exact ORT comparisons should prefer single-threaded intra-op execution unless the assertion is tolerant to reduction-order differences.

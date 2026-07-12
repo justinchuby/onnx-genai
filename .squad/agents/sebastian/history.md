@@ -12,3 +12,8 @@ Sebastian's perf review is now in decisions. §26 should prioritize active-row c
 ## 2026-07-12T13:52:00-07:00 — §26 Stage A/B complete
 - Sebastian delivered `Engine::generate_batched_static` and `ContinuousBatchManager`; fixed batched static-cache generation matches individual runs and measured 6.2x throughput on the tiny fixture.
 - Future scheduler/perf work should preserve the `submit`/`step`/`poll` contract and use Deckard's active-row compaction when rows finish or new requests are admitted.
+
+## 2026-07-12T14:28:00-07:00 — Batched-test ORT determinism fixed
+- Sebastian added `SessionOptions::with_intra_op_threads` and `Engine::from_dir_with_session_options` so correctness tests can force single-thread ORT execution.
+- Batched static-cache exact-equality tests now use `intra_op_threads=1`, eliminating reduction-order FP tie flakes while production defaults remain unchanged.
+- Preserve this convention for future real-model exact-equality tests.
