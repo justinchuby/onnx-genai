@@ -218,6 +218,16 @@ pub(crate) fn select_next_token(
     select_next_token_with_sampler(logits, context, chain, &mut sampler)
 }
 
+pub(crate) fn select_next_token_with_rng(
+    logits: &mut [f32],
+    context: &ProcessorContext,
+    options: &GenerateOptions,
+    chain: &ProcessorChain,
+    rng: &mut crate::sampling::SamplingRng,
+) -> TokenId {
+    select_next_token(logits, context, options, chain, rng.value_for(options))
+}
+
 pub(crate) fn select_next_token_with_sampler(
     logits: &mut [f32],
     context: &ProcessorContext,

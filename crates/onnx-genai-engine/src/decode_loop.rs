@@ -4,7 +4,10 @@ use crate::config::{
     FinishReason, GenerateOptions, GenerateResult, GenerateToken, GenerateTokenCallback,
 };
 use crate::logits::{ProcessorChain, ProcessorContext, TokenId};
-use crate::processors::{ensure_constrained_finish, finish_reason_after_token, select_next_token};
+use crate::processors::{
+    ensure_constrained_finish, finish_reason_after_token, select_next_token_with_rng,
+};
+use crate::sampling::SamplingRng;
 use onnx_genai_ort::Tokenizer;
 
 pub(crate) struct DecodeLoopState {
@@ -12,15 +15,17 @@ pub(crate) struct DecodeLoopState {
     pub(crate) generated_text: String,
     pub(crate) step: usize,
     pub(crate) prefix_cache_hit_len: usize,
+    pub(crate) rng: SamplingRng,
 }
 
 impl DecodeLoopState {
-    pub(crate) fn new(prefix_cache_hit_len: usize) -> Self {
+    pub(crate) fn new(prefix_cache_hit_len: usize, seed: Option<u64>) -> Self {
         Self {
             generated_tokens: Vec::new(),
             generated_text: String::new(),
             step: 0,
             prefix_cache_hit_len,
+            rng: SamplingRng::new(seed),
         }
     }
 }
@@ -91,7 +96,8 @@ pub(crate) fn step_decode_loop<B: DecodeLoopBackend>(
         step: state.step,
     };
     let mut logits = backend.next_logits()?;
-    let token_id = select_next_token(&mut logits, &context, options, chain, 0.0);
+    let token_id =
+        select_next_token_with_rng(&mut logits, &context, options, chain, &mut state.rng);
     backend.commit_token(token_id)?;
 
     if let Some(finish_reason) = commit_selected_token(

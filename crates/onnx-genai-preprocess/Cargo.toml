@@ -1,0 +1,17 @@
+[package]
+name = "onnx-genai-preprocess"
+description = "Native image and audio preprocessing for ONNX generative AI models"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords = ["onnx", "inference", "image", "audio"]
+categories = ["science", "multimedia"]
+
+[dependencies]
+anyhow = { workspace = true }
+hound = { workspace = true }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+rustfft = { workspace = true }
+serde = { workspace = true }
+serde_yaml = { workspace = true }

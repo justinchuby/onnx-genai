@@ -4,6 +4,7 @@ use crate::config::{GenerateOptions, SessionId};
 use crate::decode::{DecodeState, ModelDecodePath};
 use crate::kv_bridge::KvModelInfo;
 use crate::logits::{ProcessorChain, TokenId};
+use crate::sampling::SamplingRng;
 use onnx_genai_kv::PagedKvCache;
 use onnx_genai_ort::Session;
 
@@ -29,6 +30,7 @@ pub(crate) struct ActiveGenerate {
     pub(crate) generated_tokens: Vec<TokenId>,
     pub(crate) generated_text: String,
     pub(crate) step: usize,
+    pub(crate) rng: SamplingRng,
 }
 
 pub(crate) struct DraftModel {

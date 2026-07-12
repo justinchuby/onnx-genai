@@ -1,23 +1,10 @@
-use std::time::Duration;
+use std::{path::Path, time::Duration};
 
 use anyhow::Context;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use image::{DynamicImage, imageops::FilterType};
+use onnx_genai_preprocess::image::ImagePreprocessor;
 
 const MAX_IMAGE_BYTES: usize = 20 * 1024 * 1024;
-
-#[derive(Debug, Clone)]
-pub(crate) struct VisionInputSpec {
-    pub(crate) endpoint: String,
-    pub(crate) shape: Vec<i64>,
-    pub(crate) layout: ImageLayout,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum ImageLayout {
-    Nchw,
-    Nhwc,
-}
 
 #[derive(Debug)]
 pub(crate) struct ImageTensor {
@@ -26,47 +13,29 @@ pub(crate) struct ImageTensor {
     pub(crate) data: Vec<f32>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct VisionInputSpec {
+    pub(crate) endpoint: String,
+    preprocessor: ImagePreprocessor,
+}
+
 impl VisionInputSpec {
+    #[cfg(test)]
     pub(crate) fn from_input(endpoint: String, shape: &[i64]) -> anyhow::Result<Self> {
-        if shape.len() != 4 {
-            anyhow::bail!(
-                "vision input '{endpoint}' must be rank 4, but the model declares {shape:?}"
-            );
-        }
-        let layout = match (shape[1], shape[3]) {
-            (3, _) => ImageLayout::Nchw,
-            (_, 3) => ImageLayout::Nhwc,
-            _ => anyhow::bail!(
-                "vision input '{endpoint}' must declare an RGB channel dimension, but the model declares {shape:?}"
-            ),
-        };
-        let (height, width) = match layout {
-            ImageLayout::Nchw => (shape[2], shape[3]),
-            ImageLayout::Nhwc => (shape[1], shape[2]),
-        };
-        if height <= 0 || width <= 0 {
-            anyhow::bail!(
-                "vision input '{endpoint}' must declare fixed image dimensions, but the model declares {shape:?}"
-            );
-        }
-        if shape[0] == 0 || shape[0] < -1 {
-            anyhow::bail!(
-                "vision input '{endpoint}' has invalid batch dimension {}",
-                shape[0]
-            );
-        }
-        Ok(Self {
-            endpoint,
-            shape: shape.to_vec(),
-            layout,
-        })
+        Self::from_input_and_metadata(endpoint, shape, None)
     }
 
-    fn dimensions(&self) -> (u32, u32) {
-        match self.layout {
-            ImageLayout::Nchw => (self.shape[3] as u32, self.shape[2] as u32),
-            ImageLayout::Nhwc => (self.shape[2] as u32, self.shape[1] as u32),
-        }
+    pub(crate) fn from_input_and_metadata(
+        endpoint: String,
+        shape: &[i64],
+        metadata_path: Option<&Path>,
+    ) -> anyhow::Result<Self> {
+        let preprocessor = ImagePreprocessor::from_input_and_metadata(shape, metadata_path)
+            .with_context(|| format!("invalid preprocessing for vision input '{endpoint}'"))?;
+        Ok(Self {
+            endpoint,
+            preprocessor,
+        })
     }
 }
 
@@ -74,63 +43,18 @@ pub(crate) async fn load_and_preprocess(
     urls: &[String],
     spec: &VisionInputSpec,
 ) -> anyhow::Result<ImageTensor> {
-    if urls.is_empty() {
-        anyhow::bail!("at least one image is required");
-    }
-    if spec.shape[0] > 0 && spec.shape[0] as usize != urls.len() {
-        anyhow::bail!(
-            "this model expects {} image(s) per request, but {} were provided",
-            spec.shape[0],
-            urls.len()
-        );
-    }
-
     let mut images = Vec::with_capacity(urls.len());
     for url in urls {
-        let bytes = load_image_bytes(url).await?;
-        images.push(
-            image::load_from_memory(&bytes)
-                .with_context(|| format!("failed to decode image from {url}"))?,
-        );
+        images.push(load_image_bytes(url).await?);
     }
-    preprocess_images(&images, spec)
-}
-
-pub(crate) fn preprocess_images(
-    images: &[DynamicImage],
-    spec: &VisionInputSpec,
-) -> anyhow::Result<ImageTensor> {
-    let (width, height) = spec.dimensions();
-    let pixels_per_image = width as usize * height as usize;
-    let mut data = Vec::with_capacity(images.len() * 3 * pixels_per_image);
-
-    for image in images {
-        let rgb = image
-            .resize_exact(width, height, FilterType::Triangle)
-            .to_rgb8();
-        // The generic pipeline metadata exposes shape and dtype but no processor
-        // statistics, so use RGB values normalized to [0, 1].
-        match spec.layout {
-            ImageLayout::Nchw => {
-                for channel in 0..3 {
-                    data.extend(rgb.pixels().map(|pixel| pixel[channel] as f32 / 255.0));
-                }
-            }
-            ImageLayout::Nhwc => {
-                data.extend(
-                    rgb.pixels()
-                        .flat_map(|pixel| pixel.0.map(|value| value as f32 / 255.0)),
-                );
-            }
-        }
-    }
-
-    let mut shape = spec.shape.clone();
-    shape[0] = i64::try_from(images.len()).context("image batch is too large")?;
+    let tensor = spec
+        .preprocessor
+        .preprocess_encoded(&images)
+        .with_context(|| format!("failed to preprocess image for {}", spec.endpoint))?;
     Ok(ImageTensor {
         endpoint: spec.endpoint.clone(),
-        shape,
-        data,
+        shape: tensor.shape,
+        data: tensor.data,
     })
 }
 

@@ -151,7 +151,11 @@ impl AppState {
                         input.dtype
                     );
                 }
-                Some(VisionInputSpec::from_input(endpoint.clone(), &input.shape)?)
+                Some(VisionInputSpec::from_input_and_metadata(
+                    endpoint.clone(),
+                    &input.shape,
+                    Some(&directory.metadata_path),
+                )?)
             }
             _ => anyhow::bail!("pipeline declares multiple pixel_values inputs"),
         };

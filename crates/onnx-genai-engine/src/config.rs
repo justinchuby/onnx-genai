@@ -134,6 +134,8 @@ pub struct GenerateOptions {
     pub presence_penalty: f32,
     /// If true, choose argmax after processors; otherwise sample categorically.
     pub greedy: bool,
+    /// Optional seed for reproducible categorical sampling.
+    pub seed: Option<u64>,
     /// Text or token sequences that terminate generation when matched as a suffix.
     pub stop_sequences: Vec<StopSequence>,
     /// Optional EOS token id.
@@ -163,6 +165,7 @@ impl Default for GenerateOptions {
             frequency_penalty: 0.0,
             presence_penalty: 0.0,
             greedy: true,
+            seed: None,
             stop_sequences: Vec::new(),
             eos_token_id: None,
             stop_on_eos: true,

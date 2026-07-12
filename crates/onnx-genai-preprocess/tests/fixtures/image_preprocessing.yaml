@@ -1,0 +1,10 @@
+preprocessing:
+  image:
+    resize:
+      mode: fixed
+      size: 2
+      interpolation: bicubic
+      crop: none
+    normalize:
+      mean: [0.1, 0.2, 0.3]
+      std: [0.4, 0.5, 0.6]

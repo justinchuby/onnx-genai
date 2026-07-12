@@ -2,6 +2,32 @@
 
 use crate::config::GenerateOptions;
 use crate::logits::{ProcessorContext, TokenId};
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
+
+/// Per-request random state used only by categorical sampling.
+pub(crate) struct SamplingRng {
+    rng: StdRng,
+}
+
+impl SamplingRng {
+    pub(crate) fn new(seed: Option<u64>) -> Self {
+        let rng = seed.map_or_else(StdRng::from_os_rng, StdRng::seed_from_u64);
+        Self { rng }
+    }
+
+    pub(crate) fn for_row(seed: Option<u64>, row_index: usize) -> Self {
+        Self::new(seed.map(|seed| seed.wrapping_add(row_index as u64)))
+    }
+
+    pub(crate) fn value_for(&mut self, options: &GenerateOptions) -> f32 {
+        if options.greedy || options.temperature == 0.0 {
+            0.0
+        } else {
+            self.rng.random()
+        }
+    }
+}
 
 /// Final token selector used after logit processors have run.
 ///
@@ -97,7 +123,7 @@ pub fn sample_greedy(logits: &[f32]) -> u32 {
     best.map(|(idx, _)| idx as u32).unwrap_or(0)
 }
 
-/// Sample categorically from logits using `rng_value` in [0, 1].
+/// Sample categorically from logits using `rng_value` in [0, 1).
 pub fn sample_categorical(logits: &[f32], rng_value: f32) -> u32 {
     if logits.is_empty() {
         return 0;
@@ -161,5 +187,93 @@ mod tests {
 
         let mut categorical = CategoricalSampler::new(0.75);
         assert_eq!(categorical.sample(&[0.0, 0.0], &context), 1);
+    }
+
+    #[test]
+    fn seeded_sampling_is_reproducible_and_seed_sensitive() {
+        let options = GenerateOptions {
+            greedy: false,
+            seed: Some(42),
+            ..Default::default()
+        };
+        let draw = |seed| {
+            let mut rng = SamplingRng::new(Some(seed));
+            (0..64)
+                .map(|_| sample_categorical(&[0.0, 0.0, 0.0], rng.value_for(&options)))
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(draw(42), draw(42));
+        assert_ne!(draw(42), draw(43));
+    }
+
+    #[test]
+    fn categorical_sampling_matches_softmax_distribution() {
+        let logits = [0.0_f32, 1.0, 2.0];
+        let max_logit = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let weights = logits.map(|logit| (logit - max_logit).exp());
+        let total: f32 = weights.iter().sum();
+        let expected = weights.map(|weight| weight / total);
+        let options = GenerateOptions {
+            greedy: false,
+            ..Default::default()
+        };
+        let mut rng = SamplingRng::new(Some(7));
+        let draws = 100_000;
+        let mut counts = [0_usize; 3];
+        for _ in 0..draws {
+            counts[sample_categorical(&logits, rng.value_for(&options)) as usize] += 1;
+        }
+
+        for (count, probability) in counts.into_iter().zip(expected) {
+            let observed = count as f32 / draws as f32;
+            assert!(
+                (observed - probability).abs() < 0.01,
+                "observed {observed}, expected {probability}"
+            );
+        }
+        assert!(counts.into_iter().all(|count| count > 0));
+    }
+
+    #[test]
+    fn greedy_is_seed_independent_and_does_not_advance_rng() {
+        let greedy = GenerateOptions {
+            greedy: true,
+            seed: Some(11),
+            ..Default::default()
+        };
+        let sampled = GenerateOptions {
+            greedy: false,
+            seed: Some(11),
+            ..Default::default()
+        };
+        let mut after_greedy = SamplingRng::new(greedy.seed);
+        for _ in 0..32 {
+            assert_eq!(sample_greedy(&[1.0, 3.0, 2.0]), 1);
+            assert_eq!(after_greedy.value_for(&greedy), 0.0);
+        }
+        let mut untouched = SamplingRng::new(greedy.seed);
+        assert_eq!(
+            after_greedy.value_for(&sampled),
+            untouched.value_for(&sampled)
+        );
+    }
+
+    #[test]
+    fn per_row_rngs_are_seedable_and_independent() {
+        let options = GenerateOptions {
+            greedy: false,
+            ..Default::default()
+        };
+        let sequence = |row| {
+            let mut rng = SamplingRng::for_row(Some(99), row);
+            (0..32)
+                .map(|_| rng.value_for(&options))
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(sequence(0), sequence(0));
+        assert_eq!(sequence(1), sequence(1));
+        assert_ne!(sequence(0), sequence(1));
     }
 }

@@ -14,6 +14,7 @@ onnx-genai-kv = { workspace = true }
 onnx-genai-scheduler = { workspace = true }
 onnx-genai-engine = { workspace = true }
 onnx-genai-ort = { workspace = true }
+onnx-genai-preprocess = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
 
