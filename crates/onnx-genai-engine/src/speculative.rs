@@ -25,3 +25,313 @@ pub struct GreedyStep {
     /// Whether every proposed draft token was accepted.
     pub fully_accepted: bool,
 }
+
+use crate::TokenId;
+use crate::decode::{
+    extract_logits_sequence, next_session_token_logits, propose_draft_tokens,
+    run_decode_session_logits, run_decode_step,
+};
+use crate::decode_loop::{DecodeLoopState, commit_selected_token, reached_context_limit};
+use crate::engine::Engine;
+use crate::kv_bridge::{
+    common_prefix_len, mirror_present_kv_to_pages, rewind_draft_state_to_len,
+    rewind_target_state_to_len, trim_overmaterialized_target_kv,
+};
+use crate::logits::{ProcessorChain, ProcessorContext};
+use crate::processors::{ensure_constrained_finish, select_next_token};
+use crate::session::EngineSession;
+use crate::{FinishReason, GenerateOptions, GenerateResult, GenerateTokenCallback, SessionId};
+use anyhow::Context;
+use onnx_genai_kv::KvCacheOps;
+
+impl Engine {
+    pub(crate) fn should_use_speculative(&self, options: &GenerateOptions) -> bool {
+        self.draft.is_some()
+            // Grammar processors carry per-request parser state; draft/verify
+            // would need separate parser branches for speculative candidates.
+            && options.constraint.is_none()
+            && (options.greedy || options.temperature == 0.0)
+            && options
+                .num_speculative_tokens
+                .unwrap_or(self.num_speculative_tokens)
+                > 0
+            && self.kv_model.is_some()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn generate_speculative_loop(
+        &mut self,
+        session_id: SessionId,
+        state: &mut EngineSession,
+        options: &GenerateOptions,
+        chain: &ProcessorChain,
+        max_context: Option<usize>,
+        prefix_cache_hit_len: usize,
+        generated_tokens: &mut Vec<TokenId>,
+        generated_text: &mut String,
+        mut callback: Option<&mut GenerateTokenCallback<'_>>,
+    ) -> anyhow::Result<GenerateResult> {
+        let draft_width = options
+            .num_speculative_tokens
+            .unwrap_or(self.num_speculative_tokens)
+            .max(1);
+        let mut step = 0;
+
+        loop {
+            if generated_tokens.len() >= options.max_new_tokens {
+                ensure_constrained_finish(options, generated_text, FinishReason::MaxTokens)?;
+                return self.finish_result(
+                    generated_tokens,
+                    FinishReason::MaxTokens,
+                    prefix_cache_hit_len,
+                );
+            }
+            if reached_context_limit(state.tokens.len(), max_context) {
+                ensure_constrained_finish(options, generated_text, FinishReason::Length)?;
+                return self.finish_result(
+                    generated_tokens,
+                    FinishReason::Length,
+                    prefix_cache_hit_len,
+                );
+            }
+
+            let remaining_tokens = options.max_new_tokens - generated_tokens.len();
+            let remaining_context = max_context
+                .map(|limit| limit.saturating_sub(state.tokens.len()))
+                .unwrap_or(remaining_tokens);
+            let width = draft_width
+                .min(remaining_tokens)
+                .min(remaining_context)
+                .max(1);
+
+            let base_len = state.tokens.len();
+            let base_generated_len = generated_tokens.len();
+            let mut base_logits = next_session_token_logits(
+                &self.session,
+                self.kv_model.as_ref(),
+                &mut self.kv_cache,
+                session_id,
+                state,
+            )?;
+
+            let draft_tokens = {
+                let draft_model = self
+                    .draft
+                    .as_mut()
+                    .context("speculative decoding requested without a draft model")?;
+                let draft_state = state
+                    .draft
+                    .as_mut()
+                    .context("speculative session missing draft state")?;
+                draft_state.tokens = state.tokens[..base_len].to_vec();
+                if draft_state.kv_token_count > base_len {
+                    rewind_draft_state_to_len(draft_model, draft_state, base_len)?;
+                }
+                propose_draft_tokens(
+                    draft_model,
+                    draft_state,
+                    width,
+                    generated_tokens,
+                    generated_text,
+                    step,
+                    options,
+                    chain,
+                )?
+            };
+
+            state.tokens.extend_from_slice(&draft_tokens);
+            let verified_logits = if state.decode_state.has_runner() {
+                let logits =
+                    run_decode_session_logits(&mut state.decode_state, &draft_tokens, base_len)?;
+                self.kv_cache
+                    .append(session_id, draft_tokens.len())
+                    .map_err(|e| {
+                        anyhow::anyhow!("Failed to advance KV sequence {session_id}: {}", e)
+                    })?;
+                state.kv_token_count += draft_tokens.len();
+                logits
+            } else {
+                let outputs = run_decode_step(
+                    &self.session,
+                    &mut state.decode_state,
+                    &draft_tokens,
+                    base_len,
+                )?;
+                if state.decode_state.use_kv {
+                    if let Some(kv_model) = &self.kv_model {
+                        mirror_present_kv_to_pages(
+                            &self.session,
+                            kv_model,
+                            &mut self.kv_cache,
+                            session_id,
+                            &outputs,
+                            base_len,
+                            draft_tokens.len(),
+                        )?;
+                    } else {
+                        self.kv_cache
+                            .append(session_id, draft_tokens.len())
+                            .map_err(|e| {
+                                anyhow::anyhow!("Failed to advance KV sequence {session_id}: {}", e)
+                            })?;
+                    }
+                    state.kv_token_count += draft_tokens.len();
+                }
+                extract_logits_sequence(&self.session, outputs)?
+            };
+
+            let mut target_logits = Vec::with_capacity(draft_tokens.len() + 1);
+            target_logits.push(std::mem::take(&mut base_logits));
+            target_logits.extend(verified_logits);
+
+            let mut accepted = 0;
+            let mut replacement = None;
+            for idx in 0..draft_tokens.len() {
+                let mut context = ProcessorContext {
+                    prompt_tokens: state.tokens[..base_len].to_vec(),
+                    generated_tokens: generated_tokens
+                        .iter()
+                        .copied()
+                        .chain(draft_tokens[..idx].iter().copied())
+                        .collect(),
+                    generated_text: self
+                        .tokenizer
+                        .decode(
+                            &generated_tokens
+                                .iter()
+                                .copied()
+                                .chain(draft_tokens[..idx].iter().copied())
+                                .collect::<Vec<_>>(),
+                        )
+                        .map_err(|e| {
+                            anyhow::anyhow!("Failed to detokenize speculative context: {}", e)
+                        })?,
+                    step: step + idx,
+                };
+                let target_token =
+                    select_next_token(&mut target_logits[idx], &context, options, chain, 0.0);
+                if target_token == draft_tokens[idx] {
+                    accepted += 1;
+                } else {
+                    replacement = Some(target_token);
+                    context.generated_tokens.push(target_token);
+                    break;
+                }
+            }
+
+            let mut commit_tokens = draft_tokens[..accepted].to_vec();
+            let rewind_len = base_len + accepted;
+            rewind_target_state_to_len(
+                &self.session,
+                self.kv_model.as_ref(),
+                &mut self.kv_cache,
+                session_id,
+                state,
+                rewind_len,
+            )?;
+
+            if let Some(token) = replacement {
+                commit_tokens.push(token);
+            } else if generated_tokens.len() + commit_tokens.len() < options.max_new_tokens
+                && !reached_context_limit(base_len + commit_tokens.len(), max_context)
+            {
+                let mut context = ProcessorContext {
+                    prompt_tokens: state.tokens[..base_len].to_vec(),
+                    generated_tokens: generated_tokens
+                        .iter()
+                        .copied()
+                        .chain(draft_tokens.iter().copied())
+                        .collect(),
+                    generated_text: self
+                        .tokenizer
+                        .decode(
+                            &generated_tokens
+                                .iter()
+                                .copied()
+                                .chain(draft_tokens.iter().copied())
+                                .collect::<Vec<_>>(),
+                        )
+                        .map_err(|e| {
+                            anyhow::anyhow!("Failed to detokenize speculative context: {}", e)
+                        })?,
+                    step: step + draft_tokens.len(),
+                };
+                let token = select_next_token(
+                    target_logits
+                        .last_mut()
+                        .context("target verification did not produce next-token logits")?,
+                    &context,
+                    options,
+                    chain,
+                    0.0,
+                );
+                context.generated_tokens.push(token);
+                commit_tokens.push(token);
+            }
+
+            for (commit_idx, token_id) in commit_tokens.into_iter().enumerate() {
+                if generated_tokens.len() >= options.max_new_tokens
+                    || (commit_idx >= accepted
+                        && reached_context_limit(state.tokens.len(), max_context))
+                {
+                    break;
+                }
+                if commit_idx >= accepted {
+                    state.tokens.push(token_id);
+                }
+                self.scheduler.advance(session_id);
+                let prompt_tokens = state.tokens[..base_len.min(state.tokens.len())].to_vec();
+                let mut commit_state = DecodeLoopState {
+                    generated_tokens: std::mem::take(generated_tokens),
+                    generated_text: std::mem::take(generated_text),
+                    step,
+                    prefix_cache_hit_len,
+                };
+                let finish_reason = commit_selected_token(
+                    &mut commit_state,
+                    prompt_tokens,
+                    token_id,
+                    options,
+                    chain,
+                    &self.tokenizer,
+                    callback.as_deref_mut(),
+                )?;
+                *generated_tokens = commit_state.generated_tokens;
+                *generated_text = commit_state.generated_text;
+                step = commit_state.step;
+                if let Some(finish_reason) = finish_reason {
+                    trim_overmaterialized_target_kv(
+                        &self.session,
+                        self.kv_model.as_ref(),
+                        &mut self.kv_cache,
+                        session_id,
+                        state,
+                    )?;
+                    self.sync_draft_to_target(state)?;
+                    return self.finish_result(
+                        generated_tokens,
+                        finish_reason,
+                        prefix_cache_hit_len,
+                    );
+                }
+            }
+
+            self.sync_draft_to_target(state)?;
+
+            if generated_tokens.len() == base_generated_len {
+                anyhow::bail!("speculative decoding made no progress");
+            }
+        }
+    }
+
+    pub(crate) fn sync_draft_to_target(&mut self, state: &mut EngineSession) -> anyhow::Result<()> {
+        if let (Some(draft_model), Some(draft_state)) = (&mut self.draft, &mut state.draft) {
+            let common_len = common_prefix_len(&draft_state.tokens, &state.tokens);
+            if draft_state.kv_token_count > common_len {
+                rewind_draft_state_to_len(draft_model, draft_state, common_len)?;
+            }
+            draft_state.tokens = state.tokens.clone();
+        }
+        Ok(())
+    }
+}

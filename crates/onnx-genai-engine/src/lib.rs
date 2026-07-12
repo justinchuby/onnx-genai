@@ -7,11 +7,17 @@
 //! - Logit processors (sampling)
 //! - Speculative decoding (acceleration)
 
+pub mod config;
+pub(crate) mod decode;
+pub(crate) mod decode_loop;
 pub mod engine;
 pub mod fim;
+pub(crate) mod kv_bridge;
 pub mod logits;
 pub mod pipeline;
+pub(crate) mod processors;
 pub mod sampling;
+pub(crate) mod session;
 pub mod speculative;
 
 pub use engine::{

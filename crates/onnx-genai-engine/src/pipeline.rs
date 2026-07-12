@@ -1,12 +1,14 @@
 //! Multi-model pipeline orchestrator.
 
-use crate::engine::{
-    DecodeState, Engine, EngineConfig, build_processor_chain, clone_value,
-    ensure_constrained_finish, extract_next_token_logits, finish_reason_after_token,
-    infer_kv_model_info, run_decode_step_with_extra, select_next_token,
+use crate::decode::{
+    DecodeState, clone_value, extract_next_token_logits, run_decode_step_with_extra,
 };
-use crate::logits::{ProcessorContext, TokenId};
-use crate::{FinishReason, GeneratePrompt, GenerateRequest, GenerateResult, GenerateTokenCallback};
+use crate::decode_loop::{DecodeLoopBackend, DecodeLoopState, run_decode_loop};
+use crate::engine::{Engine, EngineConfig};
+use crate::kv_bridge::infer_kv_model_info;
+use crate::logits::TokenId;
+use crate::processors::build_processor_chain;
+use crate::{GeneratePrompt, GenerateRequest, GenerateResult, GenerateTokenCallback};
 use anyhow::Context;
 use onnx_genai_metadata::{
     DataflowEdge, PhaseRunOn, PipelineSpec, PipelineStrategy, PipelineStrategyKind,
@@ -128,9 +130,6 @@ impl PipelineEngine {
         let decoder_extras = self.decoder_extra_inputs(&tensors)?;
 
         let chain = build_processor_chain(&options, Some(self.tokenizer()?))?;
-        let mut context_tokens = prompt_tokens.clone();
-        let mut generated_tokens = Vec::new();
-        let mut generated_text = String::new();
         self.decoder_state = {
             let decoder = self.models.session(&self.plan.decoder).with_context(|| {
                 format!("pipeline decoder '{}' was not loaded", self.plan.decoder)
@@ -138,89 +137,39 @@ impl PipelineEngine {
             DecodeState::new(decoder)?
         };
 
-        for step in 0..options.max_new_tokens {
-            let past_len = if self.decoder_state.use_kv {
-                context_tokens
-                    .len()
-                    .saturating_sub(if step == 0 { prompt_tokens.len() } else { 1 })
-            } else {
-                0
-            };
-            let input_tokens = if self.decoder_state.use_kv && step > 0 {
-                context_tokens[context_tokens.len() - 1..].to_vec()
-            } else {
-                context_tokens.clone()
-            };
-            let outputs = run_decode_step_with_extra(
-                self.models.session(&self.plan.decoder).with_context(|| {
-                    format!("pipeline decoder '{}' was not loaded", self.plan.decoder)
-                })?,
-                &mut self.decoder_state,
-                &input_tokens,
-                past_len,
-                &decoder_extras,
-            )?;
-            let mut logits = extract_next_token_logits(
-                self.models.session(&self.plan.decoder).with_context(|| {
-                    format!("pipeline decoder '{}' was not loaded", self.plan.decoder)
-                })?,
-                outputs,
-            )?;
-            let mut processor_context = ProcessorContext {
-                prompt_tokens: context_tokens.clone(),
-                generated_tokens: generated_tokens.clone(),
-                generated_text: generated_text.clone(),
-                step,
-            };
-            let token_id =
-                select_next_token(&mut logits, &processor_context, &options, &chain, 0.0);
-            generated_tokens.push(token_id);
-            context_tokens.push(token_id);
-
-            let token_text = self
-                .tokenizer()?
-                .decode(&[token_id])
-                .map_err(|e| anyhow::anyhow!("Failed to detokenize token {token_id}: {}", e))?;
-            generated_text.push_str(&token_text);
-            processor_context.generated_tokens = generated_tokens.clone();
-            processor_context.generated_text = generated_text.clone();
-
-            let finish_reason =
-                finish_reason_after_token(token_id, &options, &chain, &processor_context);
-            if let Some(callback) = callback.as_deref_mut() {
-                callback(crate::GenerateToken {
-                    token_id,
-                    text: token_text,
-                    finish_reason: finish_reason.clone(),
-                })?;
-            }
-            if let Some(finish_reason) = finish_reason {
-                return self.finish_result(generated_tokens, finish_reason);
-            }
-        }
-
-        ensure_constrained_finish(&options, &generated_text, FinishReason::MaxTokens)?;
-        self.finish_result(generated_tokens, FinishReason::MaxTokens)
+        let decoder = self
+            .models
+            .session(&self.plan.decoder)
+            .with_context(|| format!("pipeline decoder '{}' was not loaded", self.plan.decoder))?;
+        let tokenizer = self
+            .models
+            .tokenizer_for(&self.tokenizer_component)
+            .with_context(|| {
+                format!("no tokenizer available for '{}'", self.tokenizer_component)
+            })?;
+        let mut backend = PipelineDecodeLoopBackend {
+            decoder,
+            decoder_state: &mut self.decoder_state,
+            decoder_extras: &decoder_extras,
+            context_tokens: prompt_tokens,
+            prompt_len: 0,
+            generated_count: 0,
+        };
+        backend.prompt_len = backend.context_tokens.len();
+        let mut loop_state = DecodeLoopState::new(0);
+        run_decode_loop(
+            &mut backend,
+            &mut loop_state,
+            &options,
+            &chain,
+            tokenizer,
+            None,
+            callback.as_deref_mut(),
+        )
     }
 
     pub fn spec(&self) -> &PipelineSpec {
         &self.models.directory.spec
-    }
-
-    fn finish_result(
-        &self,
-        generated_tokens: Vec<TokenId>,
-        finish_reason: FinishReason,
-    ) -> anyhow::Result<GenerateResult> {
-        Ok(GenerateResult {
-            text: self
-                .tokenizer()?
-                .decode(&generated_tokens)
-                .map_err(|e| anyhow::anyhow!("Failed to detokenize generated tokens: {}", e))?,
-            token_ids: generated_tokens,
-            finish_reason,
-            prefix_cache_hit_len: 0,
-        })
     }
 
     fn tokenizer(&self) -> anyhow::Result<&Tokenizer> {
@@ -302,6 +251,58 @@ fn tokenize_with(tokenizer: &Tokenizer, prompt: &GeneratePrompt) -> anyhow::Resu
         GeneratePrompt::Text(text) => tokenizer
             .encode(text)
             .map_err(|e| anyhow::anyhow!("Failed to tokenize prompt: {}", e)),
+    }
+}
+
+struct PipelineDecodeLoopBackend<'a> {
+    decoder: &'a Session,
+    decoder_state: &'a mut DecodeState,
+    decoder_extras: &'a [(String, Value)],
+    context_tokens: Vec<TokenId>,
+    prompt_len: usize,
+    generated_count: usize,
+}
+
+impl DecodeLoopBackend for PipelineDecodeLoopBackend<'_> {
+    fn context_len(&self) -> usize {
+        self.context_tokens.len()
+    }
+
+    fn processor_prompt_tokens(&self) -> Vec<TokenId> {
+        self.context_tokens.clone()
+    }
+
+    fn next_logits(&mut self) -> anyhow::Result<Vec<f32>> {
+        let past_len = if self.decoder_state.use_kv {
+            self.context_tokens
+                .len()
+                .saturating_sub(if self.generated_count == 0 {
+                    self.prompt_len
+                } else {
+                    1
+                })
+        } else {
+            0
+        };
+        let input_tokens = if self.decoder_state.use_kv && self.generated_count > 0 {
+            self.context_tokens[self.context_tokens.len() - 1..].to_vec()
+        } else {
+            self.context_tokens.clone()
+        };
+        let outputs = run_decode_step_with_extra(
+            self.decoder,
+            self.decoder_state,
+            &input_tokens,
+            past_len,
+            self.decoder_extras,
+        )?;
+        extract_next_token_logits(self.decoder, outputs)
+    }
+
+    fn commit_token(&mut self, token_id: TokenId) -> anyhow::Result<()> {
+        self.context_tokens.push(token_id);
+        self.generated_count += 1;
+        Ok(())
     }
 }
 
