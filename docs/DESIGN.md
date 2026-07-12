@@ -753,3 +753,249 @@ let alt_response = branch.generate("Actually, divide by 2 instead").await?;
 3. **Multi-GPU** — Phase 1-3 target single GPU. Multi-GPU (tensor parallel) requires splitting model and KV cache across devices. Defer to Phase 4+, but design page table to support multi-device from day one.
 
 4. **Benchmarking Baseline** — Compare against onnxruntime-genai (C++) on same model + same hardware to demonstrate competitive performance despite Rust overhead (expect: minimal difference since hot path is in ORT/CUDA).
+
+---
+
+## 15. Design Decisions (Confirmed)
+
+| Decision | Choice | Notes |
+|---|---|---|
+| ORT binding | Custom C API wrapper (reference `ort` crate) | `ort` crate not fresh enough; use latest ORT C API directly via `ort-sys` |
+| GPU memory | ORT-managed (via IoBinding) | Must support NPU/DirectML/etc, not just CUDA |
+| KV cache I/O | Explicit input/output on ONNX model | Mobius generates models with KV as explicit I/O, using opset 24 tensor scatter |
+| License | MIT | |
+| MSRV | Latest stable | No old Rust version compat needed |
+| Quantized models | Must support | INT4/INT8 weight models from Mobius |
+| Diffusion | Must support | Not just LLM — diffusion pipelines too |
+
+---
+
+## 16. Quantized Model Support
+
+### How it works with ORT
+
+ORT handles quantized ops natively (MatMulNBits, QLinearConv, etc.). From our runtime's perspective:
+
+- **Weight-only quantization (W4A16, W8A16):** Model weights stored in INT4/INT8, activations in FP16. ORT dequantizes on-the-fly during execution. We load the model as-is — no special handling needed beyond passing the right session options.
+- **Weight + Activation quantization (W8A8, W4A8):** Both weights and activations quantized. ORT kernels handle this. We ensure correct input dtype.
+- **KV cache quantization:** We quantize/dequantize at the cache boundary (on append/read). Controlled by metadata's `kv_cache.quantization_tolerance`.
+
+```rust
+/// Quantization config derived from inference metadata.
+pub struct QuantConfig {
+    /// Weight quantization scheme (informational — ORT handles execution).
+    pub weight_scheme: Option<String>,  // "int4_group128", "awq", "gptq"
+    /// KV cache runtime quantization (we manage this).
+    pub kv_dtype: DataType,
+    /// Layers exempt from KV quantization.
+    pub kv_sensitive_layers: Vec<usize>,
+}
+```
+
+### What we actually need to implement
+
+1. **Model loading:** Pass correct session options (EP selection, optimization level) — ORT does the rest
+2. **KV cache quantization:** We own this. Quantize FP16→FP8/INT8 on `append()`, dequantize on read for attention input
+3. **Mixed precision metadata:** Read from `inference_metadata.yaml`, apply to KV cache manager
+
+---
+
+## 17. Diffusion Pipeline Support
+
+### Architecture for Diffusion
+
+Diffusion models are fundamentally different from LLM generation:
+- No KV cache, no autoregressive loop
+- Instead: iterative denoising loop (N steps, typically 20-50)
+- Multiple models in a pipeline: text encoder → U-Net/DiT → VAE decoder
+
+### Design
+
+```rust
+/// Diffusion pipeline executor.
+pub struct DiffusionPipeline {
+    /// Text encoder (CLIP/T5)
+    text_encoder: OrtSession,
+    /// Denoising model (U-Net or DiT)
+    denoiser: OrtSession,
+    /// VAE decoder (latent → pixel)
+    vae_decoder: OrtSession,
+    /// Noise scheduler
+    scheduler: NoiseScheduler,
+}
+
+pub enum NoiseScheduler {
+    DDPM { num_steps: usize, beta_schedule: BetaSchedule },
+    DDIM { num_steps: usize, eta: f32 },
+    EulerDiscrete { num_steps: usize },
+    FlowMatching { num_steps: usize, shift: f32 },
+}
+
+impl DiffusionPipeline {
+    pub fn generate(&self, prompt: &str, config: DiffusionConfig) -> Result<Image> {
+        // 1. Encode text
+        let text_embeddings = self.text_encoder.run(prompt_tokens)?;
+        
+        // 2. Initialize latent noise
+        let mut latents = random_latent(config.height, config.width, config.seed);
+        
+        // 3. Denoising loop
+        for t in self.scheduler.timesteps() {
+            let noise_pred = self.denoiser.run(latents, t, text_embeddings)?;
+            latents = self.scheduler.step(noise_pred, t, latents);
+            
+            // Optional: yield progress
+        }
+        
+        // 4. Decode latent → image
+        let image = self.vae_decoder.run(latents)?;
+        Ok(image)
+    }
+}
+```
+
+### Unified via Pipeline Orchestrator
+
+The existing pipeline spec from metadata handles this:
+
+```yaml
+pipeline:
+  models:
+    text_encoder: { type: text_encoder, filename: text_encoder.onnx }
+    unet: { type: denoiser, filename: unet.onnx }
+    vae: { type: vae_decoder, filename: vae_decoder.onnx }
+  
+  strategy:
+    kind: diffusion
+    scheduler: euler_discrete
+    num_steps: 20
+    guidance_scale: 7.5
+  
+  dataflow:
+    - from: text_encoder.last_hidden_state
+      to: unet.encoder_hidden_states
+    - from: unet.output
+      to: vae.latent_sample
+  
+  phases:
+    text_encoder:
+      run_on: prompt_only
+    unet:
+      run_on: denoise_loop    # new phase type for diffusion
+    vae:
+      run_on: final_only
+```
+
+### What this means for crate structure
+
+Add a new crate or module:
+
+```
+crates/
+├── onnx-genai-engine/
+│   ├── src/
+│   │   ├── engine.rs          # LLM generation engine
+│   │   ├── diffusion.rs       # Diffusion pipeline engine (NEW)
+│   │   ├── pipeline.rs        # Unified pipeline orchestrator (routes to LLM or diffusion)
+```
+
+The `pipeline.rs` orchestrator reads `strategy.kind` from metadata:
+- `kind: speculative` → LLM generation path
+- `kind: diffusion` → Diffusion denoising path
+- `kind: null/none` → Simple single-model forward pass
+
+### Key difference from LLM path
+
+| | LLM | Diffusion |
+|---|---|---|
+| State management | KV cache (paged, persistent) | Latent tensor (temporary, fixed size) |
+| Loop | Autoregressive (variable length) | Fixed N steps |
+| Batching | Continuous batching across requests | Batch dimension within one request (CFG) |
+| Memory pattern | Growing (context accumulates) | Fixed (same size each step) |
+| Streaming | Token-by-token | Step-by-step progress |
+
+So diffusion doesn't need the KV cache manager or the continuous batching scheduler. But it shares:
+- ORT session management
+- Pipeline orchestration
+- Device placement
+- Inference metadata schema
+- The HTTP API layer
+
+---
+
+## 18. ORT C API Wrapper Design
+
+### Why custom wrapper
+
+The `ort` crate (pyke/ort):
+- Stuck on older ORT versions
+- Heavy abstraction that hides C API details we need (IoBinding, custom allocators)
+- We need latest ORT for opset 24 support (tensor scatter for KV)
+
+### Approach
+
+Thin, safe wrapper over `onnxruntime-sys` (or our own bindgen):
+
+```rust
+// crates/onnx-genai-ort/src/lib.rs
+
+/// Safe wrapper over ORT C API.
+pub struct Environment { /* OrtEnv* */ }
+pub struct Session { /* OrtSession* */ }
+pub struct IoBinding { /* OrtIoBinding* */ }
+pub struct Value { /* OrtValue* — tensor */ }
+pub struct Allocator { /* OrtAllocator* */ }
+pub struct MemoryInfo { /* OrtMemoryInfo* */ }
+
+impl Session {
+    pub fn new(env: &Environment, path: &Path, options: SessionOptions) -> Result<Self>;
+    pub fn run(&self, inputs: &[(&str, &Value)]) -> Result<Vec<Value>>;
+    pub fn run_with_binding(&self, binding: &IoBinding) -> Result<()>;
+}
+
+impl IoBinding {
+    /// Bind a pre-allocated tensor to an input/output name.
+    /// This is how we pass KV cache pages without copying.
+    pub fn bind_input(&mut self, name: &str, value: &Value) -> Result<()>;
+    pub fn bind_output(&mut self, name: &str, memory_info: &MemoryInfo) -> Result<()>;
+}
+
+impl Value {
+    /// Create a tensor on a specific device (GPU/CPU/NPU).
+    pub fn tensor(shape: &[i64], dtype: DataType, memory_info: &MemoryInfo) -> Result<Self>;
+    /// Create from existing data (zero-copy when possible).
+    pub fn from_slice<T>(data: &[T], shape: &[i64]) -> Result<Self>;
+}
+```
+
+### New crate needed
+
+```
+crates/
+├── onnx-genai-ort/            # ORT C API safe wrapper (NEW)
+│   ├── src/
+│   │   ├── lib.rs
+│   │   ├── env.rs             # Environment
+│   │   ├── session.rs         # Session + SessionOptions
+│   │   ├── value.rs           # Tensor values
+│   │   ├── binding.rs         # IoBinding
+│   │   ├── allocator.rs       # Allocator + MemoryInfo
+│   │   └── error.rs           # ORT status → Result
+│   ├── ort-sys/               # Raw bindgen (or reference onnxruntime-sys)
+│   └── Cargo.toml
+```
+
+---
+
+## 19. Updated Crate Dependency Graph
+
+```
+onnx-genai-server (binary)
+    └── onnx-genai (library, re-exports)
+            ├── onnx-genai-engine
+            │       ├── onnx-genai-kv
+            │       ├── onnx-genai-scheduler
+            │       ├── onnx-genai-metadata
+            │       └── onnx-genai-ort (NEW)
+            └── onnx-genai-metadata
+```

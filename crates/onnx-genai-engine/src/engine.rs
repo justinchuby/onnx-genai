@@ -2,7 +2,7 @@
 
 use onnx_genai_kv::{PagedKvCache, KvCacheOps, SequenceId};
 use onnx_genai_metadata::InferenceMetadata;
-use onnx_genai_scheduler::{Scheduler, SchedulerConfig, Priority};
+use onnx_genai_scheduler::{Scheduler, SchedulerConfig};
 use std::path::Path;
 
 /// Engine configuration.
@@ -34,10 +34,10 @@ pub struct Engine {
     kv_cache: PagedKvCache,
     /// Batch scheduler.
     scheduler: Scheduler,
-    // ORT session for the decoder model.
-    // session: ort::Session,  // TODO: uncomment when ort is configured
-    // Tokenizer.
-    // tokenizer: tokenizers::Tokenizer,  // TODO: uncomment when ready
+    // ORT session (added when wiring up C API)
+    // session: onnx_genai_ort::Session,
+    // Tokenizer (added when wiring up HF tokenizers)
+    // tokenizer: tokenizers::Tokenizer,
 }
 
 impl Engine {
@@ -49,7 +49,6 @@ impl Engine {
             onnx_genai_metadata::load_metadata(&metadata_path)
                 .map_err(|e| anyhow::anyhow!("Failed to load metadata: {}", e))?
         } else {
-            // Fall back to JSON
             let json_path = model_dir.join("inference_metadata.json");
             if json_path.exists() {
                 onnx_genai_metadata::load_metadata(&json_path)
@@ -80,9 +79,6 @@ impl Engine {
 
         // Initialize scheduler
         let scheduler = Scheduler::new(config.scheduler);
-
-        // TODO: Load ORT session
-        // TODO: Load tokenizer
 
         Ok(Self {
             metadata,

@@ -6,6 +6,7 @@ members = [
     "crates/onnx-genai-kv",
     "crates/onnx-genai-scheduler",
     "crates/onnx-genai-engine",
+    "crates/onnx-genai-ort",
     "crates/onnx-genai-server",
 ]
 
@@ -22,9 +23,9 @@ onnx-genai-metadata = { path = "crates/onnx-genai-metadata" }
 onnx-genai-kv = { path = "crates/onnx-genai-kv" }
 onnx-genai-scheduler = { path = "crates/onnx-genai-scheduler" }
 onnx-genai-engine = { path = "crates/onnx-genai-engine" }
+onnx-genai-ort = { path = "crates/onnx-genai-ort" }
 
 # External
-ort = "2.0.0-rc.12"
 tokenizers = "0.21"
 tokio = { version = "1", features = ["full"] }
 axum = "0.8"

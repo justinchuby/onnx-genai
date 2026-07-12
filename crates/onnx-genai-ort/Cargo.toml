@@ -1,0 +1,14 @@
+[package]
+name = "onnx-genai-ort"
+description = "Safe Rust wrapper over ONNX Runtime C API"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[build-dependencies]
+# bindgen will be added when we wire up the actual ORT C headers
+# bindgen = "0.71"
