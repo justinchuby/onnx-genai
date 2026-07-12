@@ -2,11 +2,39 @@
 
 use crate::logits::{StopSequence, TokenId};
 use onnx_genai_kv::SequenceId;
+use onnx_genai_ort::MtpDraftKvMode;
 use onnx_genai_scheduler::{Priority, SchedulerConfig};
 use std::path::PathBuf;
 
+/// Files and target-model outputs required for multi-token prediction.
+///
+/// The target decoder must emit both logits and the configured last-layer
+/// hidden-state output on every forward. The embedding and LM-head files must
+/// contain the exact target weights as little-endian f32 matrices; mismatched
+/// weights remain greedy-correct because every candidate is target-verified,
+/// but will reduce acceptance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MtpConfig {
+    /// ONNX model containing the MTP head.
+    pub head_model: PathBuf,
+    /// Target decoder output containing `[batch, sequence, hidden]` states.
+    pub target_hidden_output: String,
+    /// Raw little-endian f32 target embedding weights in `[vocab, hidden]` order.
+    pub embedding_weights: PathBuf,
+    /// Raw little-endian f32 target LM-head weights in `[hidden, vocab]` order.
+    pub lm_head_weights: PathBuf,
+    /// Target vocabulary size.
+    pub vocab_size: usize,
+    /// Target hidden size.
+    pub hidden_size: usize,
+    /// MTP-head cache strategy.
+    pub kv_mode: MtpDraftKvMode,
+    /// Number of speculative tokens produced after the guaranteed target token.
+    pub num_speculative_tokens: usize,
+}
+
 /// Built-in speculative candidate source.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SpeculativeMode {
     /// Disable speculative decoding.
     None,
@@ -19,6 +47,8 @@ pub enum SpeculativeMode {
         /// Maximum copied continuation length per verification step.
         max_tokens: usize,
     },
+    /// Propose from a target hidden state with an external MTP head.
+    Mtp(MtpConfig),
 }
 
 impl Default for SpeculativeMode {
@@ -199,8 +229,24 @@ impl GenerateOptions {
                 anyhow::bail!("prompt-lookup max_tokens must be greater than zero");
             }
         }
+        if let Some(SpeculativeMode::Mtp(config)) = &self.speculative_mode {
+            validate_mtp_config(config)?;
+        }
         Ok(())
     }
+}
+
+pub(crate) fn validate_mtp_config(config: &MtpConfig) -> anyhow::Result<()> {
+    if config.target_hidden_output.is_empty() {
+        anyhow::bail!("MTP target_hidden_output must not be empty");
+    }
+    if config.vocab_size == 0 || config.hidden_size == 0 {
+        anyhow::bail!("MTP vocab_size and hidden_size must be greater than zero");
+    }
+    if config.num_speculative_tokens == 0 {
+        anyhow::bail!("MTP num_speculative_tokens must be greater than zero");
+    }
+    Ok(())
 }
 
 /// A single generation request.

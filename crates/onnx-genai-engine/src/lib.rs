@@ -24,7 +24,7 @@ pub mod speculative;
 pub use batched::{ContinuousBatchEvent, ContinuousBatchHandle, ContinuousBatchManager};
 pub use engine::{
     Engine, EngineConfig, FinishReason, GenerateConstraint, GenerateOptions, GeneratePrompt,
-    GenerateRequest, GenerateResult, GenerateToken, GenerateTokenCallback,
+    GenerateRequest, GenerateResult, GenerateToken, GenerateTokenCallback, MtpConfig,
     PrioritizedGenerateRequest, PrioritizedGenerateResult, ScheduledGenerateArrival, SessionId,
     SpeculativeMode,
 };
@@ -36,6 +36,6 @@ pub use logits::{
 pub use pipeline::{PipelineEngine, PipelineGenerateRequest, PipelineTensors};
 pub use sampling::{CategoricalSampler, GreedySampler, Sampler};
 pub use speculative::{
-    NgramProposer, SpeculativeAcceptContext, SpeculativeProposal, SpeculativeProposer,
+    MtpProposer, NgramProposer, SpeculativeAcceptContext, SpeculativeProposal, SpeculativeProposer,
     SpeculativeProposerContext, SpeculativeStats,
 };

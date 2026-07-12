@@ -20,14 +20,17 @@ use crate::session::{ActiveGenerate, DraftModel, DraftSession, EngineSession};
 use anyhow::Context;
 use onnx_genai_kv::{KvCacheOps, PagedKvCache, PrefixCache};
 use onnx_genai_metadata::InferenceMetadata;
-use onnx_genai_ort::{Environment, ModelDirectory, Session, SessionOptions, Tokenizer};
+use onnx_genai_ort::{
+    DataType, Environment, LinearEmbedder, LinearLmHead, ModelDirectory, MtpDecodeSession, Session,
+    SessionOptions, Tokenizer,
+};
 use onnx_genai_scheduler::{Priority, Scheduler};
 use std::collections::HashMap;
 use std::path::Path;
 
 pub use crate::config::{
     EngineConfig, FinishReason, GenerateConstraint, GenerateOptions, GeneratePrompt,
-    GenerateRequest, GenerateResult, GenerateToken, GenerateTokenCallback,
+    GenerateRequest, GenerateResult, GenerateToken, GenerateTokenCallback, MtpConfig,
     PrioritizedGenerateRequest, PrioritizedGenerateResult, ScheduledGenerateArrival, SessionId,
     SpeculativeMode,
 };
@@ -57,6 +60,8 @@ pub struct Engine {
     pub(crate) session: Box<Session>,
     /// Optional draft model used by the speculative decoding path.
     pub(crate) draft: Option<DraftModel>,
+    /// Optional MTP head and target-side projections.
+    pub(crate) mtp: Option<MtpModel>,
     /// Tokenizer loaded from the model directory.
     pub(crate) tokenizer: Tokenizer,
     /// Auto-detected fill-in-the-middle token configuration.
@@ -67,6 +72,16 @@ pub struct Engine {
     pub(crate) speculative_mode: SpeculativeMode,
     /// Diagnostics from the most recent generation call.
     pub(crate) last_speculative_stats: SpeculativeStats,
+}
+
+pub(crate) struct MtpModel {
+    pub(crate) config: MtpConfig,
+    pub(crate) session: Box<Session>,
+    pub(crate) embedder: LinearEmbedder,
+    pub(crate) lm_head: LinearLmHead,
+    pub(crate) hidden_output: String,
+    pub(crate) kv_mode: onnx_genai_ort::MtpDraftKvMode,
+    pub(crate) num_speculative_tokens: usize,
 }
 
 impl Engine {
@@ -166,11 +181,76 @@ impl Engine {
             SpeculativeMode::None if draft.is_some() => SpeculativeMode::DraftModel,
             mode => mode,
         };
-        if let SpeculativeMode::PromptLookup { ngram, max_tokens } = speculative_mode {
-            if ngram == 0 || max_tokens == 0 {
+        if let SpeculativeMode::PromptLookup { ngram, max_tokens } = &speculative_mode {
+            if *ngram == 0 || *max_tokens == 0 {
                 anyhow::bail!("prompt-lookup ngram and max_tokens must be greater than zero");
             }
         }
+        let mtp = if let SpeculativeMode::Mtp(mtp_config) = &speculative_mode {
+            crate::config::validate_mtp_config(mtp_config)?;
+            let hidden_output = session
+                .outputs()
+                .iter()
+                .find(|output| output.name == mtp_config.target_hidden_output)
+                .with_context(|| {
+                    format!(
+                        "MTP target model must expose hidden-state output '{}'",
+                        mtp_config.target_hidden_output
+                    )
+                })?;
+            if hidden_output.dtype != DataType::Float32 {
+                anyhow::bail!(
+                    "MTP target hidden-state output '{}' must be Float32, got {:?}",
+                    hidden_output.name,
+                    hidden_output.dtype
+                );
+            }
+            if hidden_output.shape.last().copied().filter(|dim| *dim > 0)
+                != Some(mtp_config.hidden_size as i64)
+            {
+                anyhow::bail!(
+                    "MTP target hidden-state output '{}' shape {:?} does not end in configured hidden size {}",
+                    hidden_output.name,
+                    hidden_output.shape,
+                    mtp_config.hidden_size
+                );
+            }
+            let head_session = Session::new(
+                &environment,
+                &mtp_config.head_model,
+                session_options.clone(),
+            )
+            .map_err(|error| anyhow::anyhow!("Failed to load MTP head: {error}"))?;
+            let head_signature = MtpDecodeSession::detect(&head_session)
+                .map_err(|error| anyhow::anyhow!("Failed to inspect MTP head: {error}"))?
+                .context("configured MTP head model does not expose MTP head I/O")?;
+            if head_signature.hidden_size != mtp_config.hidden_size {
+                anyhow::bail!(
+                    "MTP head hidden size {} does not match configured target hidden size {}",
+                    head_signature.hidden_size,
+                    mtp_config.hidden_size
+                );
+            }
+            let embedding = read_f32_weights(&mtp_config.embedding_weights)?;
+            let lm_head = read_f32_weights(&mtp_config.lm_head_weights)?;
+            Some(MtpModel {
+                config: mtp_config.clone(),
+                session: Box::new(head_session),
+                embedder: LinearEmbedder::new(
+                    embedding,
+                    mtp_config.vocab_size,
+                    mtp_config.hidden_size,
+                )
+                .map_err(|error| anyhow::anyhow!("Invalid MTP embedding weights: {error}"))?,
+                lm_head: LinearLmHead::new(lm_head, mtp_config.hidden_size, mtp_config.vocab_size)
+                    .map_err(|error| anyhow::anyhow!("Invalid MTP LM-head weights: {error}"))?,
+                hidden_output: mtp_config.target_hidden_output.clone(),
+                kv_mode: mtp_config.kv_mode,
+                num_speculative_tokens: mtp_config.num_speculative_tokens,
+            })
+        } else {
+            None
+        };
 
         Ok(Self {
             metadata,
@@ -184,6 +264,7 @@ impl Engine {
             _environment: environment,
             session: Box::new(session),
             draft,
+            mtp,
             tokenizer,
             fim_config,
             num_speculative_tokens: config.num_speculative_tokens.max(1),
@@ -469,7 +550,7 @@ impl Engine {
 
     /// Create a new generation session.
     pub fn create_session(&mut self) -> anyhow::Result<SessionId> {
-        let decode_state = DecodeState::new_for_path(&self.session, &self.decode_path)?;
+        let decode_state = self.new_target_decode_state()?;
         let id = self.kv_cache.create_sequence();
         let draft = if let Some(draft_model) = &mut self.draft {
             Some(DraftSession {
@@ -504,13 +585,14 @@ impl Engine {
             .remove(session_id)
             .map_err(|e| anyhow::anyhow!("Failed to reset KV sequence {session_id}: {}", e))?;
         self.kv_cache.page_table.create_sequence(session_id);
+        let decode_state = self.new_target_decode_state()?;
         let state = self
             .sessions
             .get_mut(&session_id)
             .context("session disappeared during reset")?;
         state.tokens.clear();
         state.kv_token_count = 0;
-        state.decode_state = DecodeState::new_for_path(&self.session, &self.decode_path)?;
+        state.decode_state = decode_state;
         if let (Some(draft_model), Some(draft)) = (&mut self.draft, &mut state.draft) {
             draft_model
                 .kv_cache
@@ -523,6 +605,14 @@ impl Engine {
                 DecodeState::new_for_path(&draft_model.session, &draft_model.decode_path)?;
         }
         Ok(())
+    }
+
+    fn new_target_decode_state(&self) -> anyhow::Result<DecodeState> {
+        if matches!(&self.speculative_mode, SpeculativeMode::Mtp(_)) {
+            DecodeState::new(&self.session)
+        } else {
+            DecodeState::new_for_path(&self.session, &self.decode_path)
+        }
     }
 
     /// Close a persistent session and free its associated state.
@@ -950,6 +1040,22 @@ impl DecodeLoopBackend for SessionDecodeLoopBackend<'_> {
         self.scheduler.advance(self.session_id);
         Ok(())
     }
+}
+
+fn read_f32_weights(path: &Path) -> anyhow::Result<Vec<f32>> {
+    let bytes = std::fs::read(path)
+        .with_context(|| format!("Failed to read f32 weights from '{}'", path.display()))?;
+    if bytes.len() % std::mem::size_of::<f32>() != 0 {
+        anyhow::bail!(
+            "f32 weight file '{}' has byte length {}, which is not divisible by 4",
+            path.display(),
+            bytes.len()
+        );
+    }
+    Ok(bytes
+        .chunks_exact(4)
+        .map(|bytes| f32::from_le_bytes(bytes.try_into().expect("four-byte chunk")))
+        .collect())
 }
 
 #[cfg(test)]

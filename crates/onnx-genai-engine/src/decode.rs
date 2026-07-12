@@ -268,6 +268,39 @@ pub(crate) fn next_session_token_logits(
     extract_next_token_logits(session, outputs)
 }
 
+pub(crate) fn next_session_token_logits_and_hidden(
+    session: &Session,
+    kv_model: Option<&KvModelInfo>,
+    kv_cache: &mut PagedKvCache,
+    seq: SessionId,
+    state: &mut EngineSession,
+    hidden_output: &str,
+) -> anyhow::Result<(Vec<f32>, Vec<f32>)> {
+    if state.decode_state.has_runner() {
+        anyhow::bail!(
+            "MTP requires the target hidden-state output '{hidden_output}', which is not exposed by the optimized decode runner; initialize the target with the legacy output-preserving decode path"
+        );
+    }
+    let (input_tokens, past_len) = session_decode_input_tokens(state)?;
+    let input_len = input_tokens.len();
+    let outputs = run_decode_step(session, &mut state.decode_state, &input_tokens, past_len)?;
+    if state.decode_state.use_kv {
+        if let Some(kv_model) = kv_model {
+            mirror_present_kv_to_pages(
+                session, kv_model, kv_cache, seq, &outputs, past_len, input_len,
+            )?;
+        } else {
+            kv_cache
+                .append(seq, input_len)
+                .map_err(|e| anyhow::anyhow!("Failed to advance KV sequence {seq}: {}", e))?;
+        }
+        state.kv_token_count += input_len;
+    }
+    let logits = extract_next_token_logits_from_outputs(session, &outputs)?;
+    let hidden = extract_last_hidden(session, &outputs, hidden_output)?;
+    Ok((logits, hidden))
+}
+
 pub(crate) fn next_draft_token_logits(
     draft_model: &mut DraftModel,
     draft_state: &mut DraftSession,
@@ -585,6 +618,13 @@ pub(crate) fn extract_next_token_logits(
     session: &Session,
     outputs: Vec<Value>,
 ) -> anyhow::Result<Vec<f32>> {
+    extract_next_token_logits_from_outputs(session, &outputs)
+}
+
+fn extract_next_token_logits_from_outputs(
+    session: &Session,
+    outputs: &[Value],
+) -> anyhow::Result<Vec<f32>> {
     let logits_index = session
         .output_names()
         .iter()
@@ -611,12 +651,51 @@ pub(crate) fn extract_next_token_logits(
             let start = (*seq as usize - 1) * vocab;
             Ok(data[start..start + vocab].to_vec())
         }
+
         [batch, seq, vocab] if *batch > 0 && *seq > 0 && *vocab > 0 => {
             let vocab = *vocab as usize;
             let start = (*seq as usize - 1) * vocab;
             Ok(data[start..start + vocab].to_vec())
         }
         other => anyhow::bail!("unsupported logits tensor shape: {:?}", other),
+    }
+}
+
+fn extract_last_hidden(
+    session: &Session,
+    outputs: &[Value],
+    output_name: &str,
+) -> anyhow::Result<Vec<f32>> {
+    let index = session
+        .output_names()
+        .iter()
+        .position(|name| name == output_name)
+        .with_context(|| {
+            format!("target model did not expose hidden-state output '{output_name}'")
+        })?;
+    let value = outputs
+        .get(index)
+        .context("hidden-state output index was out of range")?;
+    let shape = value.shape();
+    let data = value
+        .to_vec_f32()
+        .map_err(|error| anyhow::anyhow!("Failed to read target hidden-state tensor: {error}"))?;
+    match shape {
+        [hidden] if *hidden > 0 => Ok(data),
+        [seq, hidden] if *seq > 0 && *hidden > 0 => {
+            let hidden = *hidden as usize;
+            let start = (*seq as usize - 1) * hidden;
+            Ok(data[start..start + hidden].to_vec())
+        }
+        [batch, seq, hidden] if *batch == 1 && *seq > 0 && *hidden > 0 => {
+            let hidden = *hidden as usize;
+            let start = (*seq as usize - 1) * hidden;
+            Ok(data[start..start + hidden].to_vec())
+        }
+        other => anyhow::bail!(
+            "unsupported target hidden-state tensor shape for '{output_name}': {:?}",
+            other
+        ),
     }
 }
 

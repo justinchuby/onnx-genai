@@ -1,14 +1,13 @@
 //! Speculative decoding engine.
 
-//! Greedy requests can propose candidates with a draft model or model-free
-//! prompt lookup. Both sources feed the same target verification, longest-prefix
-//! acceptance, correction-token, and KV rewind path. Rejected candidates never
-//! leak into subsequent decoding state.
+//! Greedy requests can propose candidates with a draft model, an MTP head, or
+//! model-free prompt lookup. All sources feed the same target verification,
+//! longest-prefix acceptance, correction-token, and KV rewind path.
 
 use crate::TokenId;
 use crate::decode::{
-    extract_logits_sequence, next_session_token_logits, propose_draft_tokens,
-    run_decode_session_logits, run_decode_step,
+    extract_logits_sequence, next_session_token_logits, next_session_token_logits_and_hidden,
+    propose_draft_tokens, run_decode_session_logits, run_decode_step,
 };
 use crate::decode_loop::{DecodeLoopState, commit_selected_token, reached_context_limit};
 use crate::engine::Engine;
@@ -25,6 +24,10 @@ use crate::{
 };
 use anyhow::Context;
 use onnx_genai_kv::KvCacheOps;
+use onnx_genai_ort::{
+    LinearEmbedder, LinearLmHead, MtpDecodeOptions, MtpDecodeSession, Session, TokenEmbedder,
+    argmax,
+};
 
 /// Speculative acceptance rule implemented by the Phase 3 engine path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,6 +54,10 @@ pub struct SpeculativeProposerContext<'a> {
     pub first_step: usize,
     pub options: &'a GenerateOptions,
     pub chain: &'a ProcessorChain,
+    /// Target decoder's last hidden state, when required by the proposer.
+    pub target_hidden: Option<&'a [f32]>,
+    /// Target model's unprocessed greedy next token.
+    pub guaranteed_token: Option<TokenId>,
 }
 
 /// Aggregate diagnostics for one speculative generation.
@@ -158,6 +165,97 @@ impl SpeculativeProposer for NgramProposer {
     }
 }
 
+/// Multi-token-prediction proposer backed by an ORT MTP-head session.
+pub struct MtpProposer<'a, E = LinearEmbedder, L = LinearLmHead> {
+    session: MtpDecodeSession<'a>,
+    embedder: E,
+    lm_head: L,
+}
+
+impl<'a, E, L> MtpProposer<'a, E, L>
+where
+    E: TokenEmbedder,
+    L: onnx_genai_ort::LmHead,
+{
+    pub fn new(
+        head: &'a Session,
+        options: MtpDecodeOptions,
+        embedder: E,
+        lm_head: L,
+    ) -> anyhow::Result<Self> {
+        let session = MtpDecodeSession::new(head, options)
+            .map_err(|error| anyhow::anyhow!("Failed to create MTP decode session: {error}"))?;
+        if session.signature().hidden_size != embedder.hidden_size() {
+            anyhow::bail!(
+                "MTP head hidden size {} does not match target embedding hidden size {}",
+                session.signature().hidden_size,
+                embedder.hidden_size()
+            );
+        }
+        Ok(Self {
+            session,
+            embedder,
+            lm_head,
+        })
+    }
+}
+
+impl<E, L> SpeculativeProposer for MtpProposer<'_, E, L>
+where
+    E: TokenEmbedder,
+    L: onnx_genai_ort::LmHead,
+{
+    fn propose(
+        &mut self,
+        context: &SpeculativeProposerContext<'_>,
+    ) -> anyhow::Result<SpeculativeProposal> {
+        let hidden = context
+            .target_hidden
+            .context("MTP proposer requires the target model's last hidden state")?;
+        let guaranteed_token = context
+            .guaranteed_token
+            .context("MTP proposer requires the target model's greedy next token")?;
+        let draft_count = context.width.saturating_sub(1);
+        let proposal = self
+            .session
+            .propose(
+                hidden,
+                guaranteed_token,
+                draft_count,
+                &self.embedder,
+                &self.lm_head,
+            )
+            .map_err(|error| anyhow::anyhow!("MTP proposal failed: {error}"))?;
+        let mut tokens = Vec::with_capacity(proposal.draft_tokens.len() + 1);
+        tokens.push(proposal.guaranteed_token);
+        tokens.extend(proposal.draft_tokens);
+        Ok(SpeculativeProposal {
+            tokens,
+            positions: None,
+            tree: None,
+        })
+    }
+
+    fn accept(&mut self, context: &SpeculativeAcceptContext<'_>) -> anyhow::Result<()> {
+        if self.session.mode() == onnx_genai_ort::MtpDraftKvMode::HiddenThreaded {
+            self.session.reset();
+            return Ok(());
+        }
+        self.session
+            .rewind(context.accepted_prefix_len.saturating_sub(1))
+            .map_err(|error| anyhow::anyhow!("Failed to rewind MTP proposal: {error}"))
+    }
+
+    fn rewind(&mut self, _target_tokens: &[TokenId]) -> anyhow::Result<()> {
+        self.session.reset();
+        Ok(())
+    }
+
+    fn name(&self) -> &str {
+        "mtp"
+    }
+}
+
 pub(crate) struct DraftModelProposer<'a> {
     draft_model: &'a mut DraftModel,
     draft_state: &'a mut DraftSession,
@@ -229,6 +327,9 @@ impl Engine {
             SpeculativeMode::None => false,
             SpeculativeMode::DraftModel => self.draft.is_some(),
             SpeculativeMode::PromptLookup { ngram, max_tokens } => ngram > 0 && max_tokens > 0,
+            SpeculativeMode::Mtp(config) => {
+                self.mtp.as_ref().is_some_and(|mtp| mtp.config == config)
+            }
         };
         mode_available
             // Grammar processors carry per-request parser state; draft/verify
@@ -252,8 +353,19 @@ impl Engine {
         mut callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
         let speculative_mode = self.speculative_mode(options);
-        let draft_width = match speculative_mode {
-            SpeculativeMode::PromptLookup { max_tokens, .. } => max_tokens,
+        let draft_width = match &speculative_mode {
+            SpeculativeMode::PromptLookup { max_tokens, .. } => *max_tokens,
+            SpeculativeMode::Mtp(_) => {
+                self.mtp
+                    .as_ref()
+                    .map(|mtp| {
+                        options
+                            .num_speculative_tokens
+                            .unwrap_or(mtp.num_speculative_tokens)
+                    })
+                    .context("MTP speculation requested without a loaded MTP head")?
+                    + 1
+            }
             _ => options
                 .num_speculative_tokens
                 .unwrap_or(self.num_speculative_tokens),
@@ -290,13 +402,42 @@ impl Engine {
 
             let base_len = state.tokens.len();
             let base_generated_len = generated_tokens.len();
-            let mut base_logits = next_session_token_logits(
-                &self.session,
-                self.kv_model.as_ref(),
-                &mut self.kv_cache,
-                session_id,
-                state,
-            )?;
+            let (mut base_logits, target_hidden) =
+                if let SpeculativeMode::Mtp(_) = &speculative_mode {
+                    let hidden_output = self
+                        .mtp
+                        .as_ref()
+                        .context("MTP speculation requested without a loaded MTP head")?
+                        .hidden_output
+                        .clone();
+                    let (logits, hidden) = next_session_token_logits_and_hidden(
+                        &self.session,
+                        self.kv_model.as_ref(),
+                        &mut self.kv_cache,
+                        session_id,
+                        state,
+                        &hidden_output,
+                    )?;
+                    (logits, Some(hidden))
+                } else {
+                    (
+                        next_session_token_logits(
+                            &self.session,
+                            self.kv_model.as_ref(),
+                            &mut self.kv_cache,
+                            session_id,
+                            state,
+                        )?,
+                        None,
+                    )
+                };
+            let guaranteed_token = target_hidden
+                .as_ref()
+                .map(|_| argmax(&base_logits).context("target logits were empty"))
+                .transpose()?
+                .map(TokenId::try_from)
+                .transpose()
+                .context("target token id exceeds u32 range")?;
 
             let proposer_context = SpeculativeProposerContext {
                 width,
@@ -306,8 +447,10 @@ impl Engine {
                 first_step: step,
                 options,
                 chain,
+                target_hidden: target_hidden.as_deref(),
+                guaranteed_token,
             };
-            let draft_tokens = match speculative_mode {
+            let draft_tokens = match &speculative_mode {
                 SpeculativeMode::None => Vec::new(),
                 SpeculativeMode::DraftModel => {
                     let draft_model = self
@@ -323,9 +466,26 @@ impl Engine {
                     proposer.propose(&proposer_context)?.tokens
                 }
                 SpeculativeMode::PromptLookup { ngram, max_tokens } => {
-                    NgramProposer::new(ngram, max_tokens)?
+                    NgramProposer::new(*ngram, *max_tokens)?
                         .propose(&proposer_context)?
                         .tokens
+                }
+                SpeculativeMode::Mtp(_) => {
+                    let mtp = self
+                        .mtp
+                        .as_ref()
+                        .context("MTP speculation requested without a loaded MTP head")?;
+                    MtpProposer::new(
+                        &mtp.session,
+                        MtpDecodeOptions {
+                            kv_mode: mtp.kv_mode,
+                            batch_size: 1,
+                        },
+                        mtp.embedder.clone(),
+                        mtp.lm_head.clone(),
+                    )?
+                    .propose(&proposer_context)?
+                    .tokens
                 }
             };
             self.last_speculative_stats.verification_steps += 1;
@@ -467,7 +627,7 @@ impl Engine {
                 commit_tokens.push(token);
             }
 
-            if matches!(speculative_mode, SpeculativeMode::DraftModel) {
+            if matches!(&speculative_mode, SpeculativeMode::DraftModel) {
                 self.notify_draft_acceptance(state, accepted, &commit_tokens)?;
             }
 
@@ -509,7 +669,7 @@ impl Engine {
                         session_id,
                         state,
                     )?;
-                    if matches!(speculative_mode, SpeculativeMode::DraftModel) {
+                    if matches!(&speculative_mode, SpeculativeMode::DraftModel) {
                         self.sync_draft_to_target(state)?;
                     }
                     return self.finish_result(
@@ -520,7 +680,7 @@ impl Engine {
                 }
             }
 
-            if matches!(speculative_mode, SpeculativeMode::DraftModel) {
+            if matches!(&speculative_mode, SpeculativeMode::DraftModel) {
                 self.sync_draft_to_target(state)?;
             }
 
@@ -559,6 +719,9 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use onnx_genai_ort::{Environment, SessionOptions};
+    use std::path::Path;
+    use std::sync::OnceLock;
 
     struct StubProposer {
         tokens: Vec<TokenId>,
@@ -607,6 +770,8 @@ mod tests {
             first_step: 0,
             options: &options,
             chain: &chain,
+            target_hidden: None,
+            guaranteed_token: None,
         })?;
         proposer.accept(&SpeculativeAcceptContext {
             accepted_prefix_len: 1,
@@ -634,9 +799,92 @@ mod tests {
             first_step: 0,
             options: &options,
             chain: &chain,
+            target_hidden: None,
+            guaranteed_token: None,
         })?;
 
         assert_eq!(proposal.tokens, vec![9, 4, 7]);
         Ok(())
+    }
+
+    fn lcg_weights(seed: u64, len: usize) -> Vec<f32> {
+        let mut state = seed;
+        (0..len)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                let bits = (state >> 33) as u32;
+                (bits as f32 / u32::MAX as f32) * 2.0 - 1.0
+            })
+            .collect()
+    }
+
+    #[test]
+    fn mtp_proposer_uses_real_head_and_returns_guaranteed_plus_k_drafts() -> anyhow::Result<()> {
+        const HIDDEN: usize = 16;
+        const VOCAB: usize = 32;
+        static ENVIRONMENT: OnceLock<Environment> = OnceLock::new();
+        let environment =
+            ENVIRONMENT.get_or_init(|| Environment::new("engine-mtp-test").expect("environment"));
+        let head_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/tiny-qwen35-mtp/model.onnx");
+        let head = Session::new(
+            environment,
+            &head_path,
+            SessionOptions::default().with_intra_op_threads(1),
+        )?;
+        let embedder =
+            LinearEmbedder::new(lcg_weights(0x1111_2222, VOCAB * HIDDEN), VOCAB, HIDDEN)?;
+        let lm_head = LinearLmHead::new(lcg_weights(0x3333_4444, HIDDEN * VOCAB), HIDDEN, VOCAB)?;
+        let hidden = lcg_weights(0xA5A5_1234, HIDDEN);
+        let mut logits = vec![0.0; VOCAB];
+        onnx_genai_ort::LmHead::logits(&lm_head, &hidden, &mut logits)?;
+        let guaranteed = argmax(&logits).context("target logits were empty")? as TokenId;
+        let options = GenerateOptions::default();
+        let chain = ProcessorChain::new();
+        let mut proposer = MtpProposer::new(&head, MtpDecodeOptions::default(), embedder, lm_head)?;
+
+        fn assert_speculative_proposer<T: SpeculativeProposer>(_proposer: &T) {}
+        assert_speculative_proposer(&proposer);
+        let proposal = proposer.propose(&SpeculativeProposerContext {
+            width: 5,
+            context_tokens: &[1],
+            generated_tokens: &[],
+            generated_text: "",
+            first_step: 0,
+            options: &options,
+            chain: &chain,
+            target_hidden: Some(&hidden),
+            guaranteed_token: Some(guaranteed),
+        })?;
+
+        assert_eq!(proposer.name(), "mtp");
+        assert_eq!(guaranteed, 13);
+        assert_eq!(proposal.tokens.len(), 5);
+        assert_eq!(proposal.tokens.first(), Some(&guaranteed));
+        assert_eq!(proposal.tokens, vec![guaranteed, 27, 11, 2, 27]);
+        Ok(())
+    }
+
+    #[test]
+    fn mtp_mode_selects_mtp_proposer_contract() {
+        let mode = SpeculativeMode::Mtp(crate::config::MtpConfig {
+            head_model: "mtp.onnx".into(),
+            target_hidden_output: "hidden_states".into(),
+            embedding_weights: "embed.f32".into(),
+            lm_head_weights: "lm_head.f32".into(),
+            vocab_size: 32,
+            hidden_size: 16,
+            kv_mode: onnx_genai_ort::MtpDraftKvMode::HiddenThreaded,
+            num_speculative_tokens: 4,
+        });
+        let selected = match mode {
+            SpeculativeMode::Mtp(_) => "mtp",
+            SpeculativeMode::DraftModel => "draft_model",
+            SpeculativeMode::PromptLookup { .. } => "prompt_lookup",
+            SpeculativeMode::None => "none",
+        };
+        assert_eq!(selected, "mtp");
     }
 }
