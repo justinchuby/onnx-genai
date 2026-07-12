@@ -1,0 +1,30 @@
+[package]
+name = "onnx-genai-bench"
+description = "Criterion benchmark suite for onnx-genai"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[features]
+bench-ort = ["dep:onnx-genai-ort"]
+
+[dependencies]
+anyhow = { workspace = true }
+onnx-genai-engine = { workspace = true }
+onnx-genai-kv = { workspace = true }
+onnx-genai-ort = { workspace = true, optional = true }
+tokenizers = { workspace = true }
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "no_model"
+harness = false
+
+[[bench]]
+name = "model"
+harness = false
+required-features = ["bench-ort"]
