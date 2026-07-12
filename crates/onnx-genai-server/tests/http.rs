@@ -2,7 +2,8 @@ use axum::{
     body::{Body, to_bytes},
     http::{Request, StatusCode, header},
 };
-use onnx_genai_server::{AppState, app};
+use onnx_genai_engine::GenerateConstraint;
+use onnx_genai_server::{AppState, ChatCompletionRequest, app, build_generate_request};
 use serde_json::{Value, json};
 use std::path::PathBuf;
 use tower::ServiceExt;
@@ -28,6 +29,10 @@ fn sse_json_chunks(text: &str) -> Vec<Value> {
         .filter(|data| *data != "[DONE]")
         .map(|data| serde_json::from_str(data).unwrap())
         .collect()
+}
+
+fn chat_request(body: Value) -> ChatCompletionRequest {
+    serde_json::from_value(body).unwrap()
 }
 
 async fn create_http_session(app: axum::Router) -> String {
@@ -106,6 +111,118 @@ async fn chat_completions_returns_openai_shape() {
     assert!(prompt_tokens > 0);
     assert_eq!(total_tokens, prompt_tokens + completion_tokens);
     assert!(json.get("session_id").is_none());
+}
+
+#[test]
+fn response_format_maps_to_generate_constraint_only_for_json_object() {
+    let json_request = chat_request(json!({
+        "model": "tiny-llm",
+        "messages": [{"role": "user", "content": "hello"}],
+        "response_format": {"type": "json_object"}
+    }));
+    let text_request = chat_request(json!({
+        "model": "tiny-llm",
+        "messages": [{"role": "user", "content": "hello"}],
+        "response_format": {"type": "text"}
+    }));
+    let absent_request = chat_request(json!({
+        "model": "tiny-llm",
+        "messages": [{"role": "user", "content": "hello"}]
+    }));
+
+    assert_eq!(
+        build_generate_request(&json_request).options.constraint,
+        Some(GenerateConstraint::Json)
+    );
+    assert_eq!(
+        build_generate_request(&text_request).options.constraint,
+        None
+    );
+    assert_eq!(
+        build_generate_request(&absent_request).options.constraint,
+        None
+    );
+}
+
+#[tokio::test]
+async fn chat_completions_response_format_json_object_returns_valid_json() {
+    let app = test_app().await;
+    let session_id = create_http_session(app.clone()).await;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("X-Session-Id", session_id)
+                .body(Body::from(
+                    json!({
+                        "model": "tiny-llm",
+                        "messages": [{"role": "user", "content": "hello"}],
+                        "max_tokens": 14,
+                        "response_format": {"type": "json_object"}
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let status = response.status();
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["object"], "chat.completion");
+    assert_eq!(json["choices"][0]["message"]["role"], "assistant");
+    let content = json["choices"][0]["message"]["content"].as_str().unwrap();
+    let parsed: Value = serde_json::from_str(content).unwrap();
+    assert!(parsed.is_object(), "{content}");
+}
+
+#[tokio::test]
+async fn streaming_chat_completions_response_format_json_object_streams_valid_json() {
+    let app = test_app().await;
+    let session_id = create_http_session(app.clone()).await;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("X-Session-Id", session_id)
+                .body(Body::from(
+                    json!({
+                        "model": "tiny-llm",
+                        "messages": [{"role": "user", "content": "hello"}],
+                        "max_tokens": 14,
+                        "stream": true,
+                        "response_format": {"type": "json_object"}
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get(header::CONTENT_TYPE).unwrap(),
+        "text/event-stream"
+    );
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let text = String::from_utf8(body.to_vec()).unwrap();
+    let data_lines = sse_data_lines(&text);
+    assert_eq!(data_lines.last(), Some(&"[DONE]"), "{text}");
+
+    let chunks = sse_json_chunks(&text);
+    let content: String = chunks
+        .iter()
+        .filter_map(|chunk| chunk["choices"][0]["delta"]["content"].as_str())
+        .collect();
+    let parsed: Value = serde_json::from_str(&content).unwrap();
+    assert!(parsed.is_object(), "{content}");
 }
 
 #[tokio::test]

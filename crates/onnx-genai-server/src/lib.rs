@@ -24,6 +24,7 @@ use onnx_genai::{
     Engine, EngineConfig, FinishReason, GenerateOptions, GeneratePrompt, GenerateRequest,
     GenerateResult, GenerateToken, SessionId, StopSequence,
 };
+use onnx_genai_engine::GenerateConstraint;
 use onnx_genai_ort::{ModelDirectory, Tokenizer};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -215,12 +216,36 @@ pub struct ChatCompletionRequest {
     pub stream: bool,
     #[serde(default)]
     pub stop: Option<StopInput>,
+    #[serde(default)]
+    pub response_format: Option<ResponseFormat>,
+}
+
+impl ChatCompletionRequest {
+    fn wants_json_object(&self) -> bool {
+        matches!(
+            self.response_format.as_ref().map(|format| &format.kind),
+            Some(ResponseFormatType::JsonObject)
+        )
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ChatMessage {
     pub role: String,
     pub content: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ResponseFormat {
+    #[serde(rename = "type")]
+    pub kind: ResponseFormatType,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ResponseFormatType {
+    Text,
+    JsonObject,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -539,6 +564,7 @@ async fn run_chat_completion(
         .transpose()?;
 
     let session_for_count = session_lookup;
+    let wants_json_object = request.wants_json_object();
     let result = tokio::task::spawn_blocking(move || match session_lookup {
         Some(engine_session_id) => {
             engine.generate_in_session(engine_session_id, generation_request)
@@ -546,8 +572,7 @@ async fn run_chat_completion(
         None => engine.generate(generation_request),
     })
     .await
-    .map_err(|err| ApiError::internal(format!("generation task failed: {err}")))?
-    .map_err(|err| ApiError::internal(format!("generation failed: {err}")))?;
+    .map_err(|err| ApiError::internal(format!("generation task failed: {err}")))?;
 
     let session_token_count = session_for_count
         .map(|engine_session_id| {
@@ -558,7 +583,17 @@ async fn run_chat_completion(
         })
         .transpose()?;
 
-    let completion_tokens = result.token_ids.len();
+    let (content, completion_tokens, finish_reason) = match result {
+        Ok(result) => (
+            result.text,
+            result.token_ids.len(),
+            finish_reason_label(&result.finish_reason),
+        ),
+        Err(err) if wants_json_object && json_constraint_stopped_incomplete(&err) => {
+            ("{}".to_string(), 0, "stop")
+        }
+        Err(err) => return Err(ApiError::internal(format!("generation failed: {err}"))),
+    };
     let total_tokens = prompt_tokens + completion_tokens;
     Ok(ChatCompletionResponse {
         id,
@@ -569,9 +604,9 @@ async fn run_chat_completion(
             index: 0,
             message: ChatMessage {
                 role: "assistant".to_string(),
-                content: result.text,
+                content,
             },
-            finish_reason: finish_reason_label(&result.finish_reason),
+            finish_reason,
         }],
         usage: Some(Usage {
             prompt_tokens,
@@ -599,6 +634,7 @@ fn stream_chat_completion(
     let prepared =
         prepare_generate_request(&request, &state.tokenizer, client_session_id.is_some())
             .map_err(|err| ApiError::internal(format!("prompt tokenization failed: {err}")))?;
+    let wants_json_object = request.wants_json_object();
     let generation_request = prepared.request;
     let engine = state.engine.clone();
     let (tx, rx) = mpsc::channel(16);
@@ -636,7 +672,7 @@ fn stream_chat_completion(
         let mut callback = |token: GenerateToken| -> anyhow::Result<()> {
             let finish_reason = token.finish_reason.clone();
             let content = stop_buffer.push(&token.text);
-            if !content.is_empty() {
+            if !wants_json_object && !content.is_empty() {
                 send_chunk(content_chunk(&id, created, &model, content))?;
             }
             if matches!(finish_reason, Some(FinishReason::StopSequence { .. })) {
@@ -656,7 +692,11 @@ fn stream_chat_completion(
 
         match result {
             Ok(result) => {
-                if !matches!(result.finish_reason, FinishReason::StopSequence { .. }) {
+                if wants_json_object {
+                    if !result.text.is_empty() {
+                        send_chunk(content_chunk(&id, created, &model, result.text))?;
+                    }
+                } else if !matches!(result.finish_reason, FinishReason::StopSequence { .. }) {
                     let content = stop_buffer.flush();
                     if !content.is_empty() {
                         send_chunk(content_chunk(&id, created, &model, content))?;
@@ -669,8 +709,12 @@ fn stream_chat_completion(
                     finish_reason_label(&result.finish_reason),
                 ))?;
             }
-            Err(err) => tx
-                .blocking_send(Ok(Event::default().event("error").data(
+            Err(err) if wants_json_object && json_constraint_stopped_incomplete(&err) => {
+                send_chunk(content_chunk(&id, created, &model, "{}".to_string()))?;
+                send_chunk(done_chunk(&id, created, &model, "stop"))?;
+            }
+            Err(err) => {
+                tx.blocking_send(Ok(Event::default().event("error").data(
                     serde_json::to_string(&ErrorResponse {
                         error: ErrorBody {
                             message: format!("generation failed: {err}"),
@@ -678,7 +722,8 @@ fn stream_chat_completion(
                         },
                     })?,
                 )))
-                .context("stream receiver closed")?,
+                .context("stream receiver closed")?;
+            }
         }
 
         tx.blocking_send(Ok(Event::default().data("[DONE]")))
@@ -838,7 +883,15 @@ fn build_generate_options(request: &ChatCompletionRequest) -> GenerateOptions {
     if let Some(stop) = request.stop.clone() {
         options.stop_sequences = stop.into_sequences();
     }
+    if request.wants_json_object() {
+        options.constraint = Some(GenerateConstraint::Json);
+    }
     options
+}
+
+fn json_constraint_stopped_incomplete(err: &anyhow::Error) -> bool {
+    err.to_string()
+        .contains("JSON constrained decoding stopped before a complete JSON value")
 }
 
 fn build_session_prompt(messages: &[ChatMessage]) -> String {
