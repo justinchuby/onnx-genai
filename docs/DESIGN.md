@@ -999,3 +999,443 @@ onnx-genai-server (binary)
             │       └── onnx-genai-ort (NEW)
             └── onnx-genai-metadata
 ```
+
+---
+
+## 20. Generalized Pipeline Architecture
+
+### The Problem
+
+Generative AI inference isn't just "text in → text out." Real workloads include:
+
+| Pipeline | Input | Output | Models Involved |
+|---|---|---|---|
+| Text generation (LLM) | text | text | decoder |
+| Vision-Language (VLM) | image + text | text | vision_encoder + decoder |
+| Text-to-Speech (TTS) | text | audio | text_encoder + acoustic_model + vocoder |
+| Speech-to-Text (ASR) | audio | text | feature_extractor + encoder + decoder |
+| Audio-to-Audio | audio | audio | encoder + decoder (e.g., voice conversion) |
+| Image generation | text | image | text_encoder + denoiser + vae_decoder |
+| Image editing | image + text | image | image_encoder + text_encoder + denoiser + vae_decoder |
+| Embedding | text/image/audio | vector | encoder |
+| Reranking | text pairs | scores | cross_encoder |
+| Classification | text/image | labels | encoder + classifier_head |
+| OCR | image | text | vision_encoder + decoder |
+| Video generation | text/image | video frames | text_encoder + temporal_denoiser + vae_decoder |
+
+### Design Principle: Pipelines as DAGs with Loop Strategies
+
+Every pipeline above is a **directed acyclic graph of models** with optional **loop strategies** controlling iteration:
+
+```
+Pipeline = DAG(models, dataflow) + Strategy(loop_kind, termination)
+```
+
+Three fundamental loop strategies cover all cases:
+
+1. **Autoregressive** — generate one token at a time until stop condition (LLM, ASR decoder)
+2. **Fixed-step iterative** — run N times with evolving state (diffusion, flow matching)
+3. **Single-pass** — run once, no iteration (embedding, classification, encoder, vocoder)
+
+### 20.1 Pipeline Spec Schema (Generalized)
+
+```yaml
+pipeline:
+  # Models in this pipeline
+  models:
+    model_name:
+      filename: "model.onnx"
+      type: encoder | decoder | denoiser | vocoder | classifier | embedder
+      # Optional: execution constraints
+      device_preference: gpu | npu | cpu
+      
+  # How data flows between models
+  dataflow:
+    - from: model_a.output_name
+      to: model_b.input_name
+      dtype: fp16 | fp32 | int64 | string
+      device_transfer: true | false  # needs D2H or H2D copy?
+      
+  # Execution strategy
+  strategy:
+    kind: autoregressive | iterative | single_pass | composite
+    # ... kind-specific parameters below
+    
+  # Per-model phase gating (when does each model run?)
+  phases:
+    model_name:
+      run_on: prompt_only | every_step | final_only | on_demand
+```
+
+### 20.2 Strategy Definitions
+
+#### Autoregressive (LLM, ASR decoder)
+
+```yaml
+strategy:
+  kind: autoregressive
+  decoder: decoder_model_name
+  max_tokens: 4096
+  stop_conditions:
+    - eos_token: true
+    - stop_sequences: ["</s>", "<|end|>"]
+    - max_tokens: true
+  kv_cache:
+    enabled: true
+    # Links to top-level kv_cache spec for quantization/operations
+  speculative:  # optional acceleration
+    draft: { producer: ngram, tokens_per_step: 5 }
+    acceptance: greedy
+```
+
+#### Iterative (Diffusion, Flow Matching)
+
+```yaml
+strategy:
+  kind: iterative
+  denoiser: unet_model_name
+  scheduler: euler_discrete | ddim | ddpm | flow_matching
+  num_steps: 20
+  guidance_scale: 7.5   # classifier-free guidance
+  state:
+    name: latents
+    init: random_normal   # or from_input (for img2img)
+    shape: [1, 4, 64, 64]
+    dtype: fp16
+```
+
+#### Single-Pass (Embedding, Classification, Feature Extraction)
+
+```yaml
+strategy:
+  kind: single_pass
+  model: encoder_model_name
+  # No loop, just run once
+  batching:
+    max_batch_size: 64
+    dynamic_batching: true
+    padding_strategy: longest | max_length
+```
+
+#### Composite (Multi-strategy pipelines)
+
+For pipelines that combine strategies (e.g., ASR = single_pass encoder + autoregressive decoder):
+
+```yaml
+strategy:
+  kind: composite
+  stages:
+    - name: encode
+      strategy: { kind: single_pass, model: encoder }
+      run_on: prompt_only
+    - name: decode
+      strategy: { kind: autoregressive, decoder: decoder }
+      run_on: every_step
+```
+
+### 20.3 Concrete Pipeline Examples
+
+#### Text-to-Speech (TTS)
+
+```yaml
+pipeline:
+  models:
+    text_encoder:
+      filename: text_encoder.onnx
+      type: encoder
+    acoustic:
+      filename: acoustic_model.onnx
+      type: decoder
+    vocoder:
+      filename: vocoder.onnx
+      type: vocoder
+      
+  dataflow:
+    - from: text_encoder.hidden_states
+      to: acoustic.encoder_hidden_states
+      dtype: fp16
+    - from: acoustic.mel_spectrogram
+      to: vocoder.mel_input
+      dtype: fp32
+      
+  strategy:
+    kind: composite
+    stages:
+      - name: encode_text
+        strategy: { kind: single_pass, model: text_encoder }
+      - name: generate_mel
+        strategy:
+          kind: autoregressive
+          decoder: acoustic
+          stop_conditions:
+            - eos_token: true
+      - name: synthesize_audio
+        strategy: { kind: single_pass, model: vocoder }
+        
+  phases:
+    text_encoder: { run_on: prompt_only }
+    acoustic: { run_on: every_step }
+    vocoder: { run_on: final_only }
+```
+
+#### Speech-to-Text (ASR / Whisper-style)
+
+```yaml
+pipeline:
+  models:
+    feature_extractor:
+      filename: feature_extractor.onnx
+      type: encoder
+      # Mel spectrogram computation (or could be done in preprocessing)
+    encoder:
+      filename: encoder.onnx
+      type: encoder
+    decoder:
+      filename: decoder.onnx
+      type: decoder
+      
+  dataflow:
+    - from: feature_extractor.mel_features
+      to: encoder.input_features
+      dtype: fp32
+    - from: encoder.last_hidden_state
+      to: decoder.encoder_hidden_states
+      dtype: fp16
+      
+  strategy:
+    kind: composite
+    stages:
+      - name: extract_features
+        strategy: { kind: single_pass, model: feature_extractor }
+      - name: encode_audio
+        strategy: { kind: single_pass, model: encoder }
+      - name: decode_text
+        strategy:
+          kind: autoregressive
+          decoder: decoder
+          max_tokens: 448
+          stop_conditions:
+            - eos_token: true
+            - special_tokens: ["<|endoftext|>"]
+```
+
+#### Embedding (text, image, or audio)
+
+```yaml
+pipeline:
+  models:
+    encoder:
+      filename: encoder.onnx
+      type: embedder
+      
+  strategy:
+    kind: single_pass
+    model: encoder
+    batching:
+      max_batch_size: 128
+      dynamic_batching: true
+      padding_strategy: longest
+    pooling: mean | cls | last_token  # how to get fixed-size embedding from variable-length output
+    normalize: true  # L2 normalize output embeddings
+```
+
+#### Audio-to-Audio (Voice Conversion / Enhancement)
+
+```yaml
+pipeline:
+  models:
+    content_encoder:
+      filename: content_encoder.onnx
+      type: encoder
+    speaker_encoder:
+      filename: speaker_encoder.onnx
+      type: encoder
+    decoder:
+      filename: decoder.onnx
+      type: decoder
+    vocoder:
+      filename: vocoder.onnx
+      type: vocoder
+      
+  dataflow:
+    - from: content_encoder.content_features
+      to: decoder.content_input
+      dtype: fp16
+    - from: speaker_encoder.speaker_embedding
+      to: decoder.speaker_condition
+      dtype: fp16
+    - from: decoder.mel_output
+      to: vocoder.mel_input
+      dtype: fp32
+      
+  strategy:
+    kind: composite
+    stages:
+      - name: encode_content
+        strategy: { kind: single_pass, model: content_encoder }
+      - name: encode_speaker
+        strategy: { kind: single_pass, model: speaker_encoder }
+      - name: decode
+        strategy: { kind: autoregressive, decoder: decoder }
+      - name: vocalize
+        strategy: { kind: single_pass, model: vocoder }
+```
+
+#### Image-to-Text (OCR / Captioning)
+
+```yaml
+pipeline:
+  models:
+    vision_encoder:
+      filename: vision_encoder.onnx
+      type: encoder
+    decoder:
+      filename: decoder.onnx
+      type: decoder
+      
+  dataflow:
+    - from: vision_encoder.image_features
+      to: decoder.encoder_hidden_states
+      dtype: fp16
+      
+  strategy:
+    kind: composite
+    stages:
+      - name: encode_image
+        strategy: { kind: single_pass, model: vision_encoder }
+      - name: generate_text
+        strategy:
+          kind: autoregressive
+          decoder: decoder
+          max_tokens: 1024
+          kv_cache: { enabled: true }
+```
+
+#### Reranking / Cross-Encoder
+
+```yaml
+pipeline:
+  models:
+    cross_encoder:
+      filename: cross_encoder.onnx
+      type: classifier
+      
+  strategy:
+    kind: single_pass
+    model: cross_encoder
+    batching:
+      max_batch_size: 256
+      dynamic_batching: true
+    output:
+      type: scores   # single float per input pair
+      activation: sigmoid  # or none for raw logits
+```
+
+### 20.4 API Surface for Different Pipeline Types
+
+```rust
+/// Unified pipeline handle — different execution paths based on strategy.
+pub enum Pipeline {
+    Autoregressive(AutoregressivePipeline),
+    Iterative(IterativePipeline),
+    SinglePass(SinglePassPipeline),
+    Composite(CompositePipeline),
+}
+
+/// Public API adapts to pipeline type:
+impl Engine {
+    // --- Text generation (autoregressive) ---
+    pub fn generate(&self, request: GenerateRequest) -> GenerateStream;
+    
+    // --- Embedding (single_pass, batched) ---
+    pub fn embed(&self, inputs: &[&str]) -> Result<Vec<Vec<f32>>>;
+    
+    // --- Image generation (iterative) ---
+    pub fn generate_image(&self, request: ImageRequest) -> ImageStream;
+    
+    // --- Speech-to-text (composite: single_pass + autoregressive) ---
+    pub fn transcribe(&self, audio: &AudioInput) -> TranscribeStream;
+    
+    // --- Text-to-speech (composite: single_pass + autoregressive + single_pass) ---
+    pub fn synthesize(&self, text: &str, voice: &str) -> Result<AudioOutput>;
+    
+    // --- Generic (any pipeline) ---
+    pub fn run_pipeline(&self, inputs: PipelineInputs) -> PipelineOutputStream;
+}
+```
+
+### 20.5 Preprocessing and Postprocessing
+
+Some pipelines need non-NN processing (audio feature extraction, image resizing, tokenization). These are NOT ORT sessions but host-side operations:
+
+```yaml
+pipeline:
+  preprocessing:
+    - name: audio_features
+      kind: mel_spectrogram
+      params: { sample_rate: 16000, n_mels: 80, n_fft: 400 }
+    - name: image_resize
+      kind: resize_and_normalize
+      params: { size: [224, 224], mean: [0.485, 0.456, 0.406], std: [0.229, 0.224, 0.225] }
+      
+  postprocessing:
+    - name: audio_output
+      kind: griffin_lim  # or just pass-through if vocoder produces waveform
+    - name: detokenize
+      kind: tokenizer_decode
+```
+
+Implementation: a `ProcessingStep` trait:
+
+```rust
+pub trait ProcessingStep: Send + Sync {
+    fn process(&self, input: &Tensor) -> Result<Tensor>;
+    fn name(&self) -> &str;
+}
+
+// Built-in steps:
+pub struct MelSpectrogram { config: MelConfig }
+pub struct ImageResize { size: (usize, usize), normalize: bool }
+pub struct TokenizerDecode { tokenizer: Tokenizer }
+pub struct AudioResample { target_sample_rate: u32 }
+```
+
+### 20.6 Streaming Behavior per Strategy
+
+| Strategy | Streaming Output | What's Streamed |
+|---|---|---|
+| Autoregressive | Yes, token-by-token | Each generated token |
+| Iterative | Yes, step-by-step | Intermediate latent (denoised image preview) |
+| Single-pass | No (or batch progress) | Final result only |
+| Composite | Depends on final stage | Follows the last stage's streaming behavior |
+
+### 20.7 Memory Management per Strategy
+
+| Strategy | KV Cache | State Tensor | Batching |
+|---|---|---|---|
+| Autoregressive | Paged, growing | N/A | Continuous batching (scheduler) |
+| Iterative | N/A | Fixed size, evolving | Request-level batching (CFG doubles batch) |
+| Single-pass | N/A | N/A | Dynamic batching (accumulate → run) |
+| Composite | Per-stage | Per-stage | Follows bottleneck stage |
+
+This means:
+- KV cache manager only activates for autoregressive stages
+- Scheduler only needed for autoregressive stages
+- Single-pass stages use a simpler "batch accumulator" pattern
+- Iterative stages manage a fixed-size state tensor
+
+### 20.8 Crate Structure Update
+
+```
+crates/onnx-genai-engine/src/
+├── engine.rs              # Top-level engine (routes to strategy)
+├── autoregressive.rs      # Autoregressive generation loop + KV + speculative
+├── iterative.rs           # Diffusion/flow denoising loop
+├── single_pass.rs         # Embedding, classification, single forward
+├── composite.rs           # Multi-stage pipeline orchestrator
+├── pipeline.rs            # Pipeline loading + DAG construction from metadata
+├── preprocessing.rs       # Non-NN processing steps
+├── logits.rs              # Logit processor chain (autoregressive only)
+├── sampling.rs            # Token sampling
+└── speculative.rs         # Speculative decoding (autoregressive only)
+```
