@@ -11,10 +11,15 @@ use onnx_genai_engine::{
 use onnx_genai_ort::Value;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 
-use crate::image_input::ImageTensor;
 use crate::metrics::GenerationMetrics;
 
 const DRIVER_OUTPUT_BUFFER: usize = 16;
+
+pub(crate) struct PipelineInputTensor {
+    pub(crate) endpoint: String,
+    pub(crate) data: Vec<f32>,
+    pub(crate) shape: Vec<i64>,
+}
 
 #[derive(Clone)]
 pub(crate) struct EngineDriver {
@@ -40,7 +45,7 @@ pub(crate) enum DriverCommand {
     },
     GeneratePipeline {
         request: Box<GenerateRequest>,
-        image: Option<ImageTensor>,
+        input: Option<PipelineInputTensor>,
         events: mpsc::Sender<DriverEvent>,
         permit: OwnedSemaphorePermit,
     },
@@ -182,7 +187,7 @@ impl EngineDriver {
     pub(crate) async fn generate_pipeline(
         &self,
         request: GenerateRequest,
-        image: Option<ImageTensor>,
+        input: Option<PipelineInputTensor>,
     ) -> Result<mpsc::Receiver<DriverEvent>, GenerateSubmitError> {
         let permit = self
             .generation_capacity
@@ -195,7 +200,7 @@ impl EngineDriver {
             .commands
             .send(DriverCommand::GeneratePipeline {
                 request: Box::new(request),
-                image,
+                input,
                 events,
                 permit,
             })
@@ -265,10 +270,10 @@ fn run_pipeline_driver(engine: &mut PipelineEngine, mut rx: mpsc::Receiver<Drive
         match command {
             DriverCommand::GeneratePipeline {
                 request,
-                image,
+                input,
                 events,
                 permit,
-            } => run_pipeline_generation(engine, *request, image, events, permit),
+            } => run_pipeline_generation(engine, *request, input, events, permit),
             DriverCommand::CreateSession(response) => {
                 let _ = response.send(Err(anyhow::anyhow!(
                     "sessions are not supported by pipeline models"
@@ -517,17 +522,17 @@ fn handle_driver_command(engine: &mut Engine, command: DriverCommand) {
 fn run_pipeline_generation(
     engine: &mut PipelineEngine,
     request: GenerateRequest,
-    image: Option<ImageTensor>,
+    input: Option<PipelineInputTensor>,
     events: mpsc::Sender<DriverEvent>,
     _permit: OwnedSemaphorePermit,
 ) {
     let mut metrics = GenerationMetrics::start();
-    let pipeline_request = match image {
-        Some(image) => match Value::from_vec_f32(image.data, &image.shape) {
-            Ok(value) => PipelineGenerateRequest::new(request).with_input(image.endpoint, value),
+    let pipeline_request = match input {
+        Some(input) => match Value::from_vec_f32(input.data, &input.shape) {
+            Ok(value) => PipelineGenerateRequest::new(request).with_input(input.endpoint, value),
             Err(err) => {
                 let _ = events.try_send(DriverEvent::Error(format!(
-                    "failed to create image tensor: {err}"
+                    "failed to create pipeline input tensor: {err}"
                 )));
                 return;
             }

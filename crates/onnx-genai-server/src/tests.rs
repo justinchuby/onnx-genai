@@ -34,6 +34,49 @@ fn tiny_png_data_uri() -> String {
     )
 }
 
+fn tiny_wav_bytes() -> Vec<u8> {
+    let samples = [0_i16; 1_280];
+    let data_len = (samples.len() * 2) as u32;
+    let mut wav = Vec::with_capacity(44 + data_len as usize);
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&(36 + data_len).to_le_bytes());
+    wav.extend_from_slice(b"WAVEfmt ");
+    wav.extend_from_slice(&16_u32.to_le_bytes());
+    wav.extend_from_slice(&1_u16.to_le_bytes());
+    wav.extend_from_slice(&1_u16.to_le_bytes());
+    wav.extend_from_slice(&16_000_u32.to_le_bytes());
+    wav.extend_from_slice(&32_000_u32.to_le_bytes());
+    wav.extend_from_slice(&2_u16.to_le_bytes());
+    wav.extend_from_slice(&16_u16.to_le_bytes());
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&data_len.to_le_bytes());
+    for sample in samples {
+        wav.extend_from_slice(&sample.to_le_bytes());
+    }
+    wav
+}
+
+fn tiny_wav_base64() -> String {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    STANDARD.encode(tiny_wav_bytes())
+}
+
+fn multipart_audio_body(response_format: &str) -> (String, Vec<u8>) {
+    let boundary = "onnx-genai-audio-boundary";
+    let mut body = Vec::new();
+    body.extend_from_slice(
+        format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\ntiny-whisper\r\n\
+             --{boundary}\r\nContent-Disposition: form-data; name=\"response_format\"\r\n\r\n{response_format}\r\n\
+             --{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"tiny.wav\"\r\nContent-Type: audio/wav\r\n\r\n"
+        )
+        .as_bytes(),
+    );
+    body.extend_from_slice(&tiny_wav_bytes());
+    body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+    (boundary.to_string(), body)
+}
+
 #[test]
 fn multimodal_message_parses_text_and_data_image_parts() {
     let request: ChatCompletionRequest = serde_json::from_value(json!({
@@ -58,6 +101,208 @@ fn multimodal_message_parses_text_and_data_image_parts() {
     );
     assert_eq!(request.image_urls().len(), 1);
     assert!(request.image_urls()[0].starts_with("data:image/png;base64,"));
+}
+
+#[test]
+fn multimodal_message_parses_base64_wav_input_audio_part() {
+    let request: ChatCompletionRequest = serde_json::from_value(json!({
+        "model": "tiny-whisper",
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Transcribe this"},
+                {"type": "input_audio", "input_audio": {
+                    "data": tiny_wav_base64(),
+                    "format": "wav"
+                }}
+            ]
+        }]
+    }))
+    .unwrap();
+
+    assert_eq!(
+        request.messages[0]
+            .content
+            .as_ref()
+            .expect("content")
+            .text(),
+        "Transcribe this"
+    );
+    let audio = request.input_audio();
+    assert_eq!(audio.len(), 1);
+    assert_eq!(audio[0].format, "wav");
+    assert!(!audio[0].data.is_empty());
+}
+
+#[test]
+fn transcription_json_response_has_openai_shape() {
+    let response = crate::types::AudioTranscriptionResponse {
+        text: "hello".to_string(),
+    };
+    assert_eq!(
+        serde_json::to_value(response).unwrap(),
+        json!({"text": "hello"})
+    );
+}
+
+#[tokio::test]
+async fn transcription_multipart_against_non_audio_model_returns_400() {
+    let (boundary, body) = multipart_audio_body("json");
+    let response = app(tiny_state())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/audio/transcriptions")
+                .header(
+                    header::CONTENT_TYPE,
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        body["error"]["message"],
+        "this model does not support audio transcription"
+    );
+}
+
+#[tokio::test]
+async fn audio_chat_against_non_audio_model_returns_400() {
+    let response = app(tiny_state())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "tiny-llm",
+                        "messages": [{
+                            "role": "user",
+                            "content": [{
+                                "type": "input_audio",
+                                "input_audio": {
+                                    "data": tiny_wav_base64(),
+                                    "format": "wav"
+                                }
+                            }]
+                        }],
+                        "max_tokens": 1
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        body["error"]["message"],
+        "this model does not support audio input"
+    );
+}
+
+#[tokio::test]
+#[ignore = "synthetic Whisper-contract smoke test; run explicitly for audio server validation"]
+async fn audio_endpoints_route_through_tiny_whisper_pipeline() {
+    let model_dir =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-whisper");
+    let router =
+        app(AppState::load(&model_dir, Some("tiny-whisper".to_string()))
+            .expect("load Whisper fixture"));
+
+    let chat_response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "tiny-whisper",
+                        "messages": [{
+                            "role": "user",
+                            "content": [{
+                                "type": "input_audio",
+                                "input_audio": {
+                                    "data": tiny_wav_base64(),
+                                    "format": "wav"
+                                }
+                            }]
+                        }],
+                        "max_tokens": 2,
+                        "temperature": 0.0
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(chat_response.status(), StatusCode::OK);
+    let chat_body = to_bytes(chat_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let chat_body: Value = serde_json::from_slice(&chat_body).unwrap();
+    assert!(chat_body["choices"][0]["message"]["content"].is_string());
+
+    let (boundary, body) = multipart_audio_body("json");
+    let transcription_response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/audio/transcriptions")
+                .header(
+                    header::CONTENT_TYPE,
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(transcription_response.status(), StatusCode::OK);
+    let transcription_body = to_bytes(transcription_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let transcription_body: Value = serde_json::from_slice(&transcription_body).unwrap();
+    assert!(transcription_body["text"].is_string());
+
+    let (boundary, body) = multipart_audio_body("text");
+    let text_response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/audio/transcriptions")
+                .header(
+                    header::CONTENT_TYPE,
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(text_response.status(), StatusCode::OK);
+    assert_eq!(
+        text_response.headers()[header::CONTENT_TYPE],
+        "text/plain; charset=utf-8"
+    );
+    let text_body = to_bytes(text_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert!(!text_body.is_empty());
 }
 
 #[tokio::test]

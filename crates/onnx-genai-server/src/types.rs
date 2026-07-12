@@ -76,6 +76,15 @@ impl ChatCompletionRequest {
             .map(ToString::to_string)
             .collect()
     }
+
+    pub(crate) fn input_audio(&self) -> Vec<InputAudio> {
+        self.messages
+            .iter()
+            .filter_map(|message| message.content.as_ref())
+            .flat_map(ChatMessageContent::input_audio)
+            .cloned()
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -104,7 +113,8 @@ impl ChatMessageContent {
                 .iter()
                 .filter_map(|part| match part {
                     ChatMessageContentPart::Text { text } => Some(text.as_str()),
-                    ChatMessageContentPart::ImageUrl { .. } => None,
+                    ChatMessageContentPart::ImageUrl { .. }
+                    | ChatMessageContentPart::InputAudio { .. } => None,
                 })
                 .collect::<Vec<_>>()
                 .join(""),
@@ -119,7 +129,19 @@ impl ChatMessageContent {
         .iter()
         .filter_map(|part| match part {
             ChatMessageContentPart::ImageUrl { image_url } => Some(image_url.url.as_str()),
-            ChatMessageContentPart::Text { .. } => None,
+            ChatMessageContentPart::Text { .. } | ChatMessageContentPart::InputAudio { .. } => None,
+        })
+    }
+
+    pub(crate) fn input_audio(&self) -> impl Iterator<Item = &InputAudio> {
+        match self {
+            Self::Text(_) => [].as_slice(),
+            Self::Parts(parts) => parts.as_slice(),
+        }
+        .iter()
+        .filter_map(|part| match part {
+            ChatMessageContentPart::InputAudio { input_audio } => Some(input_audio),
+            ChatMessageContentPart::Text { .. } | ChatMessageContentPart::ImageUrl { .. } => None,
         })
     }
 }
@@ -135,11 +157,23 @@ impl From<String> for ChatMessageContent {
 pub enum ChatMessageContentPart {
     Text { text: String },
     ImageUrl { image_url: ImageUrl },
+    InputAudio { input_audio: InputAudio },
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ImageUrl {
     pub url: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct InputAudio {
+    pub data: String,
+    pub format: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AudioTranscriptionResponse {
+    pub text: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

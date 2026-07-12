@@ -6,7 +6,7 @@ use std::{
 use anyhow::Context;
 use axum::{
     Json,
-    extract::{Path as AxumPath, State},
+    extract::{Multipart, Path as AxumPath, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response, Sse, sse::Event},
 };
@@ -21,16 +21,17 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::{
-    driver::{DriverEvent, GenerateSubmitError},
+    driver::{DriverEvent, GenerateSubmitError, PipelineInputTensor},
     sse::{
         StopBoundaryBuffer, completion_chunk, completion_done_chunk, content_chunk, done_chunk,
         role_chunk, send_completion_stream_chunk, send_stream_chunk, tool_calls_chunk,
     },
     state::{AppState, ServerConfig},
     types::{
-        ChatChoice, ChatCompletionRequest, ChatCompletionResponse, ChatMessage, ChatMessageContent,
-        ChatMessageToolCall, ChatMessageToolCallFunction, ChatTool, CompletionChoice,
-        CompletionRequest, CompletionResponse, StopInput, ToolChoice, ToolChoiceMode, Usage,
+        AudioTranscriptionResponse, ChatChoice, ChatCompletionRequest, ChatCompletionResponse,
+        ChatMessage, ChatMessageContent, ChatMessageToolCall, ChatMessageToolCallFunction,
+        ChatTool, CompletionChoice, CompletionRequest, CompletionResponse, InputAudio, StopInput,
+        ToolChoice, ToolChoiceMode, Usage,
     },
 };
 
@@ -301,6 +302,118 @@ pub(crate) async fn completions(
     }
 }
 
+pub(crate) async fn audio_transcriptions(
+    State(state): State<AppState>,
+    mut multipart: Multipart,
+) -> Result<Response, ApiError> {
+    let mut file = None;
+    let mut filename = None;
+    let mut language = None;
+    let mut response_format = "json".to_string();
+
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|err| ApiError::bad_request(format!("invalid multipart form: {err}")))?
+    {
+        let name = field.name().unwrap_or_default().to_string();
+        match name.as_str() {
+            "file" => {
+                filename = field.file_name().map(ToString::to_string);
+                file = Some(
+                    field
+                        .bytes()
+                        .await
+                        .map_err(|err| {
+                            ApiError::bad_request(format!("failed to read audio file: {err}"))
+                        })?
+                        .to_vec(),
+                );
+            }
+            "language" => {
+                language = Some(field.text().await.map_err(|err| {
+                    ApiError::bad_request(format!("invalid language field: {err}"))
+                })?);
+            }
+            "response_format" => {
+                response_format = field.text().await.map_err(|err| {
+                    ApiError::bad_request(format!("invalid response_format field: {err}"))
+                })?;
+            }
+            "model" => {
+                let _ = field
+                    .text()
+                    .await
+                    .map_err(|err| ApiError::bad_request(format!("invalid model field: {err}")))?;
+            }
+            _ => {}
+        }
+    }
+
+    let bytes = file.ok_or_else(|| ApiError::bad_request("multipart field 'file' is required"))?;
+    if !matches!(response_format.as_str(), "json" | "text") {
+        return Err(ApiError::bad_request(format!(
+            "unsupported response_format '{response_format}'; expected 'json' or 'text'"
+        )));
+    }
+    if filename
+        .as_deref()
+        .is_some_and(|name| name.to_ascii_lowercase().ends_with(".mp3"))
+    {
+        return Err(ApiError::bad_request(
+            "MP3 audio is not supported yet; provide a PCM16 WAV file",
+        ));
+    }
+    let spec = state
+        .audio_input
+        .as_ref()
+        .ok_or_else(|| ApiError::bad_request("this model does not support audio transcription"))?;
+    let input = crate::audio_input::preprocess_wav(&bytes, spec)
+        .map_err(|err| ApiError::bad_request(format!("invalid audio input: {err}")))?;
+    let max_tokens = spec
+        .max_tokens
+        .unwrap_or(state.config.max_output_tokens)
+        .min(state.config.max_output_tokens);
+    let token_ids = audio_decoder_prompt(&state.tokenizer, language.as_deref())?;
+    let prompt_tokens = token_ids.len();
+    let request = GenerateRequest {
+        prompt: GeneratePrompt::TokenIds(token_ids),
+        options: GenerateOptions {
+            max_new_tokens: max_tokens,
+            temperature: 0.0,
+            max_context: state.model_max_context,
+            ..GenerateOptions::default()
+        },
+    };
+    let result = collect_generation_result(
+        state
+            .engine
+            .generate_pipeline(
+                request,
+                Some(PipelineInputTensor {
+                    endpoint: input.endpoint,
+                    data: input.data,
+                    shape: input.shape,
+                }),
+            )
+            .await
+            .map_err(map_generate_submit_error)?,
+    )
+    .await
+    .map_err(|err| ApiError::internal(format!("transcription failed: {err}")))?;
+    crate::metrics::add_prompt_tokens(prompt_tokens);
+
+    match response_format.as_str() {
+        "json" => Ok(Json(AudioTranscriptionResponse { text: result.text }).into_response()),
+        "text" => Ok((
+            [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+            result.text,
+        )
+            .into_response()),
+        _ => unreachable!("response format validated before generation"),
+    }
+}
+
 async fn run_completion(
     state: AppState,
     request: CompletionRequest,
@@ -457,6 +570,17 @@ pub(crate) async fn chat_completions(
         ));
     }
     let image_urls = request.image_urls();
+    let input_audio = request.input_audio();
+    if !image_urls.is_empty() && !input_audio.is_empty() {
+        return Err(ApiError::bad_request(
+            "image and audio inputs cannot be combined in one request",
+        ));
+    }
+    if input_audio.len() > 1 {
+        return Err(ApiError::bad_request(
+            "only one input_audio content part is supported per request",
+        ));
+    }
     if !image_urls.is_empty() && !state.pipeline {
         return Err(ApiError::bad_request(
             "this model does not support image input",
@@ -467,14 +591,25 @@ pub(crate) async fn chat_completions(
             "this pipeline model does not support image input",
         ));
     }
+    if !input_audio.is_empty() && !state.pipeline {
+        return Err(ApiError::bad_request(
+            "this model does not support audio input",
+        ));
+    }
+    if !input_audio.is_empty() && state.audio_input.is_none() {
+        return Err(ApiError::bad_request(
+            "this pipeline model does not support audio input",
+        ));
+    }
     if request.stream {
         Ok(
-            stream_chat_completion(state, request, session_id, image_urls)
+            stream_chat_completion(state, request, session_id, image_urls, input_audio)
                 .await?
                 .into_response(),
         )
     } else {
-        let response = run_chat_completion(state, request, session_id, image_urls).await?;
+        let response =
+            run_chat_completion(state, request, session_id, image_urls, input_audio).await?;
         Ok(Json(response).into_response())
     }
 }
@@ -484,17 +619,21 @@ async fn run_chat_completion(
     request: ChatCompletionRequest,
     client_session_id: Option<String>,
     image_urls: Vec<String>,
+    input_audio: Vec<InputAudio>,
 ) -> Result<ChatCompletionResponse, ApiError> {
     let id = completion_id();
     let created = now_unix();
     let model = request.model.clone();
-    let prepared = prepare_generate_request(
+    let mut prepared = prepare_generate_request(
         &request,
         &state.tokenizer,
         state.chat_template.as_deref(),
         client_session_id.is_some(),
     )
     .map_err(|err| ApiError::internal(format!("prompt tokenization failed: {err}")))?;
+    if !input_audio.is_empty() {
+        prepared = prepare_audio_generate_request(&request, &state.tokenizer)?;
+    }
     enforce_context_cap(
         prepared.prompt_tokens,
         request.max_tokens,
@@ -511,25 +650,30 @@ async fn run_chat_completion(
 
     let session_for_count = session_lookup;
     let wants_json_object = request.wants_json_object();
-    let image = if image_urls.is_empty() {
-        None
-    } else {
-        Some(
-            crate::image_input::load_and_preprocess(
-                &image_urls,
-                state
-                    .vision_input
-                    .as_ref()
-                    .expect("vision input checked before generation"),
-            )
-            .await
-            .map_err(|err| ApiError::bad_request(format!("invalid image input: {err}")))?,
+    let pipeline_input = if !image_urls.is_empty() {
+        let image = crate::image_input::load_and_preprocess(
+            &image_urls,
+            state
+                .vision_input
+                .as_ref()
+                .expect("vision input checked before generation"),
         )
+        .await
+        .map_err(|err| ApiError::bad_request(format!("invalid image input: {err}")))?;
+        Some(PipelineInputTensor {
+            endpoint: image.endpoint,
+            data: image.data,
+            shape: image.shape,
+        })
+    } else if let Some(audio) = input_audio.first() {
+        Some(preprocess_chat_audio(audio, &state)?)
+    } else {
+        None
     };
     let result = collect_generation_result(if state.pipeline {
         state
             .engine
-            .generate_pipeline(generation_request, image)
+            .generate_pipeline(generation_request, pipeline_input)
             .await
             .map_err(map_generate_submit_error)?
     } else {
@@ -612,6 +756,7 @@ async fn stream_chat_completion(
     request: ChatCompletionRequest,
     client_session_id: Option<String>,
     image_urls: Vec<String>,
+    input_audio: Vec<InputAudio>,
 ) -> Result<Sse<ReceiverStream<Result<Event, Infallible>>>, ApiError> {
     let id = completion_id();
     let created = now_unix();
@@ -621,13 +766,16 @@ async fn stream_chat_completion(
         .clone()
         .map(StopInput::into_texts)
         .unwrap_or_default();
-    let prepared = prepare_generate_request(
+    let mut prepared = prepare_generate_request(
         &request,
         &state.tokenizer,
         state.chat_template.as_deref(),
         client_session_id.is_some(),
     )
     .map_err(|err| ApiError::internal(format!("prompt tokenization failed: {err}")))?;
+    if !input_audio.is_empty() {
+        prepared = prepare_audio_generate_request(&request, &state.tokenizer)?;
+    }
     enforce_context_cap(
         prepared.prompt_tokens,
         request.max_tokens,
@@ -642,25 +790,30 @@ async fn stream_chat_completion(
     } else {
         None
     };
-    let image = if image_urls.is_empty() {
-        None
-    } else {
-        Some(
-            crate::image_input::load_and_preprocess(
-                &image_urls,
-                state
-                    .vision_input
-                    .as_ref()
-                    .expect("vision input checked before generation"),
-            )
-            .await
-            .map_err(|err| ApiError::bad_request(format!("invalid image input: {err}")))?,
+    let pipeline_input = if !image_urls.is_empty() {
+        let image = crate::image_input::load_and_preprocess(
+            &image_urls,
+            state
+                .vision_input
+                .as_ref()
+                .expect("vision input checked before generation"),
         )
+        .await
+        .map_err(|err| ApiError::bad_request(format!("invalid image input: {err}")))?;
+        Some(PipelineInputTensor {
+            endpoint: image.endpoint,
+            data: image.data,
+            shape: image.shape,
+        })
+    } else if let Some(audio) = input_audio.first() {
+        Some(preprocess_chat_audio(audio, &state)?)
+    } else {
+        None
     };
     let mut driver_rx = if state.pipeline {
         state
             .engine
-            .generate_pipeline(generation_request, image)
+            .generate_pipeline(generation_request, pipeline_input)
             .await
             .map_err(map_generate_submit_error)?
     } else {
@@ -805,6 +958,66 @@ pub(crate) async fn collect_generation_result(
         }
     }
     Err("generation stream ended before result".to_string())
+}
+
+fn preprocess_chat_audio(
+    input: &InputAudio,
+    state: &AppState,
+) -> Result<PipelineInputTensor, ApiError> {
+    let bytes = crate::audio_input::decode_chat_audio(input)
+        .map_err(|err| ApiError::bad_request(format!("invalid audio input: {err}")))?;
+    let spec = state
+        .audio_input
+        .as_ref()
+        .expect("audio input checked before generation");
+    let input = crate::audio_input::preprocess_wav(&bytes, spec)
+        .map_err(|err| ApiError::bad_request(format!("invalid audio input: {err}")))?;
+    Ok(PipelineInputTensor {
+        endpoint: input.endpoint,
+        data: input.data,
+        shape: input.shape,
+    })
+}
+
+fn prepare_audio_generate_request(
+    request: &ChatCompletionRequest,
+    tokenizer: &Tokenizer,
+) -> Result<PreparedGenerateRequest, ApiError> {
+    let token_ids = audio_decoder_prompt(tokenizer, None)?;
+    let prompt_tokens = token_ids.len();
+    Ok(PreparedGenerateRequest {
+        request: GenerateRequest {
+            prompt: GeneratePrompt::TokenIds(token_ids),
+            options: build_generate_options_with_tokenizer(request, tokenizer),
+        },
+        prompt_tokens,
+    })
+}
+
+fn audio_decoder_prompt(
+    tokenizer: &Tokenizer,
+    language: Option<&str>,
+) -> Result<Vec<u32>, ApiError> {
+    let mut token_ids = vec![
+        tokenizer
+            .token_id("<|startoftranscript|>")
+            .or_else(|| tokenizer.eos_token_id())
+            .unwrap_or(0),
+    ];
+    if let Some(language) = language.filter(|value| !value.is_empty()) {
+        let token = format!("<|{}|>", language.to_ascii_lowercase());
+        token_ids.push(tokenizer.token_id(&token).ok_or_else(|| {
+            ApiError::bad_request(format!(
+                "language '{language}' is not supported by this model tokenizer"
+            ))
+        })?);
+    }
+    for token in ["<|transcribe|>", "<|notimestamps|>"] {
+        if let Some(token_id) = tokenizer.token_id(token) {
+            token_ids.push(token_id);
+        }
+    }
+    Ok(token_ids)
 }
 
 fn validate_request(

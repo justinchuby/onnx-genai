@@ -7,7 +7,7 @@ use std::{net::SocketAddr, time::Instant};
 
 use axum::{
     Router,
-    extract::Request,
+    extract::{DefaultBodyLimit, Request},
     middleware,
     middleware::Next,
     response::Response,
@@ -15,6 +15,7 @@ use axum::{
 };
 use tracing::Instrument;
 
+mod audio_input;
 mod driver;
 mod image_input;
 mod metrics;
@@ -30,11 +31,11 @@ pub use routes::{
 };
 pub use state::{AppState, ServerConfig};
 pub use types::{
-    ChatChoice, ChatCompletionRequest, ChatCompletionResponse, ChatMessage, ChatMessageContent,
-    ChatMessageContentPart, ChatMessageToolCall, ChatMessageToolCallFunction, ChatTool,
-    ChatToolFunction, CompletionChoice, CompletionRequest, CompletionResponse, ImageUrl,
-    ResponseFormat, ResponseFormatType, StopInput, ToolChoice, ToolChoiceFunction, ToolChoiceMode,
-    ToolChoiceSpecific, Usage,
+    AudioTranscriptionResponse, ChatChoice, ChatCompletionRequest, ChatCompletionResponse,
+    ChatMessage, ChatMessageContent, ChatMessageContentPart, ChatMessageToolCall,
+    ChatMessageToolCallFunction, ChatTool, ChatToolFunction, CompletionChoice, CompletionRequest,
+    CompletionResponse, ImageUrl, InputAudio, ResponseFormat, ResponseFormatType, StopInput,
+    ToolChoice, ToolChoiceFunction, ToolChoiceMode, ToolChoiceSpecific, Usage,
 };
 
 pub fn app(state: AppState) -> Router {
@@ -45,6 +46,10 @@ pub fn app(state: AppState) -> Router {
         .route("/v1/sessions", post(routes::create_session))
         .route("/v1/sessions/{id}", delete(routes::delete_session))
         .route("/v1/completions", post(routes::completions))
+        .route(
+            "/v1/audio/transcriptions",
+            post(routes::audio_transcriptions).layer(DefaultBodyLimit::max(25 * 1024 * 1024)),
+        )
         .route("/v1/chat/completions", post(routes::chat_completions));
     #[cfg(feature = "metrics")]
     let router = router.route("/metrics", get(routes::prometheus_metrics));

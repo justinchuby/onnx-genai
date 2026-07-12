@@ -3,11 +3,15 @@ use std::{path::Path, sync::Arc, time::Instant};
 use anyhow::Context;
 use onnx_genai::{Engine, EngineConfig};
 use onnx_genai_engine::FimConfig;
+use onnx_genai_metadata::PipelineStrategy;
 use onnx_genai_ort::{
     ChatTemplate, DataType, ModelDirectory, PipelineModelDirectory, PipelineModels, Tokenizer,
 };
 
-use crate::{driver::EngineDriver, image_input::VisionInputSpec, session::SessionRegistry};
+use crate::{
+    audio_input::AudioInputSpec, driver::EngineDriver, image_input::VisionInputSpec,
+    session::SessionRegistry,
+};
 
 const DEFAULT_MAX_OUTPUT_TOKENS: usize = 4096;
 const DEFAULT_MAX_SESSIONS: usize = 256;
@@ -26,6 +30,7 @@ pub struct AppState {
     pub(crate) fim_config: Option<FimConfig>,
     pub(crate) pipeline: bool,
     pub(crate) vision_input: Option<VisionInputSpec>,
+    pub(crate) audio_input: Option<AudioInputSpec>,
     pub(crate) started_at: Instant,
 }
 
@@ -159,6 +164,34 @@ impl AppState {
             }
             _ => anyhow::bail!("pipeline declares multiple pixel_values inputs"),
         };
+        let audio_inputs = models
+            .sessions
+            .iter()
+            .flat_map(|(component, session)| {
+                session.inputs().iter().filter_map(move |input| {
+                    (input.name == "input_features")
+                        .then_some((format!("{component}.{}", input.name), input))
+                })
+            })
+            .collect::<Vec<_>>();
+        let pipeline_max_tokens = strategy_max_tokens(&directory.spec.strategy);
+        let audio_input = match audio_inputs.as_slice() {
+            [] => None,
+            [(endpoint, input)] => {
+                if input.dtype != DataType::Float32 {
+                    anyhow::bail!(
+                        "audio input '{endpoint}' must be Float32, but the model declares {:?}",
+                        input.dtype
+                    );
+                }
+                Some(AudioInputSpec::from_input(
+                    endpoint.clone(),
+                    &input.shape,
+                    pipeline_max_tokens,
+                )?)
+            }
+            _ => anyhow::bail!("pipeline declares multiple input_features inputs"),
+        };
         drop(models);
 
         let engine = Engine::from_pipeline_dir(model_dir, EngineConfig::default())?;
@@ -173,6 +206,7 @@ impl AppState {
             fim_config: None,
             pipeline: true,
             vision_input,
+            audio_input,
             started_at: Instant::now(),
         })
     }
@@ -218,6 +252,7 @@ impl AppState {
             fim_config,
             pipeline: false,
             vision_input: None,
+            audio_input: None,
             started_at: Instant::now(),
         }
     }
@@ -226,6 +261,16 @@ impl AppState {
         &self.model_id
     }
 }
+
+fn strategy_max_tokens(strategy: &PipelineStrategy) -> Option<usize> {
+    strategy.max_tokens.or_else(|| {
+        strategy
+            .stages
+            .iter()
+            .find_map(|stage| strategy_max_tokens(&stage.strategy))
+    })
+}
+
 fn infer_model_id(model_dir: &Path) -> String {
     model_dir
         .file_name()
