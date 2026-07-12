@@ -3562,3 +3562,401 @@ pub fn detect_speculator(model_dir: &Path) -> Option<SpeculatorDetection> {
 ```
 
 **Key advantage:** Mobius handles all the hard ONNX export problems (graph optimization, operator fusion, opset compatibility, quantization). We focus purely on fast inference of the resulting model.
+
+---
+
+## 29. Language Diffusion Models
+
+### 29.1 What Is Language Diffusion
+
+Language diffusion generates text by **iteratively denoising a sequence of masked/corrupted tokens**, rather than appending one token at a time. All positions are generated in parallel and refined over multiple steps.
+
+```
+Autoregressive (GPT-style):
+  Step 0: [The]
+  Step 1: [The, cat]
+  Step 2: [The, cat, sat]
+  Step 3: [The, cat, sat, down]
+  → 4 steps for 4 tokens, strictly left-to-right
+
+Language Diffusion (MDLM/Mercury-style):
+  Step 0: [MASK, MASK, MASK, MASK]          ← fully masked
+  Step 1: [The,  MASK, sat,  MASK]          ← high-confidence positions unmasked
+  Step 2: [The,  cat,  sat,  MASK]          ← more positions resolved
+  Step 3: [The,  cat,  sat,  down]          ← all resolved
+  → 3 steps for 4 tokens, any-order, parallel
+```
+
+### 29.2 Key Models
+
+| Model | Scale | Method | Key Innovation |
+|---|---|---|---|
+| **MDLM** | Research | Masked discrete diffusion | Continuous-time masked diffusion with score entropy loss |
+| **SEDD** | Research | Score entropy discrete diffusion | Concrete score matching for discrete data |
+| **Mercury** | LLaMA-scale (up to 10B+) | Masked diffusion | First production-scale language diffusion, 10× faster than AR |
+| **Plaid** | 1B+ | Discrete diffusion | Efficient training + adaptive step scheduling |
+| **DART** | Research | Non-autoregressive | Any-order autoregressive with diffusion |
+| **Dream** | Research | Discrete denoising | Reparameterized discrete diffusion |
+| **LLaDA** | 8B | Large language diffusion with adaptation | Competitive with LLaMA-3 on benchmarks |
+
+### 29.3 How It Differs from Image Diffusion
+
+| Aspect | Image Diffusion | Language Diffusion |
+|---|---|---|
+| **Space** | Continuous (float pixels/latents) | Discrete (token IDs from finite vocab) |
+| **Corruption** | Gaussian noise addition | Token masking or uniform corruption |
+| **State** | Noisy float tensor | Partially-masked token sequence |
+| **Per-step output** | Denoised float tensor | Logits per position over vocab |
+| **Schedule** | Noise schedule (β_t) | Masking schedule (what % masked at step t) |
+| **Unmasking** | Deterministic denoise | Confidence-based: unmask positions where model is most certain |
+| **KV cache** | N/A | N/A (no causal attention, full bidirectional) |
+
+### 29.4 Pipeline Strategy: `discrete_diffusion`
+
+Extends our strategy taxonomy (§20) with a fourth fundamental type:
+
+```yaml
+strategy:
+  kind: discrete_diffusion
+  model: denoiser
+  
+  # Masking schedule
+  schedule:
+    type: cosine | linear | sigmoid | adaptive
+    total_steps: 64          # max denoising steps
+    
+  # Unmasking policy
+  unmasking:
+    policy: confidence | random | entropy | hybrid
+    # confidence: unmask highest-probability positions first
+    # random: unmask random subset each step
+    # entropy: unmask lowest-entropy positions first
+    # hybrid: confidence with random tiebreaking
+    
+    tokens_per_step: adaptive  # or fixed number
+    min_confidence: 0.9        # only unmask if P(token) > threshold
+    
+  # Generation shape
+  output:
+    length: fixed | variable
+    max_length: 2048
+    # fixed: generate exactly max_length tokens (pad/truncate)
+    # variable: stop when all positions unmasked
+```
+
+### 29.5 Core Engine Design
+
+```rust
+/// Discrete diffusion generation engine.
+pub struct DiscreteDiffusionEngine {
+    /// The denoiser model (bidirectional transformer, NOT causal).
+    session: Session,
+    /// Tokenizer.
+    tokenizer: Tokenizer,
+    /// Masking schedule.
+    schedule: MaskSchedule,
+    /// Unmasking policy.
+    unmasking: UnmaskingPolicy,
+    /// Mask token ID.
+    mask_token_id: TokenId,
+}
+
+/// The state of a diffusion generation: a partially-masked sequence.
+pub struct DiffusionState {
+    /// Current token IDs. Masked positions hold mask_token_id.
+    tokens: Vec<TokenId>,
+    /// Which positions are still masked (true = masked).
+    mask: Vec<bool>,
+    /// Current diffusion timestep (decreasing: T → 0).
+    timestep: usize,
+    /// Confidence scores from last forward pass (per position).
+    confidences: Vec<f32>,
+}
+
+impl DiscreteDiffusionEngine {
+    /// Generate text via iterative denoising.
+    pub fn generate(&self, request: DiffusionRequest) -> Result<DiffusionResult> {
+        // 1. Initialize: all positions masked (or partially given for infilling)
+        let mut state = self.initialize_state(&request);
+        
+        // 2. Iterative denoising loop
+        for step in (0..self.schedule.total_steps).rev() {
+            // Compute masking ratio for this timestep
+            let target_unmask_ratio = self.schedule.ratio_at(step);
+            
+            // Forward pass: get logits for all positions
+            // (bidirectional attention — every position sees every other position)
+            let logits = self.forward(&state, step)?;
+            
+            // Decide which positions to unmask this step
+            let to_unmask = self.unmasking.select_positions(
+                &state,
+                &logits,
+                target_unmask_ratio,
+            );
+            
+            // Sample tokens for unmasked positions
+            for pos in to_unmask {
+                let token = self.sample_position(&logits[pos], &request.sampling)?;
+                state.tokens[pos] = token;
+                state.mask[pos] = false;
+            }
+            
+            // Optional: re-mask low-confidence positions (allows correction)
+            if self.schedule.allows_remask(step) {
+                self.remask_low_confidence(&mut state, &logits);
+            }
+            
+            // Stream intermediate result if requested
+            if let Some(cb) = &request.callback {
+                cb(DiffusionStep {
+                    step,
+                    tokens: state.tokens.clone(),
+                    mask: state.mask.clone(),
+                    unmasked_ratio: state.unmasked_ratio(),
+                })?;
+            }
+            
+            // Early stop if all positions are unmasked
+            if state.all_unmasked() {
+                break;
+            }
+        }
+        
+        Ok(DiffusionResult {
+            text: self.tokenizer.decode(&state.tokens)?,
+            token_ids: state.tokens,
+            steps_used: self.schedule.total_steps - state.timestep,
+        })
+    }
+}
+```
+
+### 29.6 Masking Schedules
+
+```rust
+pub enum MaskSchedule {
+    /// Linear: unmask uniformly across steps.
+    Linear { total_steps: usize },
+    /// Cosine: slow start, fast middle, slow end. Most common.
+    Cosine { total_steps: usize },
+    /// Sigmoid: sharp transition in the middle.
+    Sigmoid { total_steps: usize },
+    /// Adaptive: adjust steps based on sequence difficulty.
+    Adaptive {
+        max_steps: usize,
+        /// Stop early if all positions have confidence > threshold.
+        early_stop_confidence: f32,
+    },
+}
+
+impl MaskSchedule {
+    /// What fraction of tokens should be unmasked at timestep t.
+    /// t goes from T (fully masked) to 0 (fully unmasked).
+    pub fn ratio_at(&self, t: usize) -> f32 {
+        match self {
+            MaskSchedule::Linear { total_steps } => {
+                1.0 - (t as f32 / *total_steps as f32)
+            }
+            MaskSchedule::Cosine { total_steps } => {
+                let s = t as f32 / *total_steps as f32;
+                1.0 - (s * std::f32::consts::FRAC_PI_2).cos()
+            }
+            ...
+        }
+    }
+    
+    /// Whether re-masking (correcting earlier decisions) is allowed at step t.
+    pub fn allows_remask(&self, t: usize) -> bool {
+        // Typically allow remask in early steps (high t), freeze in later steps
+        t > self.total_steps() / 3
+    }
+}
+```
+
+### 29.7 Why Language Diffusion Matters for Coding Agents
+
+**1. Native infilling without FIM tokens:**
+```rust
+// Autoregressive: needs special FIM tokens, model must be trained for it
+// "<|fim_prefix|>def fib(n):<|fim_suffix|>\n    return result<|fim_middle|>"
+
+// Language diffusion: just mask the positions you want filled
+// "def fib(n):\n    [MASK MASK MASK MASK MASK]\n    return result"
+// → The model fills in the masked positions directly.
+```
+
+**2. Parallel multi-position editing:**
+```
+// Need to change variable name from 'x' to 'count' in 5 places:
+// AR: regenerate entire file or do 5 separate edits
+// Diffusion: mask all 5 positions, denoise in parallel → all updated consistently
+```
+
+**3. Speed for long generations:**
+```
+// 512 tokens:
+// AR: 512 forward passes (sequential)
+// Diffusion: ~32-64 forward passes (parallel across all positions)
+// With adaptive scheduling: even fewer if content is predictable
+```
+
+**4. Controllable generation length:**
+```
+// Know you need exactly 200 tokens of code? 
+// Initialize 200 masked positions → denoise.
+// No need for length-predicting heuristics.
+```
+
+### 29.8 Conditional Diffusion (Guided Generation)
+
+```rust
+/// Conditioning modes for language diffusion.
+pub enum DiffusionCondition {
+    /// Unconditional: generate from scratch.
+    Unconditional { length: usize },
+    
+    /// Prefix-conditioned: given prefix, generate continuation.
+    /// (Prefix positions are never masked.)
+    Prefix { prefix: Vec<TokenId>, generate_length: usize },
+    
+    /// Infilling: given prefix + suffix, fill the middle.
+    Infill {
+        prefix: Vec<TokenId>,
+        suffix: Vec<TokenId>,
+        fill_length: usize,  // or estimate
+    },
+    
+    /// Span corruption: multiple spans to fill (T5-style).
+    SpanFill {
+        tokens: Vec<TokenId>,
+        /// (start, end) indices of spans to regenerate.
+        spans: Vec<(usize, usize)>,
+    },
+    
+    /// Editing: given full text, re-generate specific positions.
+    Edit {
+        original: Vec<TokenId>,
+        /// Positions to re-generate (mask these, keep rest).
+        edit_positions: Vec<usize>,
+    },
+}
+```
+
+### 29.9 Differences from Existing Strategies
+
+| Aspect | Autoregressive | Image Diffusion (iterative) | Language Diffusion (discrete_diffusion) |
+|---|---|---|---|
+| KV Cache | Yes (paged) | No | No |
+| Attention | Causal (lower triangular) | Full bidirectional | Full bidirectional |
+| Continuous batching | Yes (different lengths) | Yes (same shape) | Yes (same shape within step) |
+| Speculative decoding | Yes (draft model) | No | Possible (adaptive step skipping) |
+| Streaming | Token-by-token | Step-by-step preview | Step-by-step (increasing resolution) |
+| Position flexibility | Left-to-right only | All positions | Any subset of positions |
+| Memory per step | O(1) new + cached KV | O(n) full state | O(n) full state |
+
+### 29.10 Memory & Batching
+
+**No KV cache needed** — every step is a full bidirectional forward pass. This simplifies memory management but means each step is a full O(n²) attention:
+
+```rust
+// Memory comparison for 2048-token generation:
+// AR: KV cache grows each step, peak = full sequence KV
+// Diffusion: constant memory per step (full 2048×2048 attention each time)
+//
+// AR total compute: Σ(i=1..2048) O(i) = O(n²) across all steps
+// Diffusion total compute: 64 × O(2048²) = O(64 × n²)
+// → Diffusion does more FLOPs but steps are parallelizable on GPU
+```
+
+**Batching:** Multiple diffusion requests at the same step can be batched naturally (all same shape). Requests at different steps can still batch if padded.
+
+```rust
+impl Scheduler {
+    /// Schedule diffusion requests — simpler than AR since no KV state.
+    fn schedule_diffusion(&self, requests: &[DiffusionRequest]) -> DiffusionBatch {
+        // Group by sequence length (or pad to max)
+        // All positions processed in one forward pass per step
+        // No KV cache allocation/management needed
+        ...
+    }
+}
+```
+
+### 29.11 Integration with Tool Use
+
+Language diffusion + tool use works differently from AR:
+
+```
+// AR tool use: generate until tool_call token → pause → resume from that point
+// Diffusion tool use: 
+//   1. Generate full response in masked form
+//   2. Detect tool_call pattern in partially-unmasked output
+//   3. Unmask tool_call JSON first (high priority positions)
+//   4. Execute tool
+//   5. Insert tool result as fixed (unmasked) tokens
+//   6. Re-run denoising on remaining masked positions with tool result as context
+```
+
+```rust
+/// Tool-aware diffusion: detect and prioritize tool call positions.
+pub struct ToolAwareDiffusion {
+    /// Positions identified as likely tool call JSON.
+    tool_call_positions: Option<Range<usize>>,
+    /// After tool execution, these positions are fixed context.
+    tool_result_positions: Option<Range<usize>>,
+}
+```
+
+### 29.12 Metadata Schema
+
+```yaml
+# inference_metadata.yaml for a language diffusion model
+model:
+  type: discrete_diffusion
+  attention: bidirectional    # NOT causal
+  mask_token_id: 128256      # special [MASK] token
+  
+pipeline:
+  strategy:
+    kind: discrete_diffusion
+    schedule:
+      type: cosine
+      total_steps: 64
+    unmasking:
+      policy: confidence
+      min_confidence: 0.9
+    output:
+      max_length: 4096
+      
+# No kv_cache section — diffusion models don't use KV cache
+# No speculative section — different acceleration methods apply
+```
+
+### 29.13 Acceleration Techniques (Diffusion-Specific)
+
+| Technique | Description | Speedup |
+|---|---|---|
+| **Adaptive step scheduling** | Skip steps when confidence is already high | 2-4× |
+| **Distillation** | Train fewer-step model from many-step teacher | 2-8× |
+| **Caching unchanged positions** | Only recompute attention for recently-changed positions | 1.5-2× |
+| **Progressive unmasking** | Unmask more tokens per step as confidence increases | 1.5-3× |
+| **Parallel sample + verify** | Generate multiple candidates, pick best | Quality improvement |
+
+### 29.14 Crate Structure
+
+```
+crates/onnx-genai-engine/src/
+├── autoregressive.rs          # AR generation (existing)
+├── iterative.rs               # Image diffusion (existing)
+├── single_pass.rs             # Embedding/classification (existing)
+├── composite.rs               # Multi-stage pipelines (existing)
+├── discrete_diffusion.rs      # NEW: language diffusion engine
+├── discrete_diffusion/
+│   ├── mod.rs                 # DiscreteDiffusionEngine
+│   ├── schedule.rs            # MaskSchedule variants
+│   ├── unmasking.rs           # UnmaskingPolicy (confidence/entropy/hybrid)
+│   ├── state.rs               # DiffusionState management
+│   └── condition.rs           # DiffusionCondition (infill/edit/prefix)
+└── ...
+```
