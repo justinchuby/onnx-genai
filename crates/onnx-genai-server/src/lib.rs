@@ -14,7 +14,7 @@ use anyhow::Context;
 use axum::{
     Json, Router,
     extract::{Path as AxumPath, State},
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response, Sse, sse::Event},
     routing::{delete, get, post},
 };
@@ -25,16 +25,17 @@ use onnx_genai::{
 use onnx_genai_engine::{ContinuousBatchEvent, ContinuousBatchManager, GenerateConstraint};
 use onnx_genai_ort::{ChatMessage as TemplateChatMessage, ChatTemplate, ModelDirectory, Tokenizer};
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 
 const SESSION_ID_HEADER: &str = "x-session-id";
 const DEFAULT_MAX_OUTPUT_TOKENS: usize = 4096;
 const DEFAULT_MAX_SESSIONS: usize = 256;
+const DEFAULT_MAX_PENDING: usize = 256;
 const DEFAULT_MAX_BATCH: usize = 4;
 const MAX_SESSION_ID_LEN: usize = 128;
-const DRIVER_COMMAND_BUFFER: usize = 1024;
 const DRIVER_OUTPUT_BUFFER: usize = 16;
+const OVERLOAD_RETRY_AFTER_SECS: u64 = 1;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -51,6 +52,8 @@ pub struct AppState {
 pub struct ServerConfig {
     pub max_output_tokens: usize,
     pub max_sessions: usize,
+    /// Maximum generation requests admitted to the driver, including active and queued work.
+    pub max_pending: usize,
 }
 
 impl Default for ServerConfig {
@@ -58,6 +61,7 @@ impl Default for ServerConfig {
         Self {
             max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
             max_sessions: DEFAULT_MAX_SESSIONS,
+            max_pending: DEFAULT_MAX_PENDING,
         }
     }
 }
@@ -70,6 +74,9 @@ impl ServerConfig {
         if self.max_sessions == 0 {
             anyhow::bail!("max_sessions must be greater than zero");
         }
+        if self.max_pending == 0 {
+            anyhow::bail!("max_pending must be greater than zero");
+        }
         Ok(self)
     }
 }
@@ -77,6 +84,7 @@ impl ServerConfig {
 #[derive(Clone)]
 struct EngineDriver {
     commands: mpsc::Sender<DriverCommand>,
+    generation_capacity: Arc<Semaphore>,
 }
 
 enum DriverCommand {
@@ -93,6 +101,7 @@ enum DriverCommand {
         session_id: Option<SessionId>,
         request: GenerateRequest,
         events: mpsc::Sender<DriverEvent>,
+        permit: OwnedSemaphorePermit,
     },
 }
 
@@ -105,20 +114,35 @@ enum DriverEvent {
 
 struct EngineOwner(Engine);
 
+#[derive(Debug)]
+enum GenerateSubmitError {
+    Overloaded,
+    DriverStopped,
+}
+
+struct DriverRoute {
+    events: mpsc::Sender<DriverEvent>,
+    _permit: OwnedSemaphorePermit,
+}
+
 // SAFETY: The engine is moved exactly once into the dedicated driver thread.
 // All ORT runners, sessions, KV state, and the continuous batch manager stay
 // owned by that thread and are accessed only by processing channel commands.
 unsafe impl Send for EngineOwner {}
 
 impl EngineDriver {
-    fn start(engine: Engine, max_batch: usize) -> Self {
-        let (commands, rx) = mpsc::channel(DRIVER_COMMAND_BUFFER);
+    fn start(engine: Engine, max_batch: usize, max_pending: usize) -> Self {
+        let (commands, rx) = mpsc::channel(max_pending);
+        let generation_capacity = Arc::new(Semaphore::new(max_pending));
         let owner = EngineOwner(engine);
         thread::Builder::new()
             .name("onnx-genai-batch-driver".to_string())
             .spawn(move || run_engine_driver(owner, rx, max_batch))
             .expect("failed to spawn onnx-genai engine driver");
-        Self { commands }
+        Self {
+            commands,
+            generation_capacity,
+        }
     }
 
     async fn create_session(&self) -> anyhow::Result<SessionId> {
@@ -161,16 +185,22 @@ impl EngineDriver {
         &self,
         session_id: Option<SessionId>,
         request: GenerateRequest,
-    ) -> anyhow::Result<mpsc::Receiver<DriverEvent>> {
+    ) -> Result<mpsc::Receiver<DriverEvent>, GenerateSubmitError> {
+        let permit = self
+            .generation_capacity
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| GenerateSubmitError::Overloaded)?;
         let (events, rx) = mpsc::channel(DRIVER_OUTPUT_BUFFER);
         self.commands
             .send(DriverCommand::Generate {
                 session_id,
                 request,
                 events,
+                permit,
             })
             .await
-            .map_err(|_| anyhow::anyhow!("engine driver stopped"))?;
+            .map_err(|_| GenerateSubmitError::DriverStopped)?;
         Ok(rx)
     }
 }
@@ -222,6 +252,7 @@ fn run_static_engine_driver(
                 session_id: None,
                 request,
                 events,
+                permit,
             } => {
                 run_static_batch_until_idle(
                     engine,
@@ -230,6 +261,7 @@ fn run_static_engine_driver(
                     max_batch,
                     request,
                     events,
+                    permit,
                 );
             }
             command => handle_driver_command(engine, command),
@@ -244,18 +276,27 @@ fn run_static_batch_until_idle(
     max_batch: usize,
     first_request: GenerateRequest,
     first_events: mpsc::Sender<DriverEvent>,
+    first_permit: OwnedSemaphorePermit,
 ) {
     let mut manager = match engine.continuous_batch_manager(max_batch) {
         Ok(manager) => manager,
         Err(err) => {
-            let _ = first_events.blocking_send(DriverEvent::Error(format!(
+            let _ = first_events.try_send(DriverEvent::Error(format!(
                 "continuous batch setup failed: {err}"
             )));
             return;
         }
     };
-    let mut routes: HashMap<usize, mpsc::Sender<DriverEvent>> = HashMap::new();
-    submit_to_continuous_manager(&mut manager, &mut routes, first_request, first_events);
+    let mut routes: HashMap<usize, DriverRoute> = HashMap::new();
+    let mut abandoned = HashMap::new();
+    submit_to_continuous_manager(
+        &mut manager,
+        &mut routes,
+        &mut abandoned,
+        first_request,
+        first_events,
+        first_permit,
+    );
 
     loop {
         while let Ok(command) = rx.try_recv() {
@@ -264,19 +305,27 @@ fn run_static_batch_until_idle(
                     session_id: None,
                     request,
                     events,
-                } => submit_to_continuous_manager(&mut manager, &mut routes, request, events),
+                    permit,
+                } => submit_to_continuous_manager(
+                    &mut manager,
+                    &mut routes,
+                    &mut abandoned,
+                    request,
+                    events,
+                    permit,
+                ),
                 command => deferred.push_back(command),
             }
         }
 
         if let Err(err) = manager.step() {
             let message = format!("continuous batch generation failed: {err}");
-            for (_, events) in routes.drain() {
-                let _ = events.blocking_send(DriverEvent::Error(message.clone()));
+            for (_, route) in routes.drain() {
+                let _ = route.events.try_send(DriverEvent::Error(message.clone()));
             }
             break;
         }
-        route_continuous_events(manager.poll(), &mut routes);
+        route_continuous_events(manager.poll(), &mut routes, &mut abandoned);
         if manager.is_idle() {
             break;
         }
@@ -285,35 +334,54 @@ fn run_static_batch_until_idle(
 
 fn submit_to_continuous_manager(
     manager: &mut ContinuousBatchManager<'_>,
-    routes: &mut HashMap<usize, mpsc::Sender<DriverEvent>>,
+    routes: &mut HashMap<usize, DriverRoute>,
+    abandoned: &mut HashMap<usize, OwnedSemaphorePermit>,
     request: GenerateRequest,
     events: mpsc::Sender<DriverEvent>,
+    permit: OwnedSemaphorePermit,
 ) {
     match manager.submit(request) {
         Ok(handle) => {
-            routes.insert(handle.id, events);
-            route_continuous_events(manager.poll(), routes);
+            routes.insert(
+                handle.id,
+                DriverRoute {
+                    events,
+                    _permit: permit,
+                },
+            );
+            route_continuous_events(manager.poll(), routes, abandoned);
         }
         Err(err) => {
-            let _ = events.blocking_send(DriverEvent::Error(err.to_string()));
+            let _ = events.try_send(DriverEvent::Error(err.to_string()));
         }
     }
 }
 
 fn route_continuous_events(
     events: Vec<ContinuousBatchEvent>,
-    routes: &mut HashMap<usize, mpsc::Sender<DriverEvent>>,
+    routes: &mut HashMap<usize, DriverRoute>,
+    abandoned: &mut HashMap<usize, OwnedSemaphorePermit>,
 ) {
     for event in events {
         match event {
             ContinuousBatchEvent::Token { handle, token } => {
-                if let Some(events) = routes.get(&handle.id) {
-                    let _ = events.blocking_send(DriverEvent::Token(token));
+                // A slow or disconnected consumer loses its route immediately. The
+                // driver never waits for output capacity; it keeps stepping every
+                // other row while the manager retires the abandoned row.
+                let delivery_failed = routes
+                    .get(&handle.id)
+                    .is_some_and(|route| route.events.try_send(DriverEvent::Token(token)).is_err());
+                if delivery_failed {
+                    if let Some(route) = routes.remove(&handle.id) {
+                        abandoned.insert(handle.id, route._permit);
+                    }
                 }
             }
             ContinuousBatchEvent::Finished { handle, result } => {
-                if let Some(events) = routes.remove(&handle.id) {
-                    let _ = events.blocking_send(DriverEvent::Finished(result));
+                if let Some(route) = routes.remove(&handle.id) {
+                    let _ = route.events.try_send(DriverEvent::Finished(result));
+                } else {
+                    abandoned.remove(&handle.id);
                 }
             }
         }
@@ -341,7 +409,8 @@ fn handle_driver_command(engine: &mut Engine, command: DriverCommand) {
             session_id,
             request,
             events,
-        } => run_fallback_generation(engine, session_id, request, events),
+            permit,
+        } => run_fallback_generation(engine, session_id, request, events, permit),
     }
 }
 
@@ -350,10 +419,11 @@ fn run_fallback_generation(
     session_id: Option<SessionId>,
     request: GenerateRequest,
     events: mpsc::Sender<DriverEvent>,
+    _permit: OwnedSemaphorePermit,
 ) {
     let mut callback = |token: GenerateToken| -> anyhow::Result<()> {
         events
-            .blocking_send(DriverEvent::Token(token))
+            .try_send(DriverEvent::Token(token))
             .context("stream receiver closed")
     };
     let result = match session_id {
@@ -364,10 +434,10 @@ fn run_fallback_generation(
     };
     match result {
         Ok(result) => {
-            let _ = events.blocking_send(DriverEvent::Finished(result));
+            let _ = events.try_send(DriverEvent::Finished(result));
         }
         Err(err) => {
-            let _ = events.blocking_send(DriverEvent::Error(err.to_string()));
+            let _ = events.try_send(DriverEvent::Error(err.to_string()));
         }
     }
 }
@@ -532,7 +602,7 @@ impl AppState {
         let config = config.validate().expect("validated server config");
         Self {
             model_id,
-            engine: EngineDriver::start(engine, DEFAULT_MAX_BATCH),
+            engine: EngineDriver::start(engine, DEFAULT_MAX_BATCH, config.max_pending),
             tokenizer: Arc::new(tokenizer),
             chat_template: chat_template.map(Arc::new),
             sessions: SessionRegistry::new(config.max_sessions),
@@ -819,6 +889,7 @@ struct ErrorBody {
 struct ApiError {
     status: StatusCode,
     message: String,
+    retry_after_secs: Option<u64>,
 }
 
 struct PreparedGenerateRequest {
@@ -895,6 +966,7 @@ impl ApiError {
         Self {
             status: StatusCode::BAD_REQUEST,
             message: message.into(),
+            retry_after_secs: None,
         }
     }
 
@@ -902,6 +974,7 @@ impl ApiError {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             message: message.into(),
+            retry_after_secs: None,
         }
     }
 
@@ -909,6 +982,15 @@ impl ApiError {
         Self {
             status: StatusCode::NOT_FOUND,
             message: message.into(),
+            retry_after_secs: None,
+        }
+    }
+
+    fn too_many_requests(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            message: message.into(),
+            retry_after_secs: Some(OVERLOAD_RETRY_AFTER_SECS),
         }
     }
 }
@@ -921,7 +1003,23 @@ impl IntoResponse for ApiError {
                 kind: "server_error",
             },
         });
-        (self.status, body).into_response()
+        let mut response = (self.status, body).into_response();
+        if let Some(seconds) = self.retry_after_secs {
+            response.headers_mut().insert(
+                header::RETRY_AFTER,
+                HeaderValue::from_str(&seconds.to_string()).expect("valid retry-after"),
+            );
+        }
+        response
+    }
+}
+
+fn map_generate_submit_error(err: GenerateSubmitError) -> ApiError {
+    match err {
+        GenerateSubmitError::Overloaded => ApiError::too_many_requests(
+            "generation capacity exceeded; retry after the server finishes queued work",
+        ),
+        GenerateSubmitError::DriverStopped => ApiError::internal("engine driver stopped"),
     }
 }
 
@@ -1039,7 +1137,7 @@ async fn run_chat_completion(
             .engine
             .generate(session_lookup, generation_request)
             .await
-            .map_err(|err| ApiError::internal(format!("generation submit failed: {err}")))?,
+            .map_err(map_generate_submit_error)?,
     )
     .await
     .map_err(|err| ApiError::internal(format!("generation failed: {err}")));
@@ -1146,7 +1244,7 @@ async fn stream_chat_completion(
         .engine
         .generate(session_lookup, generation_request)
         .await
-        .map_err(|err| ApiError::internal(format!("generation submit failed: {err}")))?;
+        .map_err(map_generate_submit_error)?;
 
     tokio::spawn(async move {
         send_stream_chunk(&tx, role_chunk(&id, created, &model)).await?;
@@ -1906,7 +2004,18 @@ fn load_model_max_context(metadata_path: Option<&Path>) -> anyhow::Result<Option
 
 #[cfg(test)]
 mod tests {
-    use super::StopBoundaryBuffer;
+    use super::{
+        AppState, ChatCompletionRequest, DriverCommand, Engine, EngineConfig, EngineDriver,
+        ServerConfig, StopBoundaryBuffer, app, build_generate_request, collect_generation_result,
+    };
+    use axum::{
+        body::{Body, to_bytes},
+        http::{Request, StatusCode, header},
+    };
+    use serde_json::{Value, json};
+    use std::{path::PathBuf, time::Duration};
+    use tokio::{sync::mpsc, time::timeout};
+    use tower::ServiceExt;
 
     #[test]
     fn stop_boundary_buffer_holds_partial_stop_sequence() {
@@ -1924,5 +2033,103 @@ mod tests {
         assert_eq!(buffer.push("hello tok"), "hello ");
         assert_eq!(buffer.push("20"), "");
         assert_eq!(buffer.flush(), "");
+    }
+
+    #[tokio::test]
+    async fn generation_over_capacity_returns_429_with_retry_after() {
+        let model_dir =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
+        let state = AppState::load_with_config(
+            &model_dir,
+            Some("tiny-llm".to_string()),
+            ServerConfig {
+                max_output_tokens: 16,
+                max_sessions: 8,
+                max_pending: 1,
+            },
+        )
+        .unwrap();
+        let _occupied = state
+            .engine
+            .generation_capacity
+            .clone()
+            .try_acquire_owned()
+            .unwrap();
+
+        let response = app(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "model": "tiny-llm",
+                            "messages": [{"role": "user", "content": "hello"}],
+                            "max_tokens": 1
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers()[header::RETRY_AFTER], "1");
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("generation capacity exceeded")
+        );
+    }
+
+    #[tokio::test]
+    async fn stalled_output_route_does_not_block_another_completion() {
+        let model_dir =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm-scatter");
+        let engine = Engine::from_dir(&model_dir, EngineConfig::default()).unwrap();
+        let driver = EngineDriver::start(engine, 2, 2);
+        let slow_request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "tiny-llm-scatter",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 8
+        }))
+        .unwrap();
+        let fast_request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "tiny-llm-scatter",
+            "messages": [{"role": "user", "content": "world"}],
+            "max_tokens": 2
+        }))
+        .unwrap();
+        let (slow_tx, _slow_rx) = mpsc::channel(1);
+        let slow_permit = driver
+            .generation_capacity
+            .clone()
+            .try_acquire_owned()
+            .unwrap();
+        driver
+            .commands
+            .send(DriverCommand::Generate {
+                session_id: None,
+                request: build_generate_request(&slow_request),
+                events: slow_tx,
+                permit: slow_permit,
+            })
+            .await
+            .unwrap();
+        let fast_rx = driver
+            .generate(None, build_generate_request(&fast_request))
+            .await
+            .unwrap();
+
+        let fast_result = timeout(Duration::from_secs(5), collect_generation_result(fast_rx))
+            .await
+            .expect("fast request timed out behind stalled consumer")
+            .expect("fast request failed");
+        assert_eq!(fast_result.token_ids.len(), 2);
     }
 }

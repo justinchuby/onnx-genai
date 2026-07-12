@@ -105,6 +105,7 @@ async fn chat_completions_rejects_max_tokens_over_server_cap() {
     let app = test_app_with_config(ServerConfig {
         max_output_tokens: 2,
         max_sessions: 8,
+        max_pending: 8,
     })
     .await;
     let response = app
@@ -166,6 +167,7 @@ async fn sessions_are_lru_evicted_at_configured_cap() {
     let app = test_app_with_config(ServerConfig {
         max_output_tokens: 16,
         max_sessions: 2,
+        max_pending: 8,
     })
     .await;
     let first = create_http_session(app.clone()).await;
