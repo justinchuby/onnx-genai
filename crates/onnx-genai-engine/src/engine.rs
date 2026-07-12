@@ -89,6 +89,9 @@ pub struct GenerateOptions {
     pub eos_token_id: Option<TokenId>,
     /// Whether matching `eos_token_id` terminates generation.
     pub stop_on_eos: bool,
+    /// Optional maximum total context length (prompt + generated tokens).
+    /// Used when model metadata does not declare `model.max_sequence_length`.
+    pub max_context: Option<usize>,
 }
 
 impl Default for GenerateOptions {
@@ -103,6 +106,7 @@ impl Default for GenerateOptions {
             stop_sequences: Vec::new(),
             eos_token_id: None,
             stop_on_eos: true,
+            max_context: None,
         }
     }
 }
@@ -120,6 +124,9 @@ impl GenerateOptions {
         }
         if !self.repetition_penalty.is_finite() || self.repetition_penalty <= 0.0 {
             anyhow::bail!("repetition_penalty must be finite and greater than zero");
+        }
+        if self.max_context == Some(0) {
+            anyhow::bail!("max_context must be greater than zero when provided");
         }
         Ok(())
     }
@@ -152,6 +159,8 @@ pub enum FinishReason {
     EosToken,
     /// A stop sequence matched; index refers to `GenerateOptions::stop_sequences`.
     StopSequence { index: usize },
+    /// The model context window was reached before another decode step could run.
+    Length,
 }
 
 /// Final generation output.
@@ -337,6 +346,7 @@ impl Engine {
             );
         }
 
+        let max_context = self.max_context_for_request(&options);
         let chain = build_processor_chain(&options);
         let mut generated_tokens = Vec::new();
         let mut generated_text = String::new();
@@ -350,6 +360,17 @@ impl Engine {
 
         let result = (|| -> anyhow::Result<GenerateResult> {
             for step in 0..options.max_new_tokens {
+                if reached_context_limit(state.tokens.len(), max_context) {
+                    return Ok(GenerateResult {
+                        text: self.tokenizer.decode(&generated_tokens).map_err(|e| {
+                            anyhow::anyhow!("Failed to detokenize generated tokens: {}", e)
+                        })?,
+                        token_ids: generated_tokens,
+                        finish_reason: FinishReason::Length,
+                        prefix_cache_hit_len,
+                    });
+                }
+
                 let mut context = ProcessorContext {
                     prompt_tokens: state.tokens.clone(),
                     generated_tokens: generated_tokens.clone(),
@@ -408,7 +429,7 @@ impl Engine {
                 prefix_cache_hit_len,
             })
         })();
-        if result.is_ok() {
+        if result.is_ok() && !exceeded_context_limit(state.tokens.len(), max_context) {
             self.ensure_session_kv_current(session_id, &mut state)?;
             self.insert_cached_prefixes(session_id, &state, prompt_tokens.len())?;
         }
@@ -473,6 +494,14 @@ impl Engine {
     /// Get the loaded metadata.
     pub fn metadata(&self) -> &InferenceMetadata {
         &self.metadata
+    }
+
+    fn max_context_for_request(&self, options: &GenerateOptions) -> Option<usize> {
+        self.metadata
+            .model
+            .as_ref()
+            .and_then(|model| model.max_sequence_length)
+            .or(options.max_context)
     }
 
     fn tokenize_prompt(&self, prompt: &GeneratePrompt) -> anyhow::Result<Vec<TokenId>> {
@@ -789,9 +818,9 @@ fn run_decode_step(
             let value = if past_len == 0 {
                 empty_past_value(info)?
             } else {
-                decode_state.past.remove(&info.name).with_context(|| {
+                clone_value(decode_state.past.get(&info.name).with_context(|| {
                     format!("missing cached KV tensor for input '{}'", info.name)
-                })?
+                })?)?
             };
             owned_inputs.push((info.name.clone(), value));
         } else {
@@ -807,9 +836,17 @@ fn run_decode_step(
         .iter()
         .map(|(name, value)| (name.as_str(), value))
         .collect::<Vec<_>>();
-    let outputs = session
-        .run(&input_refs)
-        .map_err(|e| anyhow::anyhow!("ORT session run failed: {}", e))?;
+    let outputs = session.run(&input_refs).map_err(|e| {
+        let message = e.to_string();
+        if is_gather_out_of_bounds(&message) {
+            anyhow::anyhow!(
+                "model context length exceeded during ORT decode; configure inference metadata `model.max_sequence_length` or GenerateOptions::max_context to stop cleanly before the context window is exceeded: {}",
+                e
+            )
+        } else {
+            anyhow::anyhow!("ORT session run failed: {}", e)
+        }
+    })?;
 
     if decode_state.use_kv {
         decode_state.past.clear();
@@ -1284,6 +1321,21 @@ fn kv_suffix(name: &str) -> Option<String> {
     None
 }
 
+fn reached_context_limit(current_context_len: usize, max_context: Option<usize>) -> bool {
+    max_context.is_some_and(|limit| current_context_len >= limit)
+}
+
+fn exceeded_context_limit(current_context_len: usize, max_context: Option<usize>) -> bool {
+    max_context.is_some_and(|limit| current_context_len > limit)
+}
+
+fn is_gather_out_of_bounds(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("gather")
+        && (lower.contains("indices element out of data bounds")
+            || lower.contains("idx=") && lower.contains("out of"))
+}
+
 fn build_processor_chain(options: &GenerateOptions) -> ProcessorChain {
     let mut chain = ProcessorChain::new();
 
@@ -1460,6 +1512,49 @@ mod tests {
         assert_eq!(result.token_ids.len(), 3);
         assert_eq!(result.finish_reason, FinishReason::MaxTokens);
         assert!(engine.sessions.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn tiny_fixture_stops_at_explicit_context_length_without_ort_error() -> anyhow::Result<()> {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/tiny-llm")
+            .canonicalize()?;
+        let mut engine = Engine::from_dir(&fixture, EngineConfig::default())?;
+        let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(vec![2, 4, 3]));
+        request.options.max_new_tokens = 32;
+        request.options.temperature = 0.0;
+        request.options.stop_on_eos = false;
+        request.options.max_context = Some(16);
+
+        let result = engine.generate(request)?;
+
+        assert_eq!(result.token_ids.len(), 13);
+        assert_eq!(result.finish_reason, FinishReason::Length);
+        assert!(engine.sessions.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn tiny_fixture_session_stops_at_explicit_context_length_without_ort_error()
+    -> anyhow::Result<()> {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/tiny-llm")
+            .canonicalize()?;
+        let mut engine = Engine::from_dir(&fixture, EngineConfig::default())?;
+        let session_id = engine.create_session()?;
+        let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(vec![2, 4, 3]));
+        request.options.max_new_tokens = 32;
+        request.options.temperature = 0.0;
+        request.options.stop_on_eos = false;
+        request.options.max_context = Some(16);
+
+        let result = engine.generate_in_session(session_id, request)?;
+
+        assert_eq!(result.token_ids.len(), 13);
+        assert_eq!(result.finish_reason, FinishReason::Length);
+        assert_eq!(engine.session_token_count(session_id)?, 16);
+        engine.close_session(session_id)?;
         Ok(())
     }
 
