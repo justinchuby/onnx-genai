@@ -3518,29 +3518,9 @@ onnx-genai bench ./model --speculator ./speculator --dataset ./prompts.jsonl
 # Output: acceptance_rate, tokens/s, speedup_vs_baseline
 ```
 
-### 28.9 Speculators Format → ONNX Export
+### 28.9 Model Conversion (Out of Scope)
 
-To use speculators-trained models in our engine, they need ONNX export:
-
-```python
-# Export a speculators-trained EAGLE model to ONNX
-from speculators import SpeculatorModel
-import torch
-
-model = SpeculatorModel.from_pretrained("RedHatAI/Qwen3-8B-speculator.eagle3")
-dummy_input = {
-    "input_ids": torch.zeros(1, 1, dtype=torch.long),
-    "hidden_states": torch.zeros(1, 1, model.config.transformer_layer_config.hidden_size),
-}
-torch.onnx.export(model, dummy_input, "eagle_adapter.onnx", opset_version=24)
-```
-
-We provide a conversion script:
-```bash
-# Convert HF speculators model → ONNX + our metadata
-onnx-genai convert-speculator RedHatAI/Qwen3-8B-speculator.eagle3 --output ./eagle-onnx/
-# Creates: eagle-onnx/adapter.onnx + eagle-onnx/inference_metadata.yaml + eagle-onnx/config.json
-```
+This repo does NOT do model conversion. ONNX export is handled by **Mobius** or upstream tooling. We only consume pre-built ONNX models.
 
 ### 28.10 Mobius Integration (ONNX Model Building)
 
