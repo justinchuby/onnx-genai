@@ -6376,3 +6376,494 @@ pub struct EvictionPolicy {
 ```
 
 This is particularly relevant for multi-model deployments (VLM with vision encoder + decoder + maybe a reranker) where not all models need to stay resident.
+
+---
+
+## 38. Distributed KV Cache & External Storage Connector
+
+*Inspired by LMCache (https://github.com/lmcache/lmcache)*
+
+### 38.1 Problem
+
+Single-node KV cache has fundamental limits:
+1. GPU memory caps the number of concurrent sessions
+2. KV is lost when a process crashes (fate-sharing)
+3. Multiple nodes can't share prefix KV — each recomputes the same system prompt
+4. Prefill-decode disaggregation (separate prefill vs decode nodes) requires KV transport
+
+LMCache solves this with a multi-tier, cross-node KV storage daemon. We don't want to reimplement all of that — we want a **connector interface** so external KV stores (LMCache, Mooncake, InfiniStore, or our own) can plug in.
+
+### 38.2 Architecture
+
+```
+┌──────────────────────────────┐     ┌──────────────────────────────┐
+│    onnx-genai instance A     │     │    onnx-genai instance B     │
+│  ┌────────────────────────┐  │     │  ┌────────────────────────┐  │
+│  │   Paged KV Cache       │  │     │  │   Paged KV Cache       │  │
+│  │   (GPU pages)          │  │     │  │   (GPU pages)          │  │
+│  └──────────┬─────────────┘  │     │  └──────────┬─────────────┘  │
+│  ┌──────────▼─────────────┐  │     │  ┌──────────▼─────────────┐  │
+│  │   KvCacheConnector     │  │     │  │   KvCacheConnector     │  │
+│  │   (trait impl)         │  │     │  │   (trait impl)         │  │
+│  └──────────┬─────────────┘  │     │  └──────────┬─────────────┘  │
+└─────────────┼────────────────┘     └─────────────┼────────────────┘
+              │                                     │
+              └──────────────┬──────────────────────┘
+                             │ gRPC / RDMA / shared memory
+                   ┌─────────▼─────────┐
+                   │  External KV Store │
+                   │  (LMCache daemon / │
+                   │   Mooncake / Redis │
+                   │   / custom)        │
+                   └─────────┬─────────┘
+                             │
+              ┌──────────────┼──────────────┐
+              ▼              ▼              ▼
+         GPU memory     CPU DRAM     Disk/NVMe/Remote
+         (hot)          (warm)       (cold)
+```
+
+### 38.3 Core Trait: KvCacheConnector
+
+```rust
+/// External KV cache storage interface.
+/// Implementations: LocalTiered, LMCache, Mooncake, InfiniStore, Redis, etc.
+#[async_trait]
+pub trait KvCacheConnector: Send + Sync {
+    /// Query: is KV for this token sequence already cached externally?
+    /// Returns location info so scheduler can estimate load cost.
+    async fn lookup(&self, key: &KvCacheKey) -> Result<KvCacheLocation>;
+
+    /// Batch lookup: check multiple sequences at once (amortize network RTT).
+    async fn lookup_batch(&self, keys: &[KvCacheKey]) -> Result<Vec<KvCacheLocation>>;
+
+    /// Store: push newly computed KV pages to external storage.
+    /// Called asynchronously after prefill — must NOT block inference.
+    async fn store(&self, entry: KvStoreEntry) -> Result<()>;
+
+    /// Fetch: load KV from external storage into local device memory.
+    /// Returns pages ready to be used by the model.
+    async fn fetch(&self, key: &KvCacheKey, target: Device) -> Result<FetchedKv>;
+
+    /// Prefetch: hint that this KV will be needed soon.
+    /// Non-blocking. Implementation may start background transfer.
+    fn prefetch(&self, key: &KvCacheKey, target: Device);
+
+    /// Pin: mark entry as non-evictable (hot system prompts, etc.)
+    async fn pin(&self, key: &KvCacheKey) -> Result<()>;
+
+    /// Unpin: allow eviction again.
+    async fn unpin(&self, key: &KvCacheKey) -> Result<()>;
+
+    /// Evict: explicitly remove from external storage.
+    async fn evict(&self, key: &KvCacheKey) -> Result<()>;
+
+    /// Health check.
+    async fn health(&self) -> ConnectorHealth;
+
+    /// Connector capabilities (so scheduler knows what's possible).
+    fn capabilities(&self) -> ConnectorCapabilities;
+}
+```
+
+### 38.4 Key Types
+
+```rust
+/// Identifies a cached KV segment by token content hash.
+/// Uses chunked hashing: tokens are split into fixed-size chunks (e.g., 256 tokens),
+/// each chunk hashed independently. This enables prefix sharing at chunk granularity.
+#[derive(Clone, Hash, Eq, PartialEq)]
+pub struct KvCacheKey {
+    /// Model identity (different models have incompatible KV).
+    pub model_id: String,
+    /// Layer range this KV covers (for layer-parallel storage).
+    pub layer_range: Range<usize>,
+    /// Token chunk hash. Computed as hash(token_ids[chunk_start..chunk_end]).
+    pub chunk_hash: u64,
+    /// Chunk index within the sequence (for ordering).
+    pub chunk_index: u32,
+    /// Number of tokens in this chunk.
+    pub num_tokens: u32,
+}
+
+/// Where the KV currently lives.
+pub enum KvCacheLocation {
+    /// On this node's GPU — can use immediately, zero cost.
+    LocalGpu { page_ids: Vec<PageId> },
+    /// On this node's CPU (pinned memory) — need GPU upload.
+    LocalCpu { estimated_load_ms: f64, size_bytes: usize },
+    /// On this node's disk/NVMe — need disk read + GPU upload.
+    LocalDisk { estimated_load_ms: f64, size_bytes: usize },
+    /// On a remote node — need network transfer.
+    Remote { node_id: String, estimated_load_ms: f64, size_bytes: usize },
+    /// Not cached anywhere — must recompute (full prefill).
+    NotFound,
+}
+
+/// Data to store externally.
+pub struct KvStoreEntry {
+    pub key: KvCacheKey,
+    /// Raw KV data (GPU tensor, will be copied by connector).
+    pub kv_data: KvTensorRef,
+    /// Storage hints.
+    pub priority: CachePriority,
+    pub ttl: Option<Duration>,
+}
+
+/// Retrieved KV data.
+pub struct FetchedKv {
+    pub key: KvCacheKey,
+    /// Pages allocated and filled on target device, ready for model use.
+    pub pages: Vec<PageId>,
+    /// Actual transfer time (for metrics).
+    pub transfer_time: Duration,
+}
+
+/// What the connector supports.
+pub struct ConnectorCapabilities {
+    /// Supports cross-node sharing (not just local offload).
+    pub distributed: bool,
+    /// Supports async prefetch.
+    pub prefetch: bool,
+    /// Supports pinning.
+    pub pinnable: bool,
+    /// Maximum chunk size in tokens.
+    pub max_chunk_tokens: usize,
+    /// Supported compression formats.
+    pub compression: Vec<CompressionFormat>,
+}
+
+pub enum CachePriority {
+    /// System prompt, shared by many sessions — keep as long as possible.
+    SystemPrompt,
+    /// Active session — keep until session ends.
+    Session,
+    /// Speculative — might be reused, low priority.
+    Opportunistic,
+}
+
+pub enum CompressionFormat {
+    None,
+    /// FP16 → FP8 quantization (2× compression, minimal quality loss).
+    Fp8,
+    /// CacheGen-style learned compression.
+    CacheGen,
+    /// zstd byte-level compression (for CPU/disk tier).
+    Zstd,
+}
+```
+
+### 38.5 Built-in Implementations
+
+#### 38.5.1 LocalTieredConnector (ships by default)
+
+```rust
+/// GPU → CPU → Disk tiered storage on a single node.
+/// No external daemon needed. Covers the "more sessions than GPU memory" case.
+pub struct LocalTieredConnector {
+    /// CPU tier: pinned memory pool.
+    cpu_pool: PinnedMemoryPool,
+    /// Disk tier: memory-mapped files or direct I/O.
+    disk_backend: Option<DiskBackend>,
+    /// Eviction policy.
+    eviction: LruEviction,
+    /// Async offload task handle.
+    offload_handle: JoinHandle<()>,
+}
+```
+
+This is the default when no external connector is configured. Handles:
+- Overflow: when GPU pages are full, offload cold sessions' KV to CPU
+- Reload: when session resumes, load from CPU → GPU (fast, ~1ms for typical page)
+- Disk: for very large contexts or many idle sessions, spill to NVMe
+
+#### 38.5.2 LMCacheConnector (optional integration)
+
+```rust
+/// Connects to an LMCache daemon via gRPC.
+/// LMCache manages multi-tier storage and cross-node sharing.
+pub struct LMCacheConnector {
+    /// gRPC client to LMCache daemon.
+    client: LmCacheClient,
+    /// Token chunking config (must match LMCache's chunk size).
+    chunk_size: usize,  // default: 256 tokens
+}
+```
+
+Configuration:
+```yaml
+# server config
+kv_connector:
+  type: lmcache
+  endpoint: "localhost:65432"
+  chunk_size: 256
+  compression: fp8
+  async_store: true     # don't block inference on store
+```
+
+#### 38.5.3 NullConnector (no external storage)
+
+```rust
+/// No external storage. KV lives only in GPU paged cache.
+/// Simplest mode: single node, no offload.
+pub struct NullConnector;
+
+impl KvCacheConnector for NullConnector {
+    async fn lookup(&self, _: &KvCacheKey) -> Result<KvCacheLocation> {
+        Ok(KvCacheLocation::NotFound)
+    }
+    // all other methods are no-ops
+}
+```
+
+### 38.6 Integration with Scheduler
+
+The scheduler uses the connector to make informed decisions:
+
+```rust
+impl Scheduler {
+    async fn schedule_request(&mut self, request: &Request) -> ScheduleResult {
+        // 1. Compute token chunk hashes for this request's prompt
+        let chunks = chunk_tokens(&request.prompt_tokens, self.chunk_size);
+        let keys: Vec<KvCacheKey> = chunks.iter().map(|c| c.to_key(&self.model_id)).collect();
+        
+        // 2. Batch lookup: which chunks are cached?
+        let locations = self.connector.lookup_batch(&keys).await?;
+        
+        // 3. Compute savings
+        let cached_tokens: usize = locations.iter()
+            .filter(|loc| !matches!(loc, KvCacheLocation::NotFound))
+            .map(|_| self.chunk_size)
+            .sum();
+        let must_compute_tokens = request.prompt_tokens.len() - cached_tokens;
+        
+        // 4. Estimate total cost (prefill compute + KV load time)
+        let compute_time = estimate_prefill_time(must_compute_tokens);
+        let load_time = locations.iter()
+            .filter_map(|loc| match loc {
+                KvCacheLocation::LocalCpu { estimated_load_ms, .. } => Some(*estimated_load_ms),
+                KvCacheLocation::LocalDisk { estimated_load_ms, .. } => Some(*estimated_load_ms),
+                KvCacheLocation::Remote { estimated_load_ms, .. } => Some(*estimated_load_ms),
+                _ => None,
+            })
+            .max_by(|a, b| a.partial_cmp(b).unwrap())
+            .unwrap_or(0.0);
+        
+        // 5. Issue prefetch for non-local cached chunks
+        for (key, loc) in keys.iter().zip(&locations) {
+            if matches!(loc, KvCacheLocation::LocalCpu { .. } | KvCacheLocation::Remote { .. }) {
+                self.connector.prefetch(key, Device::Gpu(0));
+            }
+        }
+        
+        // 6. Schedule with awareness of true prefill cost
+        ScheduleResult {
+            cached_tokens,
+            must_compute_tokens,
+            estimated_ttft_ms: compute_time + load_time,
+        }
+    }
+}
+```
+
+### 38.7 Integration with Router (§34)
+
+The router can use connector info for smarter routing:
+
+```rust
+impl Router {
+    fn route_with_kv_awareness(&self, request: &IncomingRequest) -> NodeId {
+        // 1. Normal affinity check (§34)
+        if let Some(node) = self.session_affinity(request) {
+            return node;
+        }
+        
+        // 2. NEW: check which node has the KV cached
+        // Router queries each node's connector for the prompt's chunk hashes
+        if let Some(node) = self.find_node_with_cached_kv(request) {
+            return node;  // route to node that already has the KV → skip prefill
+        }
+        
+        // 3. Fall back to least-loaded
+        self.least_loaded_node()
+    }
+}
+```
+
+Router status endpoint now includes KV location info:
+```json
+GET /v1/status
+{
+  "kv_connector": {
+    "type": "lmcache",
+    "healthy": true,
+    "cached_sequences": 1247,
+    "cached_tokens": 319232,
+    "tiers": {
+      "gpu": { "entries": 42, "bytes": 2147483648 },
+      "cpu": { "entries": 312, "bytes": 8589934592 },
+      "remote": { "entries": 893, "bytes": 34359738368 }
+    }
+  }
+}
+```
+
+### 38.8 Token Chunking Strategy
+
+LMCache uses fixed-size token chunks (default 256) as the unit of caching. We adopt the same:
+
+```rust
+/// Split a token sequence into fixed-size chunks for caching.
+/// Last chunk may be smaller (padded or stored as-is).
+pub fn chunk_tokens(tokens: &[TokenId], chunk_size: usize) -> Vec<TokenChunk> {
+    tokens.chunks(chunk_size)
+        .enumerate()
+        .map(|(idx, chunk)| TokenChunk {
+            index: idx as u32,
+            tokens: chunk.to_vec(),
+            hash: hash_tokens(chunk),
+        })
+        .collect()
+}
+```
+
+**Chunk size alignment:** Our page size (§16) and connector chunk size should be related (ideally equal or integer multiples) to avoid fragmentation when mapping between paged cache pages and connector chunks.
+
+```yaml
+# Recommended: page_size = chunk_size
+kv_cache:
+  page_size: 256          # tokens per page
+
+kv_connector:
+  chunk_size: 256         # tokens per cached chunk (matches page_size)
+```
+
+### 38.9 Async Store Pipeline (Non-Blocking)
+
+Storing KV externally must NEVER block inference:
+
+```rust
+/// Background offload pipeline.
+/// Runs on a dedicated tokio task, processes store requests from a channel.
+pub struct OffloadPipeline {
+    /// Bounded channel from inference thread.
+    rx: mpsc::Receiver<KvStoreEntry>,
+    connector: Arc<dyn KvCacheConnector>,
+    /// Compression before store (optional).
+    compression: Option<CompressionFormat>,
+}
+
+impl OffloadPipeline {
+    pub async fn run(mut self) {
+        while let Some(entry) = self.rx.recv().await {
+            // Compress if configured
+            let entry = if let Some(fmt) = &self.compression {
+                compress_kv(entry, fmt)
+            } else {
+                entry
+            };
+            
+            // Store (async, retries internally)
+            if let Err(e) = self.connector.store(entry).await {
+                tracing::warn!("KV offload failed: {e}");
+                // Non-fatal: inference continues, we just lose this cache entry
+            }
+        }
+    }
+}
+```
+
+The inference thread does:
+```rust
+// After prefill completes, fire-and-forget the KV to the offload pipeline
+let _ = self.offload_tx.try_send(kv_entry);  // bounded channel, drops if full
+```
+
+### 38.10 Prefill-Decode Disaggregation (P/D Split)
+
+The most advanced use case: separate prefill and decode into specialized nodes.
+
+```
+Prefill Node (big batch, high throughput)     Decode Node (low latency, many sessions)
+┌──────────────────────────────┐              ┌──────────────────────────────┐
+│ Receives prompt              │              │ Receives generation request  │
+│ Computes full KV for prompt  │              │ Loads KV from connector      │
+│ Stores KV via connector      │──── KV ────→│ Runs decode loop             │
+│ Returns "prefill complete"   │   transfer   │ Returns tokens               │
+└──────────────────────────────┘              └──────────────────────────────┘
+```
+
+This requires:
+- **Router awareness:** route prefill-heavy requests to prefill nodes, decode to decode nodes
+- **Low-latency transfer:** RDMA/GPU-direct or at minimum fast TCP
+- **Coordination:** prefill node signals completion before decode node starts
+
+```rust
+pub enum NodeRole {
+    /// Handles both prefill and decode (default, single-node).
+    Unified,
+    /// Specialized prefill: optimized for large batch prefill, stores KV externally.
+    PrefillOnly,
+    /// Specialized decode: loads KV from external, optimized for low-latency generation.
+    DecodeOnly,
+}
+```
+
+P/D disaggregation is an advanced deployment mode. The connector trait is the same — it just happens that the prefill node always calls `store()` and the decode node always calls `fetch()`.
+
+### 38.11 Metrics
+
+```
+# Connector operations
+onnx_genai_kv_connector_lookups_total        counter  {result=hit|miss}
+onnx_genai_kv_connector_store_total          counter  {tier=cpu|disk|remote}
+onnx_genai_kv_connector_fetch_total          counter  {tier=cpu|disk|remote}
+onnx_genai_kv_connector_fetch_seconds        histogram {tier}
+onnx_genai_kv_connector_store_seconds        histogram {tier}
+onnx_genai_kv_connector_prefetch_hit_rate    gauge    # prefetch was ready when needed
+
+# Savings
+onnx_genai_kv_connector_tokens_saved_total   counter  # tokens not recomputed (loaded from cache)
+onnx_genai_kv_connector_prefill_saved_seconds histogram # prefill time saved per request
+
+# Health
+onnx_genai_kv_connector_healthy              gauge    {backend}
+onnx_genai_kv_connector_offload_queue_depth  gauge    # pending async stores
+onnx_genai_kv_connector_offload_drops_total  counter  # stores dropped (queue full)
+```
+
+### 38.12 Configuration
+
+```yaml
+# Full config example
+kv_connector:
+  # Built-in: "none" | "local_tiered" | "lmcache"
+  # Plugin: path to shared library implementing KvCacheConnector via C ABI
+  type: local_tiered
+  
+  # Local tiered settings
+  cpu:
+    enabled: true
+    max_bytes: 8589934592     # 8 GB pinned memory pool
+    pinned: true              # use CUDA pinned memory for fast transfers
+  disk:
+    enabled: true
+    path: /var/cache/onnx-genai/kv
+    max_bytes: 107374182400   # 100 GB
+    use_direct_io: true       # O_DIRECT for NVMe
+    
+  # Common settings
+  chunk_size: 256             # tokens per chunk (align with page_size)
+  compression: fp8            # none | fp8 | zstd
+  async_store: true
+  offload_queue_size: 1024    # max pending async stores
+  
+  # Eviction
+  eviction:
+    policy: lru               # lru | lfu | priority_lru
+    min_lifetime_sec: 60      # don't evict chunks younger than this
+    
+  # LMCache-specific (when type: lmcache)
+  # endpoint: "localhost:65432"
+  # auth_token: "..."
+```
