@@ -9,8 +9,12 @@
 
 pub mod engine;
 pub mod logits;
+pub mod pipeline;
 pub mod sampling;
 pub mod speculative;
-pub mod pipeline;
 
-pub use engine::Engine;
+pub use engine::{
+    Engine, EngineConfig, FinishReason, GenerateOptions, GeneratePrompt, GenerateRequest,
+    GenerateResult, GenerateToken, GenerateTokenCallback,
+};
+pub use logits::{StopSequence, TokenId};

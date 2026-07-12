@@ -107,7 +107,13 @@ impl Scheduler {
     }
 
     /// Submit a new request to the scheduler.
-    pub fn add_request(&mut self, seq_id: SequenceId, prompt_tokens: usize, max_tokens: usize, priority: Priority) -> u64 {
+    pub fn add_request(
+        &mut self,
+        seq_id: SequenceId,
+        prompt_tokens: usize,
+        max_tokens: usize,
+        priority: Priority,
+    ) -> u64 {
         let id = self.next_request_id;
         self.next_request_id += 1;
         self.clock += 1;
