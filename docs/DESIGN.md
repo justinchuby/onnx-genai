@@ -4824,3 +4824,666 @@ INFO  Throughput: prompt=1234.5 tok/s, gen=567.8 tok/s.
       SpecDecode: acceptance=75.1%, mean_len=3.42, per_pos=[0.95, 0.82, 0.71, 0.55].
       Preemptions: 0, Evictions: 3.
 ```
+
+## 32. Metrics Exposure API
+
+§31 defined *what* we measure. This section defines *how* we expose it: the concrete HTTP endpoints, wire formats, security model, and integration points.
+
+### 32.1 Endpoint Summary
+
+| Path | Method | Auth | Purpose | Feature Flag |
+|------|--------|------|---------|--------------|
+| `/metrics` | GET | None | Prometheus scrape target | `metrics` |
+| `/v1/status` | GET | API key | Quick health/status JSON | *(always on)* |
+| `/v1/debug/sessions` | GET | Localhost | Active session introspection | `debug-endpoints` |
+| `/v1/debug/kv` | GET | Localhost | KV cache state | `debug-endpoints` |
+| `/v1/debug/scheduler` | GET | Localhost | Scheduler state | `debug-endpoints` |
+| `/v1/debug/batch` | GET | Localhost | Current batch composition | `debug-endpoints` |
+| `/v1/debug/events` | GET (SSE) | Localhost | Real-time event stream | `debug-endpoints` |
+| `/v1/debug/trace/start` | POST | Localhost | Start Perfetto trace | `debug-endpoints` |
+| `/v1/debug/trace/stop` | POST | Localhost | Stop trace & download | `debug-endpoints` |
+| `/v1/debug/log-level` | PUT | Localhost | Change log level at runtime | `debug-endpoints` |
+| `/v1/debug/config` | GET | Localhost | Running configuration dump | `debug-endpoints` |
+
+### 32.2 Prometheus Metrics Endpoint
+
+**`GET /metrics`**
+
+Standard Prometheus exposition format. Served on the main HTTP port (not a separate port) for simplicity. No authentication — Prometheus expects unauthenticated scrape targets. Restrict via network policy or `observability.metrics.bind` config.
+
+**Request:** No parameters.
+
+**Response:** `text/plain; version=0.0.4; charset=utf-8`
+
+```
+# HELP onnx_genai_requests_total Total generation requests.
+# TYPE onnx_genai_requests_total counter
+onnx_genai_requests_total{status="success"} 12847
+onnx_genai_requests_total{status="error"} 23
+onnx_genai_requests_total{status="cancelled"} 5
+
+# HELP onnx_genai_time_to_first_token_seconds Time to first token.
+# TYPE onnx_genai_time_to_first_token_seconds histogram
+onnx_genai_time_to_first_token_seconds_bucket{le="0.01"} 342
+onnx_genai_time_to_first_token_seconds_bucket{le="0.025"} 1893
+onnx_genai_time_to_first_token_seconds_bucket{le="0.05"} 8721
+onnx_genai_time_to_first_token_seconds_bucket{le="0.1"} 11432
+onnx_genai_time_to_first_token_seconds_bucket{le="0.25"} 12510
+onnx_genai_time_to_first_token_seconds_bucket{le="0.5"} 12780
+onnx_genai_time_to_first_token_seconds_bucket{le="1.0"} 12840
+onnx_genai_time_to_first_token_seconds_bucket{le="+Inf"} 12847
+onnx_genai_time_to_first_token_seconds_sum 412.83
+onnx_genai_time_to_first_token_seconds_count 12847
+
+# HELP onnx_genai_generation_throughput Current generation tokens/sec.
+# TYPE onnx_genai_generation_throughput gauge
+onnx_genai_generation_throughput 534.2
+
+# HELP onnx_genai_kv_usage_ratio KV cache utilization (0.0-1.0).
+# TYPE onnx_genai_kv_usage_ratio gauge
+onnx_genai_kv_usage_ratio 0.873
+
+# ... (full catalog from §31.16)
+```
+
+**Feature flag:** `metrics`. When disabled, `/metrics` returns `404`.
+
+**Implementation notes:**
+- Uses `prometheus-client` crate (not the deprecated `prometheus` crate).
+- Metrics are collected into a `Registry` and rendered on each scrape — no background thread.
+- Histogram buckets for latency: `[0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.15, 0.2, 0.3, 0.5, 0.75, 1.0, 2.5, 5.0]`.
+- Memory overhead: ~8 KB per unique metric family. Full catalog ≈ 200 KB total.
+
+### 32.3 OpenTelemetry OTLP Export
+
+Alternative to Prometheus pull model. Pushes metrics (and traces/logs) to any OTLP-compatible backend (Grafana Cloud, Datadog, Jaeger, etc.).
+
+**Configuration:**
+
+```yaml
+observability:
+  otlp:
+    enabled: false
+    endpoint: "http://localhost:4317"    # gRPC OTLP endpoint
+    # endpoint: "http://localhost:4318"  # HTTP OTLP endpoint
+    protocol: grpc                       # grpc | http
+    headers:                             # custom headers (e.g., auth)
+      Authorization: "Bearer <token>"
+    export_interval_seconds: 15          # metric push interval
+    export_timeout_seconds: 10
+    resource_attributes:                 # OpenTelemetry resource
+      service.name: onnx-genai
+      service.version: "0.1.0"
+      deployment.environment: production
+    export:
+      metrics: true
+      traces: true                       # export tracing spans as OTLP traces
+      logs: false                        # structured logs as OTLP log records
+```
+
+**Feature flag:** `otel`. When enabled, metrics are dual-exported (Prometheus *and* OTLP). When `metrics` is off but `otel` is on, only OTLP push is active.
+
+**Crates:** `opentelemetry 0.28`, `opentelemetry-otlp`, `tracing-opentelemetry`.
+
+**Graceful degradation:** If the OTLP endpoint is unreachable, export silently drops batches after `export_timeout_seconds`. A counter `onnx_genai_otlp_export_failures_total` tracks drops. No backpressure on the engine.
+
+### 32.4 Status Endpoint
+
+**`GET /v1/status`**
+
+Quick health check returning server state. Suitable for load balancer health checks and monitoring dashboards. Authenticated via API key (same as `/v1/chat/completions`).
+
+**Request parameters:** None.
+
+**Response:** `application/json`, status `200 OK`.
+
+```json
+{
+  "status": "ready",
+  "version": "0.1.0",
+  "uptime_seconds": 84321,
+  "model": {
+    "name": "microsoft/phi-4-mini",
+    "parameters": "3.8B",
+    "quantization": "int4-awq",
+    "execution_provider": "CUDA",
+    "max_context_length": 131072
+  },
+  "engine": {
+    "requests_active": 8,
+    "requests_waiting": 2,
+    "requests_total": 12847,
+    "tokens_generated_total": 1847293,
+    "generation_throughput_tps": 534.2,
+    "prompt_throughput_tps": 1234.5
+  },
+  "kv_cache": {
+    "pages_used": 1792,
+    "pages_total": 2048,
+    "usage_ratio": 0.875,
+    "pages_shared": 256,
+    "pages_offloaded": 64,
+    "prefix_cache_hit_rate": 0.732
+  },
+  "sessions": {
+    "active": 8,
+    "paused": 3,
+    "total_created": 142
+  },
+  "speculation": {
+    "enabled": true,
+    "acceptance_rate": 0.751,
+    "mean_acceptance_length": 3.42
+  }
+}
+```
+
+**Status values:**
+- `"starting"` — model loading in progress
+- `"ready"` — accepting requests
+- `"draining"` — graceful shutdown, finishing in-flight requests
+- `"error"` — unrecoverable error (detail in `error` field)
+
+**Feature flag:** None. Always compiled in; it's the server's health endpoint.
+
+### 32.5 Debug Endpoints
+
+All debug endpoints require the `debug-endpoints` feature flag and are **localhost-only** by default. Remote access requires explicit opt-in via `observability.debug.allow_remote: true` plus API key auth.
+
+#### 32.5.1 `GET /v1/debug/sessions`
+
+List active sessions with KV cache and generation state.
+
+**Query parameters:**
+
+| Param | Type | Default | Description |
+|-------|------|---------|-------------|
+| `limit` | u32 | 50 | Max sessions to return |
+| `offset` | u32 | 0 | Pagination offset |
+| `sort` | string | `"kv_pages"` | Sort by: `kv_pages`, `created`, `last_active`, `priority` |
+| `priority` | string | *(all)* | Filter: `interactive`, `batch`, `background` |
+
+**Response:**
+
+```json
+{
+  "total": 11,
+  "sessions": [
+    {
+      "session_id": "agent-worker-3",
+      "priority": "interactive",
+      "state": "generating",
+      "created_at": "2026-07-12T14:30:00Z",
+      "last_active_at": "2026-07-12T14:55:12Z",
+      "kv_pages": 347,
+      "context_length": 22208,
+      "max_context_length": 131072,
+      "tokens_generated": 1842,
+      "pending_tool_calls": 0,
+      "speculation": {
+        "enabled": true,
+        "acceptance_rate": 0.82
+      }
+    },
+    {
+      "session_id": "agent-lead",
+      "priority": "interactive",
+      "state": "paused_tool_call",
+      "created_at": "2026-07-12T13:10:00Z",
+      "last_active_at": "2026-07-12T14:52:30Z",
+      "kv_pages": 892,
+      "context_length": 57088,
+      "max_context_length": 131072,
+      "tokens_generated": 8421,
+      "pending_tool_calls": 1,
+      "speculation": {
+        "enabled": true,
+        "acceptance_rate": 0.79
+      }
+    }
+  ]
+}
+```
+
+#### 32.5.2 `GET /v1/debug/kv`
+
+KV cache detailed state.
+
+**Query parameters:** None.
+
+**Response:**
+
+```json
+{
+  "total_pages": 2048,
+  "used_pages": 1792,
+  "free_pages": 256,
+  "shared_pages": 312,
+  "offloaded_pages": 64,
+  "usage_ratio": 0.875,
+  "page_size_tokens": 64,
+  "total_capacity_tokens": 131072,
+  "prefix_cache": {
+    "entries": 47,
+    "hit_rate": 0.732,
+    "hit_rate_window": 1000,
+    "total_queries": 184293,
+    "total_hits": 134903
+  },
+  "eviction_stats": {
+    "total_evictions": 342,
+    "by_reason": {
+      "capacity": 298,
+      "preemption": 31,
+      "idle_timeout": 13,
+      "manual_reset": 0
+    },
+    "avg_lifetime_seconds": 127.4,
+    "avg_idle_before_eviction_seconds": 45.2
+  },
+  "per_session": [
+    { "session_id": "agent-lead", "pages": 892, "tokens": 57088, "shared_pages": 128 },
+    { "session_id": "agent-worker-3", "pages": 347, "tokens": 22208, "shared_pages": 89 }
+  ]
+}
+```
+
+#### 32.5.3 `GET /v1/debug/scheduler`
+
+Scheduler internals.
+
+**Response:**
+
+```json
+{
+  "policy": "priority_fcfs",
+  "max_batch_size": 32,
+  "max_batch_tokens": 4096,
+  "running": [
+    { "session_id": "agent-worker-3", "priority": "interactive", "tokens_remaining": 214 }
+  ],
+  "waiting": [
+    { "session_id": "batch-job-7", "priority": "batch", "queued_at": "2026-07-12T14:55:10Z", "prompt_tokens": 2048 }
+  ],
+  "preempted": [],
+  "stats": {
+    "total_iterations": 184293,
+    "total_preemptions": 31,
+    "avg_batch_size": 4.7,
+    "avg_batch_tokens": 1247
+  }
+}
+```
+
+#### 32.5.4 `GET /v1/debug/batch`
+
+Current batch composition (what's in the forward pass right now).
+
+**Response:**
+
+```json
+{
+  "batch_id": 184294,
+  "timestamp": "2026-07-12T14:55:12.345Z",
+  "sequences": 5,
+  "total_tokens": 1389,
+  "composition": [
+    {
+      "session_id": "agent-worker-3",
+      "type": "decode",
+      "tokens": 1,
+      "kv_length": 22208
+    },
+    {
+      "session_id": "new-request-42",
+      "type": "prefill",
+      "tokens": 1024,
+      "kv_length": 0,
+      "chunked": true,
+      "chunk_index": 0,
+      "total_chunks": 2
+    },
+    {
+      "session_id": "agent-worker-3",
+      "type": "speculative_draft",
+      "tokens": 4,
+      "kv_length": 22208
+    }
+  ],
+  "padding_tokens": 0,
+  "utilization": 0.339
+}
+```
+
+#### 32.5.5 `GET /v1/debug/config`
+
+Dump the running configuration (redacting secrets).
+
+**Response:**
+
+```json
+{
+  "model": { "path": "/models/phi-4-mini-int4", "max_context_length": 131072 },
+  "engine": { "max_batch_size": 32, "max_batch_tokens": 4096, "scheduling_policy": "priority_fcfs" },
+  "kv_cache": { "num_pages": 2048, "page_size": 64, "offload_enabled": true },
+  "speculation": { "enabled": true, "draft_model": "/models/phi-4-mini-draft", "num_speculative_tokens": 5 },
+  "observability": { "logging": { "level": "info" }, "metrics": { "enabled": true }, "otlp": { "enabled": false } }
+}
+```
+
+### 32.6 SSE Event Stream
+
+**`GET /v1/debug/events`**
+
+Server-Sent Events stream for real-time monitoring. Localhost-only. Ideal for TUI dashboards or live Grafana panels via SSE data source.
+
+**Query parameters:**
+
+| Param | Type | Default | Description |
+|-------|------|---------|-------------|
+| `filter` | string | `"*"` | Comma-separated event types: `request`, `batch`, `eviction`, `preemption`, `error`, `stats`, `tool` |
+| `interval_ms` | u32 | 1000 | Min interval for `stats` events |
+
+**Response:** `text/event-stream`
+
+```
+event: stats
+data: {"timestamp":"2026-07-12T14:55:12Z","throughput_tps":534.2,"requests_active":8,"requests_waiting":2,"kv_usage":0.875,"batch_size":5}
+
+event: request
+data: {"type":"start","request_id":"req-abc123","session_id":"agent-worker-3","prompt_tokens":1024}
+
+event: batch
+data: {"batch_id":184294,"sequences":5,"tokens":1389,"prefill_seqs":1,"decode_seqs":4}
+
+event: eviction
+data: {"session_id":"idle-session-9","pages":128,"reason":"idle_timeout","lifetime_seconds":342.1}
+
+event: request
+data: {"type":"complete","request_id":"req-abc123","session_id":"agent-worker-3","tokens_generated":142,"ttft_ms":45.2,"e2e_ms":847.3,"finish_reason":"stop"}
+
+event: error
+data: {"type":"ort_error","message":"CUDA out of memory","session_id":"batch-job-12"}
+
+event: tool
+data: {"session_id":"agent-lead","tool":"web_search","state":"executing","elapsed_ms":230}
+```
+
+**Connection limits:** Max 4 concurrent SSE connections. Additional connections get `429 Too Many Requests`.
+
+**Memory overhead:** Events are not buffered — they're written directly to connected SSE clients. No ring buffer for SSE (unlike Perfetto traces). If no clients are connected, events are not generated.
+
+### 32.7 Per-Request Response Metadata
+
+Every `/v1/chat/completions` response includes timing metadata — no extra config needed.
+
+#### 32.7.1 Response Headers
+
+```
+X-Request-Id: req-abc123
+X-Time-To-First-Token-Ms: 45
+X-Queue-Wait-Ms: 3
+X-Prefill-Ms: 42
+X-Generation-Ms: 802
+X-Tokens-Generated: 142
+X-Tokens-Prompt: 1024
+X-Tokens-Cached: 512
+X-Speculation-Acceptance-Rate: 0.82
+```
+
+Headers are always present. Lightweight (no JSON parsing needed), compatible with proxies/load balancers.
+
+#### 32.7.2 Usage Object in Response Body
+
+Standard OpenAI-compatible `usage` field, plus extended timing:
+
+```json
+{
+  "id": "chatcmpl-abc123",
+  "object": "chat.completion",
+  "model": "phi-4-mini",
+  "choices": [ ... ],
+  "usage": {
+    "prompt_tokens": 1024,
+    "completion_tokens": 142,
+    "total_tokens": 1166,
+    "prompt_tokens_details": {
+      "cached_tokens": 512
+    },
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    }
+  },
+  "timing": {
+    "queue_ms": 3,
+    "prefill_ms": 42,
+    "generation_ms": 802,
+    "total_ms": 847,
+    "time_to_first_token_ms": 45,
+    "inter_token_latency_ms": 5.65,
+    "tokens_per_second": 167.6
+  }
+}
+```
+
+For streaming responses, the `timing` and `usage` objects appear in the final `[DONE]`-preceding chunk:
+
+```
+data: {"id":"chatcmpl-abc123","choices":[{"delta":{},"finish_reason":"stop","index":0}],"usage":{...},"timing":{...}}
+
+data: [DONE]
+```
+
+**Feature flag:** The `timing` field requires `metrics` feature. When disabled, only standard `usage` is returned. The `usage` field is always present (OpenAI API compat).
+
+### 32.8 Periodic Log Summary
+
+Following vLLM's pattern (§31.17), a summary line is logged every N seconds on a background timer.
+
+**Configuration:**
+
+```yaml
+observability:
+  logging:
+    periodic_stats_interval_seconds: 10   # 0 to disable
+```
+
+**Format (structured JSON in production):**
+
+```json
+{
+  "level": "INFO",
+  "target": "onnx_genai::stats",
+  "event": "periodic_stats",
+  "interval_seconds": 10,
+  "throughput": { "prompt_tps": 1234.5, "generation_tps": 567.8 },
+  "requests": { "active": 8, "waiting": 2, "completed_interval": 12 },
+  "kv_cache": { "usage_ratio": 0.873, "used": 1792, "total": 2048, "shared": 256, "offloaded": 64 },
+  "prefix_cache": { "hit_rate": 0.732 },
+  "speculation": { "acceptance_rate": 0.751, "mean_length": 3.42 },
+  "evictions_interval": 3,
+  "preemptions_interval": 0,
+  "errors_interval": 0
+}
+```
+
+**Pretty format (for development / `format: pretty`):**
+
+```
+INFO  [stats] Throughput: prompt=1234.5 tok/s, gen=567.8 tok/s. Running: 8, Waiting: 2. KV: 87.3% (1792/2048). PrefixCache: 73.2%. SpecDec: 75.1% accept, 3.42 mean. Evictions: 3, Preemptions: 0.
+```
+
+**Feature flag:** None (part of `logging`). Disable by setting interval to 0.
+
+### 32.9 Security Model
+
+Three tiers of endpoint protection:
+
+| Tier | Endpoints | Auth | Network |
+|------|-----------|------|---------|
+| **Public** | `/metrics` | None | Configurable bind address |
+| **API** | `/v1/status`, `/v1/chat/completions` | API key (`Authorization: Bearer`) | Any |
+| **Debug** | `/v1/debug/*` | None (localhost) or API key (remote) | Localhost-only by default |
+
+**Configuration:**
+
+```yaml
+observability:
+  metrics:
+    bind: "127.0.0.1:9090"     # separate bind for /metrics (optional)
+    # If unset, /metrics is served on the main server port
+
+  debug:
+    enabled: true               # master switch for /v1/debug/*
+    allow_remote: false          # if true, requires API key for /v1/debug/*
+    # When allow_remote is false, debug endpoints reject non-loopback IPs
+    # with 403 Forbidden regardless of auth headers
+```
+
+**Implementation (axum middleware):**
+
+```rust
+/// Middleware that restricts debug endpoints to localhost.
+async fn localhost_only(
+    req: Request<Body>,
+    next: Next,
+) -> Response {
+    let remote_addr = req.extensions().get::<ConnectInfo<SocketAddr>>();
+    match remote_addr {
+        Some(ConnectInfo(addr)) if addr.ip().is_loopback() => next.run(req).await,
+        _ => StatusCode::FORBIDDEN.into_response(),
+    }
+}
+
+/// Debug route group with conditional auth.
+pub fn debug_routes(config: &ObservabilityConfig) -> Router {
+    let router = Router::new()
+        .route("/v1/debug/sessions", get(list_sessions))
+        .route("/v1/debug/kv", get(kv_cache_state))
+        .route("/v1/debug/scheduler", get(scheduler_state))
+        .route("/v1/debug/batch", get(current_batch_info))
+        .route("/v1/debug/events", get(sse_events))
+        .route("/v1/debug/trace/start", post(start_trace))
+        .route("/v1/debug/trace/stop", post(stop_trace))
+        .route("/v1/debug/log-level", put(set_log_level))
+        .route("/v1/debug/config", get(dump_config));
+
+    if config.debug.allow_remote {
+        router.layer(middleware::from_fn(api_key_auth))
+    } else {
+        router.layer(middleware::from_fn(localhost_only))
+    }
+}
+```
+
+**Perfetto trace files:** Written to a temp directory with `0600` permissions. The `/v1/debug/trace/stop` response streams the file and then deletes it.
+
+### 32.10 Graceful Degradation
+
+When features are disabled at compile time or runtime:
+
+| Feature off | Behavior |
+|-------------|----------|
+| `metrics` disabled | `/metrics` → `404`. `timing` field omitted from chat responses. Internal counters still run for periodic log stats. |
+| `otel` disabled | No OTLP export. Prometheus still works if `metrics` is on. |
+| `debug-endpoints` disabled | All `/v1/debug/*` → `404`. |
+| `tracing` disabled | `trace_span!()` compiles to no-op. Perfetto endpoints → `404`. |
+| `metrics` + `otel` both off | No metric collection overhead. Atomic counter increments are skipped. Periodic log line uses engine-internal rolling averages only. |
+
+**Runtime disable:** `PUT /v1/debug/log-level` with `{"level": "off"}` suppresses periodic stats. Individual metric families cannot be disabled at runtime (not worth the complexity).
+
+### 32.11 Memory Overhead
+
+| Component | Steady-state memory | Notes |
+|-----------|-------------------|-------|
+| Prometheus registry | ~200 KB | All metric families + histogram buckets |
+| Perfetto ring buffer | 0 (inactive) / 16 MB (active) | Configurable `buffer_size`, bounded |
+| SSE event stream | ~0 (no buffer) | Write-through to clients |
+| Per-request timestamps | ~128 bytes/request | Freed on completion |
+| Prefix cache sliding window | ~24 KB | 1000 entries × 24 bytes |
+| OTLP export buffer | ~1 MB | Batch buffer, bounded |
+
+Total always-on overhead: **~250 KB**. With active tracing: **~17 MB** (dominated by Perfetto ring buffer).
+
+### 32.12 Grafana Dashboard Compatibility
+
+The metrics are designed to populate a standard Grafana dashboard with these panels:
+
+**Row 1: Request Overview**
+- Requests/sec: `rate(onnx_genai_requests_total[5m])`
+- Error rate: `rate(onnx_genai_requests_total{status="error"}[5m]) / rate(onnx_genai_requests_total[5m])`
+- Active requests: `onnx_genai_requests_active`
+- Queue depth: `onnx_genai_requests_waiting`
+
+**Row 2: Latency**
+- TTFT p50/p95/p99: `histogram_quantile(0.95, rate(onnx_genai_time_to_first_token_seconds_bucket[5m]))`
+- ITL p50/p95/p99: `histogram_quantile(0.95, rate(onnx_genai_inter_token_latency_seconds_bucket[5m]))`
+- E2E latency: `histogram_quantile(0.95, rate(onnx_genai_e2e_latency_seconds_bucket[5m]))`
+- Queue wait: `histogram_quantile(0.95, rate(onnx_genai_queue_wait_seconds_bucket[5m]))`
+
+**Row 3: Throughput**
+- Generation tokens/sec: `onnx_genai_generation_throughput`
+- Prompt tokens/sec: `onnx_genai_prompt_throughput`
+- Batch size distribution: `histogram_quantile(0.5, rate(onnx_genai_batch_size_bucket[5m]))`
+
+**Row 4: KV Cache**
+- KV utilization: `onnx_genai_kv_usage_ratio`
+- Prefix cache hit rate: `onnx_genai_prefix_cache_hit_rate`
+- Evictions/sec: `rate(onnx_genai_kv_evictions_total[5m])`
+- Pages breakdown (stacked): `onnx_genai_kv_pages_used`, `onnx_genai_kv_pages_shared`, `onnx_genai_kv_pages_offloaded`
+
+**Row 5: Speculation** (conditional)
+- Acceptance rate: `onnx_genai_spec_acceptance_rate`
+- Per-position acceptance: `onnx_genai_spec_acceptance_per_position{position="0"}` through `{position="4"}`
+- Mean acceptance length: `onnx_genai_spec_mean_acceptance_length`
+
+**Row 6: Sessions & Tools**
+- Active sessions by priority: `onnx_genai_sessions_active{priority=~".*"}`
+- Tool call rate: `rate(onnx_genai_tool_calls_total[5m])`
+- Tool latency p95: `histogram_quantile(0.95, rate(onnx_genai_tool_latency_seconds_bucket[5m]))`
+
+A reference dashboard JSON will ship as `dashboards/onnx-genai.json` in the repo.
+
+### 32.13 Implementation: Axum Router Assembly
+
+```rust
+use axum::{Router, routing::{get, put, post}};
+
+pub fn observability_routes(config: &Config) -> Router {
+    let mut router = Router::new();
+
+    // /v1/status — always on
+    router = router.route("/v1/status", get(status_handler));
+
+    // /metrics — Prometheus scrape
+    #[cfg(feature = "metrics")]
+    {
+        router = router.route("/metrics", get(prometheus_handler));
+    }
+
+    // /v1/debug/* — debug introspection
+    #[cfg(feature = "debug-endpoints")]
+    if config.observability.debug.enabled {
+        let debug = Router::new()
+            .route("/v1/debug/sessions", get(sessions_handler))
+            .route("/v1/debug/kv", get(kv_handler))
+            .route("/v1/debug/scheduler", get(scheduler_handler))
+            .route("/v1/debug/batch", get(batch_handler))
+            .route("/v1/debug/events", get(sse_handler))
+            .route("/v1/debug/config", get(config_handler))
+            .route("/v1/debug/trace/start", post(trace_start_handler))
+            .route("/v1/debug/trace/stop", post(trace_stop_handler))
+            .route("/v1/debug/log-level", put(log_level_handler));
+
+        let debug = if config.observability.debug.allow_remote {
+            debug.layer(middleware::from_fn(api_key_auth))
+        } else {
+            debug.layer(middleware::from_fn(localhost_only))
+        };
+
+        router = router.merge(debug);
+    }
+
+    router
+}
+```
