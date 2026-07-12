@@ -5579,3 +5579,282 @@ onnx_genai_vram_total_bytes               gauge  # total GPU memory used
 ```
 
 This gives users (and us) transparency into where memory goes — and helps identify optimization targets.
+
+---
+
+## 34. Cluster Deployment & Session-Aware Router
+
+### 34.1 Why Not Build Our Own Full Load Balancer
+
+General-purpose load balancing (TLS termination, rate limiting, health checks, connection pooling) is a solved problem. Nginx, Envoy, HAProxy, and cloud LBs do it better than we ever will. We don't reimplement any of that.
+
+**But** generic LBs don't understand LLM inference. Round-robin is actively harmful because:
+
+1. **KV cache affinity** — a session's KV cache lives on one specific GPU. Routing the next turn to a different node means re-prefilling the entire conversation (seconds of wasted compute).
+2. **Load asymmetry** — one long generation can saturate a GPU for seconds while another node is idle. Request count ≠ actual load.
+3. **Prefix sharing** — agents with the same system prompt should co-locate to share KV pages.
+
+### 34.2 Architecture: Thin Router + Fat Inference Nodes
+
+```
+                        ┌─────────────────────┐
+                        │   Nginx / Envoy     │  TLS, rate limit, basic health
+                        │   (standard LB)      │
+                        └──────────┬──────────┘
+                                   │
+                        ┌──────────▼──────────┐
+                        │  onnx-genai-router  │  Session affinity, load-aware routing
+                        │  (lightweight bin)   │  Polls /v1/status from each node
+                        └──────────┬──────────┘
+                                   │
+                    ┌──────────────┼──────────────┐
+                    ▼              ▼              ▼
+            ┌──────────┐   ┌──────────┐   ┌──────────┐
+            │ onnx-genai│   │ onnx-genai│   │ onnx-genai│
+            │  :8000    │   │  :8001    │   │  :8002    │
+            │  GPU 0    │   │  GPU 1    │   │  GPU 2    │
+            └──────────┘   └──────────┘   └──────────┘
+```
+
+**The router is a separate binary** (`onnx-genai-router`), not embedded in the inference server.
+
+### 34.3 Router Responsibilities (Only These)
+
+| Does | Doesn't |
+|---|---|
+| Session → node affinity mapping | TLS termination |
+| Load-aware routing (KV usage, queue depth) | Rate limiting |
+| Prefix-aware co-location | Connection pooling |
+| Failover (node down → re-route) | Authentication |
+| Route table management | Request transformation |
+
+### 34.4 Router Design
+
+```rust
+/// Lightweight session-aware router.
+/// Single binary, stateless-ish (session map persisted optionally).
+pub struct Router {
+    /// Known inference nodes.
+    nodes: Vec<NodeState>,
+    /// Session → node affinity mapping.
+    session_map: HashMap<String, NodeId>,
+    /// Prefix hash → node mapping (for prefix sharing).
+    prefix_map: HashMap<u64, NodeId>,
+    /// Routing policy.
+    policy: RoutingPolicy,
+}
+
+/// Snapshot of a node's state (refreshed every 1-2s via GET /v1/status).
+pub struct NodeState {
+    pub id: NodeId,
+    pub address: SocketAddr,
+    pub healthy: bool,
+    /// From /v1/status response:
+    pub kv_usage: f32,           // 0.0-1.0
+    pub queue_depth: u32,
+    pub active_sessions: u32,
+    pub tokens_per_second: f64,
+    pub last_poll: Instant,
+}
+```
+
+### 34.5 Routing Algorithm
+
+```rust
+pub enum RoutingPolicy {
+    /// Prefer session affinity, fall back to least-loaded.
+    AffinityThenLoad,
+    /// Prefer prefix sharing, fall back to least-loaded.
+    PrefixThenLoad,
+    /// Always route to least KV usage.
+    LeastKvUsage,
+    /// Weighted: affinity × 0.5 + kv_usage × 0.3 + queue_depth × 0.2
+    Weighted(WeightConfig),
+}
+
+impl Router {
+    /// Core routing decision.
+    pub fn route(&mut self, request: &IncomingRequest) -> NodeId {
+        // 1. Check session affinity
+        if let Some(session_id) = &request.session_id {
+            if let Some(&node) = self.session_map.get(session_id) {
+                if self.nodes[node].healthy && self.nodes[node].kv_usage < 0.95 {
+                    return node;  // Same node, KV cache intact
+                }
+                // Node full or down — must re-route (KV cache lost, will re-prefill)
+            }
+        }
+        
+        // 2. Check prefix sharing opportunity
+        if let Some(prefix_hash) = request.system_prompt_hash() {
+            if let Some(&node) = self.prefix_map.get(&prefix_hash) {
+                if self.nodes[node].healthy && self.nodes[node].kv_usage < 0.85 {
+                    return node;  // Co-locate for prefix sharing
+                }
+            }
+        }
+        
+        // 3. Fall back to least-loaded node
+        self.least_loaded_node()
+    }
+    
+    fn least_loaded_node(&self) -> NodeId {
+        self.nodes.iter()
+            .filter(|n| n.healthy)
+            .min_by(|a, b| {
+                // Score = kv_usage * 0.6 + normalized_queue * 0.4
+                let score_a = a.kv_usage * 0.6 + (a.queue_depth as f32 / 10.0) * 0.4;
+                let score_b = b.kv_usage * 0.6 + (b.queue_depth as f32 / 10.0) * 0.4;
+                score_a.partial_cmp(&score_b).unwrap()
+            })
+            .map(|n| n.id)
+            .expect("no healthy nodes")
+    }
+}
+```
+
+### 34.6 Session Migration (When Affinity Breaks)
+
+When a node goes down or is too full, sessions must migrate:
+
+```rust
+pub struct MigrationEvent {
+    pub session_id: String,
+    pub from_node: NodeId,
+    pub to_node: NodeId,
+    pub reason: MigrationReason,
+    /// Estimated re-prefill cost (tokens).
+    pub reprefill_tokens: u64,
+}
+
+pub enum MigrationReason {
+    /// Original node is down.
+    NodeDown,
+    /// Original node is overloaded (KV > 95%).
+    Overloaded,
+    /// Manual rebalancing.
+    Rebalance,
+}
+```
+
+Migration = KV cache is lost on old node. New node must re-prefill the conversation history. The router tracks this cost for observability.
+
+### 34.7 Router HTTP API
+
+```
+# Router's own endpoints (not proxied to inference nodes):
+
+GET  /router/status           → router health + node states
+GET  /router/sessions         → session → node mapping table
+GET  /router/metrics          → Prometheus metrics for routing decisions
+POST /router/drain/{node_id}  → gracefully drain a node (stop new sessions, wait for existing)
+POST /router/rebalance        → trigger session rebalancing across nodes
+
+# Everything else is proxied to the selected inference node:
+POST /v1/chat/completions     → routed to appropriate node
+POST /v1/sessions             → routed + affinity recorded
+GET  /v1/models               → any healthy node (cached)
+```
+
+### 34.8 Node Status Contract
+
+What the inference server must expose for the router to work:
+
+```json
+GET /v1/status
+{
+  "node_id": "gpu-2",
+  "healthy": true,
+  "kv_usage": 0.73,
+  "kv_pages_used": 1496,
+  "kv_pages_total": 2048,
+  "kv_pages_shared": 256,
+  "queue_depth": 2,
+  "active_sessions": 8,
+  "paused_sessions": 3,
+  "tokens_per_second": 167.6,
+  "batch_utilization": 0.82,
+  "sessions": [
+    { "id": "agent-worker-3", "priority": "standard", "kv_pages": 64, "state": "paused" },
+    { "id": "agent-worker-7", "priority": "interactive", "kv_pages": 128, "state": "decoding" }
+  ],
+  "prefix_hashes": ["a1b2c3d4", "e5f6a7b8"]
+}
+```
+
+The router polls this every 1-2 seconds. Total overhead: ~1KB JSON × N nodes × 0.5-1 QPS = negligible.
+
+### 34.9 Deployment Modes
+
+| Mode | Setup | Router? |
+|---|---|---|
+| **Single GPU** | `onnx-genai serve` | No router needed |
+| **Single machine, multi-GPU** | N processes + Nginx | Optional (Nginx sticky sessions may suffice) |
+| **Multi-node cluster** | N machines + `onnx-genai-router` + Nginx | Yes |
+| **Kubernetes** | Deployment + Service + `onnx-genai-router` as sidecar or standalone | Yes (or use KubeAI) |
+
+### 34.10 Crate Structure
+
+```
+crates/onnx-genai-router/
+├── Cargo.toml
+├── src/
+│   ├── main.rs           # CLI entry point
+│   ├── router.rs         # Core routing logic
+│   ├── node_poller.rs    # Background /v1/status polling
+│   ├── session_map.rs    # Session → node affinity table
+│   ├── prefix_map.rs     # Prefix hash → node co-location
+│   ├── proxy.rs          # HTTP reverse proxy (hyper-based)
+│   ├── api.rs            # /router/* endpoints
+│   └── config.rs         # YAML config
+```
+
+Dependencies: minimal. `hyper` + `tokio` + `serde`. No ORT, no engine, no KV cache code. Pure networking.
+
+### 34.11 Configuration
+
+```yaml
+# router.yaml
+listen: "0.0.0.0:8080"
+
+nodes:
+  - address: "10.0.0.1:8000"
+    name: "gpu-0"
+  - address: "10.0.0.2:8000"
+    name: "gpu-1"
+  - address: "10.0.0.3:8000"
+    name: "gpu-2"
+
+routing:
+  policy: affinity_then_load
+  poll_interval_ms: 1000
+  overload_threshold: 0.95    # KV usage above this triggers migration
+  prefix_colocate: true       # co-locate sessions with same system prompt
+
+health:
+  check_interval_ms: 5000
+  unhealthy_after_misses: 3   # mark node unhealthy after 3 missed polls
+  
+session_map:
+  persist: false              # optional: persist to file for router restart
+  persist_path: "/var/lib/onnx-genai-router/sessions.json"
+```
+
+### 34.12 Router Metrics
+
+```
+# Routing decisions
+onnx_genai_router_requests_total              counter  {node, decision=affinity|prefix|least_loaded}
+onnx_genai_router_session_migrations_total    counter  {reason=node_down|overloaded|rebalance}
+onnx_genai_router_reprefill_tokens_total      counter  # tokens wasted on re-prefill after migration
+
+# Node health
+onnx_genai_router_node_healthy                gauge    {node}
+onnx_genai_router_node_kv_usage               gauge    {node}
+onnx_genai_router_node_queue_depth             gauge    {node}
+
+# Router internals
+onnx_genai_router_session_map_size            gauge    # entries in session → node map
+onnx_genai_router_prefix_map_size             gauge    # entries in prefix → node map
+onnx_genai_router_poll_latency_seconds        histogram {node}
+```
