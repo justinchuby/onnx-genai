@@ -3541,3 +3541,44 @@ We provide a conversion script:
 onnx-genai convert-speculator RedHatAI/Qwen3-8B-speculator.eagle3 --output ./eagle-onnx/
 # Creates: eagle-onnx/adapter.onnx + eagle-onnx/inference_metadata.yaml + eagle-onnx/config.json
 ```
+
+### 28.10 Mobius Integration (ONNX Model Building)
+
+The conversion path from trained speculators to ONNX is handled by **Mobius** (Microsoft's ONNX model builder for GenAI). Mobius already supports building speculator models (e.g., Gemma 4 DFlash).
+
+**Actual pipeline:**
+```
+Speculators training (PyTorch) 
+    → HF checkpoint (safetensors + config.json)
+    → Mobius build (handles export, graph optimization, opset 24)
+    → ONNX speculator model + inference_metadata.yaml
+    → onnx-genai engine loads directly
+```
+
+**We do NOT need a separate `convert-speculator` script.** Mobius IS the converter. Our responsibility is purely on the consumption side:
+
+1. **Load** the ONNX model Mobius produces
+2. **Detect** speculator type from config/metadata
+3. **Route** to the correct `SpeculativeProposer` implementation
+4. **Handle** vocab mapping if Mobius includes t2d/d2t tensors
+5. **Bind** multi-layer outputs (DFlash anchor hidden states are already graph outputs)
+
+This means our `detect_speculator()` should also check for Mobius-style metadata in addition to HF `speculator_config`:
+
+```rust
+/// Check for speculator config in either:
+/// 1. HF-style: config.json → speculator_config.proposal_type
+/// 2. Mobius-style: inference_metadata.yaml → speculative.method
+pub fn detect_speculator(model_dir: &Path) -> Option<SpeculatorDetection> {
+    // Try our native metadata first
+    if let Some(meta) = try_load_inference_metadata(model_dir) {
+        if let Some(spec) = &meta.speculative {
+            return Some(SpeculatorDetection::from_metadata(spec));
+        }
+    }
+    // Fall back to HF config.json
+    try_detect_from_hf_config(model_dir)
+}
+```
+
+**Key advantage:** Mobius handles all the hard ONNX export problems (graph optimization, operator fusion, opset compatibility, quantization). We focus purely on fast inference of the resulting model.
