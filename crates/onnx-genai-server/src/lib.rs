@@ -22,7 +22,9 @@ use onnx_genai::{
     Engine, EngineConfig, FinishReason, GenerateOptions, GeneratePrompt, GenerateRequest,
     GenerateResult, GenerateToken, SessionId, StopSequence,
 };
-use onnx_genai_engine::{ContinuousBatchEvent, ContinuousBatchManager, GenerateConstraint};
+use onnx_genai_engine::{
+    ContinuousBatchEvent, ContinuousBatchManager, FimConfig, GenerateConstraint,
+};
 use onnx_genai_ort::{ChatMessage as TemplateChatMessage, ChatTemplate, ModelDirectory, Tokenizer};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
@@ -46,6 +48,7 @@ pub struct AppState {
     sessions: SessionRegistry,
     config: ServerConfig,
     model_max_context: Option<usize>,
+    fim_config: Option<FimConfig>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -100,6 +103,14 @@ enum DriverCommand {
     Generate {
         session_id: Option<SessionId>,
         request: Box<GenerateRequest>,
+        events: mpsc::Sender<DriverEvent>,
+        permit: OwnedSemaphorePermit,
+    },
+    GenerateFim {
+        prefix: String,
+        suffix: String,
+        fim_config: FimConfig,
+        options: Box<GenerateOptions>,
         events: mpsc::Sender<DriverEvent>,
         permit: OwnedSemaphorePermit,
     },
@@ -196,6 +207,33 @@ impl EngineDriver {
             .send(DriverCommand::Generate {
                 session_id,
                 request: Box::new(request),
+                events,
+                permit,
+            })
+            .await
+            .map_err(|_| GenerateSubmitError::DriverStopped)?;
+        Ok(rx)
+    }
+
+    async fn generate_fim(
+        &self,
+        prefix: String,
+        suffix: String,
+        fim_config: FimConfig,
+        options: GenerateOptions,
+    ) -> Result<mpsc::Receiver<DriverEvent>, GenerateSubmitError> {
+        let permit = self
+            .generation_capacity
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| GenerateSubmitError::Overloaded)?;
+        let (events, rx) = mpsc::channel(DRIVER_OUTPUT_BUFFER);
+        self.commands
+            .send(DriverCommand::GenerateFim {
+                prefix,
+                suffix,
+                fim_config,
+                options: Box::new(options),
                 events,
                 permit,
             })
@@ -409,6 +447,14 @@ fn handle_driver_command(engine: &mut Engine, command: DriverCommand) {
             events,
             permit,
         } => run_fallback_generation(engine, session_id, *request, events, permit),
+        DriverCommand::GenerateFim {
+            prefix,
+            suffix,
+            fim_config,
+            options,
+            events,
+            permit,
+        } => run_fim_generation(engine, prefix, suffix, fim_config, *options, events, permit),
     }
 }
 
@@ -431,6 +477,25 @@ fn run_fallback_generation(
         None => engine.generate_with_callback(request, Some(&mut callback)),
     };
     match result {
+        Ok(result) => {
+            let _ = events.try_send(DriverEvent::Finished(result));
+        }
+        Err(err) => {
+            let _ = events.try_send(DriverEvent::Error(err.to_string()));
+        }
+    }
+}
+
+fn run_fim_generation(
+    engine: &mut Engine,
+    prefix: String,
+    suffix: String,
+    fim_config: FimConfig,
+    options: GenerateOptions,
+    events: mpsc::Sender<DriverEvent>,
+    _permit: OwnedSemaphorePermit,
+) {
+    match engine.generate_fim_with_config(prefix, suffix, options, &fim_config) {
         Ok(result) => {
             let _ = events.try_send(DriverEvent::Finished(result));
         }
@@ -598,6 +663,7 @@ impl AppState {
         model_max_context: Option<usize>,
     ) -> Self {
         let config = config.validate().expect("validated server config");
+        let fim_config = engine.fim_config().cloned();
         Self {
             model_id,
             engine: EngineDriver::start(engine, DEFAULT_MAX_BATCH, config.max_pending),
@@ -606,6 +672,7 @@ impl AppState {
             sessions: SessionRegistry::new(config.max_sessions),
             config,
             model_max_context,
+            fim_config,
         }
     }
 
@@ -620,6 +687,7 @@ pub fn app(state: AppState) -> Router {
         .route("/v1/models", get(models))
         .route("/v1/sessions", post(create_session))
         .route("/v1/sessions/{id}", delete(delete_session))
+        .route("/v1/completions", post(completions))
         .route("/v1/chat/completions", post(chat_completions))
         .with_state(state)
 }
@@ -653,6 +721,30 @@ pub struct ChatCompletionRequest {
     pub tools: Option<Vec<ChatTool>>,
     #[serde(default)]
     pub tool_choice: Option<ToolChoice>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CompletionRequest {
+    pub model: String,
+    pub prompt: String,
+    #[serde(default)]
+    pub suffix: Option<String>,
+    #[serde(default = "default_max_tokens")]
+    pub max_tokens: usize,
+    #[serde(default = "default_temperature")]
+    pub temperature: f32,
+    #[serde(default = "default_top_p")]
+    pub top_p: f32,
+    #[serde(default)]
+    pub min_p: f32,
+    #[serde(default)]
+    pub frequency_penalty: f32,
+    #[serde(default)]
+    pub presence_penalty: f32,
+    #[serde(default)]
+    pub stream: bool,
+    #[serde(default)]
+    pub stop: Option<StopInput>,
 }
 
 impl ChatCompletionRequest {
@@ -811,6 +903,41 @@ pub struct Usage {
 }
 
 #[derive(Debug, Serialize)]
+pub struct CompletionResponse {
+    pub id: String,
+    pub object: &'static str,
+    pub created: u64,
+    pub model: String,
+    pub choices: Vec<CompletionChoice>,
+    pub usage: Usage,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CompletionChoice {
+    pub text: String,
+    pub index: usize,
+    pub finish_reason: &'static str,
+    pub logprobs: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Serialize)]
+struct CompletionChunk {
+    id: String,
+    object: &'static str,
+    created: u64,
+    model: String,
+    choices: Vec<CompletionChunkChoice>,
+}
+
+#[derive(Debug, Serialize)]
+struct CompletionChunkChoice {
+    text: String,
+    index: usize,
+    finish_reason: Option<&'static str>,
+    logprobs: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Serialize)]
 struct ChatCompletionChunk {
     id: String,
     object: &'static str,
@@ -893,6 +1020,20 @@ struct ApiError {
 struct PreparedGenerateRequest {
     request: GenerateRequest,
     prompt_tokens: usize,
+}
+
+struct PreparedCompletion {
+    generation: CompletionGeneration,
+    prompt_tokens: usize,
+}
+
+enum CompletionGeneration {
+    Plain(GenerateRequest),
+    Fim {
+        prefix: String,
+        suffix: String,
+        options: GenerateOptions,
+    },
 }
 
 #[derive(Debug)]
@@ -1080,6 +1221,174 @@ async fn delete_session(
         .map_err(|err| ApiError::internal(format!("session close failed: {err}")))?;
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn completions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<CompletionRequest>,
+) -> Result<Response, ApiError> {
+    validate_completion_request(&request, &state.config)?;
+    let session_id = session_id_from_headers(&headers)?;
+    if request.suffix.is_some() && state.fim_config.is_none() {
+        return Err(ApiError::bad_request(
+            "FIM is not supported by this model because its tokenizer configuration does not declare recognized FIM tokens",
+        ));
+    }
+    if request.suffix.is_some() && session_id.is_some() {
+        return Err(ApiError::bad_request(
+            "X-Session-Id is not supported for FIM completions",
+        ));
+    }
+
+    if request.stream {
+        Ok(stream_completion(state, request, session_id)
+            .await?
+            .into_response())
+    } else {
+        Ok(Json(run_completion(state, request, session_id).await?).into_response())
+    }
+}
+
+async fn run_completion(
+    state: AppState,
+    request: CompletionRequest,
+    client_session_id: Option<String>,
+) -> Result<CompletionResponse, ApiError> {
+    let id = text_completion_id();
+    let created = now_unix();
+    let model = request.model.clone();
+    let prepared = prepare_completion(&request, &state)?;
+    enforce_context_cap(
+        prepared.prompt_tokens,
+        request.max_tokens,
+        state.model_max_context,
+    )?;
+    let result = collect_generation_result(
+        submit_completion(&state, prepared.generation, client_session_id.as_deref()).await?,
+    )
+    .await
+    .map_err(|err| ApiError::internal(format!("generation failed: {err}")))?;
+    let completion_tokens = result.token_ids.len();
+
+    Ok(CompletionResponse {
+        id,
+        object: "text_completion",
+        created,
+        model,
+        choices: vec![CompletionChoice {
+            text: result.text,
+            index: 0,
+            finish_reason: finish_reason_label(&result.finish_reason),
+            logprobs: None,
+        }],
+        usage: Usage {
+            prompt_tokens: prepared.prompt_tokens,
+            completion_tokens,
+            total_tokens: prepared.prompt_tokens + completion_tokens,
+        },
+    })
+}
+
+async fn stream_completion(
+    state: AppState,
+    request: CompletionRequest,
+    client_session_id: Option<String>,
+) -> Result<Sse<ReceiverStream<Result<Event, Infallible>>>, ApiError> {
+    let id = text_completion_id();
+    let created = now_unix();
+    let model = request.model.clone();
+    let user_stop_sequences = request
+        .stop
+        .clone()
+        .map(StopInput::into_texts)
+        .unwrap_or_default();
+    let prepared = prepare_completion(&request, &state)?;
+    enforce_context_cap(
+        prepared.prompt_tokens,
+        request.max_tokens,
+        state.model_max_context,
+    )?;
+    let mut driver_rx =
+        submit_completion(&state, prepared.generation, client_session_id.as_deref()).await?;
+    let (tx, rx) = mpsc::channel(16);
+
+    tokio::spawn(async move {
+        let mut stop_buffer = StopBoundaryBuffer::new(user_stop_sequences);
+        let mut emitted_text = false;
+        let result = loop {
+            match driver_rx.recv().await {
+                Some(DriverEvent::Token(token)) => {
+                    let finish_reason = token.finish_reason.clone();
+                    let text = stop_buffer.push(&token.text);
+                    if !text.is_empty() {
+                        emitted_text = true;
+                        send_completion_stream_chunk(
+                            &tx,
+                            completion_chunk(&id, created, &model, text),
+                        )
+                        .await?;
+                    }
+                    if matches!(finish_reason, Some(FinishReason::StopSequence { .. })) {
+                        stop_buffer.pending.clear();
+                    }
+                }
+                Some(DriverEvent::Finished(result)) => break Ok(result),
+                Some(DriverEvent::Error(message)) => break Err(message),
+                None => break Err("generation stream ended before result".to_string()),
+            }
+        };
+
+        match result {
+            Ok(result) => {
+                if !emitted_text && !result.text.is_empty() {
+                    send_completion_stream_chunk(
+                        &tx,
+                        completion_chunk(&id, created, &model, result.text),
+                    )
+                    .await?;
+                } else if !matches!(result.finish_reason, FinishReason::StopSequence { .. }) {
+                    let text = stop_buffer.flush();
+                    if !text.is_empty() {
+                        send_completion_stream_chunk(
+                            &tx,
+                            completion_chunk(&id, created, &model, text),
+                        )
+                        .await?;
+                    }
+                }
+                send_completion_stream_chunk(
+                    &tx,
+                    completion_done_chunk(
+                        &id,
+                        created,
+                        &model,
+                        finish_reason_label(&result.finish_reason),
+                    ),
+                )
+                .await?;
+            }
+            Err(err) => {
+                tx.send(Ok(Event::default().event("error").data(
+                    serde_json::to_string(&ErrorResponse {
+                        error: ErrorBody {
+                            message: format!("generation failed: {err}"),
+                            kind: "server_error",
+                        },
+                    })?,
+                )))
+                .await
+                .context("stream receiver closed")?;
+            }
+        }
+
+        tx.send(Ok(Event::default().data("[DONE]")))
+            .await
+            .context("stream receiver closed")?;
+        Ok::<(), anyhow::Error>(())
+    });
+
+    Ok(Sse::new(ReceiverStream::new(rx)))
 }
 
 async fn chat_completions(
@@ -1388,6 +1697,50 @@ async fn send_stream_chunk(
         .context("stream receiver closed")
 }
 
+async fn send_completion_stream_chunk(
+    tx: &mpsc::Sender<Result<Event, Infallible>>,
+    chunk: CompletionChunk,
+) -> anyhow::Result<()> {
+    tx.send(Ok(Event::default().data(serde_json::to_string(&chunk)?)))
+        .await
+        .context("stream receiver closed")
+}
+
+fn completion_chunk(id: &str, created: u64, model: &str, text: String) -> CompletionChunk {
+    CompletionChunk {
+        id: id.to_string(),
+        object: "text_completion",
+        created,
+        model: model.to_string(),
+        choices: vec![CompletionChunkChoice {
+            text,
+            index: 0,
+            finish_reason: None,
+            logprobs: None,
+        }],
+    }
+}
+
+fn completion_done_chunk(
+    id: &str,
+    created: u64,
+    model: &str,
+    finish_reason: &'static str,
+) -> CompletionChunk {
+    CompletionChunk {
+        id: id.to_string(),
+        object: "text_completion",
+        created,
+        model: model.to_string(),
+        choices: vec![CompletionChunkChoice {
+            text: String::new(),
+            index: 0,
+            finish_reason: Some(finish_reason),
+            logprobs: None,
+        }],
+    }
+}
+
 fn role_chunk(id: &str, created: u64, model: &str) -> ChatCompletionChunk {
     ChatCompletionChunk {
         id: id.to_string(),
@@ -1506,6 +1859,45 @@ fn validate_request(
         ));
     }
     validate_tool_choice(request)?;
+    Ok(())
+}
+
+fn validate_completion_request(
+    request: &CompletionRequest,
+    config: &ServerConfig,
+) -> Result<(), ApiError> {
+    if request.max_tokens == 0 {
+        return Err(ApiError::bad_request(
+            "max_tokens must be greater than zero",
+        ));
+    }
+    if request.max_tokens > config.max_output_tokens {
+        return Err(ApiError::bad_request(format!(
+            "max_tokens must be less than or equal to the server cap of {}",
+            config.max_output_tokens
+        )));
+    }
+    if !request.temperature.is_finite() || request.temperature < 0.0 {
+        return Err(ApiError::bad_request(
+            "temperature must be finite and non-negative",
+        ));
+    }
+    if !request.top_p.is_finite() || request.top_p < 0.0 {
+        return Err(ApiError::bad_request(
+            "top_p must be finite and non-negative",
+        ));
+    }
+    if !request.min_p.is_finite() || !(0.0..=1.0).contains(&request.min_p) {
+        return Err(ApiError::bad_request(
+            "min_p must be finite and between 0 and 1",
+        ));
+    }
+    if !request.frequency_penalty.is_finite() {
+        return Err(ApiError::bad_request("frequency_penalty must be finite"));
+    }
+    if !request.presence_penalty.is_finite() {
+        return Err(ApiError::bad_request("presence_penalty must be finite"));
+    }
     Ok(())
 }
 
@@ -1628,6 +2020,103 @@ pub fn build_generate_request(request: &ChatCompletionRequest) -> GenerateReques
     }
 }
 
+fn prepare_completion(
+    request: &CompletionRequest,
+    state: &AppState,
+) -> Result<PreparedCompletion, ApiError> {
+    let mut options = build_completion_options(request, &state.tokenizer);
+    options.max_context = state.model_max_context;
+    if let Some(suffix) = request.suffix.as_ref() {
+        let fim_config = state
+            .fim_config
+            .as_ref()
+            .ok_or_else(|| ApiError::bad_request("FIM is not supported by this model"))?;
+        let prompt = fim_config.format_prompt(&request.prompt, suffix);
+        let prompt_tokens = tokenize_prompt(&state.tokenizer, &prompt)?;
+        Ok(PreparedCompletion {
+            generation: CompletionGeneration::Fim {
+                prefix: request.prompt.clone(),
+                suffix: suffix.clone(),
+                options,
+            },
+            prompt_tokens,
+        })
+    } else {
+        let token_ids = state
+            .tokenizer
+            .encode(&request.prompt)
+            .map_err(|err| ApiError::internal(format!("prompt tokenization failed: {err}")))?;
+        let prompt_tokens = token_ids.len();
+        Ok(PreparedCompletion {
+            generation: CompletionGeneration::Plain(GenerateRequest {
+                prompt: GeneratePrompt::TokenIds(token_ids),
+                options,
+            }),
+            prompt_tokens,
+        })
+    }
+}
+
+async fn submit_completion(
+    state: &AppState,
+    generation: CompletionGeneration,
+    client_session_id: Option<&str>,
+) -> Result<mpsc::Receiver<DriverEvent>, ApiError> {
+    match generation {
+        CompletionGeneration::Plain(request) => {
+            let session_id = if let Some(id) = client_session_id {
+                Some(get_or_create_session(state, id).await?)
+            } else {
+                None
+            };
+            state
+                .engine
+                .generate(session_id, request)
+                .await
+                .map_err(map_generate_submit_error)
+        }
+        CompletionGeneration::Fim {
+            prefix,
+            suffix,
+            options,
+        } => {
+            let fim_config = state
+                .fim_config
+                .clone()
+                .ok_or_else(|| ApiError::bad_request("FIM is not supported by this model"))?;
+            state
+                .engine
+                .generate_fim(prefix, suffix, fim_config, options)
+                .await
+                .map_err(map_generate_submit_error)
+        }
+    }
+}
+
+fn tokenize_prompt(tokenizer: &Tokenizer, prompt: &str) -> Result<usize, ApiError> {
+    tokenizer
+        .encode(prompt)
+        .map(|tokens| tokens.len())
+        .map_err(|err| ApiError::internal(format!("prompt tokenization failed: {err}")))
+}
+
+fn build_completion_options(request: &CompletionRequest, tokenizer: &Tokenizer) -> GenerateOptions {
+    let mut options = GenerateOptions {
+        max_new_tokens: request.max_tokens,
+        temperature: request.temperature,
+        top_p: request.top_p,
+        min_p: request.min_p,
+        frequency_penalty: request.frequency_penalty,
+        presence_penalty: request.presence_penalty,
+        ..GenerateOptions::default()
+    };
+    if let Some(stop) = request.stop.clone() {
+        options.stop_sequences = stop.into_sequences();
+    }
+    add_tokenizer_stop_sequences(&mut options, tokenizer);
+    options
+}
+
 fn prepare_generate_request(
     request: &ChatCompletionRequest,
     tokenizer: &Tokenizer,
@@ -1729,6 +2218,11 @@ fn build_generate_options_with_tokenizer(
     tokenizer: &Tokenizer,
 ) -> GenerateOptions {
     let mut options = build_generate_options(request);
+    add_tokenizer_stop_sequences(&mut options, tokenizer);
+    options
+}
+
+fn add_tokenizer_stop_sequences(options: &mut GenerateOptions, tokenizer: &Tokenizer) {
     let eos_token_ids = tokenizer.eos_token_ids();
     if let Some(first) = eos_token_ids.first().copied() {
         options.eos_token_id = Some(first);
@@ -1745,7 +2239,6 @@ fn build_generate_options_with_tokenizer(
             options.stop_sequences.push(im_end_sequence);
         }
     }
-    options
 }
 
 fn json_constraint_stopped_incomplete_message(message: &str) -> bool {
@@ -1955,6 +2448,10 @@ fn completion_id() -> String {
     format!("chatcmpl-{}", now_unix())
 }
 
+fn text_completion_id() -> String {
+    format!("cmpl-{}", now_unix())
+}
+
 fn hex_token(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
@@ -2003,8 +2500,9 @@ fn load_model_max_context(metadata_path: Option<&Path>) -> anyhow::Result<Option
 #[cfg(test)]
 mod tests {
     use super::{
-        AppState, ChatCompletionRequest, DriverCommand, Engine, EngineConfig, EngineDriver,
-        ServerConfig, StopBoundaryBuffer, app, build_generate_request, collect_generation_result,
+        AppState, ChatCompletionRequest, CompletionGeneration, CompletionRequest, DriverCommand,
+        Engine, EngineConfig, EngineDriver, ServerConfig, StopBoundaryBuffer, app,
+        build_generate_request, collect_generation_result, prepare_completion,
     };
     use axum::{
         body::{Body, to_bytes},
@@ -2014,6 +2512,88 @@ mod tests {
     use std::{path::PathBuf, time::Duration};
     use tokio::{sync::mpsc, time::timeout};
     use tower::ServiceExt;
+
+    #[test]
+    fn completion_suffix_maps_to_fim_generation() {
+        let model_dir =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
+        let mut state =
+            AppState::load(&model_dir, Some("tiny-llm".to_string())).expect("load fixture");
+        state.fim_config = Some(onnx_genai_engine::FimConfig {
+            prefix_token: "<PRE>".to_string(),
+            middle_token: "<MID>".to_string(),
+            suffix_token: "<SUF>".to_string(),
+            format: onnx_genai_engine::FimFormat::PSM,
+        });
+        let request: CompletionRequest = serde_json::from_value(json!({
+            "model": "tiny-llm",
+            "prompt": "prefix",
+            "suffix": "suffix",
+            "max_tokens": 7,
+            "min_p": 0.2,
+            "frequency_penalty": 0.3,
+            "presence_penalty": 0.4
+        }))
+        .unwrap();
+
+        let prepared = prepare_completion(&request, &state).unwrap();
+        match prepared.generation {
+            CompletionGeneration::Fim {
+                prefix,
+                suffix,
+                options,
+            } => {
+                assert_eq!(prefix, "prefix");
+                assert_eq!(suffix, "suffix");
+                assert_eq!(options.max_new_tokens, 7);
+                assert_eq!(options.min_p, 0.2);
+                assert_eq!(options.frequency_penalty, 0.3);
+                assert_eq!(options.presence_penalty, 0.4);
+            }
+            CompletionGeneration::Plain(_) => panic!("suffix must route to FIM generation"),
+        }
+    }
+
+    #[tokio::test]
+    async fn completion_suffix_uses_fim_and_returns_text_completion() {
+        let model_dir =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
+        let mut state =
+            AppState::load(&model_dir, Some("tiny-llm".to_string())).expect("load fixture");
+        state.fim_config = Some(onnx_genai_engine::FimConfig {
+            prefix_token: "<PRE>".to_string(),
+            middle_token: "<MID>".to_string(),
+            suffix_token: "<SUF>".to_string(),
+            format: onnx_genai_engine::FimFormat::PSM,
+        });
+
+        let response = app(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/completions")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "model": "tiny-llm",
+                            "prompt": "prefix",
+                            "suffix": "suffix",
+                            "max_tokens": 1
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["object"], "text_completion");
+        assert!(json["choices"][0]["text"].is_string());
+        assert!(json["choices"][0]["logprobs"].is_null());
+    }
 
     #[test]
     fn stop_boundary_buffer_holds_partial_stop_sequence() {

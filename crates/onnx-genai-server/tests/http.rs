@@ -74,6 +74,19 @@ async fn post_chat_json(app: axum::Router, body: Value) -> Value {
     serde_json::from_slice(&body).unwrap()
 }
 
+async fn post_completion(app: axum::Router, body: Value) -> axum::response::Response {
+    app.oneshot(
+        Request::builder()
+            .method("POST")
+            .uri("/v1/completions")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap(),
+    )
+    .await
+    .unwrap()
+}
+
 fn direct_static_completion(body: Value) -> String {
     let request = chat_request(body);
     let generate_request = build_generate_request(&request);
@@ -283,6 +296,63 @@ async fn chat_completions_returns_openai_shape() {
     assert!(prompt_tokens > 0);
     assert_eq!(total_tokens, prompt_tokens + completion_tokens);
     assert!(json.get("session_id").is_none());
+}
+
+#[tokio::test]
+async fn completions_returns_openai_text_completion_shape() {
+    let response = post_completion(
+        test_app().await,
+        json!({
+            "model": "tiny-llm",
+            "prompt": "hello",
+            "max_tokens": 1,
+            "min_p": 0.05,
+            "frequency_penalty": 0.1,
+            "presence_penalty": 0.2
+        }),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert!(json["id"].as_str().unwrap().starts_with("cmpl-"));
+    assert_eq!(json["object"], "text_completion");
+    assert_eq!(json["model"], "tiny-llm");
+    assert_eq!(json["choices"][0]["index"], 0);
+    assert!(json["choices"][0]["text"].is_string());
+    assert!(json["choices"][0]["finish_reason"].is_string());
+    assert!(json["choices"][0]["logprobs"].is_null());
+    let prompt_tokens = json["usage"]["prompt_tokens"].as_u64().unwrap();
+    let completion_tokens = json["usage"]["completion_tokens"].as_u64().unwrap();
+    assert_eq!(
+        json["usage"]["total_tokens"].as_u64().unwrap(),
+        prompt_tokens + completion_tokens
+    );
+}
+
+#[tokio::test]
+async fn completions_with_suffix_rejects_model_without_fim_tokens() {
+    let response = post_completion(
+        test_app().await,
+        json!({
+            "model": "tiny-llm",
+            "prompt": "fn main() {",
+            "suffix": "}",
+            "max_tokens": 1
+        }),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    let message = json["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("FIM is not supported by this model"),
+        "{json}"
+    );
+    assert!(message.contains("recognized FIM tokens"), "{json}");
 }
 
 #[tokio::test]
@@ -733,6 +803,49 @@ async fn streaming_chat_completions_returns_sse_chunks() {
         .filter(|chunk| chunk["choices"][0]["delta"].get("content").is_some())
         .count();
     assert!(content_chunks <= 1, "{text}");
+    assert_eq!(
+        chunks.last().unwrap()["choices"][0]["finish_reason"],
+        "length"
+    );
+}
+
+#[tokio::test]
+async fn streaming_completions_returns_text_completion_chunks() {
+    let response = post_completion(
+        test_app().await,
+        json!({
+            "model": "tiny-llm",
+            "prompt": "hello",
+            "max_tokens": 1,
+            "stream": true
+        }),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get(header::CONTENT_TYPE).unwrap(),
+        "text/event-stream"
+    );
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let text = String::from_utf8(body.to_vec()).unwrap();
+    let data_lines = sse_data_lines(&text);
+    assert_eq!(data_lines.last(), Some(&"[DONE]"), "{text}");
+
+    let chunks = sse_json_chunks(&text);
+    assert!(!chunks.is_empty(), "{text}");
+    assert!(
+        chunks
+            .iter()
+            .all(|chunk| chunk["object"] == "text_completion"),
+        "{text}"
+    );
+    assert!(
+        chunks
+            .iter()
+            .all(|chunk| chunk["choices"][0]["logprobs"].is_null()),
+        "{text}"
+    );
     assert_eq!(
         chunks.last().unwrap()["choices"][0]["finish_reason"],
         "length"
