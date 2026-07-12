@@ -1493,6 +1493,7 @@ dependencies = [
  "onnx-genai-kv",
  "onnx-genai-metadata",
  "onnx-genai-ort",
+ "onnx-genai-preprocess",
  "onnx-genai-scheduler",
  "rand 0.9.5",
  "serde_json",
