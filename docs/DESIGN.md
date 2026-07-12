@@ -1,0 +1,755 @@
+# onnx-genai Design Document
+
+**Project:** onnx-genai — A Rust inference runtime for generative AI models  
+**Author:** Justin Chu  
+**Date:** 2026-07-12  
+**Status:** Design  
+
+---
+
+## 1. Vision
+
+A Rust-native generative AI runtime built on ONNX Runtime, implementing the inference metadata standard proposed in [onnx/onnx#8184](https://github.com/onnx/onnx/issues/8184). This project serves as both:
+
+1. **Reference implementation** of the ONNX inference metadata spec (proving the standard is implementable and useful)
+2. **Production-quality alternative** to onnxruntime-genai (C++) — with memory safety, modern concurrency, and clean architecture
+
+### Goals
+
+- Agent-first: multi-turn, long-context, concurrent inference as the primary workload
+- Safe: Rust ownership model guarantees KV cache lifecycle, no use-after-free, no data races in the scheduler
+- Modular: each component (KV cache, scheduler, pipeline, speculative) is independently usable and testable
+- Standard-driven: behavior derived from inference metadata declarations, not hardcoded model-type dispatch
+- ORT as execution backend: delegate all NN computation to ONNX Runtime; this project manages everything above the session level
+
+### Non-Goals
+
+- Writing custom CUDA/Metal kernels (ORT handles this via Execution Providers)
+- Replacing ORT's graph optimization or operator implementation
+- Supporting non-ONNX model formats (use Mobius to generate ONNX models)
+- Building a training framework
+
+---
+
+## 2. Architecture Overview
+
+```
+┌─────────────────────────────────────────────────────┐
+│                   Public API Layer                    │
+│  ┌───────────────────┐  ┌────────────────────────┐  │
+│  │ OpenAI-compatible │  │ Rust native API        │  │
+│  │ HTTP server       │  │ (library crate)        │  │
+│  └───────────────────┘  └────────────────────────┘  │
+├─────────────────────────────────────────────────────┤
+│                 Generation Engine                     │
+│  ┌──────────┐ ┌────────────┐ ┌───────────────────┐ │
+│  │Scheduler │ │ Speculative│ │ Logit Processors  │ │
+│  │          │ │ Decoding   │ │ (chain)           │ │
+│  └──────────┘ └────────────┘ └───────────────────┘ │
+├─────────────────────────────────────────────────────┤
+│                 Memory Management                     │
+│  ┌──────────────────┐ ┌──────────────────────────┐  │
+│  │ KV Cache Manager │ │ Prefix Cache (trie)      │  │
+│  │ (paged, tiered)  │ │                          │  │
+│  └──────────────────┘ └──────────────────────────┘  │
+├─────────────────────────────────────────────────────┤
+│                 Model Management                      │
+│  ┌──────────────────┐ ┌──────────────────────────┐  │
+│  │ Inference Meta   │ │ Pipeline Orchestrator    │  │
+│  │ Parser/Validator │ │ (multi-model)            │  │
+│  └──────────────────┘ └──────────────────────────┘  │
+├─────────────────────────────────────────────────────┤
+│                 Backend Layer                         │
+│  ┌──────────────────┐ ┌──────────────────────────┐  │
+│  │ ORT Session Mgr  │ │ HF Tokenizers           │  │
+│  │ (ort crate)      │ │ (tokenizers crate)      │  │
+│  └──────────────────┘ └──────────────────────────┘  │
+└─────────────────────────────────────────────────────┘
+```
+
+---
+
+## 3. Core Components
+
+### 3.1 Inference Metadata Parser
+
+**Responsibility:** Parse, validate, and provide access to the model's inference metadata (the spec from onnx/onnx#8184).
+
+**Input:** `inference_metadata.yaml` (or JSON) shipped alongside the model's `.onnx` files and `tokenizer.json`.
+
+**Key behaviors:**
+- Parse all spec sections (capabilities, kv_cache, quantization, pipeline, strategy, structured_output, hardware_profile)
+- Validate `required_capabilities` against runtime's supported capability set → fast-fail with clear error
+- Handle unknown fields gracefully (ignore, per spec's forward-compatibility rule)
+- Resolve `fallback_behavior` for unknown enum values
+- Provide typed Rust structs for each section
+
+```rust
+pub struct InferenceMetadata {
+    pub model: ModelCapabilities,
+    pub kv_cache: Option<KvCacheSpec>,
+    pub quantization: Option<QuantizationIntent>,
+    pub pipeline: Option<PipelineSpec>,
+    pub strategy: Option<StrategySpec>,
+    pub structured_output: Option<StructuredOutputSpec>,
+    pub hardware_requirements: Option<HardwareRequirements>,
+    pub required_capabilities: Vec<String>,
+}
+
+impl InferenceMetadata {
+    pub fn load(path: &Path) -> Result<Self, MetadataError>;
+    pub fn validate_against(&self, runtime_caps: &RuntimeCapabilities) -> Result<(), Vec<UnsupportedCapability>>;
+}
+```
+
+### 3.2 KV Cache Manager
+
+**Responsibility:** Manage KV cache memory with paged allocation, tiered storage, and Copy-on-Write semantics.
+
+**This is the most critical component for agent workloads.**
+
+#### 3.2.1 Page Table
+
+```rust
+/// A page holds KV tensors for a fixed number of tokens (e.g., 16 tokens per page)
+pub struct Page {
+    id: PageId,
+    key: Tensor,          // [num_heads, page_size, head_dim]
+    value: Tensor,        // [num_heads, page_size, head_dim]
+    ref_count: AtomicU32, // for CoW sharing
+    device: Device,       // GPU | CPU | Disk
+}
+
+pub struct PageTable {
+    /// Logical sequence → ordered list of physical pages
+    sequences: HashMap<SequenceId, Vec<PageId>>,
+    /// Physical page pool
+    pages: Slab<Page>,
+    /// Free page list per device tier
+    free_lists: HashMap<Device, VecDeque<PageId>>,
+    /// Page size in tokens
+    page_size: usize,
+}
+```
+
+#### 3.2.2 Operations (from spec §4c)
+
+```rust
+pub trait KvCacheOps {
+    /// Truncate cache to position. O(pages_removed), not O(sequence_length).
+    fn rewind_to(&mut self, seq: SequenceId, position: usize) -> Result<()>;
+    
+    /// Fork a sequence with CoW. Shared pages get ref_count++, no copy.
+    fn fork(&mut self, source: SequenceId, position: usize) -> Result<SequenceId>;
+    
+    /// Save cache state for later restore.
+    fn checkpoint(&self, seq: SequenceId) -> Result<CacheCheckpoint>;
+    fn restore(&mut self, seq: SequenceId, checkpoint: CacheCheckpoint) -> Result<()>;
+    
+    /// Append new KV entries (after a forward pass).
+    fn append(&mut self, seq: SequenceId, key: Tensor, value: Tensor) -> Result<()>;
+    
+    /// Evict pages to a lower tier (GPU→CPU→Disk) based on policy.
+    fn evict(&mut self, policy: EvictionPolicy, target_free_pages: usize) -> Result<usize>;
+    
+    /// Prefetch pages from lower tier back to GPU.
+    fn prefetch(&mut self, seq: SequenceId, range: Range<usize>) -> Result<()>;
+}
+```
+
+#### 3.2.3 Tiered Storage
+
+```
+GPU HBM (hot)  ←→  CPU RAM (warm)  ←→  SSD (cold)
+     ↑                    ↑                  ↑
+  active gen         paused session      suspended session
+```
+
+Eviction policy options (configured per-model via metadata):
+- **LRU** — least recently accessed page gets evicted
+- **Priority** — lower-priority sequences evict first
+- **Layer-aware** — metadata's `sensitive_layers` keeps those on GPU
+
+#### 3.2.4 Quantized KV Cache
+
+Per metadata spec, support runtime KV quantization:
+```rust
+pub struct KvQuantConfig {
+    pub key_dtype: DataType,      // from metadata.kv_cache.quantization_tolerance.key
+    pub value_dtype: DataType,
+    pub sensitive_layers: Vec<usize>,  // keep these at native precision
+}
+```
+
+Quantize on write (when appending to cache), dequantize on read (when feeding to attention). Sensitive layers bypass quantization.
+
+### 3.3 Prefix Cache
+
+**Responsibility:** Detect and share common prefixes across sequences to avoid redundant computation.
+
+**Data structure:** Radix tree (trie) keyed by token sequences.
+
+```rust
+pub struct PrefixCache {
+    root: TrieNode,
+}
+
+struct TrieNode {
+    /// Token at this node
+    token: Option<TokenId>,
+    /// Children keyed by next token
+    children: HashMap<TokenId, Box<TrieNode>>,
+    /// Cached KV pages for the prefix ending here
+    kv_pages: Option<Vec<PageId>>,
+    /// How many active sequences share this prefix
+    ref_count: usize,
+}
+
+impl PrefixCache {
+    /// Find longest cached prefix for a token sequence.
+    /// Returns (prefix_length, page_ids) — caller can skip prefill for these tokens.
+    pub fn lookup(&self, tokens: &[TokenId]) -> (usize, Vec<PageId>);
+    
+    /// Insert a computed prefix into the cache.
+    pub fn insert(&mut self, tokens: &[TokenId], pages: Vec<PageId>);
+    
+    /// Evict least-used prefixes to free pages.
+    pub fn evict_lru(&mut self, target_pages: usize) -> Vec<PageId>;
+}
+```
+
+**Agent scenario:** All sessions sharing the same system prompt → first `lookup` returns the full system prompt's KV → skip that prefill entirely on subsequent requests.
+
+### 3.4 Scheduler
+
+**Responsibility:** Decide which sequences to run, when, and in what batch — managing GPU resources across concurrent requests.
+
+#### 3.4.1 Request Lifecycle
+
+```
+Arriving → Queued → Prefilling → Generating → Completed
+                         ↓              ↓
+                    Preempted ←──── Preempted
+                         ↓
+                    Swapped (KV on CPU)
+```
+
+#### 3.4.2 Scheduling Policy
+
+```rust
+pub struct Scheduler {
+    /// Requests waiting to be processed
+    waiting: PriorityQueue<Request>,
+    /// Currently running (in the batch)
+    running: Vec<RunningSequence>,
+    /// Preempted (KV cache swapped to CPU)
+    swapped: Vec<SwappedSequence>,
+    /// Configuration
+    config: SchedulerConfig,
+}
+
+pub struct SchedulerConfig {
+    pub max_batch_size: usize,
+    pub max_total_tokens: usize,       // total KV budget across all sequences
+    pub preemption_policy: PreemptionPolicy,  // recompute | swap
+    pub priority_policy: PriorityPolicy,      // fcfs | priority | fair_share
+}
+
+impl Scheduler {
+    /// Called each iteration: decide what to run next.
+    /// Returns: sequences to prefill, sequences to decode, sequences to preempt.
+    pub fn schedule(&mut self) -> ScheduleDecision;
+}
+
+pub struct ScheduleDecision {
+    pub prefill: Vec<PrefillRequest>,   // new sequences entering the batch
+    pub decode: Vec<DecodeRequest>,     // continuing generation
+    pub preempt: Vec<SequenceId>,       // kick out to make room
+    pub swap_in: Vec<SequenceId>,       // bring back from CPU
+}
+```
+
+#### 3.4.3 Continuous Batching
+
+Each scheduling iteration:
+1. Completed sequences leave the batch (free their pages)
+2. Preempted sequences swap out if memory pressure
+3. New sequences enter if budget allows
+4. All active sequences get one decode step together
+
+This means different sequences can be at different positions — no padding waste.
+
+### 3.5 Speculative Decoding Engine
+
+**Responsibility:** Implement the parameterized speculative decoding loop based on metadata's `strategy` spec.
+
+```rust
+pub struct SpeculativeEngine {
+    pub config: SpeculativeConfig,
+}
+
+pub struct SpeculativeConfig {
+    pub producer: DraftProducer,
+    pub acceptance: AcceptanceRule,
+    pub tokens_per_step: usize,    // K
+    pub topology: Topology,         // Linear | Tree
+}
+
+pub enum DraftProducer {
+    DraftModel { session: OrtSession },
+    SelfSpeculative { depth: usize },
+    Ngram { min_match: usize, max_draft: usize, window: usize },
+    ExtraHeads { head_name: String },
+}
+
+pub enum AcceptanceRule {
+    Greedy,
+    RejectionSampling,
+    Typical { threshold: f32 },
+}
+
+impl SpeculativeEngine {
+    /// Run one speculative step:
+    /// 1. Draft K tokens using producer
+    /// 2. Verify all K in one target forward pass
+    /// 3. Accept/reject using acceptance rule
+    /// 4. Rewind KV cache for rejected tokens
+    /// Returns: accepted tokens (1..=K+1)
+    pub fn step(
+        &self,
+        target_session: &OrtSession,
+        kv_cache: &mut dyn KvCacheOps,
+        sequence: &mut Sequence,
+    ) -> Result<Vec<TokenId>>;
+}
+```
+
+**KV rollback integration:** After rejection, `kv_cache.rewind_to(seq, accepted_position)` — this is why paged KV with O(1) rewind matters.
+
+### 3.6 Logit Processor Chain
+
+**Responsibility:** Apply ordered transformations to logits before sampling.
+
+```rust
+pub trait LogitProcessor: Send + Sync {
+    fn process(&self, logits: &mut [f32], context: &ProcessorContext);
+    fn name(&self) -> &str;
+}
+
+pub struct ProcessorChain {
+    processors: Vec<Box<dyn LogitProcessor>>,
+}
+
+// Built-in processors:
+pub struct TemperatureProcessor { temperature: f32 }
+pub struct TopPProcessor { top_p: f32 }
+pub struct TopKProcessor { top_k: usize }
+pub struct RepetitionPenaltyProcessor { penalty: f32 }
+pub struct FrequencyPenaltyProcessor { penalty: f32 }
+pub struct PresencePenaltyProcessor { penalty: f32 }
+pub struct GrammarProcessor { grammar: CompiledGrammar }  // for structured output
+pub struct StopSequenceProcessor { sequences: Vec<Vec<TokenId>> }
+```
+
+Order matters (configured via metadata or API):
+1. Repetition/frequency/presence penalties
+2. Grammar constraint (mask invalid tokens)
+3. Temperature scaling
+4. Top-K filtering
+5. Top-P (nucleus) filtering
+
+### 3.7 Pipeline Orchestrator
+
+**Responsibility:** Execute multi-model pipelines as declared in metadata's `pipeline` spec.
+
+```rust
+pub struct Pipeline {
+    pub models: HashMap<String, ModelHandle>,
+    pub dataflow: Vec<DataflowEdge>,
+    pub phases: HashMap<String, PhaseConfig>,
+}
+
+pub struct DataflowEdge {
+    pub from_model: String,
+    pub from_output: String,
+    pub to_model: String,
+    pub to_input: String,
+    pub dtype: DataType,
+    pub device_transfer: bool,
+}
+
+pub enum Phase {
+    PromptOnly,  // run once on initial input
+    Always,      // run every step
+    FinalOnly,   // run only when generating final output
+}
+
+impl Pipeline {
+    /// Execute the pipeline for one step, respecting phase gating and dataflow.
+    pub fn step(&mut self, phase: CurrentPhase, inputs: &Inputs) -> Result<Outputs>;
+}
+```
+
+**Example:** Vision-Language Model
+1. Phase=PromptOnly: Run CLIP encoder → image_features
+2. Phase=Always: Feed (text + image_features) to decoder → generate tokens
+3. Dataflow edge: `clip.image_features` → `decoder.encoder_hidden_states`
+
+### 3.8 ORT Session Manager
+
+**Responsibility:** Manage ORT InferenceSession lifecycle, I/O binding, and device placement.
+
+```rust
+pub struct SessionManager {
+    env: Arc<ort::Environment>,
+    sessions: HashMap<String, OrtSession>,
+}
+
+pub struct OrtSession {
+    session: ort::Session,
+    io_binding: Option<ort::IoBinding>,
+    device: Device,
+    metadata: SessionMetadata,
+}
+
+impl SessionManager {
+    /// Load a model from ONNX file with specified execution provider.
+    pub fn load(&mut self, name: &str, path: &Path, device: Device) -> Result<()>;
+    
+    /// Run inference with pre-bound I/O (avoids host↔device copies).
+    pub fn run(&self, name: &str, inputs: &IoBindings) -> Result<Outputs>;
+    
+    /// Unload a model to free resources.
+    pub fn unload(&mut self, name: &str) -> Result<()>;
+}
+```
+
+---
+
+## 4. Data Flow: A Single Generation Step
+
+```
+1. Scheduler.schedule()
+   → decides which sequences to decode this iteration
+
+2. For each sequence in batch:
+   a. KvCacheManager provides page table mapping
+   b. Construct attention mask from page table
+   c. Bind inputs to ORT session (input_ids, attention_mask, KV pages)
+
+3. ORT session.run()
+   → returns logits [batch_size, vocab_size]
+
+4. LogitProcessorChain.process(logits)
+   → apply penalties, grammar mask, temperature, top-p/k
+
+5. Sample token(s) from processed logits
+
+6. For each sequence:
+   a. KvCacheManager.append(new KV from this step)
+   b. Check stop conditions
+   c. If done: notify scheduler, free pages
+   d. If speculative: run verify loop, rewind rejected
+
+7. Yield generated tokens to streaming response
+```
+
+---
+
+## 5. Concurrency Model
+
+```rust
+// Main generation loop runs on a dedicated thread
+// API requests come in via async (tokio)
+// Communication via channels
+
+pub struct Engine {
+    /// Async → Engine: new requests, cancellations
+    request_rx: mpsc::Receiver<EngineRequest>,
+    /// Engine → Async: streaming tokens, completion
+    response_tx: broadcast::Sender<EngineResponse>,
+    /// Core components (owned by engine thread, no sharing)
+    scheduler: Scheduler,
+    kv_cache: KvCacheManager,
+    prefix_cache: PrefixCache,
+    session_mgr: SessionManager,
+}
+
+impl Engine {
+    /// Main loop: runs on its own thread, processes one batch per iteration.
+    pub fn run_loop(&mut self) {
+        loop {
+            // Drain incoming requests
+            self.process_new_requests();
+            // Schedule
+            let decision = self.scheduler.schedule();
+            // Execute batch
+            self.execute_batch(decision);
+            // Stream results back
+            self.emit_tokens();
+        }
+    }
+}
+```
+
+**Key design choice:** The engine owns all mutable state (KV cache, scheduler, sessions) on a single thread. No locks needed. API layer is async (tokio) and communicates via channels. This is the pattern used by vLLM's engine and avoids the complexity of fine-grained locking.
+
+---
+
+## 6. Model Directory Structure
+
+```
+model_dir/
+├── inference_metadata.yaml    # The standard metadata spec
+├── tokenizer.json             # HF tokenizers format
+├── decoder.onnx               # Main decoder model (from Mobius)
+├── decoder_data/              # External weights (if model is >2GB)
+│   ├── weights_0.safetensors
+│   └── weights_1.safetensors
+├── vision_encoder.onnx        # Optional: for VLMs
+└── draft_model.onnx           # Optional: for speculative decoding
+```
+
+`inference_metadata.yaml` is the single source of truth for how to load and run the model. No hardcoded `model_type` string dispatch.
+
+---
+
+## 7. Crate Structure
+
+```
+onnx-genai/
+├── Cargo.toml                 # workspace
+├── crates/
+│   ├── onnx-genai/            # Main library crate (re-exports everything)
+│   │   ├── src/lib.rs
+│   │   └── Cargo.toml
+│   ├── onnx-genai-metadata/   # Inference metadata parser + types
+│   │   ├── src/
+│   │   │   ├── lib.rs
+│   │   │   ├── schema.rs      # Typed structs for all spec sections
+│   │   │   ├── parser.rs      # YAML/JSON parsing + validation
+│   │   │   └── validation.rs  # required_capabilities check
+│   │   └── Cargo.toml
+│   ├── onnx-genai-kv/         # KV cache manager
+│   │   ├── src/
+│   │   │   ├── lib.rs
+│   │   │   ├── page_table.rs
+│   │   │   ├── paged_cache.rs
+│   │   │   ├── prefix_cache.rs
+│   │   │   ├── tiered.rs      # GPU→CPU→Disk eviction
+│   │   │   └── quantized.rs   # KV quantization
+│   │   └── Cargo.toml
+│   ├── onnx-genai-scheduler/  # Continuous batching scheduler
+│   │   ├── src/
+│   │   │   ├── lib.rs
+│   │   │   ├── scheduler.rs
+│   │   │   ├── policy.rs      # FCFS, priority, fair-share
+│   │   │   └── preemption.rs
+│   │   └── Cargo.toml
+│   ├── onnx-genai-engine/     # Generation engine (ties everything together)
+│   │   ├── src/
+│   │   │   ├── lib.rs
+│   │   │   ├── engine.rs      # Main loop
+│   │   │   ├── speculative.rs
+│   │   │   ├── pipeline.rs    # Multi-model orchestration
+│   │   │   ├── logits.rs      # Logit processor chain
+│   │   │   └── sampling.rs
+│   │   └── Cargo.toml
+│   └── onnx-genai-server/     # OpenAI-compatible HTTP server
+│       ├── src/
+│       │   ├── main.rs
+│       │   ├── routes.rs      # /v1/chat/completions, /v1/completions
+│       │   ├── streaming.rs   # SSE streaming
+│       │   └── models.rs      # Request/response types
+│       └── Cargo.toml
+├── tests/
+│   ├── integration/           # End-to-end tests with tiny models
+│   └── fixtures/              # Test model dirs with metadata
+├── docs/
+│   ├── DESIGN.md              # This file
+│   ├── ARCHITECTURE.md        # Component interaction diagrams
+│   └── METADATA_SPEC.md       # Local copy of the spec
+└── README.md
+```
+
+---
+
+## 8. Dependencies
+
+| Crate | Purpose | Version |
+|---|---|---|
+| `ort` | ONNX Runtime Rust bindings | latest |
+| `tokenizers` | HuggingFace tokenizers | latest |
+| `tokio` | Async runtime for HTTP server | 1.x |
+| `axum` | HTTP framework (for OpenAI-compatible API) | 0.7+ |
+| `serde` + `serde_yaml` + `serde_json` | Metadata parsing | latest |
+| `tracing` | Structured logging | latest |
+| `thiserror` | Error types | latest |
+
+---
+
+## 9. API Surface
+
+### 9.1 Library API (Rust)
+
+```rust
+use onnx_genai::{Engine, EngineConfig, GenerateRequest, GenerateStream};
+
+// Load model
+let engine = Engine::from_dir("./models/phi-4/", EngineConfig::default())?;
+
+// Generate (streaming)
+let request = GenerateRequest {
+    messages: vec![Message::user("What is 2+2?")],
+    max_tokens: 100,
+    temperature: 0.7,
+    ..Default::default()
+};
+
+let mut stream = engine.generate(request)?;
+while let Some(token) = stream.next().await {
+    print!("{}", token.text);
+}
+```
+
+### 9.2 HTTP API (OpenAI-compatible)
+
+```bash
+curl http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "phi-4",
+    "messages": [{"role": "user", "content": "Hello"}],
+    "stream": true
+  }'
+```
+
+### 9.3 Multi-session (Agent) API
+
+```rust
+// Create a session (KV cache persists across calls)
+let session = engine.create_session("phi-4")?;
+
+// First turn
+let response1 = session.generate("You are a helpful assistant. What is 2+2?").await?;
+
+// Second turn — prefix cache kicks in, only new tokens computed
+let response2 = session.generate("Now multiply that by 3").await?;
+
+// Fork a session (CoW — cheap, shares prefix KV)
+let branch = session.fork()?;
+let alt_response = branch.generate("Actually, divide by 2 instead").await?;
+```
+
+---
+
+## 10. Implementation Phases
+
+### Phase 1: Foundation (Target: working end-to-end for a single model)
+
+- [ ] Workspace + crate scaffold
+- [ ] Inference metadata parser (`onnx-genai-metadata`)
+- [ ] ORT session loading + basic forward pass
+- [ ] Tokenizer integration (HF tokenizers crate)
+- [ ] Simple KV cache (non-paged, single sequence)
+- [ ] Greedy generation loop
+- [ ] Basic logit processors (temperature, top-p, stop sequences)
+- [ ] CLI: `onnx-genai generate --model ./path "prompt"`
+
+**Exit criteria:** Can load a Phi-4 ONNX model (from Mobius) and generate text greedily, end-to-end.
+
+### Phase 2: Agent Essentials
+
+- [ ] Paged KV cache (page table, free list, append/rewind)
+- [ ] Prefix cache (radix trie, lookup, insert)
+- [ ] Multi-session support (persistent KV across turns)
+- [ ] CoW fork
+- [ ] Continuous batching scheduler (basic FCFS)
+- [ ] OpenAI-compatible HTTP server with streaming
+
+**Exit criteria:** Can serve multiple concurrent chat sessions with prefix sharing. Second turn in same session is measurably faster (prefix cache hit).
+
+### Phase 3: Performance
+
+- [ ] Speculative decoding (draft model + greedy acceptance first)
+- [ ] Tiered KV storage (GPU→CPU eviction under pressure)
+- [ ] Priority-based scheduling + preemption
+- [ ] KV cache quantization (fp8)
+- [ ] Token streaming with early stopping
+
+**Exit criteria:** Speculative decoding shows >1.5× speedup. System handles 10+ concurrent sessions without OOM.
+
+### Phase 4: Pipeline + Advanced
+
+- [ ] Multi-model pipeline orchestration
+- [ ] Vision-language model support (image encoder + decoder)
+- [ ] Grammar/JSON constrained decoding
+- [ ] Rejection sampling acceptance rule
+- [ ] Tree-structured speculative decoding
+- [ ] Hardware profile matching
+
+**Exit criteria:** Can run a VLM pipeline (CLIP + decoder) end-to-end via inference metadata declaration.
+
+---
+
+## 11. Testing Strategy
+
+### Unit Tests
+- Metadata parsing: valid/invalid/forward-compatible schemas
+- KV cache: page allocation, rewind, fork, eviction, quantization
+- Prefix cache: lookup, insert, LRU eviction
+- Scheduler: policy decisions, preemption triggers
+- Logit processors: each processor in isolation + chain ordering
+
+### Integration Tests
+- End-to-end generation with a tiny model (2-layer transformer, committed as test fixture)
+- Multi-turn session with prefix cache validation
+- Concurrent sessions via HTTP API
+- Speculative decoding correctness (greedy spec == greedy baseline, token-for-token)
+
+### Benchmarks
+- Tokens/sec (single stream, batched)
+- Time-to-first-token (TTFT)
+- Prefix cache hit rate
+- Memory utilization (pages allocated vs wasted)
+- Speculative acceptance rate
+
+---
+
+## 12. Key Design Decisions
+
+| Decision | Choice | Rationale |
+|---|---|---|
+| Language | Rust | Memory safety for KV management, zero-cost concurrency, learning goal, portfolio value |
+| NN backend | ORT (via `ort` crate) | Leverages existing EP ecosystem, don't rewrite kernels |
+| Model format | ONNX (generated by Mobius) | Standard format, ORT native |
+| Tokenizer | HF `tokenizers` crate | Rust native, battle-tested, same format as model ships with |
+| HTTP framework | Axum | Performant, ergonomic, tokio-native |
+| Concurrency | Single engine thread + async API | Avoids lock contention on hot path; proven pattern (vLLM) |
+| Config format | YAML (inference_metadata.yaml) | Human-readable, good Rust serde support |
+| KV page size | 16 tokens (configurable) | Balances fragmentation vs waste; matches vLLM default |
+
+---
+
+## 13. Relationship to Existing Projects
+
+| Project | Relationship |
+|---|---|
+| **onnxruntime-genai** (C++) | This is the Rust alternative. Same scope, different implementation philosophy. |
+| **ORT** | Backend dependency. We call ORT sessions; we don't modify or replace ORT. |
+| **Mobius** | Model generation tool. Produces the ONNX models we consume. |
+| **onnx/onnx#8184** | The spec this project implements. This is the reference implementation. |
+| **vLLM** | Architectural inspiration (PagedAttention, continuous batching, scheduler design). |
+| **HuggingFace tokenizers** | Direct dependency for tokenization. |
+
+---
+
+## 14. Open Questions
+
+1. **IO Binding vs. Manual Tensor Management** — ORT's `IoBinding` API allows pre-allocating device buffers and avoiding copies. How deeply should we integrate with it? (Likely: deeply, it's the key to avoiding host↔device round-trips for KV cache.)
+
+2. **KV Cache in ORT Session** — ORT sessions typically manage their own state. For paged KV, we need to pass page pointers as inputs. This requires the ONNX model to expose KV as explicit inputs/outputs (which Mobius models do), not hidden internal state.
+
+3. **Multi-GPU** — Phase 1-3 target single GPU. Multi-GPU (tensor parallel) requires splitting model and KV cache across devices. Defer to Phase 4+, but design page table to support multi-device from day one.
+
+4. **Benchmarking Baseline** — Compare against onnxruntime-genai (C++) on same model + same hardware to demonstrate competitive performance despite Rust overhead (expect: minimal difference since hot path is in ORT/CUDA).

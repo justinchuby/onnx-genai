@@ -1,0 +1,11 @@
+[package]
+name = "onnx-genai-scheduler"
+description = "Continuous batching scheduler with preemption"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+onnx-genai-kv = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }

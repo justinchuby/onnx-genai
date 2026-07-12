@@ -1,0 +1,12 @@
+[package]
+name = "onnx-genai"
+description = "Rust inference runtime for generative AI models on ONNX Runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+onnx-genai-metadata = { workspace = true }
+onnx-genai-kv = { workspace = true }
+onnx-genai-scheduler = { workspace = true }
+onnx-genai-engine = { workspace = true }

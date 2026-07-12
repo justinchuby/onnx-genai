@@ -1,0 +1,37 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/onnx-genai",
+    "crates/onnx-genai-metadata",
+    "crates/onnx-genai-kv",
+    "crates/onnx-genai-scheduler",
+    "crates/onnx-genai-engine",
+    "crates/onnx-genai-server",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+authors = ["Justin Chu"]
+repository = "https://github.com/justinchuby/onnx-genai"
+
+[workspace.dependencies]
+# Internal crates
+onnx-genai-metadata = { path = "crates/onnx-genai-metadata" }
+onnx-genai-kv = { path = "crates/onnx-genai-kv" }
+onnx-genai-scheduler = { path = "crates/onnx-genai-scheduler" }
+onnx-genai-engine = { path = "crates/onnx-genai-engine" }
+
+# External
+ort = "2.0.0-rc.12"
+tokenizers = "0.21"
+tokio = { version = "1", features = ["full"] }
+axum = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+thiserror = "2"
+anyhow = "1"

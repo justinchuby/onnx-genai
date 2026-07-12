@@ -1,0 +1,11 @@
+[package]
+name = "onnx-genai-kv"
+description = "Paged KV cache manager with tiered storage and prefix sharing"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+onnx-genai-metadata = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
