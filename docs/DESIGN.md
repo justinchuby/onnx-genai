@@ -7340,3 +7340,390 @@ onnx_genai_kv_gather_bytes_total         counter   # bytes gathered for model in
 onnx_genai_kv_gather_seconds             histogram # gather time per forward pass
 onnx_genai_kv_scatter_bytes_total        counter   # bytes scattered after forward
 ```
+
+---
+
+## 40. Sliding Window Attention & Long Context on Limited Hardware
+
+### 40.1 The Problem
+
+Agentic coding on PC requires long effective context but limited VRAM:
+
+```
+Full attention KV for 128K context (Llama 3 8B, FP16):
+= 128K tokens × 32 layers × 2(K+V) × 8 heads × 128 dim × 2 bytes
+≈ 16 GB  (just KV, before model weights)
+
+Typical PC GPU: 8-12 GB total
+```
+
+Paged attention reduces fragmentation but doesn't reduce total KV size.
+We need strategies that reduce the amount of KV that must live in GPU memory.
+
+### 40.2 Sliding Window Attention (SWA)
+
+Models like Gemma 2, Mistral, and Phi-3 use sliding window attention during training:
+each token only attends to the most recent W tokens (e.g., W=4096 or W=8192).
+
+**Implication for KV cache:** We only need to keep W tokens of KV in memory, regardless of total sequence length.
+
+```rust
+/// Sliding window KV cache configuration.
+/// Only the most recent `window_size` tokens' KV are kept per layer.
+pub struct SlidingWindowConfig {
+    /// Window size in tokens. KV older than this is discarded.
+    /// Set by model architecture (from inference_metadata.yaml).
+    pub window_size: usize,
+    
+    /// Whether to keep "attention sink" tokens at the start.
+    /// StreamingLLM showed first few tokens stabilize attention distribution.
+    pub sink_tokens: usize,  // typically 4-8
+}
+```
+
+**How it works in our paged cache:**
+
+```rust
+impl PagedKvCache {
+    /// After each decode step, evict pages that fell out of the window.
+    /// This is automatic — no explicit eviction call needed from the engine.
+    pub fn apply_sliding_window(&mut self, session: &SessionId, config: &SlidingWindowConfig) {
+        let total_tokens = self.session_length(session);
+        let keep_start = config.sink_tokens;
+        let keep_from = total_tokens.saturating_sub(config.window_size);
+        
+        // Pages entirely before the window (and after sink) can be freed
+        let pages_to_free: Vec<PageId> = self.session_pages(session)
+            .iter()
+            .enumerate()
+            .filter(|(idx, _)| {
+                let token_start = idx * PAGE_SIZE;
+                let token_end = token_start + PAGE_SIZE;
+                // Free if: past sink AND entirely before window
+                token_start >= keep_start && token_end <= keep_from
+            })
+            .map(|(_, &page_id)| page_id)
+            .collect();
+        
+        for page_id in pages_to_free {
+            self.free_page(page_id);
+        }
+    }
+}
+```
+
+**Memory usage with SWA:**
+```
+Window=4096, page_size=16:
+Pages per session = (4096 + sink_tokens) / 16 = 256 pages + 1 sink page
+Per-session KV = 257 × 16 tokens × 32 layers × 2 × 8 × 128 × 2 bytes
+              ≈ 512 MB (FP16)
+              ≈ 256 MB (FP8 quantized)
+
+On 8GB GPU with 4B Q4 model (~2.5GB):
+Available for KV: ~5 GB
+Concurrent sessions: 5GB / 256MB ≈ 19 sessions (FP8 + SWA)
+```
+
+### 40.3 Hybrid Attention Patterns (Gemma 2 / Gemma 4 Style)
+
+Modern models don't use pure SWA — they interleave:
+
+```
+Layer 0:  sliding window (W=4096)    ← local attention
+Layer 1:  full attention              ← global attention
+Layer 2:  sliding window (W=4096)
+Layer 3:  full attention
+...
+```
+
+**Impact on KV cache:** Different layers need different amounts of KV stored.
+
+```rust
+/// Per-layer attention pattern (from model config).
+pub enum LayerAttentionPattern {
+    /// Full attention: must keep all KV for this layer.
+    Full,
+    /// Sliding window: only keep last W tokens.
+    SlidingWindow { window_size: usize },
+    /// Local + global hybrid with stride.
+    Strided { local_window: usize, global_stride: usize },
+}
+
+/// Model-level attention configuration.
+pub struct AttentionConfig {
+    /// Per-layer pattern. Length == num_layers.
+    pub layers: Vec<LayerAttentionPattern>,
+    /// Sink tokens kept for all layers.
+    pub sink_tokens: usize,
+}
+```
+
+```yaml
+# inference_metadata.yaml for Gemma 2 style
+attention:
+  sink_tokens: 4
+  layers:
+    # Alternating: even=sliding, odd=full
+    - pattern: sliding_window
+      window_size: 4096
+    - pattern: full
+    - pattern: sliding_window
+      window_size: 4096
+    - pattern: full
+    # ... repeating for all 32 layers
+    
+  # Shorthand (equivalent):
+  layer_pattern: alternating
+  sliding_window_size: 4096
+  full_every_n: 2    # every 2nd layer is full attention
+```
+
+**Memory with hybrid (16 sliding + 16 full layers, 32K context):**
+```
+Sliding layers (16): 4096 tokens × 16 layers = 65K token-layers
+Full layers (16):    32768 tokens × 16 layers = 524K token-layers
+Total: 589K token-layers
+
+vs pure full: 32768 × 32 = 1048K token-layers
+Saving: 44% less KV memory
+```
+
+### 40.4 Attention Sink (StreamingLLM)
+
+First few tokens get disproportionate attention regardless of content. Discarding them destabilizes generation:
+
+```
+Token positions:  [0, 1, 2, 3] ... [seq_len - W, ..., seq_len]
+                   └─ sinks ─┘     └──── sliding window ────┘
+                   Always kept      Most recent W tokens
+                   
+Tokens in between: KV discarded (not attended)
+```
+
+```rust
+/// StreamingLLM-style KV layout.
+pub struct StreamingKvLayout {
+    /// Sink pages (always first few pages, never evicted).
+    sink_pages: Vec<PageId>,
+    /// Rolling window pages (circular buffer of most recent).
+    window_pages: VecDeque<PageId>,
+    /// Maximum window pages.
+    max_window_pages: usize,
+}
+
+impl StreamingKvLayout {
+    /// Add new token's KV. If window full, evict oldest window page.
+    pub fn push_page(&mut self, page_id: PageId) -> Option<PageId> {
+        if self.window_pages.len() >= self.max_window_pages {
+            let evicted = self.window_pages.pop_front();
+            self.window_pages.push_back(page_id);
+            evicted  // return freed page
+        } else {
+            self.window_pages.push_back(page_id);
+            None
+        }
+    }
+    
+    /// Get all pages for attention (sinks + window).
+    pub fn active_pages(&self) -> impl Iterator<Item = &PageId> {
+        self.sink_pages.iter().chain(self.window_pages.iter())
+    }
+    
+    /// Actual token count attended (for position encoding).
+    pub fn attended_length(&self) -> usize {
+        (self.sink_pages.len() + self.window_pages.len()) * PAGE_SIZE
+    }
+}
+```
+
+### 40.5 Selective KV Retention (H2O / Scissorhands / Landmark)
+
+Beyond simple windowing — keep "important" tokens based on attention scores:
+
+```rust
+/// Importance-based KV eviction.
+/// Keep tokens that historically received high attention scores.
+pub enum SelectiveRetentionPolicy {
+    /// Heavy Hitter Oracle (H2O): keep top-k attended tokens + recent window.
+    HeavyHitter {
+        /// Number of "landmark" tokens to keep (highest cumulative attention).
+        num_landmarks: usize,
+        /// Recent window to always keep.
+        recent_window: usize,
+    },
+    /// Fixed budget: keep exactly N tokens total, evict lowest-attention ones.
+    FixedBudget {
+        max_tokens: usize,
+    },
+}
+
+/// Per-token attention accumulator (for H2O).
+pub struct AttentionAccumulator {
+    /// Cumulative attention score received by each token position.
+    scores: Vec<f32>,
+}
+
+impl AttentionAccumulator {
+    /// After each attention layer, accumulate scores.
+    /// attention_weights: [heads, seq_len] — sum of attention this token received.
+    pub fn update(&mut self, attention_weights: &[f32]) {
+        for (i, &score) in attention_weights.iter().enumerate() {
+            if i < self.scores.len() {
+                self.scores[i] += score;
+            }
+        }
+    }
+    
+    /// Get indices of tokens to keep (top-k by score + recent window).
+    pub fn select_keep(&self, num_landmarks: usize, recent_window: usize) -> Vec<usize> {
+        let total = self.scores.len();
+        let recent_start = total.saturating_sub(recent_window);
+        
+        // Always keep recent window
+        let mut keep: Vec<usize> = (recent_start..total).collect();
+        
+        // Add top-k landmarks from older tokens
+        let mut older: Vec<(usize, f32)> = self.scores[..recent_start]
+            .iter()
+            .enumerate()
+            .map(|(i, &s)| (i, s))
+            .collect();
+        older.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        keep.extend(older.iter().take(num_landmarks).map(|(i, _)| *i));
+        
+        keep.sort();
+        keep
+    }
+}
+```
+
+**Problem:** Requires attention weights as output from ORT, which most ONNX models don't expose. This is an advanced optimization that needs model cooperation.
+
+### 40.6 The Practical PC Agentic Coding Stack
+
+For a PC with 8GB GPU running a coding agent:
+
+```yaml
+# Recommended configuration for PC agentic coding
+model:
+  # Use a model with native sliding window (Gemma 2 9B / Mistral 7B)
+  name: gemma-2-9b-it
+  quantization: Q4_K_M        # ~5GB model weights
+  
+kv_cache:
+  page_size: 16
+  # KV quantization
+  dtype: fp8                  # halves KV memory
+  
+  # Sliding window (matches model architecture)
+  attention:
+    layer_pattern: alternating
+    sliding_window_size: 8192
+    sink_tokens: 4
+    
+  # Overflow to CPU
+  overflow:
+    enabled: true
+    cpu_pool_bytes: 8589934592  # 8GB CPU pinned memory
+    # Full-attention layers overflow to CPU, loaded on demand
+    offload_full_layers: true
+
+# Agent-level context management (NOT in inference engine)
+agent:
+  # Summarize old turns to keep context short
+  context_strategy: rolling_summary
+  max_active_context: 8192    # tokens in active window
+  summary_trigger: 6000       # summarize when context exceeds this
+```
+
+**Memory budget:**
+```
+Model weights (Q4):           ~5.0 GB
+Sliding window KV (FP8):     ~0.5 GB (8K window, 16 SWA layers)
+Full-attention KV (FP8):     ~1.0 GB (8K context, 16 full layers, managed)
+Runtime + buffers:            ~0.5 GB
+─────────────────────────────────────
+Total:                        ~7.0 GB  ← fits in 8GB!
+```
+
+And the agent effectively has "infinite" context through:
+1. Sliding window handles long generation without growing memory
+2. CPU offload for full-attention layers if context exceeds GPU budget
+3. Agent-level summarization keeps active context compact
+4. Prefix sharing between tool calls (radix tree, §39)
+
+### 40.7 Integration with Existing Design
+
+| Component | How SWA integrates |
+|---|---|
+| Paged KV cache (§16) | `apply_sliding_window()` frees old pages automatically |
+| Radix tree (§39) | Shared prefix pages are still shared; window only evicts per-session suffix |
+| KV connector (§38) | Before evicting windowed-out pages, optionally offload to CPU tier |
+| Scheduler | Knows true attended length (not total generated length) for memory accounting |
+| Metrics (§31) | Track `kv_pages_evicted_window` separately from capacity eviction |
+
+### 40.8 Position Encoding with Discontinuous KV
+
+When we keep sinks + window but drop the middle, position IDs become discontinuous:
+
+```
+Kept positions: [0, 1, 2, 3, ..., 3900, 3901, ..., 8000]
+                 └─ sinks ─┘            └─── window ───┘
+                 pos 0-3                 pos 3900-8000
+                 
+Middle (pos 4-3899) discarded.
+```
+
+**RoPE models handle this correctly** — each token's positional embedding is computed from its absolute position, not its index in the KV buffer. So even with gaps, the model sees correct relative distances.
+
+```rust
+/// Compute position IDs for discontinuous KV (sinks + window).
+pub fn compute_position_ids(
+    sink_positions: &[usize],     // [0, 1, 2, 3]
+    window_start: usize,          // 3900
+    window_len: usize,            // 4100
+) -> Vec<usize> {
+    let mut positions = sink_positions.to_vec();
+    positions.extend(window_start..window_start + window_len);
+    positions
+    // Result: [0, 1, 2, 3, 3900, 3901, ..., 8000]
+    // Model's RoPE uses these actual positions, not buffer indices
+}
+```
+
+**Models with learned position embeddings** (rare now, mostly legacy) cannot do this — they need contiguous positions. But all modern models (Llama, Gemma, Mistral, Phi) use RoPE. Not a concern.
+
+### 40.9 Configuration in inference_metadata.yaml
+
+```yaml
+# Full attention config schema
+attention:
+  # Global settings
+  sink_tokens: 4                    # StreamingLLM sink (default: 4)
+  
+  # Per-layer pattern
+  layer_pattern: alternating        # uniform | alternating | custom
+  
+  # For uniform:
+  # type: full | sliding_window
+  # window_size: 4096
+  
+  # For alternating:
+  sliding_window_size: 4096
+  full_every_n: 2                   # every Nth layer is full attention
+  
+  # For custom (per-layer):
+  # layers:
+  #   - { type: sliding_window, window_size: 4096 }
+  #   - { type: full }
+  #   - ...
+  
+  # Selective retention (optional, advanced)
+  retention:
+    policy: none                    # none | heavy_hitter | fixed_budget
+    # For heavy_hitter:
+    # num_landmarks: 256
+    # For fixed_budget:
+    # max_tokens: 4096
+```
