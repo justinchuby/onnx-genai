@@ -25,7 +25,7 @@ pub type TokenId = u32;
 /// Device tier for page storage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Device {
-    Gpu(usize),  // GPU index
+    Gpu(usize), // GPU index
     Cpu,
     Disk,
 }

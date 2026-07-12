@@ -7,16 +7,20 @@
 //!
 //! Design: reference the `ort` crate (pyke) for patterns, but use latest ORT directly.
 
-pub mod env;
-pub mod session;
-pub mod value;
-pub mod binding;
 pub mod allocator;
+pub mod binding;
+pub mod env;
 pub mod error;
+pub mod loader;
+pub mod session;
+pub mod tokenizer;
+pub mod value;
 
-pub use env::Environment;
-pub use session::{Session, SessionOptions};
-pub use value::{Value, DataType};
+pub use allocator::{Allocator, AllocatorType, MemoryInfo, MemoryType};
 pub use binding::IoBinding;
-pub use allocator::{Allocator, MemoryInfo, MemoryType, AllocatorType};
+pub use env::Environment;
 pub use error::{OrtError, Result};
+pub use loader::ModelDirectory;
+pub use session::{Session, SessionOptions, TensorInfo};
+pub use tokenizer::Tokenizer;
+pub use value::{DataType, Value};
