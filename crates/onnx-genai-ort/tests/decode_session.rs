@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use onnx_genai_ort::{
     BatchedStaticCacheDecodeSession, DataType, DecodeKvMode, DecodeSession, DecodeSessionOptions,
@@ -15,10 +16,22 @@ fn tiny_scatter_llm() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm-scatter/model.onnx")
 }
 
-fn load_session() -> (Environment, Session) {
-    let env = Environment::new("decode-session-test").expect("env");
-    let session = Session::new(&env, &tiny_llm(), SessionOptions::default()).expect("session");
-    (env, session)
+fn deterministic_session_options() -> SessionOptions {
+    SessionOptions::default().with_intra_op_threads(1)
+}
+
+fn test_environment() -> &'static Environment {
+    static ENVIRONMENT: OnceLock<Environment> = OnceLock::new();
+    ENVIRONMENT.get_or_init(|| Environment::new("decode-session-test").expect("env"))
+}
+
+fn load_session() -> Session {
+    Session::new(
+        test_environment(),
+        &tiny_llm(),
+        deterministic_session_options(),
+    )
+    .expect("session")
 }
 
 #[test]
@@ -32,7 +45,7 @@ fn fp16_value_round_trips_bits() {
 
 #[test]
 fn bound_decode_logits_match_naive_repass() {
-    let (_env, session) = load_session();
+    let session = load_session();
     let tokens = [1_i64, 5, 7];
     let naive = naive_logits(&session, &tokens);
 
@@ -51,7 +64,7 @@ fn bound_decode_logits_match_naive_repass() {
 
 #[test]
 fn bound_decode_rewind_matches_replay() {
-    let (_env, session) = load_session();
+    let session = load_session();
     let mut decode =
         DecodeSession::new(&session, DecodeSessionOptions::default()).expect("decode session");
 
@@ -71,9 +84,12 @@ fn bound_decode_rewind_matches_replay() {
 
 #[test]
 fn static_cache_decode_reuses_buffers_and_rewinds_deterministically() {
-    let env = Environment::new("static-cache-decode-test").expect("env");
-    let session =
-        Session::new(&env, &tiny_scatter_llm(), SessionOptions::default()).expect("session");
+    let session = Session::new(
+        test_environment(),
+        &tiny_scatter_llm(),
+        deterministic_session_options(),
+    )
+    .expect("session");
     let signature = StaticCacheDecodeSession::detect(&session)
         .expect("detect")
         .expect("static-cache signature");
@@ -146,9 +162,12 @@ fn static_cache_decode_reuses_buffers_and_rewinds_deterministically() {
 
 #[test]
 fn batched_static_cache_matches_unbatched_rows_and_reuses_slots() {
-    let env = Environment::new("batched-static-cache-decode-test").expect("env");
-    let session =
-        Session::new(&env, &tiny_scatter_llm(), SessionOptions::default()).expect("session");
+    let session = Session::new(
+        test_environment(),
+        &tiny_scatter_llm(),
+        deterministic_session_options(),
+    )
+    .expect("session");
     let prompts = [vec![1_i64, 5], vec![2_i64, 6, 7], vec![3_i64]];
     let generated = 3;
 
@@ -240,9 +259,12 @@ fn batched_static_cache_matches_unbatched_rows_and_reuses_slots() {
 
 #[test]
 fn batched_static_cache_active_compaction_skips_inactive_rows_and_admits_replacement() {
-    let env = Environment::new("batched-static-cache-active-compaction-test").expect("env");
-    let session =
-        Session::new(&env, &tiny_scatter_llm(), SessionOptions::default()).expect("session");
+    let session = Session::new(
+        test_environment(),
+        &tiny_scatter_llm(),
+        deterministic_session_options(),
+    )
+    .expect("session");
     let prompts = [
         vec![1_i64, 5],
         vec![2_i64, 6],
