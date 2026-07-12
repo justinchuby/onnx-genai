@@ -20,110 +20,226 @@ from pathlib import Path
 
 import numpy as np
 import onnx
-from onnx import TensorProto, helper, numpy_helper
+from onnxscript import ir
 
 
-def const_array(name: str, array: np.ndarray) -> onnx.TensorProto:
-    return numpy_helper.from_array(array, name=name)
-
-
-def scalar_const_node(name: str, output: str, value: np.ndarray) -> onnx.NodeProto:
-    return helper.make_node(
-        "Constant",
-        inputs=[],
-        outputs=[output],
+def tensor_value(name: str, dtype: ir.DataType, shape: list[int | str]) -> ir.Value:
+    return ir.Value(
         name=name,
-        value=const_array(f"{name}_value", value),
+        type=ir.TensorType(dtype),
+        shape=ir.Shape(shape),
     )
 
 
-def save_model(model: onnx.ModelProto, path: Path) -> None:
-    onnx.checker.check_model(model)
-    onnx.save(model, path)
+def initializer(name: str, array: np.ndarray) -> ir.Value:
+    return ir.Value(
+        name=name,
+        const_value=ir.Tensor(array, name=name),
+    )
+
+
+def node(
+    op_type: str,
+    inputs: list[ir.Value],
+    output: str,
+    *,
+    name: str = "",
+    attributes: tuple[ir.Attr, ...] | list[ir.Attr] = (),
+) -> ir.Node:
+    output_value = ir.Value(name=output)
+    return ir.Node(
+        "",
+        op_type,
+        inputs,
+        attributes,
+        outputs=[output_value],
+        name=name,
+    )
+
+
+def constant_node(name: str, output: str, value: np.ndarray) -> ir.Node:
+    return node(
+        "Constant",
+        [],
+        output,
+        name=name,
+        attributes=[ir.AttrTensor("value", ir.Tensor(value, name=f"{name}_value"))],
+    )
+
+
+def save_model(model: ir.Model, path: Path) -> None:
+    ir.save(model, path)
+    onnx.checker.check_model(path)
 
 
 def build_encoder(path: Path) -> None:
-    pixel_values = helper.make_tensor_value_info(
-        "pixel_values", TensorProto.FLOAT, [1, 3, 2, 2]
-    )
-    image_features = helper.make_tensor_value_info(
-        "image_features", TensorProto.FLOAT, [1, 1, 4]
-    )
+    pixel_values = tensor_value("pixel_values", ir.DataType.FLOAT, [1, 3, 2, 2])
     weights = np.arange(48, dtype=np.float32).reshape(12, 4) / 100.0
     bias = np.array([0.01, 0.02, 0.03, 0.04], dtype=np.float32)
+    encoder_w = initializer("encoder_w", weights)
+    encoder_b = initializer("encoder_b", bias)
 
-    graph = helper.make_graph(
-        [
-            helper.make_node("Flatten", ["pixel_values"], ["pixels_flat"], axis=1),
-            helper.make_node("MatMul", ["pixels_flat", "encoder_w"], ["features_flat"]),
-            helper.make_node("Add", ["features_flat", "encoder_b"], ["features_biased"]),
-            scalar_const_node("encoder_unsqueeze_axes", "encoder_axes", np.array([1], dtype=np.int64)),
-            helper.make_node("Unsqueeze", ["features_biased", "encoder_axes"], ["image_features"]),
-        ],
-        "tiny_vlm_encoder",
+    flatten = node(
+        "Flatten",
         [pixel_values],
-        [image_features],
-        initializer=[const_array("encoder_w", weights), const_array("encoder_b", bias)],
+        "pixels_flat",
+        attributes=[ir.AttrInt64("axis", 1)],
     )
-    model = helper.make_model(
+    matmul = node("MatMul", [flatten.outputs[0], encoder_w], "features_flat")
+    add = node("Add", [matmul.outputs[0], encoder_b], "features_biased")
+    axes = constant_node(
+        "encoder_unsqueeze_axes", "encoder_axes", np.array([1], dtype=np.int64)
+    )
+    unsqueeze = node(
+        "Unsqueeze", [add.outputs[0], axes.outputs[0]], "image_features"
+    )
+    unsqueeze.outputs[0].type = ir.TensorType(ir.DataType.FLOAT)
+    unsqueeze.outputs[0].shape = ir.Shape([1, 1, 4])
+
+    graph = ir.Graph(
+        [pixel_values],
+        [unsqueeze.outputs[0]],
+        nodes=[flatten, matmul, add, axes, unsqueeze],
+        initializers=[encoder_w, encoder_b],
+        opset_imports={"": 13},
+        name="tiny_vlm_encoder",
+    )
+    model = ir.Model(
         graph,
-        opset_imports=[helper.make_operatorsetid("", 13)],
+        ir_version=8,
         producer_name="onnx-genai tiny-vlm fixture",
     )
-    model.ir_version = 8
     save_model(model, path)
 
 
 def build_decoder(path: Path) -> None:
-    input_ids = helper.make_tensor_value_info(
-        "input_ids", TensorProto.INT64, ["batch", "sequence"]
+    input_ids = tensor_value(
+        "input_ids", ir.DataType.INT64, ["batch", "sequence"]
     )
-    image_features = helper.make_tensor_value_info(
-        "image_features", TensorProto.FLOAT, [1, 1, 4]
-    )
-    logits = helper.make_tensor_value_info(
-        "logits", TensorProto.FLOAT, ["batch", "sequence", 8]
+    image_features = tensor_value(
+        "image_features", ir.DataType.FLOAT, [1, 1, 4]
     )
 
     token_bias = np.array(
         [[[-4.0, -4.0, -4.0, -4.0, 8.0, -4.0, -4.0, -4.0]]], dtype=np.float32
     )
+    token_bias_value = initializer("token_bias", token_bias)
 
-    graph = helper.make_graph(
-        [
-            helper.make_node("Shape", ["input_ids"], ["input_shape"]),
-            scalar_const_node("batch_index", "batch_index_value", np.array(0, dtype=np.int64)),
-            scalar_const_node("seq_index", "seq_index_value", np.array(1, dtype=np.int64)),
-            scalar_const_node("shape_unsqueeze_axes", "shape_axes", np.array([0], dtype=np.int64)),
-            scalar_const_node("vocab_dim", "vocab_dim_value", np.array([8], dtype=np.int64)),
-            helper.make_node("Gather", ["input_shape", "batch_index_value"], ["batch_dim"], axis=0),
-            helper.make_node("Gather", ["input_shape", "seq_index_value"], ["seq_dim"], axis=0),
-            helper.make_node("Unsqueeze", ["batch_dim", "shape_axes"], ["batch_dim_vec"]),
-            helper.make_node("Unsqueeze", ["seq_dim", "shape_axes"], ["seq_dim_vec"]),
-            helper.make_node("Concat", ["batch_dim_vec", "seq_dim_vec", "vocab_dim_value"], ["logits_shape"], axis=0),
-            helper.make_node(
-                "ConstantOfShape",
-                ["logits_shape"],
-                ["zero_logits"],
-                value=const_array("zero_logits_value", np.array([0.0], dtype=np.float32)),
-            ),
-            helper.make_node("ReduceMean", ["image_features"], ["image_bias_flat"], axes=[1, 2], keepdims=0),
-            scalar_const_node("bias_unsqueeze_axes", "bias_axes", np.array([1, 2], dtype=np.int64)),
-            helper.make_node("Unsqueeze", ["image_bias_flat", "bias_axes"], ["image_bias"]),
-            helper.make_node("Add", ["zero_logits", "image_bias"], ["image_conditioned_logits"]),
-            helper.make_node("Add", ["image_conditioned_logits", "token_bias"], ["logits"]),
-        ],
-        "tiny_vlm_decoder",
-        [input_ids, image_features],
-        [logits],
-        initializer=[const_array("token_bias", token_bias)],
+    shape = node("Shape", [input_ids], "input_shape")
+    batch_index = constant_node(
+        "batch_index", "batch_index_value", np.array(0, dtype=np.int64)
     )
-    model = helper.make_model(
+    seq_index = constant_node(
+        "seq_index", "seq_index_value", np.array(1, dtype=np.int64)
+    )
+    shape_axes = constant_node(
+        "shape_unsqueeze_axes", "shape_axes", np.array([0], dtype=np.int64)
+    )
+    vocab_dim = constant_node(
+        "vocab_dim", "vocab_dim_value", np.array([8], dtype=np.int64)
+    )
+    batch_dim = node(
+        "Gather",
+        [shape.outputs[0], batch_index.outputs[0]],
+        "batch_dim",
+        attributes=[ir.AttrInt64("axis", 0)],
+    )
+    seq_dim = node(
+        "Gather",
+        [shape.outputs[0], seq_index.outputs[0]],
+        "seq_dim",
+        attributes=[ir.AttrInt64("axis", 0)],
+    )
+    batch_dim_vec = node(
+        "Unsqueeze",
+        [batch_dim.outputs[0], shape_axes.outputs[0]],
+        "batch_dim_vec",
+    )
+    seq_dim_vec = node(
+        "Unsqueeze",
+        [seq_dim.outputs[0], shape_axes.outputs[0]],
+        "seq_dim_vec",
+    )
+    logits_shape = node(
+        "Concat",
+        [batch_dim_vec.outputs[0], seq_dim_vec.outputs[0], vocab_dim.outputs[0]],
+        "logits_shape",
+        attributes=[ir.AttrInt64("axis", 0)],
+    )
+    zero_logits = node(
+        "ConstantOfShape",
+        [logits_shape.outputs[0]],
+        "zero_logits",
+        attributes=[
+            ir.AttrTensor(
+                "value",
+                ir.Tensor(
+                    np.array([0.0], dtype=np.float32),
+                    name="zero_logits_value",
+                ),
+            )
+        ],
+    )
+    image_bias_flat = node(
+        "ReduceMean",
+        [image_features],
+        "image_bias_flat",
+        attributes=[
+            ir.AttrInt64s("axes", [1, 2]),
+            ir.AttrInt64("keepdims", 0),
+        ],
+    )
+    bias_axes = constant_node(
+        "bias_unsqueeze_axes", "bias_axes", np.array([1, 2], dtype=np.int64)
+    )
+    image_bias = node(
+        "Unsqueeze",
+        [image_bias_flat.outputs[0], bias_axes.outputs[0]],
+        "image_bias",
+    )
+    image_conditioned_logits = node(
+        "Add",
+        [zero_logits.outputs[0], image_bias.outputs[0]],
+        "image_conditioned_logits",
+    )
+    logits = node(
+        "Add",
+        [image_conditioned_logits.outputs[0], token_bias_value],
+        "logits",
+    )
+    logits.outputs[0].type = ir.TensorType(ir.DataType.FLOAT)
+    logits.outputs[0].shape = ir.Shape(["batch", "sequence", 8])
+
+    graph = ir.Graph(
+        [input_ids, image_features],
+        [logits.outputs[0]],
+        nodes=[
+            shape,
+            batch_index,
+            seq_index,
+            shape_axes,
+            vocab_dim,
+            batch_dim,
+            seq_dim,
+            batch_dim_vec,
+            seq_dim_vec,
+            logits_shape,
+            zero_logits,
+            image_bias_flat,
+            bias_axes,
+            image_bias,
+            image_conditioned_logits,
+            logits,
+        ],
+        initializers=[token_bias_value],
+        opset_imports={"": 13},
+        name="tiny_vlm_decoder",
+    )
+    model = ir.Model(
         graph,
-        opset_imports=[helper.make_operatorsetid("", 13)],
+        ir_version=8,
         producer_name="onnx-genai tiny-vlm fixture",
     )
-    model.ir_version = 8
     save_model(model, path)
 
 
