@@ -52,6 +52,13 @@ impl Drop for Environment {
     }
 }
 
-// Safety: OrtEnv is thread-safe per ORT documentation
+// SAFETY: ORT environments are process-level handles that the ORT C API permits
+// to be used from multiple threads. This wrapper only shares the opaque handle,
+// never mutates Rust-owned state through shared references, and releases it once
+// from `Drop` after owning structs have dropped their sessions. This would stop
+// being sound if ORT changed `OrtEnv` to require thread-affine access, or if a
+// future owner dropped the environment while live sessions could still call ORT.
 unsafe impl Send for Environment {}
+// SAFETY: Same invariant as `Send`: shared references expose only the stable ORT
+// environment handle, whose operations are thread-safe under ORT's contract.
 unsafe impl Sync for Environment {}

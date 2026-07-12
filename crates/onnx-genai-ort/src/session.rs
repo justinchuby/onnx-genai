@@ -354,7 +354,17 @@ impl Drop for Session {
     }
 }
 
+// SAFETY: `Session` owns one `OrtSession` handle plus immutable Rust metadata.
+// ONNX Runtime documents `OrtSession::Run`/`RunWithBinding` as safe for
+// concurrent calls on the same session; per-run inputs, outputs, and `IoBinding`
+// values are supplied by the caller and are not stored in `Session`. `Drop` still
+// requires unique ownership and releases the handle exactly once. This would stop
+// being sound for an execution provider that violates ORT's concurrent-run
+// contract, or if future code cached mutable per-run state inside `Session`.
 unsafe impl Send for Session {}
+// SAFETY: Shared `&Session` access only permits ORT runs against the thread-safe
+// session handle and reads immutable metadata. Callers must not share a mutable
+// ORT binding/value through unsafe code across concurrent runs.
 unsafe impl Sync for Session {}
 
 struct RawSessionOptions {

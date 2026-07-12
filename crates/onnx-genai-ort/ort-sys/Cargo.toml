@@ -11,3 +11,4 @@ doctest = false
 
 [build-dependencies]
 bindgen = "0.71"
+sha2 = "0.10"

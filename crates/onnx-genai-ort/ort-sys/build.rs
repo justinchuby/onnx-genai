@@ -8,13 +8,31 @@
 //! 3. Automatic download of prebuilt ORT from GitHub releases
 
 use std::env;
+use std::io::Read;
 use std::path::{Path, PathBuf};
+
+use sha2::{Digest, Sha256};
 
 // Keep this aligned with the ORT headers used by bindgen. ORT 1.27.x exposes
 // ORT_API_VERSION 27, so the downloaded runtime must also be 1.27.x.
 const ORT_VERSION: &str = "1.27.0";
 const ORT_API_VERSION: &str = "27";
 const ORT_RELEASE_BASE: &str = "https://github.com/microsoft/onnxruntime/releases/download";
+
+const ORT_ARCHIVE_CHECKSUMS: &[(&str, &str)] = &[
+    (
+        "onnxruntime-linux-x64-1.27.0.tgz",
+        "547e40a48f1fe73e3f812d7c88a948612c23f896b91e4e2ee1e232d7b468246f",
+    ),
+    (
+        "onnxruntime-osx-arm64-1.27.0.tgz",
+        "545e81c58152353acb0d1e8bd6ce4b62f830c0961f5b3acfedc790ffd76e477a",
+    ),
+    (
+        "onnxruntime-win-x64-1.27.0.zip",
+        "c5c81710938e68079ff1a192b04897faabe4b43830d48f39f27ecd4e16138bfc",
+    ),
+];
 
 fn main() {
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
@@ -137,19 +155,7 @@ fn find_ort_root() -> PathBuf {
 }
 
 fn download_prebuilt(target_dir: &Path) {
-    let (os, ext) = if target_os() == "linux" {
-        ("linux-x64", "tgz")
-    } else if target_os() == "macos" {
-        if target_arch() == "aarch64" {
-            ("osx-arm64", "tgz")
-        } else {
-            ("osx-x86_64", "tgz")
-        }
-    } else if target_os() == "windows" {
-        ("win-x64", "zip")
-    } else {
-        panic!("Unsupported platform for automatic ORT download");
-    };
+    let (os, ext) = prebuilt_target();
 
     let filename = format!("onnxruntime-{}-{}.{}", os, ORT_VERSION, ext);
     let url = format!("{}/v{}/{}", ORT_RELEASE_BASE, ORT_VERSION, filename);
@@ -168,6 +174,8 @@ fn download_prebuilt(target_dir: &Path) {
     if !status.success() {
         panic!("Failed to download ORT from {}", url);
     }
+
+    verify_archive_checksum(&download_path, &filename);
 
     // Extract
     let parent_dir = target_dir.parent().unwrap();
@@ -214,6 +222,69 @@ fn download_prebuilt(target_dir: &Path) {
 
     // Cleanup
     let _ = std::fs::remove_file(&download_path);
+}
+
+fn prebuilt_target() -> (&'static str, &'static str) {
+    if target_os() == "linux" {
+        ("linux-x64", "tgz")
+    } else if target_os() == "macos" {
+        if target_arch() == "aarch64" {
+            ("osx-arm64", "tgz")
+        } else {
+            ("osx-x86_64", "tgz")
+        }
+    } else if target_os() == "windows" {
+        ("win-x64", "zip")
+    } else {
+        panic!("Unsupported platform for automatic ORT download");
+    }
+}
+
+fn verify_archive_checksum(download_path: &Path, filename: &str) {
+    let Some(expected) = expected_archive_checksum(filename) else {
+        let message = format!(
+            "No SHA-256 checksum is pinned for ORT archive {filename}. \
+             Add its official digest to ORT_ARCHIVE_CHECKSUMS in ort-sys/build.rs; \
+             this build cannot verify the downloaded native runtime."
+        );
+        println!("cargo:warning={message}");
+        eprintln!("WARNING: {message}");
+        return;
+    };
+
+    let actual = sha256_file_hex(download_path).unwrap_or_else(|err| {
+        panic!(
+            "Failed to compute SHA-256 for downloaded ORT archive {}: {err}",
+            download_path.display()
+        )
+    });
+
+    if actual != expected {
+        panic!(
+            "SHA-256 mismatch for downloaded ORT archive {filename}: \
+             expected {expected}, got {actual}. Refusing to extract native runtime."
+        );
+    }
+}
+
+fn expected_archive_checksum(filename: &str) -> Option<&'static str> {
+    ORT_ARCHIVE_CHECKSUMS
+        .iter()
+        .find_map(|(known_filename, checksum)| (*known_filename == filename).then_some(*checksum))
+}
+
+fn sha256_file_hex(path: &Path) -> std::io::Result<String> {
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 fn cached_prebuilt_matches_version(download_dir: &Path) -> bool {
