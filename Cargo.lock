@@ -932,6 +932,7 @@ dependencies = [
  "clap",
  "onnx-genai",
  "onnx-genai-engine",
+ "onnx-genai-ort",
  "serde",
  "serde_json",
  "tokio",

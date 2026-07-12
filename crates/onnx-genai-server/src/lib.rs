@@ -24,6 +24,7 @@ use onnx_genai::{
     Engine, EngineConfig, FinishReason, GenerateOptions, GeneratePrompt, GenerateRequest,
     GenerateResult, GenerateToken, SessionId, StopSequence,
 };
+use onnx_genai_ort::{ModelDirectory, Tokenizer};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -34,6 +35,7 @@ const SESSION_ID_HEADER: &str = "x-session-id";
 pub struct AppState {
     model_id: String,
     engine: SharedEngine,
+    tokenizer: Arc<Tokenizer>,
     sessions: SessionRegistry,
 }
 
@@ -160,15 +162,20 @@ impl SessionRegistry {
 
 impl AppState {
     pub fn load(model_dir: &Path, model_id: Option<String>) -> anyhow::Result<Self> {
+        let model_directory = ModelDirectory::load(model_dir)
+            .map_err(|e| anyhow::anyhow!("Failed to resolve model directory: {}", e))?;
+        let tokenizer = Tokenizer::from_file(&model_directory.tokenizer_path)
+            .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {}", e))?;
         let engine = Engine::from_dir(model_dir, EngineConfig::default())?;
         let model_id = model_id.unwrap_or_else(|| infer_model_id(model_dir));
-        Ok(Self::new(model_id, engine))
+        Ok(Self::new(model_id, engine, tokenizer))
     }
 
-    pub fn new(model_id: String, engine: Engine) -> Self {
+    pub fn new(model_id: String, engine: Engine, tokenizer: Tokenizer) -> Self {
         Self {
             model_id,
             engine: SharedEngine::new(engine),
+            tokenizer: Arc::new(tokenizer),
             sessions: SessionRegistry::new(),
         }
     }
@@ -329,6 +336,11 @@ struct ApiError {
     message: String,
 }
 
+struct PreparedGenerateRequest {
+    request: GenerateRequest,
+    prompt_tokens: usize,
+}
+
 impl ApiError {
     fn bad_request(message: impl Into<String>) -> Self {
         Self {
@@ -429,7 +441,7 @@ async fn chat_completions(
     validate_request(&request)?;
     let session_id = session_id_from_headers(&headers)?;
     if request.stream {
-        Ok(stream_chat_completion(state, request, session_id).into_response())
+        Ok(stream_chat_completion(state, request, session_id)?.into_response())
     } else {
         let response = run_chat_completion(state, request, session_id).await?;
         Ok(Json(response).into_response())
@@ -444,11 +456,11 @@ async fn run_chat_completion(
     let id = completion_id();
     let created = now_unix();
     let model = request.model.clone();
-    let generation_request = if client_session_id.is_some() {
-        build_session_generate_request(&request)
-    } else {
-        build_generate_request(&request)
-    };
+    let prepared =
+        prepare_generate_request(&request, &state.tokenizer, client_session_id.is_some())
+            .map_err(|err| ApiError::internal(format!("prompt tokenization failed: {err}")))?;
+    let prompt_tokens = prepared.prompt_tokens;
+    let generation_request = prepared.request;
     let engine = state.engine.clone();
     let session_lookup = client_session_id
         .as_deref()
@@ -476,6 +488,7 @@ async fn run_chat_completion(
         .transpose()?;
 
     let completion_tokens = result.token_ids.len();
+    let total_tokens = prompt_tokens + completion_tokens;
     Ok(ChatCompletionResponse {
         id,
         object: "chat.completion",
@@ -490,9 +503,9 @@ async fn run_chat_completion(
             finish_reason: finish_reason_label(&result.finish_reason),
         }],
         usage: Some(Usage {
-            prompt_tokens: 0,
+            prompt_tokens,
             completion_tokens,
-            total_tokens: completion_tokens,
+            total_tokens,
         }),
         session_id: client_session_id,
         session_token_count,
@@ -503,15 +516,14 @@ fn stream_chat_completion(
     state: AppState,
     request: ChatCompletionRequest,
     client_session_id: Option<String>,
-) -> Sse<ReceiverStream<Result<Event, Infallible>>> {
+) -> Result<Sse<ReceiverStream<Result<Event, Infallible>>>, ApiError> {
     let id = completion_id();
     let created = now_unix();
     let model = request.model.clone();
-    let generation_request = if client_session_id.is_some() {
-        build_session_generate_request(&request)
-    } else {
-        build_generate_request(&request)
-    };
+    let prepared =
+        prepare_generate_request(&request, &state.tokenizer, client_session_id.is_some())
+            .map_err(|err| ApiError::internal(format!("prompt tokenization failed: {err}")))?;
+    let generation_request = prepared.request;
     let engine = state.engine.clone();
     let (tx, rx) = mpsc::channel(16);
     let session_lookup = client_session_id
@@ -581,7 +593,7 @@ fn stream_chat_completion(
         Ok::<(), anyhow::Error>(())
     });
 
-    Sse::new(ReceiverStream::new(rx))
+    Ok(Sse::new(ReceiverStream::new(rx)))
 }
 
 fn role_chunk(id: &str, created: u64, model: &str) -> ChatCompletionChunk {
@@ -700,11 +712,27 @@ pub fn build_generate_request(request: &ChatCompletionRequest) -> GenerateReques
     }
 }
 
-fn build_session_generate_request(request: &ChatCompletionRequest) -> GenerateRequest {
-    GenerateRequest {
-        prompt: GeneratePrompt::Text(build_session_prompt(&request.messages)),
-        options: build_generate_options(request),
-    }
+fn prepare_generate_request(
+    request: &ChatCompletionRequest,
+    tokenizer: &Tokenizer,
+    session: bool,
+) -> anyhow::Result<PreparedGenerateRequest> {
+    let prompt = if session {
+        build_session_prompt(&request.messages)
+    } else {
+        build_prompt(&request.messages)
+    };
+    let token_ids = tokenizer
+        .encode(&prompt)
+        .map_err(|e| anyhow::anyhow!("Failed to tokenize prompt: {}", e))?;
+    let prompt_tokens = token_ids.len();
+    Ok(PreparedGenerateRequest {
+        request: GenerateRequest {
+            prompt: GeneratePrompt::TokenIds(token_ids),
+            options: build_generate_options(request),
+        },
+        prompt_tokens,
+    })
 }
 
 fn build_generate_options(request: &ChatCompletionRequest) -> GenerateOptions {
@@ -745,7 +773,7 @@ pub fn build_prompt(messages: &[ChatMessage]) -> String {
 
 fn finish_reason_label(reason: &FinishReason) -> &'static str {
     match reason {
-        FinishReason::MaxTokens => "length",
+        FinishReason::MaxTokens | FinishReason::Length => "length",
         FinishReason::EosToken | FinishReason::StopSequence { .. } => "stop",
     }
 }

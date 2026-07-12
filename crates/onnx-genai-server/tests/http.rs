@@ -86,6 +86,11 @@ async fn chat_completions_returns_openai_shape() {
     assert_eq!(json["choices"][0]["message"]["role"], "assistant");
     assert!(json["choices"][0]["message"]["content"].is_string());
     assert!(json["choices"][0]["finish_reason"].is_string());
+    let prompt_tokens = json["usage"]["prompt_tokens"].as_u64().unwrap();
+    let completion_tokens = json["usage"]["completion_tokens"].as_u64().unwrap();
+    let total_tokens = json["usage"]["total_tokens"].as_u64().unwrap();
+    assert!(prompt_tokens > 0);
+    assert_eq!(total_tokens, prompt_tokens + completion_tokens);
     assert!(json.get("session_id").is_none());
 }
 

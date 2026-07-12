@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 onnx-genai = { path = "../onnx-genai" }
 onnx-genai-engine = { workspace = true }
+onnx-genai-ort = { workspace = true }
 tokio = { workspace = true }
 axum = { workspace = true }
 serde = { workspace = true }
