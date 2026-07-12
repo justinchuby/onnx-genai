@@ -1439,3 +1439,714 @@ crates/onnx-genai-engine/src/
 ├── sampling.rs            # Token sampling
 └── speculative.rs         # Speculative decoding (autoregressive only)
 ```
+
+---
+
+## 21. Tool Use / Function Calling
+
+### 21.1 Overview
+
+A local coding agent needs to:
+1. See available tools (file_read, file_write, shell_exec, search, etc.)
+2. Decide when to call a tool vs. continue generating text
+3. Output a structured tool call (function name + arguments)
+4. Receive tool results and continue generation
+
+This must work with **any model** that supports tool use (Llama, Qwen, Mistral, Phi, etc.) — each has different chat templates and tool call formats.
+
+### 21.2 Tool Schema
+
+```rust
+/// A tool available to the model.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolDefinition {
+    /// Tool name (must match what model outputs).
+    pub name: String,
+    /// Human-readable description.
+    pub description: String,
+    /// JSON Schema for the tool's parameters.
+    pub parameters: serde_json::Value,
+}
+
+/// How the model should use tools.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum ToolChoice {
+    /// Model decides whether to call a tool.
+    Auto,
+    /// Model MUST call one of the provided tools.
+    Required,
+    /// Model must call this specific tool.
+    Function { name: String },
+    /// Model must NOT call any tool (plain text response).
+    None,
+}
+
+/// A tool call emitted by the model.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolCall {
+    /// Unique ID for this call (for matching results).
+    pub id: String,
+    /// Tool name.
+    pub name: String,
+    /// JSON arguments.
+    pub arguments: serde_json::Value,
+}
+
+/// Result of a tool execution, fed back to the model.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolResult {
+    /// Matches ToolCall.id.
+    pub tool_call_id: String,
+    /// Tool output (string or structured).
+    pub content: String,
+    /// Whether the tool call errored.
+    pub is_error: bool,
+}
+```
+
+### 21.3 Chat Template Abstraction
+
+Different models encode tool calls differently. We abstract this:
+
+```rust
+/// Formats messages + tools into model-specific token sequences.
+pub trait ChatTemplate: Send + Sync {
+    /// Format a conversation with tool definitions into a prompt.
+    fn apply(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[ToolDefinition],
+        tool_choice: &ToolChoice,
+    ) -> Vec<TokenId>;
+
+    /// Parse generated text to detect tool calls.
+    /// Returns None if the output is plain text (no tool call).
+    fn parse_tool_calls(&self, generated_text: &str) -> Option<Vec<ToolCall>>;
+
+    /// Get stop tokens that indicate end-of-turn or end-of-tool-call.
+    fn stop_tokens(&self) -> Vec<StopSequence>;
+
+    /// Get the tool-call start marker (e.g., "<|tool_call|>", "<function_call>").
+    fn tool_call_start_marker(&self) -> Option<&str>;
+}
+
+/// Built-in templates for common model families.
+pub enum BuiltinTemplate {
+    /// Llama 3.x / Llama 4 tool format
+    Llama,
+    /// Qwen 2.5 / Qwen 3 tool format
+    Qwen,
+    /// Mistral / Mixtral tool format  
+    Mistral,
+    /// Phi-4 tool format
+    Phi,
+    /// Generic: uses Jinja template from tokenizer_config.json
+    Jinja { template: String },
+}
+```
+
+### 21.4 Tool Call Detection During Generation
+
+Two approaches, use both:
+
+**A. Token-level detection (fast path):**
+```rust
+/// Watches generated tokens for tool-call start markers.
+pub struct ToolCallDetector {
+    /// Partial match buffer for multi-token markers.
+    buffer: String,
+    /// Known start markers for active template.
+    start_markers: Vec<String>,
+    /// Once detected, switch to constrained mode.
+    detected: bool,
+}
+
+impl LogitProcessor for ToolCallDetector {
+    fn signal(&self, context: &ProcessorContext) -> Option<ProcessorSignal> {
+        if self.detected {
+            Some(ProcessorSignal::ToolCallStart)
+        } else {
+            None
+        }
+    }
+}
+```
+
+**B. Constrained generation after detection:**
+
+Once we detect a tool call is starting, switch to JSON Schema constrained decoding to guarantee valid tool call JSON:
+
+```rust
+/// After tool_call_start_marker detected, constrain output to valid tool JSON.
+pub struct ToolCallConstraint {
+    /// JSON Schema built from available tool definitions.
+    schema: JsonSchemaConstraint,
+    /// Which tools are allowed (from ToolChoice).
+    allowed_tools: Vec<String>,
+}
+```
+
+### 21.5 Multi-Turn Tool Loop
+
+```rust
+/// A generation session with tool-use loop.
+pub struct ToolSession {
+    engine: Engine,
+    tools: Vec<ToolDefinition>,
+    template: Box<dyn ChatTemplate>,
+    messages: Vec<ChatMessage>,
+}
+
+impl ToolSession {
+    /// Run one generation step. Returns either text or tool calls.
+    pub fn step(&mut self) -> Result<StepResult> { ... }
+    
+    /// Feed tool results back and continue generation.
+    pub fn submit_tool_results(&mut self, results: Vec<ToolResult>) -> Result<StepResult> { ... }
+}
+
+pub enum StepResult {
+    /// Model produced final text response.
+    Text(String),
+    /// Model wants to call tools. Caller executes them and calls submit_tool_results.
+    ToolCalls(Vec<ToolCall>),
+    /// Model produced text + tool calls (parallel).
+    Mixed { text: String, tool_calls: Vec<ToolCall> },
+}
+```
+
+### 21.6 HTTP API (OpenAI-compatible)
+
+```json
+POST /v1/chat/completions
+{
+  "model": "local-model",
+  "messages": [...],
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "file_read",
+        "description": "Read file contents",
+        "parameters": { "type": "object", "properties": { "path": { "type": "string" } }, "required": ["path"] }
+      }
+    }
+  ],
+  "tool_choice": "auto"
+}
+```
+
+Response with tool call:
+```json
+{
+  "choices": [{
+    "message": {
+      "role": "assistant",
+      "tool_calls": [{
+        "id": "call_abc123",
+        "type": "function",
+        "function": { "name": "file_read", "arguments": "{\"path\": \"src/main.rs\"}" }
+      }]
+    },
+    "finish_reason": "tool_calls"
+  }]
+}
+```
+
+### 21.7 KV Cache Across Tool Turns
+
+Critical for coding agent performance — don't recompute the entire context each turn:
+
+```
+Turn 1: [system + tools + user] → generate → tool_call     (KV cached)
+Turn 2: [... + tool_result + ...] → generate → text        (reuse Turn 1 KV, append new)
+```
+
+The multi-session support (already implemented) handles this. Each `SessionId` preserves KV state. Tool results are appended as new tokens, and only the new portion requires prefill.
+
+---
+
+## 22. Grammar-Based Constrained Decoding
+
+### 22.1 Overview
+
+JSON constraint exists. Now generalize to arbitrary grammars for:
+- JSON Schema (specific shape, not just valid JSON)
+- Regex patterns (dates, emails, enums)
+- GBNF/EBNF grammars (custom DSLs, code, XML)
+- Tool call formats (model-specific structured output)
+
+### 22.2 Grammar Specification
+
+```rust
+/// A grammar that constrains generation output.
+#[derive(Debug, Clone)]
+pub enum Grammar {
+    /// Any valid JSON.
+    Json,
+    /// JSON conforming to a specific schema.
+    JsonSchema(serde_json::Value),
+    /// Output must match this regex.
+    Regex(String),
+    /// Context-free grammar in GBNF notation (llama.cpp compatible).
+    Gbnf(String),
+    /// Choice between literal strings.
+    Choice(Vec<String>),
+}
+
+/// Compiled grammar ready for token-level enforcement.
+pub trait CompiledGrammar: Send + Sync {
+    /// Given current generated text, which tokens are allowed next?
+    fn allowed_tokens(&self, state: &GrammarState, vocab: &Vocabulary) -> TokenMask;
+    
+    /// Advance the grammar state after accepting a token.
+    fn advance(&self, state: &mut GrammarState, token_text: &str);
+    
+    /// Is the grammar in an accepting state? (output is complete & valid)
+    fn is_accepting(&self, state: &GrammarState) -> bool;
+    
+    /// Can the grammar still reach an accepting state? (or is it stuck)
+    fn is_dead(&self, state: &GrammarState) -> bool;
+}
+
+/// Opaque grammar automaton state.
+pub struct GrammarState {
+    /// Stack of automaton states (for recursive grammars).
+    stack: Vec<u32>,
+    /// Current position in the generated output.
+    position: usize,
+}
+
+/// Bit vector over vocabulary — true = token is allowed.
+pub struct TokenMask {
+    bits: Vec<u64>,
+    vocab_size: usize,
+}
+
+impl TokenMask {
+    pub fn apply_to_logits(&self, logits: &mut [f32]) {
+        for (i, logit) in logits.iter_mut().enumerate() {
+            if !self.is_set(i) {
+                *logit = f32::NEG_INFINITY;
+            }
+        }
+    }
+}
+```
+
+### 22.3 JSON Schema Constraint
+
+More powerful than plain JSON — ensures output matches a specific schema:
+
+```rust
+pub struct JsonSchemaConstraint {
+    schema: serde_json::Value,
+    /// Precomputed: for each schema node, what characters can appear next.
+    automaton: SchemaAutomaton,
+}
+
+/// Handles:
+/// - Required/optional properties
+/// - Type enforcement (string, number, boolean, null, array, object)
+/// - Enum values
+/// - String patterns (regex within strings)
+/// - Nested objects/arrays
+/// - Min/max length, min/max items
+/// - oneOf/anyOf/allOf
+impl CompiledGrammar for JsonSchemaConstraint { ... }
+```
+
+### 22.4 GBNF Grammar Engine
+
+GBNF (GGML BNF) is the de-facto standard for grammar-constrained generation (used by llama.cpp, vLLM, etc.):
+
+```
+root   ::= object
+object ::= "{" ws members ws "}"
+members ::= pair ("," ws pair)*
+pair   ::= string ":" ws value
+value  ::= string | number | "true" | "false" | "null" | object | array
+...
+```
+
+```rust
+pub struct GbnfEngine {
+    /// Parsed grammar rules.
+    rules: Vec<GbnfRule>,
+    /// Rule name → index.
+    rule_index: HashMap<String, usize>,
+    /// Root rule name.
+    root: String,
+}
+
+impl GbnfEngine {
+    pub fn compile(grammar_text: &str) -> Result<Self>;
+}
+
+impl CompiledGrammar for GbnfEngine { ... }
+```
+
+### 22.5 Regex Constraint
+
+```rust
+pub struct RegexConstraint {
+    /// DFA states compiled from the regex.
+    dfa: CompiledDfa,
+}
+
+impl RegexConstraint {
+    pub fn new(pattern: &str) -> Result<Self> {
+        // Compile regex to DFA for efficient per-token stepping
+        let dfa = compile_regex_to_dfa(pattern)?;
+        Ok(Self { dfa })
+    }
+}
+
+impl CompiledGrammar for RegexConstraint { ... }
+```
+
+### 22.6 Performance: Precomputed Token Masks
+
+For large vocabularies (32K-128K tokens), computing `allowed_tokens` per step is expensive. Optimization: **precompute masks for common grammar states**.
+
+```rust
+/// Cache of grammar_state → allowed token mask.
+pub struct GrammarCache {
+    /// State hash → precomputed mask.
+    cache: HashMap<u64, Arc<TokenMask>>,
+    /// Maximum cache entries.
+    max_size: usize,
+}
+```
+
+For JSON Schema specifically, most states repeat (e.g., "inside a string", "expecting colon", "expecting value"). Precompute those ~20 common states → amortized O(1) per token.
+
+### 22.7 Integration with Logit Processor Chain
+
+```rust
+/// Grammar-based logit processor (slots into existing chain).
+pub struct GrammarProcessor {
+    grammar: Box<dyn CompiledGrammar>,
+    state: GrammarState,
+    vocab: Arc<Vocabulary>,
+    cache: GrammarCache,
+}
+
+impl LogitProcessor for GrammarProcessor {
+    fn process(&self, logits: &mut [f32], context: &ProcessorContext) {
+        let mask = self.cache.get_or_compute(&self.state, |state| {
+            self.grammar.allowed_tokens(state, &self.vocab)
+        });
+        mask.apply_to_logits(logits);
+    }
+    
+    fn signal(&self, _context: &ProcessorContext) -> Option<ProcessorSignal> {
+        if self.grammar.is_accepting(&self.state) {
+            Some(ProcessorSignal::GrammarComplete)
+        } else {
+            None
+        }
+    }
+}
+```
+
+### 22.8 HTTP API
+
+```json
+POST /v1/chat/completions
+{
+  "model": "local-model",
+  "messages": [...],
+  "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+      "name": "tool_call",
+      "schema": { "type": "object", "properties": { "name": { "type": "string" }, "args": { "type": "object" } }, "required": ["name", "args"] }
+    }
+  }
+}
+```
+
+Or with GBNF:
+```json
+{
+  "grammar": "root ::= \"{\" ws \"\\\"action\\\":\" ws action ...",
+}
+```
+
+---
+
+## 23. Conditional Generation (Fill-in-the-Middle / Infilling)
+
+### 23.1 Overview
+
+A coding agent doesn't just append text — it needs to:
+- **Fill in the middle** (FIM): given prefix + suffix, generate the middle
+- **Complete at cursor**: given code before and after cursor, generate the insertion
+- **Constrained completion**: generate code that satisfies surrounding context (types, imports)
+
+### 23.2 FIM Format
+
+Models use special tokens for FIM. The format varies:
+
+```rust
+/// Fill-in-the-middle configuration.
+#[derive(Debug, Clone)]
+pub struct FimConfig {
+    /// Token/string that marks the beginning of prefix.
+    pub prefix_token: String,    // e.g., "<|fim_prefix|>" or "<PRE>"
+    /// Token/string that marks the beginning of middle (to be generated).
+    pub middle_token: String,    // e.g., "<|fim_middle|>" or "<MID>"
+    /// Token/string that marks the beginning of suffix.
+    pub suffix_token: String,    // e.g., "<|fim_suffix|>" or "<SUF>"
+    /// Format: PSM (prefix-suffix-middle) or SPM (suffix-prefix-middle).
+    pub format: FimFormat,
+}
+
+#[derive(Debug, Clone)]
+pub enum FimFormat {
+    /// Prefix → Suffix → Middle (most models: StarCoder, CodeLlama, Qwen)
+    PSM,
+    /// Suffix → Prefix → Middle (some older models)
+    SPM,
+}
+
+impl FimConfig {
+    /// Auto-detect from tokenizer_config.json or model metadata.
+    pub fn from_tokenizer_config(config: &serde_json::Value) -> Option<Self>;
+    
+    /// Format a FIM prompt.
+    pub fn format_prompt(&self, prefix: &str, suffix: &str) -> String {
+        match self.format {
+            FimFormat::PSM => format!(
+                "{}{}{}{}{}",
+                self.prefix_token, prefix, self.suffix_token, suffix, self.middle_token
+            ),
+            FimFormat::SPM => format!(
+                "{}{}{}{}{}",
+                self.suffix_token, suffix, self.prefix_token, prefix, self.middle_token
+            ),
+        }
+    }
+}
+```
+
+### 23.3 Coding Agent Request Types
+
+```rust
+/// A code generation request (superset of plain text generation).
+pub struct CodeGenerateRequest {
+    /// The generation mode.
+    pub mode: CodeMode,
+    /// Language hint (for stop heuristics).
+    pub language: Option<String>,
+    /// Maximum tokens to generate.
+    pub max_tokens: u32,
+    /// Stop sequences (in addition to model defaults).
+    pub stop: Vec<String>,
+    /// Temperature (lower = more deterministic for code).
+    pub temperature: f32,
+}
+
+#[derive(Debug, Clone)]
+pub enum CodeMode {
+    /// Standard completion: continue from prefix.
+    Complete {
+        prefix: String,
+    },
+    /// Fill-in-the-middle: generate between prefix and suffix.
+    Infill {
+        prefix: String,
+        suffix: String,
+    },
+    /// Multi-file context: other files as context + FIM in target file.
+    RepoContext {
+        /// Other relevant files (path → content).
+        context_files: Vec<(String, String)>,
+        /// Target file prefix (before cursor).
+        prefix: String,
+        /// Target file suffix (after cursor).
+        suffix: String,
+        /// Target file path (for language detection).
+        file_path: String,
+    },
+}
+```
+
+### 23.4 Stop Conditions for Code Generation
+
+Code completion needs smarter stopping than plain text:
+
+```rust
+/// Code-aware stop conditions.
+pub struct CodeStopConditions {
+    /// Stop at end of logical block (matching braces/indentation).
+    pub stop_at_block_end: bool,
+    /// Stop after N complete lines.
+    pub max_lines: Option<usize>,
+    /// Stop if indentation returns to or before the starting level.
+    pub stop_at_dedent: bool,
+    /// Stop at these literal strings.
+    pub stop_sequences: Vec<String>,
+    /// Language-specific: stop at next function/class definition.
+    pub stop_at_next_definition: bool,
+}
+
+/// Implements stop logic as a LogitProcessor.
+pub struct CodeStopProcessor {
+    config: CodeStopConditions,
+    language: Language,
+    start_indent: usize,
+}
+
+impl LogitProcessor for CodeStopProcessor {
+    fn signal(&self, context: &ProcessorContext) -> Option<ProcessorSignal> {
+        // Check indentation, brace matching, line count, etc.
+        ...
+    }
+}
+```
+
+### 23.5 Suffix-Aware Constrained Generation
+
+For infilling, the generated text must **merge cleanly** with the suffix. This means:
+
+```rust
+/// Ensures generated output transitions smoothly into the suffix.
+pub struct SuffixConstraint {
+    /// The suffix text that follows the generation.
+    suffix: String,
+    /// Characters of suffix we've already "eaten" (overlap detection).
+    overlap_detected: usize,
+}
+
+impl LogitProcessor for SuffixConstraint {
+    fn process(&self, logits: &mut [f32], context: &ProcessorContext) {
+        // If generated text is starting to reproduce the suffix,
+        // boost EOS / stop probability.
+        // Prevents: prefix + generated + suffix having duplicated content.
+    }
+    
+    fn signal(&self, context: &ProcessorContext) -> Option<ProcessorSignal> {
+        if self.detected_suffix_overlap(context) {
+            Some(ProcessorSignal::SuffixOverlap)
+        } else {
+            None
+        }
+    }
+}
+```
+
+### 23.6 Repo-Level Context (for Coding Agent)
+
+A coding agent needs multi-file awareness:
+
+```rust
+/// Formats repository context for the model.
+pub trait RepoContextFormatter: Send + Sync {
+    /// Format context files + target FIM into a single prompt.
+    fn format(
+        &self,
+        context_files: &[(String, String)],  // (path, content)
+        target_path: &str,
+        prefix: &str,
+        suffix: &str,
+        fim_config: &FimConfig,
+    ) -> String;
+    
+    /// Maximum context window to use for repo context (tokens).
+    fn max_context_tokens(&self) -> usize;
+    
+    /// Prioritize which files to include when context is limited.
+    fn rank_context_files(
+        &self,
+        target_path: &str,
+        available_files: &[(String, String)],
+    ) -> Vec<usize>;
+}
+
+/// Default: recently edited files + imports/dependencies first.
+pub struct DefaultRepoFormatter {
+    max_tokens: usize,
+}
+```
+
+### 23.7 HTTP API Extensions
+
+```json
+POST /v1/completions
+{
+  "model": "local-model",
+  "prompt": "<|fim_prefix|>def fibonacci(n):\n    <|fim_suffix|>\n    return result<|fim_middle|>",
+  "max_tokens": 100,
+  "temperature": 0.2,
+  "stop": ["\n\n"]
+}
+```
+
+Higher-level code completion endpoint:
+```json
+POST /v1/code/completions
+{
+  "model": "local-model",
+  "mode": "infill",
+  "prefix": "def fibonacci(n):\n    ",
+  "suffix": "\n    return result",
+  "language": "python",
+  "max_tokens": 100,
+  "stop_at_dedent": true,
+  "context_files": [
+    { "path": "utils.py", "content": "..." }
+  ]
+}
+```
+
+### 23.8 Integration: Tool Use + Grammar + FIM Together
+
+A coding agent request flow:
+
+```
+1. User: "Add error handling to this function"
+2. Engine receives: system prompt + tools + code context
+3. Model decides: call file_read tool → get current code
+4. Tool result fed back (KV cache preserved)
+5. Model decides: generate code edit (FIM mode, grammar-constrained to valid syntax)
+6. Model outputs: tool_call(file_write, {path, content})  ← JSON Schema constrained
+7. Agent executes write, feeds result back
+8. Model: "Done. Added try/except with logging." (plain text)
+```
+
+All three systems compose:
+- **Tool use**: decides *what* to do (read/write/search)
+- **Grammar**: ensures *structured output* is valid (tool call JSON, code blocks)
+- **FIM/conditional**: generates *code content* that fits surrounding context
+
+### 23.9 Crate Structure Update
+
+```
+crates/onnx-genai-engine/src/
+├── constraints/
+│   ├── mod.rs              # CompiledGrammar trait + TokenMask
+│   ├── json.rs             # Existing JSON constraint (refactored)
+│   ├── json_schema.rs      # JSON Schema constraint
+│   ├── regex.rs            # Regex → DFA constraint
+│   ├── gbnf.rs             # GBNF grammar engine
+│   └── choice.rs           # Simple enum/choice constraint
+├── tools/
+│   ├── mod.rs              # ToolDefinition, ToolCall, ToolResult types
+│   ├── template.rs         # ChatTemplate trait + built-in templates
+│   ├── detector.rs         # ToolCallDetector (logit processor)
+│   └── session.rs          # ToolSession (multi-turn loop)
+├── code/
+│   ├── mod.rs              # CodeGenerateRequest, CodeMode
+│   ├── fim.rs              # FimConfig, format detection
+│   ├── stop.rs             # CodeStopProcessor
+│   ├── suffix.rs           # SuffixConstraint
+│   └── repo_context.rs     # RepoContextFormatter
+├── engine.rs
+├── pipeline.rs
+├── logits.rs
+├── sampling.rs
+└── speculative.rs
+```
