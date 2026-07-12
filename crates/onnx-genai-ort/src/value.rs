@@ -311,6 +311,86 @@ impl Value {
         Ok(())
     }
 
+    /// Repack selected rows to the prefix of a rank-3 row-major tensor.
+    pub(crate) fn pack_rank3_rows_to_prefix(&mut self, sources: &[usize]) -> Result<()> {
+        if self.shape.len() != 3 {
+            return Err(OrtError::InvalidArgument(format!(
+                "pack_rank3_rows_to_prefix requires rank-3 tensor, got {:?}",
+                self.shape
+            )));
+        }
+        let batch = self.shape[0] as usize;
+        if sources.iter().any(|&row| row >= batch) {
+            return Err(OrtError::InvalidArgument(format!(
+                "row pack sources {sources:?} out of range for batch {batch}"
+            )));
+        }
+        let row_len = (self.shape[1] as usize)
+            .checked_mul(self.shape[2] as usize)
+            .ok_or_else(|| {
+                OrtError::InvalidArgument(format!("tensor shape too large: {:?}", self.shape))
+            })?;
+        match &mut self.backing {
+            TensorBacking::F32(data) => {
+                let mut prefix = Vec::with_capacity(sources.len() * row_len);
+                for &src in sources {
+                    let start = src * row_len;
+                    prefix.extend_from_slice(&data[start..start + row_len]);
+                }
+                data[..prefix.len()].copy_from_slice(&prefix);
+            }
+            TensorBacking::F16(data) => {
+                let mut prefix = Vec::with_capacity(sources.len() * row_len);
+                for &src in sources {
+                    let start = src * row_len;
+                    prefix.extend_from_slice(&data[start..start + row_len]);
+                }
+                data[..prefix.len()].copy_from_slice(&prefix);
+            }
+            TensorBacking::None => match self.dtype {
+                DataType::Float32 => {
+                    let ptr = tensor_data_ptr(self.ptr.as_ptr())?.cast::<f32>();
+                    let mut prefix = Vec::with_capacity(sources.len() * row_len);
+                    for &src in sources {
+                        // SAFETY: `src` was range-checked above.
+                        let row =
+                            unsafe { std::slice::from_raw_parts(ptr.add(src * row_len), row_len) };
+                        prefix.extend_from_slice(row);
+                    }
+                    // SAFETY: the prefix length is at most the tensor allocation.
+                    unsafe {
+                        std::slice::from_raw_parts_mut(ptr, prefix.len()).copy_from_slice(&prefix);
+                    }
+                }
+                DataType::Float16 => {
+                    let ptr = tensor_data_ptr(self.ptr.as_ptr())?.cast::<u16>();
+                    let mut prefix = Vec::with_capacity(sources.len() * row_len);
+                    for &src in sources {
+                        // SAFETY: `src` was range-checked above.
+                        let row =
+                            unsafe { std::slice::from_raw_parts(ptr.add(src * row_len), row_len) };
+                        prefix.extend_from_slice(row);
+                    }
+                    // SAFETY: the prefix length is at most the tensor allocation.
+                    unsafe {
+                        std::slice::from_raw_parts_mut(ptr, prefix.len()).copy_from_slice(&prefix);
+                    }
+                }
+                dtype => {
+                    return Err(OrtError::InvalidArgument(format!(
+                        "cannot pack static-cache rows for dtype {dtype:?}"
+                    )));
+                }
+            },
+            TensorBacking::I64(_) | TensorBacking::Alias(_) => {
+                return Err(OrtError::InvalidArgument(
+                    "cannot pack rows for non-owned or non-KV tensor".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Create a no-copy CPU tensor alias over the prefix of an existing tensor.
     ///
     /// The returned OrtValue has its own shape but points at the same underlying

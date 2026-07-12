@@ -131,14 +131,11 @@ pub struct StaticCacheDecodeSession<'a> {
 
 /// Batched stateful decode runner for static-cache TensorScatter models.
 ///
-/// One agent/session is assigned to one batch row. KV buffers are allocated once
-/// as `[B, MAX_LEN, KV_DIM]` per layer and bound in-place like
-/// [`StaticCacheDecodeSession`]. Each row has its own logical cursor used to
-/// build `write_indices[row]` and `nonpad_kv_seqlen[row]`.
-///
-/// Inactive rows are not logically advanced and can be reset/reused, but this
-/// first slice still binds the full fixed batch; inactive rows therefore still
-/// consume model compute until a future compacted-row/view optimization lands.
+/// One agent/session is assigned to one logical row id. KV buffers are allocated
+/// once as `[B, MAX_LEN, KV_DIM]` per layer and bound in-place like
+/// [`StaticCacheDecodeSession`]. Logical rows can be compacted to a packed
+/// physical prefix so active-only steps bind `[active, MAX_LEN, KV_DIM]` aliases
+/// and avoid running model compute for inactive rows.
 pub struct BatchedStaticCacheDecodeSession<'a> {
     session: &'a Session,
     binding: IoBinding,
@@ -146,6 +143,8 @@ pub struct BatchedStaticCacheDecodeSession<'a> {
     batch_size: usize,
     row_lens: Vec<usize>,
     active: Vec<bool>,
+    logical_to_physical: Vec<Option<usize>>,
+    physical_to_logical: Vec<Option<usize>>,
     mode: StaticCacheBindingMode,
     buffers: Vec<StaticCacheBuffer>,
 }
@@ -748,6 +747,8 @@ impl<'a> BatchedStaticCacheDecodeSession<'a> {
             ));
         }
         let buffers = allocate_static_cache_buffers(options.batch_size, &pairs)?;
+        let logical_to_physical = (0..batch_size).map(Some).collect::<Vec<_>>();
+        let physical_to_logical = (0..batch_size).map(Some).collect::<Vec<_>>();
         Ok(Self {
             session,
             binding: IoBinding::new(session)?,
@@ -755,6 +756,8 @@ impl<'a> BatchedStaticCacheDecodeSession<'a> {
             batch_size,
             row_lens: vec![0; batch_size],
             active: vec![true; batch_size],
+            logical_to_physical,
+            physical_to_logical,
             mode: StaticCacheBindingMode::InPlaceAlias,
             buffers,
         })
@@ -790,16 +793,42 @@ impl<'a> BatchedStaticCacheDecodeSession<'a> {
         Ok(self.active[row])
     }
 
+    /// Physical slot currently holding a logical row, if that row is assigned.
+    pub fn physical_slot(&self, row: usize) -> Result<Option<usize>> {
+        self.check_row(row)?;
+        Ok(self.logical_to_physical[row])
+    }
+
+    /// Logical row id currently held by a physical slot, if any.
+    pub fn logical_row_for_physical_slot(&self, slot: usize) -> Result<Option<usize>> {
+        self.check_row(slot)?;
+        Ok(self.physical_to_logical[slot])
+    }
+
+    /// Number of rows that will participate in an active-only step.
+    pub fn active_batch_size(&self) -> usize {
+        self.active.iter().filter(|&&active| active).count()
+    }
+
+    /// Fraction of the fixed batch skipped by an active-only step after compaction.
+    pub fn inactive_compute_fraction(&self) -> f32 {
+        if self.batch_size == 0 {
+            0.0
+        } else {
+            (self.batch_size - self.active_batch_size()) as f32 / self.batch_size as f32
+        }
+    }
+
+    /// Active logical rows in the physical order used by active-only logits.
     pub fn active_rows(&self) -> Vec<usize> {
-        self.active
+        self.physical_to_logical
             .iter()
-            .enumerate()
-            .filter_map(|(row, active)| active.then_some(row))
+            .filter_map(|row| row.and_then(|row| self.active[row].then_some(row)))
             .collect()
     }
 
-    /// Mark a row inactive. It remains in the bound batch and still costs
-    /// compute, but its logical cursor is not advanced by `prefill`/`step`.
+    /// Mark a row inactive. It remains assigned until `compact` packs active
+    /// rows to the prefix and frees inactive physical slots.
     pub fn deactivate_row(&mut self, row: usize) -> Result<()> {
         self.check_row(row)?;
         self.active[row] = false;
@@ -809,6 +838,11 @@ impl<'a> BatchedStaticCacheDecodeSession<'a> {
     /// Mark a retained row active without modifying its KV contents or cursor.
     pub fn activate_row(&mut self, row: usize) -> Result<()> {
         self.check_row(row)?;
+        if self.logical_to_physical[row].is_none() {
+            return Err(OrtError::InvalidArgument(format!(
+                "row {row} is not assigned to a physical slot; call assign_row/admit_row first"
+            )));
+        }
         self.active[row] = true;
         Ok(())
     }
@@ -817,6 +851,16 @@ impl<'a> BatchedStaticCacheDecodeSession<'a> {
     /// agent/session.
     pub fn assign_row(&mut self, row: usize) -> Result<()> {
         self.check_row(row)?;
+        let physical = match self.logical_to_physical[row] {
+            Some(physical) => physical,
+            None => self.free_physical_slot().ok_or_else(|| {
+                OrtError::InvalidArgument(format!(
+                    "no free physical slot available to assign row {row}; deactivate and compact first"
+                ))
+            })?,
+        };
+        self.logical_to_physical[row] = Some(physical);
+        self.physical_to_logical[physical] = Some(row);
         self.binding.clear()?;
         for buffer in &mut self.buffers {
             Arc::get_mut(&mut buffer.current)
@@ -826,7 +870,7 @@ impl<'a> BatchedStaticCacheDecodeSession<'a> {
                         buffer.input_name
                     ))
                 })?
-                .zero_rank3_row(row)?;
+                .zero_rank3_row(physical)?;
             if let Some(alternate) = buffer.alternate.as_mut() {
                 Arc::get_mut(alternate)
                     .ok_or_else(|| {
@@ -835,12 +879,54 @@ impl<'a> BatchedStaticCacheDecodeSession<'a> {
                             buffer.output_name
                         ))
                     })?
-                    .zero_rank3_row(row)?;
+                    .zero_rank3_row(physical)?;
             }
         }
         self.row_lens[row] = 0;
         self.active[row] = true;
         Ok(())
+    }
+
+    /// Alias for [`Self::assign_row`] that names the continuous-batching admit
+    /// operation Sebastian's manager will call for a recycled logical row id.
+    pub fn admit_row(&mut self, row: usize) -> Result<()> {
+        self.assign_row(row)
+    }
+
+    /// Replace the active logical row set and compact it in the provided order.
+    pub fn set_active_rows(&mut self, rows: &[usize]) -> Result<()> {
+        let mut seen = vec![false; self.batch_size];
+        for &row in rows {
+            self.check_row(row)?;
+            if self.logical_to_physical[row].is_none() {
+                return Err(OrtError::InvalidArgument(format!(
+                    "row {row} is not assigned to a physical slot"
+                )));
+            }
+            if std::mem::replace(&mut seen[row], true) {
+                return Err(OrtError::InvalidArgument(format!(
+                    "row {row} appears more than once in active set"
+                )));
+            }
+        }
+        self.active.fill(false);
+        for &row in rows {
+            self.active[row] = true;
+        }
+        self.compact_active_rows_in_order(rows)
+    }
+
+    /// Pack active logical rows into physical slots `0..active_count`.
+    ///
+    /// ORT IoBinding binds whole OrtValues, not gathered batch-dimension views,
+    /// so active-only execution uses compaction plus prefix aliases. The copy is
+    /// `active_count * MAX_LEN * KV_DIM` per KV tensor when rows move, paid only
+    /// when membership/order changes; subsequent decode steps avoid fixed-B
+    /// model compute for inactive rows.
+    pub fn compact(&mut self) -> Result<usize> {
+        let rows = self.active_rows();
+        self.compact_active_rows_in_order(&rows)?;
+        Ok(rows.len())
     }
 
     /// Rewind one row's logical write cursor. Stale suffix slots are ignored by
@@ -900,6 +986,25 @@ impl<'a> BatchedStaticCacheDecodeSession<'a> {
     ) -> Result<Value> {
         self.run_batched_static_chunk(next_token_ids, position_ids, 1, Some(advance_rows))?;
         self.last_logits()
+    }
+
+    /// Scatter one token per active row after compacting active rows to the
+    /// physical prefix. Inputs and returned logits are ordered by
+    /// [`Self::active_rows`], and the returned tensor has shape
+    /// `[active_count, 1, vocab]`.
+    pub fn step_active(&mut self, next_token_ids: &[i64], position_ids: &[i64]) -> Result<Value> {
+        self.run_active_static_chunk(next_token_ids, position_ids, 1, None)
+    }
+
+    /// Active-only variant of [`Self::step_select`]. `advance_active_rows` is
+    /// indexed in active-row order, not fixed logical-row order.
+    pub fn step_active_select(
+        &mut self,
+        next_token_ids: &[i64],
+        position_ids: &[i64],
+        advance_active_rows: &[bool],
+    ) -> Result<Value> {
+        self.run_active_static_chunk(next_token_ids, position_ids, 1, Some(advance_active_rows))
     }
 
     /// Extract logits for one row/sequence position from a `[B, S, vocab]`
@@ -966,6 +1071,11 @@ impl<'a> BatchedStaticCacheDecodeSession<'a> {
                     self.signature.max_len
                 )));
             }
+            if advance && self.logical_to_physical[row].is_none() {
+                return Err(OrtError::InvalidArgument(format!(
+                    "active row {row} is not assigned to a physical slot"
+                )));
+            }
         }
         match self.try_run_batched_static_chunk(input_ids, position_ids, seq_len, &advances) {
             Ok(()) => {
@@ -995,6 +1105,223 @@ impl<'a> BatchedStaticCacheDecodeSession<'a> {
         }
     }
 
+    fn run_active_static_chunk(
+        &mut self,
+        input_ids: &[i64],
+        position_ids: &[i64],
+        seq_len: usize,
+        advance_active_rows: Option<&[bool]>,
+    ) -> Result<Value> {
+        self.compact()?;
+        let rows = self.active_rows();
+        if rows.is_empty() {
+            return Err(OrtError::InvalidArgument(
+                "active-only static-cache step requires at least one active row".into(),
+            ));
+        }
+        if let Some(advance_active_rows) = advance_active_rows
+            && advance_active_rows.len() != rows.len()
+        {
+            return Err(OrtError::InvalidArgument(format!(
+                "advance_active_rows length {} does not match active batch {}",
+                advance_active_rows.len(),
+                rows.len()
+            )));
+        }
+        if input_ids.len() != rows.len() * seq_len {
+            return Err(OrtError::InvalidArgument(format!(
+                "input_ids length {} does not match [active={}, S={}]",
+                input_ids.len(),
+                rows.len(),
+                seq_len
+            )));
+        }
+        let advances = rows
+            .iter()
+            .enumerate()
+            .map(|(index, _)| advance_active_rows.is_none_or(|mask| mask[index]))
+            .collect::<Vec<_>>();
+        for (&row, &advance) in rows.iter().zip(&advances) {
+            if advance && self.row_lens[row] + seq_len > self.signature.max_len {
+                return Err(OrtError::InvalidArgument(format!(
+                    "row {row} static-cache write {}..{} exceeds capacity {}",
+                    self.row_lens[row],
+                    self.row_lens[row] + seq_len,
+                    self.signature.max_len
+                )));
+            }
+        }
+
+        match self.try_run_active_static_chunk(input_ids, position_ids, seq_len, &rows, &advances) {
+            Ok(logits) => {
+                for (&row, advance) in rows.iter().zip(advances) {
+                    if advance {
+                        self.row_lens[row] += seq_len;
+                    }
+                }
+                Ok(logits)
+            }
+            Err(first_err) if self.mode == StaticCacheBindingMode::InPlaceAlias => {
+                self.enable_handle_swap()?;
+                let logits = self
+                    .try_run_active_static_chunk(input_ids, position_ids, seq_len, &rows, &advances)
+                    .map_err(|second_err| {
+                        OrtError::InvalidArgument(format!(
+                            "active static-cache in-place alias run failed ({first_err}); handle-swap fallback also failed ({second_err})"
+                        ))
+                    })?;
+                for (&row, advance) in rows.iter().zip(advances) {
+                    if advance {
+                        self.row_lens[row] += seq_len;
+                    }
+                }
+                Ok(logits)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    fn try_run_active_static_chunk(
+        &mut self,
+        input_ids: &[i64],
+        position_ids: &[i64],
+        seq_len: usize,
+        rows: &[usize],
+        advances: &[bool],
+    ) -> Result<Value> {
+        let batch = rows.len() as i64;
+        let input_ids_value = Value::from_slice_i64(input_ids, &[batch, seq_len as i64])?;
+        let position_ids_value = if self.signature.has_position_ids {
+            if position_ids.len() != input_ids.len() {
+                return Err(OrtError::InvalidArgument(
+                    "position_ids length must match input_ids length".into(),
+                ));
+            }
+            Some(Value::from_slice_i64(
+                position_ids,
+                &[batch, seq_len as i64],
+            )?)
+        } else {
+            None
+        };
+        let write_indices = rows
+            .iter()
+            .map(|&row| self.row_lens[row] as i64)
+            .collect::<Vec<_>>();
+        let nonpad_kv_seqlen = rows
+            .iter()
+            .zip(advances)
+            .map(|(&row, &advance)| {
+                (if advance {
+                    self.row_lens[row] + seq_len
+                } else {
+                    self.row_lens[row]
+                }) as i64
+            })
+            .collect::<Vec<_>>();
+        let write_indices = Value::from_slice_i64(&write_indices, &[batch])?;
+        let nonpad_kv_seqlen = Value::from_slice_i64(&nonpad_kv_seqlen, &[batch])?;
+
+        struct PrefixBinding {
+            input_name: String,
+            output_name: String,
+            input: Value,
+            output: Option<Value>,
+        }
+
+        let mut prefix_bindings = Vec::with_capacity(self.buffers.len());
+        for buffer in &self.buffers {
+            let shape = [batch, buffer.current.shape()[1], buffer.current.shape()[2]];
+            let input = Value::alias_with_shape(Arc::clone(&buffer.current), &shape)?;
+            let output = match self.mode {
+                StaticCacheBindingMode::InPlaceAlias => None,
+                StaticCacheBindingMode::HandleSwap => {
+                    let alternate = buffer.alternate.as_ref().ok_or_else(|| {
+                        OrtError::InvalidArgument(format!(
+                            "missing static-cache alternate buffer for '{}'",
+                            buffer.output_name
+                        ))
+                    })?;
+                    Some(Value::alias_with_shape(Arc::clone(alternate), &shape)?)
+                }
+            };
+            prefix_bindings.push(PrefixBinding {
+                input_name: buffer.input_name.clone(),
+                output_name: buffer.output_name.clone(),
+                input,
+                output,
+            });
+        }
+
+        self.binding.clear()?;
+        for input in self.session.inputs() {
+            match input.name.as_str() {
+                "input_ids" => self.binding.bind_input(&input.name, &input_ids_value)?,
+                "position_ids" => {
+                    let Some(position_ids_value) = position_ids_value.as_ref() else {
+                        return Err(OrtError::InvalidArgument(
+                            "model requires position_ids but none were prepared".into(),
+                        ));
+                    };
+                    self.binding.bind_input(&input.name, position_ids_value)?;
+                }
+                "write_indices" => self.binding.bind_input(&input.name, &write_indices)?,
+                "nonpad_kv_seqlen" => self.binding.bind_input(&input.name, &nonpad_kv_seqlen)?,
+                name => {
+                    let Some(binding) = prefix_bindings
+                        .iter()
+                        .find(|binding| binding.input_name == name)
+                    else {
+                        return Err(OrtError::InvalidArgument(format!(
+                            "unsupported static-cache input '{}'",
+                            input.name
+                        )));
+                    };
+                    self.binding.bind_input(&input.name, &binding.input)?;
+                }
+            }
+        }
+
+        let mut borrowed_outputs = Vec::new();
+        for output in self.session.output_names() {
+            if let Some(binding) = prefix_bindings
+                .iter()
+                .find(|binding| binding.output_name == *output)
+            {
+                let output_value = binding.output.as_ref().unwrap_or(&binding.input);
+                borrowed_outputs.push(output_value.raw_ptr_addr());
+                self.binding.bind_output(output, output_value)?;
+            } else {
+                self.binding
+                    .bind_output_to_device(output, &MemoryInfo::cpu()?)?;
+            }
+        }
+
+        self.session.run_with_binding(&self.binding)?;
+        let outputs = self.binding.output_values_or_borrowed(&borrowed_outputs)?;
+        if self.mode == StaticCacheBindingMode::HandleSwap {
+            for buffer in &mut self.buffers {
+                let alternate = buffer.alternate.as_mut().ok_or_else(|| {
+                    OrtError::InvalidArgument(format!(
+                        "missing static-cache alternate buffer for '{}'",
+                        buffer.output_name
+                    ))
+                })?;
+                std::mem::swap(&mut buffer.current, alternate);
+            }
+        }
+        for (name, value) in self.session.output_names().iter().zip(outputs) {
+            if is_logits_output(name) {
+                return value.ok_or_else(|| {
+                    OrtError::InvalidArgument("logits unexpectedly aliased a KV buffer".into())
+                });
+            }
+        }
+        Err(OrtError::InvalidArgument(
+            "model did not produce logits".into(),
+        ))
+    }
+
     fn try_run_batched_static_chunk(
         &mut self,
         input_ids: &[i64],
@@ -1011,30 +1338,56 @@ impl<'a> BatchedStaticCacheDecodeSession<'a> {
                 seq_len
             )));
         }
-        let input_ids_value = Value::from_slice_i64(input_ids, &[batch, seq_len as i64])?;
-        let position_ids_value = if self.signature.has_position_ids {
+        let mut physical_input_ids = vec![0_i64; input_ids.len()];
+        let mut physical_position_ids = if self.signature.has_position_ids {
             if position_ids.len() != input_ids.len() {
                 return Err(OrtError::InvalidArgument(
                     "position_ids length must match input_ids length".into(),
                 ));
             }
+            vec![0_i64; position_ids.len()]
+        } else {
+            Vec::new()
+        };
+        for physical in 0..self.batch_size {
+            let Some(logical) = self.physical_to_logical[physical] else {
+                continue;
+            };
+            let src = logical * seq_len;
+            let dst = physical * seq_len;
+            physical_input_ids[dst..dst + seq_len].copy_from_slice(&input_ids[src..src + seq_len]);
+            if self.signature.has_position_ids {
+                physical_position_ids[dst..dst + seq_len]
+                    .copy_from_slice(&position_ids[src..src + seq_len]);
+            }
+        }
+        let input_ids_value = Value::from_slice_i64(&physical_input_ids, &[batch, seq_len as i64])?;
+        let position_ids_value = if self.signature.has_position_ids {
             Some(Value::from_slice_i64(
-                position_ids,
+                &physical_position_ids,
                 &[batch, seq_len as i64],
             )?)
         } else {
             None
         };
-        let write_indices = self
-            .row_lens
-            .iter()
-            .map(|len| *len as i64)
+        let write_indices = (0..self.batch_size)
+            .map(|physical| {
+                self.physical_to_logical[physical]
+                    .map(|row| self.row_lens[row])
+                    .unwrap_or(0) as i64
+            })
             .collect::<Vec<_>>();
-        let nonpad_kv_seqlen = self
-            .row_lens
-            .iter()
-            .zip(advances)
-            .map(|(len, advance)| if *advance { len + seq_len } else { *len } as i64)
+        let nonpad_kv_seqlen = (0..self.batch_size)
+            .map(|physical| {
+                let Some(row) = self.physical_to_logical[physical] else {
+                    return 0_i64;
+                };
+                if advances[row] {
+                    (self.row_lens[row] + seq_len) as i64
+                } else {
+                    self.row_lens[row] as i64
+                }
+            })
             .collect::<Vec<_>>();
         let write_indices = Value::from_slice_i64(&write_indices, &[batch])?;
         let nonpad_kv_seqlen = Value::from_slice_i64(&nonpad_kv_seqlen, &[batch])?;
@@ -1140,6 +1493,75 @@ impl<'a> BatchedStaticCacheDecodeSession<'a> {
         }
         self.mode = StaticCacheBindingMode::HandleSwap;
         Ok(())
+    }
+
+    fn compact_active_rows_in_order(&mut self, rows: &[usize]) -> Result<()> {
+        let source_slots = rows
+            .iter()
+            .map(|&row| {
+                self.check_row(row)?;
+                if !self.active[row] {
+                    return Err(OrtError::InvalidArgument(format!(
+                        "row {row} is not active"
+                    )));
+                }
+                self.logical_to_physical[row].ok_or_else(|| {
+                    OrtError::InvalidArgument(format!(
+                        "row {row} is not assigned to a physical slot"
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        if source_slots
+            .iter()
+            .copied()
+            .enumerate()
+            .all(|(target, source)| target == source)
+            && self
+                .physical_to_logical
+                .iter()
+                .enumerate()
+                .all(|(physical, row)| physical < rows.len() || row.is_none())
+        {
+            return Ok(());
+        }
+
+        self.binding.clear()?;
+        for buffer in &mut self.buffers {
+            Arc::get_mut(&mut buffer.current)
+                .ok_or_else(|| {
+                    OrtError::InvalidArgument(format!(
+                        "static-cache buffer '{}' is still borrowed",
+                        buffer.input_name
+                    ))
+                })?
+                .pack_rank3_rows_to_prefix(&source_slots)?;
+            if let Some(alternate) = buffer.alternate.as_mut() {
+                Arc::get_mut(alternate)
+                    .ok_or_else(|| {
+                        OrtError::InvalidArgument(format!(
+                            "static-cache alternate buffer '{}' is still borrowed",
+                            buffer.output_name
+                        ))
+                    })?
+                    .pack_rank3_rows_to_prefix(&source_slots)?;
+            }
+        }
+
+        let mut logical_to_physical = vec![None; self.batch_size];
+        let mut physical_to_logical = vec![None; self.batch_size];
+        for (physical, &row) in rows.iter().enumerate() {
+            logical_to_physical[row] = Some(physical);
+            physical_to_logical[physical] = Some(row);
+        }
+        self.logical_to_physical = logical_to_physical;
+        self.physical_to_logical = physical_to_logical;
+        Ok(())
+    }
+
+    fn free_physical_slot(&self) -> Option<usize> {
+        self.physical_to_logical.iter().position(Option::is_none)
     }
 
     fn check_row(&self, row: usize) -> Result<()> {

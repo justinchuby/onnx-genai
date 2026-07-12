@@ -238,6 +238,136 @@ fn batched_static_cache_matches_unbatched_rows_and_reuses_slots() {
     );
 }
 
+#[test]
+fn batched_static_cache_active_compaction_skips_inactive_rows_and_admits_replacement() {
+    let env = Environment::new("batched-static-cache-active-compaction-test").expect("env");
+    let session =
+        Session::new(&env, &tiny_scatter_llm(), SessionOptions::default()).expect("session");
+    let prompts = [
+        vec![1_i64, 5],
+        vec![2_i64, 6],
+        vec![3_i64, 7],
+        vec![4_i64, 8],
+    ];
+    let expected = prompts
+        .iter()
+        .map(|prompt| static_cache_greedy_trace(&session, prompt, 2))
+        .collect::<Vec<_>>();
+
+    let mut batched =
+        BatchedStaticCacheDecodeSession::new(&session, StaticCacheDecodeOptions { batch_size: 4 })
+            .expect("batched static decode session");
+
+    for prompt_index in 0..2 {
+        let ids = prompts
+            .iter()
+            .map(|prompt| prompt[prompt_index])
+            .collect::<Vec<_>>();
+        let positions = vec![prompt_index as i64; prompts.len()];
+        let logits = batched.step(&ids, &positions).expect("prompt step");
+        for (row, trace) in expected.iter().enumerate() {
+            let row_logits =
+                BatchedStaticCacheDecodeSession::row_logits(&logits, row, 0).expect("row logits");
+            assert_close(&row_logits, &trace.logits[prompt_index]);
+        }
+    }
+
+    let first_generated_ids = [0_usize, 1, 2, 3]
+        .into_iter()
+        .map(|row| argmax(&expected[row].logits[1]) as i64)
+        .collect::<Vec<_>>();
+    let full_logits = batched
+        .step(&first_generated_ids, &[2, 2, 2, 2])
+        .expect("full first generated step");
+    for &row in &[0_usize, 2] {
+        let row_logits =
+            BatchedStaticCacheDecodeSession::row_logits(&full_logits, row, 0).expect("row logits");
+        assert_close(&row_logits, &expected[row].logits[2]);
+        assert_eq!(argmax(&row_logits), argmax(&expected[row].logits[2]));
+    }
+    let mut full_reference =
+        BatchedStaticCacheDecodeSession::new(&session, StaticCacheDecodeOptions { batch_size: 4 })
+            .expect("full reference");
+    for prompt_index in 0..2 {
+        let ids = prompts
+            .iter()
+            .map(|prompt| prompt[prompt_index])
+            .collect::<Vec<_>>();
+        full_reference
+            .step(&ids, &vec![prompt_index as i64; prompts.len()])
+            .expect("reference prompt step");
+    }
+    full_reference
+        .step(&first_generated_ids, &[2, 2, 2, 2])
+        .expect("reference first generated step");
+
+    batched.deactivate_row(1).expect("deactivate row 1");
+    batched.deactivate_row(3).expect("deactivate row 3");
+    assert_eq!(batched.compact().expect("compact active rows"), 2);
+    assert_eq!(batched.active_rows(), vec![0, 2]);
+    assert_eq!(batched.physical_slot(0).expect("row 0 slot"), Some(0));
+    assert_eq!(batched.physical_slot(2).expect("row 2 slot"), Some(1));
+    assert_eq!(batched.physical_slot(1).expect("row 1 slot"), None);
+    assert_eq!(
+        batched.logical_row_for_physical_slot(1).expect("slot 1"),
+        Some(2)
+    );
+    assert!((batched.inactive_compute_fraction() - 0.5).abs() < f32::EPSILON);
+
+    let second_generated_ids = [0_usize, 2]
+        .into_iter()
+        .map(|row| argmax(&expected[row].logits[2]) as i64)
+        .collect::<Vec<_>>();
+    let full_second_ids = [0_usize, 1, 2, 3]
+        .into_iter()
+        .map(|row| argmax(&expected[row].logits[2]) as i64)
+        .collect::<Vec<_>>();
+    let full_reference_logits = full_reference
+        .step(&full_second_ids, &[3, 3, 3, 3])
+        .expect("reference second generated step");
+    let active_logits = batched
+        .step_active(&second_generated_ids, &[3, 3])
+        .expect("active second generated step");
+    assert_eq!(active_logits.shape(), &[2, 1, 32]);
+    for (active_index, row) in [0_usize, 2].into_iter().enumerate() {
+        let row_logits =
+            BatchedStaticCacheDecodeSession::row_logits(&active_logits, active_index, 0)
+                .expect("active row logits");
+        assert_close(&row_logits, &expected[row].logits[3]);
+        let full_row_logits =
+            BatchedStaticCacheDecodeSession::row_logits(&full_reference_logits, row, 0)
+                .expect("full reference row logits");
+        assert_close(&row_logits, &full_row_logits);
+        assert_eq!(argmax(&row_logits), argmax(&expected[row].logits[3]));
+    }
+
+    batched.admit_row(1).expect("admit replacement row 1");
+    assert_eq!(batched.physical_slot(1).expect("replacement slot"), Some(2));
+    assert_eq!(batched.row_len(1).expect("replacement len"), 0);
+    assert_eq!(batched.active_rows(), vec![0, 2, 1]);
+
+    let replacement = static_cache_greedy_trace(&session, &[9_i64, 10], 0);
+    for (index, token) in replacement.input_tokens.iter().enumerate() {
+        let logits = batched
+            .step_active_select(
+                &[0, 0, *token],
+                &[
+                    batched.row_len(0).expect("row 0 len") as i64,
+                    0,
+                    index as i64,
+                ],
+                &[false, false, true],
+            )
+            .expect("replacement active prefill");
+        let row_logits =
+            BatchedStaticCacheDecodeSession::row_logits(&logits, 2, 0).expect("replacement logits");
+        assert_close(&row_logits, &replacement.logits[index]);
+    }
+    assert_eq!(batched.row_len(1).expect("replacement final len"), 2);
+    assert_eq!(batched.active_batch_size(), 3);
+    assert!((batched.inactive_compute_fraction() - 0.25).abs() < f32::EPSILON);
+}
+
 struct StaticTrace {
     input_tokens: Vec<i64>,
     logits: Vec<Vec<f32>>,
