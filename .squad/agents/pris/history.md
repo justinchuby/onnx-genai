@@ -25,3 +25,6 @@ Delivered Phase 3 validation: real TinyStories coherent CLI/HTTP generation, 12-
 
 ## 2026-07-12T12:02:00-07:00 — Qwen, Hermes, VLM, and long-context validation delivered
 Validated Qwen2.5-0.5B Mobius builds and coherent generation, HTTP tool use, Hermes/coding-agent tool-loop acceptance, tiny VLM fixture scaffolding, static-cache scatter models, and flat 25-27 ms/token long-context decode.
+
+## 2026-07-12T13:14:00-07:00 — Harness hardening merged
+Pris's coding-agent harness sandbox is now in decisions: workspace path confinement, no shell execution, argv allow-list, guarded Python scripts, symlink/traversal rejection, and passing self-test.

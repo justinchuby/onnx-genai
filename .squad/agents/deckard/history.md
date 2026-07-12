@@ -26,3 +26,6 @@ Delivered Phase 3 KV work: hot/cold LRU page tiering plus opt-in `KvDType::Int8`
 
 ## 2026-07-12T12:02:00-07:00 — ORT chat-template and decode substrate delivered
 Delivered pipeline schema/loader support, MiniJinja chat templates, multi-EOS discovery, fp16 Value helpers, zero-copy IoBinding DecodeSession, and StaticCacheDecodeSession with runtime-owned static KV buffers.
+
+## 2026-07-12T13:14:00-07:00 — ORT hardening and batching notes merged
+Deckard's GPU EP, batched static-cache decode, and ORT checksum notes are now in decisions. WebGPU/CoreML are selectable but slower than CPU on small Qwen decode; batched static decode matches unbatched but needs compaction.

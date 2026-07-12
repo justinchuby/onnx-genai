@@ -6,3 +6,5 @@
 - **Requested by:** Justin Chu
 - **Joined:** 2026-07-12
 
+## 2026-07-12T13:14:00-07:00 — Engine quality review merged
+Gaff's review is now in decisions: engine.rs is a ~3,300-line god module. Refactor toward shared decode loop, module split, DecodeBackend, Sampler, proposer/verifier seams, and targeted tests.

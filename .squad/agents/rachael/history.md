@@ -20,3 +20,6 @@ Delivered Phase 3 server hardening: prompt-token usage accounting, SSE stop-sequ
 
 ## 2026-07-12T12:02:00-07:00 — Tool-use server integration delivered
 Delivered OpenAI response_format JSON constraints, tools/tool_choice/tool-role handling, <tool_call> parsing into tool_calls, and forced tool_choice with generated Lark %json grammar.
+
+## 2026-07-12T13:14:00-07:00 — Server hardening merged
+Rachael's server DoS/session hardening is now in decisions: max_output_tokens=4096, max_sessions=256 LRU, 128-bit CSPRNG session ids, context-token caps, and loopback/no-auth deployment notes.

@@ -1,5 +1,5 @@
 # Now
 
-**Updated:** 2026-07-12T12:02:00-07:00
+**Updated:** 2026-07-12T13:14:00-07:00
 
-Current focus: Phases 1-4 + tool use/grammar + Qwen + Hermes-agent E2E + long-context O(1)/token all done. Next per DESIGN §23-28: FIM (§23), Min-P/freq/presence samplers (§24), extensibility traits (§25), batched multi-agent serving + PAUSED-on-tool (§26), advanced speculative MTP/Medusa/EAGLE (§27), vLLM speculators (§28); plus paged-attention milestone and onnx.helper->onnxscript fixture refactor.
+Current focus: Reviews done + security hardening shipped. Refactoring engine.rs (decompose + DecodeBackend trait) before §26. Pending: SpeculativeProposer/Sampler traits, §26 batched serving (with row compaction + unified KV per Sebastian), §27/§28 speculative, paged-attention, onnx.helper->onnxscript fixture refactor.

@@ -22,3 +22,6 @@ Phase 3 plan completed and executed. Team delivered speculative decoding, tiered
 
 ## 2026-07-12T12:02:00-07:00 — Phase 4 and long-context plans completed
 Roy's Phase 4, tool-use/grammar, and long-context plans were executed: pipeline execution, constrained decoding, OpenAI tool use, Qwen/Hermes validation, and O(1)/token static-cache decode are now recorded. Next roadmap follows DESIGN §23-28 plus paged attention.
+
+## 2026-07-12T13:14:00-07:00 — Architecture review merged
+Roy's workspace review is now in decisions: crate split is sound, but engine.rs must be decomposed and §26 needs an engine loop/channel plus DecodeBackend before true batching. §27/§28 need SpeculativeProposer/verifier seams.

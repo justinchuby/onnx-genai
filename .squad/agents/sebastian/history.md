@@ -6,3 +6,5 @@
 - **Requested by:** Justin Chu
 - **Joined:** 2026-07-12
 
+## 2026-07-12T13:14:00-07:00 — Performance review merged
+Sebastian's perf review is now in decisions. §26 should prioritize active-row compaction, ORT KV as hot source of truth, fewer per-step allocations, direct/borrowed logits access, and explicit snapshot/import/export for paged KV.

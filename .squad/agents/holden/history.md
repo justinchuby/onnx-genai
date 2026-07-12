@@ -6,3 +6,5 @@
 - **Requested by:** Justin Chu
 - **Joined:** 2026-07-12
 
+## 2026-07-12T13:14:00-07:00 — Security audit merged
+Holden's unsafe/resource/supply-chain audit is now in decisions. Current unsafe invariants are documented and sound under today's constraints; cargo audit found 0 vulns and 2 unmaintained transitive tokenizers warnings.

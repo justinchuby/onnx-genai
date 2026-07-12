@@ -1712,3 +1712,65 @@ Blocked/ordered:
 - **Long-context efficiency:** Mobius `--static-cache` tensor-scatter models use runtime-owned KV buffers; ORT `DecodeSession` enables zero-copy present-to-past, `StaticCacheDecodeSession` scatters in place, and engine decode migrated to these paths. Benchmark latency stayed flat at ~25-27 ms/token from 64 to 2048 context with 48 MiB preallocated KV and no per-step growth, proving O(1)/token; 128K is a larger-buffer extension.
 - **Directives:** runtime owns KV buffers and scatter is only a hint; use this project's inference-metadata config rather than ORT-GenAI `genai_config`; paged attention is the next long-context milestone; Python-built ONNX models should use onnxscript/onnx-ir, not `onnx.helper`; commit and push per agent; `Cargo.lock` is committed.
 **Why:** These decisions close Phase 4 plus tool-use/grammar and long-context acceptance, while preserving the directives that govern the next design increments.
+
+---
+
+### 2026-07-12T13:14:00-07:00: New reviewers and specialists joined
+**By:** Scribe
+**What:** Added Gaff (Code Reviewer / Quality), Sebastian (Performance Engineer), and Holden (Security Engineer) to the working team context.
+**Why:** Recent work now includes dedicated quality, performance, and security review tracks alongside Roy, Deckard, Batty, Rachael, and Pris.
+
+---
+
+### 2026-07-12T13:14:00-07:00: §23/§24 feature milestones and ORT execution-provider work
+**By:** Scribe
+**What:** Merged Batty and Deckard feature notes:
+- §24 sampling now includes `MinPProcessor`, `FrequencyPenaltyProcessor`, and `PresencePenaltyProcessor` wired through additive `GenerateOptions` fields. Processor order is repetition/frequency/presence penalties, hard stops/constraints, temperature, top-k, top-p, then min-p.
+- §23 FIM adds `FimConfig`, `FimFormat::{PSM, SPM}`, tokenizer-config auto-detection for common coder-model tokens, `Engine::fim_config()`, `generate_fim`, and `generate_fim_with_config`; generated output is only the filled middle and FIM sentinels are added to stops.
+- ORT execution-provider selection is available through `SessionOptions::with_execution_provider(...)` and `ONNX_GENAI_EP=cpu|webgpu|coreml`; unavailable or incompatible GPU EPs warn and fall back to CPU. On the tested Qwen2.5-0.5B workloads, WebGPU and CoreML produced matching greedy tokens but were slower than CPU for small decode workloads.
+- `BatchedStaticCacheDecodeSession` supports fixed B>1 static-cache rows with one ORT forward, per-row cursors/logits, rewind, deactivate/activate, and slot reuse. Validation showed batched rows match independent unbatched `StaticCacheDecodeSession` traces.
+**Why:** These close recent sampler, FIM, EP-selection, and first batched static-cache slices while preserving the caveat that inactive batched rows still consume compute until row compaction lands.
+
+---
+
+### 2026-07-12T13:14:00-07:00: Architecture and quality review findings
+**By:** Roy and Gaff, merged by Scribe
+**What:** The crate split remains sound: metadata, ORT, KV/cache, scheduler, engine, server, and facade largely match the intended design layers. The main architectural blocker is `crates/onnx-genai-engine/src/engine.rs`, now about 3,300 lines and acting as a god module for API DTOs, loading, sessions, scheduler driving, prefix/KV bridging, decode selection, speculative verification, FIM, constraints, sampling, logits, and tests. Server and ORT decode modules are also growing.
+
+Prioritized refactor direction:
+- Decompose `engine.rs` into API, loader, session state, decode backend, KV bridge, processor/sampler, speculative, and FIM integration modules before §26-§28 expansion.
+- Introduce a `DecodeBackend` / `DecodeSessionOps` seam before true batching, paged attention, hidden-state verifier runs, MTP, or EAGLE.
+- Replace whole-call `Arc<Mutex<Engine>>` serving with an engine runtime loop/channel for §26; the scheduler should emit real batch plans consumed by the decode backend.
+- Move current draft-model greedy speculation behind `SpeculativeProposer` + verifier traits before §27/§28.
+- Add a stateful `Sampler` trait with RNG/seed handling; current generation still routes deterministic `rng_value` plumbing in many paths.
+- Keep DESIGN §25 extensibility incremental: use Rust traits and `EngineBuilder` first, not a dynamic plugin ABI.
+**Why:** §26 batched serving, §27 advanced speculation, and §28 vLLM speculator compatibility will otherwise keep editing the same engine loops and hard-coded backend matches, increasing merge conflicts and hidden correctness risk.
+
+---
+
+### 2026-07-12T13:14:00-07:00: Security review baseline, fixed hardening, and remaining warnings
+**By:** Security review, Holden, Pris, Deckard, and Rachael; merged by Scribe
+**What:** Security review found the FFI/unsafe baseline solid: ORT tensor creation validates shapes and lifetimes, `BatchedStaticCacheDecodeSession` bounds-checks row/cursor access, chat templates render data rather than compiling user templates, KV is safe Rust, and server JSON/tool parsing avoids unchecked attacker-data unwraps.
+
+Fixed issues:
+- `scripts/coding_agent.py` harness is sandboxed: workspace-confined paths, no `shell=True`, allow-listed argv, command-output caps, guarded Python script execution, symlink/traversal/absolute-path escape rejection, and a passing self-test.
+- ORT download supply-chain hardening now verifies pinned SHA-256 digests for official ONNX Runtime 1.27.0 Linux x64, macOS arm64, and Windows x64 archives before extraction; missing future digests warn loudly and should be added before relying on that auto-download path.
+- Unsafe invariants for `Environment`, `Session`, `SharedEngine`, and `stable_session_ref` were documented. They are sound under current ORT contracts, mutex serialization, boxed-session allocation stability, and Engine drop ordering, but should not be carried unchanged into true concurrent §26 serving.
+- Server DoS/session hardening added `max_output_tokens=4096`, `max_sessions=256` LRU eviction, 128-bit CSPRNG `sess-...` ids, model-context/token cap validation, and bind-site documentation about loopback/no-auth/auth-proxy expectations.
+- `cargo audit` reported 0 vulnerabilities. Two unmaintained transitive warnings remain through `tokenizers` (`number_prefix` via `indicatif`, and `paste`); track upstream updates and avoid adding direct `paste` usage.
+**Why:** The immediate command-execution, native-download integrity, predictable session-id, unbounded-output, and unbounded-session risks are addressed, while future §26 work still needs stronger ownership/concurrency invariants and broader resource-budget enforcement.
+
+---
+
+### 2026-07-12T13:14:00-07:00: Sebastian performance review and §26 perf queue
+**By:** Sebastian, merged by Scribe
+**What:** Performance review found the key §26 blocker is active-row utilization: `BatchedStaticCacheDecodeSession` logically skips inactive rows but still binds and runs the full fixed batch, so compute efficiency is roughly `active_rows / batch_size`. Implement active-row compaction with logical-to-physical row mapping, packed active rows, prefix row views, and logits scatter before treating paused rows as free.
+
+Additional perf direction:
+- Pick one live KV source of truth per path. ORT static/shared-buffer KV should be hot-path truth now; paged/tiered/int8 KV is not live source-of-truth on current ORT runner paths and should become explicit snapshot/import/export or future page-backed serving, not an always-on f32 mirror.
+- Prefer static-cache or validated shared-buffer contracts for long context; past/present zero-copy still has O(context) ORT present allocation/output growth and attention-mask allocation.
+- Reduce per-step hot-path allocations by reusing small input buffers/Values, precomputing binding plans, caching memory info and output maps, and avoiding full rebinds when shapes are stable.
+- Avoid full logits tensor clones and row re-clones; add borrowed/range logit access or process final-row logits in place.
+- Add static-cache chunk append, carry fp16 KV dtype through engine/snapshot paths, keep int8 for cold snapshots unless redesigned for in-place per-slot/group quantization, and prevent runner metadata-only pages from being mistaken for valid KV tensors.
+**Why:** Batched serving should land with compaction and unified KV ownership, not just a fixed-B wrapper that wastes inactive rows and duplicates memory/accounting work.
+

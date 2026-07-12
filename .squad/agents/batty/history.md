@@ -27,3 +27,6 @@ Delivered Phase 3 engine work: greedy speculative decoding, priority scheduling 
 
 ## 2026-07-12T12:02:00-07:00 — Phase 4 engine and decode migration delivered
 Delivered constrained decoding (JSON FSM + llguidance JSON Schema/Regex/Lark), pipeline executor APIs, and engine migration to DecodeSession/StaticCacheDecodeSession for O(1)/token KV movement.
+
+## 2026-07-12T13:14:00-07:00 — Samplers and FIM merged
+Batty's §24 sampler processors and §23 FIM APIs are now in decisions. Upcoming engine work should align these paths with Sampler, DecodeBackend, and SpeculativeProposer abstractions.
