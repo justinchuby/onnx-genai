@@ -38,6 +38,25 @@ fn chat_request(body: Value) -> ChatCompletionRequest {
     serde_json::from_value(body).unwrap()
 }
 
+async fn post_chat_json(app: axum::Router, body: Value) -> Value {
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let status = response.status();
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    serde_json::from_slice(&body).unwrap()
+}
+
 async fn create_http_session(app: axum::Router) -> String {
     let response = app
         .oneshot(
@@ -220,6 +239,77 @@ fn parser_converts_qwen_tool_call_blocks_to_openai_tool_calls() {
     let second_args: Value = serde_json::from_str(&calls[1].function.arguments).unwrap();
     assert_eq!(second_args["path"], "src/lib.rs");
     assert_eq!(second_args["content"], "ok");
+}
+
+#[tokio::test]
+#[ignore = "requires gitignored models/qwen2.5-0.5b real model fixture"]
+async fn qwen_real_model_tool_use_chain_end_to_end() {
+    let model_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../models/qwen2.5-0.5b");
+    assert!(
+        model_dir.exists(),
+        "build the real model fixture with scripts/build_qwen.sh"
+    );
+    let app = app(AppState::load(&model_dir, Some("qwen2.5-0.5b".to_string())).unwrap());
+    let tool = json!({
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Get current weather for a city",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "location": {"type": "string"},
+                    "unit": {"type": "string", "enum": ["celsius", "fahrenheit"]}
+                },
+                "required": ["location"]
+            }
+        }
+    });
+    let first_messages = json!([
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "user", "content": "What's the weather in Paris? Use the tool."}
+    ]);
+
+    let forced = post_chat_json(
+        app.clone(),
+        json!({
+            "model": "qwen2.5-0.5b",
+            "messages": first_messages,
+            "tools": [tool.clone()],
+            "tool_choice": {"type": "function", "function": {"name": "get_weather"}}
+        }),
+    )
+    .await;
+    assert_eq!(forced["choices"][0]["finish_reason"], "tool_calls");
+    let tool_call = forced["choices"][0]["message"]["tool_calls"][0].clone();
+    assert_eq!(tool_call["function"]["name"], "get_weather");
+    let args: Value =
+        serde_json::from_str(tool_call["function"]["arguments"].as_str().unwrap()).unwrap();
+    assert!(args["location"].is_string(), "{args}");
+
+    let final_response = post_chat_json(
+        app,
+        json!({
+            "model": "qwen2.5-0.5b",
+            "messages": [
+                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": "What's the weather in Paris? Use the tool."},
+                {"role": "assistant", "content": null, "tool_calls": [tool_call]},
+                {"role": "tool", "tool_call_id": "call_0", "content": "{\"temp\":18,\"unit\":\"celsius\"}"}
+            ],
+            "tools": [tool],
+            "tool_choice": "auto"
+        }),
+    )
+    .await;
+    assert_eq!(final_response["choices"][0]["finish_reason"], "stop");
+    assert!(
+        final_response["choices"][0]["message"]["content"]
+            .as_str()
+            .unwrap()
+            .contains("18"),
+        "{final_response}"
+    );
 }
 
 #[tokio::test]
