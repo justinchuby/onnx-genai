@@ -23,3 +23,7 @@ Delivered OpenAI response_format JSON constraints, tools/tool_choice/tool-role h
 
 ## 2026-07-12T13:14:00-07:00 — Server hardening merged
 Rachael's server DoS/session hardening is now in decisions: max_output_tokens=4096, max_sessions=256 LRU, 128-bit CSPRNG session ids, context-token caps, and loopback/no-auth deployment notes.
+
+## 2026-07-12T13:52:00-07:00 — §26 Stage C server complete
+- Rachael replaced the global generation mutex with a single engine driver thread and channels; concurrent STATIC-CACHE HTTP requests now share `ContinuousBatchManager` batched forward passes.
+- Server behavior preserves streaming, tool turns, caps, CSPRNG session ids, and past/present fallback; future tool-pause/resume work should extend the driver protocol rather than reintroduce shared Engine locking.

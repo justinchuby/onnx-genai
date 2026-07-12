@@ -29,3 +29,7 @@ Delivered pipeline schema/loader support, MiniJinja chat templates, multi-EOS di
 
 ## 2026-07-12T13:14:00-07:00 — ORT hardening and batching notes merged
 Deckard's GPU EP, batched static-cache decode, and ORT checksum notes are now in decisions. WebGPU/CoreML are selectable but slower than CPU on small Qwen decode; batched static decode matches unbatched but needs compaction.
+
+## 2026-07-12T13:52:00-07:00 — §26 active-row compaction complete
+- Deckard's `BatchedStaticCacheDecodeSession` active-row API is now part of the serving contract: `set_active_rows`, `compact`, `admit_row`, `deactivate_row`, `step_active`, and slot diagnostics back Sebastian/Rachael continuous batching.
+- Future paged-attention and ORT work should keep logical row ids stable while allowing packed physical execution.

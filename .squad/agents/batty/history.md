@@ -30,3 +30,7 @@ Delivered constrained decoding (JSON FSM + llguidance JSON Schema/Regex/Lark), p
 
 ## 2026-07-12T13:14:00-07:00 — Samplers and FIM merged
 Batty's §24 sampler processors and §23 FIM APIs are now in decisions. Upcoming engine work should align these paths with Sampler, DecodeBackend, and SpeculativeProposer abstractions.
+
+## 2026-07-12T13:52:00-07:00 — §26 engine refactor and batched serving complete
+- Batty's engine decomposition is now the foundation for batched serving: `DecodeBackend` and the shared decode loop are the stable seam for past/present, static-cache, and future speculative/paged-attention backends.
+- Coordinate future §27/§28 work with Sebastian's `ContinuousBatchManager`, Deckard's active-row API, and Rachael's single-owner server driver.
