@@ -1,9 +1,9 @@
 //! Main generation engine.
 
 use crate::logits::{
-    ConstraintProcessor, JsonConstraint, ProcessorChain, ProcessorContext, ProcessorSignal,
-    RepetitionPenaltyProcessor, StopSequence, StopSequenceProcessor, TemperatureProcessor, TokenId,
-    TopKProcessor, TopPProcessor,
+    ConstraintProcessor, GrammarConstraintKind, JsonConstraint, LlguidanceConstraint,
+    ProcessorChain, ProcessorContext, ProcessorSignal, RepetitionPenaltyProcessor, StopSequence,
+    StopSequenceProcessor, TemperatureProcessor, TokenId, TopKProcessor, TopPProcessor,
 };
 use crate::sampling::{sample_categorical, sample_greedy};
 use anyhow::Context;
@@ -129,6 +129,12 @@ impl Default for GenerateOptions {
 pub enum GenerateConstraint {
     /// Constrain output to one complete, well-formed JSON value.
     Json,
+    /// Constrain output to a JSON value accepted by the provided JSON Schema.
+    JsonSchema(String),
+    /// Constrain output to text matching the provided Rust regular expression.
+    Regex(String),
+    /// Constrain output to the provided llguidance Lark grammar.
+    Lark(String),
 }
 
 impl GenerateOptions {
@@ -1016,6 +1022,9 @@ impl Engine {
 
     fn should_use_speculative(&self, options: &GenerateOptions) -> bool {
         self.draft.is_some()
+            // Grammar processors carry per-request parser state; draft/verify
+            // would need separate parser branches for speculative candidates.
+            && options.constraint.is_none()
             && (options.greedy || options.temperature == 0.0)
             && options
                 .num_speculative_tokens
@@ -2304,6 +2313,45 @@ pub(crate) fn build_processor_chain(
                     options.eos_token_id,
                 )));
             }
+            GenerateConstraint::JsonSchema(schema) => {
+                chain.add(Box::new(ConstraintProcessor::new(
+                    build_llguidance_constraint(
+                        GrammarConstraintKind::JsonSchema,
+                        schema,
+                        tokenizer,
+                        &token_texts,
+                        options.eos_token_id,
+                    )?,
+                    token_texts,
+                    options.eos_token_id,
+                )));
+            }
+            GenerateConstraint::Regex(regex) => {
+                chain.add(Box::new(ConstraintProcessor::new(
+                    build_llguidance_constraint(
+                        GrammarConstraintKind::Regex,
+                        regex,
+                        tokenizer,
+                        &token_texts,
+                        options.eos_token_id,
+                    )?,
+                    token_texts,
+                    options.eos_token_id,
+                )));
+            }
+            GenerateConstraint::Lark(grammar) => {
+                chain.add(Box::new(ConstraintProcessor::new(
+                    build_llguidance_constraint(
+                        GrammarConstraintKind::Lark,
+                        grammar,
+                        tokenizer,
+                        &token_texts,
+                        options.eos_token_id,
+                    )?,
+                    token_texts,
+                    options.eos_token_id,
+                )));
+            }
         }
     }
 
@@ -2326,6 +2374,36 @@ pub(crate) fn build_processor_chain(
     }
 
     Ok(chain)
+}
+
+fn build_llguidance_constraint(
+    kind: GrammarConstraintKind,
+    grammar: &str,
+    tokenizer: &Tokenizer,
+    token_texts: &[Option<String>],
+    eos_token_id: Option<TokenId>,
+) -> anyhow::Result<Box<dyn crate::logits::Constraint>> {
+    match LlguidanceConstraint::from_hf_tokenizer(
+        kind,
+        grammar,
+        tokenizer.inner(),
+        token_texts.len(),
+        eos_token_id,
+    ) {
+        Ok(constraint) => Ok(Box::new(constraint)),
+        Err(hf_error) => LlguidanceConstraint::from_token_texts(
+            kind,
+            grammar,
+            token_texts,
+            eos_token_id,
+        )
+        .map(|constraint| Box::new(constraint) as Box<dyn crate::logits::Constraint>)
+        .with_context(|| {
+            format!(
+                "failed to initialize llguidance with HuggingFace tokenizer ({hf_error}) or decoded-token fallback"
+            )
+        }),
+    }
 }
 
 pub(crate) fn ensure_constrained_finish(

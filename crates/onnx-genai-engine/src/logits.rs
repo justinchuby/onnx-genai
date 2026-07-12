@@ -4,6 +4,11 @@
 //! repetition penalties -> constraints/stop checks -> temperature -> top-k -> top-p.
 
 use std::collections::HashSet;
+use std::sync::Mutex;
+
+use llguidance::api::TopLevelGrammar;
+use llguidance::toktrie::{ApproximateTokEnv, InferenceCapabilities, TokRxInfo, TokTrie};
+use llguidance::{Constraint as LlgConstraint, ParserFactory};
 
 /// Token id used by the generation engine.
 pub type TokenId = u32;
@@ -67,6 +72,13 @@ pub trait Constraint: Send + Sync {
     ) -> Vec<bool>;
 
     fn name(&self) -> &str;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrammarConstraintKind {
+    JsonSchema,
+    Regex,
+    Lark,
 }
 
 /// A logit processor modifies the logit distribution before sampling.
@@ -197,6 +209,7 @@ impl Constraint for JsonConstraint {
                 if candidate.is_eos {
                     return complete;
                 }
+
                 if candidate.text.is_empty() {
                     return false;
                 }
@@ -211,6 +224,156 @@ impl Constraint for JsonConstraint {
 
     fn name(&self) -> &str {
         "json_constraint"
+    }
+}
+
+/// llguidance-backed grammar constraint for JSON Schema, regex, and Lark grammars.
+///
+/// The state machine is advanced from `ProcessorContext::generated_tokens` before
+/// computing the next-token mask. This keeps the existing logit-processor API
+/// unchanged while still using llguidance's compute-mask/commit-token loop.
+pub struct LlguidanceConstraint {
+    kind: GrammarConstraintKind,
+    inner: Mutex<LlguidanceState>,
+}
+
+struct LlguidanceState {
+    constraint: LlgConstraint,
+    committed_len: usize,
+}
+
+impl LlguidanceConstraint {
+    pub fn from_hf_tokenizer(
+        kind: GrammarConstraintKind,
+        grammar: &str,
+        tokenizer: &tokenizers::Tokenizer,
+        vocab_size: usize,
+        eos_token_id: Option<TokenId>,
+    ) -> anyhow::Result<Self> {
+        let mut byte_tokenizer =
+            toktrie_hf_tokenizers::ByteTokenizer::from_tokenizer(tokenizer.clone())?;
+        if let Some(eos_token_id) = eos_token_id {
+            byte_tokenizer.set_eos_token(eos_token_id);
+        }
+        let tok_env = byte_tokenizer.into_tok_env(Some(vocab_size))?;
+        Self::from_tok_env(kind, grammar, &tok_env)
+    }
+
+    pub fn from_token_texts(
+        kind: GrammarConstraintKind,
+        grammar: &str,
+        token_texts: &[Option<String>],
+        eos_token_id: Option<TokenId>,
+    ) -> anyhow::Result<Self> {
+        let mut token_bytes = Vec::with_capacity(token_texts.len());
+        for (idx, text) in token_texts.iter().enumerate() {
+            if Some(idx as TokenId) == eos_token_id {
+                let mut bytes = b"<eos>".to_vec();
+                bytes.insert(0, TokTrie::SPECIAL_TOKEN_MARKER);
+                token_bytes.push(bytes);
+            } else {
+                token_bytes.push(text.as_deref().unwrap_or_default().as_bytes().to_vec());
+            }
+        }
+        let info = TokRxInfo {
+            vocab_size: token_bytes.len() as u32,
+            tok_eos: eos_token_id.unwrap_or(0),
+            tok_bos: None,
+            tok_pad: None,
+            tok_unk: None,
+            tok_end_of_turn: None,
+        };
+        let tok_trie = TokTrie::from(&info, &token_bytes);
+        let tok_env: llguidance::toktrie::TokEnv =
+            std::sync::Arc::new(ApproximateTokEnv::new(tok_trie));
+        Self::from_tok_env(kind, grammar, &tok_env)
+    }
+
+    fn from_tok_env(
+        kind: GrammarConstraintKind,
+        grammar: &str,
+        tok_env: &llguidance::toktrie::TokEnv,
+    ) -> anyhow::Result<Self> {
+        let grammar = top_level_grammar(kind, grammar)?;
+        let factory = ParserFactory::new(tok_env, InferenceCapabilities::default(), &[])?;
+        let parser = factory.create_parser(grammar)?;
+        Ok(Self {
+            kind,
+            inner: Mutex::new(LlguidanceState {
+                constraint: LlgConstraint::new(parser),
+                committed_len: 0,
+            }),
+        })
+    }
+}
+
+fn top_level_grammar(
+    kind: GrammarConstraintKind,
+    grammar: &str,
+) -> anyhow::Result<TopLevelGrammar> {
+    match kind {
+        GrammarConstraintKind::JsonSchema => {
+            let schema = serde_json::from_str(grammar)?;
+            Ok(TopLevelGrammar::from_json_schema(schema))
+        }
+        GrammarConstraintKind::Regex => Ok(TopLevelGrammar::from_regex(grammar)),
+        GrammarConstraintKind::Lark => Ok(TopLevelGrammar::from_lark(grammar.to_string())),
+    }
+}
+
+impl Constraint for LlguidanceConstraint {
+    fn allowed_next_tokens(
+        &self,
+        context: &ProcessorContext,
+        candidates: &[TokenCandidate],
+    ) -> Vec<bool> {
+        let mut inner = match self.inner.lock() {
+            Ok(inner) => inner,
+            Err(_) => return vec![false; candidates.len()],
+        };
+
+        if context.generated_tokens.len() < inner.committed_len {
+            return vec![false; candidates.len()];
+        }
+
+        for token in &context.generated_tokens[inner.committed_len..] {
+            if inner.constraint.commit_token(Some(*token)).is_err() {
+                return vec![false; candidates.len()];
+            }
+            inner.committed_len += 1;
+        }
+
+        let step = match inner.constraint.compute_mask() {
+            Ok(step) => step.clone(),
+            Err(_) => return vec![false; candidates.len()],
+        };
+
+        if step.is_stop() {
+            return candidates
+                .iter()
+                .map(|candidate| candidate.is_eos)
+                .collect();
+        }
+
+        let Some(mask) = step.sample_mask.as_ref() else {
+            return vec![false; candidates.len()];
+        };
+
+        candidates
+            .iter()
+            .map(|candidate| {
+                let idx = candidate.token_id as usize;
+                idx < mask.len() && mask.get(idx)
+            })
+            .collect()
+    }
+
+    fn name(&self) -> &str {
+        match self.kind {
+            GrammarConstraintKind::JsonSchema => "json_schema_constraint",
+            GrammarConstraintKind::Regex => "regex_constraint",
+            GrammarConstraintKind::Lark => "lark_constraint",
+        }
     }
 }
 
@@ -943,6 +1106,116 @@ mod tests {
                 "{text}"
             );
         }
+    }
+
+    fn grammar_token_texts() -> Vec<Option<String>> {
+        vec![
+            Some("x".to_string()),
+            Some("{".to_string()),
+            Some("\"name\"".to_string()),
+            Some(":".to_string()),
+            Some("\"bob\"".to_string()),
+            Some(",".to_string()),
+            Some("\"age\"".to_string()),
+            Some("42".to_string()),
+            Some("}".to_string()),
+            Some(String::new()),
+            Some("\"extra\"".to_string()),
+            Some("true".to_string()),
+            Some("A".to_string()),
+            Some("B".to_string()),
+            Some("Z".to_string()),
+            Some("1".to_string()),
+            Some("2".to_string()),
+        ]
+    }
+
+    fn generate_scripted_grammar(
+        kind: GrammarConstraintKind,
+        grammar: &str,
+        script: &[TokenId],
+        eos_token_id: TokenId,
+    ) -> anyhow::Result<String> {
+        let token_texts = grammar_token_texts();
+        let processor = ConstraintProcessor::new(
+            Box::new(LlguidanceConstraint::from_token_texts(
+                kind,
+                grammar,
+                &token_texts,
+                Some(eos_token_id),
+            )?),
+            token_texts.clone(),
+            Some(eos_token_id),
+        );
+        let mut generated_text = String::new();
+        let mut generated_tokens = Vec::new();
+
+        for (step, &desired) in script.iter().enumerate() {
+            let context = ProcessorContext {
+                generated_tokens: generated_tokens.clone(),
+                generated_text: generated_text.clone(),
+                step,
+                ..Default::default()
+            };
+            let mut logits = vec![0.0; token_texts.len()];
+            logits[0] = 100.0;
+            logits[desired as usize] = 101.0;
+            processor.process(&mut logits, &context);
+            assert!(
+                logits[desired as usize].is_finite(),
+                "desired token {desired} was masked at {generated_text:?}"
+            );
+            assert_eq!(logits[0], f32::NEG_INFINITY);
+            let selected = sample_greedy(&logits);
+            assert_eq!(selected, desired);
+            if selected == eos_token_id {
+                break;
+            }
+            generated_tokens.push(selected);
+            generated_text.push_str(token_texts[selected as usize].as_deref().unwrap());
+        }
+
+        Ok(generated_text)
+    }
+
+    #[test]
+    fn json_schema_constraint_generates_schema_valid_objects() -> anyhow::Result<()> {
+        let schema = r#"{
+            "type": "object",
+            "properties": {
+                "name": { "type": "string" },
+                "age": { "type": "integer" }
+            },
+            "required": ["name", "age"],
+            "additionalProperties": false
+        }"#;
+
+        for _ in 0..4 {
+            let text = generate_scripted_grammar(
+                GrammarConstraintKind::JsonSchema,
+                schema,
+                &[1, 2, 3, 4, 5, 6, 3, 7, 8, 9],
+                9,
+            )?;
+            let value: serde_json::Value = serde_json::from_str(&text)?;
+            assert_eq!(value["name"].as_str(), Some("bob"));
+            assert_eq!(value["age"].as_i64(), Some(42));
+            assert_eq!(value.as_object().map(|object| object.len()), Some(2));
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn regex_constraint_forces_matching_output() -> anyhow::Result<()> {
+        let text = generate_scripted_grammar(
+            GrammarConstraintKind::Regex,
+            "[A-Z]{2}[0-9]{2}",
+            &[12, 13, 15, 16, 9],
+            9,
+        )?;
+        assert_eq!(text, "AB12");
+        Ok(())
     }
 
     #[test]
