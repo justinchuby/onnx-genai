@@ -1,6 +1,7 @@
 /target
 models/
 *.onnx
+!tests/fixtures/tiny-llm-scatter/model.onnx
 *.safetensors
 .DS_Store
 

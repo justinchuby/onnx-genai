@@ -16,6 +16,50 @@ pub enum DecodeKvMode {
     SharedBuffer,
 }
 
+/// Static-cache output binding strategy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StaticCacheBindingMode {
+    /// Bind `updated_key_cache.N` / `updated_value_cache.N` to the same
+    /// runtime-owned OrtValue as the corresponding input cache.
+    InPlaceAlias,
+    /// Bind outputs to a second runtime-owned buffer and swap handles after a
+    /// run. This is the fallback if an ORT build rejects input/output aliasing.
+    HandleSwap,
+}
+
+/// Introspected static-cache model signature.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StaticCacheSignature {
+    pub layers: usize,
+    pub max_len: usize,
+    pub kv_dim: usize,
+    pub dtype: DataType,
+    pub has_position_ids: bool,
+}
+
+/// Snapshot of a runtime-owned static-cache KV buffer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StaticCacheBufferInfo {
+    pub input_name: String,
+    pub output_name: String,
+    pub shape: Vec<i64>,
+    pub dtype: DataType,
+    pub data_ptr: usize,
+    pub numel: usize,
+}
+
+/// Options for [`StaticCacheDecodeSession`].
+#[derive(Debug, Clone)]
+pub struct StaticCacheDecodeOptions {
+    pub batch_size: i64,
+}
+
+impl Default for StaticCacheDecodeOptions {
+    fn default() -> Self {
+        Self { batch_size: 1 }
+    }
+}
+
 /// Options for [`DecodeSession`].
 #[derive(Debug, Clone)]
 pub struct DecodeSessionOptions {
@@ -53,6 +97,36 @@ pub struct DecodeSession<'a> {
     current_kv: HashMap<String, Arc<Value>>,
     current_len: usize,
     mode: DecodeKvMode,
+}
+
+struct StaticCachePair {
+    index: usize,
+    key_input: TensorInfo,
+    value_input: TensorInfo,
+    key_output: String,
+    value_output: String,
+}
+
+struct StaticCacheBuffer {
+    input_name: String,
+    output_name: String,
+    current: Arc<Value>,
+    alternate: Option<Arc<Value>>,
+}
+
+/// Stateful decode runner for Mobius/STATIC-CACHE TensorScatter models.
+///
+/// The runtime owns fixed `[B, MAX_LEN, KV_DIM]` key/value buffers. The model's
+/// `updated_*` outputs are bound back onto those buffers; the graph scatter is a
+/// write hint, not the source of truth for cache ownership.
+pub struct StaticCacheDecodeSession<'a> {
+    session: &'a Session,
+    binding: IoBinding,
+    signature: StaticCacheSignature,
+    batch_size: i64,
+    current_len: usize,
+    mode: StaticCacheBindingMode,
+    buffers: Vec<StaticCacheBuffer>,
 }
 
 impl<'a> DecodeSession<'a> {
@@ -128,6 +202,7 @@ impl<'a> DecodeSession<'a> {
         self.binding.clear()?;
         self.bind_standard_inputs(&input_ids, &attention_mask, &position_ids)?;
         self.bind_kv_inputs()?;
+        let mut borrowed_outputs = Vec::new();
         for output in self.session.output_names() {
             if self.mode == DecodeKvMode::SharedBuffer
                 && let Some(pair) = self.kv_pairs.iter().find(|pair| pair.present == *output)
@@ -138,6 +213,7 @@ impl<'a> DecodeSession<'a> {
                         pair.past
                     ))
                 })?;
+                borrowed_outputs.push(value.raw_ptr_addr());
                 self.binding.bind_output(output, value)?;
             } else {
                 self.binding
@@ -147,8 +223,18 @@ impl<'a> DecodeSession<'a> {
 
         self.session.run_with_binding(&self.binding)?;
         let mut logits = None;
-        let outputs = self.binding.output_values()?;
-        self.rotate_outputs(outputs, &mut logits)?;
+        if self.mode == DecodeKvMode::SharedBuffer {
+            let outputs = self.binding.output_values_or_borrowed(&borrowed_outputs)?;
+            for (name, value) in self.session.output_names().iter().zip(outputs) {
+                if is_logits_output(name) {
+                    logits = value;
+                    break;
+                }
+            }
+        } else {
+            let outputs = self.binding.output_values()?;
+            self.rotate_outputs(outputs, &mut logits)?;
+        }
         self.current_len = self
             .current_len
             .checked_add(new_input_ids.len())
@@ -347,6 +433,274 @@ impl<'a> DecodeSession<'a> {
     }
 }
 
+impl<'a> StaticCacheDecodeSession<'a> {
+    /// Detect a STATIC-CACHE/TensorScatter signature from ONNX graph I/O.
+    pub fn detect(session: &Session) -> Result<Option<StaticCacheSignature>> {
+        Ok(detect_static_cache(session)?.map(|(signature, _)| signature))
+    }
+
+    /// Create a static-cache decode session if the graph exposes the signature.
+    pub fn new(session: &'a Session, options: StaticCacheDecodeOptions) -> Result<Self> {
+        let (signature, pairs) = detect_static_cache(session)?.ok_or_else(|| {
+            OrtError::InvalidArgument(
+                "model does not expose static-cache key_cache/write_indices inputs".into(),
+            )
+        })?;
+        let buffers = allocate_static_cache_buffers(options.batch_size, &pairs)?;
+        Ok(Self {
+            session,
+            binding: IoBinding::new(session)?,
+            signature,
+            batch_size: options.batch_size,
+            current_len: 0,
+            mode: StaticCacheBindingMode::InPlaceAlias,
+            buffers,
+        })
+    }
+
+    pub fn signature(&self) -> &StaticCacheSignature {
+        &self.signature
+    }
+
+    pub fn binding_mode(&self) -> StaticCacheBindingMode {
+        self.mode
+    }
+
+    pub fn max_len(&self) -> usize {
+        self.signature.max_len
+    }
+
+    pub fn current_len(&self) -> usize {
+        self.current_len
+    }
+
+    /// Runtime-owned KV buffer identities and sizes.
+    pub fn buffer_infos(&self) -> Result<Vec<StaticCacheBufferInfo>> {
+        self.buffers
+            .iter()
+            .map(|buffer| {
+                Ok(StaticCacheBufferInfo {
+                    input_name: buffer.input_name.clone(),
+                    output_name: buffer.output_name.clone(),
+                    shape: buffer.current.shape().to_vec(),
+                    dtype: buffer.current.dtype(),
+                    data_ptr: buffer.current.data_ptr_addr()?,
+                    numel: buffer.current.numel(),
+                })
+            })
+            .collect()
+    }
+
+    /// Scatter a prompt chunk into slots `0..P` and return logits.
+    pub fn prefill(&mut self, input_ids: &[i64], position_ids: &[i64]) -> Result<Value> {
+        let seq_len = self.seq_len_from_flat_input(input_ids)?;
+        self.run_static_chunk(input_ids, position_ids, seq_len, 0)?;
+        self.current_len = seq_len;
+        self.last_logits()
+    }
+
+    /// Scatter one token per batch row at the current write cursor.
+    pub fn step(&mut self, next_token_ids: &[i64], position_ids: &[i64]) -> Result<Value> {
+        if next_token_ids.len() != self.batch_size as usize {
+            return Err(OrtError::InvalidArgument(format!(
+                "static-cache step expects {} token ids, got {}",
+                self.batch_size,
+                next_token_ids.len()
+            )));
+        }
+        self.run_static_chunk(next_token_ids, position_ids, 1, self.current_len)?;
+        self.current_len += 1;
+        self.last_logits()
+    }
+
+    /// Rewind the logical write cursor. Buffers are retained and stale suffix
+    /// slots are overwritten by subsequent prefill/step calls.
+    pub fn rewind(&mut self, target_len: usize) -> Result<()> {
+        if target_len > self.current_len {
+            return Err(OrtError::InvalidArgument(format!(
+                "cannot rewind static cache from {} to larger length {}",
+                self.current_len, target_len
+            )));
+        }
+        self.current_len = target_len;
+        Ok(())
+    }
+
+    fn seq_len_from_flat_input(&self, input_ids: &[i64]) -> Result<usize> {
+        let batch = self.batch_size as usize;
+        if batch == 0 || input_ids.is_empty() || input_ids.len() % batch != 0 {
+            return Err(OrtError::InvalidArgument(format!(
+                "input_ids length {} is not a non-empty multiple of batch {}",
+                input_ids.len(),
+                batch
+            )));
+        }
+        Ok(input_ids.len() / batch)
+    }
+
+    fn run_static_chunk(
+        &mut self,
+        input_ids: &[i64],
+        position_ids: &[i64],
+        seq_len: usize,
+        write_index: usize,
+    ) -> Result<()> {
+        if write_index + seq_len > self.signature.max_len {
+            return Err(OrtError::InvalidArgument(format!(
+                "static-cache write {}..{} exceeds capacity {}",
+                write_index,
+                write_index + seq_len,
+                self.signature.max_len
+            )));
+        }
+        match self.try_run_static_chunk(input_ids, position_ids, seq_len, write_index) {
+            Ok(()) => Ok(()),
+            Err(first_err) if self.mode == StaticCacheBindingMode::InPlaceAlias => {
+                self.enable_handle_swap()?;
+                self.try_run_static_chunk(input_ids, position_ids, seq_len, write_index)
+                    .map_err(|second_err| {
+                        OrtError::InvalidArgument(format!(
+                            "static-cache in-place alias run failed ({first_err}); handle-swap fallback also failed ({second_err})"
+                        ))
+                    })
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    fn try_run_static_chunk(
+        &mut self,
+        input_ids: &[i64],
+        position_ids: &[i64],
+        seq_len: usize,
+        write_index: usize,
+    ) -> Result<()> {
+        let batch = self.batch_size;
+        let input_ids_value = Value::from_slice_i64(input_ids, &[batch, seq_len as i64])?;
+        let position_ids_value = if self.signature.has_position_ids {
+            if position_ids.len() != input_ids.len() {
+                return Err(OrtError::InvalidArgument(
+                    "position_ids length must match input_ids length".into(),
+                ));
+            }
+            Some(Value::from_slice_i64(
+                position_ids,
+                &[batch, seq_len as i64],
+            )?)
+        } else {
+            None
+        };
+        let write_indices =
+            Value::from_slice_i64(&vec![write_index as i64; batch as usize], &[batch])?;
+        let nonpad_kv_seqlen = Value::from_slice_i64(
+            &vec![(write_index + seq_len) as i64; batch as usize],
+            &[batch],
+        )?;
+
+        self.binding.clear()?;
+        for input in self.session.inputs() {
+            match input.name.as_str() {
+                "input_ids" => self.binding.bind_input(&input.name, &input_ids_value)?,
+                "position_ids" => {
+                    let Some(position_ids_value) = position_ids_value.as_ref() else {
+                        return Err(OrtError::InvalidArgument(
+                            "model requires position_ids but none were prepared".into(),
+                        ));
+                    };
+                    self.binding.bind_input(&input.name, position_ids_value)?;
+                }
+                "write_indices" => self.binding.bind_input(&input.name, &write_indices)?,
+                "nonpad_kv_seqlen" => self.binding.bind_input(&input.name, &nonpad_kv_seqlen)?,
+                name => {
+                    let Some(buffer) = self.buffers.iter().find(|buffer| buffer.input_name == name)
+                    else {
+                        return Err(OrtError::InvalidArgument(format!(
+                            "unsupported static-cache input '{}'",
+                            input.name
+                        )));
+                    };
+                    self.binding.bind_input(&input.name, &buffer.current)?;
+                }
+            }
+        }
+
+        let mut borrowed_outputs = Vec::new();
+        for output in self.session.output_names() {
+            if let Some(buffer) = self
+                .buffers
+                .iter()
+                .find(|buffer| buffer.output_name == *output)
+            {
+                let output_value = match self.mode {
+                    StaticCacheBindingMode::InPlaceAlias => &buffer.current,
+                    StaticCacheBindingMode::HandleSwap => {
+                        buffer.alternate.as_ref().ok_or_else(|| {
+                            OrtError::InvalidArgument(format!(
+                                "missing static-cache alternate buffer for '{}'",
+                                buffer.output_name
+                            ))
+                        })?
+                    }
+                };
+                borrowed_outputs.push(output_value.raw_ptr_addr());
+                self.binding.bind_output(output, output_value)?;
+            } else {
+                self.binding
+                    .bind_output_to_device(output, &MemoryInfo::cpu()?)?;
+            }
+        }
+
+        self.session.run_with_binding(&self.binding)?;
+        if self.mode == StaticCacheBindingMode::HandleSwap {
+            for buffer in &mut self.buffers {
+                let alternate = buffer.alternate.as_mut().ok_or_else(|| {
+                    OrtError::InvalidArgument(format!(
+                        "missing static-cache alternate buffer for '{}'",
+                        buffer.output_name
+                    ))
+                })?;
+                std::mem::swap(&mut buffer.current, alternate);
+            }
+        }
+        Ok(())
+    }
+
+    fn last_logits(&self) -> Result<Value> {
+        let borrowed_outputs = self
+            .buffers
+            .iter()
+            .flat_map(|buffer| {
+                std::iter::once(buffer.current.raw_ptr_addr())
+                    .chain(buffer.alternate.as_ref().map(|value| value.raw_ptr_addr()))
+            })
+            .collect::<Vec<_>>();
+        let outputs = self.binding.output_values_or_borrowed(&borrowed_outputs)?;
+        for (name, value) in self.session.output_names().iter().zip(outputs) {
+            if is_logits_output(name) {
+                return value.ok_or_else(|| {
+                    OrtError::InvalidArgument("logits unexpectedly aliased a KV buffer".into())
+                });
+            }
+        }
+        Err(OrtError::InvalidArgument(
+            "model did not produce logits".into(),
+        ))
+    }
+
+    fn enable_handle_swap(&mut self) -> Result<()> {
+        for buffer in &mut self.buffers {
+            if buffer.alternate.is_none() {
+                buffer.alternate = Some(Arc::new(zeroed_value(
+                    buffer.current.shape(),
+                    buffer.current.dtype(),
+                )?));
+            }
+        }
+        self.mode = StaticCacheBindingMode::HandleSwap;
+        Ok(())
+    }
+}
+
 fn infer_kv_pairs(session: &Session) -> Result<Vec<KvPair>> {
     let input_names = session.input_names();
     let mut pairs = Vec::new();
@@ -435,4 +789,189 @@ fn kv_suffix(name: &str) -> Option<String> {
         }
     }
     None
+}
+
+fn detect_static_cache(
+    session: &Session,
+) -> Result<Option<(StaticCacheSignature, Vec<StaticCachePair>)>> {
+    let has_write_indices = session
+        .input_names()
+        .iter()
+        .any(|name| name == "write_indices");
+    let has_nonpad = session
+        .input_names()
+        .iter()
+        .any(|name| name == "nonpad_kv_seqlen");
+    if !has_write_indices || !has_nonpad {
+        return Ok(None);
+    }
+
+    let mut indices = session
+        .inputs()
+        .iter()
+        .filter_map(|input| static_cache_suffix(&input.name, "key_cache."))
+        .collect::<Vec<_>>();
+    indices.sort_unstable();
+    indices.dedup();
+    if indices.is_empty() {
+        return Ok(None);
+    }
+
+    let mut pairs = Vec::with_capacity(indices.len());
+    let mut max_len = None;
+    let mut kv_dim = None;
+    let mut dtype = None;
+    for index in indices {
+        let key_name = format!("key_cache.{index}");
+        let value_name = format!("value_cache.{index}");
+        let key_output = format!("updated_key_cache.{index}");
+        let value_output = format!("updated_value_cache.{index}");
+        let key_input = session
+            .inputs()
+            .iter()
+            .find(|input| input.name == key_name)
+            .cloned()
+            .ok_or_else(|| OrtError::InvalidArgument(format!("missing input '{key_name}'")))?;
+        let value_input = session
+            .inputs()
+            .iter()
+            .find(|input| input.name == value_name)
+            .cloned()
+            .ok_or_else(|| OrtError::InvalidArgument(format!("missing input '{value_name}'")))?;
+        if !session
+            .output_names()
+            .iter()
+            .any(|name| name == &key_output)
+        {
+            return Err(OrtError::InvalidArgument(format!(
+                "missing output '{key_output}'"
+            )));
+        }
+        if !session
+            .output_names()
+            .iter()
+            .any(|name| name == &value_output)
+        {
+            return Err(OrtError::InvalidArgument(format!(
+                "missing output '{value_output}'"
+            )));
+        }
+        validate_static_cache_tensor(&key_input)?;
+        validate_static_cache_tensor(&value_input)?;
+        if key_input.shape[1..] != value_input.shape[1..] {
+            return Err(OrtError::InvalidArgument(format!(
+                "key/value cache shape mismatch for layer {index}: {:?} vs {:?}",
+                key_input.shape, value_input.shape
+            )));
+        }
+        if key_input.dtype != value_input.dtype {
+            return Err(OrtError::InvalidArgument(format!(
+                "key/value cache dtype mismatch for layer {index}: {:?} vs {:?}",
+                key_input.dtype, value_input.dtype
+            )));
+        }
+        let layer_max_len = key_input.shape[1] as usize;
+        let layer_kv_dim = key_input.shape[2] as usize;
+        if max_len.get_or_insert(layer_max_len) != &layer_max_len {
+            return Err(OrtError::InvalidArgument(
+                "static-cache layers have inconsistent max lengths".into(),
+            ));
+        }
+        if kv_dim.get_or_insert(layer_kv_dim) != &layer_kv_dim {
+            return Err(OrtError::InvalidArgument(
+                "static-cache layers have inconsistent KV dims".into(),
+            ));
+        }
+        if dtype.get_or_insert(key_input.dtype) != &key_input.dtype {
+            return Err(OrtError::InvalidArgument(
+                "static-cache layers have inconsistent dtypes".into(),
+            ));
+        }
+        pairs.push(StaticCachePair {
+            index,
+            key_input,
+            value_input,
+            key_output,
+            value_output,
+        });
+    }
+    pairs.sort_by_key(|pair| pair.index);
+    let signature = StaticCacheSignature {
+        layers: pairs.len(),
+        max_len: max_len.expect("non-empty static cache pairs"),
+        kv_dim: kv_dim.expect("non-empty static cache pairs"),
+        dtype: dtype.expect("non-empty static cache pairs"),
+        has_position_ids: session
+            .input_names()
+            .iter()
+            .any(|name| name == "position_ids"),
+    };
+    Ok(Some((signature, pairs)))
+}
+
+fn static_cache_suffix(name: &str, prefix: &str) -> Option<usize> {
+    name.strip_prefix(prefix)?.parse().ok()
+}
+
+fn validate_static_cache_tensor(info: &TensorInfo) -> Result<()> {
+    if info.dtype != DataType::Float32 && info.dtype != DataType::Float16 {
+        return Err(OrtError::InvalidArgument(format!(
+            "static-cache tensor '{}' must be Float32 or Float16, got {:?}",
+            info.name, info.dtype
+        )));
+    }
+    if info.shape.len() != 3 || info.shape[1] <= 0 || info.shape[2] <= 0 {
+        return Err(OrtError::InvalidArgument(format!(
+            "static-cache tensor '{}' must have shape [B, MAX_LEN, KV_DIM], got {:?}",
+            info.name, info.shape
+        )));
+    }
+    Ok(())
+}
+
+fn allocate_static_cache_buffers(
+    batch_size: i64,
+    pairs: &[StaticCachePair],
+) -> Result<Vec<StaticCacheBuffer>> {
+    if batch_size <= 0 {
+        return Err(OrtError::InvalidArgument(format!(
+            "batch_size must be positive, got {batch_size}"
+        )));
+    }
+    let mut buffers = Vec::with_capacity(pairs.len() * 2);
+    for pair in pairs {
+        for (input, output) in [
+            (&pair.key_input, &pair.key_output),
+            (&pair.value_input, &pair.value_output),
+        ] {
+            let mut shape = input.shape.clone();
+            shape[0] = batch_size;
+            buffers.push(StaticCacheBuffer {
+                input_name: input.name.clone(),
+                output_name: output.clone(),
+                current: Arc::new(zeroed_value(&shape, input.dtype)?),
+                alternate: None,
+            });
+        }
+    }
+    Ok(buffers)
+}
+
+fn zeroed_value(shape: &[i64], dtype: DataType) -> Result<Value> {
+    let numel = shape.iter().try_fold(1usize, |acc, &dim| {
+        if dim < 0 {
+            return Err(OrtError::InvalidArgument(format!(
+                "cannot allocate tensor with dynamic shape {shape:?}"
+            )));
+        }
+        acc.checked_mul(dim as usize)
+            .ok_or_else(|| OrtError::InvalidArgument(format!("tensor shape too large: {shape:?}")))
+    })?;
+    match dtype {
+        DataType::Float32 => Value::from_vec_f32(vec![0.0; numel], shape),
+        DataType::Float16 => Value::from_vec_f16_bits(vec![0; numel], shape),
+        dtype => Err(OrtError::InvalidArgument(format!(
+            "cannot allocate static-cache tensor with dtype {dtype:?}"
+        ))),
+    }
 }

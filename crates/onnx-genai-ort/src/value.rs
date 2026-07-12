@@ -249,6 +249,16 @@ impl Value {
         self.ptr.as_ptr()
     }
 
+    pub(crate) fn raw_ptr_addr(&self) -> usize {
+        self.ptr.as_ptr() as usize
+    }
+
+    /// Return the address of the tensor data buffer. Intended for tests and
+    /// decode-session diagnostics that need to verify buffer reuse.
+    pub fn data_ptr_addr(&self) -> Result<usize> {
+        Ok(tensor_data_ptr(self.ptr.as_ptr())? as usize)
+    }
+
     /// Create a no-copy CPU tensor alias over the prefix of an existing tensor.
     ///
     /// The returned OrtValue has its own shape but points at the same underlying

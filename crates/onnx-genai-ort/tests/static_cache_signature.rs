@@ -7,7 +7,6 @@ fn tiny_scatter_llm() -> PathBuf {
 }
 
 #[test]
-#[ignore = "documents the Mobius static-cache TensorScatter fixture contract"]
 fn tiny_scatter_signature_matches_mobius_static_cache_contract()
 -> Result<(), Box<dyn std::error::Error>> {
     let env = Environment::new("tiny-scatter-signature")?;

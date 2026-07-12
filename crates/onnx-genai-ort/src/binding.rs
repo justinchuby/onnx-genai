@@ -1,5 +1,6 @@
 //! ORT IoBinding — pre-bind inputs/outputs to avoid per-run copies.
 
+use std::collections::HashSet;
 use std::ffi::CString;
 use std::ptr::NonNull;
 
@@ -94,6 +95,15 @@ impl IoBinding {
     ///
     /// Values are returned in the same order outputs were bound.
     pub fn output_values(&self) -> Result<Vec<Value>> {
+        self.output_values_or_borrowed(&[])
+            .map(|values| values.into_iter().flatten().collect())
+    }
+
+    pub(crate) fn output_values_or_borrowed(
+        &self,
+        borrowed_raw_ptrs: &[usize],
+    ) -> Result<Vec<Option<Value>>> {
+        let borrowed_raw_ptrs = borrowed_raw_ptrs.iter().copied().collect::<HashSet<_>>();
         let allocator = Allocator::default_cpu()?;
         let api = crate::error::api()?;
         let get_outputs = api
@@ -127,7 +137,15 @@ impl IoBinding {
         crate::error::check_status(unsafe { free(allocator.as_ptr(), output_ptrs.cast()) })?;
         raw_values
             .into_iter()
-            .map(|ptr| unsafe { Value::from_raw(ptr) })
+            .map(|ptr| {
+                if borrowed_raw_ptrs.contains(&(ptr as usize)) {
+                    Ok(None)
+                } else {
+                    // SAFETY: ORT returned this non-borrowed output OrtValue to
+                    // the caller, so this wrapper owns and releases it.
+                    unsafe { Value::from_raw(ptr).map(Some) }
+                }
+            })
             .collect()
     }
 }

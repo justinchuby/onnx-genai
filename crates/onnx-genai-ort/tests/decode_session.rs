@@ -3,11 +3,16 @@ use std::path::{Path, PathBuf};
 
 use onnx_genai_ort::{
     DataType, DecodeKvMode, DecodeSession, DecodeSessionOptions, Environment, Session,
-    SessionOptions, TensorInfo, Value,
+    SessionOptions, StaticCacheBindingMode, StaticCacheDecodeOptions, StaticCacheDecodeSession,
+    TensorInfo, Value,
 };
 
 fn tiny_llm() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm/model.onnx")
+}
+
+fn tiny_scatter_llm() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm-scatter/model.onnx")
 }
 
 fn load_session() -> (Environment, Session) {
@@ -62,6 +67,81 @@ fn bound_decode_rewind_matches_replay() {
     let naive = naive_logits(&session, &[1, 5]);
     assert_close(&first_logits, &naive[0]);
     assert_close(&replayed.to_vec_f32().expect("replayed logits"), &naive[1]);
+}
+
+#[test]
+fn static_cache_decode_reuses_buffers_and_rewinds_deterministically() {
+    let env = Environment::new("static-cache-decode-test").expect("env");
+    let session =
+        Session::new(&env, &tiny_scatter_llm(), SessionOptions::default()).expect("session");
+    let signature = StaticCacheDecodeSession::detect(&session)
+        .expect("detect")
+        .expect("static-cache signature");
+    assert_eq!(signature.layers, 1);
+    assert_eq!(signature.max_len, 16);
+    assert_eq!(signature.kv_dim, 16);
+    assert!(!signature.has_position_ids);
+
+    let mut decode =
+        StaticCacheDecodeSession::new(&session, StaticCacheDecodeOptions { batch_size: 1 })
+            .expect("static decode session");
+    let initial_buffers = decode.buffer_infos().expect("initial buffers");
+    assert_eq!(initial_buffers.len(), 2);
+
+    let prefill = decode.prefill(&[1, 5], &[0, 1]).expect("prefill");
+    assert_eq!(prefill.shape(), &[1, 2, 32]);
+    assert_eq!(decode.current_len(), 2);
+    assert_eq!(decode.max_len(), 16);
+    assert_eq!(
+        decode.buffer_infos().expect("after prefill"),
+        initial_buffers
+    );
+
+    let first = decode.step(&[7], &[2]).expect("first step");
+    let first_logits = first.to_vec_f32().expect("first logits");
+    let first_token = argmax(&first_logits) as i64;
+    assert_eq!(decode.current_len(), 3);
+    assert_eq!(decode.binding_mode(), StaticCacheBindingMode::InPlaceAlias);
+    assert_eq!(decode.buffer_infos().expect("after first"), initial_buffers);
+
+    let second = decode.step(&[first_token], &[3]).expect("second step");
+    let second_logits = second.to_vec_f32().expect("second logits");
+    let second_token = argmax(&second_logits) as i64;
+    assert_eq!(
+        decode.buffer_infos().expect("after second"),
+        initial_buffers
+    );
+
+    let third = decode.step(&[second_token], &[4]).expect("third step");
+    let third_logits = third.to_vec_f32().expect("third logits");
+    let third_token = argmax(&third_logits) as i64;
+    assert_eq!(decode.buffer_infos().expect("after third"), initial_buffers);
+    eprintln!("static-cache tiny tokens: [{first_token}, {second_token}, {third_token}]");
+
+    decode.rewind(3).expect("rewind to first generated token");
+    assert_eq!(decode.current_len(), 3);
+    assert_eq!(
+        decode.buffer_infos().expect("after rewind"),
+        initial_buffers
+    );
+
+    let replay_second = decode
+        .step(&[first_token], &[3])
+        .expect("replay second step");
+    let replay_second_logits = replay_second.to_vec_f32().expect("replay second logits");
+    assert_close(&replay_second_logits, &second_logits);
+    assert_eq!(argmax(&replay_second_logits) as i64, second_token);
+
+    let replay_third = decode
+        .step(&[second_token], &[4])
+        .expect("replay third step");
+    let replay_third_logits = replay_third.to_vec_f32().expect("replay third logits");
+    assert_close(&replay_third_logits, &third_logits);
+    assert_eq!(argmax(&replay_third_logits) as i64, third_token);
+    assert_eq!(
+        decode.buffer_infos().expect("after replay"),
+        initial_buffers
+    );
 }
 
 fn naive_logits(session: &Session, tokens: &[i64]) -> Vec<Vec<f32>> {
@@ -135,4 +215,13 @@ fn assert_close(actual: &[f32], expected: &[f32]) {
             "logit {index}: {actual} != {expected}"
         );
     }
+}
+
+fn argmax(values: &[f32]) -> usize {
+    values
+        .iter()
+        .enumerate()
+        .max_by(|(_, left), (_, right)| left.total_cmp(right))
+        .map(|(index, _)| index)
+        .expect("non-empty logits")
 }
