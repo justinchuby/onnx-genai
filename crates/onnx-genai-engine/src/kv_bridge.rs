@@ -460,3 +460,398 @@ pub(crate) fn kv_layer_index(name: &str) -> Option<usize> {
         .find(|part| !part.is_empty())
         .and_then(|part| part.parse().ok())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::decode::{ModelDecodePath, run_decode_session_logits};
+    use onnx_genai_kv::{KvCacheOps, MaterializedLayerKv};
+    use onnx_genai_ort::{Environment, SessionOptions};
+    use std::path::{Path, PathBuf};
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    fn model_test_lock() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn fixture(name: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures")
+            .join(name)
+            .join("model.onnx")
+    }
+
+    fn load_session(name: &str) -> anyhow::Result<(Environment, Session)> {
+        let environment = Environment::new("kv-bridge-tests")?;
+        let session = Session::new(
+            &environment,
+            &fixture(name),
+            SessionOptions::default().with_intra_op_threads(1),
+        )?;
+        Ok((environment, session))
+    }
+
+    fn tensor_config() -> PageTensorConfig {
+        PageTensorConfig {
+            num_layers: 1,
+            num_kv_heads: 2,
+            head_dim: 2,
+            page_size: 2,
+            dtype: KvDType::F32,
+        }
+    }
+
+    fn append_token(cache: &mut PagedKvCache, seq: SessionId, base: f32) {
+        let key = [base, base + 1.0, base + 2.0, base + 3.0];
+        let value = [base + 10.0, base + 11.0, base + 12.0, base + 13.0];
+        cache
+            .append_token_kv(
+                seq,
+                &[LayerKv {
+                    key: &key,
+                    value: &value,
+                }],
+            )
+            .unwrap();
+    }
+
+    fn infers_past_present_model_and_rejects_static_cache_as_kv_bridge_model() -> anyhow::Result<()>
+    {
+        let _guard = model_test_lock();
+        let (_environment, session) = load_session("tiny-llm")?;
+        let info = infer_kv_model_info(&session, 4)?.expect("past/present KV model");
+        assert_eq!(
+            info.tensor_config,
+            PageTensorConfig {
+                num_layers: 1,
+                num_kv_heads: 2,
+                head_dim: 8,
+                page_size: 4,
+                dtype: KvDType::F32,
+            }
+        );
+        assert_eq!(info.layers[0].key_present, "present.0.key");
+        assert_eq!(info.layers[0].value_present, "present.0.value");
+        assert_eq!(info.layers[0].key_past, "past_key_values.0.key");
+        assert_eq!(info.layers[0].value_past, "past_key_values.0.value");
+
+        let (_environment, static_session) = load_session("tiny-llm-scatter")?;
+        assert!(infer_kv_model_info(&static_session, 4)?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn validates_kv_metadata_and_shape_helpers() {
+        let valid = TensorInfo {
+            name: "present.7.key".into(),
+            dtype: DataType::Float32,
+            shape: vec![-1, 2, -1, 8],
+        };
+        assert_eq!(infer_kv_heads_and_head_dim(&valid).unwrap(), (2, 8));
+        assert_eq!(kv_layer_index(&valid.name), Some(7));
+        assert_eq!(kv_layer_index("present.key"), None);
+        assert_eq!(past_shape(&[-1, 2, -1, 8], 3).unwrap(), [1, 2, 3, 8]);
+        assert_eq!(row_major_strides(&[1, 2, 3, 4]), [24, 12, 4, 1]);
+
+        let wrong_dtype = TensorInfo {
+            dtype: DataType::Int64,
+            ..valid.clone()
+        };
+        assert!(
+            infer_kv_heads_and_head_dim(&wrong_dtype)
+                .unwrap_err()
+                .to_string()
+                .contains("must be Float32 rank >= 3")
+        );
+        let unknown_head_dim = TensorInfo {
+            shape: vec![-1, 2, -1, -1],
+            ..valid
+        };
+        assert!(
+            infer_kv_heads_and_head_dim(&unknown_head_dim)
+                .unwrap_err()
+                .to_string()
+                .contains("cannot infer KV head_dim")
+        );
+        assert!(past_shape(&[1, 2], 3).is_err());
+    }
+
+    #[test]
+    fn extracts_tokens_from_present_tensor_and_reports_bad_layouts() {
+        let config = PageTensorConfig {
+            num_layers: 1,
+            num_kv_heads: 2,
+            head_dim: 2,
+            page_size: 2,
+            dtype: KvDType::F32,
+        };
+        let data = (0..12).map(|value| value as f32).collect::<Vec<_>>();
+        assert_eq!(
+            extract_present_token(&data, &[1, 2, 3, 2], config, 1).unwrap(),
+            [2.0, 3.0, 8.0, 9.0]
+        );
+        assert!(
+            extract_present_token(&data, &[1, 2, 3, 4], config, 1)
+                .unwrap_err()
+                .to_string()
+                .contains("head axis not found")
+        );
+        assert!(
+            extract_present_token(&data[..4], &[1, 2, 3, 2], config, 2)
+                .unwrap_err()
+                .to_string()
+                .contains("index out of bounds")
+        );
+    }
+
+    fn mirrors_present_append_range_into_paged_cache() -> anyhow::Result<()> {
+        let _guard = model_test_lock();
+        let (_environment, session) = load_session("tiny-llm")?;
+        let model = infer_kv_model_info(&session, 2)?.unwrap();
+        let mut cache = PagedKvCache::new_with_tensor_config(model.tensor_config, 4);
+        let seq = cache.create_sequence();
+
+        let logits = Value::from_vec_f32(vec![0.0; 2 * 32], &[1, 2, 32])?;
+        let key = (0..64).map(|value| value as f32).collect::<Vec<_>>();
+        let value = (100..164).map(|value| value as f32).collect::<Vec<_>>();
+        let outputs = vec![
+            logits,
+            Value::from_vec_f32(key, &[1, 2, 4, 8])?,
+            Value::from_vec_f32(value, &[1, 2, 4, 8])?,
+        ];
+
+        mirror_present_kv_to_pages(&session, &model, &mut cache, seq, &outputs, 1, 2)?;
+        let materialized = cache.materialize_sequence(seq)?;
+        assert_eq!(materialized.sequence_len, 2);
+        assert_eq!(
+            materialized.layers[0].key,
+            [
+                8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0, 17.0, 18.0, 19.0, 20.0, 21.0,
+                22.0, 23.0, 40.0, 41.0, 42.0, 43.0, 44.0, 45.0, 46.0, 47.0, 48.0, 49.0, 50.0, 51.0,
+                52.0, 53.0, 54.0, 55.0,
+            ]
+        );
+        assert_eq!(
+            &materialized.layers[0].value[..8],
+            &[108.0, 109.0, 110.0, 111.0, 112.0, 113.0, 114.0, 115.0]
+        );
+
+        let missing_seq =
+            mirror_present_kv_to_pages(&session, &model, &mut cache, 999, &outputs, 1, 1)
+                .unwrap_err();
+        assert!(
+            missing_seq
+                .to_string()
+                .contains("Failed to mirror present KV")
+        );
+        Ok(())
+    }
+
+    fn materializes_past_values_in_model_input_layout() -> anyhow::Result<()> {
+        let _guard = model_test_lock();
+        let (_environment, session) = load_session("tiny-llm")?;
+        let model = infer_kv_model_info(&session, 2)?.unwrap();
+        let materialized = onnx_genai_kv::MaterializedKv {
+            sequence_len: 2,
+            num_kv_heads: 2,
+            head_dim: 8,
+            layers: vec![MaterializedLayerKv {
+                key: (0..32).map(|value| value as f32).collect(),
+                value: (100..132).map(|value| value as f32).collect(),
+            }],
+        };
+        let mut state = DecodeState::new(&session)?;
+        state
+            .past
+            .insert("stale".into(), Value::from_vec_f32(vec![0.0], &[1])?);
+
+        load_materialized_past(&session, &model, &mut state, &materialized)?;
+
+        assert!(!state.past.contains_key("stale"));
+        let key = &state.past["past_key_values.0.key"];
+        assert_eq!(key.shape(), &[1, 2, 2, 8]);
+        assert_eq!(key.to_vec_f32()?, materialized.layers[0].key);
+        assert_eq!(
+            state.past["past_key_values.0.value"].to_vec_f32()?,
+            materialized.layers[0].value
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn attaches_prefix_pages_and_selects_only_pages_needed_for_length() -> anyhow::Result<()> {
+        let mut cache = PagedKvCache::new_with_tensor_config(tensor_config(), 8);
+        let source = cache.create_sequence();
+        for base in [0.0, 10.0, 20.0] {
+            append_token(&mut cache, source, base);
+        }
+        let source_pages = sequence_pages_for_len(&cache, source, 3)?;
+        assert_eq!(source_pages.len(), 2);
+        assert_eq!(sequence_pages_for_len(&cache, source, 1)?.len(), 1);
+
+        let target = cache.create_sequence();
+        attach_pages_to_sequence(&mut cache, target, &source_pages, 3)?;
+        assert_eq!(
+            cache.materialize_sequence(target)?,
+            cache.materialize_sequence(source)?
+        );
+        assert!(
+            attach_pages_to_sequence(&mut cache, target, &source_pages, 3)
+                .unwrap_err()
+                .to_string()
+                .contains("non-empty sequence")
+        );
+        assert!(attach_pages_to_sequence(&mut cache, 999, &source_pages, 3).is_err());
+        assert!(sequence_pages_for_len(&cache, 999, 1).is_err());
+        Ok(())
+    }
+
+    fn rewinds_materialized_ort_past_and_handles_edge_branches() -> anyhow::Result<()> {
+        let _guard = model_test_lock();
+        let (_environment, session) = load_session("tiny-llm")?;
+        let model = infer_kv_model_info(&session, 2)?.unwrap();
+        let mut cache = PagedKvCache::new_with_tensor_config(model.tensor_config, 8);
+        let seq = cache.create_sequence();
+        for base in [0.0, 10.0, 20.0] {
+            let key = vec![base; 16];
+            let value = vec![base + 1.0; 16];
+            cache.append_token_kv(
+                seq,
+                &[LayerKv {
+                    key: &key,
+                    value: &value,
+                }],
+            )?;
+        }
+        let mut decode_state = DecodeState::new(&session)?;
+        let mut count = 3;
+
+        rewind_decode_state_to_len(
+            &session,
+            Some(&model),
+            &mut cache,
+            seq,
+            &mut decode_state,
+            &mut count,
+            2,
+        )?;
+        assert_eq!(count, 2);
+        assert_eq!(
+            decode_state.past["past_key_values.0.key"].shape(),
+            &[1, 2, 2, 8]
+        );
+
+        rewind_decode_state_to_len(
+            &session,
+            Some(&model),
+            &mut cache,
+            seq,
+            &mut decode_state,
+            &mut count,
+            0,
+        )?;
+        assert_eq!(count, 0);
+        assert!(decode_state.past.is_empty());
+
+        count = 1;
+        let error = rewind_decode_state_to_len(
+            &session,
+            None,
+            &mut cache,
+            seq,
+            &mut decode_state,
+            &mut count,
+            0,
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("without paged KV materialization")
+        );
+
+        decode_state.use_kv = false;
+        rewind_decode_state_to_len(
+            &session,
+            None,
+            &mut cache,
+            seq,
+            &mut decode_state,
+            &mut count,
+            5,
+        )?;
+        assert_eq!(count, 0);
+        Ok(())
+    }
+
+    fn rewinds_static_and_past_present_decode_runners() -> anyhow::Result<()> {
+        let _guard = model_test_lock();
+        for (fixture_name, path) in [
+            (
+                "tiny-llm-scatter",
+                ModelDecodePath::StaticCache { max_len: 16 },
+            ),
+            (
+                "tiny-llm",
+                ModelDecodePath::PastPresent {
+                    shared_buffer: false,
+                    max_len: None,
+                },
+            ),
+        ] {
+            let (_environment, session) = load_session(fixture_name)?;
+            let mut state = DecodeState::new_for_path(&session, &path)?;
+            let mut cache = PagedKvCache::new(2, 8);
+            let seq = cache.create_sequence();
+            run_decode_session_logits(&mut state, &[2, 4, 3], 0)?;
+            cache.append(seq, 3)?;
+            let mut count = 3;
+
+            rewind_decode_state_to_len(&session, None, &mut cache, seq, &mut state, &mut count, 1)?;
+
+            assert_eq!(count, 1);
+            assert_eq!(state.runner_len(), 1);
+            assert_eq!(cache.len(seq)?, 1);
+        }
+        Ok(())
+    }
+
+    fn rewinds_target_state_and_trims_overmaterialized_kv() -> anyhow::Result<()> {
+        let _guard = model_test_lock();
+        let (_environment, session) = load_session("tiny-llm-scatter")?;
+        let mut cache = PagedKvCache::new(2, 8);
+        let seq = cache.create_sequence();
+        cache.append(seq, 4)?;
+        let mut state = EngineSession {
+            tokens: vec![2, 4, 3],
+            kv_token_count: 4,
+            decode_state: DecodeState::new(&session)?,
+            draft: None,
+        };
+
+        trim_overmaterialized_target_kv(&session, None, &mut cache, seq, &mut state)?;
+        assert_eq!(state.kv_token_count, 0);
+        assert_eq!(cache.len(seq)?, 4);
+
+        state.decode_state.use_kv = true;
+        state.kv_token_count = 4;
+        rewind_target_state_to_len(&session, None, &mut cache, seq, &mut state, 4)?;
+        assert_eq!(state.tokens, [2, 4, 3]);
+        assert_eq!(state.kv_token_count, 4);
+        assert_eq!(common_prefix_len(&[1, 2, 3], &[1, 2, 4, 5]), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn model_backed_bridge_paths_are_deterministic() -> anyhow::Result<()> {
+        infers_past_present_model_and_rejects_static_cache_as_kv_bridge_model()?;
+        mirrors_present_append_range_into_paged_cache()?;
+        materializes_past_values_in_model_input_layout()?;
+        rewinds_materialized_ort_past_and_handles_edge_branches()?;
+        rewinds_static_and_past_present_decode_runners()?;
+        rewinds_target_state_and_trims_overmaterialized_kv()
+    }
+}
