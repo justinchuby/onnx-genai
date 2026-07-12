@@ -1,0 +1,10 @@
+[package]
+name = "onnx-genai-ort-sys"
+description = "Raw FFI bindings to ONNX Runtime C API"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+links = "onnxruntime"
+
+[build-dependencies]
+bindgen = "0.71"

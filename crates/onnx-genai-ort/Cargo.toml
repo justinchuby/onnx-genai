@@ -6,9 +6,6 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+onnx-genai-ort-sys = { path = "ort-sys" }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-
-[build-dependencies]
-# bindgen will be added when we wire up the actual ORT C headers
-# bindgen = "0.71"

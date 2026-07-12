@@ -8,6 +8,7 @@ members = [
     "crates/onnx-genai-engine",
     "crates/onnx-genai-ort",
     "crates/onnx-genai-server",
+    "crates/onnx-genai-ort/ort-sys",
 ]
 
 [workspace.package]
