@@ -1,5 +1,5 @@
 # Now
 
-**Updated:** 2026-07-12T14:50:00-07:00
+**Updated:** 2026-07-12T16:14:00-07:00
 
-PUBLISHED to crates.io as onnx-genai v0.1.0 (+7 crates). CI + recurring cargo-audit live; audit DoS findings fixed. Complete runtime: generation/tool-use/grammar/FIM/long-context O(1)/batched-serving/speculative(draft+prompt-lookup+MTP). Remaining optional: EAGLE-3 proposer, full-MTP decode optimization, clippy -D warnings cleanup, paged attention (blocked by mobius). Audit regularly per user.
+Issues #2-5 closed. OpenAI endpoints: chat+tools+FIM(/v1/completions)+vision(image_url)+streaming; /metrics + /v1/status observability; onnx-genai-bench crate; coverage 75.6%. Remaining: real VLM model for vision quality (mobius CLIP+decoder), engine kv_bridge coverage, Perfetto/debug endpoints, §29 diffusion, §33/34 cluster/router, EAGLE-3 proposer.

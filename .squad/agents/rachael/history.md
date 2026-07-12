@@ -31,3 +31,8 @@ Rachael's server DoS/session hardening is now in decisions: max_output_tokens=40
 
 ### 2026-07-12T14:50:00-07:00
 Batched-driver DoS hardening is canonical: admission is bounded by `max_pending` with HTTP 429, and driver output delivery is non-blocking so slow or closed clients are dropped without stalling other rows.
+
+## 2026-07-12T16:14:00-07:00 — Issues #2/#4 and OpenAI surface logged
+- Server split (#2) and legacy completions/FIM endpoint (#4) are canonical decisions.
+- OpenAI surface now includes chat, tools, FIM via `/v1/completions`, image input parts for `/v1/chat/completions`, and streaming.
+- Vision routing accepts data URI / bounded HTTP(S) images and routes VLM pipeline requests; real quality depends on Pris delivering a mobius CLIP+decoder VLM package.

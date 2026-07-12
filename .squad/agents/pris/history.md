@@ -32,3 +32,8 @@ Pris's coding-agent harness sandbox is now in decisions: workspace path confinem
 
 ### 2026-07-12T14:50:00-07:00
 Advanced fixture work is canonical: builders use onnxscript/onnx-ir, `tiny-mtp-full` provides ignored greedy-equivalence e2e MTP coverage, `tiny-eagle3` exists for future proposer work, and paged attention remains blocked by Mobius support.
+
+## 2026-07-12T16:14:00-07:00 — Coverage baseline and vision follow-up logged
+- Coverage baseline is canonical: 75.63% line / 74.34% region overall, with KV 93.63, Scheduler 91.70, Server 80.05, Engine 74.87, ORT 68.67 line coverage.
+- `scripts/coverage.sh --fail-under-lines 75` is the proposed CI floor; prioritize engine `kv_bridge` and targeted ORT decode error fixtures.
+- Vision endpoint routing exists, but real quality needs a mobius CLIP+decoder VLM package and processor metadata.

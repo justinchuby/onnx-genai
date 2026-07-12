@@ -17,3 +17,8 @@ Sebastian's perf review is now in decisions. §26 should prioritize active-row c
 - Sebastian added `SessionOptions::with_intra_op_threads` and `Engine::from_dir_with_session_options` so correctness tests can force single-thread ORT execution.
 - Batched static-cache exact-equality tests now use `intra_op_threads=1`, eliminating reduction-order FP tie flakes while production defaults remain unchanged.
 - Preserve this convention for future real-model exact-equality tests.
+
+## 2026-07-12T16:14:00-07:00 — Benchmark and observability contracts logged
+- `onnx-genai-bench` and `scripts/run_benchmarks.sh` are canonical for device-comparable Criterion runs; preserve stable scenario names and machine metadata.
+- Observability core is canonical: atomic metrics, `/metrics`, `/v1/status`, request spans, trace IDs, driver/session/token/TTFT/latency/cache-hit/429 counters.
+- Perfetto, OTLP, and full debug endpoints remain future work.

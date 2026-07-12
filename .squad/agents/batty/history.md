@@ -43,3 +43,8 @@ Batty's §24 sampler processors and §23 FIM APIs are now in decisions. Upcoming
 
 ### 2026-07-12T14:50:00-07:00
 Prompt-lookup speculation and `MtpProposer` are accepted canonical runtime milestones. MTP proposals go through shared greedy verification; future work is optimized hidden-output decode and EAGLE-3 proposer support.
+
+## 2026-07-12T16:14:00-07:00 — Decode ownership and CI clippy convention logged
+- Decode ownership is canonical: ORT owns forward execution plus KV buffers/cursors/rewind; engine owns generation policy, loops, stopping, constraints, logical KV policy, and `DecodeBackend`.
+- CI clippy is blocking with `cargo clippy --workspace --all-targets -- -D warnings`.
+- Engine `kv_bridge` is the largest coverage gap; future EAGLE-3 proposer work should preserve the ORT/engine boundary.
