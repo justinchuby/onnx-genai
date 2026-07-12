@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 use onnx_genai_ort::{
     BatchedStaticCacheDecodeSession, DataType, DecodeKvMode, DecodeSession, DecodeSessionOptions,
@@ -25,6 +25,11 @@ fn test_environment() -> &'static Environment {
     ENVIRONMENT.get_or_init(|| Environment::new("decode-session-test").expect("env"))
 }
 
+fn ort_test_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
 fn load_session() -> Session {
     Session::new(
         test_environment(),
@@ -45,6 +50,7 @@ fn fp16_value_round_trips_bits() {
 
 #[test]
 fn bound_decode_logits_match_naive_repass() {
+    let _guard = ort_test_lock().lock().expect("ORT test lock");
     let session = load_session();
     let tokens = [1_i64, 5, 7];
     let naive = naive_logits(&session, &tokens);
@@ -64,6 +70,7 @@ fn bound_decode_logits_match_naive_repass() {
 
 #[test]
 fn bound_decode_rewind_matches_replay() {
+    let _guard = ort_test_lock().lock().expect("ORT test lock");
     let session = load_session();
     let mut decode =
         DecodeSession::new(&session, DecodeSessionOptions::default()).expect("decode session");
@@ -84,6 +91,7 @@ fn bound_decode_rewind_matches_replay() {
 
 #[test]
 fn static_cache_decode_reuses_buffers_and_rewinds_deterministically() {
+    let _guard = ort_test_lock().lock().expect("ORT test lock");
     let session = Session::new(
         test_environment(),
         &tiny_scatter_llm(),
@@ -162,6 +170,7 @@ fn static_cache_decode_reuses_buffers_and_rewinds_deterministically() {
 
 #[test]
 fn batched_static_cache_matches_unbatched_rows_and_reuses_slots() {
+    let _guard = ort_test_lock().lock().expect("ORT test lock");
     let session = Session::new(
         test_environment(),
         &tiny_scatter_llm(),
@@ -211,8 +220,7 @@ fn batched_static_cache_matches_unbatched_rows_and_reuses_slots() {
             if advance[row] {
                 let row_logits =
                     BatchedStaticCacheDecodeSession::row_logits(&logits, row, 0).expect("row");
-                assert_close(&row_logits, &trace.logits[step]);
-                assert_eq!(argmax(&row_logits), argmax(&trace.logits[step]));
+                assert_batched_matches_individual(&row_logits, &trace.logits[step]);
             }
         }
         assert_eq!(batched.buffer_infos().expect("after step"), initial_buffers);
@@ -229,7 +237,7 @@ fn batched_static_cache_matches_unbatched_rows_and_reuses_slots() {
         )
         .expect("replay row 1");
     let replay_row = BatchedStaticCacheDecodeSession::row_logits(&replay, 1, 0).expect("row 1");
-    assert_close(&replay_row, &expected[1].logits[2]);
+    assert_batched_matches_individual(&replay_row, &expected[1].logits[2]);
     assert_eq!(batched.row_len(1).expect("row 1 len"), 3);
 
     batched.deactivate_row(2).expect("deactivate row 2");
@@ -248,7 +256,7 @@ fn batched_static_cache_matches_unbatched_rows_and_reuses_slots() {
             .expect("replacement row step");
         let row_logits =
             BatchedStaticCacheDecodeSession::row_logits(&logits, 2, 0).expect("replacement row");
-        assert_close(&row_logits, &replacement.logits[index]);
+        assert_batched_matches_individual(&row_logits, &replacement.logits[index]);
     }
     assert_eq!(batched.row_len(2).expect("replacement len"), 2);
     assert_eq!(
@@ -259,6 +267,7 @@ fn batched_static_cache_matches_unbatched_rows_and_reuses_slots() {
 
 #[test]
 fn batched_static_cache_active_compaction_skips_inactive_rows_and_admits_replacement() {
+    let _guard = ort_test_lock().lock().expect("ORT test lock");
     let session = Session::new(
         test_environment(),
         &tiny_scatter_llm(),
@@ -290,7 +299,7 @@ fn batched_static_cache_active_compaction_skips_inactive_rows_and_admits_replace
         for (row, trace) in expected.iter().enumerate() {
             let row_logits =
                 BatchedStaticCacheDecodeSession::row_logits(&logits, row, 0).expect("row logits");
-            assert_close(&row_logits, &trace.logits[prompt_index]);
+            assert_batched_matches_individual(&row_logits, &trace.logits[prompt_index]);
         }
     }
 
@@ -304,8 +313,7 @@ fn batched_static_cache_active_compaction_skips_inactive_rows_and_admits_replace
     for &row in &[0_usize, 2] {
         let row_logits =
             BatchedStaticCacheDecodeSession::row_logits(&full_logits, row, 0).expect("row logits");
-        assert_close(&row_logits, &expected[row].logits[2]);
-        assert_eq!(argmax(&row_logits), argmax(&expected[row].logits[2]));
+        assert_batched_matches_individual(&row_logits, &expected[row].logits[2]);
     }
     let mut full_reference =
         BatchedStaticCacheDecodeSession::new(&session, StaticCacheDecodeOptions { batch_size: 4 })
@@ -355,12 +363,11 @@ fn batched_static_cache_active_compaction_skips_inactive_rows_and_admits_replace
         let row_logits =
             BatchedStaticCacheDecodeSession::row_logits(&active_logits, active_index, 0)
                 .expect("active row logits");
-        assert_close(&row_logits, &expected[row].logits[3]);
+        assert_batched_matches_individual(&row_logits, &expected[row].logits[3]);
         let full_row_logits =
             BatchedStaticCacheDecodeSession::row_logits(&full_reference_logits, row, 0)
                 .expect("full reference row logits");
         assert_close(&row_logits, &full_row_logits);
-        assert_eq!(argmax(&row_logits), argmax(&expected[row].logits[3]));
     }
 
     batched.admit_row(1).expect("admit replacement row 1");
@@ -383,7 +390,7 @@ fn batched_static_cache_active_compaction_skips_inactive_rows_and_admits_replace
             .expect("replacement active prefill");
         let row_logits =
             BatchedStaticCacheDecodeSession::row_logits(&logits, 2, 0).expect("replacement logits");
-        assert_close(&row_logits, &replacement.logits[index]);
+        assert_batched_matches_individual(&row_logits, &replacement.logits[index]);
     }
     assert_eq!(batched.row_len(1).expect("replacement final len"), 2);
     assert_eq!(batched.active_batch_size(), 3);
@@ -491,6 +498,30 @@ fn assert_close(actual: &[f32], expected: &[f32]) {
         assert!(
             (actual - expected).abs() <= 1e-5,
             "logit {index}: {actual} != {expected}"
+        );
+    }
+}
+
+fn assert_batched_matches_individual(batched: &[f32], individual: &[f32]) {
+    const TOLERANCE: f32 = 1e-4;
+
+    assert_eq!(batched.len(), individual.len());
+    for (index, (batched, individual)) in batched.iter().zip(individual).enumerate() {
+        assert!(
+            (batched - individual).abs() <= TOLERANCE,
+            "logit {index}: batched {batched} != individual {individual}"
+        );
+    }
+
+    let batched_argmax = argmax(batched);
+    let individual_argmax = argmax(individual);
+    if batched_argmax != individual_argmax {
+        // Batched and individual GEMMs have different reduction structures even with one ORT
+        // thread. An ordering change is acceptable only when both outputs show a near-tie.
+        assert!(
+            (batched[batched_argmax] - batched[individual_argmax]).abs() <= TOLERANCE
+                && (individual[individual_argmax] - individual[batched_argmax]).abs() <= TOLERANCE,
+            "argmax mismatch: batched {batched_argmax}, individual {individual_argmax}"
         );
     }
 }
