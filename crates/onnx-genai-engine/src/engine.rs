@@ -12,7 +12,9 @@ use onnx_genai_kv::{
 };
 use onnx_genai_metadata::InferenceMetadata;
 use onnx_genai_ort::{
-    DataType, Environment, ModelDirectory, Session, SessionOptions, TensorInfo, Tokenizer, Value,
+    DataType, DecodeSession, DecodeSessionOptions, Environment, ModelDirectory, Session,
+    SessionOptions, StaticCacheDecodeOptions, StaticCacheDecodeSession, TensorInfo, Tokenizer,
+    Value,
 };
 use onnx_genai_scheduler::{Priority, Scheduler, SchedulerConfig};
 use std::collections::HashMap;
@@ -246,8 +248,12 @@ pub struct Engine {
     kv_cache: PagedKvCache,
     /// Shared-prefix cache for reusing paged KV across sessions.
     prefix_cache: PrefixCache,
+    /// Token-only prefix index used by ORT-owned decode sessions until page import/export lands.
+    token_prefix_cache: Vec<Vec<TokenId>>,
     /// KV tensor layout inferred from model present/past TensorInfo.
     kv_model: Option<KvModelInfo>,
+    /// ORT decode path selected by model I/O introspection.
+    decode_path: ModelDecodePath,
     /// Batch scheduler.
     scheduler: Scheduler,
     /// Persistent multi-turn session state, keyed by session id.
@@ -255,7 +261,7 @@ pub struct Engine {
     /// ORT environment kept alive for the session.
     _environment: Environment,
     /// ORT session for decoder execution.
-    session: Session,
+    session: Box<Session>,
     /// Optional draft model used by the speculative decoding path.
     draft: Option<DraftModel>,
     /// Tokenizer loaded from the model directory.
@@ -305,6 +311,11 @@ impl Engine {
             SessionOptions::default(),
         )
         .map_err(|e| anyhow::anyhow!("Failed to load ORT session: {}", e))?;
+        let metadata_max_context = metadata
+            .model
+            .as_ref()
+            .and_then(|model| model.max_sequence_length);
+        let decode_path = detect_model_decode_path(&session, metadata_max_context)?;
         let tokenizer = Tokenizer::from_file(&model_directory.tokenizer_path)
             .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {}", e))?;
         let kv_model = infer_kv_model_info(&session, config.page_size)?;
@@ -317,6 +328,7 @@ impl Engine {
                 SessionOptions::default(),
             )
             .map_err(|e| anyhow::anyhow!("Failed to load draft ORT session: {}", e))?;
+            let draft_decode_path = detect_model_decode_path(&draft_session, metadata_max_context)?;
             let draft_kv_model = infer_kv_model_info(&draft_session, config.page_size)?;
             let draft_kv_cache = if let Some(kv_model) = &draft_kv_model {
                 PagedKvCache::new_with_tensor_config(kv_model.tensor_config, config.num_gpu_pages)
@@ -324,7 +336,8 @@ impl Engine {
                 PagedKvCache::new(config.page_size, config.num_gpu_pages)
             };
             Some(DraftModel {
-                session: draft_session,
+                session: Box::new(draft_session),
+                decode_path: draft_decode_path,
                 kv_model: draft_kv_model,
                 kv_cache: draft_kv_cache,
             })
@@ -343,11 +356,13 @@ impl Engine {
             metadata,
             kv_cache,
             prefix_cache: PrefixCache::new(),
+            token_prefix_cache: Vec::new(),
             kv_model,
+            decode_path,
             scheduler,
             sessions: HashMap::new(),
             _environment: environment,
-            session,
+            session: Box::new(session),
             draft,
             tokenizer,
             num_speculative_tokens: config.num_speculative_tokens.max(1),
@@ -652,14 +667,17 @@ impl Engine {
 
     /// Create a new generation session.
     pub fn create_session(&mut self) -> anyhow::Result<SessionId> {
-        let decode_state = DecodeState::new(&self.session)?;
+        let decode_state = DecodeState::new_for_path(&self.session, &self.decode_path)?;
         let id = self.kv_cache.create_sequence();
         let draft = if let Some(draft_model) = &mut self.draft {
             Some(DraftSession {
                 seq: draft_model.kv_cache.create_sequence(),
                 tokens: Vec::new(),
                 kv_token_count: 0,
-                decode_state: DecodeState::new(&draft_model.session)?,
+                decode_state: DecodeState::new_for_path(
+                    &draft_model.session,
+                    &draft_model.decode_path,
+                )?,
             })
         } else {
             None
@@ -690,7 +708,7 @@ impl Engine {
             .context("session disappeared during reset")?;
         state.tokens.clear();
         state.kv_token_count = 0;
-        state.decode_state = DecodeState::new(&self.session)?;
+        state.decode_state = DecodeState::new_for_path(&self.session, &self.decode_path)?;
         if let (Some(draft_model), Some(draft)) = (&mut self.draft, &mut state.draft) {
             draft_model
                 .kv_cache
@@ -699,7 +717,8 @@ impl Engine {
             draft.seq = draft_model.kv_cache.create_sequence();
             draft.tokens.clear();
             draft.kv_token_count = 0;
-            draft.decode_state = DecodeState::new(&draft_model.session)?;
+            draft.decode_state =
+                DecodeState::new_for_path(&draft_model.session, &draft_model.decode_path)?;
         }
         Ok(())
     }
@@ -737,11 +756,29 @@ impl Engine {
     }
 
     fn max_context_for_request(&self, options: &GenerateOptions) -> Option<usize> {
-        self.metadata
+        let configured = self
+            .metadata
             .model
             .as_ref()
             .and_then(|model| model.max_sequence_length)
-            .or(options.max_context)
+            .or(options.max_context);
+        match self.decode_path_max_len() {
+            Some(runtime_max) => {
+                Some(configured.map_or(runtime_max, |limit| limit.min(runtime_max)))
+            }
+            None => configured,
+        }
+    }
+
+    fn decode_path_max_len(&self) -> Option<usize> {
+        match self.decode_path {
+            ModelDecodePath::StaticCache { max_len } => Some(max_len),
+            ModelDecodePath::PastPresent {
+                shared_buffer: true,
+                max_len,
+            } => max_len,
+            ModelDecodePath::PastPresent { .. } | ModelDecodePath::Legacy => None,
+        }
     }
 
     fn tokenize_prompt(&self, prompt: &GeneratePrompt) -> anyhow::Result<Vec<TokenId>> {
@@ -760,7 +797,9 @@ impl Engine {
         state: &mut EngineSession,
         prompt_tokens: &[TokenId],
     ) -> anyhow::Result<usize> {
-        let same_session_hit_len = if state.decode_state.use_kv {
+        let same_session_hit_len = if state.decode_state.has_runner() {
+            state.decode_state.runner_len().min(state.tokens.len())
+        } else if state.decode_state.use_kv {
             state.kv_token_count.min(state.tokens.len())
         } else {
             0
@@ -769,7 +808,15 @@ impl Engine {
         let mut loaded_prompt_prefix = 0;
         let mut cross_session_hit_len = 0;
 
-        if started_empty
+        if started_empty && state.decode_state.has_runner() {
+            cross_session_hit_len = self
+                .token_prefix_cache
+                .iter()
+                .map(|cached| common_prefix_len(cached, prompt_tokens).min(cached.len()))
+                .filter(|&len| len > 0)
+                .max()
+                .unwrap_or(0);
+        } else if started_empty
             && state.decode_state.use_kv
             && self.kv_model.is_some()
             && self.kv_cache.page_table.tensor_config.is_some()
@@ -994,6 +1041,15 @@ impl Engine {
         state: &EngineSession,
         prompt_len: usize,
     ) -> anyhow::Result<()> {
+        if state.decode_state.has_runner() {
+            if prompt_len > 0 && prompt_len <= state.kv_token_count {
+                self.insert_token_prefix(&state.tokens[..prompt_len]);
+            }
+            if state.kv_token_count == state.tokens.len() {
+                self.insert_token_prefix(&state.tokens);
+            }
+            return Ok(());
+        }
         if self.kv_model.is_none() || state.kv_token_count == 0 {
             return Ok(());
         }
@@ -1018,6 +1074,18 @@ impl Engine {
         self.prefix_cache
             .insert_pages(tokens, &page_ids, &mut self.kv_cache.page_table);
         Ok(())
+    }
+
+    fn insert_token_prefix(&mut self, tokens: &[TokenId]) {
+        if tokens.is_empty()
+            || self
+                .token_prefix_cache
+                .iter()
+                .any(|cached| cached.as_slice() == tokens)
+        {
+            return;
+        }
+        self.token_prefix_cache.push(tokens.to_vec());
     }
 
     fn should_use_speculative(&self, options: &GenerateOptions) -> bool {
@@ -1115,36 +1183,49 @@ impl Engine {
             };
 
             state.tokens.extend_from_slice(&draft_tokens);
-            let outputs = run_decode_step(
-                &self.session,
-                &mut state.decode_state,
-                &draft_tokens,
-                base_len,
-            )?;
-            if state.decode_state.use_kv {
-                if let Some(kv_model) = &self.kv_model {
-                    mirror_present_kv_to_pages(
-                        &self.session,
-                        kv_model,
-                        &mut self.kv_cache,
-                        session_id,
-                        &outputs,
-                        base_len,
-                        draft_tokens.len(),
-                    )?;
-                } else {
-                    self.kv_cache
-                        .append(session_id, draft_tokens.len())
-                        .map_err(|e| {
-                            anyhow::anyhow!("Failed to advance KV sequence {session_id}: {}", e)
-                        })?;
-                }
+            let verified_logits = if state.decode_state.has_runner() {
+                let logits =
+                    run_decode_session_logits(&mut state.decode_state, &draft_tokens, base_len)?;
+                self.kv_cache
+                    .append(session_id, draft_tokens.len())
+                    .map_err(|e| {
+                        anyhow::anyhow!("Failed to advance KV sequence {session_id}: {}", e)
+                    })?;
                 state.kv_token_count += draft_tokens.len();
-            }
+                logits
+            } else {
+                let outputs = run_decode_step(
+                    &self.session,
+                    &mut state.decode_state,
+                    &draft_tokens,
+                    base_len,
+                )?;
+                if state.decode_state.use_kv {
+                    if let Some(kv_model) = &self.kv_model {
+                        mirror_present_kv_to_pages(
+                            &self.session,
+                            kv_model,
+                            &mut self.kv_cache,
+                            session_id,
+                            &outputs,
+                            base_len,
+                            draft_tokens.len(),
+                        )?;
+                    } else {
+                        self.kv_cache
+                            .append(session_id, draft_tokens.len())
+                            .map_err(|e| {
+                                anyhow::anyhow!("Failed to advance KV sequence {session_id}: {}", e)
+                            })?;
+                    }
+                    state.kv_token_count += draft_tokens.len();
+                }
+                extract_logits_sequence(&self.session, outputs)?
+            };
 
             let mut target_logits = Vec::with_capacity(draft_tokens.len() + 1);
             target_logits.push(std::mem::take(&mut base_logits));
-            target_logits.extend(extract_logits_sequence(&self.session, outputs)?);
+            target_logits.extend(verified_logits);
 
             let mut accepted = 0;
             let mut replacement = None;
@@ -1342,7 +1423,8 @@ struct ActiveGenerate {
 }
 
 struct DraftModel {
-    session: Session,
+    session: Box<Session>,
+    decode_path: ModelDecodePath,
     kv_model: Option<KvModelInfo>,
     kv_cache: PagedKvCache,
 }
@@ -1368,11 +1450,29 @@ struct KvLayerIo {
     value_past: String,
 }
 
+#[derive(Debug, Clone)]
+enum ModelDecodePath {
+    StaticCache {
+        max_len: usize,
+    },
+    PastPresent {
+        shared_buffer: bool,
+        max_len: Option<usize>,
+    },
+    Legacy,
+}
+
+enum DecodeRunner {
+    StaticCache(StaticCacheDecodeSession<'static>),
+    PastPresent(DecodeSession<'static>),
+}
+
 pub(crate) struct DecodeState {
     pub(crate) use_kv: bool,
     past: HashMap<String, Value>,
     present_to_past: HashMap<String, String>,
     kv_inputs: Vec<String>,
+    runner: Option<DecodeRunner>,
 }
 
 impl DecodeState {
@@ -1396,6 +1496,7 @@ impl DecodeState {
                 past: HashMap::new(),
                 present_to_past: HashMap::new(),
                 kv_inputs,
+                runner: None,
             });
         }
 
@@ -1422,7 +1523,64 @@ impl DecodeState {
             past: HashMap::new(),
             present_to_past,
             kv_inputs,
+            runner: None,
         })
+    }
+
+    fn new_for_path(session: &Session, path: &ModelDecodePath) -> anyhow::Result<Self> {
+        match path {
+            ModelDecodePath::Legacy => Self::new(session),
+            ModelDecodePath::StaticCache { .. } => Ok(Self {
+                use_kv: true,
+                past: HashMap::new(),
+                present_to_past: HashMap::new(),
+                kv_inputs: Vec::new(),
+                runner: Some(DecodeRunner::StaticCache(StaticCacheDecodeSession::new(
+                    stable_session_ref(session),
+                    StaticCacheDecodeOptions { batch_size: 1 },
+                )?)),
+            }),
+            ModelDecodePath::PastPresent {
+                shared_buffer,
+                max_len,
+            } => {
+                let mut state = Self::new(session)?;
+                if state.use_kv {
+                    state.runner = Some(DecodeRunner::PastPresent(DecodeSession::new(
+                        stable_session_ref(session),
+                        DecodeSessionOptions {
+                            batch_size: 1,
+                            max_length: *max_len,
+                            past_present_share_buffer: Some(*shared_buffer),
+                        },
+                    )?));
+                }
+                Ok(state)
+            }
+        }
+    }
+
+    fn has_runner(&self) -> bool {
+        self.runner.is_some()
+    }
+
+    fn runner_len(&self) -> usize {
+        match &self.runner {
+            Some(DecodeRunner::StaticCache(session)) => session.current_len(),
+            Some(DecodeRunner::PastPresent(session)) => session.past_len(),
+            None => 0,
+        }
+    }
+
+    fn rewind_runner(&mut self, target_len: usize) -> anyhow::Result<()> {
+        match &mut self.runner {
+            Some(DecodeRunner::StaticCache(session)) => session.rewind(target_len)?,
+            Some(DecodeRunner::PastPresent(session)) => session.rewind(target_len)?,
+            None => {
+                self.past.clear();
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1435,6 +1593,17 @@ fn next_session_token_logits(
 ) -> anyhow::Result<Vec<f32>> {
     let (input_tokens, past_len) = session_decode_input_tokens(state)?;
     let input_len = input_tokens.len();
+    if state.decode_state.has_runner() {
+        let logits = run_decode_session_logits(&mut state.decode_state, &input_tokens, past_len)?;
+        kv_cache
+            .append(seq, input_len)
+            .map_err(|e| anyhow::anyhow!("Failed to advance KV sequence {seq}: {}", e))?;
+        state.kv_token_count += input_len;
+        return logits
+            .into_iter()
+            .last()
+            .context("decode session produced no logits");
+    }
     let outputs = run_decode_step(session, &mut state.decode_state, &input_tokens, past_len)?;
     if state.decode_state.use_kv {
         if let Some(kv_model) = kv_model {
@@ -1457,6 +1626,19 @@ fn next_draft_token_logits(
 ) -> anyhow::Result<Vec<f32>> {
     let (input_tokens, past_len) = draft_decode_input_tokens(draft_state)?;
     let input_len = input_tokens.len();
+    if draft_state.decode_state.has_runner() {
+        let logits =
+            run_decode_session_logits(&mut draft_state.decode_state, &input_tokens, past_len)?;
+        draft_model
+            .kv_cache
+            .append(draft_state.seq, input_len)
+            .map_err(|e| anyhow::anyhow!("Failed to advance draft KV sequence: {}", e))?;
+        draft_state.kv_token_count += input_len;
+        return logits
+            .into_iter()
+            .last()
+            .context("draft decode session produced no logits");
+    }
     let outputs = run_decode_step(
         &draft_model.session,
         &mut draft_state.decode_state,
@@ -1564,6 +1746,75 @@ fn draft_decode_input_tokens(state: &DraftSession) -> anyhow::Result<(Vec<TokenI
         }
         Ok((state.tokens.clone(), 0))
     }
+}
+
+fn run_decode_session_logits(
+    decode_state: &mut DecodeState,
+    token_ids: &[TokenId],
+    past_len: usize,
+) -> anyhow::Result<Vec<Vec<f32>>> {
+    if token_ids.is_empty() {
+        anyhow::bail!("decode session step requires at least one input token");
+    }
+    let current_len = decode_state.runner_len();
+    if current_len > past_len {
+        decode_state.rewind_runner(past_len)?;
+    } else if current_len < past_len {
+        anyhow::bail!(
+            "decode session cursor {} is behind requested past length {}; replay is required",
+            current_len,
+            past_len
+        );
+    }
+
+    let input_ids = token_ids
+        .iter()
+        .map(|&id| i64::from(id))
+        .collect::<Vec<_>>();
+    match decode_state
+        .runner
+        .as_mut()
+        .context("decode session runner not initialized")?
+    {
+        DecodeRunner::PastPresent(runner) => {
+            let total_len = past_len + input_ids.len();
+            let attention_mask = vec![1_i64; total_len];
+            let position_ids = (past_len..total_len)
+                .map(|pos| i64::try_from(pos).context("position id exceeds i64 range"))
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            let logits = runner.step(&input_ids, &attention_mask, &position_ids)?;
+            extract_logits_value_sequence(&logits)
+        }
+        DecodeRunner::StaticCache(runner) => {
+            if runner.current_len() == 0 {
+                let position_ids = (0..input_ids.len())
+                    .map(|pos| i64::try_from(pos).context("position id exceeds i64 range"))
+                    .collect::<anyhow::Result<Vec<_>>>()?;
+                let logits = runner.prefill(&input_ids, &position_ids)?;
+                extract_logits_value_sequence(&logits)
+            } else {
+                let mut logits = Vec::with_capacity(input_ids.len());
+                for &token in &input_ids {
+                    let pos = i64::try_from(runner.current_len())
+                        .context("position id exceeds i64 range")?;
+                    let value = runner.step(&[token], &[pos])?;
+                    logits.push(extract_logits_value_next(&value)?);
+                }
+                Ok(logits)
+            }
+        }
+    }
+    .map_err(|error| {
+        let message = error.to_string();
+        if is_gather_out_of_bounds(&message) {
+            anyhow::anyhow!(
+                "model context length exceeded during ORT decode; configure inference metadata `model.max_sequence_length` or GenerateOptions::max_context to stop cleanly before the context window is exceeded: {}",
+                error
+            )
+        } else {
+            error
+        }
+    })
 }
 
 fn run_decode_step(
@@ -1737,6 +1988,41 @@ pub(crate) fn infer_kv_model_info(
         tensor_config: config,
         layers,
     }))
+}
+
+fn detect_model_decode_path(
+    session: &Session,
+    metadata_max_context: Option<usize>,
+) -> anyhow::Result<ModelDecodePath> {
+    if let Some(signature) = StaticCacheDecodeSession::detect(session)? {
+        return Ok(ModelDecodePath::StaticCache {
+            max_len: signature.max_len,
+        });
+    }
+
+    let has_kv_inputs = session.inputs().iter().any(|info| is_kv_input(&info.name));
+    let has_present_outputs = session
+        .outputs()
+        .iter()
+        .any(|info| is_present_output(&info.name));
+    if has_kv_inputs || has_present_outputs {
+        let shared_buffer =
+            session.past_present_share_buffer_supported() && metadata_max_context.is_some();
+        return Ok(ModelDecodePath::PastPresent {
+            shared_buffer,
+            max_len: metadata_max_context.filter(|_| shared_buffer),
+        });
+    }
+
+    Ok(ModelDecodePath::Legacy)
+}
+
+fn stable_session_ref(session: &Session) -> &'static Session {
+    // Decode sessions live inside EngineSession, while their referenced Session is
+    // boxed in Engine/DraftModel and dropped only after all EngineSessions. The
+    // boxed allocation is stable across Engine moves; the transmute narrows that
+    // invariant to ORT's current reference-based decode-session API.
+    unsafe { std::mem::transmute::<&Session, &'static Session>(session) }
 }
 
 fn infer_kv_heads_and_head_dim(info: &TensorInfo) -> anyhow::Result<(usize, usize)> {
@@ -2014,6 +2300,14 @@ fn rewind_decode_state_to_len(
     if *kv_token_count == len {
         return Ok(());
     }
+    if decode_state.has_runner() {
+        kv_cache
+            .rewind_to(seq, len)
+            .map_err(|e| anyhow::anyhow!("Failed to rewind KV sequence {seq} to {len}: {}", e))?;
+        decode_state.rewind_runner(len)?;
+        *kv_token_count = len;
+        return Ok(());
+    }
     if kv_model.is_none() && *kv_token_count != len {
         anyhow::bail!("cannot rewind ORT KV tensors without paged KV materialization");
     }
@@ -2155,6 +2449,42 @@ fn extract_logits_sequence(
     let logits = outputs
         .get(logits_index)
         .context("logits output index was out of range")?;
+    let shape = logits.shape();
+    let data = logits
+        .to_vec_f32()
+        .map_err(|e| anyhow::anyhow!("Failed to read logits tensor: {}", e))?;
+
+    match shape {
+        [vocab] if *vocab > 0 => Ok(vec![data]),
+        [seq, vocab] if *seq > 0 && *vocab > 0 => {
+            let vocab = *vocab as usize;
+            Ok(data
+                .chunks(vocab)
+                .take(*seq as usize)
+                .map(|chunk| chunk.to_vec())
+                .collect())
+        }
+        [batch, seq, vocab] if *batch > 0 && *seq > 0 && *vocab > 0 => {
+            let vocab = *vocab as usize;
+            Ok(data
+                .chunks(vocab)
+                .take(*seq as usize)
+                .map(|chunk| chunk.to_vec())
+                .collect())
+        }
+        other => anyhow::bail!("unsupported logits tensor shape: {:?}", other),
+    }
+}
+
+fn extract_logits_value_next(logits: &Value) -> anyhow::Result<Vec<f32>> {
+    let sequence = extract_logits_value_sequence(logits)?;
+    sequence
+        .into_iter()
+        .last()
+        .context("logits tensor did not contain any sequence rows")
+}
+
+fn extract_logits_value_sequence(logits: &Value) -> anyhow::Result<Vec<Vec<f32>>> {
     let shape = logits.shape();
     let data = logits
         .to_vec_f32()
@@ -2620,6 +2950,54 @@ mod tests {
         assert_eq!(result.token_ids.len(), 3);
         assert_eq!(result.finish_reason, FinishReason::MaxTokens);
         assert!(engine.sessions.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn tiny_fixture_uses_past_present_decode_session_with_stable_greedy_output()
+    -> anyhow::Result<()> {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/tiny-llm")
+            .canonicalize()?;
+        let mut engine = Engine::from_dir(&fixture, EngineConfig::default())?;
+        assert!(matches!(
+            engine.decode_path,
+            ModelDecodePath::PastPresent {
+                shared_buffer: false,
+                ..
+            }
+        ));
+        let mut request = GenerateRequest::new("hello");
+        request.options.max_new_tokens = 3;
+        request.options.temperature = 0.0;
+        request.options.stop_on_eos = false;
+
+        let result = engine.generate(request)?;
+
+        assert_eq!(result.token_ids, vec![22, 22, 20]);
+        Ok(())
+    }
+
+    #[test]
+    fn scatter_fixture_uses_static_cache_decode_session_with_stable_greedy_output()
+    -> anyhow::Result<()> {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/tiny-llm-scatter")
+            .canonicalize()?;
+        let mut engine = Engine::from_dir(&fixture, EngineConfig::default())?;
+        assert!(matches!(
+            engine.decode_path,
+            ModelDecodePath::StaticCache { max_len } if max_len > 0
+        ));
+        let mut request = GenerateRequest::new("hello");
+        request.options.max_new_tokens = 3;
+        request.options.temperature = 0.0;
+        request.options.stop_on_eos = false;
+
+        let result = engine.generate(request)?;
+
+        assert_eq!(result.token_ids, vec![23, 15, 28]);
+        assert_eq!(result.finish_reason, FinishReason::MaxTokens);
         Ok(())
     }
 
