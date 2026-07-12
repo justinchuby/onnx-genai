@@ -15,6 +15,6 @@ pub mod speculative;
 
 pub use engine::{
     Engine, EngineConfig, FinishReason, GenerateOptions, GeneratePrompt, GenerateRequest,
-    GenerateResult, GenerateToken, GenerateTokenCallback,
+    GenerateResult, GenerateToken, GenerateTokenCallback, SessionId,
 };
 pub use logits::{StopSequence, TokenId};

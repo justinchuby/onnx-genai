@@ -6,7 +6,7 @@ use crate::logits::{
 };
 use crate::sampling::{sample_categorical, sample_greedy};
 use anyhow::Context;
-use onnx_genai_kv::{PagedKvCache, SequenceId};
+use onnx_genai_kv::{KvCacheOps, PagedKvCache, SequenceId};
 use onnx_genai_metadata::InferenceMetadata;
 use onnx_genai_ort::{
     DataType, Environment, ModelDirectory, Session, SessionOptions, TensorInfo, Tokenizer, Value,
@@ -14,6 +14,9 @@ use onnx_genai_ort::{
 use onnx_genai_scheduler::{Priority, Scheduler, SchedulerConfig};
 use std::collections::HashMap;
 use std::path::Path;
+
+/// Identifier for a persistent generation session.
+pub type SessionId = SequenceId;
 
 /// Engine configuration.
 #[derive(Debug, Clone)]
@@ -179,6 +182,8 @@ pub struct Engine {
     kv_cache: PagedKvCache,
     /// Batch scheduler.
     scheduler: Scheduler,
+    /// Persistent multi-turn session state, keyed by session id.
+    sessions: HashMap<SessionId, EngineSession>,
     /// ORT environment kept alive for the session.
     _environment: Environment,
     /// ORT session for decoder execution.
@@ -238,6 +243,7 @@ impl Engine {
             metadata,
             kv_cache,
             scheduler,
+            sessions: HashMap::new(),
             _environment: environment,
             session,
             tokenizer,
@@ -256,6 +262,33 @@ impl Engine {
         request: GenerateRequest,
         mut callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
+        let session_id = self.create_session()?;
+        let result =
+            self.generate_in_session_with_callback(session_id, request, callback.as_deref_mut());
+        let close_result = self.close_session(session_id);
+        match (result, close_result) {
+            (Ok(result), Ok(())) => Ok(result),
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+        }
+    }
+
+    /// Generate text in a persistent session, reusing the session's accumulated KV state.
+    pub fn generate_in_session(
+        &mut self,
+        session_id: SessionId,
+        request: GenerateRequest,
+    ) -> anyhow::Result<GenerateResult> {
+        self.generate_in_session_with_callback(session_id, request, None)
+    }
+
+    /// Generate text in a persistent session and optionally stream generated tokens.
+    pub fn generate_in_session_with_callback(
+        &mut self,
+        session_id: SessionId,
+        request: GenerateRequest,
+        mut callback: Option<&mut GenerateTokenCallback<'_>>,
+    ) -> anyhow::Result<GenerateResult> {
         request.options.validate()?;
         let mut options = request.options.clone();
         if options.eos_token_id.is_none() {
@@ -265,72 +298,148 @@ impl Engine {
         if prompt_tokens.is_empty() {
             anyhow::bail!("prompt must contain at least one token");
         }
-        let mut decode_state = DecodeState::new(&self.session)?;
-        let seq_id = self.create_session();
-        self.scheduler.add_request(
-            seq_id,
+        if !self.sessions.contains_key(&session_id) {
+            anyhow::bail!("session {session_id} not found");
+        }
+
+        let request_id = self.scheduler.enqueue_generate_request(
+            session_id,
             prompt_tokens.len(),
             options.max_new_tokens,
             Priority::Normal,
         );
+        let scheduled = self
+            .scheduler
+            .drive_next_fcfs()
+            .context("scheduler did not admit the session generate request")?;
+        if scheduled.request_id != request_id || scheduled.seq_id != session_id {
+            anyhow::bail!(
+                "scheduler admitted request {} for session {}, expected request {} for session {}",
+                scheduled.request_id,
+                scheduled.seq_id,
+                request_id,
+                session_id
+            );
+        }
 
         let chain = build_processor_chain(&options);
         let mut generated_tokens = Vec::new();
         let mut generated_text = String::new();
 
-        for step in 0..options.max_new_tokens {
-            let mut context = ProcessorContext {
-                prompt_tokens: prompt_tokens.clone(),
-                generated_tokens: generated_tokens.clone(),
-                generated_text: generated_text.clone(),
-                step,
-            };
+        let mut state = self
+            .sessions
+            .remove(&session_id)
+            .with_context(|| format!("session {session_id} not found"))?;
+        state.tokens.extend_from_slice(&prompt_tokens);
 
-            let mut logits = self.next_token_logits(
-                seq_id,
-                &prompt_tokens,
-                &generated_tokens,
-                &mut decode_state,
-            )?;
-            let token_id = select_next_token(&mut logits, &context, &options, &chain, 0.0);
-            generated_tokens.push(token_id);
-            self.scheduler.advance(seq_id);
+        let result = (|| -> anyhow::Result<GenerateResult> {
+            for step in 0..options.max_new_tokens {
+                let mut context = ProcessorContext {
+                    prompt_tokens: state.tokens.clone(),
+                    generated_tokens: generated_tokens.clone(),
+                    generated_text: generated_text.clone(),
+                    step,
+                };
 
-            let token_text = self.detokenize_token(token_id)?;
-            generated_text.push_str(&token_text);
-            context.generated_tokens = generated_tokens.clone();
-            context.generated_text = generated_text.clone();
+                let mut logits = next_session_token_logits(&self.session, &mut state)?;
+                let token_id = select_next_token(&mut logits, &context, &options, &chain, 0.0);
+                generated_tokens.push(token_id);
+                state.tokens.push(token_id);
+                self.scheduler.advance(session_id);
 
-            let finish_reason = finish_reason_after_token(token_id, &options, &chain, &context);
-            if let Some(callback) = callback.as_deref_mut() {
-                callback(GenerateToken {
-                    token_id,
-                    text: token_text,
-                    finish_reason: finish_reason.clone(),
-                })?;
+                let token_text = self
+                    .tokenizer
+                    .decode(&[token_id])
+                    .map_err(|e| anyhow::anyhow!("Failed to detokenize token {token_id}: {}", e))?;
+                generated_text.push_str(&token_text);
+                context.generated_tokens = generated_tokens.clone();
+                context.generated_text = generated_text.clone();
+
+                let finish_reason = finish_reason_after_token(token_id, &options, &chain, &context);
+                if let Some(callback) = callback.as_deref_mut() {
+                    callback(GenerateToken {
+                        token_id,
+                        text: token_text,
+                        finish_reason: finish_reason.clone(),
+                    })?;
+                }
+
+                if let Some(finish_reason) = finish_reason {
+                    return Ok(GenerateResult {
+                        text: self.tokenizer.decode(&generated_tokens).map_err(|e| {
+                            anyhow::anyhow!("Failed to detokenize generated tokens: {}", e)
+                        })?,
+                        token_ids: generated_tokens,
+                        finish_reason,
+                    });
+                }
             }
 
-            if let Some(finish_reason) = finish_reason {
-                self.scheduler.complete(seq_id);
-                return Ok(GenerateResult {
-                    text: self.detokenize_tokens(&generated_tokens)?,
-                    token_ids: generated_tokens,
-                    finish_reason,
-                });
-            }
-        }
-
-        self.scheduler.complete(seq_id);
-        Ok(GenerateResult {
-            text: self.detokenize_tokens(&generated_tokens)?,
-            token_ids: generated_tokens,
-            finish_reason: FinishReason::MaxTokens,
-        })
+            Ok(GenerateResult {
+                text: self
+                    .tokenizer
+                    .decode(&generated_tokens)
+                    .map_err(|e| anyhow::anyhow!("Failed to detokenize generated tokens: {}", e))?,
+                token_ids: generated_tokens,
+                finish_reason: FinishReason::MaxTokens,
+            })
+        })();
+        self.sessions.insert(session_id, state);
+        self.scheduler.complete(session_id);
+        result
     }
 
     /// Create a new generation session.
-    pub fn create_session(&mut self) -> SequenceId {
-        self.kv_cache.create_sequence()
+    pub fn create_session(&mut self) -> anyhow::Result<SessionId> {
+        let decode_state = DecodeState::new(&self.session)?;
+        let id = self.kv_cache.create_sequence();
+        let state = EngineSession {
+            tokens: Vec::new(),
+            kv_token_count: 0,
+            decode_state,
+        };
+        self.sessions.insert(id, state);
+        Ok(id)
+    }
+
+    /// Reset a persistent session, freeing its current state while keeping the id usable.
+    pub fn reset_session(&mut self, session_id: SessionId) -> anyhow::Result<()> {
+        if !self.sessions.contains_key(&session_id) {
+            anyhow::bail!("session {session_id} not found");
+        }
+        self.scheduler.complete(session_id);
+        self.kv_cache
+            .remove(session_id)
+            .map_err(|e| anyhow::anyhow!("Failed to reset KV sequence {session_id}: {}", e))?;
+        self.kv_cache.page_table.create_sequence(session_id);
+        let state = self
+            .sessions
+            .get_mut(&session_id)
+            .context("session disappeared during reset")?;
+        state.tokens.clear();
+        state.kv_token_count = 0;
+        state.decode_state = DecodeState::new(&self.session)?;
+        Ok(())
+    }
+
+    /// Close a persistent session and free its associated state.
+    pub fn close_session(&mut self, session_id: SessionId) -> anyhow::Result<()> {
+        self.scheduler.complete(session_id);
+        self.sessions
+            .remove(&session_id)
+            .with_context(|| format!("session {session_id} not found"))?;
+        self.kv_cache
+            .remove(session_id)
+            .map_err(|e| anyhow::anyhow!("Failed to remove KV sequence {session_id}: {}", e))?;
+        Ok(())
+    }
+
+    /// Number of logical tokens retained in a persistent session.
+    pub fn session_token_count(&self, session_id: SessionId) -> anyhow::Result<usize> {
+        self.sessions
+            .get(&session_id)
+            .map(|state| state.tokens.len())
+            .with_context(|| format!("session {session_id} not found"))
     }
 
     /// Get the loaded metadata.
@@ -347,31 +456,15 @@ impl Engine {
                 .map_err(|e| anyhow::anyhow!("Failed to tokenize prompt: {}", e)),
         }
     }
+}
 
-    fn detokenize_token(&self, token_id: TokenId) -> anyhow::Result<String> {
-        self.tokenizer
-            .decode(&[token_id])
-            .map_err(|e| anyhow::anyhow!("Failed to detokenize token {token_id}: {}", e))
-    }
-
-    fn detokenize_tokens(&self, token_ids: &[TokenId]) -> anyhow::Result<String> {
-        self.tokenizer
-            .decode(token_ids)
-            .map_err(|e| anyhow::anyhow!("Failed to detokenize generated tokens: {}", e))
-    }
-
-    fn next_token_logits(
-        &mut self,
-        _seq_id: SequenceId,
-        prompt_tokens: &[TokenId],
-        generated_tokens: &[TokenId],
-        decode_state: &mut DecodeState,
-    ) -> anyhow::Result<Vec<f32>> {
-        let (input_tokens, past_len) =
-            decode_input_tokens(prompt_tokens, generated_tokens, decode_state)?;
-        let outputs = run_decode_step(&self.session, decode_state, &input_tokens, past_len)?;
-        extract_next_token_logits(&self.session, outputs)
-    }
+struct EngineSession {
+    /// Logical token context retained across turns.
+    tokens: Vec<TokenId>,
+    /// Prefix length currently materialized in `decode_state.past`.
+    kv_token_count: usize,
+    /// ORT-managed past tensors retained between calls.
+    decode_state: DecodeState,
 }
 
 struct DecodeState {
@@ -432,26 +525,38 @@ impl DecodeState {
     }
 }
 
-fn decode_input_tokens(
-    prompt_tokens: &[TokenId],
-    generated_tokens: &[TokenId],
-    decode_state: &DecodeState,
-) -> anyhow::Result<(Vec<TokenId>, usize)> {
-    if decode_state.use_kv && !decode_state.past.is_empty() {
-        let token = generated_tokens
-            .last()
-            .copied()
-            .context("KV decode step has no generated token to feed")?;
-        Ok((
-            vec![token],
-            prompt_tokens.len() + generated_tokens.len() - 1,
-        ))
-    } else {
-        let mut tokens = prompt_tokens.to_vec();
-        if !decode_state.use_kv {
-            tokens.extend_from_slice(generated_tokens);
+fn next_session_token_logits(
+    session: &Session,
+    state: &mut EngineSession,
+) -> anyhow::Result<Vec<f32>> {
+    let (input_tokens, past_len) = session_decode_input_tokens(state)?;
+    let input_len = input_tokens.len();
+    let outputs = run_decode_step(session, &mut state.decode_state, &input_tokens, past_len)?;
+    if state.decode_state.use_kv {
+        state.kv_token_count += input_len;
+    }
+    extract_next_token_logits(session, outputs)
+}
+
+fn session_decode_input_tokens(state: &EngineSession) -> anyhow::Result<(Vec<TokenId>, usize)> {
+    if state.decode_state.use_kv {
+        if state.kv_token_count > state.tokens.len() {
+            anyhow::bail!(
+                "session KV token count {} exceeds logical context length {}",
+                state.kv_token_count,
+                state.tokens.len()
+            );
         }
-        Ok((tokens, 0))
+        let input_tokens = state.tokens[state.kv_token_count..].to_vec();
+        if input_tokens.is_empty() {
+            anyhow::bail!("session decode step has no new token to feed");
+        }
+        Ok((input_tokens, state.kv_token_count))
+    } else {
+        if state.tokens.is_empty() {
+            anyhow::bail!("decode step requires at least one context token");
+        }
+        Ok((state.tokens.clone(), 0))
     }
 }
 
@@ -835,6 +940,38 @@ mod tests {
 
         assert_eq!(result.token_ids.len(), 3);
         assert_eq!(result.finish_reason, FinishReason::MaxTokens);
+        assert!(engine.sessions.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn tiny_fixture_session_persists_context_across_turns() -> anyhow::Result<()> {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/tiny-llm")
+            .canonicalize()?;
+        let mut engine = Engine::from_dir(&fixture, EngineConfig::default())?;
+        let session_id = engine.create_session()?;
+
+        let mut first = GenerateRequest::new("hello");
+        first.options.max_new_tokens = 2;
+        first.options.temperature = 0.0;
+        first.options.stop_on_eos = false;
+        let first_result = engine.generate_in_session(session_id, first)?;
+        let first_count = engine.session_token_count(session_id)?;
+
+        let mut second = GenerateRequest::new(" world");
+        second.options.max_new_tokens = 2;
+        second.options.temperature = 0.0;
+        second.options.stop_on_eos = false;
+        let second_result = engine.generate_in_session(session_id, second)?;
+        let second_count = engine.session_token_count(session_id)?;
+
+        assert_eq!(first_result.token_ids.len(), 2);
+        assert_eq!(second_result.token_ids.len(), 2);
+        assert!(second_count > first_count);
+        assert!(engine.sessions[&session_id].kv_token_count > 0);
+        engine.close_session(session_id)?;
+        assert!(engine.sessions.is_empty());
         Ok(())
     }
 }

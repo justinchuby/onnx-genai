@@ -13,5 +13,5 @@ pub use onnx_genai_scheduler as scheduler;
 
 pub use onnx_genai_engine::{
     Engine, EngineConfig, FinishReason, GenerateOptions, GeneratePrompt, GenerateRequest,
-    GenerateResult, GenerateToken, GenerateTokenCallback, StopSequence, TokenId,
+    GenerateResult, GenerateToken, GenerateTokenCallback, SessionId, StopSequence, TokenId,
 };

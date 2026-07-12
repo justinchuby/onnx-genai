@@ -32,6 +32,13 @@ pub struct Request {
     pub arrived_at: u64,
 }
 
+/// A single request admitted by the minimal FCFS drive loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScheduledRequest {
+    pub request_id: u64,
+    pub seq_id: SequenceId,
+}
+
 /// A sequence currently in the running batch.
 #[derive(Debug)]
 pub struct RunningSequence {
@@ -126,6 +133,44 @@ impl Scheduler {
             arrived_at: self.clock,
         });
         id
+    }
+
+    /// Enqueue a generation request.
+    ///
+    /// This is the Phase 2 engine-facing API. It currently aliases `add_request`;
+    /// future continuous batching work can expand the request shape without making
+    /// engine callers manipulate the lower-level scheduler queue directly.
+    pub fn enqueue_generate_request(
+        &mut self,
+        seq_id: SequenceId,
+        prompt_tokens: usize,
+        max_tokens: usize,
+        priority: Priority,
+    ) -> u64 {
+        self.add_request(seq_id, prompt_tokens, max_tokens, priority)
+    }
+
+    /// Admit one queued request using the current FCFS policy.
+    ///
+    /// This is intentionally single-request for the first session integration;
+    /// full continuous batching will replace this with batch formation.
+    pub fn drive_next_fcfs(&mut self) -> Option<ScheduledRequest> {
+        if self.running.len() >= self.config.max_batch_size || self.waiting.is_empty() {
+            return None;
+        }
+
+        let request = self.waiting.remove(0);
+        self.running.push(RunningSequence {
+            seq_id: request.seq_id,
+            request_id: request.id,
+            generated_tokens: 0,
+            max_tokens: request.max_tokens,
+            priority: request.priority,
+        });
+        Some(ScheduledRequest {
+            request_id: request.id,
+            seq_id: request.seq_id,
+        })
     }
 
     /// Called each iteration to decide what to run.
