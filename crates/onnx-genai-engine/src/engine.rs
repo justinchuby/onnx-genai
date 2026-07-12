@@ -162,6 +162,28 @@ impl GenerateRequest {
     }
 }
 
+/// A generation request with an explicit scheduler priority.
+#[derive(Debug, Clone)]
+pub struct PrioritizedGenerateRequest {
+    pub session_id: SessionId,
+    pub request: GenerateRequest,
+    pub priority: Priority,
+}
+
+/// A prioritized request that becomes visible to the engine after a decode-step count.
+#[derive(Debug, Clone)]
+pub struct ScheduledGenerateArrival {
+    pub arrival_step: usize,
+    pub request: PrioritizedGenerateRequest,
+}
+
+/// Result for one request driven through the priority scheduler.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrioritizedGenerateResult {
+    pub session_id: SessionId,
+    pub result: GenerateResult,
+}
+
 /// Why generation stopped.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FinishReason {
@@ -347,11 +369,36 @@ impl Engine {
         self.generate_in_session_with_callback(session_id, request, None)
     }
 
+    /// Generate text in a persistent session with an explicit scheduler priority.
+    pub fn generate_in_session_with_priority(
+        &mut self,
+        session_id: SessionId,
+        request: GenerateRequest,
+        priority: Priority,
+    ) -> anyhow::Result<GenerateResult> {
+        self.generate_in_session_with_priority_and_callback(session_id, request, priority, None)
+    }
+
     /// Generate text in a persistent session and optionally stream generated tokens.
     pub fn generate_in_session_with_callback(
         &mut self,
         session_id: SessionId,
         request: GenerateRequest,
+        mut callback: Option<&mut GenerateTokenCallback<'_>>,
+    ) -> anyhow::Result<GenerateResult> {
+        self.generate_in_session_with_priority_and_callback(
+            session_id,
+            request,
+            Priority::Normal,
+            callback.as_deref_mut(),
+        )
+    }
+
+    fn generate_in_session_with_priority_and_callback(
+        &mut self,
+        session_id: SessionId,
+        request: GenerateRequest,
+        priority: Priority,
         mut callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
         request.options.validate()?;
@@ -371,7 +418,7 @@ impl Engine {
             session_id,
             prompt_tokens.len(),
             options.max_new_tokens,
-            Priority::Normal,
+            priority,
         );
         let scheduled = self
             .scheduler
@@ -491,6 +538,97 @@ impl Engine {
         self.sessions.insert(session_id, state);
         self.scheduler.complete(session_id);
         result
+    }
+
+    /// Drive a set of already-arrived prioritized requests to completion.
+    ///
+    /// This is the Phase 3 engine-facing scheduler drive API. It runs one
+    /// sequence at a time for now, but honors priority ordering and scheduler
+    /// preemption decisions while preserving session decode state and KV in place.
+    pub fn drive_prioritized_requests(
+        &mut self,
+        requests: Vec<PrioritizedGenerateRequest>,
+    ) -> anyhow::Result<Vec<PrioritizedGenerateResult>> {
+        let arrivals = requests
+            .into_iter()
+            .map(|request| ScheduledGenerateArrival {
+                arrival_step: 0,
+                request,
+            })
+            .collect();
+        self.drive_prioritized_arrivals(arrivals)
+    }
+
+    /// Drive prioritized requests that arrive after specific generated-token steps.
+    ///
+    /// This lets async server code drain newly-arrived requests between scheduler
+    /// iterations. Preemption is swap-style: active `EngineSession` state, ORT past
+    /// tensors, and mirrored paged KV stay owned by the engine and are resumed
+    /// without recomputation.
+    pub fn drive_prioritized_arrivals(
+        &mut self,
+        mut arrivals: Vec<ScheduledGenerateArrival>,
+    ) -> anyhow::Result<Vec<PrioritizedGenerateResult>> {
+        arrivals.sort_by_key(|arrival| arrival.arrival_step);
+        let total_requests = arrivals.len();
+        let mut next_arrival = 0;
+        let mut generated_steps = 0;
+        let mut active: HashMap<SessionId, ActiveGenerate> = HashMap::new();
+        let mut results = Vec::with_capacity(total_requests);
+
+        while results.len() < total_requests {
+            while next_arrival < arrivals.len()
+                && arrivals[next_arrival].arrival_step <= generated_steps
+            {
+                let arrival = arrivals[next_arrival].clone();
+                next_arrival += 1;
+                let active_request = self.prepare_active_generate(arrival.request)?;
+                if active
+                    .insert(active_request.session_id, active_request)
+                    .is_some()
+                {
+                    anyhow::bail!("session already has an active generation request");
+                }
+            }
+
+            let decision = self.scheduler.schedule();
+            let mut runnable = Vec::new();
+            for seq in decision
+                .prefill
+                .iter()
+                .chain(decision.swap_in.iter())
+                .chain(decision.decode.iter())
+            {
+                if !decision.preempt.contains(seq) && !runnable.contains(seq) {
+                    runnable.push(*seq);
+                }
+            }
+
+            if runnable.is_empty() {
+                if next_arrival < arrivals.len() {
+                    generated_steps = arrivals[next_arrival].arrival_step;
+                    continue;
+                }
+                anyhow::bail!("scheduler made no runnable decision with active requests remaining");
+            }
+
+            for session_id in runnable {
+                let mut active_request = active.remove(&session_id).with_context(|| {
+                    format!("active request for session {session_id} not found")
+                })?;
+                let step_result = self.step_active_generate(&mut active_request)?;
+                generated_steps += 1;
+                if let Some(result) = step_result {
+                    let session_id = active_request.session_id;
+                    self.finish_active_generate(active_request)?;
+                    results.push(PrioritizedGenerateResult { session_id, result });
+                } else {
+                    active.insert(session_id, active_request);
+                }
+            }
+        }
+
+        Ok(results)
     }
 
     /// Create a new generation session.
@@ -675,6 +813,133 @@ impl Engine {
             state.tokens.extend_from_slice(prompt_tokens);
         }
         Ok(same_session_hit_len.max(cross_session_hit_len))
+    }
+
+    fn prepare_active_generate(
+        &mut self,
+        request: PrioritizedGenerateRequest,
+    ) -> anyhow::Result<ActiveGenerate> {
+        request.request.options.validate()?;
+        let mut options = request.request.options.clone();
+        if options.eos_token_id.is_none() {
+            options.eos_token_id = self.tokenizer.eos_token_id();
+        }
+        let prompt_tokens = self.tokenize_prompt(&request.request.prompt)?;
+        if prompt_tokens.is_empty() {
+            anyhow::bail!("prompt must contain at least one token");
+        }
+        if !self.sessions.contains_key(&request.session_id) {
+            anyhow::bail!("session {} not found", request.session_id);
+        }
+        if self.should_use_speculative(&options) {
+            anyhow::bail!(
+                "prioritized drive API currently supports the single-sequence non-speculative path; batched/speculative drive is future work"
+            );
+        }
+
+        self.scheduler.enqueue_generate_request(
+            request.session_id,
+            prompt_tokens.len(),
+            options.max_new_tokens,
+            request.priority,
+        );
+        let max_context = self.max_context_for_request(&options);
+        let chain = build_processor_chain(&options);
+        let mut state = self
+            .sessions
+            .remove(&request.session_id)
+            .with_context(|| format!("session {} not found", request.session_id))?;
+        let prefix_cache_hit_len =
+            self.prepare_session_prefix(request.session_id, &mut state, &prompt_tokens)?;
+        Ok(ActiveGenerate {
+            session_id: request.session_id,
+            state,
+            options,
+            chain,
+            max_context,
+            prompt_len: prompt_tokens.len(),
+            prefix_cache_hit_len,
+            generated_tokens: Vec::new(),
+            generated_text: String::new(),
+            step: 0,
+        })
+    }
+
+    fn step_active_generate(
+        &mut self,
+        active: &mut ActiveGenerate,
+    ) -> anyhow::Result<Option<GenerateResult>> {
+        if reached_context_limit(active.state.tokens.len(), active.max_context) {
+            return self
+                .finish_result(
+                    &active.generated_tokens,
+                    FinishReason::Length,
+                    active.prefix_cache_hit_len,
+                )
+                .map(Some);
+        }
+
+        let mut context = ProcessorContext {
+            prompt_tokens: active.state.tokens.clone(),
+            generated_tokens: active.generated_tokens.clone(),
+            generated_text: active.generated_text.clone(),
+            step: active.step,
+        };
+
+        let mut logits = next_session_token_logits(
+            &self.session,
+            self.kv_model.as_ref(),
+            &mut self.kv_cache,
+            active.session_id,
+            &mut active.state,
+        )?;
+        let token_id =
+            select_next_token(&mut logits, &context, &active.options, &active.chain, 0.0);
+        active.generated_tokens.push(token_id);
+        active.state.tokens.push(token_id);
+        self.scheduler.advance(active.session_id);
+
+        let token_text = self
+            .tokenizer
+            .decode(&[token_id])
+            .map_err(|e| anyhow::anyhow!("Failed to detokenize token {token_id}: {}", e))?;
+        active.generated_text.push_str(&token_text);
+        context.generated_tokens = active.generated_tokens.clone();
+        context.generated_text = active.generated_text.clone();
+
+        active.step += 1;
+        if let Some(finish_reason) =
+            finish_reason_after_token(token_id, &active.options, &active.chain, &context)
+        {
+            return self
+                .finish_result(
+                    &active.generated_tokens,
+                    finish_reason,
+                    active.prefix_cache_hit_len,
+                )
+                .map(Some);
+        }
+        if active.generated_tokens.len() >= active.options.max_new_tokens {
+            return self
+                .finish_result(
+                    &active.generated_tokens,
+                    FinishReason::MaxTokens,
+                    active.prefix_cache_hit_len,
+                )
+                .map(Some);
+        }
+
+        Ok(None)
+    }
+
+    fn finish_active_generate(&mut self, mut active: ActiveGenerate) -> anyhow::Result<()> {
+        if !exceeded_context_limit(active.state.tokens.len(), active.max_context) {
+            self.ensure_session_kv_current(active.session_id, &mut active.state)?;
+            self.insert_cached_prefixes(active.session_id, &active.state, active.prompt_len)?;
+        }
+        self.sessions.insert(active.session_id, active.state);
+        self.scheduler.complete(active.session_id);
+        Ok(())
     }
 
     fn ensure_session_kv_current(
@@ -1027,6 +1292,19 @@ struct EngineSession {
     decode_state: DecodeState,
     /// Optional draft-model state aligned to this target sequence.
     draft: Option<DraftSession>,
+}
+
+struct ActiveGenerate {
+    session_id: SessionId,
+    state: EngineSession,
+    options: GenerateOptions,
+    chain: ProcessorChain,
+    max_context: Option<usize>,
+    prompt_len: usize,
+    prefix_cache_hit_len: usize,
+    generated_tokens: Vec<TokenId>,
+    generated_text: String,
+    step: usize,
 }
 
 struct DraftModel {
@@ -2180,8 +2458,8 @@ mod tests {
     }
 
     #[test]
-    fn tiny_fixture_session_stops_at_explicit_context_length_without_ort_error(
-    ) -> anyhow::Result<()> {
+    fn tiny_fixture_session_stops_at_explicit_context_length_without_ort_error()
+    -> anyhow::Result<()> {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../tests/fixtures/tiny-llm")
             .canonicalize()?;
