@@ -26,6 +26,7 @@ pub use engine::{
     Engine, EngineConfig, FinishReason, GenerateConstraint, GenerateOptions, GeneratePrompt,
     GenerateRequest, GenerateResult, GenerateToken, GenerateTokenCallback,
     PrioritizedGenerateRequest, PrioritizedGenerateResult, ScheduledGenerateArrival, SessionId,
+    SpeculativeMode,
 };
 pub use fim::{FimConfig, FimFormat};
 pub use logits::{
@@ -35,5 +36,6 @@ pub use logits::{
 pub use pipeline::{PipelineEngine, PipelineGenerateRequest, PipelineTensors};
 pub use sampling::{CategoricalSampler, GreedySampler, Sampler};
 pub use speculative::{
-    SpeculativeAcceptContext, SpeculativeProposal, SpeculativeProposer, SpeculativeProposerContext,
+    NgramProposer, SpeculativeAcceptContext, SpeculativeProposal, SpeculativeProposer,
+    SpeculativeProposerContext, SpeculativeStats,
 };

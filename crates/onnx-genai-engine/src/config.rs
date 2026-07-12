@@ -5,6 +5,28 @@ use onnx_genai_kv::SequenceId;
 use onnx_genai_scheduler::{Priority, SchedulerConfig};
 use std::path::PathBuf;
 
+/// Built-in speculative candidate source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpeculativeMode {
+    /// Disable speculative decoding.
+    None,
+    /// Propose tokens with the configured draft model.
+    DraftModel,
+    /// Copy continuations from the most recent matching context n-gram.
+    PromptLookup {
+        /// Number of trailing context tokens used as the lookup key.
+        ngram: usize,
+        /// Maximum copied continuation length per verification step.
+        max_tokens: usize,
+    },
+}
+
+impl Default for SpeculativeMode {
+    fn default() -> Self {
+        Self::None
+    }
+}
+
 /// Identifier for a persistent generation session.
 pub type SessionId = SequenceId;
 
@@ -21,6 +43,9 @@ pub struct EngineConfig {
     pub draft_model: Option<PathBuf>,
     /// Number of draft tokens proposed per speculative step.
     pub num_speculative_tokens: usize,
+    /// Default speculative source. For compatibility, a configured
+    /// `draft_model` selects `DraftModel` when this remains `None`.
+    pub speculative_mode: SpeculativeMode,
 }
 
 impl Default for EngineConfig {
@@ -31,6 +56,7 @@ impl Default for EngineConfig {
             scheduler: SchedulerConfig::default(),
             draft_model: None,
             num_speculative_tokens: 4,
+            speculative_mode: SpeculativeMode::None,
         }
     }
 }
@@ -94,6 +120,8 @@ pub struct GenerateOptions {
     pub max_context: Option<usize>,
     /// Optional per-request override for speculative draft width K.
     pub num_speculative_tokens: Option<usize>,
+    /// Optional per-request speculative mode override.
+    pub speculative_mode: Option<SpeculativeMode>,
     /// Optional constrained decoding grammar. None preserves unconstrained generation.
     pub constraint: Option<GenerateConstraint>,
 }
@@ -115,6 +143,7 @@ impl Default for GenerateOptions {
             stop_on_eos: true,
             max_context: None,
             num_speculative_tokens: None,
+            speculative_mode: None,
             constraint: None,
         }
     }
@@ -161,6 +190,14 @@ impl GenerateOptions {
         }
         if self.num_speculative_tokens == Some(0) {
             anyhow::bail!("num_speculative_tokens must be greater than zero when provided");
+        }
+        if let Some(SpeculativeMode::PromptLookup { ngram, max_tokens }) = &self.speculative_mode {
+            if *ngram == 0 {
+                anyhow::bail!("prompt-lookup ngram must be greater than zero");
+            }
+            if *max_tokens == 0 {
+                anyhow::bail!("prompt-lookup max_tokens must be greater than zero");
+            }
         }
         Ok(())
     }

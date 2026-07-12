@@ -1,14 +1,9 @@
 //! Speculative decoding engine.
 
-//! Phase 3 currently wires the draft-model/greedy acceptance path directly into
-//! [`crate::engine::Engine`] so the public `generate` API remains stable. When
-//! `EngineConfig::draft_model` is set, greedy requests propose `K`
-//! autoregressive draft tokens, verify them with one target pass, accept the
-//! longest target-greedy prefix, and take the target token at the first
-//! mismatch. Target paged KV is rewound before committing the target token, and
-//! draft KV is rewound to the shared prefix so the correction/bonus token seeds
-//! the next draft round. Rejected draft tokens never leak into subsequent
-//! decoding state.
+//! Greedy requests can propose candidates with a draft model or model-free
+//! prompt lookup. Both sources feed the same target verification, longest-prefix
+//! acceptance, correction-token, and KV rewind path. Rejected candidates never
+//! leak into subsequent decoding state.
 
 use crate::TokenId;
 use crate::decode::{
@@ -24,7 +19,10 @@ use crate::kv_bridge::{
 use crate::logits::{ProcessorChain, ProcessorContext};
 use crate::processors::{ensure_constrained_finish, select_next_token};
 use crate::session::{DraftModel, DraftSession, EngineSession};
-use crate::{FinishReason, GenerateOptions, GenerateResult, GenerateTokenCallback, SessionId};
+use crate::{
+    FinishReason, GenerateOptions, GenerateResult, GenerateTokenCallback, SessionId,
+    SpeculativeMode,
+};
 use anyhow::Context;
 use onnx_genai_kv::KvCacheOps;
 
@@ -47,11 +45,21 @@ pub struct GreedyStep {
 /// Inputs a proposer needs to draft speculative candidates for one verify pass.
 pub struct SpeculativeProposerContext<'a> {
     pub width: usize,
+    pub context_tokens: &'a [TokenId],
     pub generated_tokens: &'a [TokenId],
     pub generated_text: &'a str,
     pub first_step: usize,
     pub options: &'a GenerateOptions,
     pub chain: &'a ProcessorChain,
+}
+
+/// Aggregate diagnostics for one speculative generation.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SpeculativeStats {
+    pub verification_steps: usize,
+    pub proposed_tokens: usize,
+    pub accepted_tokens: usize,
+    pub multi_token_accepts: usize,
 }
 
 /// Candidate tokens proposed for a target-model verification pass.
@@ -95,6 +103,59 @@ pub trait SpeculativeProposer {
     }
 
     fn name(&self) -> &str;
+}
+
+/// Model-free proposer that copies the continuation after the most recent
+/// earlier occurrence of the current context suffix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NgramProposer {
+    ngram: usize,
+    max_tokens: usize,
+}
+
+impl NgramProposer {
+    pub fn new(ngram: usize, max_tokens: usize) -> anyhow::Result<Self> {
+        if ngram == 0 {
+            anyhow::bail!("ngram must be greater than zero");
+        }
+        if max_tokens == 0 {
+            anyhow::bail!("max_tokens must be greater than zero");
+        }
+        Ok(Self { ngram, max_tokens })
+    }
+}
+
+impl SpeculativeProposer for NgramProposer {
+    fn propose(
+        &mut self,
+        context: &SpeculativeProposerContext<'_>,
+    ) -> anyhow::Result<SpeculativeProposal> {
+        let tokens = context.context_tokens;
+        if tokens.len() <= self.ngram {
+            return Ok(SpeculativeProposal::linear(Vec::new()));
+        }
+
+        let suffix_start = tokens.len() - self.ngram;
+        let suffix = &tokens[suffix_start..];
+        let Some(match_start) = (0..suffix_start).rev().find(|&start| {
+            start + self.ngram < tokens.len() && &tokens[start..start + self.ngram] == suffix
+        }) else {
+            return Ok(SpeculativeProposal::linear(Vec::new()));
+        };
+
+        let continuation_start = match_start + self.ngram;
+        let continuation_len = context
+            .width
+            .min(self.max_tokens)
+            .min(tokens.len() - continuation_start);
+        Ok(SpeculativeProposal::linear(
+            tokens[continuation_start..continuation_start + continuation_len].to_vec(),
+        ))
+    }
+
+    fn name(&self) -> &str {
+        "prompt_lookup"
+    }
 }
 
 pub(crate) struct DraftModelProposer<'a> {
@@ -156,16 +217,24 @@ impl SpeculativeProposer for DraftModelProposer<'_> {
 }
 
 impl Engine {
+    fn speculative_mode(&self, options: &GenerateOptions) -> SpeculativeMode {
+        options
+            .speculative_mode
+            .clone()
+            .unwrap_or_else(|| self.speculative_mode.clone())
+    }
+
     pub(crate) fn should_use_speculative(&self, options: &GenerateOptions) -> bool {
-        self.draft.is_some()
+        let mode_available = match self.speculative_mode(options) {
+            SpeculativeMode::None => false,
+            SpeculativeMode::DraftModel => self.draft.is_some(),
+            SpeculativeMode::PromptLookup { ngram, max_tokens } => ngram > 0 && max_tokens > 0,
+        };
+        mode_available
             // Grammar processors carry per-request parser state; draft/verify
             // would need separate parser branches for speculative candidates.
             && options.constraint.is_none()
             && (options.greedy || options.temperature == 0.0)
-            && options
-                .num_speculative_tokens
-                .unwrap_or(self.num_speculative_tokens)
-                > 0
             && self.kv_model.is_some()
     }
 
@@ -182,10 +251,14 @@ impl Engine {
         generated_text: &mut String,
         mut callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
-        let draft_width = options
-            .num_speculative_tokens
-            .unwrap_or(self.num_speculative_tokens)
-            .max(1);
+        let speculative_mode = self.speculative_mode(options);
+        let draft_width = match speculative_mode {
+            SpeculativeMode::PromptLookup { max_tokens, .. } => max_tokens,
+            _ => options
+                .num_speculative_tokens
+                .unwrap_or(self.num_speculative_tokens),
+        }
+        .max(1);
         let mut step = 0;
 
         loop {
@@ -225,31 +298,43 @@ impl Engine {
                 state,
             )?;
 
-            let draft_tokens = {
-                let draft_model = self
-                    .draft
-                    .as_mut()
-                    .context("speculative decoding requested without a draft model")?;
-                let draft_state = state
-                    .draft
-                    .as_mut()
-                    .context("speculative session missing draft state")?;
-                let mut proposer = DraftModelProposer::new(draft_model, draft_state);
-                proposer.align_to_target_prefix(&state.tokens, base_len)?;
-                proposer
-                    .propose(&SpeculativeProposerContext {
-                        width,
-                        generated_tokens,
-                        generated_text,
-                        first_step: step,
-                        options,
-                        chain,
-                    })?
-                    .tokens
+            let proposer_context = SpeculativeProposerContext {
+                width,
+                context_tokens: &state.tokens,
+                generated_tokens,
+                generated_text,
+                first_step: step,
+                options,
+                chain,
             };
+            let draft_tokens = match speculative_mode {
+                SpeculativeMode::None => Vec::new(),
+                SpeculativeMode::DraftModel => {
+                    let draft_model = self
+                        .draft
+                        .as_mut()
+                        .context("speculative decoding requested without a draft model")?;
+                    let draft_state = state
+                        .draft
+                        .as_mut()
+                        .context("speculative session missing draft state")?;
+                    let mut proposer = DraftModelProposer::new(draft_model, draft_state);
+                    proposer.align_to_target_prefix(&state.tokens, base_len)?;
+                    proposer.propose(&proposer_context)?.tokens
+                }
+                SpeculativeMode::PromptLookup { ngram, max_tokens } => {
+                    NgramProposer::new(ngram, max_tokens)?
+                        .propose(&proposer_context)?
+                        .tokens
+                }
+            };
+            self.last_speculative_stats.verification_steps += 1;
+            self.last_speculative_stats.proposed_tokens += draft_tokens.len();
 
             state.tokens.extend_from_slice(&draft_tokens);
-            let verified_logits = if state.decode_state.has_runner() {
+            let verified_logits = if draft_tokens.is_empty() {
+                Vec::new()
+            } else if state.decode_state.has_runner() {
                 let logits =
                     run_decode_session_logits(&mut state.decode_state, &draft_tokens, base_len)?;
                 self.kv_cache
@@ -327,6 +412,10 @@ impl Engine {
                     break;
                 }
             }
+            self.last_speculative_stats.accepted_tokens += accepted;
+            if accepted >= 2 {
+                self.last_speculative_stats.multi_token_accepts += 1;
+            }
 
             let mut commit_tokens = draft_tokens[..accepted].to_vec();
             let rewind_len = base_len + accepted;
@@ -378,7 +467,9 @@ impl Engine {
                 commit_tokens.push(token);
             }
 
-            self.notify_draft_acceptance(state, accepted, &commit_tokens)?;
+            if matches!(speculative_mode, SpeculativeMode::DraftModel) {
+                self.notify_draft_acceptance(state, accepted, &commit_tokens)?;
+            }
 
             for (commit_idx, token_id) in commit_tokens.into_iter().enumerate() {
                 if generated_tokens.len() >= options.max_new_tokens
@@ -418,7 +509,9 @@ impl Engine {
                         session_id,
                         state,
                     )?;
-                    self.sync_draft_to_target(state)?;
+                    if matches!(speculative_mode, SpeculativeMode::DraftModel) {
+                        self.sync_draft_to_target(state)?;
+                    }
                     return self.finish_result(
                         generated_tokens,
                         finish_reason,
@@ -427,7 +520,9 @@ impl Engine {
                 }
             }
 
-            self.sync_draft_to_target(state)?;
+            if matches!(speculative_mode, SpeculativeMode::DraftModel) {
+                self.sync_draft_to_target(state)?;
+            }
 
             if generated_tokens.len() == base_generated_len {
                 anyhow::bail!("speculative decoding made no progress");
@@ -506,6 +601,7 @@ mod tests {
 
         let proposal = proposer.propose(&SpeculativeProposerContext {
             width: 2,
+            context_tokens: &[1],
             generated_tokens: &[1],
             generated_text: "a",
             first_step: 0,
@@ -522,6 +618,25 @@ mod tests {
         assert_eq!(proposal.tokens, vec![3, 5]);
         assert_eq!(proposer.accepted, Some(1));
         assert_eq!(proposer.rewound_to, Some(vec![1, 3, 4]));
+        Ok(())
+    }
+
+    #[test]
+    fn ngram_proposer_copies_most_recent_matching_continuation() -> anyhow::Result<()> {
+        let options = GenerateOptions::default();
+        let chain = ProcessorChain::new();
+        let mut proposer = NgramProposer::new(2, 4)?;
+        let proposal = proposer.propose(&SpeculativeProposerContext {
+            width: 3,
+            context_tokens: &[7, 8, 9, 4, 7, 8],
+            generated_tokens: &[],
+            generated_text: "",
+            first_step: 0,
+            options: &options,
+            chain: &chain,
+        })?;
+
+        assert_eq!(proposal.tokens, vec![9, 4, 7]);
         Ok(())
     }
 }

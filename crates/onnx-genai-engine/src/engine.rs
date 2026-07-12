@@ -29,7 +29,9 @@ pub use crate::config::{
     EngineConfig, FinishReason, GenerateConstraint, GenerateOptions, GeneratePrompt,
     GenerateRequest, GenerateResult, GenerateToken, GenerateTokenCallback,
     PrioritizedGenerateRequest, PrioritizedGenerateResult, ScheduledGenerateArrival, SessionId,
+    SpeculativeMode,
 };
+use crate::speculative::SpeculativeStats;
 
 /// The generation engine.
 pub struct Engine {
@@ -61,6 +63,10 @@ pub struct Engine {
     pub(crate) fim_config: Option<FimConfig>,
     /// Default speculative draft width K.
     pub(crate) num_speculative_tokens: usize,
+    /// Default speculative candidate source.
+    pub(crate) speculative_mode: SpeculativeMode,
+    /// Diagnostics from the most recent generation call.
+    pub(crate) last_speculative_stats: SpeculativeStats,
 }
 
 impl Engine {
@@ -155,6 +161,16 @@ impl Engine {
             PagedKvCache::new(config.page_size, config.num_gpu_pages)
         };
 
+        let speculative_mode = match config.speculative_mode {
+            SpeculativeMode::None if draft.is_some() => SpeculativeMode::DraftModel,
+            mode => mode,
+        };
+        if let SpeculativeMode::PromptLookup { ngram, max_tokens } = speculative_mode {
+            if ngram == 0 || max_tokens == 0 {
+                anyhow::bail!("prompt-lookup ngram and max_tokens must be greater than zero");
+            }
+        }
+
         Ok(Self {
             metadata,
             kv_cache,
@@ -170,6 +186,8 @@ impl Engine {
             tokenizer,
             fim_config,
             num_speculative_tokens: config.num_speculative_tokens.max(1),
+            speculative_mode,
+            last_speculative_stats: SpeculativeStats::default(),
         })
     }
 
@@ -177,6 +195,11 @@ impl Engine {
     ///
     pub fn generate(&mut self, request: GenerateRequest) -> anyhow::Result<GenerateResult> {
         self.generate_with_callback(request, None)
+    }
+
+    /// Speculative verification diagnostics from the most recent generation.
+    pub fn last_speculative_stats(&self) -> SpeculativeStats {
+        self.last_speculative_stats
     }
 
     /// Generate the middle text for a fill-in-the-middle request.
@@ -265,6 +288,7 @@ impl Engine {
         priority: Priority,
         mut callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
+        self.last_speculative_stats = SpeculativeStats::default();
         request.options.validate()?;
         let mut options = request.options.clone();
         if options.eos_token_id.is_none() {
