@@ -3,9 +3,11 @@ use std::{path::Path, sync::Arc};
 use anyhow::Context;
 use onnx_genai::{Engine, EngineConfig};
 use onnx_genai_engine::FimConfig;
-use onnx_genai_ort::{ChatTemplate, ModelDirectory, Tokenizer};
+use onnx_genai_ort::{
+    ChatTemplate, DataType, ModelDirectory, PipelineModelDirectory, PipelineModels, Tokenizer,
+};
 
-use crate::{driver::EngineDriver, session::SessionRegistry};
+use crate::{driver::EngineDriver, image_input::VisionInputSpec, session::SessionRegistry};
 
 const DEFAULT_MAX_OUTPUT_TOKENS: usize = 4096;
 const DEFAULT_MAX_SESSIONS: usize = 256;
@@ -22,6 +24,8 @@ pub struct AppState {
     pub(crate) config: ServerConfig,
     pub(crate) model_max_context: Option<usize>,
     pub(crate) fim_config: Option<FimConfig>,
+    pub(crate) pipeline: bool,
+    pub(crate) vision_input: Option<VisionInputSpec>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -70,11 +74,30 @@ impl AppState {
         let model_directory = ModelDirectory::load(model_dir)
             .map_err(|e| anyhow::anyhow!("Failed to resolve model directory: {}", e))?;
         let model_max_context = load_model_max_context(model_directory.metadata_path.as_deref())?;
+        let chat_template = load_chat_template(model_dir)?;
+        let model_id = model_id.unwrap_or_else(|| infer_model_id(model_dir));
+        let metadata = model_directory
+            .metadata_path
+            .as_deref()
+            .map(onnx_genai_metadata::load_metadata)
+            .transpose()
+            .with_context(|| format!("failed to load metadata from {}", model_dir.display()))?;
+        if metadata
+            .as_ref()
+            .is_some_and(|metadata| metadata.pipeline.is_some())
+        {
+            return Self::load_pipeline(
+                model_dir,
+                model_id,
+                config,
+                model_max_context,
+                chat_template,
+            );
+        }
+
         let tokenizer = Tokenizer::from_file(&model_directory.tokenizer_path)
             .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {}", e))?;
-        let chat_template = load_chat_template(model_dir)?;
         let engine = Engine::from_dir(model_dir, EngineConfig::default())?;
-        let model_id = model_id.unwrap_or_else(|| infer_model_id(model_dir));
         Ok(Self::new_with_template_and_config(
             model_id,
             engine,
@@ -83,6 +106,69 @@ impl AppState {
             config,
             model_max_context,
         ))
+    }
+
+    fn load_pipeline(
+        model_dir: &Path,
+        model_id: String,
+        config: ServerConfig,
+        model_max_context: Option<usize>,
+        chat_template: Option<ChatTemplate>,
+    ) -> anyhow::Result<Self> {
+        let directory = PipelineModelDirectory::load(model_dir)
+            .map_err(|e| anyhow::anyhow!("Failed to resolve pipeline directory: {e}"))?;
+        let tokenizer_path = directory
+            .spec
+            .models
+            .values()
+            .find(|component| component.role == "decoder")
+            .and_then(|component| component.tokenizer.as_ref())
+            .map(|path| model_dir.join(path))
+            .or(directory.tokenizer_paths.shared.clone())
+            .context("pipeline model has no decoder or shared tokenizer")?;
+        let tokenizer = Tokenizer::from_file(&tokenizer_path)
+            .map_err(|e| anyhow::anyhow!("Failed to load pipeline tokenizer: {e}"))?;
+
+        let models = PipelineModels::load(model_dir)
+            .map_err(|e| anyhow::anyhow!("Failed to inspect pipeline models: {e}"))?;
+        let vision_inputs = models
+            .sessions
+            .iter()
+            .flat_map(|(component, session)| {
+                session.inputs().iter().filter_map(move |input| {
+                    (input.name == "pixel_values")
+                        .then_some((format!("{component}.{}", input.name), input))
+                })
+            })
+            .collect::<Vec<_>>();
+        let vision_input = match vision_inputs.as_slice() {
+            [] => None,
+            [(endpoint, input)] => {
+                if input.dtype != DataType::Float32 {
+                    anyhow::bail!(
+                        "vision input '{endpoint}' must be Float32, but the model declares {:?}",
+                        input.dtype
+                    );
+                }
+                Some(VisionInputSpec::from_input(endpoint.clone(), &input.shape)?)
+            }
+            _ => anyhow::bail!("pipeline declares multiple pixel_values inputs"),
+        };
+        drop(models);
+
+        let engine = Engine::from_pipeline_dir(model_dir, EngineConfig::default())?;
+        Ok(Self {
+            model_id,
+            engine: EngineDriver::start_pipeline(engine, config.max_pending),
+            tokenizer: Arc::new(tokenizer),
+            chat_template: chat_template.map(Arc::new),
+            sessions: SessionRegistry::new(config.max_sessions),
+            config,
+            model_max_context,
+            fim_config: None,
+            pipeline: true,
+            vision_input,
+        })
     }
 
     pub fn new(model_id: String, engine: Engine, tokenizer: Tokenizer) -> Self {
@@ -124,6 +210,8 @@ impl AppState {
             config,
             model_max_context,
             fim_config,
+            pipeline: false,
+            vision_input: None,
         }
     }
 

@@ -28,7 +28,7 @@ use crate::{
     },
     state::{AppState, ServerConfig},
     types::{
-        ChatChoice, ChatCompletionRequest, ChatCompletionResponse, ChatMessage,
+        ChatChoice, ChatCompletionRequest, ChatCompletionResponse, ChatMessage, ChatMessageContent,
         ChatMessageToolCall, ChatMessageToolCallFunction, ChatTool, CompletionChoice,
         CompletionRequest, CompletionResponse, StopInput, ToolChoice, ToolChoiceMode, Usage,
     },
@@ -185,6 +185,11 @@ pub(crate) async fn models(State(state): State<AppState>) -> Json<ModelsResponse
 pub(crate) async fn create_session(
     State(state): State<AppState>,
 ) -> Result<Json<SessionResponse>, ApiError> {
+    if state.pipeline {
+        return Err(ApiError::bad_request(
+            "sessions are not supported by pipeline models",
+        ));
+    }
     let client_id = state
         .sessions
         .next_client_id()
@@ -231,6 +236,11 @@ pub(crate) async fn completions(
     headers: HeaderMap,
     Json(request): Json<CompletionRequest>,
 ) -> Result<Response, ApiError> {
+    if state.pipeline {
+        return Err(ApiError::bad_request(
+            "/v1/completions is not supported by pipeline models",
+        ));
+    }
     validate_completion_request(&request, &state.config)?;
     let session_id = session_id_from_headers(&headers)?;
     if request.suffix.is_some() && state.fim_config.is_none() {
@@ -401,12 +411,30 @@ pub(crate) async fn chat_completions(
 ) -> Result<Response, ApiError> {
     validate_request(&request, &state.config)?;
     let session_id = session_id_from_headers(&headers)?;
+    if state.pipeline && session_id.is_some() {
+        return Err(ApiError::bad_request(
+            "X-Session-Id is not supported by pipeline models",
+        ));
+    }
+    let image_urls = request.image_urls();
+    if !image_urls.is_empty() && !state.pipeline {
+        return Err(ApiError::bad_request(
+            "this model does not support image input",
+        ));
+    }
+    if !image_urls.is_empty() && state.vision_input.is_none() {
+        return Err(ApiError::bad_request(
+            "this pipeline model does not support image input",
+        ));
+    }
     if request.stream {
-        Ok(stream_chat_completion(state, request, session_id)
-            .await?
-            .into_response())
+        Ok(
+            stream_chat_completion(state, request, session_id, image_urls)
+                .await?
+                .into_response(),
+        )
     } else {
-        let response = run_chat_completion(state, request, session_id).await?;
+        let response = run_chat_completion(state, request, session_id, image_urls).await?;
         Ok(Json(response).into_response())
     }
 }
@@ -415,6 +443,7 @@ async fn run_chat_completion(
     state: AppState,
     request: ChatCompletionRequest,
     client_session_id: Option<String>,
+    image_urls: Vec<String>,
 ) -> Result<ChatCompletionResponse, ApiError> {
     let id = completion_id();
     let created = now_unix();
@@ -442,13 +471,34 @@ async fn run_chat_completion(
 
     let session_for_count = session_lookup;
     let wants_json_object = request.wants_json_object();
-    let result = collect_generation_result(
+    let image = if image_urls.is_empty() {
+        None
+    } else {
+        Some(
+            crate::image_input::load_and_preprocess(
+                &image_urls,
+                state
+                    .vision_input
+                    .as_ref()
+                    .expect("vision input checked before generation"),
+            )
+            .await
+            .map_err(|err| ApiError::bad_request(format!("invalid image input: {err}")))?,
+        )
+    };
+    let result = collect_generation_result(if state.pipeline {
+        state
+            .engine
+            .generate_pipeline(generation_request, image)
+            .await
+            .map_err(map_generate_submit_error)?
+    } else {
         state
             .engine
             .generate(session_lookup, generation_request)
             .await
-            .map_err(map_generate_submit_error)?,
-    )
+            .map_err(map_generate_submit_error)?
+    })
     .await
     .map_err(|err| ApiError::internal(format!("generation failed: {err}")));
 
@@ -500,7 +550,7 @@ async fn run_chat_completion(
             index: 0,
             message: ChatMessage {
                 role: "assistant".to_string(),
-                content,
+                content: content.map(ChatMessageContent::Text),
                 tool_calls,
                 tool_call_id: None,
             },
@@ -520,6 +570,7 @@ async fn stream_chat_completion(
     state: AppState,
     request: ChatCompletionRequest,
     client_session_id: Option<String>,
+    image_urls: Vec<String>,
 ) -> Result<Sse<ReceiverStream<Result<Event, Infallible>>>, ApiError> {
     let id = completion_id();
     let created = now_unix();
@@ -550,11 +601,34 @@ async fn stream_chat_completion(
     } else {
         None
     };
-    let mut driver_rx = state
-        .engine
-        .generate(session_lookup, generation_request)
-        .await
-        .map_err(map_generate_submit_error)?;
+    let image = if image_urls.is_empty() {
+        None
+    } else {
+        Some(
+            crate::image_input::load_and_preprocess(
+                &image_urls,
+                state
+                    .vision_input
+                    .as_ref()
+                    .expect("vision input checked before generation"),
+            )
+            .await
+            .map_err(|err| ApiError::bad_request(format!("invalid image input: {err}")))?,
+        )
+    };
+    let mut driver_rx = if state.pipeline {
+        state
+            .engine
+            .generate_pipeline(generation_request, image)
+            .await
+            .map_err(map_generate_submit_error)?
+    } else {
+        state
+            .engine
+            .generate(session_lookup, generation_request)
+            .await
+            .map_err(map_generate_submit_error)?
+    };
 
     tokio::spawn(async move {
         send_stream_chunk(&tx, role_chunk(&id, created, &model)).await?;
@@ -1126,7 +1200,8 @@ fn tools_offered_to_model(request: &ChatCompletionRequest) -> Option<&Vec<ChatTo
 fn build_session_prompt(messages: &[ChatMessage]) -> String {
     messages
         .last()
-        .and_then(|message| message.content.clone())
+        .and_then(|message| message.content.as_ref())
+        .map(ChatMessageContent::text)
         .unwrap_or_default()
 }
 
@@ -1141,7 +1216,11 @@ fn render_prompt(
             .map(|message| {
                 let mut template_message = TemplateChatMessage::new(
                     message.role.as_str(),
-                    message.content.clone().unwrap_or_default(),
+                    message
+                        .content
+                        .as_ref()
+                        .map(ChatMessageContent::text)
+                        .unwrap_or_default(),
                 );
                 if let Some(tool_calls) = &message.tool_calls {
                     template_message =
@@ -1185,7 +1264,7 @@ pub fn build_prompt(request: &ChatCompletionRequest) -> String {
             prompt.push('\n');
         }
         if let Some(content) = &message.content {
-            prompt.push_str(content);
+            prompt.push_str(&content.text());
         }
         if let Some(tool_calls) = &message.tool_calls {
             if message.content.is_some() {

@@ -10,9 +10,163 @@ use axum::{
 };
 use onnx_genai::{Engine, EngineConfig};
 use serde_json::{Value, json};
-use std::{path::PathBuf, time::Duration};
+use std::{io::Cursor, path::PathBuf, time::Duration};
 use tokio::{sync::mpsc, time::timeout};
 use tower::ServiceExt;
+
+fn tiny_png_data_uri() -> String {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use image::{DynamicImage, ImageFormat, Rgb, RgbImage};
+
+    let image = RgbImage::from_pixel(3, 4, Rgb([64, 128, 255]));
+    let mut png = Cursor::new(Vec::new());
+    DynamicImage::ImageRgb8(image)
+        .write_to(&mut png, ImageFormat::Png)
+        .unwrap();
+    format!(
+        "data:image/png;base64,{}",
+        STANDARD.encode(png.into_inner())
+    )
+}
+
+#[test]
+fn multimodal_message_parses_text_and_data_image_parts() {
+    let request: ChatCompletionRequest = serde_json::from_value(json!({
+        "model": "tiny-vlm",
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "What is shown?"},
+                {"type": "image_url", "image_url": {"url": tiny_png_data_uri()}}
+            ]
+        }]
+    }))
+    .unwrap();
+
+    assert_eq!(
+        request.messages[0]
+            .content
+            .as_ref()
+            .expect("content")
+            .text(),
+        "What is shown?"
+    );
+    assert_eq!(request.image_urls().len(), 1);
+    assert!(request.image_urls()[0].starts_with("data:image/png;base64,"));
+}
+
+#[tokio::test]
+async fn image_decode_and_preprocessing_use_pipeline_tensor_shape() {
+    use onnx_genai_ort::{DataType, PipelineModels};
+
+    let model_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../models/tiny-vlm");
+    if !model_dir.is_dir() {
+        eprintln!("skipping image preprocessing test: tiny-vlm fixture is absent");
+        return;
+    }
+    let models = PipelineModels::load(&model_dir).unwrap();
+    let encoder = models.session("encoder").expect("encoder");
+    let input = encoder
+        .inputs()
+        .iter()
+        .find(|input| input.name == "pixel_values")
+        .expect("pixel_values");
+    assert_eq!(input.dtype, DataType::Float32);
+    let spec = crate::image_input::VisionInputSpec::from_input(
+        "encoder.pixel_values".to_string(),
+        &input.shape,
+    )
+    .unwrap();
+    let tensor = crate::image_input::load_and_preprocess(&[tiny_png_data_uri()], &spec)
+        .await
+        .unwrap();
+
+    assert_eq!(tensor.shape, input.shape);
+    assert_eq!(
+        tensor.data.len(),
+        input.shape.iter().product::<i64>() as usize
+    );
+    assert!(tensor.data.iter().all(|value| (0.0..=1.0).contains(value)));
+}
+
+#[tokio::test]
+async fn vision_request_against_non_pipeline_model_returns_400() {
+    let model_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
+    let state = AppState::load(&model_dir, Some("tiny-llm".to_string())).expect("load fixture");
+    let response = app(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "tiny-llm",
+                        "messages": [{
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": "describe"},
+                                {"type": "image_url", "image_url": {"url": tiny_png_data_uri()}}
+                            ]
+                        }],
+                        "max_tokens": 1
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        body["error"]["message"],
+        "this model does not support image input"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires gitignored models/tiny-vlm; run scripts/build_tiny_vlm.py first"]
+async fn vision_request_routes_through_tiny_vlm_pipeline() {
+    let model_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../models/tiny-vlm");
+    if !model_dir.is_dir() {
+        eprintln!("skipping tiny VLM server test: fixture is absent");
+        return;
+    }
+    let state = AppState::load(&model_dir, Some("tiny-vlm".to_string())).expect("load fixture");
+    let response = app(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "tiny-vlm",
+                        "messages": [{
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": "describe"},
+                                {"type": "image_url", "image_url": {"url": tiny_png_data_uri()}}
+                            ]
+                        }],
+                        "max_tokens": 1,
+                        "temperature": 0.0
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    assert!(body["choices"][0]["message"]["content"].is_string());
+}
 
 #[test]
 fn completion_suffix_maps_to_fim_generation() {

@@ -8,6 +8,7 @@ use axum::{
 };
 
 mod driver;
+mod image_input;
 mod routes;
 mod session;
 mod sse;
@@ -20,10 +21,11 @@ pub use routes::{
 };
 pub use state::{AppState, ServerConfig};
 pub use types::{
-    ChatChoice, ChatCompletionRequest, ChatCompletionResponse, ChatMessage, ChatMessageToolCall,
-    ChatMessageToolCallFunction, ChatTool, ChatToolFunction, CompletionChoice, CompletionRequest,
-    CompletionResponse, ResponseFormat, ResponseFormatType, StopInput, ToolChoice,
-    ToolChoiceFunction, ToolChoiceMode, ToolChoiceSpecific, Usage,
+    ChatChoice, ChatCompletionRequest, ChatCompletionResponse, ChatMessage, ChatMessageContent,
+    ChatMessageContentPart, ChatMessageToolCall, ChatMessageToolCallFunction, ChatTool,
+    ChatToolFunction, CompletionChoice, CompletionRequest, CompletionResponse, ImageUrl,
+    ResponseFormat, ResponseFormatType, StopInput, ToolChoice, ToolChoiceFunction, ToolChoiceMode,
+    ToolChoiceSpecific, Usage,
 };
 
 pub fn app(state: AppState) -> Router {

@@ -4,8 +4,14 @@ use anyhow::Context;
 use onnx_genai::{
     Engine, GenerateOptions, GenerateRequest, GenerateResult, GenerateToken, SessionId,
 };
-use onnx_genai_engine::{ContinuousBatchEvent, ContinuousBatchManager, FimConfig};
+use onnx_genai_engine::{
+    ContinuousBatchEvent, ContinuousBatchManager, FimConfig, PipelineEngine,
+    PipelineGenerateRequest,
+};
+use onnx_genai_ort::Value;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
+
+use crate::image_input::ImageTensor;
 
 const DRIVER_OUTPUT_BUFFER: usize = 16;
 
@@ -31,6 +37,12 @@ pub(crate) enum DriverCommand {
         events: mpsc::Sender<DriverEvent>,
         permit: OwnedSemaphorePermit,
     },
+    GeneratePipeline {
+        request: Box<GenerateRequest>,
+        image: Option<ImageTensor>,
+        events: mpsc::Sender<DriverEvent>,
+        permit: OwnedSemaphorePermit,
+    },
     GenerateFim {
         prefix: String,
         suffix: String,
@@ -48,7 +60,12 @@ pub(crate) enum DriverEvent {
     Error(String),
 }
 
-struct EngineOwner(Engine);
+enum EngineBackend {
+    Single(Box<Engine>),
+    Pipeline(Box<PipelineEngine>),
+}
+
+struct EngineOwner(EngineBackend);
 
 #[derive(Debug)]
 pub(crate) enum GenerateSubmitError {
@@ -70,11 +87,25 @@ impl EngineDriver {
     pub(crate) fn start(engine: Engine, max_batch: usize, max_pending: usize) -> Self {
         let (commands, rx) = mpsc::channel(max_pending);
         let generation_capacity = Arc::new(Semaphore::new(max_pending));
-        let owner = EngineOwner(engine);
+        let owner = EngineOwner(EngineBackend::Single(Box::new(engine)));
         thread::Builder::new()
             .name("onnx-genai-batch-driver".to_string())
             .spawn(move || run_engine_driver(owner, rx, max_batch))
             .expect("failed to spawn onnx-genai engine driver");
+        Self {
+            commands,
+            generation_capacity,
+        }
+    }
+
+    pub(crate) fn start_pipeline(engine: PipelineEngine, max_pending: usize) -> Self {
+        let (commands, rx) = mpsc::channel(max_pending);
+        let generation_capacity = Arc::new(Semaphore::new(max_pending));
+        let owner = EngineOwner(EngineBackend::Pipeline(Box::new(engine)));
+        thread::Builder::new()
+            .name("onnx-genai-pipeline-driver".to_string())
+            .spawn(move || run_engine_driver(owner, rx, 1))
+            .expect("failed to spawn onnx-genai pipeline driver");
         Self {
             commands,
             generation_capacity,
@@ -140,6 +171,29 @@ impl EngineDriver {
         Ok(rx)
     }
 
+    pub(crate) async fn generate_pipeline(
+        &self,
+        request: GenerateRequest,
+        image: Option<ImageTensor>,
+    ) -> Result<mpsc::Receiver<DriverEvent>, GenerateSubmitError> {
+        let permit = self
+            .generation_capacity
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| GenerateSubmitError::Overloaded)?;
+        let (events, rx) = mpsc::channel(DRIVER_OUTPUT_BUFFER);
+        self.commands
+            .send(DriverCommand::GeneratePipeline {
+                request: Box::new(request),
+                image,
+                events,
+                permit,
+            })
+            .await
+            .map_err(|_| GenerateSubmitError::DriverStopped)?;
+        Ok(rx)
+    }
+
     pub(crate) async fn generate_fim(
         &self,
         prefix: String,
@@ -169,7 +223,13 @@ impl EngineDriver {
 }
 
 fn run_engine_driver(owner: EngineOwner, rx: mpsc::Receiver<DriverCommand>, max_batch: usize) {
-    let mut engine = owner.0;
+    let mut engine = match owner.0 {
+        EngineBackend::Single(engine) => *engine,
+        EngineBackend::Pipeline(mut pipeline) => {
+            run_pipeline_driver(&mut pipeline, rx);
+            return;
+        }
+    };
     let static_batch_supported = engine.continuous_batch_manager(max_batch).is_ok();
     if static_batch_supported {
         tracing::info!(max_batch, "static-cache continuous batch driver enabled");
@@ -177,6 +237,39 @@ fn run_engine_driver(owner: EngineOwner, rx: mpsc::Receiver<DriverCommand>, max_
     } else {
         tracing::info!("continuous batch driver disabled; using per-request engine path");
         run_fallback_engine_driver(&mut engine, rx);
+    }
+}
+
+fn run_pipeline_driver(engine: &mut PipelineEngine, mut rx: mpsc::Receiver<DriverCommand>) {
+    while let Some(command) = rx.blocking_recv() {
+        match command {
+            DriverCommand::GeneratePipeline {
+                request,
+                image,
+                events,
+                permit,
+            } => run_pipeline_generation(engine, *request, image, events, permit),
+            DriverCommand::CreateSession(response) => {
+                let _ = response.send(Err(anyhow::anyhow!(
+                    "sessions are not supported by pipeline models"
+                )));
+            }
+            DriverCommand::CloseSession { response, .. } => {
+                let _ = response.send(Err(anyhow::anyhow!(
+                    "sessions are not supported by pipeline models"
+                )));
+            }
+            DriverCommand::SessionTokenCount { response, .. } => {
+                let _ = response.send(Err(anyhow::anyhow!(
+                    "sessions are not supported by pipeline models"
+                )));
+            }
+            DriverCommand::Generate { events, .. } | DriverCommand::GenerateFim { events, .. } => {
+                let _ = events.try_send(DriverEvent::Error(
+                    "invalid generation route for pipeline model".to_string(),
+                ));
+            }
+        }
     }
 }
 
@@ -380,6 +473,45 @@ fn handle_driver_command(engine: &mut Engine, command: DriverCommand) {
             events,
             permit,
         } => run_fim_generation(engine, prefix, suffix, fim_config, *options, events, permit),
+        DriverCommand::GeneratePipeline { events, .. } => {
+            let _ = events.try_send(DriverEvent::Error(
+                "invalid pipeline generation route for single model".to_string(),
+            ));
+        }
+    }
+}
+
+fn run_pipeline_generation(
+    engine: &mut PipelineEngine,
+    request: GenerateRequest,
+    image: Option<ImageTensor>,
+    events: mpsc::Sender<DriverEvent>,
+    _permit: OwnedSemaphorePermit,
+) {
+    let pipeline_request = match image {
+        Some(image) => match Value::from_vec_f32(image.data, &image.shape) {
+            Ok(value) => PipelineGenerateRequest::new(request).with_input(image.endpoint, value),
+            Err(err) => {
+                let _ = events.try_send(DriverEvent::Error(format!(
+                    "failed to create image tensor: {err}"
+                )));
+                return;
+            }
+        },
+        None => PipelineGenerateRequest::new(request),
+    };
+    let mut callback = |token: GenerateToken| -> anyhow::Result<()> {
+        events
+            .try_send(DriverEvent::Token(token))
+            .context("stream receiver closed")
+    };
+    match engine.generate_with_callback(pipeline_request, Some(&mut callback)) {
+        Ok(result) => {
+            let _ = events.try_send(DriverEvent::Finished(result));
+        }
+        Err(err) => {
+            let _ = events.try_send(DriverEvent::Error(err.to_string()));
+        }
     }
 }
 

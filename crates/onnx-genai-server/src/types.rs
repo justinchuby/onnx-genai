@@ -67,17 +67,79 @@ impl ChatCompletionRequest {
                     || message.role == "tool"
             })
     }
+
+    pub(crate) fn image_urls(&self) -> Vec<String> {
+        self.messages
+            .iter()
+            .filter_map(|message| message.content.as_ref())
+            .flat_map(ChatMessageContent::image_urls)
+            .map(ToString::to_string)
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ChatMessage {
     pub role: String,
     #[serde(default)]
-    pub content: Option<String>,
+    pub content: Option<ChatMessageContent>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ChatMessageToolCall>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum ChatMessageContent {
+    Text(String),
+    Parts(Vec<ChatMessageContentPart>),
+}
+
+impl ChatMessageContent {
+    pub(crate) fn text(&self) -> String {
+        match self {
+            Self::Text(text) => text.clone(),
+            Self::Parts(parts) => parts
+                .iter()
+                .filter_map(|part| match part {
+                    ChatMessageContentPart::Text { text } => Some(text.as_str()),
+                    ChatMessageContentPart::ImageUrl { .. } => None,
+                })
+                .collect::<Vec<_>>()
+                .join(""),
+        }
+    }
+
+    pub(crate) fn image_urls(&self) -> impl Iterator<Item = &str> {
+        match self {
+            Self::Text(_) => [].as_slice(),
+            Self::Parts(parts) => parts.as_slice(),
+        }
+        .iter()
+        .filter_map(|part| match part {
+            ChatMessageContentPart::ImageUrl { image_url } => Some(image_url.url.as_str()),
+            ChatMessageContentPart::Text { .. } => None,
+        })
+    }
+}
+
+impl From<String> for ChatMessageContent {
+    fn from(value: String) -> Self {
+        Self::Text(value)
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ChatMessageContentPart {
+    Text { text: String },
+    ImageUrl { image_url: ImageUrl },
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ImageUrl {
+    pub url: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
