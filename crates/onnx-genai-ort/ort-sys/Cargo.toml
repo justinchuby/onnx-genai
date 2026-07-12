@@ -1,9 +1,12 @@
 [package]
 name = "onnx-genai-ort-sys"
-description = "Raw FFI bindings to ONNX Runtime C API"
-version = "0.1.0"
-edition = "2024"
-license = "MIT"
+description = "Raw FFI bindings to the ONNX Runtime C API"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords = ["onnx", "runtime", "inference", "ffi"]
+categories = ["external-ffi-bindings", "science"]
 links = "onnxruntime"
 
 [lib]

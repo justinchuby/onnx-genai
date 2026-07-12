@@ -1,14 +1,17 @@
 [package]
 name = "onnx-genai-ort"
-description = "Safe Rust wrapper over ONNX Runtime C API"
+description = "Safe Rust APIs for generative model inference with ONNX Runtime"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+keywords = ["onnx", "runtime", "inference", "ffi"]
+categories = ["api-bindings", "science"]
 
 [dependencies]
 minijinja = { version = "2", features = ["json"] }
 onnx-genai-metadata = { workspace = true }
-onnx-genai-ort-sys = { path = "ort-sys" }
+onnx-genai-ort-sys = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

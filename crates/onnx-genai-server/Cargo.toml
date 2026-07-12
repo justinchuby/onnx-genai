@@ -4,9 +4,12 @@ description = "OpenAI-compatible HTTP server for onnx-genai"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+keywords = ["onnx", "llm", "inference", "server"]
+categories = ["web-programming::http-server", "science"]
 
 [dependencies]
-onnx-genai = { path = "../onnx-genai" }
+onnx-genai = { workspace = true }
 onnx-genai-engine = { workspace = true }
 onnx-genai-metadata = { workspace = true }
 onnx-genai-ort = { workspace = true }

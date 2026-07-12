@@ -4,6 +4,9 @@ description = "Paged KV cache manager with tiered storage and prefix sharing"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+keywords = ["llm", "inference", "kv-cache", "genai"]
+categories = ["caching", "science"]
 
 [dependencies]
 onnx-genai-metadata = { workspace = true }

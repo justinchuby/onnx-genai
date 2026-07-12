@@ -1,9 +1,12 @@
 [package]
 name = "onnx-genai-scheduler"
-description = "Continuous batching scheduler with preemption"
+description = "Continuous batching and preemption scheduler for LLM inference"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+keywords = ["llm", "inference", "scheduler", "batching"]
+categories = ["concurrency", "science"]
 
 [dependencies]
 onnx-genai-kv = { workspace = true }

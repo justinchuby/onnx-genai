@@ -4,6 +4,9 @@ description = "Rust inference runtime for generative AI models on ONNX Runtime"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+keywords = ["onnx", "llm", "inference", "genai"]
+categories = ["science", "text-processing"]
 
 [dependencies]
 onnx-genai-metadata = { workspace = true }

@@ -20,11 +20,13 @@ repository = "https://github.com/justinchuby/onnx-genai"
 
 [workspace.dependencies]
 # Internal crates
-onnx-genai-metadata = { path = "crates/onnx-genai-metadata" }
-onnx-genai-kv = { path = "crates/onnx-genai-kv" }
-onnx-genai-scheduler = { path = "crates/onnx-genai-scheduler" }
-onnx-genai-engine = { path = "crates/onnx-genai-engine" }
-onnx-genai-ort = { path = "crates/onnx-genai-ort" }
+onnx-genai = { path = "crates/onnx-genai", version = "0.1.0" }
+onnx-genai-metadata = { path = "crates/onnx-genai-metadata", version = "0.1.0" }
+onnx-genai-kv = { path = "crates/onnx-genai-kv", version = "0.1.0" }
+onnx-genai-scheduler = { path = "crates/onnx-genai-scheduler", version = "0.1.0" }
+onnx-genai-engine = { path = "crates/onnx-genai-engine", version = "0.1.0" }
+onnx-genai-ort = { path = "crates/onnx-genai-ort", version = "0.1.0" }
+onnx-genai-ort-sys = { path = "crates/onnx-genai-ort/ort-sys", version = "0.1.0" }
 
 # External
 tokenizers = "0.21"

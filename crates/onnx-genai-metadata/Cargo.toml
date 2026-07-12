@@ -1,9 +1,12 @@
 [package]
 name = "onnx-genai-metadata"
-description = "ONNX inference metadata parser and types"
+description = "Metadata parsing and validation for generative ONNX models"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+keywords = ["onnx", "metadata", "inference", "genai"]
+categories = ["science", "parser-implementations"]
 
 [dependencies]
 serde = { workspace = true }
