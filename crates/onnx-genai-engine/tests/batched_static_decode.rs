@@ -91,6 +91,32 @@ fn continuous_batch_matches_individual_under_admission_eviction() -> anyhow::Res
 }
 
 #[test]
+fn batched_static_decode_returns_logprobs_per_row() -> anyhow::Result<()> {
+    let fixture = tiny_scatter_fixture()?;
+    let mut requests = vec![
+        token_request(vec![1, 5], 2),
+        token_request(vec![2, 6, 7], 3),
+    ];
+    for request in &mut requests {
+        request.options.top_logprobs = Some(2);
+    }
+
+    let mut engine = deterministic_engine(&fixture)?;
+    let results = engine.generate_batched_static(requests.clone())?;
+    let mut continuous_engine = deterministic_engine(&fixture)?;
+    let continuous_results = continuous_engine.run_continuous_batch(requests, 2)?;
+
+    for result in results.into_iter().chain(continuous_results) {
+        let logprobs = result.logprobs.expect("logprobs requested");
+        assert_eq!(logprobs.len(), result.token_ids.len());
+        assert!(logprobs.iter().all(|token| token.logprob <= 0.0
+            && token.top.windows(2).all(|pair| pair[0].1 >= pair[1].1)
+            && token.top.iter().any(|(id, _)| *id == token.token_id)));
+    }
+    Ok(())
+}
+
+#[test]
 #[ignore = "micro-measurement; run with --ignored --nocapture to inspect tokens/sec"]
 fn batched_static_decode_reports_tiny_scatter_throughput() -> anyhow::Result<()> {
     let fixture = tiny_scatter_fixture()?;

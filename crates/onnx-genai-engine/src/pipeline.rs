@@ -156,7 +156,7 @@ impl PipelineEngine {
             generated_count: 0,
         };
         backend.prompt_len = backend.context_tokens.len();
-        let mut loop_state = DecodeLoopState::new(0, options.seed);
+        let mut loop_state = DecodeLoopState::new(0, options.seed, options.top_logprobs);
         run_decode_loop(
             &mut backend,
             &mut loop_state,

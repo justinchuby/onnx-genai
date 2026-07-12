@@ -151,6 +151,12 @@ pub struct GenerateOptions {
     pub speculative_mode: Option<SpeculativeMode>,
     /// Optional constrained decoding grammar. None preserves unconstrained generation.
     pub constraint: Option<GenerateConstraint>,
+    /// Return per-token log probabilities and this many highest-probability alternatives.
+    ///
+    /// Values are computed from the final post-processor distribution used for sampling.
+    /// The chosen token is always included in `TokenLogprob::top`, in addition to the
+    /// requested alternatives when it is not already among them.
+    pub top_logprobs: Option<usize>,
 }
 
 impl Default for GenerateOptions {
@@ -173,6 +179,7 @@ impl Default for GenerateOptions {
             num_speculative_tokens: None,
             speculative_mode: None,
             constraint: None,
+            top_logprobs: None,
         }
     }
 }
@@ -281,7 +288,7 @@ pub struct ScheduledGenerateArrival {
 }
 
 /// Result for one request driven through the priority scheduler.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PrioritizedGenerateResult {
     pub session_id: SessionId,
     pub result: GenerateResult,
@@ -301,7 +308,7 @@ pub enum FinishReason {
 }
 
 /// Final generation output.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct GenerateResult {
     /// Detokenized generated text.
     pub text: String,
@@ -311,6 +318,19 @@ pub struct GenerateResult {
     pub finish_reason: FinishReason,
     /// Number of prompt/context tokens whose KV state was reused from the prefix cache.
     pub prefix_cache_hit_len: usize,
+    /// Per-generated-token log probabilities, or `None` when not requested.
+    pub logprobs: Option<Vec<TokenLogprob>>,
+}
+
+/// Log-probability metadata for one generated token.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TokenLogprob {
+    /// The selected token id.
+    pub token_id: TokenId,
+    /// Natural-log probability of the selected token.
+    pub logprob: f32,
+    /// Highest-probability tokens and their natural-log probabilities, sorted descending.
+    pub top: Vec<(TokenId, f32)>,
 }
 
 /// Per-token streaming event shape for future callback/iterator APIs.

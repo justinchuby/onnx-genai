@@ -562,7 +562,7 @@ pub(crate) fn run_decode_step_with_extra(
     let mut owned_inputs: Vec<(String, Value)> = Vec::new();
     for info in session.inputs() {
         let lower = info.name.to_ascii_lowercase();
-        if lower == "input_ids" || lower.ends_with(".input_ids") {
+        if is_token_input_name(&lower) {
             ensure_i64(info)?;
             owned_inputs.push((
                 info.name.clone(),
@@ -803,6 +803,13 @@ fn ensure_i64(info: &TensorInfo) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn is_token_input_name(lower_name: &str) -> bool {
+    lower_name == "input_ids"
+        || lower_name == "decoder_input_ids"
+        || lower_name.ends_with(".input_ids")
+        || lower_name.ends_with(".decoder_input_ids")
+}
+
 fn empty_past_value(info: &TensorInfo) -> anyhow::Result<Value> {
     if info.dtype != DataType::Float32 {
         anyhow::bail!(
@@ -891,4 +898,18 @@ pub(crate) fn is_gather_out_of_bounds(message: &str) -> bool {
     lower.contains("gather")
         && (lower.contains("indices element out of data bounds")
             || lower.contains("idx=") && lower.contains("out of"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_token_input_name;
+
+    #[test]
+    fn recognizes_causal_and_seq2seq_token_input_names() {
+        assert!(is_token_input_name("input_ids"));
+        assert!(is_token_input_name("decoder_input_ids"));
+        assert!(is_token_input_name("model.input_ids"));
+        assert!(is_token_input_name("model.decoder_input_ids"));
+        assert!(!is_token_input_name("encoder_input_ids"));
+    }
 }

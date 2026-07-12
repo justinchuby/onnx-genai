@@ -9,7 +9,9 @@ use crate::decode::{
     extract_logits_sequence, next_session_token_logits, next_session_token_logits_and_hidden,
     propose_draft_tokens, run_decode_session_logits, run_decode_step,
 };
-use crate::decode_loop::{DecodeLoopState, commit_selected_token, reached_context_limit};
+use crate::decode_loop::{
+    DecodeLoopState, commit_selected_token, logprob_for_token, reached_context_limit,
+};
 use crate::engine::Engine;
 use crate::kv_bridge::{
     common_prefix_len, mirror_present_kv_to_pages, rewind_draft_state_to_len,
@@ -506,6 +508,7 @@ impl Engine {
         prefix_cache_hit_len: usize,
         generated_tokens: &mut Vec<TokenId>,
         generated_text: &mut String,
+        generated_logprobs: &mut Option<Vec<crate::config::TokenLogprob>>,
         rng: &mut SamplingRng,
         mut callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
@@ -537,6 +540,7 @@ impl Engine {
                     generated_tokens,
                     FinishReason::MaxTokens,
                     prefix_cache_hit_len,
+                    generated_logprobs.as_deref(),
                 );
             }
             if reached_context_limit(state.tokens.len(), max_context) {
@@ -545,6 +549,7 @@ impl Engine {
                     generated_tokens,
                     FinishReason::Length,
                     prefix_cache_hit_len,
+                    generated_logprobs.as_deref(),
                 );
             }
 
@@ -697,6 +702,7 @@ impl Engine {
 
             let mut accepted = 0;
             let mut replacement = None;
+            let mut candidate_logprobs = options.top_logprobs.map(|_| Vec::new());
             for idx in 0..draft_tokens.len() {
                 let mut context = ProcessorContext {
                     prompt_tokens: state.tokens[..base_len].to_vec(),
@@ -726,6 +732,15 @@ impl Engine {
                     chain,
                     rng,
                 );
+                if let (Some(top_logprobs), Some(logprobs)) =
+                    (options.top_logprobs, candidate_logprobs.as_mut())
+                {
+                    logprobs.push(logprob_for_token(
+                        &target_logits[idx],
+                        target_token,
+                        top_logprobs,
+                    ));
+                }
                 if target_token == draft_tokens[idx] {
                     accepted += 1;
                 } else {
@@ -740,6 +755,9 @@ impl Engine {
             }
 
             let mut commit_tokens = draft_tokens[..accepted].to_vec();
+            let mut commit_logprobs = candidate_logprobs
+                .as_ref()
+                .map(|logprobs| logprobs[..accepted].to_vec());
             let rewind_len = base_len + accepted;
             rewind_target_state_to_len(
                 &self.session,
@@ -752,6 +770,11 @@ impl Engine {
 
             if let Some(token) = replacement {
                 commit_tokens.push(token);
+                if let (Some(source), Some(commit)) =
+                    (candidate_logprobs.as_ref(), commit_logprobs.as_mut())
+                {
+                    commit.push(source[accepted].clone());
+                }
             } else if generated_tokens.len() + commit_tokens.len() < options.max_new_tokens
                 && !reached_context_limit(base_len + commit_tokens.len(), max_context)
             {
@@ -785,6 +808,17 @@ impl Engine {
                     chain,
                     rng,
                 );
+                if let (Some(top_logprobs), Some(logprobs)) =
+                    (options.top_logprobs, commit_logprobs.as_mut())
+                {
+                    logprobs.push(logprob_for_token(
+                        target_logits
+                            .last()
+                            .context("target verification did not produce next-token logits")?,
+                        token,
+                        top_logprobs,
+                    ));
+                }
                 context.generated_tokens.push(token);
                 commit_tokens.push(token);
             }
@@ -810,8 +844,14 @@ impl Engine {
                     generated_text: std::mem::take(generated_text),
                     step,
                     prefix_cache_hit_len,
+                    logprobs: generated_logprobs.take(),
                     rng: SamplingRng::new(options.seed),
                 };
+                if let (Some(all_logprobs), Some(step_logprobs)) =
+                    (commit_state.logprobs.as_mut(), commit_logprobs.as_ref())
+                {
+                    all_logprobs.push(step_logprobs[commit_idx].clone());
+                }
                 let finish_reason = commit_selected_token(
                     &mut commit_state,
                     prompt_tokens,
@@ -823,6 +863,7 @@ impl Engine {
                 )?;
                 *generated_tokens = commit_state.generated_tokens;
                 *generated_text = commit_state.generated_text;
+                *generated_logprobs = commit_state.logprobs;
                 step = commit_state.step;
                 if let Some(finish_reason) = finish_reason {
                     trim_overmaterialized_target_kv(
@@ -839,6 +880,7 @@ impl Engine {
                         generated_tokens,
                         finish_reason,
                         prefix_cache_hit_len,
+                        generated_logprobs.as_deref(),
                     );
                 }
             }

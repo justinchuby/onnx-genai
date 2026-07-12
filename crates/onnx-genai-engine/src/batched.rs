@@ -5,7 +5,7 @@ use crate::config::{
 };
 use crate::decode::ModelDecodePath;
 use crate::decode_loop::{
-    DecodeLoopState, commit_selected_token, finish_result, reached_context_limit,
+    DecodeLoopState, commit_selected_token, finish_result, logprob_for_token, reached_context_limit,
 };
 use crate::engine::Engine;
 use crate::logits::{ProcessorChain, ProcessorContext, TokenId};
@@ -23,7 +23,7 @@ pub struct ContinuousBatchHandle {
     pub id: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ContinuousBatchEvent {
     Token {
         handle: ContinuousBatchHandle,
@@ -167,7 +167,7 @@ impl<'a> ContinuousBatchManager<'a> {
             ensure_constrained_finish(&options, "", FinishReason::Length)?;
             self.events.push_back(ContinuousBatchEvent::Finished {
                 handle,
-                result: finish_result(self.tokenizer, &[], FinishReason::Length, 0)?,
+                result: finish_result(self.tokenizer, &[], FinishReason::Length, 0, None)?,
             });
             return Ok(handle);
         }
@@ -252,7 +252,7 @@ impl<'a> ContinuousBatchManager<'a> {
                 .assign_row(row_index)
                 .map_err(|e| anyhow::anyhow!("Failed to assign continuous row: {}", e))?;
             let rng = SamplingRng::for_row(pending.options.seed, row_index);
-            let loop_state = DecodeLoopState::with_rng(0, rng);
+            let loop_state = DecodeLoopState::with_rng(0, rng, pending.options.top_logprobs);
             let mut row = ContinuousBatchRow {
                 handle: pending.handle,
                 physical_row: row_index,
@@ -282,6 +282,11 @@ impl<'a> ContinuousBatchManager<'a> {
             &row.chain,
             &mut row.state.rng,
         );
+        if let (Some(top_logprobs), Some(logprobs)) =
+            (row.options.top_logprobs, row.state.logprobs.as_mut())
+        {
+            logprobs.push(logprob_for_token(&logits, token_id, top_logprobs));
+        }
         row.context_tokens.push(token_id);
 
         let mut emitted_token = None;
@@ -334,6 +339,7 @@ impl<'a> ContinuousBatchManager<'a> {
                     &row.state.generated_tokens,
                     reason,
                     row.state.prefix_cache_hit_len,
+                    row.state.logprobs.as_deref(),
                 )?,
             });
             Ok(true)
@@ -465,12 +471,13 @@ impl Engine {
                     &[],
                     FinishReason::Length,
                     0,
+                    None,
                 )?);
                 continue;
             }
             let physical_row = rows.len();
             let rng = SamplingRng::for_row(options.seed, physical_row);
-            let loop_state = DecodeLoopState::with_rng(0, rng);
+            let loop_state = DecodeLoopState::with_rng(0, rng, options.top_logprobs);
             rows.push(BatchRow {
                 result_index,
                 physical_row,
@@ -512,6 +519,11 @@ impl Engine {
                     &row.chain,
                     &mut row.state.rng,
                 );
+                if let (Some(top_logprobs), Some(logprobs)) =
+                    (row.options.top_logprobs, row.state.logprobs.as_mut())
+                {
+                    logprobs.push(logprob_for_token(&logits, token_id, top_logprobs));
+                }
                 row.context_tokens.push(token_id);
 
                 let finish_reason = commit_selected_token(
@@ -551,6 +563,7 @@ impl Engine {
                         &row.state.generated_tokens,
                         reason,
                         row.state.prefix_cache_hit_len,
+                        row.state.logprobs.as_deref(),
                     )?);
                     decode
                         .deactivate_row(row.physical_row)

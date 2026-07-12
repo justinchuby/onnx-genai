@@ -32,7 +32,7 @@ pub use crate::config::{
     EngineConfig, FinishReason, GenerateConstraint, GenerateOptions, GeneratePrompt,
     GenerateRequest, GenerateResult, GenerateToken, GenerateTokenCallback, MtpConfig,
     PrioritizedGenerateRequest, PrioritizedGenerateResult, ScheduledGenerateArrival, SessionId,
-    SpeculativeMode,
+    SpeculativeMode, TokenLogprob,
 };
 use crate::speculative::{LinearEmbedder, LinearLmHead, SpeculativeStats};
 
@@ -412,7 +412,8 @@ impl Engine {
             .with_context(|| format!("session {session_id} not found"))?;
         let prefix_cache_hit_len =
             self.prepare_session_prefix(session_id, &mut state, &prompt_tokens)?;
-        let mut loop_state = DecodeLoopState::new(prefix_cache_hit_len, options.seed);
+        let mut loop_state =
+            DecodeLoopState::new(prefix_cache_hit_len, options.seed, options.top_logprobs);
 
         let result = (|| -> anyhow::Result<GenerateResult> {
             if self.should_use_speculative(&options) {
@@ -425,6 +426,7 @@ impl Engine {
                     prefix_cache_hit_len,
                     &mut loop_state.generated_tokens,
                     &mut loop_state.generated_text,
+                    &mut loop_state.logprobs,
                     &mut loop_state.rng,
                     callback.as_deref_mut(),
                 );
@@ -843,6 +845,7 @@ impl Engine {
         let prefix_cache_hit_len =
             self.prepare_session_prefix(request.session_id, &mut state, &prompt_tokens)?;
         let rng = SamplingRng::new(options.seed);
+        let logprobs = options.top_logprobs.map(|_| Vec::new());
         Ok(ActiveGenerate {
             session_id: request.session_id,
             state,
@@ -853,6 +856,7 @@ impl Engine {
             prefix_cache_hit_len,
             generated_tokens: Vec::new(),
             generated_text: String::new(),
+            logprobs,
             step: 0,
             rng,
         })
@@ -865,6 +869,7 @@ impl Engine {
         let mut loop_state = DecodeLoopState {
             generated_tokens: std::mem::take(&mut active.generated_tokens),
             generated_text: std::mem::take(&mut active.generated_text),
+            logprobs: active.logprobs.take(),
             step: active.step,
             prefix_cache_hit_len: active.prefix_cache_hit_len,
             rng: std::mem::replace(&mut active.rng, SamplingRng::new(Some(0))),
@@ -890,6 +895,7 @@ impl Engine {
         };
         active.generated_tokens = loop_state.generated_tokens;
         active.generated_text = loop_state.generated_text;
+        active.logprobs = loop_state.logprobs;
         active.step = loop_state.step;
         active.rng = loop_state.rng;
         if step_result.is_some() {
@@ -906,6 +912,7 @@ impl Engine {
                     &active.generated_tokens,
                     FinishReason::MaxTokens,
                     active.prefix_cache_hit_len,
+                    active.logprobs.as_deref(),
                 )
                 .map(Some);
         }
@@ -998,6 +1005,7 @@ impl Engine {
         generated_tokens: &[TokenId],
         finish_reason: FinishReason,
         prefix_cache_hit_len: usize,
+        logprobs: Option<&[crate::config::TokenLogprob]>,
     ) -> anyhow::Result<GenerateResult> {
         Ok(GenerateResult {
             text: self
@@ -1007,6 +1015,7 @@ impl Engine {
             token_ids: generated_tokens.to_vec(),
             finish_reason,
             prefix_cache_hit_len,
+            logprobs: logprobs.map(<[crate::config::TokenLogprob]>::to_vec),
         })
     }
 }
@@ -1065,11 +1074,26 @@ fn read_f32_weights(path: &Path) -> anyhow::Result<Vec<f32>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::decode_loop::logprob_for_token;
     use crate::logits::ProcessorContext;
     use crate::processors::{
         finish_reason_after_token, select_next_token, select_next_token_with_sampler,
     };
     use crate::sampling::Sampler;
+
+    #[test]
+    fn token_logprobs_use_log_softmax_and_sorted_top_tokens() {
+        let logits = [1.0, f32::NEG_INFINITY, 3.0, 2.0];
+        let result = logprob_for_token(&logits, 3, 2);
+        let logsumexp = 3.0 + ((1.0_f32 - 3.0).exp() + 1.0 + (2.0_f32 - 3.0).exp()).ln();
+
+        assert_eq!(result.token_id, 3);
+        assert_eq!(result.logprob, 2.0 - logsumexp);
+        assert!(result.logprob <= 0.0);
+        assert!(result.top.windows(2).all(|pair| pair[0].1 >= pair[1].1));
+        assert!(result.top.iter().any(|(token_id, _)| *token_id == 3));
+        assert!(result.top.iter().all(|(token_id, _)| *token_id != 1));
+    }
 
     #[test]
     fn processor_chain_uses_documented_order() {
@@ -1313,6 +1337,51 @@ mod tests {
         assert_eq!(result.token_ids.len(), 3);
         assert_eq!(result.finish_reason, FinishReason::MaxTokens);
         assert!(engine.sessions.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn tiny_fixture_returns_opt_in_per_token_logprobs() -> anyhow::Result<()> {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/tiny-llm")
+            .canonicalize()?;
+        let mut engine = Engine::from_dir_with_session_options(
+            &fixture,
+            EngineConfig::default(),
+            SessionOptions::default().with_intra_op_threads(1),
+        )?;
+        let mut request = GenerateRequest::new("hello");
+        request.options.max_new_tokens = 3;
+        request.options.temperature = 0.0;
+        request.options.stop_on_eos = false;
+        request.options.top_logprobs = Some(3);
+
+        let result = engine.generate(request)?;
+        let logprobs = result.logprobs.as_ref().expect("logprobs requested");
+
+        assert_eq!(logprobs.len(), result.token_ids.len());
+        for (token_id, token_logprob) in result.token_ids.iter().zip(logprobs) {
+            assert_eq!(*token_id, token_logprob.token_id);
+            assert!(token_logprob.logprob <= 0.0);
+            assert!(
+                token_logprob
+                    .top
+                    .windows(2)
+                    .all(|pair| pair[0].1 >= pair[1].1)
+            );
+            assert!(
+                token_logprob
+                    .top
+                    .iter()
+                    .any(|(top_token_id, _)| top_token_id == token_id)
+            );
+        }
+
+        let mut disabled = GenerateRequest::new("hello");
+        disabled.options.max_new_tokens = 1;
+        disabled.options.temperature = 0.0;
+        disabled.options.stop_on_eos = false;
+        assert!(engine.generate(disabled)?.logprobs.is_none());
         Ok(())
     }
 

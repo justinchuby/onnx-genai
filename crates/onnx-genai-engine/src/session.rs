@@ -1,6 +1,6 @@
 //! Persistent engine and draft generation session state.
 
-use crate::config::{GenerateOptions, SessionId};
+use crate::config::{GenerateOptions, SessionId, TokenLogprob};
 use crate::decode::{DecodeState, ModelDecodePath};
 use crate::kv_bridge::KvModelInfo;
 use crate::logits::{ProcessorChain, TokenId};
@@ -29,6 +29,7 @@ pub(crate) struct ActiveGenerate {
     pub(crate) prefix_cache_hit_len: usize,
     pub(crate) generated_tokens: Vec<TokenId>,
     pub(crate) generated_text: String,
+    pub(crate) logprobs: Option<Vec<TokenLogprob>>,
     pub(crate) step: usize,
     pub(crate) rng: SamplingRng,
 }

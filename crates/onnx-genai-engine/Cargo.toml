@@ -24,3 +24,4 @@ llguidance = "1.7.6"
 toktrie_hf_tokenizers = "1.7.6"
 
 [dev-dependencies]
+onnx-genai-preprocess = { workspace = true }

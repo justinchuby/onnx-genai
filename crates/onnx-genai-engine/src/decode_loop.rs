@@ -2,6 +2,7 @@
 
 use crate::config::{
     FinishReason, GenerateOptions, GenerateResult, GenerateToken, GenerateTokenCallback,
+    TokenLogprob,
 };
 use crate::logits::{ProcessorChain, ProcessorContext, TokenId};
 use crate::processors::{
@@ -15,20 +16,30 @@ pub(crate) struct DecodeLoopState {
     pub(crate) generated_text: String,
     pub(crate) step: usize,
     pub(crate) prefix_cache_hit_len: usize,
+    pub(crate) logprobs: Option<Vec<TokenLogprob>>,
     pub(crate) rng: SamplingRng,
 }
 
 impl DecodeLoopState {
-    pub(crate) fn new(prefix_cache_hit_len: usize, seed: Option<u64>) -> Self {
-        Self::with_rng(prefix_cache_hit_len, SamplingRng::new(seed))
+    pub(crate) fn new(
+        prefix_cache_hit_len: usize,
+        seed: Option<u64>,
+        top_logprobs: Option<usize>,
+    ) -> Self {
+        Self::with_rng(prefix_cache_hit_len, SamplingRng::new(seed), top_logprobs)
     }
 
-    pub(crate) fn with_rng(prefix_cache_hit_len: usize, rng: SamplingRng) -> Self {
+    pub(crate) fn with_rng(
+        prefix_cache_hit_len: usize,
+        rng: SamplingRng,
+        top_logprobs: Option<usize>,
+    ) -> Self {
         Self {
             generated_tokens: Vec::new(),
             generated_text: String::new(),
             step: 0,
             prefix_cache_hit_len,
+            logprobs: top_logprobs.map(|_| Vec::new()),
             rng,
         }
     }
@@ -70,6 +81,7 @@ pub(crate) fn run_decode_loop<B: DecodeLoopBackend>(
         &state.generated_tokens,
         FinishReason::MaxTokens,
         state.prefix_cache_hit_len,
+        state.logprobs.as_deref(),
     )
 }
 
@@ -89,6 +101,7 @@ pub(crate) fn step_decode_loop<B: DecodeLoopBackend>(
             &state.generated_tokens,
             FinishReason::Length,
             state.prefix_cache_hit_len,
+            state.logprobs.as_deref(),
         )
         .map(Some);
     }
@@ -102,6 +115,9 @@ pub(crate) fn step_decode_loop<B: DecodeLoopBackend>(
     let mut logits = backend.next_logits()?;
     let token_id =
         select_next_token_with_rng(&mut logits, &context, options, chain, &mut state.rng);
+    if let (Some(top_logprobs), Some(logprobs)) = (options.top_logprobs, state.logprobs.as_mut()) {
+        logprobs.push(logprob_for_token(&logits, token_id, top_logprobs));
+    }
     backend.commit_token(token_id)?;
 
     if let Some(finish_reason) = commit_selected_token(
@@ -118,6 +134,7 @@ pub(crate) fn step_decode_loop<B: DecodeLoopBackend>(
             &state.generated_tokens,
             finish_reason,
             state.prefix_cache_hit_len,
+            state.logprobs.as_deref(),
         )
         .map(Some);
     }
@@ -161,6 +178,7 @@ pub(crate) fn finish_result(
     generated_tokens: &[TokenId],
     finish_reason: FinishReason,
     prefix_cache_hit_len: usize,
+    logprobs: Option<&[TokenLogprob]>,
 ) -> anyhow::Result<GenerateResult> {
     Ok(GenerateResult {
         text: tokenizer
@@ -169,7 +187,53 @@ pub(crate) fn finish_result(
         token_ids: generated_tokens.to_vec(),
         finish_reason,
         prefix_cache_hit_len,
+        logprobs: logprobs.map(<[TokenLogprob]>::to_vec),
     })
+}
+
+pub(crate) fn logprob_for_token(
+    logits: &[f32],
+    token_id: TokenId,
+    top_logprobs: usize,
+) -> TokenLogprob {
+    let max_logit = logits
+        .iter()
+        .copied()
+        .filter(|logit| logit.is_finite())
+        .fold(f32::NEG_INFINITY, f32::max);
+    let logsumexp = max_logit
+        + logits
+            .iter()
+            .copied()
+            .filter(|logit| logit.is_finite())
+            .map(|logit| (logit - max_logit).exp())
+            .sum::<f32>()
+            .ln();
+    let logprob = logits
+        .get(token_id as usize)
+        .copied()
+        .filter(|logit| logit.is_finite())
+        .map_or(f32::NEG_INFINITY, |logit| logit - logsumexp);
+
+    let mut top = logits
+        .iter()
+        .copied()
+        .enumerate()
+        .filter(|(_, logit)| logit.is_finite())
+        .map(|(id, logit)| (id as TokenId, logit - logsumexp))
+        .collect::<Vec<_>>();
+    top.sort_unstable_by(|left, right| right.1.total_cmp(&left.1));
+    top.truncate(top_logprobs);
+    if !top.iter().any(|(id, _)| *id == token_id) {
+        top.push((token_id, logprob));
+        top.sort_unstable_by(|left, right| right.1.total_cmp(&left.1));
+    }
+
+    TokenLogprob {
+        token_id,
+        logprob,
+        top,
+    }
 }
 
 pub(crate) fn reached_context_limit(

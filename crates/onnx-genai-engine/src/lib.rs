@@ -26,7 +26,7 @@ pub use engine::{
     Engine, EngineConfig, FinishReason, GenerateConstraint, GenerateOptions, GeneratePrompt,
     GenerateRequest, GenerateResult, GenerateToken, GenerateTokenCallback, MtpConfig,
     PrioritizedGenerateRequest, PrioritizedGenerateResult, ScheduledGenerateArrival, SessionId,
-    SpeculativeMode,
+    SpeculativeMode, TokenLogprob,
 };
 pub use fim::{FimConfig, FimFormat};
 pub use logits::{

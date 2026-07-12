@@ -42,13 +42,15 @@ fn prompt_lookup_greedy_matches_plain_greedy_exactly() -> anyhow::Result<()> {
             max_tokens: 4,
         },
     )?;
-    let request = greedy_request(GeneratePrompt::Text("hello".to_string()), 12);
+    let mut request = greedy_request(GeneratePrompt::Text("hello".to_string()), 12);
+    request.options.top_logprobs = Some(3);
 
     let expected = baseline.generate(request.clone())?;
     let actual = prompt_lookup.generate(request)?;
     let stats = prompt_lookup.last_speculative_stats();
 
     assert_eq!(actual.token_ids, expected.token_ids);
+    assert_eq!(actual.logprobs, expected.logprobs);
     assert_eq!(actual.finish_reason, expected.finish_reason);
     assert!(stats.proposed_tokens > 0);
     assert!(
