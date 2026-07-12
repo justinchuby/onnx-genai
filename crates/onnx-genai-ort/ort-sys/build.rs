@@ -10,7 +10,10 @@
 use std::env;
 use std::path::{Path, PathBuf};
 
+// Keep this aligned with the ORT headers used by bindgen. ORT 1.27.x exposes
+// ORT_API_VERSION 27, so the downloaded runtime must also be 1.27.x.
 const ORT_VERSION: &str = "1.27.0";
+const ORT_API_VERSION: &str = "27";
 const ORT_RELEASE_BASE: &str = "https://github.com/microsoft/onnxruntime/releases/download";
 
 fn main() {
@@ -33,8 +36,12 @@ fn main() {
     }
 
     // Link
+    ensure_major_version_runtime_link(&lib_dir);
     println!("cargo:rustc-link-search=native={}", lib_dir.display());
     println!("cargo:rustc-link-lib=dylib=onnxruntime");
+    if target_os() == "macos" || target_os() == "linux" {
+        println!("cargo:rustc-link-arg=-Wl,-rpath,{}", lib_dir.display());
+    }
 
     // For downstream crates
     println!("cargo:ort_lib_dir={}", lib_dir.display());
@@ -108,12 +115,21 @@ fn find_ort_root() -> PathBuf {
 
     // 4. Auto-download prebuilt
     let download_dir = PathBuf::from(env::var("OUT_DIR").unwrap()).join("ort-prebuilt");
-    if download_dir
-        .join("include")
-        .join("onnxruntime_c_api.h")
-        .exists()
-    {
+    if cached_prebuilt_matches_version(&download_dir) {
         return download_dir;
+    }
+    if download_dir.exists() {
+        eprintln!(
+            "Removing stale ONNX Runtime prebuilt cache at {} (expected {})",
+            download_dir.display(),
+            ORT_VERSION
+        );
+        std::fs::remove_dir_all(&download_dir).unwrap_or_else(|err| {
+            panic!(
+                "Failed to remove stale ORT prebuilt cache at {}: {err}",
+                download_dir.display()
+            )
+        });
     }
 
     download_prebuilt(&download_dir);
@@ -121,15 +137,15 @@ fn find_ort_root() -> PathBuf {
 }
 
 fn download_prebuilt(target_dir: &Path) {
-    let (os, ext) = if cfg!(target_os = "linux") {
+    let (os, ext) = if target_os() == "linux" {
         ("linux-x64", "tgz")
-    } else if cfg!(target_os = "macos") {
-        if cfg!(target_arch = "aarch64") {
+    } else if target_os() == "macos" {
+        if target_arch() == "aarch64" {
             ("osx-arm64", "tgz")
         } else {
             ("osx-x86_64", "tgz")
         }
-    } else if cfg!(target_os = "windows") {
+    } else if target_os() == "windows" {
         ("win-x64", "zip")
     } else {
         panic!("Unsupported platform for automatic ORT download");
@@ -154,25 +170,26 @@ fn download_prebuilt(target_dir: &Path) {
     }
 
     // Extract
-    std::fs::create_dir_all(target_dir).unwrap();
+    let parent_dir = target_dir.parent().unwrap();
+    std::fs::create_dir_all(parent_dir).unwrap();
 
     if ext == "tgz" {
         let status = std::process::Command::new("tar")
             .args(["xzf"])
             .arg(&download_path)
             .arg("-C")
-            .arg(target_dir.parent().unwrap())
+            .arg(parent_dir)
             .status()
             .expect("Failed to run tar");
         if !status.success() {
             panic!("Failed to extract ORT archive");
         }
         // Rename extracted directory
-        let extracted = target_dir
-            .parent()
-            .unwrap()
-            .join(format!("onnxruntime-{}-{}", os, ORT_VERSION));
+        let extracted = parent_dir.join(format!("onnxruntime-{}-{}", os, ORT_VERSION));
         if extracted.exists() {
+            if target_dir.exists() {
+                std::fs::remove_dir_all(target_dir).unwrap();
+            }
             std::fs::rename(&extracted, target_dir).unwrap();
         }
     } else {
@@ -180,21 +197,162 @@ fn download_prebuilt(target_dir: &Path) {
         let status = std::process::Command::new("unzip")
             .arg(&download_path)
             .arg("-d")
-            .arg(target_dir.parent().unwrap())
+            .arg(parent_dir)
             .status()
             .expect("Failed to run unzip");
         if !status.success() {
             panic!("Failed to extract ORT archive");
         }
-        let extracted = target_dir
-            .parent()
-            .unwrap()
-            .join(format!("onnxruntime-{}-{}", os, ORT_VERSION));
+        let extracted = parent_dir.join(format!("onnxruntime-{}-{}", os, ORT_VERSION));
         if extracted.exists() {
+            if target_dir.exists() {
+                std::fs::remove_dir_all(target_dir).unwrap();
+            }
             std::fs::rename(&extracted, target_dir).unwrap();
         }
     }
 
     // Cleanup
     let _ = std::fs::remove_file(&download_path);
+}
+
+fn cached_prebuilt_matches_version(download_dir: &Path) -> bool {
+    let header_path = download_dir.join("include").join("onnxruntime_c_api.h");
+    header_matches_api_version(&header_path)
+        && expected_versioned_runtime_path(&download_dir.join("lib")).exists()
+}
+
+fn header_matches_api_version(header_path: &Path) -> bool {
+    let Ok(header) = std::fs::read_to_string(header_path) else {
+        return false;
+    };
+
+    header.contains(&format!("#define ORT_API_VERSION {ORT_API_VERSION}"))
+}
+
+fn ensure_major_version_runtime_link(lib_dir: &Path) {
+    let Some((major_name, versioned_name)) = runtime_library_names() else {
+        return;
+    };
+
+    let major_path = lib_dir.join(major_name);
+    let versioned_path = lib_dir.join(&versioned_name);
+    if !versioned_path.exists() {
+        panic!(
+            "Cannot find expected ONNX Runtime {} shared library at {}",
+            ORT_VERSION,
+            versioned_path.display()
+        );
+    }
+
+    if major_path.exists() {
+        configure_macos_install_names(lib_dir, &major_path, &versioned_path);
+        return;
+    }
+
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&versioned_name, &major_path).unwrap_or_else(|err| {
+        panic!(
+            "Failed to create ONNX Runtime major-version symlink {} -> {}: {err}",
+            major_path.display(),
+            versioned_name
+        )
+    });
+
+    configure_macos_install_names(lib_dir, &major_path, &versioned_path);
+}
+
+fn configure_macos_install_names(lib_dir: &Path, major_path: &Path, versioned_path: &Path) {
+    if target_os() != "macos" {
+        return;
+    }
+
+    set_macos_install_name(major_path, versioned_path);
+
+    let unversioned_path = lib_dir.join("libonnxruntime.dylib");
+    if unversioned_path.exists() {
+        set_macos_install_name(major_path, &unversioned_path);
+    }
+}
+
+fn set_macos_install_name(major_path: &Path, library_path: &Path) {
+    let desired_id = major_path.to_string_lossy();
+    let current_id = std::process::Command::new("otool")
+        .arg("-D")
+        .arg(library_path)
+        .output()
+        .ok()
+        .and_then(|output| {
+            if output.status.success() {
+                String::from_utf8(output.stdout).ok()
+            } else {
+                None
+            }
+        })
+        .and_then(|stdout| stdout.lines().nth(1).map(str::to_string));
+
+    if current_id.as_deref() != Some(desired_id.as_ref()) {
+        let status = std::process::Command::new("install_name_tool")
+            .arg("-id")
+            .arg(desired_id.as_ref())
+            .arg(library_path)
+            .status()
+            .expect("Failed to run install_name_tool");
+
+        if !status.success() {
+            panic!(
+                "Failed to set ONNX Runtime install name for {}",
+                library_path.display()
+            );
+        }
+    }
+
+    let status = std::process::Command::new("codesign")
+        .args(["--force", "--sign", "-"])
+        .arg(library_path)
+        .status()
+        .expect("Failed to run codesign after modifying ONNX Runtime install name");
+
+    if !status.success() {
+        panic!(
+            "Failed to ad-hoc codesign modified ONNX Runtime library {}",
+            library_path.display()
+        );
+    }
+}
+
+fn expected_versioned_runtime_path(lib_dir: &Path) -> PathBuf {
+    if target_os() == "macos" {
+        lib_dir.join(format!("libonnxruntime.{ORT_VERSION}.dylib"))
+    } else if target_os() == "linux" {
+        lib_dir.join(format!("libonnxruntime.so.{ORT_VERSION}"))
+    } else if target_os() == "windows" {
+        lib_dir.join("onnxruntime.dll")
+    } else {
+        lib_dir.join(format!("libonnxruntime.{ORT_VERSION}"))
+    }
+}
+
+fn runtime_library_names() -> Option<(&'static str, String)> {
+    if target_os() == "macos" {
+        Some((
+            "libonnxruntime.1.dylib",
+            format!("libonnxruntime.{ORT_VERSION}.dylib"),
+        ))
+    } else if target_os() == "linux" {
+        Some((
+            "libonnxruntime.so.1",
+            format!("libonnxruntime.so.{ORT_VERSION}"),
+        ))
+    } else {
+        None
+    }
+}
+
+fn target_os() -> String {
+    env::var("CARGO_CFG_TARGET_OS").unwrap_or_else(|_| env::consts::OS.to_string())
+}
+
+fn target_arch() -> String {
+    env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_else(|_| env::consts::ARCH.to_string())
 }
