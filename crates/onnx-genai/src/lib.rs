@@ -12,6 +12,10 @@ pub use onnx_genai_ort as ort;
 pub use onnx_genai_scheduler as scheduler;
 
 pub use onnx_genai_engine::{
-    Engine, EngineConfig, FinishReason, GenerateOptions, GeneratePrompt, GenerateRequest,
-    GenerateResult, GenerateToken, GenerateTokenCallback, SessionId, StopSequence, TokenId,
+    CategoricalSampler, Constraint, ConstraintProcessor, Engine, EngineConfig, FinishReason,
+    GenerateOptions, GeneratePrompt, GenerateRequest, GenerateResult, GenerateToken,
+    GenerateTokenCallback, GreedySampler, JsonConstraint, LogitProcessor, ProcessorChain,
+    ProcessorChainBuilder, ProcessorContext, ProcessorSignal, Sampler, SessionId,
+    SpeculativeAcceptContext, SpeculativeProposal, SpeculativeProposer, SpeculativeProposerContext,
+    StopSequence, TokenId,
 };
