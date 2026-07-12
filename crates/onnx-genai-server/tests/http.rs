@@ -16,6 +16,20 @@ async fn test_app() -> axum::Router {
     app(state)
 }
 
+fn sse_data_lines(text: &str) -> Vec<&str> {
+    text.lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .collect()
+}
+
+fn sse_json_chunks(text: &str) -> Vec<Value> {
+    sse_data_lines(text)
+        .into_iter()
+        .filter(|data| *data != "[DONE]")
+        .map(|data| serde_json::from_str(data).unwrap())
+        .collect()
+}
+
 async fn create_http_session(app: axum::Router) -> String {
     let response = app
         .oneshot(
@@ -128,6 +142,69 @@ async fn streaming_chat_completions_returns_sse_chunks() {
     let text = String::from_utf8(body.to_vec()).unwrap();
     assert!(text.contains("chat.completion.chunk"), "{text}");
     assert!(text.contains("[DONE]"), "{text}");
+
+    let data_lines = sse_data_lines(&text);
+    assert_eq!(data_lines.last(), Some(&"[DONE]"));
+    let chunks = sse_json_chunks(&text);
+    let content_chunks = chunks
+        .iter()
+        .filter(|chunk| chunk["choices"][0]["delta"].get("content").is_some())
+        .count();
+    assert!(content_chunks <= 1, "{text}");
+    assert_eq!(
+        chunks.last().unwrap()["choices"][0]["finish_reason"],
+        "length"
+    );
+}
+
+#[tokio::test]
+async fn streaming_chat_completions_stop_sequence_finishes_before_max_tokens() {
+    let app = test_app().await;
+    let session_id = create_http_session(app.clone()).await;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("X-Session-Id", session_id)
+                .body(Body::from(
+                    json!({
+                        "model": "tiny-llm",
+                        "messages": [{"role": "user", "content": "hello"}],
+                        "max_tokens": 10,
+                        "stream": true,
+                        "stop": "tok22"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let text = String::from_utf8(body.to_vec()).unwrap();
+    let data_lines = sse_data_lines(&text);
+    assert_eq!(data_lines.last(), Some(&"[DONE]"), "{text}");
+
+    let chunks = sse_json_chunks(&text);
+    let content: String = chunks
+        .iter()
+        .filter_map(|chunk| chunk["choices"][0]["delta"]["content"].as_str())
+        .collect();
+    let content_chunks = chunks
+        .iter()
+        .filter(|chunk| chunk["choices"][0]["delta"].get("content").is_some())
+        .count();
+
+    assert!(content_chunks < 10, "{text}");
+    assert!(!content.contains("tok22"), "{text}");
+    assert_eq!(
+        chunks.last().unwrap()["choices"][0]["finish_reason"],
+        "stop"
+    );
 }
 
 #[tokio::test]

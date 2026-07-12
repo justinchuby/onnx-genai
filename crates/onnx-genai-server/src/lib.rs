@@ -231,11 +231,18 @@ pub enum StopInput {
 }
 
 impl StopInput {
-    fn into_sequences(self) -> Vec<StopSequence> {
+    fn into_texts(self) -> Vec<String> {
         match self {
-            Self::One(value) => vec![StopSequence::Text(value)],
-            Self::Many(values) => values.into_iter().map(StopSequence::Text).collect(),
+            Self::One(value) => vec![value],
+            Self::Many(values) => values,
         }
+    }
+
+    fn into_sequences(self) -> Vec<StopSequence> {
+        self.into_texts()
+            .into_iter()
+            .map(StopSequence::Text)
+            .collect()
     }
 }
 
@@ -339,6 +346,70 @@ struct ApiError {
 struct PreparedGenerateRequest {
     request: GenerateRequest,
     prompt_tokens: usize,
+}
+
+#[derive(Debug)]
+struct StopBoundaryBuffer {
+    stop_sequences: Vec<String>,
+    pending: String,
+}
+
+impl StopBoundaryBuffer {
+    fn new(stop_sequences: Vec<String>) -> Self {
+        Self {
+            stop_sequences: stop_sequences
+                .into_iter()
+                .filter(|sequence| !sequence.is_empty())
+                .collect(),
+            pending: String::new(),
+        }
+    }
+
+    fn push(&mut self, text: &str) -> String {
+        if self.stop_sequences.is_empty() {
+            return text.to_string();
+        }
+
+        self.pending.push_str(text);
+        if let Some(stop_start) = self.earliest_stop_start() {
+            let safe = self.pending[..stop_start].to_string();
+            self.pending.clear();
+            return safe;
+        }
+
+        let keep = self.longest_stop_prefix_suffix_len();
+        let emit_len = self.pending.len().saturating_sub(keep);
+        if emit_len == 0 {
+            return String::new();
+        }
+
+        let safe = self.pending[..emit_len].to_string();
+        self.pending = self.pending[emit_len..].to_string();
+        safe
+    }
+
+    fn flush(&mut self) -> String {
+        std::mem::take(&mut self.pending)
+    }
+
+    fn earliest_stop_start(&self) -> Option<usize> {
+        self.stop_sequences
+            .iter()
+            .filter_map(|sequence| self.pending.find(sequence))
+            .min()
+    }
+
+    fn longest_stop_prefix_suffix_len(&self) -> usize {
+        let mut keep = 0;
+        for sequence in &self.stop_sequences {
+            for (prefix_len, _) in sequence.char_indices().skip(1) {
+                if self.pending.ends_with(&sequence[..prefix_len]) {
+                    keep = keep.max(prefix_len);
+                }
+            }
+        }
+        keep
+    }
 }
 
 impl ApiError {
@@ -520,6 +591,11 @@ fn stream_chat_completion(
     let id = completion_id();
     let created = now_unix();
     let model = request.model.clone();
+    let stop_sequences = request
+        .stop
+        .clone()
+        .map(StopInput::into_texts)
+        .unwrap_or_default();
     let prepared =
         prepare_generate_request(&request, &state.tokenizer, client_session_id.is_some())
             .map_err(|err| ApiError::internal(format!("prompt tokenization failed: {err}")))?;
@@ -556,8 +632,17 @@ fn stream_chat_completion(
 
         send_chunk(role_chunk(&id, created, &model))?;
 
+        let mut stop_buffer = StopBoundaryBuffer::new(stop_sequences);
         let mut callback = |token: GenerateToken| -> anyhow::Result<()> {
-            send_chunk(content_chunk(&id, created, &model, token.text))
+            let finish_reason = token.finish_reason.clone();
+            let content = stop_buffer.push(&token.text);
+            if !content.is_empty() {
+                send_chunk(content_chunk(&id, created, &model, content))?;
+            }
+            if matches!(finish_reason, Some(FinishReason::StopSequence { .. })) {
+                stop_buffer.pending.clear();
+            }
+            Ok(())
         };
 
         let result = match session_lookup {
@@ -570,12 +655,20 @@ fn stream_chat_completion(
         };
 
         match result {
-            Ok(result) => send_chunk(done_chunk(
-                &id,
-                created,
-                &model,
-                finish_reason_label(&result.finish_reason),
-            ))?,
+            Ok(result) => {
+                if !matches!(result.finish_reason, FinishReason::StopSequence { .. }) {
+                    let content = stop_buffer.flush();
+                    if !content.is_empty() {
+                        send_chunk(content_chunk(&id, created, &model, content))?;
+                    }
+                }
+                send_chunk(done_chunk(
+                    &id,
+                    created,
+                    &model,
+                    finish_reason_label(&result.finish_reason),
+                ))?;
+            }
             Err(err) => tx
                 .blocking_send(Ok(Event::default().event("error").data(
                     serde_json::to_string(&ErrorResponse {
@@ -807,4 +900,27 @@ fn infer_model_id(model_dir: &Path) -> String {
         .and_then(|name| name.to_str())
         .unwrap_or("onnx-genai-model")
         .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::StopBoundaryBuffer;
+
+    #[test]
+    fn stop_boundary_buffer_holds_partial_stop_sequence() {
+        let mut buffer = StopBoundaryBuffer::new(vec!["tok20".to_string()]);
+        assert_eq!(buffer.push("to"), "");
+        assert_eq!(buffer.push("k"), "");
+        assert_eq!(buffer.push("2"), "");
+        assert_eq!(buffer.push("1"), "tok21");
+        assert_eq!(buffer.flush(), "");
+    }
+
+    #[test]
+    fn stop_boundary_buffer_suppresses_matched_stop_sequence() {
+        let mut buffer = StopBoundaryBuffer::new(vec!["tok20".to_string()]);
+        assert_eq!(buffer.push("hello tok"), "hello ");
+        assert_eq!(buffer.push("20"), "");
+        assert_eq!(buffer.flush(), "");
+    }
 }
