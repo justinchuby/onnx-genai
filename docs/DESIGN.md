@@ -4005,3 +4005,537 @@ Microsoft's reliability reputation took decades to build. One bad ORT release th
 
 **5. The talent pipeline advantage.**
 Microsoft can attract and retain framework engineers who want stability, impact at scale, and not burning out on startup pace. This is a real, underappreciated competitive advantage in a market where most AI infra talent is chasing startup equity. The people who build the best frameworks are often the ones who value craftsmanship over speed — and Microsoft's culture (at its best) supports that.
+
+---
+
+## 31. Observability, Logging & Profiling
+
+### 31.1 Design Goals
+
+1. **Zero-cost when off** — tracing/profiling in release builds must have zero overhead when disabled. No allocations, no syscalls, no branch mispredictions.
+2. **Always-on structured logging** — every request gets a trace ID, every error has context.
+3. **Perfetto trace export** — visualize inference execution on a timeline: forward passes, KV cache ops, scheduling, sampling, tool calls.
+4. **Prometheus/OpenTelemetry metrics** — production monitoring: latency percentiles, throughput, cache hit rates, queue depths.
+5. **Live introspection** — query engine state without restarting: active sessions, KV utilization, batch composition.
+
+### 31.2 Layered Architecture
+
+```
+┌─────────────────────────────────────────────────────┐
+│  Layer 4: Export                                     │
+│  Perfetto (.pftrace) │ Chrome JSON │ OTLP │ stdout  │
+├─────────────────────────────────────────────────────┤
+│  Layer 3: Aggregation                               │
+│  Metrics (counters, histograms) │ Span collector    │
+├─────────────────────────────────────────────────────┤
+│  Layer 2: Instrumentation                           │
+│  Trace spans │ Events │ Counters │ Flow events      │
+├─────────────────────────────────────────────────────┤
+│  Layer 1: Core                                      │
+│  tracing crate (Rust ecosystem standard)            │
+└─────────────────────────────────────────────────────┘
+```
+
+### 31.3 Instrumentation Points
+
+Every critical path gets a trace span:
+
+```rust
+/// Instrumented components and their span names.
+///
+/// Engine:
+///   engine.generate              — full generation request (root span)
+///   engine.prefill               — prompt encoding phase
+///   engine.decode_step           — single decode iteration
+///   engine.speculative_step      — draft + verify cycle
+///   engine.diffusion_step        — single denoising step
+///
+/// ORT:
+///   ort.session_run              — single ORT forward pass
+///   ort.io_binding_bind          — binding inputs/outputs
+///   ort.io_binding_run           — run with pre-bound tensors
+///
+/// KV Cache:
+///   kv.allocate_page             — page allocation
+///   kv.evict                     — page eviction (with reason)
+///   kv.fork                      — CoW fork
+///   kv.prefix_match              — prefix cache lookup (hit/miss)
+///   kv.offload                   — GPU→CPU offload
+///   kv.reload                    — CPU→GPU reload
+///
+/// Scheduler:
+///   scheduler.iteration          — one scheduling round
+///   scheduler.preempt            — preemption event
+///   scheduler.batch_compose      — batch assembly
+///
+/// Sampling:
+///   sampling.logit_process       — full processor chain
+///   sampling.grammar_mask        — grammar constraint application
+///   sampling.sample_token        — final token selection
+///
+/// Tool Use:
+///   tool.detect                  — tool call detection
+///   tool.parse                   — tool call JSON parsing
+///   tool.execute                 — tool execution (external)
+///   tool.resume                  — generation resume after tool result
+///
+/// Pipeline:
+///   pipeline.stage               — multi-model pipeline stage
+///   pipeline.dataflow_transfer   — tensor transfer between models
+///
+/// Server:
+///   http.request                 — full HTTP request lifecycle
+///   http.stream_chunk            — SSE chunk sent
+```
+
+### 31.4 Perfetto Trace Generation
+
+Perfetto uses the Chrome Trace Event Format (JSON) or its own protobuf format. We generate both:
+
+```rust
+/// Perfetto-compatible trace writer.
+pub struct PerfettoTracer {
+    /// Ring buffer of trace events (bounded memory).
+    events: RingBuffer<TraceEvent>,
+    /// Whether tracing is currently active.
+    active: AtomicBool,
+    /// Process/thread ID mapping.
+    thread_names: HashMap<u64, String>,
+    /// Counter tracks (GPU pages, batch size, queue depth, etc.).
+    counters: HashMap<String, CounterTrack>,
+}
+
+/// A single trace event (Chrome Trace Event Format).
+#[derive(Serialize)]
+pub struct TraceEvent {
+    /// Event name.
+    pub name: String,
+    /// Category (engine, ort, kv, scheduler, sampling, tool, http).
+    pub cat: String,
+    /// Phase: B(begin), E(end), X(complete), C(counter), i(instant), f/s/t(flow).
+    pub ph: char,
+    /// Timestamp in microseconds.
+    pub ts: u64,
+    /// Duration in microseconds (for ph=X complete events).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dur: Option<u64>,
+    /// Process ID.
+    pub pid: u64,
+    /// Thread ID.
+    pub tid: u64,
+    /// Custom arguments.
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    pub args: HashMap<String, serde_json::Value>,
+}
+
+impl PerfettoTracer {
+    /// Start recording trace events.
+    pub fn start(&self) {
+        self.active.store(true, Ordering::Release);
+    }
+    
+    /// Stop recording and export to file.
+    pub fn stop_and_export(&self, path: &Path, format: TraceFormat) -> Result<()> {
+        self.active.store(false, Ordering::Release);
+        match format {
+            TraceFormat::ChromeJson => self.export_chrome_json(path),
+            TraceFormat::Perfetto => self.export_perfetto_proto(path),
+        }
+    }
+}
+
+pub enum TraceFormat {
+    /// Chrome JSON trace (open in chrome://tracing or Perfetto UI).
+    ChromeJson,
+    /// Perfetto protobuf (.pftrace, open in ui.perfetto.dev).
+    Perfetto,
+}
+```
+
+### 31.5 What a Trace Looks Like
+
+```
+Time →
+┌─────────────────────────────────────────────────────────────────┐
+│ http.request (session=agent-3, 847ms)                           │
+│ ┌─────────────────────────────────────────────────────────────┐ │
+│ │ engine.generate (max_tokens=256)                            │ │
+│ │ ┌──────────┐                                                │ │
+│ │ │ prefill  │ 45ms, 1024 prompt tokens                      │ │
+│ │ │ ┌──────┐ │                                                │ │
+│ │ │ │ort.  │ │ 38ms, batch=1, tokens=1024                    │ │
+│ │ │ │run   │ │                                                │ │
+│ │ │ └──────┘ │                                                │ │
+│ │ └──────────┘                                                │ │
+│ │ ┌───┐┌───┐┌───┐┌───┐┌──────────────┐┌───┐┌───┐┌───┐       │ │
+│ │ │d.1││d.2││d.3││d.4││ tool.execute ││d.5││d.6││d.7│ ...   │ │
+│ │ │2ms││2ms││2ms││2ms││   120ms      ││2ms││2ms││2ms│       │ │
+│ │ └───┘└───┘└───┘└───┘└──────────────┘└───┘└───┘└───┘       │ │
+│ └─────────────────────────────────────────────────────────────┘ │
+│                                                                 │
+│ Counter: kv_pages_used ─────────────────────────                │
+│          ▁▂▃▄▅▅▅▅▅▅▅▅▅▅▅▆▆▆▆▆▆▇▇▇▇▇▇█████████                │
+│ Counter: batch_size    ─────────────────────────                │
+│          ▃▃▃▃▃▃▃▃▃▃▃▃▃▁▁▁▁▁▁▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃                │
+│ Counter: queue_depth   ─────────────────────────                │
+│          ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁                │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 31.6 Flow Events (Request Lifecycle Tracking)
+
+Track a request across async boundaries (scheduler queue → batch → forward pass → response):
+
+```rust
+/// Flow events connect spans across threads/async boundaries.
+/// Essential for seeing: "this request waited in queue 50ms, then got
+/// batched with 3 others, then forward pass took 12ms."
+
+// When request enters scheduler queue:
+tracer.flow_start("request_flow", request_id, "scheduler.enqueue");
+
+// When scheduler picks it for a batch:
+tracer.flow_step("request_flow", request_id, "scheduler.batch_assign");
+
+// When forward pass starts:
+tracer.flow_step("request_flow", request_id, "ort.session_run");
+
+// When token is sent back to client:
+tracer.flow_end("request_flow", request_id, "http.stream_chunk");
+```
+
+### 31.7 Counter Tracks
+
+Continuous metrics visualized as line charts in Perfetto:
+
+```rust
+/// Counters emitted every scheduling iteration.
+pub struct EngineCounters {
+    // Memory
+    pub kv_pages_used: u64,
+    pub kv_pages_total: u64,
+    pub kv_pages_shared: u64,       // prefix cache shared pages
+    pub kv_offloaded_pages: u64,    // pages on CPU
+    
+    // Throughput
+    pub tokens_generated_total: u64,
+    pub tokens_per_second: f64,     // rolling window
+    pub prefill_tokens_per_second: f64,
+    
+    // Batching
+    pub current_batch_size: u64,    // sequences in current batch
+    pub current_batch_tokens: u64,  // total tokens in current forward
+    pub queue_depth: u64,           // waiting requests
+    
+    // Sessions
+    pub active_sessions: u64,
+    pub paused_sessions: u64,       // waiting on tool results
+    
+    // Speculation
+    pub speculation_acceptance_rate: f64,
+    pub draft_tokens_per_step: f64,
+    
+    // Cache
+    pub prefix_cache_hit_rate: f64,
+    pub prefix_cache_entries: u64,
+    
+    // Grammar
+    pub grammar_mask_time_us: u64,  // time spent in grammar constraint
+}
+```
+
+### 31.8 Integration with `tracing` Crate
+
+Use Rust's `tracing` ecosystem as the instrumentation layer. Custom subscriber exports to Perfetto:
+
+```rust
+use tracing::{instrument, info_span, Span};
+use tracing_subscriber::Layer;
+
+/// Instrument a decode step with full context.
+#[instrument(
+    level = "debug",
+    skip(self, state),
+    fields(
+        session_id = %session_id,
+        step = step,
+        batch_size = batch_size,
+        tokens_in_batch = tokens_in_batch,
+    )
+)]
+pub fn decode_step(
+    &mut self,
+    session_id: SessionId,
+    step: usize,
+    batch_size: usize,
+    tokens_in_batch: usize,
+) -> Result<TokenId> {
+    // ORT forward pass (sub-span created automatically)
+    let logits = {
+        let _ort_span = info_span!("ort.session_run",
+            input_tokens = 1,
+            kv_length = self.kv_length(session_id),
+        ).entered();
+        self.session.run(&inputs)?
+    };
+    
+    // Logit processing
+    let token = {
+        let _sample_span = info_span!("sampling.logit_process",
+            chain_len = self.chain.len(),
+        ).entered();
+        self.chain.process(&mut logits, &context);
+        self.sampler.sample(&logits, &context)
+    };
+    
+    token
+}
+
+/// Custom tracing subscriber that collects spans into Perfetto format.
+pub struct PerfettoLayer {
+    tracer: Arc<PerfettoTracer>,
+}
+
+impl<S: tracing::Subscriber> Layer<S> for PerfettoLayer {
+    fn on_enter(&self, id: &span::Id, ctx: Context<'_, S>) {
+        // Record span begin event with timestamp
+    }
+    
+    fn on_exit(&self, id: &span::Id, ctx: Context<'_, S>) {
+        // Record span end event, compute duration
+    }
+    
+    fn on_event(&self, event: &tracing::Event<'_>, ctx: Context<'_, S>) {
+        // Record instant events (counters, markers)
+    }
+}
+```
+
+### 31.9 Structured Logging
+
+Every log line is structured JSON with trace context:
+
+```rust
+// What gets logged (structured, not printf):
+{
+    "timestamp": "2026-07-12T14:30:00.123Z",
+    "level": "INFO",
+    "target": "onnx_genai_engine::engine",
+    "span": "engine.generate",
+    "trace_id": "abc123",
+    "session_id": "agent-worker-3",
+    "fields": {
+        "event": "generation_complete",
+        "tokens_generated": 142,
+        "time_to_first_token_ms": 45,
+        "total_time_ms": 847,
+        "tokens_per_second": 167.6,
+        "finish_reason": "stop",
+        "cache_hit_tokens": 512,
+        "speculation_acceptance_rate": 0.82
+    }
+}
+```
+
+Log levels and what goes where:
+
+```
+ERROR — ORT failures, OOM, corruption (always on)
+WARN  — preemption, eviction, slow forward pass, fallback paths
+INFO  — request start/end, session lifecycle, config changes
+DEBUG — per-step decode, cache operations, scheduling decisions
+TRACE — per-token logits, individual processor timings, tensor shapes
+```
+
+### 31.10 Runtime Profiling Controls
+
+```rust
+/// Profiling can be started/stopped at runtime via HTTP API.
+/// No restart needed.
+
+// Start profiling:
+// POST /v1/debug/trace/start
+// { "duration_seconds": 30, "level": "debug" }
+
+// Stop and download trace:
+// POST /v1/debug/trace/stop
+// → Returns .pftrace file (open in ui.perfetto.dev)
+
+// Or via CLI:
+// onnx-genai profile --duration 30s --output trace.pftrace
+// onnx-genai profile --duration 10s --output trace.json --format chrome
+
+/// HTTP endpoints for runtime introspection.
+pub fn debug_routes() -> Router {
+    Router::new()
+        // Tracing
+        .route("/v1/debug/trace/start", post(start_trace))
+        .route("/v1/debug/trace/stop", post(stop_trace))
+        
+        // Live metrics
+        .route("/v1/debug/metrics", get(prometheus_metrics))
+        .route("/v1/debug/counters", get(live_counters))
+        
+        // Engine state
+        .route("/v1/debug/sessions", get(list_sessions))
+        .route("/v1/debug/kv", get(kv_cache_state))
+        .route("/v1/debug/scheduler", get(scheduler_state))
+        .route("/v1/debug/batch", get(current_batch_info))
+        
+        // Log level control
+        .route("/v1/debug/log-level", put(set_log_level))
+}
+```
+
+### 31.11 ORT-Level Profiling Integration
+
+ORT has its own profiling support. We wire it in:
+
+```rust
+/// Enable ORT's built-in profiling and merge with our traces.
+pub struct OrtProfilingBridge {
+    /// ORT profiling output path.
+    ort_profile_path: PathBuf,
+}
+
+impl OrtProfilingBridge {
+    /// Enable ORT profiling on session options.
+    pub fn enable(&self, options: &mut SessionOptions) {
+        // ORT_ENABLE_PROFILING env var or API call
+        // ORT outputs its own Chrome trace JSON with kernel-level timing
+    }
+    
+    /// Merge ORT's trace with our engine trace.
+    /// ORT trace has: kernel execution, memory allocation, EP selection.
+    /// Our trace has: scheduling, KV cache, sampling, tool use.
+    /// Combined = full picture from HTTP request to GPU kernel.
+    pub fn merge_traces(
+        engine_trace: &Path,
+        ort_trace: &Path,
+        output: &Path,
+    ) -> Result<()> {
+        // Align timestamps, merge into single Perfetto trace
+        ...
+    }
+}
+```
+
+### 31.12 Prometheus / OpenTelemetry Metrics
+
+```rust
+/// Prometheus metrics for production monitoring.
+/// Exposed at GET /v1/debug/metrics
+///
+/// # HELP onnx_genai_requests_total Total generation requests
+/// # TYPE onnx_genai_requests_total counter
+/// onnx_genai_requests_total{status="success"} 1234
+/// onnx_genai_requests_total{status="error"} 5
+///
+/// # HELP onnx_genai_time_to_first_token_seconds TTFT histogram
+/// # TYPE onnx_genai_time_to_first_token_seconds histogram
+/// onnx_genai_time_to_first_token_seconds_bucket{le="0.05"} 800
+/// onnx_genai_time_to_first_token_seconds_bucket{le="0.1"} 1100
+///
+/// # HELP onnx_genai_tokens_per_second Current generation throughput
+/// # TYPE onnx_genai_tokens_per_second gauge
+/// onnx_genai_tokens_per_second 167.6
+///
+/// # HELP onnx_genai_kv_pages_used Current KV cache page utilization
+/// # TYPE onnx_genai_kv_pages_used gauge
+/// onnx_genai_kv_pages_used 1847
+///
+/// Key metrics:
+/// - onnx_genai_requests_total (counter, by status)
+/// - onnx_genai_time_to_first_token_seconds (histogram)
+/// - onnx_genai_inter_token_latency_seconds (histogram)
+/// - onnx_genai_tokens_per_second (gauge)
+/// - onnx_genai_tokens_generated_total (counter)
+/// - onnx_genai_kv_pages_used (gauge)
+/// - onnx_genai_kv_pages_total (gauge)
+/// - onnx_genai_kv_evictions_total (counter, by reason)
+/// - onnx_genai_kv_prefix_cache_hit_rate (gauge)
+/// - onnx_genai_batch_size (histogram)
+/// - onnx_genai_queue_depth (gauge)
+/// - onnx_genai_queue_wait_seconds (histogram)
+/// - onnx_genai_active_sessions (gauge, by priority)
+/// - onnx_genai_speculation_acceptance_rate (gauge)
+/// - onnx_genai_grammar_mask_seconds (histogram)
+/// - onnx_genai_preemptions_total (counter)
+/// - onnx_genai_ort_forward_seconds (histogram, by model)
+```
+
+### 31.13 Zero-Cost When Off
+
+```rust
+/// All instrumentation compiles to nothing when disabled.
+/// 
+/// Release build with default features:
+///   - Structured logging: always on (INFO level, minimal overhead)
+///   - Perfetto tracing: compiled in but inactive (atomic bool check only)
+///   - Prometheus metrics: compiled in, near-zero cost (atomic counters)
+///   - Debug endpoints: compiled in, no cost unless called
+///
+/// Release build with `--no-default-features`:
+///   - Everything stripped via cfg
+
+#[cfg(feature = "tracing")]
+macro_rules! trace_span {
+    ($name:expr, $($field:tt)*) => {
+        tracing::info_span!($name, $($field)*)
+    };
+}
+
+#[cfg(not(feature = "tracing"))]
+macro_rules! trace_span {
+    ($name:expr, $($field:tt)*) => {
+        // Compiles to nothing
+    };
+}
+```
+
+### 31.14 Feature Flags
+
+```toml
+[features]
+default = ["logging", "metrics", "tracing"]
+
+# Structured logging (tracing crate)
+logging = ["tracing", "tracing-subscriber"]
+
+# Prometheus metrics
+metrics = ["prometheus-client"]
+
+# Perfetto trace generation
+tracing = ["tracing", "tracing-subscriber"]
+perfetto = ["tracing", "prost"]  # protobuf for native .pftrace format
+
+# OpenTelemetry export
+otel = ["opentelemetry", "opentelemetry-otlp", "tracing-opentelemetry"]
+
+# Debug HTTP endpoints (/v1/debug/*)
+debug-endpoints = []
+```
+
+### 31.15 Configuration
+
+```yaml
+# server_config.yaml
+observability:
+  logging:
+    level: info           # error/warn/info/debug/trace
+    format: json          # json or pretty (for development)
+    output: stderr        # stderr, stdout, or file path
+    
+  metrics:
+    enabled: true
+    endpoint: /v1/debug/metrics
+    
+  tracing:
+    enabled: false        # off by default, start via API
+    buffer_size: 1000000  # max events in ring buffer
+    default_level: debug  # what to capture when tracing is active
+    
+  profiling:
+    ort_profiling: false       # enable ORT's built-in profiling
+    merge_ort_traces: true     # auto-merge ORT + engine traces
+```
