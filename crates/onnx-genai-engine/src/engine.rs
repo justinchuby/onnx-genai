@@ -15,7 +15,7 @@ use onnx_genai_ort::{
 };
 use onnx_genai_scheduler::{Priority, Scheduler, SchedulerConfig};
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Identifier for a persistent generation session.
 pub type SessionId = SequenceId;
@@ -29,6 +29,10 @@ pub struct EngineConfig {
     pub page_size: usize,
     /// Scheduler config.
     pub scheduler: SchedulerConfig,
+    /// Optional draft model directory used for greedy speculative decoding.
+    pub draft_model: Option<PathBuf>,
+    /// Number of draft tokens proposed per speculative step.
+    pub num_speculative_tokens: usize,
 }
 
 impl Default for EngineConfig {
@@ -37,6 +41,8 @@ impl Default for EngineConfig {
             num_gpu_pages: 1024,
             page_size: 16,
             scheduler: SchedulerConfig::default(),
+            draft_model: None,
+            num_speculative_tokens: 4,
         }
     }
 }
@@ -92,6 +98,8 @@ pub struct GenerateOptions {
     /// Optional maximum total context length (prompt + generated tokens).
     /// Used when model metadata does not declare `model.max_sequence_length`.
     pub max_context: Option<usize>,
+    /// Optional per-request override for speculative draft width K.
+    pub num_speculative_tokens: Option<usize>,
 }
 
 impl Default for GenerateOptions {
@@ -107,6 +115,7 @@ impl Default for GenerateOptions {
             eos_token_id: None,
             stop_on_eos: true,
             max_context: None,
+            num_speculative_tokens: None,
         }
     }
 }
@@ -127,6 +136,9 @@ impl GenerateOptions {
         }
         if self.max_context == Some(0) {
             anyhow::bail!("max_context must be greater than zero when provided");
+        }
+        if self.num_speculative_tokens == Some(0) {
+            anyhow::bail!("num_speculative_tokens must be greater than zero when provided");
         }
         Ok(())
     }
@@ -205,8 +217,12 @@ pub struct Engine {
     _environment: Environment,
     /// ORT session for decoder execution.
     session: Session,
+    /// Optional draft model used by the speculative decoding path.
+    draft: Option<DraftModel>,
     /// Tokenizer loaded from the model directory.
     tokenizer: Tokenizer,
+    /// Default speculative draft width K.
+    num_speculative_tokens: usize,
 }
 
 impl Engine {
@@ -253,6 +269,29 @@ impl Engine {
         let tokenizer = Tokenizer::from_file(&model_directory.tokenizer_path)
             .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {}", e))?;
         let kv_model = infer_kv_model_info(&session, config.page_size)?;
+        let draft = if let Some(draft_model_path) = &config.draft_model {
+            let draft_directory = ModelDirectory::load(draft_model_path)
+                .map_err(|e| anyhow::anyhow!("Failed to resolve draft model directory: {}", e))?;
+            let draft_session = Session::new(
+                &environment,
+                &draft_directory.model_path,
+                SessionOptions::default(),
+            )
+            .map_err(|e| anyhow::anyhow!("Failed to load draft ORT session: {}", e))?;
+            let draft_kv_model = infer_kv_model_info(&draft_session, config.page_size)?;
+            let draft_kv_cache = if let Some(kv_model) = &draft_kv_model {
+                PagedKvCache::new_with_tensor_config(kv_model.tensor_config, config.num_gpu_pages)
+            } else {
+                PagedKvCache::new(config.page_size, config.num_gpu_pages)
+            };
+            Some(DraftModel {
+                session: draft_session,
+                kv_model: draft_kv_model,
+                kv_cache: draft_kv_cache,
+            })
+        } else {
+            None
+        };
         let kv_cache = if let Some(kv_model) = &kv_model {
             // The paged tensor layout is derived from present-KV outputs: each
             // layer has key/value tensors shaped like [batch, kv_heads, seq, head_dim].
@@ -270,7 +309,9 @@ impl Engine {
             sessions: HashMap::new(),
             _environment: environment,
             session,
+            draft,
             tokenizer,
+            num_speculative_tokens: config.num_speculative_tokens.max(1),
         })
     }
 
@@ -359,6 +400,20 @@ impl Engine {
             self.prepare_session_prefix(session_id, &mut state, &prompt_tokens)?;
 
         let result = (|| -> anyhow::Result<GenerateResult> {
+            if self.should_use_speculative(&options) {
+                return self.generate_speculative_loop(
+                    session_id,
+                    &mut state,
+                    &options,
+                    &chain,
+                    max_context,
+                    prefix_cache_hit_len,
+                    &mut generated_tokens,
+                    &mut generated_text,
+                    callback.as_deref_mut(),
+                );
+            }
+
             for step in 0..options.max_new_tokens {
                 if reached_context_limit(state.tokens.len(), max_context) {
                     return Ok(GenerateResult {
@@ -442,10 +497,21 @@ impl Engine {
     pub fn create_session(&mut self) -> anyhow::Result<SessionId> {
         let decode_state = DecodeState::new(&self.session)?;
         let id = self.kv_cache.create_sequence();
+        let draft = if let Some(draft_model) = &mut self.draft {
+            Some(DraftSession {
+                seq: draft_model.kv_cache.create_sequence(),
+                tokens: Vec::new(),
+                kv_token_count: 0,
+                decode_state: DecodeState::new(&draft_model.session)?,
+            })
+        } else {
+            None
+        };
         let state = EngineSession {
             tokens: Vec::new(),
             kv_token_count: 0,
             decode_state,
+            draft,
         };
         self.sessions.insert(id, state);
         Ok(id)
@@ -468,18 +534,35 @@ impl Engine {
         state.tokens.clear();
         state.kv_token_count = 0;
         state.decode_state = DecodeState::new(&self.session)?;
+        if let (Some(draft_model), Some(draft)) = (&mut self.draft, &mut state.draft) {
+            draft_model
+                .kv_cache
+                .remove(draft.seq)
+                .map_err(|e| anyhow::anyhow!("Failed to reset draft KV sequence: {}", e))?;
+            draft.seq = draft_model.kv_cache.create_sequence();
+            draft.tokens.clear();
+            draft.kv_token_count = 0;
+            draft.decode_state = DecodeState::new(&draft_model.session)?;
+        }
         Ok(())
     }
 
     /// Close a persistent session and free its associated state.
     pub fn close_session(&mut self, session_id: SessionId) -> anyhow::Result<()> {
         self.scheduler.complete(session_id);
-        self.sessions
+        let state = self
+            .sessions
             .remove(&session_id)
             .with_context(|| format!("session {session_id} not found"))?;
         self.kv_cache
             .remove(session_id)
             .map_err(|e| anyhow::anyhow!("Failed to remove KV sequence {session_id}: {}", e))?;
+        if let (Some(draft_model), Some(draft)) = (&mut self.draft, state.draft) {
+            draft_model
+                .kv_cache
+                .remove(draft.seq)
+                .map_err(|e| anyhow::anyhow!("Failed to remove draft KV sequence: {}", e))?;
+        }
         Ok(())
     }
 
@@ -642,6 +725,297 @@ impl Engine {
             .insert_pages(tokens, &page_ids, &mut self.kv_cache.page_table);
         Ok(())
     }
+
+    fn should_use_speculative(&self, options: &GenerateOptions) -> bool {
+        self.draft.is_some()
+            && (options.greedy || options.temperature == 0.0)
+            && options
+                .num_speculative_tokens
+                .unwrap_or(self.num_speculative_tokens)
+                > 0
+            && self.kv_model.is_some()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn generate_speculative_loop(
+        &mut self,
+        session_id: SessionId,
+        state: &mut EngineSession,
+        options: &GenerateOptions,
+        chain: &ProcessorChain,
+        max_context: Option<usize>,
+        prefix_cache_hit_len: usize,
+        generated_tokens: &mut Vec<TokenId>,
+        generated_text: &mut String,
+        mut callback: Option<&mut GenerateTokenCallback<'_>>,
+    ) -> anyhow::Result<GenerateResult> {
+        let draft_width = options
+            .num_speculative_tokens
+            .unwrap_or(self.num_speculative_tokens)
+            .max(1);
+        let mut step = 0;
+
+        loop {
+            if generated_tokens.len() >= options.max_new_tokens {
+                return self.finish_result(
+                    generated_tokens,
+                    FinishReason::MaxTokens,
+                    prefix_cache_hit_len,
+                );
+            }
+            if reached_context_limit(state.tokens.len(), max_context) {
+                return self.finish_result(
+                    generated_tokens,
+                    FinishReason::Length,
+                    prefix_cache_hit_len,
+                );
+            }
+
+            let remaining_tokens = options.max_new_tokens - generated_tokens.len();
+            let remaining_context = max_context
+                .map(|limit| limit.saturating_sub(state.tokens.len()))
+                .unwrap_or(remaining_tokens);
+            let width = draft_width
+                .min(remaining_tokens)
+                .min(remaining_context)
+                .max(1);
+
+            let base_len = state.tokens.len();
+            let base_generated_len = generated_tokens.len();
+            let mut base_logits = next_session_token_logits(
+                &self.session,
+                self.kv_model.as_ref(),
+                &mut self.kv_cache,
+                session_id,
+                state,
+            )?;
+
+            let draft_tokens = {
+                let draft_model = self
+                    .draft
+                    .as_mut()
+                    .context("speculative decoding requested without a draft model")?;
+                let draft_state = state
+                    .draft
+                    .as_mut()
+                    .context("speculative session missing draft state")?;
+                draft_state.tokens = state.tokens[..base_len].to_vec();
+                if draft_state.kv_token_count > base_len {
+                    rewind_draft_state_to_len(draft_model, draft_state, base_len)?;
+                }
+                propose_draft_tokens(
+                    draft_model,
+                    draft_state,
+                    width,
+                    generated_tokens,
+                    generated_text,
+                    step,
+                    options,
+                    chain,
+                )?
+            };
+
+            state.tokens.extend_from_slice(&draft_tokens);
+            let outputs = run_decode_step(
+                &self.session,
+                &mut state.decode_state,
+                &draft_tokens,
+                base_len,
+            )?;
+            if state.decode_state.use_kv {
+                if let Some(kv_model) = &self.kv_model {
+                    mirror_present_kv_to_pages(
+                        &self.session,
+                        kv_model,
+                        &mut self.kv_cache,
+                        session_id,
+                        &outputs,
+                        base_len,
+                        draft_tokens.len(),
+                    )?;
+                } else {
+                    self.kv_cache
+                        .append(session_id, draft_tokens.len())
+                        .map_err(|e| {
+                            anyhow::anyhow!("Failed to advance KV sequence {session_id}: {}", e)
+                        })?;
+                }
+                state.kv_token_count += draft_tokens.len();
+            }
+
+            let mut target_logits = Vec::with_capacity(draft_tokens.len() + 1);
+            target_logits.push(std::mem::take(&mut base_logits));
+            target_logits.extend(extract_logits_sequence(&self.session, outputs)?);
+
+            let mut accepted = 0;
+            let mut replacement = None;
+            for idx in 0..draft_tokens.len() {
+                let mut context = ProcessorContext {
+                    prompt_tokens: state.tokens[..base_len].to_vec(),
+                    generated_tokens: generated_tokens
+                        .iter()
+                        .copied()
+                        .chain(draft_tokens[..idx].iter().copied())
+                        .collect(),
+                    generated_text: self
+                        .tokenizer
+                        .decode(
+                            &generated_tokens
+                                .iter()
+                                .copied()
+                                .chain(draft_tokens[..idx].iter().copied())
+                                .collect::<Vec<_>>(),
+                        )
+                        .map_err(|e| {
+                            anyhow::anyhow!("Failed to detokenize speculative context: {}", e)
+                        })?,
+                    step: step + idx,
+                };
+                let target_token =
+                    select_next_token(&mut target_logits[idx], &context, options, chain, 0.0);
+                if target_token == draft_tokens[idx] {
+                    accepted += 1;
+                } else {
+                    replacement = Some(target_token);
+                    context.generated_tokens.push(target_token);
+                    break;
+                }
+            }
+
+            let mut commit_tokens = draft_tokens[..accepted].to_vec();
+            let rewind_len = base_len + accepted;
+            rewind_target_state_to_len(
+                &self.session,
+                self.kv_model.as_ref(),
+                &mut self.kv_cache,
+                session_id,
+                state,
+                rewind_len,
+            )?;
+
+            if let Some(token) = replacement {
+                commit_tokens.push(token);
+            } else if generated_tokens.len() + commit_tokens.len() < options.max_new_tokens
+                && !reached_context_limit(base_len + commit_tokens.len(), max_context)
+            {
+                let mut context = ProcessorContext {
+                    prompt_tokens: state.tokens[..base_len].to_vec(),
+                    generated_tokens: generated_tokens
+                        .iter()
+                        .copied()
+                        .chain(draft_tokens.iter().copied())
+                        .collect(),
+                    generated_text: self
+                        .tokenizer
+                        .decode(
+                            &generated_tokens
+                                .iter()
+                                .copied()
+                                .chain(draft_tokens.iter().copied())
+                                .collect::<Vec<_>>(),
+                        )
+                        .map_err(|e| {
+                            anyhow::anyhow!("Failed to detokenize speculative context: {}", e)
+                        })?,
+                    step: step + draft_tokens.len(),
+                };
+                let token = select_next_token(
+                    target_logits
+                        .last_mut()
+                        .context("target verification did not produce next-token logits")?,
+                    &context,
+                    options,
+                    chain,
+                    0.0,
+                );
+                context.generated_tokens.push(token);
+                commit_tokens.push(token);
+            }
+
+            for (commit_idx, token_id) in commit_tokens.into_iter().enumerate() {
+                if generated_tokens.len() >= options.max_new_tokens
+                    || (commit_idx >= accepted
+                        && reached_context_limit(state.tokens.len(), max_context))
+                {
+                    break;
+                }
+                generated_tokens.push(token_id);
+                if commit_idx >= accepted {
+                    state.tokens.push(token_id);
+                }
+                self.scheduler.advance(session_id);
+                let token_text = self
+                    .tokenizer
+                    .decode(&[token_id])
+                    .map_err(|e| anyhow::anyhow!("Failed to detokenize token {token_id}: {}", e))?;
+                generated_text.push_str(&token_text);
+                let context = ProcessorContext {
+                    prompt_tokens: state.tokens[..base_len.min(state.tokens.len())].to_vec(),
+                    generated_tokens: generated_tokens.clone(),
+                    generated_text: generated_text.clone(),
+                    step,
+                };
+                let finish_reason = finish_reason_after_token(token_id, options, chain, &context);
+                if let Some(callback) = callback.as_deref_mut() {
+                    callback(GenerateToken {
+                        token_id,
+                        text: token_text,
+                        finish_reason: finish_reason.clone(),
+                    })?;
+                }
+                step += 1;
+                if let Some(finish_reason) = finish_reason {
+                    trim_overmaterialized_target_kv(
+                        &self.session,
+                        self.kv_model.as_ref(),
+                        &mut self.kv_cache,
+                        session_id,
+                        state,
+                    )?;
+                    self.sync_draft_to_target(state)?;
+                    return self.finish_result(
+                        generated_tokens,
+                        finish_reason,
+                        prefix_cache_hit_len,
+                    );
+                }
+            }
+
+            self.sync_draft_to_target(state)?;
+
+            if generated_tokens.len() == base_generated_len {
+                anyhow::bail!("speculative decoding made no progress");
+            }
+        }
+    }
+
+    fn sync_draft_to_target(&mut self, state: &mut EngineSession) -> anyhow::Result<()> {
+        if let (Some(draft_model), Some(draft_state)) = (&mut self.draft, &mut state.draft) {
+            let target_len = state.tokens.len();
+            if draft_state.kv_token_count > target_len {
+                rewind_draft_state_to_len(draft_model, draft_state, target_len)?;
+            }
+            draft_state.tokens = state.tokens.clone();
+        }
+        Ok(())
+    }
+
+    fn finish_result(
+        &self,
+        generated_tokens: &[TokenId],
+        finish_reason: FinishReason,
+        prefix_cache_hit_len: usize,
+    ) -> anyhow::Result<GenerateResult> {
+        Ok(GenerateResult {
+            text: self
+                .tokenizer
+                .decode(generated_tokens)
+                .map_err(|e| anyhow::anyhow!("Failed to detokenize generated tokens: {}", e))?,
+            token_ids: generated_tokens.to_vec(),
+            finish_reason,
+            prefix_cache_hit_len,
+        })
+    }
 }
 
 struct EngineSession {
@@ -650,6 +1024,21 @@ struct EngineSession {
     /// Prefix length currently materialized in `decode_state.past`.
     kv_token_count: usize,
     /// ORT-managed past tensors retained between calls.
+    decode_state: DecodeState,
+    /// Optional draft-model state aligned to this target sequence.
+    draft: Option<DraftSession>,
+}
+
+struct DraftModel {
+    session: Session,
+    kv_model: Option<KvModelInfo>,
+    kv_cache: PagedKvCache,
+}
+
+struct DraftSession {
+    seq: SessionId,
+    tokens: Vec<TokenId>,
+    kv_token_count: usize,
     decode_state: DecodeState,
 }
 
@@ -750,6 +1139,77 @@ fn next_session_token_logits(
     extract_next_token_logits(session, outputs)
 }
 
+fn next_draft_token_logits(
+    draft_model: &mut DraftModel,
+    draft_state: &mut DraftSession,
+) -> anyhow::Result<Vec<f32>> {
+    let (input_tokens, past_len) = draft_decode_input_tokens(draft_state)?;
+    let input_len = input_tokens.len();
+    let outputs = run_decode_step(
+        &draft_model.session,
+        &mut draft_state.decode_state,
+        &input_tokens,
+        past_len,
+    )?;
+    if draft_state.decode_state.use_kv {
+        if let Some(kv_model) = &draft_model.kv_model {
+            mirror_present_kv_to_pages(
+                &draft_model.session,
+                kv_model,
+                &mut draft_model.kv_cache,
+                draft_state.seq,
+                &outputs,
+                past_len,
+                input_len,
+            )?;
+        } else {
+            draft_model
+                .kv_cache
+                .append(draft_state.seq, input_len)
+                .map_err(|e| anyhow::anyhow!("Failed to advance draft KV sequence: {}", e))?;
+        }
+        draft_state.kv_token_count += input_len;
+    }
+    extract_next_token_logits(&draft_model.session, outputs)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn propose_draft_tokens(
+    draft_model: &mut DraftModel,
+    draft_state: &mut DraftSession,
+    width: usize,
+    generated_tokens: &[TokenId],
+    generated_text: &str,
+    first_step: usize,
+    options: &GenerateOptions,
+    chain: &ProcessorChain,
+) -> anyhow::Result<Vec<TokenId>> {
+    let prompt_len = draft_state
+        .tokens
+        .len()
+        .saturating_sub(generated_tokens.len());
+    let mut proposed = Vec::with_capacity(width);
+    let mut draft_generated = generated_tokens.to_vec();
+    let mut draft_text = generated_text.to_string();
+
+    for offset in 0..width {
+        let mut logits = next_draft_token_logits(draft_model, draft_state)?;
+        let context = ProcessorContext {
+            prompt_tokens: draft_state.tokens[..prompt_len.min(draft_state.tokens.len())].to_vec(),
+            generated_tokens: draft_generated.clone(),
+            generated_text: draft_text.clone(),
+            step: first_step + offset,
+        };
+        let token = select_next_token(&mut logits, &context, options, chain, 0.0);
+        proposed.push(token);
+        draft_generated.push(token);
+        draft_state.tokens.push(token);
+        draft_text.clear();
+    }
+
+    Ok(proposed)
+}
+
 fn session_decode_input_tokens(state: &EngineSession) -> anyhow::Result<(Vec<TokenId>, usize)> {
     if state.decode_state.use_kv {
         if state.kv_token_count > state.tokens.len() {
@@ -767,6 +1227,28 @@ fn session_decode_input_tokens(state: &EngineSession) -> anyhow::Result<(Vec<Tok
     } else {
         if state.tokens.is_empty() {
             anyhow::bail!("decode step requires at least one context token");
+        }
+        Ok((state.tokens.clone(), 0))
+    }
+}
+
+fn draft_decode_input_tokens(state: &DraftSession) -> anyhow::Result<(Vec<TokenId>, usize)> {
+    if state.decode_state.use_kv {
+        if state.kv_token_count > state.tokens.len() {
+            anyhow::bail!(
+                "draft KV token count {} exceeds logical context length {}",
+                state.kv_token_count,
+                state.tokens.len()
+            );
+        }
+        let input_tokens = state.tokens[state.kv_token_count..].to_vec();
+        if input_tokens.is_empty() {
+            anyhow::bail!("draft decode step has no new token to feed");
+        }
+        Ok((input_tokens, state.kv_token_count))
+    } else {
+        if state.tokens.is_empty() {
+            anyhow::bail!("draft decode step requires at least one context token");
         }
         Ok((state.tokens.clone(), 0))
     }
@@ -1132,6 +1614,90 @@ fn attach_pages_to_sequence(
     Ok(())
 }
 
+fn rewind_target_state_to_len(
+    session: &Session,
+    kv_model: Option<&KvModelInfo>,
+    kv_cache: &mut PagedKvCache,
+    seq: SessionId,
+    state: &mut EngineSession,
+    len: usize,
+) -> anyhow::Result<()> {
+    state.tokens.truncate(len);
+    rewind_decode_state_to_len(
+        session,
+        kv_model,
+        kv_cache,
+        seq,
+        &mut state.decode_state,
+        &mut state.kv_token_count,
+        len,
+    )
+}
+
+fn trim_overmaterialized_target_kv(
+    session: &Session,
+    kv_model: Option<&KvModelInfo>,
+    kv_cache: &mut PagedKvCache,
+    seq: SessionId,
+    state: &mut EngineSession,
+) -> anyhow::Result<()> {
+    if state.kv_token_count > state.tokens.len() {
+        rewind_target_state_to_len(session, kv_model, kv_cache, seq, state, state.tokens.len())?;
+    }
+    Ok(())
+}
+
+fn rewind_draft_state_to_len(
+    draft_model: &mut DraftModel,
+    state: &mut DraftSession,
+    len: usize,
+) -> anyhow::Result<()> {
+    state.tokens.truncate(len);
+    rewind_decode_state_to_len(
+        &draft_model.session,
+        draft_model.kv_model.as_ref(),
+        &mut draft_model.kv_cache,
+        state.seq,
+        &mut state.decode_state,
+        &mut state.kv_token_count,
+        len,
+    )
+}
+
+fn rewind_decode_state_to_len(
+    session: &Session,
+    kv_model: Option<&KvModelInfo>,
+    kv_cache: &mut PagedKvCache,
+    seq: SessionId,
+    decode_state: &mut DecodeState,
+    kv_token_count: &mut usize,
+    len: usize,
+) -> anyhow::Result<()> {
+    if !decode_state.use_kv {
+        *kv_token_count = 0;
+        return Ok(());
+    }
+    if *kv_token_count == len {
+        return Ok(());
+    }
+    if kv_model.is_none() && *kv_token_count != len {
+        anyhow::bail!("cannot rewind ORT KV tensors without paged KV materialization");
+    }
+    kv_cache
+        .rewind_to(seq, len)
+        .map_err(|e| anyhow::anyhow!("Failed to rewind KV sequence {seq} to {len}: {}", e))?;
+    *kv_token_count = len;
+    if len == 0 {
+        decode_state.past.clear();
+        return Ok(());
+    }
+    let kv_model = kv_model.context("missing KV model after rewind check")?;
+    let materialized = kv_cache
+        .materialize_sequence(seq)
+        .map_err(|e| anyhow::anyhow!("Failed to materialize rewound KV sequence {seq}: {}", e))?;
+    load_materialized_past(session, kv_model, decode_state, &materialized)
+}
+
 fn sequence_pages_for_len(
     kv_cache: &PagedKvCache,
     seq: SessionId,
@@ -1229,6 +1795,51 @@ fn extract_next_token_logits(session: &Session, outputs: Vec<Value>) -> anyhow::
             let vocab = *vocab as usize;
             let start = (*seq as usize - 1) * vocab;
             Ok(data[start..start + vocab].to_vec())
+        }
+        other => anyhow::bail!("unsupported logits tensor shape: {:?}", other),
+    }
+}
+
+fn extract_logits_sequence(
+    session: &Session,
+    outputs: Vec<Value>,
+) -> anyhow::Result<Vec<Vec<f32>>> {
+    let logits_index = session
+        .output_names()
+        .iter()
+        .position(|name| name == "logits")
+        .or_else(|| {
+            session
+                .output_names()
+                .iter()
+                .position(|name| name.to_ascii_lowercase().contains("logits"))
+        })
+        .context("model did not expose a logits output")?;
+    let logits = outputs
+        .get(logits_index)
+        .context("logits output index was out of range")?;
+    let shape = logits.shape();
+    let data = logits
+        .to_vec_f32()
+        .map_err(|e| anyhow::anyhow!("Failed to read logits tensor: {}", e))?;
+
+    match shape {
+        [vocab] if *vocab > 0 => Ok(vec![data]),
+        [seq, vocab] if *seq > 0 && *vocab > 0 => {
+            let vocab = *vocab as usize;
+            Ok(data
+                .chunks(vocab)
+                .take(*seq as usize)
+                .map(|chunk| chunk.to_vec())
+                .collect())
+        }
+        [batch, seq, vocab] if *batch > 0 && *seq > 0 && *vocab > 0 => {
+            let vocab = *vocab as usize;
+            Ok(data
+                .chunks(vocab)
+                .take(*seq as usize)
+                .map(|chunk| chunk.to_vec())
+                .collect())
         }
         other => anyhow::bail!("unsupported logits tensor shape: {:?}", other),
     }
@@ -1516,6 +2127,39 @@ mod tests {
     }
 
     #[test]
+    fn tiny_fixture_speculative_matches_plain_greedy_with_k_gt_one() -> anyhow::Result<()> {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/tiny-llm")
+            .canonicalize()?;
+        let mut baseline = Engine::from_dir(&fixture, EngineConfig::default())?;
+        let mut speculative = Engine::from_dir(
+            &fixture,
+            EngineConfig {
+                draft_model: Some(fixture.clone()),
+                num_speculative_tokens: 3,
+                ..Default::default()
+            },
+        )?;
+
+        let mut request = GenerateRequest::new("hello");
+        request.options.max_new_tokens = 6;
+        request.options.temperature = 0.0;
+        request.options.stop_on_eos = false;
+        request.options.num_speculative_tokens = Some(3);
+
+        let baseline_result = baseline.generate(request.clone())?;
+        let speculative_result = speculative.generate(request)?;
+
+        assert_eq!(speculative_result.token_ids, baseline_result.token_ids);
+        assert_eq!(
+            speculative_result.finish_reason,
+            baseline_result.finish_reason
+        );
+        assert_eq!(speculative_result.token_ids.len(), 6);
+        Ok(())
+    }
+
+    #[test]
     fn tiny_fixture_stops_at_explicit_context_length_without_ort_error() -> anyhow::Result<()> {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../tests/fixtures/tiny-llm")
@@ -1536,8 +2180,8 @@ mod tests {
     }
 
     #[test]
-    fn tiny_fixture_session_stops_at_explicit_context_length_without_ort_error()
-    -> anyhow::Result<()> {
+    fn tiny_fixture_session_stops_at_explicit_context_length_without_ort_error(
+    ) -> anyhow::Result<()> {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../tests/fixtures/tiny-llm")
             .canonicalize()?;
