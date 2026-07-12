@@ -922,7 +922,10 @@ impl DecodeLoopBackend for SessionDecodeLoopBackend<'_> {
 mod tests {
     use super::*;
     use crate::logits::ProcessorContext;
-    use crate::processors::{finish_reason_after_token, select_next_token};
+    use crate::processors::{
+        finish_reason_after_token, select_next_token, select_next_token_with_sampler,
+    };
+    use crate::sampling::Sampler;
 
     #[test]
     fn processor_chain_uses_documented_order() {
@@ -1019,6 +1022,37 @@ mod tests {
             select_next_token(&mut logits, &context, &options, &chain, 0.75),
             1
         );
+    }
+
+    struct LastTokenSampler;
+
+    impl Sampler for LastTokenSampler {
+        fn sample(&mut self, logits: &[f32], _context: &ProcessorContext) -> TokenId {
+            logits.len().saturating_sub(1) as TokenId
+        }
+
+        fn name(&self) -> &str {
+            "last_token"
+        }
+    }
+
+    #[test]
+    fn custom_sampler_can_select_after_default_processors() {
+        let options = GenerateOptions {
+            top_k: 2,
+            ..Default::default()
+        };
+        let chain = build_processor_chain(&options, None).unwrap();
+        let context = ProcessorContext::default();
+        let mut logits = vec![0.0, 2.0, 4.0, 3.0];
+        let mut sampler = LastTokenSampler;
+
+        assert_eq!(
+            select_next_token_with_sampler(&mut logits, &context, &chain, &mut sampler),
+            3
+        );
+        assert_eq!(logits[0], f32::NEG_INFINITY);
+        assert_eq!(logits[1], f32::NEG_INFINITY);
     }
 
     #[test]

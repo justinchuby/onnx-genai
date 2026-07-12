@@ -10,6 +10,24 @@
 //! the next draft round. Rejected draft tokens never leak into subsequent
 //! decoding state.
 
+use crate::TokenId;
+use crate::decode::{
+    extract_logits_sequence, next_session_token_logits, propose_draft_tokens,
+    run_decode_session_logits, run_decode_step,
+};
+use crate::decode_loop::{DecodeLoopState, commit_selected_token, reached_context_limit};
+use crate::engine::Engine;
+use crate::kv_bridge::{
+    common_prefix_len, mirror_present_kv_to_pages, rewind_draft_state_to_len,
+    rewind_target_state_to_len, trim_overmaterialized_target_kv,
+};
+use crate::logits::{ProcessorChain, ProcessorContext};
+use crate::processors::{ensure_constrained_finish, select_next_token};
+use crate::session::{DraftModel, DraftSession, EngineSession};
+use crate::{FinishReason, GenerateOptions, GenerateResult, GenerateTokenCallback, SessionId};
+use anyhow::Context;
+use onnx_genai_kv::KvCacheOps;
+
 /// Speculative acceptance rule implemented by the Phase 3 engine path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AcceptanceRule {
@@ -26,23 +44,116 @@ pub struct GreedyStep {
     pub fully_accepted: bool,
 }
 
-use crate::TokenId;
-use crate::decode::{
-    extract_logits_sequence, next_session_token_logits, propose_draft_tokens,
-    run_decode_session_logits, run_decode_step,
-};
-use crate::decode_loop::{DecodeLoopState, commit_selected_token, reached_context_limit};
-use crate::engine::Engine;
-use crate::kv_bridge::{
-    common_prefix_len, mirror_present_kv_to_pages, rewind_draft_state_to_len,
-    rewind_target_state_to_len, trim_overmaterialized_target_kv,
-};
-use crate::logits::{ProcessorChain, ProcessorContext};
-use crate::processors::{ensure_constrained_finish, select_next_token};
-use crate::session::EngineSession;
-use crate::{FinishReason, GenerateOptions, GenerateResult, GenerateTokenCallback, SessionId};
-use anyhow::Context;
-use onnx_genai_kv::KvCacheOps;
+/// Inputs a proposer needs to draft speculative candidates for one verify pass.
+pub struct SpeculativeProposerContext<'a> {
+    pub width: usize,
+    pub generated_tokens: &'a [TokenId],
+    pub generated_text: &'a str,
+    pub first_step: usize,
+    pub options: &'a GenerateOptions,
+    pub chain: &'a ProcessorChain,
+}
+
+/// Candidate tokens proposed for a target-model verification pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpeculativeProposal {
+    pub tokens: Vec<TokenId>,
+    pub positions: Option<Vec<usize>>,
+    pub tree: Option<Vec<Vec<usize>>>,
+}
+
+impl SpeculativeProposal {
+    pub fn linear(tokens: Vec<TokenId>) -> Self {
+        Self {
+            tokens,
+            positions: None,
+            tree: None,
+        }
+    }
+}
+
+/// Outcome reported back to the proposer after verification and commit.
+pub struct SpeculativeAcceptContext<'a> {
+    pub accepted_prefix_len: usize,
+    pub committed_tokens: &'a [TokenId],
+    pub target_tokens: &'a [TokenId],
+}
+
+/// Source of speculative draft tokens.
+pub trait SpeculativeProposer {
+    fn propose(
+        &mut self,
+        context: &SpeculativeProposerContext<'_>,
+    ) -> anyhow::Result<SpeculativeProposal>;
+
+    fn accept(&mut self, _context: &SpeculativeAcceptContext<'_>) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn rewind(&mut self, _target_tokens: &[TokenId]) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn name(&self) -> &str;
+}
+
+pub(crate) struct DraftModelProposer<'a> {
+    draft_model: &'a mut DraftModel,
+    draft_state: &'a mut DraftSession,
+}
+
+impl<'a> DraftModelProposer<'a> {
+    fn new(draft_model: &'a mut DraftModel, draft_state: &'a mut DraftSession) -> Self {
+        Self {
+            draft_model,
+            draft_state,
+        }
+    }
+
+    fn align_to_target_prefix(
+        &mut self,
+        target_tokens: &[TokenId],
+        prefix_len: usize,
+    ) -> anyhow::Result<()> {
+        self.draft_state.tokens = target_tokens[..prefix_len].to_vec();
+        if self.draft_state.kv_token_count > prefix_len {
+            rewind_draft_state_to_len(self.draft_model, self.draft_state, prefix_len)?;
+        }
+        Ok(())
+    }
+}
+
+impl SpeculativeProposer for DraftModelProposer<'_> {
+    fn propose(
+        &mut self,
+        context: &SpeculativeProposerContext<'_>,
+    ) -> anyhow::Result<SpeculativeProposal> {
+        let tokens = propose_draft_tokens(
+            self.draft_model,
+            self.draft_state,
+            context.width,
+            context.generated_tokens,
+            context.generated_text,
+            context.first_step,
+            context.options,
+            context.chain,
+        )?;
+        Ok(SpeculativeProposal::linear(tokens))
+    }
+
+    fn rewind(&mut self, target_tokens: &[TokenId]) -> anyhow::Result<()> {
+        let common_len = common_prefix_len(&self.draft_state.tokens, target_tokens);
+        if self.draft_state.kv_token_count > common_len {
+            rewind_draft_state_to_len(self.draft_model, self.draft_state, common_len)?;
+        }
+        self.draft_state.tokens = target_tokens.to_vec();
+        Ok(())
+    }
+
+    fn name(&self) -> &str {
+        "draft_model"
+    }
+}
 
 impl Engine {
     pub(crate) fn should_use_speculative(&self, options: &GenerateOptions) -> bool {
@@ -123,20 +234,18 @@ impl Engine {
                     .draft
                     .as_mut()
                     .context("speculative session missing draft state")?;
-                draft_state.tokens = state.tokens[..base_len].to_vec();
-                if draft_state.kv_token_count > base_len {
-                    rewind_draft_state_to_len(draft_model, draft_state, base_len)?;
-                }
-                propose_draft_tokens(
-                    draft_model,
-                    draft_state,
-                    width,
-                    generated_tokens,
-                    generated_text,
-                    step,
-                    options,
-                    chain,
-                )?
+                let mut proposer = DraftModelProposer::new(draft_model, draft_state);
+                proposer.align_to_target_prefix(&state.tokens, base_len)?;
+                proposer
+                    .propose(&SpeculativeProposerContext {
+                        width,
+                        generated_tokens,
+                        generated_text,
+                        first_step: step,
+                        options,
+                        chain,
+                    })?
+                    .tokens
             };
 
             state.tokens.extend_from_slice(&draft_tokens);
@@ -269,6 +378,8 @@ impl Engine {
                 commit_tokens.push(token);
             }
 
+            self.notify_draft_acceptance(state, accepted, &commit_tokens)?;
+
             for (commit_idx, token_id) in commit_tokens.into_iter().enumerate() {
                 if generated_tokens.len() >= options.max_new_tokens
                     || (commit_idx >= accepted
@@ -326,12 +437,91 @@ impl Engine {
 
     pub(crate) fn sync_draft_to_target(&mut self, state: &mut EngineSession) -> anyhow::Result<()> {
         if let (Some(draft_model), Some(draft_state)) = (&mut self.draft, &mut state.draft) {
-            let common_len = common_prefix_len(&draft_state.tokens, &state.tokens);
-            if draft_state.kv_token_count > common_len {
-                rewind_draft_state_to_len(draft_model, draft_state, common_len)?;
-            }
-            draft_state.tokens = state.tokens.clone();
+            DraftModelProposer::new(draft_model, draft_state).rewind(&state.tokens)?;
         }
+        Ok(())
+    }
+
+    fn notify_draft_acceptance(
+        &mut self,
+        state: &mut EngineSession,
+        accepted_prefix_len: usize,
+        committed_tokens: &[TokenId],
+    ) -> anyhow::Result<()> {
+        if let (Some(draft_model), Some(draft_state)) = (&mut self.draft, &mut state.draft) {
+            DraftModelProposer::new(draft_model, draft_state).accept(
+                &SpeculativeAcceptContext {
+                    accepted_prefix_len,
+                    committed_tokens,
+                    target_tokens: &state.tokens,
+                },
+            )?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct StubProposer {
+        tokens: Vec<TokenId>,
+        accepted: Option<usize>,
+        rewound_to: Option<Vec<TokenId>>,
+    }
+
+    impl SpeculativeProposer for StubProposer {
+        fn propose(
+            &mut self,
+            _context: &SpeculativeProposerContext<'_>,
+        ) -> anyhow::Result<SpeculativeProposal> {
+            Ok(SpeculativeProposal::linear(self.tokens.clone()))
+        }
+
+        fn accept(&mut self, context: &SpeculativeAcceptContext<'_>) -> anyhow::Result<()> {
+            self.accepted = Some(context.accepted_prefix_len);
+            Ok(())
+        }
+
+        fn rewind(&mut self, target_tokens: &[TokenId]) -> anyhow::Result<()> {
+            self.rewound_to = Some(target_tokens.to_vec());
+            Ok(())
+        }
+
+        fn name(&self) -> &str {
+            "stub"
+        }
+    }
+
+    #[test]
+    fn speculative_proposer_trait_supports_non_draft_sources() -> anyhow::Result<()> {
+        let options = GenerateOptions::default();
+        let chain = ProcessorChain::new();
+        let mut proposer = StubProposer {
+            tokens: vec![3, 5],
+            accepted: None,
+            rewound_to: None,
+        };
+
+        let proposal = proposer.propose(&SpeculativeProposerContext {
+            width: 2,
+            generated_tokens: &[1],
+            generated_text: "a",
+            first_step: 0,
+            options: &options,
+            chain: &chain,
+        })?;
+        proposer.accept(&SpeculativeAcceptContext {
+            accepted_prefix_len: 1,
+            committed_tokens: &[3, 4],
+            target_tokens: &[1, 3, 4],
+        })?;
+        proposer.rewind(&[1, 3, 4])?;
+
+        assert_eq!(proposal.tokens, vec![3, 5]);
+        assert_eq!(proposer.accepted, Some(1));
+        assert_eq!(proposer.rewound_to, Some(vec![1, 3, 4]));
         Ok(())
     }
 }

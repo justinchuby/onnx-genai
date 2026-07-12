@@ -8,7 +8,7 @@ use crate::logits::{
     ProcessorContext, ProcessorSignal, RepetitionPenaltyProcessor, StopSequence,
     StopSequenceProcessor, TemperatureProcessor, TokenId, TopKProcessor, TopPProcessor,
 };
-use crate::sampling::{sample_categorical, sample_greedy};
+use crate::sampling::{Sampler, default_sampler_for_options};
 use anyhow::Context;
 use onnx_genai_ort::Tokenizer;
 use std::path::Path;
@@ -214,12 +214,18 @@ pub(crate) fn select_next_token(
     chain: &ProcessorChain,
     rng_value: f32,
 ) -> TokenId {
+    let mut sampler = default_sampler_for_options(options, rng_value);
+    select_next_token_with_sampler(logits, context, chain, &mut sampler)
+}
+
+pub(crate) fn select_next_token_with_sampler(
+    logits: &mut [f32],
+    context: &ProcessorContext,
+    chain: &ProcessorChain,
+    sampler: &mut dyn Sampler,
+) -> TokenId {
     chain.process(logits, context);
-    if options.greedy || options.temperature == 0.0 {
-        sample_greedy(logits)
-    } else {
-        sample_categorical(logits, rng_value)
-    }
+    sampler.sample(logits, context)
 }
 
 pub(crate) fn finish_reason_after_token(

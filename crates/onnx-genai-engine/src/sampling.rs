@@ -1,5 +1,86 @@
 //! Token sampling from processed logits.
 
+use crate::config::GenerateOptions;
+use crate::logits::{ProcessorContext, TokenId};
+
+/// Final token selector used after logit processors have run.
+///
+/// The built-in generation path constructs one of the built-in samplers from
+/// [`GenerateOptions`]. New decode paths can provide another implementation
+/// without changing token commit logic.
+pub trait Sampler: Send {
+    fn sample(&mut self, logits: &[f32], context: &ProcessorContext) -> TokenId;
+    fn name(&self) -> &str;
+}
+
+/// Argmax sampler. Ties keep the lowest token id.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct GreedySampler;
+
+impl Sampler for GreedySampler {
+    fn sample(&mut self, logits: &[f32], _context: &ProcessorContext) -> TokenId {
+        sample_greedy(logits)
+    }
+
+    fn name(&self) -> &str {
+        "greedy"
+    }
+}
+
+/// Categorical sampler using the deterministic RNG value supplied by the caller.
+#[derive(Debug, Clone, Copy)]
+pub struct CategoricalSampler {
+    rng_value: f32,
+}
+
+impl CategoricalSampler {
+    pub fn new(rng_value: f32) -> Self {
+        Self { rng_value }
+    }
+}
+
+impl Sampler for CategoricalSampler {
+    fn sample(&mut self, logits: &[f32], _context: &ProcessorContext) -> TokenId {
+        sample_categorical(logits, self.rng_value)
+    }
+
+    fn name(&self) -> &str {
+        "categorical"
+    }
+}
+
+pub(crate) enum DefaultSampler {
+    Greedy(GreedySampler),
+    Categorical(CategoricalSampler),
+}
+
+impl Sampler for DefaultSampler {
+    fn sample(&mut self, logits: &[f32], context: &ProcessorContext) -> TokenId {
+        match self {
+            Self::Greedy(sampler) => sampler.sample(logits, context),
+            Self::Categorical(sampler) => sampler.sample(logits, context),
+        }
+    }
+
+    fn name(&self) -> &str {
+        match self {
+            Self::Greedy(sampler) => sampler.name(),
+            Self::Categorical(sampler) => sampler.name(),
+        }
+    }
+}
+
+pub(crate) fn default_sampler_for_options(
+    options: &GenerateOptions,
+    rng_value: f32,
+) -> DefaultSampler {
+    if options.greedy || options.temperature == 0.0 {
+        DefaultSampler::Greedy(GreedySampler)
+    } else {
+        DefaultSampler::Categorical(CategoricalSampler::new(rng_value))
+    }
+}
+
 /// Sample a token from logits using argmax. Ties keep the lowest token id.
 pub fn sample_greedy(logits: &[f32]) -> u32 {
     let mut best: Option<(usize, f32)> = None;
@@ -70,5 +151,15 @@ mod tests {
     #[test]
     fn categorical_respects_rng_value() {
         assert_eq!(sample_categorical(&[10.0, 0.0], 0.99), 0);
+    }
+
+    #[test]
+    fn sampler_trait_dispatch_matches_free_functions() {
+        let context = ProcessorContext::default();
+        let mut greedy = GreedySampler;
+        assert_eq!(greedy.sample(&[1.0, 2.0, 2.0], &context), 1);
+
+        let mut categorical = CategoricalSampler::new(0.75);
+        assert_eq!(categorical.sample(&[0.0, 0.0], &context), 1);
     }
 }

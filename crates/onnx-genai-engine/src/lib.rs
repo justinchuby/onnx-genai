@@ -28,5 +28,12 @@ pub use engine::{
     PrioritizedGenerateRequest, PrioritizedGenerateResult, ScheduledGenerateArrival, SessionId,
 };
 pub use fim::{FimConfig, FimFormat};
-pub use logits::{Constraint, JsonConstraint, StopSequence, TokenId};
+pub use logits::{
+    Constraint, ConstraintProcessor, JsonConstraint, LogitProcessor, ProcessorChain,
+    ProcessorChainBuilder, ProcessorContext, ProcessorSignal, StopSequence, TokenId,
+};
 pub use pipeline::{PipelineEngine, PipelineGenerateRequest, PipelineTensors};
+pub use sampling::{CategoricalSampler, GreedySampler, Sampler};
+pub use speculative::{
+    SpeculativeAcceptContext, SpeculativeProposal, SpeculativeProposer, SpeculativeProposerContext,
+};

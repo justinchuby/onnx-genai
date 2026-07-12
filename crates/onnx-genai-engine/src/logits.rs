@@ -106,8 +106,25 @@ impl ProcessorChain {
         }
     }
 
+    pub fn builder() -> ProcessorChainBuilder {
+        ProcessorChainBuilder::new()
+    }
+
     pub fn add(&mut self, processor: Box<dyn LogitProcessor>) {
         self.processors.push(processor);
+    }
+
+    pub fn add_constraint(
+        &mut self,
+        constraint: Box<dyn Constraint>,
+        token_texts: Vec<Option<String>>,
+        eos_token_id: Option<TokenId>,
+    ) {
+        self.add(Box::new(ConstraintProcessor::new(
+            constraint,
+            token_texts,
+            eos_token_id,
+        )));
     }
 
     /// Apply processors in insertion order.
@@ -125,6 +142,40 @@ impl ProcessorChain {
     /// Processor names in configured order, useful for diagnostics and tests.
     pub fn names(&self) -> Vec<&str> {
         self.processors.iter().map(|proc| proc.name()).collect()
+    }
+}
+
+/// Builder/registry for assembling custom processor chains.
+#[derive(Default)]
+pub struct ProcessorChainBuilder {
+    chain: ProcessorChain,
+}
+
+impl ProcessorChainBuilder {
+    pub fn new() -> Self {
+        Self {
+            chain: ProcessorChain::new(),
+        }
+    }
+
+    pub fn register_processor(mut self, processor: Box<dyn LogitProcessor>) -> Self {
+        self.chain.add(processor);
+        self
+    }
+
+    pub fn register_constraint(
+        mut self,
+        constraint: Box<dyn Constraint>,
+        token_texts: Vec<Option<String>>,
+        eos_token_id: Option<TokenId>,
+    ) -> Self {
+        self.chain
+            .add_constraint(constraint, token_texts, eos_token_id);
+        self
+    }
+
+    pub fn build(self) -> ProcessorChain {
+        self.chain
     }
 }
 
@@ -1361,5 +1412,71 @@ mod tests {
 
         assert_eq!(sample_greedy(&logits), 0);
         assert_eq!(logits, vec![10.0, 1.0]);
+    }
+
+    struct ForceTokenProcessor {
+        token_id: TokenId,
+    }
+
+    impl LogitProcessor for ForceTokenProcessor {
+        fn process(&self, logits: &mut [f32], _context: &ProcessorContext) {
+            for (idx, logit) in logits.iter_mut().enumerate() {
+                *logit = if idx as TokenId == self.token_id {
+                    0.0
+                } else {
+                    f32::NEG_INFINITY
+                };
+            }
+        }
+
+        fn name(&self) -> &str {
+            "force_token"
+        }
+    }
+
+    struct EvenTokenConstraint;
+
+    impl Constraint for EvenTokenConstraint {
+        fn allowed_next_tokens(
+            &self,
+            _context: &ProcessorContext,
+            candidates: &[TokenCandidate],
+        ) -> Vec<bool> {
+            candidates
+                .iter()
+                .map(|candidate| candidate.token_id % 2 == 0)
+                .collect()
+        }
+
+        fn name(&self) -> &str {
+            "even_token_constraint"
+        }
+    }
+
+    #[test]
+    fn processor_chain_builder_registers_custom_processors_and_constraints() {
+        let context = ProcessorContext::default();
+        let chain = ProcessorChain::builder()
+            .register_processor(Box::new(ForceTokenProcessor { token_id: 2 }))
+            .register_constraint(
+                Box::new(EvenTokenConstraint),
+                vec![
+                    Some("0".into()),
+                    Some("1".into()),
+                    Some("2".into()),
+                    Some("3".into()),
+                ],
+                None,
+            )
+            .build();
+        let mut logits = vec![1.0, 1.0, 1.0, 1.0];
+
+        chain.process(&mut logits, &context);
+
+        assert_eq!(
+            logits,
+            vec![f32::NEG_INFINITY, f32::NEG_INFINITY, 0.0, f32::NEG_INFINITY]
+        );
+        assert_eq!(chain.names(), vec!["force_token", "even_token_constraint"]);
     }
 }
