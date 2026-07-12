@@ -1,0 +1,11 @@
+{
+  "assignments": [
+    {
+      "assignment_id": "onnx-genai-2026-07-12",
+      "universe": "Blade Runner",
+      "created_at": "2026-07-12",
+      "shape": "systems/performance-critical Rust inference runtime",
+      "cast": ["Roy", "Deckard", "Batty", "Rachael", "Pris"]
+    }
+  ]
+}

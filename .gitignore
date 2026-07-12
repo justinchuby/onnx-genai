@@ -1,8 +1,35 @@
 /target
-Cargo.lock
 *.onnx
 *.safetensors
 .DS_Store
+
+# Rust
+# Existing Rust entries above: /target and Cargo.lock (left as-is).
+**/*.rs.bk
+*.pdb
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+.venv/
+venv/
+env/
+ENV/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+*.so
+.coverage
+htmlcov/
+.tox/
+
 # Squad: ignore runtime state (logs, inbox, sessions)
 # Note: .squad/casting/* is identity and MUST be committed to main, not ignored
 .squad/orchestration-log/
