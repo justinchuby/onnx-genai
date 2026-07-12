@@ -8,6 +8,7 @@
 //! - Speculative decoding (acceleration)
 
 pub mod engine;
+pub mod fim;
 pub mod logits;
 pub mod pipeline;
 pub mod sampling;
@@ -18,5 +19,6 @@ pub use engine::{
     GenerateRequest, GenerateResult, GenerateToken, GenerateTokenCallback,
     PrioritizedGenerateRequest, PrioritizedGenerateResult, ScheduledGenerateArrival, SessionId,
 };
+pub use fim::{FimConfig, FimFormat};
 pub use logits::{Constraint, JsonConstraint, StopSequence, TokenId};
 pub use pipeline::{PipelineEngine, PipelineGenerateRequest, PipelineTensors};

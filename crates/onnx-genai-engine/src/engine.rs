@@ -1,5 +1,6 @@
 //! Main generation engine.
 
+use crate::FimConfig;
 use crate::logits::{
     ConstraintProcessor, FrequencyPenaltyProcessor, GrammarConstraintKind, JsonConstraint,
     LlguidanceConstraint, MinPProcessor, PresencePenaltyProcessor, ProcessorChain,
@@ -285,6 +286,8 @@ pub struct Engine {
     draft: Option<DraftModel>,
     /// Tokenizer loaded from the model directory.
     tokenizer: Tokenizer,
+    /// Auto-detected fill-in-the-middle token configuration.
+    fim_config: Option<FimConfig>,
     /// Default speculative draft width K.
     num_speculative_tokens: usize,
 }
@@ -337,6 +340,7 @@ impl Engine {
         let decode_path = detect_model_decode_path(&session, metadata_max_context)?;
         let tokenizer = Tokenizer::from_file(&model_directory.tokenizer_path)
             .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {}", e))?;
+        let fim_config = load_fim_config_from_model_dir(&model_directory.root)?;
         let kv_model = infer_kv_model_info(&session, config.page_size)?;
         let draft = if let Some(draft_model_path) = &config.draft_model {
             let draft_directory = ModelDirectory::load(draft_model_path)
@@ -384,6 +388,7 @@ impl Engine {
             session: Box::new(session),
             draft,
             tokenizer,
+            fim_config,
             num_speculative_tokens: config.num_speculative_tokens.max(1),
         })
     }
@@ -392,6 +397,34 @@ impl Engine {
     ///
     pub fn generate(&mut self, request: GenerateRequest) -> anyhow::Result<GenerateResult> {
         self.generate_with_callback(request, None)
+    }
+
+    /// Generate the middle text for a fill-in-the-middle request.
+    pub fn generate_fim(
+        &mut self,
+        prefix: impl AsRef<str>,
+        suffix: impl AsRef<str>,
+        options: GenerateOptions,
+    ) -> anyhow::Result<GenerateResult> {
+        let fim_config = self
+            .fim_config
+            .clone()
+            .context("model tokenizer_config.json does not declare recognized FIM tokens")?;
+        self.generate_fim_with_config(prefix, suffix, options, &fim_config)
+    }
+
+    /// Generate the middle text using an explicit fill-in-the-middle configuration.
+    pub fn generate_fim_with_config(
+        &mut self,
+        prefix: impl AsRef<str>,
+        suffix: impl AsRef<str>,
+        options: GenerateOptions,
+        fim_config: &FimConfig,
+    ) -> anyhow::Result<GenerateResult> {
+        let prompt = fim_config.format_prompt(prefix.as_ref(), suffix.as_ref());
+        let mut request = GenerateRequest::new(prompt);
+        request.options = self.fim_options(fim_config, options);
+        self.generate(request)
     }
 
     /// Generate text and optionally stream each generated token to `callback`.
@@ -772,6 +805,39 @@ impl Engine {
     /// Get the loaded metadata.
     pub fn metadata(&self) -> &InferenceMetadata {
         &self.metadata
+    }
+
+    /// Auto-detected fill-in-the-middle configuration, if the tokenizer declares one.
+    pub fn fim_config(&self) -> Option<&FimConfig> {
+        self.fim_config.as_ref()
+    }
+
+    fn fim_options(&self, fim_config: &FimConfig, mut options: GenerateOptions) -> GenerateOptions {
+        if options.eos_token_id.is_none() {
+            options.eos_token_id = self.tokenizer.eos_token_id();
+        }
+        for eos_token_id in self.tokenizer.eos_token_ids() {
+            push_unique_stop_sequence(
+                &mut options.stop_sequences,
+                StopSequence::Tokens(vec![eos_token_id]),
+            );
+        }
+        for token in [
+            fim_config.prefix_token.as_str(),
+            fim_config.middle_token.as_str(),
+            fim_config.suffix_token.as_str(),
+            "<|fim_pad|>",
+            "<|endoftext|>",
+            "<|file_sep|>",
+        ] {
+            if let Some(token_id) = self.tokenizer.token_id(token) {
+                push_unique_stop_sequence(
+                    &mut options.stop_sequences,
+                    StopSequence::Tokens(vec![token_id]),
+                );
+            }
+        }
+        options
     }
 
     fn max_context_for_request(&self, options: &GenerateOptions) -> Option<usize> {
@@ -2743,6 +2809,25 @@ pub(crate) fn build_processor_chain(
     Ok(chain)
 }
 
+fn load_fim_config_from_model_dir(model_dir: &Path) -> anyhow::Result<Option<FimConfig>> {
+    let tokenizer_config = model_dir.join("tokenizer_config.json");
+    if !tokenizer_config.is_file() {
+        return Ok(None);
+    }
+
+    let text = std::fs::read_to_string(&tokenizer_config)
+        .with_context(|| format!("failed to read {}", tokenizer_config.display()))?;
+    let value: serde_json::Value = serde_json::from_str(&text)
+        .with_context(|| format!("invalid JSON in {}", tokenizer_config.display()))?;
+    Ok(FimConfig::from_tokenizer_config(&value))
+}
+
+fn push_unique_stop_sequence(stop_sequences: &mut Vec<StopSequence>, stop: StopSequence) {
+    if !stop_sequences.contains(&stop) {
+        stop_sequences.push(stop);
+    }
+}
+
 fn build_llguidance_constraint(
     kind: GrammarConstraintKind,
     grammar: &str,
@@ -3161,6 +3246,35 @@ mod tests {
         assert!(engine.sessions[&session_id].kv_token_count > 0);
         engine.close_session(session_id)?;
         assert!(engine.sessions.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires ONNX_GENAI_FIM_MODEL_DIR to point at a FIM-capable coder model"]
+    fn fim_generation_runs_with_fim_capable_model() -> anyhow::Result<()> {
+        let Ok(model_dir) = std::env::var("ONNX_GENAI_FIM_MODEL_DIR") else {
+            eprintln!("set ONNX_GENAI_FIM_MODEL_DIR to a Qwen2.5-Coder/StarCoder-style model");
+            return Ok(());
+        };
+        let mut engine = Engine::from_dir(Path::new(&model_dir), EngineConfig::default())?;
+        assert!(
+            engine.fim_config().is_some(),
+            "model tokenizer_config.json must expose recognized FIM tokens"
+        );
+
+        let mut options = GenerateOptions {
+            max_new_tokens: 16,
+            temperature: 0.0,
+            ..Default::default()
+        };
+        options
+            .stop_sequences
+            .push(StopSequence::Text("\n\n".into()));
+
+        let result =
+            engine.generate_fim("fn add(a: i32, b: i32) -> i32 {\n    ", "\n}", options)?;
+
+        assert!(!result.token_ids.is_empty());
         Ok(())
     }
 }
