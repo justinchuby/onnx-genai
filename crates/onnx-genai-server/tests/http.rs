@@ -2,8 +2,11 @@ use axum::{
     body::{Body, to_bytes},
     http::{Request, StatusCode, header},
 };
+use onnx_genai::GeneratePrompt;
 use onnx_genai_engine::GenerateConstraint;
-use onnx_genai_server::{AppState, ChatCompletionRequest, app, build_generate_request};
+use onnx_genai_server::{
+    AppState, ChatCompletionRequest, app, build_generate_request, parse_assistant_output,
+};
 use serde_json::{Value, json};
 use std::path::PathBuf;
 use tower::ServiceExt;
@@ -142,6 +145,81 @@ fn response_format_maps_to_generate_constraint_only_for_json_object() {
         build_generate_request(&absent_request).options.constraint,
         None
     );
+}
+
+#[test]
+fn chat_request_with_tools_renders_tool_schema_in_prompt() {
+    let request = chat_request(json!({
+        "model": "tiny-llm",
+        "messages": [
+            {"role": "user", "content": "What is the weather?"},
+            {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_0",
+                    "type": "function",
+                    "function": {"name": "get_weather", "arguments": "{\"city\":\"Seattle\"}"}
+                }]
+            },
+            {"role": "tool", "tool_call_id": "call_0", "content": "{\"temp\":72}"}
+        ],
+        "tools": [{
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Get current weather",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"]
+                }
+            }
+        }],
+        "tool_choice": "auto"
+    }));
+
+    let generate_request = build_generate_request(&request);
+    let GeneratePrompt::Text(prompt) = generate_request.prompt else {
+        panic!("expected text prompt");
+    };
+    assert!(prompt.contains("<|tools|>"), "{prompt}");
+    assert!(prompt.contains("get_weather"), "{prompt}");
+    assert!(
+        prompt.contains("\"city\":{\"type\":\"string\"}"),
+        "{prompt}"
+    );
+    assert!(prompt.contains("<|tool|>"), "{prompt}");
+    assert!(prompt.contains("tool_call_id: call_0"), "{prompt}");
+}
+
+#[test]
+fn parser_converts_qwen_tool_call_blocks_to_openai_tool_calls() {
+    let parsed = parse_assistant_output(
+        r#"Thinking...
+<tool_call>
+{"name":"read_file","arguments":{"path":"src/lib.rs"}}
+</tool_call>
+<tool_call>
+{"name":"write_file","arguments":{"path":"src/lib.rs","content":"ok"}}
+</tool_call>"#
+            .to_string(),
+        "stop",
+    );
+
+    assert_eq!(parsed.finish_reason, "tool_calls");
+    assert!(parsed.content.is_none());
+    let calls = parsed.tool_calls.unwrap();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0].id, "call_0");
+    assert_eq!(calls[0].kind, "function");
+    assert_eq!(calls[0].function.name, "read_file");
+    assert_eq!(calls[0].function.arguments, r#"{"path":"src/lib.rs"}"#);
+    assert_eq!(calls[1].id, "call_1");
+    assert_eq!(calls[1].function.name, "write_file");
+    let second_args: Value = serde_json::from_str(&calls[1].function.arguments).unwrap();
+    assert_eq!(second_args["path"], "src/lib.rs");
+    assert_eq!(second_args["content"], "ok");
 }
 
 #[tokio::test]

@@ -25,7 +25,7 @@ use onnx_genai::{
     GenerateResult, GenerateToken, SessionId, StopSequence,
 };
 use onnx_genai_engine::GenerateConstraint;
-use onnx_genai_ort::{ModelDirectory, Tokenizer};
+use onnx_genai_ort::{ChatMessage as TemplateChatMessage, ChatTemplate, ModelDirectory, Tokenizer};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -37,6 +37,7 @@ pub struct AppState {
     model_id: String,
     engine: SharedEngine,
     tokenizer: Arc<Tokenizer>,
+    chat_template: Option<Arc<ChatTemplate>>,
     sessions: SessionRegistry,
 }
 
@@ -167,16 +168,32 @@ impl AppState {
             .map_err(|e| anyhow::anyhow!("Failed to resolve model directory: {}", e))?;
         let tokenizer = Tokenizer::from_file(&model_directory.tokenizer_path)
             .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {}", e))?;
+        let chat_template = load_chat_template(model_dir)?;
         let engine = Engine::from_dir(model_dir, EngineConfig::default())?;
         let model_id = model_id.unwrap_or_else(|| infer_model_id(model_dir));
-        Ok(Self::new(model_id, engine, tokenizer))
+        Ok(Self::new_with_template(
+            model_id,
+            engine,
+            tokenizer,
+            chat_template,
+        ))
     }
 
     pub fn new(model_id: String, engine: Engine, tokenizer: Tokenizer) -> Self {
+        Self::new_with_template(model_id, engine, tokenizer, None)
+    }
+
+    pub fn new_with_template(
+        model_id: String,
+        engine: Engine,
+        tokenizer: Tokenizer,
+        chat_template: Option<ChatTemplate>,
+    ) -> Self {
         Self {
             model_id,
             engine: SharedEngine::new(engine),
             tokenizer: Arc::new(tokenizer),
+            chat_template: chat_template.map(Arc::new),
             sessions: SessionRegistry::new(),
         }
     }
@@ -218,6 +235,10 @@ pub struct ChatCompletionRequest {
     pub stop: Option<StopInput>,
     #[serde(default)]
     pub response_format: Option<ResponseFormat>,
+    #[serde(default)]
+    pub tools: Option<Vec<ChatTool>>,
+    #[serde(default)]
+    pub tool_choice: Option<ToolChoice>,
 }
 
 impl ChatCompletionRequest {
@@ -227,12 +248,87 @@ impl ChatCompletionRequest {
             Some(ResponseFormatType::JsonObject)
         )
     }
+
+    fn has_tool_context(&self) -> bool {
+        self.tools.as_ref().is_some_and(|tools| !tools.is_empty())
+            || self.tool_choice.is_some()
+            || self.messages.iter().any(|message| {
+                message
+                    .tool_calls
+                    .as_ref()
+                    .is_some_and(|calls| !calls.is_empty())
+                    || message.tool_call_id.is_some()
+                    || message.role == "tool"
+            })
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ChatMessage {
     pub role: String,
-    pub content: String,
+    #[serde(default)]
+    pub content: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ChatMessageToolCall>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ChatMessageToolCall {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub function: ChatMessageToolCallFunction,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ChatMessageToolCallFunction {
+    pub name: String,
+    pub arguments: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ChatTool {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub function: ChatToolFunction,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ChatToolFunction {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parameters: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum ToolChoice {
+    Mode(ToolChoiceMode),
+    Specific(ToolChoiceSpecific),
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolChoiceMode {
+    Auto,
+    None,
+    Required,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ToolChoiceSpecific {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub function: ToolChoiceFunction,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ToolChoiceFunction {
+    pub name: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -322,6 +418,17 @@ struct Delta {
     role: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_calls: Option<Vec<ChunkToolCall>>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ChunkToolCall {
+    index: usize,
+    id: String,
+    #[serde(rename = "type")]
+    kind: String,
+    function: ChatMessageToolCallFunction,
 }
 
 #[derive(Debug, Serialize)]
@@ -552,9 +659,13 @@ async fn run_chat_completion(
     let id = completion_id();
     let created = now_unix();
     let model = request.model.clone();
-    let prepared =
-        prepare_generate_request(&request, &state.tokenizer, client_session_id.is_some())
-            .map_err(|err| ApiError::internal(format!("prompt tokenization failed: {err}")))?;
+    let prepared = prepare_generate_request(
+        &request,
+        &state.tokenizer,
+        state.chat_template.as_deref(),
+        client_session_id.is_some(),
+    )
+    .map_err(|err| ApiError::internal(format!("prompt tokenization failed: {err}")))?;
     let prompt_tokens = prepared.prompt_tokens;
     let generation_request = prepared.request;
     let engine = state.engine.clone();
@@ -583,14 +694,19 @@ async fn run_chat_completion(
         })
         .transpose()?;
 
-    let (content, completion_tokens, finish_reason) = match result {
-        Ok(result) => (
-            result.text,
-            result.token_ids.len(),
-            finish_reason_label(&result.finish_reason),
-        ),
+    let (content, tool_calls, completion_tokens, finish_reason) = match result {
+        Ok(result) => {
+            let parsed =
+                parse_assistant_output(result.text, finish_reason_label(&result.finish_reason));
+            (
+                parsed.content,
+                parsed.tool_calls,
+                result.token_ids.len(),
+                parsed.finish_reason,
+            )
+        }
         Err(err) if wants_json_object && json_constraint_stopped_incomplete(&err) => {
-            ("{}".to_string(), 0, "stop")
+            (Some("{}".to_string()), None, 0, "stop")
         }
         Err(err) => return Err(ApiError::internal(format!("generation failed: {err}"))),
     };
@@ -605,6 +721,8 @@ async fn run_chat_completion(
             message: ChatMessage {
                 role: "assistant".to_string(),
                 content,
+                tool_calls,
+                tool_call_id: None,
             },
             finish_reason,
         }],
@@ -626,14 +744,18 @@ fn stream_chat_completion(
     let id = completion_id();
     let created = now_unix();
     let model = request.model.clone();
-    let stop_sequences = request
+    let user_stop_sequences = request
         .stop
         .clone()
         .map(StopInput::into_texts)
         .unwrap_or_default();
-    let prepared =
-        prepare_generate_request(&request, &state.tokenizer, client_session_id.is_some())
-            .map_err(|err| ApiError::internal(format!("prompt tokenization failed: {err}")))?;
+    let prepared = prepare_generate_request(
+        &request,
+        &state.tokenizer,
+        state.chat_template.as_deref(),
+        client_session_id.is_some(),
+    )
+    .map_err(|err| ApiError::internal(format!("prompt tokenization failed: {err}")))?;
     let wants_json_object = request.wants_json_object();
     let generation_request = prepared.request;
     let engine = state.engine.clone();
@@ -668,11 +790,19 @@ fn stream_chat_completion(
 
         send_chunk(role_chunk(&id, created, &model))?;
 
-        let mut stop_buffer = StopBoundaryBuffer::new(stop_sequences);
+        let mut stop_buffer = StopBoundaryBuffer::new(user_stop_sequences);
+        let mut buffered_text = String::new();
+        let buffer_for_tool_detection = request.has_tool_context()
+            && !matches!(
+                request.tool_choice,
+                Some(ToolChoice::Mode(ToolChoiceMode::None))
+            );
         let mut callback = |token: GenerateToken| -> anyhow::Result<()> {
             let finish_reason = token.finish_reason.clone();
             let content = stop_buffer.push(&token.text);
-            if !wants_json_object && !content.is_empty() {
+            if buffer_for_tool_detection {
+                buffered_text.push_str(&content);
+            } else if !wants_json_object && !content.is_empty() {
                 send_chunk(content_chunk(&id, created, &model, content))?;
             }
             if matches!(finish_reason, Some(FinishReason::StopSequence { .. })) {
@@ -692,22 +822,49 @@ fn stream_chat_completion(
 
         match result {
             Ok(result) => {
-                if wants_json_object {
+                if buffer_for_tool_detection {
+                    if !matches!(result.finish_reason, FinishReason::StopSequence { .. }) {
+                        buffered_text.push_str(&stop_buffer.flush());
+                    }
+                    let tool_calls = parse_tool_calls(&buffered_text);
+                    if tool_calls.is_empty() {
+                        if !buffered_text.is_empty() {
+                            send_chunk(content_chunk(&id, created, &model, buffered_text))?;
+                        }
+                        send_chunk(done_chunk(
+                            &id,
+                            created,
+                            &model,
+                            finish_reason_label(&result.finish_reason),
+                        ))?;
+                    } else {
+                        send_chunk(tool_calls_chunk(&id, created, &model, tool_calls))?;
+                        send_chunk(done_chunk(&id, created, &model, "tool_calls"))?;
+                    }
+                } else if wants_json_object {
                     if !result.text.is_empty() {
                         send_chunk(content_chunk(&id, created, &model, result.text))?;
                     }
-                } else if !matches!(result.finish_reason, FinishReason::StopSequence { .. }) {
-                    let content = stop_buffer.flush();
-                    if !content.is_empty() {
-                        send_chunk(content_chunk(&id, created, &model, content))?;
+                    send_chunk(done_chunk(
+                        &id,
+                        created,
+                        &model,
+                        finish_reason_label(&result.finish_reason),
+                    ))?;
+                } else {
+                    if !matches!(result.finish_reason, FinishReason::StopSequence { .. }) {
+                        let content = stop_buffer.flush();
+                        if !content.is_empty() {
+                            send_chunk(content_chunk(&id, created, &model, content))?;
+                        }
                     }
+                    send_chunk(done_chunk(
+                        &id,
+                        created,
+                        &model,
+                        finish_reason_label(&result.finish_reason),
+                    ))?;
                 }
-                send_chunk(done_chunk(
-                    &id,
-                    created,
-                    &model,
-                    finish_reason_label(&result.finish_reason),
-                ))?;
             }
             Err(err) if wants_json_object && json_constraint_stopped_incomplete(&err) => {
                 send_chunk(content_chunk(&id, created, &model, "{}".to_string()))?;
@@ -745,6 +902,7 @@ fn role_chunk(id: &str, created: u64, model: &str) -> ChatCompletionChunk {
             delta: Delta {
                 role: Some("assistant"),
                 content: None,
+                tool_calls: None,
             },
             finish_reason: None,
         }],
@@ -762,6 +920,41 @@ fn content_chunk(id: &str, created: u64, model: &str, content: String) -> ChatCo
             delta: Delta {
                 role: None,
                 content: Some(content),
+                tool_calls: None,
+            },
+            finish_reason: None,
+        }],
+    }
+}
+
+fn tool_calls_chunk(
+    id: &str,
+    created: u64,
+    model: &str,
+    tool_calls: Vec<ChatMessageToolCall>,
+) -> ChatCompletionChunk {
+    ChatCompletionChunk {
+        id: id.to_string(),
+        object: "chat.completion.chunk",
+        created,
+        model: model.to_string(),
+        choices: vec![ChunkChoice {
+            index: 0,
+            delta: Delta {
+                role: None,
+                content: None,
+                tool_calls: Some(
+                    tool_calls
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, call)| ChunkToolCall {
+                            index,
+                            id: call.id,
+                            kind: call.kind,
+                            function: call.function,
+                        })
+                        .collect(),
+                ),
             },
             finish_reason: None,
         }],
@@ -845,7 +1038,7 @@ fn get_or_create_session(state: &AppState, client_id: &str) -> Result<SessionId,
 
 pub fn build_generate_request(request: &ChatCompletionRequest) -> GenerateRequest {
     GenerateRequest {
-        prompt: GeneratePrompt::Text(build_prompt(&request.messages)),
+        prompt: GeneratePrompt::Text(build_prompt(request)),
         options: build_generate_options(request),
     }
 }
@@ -853,12 +1046,13 @@ pub fn build_generate_request(request: &ChatCompletionRequest) -> GenerateReques
 fn prepare_generate_request(
     request: &ChatCompletionRequest,
     tokenizer: &Tokenizer,
+    chat_template: Option<&ChatTemplate>,
     session: bool,
 ) -> anyhow::Result<PreparedGenerateRequest> {
-    let prompt = if session {
+    let prompt = if session && !request.has_tool_context() {
         build_session_prompt(&request.messages)
     } else {
-        build_prompt(&request.messages)
+        render_prompt(request, chat_template)?
     };
     let token_ids = tokenizer
         .encode(&prompt)
@@ -867,7 +1061,7 @@ fn prepare_generate_request(
     Ok(PreparedGenerateRequest {
         request: GenerateRequest {
             prompt: GeneratePrompt::TokenIds(token_ids),
-            options: build_generate_options(request),
+            options: build_generate_options_with_tokenizer(request, tokenizer),
         },
         prompt_tokens,
     })
@@ -889,6 +1083,30 @@ fn build_generate_options(request: &ChatCompletionRequest) -> GenerateOptions {
     options
 }
 
+fn build_generate_options_with_tokenizer(
+    request: &ChatCompletionRequest,
+    tokenizer: &Tokenizer,
+) -> GenerateOptions {
+    let mut options = build_generate_options(request);
+    let eos_token_ids = tokenizer.eos_token_ids();
+    if let Some(first) = eos_token_ids.first().copied() {
+        options.eos_token_id = Some(first);
+    }
+    for eos_token_id in eos_token_ids {
+        let eos_sequence = StopSequence::Tokens(vec![eos_token_id]);
+        if !options.stop_sequences.contains(&eos_sequence) {
+            options.stop_sequences.push(eos_sequence);
+        }
+    }
+    if let Some(im_end_id) = tokenizer.token_id("<|im_end|>") {
+        let im_end_sequence = StopSequence::Tokens(vec![im_end_id]);
+        if !options.stop_sequences.contains(&im_end_sequence) {
+            options.stop_sequences.push(im_end_sequence);
+        }
+    }
+    options
+}
+
 fn json_constraint_stopped_incomplete(err: &anyhow::Error) -> bool {
     err.to_string()
         .contains("JSON constrained decoding stopped before a complete JSON value")
@@ -897,24 +1115,156 @@ fn json_constraint_stopped_incomplete(err: &anyhow::Error) -> bool {
 fn build_session_prompt(messages: &[ChatMessage]) -> String {
     messages
         .last()
-        .map(|message| message.content.clone())
+        .and_then(|message| message.content.clone())
         .unwrap_or_default()
+}
+
+fn render_prompt(
+    request: &ChatCompletionRequest,
+    chat_template: Option<&ChatTemplate>,
+) -> anyhow::Result<String> {
+    if let Some(chat_template) = chat_template {
+        let messages = request
+            .messages
+            .iter()
+            .map(|message| {
+                let mut template_message = TemplateChatMessage::new(
+                    message.role.as_str(),
+                    message.content.clone().unwrap_or_default(),
+                );
+                if let Some(tool_calls) = &message.tool_calls {
+                    template_message =
+                        template_message.with_tool_calls(serde_json::to_value(tool_calls)?);
+                }
+                Ok(template_message)
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let tools_json = request
+            .tools
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
+        return chat_template
+            .render(&messages, tools_json.as_deref(), true)
+            .map_err(|err| anyhow::anyhow!("chat template render failed: {err}"));
+    }
+    Ok(build_prompt(request))
 }
 
 /// Build the Phase 2 chat prompt with a simple role-tagged template:
 /// `<|role|>\n{content}\n` for every message, followed by `<|assistant|>\n`.
 /// Model-specific templates will replace this once tokenizer chat templates are wired.
-pub fn build_prompt(messages: &[ChatMessage]) -> String {
+pub fn build_prompt(request: &ChatCompletionRequest) -> String {
     let mut prompt = String::new();
-    for message in messages {
+    if let Some(tools) = request.tools.as_ref().filter(|tools| !tools.is_empty()) {
+        prompt.push_str("<|tools|>\n");
+        prompt.push_str(&serde_json::to_string(tools).unwrap_or_else(|_| "[]".to_string()));
+        prompt.push('\n');
+    }
+    if let Some(tool_choice) = &request.tool_choice {
+        prompt.push_str("<|tool_choice|>\n");
+        prompt.push_str(&tool_choice_prompt(tool_choice));
+        prompt.push('\n');
+    }
+    for message in &request.messages {
         prompt.push_str("<|");
         prompt.push_str(message.role.trim());
         prompt.push_str("|>\n");
-        prompt.push_str(&message.content);
+        if let Some(tool_call_id) = &message.tool_call_id {
+            prompt.push_str("tool_call_id: ");
+            prompt.push_str(tool_call_id);
+            prompt.push('\n');
+        }
+        if let Some(content) = &message.content {
+            prompt.push_str(content);
+        }
+        if let Some(tool_calls) = &message.tool_calls {
+            if message.content.is_some() {
+                prompt.push('\n');
+            }
+            prompt
+                .push_str(&serde_json::to_string(tool_calls).unwrap_or_else(|_| "[]".to_string()));
+        }
         prompt.push('\n');
     }
     prompt.push_str("<|assistant|>\n");
     prompt
+}
+
+fn tool_choice_prompt(tool_choice: &ToolChoice) -> String {
+    match tool_choice {
+        ToolChoice::Mode(mode) => match mode {
+            ToolChoiceMode::Auto => "auto".to_string(),
+            ToolChoiceMode::None => "none".to_string(),
+            ToolChoiceMode::Required => "required".to_string(),
+        },
+        ToolChoice::Specific(choice) => format!("function: {}", choice.function.name),
+    }
+}
+
+pub fn parse_tool_calls(output: &str) -> Vec<ChatMessageToolCall> {
+    let mut calls = Vec::new();
+    let mut rest = output;
+    while let Some(start) = rest.find("<tool_call>") {
+        rest = &rest[start + "<tool_call>".len()..];
+        let Some(end) = rest.find("</tool_call>") else {
+            break;
+        };
+        let body = rest[..end].trim();
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(body) {
+            if let Some(call) = parsed_tool_call_to_openai(calls.len(), value) {
+                calls.push(call);
+            }
+        }
+        rest = &rest[end + "</tool_call>".len()..];
+    }
+    calls
+}
+
+#[derive(Debug, Clone)]
+pub struct ParsedAssistantOutput {
+    pub content: Option<String>,
+    pub tool_calls: Option<Vec<ChatMessageToolCall>>,
+    pub finish_reason: &'static str,
+}
+
+pub fn parse_assistant_output(
+    output: String,
+    default_finish_reason: &'static str,
+) -> ParsedAssistantOutput {
+    let tool_calls = parse_tool_calls(&output);
+    if tool_calls.is_empty() {
+        ParsedAssistantOutput {
+            content: Some(output),
+            tool_calls: None,
+            finish_reason: default_finish_reason,
+        }
+    } else {
+        ParsedAssistantOutput {
+            content: None,
+            tool_calls: Some(tool_calls),
+            finish_reason: "tool_calls",
+        }
+    }
+}
+
+fn parsed_tool_call_to_openai(
+    index: usize,
+    value: serde_json::Value,
+) -> Option<ChatMessageToolCall> {
+    let name = value.get("name")?.as_str()?.to_string();
+    let arguments = value
+        .get("arguments")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    Some(ChatMessageToolCall {
+        id: format!("call_{index}"),
+        kind: "function".to_string(),
+        function: ChatMessageToolCallFunction {
+            name,
+            arguments: serde_json::to_string(&arguments).ok()?,
+        },
+    })
 }
 
 fn finish_reason_label(reason: &FinishReason) -> &'static str {
@@ -953,6 +1303,24 @@ fn infer_model_id(model_dir: &Path) -> String {
         .and_then(|name| name.to_str())
         .unwrap_or("onnx-genai-model")
         .to_string()
+}
+
+fn load_chat_template(model_dir: &Path) -> anyhow::Result<Option<ChatTemplate>> {
+    let standalone = model_dir.join("chat_template.jinja");
+    let tokenizer_config = model_dir.join("tokenizer_config.json");
+    let has_template = standalone.is_file()
+        || tokenizer_config.is_file()
+            && std::fs::read_to_string(&tokenizer_config)
+                .ok()
+                .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+                .and_then(|value| value.get("chat_template").cloned())
+                .and_then(|value| value.as_str().map(ToString::to_string))
+                .is_some();
+    if has_template {
+        Ok(Some(ChatTemplate::from_model_dir(model_dir)?))
+    } else {
+        Ok(None)
+    }
 }
 
 #[cfg(test)]
