@@ -129,6 +129,27 @@ pub struct StaticCacheDecodeSession<'a> {
     buffers: Vec<StaticCacheBuffer>,
 }
 
+/// Batched stateful decode runner for static-cache TensorScatter models.
+///
+/// One agent/session is assigned to one batch row. KV buffers are allocated once
+/// as `[B, MAX_LEN, KV_DIM]` per layer and bound in-place like
+/// [`StaticCacheDecodeSession`]. Each row has its own logical cursor used to
+/// build `write_indices[row]` and `nonpad_kv_seqlen[row]`.
+///
+/// Inactive rows are not logically advanced and can be reset/reused, but this
+/// first slice still binds the full fixed batch; inactive rows therefore still
+/// consume model compute until a future compacted-row/view optimization lands.
+pub struct BatchedStaticCacheDecodeSession<'a> {
+    session: &'a Session,
+    binding: IoBinding,
+    signature: StaticCacheSignature,
+    batch_size: usize,
+    row_lens: Vec<usize>,
+    active: Vec<bool>,
+    mode: StaticCacheBindingMode,
+    buffers: Vec<StaticCacheBuffer>,
+}
+
 impl<'a> DecodeSession<'a> {
     /// Create a decode session and infer KV input/output pairs from graph names.
     pub fn new(session: &'a Session, options: DecodeSessionOptions) -> Result<Self> {
@@ -697,6 +718,437 @@ impl<'a> StaticCacheDecodeSession<'a> {
             }
         }
         self.mode = StaticCacheBindingMode::HandleSwap;
+        Ok(())
+    }
+}
+
+impl<'a> BatchedStaticCacheDecodeSession<'a> {
+    /// Detect a STATIC-CACHE/TensorScatter signature from ONNX graph I/O.
+    pub fn detect(session: &Session) -> Result<Option<StaticCacheSignature>> {
+        StaticCacheDecodeSession::detect(session)
+    }
+
+    /// Create a batched static-cache decode session with all rows active at
+    /// cursor 0.
+    pub fn new(session: &'a Session, options: StaticCacheDecodeOptions) -> Result<Self> {
+        let (signature, pairs) = detect_static_cache(session)?.ok_or_else(|| {
+            OrtError::InvalidArgument(
+                "model does not expose static-cache key_cache/write_indices inputs".into(),
+            )
+        })?;
+        let batch_size = usize::try_from(options.batch_size).map_err(|_| {
+            OrtError::InvalidArgument(format!(
+                "batch_size must be positive, got {}",
+                options.batch_size
+            ))
+        })?;
+        if batch_size == 0 {
+            return Err(OrtError::InvalidArgument(
+                "batch_size must be positive".into(),
+            ));
+        }
+        let buffers = allocate_static_cache_buffers(options.batch_size, &pairs)?;
+        Ok(Self {
+            session,
+            binding: IoBinding::new(session)?,
+            signature,
+            batch_size,
+            row_lens: vec![0; batch_size],
+            active: vec![true; batch_size],
+            mode: StaticCacheBindingMode::InPlaceAlias,
+            buffers,
+        })
+    }
+
+    pub fn signature(&self) -> &StaticCacheSignature {
+        &self.signature
+    }
+
+    pub fn binding_mode(&self) -> StaticCacheBindingMode {
+        self.mode
+    }
+
+    pub fn batch_size(&self) -> usize {
+        self.batch_size
+    }
+
+    pub fn max_len(&self) -> usize {
+        self.signature.max_len
+    }
+
+    pub fn row_len(&self, row: usize) -> Result<usize> {
+        self.check_row(row)?;
+        Ok(self.row_lens[row])
+    }
+
+    pub fn row_lens(&self) -> &[usize] {
+        &self.row_lens
+    }
+
+    pub fn is_active(&self, row: usize) -> Result<bool> {
+        self.check_row(row)?;
+        Ok(self.active[row])
+    }
+
+    pub fn active_rows(&self) -> Vec<usize> {
+        self.active
+            .iter()
+            .enumerate()
+            .filter_map(|(row, active)| active.then_some(row))
+            .collect()
+    }
+
+    /// Mark a row inactive. It remains in the bound batch and still costs
+    /// compute, but its logical cursor is not advanced by `prefill`/`step`.
+    pub fn deactivate_row(&mut self, row: usize) -> Result<()> {
+        self.check_row(row)?;
+        self.active[row] = false;
+        Ok(())
+    }
+
+    /// Mark a retained row active without modifying its KV contents or cursor.
+    pub fn activate_row(&mut self, row: usize) -> Result<()> {
+        self.check_row(row)?;
+        self.active[row] = true;
+        Ok(())
+    }
+
+    /// Reset one row's KV region and cursor, then mark it active for a new
+    /// agent/session.
+    pub fn assign_row(&mut self, row: usize) -> Result<()> {
+        self.check_row(row)?;
+        self.binding.clear()?;
+        for buffer in &mut self.buffers {
+            Arc::get_mut(&mut buffer.current)
+                .ok_or_else(|| {
+                    OrtError::InvalidArgument(format!(
+                        "static-cache buffer '{}' is still borrowed",
+                        buffer.input_name
+                    ))
+                })?
+                .zero_rank3_row(row)?;
+            if let Some(alternate) = buffer.alternate.as_mut() {
+                Arc::get_mut(alternate)
+                    .ok_or_else(|| {
+                        OrtError::InvalidArgument(format!(
+                            "static-cache alternate buffer '{}' is still borrowed",
+                            buffer.output_name
+                        ))
+                    })?
+                    .zero_rank3_row(row)?;
+            }
+        }
+        self.row_lens[row] = 0;
+        self.active[row] = true;
+        Ok(())
+    }
+
+    /// Rewind one row's logical write cursor. Stale suffix slots are ignored by
+    /// later `nonpad_kv_seqlen` values and overwritten by future writes.
+    pub fn rewind_row(&mut self, row: usize, target_len: usize) -> Result<()> {
+        self.check_row(row)?;
+        if target_len > self.row_lens[row] {
+            return Err(OrtError::InvalidArgument(format!(
+                "cannot rewind row {row} from {} to larger length {target_len}",
+                self.row_lens[row]
+            )));
+        }
+        self.row_lens[row] = target_len;
+        Ok(())
+    }
+
+    /// Runtime-owned KV buffer identities and sizes.
+    pub fn buffer_infos(&self) -> Result<Vec<StaticCacheBufferInfo>> {
+        self.buffers
+            .iter()
+            .map(|buffer| {
+                Ok(StaticCacheBufferInfo {
+                    input_name: buffer.input_name.clone(),
+                    output_name: buffer.output_name.clone(),
+                    shape: buffer.current.shape().to_vec(),
+                    dtype: buffer.current.dtype(),
+                    data_ptr: buffer.current.data_ptr_addr()?,
+                    numel: buffer.current.numel(),
+                })
+            })
+            .collect()
+    }
+
+    /// Scatter a same-length chunk for every active row and return `[B, S, V]`
+    /// logits. Inactive rows receive the provided dummy ids but their row cursor
+    /// and `nonpad_kv_seqlen` are left unchanged.
+    pub fn prefill(&mut self, input_ids: &[i64], position_ids: &[i64]) -> Result<Value> {
+        let seq_len = self.seq_len_from_flat_input(input_ids)?;
+        self.run_batched_static_chunk(input_ids, position_ids, seq_len, None)?;
+        self.last_logits()
+    }
+
+    /// Scatter one token per active row at each row's current cursor.
+    pub fn step(&mut self, next_token_ids: &[i64], position_ids: &[i64]) -> Result<Value> {
+        self.run_batched_static_chunk(next_token_ids, position_ids, 1, None)?;
+        self.last_logits()
+    }
+
+    /// Scatter one token per row, advancing only rows where `advance_rows[row]`
+    /// is true and the row is active. This is useful for ragged prompt prefill
+    /// and continuous-batch join/leave tests.
+    pub fn step_select(
+        &mut self,
+        next_token_ids: &[i64],
+        position_ids: &[i64],
+        advance_rows: &[bool],
+    ) -> Result<Value> {
+        self.run_batched_static_chunk(next_token_ids, position_ids, 1, Some(advance_rows))?;
+        self.last_logits()
+    }
+
+    /// Extract logits for one row/sequence position from a `[B, S, vocab]`
+    /// logits tensor.
+    pub fn row_logits(logits: &Value, row: usize, seq_index: usize) -> Result<Vec<f32>> {
+        if logits.dtype() != DataType::Float32 || logits.shape().len() != 3 {
+            return Err(OrtError::InvalidArgument(format!(
+                "expected Float32 logits [B, S, V], got {:?} {:?}",
+                logits.dtype(),
+                logits.shape()
+            )));
+        }
+        let shape = logits.shape();
+        let batch = shape[0] as usize;
+        let seq_len = shape[1] as usize;
+        let vocab = shape[2] as usize;
+        if row >= batch || seq_index >= seq_len {
+            return Err(OrtError::InvalidArgument(format!(
+                "logits row/seq ({row}, {seq_index}) out of range for shape {:?}",
+                logits.shape()
+            )));
+        }
+        let data = logits.to_vec_f32()?;
+        let start = (row * seq_len + seq_index) * vocab;
+        Ok(data[start..start + vocab].to_vec())
+    }
+
+    fn seq_len_from_flat_input(&self, input_ids: &[i64]) -> Result<usize> {
+        if input_ids.is_empty() || input_ids.len() % self.batch_size != 0 {
+            return Err(OrtError::InvalidArgument(format!(
+                "input_ids length {} is not a non-empty multiple of batch {}",
+                input_ids.len(),
+                self.batch_size
+            )));
+        }
+        Ok(input_ids.len() / self.batch_size)
+    }
+
+    fn run_batched_static_chunk(
+        &mut self,
+        input_ids: &[i64],
+        position_ids: &[i64],
+        seq_len: usize,
+        advance_rows: Option<&[bool]>,
+    ) -> Result<()> {
+        if let Some(advance_rows) = advance_rows
+            && advance_rows.len() != self.batch_size
+        {
+            return Err(OrtError::InvalidArgument(format!(
+                "advance_rows length {} does not match batch {}",
+                advance_rows.len(),
+                self.batch_size
+            )));
+        }
+        let advances = (0..self.batch_size)
+            .map(|row| self.active[row] && advance_rows.is_none_or(|mask| mask[row]))
+            .collect::<Vec<_>>();
+        for (row, advance) in advances.iter().copied().enumerate() {
+            if advance && self.row_lens[row] + seq_len > self.signature.max_len {
+                return Err(OrtError::InvalidArgument(format!(
+                    "row {row} static-cache write {}..{} exceeds capacity {}",
+                    self.row_lens[row],
+                    self.row_lens[row] + seq_len,
+                    self.signature.max_len
+                )));
+            }
+        }
+        match self.try_run_batched_static_chunk(input_ids, position_ids, seq_len, &advances) {
+            Ok(()) => {
+                for (row, advance) in advances.into_iter().enumerate() {
+                    if advance {
+                        self.row_lens[row] += seq_len;
+                    }
+                }
+                Ok(())
+            }
+            Err(first_err) if self.mode == StaticCacheBindingMode::InPlaceAlias => {
+                self.enable_handle_swap()?;
+                self.try_run_batched_static_chunk(input_ids, position_ids, seq_len, &advances)
+                    .map_err(|second_err| {
+                        OrtError::InvalidArgument(format!(
+                            "batched static-cache in-place alias run failed ({first_err}); handle-swap fallback also failed ({second_err})"
+                        ))
+                    })?;
+                for (row, advance) in advances.into_iter().enumerate() {
+                    if advance {
+                        self.row_lens[row] += seq_len;
+                    }
+                }
+                Ok(())
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    fn try_run_batched_static_chunk(
+        &mut self,
+        input_ids: &[i64],
+        position_ids: &[i64],
+        seq_len: usize,
+        advances: &[bool],
+    ) -> Result<()> {
+        let batch = self.batch_size as i64;
+        if input_ids.len() != self.batch_size * seq_len {
+            return Err(OrtError::InvalidArgument(format!(
+                "input_ids length {} does not match [B={}, S={}]",
+                input_ids.len(),
+                self.batch_size,
+                seq_len
+            )));
+        }
+        let input_ids_value = Value::from_slice_i64(input_ids, &[batch, seq_len as i64])?;
+        let position_ids_value = if self.signature.has_position_ids {
+            if position_ids.len() != input_ids.len() {
+                return Err(OrtError::InvalidArgument(
+                    "position_ids length must match input_ids length".into(),
+                ));
+            }
+            Some(Value::from_slice_i64(
+                position_ids,
+                &[batch, seq_len as i64],
+            )?)
+        } else {
+            None
+        };
+        let write_indices = self
+            .row_lens
+            .iter()
+            .map(|len| *len as i64)
+            .collect::<Vec<_>>();
+        let nonpad_kv_seqlen = self
+            .row_lens
+            .iter()
+            .zip(advances)
+            .map(|(len, advance)| if *advance { len + seq_len } else { *len } as i64)
+            .collect::<Vec<_>>();
+        let write_indices = Value::from_slice_i64(&write_indices, &[batch])?;
+        let nonpad_kv_seqlen = Value::from_slice_i64(&nonpad_kv_seqlen, &[batch])?;
+
+        self.binding.clear()?;
+        for input in self.session.inputs() {
+            match input.name.as_str() {
+                "input_ids" => self.binding.bind_input(&input.name, &input_ids_value)?,
+                "position_ids" => {
+                    let Some(position_ids_value) = position_ids_value.as_ref() else {
+                        return Err(OrtError::InvalidArgument(
+                            "model requires position_ids but none were prepared".into(),
+                        ));
+                    };
+                    self.binding.bind_input(&input.name, position_ids_value)?;
+                }
+                "write_indices" => self.binding.bind_input(&input.name, &write_indices)?,
+                "nonpad_kv_seqlen" => self.binding.bind_input(&input.name, &nonpad_kv_seqlen)?,
+                name => {
+                    let Some(buffer) = self.buffers.iter().find(|buffer| buffer.input_name == name)
+                    else {
+                        return Err(OrtError::InvalidArgument(format!(
+                            "unsupported static-cache input '{}'",
+                            input.name
+                        )));
+                    };
+                    self.binding.bind_input(&input.name, &buffer.current)?;
+                }
+            }
+        }
+
+        let mut borrowed_outputs = Vec::new();
+        for output in self.session.output_names() {
+            if let Some(buffer) = self
+                .buffers
+                .iter()
+                .find(|buffer| buffer.output_name == *output)
+            {
+                let output_value = match self.mode {
+                    StaticCacheBindingMode::InPlaceAlias => &buffer.current,
+                    StaticCacheBindingMode::HandleSwap => {
+                        buffer.alternate.as_ref().ok_or_else(|| {
+                            OrtError::InvalidArgument(format!(
+                                "missing static-cache alternate buffer for '{}'",
+                                buffer.output_name
+                            ))
+                        })?
+                    }
+                };
+                borrowed_outputs.push(output_value.raw_ptr_addr());
+                self.binding.bind_output(output, output_value)?;
+            } else {
+                self.binding
+                    .bind_output_to_device(output, &MemoryInfo::cpu()?)?;
+            }
+        }
+
+        self.session.run_with_binding(&self.binding)?;
+        if self.mode == StaticCacheBindingMode::HandleSwap {
+            for buffer in &mut self.buffers {
+                let alternate = buffer.alternate.as_mut().ok_or_else(|| {
+                    OrtError::InvalidArgument(format!(
+                        "missing static-cache alternate buffer for '{}'",
+                        buffer.output_name
+                    ))
+                })?;
+                std::mem::swap(&mut buffer.current, alternate);
+            }
+        }
+        Ok(())
+    }
+
+    fn last_logits(&self) -> Result<Value> {
+        let borrowed_outputs = self
+            .buffers
+            .iter()
+            .flat_map(|buffer| {
+                std::iter::once(buffer.current.raw_ptr_addr())
+                    .chain(buffer.alternate.as_ref().map(|value| value.raw_ptr_addr()))
+            })
+            .collect::<Vec<_>>();
+        let outputs = self.binding.output_values_or_borrowed(&borrowed_outputs)?;
+        for (name, value) in self.session.output_names().iter().zip(outputs) {
+            if is_logits_output(name) {
+                return value.ok_or_else(|| {
+                    OrtError::InvalidArgument("logits unexpectedly aliased a KV buffer".into())
+                });
+            }
+        }
+        Err(OrtError::InvalidArgument(
+            "model did not produce logits".into(),
+        ))
+    }
+
+    fn enable_handle_swap(&mut self) -> Result<()> {
+        for buffer in &mut self.buffers {
+            if buffer.alternate.is_none() {
+                buffer.alternate = Some(Arc::new(zeroed_value(
+                    buffer.current.shape(),
+                    buffer.current.dtype(),
+                )?));
+            }
+        }
+        self.mode = StaticCacheBindingMode::HandleSwap;
+        Ok(())
+    }
+
+    fn check_row(&self, row: usize) -> Result<()> {
+        if row >= self.batch_size {
+            return Err(OrtError::InvalidArgument(format!(
+                "row {row} out of range for batch {}",
+                self.batch_size
+            )));
+        }
         Ok(())
     }
 }

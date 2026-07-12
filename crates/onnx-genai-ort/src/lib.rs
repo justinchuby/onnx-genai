@@ -22,9 +22,9 @@ pub use allocator::{Allocator, AllocatorType, MemoryInfo, MemoryType};
 pub use binding::IoBinding;
 pub use chat_template::{ChatMessage, ChatRole, ChatTemplate};
 pub use decode::{
-    DecodeKvMode, DecodeSession, DecodeSessionOptions, StaticCacheBindingMode,
-    StaticCacheBufferInfo, StaticCacheDecodeOptions, StaticCacheDecodeSession,
-    StaticCacheSignature,
+    BatchedStaticCacheDecodeSession, DecodeKvMode, DecodeSession, DecodeSessionOptions,
+    StaticCacheBindingMode, StaticCacheBufferInfo, StaticCacheDecodeOptions,
+    StaticCacheDecodeSession, StaticCacheSignature,
 };
 pub use env::Environment;
 pub use error::{OrtError, Result};

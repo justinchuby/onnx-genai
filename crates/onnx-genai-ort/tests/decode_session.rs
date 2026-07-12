@@ -2,9 +2,9 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use onnx_genai_ort::{
-    DataType, DecodeKvMode, DecodeSession, DecodeSessionOptions, Environment, Session,
-    SessionOptions, StaticCacheBindingMode, StaticCacheDecodeOptions, StaticCacheDecodeSession,
-    TensorInfo, Value,
+    BatchedStaticCacheDecodeSession, DataType, DecodeKvMode, DecodeSession, DecodeSessionOptions,
+    Environment, Session, SessionOptions, StaticCacheBindingMode, StaticCacheDecodeOptions,
+    StaticCacheDecodeSession, TensorInfo, Value,
 };
 
 fn tiny_llm() -> PathBuf {
@@ -142,6 +142,132 @@ fn static_cache_decode_reuses_buffers_and_rewinds_deterministically() {
         decode.buffer_infos().expect("after replay"),
         initial_buffers
     );
+}
+
+#[test]
+fn batched_static_cache_matches_unbatched_rows_and_reuses_slots() {
+    let env = Environment::new("batched-static-cache-decode-test").expect("env");
+    let session =
+        Session::new(&env, &tiny_scatter_llm(), SessionOptions::default()).expect("session");
+    let prompts = [vec![1_i64, 5], vec![2_i64, 6, 7], vec![3_i64]];
+    let generated = 3;
+
+    let expected = prompts
+        .iter()
+        .map(|prompt| static_cache_greedy_trace(&session, prompt, generated))
+        .collect::<Vec<_>>();
+    let max_steps = expected
+        .iter()
+        .map(|trace| trace.input_tokens.len())
+        .max()
+        .expect("traces");
+
+    let mut batched =
+        BatchedStaticCacheDecodeSession::new(&session, StaticCacheDecodeOptions { batch_size: 3 })
+            .expect("batched static decode session");
+    let initial_buffers = batched.buffer_infos().expect("initial buffers");
+    assert_eq!(initial_buffers.len(), 2);
+    assert!(
+        initial_buffers
+            .iter()
+            .all(|buffer| buffer.shape == [3, 16, 16])
+    );
+
+    for step in 0..max_steps {
+        let mut ids = vec![0_i64; prompts.len()];
+        let mut positions = vec![0_i64; prompts.len()];
+        let mut advance = vec![false; prompts.len()];
+        for (row, trace) in expected.iter().enumerate() {
+            if step < trace.input_tokens.len() {
+                ids[row] = trace.input_tokens[step];
+                positions[row] = batched.row_len(row).expect("row len") as i64;
+                advance[row] = true;
+            }
+        }
+
+        let logits = batched
+            .step_select(&ids, &positions, &advance)
+            .expect("batched step");
+        for (row, trace) in expected.iter().enumerate() {
+            if advance[row] {
+                let row_logits =
+                    BatchedStaticCacheDecodeSession::row_logits(&logits, row, 0).expect("row");
+                assert_close(&row_logits, &trace.logits[step]);
+                assert_eq!(argmax(&row_logits), argmax(&trace.logits[step]));
+            }
+        }
+        assert_eq!(batched.buffer_infos().expect("after step"), initial_buffers);
+    }
+    assert_eq!(batched.row_lens(), &[5, 6, 4]);
+    assert_eq!(batched.active_rows(), vec![0, 1, 2]);
+
+    batched.rewind_row(1, 2).expect("rewind row 1");
+    let replay = batched
+        .step_select(
+            &[0, expected[1].input_tokens[2], 0],
+            &[0, 2, 0],
+            &[false, true, false],
+        )
+        .expect("replay row 1");
+    let replay_row = BatchedStaticCacheDecodeSession::row_logits(&replay, 1, 0).expect("row 1");
+    assert_close(&replay_row, &expected[1].logits[2]);
+    assert_eq!(batched.row_len(1).expect("row 1 len"), 3);
+
+    batched.deactivate_row(2).expect("deactivate row 2");
+    assert!(!batched.is_active(2).expect("row 2 active"));
+    batched.assign_row(2).expect("reuse row 2");
+    assert!(batched.is_active(2).expect("row 2 active"));
+    assert_eq!(batched.row_len(2).expect("row 2 reset"), 0);
+    let replacement = static_cache_greedy_trace(&session, &[4_i64, 9], 0);
+    for (index, token) in replacement.input_tokens.iter().enumerate() {
+        let logits = batched
+            .step_select(
+                &[0, 0, *token],
+                &[0, 0, index as i64],
+                &[false, false, true],
+            )
+            .expect("replacement row step");
+        let row_logits =
+            BatchedStaticCacheDecodeSession::row_logits(&logits, 2, 0).expect("replacement row");
+        assert_close(&row_logits, &replacement.logits[index]);
+    }
+    assert_eq!(batched.row_len(2).expect("replacement len"), 2);
+    assert_eq!(
+        batched.buffer_infos().expect("after reuse"),
+        initial_buffers
+    );
+}
+
+struct StaticTrace {
+    input_tokens: Vec<i64>,
+    logits: Vec<Vec<f32>>,
+}
+
+fn static_cache_greedy_trace(session: &Session, prompt: &[i64], generated: usize) -> StaticTrace {
+    let mut decode =
+        StaticCacheDecodeSession::new(session, StaticCacheDecodeOptions { batch_size: 1 })
+            .expect("static decode session");
+    let mut input_tokens = Vec::new();
+    let mut logits = Vec::new();
+    for (position, token) in prompt.iter().enumerate() {
+        let value = decode
+            .step(&[*token], &[position as i64])
+            .expect("prompt step");
+        input_tokens.push(*token);
+        logits.push(value.to_vec_f32().expect("prompt logits"));
+    }
+    for _ in 0..generated {
+        let next = argmax(logits.last().expect("previous logits")) as i64;
+        let value = decode
+            .step(&[next], &[decode.current_len() as i64])
+            .expect("generated step");
+        input_tokens.push(next);
+        logits.push(value.to_vec_f32().expect("generated logits"));
+    }
+    StaticTrace {
+        input_tokens,
+        logits,
+    }
 }
 
 fn naive_logits(session: &Session, tokens: &[i64]) -> Vec<Vec<f32>> {

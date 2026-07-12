@@ -259,6 +259,58 @@ impl Value {
         Ok(tensor_data_ptr(self.ptr.as_ptr())? as usize)
     }
 
+    /// Zero one row of a rank-3 row-major tensor shaped `[B, N, D]`.
+    pub(crate) fn zero_rank3_row(&mut self, row: usize) -> Result<()> {
+        if self.shape.len() != 3 {
+            return Err(OrtError::InvalidArgument(format!(
+                "zero_rank3_row requires rank-3 tensor, got {:?}",
+                self.shape
+            )));
+        }
+        let batch = self.shape[0] as usize;
+        if row >= batch {
+            return Err(OrtError::InvalidArgument(format!(
+                "row {row} out of range for batch {batch}"
+            )));
+        }
+        let row_len = (self.shape[1] as usize)
+            .checked_mul(self.shape[2] as usize)
+            .ok_or_else(|| {
+                OrtError::InvalidArgument(format!("tensor shape too large: {:?}", self.shape))
+            })?;
+        let start = row
+            .checked_mul(row_len)
+            .ok_or_else(|| OrtError::InvalidArgument("row offset overflow".into()))?;
+        match &mut self.backing {
+            TensorBacking::F32(data) => data[start..start + row_len].fill(0.0),
+            TensorBacking::F16(data) => data[start..start + row_len].fill(0),
+            TensorBacking::None => match self.dtype {
+                DataType::Float32 => {
+                    let ptr = tensor_data_ptr(self.ptr.as_ptr())?.cast::<f32>();
+                    // SAFETY: `start..start + row_len` lies within this tensor's
+                    // row-major allocation, and ORT returned a mutable data pointer.
+                    unsafe { std::slice::from_raw_parts_mut(ptr.add(start), row_len) }.fill(0.0);
+                }
+                DataType::Float16 => {
+                    let ptr = tensor_data_ptr(self.ptr.as_ptr())?.cast::<u16>();
+                    // SAFETY: same bounds/invariants as the Float32 branch.
+                    unsafe { std::slice::from_raw_parts_mut(ptr.add(start), row_len) }.fill(0);
+                }
+                dtype => {
+                    return Err(OrtError::InvalidArgument(format!(
+                        "cannot zero static-cache row for dtype {dtype:?}"
+                    )));
+                }
+            },
+            TensorBacking::I64(_) | TensorBacking::Alias(_) => {
+                return Err(OrtError::InvalidArgument(
+                    "cannot zero row for non-owned or non-KV tensor".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Create a no-copy CPU tensor alias over the prefix of an existing tensor.
     ///
     /// The returned OrtValue has its own shape but points at the same underlying
