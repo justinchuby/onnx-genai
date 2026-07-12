@@ -807,6 +807,73 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn ngram_proposer_validates_configuration_and_empty_matches() -> anyhow::Result<()> {
+        assert_eq!(
+            NgramProposer::new(0, 1).unwrap_err().to_string(),
+            "ngram must be greater than zero"
+        );
+        assert_eq!(
+            NgramProposer::new(1, 0).unwrap_err().to_string(),
+            "max_tokens must be greater than zero"
+        );
+
+        let options = GenerateOptions::default();
+        let chain = ProcessorChain::new();
+        let context = |tokens| SpeculativeProposerContext {
+            width: 4,
+            context_tokens: tokens,
+            generated_tokens: &[],
+            generated_text: "",
+            first_step: 0,
+            options: &options,
+            chain: &chain,
+            target_hidden: None,
+            guaranteed_token: None,
+        };
+        let mut proposer = NgramProposer::new(2, 4)?;
+
+        assert!(proposer.propose(&context(&[1, 2]))?.tokens.is_empty());
+        assert!(proposer.propose(&context(&[1, 2, 3, 4]))?.tokens.is_empty());
+        assert_eq!(proposer.name(), "prompt_lookup");
+        Ok(())
+    }
+
+    #[test]
+    fn ngram_proposer_respects_request_and_config_widths() -> anyhow::Result<()> {
+        let options = GenerateOptions::default();
+        let chain = ProcessorChain::new();
+        let tokens = [1, 2, 3, 4, 1, 2];
+        let mut proposer = NgramProposer::new(2, 2)?;
+        let proposal = proposer.propose(&SpeculativeProposerContext {
+            width: 8,
+            context_tokens: &tokens,
+            generated_tokens: &[],
+            generated_text: "",
+            first_step: 0,
+            options: &options,
+            chain: &chain,
+            target_hidden: None,
+            guaranteed_token: None,
+        })?;
+        assert_eq!(proposal.tokens, vec![3, 4]);
+
+        let mut proposer = NgramProposer::new(2, 8)?;
+        let proposal = proposer.propose(&SpeculativeProposerContext {
+            width: 1,
+            context_tokens: &tokens,
+            generated_tokens: &[],
+            generated_text: "",
+            first_step: 0,
+            options: &options,
+            chain: &chain,
+            target_hidden: None,
+            guaranteed_token: None,
+        })?;
+        assert_eq!(proposal.tokens, vec![3]);
+        Ok(())
+    }
+
     fn lcg_weights(seed: u64, len: usize) -> Vec<f32> {
         let mut state = seed;
         (0..len)

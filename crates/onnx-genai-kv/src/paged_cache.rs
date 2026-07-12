@@ -762,4 +762,108 @@ mod tests {
         assert_close(&materialized.layers[0].key, &expected_key, 0.05);
         assert_close(&materialized.layers[0].value, &expected_value, 0.05);
     }
+
+    #[test]
+    fn tensor_write_rejects_unconfigured_invalid_shape_and_position() {
+        let mut unconfigured = PagedKvCache::new(2, 1);
+        let seq = unconfigured.create_sequence();
+        let token = layers(0.0);
+        assert!(matches!(
+            unconfigured.append_token_kv(seq, &borrowed_layers(&token)),
+            Err(KvError::TensorStorageNotConfigured)
+        ));
+
+        let mut cache = PagedKvCache::new_with_tensor_config(config(), 2);
+        let seq = cache.create_sequence();
+        let missing_layer = &borrowed_layers(&token)[..1];
+        assert!(matches!(
+            cache.append_token_kv(seq, missing_layer),
+            Err(KvError::InvalidTensorShape("wrong number of layers"))
+        ));
+
+        let malformed = vec![
+            LayerKv {
+                key: &[1.0],
+                value: &[1.0],
+            },
+            LayerKv {
+                key: &[1.0],
+                value: &[1.0],
+            },
+        ];
+        assert!(matches!(
+            cache.append_token_kv(seq, &malformed),
+            Err(KvError::InvalidTensorShape(_))
+        ));
+        assert!(matches!(
+            cache.write_token_kv(seq, 1, &borrowed_layers(&token)),
+            Err(KvError::InvalidPosition {
+                position: 1,
+                length: 0
+            })
+        ));
+    }
+
+    #[test]
+    fn int8_rewrite_after_fork_is_copy_on_write() {
+        let mut cache = PagedKvCache::new_with_tensor_config(small_config(KvDType::Int8), 2);
+        let source = cache.create_sequence();
+        let original = small_layers([-1.0, -0.5, 0.5, 1.0]);
+        cache
+            .append_token_kv(source, &borrowed_layers(&original))
+            .unwrap();
+        let forked = cache.fork(source, 1).unwrap();
+        let replacement = small_layers([2.0, 3.0, 4.0, 5.0]);
+
+        cache
+            .write_token_kv(forked, 0, &borrowed_layers(&replacement))
+            .unwrap();
+
+        let source_page = cache.page_table.get_sequence(source).unwrap()[0];
+        let forked_page = cache.page_table.get_sequence(forked).unwrap()[0];
+        assert_ne!(source_page, forked_page);
+        assert_close(
+            &cache.materialize_sequence(source).unwrap().layers[0].key,
+            &original[0].0,
+            0.05,
+        );
+        assert_close(
+            &cache.materialize_sequence(forked).unwrap().layers[0].key,
+            &replacement[0].0,
+            0.05,
+        );
+    }
+
+    #[test]
+    fn eviction_and_prefetch_cover_empty_and_invalid_ranges() {
+        for policy in [
+            EvictionPolicy::Lru,
+            EvictionPolicy::Priority,
+            EvictionPolicy::LayerAware,
+        ] {
+            let mut cache = PagedKvCache::new(1, 2);
+            let seq = cache.create_sequence();
+            cache.append(seq, 2).unwrap();
+            assert_eq!(cache.evict(policy, 3), 2);
+        }
+
+        let mut cache = PagedKvCache::new(2, 1);
+        let seq = cache.create_sequence();
+        cache.append(seq, 1).unwrap();
+        assert_eq!(cache.prefetch(seq, 1, 1).unwrap(), 0);
+        assert!(matches!(
+            cache.prefetch(seq, 1, 0),
+            Err(KvError::InvalidPosition {
+                position: 0,
+                length: 1
+            })
+        ));
+        assert!(matches!(
+            cache.prefetch(seq, 0, 2),
+            Err(KvError::InvalidPosition {
+                position: 2,
+                length: 1
+            })
+        ));
+    }
 }

@@ -1237,6 +1237,55 @@ mod tests {
     }
 
     #[test]
+    fn json_constraint_defers_stop_until_value_is_complete() {
+        let options = GenerateOptions {
+            constraint: Some(GenerateConstraint::Json),
+            stop_sequences: vec![StopSequence::Text("}".to_string())],
+            ..Default::default()
+        };
+        let chain_options = GenerateOptions {
+            stop_sequences: options.stop_sequences.clone(),
+            ..Default::default()
+        };
+        let chain = build_processor_chain(&chain_options, None).unwrap();
+        let incomplete = ProcessorContext {
+            generated_text: "{\"value\":".to_string(),
+            ..Default::default()
+        };
+        let complete = ProcessorContext {
+            generated_text: "{\"value\":1}".to_string(),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            finish_reason_after_token(1, &options, &chain, &incomplete),
+            None
+        );
+        assert_eq!(
+            finish_reason_after_token(1, &options, &chain, &complete),
+            Some(FinishReason::StopSequence { index: 0 })
+        );
+    }
+
+    #[test]
+    fn incomplete_json_constraint_rejects_length_finishes() {
+        let options = GenerateOptions {
+            constraint: Some(GenerateConstraint::Json),
+            ..Default::default()
+        };
+        for reason in [FinishReason::MaxTokens, FinishReason::Length] {
+            let error = ensure_constrained_finish(&options, "{\"value\":", reason).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("stopped before a complete JSON value")
+            );
+        }
+        ensure_constrained_finish(&options, "{\"value\":1}", FinishReason::MaxTokens).unwrap();
+        ensure_constrained_finish(&options, "", FinishReason::EosToken).unwrap();
+    }
+
+    #[test]
     fn common_prefix_len_stops_before_rejected_draft_token() {
         assert_eq!(common_prefix_len(&[1, 2, 3, 4], &[1, 2, 9]), 2);
         assert_eq!(common_prefix_len(&[1, 2, 3], &[1, 2, 3, 4]), 3);

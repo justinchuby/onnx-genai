@@ -179,6 +179,13 @@ from the OS CSPRNG, context length is checked when declared by model metadata,
 and automatically downloaded ONNX Runtime archives require pinned SHA-256
 checksums. Tool execution is always the client's responsibility.
 
+## Coverage
+
+Run `scripts/coverage.sh` to install the required LLVM tools when missing and
+print workspace coverage. The final `TOTAL` row is the overall percentage; the
+preceding rows identify low-coverage source files. For annotated source, run
+`scripts/coverage.sh --html --open` instead of the default summary output.
+
 ## Project Structure
 
 ```text

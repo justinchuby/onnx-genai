@@ -320,4 +320,25 @@ mod tests {
         assert_eq!(cache.lookup(&[2]), (0, Vec::new()));
         assert_eq!(cache.lookup(&[3]), (0, Vec::new()));
     }
+
+    #[test]
+    fn release_and_eviction_are_safe_for_missing_or_active_entries() {
+        let mut table = page_table();
+        let page = table.allocate(Device::Gpu(0)).unwrap();
+        let mut cache = PrefixCache::new();
+        cache.insert_pages(&[7, 8], &[page], &mut table);
+
+        assert!(cache.release_shared(&[7, 8], 0, &mut table).is_empty());
+        assert!(cache.release_shared(&[7], 2, &mut table).is_empty());
+        assert!(cache.release_shared(&[9, 9], 2, &mut table).is_empty());
+
+        let matched = cache.lookup_shared(&[7, 8], &mut table);
+        assert_eq!(cache.evict_lru(1, &mut table), Vec::<PageId>::new());
+        assert_eq!(
+            cache.release_shared(&[7, 8], matched.matched_tokens, &mut table),
+            vec![page]
+        );
+        assert_eq!(cache.evict_lru(1, &mut table), vec![page]);
+        assert!(cache.evict_lru(1, &mut table).is_empty());
+    }
 }

@@ -46,10 +46,15 @@ fn prompt_lookup_greedy_matches_plain_greedy_exactly() -> anyhow::Result<()> {
 
     let expected = baseline.generate(request.clone())?;
     let actual = prompt_lookup.generate(request)?;
+    let stats = prompt_lookup.last_speculative_stats();
 
     assert_eq!(actual.token_ids, expected.token_ids);
     assert_eq!(actual.finish_reason, expected.finish_reason);
-    assert!(prompt_lookup.last_speculative_stats().proposed_tokens > 0);
+    assert!(stats.proposed_tokens > 0);
+    assert!(
+        stats.accepted_tokens < stats.proposed_tokens,
+        "fixture should exercise correction after a rejected proposal: {stats:?}"
+    );
     Ok(())
 }
 
