@@ -29,7 +29,9 @@ jobs:
             python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')"
 
           crate_exists() {
+            # crates.io returns 403 without a User-Agent, so the guard MUST send one.
             curl --fail --silent --show-error \
+              -H "User-Agent: onnx-genai-publish (github-actions; justinchuby/onnx-genai)" \
               "https://crates.io/api/v1/crates/$1/$version" >/dev/null 2>&1
           }
 
@@ -44,8 +46,16 @@ jobs:
 
             for attempt in 1 2 3 4 5 6; do
               echo "Publishing $crate $version (attempt $attempt/6)"
-              if cargo publish --locked -p "$crate"; then
+              if out="$(cargo publish --locked -p "$crate" 2>&1)"; then
+                echo "$out"
                 sleep 30
+                return
+              fi
+              echo "$out"
+
+              # Idempotent: an already-published version is success, not failure.
+              if echo "$out" | grep -qiE "already (exists|uploaded)"; then
+                echo "$crate $version already exists on crates.io; skipping."
                 return
               fi
 
