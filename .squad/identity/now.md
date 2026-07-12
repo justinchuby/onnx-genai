@@ -1,5 +1,5 @@
 # Now
 
-**Updated:** 2026-07-12T10:10:00-07:00
+**Updated:** 2026-07-12T12:02:00-07:00
 
-Current focus: Phases 1-3 complete (greedy+speculative gen, paged/tiered/quantized KV, prefix reuse, multi-session, priority+preemption, OpenAI HTTP w/ streaming early-stop; real coherent text verified). Speculative speedup is correct but CPU/tiny-model-bound (<1x locally). Known: flaky async SSE test to harden. Next: Phase 4 (multi-model pipeline, VLM, grammar/JSON constrained decoding, tree speculative, HW profiles).
+Current focus: Phases 1-4 + tool use/grammar + Qwen + Hermes-agent E2E + long-context O(1)/token all done. Next per DESIGN §23-28: FIM (§23), Min-P/freq/presence samplers (§24), extensibility traits (§25), batched multi-agent serving + PAUSED-on-tool (§26), advanced speculative MTP/Medusa/EAGLE (§27), vLLM speculators (§28); plus paged-attention milestone and onnx.helper->onnxscript fixture refactor.

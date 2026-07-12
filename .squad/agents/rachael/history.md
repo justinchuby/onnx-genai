@@ -17,3 +17,6 @@ Rachael delivered the OpenAI-compatible HTTP server with `/health`, `/v1/models`
 
 ## 2026-07-12T10:10:00-07:00 — Phase 3 complete
 Delivered Phase 3 server hardening: prompt-token usage accounting, SSE stop-sequence buffering/suppression with terminal stop chunks, `[DONE]`, and client-disconnect cancellation at callback boundaries.
+
+## 2026-07-12T12:02:00-07:00 — Tool-use server integration delivered
+Delivered OpenAI response_format JSON constraints, tools/tool_choice/tool-role handling, <tool_call> parsing into tool_calls, and forced tool_choice with generated Lark %json grammar.

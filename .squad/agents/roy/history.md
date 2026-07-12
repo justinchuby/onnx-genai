@@ -19,3 +19,6 @@ Roy's Phase 2 plan was executed successfully: paged KV tensor storage, prefix ca
 
 ## 2026-07-12T10:10:00-07:00 — Phase 3 complete
 Phase 3 plan completed and executed. Team delivered speculative decoding, tiered/quantized KV, priority/preemption, streaming/accounting hardening, and validation; speedup limitation is environment-bound locally.
+
+## 2026-07-12T12:02:00-07:00 — Phase 4 and long-context plans completed
+Roy's Phase 4, tool-use/grammar, and long-context plans were executed: pipeline execution, constrained decoding, OpenAI tool use, Qwen/Hermes validation, and O(1)/token static-cache decode are now recorded. Next roadmap follows DESIGN §23-28 plus paged attention.

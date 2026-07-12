@@ -24,3 +24,6 @@ Batty delivered persistent engine sessions, stateless `generate` compatibility, 
 
 ## 2026-07-12T10:10:00-07:00 — Phase 3 complete
 Delivered Phase 3 engine work: greedy speculative decoding, priority scheduling with swap preemption, context-window guard, and real-draft KV rewind fix; real differing model speculation is target-greedy token-identical.
+
+## 2026-07-12T12:02:00-07:00 — Phase 4 engine and decode migration delivered
+Delivered constrained decoding (JSON FSM + llguidance JSON Schema/Regex/Lark), pipeline executor APIs, and engine migration to DecodeSession/StaticCacheDecodeSession for O(1)/token KV movement.

@@ -22,3 +22,6 @@ Pris delivered Phase 2 coverage for interleaved persistent sessions, reset isola
 
 ## 2026-07-12T10:10:00-07:00 — Phase 3 complete
 Delivered Phase 3 validation: real TinyStories coherent CLI/HTTP generation, 12-session KV pressure pass with no OOM, speculative correctness harness, and documented CPU/tiny-model speedup limitation.
+
+## 2026-07-12T12:02:00-07:00 — Qwen, Hermes, VLM, and long-context validation delivered
+Validated Qwen2.5-0.5B Mobius builds and coherent generation, HTTP tool use, Hermes/coding-agent tool-loop acceptance, tiny VLM fixture scaffolding, static-cache scatter models, and flat 25-27 ms/token long-context decode.
