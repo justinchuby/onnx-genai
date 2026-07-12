@@ -5487,3 +5487,95 @@ pub fn observability_routes(config: &Config) -> Router {
     router
 }
 ```
+
+---
+
+## 33. ORT vs llama.cpp: PC Deployment Gap Analysis
+
+*From real user feedback on Foundry Local vs llama.cpp, 2026-07-12.*
+
+### 33.1 The Problem
+
+Users comparing Foundry Local (ORT-based) against llama.cpp for local PC deployment report:
+1. **Higher VRAM usage** for the same quantized model
+2. **Larger binary/DLL size** (ORT CUDA EP)
+
+Both matter critically on consumer GPUs (8-12 GB VRAM) where every MB counts.
+
+### 33.2 VRAM Gap Root Causes
+
+| Factor | llama.cpp | ORT (CUDA EP) | Gap |
+|---|---|---|---|
+| **Quantized matmul** | Compressed-domain kernel: operates directly on Q4/Q8 weights, no dequantize | MatMulNBits likely dequantizes to FP16 → cuBLAS matmul → extra intermediate tensor | ORT allocates full FP16 weight tensor temporarily |
+| **KV cache dtype** | Default FP16, supports Q8_0/Q4_0 KV | Likely FP32 KV cache by default | 2× KV memory if FP32 |
+| **Memory allocator** | Custom slab allocator, tight control | ORT arena allocator, may over-provision | Fragmentation + headroom waste |
+| **Op fusion** | Hand-fused attention + FFN kernels | Relies on graph optimizer for fusion, not always optimal | Missed fusions = extra intermediate buffers |
+| **Context overhead** | Minimal runtime state | ORT session, graph state, EP state | Fixed overhead per model load |
+
+### 33.3 Binary Size Gap Root Causes
+
+| Component | llama.cpp | ORT (CUDA EP) |
+|---|---|---|
+| Core binary | ~5-10 MB | onnxruntime.dll ~200-500 MB |
+| CUDA kernels | Only ~20 ops needed for transformers | Hundreds of ops compiled for CUDA |
+| Dependencies | cuBLAS optional, no cuDNN | cuBLAS + cuDNN required |
+| Op coverage | Transformer-only | General purpose (CNN, RNN, transformer, etc.) |
+| Build granularity | Single target arch | Multi-arch, multi-EP support compiled in |
+
+### 33.4 Implications for onnx-genai
+
+**What we can control (our runtime layer):**
+- Default KV cache to FP16 (not FP32)
+- Implement KV cache quantization (FP8/Q8 as designed in §16)
+- Aggressive memory reuse patterns in paged cache
+- Profile and document actual VRAM breakdown per component
+
+**What needs ORT-level changes (upstream):**
+- Compressed-domain quantized matmul kernels (avoid dequantize round-trip)
+- Build-time op stripping (only include ops used by loaded model)
+- Reduced binary: `onnxruntime-genai-slim` with only transformer-relevant CUDA kernels
+- Better arena allocator tuning defaults for genai workloads
+
+**Where we have an advantage over llama.cpp:**
+- **DirectML EP** — llama.cpp's DirectML/Vulkan support is weak. AMD/Intel GPU users get a poor experience with llama.cpp but good support from ORT
+- **NPU support** — QNN EP for Snapdragon, CoreML for Apple Silicon. llama.cpp has no NPU path
+- **Multi-EP** — same model, automatic fallback: CUDA → DirectML → CPU
+- **Quantization variety** — ORT supports more quantization formats via ONNX ops
+- **Enterprise features** — ONNX model signing, sandboxing, telemetry, compliance
+
+### 33.5 Competitive Strategy for PC Deployment
+
+```
+Short term:
+  - Don't compete with llama.cpp on CUDA-only VRAM efficiency (they win)
+  - Win on DirectML (AMD/Intel GPUs) and NPU (Snapdragon/Apple Silicon)
+  - Win on "just works" model loading (ONNX is standard format)
+
+Medium term:
+  - Push ORT team for compressed-domain kernels
+  - Push for binary size reduction (op stripping, slim builds)
+  - Our KV cache quantization helps close VRAM gap
+
+Long term:
+  - If ORT kernels catch up, our runtime + ORT = competitive everywhere
+  - Enterprise features (security, compliance, telemetry) differentiate
+  - Multi-modal pipeline support (not just LLM) is broader than llama.cpp
+```
+
+### 33.6 Tracking Metrics
+
+Add specific metrics to track competitive position:
+
+```
+# Per-model VRAM breakdown
+onnx_genai_vram_model_weights_bytes       gauge  # static weight memory
+onnx_genai_vram_kv_cache_bytes            gauge  # KV cache memory
+onnx_genai_vram_activations_bytes         gauge  # intermediate activation memory
+onnx_genai_vram_ort_overhead_bytes        gauge  # ORT runtime overhead
+onnx_genai_vram_total_bytes               gauge  # total GPU memory used
+
+# Binary size (build-time, document in CI)
+# onnxruntime.dll size, total deployment size
+```
+
+This gives users (and us) transparency into where memory goes — and helps identify optimization targets.
