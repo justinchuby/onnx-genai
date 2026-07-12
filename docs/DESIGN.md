@@ -2150,3 +2150,476 @@ crates/onnx-genai-engine/src/
 ├── sampling.rs
 └── speculative.rs
 ```
+
+---
+
+## 24. Sampling Policy & Configuration
+
+### 24.1 Current State
+
+Already implemented:
+- `TemperatureProcessor` — divide logits by T
+- `TopKProcessor` — keep top-K, -inf rest
+- `TopPProcessor` — nucleus sampling
+- `RepetitionPenaltyProcessor` — penalize repeated tokens
+- `StopSequenceProcessor` — detect stop strings
+- `ConstraintProcessor` — grammar/JSON masking
+- `sample_greedy` + `sample_categorical` — final token selection
+
+### 24.2 Missing Samplers
+
+```rust
+/// Min-P sampling: only keep tokens with P >= min_p * P(top_token).
+/// More adaptive than top-p for varying entropy distributions.
+pub struct MinPProcessor {
+    pub min_p: f32,
+}
+
+/// Frequency penalty: penalize based on count, not just presence.
+/// penalty = -frequency_penalty * count(token)
+pub struct FrequencyPenaltyProcessor {
+    pub penalty: f32,
+}
+
+/// Presence penalty: flat penalty if token appeared at all.
+/// Different from repetition_penalty (which scales the logit).
+pub struct PresencePenaltyProcessor {
+    pub penalty: f32,
+}
+
+/// Top-A sampling: adaptive threshold based on entropy.
+pub struct TopAProcessor {
+    pub top_a: f32,
+}
+
+/// Mirostat: target a specific perplexity (entropy) level.
+/// Self-tuning temperature that adapts during generation.
+pub struct MirostatProcessor {
+    pub tau: f32,        // target entropy
+    pub eta: f32,        // learning rate
+    mu: f32,             // evolving state
+    pub version: MirostatVersion,
+}
+
+pub enum MirostatVersion { V1, V2 }
+
+/// Typical sampling: keep tokens within typical information content.
+pub struct TypicalPProcessor {
+    pub p: f32,
+}
+
+/// DRY (Don't Repeat Yourself): penalize n-gram repetitions.
+/// More sophisticated than simple repetition penalty.
+pub struct DryProcessor {
+    pub multiplier: f32,
+    pub base: f32,
+    pub allowed_length: usize,
+    pub sequence_breakers: Vec<TokenId>,
+}
+
+/// XTC (eXclude Top Choices): randomly exclude top-probability tokens
+/// to increase diversity while maintaining coherence.
+pub struct XtcProcessor {
+    pub probability: f32,  // chance of excluding
+    pub threshold: f32,    // only exclude above this probability
+}
+```
+
+### 24.3 Sampling Configuration (User-Facing)
+
+```rust
+/// Complete sampling configuration exposed via API.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SamplingConfig {
+    // --- Temperature family ---
+    /// Temperature for logit scaling. 0 = greedy.
+    pub temperature: f32,
+    /// Dynamic temperature range [min, max] (optional).
+    pub dynatemp_range: Option<(f32, f32)>,
+    
+    // --- Truncation family ---
+    pub top_k: Option<usize>,
+    pub top_p: Option<f32>,
+    pub min_p: Option<f32>,
+    pub top_a: Option<f32>,
+    pub typical_p: Option<f32>,
+    
+    // --- Penalty family ---
+    pub repetition_penalty: Option<f32>,
+    pub frequency_penalty: Option<f32>,
+    pub presence_penalty: Option<f32>,
+    pub dry: Option<DryConfig>,
+    pub xtc: Option<XtcConfig>,
+    
+    // --- Adaptive ---
+    pub mirostat: Option<MirostatConfig>,
+    
+    // --- Seed ---
+    pub seed: Option<u64>,
+}
+
+impl SamplingConfig {
+    /// Build the processor chain from this config.
+    /// Order: repetition/DRY → constraints → temperature → truncation → XTC
+    pub fn build_chain(&self) -> ProcessorChain { ... }
+}
+```
+
+### 24.4 Processor Ordering
+
+Order matters. Our canonical order (matches community consensus):
+
+```
+1. Repetition/Frequency/Presence/DRY penalties  (modify logits based on history)
+2. Grammar/Constraint masking                    (hard mask: -inf invalid tokens)
+3. Temperature                                   (scale distribution)
+4. Top-K                                         (coarse truncation)
+5. Top-P / Min-P / Top-A / Typical-P            (fine truncation)
+6. XTC                                           (random exclusion)
+7. [Sample from resulting distribution]
+8. Mirostat feedback                             (adjust for next step)
+```
+
+This is configurable — users can reorder via explicit `processor_order` field.
+
+---
+
+## 25. Extensibility & Component Replacement
+
+### 25.1 Design Philosophy
+
+Every major subsystem is behind a **trait** (interface). Users can:
+- Swap implementations at compile time (feature flags + generics)
+- Swap at runtime (trait objects / `Box<dyn Trait>`)
+- Extend without forking (register custom processors, caches, samplers)
+
+### 25.2 Trait Contracts (Public API Surface)
+
+```rust
+// === KV Cache ===
+// Users can replace paged cache with: ring buffer, offloaded (CPU/disk), quantized, etc.
+pub trait KvCacheOps: Send + Sync {
+    fn create_sequence(&mut self) -> SequenceId;
+    fn delete_sequence(&mut self, seq: SequenceId) -> Result<(), KvError>;
+    fn append(&mut self, seq: SequenceId, num_tokens: usize) -> Result<(), KvError>;
+    fn rewind_to(&mut self, seq: SequenceId, position: usize) -> Result<(), KvError>;
+    fn fork(&mut self, source: SequenceId, position: usize) -> Result<SequenceId, KvError>;
+    fn checkpoint(&self, seq: SequenceId) -> Result<CacheCheckpoint, KvError>;
+    fn restore(&mut self, seq: SequenceId, checkpoint: CacheCheckpoint) -> Result<(), KvError>;
+    fn sequence_length(&self, seq: SequenceId) -> Option<usize>;
+    fn total_pages_used(&self) -> usize;
+    fn total_pages_available(&self) -> usize;
+    
+    // New: device placement
+    fn device(&self) -> Device;
+    // New: materialization for IoBinding
+    fn materialize(&self, seq: SequenceId) -> Result<MaterializedKv, KvError>;
+}
+
+// === Logit Processing ===
+// Already a trait — users register custom processors.
+pub trait LogitProcessor: Send + Sync {
+    fn process(&self, logits: &mut [f32], context: &ProcessorContext);
+    fn name(&self) -> &str;
+    fn signal(&self, _context: &ProcessorContext) -> Option<ProcessorSignal> { None }
+    /// Priority in the chain (lower = earlier). Default = 100.
+    fn priority(&self) -> u32 { 100 }
+}
+
+// === Sampling ===
+pub trait Sampler: Send + Sync {
+    /// Select a token from processed logits.
+    fn sample(&mut self, logits: &[f32], context: &ProcessorContext) -> TokenId;
+    fn name(&self) -> &str;
+}
+
+// Built-in samplers:
+pub struct GreedySampler;
+pub struct CategoricalSampler { rng: StdRng }
+pub struct MirostatSampler { tau: f32, eta: f32, mu: f32 }
+
+// === Scheduling ===
+pub trait SchedulerPolicy: Send + Sync {
+    /// Select which sequences run in the next batch.
+    fn select_batch(
+        &mut self,
+        waiting: &[SequenceState],
+        running: &[SequenceState],
+        max_batch_tokens: usize,
+    ) -> SchedulerDecision;
+    
+    fn name(&self) -> &str;
+}
+
+pub enum SchedulerDecision {
+    /// Run these sequences.
+    Run(Vec<SequenceId>),
+    /// Preempt some running sequences to make room.
+    Preempt { victims: Vec<SequenceId>, run: Vec<SequenceId> },
+    /// No work to do.
+    Idle,
+}
+
+// Built-in policies:
+pub struct FcfsPolicy;           // First-come-first-served
+pub struct PriorityPolicy;       // Priority queue with preemption  
+pub struct FairnessPolicy;       // Round-robin with starvation prevention
+
+// === Chat Template ===
+pub trait ChatTemplate: Send + Sync {
+    fn apply(&self, messages: &[ChatMessage], tools: &[ToolDefinition], tool_choice: &ToolChoice) -> Vec<TokenId>;
+    fn parse_tool_calls(&self, generated_text: &str) -> Option<Vec<ToolCall>>;
+    fn stop_tokens(&self) -> Vec<StopSequence>;
+}
+
+// === Preprocessing ===
+pub trait ProcessingStep: Send + Sync {
+    fn process(&self, input: &Tensor) -> Result<Tensor>;
+    fn name(&self) -> &str;
+}
+
+// === Model Loading ===
+pub trait ModelLoader: Send + Sync {
+    fn load_session(&self, path: &Path, options: &SessionOptions) -> Result<Session>;
+    fn supports_format(&self, path: &Path) -> bool;
+}
+```
+
+### 25.3 Registry Pattern (Runtime Extensibility)
+
+```rust
+/// Global registry for user-provided components.
+pub struct EngineBuilder {
+    config: EngineConfig,
+    // Replaceable components:
+    kv_cache: Option<Box<dyn KvCacheOps>>,
+    scheduler_policy: Option<Box<dyn SchedulerPolicy>>,
+    sampler: Option<Box<dyn Sampler>>,
+    chat_template: Option<Box<dyn ChatTemplate>>,
+    model_loader: Option<Box<dyn ModelLoader>>,
+    // Additive components:
+    logit_processors: Vec<Box<dyn LogitProcessor>>,
+    preprocessing_steps: Vec<Box<dyn ProcessingStep>>,
+    postprocessing_steps: Vec<Box<dyn ProcessingStep>>,
+    constraints: Vec<Box<dyn Constraint>>,
+}
+
+impl EngineBuilder {
+    pub fn new(config: EngineConfig) -> Self { ... }
+    
+    // --- Replace core components ---
+    pub fn with_kv_cache(mut self, cache: impl KvCacheOps + 'static) -> Self {
+        self.kv_cache = Some(Box::new(cache));
+        self
+    }
+    
+    pub fn with_scheduler_policy(mut self, policy: impl SchedulerPolicy + 'static) -> Self {
+        self.scheduler_policy = Some(Box::new(policy));
+        self
+    }
+    
+    pub fn with_sampler(mut self, sampler: impl Sampler + 'static) -> Self {
+        self.sampler = Some(Box::new(sampler));
+        self
+    }
+    
+    pub fn with_chat_template(mut self, template: impl ChatTemplate + 'static) -> Self {
+        self.chat_template = Some(Box::new(template));
+        self
+    }
+    
+    // --- Add extra processors ---
+    pub fn add_logit_processor(mut self, processor: impl LogitProcessor + 'static) -> Self {
+        self.logit_processors.push(Box::new(processor));
+        self
+    }
+    
+    pub fn add_preprocessing(mut self, step: impl ProcessingStep + 'static) -> Self {
+        self.preprocessing_steps.push(Box::new(step));
+        self
+    }
+    
+    /// Build the engine with all configured components.
+    pub fn build(self, model_dir: &Path) -> Result<Engine> { ... }
+}
+```
+
+Usage:
+```rust
+let engine = EngineBuilder::new(config)
+    .with_kv_cache(MyCustomQuantizedCache::new(...))
+    .with_scheduler_policy(PriorityPolicy::new())
+    .add_logit_processor(MyDomainSpecificFilter::new())
+    .build(model_dir)?;
+```
+
+### 25.4 Feature Flags (Compile-Time Selection)
+
+```toml
+[features]
+default = ["paged-kv", "json-constraint"]
+
+# KV cache implementations
+paged-kv = []           # Default paged cache
+ring-kv = []            # Simple ring buffer (less memory, no fork)
+offload-kv = []         # CPU/disk offloading for long contexts
+
+# Constraint engines
+json-constraint = []    # JSON/JSON Schema (lightweight)
+gbnf = []               # Full GBNF grammar engine
+regex-constraint = []   # Regex → DFA
+
+# Sampling
+full-samplers = []      # All sampler variants (mirostat, DRY, XTC, etc.)
+minimal-samplers = []   # Just greedy + temperature + top-p
+
+# Model formats
+gguf = []               # Load GGUF models (needs gguf parser)
+safetensors = []        # Load from safetensors (for weight inspection)
+```
+
+### 25.5 ABI Stability Contract
+
+For C consumers and plugins loaded at runtime:
+
+```rust
+/// Stable C ABI for engine operations.
+/// Versioned: breaking changes bump major version.
+#[repr(C)]
+pub struct OnnxGenaiApi {
+    pub version: u32,  // ABI version (semver major)
+    
+    // Lifecycle
+    pub engine_create: unsafe extern "C" fn(config: *const c_char) -> *mut Engine,
+    pub engine_destroy: unsafe extern "C" fn(engine: *mut Engine),
+    
+    // Generation
+    pub generate: unsafe extern "C" fn(
+        engine: *mut Engine,
+        request_json: *const c_char,
+        callback: Option<TokenCallback>,
+        user_data: *mut c_void,
+    ) -> *mut c_char,  // returns JSON result (caller frees)
+    
+    // Session
+    pub session_create: unsafe extern "C" fn(engine: *mut Engine) -> u64,
+    pub session_destroy: unsafe extern "C" fn(engine: *mut Engine, session: u64),
+    
+    // Plugin registration
+    pub register_logit_processor: unsafe extern "C" fn(
+        engine: *mut Engine,
+        name: *const c_char,
+        process_fn: LogitProcessFn,
+        user_data: *mut c_void,
+    ),
+    pub register_sampler: unsafe extern "C" fn(
+        engine: *mut Engine,
+        name: *const c_char,
+        sample_fn: SampleFn,
+        user_data: *mut c_void,
+    ),
+}
+
+/// Token callback signature (C ABI).
+pub type TokenCallback = unsafe extern "C" fn(
+    token_id: u32,
+    token_text: *const c_char,
+    user_data: *mut c_void,
+) -> bool;  // return false to cancel generation
+
+/// Logit processor function (C ABI plugin).
+pub type LogitProcessFn = unsafe extern "C" fn(
+    logits: *mut f32,
+    vocab_size: usize,
+    context: *const ProcessorContextC,
+    user_data: *mut c_void,
+);
+
+/// Sampler function (C ABI plugin).
+pub type SampleFn = unsafe extern "C" fn(
+    logits: *const f32,
+    vocab_size: usize,
+    user_data: *mut c_void,
+) -> u32;
+```
+
+### 25.6 Plugin System (Dynamic Loading)
+
+```rust
+/// A dynamically loaded plugin (.so/.dylib/.dll).
+pub struct Plugin {
+    _lib: libloading::Library,
+    metadata: PluginMetadata,
+}
+
+#[repr(C)]
+pub struct PluginMetadata {
+    /// Plugin name.
+    pub name: *const c_char,
+    /// Plugin version (semver string).
+    pub version: *const c_char,
+    /// Minimum engine ABI version required.
+    pub min_abi_version: u32,
+    /// Maximum engine ABI version supported.
+    pub max_abi_version: u32,
+}
+
+/// Plugin entry point signature.
+/// Called once when plugin is loaded. Plugin registers its components.
+pub type PluginInitFn = unsafe extern "C" fn(api: *const OnnxGenaiApi) -> i32;
+
+impl EngineBuilder {
+    /// Load a plugin from a shared library path.
+    pub fn load_plugin(mut self, path: &Path) -> Result<Self> {
+        // dlopen, find "onnx_genai_plugin_init" symbol, call it
+        ...
+    }
+}
+```
+
+### 25.7 Versioning & Compatibility Matrix
+
+| Component | Trait | ABI-stable? | Hot-swappable? |
+|---|---|---|---|
+| KV Cache | `KvCacheOps` | No (Rust trait) | At build time |
+| Sampler | `Sampler` | Yes (C ABI) | Runtime plugin |
+| LogitProcessor | `LogitProcessor` | Yes (C ABI) | Runtime plugin |
+| Scheduler | `SchedulerPolicy` | No (Rust trait) | At build time |
+| ChatTemplate | `ChatTemplate` | No (Rust trait) | At build time |
+| ModelLoader | `ModelLoader` | No (Rust trait) | At build time |
+| Constraint | `Constraint` | Yes (via GBNF string) | Runtime (pass grammar string) |
+
+**ABI stability rules:**
+1. C ABI functions never change signature (add new functions instead)
+2. Version field in API struct allows forward-compatibility checks
+3. Struct layouts with `#[repr(C)]` never reorder fields
+4. New features = new optional function pointers (NULL = not supported)
+
+### 25.8 Example: Custom KV Cache Implementation
+
+```rust
+/// Example: Ring buffer KV cache for constrained memory environments.
+/// Trades off: no fork, no prefix cache, but fixed memory footprint.
+pub struct RingKvCache {
+    ring_size: usize,  // max tokens before wrap
+    heads: HashMap<SequenceId, RingHead>,
+}
+
+impl KvCacheOps for RingKvCache {
+    fn append(&mut self, seq: SequenceId, num_tokens: usize) -> Result<(), KvError> {
+        // Wrap around when ring is full (oldest tokens evicted)
+        ...
+    }
+    
+    fn fork(&mut self, _source: SequenceId, _position: usize) -> Result<SequenceId, KvError> {
+        // Ring buffer doesn't support fork — return error
+        Err(KvError::UnsupportedOperation("fork not supported by RingKvCache"))
+    }
+    ...
+}
+
+// Usage:
+let engine = EngineBuilder::new(config)
+    .with_kv_cache(RingKvCache::new(4096))  // 4K token window
+    .build(model_dir)?;
+```
