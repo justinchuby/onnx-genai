@@ -9,6 +9,9 @@ Maps work domains to team members. The coordinator uses this to dispatch.
 | Generation engine, scheduler, continuous batching, speculative decoding, logit chain, sampling | Batty (Engine) |
 | HTTP server, OpenAI-compatible API, request/response handling, streaming | Rachael (Server) |
 | Tests, benchmarks, correctness, edge cases, fixtures | Pris (Tester) |
+| Code review, quality, clarity, maintainability, extensibility verdicts | Gaff (Reviewer) |
+| Performance, throughput, latency, batched serving, KV efficiency, benchmarks | Sebastian (Perf) |
+| Security, FFI/unsafe audit, server hardening, supply-chain, untrusted-input safety | Holden (Security) |
 | Memory, decisions, session logs | Scribe |
 | Work queue, backlog, keep-alive | Ralph |
 | RAI review, content safety | Rai |

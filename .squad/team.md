@@ -18,6 +18,9 @@
 | Batty | Engine Dev | .squad/agents/batty/charter.md | ⚡ Engine |
 | Rachael | Server Dev | .squad/agents/rachael/charter.md | 🌐 Server |
 | Pris | Tester | .squad/agents/pris/charter.md | 🧪 Test |
+| Gaff | Code Reviewer / Quality | .squad/agents/gaff/charter.md | 🔎 Review |
+| Sebastian | Performance Engineer | .squad/agents/sebastian/charter.md | ⚙️ Perf |
+| Holden | Security Engineer | .squad/agents/holden/charter.md | 🔒 Security |
 | Scribe | Session Logger | .squad/agents/scribe/charter.md | 📋 Scribe |
 | Ralph | Work Monitor | .squad/agents/ralph/charter.md | 🔄 Monitor |
 | Rai | RAI Reviewer | .squad/agents/rai/charter.md | 🛡️ RAI |
