@@ -2,6 +2,9 @@
 models/
 *.onnx
 !tests/fixtures/tiny-llm-scatter/model.onnx
+!tests/fixtures/tiny-qwen35-mtp/model.onnx
+!tests/fixtures/tiny-eagle3/model.onnx
+!crates/onnx-genai-ort/tests/fixtures/speculator-eagle3/model.onnx
 *.safetensors
 .DS_Store
 

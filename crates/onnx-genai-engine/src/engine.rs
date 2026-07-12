@@ -97,6 +97,7 @@ impl Engine {
                 quantization: None,
                 pipeline: None,
                 strategy: None,
+                speculative: None,
                 structured_output: None,
                 hardware_requirements: None,
             }
