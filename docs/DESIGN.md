@@ -1,9 +1,9 @@
 # onnx-genai Design Document
 
-**Project:** onnx-genai — A Rust inference runtime for generative AI models  
-**Author:** Justin Chu  
-**Date:** 2026-07-12  
-**Status:** Design  
+**Project:** onnx-genai — A Rust inference runtime for generative AI models
+**Author:** Justin Chu's agent
+**Date:** 2026-07-12
+**Status:** Design
 
 ---
 
@@ -138,20 +138,20 @@ pub struct PageTable {
 pub trait KvCacheOps {
     /// Truncate cache to position. O(pages_removed), not O(sequence_length).
     fn rewind_to(&mut self, seq: SequenceId, position: usize) -> Result<()>;
-    
+
     /// Fork a sequence with CoW. Shared pages get ref_count++, no copy.
     fn fork(&mut self, source: SequenceId, position: usize) -> Result<SequenceId>;
-    
+
     /// Save cache state for later restore.
     fn checkpoint(&self, seq: SequenceId) -> Result<CacheCheckpoint>;
     fn restore(&mut self, seq: SequenceId, checkpoint: CacheCheckpoint) -> Result<()>;
-    
+
     /// Append new KV entries (after a forward pass).
     fn append(&mut self, seq: SequenceId, key: Tensor, value: Tensor) -> Result<()>;
-    
+
     /// Evict pages to a lower tier (GPU→CPU→Disk) based on policy.
     fn evict(&mut self, policy: EvictionPolicy, target_free_pages: usize) -> Result<usize>;
-    
+
     /// Prefetch pages from lower tier back to GPU.
     fn prefetch(&mut self, seq: SequenceId, range: Range<usize>) -> Result<()>;
 }
@@ -209,10 +209,10 @@ impl PrefixCache {
     /// Find longest cached prefix for a token sequence.
     /// Returns (prefix_length, page_ids) — caller can skip prefill for these tokens.
     pub fn lookup(&self, tokens: &[TokenId]) -> (usize, Vec<PageId>);
-    
+
     /// Insert a computed prefix into the cache.
     pub fn insert(&mut self, tokens: &[TokenId], pages: Vec<PageId>);
-    
+
     /// Evict least-used prefixes to free pages.
     pub fn evict_lru(&mut self, target_pages: usize) -> Vec<PageId>;
 }
@@ -415,10 +415,10 @@ pub struct OrtSession {
 impl SessionManager {
     /// Load a model from ONNX file with specified execution provider.
     pub fn load(&mut self, name: &str, path: &Path, device: Device) -> Result<()>;
-    
+
     /// Run inference with pre-bound I/O (avoids host↔device copies).
     pub fn run(&self, name: &str, inputs: &IoBindings) -> Result<Outputs>;
-    
+
     /// Unload a model to free resources.
     pub fn unload(&mut self, name: &str) -> Result<()>;
 }
@@ -835,18 +835,18 @@ impl DiffusionPipeline {
     pub fn generate(&self, prompt: &str, config: DiffusionConfig) -> Result<Image> {
         // 1. Encode text
         let text_embeddings = self.text_encoder.run(prompt_tokens)?;
-        
+
         // 2. Initialize latent noise
         let mut latents = random_latent(config.height, config.width, config.seed);
-        
+
         // 3. Denoising loop
         for t in self.scheduler.timesteps() {
             let noise_pred = self.denoiser.run(latents, t, text_embeddings)?;
             latents = self.scheduler.step(noise_pred, t, latents);
-            
+
             // Optional: yield progress
         }
-        
+
         // 4. Decode latent → image
         let image = self.vae_decoder.run(latents)?;
         Ok(image)
@@ -864,19 +864,19 @@ pipeline:
     text_encoder: { type: text_encoder, filename: text_encoder.onnx }
     unet: { type: denoiser, filename: unet.onnx }
     vae: { type: vae_decoder, filename: vae_decoder.onnx }
-  
+
   strategy:
     kind: diffusion
     scheduler: euler_discrete
     num_steps: 20
     guidance_scale: 7.5
-  
+
   dataflow:
     - from: text_encoder.last_hidden_state
       to: unet.encoder_hidden_states
     - from: unet.output
       to: vae.latent_sample
-  
+
   phases:
     text_encoder:
       run_on: prompt_only
@@ -1048,19 +1048,19 @@ pipeline:
       type: encoder | decoder | denoiser | vocoder | classifier | embedder
       # Optional: execution constraints
       device_preference: gpu | npu | cpu
-      
+
   # How data flows between models
   dataflow:
     - from: model_a.output_name
       to: model_b.input_name
       dtype: fp16 | fp32 | int64 | string
       device_transfer: true | false  # needs D2H or H2D copy?
-      
+
   # Execution strategy
   strategy:
     kind: autoregressive | iterative | single_pass | composite
     # ... kind-specific parameters below
-    
+
   # Per-model phase gating (when does each model run?)
   phases:
     model_name:
@@ -1149,7 +1149,7 @@ pipeline:
     vocoder:
       filename: vocoder.onnx
       type: vocoder
-      
+
   dataflow:
     - from: text_encoder.hidden_states
       to: acoustic.encoder_hidden_states
@@ -1157,7 +1157,7 @@ pipeline:
     - from: acoustic.mel_spectrogram
       to: vocoder.mel_input
       dtype: fp32
-      
+
   strategy:
     kind: composite
     stages:
@@ -1171,7 +1171,7 @@ pipeline:
             - eos_token: true
       - name: synthesize_audio
         strategy: { kind: single_pass, model: vocoder }
-        
+
   phases:
     text_encoder: { run_on: prompt_only }
     acoustic: { run_on: every_step }
@@ -1193,7 +1193,7 @@ pipeline:
     decoder:
       filename: decoder.onnx
       type: decoder
-      
+
   dataflow:
     - from: feature_extractor.mel_features
       to: encoder.input_features
@@ -1201,7 +1201,7 @@ pipeline:
     - from: encoder.last_hidden_state
       to: decoder.encoder_hidden_states
       dtype: fp16
-      
+
   strategy:
     kind: composite
     stages:
@@ -1227,7 +1227,7 @@ pipeline:
     encoder:
       filename: encoder.onnx
       type: embedder
-      
+
   strategy:
     kind: single_pass
     model: encoder
@@ -1256,7 +1256,7 @@ pipeline:
     vocoder:
       filename: vocoder.onnx
       type: vocoder
-      
+
   dataflow:
     - from: content_encoder.content_features
       to: decoder.content_input
@@ -1267,7 +1267,7 @@ pipeline:
     - from: decoder.mel_output
       to: vocoder.mel_input
       dtype: fp32
-      
+
   strategy:
     kind: composite
     stages:
@@ -1292,12 +1292,12 @@ pipeline:
     decoder:
       filename: decoder.onnx
       type: decoder
-      
+
   dataflow:
     - from: vision_encoder.image_features
       to: decoder.encoder_hidden_states
       dtype: fp16
-      
+
   strategy:
     kind: composite
     stages:
@@ -1319,7 +1319,7 @@ pipeline:
     cross_encoder:
       filename: cross_encoder.onnx
       type: classifier
-      
+
   strategy:
     kind: single_pass
     model: cross_encoder
@@ -1346,19 +1346,19 @@ pub enum Pipeline {
 impl Engine {
     // --- Text generation (autoregressive) ---
     pub fn generate(&self, request: GenerateRequest) -> GenerateStream;
-    
+
     // --- Embedding (single_pass, batched) ---
     pub fn embed(&self, inputs: &[&str]) -> Result<Vec<Vec<f32>>>;
-    
+
     // --- Image generation (iterative) ---
     pub fn generate_image(&self, request: ImageRequest) -> ImageStream;
-    
+
     // --- Speech-to-text (composite: single_pass + autoregressive) ---
     pub fn transcribe(&self, audio: &AudioInput) -> TranscribeStream;
-    
+
     // --- Text-to-speech (composite: single_pass + autoregressive + single_pass) ---
     pub fn synthesize(&self, text: &str, voice: &str) -> Result<AudioOutput>;
-    
+
     // --- Generic (any pipeline) ---
     pub fn run_pipeline(&self, inputs: PipelineInputs) -> PipelineOutputStream;
 }
@@ -1377,7 +1377,7 @@ pipeline:
     - name: image_resize
       kind: resize_and_normalize
       params: { size: [224, 224], mean: [0.485, 0.456, 0.406], std: [0.229, 0.224, 0.225] }
-      
+
   postprocessing:
     - name: audio_output
       kind: griffin_lim  # or just pass-through if vocoder produces waveform
