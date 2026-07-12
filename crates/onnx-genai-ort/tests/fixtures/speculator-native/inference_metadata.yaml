@@ -1,0 +1,7 @@
+speculative:
+  method: mtp
+  tokens_per_step: 3
+  verifier:
+    name_or_path: example/native-verifier
+    architectures:
+      - NativeVerifierForCausalLM

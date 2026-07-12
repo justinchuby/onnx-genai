@@ -31,6 +31,11 @@ pub struct InferenceMetadata {
     #[serde(default)]
     pub strategy: Option<StrategySpec>,
 
+    /// Speculator model declaration. This is the preferred, native source for
+    /// speculator discovery; HuggingFace `config.json` is a compatibility fallback.
+    #[serde(default, alias = "speculator_config")]
+    pub speculative: Option<SpeculatorConfig>,
+
     /// Structured output support declaration.
     #[serde(default)]
     pub structured_output: Option<StructuredOutputSpec>,
@@ -38,6 +43,58 @@ pub struct InferenceMetadata {
     /// Hardware requirements for distribution matching.
     #[serde(default)]
     pub hardware_requirements: Option<HardwareRequirements>,
+}
+
+/// Configuration published with a standalone speculative proposer model.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct SpeculatorConfig {
+    /// Proposal architecture used by the speculator.
+    #[serde(alias = "method")]
+    pub proposal_type: ProposalType,
+    /// Maximum number of tokens proposed per verification step.
+    #[serde(default = "default_num_speculative_tokens", alias = "tokens_per_step")]
+    pub num_speculative_tokens: usize,
+    /// Verifier model this speculator was trained against.
+    #[serde(default)]
+    pub verifier: Option<SpeculatorVerifier>,
+}
+
+fn default_num_speculative_tokens() -> usize {
+    4
+}
+
+/// Verifier identity embedded in a speculator package.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct SpeculatorVerifier {
+    pub name_or_path: Option<String>,
+    #[serde(default)]
+    pub architectures: Vec<String>,
+}
+
+/// Speculator proposal architecture, preserving unknown future values.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProposalType {
+    Eagle3,
+    PEagle,
+    Mtp,
+    DFlash,
+    Unknown(String),
+}
+
+impl<'de> Deserialize<'de> for ProposalType {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Ok(match value.to_ascii_lowercase().as_str() {
+            "eagle" | "eagle3" | "eagle-3" => Self::Eagle3,
+            "peagle" | "p-eagle" => Self::PEagle,
+            "mtp" => Self::Mtp,
+            "dflash" | "d-flash" => Self::DFlash,
+            _ => Self::Unknown(value),
+        })
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]

@@ -6,7 +6,10 @@ pub mod parser;
 pub mod schema;
 pub mod validation;
 
-pub use parser::{load_metadata, load_pipeline_spec};
+pub use parser::{
+    SpeculatorConfigSource, SpeculatorDescriptor, SpeculatorProposerKind, SpeculatorProposerStatus,
+    detect_speculator, load_metadata, load_pipeline_spec,
+};
 pub use schema::*;
 pub use validation::{
     PipelineValidationError, RuntimeCapabilities, validate, validate_pipeline_spec,

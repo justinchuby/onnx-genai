@@ -29,6 +29,10 @@ pub use decode::{
 pub use env::Environment;
 pub use error::{OrtError, Result};
 pub use loader::{ModelDirectory, PipelineModelDirectory, PipelineModels, PipelineTokenizerPaths};
+pub use onnx_genai_metadata::{
+    ProposalType, SpeculatorConfig, SpeculatorConfigSource, SpeculatorDescriptor,
+    SpeculatorProposerKind, SpeculatorProposerStatus, SpeculatorVerifier, detect_speculator,
+};
 pub use session::{
     ExecutionProvider, Session, SessionOptions, TensorInfo, available_execution_providers,
 };

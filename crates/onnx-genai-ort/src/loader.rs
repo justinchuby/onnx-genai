@@ -3,7 +3,9 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use onnx_genai_metadata::{PipelineSpec, load_pipeline_spec};
+use onnx_genai_metadata::{
+    PipelineSpec, SpeculatorDescriptor, detect_speculator, load_pipeline_spec,
+};
 
 use crate::{Environment, OrtError, Result, Session, SessionOptions, Tokenizer};
 
@@ -15,6 +17,8 @@ pub struct ModelDirectory {
     pub tokenizer_path: PathBuf,
     /// Optional Phase 1 metadata path. Missing metadata is tolerated.
     pub metadata_path: Option<PathBuf>,
+    /// Detected standalone speculator declaration, if present.
+    pub speculator: Option<SpeculatorDescriptor>,
 }
 
 impl ModelDirectory {
@@ -46,12 +50,14 @@ impl ModelDirectory {
         .iter()
         .map(|name| root.join(name))
         .find(|path| path.is_file());
+        let speculator = detect_speculator(root);
 
         Ok(Self {
             root: root.to_path_buf(),
             model_path,
             tokenizer_path,
             metadata_path,
+            speculator,
         })
     }
 }

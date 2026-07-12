@@ -1,0 +1,9 @@
+{
+  "speculator_config": {
+    "proposal_type": "future-tree-v2",
+    "num_speculative_tokens": 7,
+    "verifier": {
+      "name_or_path": "example/verifier"
+    }
+  }
+}
