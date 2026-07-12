@@ -1,4 +1,5 @@
 use onnx_genai_engine::{Engine, EngineConfig, FinishReason, GeneratePrompt, GenerateRequest};
+use onnx_genai_ort::SessionOptions;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -16,6 +17,16 @@ fn token_request(tokens: Vec<u32>, max_new_tokens: usize) -> GenerateRequest {
     request
 }
 
+fn deterministic_engine(model_dir: &Path) -> anyhow::Result<Engine> {
+    // Keep batched-vs-individual exact-match assertions out of ORT CPU
+    // multi-threaded reduction-order variance near logit ties.
+    Engine::from_dir_with_session_options(
+        model_dir,
+        EngineConfig::default(),
+        SessionOptions::default().with_intra_op_threads(1),
+    )
+}
+
 #[test]
 fn batched_static_decode_matches_individual_static_generates() -> anyhow::Result<()> {
     let fixture = tiny_scatter_fixture()?;
@@ -29,10 +40,10 @@ fn batched_static_decode_matches_individual_static_generates() -> anyhow::Result
     let expected = requests
         .iter()
         .cloned()
-        .map(|request| Engine::from_dir(&fixture, EngineConfig::default())?.generate(request))
+        .map(|request| deterministic_engine(&fixture)?.generate(request))
         .collect::<anyhow::Result<Vec<_>>>()?;
 
-    let mut engine = Engine::from_dir(&fixture, EngineConfig::default())?;
+    let mut engine = deterministic_engine(&fixture)?;
     let batched = engine.generate_batched_static(requests)?;
 
     assert_eq!(batched, expected);
@@ -64,10 +75,10 @@ fn continuous_batch_matches_individual_under_admission_eviction() -> anyhow::Res
     let expected = requests
         .iter()
         .cloned()
-        .map(|request| Engine::from_dir(&fixture, EngineConfig::default())?.generate(request))
+        .map(|request| deterministic_engine(&fixture)?.generate(request))
         .collect::<anyhow::Result<Vec<_>>>()?;
 
-    let mut engine = Engine::from_dir(&fixture, EngineConfig::default())?;
+    let mut engine = deterministic_engine(&fixture)?;
     let continuous = engine.run_continuous_batch(requests, 4)?;
 
     assert_eq!(continuous, expected);

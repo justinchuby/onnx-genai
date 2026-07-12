@@ -66,6 +66,15 @@ pub struct Engine {
 impl Engine {
     /// Load a model from a directory.
     pub fn from_dir(model_dir: &Path, config: EngineConfig) -> anyhow::Result<Self> {
+        Self::from_dir_with_session_options(model_dir, config, SessionOptions::default())
+    }
+
+    /// Load a model from a directory with explicit ORT session options.
+    pub fn from_dir_with_session_options(
+        model_dir: &Path,
+        config: EngineConfig,
+        session_options: SessionOptions,
+    ) -> anyhow::Result<Self> {
         let model_directory = ModelDirectory::load(model_dir)
             .map_err(|e| anyhow::anyhow!("Failed to resolve model directory: {}", e))?;
 
@@ -101,7 +110,7 @@ impl Engine {
         let session = Session::new(
             &environment,
             &model_directory.model_path,
-            SessionOptions::default(),
+            session_options.clone(),
         )
         .map_err(|e| anyhow::anyhow!("Failed to load ORT session: {}", e))?;
         let metadata_max_context = metadata
@@ -119,7 +128,7 @@ impl Engine {
             let draft_session = Session::new(
                 &environment,
                 &draft_directory.model_path,
-                SessionOptions::default(),
+                session_options.clone(),
             )
             .map_err(|e| anyhow::anyhow!("Failed to load draft ORT session: {}", e))?;
             let draft_decode_path = detect_model_decode_path(&draft_session, metadata_max_context)?;

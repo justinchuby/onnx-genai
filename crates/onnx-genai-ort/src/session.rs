@@ -58,6 +58,14 @@ impl SessionOptions {
             ..Self::cpu()
         }
     }
+
+    /// Set the number of ORT intra-op threads.
+    ///
+    /// Values less than or equal to zero leave thread selection to ORT.
+    pub fn with_intra_op_threads(mut self, threads: i32) -> Self {
+        self.intra_op_num_threads = threads;
+        self
+    }
 }
 
 /// Return the execution providers reported by the linked ONNX Runtime build.
