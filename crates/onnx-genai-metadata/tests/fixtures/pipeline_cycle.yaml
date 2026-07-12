@@ -1,0 +1,20 @@
+pipeline:
+  models:
+    encoder:
+      filename: encoder.onnx
+      type: encoder
+    decoder:
+      filename: decoder.onnx
+      type: decoder
+  dataflow:
+    - from: encoder.hidden
+      to: decoder.encoder_hidden_states
+    - from: decoder.state
+      to: encoder.state
+  strategy:
+    kind: composite
+    stages:
+      - name: encode
+        strategy: { kind: single_pass, model: encoder }
+      - name: decode
+        strategy: { kind: autoregressive, decoder: decoder }

@@ -1,0 +1,23 @@
+pipeline:
+  models:
+    encoder:
+      filename: encoder.onnx.fixture
+      type: encoder
+    decoder:
+      filename: decoder.onnx.fixture
+      type: decoder
+      tokenizer: decoder-tokenizer.json
+  dataflow:
+    - from: encoder.hidden_states
+      to: decoder.encoder_hidden_states
+      dtype: fp32
+      device_transfer: false
+  strategy:
+    kind: composite
+    stages:
+      - name: encode
+        strategy: { kind: single_pass, model: encoder }
+        run_on: prompt_only
+      - name: decode
+        strategy: { kind: autoregressive, decoder: decoder, max_tokens: 16 }
+        run_on: every_step

@@ -6,9 +6,11 @@ pub mod parser;
 pub mod schema;
 pub mod validation;
 
-pub use parser::load_metadata;
+pub use parser::{load_metadata, load_pipeline_spec};
 pub use schema::*;
-pub use validation::{RuntimeCapabilities, validate};
+pub use validation::{
+    PipelineValidationError, RuntimeCapabilities, validate, validate_pipeline_spec,
+};
 
 /// Error type for metadata operations.
 #[derive(Debug, thiserror::Error)]

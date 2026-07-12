@@ -873,6 +873,7 @@ dependencies = [
  "onnx-genai-metadata",
  "onnx-genai-ort",
  "onnx-genai-scheduler",
+ "serde_json",
  "thiserror",
  "tokio",
  "tracing",
@@ -901,6 +902,7 @@ dependencies = [
 name = "onnx-genai-ort"
 version = "0.1.0"
 dependencies = [
+ "onnx-genai-metadata",
  "onnx-genai-ort-sys",
  "thiserror",
  "tokenizers",

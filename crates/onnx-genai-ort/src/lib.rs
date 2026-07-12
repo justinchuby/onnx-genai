@@ -20,7 +20,7 @@ pub use allocator::{Allocator, AllocatorType, MemoryInfo, MemoryType};
 pub use binding::IoBinding;
 pub use env::Environment;
 pub use error::{OrtError, Result};
-pub use loader::ModelDirectory;
+pub use loader::{ModelDirectory, PipelineModelDirectory, PipelineModels, PipelineTokenizerPaths};
 pub use session::{Session, SessionOptions, TensorInfo};
 pub use tokenizer::Tokenizer;
 pub use value::{DataType, Value};

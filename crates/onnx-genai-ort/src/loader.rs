@@ -1,8 +1,11 @@
 //! Model directory resolution for Phase 1 runtime loading.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use crate::{OrtError, Result};
+use onnx_genai_metadata::{PipelineSpec, load_pipeline_spec};
+
+use crate::{Environment, OrtError, Result, Session, SessionOptions, Tokenizer};
 
 /// Resolved files needed to load a single ONNX text-generation model.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,6 +56,142 @@ impl ModelDirectory {
     }
 }
 
+/// Resolved tokenizer files for a pipeline model directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PipelineTokenizerPaths {
+    pub shared: Option<PathBuf>,
+    pub per_component: BTreeMap<String, PathBuf>,
+}
+
+impl PipelineTokenizerPaths {
+    /// Return a component-specific tokenizer path, falling back to the shared tokenizer.
+    pub fn for_component(&self, component: &str) -> Option<&Path> {
+        self.per_component
+            .get(component)
+            .or(self.shared.as_ref())
+            .map(PathBuf::as_path)
+    }
+}
+
+/// Resolved files for a generalized multi-model pipeline directory.
+#[derive(Debug, Clone)]
+pub struct PipelineModelDirectory {
+    pub root: PathBuf,
+    pub metadata_path: PathBuf,
+    pub spec: PipelineSpec,
+    pub model_paths: BTreeMap<String, PathBuf>,
+    pub tokenizer_paths: PipelineTokenizerPaths,
+}
+
+impl PipelineModelDirectory {
+    /// Resolve the validated pipeline spec and all referenced model/tokenizer files.
+    pub fn load(root: impl AsRef<Path>) -> Result<Self> {
+        let root = root.as_ref();
+        if !root.is_dir() {
+            return Err(OrtError::InvalidArgument(format!(
+                "model directory does not exist: {}",
+                root.display()
+            )));
+        }
+
+        let metadata_path = resolve_metadata_path(root)?;
+        let spec = load_pipeline_spec(&metadata_path)
+            .map_err(|err| OrtError::InvalidArgument(err.to_string()))?;
+
+        let mut model_paths = BTreeMap::new();
+        let mut per_component_tokenizers = BTreeMap::new();
+        for (name, component) in &spec.models {
+            model_paths.insert(
+                name.clone(),
+                resolve_relative_file(root, &component.filename, "pipeline model")?,
+            );
+            if let Some(tokenizer) = &component.tokenizer {
+                per_component_tokenizers.insert(
+                    name.clone(),
+                    resolve_relative_file(root, tokenizer, "component tokenizer")?,
+                );
+            }
+        }
+
+        let shared_tokenizer = root.join("tokenizer.json");
+        let tokenizer_paths = PipelineTokenizerPaths {
+            shared: shared_tokenizer.is_file().then_some(shared_tokenizer),
+            per_component: per_component_tokenizers,
+        };
+
+        Ok(Self {
+            root: root.to_path_buf(),
+            metadata_path,
+            spec,
+            model_paths,
+            tokenizer_paths,
+        })
+    }
+}
+
+/// Loaded ORT sessions and tokenizer assets for a pipeline model directory.
+pub struct PipelineModels {
+    pub sessions: BTreeMap<String, Session>,
+    pub tokenizers: BTreeMap<String, Tokenizer>,
+    pub shared_tokenizer: Option<Tokenizer>,
+    pub directory: PipelineModelDirectory,
+    _environment: Environment,
+}
+
+impl PipelineModels {
+    /// Resolve and load all pipeline ONNX models using default CPU session options.
+    pub fn load(root: impl AsRef<Path>) -> Result<Self> {
+        Self::load_with_options(root, SessionOptions::default())
+    }
+
+    /// Resolve and load all pipeline ONNX models using caller-provided session options.
+    pub fn load_with_options(root: impl AsRef<Path>, options: SessionOptions) -> Result<Self> {
+        let directory = PipelineModelDirectory::load(root)?;
+        let environment = Environment::new("onnx-genai-pipeline")?;
+
+        let mut sessions = BTreeMap::new();
+        for (name, path) in &directory.model_paths {
+            sessions.insert(
+                name.clone(),
+                Session::new(&environment, path, options.clone())?,
+            );
+        }
+
+        let shared_tokenizer = directory
+            .tokenizer_paths
+            .shared
+            .as_ref()
+            .map(Tokenizer::from_file)
+            .transpose()?;
+        let tokenizers = directory
+            .tokenizer_paths
+            .per_component
+            .iter()
+            .map(|(name, path)| Ok((name.clone(), Tokenizer::from_file(path)?)))
+            .collect::<Result<_>>()?;
+
+        Ok(Self {
+            sessions,
+            tokenizers,
+            shared_tokenizer,
+            directory,
+            _environment: environment,
+        })
+    }
+
+    /// Return a component-specific tokenizer, falling back to the shared tokenizer.
+    pub fn tokenizer_for(&self, component: &str) -> Option<&Tokenizer> {
+        self.tokenizers
+            .get(component)
+            .or(self.shared_tokenizer.as_ref())
+    }
+
+    /// Return a loaded session by component name.
+    pub fn session(&self, component: &str) -> Option<&Session> {
+        self.sessions.get(component)
+    }
+}
+
 fn resolve_model_path(root: &Path) -> Result<PathBuf> {
     let decoder = root.join("decoder.onnx");
     if decoder.is_file() {
@@ -81,5 +220,45 @@ fn resolve_model_path(root: &Path) -> Result<PathBuf> {
             root.display(),
             many
         ))),
+    }
+}
+
+fn resolve_metadata_path(root: &Path) -> Result<PathBuf> {
+    [
+        "inference_metadata.yaml",
+        "inference_metadata.yml",
+        "inference_metadata.json",
+    ]
+    .iter()
+    .map(|name| root.join(name))
+    .find(|path| path.is_file())
+    .ok_or_else(|| {
+        OrtError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("pipeline metadata not found in {}", root.display()),
+        ))
+    })
+}
+
+fn resolve_relative_file(root: &Path, relative: &str, description: &str) -> Result<PathBuf> {
+    let relative_path = Path::new(relative);
+    if relative_path.is_absolute()
+        || relative_path
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err(OrtError::InvalidArgument(format!(
+            "{description} path must be relative to the model directory without '..': {relative}"
+        )));
+    }
+
+    let path = root.join(relative_path);
+    if path.is_file() {
+        Ok(path)
+    } else {
+        Err(OrtError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("{description} file not found: {}", path.display()),
+        )))
     }
 }

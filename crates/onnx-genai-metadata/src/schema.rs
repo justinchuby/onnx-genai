@@ -1,6 +1,8 @@
 //! Typed structs for all inference metadata spec sections.
 
-use serde::Deserialize;
+use std::collections::BTreeMap;
+
+use serde::{Deserialize, Deserializer};
 
 /// Top-level inference metadata.
 #[derive(Debug, Clone, Deserialize)]
@@ -131,17 +133,129 @@ pub struct QuantizationOverride {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct PipelineSpec {
-    pub models: Option<serde_json::Value>,
-    pub dataflow: Option<Vec<DataflowEdge>>,
-    pub phases: Option<serde_json::Value>,
+    /// Named model components that participate in the pipeline DAG.
+    pub models: BTreeMap<String, PipelineComponentSpec>,
+    /// Directed tensor/data edges between component ports.
+    #[serde(default)]
+    pub dataflow: Vec<DataflowEdge>,
+    /// Loop/execution strategy for the pipeline.
+    pub strategy: PipelineStrategy,
+    /// Optional per-component phase gating.
+    #[serde(default)]
+    pub phases: BTreeMap<String, PhaseConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PipelineComponentSpec {
+    /// ONNX filename relative to the model directory root.
+    pub filename: String,
+    /// Component role, for example encoder, decoder, draft, denoiser, or vocoder.
+    #[serde(rename = "type")]
+    pub role: String,
+    /// Optional execution/device preference declared by the model package.
+    pub device_preference: Option<String>,
+    /// Optional tokenizer filename relative to the model directory root. If absent,
+    /// loaders may use a shared top-level tokenizer.json when present.
+    pub tokenizer: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct DataflowEdge {
+    /// Source endpoint as `component.output_name`.
     pub from: String,
+    /// Destination endpoint as `component.input_name`.
     pub to: String,
     pub dtype: Option<String>,
     pub device_transfer: Option<bool>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PhaseConfig {
+    pub run_on: PhaseRunOn,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PhaseRunOn {
+    PromptOnly,
+    EveryStep,
+    FinalOnly,
+    OnDemand,
+    Other(String),
+}
+
+impl<'de> Deserialize<'de> for PhaseRunOn {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Ok(match value.as_str() {
+            "prompt_only" => Self::PromptOnly,
+            "every_step" | "always" => Self::EveryStep,
+            "final_only" => Self::FinalOnly,
+            "on_demand" => Self::OnDemand,
+            _ => Self::Other(value),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PipelineStrategy {
+    pub kind: PipelineStrategyKind,
+
+    /// Autoregressive decoder component name.
+    pub decoder: Option<String>,
+    pub max_tokens: Option<usize>,
+    pub stop_conditions: Option<Vec<serde_json::Value>>,
+    pub kv_cache: Option<serde_json::Value>,
+    pub speculative: Option<serde_json::Value>,
+
+    /// Single-pass component name.
+    pub model: Option<String>,
+    pub batching: Option<serde_json::Value>,
+
+    /// Iterative/diffusion component and loop configuration.
+    pub denoiser: Option<String>,
+    pub scheduler: Option<String>,
+    pub num_steps: Option<usize>,
+    pub guidance_scale: Option<f32>,
+    pub state: Option<serde_json::Value>,
+
+    /// Composite strategy stages.
+    #[serde(default)]
+    pub stages: Vec<PipelineStrategyStage>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PipelineStrategyStage {
+    pub name: String,
+    pub strategy: Box<PipelineStrategy>,
+    pub run_on: Option<PhaseRunOn>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PipelineStrategyKind {
+    Autoregressive,
+    Iterative,
+    SinglePass,
+    Composite,
+    Other(String),
+}
+
+impl<'de> Deserialize<'de> for PipelineStrategyKind {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Ok(match value.as_str() {
+            "autoregressive" => Self::Autoregressive,
+            "iterative" | "diffusion_steps" | "diffusion-steps" => Self::Iterative,
+            "single_pass" | "single-pass" => Self::SinglePass,
+            "composite" => Self::Composite,
+            _ => Self::Other(value),
+        })
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]

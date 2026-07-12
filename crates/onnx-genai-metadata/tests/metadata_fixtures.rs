@@ -1,10 +1,19 @@
 use std::path::{Path, PathBuf};
 
-use onnx_genai_metadata::{MetadataError, RuntimeCapabilities, load_metadata, validate};
+use onnx_genai_metadata::{
+    MetadataError, PipelineStrategyKind, RuntimeCapabilities, load_metadata, load_pipeline_spec,
+    validate, validate_pipeline_spec,
+};
 
 fn fixture(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
+        .join("tests/fixtures")
+        .join(name)
+}
+
+fn crate_fixture(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures")
         .join(name)
 }
@@ -127,4 +136,55 @@ fn capability_validation_uses_runtime_supported_set() {
     let unsupported = validate(&metadata, &runtime).expect_err("missing GQA support is reported");
 
     assert_eq!(unsupported, ["grouped_query_attention"]);
+}
+
+#[test]
+fn parses_and_validates_pipeline_fixture() {
+    let spec = load_pipeline_spec(&crate_fixture("pipeline_valid.yaml"))
+        .expect("valid pipeline fixture parses and validates");
+
+    assert_eq!(spec.models.len(), 2);
+    assert_eq!(
+        spec.models["vision_encoder"].filename,
+        "vision_encoder.onnx"
+    );
+    assert_eq!(spec.models["decoder"].role, "decoder");
+    assert_eq!(
+        spec.models["decoder"].tokenizer.as_deref(),
+        Some("tokenizer.json")
+    );
+    assert_eq!(spec.dataflow[0].from, "vision_encoder.image_features");
+    assert!(matches!(
+        spec.strategy.kind,
+        PipelineStrategyKind::Composite
+    ));
+    assert_eq!(spec.strategy.stages.len(), 2);
+}
+
+#[test]
+fn pipeline_validation_rejects_dangling_edges() {
+    let metadata = load_metadata(&crate_fixture("pipeline_dangling.yaml"))
+        .expect("fixture parses structurally");
+    let spec = metadata.pipeline.expect("pipeline section");
+    let err = validate_pipeline_spec(&spec).expect_err("dangling component is rejected");
+
+    assert!(
+        err.errors
+            .iter()
+            .any(|error| error.contains("unknown component"))
+    );
+}
+
+#[test]
+fn pipeline_validation_rejects_cycles() {
+    let metadata =
+        load_metadata(&crate_fixture("pipeline_cycle.yaml")).expect("fixture parses structurally");
+    let spec = metadata.pipeline.expect("pipeline section");
+    let err = validate_pipeline_spec(&spec).expect_err("cycle is rejected");
+
+    assert!(
+        err.errors
+            .iter()
+            .any(|error| error.contains("contains a cycle"))
+    );
 }
