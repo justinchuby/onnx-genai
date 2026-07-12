@@ -15,3 +15,7 @@
 
 ## 2026-07-12T09:20:00-07:00 — Tiny fixture enabled Phase 1 E2E
 - The deterministic `tests/fixtures/tiny-llm/` model and tokenizer enabled the first end-to-end greedy generation smoke test through the facade CLI, engine, tokenizer, and ORT session.
+
+
+## 2026-07-12T09:38:00-07:00 — Phase 2 complete
+Pris delivered Phase 2 coverage for interleaved persistent sessions, reset isolation, KV fork CoW independence, same-session prefix hit (`prefix_cache_hit_len > 0`, warm hit observed as 6), and cross-session prefix reuse with matching greedy output.

@@ -16,3 +16,7 @@
 
 ## 2026-07-12T09:20:00-07:00 — ORT/tokenizer APIs enabled Phase 1 E2E
 - The CPU `Session`, graph I/O metadata, tensor `Value` helpers, `ModelDirectory`, and `Tokenizer` APIs enabled Batty and Rachael to complete end-to-end greedy generation via the CLI tiny fixture.
+
+
+## 2026-07-12T09:38:00-07:00 — Phase 2 complete
+Deckard delivered paged KV tensor storage (`new_with_tensor_config`, `append_token_kv`, `write_token_kv`, `materialize_sequence`), prefix cache page ownership/refcount lifecycle, CoW-safe writes, and ORT `1.27.0` runtime packaging so the server boots standalone without `DYLD_LIBRARY_PATH`.

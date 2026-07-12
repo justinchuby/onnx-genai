@@ -17,3 +17,7 @@
 - Wired generation to real ORT session execution and HF tokenizer loading.
 - Added graph input discovery for `input_ids`, `attention_mask`, `position_ids`, and past/present KV names; threads model-owned KV tensors when present and falls back to full-sequence reruns otherwise.
 - Tiny-fixture CLI greedy generation now runs end-to-end; 13 engine tests pass.
+
+
+## 2026-07-12T09:38:00-07:00 — Phase 2 complete
+Batty delivered persistent engine sessions, stateless `generate` compatibility, minimal FCFS scheduler admission, paged-KV mirroring, same/cross-session prefix reuse, and `GenerateResult::prefix_cache_hit_len` for cache observability.
