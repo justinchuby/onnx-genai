@@ -1,7 +1,7 @@
 //! Prefix cache using a radix trie.
 
-use std::collections::HashMap;
 use crate::{TokenId, page_table::PageId};
+use std::collections::HashMap;
 
 /// Radix trie for prefix caching.
 /// Shares KV pages for common token prefixes across sessions.
@@ -54,13 +54,13 @@ impl PrefixCache {
         let mut node = &mut self.root;
 
         for (i, &token) in tokens.iter().enumerate() {
-            node = node.children
-                .entry(token)
-                .or_insert_with(|| Box::new(TrieNode {
+            node = node.children.entry(token).or_insert_with(|| {
+                Box::new(TrieNode {
                     children: HashMap::new(),
                     page_ids: Vec::new(),
                     ref_count: 0,
-                }));
+                })
+            });
 
             // Assign page IDs proportionally (simplified)
             if i < page_ids.len() {

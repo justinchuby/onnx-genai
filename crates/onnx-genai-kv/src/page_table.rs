@@ -1,7 +1,7 @@
 //! Page table: maps sequences to physical pages.
 
-use std::collections::HashMap;
 use crate::{Device, SequenceId};
+use std::collections::HashMap;
 
 /// Unique page identifier.
 pub type PageId = u32;
@@ -43,13 +43,16 @@ impl PageTable {
 
         for i in 0..num_gpu_pages {
             let id = i as PageId;
-            pages.insert(id, Page {
+            pages.insert(
                 id,
-                ref_count: 0,
-                device: Device::Gpu(0),
-                filled: 0,
-                last_access: 0,
-            });
+                Page {
+                    id,
+                    ref_count: 0,
+                    device: Device::Gpu(0),
+                    filled: 0,
+                    last_access: 0,
+                },
+            );
             free_pages.push(id);
         }
 

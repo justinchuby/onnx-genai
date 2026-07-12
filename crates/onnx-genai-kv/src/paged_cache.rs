@@ -1,8 +1,8 @@
 //! Paged KV cache implementation.
 
 use crate::{
-    page_table::{PageId, PageTable},
     CacheCheckpoint, Device, EvictionPolicy, KvCacheOps, KvError, SequenceId,
+    page_table::{PageId, PageTable},
 };
 
 /// Paged KV cache manager.
@@ -36,7 +36,9 @@ impl PagedKvCache {
 
 impl KvCacheOps for PagedKvCache {
     fn rewind_to(&mut self, seq: SequenceId, position: usize) -> Result<(), KvError> {
-        let pages = self.page_table.get_sequence(seq)
+        let pages = self
+            .page_table
+            .get_sequence(seq)
             .ok_or(KvError::SequenceNotFound(seq))?;
 
         let page_size = self.page_table.page_size;
@@ -57,7 +59,9 @@ impl KvCacheOps for PagedKvCache {
     }
 
     fn fork(&mut self, source: SequenceId, _position: usize) -> Result<SequenceId, KvError> {
-        let source_pages = self.page_table.get_sequence(source)
+        let source_pages = self
+            .page_table
+            .get_sequence(source)
             .ok_or(KvError::SequenceNotFound(source))?
             .to_vec();
 
@@ -75,7 +79,9 @@ impl KvCacheOps for PagedKvCache {
     }
 
     fn checkpoint(&self, seq: SequenceId) -> Result<CacheCheckpoint, KvError> {
-        let pages = self.page_table.get_sequence(seq)
+        let pages = self
+            .page_table
+            .get_sequence(seq)
             .ok_or(KvError::SequenceNotFound(seq))?;
 
         Ok(CacheCheckpoint {
@@ -91,7 +97,9 @@ impl KvCacheOps for PagedKvCache {
     }
 
     fn append(&mut self, seq: SequenceId, num_tokens: usize) -> Result<(), KvError> {
-        let _ = self.page_table.get_sequence(seq)
+        let _ = self
+            .page_table
+            .get_sequence(seq)
             .ok_or(KvError::SequenceNotFound(seq))?;
 
         let page_size = self.page_table.page_size;
@@ -99,8 +107,13 @@ impl KvCacheOps for PagedKvCache {
         // Allocate new pages as needed
         let mut remaining = num_tokens;
         while remaining > 0 {
-            let page_id = self.page_table.allocate(Device::Gpu(0))
-                .ok_or(KvError::OutOfMemory { needed: 1, available: 0 })?;
+            let page_id = self
+                .page_table
+                .allocate(Device::Gpu(0))
+                .ok_or(KvError::OutOfMemory {
+                    needed: 1,
+                    available: 0,
+                })?;
             self.page_table.push_page(seq, page_id);
             remaining = remaining.saturating_sub(page_size);
         }
@@ -109,7 +122,9 @@ impl KvCacheOps for PagedKvCache {
     }
 
     fn len(&self, seq: SequenceId) -> Result<usize, KvError> {
-        let pages = self.page_table.get_sequence(seq)
+        let pages = self
+            .page_table
+            .get_sequence(seq)
             .ok_or(KvError::SequenceNotFound(seq))?;
         Ok(pages.len() * self.page_table.page_size)
     }
