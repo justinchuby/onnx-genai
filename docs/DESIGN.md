@@ -4539,3 +4539,288 @@ observability:
     ort_profiling: false       # enable ORT's built-in profiling
     merge_ort_traces: true     # auto-merge ORT + engine traces
 ```
+
+### 31.16 Comprehensive Metrics Catalog (informed by vLLM/SGLang)
+
+After studying vLLM v1's metrics system, here's the complete metrics catalog organized by category. We track everything vLLM tracks, plus our ORT-specific and multi-agent metrics.
+
+#### A. Prefix Cache Metrics
+
+vLLM uses a sliding-window `CachingMetrics` (last N requests) for hit rate. We adopt the same pattern:
+
+```rust
+/// Sliding-window cache metrics (mirrors vLLM's CachingMetrics).
+pub struct CachingMetrics {
+    /// Rolling window of (requests, queries, hits).
+    window: VecDeque<(u64, u64, u64)>,
+    /// Max requests in window.
+    max_recent_requests: usize,  // default: 1000
+    /// Aggregated totals within window.
+    agg_requests: u64,
+    agg_queries: u64,   // tokens queried
+    agg_hits: u64,       // tokens that hit cache
+}
+
+/// Per-scheduling-step prefix cache stats.
+pub struct PrefixCacheStats {
+    // New requests
+    pub requests: u64,           // number of requests in this update
+    pub queries: u64,            // tokens queried against cache
+    pub hits: u64,               // tokens found in cache (saved compute)
+    
+    // Previously preempted requests (re-scheduled)
+    pub preempted_requests: u64,
+    pub preempted_queries: u64,
+    pub preempted_hits: u64,     // preempted requests often hit more (their KV was evicted but prefix might remain)
+    
+    pub reset: bool,             // cache was reset/cleared
+}
+```
+
+**Prometheus metrics:**
+```
+# Prefix cache
+onnx_genai_prefix_cache_hit_rate            gauge     # sliding window hit rate (0.0-1.0)
+onnx_genai_prefix_cache_queries_total       counter   # total tokens queried
+onnx_genai_prefix_cache_hits_total          counter   # total tokens found in cache
+onnx_genai_prefix_cache_hit_tokens_saved    counter   # prefill tokens skipped thanks to cache
+onnx_genai_prefix_cache_entries             gauge     # number of cached prefix entries
+onnx_genai_prefix_cache_resets_total        counter   # times cache was fully reset
+```
+
+#### B. KV Cache Eviction Metrics
+
+vLLM tracks per-eviction events with lifetime and reuse patterns. Critical for tuning cache size:
+
+```rust
+/// Single KV cache block eviction event.
+pub struct KvEvictionEvent {
+    /// How long this block lived in cache (seconds).
+    pub lifetime_seconds: f64,
+    /// How long since this block was last accessed.
+    pub idle_seconds: f64,
+    /// Gaps between reuses (if reused multiple times).
+    pub reuse_gaps_seconds: Vec<f64>,
+    /// Eviction reason.
+    pub reason: EvictionReason,
+    /// Priority of the evicted session.
+    pub session_priority: AgentPriority,
+}
+
+pub enum EvictionReason {
+    /// No free pages, need space for new request.
+    Capacity,
+    /// Lower-priority session preempted.
+    Preemption,
+    /// Session idle timeout expired.
+    IdleTimeout,
+    /// Explicit cache clear (API call).
+    ManualReset,
+    /// Memory pressure from other EP (e.g., ORT internal allocation).
+    MemoryPressure,
+}
+```
+
+**Prometheus metrics:**
+```
+# KV cache pages
+onnx_genai_kv_pages_used                   gauge     # current pages in use
+onnx_genai_kv_pages_total                  gauge     # total available pages
+onnx_genai_kv_pages_shared                 gauge     # pages shared via prefix cache (CoW)
+onnx_genai_kv_pages_offloaded              gauge     # pages on CPU (swapped out)
+onnx_genai_kv_usage_ratio                  gauge     # used/total (0.0-1.0)
+
+# Eviction
+onnx_genai_kv_evictions_total              counter   # total eviction events {reason}
+onnx_genai_kv_eviction_lifetime_seconds    histogram # how long evicted blocks lived
+onnx_genai_kv_eviction_idle_seconds        histogram # idle time before eviction
+onnx_genai_kv_offload_total                counter   # GPU→CPU offload events
+onnx_genai_kv_reload_total                 counter   # CPU→GPU reload events
+onnx_genai_kv_offload_latency_seconds      histogram # offload transfer time
+```
+
+#### C. Request Lifecycle Metrics
+
+vLLM tracks detailed per-request timestamps. Essential for diagnosing latency:
+
+```rust
+/// Per-request lifecycle timestamps.
+pub struct RequestTimestamps {
+    /// When request arrived at HTTP layer (wall clock).
+    pub arrival_time: Instant,
+    /// When request entered scheduler queue (monotonic).
+    pub queued_ts: Instant,
+    /// When request was first scheduled into a batch.
+    pub scheduled_ts: Instant,
+    /// When first token was generated.
+    pub first_token_ts: Instant,
+    /// When last token was generated (request complete).
+    pub last_token_ts: Instant,
+}
+
+/// Derived metrics from timestamps.
+pub struct RequestLatencyBreakdown {
+    /// Queue wait time: queued_ts → scheduled_ts
+    pub queue_time_ms: f64,
+    /// Prefill time: scheduled_ts → first_token_ts
+    pub prefill_time_ms: f64,
+    /// Time to first token: arrival → first_token (user-perceived)
+    pub ttft_ms: f64,
+    /// Inter-token latency: avg time between consecutive tokens
+    pub itl_ms: f64,
+    /// End-to-end: arrival → last_token
+    pub e2e_latency_ms: f64,
+    /// Total tokens generated
+    pub num_generation_tokens: u32,
+    /// Prompt tokens
+    pub num_prompt_tokens: u32,
+    /// Prompt tokens that were cached (not computed)
+    pub num_cached_tokens: u32,
+    /// Finish reason
+    pub finish_reason: FinishReason,
+}
+```
+
+**Prometheus metrics:**
+```
+# Latency
+onnx_genai_time_to_first_token_seconds     histogram # TTFT (most important user-facing metric)
+onnx_genai_inter_token_latency_seconds     histogram # per-token latency
+onnx_genai_e2e_latency_seconds             histogram # end-to-end request latency
+onnx_genai_queue_wait_seconds              histogram # time in scheduler queue
+onnx_genai_prefill_seconds                 histogram # prefill phase duration
+
+# Request counts
+onnx_genai_requests_total                  counter   # {status=success|error|cancelled}
+onnx_genai_requests_active                 gauge     # currently in-flight
+onnx_genai_requests_waiting                gauge     # in scheduler queue
+onnx_genai_requests_preempted_total        counter   # preempted and re-queued
+```
+
+#### D. Throughput Metrics
+
+```
+# Token throughput
+onnx_genai_prompt_tokens_total             counter   # total prompt tokens processed
+onnx_genai_prompt_tokens_computed           counter   # actually computed (excl. cached)
+onnx_genai_generation_tokens_total         counter   # total tokens generated
+onnx_genai_prompt_throughput               gauge     # prompt tokens/sec (rolling)
+onnx_genai_generation_throughput           gauge     # generation tokens/sec (rolling)
+```
+
+#### E. Scheduler & Batching Metrics
+
+```
+# Scheduler
+onnx_genai_scheduler_running_requests      gauge     # requests currently generating
+onnx_genai_scheduler_waiting_requests      gauge     # requests waiting to be scheduled
+onnx_genai_scheduler_skipped_requests      gauge     # deferred (e.g., LoRA adapter not loaded)
+onnx_genai_scheduler_preemptions_total     counter   # total preemption events
+onnx_genai_scheduler_step_counter          counter   # total scheduling iterations
+
+# Batching
+onnx_genai_batch_size                      histogram # sequences per forward pass
+onnx_genai_batch_tokens                    histogram # total tokens per forward pass
+onnx_genai_batch_utilization               gauge     # batch_tokens / max_batch_tokens
+onnx_genai_prefill_chunk_tokens            histogram # tokens per chunked prefill
+```
+
+#### F. Speculative Decoding Metrics
+
+vLLM tracks per-position acceptance rates — not just overall. This is critical for tuning:
+
+```rust
+/// Per-step speculation stats.
+pub struct SpecDecodingStats {
+    /// Number of speculative positions configured.
+    pub num_spec_tokens: usize,
+    /// Total draft rounds this step.
+    pub num_drafts: u64,
+    /// Total draft tokens proposed.
+    pub num_draft_tokens: u64,
+    /// Total draft tokens accepted.
+    pub num_accepted_tokens: u64,
+    /// Per-position acceptance counts.
+    /// Index 0 = first speculative position, etc.
+    /// Shows acceptance rate decay by position.
+    pub accepted_per_position: Vec<u64>,
+    pub drafted_per_position: Vec<u64>,
+}
+
+// Example log output (vLLM style):
+// SpecDecoding metrics:
+//   Mean acceptance length: 3.42
+//   Accepted throughput: 534.2 tokens/s
+//   Drafted throughput: 712.8 tokens/s
+//   Per-position acceptance rate: 0.95, 0.82, 0.71, 0.55, 0.38
+//   Avg Draft acceptance rate: 75.1%
+```
+
+**Prometheus metrics:**
+```
+onnx_genai_spec_drafts_total               counter   # total draft rounds
+onnx_genai_spec_draft_tokens_total         counter   # total tokens drafted
+onnx_genai_spec_accepted_tokens_total      counter   # total tokens accepted
+onnx_genai_spec_acceptance_rate            gauge     # rolling acceptance rate
+onnx_genai_spec_mean_acceptance_length     gauge     # avg accepted tokens per draft round
+onnx_genai_spec_acceptance_per_position    gauge     # {position=0,1,2,...} per-position rate
+onnx_genai_spec_draft_throughput           gauge     # draft tokens/sec
+onnx_genai_spec_accepted_throughput        gauge     # accepted tokens/sec
+```
+
+#### G. ORT-Specific Metrics (unique to us)
+
+```
+# Execution Provider
+onnx_genai_ort_forward_seconds             histogram # {model, ep} forward pass time
+onnx_genai_ort_ep_selected                 gauge     # which EP is active {ep=CUDA|DirectML|CPU}
+onnx_genai_ort_io_binding_bind_seconds     histogram # IoBinding setup time
+onnx_genai_ort_io_binding_run_seconds      histogram # IoBinding run time
+
+# Memory (ORT-level)
+onnx_genai_ort_memory_allocated_bytes      gauge     # {device} ORT allocator usage
+onnx_genai_ort_memory_arena_bytes          gauge     # arena allocator size
+```
+
+#### H. Multi-Agent Metrics (unique to us)
+
+```
+# Sessions
+onnx_genai_sessions_active                 gauge     # {priority} total active sessions
+onnx_genai_sessions_paused                 gauge     # sessions waiting on tool results
+onnx_genai_sessions_kv_pages               histogram # pages per session
+onnx_genai_session_lifetime_seconds        histogram # session duration
+
+# Tool use
+onnx_genai_tool_calls_total                counter   # {tool_name} total tool invocations
+onnx_genai_tool_latency_seconds            histogram # {tool_name} tool execution time
+onnx_genai_tool_turns_per_request          histogram # tool round-trips per request
+
+# Grammar
+onnx_genai_grammar_mask_seconds            histogram # time computing token mask
+onnx_genai_grammar_cache_hit_rate          gauge     # grammar state cache hit rate
+onnx_genai_grammar_type_active             gauge     # {type=json|json_schema|gbnf|regex}
+```
+
+#### I. Error & Health Metrics
+
+```
+onnx_genai_errors_total                    counter   # {type} ORT errors, OOM, timeout, etc.
+onnx_genai_corrupted_logits_total          counter   # NaN/Inf in logits (model issue)
+onnx_genai_oom_events_total                counter   # out-of-memory events
+onnx_genai_model_load_seconds              histogram # model loading time
+onnx_genai_uptime_seconds                  gauge     # server uptime
+```
+
+### 31.17 Logging Format for Periodic Stats
+
+Following vLLM's pattern, log a summary line every N seconds:
+
+```
+INFO  Throughput: prompt=1234.5 tok/s, gen=567.8 tok/s.
+      Running: 8 reqs, Waiting: 2 reqs.
+      KV cache: 87.3% (1792/2048 pages, 256 shared, 64 offloaded).
+      Prefix cache hit rate: 73.2% (last 1000 reqs).
+      SpecDecode: acceptance=75.1%, mean_len=3.42, per_pos=[0.95, 0.82, 0.71, 0.55].
+      Preemptions: 0, Evictions: 3.
+```
