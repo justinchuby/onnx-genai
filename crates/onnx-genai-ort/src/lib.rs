@@ -10,6 +10,7 @@
 pub mod allocator;
 pub mod binding;
 pub mod chat_template;
+pub mod decode;
 pub mod env;
 pub mod error;
 pub mod loader;
@@ -20,6 +21,7 @@ pub mod value;
 pub use allocator::{Allocator, AllocatorType, MemoryInfo, MemoryType};
 pub use binding::IoBinding;
 pub use chat_template::{ChatMessage, ChatRole, ChatTemplate};
+pub use decode::{DecodeKvMode, DecodeSession, DecodeSessionOptions};
 pub use env::Environment;
 pub use error::{OrtError, Result};
 pub use loader::{ModelDirectory, PipelineModelDirectory, PipelineModels, PipelineTokenizerPaths};

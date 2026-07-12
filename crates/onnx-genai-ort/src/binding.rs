@@ -3,7 +3,7 @@
 use std::ffi::CString;
 use std::ptr::NonNull;
 
-use crate::{MemoryInfo, OrtError, Result, Session, Value};
+use crate::{Allocator, MemoryInfo, OrtError, Result, Session, Value};
 
 /// IoBinding allows pre-allocating and binding device tensors.
 /// This is critical for KV cache: we keep cache pages on-device and
@@ -88,6 +88,47 @@ impl IoBinding {
 
     pub(crate) fn as_ptr(&self) -> *const onnx_genai_ort_sys::OrtIoBinding {
         self.ptr.as_ptr()
+    }
+
+    /// Take the OrtValues produced by the most recent `RunWithBinding`.
+    ///
+    /// Values are returned in the same order outputs were bound.
+    pub fn output_values(&self) -> Result<Vec<Value>> {
+        let allocator = Allocator::default_cpu()?;
+        let api = crate::error::api()?;
+        let get_outputs = api
+            .GetBoundOutputValues
+            .ok_or(OrtError::ApiUnavailable("GetBoundOutputValues"))?;
+        let free = api
+            .AllocatorFree
+            .ok_or(OrtError::ApiUnavailable("AllocatorFree"))?;
+        let mut output_ptrs = std::ptr::null_mut();
+        let mut output_count = 0usize;
+        // SAFETY: binding and allocator are valid; ORT allocates an array of
+        // OrtValue pointers and transfers ownership of each OrtValue to us.
+        crate::error::check_status(unsafe {
+            get_outputs(
+                self.ptr.as_ptr(),
+                allocator.as_ptr(),
+                &mut output_ptrs,
+                &mut output_count,
+            )
+        })?;
+        if output_count == 0 {
+            return Ok(Vec::new());
+        }
+        if output_ptrs.is_null() {
+            return Err(OrtError::NullPointer);
+        }
+
+        // SAFETY: ORT returned `output_count` pointers in an allocator-owned
+        // array. We copy the pointers, free the array, and wrap each value.
+        let raw_values = unsafe { std::slice::from_raw_parts(output_ptrs, output_count) }.to_vec();
+        crate::error::check_status(unsafe { free(allocator.as_ptr(), output_ptrs.cast()) })?;
+        raw_values
+            .into_iter()
+            .map(|ptr| unsafe { Value::from_raw(ptr) })
+            .collect()
     }
 }
 

@@ -195,6 +195,69 @@ impl Session {
         &self.outputs
     }
 
+    /// Look up a custom ONNX model metadata value by key.
+    pub fn custom_metadata_value(&self, key: &str) -> Result<Option<String>> {
+        let key = CString::new(key)
+            .map_err(|_| OrtError::InvalidArgument("metadata key contains NUL".into()))?;
+        let allocator = Allocator::default_cpu()?;
+        let api = crate::error::api()?;
+        let get_metadata = api
+            .SessionGetModelMetadata
+            .ok_or(OrtError::ApiUnavailable("SessionGetModelMetadata"))?;
+        let lookup = api
+            .ModelMetadataLookupCustomMetadataMap
+            .ok_or(OrtError::ApiUnavailable(
+                "ModelMetadataLookupCustomMetadataMap",
+            ))?;
+        let release_metadata = api
+            .ReleaseModelMetadata
+            .ok_or(OrtError::ApiUnavailable("ReleaseModelMetadata"))?;
+        let free = api
+            .AllocatorFree
+            .ok_or(OrtError::ApiUnavailable("AllocatorFree"))?;
+
+        let mut metadata = std::ptr::null_mut();
+        // SAFETY: session is valid and metadata is an out-parameter.
+        crate::error::check_status(unsafe { get_metadata(self.ptr.as_ptr(), &mut metadata) })?;
+        if metadata.is_null() {
+            return Ok(None);
+        }
+
+        let result = (|| {
+            let mut value_ptr = std::ptr::null_mut();
+            // SAFETY: metadata, allocator, and key are valid for the call.
+            crate::error::check_status(unsafe {
+                lookup(metadata, allocator.as_ptr(), key.as_ptr(), &mut value_ptr)
+            })?;
+            if value_ptr.is_null() {
+                return Ok(None);
+            }
+            // SAFETY: ORT returned a NUL-terminated string allocated by allocator.
+            let value = unsafe { CStr::from_ptr(value_ptr) }
+                .to_string_lossy()
+                .into_owned();
+            crate::error::check_status(unsafe { free(allocator.as_ptr(), value_ptr.cast()) })?;
+            Ok(Some(value))
+        })();
+
+        // SAFETY: metadata was allocated by ORT and is released once.
+        unsafe { release_metadata(metadata) };
+        result
+    }
+
+    /// Detect whether model metadata declares ORT past/present share-buffer KV.
+    pub fn past_present_share_buffer_supported(&self) -> bool {
+        ["past_present_share_buffer", "past.present.share_buffer"]
+            .iter()
+            .filter_map(|key| self.custom_metadata_value(key).ok().flatten())
+            .any(|value| {
+                matches!(
+                    value.to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+    }
+
     pub(crate) fn as_mut_ptr(&self) -> *mut onnx_genai_ort_sys::OrtSession {
         self.ptr.as_ptr()
     }

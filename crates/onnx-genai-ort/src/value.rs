@@ -1,6 +1,7 @@
 //! ORT Values (tensors).
 
 use std::ptr::NonNull;
+use std::sync::Arc;
 
 use crate::{MemoryInfo, OrtError, Result};
 
@@ -86,7 +87,9 @@ impl DataType {
 
 enum TensorBacking {
     F32(Vec<f32>),
+    F16(Vec<u16>),
     I64(Vec<i64>),
+    Alias(Arc<Value>),
     None,
 }
 
@@ -133,6 +136,11 @@ impl Value {
         Self::from_vec_f32(data.to_vec(), shape)
     }
 
+    /// Create a CPU Float16 tensor from IEEE-754 half-precision bit patterns.
+    pub fn from_slice_f16_bits(data: &[u16], shape: &[i64]) -> Result<Self> {
+        Self::from_vec_f16_bits(data.to_vec(), shape)
+    }
+
     /// Create a tensor from i64 data (for input_ids, attention_mask).
     pub fn from_slice_i64(data: &[i64], shape: &[i64]) -> Result<Self> {
         Self::from_vec_i64(data.to_vec(), shape)
@@ -152,6 +160,23 @@ impl Value {
             shape: shape.to_vec(),
             dtype: DataType::Float32,
             backing: TensorBacking::F32(data),
+        })
+    }
+
+    /// Create a CPU Float16 tensor from owned IEEE-754 half-precision bit patterns.
+    pub fn from_vec_f16_bits(mut data: Vec<u16>, shape: &[i64]) -> Result<Self> {
+        validate_shape(shape, Some(data.len()))?;
+        let ptr = create_tensor_with_data(
+            data.as_mut_ptr().cast(),
+            data.len() * std::mem::size_of::<u16>(),
+            shape,
+            DataType::Float16,
+        )?;
+        Ok(Self {
+            ptr,
+            shape: shape.to_vec(),
+            dtype: DataType::Float16,
+            backing: TensorBacking::F16(data),
         })
     }
 
@@ -198,6 +223,17 @@ impl Value {
         tensor_data_to_vec(self.ptr.as_ptr(), self.numel())
     }
 
+    /// Copy Float16 tensor data out as IEEE-754 half-precision bit patterns.
+    pub fn to_vec_f16_bits(&self) -> Result<Vec<u16>> {
+        if self.dtype != DataType::Float16 {
+            return Err(OrtError::InvalidArgument(format!(
+                "requested Float16 data from {:?} tensor",
+                self.dtype
+            )));
+        }
+        tensor_data_to_vec(self.ptr.as_ptr(), self.numel())
+    }
+
     /// Copy tensor data out as i64 values.
     pub fn to_vec_i64(&self) -> Result<Vec<i64>> {
         if self.dtype != DataType::Int64 {
@@ -211,6 +247,41 @@ impl Value {
 
     pub(crate) fn as_ptr(&self) -> *const onnx_genai_ort_sys::OrtValue {
         self.ptr.as_ptr()
+    }
+
+    /// Create a no-copy CPU tensor alias over the prefix of an existing tensor.
+    ///
+    /// The returned OrtValue has its own shape but points at the same underlying
+    /// tensor data as `owner`. `owner` is kept alive by the alias backing.
+    pub fn alias_with_shape(owner: Arc<Value>, shape: &[i64]) -> Result<Self> {
+        validate_shape(shape, None)?;
+        let alias_numel = shape.iter().try_fold(1usize, |acc, &dim| {
+            acc.checked_mul(dim as usize).ok_or_else(|| {
+                OrtError::InvalidArgument(format!("tensor shape too large: {shape:?}"))
+            })
+        })?;
+        if alias_numel > owner.numel() {
+            return Err(OrtError::InvalidArgument(format!(
+                "alias shape {:?} has {} elements, larger than owner shape {:?} with {} elements",
+                shape,
+                alias_numel,
+                owner.shape(),
+                owner.numel()
+            )));
+        }
+        let data = tensor_data_ptr(owner.ptr.as_ptr())?;
+        let ptr = create_tensor_with_data(
+            data,
+            alias_numel * owner.dtype.size_of(),
+            shape,
+            owner.dtype,
+        )?;
+        Ok(Self {
+            ptr,
+            shape: shape.to_vec(),
+            dtype: owner.dtype,
+            backing: TensorBacking::Alias(owner),
+        })
     }
 
     pub(crate) unsafe fn from_raw(ptr: *mut onnx_genai_ort_sys::OrtValue) -> Result<Self> {
@@ -229,7 +300,9 @@ impl Drop for Value {
     fn drop(&mut self) {
         let _keep_data_alive = match &self.backing {
             TensorBacking::F32(data) => data.len(),
+            TensorBacking::F16(data) => data.len(),
             TensorBacking::I64(data) => data.len(),
+            TensorBacking::Alias(owner) => owner.numel(),
             TensorBacking::None => 0,
         };
         if let Ok(api) = crate::error::api()
@@ -354,7 +427,23 @@ fn tensor_data_to_vec<T: Copy>(
     if data.is_null() {
         return Err(OrtError::NullPointer);
     }
+
     // SAFETY: caller ensures `T` matches the tensor dtype and `len` is numel.
     let slice = unsafe { std::slice::from_raw_parts(data.cast::<T>(), len) };
     Ok(slice.to_vec())
+}
+
+fn tensor_data_ptr(value: *mut onnx_genai_ort_sys::OrtValue) -> Result<*mut std::ffi::c_void> {
+    let api = crate::error::api()?;
+    let get_data = api
+        .GetTensorMutableData
+        .ok_or(OrtError::ApiUnavailable("GetTensorMutableData"))?;
+    let mut data = std::ptr::null_mut();
+    // SAFETY: `value` is a valid tensor OrtValue; ORT returns a pointer valid
+    // until the value is released. The caller keeps the owner alive.
+    crate::error::check_status(unsafe { get_data(value, &mut data) })?;
+    if data.is_null() {
+        return Err(OrtError::NullPointer);
+    }
+    Ok(data)
 }
