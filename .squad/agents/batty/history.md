@@ -21,3 +21,6 @@
 
 ## 2026-07-12T09:38:00-07:00 — Phase 2 complete
 Batty delivered persistent engine sessions, stateless `generate` compatibility, minimal FCFS scheduler admission, paged-KV mirroring, same/cross-session prefix reuse, and `GenerateResult::prefix_cache_hit_len` for cache observability.
+
+## 2026-07-12T10:10:00-07:00 — Phase 3 complete
+Delivered Phase 3 engine work: greedy speculative decoding, priority scheduling with swap preemption, context-window guard, and real-draft KV rewind fix; real differing model speculation is target-greedy token-identical.

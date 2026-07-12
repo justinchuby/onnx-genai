@@ -19,3 +19,6 @@
 
 ## 2026-07-12T09:38:00-07:00 — Phase 2 complete
 Pris delivered Phase 2 coverage for interleaved persistent sessions, reset isolation, KV fork CoW independence, same-session prefix hit (`prefix_cache_hit_len > 0`, warm hit observed as 6), and cross-session prefix reuse with matching greedy output.
+
+## 2026-07-12T10:10:00-07:00 — Phase 3 complete
+Delivered Phase 3 validation: real TinyStories coherent CLI/HTTP generation, 12-session KV pressure pass with no OOM, speculative correctness harness, and documented CPU/tiny-model speedup limitation.

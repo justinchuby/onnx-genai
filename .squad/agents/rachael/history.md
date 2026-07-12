@@ -14,3 +14,6 @@
 
 ## 2026-07-12T09:38:00-07:00 — Phase 2 complete
 Rachael delivered the OpenAI-compatible HTTP server with `/health`, `/v1/models`, `/v1/chat/completions`, SSE streaming, `X-Session-Id` persistent session addressing, `POST /v1/sessions`, and `DELETE /v1/sessions/{id}` lifecycle support.
+
+## 2026-07-12T10:10:00-07:00 — Phase 3 complete
+Delivered Phase 3 server hardening: prompt-token usage accounting, SSE stop-sequence buffering/suppression with terminal stop chunks, `[DONE]`, and client-disconnect cancellation at callback boundaries.

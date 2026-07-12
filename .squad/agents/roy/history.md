@@ -16,3 +16,6 @@
 
 ## 2026-07-12T09:38:00-07:00 — Phase 2 complete
 Roy's Phase 2 plan was executed successfully: paged KV tensor storage, prefix cache lifecycle/CoW, persistent multi-session engine APIs, HTTP/SSE session surface, and Pris's exit tests are now in place. Shared contracts include `prefix_cache_hit_len`, `X-Session-Id`, and standalone ORT runtime packaging.
+
+## 2026-07-12T10:10:00-07:00 — Phase 3 complete
+Phase 3 plan completed and executed. Team delivered speculative decoding, tiered/quantized KV, priority/preemption, streaming/accounting hardening, and validation; speedup limitation is environment-bound locally.

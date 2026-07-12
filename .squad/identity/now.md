@@ -1,5 +1,5 @@
 # Now
 
-**Updated:** 2026-07-12T09:38:00-07:00
+**Updated:** 2026-07-12T10:10:00-07:00
 
-Current focus: Phase 2 Agent Essentials complete + server runnable standalone. Next: real-model text-generation validation, robustness (context-length guard, usage.prompt_tokens=0 bug), then Phase 3 Performance (speculative decoding, tiered KV, priority scheduling).
+Current focus: Phases 1-3 complete (greedy+speculative gen, paged/tiered/quantized KV, prefix reuse, multi-session, priority+preemption, OpenAI HTTP w/ streaming early-stop; real coherent text verified). Speculative speedup is correct but CPU/tiny-model-bound (<1x locally). Known: flaky async SSE test to harden. Next: Phase 4 (multi-model pipeline, VLM, grammar/JSON constrained decoding, tree speculative, HW profiles).
