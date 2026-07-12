@@ -7,6 +7,7 @@
 //! - Logit processors (sampling)
 //! - Speculative decoding (acceleration)
 
+pub(crate) mod batched;
 pub mod config;
 pub(crate) mod decode;
 pub(crate) mod decode_loop;
