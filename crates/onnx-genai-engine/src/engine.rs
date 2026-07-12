@@ -21,8 +21,7 @@ use anyhow::Context;
 use onnx_genai_kv::{KvCacheOps, PagedKvCache, PrefixCache};
 use onnx_genai_metadata::InferenceMetadata;
 use onnx_genai_ort::{
-    DataType, Environment, LinearEmbedder, LinearLmHead, ModelDirectory, MtpDecodeSession, Session,
-    SessionOptions, Tokenizer,
+    DataType, Environment, ModelDirectory, MtpDecodeSession, Session, SessionOptions, Tokenizer,
 };
 use onnx_genai_scheduler::{Priority, Scheduler};
 use std::collections::HashMap;
@@ -34,7 +33,7 @@ pub use crate::config::{
     PrioritizedGenerateRequest, PrioritizedGenerateResult, ScheduledGenerateArrival, SessionId,
     SpeculativeMode,
 };
-use crate::speculative::SpeculativeStats;
+use crate::speculative::{LinearEmbedder, LinearLmHead, SpeculativeStats};
 
 /// The generation engine.
 pub struct Engine {

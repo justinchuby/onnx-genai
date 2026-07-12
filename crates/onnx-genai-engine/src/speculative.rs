@@ -24,10 +24,133 @@ use crate::{
 };
 use anyhow::Context;
 use onnx_genai_kv::KvCacheOps;
-use onnx_genai_ort::{
-    LinearEmbedder, LinearLmHead, MtpDecodeOptions, MtpDecodeSession, Session, TokenEmbedder,
-    argmax,
-};
+use onnx_genai_ort::{MtpDecodeOptions, MtpDecodeSession, Session};
+
+/// Produces a target-model token embedding for an MTP proposal step.
+pub trait TokenEmbedder {
+    fn hidden_size(&self) -> usize;
+    fn embed(&self, token: TokenId, out: &mut [f32]) -> anyhow::Result<()>;
+}
+
+/// Projects a target-model hidden state to vocabulary logits.
+pub trait LmHead {
+    fn vocab_size(&self) -> usize;
+    fn logits(&self, hidden: &[f32], out: &mut [f32]) -> anyhow::Result<()>;
+}
+
+/// Dense target embedding table in row-major `[vocab, hidden]` order.
+#[derive(Debug, Clone)]
+pub struct LinearEmbedder {
+    weight: Vec<f32>,
+    vocab: usize,
+    hidden: usize,
+}
+
+impl LinearEmbedder {
+    pub fn new(weight: Vec<f32>, vocab: usize, hidden: usize) -> anyhow::Result<Self> {
+        if weight.len() != vocab * hidden {
+            anyhow::bail!(
+                "embedder weight length {} != vocab {vocab} * hidden {hidden}",
+                weight.len()
+            );
+        }
+        Ok(Self {
+            weight,
+            vocab,
+            hidden,
+        })
+    }
+}
+
+impl TokenEmbedder for LinearEmbedder {
+    fn hidden_size(&self) -> usize {
+        self.hidden
+    }
+
+    fn embed(&self, token: TokenId, out: &mut [f32]) -> anyhow::Result<()> {
+        let token = token as usize;
+        if token >= self.vocab {
+            anyhow::bail!("token {token} out of range for vocab {}", self.vocab);
+        }
+        if out.len() != self.hidden {
+            anyhow::bail!(
+                "embed output length {} != hidden {}",
+                out.len(),
+                self.hidden
+            );
+        }
+        let start = token * self.hidden;
+        out.copy_from_slice(&self.weight[start..start + self.hidden]);
+        Ok(())
+    }
+}
+
+/// Dense target LM-head projection in row-major `[hidden, vocab]` order.
+#[derive(Debug, Clone)]
+pub struct LinearLmHead {
+    weight: Vec<f32>,
+    hidden: usize,
+    vocab: usize,
+}
+
+impl LinearLmHead {
+    pub fn new(weight: Vec<f32>, hidden: usize, vocab: usize) -> anyhow::Result<Self> {
+        if weight.len() != hidden * vocab {
+            anyhow::bail!(
+                "lm-head weight length {} != hidden {hidden} * vocab {vocab}",
+                weight.len()
+            );
+        }
+        Ok(Self {
+            weight,
+            hidden,
+            vocab,
+        })
+    }
+}
+
+impl LmHead for LinearLmHead {
+    fn vocab_size(&self) -> usize {
+        self.vocab
+    }
+
+    fn logits(&self, hidden: &[f32], out: &mut [f32]) -> anyhow::Result<()> {
+        if hidden.len() != self.hidden {
+            anyhow::bail!(
+                "lm-head input length {} != hidden {}",
+                hidden.len(),
+                self.hidden
+            );
+        }
+        if out.len() != self.vocab {
+            anyhow::bail!(
+                "lm-head output length {} != vocab {}",
+                out.len(),
+                self.vocab
+            );
+        }
+        for (col, slot) in out.iter_mut().enumerate() {
+            let mut acc = 0.0f32;
+            for (row, &value) in hidden.iter().enumerate() {
+                acc += value * self.weight[row * self.vocab + col];
+            }
+            *slot = acc;
+        }
+        Ok(())
+    }
+}
+
+/// Index of the maximum logit, resolving ties to the lowest index.
+pub fn argmax(logits: &[f32]) -> Option<usize> {
+    logits
+        .iter()
+        .enumerate()
+        .fold(None, |best, (index, &value)| match best {
+            Some((_, best_value)) if value <= best_value => best,
+            _ => Some((index, value)),
+        })
+        .map(|(index, _)| index)
+}
 
 /// Speculative acceptance rule implemented by the Phase 3 engine path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -175,7 +298,7 @@ pub struct MtpProposer<'a, E = LinearEmbedder, L = LinearLmHead> {
 impl<'a, E, L> MtpProposer<'a, E, L>
 where
     E: TokenEmbedder,
-    L: onnx_genai_ort::LmHead,
+    L: LmHead,
 {
     pub fn new(
         head: &'a Session,
@@ -203,7 +326,7 @@ where
 impl<E, L> SpeculativeProposer for MtpProposer<'_, E, L>
 where
     E: TokenEmbedder,
-    L: onnx_genai_ort::LmHead,
+    L: LmHead,
 {
     fn propose(
         &mut self,
@@ -216,19 +339,34 @@ where
             .guaranteed_token
             .context("MTP proposer requires the target model's greedy next token")?;
         let draft_count = context.width.saturating_sub(1);
-        let proposal = self
-            .session
-            .propose(
-                hidden,
-                guaranteed_token,
-                draft_count,
-                &self.embedder,
-                &self.lm_head,
-            )
-            .map_err(|error| anyhow::anyhow!("MTP proposal failed: {error}"))?;
-        let mut tokens = Vec::with_capacity(proposal.draft_tokens.len() + 1);
-        tokens.push(proposal.guaranteed_token);
-        tokens.extend(proposal.draft_tokens);
+        if hidden.len() != self.session.signature().hidden_size {
+            anyhow::bail!(
+                "target_hidden length {} != hidden {}",
+                hidden.len(),
+                self.session.signature().hidden_size
+            );
+        }
+        self.session.reset();
+        let mut tokens = Vec::with_capacity(draft_count + 1);
+        tokens.push(guaranteed_token);
+        let mut running_hidden = hidden.to_vec();
+        let mut previous_token = guaranteed_token;
+        let mut embedding = vec![0.0f32; self.session.signature().hidden_size];
+        let mut logits = vec![0.0f32; self.lm_head.vocab_size()];
+        for _ in 0..draft_count {
+            self.embedder.embed(previous_token, &mut embedding)?;
+            let position =
+                i64::try_from(self.session.past_len()).context("MTP position exceeds i64")?;
+            let mtp_hidden = self
+                .session
+                .step(&embedding, &running_hidden, position)
+                .map_err(|error| anyhow::anyhow!("MTP proposal step failed: {error}"))?;
+            self.lm_head.logits(&mtp_hidden, &mut logits)?;
+            let token = argmax(&logits).context("lm-head produced empty logits")? as TokenId;
+            tokens.push(token);
+            running_hidden = mtp_hidden;
+            previous_token = token;
+        }
         Ok(SpeculativeProposal {
             tokens,
             positions: None,
@@ -906,7 +1044,7 @@ mod tests {
         let lm_head = LinearLmHead::new(lcg_weights(0x3333_4444, HIDDEN * VOCAB), HIDDEN, VOCAB)?;
         let hidden = lcg_weights(0xA5A5_1234, HIDDEN);
         let mut logits = vec![0.0; VOCAB];
-        onnx_genai_ort::LmHead::logits(&lm_head, &hidden, &mut logits)?;
+        LmHead::logits(&lm_head, &hidden, &mut logits)?;
         let guaranteed = argmax(&logits).context("target logits were empty")? as TokenId;
         let options = GenerateOptions::default();
         let chain = ProcessorChain::new();

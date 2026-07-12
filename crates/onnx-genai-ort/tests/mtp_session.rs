@@ -2,12 +2,10 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use onnx_genai_ort::{
-    Environment, LinearEmbedder, LinearLmHead, LmHead, MtpDecodeOptions, MtpDecodeSession,
-    MtpDraftKvMode, Session, SessionOptions, TokenEmbedder, argmax,
+    Environment, MtpDecodeOptions, MtpDecodeSession, MtpDraftKvMode, Session, SessionOptions,
 };
 
 const HIDDEN: usize = 16;
-const VOCAB: usize = 32;
 
 fn tiny_mtp() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-qwen35-mtp/model.onnx")
@@ -50,14 +48,6 @@ fn target_hidden() -> Vec<f32> {
     lcg_weights(0xA5A5_1234, HIDDEN)
 }
 
-fn embedder() -> LinearEmbedder {
-    LinearEmbedder::new(lcg_weights(0x1111_2222, VOCAB * HIDDEN), VOCAB, HIDDEN).expect("embedder")
-}
-
-fn lm_head() -> LinearLmHead {
-    LinearLmHead::new(lcg_weights(0x3333_4444, HIDDEN * VOCAB), HIDDEN, VOCAB).expect("lm head")
-}
-
 #[test]
 fn detects_mtp_head_signature() {
     let session = load_head();
@@ -84,93 +74,4 @@ fn single_step_produces_hidden_state() {
     assert!(mtp_hidden.iter().all(|value| value.is_finite()));
     // HiddenThreaded never grows the head cache.
     assert_eq!(mtp.past_len(), 0);
-}
-
-#[test]
-fn proposes_k_draft_tokens_from_real_fixture() {
-    let session = load_head();
-    let mut mtp =
-        MtpDecodeSession::new(&session, MtpDecodeOptions::default()).expect("mtp session");
-
-    let embedder = embedder();
-    let lm_head = lm_head();
-    let hidden = target_hidden();
-
-    // The main model's own next-token (from logits over the target hidden) is
-    // the guaranteed token that MTP speculates beyond.
-    let mut guaranteed_logits = vec![0.0f32; VOCAB];
-    lm_head
-        .logits(&hidden, &mut guaranteed_logits)
-        .expect("guaranteed logits");
-    let guaranteed = argmax(&guaranteed_logits).expect("argmax") as u32;
-
-    let k = 4;
-    let proposal = mtp
-        .propose(&hidden, guaranteed, k, &embedder, &lm_head)
-        .expect("propose");
-
-    assert_eq!(proposal.guaranteed_token, guaranteed);
-    assert_eq!(proposal.draft_tokens.len(), k);
-    assert_eq!(proposal.draft_hiddens.len(), k);
-    for &token in &proposal.draft_tokens {
-        assert!((token as usize) < VOCAB, "draft token {token} out of vocab");
-    }
-    for hidden_state in &proposal.draft_hiddens {
-        assert_eq!(hidden_state.len(), HIDDEN);
-        assert!(hidden_state.iter().all(|value| value.is_finite()));
-    }
-
-    // Determinism: a second proposal (fresh reset) yields identical tokens.
-    let repeat = mtp
-        .propose(&hidden, guaranteed, k, &embedder, &lm_head)
-        .expect("propose repeat");
-    assert_eq!(proposal.draft_tokens, repeat.draft_tokens);
-    assert_eq!(proposal.draft_hiddens, repeat.draft_hiddens);
-
-    // The guaranteed token is a stable function of the target hidden.
-    let mut recomputed = vec![0.0f32; VOCAB];
-    lm_head.logits(&hidden, &mut recomputed).expect("recompute");
-    assert_eq!(argmax(&recomputed).expect("argmax") as u32, guaranteed);
-}
-
-#[test]
-fn manual_chain_matches_propose() {
-    // The propose loop is just: embed(prev) -> step(hidden) -> argmax(lm_head).
-    let session = load_head();
-    let mut mtp =
-        MtpDecodeSession::new(&session, MtpDecodeOptions::default()).expect("mtp session");
-    let embedder = embedder();
-    let lm_head = lm_head();
-    let hidden = target_hidden();
-
-    let mut guaranteed_logits = vec![0.0f32; VOCAB];
-    lm_head
-        .logits(&hidden, &mut guaranteed_logits)
-        .expect("logits");
-    let guaranteed = argmax(&guaranteed_logits).expect("argmax") as u32;
-
-    let k = 3;
-    let proposal = mtp
-        .propose(&hidden, guaranteed, k, &embedder, &lm_head)
-        .expect("propose");
-
-    // Reproduce the chain by hand using the low-level step API.
-    mtp.reset();
-    let mut running = hidden.clone();
-    let mut prev = guaranteed;
-    let mut expected = Vec::new();
-    let mut embed_buf = vec![0.0f32; HIDDEN];
-    let mut logits_buf = vec![0.0f32; VOCAB];
-    for i in 0..k {
-        embedder.embed(prev, &mut embed_buf).expect("embed");
-        let mtp_hidden = mtp.step(&embed_buf, &running, i as i64).expect("step");
-        lm_head
-            .logits(&mtp_hidden, &mut logits_buf)
-            .expect("logits");
-        let token = argmax(&logits_buf).expect("argmax") as u32;
-        expected.push(token);
-        prev = token;
-        running = mtp_hidden;
-    }
-    assert_eq!(proposal.draft_tokens, expected);
 }

@@ -30,10 +30,7 @@ pub use decode::{
 pub use env::Environment;
 pub use error::{OrtError, Result};
 pub use loader::{ModelDirectory, PipelineModelDirectory, PipelineModels, PipelineTokenizerPaths};
-pub use mtp::{
-    LinearEmbedder, LinearLmHead, LmHead, MtpDecodeOptions, MtpDecodeSession, MtpDraftKvMode,
-    MtpHeadSignature, MtpProposal, TokenEmbedder, argmax,
-};
+pub use mtp::{MtpDecodeOptions, MtpDecodeSession, MtpDraftKvMode, MtpHeadSignature};
 pub use onnx_genai_metadata::{
     ProposalType, SpeculatorConfig, SpeculatorConfigSource, SpeculatorDescriptor,
     SpeculatorProposerKind, SpeculatorProposerStatus, SpeculatorVerifier, detect_speculator,

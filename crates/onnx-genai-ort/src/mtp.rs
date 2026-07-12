@@ -1,16 +1,13 @@
-//! Multi-Token Prediction (MTP) self-speculative execution built on ORT.
+//! Low-level Multi-Token Prediction (MTP) head execution built on ORT.
 //!
 //! An MTP head is a small decoder module distinct from the target model. It
-//! consumes the target's hidden state plus an embedded token and predicts the
-//! next-token *hidden state* (`mtp_hidden`). The runtime applies the target's
-//! shared LM head to `mtp_hidden` to select a token, re-embeds it with the
-//! target embedding, and calls the head again to chain `k` draft tokens.
+//! consumes a hidden state plus an embedded token and produces the next hidden
+//! state (`mtp_hidden`).
 //!
 //! The MTP head graph exposes no `logits` output and no embedding/LM-head
-//! weights: those belong to the target model and are supplied to
-//! [`MtpDecodeSession::propose`] via the [`TokenEmbedder`] and [`LmHead`]
-//! traits. This keeps the head session self-contained while letting the engine
-//! (Batty's `MtpProposer`) own the target embedding/LM head.
+//! weights. [`MtpDecodeSession`] owns only one head forward pass plus its KV
+//! buffer state and rewind cursor. The engine owns embedding, LM-head
+//! projection, token selection, and the multi-step proposal loop.
 
 //! ## Head I/O (fixture `tests/fixtures/tiny-qwen35-mtp/`)
 //!
@@ -85,158 +82,6 @@ impl Default for MtpDecodeOptions {
     }
 }
 
-/// Result of proposing `k` draft tokens from a target hidden state.
-#[derive(Debug, Clone, PartialEq)]
-pub struct MtpProposal {
-    /// The target model's own committed next token (accepted unconditionally).
-    pub guaranteed_token: u32,
-    /// The `k` speculative draft tokens produced by the MTP head.
-    pub draft_tokens: Vec<u32>,
-    /// Per-draft `mtp_hidden` states (`hidden_size` floats each), useful for a
-    /// verifier that wants to reuse drafted hidden states.
-    pub draft_hiddens: Vec<Vec<f32>>,
-}
-
-/// Produces a token embedding (`inputs_embeds` row) for the MTP head.
-///
-/// In production this wraps the target model's embedding table.
-pub trait TokenEmbedder {
-    /// Hidden size of embeddings this embedder produces.
-    fn hidden_size(&self) -> usize;
-    /// Write the embedding of `token` into `out` (length == `hidden_size`).
-    fn embed(&self, token: u32, out: &mut [f32]) -> Result<()>;
-}
-
-/// Projects a hidden state to vocabulary logits.
-///
-/// In production this wraps the target model's shared LM head.
-pub trait LmHead {
-    /// Vocabulary size (length of a produced logits row).
-    fn vocab_size(&self) -> usize;
-    /// Write logits for `hidden` (length == hidden size) into `out`
-    /// (length == `vocab_size`).
-    fn logits(&self, hidden: &[f32], out: &mut [f32]) -> Result<()>;
-}
-
-/// Index of the maximum logit (ties resolved to the lowest index).
-pub fn argmax(logits: &[f32]) -> Option<usize> {
-    logits
-        .iter()
-        .enumerate()
-        .fold(None, |best, (idx, &value)| match best {
-            Some((_, best_value)) if value <= best_value => best,
-            _ => Some((idx, value)),
-        })
-        .map(|(idx, _)| idx)
-}
-
-/// A dense `[vocab, hidden]` embedding table (row-major).
-#[derive(Debug, Clone)]
-pub struct LinearEmbedder {
-    weight: Vec<f32>,
-    vocab: usize,
-    hidden: usize,
-}
-
-impl LinearEmbedder {
-    /// `weight` is `vocab * hidden` floats in row-major `[vocab, hidden]` order.
-    pub fn new(weight: Vec<f32>, vocab: usize, hidden: usize) -> Result<Self> {
-        if weight.len() != vocab * hidden {
-            return Err(OrtError::InvalidArgument(format!(
-                "embedder weight length {} != vocab {vocab} * hidden {hidden}",
-                weight.len()
-            )));
-        }
-        Ok(Self {
-            weight,
-            vocab,
-            hidden,
-        })
-    }
-}
-
-impl TokenEmbedder for LinearEmbedder {
-    fn hidden_size(&self) -> usize {
-        self.hidden
-    }
-
-    fn embed(&self, token: u32, out: &mut [f32]) -> Result<()> {
-        let token = token as usize;
-        if token >= self.vocab {
-            return Err(OrtError::InvalidArgument(format!(
-                "token {token} out of range for vocab {}",
-                self.vocab
-            )));
-        }
-        if out.len() != self.hidden {
-            return Err(OrtError::InvalidArgument(format!(
-                "embed output length {} != hidden {}",
-                out.len(),
-                self.hidden
-            )));
-        }
-        let start = token * self.hidden;
-        out.copy_from_slice(&self.weight[start..start + self.hidden]);
-        Ok(())
-    }
-}
-
-/// A dense `[hidden, vocab]` LM-head projection (row-major).
-#[derive(Debug, Clone)]
-pub struct LinearLmHead {
-    weight: Vec<f32>,
-    hidden: usize,
-    vocab: usize,
-}
-
-impl LinearLmHead {
-    /// `weight` is `hidden * vocab` floats in row-major `[hidden, vocab]` order.
-    pub fn new(weight: Vec<f32>, hidden: usize, vocab: usize) -> Result<Self> {
-        if weight.len() != hidden * vocab {
-            return Err(OrtError::InvalidArgument(format!(
-                "lm-head weight length {} != hidden {hidden} * vocab {vocab}",
-                weight.len()
-            )));
-        }
-        Ok(Self {
-            weight,
-            hidden,
-            vocab,
-        })
-    }
-}
-
-impl LmHead for LinearLmHead {
-    fn vocab_size(&self) -> usize {
-        self.vocab
-    }
-
-    fn logits(&self, hidden: &[f32], out: &mut [f32]) -> Result<()> {
-        if hidden.len() != self.hidden {
-            return Err(OrtError::InvalidArgument(format!(
-                "lm-head input length {} != hidden {}",
-                hidden.len(),
-                self.hidden
-            )));
-        }
-        if out.len() != self.vocab {
-            return Err(OrtError::InvalidArgument(format!(
-                "lm-head output length {} != vocab {}",
-                out.len(),
-                self.vocab
-            )));
-        }
-        for (col, slot) in out.iter_mut().enumerate() {
-            let mut acc = 0.0f32;
-            for (row, &h) in hidden.iter().enumerate() {
-                acc += h * self.weight[row * self.vocab + col];
-            }
-            *slot = acc;
-        }
-        Ok(())
-    }
-}
-
 #[derive(Debug, Clone)]
 struct MtpKvPair {
     past: String,
@@ -247,9 +92,8 @@ struct MtpKvPair {
 
 /// Stateful runner for an MTP-head ONNX graph.
 ///
-/// Holds the head's own single-layer KV state (when growing) and drives the
-/// autoregressive draft loop. The target embedding/LM head are supplied per
-/// [`Self::propose`] call so this session stays independent of the target model.
+/// Holds the head's own single-layer KV state (when growing) and runs one
+/// forward step at a time. It does not select tokens or drive a proposal loop.
 pub struct MtpDecodeSession<'a> {
     session: &'a Session,
     binding: IoBinding,
@@ -461,65 +305,6 @@ impl<'a> MtpDecodeSession<'a> {
         }
         mtp_hidden
             .ok_or_else(|| OrtError::InvalidArgument("MTP head did not produce mtp_hidden".into()))
-    }
-
-    /// Propose `k` draft tokens from a target hidden state and committed token.
-    ///
-    /// `target_hidden` is the target model's hidden state at the current step
-    /// (`hidden_size` floats). `target_token` is the target's own committed next
-    /// token (the guaranteed token). The head chains: for each draft it embeds
-    /// the previous token, runs one head forward with the running hidden state,
-    /// applies `lm_head` to `mtp_hidden`, and picks the argmax token.
-    pub fn propose<E: TokenEmbedder, L: LmHead>(
-        &mut self,
-        target_hidden: &[f32],
-        target_token: u32,
-        k: usize,
-        embedder: &E,
-        lm_head: &L,
-    ) -> Result<MtpProposal> {
-        let hidden = self.signature.hidden_size;
-        if target_hidden.len() != hidden {
-            return Err(OrtError::InvalidArgument(format!(
-                "target_hidden length {} != hidden {hidden}",
-                target_hidden.len()
-            )));
-        }
-        if embedder.hidden_size() != hidden {
-            return Err(OrtError::InvalidArgument(format!(
-                "embedder hidden {} != head hidden {hidden}",
-                embedder.hidden_size()
-            )));
-        }
-        self.reset();
-
-        let mut draft_tokens = Vec::with_capacity(k);
-        let mut draft_hiddens = Vec::with_capacity(k);
-        let mut running_hidden = target_hidden.to_vec();
-        let mut prev_token = target_token;
-        let mut embed_buf = vec![0.0f32; hidden];
-        let mut logits_buf = vec![0.0f32; lm_head.vocab_size()];
-
-        for _ in 0..k {
-            embedder.embed(prev_token, &mut embed_buf)?;
-            let position = i64::try_from(self.kv_len)
-                .map_err(|_| OrtError::InvalidArgument("position exceeds i64".into()))?;
-            let mtp_hidden = self.step(&embed_buf, &running_hidden, position)?;
-            lm_head.logits(&mtp_hidden, &mut logits_buf)?;
-            let token = argmax(&logits_buf)
-                .ok_or_else(|| OrtError::InvalidArgument("lm-head produced empty logits".into()))?
-                as u32;
-            draft_tokens.push(token);
-            draft_hiddens.push(mtp_hidden.clone());
-            running_hidden = mtp_hidden;
-            prev_token = token;
-        }
-
-        Ok(MtpProposal {
-            guaranteed_token: target_token,
-            draft_tokens,
-            draft_hiddens,
-        })
     }
 
     fn bind_kv_inputs(&mut self) -> Result<()> {

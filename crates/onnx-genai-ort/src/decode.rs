@@ -1,4 +1,10 @@
-//! Incremental decode helpers built on ORT IoBinding.
+//! Low-level incremental model execution built on ORT IoBinding.
+//!
+//! This module owns one forward pass at a time: raw tensor I/O, IoBinding, and
+//! runtime-owned KV buffer state including cursors and rewind. It deliberately
+//! does not select tokens, apply sampling or constraints, enforce stop
+//! conditions, or drive a multi-step generation loop. Those policies belong to
+//! `onnx-genai-engine`, behind its `DecodeBackend` adapter seam.
 
 #![allow(clippy::arc_with_non_send_sync)]
 // ORT Values are session-owned handles. These Arcs provide shared ownership inside

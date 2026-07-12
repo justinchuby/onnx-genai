@@ -36,6 +36,7 @@ pub use logits::{
 pub use pipeline::{PipelineEngine, PipelineGenerateRequest, PipelineTensors};
 pub use sampling::{CategoricalSampler, GreedySampler, Sampler};
 pub use speculative::{
-    MtpProposer, NgramProposer, SpeculativeAcceptContext, SpeculativeProposal, SpeculativeProposer,
-    SpeculativeProposerContext, SpeculativeStats,
+    LinearEmbedder, LinearLmHead, LmHead, MtpProposer, NgramProposer, SpeculativeAcceptContext,
+    SpeculativeProposal, SpeculativeProposer, SpeculativeProposerContext, SpeculativeStats,
+    TokenEmbedder, argmax,
 };

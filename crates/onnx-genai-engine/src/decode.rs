@@ -1,4 +1,12 @@
-//! Decode backend selection and ORT decode-step adapters.
+//! Engine-side decode policy and ORT decode-step adapters.
+//!
+//! The ORT crate owns a single forward pass and its runtime KV buffers. This
+//! module converts engine token context into those low-level calls and exposes
+//! [`DecodeBackend`] as the seam used by engine generation policy.
+//! [`ModelDecodePath`] is only the model-I/O selection enum; despite the older
+//! issue wording, it is not the boundary trait. Multi-step generation, token
+//! selection, stopping, constraints, and KV-management policy remain in the
+//! engine.
 
 use crate::config::{GenerateOptions, SessionId};
 use crate::kv_bridge::{KvModelInfo, mirror_present_kv_to_pages};
@@ -14,6 +22,7 @@ use onnx_genai_ort::{
 use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
+/// Model-I/O strategy used to construct the appropriate [`DecodeBackend`].
 pub(crate) enum ModelDecodePath {
     StaticCache {
         max_len: usize,
@@ -26,6 +35,11 @@ pub(crate) enum ModelDecodePath {
 }
 
 #[allow(dead_code)]
+/// Engine-facing boundary over low-level ORT forward-pass/KV-buffer sessions.
+///
+/// Implementations produce logits and maintain or rewind their local KV buffer
+/// cursor. Callers decide which tokens to feed, when to stop, and how logical
+/// KV state participates in generation.
 pub(crate) trait DecodeBackend {
     fn current_len(&self) -> usize;
     fn max_context(&self) -> Option<usize> {
