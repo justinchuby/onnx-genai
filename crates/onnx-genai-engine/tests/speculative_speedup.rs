@@ -35,14 +35,10 @@ fn timed_generate(
     prompt: &str,
     max_new_tokens: usize,
     speculative_k: usize,
-) -> anyhow::Result<(usize, FinishReason, Duration)> {
+) -> anyhow::Result<(Vec<u32>, FinishReason, Duration)> {
     let started = Instant::now();
     let result = engine.generate(request(prompt, max_new_tokens, speculative_k))?;
-    Ok((
-        result.token_ids.len(),
-        result.finish_reason,
-        started.elapsed(),
-    ))
+    Ok((result.token_ids, result.finish_reason, started.elapsed()))
 }
 
 fn tokens_per_second(tokens: usize, elapsed: Duration) -> f64 {
@@ -92,18 +88,23 @@ fn speculative_decoding_exceeds_required_speedup_when_models_are_present() -> an
     let (spec_tokens, spec_finish, speculative_elapsed) =
         timed_generate(&mut speculative, &prompt, max_new_tokens, speculative_k)?;
 
-    assert_eq!(baseline_tokens, spec_tokens);
+    assert_eq!(
+        baseline_tokens, spec_tokens,
+        "speculative greedy output must exactly match target-only greedy tokens"
+    );
     assert_eq!(baseline_finish, spec_finish);
 
-    let baseline_tps = tokens_per_second(baseline_tokens, baseline_elapsed);
-    let speculative_tps = tokens_per_second(spec_tokens, speculative_elapsed);
+    let baseline_token_count = baseline_tokens.len();
+    let speculative_token_count = spec_tokens.len();
+    let baseline_tps = tokens_per_second(baseline_token_count, baseline_elapsed);
+    let speculative_tps = tokens_per_second(speculative_token_count, speculative_elapsed);
     let speedup = speculative_tps / baseline_tps;
 
     eprintln!(
         "speculative_speedup target={} draft={} tokens={} baseline={:.3}s ({:.2} tok/s) speculative={:.3}s ({:.2} tok/s) speedup={:.3}x k={}",
         target.display(),
         draft.display(),
-        baseline_tokens,
+        baseline_token_count,
         baseline_elapsed.as_secs_f64(),
         baseline_tps,
         speculative_elapsed.as_secs_f64(),

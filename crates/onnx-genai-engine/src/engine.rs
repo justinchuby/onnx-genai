@@ -1256,9 +1256,9 @@ impl Engine {
 
     fn sync_draft_to_target(&mut self, state: &mut EngineSession) -> anyhow::Result<()> {
         if let (Some(draft_model), Some(draft_state)) = (&mut self.draft, &mut state.draft) {
-            let target_len = state.tokens.len();
-            if draft_state.kv_token_count > target_len {
-                rewind_draft_state_to_len(draft_model, draft_state, target_len)?;
+            let common_len = common_prefix_len(&draft_state.tokens, &state.tokens);
+            if draft_state.kv_token_count > common_len {
+                rewind_draft_state_to_len(draft_model, draft_state, common_len)?;
             }
             draft_state.tokens = state.tokens.clone();
         }
@@ -1942,6 +1942,13 @@ fn rewind_draft_state_to_len(
     )
 }
 
+fn common_prefix_len(left: &[TokenId], right: &[TokenId]) -> usize {
+    left.iter()
+        .zip(right.iter())
+        .take_while(|(left, right)| left == right)
+        .count()
+}
+
 fn rewind_decode_state_to_len(
     session: &Session,
     kv_model: Option<&KvModelInfo>,
@@ -2383,6 +2390,13 @@ mod tests {
             finish_reason_after_token(3, &options, &chain, &context),
             Some(FinishReason::StopSequence { index: 0 })
         );
+    }
+
+    #[test]
+    fn common_prefix_len_stops_before_rejected_draft_token() {
+        assert_eq!(common_prefix_len(&[1, 2, 3, 4], &[1, 2, 9]), 2);
+        assert_eq!(common_prefix_len(&[1, 2, 3], &[1, 2, 3, 4]), 3);
+        assert_eq!(common_prefix_len(&[7], &[8]), 0);
     }
 
     #[test]

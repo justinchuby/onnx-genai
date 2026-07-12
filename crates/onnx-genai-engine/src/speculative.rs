@@ -5,9 +5,10 @@
 //! `EngineConfig::draft_model` is set, greedy requests propose `K`
 //! autoregressive draft tokens, verify them with one target pass, accept the
 //! longest target-greedy prefix, and take the target token at the first
-//! mismatch. Target and draft paged KV are rewound to the last accepted
-//! position before the next step, so rejected draft tokens never leak into
-//! subsequent decoding state.
+//! mismatch. Target paged KV is rewound before committing the target token, and
+//! draft KV is rewound to the shared prefix so the correction/bonus token seeds
+//! the next draft round. Rejected draft tokens never leak into subsequent
+//! decoding state.
 
 /// Speculative acceptance rule implemented by the Phase 3 engine path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
