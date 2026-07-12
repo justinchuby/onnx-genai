@@ -6867,3 +6867,79 @@ kv_connector:
   # endpoint: "localhost:65432"
   # auth_token: "..."
 ```
+
+### 38.13 Page Size Selection
+
+#### The Tradeoff
+
+| Factor | Larger pages | Smaller pages |
+|---|---|---|
+| Memory waste (fragmentation) | High (avg waste = page_size/2 tokens per seq) | Low |
+| Page table overhead | Low (fewer entries) | High (more entries, more metadata) |
+| Prefix sharing granularity | Coarse (only at page boundaries) | Fine (more sharing opportunities) |
+| GPU kernel efficiency | Better (contiguous memory, vectorized access) | Worse (scattered access, more gather) |
+| External storage alignment | Fewer network round-trips | More round-trips per chunk |
+
+#### Industry Choices
+
+| System | Page size | Rationale |
+|---|---|---|
+| vLLM | 16 tokens | Balances kernel efficiency (CUDA warp=32 threads) with reasonable fragmentation |
+| SGLang | 1 token | Maximum RadixAttention prefix sharing; radix tree compresses page table |
+| LMCache | 256 tokens | Network transfer unit; amortizes gRPC/RDMA overhead |
+
+#### Our Design: Two-Level Granularity
+
+```
+GPU-local pages:     16 tokens    (kernel-friendly, low fragmentation)
+External chunks:    256 tokens    (network-friendly, amortizes transfer cost)
+Mapping:            1 chunk = 16 pages (integer multiple, no waste)
+```
+
+```yaml
+kv_cache:
+  # GPU-local page management
+  page_size: 16              # tokens per page (default)
+  # Valid range: 1, 8, 16, 32, 64
+  # Smaller: better prefix sharing, more page table memory
+  # Larger: better kernel efficiency, more fragmentation
+
+kv_connector:
+  # External storage chunk (multiple of page_size)
+  chunk_size: 256            # tokens per chunk = 16 × page_size
+  # Transfer unit: 256 tokens of KV across all layers, batched as one network op
+```
+
+#### Why 16?
+
+1. **CUDA warp alignment** — attention kernels process 16 or 32 tokens per warp iteration. Page-aligned access avoids partial warp waste.
+
+2. **Fragmentation math** — average waste per sequence = page_size/2 = 8 tokens.
+   Per-sequence overhead at 8 tokens × 32 layers × 2(K+V) × 128 head_dim × 2 bytes(FP16) = **32 KB**.
+   For 100 concurrent sequences: 3.2 MB wasted. Acceptable.
+
+3. **Page table size** — for 4096-token context:
+   - page_size=16 → 256 entries per sequence → manageable
+   - page_size=1 → 4096 entries per sequence → needs radix tree compression
+
+4. **Prefix sharing** — two requests sharing a 2048-token system prompt:
+   - page_size=16 → shared at 16-token boundaries → 128 shared pages (works well)
+   - page_size=256 → shared at 256-token boundaries → only 8 shared chunks (coarser but still effective)
+
+#### Configurable Per-Model
+
+Different models may benefit from different page sizes:
+
+```yaml
+# Small model, short contexts (Phi-3-mini, typical 512-2048 tokens)
+kv_cache:
+  page_size: 16
+
+# Long-context model (128K+), many concurrent sessions
+kv_cache:
+  page_size: 32    # reduce page table size, accept slightly more fragmentation
+
+# Coding agent with heavy prefix sharing (same system prompt + tools)
+kv_cache:
+  page_size: 8     # finer sharing granularity, more prefix cache hits
+```
