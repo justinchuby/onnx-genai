@@ -2,7 +2,7 @@
 
 use crate::{
     CacheCheckpoint, Device, EvictionPolicy, KvCacheOps, KvError, SequenceId,
-    page_table::{KvKind, PageId, PageTable, PageTensorConfig},
+    page_table::{KvDType, KvKind, PageId, PageTable, PageTensorConfig},
 };
 
 /// Borrowed per-layer K/V tensors for one token.
@@ -105,6 +105,7 @@ impl PagedKvCache {
         let page_index = position / self.page_table.page_size;
         let token_offset = position % self.page_table.page_size;
         let page_id = self.ensure_page_for_write(seq, page_index)?;
+        self.page_table.promote_to_hot(page_id)?;
 
         {
             let page = self
@@ -112,6 +113,11 @@ impl PagedKvCache {
                 .pages
                 .get_mut(&page_id)
                 .ok_or(KvError::PageNotFound(page_id))?;
+            let mut values = if matches!(config.dtype, KvDType::Int8) {
+                page.dequantized(config)
+            } else {
+                Vec::new()
+            };
             for (layer_idx, layer) in layers.iter().enumerate() {
                 for head in 0..config.num_kv_heads {
                     for dim in 0..config.head_dim {
@@ -126,10 +132,21 @@ impl PagedKvCache {
                             + token_offset)
                             * config.head_dim
                             + dim;
-                        page.data[k_offset] = layer.key[src];
-                        page.data[v_offset] = layer.value[src];
+                        match config.dtype {
+                            KvDType::F32 => {
+                                page.data[k_offset] = layer.key[src];
+                                page.data[v_offset] = layer.value[src];
+                            }
+                            KvDType::Int8 => {
+                                values[k_offset] = layer.key[src];
+                                values[v_offset] = layer.value[src];
+                            }
+                        }
                     }
                 }
+            }
+            if matches!(config.dtype, KvDType::Int8) {
+                page.store_from_f32(config, &values);
             }
             page.filled = page.filled.max(token_offset + 1);
         }
@@ -181,8 +198,8 @@ impl PagedKvCache {
                             .page_table
                             .tensor_offset(layer_idx, KvKind::Value, head, token_offset, dim)
                             .expect("validated offset");
-                        layer_out.key[dst] = page.data[key_src];
-                        layer_out.value[dst] = page.data[value_src];
+                        layer_out.key[dst] = page.value_at(config, key_src);
+                        layer_out.value[dst] = page.value_at(config, value_src);
                     }
                 }
             }
@@ -196,10 +213,71 @@ impl PagedKvCache {
         })
     }
 
+    /// Promote the sequence's pages to HOT, then materialize K/V data.
+    pub fn materialize_sequence_promoting(
+        &mut self,
+        seq: SequenceId,
+    ) -> Result<MaterializedKv, KvError> {
+        let len = self.len(seq)?;
+        self.prefetch(seq, 0, len)?;
+        self.materialize_sequence(seq)
+    }
+
     /// Evict pages to free memory. Returns number of pages freed.
     pub fn evict(&mut self, _policy: EvictionPolicy, _target: usize) -> usize {
-        // TODO: implement eviction strategies
-        0
+        match _policy {
+            EvictionPolicy::Lru | EvictionPolicy::Priority | EvictionPolicy::LayerAware => {
+                let mut evicted = 0;
+                for _ in 0.._target {
+                    if self.page_table.evict_lru_hot(None).is_ok() {
+                        evicted += 1;
+                    } else {
+                        break;
+                    }
+                }
+                evicted
+            }
+        }
+    }
+
+    /// Promote all pages backing a sequence range to the hot tier.
+    pub fn prefetch(
+        &mut self,
+        seq: SequenceId,
+        start: usize,
+        end: usize,
+    ) -> Result<usize, KvError> {
+        let len = self.len(seq)?;
+        if start > end || end > len {
+            return Err(KvError::InvalidPosition {
+                position: end,
+                length: len,
+            });
+        }
+        if start == end {
+            return Ok(0);
+        }
+        let page_size = self.page_table.page_size;
+        let first_page = start / page_size;
+        let last_page = (end - 1) / page_size;
+        let page_ids = self
+            .page_table
+            .get_sequence(seq)
+            .ok_or(KvError::SequenceNotFound(seq))?[first_page..=last_page]
+            .to_vec();
+        let mut promoted = 0;
+        for page_id in page_ids {
+            let was_cold = self
+                .page_table
+                .pages
+                .get(&page_id)
+                .is_some_and(|page| !matches!(page.device, Device::Gpu(_)));
+            self.page_table.promote_to_hot(page_id)?;
+            if was_cold {
+                promoted += 1;
+            }
+        }
+        Ok(promoted)
     }
 
     fn validate_layers(
@@ -242,6 +320,7 @@ impl PagedKvCache {
                 .ref_count
                 > 1;
             if !is_shared {
+                self.page_table.promote_to_hot(page_id)?;
                 return Ok(page_id);
             }
 
@@ -252,17 +331,24 @@ impl PagedKvCache {
                         needed: 1,
                         available: self.page_table.free_count(Device::Gpu(0)),
                     })?;
-            let (old_data, old_filled) = {
+            let old_storage = {
                 let old = self
                     .page_table
                     .pages
                     .get(&page_id)
                     .ok_or(KvError::PageNotFound(page_id))?;
-                (old.data.clone(), old.filled)
+                (
+                    old.data.clone(),
+                    old.quantized_data.clone(),
+                    old.quant_scale,
+                    old.filled,
+                )
             };
             if let Some(new_page) = self.page_table.pages.get_mut(&new_page_id) {
-                new_page.data = old_data;
-                new_page.filled = old_filled;
+                new_page.data = old_storage.0;
+                new_page.quantized_data = old_storage.1;
+                new_page.quant_scale = old_storage.2;
+                new_page.filled = old_storage.3;
             }
             self.page_table.replace_page(seq, page_index, new_page_id);
             self.page_table.free(page_id);
@@ -375,6 +461,7 @@ impl KvCacheOps for PagedKvCache {
             let page_index = position / page_size;
             let token_offset = position % page_size;
             let page_id = self.ensure_page_for_write(seq, page_index)?;
+            self.page_table.promote_to_hot(page_id)?;
             if let Some(page) = self.page_table.pages.get_mut(&page_id) {
                 page.filled = page.filled.max(token_offset + 1);
             }
@@ -431,6 +518,31 @@ mod tests {
         data.iter()
             .map(|(key, value)| LayerKv { key, value })
             .collect()
+    }
+
+    fn small_config(dtype: KvDType) -> PageTensorConfig {
+        PageTensorConfig {
+            num_layers: 1,
+            num_kv_heads: 1,
+            head_dim: 4,
+            page_size: 1,
+            dtype,
+        }
+    }
+
+    fn small_layers(values: [f32; 4]) -> Vec<(Vec<f32>, Vec<f32>)> {
+        vec![(values.to_vec(), values.map(|value| value + 10.0).to_vec())]
+    }
+
+    fn assert_close(actual: &[f32], expected: &[f32], tolerance: f32) {
+        assert_eq!(actual.len(), expected.len());
+        for (idx, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+            let diff = (actual - expected).abs();
+            assert!(
+                diff <= tolerance,
+                "idx {idx}: actual {actual}, expected {expected}, diff {diff}, tolerance {tolerance}"
+            );
+        }
     }
 
     #[test]
@@ -529,5 +641,126 @@ mod tests {
         assert_eq!(cache.page_table.pages[&forked_page].ref_count, 1);
         assert_eq!(cache.len(seq).unwrap(), 2);
         assert_eq!(cache.len(forked).unwrap(), 3);
+    }
+
+    #[test]
+    fn tiered_eviction_moves_lru_hot_page_to_cold_and_preserves_f32_data() {
+        let mut cache = PagedKvCache::new_with_tensor_config(small_config(KvDType::F32), 2);
+        let seq = cache.create_sequence();
+        let t0 = small_layers([1.0, 2.0, 3.0, 4.0]);
+        let t1 = small_layers([5.0, 6.0, 7.0, 8.0]);
+        let t2 = small_layers([9.0, 10.0, 11.0, 12.0]);
+
+        cache.append_token_kv(seq, &borrowed_layers(&t0)).unwrap();
+        cache.append_token_kv(seq, &borrowed_layers(&t1)).unwrap();
+        let first_page = cache.page_table.get_sequence(seq).unwrap()[0];
+        assert_eq!(cache.page_table.hot_used_count(), 2);
+
+        cache.append_token_kv(seq, &borrowed_layers(&t2)).unwrap();
+
+        assert_eq!(cache.page_table.pages[&first_page].device, Device::Cpu);
+        assert_eq!(cache.page_table.hot_used_count(), 2);
+        let materialized = cache.materialize_sequence(seq).unwrap();
+        assert_eq!(
+            materialized.layers[0].key,
+            [
+                1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0
+            ]
+        );
+        assert_eq!(
+            materialized.layers[0].value,
+            [
+                11.0, 12.0, 13.0, 14.0, 15.0, 16.0, 17.0, 18.0, 19.0, 20.0, 21.0, 22.0
+            ]
+        );
+    }
+
+    #[test]
+    fn tiered_prefetch_promotes_cold_page_and_evicts_another_lru_hot_page() {
+        let mut cache = PagedKvCache::new_with_tensor_config(small_config(KvDType::F32), 2);
+        let seq = cache.create_sequence();
+        for base in [1.0, 5.0, 9.0] {
+            let token = small_layers([base, base + 1.0, base + 2.0, base + 3.0]);
+            cache
+                .append_token_kv(seq, &borrowed_layers(&token))
+                .unwrap();
+        }
+        let pages = cache.page_table.get_sequence(seq).unwrap().to_vec();
+        assert_eq!(cache.page_table.pages[&pages[0]].device, Device::Cpu);
+        assert_eq!(cache.prefetch(seq, 0, 1).unwrap(), 1);
+
+        assert_eq!(cache.page_table.pages[&pages[0]].device, Device::Gpu(0));
+        assert_eq!(cache.page_table.hot_used_count(), 2);
+        assert!(
+            pages[1..]
+                .iter()
+                .any(|page_id| cache.page_table.pages[page_id].device == Device::Cpu)
+        );
+    }
+
+    #[test]
+    fn tiered_lru_evicts_least_recently_accessed_hot_page() {
+        let mut cache = PagedKvCache::new_with_tensor_config(small_config(KvDType::F32), 2);
+        let seq = cache.create_sequence();
+        let t0 = small_layers([1.0, 1.1, 1.2, 1.3]);
+        let t1 = small_layers([2.0, 2.1, 2.2, 2.3]);
+        let t2 = small_layers([3.0, 3.1, 3.2, 3.3]);
+        cache.append_token_kv(seq, &borrowed_layers(&t0)).unwrap();
+        cache.append_token_kv(seq, &borrowed_layers(&t1)).unwrap();
+        let pages = cache.page_table.get_sequence(seq).unwrap().to_vec();
+
+        cache.write_token_kv(seq, 0, &borrowed_layers(&t0)).unwrap();
+        cache.append_token_kv(seq, &borrowed_layers(&t2)).unwrap();
+
+        assert_eq!(cache.page_table.pages[&pages[0]].device, Device::Gpu(0));
+        assert_eq!(cache.page_table.pages[&pages[1]].device, Device::Cpu);
+    }
+
+    #[test]
+    fn int8_quantize_dequantize_round_trip_is_within_tolerance() {
+        let mut cache = PagedKvCache::new_with_tensor_config(small_config(KvDType::Int8), 2);
+        let seq = cache.create_sequence();
+        let token = small_layers([-1.0, -0.25, 0.25, 1.0]);
+
+        cache
+            .append_token_kv(seq, &borrowed_layers(&token))
+            .unwrap();
+
+        let page_id = cache.page_table.get_sequence(seq).unwrap()[0];
+        let page = &cache.page_table.pages[&page_id];
+        assert!(page.data.is_empty());
+        assert_eq!(
+            page.quantized_data.len(),
+            small_config(KvDType::Int8).f32_len_per_page()
+        );
+        let materialized = cache.materialize_sequence(seq).unwrap();
+        assert_close(&materialized.layers[0].key, &token[0].0, 0.05);
+        assert_close(&materialized.layers[0].value, &token[0].1, 0.05);
+    }
+
+    #[test]
+    fn int8_quantized_append_materialize_across_pages() {
+        let mut cache = PagedKvCache::new_with_tensor_config(small_config(KvDType::Int8), 1);
+        let seq = cache.create_sequence();
+        let tokens = [
+            small_layers([0.0, 0.2, 0.4, 0.6]),
+            small_layers([0.8, 1.0, 1.2, 1.4]),
+        ];
+        for token in &tokens {
+            cache.append_token_kv(seq, &borrowed_layers(token)).unwrap();
+        }
+
+        let pages = cache.page_table.get_sequence(seq).unwrap();
+        assert_eq!(pages.len(), 2);
+        assert!(
+            pages
+                .iter()
+                .any(|id| cache.page_table.pages[id].device == Device::Cpu)
+        );
+        let materialized = cache.materialize_sequence(seq).unwrap();
+        let expected_key = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0, 1.2, 1.4];
+        let expected_value = [10.0, 10.2, 10.4, 10.6, 10.8, 11.0, 11.2, 11.4];
+        assert_close(&materialized.layers[0].key, &expected_key, 0.05);
+        assert_close(&materialized.layers[0].value, &expected_value, 0.05);
     }
 }
