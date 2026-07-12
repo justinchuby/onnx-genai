@@ -1,7 +1,7 @@
 use std::{net::SocketAddr, path::PathBuf};
 
 use clap::Parser;
-use onnx_genai_server::{AppState, serve};
+use onnx_genai_server::{AppState, ServerConfig, serve};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -20,6 +20,14 @@ struct Cli {
     /// Socket address to bind.
     #[arg(long, default_value = "127.0.0.1:8080")]
     addr: SocketAddr,
+
+    /// Maximum requested output tokens per chat completion. Falls back to ONNX_GENAI_MAX_OUTPUT_TOKENS.
+    #[arg(long, env = "ONNX_GENAI_MAX_OUTPUT_TOKENS", default_value_t = 4096)]
+    max_output_tokens: usize,
+
+    /// Maximum concurrent server sessions before least-recently-used eviction. Falls back to ONNX_GENAI_MAX_SESSIONS.
+    #[arg(long, env = "ONNX_GENAI_MAX_SESSIONS", default_value_t = 256)]
+    max_sessions: usize,
 }
 
 #[tokio::main]
@@ -29,7 +37,14 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse();
-    let state = AppState::load(&cli.model, cli.model_id)?;
+    let state = AppState::load_with_config(
+        &cli.model,
+        cli.model_id,
+        ServerConfig {
+            max_output_tokens: cli.max_output_tokens,
+            max_sessions: cli.max_sessions,
+        },
+    )?;
     tracing::info!(addr = %cli.addr, model = state.model_id(), "starting onnx-genai server");
     serve(cli.addr, state).await
 }

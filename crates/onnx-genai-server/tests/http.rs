@@ -5,7 +5,8 @@ use axum::{
 use onnx_genai::GeneratePrompt;
 use onnx_genai_engine::GenerateConstraint;
 use onnx_genai_server::{
-    AppState, ChatCompletionRequest, app, build_generate_request, parse_assistant_output,
+    AppState, ChatCompletionRequest, ServerConfig, app, build_generate_request,
+    parse_assistant_output,
 };
 use serde_json::{Value, json};
 use std::path::PathBuf;
@@ -17,6 +18,12 @@ fn fixture_dir() -> PathBuf {
 
 async fn test_app() -> axum::Router {
     let state = AppState::load(&fixture_dir(), Some("tiny-llm".to_string())).unwrap();
+    app(state)
+}
+
+async fn test_app_with_config(config: ServerConfig) -> axum::Router {
+    let state =
+        AppState::load_with_config(&fixture_dir(), Some("tiny-llm".to_string()), config).unwrap();
     app(state)
 }
 
@@ -74,6 +81,130 @@ async fn create_http_session(app: axum::Router) -> String {
     let json: Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["object"], "session");
     json["id"].as_str().unwrap().to_string()
+}
+
+#[tokio::test]
+async fn chat_completions_rejects_max_tokens_over_server_cap() {
+    let app = test_app_with_config(ServerConfig {
+        max_output_tokens: 2,
+        max_sessions: 8,
+    })
+    .await;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "tiny-llm",
+                        "messages": [{"role": "user", "content": "hello"}],
+                        "max_tokens": 3
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert!(
+        json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("server cap of 2"),
+        "{json}"
+    );
+}
+
+#[tokio::test]
+async fn session_ids_are_random_csprng_tokens() {
+    let app = test_app().await;
+    let mut ids = Vec::new();
+    for _ in 0..8 {
+        ids.push(create_http_session(app.clone()).await);
+    }
+
+    let mut values = Vec::new();
+    for id in &ids {
+        let token = id.strip_prefix("sess-").expect("session id prefix");
+        assert_eq!(token.len(), 32, "{id}");
+        assert!(token.chars().all(|ch| ch.is_ascii_hexdigit()), "{id}");
+        values.push(u128::from_str_radix(token, 16).unwrap());
+    }
+    let unique = ids.iter().collect::<std::collections::HashSet<_>>();
+    assert_eq!(unique.len(), ids.len(), "{ids:?}");
+    assert!(
+        values.windows(2).all(|pair| pair[0].abs_diff(pair[1]) != 1),
+        "{ids:?}"
+    );
+}
+
+#[tokio::test]
+async fn sessions_are_lru_evicted_at_configured_cap() {
+    let app = test_app_with_config(ServerConfig {
+        max_output_tokens: 16,
+        max_sessions: 2,
+    })
+    .await;
+    let first = create_http_session(app.clone()).await;
+    let second = create_http_session(app.clone()).await;
+
+    let touch_first = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("X-Session-Id", &first)
+                .body(Body::from(
+                    json!({
+                        "model": "tiny-llm",
+                        "messages": [{"role": "user", "content": "hello"}],
+                        "max_tokens": 1
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(touch_first.status(), StatusCode::OK);
+
+    let third = create_http_session(app.clone()).await;
+
+    let evicted = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/v1/sessions/{second}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(evicted.status(), StatusCode::NOT_FOUND);
+
+    for id in [first, third] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/v1/sessions/{id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
 }
 
 #[tokio::test]

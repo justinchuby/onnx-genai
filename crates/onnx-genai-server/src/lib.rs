@@ -5,10 +5,7 @@ use std::{
     convert::Infallible,
     net::SocketAddr,
     path::Path,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -31,6 +28,9 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
 const SESSION_ID_HEADER: &str = "x-session-id";
+const DEFAULT_MAX_OUTPUT_TOKENS: usize = 4096;
+const DEFAULT_MAX_SESSIONS: usize = 256;
+const MAX_SESSION_ID_LEN: usize = 128;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -39,14 +39,50 @@ pub struct AppState {
     tokenizer: Arc<Tokenizer>,
     chat_template: Option<Arc<ChatTemplate>>,
     sessions: SessionRegistry,
+    config: ServerConfig,
+    model_max_context: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ServerConfig {
+    pub max_output_tokens: usize,
+    pub max_sessions: usize,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
+            max_sessions: DEFAULT_MAX_SESSIONS,
+        }
+    }
+}
+
+impl ServerConfig {
+    fn validate(self) -> anyhow::Result<Self> {
+        if self.max_output_tokens == 0 {
+            anyhow::bail!("max_output_tokens must be greater than zero");
+        }
+        if self.max_sessions == 0 {
+            anyhow::bail!("max_sessions must be greater than zero");
+        }
+        Ok(self)
+    }
 }
 
 #[derive(Clone)]
 struct SharedEngine(Arc<Mutex<Engine>>);
 
-// Phase 2 serializes all generation through a mutex. ORT sessions already declare Send/Sync;
-// this wrapper keeps the HTTP layer server-only until the engine exposes its own Send bound.
+// SAFETY: `SharedEngine` is an `Arc<Mutex<Engine>>`; every HTTP entry point
+// takes the mutex before touching `Engine`, so non-`Sync` internals such as decode
+// runners, ORT values, and KV/session state are never accessed concurrently. The
+// value moved between worker threads is only the mutex owner handle. This would
+// stop being sound if `Engine` access escaped the mutex, if generation moved to
+// true concurrent/batched mutation without structural `Send`/`Sync` bounds, or if
+// runners were stored in background tasks outside the locked engine owner.
 unsafe impl Send for SharedEngine {}
+// SAFETY: Shared references only clone/lock the `Arc<Mutex<_>>`; mutation remains
+// serialized by the mutex invariant described above.
 unsafe impl Sync for SharedEngine {}
 
 impl SharedEngine {
@@ -119,63 +155,130 @@ impl SharedEngine {
 
 #[derive(Clone)]
 struct SessionRegistry {
-    sessions: Arc<Mutex<HashMap<String, SessionId>>>,
-    next_id: Arc<AtomicU64>,
+    inner: Arc<Mutex<SessionRegistryInner>>,
+    max_sessions: usize,
+}
+
+#[derive(Debug)]
+struct SessionRegistryInner {
+    sessions: HashMap<String, SessionEntry>,
+    access_clock: u64,
+}
+
+#[derive(Debug)]
+struct SessionEntry {
+    engine_session_id: SessionId,
+    last_access: u64,
 }
 
 impl SessionRegistry {
-    fn new() -> Self {
+    fn new(max_sessions: usize) -> Self {
         Self {
-            sessions: Arc::new(Mutex::new(HashMap::new())),
-            next_id: Arc::new(AtomicU64::new(1)),
+            inner: Arc::new(Mutex::new(SessionRegistryInner {
+                sessions: HashMap::new(),
+                access_clock: 0,
+            })),
+            max_sessions,
         }
     }
 
-    fn insert(&self, client_id: String, engine_session_id: SessionId) -> anyhow::Result<()> {
-        self.sessions
+    fn insert(
+        &self,
+        client_id: String,
+        engine_session_id: SessionId,
+    ) -> anyhow::Result<Option<SessionId>> {
+        let mut inner = self
+            .inner
             .lock()
-            .map_err(|_| anyhow::anyhow!("session registry mutex poisoned"))?
-            .insert(client_id, engine_session_id);
-        Ok(())
+            .map_err(|_| anyhow::anyhow!("session registry mutex poisoned"))?;
+        let evicted = if inner.sessions.len() >= self.max_sessions {
+            inner
+                .sessions
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_access)
+                .map(|(id, _)| id.clone())
+                .and_then(|id| {
+                    inner
+                        .sessions
+                        .remove(&id)
+                        .map(|entry| entry.engine_session_id)
+                })
+        } else {
+            None
+        };
+        inner.access_clock = inner.access_clock.saturating_add(1);
+        let last_access = inner.access_clock;
+        inner.sessions.insert(
+            client_id,
+            SessionEntry {
+                engine_session_id,
+                last_access,
+            },
+        );
+        Ok(evicted)
     }
 
     fn get(&self, client_id: &str) -> anyhow::Result<Option<SessionId>> {
-        Ok(self
-            .sessions
+        let mut inner = self
+            .inner
             .lock()
-            .map_err(|_| anyhow::anyhow!("session registry mutex poisoned"))?
-            .get(client_id)
-            .copied())
+            .map_err(|_| anyhow::anyhow!("session registry mutex poisoned"))?;
+        if !inner.sessions.contains_key(client_id) {
+            return Ok(None);
+        }
+        inner.access_clock = inner.access_clock.saturating_add(1);
+        let last_access = inner.access_clock;
+        let entry = inner
+            .sessions
+            .get_mut(client_id)
+            .expect("entry checked above");
+        entry.last_access = last_access;
+        Ok(Some(entry.engine_session_id))
     }
 
     fn remove(&self, client_id: &str) -> anyhow::Result<Option<SessionId>> {
         Ok(self
-            .sessions
+            .inner
             .lock()
             .map_err(|_| anyhow::anyhow!("session registry mutex poisoned"))?
-            .remove(client_id))
+            .sessions
+            .remove(client_id)
+            .map(|entry| entry.engine_session_id))
     }
 
-    fn next_client_id(&self) -> String {
-        let sequence = self.next_id.fetch_add(1, Ordering::Relaxed);
-        format!("sess-{}-{sequence}", now_unix())
+    fn next_client_id(&self) -> anyhow::Result<String> {
+        let mut bytes = [0_u8; 16];
+        getrandom::fill(&mut bytes).context("OS CSPRNG failed")?;
+        Ok(format!("sess-{}", hex_token(&bytes)))
     }
 }
 
 impl AppState {
     pub fn load(model_dir: &Path, model_id: Option<String>) -> anyhow::Result<Self> {
+        Self::load_with_config(model_dir, model_id, ServerConfig::default())
+    }
+
+    pub fn load_with_config(
+        model_dir: &Path,
+        model_id: Option<String>,
+        config: ServerConfig,
+    ) -> anyhow::Result<Self> {
+        let config = config.validate()?;
         let model_directory = ModelDirectory::load(model_dir)
             .map_err(|e| anyhow::anyhow!("Failed to resolve model directory: {}", e))?;
+        let model_max_context = load_model_max_context(model_directory.metadata_path.as_deref())?;
         let tokenizer = Tokenizer::from_file(&model_directory.tokenizer_path)
             .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {}", e))?;
         let chat_template = load_chat_template(model_dir)?;
         let engine = Engine::from_dir(model_dir, EngineConfig::default())?;
         let model_id = model_id.unwrap_or_else(|| infer_model_id(model_dir));
-        Ok(Self::new_with_template(
+        Ok(Self::new_with_template_and_config(
             model_id,
             engine,
             tokenizer,
             chat_template,
+            config,
+            model_max_context,
         ))
     }
 
@@ -189,12 +292,33 @@ impl AppState {
         tokenizer: Tokenizer,
         chat_template: Option<ChatTemplate>,
     ) -> Self {
+        Self::new_with_template_and_config(
+            model_id,
+            engine,
+            tokenizer,
+            chat_template,
+            ServerConfig::default(),
+            None,
+        )
+    }
+
+    fn new_with_template_and_config(
+        model_id: String,
+        engine: Engine,
+        tokenizer: Tokenizer,
+        chat_template: Option<ChatTemplate>,
+        config: ServerConfig,
+        model_max_context: Option<usize>,
+    ) -> Self {
+        let config = config.validate().expect("validated server config");
         Self {
             model_id,
             engine: SharedEngine::new(engine),
             tokenizer: Arc::new(tokenizer),
             chat_template: chat_template.map(Arc::new),
-            sessions: SessionRegistry::new(),
+            sessions: SessionRegistry::new(config.max_sessions),
+            config,
+            model_max_context,
         }
     }
 
@@ -214,6 +338,9 @@ pub fn app(state: AppState) -> Router {
 }
 
 pub async fn serve(addr: SocketAddr, state: AppState) -> anyhow::Result<()> {
+    // Security posture: the server has no built-in authentication. The CLI defaults
+    // to 127.0.0.1, enforces max_tokens/max_sessions caps, and issues CSPRNG session
+    // ids; binding a non-loopback --addr should be done only behind an auth proxy.
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app(state)).await?;
     Ok(())
@@ -599,7 +726,10 @@ async fn models(State(state): State<AppState>) -> Json<ModelsResponse> {
 }
 
 async fn create_session(State(state): State<AppState>) -> Result<Json<SessionResponse>, ApiError> {
-    let client_id = state.sessions.next_client_id();
+    let client_id = state
+        .sessions
+        .next_client_id()
+        .map_err(|err| ApiError::internal(format!("session id generation failed: {err}")))?;
     let engine = state.engine.clone();
     let engine_session_id = tokio::task::spawn_blocking(move || engine.create_session())
         .await
@@ -609,7 +739,8 @@ async fn create_session(State(state): State<AppState>) -> Result<Json<SessionRes
     state
         .sessions
         .insert(client_id.clone(), engine_session_id)
-        .map_err(|err| ApiError::internal(format!("session registry failed: {err}")))?;
+        .map_err(|err| ApiError::internal(format!("session registry failed: {err}")))
+        .and_then(|evicted| close_evicted_session(&state, evicted))?;
 
     Ok(Json(SessionResponse {
         id: client_id,
@@ -641,7 +772,7 @@ async fn chat_completions(
     headers: HeaderMap,
     Json(request): Json<ChatCompletionRequest>,
 ) -> Result<Response, ApiError> {
-    validate_request(&request)?;
+    validate_request(&request, &state.config)?;
     let session_id = session_id_from_headers(&headers)?;
     if request.stream {
         Ok(stream_chat_completion(state, request, session_id)?.into_response())
@@ -666,8 +797,14 @@ async fn run_chat_completion(
         client_session_id.is_some(),
     )
     .map_err(|err| ApiError::internal(format!("prompt tokenization failed: {err}")))?;
+    enforce_context_cap(
+        prepared.prompt_tokens,
+        request.max_tokens,
+        state.model_max_context,
+    )?;
     let prompt_tokens = prepared.prompt_tokens;
-    let generation_request = prepared.request;
+    let mut generation_request = prepared.request;
+    generation_request.options.max_context = state.model_max_context;
     let engine = state.engine.clone();
     let session_lookup = client_session_id
         .as_deref()
@@ -764,8 +901,14 @@ fn stream_chat_completion(
         client_session_id.is_some(),
     )
     .map_err(|err| ApiError::internal(format!("prompt tokenization failed: {err}")))?;
+    enforce_context_cap(
+        prepared.prompt_tokens,
+        request.max_tokens,
+        state.model_max_context,
+    )?;
     let wants_json_object = request.wants_json_object();
-    let generation_request = prepared.request;
+    let mut generation_request = prepared.request;
+    generation_request.options.max_context = state.model_max_context;
     let engine = state.engine.clone();
     let (tx, rx) = mpsc::channel(16);
     let session_lookup = client_session_id
@@ -985,7 +1128,10 @@ fn done_chunk(
     }
 }
 
-fn validate_request(request: &ChatCompletionRequest) -> Result<(), ApiError> {
+fn validate_request(
+    request: &ChatCompletionRequest,
+    config: &ServerConfig,
+) -> Result<(), ApiError> {
     if request.messages.is_empty() {
         return Err(ApiError::bad_request("messages must not be empty"));
     }
@@ -993,6 +1139,12 @@ fn validate_request(request: &ChatCompletionRequest) -> Result<(), ApiError> {
         return Err(ApiError::bad_request(
             "max_tokens must be greater than zero",
         ));
+    }
+    if request.max_tokens > config.max_output_tokens {
+        return Err(ApiError::bad_request(format!(
+            "max_tokens must be less than or equal to the server cap of {}",
+            config.max_output_tokens
+        )));
     }
     if !request.temperature.is_finite() || request.temperature < 0.0 {
         return Err(ApiError::bad_request(
@@ -1005,6 +1157,25 @@ fn validate_request(request: &ChatCompletionRequest) -> Result<(), ApiError> {
         ));
     }
     validate_tool_choice(request)?;
+    Ok(())
+}
+
+fn enforce_context_cap(
+    prompt_tokens: usize,
+    max_tokens: usize,
+    model_max_context: Option<usize>,
+) -> Result<(), ApiError> {
+    let Some(model_max_context) = model_max_context else {
+        return Ok(());
+    };
+    let total = prompt_tokens
+        .checked_add(max_tokens)
+        .ok_or_else(|| ApiError::bad_request("prompt_tokens + max_tokens overflowed"))?;
+    if total > model_max_context {
+        return Err(ApiError::bad_request(format!(
+            "prompt token count ({prompt_tokens}) plus max_tokens ({max_tokens}) exceeds model context limit ({model_max_context})"
+        )));
+    }
     Ok(())
 }
 
@@ -1057,6 +1228,11 @@ fn session_id_from_headers(headers: &HeaderMap) -> Result<Option<String>, ApiErr
     if session_id.is_empty() {
         return Err(ApiError::bad_request("X-Session-Id must not be empty"));
     }
+    if session_id.len() > MAX_SESSION_ID_LEN {
+        return Err(ApiError::bad_request(format!(
+            "X-Session-Id must be at most {MAX_SESSION_ID_LEN} bytes"
+        )));
+    }
     Ok(Some(session_id.to_string()))
 }
 
@@ -1076,8 +1252,19 @@ fn get_or_create_session(state: &AppState, client_id: &str) -> Result<SessionId,
     state
         .sessions
         .insert(client_id.to_string(), engine_session_id)
-        .map_err(|err| ApiError::internal(format!("session registry failed: {err}")))?;
+        .map_err(|err| ApiError::internal(format!("session registry failed: {err}")))
+        .and_then(|evicted| close_evicted_session(state, evicted))?;
     Ok(engine_session_id)
+}
+
+fn close_evicted_session(state: &AppState, evicted: Option<SessionId>) -> Result<(), ApiError> {
+    if let Some(evicted) = evicted {
+        state
+            .engine
+            .close_session(evicted)
+            .map_err(|err| ApiError::internal(format!("evicted session close failed: {err}")))?;
+    }
+    Ok(())
 }
 
 pub fn build_generate_request(request: &ChatCompletionRequest) -> GenerateRequest {
@@ -1412,6 +1599,16 @@ fn completion_id() -> String {
     format!("chatcmpl-{}", now_unix())
 }
 
+fn hex_token(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
 fn infer_model_id(model_dir: &Path) -> String {
     model_dir
         .file_name()
@@ -1436,6 +1633,15 @@ fn load_chat_template(model_dir: &Path) -> anyhow::Result<Option<ChatTemplate>> 
     } else {
         Ok(None)
     }
+}
+
+fn load_model_max_context(metadata_path: Option<&Path>) -> anyhow::Result<Option<usize>> {
+    let Some(metadata_path) = metadata_path else {
+        return Ok(None);
+    };
+    let metadata = onnx_genai_metadata::load_metadata(metadata_path)
+        .with_context(|| format!("failed to load {}", metadata_path.display()))?;
+    Ok(metadata.model.and_then(|model| model.max_sequence_length))
 }
 
 #[cfg(test)]
