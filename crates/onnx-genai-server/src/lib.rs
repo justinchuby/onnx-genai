@@ -1,33 +1,40 @@
 //! OpenAI-compatible HTTP server wiring for onnx-genai.
 
 use std::{
+    collections::HashMap,
     convert::Infallible,
     net::SocketAddr,
     path::Path,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::Context;
 use axum::{
     Json, Router,
-    extract::State,
-    http::StatusCode,
+    extract::{Path as AxumPath, State},
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response, Sse, sse::Event},
-    routing::{get, post},
+    routing::{delete, get, post},
 };
 use onnx_genai::{
     Engine, EngineConfig, FinishReason, GenerateOptions, GeneratePrompt, GenerateRequest,
-    GenerateToken, StopSequence,
+    GenerateResult, GenerateToken, SessionId, StopSequence,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
+const SESSION_ID_HEADER: &str = "x-session-id";
+
 #[derive(Clone)]
 pub struct AppState {
     model_id: String,
     engine: SharedEngine,
+    sessions: SessionRegistry,
 }
 
 #[derive(Clone)]
@@ -60,6 +67,95 @@ impl SharedEngine {
             .map_err(|_| anyhow::anyhow!("engine mutex poisoned"))?
             .generate_with_callback(request, Some(callback))
     }
+
+    fn create_session(&self) -> anyhow::Result<SessionId> {
+        self.0
+            .lock()
+            .map_err(|_| anyhow::anyhow!("engine mutex poisoned"))?
+            .create_session()
+    }
+
+    fn close_session(&self, session_id: SessionId) -> anyhow::Result<()> {
+        self.0
+            .lock()
+            .map_err(|_| anyhow::anyhow!("engine mutex poisoned"))?
+            .close_session(session_id)
+    }
+
+    fn generate_in_session(
+        &self,
+        session_id: SessionId,
+        request: GenerateRequest,
+    ) -> anyhow::Result<GenerateResult> {
+        self.0
+            .lock()
+            .map_err(|_| anyhow::anyhow!("engine mutex poisoned"))?
+            .generate_in_session(session_id, request)
+    }
+
+    fn generate_in_session_with_callback(
+        &self,
+        session_id: SessionId,
+        request: GenerateRequest,
+        callback: &mut onnx_genai::GenerateTokenCallback<'_>,
+    ) -> anyhow::Result<GenerateResult> {
+        self.0
+            .lock()
+            .map_err(|_| anyhow::anyhow!("engine mutex poisoned"))?
+            .generate_in_session_with_callback(session_id, request, Some(callback))
+    }
+
+    fn session_token_count(&self, session_id: SessionId) -> anyhow::Result<usize> {
+        self.0
+            .lock()
+            .map_err(|_| anyhow::anyhow!("engine mutex poisoned"))?
+            .session_token_count(session_id)
+    }
+}
+
+#[derive(Clone)]
+struct SessionRegistry {
+    sessions: Arc<Mutex<HashMap<String, SessionId>>>,
+    next_id: Arc<AtomicU64>,
+}
+
+impl SessionRegistry {
+    fn new() -> Self {
+        Self {
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            next_id: Arc::new(AtomicU64::new(1)),
+        }
+    }
+
+    fn insert(&self, client_id: String, engine_session_id: SessionId) -> anyhow::Result<()> {
+        self.sessions
+            .lock()
+            .map_err(|_| anyhow::anyhow!("session registry mutex poisoned"))?
+            .insert(client_id, engine_session_id);
+        Ok(())
+    }
+
+    fn get(&self, client_id: &str) -> anyhow::Result<Option<SessionId>> {
+        Ok(self
+            .sessions
+            .lock()
+            .map_err(|_| anyhow::anyhow!("session registry mutex poisoned"))?
+            .get(client_id)
+            .copied())
+    }
+
+    fn remove(&self, client_id: &str) -> anyhow::Result<Option<SessionId>> {
+        Ok(self
+            .sessions
+            .lock()
+            .map_err(|_| anyhow::anyhow!("session registry mutex poisoned"))?
+            .remove(client_id))
+    }
+
+    fn next_client_id(&self) -> String {
+        let sequence = self.next_id.fetch_add(1, Ordering::Relaxed);
+        format!("sess-{}-{sequence}", now_unix())
+    }
 }
 
 impl AppState {
@@ -73,6 +169,7 @@ impl AppState {
         Self {
             model_id,
             engine: SharedEngine::new(engine),
+            sessions: SessionRegistry::new(),
         }
     }
 
@@ -85,6 +182,8 @@ pub fn app(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/v1/models", get(models))
+        .route("/v1/sessions", post(create_session))
+        .route("/v1/sessions/{id}", delete(delete_session))
         .route("/v1/chat/completions", post(chat_completions))
         .with_state(state)
 }
@@ -142,6 +241,10 @@ pub struct ChatCompletionResponse {
     pub choices: Vec<ChatChoice>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage: Option<Usage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_token_count: Option<usize>,
 }
 
 #[derive(Debug, Serialize)]
@@ -203,6 +306,12 @@ struct HealthResponse {
 }
 
 #[derive(Debug, Serialize)]
+struct SessionResponse {
+    id: String,
+    object: &'static str,
+}
+
+#[derive(Debug, Serialize)]
 struct ErrorResponse {
     error: ErrorBody,
 }
@@ -231,6 +340,13 @@ impl ApiError {
     fn internal(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: message.into(),
+        }
+    }
+
+    fn not_found(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
             message: message.into(),
         }
     }
@@ -267,15 +383,55 @@ async fn models(State(state): State<AppState>) -> Json<ModelsResponse> {
     })
 }
 
+async fn create_session(State(state): State<AppState>) -> Result<Json<SessionResponse>, ApiError> {
+    let client_id = state.sessions.next_client_id();
+    let engine = state.engine.clone();
+    let engine_session_id = tokio::task::spawn_blocking(move || engine.create_session())
+        .await
+        .map_err(|err| ApiError::internal(format!("session create task failed: {err}")))?
+        .map_err(|err| ApiError::internal(format!("session create failed: {err}")))?;
+
+    state
+        .sessions
+        .insert(client_id.clone(), engine_session_id)
+        .map_err(|err| ApiError::internal(format!("session registry failed: {err}")))?;
+
+    Ok(Json(SessionResponse {
+        id: client_id,
+        object: "session",
+    }))
+}
+
+async fn delete_session(
+    State(state): State<AppState>,
+    AxumPath(client_id): AxumPath<String>,
+) -> Result<StatusCode, ApiError> {
+    let engine_session_id = state
+        .sessions
+        .remove(&client_id)
+        .map_err(|err| ApiError::internal(format!("session registry failed: {err}")))?
+        .ok_or_else(|| ApiError::not_found(format!("session {client_id} not found")))?;
+
+    let engine = state.engine.clone();
+    tokio::task::spawn_blocking(move || engine.close_session(engine_session_id))
+        .await
+        .map_err(|err| ApiError::internal(format!("session close task failed: {err}")))?
+        .map_err(|err| ApiError::internal(format!("session close failed: {err}")))?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn chat_completions(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(request): Json<ChatCompletionRequest>,
 ) -> Result<Response, ApiError> {
     validate_request(&request)?;
+    let session_id = session_id_from_headers(&headers)?;
     if request.stream {
-        Ok(stream_chat_completion(state, request).into_response())
+        Ok(stream_chat_completion(state, request, session_id).into_response())
     } else {
-        let response = run_chat_completion(state, request).await?;
+        let response = run_chat_completion(state, request, session_id).await?;
         Ok(Json(response).into_response())
     }
 }
@@ -283,17 +439,41 @@ async fn chat_completions(
 async fn run_chat_completion(
     state: AppState,
     request: ChatCompletionRequest,
+    client_session_id: Option<String>,
 ) -> Result<ChatCompletionResponse, ApiError> {
     let id = completion_id();
     let created = now_unix();
     let model = request.model.clone();
-    let generation_request = build_generate_request(&request);
+    let generation_request = if client_session_id.is_some() {
+        build_session_generate_request(&request)
+    } else {
+        build_generate_request(&request)
+    };
     let engine = state.engine.clone();
+    let session_lookup = client_session_id
+        .as_deref()
+        .map(|id| get_or_create_session(&state, id))
+        .transpose()?;
 
-    let result = tokio::task::spawn_blocking(move || engine.generate(generation_request))
-        .await
-        .map_err(|err| ApiError::internal(format!("generation task failed: {err}")))?
-        .map_err(|err| ApiError::internal(format!("generation failed: {err}")))?;
+    let session_for_count = session_lookup;
+    let result = tokio::task::spawn_blocking(move || match session_lookup {
+        Some(engine_session_id) => {
+            engine.generate_in_session(engine_session_id, generation_request)
+        }
+        None => engine.generate(generation_request),
+    })
+    .await
+    .map_err(|err| ApiError::internal(format!("generation task failed: {err}")))?
+    .map_err(|err| ApiError::internal(format!("generation failed: {err}")))?;
+
+    let session_token_count = session_for_count
+        .map(|engine_session_id| {
+            state
+                .engine
+                .session_token_count(engine_session_id)
+                .map_err(|err| ApiError::internal(format!("session token count failed: {err}")))
+        })
+        .transpose()?;
 
     let completion_tokens = result.token_ids.len();
     Ok(ChatCompletionResponse {
@@ -314,21 +494,49 @@ async fn run_chat_completion(
             completion_tokens,
             total_tokens: completion_tokens,
         }),
+        session_id: client_session_id,
+        session_token_count,
     })
 }
 
 fn stream_chat_completion(
     state: AppState,
     request: ChatCompletionRequest,
+    client_session_id: Option<String>,
 ) -> Sse<ReceiverStream<Result<Event, Infallible>>> {
     let id = completion_id();
     let created = now_unix();
     let model = request.model.clone();
-    let generation_request = build_generate_request(&request);
+    let generation_request = if client_session_id.is_some() {
+        build_session_generate_request(&request)
+    } else {
+        build_generate_request(&request)
+    };
     let engine = state.engine.clone();
     let (tx, rx) = mpsc::channel(16);
+    let session_lookup = client_session_id
+        .as_deref()
+        .map(|id| get_or_create_session(&state, id));
 
     tokio::task::spawn_blocking(move || {
+        let session_lookup = match session_lookup.transpose() {
+            Ok(value) => value,
+            Err(err) => {
+                tx.blocking_send(Ok(Event::default().event("error").data(
+                    serde_json::to_string(&ErrorResponse {
+                        error: ErrorBody {
+                            message: format!("session setup failed: {}", err.message),
+                            kind: "server_error",
+                        },
+                    })?,
+                )))
+                .context("stream receiver closed")?;
+                tx.blocking_send(Ok(Event::default().data("[DONE]")))
+                    .context("stream receiver closed")?;
+                return Ok::<(), anyhow::Error>(());
+            }
+        };
+
         let send_chunk = |chunk: ChatCompletionChunk| -> anyhow::Result<()> {
             tx.blocking_send(Ok(Event::default().data(serde_json::to_string(&chunk)?)))
                 .context("stream receiver closed")
@@ -340,7 +548,14 @@ fn stream_chat_completion(
             send_chunk(content_chunk(&id, created, &model, token.text))
         };
 
-        let result = engine.generate_with_callback(generation_request, &mut callback);
+        let result = match session_lookup {
+            Some(engine_session_id) => engine.generate_in_session_with_callback(
+                engine_session_id,
+                generation_request,
+                &mut callback,
+            ),
+            None => engine.generate_with_callback(generation_request, &mut callback),
+        };
 
         match result {
             Ok(result) => send_chunk(done_chunk(
@@ -444,7 +659,55 @@ fn validate_request(request: &ChatCompletionRequest) -> Result<(), ApiError> {
     Ok(())
 }
 
+fn session_id_from_headers(headers: &HeaderMap) -> Result<Option<String>, ApiError> {
+    let Some(value) = headers.get(SESSION_ID_HEADER) else {
+        return Ok(None);
+    };
+    let session_id = value
+        .to_str()
+        .map_err(|_| ApiError::bad_request("X-Session-Id must be valid UTF-8"))?
+        .trim();
+    if session_id.is_empty() {
+        return Err(ApiError::bad_request("X-Session-Id must not be empty"));
+    }
+    Ok(Some(session_id.to_string()))
+}
+
+fn get_or_create_session(state: &AppState, client_id: &str) -> Result<SessionId, ApiError> {
+    if let Some(engine_session_id) = state
+        .sessions
+        .get(client_id)
+        .map_err(|err| ApiError::internal(format!("session registry failed: {err}")))?
+    {
+        return Ok(engine_session_id);
+    }
+
+    let engine_session_id = state
+        .engine
+        .create_session()
+        .map_err(|err| ApiError::internal(format!("session create failed: {err}")))?;
+    state
+        .sessions
+        .insert(client_id.to_string(), engine_session_id)
+        .map_err(|err| ApiError::internal(format!("session registry failed: {err}")))?;
+    Ok(engine_session_id)
+}
+
 pub fn build_generate_request(request: &ChatCompletionRequest) -> GenerateRequest {
+    GenerateRequest {
+        prompt: GeneratePrompt::Text(build_prompt(&request.messages)),
+        options: build_generate_options(request),
+    }
+}
+
+fn build_session_generate_request(request: &ChatCompletionRequest) -> GenerateRequest {
+    GenerateRequest {
+        prompt: GeneratePrompt::Text(build_session_prompt(&request.messages)),
+        options: build_generate_options(request),
+    }
+}
+
+fn build_generate_options(request: &ChatCompletionRequest) -> GenerateOptions {
     let mut options = GenerateOptions {
         max_new_tokens: request.max_tokens,
         temperature: request.temperature,
@@ -454,11 +717,14 @@ pub fn build_generate_request(request: &ChatCompletionRequest) -> GenerateReques
     if let Some(stop) = request.stop.clone() {
         options.stop_sequences = stop.into_sequences();
     }
+    options
+}
 
-    GenerateRequest {
-        prompt: GeneratePrompt::Text(build_prompt(&request.messages)),
-        options,
-    }
+fn build_session_prompt(messages: &[ChatMessage]) -> String {
+    messages
+        .last()
+        .map(|message| message.content.clone())
+        .unwrap_or_default()
 }
 
 /// Build the Phase 2 chat prompt with a simple role-tagged template:
