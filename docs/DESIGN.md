@@ -3279,3 +3279,265 @@ speculative:
 | Lookahead | 1.5-2.5× | None | None |
 
 For coding agent: EAGLE or MTP gives best bang-for-buck. Code is highly predictable → high acceptance rates → larger speedups.
+
+---
+
+## 28. Speculator Model Compatibility (vLLM Speculators Integration)
+
+### 28.1 Motivation
+
+The vLLM `speculators` library (github.com/vllm-project/speculators) is becoming the standard for training and publishing speculative decoding models. RedHat has published EAGLE-3, P-EAGLE, and DFlash speculators for Qwen3, Llama, Gemma 4 on HuggingFace. We should be able to load and run these directly.
+
+### 28.2 Auto-Discovery from HuggingFace Config
+
+Speculators publish a `config.json` with a `speculator_config` field:
+
+```json
+{
+  "architectures": ["EagleModel"],
+  "speculator_config": {
+    "proposal_type": "eagle3",
+    "num_speculative_tokens": 4,
+    "verifier": {
+      "name_or_path": "Qwen/Qwen3-8B",
+      "architectures": ["Qwen3ForCausalLM"]
+    }
+  }
+}
+```
+
+Our loader detects this automatically:
+
+```rust
+/// Check if a model directory contains a speculator config.
+pub fn detect_speculator(model_dir: &Path) -> Option<SpeculatorDetection> {
+    let config_path = model_dir.join("config.json");
+    let config: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(config_path).ok()?).ok()?;
+    
+    let spec_config = config.get("speculator_config")?;
+    let proposal_type = spec_config.get("proposal_type")?.as_str()?;
+    
+    Some(SpeculatorDetection {
+        proposal_type: proposal_type.to_string(),
+        num_tokens: spec_config.get("num_speculative_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(4) as usize,
+        verifier_path: spec_config.get("verifier")
+            .and_then(|v| v.get("name_or_path"))
+            .and_then(|v| v.as_str())
+            .map(String::from),
+    })
+}
+
+pub struct SpeculatorDetection {
+    pub proposal_type: String,    // "eagle3", "peagle", "dflash", "mtp"
+    pub num_tokens: usize,
+    pub verifier_path: Option<String>,
+}
+```
+
+### 28.3 Draft Vocabulary Mapping
+
+Speculators often train draft models with a **reduced vocabulary** for speed. A 128K vocab target might have a 32K vocab draft. Need bidirectional mapping:
+
+```rust
+/// Maps between draft model's reduced vocabulary and target's full vocabulary.
+pub struct VocabMapping {
+    /// Target token ID → Draft token ID (or None if not in draft vocab).
+    /// Shape: [verifier_vocab_size]. True = token exists in draft vocab.
+    target_to_draft_mask: Vec<bool>,
+    /// Draft token ID → Target token ID.
+    /// Shape: [draft_vocab_size].
+    draft_to_target: Vec<u32>,
+    /// Draft vocab size.
+    pub draft_vocab_size: usize,
+    /// Target vocab size.
+    pub target_vocab_size: usize,
+}
+
+impl VocabMapping {
+    /// Load from speculators-format files (t2d.pt, d2t.pt as safetensors/npy).
+    pub fn load(model_dir: &Path) -> Result<Option<Self>> {
+        let t2d_path = model_dir.join("t2d.safetensors");
+        let d2t_path = model_dir.join("d2t.safetensors");
+        if !t2d_path.exists() || !d2t_path.exists() {
+            return Ok(None);  // Same vocab, no mapping needed
+        }
+        // Load tensors...
+        ...
+    }
+    
+    /// Convert target token IDs to draft token IDs for draft model input.
+    pub fn to_draft(&self, target_ids: &[u32]) -> Vec<u32> {
+        target_ids.iter().map(|&tid| {
+            // Binary search or lookup in t2d mapping
+            self.target_to_draft_index(tid).unwrap_or(0) // UNK if not in draft vocab
+        }).collect()
+    }
+    
+    /// Convert draft model output logits back to target vocab space.
+    /// Unmapped positions get -inf.
+    pub fn draft_logits_to_target(&self, draft_logits: &[f32]) -> Vec<f32> {
+        let mut target_logits = vec![f32::NEG_INFINITY; self.target_vocab_size];
+        for (draft_idx, &logit) in draft_logits.iter().enumerate() {
+            let target_idx = self.draft_to_target[draft_idx] as usize;
+            target_logits[target_idx] = logit;
+        }
+        target_logits
+    }
+}
+```
+
+### 28.4 Multi-Layer Feature Extraction (DFlash)
+
+DFlash uses hidden states from **multiple layers** of the verifier as "anchors":
+
+```rust
+/// DFlash configuration.
+pub struct DFlashConfig {
+    /// Which verifier layers to extract hidden states from.
+    pub anchor_layers: Vec<usize>,  // e.g., [8, 16, 24] for a 32-layer model
+    /// Block size for anchored drafting.
+    pub block_size: usize,
+    /// Maximum number of anchor blocks per draft step.
+    pub max_anchors: usize,
+}
+
+/// The ONNX model for DFlash needs intermediate layer outputs.
+/// In inference_metadata.yaml:
+///
+/// ```yaml
+/// speculative:
+///   method: dflash
+///   dflash:
+///     anchor_layers: [8, 16, 24]
+///     anchor_outputs: ["hidden_state_8", "hidden_state_16", "hidden_state_24"]
+///     block_size: 4
+/// ```
+///
+/// The verifier ONNX model must be exported with these intermediate outputs.
+```
+
+### 28.5 Sliding Window for Draft Model KV
+
+Draft models don't need full-context attention — recent tokens are most predictive:
+
+```rust
+/// Draft model KV cache with sliding window.
+pub struct DraftKvConfig {
+    /// Window size (tokens). Draft only attends to last N tokens.
+    pub sliding_window: usize,     // e.g., 512
+    /// Layers that use full attention (indices). Rest use sliding window.
+    pub full_attention_layers: Vec<usize>,  // e.g., [0] (first layer only)
+}
+
+// Memory savings:
+// Target: 32 layers × 4K context × 128 dim = 16M params of KV
+// Draft (window=512): 8 layers × 512 context × 64 dim = 256K params of KV
+// → Draft KV is ~1.5% of target KV
+```
+
+### 28.6 P-EAGLE: Parallel Multi-Token Prediction
+
+P-EAGLE extends EAGLE-3 with **parallel** token prediction via COD (Conditional-On-Distribution) sampling — predicts multiple draft tokens in a single forward pass rather than sequentially:
+
+```rust
+/// P-EAGLE: one forward → multiple draft tokens (not sequential).
+pub struct PEagleConfig {
+    /// Number of parallel draft tokens per forward pass.
+    pub parallel_tokens: usize,
+    /// COD (Conditional-On-Distribution) sampling for parallel independence.
+    pub cod_sampling: bool,
+    /// Base EAGLE config.
+    pub eagle: EagleConfig,
+}
+
+/// COD Sampling: each draft position conditions on the probability distribution
+/// of the previous position rather than a single sampled token.
+/// This allows parallel prediction without sequential dependency.
+///
+/// Standard EAGLE: token_1 → token_2 → token_3 (sequential, 3 forwards)
+/// P-EAGLE:        [token_1, token_2, token_3] (parallel, 1 forward)
+///
+/// Trade-off: slightly lower acceptance rate, but 3× fewer draft forwards.
+```
+
+### 28.7 Unified Loading (Speculators-Compatible)
+
+```rust
+impl Engine {
+    /// Load a model with automatic speculator detection.
+    pub fn from_dir_with_speculation(
+        verifier_dir: &Path,
+        speculator_dir: Option<&Path>,
+        config: EngineConfig,
+    ) -> Result<Self> {
+        let mut engine = Self::from_dir(verifier_dir, config)?;
+        
+        // Auto-detect speculator
+        let spec_dir = speculator_dir.or_else(|| {
+            // Check if verifier has embedded speculator config
+            detect_speculator(verifier_dir).map(|_| verifier_dir)
+        });
+        
+        if let Some(dir) = spec_dir {
+            let detection = detect_speculator(dir)
+                .ok_or_else(|| anyhow!("No speculator config found"))?;
+            
+            let proposer: Box<dyn SpeculativeProposer> = match detection.proposal_type.as_str() {
+                "eagle3" | "eagle" => Box::new(EagleProposer::load(dir, &engine)?),
+                "peagle" => Box::new(PEagleProposer::load(dir, &engine)?),
+                "dflash" => Box::new(DFlashProposer::load(dir, &engine)?),
+                "mtp" => Box::new(MtpProposer::load(dir, &engine)?),
+                "ngram" => Box::new(NgramProposer::new(detection.num_tokens)),
+                other => anyhow::bail!("Unsupported speculator type: {}", other),
+            };
+            
+            // Load vocab mapping if present
+            let vocab_mapping = VocabMapping::load(dir)?;
+            
+            engine.enable_speculation(proposer, vocab_mapping);
+        }
+        
+        Ok(engine)
+    }
+}
+```
+
+### 28.8 CLI Integration
+
+```bash
+# Serve verifier + speculator (auto-detected from HF format)
+onnx-genai serve ./qwen3-8b --speculator ./qwen3-8b-speculator-eagle3
+
+# Or if speculator is embedded in model dir:
+onnx-genai serve ./qwen3-8b-with-speculator
+
+# Benchmark speculation effectiveness:
+onnx-genai bench ./model --speculator ./speculator --dataset ./prompts.jsonl
+# Output: acceptance_rate, tokens/s, speedup_vs_baseline
+```
+
+### 28.9 Speculators Format → ONNX Export
+
+To use speculators-trained models in our engine, they need ONNX export:
+
+```python
+# Export a speculators-trained EAGLE model to ONNX
+from speculators import SpeculatorModel
+import torch
+
+model = SpeculatorModel.from_pretrained("RedHatAI/Qwen3-8B-speculator.eagle3")
+dummy_input = {
+    "input_ids": torch.zeros(1, 1, dtype=torch.long),
+    "hidden_states": torch.zeros(1, 1, model.config.transformer_layer_config.hidden_size),
+}
+torch.onnx.export(model, dummy_input, "eagle_adapter.onnx", opset_version=24)
+```
+
+We provide a conversion script:
+```bash
+# Convert HF speculators model → ONNX + our metadata
+onnx-genai convert-speculator RedHatAI/Qwen3-8B-speculator.eagle3 --output ./eagle-onnx/
+# Creates: eagle-onnx/adapter.onnx + eagle-onnx/inference_metadata.yaml + eagle-onnx/config.json
+```
