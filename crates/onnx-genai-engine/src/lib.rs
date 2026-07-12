@@ -14,8 +14,8 @@ pub mod sampling;
 pub mod speculative;
 
 pub use engine::{
-    Engine, EngineConfig, FinishReason, GenerateOptions, GeneratePrompt, GenerateRequest,
-    GenerateResult, GenerateToken, GenerateTokenCallback, PrioritizedGenerateRequest,
-    PrioritizedGenerateResult, ScheduledGenerateArrival, SessionId,
+    Engine, EngineConfig, FinishReason, GenerateConstraint, GenerateOptions, GeneratePrompt,
+    GenerateRequest, GenerateResult, GenerateToken, GenerateTokenCallback,
+    PrioritizedGenerateRequest, PrioritizedGenerateResult, ScheduledGenerateArrival, SessionId,
 };
-pub use logits::{StopSequence, TokenId};
+pub use logits::{Constraint, JsonConstraint, StopSequence, TokenId};

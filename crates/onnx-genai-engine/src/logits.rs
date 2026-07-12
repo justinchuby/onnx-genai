@@ -46,6 +46,29 @@ pub enum ProcessorSignal {
     StopSequence { index: usize },
 }
 
+/// A candidate token considered by a constrained decoder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TokenCandidate {
+    pub token_id: TokenId,
+    pub text: String,
+    pub is_eos: bool,
+}
+
+/// A decoding constraint returns the mask of tokens that keep the output valid.
+///
+/// The processor owns pre-decoded token text so constraints can validate at the
+/// character level. Decoding every vocabulary token is intentionally simple and
+/// correct, but can be slow for large vocabularies.
+pub trait Constraint: Send + Sync {
+    fn allowed_next_tokens(
+        &self,
+        context: &ProcessorContext,
+        candidates: &[TokenCandidate],
+    ) -> Vec<bool>;
+
+    fn name(&self) -> &str;
+}
+
 /// A logit processor modifies the logit distribution before sampling.
 pub trait LogitProcessor: Send + Sync {
     fn process(&self, logits: &mut [f32], context: &ProcessorContext);
@@ -93,6 +116,479 @@ impl ProcessorChain {
 }
 
 // --- Built-in processors ---
+
+pub struct ConstraintProcessor {
+    constraint: Box<dyn Constraint>,
+    token_texts: Vec<Option<String>>,
+    eos_token_id: Option<TokenId>,
+}
+
+impl ConstraintProcessor {
+    pub fn new(
+        constraint: Box<dyn Constraint>,
+        token_texts: Vec<Option<String>>,
+        eos_token_id: Option<TokenId>,
+    ) -> Self {
+        Self {
+            constraint,
+            token_texts,
+            eos_token_id,
+        }
+    }
+}
+
+impl LogitProcessor for ConstraintProcessor {
+    fn process(&self, logits: &mut [f32], context: &ProcessorContext) {
+        let candidates: Vec<_> = (0..logits.len())
+            .map(|idx| {
+                let token_id = idx as TokenId;
+                TokenCandidate {
+                    token_id,
+                    text: self
+                        .token_texts
+                        .get(idx)
+                        .and_then(|text| text.clone())
+                        .unwrap_or_default(),
+                    is_eos: self.eos_token_id == Some(token_id),
+                }
+            })
+            .collect();
+        let mask = self.constraint.allowed_next_tokens(context, &candidates);
+        for (idx, logit) in logits.iter_mut().enumerate() {
+            if !mask.get(idx).copied().unwrap_or(false) {
+                *logit = f32::NEG_INFINITY;
+            }
+        }
+    }
+
+    fn name(&self) -> &str {
+        self.constraint.name()
+    }
+}
+
+/// Character-level JSON grammar constraint.
+///
+/// This validates the generated prefix plus each candidate token and only allows
+/// tokens that keep the prefix valid and completable. EOS is allowed only after
+/// a complete, balanced JSON value. JSON Schema constraints are future work.
+#[derive(Debug, Clone, Default)]
+pub struct JsonConstraint;
+
+impl JsonConstraint {
+    pub fn prefix_is_valid(text: &str) -> bool {
+        JsonPrefixParser::parse(text).is_ok()
+    }
+
+    pub fn is_complete(text: &str) -> bool {
+        JsonPrefixParser::parse(text).is_ok_and(|parser| parser.is_complete())
+    }
+}
+
+impl Constraint for JsonConstraint {
+    fn allowed_next_tokens(
+        &self,
+        context: &ProcessorContext,
+        candidates: &[TokenCandidate],
+    ) -> Vec<bool> {
+        let complete = Self::is_complete(&context.generated_text);
+        candidates
+            .iter()
+            .map(|candidate| {
+                if candidate.is_eos {
+                    return complete;
+                }
+                if candidate.text.is_empty() {
+                    return false;
+                }
+                let mut next =
+                    String::with_capacity(context.generated_text.len() + candidate.text.len());
+                next.push_str(&context.generated_text);
+                next.push_str(&candidate.text);
+                Self::prefix_is_valid(&next)
+            })
+            .collect()
+    }
+
+    fn name(&self) -> &str {
+        "json_constraint"
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContainerKind {
+    Object,
+    Array,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Expect {
+    KeyOrEnd,
+    Key,
+    Colon,
+    ValueOrEnd,
+    Value,
+    CommaOrEnd,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Container {
+    kind: ContainerKind,
+    expect: Expect,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StringRole {
+    Key,
+    Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Mode {
+    Normal,
+    String {
+        role: StringRole,
+        escape: bool,
+        unicode_remaining: u8,
+    },
+    Number(NumberState),
+    Literal {
+        target: &'static str,
+        matched: usize,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NumberPhase {
+    Minus,
+    Zero,
+    Int,
+    Dot,
+    Fraction,
+    ExpStart,
+    ExpSign,
+    ExpDigits,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NumberState {
+    phase: NumberPhase,
+}
+
+impl NumberState {
+    fn start(ch: char) -> Option<Self> {
+        let phase = match ch {
+            '-' => NumberPhase::Minus,
+            '0' => NumberPhase::Zero,
+            '1'..='9' => NumberPhase::Int,
+            _ => return None,
+        };
+        Some(Self { phase })
+    }
+
+    fn is_complete(self) -> bool {
+        matches!(
+            self.phase,
+            NumberPhase::Zero | NumberPhase::Int | NumberPhase::Fraction | NumberPhase::ExpDigits
+        )
+    }
+
+    fn consume(&mut self, ch: char) -> bool {
+        self.phase = match (self.phase, ch) {
+            (NumberPhase::Minus, '0') => NumberPhase::Zero,
+            (NumberPhase::Minus, '1'..='9') => NumberPhase::Int,
+            (NumberPhase::Zero, '.') | (NumberPhase::Int, '.') => NumberPhase::Dot,
+            (NumberPhase::Zero, 'e' | 'E')
+            | (NumberPhase::Int, 'e' | 'E')
+            | (NumberPhase::Fraction, 'e' | 'E') => NumberPhase::ExpStart,
+            (NumberPhase::Int, '0'..='9') => NumberPhase::Int,
+            (NumberPhase::Dot, '0'..='9') | (NumberPhase::Fraction, '0'..='9') => {
+                NumberPhase::Fraction
+            }
+            (NumberPhase::ExpStart, '+' | '-') => NumberPhase::ExpSign,
+            (NumberPhase::ExpStart, '0'..='9')
+            | (NumberPhase::ExpSign, '0'..='9')
+            | (NumberPhase::ExpDigits, '0'..='9') => NumberPhase::ExpDigits,
+            _ => return false,
+        };
+        true
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct JsonPrefixParser {
+    stack: Vec<Container>,
+    root_complete: bool,
+    mode: Mode,
+}
+
+impl JsonPrefixParser {
+    fn parse(text: &str) -> Result<Self, ()> {
+        let mut parser = Self {
+            stack: Vec::new(),
+            root_complete: false,
+            mode: Mode::Normal,
+        };
+        for ch in text.chars() {
+            parser.consume(ch)?;
+        }
+        Ok(parser)
+    }
+
+    fn is_complete(&self) -> bool {
+        let mut parser = self.clone();
+        match parser.mode {
+            Mode::Normal => {}
+            Mode::Number(state) if state.is_complete() => {
+                parser.mode = Mode::Normal;
+                if parser.finish_value().is_err() {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+        parser.stack.is_empty() && parser.root_complete
+    }
+
+    fn consume(&mut self, ch: char) -> Result<(), ()> {
+        loop {
+            match &mut self.mode {
+                Mode::Normal => return self.consume_normal(ch),
+                Mode::String {
+                    role,
+                    escape,
+                    unicode_remaining,
+                } => {
+                    if *unicode_remaining > 0 {
+                        if ch.is_ascii_hexdigit() {
+                            *unicode_remaining -= 1;
+                            return Ok(());
+                        }
+                        return Err(());
+                    }
+                    if *escape {
+                        if matches!(ch, '"' | '\\' | '/' | 'b' | 'f' | 'n' | 'r' | 't') {
+                            *escape = false;
+                            return Ok(());
+                        }
+                        if ch == 'u' {
+                            *escape = false;
+                            *unicode_remaining = 4;
+                            return Ok(());
+                        }
+                        return Err(());
+                    }
+                    match ch {
+                        '"' => {
+                            let role = *role;
+                            self.mode = Mode::Normal;
+                            match role {
+                                StringRole::Key => {
+                                    let top = self.stack.last_mut().ok_or(())?;
+                                    if top.kind != ContainerKind::Object
+                                        || !matches!(top.expect, Expect::Key | Expect::KeyOrEnd)
+                                    {
+                                        return Err(());
+                                    }
+                                    top.expect = Expect::Colon;
+                                }
+                                StringRole::Value => self.finish_value()?,
+                            }
+                            return Ok(());
+                        }
+                        '\\' => {
+                            *escape = true;
+                            return Ok(());
+                        }
+                        c if c <= '\u{1f}' => return Err(()),
+                        _ => return Ok(()),
+                    }
+                }
+                Mode::Number(state) => {
+                    if state.consume(ch) {
+                        return Ok(());
+                    }
+                    if state.is_complete() {
+                        self.mode = Mode::Normal;
+                        self.finish_value()?;
+                        continue;
+                    }
+                    return Err(());
+                }
+                Mode::Literal { target, matched } => {
+                    let expected = target.as_bytes().get(*matched).copied();
+                    if expected == Some(ch as u8) {
+                        *matched += 1;
+                        if *matched == target.len() {
+                            self.mode = Mode::Normal;
+                            self.finish_value()?;
+                        }
+                        return Ok(());
+                    }
+                    if *matched == target.len() {
+                        self.mode = Mode::Normal;
+                        self.finish_value()?;
+                        continue;
+                    }
+                    return Err(());
+                }
+            }
+        }
+    }
+
+    fn consume_normal(&mut self, ch: char) -> Result<(), ()> {
+        if ch.is_whitespace() {
+            return Ok(());
+        }
+        if self.root_complete && self.stack.is_empty() {
+            return Err(());
+        }
+
+        match self.current_expect() {
+            Expect::Value | Expect::ValueOrEnd => {
+                if matches!(self.current_expect(), Expect::ValueOrEnd) && ch == ']' {
+                    return self.close_container(ContainerKind::Array);
+                }
+                self.start_value(ch)
+            }
+            Expect::KeyOrEnd => match ch {
+                '}' => self.close_container(ContainerKind::Object),
+                '"' => {
+                    if let Some(top) = self.stack.last_mut() {
+                        top.expect = Expect::Key;
+                    }
+                    self.mode = Mode::String {
+                        role: StringRole::Key,
+                        escape: false,
+                        unicode_remaining: 0,
+                    };
+                    Ok(())
+                }
+                _ => Err(()),
+            },
+            Expect::Key => {
+                if ch == '"' {
+                    self.mode = Mode::String {
+                        role: StringRole::Key,
+                        escape: false,
+                        unicode_remaining: 0,
+                    };
+                    Ok(())
+                } else {
+                    Err(())
+                }
+            }
+            Expect::Colon => {
+                if ch == ':' {
+                    let top = self.stack.last_mut().ok_or(())?;
+                    top.expect = Expect::Value;
+                    Ok(())
+                } else {
+                    Err(())
+                }
+            }
+            Expect::CommaOrEnd => match (self.stack.last().map(|c| c.kind), ch) {
+                (Some(ContainerKind::Object), ',') => {
+                    self.stack.last_mut().ok_or(())?.expect = Expect::Key;
+                    Ok(())
+                }
+                (Some(ContainerKind::Object), '}') => self.close_container(ContainerKind::Object),
+                (Some(ContainerKind::Array), ',') => {
+                    self.stack.last_mut().ok_or(())?.expect = Expect::Value;
+                    Ok(())
+                }
+                (Some(ContainerKind::Array), ']') => self.close_container(ContainerKind::Array),
+                _ => Err(()),
+            },
+        }
+    }
+
+    fn current_expect(&self) -> Expect {
+        self.stack
+            .last()
+            .map(|container| container.expect)
+            .unwrap_or(Expect::Value)
+    }
+
+    fn start_value(&mut self, ch: char) -> Result<(), ()> {
+        match ch {
+            '{' => {
+                self.stack.push(Container {
+                    kind: ContainerKind::Object,
+                    expect: Expect::KeyOrEnd,
+                });
+                Ok(())
+            }
+            '[' => {
+                self.stack.push(Container {
+                    kind: ContainerKind::Array,
+                    expect: Expect::ValueOrEnd,
+                });
+                Ok(())
+            }
+            '"' => {
+                self.mode = Mode::String {
+                    role: StringRole::Value,
+                    escape: false,
+                    unicode_remaining: 0,
+                };
+                Ok(())
+            }
+            't' => {
+                self.mode = Mode::Literal {
+                    target: "true",
+                    matched: 1,
+                };
+                Ok(())
+            }
+            'f' => {
+                self.mode = Mode::Literal {
+                    target: "false",
+                    matched: 1,
+                };
+                Ok(())
+            }
+            'n' => {
+                self.mode = Mode::Literal {
+                    target: "null",
+                    matched: 1,
+                };
+                Ok(())
+            }
+            '-' | '0'..='9' => {
+                self.mode = Mode::Number(NumberState::start(ch).ok_or(())?);
+                Ok(())
+            }
+            _ => Err(()),
+        }
+    }
+
+    fn close_container(&mut self, kind: ContainerKind) -> Result<(), ()> {
+        let container = self.stack.pop().ok_or(())?;
+        if container.kind != kind {
+            return Err(());
+        }
+        self.finish_value()
+    }
+
+    fn finish_value(&mut self) -> Result<(), ()> {
+        if let Some(parent) = self.stack.last_mut() {
+            match (parent.kind, parent.expect) {
+                (ContainerKind::Object, Expect::Value)
+                | (ContainerKind::Array, Expect::Value)
+                | (ContainerKind::Array, Expect::ValueOrEnd) => {
+                    parent.expect = Expect::CommaOrEnd;
+                    Ok(())
+                }
+                _ => Err(()),
+            }
+        } else if !self.root_complete {
+            self.root_complete = true;
+            Ok(())
+        } else {
+            Err(())
+        }
+    }
+}
 
 pub struct TemperatureProcessor {
     pub temperature: f32,
@@ -283,6 +779,7 @@ impl LogitProcessor for TopPProcessor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sampling::sample_greedy;
 
     fn context(prompt_tokens: Vec<TokenId>, generated_tokens: Vec<TokenId>) -> ProcessorContext {
         ProcessorContext {
@@ -350,5 +847,114 @@ mod tests {
             processor.signal(&text_context),
             Some(ProcessorSignal::StopSequence { index: 1 })
         );
+    }
+
+    fn json_token_texts() -> Vec<Option<String>> {
+        vec![
+            Some("not-json".to_string()),
+            Some("{".to_string()),
+            Some("\"".to_string()),
+            Some("a".to_string()),
+            Some("\":".to_string()),
+            Some("1".to_string()),
+            Some("}".to_string()),
+            Some("[".to_string()),
+            Some("true".to_string()),
+            Some(",".to_string()),
+            Some("null".to_string()),
+            Some("]".to_string()),
+            Some("\"ok\"".to_string()),
+            Some("-12.3e+4".to_string()),
+            Some(String::new()),
+            Some("\n".to_string()),
+        ]
+    }
+
+    fn generate_scripted_json(script: &[TokenId], eos_token_id: TokenId) -> String {
+        let processor = ConstraintProcessor::new(
+            Box::new(JsonConstraint),
+            json_token_texts(),
+            Some(eos_token_id),
+        );
+        let mut generated_text = String::new();
+        let mut generated_tokens = Vec::new();
+
+        for (step, &desired) in script.iter().enumerate() {
+            let context = ProcessorContext {
+                generated_tokens: generated_tokens.clone(),
+                generated_text: generated_text.clone(),
+                step,
+                ..Default::default()
+            };
+            let mut logits = vec![f32::NEG_INFINITY; json_token_texts().len()];
+            logits[desired as usize] = 1.0;
+            processor.process(&mut logits, &context);
+            let selected = sample_greedy(&logits);
+            assert_eq!(selected, desired);
+            if selected == eos_token_id {
+                break;
+            }
+            generated_tokens.push(selected);
+            generated_text.push_str(
+                json_token_texts()[selected as usize]
+                    .as_deref()
+                    .expect("test token text"),
+            );
+        }
+
+        generated_text
+    }
+
+    #[test]
+    fn json_constraint_masks_invalid_tokens_and_allows_eos_only_when_complete() {
+        let processor =
+            ConstraintProcessor::new(Box::new(JsonConstraint), json_token_texts(), Some(14));
+
+        let mut logits = vec![0.0; json_token_texts().len()];
+        logits[6] = 10.0;
+        logits[1] = 1.0;
+        processor.process(&mut logits, &ProcessorContext::default());
+        assert_eq!(logits[6], f32::NEG_INFINITY);
+        assert!(logits[1].is_finite());
+        assert_eq!(logits[14], f32::NEG_INFINITY);
+
+        let complete_context = ProcessorContext {
+            generated_text: "{\"a\":1}".to_string(),
+            ..Default::default()
+        };
+        let mut complete_logits = vec![0.0; json_token_texts().len()];
+        processor.process(&mut complete_logits, &complete_context);
+        assert!(complete_logits[14].is_finite());
+        assert_eq!(complete_logits[1], f32::NEG_INFINITY);
+    }
+
+    #[test]
+    fn json_constraint_generates_parseable_balanced_json_values() {
+        for script in [
+            vec![1, 2, 3, 4, 5, 6, 14],
+            vec![7, 8, 9, 10, 11, 14],
+            vec![12, 14],
+            vec![13, 14],
+        ] {
+            let text = generate_scripted_json(&script, 14);
+            assert!(JsonConstraint::is_complete(&text), "{text}");
+            assert!(
+                serde_json::from_str::<serde_json::Value>(&text).is_ok(),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn unconstrained_logits_are_unaffected() {
+        let context = ProcessorContext::default();
+        let mut logits = vec![10.0, 1.0];
+        assert_eq!(sample_greedy(&logits), 0);
+
+        let chain = ProcessorChain::new();
+        chain.process(&mut logits, &context);
+
+        assert_eq!(sample_greedy(&logits), 0);
+        assert_eq!(logits, vec![10.0, 1.0]);
     }
 }

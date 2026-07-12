@@ -1,8 +1,9 @@
 //! Main generation engine.
 
 use crate::logits::{
-    ProcessorChain, ProcessorContext, ProcessorSignal, RepetitionPenaltyProcessor, StopSequence,
-    StopSequenceProcessor, TemperatureProcessor, TokenId, TopKProcessor, TopPProcessor,
+    ConstraintProcessor, JsonConstraint, ProcessorChain, ProcessorContext, ProcessorSignal,
+    RepetitionPenaltyProcessor, StopSequence, StopSequenceProcessor, TemperatureProcessor, TokenId,
+    TopKProcessor, TopPProcessor,
 };
 use crate::sampling::{sample_categorical, sample_greedy};
 use anyhow::Context;
@@ -100,6 +101,8 @@ pub struct GenerateOptions {
     pub max_context: Option<usize>,
     /// Optional per-request override for speculative draft width K.
     pub num_speculative_tokens: Option<usize>,
+    /// Optional constrained decoding grammar. None preserves unconstrained generation.
+    pub constraint: Option<GenerateConstraint>,
 }
 
 impl Default for GenerateOptions {
@@ -116,8 +119,16 @@ impl Default for GenerateOptions {
             stop_on_eos: true,
             max_context: None,
             num_speculative_tokens: None,
+            constraint: None,
         }
     }
+}
+
+/// Built-in constrained decoding grammars.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GenerateConstraint {
+    /// Constrain output to one complete, well-formed JSON value.
+    Json,
 }
 
 impl GenerateOptions {
@@ -435,7 +446,7 @@ impl Engine {
         }
 
         let max_context = self.max_context_for_request(&options);
-        let chain = build_processor_chain(&options);
+        let chain = build_processor_chain(&options, Some(&self.tokenizer))?;
         let mut generated_tokens = Vec::new();
         let mut generated_text = String::new();
 
@@ -463,6 +474,7 @@ impl Engine {
 
             for step in 0..options.max_new_tokens {
                 if reached_context_limit(state.tokens.len(), max_context) {
+                    ensure_constrained_finish(&options, &generated_text, FinishReason::Length)?;
                     return Ok(GenerateResult {
                         text: self.tokenizer.decode(&generated_tokens).map_err(|e| {
                             anyhow::anyhow!("Failed to detokenize generated tokens: {}", e)
@@ -521,6 +533,7 @@ impl Engine {
                 }
             }
 
+            ensure_constrained_finish(&options, &generated_text, FinishReason::MaxTokens)?;
             Ok(GenerateResult {
                 text: self
                     .tokenizer
@@ -844,7 +857,7 @@ impl Engine {
             request.priority,
         );
         let max_context = self.max_context_for_request(&options);
-        let chain = build_processor_chain(&options);
+        let chain = build_processor_chain(&options, Some(&self.tokenizer))?;
         let mut state = self
             .sessions
             .remove(&request.session_id)
@@ -870,6 +883,11 @@ impl Engine {
         active: &mut ActiveGenerate,
     ) -> anyhow::Result<Option<GenerateResult>> {
         if reached_context_limit(active.state.tokens.len(), active.max_context) {
+            ensure_constrained_finish(
+                &active.options,
+                &active.generated_text,
+                FinishReason::Length,
+            )?;
             return self
                 .finish_result(
                     &active.generated_tokens,
@@ -920,6 +938,11 @@ impl Engine {
                 .map(Some);
         }
         if active.generated_tokens.len() >= active.options.max_new_tokens {
+            ensure_constrained_finish(
+                &active.options,
+                &active.generated_text,
+                FinishReason::MaxTokens,
+            )?;
             return self
                 .finish_result(
                     &active.generated_tokens,
@@ -1022,6 +1045,7 @@ impl Engine {
 
         loop {
             if generated_tokens.len() >= options.max_new_tokens {
+                ensure_constrained_finish(options, generated_text, FinishReason::MaxTokens)?;
                 return self.finish_result(
                     generated_tokens,
                     FinishReason::MaxTokens,
@@ -1029,6 +1053,7 @@ impl Engine {
                 );
             }
             if reached_context_limit(state.tokens.len(), max_context) {
+                ensure_constrained_finish(options, generated_text, FinishReason::Length)?;
                 return self.finish_result(
                     generated_tokens,
                     FinishReason::Length,
@@ -2232,7 +2257,10 @@ fn is_gather_out_of_bounds(message: &str) -> bool {
             || lower.contains("idx=") && lower.contains("out of"))
 }
 
-fn build_processor_chain(options: &GenerateOptions) -> ProcessorChain {
+fn build_processor_chain(
+    options: &GenerateOptions,
+    tokenizer: Option<&Tokenizer>,
+) -> anyhow::Result<ProcessorChain> {
     let mut chain = ProcessorChain::new();
 
     if options.repetition_penalty != 1.0 {
@@ -2245,6 +2273,20 @@ fn build_processor_chain(options: &GenerateOptions) -> ProcessorChain {
         chain.add(Box::new(StopSequenceProcessor::new(
             options.stop_sequences.clone(),
         )));
+    }
+
+    if let Some(constraint) = &options.constraint {
+        let tokenizer = tokenizer.context("constrained decoding requires a tokenizer")?;
+        let token_texts = tokenizer_token_texts(tokenizer);
+        match constraint {
+            GenerateConstraint::Json => {
+                chain.add(Box::new(ConstraintProcessor::new(
+                    Box::new(JsonConstraint),
+                    token_texts,
+                    options.eos_token_id,
+                )));
+            }
+        }
     }
 
     if options.temperature > 0.0 && options.temperature != 1.0 {
@@ -2265,7 +2307,37 @@ fn build_processor_chain(options: &GenerateOptions) -> ProcessorChain {
         }));
     }
 
-    chain
+    Ok(chain)
+}
+
+fn ensure_constrained_finish(
+    options: &GenerateOptions,
+    generated_text: &str,
+    finish_reason: FinishReason,
+) -> anyhow::Result<()> {
+    if matches!(
+        (&options.constraint, finish_reason),
+        (
+            Some(GenerateConstraint::Json),
+            FinishReason::MaxTokens | FinishReason::Length
+        )
+    ) && !JsonConstraint::is_complete(generated_text)
+    {
+        anyhow::bail!(
+            "JSON constrained decoding stopped before a complete JSON value; increase max_new_tokens or max_context"
+        );
+    }
+    Ok(())
+}
+
+fn tokenizer_token_texts(tokenizer: &Tokenizer) -> Vec<Option<String>> {
+    let vocab = tokenizer.inner().get_vocab(true);
+    let max_id = vocab.values().copied().max().unwrap_or(0) as usize;
+    let mut token_texts = vec![None; max_id + 1];
+    for id in 0..=max_id {
+        token_texts[id] = tokenizer.decode(&[id as TokenId]).ok();
+    }
+    token_texts
 }
 
 fn select_next_token(
@@ -2294,7 +2366,13 @@ fn finish_reason_after_token(
     }
 
     match chain.signal(context) {
-        Some(ProcessorSignal::StopSequence { index }) => Some(FinishReason::StopSequence { index }),
+        Some(ProcessorSignal::StopSequence { index })
+            if !matches!(&options.constraint, Some(GenerateConstraint::Json))
+                || JsonConstraint::is_complete(&context.generated_text) =>
+        {
+            Some(FinishReason::StopSequence { index })
+        }
+        Some(ProcessorSignal::StopSequence { .. }) => None,
         None => None,
     }
 }
@@ -2313,7 +2391,7 @@ mod tests {
             stop_sequences: vec![StopSequence::Tokens(vec![42])],
             ..Default::default()
         };
-        let chain = build_processor_chain(&options);
+        let chain = build_processor_chain(&options, None).unwrap();
         assert_eq!(
             chain.names(),
             vec![
@@ -2327,13 +2405,44 @@ mod tests {
     }
 
     #[test]
+    fn processor_chain_includes_json_constraint_before_sampling_filters() -> anyhow::Result<()> {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/tiny-llm/tokenizer.json")
+            .canonicalize()?;
+        let tokenizer = Tokenizer::from_file(&fixture)
+            .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {}", e))?;
+        let options = GenerateOptions {
+            temperature: 0.7,
+            top_p: 0.9,
+            top_k: 10,
+            repetition_penalty: 1.1,
+            constraint: Some(GenerateConstraint::Json),
+            ..Default::default()
+        };
+
+        let chain = build_processor_chain(&options, Some(&tokenizer))?;
+
+        assert_eq!(
+            chain.names(),
+            vec![
+                "repetition_penalty",
+                "json_constraint",
+                "temperature",
+                "top_k",
+                "top_p"
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
     fn greedy_selection_uses_argmax_after_processors() {
         let options = GenerateOptions {
             greedy: true,
             top_k: 2,
             ..Default::default()
         };
-        let chain = build_processor_chain(&options);
+        let chain = build_processor_chain(&options, None).unwrap();
         let context = ProcessorContext::default();
         let mut logits = vec![0.0, 2.0, 4.0, 3.0];
         assert_eq!(
@@ -2348,7 +2457,7 @@ mod tests {
             greedy: false,
             ..Default::default()
         };
-        let chain = build_processor_chain(&options);
+        let chain = build_processor_chain(&options, None).unwrap();
         let context = ProcessorContext::default();
         let mut logits = vec![0.0, 0.0];
         assert_eq!(
@@ -2364,7 +2473,7 @@ mod tests {
             stop_sequences: vec![StopSequence::Tokens(vec![7])],
             ..Default::default()
         };
-        let chain = build_processor_chain(&options);
+        let chain = build_processor_chain(&options, None).unwrap();
         let context = ProcessorContext {
             generated_tokens: vec![7],
             ..Default::default()
@@ -2381,7 +2490,7 @@ mod tests {
             stop_sequences: vec![StopSequence::Tokens(vec![2, 3])],
             ..Default::default()
         };
-        let chain = build_processor_chain(&options);
+        let chain = build_processor_chain(&options, None).unwrap();
         let context = ProcessorContext {
             generated_tokens: vec![1, 2, 3],
             ..Default::default()
