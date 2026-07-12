@@ -1,0 +1,431 @@
+use std::{collections::HashMap, sync::Arc, thread};
+
+use anyhow::Context;
+use onnx_genai::{
+    Engine, GenerateOptions, GenerateRequest, GenerateResult, GenerateToken, SessionId,
+};
+use onnx_genai_engine::{ContinuousBatchEvent, ContinuousBatchManager, FimConfig};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
+
+const DRIVER_OUTPUT_BUFFER: usize = 16;
+
+#[derive(Clone)]
+pub(crate) struct EngineDriver {
+    pub(crate) commands: mpsc::Sender<DriverCommand>,
+    pub(crate) generation_capacity: Arc<Semaphore>,
+}
+
+pub(crate) enum DriverCommand {
+    CreateSession(tokio::sync::oneshot::Sender<anyhow::Result<SessionId>>),
+    CloseSession {
+        session_id: SessionId,
+        response: tokio::sync::oneshot::Sender<anyhow::Result<()>>,
+    },
+    SessionTokenCount {
+        session_id: SessionId,
+        response: tokio::sync::oneshot::Sender<anyhow::Result<usize>>,
+    },
+    Generate {
+        session_id: Option<SessionId>,
+        request: Box<GenerateRequest>,
+        events: mpsc::Sender<DriverEvent>,
+        permit: OwnedSemaphorePermit,
+    },
+    GenerateFim {
+        prefix: String,
+        suffix: String,
+        fim_config: FimConfig,
+        options: Box<GenerateOptions>,
+        events: mpsc::Sender<DriverEvent>,
+        permit: OwnedSemaphorePermit,
+    },
+}
+
+#[derive(Debug)]
+pub(crate) enum DriverEvent {
+    Token(GenerateToken),
+    Finished(GenerateResult),
+    Error(String),
+}
+
+struct EngineOwner(Engine);
+
+#[derive(Debug)]
+pub(crate) enum GenerateSubmitError {
+    Overloaded,
+    DriverStopped,
+}
+
+struct DriverRoute {
+    events: mpsc::Sender<DriverEvent>,
+    _permit: OwnedSemaphorePermit,
+}
+
+// SAFETY: The engine is moved exactly once into the dedicated driver thread.
+// All ORT runners, sessions, KV state, and the continuous batch manager stay
+// owned by that thread and are accessed only by processing channel commands.
+unsafe impl Send for EngineOwner {}
+
+impl EngineDriver {
+    pub(crate) fn start(engine: Engine, max_batch: usize, max_pending: usize) -> Self {
+        let (commands, rx) = mpsc::channel(max_pending);
+        let generation_capacity = Arc::new(Semaphore::new(max_pending));
+        let owner = EngineOwner(engine);
+        thread::Builder::new()
+            .name("onnx-genai-batch-driver".to_string())
+            .spawn(move || run_engine_driver(owner, rx, max_batch))
+            .expect("failed to spawn onnx-genai engine driver");
+        Self {
+            commands,
+            generation_capacity,
+        }
+    }
+
+    pub(crate) async fn create_session(&self) -> anyhow::Result<SessionId> {
+        let (response, rx) = tokio::sync::oneshot::channel();
+        self.commands
+            .send(DriverCommand::CreateSession(response))
+            .await
+            .map_err(|_| anyhow::anyhow!("engine driver stopped"))?;
+        rx.await
+            .map_err(|_| anyhow::anyhow!("engine driver stopped"))?
+    }
+
+    pub(crate) async fn close_session(&self, session_id: SessionId) -> anyhow::Result<()> {
+        let (response, rx) = tokio::sync::oneshot::channel();
+        self.commands
+            .send(DriverCommand::CloseSession {
+                session_id,
+                response,
+            })
+            .await
+            .map_err(|_| anyhow::anyhow!("engine driver stopped"))?;
+        rx.await
+            .map_err(|_| anyhow::anyhow!("engine driver stopped"))?
+    }
+
+    pub(crate) async fn session_token_count(&self, session_id: SessionId) -> anyhow::Result<usize> {
+        let (response, rx) = tokio::sync::oneshot::channel();
+        self.commands
+            .send(DriverCommand::SessionTokenCount {
+                session_id,
+                response,
+            })
+            .await
+            .map_err(|_| anyhow::anyhow!("engine driver stopped"))?;
+        rx.await
+            .map_err(|_| anyhow::anyhow!("engine driver stopped"))?
+    }
+
+    pub(crate) async fn generate(
+        &self,
+        session_id: Option<SessionId>,
+        request: GenerateRequest,
+    ) -> Result<mpsc::Receiver<DriverEvent>, GenerateSubmitError> {
+        let permit = self
+            .generation_capacity
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| GenerateSubmitError::Overloaded)?;
+        let (events, rx) = mpsc::channel(DRIVER_OUTPUT_BUFFER);
+        self.commands
+            .send(DriverCommand::Generate {
+                session_id,
+                request: Box::new(request),
+                events,
+                permit,
+            })
+            .await
+            .map_err(|_| GenerateSubmitError::DriverStopped)?;
+        Ok(rx)
+    }
+
+    pub(crate) async fn generate_fim(
+        &self,
+        prefix: String,
+        suffix: String,
+        fim_config: FimConfig,
+        options: GenerateOptions,
+    ) -> Result<mpsc::Receiver<DriverEvent>, GenerateSubmitError> {
+        let permit = self
+            .generation_capacity
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| GenerateSubmitError::Overloaded)?;
+        let (events, rx) = mpsc::channel(DRIVER_OUTPUT_BUFFER);
+        self.commands
+            .send(DriverCommand::GenerateFim {
+                prefix,
+                suffix,
+                fim_config,
+                options: Box::new(options),
+                events,
+                permit,
+            })
+            .await
+            .map_err(|_| GenerateSubmitError::DriverStopped)?;
+        Ok(rx)
+    }
+}
+
+fn run_engine_driver(owner: EngineOwner, rx: mpsc::Receiver<DriverCommand>, max_batch: usize) {
+    let mut engine = owner.0;
+    let static_batch_supported = engine.continuous_batch_manager(max_batch).is_ok();
+    if static_batch_supported {
+        tracing::info!(max_batch, "static-cache continuous batch driver enabled");
+        run_static_engine_driver(&mut engine, rx, max_batch);
+    } else {
+        tracing::info!("continuous batch driver disabled; using per-request engine path");
+        run_fallback_engine_driver(&mut engine, rx);
+    }
+}
+
+fn run_fallback_engine_driver(engine: &mut Engine, mut rx: mpsc::Receiver<DriverCommand>) {
+    while let Some(command) = rx.blocking_recv() {
+        handle_driver_command(engine, command);
+    }
+}
+
+fn run_static_engine_driver(
+    engine: &mut Engine,
+    mut rx: mpsc::Receiver<DriverCommand>,
+    max_batch: usize,
+) {
+    // The current ContinuousBatchManager API accepts GenerateRequest only.
+    // X-Session-Id requests keep using the driver's per-request engine path so
+    // persistent engine KV/session semantics are preserved until the manager
+    // grows a SessionId-aware submit API.
+    let mut deferred = std::collections::VecDeque::new();
+    loop {
+        while let Ok(command) = rx.try_recv() {
+            match command {
+                command @ DriverCommand::Generate {
+                    session_id: None, ..
+                } => deferred.push_back(command),
+                command => deferred.push_back(command),
+            }
+        }
+
+        let Some(first) = deferred.pop_front().or_else(|| rx.blocking_recv()) else {
+            break;
+        };
+
+        match first {
+            DriverCommand::Generate {
+                session_id: None,
+                request,
+                events,
+                permit,
+            } => {
+                run_static_batch_until_idle(
+                    engine,
+                    &mut rx,
+                    &mut deferred,
+                    max_batch,
+                    *request,
+                    events,
+                    permit,
+                );
+            }
+            command => handle_driver_command(engine, command),
+        }
+    }
+}
+
+fn run_static_batch_until_idle(
+    engine: &Engine,
+    rx: &mut mpsc::Receiver<DriverCommand>,
+    deferred: &mut std::collections::VecDeque<DriverCommand>,
+    max_batch: usize,
+    first_request: GenerateRequest,
+    first_events: mpsc::Sender<DriverEvent>,
+    first_permit: OwnedSemaphorePermit,
+) {
+    let mut manager = match engine.continuous_batch_manager(max_batch) {
+        Ok(manager) => manager,
+        Err(err) => {
+            let _ = first_events.try_send(DriverEvent::Error(format!(
+                "continuous batch setup failed: {err}"
+            )));
+            return;
+        }
+    };
+    let mut routes: HashMap<usize, DriverRoute> = HashMap::new();
+    let mut abandoned = HashMap::new();
+    submit_to_continuous_manager(
+        &mut manager,
+        &mut routes,
+        &mut abandoned,
+        first_request,
+        first_events,
+        first_permit,
+    );
+
+    loop {
+        while let Ok(command) = rx.try_recv() {
+            match command {
+                DriverCommand::Generate {
+                    session_id: None,
+                    request,
+                    events,
+                    permit,
+                } => submit_to_continuous_manager(
+                    &mut manager,
+                    &mut routes,
+                    &mut abandoned,
+                    *request,
+                    events,
+                    permit,
+                ),
+                command => deferred.push_back(command),
+            }
+        }
+
+        if let Err(err) = manager.step() {
+            let message = format!("continuous batch generation failed: {err}");
+            for (_, route) in routes.drain() {
+                let _ = route.events.try_send(DriverEvent::Error(message.clone()));
+            }
+            break;
+        }
+        route_continuous_events(manager.poll(), &mut routes, &mut abandoned);
+        if manager.is_idle() {
+            break;
+        }
+    }
+}
+
+fn submit_to_continuous_manager(
+    manager: &mut ContinuousBatchManager<'_>,
+    routes: &mut HashMap<usize, DriverRoute>,
+    abandoned: &mut HashMap<usize, OwnedSemaphorePermit>,
+    request: GenerateRequest,
+    events: mpsc::Sender<DriverEvent>,
+    permit: OwnedSemaphorePermit,
+) {
+    match manager.submit(request) {
+        Ok(handle) => {
+            routes.insert(
+                handle.id,
+                DriverRoute {
+                    events,
+                    _permit: permit,
+                },
+            );
+            route_continuous_events(manager.poll(), routes, abandoned);
+        }
+        Err(err) => {
+            let _ = events.try_send(DriverEvent::Error(err.to_string()));
+        }
+    }
+}
+
+fn route_continuous_events(
+    events: Vec<ContinuousBatchEvent>,
+    routes: &mut HashMap<usize, DriverRoute>,
+    abandoned: &mut HashMap<usize, OwnedSemaphorePermit>,
+) {
+    for event in events {
+        match event {
+            ContinuousBatchEvent::Token { handle, token } => {
+                // A slow or disconnected consumer loses its route immediately. The
+                // driver never waits for output capacity; it keeps stepping every
+                // other row while the manager retires the abandoned row.
+                let delivery_failed = routes
+                    .get(&handle.id)
+                    .is_some_and(|route| route.events.try_send(DriverEvent::Token(token)).is_err());
+                if delivery_failed && let Some(route) = routes.remove(&handle.id) {
+                    abandoned.insert(handle.id, route._permit);
+                }
+            }
+            ContinuousBatchEvent::Finished { handle, result } => {
+                if let Some(route) = routes.remove(&handle.id) {
+                    let _ = route.events.try_send(DriverEvent::Finished(result));
+                } else {
+                    abandoned.remove(&handle.id);
+                }
+            }
+        }
+    }
+}
+
+fn handle_driver_command(engine: &mut Engine, command: DriverCommand) {
+    match command {
+        DriverCommand::CreateSession(response) => {
+            let _ = response.send(engine.create_session());
+        }
+        DriverCommand::CloseSession {
+            session_id,
+            response,
+        } => {
+            let _ = response.send(engine.close_session(session_id));
+        }
+        DriverCommand::SessionTokenCount {
+            session_id,
+            response,
+        } => {
+            let _ = response.send(engine.session_token_count(session_id));
+        }
+        DriverCommand::Generate {
+            session_id,
+            request,
+            events,
+            permit,
+        } => run_fallback_generation(engine, session_id, *request, events, permit),
+        DriverCommand::GenerateFim {
+            prefix,
+            suffix,
+            fim_config,
+            options,
+            events,
+            permit,
+        } => run_fim_generation(engine, prefix, suffix, fim_config, *options, events, permit),
+    }
+}
+
+fn run_fallback_generation(
+    engine: &mut Engine,
+    session_id: Option<SessionId>,
+    request: GenerateRequest,
+    events: mpsc::Sender<DriverEvent>,
+    _permit: OwnedSemaphorePermit,
+) {
+    let mut callback = |token: GenerateToken| -> anyhow::Result<()> {
+        events
+            .try_send(DriverEvent::Token(token))
+            .context("stream receiver closed")
+    };
+    let result = match session_id {
+        Some(session_id) => {
+            engine.generate_in_session_with_callback(session_id, request, Some(&mut callback))
+        }
+        None => engine.generate_with_callback(request, Some(&mut callback)),
+    };
+    match result {
+        Ok(result) => {
+            let _ = events.try_send(DriverEvent::Finished(result));
+        }
+        Err(err) => {
+            let _ = events.try_send(DriverEvent::Error(err.to_string()));
+        }
+    }
+}
+
+fn run_fim_generation(
+    engine: &mut Engine,
+    prefix: String,
+    suffix: String,
+    fim_config: FimConfig,
+    options: GenerateOptions,
+    events: mpsc::Sender<DriverEvent>,
+    _permit: OwnedSemaphorePermit,
+) {
+    match engine.generate_fim_with_config(prefix, suffix, options, &fim_config) {
+        Ok(result) => {
+            let _ = events.try_send(DriverEvent::Finished(result));
+        }
+        Err(err) => {
+            let _ = events.try_send(DriverEvent::Error(err.to_string()));
+        }
+    }
+}

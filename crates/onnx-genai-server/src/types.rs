@@ -1,0 +1,231 @@
+use onnx_genai::StopSequence;
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Deserialize)]
+pub struct ChatCompletionRequest {
+    pub model: String,
+    pub messages: Vec<ChatMessage>,
+    #[serde(default = "default_max_tokens")]
+    pub max_tokens: usize,
+    #[serde(default = "default_temperature")]
+    pub temperature: f32,
+    #[serde(default = "default_top_p")]
+    pub top_p: f32,
+    #[serde(default)]
+    pub stream: bool,
+    #[serde(default)]
+    pub stop: Option<StopInput>,
+    #[serde(default)]
+    pub response_format: Option<ResponseFormat>,
+    #[serde(default)]
+    pub tools: Option<Vec<ChatTool>>,
+    #[serde(default)]
+    pub tool_choice: Option<ToolChoice>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CompletionRequest {
+    pub model: String,
+    pub prompt: String,
+    #[serde(default)]
+    pub suffix: Option<String>,
+    #[serde(default = "default_max_tokens")]
+    pub max_tokens: usize,
+    #[serde(default = "default_temperature")]
+    pub temperature: f32,
+    #[serde(default = "default_top_p")]
+    pub top_p: f32,
+    #[serde(default)]
+    pub min_p: f32,
+    #[serde(default)]
+    pub frequency_penalty: f32,
+    #[serde(default)]
+    pub presence_penalty: f32,
+    #[serde(default)]
+    pub stream: bool,
+    #[serde(default)]
+    pub stop: Option<StopInput>,
+}
+
+impl ChatCompletionRequest {
+    pub(crate) fn wants_json_object(&self) -> bool {
+        matches!(
+            self.response_format.as_ref().map(|format| &format.kind),
+            Some(ResponseFormatType::JsonObject)
+        )
+    }
+
+    pub(crate) fn has_tool_context(&self) -> bool {
+        self.tools.as_ref().is_some_and(|tools| !tools.is_empty())
+            || self.tool_choice.is_some()
+            || self.messages.iter().any(|message| {
+                message
+                    .tool_calls
+                    .as_ref()
+                    .is_some_and(|calls| !calls.is_empty())
+                    || message.tool_call_id.is_some()
+                    || message.role == "tool"
+            })
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ChatMessage {
+    pub role: String,
+    #[serde(default)]
+    pub content: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ChatMessageToolCall>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ChatMessageToolCall {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub function: ChatMessageToolCallFunction,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ChatMessageToolCallFunction {
+    pub name: String,
+    pub arguments: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ChatTool {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub function: ChatToolFunction,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ChatToolFunction {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parameters: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum ToolChoice {
+    Mode(ToolChoiceMode),
+    Specific(ToolChoiceSpecific),
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolChoiceMode {
+    Auto,
+    None,
+    Required,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ToolChoiceSpecific {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub function: ToolChoiceFunction,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ToolChoiceFunction {
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ResponseFormat {
+    #[serde(rename = "type")]
+    pub kind: ResponseFormatType,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ResponseFormatType {
+    Text,
+    JsonObject,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum StopInput {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl StopInput {
+    pub(crate) fn into_texts(self) -> Vec<String> {
+        match self {
+            Self::One(value) => vec![value],
+            Self::Many(values) => values,
+        }
+    }
+
+    pub(crate) fn into_sequences(self) -> Vec<StopSequence> {
+        self.into_texts()
+            .into_iter()
+            .map(StopSequence::Text)
+            .collect()
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct ChatCompletionResponse {
+    pub id: String,
+    pub object: &'static str,
+    pub created: u64,
+    pub model: String,
+    pub choices: Vec<ChatChoice>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Usage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_token_count: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ChatChoice {
+    pub index: usize,
+    pub message: ChatMessage,
+    pub finish_reason: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+pub struct Usage {
+    pub prompt_tokens: usize,
+    pub completion_tokens: usize,
+    pub total_tokens: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CompletionResponse {
+    pub id: String,
+    pub object: &'static str,
+    pub created: u64,
+    pub model: String,
+    pub choices: Vec<CompletionChoice>,
+    pub usage: Usage,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CompletionChoice {
+    pub text: String,
+    pub index: usize,
+    pub finish_reason: &'static str,
+    pub logprobs: Option<serde_json::Value>,
+}
+
+fn default_max_tokens() -> usize {
+    256
+}
+fn default_temperature() -> f32 {
+    1.0
+}
+fn default_top_p() -> f32 {
+    1.0
+}
