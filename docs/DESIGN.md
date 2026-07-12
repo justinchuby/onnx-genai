@@ -2904,3 +2904,378 @@ serving:
     enabled: true
     min_refcount_to_pin: 2     # pin after 2+ sessions use same prefix
 ```
+
+---
+
+## 27. Multi-Token Speculative Decoding (MTS)
+
+### 27.1 Taxonomy of Speculative Methods
+
+| Method | Draft Source | Models | Verification | Example |
+|---|---|---|---|---|
+| **Draft model** (current) | Separate smaller model | 2 | Target verifies draft tokens | Llama-70B + Llama-8B |
+| **Self-speculative** | Same model, early exit | 1 | Later layers verify early-exit tokens | LayerSkip |
+| **Multi-token prediction (MTP)** | Extra prediction heads on target | 1 | Main head verifies auxiliary heads | DeepSeek-V3, Meta MTP |
+| **Medusa** | Fine-tuned extra heads | 1 | Tree-structured verification | Medusa-2 |
+| **EAGLE** | Feature-level draft with autoregression | 1+adapter | Target verifies feature-based proposals | EAGLE-2 |
+| **N-gram / Prompt lookup** | Input token patterns | 0 | Target verifies repeated patterns | Already supported |
+| **Lookahead** | Jacobi iteration on target | 1 | N-gram cache from Jacobi trajectories | Lookahead Decoding |
+
+### 27.2 Multi-Token Prediction (MTP) Design
+
+MTP models (DeepSeek-V3, Meta's multi-token) have additional output heads that predict future tokens:
+
+```
+Input: [t1, t2, t3, t4]
+
+Normal head (position +1):  predicts t5    ← always correct (autoregressive)
+MTP head 1 (position +2):   predicts t6    ← speculative
+MTP head 2 (position +3):   predicts t7    ← speculative
+MTP head 3 (position +4):   predicts t8    ← speculative
+```
+
+One forward pass → 4 token candidates. Verify MTP predictions on next step.
+
+```rust
+/// Multi-token prediction model configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MtpConfig {
+    /// Number of extra prediction heads (k).
+    /// Model outputs k+1 token predictions per forward pass.
+    pub num_speculative_heads: usize,
+    /// Output names for each head in the ONNX model.
+    /// Index 0 = main head (always trusted), 1..k = speculative heads.
+    pub head_output_names: Vec<String>,
+    /// Acceptance rule for speculative heads.
+    pub acceptance: MtpAcceptance,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum MtpAcceptance {
+    /// Accept if MTP head's argmax matches target's next-step argmax.
+    Greedy,
+    /// Stochastic acceptance (for sampling): accept with P(draft)/P(target) probability.
+    Stochastic,
+    /// Threshold: accept if top-1 probability from MTP head > threshold.
+    Confidence { min_prob: f32 },
+}
+```
+
+### 27.3 Medusa-Style Tree Verification
+
+Medusa uses multiple heads but verifies them in a **tree structure** — not just sequential:
+
+```
+Step 1: Main model generates token A (head 0)
+        Medusa head 1 proposes: [B1, B2, B3]  (top-3 for position +2)
+        Medusa head 2 proposes: [C1, C2]       (top-2 for position +3)
+
+Step 2: Verify tree of candidates in ONE forward pass:
+        [A→B1→C1, A→B1→C2, A→B2→C1, A→B2→C2, A→B3→C1, A→B3→C2]
+        
+        Using tree attention mask — all candidates verified simultaneously.
+```
+
+```rust
+/// Medusa tree-structured speculation.
+pub struct MedusaConfig {
+    /// Number of Medusa heads.
+    pub num_heads: usize,
+    /// Top-k candidates per head.
+    pub top_k_per_head: Vec<usize>,  // e.g., [3, 2, 2] → 3×2×2 = 12 tree paths
+    /// Tree attention: which positions attend to which.
+    pub tree_structure: TreeStructure,
+    /// Maximum tree candidates per verification step.
+    pub max_candidates: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct TreeStructure {
+    /// Parent index for each node in the verification batch.
+    /// Root has parent = -1.
+    pub parent_indices: Vec<i32>,
+    /// Depth of each node.
+    pub depths: Vec<usize>,
+}
+
+impl MedusaConfig {
+    /// Build the tree attention mask for verification.
+    pub fn build_tree_attention_mask(&self) -> Vec<Vec<bool>> {
+        // Each candidate attends to its ancestors in the tree.
+        // Enables single-pass verification of all candidates.
+        ...
+    }
+}
+```
+
+### 27.4 EAGLE (Feature-Level Speculation)
+
+EAGLE doesn't predict tokens directly — it predicts **hidden states** then uses the target's LM head:
+
+```
+Target model: input → hidden_states → LM_head → token
+EAGLE adapter: prev_hidden + prev_token_embed → draft_hidden → LM_head → draft_token
+```
+
+```rust
+/// EAGLE speculation config.
+pub struct EagleConfig {
+    /// Path to EAGLE adapter model (lightweight autoregressive on features).
+    pub adapter_model: String,
+    /// Number of draft tokens to propose per step.
+    pub draft_tokens: usize,
+    /// Whether to use tree-structured verification (EAGLE-2).
+    pub tree_verification: bool,
+    /// Feature layer to tap from target model.
+    pub feature_layer: i32,  // -1 = last hidden state
+}
+```
+
+### 27.5 Self-Speculative (Early Exit)
+
+Use the same model's early layers as draft:
+
+```rust
+/// Self-speculative: early layers as draft, full model verifies.
+pub struct SelfSpecConfig {
+    /// Exit at this layer for draft tokens.
+    pub draft_exit_layer: usize,   // e.g., layer 8 of 32
+    /// Number of draft tokens before full verification.
+    pub draft_tokens: usize,
+    /// Confidence threshold for early exit.
+    pub exit_confidence: f32,
+}
+```
+
+Requires model to expose intermediate layer outputs (ONNX: add early-exit output node at layer N).
+
+### 27.6 Unified Speculation Interface
+
+All methods share the same contract:
+
+```rust
+/// Unified interface for all speculative methods.
+pub trait SpeculativeProposer: Send + Sync {
+    /// Propose candidate tokens for speculation.
+    /// Returns one or more candidate sequences (tree = multiple paths).
+    fn propose(
+        &mut self,
+        context: &SpeculativeContext,
+    ) -> Result<Vec<CandidateSequence>>;
+    
+    /// Update internal state after verification results.
+    fn update(&mut self, accepted: &VerificationResult);
+    
+    /// Name for metrics/logging.
+    fn name(&self) -> &str;
+    
+    /// Expected speedup ratio (for scheduling decisions).
+    fn expected_speedup(&self) -> f32;
+}
+
+pub struct SpeculativeContext {
+    /// Tokens generated so far.
+    pub tokens: Vec<TokenId>,
+    /// Last hidden state from target model (for EAGLE).
+    pub last_hidden_state: Option<Value>,
+    /// Sampling config (needed for stochastic acceptance).
+    pub sampling: SamplingConfig,
+}
+
+pub struct CandidateSequence {
+    /// Proposed token IDs.
+    pub tokens: Vec<TokenId>,
+    /// Confidence/probability for each token.
+    pub probs: Vec<f32>,
+    /// Tree parent index (-1 = root). Sequential = [−1, 0, 1, 2, ...].
+    pub parent_indices: Vec<i32>,
+}
+
+pub struct VerificationResult {
+    /// How many tokens from each candidate path were accepted.
+    pub accepted_lengths: Vec<usize>,
+    /// The bonus token from the verifier (token at first mismatch position).
+    pub bonus_token: TokenId,
+}
+```
+
+### 27.7 Verification Engine
+
+Single verification engine handles all proposer types:
+
+```rust
+pub struct SpeculativeEngine {
+    proposer: Box<dyn SpeculativeProposer>,
+    verifier: VerifierSession,  // the target model
+    config: SpeculativeEngineConfig,
+}
+
+pub struct SpeculativeEngineConfig {
+    /// Max draft tokens before verification.
+    pub max_draft_tokens: usize,
+    /// Acceptance rule.
+    pub acceptance: AcceptanceRule,
+    /// Adaptive: disable speculation when acceptance rate drops below threshold.
+    pub min_acceptance_rate: f32,
+    /// Window for acceptance rate tracking.
+    pub acceptance_window: usize,
+}
+
+#[derive(Debug, Clone)]
+pub enum AcceptanceRule {
+    /// Accept iff argmax(target) == draft_token.
+    Greedy,
+    /// Accept with probability min(1, P_target/P_draft). Preserves distribution.
+    Stochastic,
+    /// Accept if target top-1 prob for this token > threshold.
+    Threshold(f32),
+    /// Typical acceptance: accept if token is within typical set.
+    Typical { tau: f32 },
+}
+
+impl SpeculativeEngine {
+    /// Run one speculative step: propose → verify → accept.
+    pub fn step(&mut self, context: &mut GenerationContext) -> Result<Vec<TokenId>> {
+        // 1. Get proposals
+        let candidates = self.proposer.propose(&context.spec_context())?;
+        
+        // 2. Build verification batch
+        //    - Sequential: just concat [accepted_so_far + draft_tokens]
+        //    - Tree: build tree attention mask, run all paths in one forward
+        let verify_batch = self.build_verify_batch(&candidates);
+        
+        // 3. One target forward pass (verifies all candidates)
+        let target_logits = self.verifier.forward(&verify_batch)?;
+        
+        // 4. Accept/reject using configured rule
+        let result = self.verify(&candidates, &target_logits);
+        
+        // 5. Update proposer state
+        self.proposer.update(&result);
+        
+        // 6. Return accepted tokens + bonus
+        Ok(result.accepted_tokens())
+    }
+}
+```
+
+### 27.8 Tree Attention for Verification
+
+Tree verification (Medusa/EAGLE-2) verifies multiple candidate paths in ONE forward pass using a custom attention mask:
+
+```rust
+/// Build tree attention mask for verification.
+/// 
+/// Example: 3 candidates from position 5: [A, B, C]
+/// Candidate A continues: [A→D, A→E]
+///
+/// Attention mask (1 = can attend):
+///     pos: 0  1  2  3  4  A  B  C  AD AE
+/// A:       [1, 1, 1, 1, 1, 1, 0, 0, 0, 0]
+/// B:       [1, 1, 1, 1, 1, 0, 1, 0, 0, 0]
+/// C:       [1, 1, 1, 1, 1, 0, 0, 1, 0, 0]
+/// AD:      [1, 1, 1, 1, 1, 1, 0, 0, 1, 0]
+/// AE:      [1, 1, 1, 1, 1, 1, 0, 0, 0, 1]
+fn build_tree_attention_mask(
+    context_len: usize,
+    candidates: &[CandidateSequence],
+) -> Vec<Vec<bool>> {
+    // Each candidate attends to:
+    // 1. All context tokens (0..context_len)
+    // 2. Its own ancestor chain in the tree
+    ...
+}
+```
+
+### 27.9 Adaptive Speculation
+
+Not all sequences benefit from speculation equally. Adapt at runtime:
+
+```rust
+pub struct AdaptiveSpeculation {
+    /// Rolling acceptance rate.
+    acceptance_history: VecDeque<bool>,
+    /// Current draft length (adapts based on acceptance).
+    current_draft_len: usize,
+    /// Min/max bounds.
+    min_draft: usize,  // 1
+    max_draft: usize,  // e.g., 8
+}
+
+impl AdaptiveSpeculation {
+    /// Adjust draft length based on recent acceptance rate.
+    pub fn adapt(&mut self) {
+        let rate = self.acceptance_rate();
+        if rate > 0.8 {
+            // High acceptance → try more draft tokens
+            self.current_draft_len = (self.current_draft_len + 1).min(self.max_draft);
+        } else if rate < 0.4 {
+            // Low acceptance → reduce draft (or disable speculation)
+            self.current_draft_len = (self.current_draft_len - 1).max(self.min_draft);
+        }
+    }
+    
+    /// Completely disable speculation if it's not helping.
+    pub fn should_disable(&self) -> bool {
+        // If acceptance rate < 30% over last 50 tokens, speculation adds overhead
+        self.acceptance_rate() < 0.3 && self.acceptance_history.len() >= 50
+    }
+}
+```
+
+### 27.10 ONNX Model Requirements
+
+For each speculation method, the ONNX model needs specific outputs:
+
+```yaml
+# inference_metadata.yaml
+speculative:
+  method: mtp
+  mtp:
+    num_heads: 3
+    head_outputs: ["logits", "logits_head_1", "logits_head_2", "logits_head_3"]
+    
+# Or Medusa:
+speculative:
+  method: medusa
+  medusa:
+    num_heads: 3
+    top_k: [3, 2, 2]
+    head_outputs: ["medusa_head_0", "medusa_head_1", "medusa_head_2"]
+    
+# Or EAGLE:
+speculative:
+  method: eagle
+  eagle:
+    adapter_model: "eagle_adapter.onnx"
+    feature_output: "hidden_states"  # target model must expose this
+    draft_tokens: 5
+
+# Or self-speculative:
+speculative:
+  method: self_speculative
+  self_speculative:
+    draft_exit_layer: 8
+    exit_output: "layer_8_logits"  # model has early-exit output node
+    
+# Or draft model (existing):
+speculative:
+  method: draft_model
+  draft:
+    model: "draft_model.onnx"
+    tokens_per_step: 5
+```
+
+### 27.11 Performance Characteristics
+
+| Method | Speedup | Extra Memory | Model Changes Needed |
+|---|---|---|---|
+| Draft model | 2-3× | Full draft model | None (two models) |
+| MTP | 2-3× | ~5% (extra head weights) | Export with MTP heads |
+| Medusa | 2-3× | ~10% (trained heads) | Fine-tune + export heads |
+| EAGLE | 2.5-4× | ~15% (adapter) | Train adapter |
+| Self-speculative | 1.5-2× | None | Model with early-exit output |
+| N-gram | 1.2-2× | None | None |
+| Lookahead | 1.5-2.5× | None | None |
+
+For coding agent: EAGLE or MTP gives best bang-for-buck. Code is highly predictable → high acceptance rates → larger speedups.
