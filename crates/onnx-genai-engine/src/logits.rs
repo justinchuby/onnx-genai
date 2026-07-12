@@ -1,9 +1,10 @@
 //! Logit processor chain.
 //!
-//! Phase 1 uses the documented processor order:
-//! repetition penalties -> constraints/stop checks -> temperature -> top-k -> top-p.
+//! Processor order:
+//! repetition/frequency/presence penalties -> constraints/stop checks ->
+//! temperature -> top-k -> top-p -> min-p.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
 use llguidance::api::TopLevelGrammar;
@@ -805,6 +806,58 @@ impl LogitProcessor for RepetitionPenaltyProcessor {
     }
 }
 
+pub struct FrequencyPenaltyProcessor {
+    pub frequency_penalty: f32,
+}
+
+impl LogitProcessor for FrequencyPenaltyProcessor {
+    fn process(&self, logits: &mut [f32], context: &ProcessorContext) {
+        if !self.frequency_penalty.is_finite() || self.frequency_penalty == 0.0 {
+            return;
+        }
+
+        let mut counts: HashMap<TokenId, usize> = HashMap::new();
+        for &token_id in &context.generated_tokens {
+            *counts.entry(token_id).or_default() += 1;
+        }
+
+        for (token_id, count) in counts {
+            if let Some(logit) = logits.get_mut(token_id as usize) {
+                *logit -= self.frequency_penalty * count as f32;
+            }
+        }
+    }
+
+    fn name(&self) -> &str {
+        "frequency_penalty"
+    }
+}
+
+pub struct PresencePenaltyProcessor {
+    pub presence_penalty: f32,
+}
+
+impl LogitProcessor for PresencePenaltyProcessor {
+    fn process(&self, logits: &mut [f32], context: &ProcessorContext) {
+        if !self.presence_penalty.is_finite() || self.presence_penalty == 0.0 {
+            return;
+        }
+
+        let mut seen = HashSet::new();
+        for &token_id in &context.generated_tokens {
+            if seen.insert(token_id) {
+                if let Some(logit) = logits.get_mut(token_id as usize) {
+                    *logit -= self.presence_penalty;
+                }
+            }
+        }
+    }
+
+    fn name(&self) -> &str {
+        "presence_penalty"
+    }
+}
+
 pub struct StopSequenceProcessor {
     pub sequences: Vec<StopSequence>,
 }
@@ -939,6 +992,55 @@ impl LogitProcessor for TopPProcessor {
     }
 }
 
+pub struct MinPProcessor {
+    pub min_p: f32,
+}
+
+impl LogitProcessor for MinPProcessor {
+    fn process(&self, logits: &mut [f32], _context: &ProcessorContext) {
+        if !self.min_p.is_finite() || self.min_p <= 0.0 || logits.is_empty() {
+            return;
+        }
+
+        let max_logit = logits
+            .iter()
+            .copied()
+            .filter(|v| !v.is_nan())
+            .fold(f32::NEG_INFINITY, f32::max);
+        if !max_logit.is_finite() {
+            return;
+        }
+
+        let weights: Vec<f32> = logits
+            .iter()
+            .map(|&logit| {
+                if logit.is_nan() {
+                    0.0
+                } else {
+                    (logit - max_logit).exp()
+                }
+            })
+            .collect();
+        let exp_sum: f32 = weights.iter().sum();
+        if !exp_sum.is_finite() || exp_sum <= 0.0 {
+            return;
+        }
+
+        let top_prob = 1.0 / exp_sum;
+        let threshold = self.min_p.min(1.0) * top_prob;
+        for (logit, weight) in logits.iter_mut().zip(weights) {
+            let prob = weight / exp_sum;
+            if !prob.is_finite() || prob < threshold {
+                *logit = f32::NEG_INFINITY;
+            }
+        }
+    }
+
+    fn name(&self) -> &str {
+        "min_p"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -962,6 +1064,26 @@ mod tests {
     }
 
     #[test]
+    fn frequency_penalty_scales_with_generated_count() {
+        let processor = FrequencyPenaltyProcessor {
+            frequency_penalty: 0.5,
+        };
+        let mut logits = vec![4.0, 4.0, 4.0];
+        processor.process(&mut logits, &context(vec![0, 0], vec![0, 1, 1]));
+        assert_eq!(logits, vec![3.5, 3.0, 4.0]);
+    }
+
+    #[test]
+    fn presence_penalty_applies_once_per_generated_token() {
+        let processor = PresencePenaltyProcessor {
+            presence_penalty: 0.75,
+        };
+        let mut logits = vec![4.0, 4.0, 4.0];
+        processor.process(&mut logits, &context(vec![0], vec![1, 1, 2]));
+        assert_eq!(logits, vec![4.0, 3.25, 3.25]);
+    }
+
+    #[test]
     fn top_k_masks_tokens_below_threshold() {
         let processor = TopKProcessor { top_k: 2 };
         let mut logits = vec![0.0, 5.0, 1.0, 4.0];
@@ -976,6 +1098,16 @@ mod tests {
         processor.process(&mut logits, &ProcessorContext::default());
         assert!(logits[0].is_finite());
         assert_eq!(logits[1], f32::NEG_INFINITY);
+        assert_eq!(logits[2], f32::NEG_INFINITY);
+    }
+
+    #[test]
+    fn min_p_masks_relative_to_top_token_probability() {
+        let processor = MinPProcessor { min_p: 0.5 };
+        let mut logits = vec![0.0, -0.5, -1.0];
+        processor.process(&mut logits, &ProcessorContext::default());
+        assert!(logits[0].is_finite());
+        assert!(logits[1].is_finite());
         assert_eq!(logits[2], f32::NEG_INFINITY);
     }
 

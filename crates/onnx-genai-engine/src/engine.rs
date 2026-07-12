@@ -1,8 +1,9 @@
 //! Main generation engine.
 
 use crate::logits::{
-    ConstraintProcessor, GrammarConstraintKind, JsonConstraint, LlguidanceConstraint,
-    ProcessorChain, ProcessorContext, ProcessorSignal, RepetitionPenaltyProcessor, StopSequence,
+    ConstraintProcessor, FrequencyPenaltyProcessor, GrammarConstraintKind, JsonConstraint,
+    LlguidanceConstraint, MinPProcessor, PresencePenaltyProcessor, ProcessorChain,
+    ProcessorContext, ProcessorSignal, RepetitionPenaltyProcessor, StopSequence,
     StopSequenceProcessor, TemperatureProcessor, TokenId, TopKProcessor, TopPProcessor,
 };
 use crate::sampling::{sample_categorical, sample_greedy};
@@ -88,8 +89,14 @@ pub struct GenerateOptions {
     pub top_p: f32,
     /// Keep only the top-k logits before sampling. Zero disables top-k filtering.
     pub top_k: usize,
+    /// Min-p sampling threshold. Zero disables min-p filtering.
+    pub min_p: f32,
     /// Repetition penalty applied to prompt and generated tokens. Values <= 1 disable it.
     pub repetition_penalty: f32,
+    /// OpenAI-style count penalty: logit[t] -= frequency_penalty * count(t).
+    pub frequency_penalty: f32,
+    /// OpenAI-style presence penalty: logit[t] -= presence_penalty once if seen.
+    pub presence_penalty: f32,
     /// If true, choose argmax after processors; otherwise sample categorically.
     pub greedy: bool,
     /// Text or token sequences that terminate generation when matched as a suffix.
@@ -114,7 +121,10 @@ impl Default for GenerateOptions {
             temperature: 1.0,
             top_p: 1.0,
             top_k: 0,
+            min_p: 0.0,
             repetition_penalty: 1.0,
+            frequency_penalty: 0.0,
+            presence_penalty: 0.0,
             greedy: true,
             stop_sequences: Vec::new(),
             eos_token_id: None,
@@ -150,8 +160,17 @@ impl GenerateOptions {
         if !self.top_p.is_finite() || self.top_p < 0.0 {
             anyhow::bail!("top_p must be finite and non-negative");
         }
+        if !self.min_p.is_finite() || !(0.0..=1.0).contains(&self.min_p) {
+            anyhow::bail!("min_p must be finite and between 0 and 1");
+        }
         if !self.repetition_penalty.is_finite() || self.repetition_penalty <= 0.0 {
             anyhow::bail!("repetition_penalty must be finite and greater than zero");
+        }
+        if !self.frequency_penalty.is_finite() {
+            anyhow::bail!("frequency_penalty must be finite");
+        }
+        if !self.presence_penalty.is_finite() {
+            anyhow::bail!("presence_penalty must be finite");
         }
         if self.max_context == Some(0) {
             anyhow::bail!("max_context must be greater than zero when provided");
@@ -2626,6 +2645,18 @@ pub(crate) fn build_processor_chain(
         }));
     }
 
+    if options.frequency_penalty != 0.0 {
+        chain.add(Box::new(FrequencyPenaltyProcessor {
+            frequency_penalty: options.frequency_penalty,
+        }));
+    }
+
+    if options.presence_penalty != 0.0 {
+        chain.add(Box::new(PresencePenaltyProcessor {
+            presence_penalty: options.presence_penalty,
+        }));
+    }
+
     if !options.stop_sequences.is_empty() {
         chain.add(Box::new(StopSequenceProcessor::new(
             options.stop_sequences.clone(),
@@ -2700,6 +2731,12 @@ pub(crate) fn build_processor_chain(
     if options.top_p < 1.0 {
         chain.add(Box::new(TopPProcessor {
             top_p: options.top_p,
+        }));
+    }
+
+    if options.min_p > 0.0 {
+        chain.add(Box::new(MinPProcessor {
+            min_p: options.min_p,
         }));
     }
 
@@ -2813,7 +2850,10 @@ mod tests {
             temperature: 0.7,
             top_p: 0.9,
             top_k: 10,
+            min_p: 0.05,
             repetition_penalty: 1.1,
+            frequency_penalty: 0.2,
+            presence_penalty: 0.3,
             stop_sequences: vec![StopSequence::Tokens(vec![42])],
             ..Default::default()
         };
@@ -2822,10 +2862,13 @@ mod tests {
             chain.names(),
             vec![
                 "repetition_penalty",
+                "frequency_penalty",
+                "presence_penalty",
                 "stop_sequence",
                 "temperature",
                 "top_k",
-                "top_p"
+                "top_p",
+                "min_p"
             ]
         );
     }
@@ -2841,7 +2884,10 @@ mod tests {
             temperature: 0.7,
             top_p: 0.9,
             top_k: 10,
+            min_p: 0.05,
             repetition_penalty: 1.1,
+            frequency_penalty: 0.2,
+            presence_penalty: 0.3,
             constraint: Some(GenerateConstraint::Json),
             ..Default::default()
         };
@@ -2852,10 +2898,13 @@ mod tests {
             chain.names(),
             vec![
                 "repetition_penalty",
+                "frequency_penalty",
+                "presence_penalty",
                 "json_constraint",
                 "temperature",
                 "top_k",
-                "top_p"
+                "top_p",
+                "min_p"
             ]
         );
         Ok(())
@@ -2890,6 +2939,13 @@ mod tests {
             select_next_token(&mut logits, &context, &options, &chain, 0.75),
             1
         );
+    }
+
+    #[test]
+    fn default_processor_chain_is_empty_for_unchanged_defaults() {
+        let options = GenerateOptions::default();
+        let chain = build_processor_chain(&options, None).unwrap();
+        assert!(chain.names().is_empty());
     }
 
     #[test]
