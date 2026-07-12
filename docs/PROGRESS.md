@@ -1,6 +1,6 @@
 # onnx-genai — Implementation Progress
 
-Tracks implementation status of `docs/DESIGN.md` (§1–§38). Updated as work lands.
+Tracks implementation status of `docs/DESIGN.md` (§1–§40). Updated as work lands.
 
 **Published:** `onnx-genai` v0.1.0 + 8 sub-crates on crates.io. CI (fmt/build/test/**blocking clippy**) + scheduled `cargo-audit`. Coverage ~77% line.
 
@@ -11,12 +11,12 @@ _Last updated: 2026-07-12_
 | § | Feature | Status | Notes |
 |---|---------|--------|-------|
 | 1–8 | Vision, architecture, core components, data flow, concurrency, model dir, crates, deps | ✅ Done | |
-| 9 | API surface | 🟡 Partial | chat/completions/models/sessions/status/metrics ✅; embeddings (#7), audio (#12), `/v1/debug/*` (#13) missing |
+| 9 | API surface | 🟡 Partial | chat/completions/models/sessions/status/metrics/audio ✅; embeddings (#7), `/v1/debug/*` (#13) missing |
 | 11,12,15 | Testing, design decisions | ✅ Done | coverage ~77% |
 | 16 | Quantized models | ✅ Done | EP select + int8 KV; fp8 KV = #15 |
 | 17 | Diffusion pipeline (image) | ❌ Missing | #16 |
 | 18,19 | ORT wrapper, dep graph | ✅ Done | |
-| 20 | Generalized pipeline | 🟡 Partial | AR/composite/single-pass/vision ✅; iterative/audio pending |
+| 20 | Generalized pipeline | 🟡 Partial | AR/composite/single-pass/vision/audio ✅; iterative diffusion pending |
 | 21 | Tool use / function calling | ✅ Done | Hermes-verified E2E |
 | 22 | Grammar constrained decoding | ✅ Done | llguidance JSON-schema/regex/lark |
 | 23 | FIM / infilling | ✅ Done | engine + `POST /v1/completions` |
@@ -29,15 +29,17 @@ _Last updated: 2026-07-12_
 | 31 | Observability | 🟡 Partial | `/metrics` + `/v1/status` + trace ids ✅; Perfetto/OTLP/debug = #13 |
 | 32 | Metrics API | ✅ Done | |
 | 34 | Cluster/session router | ❌ Missing | |
-| 35 | Native preprocessing | 🟡 Partial | `onnx-genai-preprocess` crate: image (bicubic/CLIP) + audio log-mel ✅; audio wiring = #12 |
+| 35 | Native preprocessing | 🟡 Partial | `onnx-genai-preprocess` crate: image (bicubic/CLIP) + audio log-mel ✅; audio wired ✅ (#12); vision tiling remainder = #14 |
 | 36 | Backpressure/lifecycle | 🟡 Partial | admission cap + 429 ✅; queue-depth config pending |
 | 37 | Model lifecycle mgmt | ❌ Missing | single model at startup; #9 |
 | 38 | Distributed KV connector | ❌ Missing | local tiered KV only |
+| 39 | Paged/radix attention | 🟡 Upstream | Mobius block-table KV graph (Option C, std ops) = draft PR onnxruntime/mobius#395; runtime wiring pending |
+| 40 | Sliding window attention | ❌ Missing | new design section; long context on limited HW — not yet implemented |
 
 ## Open backlog (GitHub issues)
 
-- **#7** `/v1/embeddings` · **#8** logprobs · **#9** model lifecycle/multi-model · **#10** EAGLE-3 proposer · **#12** audio input (`input_audio` + `/v1/audio/transcriptions`) · **#13** debug endpoints + Perfetto · **#14** vision preprocessing (tiling/anyres remainder) · **#15** fp8 KV quant · **#16** image diffusion.
-- Closed: **#2** server split · **#3** decode ownership · **#4** FIM endpoint · **#5** benchmarks · **#11** audio log-mel preprocessing.
+- **#7** `/v1/embeddings` · **#8** logprobs · **#9** model lifecycle/multi-model · **#10** EAGLE-3 proposer · **#13** debug endpoints + Perfetto · **#14** vision preprocessing (tiling/anyres remainder) · **#15** fp8 KV quant · **#16** image diffusion.
+- Closed: **#2** server split · **#3** decode ownership · **#4** FIM endpoint · **#5** benchmarks · **#11** audio log-mel preprocessing · **#12** audio input.
 
 ## Recently completed (this session)
 
@@ -47,5 +49,5 @@ Complete runtime built from scaffold + published: generation (greedy/speculative
 
 - Preprocessing lives in its own crate `onnx-genai-preprocess` (§35).
 - Real-model exact-equality tests use `intra_op_threads=1` (ORT FP determinism).
-- Paged attention deferred: Mobius lacks block-table KV (contiguous static-cache only).
+- Paged/radix attention (§39.4 Option C): Mobius now grows block-table KV via standard ONNX ops (ScatterND + Gather + opset-24 Attention) — draft PR onnxruntime/mobius#395. Same op path supports vLLM PagedAttention AND SGLang RadixAttention (share physical pages via block_table). Runtime-side wiring to consume paged KV is the next step once the PR lands.
 - Audio & vision quality gated on real Mobius model packages (Whisper / CLIP+decoder).
