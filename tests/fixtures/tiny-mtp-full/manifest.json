@@ -1,0 +1,219 @@
+{
+  "generator": "scripts/build_tiny_mtp_full.py",
+  "mobius_root": "/Users/justinc/Documents/GitHub/mobius",
+  "seed": 20260712,
+  "purpose": "Random deterministic target+MTP fixture for end-to-end orchestration tests.",
+  "config": {
+    "target_architecture": "GPT2CausalLMWithHidden",
+    "mtp_architecture": "Qwen35MtpModel",
+    "vocab_size": 32,
+    "hidden_size": 16,
+    "intermediate_size": 32,
+    "num_hidden_layers": 1,
+    "num_attention_heads": 2,
+    "target_num_key_value_heads": 2,
+    "mtp_num_key_value_heads": 1,
+    "head_dim": 8,
+    "layer_types": [
+      "full_attention"
+    ],
+    "output_layer_indices": [
+      0
+    ]
+  },
+  "target": {
+    "inputs": [
+      {
+        "name": "input_ids",
+        "dtype": "INT64",
+        "shape": [
+          "batch",
+          "sequence_len"
+        ]
+      },
+      {
+        "name": "attention_mask",
+        "dtype": "INT64",
+        "shape": [
+          "batch",
+          "past_seq_len + seq_len"
+        ]
+      },
+      {
+        "name": "position_ids",
+        "dtype": "INT64",
+        "shape": [
+          "batch",
+          "sequence_len"
+        ]
+      },
+      {
+        "name": "past_key_values.0.key",
+        "dtype": "FLOAT",
+        "shape": [
+          "batch",
+          "2",
+          "past_sequence_len",
+          "8"
+        ]
+      },
+      {
+        "name": "past_key_values.0.value",
+        "dtype": "FLOAT",
+        "shape": [
+          "batch",
+          "2",
+          "past_sequence_len",
+          "8"
+        ]
+      }
+    ],
+    "outputs": [
+      {
+        "name": "logits",
+        "dtype": "FLOAT",
+        "shape": [
+          "batch",
+          "sequence_len",
+          "32"
+        ]
+      },
+      {
+        "name": "present.0.key",
+        "dtype": "FLOAT",
+        "shape": [
+          "batch",
+          "2",
+          "past_sequence_len + sequence_len",
+          "8"
+        ]
+      },
+      {
+        "name": "present.0.value",
+        "dtype": "FLOAT",
+        "shape": [
+          "batch",
+          "2",
+          "past_sequence_len + sequence_len",
+          "8"
+        ]
+      },
+      {
+        "name": "hidden_states.0",
+        "dtype": "FLOAT",
+        "shape": [
+          "batch",
+          "sequence_len",
+          "16"
+        ]
+      }
+    ]
+  },
+  "mtp_head": {
+    "inputs": [
+      {
+        "name": "inputs_embeds",
+        "dtype": "FLOAT",
+        "shape": [
+          "batch",
+          "sequence_len",
+          "16"
+        ]
+      },
+      {
+        "name": "hidden_states",
+        "dtype": "FLOAT",
+        "shape": [
+          "batch",
+          "sequence_len",
+          "16"
+        ]
+      },
+      {
+        "name": "attention_mask",
+        "dtype": "INT64",
+        "shape": [
+          "batch",
+          "past_seq_len + seq_len"
+        ]
+      },
+      {
+        "name": "position_ids",
+        "dtype": "INT64",
+        "shape": [
+          "batch",
+          "sequence_len"
+        ]
+      },
+      {
+        "name": "past_key_values.0.key",
+        "dtype": "FLOAT",
+        "shape": [
+          "batch",
+          "1",
+          "past_sequence_len",
+          "8"
+        ]
+      },
+      {
+        "name": "past_key_values.0.value",
+        "dtype": "FLOAT",
+        "shape": [
+          "batch",
+          "1",
+          "past_sequence_len",
+          "8"
+        ]
+      }
+    ],
+    "outputs": [
+      {
+        "name": "mtp_hidden",
+        "dtype": "FLOAT",
+        "shape": [
+          "batch",
+          "sequence_len",
+          "16"
+        ]
+      },
+      {
+        "name": "present.0.key",
+        "dtype": "FLOAT",
+        "shape": [
+          "batch",
+          "1",
+          "past_sequence_len + sequence_len",
+          "8"
+        ]
+      },
+      {
+        "name": "present.0.value",
+        "dtype": "FLOAT",
+        "shape": [
+          "batch",
+          "1",
+          "past_sequence_len + sequence_len",
+          "8"
+        ]
+      }
+    ]
+  },
+  "runtime": {
+    "target_hidden_output": "hidden_states.0",
+    "embedding_weights": "embedding.f32",
+    "embedding_layout": "[vocab, hidden]",
+    "lm_head_weights": "lm_head.f32",
+    "lm_head_layout": "[hidden, vocab]",
+    "mtp_head_model": "mtp/model.onnx",
+    "mtp_kv_mode": "HiddenThreaded"
+  },
+  "files": {
+    "embedding.f32": 2048,
+    "lm_head.f32": 2048,
+    "model.onnx": 15972,
+    "model.onnx.data": 13312,
+    "mtp/model.onnx": 27546,
+    "mtp/model.onnx.data": 12288,
+    "tokenizer.json": 2038
+  }
+}
