@@ -2623,3 +2623,284 @@ let engine = EngineBuilder::new(config)
     .with_kv_cache(RingKvCache::new(4096))  // 4K token window
     .build(model_dir)?;
 ```
+
+---
+
+## 26. Multi-Agent Serving
+
+### 26.1 Problem
+
+A local coding agent swarm (e.g., Flightdeck workers) means 5-20+ concurrent agents hitting one GPU. Naive sequential serving wastes compute. We need:
+
+- Multiple agents generating simultaneously (batched forward passes)
+- Agents waiting on tools don't block others
+- Shared system prompt KV across agents (prefix cache)
+- Memory budget so one runaway agent doesn't starve others
+- Priority so interactive requests beat background work
+
+### 26.2 Agent Lifecycle States
+
+```
+┌─────────┐    prefill     ┌───────────┐    token     ┌────────────┐
+│ QUEUED  │──────────────→ │ DECODING  │────────────→ │ DECODING   │──→ ...
+└─────────┘                └───────────┘              └────────────┘
+                                │                           │
+                         tool_call detected          finish/max_tokens
+                                │                           │
+                                ▼                           ▼
+                        ┌──────────────┐           ┌────────────┐
+                        │   PAUSED     │           │  COMPLETE  │
+                        │ (waiting     │           └────────────┘
+                        │  tool result)│
+                        └──────────────┘
+                                │
+                         tool_result arrives
+                                │
+                                ▼
+                        ┌──────────────┐
+                        │  RE-QUEUED   │──→ back to DECODING (KV intact)
+                        └──────────────┘
+```
+
+Key: PAUSED agents keep KV cache allocated but release their batch slot. This is the common state for coding agents (waiting on file I/O, shell commands, etc.).
+
+### 26.3 Priority Classes
+
+```rust
+/// Priority levels for scheduling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum AgentPriority {
+    /// Interactive: user-facing code completion, chat response.
+    /// Preempts everything. Target: first-token < 100ms.
+    Interactive = 0,
+    /// Standard: normal agent generation (tool calls, code gen).
+    Standard = 1,
+    /// Background: indexing, summarization, speculative prefill.
+    /// Gets remaining capacity. Can be fully preempted.
+    Background = 2,
+}
+
+/// Per-session (per-agent) configuration.
+pub struct SessionConfig {
+    pub priority: AgentPriority,
+    /// Maximum KV pages this session can hold.
+    pub max_pages: Option<usize>,
+    /// Maximum tokens per generation step.
+    pub max_tokens_per_turn: u32,
+    /// Timeout before evicting paused session's KV.
+    pub pause_eviction_timeout: Duration,
+}
+```
+
+### 26.4 Memory Budget & Eviction
+
+```rust
+/// Memory budget controller.
+pub struct MemoryBudget {
+    /// Total GPU pages available.
+    total_pages: usize,
+    /// Reserved for interactive requests (guaranteed headroom).
+    interactive_reserve: usize,  // e.g., 20% of total
+    /// Per-session page limits.
+    session_limits: HashMap<SessionId, usize>,
+    /// Eviction order when memory pressure hits.
+    eviction_policy: EvictionPolicy,
+}
+
+pub enum EvictionPolicy {
+    /// Evict lowest-priority sessions first, then LRU within same priority.
+    PriorityThenLru,
+    /// Evict largest sessions first (free most memory per eviction).
+    LargestFirst,
+    /// Evict sessions with best prefix cache hit potential last.
+    PrefixAware,
+}
+
+impl MemoryBudget {
+    /// Can this session allocate more pages?
+    pub fn can_allocate(&self, session: SessionId, num_pages: usize) -> bool { ... }
+    
+    /// Evict sessions until `needed` pages are free.
+    /// Returns evicted session IDs (their KV is offloaded to CPU or dropped).
+    pub fn evict_for(&mut self, needed: usize, exclude: &[SessionId]) -> Vec<SessionId> { ... }
+}
+```
+
+**Eviction tiers:**
+1. Drop background sessions' KV (they can re-prefill cheaply)
+2. Offload paused standard sessions to CPU (swap back on resume)
+3. Preempt running standard sessions (recompute from last checkpoint)
+4. Never touch interactive sessions unless OOM
+
+### 26.5 Batched Prefill (Chunked)
+
+When multiple agents start simultaneously (e.g., Flightdeck spawns 5 workers):
+
+```rust
+/// Chunked prefill: split long prompts into chunks, interleave with decoding.
+pub struct ChunkedPrefillConfig {
+    /// Maximum tokens per prefill chunk.
+    pub chunk_size: usize,  // e.g., 512
+    /// How many prefill chunks to run before yielding to decode.
+    pub chunks_before_yield: usize,  // e.g., 2
+}
+
+// Scheduling within a single forward pass:
+// [Agent A prefill chunk 512tok] + [Agent B decode 1tok] + [Agent C decode 1tok]
+// Next iteration:
+// [Agent A prefill chunk 512tok] + [Agent B decode 1tok] + [Agent C decode 1tok]
+// ...until A's prefill is done, then A joins decode batch.
+```
+
+This prevents a new agent with a 4K prompt from blocking all existing agents for seconds.
+
+### 26.6 Prefix Cache Sharing
+
+Coding agents typically share:
+- System prompt (instructions, tool definitions) — often 2-4K tokens
+- Repository context (common files) — varies
+
+```rust
+/// Prefix cache aware of multi-agent sharing.
+impl PrefixCache {
+    /// Register a prefix as "shared" — never evict while any session references it.
+    pub fn pin_shared_prefix(&mut self, tokens: &[TokenId]) -> PrefixId;
+    
+    /// Attach a session to a shared prefix (CoW fork from prefix end).
+    pub fn attach_to_prefix(&mut self, prefix: PrefixId, session: SessionId) -> Result<()>;
+    
+    /// Stats: how many sessions share this prefix.
+    pub fn prefix_refcount(&self, prefix: PrefixId) -> usize;
+}
+
+// Memory savings example:
+// 10 agents × 3K token system prompt = 30K tokens of KV
+// With prefix sharing: 3K tokens of KV (computed once, shared via CoW pages)
+// Savings: 90% memory reduction for system prompt KV
+```
+
+### 26.7 Scheduling Algorithm
+
+```rust
+impl Scheduler {
+    /// Core scheduling loop: called every iteration.
+    pub fn schedule_iteration(&mut self, budget: &MemoryBudget) -> BatchPlan {
+        let mut plan = BatchPlan::new();
+        
+        // 1. Always include interactive decode requests.
+        for session in self.decoding_sessions(AgentPriority::Interactive) {
+            plan.add_decode(session);
+        }
+        
+        // 2. Include standard decode requests up to batch limit.
+        let remaining = self.max_batch_tokens - plan.total_tokens();
+        for session in self.decoding_sessions(AgentPriority::Standard) {
+            if plan.total_tokens() + 1 > self.max_batch_tokens { break; }
+            plan.add_decode(session);
+        }
+        
+        // 3. Interleave prefill chunks if capacity remains.
+        let prefill_budget = remaining.min(self.chunked_prefill.chunk_size);
+        if let Some(prefilling) = self.next_prefill_session() {
+            plan.add_prefill_chunk(prefilling, prefill_budget);
+        }
+        
+        // 4. Background decode gets whatever's left.
+        for session in self.decoding_sessions(AgentPriority::Background) {
+            if plan.total_tokens() >= self.max_batch_tokens { break; }
+            plan.add_decode(session);
+        }
+        
+        plan
+    }
+}
+
+pub struct BatchPlan {
+    /// Decode steps: each contributes 1 token to the batch.
+    pub decode: Vec<SessionId>,
+    /// Prefill chunk: contributes N tokens from one session.
+    pub prefill: Option<(SessionId, usize)>,
+    /// Total tokens in this forward pass.
+    pub total_tokens: usize,
+}
+```
+
+### 26.8 HTTP API for Multi-Agent
+
+```json
+POST /v1/chat/completions
+{
+  "model": "local-model",
+  "messages": [...],
+  "session_id": "agent-worker-3",
+  "x-priority": "standard",
+  "x-max-pages": 256
+}
+```
+
+Or via header:
+```
+X-Session-Id: agent-worker-3
+X-Priority: interactive
+```
+
+### 26.9 Observability
+
+```rust
+/// Runtime metrics exposed via /v1/status endpoint.
+#[derive(Serialize)]
+pub struct ServerStatus {
+    pub active_sessions: usize,
+    pub decoding_sessions: usize,
+    pub paused_sessions: usize,
+    pub queued_requests: usize,
+    pub gpu_pages_used: usize,
+    pub gpu_pages_total: usize,
+    pub gpu_pages_shared: usize,   // prefix cache shared pages
+    pub batch_utilization: f32,     // avg tokens per forward / max batch tokens
+    pub per_session: Vec<SessionStatus>,
+}
+
+pub struct SessionStatus {
+    pub session_id: String,
+    pub state: SessionState,       // decoding / paused / queued
+    pub priority: AgentPriority,
+    pub kv_pages: usize,
+    pub tokens_generated: usize,
+    pub time_in_queue_ms: u64,
+}
+```
+
+### 26.10 Configuration
+
+```yaml
+# server_config.yaml
+serving:
+  max_batch_tokens: 4096       # max tokens per forward pass
+  max_concurrent_sessions: 32  # hard limit on active sessions
+  
+  memory:
+    total_gpu_pages: 2048
+    interactive_reserve_pct: 20
+    eviction_policy: priority_then_lru
+    offload_to_cpu: true        # swap evicted KV to CPU RAM
+    
+  prefill:
+    chunk_size: 512
+    chunks_before_yield: 2
+    
+  priorities:
+    interactive:
+      max_queue_time_ms: 50
+      preempt_others: true
+    standard:
+      max_queue_time_ms: 5000
+      pause_eviction_timeout_s: 300  # 5 min idle before KV eviction
+    background:
+      max_queue_time_ms: 30000
+      max_pages_per_session: 128     # limit background memory usage
+      
+  prefix_sharing:
+    enabled: true
+    min_refcount_to_pin: 2     # pin after 2+ sessions use same prefix
+```
