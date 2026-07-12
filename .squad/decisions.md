@@ -83,3 +83,39 @@ Only integration points waiting on Deckard's ORT/tokenizer/model-loader API rema
 **By:** Roy
 **What:** Assessed `docs/DESIGN.md` Phase 1 against current crate sources. Workspace scaffolding exists; metadata, KV, ORT, scheduler, engine, logit processors, server, and facade crates are present, but end-to-end generation is blocked by stub ORT execution, no tokenizer wiring, and no engine generation API/loop. The next increment should prioritize making `onnx-genai-ort` actually load and run a CPU ONNX session, then wire tokenizer/model-dir discovery and a minimal greedy single-sequence engine path.
 **Why:** DESIGN.md Phase 1 exit criteria is loading a Phi-4 ONNX model and generating greedily end-to-end. No other Phase 1 component can be validated against a real model until the ORT wrapper returns real output tensors; this is the highest-leverage unblocker for Deckard, Batty, Rachael, and Pris to parallelize follow-on work.
+
+---
+
+# 2026-07-12T09:15:00-07:00: Phase 1 greedy generation wiring
+
+**By:** Batty
+
+## Decision
+
+`onnx-genai-engine` now loads models through `onnx_genai_ort::ModelDirectory`, creates a CPU `Environment` and `Session`, and loads the colocated HF `Tokenizer`. `Engine::generate` performs real single-sequence greedy generation: tokenize prompt, run prefill, process logits, select argmax when `greedy` or `temperature == 0`, stream token callbacks, detokenize, and stop on EOS, configured stop sequences, or `max_new_tokens`.
+
+## ORT input discovery
+
+The engine introspects `Session::inputs()` for every run. It recognizes `input_ids`, `attention_mask`, `position_ids`, and past key/value inputs by graph name rather than hardcoding one model schema. Unsupported required inputs now return a clear error with the input name and shape.
+
+## KV threading
+
+Phase 1 uses simple model-owned KV tensors, not `onnx-genai-kv` paging. If the graph exposes past key/value inputs and matching present key/value outputs, prefill feeds zero-length Float32 past tensors shaped from `TensorInfo`; each subsequent step feeds only the previously generated token plus the last run's present tensors remapped to the corresponding past input names. If the graph has no KV I/O, the engine falls back to re-feeding the full running sequence each step.
+
+## Termination
+
+The loop stops when tokenizer/default or request EOS is generated, any configured text/token stop sequence matches the generated suffix, or `max_new_tokens` is reached. Final text is decoded from all generated tokens; per-token callback text uses single-token decode for streaming continuity.
+
+---
+
+### 2026-07-12T09:15:00-07:00: Facade generate CLI argument surface
+**By:** Rachael
+**What:** Added the `onnx-genai generate` CLI surface in the facade crate with `--model <DIR>`, optional `--max-new-tokens`, `--temperature`, `--top-p`, `--top-k`, repeatable `--stop`, `--stream`, and a positional prompt. The command maps those flags onto `GenerateOptions::max_new_tokens`, `temperature`, `top_p`, `top_k`, and `stop_sequences` as `StopSequence::Text`, wraps the prompt in `GenerateRequest`, constructs `Engine::from_dir(..., EngineConfig::default())`, then calls `Engine::generate` or `Engine::generate_with_callback` for streaming.
+**Why:** The facade CLI should consume Batty's public generation API directly without redefining types or touching the engine crate, while preserving a simple Phase 1 surface compatible with the documented generation options.
+
+---
+
+### 2026-07-12T09:20:00-07:00: Phase 1 Foundation exit criteria met
+**By:** Scribe
+**What:** Phase 1 Foundation is complete: `onnx-genai generate --model tests/fixtures/tiny-llm "hello world"` runs greedy generation end-to-end through the facade CLI, engine, tokenizer, ORT session, and tiny fixture. `cargo test --workspace` is fully green, and the work is pushed to `origin/main` in the `ccbf81b` range.
+**Why:** The Design Phase 1 exit criterion requires end-to-end greedy generation against a real ONNX model path. Batty's engine wiring, Rachael's CLI facade, Deckard's ORT/tokenizer APIs, and Pris's tiny fixture now satisfy that foundation milestone and unblock Phase 2 Agent Essentials.

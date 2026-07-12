@@ -13,3 +13,6 @@
 ## 2026-07-12T09:13:00-07:00 — ORT session, model-directory, and tokenizer contracts delivered
 - Delivered real CPU `Environment`/`Session` load-run APIs, tensor `Value` helpers, graph metadata accessors, optional IoBinding, `ModelDirectory::load`, and `Tokenizer` encode/decode helpers.
 - Key contract for next-batch wiring: `Session::run` accepts named `Value` inputs and returns outputs ordered by `output_names()` / `outputs()`; tokenizer decode skips special tokens and exposes optional EOS id.
+
+## 2026-07-12T09:20:00-07:00 — ORT/tokenizer APIs enabled Phase 1 E2E
+- The CPU `Session`, graph I/O metadata, tensor `Value` helpers, `ModelDirectory`, and `Tokenizer` APIs enabled Batty and Rachael to complete end-to-end greedy generation via the CLI tiny fixture.
