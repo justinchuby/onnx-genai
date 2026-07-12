@@ -132,7 +132,7 @@ pub enum GenerateConstraint {
 }
 
 impl GenerateOptions {
-    fn validate(&self) -> anyhow::Result<()> {
+    pub(crate) fn validate(&self) -> anyhow::Result<()> {
         if self.max_new_tokens == 0 {
             anyhow::bail!("max_new_tokens must be greater than zero");
         }
@@ -1346,7 +1346,7 @@ struct DraftSession {
 }
 
 #[derive(Debug, Clone)]
-struct KvModelInfo {
+pub(crate) struct KvModelInfo {
     tensor_config: PageTensorConfig,
     layers: Vec<KvLayerIo>,
 }
@@ -1359,15 +1359,15 @@ struct KvLayerIo {
     value_past: String,
 }
 
-struct DecodeState {
-    use_kv: bool,
+pub(crate) struct DecodeState {
+    pub(crate) use_kv: bool,
     past: HashMap<String, Value>,
     present_to_past: HashMap<String, String>,
     kv_inputs: Vec<String>,
 }
 
 impl DecodeState {
-    fn new(session: &Session) -> anyhow::Result<Self> {
+    pub(crate) fn new(session: &Session) -> anyhow::Result<Self> {
         let kv_inputs = session
             .inputs()
             .iter()
@@ -1563,6 +1563,16 @@ fn run_decode_step(
     token_ids: &[TokenId],
     past_len: usize,
 ) -> anyhow::Result<Vec<Value>> {
+    run_decode_step_with_extra(session, decode_state, token_ids, past_len, &[])
+}
+
+pub(crate) fn run_decode_step_with_extra(
+    session: &Session,
+    decode_state: &mut DecodeState,
+    token_ids: &[TokenId],
+    past_len: usize,
+    extra_inputs: &[(String, Value)],
+) -> anyhow::Result<Vec<Value>> {
     if token_ids.is_empty() {
         anyhow::bail!("decode step requires at least one input token");
     }
@@ -1608,9 +1618,11 @@ fn run_decode_step(
                 })?)?
             };
             owned_inputs.push((info.name.clone(), value));
+        } else if let Some((_, value)) = extra_inputs.iter().find(|(name, _)| name == &info.name) {
+            owned_inputs.push((info.name.clone(), clone_value(value)?));
         } else {
             anyhow::bail!(
-                "unsupported model input '{}' with shape {:?}; supported inputs are input_ids, attention_mask, position_ids, and past key-values",
+                "unsupported model input '{}' with shape {:?}; supported inputs are input_ids, attention_mask, position_ids, past key-values, and pipeline-routed extra inputs",
                 info.name,
                 info.shape
             );
@@ -1647,7 +1659,10 @@ fn run_decode_step(
     Ok(outputs)
 }
 
-fn infer_kv_model_info(session: &Session, page_size: usize) -> anyhow::Result<Option<KvModelInfo>> {
+pub(crate) fn infer_kv_model_info(
+    session: &Session,
+    page_size: usize,
+) -> anyhow::Result<Option<KvModelInfo>> {
     let mut key_outputs = Vec::new();
     let mut value_outputs = Vec::new();
     for info in session
@@ -2074,7 +2089,10 @@ fn kv_layer_index(name: &str) -> Option<usize> {
         .and_then(|part| part.parse().ok())
 }
 
-fn extract_next_token_logits(session: &Session, outputs: Vec<Value>) -> anyhow::Result<Vec<f32>> {
+pub(crate) fn extract_next_token_logits(
+    session: &Session,
+    outputs: Vec<Value>,
+) -> anyhow::Result<Vec<f32>> {
     let logits_index = session
         .output_names()
         .iter()
@@ -2200,7 +2218,7 @@ fn empty_past_value(info: &TensorInfo) -> anyhow::Result<Value> {
         .map_err(|e| anyhow::anyhow!("Failed to create empty KV input '{}': {}", info.name, e))
 }
 
-fn clone_value(value: &Value) -> anyhow::Result<Value> {
+pub(crate) fn clone_value(value: &Value) -> anyhow::Result<Value> {
     match value.dtype() {
         DataType::Float32 => Value::from_slice_f32(&value.to_vec_f32()?, value.shape())
             .map_err(|e| anyhow::anyhow!("Failed to clone Float32 ORT value: {}", e)),
@@ -2257,7 +2275,7 @@ fn is_gather_out_of_bounds(message: &str) -> bool {
             || lower.contains("idx=") && lower.contains("out of"))
 }
 
-fn build_processor_chain(
+pub(crate) fn build_processor_chain(
     options: &GenerateOptions,
     tokenizer: Option<&Tokenizer>,
 ) -> anyhow::Result<ProcessorChain> {
@@ -2310,7 +2328,7 @@ fn build_processor_chain(
     Ok(chain)
 }
 
-fn ensure_constrained_finish(
+pub(crate) fn ensure_constrained_finish(
     options: &GenerateOptions,
     generated_text: &str,
     finish_reason: FinishReason,
@@ -2340,7 +2358,7 @@ fn tokenizer_token_texts(tokenizer: &Tokenizer) -> Vec<Option<String>> {
     token_texts
 }
 
-fn select_next_token(
+pub(crate) fn select_next_token(
     logits: &mut [f32],
     context: &ProcessorContext,
     options: &GenerateOptions,
@@ -2355,7 +2373,7 @@ fn select_next_token(
     }
 }
 
-fn finish_reason_after_token(
+pub(crate) fn finish_reason_after_token(
     token_id: TokenId,
     options: &GenerateOptions,
     chain: &ProcessorChain,

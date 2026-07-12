@@ -19,3 +19,4 @@ pub use engine::{
     PrioritizedGenerateRequest, PrioritizedGenerateResult, ScheduledGenerateArrival, SessionId,
 };
 pub use logits::{Constraint, JsonConstraint, StopSequence, TokenId};
+pub use pipeline::{PipelineEngine, PipelineGenerateRequest, PipelineTensors};
