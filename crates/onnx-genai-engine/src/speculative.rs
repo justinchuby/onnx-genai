@@ -6,9 +6,9 @@
 
 use crate::TokenId;
 use crate::decode::{
-    extract_logits_sequence, next_session_token_logits, next_session_token_logits_and_hidden,
-    next_session_token_logits_and_hiddens, propose_draft_tokens, run_decode_session_logits,
-    run_decode_step,
+    apply_paged_sliding_window, extract_logits_sequence, next_session_token_logits,
+    next_session_token_logits_and_hidden, next_session_token_logits_and_hiddens,
+    propose_draft_tokens, run_decode_session_logits, run_decode_step,
 };
 use crate::decode_loop::{
     DecodeLoopState, commit_selected_token, logprob_for_token, reached_context_limit,
@@ -839,6 +839,7 @@ impl Engine {
                 state.kv_token_count += draft_tokens.len();
                 logits
             } else {
+                let retained_base_len = state.decode_state.retained_kv_len(base_len);
                 let outputs = run_decode_step(
                     &self.session,
                     &mut state.decode_state,
@@ -853,7 +854,7 @@ impl Engine {
                             &mut self.kv_cache,
                             session_id,
                             &outputs,
-                            base_len,
+                            retained_base_len,
                             draft_tokens.len(),
                         )?;
                     } else {
@@ -864,6 +865,11 @@ impl Engine {
                             })?;
                     }
                     state.kv_token_count += draft_tokens.len();
+                    apply_paged_sliding_window(
+                        &mut self.kv_cache,
+                        session_id,
+                        state.decode_state.sliding_window(),
+                    )?;
                 }
                 extract_logits_sequence(&self.session, outputs)?
             };

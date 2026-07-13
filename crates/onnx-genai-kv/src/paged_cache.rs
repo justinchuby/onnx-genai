@@ -27,6 +27,8 @@ pub struct MaterializedLayerKv {
 /// Materialized K/V tensors for all layers over a sequence.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MaterializedKv {
+    /// Absolute position of the first token in these tensors.
+    pub start_position: usize,
     pub sequence_len: usize,
     pub num_kv_heads: usize,
     pub head_dim: usize,
@@ -95,6 +97,13 @@ impl PagedKvCache {
         self.validate_layers(config, layers)?;
 
         let len = self.len(seq)?;
+        let start = self.retained_start(seq)?;
+        if position < start {
+            return Err(KvError::PositionEvicted {
+                position,
+                retained_start: start,
+            });
+        }
         if position > len {
             return Err(KvError::InvalidPosition {
                 position,
@@ -102,8 +111,9 @@ impl PagedKvCache {
             });
         }
 
-        let page_index = position / self.page_table.page_size;
-        let token_offset = position % self.page_table.page_size;
+        let retained_position = position - start;
+        let page_index = retained_position / self.page_table.page_size;
+        let token_offset = retained_position % self.page_table.page_size;
         let page_id = self.ensure_page_for_write(seq, page_index)?;
         self.page_table.promote_to_hot(page_id)?;
 
@@ -164,7 +174,9 @@ impl PagedKvCache {
             .page_table
             .tensor_config
             .ok_or(KvError::TensorStorageNotConfigured)?;
-        let len = self.len(seq)?;
+        let start = self.retained_start(seq)?;
+        let end = self.len(seq)?;
+        let len = end - start;
         let pages = self
             .page_table
             .get_sequence(seq)
@@ -206,6 +218,7 @@ impl PagedKvCache {
         }
 
         Ok(MaterializedKv {
+            start_position: start,
             sequence_len: len,
             num_kv_heads: config.num_kv_heads,
             head_dim: config.head_dim,
@@ -218,9 +231,63 @@ impl PagedKvCache {
         &mut self,
         seq: SequenceId,
     ) -> Result<MaterializedKv, KvError> {
+        let start = self.retained_start(seq)?;
         let len = self.len(seq)?;
-        self.prefetch(seq, 0, len)?;
+        self.prefetch(seq, start, len)?;
         self.materialize_sequence(seq)
+    }
+
+    /// Absolute range of KV positions currently retained for `seq`.
+    pub fn retained_range(&self, seq: SequenceId) -> Result<std::ops::Range<usize>, KvError> {
+        Ok(self.retained_start(seq)?..self.len(seq)?)
+    }
+
+    /// Number of KV tokens currently retained for `seq`.
+    pub fn retained_len(&self, seq: SequenceId) -> Result<usize, KvError> {
+        let range = self.retained_range(seq)?;
+        Ok(range.end - range.start)
+    }
+
+    /// Free complete leading pages that are older than the sliding window.
+    ///
+    /// The logical sequence length remains absolute, while the retained start
+    /// advances by page-sized increments. At most `window_size + page_size - 1`
+    /// tokens remain because a partially overlapping page is preserved.
+    pub fn apply_sliding_window(
+        &mut self,
+        seq: SequenceId,
+        window_size: usize,
+    ) -> Result<usize, KvError> {
+        if window_size == 0 {
+            return Err(KvError::InvalidWindowSize);
+        }
+        let start = self.retained_start(seq)?;
+        let end = self.len(seq)?;
+        let keep_from = end.saturating_sub(window_size);
+        let pages_to_free = keep_from
+            .saturating_sub(start)
+            .checked_div(self.page_table.page_size)
+            .unwrap_or(0);
+        if pages_to_free == 0 {
+            return Ok(0);
+        }
+
+        let removed = {
+            let pages = self
+                .page_table
+                .sequences
+                .get_mut(&seq)
+                .ok_or(KvError::SequenceNotFound(seq))?;
+            pages
+                .drain(..pages_to_free.min(pages.len()))
+                .collect::<Vec<_>>()
+        };
+        for page_id in &removed {
+            self.page_table.free(*page_id);
+        }
+        self.page_table
+            .set_sequence_start(seq, start + removed.len() * self.page_table.page_size);
+        Ok(removed.len())
     }
 
     /// Evict pages to free memory. Returns number of pages freed.
@@ -247,7 +314,14 @@ impl PagedKvCache {
         start: usize,
         end: usize,
     ) -> Result<usize, KvError> {
+        let retained_start = self.retained_start(seq)?;
         let len = self.len(seq)?;
+        if start < retained_start {
+            return Err(KvError::PositionEvicted {
+                position: start,
+                retained_start,
+            });
+        }
         if start > end || end > len {
             return Err(KvError::InvalidPosition {
                 position: end,
@@ -258,8 +332,8 @@ impl PagedKvCache {
             return Ok(0);
         }
         let page_size = self.page_table.page_size;
-        let first_page = start / page_size;
-        let last_page = (end - 1) / page_size;
+        let first_page = (start - retained_start) / page_size;
+        let last_page = (end - 1 - retained_start) / page_size;
         let page_ids = self
             .page_table
             .get_sequence(seq)
@@ -372,17 +446,31 @@ impl PagedKvCache {
         self.page_table.push_page(seq, page_id);
         Ok(page_id)
     }
+
+    fn retained_start(&self, seq: SequenceId) -> Result<usize, KvError> {
+        self.page_table
+            .sequence_start(seq)
+            .ok_or(KvError::SequenceNotFound(seq))
+    }
 }
 
 impl KvCacheOps for PagedKvCache {
     fn rewind_to(&mut self, seq: SequenceId, position: usize) -> Result<(), KvError> {
+        let retained_start = self.retained_start(seq)?;
         let length = self.len(seq)?;
+        if position < retained_start {
+            return Err(KvError::PositionEvicted {
+                position,
+                retained_start,
+            });
+        }
         if position > length {
             return Err(KvError::InvalidPosition { position, length });
         }
 
         let page_size = self.page_table.page_size;
-        let pages_needed = position.div_ceil(page_size);
+        let retained_position = position - retained_start;
+        let pages_needed = retained_position.div_ceil(page_size);
 
         let current_pages = self
             .page_table
@@ -396,8 +484,8 @@ impl KvCacheOps for PagedKvCache {
         if let Some(seq_pages) = self.page_table.sequences.get_mut(&seq) {
             seq_pages.truncate(pages_needed);
         }
-        if position > 0 {
-            let last_offset = (position - 1) % page_size + 1;
+        if retained_position > 0 {
+            let last_offset = (retained_position - 1) % page_size + 1;
             if let Some(&last_page_id) = self.page_table.sequences.get(&seq).and_then(|p| p.last())
                 && let Some(page) = self.page_table.pages.get_mut(&last_page_id)
             {
@@ -410,13 +498,20 @@ impl KvCacheOps for PagedKvCache {
     }
 
     fn fork(&mut self, source: SequenceId, position: usize) -> Result<SequenceId, KvError> {
+        let retained_start = self.retained_start(source)?;
         let length = self.len(source)?;
+        if position < retained_start {
+            return Err(KvError::PositionEvicted {
+                position,
+                retained_start,
+            });
+        }
         if position > length {
             return Err(KvError::InvalidPosition { position, length });
         }
 
         let page_size = self.page_table.page_size;
-        let pages_needed = position.div_ceil(page_size);
+        let pages_needed = (position - retained_start).div_ceil(page_size);
         let source_pages = self
             .page_table
             .get_sequence(source)
@@ -427,6 +522,7 @@ impl KvCacheOps for PagedKvCache {
             .collect::<Vec<_>>();
 
         let new_seq = self.create_sequence();
+        self.page_table.set_sequence_start(new_seq, retained_start);
         for page_id in &source_pages {
             self.page_table.retain(*page_id);
             self.page_table.push_page(new_seq, *page_id);
@@ -450,15 +546,24 @@ impl KvCacheOps for PagedKvCache {
     }
 
     fn restore(&mut self, seq: SequenceId, checkpoint: CacheCheckpoint) -> Result<(), KvError> {
+        let retained_start = self.retained_start(seq)?;
+        if checkpoint.position < retained_start {
+            return Err(KvError::PositionEvicted {
+                position: checkpoint.position,
+                retained_start,
+            });
+        }
         self.rewind_to(seq, checkpoint.position)
     }
 
     fn append(&mut self, seq: SequenceId, num_tokens: usize) -> Result<(), KvError> {
         let length = self.len(seq)?;
+        let retained_start = self.retained_start(seq)?;
         let page_size = self.page_table.page_size;
         for position in length..length + num_tokens {
-            let page_index = position / page_size;
-            let token_offset = position % page_size;
+            let retained_position = position - retained_start;
+            let page_index = retained_position / page_size;
+            let token_offset = retained_position % page_size;
             let page_id = self.ensure_page_for_write(seq, page_index)?;
             self.page_table.promote_to_hot(page_id)?;
             if let Some(page) = self.page_table.pages.get_mut(&page_id) {
@@ -587,9 +692,78 @@ mod tests {
                     expected_v.extend_from_slice(&token[layer_idx].1[head * 3..head * 3 + 3]);
                 }
             }
+
             assert_eq!(materialized.layers[layer_idx].key, expected_k);
             assert_eq!(materialized.layers[layer_idx].value, expected_v);
         }
+    }
+
+    #[test]
+    fn sliding_window_evicts_leading_pages_and_preserves_absolute_positions() {
+        let mut cache = PagedKvCache::new_with_tensor_config(config(), 8);
+        let seq = cache.create_sequence();
+        for position in 0..9 {
+            let token = layers(position as f32 * 1000.0);
+            cache
+                .append_token_kv(seq, &borrowed_layers(&token))
+                .unwrap();
+        }
+
+        assert_eq!(cache.apply_sliding_window(seq, 3).unwrap(), 3);
+        assert_eq!(cache.len(seq).unwrap(), 9);
+        assert_eq!(cache.retained_range(seq).unwrap(), 6..9);
+        assert_eq!(cache.page_table.get_sequence(seq).unwrap().len(), 2);
+
+        for position in 9..11 {
+            let token = layers(position as f32 * 1000.0);
+            assert_eq!(
+                cache
+                    .append_token_kv(seq, &borrowed_layers(&token))
+                    .unwrap(),
+                position
+            );
+            cache.apply_sliding_window(seq, 3).unwrap();
+        }
+
+        assert_eq!(cache.len(seq).unwrap(), 11);
+        assert_eq!(cache.retained_range(seq).unwrap(), 8..11);
+        assert!(matches!(
+            cache.rewind_to(seq, 7),
+            Err(KvError::PositionEvicted {
+                position: 7,
+                retained_start: 8
+            })
+        ));
+        cache.rewind_to(seq, 10).unwrap();
+        assert_eq!(cache.retained_range(seq).unwrap(), 8..10);
+
+        let materialized = cache.materialize_sequence(seq).unwrap();
+        assert_eq!(materialized.start_position, 8);
+        assert_eq!(materialized.sequence_len, 2);
+        for layer_idx in 0..2 {
+            let expected = [layers(8000.0), layers(9000.0)];
+            let mut expected_k = Vec::new();
+            let mut expected_v = Vec::new();
+            for head in 0..2 {
+                for token in &expected {
+                    expected_k.extend_from_slice(&token[layer_idx].0[head * 3..head * 3 + 3]);
+                    expected_v.extend_from_slice(&token[layer_idx].1[head * 3..head * 3 + 3]);
+                }
+            }
+            assert_eq!(materialized.layers[layer_idx].key, expected_k);
+            assert_eq!(materialized.layers[layer_idx].value, expected_v);
+        }
+    }
+
+    #[test]
+    fn cache_without_sliding_window_retains_full_sequence() {
+        let mut cache = PagedKvCache::new(2, 4);
+        let seq = cache.create_sequence();
+        cache.append(seq, 7).unwrap();
+
+        assert_eq!(cache.len(seq).unwrap(), 7);
+        assert_eq!(cache.retained_range(seq).unwrap(), 0..7);
+        assert_eq!(cache.page_table.get_sequence(seq).unwrap().len(), 4);
     }
 
     #[test]

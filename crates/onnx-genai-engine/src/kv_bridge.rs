@@ -122,11 +122,8 @@ pub(crate) fn infer_kv_heads_and_head_dim(info: &TensorInfo) -> anyhow::Result<(
 
 /// KV present/past tensor element types the runtime can consume.
 ///
-/// The host paged-mirror path ([`mirror_present_kv_to_pages`]) only reads fp32
-/// data, but fp16 KV is valid for on-device / share-buffer decode runners that
-/// never round-trip KV through the host cache. Accepting both here unblocks
-/// loading fp16 GroupQueryAttention (GQA) WebGPU exports while keeping the fp32
-/// legacy path intact.
+/// The host paged-mirror path widens fp16 values to fp32 page storage. Shared
+/// buffers keep their native dtype and never round-trip through the host cache.
 fn is_supported_kv_dtype(dtype: DataType) -> bool {
     matches!(dtype, DataType::Float32 | DataType::Float16)
 }
@@ -146,16 +143,6 @@ pub(crate) fn mirror_present_kv_to_pages(
         .enumerate()
         .map(|(idx, name)| (name.as_str(), idx))
         .collect::<HashMap<_, _>>();
-    if let Some(layer) = kv_model.layers.first()
-        && let Some(&idx) = output_lookup.get(layer.key_present.as_str())
-        && outputs[idx].dtype() != DataType::Float32
-    {
-        anyhow::bail!(
-            "host KV mirroring requires Float32 present KV, but '{}' is {:?}; fp16/share-buffer KV must use a device-resident decode runner",
-            layer.key_present,
-            outputs[idx].dtype()
-        );
-    }
     let layer_data = kv_model
         .layers
         .iter()
@@ -163,7 +150,7 @@ pub(crate) fn mirror_present_kv_to_pages(
             let key = outputs[*output_lookup
                 .get(layer.key_present.as_str())
                 .with_context(|| format!("missing output '{}'", layer.key_present))?]
-            .to_vec_f32()?;
+            .to_vec_f32_lossy()?;
             let key_shape = outputs[*output_lookup
                 .get(layer.key_present.as_str())
                 .with_context(|| format!("missing output '{}'", layer.key_present))?]
@@ -172,7 +159,7 @@ pub(crate) fn mirror_present_kv_to_pages(
             let value = outputs[*output_lookup
                 .get(layer.value_present.as_str())
                 .with_context(|| format!("missing output '{}'", layer.value_present))?]
-            .to_vec_f32()?;
+            .to_vec_f32_lossy()?;
             let value_shape = outputs[*output_lookup
                 .get(layer.value_present.as_str())
                 .with_context(|| format!("missing output '{}'", layer.value_present))?]
@@ -243,6 +230,12 @@ pub(crate) fn load_materialized_past(
     decode_state: &mut DecodeState,
     materialized: &onnx_genai_kv::MaterializedKv,
 ) -> anyhow::Result<()> {
+    if materialized.start_position != 0 {
+        anyhow::bail!(
+            "cannot load paged KV starting at absolute position {} into a contiguous past/present graph",
+            materialized.start_position
+        );
+    }
     let input_shapes = session
         .inputs()
         .iter()
@@ -398,6 +391,14 @@ pub(crate) fn rewind_decode_state_to_len(
         *kv_token_count = len;
         return Ok(());
     }
+    if decode_state.is_windowed() {
+        decode_state.rewind_windowed(*kv_token_count, len)?;
+        kv_cache
+            .rewind_to(seq, len)
+            .map_err(|e| anyhow::anyhow!("Failed to rewind KV sequence {seq} to {len}: {}", e))?;
+        *kv_token_count = len;
+        return Ok(());
+    }
     if kv_model.is_none() && *kv_token_count != len {
         anyhow::bail!("cannot rewind ORT KV tensors without paged KV materialization");
     }
@@ -485,7 +486,9 @@ pub(crate) fn kv_layer_index(name: &str) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::decode::{ModelDecodePath, run_decode_session_logits};
+    use crate::decode::{
+        ModelDecodePath, detect_model_decode_path, run_decode_session_logits, run_decode_step,
+    };
     use onnx_genai_kv::{KvCacheOps, MaterializedLayerKv};
     use onnx_genai_ort::{Environment, SessionOptions};
     use std::path::{Path, PathBuf};
@@ -683,6 +686,7 @@ mod tests {
         let (_environment, session) = load_session("tiny-llm")?;
         let model = infer_kv_model_info(&session, 2)?.unwrap();
         let materialized = onnx_genai_kv::MaterializedKv {
+            start_position: 0,
             sequence_len: 2,
             num_kv_heads: 2,
             head_dim: 8,
@@ -827,6 +831,7 @@ mod tests {
                 ModelDecodePath::PastPresent {
                     shared_buffer: false,
                     max_len: None,
+                    sliding_window: None,
                 },
             ),
         ] {
@@ -844,6 +849,32 @@ mod tests {
             assert_eq!(state.runner_len(), 1);
             assert_eq!(cache.len(seq)?, 1);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn windowed_past_present_keeps_absolute_positions_with_bounded_past() -> anyhow::Result<()> {
+        let _guard = model_test_lock();
+        let (_environment, session) = load_session("tiny-llm")?;
+        let path = detect_model_decode_path(&session, None, None, Some(2))?;
+        assert!(matches!(
+            path,
+            ModelDecodePath::PastPresent {
+                shared_buffer: false,
+                max_len: None,
+                sliding_window: Some(2)
+            }
+        ));
+        let mut state = DecodeState::new_for_path(&session, &path)?;
+
+        run_decode_step(&session, &mut state, &[2, 4], 0)?;
+        assert_eq!(state.retained_kv_len(2), 2);
+        assert!(state.past.values().all(|value| value.shape()[2] == 2));
+
+        run_decode_step(&session, &mut state, &[3], 2)?;
+        assert_eq!(state.retained_kv_len(3), 2);
+        assert!(state.past.values().all(|value| value.shape()[2] == 2));
+        assert!(detect_model_decode_path(&session, Some(16), Some(16), Some(2)).is_err());
         Ok(())
     }
 

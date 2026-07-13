@@ -642,6 +642,7 @@ impl Engine {
             ModelDecodePath::PastPresent {
                 shared_buffer: true,
                 max_len,
+                ..
             } => max_len,
             ModelDecodePath::PastPresent { .. } | ModelDecodePath::Legacy => None,
         };

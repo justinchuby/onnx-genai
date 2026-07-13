@@ -81,6 +81,13 @@ pub enum KvError {
     OutOfMemory { needed: usize, available: usize },
     #[error("Invalid position {position} for sequence length {length}")]
     InvalidPosition { position: usize, length: usize },
+    #[error("Position {position} was evicted; first retained position is {retained_start}")]
+    PositionEvicted {
+        position: usize,
+        retained_start: usize,
+    },
+    #[error("Sliding-window size must be greater than zero")]
+    InvalidWindowSize,
     #[error("Tensor storage is not configured for this cache")]
     TensorStorageNotConfigured,
     #[error("Invalid KV tensor shape: {0}")]

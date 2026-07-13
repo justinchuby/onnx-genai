@@ -155,8 +155,13 @@ impl Engine {
         // onnxruntime-genai's genai_config.json, drives the runtime-owned
         // share-buffer KV path for GQA models.
         let shared_kv_max_len = crate::decode::shared_kv_buffer_len_from_metadata(&metadata);
-        let decode_path =
-            detect_model_decode_path(&session, metadata_max_context, shared_kv_max_len)?;
+        let sliding_window = crate::decode::sliding_window_from_metadata(&metadata)?;
+        let decode_path = detect_model_decode_path(
+            &session,
+            metadata_max_context,
+            shared_kv_max_len,
+            sliding_window,
+        )?;
         let tokenizer = Tokenizer::from_file(&model_directory.tokenizer_path)
             .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {}", e))?;
         let fim_config = load_fim_config_from_model_dir(&model_directory.root)?;
@@ -171,7 +176,7 @@ impl Engine {
             )
             .map_err(|e| anyhow::anyhow!("Failed to load draft ORT session: {}", e))?;
             let draft_decode_path =
-                detect_model_decode_path(&draft_session, metadata_max_context, None)?;
+                detect_model_decode_path(&draft_session, metadata_max_context, None, None)?;
             let draft_kv_model = infer_kv_model_info(&draft_session, config.page_size)?;
             let draft_kv_cache = if let Some(kv_model) = &draft_kv_model {
                 PagedKvCache::new_with_tensor_config(kv_model.tensor_config, config.num_gpu_pages)
@@ -804,6 +809,7 @@ impl Engine {
             ModelDecodePath::PastPresent {
                 shared_buffer: true,
                 max_len,
+                ..
             } => max_len,
             ModelDecodePath::PastPresent { .. } | ModelDecodePath::Legacy => None,
         }
@@ -836,7 +842,7 @@ impl Engine {
         let mut loaded_prompt_prefix = 0;
         let mut cross_session_hit_len = 0;
 
-        if started_empty && state.decode_state.has_runner() {
+        if started_empty && state.decode_state.uses_token_prefix_cache() {
             cross_session_hit_len = self
                 .token_prefix_cache
                 .iter()
@@ -1054,7 +1060,7 @@ impl Engine {
         state: &EngineSession,
         prompt_len: usize,
     ) -> anyhow::Result<()> {
-        if state.decode_state.has_runner() {
+        if state.decode_state.uses_token_prefix_cache() {
             if prompt_len > 0 && prompt_len <= state.kv_token_count {
                 self.insert_token_prefix(&state.tokens[..prompt_len]);
             }

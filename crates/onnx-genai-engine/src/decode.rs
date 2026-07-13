@@ -32,6 +32,7 @@ pub(crate) enum ModelDecodePath {
     PastPresent {
         shared_buffer: bool,
         max_len: Option<usize>,
+        sliding_window: Option<usize>,
     },
     Legacy,
 }
@@ -136,6 +137,8 @@ pub(crate) struct DecodeState {
     pub(crate) past: HashMap<String, Value>,
     pub(crate) present_to_past: HashMap<String, String>,
     pub(crate) kv_inputs: Vec<String>,
+    sliding_window: Option<usize>,
+    retained_kv_len: usize,
     runner: Option<DecodeRunner>,
 }
 
@@ -160,6 +163,8 @@ impl DecodeState {
                 past: HashMap::new(),
                 present_to_past: HashMap::new(),
                 kv_inputs,
+                sliding_window: None,
+                retained_kv_len: 0,
                 runner: None,
             });
         }
@@ -187,6 +192,8 @@ impl DecodeState {
             past: HashMap::new(),
             present_to_past,
             kv_inputs,
+            sliding_window: None,
+            retained_kv_len: 0,
             runner: None,
         })
     }
@@ -199,6 +206,8 @@ impl DecodeState {
                 past: HashMap::new(),
                 present_to_past: HashMap::new(),
                 kv_inputs: Vec::new(),
+                sliding_window: None,
+                retained_kv_len: 0,
                 runner: Some(DecodeRunner::StaticCache(StaticCacheDecodeSession::new(
                     stable_session_ref(session),
                     StaticCacheDecodeOptions { batch_size: 1 },
@@ -207,9 +216,11 @@ impl DecodeState {
             ModelDecodePath::PastPresent {
                 shared_buffer,
                 max_len,
+                sliding_window,
             } => {
                 let mut state = Self::new(session)?;
-                if state.use_kv {
+                state.sliding_window = *sliding_window;
+                if state.use_kv && sliding_window.is_none() {
                     state.runner = Some(DecodeRunner::PastPresent(DecodeSession::new(
                         stable_session_ref(session),
                         DecodeSessionOptions {
@@ -226,6 +237,26 @@ impl DecodeState {
 
     pub(crate) fn has_runner(&self) -> bool {
         self.runner.is_some()
+    }
+
+    pub(crate) fn is_windowed(&self) -> bool {
+        self.sliding_window.is_some()
+    }
+
+    pub(crate) fn sliding_window(&self) -> Option<usize> {
+        self.sliding_window
+    }
+
+    pub(crate) fn uses_token_prefix_cache(&self) -> bool {
+        self.has_runner() || self.is_windowed()
+    }
+
+    pub(crate) fn retained_kv_len(&self, absolute_past_len: usize) -> usize {
+        if self.is_windowed() {
+            self.retained_kv_len
+        } else {
+            absolute_past_len
+        }
     }
 
     pub(crate) fn runner_len(&self) -> usize {
@@ -246,6 +277,74 @@ impl DecodeState {
         }
         Ok(())
     }
+
+    pub(crate) fn apply_window_after_step(
+        &mut self,
+        session: &Session,
+        absolute_total_len: usize,
+        present_len: usize,
+    ) -> anyhow::Result<()> {
+        let Some(window_size) = self.sliding_window else {
+            return Ok(());
+        };
+        let retained_len = present_len.min(window_size);
+        let trim_start = present_len - retained_len;
+        if trim_start > 0 {
+            for input_name in &self.kv_inputs {
+                let info = session
+                    .inputs()
+                    .iter()
+                    .find(|info| info.name == *input_name)
+                    .with_context(|| format!("missing KV input metadata for '{input_name}'"))?;
+                let seq_axis = info
+                    .shape
+                    .len()
+                    .checked_sub(2)
+                    .context("KV input rank must be at least 2")?;
+                let value = self
+                    .past
+                    .get(input_name)
+                    .with_context(|| format!("missing cached KV tensor for '{input_name}'"))?;
+                let trimmed = slice_value_axis(value, seq_axis, trim_start, retained_len)?;
+                self.past.insert(input_name.clone(), trimmed);
+            }
+        }
+        self.retained_kv_len = retained_len;
+        debug_assert_eq!(
+            absolute_total_len.saturating_sub(self.retained_kv_len),
+            absolute_total_len.saturating_sub(window_size)
+        );
+        Ok(())
+    }
+
+    pub(crate) fn rewind_windowed(
+        &mut self,
+        absolute_current_len: usize,
+        target_len: usize,
+    ) -> anyhow::Result<()> {
+        let window_size = self
+            .sliding_window
+            .context("windowed rewind requires sliding-window state")?;
+        let retained_start = absolute_current_len.saturating_sub(self.retained_kv_len);
+        if target_len < retained_start {
+            anyhow::bail!(
+                "cannot rewind sliding-window KV to absolute position {target_len}; positions before {retained_start} were evicted"
+            );
+        }
+        let target_retained_len = target_len - retained_start;
+        if target_retained_len < self.retained_kv_len {
+            for value in self.past.values_mut() {
+                let seq_axis = value
+                    .shape()
+                    .len()
+                    .checked_sub(2)
+                    .context("KV tensor rank must be at least 2")?;
+                *value = slice_value_axis(value, seq_axis, 0, target_retained_len)?;
+            }
+        }
+        self.retained_kv_len = target_retained_len.min(window_size);
+        Ok(())
+    }
 }
 
 pub(crate) fn next_session_token_logits(
@@ -255,7 +354,16 @@ pub(crate) fn next_session_token_logits(
     seq: SessionId,
     state: &mut EngineSession,
 ) -> anyhow::Result<Vec<f32>> {
-    let (input_tokens, past_len) = session_decode_input_tokens(state)?;
+    let (mut input_tokens, mut past_len) = session_decode_input_tokens(state)?;
+    consume_windowed_prefix(
+        session,
+        kv_model,
+        kv_cache,
+        seq,
+        state,
+        &mut input_tokens,
+        &mut past_len,
+    )?;
     let input_len = input_tokens.len();
     if state.decode_state.has_runner() {
         let logits = run_decode_session_logits(&mut state.decode_state, &input_tokens, past_len)?;
@@ -268,11 +376,18 @@ pub(crate) fn next_session_token_logits(
             .last()
             .context("decode session produced no logits");
     }
+    let retained_past_len = state.decode_state.retained_kv_len(past_len);
     let outputs = run_decode_step(session, &mut state.decode_state, &input_tokens, past_len)?;
     if state.decode_state.use_kv {
         if let Some(kv_model) = kv_model {
             mirror_present_kv_to_pages(
-                session, kv_model, kv_cache, seq, &outputs, past_len, input_len,
+                session,
+                kv_model,
+                kv_cache,
+                seq,
+                &outputs,
+                retained_past_len,
+                input_len,
             )?;
         } else {
             kv_cache
@@ -280,6 +395,7 @@ pub(crate) fn next_session_token_logits(
                 .map_err(|e| anyhow::anyhow!("Failed to advance KV sequence {seq}: {}", e))?;
         }
         state.kv_token_count += input_len;
+        apply_paged_sliding_window(kv_cache, seq, state.decode_state.sliding_window())?;
     }
     extract_next_token_logits(session, outputs)
 }
@@ -322,13 +438,29 @@ pub(crate) fn next_session_token_logits_and_hiddens(
             hidden_outputs
         );
     }
-    let (input_tokens, past_len) = session_decode_input_tokens(state)?;
+    let (mut input_tokens, mut past_len) = session_decode_input_tokens(state)?;
+    consume_windowed_prefix(
+        session,
+        kv_model,
+        kv_cache,
+        seq,
+        state,
+        &mut input_tokens,
+        &mut past_len,
+    )?;
     let input_len = input_tokens.len();
+    let retained_past_len = state.decode_state.retained_kv_len(past_len);
     let outputs = run_decode_step(session, &mut state.decode_state, &input_tokens, past_len)?;
     if state.decode_state.use_kv {
         if let Some(kv_model) = kv_model {
             mirror_present_kv_to_pages(
-                session, kv_model, kv_cache, seq, &outputs, past_len, input_len,
+                session,
+                kv_model,
+                kv_cache,
+                seq,
+                &outputs,
+                retained_past_len,
+                input_len,
             )?;
         } else {
             kv_cache
@@ -336,6 +468,7 @@ pub(crate) fn next_session_token_logits_and_hiddens(
                 .map_err(|e| anyhow::anyhow!("Failed to advance KV sequence {seq}: {}", e))?;
         }
         state.kv_token_count += input_len;
+        apply_paged_sliding_window(kv_cache, seq, state.decode_state.sliding_window())?;
     }
     let logits = extract_next_token_logits_from_outputs(session, &outputs)?;
     let hidden = hidden_outputs
@@ -364,6 +497,7 @@ pub(crate) fn next_draft_token_logits(
             .last()
             .context("draft decode session produced no logits");
     }
+    let retained_past_len = draft_state.decode_state.retained_kv_len(past_len);
     let outputs = run_decode_step(
         &draft_model.session,
         &mut draft_state.decode_state,
@@ -378,7 +512,7 @@ pub(crate) fn next_draft_token_logits(
                 &mut draft_model.kv_cache,
                 draft_state.seq,
                 &outputs,
-                past_len,
+                retained_past_len,
                 input_len,
             )?;
         } else {
@@ -388,8 +522,78 @@ pub(crate) fn next_draft_token_logits(
                 .map_err(|e| anyhow::anyhow!("Failed to advance draft KV sequence: {}", e))?;
         }
         draft_state.kv_token_count += input_len;
+        apply_paged_sliding_window(
+            &mut draft_model.kv_cache,
+            draft_state.seq,
+            draft_state.decode_state.sliding_window(),
+        )?;
     }
+
     extract_next_token_logits(&draft_model.session, outputs)
+}
+
+pub(crate) fn apply_paged_sliding_window(
+    kv_cache: &mut PagedKvCache,
+    seq: SessionId,
+    sliding_window: Option<usize>,
+) -> anyhow::Result<()> {
+    if let Some(window_size) = sliding_window {
+        kv_cache
+            .apply_sliding_window(seq, window_size)
+            .map_err(|error| {
+                anyhow::anyhow!("Failed to apply KV sliding window for sequence {seq}: {error}")
+            })?;
+    }
+    Ok(())
+}
+
+fn consume_windowed_prefix(
+    session: &Session,
+    kv_model: Option<&KvModelInfo>,
+    kv_cache: &mut PagedKvCache,
+    seq: SessionId,
+    state: &mut EngineSession,
+    input_tokens: &mut Vec<TokenId>,
+    past_len: &mut usize,
+) -> anyhow::Result<()> {
+    let Some(window_size) = state.decode_state.sliding_window() else {
+        return Ok(());
+    };
+    let mut consumed = 0;
+    while input_tokens.len() - consumed > 1 {
+        let retained_past_len = state.decode_state.retained_kv_len(*past_len);
+        let chunk_capacity = window_size;
+        let remaining = input_tokens.len() - consumed;
+        if remaining <= chunk_capacity {
+            break;
+        }
+        let chunk_len = chunk_capacity.min(remaining - 1);
+        let chunk = input_tokens[consumed..consumed + chunk_len].to_vec();
+        let outputs = run_decode_step(session, &mut state.decode_state, &chunk, *past_len)?;
+        if let Some(kv_model) = kv_model {
+            mirror_present_kv_to_pages(
+                session,
+                kv_model,
+                kv_cache,
+                seq,
+                &outputs,
+                retained_past_len,
+                chunk_len,
+            )?;
+        } else {
+            kv_cache
+                .append(seq, chunk_len)
+                .map_err(|error| anyhow::anyhow!("Failed to advance KV sequence {seq}: {error}"))?;
+        }
+        state.kv_token_count += chunk_len;
+        *past_len += chunk_len;
+        apply_paged_sliding_window(kv_cache, seq, Some(window_size))?;
+        consumed += chunk_len;
+    }
+    if consumed > 0 {
+        input_tokens.drain(..consumed);
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -482,8 +686,14 @@ pub(crate) fn detect_model_decode_path(
     session: &Session,
     metadata_max_context: Option<usize>,
     shared_kv_max_len: Option<usize>,
+    sliding_window: Option<usize>,
 ) -> anyhow::Result<ModelDecodePath> {
     if let Some(signature) = StaticCacheDecodeSession::detect(session)? {
+        if sliding_window.is_some() {
+            anyhow::bail!(
+                "sliding-window attention is not supported by the static-cache decode path; Mobius must emit a rotating/circular static cache contract"
+            );
+        }
         return Ok(ModelDecodePath::StaticCache {
             max_len: signature.max_len,
         });
@@ -495,6 +705,21 @@ pub(crate) fn detect_model_decode_path(
         .iter()
         .any(|info| is_present_output(&info.name));
     if has_kv_inputs || has_present_outputs {
+        if sliding_window.is_some() && shared_kv_max_len.is_some() {
+            anyhow::bail!(
+                "sliding-window GroupQueryAttention cannot use the current append-only shared KV buffer; Mobius must emit `local_window_size` plus a bounded circular-cache/write-offset contract"
+            );
+        }
+        if sliding_window.is_some() {
+            // The model graph remains responsible for local-attention masking.
+            // This path bounds the runtime-owned past tensors and preserves
+            // absolute position_ids while the graph applies its trained window.
+            return Ok(ModelDecodePath::PastPresent {
+                shared_buffer: false,
+                max_len: None,
+                sliding_window,
+            });
+        }
         // Our own `InferenceMetadata` (from `inference_metadata.yaml`) can declare
         // that the runtime owns a single max-length device-resident KV buffer that
         // is aliased `present.*` -> `past_key_values.*` across decode steps
@@ -506,6 +731,7 @@ pub(crate) fn detect_model_decode_path(
             return Ok(ModelDecodePath::PastPresent {
                 shared_buffer: true,
                 max_len: Some(max_len),
+                sliding_window: None,
             });
         }
 
@@ -514,10 +740,26 @@ pub(crate) fn detect_model_decode_path(
         return Ok(ModelDecodePath::PastPresent {
             shared_buffer,
             max_len: metadata_max_context.filter(|_| shared_buffer),
+            sliding_window: None,
         });
     }
 
     Ok(ModelDecodePath::Legacy)
+}
+
+/// Sliding-window size declared by the model, if present and valid.
+pub(crate) fn sliding_window_from_metadata(
+    metadata: &InferenceMetadata,
+) -> anyhow::Result<Option<usize>> {
+    let window = metadata
+        .model
+        .as_ref()
+        .and_then(|model| model.attention.as_ref())
+        .and_then(|attention| attention.sliding_window);
+    if window == Some(0) {
+        anyhow::bail!("model.attention.sliding_window must be greater than zero");
+    }
+    Ok(window)
 }
 
 /// Decide whether our `InferenceMetadata` requests the runtime to own a single
@@ -575,7 +817,10 @@ fn metadata_kv_is_fp16(metadata: &InferenceMetadata) -> bool {
 
 /// Whether a dtype string denotes 16-bit floating point.
 fn is_fp16_dtype(dtype: &str) -> bool {
-    matches!(dtype.to_ascii_lowercase().as_str(), "float16" | "fp16" | "half")
+    matches!(
+        dtype.to_ascii_lowercase().as_str(),
+        "float16" | "fp16" | "half"
+    )
 }
 
 fn stable_session_ref(session: &Session) -> &'static Session {
@@ -651,15 +896,13 @@ pub(crate) fn run_decode_step_with_extra(
     }
 
     let seq_len = token_ids.len();
-    let total_len = past_len + seq_len;
+    let retained_past_len = decode_state.retained_kv_len(past_len);
+    let (total_len, position_ids) = decode_step_layout(past_len, retained_past_len, seq_len)?;
     let input_ids = token_ids
         .iter()
         .map(|&id| i64::from(id))
         .collect::<Vec<_>>();
     let attention_mask = vec![1_i64; total_len];
-    let position_ids = (past_len..total_len)
-        .map(|pos| i64::try_from(pos).context("position id exceeds i64 range"))
-        .collect::<anyhow::Result<Vec<_>>>()?;
 
     let mut owned_inputs: Vec<(String, Value)> = Vec::new();
     for info in session.inputs() {
@@ -683,7 +926,7 @@ pub(crate) fn run_decode_step_with_extra(
                 Value::from_slice_i64(&position_ids, &[1, seq_len as i64])?,
             ));
         } else if decode_state.use_kv && decode_state.kv_inputs.contains(&info.name) {
-            let value = if past_len == 0 {
+            let value = if retained_past_len == 0 {
                 empty_past_value(info)?
             } else {
                 clone_value(decode_state.past.get(&info.name).with_context(|| {
@@ -727,6 +970,7 @@ pub(crate) fn run_decode_step_with_extra(
                     .insert(past_name.clone(), clone_value(value)?);
             }
         }
+        decode_state.apply_window_after_step(session, past_len + seq_len, total_len)?;
     }
 
     Ok(outputs)
@@ -870,6 +1114,23 @@ fn extract_logits_value_next(logits: &Value) -> anyhow::Result<Vec<f32>> {
         .context("logits tensor did not contain any sequence rows")
 }
 
+fn decode_step_layout(
+    absolute_past_len: usize,
+    retained_past_len: usize,
+    input_len: usize,
+) -> anyhow::Result<(usize, Vec<i64>)> {
+    let attended_len = retained_past_len
+        .checked_add(input_len)
+        .context("attention length overflow")?;
+    let absolute_total_len = absolute_past_len
+        .checked_add(input_len)
+        .context("absolute position overflow")?;
+    let position_ids = (absolute_past_len..absolute_total_len)
+        .map(|position| i64::try_from(position).context("position id exceeds i64 range"))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    Ok((attended_len, position_ids))
+}
+
 fn extract_logits_value_sequence(logits: &Value) -> anyhow::Result<Vec<Vec<f32>>> {
     let shape = logits.shape();
     let data = logits
@@ -913,9 +1174,9 @@ fn is_token_input_name(lower_name: &str) -> bool {
 }
 
 fn empty_past_value(info: &TensorInfo) -> anyhow::Result<Value> {
-    if info.dtype != DataType::Float32 {
+    if !matches!(info.dtype, DataType::Float32 | DataType::Float16) {
         anyhow::bail!(
-            "KV input '{}' must be Float32 for Phase 1, got {:?}",
+            "KV input '{}' must be Float32 or Float16, got {:?}",
             info.name,
             info.dtype
         );
@@ -946,18 +1207,75 @@ fn empty_past_value(info: &TensorInfo) -> anyhow::Result<Value> {
         };
         shape.push(value);
     }
-    Value::from_slice_f32(&[], &shape)
-        .map_err(|e| anyhow::anyhow!("Failed to create empty KV input '{}': {}", info.name, e))
+    match info.dtype {
+        DataType::Float32 => Value::from_slice_f32(&[], &shape),
+        DataType::Float16 => Value::from_vec_f16_bits(Vec::new(), &shape),
+        _ => unreachable!("dtype checked above"),
+    }
+    .map_err(|e| anyhow::anyhow!("Failed to create empty KV input '{}': {}", info.name, e))
 }
 
 pub(crate) fn clone_value(value: &Value) -> anyhow::Result<Value> {
     match value.dtype() {
         DataType::Float32 => Value::from_slice_f32(&value.to_vec_f32()?, value.shape())
             .map_err(|e| anyhow::anyhow!("Failed to clone Float32 ORT value: {}", e)),
+        DataType::Float16 => Value::from_vec_f16_bits(value.to_vec_f16_bits()?, value.shape())
+            .map_err(|e| anyhow::anyhow!("Failed to clone Float16 ORT value: {}", e)),
         DataType::Int64 => Value::from_slice_i64(&value.to_vec_i64()?, value.shape())
             .map_err(|e| anyhow::anyhow!("Failed to clone Int64 ORT value: {}", e)),
         dtype => anyhow::bail!("unsupported cached ORT value dtype: {:?}", dtype),
     }
+}
+
+fn slice_value_axis(value: &Value, axis: usize, start: usize, len: usize) -> anyhow::Result<Value> {
+    let shape = value.shape();
+    let axis_len = *shape.get(axis).context("KV slice axis is out of bounds")?;
+    let axis_len = usize::try_from(axis_len).context("KV slice axis length is negative")?;
+    if start > axis_len || len > axis_len - start {
+        anyhow::bail!(
+            "KV slice [{start}..{}) exceeds axis length {axis_len}",
+            start + len
+        );
+    }
+    let mut output_shape = shape.to_vec();
+    output_shape[axis] = i64::try_from(len).context("KV slice length exceeds i64")?;
+
+    fn copy_axis_slice<T: Copy>(
+        input: &[T],
+        shape: &[i64],
+        axis: usize,
+        start: usize,
+        len: usize,
+    ) -> Vec<T> {
+        let inner = shape[axis + 1..]
+            .iter()
+            .map(|&dim| dim as usize)
+            .product::<usize>();
+        let outer = shape[..axis]
+            .iter()
+            .map(|&dim| dim as usize)
+            .product::<usize>();
+        let axis_len = shape[axis] as usize;
+        let mut output = Vec::with_capacity(outer * len * inner);
+        for outer_idx in 0..outer {
+            let base = outer_idx * axis_len * inner + start * inner;
+            output.extend_from_slice(&input[base..base + len * inner]);
+        }
+        output
+    }
+
+    match value.dtype() {
+        DataType::Float32 => Value::from_vec_f32(
+            copy_axis_slice(&value.to_vec_f32()?, shape, axis, start, len),
+            &output_shape,
+        ),
+        DataType::Float16 => Value::from_vec_f16_bits(
+            copy_axis_slice(&value.to_vec_f16_bits()?, shape, axis, start, len),
+            &output_shape,
+        ),
+        dtype => anyhow::bail!("cannot slice cached KV tensor with dtype {dtype:?}"),
+    }
+    .map_err(|error| anyhow::anyhow!("Failed to slice cached KV tensor: {error}"))
 }
 
 pub(crate) fn is_kv_input(name: &str) -> bool {
@@ -1005,13 +1323,14 @@ pub(crate) fn is_gather_out_of_bounds(message: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_fp16_dtype, is_group_query_attention, is_token_input_name,
-        shared_kv_buffer_len_from_metadata,
+        decode_step_layout, is_fp16_dtype, is_group_query_attention, is_token_input_name,
+        shared_kv_buffer_len_from_metadata, slice_value_axis, sliding_window_from_metadata,
     };
     use onnx_genai_metadata::{
         AttentionConfig, InferenceMetadata, KvCacheSpec, ModelCapabilities, RuntimeConfigurable,
         RuntimeKvConfig,
     };
+    use onnx_genai_ort::Value;
 
     #[test]
     fn recognizes_causal_and_seq2seq_token_input_names() {
@@ -1175,5 +1494,63 @@ mod tests {
     #[test]
     fn no_shared_kv_when_metadata_empty() {
         assert_eq!(shared_kv_buffer_len_from_metadata(&empty_metadata()), None);
+    }
+
+    #[test]
+    fn sliding_window_metadata_is_consumed_and_validated() {
+        let mut attention = gqa_attention();
+        attention.sliding_window = Some(4096);
+        let metadata = InferenceMetadata {
+            model: Some(ModelCapabilities {
+                attention: Some(attention),
+                max_sequence_length: Some(131_072),
+                speculative: None,
+                runtime_configurable: None,
+            }),
+            ..empty_metadata()
+        };
+        assert_eq!(sliding_window_from_metadata(&metadata).unwrap(), Some(4096));
+
+        let mut invalid = metadata.clone();
+        invalid
+            .model
+            .as_mut()
+            .unwrap()
+            .attention
+            .as_mut()
+            .unwrap()
+            .sliding_window = Some(0);
+        assert!(sliding_window_from_metadata(&invalid).is_err());
+        assert_eq!(
+            sliding_window_from_metadata(&empty_metadata()).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn windowed_layout_keeps_absolute_positions_with_bounded_attention_length() {
+        let (attended_len, position_ids) = decode_step_layout(10_000, 4096, 3).unwrap();
+        assert_eq!(attended_len, 4099);
+        assert_eq!(position_ids, vec![10_000, 10_001, 10_002]);
+
+        let (full_len, full_positions) = decode_step_layout(7, 7, 2).unwrap();
+        assert_eq!(full_len, 9);
+        assert_eq!(full_positions, vec![7, 8]);
+    }
+
+    #[test]
+    fn kv_axis_slicing_keeps_requested_suffix_in_order() {
+        let value = Value::from_vec_f32(
+            vec![0.0, 1.0, 10.0, 11.0, 20.0, 21.0, 30.0, 31.0, 40.0, 41.0],
+            &[1, 1, 5, 2],
+        )
+        .unwrap();
+        let suffix = slice_value_axis(&value, 2, 2, 3).unwrap();
+
+        assert_eq!(suffix.shape(), &[1, 1, 3, 2]);
+        assert_eq!(
+            suffix.to_vec_f32().unwrap(),
+            vec![20.0, 21.0, 30.0, 31.0, 40.0, 41.0]
+        );
     }
 }

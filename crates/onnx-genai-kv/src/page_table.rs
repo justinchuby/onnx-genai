@@ -153,6 +153,8 @@ pub struct PageTable {
     pub sequences: HashMap<SequenceId, Vec<PageId>>,
     /// Logical sequence → current token length.
     pub sequence_lengths: HashMap<SequenceId, usize>,
+    /// Logical sequence → absolute position of the first retained token.
+    pub sequence_starts: HashMap<SequenceId, usize>,
     /// All physical pages.
     pub pages: HashMap<PageId, Page>,
     /// Free pages per device.
@@ -204,6 +206,7 @@ impl PageTable {
         Self {
             sequences: HashMap::new(),
             sequence_lengths: HashMap::new(),
+            sequence_starts: HashMap::new(),
             pages,
             free_pages: free_map,
             page_size,
@@ -287,9 +290,19 @@ impl PageTable {
         self.sequence_lengths.get(&seq).copied()
     }
 
+    pub fn sequence_start(&self, seq: SequenceId) -> Option<usize> {
+        self.sequence_starts.get(&seq).copied()
+    }
+
     pub fn set_sequence_len(&mut self, seq: SequenceId, len: usize) {
         if let Some(slot) = self.sequence_lengths.get_mut(&seq) {
             *slot = len;
+        }
+    }
+
+    pub fn set_sequence_start(&mut self, seq: SequenceId, start: usize) {
+        if let Some(slot) = self.sequence_starts.get_mut(&seq) {
+            *slot = start;
         }
     }
 
@@ -297,6 +310,7 @@ impl PageTable {
     pub fn create_sequence(&mut self, seq: SequenceId) {
         self.sequences.insert(seq, Vec::new());
         self.sequence_lengths.insert(seq, 0);
+        self.sequence_starts.insert(seq, 0);
     }
 
     /// Append a page to a sequence.
@@ -403,6 +417,7 @@ impl PageTable {
     /// Remove a sequence and return its pages.
     pub fn remove_sequence(&mut self, seq: SequenceId) -> Vec<PageId> {
         self.sequence_lengths.remove(&seq);
+        self.sequence_starts.remove(&seq);
         self.sequences.remove(&seq).unwrap_or_default()
     }
 
