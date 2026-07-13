@@ -197,3 +197,115 @@ Canonical, append-only record of accepted team decisions. Only the Coordinator (
 **By:** Sebastian
 **What:** Added a Rust comparison binary plus `scripts/compare_runtimes.sh` to probe onnx-genai, Ollama, and LM Studio, then measure fixed Qwen2.5-0.5B-Instruct short/long prompts with greedy streaming TTFT, decode throughput, total latency, and estimated prefill throughput. The Apple M1 Max baseline used onnx-genai's 1.98 GB f32 dynamic-cache ONNX model on CPU and identical 531.1 MB Q8_0 GGUF bytes in Ollama and LM Studio.
 **Why:** A common API-level harness with warmups, median/p90, exact runtime/model labels, machine metadata, graceful skips, and saved Markdown reports makes periodic comparisons reproducible and prevents cherry-picked claims. The baseline verdict is that onnx-genai is currently slower on every reported median metric; quantized/fused ONNX execution, persistent IoBinding/KV reuse, and prefill/thread/cache-shape tuning are the next priorities.
+
+---
+
+### 2026-07-12: Runtime consumes fp16 GroupQueryAttention (GQA) WebGPU KV via genai_config share-buffer
+**By:** Batty
+**What:** Made the onnx-genai runtime load and decode Deckard's fp16 `com.microsoft::GroupQueryAttention` WebGPU export (`models/qwen2.5-0.5b-gqa-webgpu/`). Four changes:
+1. **Accept fp16 KV.** `crates/onnx-genai-engine/src/kv_bridge.rs` no longer hard-requires Float32 present/past KV: `infer_kv_model_info` and `infer_kv_heads_and_head_dim` accept Float32 **or** Float16 (new `is_supported_kv_dtype` helper), matching the eagle3/mtp pattern. This removes the `present.0.key must be Float32 rank >= 3, got Float16` load failure. The host paged-mirror path stays fp32-only and now bails with a clear message if fp16 KV ever reaches it (it never does for GQA — see #2).
+2. **Bypass the fp32 host cache for share-buffer KV.** GQA models take the existing `ModelDecodePath::PastPresent` runner (`DecodeSession`), so `next_session_token_logits` skips `mirror_present_kv_to_pages` entirely; KV OrtValues stay ORT-owned and the host `PagedKvCache` is used only for logical length bookkeeping (`append`). New: the runner now selects `DecodeKvMode::SharedBuffer` for GQA (present aliased onto the same max-length past buffer), not the CPU-round-tripping `ZeroCopyRebind`.
+3. **Consume `genai_config.json`.** New module `crates/onnx-genai-engine/src/genai_config.rs` reads `search.past_present_share_buffer`, `search.max_length`, and `model.context_length`. `detect_model_decode_path` now takes this config: a `past_present_share_buffer: true` declaration is authoritative and pre-sizes the shared KV buffer to `max_length` (4096), falling back to `context_length`/metadata. This also bounds the context-window guard via `decode_path_max_len`.
+4. **fp16 logits/hidden reads.** GQA emits fp16 `logits`; added `Value::to_vec_f32_lossy()` (ORT crate, uses `half`) that widens Float16 → f32 and passes Float32 through. Engine logits/hidden extractors (`extract_next_token_logits_from_outputs`, `extract_logits_sequence`, `extract_logits_value_sequence`, `extract_last_hidden`) now use it. Fixes `requested f32 data from Float16 tensor`.
+
+Non-GQA fp32 / static-cache / CPU paths are unchanged (draft models pass `None` genai_config; share-buffer still requires an explicit declaration or ORT metadata + max context).
+
+**Verification (real model, per-request server path):**
+- `ONNX_GENAI_EP=webgpu` load succeeds and is **coherent**: "What is the capital of France?" → `Paris`; 128-token Eiffel-Tower essay is fluent.
+- **WebGPU decode ≈ 21 tok/s** (isolated by differencing 8 vs 136 max_tokens), up from the prior WebGPU-fp16 **9 tok/s** (~2.3×). CPU EP on the same GQA model is coherent at **≈ 38 tok/s** (prior CPU reference 43). WebGPU is now far ahead of the old plain-Attention path but still trails CPU.
+- `cargo test -p onnx-genai-engine -p onnx-genai-ort` → exit 0 (all pass, incl. new genai_config + `to_vec_f32_lossy` tests). `cargo clippy -p onnx-genai-engine -p onnx-genai-ort --all-targets -- -D warnings` → exit 0.
+
+**Why / remaining optimization (follow-up):** The shared KV buffer is currently allocated with the default **CPU** allocator (`Value::empty` → `Allocator::default_cpu`). In SharedBuffer mode ORT therefore still copies each layer's KV host↔device per step, so WebGPU has not yet overtaken CPU. The remaining win is a **device-resident (WebGPU) shared KV buffer** plus enabling the genai_config WebGPU provider options (`enableGraphCapture: 1`, `validationMode: disabled`), which should eliminate the last H2D/D2H copies and let WebGPU decode pass CPU. Sebastian's harness run vs LM Studio is a separate follow-up.
+
+**Files changed:** `crates/onnx-genai-engine/src/kv_bridge.rs`, `crates/onnx-genai-engine/src/decode.rs`, `crates/onnx-genai-engine/src/engine.rs`, `crates/onnx-genai-engine/src/lib.rs`, `crates/onnx-genai-engine/src/genai_config.rs` (new), `crates/onnx-genai-ort/src/value.rs`, `crates/onnx-genai-ort/Cargo.toml` (+`half`), `crates/onnx-genai-ort/tests/decode_session.rs`, `Cargo.lock`.
+
+---
+
+# Decision: Q4 GGUF→ONNX correctness fix (invalid MatMulNBits output)
+
+- **Author:** Batty (Engine)
+- **Date:** 2026-07-12T18:05:00-07:00
+- **Requested by:** Justin Chu
+- **Scope:** Mobius `src/mobius/integrations/gguf/**` only (no onnx-genai runtime change needed)
+
+## Problem
+`mobius build-gguf` converted `qwen2.5-0.5b-instruct-q4_0.gguf` (sha256 7671c0c3…)
+into a `MatMulNBits` ONNX graph that **loaded** (168 nodes, CPU + WebGPU) but produced
+**deterministic garbage** on both EPs (e.g. `辱字母…EventData`). llama.cpp/LM Studio
+run the same GGUF correctly, so the GGUF weights are good and the conversion was wrong.
+
+## Root cause — TWO independent conversion bugs (both required to fix)
+
+### 1. Missing attention biases (primary)
+`gguf_to_config()` never inferred projection-bias flags, so `attn_qkv_bias` defaulted
+to `False`. Qwen2 carries Q/K/V biases (`blk.N.attn_{q,k,v}.bias`, magnitudes q≈79,
+k≈130). With the flag false, the graph builder omitted the bias `Add` after each
+projection (`MatMulNBits → RotaryEmbedding` instead of `MatMulNBits → Add(bias) →
+RotaryEmbedding`), destroying attention. The fp16 reference graph has the `Add`.
+
+### 2. Spurious / mis-shaped Q/K reverse-permute (secondary, also fatal)
+- Qwen2 was mapped to the Llama Q/K interleaved-rope reverse-permute (`_PROCESSORS`
+  + name-based `_needs_qk_permute`). **Qwen2/Qwen3 use NEOX rope and are NOT permuted
+  by llama.cpp** — reverse-permuting scrambles the heads.
+- `_reverse_permute` also used the *forward* reshape `(n_head, 2, dim)` instead of the
+  inverse `(n_head, dim, 2)` (HF `modeling_gguf_pytorch_utils._reverse_permute_weights`
+  uses `(n_head, dim, 2)`). This only accidentally inverts when `dim == 2`
+  (head_dim == 4); for head_dim 64 it corrupts Llama/Mistral Q/K too. The paired test
+  was self-consistently wrong (its `_forward_permute` used the inverse reshape), so it
+  passed while production was broken.
+
+Isolation proof: with biases restored but the Qwen2 permute re-enabled, output is
+garbage again — confirming both bugs are independently fatal.
+
+The MatMulNBits weight repacking itself was **correct**: dequant(repacked layer-0
+q_proj) == GGUF Q4_0 dequant exactly (max_abs_diff = 0.0). Nibble order, scale, zp
+(default 8 for symmetric Q4_0), block_size=32, and N/K were all fine.
+
+## Fix (files changed, mobius)
+- `_config_mapping.py`: add `_infer_attn_qkv_bias/_infer_attn_o_bias/_infer_mlp_bias`
+  (tensor-presence inference, mirroring `_infer_tie_embeddings`); wire into
+  `ArchitectureConfig`. Qwen2.5 now → `attn_qkv_bias=True, attn_o_bias=False,
+  mlp_bias=False`.
+- `_tensor_processors.py`: correct `_reverse_permute` reshape to `(n_head, dim, 2)`;
+  add `LLAMA_QK_PERMUTE_MODEL_TYPES = {llama, mistral}` + `needs_llama_qk_permute`;
+  remove `qwen2`/`qwen3` from `_PROCESSORS`.
+- `_builder.py`: gate the quantized inline `_needs_qk_permute` on `model_type` via
+  `needs_llama_qk_permute`.
+
+## Tests added
+- `_tensor_processors_test.py`: HF-reference reverse-permute round-trip at head_dim=64;
+  fixed the self-wrong `_forward_permute`; Qwen not-permuted regressions; builder gate.
+- `_reader_test.py`: projection-bias inference from tensor names.
+
+## Verification (real exit codes)
+- `pytest src/mobius/integrations/gguf/ -q` → **151 passed** (exit 0).
+- Re-converted `models/qwen2.5-0.5b-q4-onnx-fixed` and ran onnx-genai server (CPU EP):
+  - Before: `辱字母\`\amaisten…EventData`
+  - After:  `The capital of France is Paris.` / `12 plus 7 is 19.` (matches fp16).
+
+## Notes / follow-ups
+- Only `src/mobius/integrations/gguf/**` changed; Deckard's files untouched.
+- The `_reverse_permute` reshape fix also corrects a latent Llama/Mistral bug for any
+  head_dim != 4.
+- No commits made (coordinator commits).
+
+---
+
+### 2026-07-12: Target WebGPU builds at GroupQueryAttention
+**By:** Deckard
+**What:** Mobius WebGPU causal-LM exports use the existing EP-aware build context: `--ep webgpu` resolves `EpCapabilities.gqa_dtypes`, and fp16 standard-RoPE decoders emit `com.microsoft::GroupQueryAttention` directly with Q/K/V, past K/V, sequence lengths, and RoPE tables. Added explicit WebGPU fp16 regression coverage. The Qwen2.5-0.5B export contains 24 GQA and zero Attention nodes; ORT placed all 24 GQA nodes on WebGPU, with 268 WebGPU nodes, 6 CPU shape/seqlen nodes, one H2D copy node, and zero D2H copy nodes.
+**Why:** The previous plain-Attention graph placed 24 Attention nodes on CPU and inserted 121 D2H plus 74 H2D copies per token. GQA removes that decomposition and keeps fused attention/RoPE/KV update in the WebGPU partition. The onnx-genai server still cannot consume the fp16 GQA cache: `crates/onnx-genai-engine/src/kv_bridge.rs` unconditionally requires Float32 present KV and mirrors it through host `PagedKvCache`; loading fails with `present KV output 'present.0.key' must be Float32 rank >= 3, got Float16 [-1, 2, -1, 64]`. Follow-up must route GQA models through ORT-owned shared/device KV buffers, propagate the Mobius `past_present_share_buffer`/max-length contract into onnx-genai model metadata or config loading, and skip host KV mirroring for that path.
+
+---
+
+### 2026-07-12: Make same-source GGUF the primary cross-runtime benchmark
+**By:** Sebastian
+**What:** Cross-runtime reports must identify one GGUF by filename and SHA-256, load those exact bytes in llama.cpp runtimes, and convert the same file through Mobius with `--keep-quantized`. The verified 2026-07-12 path uses official Qwen2.5-0.5B-Instruct Q4_0 because Q4_K_M currently fails Mobius weight-shape validation. onnx-genai successfully loaded 168 `MatMulNBits` projection nodes, but current Mobius dequantizes the quantized embedding and output head to fp32. The measured ORT CPU stack remained 77-80% slower in decode and much slower in prefill than Ollama/LM Studio Metal.
+**Why:** The earlier fp32-ONNX versus GGUF baseline confounded runtime and quantization. Same-source conversion removes the dominant projection-weight mismatch, while explicitly recording the remaining embedding/head and CPU-vs-Metal limitations prevents the result from being overstated as perfectly byte- and device-identical.
+
+---
+
+### 2026-07-12: WebGPU benchmark correctness gate and fallback
+**By:** Sebastian
+**What:** The primary periodic comparison is onnx-genai WebGPU EP versus LM Studio Metal only. ORT 1.27 assigned all 168 Q4 `MatMulNBits` projections to WebGPU rather than CPU, but the converted Q4 graph produced the same invalid deterministic output on CPU and WebGPU, so it failed correctness and was not benchmarked. The reported GPU number therefore uses a non-quantized fp16 ONNX graph with fp32 logits/KV boundary casts versus the exact Q4_0 GGUF in LM Studio, clearly labeled as non-parity.
+**Why:** GPU-vs-GPU is the fair runtime/backend comparison requested, but incorrect model output cannot support a performance claim. The fp16 fallback preserves a usable WebGPU measurement while exposing the current runtime constraints: attention and KV plumbing remain on CPU, native fp16 logits/KV are unsupported, and decode is substantially slower than both LM Studio and the historical CPU-EP baseline.

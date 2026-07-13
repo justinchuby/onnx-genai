@@ -52,3 +52,7 @@ Prompt-lookup speculation and `MtpProposer` are accepted canonical runtime miles
 ## 2026-07-12T17:30:00-07:00 — EAGLE/logprobs/sampling batch logged
 - EAGLE-3 hidden-state contract, opt-in engine token logprobs, and real categorical sampling with per-request seedable RNG are now canonical decisions.
 - Future server work should map engine `TokenLogprob` data onto OpenAI chat/completions logprob surfaces.
+
+## 2026-07-12T19:05:00-07:00 — fp16 GQA WebGPU KV consumed
+- Runtime now loads + decodes the fp16 `com.microsoft::GroupQueryAttention` WebGPU export. KV bridge accepts Float16 (not just Float32); GQA routes through the `DecodeSession` SharedBuffer runner (present aliased onto a max-length past buffer) instead of the fp32 host paged-mirror. New `genai_config.rs` reads `past_present_share_buffer`/`max_length` from `genai_config.json`; `Value::to_vec_f32_lossy` widens fp16 logits.
+- Verified real model: WebGPU coherent ("Paris") at ~21 tok/s decode (up from 9); CPU ~38 tok/s. Remaining follow-up: shared KV buffer is CPU-allocated so ORT still copies host↔device each step — make it device-resident (+ graph-capture provider opts) to pass CPU. See `.squad/decisions/inbox/batty-fp16-gqa-kv.md`.

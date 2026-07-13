@@ -5,6 +5,15 @@ streaming APIs. The primary periodic comparison is GPU-to-GPU: ONNX Runtime
 WebGPU EP versus LM Studio's llama.cpp Metal backend. Ollama is not part of the
 primary comparison.
 
+## Current-state comparison
+
+The current honest checkpoint is
+[`2026-07-12-JustindeMacBook-Pro-gqa-fixed.md`](2026-07-12-JustindeMacBook-Pro-gqa-fixed.md).
+It covers correctness-verified fp16 GQA WebGPU, the first correctness-valid Q4
+CPU result, LM Studio Metal, and LM Studio with GPU off for CPU-vs-CPU parity.
+The older reports below are historical trajectories and include the invalid
+pre-fix Q4 artifact where explicitly noted.
+
 ## Methodology
 
 - Model family and size: Qwen2.5-0.5B-Instruct.
