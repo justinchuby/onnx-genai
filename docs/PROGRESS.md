@@ -31,7 +31,7 @@ _Last updated: 2026-07-13_
 | 34 | Cluster/session router | ❌ Missing | |
 | 35 | Native preprocessing | ✅ Done | `onnx-genai-preprocess`: image (bicubic/CLIP + tiling none/fixed_grid/dynamic_anyres) + audio log-mel; audio wired (#12). Multi-tile prompt token-expansion library (`expand_image_placeholders`, thumbnail-order-safe) ✅; engine count-based expansion + server tile-count seam wired (#14) ✅ |
 | 36 | Backpressure/lifecycle | ✅ Done | admission cap + 429 ✅; configurable `max_queue_depth` (CLI/env) + 429 Retry-After ✅ |
-| 37 | Model lifecycle mgmt | ❌ Missing | single model at startup; #9 |
+| 37 | Model lifecycle mgmt | ✅ Done | Multi-model registry (#9): M1 `ModelHandle`+`ModelRegistry` refactor (Gaff 🟢); M2 multi-model config (`--models-dir`/`--models-config`, TOML/JSON) + startup load + per-request routing + deterministic default (Chew 🟡→fixed: embeddings empty-model default); M3 runtime load/unload + lazy load + LRU eviction + admin endpoints (`/v1/admin/models`, gated) with lock-safe `spawn_blocking` build + per-id load de-dup + graceful `Arc`-drain unload (Deckard 🟢) |
 | 38 | Distributed KV connector | ❌ Missing | local tiered KV only |
 | 39 | Paged/radix attention | 🟡 Upstream | Mobius block-table KV graph (Option C, std ops) = draft PR onnxruntime/mobius#395; runtime wiring pending |
 | 40 | Sliding window attention | 🟡 Partial | Contiguous single-window SWA (metadata `sliding_window` + KV `apply_sliding_window` + windowed decode) ✅; **attention-sink tokens (StreamingLLM §40.4)** ✅ token-exact `[0,sink)∪[window_start,len)`; per-layer hybrid (§40.3) + discontinuous `position_ids` (§40.8) declined pending Mobius/ORT |
