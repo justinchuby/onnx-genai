@@ -38,3 +38,28 @@ For Criterion's detailed HTML reports:
 cargo bench -p onnx-genai-bench --bench no_model
 cargo bench -p onnx-genai-bench --features bench-ort --bench model
 ```
+
+## Cross-runtime HTTP comparison
+
+`compare` measures the deployment-facing OpenAI streaming API against other local runtimes.
+It records TTFT, decode throughput, total latency, and estimated prefill throughput for fixed
+short- and long-context Qwen2.5 prompts. Unavailable servers or unloaded models are reported
+and skipped instead of failing the run.
+
+With onnx-genai, Ollama, and LM Studio already serving their models:
+
+```bash
+scripts/compare_runtimes.sh
+```
+
+The script writes `docs/benchmarks/YYYY-MM-DD-HOSTNAME.md`. Override `RUNS`, `WARMUPS`,
+`MAX_TOKENS`, `OUTPUT`, or any full runtime specification:
+
+```bash
+RUNS=10 \
+ONNX_RUNTIME='onnx-genai|http://127.0.0.1:8080/v1|qwen2.5-0.5b|ONNX f32|CPU EP; default threads' \
+scripts/compare_runtimes.sh
+```
+
+Each runtime specification is `NAME|BASE_URL|MODEL|FORMAT|SETTINGS`. Keep format and
+quantization labels exact; a comparison across unlabeled quantizations is not meaningful.

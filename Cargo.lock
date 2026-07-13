@@ -1504,11 +1504,14 @@ name = "onnx-genai-bench"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "clap",
  "criterion",
  "onnx-genai-engine",
  "onnx-genai-kv",
  "onnx-genai-ort",
+ "serde_json",
  "tokenizers",
+ "tokio",
 ]
 
 [[package]]
