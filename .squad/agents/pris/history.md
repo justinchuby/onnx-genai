@@ -38,6 +38,10 @@ Advanced fixture work is canonical: builders use onnxscript/onnx-ir, `tiny-mtp-f
 - `scripts/coverage.sh --fail-under-lines 75` is the proposed CI floor; prioritize engine `kv_bridge` and targeted ORT decode error fixtures.
 - Vision endpoint routing exists, but real quality needs a mobius CLIP+decoder VLM package and processor metadata.
 
-## 2026-07-12T17:30:00-07:00 — Coverage and Whisper model contract logged
-- `kv_bridge.rs` deterministic coverage was raised to 94.51% line coverage, and the Mobius Whisper encoder/decoder I/O contract is now canonical.
-- Future ASR work should preserve the `input_features` encoder and `decoder_input_ids` decoder alias contract.
+## 2026-07-20T00:00:00Z — §34 Router R1 (node status endpoint) landed
+- Delivered `GET /v1/status` on `onnx-genai-server` implementing the §34.8 node-status contract (`NodeStatus` + `SessionStatus`).
+- Added `--node-id` / `ONNX_GENAI_NODE_ID` with hostname fallback and CSPRNG `node-<hex>` default.
+- Real fields: `node_id`, `healthy`, `queue_depth`, `active_sessions`; all placeholder fields documented `// not yet tracked`.
+- Commit 050259f (initial R1); commit 74314e8 (f32 alignment fix — `kv_usage`/`batch_utilization` changed from `f64` to `f32` to match router's mirror struct).
+- Chew's 🟡 review identified the f32 type mismatch; Pris addressed it directly.
+

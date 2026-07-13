@@ -133,3 +133,65 @@ Canonical, append-only record of accepted team decisions. Only the Coordinator (
 **What:** Removed the unconditional `if request.model.trim().is_empty() { return Err(...bad_request...) }` guard from `validate_embedding_request` in `routes.rs`. Added two tests: `empty_model_field_falls_back_to_default_on_embeddings` (empty `model` → 200 via registry default) and `unknown_model_returns_404_on_embeddings_endpoint` (unknown name → 404). Zhora was locked out per reviewer protocol (Chew's 🟡 review on M2 identified the inconsistency).
 **Why:** The routing contract for all inference endpoints is: empty `model` → deterministic default; unknown named model → 404. The embeddings guard short-circuited after `resolve_model` had already succeeded, making `/v1/embeddings` the only endpoint that rejected a valid empty-model request with a spurious 400. Removing the guard restores parity across all four inference endpoints.
 
+---
+
+### 2026-07-20: §34 Router Epic Kickoff — §37 Model Lifecycle Complete
+**By:** Scribe (on behalf of coordinator orchestration batch)
+**What:** §37 / Issue #9 model lifecycle (M1+M2+M3) is fully complete: M1 (ModelHandle + ModelRegistry refactor), M2 (multi-model config + routing + deterministic default, commit b5934c6), M3 (runtime load/unload + LRU eviction + lazy load + admin endpoints, commit a5106f5), and embeddings routing fix (commit 561ee1a, Rachael). §34 router epic (R1/R2/R3) has kicked off. Pris and Roy are working R1/R2/R3 in parallel with Zhora/Rachael available for follow-up.
+**Why:** Captures the handoff point between §37 completion and §34 commencement for audit purposes.
+
+---
+
+### 2026-07-20: §34.8 Node Status Contract (R1) — GET /v1/status on onnx-genai-server
+**By:** Pris (Rust engineer)
+**Commit:** 050259f
+**What:** Added `GET /v1/status` node-status endpoint to `onnx-genai-server`, returning the §34.8 contract as typed serde structs `NodeStatus` + `SessionStatus`. Replaced the previous ad-hoc `/v1/status` shape with the §34.8 node-status shape (pre-release, no back-compat alias). New `--node-id` CLI arg with env fallback `ONNX_GENAI_NODE_ID`; default resolved by `default_node_id()` → hostname else CSPRNG `node-<hex>`. Removed now-dead `MetricsSnapshot::total_requests` and `AppState::started_at`. Real fields: `node_id`, `healthy`, `queue_depth`, `active_sessions`, `sessions[].id` (redacted). Placeholder zeros: `kv_usage`, `kv_pages_*`, `paused_sessions`, `tokens_per_second`, `batch_utilization`, per-session `priority`/`kv_pages`/`state`, `prefix_hashes` — all documented with `// not yet tracked` comments. Files changed: `crates/onnx-genai-server/src/{routes.rs, state.rs, main.rs, lib.rs, metrics.rs, tests.rs}`.
+**Why:** The router (§34) polls `/v1/status` every 1-2s. Placeholders use documented zeros so downstream consumers can distinguish "0" from "unmeasured" once engine exposes KV/throughput getters. `node_id` is decoupled from any model so a multi-model node reports one node identity.
+**Follow-ups:** Wire real `kv_pages_*`/`kv_usage` once engine exposes paged-KV stats; add rolling `tokens_per_second` + `batch_utilization`; track per-session priority/state and prefix hashes.
+
+---
+
+### 2026-07-20: §34.8 Node Status — f32 alignment fix (R1 follow-up)
+**By:** Pris (Rust engineer)
+**Commit:** 74314e8
+**What:** Changed `NodeStatus.kv_usage` and `NodeStatus.batch_utilization` from `f64` to `f32` in `crates/onnx-genai-server/src/routes.rs`. The cluster router's mirror struct (`crates/onnx-genai-router/src/node.rs` `NodeStatus`) deserializes both fields as `f32` and uses `f32` for overload-threshold comparisons (`NodeState.kv_usage: f32`, `accepts_affinity(overload_threshold: f32)`). `tokens_per_second` is `f64` in both — left unchanged.
+**Why:** The server was serializing `kv_usage`/`batch_utilization` as `f64`, causing a silent serde downcast on the router side. Per the §34.8 contract both sides must agree on canonical width.
+
+---
+
+### 2026-07-20: onnx-genai-router core (R2) — pure session-aware routing
+**By:** Roy (Rust engineer)
+**Commit:** 1f58099
+**What:** Created new standalone crate `crates/onnx-genai-router/` implementing the model-agnostic, session-aware router core from DESIGN.md §34. Added to root `[workspace] members`. Pure logic + config + polling data model + full unit tests; proxy/HTTP server deferred to R3. Modules: `config.rs` (`RouterConfig` YAML: listen, nodes[], routing, health, session_map; `RoutingPolicy` enum); `node.rs` (`NodeId`, `NodeState`, `NodeStatus` deserialize mirror, `NodeStatusFetcher` trait as R3 async seam); `router.rs` (`Router`, `RouteRequest`, `RoutingDecision`, affinity→prefix→least-loaded per §34.5); `session_map.rs` (affinity table + optional JSON persistence + `MigrationEvent`/`MigrationReason`); `prefix_map.rs` (prefix-hash→node map + FNV-1a 64-bit `hash_system_prompt`). Key decisions: (1) `/v1/status` contract mirrored not shared — router must NOT depend on server/engine/ORT crates; (2) `route`/`least_loaded_node` return `Option<NodeId>`, never panic; (3) model-agnostic opaque ids; (4) custom serde for `RoutingPolicy` YAML shape; (5) FNV-1a 64-bit prefix hash for cross-process stability.
+**Why:** Generic round-robin LBs are harmful for LLM inference (KV affinity, load asymmetry, prefix sharing — §34.1). This crate provides the smart routing layer kept small, pure, and fully unit-tested so R3 can add transport without touching decision logic.
+**Validation:** `cargo test -p onnx-genai-router` → 36 passed; clippy `-D warnings` → clean; workspace build ok.
+
+---
+
+### 2026-07-20: onnx-genai-router R3 — networking/runtime (proxy, API, poller, metrics)
+**By:** Roy (Rust engineer)
+**Commit:** ee8e464
+**What:** Turned `crates/onnx-genai-router/` into a runnable model-agnostic reverse-proxy binary on top of the R2 pure core. Added modules: `node_poller.rs`, `proxy.rs`, `api.rs`, `metrics.rs`, `state.rs`, `main.rs`, `tests/proxy_integration.rs`. Extended `router.rs` additively (draining set + `rebalance()` + `record_session_affinity()`). Key decisions: (1) hyper-util legacy client for transparent SSE streaming, no reqwest; (2) request bodies buffered ≤16 MiB for field extraction, response bodies streamed; (3) model-agnostic extraction (`session_id`/`session` for affinity, first system-role content for prefix hash); (4) `std::sync::Mutex` (not tokio) behind Arc, guard always dropped before `.await`; (5) `draining: HashSet<NodeId>` for §34.7 drain semantic; (6) rebalance reassigns affinity for unhealthy/draining/overloaded sessions only (lazy re-prefill); (7) hand-rolled Prometheus text, no prometheus crate; (8) lean deps: axum, hyper, hyper-util, http-body-util, bytes, clap, anyhow, tracing-subscriber. Endpoints: `GET /router/status`, `GET /router/sessions`, `GET /router/metrics`, `POST /router/drain/{node_id}`, `POST /router/rebalance`; all else proxied. CLI: `--config <router.yaml>` / `ONNX_GENAI_ROUTER_CONFIG`, optional `--listen`.
+**Why:** R2 shipped the pure decision core; R3 gives it a transport for actual reverse-proxy inference traffic with node health tracking, operational controls, and metrics — without model-specific behavior.
+**Validation:** `cargo test -p onnx-genai-router` → 67 passed; clippy `-D warnings` → clean; manual smoke: binary boots, poller demotes unreachable node, all API endpoints behave correctly.
+
+---
+
+### 2026-07-20: onnx-genai-router — `affinity_weight` as continuous scoring bonus in Weighted policy
+**By:** Roy (Rust engineer)
+**Commit:** 54e5363
+**What:** Implemented `affinity_weight` in the `Weighted` routing policy as a continuous scoring bonus rather than a binary gate. Removed binary `Step::Affinity` gate from `Weighted`'s `policy_steps` (only `Step::Prefix` remains as pre-step). Added `weighted_fallback_node(&self, request)` scoring all healthy, non-draining candidates via `weighted_node_score`: `kv_usage × kv_weight + normalized_queue × queue_weight − bonus`, where `bonus = affinity_weight` if the node is the session's affinity target AND `kv_usage < overload_threshold`, else 0. Removed misleading comment `"affinity_weight is applied in the affinity step, not here"` from `load_score()`. `least_loaded_node()`/`load_score()` unchanged (serve `rebalance()`).
+**Why:** DESIGN.md §34.5 defines Weighted as `affinity × 0.5 + kv_usage × 0.3 + queue_depth × 0.2` — affinity is a scored term, not a binary filter. The previous binary gate made Weighted identical to AffinityThenLoad for session-carrying requests. The fix makes Weighted a genuine smooth blend: affinity node wins more often when `affinity_weight` is high but loses to less-loaded nodes when the load delta is large enough.
+
+---
+
+### 2026-07-20: onnx-genai-router R3 — concurrency hardening (4 fixes)
+**By:** Roy (Rust engineer)
+**Commit:** a36cbbd
+**What:** Four hardening items from Deckard's 🟡 concurrency review of R3 (commit 54e5363). All 66 pre-existing + 7 new tests green; clippy clean.
+1. **Concurrent poller** [Medium]: `node_poller::poll_once` now snapshots `(id, address)` under one short lock, releases it, drives all `fetch` futures concurrently via `futures_util::future::join_all`, then applies each result under a short lock. Added `futures-util` dep (std+async-await). Mutex never held across `.await`. Chose `join_all` over `JoinSet` because `fetch` futures borrow `&F` (not `'static`).
+2. **Miss-on-unknown-id** [Low]: When `update_node` returns `false` (node self-reports id not in config), `apply_poll_result` now calls `record_node_miss` so the node accrues misses and demotes to unhealthy. Previously it stayed in healthy/zero-load state, attracting least-loaded routing.
+3. **Response cap** [Low]: `proxy::capture_session_affinity` no longer does uncapped `body.collect()`. If upstream advertises `Content-Length > MAX_REQUEST_BODY` (16 MiB), response is streamed through untouched (affinity capture skipped, request NOT failed). Otherwise body buffered with `axum::body::to_bytes(_, cap)`.
+4. **Rebalance overload guard** [Low]: Added `Router::least_loaded_node_below_threshold` (healthy && !draining && `kv_usage < overload_threshold`); used in `rebalance()` instead of `least_loaded_node`. When all healthy non-draining nodes are at/above threshold, rebalance leaves sessions in place — no thrash migration + re-prefill cost.
+**Why:** Serial poller degraded health refresh for healthy nodes when cluster was degraded; unknown-id nodes attracted traffic incorrectly; uncapped response buffering was a DoS vector; rebalance could thrash between saturated nodes with no benefit.
+

@@ -26,5 +26,9 @@ Roy's Phase 4, tool-use/grammar, and long-context plans were executed: pipeline 
 ## 2026-07-12T13:14:00-07:00 — Architecture review merged
 Roy's workspace review is now in decisions: crate split is sound, but engine.rs must be decomposed and §26 needs an engine loop/channel plus DecodeBackend before true batching. §27/§28 need SpeculativeProposer/verifier seams.
 
-## 2026-07-12T17:30:00-07:00 — DESIGN audit merged
-- Roy's §1-§38 audit is now canonical; remaining high-value gaps include embeddings, logprobs, model lifecycle, EAGLE-3 completion, audio/Whisper polish, debug/profiling, and real multimodal packages.
+## 2026-07-20T00:00:00Z — §34 Router R2+R3+affinity+hardening landed
+- R2 (commit 1f58099): Created `crates/onnx-genai-router/` — pure session-aware routing core. Modules: `config.rs`, `node.rs`, `router.rs`, `session_map.rs`, `prefix_map.rs`. Policies: AffinityThenLoad, PrefixThenLoad, LeastKvUsage, Weighted. FNV-1a 64-bit prefix hash; optional JSON session-map persistence. 36 unit tests, clippy clean.
+- R3 (commit ee8e464): Runnable reverse-proxy binary with `node_poller`, `proxy`, `api`, `metrics`, `state`, `main`. hyper-util client for transparent SSE streaming; hand-rolled Prometheus text; draining semantic; lazy rebalance. `/router/status|sessions|metrics|drain|rebalance` endpoints; all else proxied. 67 tests, clippy clean.
+- Affinity weight fix (commit 54e5363): `Weighted` policy corrected from binary gate to continuous scoring bonus per §34.5. Formula: `kv_usage × kv_weight + normalized_queue × queue_weight − bonus`, where `bonus = affinity_weight` if affinity node and below overload threshold.
+- R3 hardening (commit a36cbbd, post Deckard 🟡 review): (1) concurrent poller via `join_all`; (2) miss-on-unknown-id; (3) 16 MiB response cap on session affinity capture; (4) rebalance overload guard (`least_loaded_node_below_threshold`). 73 tests total.
+
