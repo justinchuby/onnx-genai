@@ -107,12 +107,14 @@ fn main() {
     profile::reset();
 
     let mut total_tokens = 0u64;
+    let mut last_text = String::new();
     let start = Instant::now();
     for _ in 0..args.runs {
         let result = engine
             .generate(request(&args.prompt, args.tokens))
             .expect("measured generate");
         total_tokens += result.token_ids.len() as u64;
+        last_text = result.text.clone();
         std::hint::black_box(&result);
     }
     let elapsed = start.elapsed();
@@ -127,6 +129,7 @@ fn main() {
         tok_per_s,
         per_token_us
     );
+    println!("--- generated text (coherence check) ---\n{last_text}\n---");
 
     if profile::enabled() {
         println!("{}", profile::report(total_tokens));
