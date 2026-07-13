@@ -11,7 +11,7 @@ _Last updated: 2026-07-12_
 | § | Feature | Status | Notes |
 |---|---------|--------|-------|
 | 1–8 | Vision, architecture, core components, data flow, concurrency, model dir, crates, deps | ✅ Done | |
-| 9 | API surface | 🟡 Partial | chat/completions/models/sessions/status/metrics/audio ✅; embeddings (#7), `/v1/debug/*` (#13) missing |
+| 9 | API surface | 🟡 Partial | chat/completions/models/sessions/status/metrics/audio/embeddings(#7 scaffold)/logprobs(#8) ✅; `/v1/debug/*` (#13) pending |
 | 11,12,15 | Testing, design decisions | ✅ Done | coverage ~77% |
 | 16 | Quantized models | ✅ Done | EP select + int8 KV; fp8 KV = #15 |
 | 17 | Diffusion pipeline (image) | ❌ Missing | #16 |
@@ -58,4 +58,7 @@ Complete runtime built from scaffold + published: generation (greedy/speculative
   - **In progress:** Q4+GQA WebGPU model (quantized weights + on-device attention) — the fair GPU comparison vs LM Studio Metal.
   - **Q4+GQA WebGPU = 30.5 tok/s** (168 MatMulNBits + 24 GQA); quantized embedding via `GatherBlockQuantized` (272MB→76MB, mobius PR #400); Q4_K_M support (PR #399).
   - **Device-resident KV blocked by ORT 1.27 WebGPU EP** — binding a user-preallocated device tensor as an in-place GQA share-buffer SIGSEGVs on long gens; gated behind `ONNX_GENAI_DEVICE_KV=1`. Safe default (`validationMode=disabled`) ships → **~49.6 tok/s** (no regression). Plumbing ready for when ORT fixes it — and for **CUDA** (mature IoBinding + `enable_cuda_graph`), the likely path to close the gap on H200.
-  - Next: CUDA EP support (feature-gated device-KV + cuda-graph, user tests on H200); benchmark stacked model vs LM Studio Metal, Ollama, and Foundry Local (ORT-based, most direct). Mobius PRs #395-400.
+  - **Profiling (Sebastian):** CPU decode is **98.9% `ort.session_run`** — our orchestration ~1% (KV Arc-rotated, no host copies, no prefill recompute). **We are ORT-kernel-bound, not runtime-bound** (CPU 43.6 vs LM Studio CPU 157, 3.6×). `onnx-genai-ort/profile.rs` + `bench/profile_decode.rs`; `ONNX_GENAI_INTRA_OP_THREADS` knob; `docs/benchmarks/H200-CUDA-runbook.md`.
+  - **Model-side levers (ours):** quantized embedding (`GatherBlockQuantized`, mobius #400) + quantized output head (mobius #401) → all-quantized graph (0 fp32 MatMul), 1.2 GB → 399 MB. Decode speedup pending rigorous re-benchmark. Residual gap = ORT int4 MLAS CPU kernel vs llama.cpp GGML (upstream, not ours).
+  - **CUDA (H200):** `--features cuda`, device-resident KV + `enable_cuda_graph` (works on CUDA unlike ORT-blocked WebGPU). Runbook committed. Next: Foundry Local comparison (ORT-vs-ORT).
+  - Config standard: `InferenceMetadata` now has a `schemars`-derived JSON Schema (`schema/inference_metadata.schema.json`, Draft 2020-12). Mobius PRs #395-401.
