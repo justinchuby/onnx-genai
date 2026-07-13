@@ -169,6 +169,20 @@ impl PrefixCache {
         released
     }
 
+    /// Detach an exact cached prefix, returning the pages it referenced.
+    ///
+    /// Unlike [`evict_lru`](Self::evict_lru) this targets a specific prefix and
+    /// ignores `ref_count`, so it is the primitive an owner uses for an explicit
+    /// remove. It only clears the node's page list and shared ref count; it does
+    /// **not** touch page-table ref counts (the caller owns that accounting).
+    pub fn remove(&mut self, tokens: &[TokenId]) -> Vec<PageId> {
+        let Some(node) = self.find_node_mut(tokens) else {
+            return Vec::new();
+        };
+        node.ref_count = 0;
+        std::mem::take(&mut node.page_ids)
+    }
+
     /// Number of trie nodes excluding the root.
     pub fn len(&self) -> usize {
         Self::count_nodes(&self.root)

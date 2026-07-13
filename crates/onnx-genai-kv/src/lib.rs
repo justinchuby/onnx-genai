@@ -23,6 +23,7 @@
 
 pub mod connector;
 pub mod fp8;
+pub mod local_tiered;
 pub mod page_table;
 pub mod paged_cache;
 pub mod prefix_cache;
@@ -34,6 +35,7 @@ pub use connector::{
     KvStoreEntry, KvTensorRef, NullConnector, TokenChunk, chunk_tokens, hash_tokens,
 };
 pub use fp8::{Fp8Format, decode_f32 as decode_fp8, encode_f32 as encode_fp8};
+pub use local_tiered::{DiskTierConfig, LocalTieredConfig, LocalTieredConnector};
 pub use page_table::{
     KvDType, KvKind, KvQuantConfig, LayerKvDType, Page, PageId, PageTable, PageTensorConfig,
 };
