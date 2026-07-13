@@ -21,6 +21,16 @@ fn tiny_state() -> AppState {
     AppState::load(&model_dir, Some("tiny-llm".to_string())).expect("load fixture")
 }
 
+fn sse_json_events(body: &[u8]) -> Vec<Value> {
+    std::str::from_utf8(body)
+        .unwrap()
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter(|data| *data != "[DONE]")
+        .map(|data| serde_json::from_str(data).unwrap())
+        .collect()
+}
+
 fn tiny_png_data_uri() -> String {
     use base64::{Engine as _, engine::general_purpose::STANDARD};
     use image::{DynamicImage, ImageFormat, Rgb, RgbImage};
@@ -183,6 +193,265 @@ fn embedding_request_accepts_openai_input_variants_and_defaults_to_float() {
         }))
         .is_err()
     );
+}
+
+#[tokio::test]
+async fn chat_logprobs_match_openai_shape_and_are_opt_in() {
+    let router = app(tiny_state());
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "tiny-llm",
+                        "messages": [{"role": "user", "content": "hello"}],
+                        "max_tokens": 2,
+                        "temperature": 0.0,
+                        "logprobs": true,
+                        "top_logprobs": 2
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let content = body["choices"][0]["logprobs"]["content"]
+        .as_array()
+        .unwrap();
+    assert_eq!(
+        content.len(),
+        body["usage"]["completion_tokens"].as_u64().unwrap() as usize
+    );
+    for token in content {
+        let token_text = token["token"].as_str().unwrap();
+        let bytes = token["bytes"].as_array().unwrap();
+        assert_eq!(
+            bytes
+                .iter()
+                .map(|byte| byte.as_u64().unwrap() as u8)
+                .collect::<Vec<_>>(),
+            token_text.as_bytes()
+        );
+        assert!(token["logprob"].is_number());
+        let top_logprobs = token["top_logprobs"].as_array().unwrap();
+        assert!(top_logprobs.len() <= 2);
+        for alternative in top_logprobs {
+            let token_text = alternative["token"].as_str().unwrap();
+            assert_eq!(
+                alternative["bytes"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|byte| byte.as_u64().unwrap() as u8)
+                    .collect::<Vec<_>>(),
+                token_text.as_bytes()
+            );
+        }
+    }
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "tiny-llm",
+                        "messages": [{"role": "user", "content": "hello"}],
+                        "max_tokens": 1,
+                        "temperature": 0.0
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert!(body["choices"][0]["logprobs"].is_null());
+}
+
+#[tokio::test]
+async fn completion_logprobs_match_legacy_openai_shape() {
+    let response = app(tiny_state())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/completions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "tiny-llm",
+                        "prompt": "hello",
+                        "max_tokens": 3,
+                        "temperature": 0.0,
+                        "logprobs": 2
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let logprobs = &body["choices"][0]["logprobs"];
+    let tokens = logprobs["tokens"].as_array().unwrap();
+    let token_logprobs = logprobs["token_logprobs"].as_array().unwrap();
+    let top_logprobs = logprobs["top_logprobs"].as_array().unwrap();
+    let offsets = logprobs["text_offset"].as_array().unwrap();
+    assert_eq!(tokens.len(), 3);
+    assert_eq!(token_logprobs.len(), tokens.len());
+    assert_eq!(top_logprobs.len(), tokens.len());
+    assert_eq!(offsets.len(), tokens.len());
+    let mut expected_offset = 0;
+    for index in 0..tokens.len() {
+        assert_eq!(offsets[index].as_u64().unwrap() as usize, expected_offset);
+        expected_offset += tokens[index].as_str().unwrap().len();
+        assert!(top_logprobs[index].as_object().unwrap().len() <= 2);
+    }
+}
+
+#[tokio::test]
+async fn streaming_chat_and_completion_chunks_include_logprobs() {
+    let chat = app(tiny_state())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "tiny-llm",
+                        "messages": [{"role": "user", "content": "hello"}],
+                        "max_tokens": 2,
+                        "temperature": 0.0,
+                        "stream": true,
+                        "logprobs": true,
+                        "top_logprobs": 1
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let events = sse_json_events(&to_bytes(chat.into_body(), usize::MAX).await.unwrap());
+    let content_events = events
+        .iter()
+        .filter(|event| event["choices"][0]["delta"]["content"].is_string())
+        .collect::<Vec<_>>();
+    assert_eq!(content_events.len(), 2);
+    for event in content_events {
+        let record = &event["choices"][0]["logprobs"]["content"][0];
+        assert_eq!(event["choices"][0]["delta"]["content"], record["token"]);
+        assert_eq!(record["top_logprobs"].as_array().unwrap().len(), 1);
+        assert!(record["bytes"].is_array());
+    }
+
+    let completion = app(tiny_state())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/completions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "tiny-llm",
+                        "prompt": "hello",
+                        "max_tokens": 2,
+                        "temperature": 0.0,
+                        "stream": true,
+                        "logprobs": 1
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let events = sse_json_events(&to_bytes(completion.into_body(), usize::MAX).await.unwrap());
+    let token_events = events
+        .iter()
+        .filter(|event| {
+            !event["choices"][0]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .is_empty()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(token_events.len(), 2);
+    for event in token_events {
+        let logprobs = &event["choices"][0]["logprobs"];
+        assert_eq!(logprobs["tokens"].as_array().unwrap().len(), 1);
+        assert_eq!(logprobs["token_logprobs"].as_array().unwrap().len(), 1);
+        assert_eq!(logprobs["top_logprobs"].as_array().unwrap().len(), 1);
+        assert_eq!(logprobs["text_offset"].as_array().unwrap().len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn logprobs_validation_enforces_openai_limits() {
+    for body in [
+        json!({
+            "model": "tiny-llm",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 1,
+            "top_logprobs": 1
+        }),
+        json!({
+            "model": "tiny-llm",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 1,
+            "logprobs": true,
+            "top_logprobs": 21
+        }),
+    ] {
+        let response = app(tiny_state())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    let response = app(tiny_state())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/completions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "tiny-llm",
+                        "prompt": "hello",
+                        "max_tokens": 1,
+                        "logprobs": 6
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
 #[test]

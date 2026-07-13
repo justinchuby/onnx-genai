@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use onnx_genai::StopSequence;
 use serde::{Deserialize, Serialize};
 
@@ -92,6 +94,10 @@ pub struct ChatCompletionRequest {
     pub tools: Option<Vec<ChatTool>>,
     #[serde(default)]
     pub tool_choice: Option<ToolChoice>,
+    #[serde(default)]
+    pub logprobs: bool,
+    #[serde(default)]
+    pub top_logprobs: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -116,6 +122,8 @@ pub struct CompletionRequest {
     pub stream: bool,
     #[serde(default)]
     pub stop: Option<StopInput>,
+    #[serde(default)]
+    pub logprobs: Option<usize>,
 }
 
 impl ChatCompletionRequest {
@@ -360,6 +368,27 @@ pub struct ChatChoice {
     pub index: usize,
     pub message: ChatMessage,
     pub finish_reason: &'static str,
+    pub logprobs: Option<ChatLogprobs>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ChatLogprobs {
+    pub content: Vec<ChatTokenLogprob>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ChatTokenLogprob {
+    pub token: String,
+    pub logprob: f32,
+    pub bytes: Vec<u8>,
+    pub top_logprobs: Vec<ChatTopLogprob>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ChatTopLogprob {
+    pub token: String,
+    pub logprob: f32,
+    pub bytes: Vec<u8>,
 }
 
 #[derive(Debug, Serialize)]
@@ -384,7 +413,15 @@ pub struct CompletionChoice {
     pub text: String,
     pub index: usize,
     pub finish_reason: &'static str,
-    pub logprobs: Option<serde_json::Value>,
+    pub logprobs: Option<CompletionLogprobs>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CompletionLogprobs {
+    pub tokens: Vec<String>,
+    pub token_logprobs: Vec<f32>,
+    pub top_logprobs: Vec<BTreeMap<String, f32>>,
+    pub text_offset: Vec<usize>,
 }
 
 fn default_max_tokens() -> usize {

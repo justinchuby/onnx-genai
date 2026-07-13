@@ -14,7 +14,7 @@ use onnx_genai::{
     FinishReason, GenerateOptions, GeneratePrompt, GenerateRequest, GenerateResult, SessionId,
     StopSequence,
 };
-use onnx_genai_engine::GenerateConstraint;
+use onnx_genai_engine::{GenerateConstraint, TokenLogprob};
 use onnx_genai_ort::{ChatMessage as TemplateChatMessage, ChatTemplate, Tokenizer};
 use serde::Serialize;
 use tokio::sync::mpsc;
@@ -29,8 +29,9 @@ use crate::{
     state::{AppState, ServerConfig},
     types::{
         AudioTranscriptionResponse, ChatChoice, ChatCompletionRequest, ChatCompletionResponse,
-        ChatMessage, ChatMessageContent, ChatMessageToolCall, ChatMessageToolCallFunction,
-        ChatTool, CompletionChoice, CompletionRequest, CompletionResponse, EmbeddingInput,
+        ChatLogprobs, ChatMessage, ChatMessageContent, ChatMessageToolCall,
+        ChatMessageToolCallFunction, ChatTokenLogprob, ChatTool, ChatTopLogprob, CompletionChoice,
+        CompletionLogprobs, CompletionRequest, CompletionResponse, EmbeddingInput,
         EmbeddingRequest, EmbeddingResponse, InputAudio, StopInput, ToolChoice, ToolChoiceMode,
         Usage,
     },
@@ -39,6 +40,8 @@ use crate::{
 const SESSION_ID_HEADER: &str = "x-session-id";
 const MAX_SESSION_ID_LEN: usize = 128;
 const OVERLOAD_RETRY_AFTER_SECS: u64 = 1;
+const MAX_CHAT_TOP_LOGPROBS: usize = 20;
+const MAX_COMPLETION_LOGPROBS: usize = 5;
 
 #[derive(Debug, Serialize)]
 pub(crate) struct ModelsResponse {
@@ -501,6 +504,8 @@ async fn run_completion(
     let id = text_completion_id();
     let created = now_unix();
     let model = request.model.clone();
+    let requested_logprobs = request.logprobs;
+    let tokenizer = state.tokenizer.clone();
     let prepared = prepare_completion(&request, &state)?;
     enforce_context_cap(
         prepared.prompt_tokens,
@@ -514,6 +519,8 @@ async fn run_completion(
     .map_err(|err| ApiError::internal(format!("generation failed: {err}")))?;
     crate::metrics::add_prompt_tokens(prepared.prompt_tokens);
     let completion_tokens = result.token_ids.len();
+    let logprobs = completion_logprobs(&result, &tokenizer, requested_logprobs)
+        .map_err(|err| ApiError::internal(format!("logprobs conversion failed: {err}")))?;
 
     Ok(CompletionResponse {
         id,
@@ -524,7 +531,7 @@ async fn run_completion(
             text: result.text,
             index: 0,
             finish_reason: finish_reason_label(&result.finish_reason),
-            logprobs: None,
+            logprobs,
         }],
         usage: Usage {
             prompt_tokens: prepared.prompt_tokens,
@@ -542,6 +549,8 @@ async fn stream_completion(
     let id = text_completion_id();
     let created = now_unix();
     let model = request.model.clone();
+    let requested_logprobs = request.logprobs;
+    let tokenizer = state.tokenizer.clone();
     let user_stop_sequences = request
         .stop
         .clone()
@@ -559,18 +568,21 @@ async fn stream_completion(
     let (tx, rx) = mpsc::channel(16);
 
     tokio::spawn(async move {
-        let mut stop_buffer = StopBoundaryBuffer::new(user_stop_sequences);
+        let mut stop_buffer = StopBoundaryBuffer::new(user_stop_sequences.clone());
         let mut emitted_text = false;
         let result = loop {
             match driver_rx.recv().await {
                 Some(DriverEvent::Token(token)) => {
+                    if requested_logprobs.is_some() {
+                        continue;
+                    }
                     let finish_reason = token.finish_reason.clone();
                     let text = stop_buffer.push(&token.text);
                     if !text.is_empty() {
                         emitted_text = true;
                         send_completion_stream_chunk(
                             &tx,
-                            completion_chunk(&id, created, &model, text),
+                            completion_chunk(&id, created, &model, text, None),
                         )
                         .await?;
                     }
@@ -586,10 +598,20 @@ async fn stream_completion(
 
         match result {
             Ok(result) => {
-                if !emitted_text && !result.text.is_empty() {
+                if let Some(requested_logprobs) = requested_logprobs {
+                    send_completion_logprob_chunks(
+                        &tx,
+                        (&id, created, &model),
+                        &result,
+                        &tokenizer,
+                        requested_logprobs,
+                        &user_stop_sequences,
+                    )
+                    .await?;
+                } else if !emitted_text && !result.text.is_empty() {
                     send_completion_stream_chunk(
                         &tx,
-                        completion_chunk(&id, created, &model, result.text),
+                        completion_chunk(&id, created, &model, result.text, None),
                     )
                     .await?;
                 } else if !matches!(result.finish_reason, FinishReason::StopSequence { .. }) {
@@ -597,7 +619,7 @@ async fn stream_completion(
                     if !text.is_empty() {
                         send_completion_stream_chunk(
                             &tx,
-                            completion_chunk(&id, created, &model, text),
+                            completion_chunk(&id, created, &model, text, None),
                         )
                         .await?;
                     }
@@ -703,6 +725,10 @@ async fn run_chat_completion(
     let id = completion_id();
     let created = now_unix();
     let model = request.model.clone();
+    let requested_top_logprobs = request
+        .logprobs
+        .then_some(request.top_logprobs.unwrap_or(0));
+    let tokenizer = state.tokenizer.clone();
     let mut prepared = prepare_generate_request(
         &request,
         &state.tokenizer,
@@ -778,9 +804,11 @@ async fn run_chat_completion(
         None
     };
 
-    let (content, tool_calls, completion_tokens, finish_reason) = match result {
+    let (content, tool_calls, completion_tokens, finish_reason, logprobs) = match result {
         Ok(result) => {
             let default_finish_reason = finish_reason_label(&result.finish_reason);
+            let logprobs = chat_logprobs(&result, &tokenizer, requested_top_logprobs)
+                .map_err(|err| ApiError::internal(format!("logprobs conversion failed: {err}")))?;
             let parsed = if tools_parseable_from_output(&request) {
                 parse_assistant_output(result.text, default_finish_reason)
             } else {
@@ -795,12 +823,13 @@ async fn run_chat_completion(
                 parsed.tool_calls,
                 result.token_ids.len(),
                 parsed.finish_reason,
+                logprobs,
             )
         }
         Err(err)
             if wants_json_object && json_constraint_stopped_incomplete_message(&err.message) =>
         {
-            (Some("{}".to_string()), None, 0, "stop")
+            (Some("{}".to_string()), None, 0, "stop", None)
         }
         Err(err) => return Err(err),
     };
@@ -819,6 +848,7 @@ async fn run_chat_completion(
                 tool_call_id: None,
             },
             finish_reason,
+            logprobs,
         }],
         usage: Some(Usage {
             prompt_tokens,
@@ -840,6 +870,10 @@ async fn stream_chat_completion(
     let id = completion_id();
     let created = now_unix();
     let model = request.model.clone();
+    let requested_top_logprobs = request
+        .logprobs
+        .then_some(request.top_logprobs.unwrap_or(0));
+    let tokenizer = state.tokenizer.clone();
     let user_stop_sequences = request
         .stop
         .clone()
@@ -907,19 +941,22 @@ async fn stream_chat_completion(
     tokio::spawn(async move {
         send_stream_chunk(&tx, role_chunk(&id, created, &model)).await?;
 
-        let mut stop_buffer = StopBoundaryBuffer::new(user_stop_sequences);
+        let mut stop_buffer = StopBoundaryBuffer::new(user_stop_sequences.clone());
         let mut buffered_text = String::new();
         let buffer_for_tool_detection =
             request.has_tool_context() && tools_parseable_from_output(&request);
         let result = loop {
             match driver_rx.recv().await {
                 Some(DriverEvent::Token(token)) => {
+                    if requested_top_logprobs.is_some() {
+                        continue;
+                    }
                     let finish_reason = token.finish_reason.clone();
                     let content = stop_buffer.push(&token.text);
                     if buffer_for_tool_detection {
                         buffered_text.push_str(&content);
                     } else if !wants_json_object && !content.is_empty() {
-                        send_stream_chunk(&tx, content_chunk(&id, created, &model, content))
+                        send_stream_chunk(&tx, content_chunk(&id, created, &model, content, None))
                             .await?;
                     }
                     if matches!(finish_reason, Some(FinishReason::StopSequence { .. })) {
@@ -934,7 +971,39 @@ async fn stream_chat_completion(
 
         match result {
             Ok(result) => {
-                if buffer_for_tool_detection {
+                if let Some(requested_top_logprobs) = requested_top_logprobs {
+                    let tool_calls = if buffer_for_tool_detection {
+                        parse_tool_calls(&result.text)
+                    } else {
+                        Vec::new()
+                    };
+                    if tool_calls.is_empty() {
+                        send_chat_logprob_chunks(
+                            &tx,
+                            (&id, created, &model),
+                            &result,
+                            &tokenizer,
+                            requested_top_logprobs,
+                            &user_stop_sequences,
+                        )
+                        .await?;
+                        send_stream_chunk(
+                            &tx,
+                            done_chunk(
+                                &id,
+                                created,
+                                &model,
+                                finish_reason_label(&result.finish_reason),
+                            ),
+                        )
+                        .await?;
+                    } else {
+                        send_stream_chunk(&tx, tool_calls_chunk(&id, created, &model, tool_calls))
+                            .await?;
+                        send_stream_chunk(&tx, done_chunk(&id, created, &model, "tool_calls"))
+                            .await?;
+                    }
+                } else if buffer_for_tool_detection {
                     if !matches!(result.finish_reason, FinishReason::StopSequence { .. }) {
                         buffered_text.push_str(&stop_buffer.flush());
                     }
@@ -943,7 +1012,7 @@ async fn stream_chat_completion(
                         if !buffered_text.is_empty() {
                             send_stream_chunk(
                                 &tx,
-                                content_chunk(&id, created, &model, buffered_text),
+                                content_chunk(&id, created, &model, buffered_text, None),
                             )
                             .await?;
                         }
@@ -965,8 +1034,11 @@ async fn stream_chat_completion(
                     }
                 } else if wants_json_object {
                     if !result.text.is_empty() {
-                        send_stream_chunk(&tx, content_chunk(&id, created, &model, result.text))
-                            .await?;
+                        send_stream_chunk(
+                            &tx,
+                            content_chunk(&id, created, &model, result.text, None),
+                        )
+                        .await?;
                     }
                     send_stream_chunk(
                         &tx,
@@ -982,8 +1054,11 @@ async fn stream_chat_completion(
                     if !matches!(result.finish_reason, FinishReason::StopSequence { .. }) {
                         let content = stop_buffer.flush();
                         if !content.is_empty() {
-                            send_stream_chunk(&tx, content_chunk(&id, created, &model, content))
-                                .await?;
+                            send_stream_chunk(
+                                &tx,
+                                content_chunk(&id, created, &model, content, None),
+                            )
+                            .await?;
                         }
                     }
                     send_stream_chunk(
@@ -999,8 +1074,11 @@ async fn stream_chat_completion(
                 }
             }
             Err(err) if wants_json_object && json_constraint_stopped_incomplete_message(&err) => {
-                send_stream_chunk(&tx, content_chunk(&id, created, &model, "{}".to_string()))
-                    .await?;
+                send_stream_chunk(
+                    &tx,
+                    content_chunk(&id, created, &model, "{}".to_string(), None),
+                )
+                .await?;
                 send_stream_chunk(&tx, done_chunk(&id, created, &model, "stop")).await?;
             }
             Err(err) => {
@@ -1127,6 +1205,19 @@ fn validate_request(
             "top_p must be finite and non-negative",
         ));
     }
+    if request
+        .top_logprobs
+        .is_some_and(|count| count > MAX_CHAT_TOP_LOGPROBS)
+    {
+        return Err(ApiError::bad_request(format!(
+            "top_logprobs must be between 0 and {MAX_CHAT_TOP_LOGPROBS}"
+        )));
+    }
+    if request.top_logprobs.is_some() && !request.logprobs {
+        return Err(ApiError::bad_request(
+            "top_logprobs requires logprobs to be true",
+        ));
+    }
     validate_tool_choice(request)?;
     Ok(())
 }
@@ -1166,6 +1257,14 @@ fn validate_completion_request(
     }
     if !request.presence_penalty.is_finite() {
         return Err(ApiError::bad_request("presence_penalty must be finite"));
+    }
+    if request
+        .logprobs
+        .is_some_and(|count| count > MAX_COMPLETION_LOGPROBS)
+    {
+        return Err(ApiError::bad_request(format!(
+            "logprobs must be between 0 and {MAX_COMPLETION_LOGPROBS}"
+        )));
     }
     Ok(())
 }
@@ -1377,6 +1476,7 @@ fn build_completion_options(request: &CompletionRequest, tokenizer: &Tokenizer) 
         min_p: request.min_p,
         frequency_penalty: request.frequency_penalty,
         presence_penalty: request.presence_penalty,
+        top_logprobs: request.logprobs,
         ..GenerateOptions::default()
     };
     if let Some(stop) = request.stop.clone() {
@@ -1415,6 +1515,9 @@ fn build_generate_options(request: &ChatCompletionRequest) -> GenerateOptions {
         max_new_tokens: request.max_tokens,
         temperature: request.temperature,
         top_p: request.top_p,
+        top_logprobs: request
+            .logprobs
+            .then_some(request.top_logprobs.unwrap_or(0)),
         ..GenerateOptions::default()
     };
     if let Some(stop) = request.stop.clone() {
@@ -1690,6 +1793,225 @@ fn parsed_tool_call_to_openai(
             arguments: serde_json::to_string(&arguments).ok()?,
         },
     })
+}
+
+fn chat_logprobs(
+    result: &GenerateResult,
+    tokenizer: &Tokenizer,
+    requested_top_logprobs: Option<usize>,
+) -> anyhow::Result<Option<ChatLogprobs>> {
+    let Some(requested_top_logprobs) = requested_top_logprobs else {
+        return Ok(None);
+    };
+    let logprobs = result
+        .logprobs
+        .as_deref()
+        .context("engine did not return requested logprobs")?;
+    if logprobs.len() != result.token_ids.len() {
+        anyhow::bail!(
+            "engine returned {} logprob records for {} generated tokens",
+            logprobs.len(),
+            result.token_ids.len()
+        );
+    }
+    let content = logprobs
+        .iter()
+        .map(|entry| chat_token_logprob(tokenizer, entry, requested_top_logprobs))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    Ok(Some(ChatLogprobs { content }))
+}
+
+fn chat_token_logprob(
+    tokenizer: &Tokenizer,
+    entry: &TokenLogprob,
+    requested_top_logprobs: usize,
+) -> anyhow::Result<ChatTokenLogprob> {
+    let token = decode_logprob_token(tokenizer, entry.token_id)?;
+    let top_logprobs = entry
+        .top
+        .iter()
+        .take(requested_top_logprobs)
+        .map(|&(token_id, logprob)| {
+            let token = decode_logprob_token(tokenizer, token_id)?;
+            Ok(ChatTopLogprob {
+                bytes: token.as_bytes().to_vec(),
+                token,
+                logprob,
+            })
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    Ok(ChatTokenLogprob {
+        bytes: token.as_bytes().to_vec(),
+        token,
+        logprob: entry.logprob,
+        top_logprobs,
+    })
+}
+
+fn completion_logprobs(
+    result: &GenerateResult,
+    tokenizer: &Tokenizer,
+    requested_top_logprobs: Option<usize>,
+) -> anyhow::Result<Option<CompletionLogprobs>> {
+    let Some(requested_top_logprobs) = requested_top_logprobs else {
+        return Ok(None);
+    };
+    let logprobs = result
+        .logprobs
+        .as_deref()
+        .context("engine did not return requested logprobs")?;
+    if logprobs.len() != result.token_ids.len() {
+        anyhow::bail!(
+            "engine returned {} logprob records for {} generated tokens",
+            logprobs.len(),
+            result.token_ids.len()
+        );
+    }
+
+    let mut tokens = Vec::with_capacity(logprobs.len());
+    let mut token_logprobs = Vec::with_capacity(logprobs.len());
+    let mut top_logprobs = Vec::with_capacity(logprobs.len());
+    let mut text_offset = Vec::with_capacity(logprobs.len());
+    let mut offset = 0;
+    for entry in logprobs {
+        let token = decode_logprob_token(tokenizer, entry.token_id)?;
+        text_offset.push(offset);
+        offset += token.len();
+        tokens.push(token);
+        token_logprobs.push(entry.logprob);
+        top_logprobs.push(
+            entry
+                .top
+                .iter()
+                .take(requested_top_logprobs)
+                .map(|&(token_id, logprob)| {
+                    Ok((decode_logprob_token(tokenizer, token_id)?, logprob))
+                })
+                .collect::<anyhow::Result<_>>()?,
+        );
+    }
+    Ok(Some(CompletionLogprobs {
+        tokens,
+        token_logprobs,
+        top_logprobs,
+        text_offset,
+    }))
+}
+
+fn decode_logprob_token(tokenizer: &Tokenizer, token_id: u32) -> anyhow::Result<String> {
+    let decoded = tokenizer
+        .decode(&[token_id])
+        .with_context(|| format!("failed to decode token id {token_id}"))?;
+    if !decoded.is_empty() {
+        return Ok(decoded);
+    }
+    tokenizer
+        .inner()
+        .id_to_token(token_id)
+        .with_context(|| format!("token id {token_id} is not in the tokenizer vocabulary"))
+}
+
+async fn send_completion_logprob_chunks(
+    tx: &mpsc::Sender<Result<Event, Infallible>>,
+    response: (&str, u64, &str),
+    result: &GenerateResult,
+    tokenizer: &Tokenizer,
+    requested_top_logprobs: usize,
+    stop_sequences: &[String],
+) -> anyhow::Result<()> {
+    let (id, created, model) = response;
+    let logprobs = completion_logprobs(result, tokenizer, Some(requested_top_logprobs))?
+        .context("requested completion logprobs were not built")?;
+    let stream_text = result
+        .token_ids
+        .iter()
+        .map(|&token_id| tokenizer.decode(&[token_id]).map_err(anyhow::Error::from))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let visible_text = truncate_tokens_at_stop(&stream_text, stop_sequences);
+    for (index, text) in visible_text.into_iter().enumerate() {
+        if text.is_empty() {
+            continue;
+        }
+        send_completion_stream_chunk(
+            tx,
+            completion_chunk(
+                id,
+                created,
+                model,
+                text,
+                Some(CompletionLogprobs {
+                    tokens: vec![logprobs.tokens[index].clone()],
+                    token_logprobs: vec![logprobs.token_logprobs[index]],
+                    top_logprobs: vec![logprobs.top_logprobs[index].clone()],
+                    text_offset: vec![logprobs.text_offset[index]],
+                }),
+            ),
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn send_chat_logprob_chunks(
+    tx: &mpsc::Sender<Result<Event, Infallible>>,
+    response: (&str, u64, &str),
+    result: &GenerateResult,
+    tokenizer: &Tokenizer,
+    requested_top_logprobs: usize,
+    stop_sequences: &[String],
+) -> anyhow::Result<()> {
+    let (id, created, model) = response;
+    let logprobs = chat_logprobs(result, tokenizer, Some(requested_top_logprobs))?
+        .context("requested chat logprobs were not built")?;
+    let stream_text = result
+        .token_ids
+        .iter()
+        .map(|&token_id| tokenizer.decode(&[token_id]).map_err(anyhow::Error::from))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let visible_text = truncate_tokens_at_stop(&stream_text, stop_sequences);
+    for (index, content) in visible_text.into_iter().enumerate() {
+        if content.is_empty() {
+            continue;
+        }
+        send_stream_chunk(
+            tx,
+            content_chunk(
+                id,
+                created,
+                model,
+                content,
+                Some(ChatLogprobs {
+                    content: vec![logprobs.content[index].clone()],
+                }),
+            ),
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+fn truncate_tokens_at_stop(tokens: &[String], stop_sequences: &[String]) -> Vec<String> {
+    let text = tokens.concat();
+    let cutoff = stop_sequences
+        .iter()
+        .filter(|stop| !stop.is_empty())
+        .filter_map(|stop| text.find(stop))
+        .min()
+        .unwrap_or(text.len());
+    let mut cursor = 0;
+    let mut visible = Vec::new();
+    for token in tokens {
+        if cursor >= cutoff {
+            break;
+        }
+        let mut end = (cutoff - cursor).min(token.len());
+        while !token.is_char_boundary(end) {
+            end -= 1;
+        }
+        visible.push(token[..end].to_string());
+        cursor += token.len();
+    }
+    visible
 }
 
 fn finish_reason_label(reason: &FinishReason) -> &'static str {

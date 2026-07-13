@@ -5,7 +5,9 @@ use axum::response::sse::Event;
 use serde::Serialize;
 use tokio::sync::mpsc;
 
-use crate::types::{ChatMessageToolCall, ChatMessageToolCallFunction};
+use crate::types::{
+    ChatLogprobs, ChatMessageToolCall, ChatMessageToolCallFunction, CompletionLogprobs,
+};
 
 #[derive(Debug, Serialize)]
 pub(crate) struct CompletionChunk {
@@ -21,7 +23,7 @@ pub(crate) struct CompletionChunkChoice {
     text: String,
     index: usize,
     finish_reason: Option<&'static str>,
-    logprobs: Option<serde_json::Value>,
+    logprobs: Option<CompletionLogprobs>,
 }
 
 #[derive(Debug, Serialize)]
@@ -37,6 +39,7 @@ pub(crate) struct ChatCompletionChunk {
 pub(crate) struct ChunkChoice {
     index: usize,
     delta: Delta,
+    logprobs: Option<ChatLogprobs>,
     finish_reason: Option<&'static str>,
 }
 
@@ -144,6 +147,7 @@ pub(crate) fn completion_chunk(
     created: u64,
     model: &str,
     text: String,
+    logprobs: Option<CompletionLogprobs>,
 ) -> CompletionChunk {
     CompletionChunk {
         id: id.to_string(),
@@ -154,7 +158,7 @@ pub(crate) fn completion_chunk(
             text,
             index: 0,
             finish_reason: None,
-            logprobs: None,
+            logprobs,
         }],
     }
 }
@@ -192,6 +196,7 @@ pub(crate) fn role_chunk(id: &str, created: u64, model: &str) -> ChatCompletionC
                 content: None,
                 tool_calls: None,
             },
+            logprobs: None,
             finish_reason: None,
         }],
     }
@@ -202,6 +207,7 @@ pub(crate) fn content_chunk(
     created: u64,
     model: &str,
     content: String,
+    logprobs: Option<ChatLogprobs>,
 ) -> ChatCompletionChunk {
     ChatCompletionChunk {
         id: id.to_string(),
@@ -215,6 +221,7 @@ pub(crate) fn content_chunk(
                 content: Some(content),
                 tool_calls: None,
             },
+            logprobs,
             finish_reason: None,
         }],
     }
@@ -249,6 +256,7 @@ pub(crate) fn tool_calls_chunk(
                         .collect(),
                 ),
             },
+            logprobs: None,
             finish_reason: None,
         }],
     }
@@ -268,6 +276,7 @@ pub(crate) fn done_chunk(
         choices: vec![ChunkChoice {
             index: 0,
             delta: Delta::default(),
+            logprobs: None,
             finish_reason: Some(finish_reason),
         }],
     }
