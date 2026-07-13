@@ -1,0 +1,25 @@
+[package]
+name = "onnx-genai-router"
+description = "Lightweight, session-aware router for onnx-genai inference clusters"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords = ["onnx", "llm", "inference", "router", "load-balancing"]
+categories = ["web-programming", "network-programming"]
+
+[dependencies]
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+# R3 (follow-up milestone) adds the hyper reverse proxy + HTTP server. The
+# proxy.rs / api.rs / main.rs modules and their `hyper` dependency are
+# intentionally deferred so this milestone stays a pure, unit-testable core.
+# hyper = { version = "1", features = ["server", "client", "http1"] }
+
+[dev-dependencies]
+tempfile = "3"

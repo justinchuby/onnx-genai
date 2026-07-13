@@ -1619,6 +1619,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "onnx-genai-router"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "onnx-genai-scheduler"
 version = "0.1.0"
 dependencies = [
