@@ -19,7 +19,7 @@ use axum::extract::{Request, State};
 use axum::http::{HeaderMap, HeaderName, Method, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full};
+use http_body_util::Full;
 use hyper::Request as HyperRequest;
 use serde_json::Value;
 
@@ -157,16 +157,43 @@ async fn forward(
 
 /// Buffer a `/v1/sessions` response, record affinity for the server-assigned
 /// session id, then return the (rebuilt) response to the client.
+///
+/// The buffer is capped at [`MAX_REQUEST_BODY`] (symmetric with the request
+/// path). A session-creation response is small JSON. If the upstream advertises
+/// a `Content-Length` larger than the cap we **stream the response through
+/// untouched without capturing affinity** rather than failing the client's
+/// request. If the body has no `Content-Length` (e.g. chunked) and turns out to
+/// exceed the cap while buffering, we can no longer stream it (it has been
+/// consumed), so we surface a `502` — but this is not the streaming path a
+/// well-behaved session endpoint takes.
 async fn capture_session_affinity(
     state: &SharedState,
     node_id: &NodeId,
     response: Response,
 ) -> Response {
     let (parts, body) = response.into_parts();
-    let bytes = match body.collect().await {
-        Ok(collected) => collected.to_bytes(),
+
+    // If the upstream declares an oversize body up front, don't buffer it:
+    // stream it straight through and skip affinity capture.
+    let declared_len = content_length(&parts.headers);
+    if exceeds_cap(declared_len, MAX_REQUEST_BODY) {
+        tracing::warn!(
+            node = %node_id,
+            content_length = ?declared_len,
+            "/v1/sessions response exceeds buffer cap; streaming through without capturing affinity"
+        );
+        return Response::from_parts(parts, body);
+    }
+
+    // Buffer within the cap (symmetric with the request-path upload cap).
+    let bytes = match axum::body::to_bytes(body, MAX_REQUEST_BODY).await {
+        Ok(bytes) => bytes,
         Err(err) => {
-            tracing::warn!(error = %err, "failed to read /v1/sessions response body");
+            tracing::warn!(
+                node = %node_id,
+                error = %err,
+                "failed reading /v1/sessions response within buffer cap; skipping affinity capture"
+            );
             return (StatusCode::BAD_GATEWAY, "failed reading upstream response").into_response();
         }
     };
@@ -180,6 +207,22 @@ async fn capture_session_affinity(
     // A buffered body has a known length; drop any stale transfer-encoding.
     rebuilt.headers_mut().remove(header::TRANSFER_ENCODING);
     rebuilt
+}
+
+/// Parse a `Content-Length` header into bytes, if present and valid.
+fn content_length(headers: &HeaderMap) -> Option<u64> {
+    headers
+        .get(header::CONTENT_LENGTH)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()
+}
+
+/// Whether a declared body length is known to exceed the buffering cap.
+fn exceeds_cap(declared_len: Option<u64>, cap: usize) -> bool {
+    matches!(declared_len, Some(len) if len > cap as u64)
 }
 
 /// Extract the (opaque) affinity + prefix signals from a request body.
@@ -351,5 +394,59 @@ mod tests {
         assert!(is_hop_by_hop(&HeaderName::from_static("connection")));
         assert!(is_hop_by_hop(&HeaderName::from_static("host")));
         assert!(!is_hop_by_hop(&HeaderName::from_static("content-type")));
+    }
+
+    #[test]
+    fn oversize_content_length_exceeds_cap() {
+        // A declared length above the cap is oversize; at/below is not.
+        assert!(exceeds_cap(Some(MAX_REQUEST_BODY as u64 + 1), MAX_REQUEST_BODY));
+        assert!(!exceeds_cap(Some(MAX_REQUEST_BODY as u64), MAX_REQUEST_BODY));
+        assert!(!exceeds_cap(Some(0), MAX_REQUEST_BODY));
+        // Unknown length is not treated as oversize (buffer-with-cap path).
+        assert!(!exceeds_cap(None, MAX_REQUEST_BODY));
+    }
+
+    #[test]
+    fn content_length_parses_valid_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_LENGTH, "1234".parse().unwrap());
+        assert_eq!(content_length(&headers), Some(1234));
+
+        headers.insert(header::CONTENT_LENGTH, "not-a-number".parse().unwrap());
+        assert_eq!(content_length(&headers), None);
+
+        assert_eq!(content_length(&HeaderMap::new()), None);
+    }
+
+    #[tokio::test]
+    async fn oversize_session_response_streams_through_without_capturing() {
+        use crate::config::RoutingPolicy;
+        use crate::node::NodeState;
+        use crate::router::Router;
+        use crate::state::AppState;
+
+        let router = Router::new(
+            vec![NodeState::new("gpu-0", "10.0.0.1:8000")],
+            RoutingPolicy::AffinityThenLoad,
+        );
+        let state = AppState::new(router, 10);
+        let node_id = NodeId::new("gpu-0");
+
+        // Build a response that advertises an oversize Content-Length but whose
+        // body would parse as a session id if it were (wrongly) captured.
+        let body = br#"{"id":"should-not-be-captured"}"#.to_vec();
+        let mut response = Response::new(Body::from(body));
+        response.headers_mut().insert(
+            header::CONTENT_LENGTH,
+            ((MAX_REQUEST_BODY + 1) as u64).into(),
+        );
+
+        let out = capture_session_affinity(&state, &node_id, response).await;
+
+        // Streamed through unchanged (200, still declares the oversize length)
+        // and, crucially, NO affinity was recorded.
+        assert_eq!(out.status(), StatusCode::OK);
+        let router = state.router.lock().unwrap();
+        assert!(router.session_map().get("should-not-be-captured").is_none());
     }
 }

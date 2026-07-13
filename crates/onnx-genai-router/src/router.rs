@@ -193,7 +193,25 @@ impl Router {
             .map(|n| n.id.clone())
     }
 
-    /// Fallback node selection used by [`Self::pick`].
+    /// Like [`Self::least_loaded_node`] but additionally requires the candidate
+    /// to be *below* `overload_threshold`. Returns `None` when every healthy,
+    /// non-draining node is at/above the threshold. Used by [`Self::rebalance`]
+    /// so it never migrates a session onto a still-overloaded node.
+    fn least_loaded_node_below_threshold(&self) -> Option<NodeId> {
+        self.nodes
+            .iter()
+            .filter(|n| {
+                n.healthy
+                    && !self.draining.contains(&n.id)
+                    && n.kv_usage < self.overload_threshold
+            })
+            .min_by(|a, b| {
+                self.load_score(a)
+                    .partial_cmp(&self.load_score(b))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|n| n.id.clone())
+    }
     ///
     /// For [`RoutingPolicy::Weighted`] the session's current affinity node
     /// receives a score reduction of `affinity_weight`, making it "stickier"
@@ -337,7 +355,15 @@ impl Router {
             if !needs_move {
                 continue;
             }
-            if let Some(target) = self.least_loaded_node()
+            // Only migrate to a target that is actually below the overload
+            // threshold. If every healthy, non-draining node is saturated,
+            // moving the session would just record a Rebalance migration (and a
+            // re-prefill cost) with no real relief — pure thrash. In that case
+            // we leave the session where it is. (The normal route() path still
+            // falls back to the plain least-loaded node so live traffic is
+            // always routed somewhere; this restraint is specific to the
+            // operator-triggered rebalance sweep.)
+            if let Some(target) = self.least_loaded_node_below_threshold()
                 && target != node
             {
                 self.session_map
@@ -772,6 +798,57 @@ health:
         };
         r.route(&req);
         assert_eq!(r.rebalance(), 0);
+    }
+
+    /// When the pinned node is overloaded but every other healthy, non-draining
+    /// node is *also* at/above the overload threshold, rebalance must NOT move
+    /// the session: migrating to another saturated node buys no relief and just
+    /// records a Rebalance migration + a re-prefill cost (thrash).
+    #[test]
+    fn rebalance_skips_when_all_targets_overloaded() {
+        let mut r = router(
+            vec![node("gpu-0", true, 0.2, 0), node("gpu-1", true, 0.1, 0)],
+            RoutingPolicy::AffinityThenLoad,
+        );
+        // Pin s1 to the least-loaded node.
+        let req = RouteRequest {
+            session_id: Some("s1".into()),
+            system_prompt_hash: None,
+        };
+        let pinned = r.route(&req).unwrap();
+        let migrations_before = r.session_map().migrations().len();
+        // Saturate every node above the overload threshold (0.95).
+        for n in ["gpu-0", "gpu-1"] {
+            r.node_mut(&NodeId::new(n)).unwrap().kv_usage = 0.99;
+        }
+        // The pinned node needs to move (overloaded) but no viable target
+        // exists, so nothing is migrated.
+        assert_eq!(r.rebalance(), 0);
+        assert_eq!(r.session_map().get("s1"), Some(&pinned));
+        assert_eq!(r.session_map().migrations().len(), migrations_before);
+    }
+
+    /// Conversely, rebalance DOES migrate an overloaded session when at least
+    /// one healthy, non-draining node is below the overload threshold.
+    #[test]
+    fn rebalance_migrates_when_below_threshold_target_exists() {
+        let mut r = router(
+            vec![node("gpu-0", true, 0.2, 0), node("gpu-1", true, 0.1, 0)],
+            RoutingPolicy::AffinityThenLoad,
+        );
+        let req = RouteRequest {
+            session_id: Some("s1".into()),
+            system_prompt_hash: None,
+        };
+        let pinned = r.route(&req).unwrap();
+        // Overload only the pinned node; the other stays a viable target.
+        r.node_mut(&pinned).unwrap().kv_usage = 0.99;
+        assert_eq!(r.rebalance(), 1);
+        assert_ne!(r.session_map().get("s1"), Some(&pinned));
+        assert_eq!(
+            r.session_map().migrations().last().unwrap().reason,
+            MigrationReason::Rebalance
+        );
     }
 
     // ---- Weighted affinity bonus tests -------------------------------------

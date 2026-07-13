@@ -1626,6 +1626,7 @@ dependencies = [
  "axum",
  "bytes",
  "clap",
+ "futures-util",
  "http-body-util",
  "hyper",
  "hyper-util",

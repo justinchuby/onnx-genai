@@ -32,6 +32,10 @@ hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "tokio"] }
 http-body-util = "0.1"
 bytes = "1"
+# Concurrent fan-out of per-node status polls (join_all over borrowed fetch
+# futures). tokio's JoinSet needs 'static tasks, but the fetch futures borrow
+# the shared fetcher, so we drive them concurrently on one task instead.
+futures-util = { version = "0.3", default-features = false, features = ["std", "async-await"] }
 
 [dev-dependencies]
 tempfile = "3"
