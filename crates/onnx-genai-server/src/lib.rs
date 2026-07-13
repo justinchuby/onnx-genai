@@ -35,7 +35,7 @@ pub use routes::{
     ParsedAssistantOutput, build_generate_request, build_prompt, parse_assistant_output,
     parse_tool_calls,
 };
-pub use state::{AppState, ServerConfig, parse_kv_cache_dtype};
+pub use state::{AppState, ServerConfig, default_node_id, parse_kv_cache_dtype};
 pub use types::{
     AudioTranscriptionResponse, ChatChoice, ChatCompletionRequest, ChatCompletionResponse,
     ChatLogprobs, ChatMessage, ChatMessageContent, ChatMessageContentPart, ChatMessageToolCall,

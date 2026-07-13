@@ -71,16 +71,37 @@ pub(crate) struct HealthResponse {
     model: String,
 }
 
+/// Node-status contract polled by the cluster router (§34.8) every 1-2s.
+///
+/// Field honesty: values are populated from generic runtime state where a getter
+/// exists (`queue_depth`, `active_sessions`, `healthy`, `node_id`). Metrics the
+/// server cannot yet measure are reported as documented zeros/empties rather than
+/// fabricated — see the per-field comments in [`status`]. All values are
+/// model-agnostic; `node_id` names this node, never a model.
 #[derive(Debug, Serialize)]
-pub(crate) struct StatusResponse {
-    status: &'static str,
-    version: &'static str,
-    uptime_seconds: u64,
-    model_id: String,
-    active_sessions: u64,
-    pending_queue_depth: u64,
-    total_requests: u64,
-    total_tokens: u64,
+pub(crate) struct NodeStatus {
+    node_id: String,
+    healthy: bool,
+    kv_usage: f64,
+    kv_pages_used: u32,
+    kv_pages_total: u32,
+    kv_pages_shared: u32,
+    queue_depth: u32,
+    active_sessions: u32,
+    paused_sessions: u32,
+    tokens_per_second: f64,
+    batch_utilization: f64,
+    sessions: Vec<SessionStatus>,
+    prefix_hashes: Vec<String>,
+}
+
+/// Per-session detail entry in [`NodeStatus::sessions`] (§34.8).
+#[derive(Debug, Serialize)]
+pub(crate) struct SessionStatus {
+    id: String,
+    priority: String,
+    kv_pages: u32,
+    state: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -304,17 +325,48 @@ pub(crate) async fn models(State(state): State<AppState>) -> Json<ModelsResponse
     })
 }
 
-pub(crate) async fn status(State(state): State<AppState>) -> Json<StatusResponse> {
+/// `GET /v1/status` — node-status contract for the cluster router (§34.8).
+///
+/// Real values: `queue_depth` (admission queue), `active_sessions` (session
+/// registry), `healthy`, `node_id`. Everything else is a documented placeholder
+/// because the underlying getter does not exist yet — see per-field comments.
+pub(crate) async fn status(State(state): State<AppState>) -> Json<NodeStatus> {
     let snapshot = crate::metrics::snapshot();
-    Json(StatusResponse {
-        status: "ready",
-        version: env!("CARGO_PKG_VERSION"),
-        uptime_seconds: state.started_at.elapsed().as_secs(),
-        model_id: state.registry.default_id().unwrap_or_default().to_string(),
-        active_sessions: snapshot.active_sessions,
-        pending_queue_depth: snapshot.pending_requests,
-        total_requests: snapshot.total_requests,
-        total_tokens: snapshot.total_tokens,
+    Json(NodeStatus {
+        // Node-level id from server config; independent of any loaded model.
+        node_id: state.config.node_id.clone(),
+        // Healthy while the node has a default model registered to serve.
+        healthy: state.registry.default_id().is_some(),
+        // KV page statistics: the engine does not yet expose paged-KV
+        // introspection (see /v1/debug/kv), so these stay 0 until a getter exists.
+        kv_usage: 0.0,      // not yet tracked
+        kv_pages_used: 0,   // not yet tracked
+        kv_pages_total: 0,  // not yet tracked
+        kv_pages_shared: 0, // not yet tracked
+        // Real: admission/backpressure queue depth (§36).
+        queue_depth: u32::try_from(snapshot.pending_requests).unwrap_or(u32::MAX),
+        // Real: aggregate active sessions across the node.
+        active_sessions: u32::try_from(snapshot.active_sessions).unwrap_or(u32::MAX),
+        paused_sessions: 0,     // not yet tracked (no preemption/pause state exposed)
+        tokens_per_second: 0.0, // not yet tracked (only cumulative token totals recorded)
+        batch_utilization: 0.0, // not yet tracked (max batch size not surfaced to the server)
+        // Per-session detail: session ids are real (redacted, since full ids are
+        // bearer tokens — see session.rs). priority/kv_pages/state are not yet
+        // tracked, so they carry documented placeholders rather than invented values.
+        sessions: state
+            .sessions
+            .client_ids_redacted()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|id| SessionStatus {
+                id,
+                priority: "unknown".to_string(), // not yet tracked
+                kv_pages: 0,                      // not yet tracked
+                state: "unknown".to_string(),     // not yet tracked
+            })
+            .collect(),
+        // System-prompt prefix hashes are not yet surfaced by the engine.
+        prefix_hashes: Vec::new(),
     })
 }
 

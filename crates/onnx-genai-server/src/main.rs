@@ -3,7 +3,8 @@ use std::{net::SocketAddr, path::PathBuf};
 use clap::{ArgGroup, Parser};
 use onnx_genai_engine::KvDType;
 use onnx_genai_server::{
-    AppState, ModelSpec, ModelsConfig, ServerConfig, from_models_dir, parse_kv_cache_dtype, serve,
+    AppState, ModelSpec, ModelsConfig, ServerConfig, default_node_id, from_models_dir,
+    parse_kv_cache_dtype, serve,
 };
 
 #[derive(Debug, Parser)]
@@ -41,6 +42,12 @@ struct Cli {
     /// Falls back to ONNX_GENAI_MODELS_CONFIG.
     #[arg(long, env = "ONNX_GENAI_MODELS_CONFIG", group = "model_source")]
     models_config: Option<PathBuf>,
+
+    /// Node-level identifier reported by GET /v1/status for the cluster router (§34.8).
+    /// Model-agnostic: it names this server process, not any model.
+    /// Falls back to ONNX_GENAI_NODE_ID, then to the hostname or a generated id.
+    #[arg(long, env = "ONNX_GENAI_NODE_ID")]
+    node_id: Option<String>,
 
     /// Socket address to bind.
     #[arg(long, default_value = "127.0.0.1:8080")]
@@ -96,6 +103,7 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     let server_config = ServerConfig {
+        node_id: cli.node_id.unwrap_or_else(default_node_id),
         max_output_tokens: cli.max_output_tokens,
         max_sessions: cli.max_sessions,
         max_queue_depth: cli.max_queue_depth,

@@ -1,4 +1,4 @@
-use std::{path::Path, sync::Arc, time::Instant};
+use std::{path::Path, sync::Arc};
 
 use anyhow::Context;
 use onnx_genai::{Engine, EngineConfig};
@@ -45,11 +45,45 @@ pub struct AppState {
     pub(crate) registry: ModelRegistry,
     pub(crate) sessions: SessionRegistry,
     pub(crate) config: ServerConfig,
-    pub(crate) started_at: Instant,
+}
+
+/// Resolve a default node identifier for the §34 cluster router's node-status
+/// contract. This is a NODE-level id, independent of any loaded model.
+///
+/// Resolution order: the host's name (`HOSTNAME`/`COMPUTERNAME`), else a stable
+/// random `node-<hex>` id generated from the OS CSPRNG. Never derived from a model.
+pub fn default_node_id() -> String {
+    if let Some(host) = std::env::var_os("HOSTNAME")
+        .or_else(|| std::env::var_os("COMPUTERNAME"))
+        .and_then(|value| value.into_string().ok())
+    {
+        let host = host.trim();
+        if !host.is_empty() {
+            return host.to_string();
+        }
+    }
+    let mut bytes = [0_u8; 8];
+    if getrandom::fill(&mut bytes).is_ok() {
+        return format!("node-{}", hex(&bytes));
+    }
+    "node".to_string()
+}
+
+fn hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
 }
 
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
+    /// Node-level identifier reported by `GET /v1/status` for the cluster router
+    /// (§34.8). Independent of any model; defaults to the hostname or a generated id.
+    pub node_id: String,
     pub max_output_tokens: usize,
     pub max_sessions: usize,
     /// Maximum generation requests admitted to the driver, including active and queued work.
@@ -77,6 +111,7 @@ pub struct ServerConfig {
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
+            node_id: default_node_id(),
             max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
             max_sessions: DEFAULT_MAX_SESSIONS,
             max_queue_depth: DEFAULT_MAX_QUEUE_DEPTH,
@@ -91,6 +126,9 @@ impl Default for ServerConfig {
 
 impl ServerConfig {
     fn validate(self) -> anyhow::Result<Self> {
+        if self.node_id.trim().is_empty() {
+            anyhow::bail!("node_id must not be empty");
+        }
         if self.max_output_tokens == 0 {
             anyhow::bail!("max_output_tokens must be greater than zero");
         }
@@ -132,7 +170,6 @@ impl AppState {
             registry,
             sessions: SessionRegistry::new(config.max_sessions),
             config,
-            started_at: Instant::now(),
         })
     }
 
@@ -153,7 +190,6 @@ impl AppState {
             registry,
             sessions: SessionRegistry::new(config.max_sessions),
             config,
-            started_at: Instant::now(),
         })
     }
 
@@ -204,7 +240,6 @@ impl AppState {
             registry,
             sessions: SessionRegistry::new(config.max_sessions),
             config,
-            started_at: Instant::now(),
         }
     }
 

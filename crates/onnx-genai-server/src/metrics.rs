@@ -198,12 +198,6 @@ pub(crate) fn snapshot() -> MetricsSnapshot {
         prefix_cache_hits: REGISTRY.prefix_cache_hits.load(Ordering::Relaxed),
         prefix_cache_lookups: REGISTRY.prefix_cache_lookups.load(Ordering::Relaxed),
         rejections: REGISTRY.rejections.load(Ordering::Relaxed),
-        total_requests: REGISTRY
-            .requests
-            .iter()
-            .flat_map(|statuses| statuses.iter())
-            .map(|value| value.load(Ordering::Relaxed))
-            .sum(),
         total_tokens: prompt_tokens.saturating_add(completion_tokens),
     }
 }
@@ -211,7 +205,6 @@ pub(crate) fn snapshot() -> MetricsSnapshot {
 pub(crate) struct MetricsSnapshot {
     pub(crate) active_sessions: u64,
     pub(crate) pending_requests: u64,
-    pub(crate) total_requests: u64,
     pub(crate) total_tokens: u64,
     pub(crate) current_batch_size: u64,
     pub(crate) prefix_cache_hits: u64,

@@ -917,7 +917,7 @@ async fn vision_request_against_non_pipeline_model_returns_400() {
 }
 
 #[tokio::test]
-async fn status_reports_sane_server_fields() {
+async fn status_reports_node_status_contract() {
     let response = app(tiny_state())
         .oneshot(
             Request::builder()
@@ -931,14 +931,95 @@ async fn status_reports_sane_server_fields() {
     assert_eq!(response.status(), StatusCode::OK);
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     let body: Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(body["status"], "ready");
-    assert_eq!(body["model_id"], "tiny-llm");
-    assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
-    assert!(body["uptime_seconds"].is_u64());
+
+    // node_id is present, non-empty, and NOT the model id (model-agnostic).
+    let node_id = body["node_id"].as_str().expect("node_id is a string");
+    assert!(!node_id.is_empty(), "node_id must not be empty");
+    assert_ne!(node_id, "tiny-llm", "node_id must not be the model id");
+
+    assert_eq!(body["healthy"], true);
+    // Real metrics serialize with the right JSON types.
+    assert!(body["queue_depth"].is_u64());
     assert!(body["active_sessions"].is_u64());
-    assert!(body["pending_queue_depth"].is_u64());
-    assert!(body["total_requests"].is_u64());
-    assert!(body["total_tokens"].is_u64());
+    assert!(body["paused_sessions"].is_u64());
+    assert!(body["kv_usage"].is_number());
+    assert!(body["kv_pages_used"].is_u64());
+    assert!(body["kv_pages_total"].is_u64());
+    assert!(body["kv_pages_shared"].is_u64());
+    assert!(body["tokens_per_second"].is_number());
+    assert!(body["batch_utilization"].is_number());
+    assert!(body["sessions"].is_array());
+    assert!(body["prefix_hashes"].is_array());
+}
+
+#[tokio::test]
+async fn status_node_id_reflects_configured_value() {
+    let model_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
+    let state = AppState::load_with_config(
+        &model_dir,
+        Some("tiny-llm".to_string()),
+        ServerConfig {
+            node_id: "gpu-7".to_string(),
+            ..ServerConfig::default()
+        },
+    )
+    .expect("load fixture with node id");
+
+    let response = app(state)
+        .oneshot(
+            Request::builder()
+                .uri("/v1/status")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["node_id"], "gpu-7");
+}
+
+#[tokio::test]
+async fn status_active_sessions_reflect_real_state() {
+    let state = tiny_state();
+    let handle = state.registry.resolve("").unwrap();
+    // Create a real engine session and register it, mirroring the session route.
+    let engine_session = handle
+        .engine
+        .create_session()
+        .await
+        .expect("create engine session");
+    let client_id = state.sessions.next_client_id().unwrap();
+    state
+        .sessions
+        .insert(client_id, engine_session)
+        .expect("register session");
+
+    let response = app(state)
+        .oneshot(
+            Request::builder()
+                .uri("/v1/status")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    assert!(
+        body["active_sessions"].as_u64().unwrap() >= 1,
+        "active_sessions must reflect the registered session"
+    );
+    let sessions = body["sessions"].as_array().unwrap();
+    assert!(
+        !sessions.is_empty(),
+        "sessions list must include the registered session"
+    );
+    assert!(sessions[0]["id"].as_str().unwrap().starts_with("sess-"));
 }
 
 #[tokio::test]
