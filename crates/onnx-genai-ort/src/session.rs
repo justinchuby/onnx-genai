@@ -4,7 +4,7 @@ use std::ffi::{CStr, CString};
 use std::path::Path;
 use std::ptr::NonNull;
 
-use crate::{Allocator, DataType, Environment, IoBinding, OrtError, Result, Value};
+use crate::{Allocator, DataType, Environment, IoBinding, MemoryInfo, OrtError, Result, Value};
 
 /// Execution provider selection.
 #[derive(Debug, Clone)]
@@ -29,6 +29,15 @@ pub struct SessionOptions {
     pub intra_op_num_threads: i32,
     /// Number of inter-op threads.
     pub inter_op_num_threads: i32,
+    /// Enable ORT WebGPU graph capture (`enableGraphCapture=1`). Only applied
+    /// when a WebGPU execution provider is selected. Graph capture requires
+    /// stable input/output buffer addresses and shapes across runs, which the
+    /// device-resident persistent KV IoBinding provides for KV tensors.
+    pub webgpu_graph_capture: bool,
+    /// Disable WebGPU/Dawn validation (`validationMode=disabled`). Only applied
+    /// when a WebGPU execution provider is selected. Validation is a
+    /// debug-oriented overhead layer; disabling it is safe for trusted graphs.
+    pub webgpu_disable_validation: bool,
 }
 
 impl Default for SessionOptions {
@@ -37,6 +46,7 @@ impl Default for SessionOptions {
         if let Some(execution_providers) = execution_providers_from_env() {
             options.execution_providers = execution_providers;
         }
+        options.apply_provider_defaults();
         options
     }
 }
@@ -48,14 +58,35 @@ impl SessionOptions {
             optimization_level: 99,
             intra_op_num_threads: 0, // ORT decides
             inter_op_num_threads: 0,
+            webgpu_graph_capture: false,
+            webgpu_disable_validation: false,
         }
     }
 
     /// Create default session options with a single explicit execution provider.
     pub fn with_execution_provider(provider: ExecutionProvider) -> Self {
-        Self {
+        let mut options = Self {
             execution_providers: vec![provider],
             ..Self::cpu()
+        };
+        options.apply_provider_defaults();
+        options
+    }
+
+    fn selects_webgpu(&self) -> bool {
+        self.execution_providers
+            .iter()
+            .any(|provider| matches!(provider, ExecutionProvider::WebGpu))
+    }
+
+    /// Turn on the WebGPU performance provider options that are safe by default
+    /// once a WebGPU EP is selected: validation is disabled (pure overhead
+    /// reduction) and graph capture follows `ONNX_GENAI_WEBGPU_GRAPH_CAPTURE`
+    /// (default off, since it requires fully stable I/O across runs).
+    fn apply_provider_defaults(&mut self) {
+        if self.selects_webgpu() {
+            self.webgpu_disable_validation = webgpu_disable_validation_from_env();
+            self.webgpu_graph_capture = webgpu_graph_capture_from_env();
         }
     }
 
@@ -125,6 +156,9 @@ pub struct Session {
     output_names: Vec<String>,
     inputs: Vec<TensorInfo>,
     outputs: Vec<TensorInfo>,
+    /// Execution providers requested for this session (priority order). Used to
+    /// decide whether device-resident KV buffers can be allocated.
+    execution_providers: Vec<ExecutionProvider>,
 }
 
 impl Session {
@@ -155,6 +189,7 @@ impl Session {
                 &mut ptr,
             )
         });
+        let mut effective_providers = options.execution_providers.clone();
         if let Err(err) = create_result {
             if requested_non_cpu_provider(&options) {
                 tracing::warn!(
@@ -172,6 +207,7 @@ impl Session {
                         &mut ptr,
                     )
                 })?;
+                effective_providers = cpu_options.execution_providers;
             } else {
                 return Err(err);
             }
@@ -191,6 +227,7 @@ impl Session {
             output_names,
             inputs,
             outputs,
+            execution_providers: effective_providers,
         })
     }
 
@@ -349,6 +386,56 @@ impl Session {
     pub(crate) fn as_mut_ptr(&self) -> *mut onnx_genai_ort_sys::OrtSession {
         self.ptr.as_ptr()
     }
+
+    /// Whether a WebGPU execution provider is (effectively) active for this
+    /// session.
+    pub fn is_webgpu(&self) -> bool {
+        self.execution_providers
+            .iter()
+            .any(|provider| matches!(provider, ExecutionProvider::WebGpu))
+    }
+
+    /// Create a device-resident allocator for KV buffers, if this session runs
+    /// on an execution provider that owns device memory (currently WebGPU).
+    ///
+    /// Returns `Ok(None)` for CPU/unsupported EPs, so callers keep using the CPU
+    /// allocator. If a device EP is selected but ORT cannot produce a matching
+    /// allocator (e.g. the EP silently fell back to CPU), the error is logged
+    /// and `Ok(None)` is returned so decode still works via CPU buffers.
+    pub(crate) fn device_kv_allocator(&self) -> Result<Option<Allocator>> {
+        if !self.is_webgpu() {
+            return Ok(None);
+        }
+        if !device_kv_enabled_from_env() {
+            // Default path: device-resident KV is opt-in because ORT 1.27's
+            // WebGPU EP segfaults on externally pre-allocated device KV tensors
+            // bound as a persistent in-place share-buffer (see decision file).
+            return Ok(None);
+        }
+        let memory_info = match MemoryInfo::webgpu() {
+            Ok(info) => info,
+            Err(err) => {
+                tracing::warn!(
+                    "WebGPU device memory info unavailable ({err}); using CPU KV buffers"
+                );
+                return Ok(None);
+            }
+        };
+        match Allocator::for_session_device(self.ptr.as_ptr(), memory_info) {
+            Ok(allocator) => {
+                tracing::warn!(
+                    "ONNX_GENAI_DEVICE_KV=1: allocating shared GQA KV on the WebGPU device allocator (EXPERIMENTAL; ORT 1.27 WebGPU may segfault during multi-step decode)"
+                );
+                Ok(Some(allocator))
+            }
+            Err(err) => {
+                tracing::warn!(
+                    "Could not create WebGPU device KV allocator ({err}); falling back to CPU KV buffers"
+                );
+                Ok(None)
+            }
+        }
+    }
 }
 
 impl Drop for Session {
@@ -420,6 +507,7 @@ impl RawSessionOptions {
         }
 
         append_execution_providers(this.ptr.as_ptr(), options)?;
+        apply_webgpu_provider_options(this.ptr.as_ptr(), options)?;
 
         Ok(this)
     }
@@ -450,6 +538,96 @@ fn requested_non_cpu_provider(options: &SessionOptions) -> bool {
         .execution_providers
         .iter()
         .any(|provider| !matches!(provider, ExecutionProvider::Cpu))
+}
+
+fn webgpu_graph_capture_from_env() -> bool {
+    match std::env::var("ONNX_GENAI_WEBGPU_GRAPH_CAPTURE") {
+        Ok(value) => matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+        Err(_) => false,
+    }
+}
+
+/// Whether to disable WebGPU validation. Default true (safe overhead
+/// reduction); set `ONNX_GENAI_WEBGPU_VALIDATION=1` to keep validation on.
+fn webgpu_disable_validation_from_env() -> bool {
+    match std::env::var("ONNX_GENAI_WEBGPU_VALIDATION") {
+        Ok(value) => !matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+        Err(_) => true,
+    }
+}
+
+/// Whether device-resident KV buffers are enabled. Default **false**: on the
+/// ORT 1.27 WebGPU EP, binding a user-pre-allocated `WebGPU_Buffer` device
+/// tensor as a persistent in-place `past`/`present` share-buffer segfaults
+/// (`EXC_BAD_ACCESS`, call through a null function pointer) during multi-step
+/// decode. Set `ONNX_GENAI_DEVICE_KV=1` to opt in experimentally once ORT
+/// supports external device KV tensors. See
+/// `.squad/decisions/inbox/leon-device-resident-kv.md`.
+fn device_kv_enabled_from_env() -> bool {
+    match std::env::var("ONNX_GENAI_DEVICE_KV") {
+        Ok(value) => matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+        Err(_) => false,
+    }
+}
+
+/// Apply WebGPU EP provider options via session config entries.
+///
+/// The WebGPU EP reads these from the merged `ConfigOptions` (see ORT
+/// `webgpu_provider_factory.cc`), keyed by the full `ep.webgpuexecutionprovider.*`
+/// names. `AddSessionConfigEntry` is the EP-agnostic way to set them. No-ops
+/// unless a WebGPU EP is selected.
+fn apply_webgpu_provider_options(
+    session_options: *mut onnx_genai_ort_sys::OrtSessionOptions,
+    options: &SessionOptions,
+) -> Result<()> {
+    if !options.selects_webgpu() {
+        return Ok(());
+    }
+    if options.webgpu_disable_validation {
+        add_session_config_entry(
+            session_options,
+            "ep.webgpuexecutionprovider.validationMode",
+            "disabled",
+        )?;
+    }
+    if options.webgpu_graph_capture {
+        add_session_config_entry(
+            session_options,
+            "ep.webgpuexecutionprovider.enableGraphCapture",
+            "1",
+        )?;
+        tracing::info!("Enabled ONNX Runtime WebGPU graph capture");
+    }
+    Ok(())
+}
+
+fn add_session_config_entry(
+    session_options: *mut onnx_genai_ort_sys::OrtSessionOptions,
+    key: &str,
+    value: &str,
+) -> Result<()> {
+    let api = crate::error::api()?;
+    let add = api
+        .AddSessionConfigEntry
+        .ok_or(OrtError::ApiUnavailable("AddSessionConfigEntry"))?;
+    let key_c = CString::new(key)
+        .map_err(|_| OrtError::InvalidArgument("session config key contains NUL".into()))?;
+    let value_c = CString::new(value)
+        .map_err(|_| OrtError::InvalidArgument("session config value contains NUL".into()))?;
+    // SAFETY: `session_options` is a valid handle; both C strings are
+    // NUL-terminated and live for the call.
+    crate::error::check_status(unsafe {
+        add(session_options, key_c.as_ptr(), value_c.as_ptr())
+    })
 }
 
 fn append_execution_providers(

@@ -68,6 +68,49 @@ impl MemoryInfo {
         Self::new_device("DML", device_id, MemoryType::Default)
     }
 
+    /// Create WebGPU device memory info matching the ORT WebGPU EP allocator.
+    ///
+    /// The WebGPU EP registers its `GpuBufferAllocator` with an `OrtMemoryInfo`
+    /// named `WebGPU_Buffer` on a `GPU`/`DEFAULT`/`VendorIds::NONE` device (see
+    /// ORT `core/providers/webgpu/allocator.{h,cc}`). The legacy
+    /// `CreateCpuMemoryInfo`/`CreateMemoryInfo` C API only recognizes a fixed set
+    /// of device names and rejects `WebGPU_Buffer` ("Specified device is not
+    /// supported. Try CreateMemoryInfo_V2."), so we use `CreateMemoryInfo_V2`
+    /// with an explicit device type to construct a matching handle.
+    pub fn webgpu() -> Result<Self> {
+        const WEBGPU_BUFFER: &str = "WebGPU_Buffer";
+        let name = CString::new(WEBGPU_BUFFER)
+            .map_err(|_| OrtError::InvalidArgument("memory device name contains NUL".into()))?;
+        let mut ptr = std::ptr::null_mut();
+        let api = crate::error::api()?;
+        let create = api
+            .CreateMemoryInfo_V2
+            .ok_or(OrtError::ApiUnavailable("CreateMemoryInfo_V2"))?;
+        // SAFETY: `name` is NUL-terminated and lives for the call; `ptr` is a
+        // valid out-parameter. Parameters mirror the WebGPU EP's own
+        // `GpuBufferAllocator` OrtMemoryInfo so `CreateAllocator` can match it:
+        // device type GPU, vendor id NONE (0), device id 0, default memory type,
+        // default alignment (0), device allocator.
+        crate::error::check_status(unsafe {
+            create(
+                name.as_ptr(),
+                onnx_genai_ort_sys::OrtMemoryInfoDeviceType_GPU,
+                0,
+                0,
+                onnx_genai_ort_sys::OrtDeviceMemoryType_DEFAULT,
+                0,
+                onnx_genai_ort_sys::OrtDeviceAllocator,
+                &mut ptr,
+            )
+        })?;
+        Ok(Self {
+            ptr: NonNull::new(ptr).ok_or(OrtError::NullPointer)?,
+            device_name: WEBGPU_BUFFER.to_string(),
+            device_id: 0,
+            memory_type: MemoryType::Default,
+        })
+    }
+
     fn new_device(device_name: &str, device_id: i32, memory_type: MemoryType) -> Result<Self> {
         let name = CString::new(device_name)
             .map_err(|_| OrtError::InvalidArgument("memory device name contains NUL".into()))?;
@@ -138,6 +181,38 @@ impl Allocator {
             ptr,
             memory_info: MemoryInfo::cpu()?,
             owned: false,
+        })
+    }
+
+    /// Create an allocator for `session` that allocates on the device described
+    /// by `memory_info` (e.g. the WebGPU EP's `WebGPU_Buffer` device).
+    ///
+    /// This wraps the session's internal EP allocator, so tensors created with
+    /// it are device-resident. `CreateAllocator` fails if the session has no
+    /// allocator matching `memory_info` (for example when the requested EP was
+    /// not actually attached and the session fell back to CPU); callers should
+    /// treat that error as "device allocation unavailable" and fall back to the
+    /// CPU allocator. The returned allocator becomes invalid when the session is
+    /// dropped, so it must not outlive the session it was created from.
+    pub(crate) fn for_session_device(
+        session: *const onnx_genai_ort_sys::OrtSession,
+        memory_info: MemoryInfo,
+    ) -> Result<Self> {
+        let mut ptr = std::ptr::null_mut();
+        let api = crate::error::api()?;
+        let create = api
+            .CreateAllocator
+            .ok_or(OrtError::ApiUnavailable("CreateAllocator"))?;
+        // SAFETY: `session` is a valid ORT session pointer and `memory_info` is a
+        // valid handle; `ptr` is an out-parameter. On success ORT transfers an
+        // owned allocator that this wrapper releases in Drop.
+        crate::error::check_status(unsafe {
+            create(session, memory_info.as_ptr(), &mut ptr)
+        })?;
+        Ok(Self {
+            ptr,
+            memory_info,
+            owned: true,
         })
     }
 

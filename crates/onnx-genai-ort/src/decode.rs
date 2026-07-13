@@ -440,6 +440,22 @@ impl<'a> DecodeSession<'a> {
     fn allocate_shared_buffers(&mut self, batch_size: i64, max_length: usize) -> Result<()> {
         let max_length = i64::try_from(max_length)
             .map_err(|_| OrtError::InvalidArgument("max_length exceeds i64".into()))?;
+        // Prefer a device-resident (e.g. WebGPU) allocator so the runtime-owned
+        // max-length KV buffers live on the EP device. Bound as both
+        // `past_key_values.*` inputs and `present.*` outputs, the KV cache then
+        // stays on-device across decode steps (present aliased in place onto
+        // past), eliminating the per-step host<->device KV copies the default
+        // CPU allocator would force under an accelerator EP. Falls back to the
+        // CPU allocator for CPU / non-device EPs.
+        let device_allocator = self.session.device_kv_allocator()?;
+        let cpu_allocator;
+        let allocator = match device_allocator.as_ref() {
+            Some(allocator) => allocator,
+            None => {
+                cpu_allocator = crate::Allocator::default_cpu()?;
+                &cpu_allocator
+            }
+        };
         for pair in &self.kv_pairs {
             let mut shape = pair.input.shape.clone();
             for (axis, dim) in shape.iter_mut().enumerate() {
@@ -456,7 +472,7 @@ impl<'a> DecodeSession<'a> {
             }
             self.current_kv.insert(
                 pair.past.clone(),
-                Arc::new(Value::empty(&shape, pair.input.dtype)?),
+                Arc::new(Value::empty_in(&shape, pair.input.dtype, allocator)?),
             );
         }
         Ok(())

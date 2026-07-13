@@ -103,17 +103,31 @@ pub struct Value {
 
 impl Value {
     /// Create a tensor value with given shape and type.
-    /// Memory is allocated on the device specified by MemoryInfo (via allocator).
+    ///
+    /// Memory is allocated with the default CPU allocator. Use
+    /// [`Value::empty_in`] to allocate on a specific (device) allocator.
     pub fn empty(shape: &[i64], dtype: DataType) -> Result<Self> {
+        Self::empty_in(shape, dtype, &crate::Allocator::default_cpu()?)
+    }
+
+    /// Create an uninitialized tensor value on the memory owned by `allocator`.
+    ///
+    /// When `allocator` is a device allocator (e.g. the WebGPU EP's
+    /// `WebGPU_Buffer` allocator from [`crate::Allocator::for_session_device`]),
+    /// the tensor is device-resident: binding it as both a `past_key_values.*`
+    /// input and `present.*` output keeps the KV cache on-device across decode
+    /// steps and eliminates the per-step host<->device copies that the default
+    /// CPU allocator would incur under an accelerator EP. The contents are
+    /// uninitialized; callers must ensure unwritten regions are masked out.
+    pub fn empty_in(shape: &[i64], dtype: DataType, allocator: &crate::Allocator) -> Result<Self> {
         validate_shape(shape, None)?;
-        let allocator = crate::Allocator::default_cpu()?;
         let mut ptr = std::ptr::null_mut();
         let api = crate::error::api()?;
         let create = api
             .CreateTensorAsOrtValue
             .ok_or(OrtError::ApiUnavailable("CreateTensorAsOrtValue"))?;
         // SAFETY: `shape` points to `shape.len()` i64 dimensions, `ptr` is a
-        // valid out-parameter, and the default CPU allocator remains valid.
+        // valid out-parameter, and `allocator` remains valid for the call.
         crate::error::check_status(unsafe {
             create(
                 allocator.as_ptr(),
