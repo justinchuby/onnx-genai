@@ -1238,7 +1238,9 @@
             "p-eagle",
             "mtp",
             "dflash",
-            "d-flash"
+            "d-flash",
+            "gemma4_assistant",
+            "gemma4-assistant"
           ]
         },
         {
@@ -1253,7 +1255,9 @@
               "p-eagle",
               "mtp",
               "dflash",
-              "d-flash"
+              "d-flash",
+              "gemma4_assistant",
+              "gemma4-assistant"
             ]
           }
         }
@@ -1404,6 +1408,29 @@
         "dtype"
       ]
     },
+    "SharedKvGroup": {
+      "description": "One shared-KV binding group for a shared-KV proposer.\n\nA `gemma4_assistant` graph exposes `shared_kv.<name>.key` and\n`shared_kv.<name>.value` inputs bound to slices of the target model's paged\nKV cache. `target_layers` lists the target KV layer indices feeding this\nslice.",
+      "type": "object",
+      "properties": {
+        "name": {
+          "description": "Assistant input prefix, e.g. `sliding_attention` or `full_attention`.",
+          "type": "string"
+        },
+        "target_layers": {
+          "description": "Target KV layer indices whose cache feeds this shared-KV slice.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "integer",
+            "format": "uint",
+            "minimum": 0
+          }
+        }
+      },
+      "required": [
+        "name"
+      ]
+    },
     "SpeculativeModelInfo": {
       "description": "Build-time support for self-contained speculative decoding.",
       "type": "object",
@@ -1430,6 +1457,24 @@
       "description": "Configuration published with a standalone speculative proposer model.",
       "type": "object",
       "properties": {
+        "backbone_hidden_size": {
+          "description": "Target backbone hidden size `H` shared with the proposer.\n\nFor `gemma4_assistant`, `inputs_embeds` is `[B, q, 2*H]` and\n`projected_state` is `[B, q, H]`.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "default": null,
+          "minimum": 1
+        },
+        "logits_output": {
+          "description": "Name of the proposer's draft-distribution output.\n\nDefaults to `logits` for `gemma4_assistant`.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
         "method": {
           "description": "Deprecated alias for `proposal_type`.",
           "allOf": [
@@ -1440,6 +1485,14 @@
           ],
           "deprecated": true
         },
+        "model": {
+          "description": "Relative path (from the model directory) to the proposer ONNX model.\n\nUsed by the `gemma4_assistant` shared-KV proposer to locate the\nassistant graph. Optional for forward compatibility with proposer\nfamilies that do not ship a standalone model file.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
         "num_speculative_tokens": {
           "description": "Maximum number of tokens proposed per verifier step; defaults to 4.\n\nThe deprecated `tokens_per_step` alias is accepted on input.",
           "type": "integer",
@@ -1447,9 +1500,24 @@
           "default": 4,
           "minimum": 1
         },
+        "projected_state_output": {
+          "description": "Name of the proposer output threaded forward between steps.\n\nDefaults to `projected_state` for `gemma4_assistant`.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
         "proposal_type": {
           "description": "Proposal architecture used by the speculator.\n\nThe deprecated `method` alias is accepted on input.",
           "$ref": "#/$defs/ProposalType"
+        },
+        "shared_kv": {
+          "description": "Shared-KV binding groups consumed by the proposer.\n\nEach group names an assistant input prefix\n(`shared_kv.<name>.{key,value}`) and the target KV layer indices whose\ncache feeds that slice. Empty for proposers that own their KV cache.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/SharedKvGroup"
+          }
         },
         "tokens_per_step": {
           "description": "Deprecated alias for `num_speculative_tokens`.",
@@ -1474,6 +1542,16 @@
               "type": "null"
             }
           ]
+        },
+        "vocab_size": {
+          "description": "Vocabulary size of the proposer's own `logits` output.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "default": null,
+          "minimum": 1
         }
       },
       "allOf": [

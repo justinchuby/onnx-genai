@@ -29,7 +29,8 @@ use crate::{
 use anyhow::Context;
 use onnx_genai_kv::KvCacheOps;
 use onnx_genai_ort::{
-    Eagle3DecodeOptions, Eagle3DecodeSession, MtpDecodeOptions, MtpDecodeSession, Session,
+    Eagle3DecodeOptions, Eagle3DecodeSession, Gemma4AssistantDecodeSession, Gemma4SharedKvInput,
+    MtpDecodeOptions, MtpDecodeSession, Session,
 };
 
 /// Produces a target-model token embedding for an MTP proposal step.
@@ -191,6 +192,8 @@ pub struct SpeculativeProposerContext<'a> {
     pub target_hidden_layers: Option<&'a [Vec<f32>]>,
     /// Target model's unprocessed greedy next token.
     pub guaranteed_token: Option<TokenId>,
+    /// Target KV slices bound to a Gemma4 assistant's `shared_kv.*` inputs.
+    pub gemma4_shared_kv: Option<&'a [Gemma4SharedKvInput]>,
 }
 
 /// Aggregate diagnostics for one speculative generation.
@@ -516,6 +519,91 @@ where
     }
 }
 
+/// Gemma4 shared-KV assistant proposer.
+///
+/// The assistant owns no KV cache: it reads slices of the target model's paged
+/// KV cache through `shared_kv.*` inputs (provided via the proposer context) and
+/// carries its own internal `lm_head`. Each step consumes
+/// `inputs_embeds = concat(previous_projected_state, current_projected_state)`
+/// (each `H` wide), emits full draft `logits`, and threads its `projected_state`
+/// output forward. Step 0 seeds both projected states from the target's last
+/// hidden state.
+pub struct Gemma4AssistantProposer<'a> {
+    session: Gemma4AssistantDecodeSession<'a>,
+}
+
+impl<'a> Gemma4AssistantProposer<'a> {
+    pub fn new(model: &'a Session) -> anyhow::Result<Self> {
+        let session = Gemma4AssistantDecodeSession::new(model).map_err(|error| {
+            anyhow::anyhow!("Failed to create Gemma4 assistant decode session: {error}")
+        })?;
+        Ok(Self { session })
+    }
+
+    /// Target backbone hidden size `H` expected by this assistant.
+    pub fn hidden_size(&self) -> usize {
+        self.session.signature().backbone_hidden_size
+    }
+}
+
+impl SpeculativeProposer for Gemma4AssistantProposer<'_> {
+    fn propose(
+        &mut self,
+        context: &SpeculativeProposerContext<'_>,
+    ) -> anyhow::Result<SpeculativeProposal> {
+        let hidden = context
+            .target_hidden
+            .context("Gemma4 assistant proposer requires the target model's last hidden state")?;
+        let guaranteed_token = context
+            .guaranteed_token
+            .context("Gemma4 assistant proposer requires the target model's greedy next token")?;
+        let shared_kv = context
+            .gemma4_shared_kv
+            .context("Gemma4 assistant proposer requires target shared-KV slices")?;
+        let hidden_size = self.session.signature().backbone_hidden_size;
+        if hidden.len() != hidden_size {
+            anyhow::bail!(
+                "target_hidden length {} != Gemma4 assistant hidden {hidden_size}",
+                hidden.len()
+            );
+        }
+
+        let draft_count = context.width.saturating_sub(1);
+        let mut tokens = Vec::with_capacity(draft_count + 1);
+        tokens.push(guaranteed_token);
+
+        // (prev, cur) projected states threaded across steps; both seed from the
+        // target's last hidden state before the assistant has produced any state.
+        let mut prev_state = hidden.to_vec();
+        let mut cur_state = hidden.to_vec();
+        let mut inputs_embeds = vec![0.0f32; 2 * hidden_size];
+        for step in 0..draft_count {
+            inputs_embeds[..hidden_size].copy_from_slice(&prev_state);
+            inputs_embeds[hidden_size..].copy_from_slice(&cur_state);
+            let position = i64::try_from(context.context_tokens.len() + step)
+                .context("Gemma4 assistant position exceeds i64")?;
+            let output = self
+                .session
+                .step(&inputs_embeds, position, shared_kv)
+                .map_err(|error| {
+                    anyhow::anyhow!("Gemma4 assistant proposal step failed: {error}")
+                })?;
+            let token = TokenId::try_from(
+                argmax(&output.logits)
+                    .context("Gemma4 assistant produced empty draft logits")?,
+            )
+            .context("Gemma4 assistant token id exceeds u32 range")?;
+            tokens.push(token);
+            prev_state = std::mem::replace(&mut cur_state, output.projected_state);
+        }
+        Ok(SpeculativeProposal::linear(tokens))
+    }
+
+    fn name(&self) -> &str {
+        "gemma4_assistant"
+    }
+}
+
 pub(crate) struct DraftModelProposer<'a> {
     draft_model: &'a mut DraftModel,
     draft_state: &'a mut DraftSession,
@@ -611,6 +699,10 @@ impl Engine {
                 .eagle3
                 .as_ref()
                 .is_some_and(|eagle3| eagle3.config == config),
+            SpeculativeMode::Gemma4Assistant(config) => self
+                .gemma4_assistant
+                .as_ref()
+                .is_some_and(|assistant| assistant.config == config),
         };
         mode_available
             // Grammar processors carry per-request parser state; draft/verify
@@ -658,6 +750,19 @@ impl Engine {
                             .unwrap_or(eagle3.num_speculative_tokens)
                     })
                     .context("EAGLE-3 speculation requested without a loaded EAGLE-3 head")?
+                    + 1
+            }
+            SpeculativeMode::Gemma4Assistant(_) => {
+                self.gemma4_assistant
+                    .as_ref()
+                    .map(|assistant| {
+                        options
+                            .num_speculative_tokens
+                            .unwrap_or(assistant.num_speculative_tokens)
+                    })
+                    .context(
+                        "Gemma4 assistant speculation requested without a loaded assistant model",
+                    )?
                     + 1
             }
             _ => options
@@ -735,6 +840,25 @@ impl Engine {
                         .cloned()
                         .context("EAGLE-3 target hidden-state list was empty")?;
                     (logits, Some(last_hidden), Some(layers))
+                } else if let SpeculativeMode::Gemma4Assistant(_) = &speculative_mode {
+                    let hidden_output = self
+                        .gemma4_assistant
+                        .as_ref()
+                        .context(
+                            "Gemma4 assistant speculation requested without a loaded assistant model",
+                        )?
+                        .config
+                        .target_hidden_output
+                        .clone();
+                    let (logits, hidden) = next_session_token_logits_and_hidden(
+                        &self.session,
+                        self.kv_model.as_ref(),
+                        &mut self.kv_cache,
+                        session_id,
+                        state,
+                        &hidden_output,
+                    )?;
+                    (logits, Some(hidden), None)
                 } else {
                     (
                         next_session_token_logits(
@@ -756,6 +880,13 @@ impl Engine {
                 .transpose()
                 .context("target token id exceeds u32 range")?;
 
+            // Slice the target's paged KV for the assistant's shared_kv.* inputs.
+            let gemma4_shared_kv = if let SpeculativeMode::Gemma4Assistant(_) = &speculative_mode {
+                Some(self.gemma4_shared_kv_slices(session_id)?)
+            } else {
+                None
+            };
+
             let proposer_context = SpeculativeProposerContext {
                 width,
                 context_tokens: &state.tokens,
@@ -767,6 +898,7 @@ impl Engine {
                 target_hidden: target_hidden.as_deref(),
                 target_hidden_layers: target_hidden_layers.as_deref(),
                 guaranteed_token,
+                gemma4_shared_kv: gemma4_shared_kv.as_deref(),
             };
             let draft_tokens = match &speculative_mode {
                 SpeculativeMode::None => Vec::new(),
@@ -820,6 +952,14 @@ impl Engine {
                     )?
                     .propose(&proposer_context)?
                     .tokens
+                }
+                SpeculativeMode::Gemma4Assistant(_) => {
+                    let assistant = self.gemma4_assistant.as_ref().context(
+                        "Gemma4 assistant speculation requested without a loaded assistant model",
+                    )?;
+                    Gemma4AssistantProposer::new(&assistant.session)?
+                        .propose(&proposer_context)?
+                        .tokens
                 }
             };
             self.last_speculative_stats.verification_steps += 1;
@@ -1074,6 +1214,47 @@ impl Engine {
         }
     }
 
+    /// Slice the target model's paged KV cache into per-group `shared_kv.*`
+    /// tensors for the Gemma4 assistant. Each configured group binds a single
+    /// representative target layer (the last listed `target_layers` index); the
+    /// assistant has no cache of its own, so these slices are materialized once
+    /// at the current base position and reused across all draft steps.
+    fn gemma4_shared_kv_slices(
+        &self,
+        session_id: SessionId,
+    ) -> anyhow::Result<Vec<Gemma4SharedKvInput>> {
+        let assistant = self
+            .gemma4_assistant
+            .as_ref()
+            .context("Gemma4 shared-KV slicing requested without a loaded assistant model")?;
+        let materialized = self
+            .kv_cache
+            .materialize_sequence(session_id)
+            .map_err(|e| anyhow::anyhow!("Failed to materialize target KV for shared_kv: {}", e))?;
+        let num_layers = materialized.layers.len();
+        let mut slices = Vec::with_capacity(assistant.config.shared_kv.len());
+        for group in &assistant.config.shared_kv {
+            let layer_idx = group.target_layers.last().copied().with_context(|| {
+                format!("shared_kv group '{}' has no target layers", group.name)
+            })?;
+            let layer = materialized.layers.get(layer_idx).with_context(|| {
+                format!(
+                    "shared_kv group '{}' references target layer {} but only {} layers exist",
+                    group.name, layer_idx, num_layers
+                )
+            })?;
+            slices.push(Gemma4SharedKvInput {
+                name: group.name.clone(),
+                key: layer.key.clone(),
+                value: layer.value.clone(),
+                kv_heads: materialized.num_kv_heads,
+                kv_len: materialized.sequence_len,
+                head_dim: materialized.head_dim,
+            });
+        }
+        Ok(slices)
+    }
+
     pub(crate) fn sync_draft_to_target(&mut self, state: &mut EngineSession) -> anyhow::Result<()> {
         if let (Some(draft_model), Some(draft_state)) = (&mut self.draft, &mut state.draft) {
             DraftModelProposer::new(draft_model, draft_state).rewind(&state.tokens)?;
@@ -1157,6 +1338,7 @@ mod tests {
             target_hidden: None,
             target_hidden_layers: None,
             guaranteed_token: None,
+            gemma4_shared_kv: None,
         })?;
         proposer.accept(&SpeculativeAcceptContext {
             accepted_prefix_len: 1,
@@ -1187,6 +1369,7 @@ mod tests {
             target_hidden: None,
             target_hidden_layers: None,
             guaranteed_token: None,
+            gemma4_shared_kv: None,
         })?;
 
         assert_eq!(proposal.tokens, vec![9, 4, 7]);
@@ -1217,6 +1400,7 @@ mod tests {
             target_hidden: None,
             target_hidden_layers: None,
             guaranteed_token: None,
+            gemma4_shared_kv: None,
         };
         let mut proposer = NgramProposer::new(2, 4)?;
 
@@ -1243,6 +1427,7 @@ mod tests {
             target_hidden: None,
             target_hidden_layers: None,
             guaranteed_token: None,
+            gemma4_shared_kv: None,
         })?;
         assert_eq!(proposal.tokens, vec![3, 4]);
 
@@ -1258,6 +1443,7 @@ mod tests {
             target_hidden: None,
             target_hidden_layers: None,
             guaranteed_token: None,
+            gemma4_shared_kv: None,
         })?;
         assert_eq!(proposal.tokens, vec![3]);
         Ok(())
@@ -1332,6 +1518,7 @@ mod tests {
             target_hidden: Some(&hidden),
             target_hidden_layers: None,
             guaranteed_token: Some(guaranteed),
+            gemma4_shared_kv: None,
         })?;
 
         assert_eq!(proposer.name(), "mtp");
@@ -1371,6 +1558,7 @@ mod tests {
             target_hidden: Some(&layers[2]),
             target_hidden_layers: Some(&layers),
             guaranteed_token: Some(7),
+            gemma4_shared_kv: None,
         })?;
 
         assert_eq!(proposer.name(), "eagle3");
@@ -1410,6 +1598,7 @@ mod tests {
             target_hidden: Some(&layers[2]),
             target_hidden_layers: Some(&layers),
             guaranteed_token: Some(9),
+            gemma4_shared_kv: None,
         };
         let mut proposer = Eagle3Proposer::new(&head, Eagle3DecodeOptions::default(), embedder)?;
 
@@ -1442,6 +1631,7 @@ mod tests {
             SpeculativeMode::Eagle3(_) => "eagle3",
             SpeculativeMode::DraftModel => "draft_model",
             SpeculativeMode::PromptLookup { .. } => "prompt_lookup",
+            SpeculativeMode::Gemma4Assistant(_) => "gemma4_assistant",
             SpeculativeMode::None => "none",
         };
         assert_eq!(selected, "mtp");
@@ -1463,6 +1653,7 @@ mod tests {
             SpeculativeMode::Mtp(_) => "mtp",
             SpeculativeMode::DraftModel => "draft_model",
             SpeculativeMode::PromptLookup { .. } => "prompt_lookup",
+            SpeculativeMode::Gemma4Assistant(_) => "gemma4_assistant",
             SpeculativeMode::None => "none",
         };
         assert_eq!(selected, "eagle3");

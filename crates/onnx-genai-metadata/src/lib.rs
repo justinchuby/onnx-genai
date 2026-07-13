@@ -7,8 +7,8 @@ pub mod schema;
 pub mod validation;
 
 pub use parser::{
-    SpeculatorConfigSource, SpeculatorDescriptor, SpeculatorProposerKind, SpeculatorProposerStatus,
-    detect_speculator, load_metadata, load_pipeline_spec,
+    Gemma4AssistantSpec, SpeculatorConfigSource, SpeculatorDescriptor, SpeculatorProposerKind,
+    SpeculatorProposerStatus, detect_speculator, load_metadata, load_pipeline_spec,
 };
 pub use schema::*;
 pub use validation::{

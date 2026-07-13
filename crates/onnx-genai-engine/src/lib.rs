@@ -25,10 +25,10 @@ pub mod speculative;
 pub use batched::{ContinuousBatchEvent, ContinuousBatchHandle, ContinuousBatchManager};
 pub use embedding::{EmbeddingOptions, EmbeddingPooling};
 pub use engine::{
-    Eagle3Config, Engine, EngineConfig, FinishReason, GenerateConstraint, GenerateOptions,
-    GeneratePrompt, GenerateRequest, GenerateResult, GenerateToken, GenerateTokenCallback,
-    MtpConfig, PrioritizedGenerateRequest, PrioritizedGenerateResult, ScheduledGenerateArrival,
-    SessionId, SpeculativeMode, TokenLogprob,
+    Eagle3Config, Engine, EngineConfig, FinishReason, Gemma4AssistantConfig, GenerateConstraint,
+    GenerateOptions, GeneratePrompt, GenerateRequest, GenerateResult, GenerateToken,
+    GenerateTokenCallback, MtpConfig, PrioritizedGenerateRequest, PrioritizedGenerateResult,
+    ScheduledGenerateArrival, SessionId, SharedKvBinding, SpeculativeMode, TokenLogprob,
 };
 pub use onnx_genai_kv::KvDType;
 pub use fim::{FimConfig, FimFormat};

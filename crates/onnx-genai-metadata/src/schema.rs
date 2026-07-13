@@ -82,6 +82,63 @@ pub struct SpeculatorConfig {
     /// Identity of the verifier model against which this proposer was trained.
     #[serde(default)]
     pub verifier: Option<SpeculatorVerifier>,
+
+    /// Relative path (from the model directory) to the proposer ONNX model.
+    ///
+    /// Used by the `gemma4_assistant` shared-KV proposer to locate the
+    /// assistant graph. Optional for forward compatibility with proposer
+    /// families that do not ship a standalone model file.
+    #[serde(default)]
+    pub model: Option<String>,
+
+    /// Target backbone hidden size `H` shared with the proposer.
+    ///
+    /// For `gemma4_assistant`, `inputs_embeds` is `[B, q, 2*H]` and
+    /// `projected_state` is `[B, q, H]`.
+    #[serde(default)]
+    #[schemars(range(min = 1))]
+    pub backbone_hidden_size: Option<usize>,
+
+    /// Vocabulary size of the proposer's own `logits` output.
+    #[serde(default)]
+    #[schemars(range(min = 1))]
+    pub vocab_size: Option<usize>,
+
+    /// Name of the proposer output threaded forward between steps.
+    ///
+    /// Defaults to `projected_state` for `gemma4_assistant`.
+    #[serde(default)]
+    pub projected_state_output: Option<String>,
+
+    /// Name of the proposer's draft-distribution output.
+    ///
+    /// Defaults to `logits` for `gemma4_assistant`.
+    #[serde(default)]
+    pub logits_output: Option<String>,
+
+    /// Shared-KV binding groups consumed by the proposer.
+    ///
+    /// Each group names an assistant input prefix
+    /// (`shared_kv.<name>.{key,value}`) and the target KV layer indices whose
+    /// cache feeds that slice. Empty for proposers that own their KV cache.
+    #[serde(default)]
+    pub shared_kv: Vec<SharedKvGroup>,
+}
+
+/// One shared-KV binding group for a shared-KV proposer.
+///
+/// A `gemma4_assistant` graph exposes `shared_kv.<name>.key` and
+/// `shared_kv.<name>.value` inputs bound to slices of the target model's paged
+/// KV cache. `target_layers` lists the target KV layer indices feeding this
+/// slice.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, JsonSchema)]
+pub struct SharedKvGroup {
+    /// Assistant input prefix, e.g. `sliding_attention` or `full_attention`.
+    pub name: String,
+
+    /// Target KV layer indices whose cache feeds this shared-KV slice.
+    #[serde(default)]
+    pub target_layers: Vec<usize>,
 }
 
 fn default_num_speculative_tokens() -> usize {
@@ -114,6 +171,8 @@ pub enum ProposalType {
     Mtp,
     /// D-Flash proposer.
     DFlash,
+    /// Gemma4 `*-assistant` shared-KV proposer.
+    Gemma4Assistant,
     /// Future proposal architecture not recognized by this runtime version.
     Unknown(String),
 }
@@ -129,6 +188,7 @@ impl<'de> Deserialize<'de> for ProposalType {
             "peagle" | "p-eagle" => Self::PEagle,
             "mtp" => Self::Mtp,
             "dflash" | "d-flash" => Self::DFlash,
+            "gemma4_assistant" | "gemma4-assistant" => Self::Gemma4Assistant,
             _ => Self::Unknown(value),
         })
     }
@@ -929,7 +989,16 @@ mod schema_helpers {
         extensible_string_enum(
             schema,
             &[
-                "eagle", "eagle3", "eagle-3", "peagle", "p-eagle", "mtp", "dflash", "d-flash",
+                "eagle",
+                "eagle3",
+                "eagle-3",
+                "peagle",
+                "p-eagle",
+                "mtp",
+                "dflash",
+                "d-flash",
+                "gemma4_assistant",
+                "gemma4-assistant",
             ],
         );
     }

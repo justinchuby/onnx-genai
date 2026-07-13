@@ -9,6 +9,8 @@ models/
 !tests/fixtures/tiny-whisper/encoder.onnx
 !tests/fixtures/tiny-whisper/decoder.onnx
 !crates/onnx-genai-ort/tests/fixtures/speculator-eagle3/model.onnx
+!tests/fixtures/tiny-gemma4-assistant/model.onnx
+!tests/fixtures/tiny-gemma4-assistant/assistant/model.onnx
 *.safetensors
 .DS_Store
 
