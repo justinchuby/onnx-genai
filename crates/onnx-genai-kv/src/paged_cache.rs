@@ -2,8 +2,9 @@
 
 use crate::{
     CacheCheckpoint, Device, EvictionPolicy, KvCacheOps, KvError, SequenceId,
-    page_table::{KvDType, KvKind, PageId, PageTable, PageTensorConfig},
+    page_table::{KvKind, KvQuantConfig, PageId, PageTable, PageTensorConfig},
 };
+use onnx_genai_metadata::KvCacheSpec;
 
 /// Borrowed per-layer K/V tensors for one token.
 ///
@@ -58,6 +59,33 @@ impl PagedKvCache {
             ),
             next_seq_id: 0,
         }
+    }
+
+    /// Create a tensor cache with a per-layer key/value precision policy.
+    pub fn new_with_quant_config(
+        config: PageTensorConfig,
+        quant_config: KvQuantConfig,
+        num_gpu_pages: usize,
+    ) -> Result<Self, KvError> {
+        Ok(Self {
+            page_table: PageTable::new_with_quant_config(
+                config.page_size,
+                num_gpu_pages,
+                config,
+                quant_config,
+            )?,
+            next_seq_id: 0,
+        })
+    }
+
+    /// Create a tensor cache using the KV precision policy in model metadata.
+    pub fn new_with_metadata(
+        config: PageTensorConfig,
+        spec: &KvCacheSpec,
+        num_gpu_pages: usize,
+    ) -> Result<Self, KvError> {
+        let quant_config = KvQuantConfig::from_metadata(spec, config.num_layers)?;
+        Self::new_with_quant_config(config, quant_config, num_gpu_pages)
     }
 
     /// Create a new sequence, returns its ID.
@@ -123,7 +151,8 @@ impl PagedKvCache {
                 .pages
                 .get_mut(&page_id)
                 .ok_or(KvError::PageNotFound(page_id))?;
-            let mut values = if matches!(config.dtype, KvDType::Int8) {
+            let has_quantized_storage = page.has_quantized_storage();
+            let mut values = if has_quantized_storage {
                 page.dequantized(config)
             } else {
                 Vec::new()
@@ -142,20 +171,17 @@ impl PagedKvCache {
                             + token_offset)
                             * config.head_dim
                             + dim;
-                        match config.dtype {
-                            KvDType::F32 => {
-                                page.data[k_offset] = layer.key[src];
-                                page.data[v_offset] = layer.value[src];
-                            }
-                            KvDType::Int8 => {
-                                values[k_offset] = layer.key[src];
-                                values[v_offset] = layer.value[src];
-                            }
+                        if has_quantized_storage {
+                            values[k_offset] = layer.key[src];
+                            values[v_offset] = layer.value[src];
+                        } else {
+                            page.data[k_offset] = layer.key[src];
+                            page.data[v_offset] = layer.value[src];
                         }
                     }
                 }
             }
-            if matches!(config.dtype, KvDType::Int8) {
+            if has_quantized_storage {
                 page.store_from_f32(config, &values);
             }
             page.filled = page.filled.max(token_offset + 1);
@@ -414,6 +440,8 @@ impl PagedKvCache {
                 (
                     old.data.clone(),
                     old.quantized_data.clone(),
+                    old.fp8_data.clone(),
+                    old.quant_scales.clone(),
                     old.quant_scale,
                     old.filled,
                 )
@@ -421,8 +449,10 @@ impl PagedKvCache {
             if let Some(new_page) = self.page_table.pages.get_mut(&new_page_id) {
                 new_page.data = old_storage.0;
                 new_page.quantized_data = old_storage.1;
-                new_page.quant_scale = old_storage.2;
-                new_page.filled = old_storage.3;
+                new_page.fp8_data = old_storage.2;
+                new_page.quant_scales = old_storage.3;
+                new_page.quant_scale = old_storage.4;
+                new_page.filled = old_storage.5;
             }
             self.page_table.replace_page(seq, page_index, new_page_id);
             self.page_table.free(page_id);
@@ -593,6 +623,9 @@ impl KvCacheOps for PagedKvCache {
 mod tests {
     use super::*;
     use crate::{KvDType, PageTensorConfig};
+    use onnx_genai_metadata::{
+        KvCacheSpec, KvComponentTolerance, KvQuantTolerance, LayerPrecisionOverride,
+    };
 
     fn config() -> PageTensorConfig {
         PageTensorConfig {
@@ -628,6 +661,16 @@ mod tests {
         PageTensorConfig {
             num_layers: 1,
             num_kv_heads: 1,
+            head_dim: 4,
+            page_size: 1,
+            dtype,
+        }
+    }
+
+    fn two_head_config(dtype: KvDType) -> PageTensorConfig {
+        PageTensorConfig {
+            num_layers: 1,
+            num_kv_heads: 2,
             head_dim: 4,
             page_size: 1,
             dtype,
@@ -909,6 +952,181 @@ mod tests {
         let materialized = cache.materialize_sequence(seq).unwrap();
         assert_close(&materialized.layers[0].key, &token[0].0, 0.05);
         assert_close(&materialized.layers[0].value, &token[0].1, 0.05);
+    }
+
+    #[test]
+    fn fp8_e4m3fn_round_trip_uses_per_component_head_scales() {
+        let config = two_head_config(KvDType::Fp8E4M3Fn);
+        let mut cache = PagedKvCache::new_with_tensor_config(config, 1);
+        let seq = cache.create_sequence();
+        let token = vec![(
+            vec![-1.0, -0.3, 0.3, 1.0, -100.0, -30.0, 30.0, 100.0],
+            vec![-2.0, -0.6, 0.6, 2.0, -200.0, -60.0, 60.0, 200.0],
+        )];
+
+        cache
+            .append_token_kv(seq, &borrowed_layers(&token))
+            .unwrap();
+
+        let page_id = cache.page_table.get_sequence(seq).unwrap()[0];
+        let page = &cache.page_table.pages[&page_id];
+        assert!(page.data.is_empty());
+        assert!(page.quantized_data.is_empty());
+        assert_eq!(page.fp8_data.len(), config.f32_len_per_page());
+        assert_eq!(page.quant_scales.len(), 4);
+        assert_close(
+            &page.quant_scales,
+            &[1.0 / 448.0, 100.0 / 448.0, 2.0 / 448.0, 200.0 / 448.0],
+            1.0e-7,
+        );
+
+        let materialized = cache.materialize_sequence(seq).unwrap();
+        assert_close(
+            &materialized.layers[0].key,
+            &[
+                -1.0,
+                -0.285_714_3,
+                0.285_714_3,
+                1.0,
+                -100.0,
+                -28.571_43,
+                28.571_43,
+                100.0,
+            ],
+            1.0e-5,
+        );
+        assert_close(
+            &materialized.layers[0].value,
+            &[
+                -2.0,
+                -0.571_428_6,
+                0.571_428_6,
+                2.0,
+                -200.0,
+                -57.142_86,
+                57.142_86,
+                200.0,
+            ],
+            1.0e-5,
+        );
+    }
+
+    #[test]
+    fn fp8_e5m2_round_trip_is_within_format_error_bound() {
+        let mut cache = PagedKvCache::new_with_tensor_config(small_config(KvDType::Fp8E5M2), 1);
+        let seq = cache.create_sequence();
+        let token = small_layers([-1.0, -0.3, 0.3, 1.0]);
+
+        cache
+            .append_token_kv(seq, &borrowed_layers(&token))
+            .unwrap();
+
+        let materialized = cache.materialize_sequence(seq).unwrap();
+        assert_close(
+            &materialized.layers[0].key,
+            &[-1.0, -0.285_714_3, 0.285_714_3, 1.0],
+            1.0e-6,
+        );
+        assert_close(
+            &materialized.layers[0].value,
+            &[9.428_572, 9.428_572, 11.0, 11.0],
+            1.0e-5,
+        );
+    }
+
+    #[test]
+    fn metadata_precision_policy_honors_overrides_and_sensitive_layers() {
+        let spec = KvCacheSpec {
+            native_dtype: Some("float8_e4m3fn".to_owned()),
+            quantization_tolerance: Some(KvQuantTolerance {
+                key: Some(KvComponentTolerance {
+                    default: Some("float8_e5m2".to_owned()),
+                    per_layer: Some(vec![LayerPrecisionOverride {
+                        layers: vec![1],
+                        min_precision: "fp16".to_owned(),
+                    }]),
+                    quantization_axis: Some("per_channel".to_owned()),
+                }),
+                value: Some(KvComponentTolerance {
+                    default: None,
+                    per_layer: None,
+                    quantization_axis: Some("per_token".to_owned()),
+                }),
+            }),
+            sensitive_layers: Some(vec![0, -1]),
+            operations: None,
+        };
+
+        let quant = KvQuantConfig::from_metadata(&spec, 4).unwrap();
+        assert_eq!(
+            quant.layer(0),
+            Some(crate::LayerKvDType {
+                key: KvDType::F32,
+                value: KvDType::F32,
+            })
+        );
+        assert_eq!(
+            quant.layer(1),
+            Some(crate::LayerKvDType {
+                key: KvDType::F32,
+                value: KvDType::Fp8E4M3Fn,
+            })
+        );
+        assert_eq!(
+            quant.layer(2),
+            Some(crate::LayerKvDType {
+                key: KvDType::Fp8E5M2,
+                value: KvDType::Fp8E4M3Fn,
+            })
+        );
+        assert_eq!(
+            quant.layer(3),
+            Some(crate::LayerKvDType {
+                key: KvDType::F32,
+                value: KvDType::F32,
+            })
+        );
+        assert_eq!(
+            KvDType::from_metadata_name("float16").unwrap(),
+            KvDType::F32
+        );
+    }
+
+    #[test]
+    fn sensitive_layer_storage_bypasses_fp8_quantization() {
+        let config = PageTensorConfig {
+            num_layers: 2,
+            num_kv_heads: 1,
+            head_dim: 4,
+            page_size: 1,
+            dtype: KvDType::Fp8E4M3Fn,
+        };
+        let spec = KvCacheSpec {
+            native_dtype: Some("float8_e4m3fn".to_owned()),
+            quantization_tolerance: None,
+            sensitive_layers: Some(vec![1]),
+            operations: None,
+        };
+        let mut cache = PagedKvCache::new_with_metadata(config, &spec, 1).unwrap();
+        let seq = cache.create_sequence();
+        let token = vec![
+            (vec![0.1, 0.2, 0.3, 0.4], vec![1.1, 1.2, 1.3, 1.4]),
+            (vec![10.1, 10.2, 10.3, 10.4], vec![11.1, 11.2, 11.3, 11.4]),
+        ];
+
+        cache
+            .append_token_kv(seq, &borrowed_layers(&token))
+            .unwrap();
+
+        let page_id = cache.page_table.get_sequence(seq).unwrap()[0];
+        let page = &cache.page_table.pages[&page_id];
+        assert_eq!(page.data.len(), 8);
+        assert_eq!(page.fp8_data.len(), 8);
+        let materialized = cache.materialize_sequence(seq).unwrap();
+        assert_eq!(materialized.layers[1].key, token[1].0);
+        assert_eq!(materialized.layers[1].value, token[1].1);
+        assert_close(&materialized.layers[0].key, &token[0].0, 0.025);
+        assert_close(&materialized.layers[0].value, &token[0].1, 0.1);
     }
 
     #[test]

@@ -1,6 +1,10 @@
 //! Page table: maps sequences to physical pages.
 
-use crate::{Device, KvError, SequenceId};
+use crate::{
+    Device, KvError, SequenceId,
+    fp8::{Fp8Format, decode_f32 as decode_fp8, encode_f32 as encode_fp8},
+};
+use onnx_genai_metadata::{KvCacheSpec, KvComponentTolerance, LayerPrecisionOverride};
 use std::collections::HashMap;
 
 /// Unique page identifier.
@@ -11,12 +15,198 @@ pub type PageId = u32;
 pub enum KvDType {
     /// 32-bit floating point key/value data.
     F32,
-    /// Symmetric signed 8-bit quantized K/V data with one scale per page.
+    /// Symmetric signed 8-bit quantized K/V data with external scaling.
     ///
-    /// Values are reconstructed as `q as f32 * scale`. This is intentionally
-    /// an integer scheme rather than fp8 e4m3 so the cache can bound error
-    /// without depending on target-specific fp8 support.
+    /// Values are reconstructed as `q as f32 * scale`.
     Int8,
+    /// OCP E4M3FN FP8 with a software codec and external scaling.
+    Fp8E4M3Fn,
+    /// OCP E5M2 FP8 with a software codec and external scaling.
+    Fp8E5M2,
+}
+
+impl KvDType {
+    /// Parse a metadata KV dtype name.
+    pub fn from_metadata_name(name: &str) -> Result<Self, KvError> {
+        let normalized = name.trim().to_ascii_lowercase().replace('-', "_");
+        match normalized.as_str() {
+            "float32" | "fp32" | "float16" | "fp16" | "half" | "bfloat16" | "bf16" => Ok(Self::F32),
+            "int8" => Ok(Self::Int8),
+            "float8_e4m3fn" | "fp8_e4m3fn" | "float8_e4m3" | "fp8_e4m3" => Ok(Self::Fp8E4M3Fn),
+            "float8_e5m2" | "fp8_e5m2" => Ok(Self::Fp8E5M2),
+            _ => Err(KvError::UnsupportedKvDType(name.to_owned())),
+        }
+    }
+
+    const fn fp8_format(self) -> Option<Fp8Format> {
+        match self {
+            Self::Fp8E4M3Fn => Some(Fp8Format::E4M3Fn),
+            Self::Fp8E5M2 => Some(Fp8Format::E5M2),
+            Self::F32 | Self::Int8 => None,
+        }
+    }
+
+    const fn is_quantized(self) -> bool {
+        !matches!(self, Self::F32)
+    }
+
+    const fn precision_rank(self) -> u8 {
+        match self {
+            Self::F32 => 3,
+            Self::Fp8E4M3Fn | Self::Fp8E5M2 => 2,
+            Self::Int8 => 1,
+        }
+    }
+}
+
+/// Key/value storage precision for one transformer layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LayerKvDType {
+    pub key: KvDType,
+    pub value: KvDType,
+}
+
+/// Per-layer KV precision policy derived from inference metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KvQuantConfig {
+    layers: Vec<LayerKvDType>,
+}
+
+impl KvQuantConfig {
+    /// Use one dtype for every key and value layer.
+    pub fn homogeneous(dtype: KvDType, num_layers: usize) -> Self {
+        Self {
+            layers: vec![
+                LayerKvDType {
+                    key: dtype,
+                    value: dtype,
+                };
+                num_layers
+            ],
+        }
+    }
+
+    /// Build a precision policy from `kv_cache` metadata.
+    ///
+    /// Component defaults override `native_dtype`, per-layer minimum precision
+    /// overrides component defaults, and `sensitive_layers` remain in f32.
+    pub fn from_metadata(spec: &KvCacheSpec, num_layers: usize) -> Result<Self, KvError> {
+        let native_dtype = spec
+            .native_dtype
+            .as_deref()
+            .map(KvDType::from_metadata_name)
+            .transpose()?
+            .unwrap_or(KvDType::F32);
+        let key_tolerance = spec
+            .quantization_tolerance
+            .as_ref()
+            .and_then(|tolerance| tolerance.key.as_ref());
+        let value_tolerance = spec
+            .quantization_tolerance
+            .as_ref()
+            .and_then(|tolerance| tolerance.value.as_ref());
+        let key_dtype = component_default(key_tolerance, native_dtype)?;
+        let value_dtype = component_default(value_tolerance, native_dtype)?;
+        let mut config = Self {
+            layers: vec![
+                LayerKvDType {
+                    key: key_dtype,
+                    value: value_dtype,
+                };
+                num_layers
+            ],
+        };
+
+        apply_layer_overrides(&mut config.layers, key_tolerance, num_layers, KvKind::Key)?;
+        apply_layer_overrides(
+            &mut config.layers,
+            value_tolerance,
+            num_layers,
+            KvKind::Value,
+        )?;
+        for &layer in spec.sensitive_layers.as_deref().unwrap_or_default() {
+            let layer = resolve_layer_index(layer, num_layers)?;
+            config.layers[layer] = LayerKvDType {
+                key: KvDType::F32,
+                value: KvDType::F32,
+            };
+        }
+        Ok(config)
+    }
+
+    pub fn layer(&self, layer: usize) -> Option<LayerKvDType> {
+        self.layers.get(layer).copied()
+    }
+
+    pub fn num_layers(&self) -> usize {
+        self.layers.len()
+    }
+
+    fn dtype(&self, layer: usize, kind: KvKind) -> KvDType {
+        let layer = self.layers[layer];
+        match kind {
+            KvKind::Key => layer.key,
+            KvKind::Value => layer.value,
+        }
+    }
+}
+
+fn component_default(
+    tolerance: Option<&KvComponentTolerance>,
+    fallback: KvDType,
+) -> Result<KvDType, KvError> {
+    tolerance
+        .and_then(|component| component.default.as_deref())
+        .map(KvDType::from_metadata_name)
+        .transpose()
+        .map(|dtype| dtype.unwrap_or(fallback))
+}
+
+fn apply_layer_overrides(
+    layers: &mut [LayerKvDType],
+    tolerance: Option<&KvComponentTolerance>,
+    num_layers: usize,
+    kind: KvKind,
+) -> Result<(), KvError> {
+    let Some(overrides) = tolerance.and_then(|component| component.per_layer.as_deref()) else {
+        return Ok(());
+    };
+    for precision_override in overrides {
+        apply_layer_override(layers, precision_override, num_layers, kind)?;
+    }
+    Ok(())
+}
+
+fn apply_layer_override(
+    layers: &mut [LayerKvDType],
+    precision_override: &LayerPrecisionOverride,
+    num_layers: usize,
+    kind: KvKind,
+) -> Result<(), KvError> {
+    let dtype = KvDType::from_metadata_name(&precision_override.min_precision)?;
+    for &layer in &precision_override.layers {
+        let layer = resolve_layer_index(layer, num_layers)?;
+        let slot = match kind {
+            KvKind::Key => &mut layers[layer].key,
+            KvKind::Value => &mut layers[layer].value,
+        };
+        if dtype.precision_rank() >= slot.precision_rank() {
+            *slot = dtype;
+        }
+    }
+    Ok(())
+}
+
+fn resolve_layer_index(layer: i32, num_layers: usize) -> Result<usize, KvError> {
+    let resolved = if layer < 0 {
+        i64::try_from(num_layers).unwrap_or(i64::MAX) + i64::from(layer)
+    } else {
+        i64::from(layer)
+    };
+    if resolved < 0 || resolved >= i64::try_from(num_layers).unwrap_or(i64::MAX) {
+        return Err(KvError::InvalidKvLayer { layer, num_layers });
+    }
+    Ok(resolved as usize)
 }
 
 /// Tensor geometry and scalar type for one physical page.
@@ -53,10 +243,10 @@ pub enum KvKind {
 
 /// A physical page holding KV data for a fixed number of tokens.
 ///
-/// For `PageTensorConfig { L, H, P, D, F32 }`, `data` is a contiguous f32
-/// buffer with shape `[L, 2, H, P, D]`, where axis 1 is `0 = key`,
-/// `1 = value`. For `KvDType::Int8`, `data` is empty and `quantized_data`
-/// stores the same logical layout with `quant_scale`. The flat offset is:
+/// Logical tensor shape is `[L, 2, H, P, D]`, where axis 1 is `0 = key`,
+/// `1 = value`. Physical f32, int8, and fp8 buffers contain only components
+/// assigned to that precision. Quantized components use one scale per head.
+/// The flat logical offset is:
 /// `(((((layer * 2 + kv) * H + head) * P + token_offset) * D) + dim)`.
 #[derive(Debug, Clone)]
 pub struct Page {
@@ -69,82 +259,195 @@ pub struct Page {
     pub filled: usize,
     /// Last access timestamp (for LRU eviction).
     pub last_access: u64,
-    /// Contiguous page-local KV tensor storage. Empty for count-only caches.
+    /// Compact page-local f32 storage. Empty when every component is quantized.
     pub data: Vec<f32>,
-    /// Quantized page-local KV tensor storage for `KvDType::Int8`.
+    /// Compact signed int8 storage.
     pub quantized_data: Vec<i8>,
-    /// Symmetric dequantization scale for `quantized_data`.
+    /// Compact FP8 bit patterns.
+    pub fp8_data: Vec<u8>,
+    /// Per-layer, per-K/V, per-head dequantization scales.
+    pub quant_scales: Vec<f32>,
+    /// First quantization scale, retained for compatibility with int8 callers.
     pub quant_scale: f32,
+    storage_layout: Vec<ComponentStorage>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ComponentStorage {
+    dtype: KvDType,
+    data_offset: usize,
+    quantized_offset: usize,
+    fp8_offset: usize,
+    scale_offset: usize,
 }
 
 impl Page {
-    fn new(id: PageId, device: Device, page_f32_len: usize, dtype: Option<KvDType>) -> Self {
-        let (data, quantized_data, quant_scale) = match dtype {
-            Some(KvDType::F32) => (vec![0.0; page_f32_len], Vec::new(), 1.0),
-            Some(KvDType::Int8) => (Vec::new(), vec![0; page_f32_len], 1.0),
-            None => (Vec::new(), Vec::new(), 1.0),
-        };
+    fn new(
+        id: PageId,
+        device: Device,
+        config: Option<PageTensorConfig>,
+        quant_config: Option<&KvQuantConfig>,
+    ) -> Self {
+        let mut storage_layout = Vec::new();
+        let mut data_len = 0;
+        let mut quantized_len = 0;
+        let mut fp8_len = 0;
+        let mut scale_len = 0;
+        if let (Some(config), Some(quant_config)) = (config, quant_config) {
+            let component_len = config.num_kv_heads * config.page_size * config.head_dim;
+            for layer in 0..config.num_layers {
+                for kind in [KvKind::Key, KvKind::Value] {
+                    let dtype = quant_config.dtype(layer, kind);
+                    storage_layout.push(ComponentStorage {
+                        dtype,
+                        data_offset: data_len,
+                        quantized_offset: quantized_len,
+                        fp8_offset: fp8_len,
+                        scale_offset: scale_len,
+                    });
+                    match dtype {
+                        KvDType::F32 => data_len += component_len,
+                        KvDType::Int8 => {
+                            quantized_len += component_len;
+                            scale_len += config.num_kv_heads;
+                        }
+                        KvDType::Fp8E4M3Fn | KvDType::Fp8E5M2 => {
+                            fp8_len += component_len;
+                            scale_len += config.num_kv_heads;
+                        }
+                    }
+                }
+            }
+        }
         Self {
             id,
             ref_count: 0,
             device,
             filled: 0,
             last_access: 0,
-            data,
-            quantized_data,
-            quant_scale,
+            data: vec![0.0; data_len],
+            quantized_data: vec![0; quantized_len],
+            fp8_data: vec![0; fp8_len],
+            quant_scales: vec![1.0; scale_len],
+            storage_layout,
+            quant_scale: 1.0,
         }
     }
 
-    pub fn reset_storage(&mut self, config: Option<PageTensorConfig>) {
+    pub fn reset_storage(&mut self, _config: Option<PageTensorConfig>) {
         self.filled = 0;
         self.quant_scale = 1.0;
-        match config.map(|c| c.dtype) {
-            Some(KvDType::F32) => self.data.fill(0.0),
-            Some(KvDType::Int8) => self.quantized_data.fill(0),
-            None => {}
-        }
+        self.data.fill(0.0);
+        self.quantized_data.fill(0);
+        self.fp8_data.fill(0);
+        self.quant_scales.fill(1.0);
     }
 
     pub fn value_at(&self, config: PageTensorConfig, offset: usize) -> f32 {
-        match config.dtype {
-            KvDType::F32 => self.data[offset],
-            KvDType::Int8 => self.quantized_data[offset] as f32 * self.quant_scale,
+        let component_len = component_len(config);
+        let component = offset / component_len;
+        let component_offset = offset % component_len;
+        let head = component_offset / (config.page_size * config.head_dim);
+        let storage = self.storage_layout[component];
+        match storage.dtype {
+            KvDType::F32 => self.data[storage.data_offset + component_offset],
+            KvDType::Int8 => {
+                let scale = self.quant_scales[storage.scale_offset + head];
+                f32::from(self.quantized_data[storage.quantized_offset + component_offset]) * scale
+            }
+            KvDType::Fp8E4M3Fn | KvDType::Fp8E5M2 => {
+                let scale = self.quant_scales[storage.scale_offset + head];
+                decode_fp8(
+                    self.fp8_data[storage.fp8_offset + component_offset],
+                    storage.dtype.fp8_format().expect("fp8 dtype"),
+                ) * scale
+            }
         }
     }
 
     pub fn dequantized(&self, config: PageTensorConfig) -> Vec<f32> {
-        match config.dtype {
-            KvDType::F32 => self.data.clone(),
-            KvDType::Int8 => self
-                .quantized_data
-                .iter()
-                .map(|&q| q as f32 * self.quant_scale)
-                .collect(),
+        let mut values = vec![0.0; config.f32_len_per_page()];
+        for component in 0..self.storage_layout.len() {
+            let component_len = component_len(config);
+            let logical_offset = component * component_len;
+            for component_offset in 0..component_len {
+                values[logical_offset + component_offset] =
+                    self.value_at(config, logical_offset + component_offset);
+            }
         }
+        values
     }
 
     pub fn store_from_f32(&mut self, config: PageTensorConfig, values: &[f32]) {
-        match config.dtype {
-            KvDType::F32 => {
-                self.data.clear();
-                self.data.extend_from_slice(values);
+        assert_eq!(values.len(), config.f32_len_per_page());
+        let component_len = component_len(config);
+        let head_len = config.page_size * config.head_dim;
+        for (component, storage) in self.storage_layout.iter().copied().enumerate() {
+            let logical_offset = component * component_len;
+            if storage.dtype == KvDType::F32 {
+                self.data[storage.data_offset..storage.data_offset + component_len]
+                    .copy_from_slice(&values[logical_offset..logical_offset + component_len]);
+                continue;
             }
-            KvDType::Int8 => {
-                let max_abs = values
+            for head in 0..config.num_kv_heads {
+                let logical_head_offset = logical_offset + head * head_len;
+                let head_values = &values[logical_head_offset..logical_head_offset + head_len];
+                let max_abs = head_values
                     .iter()
+                    .filter(|value| value.is_finite())
                     .fold(0.0_f32, |acc, value| acc.max(value.abs()));
-                self.quant_scale = if max_abs == 0.0 { 1.0 } else { max_abs / 127.0 };
-                self.quantized_data.clear();
-                self.quantized_data.extend(values.iter().map(|value| {
-                    (value / self.quant_scale)
-                        .round()
-                        .clamp(i8::MIN as f32, i8::MAX as f32) as i8
-                }));
-                self.data.clear();
+                let denominator = match storage.dtype {
+                    KvDType::Int8 => 127.0,
+                    KvDType::Fp8E4M3Fn | KvDType::Fp8E5M2 => {
+                        storage.dtype.fp8_format().expect("fp8 dtype").max_finite()
+                    }
+                    KvDType::F32 => unreachable!(),
+                };
+                let scale = if max_abs == 0.0 {
+                    1.0
+                } else {
+                    max_abs / denominator
+                };
+                self.quant_scales[storage.scale_offset + head] = scale;
+                let component_head_offset = head * head_len;
+                match storage.dtype {
+                    KvDType::Int8 => {
+                        let output_offset = storage.quantized_offset + component_head_offset;
+                        for (output, value) in self.quantized_data
+                            [output_offset..output_offset + head_len]
+                            .iter_mut()
+                            .zip(head_values)
+                        {
+                            *output = (value / scale).round().clamp(-127.0, 127.0) as i8;
+                        }
+                    }
+                    KvDType::Fp8E4M3Fn | KvDType::Fp8E5M2 => {
+                        let output_offset = storage.fp8_offset + component_head_offset;
+                        let format = storage.dtype.fp8_format().expect("fp8 dtype");
+                        for (output, value) in self.fp8_data
+                            [output_offset..output_offset + head_len]
+                            .iter_mut()
+                            .zip(head_values)
+                        {
+                            *output = encode_fp8(*value / scale, format);
+                        }
+                    }
+                    KvDType::F32 => unreachable!(),
+                }
             }
         }
+        self.quant_scale = self.quant_scales.first().copied().unwrap_or(1.0);
     }
+
+    pub fn has_quantized_storage(&self) -> bool {
+        self.storage_layout
+            .iter()
+            .any(|storage| storage.dtype.is_quantized())
+    }
+}
+
+const fn component_len(config: PageTensorConfig) -> usize {
+    config.num_kv_heads * config.page_size * config.head_dim
 }
 
 /// The page table manages the mapping from logical sequences to physical pages.
@@ -163,6 +466,8 @@ pub struct PageTable {
     pub page_size: usize,
     /// Optional tensor storage layout.
     pub tensor_config: Option<PageTensorConfig>,
+    /// Per-layer key/value precision policy.
+    pub quant_config: Option<KvQuantConfig>,
     /// Monotonic clock for LRU.
     clock: u64,
     /// Maximum number of live pages allowed in the hot tier.
@@ -173,13 +478,43 @@ pub struct PageTable {
 
 impl PageTable {
     pub fn new(page_size: usize, num_gpu_pages: usize) -> Self {
-        Self::new_with_tensor_config(page_size, num_gpu_pages, None)
+        Self::new_with_storage(page_size, num_gpu_pages, None, None)
     }
 
     pub fn new_with_tensor_config(
         page_size: usize,
         num_gpu_pages: usize,
         tensor_config: Option<PageTensorConfig>,
+    ) -> Self {
+        let quant_config =
+            tensor_config.map(|config| KvQuantConfig::homogeneous(config.dtype, config.num_layers));
+        Self::new_with_storage(page_size, num_gpu_pages, tensor_config, quant_config)
+    }
+
+    pub fn new_with_quant_config(
+        page_size: usize,
+        num_gpu_pages: usize,
+        tensor_config: PageTensorConfig,
+        quant_config: KvQuantConfig,
+    ) -> Result<Self, KvError> {
+        if quant_config.num_layers() != tensor_config.num_layers {
+            return Err(KvError::InvalidQuantizationConfig(
+                "quantization layer count must match tensor config".to_owned(),
+            ));
+        }
+        Ok(Self::new_with_storage(
+            page_size,
+            num_gpu_pages,
+            Some(tensor_config),
+            Some(quant_config),
+        ))
+    }
+
+    fn new_with_storage(
+        page_size: usize,
+        num_gpu_pages: usize,
+        tensor_config: Option<PageTensorConfig>,
+        quant_config: Option<KvQuantConfig>,
     ) -> Self {
         if let Some(config) = tensor_config {
             assert_eq!(
@@ -191,12 +526,12 @@ impl PageTable {
 
         let mut pages = HashMap::new();
         let mut free_pages = vec![];
-        let page_f32_len = tensor_config.map_or(0, PageTensorConfig::f32_len_per_page);
-        let dtype = tensor_config.map(|config| config.dtype);
-
         for i in 0..num_gpu_pages {
             let id = i as PageId;
-            pages.insert(id, Page::new(id, Device::Gpu(0), page_f32_len, dtype));
+            pages.insert(
+                id,
+                Page::new(id, Device::Gpu(0), tensor_config, quant_config.as_ref()),
+            );
             free_pages.push(id);
         }
 
@@ -211,6 +546,7 @@ impl PageTable {
             free_pages: free_map,
             page_size,
             tensor_config,
+            quant_config,
             clock: 0,
             hot_capacity: num_gpu_pages,
             next_page_id: num_gpu_pages as PageId,
@@ -244,9 +580,8 @@ impl PageTable {
             let mut page = Page::new(
                 page_id,
                 device,
-                self.tensor_config
-                    .map_or(0, PageTensorConfig::f32_len_per_page),
-                self.tensor_config.map(|config| config.dtype),
+                self.tensor_config,
+                self.quant_config.as_ref(),
             );
             page.ref_count = 1;
             self.clock += 1;

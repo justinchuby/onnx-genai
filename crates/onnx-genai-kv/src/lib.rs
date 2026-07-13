@@ -7,12 +7,16 @@
 //! - Prefix sharing via radix trie
 //! - Rewind/checkpoint operations for speculative decoding
 
+pub mod fp8;
 pub mod page_table;
 pub mod paged_cache;
 pub mod prefix_cache;
 pub mod tiered;
 
-pub use page_table::{KvDType, KvKind, Page, PageId, PageTable, PageTensorConfig};
+pub use fp8::{Fp8Format, decode_f32 as decode_fp8, encode_f32 as encode_fp8};
+pub use page_table::{
+    KvDType, KvKind, KvQuantConfig, LayerKvDType, Page, PageId, PageTable, PageTensorConfig,
+};
 pub use paged_cache::{LayerKv, MaterializedKv, MaterializedLayerKv, PagedKvCache};
 pub use prefix_cache::PrefixCache;
 
@@ -92,6 +96,12 @@ pub enum KvError {
     TensorStorageNotConfigured,
     #[error("Invalid KV tensor shape: {0}")]
     InvalidTensorShape(&'static str),
+    #[error("Unsupported KV dtype: {0}")]
+    UnsupportedKvDType(String),
+    #[error("Invalid KV layer {layer} for model with {num_layers} layers")]
+    InvalidKvLayer { layer: i32, num_layers: usize },
+    #[error("Invalid KV quantization config: {0}")]
+    InvalidQuantizationConfig(String),
     #[error("Page {0} not found")]
     PageNotFound(PageId),
 }

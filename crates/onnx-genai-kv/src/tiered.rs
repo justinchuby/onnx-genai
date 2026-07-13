@@ -7,7 +7,6 @@
 //! now; a future GPU backend can replace the move hooks with device copies or
 //! async prefetch without changing the cache-facing API.
 //!
-//! Quantized K/V storage uses `KvDType::Int8`: a symmetric signed int8 payload
-//! with one scale per page. On write, the page is quantized from f32; on read,
-//! values are reconstructed as `q as f32 * scale`. The expected absolute error
-//! for one quantization pass is bounded by roughly `scale / 2` for that page.
+//! Quantized K/V storage supports symmetric int8 and scaled FP8 E4M3FN/E5M2.
+//! Each layer, K/V component, and head has an independent scale. On write, f32
+//! values are quantized into compact page storage; reads reconstruct f32 values.
