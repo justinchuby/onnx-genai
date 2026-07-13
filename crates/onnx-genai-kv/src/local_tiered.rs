@@ -303,7 +303,11 @@ impl Interior {
     }
 
     /// Resolve a chunk's current location from its resident pages.
-    fn locate(&self, entry: &ChunkEntry) -> KvCacheLocation {
+    ///
+    /// `cpu_load_ms_per_page` is the caller-supplied rate from
+    /// [`LocalTieredConfig::cpu_load_ms_per_page`]; it is not stored on
+    /// `Interior` to keep the interior state free of config duplication.
+    fn locate(&self, entry: &ChunkEntry, cpu_load_ms_per_page: f64) -> KvCacheLocation {
         let all_hot = entry
             .page_ids
             .iter()
@@ -313,7 +317,7 @@ impl Interior {
                 page_ids: entry.page_ids.clone(),
             }
         } else {
-            let on_cpu = entry
+            let pages_needing_upload = entry
                 .page_ids
                 .iter()
                 .filter(|pid| {
@@ -324,7 +328,7 @@ impl Interior {
                 })
                 .count();
             KvCacheLocation::LocalCpu {
-                estimated_load_ms: on_cpu as f64,
+                estimated_load_ms: pages_needing_upload as f64 * cpu_load_ms_per_page,
                 size_bytes: entry.size_bytes,
             }
         }
@@ -345,17 +349,18 @@ impl KvCacheConnector for LocalTieredConnector {
     async fn lookup(&self, key: &KvCacheKey) -> ConnectorResult<KvCacheLocation> {
         let inner = self.inner.lock().expect("connector mutex poisoned");
         Ok(match inner.chunks.get(key) {
-            Some(entry) => inner.locate(entry),
+            Some(entry) => inner.locate(entry, self.config.cpu_load_ms_per_page),
             None => KvCacheLocation::NotFound,
         })
     }
 
     async fn lookup_batch(&self, keys: &[KvCacheKey]) -> ConnectorResult<Vec<KvCacheLocation>> {
         let inner = self.inner.lock().expect("connector mutex poisoned");
+        let rate = self.config.cpu_load_ms_per_page;
         Ok(keys
             .iter()
             .map(|key| match inner.chunks.get(key) {
-                Some(entry) => inner.locate(entry),
+                Some(entry) => inner.locate(entry, rate),
                 None => KvCacheLocation::NotFound,
             })
             .collect())
@@ -876,4 +881,36 @@ mod tests {
             KvCacheLocation::LocalGpu { .. }
         ));
     }
+
+    #[tokio::test]
+    async fn cpu_load_ms_scales_by_configured_rate() {
+        // hot_capacity = 2; cpu_load_ms_per_page = 2.5.
+        // Storing 3 single-page chunks offloads the first to CPU.
+        // That one CPU-resident page should cost 2.5 ms, not 1.0 ms.
+        let cfg = LocalTieredConfig {
+            cpu_load_ms_per_page: 2.5,
+            ..small_config()
+        };
+        let conn = LocalTieredConnector::new(cfg).unwrap();
+        let k0 = key("m", 0, 10, 4);
+        let k1 = key("m", 1, 11, 4);
+        let k2 = key("m", 2, 12, 4);
+        for k in [&k0, &k1, &k2] {
+            conn.store(store_entry(k.clone(), CachePriority::Session))
+                .await
+                .unwrap();
+        }
+        // k0 was the first stored; hot_capacity=2 means it got offloaded.
+        match conn.lookup(&k0).await.unwrap() {
+            KvCacheLocation::LocalCpu { estimated_load_ms, .. } => {
+                // 1 CPU-resident page × 2.5 ms/page = 2.5 ms
+                assert!(
+                    (estimated_load_ms - 2.5).abs() < f64::EPSILON,
+                    "expected 2.5 ms, got {estimated_load_ms}"
+                );
+            }
+            other => panic!("expected LocalCpu, got {other:?}"),
+        }
+    }
 }
+
