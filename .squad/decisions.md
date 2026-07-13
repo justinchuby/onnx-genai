@@ -195,3 +195,289 @@ Canonical, append-only record of accepted team decisions. Only the Coordinator (
 4. **Rebalance overload guard** [Low]: Added `Router::least_loaded_node_below_threshold` (healthy && !draining && `kv_usage < overload_threshold`); used in `rebalance()` instead of `least_loaded_node`. When all healthy non-draining nodes are at/above threshold, rebalance leaves sessions in place — no thrash migration + re-prefill cost.
 **Why:** Serial poller degraded health refresh for healthy nodes when cluster was degraded; unknown-id nodes attracted traffic incorrectly; uncapped response buffering was a DoS vector; rebalance could thrash between saturated nodes with no benefit.
 
+---
+
+### 2026-07-20T00:00:00Z: §38 Distributed KV Connector — K1 abstraction foundation
+**By:** Zhora
+**What:** Added a pluggable external-KV-cache connector abstraction in
+`crates/onnx-genai-kv` as new module `src/connector.rs` (re-exported from
+`lib.rs`). This is the K1 milestone: pure abstraction + `NullConnector` +
+tests. No engine/scheduler wiring (K3) and no concrete backends
+(LocalTiered/LMCache, K2).
+
+Surface:
+- Async trait `KvCacheConnector: Send + Sync` (`#[async_trait]`): `lookup`,
+  `lookup_batch` (default impl loops over `lookup`; overridable for RTT
+  amortization), `store`, `fetch`, `prefetch` (sync/non-blocking), `pin`,
+  `unpin`, `evict`, `health`, `capabilities`. Object-safe (test asserts
+  `Arc<dyn KvCacheConnector>`) so K3 can hold it dynamically.
+- Types (§38.4): `KvCacheKey{model_id,layer_range,chunk_hash,chunk_index,
+  num_tokens}` (derives Clone/Hash/Eq/PartialEq/Debug); `KvCacheLocation`
+  (LocalGpu/LocalCpu/LocalDisk/Remote/NotFound); `KvStoreEntry`; `FetchedKv`;
+  `ConnectorCapabilities`; `CachePriority`; `CompressionFormat`;
+  `ConnectorHealth` (enum Healthy / Degraded{detail} / Unavailable{detail}).
+- Error type `ConnectorError` (NotFound/Backend/Unsupported) +
+  `ConnectorResult<T>` alias — kept separate from `KvError` since connector
+  failures are transport/IO-dominated.
+- Chunking (§38.8): `chunk_tokens(&[TokenId], chunk_size) -> Vec<TokenChunk>`,
+  `TokenChunk{index,tokens,hash}` with `to_key(model_id, layer_range)`, and
+  `DEFAULT_CHUNK_SIZE = 256`.
+- `NullConnector`: lookup/lookup_batch → NotFound; store/pin/unpin/evict → Ok
+  no-op; fetch → Err(NotFound); prefetch → no-op; health → Healthy;
+  capabilities → {distributed:false, prefetch:false, pinnable:false,
+  max_chunk_tokens: usize::MAX, compression:[None]}.
+- Reused existing crate types: `PageId`, `Device`, `TokenId`, `thiserror`.
+
+**Stable chunk-hash choice:** `hash_tokens` = **FNV-1a (64-bit)** over the
+little-endian bytes of each `u32` token id, with fixed offset-basis/prime
+constants inlined. Chosen over Rust's `DefaultHasher` (SipHash is
+per-process-randomly-seeded and would break cross-node prefix sharing). Hash
+is per-chunk (depends only on that chunk's tokens, never neighbours), enabling
+chunk-granular prefix sharing. A test pins hardcoded expected hashes so any
+future hasher change is caught.
+
+**KvTensorRef placeholder:** `KvStoreEntry.kv_data`/tensor data uses a minimal
+opaque `KvTensorRef{size_bytes}` placeholder (doc-commented) so K1 stays free
+of ORT/engine deps. K2 will flesh it into a real device-memory descriptor /
+tensor view without changing the trait surface.
+
+**Model-agnostic:** `model_id` is an opaque namespacing string; nothing
+branches on model names. `chunk_size`, compression, and capabilities are
+params/config, never hardcoded per model.
+
+**Deferred:** engine/scheduler wiring → K3; concrete backends
+(LocalTiered/LMCache) → K2.
+
+**Deps:** added `async-trait` to workspace deps and to onnx-genai-kv
+`[dependencies]`; added `tokio` (workspace) to onnx-genai-kv
+`[dev-dependencies]` for `#[tokio::test]`.
+
+**Validation:** `cargo test -p onnx-genai-kv --lib` → 55 passed (20 new
+connector tests, existing kv tests green). `cargo clippy -p onnx-genai-kv
+--all-targets -- -D warnings` → clean.
+
+**Why:** Establishes the connector seam so distributed/tiered KV and cross-node
+prefix sharing can be added in K2/K3 without reshaping the abstraction, while
+keeping the default (single-node, no offload) behaviour a trivial no-op.
+
+---
+
+### 2026-07-20T00:00:00Z: §38 Distributed KV Connector — K2 LocalTieredConnector
+
+**By:** Zhora
+
+**What:** Implemented the default, ships-by-default `LocalTieredConnector`
+(DESIGN §38.5.1) plus `LocalTieredConfig` and `DiskTierConfig` in the new module
+`crates/onnx-genai-kv/src/local_tiered.rs` (re-exported from `lib.rs`). Added a
+small `PrefixCache::remove(tokens) -> Vec<PageId>` primitive to
+`src/prefix_cache.rs`. This is the concrete single-node GPU→CPU tiered backend
+behind the K1 `KvCacheConnector` trait. No scheduler wiring (that is K3).
+
+Files:
+- `src/local_tiered.rs` (new): connector, config, disk-tier config, 11 tests.
+- `src/prefix_cache.rs`: added `remove` (detach a specific prefix node, return
+  its pages; does NOT touch page-table refcounts — the owner does).
+- `src/lib.rs`: `pub mod local_tiered;` + re-export
+  `DiskTierConfig, LocalTieredConfig, LocalTieredConnector`.
+
+**How the bridge works (reuse, not reinvent):**
+- `PageTable` owns physical pages and hot/cold tiering. `Device::Gpu(0)` = hot,
+  `Device::Cpu` = cold. Each stored chunk holds exactly ONE page-table ref,
+  released on `evict`. When the hot pool fills, `PageTable::allocate` auto-
+  offloads the LRU hot page to CPU; `fetch`/`prefetch` promote back to GPU.
+- `PrefixCache` is the content-addressed prefix index: every chunk is registered
+  under a deterministic token path derived from its `KvCacheKey`
+  (`key_path` = FNV(model_id) ++ layer_range ++ chunk_index ++ chunk_hash ++
+  num_tokens). Chunks with identical content resolve to the same pages
+  (chunk-granular prefix sharing via `PrefixCache::lookup`/`remove`). I used
+  `insert`/`lookup`/`remove` (no refcount side effects) so retention stays owned
+  by the connector+PageTable — clean, single-ref accounting.
+- `chunks: HashMap<KvCacheKey, ChunkEntry>` is the authoritative O(1) resolver
+  used by lookup/fetch; records page_ids, priority, ttl, size_bytes, and path.
+
+**Location / estimate model:** a chunk of `num_tokens` occupies
+`ceil(num_tokens / page_size)` pages. `lookup` reports `LocalGpu{page_ids}` when
+ALL pages are `Device::Gpu(_)`, else `LocalCpu{estimated_load_ms, size_bytes}`
+where `estimated_load_ms = pages_needing_upload * cpu_load_ms_per_page`
+(default 1 ms/page, per design "~1ms for typical page") and
+`size_bytes = pages * bytes_per_page` (halved for Fp8). Honest linear estimates;
+`fetch` reports the *actual* elapsed `transfer_time`. `LocalDisk`/`Remote` are
+never fabricated.
+
+**Compression wiring:** `LocalTieredConfig.compression`; `new()` rejects
+`CacheGen`/`Zstd` with `ConnectorError::Unsupported` (only `None` and `Fp8`
+implemented). Fp8 halves `size_bytes` and the store path exercises the real
+codec via `fp8::encode_f32`/`decode_f32` (E4M3Fn). Real tensor-byte compression
+lands with the K2+ tensor handle (`KvTensorRef` is still a size-only
+placeholder). `capabilities().compression == [None, Fp8]`.
+
+**Priority + pinning:** hard eviction (total `max_cached_pages` budget) is
+priority-aware: Opportunistic evicted before Session before SystemPrompt, ties
+break on oldest `stored_at`; pinned chunks are skipped. Tier demotion (hot→cold
+under `hot_capacity` pressure) is LRU and also skips pinned pages and never
+demotes a page of higher priority than the incoming chunk. `pin`/`unpin` toggle
+an internal pinned set; `evict` frees pages + drops the mapping (and the
+prefix-cache node).
+
+**Disk-tier decision:** NOT implemented this milestone. `disk_backend` defaults
+to `None`; `DiskTierConfig{path}` lets a disk tier be *configured*, and `health`
+returns `Degraded` when configured-but-unavailable (dir missing), `Healthy`
+otherwise. A real mmap/direct-I/O spill + `LocalDisk` locations are a documented
+future extension. No fake `LocalDisk` results.
+
+**Prefetch approach:** non-blocking `fn` — `try_lock` the interior mutex; if
+acquired, best-effort synchronous promote of the chunk's pages to GPU (respecting
+pins/room); if the lock is busy, the hint is silently dropped. No background
+thread, so the crate stays runtime-free (no tokio dependency added); a future
+revision may queue hints for an offload task.
+
+**Lock discipline:** all interior state (`PageTable`, `PrefixCache`, `chunks`,
+`pinned`) lives behind ONE `std::sync::Mutex`. Every critical section is
+synchronous and short; the guard is always dropped before the async method
+returns — a std guard is NEVER held across `.await` (structurally ensured; there
+are no awaits inside the locked regions). Clippy `-D warnings` clean.
+
+**Tests (11 new, all in `#[cfg(test)]`):**
+`store_then_lookup_reports_local_gpu_and_unknown_is_not_found`,
+`overflowing_hot_capacity_offloads_to_cpu_tier`,
+`fetch_promotes_cpu_resident_chunk_and_missing_errors`,
+`identical_content_shares_the_same_pages_via_prefix_cache`,
+`pin_prevents_eviction_and_unpin_allows_it_and_evict_drops_mapping`,
+`opportunistic_is_evicted_before_session_and_system_prompt`,
+`compression_none_and_fp8_round_trip`, `unsupported_compression_is_rejected`,
+`capabilities_and_health_are_reported`, `lookup_batch_resolves_all_keys`,
+`prefetch_is_non_blocking_and_promotes_when_possible`.
+
+**Why:** delivers the concrete default local backend for §38 by bridging the
+existing kv-crate facilities (PageTable tiering + PrefixCache prefix sharing +
+fp8 codec) behind the K1 trait, model-agnostic and fully config-driven, without
+reinventing tiering or prefix matching, and without engine coupling.
+
+**Validation:** `cargo test -p onnx-genai-kv --lib` → 66 passed (55 K1/prior +
+11 new); `cargo clippy -p onnx-genai-kv --all-targets -- -D warnings` → clean.
+
+---
+
+### 2026-07-13: Wire KvCacheConnector into the engine's prefix-cache-hit path (K3)
+
+**By:** Leon
+
+**What:**
+Extended `onnx-genai-engine` so an optional, model-agnostic `KvCacheConnector`
+participates in cross-session prefix reuse, without disturbing the existing
+in-process `lookup_shared`/`release_shared` refcount path.
+
+- **Config (generic):** new `EngineConfig.kv_connector: KvConnectorConfig`
+  (`config.rs`). It expresses *which backend* (`KvConnectorBackend::Null` |
+  `LocalTiered(LocalTieredConfig)`) plus backend-neutral knobs (`model_id`,
+  `chunk_size`, `store_priority`, `recompute_ms_per_token`). Default is `Null`,
+  which reproduces today's behavior exactly. No per-model branches; `model_id`
+  is an opaque key namespace, defaulting to the model directory name.
+- **Bridge:** new `connector_bridge.rs` with `ConnectorBridge`. A `null()`
+  bridge is fully inert (no runtime, every method early-returns). An active
+  bridge owns a private current-thread Tokio runtime and `block_on`s the async
+  trait (the shipped backends complete synchronously, never yielding).
+- **STORE (LIVE):** `Engine::insert_cached_prefixes` now also calls
+  `ConnectorBridge::store_prefix(&state.tokens, kv_token_count)`, chunking the
+  resident KV at `chunk_size` and pushing each *complete* chunk with the
+  configured `CachePriority`.
+- **LOOKUP (LIVE, reporting only):** `Engine::prepare_session_prefix` computes
+  the in-process hit as before, then calls
+  `ConnectorBridge::lookup_extension(prompt_tokens, in_process_hit)`. That
+  chunks the tokens beyond the in-process boundary, builds `KvCacheKey`s via the
+  connector's chunk-hash helper, calls `lookup_batch`, and walks the contiguous
+  run of resident chunks — counting a chunk only while `estimated_load_ms <=
+  num_tokens * recompute_ms_per_token` (fetch-vs-recompute signal, DESIGN §38).
+- **Observability:** `Engine::last_connector_stats() -> ConnectorStats`
+  (lookups / chunk_hits / would_extend_tokens / fetched_tokens / stores).
+
+**LIVE end-to-end:** generic connector config + construction; store-after-prefill;
+connector lookup with contiguous-hit + fetch-vs-recompute decision; stats.
+Default `Null` path is byte-for-byte unchanged (verified by test).
+
+**DEFERRED — `TODO(K3-materialize)`:** actually fetching hit chunks and copying
+their KV into the engine's paged KV cache so prefill can be *shortened*. Reason:
+the K1 `KvTensorRef`/`FetchedKv` carry only a `size_bytes` placeholder plus page
+ids in the connector's *own* PageTable — there is no real device-tensor handle
+to copy from, and the connector's `store` never received real KV bytes. Wiring
+materialization would require giving those types a real tensor handle. Until
+then `lookup_extension` returns `would_extend_tokens` for metrics but does NOT
+alter `prefix_cache_hit_len`, so generation output stays exactly correct — we
+never claim a hit we cannot serve.
+
+**Why:**
+- Model-agnostic config was a hard user directive; an enum of backends + neutral
+  knobs generalizes to remote/distributed connectors later with no engine change.
+- The engine's `prefix_cache` (refcounted shared pages) and the connector's own
+  `PrefixCache`/`PageTable` are kept strictly separate — no aliasing, no
+  double-free risk, per the K1/K2 foundation notes.
+- Honest deferral over faked materialization: silently substituting placeholder
+  KV would corrupt outputs. The store + lookup halves are fully real and tested,
+  leaving a precise, isolated seam for the fetch→materialize follow-up.
+
+**Validation:** `cargo build -p onnx-genai-engine` clean; `cargo test -p
+onnx-genai-engine --lib` = 102 passed / 0 failed / 1 ignored (11 new connector
+tests); `cargo clippy -p onnx-genai-engine --lib` and `--tests` clean with
+`-D warnings`; `cargo test -p onnx-genai-kv --lib` = 67 passed; full workspace
+builds. Commit: 2667b3d.
+
+---
+
+### 2026-07-13: Definition of "pages_needing_upload" in estimated_load_ms
+
+**By:** Zhora
+
+**What:** `pages_needing_upload` in `locate()` is defined as the count of pages in a chunk that are currently NOT on a GPU device (i.e., residing on the CPU tier). These are the pages that the K3 scheduler would need to upload before the chunk is hot. Pages already on GPU are excluded — they are zero-cost to access and need no upload.
+
+**Why:** The module doc (line ~29) states the estimate is `pages_needing_upload * cpu_load_ms_per_page`. The code already counted CPU-resident (non-GPU) pages as `on_cpu`; the bug was that this count was used directly as milliseconds (equivalent to assuming `cpu_load_ms_per_page = 1.0`) rather than being multiplied by the configured rate. The fix multiplies `on_cpu` by `cpu_load_ms_per_page`, which is consistent with the doc's intent and gives correct scaling for any configured value. Commit: 30ee870.
+
+---
+
+### 2026-07-13: KvCacheKey chunk hash is now prefix-dependent (cumulative FNV state)
+
+**By:** Zhora
+
+**What:**
+Reworked the §38 chunk-hashing scheme so `KvCacheKey.chunk_hash` encodes the
+full preceding token context instead of just that chunk's tokens.
+
+- Chose the **folded-chunk_hash** design (NOT a new `prefix_hash` field).
+  `KvCacheKey`'s shape is unchanged; `chunk_hash` now carries a *cumulative*
+  hash. Implementation: `chunk_tokens` threads a single FNV-1a state across
+  chunk boundaries, snapshotting it at each boundary, so
+  `chunks[i].hash == hash_tokens(&all_tokens[0..=end_of_chunk_i])`. Continuing
+  the running FNV state is exactly "the cumulative hash of all preceding chunks'
+  tokens ++ this chunk's tokens" and is cleaner than re-folding the previous
+  digest's bytes (no extra step, and it stays trivially equal to the pure hash
+  of the covered prefix, which makes the guard test self-evident).
+- Pure `hash_tokens` is untouched (still the position-independent FNV-1a of the
+  slice passed in) and is still used by `LocalTieredConnector::key_path` to hash
+  the opaque `model_id`. Its hardcoded-value guard is unchanged.
+- Added a hardcoded-value guard for the *rolling* chunk hashes
+  (`chunk_tokens_cumulative_hash_is_stable_against_hardcoded_values`) to keep
+  determinism + process-independence locked, and updated the misleading
+  "depends only on that chunk's tokens — never on surrounding chunks" doc on
+  `hash_tokens`/`KvCacheKey`/`TokenChunk` to describe prefix-dependence.
+
+**Invariant established:** equal `KvCacheKey` ⟹ identical token sequence from
+position 0 through the end of that chunk (for a fixed `model_id` + `layer_range`).
+
+**Why:**
+Deckard's K3 review surfaced a latent correctness landmine: a chunk's real KV is
+prefix-dependent (causal attention — chunk N depends on tokens 0..N), but the K1
+key hashed only the chunk window. Two sequences sharing chunk N's tokens but
+differing earlier produced an identical key yet different real KV. Harmless in
+K3 (metrics only), but K4 materialization would copy fetched KV into the paged
+cache on the strength of this key and **silently corrupt output**. The cumulative
+scheme fixes this while preserving genuine cross-node prefix sharing: two
+requests with the same prefix through chunk N still get the same key for chunk N
+(shared system prompts / common prefixes still dedupe); only genuinely-different
+prefixes now correctly diverge. No backward-compat shim (pre-release); no new
+deps; trait object-safety unchanged; engine `key_for`/`chunk_tokens` API surface
+unchanged so `connector_bridge.rs` picks up prefix-dependence transparently.
+
+Proven by: `chunk_hash_is_prefix_dependent` (shared window + different earlier
+tokens ⟹ different key) and `chunk_hash_shared_prefix_still_collides`
+(identical prefix ⟹ identical keys through the shared boundary, diverging after).
+Commit: ac12480.
+

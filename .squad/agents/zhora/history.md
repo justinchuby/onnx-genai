@@ -41,3 +41,36 @@ Added `/v1/debug/config`, `/v1/debug/sessions`, `/v1/debug/kv`, and `/v1/debug/t
 §37 / Issue #9 model lifecycle epic: COMPLETE (M1 + M2 + M3).
 Locked out of embeddings follow-up per reviewer protocol; Rachael delivered fix.
 Next: §34 router epic (R1/R2/R3) has kicked off.
+
+## 2026-07-13T23:15:17Z — §38 KV Connector K1 + K2 + cpu-load fix + prefix-hash fix
+
+### K1 — Pluggable KvCacheConnector abstraction
+- Added `KvCacheConnector` async trait + `NullConnector` in `crates/onnx-genai-kv/src/connector.rs`.
+- Types: `KvCacheKey`, `KvCacheLocation`, `KvStoreEntry`, `FetchedKv`, `ConnectorCapabilities`, `CachePriority`, `CompressionFormat`, `ConnectorHealth`, `ConnectorError`.
+- Chunking: `chunk_tokens`, `TokenChunk`, `hash_tokens` (FNV-1a 64-bit, process-independent). `DEFAULT_CHUNK_SIZE = 256`.
+- Deps added: `async-trait` to workspace + kv crate; `tokio` to kv dev-deps.
+- 55 tests green; clippy clean.
+
+### K2 — LocalTieredConnector
+- Implemented `LocalTieredConnector` in `crates/onnx-genai-kv/src/local_tiered.rs`.
+- Bridges existing `PageTable` (hot/cold tiering) + `PrefixCache` (content-addressed index). Single `std::sync::Mutex` lock; no std guard held across `.await`.
+- Priority-aware eviction (Opportunistic < Session < SystemPrompt); pinning; Fp8 codec.
+- `PrefixCache::remove` primitive added to `src/prefix_cache.rs`.
+- 11 new tests (66 total); clippy clean.
+- Reviewed by Chew (🟡): `cpu_load_ms_per_page` unscaled defect found.
+
+### cpu_load_ms_per_page fix (commit 30ee870)
+- `locate()` now: `estimated_load_ms = pages_needing_upload * cpu_load_ms_per_page`.
+- Added `cpu_load_ms_scales_by_configured_rate` test.
+
+### Prefix-dependent chunk hash fix (commit ac12480)
+- `chunk_tokens` threads cumulative FNV-1a state across chunk boundaries.
+- **Invariant:** equal `KvCacheKey` ⟹ identical token sequence from position 0 through end of chunk.
+- Preserves genuine prefix sharing; defuses K4-materialize landmine flagged by Deckard.
+- Tests: `chunk_hash_is_prefix_dependent`, `chunk_hash_shared_prefix_still_collides`, hardcoded-value stability guard.
+
+### K4-materialize TODO (shared context)
+- `TODO(K3-materialize)` in `connector_bridge.rs`: fetch hit chunks → copy KV into paged cache → shorten prefill.
+- Blocked on `KvTensorRef` needing a real device-tensor handle (currently size-only placeholder).
+- The prefix-dependent-hash invariant is now in place. K4 implementor can trust `KvCacheKey` equality as proof of identical prefix.
+

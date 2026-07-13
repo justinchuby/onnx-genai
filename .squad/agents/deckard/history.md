@@ -53,3 +53,27 @@ Published v0.1.0 release path is canonical: `.github/workflows/publish.yml` uses
 
 ## 2026-07-13T20:55:00Z — §37/#9 model lifecycle read-only scope
 - Scoped issue #9 model lifecycle architecture (read-only). Produced milestone plan M1–M4: M1 ModelHandle/Registry extraction, M2 real routing errors, M3 load/unload (RwLock), M4 status field. Saved to session files. Zhora independently implemented M1 in the same batch.
+
+## 2026-07-13T23:15:17Z — §38 K3 code review
+
+Reviewed `crates/onnx-genai-engine/src/{connector_bridge.rs, engine.rs, config.rs, lib.rs}` (Leon, commit 2667b3d).
+
+Independently verified 7 high-risk items — all clean:
+1. No nested-runtime panic: dedicated `std::thread` + private current-thread Tokio; `block_on` not called from existing Tokio context.
+2. No refcount aliasing: engine's `prefix_cache` strictly separate from connector's `PrefixCache`/`PageTable`.
+3. Correct chunk-boundary math: aligns with K1 `chunk_tokens` contract.
+4. Inert Null default: byte-for-byte identical to prior behavior.
+5. Honest deferral: `would_extend_tokens` metric only; `prefix_cache_hit_len` not altered; no faked hits.
+6. Model-agnostic: no model-name branches.
+7. Clean lock discipline: no locks held across `.await`.
+
+Verdict: 🟢 **SHIP**.
+
+**Advisory (K4-materialize):** chunk hash was prefix-INDEPENDENT — K4 materialization would copy wrong KV and silently corrupt outputs. Zhora subsequently fixed this (commit ac12480).
+
+### Shared context for K4-materialize
+- `TODO(K3-materialize)` in `connector_bridge.rs`: fetch chunks → copy KV into paged cache → shorten prefill.
+- Blocked on `KvTensorRef` needing real device-tensor handle.
+- **Prefix-dependent hash invariant now established** (Zhora, ac12480): `KvCacheKey` equality ⟹ identical prefix through that chunk. Safe to trust for copy-on-hit.
+- Lock discipline invariant: std guard in `ConnectorBridge` (if any) must NEVER be held across `.await`.
+
