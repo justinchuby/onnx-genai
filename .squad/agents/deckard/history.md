@@ -46,3 +46,7 @@ Published v0.1.0 release path is canonical: `.github/workflows/publish.yml` uses
 ## 2026-07-12T17:30:00-07:00 — Preprocess, tiling, compaction, and Mobius paged-cache logged
 - `onnx-genai-preprocess`, metadata-driven/LLaVA-style image tiling, tolerant serialized ORT compaction tests, and Mobius paged-cache draft PR #395 are now recorded.
 - Future onnx-genai paged attention should drive Mobius `key_pool`/`value_pool`, `block_table`, `slot_mapping`, and `nonpad_kv_seqlen` contracts.
+
+
+## 2026-07-13T18:30:00Z — Review/fix batch
+- Owned Sapper's reviewer-lockout follow-up and landed `8a0cf4b`, making thumbnail token/pixel order authoritative from tensor layout.

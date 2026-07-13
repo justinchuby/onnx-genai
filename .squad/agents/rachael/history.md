@@ -40,3 +40,7 @@ Batched-driver DoS hardening is canonical: admission is bounded by `max_pending`
 ## 2026-07-12T17:30:00-07:00 — Vision fidelity and audio endpoints logged
 - Metadata-driven vision preprocessing and OpenAI-compatible `input_audio` plus `/v1/audio/transcriptions` routing are now canonical.
 - Real audio/vision quality remains gated on production Mobius model packages and complete processor metadata.
+
+
+## 2026-07-13T18:30:00Z — Review/fix batch
+- Owned Zhora's reviewer-lockout security follow-up and landed `2e67806`, gating `/v1/debug/*` default-off and redacting session identifiers.

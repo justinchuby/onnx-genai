@@ -574,3 +574,11 @@ The intended lever (eliminating host↔device KV copies via device-resident KV) 
 **By:** Zhora
 **What:** Added `/v1/debug/config`, `/v1/debug/sessions`, `/v1/debug/kv`, and `/v1/debug/trace`; renamed the server's active-plus-queued generation cap to `max_queue_depth` (`--max-queue-depth` / `ONNX_GENAI_MAX_QUEUE_DEPTH`).
 **Why:** The debug endpoints expose current server configuration, sessions, existing cache/admission metrics, and tracing status without creating new engine subsystems. The explicit queue-depth setting documents and configures the existing semaphore-based HTTP 429 admission boundary.
+
+---
+
+### 2026-07-13T18:30:00Z: Reviewer rejection lockout and debug hardening
+**By:** Scribe
+**What:** Reviewer-rejection lockout was applied correctly in the review/fix batch: Zhora was locked out after Gaff rejected unauthenticated `/v1/debug/*`; Sapper was locked out after Gaff flagged thumbnail token/pixel ordering; Batty was locked out after Luv rejected vision token-expansion multi-image accounting and `tokens_per_tile` guards. Follow-up fixes were owned by Rachael (`2e67806`), Deckard (`8a0cf4b`), and Leon (`458fb78`) respectively.
+**Security:** `/v1/debug/*` is now hardened default-off and redacts session identifiers, closing the rejected unauthenticated session-ID disclosure path.
+**Why:** Rejections must move remediation to a different owner, and debug surfaces must fail closed unless explicitly enabled.

@@ -5,3 +5,7 @@ Hired as Engine Dev (KV & runtime buffers) to add capacity alongside Batty as th
 
 ## 2026-07-13: Landed attention-sink SWA support
 Extended sliding-window attention with StreamingLLM-style sink-token retention across metadata, engine decode state, runtime KV buffers, and paged-KV bookkeeping. Landed as commit `2371864`.
+
+
+## 2026-07-13T18:30:00Z — Review/fix batch
+- Owned Batty's reviewer-lockout fix for issue #14 and landed `458fb78`, adding multi-image over-count bailouts and `tokens_per_tile` guards.
