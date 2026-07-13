@@ -279,17 +279,25 @@ fn tokenize_with(tokenizer: &Tokenizer, prompt: &GeneratePrompt) -> anyhow::Resu
     }
 }
 
-/// Expand each image placeholder token in `prompt_tokens` into
+/// Expand the single image placeholder token in `prompt_tokens` into
 /// `tokens_per_tile * num_tiles` copies of that same token.
 ///
 /// Returns the input unchanged when `num_image_tiles` is `None`.
+///
+/// Only a **single** placeholder occurrence is supported. `num_image_tiles` is
+/// an aggregate tile count across all images in the request, so expanding
+/// multiple placeholders by that aggregate would produce the wrong number of
+/// image-token slots. Richer per-image metadata (and row/column separator
+/// tokens) requires the full preprocessing path; this count-based path targets
+/// separator-free single-image models only.
 ///
 /// Errors when:
 /// - `num_image_tiles` is `Some` but the pipeline metadata declares no vision
 ///   contract (`image_placeholder_token_id` or `tokens_per_tile` missing).
 /// - The placeholder token ID does not fit in `TokenId` (u32).
-/// - The prompt contains no placeholder tokens.
-/// - Arithmetic would overflow.
+/// - `tokens_per_tile` is zero.
+/// - The prompt contains no placeholder token, or more than one.
+/// - Arithmetic would overflow, or the expanded sequence is empty.
 fn expand_image_placeholders_count_based(
     prompt_tokens: Vec<TokenId>,
     num_image_tiles: Option<usize>,
@@ -314,6 +322,12 @@ fn expand_image_placeholders_count_based(
         ),
     };
 
+    if tokens_per_tile == 0 {
+        anyhow::bail!(
+            "pipeline metadata tokens_per_tile is 0; must be at least 1"
+        );
+    }
+
     let placeholder_id: TokenId = u32::try_from(placeholder_i64)
         .with_context(|| {
             format!(
@@ -331,20 +345,23 @@ fn expand_image_placeholders_count_based(
              (id={placeholder_id}); the prompt must contain exactly one placeholder"
         );
     }
+    if placeholder_count > 1 {
+        anyhow::bail!(
+            "multi-image count-based expansion is not supported: found {placeholder_count} image \
+             placeholders (id={placeholder_id}) but only an aggregate tile count is available; \
+             supply a single image or thread per-image tile counts"
+        );
+    }
 
     let expansion: usize = tokens_per_tile
         .checked_mul(num_tiles)
         .context("image token expansion overflow: tokens_per_tile * num_image_tiles is too large")?;
 
-    // Each placeholder expands to `expansion` copies; non-placeholder tokens are kept.
+    // The single placeholder expands to `expansion` copies; all other tokens are kept.
     let new_len = prompt_tokens
         .len()
-        .checked_sub(placeholder_count)
-        .and_then(|base| {
-            placeholder_count
-                .checked_mul(expansion)
-                .and_then(|added| base.checked_add(added))
-        })
+        .checked_sub(1)
+        .and_then(|base| base.checked_add(expansion))
         .context("expanded prompt token sequence length overflows")?;
 
     let mut expanded = Vec::new();
@@ -360,6 +377,13 @@ fn expand_image_placeholders_count_based(
         } else {
             expanded.push(token);
         }
+    }
+
+    if expanded.is_empty() {
+        anyhow::bail!(
+            "image placeholder expansion produced an empty token sequence; \
+             check that num_image_tiles > 0 and the prompt contains non-placeholder tokens"
+        );
     }
 
     Ok(expanded)
@@ -660,14 +684,16 @@ mod tests {
     }
 
     #[test]
-    fn image_placeholder_expansion_multiple_placeholders() {
-        // Two placeholders each with 1 tile × 4 tokens/tile
+    fn image_placeholder_expansion_multiple_placeholders_errors() {
+        // Count-based path only supports a single placeholder; >1 must error.
         let tokens: Vec<TokenId> = vec![100, 5, 100];
         let cfg = vision_config(100, 4);
-        let expanded =
-            expand_image_placeholders_count_based(tokens, Some(1), Some(&cfg)).unwrap();
-        // Each placeholder → 4 copies
-        assert_eq!(expanded, vec![100, 100, 100, 100, 5, 100, 100, 100, 100]);
+        let err =
+            expand_image_placeholders_count_based(tokens, Some(1), Some(&cfg)).unwrap_err();
+        assert!(
+            err.to_string().contains("multi-image count-based expansion is not supported"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -717,5 +743,30 @@ mod tests {
         let err =
             expand_image_placeholders_count_based(tokens, Some(1), Some(&cfg)).unwrap_err();
         assert!(err.to_string().contains("out of range"));
+    }
+
+    #[test]
+    fn image_placeholder_expansion_tokens_per_tile_zero_errors() {
+        let tokens: Vec<TokenId> = vec![1, 100, 2];
+        let cfg = vision_config(100, 0);
+        let err =
+            expand_image_placeholders_count_based(tokens, Some(1), Some(&cfg)).unwrap_err();
+        assert!(
+            err.to_string().contains("tokens_per_tile is 0"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn image_placeholder_expansion_zero_tiles_produces_empty_errors() {
+        // tokens_per_tile=4, num_tiles=0 → expansion=0 → prompt becomes empty
+        let tokens: Vec<TokenId> = vec![100];
+        let cfg = vision_config(100, 4);
+        let err =
+            expand_image_placeholders_count_based(tokens, Some(0), Some(&cfg)).unwrap_err();
+        assert!(
+            err.to_string().contains("empty token sequence"),
+            "unexpected error: {err}"
+        );
     }
 }
