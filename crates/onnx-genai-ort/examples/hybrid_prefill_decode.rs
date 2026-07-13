@@ -15,7 +15,7 @@
 //! generation from the prompt length.
 //!
 //! Usage:
-//!   ONNX_GENAI_METAL_EP_LIB=<abs path to libonnxruntime_mps_ep.dylib> \
+//!   ONNX_GENAI_METAL_EP_LIB=<abs path to libonnxruntime_mlx_ep.dylib> \
 //!   cargo run -p onnx-genai-ort --release --example hybrid_prefill_decode -- \
 //!     --model models/qwen2.5-0.5b-cpu-recipe \
 //!     --prompt "What is the capital of France?" --pad-to 512 --max-tokens 32 \
@@ -472,7 +472,7 @@ fn print_help() {
         "Usage: cargo run -p onnx-genai-ort --release --example hybrid_prefill_decode -- \\\n  \
          --model <DIR> [--prompt TEXT] [--pad-to N] [--max-tokens N] \\\n  \
          [--mode cpu|metal|hybrid|all] [--no-warmup]\n\n\
-         Set ONNX_GENAI_METAL_EP_LIB to the built libonnxruntime_mps_ep.dylib for Metal/hybrid."
+         Set ONNX_GENAI_METAL_EP_LIB to the built libonnxruntime_mlx_ep.dylib for Metal/hybrid."
     );
 }
 

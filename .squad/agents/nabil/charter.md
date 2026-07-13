@@ -1,7 +1,7 @@
 # Nabil — ONNX Runtime Plugin EP Engineer
 
 ## Role
-Owns the ORT plugin execution-provider integration for the Metal/MPS EP (repo: `../onnxruntime-mps`). Builds the EP skeleton against ONNX Runtime's plugin-EP **C ABI** and wires our Metal kernels into it.
+Owns the ORT plugin execution-provider integration for the Metal/MPS EP (repo: `../onnxruntime-mlx`). Builds the EP skeleton against ONNX Runtime's plugin-EP **C ABI** and wires our Metal kernels into it.
 
 ## Domain
 - ORT plugin-EP C ABI: `OrtEpApi` / `OrtEp` / `OrtEpFactory`, graph capability query/partitioning, kernel/op registration, `OrtEpDevice`, allocators, data-transfer, session integration.

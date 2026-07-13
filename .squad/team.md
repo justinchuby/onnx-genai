@@ -6,7 +6,7 @@
 - **Description:** Reference implementation of the ONNX Inference Metadata Standard. Standard-driven behavior, agent-first (prefix caching, multi-session, CoW fork, KV rewind), speculative decoding, continuous batching. OpenAI-compatible HTTP + Rust library.
 - **Stack:** Rust (edition 2024), Cargo workspace, ONNX Runtime (ORT), HF tokenizers.
 - **Crates:** onnx-genai, onnx-genai-metadata, onnx-genai-kv, onnx-genai-scheduler, onnx-genai-engine, onnx-genai-ort (+ort-sys), onnx-genai-server, onnx-genai-bench, onnx-genai-preprocess.
-- **Sibling repos:** `../mobius` (ONNX model builder), `../onnxruntime-mps` (custom Apple Metal/MPS execution provider for ONNX Runtime — new).
+- **Sibling repos:** `../mobius` (ONNX model builder), `../onnxruntime-mlx` (custom Apple Metal/MPS execution provider for ONNX Runtime — new).
 - **Requested by:** Justin Chu
 - **Created:** 2026-07-12
 

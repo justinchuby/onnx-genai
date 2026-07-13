@@ -1,7 +1,7 @@
 # Coco — Metal/MPS Kernel Engineer (Data & Quantization Ops)
 
 ## Role
-Implements the data-movement, quantization, and elementwise Metal/MPS kernels for the Metal EP (repo `../onnxruntime-mps`).
+Implements the data-movement, quantization, and elementwise Metal/MPS kernels for the Metal EP (repo `../onnxruntime-mlx`).
 
 ## Domain
 - **GatherBlockQuantized** (int4 embedding gather), Gather, ScatterND.

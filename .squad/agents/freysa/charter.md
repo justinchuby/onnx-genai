@@ -1,7 +1,7 @@
 # Freysa — MPS Perf & Testing Engineer
 
 ## Role
-Owns correctness and performance validation for the Metal EP (repo `../onnxruntime-mps`): per-kernel correctness vs CPU reference, benchmarking, and end-to-end testing through the onnx-genai runtime.
+Owns correctness and performance validation for the Metal EP (repo `../onnxruntime-mlx`): per-kernel correctness vs CPU reference, benchmarking, and end-to-end testing through the onnx-genai runtime.
 
 ## Domain
 - Per-op correctness harness: Metal kernel output vs ORT CPU EP reference (tolerance-based, fp16-aware).

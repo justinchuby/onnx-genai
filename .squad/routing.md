@@ -15,7 +15,7 @@ Maps work domains to team members. The coordinator uses this to dispatch.
 | Code review, quality, clarity, maintainability, extensibility verdicts | Gaff (Reviewer) |
 | Code review — correctness/safety/API-contract gates | Luv (Reviewer) |
 | Code review — numerics/precision (fp16/Q4/sampling), model-conversion fidelity | Chew (Reviewer) |
-| Metal EP integration (ORT plugin-EP C ABI, kernel registration, partitioning) — `../onnxruntime-mps` | Nabil (Metal EP) |
+| Metal EP integration (ORT plugin-EP C ABI, kernel registration, partitioning) — `../onnxruntime-mlx` | Nabil (Metal EP) |
 | Metal/MPS compute kernels (MatMulNBits, GQA/attention, softmax, RoPE, RMSNorm) | Mariette (Metal) |
 | Metal/MPS data/quant kernels (GatherBlockQuantized, quantize/dequant, KV, elementwise) | Coco (Metal) |
 | Metal EP correctness + benchmarking + E2E via onnx-genai | Freysa (Metal) |

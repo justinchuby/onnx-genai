@@ -1,7 +1,7 @@
 # Mariette — Metal/MPS Kernel Engineer (Core Compute)
 
 ## Role
-Implements the heavy compute Metal/MPS kernels for the Metal EP (repo `../onnxruntime-mps`): the ops that dominate LLM inference.
+Implements the heavy compute Metal/MPS kernels for the Metal EP (repo `../onnxruntime-mlx`): the ops that dominate LLM inference.
 
 ## Domain
 - **MatMul / MatMulNBits (int4, block-wise, accuracy_level int8 path)** — the decode hot path; match llama.cpp's Metal int8 dot-product performance.

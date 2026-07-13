@@ -957,7 +957,7 @@ fn append_metal_execution_provider(
     }
     if selected.is_empty() {
         return Err(OrtError::InvalidArgument(
-            "MetalEP device not found after registering the onnxruntime-mps plugin".into(),
+            "MetalEP device not found after registering the onnxruntime-mlx plugin".into(),
         ));
     }
 
@@ -984,7 +984,7 @@ fn append_metal_execution_provider(
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn metal_plugin_path() -> Result<std::path::PathBuf> {
-    const HELP: &str = "set ONNX_GENAI_METAL_EP_LIB to the built onnxruntime-mps plugin";
+    const HELP: &str = "set ONNX_GENAI_METAL_EP_LIB to the built onnxruntime-mlx plugin (libonnxruntime_mlx_ep.dylib)";
     let value = std::env::var_os("ONNX_GENAI_METAL_EP_LIB")
         .filter(|value| !value.is_empty())
         .ok_or_else(|| OrtError::InvalidArgument(HELP.into()))?;
