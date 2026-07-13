@@ -7727,3 +7727,453 @@ attention:
     # For fixed_budget:
     # max_tokens: 4096
 ```
+
+---
+
+## 41. Robotics & Real-Time Control Models
+
+### 41.1 Why Robotics Fits Our Architecture
+
+Robotics foundation models are a natural fit for onnx-genai:
+- **Must run locally** — control loops need <50ms latency, can't round-trip to cloud
+- **Single-machine deployment** — one GPU/NPU on the robot (Jetson Orin, PC, edge device)
+- **Multi-modal pipelines** — camera + proprioception → action (maps to our DAG pipeline)
+- **ORT already dominates edge** — Jetson, QNN, CoreML are ORT execution providers
+
+### 41.2 Model Taxonomy
+
+| Category | Examples | Input | Output | Our Pipeline Strategy |
+|---|---|---|---|---|
+| **VLA** (Vision-Language-Action) | RT-2, OpenVLA, π₀, Octo | image + text instruction | action tokens/vector | `autoregressive` or `single_pass` |
+| **Diffusion Policy** | Diffusion Policy, 3D Diffusion Policy | image + proprioception | action trajectory [T, dim] | `iterative` (DDPM/DDIM) |
+| **World Model** | UniSim, Genie 2, Cosmos, DIAMOND | image/video + action | predicted next frame | `iterative` (video diffusion) |
+| **Imitation Learning** | ACT, BeT, VINN | observation history | action chunk | `single_pass` |
+| **Navigation** | ViNT, NoMaD, GNM | image + goal | waypoint/velocity | `single_pass` |
+| **Manipulation** | RoboFlamingo, MOO, SuSIE | multi-view + task | 6DOF pose + gripper | `autoregressive` or `single_pass` |
+
+All of these map cleanly to our existing four strategy kinds. No new strategy type needed.
+
+### 41.3 Key Difference: Control Loop Mode
+
+LLM serving is request-response. Robotics is a **continuous control loop**:
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│                    Control Loop (50Hz = 20ms/cycle)           │
+│                                                              │
+│  ┌─────────┐    ┌──────────────┐    ┌─────────┐    ┌─────┐ │
+│  │ Sensors │───→│ Preprocess   │───→│ Model   │───→│ Act │ │
+│  │ (camera,│    │ (resize,norm,│    │ (ORT    │    │     │ │
+│  │  IMU,   │    │  history     │    │  forward│    │robot│ │
+│  │  joints)│    │  buffer)     │    │  pass)  │    │ API │ │
+│  └─────────┘    └──────────────┘    └─────────┘    └─────┘ │
+│       ↑                                               │      │
+│       └───────────────── feedback ────────────────────┘      │
+└──────────────────────────────────────────────────────────────┘
+```
+
+```rust
+/// Real-time control loop runner.
+/// NOT HTTP-based — runs as a tight loop with timing guarantees.
+pub struct ControlLoop {
+    /// The inference pipeline (single_pass or short autoregressive).
+    pipeline: PipelineEngine,
+    /// Sensor input sources.
+    sensors: Vec<Box<dyn SensorSource>>,
+    /// Action output sink.
+    actuator: Box<dyn ActuatorSink>,
+    /// Target frequency in Hz (e.g., 50Hz for manipulation, 100Hz for locomotion).
+    target_hz: f64,
+    /// Observation history buffer (for temporal models).
+    history: ObservationHistory,
+    /// Safety constraints.
+    safety: SafetyConfig,
+}
+
+impl ControlLoop {
+    /// Main loop — runs until stopped.
+    pub async fn run(&mut self) -> Result<()> {
+        let period = Duration::from_secs_f64(1.0 / self.target_hz);
+        let mut interval = tokio::time::interval(period);
+        
+        loop {
+            interval.tick().await;
+            let cycle_start = Instant::now();
+            
+            // 1. Read sensors
+            let observation = self.read_sensors().await?;
+            
+            // 2. Update history buffer
+            self.history.push(observation.clone());
+            
+            // 3. Preprocess (image resize, normalize, stack history frames)
+            let input = self.preprocess(&observation)?;
+            
+            // 4. Inference (single forward pass, must complete within budget)
+            let raw_action = self.pipeline.forward(&input).await?;
+            
+            // 5. Safety check + clipping
+            let safe_action = self.safety.constrain(raw_action)?;
+            
+            // 6. Send to actuator
+            self.actuator.send(safe_action).await?;
+            
+            // 7. Timing check
+            let elapsed = cycle_start.elapsed();
+            if elapsed > period {
+                tracing::warn!(
+                    "Control loop overrun: {:.1}ms > {:.1}ms budget",
+                    elapsed.as_secs_f64() * 1000.0,
+                    period.as_secs_f64() * 1000.0,
+                );
+            }
+        }
+    }
+}
+```
+
+### 41.4 Observation History Buffer
+
+World models and temporal policies need access to recent frames:
+
+```rust
+/// Fixed-size circular buffer of recent observations.
+/// Preprocessed tensors ready for model input.
+pub struct ObservationHistory {
+    /// Ring buffer of observation tensors.
+    buffer: VecDeque<ObservationFrame>,
+    /// Maximum frames to keep.
+    max_frames: usize,
+    /// Temporal stride (e.g., keep every 3rd frame for longer horizon).
+    stride: usize,
+}
+
+pub struct ObservationFrame {
+    /// Preprocessed image tensor [C, H, W].
+    pub image: Tensor,
+    /// Robot proprioception [joint_positions, velocities, forces].
+    pub proprioception: Vec<f32>,
+    /// Timestamp (for variable-rate sensors).
+    pub timestamp: Instant,
+}
+
+impl ObservationHistory {
+    /// Get stacked observation for model input.
+    /// Returns: image_stack [T, C, H, W], proprio_stack [T, proprio_dim]
+    pub fn get_stacked(&self) -> StackedObservation {
+        let frames: Vec<&ObservationFrame> = self.buffer.iter()
+            .rev()
+            .step_by(self.stride)
+            .take(self.max_frames)
+            .collect();
+        
+        StackedObservation {
+            images: stack_tensors(frames.iter().map(|f| &f.image)),
+            proprioception: stack_vectors(frames.iter().map(|f| &f.proprioception)),
+            num_frames: frames.len(),
+        }
+    }
+}
+```
+
+### 41.5 Action Space Output
+
+Unlike LLM (tokens from vocabulary), robot models output continuous action vectors:
+
+```rust
+/// Robot action output types.
+pub enum ActionOutput {
+    /// Single action vector (most policies).
+    /// e.g., [x, y, z, rx, ry, rz, gripper] for 7DOF manipulation.
+    Single(Vec<f32>),
+    
+    /// Action trajectory chunk (Diffusion Policy, ACT).
+    /// [T, action_dim] — next T timesteps of actions.
+    Trajectory {
+        actions: Vec<Vec<f32>>,
+        /// How many steps to execute before re-planning.
+        execution_horizon: usize,
+    },
+    
+    /// Tokenized actions (VLA models like RT-2).
+    /// Discrete bins that need de-tokenization.
+    Tokenized {
+        tokens: Vec<u32>,
+        /// Bin edges for each action dimension.
+        bin_edges: Vec<Vec<f32>>,
+    },
+    
+    /// Waypoint (navigation models).
+    Waypoint {
+        position: [f32; 3],   // x, y, z or x, y, heading
+        velocity: f32,
+    },
+}
+
+/// De-tokenize VLA action tokens to continuous values.
+pub fn detokenize_action(tokens: &[u32], bin_edges: &[Vec<f32>]) -> Vec<f32> {
+    tokens.iter().zip(bin_edges.iter())
+        .map(|(&token, edges)| {
+            // Token represents a bin; return bin center
+            let idx = token as usize;
+            if idx + 1 < edges.len() {
+                (edges[idx] + edges[idx + 1]) / 2.0
+            } else {
+                *edges.last().unwrap()
+            }
+        })
+        .collect()
+}
+```
+
+### 41.6 Safety Layer
+
+Physical robots need hard safety constraints that LLMs don't:
+
+```rust
+/// Safety constraints for robot actions.
+/// Applied AFTER model inference, BEFORE sending to actuators.
+/// This is a hard boundary — model output is clipped/rejected, never passed through unchecked.
+pub struct SafetyConfig {
+    /// Per-dimension action limits (joint limits, velocity caps).
+    pub action_bounds: Vec<ActionBound>,
+    /// Maximum action delta between consecutive steps (smoothness).
+    pub max_delta: Vec<f32>,
+    /// Emergency stop condition.
+    pub e_stop: EStopCondition,
+    /// Workspace boundaries (Cartesian space limits).
+    pub workspace: Option<WorkspaceBounds>,
+}
+
+pub struct ActionBound {
+    pub min: f32,
+    pub max: f32,
+}
+
+pub enum EStopCondition {
+    /// Stop if any force/torque exceeds threshold.
+    ForceLimitExceeded { threshold_n: f32 },
+    /// Stop if model output is NaN/Inf (corrupted inference).
+    InvalidOutput,
+    /// Stop if latency budget exceeded (skip this cycle).
+    LatencyOverrun,
+    /// External signal (hardware button, watchdog timeout).
+    ExternalSignal,
+}
+
+impl SafetyConfig {
+    /// Constrain raw model output to safe action.
+    pub fn constrain(&self, raw: Vec<f32>, prev_action: &[f32]) -> Result<Vec<f32>> {
+        let mut action = raw;
+        
+        // 1. Check for NaN/Inf
+        if action.iter().any(|x| !x.is_finite()) {
+            return Err(SafetyError::InvalidOutput);
+        }
+        
+        // 2. Clip to bounds
+        for (i, (val, bound)) in action.iter_mut().zip(&self.action_bounds).enumerate() {
+            *val = val.clamp(bound.min, bound.max);
+        }
+        
+        // 3. Rate limit (smooth, no jerky motion)
+        for (i, (val, &max_d)) in action.iter_mut().zip(&self.max_delta).enumerate() {
+            let delta = *val - prev_action[i];
+            if delta.abs() > max_d {
+                *val = prev_action[i] + delta.signum() * max_d;
+            }
+        }
+        
+        // 4. Workspace check (if configured)
+        if let Some(ws) = &self.workspace {
+            ws.check(&action)?;
+        }
+        
+        Ok(action)
+    }
+}
+```
+
+### 41.7 Sensor Preprocessing for Robotics
+
+Extends §35 with robot-specific preprocessing:
+
+```yaml
+# inference_metadata.yaml for a VLA model
+preprocessing:
+  image:
+    # Standard image preprocessing (same as §35)
+    decode: rgb
+    resize: { mode: fixed, size: 224 }
+    normalize: { mean: [0.5, 0.5, 0.5], std: [0.5, 0.5, 0.5] }
+    
+  depth:
+    # Depth image (from RealSense, Kinect, etc.)
+    normalize: min_max          # scale to [0, 1]
+    clip_range: [0.1, 3.0]     # meters (ignore far/near noise)
+    resize: { mode: fixed, size: 224 }
+    
+  proprioception:
+    # Robot joint state
+    normalize: per_joint        # min-max per joint from URDF limits
+    include:
+      - joint_positions         # [n_joints]
+      - joint_velocities        # [n_joints]
+      - gripper_state           # [1] (0=open, 1=closed)
+      - ee_pose                 # [7] (xyz + quaternion)
+      
+  point_cloud:
+    # 3D point cloud (optional, for 3D policies)
+    voxelize: true
+    voxel_size: 0.01           # 1cm voxels
+    bounds: [[-0.5, 0.5], [-0.5, 0.5], [0.0, 1.0]]  # workspace
+    max_points: 4096
+```
+
+### 41.8 Pipeline Configurations for Each Model Type
+
+#### VLA (Vision-Language-Action)
+
+```yaml
+# OpenVLA / RT-2 style
+pipeline:
+  models:
+    backbone:
+      filename: vla_backbone.onnx
+      type: decoder
+  preprocessing:
+    image:
+      resize: { mode: fixed, size: 224 }
+      normalize: { mean: [0.5,0.5,0.5], std: [0.5,0.5,0.5] }
+  strategy:
+    kind: autoregressive
+    max_tokens: 7              # 7 action dimensions, tokenized
+  postprocessing:
+    action:
+      type: detokenize
+      num_bins: 256
+      action_dim: 7
+```
+
+#### Diffusion Policy
+
+```yaml
+pipeline:
+  models:
+    vision_encoder:
+      filename: resnet.onnx
+      type: encoder
+    noise_predictor:
+      filename: unet.onnx
+      type: denoiser
+  preprocessing:
+    image:
+      resize: { mode: fixed, size: 96 }
+      normalize: { mean: [0.485, 0.456, 0.406], std: [0.229, 0.224, 0.225] }
+    proprioception:
+      normalize: per_joint
+  strategy:
+    kind: iterative
+    scheduler: ddim
+    num_steps: 10              # fast inference (not 1000)
+    output_shape: [16, 7]      # 16-step trajectory, 7DOF
+  postprocessing:
+    action:
+      type: trajectory
+      execution_horizon: 8     # execute 8 steps, then re-plan
+```
+
+#### World Model (Video Prediction)
+
+```yaml
+pipeline:
+  models:
+    encoder:
+      filename: encoder.onnx
+      type: encoder
+    dynamics:
+      filename: dynamics.onnx
+      type: denoiser
+    decoder:
+      filename: vae_decoder.onnx
+      type: decoder
+  preprocessing:
+    image:
+      resize: { mode: fixed, size: 256 }
+      history_frames: 4
+  strategy:
+    kind: iterative
+    scheduler: flow_matching
+    num_steps: 5
+    output: predicted_frame    # [3, 256, 256]
+```
+
+### 41.9 Deployment Targets
+
+| Platform | EP | Typical Model | Latency Target |
+|---|---|---|---|
+| Jetson Orin | TensorRT EP | Diffusion Policy (100M params) | <20ms |
+| PC + RTX 4060 | CUDA EP | OpenVLA (7B, Q4) | <100ms |
+| Jetson Nano | TensorRT EP | Small policy (10M params) | <10ms |
+| Apple Silicon | CoreML EP | ACT (50M params) | <30ms |
+| Snapdragon (drone) | QNN EP | Navigation (20M params) | <15ms |
+
+All covered by ORT execution providers. No new EP needed.
+
+### 41.10 Control Loop Server API
+
+For integration with robot middleware (ROS 2, etc.), expose a different API than the LLM HTTP server:
+
+```rust
+/// Robot control server — NOT OpenAI-compatible, purpose-built for control.
+pub struct ControlServer {
+    loop_handle: ControlLoop,
+}
+
+// API endpoints (lightweight, low-latency):
+// 
+// POST /control/start        → start control loop
+// POST /control/stop         → stop (safe zero-velocity)
+// POST /control/e_stop       → emergency stop
+// GET  /control/status       → { running, hz, last_action, latency_ms }
+// PUT  /control/goal         → update language goal / target pose
+// GET  /control/observation  → latest sensor data
+// WS   /control/stream       → WebSocket: real-time action + observation stream
+//
+// WebSocket message format:
+// → Server sends: { "action": [0.1, -0.2, ...], "obs": {...}, "dt_ms": 19.2 }
+// ← Client sends: { "goal": "pick up the red cup" } or { "e_stop": true }
+```
+
+### 41.11 Latency Budget
+
+For a 50Hz control loop (20ms budget):
+
+```
+Sensor read:       ~1ms  (USB camera frame grab)
+Preprocessing:     ~2ms  (resize + normalize, CPU)
+Model forward:    ~12ms  (ORT, GPU)  ← must be fast!
+Safety check:     <1ms   (clipping, bounds check)
+Actuator write:    ~1ms  (serial/EtherCAT command)
+─────────────────────────
+Total:            ~17ms  (3ms margin)
+```
+
+**Implication for model size:** At 50Hz on Jetson Orin, the model must complete forward pass in ~12ms. This limits practical model size to:
+- ~100M params (Diffusion Policy) → easy
+- ~1B params (small VLA, INT4) → tight but doable
+- ~7B params (full VLA like RT-2) → need to drop to 10Hz or use action chunking
+
+**Action chunking helps:** Diffusion Policy outputs 16 steps at once. Execute 8 steps (160ms at 50Hz) then re-plan. Model only runs every 160ms = 6.25Hz effective inference, but robot moves at 50Hz using the planned trajectory.
+
+### 41.12 Integration with Existing Design
+
+| Component | Robotics Use |
+|---|---|
+| Pipeline DAG (§20) | VLA/Diffusion Policy are multi-model pipelines |
+| Preprocessing (§35) | Extended with depth, proprioception, point cloud |
+| Strategy kinds (§20) | `autoregressive` (VLA), `iterative` (Diffusion Policy), `single_pass` (ACT) |
+| Metrics (§31) | + control loop Hz, latency budget utilization, safety interventions |
+| ORT wrapper (§18) | Same C API, different EPs (TensorRT for Jetson) |
+| Model lifecycle (§37) | Hot-swap policy model (transfer learning, fine-tuned version) |
+| Backpressure (§36) | N/A for single-stream control, but relevant for multi-camera preprocessing |
