@@ -45,6 +45,15 @@ _Last updated: 2026-07-13_
 
 Complete runtime built from scaffold + published: generation (greedy/speculative draft+prompt-lookup+MTP), samplers, FIM, grammar, tool use (Hermes-verified), chat templates, multi-session + prefix cache, paged/tiered/int8 KV, long-context O(1)/token static-cache, batched multi-agent serving, OpenAI HTTP (chat/completions/vision/streaming/sessions), observability, benchmarks (`onnx-genai-bench`), `onnx-genai-preprocess` crate, security hardening, CI + audits. **Fixed: categorical sampling had no RNG (always token 0).**
 
+## Design-backlog push (2026-07-13, session 2)
+
+Reviewed multi-agent batch closing several §-gaps (each committed + reviewed):
+- **§13/§31 debug endpoints + §36 backpressure** (Zhora): `/v1/debug/{config,sessions,kv,trace}` + configurable `max_queue_depth` (429+Retry-After). Security-hardened after review (Rachael): endpoints **disabled by default**, opt-in `--enable-debug-endpoints`/`ONNX_GENAI_DEBUG_ENDPOINTS=1` (404 when off, no existence leak); session capability IDs **redacted** (`sess-{8hex}…`, non-replayable).
+- **§40 sliding-window attention** (Leon): contiguous single-window SWA was already present; added **attention-sink tokens (StreamingLLM §40.4)** end-to-end (metadata `sink_tokens`, KV sink-aware windowing, engine token-exact `[0,sink)∪[window_start,len)`). Reviewed 🟢 (Chew): boundary math exact, discontinuous-position paths genuinely bail rather than emit wrong output. Per-layer hybrid (§40.3) + discontinuous `position_ids` (§40.8) declined pending Mobius/ORT.
+- **§35 multimodal token-expansion**: preprocess `expand_image_placeholders` library (Sapper) — thumbnail token/pixel order made authoritative from tensor layout after review (Deckard). Engine count-based expansion + server tile-count seam wired (#14, Batty); multi-image over-count + `tokens_per_tile>0`/empty guards added after review (Leon). Single-image path complete; multi-image bails cleanly (needs per-image tile counts).
+
+_Follow-ups:_ mobius must emit `PipelineSpec.vision` (`image_placeholder_token_id`/`tokens_per_tile`) for real VLM export; then Gemma4 E2B/12B multimodal + Gemma4 speculative-draft testing. SWA hardening nits (Chew): first-activation `debug_assert`, rewind-into-sink symmetry, draft `sink_tokens` under spec decode.
+
 ## Notable design changes / decisions to record
 
 - Preprocessing lives in its own crate `onnx-genai-preprocess` (§35).
