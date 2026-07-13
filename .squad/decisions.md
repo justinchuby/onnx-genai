@@ -559,3 +559,18 @@ The intended lever (eliminating host↔device KV copies via device-resident KV) 
 **By:** Zhora
 **What:** Add the OpenAI `/v1/embeddings` request/response contract, input validation, float/base64 vector serialization, and route wiring. Until the engine exposes single-pass hidden-state or pooled-output inference, valid requests return HTTP 501 instead of fabricated vectors.
 **Why:** The server can faithfully establish and test the public API now, but pooling, normalization, dimensions, batching, and usage accounting require real model outputs and must remain an engine-owned capability.
+
+---
+
+### 2026-07-13: Sliding Window Attention — attention-sink (StreamingLLM) support + documented ORT boundary
+**By:** Leon
+**What:** Extended SWA (DESIGN §40) with attention-sink token retention. Metadata gains `model.attention.sink_tokens: Option<usize>` (§40.9). The paged KV cache gains `PagedKvCache::apply_sliding_window_with_sinks(seq, window, sink_tokens)` — pinning the leading sink pages and evicting only the middle window pages (sink pinning is page-granular; `sink_tokens==0` delegates to the existing contiguous `apply_sliding_window`). The engine threads `sink_tokens` from metadata through `detect_model_decode_path` → `ModelDecodePath::PastPresent` → `DecodeState`, and `apply_window_after_step`/`rewind_windowed` keep `[0, sink) ∪ [window_start, len)` token-exactly in the runtime KV buffer that feeds ORT.
+**Why:** Contiguous single-window SWA was already implemented end-to-end; the real §40 gap was attention sinks (§40.4), which are correctness-critical — dropping the first tokens under a naive window corrupts the attention distribution. The runtime KV buffer (exact) and the paged cache (page-granular bookkeeping for rewind/prefix) are decoupled, so buffer sinks can be token-exact while paged sinks stay page-aligned without conflict.
+**Boundary deferred to Mobius/ORT:** (1) hybrid per-layer attention patterns (§40.3) need per-layer KV buffers and per-layer graph masks — not expressible with a single shared decode buffer today; (2) feeding **discontinuous** `position_ids` (§40.8) into a contiguous ORT graph after window/sink eviction requires model/EP support (rotating cache or `local_window_size` contract). `detect_model_decode_path` already refuses SWA + static-cache and SWA + shared-buffer combos, and `load_materialized_past` refuses windowed/sink materialize into a contiguous graph, so the runtime never silently produces wrong outputs — it declines the unsupported path instead.
+
+---
+
+### 2026-07-13: Add server debug introspection and queue-depth admission control
+**By:** Zhora
+**What:** Added `/v1/debug/config`, `/v1/debug/sessions`, `/v1/debug/kv`, and `/v1/debug/trace`; renamed the server's active-plus-queued generation cap to `max_queue_depth` (`--max-queue-depth` / `ONNX_GENAI_MAX_QUEUE_DEPTH`).
+**Why:** The debug endpoints expose current server configuration, sessions, existing cache/admission metrics, and tracing status without creating new engine subsystems. The explicit queue-depth setting documents and configures the existing semaphore-based HTTP 429 admission boundary.
