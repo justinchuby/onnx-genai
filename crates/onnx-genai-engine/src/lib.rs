@@ -11,6 +11,7 @@ pub(crate) mod batched;
 pub mod config;
 pub(crate) mod decode;
 pub(crate) mod decode_loop;
+pub mod embedding;
 pub mod engine;
 pub mod fim;
 pub(crate) mod kv_bridge;
@@ -22,6 +23,7 @@ pub(crate) mod session;
 pub mod speculative;
 
 pub use batched::{ContinuousBatchEvent, ContinuousBatchHandle, ContinuousBatchManager};
+pub use embedding::{EmbeddingOptions, EmbeddingPooling};
 pub use engine::{
     Eagle3Config, Engine, EngineConfig, FinishReason, GenerateConstraint, GenerateOptions,
     GeneratePrompt, GenerateRequest, GenerateResult, GenerateToken, GenerateTokenCallback,
