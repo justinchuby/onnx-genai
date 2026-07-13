@@ -309,3 +309,253 @@ q_proj) == GGUF Q4_0 dequant exactly (max_abs_diff = 0.0). Nibble order, scale, 
 **By:** Sebastian
 **What:** The primary periodic comparison is onnx-genai WebGPU EP versus LM Studio Metal only. ORT 1.27 assigned all 168 Q4 `MatMulNBits` projections to WebGPU rather than CPU, but the converted Q4 graph produced the same invalid deterministic output on CPU and WebGPU, so it failed correctness and was not benchmarked. The reported GPU number therefore uses a non-quantized fp16 ONNX graph with fp32 logits/KV boundary casts versus the exact Q4_0 GGUF in LM Studio, clearly labeled as non-parity.
 **Why:** GPU-vs-GPU is the fair runtime/backend comparison requested, but incorrect model output cannot support a performance claim. The fp16 fallback preserves a usable WebGPU measurement while exposing the current runtime constraints: attention and KV plumbing remain on CPU, native fp16 logits/KV are unsupported, and decode is substantially slower than both LM Studio and the historical CPU-EP baseline.
+
+---
+
+### 2026-07-12T19:38:00-07:00: GQA share-buffer KV driven by our own InferenceMetadata (not genai_config.json)
+
+**Author:** batty (Engine)
+**Supersedes:** the earlier `batty-fp16-gqa-kv` approach (merged into decisions.md, "Runtime consumes fp16 GroupQueryAttention (GQA) WebGPU KV via genai_config share-buffer"). Per Justin's architectural correction, the runtime NO LONGER reads onnxruntime-genai's `genai_config.json`. We use our OWN config (`InferenceMetadata` from `inference_metadata.yaml`) and the runtime owns/manages the KV cache; the GQA op is used for on-device attention compute only.
+
+**What changed (crates/onnx-genai-engine + onnx-genai-ort):**
+- **Deleted** `crates/onnx-genai-engine/src/genai_config.rs` and its `pub(crate) mod genai_config;` in `lib.rs`. No `genai_config.json` reads anywhere in the runtime.
+- **`decode.rs`**: `detect_model_decode_path(session, metadata_max_context, shared_kv_max_len: Option<usize>)` now takes a metadata-derived shared-KV capacity instead of a `GenaiRuntimeConfig`. New `shared_kv_buffer_len_from_metadata(&InferenceMetadata) -> Option<usize>` derives the runtime-owned share-buffer decision from our metadata. When it returns `Some(max_len)`, the model takes `ModelDecodePath::PastPresent { shared_buffer: true, max_len: Some(max_len) }` (runtime-owned max-length KV buffer, `present.*` aliased onto `past_key_values.*` across steps). Helpers: `is_group_query_attention`, `metadata_kv_is_fp16`, `is_fp16_dtype`.
+- **`engine.rs`**: loads `shared_kv_max_len` from the already-loaded `InferenceMetadata` (via `crate::decode::shared_kv_buffer_len_from_metadata`) and passes it to `detect_model_decode_path`. Draft models pass `None`.
+- **No schema.rs change was needed** — all consumed fields already exist in `crates/onnx-genai-metadata/src/schema.rs`.
+
+**(a) Exact InferenceMetadata fields the runtime reads for the GQA / runtime-owned share-buffer KV path:**
+
+The runtime enables a **runtime-owned, max-length, share-buffer KV path** iff ALL THREE hold:
+1. `model.attention.type` denotes group-query attention — accepted (case-insensitive, `-`/space normalized to `_`): `group_query_attention`, `grouped_query_attention`, `gqa`.
+2. KV native dtype is fp16 — from EITHER `kv_cache.native_dtype` OR any entry of `model.runtime_configurable.kv_cache.dtype`; accepted values (case-insensitive): `float16`, `fp16`, `half`.
+3. `model.max_sequence_length` is present — its value **pre-sizes the runtime-owned KV buffer (in tokens)**.
+
+Additional fields consumed elsewhere (unchanged, informational for the emitter):
+- `required_capabilities` — validated against the runtime's supported set. IMPORTANT: only emit capabilities the runtime supports; the runtime's supported list is `kv_cache`, `grouped_query_attention`, `multi_head_attention`, `prefix_cache`, `continuous_batching`. Do **not** require `fp16-kv` or hyphenated `group-query-attention` — those are NOT in the supported set and will fail model load with "Unsupported capabilities". Use `grouped_query_attention` (underscored) if you want to require GQA.
+- `model.attention.{num_kv_heads,num_attention_heads,head_dim}` — informational/geometry (the KV tensor geometry the engine actually binds is still inferred from the ONNX `present.*` output shapes; these should match).
+- `model.max_sequence_length` also bounds the context-window guard.
+
+Notes for the emitter:
+- `max_sequence_length` = intended **serving KV capacity** in tokens (it sizes the buffer). Emit the capacity you want the runtime to allocate (e.g. 4096), NOT necessarily the model's theoretical context window (Qwen2.5 = 32768) — a large value allocates a proportionally large KV buffer.
+- fp32 / static-cache / CPU / non-GQA models simply omit these (or omit `inference_metadata.yaml` entirely) and keep their existing decode paths; no metadata is required for them.
+
+**(b) Sample `inference_metadata.yaml` — the contract (committed at `models/qwen2.5-0.5b-gqa-webgpu/inference_metadata.yaml`, verified to run):**
+
+```yaml
+# onnx-genai inference metadata (our own config; replaces onnxruntime-genai's
+# genai_config.json). The runtime reads these fields to own and manage the KV
+# cache itself for the fp16 GroupQueryAttention WebGPU export: it allocates a
+# single max-length KV buffer and aliases present.* -> past_key_values.* across
+# decode steps, using the GQA op for on-device attention compute only.
+required_capabilities:
+  - grouped_query_attention
+model:
+  attention:
+    type: group_query_attention
+    num_kv_heads: 2
+    num_attention_heads: 14
+    head_dim: 64
+  # Sizes the runtime-owned shared KV buffer (tokens). Emitters should set this
+  # to the intended serving KV capacity, not necessarily the model's theoretical
+  # context window.
+  max_sequence_length: 4096
+  runtime_configurable:
+    kv_cache:
+      dtype:
+        - float16
+kv_cache:
+  native_dtype: float16
+```
+
+(Qwen2.5-0.5B geometry: 24 layers, num_attention_heads=14, num_key_value_heads=2, head_size=64.)
+
+**(c) schema.rs fields added:** NONE. Everything is expressed with existing schema fields (`ModelCapabilities.attention` / `AttentionConfig`, `ModelCapabilities.max_sequence_length`, `ModelCapabilities.runtime_configurable` / `RuntimeConfigurable.kv_cache` / `RuntimeKvConfig.dtype`, `KvCacheSpec.native_dtype`).
+
+**Verification:**
+- Renamed `genai_config.json` away and ran `ONNX_GENAI_EP=webgpu ./target/release/onnx-genai-server --model models/qwen2.5-0.5b-gqa-webgpu` → model loaded from `inference_metadata.yaml` ALONE; `/v1/chat/completions` "capital of France" → **"Paris"** (coherent). `genai_config.json` restored afterward.
+- Non-GQA regression: tiny fixtures (static-cache, tiny-llm) load with NO `inference_metadata.yaml` (`shared_kv_buffer_len_from_metadata` returns `None`); all engine/ort tests green.
+- `cargo test -p onnx-genai-engine -p onnx-genai-ort` → exit 0. `cargo clippy -p onnx-genai-engine -p onnx-genai-ort --all-targets -- -D warnings` → exit 0.
+
+**Follow-up (unchanged from before, separate task):** the shared KV buffer is still allocated with the default CPU allocator, so WebGPU still round-trips KV host↔device per step (~19–21 tok/s). Making it device-resident (WebGPU allocator) + WebGPU graph-capture provider options is the remaining perf win. Provider options previously came from `genai_config.json`; if we want them we must source them from our own config/EP setup, not genai_config.
+
+---
+
+### 2026-07-12: Bound runtime KV for uniform sliding-window attention
+**By:** Batty
+**What:** The engine now consumes `model.attention.sliding_window`. Past/present models use an engine-owned windowed decode path that keeps absolute position IDs while trimming ORT past tensors to the newest W tokens; long prefills are chunked so retained KV stays O(W). `PagedKvCache` tracks absolute sequence length separately from its page-aligned retained range and frees complete leading pages after each step. Non-SWA decode paths are unchanged. Static-cache SWA and fp16 GQA share-buffer SWA are rejected rather than run with incorrect indexing.
+**Why:** ONNX Runtime `GroupQueryAttention.local_window_size` limits attention computation but its current shared past/present buffer remains append-only and sized to the full sequence; shrinking that buffer to W would write out of bounds and lose absolute RoPE positions. Mobius must emit local-window masking plus a bounded circular-cache/write-offset contract (or an equivalent graph-managed rotating cache with absolute positions) before the runtime can enable SWA for GQA share-buffer/static-cache exports. The current metadata schema supports one uniform window only; §40 hybrid per-layer patterns and attention sinks require future schema/model contracts.
+
+---
+
+### 2026-07-12: Mobius emits native onnx-genai inference metadata
+**By:** Deckard
+**What:** Mobius branch `feat/onnx-genai-metadata-export` adds `mobius build --runtime onnx-genai`, which writes `inference_metadata.yaml` from `ModelPackage.config`. The emitter maps attention type, query/KV head counts, head dimension, optional sliding window, maximum sequence length, runtime-configurable KV dtypes, native KV dtype, and required GQA/KV-dtype capabilities. The Qwen2.5-0.5B WebGPU package now declares 14 attention heads, 2 KV heads, head dimension 64, maximum sequence length 32768, fp16 KV, and the `group-query-attention`/`fp16-kv` capabilities.
+**Why:** onnx-genai should consume its own `InferenceMetadata` contract instead of depending on ORT-GenAI's `genai_config.json`. Keeping the exporter in a dedicated Mobius integration makes the runtime contract explicit and testable at model-build time.
+
+---
+
+### 2026-07-12: Feature-gated CUDA EP, CUDA graphs, and device-resident GQA KV
+**By:** Leon
+**What:** `onnx-genai-ort` now has a default-off `cuda` Cargo feature. `ONNX_GENAI_EP=cuda` selects `ExecutionProvider::Cuda` and `ONNX_GENAI_CUDA_DEVICE` selects the non-negative CUDA device id (default 0). With the feature enabled, session creation uses ORT's V2 CUDA provider API (`CreateCUDAProviderOptions`, `UpdateCUDAProviderOptions`, `SessionOptionsAppendExecutionProvider_CUDA_V2`) with `device_id`; `ONNX_GENAI_CUDA_GRAPH=1` adds `enable_cuda_graph=1`. Graph-capture state is EP-generic and still maps `ONNX_GENAI_WEBGPU_GRAPH_CAPTURE` to WebGPU's existing session config. Without the feature, requesting CUDA returns `CUDA support not compiled in; rebuild with --features cuda`.
+
+`ONNX_GENAI_DEVICE_KV=1` now has a separate CUDA path: `MemoryInfo::cuda(device_id)` (`"Cuda"`, device allocator, default memory) is resolved through the session's EP allocator and the existing `DecodeSession` shared-buffer path allocates max-length fp16 GQA KV with `Value::empty_in`. WebGPU behavior is unchanged and remains opt-in/experimental because ORT 1.27 WebGPU external in-place share-buffer tensors can SIGSEGV. CUDA graph/device-KV correctness and performance require H200 validation.
+
+The CUDA feature is intentionally declared only on `onnx-genai-ort` in this change because another agent owns engine/server files. Until the coordinator adds a server-level `cuda = ["onnx-genai-ort/cuda"]` forwarding alias, use Cargo's package-qualified dependency feature:
+
+```bash
+export ORT_ROOT=/opt/onnxruntime-gpu-1.27.0
+export ONNX_GENAI_EP=cuda
+export ONNX_GENAI_CUDA_DEVICE=0
+export ONNX_GENAI_CUDA_GRAPH=1
+export ONNX_GENAI_DEVICE_KV=1
+
+cargo run --release -p onnx-genai-server \
+  --features onnx-genai-ort/cuda -- \
+  --model models/qwen2.5-0.5b-cuda \
+  --model-id qwen2.5-0.5b-cuda \
+  --addr 127.0.0.1:8080
+```
+
+After the forwarding alias is added, the requested shorthand is:
+
+```bash
+cargo run --release --features cuda -p onnx-genai-server -- \
+  --model models/qwen2.5-0.5b-cuda \
+  --model-id qwen2.5-0.5b-cuda \
+  --addr 127.0.0.1:8080
+```
+
+With LM Studio serving the comparison model at `127.0.0.1:1234`, benchmark from a second shell:
+
+```bash
+export LM_STUDIO_MODEL_ID=qwen2.5-0.5b-instruct-q4_0
+cargo run --release -p onnx-genai-bench --bin compare -- \
+  --runs 5 --warmups 1 --max-tokens 128 \
+  --tokenizer models/qwen2.5-0.5b-cuda/tokenizer.json \
+  --output docs/benchmarks/h200-cuda-vs-lm-studio.md \
+  --runtime "onnx-genai CUDA|http://127.0.0.1:8080/v1|qwen2.5-0.5b-cuda|ONNX Q4_0; fp16 GQA KV|H200 CUDA EP; enable_cuda_graph=1; device KV=1" \
+  --runtime "LM Studio|http://127.0.0.1:1234/v1|${LM_STUDIO_MODEL_ID}|GGUF Q4_0|H200 CUDA; record GPU offload/context/speculation settings"
+```
+
+**Why:** The CUDA graph is byte-identical to the validated WebGPU graph and ORT CUDA provides mature GQA/quantized kernels, IoBinding, external device allocators, and CUDA graph capture. Reusing the runtime-owned share-buffer abstraction removes per-token host/device KV transfers without changing the model or engine contract, while compile-time gating preserves CPU/WebGPU-only Mac builds.
+
+---
+
+### 2026-07-12T20:12:00-07:00: Device-resident GQA KV + persistent IoBinding + graph-capture plumbing (device-KV blocked by ORT 1.27 WebGPU SIGSEGV)
+
+**Author:** leon (Engine Dev — KV & runtime buffers)
+**Follows:** `batty-inference-metadata-gqa` (runtime-owned GQA share-buffer KV) and the perf lever it identified — the shared GQA KV buffer was CPU-allocated (`Value::empty` → default CPU allocator), so in SharedBuffer mode ORT round-trips KV host↔device every decode step, capping WebGPU decode far below Metal.
+
+**Goal:** Make the runtime-owned max-length GQA KV buffers device-resident (WebGPU allocator) and bound as a persistent, in-place `past_key_values.*`/`present.*` share-buffer IoBinding, so KV never leaves the device; enable ORT WebGPU provider options (`enableGraphCapture`, `validationMode=disabled`) that benefit from stable device buffers.
+
+---
+
+#### What was implemented (all in `crates/onnx-genai-ort/src/`)
+
+- **allocator.rs**
+  - `MemoryInfo::webgpu()` — builds the WebGPU EP `MemoryInfo` via `CreateMemoryInfo_V2` (legacy `CreateMemoryInfo` rejects the name with *"Specified device is not supported. Try CreateMemoryInfo_V2."*). Params: name `"WebGPU_Buffer"`, device type `GPU` (1), vendor id 0, device id 0, mem type `DEFAULT` (0), alignment 0, allocator type `OrtDeviceAllocator` (0).
+  - `Allocator::for_session_device(session_ptr, MemoryInfo)` — wraps the session's EP allocator via `CreateAllocator` (`owned: true`).
+- **value.rs**
+  - `Value::empty` refactored to delegate to new `Value::empty_in(shape, dtype, &Allocator)` (`CreateTensorAsOrtValue` with a caller-supplied allocator). CPU default preserved; device tensor safely outlives the local `Allocator` wrapper (ORT tensor retains the underlying AllocatorPtr shared_ptr).
+- **session.rs**
+  - `SessionOptions` gained `webgpu_graph_capture` and `webgpu_disable_validation`; `apply_provider_defaults()`/`selects_webgpu()` set them for WebGPU.
+  - `Session` now tracks effective `execution_providers` (accounts for CPU fallback); `is_webgpu()`, `device_kv_allocator() -> Result<Option<Allocator>>` (None for non-webgpu, None when `ONNX_GENAI_DEVICE_KV` not opted-in, None+warn on allocator-create failure).
+  - `apply_webgpu_provider_options()` + `add_session_config_entry()` write `ep.webgpuexecutionprovider.enableGraphCapture` and `.validationMode` via `AddSessionConfigEntry` after EPs are appended.
+  - Env gates: `device_kv_enabled_from_env()` (**DEFAULT FALSE — opt-in**), `webgpu_disable_validation_from_env()` (**DEFAULT TRUE**), `webgpu_graph_capture_from_env()` (**DEFAULT FALSE**).
+- **decode.rs (ort)**
+  - `allocate_shared_buffers` uses `session.device_kv_allocator()`; allocates KV via `Value::empty_in(device_allocator)` when present, else `Allocator::default_cpu()`.
+
+`crates/onnx-genai-engine/src/{decode.rs, kv_bridge.rs}` were **not** modified — device residence is driven automatically by the session EP inside the ort `DecodeSession`, so no engine change was warranted (avoided unnecessary edits/regressions).
+
+---
+
+#### The ORT limitation that blocks the perf lever
+
+Binding a user-pre-allocated `WebGPU_Buffer` device tensor (created via `CreateTensorAsOrtValue` on a `CreateAllocator`-derived WebGPU allocator) as a **persistent in-place `past_key_values.*`/`present.*` share-buffer** via IoBinding **segfaults** during multi-step decode on ORT **1.27.0** (ORT_API_VERSION 27) WebGPU EP:
+
+```
+EXC_BAD_ACCESS (code=1, address=0x0)
+frame #0: 0x0000000000000000   (call through a null function pointer)
+thread: onnx-genai-batch-driver  (multi-step decode)
+```
+
+- Short generations (8–16 tokens) sometimes survive; longer (≈120 tokens) reliably crash.
+- Independent of `validationMode` (crashes with `disabled`, `basic`, `full`).
+- GQA **requires** the SharedBuffer path (in-place `past==present`, max-length buffer) per the export contract — which is exactly the externally-pre-allocated in-place device tensor case that ORT does not support here.
+
+Because of this, **device-resident KV is gated OFF by default** and is opt-in via `ONNX_GENAI_DEVICE_KV=1` (experimental). The shipped default keeps CPU-allocated KV buffers (coherent + stable).
+
+`validationMode=disabled` **is** safe and ships **ON** by default for WebGPU (measured within noise, no regression). Graph capture is wired but **OFF** by default: (a) it only benefits fully device-resident I/O (blocked above), and (b) our decode binds a growing `attention_mask` (`[1, past+new]`) each step, so a captured graph cannot replay stable addresses. Verified `ONNX_GENAI_WEBGPU_GRAPH_CAPTURE=1` with CPU KV is harmless but ineffective (coherent + stable across 3×120-token runs; capture does not engage without on-device I/O).
+
+---
+
+#### Numbers (WebGPU EP, `models/qwen2.5-0.5b-q4-gqa-webgpu`, decode via differencing max_tokens 8 vs 136, `/usr/bin/time -p`)
+
+| Config | Coherence | Decode tok/s | Notes |
+|---|---|---|---|
+| Task-stated baseline | — | **30.5** | prior measurement |
+| Existing release binary (pre-change) | "The capital of France is Paris." | ~47 (median) | our machine baseline |
+| Final default (CPU KV + `validationMode=disabled`) | "Paris" + stable 5×120-tok | ~49.6 (median) | within noise, **no regression** |
+| `ONNX_GENAI_DEVICE_KV=1` (device KV) | crashes on long gen | — | **SIGSEGV** (see above) |
+
+The intended lever (eliminating host↔device KV copies via device-resident KV) is **blocked** by the ORT limitation; decode did not meaningfully improve. The device-resident plumbing is complete and correct behind the opt-in flag; the correct shipped default is coherent, stable, and non-regressing.
+
+---
+
+#### Recommended follow-ups
+1. **ORT-sanctioned device output path:** instead of creating an external device tensor, use `BindOutputToDevice(present.*, WebGPU_Buffer mem_info)` to let ORT allocate `present` on device, then rebind it as next-step `past` (ZeroCopy rebind-to-device). Avoids external-tensor creation but changes KV semantics for a share-buffer GQA model — validate coherence carefully.
+2. Track ORT WebGPU EP support for externally-allocated in-place share-buffer device tensors; re-enable `ONNX_GENAI_DEVICE_KV` default once fixed.
+3. If/when device-resident I/O works, revisit graph capture with a fixed-capacity (padded) `attention_mask` to satisfy stable-address replay.
+
+**Env flags introduced:** `ONNX_GENAI_DEVICE_KV` (default off), `ONNX_GENAI_WEBGPU_VALIDATION` (validation; disabled by default for WebGPU), `ONNX_GENAI_WEBGPU_GRAPH_CAPTURE` (default off).
+
+**Validation:** `cargo clippy -p onnx-genai-engine -p onnx-genai-ort --all-targets -- -D warnings` → exit 0 (clean). `cargo test -p onnx-genai-engine -p onnx-genai-ort` → 0 failed.
+
+---
+
+### 2026-07-12: CUDA-targeted stacked Qwen model is structurally valid
+**By:** Sapper
+**What:** Mobius branch `int/cuda-stacked` at `380acf2` combines Q4_K_M conversion and quantized embeddings, plus a shape/type stamp for `GatherBlockQuantized` so exported models pass ONNX checker. The H200-ready package is `models/qwen2.5-0.5b-cuda/`, built from Qwen2.5-0.5B-Instruct Q4_0 because no local Q4_K_M GGUF was available. It has 24 `GroupQueryAttention`, 168 `MatMulNBits`, one `GatherBlockQuantized`, zero `Attention`, fp16 KV I/O, and a 73.03 MiB packed embedding payload. `onnx.checker` and strict shape inference pass. Mobius metadata emission produced `inference_metadata.yaml` with `grouped_query_attention`, fp16 KV, and max length 4096. `build-gguf` does not yet accept `--runtime onnx-genai`, so the sidecar was emitted separately with the existing `feat/onnx-genai-metadata-export` emitter. CPU fallback generated “The capital of France is Paris.”
+**Why:** For this Qwen graph, `--ep cuda` and `--ep webgpu` produce byte-identical ONNX and external-data files: both EP capability sets allow fp16 GQA and packed QKV, while Qwen does not trigger WebGPU-only graph-capture rewrites. ORT source registers CUDA kernels for `GroupQueryAttention`, `MatMulNBits`, and `GatherBlockQuantized`; Mobius does not disallow either quantized op. Runtime CUDA follow-up still needs actual `ONNX_GENAI_EP=cuda` parsing/EP attachment, CUDA `enable_cuda_graph` provider configuration, CUDA device-resident shared-KV allocation, and Cargo/build feature gating so default Mac builds retain CPU/WebGPU ORT. Current `session.rs` only defines `ExecutionProvider::Cuda`; the environment parser and append path still fall back to CPU, and `device_kv_allocator` is WebGPU-only. Validation: `lintrunner --revision origin/main` exit 0; GGUF pytest 156 passed, exit 0.
+
+---
+
+### 2026-07-12: Emit loadable onnx-genai metadata with bounded KV capacity
+**By:** Sapper
+**What:** Mobius `--runtime onnx-genai` now emits only runtime-supported attention capabilities: `grouped_query_attention` for GQA and `multi_head_attention` for MHA. KV dtype remains represented by `kv_cache.native_dtype` and `model.runtime_configurable.kv_cache.dtype`, not an unsupported capability. `model.max_sequence_length` is treated as serving KV capacity, defaults to `min(4096, max_position_embeddings)`, and can be overridden with `--max-length N` up to the model limit.
+**Why:** onnx-genai rejects unknown required capabilities, and using Qwen2.5's theoretical 32768-token context would pre-size roughly 800 MiB of fp16 KV, exceeding WebGPU's 256 MiB buffer limit. The regenerated 4096-token metadata loaded without `genai_config.json` and coherently answered that the capital of France is Paris.
+
+---
+
+### 2026-07-12: Normalize mixed Q4_K_M GGUF projections to MatMulNBits int4
+**By:** Sapper
+**What:** Mobius now detects Q4_K-containing mixed presets as a 4-bit, block-32 asymmetric MatMulNBits target. Q4_K super-blocks are reference-dequantized across flattened tensor row boundaries and affine-requantized per 32 values; Q5_0, Q6_K, and Q8_0 projection tensors in Q4_K_M are likewise normalized to the same layout. The official `Qwen/Qwen2.5-0.5B-Instruct-GGUF:qwen2.5-0.5b-instruct-q4_k_m.gguf` converted to 168 MatMulNBits nodes and generated “The capital of France is Paris.”
+**Why:** Q4_K fractional offsets cannot be represented faithfully by simply rounding/clamping uint4 zero-points, and Q4_K_M mixes multiple GGUF quantization types while one ONNX graph requires a single packed initializer shape. Dequantize-then-requantize gives a bounded half-scale error and preserves the fast packed-uint8 MatMulNBits path.
+
+---
+
+### 2026-07-12: Preserve GGUF token embeddings with GatherBlockQuantized
+**By:** Sapper
+**What:** Mobius `build-gguf --keep-quantized` now detects a repackable GGUF `token_embd.weight`, enables `QuantizedEmbedding`, reshapes the existing MatMulNBits packed bytes to the 2-D GatherBlockQuantized layout, and emits `com.microsoft::GatherBlockQuantized` with `bits=4`, `block_size=32`, `gather_axis=0`, and `quantize_axis=1`. Tied embedding/LM-head models share the packed table and use `MatMulNBits` for the head. For Qwen2.5-0.5B, the embedding changed from one 272.27 MB fp16 initializer to a 68.07 MB uint8 initializer plus 8.51 MB fp16 scales. ORT 1.27 verbose placement assigned GatherBlockQuantized to WebGpuExecutionProvider, not CPU.
+**Why:** Gathering and dequantizing only selected token rows avoids materializing the 259.66 MiB fp16 embedding table and keeps its largest initializer below WebGPU's 256 MiB buffer limit. CPU inference produced “The capital of France is Paris.” WebGPU inference also produced coherent “The capital of France is Paris,” but the current release CLI then exited with SIGSEGV during/after generation; the fp16 GQA package is additionally blocked by the stale release runtime's pre-existing fp16-KV validation before session creation. A direct ORT 1.27 WebGPU session for that fp16 package created successfully and placed GatherBlockQuantized on WebGPU, so the operator itself is supported on-device rather than falling back.
+
+---
+
+### 2026-07-12: Treat the GQA/fixed-Q4 report as the current performance checkpoint
+**By:** Sebastian
+**What:** Use `docs/benchmarks/2026-07-12-JustindeMacBook-Pro-gqa-fixed.md` as the current cross-runtime comparison. The valid medians are WebGPU GQA 19.40/19.07 tok/s and CPU fixed-Q4 40.17/31.53 tok/s for short/long prompts; the old Q4 numbers remain invalid-output history only.
+**Why:** Both onnx-genai models now pass the coherence gate. The report adds the missing LM Studio CPU comparison and shows the next priorities are device-resident WebGPU KV plus graph capture, CPU prefill, and quantized embedding/output-head kernels.
+
+---
+
+### 2026-07-12: Q4+GQA WebGPU is valid but KV residency remains dominant
+**By:** Sebastian
+**What:** The same-source Q4_0 Mobius WebGPU build contains 168 MatMulNBits, 24 GroupQueryAttention, and zero Attention nodes; ORT places all quantized projections and GQA on WebGPU with 1 H2D/0 D2H graph copies. It is coherent and measures 30.52/29.21 tok/s versus LM Studio Metal at 201.60/221.82 tok/s.
+**Why:** Quantization improves the prior fp16-GQA WebGPU decode by 57.3%/53.2%, but WebGPU remains 6.61x/7.59x behind Metal and still trails Q4 CPU. Prioritize a device-resident WebGPU KV allocator, persistent IoBinding, and graph capture before further graph-level tuning.
+
+---
+
+### 2026-07-12: Expose embeddings endpoint with an explicit engine capability gap
+**By:** Zhora
+**What:** Add the OpenAI `/v1/embeddings` request/response contract, input validation, float/base64 vector serialization, and route wiring. Until the engine exposes single-pass hidden-state or pooled-output inference, valid requests return HTTP 501 instead of fabricated vectors.
+**Why:** The server can faithfully establish and test the public API now, but pooling, normalization, dimensions, batching, and usage accounting require real model outputs and must remain an engine-owned capability.
