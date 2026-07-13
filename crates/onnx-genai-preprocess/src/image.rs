@@ -87,6 +87,13 @@ pub struct ImageTilingSummary<'a> {
     pub tiles_per_image: &'a [usize],
     /// Local grids corresponding one-to-one with `tiles_per_image`.
     pub tile_grids: &'a [TileGrid],
+    /// Thumbnail position as stored in the image tensor.
+    ///
+    /// This is the authoritative ordering: the thumbnail tile appears at this
+    /// position within each image's tile slice of the tensor. Token expansion
+    /// must use the same ordering so that token indices line up with tile
+    /// (embedding) indices. Must match `TokenExpansionConfig::thumbnail_position`.
+    pub thumbnail_position: ThumbnailPosition,
 }
 
 /// Resolved image tiling parameters.
@@ -130,6 +137,13 @@ pub struct ImageTensor {
     /// Local tile grids corresponding to each input image.
     pub tile_grids: Vec<TileGrid>,
     pub original_sizes: Vec<(u32, u32)>,
+    /// Thumbnail position as stored in this tensor.
+    ///
+    /// When tiling with a thumbnail (`ImageTilingConfig::include_thumbnail`),
+    /// the pipeline always stores the thumbnail tile **first** within each
+    /// image's tile slice (`Prepend`). When no thumbnail is included this is
+    /// `None`. Token expansion must use this same ordering.
+    pub thumbnail_position: ThumbnailPosition,
 }
 
 impl ImageTensor {
@@ -147,6 +161,7 @@ impl ImageTensor {
             num_tiles: self.num_tiles,
             tiles_per_image: &self.tiles_per_image,
             tile_grids: &self.tile_grids,
+            thumbnail_position: self.thumbnail_position,
         }
     }
 }
@@ -179,7 +194,7 @@ pub fn expand_image_placeholders(
     let mut replacements = Vec::with_capacity(tiling.tile_grids.len());
     let mut replacement_tokens = 0usize;
     for grid in tiling.tile_grids {
-        let replacement = expanded_image_tokens(*grid, config)?;
+        let replacement = expanded_image_tokens(*grid, tiling.thumbnail_position, config)?;
         replacement_tokens = replacement_tokens
             .checked_add(replacement.len())
             .context("expanded image token sequence is too large")?;
@@ -221,8 +236,18 @@ fn validate_token_expansion(
             tiling.tile_grids.len()
         );
     }
+    // The config thumbnail position must match the actual tensor layout so that
+    // emitted token indices align with tile (embedding) indices in the tensor.
+    if config.thumbnail_position != tiling.thumbnail_position {
+        anyhow::bail!(
+            "config thumbnail_position {:?} does not match tensor thumbnail_position {:?}; \
+             token order must match the tile order stored in the image tensor",
+            config.thumbnail_position,
+            tiling.thumbnail_position,
+        );
+    }
 
-    let thumbnail_tiles = usize::from(config.thumbnail_position != ThumbnailPosition::None);
+    let thumbnail_tiles = usize::from(tiling.thumbnail_position != ThumbnailPosition::None);
     let mut total_tiles = 0usize;
     for (image_index, (&actual_tiles, grid)) in tiling
         .tiles_per_image
@@ -259,10 +284,11 @@ fn validate_token_expansion(
 
 fn expanded_image_tokens(
     grid: TileGrid,
+    thumbnail_position: ThumbnailPosition,
     config: &TokenExpansionConfig,
 ) -> anyhow::Result<Vec<i64>> {
     let local_tiles = grid.tile_count()?;
-    let thumbnail_tiles = usize::from(config.thumbnail_position != ThumbnailPosition::None);
+    let thumbnail_tiles = usize::from(thumbnail_position != ThumbnailPosition::None);
     let separator_count = usize::from(config.column_separator_token_id.is_some())
         .checked_mul(local_tiles.saturating_sub(grid.rows as usize))
         .and_then(|count| {
@@ -287,7 +313,7 @@ fn expanded_image_tokens(
             config.tokens_per_tile,
         ));
     };
-    if config.thumbnail_position == ThumbnailPosition::Prepend {
+    if thumbnail_position == ThumbnailPosition::Prepend {
         emit_tile(&mut tokens);
     }
     for row in 0..grid.rows {
@@ -305,7 +331,7 @@ fn expanded_image_tokens(
             tokens.push(separator);
         }
     }
-    if config.thumbnail_position == ThumbnailPosition::Append {
+    if thumbnail_position == ThumbnailPosition::Append {
         emit_tile(&mut tokens);
     }
     Ok(tokens)
@@ -491,6 +517,14 @@ impl ImagePreprocessor {
 
         let mut shape = self.shape.clone();
         shape[0] = i64::try_from(num_tiles).context("image tile batch is too large")?;
+        // The pipeline always places the thumbnail tile first within each image's
+        // tile slice (see tiled_image_for_grid). Carry this authoritative ordering
+        // in the tensor so callers can align token expansion with tile indices.
+        let thumbnail_position = if self.config.tiling.include_thumbnail {
+            ThumbnailPosition::Prepend
+        } else {
+            ThumbnailPosition::None
+        };
         Ok(ImageTensor {
             shape,
             data,
@@ -498,6 +532,7 @@ impl ImagePreprocessor {
             tiles_per_image,
             tile_grids,
             original_sizes,
+            thumbnail_position,
         })
     }
 }
@@ -912,6 +947,7 @@ mod tests {
                 num_tiles: 1,
                 tiles_per_image: &tiles_per_image,
                 tile_grids: &grids,
+                thumbnail_position: ThumbnailPosition::None,
             },
             &config,
         )
@@ -935,6 +971,7 @@ mod tests {
                 num_tiles: 6,
                 tiles_per_image: &tiles_per_image,
                 tile_grids: &grids,
+                thumbnail_position: ThumbnailPosition::None,
             },
             &config,
         )
@@ -954,12 +991,15 @@ mod tests {
             rows: 1,
         }];
 
+        // tiling.thumbnail_position must match config; here both say Append so
+        // that this test exercises the Append code path in expanded_image_tokens.
         let expanded = expand_image_placeholders(
             &[99],
             ImageTilingSummary {
                 num_tiles: 3,
                 tiles_per_image: &tiles_per_image,
                 tile_grids: &grids,
+                thumbnail_position: ThumbnailPosition::Append,
             },
             &config,
         )
@@ -987,6 +1027,7 @@ mod tests {
                 num_tiles: 5,
                 tiles_per_image: &tiles_per_image,
                 tile_grids: &grids,
+                thumbnail_position: ThumbnailPosition::Prepend,
             },
             &config,
         )
@@ -1017,6 +1058,7 @@ mod tests {
                 num_tiles: 5,
                 tiles_per_image: &tiles_per_image,
                 tile_grids: &grids,
+                thumbnail_position: ThumbnailPosition::None,
             },
             &config,
         )
@@ -1040,6 +1082,7 @@ mod tests {
                 num_tiles: 2,
                 tiles_per_image: &[2],
                 tile_grids: &grids,
+                thumbnail_position: ThumbnailPosition::None,
             },
             &config,
         )
@@ -1053,6 +1096,7 @@ mod tests {
                 num_tiles: 2,
                 tiles_per_image: &[2],
                 tile_grids: &grids,
+                thumbnail_position: ThumbnailPosition::None,
             },
             &config,
         )
@@ -1065,6 +1109,7 @@ mod tests {
                 num_tiles: 3,
                 tiles_per_image: &[2],
                 tile_grids: &grids,
+                thumbnail_position: ThumbnailPosition::None,
             },
             &config,
         )
@@ -1077,6 +1122,7 @@ mod tests {
                 num_tiles: 1,
                 tiles_per_image: &[1],
                 tile_grids: &grids,
+                thumbnail_position: ThumbnailPosition::None,
             },
             &config,
         )
@@ -1404,5 +1450,134 @@ preprocessing:
                 rows: 2
             }]
         );
+    }
+
+    // --- Tests specifically for thumbnail position / tile ordering alignment ---
+
+    /// Regression test for the bug reported by Gaff: when the preprocessor
+    /// includes a thumbnail it is always placed FIRST in the tensor
+    /// (`ThumbnailPosition::Prepend`).  `tiling_summary()` must report this so
+    /// that callers can drive token expansion with the correct ordering.
+    #[test]
+    fn tiling_summary_reports_prepend_thumbnail_position_matching_tensor_layout() {
+        let preprocessor = tiled_preprocessor(
+            TilingMode::FixedGrid,
+            vec![TileGrid {
+                columns: 2,
+                rows: 1,
+            }],
+            2,
+        );
+        let image = DynamicImage::ImageRgb8(RgbImage::from_pixel(4, 2, Rgb([100, 150, 200])));
+        let tensor = preprocessor.preprocess(&[image]).unwrap();
+
+        // The pipeline stores thumbnail first (index 0) then local tiles.
+        assert_eq!(
+            tensor.thumbnail_position,
+            ThumbnailPosition::Prepend,
+            "tensor thumbnail_position must be Prepend to match tiled_image_for_grid layout"
+        );
+        assert_eq!(
+            tensor.tiling_summary().thumbnail_position,
+            ThumbnailPosition::Prepend,
+        );
+        // tiles_per_image = [thumbnail + 2 local] = 3
+        assert_eq!(tensor.tiles_per_image, [3]);
+    }
+
+    /// Token order must match tile order when thumbnail is first in the tensor.
+    ///
+    /// With tokens_per_tile=1 and a 2×1 grid + prepended thumbnail the expected
+    /// token sequence is [thumbnail, local(0,0), local(0,1)].  Previously this
+    /// would be silently wrong if a caller accidentally used `Append` in config.
+    #[test]
+    fn prepend_thumbnail_token_order_matches_tensor_tile_order() {
+        let mut config = token_expansion_config();
+        config.tokens_per_tile = 1;
+        config.thumbnail_position = ThumbnailPosition::Prepend;
+        config.column_separator_token_id = Some(8);
+        let tiles_per_image = [3];
+        let grids = [TileGrid {
+            columns: 2,
+            rows: 1,
+        }];
+        // tiling.thumbnail_position=Prepend matches actual tensor layout.
+        let expanded = expand_image_placeholders(
+            &[99],
+            ImageTilingSummary {
+                num_tiles: 3,
+                tiles_per_image: &tiles_per_image,
+                tile_grids: &grids,
+                thumbnail_position: ThumbnailPosition::Prepend,
+            },
+            &config,
+        )
+        .unwrap();
+        // Expected: thumbnail first, then local tile 0, col_sep, local tile 1.
+        assert_eq!(expanded, [7, 7, 8, 7]);
+    }
+
+    /// Token expansion must reject a config whose thumbnail_position contradicts
+    /// the tensor layout reported by the tiling summary.  This is the exact
+    /// failure mode described in Gaff's review: tensor has thumbnail FIRST but
+    /// config says LAST, silently producing misaligned embeddings.
+    #[test]
+    fn mismatched_thumbnail_position_config_vs_tiling_is_rejected() {
+        let mut config = token_expansion_config();
+        config.thumbnail_position = ThumbnailPosition::Append; // wrong for a Prepend tensor
+        let tiles_per_image = [3];
+        let grids = [TileGrid {
+            columns: 2,
+            rows: 1,
+        }];
+        let error = expand_image_placeholders(
+            &[99],
+            ImageTilingSummary {
+                num_tiles: 3,
+                tiles_per_image: &tiles_per_image,
+                tile_grids: &grids,
+                thumbnail_position: ThumbnailPosition::Prepend, // actual tensor layout
+            },
+            &config,
+        )
+        .unwrap_err();
+        let msg = error.to_string();
+        assert!(
+            msg.contains("thumbnail_position"),
+            "error should mention thumbnail_position mismatch, got: {msg}"
+        );
+    }
+
+    /// Verify that token expansion driven by the real ImageTensor tiling summary
+    /// (thumbnail_position=Prepend) produces token order [thumbnail, local…],
+    /// which aligns with how tiled_image_for_grid lays out pixels in the tensor.
+    #[test]
+    fn token_expansion_from_real_tensor_summary_matches_tile_layout() {
+        let preprocessor = tiled_preprocessor(
+            TilingMode::FixedGrid,
+            vec![TileGrid {
+                columns: 2,
+                rows: 1,
+            }],
+            2,
+        );
+        let image = DynamicImage::ImageRgb8(RgbImage::from_pixel(4, 2, Rgb([10, 20, 30])));
+        let tensor = preprocessor.preprocess(&[image]).unwrap();
+        // 3 tiles: thumbnail (index 0), local (index 1), local (index 2).
+        assert_eq!(tensor.num_tiles, 3);
+        assert_eq!(tensor.thumbnail_position, ThumbnailPosition::Prepend);
+
+        let summary = tensor.tiling_summary();
+        let mut config = token_expansion_config();
+        config.tokens_per_tile = 1;
+        // Config must match the tensor layout reported by tiling_summary.
+        config.thumbnail_position = summary.thumbnail_position;
+
+        let expanded =
+            expand_image_placeholders(&[99], summary, &config).unwrap();
+        // 3 tokens total: first corresponds to thumbnail (tensor index 0),
+        // then the two local tiles in row-major order.
+        assert_eq!(expanded.len(), 3);
+        assert_eq!(expanded, [7, 7, 7]);
     }
 }
