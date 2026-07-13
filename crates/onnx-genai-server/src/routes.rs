@@ -82,7 +82,7 @@ pub(crate) struct HealthResponse {
 pub(crate) struct NodeStatus {
     node_id: String,
     healthy: bool,
-    kv_usage: f64,
+    kv_usage: f32,
     kv_pages_used: u32,
     kv_pages_total: u32,
     kv_pages_shared: u32,
@@ -90,7 +90,7 @@ pub(crate) struct NodeStatus {
     active_sessions: u32,
     paused_sessions: u32,
     tokens_per_second: f64,
-    batch_utilization: f64,
+    batch_utilization: f32,
     sessions: Vec<SessionStatus>,
     prefix_hashes: Vec<String>,
 }
