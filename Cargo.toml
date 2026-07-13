@@ -38,6 +38,7 @@ onnx-genai-ort-sys = { path = "crates/onnx-genai-ort/ort-sys", version = "0.1.0"
 tokenizers = "0.21"
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
+async-trait = "0.1"
 axum = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
