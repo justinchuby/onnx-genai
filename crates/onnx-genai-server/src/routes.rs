@@ -713,9 +713,6 @@ fn validate_embedding_request(
     request: &EmbeddingRequest,
     tokenizer: &Tokenizer,
 ) -> Result<(), ApiError> {
-    if request.model.trim().is_empty() {
-        return Err(ApiError::bad_request("model must not be empty"));
-    }
     if request.dimensions == Some(0) {
         return Err(ApiError::bad_request(
             "dimensions must be greater than zero",

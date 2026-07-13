@@ -1924,6 +1924,60 @@ async fn admin_endpoints_return_404_when_gate_is_off() {
 }
 
 #[tokio::test]
+async fn empty_model_field_falls_back_to_default_on_embeddings() {
+    // An empty `model` field on /v1/embeddings must resolve to the registry's
+    // default model and return 200, not 400.
+    let model_dir =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-mtp-full");
+    let state = AppState::load(&model_dir, Some("tiny-mtp-full".to_string()))
+        .expect("load tiny-mtp-full fixture");
+    let resp = app(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/embeddings")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "",
+                        "input": "hello"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn unknown_model_returns_404_on_embeddings_endpoint() {
+    let model_dir =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-mtp-full");
+    let state = AppState::load(&model_dir, Some("tiny-mtp-full".to_string()))
+        .expect("load tiny-mtp-full fixture");
+    let resp = app(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/embeddings")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "no-such-model",
+                        "input": "hello"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
 async fn concurrent_lazy_loads_of_same_id_load_once() {
     let state = lazy_state(ServerConfig::default());
     // Fire many concurrent requests for the same lazy model.
