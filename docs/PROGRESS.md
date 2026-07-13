@@ -11,7 +11,7 @@ _Last updated: 2026-07-13_
 | § | Feature | Status | Notes |
 |---|---------|--------|-------|
 | 1–8 | Vision, architecture, core components, data flow, concurrency, model dir, crates, deps | ✅ Done | |
-| 9 | API surface | 🟡 Partial | chat/completions/models/sessions/status/metrics/audio/embeddings(#7 scaffold)/logprobs(#8) ✅; `/v1/debug/*` (config/sessions/kv/trace) ✅; Perfetto/OTLP export (#13) deferred |
+| 9 | API surface | 🟡 Partial | chat/completions/models/sessions/status/metrics/audio ✅; `/v1/embeddings` (#7) ✅ wired to engine pooled-embedding API; logprobs(#8) ✅; `/v1/debug/*` (config/sessions/kv/trace) ✅; Perfetto/OTLP export (#13) deferred |
 | 11,12,15 | Testing, design decisions | ✅ Done | coverage ~77% |
 | 16 | Quantized models | ✅ Done | EP select + int8 KV; fp8 KV = #15 |
 | 17 | Diffusion pipeline (image) | ❌ Missing | #16 |
@@ -38,7 +38,7 @@ _Last updated: 2026-07-13_
 
 ## Open backlog (GitHub issues)
 
-- **#7** `/v1/embeddings` · **#8** logprobs · **#9** model lifecycle/multi-model · **#13** debug endpoints + Perfetto · **#15** fp8 KV quant · **#16** image diffusion.
+- **#7** `/v1/embeddings` ✅ (wired to `Engine::embed_with_options` via `DriverCommand::Embed`) · **#8** logprobs · **#9** model lifecycle/multi-model · **#13** debug endpoints + Perfetto · **#15** fp8 KV quant · **#16** image diffusion.
 - Closed: **#2** server split · **#3** decode ownership · **#4** FIM endpoint · **#5** benchmarks · **#10** EAGLE-3 proposer · **#11** audio log-mel preprocessing · **#12** audio input · **#14** vision preprocessing/tiling.
 
 ## Recently completed (this session)
