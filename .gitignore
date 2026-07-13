@@ -53,3 +53,6 @@ htmlcov/
 # Local H200 CUDA benchmark artifacts
 .ort-cuda-1.27/
 .cudaenv.sh
+.bench_long.py
+models/gguf/
+models/benchmarks/
