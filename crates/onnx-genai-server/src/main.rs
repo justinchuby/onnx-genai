@@ -1,22 +1,46 @@
 use std::{net::SocketAddr, path::PathBuf};
 
-use clap::Parser;
+use clap::{ArgGroup, Parser};
 use onnx_genai_engine::KvDType;
-use onnx_genai_server::{AppState, ServerConfig, parse_kv_cache_dtype, serve};
+use onnx_genai_server::{
+    AppState, ModelSpec, ModelsConfig, ServerConfig, from_models_dir, parse_kv_cache_dtype, serve,
+};
 
 #[derive(Debug, Parser)]
 #[command(
     name = "onnx-genai-server",
-    about = "OpenAI-compatible HTTP server for onnx-genai"
+    about = "OpenAI-compatible HTTP server for onnx-genai",
+    group(
+        ArgGroup::new("model_source")
+            .required(true)
+            .args(["model", "models_dir", "models_config"])
+    )
 )]
 struct Cli {
-    /// Model directory containing the ONNX model and tokenizer. Falls back to ONNX_GENAI_MODEL.
-    #[arg(long, env = "ONNX_GENAI_MODEL")]
-    model: PathBuf,
+    /// Single-model mode: path to a model directory containing the ONNX model and tokenizer.
+    /// Mutually exclusive with --models-dir and --models-config.
+    /// Falls back to ONNX_GENAI_MODEL.
+    #[arg(long, env = "ONNX_GENAI_MODEL", group = "model_source")]
+    model: Option<PathBuf>,
 
-    /// Model id reported by /v1/models. Defaults to the model directory name.
-    #[arg(long)]
+    /// Model id reported by /v1/models (single-model mode only).
+    /// Defaults to the model directory name.
+    /// Ignored when --models-dir or --models-config is used.
+    #[arg(long, requires = "model")]
     model_id: Option<String>,
+
+    /// Multi-model mode: parent directory whose immediate subdirectories are each
+    /// treated as one model (id = directory name, eager = true).
+    /// Mutually exclusive with --model and --models-config.
+    /// Falls back to ONNX_GENAI_MODELS_DIR.
+    #[arg(long, env = "ONNX_GENAI_MODELS_DIR", group = "model_source")]
+    models_dir: Option<PathBuf>,
+
+    /// Multi-model mode: path to a TOML or JSON config file declaring the model list.
+    /// Mutually exclusive with --model and --models-dir.
+    /// Falls back to ONNX_GENAI_MODELS_CONFIG.
+    #[arg(long, env = "ONNX_GENAI_MODELS_CONFIG", group = "model_source")]
+    models_config: Option<PathBuf>,
 
     /// Socket address to bind.
     #[arg(long, default_value = "127.0.0.1:8080")]
@@ -58,20 +82,38 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse();
-    let state = AppState::load_with_config(
-        &cli.model,
-        cli.model_id,
-        ServerConfig {
-            max_output_tokens: cli.max_output_tokens,
-            max_sessions: cli.max_sessions,
-            max_queue_depth: cli.max_queue_depth,
-            enable_debug_endpoints: cli.enable_debug_endpoints,
-            engine_config: onnx_genai_engine::EngineConfig {
-                kv_cache_dtype: cli.kv_cache_dtype,
-                ..Default::default()
-            },
+
+    let server_config = ServerConfig {
+        max_output_tokens: cli.max_output_tokens,
+        max_sessions: cli.max_sessions,
+        max_queue_depth: cli.max_queue_depth,
+        enable_debug_endpoints: cli.enable_debug_endpoints,
+        engine_config: onnx_genai_engine::EngineConfig {
+            kv_cache_dtype: cli.kv_cache_dtype,
+            ..Default::default()
         },
-    )?;
+    };
+
+    // Build the model spec list from whichever source flag was provided.
+    // Exactly one of --model / --models-dir / --models-config is required (ArgGroup).
+    let specs: Vec<ModelSpec> = if let Some(model_path) = cli.model {
+        let model_id = cli.model_id.unwrap_or_else(|| {
+            model_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("onnx-genai-model")
+                .to_string()
+        });
+        vec![ModelSpec { id: model_id, path: model_path, eager: true }]
+    } else if let Some(models_dir) = cli.models_dir {
+        from_models_dir(&models_dir)?
+    } else if let Some(config_path) = cli.models_config {
+        ModelsConfig::from_file(&config_path)?.models
+    } else {
+        unreachable!("ArgGroup enforces that exactly one model_source arg is provided")
+    };
+
+    let state = AppState::load_from_specs(specs, server_config)?;
     tracing::info!(addr = %cli.addr, model = state.model_id(), "starting onnx-genai server");
     serve(cli.addr, state).await
 }

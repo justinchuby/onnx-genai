@@ -225,6 +225,28 @@ fn map_generate_submit_error(err: GenerateSubmitError) -> ApiError {
     }
 }
 
+/// Route a request to the correct loaded model.
+///
+/// - **Non-empty `requested`** — resolves the exact id.  Returns a 404 if that id
+///   is not loaded; does NOT fall back to the default model, so callers can trust
+///   that the returned handle is the one they asked for.
+/// - **Empty `requested`** — falls back to the first/default loaded model,
+///   preserving the single-model UX where clients omit or leave `model` blank.
+fn resolve_model(
+    registry: &crate::registry::ModelRegistry,
+    requested: &str,
+) -> Result<Arc<ModelHandle>, ApiError> {
+    if requested.trim().is_empty() {
+        registry
+            .resolve("")
+            .ok_or_else(|| ApiError::internal("no model loaded"))
+    } else {
+        registry.resolve(requested).ok_or_else(|| {
+            ApiError::not_found(format!("model '{requested}' not found"))
+        })
+    }
+}
+
 pub(crate) async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
     Json(HealthResponse {
         status: "ok",
@@ -400,10 +422,7 @@ pub(crate) async fn completions(
     headers: HeaderMap,
     Json(request): Json<CompletionRequest>,
 ) -> Result<Response, ApiError> {
-    let handle = state
-        .registry
-        .resolve(&request.model)
-        .ok_or_else(|| ApiError::internal("no model loaded"))?;
+    let handle = resolve_model(&state.registry, &request.model)?;
     if handle.pipeline {
         return Err(ApiError::bad_request(
             "/v1/completions is not supported by pipeline models",
@@ -435,10 +454,7 @@ pub(crate) async fn embeddings(
     State(state): State<AppState>,
     Json(request): Json<EmbeddingRequest>,
 ) -> Result<Json<EmbeddingResponse>, ApiError> {
-    let handle = state
-        .registry
-        .resolve(&request.model)
-        .ok_or_else(|| ApiError::internal("no model loaded"))?;
+    let handle = resolve_model(&state.registry, &request.model)?;
     validate_embedding_request(&request, &handle.tokenizer)?;
 
     let encoding_format = request.encoding_format;
@@ -540,10 +556,7 @@ pub(crate) async fn audio_transcriptions(
         }
     }
 
-    let handle = state
-        .registry
-        .resolve(&model_name)
-        .ok_or_else(|| ApiError::internal("no model loaded"))?;
+    let handle = resolve_model(&state.registry, &model_name)?;
 
     let bytes = file.ok_or_else(|| ApiError::bad_request("multipart field 'file' is required"))?;
     if !matches!(response_format.as_str(), "json" | "text") {
@@ -836,10 +849,7 @@ pub(crate) async fn chat_completions(
     headers: HeaderMap,
     Json(request): Json<ChatCompletionRequest>,
 ) -> Result<Response, ApiError> {
-    let handle = state
-        .registry
-        .resolve(&request.model)
-        .ok_or_else(|| ApiError::internal("no model loaded"))?;
+    let handle = resolve_model(&state.registry, &request.model)?;
     validate_request(&request, &state.config)?;
     let session_id = session_id_from_headers(&headers)?;
     if handle.pipeline && session_id.is_some() {

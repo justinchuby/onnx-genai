@@ -3,6 +3,7 @@ use crate::{
     EmbeddingRequest, EmbeddingResponse, EmbeddingUsage, EmbeddingVector, ServerConfig, app,
     build_generate_request,
     driver::{DriverCommand, EngineDriver},
+    models_config::ModelSpec,
     routes::{CompletionGeneration, collect_generation_result, prepare_completion},
     sse::StopBoundaryBuffer,
 };
@@ -87,11 +88,15 @@ fn tiny_wav_base64() -> String {
 }
 
 fn multipart_audio_body(response_format: &str) -> (String, Vec<u8>) {
+    multipart_audio_body_for_model("tiny-whisper", response_format)
+}
+
+fn multipart_audio_body_for_model(model: &str, response_format: &str) -> (String, Vec<u8>) {
     let boundary = "onnx-genai-audio-boundary";
     let mut body = Vec::new();
     body.extend_from_slice(
         format!(
-            "--{boundary}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\ntiny-whisper\r\n\
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\n{model}\r\n\
              --{boundary}\r\nContent-Disposition: form-data; name=\"response_format\"\r\n\r\n{response_format}\r\n\
              --{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"tiny.wav\"\r\nContent-Type: audio/wav\r\n\r\n"
         )
@@ -679,7 +684,9 @@ async fn embeddings_success_path_returns_openai_compatible_response() {
 
 #[tokio::test]
 async fn transcription_multipart_against_non_audio_model_returns_400() {
-    let (boundary, body) = multipart_audio_body("json");
+    // Send the correct model name (tiny-llm) so routing succeeds, then the handler
+    // returns 400 because tiny-llm has no audio input spec.
+    let (boundary, body) = multipart_audio_body_for_model("tiny-llm", "json");
     let response = app(tiny_state())
         .oneshot(
             Request::builder()
@@ -1486,4 +1493,193 @@ fn server_config_engine_config_kv_cache_dtype_can_be_set() {
         ..ServerConfig::default()
     };
     assert_eq!(config.engine_config.kv_cache_dtype, KvDType::Fp8E4M3Fn);
+}
+
+// ── M2: multi-model routing tests ────────────────────────────────────────────
+
+/// Load the tiny-llm fixture twice under two different ids to exercise
+/// multi-model routing without requiring a second distinct fixture.
+fn two_model_state() -> AppState {
+    let path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
+    let specs = vec![
+        ModelSpec { id: "model-a".to_string(), path: path.clone(), eager: true },
+        ModelSpec { id: "model-b".to_string(), path: path.clone(), eager: true },
+    ];
+    AppState::load_from_specs(specs, ServerConfig::default()).expect("load two tiny-llm fixtures")
+}
+
+#[tokio::test]
+async fn named_model_routes_to_the_correct_handle() {
+    let router = app(two_model_state());
+    // Request for model-a returns 200 and echoes model-a in the response.
+    let resp = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "model-a",
+                        "messages": [{"role": "user", "content": "hello"}],
+                        "max_tokens": 1,
+                        "temperature": 0.0
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(body["model"], "model-a");
+}
+
+#[tokio::test]
+async fn unknown_named_model_returns_404() {
+    let router = app(two_model_state());
+    let resp = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "does-not-exist",
+                        "messages": [{"role": "user", "content": "hello"}],
+                        "max_tokens": 1
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("does-not-exist"),
+        "error should name the unknown model: {body}"
+    );
+}
+
+#[tokio::test]
+async fn empty_model_field_falls_back_to_default() {
+    let router = app(two_model_state());
+    // Sending an empty string for model should resolve to the first loaded model.
+    let resp = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "",
+                        "messages": [{"role": "user", "content": "hello"}],
+                        "max_tokens": 1,
+                        "temperature": 0.0
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    // Should succeed (200) – empty model falls back to the default, not 404.
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn models_endpoint_lists_all_loaded_models() {
+    let router = app(two_model_state());
+    let resp = router
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/v1/models")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let ids: Vec<&str> = body["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|obj| obj["id"].as_str().unwrap())
+        .collect();
+    assert!(ids.contains(&"model-a"), "model-a not in /v1/models: {body}");
+    assert!(ids.contains(&"model-b"), "model-b not in /v1/models: {body}");
+    assert_eq!(ids.len(), 2);
+}
+
+#[tokio::test]
+async fn unknown_model_returns_404_on_completions_endpoint() {
+    let router = app(tiny_state());
+    let resp = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/completions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "no-such-model",
+                        "prompt": "hello",
+                        "max_tokens": 1
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn single_model_startup_still_works_via_load_with_config() {
+    // Regression guard: the existing load_with_config / single-model path must
+    // behave identically to M1.
+    let model_dir =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
+    let state =
+        AppState::load_with_config(&model_dir, Some("tiny-llm".to_string()), ServerConfig::default())
+            .expect("single-model load must still work");
+    // Registry has exactly one entry with the expected id.
+    assert_eq!(state.registry.ids().len(), 1);
+    assert_eq!(state.registry.default_id(), Some("tiny-llm"));
+
+    let resp = app(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "tiny-llm",
+                        "messages": [{"role": "user", "content": "ping"}],
+                        "max_tokens": 1,
+                        "temperature": 0.0
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
 }

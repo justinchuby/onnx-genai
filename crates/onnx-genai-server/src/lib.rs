@@ -21,6 +21,7 @@ mod audio_input;
 mod driver;
 mod image_input;
 mod metrics;
+mod models_config;
 mod registry;
 mod routes;
 mod session;
@@ -28,6 +29,7 @@ mod sse;
 mod state;
 mod types;
 
+pub use models_config::{ModelsConfig, ModelSpec, from_models_dir};
 pub use routes::{
     ParsedAssistantOutput, build_generate_request, build_prompt, parse_assistant_output,
     parse_tool_calls,
