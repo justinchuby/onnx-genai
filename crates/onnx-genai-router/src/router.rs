@@ -10,7 +10,7 @@
 //! `.expect("no healthy nodes")`), this implementation returns `Option` and
 //! never panics — a clean pre-release contract.
 
-use crate::config::{RouterConfig, RoutingPolicy};
+use crate::config::{RouterConfig, RoutingPolicy, WeightConfig};
 use crate::node::{NodeId, NodeState, NodeStatus};
 use crate::prefix_map::PrefixMap;
 use crate::session_map::{MigrationReason, SessionMap};
@@ -132,16 +132,17 @@ impl Router {
                 }
             }
         }
-        self.least_loaded_node()
+        self.weighted_fallback_node(request)
             .map(|node| (node, RoutingDecision::LeastLoaded))
     }
 
     /// Preference order of the primary (non-fallback) steps per policy.
     fn policy_steps(&self) -> &'static [Step] {
         match self.policy {
-            RoutingPolicy::AffinityThenLoad | RoutingPolicy::Weighted(_) => {
-                &[Step::Affinity, Step::Prefix]
-            }
+            RoutingPolicy::AffinityThenLoad => &[Step::Affinity, Step::Prefix],
+            // Weighted scores affinity as a continuous bonus in the fallback;
+            // no separate binary gate here.
+            RoutingPolicy::Weighted(_) => &[Step::Prefix],
             RoutingPolicy::PrefixThenLoad => &[Step::Prefix, Step::Affinity],
             // Always route to least KV usage: skip affinity/prefix entirely.
             RoutingPolicy::LeastKvUsage => &[],
@@ -192,14 +193,41 @@ impl Router {
             .map(|n| n.id.clone())
     }
 
+    /// Fallback node selection used by [`Self::pick`].
+    ///
+    /// For [`RoutingPolicy::Weighted`] the session's current affinity node
+    /// receives a score reduction of `affinity_weight`, making it "stickier"
+    /// under moderate load (§34.5).  The bonus is withheld when the affinity
+    /// node is at or above `overload_threshold` so a saturated node cannot win
+    /// solely because of affinity.  Unhealthy and draining nodes are always
+    /// excluded.
+    ///
+    /// For all other policies delegates to [`Self::least_loaded_node`].
+    fn weighted_fallback_node(&self, request: &RouteRequest) -> Option<NodeId> {
+        let RoutingPolicy::Weighted(w) = &self.policy else {
+            return self.least_loaded_node();
+        };
+        let affinity_target = request
+            .session_id
+            .as_ref()
+            .and_then(|s| self.session_map.get(s));
+        self.nodes
+            .iter()
+            .filter(|n| n.healthy && !self.draining.contains(&n.id))
+            .min_by(|a, b| {
+                weighted_node_score(a, affinity_target, w, self.overload_threshold)
+                    .partial_cmp(&weighted_node_score(b, affinity_target, w, self.overload_threshold))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|n| n.id.clone())
+    }
+
     /// Lower is better. Scoring depends on policy (§34.5).
     fn load_score(&self, node: &NodeState) -> f32 {
         let normalized_queue = node.queue_depth as f32 / 10.0;
         match &self.policy {
             RoutingPolicy::LeastKvUsage => node.kv_usage,
             RoutingPolicy::Weighted(w) => {
-                // affinity_weight is applied in the affinity step, not here; the
-                // load-fallback score blends KV usage and queue pressure.
                 node.kv_usage * w.kv_weight + normalized_queue * w.queue_weight
             }
             RoutingPolicy::AffinityThenLoad | RoutingPolicy::PrefixThenLoad => {
@@ -355,6 +383,31 @@ impl Router {
     fn node_index(&self, id: &NodeId) -> Option<usize> {
         self.nodes.iter().position(|n| &n.id == id)
     }
+}
+
+/// Score a node for the [`RoutingPolicy::Weighted`] fallback path.
+///
+/// `score = kv_usage × kv_weight + normalized_queue × queue_weight − bonus`
+///
+/// The `affinity_weight` bonus is applied only when the node is the session's
+/// current affinity target *and* its KV usage is below `overload_threshold`.
+/// Withholding the bonus for overloaded nodes prevents the affinity discount
+/// from routing a request to a saturated node.
+fn weighted_node_score(
+    node: &NodeState,
+    affinity_target: Option<&NodeId>,
+    w: &WeightConfig,
+    overload_threshold: f32,
+) -> f32 {
+    let normalized_queue = node.queue_depth as f32 / 10.0;
+    let base = node.kv_usage * w.kv_weight + normalized_queue * w.queue_weight;
+    let is_affinity_target = affinity_target == Some(&node.id);
+    let bonus = if is_affinity_target && node.kv_usage < overload_threshold {
+        w.affinity_weight
+    } else {
+        0.0
+    };
+    base - bonus
 }
 
 /// Primary routing steps (before the least-loaded fallback).
@@ -522,6 +575,9 @@ mod tests {
 
     #[test]
     fn weighted_policy_scoring_selects_expected_node() {
+        // `least_loaded_node` uses `load_score` (no affinity bonus — that path
+        // is exercised by `weighted_fallback_node` via `route`).
+        // Scores: gpu-0 = 0.9×0.3 = 0.27, gpu-1 = 0.1×0.3 + 0.5×0.2 = 0.13.
         let w = WeightConfig {
             affinity_weight: 0.5,
             kv_weight: 0.3,
@@ -529,8 +585,8 @@ mod tests {
         };
         let r = router(
             vec![
-                node("gpu-0", true, 0.9, 0), // 0.9*0.3 = 0.27
-                node("gpu-1", true, 0.1, 5), // 0.1*0.3 + 0.5*0.2 = 0.13
+                node("gpu-0", true, 0.9, 0),
+                node("gpu-1", true, 0.1, 5),
             ],
             RoutingPolicy::Weighted(w),
         );
@@ -716,5 +772,79 @@ health:
         };
         r.route(&req);
         assert_eq!(r.rebalance(), 0);
+    }
+
+    // ---- Weighted affinity bonus tests -------------------------------------
+
+    /// With zero affinity_weight the lower-load node wins even though the
+    /// session is pinned to the higher-load node.  With a high affinity_weight
+    /// the pinned node gets a scoring discount and wins instead.
+    #[test]
+    fn weighted_affinity_bonus_changes_decision() {
+        let make_router = |affinity_weight: f32| {
+            let w = WeightConfig {
+                affinity_weight,
+                kv_weight: 0.3,
+                queue_weight: 0.2,
+            };
+            router(
+                vec![
+                    node("gpu-0", true, 0.6, 0), // affinity target; score = 0.6×0.3 = 0.18
+                    node("gpu-1", true, 0.3, 0), // competitor;      score = 0.3×0.3 = 0.09
+                ],
+                RoutingPolicy::Weighted(w),
+            )
+        };
+
+        // No bonus: gpu-1 (score 0.09) beats gpu-0 (score 0.18).
+        let mut r = make_router(0.0);
+        r.record_session_affinity("s1", NodeId::new("gpu-0"));
+        let req = RouteRequest { session_id: Some("s1".into()), system_prompt_hash: None };
+        let d = r.route_decision(&req).unwrap();
+        assert_eq!(d.0, NodeId::new("gpu-1"), "without bonus, lower-load gpu-1 wins");
+        assert_eq!(d.1, RoutingDecision::LeastLoaded);
+
+        // With affinity_weight=0.5: gpu-0 score = 0.18 − 0.5 = −0.32 < 0.09 → gpu-0 wins.
+        let mut r = make_router(0.5);
+        r.record_session_affinity("s1", NodeId::new("gpu-0"));
+        let d = r.route_decision(&req).unwrap();
+        assert_eq!(d.0, NodeId::new("gpu-0"), "with bonus, affinity gpu-0 wins");
+        assert_eq!(d.1, RoutingDecision::LeastLoaded);
+    }
+
+    /// A maximum affinity_weight must not route to an *unhealthy* affinity node.
+    #[test]
+    fn weighted_affinity_bonus_skipped_for_unhealthy_node() {
+        let w = WeightConfig { affinity_weight: 1.0, kv_weight: 0.3, queue_weight: 0.2 };
+        let mut r = router(
+            vec![
+                node("gpu-0", false, 0.1, 0), // affinity target, but unhealthy
+                node("gpu-1", true, 0.9, 0),  // only healthy candidate
+            ],
+            RoutingPolicy::Weighted(w),
+        );
+        r.record_session_affinity("s1", NodeId::new("gpu-0"));
+        let req = RouteRequest { session_id: Some("s1".into()), system_prompt_hash: None };
+        let d = r.route_decision(&req).unwrap();
+        assert_eq!(d.0, NodeId::new("gpu-1"), "unhealthy affinity node excluded despite max bonus");
+    }
+
+    /// A maximum affinity_weight must not route to an *overloaded* affinity node
+    /// (KV usage at or above the overload threshold).
+    #[test]
+    fn weighted_affinity_bonus_skipped_for_overloaded_node() {
+        let w = WeightConfig { affinity_weight: 1.0, kv_weight: 0.3, queue_weight: 0.2 };
+        let mut r = router(
+            vec![
+                node("gpu-0", true, 0.99, 0), // affinity target, but overloaded (> 0.95)
+                node("gpu-1", true, 0.5, 0),  // healthy, below threshold
+            ],
+            RoutingPolicy::Weighted(w),
+        );
+        r.record_session_affinity("s1", NodeId::new("gpu-0"));
+        let req = RouteRequest { session_id: Some("s1".into()), system_prompt_hash: None };
+        let d = r.route_decision(&req).unwrap();
+        // Without the bonus gpu-0 scores 0.99×0.3=0.297 vs gpu-1's 0.5×0.3=0.15 → gpu-1 wins.
+        assert_eq!(d.0, NodeId::new("gpu-1"), "overloaded affinity node loses without bonus");
     }
 }
