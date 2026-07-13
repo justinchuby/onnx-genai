@@ -65,9 +65,21 @@ pub type ConnectorResult<T> = Result<T, ConnectorError>;
 /// Identifies a cached KV segment by token content hash.
 ///
 /// Uses chunked hashing: tokens are split into fixed-size chunks (see
-/// [`chunk_tokens`]), each chunk hashed independently. This enables prefix
-/// sharing at chunk granularity, including *across processes and nodes* — the
-/// hash is deterministic and process-independent (see [`hash_tokens`]).
+/// [`chunk_tokens`]), and each chunk is hashed **cumulatively** over every
+/// token from position 0 through the end of that chunk. This makes the key
+/// *prefix-dependent*: two sequences produce the same `chunk_hash` for chunk N
+/// only when they share an identical token prefix `[0..=end_of_chunk_N]`.
+/// Prefix sharing still works at chunk granularity — genuinely shared prefixes
+/// (e.g. a common system prompt) collide as before — but sequences that differ
+/// *earlier* now correctly diverge, so a matching key guarantees identical
+/// preceding context. The hash is deterministic and process-independent
+/// (see [`hash_tokens`]), so keys are stable *across processes and nodes*.
+///
+/// This prefix-dependence is a **correctness requirement**: a chunk's real KV
+/// depends on all earlier tokens (causal attention), so keying it on the chunk
+/// tokens alone would let KV computed under one prefix be reused under a
+/// different prefix — silently corrupting output once fetched KV is
+/// materialized into the paged cache.
 #[derive(Clone, Hash, Eq, PartialEq, Debug)]
 pub struct KvCacheKey {
     /// Opaque model identity. Different models have incompatible KV; this is
@@ -75,7 +87,9 @@ pub struct KvCacheKey {
     pub model_id: String,
     /// Layer range this KV covers (for layer-parallel / layer-partial storage).
     pub layer_range: Range<usize>,
-    /// Token chunk hash: `hash_tokens(token_ids[chunk_start..chunk_end])`.
+    /// Cumulative token hash: `hash_tokens(token_ids[0..=chunk_end])`, i.e. the
+    /// running hash of every token up to and including this chunk. Encodes the
+    /// full preceding context, not just this chunk's tokens.
     pub chunk_hash: u64,
     /// Chunk index within the sequence (for ordering).
     pub chunk_index: u32,
@@ -201,21 +215,26 @@ pub enum ConnectorHealth {
 // Token chunking + stable hashing (DESIGN §38.8)
 // ---------------------------------------------------------------------------
 
-/// A fixed-size (except possibly the last) chunk of tokens plus its content
-/// hash, the unit of external caching (DESIGN §38.8).
+/// A fixed-size (except possibly the last) chunk of tokens plus its cumulative
+/// prefix hash, the unit of external caching (DESIGN §38.8).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TokenChunk {
     /// Chunk index within the sequence (for ordering).
     pub index: u32,
     /// The tokens in this chunk (last chunk may be shorter than `chunk_size`).
     pub tokens: Vec<TokenId>,
-    /// Content hash of `tokens` (see [`hash_tokens`]).
+    /// Cumulative content hash of every token from position 0 through the end
+    /// of this chunk — equal to `hash_tokens(&all_tokens[0..=chunk_end])` (see
+    /// [`chunk_tokens`] / [`hash_tokens`]). This makes the hash — and therefore
+    /// the [`KvCacheKey`] — prefix-dependent, not a hash of this chunk alone.
     pub hash: u64,
 }
 
 impl TokenChunk {
     /// Build the [`KvCacheKey`] for this chunk under a given model identity and
-    /// layer range. `model_id` is opaque (see the module docs).
+    /// layer range. `model_id` is opaque (see the module docs). The chunk's
+    /// cumulative prefix `hash` is carried into [`KvCacheKey::chunk_hash`], so
+    /// the resulting key encodes the full preceding token context.
     pub fn to_key(&self, model_id: impl Into<String>, layer_range: Range<usize>) -> KvCacheKey {
         KvCacheKey {
             model_id: model_id.into(),
@@ -227,20 +246,15 @@ impl TokenChunk {
     }
 }
 
-/// Stable, deterministic, process-independent hash of a token slice.
-///
-/// Implemented as **FNV-1a (64-bit)** over the little-endian bytes of each
-/// token id. FNV-1a is chosen deliberately over Rust's default hasher
-/// (`DefaultHasher`/SipHash is randomly seeded per process, so it could not be
-/// used for cross-node prefix sharing). The constants and byte order are fixed
-/// here, so the same tokens hash to the same value on every process and node.
-/// The hash of a chunk depends only on that chunk's tokens — never on
-/// surrounding chunks — which is what makes chunk-granular prefix sharing work.
-pub fn hash_tokens(tokens: &[TokenId]) -> u64 {
-    const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
-    const FNV_PRIME: u64 = 0x100000001b3;
+/// FNV-1a (64-bit) parameters. Fixed here so the same tokens hash to the same
+/// value on every process and node (required for cross-node prefix sharing).
+const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 
-    let mut hash = FNV_OFFSET_BASIS;
+/// Absorb the little-endian bytes of each token id into an existing FNV-1a
+/// state and return the updated state. Threading the state across chunk
+/// boundaries is what yields the cumulative, prefix-dependent chunk hashes.
+fn fnv1a_absorb_tokens(mut hash: u64, tokens: &[TokenId]) -> u64 {
     for &token in tokens {
         for byte in token.to_le_bytes() {
             hash ^= byte as u64;
@@ -250,25 +264,54 @@ pub fn hash_tokens(tokens: &[TokenId]) -> u64 {
     hash
 }
 
+/// Stable, deterministic, process-independent hash of a token slice.
+///
+/// Implemented as **FNV-1a (64-bit)** over the little-endian bytes of each
+/// token id. FNV-1a is chosen deliberately over Rust's default hasher
+/// (`DefaultHasher`/SipHash is randomly seeded per process, so it could not be
+/// used for cross-node prefix sharing). The constants and byte order are fixed
+/// here, so the same tokens hash to the same value on every process and node.
+///
+/// This is the pure, position-independent hash of exactly the tokens passed in.
+/// Chunk keys are *not* built from this directly on a per-chunk window; instead
+/// [`chunk_tokens`] threads the FNV state across chunk boundaries so each
+/// chunk's hash is cumulative over all preceding tokens (prefix-dependent) —
+/// which is what makes a matching [`KvCacheKey`] guarantee identical preceding
+/// context under causal attention.
+pub fn hash_tokens(tokens: &[TokenId]) -> u64 {
+    fnv1a_absorb_tokens(FNV_OFFSET_BASIS, tokens)
+}
+
 /// Split a token sequence into fixed-size chunks for caching (DESIGN §38.8).
 ///
-/// The last chunk may be smaller than `chunk_size` and is stored as-is. Each
-/// chunk is hashed independently via [`hash_tokens`]. `chunk_size` is always a
-/// parameter (default [`DEFAULT_CHUNK_SIZE`]); it is never derived from the
-/// model.
+/// The last chunk may be smaller than `chunk_size` and is stored as-is.
+/// `chunk_size` is always a parameter (default [`DEFAULT_CHUNK_SIZE`]); it is
+/// never derived from the model.
+///
+/// Each chunk's `hash` is **cumulative**: the running FNV-1a state is threaded
+/// across chunks, so `chunks[i].hash == hash_tokens(&token_ids[0..=chunk_end])`
+/// covers every token up to and including that chunk. This makes chunk keys
+/// prefix-dependent — two sequences yield the same hash for chunk `i` iff they
+/// share an identical prefix through the end of chunk `i` — which preserves
+/// genuine prefix sharing while preventing reuse of KV across differing
+/// prefixes.
 ///
 /// # Panics
 ///
 /// Panics if `chunk_size == 0`.
 pub fn chunk_tokens(token_ids: &[TokenId], chunk_size: usize) -> Vec<TokenChunk> {
     assert!(chunk_size > 0, "chunk_size must be greater than zero");
+    let mut rolling = FNV_OFFSET_BASIS;
     token_ids
         .chunks(chunk_size)
         .enumerate()
-        .map(|(idx, chunk)| TokenChunk {
-            index: idx as u32,
-            tokens: chunk.to_vec(),
-            hash: hash_tokens(chunk),
+        .map(|(idx, chunk)| {
+            rolling = fnv1a_absorb_tokens(rolling, chunk);
+            TokenChunk {
+                index: idx as u32,
+                tokens: chunk.to_vec(),
+                hash: rolling,
+            }
         })
         .collect()
 }
@@ -466,16 +509,54 @@ mod tests {
     }
 
     #[test]
-    fn chunk_hash_independent_of_surrounding_chunks() {
-        // The same 4-token window must hash identically regardless of what
-        // precedes/follows it in the full sequence.
+    fn chunk_tokens_cumulative_hash_is_stable_against_hardcoded_values() {
+        // Guards the *rolling* chunk-hash scheme: each chunk's hash is the FNV
+        // state threaded across all preceding tokens, so it equals the pure
+        // hash of the sequence up to and including that chunk. If the rolling
+        // scheme ever changes, these fail and force a review, since cross-node
+        // prefix sharing (and materialization correctness) depend on stability.
+        let tokens: Vec<TokenId> = (0..10).collect();
+        let chunks = chunk_tokens(&tokens, 4);
+        assert_eq!(chunks[0].hash, 0x30d7_7e22_c5da_0365);
+        assert_eq!(chunks[1].hash, 0x66b0_4c33_23ce_3f25);
+        assert_eq!(chunks[2].hash, 0x4363_3e3f_f0f8_85b4);
+        // Cumulative: chunk i's hash == pure hash of every token through it.
+        assert_eq!(chunks[0].hash, hash_tokens(&tokens[0..4]));
+        assert_eq!(chunks[1].hash, hash_tokens(&tokens[0..8]));
+        assert_eq!(chunks[2].hash, hash_tokens(&tokens[0..10]));
+    }
+
+    #[test]
+    fn chunk_hash_is_prefix_dependent() {
+        // Two sequences that share an identical chunk-N *window* but differ in
+        // an EARLIER chunk must now produce DIFFERENT hashes/keys for chunk N —
+        // because chunk N's real KV depends on all preceding tokens (causal
+        // attention). This is the correctness landmine fix.
         let a: Vec<TokenId> = vec![100, 101, 102, 103, 200, 201, 202, 203];
-        let b: Vec<TokenId> = vec![200, 201, 202, 203, 999, 998];
+        let b: Vec<TokenId> = vec![900, 901, 902, 903, 200, 201, 202, 203];
         let ca = chunk_tokens(&a, 4);
         let cb = chunk_tokens(&b, 4);
-        // a[4..8] == b[0..4] == [200,201,202,203]
-        assert_eq!(ca[1].hash, cb[0].hash);
-        assert_eq!(ca[1].hash, hash_tokens(&[200, 201, 202, 203]));
+        // Identical chunk-1 window ([200,201,202,203]) but different prefix.
+        assert_eq!(ca[1].tokens, cb[1].tokens);
+        assert_ne!(ca[1].hash, cb[1].hash);
+        assert_ne!(ca[1].to_key("m", 0..1), cb[1].to_key("m", 0..1));
+    }
+
+    #[test]
+    fn chunk_hash_shared_prefix_still_collides() {
+        // Genuinely-shared prefixes (e.g. a common system prompt) must still
+        // dedupe: two sequences with the SAME tokens through the end of chunk N
+        // get the SAME hash/key for every chunk up to N, even if they diverge
+        // afterwards.
+        let a: Vec<TokenId> = vec![10, 11, 12, 13, 20, 21, 22, 23, 30, 31, 32, 33];
+        let b: Vec<TokenId> = vec![10, 11, 12, 13, 20, 21, 22, 23, 77, 78, 79, 80];
+        let ca = chunk_tokens(&a, 4);
+        let cb = chunk_tokens(&b, 4);
+        // Shared prefix through chunk 1 → identical keys for chunks 0 and 1.
+        assert_eq!(ca[0].to_key("m", 0..1), cb[0].to_key("m", 0..1));
+        assert_eq!(ca[1].to_key("m", 0..1), cb[1].to_key("m", 0..1));
+        // Diverge at chunk 2 → different keys.
+        assert_ne!(ca[2].to_key("m", 0..1), cb[2].to_key("m", 0..1));
     }
 
     // --- KvCacheKey Hash/Eq --------------------------------------------
