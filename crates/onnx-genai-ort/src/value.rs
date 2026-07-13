@@ -301,6 +301,50 @@ impl Value {
         Ok(tensor_data_ptr(self.ptr.as_ptr())? as usize)
     }
 
+    /// Overwrite the leading `data.len()` Int64 elements of this tensor in
+    /// place, leaving the tensor's OrtValue (and its buffer address) unchanged.
+    ///
+    /// This is the update primitive for the static-shape captured decode loop:
+    /// the persistent `input_ids` / `position_ids` / `attention_mask` buffers
+    /// keep the fixed device/host addresses that a captured CUDA graph replays
+    /// against, while their contents change every token. `data.len()` may be
+    /// smaller than the tensor to update only a prefix (e.g. the valid region
+    /// of a max-length attention mask).
+    pub fn write_i64_prefix(&self, data: &[i64]) -> Result<()> {
+        if self.dtype != DataType::Int64 {
+            return Err(OrtError::InvalidArgument(format!(
+                "write_i64_prefix requires an Int64 tensor, got {:?}",
+                self.dtype
+            )));
+        }
+        if data.len() > self.numel() {
+            return Err(OrtError::InvalidArgument(format!(
+                "write_i64_prefix length {} exceeds tensor capacity {}",
+                data.len(),
+                self.numel()
+            )));
+        }
+        let dst = tensor_data_ptr(self.ptr.as_ptr())?.cast::<i64>();
+        // SAFETY: `dst` points to at least `numel()` contiguous i64 elements
+        // owned by this tensor; we write only the first `data.len()` of them.
+        unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), dst, data.len()) };
+        Ok(())
+    }
+
+    /// Deep-copy this tensor into a fresh host-owned [`Value`] with its own
+    /// buffer. Used to snapshot a persistent captured-decode output buffer so
+    /// the caller can consume it while the original is reused on the next step.
+    pub fn clone_owned(&self) -> Result<Value> {
+        match self.dtype {
+            DataType::Float32 => Value::from_vec_f32(self.to_vec_f32()?, &self.shape),
+            DataType::Float16 => Value::from_vec_f16_bits(self.to_vec_f16_bits()?, &self.shape),
+            DataType::Int64 => Value::from_vec_i64(self.to_vec_i64()?, &self.shape),
+            other => Err(OrtError::InvalidArgument(format!(
+                "cannot clone tensor with dtype {other:?}"
+            ))),
+        }
+    }
+
     /// Zero one row of a rank-3 row-major tensor shaped `[B, N, D]`.
     pub(crate) fn zero_rank3_row(&mut self, row: usize) -> Result<()> {
         if self.shape.len() != 3 {
