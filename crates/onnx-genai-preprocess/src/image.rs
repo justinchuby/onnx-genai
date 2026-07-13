@@ -56,6 +56,39 @@ impl TileGrid {
     }
 }
 
+/// Placement of an optional global-thumbnail token segment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThumbnailPosition {
+    None,
+    Prepend,
+    Append,
+}
+
+/// Configuration for expanding one prompt image placeholder per preprocessed image.
+///
+/// Each local tile emits `tokens_per_tile` copies of `image_token_id`. Optional
+/// column separators are emitted between tiles in a row, and optional row
+/// separators are emitted between rows. A global thumbnail emits one additional
+/// tile-sized segment before or after the local grid.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TokenExpansionConfig {
+    pub image_placeholder_token_id: i64,
+    pub image_token_id: i64,
+    pub tokens_per_tile: usize,
+    pub thumbnail_position: ThumbnailPosition,
+    pub row_separator_token_id: Option<i64>,
+    pub column_separator_token_id: Option<i64>,
+}
+
+/// Tile metadata required to expand image placeholders without image tensor data.
+#[derive(Debug, Clone, Copy)]
+pub struct ImageTilingSummary<'a> {
+    pub num_tiles: usize,
+    pub tiles_per_image: &'a [usize],
+    /// Local grids corresponding one-to-one with `tiles_per_image`.
+    pub tile_grids: &'a [TileGrid],
+}
+
 /// Resolved image tiling parameters.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImageTilingConfig {
@@ -94,6 +127,8 @@ pub struct ImageTensor {
     pub num_tiles: usize,
     /// Tile counts corresponding to each input image.
     pub tiles_per_image: Vec<usize>,
+    /// Local tile grids corresponding to each input image.
+    pub tile_grids: Vec<TileGrid>,
     pub original_sizes: Vec<(u32, u32)>,
 }
 
@@ -105,6 +140,175 @@ impl ImageTensor {
         let end = start.checked_add(values_per_tile)?;
         self.data.get(start..end)
     }
+
+    /// Returns the lightweight tiling metadata used by prompt token expansion.
+    pub fn tiling_summary(&self) -> ImageTilingSummary<'_> {
+        ImageTilingSummary {
+            num_tiles: self.num_tiles,
+            tiles_per_image: &self.tiles_per_image,
+            tile_grids: &self.tile_grids,
+        }
+    }
+}
+
+/// Replaces each image placeholder in a prompt with its image's tile token sequence.
+///
+/// Placeholders are matched to images in prompt order. The number of placeholder
+/// occurrences must exactly match `tiling.tiles_per_image.len()`. The returned
+/// token IDs are ready for the caller to pass to its scheduler/decoder; wiring
+/// this function between tokenization and sequence-length/KV allocation is the
+/// responsibility of the engine or server.
+pub fn expand_image_placeholders(
+    prompt_token_ids: &[i64],
+    tiling: ImageTilingSummary<'_>,
+    config: &TokenExpansionConfig,
+) -> anyhow::Result<Vec<i64>> {
+    validate_token_expansion(tiling, config)?;
+
+    let placeholder_count = prompt_token_ids
+        .iter()
+        .filter(|token_id| **token_id == config.image_placeholder_token_id)
+        .count();
+    if placeholder_count != tiling.tiles_per_image.len() {
+        anyhow::bail!(
+            "prompt contains {placeholder_count} image placeholder(s), but preprocessing produced {} image(s)",
+            tiling.tiles_per_image.len()
+        );
+    }
+
+    let mut replacements = Vec::with_capacity(tiling.tile_grids.len());
+    let mut replacement_tokens = 0usize;
+    for grid in tiling.tile_grids {
+        let replacement = expanded_image_tokens(*grid, config)?;
+        replacement_tokens = replacement_tokens
+            .checked_add(replacement.len())
+            .context("expanded image token sequence is too large")?;
+        replacements.push(replacement);
+    }
+
+    let output_len = prompt_token_ids
+        .len()
+        .checked_sub(placeholder_count)
+        .and_then(|length| length.checked_add(replacement_tokens))
+        .context("expanded prompt token sequence is too large")?;
+    let mut expanded = Vec::new();
+    expanded
+        .try_reserve_exact(output_len)
+        .context("failed to allocate expanded prompt token sequence")?;
+    let mut image_index = 0usize;
+    for token_id in prompt_token_ids {
+        if *token_id == config.image_placeholder_token_id {
+            expanded.extend_from_slice(&replacements[image_index]);
+            image_index += 1;
+        } else {
+            expanded.push(*token_id);
+        }
+    }
+    Ok(expanded)
+}
+
+fn validate_token_expansion(
+    tiling: ImageTilingSummary<'_>,
+    config: &TokenExpansionConfig,
+) -> anyhow::Result<()> {
+    if config.tokens_per_tile == 0 {
+        anyhow::bail!("tokens_per_tile must be greater than zero");
+    }
+    if tiling.tiles_per_image.len() != tiling.tile_grids.len() {
+        anyhow::bail!(
+            "tiles_per_image has {} entries, but tile_grids has {}",
+            tiling.tiles_per_image.len(),
+            tiling.tile_grids.len()
+        );
+    }
+
+    let thumbnail_tiles = usize::from(config.thumbnail_position != ThumbnailPosition::None);
+    let mut total_tiles = 0usize;
+    for (image_index, (&actual_tiles, grid)) in tiling
+        .tiles_per_image
+        .iter()
+        .zip(tiling.tile_grids)
+        .enumerate()
+    {
+        if grid.columns == 0 || grid.rows == 0 {
+            anyhow::bail!("image {image_index} tile grid dimensions must be greater than zero");
+        }
+        let expected_tiles = grid
+            .tile_count()?
+            .checked_add(thumbnail_tiles)
+            .context("image tile count is too large")?;
+        if actual_tiles != expected_tiles {
+            anyhow::bail!(
+                "image {image_index} reports {actual_tiles} tile(s), but its {}x{} grid and thumbnail configuration require {expected_tiles}",
+                grid.columns,
+                grid.rows
+            );
+        }
+        total_tiles = total_tiles
+            .checked_add(actual_tiles)
+            .context("total image tile count is too large")?;
+    }
+    if total_tiles != tiling.num_tiles {
+        anyhow::bail!(
+            "tiling summary reports {} total tile(s), but tiles_per_image sums to {total_tiles}",
+            tiling.num_tiles
+        );
+    }
+    Ok(())
+}
+
+fn expanded_image_tokens(
+    grid: TileGrid,
+    config: &TokenExpansionConfig,
+) -> anyhow::Result<Vec<i64>> {
+    let local_tiles = grid.tile_count()?;
+    let thumbnail_tiles = usize::from(config.thumbnail_position != ThumbnailPosition::None);
+    let separator_count = usize::from(config.column_separator_token_id.is_some())
+        .checked_mul(local_tiles.saturating_sub(grid.rows as usize))
+        .and_then(|count| {
+            usize::from(config.row_separator_token_id.is_some())
+                .checked_mul((grid.rows as usize).saturating_sub(1))
+                .and_then(|rows| count.checked_add(rows))
+        })
+        .context("expanded image separator count is too large")?;
+    let capacity = local_tiles
+        .checked_add(thumbnail_tiles)
+        .and_then(|tiles| tiles.checked_mul(config.tokens_per_tile))
+        .and_then(|tokens| tokens.checked_add(separator_count))
+        .context("expanded image token sequence is too large")?;
+    let mut tokens = Vec::new();
+    tokens
+        .try_reserve_exact(capacity)
+        .context("failed to allocate expanded image token sequence")?;
+
+    let emit_tile = |tokens: &mut Vec<i64>| {
+        tokens.extend(std::iter::repeat_n(
+            config.image_token_id,
+            config.tokens_per_tile,
+        ));
+    };
+    if config.thumbnail_position == ThumbnailPosition::Prepend {
+        emit_tile(&mut tokens);
+    }
+    for row in 0..grid.rows {
+        for column in 0..grid.columns {
+            emit_tile(&mut tokens);
+            if column + 1 < grid.columns
+                && let Some(separator) = config.column_separator_token_id
+            {
+                tokens.push(separator);
+            }
+        }
+        if row + 1 < grid.rows
+            && let Some(separator) = config.row_separator_token_id
+        {
+            tokens.push(separator);
+        }
+    }
+    if config.thumbnail_position == ThumbnailPosition::Append {
+        emit_tile(&mut tokens);
+    }
+    Ok(tokens)
 }
 
 /// Reusable image preprocessor resolved from a model input and §35 metadata.
@@ -242,10 +446,12 @@ impl ImagePreprocessor {
         let pixels_per_image = self.config.width as usize * self.config.height as usize;
         let mut tiles = Vec::new();
         let mut tiles_per_image = Vec::with_capacity(images.len());
+        let mut tile_grids = Vec::with_capacity(images.len());
         let mut original_sizes = Vec::with_capacity(images.len());
         for image in images {
             original_sizes.push((image.width(), image.height()));
-            let image_tiles = tile_image(image, &self.config)?;
+            let (grid, image_tiles) = tile_image(image, &self.config)?;
+            tile_grids.push(grid);
             tiles_per_image.push(image_tiles.len());
             tiles.extend(image_tiles);
         }
@@ -290,6 +496,7 @@ impl ImagePreprocessor {
             data,
             num_tiles,
             tiles_per_image,
+            tile_grids,
             original_sizes,
         })
     }
@@ -509,12 +716,18 @@ fn resolve_dimension(name: &str, model: i64, configured: Option<u32>) -> anyhow:
 fn tile_image(
     image: &DynamicImage,
     config: &ImagePreprocessConfig,
-) -> anyhow::Result<Vec<RgbImage>> {
+) -> anyhow::Result<(TileGrid, Vec<RgbImage>)> {
     match config.tiling.mode {
-        TilingMode::None => Ok(vec![resize_image(image, config)]),
+        TilingMode::None => Ok((
+            TileGrid {
+                columns: 1,
+                rows: 1,
+            },
+            vec![resize_image(image, config)],
+        )),
         TilingMode::FixedGrid => {
             let grid = config.tiling.aspect_ratios[0];
-            tiled_image_for_grid(image, config, grid)
+            Ok((grid, tiled_image_for_grid(image, config, grid)?))
         }
         TilingMode::DynamicAnyres => {
             let grid = select_best_grid(
@@ -524,7 +737,7 @@ fn tile_image(
                 config.tiling.max_tiles,
                 &config.tiling.aspect_ratios,
             )?;
-            tiled_image_for_grid(image, config, grid)
+            Ok((grid, tiled_image_for_grid(image, config, grid)?))
         }
     }
 }
@@ -672,6 +885,204 @@ fn normalize(value: u8, channel: usize, config: &ImagePreprocessConfig) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn token_expansion_config() -> TokenExpansionConfig {
+        TokenExpansionConfig {
+            image_placeholder_token_id: 99,
+            image_token_id: 7,
+            tokens_per_tile: 2,
+            thumbnail_position: ThumbnailPosition::None,
+            row_separator_token_id: None,
+            column_separator_token_id: None,
+        }
+    }
+
+    #[test]
+    fn expands_single_untiled_image_placeholder() {
+        let config = token_expansion_config();
+        let tiles_per_image = [1];
+        let grids = [TileGrid {
+            columns: 1,
+            rows: 1,
+        }];
+
+        let expanded = expand_image_placeholders(
+            &[1, 99, 2],
+            ImageTilingSummary {
+                num_tiles: 1,
+                tiles_per_image: &tiles_per_image,
+                tile_grids: &grids,
+            },
+            &config,
+        )
+        .unwrap();
+
+        assert_eq!(expanded, [1, 7, 7, 2]);
+    }
+
+    #[test]
+    fn expands_single_image_local_tiles_in_row_major_order() {
+        let config = token_expansion_config();
+        let tiles_per_image = [6];
+        let grids = [TileGrid {
+            columns: 3,
+            rows: 2,
+        }];
+
+        let expanded = expand_image_placeholders(
+            &[99],
+            ImageTilingSummary {
+                num_tiles: 6,
+                tiles_per_image: &tiles_per_image,
+                tile_grids: &grids,
+            },
+            &config,
+        )
+        .unwrap();
+
+        assert_eq!(expanded, [7; 12]);
+    }
+
+    #[test]
+    fn expands_tiles_with_appended_global_thumbnail() {
+        let mut config = token_expansion_config();
+        config.thumbnail_position = ThumbnailPosition::Append;
+        config.column_separator_token_id = Some(8);
+        let tiles_per_image = [3];
+        let grids = [TileGrid {
+            columns: 2,
+            rows: 1,
+        }];
+
+        let expanded = expand_image_placeholders(
+            &[99],
+            ImageTilingSummary {
+                num_tiles: 3,
+                tiles_per_image: &tiles_per_image,
+                tile_grids: &grids,
+            },
+            &config,
+        )
+        .unwrap();
+
+        assert_eq!(expanded, [7, 7, 8, 7, 7, 7, 7]);
+    }
+
+    #[test]
+    fn inserts_column_and_row_separators_between_local_tiles() {
+        let mut config = token_expansion_config();
+        config.tokens_per_tile = 1;
+        config.thumbnail_position = ThumbnailPosition::Prepend;
+        config.column_separator_token_id = Some(8);
+        config.row_separator_token_id = Some(9);
+        let tiles_per_image = [5];
+        let grids = [TileGrid {
+            columns: 2,
+            rows: 2,
+        }];
+
+        let expanded = expand_image_placeholders(
+            &[99],
+            ImageTilingSummary {
+                num_tiles: 5,
+                tiles_per_image: &tiles_per_image,
+                tile_grids: &grids,
+            },
+            &config,
+        )
+        .unwrap();
+
+        assert_eq!(expanded, [7, 7, 8, 7, 9, 7, 8, 7]);
+    }
+
+    #[test]
+    fn matches_multiple_placeholders_to_images_in_prompt_order() {
+        let mut config = token_expansion_config();
+        config.tokens_per_tile = 1;
+        let tiles_per_image = [2, 3];
+        let grids = [
+            TileGrid {
+                columns: 2,
+                rows: 1,
+            },
+            TileGrid {
+                columns: 1,
+                rows: 3,
+            },
+        ];
+
+        let expanded = expand_image_placeholders(
+            &[10, 99, 11, 99, 12],
+            ImageTilingSummary {
+                num_tiles: 5,
+                tiles_per_image: &tiles_per_image,
+                tile_grids: &grids,
+            },
+            &config,
+        )
+        .unwrap();
+
+        assert_eq!(expanded, [10, 7, 7, 11, 7, 7, 7, 12]);
+    }
+
+    #[test]
+    fn rejects_inconsistent_token_expansion_inputs() {
+        let grids = [TileGrid {
+            columns: 2,
+            rows: 1,
+        }];
+
+        let mut config = token_expansion_config();
+        config.tokens_per_tile = 0;
+        let error = expand_image_placeholders(
+            &[99],
+            ImageTilingSummary {
+                num_tiles: 2,
+                tiles_per_image: &[2],
+                tile_grids: &grids,
+            },
+            &config,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("tokens_per_tile"));
+
+        config.tokens_per_tile = 1;
+        let error = expand_image_placeholders(
+            &[99, 99],
+            ImageTilingSummary {
+                num_tiles: 2,
+                tiles_per_image: &[2],
+                tile_grids: &grids,
+            },
+            &config,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("2 image placeholder"));
+
+        let error = expand_image_placeholders(
+            &[99],
+            ImageTilingSummary {
+                num_tiles: 3,
+                tiles_per_image: &[2],
+                tile_grids: &grids,
+            },
+            &config,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("reports 3 total tile"));
+
+        let error = expand_image_placeholders(
+            &[99],
+            ImageTilingSummary {
+                num_tiles: 1,
+                tiles_per_image: &[1],
+                tile_grids: &grids,
+            },
+            &config,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("require 2"));
+    }
 
     #[test]
     fn bicubic_shortest_edge_resize_center_crops_to_target_dimensions() {
@@ -886,6 +1297,19 @@ preprocessing:
         assert_eq!(tensor.shape, [2, 3, 2, 2]);
         assert_eq!(tensor.num_tiles, 2);
         assert_eq!(tensor.tiles_per_image, [1, 1]);
+        assert_eq!(
+            tensor.tile_grids,
+            [
+                TileGrid {
+                    columns: 1,
+                    rows: 1
+                },
+                TileGrid {
+                    columns: 1,
+                    rows: 1
+                }
+            ]
+        );
         assert_eq!(tensor.original_sizes, [(3, 2), (2, 3)]);
         assert_eq!(tensor.data.len(), 2 * 3 * 2 * 2);
     }
@@ -908,6 +1332,13 @@ preprocessing:
         assert_eq!(tensor.shape, [7, 3, 2, 2]);
         assert_eq!(tensor.num_tiles, 7);
         assert_eq!(tensor.tiles_per_image, [7]);
+        assert_eq!(
+            tensor.tile_grids,
+            [TileGrid {
+                columns: 3,
+                rows: 2
+            }]
+        );
         assert_eq!(tensor.data.len(), 7 * 3 * 2 * 2);
         assert_eq!(tensor.tile_data(0).unwrap().len(), 3 * 2 * 2);
         assert_eq!(tensor.tile_data(6).unwrap().len(), 3 * 2 * 2);
@@ -966,5 +1397,12 @@ preprocessing:
         assert_eq!(tensor.shape, [5, 3, 2, 2]);
         assert_eq!(tensor.num_tiles, 5);
         assert_eq!(tensor.tiles_per_image, [5]);
+        assert_eq!(
+            tensor.tile_grids,
+            [TileGrid {
+                columns: 2,
+                rows: 2
+            }]
+        );
     }
 }
