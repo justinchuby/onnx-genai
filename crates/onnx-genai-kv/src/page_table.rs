@@ -105,6 +105,8 @@ impl KvQuantConfig {
             .quantization_tolerance
             .as_ref()
             .and_then(|tolerance| tolerance.value.as_ref());
+        validate_quant_axis(key_tolerance)?;
+        validate_quant_axis(value_tolerance)?;
         let key_dtype = component_default(key_tolerance, native_dtype)?;
         let value_dtype = component_default(value_tolerance, native_dtype)?;
         let mut config = Self {
@@ -148,6 +150,25 @@ impl KvQuantConfig {
             KvKind::Key => layer.key,
             KvKind::Value => layer.value,
         }
+    }
+}
+
+/// Validate a component's declared `quantization_axis`.
+///
+/// Only per-token quantization (one scale per token, computed across `head_dim`)
+/// can satisfy the append invariant that previously-stored tokens are never
+/// requantized. Per-channel quantization derives each scale across the token
+/// axis, so appending a new token would change the scale and force a rewrite of
+/// every stored token; it is therefore rejected explicitly rather than silently
+/// ignored. `None` defaults to per-token.
+fn validate_quant_axis(tolerance: Option<&KvComponentTolerance>) -> Result<(), KvError> {
+    let Some(axis) = tolerance.and_then(|component| component.quantization_axis.as_deref()) else {
+        return Ok(());
+    };
+    let normalized = axis.trim().to_ascii_lowercase().replace('-', "_");
+    match normalized.as_str() {
+        "per_token" | "token" => Ok(()),
+        _ => Err(KvError::UnsupportedQuantizationAxis(axis.to_owned())),
     }
 }
 
@@ -265,10 +286,14 @@ pub struct Page {
     pub quantized_data: Vec<i8>,
     /// Compact FP8 bit patterns.
     pub fp8_data: Vec<u8>,
-    /// Per-layer, per-K/V, per-head dequantization scales.
+    /// Per-layer, per-K/V, per-head, per-token dequantization scales.
+    ///
+    /// For a quantized component the scales are laid out `[head, token]`, so the
+    /// scale for `(head, token_offset)` lives at
+    /// `scale_offset + head * page_size + token_offset`. Each token owns its own
+    /// scale, which is what lets appends quantize a single token without ever
+    /// requantizing previously-stored tokens.
     pub quant_scales: Vec<f32>,
-    /// First quantization scale, retained for compatibility with int8 callers.
-    pub quant_scale: f32,
     storage_layout: Vec<ComponentStorage>,
 }
 
@@ -309,11 +334,11 @@ impl Page {
                         KvDType::F32 => data_len += component_len,
                         KvDType::Int8 => {
                             quantized_len += component_len;
-                            scale_len += config.num_kv_heads;
+                            scale_len += config.num_kv_heads * config.page_size;
                         }
                         KvDType::Fp8E4M3Fn | KvDType::Fp8E5M2 => {
                             fp8_len += component_len;
-                            scale_len += config.num_kv_heads;
+                            scale_len += config.num_kv_heads * config.page_size;
                         }
                     }
                 }
@@ -330,13 +355,11 @@ impl Page {
             fp8_data: vec![0; fp8_len],
             quant_scales: vec![1.0; scale_len],
             storage_layout,
-            quant_scale: 1.0,
         }
     }
 
     pub fn reset_storage(&mut self, _config: Option<PageTensorConfig>) {
         self.filled = 0;
-        self.quant_scale = 1.0;
         self.data.fill(0.0);
         self.quantized_data.fill(0);
         self.fp8_data.fill(0);
@@ -347,16 +370,20 @@ impl Page {
         let component_len = component_len(config);
         let component = offset / component_len;
         let component_offset = offset % component_len;
-        let head = component_offset / (config.page_size * config.head_dim);
+        let head_len = config.page_size * config.head_dim;
+        let head = component_offset / head_len;
+        let token = (component_offset % head_len) / config.head_dim;
         let storage = self.storage_layout[component];
         match storage.dtype {
             KvDType::F32 => self.data[storage.data_offset + component_offset],
             KvDType::Int8 => {
-                let scale = self.quant_scales[storage.scale_offset + head];
+                let scale =
+                    self.quant_scales[storage.scale_offset + head * config.page_size + token];
                 f32::from(self.quantized_data[storage.quantized_offset + component_offset]) * scale
             }
             KvDType::Fp8E4M3Fn | KvDType::Fp8E5M2 => {
-                let scale = self.quant_scales[storage.scale_offset + head];
+                let scale =
+                    self.quant_scales[storage.scale_offset + head * config.page_size + token];
                 decode_fp8(
                     self.fp8_data[storage.fp8_offset + component_offset],
                     storage.dtype.fp8_format().expect("fp8 dtype"),
@@ -365,78 +392,58 @@ impl Page {
         }
     }
 
-    pub fn dequantized(&self, config: PageTensorConfig) -> Vec<f32> {
-        let mut values = vec![0.0; config.f32_len_per_page()];
-        for component in 0..self.storage_layout.len() {
-            let component_len = component_len(config);
-            let logical_offset = component * component_len;
-            for component_offset in 0..component_len {
-                values[logical_offset + component_offset] =
-                    self.value_at(config, logical_offset + component_offset);
-            }
-        }
-        values
-    }
-
-    pub fn store_from_f32(&mut self, config: PageTensorConfig, values: &[f32]) {
-        assert_eq!(values.len(), config.f32_len_per_page());
-        let component_len = component_len(config);
+    /// Store one token's `head_dim` values for a single `(component, head)` slot.
+    ///
+    /// `component` is the flat K/V component index `layer * 2 + kv` (`0 = key`,
+    /// `1 = value`). For quantized components this computes a per-`(head, token)`
+    /// scale from *only* this token's values and writes only this token's bytes,
+    /// so previously-stored tokens in the page are never dequantized or
+    /// requantized. This bounds the quantization error to a single round-trip per
+    /// KV write regardless of how full the page is.
+    pub fn write_head_token(
+        &mut self,
+        config: PageTensorConfig,
+        component: usize,
+        head: usize,
+        token_offset: usize,
+        values: &[f32],
+    ) {
+        debug_assert_eq!(values.len(), config.head_dim);
+        let storage = self.storage_layout[component];
         let head_len = config.page_size * config.head_dim;
-        for (component, storage) in self.storage_layout.iter().copied().enumerate() {
-            let logical_offset = component * component_len;
-            if storage.dtype == KvDType::F32 {
-                self.data[storage.data_offset..storage.data_offset + component_len]
-                    .copy_from_slice(&values[logical_offset..logical_offset + component_len]);
-                continue;
+        let within = head * head_len + token_offset * config.head_dim;
+        let head_dim = config.head_dim;
+        match storage.dtype {
+            KvDType::F32 => {
+                let offset = storage.data_offset + within;
+                self.data[offset..offset + head_dim].copy_from_slice(values);
             }
-            for head in 0..config.num_kv_heads {
-                let logical_head_offset = logical_offset + head * head_len;
-                let head_values = &values[logical_head_offset..logical_head_offset + head_len];
-                let max_abs = head_values
-                    .iter()
-                    .filter(|value| value.is_finite())
-                    .fold(0.0_f32, |acc, value| acc.max(value.abs()));
-                let denominator = match storage.dtype {
-                    KvDType::Int8 => 127.0,
-                    KvDType::Fp8E4M3Fn | KvDType::Fp8E5M2 => {
-                        storage.dtype.fp8_format().expect("fp8 dtype").max_finite()
-                    }
-                    KvDType::F32 => unreachable!(),
-                };
-                let scale = if max_abs == 0.0 {
-                    1.0
-                } else {
-                    max_abs / denominator
-                };
-                self.quant_scales[storage.scale_offset + head] = scale;
-                let component_head_offset = head * head_len;
-                match storage.dtype {
-                    KvDType::Int8 => {
-                        let output_offset = storage.quantized_offset + component_head_offset;
-                        for (output, value) in self.quantized_data
-                            [output_offset..output_offset + head_len]
-                            .iter_mut()
-                            .zip(head_values)
-                        {
-                            *output = (value / scale).round().clamp(-127.0, 127.0) as i8;
-                        }
-                    }
-                    KvDType::Fp8E4M3Fn | KvDType::Fp8E5M2 => {
-                        let output_offset = storage.fp8_offset + component_head_offset;
-                        let format = storage.dtype.fp8_format().expect("fp8 dtype");
-                        for (output, value) in self.fp8_data
-                            [output_offset..output_offset + head_len]
-                            .iter_mut()
-                            .zip(head_values)
-                        {
-                            *output = encode_fp8(*value / scale, format);
-                        }
-                    }
-                    KvDType::F32 => unreachable!(),
+            KvDType::Int8 => {
+                let scale = quant_scale(values, 127.0);
+                self.quant_scales[storage.scale_offset + head * config.page_size + token_offset] =
+                    scale;
+                let offset = storage.quantized_offset + within;
+                for (output, value) in self.quantized_data[offset..offset + head_dim]
+                    .iter_mut()
+                    .zip(values)
+                {
+                    *output = (value / scale).round().clamp(-127.0, 127.0) as i8;
+                }
+            }
+            KvDType::Fp8E4M3Fn | KvDType::Fp8E5M2 => {
+                let format = storage.dtype.fp8_format().expect("fp8 dtype");
+                let scale = quant_scale(values, format.max_finite());
+                self.quant_scales[storage.scale_offset + head * config.page_size + token_offset] =
+                    scale;
+                let offset = storage.fp8_offset + within;
+                for (output, value) in self.fp8_data[offset..offset + head_dim]
+                    .iter_mut()
+                    .zip(values)
+                {
+                    *output = encode_fp8(value / scale, format);
                 }
             }
         }
-        self.quant_scale = self.quant_scales.first().copied().unwrap_or(1.0);
     }
 
     pub fn has_quantized_storage(&self) -> bool {
@@ -448,6 +455,21 @@ impl Page {
 
 const fn component_len(config: PageTensorConfig) -> usize {
     config.num_kv_heads * config.page_size * config.head_dim
+}
+
+/// Symmetric quantization scale for one token/head slice: the max absolute
+/// finite value divided by the format's positive dynamic range. Returns `1.0`
+/// for an all-zero slice so decode is a no-op.
+fn quant_scale(values: &[f32], denominator: f32) -> f32 {
+    let max_abs = values
+        .iter()
+        .filter(|value| value.is_finite())
+        .fold(0.0_f32, |acc, value| acc.max(value.abs()));
+    if max_abs == 0.0 {
+        1.0
+    } else {
+        max_abs / denominator
+    }
 }
 
 /// The page table manages the mapping from logical sequences to physical pages.

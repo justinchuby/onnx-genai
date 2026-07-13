@@ -151,38 +151,14 @@ impl PagedKvCache {
                 .pages
                 .get_mut(&page_id)
                 .ok_or(KvError::PageNotFound(page_id))?;
-            let has_quantized_storage = page.has_quantized_storage();
-            let mut values = if has_quantized_storage {
-                page.dequantized(config)
-            } else {
-                Vec::new()
-            };
             for (layer_idx, layer) in layers.iter().enumerate() {
                 for head in 0..config.num_kv_heads {
-                    for dim in 0..config.head_dim {
-                        let src = head * config.head_dim + dim;
-                        let k_offset = (((layer_idx * 2) * config.num_kv_heads + head)
-                            * config.page_size
-                            + token_offset)
-                            * config.head_dim
-                            + dim;
-                        let v_offset = (((layer_idx * 2 + 1) * config.num_kv_heads + head)
-                            * config.page_size
-                            + token_offset)
-                            * config.head_dim
-                            + dim;
-                        if has_quantized_storage {
-                            values[k_offset] = layer.key[src];
-                            values[v_offset] = layer.value[src];
-                        } else {
-                            page.data[k_offset] = layer.key[src];
-                            page.data[v_offset] = layer.value[src];
-                        }
-                    }
+                    let src = head * config.head_dim;
+                    let key = &layer.key[src..src + config.head_dim];
+                    let value = &layer.value[src..src + config.head_dim];
+                    page.write_head_token(config, layer_idx * 2, head, token_offset, key);
+                    page.write_head_token(config, layer_idx * 2 + 1, head, token_offset, value);
                 }
-            }
-            if has_quantized_storage {
-                page.store_from_f32(config, &values);
             }
             page.filled = page.filled.max(token_offset + 1);
         }
@@ -442,7 +418,6 @@ impl PagedKvCache {
                     old.quantized_data.clone(),
                     old.fp8_data.clone(),
                     old.quant_scales.clone(),
-                    old.quant_scale,
                     old.filled,
                 )
             };
@@ -451,8 +426,7 @@ impl PagedKvCache {
                 new_page.quantized_data = old_storage.1;
                 new_page.fp8_data = old_storage.2;
                 new_page.quant_scales = old_storage.3;
-                new_page.quant_scale = old_storage.4;
-                new_page.filled = old_storage.5;
+                new_page.filled = old_storage.4;
             }
             self.page_table.replace_page(seq, page_index, new_page_id);
             self.page_table.free(page_id);
@@ -1045,7 +1019,7 @@ mod tests {
                         layers: vec![1],
                         min_precision: "fp16".to_owned(),
                     }]),
-                    quantization_axis: Some("per_channel".to_owned()),
+                    quantization_axis: Some("per_token".to_owned()),
                 }),
                 value: Some(KvComponentTolerance {
                     default: None,
@@ -1153,6 +1127,175 @@ mod tests {
         let expected_value = [10.0, 10.2, 10.4, 10.6, 10.8, 11.0, 11.2, 11.4];
         assert_close(&materialized.layers[0].key, &expected_key, 0.05);
         assert_close(&materialized.layers[0].value, &expected_value, 0.05);
+    }
+
+    fn full_page_config(dtype: KvDType, page_size: usize) -> PageTensorConfig {
+        PageTensorConfig {
+            num_layers: 1,
+            num_kv_heads: 1,
+            head_dim: 4,
+            page_size,
+            dtype,
+        }
+    }
+
+    /// Sixteen tokens whose per-token magnitude spans six orders of magnitude.
+    /// Token 0 deliberately carries `1.061` in its first channel — the value Chew
+    /// showed drifting under the old dequantize-whole-page / requantize-whole-page
+    /// append. With a single page-wide scale driven by the largest token, token 0
+    /// collapses toward zero (~100% error); per-token scales keep it exact.
+    fn spread_magnitude_tokens() -> Vec<Vec<(Vec<f32>, Vec<f32>)>> {
+        (0..16)
+            .map(|i| {
+                let magnitude = if i == 0 { 1.061 } else { 2.0_f32.powi(i + 6) };
+                let key = vec![
+                    magnitude,
+                    magnitude * 0.9,
+                    -magnitude * 0.8,
+                    magnitude * 0.95,
+                ];
+                let value = vec![
+                    magnitude * 1.1,
+                    -magnitude,
+                    magnitude * 0.85,
+                    magnitude * 0.7,
+                ];
+                vec![(key, value)]
+            })
+            .collect()
+    }
+
+    fn assert_relative_error_bounded(actual: &[f32], expected: &[f32], max_relative: f32) {
+        assert_eq!(actual.len(), expected.len());
+        for (idx, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+            let relative = if *expected == 0.0 {
+                actual.abs()
+            } else {
+                (actual - expected).abs() / expected.abs()
+            };
+            assert!(
+                relative <= max_relative,
+                "idx {idx}: actual {actual}, expected {expected}, relative {relative}, bound {max_relative}"
+            );
+        }
+    }
+
+    /// Regression test for the fp8 page-scaling bug: filling a whole multi-token
+    /// page must not requantize tokens that were already stored. This is the test
+    /// the previous `page_size = 1` fp8 tests could never exercise.
+    #[test]
+    fn fp8_full_page_never_requantizes_previously_stored_tokens() {
+        let config = full_page_config(KvDType::Fp8E4M3Fn, 16);
+        let mut cache = PagedKvCache::new_with_tensor_config(config, 2);
+        let seq = cache.create_sequence();
+        let tokens = spread_magnitude_tokens();
+        for token in &tokens {
+            cache.append_token_kv(seq, &borrowed_layers(token)).unwrap();
+        }
+        // A single physical page holds the entire sequence.
+        assert_eq!(cache.page_table.get_sequence(seq).unwrap().len(), 1);
+        let materialized = cache.materialize_sequence(seq).unwrap();
+
+        // Every entry stays within a single E4M3 round-trip (3 mantissa bits ->
+        // <=6.25% per normal value); the old code drove token 0 to ~33% error.
+        let mut expected_key = Vec::new();
+        let mut expected_value = Vec::new();
+        for token in &tokens {
+            expected_key.extend_from_slice(&token[0].0);
+            expected_value.extend_from_slice(&token[0].1);
+        }
+        assert_relative_error_bounded(&materialized.layers[0].key, &expected_key, 0.07);
+        assert_relative_error_bounded(&materialized.layers[0].value, &expected_value, 0.07);
+
+        // Token 0's `1.061` is preserved, not the 1.41143 the old design produced.
+        assert!((materialized.layers[0].key[0] - 1.061).abs() < 0.07);
+
+        // Stronger invariant: a stored token is byte-identical whether or not
+        // later tokens were appended, proving stored data is never touched again.
+        let mut isolated = PagedKvCache::new_with_tensor_config(config, 2);
+        let iso_seq = isolated.create_sequence();
+        isolated
+            .append_token_kv(iso_seq, &borrowed_layers(&tokens[0]))
+            .unwrap();
+        let iso = isolated.materialize_sequence(iso_seq).unwrap();
+        assert_eq!(&materialized.layers[0].key[0..4], iso.layers[0].key.as_slice());
+        assert_eq!(
+            &materialized.layers[0].value[0..4],
+            iso.layers[0].value.as_slice()
+        );
+    }
+
+    /// Same invariant for the int8 path: a full multi-token page keeps every
+    /// entry within its per-token error bound and never rewrites stored tokens.
+    #[test]
+    fn int8_full_page_error_is_bounded_and_stable() {
+        let config = full_page_config(KvDType::Int8, 8);
+        let mut cache = PagedKvCache::new_with_tensor_config(config, 2);
+        let seq = cache.create_sequence();
+        let tokens: Vec<_> = (0..8)
+            .map(|i| {
+                let magnitude = if i == 0 { 1.0 } else { 2.0_f32.powi(i + 8) };
+                vec![(
+                    vec![magnitude, magnitude * 0.9, -magnitude * 0.8, magnitude * 0.95],
+                    vec![magnitude * 1.1, -magnitude, magnitude * 0.85, magnitude * 0.7],
+                )]
+            })
+            .collect();
+        for token in &tokens {
+            cache.append_token_kv(seq, &borrowed_layers(token)).unwrap();
+        }
+        assert_eq!(cache.page_table.get_sequence(seq).unwrap().len(), 1);
+        let materialized = cache.materialize_sequence(seq).unwrap();
+
+        let mut expected_key = Vec::new();
+        for token in &tokens {
+            expected_key.extend_from_slice(&token[0].0);
+        }
+        // int8 keeps ~7 bits of precision per token -> <1% per entry.
+        assert_relative_error_bounded(&materialized.layers[0].key, &expected_key, 0.01);
+
+        let mut isolated = PagedKvCache::new_with_tensor_config(config, 2);
+        let iso_seq = isolated.create_sequence();
+        isolated
+            .append_token_kv(iso_seq, &borrowed_layers(&tokens[0]))
+            .unwrap();
+        let iso = isolated.materialize_sequence(iso_seq).unwrap();
+        assert_eq!(&materialized.layers[0].key[0..4], iso.layers[0].key.as_slice());
+    }
+
+    #[test]
+    fn metadata_rejects_per_channel_quantization_axis() {
+        let spec = KvCacheSpec {
+            native_dtype: Some("float8_e4m3fn".to_owned()),
+            quantization_tolerance: Some(KvQuantTolerance {
+                key: Some(KvComponentTolerance {
+                    default: None,
+                    per_layer: None,
+                    quantization_axis: Some("per_channel".to_owned()),
+                }),
+                value: None,
+            }),
+            sensitive_layers: None,
+            operations: None,
+        };
+        assert!(matches!(
+            KvQuantConfig::from_metadata(&spec, 2),
+            Err(KvError::UnsupportedQuantizationAxis(axis)) if axis == "per_channel"
+        ));
+
+        // per_token (and an unspecified axis) remain accepted.
+        let per_token = KvCacheSpec {
+            quantization_tolerance: Some(KvQuantTolerance {
+                key: Some(KvComponentTolerance {
+                    default: None,
+                    per_layer: None,
+                    quantization_axis: Some("per_token".to_owned()),
+                }),
+                value: None,
+            }),
+            ..spec
+        };
+        assert!(KvQuantConfig::from_metadata(&per_token, 2).is_ok());
     }
 
     #[test]

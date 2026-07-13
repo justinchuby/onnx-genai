@@ -98,6 +98,11 @@ pub enum KvError {
     InvalidTensorShape(&'static str),
     #[error("Unsupported KV dtype: {0}")]
     UnsupportedKvDType(String),
+    #[error(
+        "Unsupported KV quantization axis '{0}': only per-token quantization preserves the \
+         append-without-requantize invariant"
+    )]
+    UnsupportedQuantizationAxis(String),
     #[error("Invalid KV layer {layer} for model with {num_layers} layers")]
     InvalidKvLayer { layer: i32, num_layers: usize },
     #[error("Invalid KV quantization config: {0}")]
