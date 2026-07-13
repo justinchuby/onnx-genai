@@ -909,7 +909,7 @@ fn append_metal_execution_provider(
     env: &Environment,
     session_options: *mut onnx_genai_ort_sys::OrtSessionOptions,
 ) -> Result<()> {
-    const REGISTRATION_NAME: &str = "MetalEP";
+    const REGISTRATION_NAME: &str = "MLXExecutionProvider";
 
     let plugin_path = metal_plugin_path()?;
     env.register_execution_provider_library(REGISTRATION_NAME, &plugin_path)?;
@@ -935,7 +935,7 @@ fn append_metal_execution_provider(
     })?;
     if ep_devices.is_null() {
         return Err(OrtError::InvalidArgument(
-            "MetalEP registered but ONNX Runtime returned no execution provider devices".into(),
+            "MLXExecutionProvider registered but ONNX Runtime returned no execution provider devices".into(),
         ));
     }
 
@@ -957,7 +957,7 @@ fn append_metal_execution_provider(
     }
     if selected.is_empty() {
         return Err(OrtError::InvalidArgument(
-            "MetalEP device not found after registering the onnxruntime-mlx plugin".into(),
+            "MLXExecutionProvider device not found after registering the onnxruntime-mlx plugin".into(),
         ));
     }
 
