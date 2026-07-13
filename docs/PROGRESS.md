@@ -52,7 +52,18 @@ Reviewed multi-agent batch closing several §-gaps (each committed + reviewed):
 - **§40 sliding-window attention** (Leon): contiguous single-window SWA was already present; added **attention-sink tokens (StreamingLLM §40.4)** end-to-end (metadata `sink_tokens`, KV sink-aware windowing, engine token-exact `[0,sink)∪[window_start,len)`). Reviewed 🟢 (Chew): boundary math exact, discontinuous-position paths genuinely bail rather than emit wrong output. Per-layer hybrid (§40.3) + discontinuous `position_ids` (§40.8) declined pending Mobius/ORT.
 - **§35 multimodal token-expansion**: preprocess `expand_image_placeholders` library (Sapper) — thumbnail token/pixel order made authoritative from tensor layout after review (Deckard). Engine count-based expansion + server tile-count seam wired (#14, Batty); multi-image over-count + `tokens_per_tile>0`/empty guards added after review (Leon). Single-image path complete; multi-image bails cleanly (needs per-image tile counts).
 
-_Follow-ups:_ mobius must emit `PipelineSpec.vision` (`image_placeholder_token_id`/`tokens_per_tile`) for real VLM export; then Gemma4 E2B/12B multimodal + Gemma4 speculative-draft testing. SWA hardening nits (Chew): first-activation `debug_assert`, rewind-into-sink symmetry, draft `sink_tokens` under spec decode.
+_Follow-ups:_ SWA hardening nits (Chew): first-activation `debug_assert`, rewind-into-sink symmetry, draft `sink_tokens` under spec decode.
+
+### Gemma4 multimodal export — scoped (2026-07-13, Sapper); NOT a small patch
+
+Scoped the "export Gemma4 E2B/12B via Mobius and smoke-test through onnx-genai" ask. It is **blocked on major runtime + Mobius work**, not a metadata one-liner:
+
+- **Runtime VLM contract today:** exactly one ONNX input `pixel_values` (Float32, rank-4 NCHW/NHWC RGB); server supplies `<component>.pixel_values` + tile count; prompt must contain exactly one placeholder (image URL parts do not auto-insert it yet — text must contain `<|image|>`); placeholder expands to `tokens_per_tile × num_tiles` before KV alloc; multi-image rejected. (`server/state.rs`, `server/image_input.rs`, `engine/pipeline.rs:301`.)
+- **Concrete Gemma4 IDs:** soft-token placeholder id `258880` (`<|image|>`), `tokens_per_tile = 280` (E2B fixed; 12B advertises 280 but merged-patch count can vary). `255999` is BOI `<|image>`, **not** the repeated soft-token.
+- **Why metadata-alone fails:** Gemma4 vision graphs take **rank-3 pre-patchified** tensors (`[B,N,768]` E2B / `[B,N,6912]` 12B) + require `pixel_position_ids`, dtype f16 (server forces Float32), and Gemma4 uses a **separate embedding model → `inputs_embeds`** whereas our decode loop expects token-ID inputs and runs no non-decoder component per step.
+- **Mobius gap:** `--runtime onnx-genai` exists only in open PR #398 (`541b8a7`), which emits decoder-only attn/KV metadata — **no `pipeline`, preprocessing, `pipeline.vision`, or tokenizer copy**.
+- **Speculative model:** Gemma4 `*-assistant` are 4-layer **MTP** proposers consuming target hidden states + shared KV — **not** ordinary causal drafts; cannot use the `draft_model` path. Needs a dedicated Gemma4-assistant proposer.
+- **Recommended sequencing:** (1) multi-tensor + rank-3 vision ingestion incl. `pixel_position_ids`; (2) embedding→decoder orchestration (or a Mobius fused decoder taking `input_ids`+`image_features`); (3) extend PR #398 emitter with pipeline topology + tokenizer copy + E2B vision metadata; (4) validate `--no-weights` first; (5) full E2B export on high-mem CUDA host; (6) smoke-test single image + `<|image|>Describe this image.`; (7) 12B after variable merged-patch support (~25 GB); (8) Gemma4-assistant proposer + spec integration.
 
 ## Notable design changes / decisions to record
 
