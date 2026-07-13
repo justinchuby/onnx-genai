@@ -44,3 +44,14 @@ Batched-driver DoS hardening is canonical: admission is bounded by `max_pending`
 
 ## 2026-07-13T18:30:00Z — Review/fix batch
 - Owned Zhora's reviewer-lockout security follow-up and landed `2e67806`, gating `/v1/debug/*` default-off and redacting session identifiers.
+
+
+## 2026-07-20T00:00:00Z — Embeddings empty-model default fix (M2 follow-up)
+
+- Commit: 561ee1a | Issue: #9 follow-up
+- Trigger: Chew's 🟡 M2 review (Zhora locked out per reviewer protocol).
+- Removed unconditional `if request.model.trim().is_empty() { return Err(...) }` guard from `validate_embedding_request` in `crates/onnx-genai-server/src/routes.rs`.
+- Added two tests: `empty_model_field_falls_back_to_default_on_embeddings` and `unknown_model_returns_404_on_embeddings_endpoint`.
+- Routing parity now holds across all four inference endpoints.
+- §37 / Issue #9 epic fully complete.
+- Next: §34 router epic (R1/R2/R3) has kicked off.
