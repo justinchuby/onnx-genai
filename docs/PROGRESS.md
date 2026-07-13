@@ -38,7 +38,7 @@ _Last updated: 2026-07-13_
 
 ## Open backlog (GitHub issues)
 
-- **#7** `/v1/embeddings` ✅ (wired to `Engine::embed_with_options` via `DriverCommand::Embed`) · **#8** logprobs · **#9** model lifecycle/multi-model · **#13** debug endpoints + Perfetto · **#15** fp8 KV quant ✅ (selectable fp8/int8 host-mirror storage) · **#16** image diffusion.
+- **#7** `/v1/embeddings` ✅ (wired to `Engine::embed_with_options` via `DriverCommand::Embed`) · **#8** logprobs ✅ (opt-in per-token + top_logprobs, chat+completions, streaming + speculative paths) · **#9** model lifecycle/multi-model · **#13** debug endpoints + Perfetto · **#15** fp8 KV quant ✅ (selectable fp8/int8 host-mirror storage) · **#16** image diffusion.
 - Closed: **#2** server split · **#3** decode ownership · **#4** FIM endpoint · **#5** benchmarks · **#10** EAGLE-3 proposer · **#11** audio log-mel preprocessing · **#12** audio input · **#14** vision preprocessing/tiling.
 
 ## Recently completed (this session)
