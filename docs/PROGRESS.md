@@ -23,13 +23,13 @@ _Last updated: 2026-07-12_
 | 24 | Sampling policy | ✅ Done | full sampler suite; **real RNG fixed 2026-07-12** |
 | 25 | Extensibility | ✅ Done | DecodeBackend/SpeculativeProposer/Sampler traits |
 | 26 | Multi-agent serving | ✅ Done | batched continuous serving (~6× throughput) |
-| 27 | Multi-token speculative | 🟡 Partial | draft + prompt-lookup + MTP ✅; EAGLE-3 = #10 |
-| 28 | vLLM speculator compat | 🟡 Partial | config auto-discovery ✅; EAGLE-3 proposer = #10 |
+| 27 | Multi-token speculative | ✅ Done | draft + prompt-lookup + MTP + EAGLE-3 |
+| 28 | vLLM speculator compat | ✅ Done | config auto-discovery + EAGLE-3 proposer |
 | 29 | Language diffusion | ❌ Missing | large |
 | 31 | Observability | 🟡 Partial | `/metrics` + `/v1/status` + trace ids ✅; Perfetto/OTLP/debug = #13 |
 | 32 | Metrics API | ✅ Done | |
 | 34 | Cluster/session router | ❌ Missing | |
-| 35 | Native preprocessing | 🟡 Partial | `onnx-genai-preprocess` crate: image (bicubic/CLIP) + audio log-mel ✅; audio wired ✅ (#12); vision tiling remainder = #14 |
+| 35 | Native preprocessing | ✅ Done | `onnx-genai-preprocess`: image (bicubic/CLIP + tiling none/fixed_grid/dynamic_anyres) + audio log-mel; audio wired (#12). Multi-tile prompt token-expansion = documented follow-up |
 | 36 | Backpressure/lifecycle | 🟡 Partial | admission cap + 429 ✅; queue-depth config pending |
 | 37 | Model lifecycle mgmt | ❌ Missing | single model at startup; #9 |
 | 38 | Distributed KV connector | ❌ Missing | local tiered KV only |
@@ -38,8 +38,8 @@ _Last updated: 2026-07-12_
 
 ## Open backlog (GitHub issues)
 
-- **#7** `/v1/embeddings` · **#8** logprobs · **#9** model lifecycle/multi-model · **#10** EAGLE-3 proposer · **#13** debug endpoints + Perfetto · **#14** vision preprocessing (tiling/anyres remainder) · **#15** fp8 KV quant · **#16** image diffusion.
-- Closed: **#2** server split · **#3** decode ownership · **#4** FIM endpoint · **#5** benchmarks · **#11** audio log-mel preprocessing · **#12** audio input.
+- **#7** `/v1/embeddings` · **#8** logprobs · **#9** model lifecycle/multi-model · **#13** debug endpoints + Perfetto · **#15** fp8 KV quant · **#16** image diffusion.
+- Closed: **#2** server split · **#3** decode ownership · **#4** FIM endpoint · **#5** benchmarks · **#10** EAGLE-3 proposer · **#11** audio log-mel preprocessing · **#12** audio input · **#14** vision preprocessing/tiling.
 
 ## Recently completed (this session)
 
@@ -51,3 +51,4 @@ Complete runtime built from scaffold + published: generation (greedy/speculative
 - Real-model exact-equality tests use `intra_op_threads=1` (ORT FP determinism).
 - Paged/radix attention (§39.4 Option C): Mobius now grows block-table KV via standard ONNX ops (ScatterND + Gather + opset-24 Attention) — draft PR onnxruntime/mobius#395. Same op path supports vLLM PagedAttention AND SGLang RadixAttention (share physical pages via block_table). Runtime-side wiring to consume paged KV is the next step once the PR lands.
 - Audio & vision quality gated on real Mobius model packages (Whisper / CLIP+decoder).
+- **Benchmarking (§ new):** `onnx-genai-bench` cross-runtime harness (`compare.rs` / `scripts/compare_runtimes.sh`) measures TTFT + decode tok/s vs Ollama (llama.cpp) + LM Studio over the OpenAI API. First baseline (fp32 ONNX vs Q4/Q8 GGUF) showed us ~72–83% slower on decode — but that is NOT 1:1 (quant mismatch). True 1:1 via `mobius build-gguf` (preserves GGUF quant as ONNX MatMulNBits, same weights both sides) in progress. Goal: beat llama.cpp + LM Studio. Levers if still behind: IoBinding/KV reuse, thread config, MatMulNBits kernel/EP, prefill graph.
