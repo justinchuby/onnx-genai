@@ -122,40 +122,126 @@ pub enum KvCacheLocation {
     NotFound,
 }
 
-/// Opaque handle to raw KV tensor data owned/produced by the engine.
+/// Element type of the f32-materialized KV payload carried by the connector.
 ///
-/// **K1 placeholder.** The real handle (device pointer + layout + dtype, or an
-/// ORT/engine tensor view) is intentionally *not* modelled here to keep this
-/// crate free of ORT / engine dependencies. Milestone "K2" (concrete backends)
-/// will flesh this out — e.g. replace it with a device-memory descriptor or a
-/// borrowed tensor view — without changing the trait surface.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct KvTensorRef {
-    /// Number of bytes the referenced KV occupies. Enough for size accounting /
-    /// eviction math in K1; the actual data handle lands in K2.
-    pub size_bytes: usize,
+/// Only [`KvPayloadDtype::F32`] is produced today; the field makes the on-wire
+/// contract explicit and lets a future revision carry compressed/quantized host
+/// data (e.g. FP8) without changing the trait surface. The `kv` crate treats the
+/// payload purely as typed host data — it never interprets its *meaning*.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum KvPayloadDtype {
+    /// 32-bit IEEE-754 host floats (the only format materialized today).
+    F32,
+}
+
+/// Real, owned host KV bytes for one cached chunk (DESIGN §38.4, milestone K4).
+///
+/// This replaces the K1–K3 size-only placeholder: a connector now carries the
+/// *actual* KV so it can be reused across sessions/nodes. It is deliberately
+/// **opaque in meaning** — the `kv` crate never interprets these floats as
+/// attention state; it only stores, sizes, and round-trips them. The engine
+/// owns the semantics (which model, which layers, RoPE positions, etc.).
+///
+/// ## Byte-layout contract (must match [`crate::MaterializedLayerKv`])
+///
+/// - `layers[l].key` / `layers[l].value` are each a contiguous `f32` buffer of
+///   exactly `num_kv_heads * num_tokens * head_dim` elements.
+/// - The element for head `h`, chunk-relative token `t`, dim `d` lives at
+///   flat index `(h * num_tokens + t) * head_dim + d` — i.e. **head-major**
+///   `[num_kv_heads, num_tokens, head_dim]`, identical to
+///   [`crate::MaterializedLayerKv`] sliced to this chunk's token range. Token
+///   `t` corresponds to the chunk's `chunk_index * chunk_size + t`-th absolute
+///   sequence position.
+/// - `layers.len() == num_layers`; every layer shares the same dims.
+///
+/// This exact layout is what makes an extract→store→fetch→inject round-trip
+/// byte-identical to a full recompute (see the engine's K4 wiring), so it is a
+/// **correctness contract**, not just a memory convention.
+#[derive(Clone, Debug, PartialEq)]
+pub struct KvPayload {
+    /// Number of tokens this chunk's KV covers.
+    pub num_tokens: usize,
+    /// Number of transformer layers represented (`== layers.len()`).
+    pub num_layers: usize,
+    /// KV attention heads per layer.
+    pub num_kv_heads: usize,
+    /// Per-head dimension.
+    pub head_dim: usize,
+    /// Element type of every `key`/`value` buffer.
+    pub dtype: KvPayloadDtype,
+    /// Per-layer key/value host data (see the byte-layout contract above).
+    pub layers: Vec<KvLayerPayload>,
+}
+
+/// Per-layer key/value host buffers for a [`KvPayload`].
+///
+/// Both buffers use the head-major `[num_kv_heads, num_tokens, head_dim]` layout
+/// documented on [`KvPayload`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct KvLayerPayload {
+    pub key: Vec<f32>,
+    pub value: Vec<f32>,
+}
+
+impl KvPayload {
+    /// Number of `f32` elements expected in each per-layer key (or value)
+    /// buffer under the layout contract.
+    pub fn elements_per_layer(&self) -> usize {
+        self.num_kv_heads * self.num_tokens * self.head_dim
+    }
+
+    /// Total host bytes occupied by all key/value data. Used for honest size
+    /// accounting / eviction math in place of the old placeholder `size_bytes`.
+    pub fn byte_size(&self) -> usize {
+        let elem = match self.dtype {
+            KvPayloadDtype::F32 => std::mem::size_of::<f32>(),
+        };
+        self.layers
+            .iter()
+            .map(|layer| (layer.key.len() + layer.value.len()) * elem)
+            .sum()
+    }
+
+    /// Validate that the payload's buffers match its declared dimensions.
+    ///
+    /// Returns `false` when any layer buffer has the wrong length or the layer
+    /// count disagrees with `num_layers`, so backends can reject malformed data
+    /// instead of silently storing something that will corrupt output on fetch.
+    pub fn is_well_formed(&self) -> bool {
+        if self.layers.len() != self.num_layers {
+            return false;
+        }
+        let expected = self.elements_per_layer();
+        self.layers
+            .iter()
+            .all(|layer| layer.key.len() == expected && layer.value.len() == expected)
+    }
 }
 
 /// Data handed to a connector to store externally (DESIGN §38.4).
 #[derive(Clone, Debug)]
 pub struct KvStoreEntry {
     pub key: KvCacheKey,
-    /// Raw KV data (opaque handle; connector copies as needed). See
-    /// [`KvTensorRef`].
-    pub kv_data: KvTensorRef,
+    /// Real, owned KV host data for this chunk. See [`KvPayload`].
+    pub kv_data: KvPayload,
     /// Storage priority hint.
     pub priority: CachePriority,
     /// Optional time-to-live.
     pub ttl: Option<Duration>,
 }
 
-/// KV data retrieved from external storage and materialised on a target device
+/// KV data retrieved from external storage, ready to be injected by the engine
 /// (DESIGN §38.4).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct FetchedKv {
     pub key: KvCacheKey,
-    /// Pages allocated and filled on the target device, ready for model use.
+    /// Pages allocated and filled on the target device, when the backend keeps
+    /// a device-resident mirror (empty for pure host backends).
     pub pages: Vec<PageId>,
+    /// The real KV host data for this chunk, in the [`KvPayload`] layout. The
+    /// engine injects this into its own KV state at the chunk's absolute
+    /// positions.
+    pub payload: KvPayload,
     /// Actual transfer time (for metrics).
     pub transfer_time: Duration,
 }
@@ -596,6 +682,47 @@ mod tests {
         key("model-a", 0..1, 12345)
     }
 
+    /// A deterministic, well-formed payload for round-trip / accounting tests.
+    fn sample_payload(
+        num_tokens: usize,
+        num_layers: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+    ) -> KvPayload {
+        let per_layer = num_kv_heads * num_tokens * head_dim;
+        let layers = (0..num_layers)
+            .map(|l| KvLayerPayload {
+                key: (0..per_layer).map(|i| (l * 1000 + i) as f32).collect(),
+                value: (0..per_layer).map(|i| -((l * 1000 + i) as f32)).collect(),
+            })
+            .collect();
+        KvPayload {
+            num_tokens,
+            num_layers,
+            num_kv_heads,
+            head_dim,
+            dtype: KvPayloadDtype::F32,
+            layers,
+        }
+    }
+
+    #[test]
+    fn kv_payload_byte_size_and_well_formed() {
+        let payload = sample_payload(2, 3, 2, 4);
+        // Each layer holds key+value = 2 * (2*2*4) = 32 f32 = 128 bytes; 3 layers.
+        assert_eq!(payload.elements_per_layer(), 2 * 2 * 4);
+        assert_eq!(payload.byte_size(), 3 * 2 * (2 * 2 * 4) * 4);
+        assert!(payload.is_well_formed());
+
+        let mut broken = payload.clone();
+        broken.layers[0].key.pop();
+        assert!(!broken.is_well_formed());
+
+        let mut wrong_layers = payload;
+        wrong_layers.layers.pop();
+        assert!(!wrong_layers.is_well_formed());
+    }
+
     #[tokio::test]
     async fn null_connector_lookup_is_not_found() {
         let c = NullConnector;
@@ -619,7 +746,7 @@ mod tests {
         let c = NullConnector;
         let entry = KvStoreEntry {
             key: sample_key(),
-            kv_data: KvTensorRef { size_bytes: 0 },
+            kv_data: sample_payload(1, 1, 1, 1),
             priority: CachePriority::Opportunistic,
             ttl: None,
         };

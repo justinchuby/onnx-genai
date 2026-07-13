@@ -1548,6 +1548,7 @@ name = "onnx-genai-engine"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "llguidance",
  "onnx-genai-genai-config",
  "onnx-genai-kv",

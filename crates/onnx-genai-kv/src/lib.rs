@@ -32,7 +32,8 @@ pub mod tiered;
 pub use connector::{
     CachePriority, CompressionFormat, ConnectorCapabilities, ConnectorError, ConnectorHealth,
     ConnectorResult, DEFAULT_CHUNK_SIZE, FetchedKv, KvCacheConnector, KvCacheKey, KvCacheLocation,
-    KvStoreEntry, KvTensorRef, NullConnector, TokenChunk, chunk_tokens, hash_tokens,
+    KvLayerPayload, KvPayload, KvPayloadDtype, KvStoreEntry, NullConnector, TokenChunk,
+    chunk_tokens, hash_tokens,
 };
 pub use fp8::{Fp8Format, decode_f32 as decode_fp8, encode_f32 as encode_fp8};
 pub use local_tiered::{DiskTierConfig, LocalTieredConfig, LocalTieredConnector};

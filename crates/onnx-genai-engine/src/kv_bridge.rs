@@ -5,7 +5,10 @@ use crate::decode::{DecodeState, is_kv_input, is_present_output, matching_past_i
 use crate::logits::TokenId;
 use crate::session::{DraftModel, DraftSession, EngineSession};
 use anyhow::Context;
-use onnx_genai_kv::{KvCacheOps, KvDType, LayerKv, PageId, PageTensorConfig, PagedKvCache};
+use onnx_genai_kv::{
+    KvCacheOps, KvDType, KvLayerPayload, KvPayload, KvPayloadDtype, LayerKv, PageId,
+    PageTensorConfig, PagedKvCache,
+};
 use onnx_genai_ort::{DataType, Session, TensorInfo, Value};
 use std::collections::HashMap;
 
@@ -483,6 +486,190 @@ pub(crate) fn kv_layer_index(name: &str) -> Option<usize> {
     name.split(|ch: char| !ch.is_ascii_digit())
         .find(|part| !part.is_empty())
         .and_then(|part| part.parse().ok())
+}
+
+// ---------------------------------------------------------------------------
+// Connector KV payload <-> runner-KV conversion (DESIGN §38, K4)
+// ---------------------------------------------------------------------------
+
+/// One layer's exported past K/V as owned host floats plus their ORT shapes.
+///
+/// Produced from a `PastPresent` runner's [`crate::decode::DecodeState::export_runner_kv`]
+/// so a chunk's token range can be sliced out into a portable [`KvPayload`].
+pub(crate) struct ExportedLayerKv {
+    pub(crate) key: Vec<f32>,
+    pub(crate) key_shape: Vec<i64>,
+    pub(crate) value: Vec<f32>,
+    pub(crate) value_shape: Vec<i64>,
+}
+
+/// Collect exported runner KV into per-layer host buffers in `kv_model` layer
+/// order, ready for chunk slicing via [`chunk_payload_from_exported`].
+pub(crate) fn exported_layers_from_runner(
+    kv_model: &KvModelInfo,
+    exported: &[(String, onnx_genai_ort::Value)],
+) -> anyhow::Result<Vec<ExportedLayerKv>> {
+    let by_name = exported
+        .iter()
+        .map(|(name, value)| (name.as_str(), value))
+        .collect::<HashMap<_, _>>();
+    kv_model
+        .layers
+        .iter()
+        .map(|layer| {
+            let key_v = *by_name
+                .get(layer.key_past.as_str())
+                .with_context(|| format!("exported KV missing '{}'", layer.key_past))?;
+            let value_v = *by_name
+                .get(layer.value_past.as_str())
+                .with_context(|| format!("exported KV missing '{}'", layer.value_past))?;
+            Ok(ExportedLayerKv {
+                key: key_v.to_vec_f32_lossy()?,
+                key_shape: key_v.shape().to_vec(),
+                value: value_v.to_vec_f32_lossy()?,
+                value_shape: value_v.shape().to_vec(),
+            })
+        })
+        .collect()
+}
+
+/// Slice the token range `[chunk_start, chunk_start + num_tokens)` out of the
+/// exported per-layer KV into a portable [`KvPayload`].
+///
+/// The payload uses the head-major `[num_kv_heads, num_tokens, head_dim]` layout
+/// documented on [`KvPayload`], read via the same [`extract_present_token`] axis
+/// handling used to mirror present KV, so it matches the engine's KV contract
+/// for arbitrary tensor axis orders.
+pub(crate) fn chunk_payload_from_exported(
+    layers: &[ExportedLayerKv],
+    config: PageTensorConfig,
+    chunk_start: usize,
+    num_tokens: usize,
+) -> anyhow::Result<KvPayload> {
+    let num_kv_heads = config.num_kv_heads;
+    let head_dim = config.head_dim;
+    let per_layer = num_kv_heads * num_tokens * head_dim;
+    let mut payload_layers = Vec::with_capacity(layers.len());
+    for layer in layers {
+        let mut key = vec![0.0_f32; per_layer];
+        let mut value = vec![0.0_f32; per_layer];
+        for t in 0..num_tokens {
+            let abs = chunk_start + t;
+            let key_tok = extract_present_token(&layer.key, &layer.key_shape, config, abs)?;
+            let value_tok = extract_present_token(&layer.value, &layer.value_shape, config, abs)?;
+            for head in 0..num_kv_heads {
+                for dim in 0..head_dim {
+                    let dst = (head * num_tokens + t) * head_dim + dim;
+                    let src = head * head_dim + dim;
+                    key[dst] = key_tok[src];
+                    value[dst] = value_tok[src];
+                }
+            }
+        }
+        payload_layers.push(KvLayerPayload { key, value });
+    }
+    Ok(KvPayload {
+        num_tokens,
+        num_layers: layers.len(),
+        num_kv_heads,
+        head_dim,
+        dtype: KvPayloadDtype::F32,
+        layers: payload_layers,
+    })
+}
+
+/// A fetched chunk's payload positioned at a token offset relative to the start
+/// of the contiguous fetched region (`relative_start == 0` for the first chunk).
+pub(crate) struct PlacedPayload<'a> {
+    pub(crate) relative_start: usize,
+    pub(crate) payload: &'a KvPayload,
+}
+
+/// Assemble contiguous fetched chunk payloads into full-length
+/// `(past_key_values.* name, Value)` past tensors covering `[0, total_len)`,
+/// ready for [`crate::decode::DecodeState::import_runner_kv`].
+///
+/// Each per-layer tensor is built in `[num_kv_heads, total_len, head_dim]`
+/// head-major order and shaped with [`past_shape`], matching the past-tensor
+/// contract [`load_materialized_past`] uses, so the injected KV is consumed by
+/// the model exactly as if it had been recomputed.
+pub(crate) fn past_kv_from_payloads(
+    session: &Session,
+    kv_model: &KvModelInfo,
+    placed: &[PlacedPayload<'_>],
+    total_len: usize,
+) -> anyhow::Result<Vec<(String, Value)>> {
+    let config = kv_model.tensor_config;
+    let num_kv_heads = config.num_kv_heads;
+    let head_dim = config.head_dim;
+    let input_shapes = session
+        .inputs()
+        .iter()
+        .map(|info| (info.name.as_str(), info.shape.as_slice()))
+        .collect::<HashMap<_, _>>();
+
+    let mut out = Vec::with_capacity(kv_model.layers.len() * 2);
+    for (idx, layer) in kv_model.layers.iter().enumerate() {
+        let key_shape = past_shape(
+            input_shapes
+                .get(layer.key_past.as_str())
+                .copied()
+                .context("missing key past input shape")?,
+            total_len,
+        )?;
+        let value_shape = past_shape(
+            input_shapes
+                .get(layer.value_past.as_str())
+                .copied()
+                .context("missing value past input shape")?,
+            total_len,
+        )?;
+        let full = num_kv_heads * total_len * head_dim;
+        let mut key = vec![0.0_f32; full];
+        let mut value = vec![0.0_f32; full];
+        for placed in placed {
+            let layer_payload = placed
+                .payload
+                .layers
+                .get(idx)
+                .context("fetched payload missing a layer")?;
+            let num_tokens = placed.payload.num_tokens;
+            for head in 0..num_kv_heads {
+                for t in 0..num_tokens {
+                    for dim in 0..head_dim {
+                        let dst =
+                            (head * total_len + placed.relative_start + t) * head_dim + dim;
+                        let src = (head * num_tokens + t) * head_dim + dim;
+                        key[dst] = layer_payload.key[src];
+                        value[dst] = layer_payload.value[src];
+                    }
+                }
+            }
+        }
+        out.push((layer.key_past.clone(), Value::from_vec_f32(key, &key_shape)?));
+        out.push((
+            layer.value_past.clone(),
+            Value::from_vec_f32(value, &value_shape)?,
+        ));
+    }
+    Ok(out)
+}
+
+/// Whether `kv_model`'s past KV inputs are plain f32 in the ORT graph — the
+/// only dtype the connector payload round-trips today. Non-f32 KV (fp16/fp8/
+/// int8) is skipped so a dtype mismatch can never corrupt injected output. The
+/// check uses the model's actual past-input dtype (not the coarser
+/// [`KvDType`], which folds fp16 into `F32`).
+pub(crate) fn kv_model_past_is_f32(session: &Session, kv_model: &KvModelInfo) -> bool {
+    let Some(layer) = kv_model.layers.first() else {
+        return false;
+    };
+    session
+        .inputs()
+        .iter()
+        .find(|info| info.name == layer.key_past)
+        .map(|info| info.dtype == DataType::Float32)
+        .unwrap_or(false)
 }
 
 #[cfg(test)]

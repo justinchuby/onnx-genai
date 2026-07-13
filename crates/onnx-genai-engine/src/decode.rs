@@ -18,7 +18,7 @@ use anyhow::Context;
 use onnx_genai_kv::{KvCacheOps, PagedKvCache};
 use onnx_genai_metadata::InferenceMetadata;
 use onnx_genai_ort::{
-    DataType, DecodeSession, DecodeSessionOptions, Session, StaticCacheDecodeOptions,
+    DataType, DecodeKvMode, DecodeSession, DecodeSessionOptions, Session, StaticCacheDecodeOptions,
     StaticCacheDecodeSession, TensorInfo, Value,
 };
 use std::collections::HashMap;
@@ -292,6 +292,46 @@ impl DecodeState {
             }
         }
         Ok(())
+    }
+
+    /// Whether this state's runner can hand off its KV cache as owned host
+    /// tensors (export/import) — true only for a `PastPresent` runner in
+    /// [`DecodeKvMode::ZeroCopyRebind`]. Shared-buffer / static-cache runners own
+    /// fixed device buffers that are not portable across sessions, so the
+    /// connector cannot extract or inject their KV.
+    pub(crate) fn runner_supports_kv_handoff(&self) -> bool {
+        matches!(
+            &self.runner,
+            Some(DecodeRunner::PastPresent(session))
+                if session.mode() == DecodeKvMode::ZeroCopyRebind
+        )
+    }
+
+    /// Export the runner's current KV as owned `(past_key_values.* name, Value)`
+    /// pairs covering `[0, runner_len())`. Only valid when
+    /// [`runner_supports_kv_handoff`](Self::runner_supports_kv_handoff) is true.
+    pub(crate) fn export_runner_kv(&self) -> anyhow::Result<Vec<(String, Value)>> {
+        match &self.runner {
+            Some(DecodeRunner::PastPresent(session)) => Ok(session.export_kv()?),
+            _ => anyhow::bail!("no ZeroCopyRebind PastPresent runner to export KV from"),
+        }
+    }
+
+    /// Replace the runner's KV with `kv` (covering `len` tokens) so the next
+    /// decode step continues from `len` tokens of context. Only valid when
+    /// [`runner_supports_kv_handoff`](Self::runner_supports_kv_handoff) is true.
+    pub(crate) fn import_runner_kv(
+        &mut self,
+        len: usize,
+        kv: Vec<(String, Value)>,
+    ) -> anyhow::Result<()> {
+        match &mut self.runner {
+            Some(DecodeRunner::PastPresent(session)) => {
+                session.import_kv(len, kv)?;
+                Ok(())
+            }
+            _ => anyhow::bail!("no ZeroCopyRebind PastPresent runner to import KV into"),
+        }
     }
 
     pub(crate) fn apply_window_after_step(

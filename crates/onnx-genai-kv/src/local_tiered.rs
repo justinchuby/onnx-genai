@@ -44,7 +44,8 @@ use std::time::{Duration, Instant};
 
 use crate::connector::{
     CachePriority, CompressionFormat, ConnectorCapabilities, ConnectorError, ConnectorHealth,
-    ConnectorResult, FetchedKv, KvCacheConnector, KvCacheKey, KvCacheLocation, KvStoreEntry,
+    ConnectorResult, FetchedKv, KvCacheConnector, KvCacheKey, KvCacheLocation, KvPayload,
+    KvStoreEntry,
 };
 use crate::fp8::Fp8Format;
 use crate::{Device, PageId, PageTable, PrefixCache, TokenId};
@@ -114,6 +115,11 @@ struct ChunkEntry {
     size_bytes: usize,
     /// Deterministic prefix-cache path for this key.
     path: Vec<TokenId>,
+    /// The real KV host bytes for this chunk, retained so `fetch` can return
+    /// them for cross-session/cross-node reuse (DESIGN §38, K4). In this runtime
+    /// both tiers are host RAM, so the page-table bookkeeping above tracks
+    /// tiering/eviction while these bytes are the authoritative KV.
+    payload: KvPayload,
 }
 
 /// Interior state guarded by the connector's mutex.
@@ -173,16 +179,6 @@ impl LocalTieredConnector {
         (num_tokens as usize)
             .div_ceil(self.config.page_size.max(1))
             .max(1)
-    }
-
-    /// Stored byte size for `pages` pages under the configured compression.
-    fn size_bytes(&self, pages: usize) -> usize {
-        let raw = pages * self.config.bytes_per_page;
-        match self.config.compression {
-            // FP8 is ~2× denser than the FP16 baseline.
-            CompressionFormat::Fp8 => raw.div_ceil(2),
-            _ => raw,
-        }
     }
 
     /// Deterministic prefix-cache path uniquely encoding a key. Identical chunk
@@ -374,15 +370,29 @@ impl KvCacheConnector for LocalTieredConnector {
         ) {
             return Err(ConnectorError::Unsupported("configured compression"));
         }
+        // Never store malformed KV: an incorrect payload would corrupt output
+        // once fetched and injected. Reject early instead.
+        if !entry.kv_data.is_well_formed() {
+            return Err(ConnectorError::Backend(
+                "KV payload dimensions are inconsistent with its buffers".into(),
+            ));
+        }
         let num_pages = self.pages_for(entry.key.num_tokens);
-        let size_bytes = self.size_bytes(num_pages);
+        // Honest accounting: report the bytes we actually hold (real f32 KV),
+        // not the placeholder page estimate.
+        // TODO(K4-fp8): when `config.compression == Fp8`, compress the stored
+        // payload with `self.fp8_format` and account for the halved size here.
+        // f32 round-trip is intentionally implemented first for correctness.
+        let size_bytes = entry.kv_data.byte_size();
         let path = Self::key_path(&entry.key);
         let scale = self.fp8_format;
 
         let mut inner = self.inner.lock().expect("connector mutex poisoned");
 
         if let Some(existing) = inner.chunks.get_mut(&entry.key) {
-            // Idempotent re-store of identical content: refresh hints only.
+            // Idempotent re-store of identical content: refresh hints only. The
+            // payload is byte-identical (equal key ⟹ identical tokens), so the
+            // retained bytes stay valid.
             existing.priority = entry.priority;
             existing.ttl = entry.ttl;
             existing.stored_at = Instant::now();
@@ -410,8 +420,8 @@ impl KvCacheConnector for LocalTieredConnector {
                 }
             }
             // Wire FP8: exercise the codec so the compression path is real, not
-            // merely a size adjustment. (Real tensor bytes arrive with the K2+
-            // tensor handle; here we validate the configured codec is usable.)
+            // merely a size adjustment. (Compressing the real payload bytes is
+            // deferred; see the TODO(K4-fp8) above.)
             if let Some(format) = scale {
                 let _ = crate::fp8::decode_f32(crate::fp8::encode_f32(1.0, format), format);
             }
@@ -428,6 +438,7 @@ impl KvCacheConnector for LocalTieredConnector {
                 stored_at: Instant::now(),
                 size_bytes,
                 path,
+                payload: entry.kv_data,
             },
         );
 
@@ -468,6 +479,7 @@ impl KvCacheConnector for LocalTieredConnector {
         Ok(FetchedKv {
             key: key.clone(),
             pages: entry.page_ids,
+            payload: entry.payload,
             transfer_time: start.elapsed(),
         })
     }
@@ -558,7 +570,7 @@ impl KvCacheConnector for LocalTieredConnector {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::connector::KvTensorRef;
+    use crate::connector::{KvLayerPayload, KvPayload, KvPayloadDtype};
 
     fn key(model: &str, chunk_index: u32, chunk_hash: u64, num_tokens: u32) -> KvCacheKey {
         KvCacheKey {
@@ -570,10 +582,35 @@ mod tests {
         }
     }
 
+    /// A deterministic, well-formed payload whose values are seeded from the
+    /// chunk hash so different chunks round-trip to distinguishable buffers.
+    fn payload_for(key: &KvCacheKey, num_kv_heads: usize, head_dim: usize) -> KvPayload {
+        let num_tokens = key.num_tokens as usize;
+        let num_layers = key.layer_range.len().max(1);
+        let per_layer = num_kv_heads * num_tokens * head_dim;
+        let seed = key.chunk_hash as f32;
+        let layers = (0..num_layers)
+            .map(|l| KvLayerPayload {
+                key: (0..per_layer).map(|i| seed + (l * 100 + i) as f32).collect(),
+                value: (0..per_layer)
+                    .map(|i| -(seed + (l * 100 + i) as f32))
+                    .collect(),
+            })
+            .collect();
+        KvPayload {
+            num_tokens,
+            num_layers,
+            num_kv_heads,
+            head_dim,
+            dtype: KvPayloadDtype::F32,
+            layers,
+        }
+    }
+
     fn store_entry(key: KvCacheKey, priority: CachePriority) -> KvStoreEntry {
         KvStoreEntry {
+            kv_data: payload_for(&key, 2, 4),
             key,
-            kv_data: KvTensorRef { size_bytes: 0 },
             priority,
             ttl: None,
         }
@@ -666,6 +703,58 @@ mod tests {
             conn.fetch(&unknown, Device::Gpu(0)).await,
             Err(ConnectorError::NotFound)
         ));
+    }
+
+    #[tokio::test]
+    async fn store_then_fetch_round_trips_the_exact_payload() {
+        let conn = LocalTieredConnector::new(small_config()).unwrap();
+        let k = key("m", 0, 0xABCD, 4);
+        let expected = payload_for(&k, 2, 4);
+        conn.store(store_entry(k.clone(), CachePriority::Session))
+            .await
+            .unwrap();
+
+        let fetched = conn.fetch(&k, Device::Gpu(0)).await.unwrap();
+        // Byte-for-byte identical KV comes back out — the correctness contract
+        // that makes cross-session reuse token-identical to recompute.
+        assert_eq!(fetched.payload, expected);
+        assert!(fetched.payload.is_well_formed());
+    }
+
+    #[tokio::test]
+    async fn store_rejects_malformed_payload() {
+        let conn = LocalTieredConnector::new(small_config()).unwrap();
+        let k = key("m", 0, 1, 4);
+        let mut entry = store_entry(k, CachePriority::Session);
+        entry.kv_data.layers[0].key.pop(); // now inconsistent with dims
+        assert!(matches!(
+            conn.store(entry).await,
+            Err(ConnectorError::Backend(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn eviction_drops_the_payload_so_fetch_is_not_found() {
+        let mut cfg = small_config();
+        cfg.max_cached_pages = 2; // hard cap: a 3rd chunk evicts the oldest
+        let conn = LocalTieredConnector::new(cfg).unwrap();
+        let k0 = key("m", 0, 1, 4);
+        let k1 = key("m", 1, 2, 4);
+        let k2 = key("m", 2, 3, 4);
+        for k in [&k0, &k1, &k2] {
+            conn.store(store_entry(k.clone(), CachePriority::Session))
+                .await
+                .unwrap();
+        }
+        // k0 was evicted; its payload is gone and fetch reports NotFound.
+        assert_eq!(conn.lookup(&k0).await.unwrap(), KvCacheLocation::NotFound);
+        assert!(matches!(
+            conn.fetch(&k0, Device::Gpu(0)).await,
+            Err(ConnectorError::NotFound)
+        ));
+        // A surviving chunk still round-trips its exact payload.
+        let fetched = conn.fetch(&k2, Device::Gpu(0)).await.unwrap();
+        assert_eq!(fetched.payload, payload_for(&k2, 2, 4));
     }
 
     #[tokio::test]
@@ -779,11 +868,17 @@ mod tests {
             KvCacheLocation::LocalGpu { .. }
         ));
 
-        // Fp8: stored size is halved; codec is exercised via fp8.rs.
+        // Fp8: the codec is exercised via fp8.rs, but compressing the stored
+        // payload is deferred (see TODO(K4-fp8)), so size accounting reflects the
+        // honest full f32 bytes we actually hold, not a halved estimate.
         let mut cfg = small_config();
         cfg.compression = CompressionFormat::Fp8;
         let fp8 = LocalTieredConnector::new(cfg).unwrap();
         let fk = key("m", 0, 1, 4);
+        // payload_for(2 heads, 4 head_dim), 4 tokens, 1 layer:
+        //   per-layer = 2*4*4 = 32 f32; key+value = 64 f32 = 256 bytes.
+        let expected_bytes = payload_for(&fk, 2, 4).byte_size();
+        assert_eq!(expected_bytes, 256);
         fp8.store(store_entry(fk.clone(), CachePriority::Session))
             .await
             .unwrap();
@@ -797,7 +892,7 @@ mod tests {
             .await
             .unwrap();
         match fp8.lookup(&fk).await.unwrap() {
-            KvCacheLocation::LocalCpu { size_bytes, .. } => assert_eq!(size_bytes, 512),
+            KvCacheLocation::LocalCpu { size_bytes, .. } => assert_eq!(size_bytes, expected_bytes),
             KvCacheLocation::LocalGpu { .. } => {} // still hot: size checked on CPU tier only
             other => panic!("unexpected {other:?}"),
         }

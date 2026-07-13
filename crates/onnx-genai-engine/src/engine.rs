@@ -9,8 +9,9 @@ use crate::decode_loop::{
     DecodeLoopBackend, DecodeLoopState, exceeded_context_limit, run_decode_loop, step_decode_loop,
 };
 use crate::kv_bridge::{
-    KvModelInfo, attach_pages_to_sequence, common_prefix_len, infer_kv_model_info,
-    load_materialized_past, sequence_pages_for_len,
+    KvModelInfo, PlacedPayload, attach_pages_to_sequence, chunk_payload_from_exported,
+    common_prefix_len, exported_layers_from_runner, infer_kv_model_info, kv_model_past_is_f32,
+    load_materialized_past, past_kv_from_payloads, sequence_pages_for_len,
 };
 use crate::logits::{StopSequence, TokenId};
 use crate::processors::{
@@ -20,7 +21,7 @@ use crate::processors::{
 use crate::sampling::SamplingRng;
 use crate::session::{ActiveGenerate, DraftModel, DraftSession, EngineSession};
 use anyhow::Context;
-use onnx_genai_kv::{KvCacheOps, LocalTieredConnector, PagedKvCache, PrefixCache};
+use onnx_genai_kv::{Device, KvCacheOps, LocalTieredConnector, PagedKvCache, PrefixCache};
 use onnx_genai_metadata::InferenceMetadata;
 use onnx_genai_ort::{
     DataType, Eagle3DecodeSession, Environment, SharedKvProposerSession, ModelDirectory,
@@ -525,9 +526,9 @@ impl Engine {
 
     /// External KV connector activity from the most recent generation.
     ///
-    /// Reflects lookups, would-be prefix extensions (materialization deferred in
-    /// K3), and chunk stores. Returns [`ConnectorStats::default`] when no
-    /// connector is configured.
+    /// Reflects lookups, would-be prefix extensions, tokens actually fetched and
+    /// injected (K4 materialization), and chunk stores. Returns
+    /// [`ConnectorStats::default`] when no connector is configured.
     pub fn last_connector_stats(&self) -> ConnectorStats {
         self.connector.stats().clone()
     }
@@ -1064,16 +1065,93 @@ impl Engine {
         }
         let in_process_hit = same_session_hit_len.max(cross_session_hit_len);
 
-        // K3: consult the external connector for prefix reuse *beyond* the
-        // in-process hit. This currently reports the opportunity (and drives the
-        // fetch-vs-recompute decision) but does not shorten prefill, because
-        // materializing fetched KV into the paged cache is deferred (see
-        // `ConnectorBridge::lookup_extension`). Returning `in_process_hit`
-        // unchanged keeps generation output exactly correct.
+        // K4: consult the external connector for prefix reuse *beyond* the
+        // in-process hit. When the active decode path can accept an owned-KV
+        // handoff (a ZeroCopyRebind `PastPresent` runner with f32 KV) and the
+        // session started empty, fetch the real KV bytes for the contiguous hit
+        // chunks and inject them into the runner so prefill genuinely skips
+        // those tokens. Because the chunk key is prefix-dependent, an equal key
+        // guarantees an identical prefix, so injecting fetched KV at the same
+        // absolute positions is byte-exact — proven token-identical by the gold
+        // integration test. If injection is not possible we fall back to the
+        // reporting-only `lookup_extension`, never claiming a hit we can't serve.
         if self.connector.is_active() {
+            let injected = self.try_connector_kv_injection(state, prompt_tokens, in_process_hit)?;
+            if let Some(total) = injected {
+                return Ok(in_process_hit.max(total));
+            }
             let _ = self.connector.lookup_extension(prompt_tokens, in_process_hit);
         }
         Ok(in_process_hit)
+    }
+
+    /// Try to materialize cross-session KV from the connector into the decode
+    /// runner, genuinely shortening prefill. Returns `Some(total_len)` (the KV
+    /// token count now resident in the runner) when injection happened, else
+    /// `None` (caller falls back to reporting-only lookup).
+    ///
+    /// Only runs for a freshly started session on a ZeroCopyRebind `PastPresent`
+    /// runner whose KV is f32. `import_kv` *replaces* the runner KV, so the
+    /// boundary must be the current `kv_token_count` (0 for a fresh session).
+    /// At least one prompt token is always left un-injected so decode has an
+    /// input to feed.
+    fn try_connector_kv_injection(
+        &mut self,
+        state: &mut EngineSession,
+        prompt_tokens: &[TokenId],
+        in_process_hit: usize,
+    ) -> anyhow::Result<Option<usize>> {
+        if !state.decode_state.has_runner()
+            || !state.decode_state.runner_supports_kv_handoff()
+            || state.kv_token_count != 0
+            || in_process_hit != 0
+        {
+            return Ok(None);
+        }
+        // Scope the immutable `kv_model` borrow so it does not overlap the
+        // `&mut self.connector` fetch below.
+        match self.kv_model.as_ref() {
+            Some(kv_model) if kv_model_past_is_f32(&self.session, kv_model) => {}
+            _ => return Ok(None),
+        }
+
+        let boundary = 0usize;
+        // Leave at least one prompt token to feed the decoder: cap the fetch to
+        // `prompt_len - 1` tokens so `fetched_tokens` equals what we inject.
+        let max_tokens = prompt_tokens.len().saturating_sub(1);
+        let outcome =
+            self.connector
+                .fetch_extension(prompt_tokens, boundary, max_tokens, Device::Cpu);
+        if outcome.fetched_tokens == 0 {
+            return Ok(None);
+        }
+
+        let mut chunks = outcome.chunks;
+        let mut total: usize = boundary + chunks.iter().map(|c| c.num_tokens).sum::<usize>();
+        // Safety net: the `max_tokens` cap already guarantees `total <
+        // prompt_len`, but drop trailing chunks if any invariant slipped.
+        while total >= prompt_tokens.len() {
+            match chunks.pop() {
+                Some(dropped) => total -= dropped.num_tokens,
+                None => return Ok(None),
+            }
+        }
+        if chunks.is_empty() || total == 0 {
+            return Ok(None);
+        }
+
+        let placed: Vec<PlacedPayload<'_>> = chunks
+            .iter()
+            .map(|chunk| PlacedPayload {
+                relative_start: chunk.start - boundary,
+                payload: &chunk.payload,
+            })
+            .collect();
+        let kv_model = self.kv_model.as_ref().expect("checked present above");
+        let kv = past_kv_from_payloads(&self.session, kv_model, &placed, total)?;
+        state.decode_state.import_runner_kv(total, kv)?;
+        state.kv_token_count = total;
+        Ok(Some(total))
     }
 
     fn prepare_active_generate(
@@ -1215,19 +1293,57 @@ impl Engine {
         Ok(())
     }
 
+    /// Extract the runner's freshly computed KV and store each complete resident
+    /// chunk in the connector. Best-effort: any gating failure or extraction
+    /// error skips storing (never surfaced to inference). See
+    /// [`crate::connector_bridge::ConnectorBridge::store_prefix_with`].
+    fn store_connector_prefix(&mut self, state: &EngineSession) {
+        if !state.decode_state.runner_supports_kv_handoff() {
+            return;
+        }
+        let config = match self.kv_model.as_ref() {
+            Some(kv_model) if kv_model_past_is_f32(&self.session, kv_model) => {
+                kv_model.tensor_config
+            }
+            _ => return,
+        };
+        let exported = match state.decode_state.export_runner_kv() {
+            Ok(exported) => exported,
+            Err(error) => {
+                tracing::debug!(%error, "runner KV export failed; not storing to connector");
+                return;
+            }
+        };
+        let kv_model = self.kv_model.as_ref().expect("checked present above");
+        let layers = match exported_layers_from_runner(kv_model, &exported) {
+            Ok(layers) => layers,
+            Err(error) => {
+                tracing::debug!(%error, "collecting exported runner KV failed; not storing");
+                return;
+            }
+        };
+        self.connector.store_prefix_with(
+            &state.tokens,
+            state.kv_token_count,
+            |chunk_start, num_tokens| {
+                chunk_payload_from_exported(&layers, config, chunk_start, num_tokens)
+            },
+        );
+    }
+
     fn insert_cached_prefixes(
         &mut self,
         session_id: SessionId,
         state: &EngineSession,
         prompt_len: usize,
     ) -> anyhow::Result<()> {
-        // K3: push the freshly computed, resident KV chunks to the external
-        // connector for future cross-session / cross-node reuse. This is
-        // independent of the in-process caches below and is a no-op for the
-        // default `Null` connector.
+        // K4: extract the freshly computed KV for each complete resident chunk
+        // and push the real bytes to the external connector for future
+        // cross-session / cross-node reuse. Only ZeroCopyRebind `PastPresent`
+        // runners with f32 KV can hand off owned tensors; other paths skip
+        // (store is a no-op for the default `Null` connector regardless).
         if self.connector.is_active() {
-            self.connector
-                .store_prefix(&state.tokens, state.kv_token_count);
+            self.store_connector_prefix(state);
         }
         if state.decode_state.uses_token_prefix_cache() {
             if prompt_len > 0 && prompt_len <= state.kv_token_count {
@@ -2026,47 +2142,65 @@ mod tests {
             "expected connector store path to push chunks, got {:?}",
             engine.last_connector_stats()
         );
-        // The connector must not perturb generated output (materialization is
-        // deferred; the store path is a pure side effect).
+        // The store path is a pure side effect for a first, unseen request:
+        // nothing is resident to fetch, so output matches full recompute.
         assert_eq!(result.token_ids, baseline_ids);
         Ok(())
     }
 
     #[test]
-    fn local_tiered_connector_reports_would_be_prefix_extension() -> anyhow::Result<()> {
+    fn local_tiered_connector_fetch_reuse_is_token_identical() -> anyhow::Result<()> {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../tests/fixtures/tiny-llm")
             .canonicalize()?;
         let mut engine = Engine::from_dir(&fixture, local_tiered_engine_config(2))?;
 
-        // First request populates the connector with the prompt's KV chunks.
-        let mut warm = GenerateRequest::new(GeneratePrompt::TokenIds(vec![10, 11, 12, 13, 14, 15]));
+        // Request 1 populates the connector with the prompt's KV chunks.
+        let prompt = vec![10, 11, 12, 13, 14, 15];
+        let mut warm = GenerateRequest::new(GeneratePrompt::TokenIds(prompt.clone()));
         warm.options.max_new_tokens = 1;
         warm.options.temperature = 0.0;
         warm.options.stop_on_eos = false;
         engine.generate(warm)?;
         assert!(engine.last_connector_stats().stores > 0);
 
-        // Drop the in-process token-prefix cache so the connector is the only
-        // source of cross-session reuse, isolating the connector lookup path.
+        // Drop the in-process caches so the connector is the ONLY source of
+        // cross-session reuse — simulating a fresh process / different node that
+        // shares nothing but the connector.
         engine.token_prefix_cache.clear();
         engine.prefix_cache = PrefixCache::new();
 
-        let mut reuse = GenerateRequest::new(GeneratePrompt::TokenIds(vec![10, 11, 12, 13, 14, 15]));
-        reuse.options.max_new_tokens = 1;
+        // Request 2 shares the whole prefix (≥ 1 chunk) with request 1.
+        let mut reuse = GenerateRequest::new(GeneratePrompt::TokenIds(prompt.clone()));
+        reuse.options.max_new_tokens = 4;
         reuse.options.temperature = 0.0;
         reuse.options.stop_on_eos = false;
-        engine.generate(reuse)?;
-
+        let reuse_result = engine.generate(reuse)?;
         let stats = engine.last_connector_stats();
-        // The connector recognized the previously stored chunks as reusable.
+
+        // (a) Prefill was genuinely shortened: real KV bytes were fetched and
+        // injected into the runner.
         assert!(
-            stats.would_extend_tokens > 0 && stats.chunk_hits > 0,
-            "expected connector to report a would-be extension, got {stats:?}"
+            stats.fetched_tokens > 0 && stats.chunk_hits > 0,
+            "expected connector fetch to materialize KV, got {stats:?}"
         );
-        // Materialization is deferred in K3: nothing is actually fetched, so
-        // prefill is not shortened and correctness is preserved.
-        assert_eq!(stats.fetched_tokens, 0);
+        // At least one prompt token is always left to feed the decoder.
+        assert!(stats.fetched_tokens < prompt.len());
+
+        // (b) Output is byte-for-byte identical to full recompute with a Null
+        // connector — proving the materialized KV is correct, not just present.
+        let baseline_ids = {
+            let mut baseline = Engine::from_dir(&fixture, EngineConfig::default())?;
+            let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(prompt.clone()));
+            request.options.max_new_tokens = 4;
+            request.options.temperature = 0.0;
+            request.options.stop_on_eos = false;
+            baseline.generate(request)?.token_ids
+        };
+        assert_eq!(
+            reuse_result.token_ids, baseline_ids,
+            "connector-reuse output must match full recompute exactly"
+        );
         Ok(())
     }
 }
