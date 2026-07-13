@@ -21,31 +21,39 @@
 //! this crate — it routes purely by session affinity, prefix hash, and node
 //! load reported over the `/v1/status` contract.
 //!
-//! ## Milestone scope (R2 — pure core)
+//! ## Milestone scope (R3 — networking/runtime)
 //!
-//! This milestone ships the pure routing logic, configuration model, node
-//! polling data model, and comprehensive unit tests. The hyper-based reverse
-//! proxy (`proxy.rs`), the `/router/*` HTTP API (`api.rs`), and the binary
-//! entry point (`main.rs`) are deferred to R3. The core here is structured so
-//! R3 can bolt those on without touching this logic:
+//! R3 turns the pure core into a runnable binary:
 //!
-//! - [`node::NodeStatusFetcher`] is the async seam the R3 poller implements.
-//! - [`router::Router::update_node`] / [`router::Router::record_node_miss`]
-//!   feed poll results into the pure state machine.
-//! - [`router::Router::route`] is a pure decision function over the current
-//!   node snapshot.
+//! - [`node_poller`] implements [`node::NodeStatusFetcher`] over a `hyper-util`
+//!   client and drives [`router::Router::update_node`] /
+//!   [`router::Router::record_node_miss`] on a `tokio` interval.
+//! - [`proxy`] is the model-agnostic reverse proxy (buffers the request to
+//!   extract session id + prefix hash, streams the response back).
+//! - [`api`] serves the `/router/*` endpoints and falls through to the proxy.
+//! - [`metrics`] renders the §34.12 Prometheus exposition.
+//! - [`state`] holds the shared [`router::Router`] behind an `Arc<Mutex>`.
 
+pub mod api;
 pub mod config;
+pub mod metrics;
 pub mod node;
+pub mod node_poller;
 pub mod prefix_map;
+pub mod proxy;
 pub mod router;
 pub mod session_map;
+pub mod state;
 
+pub use api::build_app;
 pub use config::{
     ConfigError, HealthConfig, NodeConfig, RouterConfig, RoutingConfig, RoutingPolicy,
     SessionMapConfig, WeightConfig,
 };
+pub use metrics::Metrics;
 pub use node::{NodeId, NodeState, NodeStatus, NodeStatusFetcher, SessionSummary};
+pub use node_poller::{HttpStatusFetcher, build_client};
 pub use prefix_map::{PrefixMap, hash_system_prompt};
 pub use router::{RouteRequest, RoutingDecision, Router};
 pub use session_map::{MigrationEvent, MigrationReason, SessionMap};
+pub use state::{AppState, SharedState};

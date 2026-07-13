@@ -8,6 +8,10 @@ repository.workspace = true
 keywords = ["onnx", "llm", "inference", "router", "load-balancing"]
 categories = ["web-programming", "network-programming"]
 
+[[bin]]
+name = "onnx-genai-router"
+path = "src/main.rs"
+
 [dependencies]
 tokio = { workspace = true }
 serde = { workspace = true }
@@ -15,11 +19,21 @@ serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { workspace = true, features = ["env"] }
+anyhow = { workspace = true }
 
-# R3 (follow-up milestone) adds the hyper reverse proxy + HTTP server. The
-# proxy.rs / api.rs / main.rs modules and their `hyper` dependency are
-# intentionally deferred so this milestone stays a pure, unit-testable core.
-# hyper = { version = "1", features = ["server", "client", "http1"] }
+# R3 networking/runtime layer. axum serves the router's own /router/* API and
+# the proxy fallback (matches the inference server, which is also axum). A
+# hyper-util client streams the reverse-proxy and /v1/status polls — chosen over
+# reqwest to honour §34.10 ("hyper + tokio + serde") and keep one client stack.
+axum = { workspace = true }
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "tokio"] }
+http-body-util = "0.1"
+bytes = "1"
 
 [dev-dependencies]
 tempfile = "3"
+tower = { workspace = true }
+tokio-stream = { workspace = true }

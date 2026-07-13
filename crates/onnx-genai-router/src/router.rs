@@ -15,6 +15,8 @@ use crate::node::{NodeId, NodeState, NodeStatus};
 use crate::prefix_map::PrefixMap;
 use crate::session_map::{MigrationReason, SessionMap};
 
+use std::collections::HashSet;
+
 /// KV-usage ceiling above which a node stops accepting prefix co-location
 /// (design §34.5). Distinct from the affinity `overload_threshold` so we keep a
 /// little headroom for prefix sharing.
@@ -54,6 +56,9 @@ pub struct Router {
     prefix_colocate: bool,
     /// Missed polls before a node is demoted (config `unhealthy_after_misses`).
     unhealthy_after_misses: u32,
+    /// Nodes being gracefully drained: they keep serving sessions that already
+    /// have affinity, but accept no *new* sessions (via prefix or least-loaded).
+    draining: HashSet<NodeId>,
 }
 
 impl Router {
@@ -68,6 +73,7 @@ impl Router {
             overload_threshold: 0.95,
             prefix_colocate: true,
             unhealthy_after_misses: 3,
+            draining: HashSet::new(),
         }
     }
 
@@ -87,6 +93,7 @@ impl Router {
             overload_threshold: config.routing.overload_threshold,
             prefix_colocate: config.routing.prefix_colocate,
             unhealthy_after_misses: config.health.unhealthy_after_misses,
+            draining: HashSet::new(),
         }
     }
 
@@ -158,6 +165,10 @@ impl Router {
         }
         let hash = request.system_prompt_hash?;
         let node = self.prefix_map.get(hash)?.clone();
+        // A draining node accepts no new sessions, even for prefix sharing.
+        if self.draining.contains(&node) {
+            return None;
+        }
         let state = self.node_by_id(&node)?;
         if state.healthy && state.kv_usage < PREFIX_KV_THRESHOLD {
             Some(node)
@@ -167,11 +178,12 @@ impl Router {
     }
 
     /// Least-loaded healthy node under the active policy's load score.
-    /// Returns `None` when no node is healthy.
+    /// Draining nodes are excluded (they accept no new sessions). Returns `None`
+    /// when no node is healthy and routable.
     pub fn least_loaded_node(&self) -> Option<NodeId> {
         self.nodes
             .iter()
-            .filter(|n| n.healthy)
+            .filter(|n| n.healthy && !self.draining.contains(&n.id))
             .min_by(|a, b| {
                 self.load_score(a)
                     .partial_cmp(&self.load_score(b))
@@ -246,6 +258,68 @@ impl Router {
         &self.nodes
     }
 
+    // ---- Draining & rebalancing (driven by the R3 /router/* API) -----------
+
+    /// Mark a node as draining (or clear it). A draining node keeps serving
+    /// sessions that already have affinity to it, but is excluded from prefix
+    /// and least-loaded selection so no *new* sessions land on it. Returns
+    /// `false` if the node id is unknown.
+    pub fn set_draining(&mut self, id: &NodeId, draining: bool) -> bool {
+        if self.node_index(id).is_none() {
+            return false;
+        }
+        if draining {
+            self.draining.insert(id.clone());
+        } else {
+            self.draining.remove(id);
+        }
+        true
+    }
+
+    /// Whether a node is currently draining.
+    pub fn is_draining(&self, id: &NodeId) -> bool {
+        self.draining.contains(id)
+    }
+
+    /// Rebalance sessions off nodes that are unhealthy, draining, or at/above
+    /// the overload threshold onto the current least-loaded node. Records a
+    /// [`MigrationReason::Rebalance`] migration for each session actually moved
+    /// and returns the number moved.
+    ///
+    /// Scope: this is the minimal operator-triggered reassignment described in
+    /// §34.7. It reassigns affinity in the router's own table; the affected
+    /// sessions re-prefill lazily on their next request (the node fleet is not
+    /// notified out-of-band).
+    pub fn rebalance(&mut self) -> usize {
+        let pinned: Vec<(String, NodeId)> = self
+            .session_map
+            .iter()
+            .map(|(s, n)| (s.clone(), n.clone()))
+            .collect();
+        let mut moved = 0;
+        for (session_id, node) in pinned {
+            let needs_move = match self.node_by_id(&node) {
+                Some(state) => {
+                    !state.healthy
+                        || self.draining.contains(&node)
+                        || state.kv_usage >= self.overload_threshold
+                }
+                None => true,
+            };
+            if !needs_move {
+                continue;
+            }
+            if let Some(target) = self.least_loaded_node()
+                && target != node
+            {
+                self.session_map
+                    .migrate(session_id, target, MigrationReason::Rebalance, 0);
+                moved += 1;
+            }
+        }
+        moved
+    }
+
     /// Look up a node by id.
     pub fn node_by_id(&self, id: &NodeId) -> Option<&NodeState> {
         self.node_index(id).map(|idx| &self.nodes[idx])
@@ -264,6 +338,13 @@ impl Router {
     /// Read-only access to the session affinity table.
     pub fn session_map(&self) -> &SessionMap {
         &self.session_map
+    }
+
+    /// Record affinity for a session whose id was assigned out-of-band (e.g. by
+    /// the node in a `POST /v1/sessions` response rather than carried in the
+    /// request). A plain assignment — no migration accounting.
+    pub fn record_session_affinity(&mut self, session_id: impl Into<String>, node: NodeId) {
+        self.session_map.assign(session_id, node);
     }
 
     /// Read-only access to the prefix co-location map.
@@ -548,5 +629,92 @@ health:
         assert!(!r.prefix_colocate);
         assert!((r.overload_threshold - 0.8).abs() < 1e-6);
         assert_eq!(r.unhealthy_after_misses, 2);
+    }
+
+    #[test]
+    fn draining_node_excluded_from_new_sessions_but_keeps_affinity() {
+        let mut r = router(
+            vec![node("gpu-0", true, 0.1, 0), node("gpu-1", true, 0.9, 0)],
+            RoutingPolicy::AffinityThenLoad,
+        );
+        // s1 pins to gpu-0 (least loaded).
+        let req = RouteRequest {
+            session_id: Some("s1".into()),
+            system_prompt_hash: None,
+        };
+        let pinned = r.route(&req).unwrap();
+        assert_eq!(pinned, NodeId::new("gpu-0"));
+        // Drain gpu-0: existing session s1 still sticks (affinity honored)...
+        assert!(r.set_draining(&pinned, true));
+        assert!(r.is_draining(&pinned));
+        let again = r.route_decision(&req).unwrap();
+        assert_eq!(again.0, pinned);
+        assert_eq!(again.1, RoutingDecision::Affinity);
+        // ...but a brand new session avoids the draining node.
+        let req2 = RouteRequest {
+            session_id: Some("s2".into()),
+            system_prompt_hash: None,
+        };
+        let new = r.route(&req2).unwrap();
+        assert_eq!(new, NodeId::new("gpu-1"));
+    }
+
+    #[test]
+    fn set_draining_unknown_node_is_false() {
+        let mut r = router(
+            vec![node("gpu-0", true, 0.1, 0)],
+            RoutingPolicy::AffinityThenLoad,
+        );
+        assert!(!r.set_draining(&NodeId::new("ghost"), true));
+    }
+
+    #[test]
+    fn draining_all_nodes_yields_no_route_for_new_session() {
+        let mut r = router(
+            vec![node("gpu-0", true, 0.1, 0)],
+            RoutingPolicy::AffinityThenLoad,
+        );
+        assert!(r.set_draining(&NodeId::new("gpu-0"), true));
+        let req = RouteRequest {
+            session_id: Some("s1".into()),
+            system_prompt_hash: None,
+        };
+        assert_eq!(r.route(&req), None);
+    }
+
+    #[test]
+    fn rebalance_moves_sessions_off_draining_node() {
+        let mut r = router(
+            vec![node("gpu-0", true, 0.2, 0), node("gpu-1", true, 0.1, 0)],
+            RoutingPolicy::AffinityThenLoad,
+        );
+        // Pin s1 to gpu-1 (least loaded).
+        let req = RouteRequest {
+            session_id: Some("s1".into()),
+            system_prompt_hash: None,
+        };
+        let pinned = r.route(&req).unwrap();
+        assert_eq!(pinned, NodeId::new("gpu-1"));
+        // Drain gpu-1 and rebalance: s1 should move to gpu-0.
+        r.set_draining(&pinned, true);
+        let moved = r.rebalance();
+        assert_eq!(moved, 1);
+        assert_eq!(r.session_map().get("s1"), Some(&NodeId::new("gpu-0")));
+        let migrations = r.session_map().migrations();
+        assert_eq!(migrations.last().unwrap().reason, MigrationReason::Rebalance);
+    }
+
+    #[test]
+    fn rebalance_noop_when_nodes_healthy_and_unloaded() {
+        let mut r = router(
+            vec![node("gpu-0", true, 0.2, 0), node("gpu-1", true, 0.1, 0)],
+            RoutingPolicy::AffinityThenLoad,
+        );
+        let req = RouteRequest {
+            session_id: Some("s1".into()),
+            system_prompt_hash: None,
+        };
+        r.route(&req);
+        assert_eq!(r.rebalance(), 0);
     }
 }

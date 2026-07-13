@@ -1622,13 +1622,23 @@ dependencies = [
 name = "onnx-genai-router"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "axum",
+ "bytes",
+ "clap",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "serde",
  "serde_json",
  "serde_yaml",
  "tempfile",
  "thiserror",
  "tokio",
+ "tokio-stream",
+ "tower",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
