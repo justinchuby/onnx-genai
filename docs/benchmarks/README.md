@@ -8,11 +8,12 @@ primary comparison.
 ## Current-state comparison
 
 The current honest checkpoint is
-[`2026-07-12-JustindeMacBook-Pro-gqa-fixed.md`](2026-07-12-JustindeMacBook-Pro-gqa-fixed.md).
-It covers correctness-verified fp16 GQA WebGPU, the first correctness-valid Q4
-CPU result, LM Studio Metal, and LM Studio with GPU off for CPU-vs-CPU parity.
-The older reports below are historical trajectories and include the invalid
-pre-fix Q4 artifact where explicitly noted.
+[`2026-07-12-JustindeMacBook-Pro-q4-gqa-webgpu.md`](2026-07-12-JustindeMacBook-Pro-q4-gqa-webgpu.md).
+It is the first correctness-verified, same-source GPU comparison with both Q4
+`MatMulNBits` weights and on-device `GroupQueryAttention`: 30.52/29.21 tok/s
+for onnx-genai WebGPU versus 201.60/221.82 tok/s for LM Studio Metal. The prior
+[`gqa-fixed`](2026-07-12-JustindeMacBook-Pro-gqa-fixed.md) report contains the
+fp16-GQA and Q4-CPU trajectory.
 
 ## Methodology
 
