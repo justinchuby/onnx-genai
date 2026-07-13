@@ -32,6 +32,11 @@ struct Cli {
     /// Maximum active plus queued generation requests. Falls back to ONNX_GENAI_MAX_QUEUE_DEPTH.
     #[arg(long, env = "ONNX_GENAI_MAX_QUEUE_DEPTH", default_value_t = 256)]
     max_queue_depth: usize,
+
+    /// Enable /v1/debug/* introspection endpoints. Off by default. Use only on loopback-bound
+    /// servers or behind an authenticated proxy. Falls back to ONNX_GENAI_DEBUG_ENDPOINTS=1.
+    #[arg(long, env = "ONNX_GENAI_DEBUG_ENDPOINTS")]
+    enable_debug_endpoints: bool,
 }
 
 #[tokio::main]
@@ -48,6 +53,7 @@ async fn main() -> anyhow::Result<()> {
             max_output_tokens: cli.max_output_tokens,
             max_sessions: cli.max_sessions,
             max_queue_depth: cli.max_queue_depth,
+            enable_debug_endpoints: cli.enable_debug_endpoints,
         },
     )?;
     tracing::info!(addr = %cli.addr, model = state.model_id(), "starting onnx-genai server");

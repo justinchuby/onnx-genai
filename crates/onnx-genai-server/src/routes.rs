@@ -280,7 +280,7 @@ pub(crate) async fn debug_sessions(
     let snapshot = crate::metrics::snapshot();
     let sessions = state
         .sessions
-        .client_ids()
+        .client_ids_redacted()
         .map_err(|err| ApiError::internal(format!("session registry failed: {err}")))?;
     Ok(Json(DebugSessionsResponse {
         active_sessions: snapshot.active_sessions,

@@ -114,12 +114,16 @@ impl SessionRegistry {
         Ok(format!("sess-{}", hex_token(&bytes)))
     }
 
-    pub(crate) fn client_ids(&self) -> anyhow::Result<Vec<String>> {
+    pub(crate) fn client_ids_redacted(&self) -> anyhow::Result<Vec<String>> {
         let inner = self
             .inner
             .lock()
             .map_err(|_| anyhow::anyhow!("session registry mutex poisoned"))?;
-        let mut ids = inner.sessions.keys().cloned().collect::<Vec<_>>();
+        let mut ids: Vec<String> = inner
+            .sessions
+            .keys()
+            .map(|id| redact_session_id(id))
+            .collect();
         ids.sort_unstable();
         Ok(ids)
     }
@@ -147,4 +151,23 @@ fn hex_token(bytes: &[u8]) -> String {
         out.push(HEX[(byte & 0x0f) as usize] as char);
     }
     out
+}
+
+/// Redact a session capability ID to prevent replay attacks.
+///
+/// Full IDs like `sess-{32hex}` are bearer tokens; we show only the first 8 hex
+/// chars (32 bits) followed by `…`, enough for log correlation without enabling
+/// session hijacking or deletion.
+fn redact_session_id(id: &str) -> String {
+    // Expected format: "sess-<32 hex chars>"
+    // Keep the prefix up to and including the first 8 hex chars, then append "…".
+    const PREFIX: &str = "sess-";
+    const VISIBLE_HEX: usize = 8;
+    if let Some(hex_part) = id.strip_prefix(PREFIX) {
+        let keep = hex_part.len().min(VISIBLE_HEX);
+        format!("{PREFIX}{}…", &hex_part[..keep])
+    } else {
+        // Unknown format — redact entirely.
+        "[redacted]".to_string()
+    }
 }

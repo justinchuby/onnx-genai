@@ -43,14 +43,10 @@ pub use types::{
 };
 
 pub fn app(state: AppState) -> Router {
-    let router = Router::new()
+    let mut router = Router::new()
         .route("/health", get(routes::health))
         .route("/v1/models", get(routes::models))
         .route("/v1/status", get(routes::status))
-        .route("/v1/debug/config", get(routes::debug_config))
-        .route("/v1/debug/sessions", get(routes::debug_sessions))
-        .route("/v1/debug/kv", get(routes::debug_kv))
-        .route("/v1/debug/trace", get(routes::debug_trace))
         .route("/v1/sessions", post(routes::create_session))
         .route("/v1/sessions/{id}", delete(routes::delete_session))
         .route("/v1/completions", post(routes::completions))
@@ -60,6 +56,13 @@ pub fn app(state: AppState) -> Router {
             post(routes::audio_transcriptions).layer(DefaultBodyLimit::max(25 * 1024 * 1024)),
         )
         .route("/v1/chat/completions", post(routes::chat_completions));
+    if state.config.enable_debug_endpoints {
+        router = router
+            .route("/v1/debug/config", get(routes::debug_config))
+            .route("/v1/debug/sessions", get(routes::debug_sessions))
+            .route("/v1/debug/kv", get(routes::debug_kv))
+            .route("/v1/debug/trace", get(routes::debug_trace));
+    }
     #[cfg(feature = "metrics")]
     let router = router.route("/metrics", get(routes::prometheus_metrics));
     router

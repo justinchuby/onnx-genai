@@ -40,6 +40,11 @@ pub struct ServerConfig {
     pub max_sessions: usize,
     /// Maximum generation requests admitted to the driver, including active and queued work.
     pub max_queue_depth: usize,
+    /// Enable the /v1/debug/* introspection endpoints. Off by default; enable with
+    /// `--enable-debug-endpoints` or `ONNX_GENAI_DEBUG_ENDPOINTS=1`. These endpoints
+    /// expose server internals and should only be used on loopback-bound instances or
+    /// behind an authenticated reverse proxy.
+    pub enable_debug_endpoints: bool,
 }
 
 impl Default for ServerConfig {
@@ -48,6 +53,7 @@ impl Default for ServerConfig {
             max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
             max_sessions: DEFAULT_MAX_SESSIONS,
             max_queue_depth: DEFAULT_MAX_QUEUE_DEPTH,
+            enable_debug_endpoints: false,
         }
     }
 }

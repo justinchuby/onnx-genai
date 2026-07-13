@@ -21,6 +21,19 @@ fn tiny_state() -> AppState {
     AppState::load(&model_dir, Some("tiny-llm".to_string())).expect("load fixture")
 }
 
+fn tiny_state_with_debug() -> AppState {
+    let model_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
+    AppState::load_with_config(
+        &model_dir,
+        Some("tiny-llm".to_string()),
+        ServerConfig {
+            enable_debug_endpoints: true,
+            ..ServerConfig::default()
+        },
+    )
+    .expect("load fixture with debug")
+}
+
 fn sse_json_events(body: &[u8]) -> Vec<Value> {
     std::str::from_utf8(body)
         .unwrap()
@@ -824,7 +837,7 @@ async fn status_reports_sane_server_fields() {
 
 #[tokio::test]
 async fn debug_endpoints_expose_config_sessions_cache_and_trace_state() {
-    let router = app(tiny_state());
+    let router = app(tiny_state_with_debug());
 
     let config = router
         .clone()
@@ -871,11 +884,20 @@ async fn debug_endpoints_expose_config_sessions_cache_and_trace_state() {
     assert_eq!(sessions.status(), StatusCode::OK);
     let sessions: Value =
         serde_json::from_slice(&to_bytes(sessions.into_body(), usize::MAX).await.unwrap()).unwrap();
+    // The list must contain a redacted entry for the created session, but must NOT
+    // contain the raw bearer credential (full capability ID).
+    let raw_id = created["id"].as_str().unwrap();
+    let session_list = sessions["sessions"].as_array().unwrap();
     assert!(
-        sessions["sessions"]
-            .as_array()
-            .unwrap()
-            .contains(&created["id"])
+        !session_list.iter().any(|v| v.as_str() == Some(raw_id)),
+        "raw session ID must not appear in debug/sessions response"
+    );
+    // Redacted form starts with "sess-" and ends with "…"
+    assert!(
+        session_list
+            .iter()
+            .any(|v| v.as_str().is_some_and(|s| s.starts_with("sess-") && s.ends_with('…'))),
+        "expected a redacted session entry (sess-<prefix>…) in debug/sessions"
     );
 
     let cache = router
@@ -915,6 +937,34 @@ async fn debug_endpoints_expose_config_sessions_cache_and_trace_state() {
             .unwrap()
             .contains("not implemented")
     );
+}
+
+#[tokio::test]
+async fn debug_endpoints_return_404_when_gate_is_off() {
+    // Default state has enable_debug_endpoints = false; routes must not be registered.
+    let router = app(tiny_state());
+    for path in &[
+        "/v1/debug/config",
+        "/v1/debug/sessions",
+        "/v1/debug/kv",
+        "/v1/debug/trace",
+    ] {
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(*path)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "{path} must return 404 when debug endpoints are disabled"
+        );
+    }
 }
 
 #[cfg(feature = "metrics")]
@@ -1140,6 +1190,7 @@ async fn queue_depth_admission_limit_returns_429_with_retry_after() {
             max_output_tokens: 16,
             max_sessions: 8,
             max_queue_depth: 1,
+            enable_debug_endpoints: false,
         },
     )
     .unwrap();
