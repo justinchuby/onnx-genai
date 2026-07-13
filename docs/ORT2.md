@@ -967,9 +967,39 @@ onnx-genai/                              (monorepo — was onnx-genai, now inclu
 └── Cargo.toml                           # Workspace
 ```
 
-**Migration path:** `onnx-genai-ort` (current ORT C API bindings) is eventually replaced by
-`ort-session` (our own runtime). During transition, both coexist — GenAI crates can target
-either backend.
+**Migration path:** The GenAI crates (`onnx-genai-engine`, `onnx-genai-kv`, etc.) depend on
+a **backend trait**, not a concrete runtime. At build time, a Cargo feature selects which
+backend to compile against:
+
+```toml
+# In onnx-genai-engine/Cargo.toml
+[features]
+default = ["backend-ort"]        # use upstream ORT via C API bindings
+backend-ort = ["dep:onnx-genai-ort"]   # existing ORT C API wrapper
+backend-ort2 = ["dep:ort-session"]     # our own runtime
+```
+
+```rust
+/// Backend-agnostic inference trait.
+/// Both onnx-genai-ort (upstream ORT) and ort-session (ORT 2.0) implement this.
+pub trait InferenceBackend: Send + Sync {
+    type Session: InferenceSession;
+    fn load_model(&self, path: &Path, options: &SessionOptions) -> Result<Self::Session>;
+}
+
+pub trait InferenceSession: Send {
+    fn run(&mut self, inputs: &[Tensor], outputs: &mut [Tensor]) -> Result<()>;
+    fn io_binding(&mut self) -> Result<IoBinding<'_>>;
+}
+```
+
+This lets users choose:
+- `backend-ort`: production-proven, full opset coverage, all existing EPs — the safe default
+- `backend-ort2`: our runtime with better placement, async transfer, strided layout — opt-in
+
+Both backends are tested in CI. The GenAI layer is backend-agnostic — KV cache, batching,
+speculative decoding, and the HTTP server work identically regardless of which runtime
+executes the ONNX graph underneath.
 
 ---
 
