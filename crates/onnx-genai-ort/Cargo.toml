@@ -13,7 +13,7 @@ default = []
 cuda = []
 
 [dependencies]
-half = "2"
+half = { version = "2", features = ["use-intrinsics"] }
 minijinja = { version = "2", features = ["json"] }
 onnx-genai-metadata = { workspace = true }
 onnx-genai-ort-sys = { workspace = true }

@@ -247,11 +247,17 @@ impl Value {
         match self.dtype {
             DataType::Float32 => self.to_vec_f32(),
             DataType::Float16 => {
-                let bits: Vec<u16> = tensor_data_to_vec(self.ptr.as_ptr(), self.numel())?;
-                Ok(bits
-                    .into_iter()
-                    .map(|value| half::f16::from_bits(value).to_f32())
-                    .collect())
+                let numel = self.numel();
+                let data = tensor_data_ptr(self.ptr.as_ptr())?;
+                // SAFETY: an fp16 tensor holds `numel` contiguous u16 elements at
+                // `data`, valid until this Value is released; we only read here.
+                let bits = unsafe { std::slice::from_raw_parts(data.cast::<u16>(), numel) };
+                // Reinterpret the raw bits as f16 and widen with half's vectorized
+                // slice conversion (hardware F16C when available), which is far
+                // faster than a per-element `from_bits().to_f32()` scalar loop on
+                // the hot logits path (~152K elements per decode step).
+                let halves: &[half::f16] = half::slice::HalfBitsSliceExt::reinterpret_cast(bits);
+                Ok(half::slice::HalfFloatSliceExt::to_f32_vec(halves))
             }
             other => Err(OrtError::InvalidArgument(format!(
                 "cannot widen {other:?} tensor to f32"
