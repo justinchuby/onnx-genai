@@ -1,0 +1,1742 @@
+{
+  "$id": "https://github.com/onnx/onnx/issues/8184",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ONNX Inference Metadata",
+  "description": "Portable, runtime-agnostic inference metadata for ONNX generative models. All top-level sections are optional, and unknown fields are permitted for forward-compatible schema evolution.",
+  "type": "object",
+  "properties": {
+    "hardware_requirements": {
+      "description": "Minimum and beneficial hardware capabilities used for distribution matching.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/HardwareRequirements"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "kv_cache": {
+      "description": "KV-cache storage, quantization tolerance, and operational semantics.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/KvCacheSpec"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "model": {
+      "description": "Build-time model properties and runtime-configurable capabilities.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ModelCapabilities"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "pipeline": {
+      "description": "Declarative multi-model pipeline and its dataflow graph.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/PipelineSpec"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "quantization": {
+      "description": "Model weight quantization intent, independent of the packed representation.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/QuantizationIntent"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "required_capabilities": {
+      "description": "Capability identifiers that a runtime MUST support or refuse to load the model.",
+      "type": "array",
+      "default": [],
+      "examples": [
+        [
+          "kv_cache",
+          "grouped_query_attention"
+        ]
+      ],
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "speculative": {
+      "description": "Standalone speculative proposer declaration.\n\nThis is the preferred native source for speculator discovery;\nHuggingFace `config.json` is a compatibility fallback. The deprecated\n`speculator_config` alias is accepted on input.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/SpeculatorConfig"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "speculator_config": {
+      "description": "Deprecated alias for `speculative`.",
+      "allOf": [
+        {
+          "description": "Standalone speculative proposer declaration.\n\nThis is the preferred native source for speculator discovery;\nHuggingFace `config.json` is a compatibility fallback. The deprecated\n`speculator_config` alias is accepted on input.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SpeculatorConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      ],
+      "deprecated": true
+    },
+    "strategy": {
+      "description": "Generic inference strategy, including speculative decoding.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/StrategySpec"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "structured_output": {
+      "description": "Structured-output formats and model training conventions.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/StructuredOutputSpec"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  },
+  "allOf": [
+    {
+      "not": {
+        "required": [
+          "speculative",
+          "speculator_config"
+        ]
+      }
+    }
+  ],
+  "$defs": {
+    "AcceptanceMethod": {
+      "description": "Speculative acceptance-rule vocabulary.",
+      "type": "string",
+      "oneOf": [
+        {
+          "title": "Known standard value",
+          "enum": [
+            "rejection_sampling",
+            "greedy",
+            "typical"
+          ]
+        },
+        {
+          "title": "Forward-compatible extension value",
+          "type": "string",
+          "not": {
+            "enum": [
+              "rejection_sampling",
+              "greedy",
+              "typical"
+            ]
+          }
+        }
+      ]
+    },
+    "AttentionConfig": {
+      "description": "Build-time attention architecture and dimensions.",
+      "type": "object",
+      "properties": {
+        "fallback_behavior": {
+          "description": "Compatible attention behavior for runtimes that do not recognize `type`.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AttentionType"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "head_dim": {
+          "description": "Per-head hidden dimension.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 1
+        },
+        "num_attention_heads": {
+          "description": "Number of query/attention heads.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 1
+        },
+        "num_kv_heads": {
+          "description": "Number of key/value heads; required by runtimes that need explicit GQA dimensions.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 1
+        },
+        "sliding_window": {
+          "description": "Sliding-window length in tokens, or null for full-context attention.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 1
+        },
+        "type": {
+          "description": "Attention architecture.\n\nCanonical values include `multi_head`, `grouped_query`, and\n`multi_latent`; future values are allowed when paired with a usable\n`fallback_behavior`.",
+          "$ref": "#/$defs/AttentionType"
+        }
+      },
+      "required": [
+        "type"
+      ]
+    },
+    "AttentionType": {
+      "description": "Attention architecture vocabulary with an extension branch.",
+      "type": "string",
+      "oneOf": [
+        {
+          "title": "Known standard value",
+          "enum": [
+            "multi_head",
+            "multi_head_attention",
+            "grouped_query",
+            "group_query_attention",
+            "grouped_query_attention",
+            "gqa",
+            "multi_latent",
+            "multi_latent_attention",
+            "mla"
+          ]
+        },
+        {
+          "title": "Forward-compatible extension value",
+          "type": "string",
+          "not": {
+            "enum": [
+              "multi_head",
+              "multi_head_attention",
+              "grouped_query",
+              "group_query_attention",
+              "grouped_query_attention",
+              "gqa",
+              "multi_latent",
+              "multi_latent_attention",
+              "mla"
+            ]
+          }
+        }
+      ]
+    },
+    "ChunkedPrefillConfig": {
+      "description": "Runtime chunked-prefill preference.",
+      "type": "object",
+      "properties": {
+        "chunk_size": {
+          "description": "Preferred number of prompt tokens processed in each prefill chunk.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 1
+        }
+      }
+    },
+    "DType": {
+      "description": "Scalar dtype vocabulary with common ONNX and runtime aliases.",
+      "type": "string",
+      "oneOf": [
+        {
+          "title": "Known standard value",
+          "enum": [
+            "float32",
+            "fp32",
+            "float16",
+            "fp16",
+            "half",
+            "bfloat16",
+            "bf16",
+            "float8_e4m3fn",
+            "fp8_e4m3fn",
+            "float8_e4m3",
+            "fp8_e4m3",
+            "float8_e5m2",
+            "fp8_e5m2",
+            "int8",
+            "uint8",
+            "int4",
+            "uint4"
+          ]
+        },
+        {
+          "title": "Forward-compatible extension value",
+          "type": "string",
+          "not": {
+            "enum": [
+              "float32",
+              "fp32",
+              "float16",
+              "fp16",
+              "half",
+              "bfloat16",
+              "bf16",
+              "float8_e4m3fn",
+              "fp8_e4m3fn",
+              "float8_e4m3",
+              "fp8_e4m3",
+              "float8_e5m2",
+              "fp8_e5m2",
+              "int8",
+              "uint8",
+              "int4",
+              "uint4"
+            ]
+          }
+        }
+      ]
+    },
+    "DataflowEdge": {
+      "description": "Directed connection between two pipeline component ports.",
+      "type": "object",
+      "properties": {
+        "device_transfer": {
+          "description": "Whether the runtime must move the value between execution devices.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "dtype": {
+          "description": "Scalar or logical data type at the component boundary.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TensorDType"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "from": {
+          "description": "Source endpoint in `component.output_name` form.",
+          "type": "string",
+          "examples": [
+            "encoder.hidden_states"
+          ],
+          "pattern": "^[^.]+\\.[^.]+$"
+        },
+        "to": {
+          "description": "Destination endpoint in `component.input_name` form.",
+          "type": "string",
+          "examples": [
+            "decoder.encoder_hidden_states"
+          ],
+          "pattern": "^[^.]+\\.[^.]+$"
+        }
+      },
+      "required": [
+        "from",
+        "to"
+      ]
+    },
+    "DevicePreference": {
+      "description": "Execution-device preference vocabulary.",
+      "type": "string",
+      "oneOf": [
+        {
+          "title": "Known standard value",
+          "enum": [
+            "auto",
+            "cpu",
+            "cuda",
+            "rocm",
+            "directml",
+            "coreml",
+            "webgpu",
+            "npu"
+          ]
+        },
+        {
+          "title": "Forward-compatible extension value",
+          "type": "string",
+          "not": {
+            "enum": [
+              "auto",
+              "cpu",
+              "cuda",
+              "rocm",
+              "directml",
+              "coreml",
+              "webgpu",
+              "npu"
+            ]
+          }
+        }
+      ]
+    },
+    "DraftConfig": {
+      "description": "Draft-token producer configuration.",
+      "type": "object",
+      "properties": {
+        "depth": {
+          "description": "Self-speculative early-exit depth.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 1
+        },
+        "heads": {
+          "description": "Named draft-head layout or selection.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "ngram": {
+          "description": "Runtime-specific n-gram or prompt-lookup configuration."
+        },
+        "producer": {
+          "description": "Producer family: `draft_model`, `self_speculative`, `ngram`, or `extra_heads`.",
+          "$ref": "#/$defs/DraftProducer"
+        },
+        "session": {
+          "description": "Named runtime session or pipeline component used as the producer.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "producer"
+      ]
+    },
+    "DraftProducer": {
+      "description": "Speculative draft-producer vocabulary.",
+      "type": "string",
+      "oneOf": [
+        {
+          "title": "Known standard value",
+          "enum": [
+            "draft_model",
+            "self_speculative",
+            "ngram",
+            "extra_heads"
+          ]
+        },
+        {
+          "title": "Forward-compatible extension value",
+          "type": "string",
+          "not": {
+            "enum": [
+              "draft_model",
+              "self_speculative",
+              "ngram",
+              "extra_heads"
+            ]
+          }
+        }
+      ]
+    },
+    "ForkPrecisionPolicy": {
+      "description": "KV fork-precision policy vocabulary.",
+      "type": "string",
+      "oneOf": [
+        {
+          "title": "Known standard value",
+          "enum": [
+            "inherit",
+            "highest",
+            "independent"
+          ]
+        },
+        {
+          "title": "Forward-compatible extension value",
+          "type": "string",
+          "not": {
+            "enum": [
+              "inherit",
+              "highest",
+              "independent"
+            ]
+          }
+        }
+      ]
+    },
+    "HardwareRequirements": {
+      "description": "Model-side hardware requirements and distribution-matching hints.",
+      "type": "object",
+      "properties": {
+        "beneficial_dtypes": {
+          "description": "Dtypes that improve performance or memory use but are not mandatory.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "$ref": "#/$defs/DType"
+          }
+        },
+        "kv_cache_memory_per_1k_tokens_mb": {
+          "description": "Estimated KV-cache memory in MiB per 1,000 cached tokens.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "float",
+          "minimum": 0.0
+        },
+        "min_memory_gb": {
+          "description": "Minimum aggregate accelerator or system memory in GiB.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "float",
+          "minimum": 0.0
+        },
+        "min_tp_degree": {
+          "description": "Minimum useful tensor-parallel degree when tensor parallelism is selected.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 1
+        },
+        "required_dtypes": {
+          "description": "Dtypes the selected device or execution provider must support.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "$ref": "#/$defs/DType"
+          }
+        },
+        "supports_tensor_parallel": {
+          "description": "Whether the model can be partitioned with tensor parallelism.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      }
+    },
+    "KvCacheOperations": {
+      "description": "Operational guarantees for mutable KV-cache state.",
+      "type": "object",
+      "properties": {
+        "checkpoint_serializable": {
+          "description": "Whether checkpoints can be serialized for suspend/resume or migration.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "fork_precision_policy": {
+          "description": "Precision policy for a copy-on-write fork, such as `inherit` or `highest`.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ForkPrecisionPolicy"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "rewind_safe": {
+          "description": "Whether truncating cache state to an earlier token position is correctness-preserving.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      }
+    },
+    "KvCacheSpec": {
+      "description": "KV-cache storage, precision tolerance, and operational guarantees.",
+      "type": "object",
+      "properties": {
+        "native_dtype": {
+          "description": "Native KV scalar dtype produced by the model before optional compression.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DType"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "operations": {
+          "description": "Cache mutation and persistence operations known to be safe for this model.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/KvCacheOperations"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "quantization_tolerance": {
+          "description": "Independent precision tolerance for key and value tensors.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/KvQuantTolerance"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "sensitive_layers": {
+          "description": "Layer indices that should retain high precision; negative indices count from the end.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "integer",
+            "format": "int32"
+          }
+        }
+      }
+    },
+    "KvComponentTolerance": {
+      "description": "Quantization tolerance for one KV-cache component.",
+      "type": "object",
+      "properties": {
+        "default": {
+          "description": "Default minimum acceptable scalar dtype for this component.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DType"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "per_layer": {
+          "description": "Layer-specific minimum-precision overrides.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "$ref": "#/$defs/LayerPrecisionOverride"
+          }
+        },
+        "quantization_axis": {
+          "description": "Quantization scaling axis, such as `per_tensor`, `per_channel`, or `per_token`.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/QuantizationAxis"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "KvQuantTolerance": {
+      "description": "Precision tolerance for key and value cache components.",
+      "type": "object",
+      "properties": {
+        "key": {
+          "description": "Key-cache precision tolerance.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/KvComponentTolerance"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "value": {
+          "description": "Value-cache precision tolerance.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/KvComponentTolerance"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "LayerPrecisionOverride": {
+      "description": "Minimum precision required by a set of model layers.",
+      "type": "object",
+      "properties": {
+        "layers": {
+          "description": "Non-empty layer-index list; negative indices count from the final layer.",
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "minItems": 1
+        },
+        "min_precision": {
+          "description": "Minimum acceptable scalar dtype for the listed layers.",
+          "$ref": "#/$defs/DType"
+        }
+      },
+      "required": [
+        "layers",
+        "min_precision"
+      ]
+    },
+    "ModelCapabilities": {
+      "description": "Model properties that are baked into the graph or advertised as configurable.",
+      "type": "object",
+      "properties": {
+        "attention": {
+          "description": "Attention architecture and dimensions.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AttentionConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "max_sequence_length": {
+          "description": "Maximum total sequence length, in tokens.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 1
+        },
+        "runtime_configurable": {
+          "description": "Features that a serving runtime may configure at load time.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RuntimeConfigurable"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "speculative": {
+          "description": "Built-in draft-head or self-speculative model properties.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SpeculativeModelInfo"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "PerformanceHints": {
+      "description": "Publisher-provided speculative decoding performance guidance.",
+      "type": "object",
+      "properties": {
+        "expected_acceptance_rate": {
+          "description": "Expected fraction of proposed tokens accepted, from 0.0 through 1.0.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "float",
+          "maximum": 1.0,
+          "minimum": 0.0
+        },
+        "optimal_k": {
+          "description": "Recommended number of draft tokens per verification step.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 1
+        }
+      }
+    },
+    "PhaseConfig": {
+      "description": "Phase gate for one pipeline component.",
+      "type": "object",
+      "properties": {
+        "run_on": {
+          "description": "Pipeline phase in which the component runs.",
+          "$ref": "#/$defs/PhaseRunOn"
+        }
+      },
+      "required": [
+        "run_on"
+      ]
+    },
+    "PhaseRunOn": {
+      "description": "Pipeline phase gate.\n\nKnown values are enumerated while future strings remain valid.",
+      "type": "string",
+      "oneOf": [
+        {
+          "title": "Known standard value",
+          "enum": [
+            "prompt_only",
+            "every_step",
+            "always",
+            "final_only",
+            "on_demand"
+          ]
+        },
+        {
+          "title": "Forward-compatible extension value",
+          "type": "string",
+          "not": {
+            "enum": [
+              "prompt_only",
+              "every_step",
+              "always",
+              "final_only",
+              "on_demand"
+            ]
+          }
+        }
+      ]
+    },
+    "PipelineComponentSpec": {
+      "description": "One executable ONNX model in a pipeline.",
+      "type": "object",
+      "properties": {
+        "device_preference": {
+          "description": "Optional execution or device preference declared by the model package.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DevicePreference"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "filename": {
+          "description": "Non-empty ONNX filename relative to the model package root.",
+          "type": "string",
+          "examples": [
+            "decoder.onnx"
+          ],
+          "minLength": 1
+        },
+        "tokenizer": {
+          "description": "Tokenizer filename relative to the package root.\n\nIf absent, loaders may use a shared top-level `tokenizer.json`.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "examples": [
+            "tokenizer.json"
+          ],
+          "minLength": 1
+        },
+        "type": {
+          "description": "Component role, for example `encoder`, `decoder`, `draft`, `denoiser`, or `vocoder`.",
+          "$ref": "#/$defs/PipelineRole"
+        }
+      },
+      "required": [
+        "filename",
+        "type"
+      ]
+    },
+    "PipelineRole": {
+      "description": "Pipeline component-role vocabulary.",
+      "type": "string",
+      "oneOf": [
+        {
+          "title": "Known standard value",
+          "enum": [
+            "encoder",
+            "vision_encoder",
+            "audio_encoder",
+            "decoder",
+            "draft",
+            "denoiser",
+            "scheduler",
+            "vocoder",
+            "speech_synthesis"
+          ]
+        },
+        {
+          "title": "Forward-compatible extension value",
+          "type": "string",
+          "not": {
+            "enum": [
+              "encoder",
+              "vision_encoder",
+              "audio_encoder",
+              "decoder",
+              "draft",
+              "denoiser",
+              "scheduler",
+              "vocoder",
+              "speech_synthesis"
+            ]
+          }
+        }
+      ]
+    },
+    "PipelineSpec": {
+      "description": "Multi-model pipeline represented as a directed acyclic dataflow graph.",
+      "type": "object",
+      "properties": {
+        "dataflow": {
+          "description": "Directed tensor or data edges between component ports.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/DataflowEdge"
+          }
+        },
+        "models": {
+          "description": "Named model components in the pipeline DAG; at least one component is required.",
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/PipelineComponentSpec"
+          },
+          "minProperties": 1
+        },
+        "phases": {
+          "description": "Optional per-component phase gating, keyed by component name.",
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/PhaseConfig"
+          }
+        },
+        "strategy": {
+          "description": "Loop and execution strategy for the pipeline.",
+          "$ref": "#/$defs/PipelineStrategy"
+        }
+      },
+      "required": [
+        "models",
+        "strategy"
+      ]
+    },
+    "PipelineStrategy": {
+      "description": "Parameterized execution strategy for a pipeline or composite stage.",
+      "type": "object",
+      "properties": {
+        "batching": {
+          "description": "Runtime-specific batching parameters."
+        },
+        "decoder": {
+          "description": "Autoregressive decoder component name.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "denoiser": {
+          "description": "Iterative or diffusion denoiser component name.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "guidance_scale": {
+          "description": "Classifier-free guidance scale or equivalent strategy-specific multiplier.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "float",
+          "minimum": 0.0
+        },
+        "kind": {
+          "description": "Strategy family; determines which strategy-specific fields are meaningful.",
+          "$ref": "#/$defs/PipelineStrategyKind"
+        },
+        "kv_cache": {
+          "description": "Runtime-specific KV-cache strategy parameters."
+        },
+        "max_tokens": {
+          "description": "Maximum number of tokens generated by an autoregressive stage.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 1
+        },
+        "model": {
+          "description": "Single-pass component name.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "num_steps": {
+          "description": "Number of iterative or diffusion steps.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 1
+        },
+        "scheduler": {
+          "description": "Scheduler identifier for iterative or diffusion execution.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "speculative": {
+          "description": "Runtime-specific speculative execution parameters."
+        },
+        "stages": {
+          "description": "Ordered child stages for a composite strategy.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PipelineStrategyStage"
+          }
+        },
+        "state": {
+          "description": "Runtime-specific iterative state declaration."
+        },
+        "stop_conditions": {
+          "description": "Runtime-specific stop-condition declarations.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": true
+        }
+      },
+      "required": [
+        "kind"
+      ]
+    },
+    "PipelineStrategyKind": {
+      "description": "Pipeline execution strategy family.\n\nKnown values are enumerated while future strings remain valid.",
+      "type": "string",
+      "oneOf": [
+        {
+          "title": "Known standard value",
+          "enum": [
+            "autoregressive",
+            "iterative",
+            "diffusion_steps",
+            "diffusion-steps",
+            "single_pass",
+            "single-pass",
+            "composite"
+          ]
+        },
+        {
+          "title": "Forward-compatible extension value",
+          "type": "string",
+          "not": {
+            "enum": [
+              "autoregressive",
+              "iterative",
+              "diffusion_steps",
+              "diffusion-steps",
+              "single_pass",
+              "single-pass",
+              "composite"
+            ]
+          }
+        }
+      ]
+    },
+    "PipelineStrategyStage": {
+      "description": "Named child stage of a composite pipeline strategy.",
+      "type": "object",
+      "properties": {
+        "name": {
+          "description": "Non-empty stage name unique within its containing composite.",
+          "type": "string",
+          "minLength": 1
+        },
+        "run_on": {
+          "description": "Optional phase gate for the stage.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PhaseRunOn"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "strategy": {
+          "description": "Execution strategy for this stage.",
+          "$ref": "#/$defs/PipelineStrategy"
+        }
+      },
+      "required": [
+        "name",
+        "strategy"
+      ]
+    },
+    "Precision": {
+      "description": "Weight precision and quantization-recipe vocabulary.",
+      "type": "string",
+      "oneOf": [
+        {
+          "title": "Known standard value",
+          "enum": [
+            "float32",
+            "fp32",
+            "float16",
+            "fp16",
+            "bfloat16",
+            "bf16",
+            "float8_e4m3fn",
+            "float8_e5m2",
+            "int8",
+            "int4",
+            "int4_group128"
+          ]
+        },
+        {
+          "title": "Forward-compatible extension value",
+          "type": "string",
+          "not": {
+            "enum": [
+              "float32",
+              "fp32",
+              "float16",
+              "fp16",
+              "bfloat16",
+              "bf16",
+              "float8_e4m3fn",
+              "float8_e5m2",
+              "int8",
+              "int4",
+              "int4_group128"
+            ]
+          }
+        }
+      ]
+    },
+    "ProposalTopology": {
+      "description": "Speculative proposal-topology vocabulary.",
+      "type": "string",
+      "oneOf": [
+        {
+          "title": "Known standard value",
+          "enum": [
+            "linear",
+            "tree"
+          ]
+        },
+        {
+          "title": "Forward-compatible extension value",
+          "type": "string",
+          "not": {
+            "enum": [
+              "linear",
+              "tree"
+            ]
+          }
+        }
+      ]
+    },
+    "ProposalType": {
+      "description": "Speculator proposal architecture.\n\nKnown spellings are enumerated in the generated schema while unknown\nstrings remain valid to preserve forward compatibility.",
+      "type": "string",
+      "oneOf": [
+        {
+          "title": "Known standard value",
+          "enum": [
+            "eagle",
+            "eagle3",
+            "eagle-3",
+            "peagle",
+            "p-eagle",
+            "mtp",
+            "dflash",
+            "d-flash"
+          ]
+        },
+        {
+          "title": "Forward-compatible extension value",
+          "type": "string",
+          "not": {
+            "enum": [
+              "eagle",
+              "eagle3",
+              "eagle-3",
+              "peagle",
+              "p-eagle",
+              "mtp",
+              "dflash",
+              "d-flash"
+            ]
+          }
+        }
+      ]
+    },
+    "QuantizationAxis": {
+      "description": "Quantization scaling-axis vocabulary.",
+      "type": "string",
+      "oneOf": [
+        {
+          "title": "Known standard value",
+          "enum": [
+            "per_tensor",
+            "per_channel",
+            "per_token",
+            "per_head"
+          ]
+        },
+        {
+          "title": "Forward-compatible extension value",
+          "type": "string",
+          "not": {
+            "enum": [
+              "per_tensor",
+              "per_channel",
+              "per_token",
+              "per_head"
+            ]
+          }
+        }
+      ]
+    },
+    "QuantizationIntent": {
+      "description": "Runtime-independent model-weight quantization intent.",
+      "type": "object",
+      "properties": {
+        "default": {
+          "description": "Default precision or quantization recipe for model weights.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Precision"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "overrides": {
+          "description": "Layer- or component-specific precision overrides.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "$ref": "#/$defs/QuantizationOverride"
+          }
+        }
+      }
+    },
+    "QuantizationOverride": {
+      "description": "Precision override for selected layers or a named graph component.",
+      "type": "object",
+      "properties": {
+        "component": {
+          "description": "Logical component path, for example `attention.qk` or `lm_head`.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        },
+        "layers": {
+          "description": "Layer indices to which the override applies; negative indices count from the end.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "integer",
+            "format": "int32"
+          }
+        },
+        "precision": {
+          "description": "Required precision or quantization recipe.",
+          "$ref": "#/$defs/Precision"
+        }
+      },
+      "required": [
+        "precision"
+      ]
+    },
+    "RuntimeConfigurable": {
+      "description": "Features whose concrete settings may be selected by the runtime.",
+      "type": "object",
+      "properties": {
+        "chunked_prefill": {
+          "description": "Chunked-prefill support and preferred chunk size.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ChunkedPrefillConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "continuous_batching": {
+          "description": "Whether continuous batching may be enabled.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "kv_cache": {
+          "description": "Supported runtime-selectable KV-cache dtypes.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RuntimeKvConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "prefix_cache": {
+          "description": "Whether prefix caching may be enabled.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      }
+    },
+    "RuntimeKvConfig": {
+      "description": "Runtime-selectable KV-cache representations.",
+      "type": "object",
+      "properties": {
+        "dtype": {
+          "description": "Non-empty list of supported KV-cache scalar dtypes, in preference order.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/DType"
+          },
+          "minItems": 1
+        }
+      },
+      "required": [
+        "dtype"
+      ]
+    },
+    "SpeculativeModelInfo": {
+      "description": "Build-time support for self-contained speculative decoding.",
+      "type": "object",
+      "properties": {
+        "has_draft_heads": {
+          "description": "Whether the exported graph contains Medusa/EAGLE/MTP-style draft heads.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "self_speculative_depth": {
+          "description": "Early-exit layer depth usable for self-speculation.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 1
+        }
+      }
+    },
+    "SpeculatorConfig": {
+      "description": "Configuration published with a standalone speculative proposer model.",
+      "type": "object",
+      "properties": {
+        "method": {
+          "description": "Deprecated alias for `proposal_type`.",
+          "allOf": [
+            {
+              "description": "Proposal architecture used by the speculator.\n\nThe deprecated `method` alias is accepted on input.",
+              "$ref": "#/$defs/ProposalType"
+            }
+          ],
+          "deprecated": true
+        },
+        "num_speculative_tokens": {
+          "description": "Maximum number of tokens proposed per verifier step; defaults to 4.\n\nThe deprecated `tokens_per_step` alias is accepted on input.",
+          "type": "integer",
+          "format": "uint",
+          "default": 4,
+          "minimum": 1
+        },
+        "proposal_type": {
+          "description": "Proposal architecture used by the speculator.\n\nThe deprecated `method` alias is accepted on input.",
+          "$ref": "#/$defs/ProposalType"
+        },
+        "tokens_per_step": {
+          "description": "Deprecated alias for `num_speculative_tokens`.",
+          "allOf": [
+            {
+              "description": "Maximum number of tokens proposed per verifier step; defaults to 4.\n\nThe deprecated `tokens_per_step` alias is accepted on input.",
+              "type": "integer",
+              "format": "uint",
+              "default": 4,
+              "minimum": 1
+            }
+          ],
+          "deprecated": true
+        },
+        "verifier": {
+          "description": "Identity of the verifier model against which this proposer was trained.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SpeculatorVerifier"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "not": {
+            "required": [
+              "num_speculative_tokens",
+              "tokens_per_step"
+            ]
+          }
+        }
+      ],
+      "oneOf": [
+        {
+          "not": {
+            "required": [
+              "method"
+            ]
+          },
+          "required": [
+            "proposal_type"
+          ]
+        },
+        {
+          "not": {
+            "required": [
+              "proposal_type"
+            ]
+          },
+          "required": [
+            "method"
+          ]
+        }
+      ],
+      "required": []
+    },
+    "SpeculatorVerifier": {
+      "description": "Verifier identity embedded in a speculator package.",
+      "type": "object",
+      "properties": {
+        "architectures": {
+          "description": "Verifier architecture class names, in preference order.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "name_or_path": {
+          "description": "HuggingFace-style verifier repository name or local model path.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "StrategyKind": {
+      "description": "Generic inference-strategy vocabulary.",
+      "type": "string",
+      "oneOf": [
+        {
+          "title": "Known standard value",
+          "enum": [
+            "speculative"
+          ]
+        },
+        {
+          "title": "Forward-compatible extension value",
+          "type": "string",
+          "not": {
+            "enum": [
+              "speculative"
+            ]
+          }
+        }
+      ]
+    },
+    "StrategySpec": {
+      "description": "Generic inference strategy declaration.",
+      "type": "object",
+      "properties": {
+        "acceptance": {
+          "description": "Draft-token acceptance rule.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AcceptanceMethod"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "draft": {
+          "description": "Draft-token producer configuration for speculative decoding.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DraftConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "kind": {
+          "description": "Strategy vocabulary entry, such as `speculative`.",
+          "$ref": "#/$defs/StrategyKind"
+        },
+        "performance_hints": {
+          "description": "Model-publisher performance guidance.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PerformanceHints"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "tokens_per_step": {
+          "description": "Number of draft tokens attempted per verification step.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 1
+        },
+        "topology": {
+          "description": "Proposal topology, such as `linear` or `tree`.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProposalTopology"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "verify": {
+          "description": "Verification configuration for speculative decoding.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/VerifyConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "kind"
+      ]
+    },
+    "StructuredOutputFormat": {
+      "description": "Structured-output constraint-format vocabulary.",
+      "type": "string",
+      "oneOf": [
+        {
+          "title": "Known standard value",
+          "enum": [
+            "json_schema",
+            "regex",
+            "context_free_grammar",
+            "choice"
+          ]
+        },
+        {
+          "title": "Forward-compatible extension value",
+          "type": "string",
+          "not": {
+            "enum": [
+              "json_schema",
+              "regex",
+              "context_free_grammar",
+              "choice"
+            ]
+          }
+        }
+      ]
+    },
+    "StructuredOutputSpec": {
+      "description": "Structured-output capabilities and model formatting conventions.",
+      "type": "object",
+      "properties": {
+        "stop_sequences": {
+          "description": "Literal token sequences that terminate a structured response.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
+        },
+        "supported_formats": {
+          "description": "Supported constraint formats, such as JSON Schema, regular expressions, or CFGs.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "$ref": "#/$defs/StructuredOutputFormat"
+          }
+        },
+        "training_format": {
+          "description": "Format in which the model was trained to emit tool calls or structured values.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "TensorDType": {
+      "description": "Tensor-boundary dtype vocabulary, including non-numeric pipeline values.",
+      "type": "string",
+      "oneOf": [
+        {
+          "title": "Known standard value",
+          "enum": [
+            "float32",
+            "fp32",
+            "float16",
+            "fp16",
+            "bfloat16",
+            "bf16",
+            "float8_e4m3fn",
+            "float8_e5m2",
+            "int64",
+            "int32",
+            "int8",
+            "uint8",
+            "bool",
+            "string"
+          ]
+        },
+        {
+          "title": "Forward-compatible extension value",
+          "type": "string",
+          "not": {
+            "enum": [
+              "float32",
+              "fp32",
+              "float16",
+              "fp16",
+              "bfloat16",
+              "bf16",
+              "float8_e4m3fn",
+              "float8_e5m2",
+              "int64",
+              "int32",
+              "int8",
+              "uint8",
+              "bool",
+              "string"
+            ]
+          }
+        }
+      ]
+    },
+    "VerificationMethod": {
+      "description": "Speculative verification-method vocabulary.",
+      "type": "string",
+      "oneOf": [
+        {
+          "title": "Known standard value",
+          "enum": [
+            "single_forward"
+          ]
+        },
+        {
+          "title": "Forward-compatible extension value",
+          "type": "string",
+          "not": {
+            "enum": [
+              "single_forward"
+            ]
+          }
+        }
+      ]
+    },
+    "VerifyConfig": {
+      "description": "Draft-token verification configuration.",
+      "type": "object",
+      "properties": {
+        "method": {
+          "description": "Verification method, such as `single_forward`.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/VerificationMethod"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "session": {
+          "description": "Named verifier session or pipeline component.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    }
+  }
+}

@@ -9,6 +9,7 @@ keywords = ["onnx", "metadata", "inference", "genai"]
 categories = ["science", "parser-implementations"]
 
 [dependencies]
+schemars = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }

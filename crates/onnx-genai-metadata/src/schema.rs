@@ -2,59 +2,84 @@
 
 use std::collections::BTreeMap;
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer};
 
-/// Top-level inference metadata.
-#[derive(Debug, Clone, Deserialize)]
+/// ONNX inference metadata consumed by runtimes and emitted by model builders.
+///
+/// Every top-level section is optional for incremental adoption. Unknown fields
+/// are allowed and must be ignored by readers for forward compatibility.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[schemars(
+    title = "ONNX Inference Metadata",
+    description = "Portable, runtime-agnostic inference metadata for ONNX generative models. All top-level sections are optional, and unknown fields are permitted for forward-compatible schema evolution.",
+    extend("$id" = "https://github.com/onnx/onnx/issues/8184"),
+    transform = schema_helpers::inference_metadata_aliases
+)]
 pub struct InferenceMetadata {
-    /// Capabilities that a runtime MUST support to load this model.
+    /// Capability identifiers that a runtime MUST support or refuse to load the model.
     #[serde(default)]
+    #[schemars(
+        extend("examples" = [["kv_cache", "grouped_query_attention"]]),
+        inner(length(min = 1))
+    )]
     pub required_capabilities: Vec<String>,
 
-    /// Model build-time properties.
+    /// Build-time model properties and runtime-configurable capabilities.
     #[serde(default)]
     pub model: Option<ModelCapabilities>,
 
-    /// KV cache configuration and tolerance.
+    /// KV-cache storage, quantization tolerance, and operational semantics.
     #[serde(default)]
     pub kv_cache: Option<KvCacheSpec>,
 
-    /// Weight quantization intent.
+    /// Model weight quantization intent, independent of the packed representation.
     #[serde(default)]
     pub quantization: Option<QuantizationIntent>,
 
-    /// Multi-model pipeline definition.
+    /// Declarative multi-model pipeline and its dataflow graph.
     #[serde(default)]
     pub pipeline: Option<PipelineSpec>,
 
-    /// Speculative decoding strategy.
+    /// Generic inference strategy, including speculative decoding.
     #[serde(default)]
     pub strategy: Option<StrategySpec>,
 
-    /// Speculator model declaration. This is the preferred, native source for
-    /// speculator discovery; HuggingFace `config.json` is a compatibility fallback.
+    /// Standalone speculative proposer declaration.
+    ///
+    /// This is the preferred native source for speculator discovery;
+    /// HuggingFace `config.json` is a compatibility fallback. The deprecated
+    /// `speculator_config` alias is accepted on input.
     #[serde(default, alias = "speculator_config")]
     pub speculative: Option<SpeculatorConfig>,
 
-    /// Structured output support declaration.
+    /// Structured-output formats and model training conventions.
     #[serde(default)]
     pub structured_output: Option<StructuredOutputSpec>,
 
-    /// Hardware requirements for distribution matching.
+    /// Minimum and beneficial hardware capabilities used for distribution matching.
     #[serde(default)]
     pub hardware_requirements: Option<HardwareRequirements>,
 }
 
 /// Configuration published with a standalone speculative proposer model.
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, JsonSchema)]
+#[schemars(transform = schema_helpers::speculator_config_aliases)]
 pub struct SpeculatorConfig {
     /// Proposal architecture used by the speculator.
+    ///
+    /// The deprecated `method` alias is accepted on input.
     #[serde(alias = "method")]
     pub proposal_type: ProposalType,
-    /// Maximum number of tokens proposed per verification step.
+
+    /// Maximum number of tokens proposed per verifier step; defaults to 4.
+    ///
+    /// The deprecated `tokens_per_step` alias is accepted on input.
     #[serde(default = "default_num_speculative_tokens", alias = "tokens_per_step")]
+    #[schemars(range(min = 1))]
     pub num_speculative_tokens: usize,
-    /// Verifier model this speculator was trained against.
+
+    /// Identity of the verifier model against which this proposer was trained.
     #[serde(default)]
     pub verifier: Option<SpeculatorVerifier>,
 }
@@ -64,20 +89,32 @@ fn default_num_speculative_tokens() -> usize {
 }
 
 /// Verifier identity embedded in a speculator package.
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, JsonSchema)]
 pub struct SpeculatorVerifier {
+    /// HuggingFace-style verifier repository name or local model path.
     pub name_or_path: Option<String>,
+
+    /// Verifier architecture class names, in preference order.
     #[serde(default)]
     pub architectures: Vec<String>,
 }
 
-/// Speculator proposal architecture, preserving unknown future values.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Speculator proposal architecture.
+///
+/// Known spellings are enumerated in the generated schema while unknown
+/// strings remain valid to preserve forward compatibility.
+#[derive(Debug, Clone, PartialEq, Eq, JsonSchema)]
+#[schemars(with = "String", transform = schema_helpers::proposal_type)]
 pub enum ProposalType {
+    /// EAGLE or EAGLE-3 proposer.
     Eagle3,
+    /// P-EAGLE proposer.
     PEagle,
+    /// Multi-token prediction proposer.
     Mtp,
+    /// D-Flash proposer.
     DFlash,
+    /// Future proposal architecture not recognized by this runtime version.
     Unknown(String),
 }
 
@@ -97,146 +134,276 @@ impl<'de> Deserialize<'de> for ProposalType {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+/// Model properties that are baked into the graph or advertised as configurable.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct ModelCapabilities {
+    /// Attention architecture and dimensions.
     pub attention: Option<AttentionConfig>,
+
+    /// Maximum total sequence length, in tokens.
+    #[schemars(range(min = 1))]
     pub max_sequence_length: Option<usize>,
+
+    /// Built-in draft-head or self-speculative model properties.
     pub speculative: Option<SpeculativeModelInfo>,
+
+    /// Features that a serving runtime may configure at load time.
     pub runtime_configurable: Option<RuntimeConfigurable>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+/// Build-time attention architecture and dimensions.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct AttentionConfig {
+    /// Attention architecture.
+    ///
+    /// Canonical values include `multi_head`, `grouped_query`, and
+    /// `multi_latent`; future values are allowed when paired with a usable
+    /// `fallback_behavior`.
     #[serde(rename = "type")]
+    #[schemars(with = "schema_vocabulary::AttentionType")]
     pub attention_type: String,
+
+    /// Number of key/value heads; required by runtimes that need explicit GQA dimensions.
+    #[schemars(range(min = 1))]
     pub num_kv_heads: Option<usize>,
+
+    /// Number of query/attention heads.
+    #[schemars(range(min = 1))]
     pub num_attention_heads: Option<usize>,
+
+    /// Per-head hidden dimension.
+    #[schemars(range(min = 1))]
     pub head_dim: Option<usize>,
+
+    /// Sliding-window length in tokens, or null for full-context attention.
+    #[schemars(range(min = 1))]
     pub sliding_window: Option<usize>,
-    /// Fallback behavior for runtimes that don't recognize `attention_type`.
+
+    /// Compatible attention behavior for runtimes that do not recognize `type`.
+    #[schemars(with = "Option<schema_vocabulary::AttentionType>")]
     pub fallback_behavior: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+/// Build-time support for self-contained speculative decoding.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct SpeculativeModelInfo {
+    /// Whether the exported graph contains Medusa/EAGLE/MTP-style draft heads.
     pub has_draft_heads: Option<bool>,
+
+    /// Early-exit layer depth usable for self-speculation.
+    #[schemars(range(min = 1))]
     pub self_speculative_depth: Option<usize>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+/// Features whose concrete settings may be selected by the runtime.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct RuntimeConfigurable {
+    /// Supported runtime-selectable KV-cache dtypes.
     pub kv_cache: Option<RuntimeKvConfig>,
+
+    /// Whether prefix caching may be enabled.
     pub prefix_cache: Option<bool>,
+
+    /// Whether continuous batching may be enabled.
     pub continuous_batching: Option<bool>,
+
+    /// Chunked-prefill support and preferred chunk size.
     pub chunked_prefill: Option<ChunkedPrefillConfig>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+/// Runtime-selectable KV-cache representations.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct RuntimeKvConfig {
+    /// Non-empty list of supported KV-cache scalar dtypes, in preference order.
+    #[schemars(with = "Vec<schema_vocabulary::DType>", length(min = 1))]
     pub dtype: Vec<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+/// Runtime chunked-prefill preference.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct ChunkedPrefillConfig {
+    /// Preferred number of prompt tokens processed in each prefill chunk.
+    #[schemars(range(min = 1))]
     pub chunk_size: Option<usize>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+/// KV-cache storage, precision tolerance, and operational guarantees.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct KvCacheSpec {
+    /// Native KV scalar dtype produced by the model before optional compression.
+    #[schemars(with = "Option<schema_vocabulary::DType>")]
     pub native_dtype: Option<String>,
+
+    /// Independent precision tolerance for key and value tensors.
     pub quantization_tolerance: Option<KvQuantTolerance>,
+
+    /// Layer indices that should retain high precision; negative indices count from the end.
     pub sensitive_layers: Option<Vec<i32>>,
+
+    /// Cache mutation and persistence operations known to be safe for this model.
     pub operations: Option<KvCacheOperations>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+/// Precision tolerance for key and value cache components.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct KvQuantTolerance {
+    /// Key-cache precision tolerance.
     pub key: Option<KvComponentTolerance>,
+
+    /// Value-cache precision tolerance.
     pub value: Option<KvComponentTolerance>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+/// Quantization tolerance for one KV-cache component.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct KvComponentTolerance {
+    /// Default minimum acceptable scalar dtype for this component.
+    #[schemars(with = "Option<schema_vocabulary::DType>")]
     pub default: Option<String>,
+
+    /// Layer-specific minimum-precision overrides.
     pub per_layer: Option<Vec<LayerPrecisionOverride>>,
+
+    /// Quantization scaling axis, such as `per_tensor`, `per_channel`, or `per_token`.
+    #[schemars(with = "Option<schema_vocabulary::QuantizationAxis>")]
     pub quantization_axis: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+/// Minimum precision required by a set of model layers.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct LayerPrecisionOverride {
+    /// Non-empty layer-index list; negative indices count from the final layer.
+    #[schemars(length(min = 1))]
     pub layers: Vec<i32>,
+
+    /// Minimum acceptable scalar dtype for the listed layers.
+    #[schemars(with = "schema_vocabulary::DType")]
     pub min_precision: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+/// Operational guarantees for mutable KV-cache state.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct KvCacheOperations {
+    /// Whether truncating cache state to an earlier token position is correctness-preserving.
     pub rewind_safe: Option<bool>,
+
+    /// Precision policy for a copy-on-write fork, such as `inherit` or `highest`.
+    #[schemars(with = "Option<schema_vocabulary::ForkPrecisionPolicy>")]
     pub fork_precision_policy: Option<String>,
+
+    /// Whether checkpoints can be serialized for suspend/resume or migration.
     pub checkpoint_serializable: Option<bool>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+/// Runtime-independent model-weight quantization intent.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct QuantizationIntent {
+    /// Default precision or quantization recipe for model weights.
+    #[schemars(with = "Option<schema_vocabulary::Precision>")]
     pub default: Option<String>,
+
+    /// Layer- or component-specific precision overrides.
     pub overrides: Option<Vec<QuantizationOverride>>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+/// Precision override for selected layers or a named graph component.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct QuantizationOverride {
+    /// Layer indices to which the override applies; negative indices count from the end.
     pub layers: Option<Vec<i32>>,
+
+    /// Logical component path, for example `attention.qk` or `lm_head`.
+    #[schemars(length(min = 1))]
     pub component: Option<String>,
+
+    /// Required precision or quantization recipe.
+    #[schemars(with = "schema_vocabulary::Precision")]
     pub precision: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+/// Multi-model pipeline represented as a directed acyclic dataflow graph.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct PipelineSpec {
-    /// Named model components that participate in the pipeline DAG.
+    /// Named model components in the pipeline DAG; at least one component is required.
+    #[schemars(extend("minProperties" = 1))]
     pub models: BTreeMap<String, PipelineComponentSpec>,
-    /// Directed tensor/data edges between component ports.
+
+    /// Directed tensor or data edges between component ports.
     #[serde(default)]
     pub dataflow: Vec<DataflowEdge>,
-    /// Loop/execution strategy for the pipeline.
+
+    /// Loop and execution strategy for the pipeline.
     pub strategy: PipelineStrategy,
-    /// Optional per-component phase gating.
+
+    /// Optional per-component phase gating, keyed by component name.
     #[serde(default)]
     pub phases: BTreeMap<String, PhaseConfig>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+/// One executable ONNX model in a pipeline.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct PipelineComponentSpec {
-    /// ONNX filename relative to the model directory root.
+    /// Non-empty ONNX filename relative to the model package root.
+    #[schemars(length(min = 1), example = &"decoder.onnx")]
     pub filename: String,
-    /// Component role, for example encoder, decoder, draft, denoiser, or vocoder.
+
+    /// Component role, for example `encoder`, `decoder`, `draft`, `denoiser`, or `vocoder`.
     #[serde(rename = "type")]
+    #[schemars(with = "schema_vocabulary::PipelineRole")]
     pub role: String,
-    /// Optional execution/device preference declared by the model package.
+
+    /// Optional execution or device preference declared by the model package.
+    #[schemars(with = "Option<schema_vocabulary::DevicePreference>")]
     pub device_preference: Option<String>,
-    /// Optional tokenizer filename relative to the model directory root. If absent,
-    /// loaders may use a shared top-level tokenizer.json when present.
+
+    /// Tokenizer filename relative to the package root.
+    ///
+    /// If absent, loaders may use a shared top-level `tokenizer.json`.
+    #[schemars(length(min = 1), example = &"tokenizer.json")]
     pub tokenizer: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+/// Directed connection between two pipeline component ports.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct DataflowEdge {
-    /// Source endpoint as `component.output_name`.
+    /// Source endpoint in `component.output_name` form.
+    #[schemars(regex(pattern = r"^[^.]+\.[^.]+$"), example = &"encoder.hidden_states")]
     pub from: String,
-    /// Destination endpoint as `component.input_name`.
+
+    /// Destination endpoint in `component.input_name` form.
+    #[schemars(regex(pattern = r"^[^.]+\.[^.]+$"), example = &"decoder.encoder_hidden_states")]
     pub to: String,
+
+    /// Scalar or logical data type at the component boundary.
+    #[schemars(with = "Option<schema_vocabulary::TensorDType>")]
     pub dtype: Option<String>,
+
+    /// Whether the runtime must move the value between execution devices.
     pub device_transfer: Option<bool>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+/// Phase gate for one pipeline component.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct PhaseConfig {
+    /// Pipeline phase in which the component runs.
     pub run_on: PhaseRunOn,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Pipeline phase gate.
+///
+/// Known values are enumerated while future strings remain valid.
+#[derive(Debug, Clone, PartialEq, Eq, JsonSchema)]
+#[schemars(with = "String", transform = schema_helpers::phase_run_on)]
 pub enum PhaseRunOn {
+    /// Run only while processing the initial prompt.
     PromptOnly,
+    /// Run at every pipeline step; `always` is accepted as an alias.
     EveryStep,
+    /// Run only when producing the final output.
     FinalOnly,
+    /// Run only when explicitly requested by the application.
     OnDemand,
+    /// Future phase gate not recognized by this runtime version.
     Other(String),
 }
 
@@ -256,46 +423,88 @@ impl<'de> Deserialize<'de> for PhaseRunOn {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+/// Parameterized execution strategy for a pipeline or composite stage.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct PipelineStrategy {
+    /// Strategy family; determines which strategy-specific fields are meaningful.
     pub kind: PipelineStrategyKind,
 
     /// Autoregressive decoder component name.
     pub decoder: Option<String>,
+
+    /// Maximum number of tokens generated by an autoregressive stage.
+    #[schemars(range(min = 1))]
     pub max_tokens: Option<usize>,
+
+    /// Runtime-specific stop-condition declarations.
     pub stop_conditions: Option<Vec<serde_json::Value>>,
+
+    /// Runtime-specific KV-cache strategy parameters.
     pub kv_cache: Option<serde_json::Value>,
+
+    /// Runtime-specific speculative execution parameters.
     pub speculative: Option<serde_json::Value>,
 
     /// Single-pass component name.
     pub model: Option<String>,
+
+    /// Runtime-specific batching parameters.
     pub batching: Option<serde_json::Value>,
 
-    /// Iterative/diffusion component and loop configuration.
+    /// Iterative or diffusion denoiser component name.
     pub denoiser: Option<String>,
+
+    /// Scheduler identifier for iterative or diffusion execution.
     pub scheduler: Option<String>,
+
+    /// Number of iterative or diffusion steps.
+    #[schemars(range(min = 1))]
     pub num_steps: Option<usize>,
+
+    /// Classifier-free guidance scale or equivalent strategy-specific multiplier.
+    #[schemars(range(min = 0.0))]
     pub guidance_scale: Option<f32>,
+
+    /// Runtime-specific iterative state declaration.
     pub state: Option<serde_json::Value>,
 
-    /// Composite strategy stages.
+    /// Ordered child stages for a composite strategy.
     #[serde(default)]
     pub stages: Vec<PipelineStrategyStage>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+/// Named child stage of a composite pipeline strategy.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct PipelineStrategyStage {
+    /// Non-empty stage name unique within its containing composite.
+    #[schemars(length(min = 1))]
     pub name: String,
+
+    /// Execution strategy for this stage.
     pub strategy: Box<PipelineStrategy>,
+
+    /// Optional phase gate for the stage.
     pub run_on: Option<PhaseRunOn>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Pipeline execution strategy family.
+///
+/// Known values are enumerated while future strings remain valid.
+#[derive(Debug, Clone, PartialEq, Eq, JsonSchema)]
+#[schemars(
+    with = "String",
+    transform = schema_helpers::pipeline_strategy_kind
+)]
 pub enum PipelineStrategyKind {
+    /// Token-by-token autoregressive generation.
     Autoregressive,
+    /// Repeated denoising or another bounded iterative loop.
     Iterative,
+    /// One invocation with no runtime-managed loop.
     SinglePass,
+    /// Ordered composition of nested strategies.
     Composite,
+    /// Future strategy family not recognized by this runtime version.
     Other(String),
 }
 
@@ -315,51 +524,520 @@ impl<'de> Deserialize<'de> for PipelineStrategyKind {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+/// Generic inference strategy declaration.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct StrategySpec {
+    /// Strategy vocabulary entry, such as `speculative`.
+    #[schemars(with = "schema_vocabulary::StrategyKind")]
     pub kind: String,
+
+    /// Draft-token producer configuration for speculative decoding.
     pub draft: Option<DraftConfig>,
+
+    /// Verification configuration for speculative decoding.
     pub verify: Option<VerifyConfig>,
+
+    /// Draft-token acceptance rule.
+    #[schemars(with = "Option<schema_vocabulary::AcceptanceMethod>")]
     pub acceptance: Option<String>,
+
+    /// Number of draft tokens attempted per verification step.
+    #[schemars(range(min = 1))]
     pub tokens_per_step: Option<usize>,
+
+    /// Proposal topology, such as `linear` or `tree`.
+    #[schemars(with = "Option<schema_vocabulary::ProposalTopology>")]
     pub topology: Option<String>,
+
+    /// Model-publisher performance guidance.
     pub performance_hints: Option<PerformanceHints>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+/// Draft-token producer configuration.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct DraftConfig {
+    /// Producer family: `draft_model`, `self_speculative`, `ngram`, or `extra_heads`.
+    #[schemars(with = "schema_vocabulary::DraftProducer")]
     pub producer: String,
+
+    /// Named runtime session or pipeline component used as the producer.
     pub session: Option<String>,
+
+    /// Self-speculative early-exit depth.
+    #[schemars(range(min = 1))]
     pub depth: Option<usize>,
+
+    /// Named draft-head layout or selection.
     pub heads: Option<String>,
+
+    /// Runtime-specific n-gram or prompt-lookup configuration.
     pub ngram: Option<serde_json::Value>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+/// Draft-token verification configuration.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct VerifyConfig {
+    /// Verification method, such as `single_forward`.
+    #[schemars(with = "Option<schema_vocabulary::VerificationMethod>")]
     pub method: Option<String>,
+
+    /// Named verifier session or pipeline component.
     pub session: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+/// Publisher-provided speculative decoding performance guidance.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct PerformanceHints {
+    /// Expected fraction of proposed tokens accepted, from 0.0 through 1.0.
+    #[schemars(range(min = 0.0, max = 1.0))]
     pub expected_acceptance_rate: Option<f32>,
+
+    /// Recommended number of draft tokens per verification step.
+    #[schemars(range(min = 1))]
     pub optimal_k: Option<usize>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+/// Structured-output capabilities and model formatting conventions.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct StructuredOutputSpec {
+    /// Supported constraint formats, such as JSON Schema, regular expressions, or CFGs.
+    #[schemars(with = "Option<Vec<schema_vocabulary::StructuredOutputFormat>>")]
     pub supported_formats: Option<Vec<String>>,
+
+    /// Format in which the model was trained to emit tool calls or structured values.
     pub training_format: Option<String>,
+
+    /// Literal token sequences that terminate a structured response.
     pub stop_sequences: Option<Vec<String>>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+/// Model-side hardware requirements and distribution-matching hints.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct HardwareRequirements {
+    /// Minimum aggregate accelerator or system memory in GiB.
+    #[schemars(range(min = 0.0))]
     pub min_memory_gb: Option<f32>,
+
+    /// Dtypes the selected device or execution provider must support.
+    #[schemars(with = "Option<Vec<schema_vocabulary::DType>>")]
     pub required_dtypes: Option<Vec<String>>,
+
+    /// Dtypes that improve performance or memory use but are not mandatory.
+    #[schemars(with = "Option<Vec<schema_vocabulary::DType>>")]
     pub beneficial_dtypes: Option<Vec<String>>,
+
+    /// Estimated KV-cache memory in MiB per 1,000 cached tokens.
+    #[schemars(range(min = 0.0))]
     pub kv_cache_memory_per_1k_tokens_mb: Option<f32>,
+
+    /// Whether the model can be partitioned with tensor parallelism.
     pub supports_tensor_parallel: Option<bool>,
+
+    /// Minimum useful tensor-parallel degree when tensor parallelism is selected.
+    #[schemars(range(min = 1))]
     pub min_tp_degree: Option<usize>,
+}
+
+mod schema_vocabulary {
+    use schemars::JsonSchema;
+
+    macro_rules! extensible_string {
+        (
+            $(#[$meta:meta])*
+            $name:ident,
+            $transform:ident,
+            $values:ident,
+            [$($value:literal),+ $(,)?]
+        ) => {
+            $(#[$meta])*
+            #[derive(JsonSchema)]
+            #[schemars(with = "String", transform = super::schema_helpers::$transform)]
+            pub(super) struct $name;
+
+            pub(super) const $values: &[&str] = &[$($value),+];
+        };
+    }
+
+    extensible_string!(
+        /// Attention architecture vocabulary with an extension branch.
+        AttentionType,
+        attention_type,
+        ATTENTION_TYPE,
+        [
+            "multi_head",
+            "multi_head_attention",
+            "grouped_query",
+            "group_query_attention",
+            "grouped_query_attention",
+            "gqa",
+            "multi_latent",
+            "multi_latent_attention",
+            "mla"
+        ]
+    );
+
+    extensible_string!(
+        /// Scalar dtype vocabulary with common ONNX and runtime aliases.
+        DType,
+        dtype,
+        DTYPE,
+        [
+            "float32",
+            "fp32",
+            "float16",
+            "fp16",
+            "half",
+            "bfloat16",
+            "bf16",
+            "float8_e4m3fn",
+            "fp8_e4m3fn",
+            "float8_e4m3",
+            "fp8_e4m3",
+            "float8_e5m2",
+            "fp8_e5m2",
+            "int8",
+            "uint8",
+            "int4",
+            "uint4"
+        ]
+    );
+
+    extensible_string!(
+        /// Tensor-boundary dtype vocabulary, including non-numeric pipeline values.
+        TensorDType,
+        tensor_dtype,
+        TENSOR_DTYPE,
+        [
+            "float32",
+            "fp32",
+            "float16",
+            "fp16",
+            "bfloat16",
+            "bf16",
+            "float8_e4m3fn",
+            "float8_e5m2",
+            "int64",
+            "int32",
+            "int8",
+            "uint8",
+            "bool",
+            "string"
+        ]
+    );
+
+    extensible_string!(
+        /// Quantization scaling-axis vocabulary.
+        QuantizationAxis,
+        quantization_axis,
+        QUANTIZATION_AXIS,
+        ["per_tensor", "per_channel", "per_token", "per_head"]
+    );
+
+    extensible_string!(
+        /// KV fork-precision policy vocabulary.
+        ForkPrecisionPolicy,
+        fork_precision_policy,
+        FORK_PRECISION_POLICY,
+        ["inherit", "highest", "independent"]
+    );
+
+    extensible_string!(
+        /// Weight precision and quantization-recipe vocabulary.
+        Precision,
+        precision,
+        PRECISION,
+        [
+            "float32",
+            "fp32",
+            "float16",
+            "fp16",
+            "bfloat16",
+            "bf16",
+            "float8_e4m3fn",
+            "float8_e5m2",
+            "int8",
+            "int4",
+            "int4_group128"
+        ]
+    );
+
+    extensible_string!(
+        /// Pipeline component-role vocabulary.
+        PipelineRole,
+        pipeline_role,
+        PIPELINE_ROLE,
+        [
+            "encoder",
+            "vision_encoder",
+            "audio_encoder",
+            "decoder",
+            "draft",
+            "denoiser",
+            "scheduler",
+            "vocoder",
+            "speech_synthesis"
+        ]
+    );
+
+    extensible_string!(
+        /// Execution-device preference vocabulary.
+        DevicePreference,
+        device_preference,
+        DEVICE_PREFERENCE,
+        [
+            "auto", "cpu", "cuda", "rocm", "directml", "coreml", "webgpu", "npu"
+        ]
+    );
+
+    extensible_string!(
+        /// Generic inference-strategy vocabulary.
+        StrategyKind,
+        strategy_kind,
+        STRATEGY_KIND,
+        ["speculative"]
+    );
+
+    extensible_string!(
+        /// Speculative draft-producer vocabulary.
+        DraftProducer,
+        draft_producer,
+        DRAFT_PRODUCER,
+        ["draft_model", "self_speculative", "ngram", "extra_heads"]
+    );
+
+    extensible_string!(
+        /// Speculative verification-method vocabulary.
+        VerificationMethod,
+        verification_method,
+        VERIFICATION_METHOD,
+        ["single_forward"]
+    );
+
+    extensible_string!(
+        /// Speculative acceptance-rule vocabulary.
+        AcceptanceMethod,
+        acceptance_method,
+        ACCEPTANCE_METHOD,
+        ["rejection_sampling", "greedy", "typical"]
+    );
+
+    extensible_string!(
+        /// Speculative proposal-topology vocabulary.
+        ProposalTopology,
+        proposal_topology,
+        PROPOSAL_TOPOLOGY,
+        ["linear", "tree"]
+    );
+
+    extensible_string!(
+        /// Structured-output constraint-format vocabulary.
+        StructuredOutputFormat,
+        structured_output_format,
+        STRUCTURED_OUTPUT_FORMAT,
+        ["json_schema", "regex", "context_free_grammar", "choice"]
+    );
+}
+
+mod schema_helpers {
+    use schemars::Schema;
+    use serde_json::{Value, json};
+
+    pub(super) fn inference_metadata_aliases(schema: &mut Schema) {
+        add_alias(
+            schema,
+            "speculative",
+            "speculator_config",
+            "Deprecated alias for `speculative`.",
+        );
+        forbid_both(schema, "speculative", "speculator_config");
+    }
+
+    pub(super) fn speculator_config_aliases(schema: &mut Schema) {
+        add_alias(
+            schema,
+            "proposal_type",
+            "method",
+            "Deprecated alias for `proposal_type`.",
+        );
+        add_alias(
+            schema,
+            "num_speculative_tokens",
+            "tokens_per_step",
+            "Deprecated alias for `num_speculative_tokens`.",
+        );
+
+        if let Some(required) = schema
+            .ensure_object()
+            .get_mut("required")
+            .and_then(Value::as_array_mut)
+        {
+            required.retain(|name| name != "proposal_type");
+        }
+
+        schema.ensure_object().insert(
+            "oneOf".into(),
+            json!([
+                {
+                    "required": ["proposal_type"],
+                    "not": {"required": ["method"]}
+                },
+                {
+                    "required": ["method"],
+                    "not": {"required": ["proposal_type"]}
+                }
+            ]),
+        );
+        forbid_both(schema, "num_speculative_tokens", "tokens_per_step");
+    }
+
+    pub(super) fn proposal_type(schema: &mut Schema) {
+        extensible_string_enum(
+            schema,
+            &[
+                "eagle", "eagle3", "eagle-3", "peagle", "p-eagle", "mtp", "dflash", "d-flash",
+            ],
+        );
+    }
+
+    pub(super) fn phase_run_on(schema: &mut Schema) {
+        extensible_string_enum(
+            schema,
+            &[
+                "prompt_only",
+                "every_step",
+                "always",
+                "final_only",
+                "on_demand",
+            ],
+        );
+    }
+
+    pub(super) fn pipeline_strategy_kind(schema: &mut Schema) {
+        extensible_string_enum(
+            schema,
+            &[
+                "autoregressive",
+                "iterative",
+                "diffusion_steps",
+                "diffusion-steps",
+                "single_pass",
+                "single-pass",
+                "composite",
+            ],
+        );
+    }
+
+    pub(super) fn attention_type(schema: &mut Schema) {
+        extensible_string_enum(schema, super::schema_vocabulary::ATTENTION_TYPE);
+    }
+
+    pub(super) fn dtype(schema: &mut Schema) {
+        extensible_string_enum(schema, super::schema_vocabulary::DTYPE);
+    }
+
+    pub(super) fn tensor_dtype(schema: &mut Schema) {
+        extensible_string_enum(schema, super::schema_vocabulary::TENSOR_DTYPE);
+    }
+
+    pub(super) fn quantization_axis(schema: &mut Schema) {
+        extensible_string_enum(schema, super::schema_vocabulary::QUANTIZATION_AXIS);
+    }
+
+    pub(super) fn fork_precision_policy(schema: &mut Schema) {
+        extensible_string_enum(schema, super::schema_vocabulary::FORK_PRECISION_POLICY);
+    }
+
+    pub(super) fn precision(schema: &mut Schema) {
+        extensible_string_enum(schema, super::schema_vocabulary::PRECISION);
+    }
+
+    pub(super) fn pipeline_role(schema: &mut Schema) {
+        extensible_string_enum(schema, super::schema_vocabulary::PIPELINE_ROLE);
+    }
+
+    pub(super) fn device_preference(schema: &mut Schema) {
+        extensible_string_enum(schema, super::schema_vocabulary::DEVICE_PREFERENCE);
+    }
+
+    pub(super) fn strategy_kind(schema: &mut Schema) {
+        extensible_string_enum(schema, super::schema_vocabulary::STRATEGY_KIND);
+    }
+
+    pub(super) fn draft_producer(schema: &mut Schema) {
+        extensible_string_enum(schema, super::schema_vocabulary::DRAFT_PRODUCER);
+    }
+
+    pub(super) fn verification_method(schema: &mut Schema) {
+        extensible_string_enum(schema, super::schema_vocabulary::VERIFICATION_METHOD);
+    }
+
+    pub(super) fn acceptance_method(schema: &mut Schema) {
+        extensible_string_enum(schema, super::schema_vocabulary::ACCEPTANCE_METHOD);
+    }
+
+    pub(super) fn proposal_topology(schema: &mut Schema) {
+        extensible_string_enum(schema, super::schema_vocabulary::PROPOSAL_TOPOLOGY);
+    }
+
+    pub(super) fn structured_output_format(schema: &mut Schema) {
+        extensible_string_enum(schema, super::schema_vocabulary::STRUCTURED_OUTPUT_FORMAT);
+    }
+
+    fn extensible_string_enum(schema: &mut Schema, known_values: &[&str]) {
+        let known_values = json!(known_values);
+        let object = schema.ensure_object();
+        object.insert("type".into(), json!("string"));
+        object.insert(
+            "oneOf".into(),
+            json!([
+                {
+                    "title": "Known standard value",
+                    "enum": known_values.clone()
+                },
+                {
+                    "title": "Forward-compatible extension value",
+                    "type": "string",
+                    "not": {"enum": known_values}
+                }
+            ]),
+        );
+    }
+
+    fn add_alias(schema: &mut Schema, canonical: &str, alias: &str, description: &str) {
+        let object = schema.ensure_object();
+        let Some(canonical_schema) = object
+            .get("properties")
+            .and_then(Value::as_object)
+            .and_then(|properties| properties.get(canonical))
+            .cloned()
+        else {
+            return;
+        };
+
+        if let Some(properties) = object.get_mut("properties").and_then(Value::as_object_mut) {
+            properties.insert(
+                alias.to_owned(),
+                json!({
+                    "allOf": [canonical_schema],
+                    "deprecated": true,
+                    "description": description
+                }),
+            );
+        }
+    }
+
+    fn forbid_both(schema: &mut Schema, first: &str, second: &str) {
+        let constraint = json!({
+            "not": {
+                "required": [first, second]
+            }
+        });
+        let object = schema.ensure_object();
+        object
+            .entry("allOf")
+            .or_insert_with(|| json!([]))
+            .as_array_mut()
+            .expect("allOf inserted as an array")
+            .push(constraint);
+    }
 }
