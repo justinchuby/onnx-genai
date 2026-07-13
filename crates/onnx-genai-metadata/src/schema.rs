@@ -85,15 +85,15 @@ pub struct SpeculatorConfig {
 
     /// Relative path (from the model directory) to the proposer ONNX model.
     ///
-    /// Used by the `gemma4_assistant` shared-KV proposer to locate the
-    /// assistant graph. Optional for forward compatibility with proposer
+    /// Used by the `shared_kv` proposer to locate the
+    /// proposer graph. Optional for forward compatibility with proposer
     /// families that do not ship a standalone model file.
     #[serde(default)]
     pub model: Option<String>,
 
     /// Target backbone hidden size `H` shared with the proposer.
     ///
-    /// For `gemma4_assistant`, `inputs_embeds` is `[B, q, 2*H]` and
+    /// For `shared_kv`, `inputs_embeds` is `[B, q, 2*H]` and
     /// `projected_state` is `[B, q, H]`.
     #[serde(default)]
     #[schemars(range(min = 1))]
@@ -106,13 +106,13 @@ pub struct SpeculatorConfig {
 
     /// Name of the proposer output threaded forward between steps.
     ///
-    /// Defaults to `projected_state` for `gemma4_assistant`.
+    /// Defaults to `projected_state` for `shared_kv`.
     #[serde(default)]
     pub projected_state_output: Option<String>,
 
     /// Name of the proposer's draft-distribution output.
     ///
-    /// Defaults to `logits` for `gemma4_assistant`.
+    /// Defaults to `logits` for `shared_kv`.
     #[serde(default)]
     pub logits_output: Option<String>,
 
@@ -127,7 +127,7 @@ pub struct SpeculatorConfig {
 
 /// One shared-KV binding group for a shared-KV proposer.
 ///
-/// A `gemma4_assistant` graph exposes `shared_kv.<name>.key` and
+/// A `shared_kv` proposer graph exposes `shared_kv.<name>.key` and
 /// `shared_kv.<name>.value` inputs bound to slices of the target model's paged
 /// KV cache. `target_layers` lists the target KV layer indices feeding this
 /// slice.
@@ -171,8 +171,8 @@ pub enum ProposalType {
     Mtp,
     /// D-Flash proposer.
     DFlash,
-    /// Gemma4 `*-assistant` shared-KV proposer.
-    Gemma4Assistant,
+    /// Shared-KV proposer (originally introduced for Gemma4 `*-assistant`).
+    SharedKv,
     /// Future proposal architecture not recognized by this runtime version.
     Unknown(String),
 }
@@ -188,7 +188,7 @@ impl<'de> Deserialize<'de> for ProposalType {
             "peagle" | "p-eagle" => Self::PEagle,
             "mtp" => Self::Mtp,
             "dflash" | "d-flash" => Self::DFlash,
-            "gemma4_assistant" | "gemma4-assistant" => Self::Gemma4Assistant,
+            "shared_kv" | "shared-kv" => Self::SharedKv,
             _ => Self::Unknown(value),
         })
     }
@@ -997,8 +997,8 @@ mod schema_helpers {
                 "mtp",
                 "dflash",
                 "d-flash",
-                "gemma4_assistant",
-                "gemma4-assistant",
+                "shared_kv",
+                "shared-kv",
             ],
         );
     }

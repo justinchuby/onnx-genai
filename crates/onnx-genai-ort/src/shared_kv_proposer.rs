@@ -1,12 +1,13 @@
-//! Low-level Gemma4 `*-assistant` shared-KV proposer execution built on ORT.
+//! Low-level shared-KV draft proposer execution built on ORT.
 //!
-//! The Gemma4 assistant is a small draft module distinct from both MTP and
-//! EAGLE-3. It owns **no** key/value cache of its own; instead it reads slices
-//! of the *target* model's paged KV cache through `shared_kv.*` inputs. It has
-//! its own internal `lm_head`, so it emits full draft `logits` directly, plus a
-//! `projected_state` that is threaded into the next step's `inputs_embeds`.
+//! The shared-KV proposer (originally introduced for Gemma4 `*-assistant` draft
+//! models) is a small draft module distinct from both MTP and EAGLE-3. It owns
+//! **no** key/value cache of its own; instead it reads slices of the *target*
+//! model's paged KV cache through `shared_kv.*` inputs. It has its own internal
+//! `lm_head`, so it emits full draft `logits` directly, plus a `projected_state`
+//! that is threaded into the next step's `inputs_embeds`.
 //!
-//! ## Graph I/O (per Mobius `Gemma4AssistantTask`)
+//! ## Graph I/O (structural signature)
 //!
 //! Inputs:
 //! - `inputs_embeds`                       `f32 [B, q, 2*H]`
@@ -20,7 +21,7 @@
 //! - `logits`                              `f32 [B, q, vocab]`
 //! - `projected_state`                     `f32 [B, q, H]`
 //!
-//! [`Gemma4AssistantDecodeSession`] owns exactly one forward pass. It does not
+//! [`SharedKvProposerSession`] owns exactly one forward pass. It does not
 //! select tokens, thread `projected_state`, or extract the target KV slices;
 //! the engine owns that policy (mirroring the MTP/EAGLE-3 ownership split).
 
@@ -32,7 +33,7 @@ use crate::{DataType, IoBinding, MemoryInfo, OrtError, Result, Session, Value};
 
 /// A single shared-KV binding group discovered in an assistant graph.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Gemma4SharedKvSpec {
+pub struct SharedKvSpec {
     /// Group name, e.g. `sliding_attention` or `full_attention`.
     pub name: String,
     /// Assistant input name for this group's keys (`shared_kv.<name>.key`).
@@ -45,9 +46,9 @@ pub struct Gemma4SharedKvSpec {
     pub head_dim: usize,
 }
 
-/// Introspected Gemma4 assistant graph signature.
+/// Introspected shared-KV proposer graph signature.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Gemma4AssistantSignature {
+pub struct SharedKvProposerSignature {
     /// Target backbone hidden size `H` (last dim of `projected_state`).
     pub backbone_hidden_size: usize,
     /// Width of `inputs_embeds` (`2*H`, concat of prev/cur projected states).
@@ -55,7 +56,7 @@ pub struct Gemma4AssistantSignature {
     /// Vocabulary size of the assistant's own `logits` output.
     pub vocab_size: usize,
     /// Shared-KV binding groups, ordered by input name.
-    pub shared_kv: Vec<Gemma4SharedKvSpec>,
+    pub shared_kv: Vec<SharedKvSpec>,
     /// Element type of the assistant's float tensors.
     pub dtype: DataType,
 }
@@ -65,8 +66,8 @@ pub struct Gemma4AssistantSignature {
 /// The engine slices these from the target model's paged KV cache. `key` and
 /// `value` are row-major `[kv_heads, kv_len, head_dim]` (batch 1).
 #[derive(Debug, Clone, PartialEq)]
-pub struct Gemma4SharedKvInput {
-    /// Group name matching a [`Gemma4SharedKvSpec::name`].
+pub struct SharedKvInput {
+    /// Group name matching a [`SharedKvSpec::name`].
     pub name: String,
     /// Row-major `[kv_heads, kv_len, head_dim]` key slice.
     pub key: Vec<f32>,
@@ -82,14 +83,14 @@ pub struct Gemma4SharedKvInput {
 
 /// Output of one assistant forward.
 #[derive(Debug, Clone, PartialEq)]
-pub struct Gemma4AssistantStepOutput {
+pub struct SharedKvProposerStepOutput {
     /// Last-position draft logits (`vocab` floats).
     pub logits: Vec<f32>,
     /// Last-position projected state (`H` floats), threaded into the next step.
     pub projected_state: Vec<f32>,
 }
 
-struct Gemma4Io {
+struct SharedKvProposerIo {
     embeds_input: String,
     mask_input: Option<String>,
     position_input: Option<String>,
@@ -97,11 +98,11 @@ struct Gemma4Io {
     projected_state_output: String,
 }
 
-/// Stateful runner for one Gemma4 assistant forward at a time.
-pub struct Gemma4AssistantDecodeSession<'a> {
+/// Stateful runner for one shared-KV proposer forward at a time.
+pub struct SharedKvProposerSession<'a> {
     session: &'a Session,
     binding: IoBinding,
-    signature: Gemma4AssistantSignature,
+    signature: SharedKvProposerSignature,
     batch_size: i64,
     embeds_input: String,
     mask_input: Option<String>,
@@ -110,17 +111,17 @@ pub struct Gemma4AssistantDecodeSession<'a> {
     projected_state_output: String,
 }
 
-impl<'a> Gemma4AssistantDecodeSession<'a> {
-    /// Detect a Gemma4 assistant signature from graph I/O, if present.
-    pub fn detect(session: &Session) -> Result<Option<Gemma4AssistantSignature>> {
-        Ok(detect_gemma4_assistant(session)?.map(|(signature, _)| signature))
+impl<'a> SharedKvProposerSession<'a> {
+    /// Detect a shared-KV proposer signature from graph I/O, if present.
+    pub fn detect(session: &Session) -> Result<Option<SharedKvProposerSignature>> {
+        Ok(detect_shared_kv_proposer(session)?.map(|(signature, _)| signature))
     }
 
-    /// Create a Gemma4 assistant decode session from an assistant graph.
+    /// Create a shared-KV proposer decode session from a proposer graph.
     pub fn new(session: &'a Session) -> Result<Self> {
-        let (signature, io) = detect_gemma4_assistant(session)?.ok_or_else(|| {
+        let (signature, io) = detect_shared_kv_proposer(session)?.ok_or_else(|| {
             OrtError::InvalidArgument(
-                "model is not a Gemma4 assistant (needs inputs_embeds + shared_kv.* inputs and \
+                "model is not a shared-KV proposer (needs inputs_embeds + shared_kv.* inputs and \
                  logits + projected_state outputs, without mtp_hidden)"
                     .into(),
             )
@@ -139,21 +140,21 @@ impl<'a> Gemma4AssistantDecodeSession<'a> {
     }
 
     /// The introspected assistant signature.
-    pub fn signature(&self) -> &Gemma4AssistantSignature {
+    pub fn signature(&self) -> &SharedKvProposerSignature {
         &self.signature
     }
 
     /// Run one assistant forward.
     ///
     /// `inputs_embeds` is row-major `[1, q, 2*H]`. `shared_kv` must provide one
-    /// entry per discovered [`Gemma4SharedKvSpec`]. `position_start` is the
+    /// entry per discovered [`SharedKvSpec`]. `position_start` is the
     /// position id of the first (and, for `q == 1`, only) token in the step.
     pub fn step(
         &mut self,
         inputs_embeds: &[f32],
         position_start: i64,
-        shared_kv: &[Gemma4SharedKvInput],
-    ) -> Result<Gemma4AssistantStepOutput> {
+        shared_kv: &[SharedKvInput],
+    ) -> Result<SharedKvProposerStepOutput> {
         let width = self.signature.inputs_embeds_width;
         if inputs_embeds.is_empty() || !inputs_embeds.len().is_multiple_of(width) {
             return Err(OrtError::InvalidArgument(format!(
@@ -264,22 +265,22 @@ impl<'a> Gemma4AssistantDecodeSession<'a> {
                     Some(last_row_f32(&value, self.signature.backbone_hidden_size)?);
             }
         }
-        Ok(Gemma4AssistantStepOutput {
+        Ok(SharedKvProposerStepOutput {
             logits: logits.ok_or_else(|| {
-                OrtError::InvalidArgument("Gemma4 assistant did not produce logits".into())
+                OrtError::InvalidArgument("shared-KV proposer did not produce logits".into())
             })?,
             projected_state: projected_state.ok_or_else(|| {
                 OrtError::InvalidArgument(
-                    "Gemma4 assistant did not produce projected_state".into(),
+                    "shared-KV proposer did not produce projected_state".into(),
                 )
             })?,
         })
     }
 }
 
-fn detect_gemma4_assistant(
+fn detect_shared_kv_proposer(
     session: &Session,
-) -> Result<Option<(Gemma4AssistantSignature, Gemma4Io)>> {
+) -> Result<Option<(SharedKvProposerSignature, SharedKvProposerIo)>> {
     let embeds_input = session
         .inputs()
         .iter()
@@ -292,7 +293,7 @@ fn detect_gemma4_assistant(
         .outputs()
         .iter()
         .find(|output| matches_name(&output.name, "projected_state"));
-    // MTP heads emit mtp_hidden; a Gemma4 assistant must not, so the two graph
+    // MTP heads emit mtp_hidden; a shared-KV proposer must not, so the two graph
     // families stay unambiguous.
     let has_mtp_hidden = session
         .outputs()
@@ -312,7 +313,7 @@ fn detect_gemma4_assistant(
     for info in [embeds_input, logits_output, projected_output] {
         if info.dtype != DataType::Float32 {
             return Err(OrtError::InvalidArgument(format!(
-                "Gemma4 assistant tensor '{}' must be Float32, got {:?}",
+                "shared-KV proposer tensor '{}' must be Float32, got {:?}",
                 info.name, info.dtype
             )));
         }
@@ -334,14 +335,14 @@ fn detect_gemma4_assistant(
         OrtError::InvalidArgument("logits must have a static vocabulary dimension".into())
     })?;
 
-    let signature = Gemma4AssistantSignature {
+    let signature = SharedKvProposerSignature {
         backbone_hidden_size,
         inputs_embeds_width,
         vocab_size,
         shared_kv,
         dtype: DataType::Float32,
     };
-    let io = Gemma4Io {
+    let io = SharedKvProposerIo {
         embeds_input: embeds_input.name.clone(),
         mask_input: session
             .inputs()
@@ -360,7 +361,7 @@ fn detect_gemma4_assistant(
 }
 
 /// Discover `shared_kv.<name>.{key,value}` input pairs, grouped by `<name>`.
-fn shared_kv_specs(session: &Session) -> Result<Vec<Gemma4SharedKvSpec>> {
+fn shared_kv_specs(session: &Session) -> Result<Vec<SharedKvSpec>> {
     let mut keys: BTreeMap<String, &crate::TensorInfo> = BTreeMap::new();
     let mut values: BTreeMap<String, &crate::TensorInfo> = BTreeMap::new();
     for input in session.inputs() {
@@ -398,7 +399,7 @@ fn shared_kv_specs(session: &Session) -> Result<Vec<Gemma4SharedKvSpec>> {
         };
         let kv_heads = usize::try_from(key.shape[1].max(1)).unwrap_or(1);
         let head_dim = usize::try_from(key.shape[3].max(1)).unwrap_or(1);
-        specs.push(Gemma4SharedKvSpec {
+        specs.push(SharedKvSpec {
             name: group.clone(),
             key_input: key.name.clone(),
             value_input: value.name.clone(),
@@ -449,7 +450,7 @@ fn last_row_f32(value: &Value, width: usize) -> Result<Vec<f32>> {
     let data = value.to_vec_f32()?;
     if width == 0 || data.len() < width || !data.len().is_multiple_of(width) {
         return Err(OrtError::InvalidArgument(format!(
-            "Gemma4 assistant output length {} is not a positive multiple of width {width}",
+            "shared-KV proposer output length {} is not a positive multiple of width {width}",
             data.len()
         )));
     }

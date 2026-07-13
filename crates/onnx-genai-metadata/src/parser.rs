@@ -21,13 +21,13 @@ pub enum SpeculatorProposerKind {
     DFlash,
 }
 
-/// Resolved Gemma4 `*-assistant` shared-KV proposer descriptor.
+/// Resolved shared-KV proposer descriptor.
 ///
 /// Every field is resolved from the `speculative` metadata section, with
 /// output-name defaults applied. `model` is resolved relative to the model
 /// directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Gemma4AssistantSpec {
+pub struct SharedKvProposerSpec {
     /// Absolute path to the assistant ONNX model.
     pub model: PathBuf,
     /// Number of speculative tokens proposed after the guaranteed target token.
@@ -47,8 +47,8 @@ pub struct Gemma4AssistantSpec {
 /// Current construction status for the engine-facing proposer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SpeculatorProposerStatus {
-    /// A fully resolved Gemma4 `*-assistant` shared-KV proposer.
-    Gemma4Assistant(Gemma4AssistantSpec),
+    /// A fully resolved shared-KV proposer.
+    SharedKv(SharedKvProposerSpec),
     NotYetSupported(SpeculatorProposerKind),
     Unknown(String),
 }
@@ -83,7 +83,7 @@ impl SpeculatorDescriptor {
             ProposalType::DFlash => {
                 SpeculatorProposerStatus::NotYetSupported(SpeculatorProposerKind::DFlash)
             }
-            ProposalType::Gemma4Assistant => resolve_gemma4_assistant(model_dir, &config),
+            ProposalType::SharedKv => resolve_shared_kv(model_dir, &config),
             ProposalType::Unknown(value) => SpeculatorProposerStatus::Unknown(value.clone()),
         };
 
@@ -98,31 +98,48 @@ impl SpeculatorDescriptor {
     }
 }
 
-/// Resolve a `gemma4_assistant` speculator into a supported proposer status.
+/// Resolve a `shared_kv` speculator into a supported proposer status.
 ///
-/// Missing required fields (`model`, `backbone_hidden_size`, `vocab_size`)
-/// degrade to [`SpeculatorProposerStatus::Unknown`] so a malformed descriptor
-/// never aborts model loading; the engine treats such descriptors as absent.
-fn resolve_gemma4_assistant(
+/// Missing or malformed required fields — `model`, `backbone_hidden_size`,
+/// `vocab_size`, an empty `shared_kv` list, or any group with empty
+/// `target_layers` — degrade to [`SpeculatorProposerStatus::Unknown`] so a
+/// malformed descriptor never aborts model loading; the engine treats such
+/// descriptors as absent.
+fn resolve_shared_kv(
     model_dir: &Path,
     config: &SpeculatorConfig,
 ) -> SpeculatorProposerStatus {
     let Some(model) = config.model.as_ref() else {
         return SpeculatorProposerStatus::Unknown(
-            "gemma4_assistant metadata is missing `model`".into(),
+            "shared_kv metadata is missing `model`".into(),
         );
     };
     let Some(backbone_hidden_size) = config.backbone_hidden_size else {
         return SpeculatorProposerStatus::Unknown(
-            "gemma4_assistant metadata is missing `backbone_hidden_size`".into(),
+            "shared_kv metadata is missing `backbone_hidden_size`".into(),
         );
     };
     let Some(vocab_size) = config.vocab_size else {
         return SpeculatorProposerStatus::Unknown(
-            "gemma4_assistant metadata is missing `vocab_size`".into(),
+            "shared_kv metadata is missing `vocab_size`".into(),
         );
     };
-    SpeculatorProposerStatus::Gemma4Assistant(Gemma4AssistantSpec {
+    if config.shared_kv.is_empty() {
+        return SpeculatorProposerStatus::Unknown(
+            "shared_kv metadata declares no `shared_kv` binding groups".into(),
+        );
+    }
+    if let Some(group) = config
+        .shared_kv
+        .iter()
+        .find(|group| group.target_layers.is_empty())
+    {
+        return SpeculatorProposerStatus::Unknown(format!(
+            "shared_kv group '{}' lists no `target_layers`",
+            group.name
+        ));
+    }
+    SpeculatorProposerStatus::SharedKv(SharedKvProposerSpec {
         model: model_dir.join(model),
         num_speculative_tokens: config.num_speculative_tokens,
         backbone_hidden_size,
@@ -222,9 +239,9 @@ mod tests {
     use super::*;
     use crate::schema::InferenceMetadata;
 
-    const GEMMA4_YAML: &str = "\
+    const SHARED_KV_YAML: &str = "\
 speculative:
-  proposal_type: gemma4_assistant
+  proposal_type: shared_kv
   num_speculative_tokens: 3
   model: assistant/model.onnx
   backbone_hidden_size: 16
@@ -239,11 +256,11 @@ speculative:
 ";
 
     #[test]
-    fn gemma4_assistant_metadata_round_trips_into_supported_descriptor() {
+    fn shared_kv_metadata_round_trips_into_supported_descriptor() {
         let metadata: InferenceMetadata =
-            serde_yaml::from_str(GEMMA4_YAML).expect("gemma4 metadata parses");
+            serde_yaml::from_str(SHARED_KV_YAML).expect("shared_kv metadata parses");
         let config = metadata.speculative.expect("speculative section present");
-        assert_eq!(config.proposal_type, ProposalType::Gemma4Assistant);
+        assert_eq!(config.proposal_type, ProposalType::SharedKv);
         assert_eq!(config.num_speculative_tokens, 3);
         assert_eq!(config.backbone_hidden_size, Some(16));
         assert_eq!(config.vocab_size, Some(32));
@@ -254,14 +271,17 @@ speculative:
         assert_eq!(config.shared_kv[1].target_layers, vec![1]);
 
         let descriptor = SpeculatorDescriptor::from_config(
-            Path::new("/models/gemma4"),
+            Path::new("/models/shared-kv"),
             config,
             SpeculatorConfigSource::InferenceMetadata,
         );
-        let SpeculatorProposerStatus::Gemma4Assistant(spec) = descriptor.proposer else {
-            panic!("expected a supported gemma4_assistant proposer");
+        let SpeculatorProposerStatus::SharedKv(spec) = descriptor.proposer else {
+            panic!("expected a supported shared_kv proposer");
         };
-        assert_eq!(spec.model, Path::new("/models/gemma4/assistant/model.onnx"));
+        assert_eq!(
+            spec.model,
+            Path::new("/models/shared-kv/assistant/model.onnx")
+        );
         assert_eq!(spec.num_speculative_tokens, 3);
         assert_eq!(spec.backbone_hidden_size, 16);
         assert_eq!(spec.vocab_size, 32);
@@ -270,46 +290,143 @@ speculative:
         assert_eq!(spec.shared_kv.len(), 2);
     }
 
+    /// A legacy `gemma4_assistant` proposal_type (pre-generalization name) no
+    /// longer resolves to SharedKv — it degrades gracefully to Unknown instead
+    /// of hard-failing model loading.
     #[test]
-    fn gemma4_assistant_defaults_output_names() {
+    fn legacy_gemma4_assistant_proposal_type_degrades_to_unknown() {
+        for legacy in &["gemma4_assistant", "gemma4-assistant"] {
+            let yaml = format!(
+                "\
+speculative:
+  proposal_type: {legacy}
+  num_speculative_tokens: 3
+  model: assistant/model.onnx
+  backbone_hidden_size: 16
+  vocab_size: 32
+  shared_kv:
+    - name: sliding_attention
+      target_layers: [0]
+"
+            );
+            let metadata: InferenceMetadata =
+                serde_yaml::from_str(&yaml).expect("metadata parses");
+            let config = metadata.speculative.expect("speculative section present");
+            assert!(
+                matches!(config.proposal_type, ProposalType::Unknown(_)),
+                "expected Unknown for legacy value '{legacy}', got {:?}",
+                config.proposal_type
+            );
+            let descriptor = SpeculatorDescriptor::from_config(
+                Path::new("/models/shared-kv"),
+                config,
+                SpeculatorConfigSource::InferenceMetadata,
+            );
+            assert!(
+                matches!(descriptor.proposer, SpeculatorProposerStatus::Unknown(_)),
+                "expected proposer Unknown for legacy value '{legacy}'"
+            );
+        }
+    }
+
+    #[test]
+    fn shared_kv_defaults_output_names() {
         let metadata: InferenceMetadata = serde_yaml::from_str(
             "\
 speculative:
-  proposal_type: gemma4-assistant
+  proposal_type: shared-kv
+  model: assistant/model.onnx
+  backbone_hidden_size: 8
+  vocab_size: 16
+  shared_kv:
+    - name: sliding_attention
+      target_layers: [0]
+",
+        )
+        .expect("shared_kv metadata parses");
+        let config = metadata.speculative.expect("speculative section present");
+        let descriptor = SpeculatorDescriptor::from_config(
+            Path::new("/models/shared-kv"),
+            config,
+            SpeculatorConfigSource::InferenceMetadata,
+        );
+        let SpeculatorProposerStatus::SharedKv(spec) = descriptor.proposer else {
+            panic!("expected a supported shared_kv proposer");
+        };
+        assert_eq!(spec.projected_state_output, "projected_state");
+        assert_eq!(spec.logits_output, "logits");
+        assert_eq!(spec.num_speculative_tokens, 4);
+        assert_eq!(spec.shared_kv.len(), 1);
+    }
+
+    #[test]
+    fn shared_kv_missing_required_field_is_unknown() {
+        let metadata: InferenceMetadata = serde_yaml::from_str(
+            "\
+speculative:
+  proposal_type: shared_kv
+  model: assistant/model.onnx
+",
+        )
+        .expect("shared_kv metadata parses");
+        let config = metadata.speculative.expect("speculative section present");
+        let descriptor = SpeculatorDescriptor::from_config(
+            Path::new("/models/shared-kv"),
+            config,
+            SpeculatorConfigSource::InferenceMetadata,
+        );
+        assert!(matches!(
+            descriptor.proposer,
+            SpeculatorProposerStatus::Unknown(_)
+        ));
+    }
+
+    /// A malformed shared-KV block (empty `shared_kv`, or a group with empty
+    /// `target_layers`) must degrade to `Unknown` rather than resolve, so it
+    /// never aborts model loading — the engine treats it as absent.
+    #[test]
+    fn shared_kv_empty_binding_groups_degrade_to_unknown() {
+        let metadata: InferenceMetadata = serde_yaml::from_str(
+            "\
+speculative:
+  proposal_type: shared_kv
   model: assistant/model.onnx
   backbone_hidden_size: 8
   vocab_size: 16
 ",
         )
-        .expect("gemma4 metadata parses");
+        .expect("shared_kv metadata parses");
         let config = metadata.speculative.expect("speculative section present");
+        assert!(config.shared_kv.is_empty());
         let descriptor = SpeculatorDescriptor::from_config(
-            Path::new("/models/gemma4"),
+            Path::new("/models/shared-kv"),
             config,
             SpeculatorConfigSource::InferenceMetadata,
         );
-        let SpeculatorProposerStatus::Gemma4Assistant(spec) = descriptor.proposer else {
-            panic!("expected a supported gemma4_assistant proposer");
-        };
-        assert_eq!(spec.projected_state_output, "projected_state");
-        assert_eq!(spec.logits_output, "logits");
-        assert_eq!(spec.num_speculative_tokens, 4);
-        assert!(spec.shared_kv.is_empty());
+        assert!(matches!(
+            descriptor.proposer,
+            SpeculatorProposerStatus::Unknown(_)
+        ));
     }
 
     #[test]
-    fn gemma4_assistant_missing_required_field_is_unknown() {
+    fn shared_kv_empty_target_layers_degrade_to_unknown() {
         let metadata: InferenceMetadata = serde_yaml::from_str(
             "\
 speculative:
-  proposal_type: gemma4_assistant
+  proposal_type: shared_kv
   model: assistant/model.onnx
+  backbone_hidden_size: 8
+  vocab_size: 16
+  shared_kv:
+    - name: sliding_attention
 ",
         )
-        .expect("gemma4 metadata parses");
+        .expect("shared_kv metadata parses");
         let config = metadata.speculative.expect("speculative section present");
+        assert!(config.shared_kv[0].target_layers.is_empty());
         let descriptor = SpeculatorDescriptor::from_config(
-            Path::new("/models/gemma4"),
+            Path::new("/models/shared-kv"),
             config,
             SpeculatorConfigSource::InferenceMetadata,
         );

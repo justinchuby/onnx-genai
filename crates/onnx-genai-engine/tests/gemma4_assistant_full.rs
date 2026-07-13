@@ -1,5 +1,5 @@
 use onnx_genai_engine::{
-    Engine, EngineConfig, Gemma4AssistantConfig, GeneratePrompt, GenerateRequest, SharedKvBinding,
+    Engine, EngineConfig, GeneratePrompt, GenerateRequest, SharedKvBinding, SharedKvProposerConfig,
     SpeculativeMode,
 };
 use onnx_genai_ort::SessionOptions;
@@ -22,8 +22,8 @@ fn engine(fixture: &Path, speculative_mode: SpeculativeMode) -> anyhow::Result<E
     )
 }
 
-fn assistant_config(fixture: &Path) -> Gemma4AssistantConfig {
-    Gemma4AssistantConfig {
+fn assistant_config(fixture: &Path) -> SharedKvProposerConfig {
+    SharedKvProposerConfig {
         assistant_model: fixture.join("assistant/model.onnx"),
         target_hidden_output: "hidden_states.0".into(),
         backbone_hidden_size: 16,
@@ -51,16 +51,17 @@ fn request() -> GenerateRequest {
     request
 }
 
-/// The Gemma4 assistant shares slices of the target's paged KV cache and threads
-/// `projected_state` forward. Because the target verifies every drafted token,
-/// speculative decoding must reproduce plain greedy decoding token-for-token.
+/// The shared-KV proposer shares slices of the target's paged KV cache and
+/// threads `projected_state` forward. Because the target verifies every drafted
+/// token, speculative decoding must reproduce plain greedy decoding
+/// token-for-token.
 #[test]
 fn gemma4_assistant_speculative_generation_matches_plain_greedy() -> anyhow::Result<()> {
     let fixture = fixture()?;
     let mut baseline = engine(&fixture, SpeculativeMode::None)?;
     let mut assistant = engine(
         &fixture,
-        SpeculativeMode::Gemma4Assistant(assistant_config(&fixture)),
+        SpeculativeMode::SharedKv(assistant_config(&fixture)),
     )?;
 
     let expected = baseline.generate(request())?;

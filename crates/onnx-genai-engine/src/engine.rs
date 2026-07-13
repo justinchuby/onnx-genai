@@ -22,7 +22,7 @@ use anyhow::Context;
 use onnx_genai_kv::{KvCacheOps, PagedKvCache, PrefixCache};
 use onnx_genai_metadata::InferenceMetadata;
 use onnx_genai_ort::{
-    DataType, Eagle3DecodeSession, Environment, Gemma4AssistantDecodeSession, ModelDirectory,
+    DataType, Eagle3DecodeSession, Environment, SharedKvProposerSession, ModelDirectory,
     MtpDecodeSession, Session, SessionOptions, Tokenizer,
 };
 use onnx_genai_scheduler::{Priority, Scheduler};
@@ -30,7 +30,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 pub use crate::config::{
-    Eagle3Config, EngineConfig, FinishReason, Gemma4AssistantConfig, GenerateConstraint,
+    Eagle3Config, EngineConfig, FinishReason, SharedKvProposerConfig, GenerateConstraint,
     GenerateOptions, GeneratePrompt, GenerateRequest, GenerateResult, GenerateToken,
     GenerateTokenCallback, MtpConfig, PrioritizedGenerateRequest, PrioritizedGenerateResult,
     ScheduledGenerateArrival, SessionId, SharedKvBinding, SpeculativeMode, TokenLogprob,
@@ -65,8 +65,8 @@ pub struct Engine {
     pub(crate) mtp: Option<MtpModel>,
     /// Optional EAGLE-3 head and target-side embedding.
     pub(crate) eagle3: Option<Eagle3Model>,
-    /// Optional Gemma4 shared-KV assistant proposer.
-    pub(crate) gemma4_assistant: Option<Gemma4AssistantModel>,
+    /// Optional shared-KV draft proposer.
+    pub(crate) shared_kv_proposer: Option<SharedKvProposerModel>,
     /// Tokenizer loaded from the model directory.
     pub(crate) tokenizer: Tokenizer,
     /// Auto-detected fill-in-the-middle token configuration.
@@ -98,8 +98,8 @@ pub(crate) struct Eagle3Model {
     pub(crate) num_speculative_tokens: usize,
 }
 
-pub(crate) struct Gemma4AssistantModel {
-    pub(crate) config: Gemma4AssistantConfig,
+pub(crate) struct SharedKvProposerModel {
+    pub(crate) config: SharedKvProposerConfig,
     pub(crate) session: Box<Session>,
     pub(crate) num_speculative_tokens: usize,
 }
@@ -224,11 +224,11 @@ impl Engine {
 
         let speculative_mode = match config.speculative_mode {
             SpeculativeMode::None if draft.is_some() => SpeculativeMode::DraftModel,
-            // No explicit mode: adopt a Gemma4 shared-KV assistant advertised by
+            // No explicit mode: adopt a shared-KV draft proposer advertised by
             // the model's own inference metadata, if the target exposes an f32
             // hidden output the assistant can be seeded from.
             SpeculativeMode::None => {
-                gemma4_assistant_mode_from_metadata(&model_directory.root, &session)
+                shared_kv_mode_from_metadata(&model_directory.root, &session)
                     .unwrap_or(SpeculativeMode::None)
             }
             mode => mode,
@@ -383,23 +383,23 @@ impl Engine {
             None
         };
 
-        let gemma4_assistant = if let SpeculativeMode::Gemma4Assistant(assistant_config) =
+        let shared_kv_proposer = if let SpeculativeMode::SharedKv(assistant_config) =
             &speculative_mode
         {
-            crate::config::validate_gemma4_assistant_config(assistant_config)?;
+            crate::config::validate_shared_kv_proposer_config(assistant_config)?;
             let hidden_output = session
                 .outputs()
                 .iter()
                 .find(|output| output.name == assistant_config.target_hidden_output)
                 .with_context(|| {
                     format!(
-                        "Gemma4 assistant target model must expose hidden-state output '{}'",
+                        "shared-KV proposer target model must expose hidden-state output '{}'",
                         assistant_config.target_hidden_output
                     )
                 })?;
             if hidden_output.dtype != DataType::Float32 {
                 anyhow::bail!(
-                    "Gemma4 assistant target hidden-state output '{}' must be Float32, got {:?}",
+                    "shared-KV proposer target hidden-state output '{}' must be Float32, got {:?}",
                     hidden_output.name,
                     hidden_output.dtype
                 );
@@ -408,7 +408,7 @@ impl Engine {
                 != Some(assistant_config.backbone_hidden_size as i64)
             {
                 anyhow::bail!(
-                    "Gemma4 assistant target hidden-state output '{}' shape {:?} does not end in configured backbone hidden size {}",
+                    "shared-KV proposer target hidden-state output '{}' shape {:?} does not end in configured backbone hidden size {}",
                     hidden_output.name,
                     hidden_output.shape,
                     assistant_config.backbone_hidden_size
@@ -419,22 +419,22 @@ impl Engine {
                 &assistant_config.assistant_model,
                 session_options.clone(),
             )
-            .map_err(|error| anyhow::anyhow!("Failed to load Gemma4 assistant model: {error}"))?;
-            let signature = Gemma4AssistantDecodeSession::detect(&assistant_session)
+            .map_err(|error| anyhow::anyhow!("Failed to load shared-KV proposer model: {error}"))?;
+            let signature = SharedKvProposerSession::detect(&assistant_session)
                 .map_err(|error| {
-                    anyhow::anyhow!("Failed to inspect Gemma4 assistant model: {error}")
+                    anyhow::anyhow!("Failed to inspect shared-KV proposer model: {error}")
                 })?
-                .context("configured Gemma4 assistant model does not expose assistant I/O")?;
+                .context("configured shared-KV proposer model does not expose proposer I/O")?;
             if signature.backbone_hidden_size != assistant_config.backbone_hidden_size {
                 anyhow::bail!(
-                    "Gemma4 assistant hidden size {} does not match configured backbone hidden size {}",
+                    "shared-KV proposer hidden size {} does not match configured backbone hidden size {}",
                     signature.backbone_hidden_size,
                     assistant_config.backbone_hidden_size
                 );
             }
             if signature.vocab_size != assistant_config.vocab_size {
                 anyhow::bail!(
-                    "Gemma4 assistant vocabulary {} does not match configured vocab size {}",
+                    "shared-KV proposer vocabulary {} does not match configured vocab size {}",
                     signature.vocab_size,
                     assistant_config.vocab_size
                 );
@@ -446,12 +446,12 @@ impl Engine {
                     .any(|spec| spec.name == group.name)
                 {
                     anyhow::bail!(
-                        "Gemma4 assistant model does not expose shared_kv group '{}'",
+                        "shared-KV proposer model does not expose shared_kv group '{}'",
                         group.name
                     );
                 }
             }
-            Some(Gemma4AssistantModel {
+            Some(SharedKvProposerModel {
                 config: assistant_config.clone(),
                 session: Box::new(assistant_session),
                 num_speculative_tokens: assistant_config.num_speculative_tokens,
@@ -474,7 +474,7 @@ impl Engine {
             draft,
             mtp,
             eagle3,
-            gemma4_assistant,
+            shared_kv_proposer,
             tokenizer,
             fim_config,
             num_speculative_tokens: config.num_speculative_tokens.max(1),
@@ -824,7 +824,7 @@ impl Engine {
             &self.speculative_mode,
             SpeculativeMode::Mtp(_)
                 | SpeculativeMode::Eagle3(_)
-                | SpeculativeMode::Gemma4Assistant(_)
+                | SpeculativeMode::SharedKv(_)
         ) {
             DecodeState::new(&self.session)
         } else {
@@ -1309,18 +1309,18 @@ fn read_f32_weights(path: &Path) -> anyhow::Result<Vec<f32>> {
         .collect())
 }
 
-/// Build a [`SpeculativeMode::Gemma4Assistant`] from a model directory's native
+/// Build a [`SpeculativeMode::SharedKv`] from a model directory's native
 /// inference metadata, or `None` when no supported assistant is advertised.
 ///
 /// The target hidden output name is not part of the shared metadata contract,
 /// so it is auto-detected: the first Float32 output whose last dimension equals
 /// the advertised backbone hidden size (excluding `logits`).
-fn gemma4_assistant_mode_from_metadata(
+fn shared_kv_mode_from_metadata(
     model_dir: &Path,
     session: &Session,
 ) -> Option<SpeculativeMode> {
     let descriptor = onnx_genai_metadata::detect_speculator(model_dir)?;
-    let onnx_genai_metadata::SpeculatorProposerStatus::Gemma4Assistant(spec) = descriptor.proposer
+    let onnx_genai_metadata::SpeculatorProposerStatus::SharedKv(spec) = descriptor.proposer
     else {
         return None;
     };
@@ -1333,7 +1333,7 @@ fn gemma4_assistant_mode_from_metadata(
             target_layers: group.target_layers,
         })
         .collect();
-    Some(SpeculativeMode::Gemma4Assistant(Gemma4AssistantConfig {
+    Some(SpeculativeMode::SharedKv(SharedKvProposerConfig {
         assistant_model: spec.model,
         target_hidden_output,
         backbone_hidden_size: spec.backbone_hidden_size,

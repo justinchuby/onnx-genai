@@ -14,7 +14,7 @@ pub mod decode;
 pub mod eagle3;
 pub mod env;
 pub mod error;
-pub mod gemma4_assistant;
+pub mod shared_kv_proposer;
 pub mod loader;
 pub mod mtp;
 pub mod profile;
@@ -36,9 +36,9 @@ pub use eagle3::{
 };
 pub use env::Environment;
 pub use error::{OrtError, Result};
-pub use gemma4_assistant::{
-    Gemma4AssistantDecodeSession, Gemma4AssistantSignature, Gemma4AssistantStepOutput,
-    Gemma4SharedKvInput, Gemma4SharedKvSpec,
+pub use shared_kv_proposer::{
+    SharedKvInput, SharedKvProposerSession, SharedKvProposerSignature, SharedKvProposerStepOutput,
+    SharedKvSpec,
 };
 pub use loader::{ModelDirectory, PipelineModelDirectory, PipelineModels, PipelineTokenizerPaths};
 pub use mtp::{MtpDecodeOptions, MtpDecodeSession, MtpDraftKvMode, MtpHeadSignature};

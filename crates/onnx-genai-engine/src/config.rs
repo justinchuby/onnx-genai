@@ -56,17 +56,17 @@ pub struct Eagle3Config {
     pub num_speculative_tokens: usize,
 }
 
-/// Files and target-model outputs required for Gemma4 `*-assistant`
-/// shared-KV speculation.
+/// Files and target-model outputs required for shared-KV draft speculation
+/// (originally introduced for Gemma4 `*-assistant` draft models).
 ///
-/// The assistant is a shared-KV proposer: it owns no KV cache and instead reads
+/// The proposer is a shared-KV draft: it owns no KV cache and instead reads
 /// slices of the target model's paged KV cache. It carries its own internal
 /// `lm_head`, so no external embedding/LM-head weights are required. Step 0
 /// seeds `inputs_embeds` from the target's last hidden state; every later step
-/// threads the assistant's own `projected_state`.
+/// threads the proposer's own `projected_state`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Gemma4AssistantConfig {
-    /// ONNX model containing the Gemma4 assistant graph.
+pub struct SharedKvProposerConfig {
+    /// ONNX model containing the shared-KV proposer graph.
     pub assistant_model: PathBuf,
     /// Target decoder output containing `[batch, sequence, hidden]` states,
     /// used to seed the first assistant step. Must be Float32.
@@ -82,7 +82,7 @@ pub struct Gemma4AssistantConfig {
     pub shared_kv: Vec<SharedKvBinding>,
 }
 
-/// One shared-KV binding for [`Gemma4AssistantConfig`].
+/// One shared-KV binding for [`SharedKvProposerConfig`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SharedKvBinding {
     /// Assistant input group name, e.g. `sliding_attention` / `full_attention`.
@@ -110,8 +110,8 @@ pub enum SpeculativeMode {
     Mtp(MtpConfig),
     /// Propose autoregressively from fused low/middle/high target hidden states.
     Eagle3(Eagle3Config),
-    /// Propose with a Gemma4 shared-KV assistant that reads target KV slices.
-    Gemma4Assistant(Gemma4AssistantConfig),
+    /// Propose with a shared-KV draft proposer that reads target KV slices.
+    SharedKv(SharedKvProposerConfig),
 }
 
 /// Identifier for a persistent generation session.
@@ -310,8 +310,8 @@ impl GenerateOptions {
         if let Some(SpeculativeMode::Eagle3(config)) = &self.speculative_mode {
             validate_eagle3_config(config)?;
         }
-        if let Some(SpeculativeMode::Gemma4Assistant(config)) = &self.speculative_mode {
-            validate_gemma4_assistant_config(config)?;
+        if let Some(SpeculativeMode::SharedKv(config)) = &self.speculative_mode {
+            validate_shared_kv_proposer_config(config)?;
         }
         Ok(())
     }
@@ -350,28 +350,28 @@ pub(crate) fn validate_eagle3_config(config: &Eagle3Config) -> anyhow::Result<()
     Ok(())
 }
 
-pub(crate) fn validate_gemma4_assistant_config(
-    config: &Gemma4AssistantConfig,
+pub(crate) fn validate_shared_kv_proposer_config(
+    config: &SharedKvProposerConfig,
 ) -> anyhow::Result<()> {
     if config.target_hidden_output.is_empty() {
-        anyhow::bail!("Gemma4 assistant target_hidden_output must not be empty");
+        anyhow::bail!("shared-KV proposer target_hidden_output must not be empty");
     }
     if config.backbone_hidden_size == 0 || config.vocab_size == 0 {
-        anyhow::bail!("Gemma4 assistant backbone_hidden_size and vocab_size must be greater than zero");
+        anyhow::bail!("shared-KV proposer backbone_hidden_size and vocab_size must be greater than zero");
     }
     if config.num_speculative_tokens == 0 {
-        anyhow::bail!("Gemma4 assistant num_speculative_tokens must be greater than zero");
+        anyhow::bail!("shared-KV proposer num_speculative_tokens must be greater than zero");
     }
     if config.shared_kv.is_empty() {
-        anyhow::bail!("Gemma4 assistant requires at least one shared_kv binding group");
+        anyhow::bail!("shared-KV proposer requires at least one shared_kv binding group");
     }
     for group in &config.shared_kv {
         if group.name.is_empty() {
-            anyhow::bail!("Gemma4 assistant shared_kv group name must not be empty");
+            anyhow::bail!("shared-KV proposer shared_kv group name must not be empty");
         }
         if group.target_layers.is_empty() {
             anyhow::bail!(
-                "Gemma4 assistant shared_kv group '{}' must list at least one target layer",
+                "shared-KV proposer shared_kv group '{}' must list at least one target layer",
                 group.name
             );
         }
