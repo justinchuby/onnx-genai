@@ -84,6 +84,73 @@ fn bound_decode_logits_match_naive_repass() {
 }
 
 #[test]
+fn exported_kv_handoff_continues_decode_identically() {
+    // Emulates the hybrid prefill/decode handoff: session A runs the prompt
+    // "prefill", its KV is exported and imported into a second DecodeSession B
+    // (same model), and B's continued decode must match a single-session run
+    // token-for-token. Cross-EP handoff uses this exact API; here both sessions
+    // are CPU so the check is deterministic.
+    let _guard = ort_test_lock().lock().expect("ORT test lock");
+    let session = load_session();
+    let prompt = [1_i64, 5, 7];
+    let continuation = [9_i64, 3];
+
+    // Reference: one session runs prefill + continuation.
+    let mut reference =
+        DecodeSession::new(&session, DecodeSessionOptions::default()).expect("reference session");
+    let prompt_mask = vec![1_i64; prompt.len()];
+    let prompt_pos = (0..prompt.len() as i64).collect::<Vec<_>>();
+    reference
+        .step(&prompt, &prompt_mask, &prompt_pos)
+        .expect("reference prefill");
+    let mut reference_logits = Vec::new();
+    for (offset, token) in continuation.iter().enumerate() {
+        let total = prompt.len() + offset + 1;
+        let pos = (prompt.len() + offset) as i64;
+        let logits = reference
+            .step(&[*token], &vec![1; total], &[pos])
+            .expect("reference step");
+        reference_logits.push(logits.to_vec_f32().expect("reference logits"));
+    }
+
+    // Hybrid: session A does prefill, exports KV; session B imports and decodes.
+    let mut prefill =
+        DecodeSession::new(&session, DecodeSessionOptions::default()).expect("prefill session");
+    prefill
+        .step(&prompt, &prompt_mask, &prompt_pos)
+        .expect("handoff prefill");
+    let handoff = prefill.export_kv().expect("export kv");
+    assert_eq!(handoff.len(), reference_kv_len(&session));
+
+    let mut decode =
+        DecodeSession::new(&session, DecodeSessionOptions::default()).expect("decode session");
+    decode
+        .import_kv(prompt.len(), handoff)
+        .expect("import kv");
+    assert_eq!(decode.past_len(), prompt.len());
+
+    for (offset, token) in continuation.iter().enumerate() {
+        let total = prompt.len() + offset + 1;
+        let pos = (prompt.len() + offset) as i64;
+        let logits = decode
+            .step(&[*token], &vec![1; total], &[pos])
+            .expect("handoff step");
+        assert_close(
+            &logits.to_vec_f32().expect("handoff logits"),
+            &reference_logits[offset],
+        );
+    }
+}
+
+fn reference_kv_len(session: &Session) -> usize {
+    session
+        .inputs()
+        .iter()
+        .filter(|info| is_kv_input(&info.name))
+        .count()
+}
+
+#[test]
 fn bound_decode_rewind_matches_replay() {
     let _guard = ort_test_lock().lock().expect("ORT test lock");
     let session = load_session();

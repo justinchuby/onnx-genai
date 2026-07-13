@@ -384,6 +384,82 @@ impl<'a> DecodeSession<'a> {
         self.current_len = 0;
     }
 
+    /// Export the current KV cache as owned, session-independent CPU tensors.
+    ///
+    /// Each entry is `(past_key_values.* input name, materialized Value)` whose
+    /// backing data is copied onto host-owned Rust buffers, so the returned
+    /// values outlive the producing session and can be handed to a *different*
+    /// [`DecodeSession`] loaded from the same model via [`Self::import_kv`].
+    ///
+    /// This is the KV-handoff primitive for hybrid execution (e.g. prefill on
+    /// the Metal EP, decode on the CPU EP). On Apple-silicon unified memory the
+    /// producing session's `present.*` outputs are already CPU-addressable, so
+    /// the copy is a cheap host `memcpy`. Only supported in
+    /// [`DecodeKvMode::ZeroCopyRebind`], where the runtime holds the present KV
+    /// as materialized OrtValues; shared-buffer mode owns fixed max-length
+    /// device buffers that are not portable across sessions.
+    pub fn export_kv(&self) -> Result<Vec<(String, Value)>> {
+        if self.mode != DecodeKvMode::ZeroCopyRebind {
+            return Err(OrtError::InvalidArgument(
+                "export_kv is only supported in ZeroCopyRebind mode".into(),
+            ));
+        }
+        let mut exported = Vec::with_capacity(self.kv_pairs.len());
+        for pair in &self.kv_pairs {
+            let value = self.current_kv.get(&pair.past).ok_or_else(|| {
+                OrtError::InvalidArgument(format!(
+                    "cannot export KV: missing tensor '{}' (run a prefill/decode step first)",
+                    pair.past
+                ))
+            })?;
+            exported.push((pair.past.clone(), clone_value_to_owned(value)?));
+        }
+        Ok(exported)
+    }
+
+    /// Adopt a KV cache produced by another session (same model) and set the
+    /// logical KV length to `len`.
+    ///
+    /// The counterpart to [`Self::export_kv`]: it replaces this session's KV
+    /// state so the next [`Self::step`] continues generation from `len` tokens
+    /// of context. Every `past_key_values.*` tensor this model expects must be
+    /// present in `kv` and match the model's dtype; the sequence axis of each
+    /// tensor must equal `len`. Only supported in
+    /// [`DecodeKvMode::ZeroCopyRebind`].
+    pub fn import_kv(&mut self, len: usize, kv: Vec<(String, Value)>) -> Result<()> {
+        if self.mode != DecodeKvMode::ZeroCopyRebind {
+            return Err(OrtError::InvalidArgument(
+                "import_kv is only supported in ZeroCopyRebind mode".into(),
+            ));
+        }
+        let mut incoming: HashMap<String, Value> = kv.into_iter().collect();
+        let mut adopted = HashMap::with_capacity(self.kv_pairs.len());
+        for pair in &self.kv_pairs {
+            let value = incoming.remove(&pair.past).ok_or_else(|| {
+                OrtError::InvalidArgument(format!("import_kv missing KV tensor '{}'", pair.past))
+            })?;
+            if value.dtype() != pair.input.dtype {
+                return Err(OrtError::InvalidArgument(format!(
+                    "import_kv dtype mismatch for '{}': got {:?}, expected {:?}",
+                    pair.past,
+                    value.dtype(),
+                    pair.input.dtype
+                )));
+            }
+            let seq_dim = value.shape().get(pair.seq_axis).copied().unwrap_or(-1);
+            if seq_dim != i64::try_from(len).unwrap_or(-1) {
+                return Err(OrtError::InvalidArgument(format!(
+                    "import_kv length mismatch for '{}': seq axis {} = {}, expected {}",
+                    pair.past, pair.seq_axis, seq_dim, len
+                )));
+            }
+            adopted.insert(pair.past.clone(), Arc::new(value));
+        }
+        self.current_kv = adopted;
+        self.current_len = len;
+        Ok(())
+    }
+
     fn bind_standard_inputs(
         &mut self,
         input_ids: &Value,
@@ -1675,6 +1751,20 @@ fn empty_past_value(info: &TensorInfo) -> Result<Value> {
 
 fn is_logits_output(name: &str) -> bool {
     name.to_ascii_lowercase().contains("logits")
+}
+
+/// Copy an OrtValue's tensor data onto host-owned Rust buffers, producing a
+/// new, session-independent CPU [`Value`]. Used to hand a KV cache between two
+/// [`DecodeSession`]s (e.g. Metal-EP prefill → CPU-EP decode).
+fn clone_value_to_owned(value: &Value) -> Result<Value> {
+    let shape = value.shape().to_vec();
+    match value.dtype() {
+        DataType::Float32 => Value::from_vec_f32(value.to_vec_f32()?, &shape),
+        DataType::Float16 => Value::from_vec_f16_bits(value.to_vec_f16_bits()?, &shape),
+        dtype => Err(OrtError::InvalidArgument(format!(
+            "cannot export/clone KV tensor with dtype {dtype:?}"
+        ))),
+    }
 }
 
 fn is_present_output(name: &str) -> bool {
