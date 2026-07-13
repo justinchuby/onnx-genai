@@ -136,4 +136,14 @@ fn main() {
     } else {
         println!("(set ONNX_GENAI_PROFILE=1 for the per-stage breakdown)");
     }
+
+    if profile::tracing_enabled() {
+        match profile::write_trace() {
+            Ok(()) => println!(
+                "wrote Perfetto timeline to {} (open at https://ui.perfetto.dev)",
+                std::env::var("ONNX_GENAI_TRACE").unwrap_or_default()
+            ),
+            Err(err) => eprintln!("failed to write trace: {err}"),
+        }
+    }
 }
