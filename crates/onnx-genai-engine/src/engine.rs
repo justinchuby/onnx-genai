@@ -168,11 +168,13 @@ impl Engine {
         // share-buffer KV path for GQA models.
         let shared_kv_max_len = crate::decode::shared_kv_buffer_len_from_metadata(&metadata);
         let sliding_window = crate::decode::sliding_window_from_metadata(&metadata)?;
+        let sink_tokens = crate::decode::sink_tokens_from_metadata(&metadata);
         let decode_path = detect_model_decode_path(
             &session,
             metadata_max_context,
             shared_kv_max_len,
             sliding_window,
+            sink_tokens,
         )?;
         let tokenizer = Tokenizer::from_file(&model_directory.tokenizer_path)
             .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {}", e))?;
@@ -188,7 +190,7 @@ impl Engine {
             )
             .map_err(|e| anyhow::anyhow!("Failed to load draft ORT session: {}", e))?;
             let draft_decode_path =
-                detect_model_decode_path(&draft_session, metadata_max_context, None, None)?;
+                detect_model_decode_path(&draft_session, metadata_max_context, None, None, 0)?;
             let draft_kv_model = infer_kv_model_info(&draft_session, config.page_size)?;
             let draft_kv_cache = if let Some(kv_model) = &draft_kv_model {
                 PagedKvCache::new_with_tensor_config(kv_model.tensor_config, config.num_gpu_pages)

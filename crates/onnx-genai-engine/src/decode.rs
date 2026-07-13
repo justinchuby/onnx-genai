@@ -33,6 +33,9 @@ pub(crate) enum ModelDecodePath {
         shared_buffer: bool,
         max_len: Option<usize>,
         sliding_window: Option<usize>,
+        /// Number of pinned leading attention-sink tokens (StreamingLLM), kept
+        /// alongside the sliding window. `None`/`0` disables sink retention.
+        sink_tokens: Option<usize>,
     },
     Legacy,
 }
@@ -139,6 +142,7 @@ pub(crate) struct DecodeState {
     pub(crate) present_to_past: HashMap<String, String>,
     pub(crate) kv_inputs: Vec<String>,
     sliding_window: Option<usize>,
+    sink_tokens: usize,
     retained_kv_len: usize,
     runner: Option<DecodeRunner>,
 }
@@ -165,6 +169,7 @@ impl DecodeState {
                 present_to_past: HashMap::new(),
                 kv_inputs,
                 sliding_window: None,
+                sink_tokens: 0,
                 retained_kv_len: 0,
                 runner: None,
             });
@@ -194,6 +199,7 @@ impl DecodeState {
             present_to_past,
             kv_inputs,
             sliding_window: None,
+            sink_tokens: 0,
             retained_kv_len: 0,
             runner: None,
         })
@@ -208,6 +214,7 @@ impl DecodeState {
                 present_to_past: HashMap::new(),
                 kv_inputs: Vec::new(),
                 sliding_window: None,
+                sink_tokens: 0,
                 retained_kv_len: 0,
                 runner: Some(DecodeRunner::StaticCache(StaticCacheDecodeSession::new(
                     stable_session_ref(session),
@@ -218,9 +225,11 @@ impl DecodeState {
                 shared_buffer,
                 max_len,
                 sliding_window,
+                sink_tokens,
             } => {
                 let mut state = Self::new(session)?;
                 state.sliding_window = *sliding_window;
+                state.sink_tokens = sink_tokens.unwrap_or(0);
                 if state.use_kv && sliding_window.is_none() {
                     state.runner = Some(DecodeRunner::PastPresent(DecodeSession::new(
                         stable_session_ref(session),
@@ -246,6 +255,11 @@ impl DecodeState {
 
     pub(crate) fn sliding_window(&self) -> Option<usize> {
         self.sliding_window
+    }
+
+    /// Number of pinned leading attention-sink tokens (0 if disabled).
+    pub(crate) fn sink_tokens(&self) -> usize {
+        self.sink_tokens
     }
 
     pub(crate) fn uses_token_prefix_cache(&self) -> bool {
@@ -282,39 +296,46 @@ impl DecodeState {
     pub(crate) fn apply_window_after_step(
         &mut self,
         session: &Session,
-        absolute_total_len: usize,
+        _absolute_total_len: usize,
         present_len: usize,
     ) -> anyhow::Result<()> {
         let Some(window_size) = self.sliding_window else {
             return Ok(());
         };
-        let retained_len = present_len.min(window_size);
-        let trim_start = present_len - retained_len;
-        if trim_start > 0 {
-            for input_name in &self.kv_inputs {
-                let info = session
-                    .inputs()
-                    .iter()
-                    .find(|info| info.name == *input_name)
-                    .with_context(|| format!("missing KV input metadata for '{input_name}'"))?;
-                let seq_axis = info
-                    .shape
-                    .len()
-                    .checked_sub(2)
-                    .context("KV input rank must be at least 2")?;
-                let value = self
-                    .past
-                    .get(input_name)
-                    .with_context(|| format!("missing cached KV tensor for '{input_name}'"))?;
-                let trimmed = slice_value_axis(value, seq_axis, trim_start, retained_len)?;
-                self.past.insert(input_name.clone(), trimmed);
-            }
+        let sink = self.sink_tokens.min(present_len);
+        let window_start = present_len.saturating_sub(window_size);
+        // The sink prefix and the window cover the whole present buffer: keep it.
+        if window_start <= sink {
+            self.retained_kv_len = present_len;
+            return Ok(());
         }
-        self.retained_kv_len = retained_len;
-        debug_assert_eq!(
-            absolute_total_len.saturating_sub(self.retained_kv_len),
-            absolute_total_len.saturating_sub(window_size)
-        );
+        let window_len = present_len - window_start;
+        for input_name in &self.kv_inputs {
+            let info = session
+                .inputs()
+                .iter()
+                .find(|info| info.name == *input_name)
+                .with_context(|| format!("missing KV input metadata for '{input_name}'"))?;
+            let seq_axis = info
+                .shape
+                .len()
+                .checked_sub(2)
+                .context("KV input rank must be at least 2")?;
+            let value = self
+                .past
+                .get(input_name)
+                .with_context(|| format!("missing cached KV tensor for '{input_name}'"))?;
+            let trimmed = if sink == 0 {
+                slice_value_axis(value, seq_axis, window_start, window_len)?
+            } else {
+                // StreamingLLM: pin sink rows, then the trailing window rows.
+                let head = slice_value_axis(value, seq_axis, 0, sink)?;
+                let tail = slice_value_axis(value, seq_axis, window_start, window_len)?;
+                concat_value_axis(&head, &tail, seq_axis)?
+            };
+            self.past.insert(input_name.clone(), trimmed);
+        }
+        self.retained_kv_len = sink + window_len;
         Ok(())
     }
 
@@ -326,24 +347,54 @@ impl DecodeState {
         let window_size = self
             .sliding_window
             .context("windowed rewind requires sliding-window state")?;
-        let retained_start = absolute_current_len.saturating_sub(self.retained_kv_len);
-        if target_len < retained_start {
-            anyhow::bail!(
-                "cannot rewind sliding-window KV to absolute position {target_len}; positions before {retained_start} were evicted"
-            );
+
+        if self.sink_tokens == 0 {
+            let retained_start = absolute_current_len.saturating_sub(self.retained_kv_len);
+            if target_len < retained_start {
+                anyhow::bail!(
+                    "cannot rewind sliding-window KV to absolute position {target_len}; positions before {retained_start} were evicted"
+                );
+            }
+            let target_retained_len = target_len - retained_start;
+            if target_retained_len < self.retained_kv_len {
+                for value in self.past.values_mut() {
+                    let seq_axis = value
+                        .shape()
+                        .len()
+                        .checked_sub(2)
+                        .context("KV tensor rank must be at least 2")?;
+                    *value = slice_value_axis(value, seq_axis, 0, target_retained_len)?;
+                }
+            }
+            self.retained_kv_len = target_retained_len.min(window_size);
+            return Ok(());
         }
-        let target_retained_len = target_len - retained_start;
-        if target_retained_len < self.retained_kv_len {
+
+        // Sink-aware layout: the buffer holds `sink` pinned rows followed by the
+        // window rows, so the absolute retained set is `[0, sink) ∪ [ws, len)`.
+        let sink = self.sink_tokens.min(self.retained_kv_len);
+        let window_len = self.retained_kv_len - sink;
+        let window_abs_start = absolute_current_len.saturating_sub(window_len);
+        let new_retained = if target_len >= window_abs_start {
+            sink + (target_len - window_abs_start)
+        } else if target_len <= sink {
+            target_len
+        } else {
+            anyhow::bail!(
+                "cannot rewind sliding-window KV to absolute position {target_len}; positions in the evicted gap [{sink}, {window_abs_start}) are unavailable"
+            );
+        };
+        if new_retained < self.retained_kv_len {
             for value in self.past.values_mut() {
                 let seq_axis = value
                     .shape()
                     .len()
                     .checked_sub(2)
                     .context("KV tensor rank must be at least 2")?;
-                *value = slice_value_axis(value, seq_axis, 0, target_retained_len)?;
+                *value = slice_value_axis(value, seq_axis, 0, new_retained)?;
             }
         }
-        self.retained_kv_len = target_retained_len.min(window_size);
+        self.retained_kv_len = new_retained;
         Ok(())
     }
 }
@@ -396,7 +447,12 @@ pub(crate) fn next_session_token_logits(
                 .map_err(|e| anyhow::anyhow!("Failed to advance KV sequence {seq}: {}", e))?;
         }
         state.kv_token_count += input_len;
-        apply_paged_sliding_window(kv_cache, seq, state.decode_state.sliding_window())?;
+        apply_paged_sliding_window(
+            kv_cache,
+            seq,
+            state.decode_state.sliding_window(),
+            state.decode_state.sink_tokens(),
+        )?;
     }
     extract_next_token_logits(session, outputs)
 }
@@ -469,7 +525,12 @@ pub(crate) fn next_session_token_logits_and_hiddens(
                 .map_err(|e| anyhow::anyhow!("Failed to advance KV sequence {seq}: {}", e))?;
         }
         state.kv_token_count += input_len;
-        apply_paged_sliding_window(kv_cache, seq, state.decode_state.sliding_window())?;
+        apply_paged_sliding_window(
+            kv_cache,
+            seq,
+            state.decode_state.sliding_window(),
+            state.decode_state.sink_tokens(),
+        )?;
     }
     let logits = extract_next_token_logits_from_outputs(session, &outputs)?;
     let hidden = hidden_outputs
@@ -527,6 +588,7 @@ pub(crate) fn next_draft_token_logits(
             &mut draft_model.kv_cache,
             draft_state.seq,
             draft_state.decode_state.sliding_window(),
+            draft_state.decode_state.sink_tokens(),
         )?;
     }
 
@@ -537,10 +599,11 @@ pub(crate) fn apply_paged_sliding_window(
     kv_cache: &mut PagedKvCache,
     seq: SessionId,
     sliding_window: Option<usize>,
+    sink_tokens: usize,
 ) -> anyhow::Result<()> {
     if let Some(window_size) = sliding_window {
         kv_cache
-            .apply_sliding_window(seq, window_size)
+            .apply_sliding_window_with_sinks(seq, window_size, sink_tokens)
             .map_err(|error| {
                 anyhow::anyhow!("Failed to apply KV sliding window for sequence {seq}: {error}")
             })?;
@@ -588,7 +651,12 @@ fn consume_windowed_prefix(
         }
         state.kv_token_count += chunk_len;
         *past_len += chunk_len;
-        apply_paged_sliding_window(kv_cache, seq, Some(window_size))?;
+        apply_paged_sliding_window(
+            kv_cache,
+            seq,
+            Some(window_size),
+            state.decode_state.sink_tokens(),
+        )?;
         consumed += chunk_len;
     }
     if consumed > 0 {
@@ -688,6 +756,7 @@ pub(crate) fn detect_model_decode_path(
     metadata_max_context: Option<usize>,
     shared_kv_max_len: Option<usize>,
     sliding_window: Option<usize>,
+    sink_tokens: usize,
 ) -> anyhow::Result<ModelDecodePath> {
     if let Some(signature) = StaticCacheDecodeSession::detect(session)? {
         if sliding_window.is_some() {
@@ -719,6 +788,7 @@ pub(crate) fn detect_model_decode_path(
                 shared_buffer: false,
                 max_len: None,
                 sliding_window,
+                sink_tokens: (sink_tokens > 0).then_some(sink_tokens),
             });
         }
         // Our own `InferenceMetadata` (from `inference_metadata.yaml`) can declare
@@ -741,6 +811,7 @@ pub(crate) fn detect_model_decode_path(
                 shared_buffer: true,
                 max_len: Some(max_len),
                 sliding_window: None,
+                sink_tokens: None,
             });
         }
 
@@ -751,6 +822,7 @@ pub(crate) fn detect_model_decode_path(
             shared_buffer,
             max_len: metadata_max_context.filter(|_| shared_buffer),
             sliding_window: None,
+            sink_tokens: None,
         });
     }
 
@@ -770,6 +842,17 @@ pub(crate) fn sliding_window_from_metadata(
         anyhow::bail!("model.attention.sliding_window must be greater than zero");
     }
     Ok(window)
+}
+
+/// Number of pinned attention-sink tokens declared by the model (StreamingLLM,
+/// DESIGN §40.4). Only meaningful when `sliding_window` is set; defaults to 0.
+pub(crate) fn sink_tokens_from_metadata(metadata: &InferenceMetadata) -> usize {
+    metadata
+        .model
+        .as_ref()
+        .and_then(|model| model.attention.as_ref())
+        .and_then(|attention| attention.sink_tokens)
+        .unwrap_or(0)
 }
 
 /// Decide whether our `InferenceMetadata` requests the runtime to own a single
@@ -1297,6 +1380,79 @@ fn slice_value_axis(value: &Value, axis: usize, start: usize, len: usize) -> any
     .map_err(|error| anyhow::anyhow!("Failed to slice cached KV tensor: {error}"))
 }
 
+/// Concatenate two KV tensors of identical shape (except along `axis`) into a
+/// single tensor along that axis. Used to splice the pinned attention-sink rows
+/// in front of the sliding-window rows.
+fn concat_value_axis(first: &Value, second: &Value, axis: usize) -> anyhow::Result<Value> {
+    let first_shape = first.shape();
+    let second_shape = second.shape();
+    if first_shape.len() != second_shape.len() {
+        anyhow::bail!("cannot concatenate KV tensors of differing rank");
+    }
+    for (dim, (a, b)) in first_shape.iter().zip(second_shape.iter()).enumerate() {
+        if dim != axis && a != b {
+            anyhow::bail!("cannot concatenate KV tensors: mismatched shape on axis {dim}");
+        }
+    }
+    let mut output_shape = first_shape.to_vec();
+    output_shape[axis] = first_shape[axis] + second_shape[axis];
+
+    fn interleave<T: Copy>(
+        first: &[T],
+        second: &[T],
+        shape_a: &[i64],
+        shape_b: &[i64],
+        axis: usize,
+    ) -> Vec<T> {
+        let inner = shape_a[axis + 1..]
+            .iter()
+            .map(|&dim| dim as usize)
+            .product::<usize>();
+        let outer = shape_a[..axis]
+            .iter()
+            .map(|&dim| dim as usize)
+            .product::<usize>();
+        let a_axis = shape_a[axis] as usize;
+        let b_axis = shape_b[axis] as usize;
+        let mut output = Vec::with_capacity(outer * (a_axis + b_axis) * inner);
+        for outer_idx in 0..outer {
+            let a_base = outer_idx * a_axis * inner;
+            output.extend_from_slice(&first[a_base..a_base + a_axis * inner]);
+            let b_base = outer_idx * b_axis * inner;
+            output.extend_from_slice(&second[b_base..b_base + b_axis * inner]);
+        }
+        output
+    }
+
+    if first.dtype() != second.dtype() {
+        anyhow::bail!("cannot concatenate KV tensors of differing dtype");
+    }
+    match first.dtype() {
+        DataType::Float32 => Value::from_vec_f32(
+            interleave(
+                &first.to_vec_f32()?,
+                &second.to_vec_f32()?,
+                first_shape,
+                second_shape,
+                axis,
+            ),
+            &output_shape,
+        ),
+        DataType::Float16 => Value::from_vec_f16_bits(
+            interleave(
+                &first.to_vec_f16_bits()?,
+                &second.to_vec_f16_bits()?,
+                first_shape,
+                second_shape,
+                axis,
+            ),
+            &output_shape,
+        ),
+        dtype => anyhow::bail!("cannot concatenate cached KV tensor with dtype {dtype:?}"),
+    }
+    .map_err(|error| anyhow::anyhow!("Failed to concatenate cached KV tensor: {error}"))
+}
+
 pub(crate) fn is_kv_input(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     lower.contains("past") && (lower.contains("key") || lower.contains("value"))
@@ -1405,6 +1561,7 @@ mod tests {
             num_attention_heads: Some(14),
             head_dim: Some(64),
             sliding_window: None,
+            sink_tokens: None,
             fallback_behavior: None,
         }
     }

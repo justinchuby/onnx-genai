@@ -478,8 +478,17 @@ pub struct PageTable {
     pub sequences: HashMap<SequenceId, Vec<PageId>>,
     /// Logical sequence → current token length.
     pub sequence_lengths: HashMap<SequenceId, usize>,
-    /// Logical sequence → absolute position of the first retained token.
+    /// Logical sequence → absolute position of the first retained *window*
+    /// token. With attention sinks this is the start of the window run, which
+    /// sits after the pinned sink prefix (see `sequence_sink_lens`).
     pub sequence_starts: HashMap<SequenceId, usize>,
+    /// Logical sequence → number of pinned leading "attention sink" tokens.
+    ///
+    /// Zero for the common contiguous case. When positive, the retained buffer
+    /// is the disjoint union `[0, sink_len) ∪ [window_start, len)` stored
+    /// contiguously as `[sink pages | window pages]`; `sink_len` is always a
+    /// multiple of `page_size`, and `window_start >= sink_len`.
+    pub sequence_sink_lens: HashMap<SequenceId, usize>,
     /// All physical pages.
     pub pages: HashMap<PageId, Page>,
     /// Free pages per device.
@@ -564,6 +573,7 @@ impl PageTable {
             sequences: HashMap::new(),
             sequence_lengths: HashMap::new(),
             sequence_starts: HashMap::new(),
+            sequence_sink_lens: HashMap::new(),
             pages,
             free_pages: free_map,
             page_size,
@@ -663,11 +673,23 @@ impl PageTable {
         }
     }
 
+    /// Number of pinned leading attention-sink tokens for `seq` (0 if none).
+    pub fn sequence_sink_len(&self, seq: SequenceId) -> Option<usize> {
+        self.sequence_sink_lens.get(&seq).copied()
+    }
+
+    pub fn set_sequence_sink_len(&mut self, seq: SequenceId, sink_len: usize) {
+        if let Some(slot) = self.sequence_sink_lens.get_mut(&seq) {
+            *slot = sink_len;
+        }
+    }
+
     /// Create a new sequence (empty).
     pub fn create_sequence(&mut self, seq: SequenceId) {
         self.sequences.insert(seq, Vec::new());
         self.sequence_lengths.insert(seq, 0);
         self.sequence_starts.insert(seq, 0);
+        self.sequence_sink_lens.insert(seq, 0);
     }
 
     /// Append a page to a sequence.
@@ -775,6 +797,7 @@ impl PageTable {
     pub fn remove_sequence(&mut self, seq: SequenceId) -> Vec<PageId> {
         self.sequence_lengths.remove(&seq);
         self.sequence_starts.remove(&seq);
+        self.sequence_sink_lens.remove(&seq);
         self.sequences.remove(&seq).unwrap_or_default()
     }
 

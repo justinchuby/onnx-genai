@@ -6,6 +6,20 @@
 //! - Tiered storage (GPU → CPU → Disk)
 //! - Prefix sharing via radix trie
 //! - Rewind/checkpoint operations for speculative decoding
+//!
+//! ## Sliding-window attention (SWA) & attention sinks (DESIGN §40)
+//!
+//! Window-bounded KV retention is supported on the paged cache via
+//! [`paged_cache::PagedKvCache::apply_sliding_window`] (contiguous window) and
+//! [`paged_cache::PagedKvCache::apply_sliding_window_with_sinks`] (StreamingLLM:
+//! pinned leading "sink" tokens + trailing window). Sink pinning on the paged
+//! cache is **page-granular** (the sink prefix is rounded up to a page
+//! boundary); the engine's runtime KV buffer applies the same window/sink
+//! **token-exactly**. Both keep O(1)/token cost.
+//!
+//! Not handled here (deferred to Mobius/ORT, see `.squad/decisions`): hybrid
+//! per-layer attention patterns (§40.3) needing per-layer KV buffers, and
+//! feeding discontinuous `position_ids` into a contiguous ORT graph (§40.8).
 
 pub mod fp8;
 pub mod page_table;

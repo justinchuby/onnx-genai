@@ -204,6 +204,15 @@
           "format": "uint",
           "minimum": 1
         },
+        "sink_tokens": {
+          "description": "Number of leading \"attention sink\" tokens always retained alongside the\nsliding window (StreamingLLM). Only meaningful when `sliding_window` is\nset; `null` or `0` disables sink retention. These first tokens stabilize\nthe attention distribution and are never evicted by the window.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0
+        },
         "sliding_window": {
           "description": "Sliding-window length in tokens, or null for full-context attention.",
           "type": [

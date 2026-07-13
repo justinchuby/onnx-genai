@@ -230,10 +230,11 @@ pub(crate) fn load_materialized_past(
     decode_state: &mut DecodeState,
     materialized: &onnx_genai_kv::MaterializedKv,
 ) -> anyhow::Result<()> {
-    if materialized.start_position != 0 {
+    if materialized.start_position != 0 || materialized.sink_len != 0 {
         anyhow::bail!(
-            "cannot load paged KV starting at absolute position {} into a contiguous past/present graph",
-            materialized.start_position
+            "cannot load paged KV starting at absolute position {} (sink_len {}) into a contiguous past/present graph; discontinuous attention-sink positions require explicit position_ids support",
+            materialized.start_position,
+            materialized.sink_len
         );
     }
     let input_shapes = session
@@ -687,6 +688,7 @@ mod tests {
         let model = infer_kv_model_info(&session, 2)?.unwrap();
         let materialized = onnx_genai_kv::MaterializedKv {
             start_position: 0,
+            sink_len: 0,
             sequence_len: 2,
             num_kv_heads: 2,
             head_dim: 8,
@@ -832,6 +834,7 @@ mod tests {
                     shared_buffer: false,
                     max_len: None,
                     sliding_window: None,
+                    sink_tokens: None,
                 },
             ),
         ] {
@@ -856,13 +859,14 @@ mod tests {
     fn windowed_past_present_keeps_absolute_positions_with_bounded_past() -> anyhow::Result<()> {
         let _guard = model_test_lock();
         let (_environment, session) = load_session("tiny-llm")?;
-        let path = detect_model_decode_path(&session, None, None, Some(2))?;
+        let path = detect_model_decode_path(&session, None, None, Some(2), 0)?;
         assert!(matches!(
             path,
             ModelDecodePath::PastPresent {
                 shared_buffer: false,
                 max_len: None,
-                sliding_window: Some(2)
+                sliding_window: Some(2),
+                sink_tokens: None,
             }
         ));
         let mut state = DecodeState::new_for_path(&session, &path)?;
@@ -874,7 +878,39 @@ mod tests {
         run_decode_step(&session, &mut state, &[3], 2)?;
         assert_eq!(state.retained_kv_len(3), 2);
         assert!(state.past.values().all(|value| value.shape()[2] == 2));
-        assert!(detect_model_decode_path(&session, Some(16), Some(16), Some(2)).is_err());
+        assert!(detect_model_decode_path(&session, Some(16), Some(16), Some(2), 0).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn windowed_past_present_pins_attention_sink_rows() -> anyhow::Result<()> {
+        let _guard = model_test_lock();
+        let (_environment, session) = load_session("tiny-llm")?;
+        // window=2, sink=1 (StreamingLLM): retained buffer = 1 sink row + up to 2
+        // window rows once the context exceeds sink + window.
+        let path = ModelDecodePath::PastPresent {
+            shared_buffer: false,
+            max_len: None,
+            sliding_window: Some(2),
+            sink_tokens: Some(1),
+        };
+        let mut state = DecodeState::new_for_path(&session, &path)?;
+        assert_eq!(state.sink_tokens(), 1);
+
+        // present_len=2, window covers the whole buffer (window_start=0 <= sink).
+        run_decode_step(&session, &mut state, &[2, 4], 0)?;
+        assert_eq!(state.retained_kv_len(2), 2);
+        assert!(state.past.values().all(|value| value.shape()[2] == 2));
+
+        // present_len=3, window_start=1 == sink: still keep everything.
+        run_decode_step(&session, &mut state, &[3], 2)?;
+        assert_eq!(state.retained_kv_len(3), 3);
+        assert!(state.past.values().all(|value| value.shape()[2] == 3));
+
+        // present_len=4, window_start=2 > sink=1: pin sink row + trailing window.
+        run_decode_step(&session, &mut state, &[5], 3)?;
+        assert_eq!(state.retained_kv_len(4), 3);
+        assert!(state.past.values().all(|value| value.shape()[2] == 3));
         Ok(())
     }
 

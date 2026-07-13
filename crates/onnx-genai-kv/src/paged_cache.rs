@@ -28,8 +28,16 @@ pub struct MaterializedLayerKv {
 /// Materialized K/V tensors for all layers over a sequence.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MaterializedKv {
-    /// Absolute position of the first token in these tensors.
+    /// Absolute position of the first *window* token in these tensors.
+    ///
+    /// With attention sinks (`sink_len > 0`) the buffer holds `sink_len`
+    /// pinned tokens at absolute positions `[0, sink_len)` followed by the
+    /// window tokens starting at `start_position`; the absolute positions are
+    /// therefore discontinuous. Without sinks the buffer is contiguous from
+    /// `start_position`.
     pub start_position: usize,
+    /// Number of leading attention-sink tokens in the buffer (0 if contiguous).
+    pub sink_len: usize,
     pub sequence_len: usize,
     pub num_kv_heads: usize,
     pub head_dim: usize,
@@ -126,7 +134,8 @@ impl PagedKvCache {
 
         let len = self.len(seq)?;
         let start = self.retained_start(seq)?;
-        if position < start {
+        let sink = self.sink_len(seq)?;
+        if position >= sink && position < start {
             return Err(KvError::PositionEvicted {
                 position,
                 retained_start: start,
@@ -139,7 +148,7 @@ impl PagedKvCache {
             });
         }
 
-        let retained_position = position - start;
+        let retained_position = self.buffer_index(seq, position)?;
         let page_index = retained_position / self.page_table.page_size;
         let token_offset = retained_position % self.page_table.page_size;
         let page_id = self.ensure_page_for_write(seq, page_index)?;
@@ -177,8 +186,10 @@ impl PagedKvCache {
             .tensor_config
             .ok_or(KvError::TensorStorageNotConfigured)?;
         let start = self.retained_start(seq)?;
+        let sink = self.sink_len(seq)?;
         let end = self.len(seq)?;
-        let len = end - start;
+        // Contiguous buffer holds the pinned sink prefix followed by the window.
+        let len = sink + (end - start);
         let pages = self
             .page_table
             .get_sequence(seq)
@@ -221,6 +232,7 @@ impl PagedKvCache {
 
         Ok(MaterializedKv {
             start_position: start,
+            sink_len: sink,
             sequence_len: len,
             num_kv_heads: config.num_kv_heads,
             head_dim: config.head_dim,
@@ -292,6 +304,86 @@ impl PagedKvCache {
         Ok(removed.len())
     }
 
+    /// Sink-aware sliding window: retain a pinned prefix of attention-sink
+    /// tokens *and* the most recent `window_size` tokens, evicting the pages in
+    /// between (StreamingLLM, DESIGN §40.4).
+    ///
+    /// Sink retention is page-granular: the first `ceil(sink_tokens/page_size)`
+    /// pages are pinned and never evicted. The retained set becomes the disjoint
+    /// union `[0, sink_len) ∪ [window_start, len)`, stored contiguously as
+    /// `[sink pages | window pages]`. With `sink_tokens == 0` this is exactly
+    /// [`apply_sliding_window`]. Returns the number of pages freed.
+    ///
+    /// The absolute positions of the two runs are discontinuous; RoPE models
+    /// remain correct because each token's positional embedding derives from its
+    /// absolute position, not its buffer index (DESIGN §40.8). Feeding these
+    /// discontinuous positions into a contiguous ORT past/present graph requires
+    /// explicit `position_ids` support and is out of scope here — see the crate
+    /// docs for the runtime boundary.
+    pub fn apply_sliding_window_with_sinks(
+        &mut self,
+        seq: SequenceId,
+        window_size: usize,
+        sink_tokens: usize,
+    ) -> Result<usize, KvError> {
+        if window_size == 0 {
+            return Err(KvError::InvalidWindowSize);
+        }
+        if sink_tokens == 0 {
+            return self.apply_sliding_window(seq, window_size);
+        }
+
+        let page_size = self.page_table.page_size;
+        let sink_pages = sink_tokens.div_ceil(page_size);
+        let sink_len_target = sink_pages * page_size;
+        let end = self.len(seq)?;
+        let keep_from = end.saturating_sub(window_size);
+
+        // Window abuts or overlaps the sink prefix: everything is retained
+        // contiguously, so there is no gap to open.
+        if keep_from <= sink_len_target {
+            return Ok(0);
+        }
+
+        let sink_active = self.sink_len(seq)? > 0;
+        let cur_window_start = if sink_active {
+            self.retained_start(seq)?
+        } else {
+            // First activation: window pages currently begin right after the
+            // soon-to-be-pinned sink pages.
+            sink_len_target
+        };
+        let new_window_start = (keep_from / page_size) * page_size;
+        if new_window_start <= cur_window_start {
+            // Ensure sink bookkeeping is set even when nothing new is evicted.
+            self.page_table.set_sequence_sink_len(seq, sink_len_target);
+            self.page_table.set_sequence_start(seq, cur_window_start);
+            return Ok(0);
+        }
+
+        let evict_pages = (new_window_start - cur_window_start) / page_size;
+        let removed = {
+            let pages = self
+                .page_table
+                .sequences
+                .get_mut(&seq)
+                .ok_or(KvError::SequenceNotFound(seq))?;
+            let window_page_count = pages.len().saturating_sub(sink_pages);
+            // Always keep at least the final window page.
+            let evict = evict_pages.min(window_page_count.saturating_sub(1));
+            pages
+                .drain(sink_pages..sink_pages + evict)
+                .collect::<Vec<_>>()
+        };
+        for page_id in &removed {
+            self.page_table.free(*page_id);
+        }
+        self.page_table.set_sequence_sink_len(seq, sink_len_target);
+        self.page_table
+            .set_sequence_start(seq, cur_window_start + removed.len() * page_size);
+        Ok(removed.len())
+    }
+
     /// Evict pages to free memory. Returns number of pages freed.
     pub fn evict(&mut self, _policy: EvictionPolicy, _target: usize) -> usize {
         match _policy {
@@ -334,8 +426,8 @@ impl PagedKvCache {
             return Ok(0);
         }
         let page_size = self.page_table.page_size;
-        let first_page = (start - retained_start) / page_size;
-        let last_page = (end - 1 - retained_start) / page_size;
+        let first_page = self.buffer_index(seq, start)? / page_size;
+        let last_page = self.buffer_index(seq, end - 1)? / page_size;
         let page_ids = self
             .page_table
             .get_sequence(seq)
@@ -456,6 +548,38 @@ impl PagedKvCache {
             .sequence_start(seq)
             .ok_or(KvError::SequenceNotFound(seq))
     }
+
+    /// Number of pinned leading attention-sink tokens for `seq` (0 if none).
+    fn sink_len(&self, seq: SequenceId) -> Result<usize, KvError> {
+        self.page_table
+            .sequence_sink_len(seq)
+            .ok_or(KvError::SequenceNotFound(seq))
+    }
+
+    /// Map an absolute token position (in the retained set) to its index in the
+    /// contiguous `[sink pages | window pages]` buffer.
+    ///
+    /// Positions inside the pinned sink prefix map to themselves; positions in
+    /// the window run are shifted so the window follows the sinks. Callers must
+    /// ensure `position` is not in the evicted gap `[sink_len, window_start)`.
+    fn buffer_index(&self, seq: SequenceId, position: usize) -> Result<usize, KvError> {
+        let sink = self.sink_len(seq)?;
+        let window_start = self.retained_start(seq)?;
+        if position < sink {
+            Ok(position)
+        } else {
+            Ok(sink + (position - window_start))
+        }
+    }
+
+    /// Number of tokens physically stored in `seq`'s contiguous page buffer:
+    /// `sink_len + (len - window_start)`. This is the length of the tensors
+    /// returned by [`materialize_sequence`](Self::materialize_sequence).
+    pub fn retained_buffer_len(&self, seq: SequenceId) -> Result<usize, KvError> {
+        let sink = self.sink_len(seq)?;
+        let window_start = self.retained_start(seq)?;
+        Ok(sink + (self.len(seq)? - window_start))
+    }
 }
 
 impl KvCacheOps for PagedKvCache {
@@ -473,7 +597,7 @@ impl KvCacheOps for PagedKvCache {
         }
 
         let page_size = self.page_table.page_size;
-        let retained_position = position - retained_start;
+        let retained_position = self.buffer_index(seq, position)?;
         let pages_needed = retained_position.div_ceil(page_size);
 
         let current_pages = self
@@ -515,7 +639,8 @@ impl KvCacheOps for PagedKvCache {
         }
 
         let page_size = self.page_table.page_size;
-        let pages_needed = (position - retained_start).div_ceil(page_size);
+        let sink = self.sink_len(source)?;
+        let pages_needed = self.buffer_index(source, position)?.div_ceil(page_size);
         let source_pages = self
             .page_table
             .get_sequence(source)
@@ -527,6 +652,7 @@ impl KvCacheOps for PagedKvCache {
 
         let new_seq = self.create_sequence();
         self.page_table.set_sequence_start(new_seq, retained_start);
+        self.page_table.set_sequence_sink_len(new_seq, sink);
         for page_id in &source_pages {
             self.page_table.retain(*page_id);
             self.page_table.push_page(new_seq, *page_id);
@@ -562,10 +688,9 @@ impl KvCacheOps for PagedKvCache {
 
     fn append(&mut self, seq: SequenceId, num_tokens: usize) -> Result<(), KvError> {
         let length = self.len(seq)?;
-        let retained_start = self.retained_start(seq)?;
         let page_size = self.page_table.page_size;
         for position in length..length + num_tokens {
-            let retained_position = position - retained_start;
+            let retained_position = self.buffer_index(seq, position)?;
             let page_index = retained_position / page_size;
             let token_offset = retained_position % page_size;
             let page_id = self.ensure_page_for_write(seq, page_index)?;
@@ -770,6 +895,135 @@ mod tests {
             assert_eq!(materialized.layers[layer_idx].key, expected_k);
             assert_eq!(materialized.layers[layer_idx].value, expected_v);
         }
+    }
+
+    fn assert_materialized_order(cache: &PagedKvCache, seq: SequenceId, order: &[f32]) {
+        let materialized = cache.materialize_sequence(seq).unwrap();
+        assert_eq!(materialized.sequence_len, order.len());
+        for layer_idx in 0..2 {
+            let expected = order.iter().map(|base| layers(*base)).collect::<Vec<_>>();
+            let mut expected_k = Vec::new();
+            let mut expected_v = Vec::new();
+            for head in 0..2 {
+                for token in &expected {
+                    expected_k.extend_from_slice(&token[layer_idx].0[head * 3..head * 3 + 3]);
+                    expected_v.extend_from_slice(&token[layer_idx].1[head * 3..head * 3 + 3]);
+                }
+            }
+            assert_eq!(materialized.layers[layer_idx].key, expected_k);
+            assert_eq!(materialized.layers[layer_idx].value, expected_v);
+        }
+    }
+
+    #[test]
+    fn sliding_window_with_sinks_pins_prefix_and_evicts_middle() {
+        // page_size = 2; sink_tokens = 2 (one pinned sink page); window = 3.
+        let mut cache = PagedKvCache::new_with_tensor_config(config(), 16);
+        let seq = cache.create_sequence();
+        for position in 0..9 {
+            let token = layers(position as f32 * 1000.0);
+            cache
+                .append_token_kv(seq, &borrowed_layers(&token))
+                .unwrap();
+        }
+
+        // keep_from = 6, sink pinned = [0,2), window = [6,9): evict pages [2,4),[4,6).
+        assert_eq!(cache.apply_sliding_window_with_sinks(seq, 3, 2).unwrap(), 2);
+        assert_eq!(cache.len(seq).unwrap(), 9);
+        assert_eq!(cache.page_table.sequence_sink_len(seq), Some(2));
+        assert_eq!(cache.retained_start(seq).unwrap(), 6);
+        assert_eq!(cache.retained_buffer_len(seq).unwrap(), 5);
+        assert_eq!(cache.page_table.get_sequence(seq).unwrap().len(), 3);
+        let m = cache.materialize_sequence(seq).unwrap();
+        assert_eq!(m.sink_len, 2);
+        assert_eq!(m.start_position, 6);
+        // Contiguous buffer holds sinks [0,1] followed by window [6,7,8].
+        assert_materialized_order(&cache, seq, &[0.0, 1000.0, 6000.0, 7000.0, 8000.0]);
+
+        // Roll forward: sinks stay pinned, window slides.
+        for position in 9..13 {
+            let token = layers(position as f32 * 1000.0);
+            assert_eq!(
+                cache
+                    .append_token_kv(seq, &borrowed_layers(&token))
+                    .unwrap(),
+                position
+            );
+            cache.apply_sliding_window_with_sinks(seq, 3, 2).unwrap();
+        }
+        // len = 13, keep_from = 10 -> window_start = 10, sinks still [0,2).
+        assert_eq!(cache.len(seq).unwrap(), 13);
+        assert_eq!(cache.page_table.sequence_sink_len(seq), Some(2));
+        assert_eq!(cache.retained_start(seq).unwrap(), 10);
+        assert_materialized_order(&cache, seq, &[0.0, 1000.0, 10000.0, 11000.0, 12000.0]);
+
+        // Rewind inside the window preserves the pinned sinks.
+        cache.rewind_to(seq, 12).unwrap();
+        assert_eq!(cache.len(seq).unwrap(), 12);
+        assert_eq!(cache.page_table.sequence_sink_len(seq), Some(2));
+        assert_materialized_order(&cache, seq, &[0.0, 1000.0, 10000.0, 11000.0]);
+
+        // Positions in the evicted gap are rejected.
+        assert!(matches!(
+            cache.rewind_to(seq, 5),
+            Err(KvError::PositionEvicted { position: 5, .. })
+        ));
+    }
+
+    #[test]
+    fn sliding_window_with_zero_sinks_matches_plain_window() {
+        let mut plain = PagedKvCache::new_with_tensor_config(config(), 16);
+        let mut sunk = PagedKvCache::new_with_tensor_config(config(), 16);
+        let a = plain.create_sequence();
+        let b = sunk.create_sequence();
+        for position in 0..9 {
+            let token = layers(position as f32 * 1000.0);
+            plain.append_token_kv(a, &borrowed_layers(&token)).unwrap();
+            sunk.append_token_kv(b, &borrowed_layers(&token)).unwrap();
+        }
+        assert_eq!(
+            plain.apply_sliding_window(a, 3).unwrap(),
+            sunk.apply_sliding_window_with_sinks(b, 3, 0).unwrap(),
+        );
+        assert_eq!(sunk.page_table.sequence_sink_len(b), Some(0));
+        assert_eq!(
+            plain.retained_range(a).unwrap(),
+            sunk.retained_range(b).unwrap()
+        );
+        assert_eq!(
+            plain.materialize_sequence(a).unwrap(),
+            sunk.materialize_sequence(b).unwrap()
+        );
+    }
+
+    #[test]
+    fn sliding_window_with_sinks_no_gap_when_window_covers_sequence() {
+        let mut cache = PagedKvCache::new_with_tensor_config(config(), 16);
+        let seq = cache.create_sequence();
+        for position in 0..4 {
+            let token = layers(position as f32 * 1000.0);
+            cache
+                .append_token_kv(seq, &borrowed_layers(&token))
+                .unwrap();
+        }
+        // window (4) + sinks cover the whole 4-token sequence: no eviction, no gap.
+        assert_eq!(cache.apply_sliding_window_with_sinks(seq, 4, 2).unwrap(), 0);
+        assert_eq!(cache.page_table.sequence_sink_len(seq), Some(0));
+        assert_eq!(cache.retained_start(seq).unwrap(), 0);
+        assert_materialized_order(&cache, seq, &[0.0, 1000.0, 2000.0, 3000.0]);
+    }
+
+    #[test]
+    fn sliding_window_with_zero_window_is_rejected() {
+        let mut cache = PagedKvCache::new_with_tensor_config(config(), 16);
+        let seq = cache.create_sequence();
+        cache
+            .append_token_kv(seq, &borrowed_layers(&layers(0.0)))
+            .unwrap();
+        assert!(matches!(
+            cache.apply_sliding_window_with_sinks(seq, 0, 2),
+            Err(KvError::InvalidWindowSize)
+        ));
     }
 
     #[test]
@@ -1218,7 +1472,10 @@ mod tests {
             .append_token_kv(iso_seq, &borrowed_layers(&tokens[0]))
             .unwrap();
         let iso = isolated.materialize_sequence(iso_seq).unwrap();
-        assert_eq!(&materialized.layers[0].key[0..4], iso.layers[0].key.as_slice());
+        assert_eq!(
+            &materialized.layers[0].key[0..4],
+            iso.layers[0].key.as_slice()
+        );
         assert_eq!(
             &materialized.layers[0].value[0..4],
             iso.layers[0].value.as_slice()
@@ -1236,8 +1493,18 @@ mod tests {
             .map(|i| {
                 let magnitude = if i == 0 { 1.0 } else { 2.0_f32.powi(i + 8) };
                 vec![(
-                    vec![magnitude, magnitude * 0.9, -magnitude * 0.8, magnitude * 0.95],
-                    vec![magnitude * 1.1, -magnitude, magnitude * 0.85, magnitude * 0.7],
+                    vec![
+                        magnitude,
+                        magnitude * 0.9,
+                        -magnitude * 0.8,
+                        magnitude * 0.95,
+                    ],
+                    vec![
+                        magnitude * 1.1,
+                        -magnitude,
+                        magnitude * 0.85,
+                        magnitude * 0.7,
+                    ],
                 )]
             })
             .collect();
@@ -1260,7 +1527,10 @@ mod tests {
             .append_token_kv(iso_seq, &borrowed_layers(&tokens[0]))
             .unwrap();
         let iso = isolated.materialize_sequence(iso_seq).unwrap();
-        assert_eq!(&materialized.layers[0].key[0..4], iso.layers[0].key.as_slice());
+        assert_eq!(
+            &materialized.layers[0].key[0..4],
+            iso.layers[0].key.as_slice()
+        );
     }
 
     #[test]

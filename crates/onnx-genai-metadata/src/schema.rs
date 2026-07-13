@@ -179,6 +179,13 @@ pub struct AttentionConfig {
     #[schemars(range(min = 1))]
     pub sliding_window: Option<usize>,
 
+    /// Number of leading "attention sink" tokens always retained alongside the
+    /// sliding window (StreamingLLM). Only meaningful when `sliding_window` is
+    /// set; `null` or `0` disables sink retention. These first tokens stabilize
+    /// the attention distribution and are never evicted by the window.
+    #[schemars(range(min = 0))]
+    pub sink_tokens: Option<usize>,
+
     /// Compatible attention behavior for runtimes that do not recognize `type`.
     #[schemars(with = "Option<schema_vocabulary::AttentionType>")]
     pub fallback_behavior: Option<String>,
@@ -1039,5 +1046,38 @@ mod schema_helpers {
             .as_array_mut()
             .expect("allOf inserted as an array")
             .push(constraint);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn attention_config_parses_sliding_window_and_sink_tokens() {
+        let yaml = r#"
+attention:
+  type: grouped_query
+  sliding_window: 4096
+  sink_tokens: 4
+max_sequence_length: 131072
+"#;
+        let model: ModelCapabilities = serde_yaml::from_str(yaml).expect("parses");
+        let attention = model.attention.expect("attention section");
+        assert_eq!(attention.sliding_window, Some(4096));
+        assert_eq!(attention.sink_tokens, Some(4));
+    }
+
+    #[test]
+    fn attention_config_defaults_sink_tokens_to_none() {
+        let yaml = r#"
+attention:
+  type: grouped_query
+  sliding_window: 4096
+"#;
+        let model: ModelCapabilities = serde_yaml::from_str(yaml).expect("parses");
+        let attention = model.attention.expect("attention section");
+        assert_eq!(attention.sliding_window, Some(4096));
+        assert_eq!(attention.sink_tokens, None);
     }
 }

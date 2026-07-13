@@ -869,6 +869,7 @@ impl Engine {
                         &mut self.kv_cache,
                         session_id,
                         state.decode_state.sliding_window(),
+                        state.decode_state.sink_tokens(),
                     )?;
                 }
                 extract_logits_sequence(&self.session, outputs)?
