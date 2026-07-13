@@ -151,9 +151,12 @@ impl Engine {
             .model
             .as_ref()
             .and_then(|model| model.max_sequence_length);
-        let genai_config =
-            crate::genai_config::load_genai_config_from_model_dir(&model_directory.root)?;
-        let decode_path = detect_model_decode_path(&session, metadata_max_context, genai_config)?;
+        // Our own inference metadata (inference_metadata.yaml), not
+        // onnxruntime-genai's genai_config.json, drives the runtime-owned
+        // share-buffer KV path for GQA models.
+        let shared_kv_max_len = crate::decode::shared_kv_buffer_len_from_metadata(&metadata);
+        let decode_path =
+            detect_model_decode_path(&session, metadata_max_context, shared_kv_max_len)?;
         let tokenizer = Tokenizer::from_file(&model_directory.tokenizer_path)
             .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {}", e))?;
         let fim_config = load_fim_config_from_model_dir(&model_directory.root)?;

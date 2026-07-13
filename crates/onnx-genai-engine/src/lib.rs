@@ -13,7 +13,6 @@ pub(crate) mod decode;
 pub(crate) mod decode_loop;
 pub mod engine;
 pub mod fim;
-pub(crate) mod genai_config;
 pub(crate) mod kv_bridge;
 pub mod logits;
 pub mod pipeline;

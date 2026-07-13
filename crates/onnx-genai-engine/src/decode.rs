@@ -16,6 +16,7 @@ use crate::sampling::SamplingRng;
 use crate::session::{DraftModel, DraftSession, EngineSession};
 use anyhow::Context;
 use onnx_genai_kv::{KvCacheOps, PagedKvCache};
+use onnx_genai_metadata::InferenceMetadata;
 use onnx_genai_ort::{
     DataType, DecodeSession, DecodeSessionOptions, Session, StaticCacheDecodeOptions,
     StaticCacheDecodeSession, TensorInfo, Value,
@@ -480,7 +481,7 @@ pub(crate) fn draft_decode_input_tokens(
 pub(crate) fn detect_model_decode_path(
     session: &Session,
     metadata_max_context: Option<usize>,
-    genai_config: Option<crate::genai_config::GenaiRuntimeConfig>,
+    shared_kv_max_len: Option<usize>,
 ) -> anyhow::Result<ModelDecodePath> {
     if let Some(signature) = StaticCacheDecodeSession::detect(session)? {
         return Ok(ModelDecodePath::StaticCache {
@@ -494,21 +495,14 @@ pub(crate) fn detect_model_decode_path(
         .iter()
         .any(|info| is_present_output(&info.name));
     if has_kv_inputs || has_present_outputs {
-        // A `genai_config.json` `past_present_share_buffer` declaration (e.g. the
-        // fp16 GroupQueryAttention WebGPU export) is authoritative: the model
-        // owns a single max-length KV buffer on-device that must be aliased
-        // present->past across steps. Its `max_length` (falling back to
-        // `context_length` or inference-metadata context) pre-sizes that buffer.
-        let config_share_buffer = genai_config
-            .and_then(|config| config.past_present_share_buffer)
-            .unwrap_or(false);
-        let config_max_len = genai_config.and_then(|config| config.effective_max_length());
-        if config_share_buffer {
-            let max_len = config_max_len.or(metadata_max_context).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "genai_config.json declares past_present_share_buffer but no max_length, context_length, or metadata max_sequence_length to size the shared KV buffer"
-                )
-            })?;
+        // Our own `InferenceMetadata` (from `inference_metadata.yaml`) can declare
+        // that the runtime owns a single max-length device-resident KV buffer that
+        // is aliased `present.*` -> `past_key_values.*` across decode steps
+        // (share-buffer) — for example the fp16 GroupQueryAttention WebGPU export.
+        // We honor that here in place of onnxruntime-genai's `genai_config.json`:
+        // the GQA op computes attention on-device while the runtime manages the KV
+        // buffer itself. `shared_kv_max_len` pre-sizes that buffer.
+        if let Some(max_len) = shared_kv_max_len {
             return Ok(ModelDecodePath::PastPresent {
                 shared_buffer: true,
                 max_len: Some(max_len),
@@ -524,6 +518,64 @@ pub(crate) fn detect_model_decode_path(
     }
 
     Ok(ModelDecodePath::Legacy)
+}
+
+/// Decide whether our `InferenceMetadata` requests the runtime to own a single
+/// max-length device-resident KV buffer with `present.*` -> `past_key_values.*`
+/// aliasing (share-buffer), returning that buffer's token capacity.
+///
+/// This replaces onnxruntime-genai's `genai_config.json` `past_present_share_buffer`
+/// hint: we derive the same intent from the model's own inference metadata. The
+/// runtime always owns/manages the KV cache; the GQA op is used only for
+/// on-device attention compute. We infer runtime-owned share-buffer KV from:
+///   * `model.attention.type` == group-query attention, plus
+///   * an fp16 native KV dtype (`kv_cache.native_dtype` or
+///     `model.runtime_configurable.kv_cache.dtype`), plus
+///   * a declared `model.max_sequence_length` (used to pre-size the buffer).
+///
+/// Non-GQA / fp32 / static-cache / CPU models return `None` and keep their
+/// existing decode paths unchanged.
+pub(crate) fn shared_kv_buffer_len_from_metadata(metadata: &InferenceMetadata) -> Option<usize> {
+    let model = metadata.model.as_ref()?;
+    let attention = model.attention.as_ref()?;
+    if !is_group_query_attention(&attention.attention_type) {
+        return None;
+    }
+    if !metadata_kv_is_fp16(metadata) {
+        return None;
+    }
+    model.max_sequence_length
+}
+
+/// Whether an `attention.type` string denotes group-query attention (GQA).
+fn is_group_query_attention(attention_type: &str) -> bool {
+    let normalized = attention_type.to_ascii_lowercase().replace(['-', ' '], "_");
+    matches!(
+        normalized.as_str(),
+        "group_query_attention" | "grouped_query_attention" | "gqa"
+    )
+}
+
+/// Whether the model declares an fp16 native KV cache, via either
+/// `kv_cache.native_dtype` or `model.runtime_configurable.kv_cache.dtype`.
+fn metadata_kv_is_fp16(metadata: &InferenceMetadata) -> bool {
+    let native_fp16 = metadata
+        .kv_cache
+        .as_ref()
+        .and_then(|kv| kv.native_dtype.as_deref())
+        .is_some_and(is_fp16_dtype);
+    let runtime_fp16 = metadata
+        .model
+        .as_ref()
+        .and_then(|model| model.runtime_configurable.as_ref())
+        .and_then(|runtime| runtime.kv_cache.as_ref())
+        .is_some_and(|kv| kv.dtype.iter().any(|dtype| is_fp16_dtype(dtype)));
+    native_fp16 || runtime_fp16
+}
+
+/// Whether a dtype string denotes 16-bit floating point.
+fn is_fp16_dtype(dtype: &str) -> bool {
+    matches!(dtype.to_ascii_lowercase().as_str(), "float16" | "fp16" | "half")
 }
 
 fn stable_session_ref(session: &Session) -> &'static Session {
@@ -952,7 +1004,14 @@ pub(crate) fn is_gather_out_of_bounds(message: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::is_token_input_name;
+    use super::{
+        is_fp16_dtype, is_group_query_attention, is_token_input_name,
+        shared_kv_buffer_len_from_metadata,
+    };
+    use onnx_genai_metadata::{
+        AttentionConfig, InferenceMetadata, KvCacheSpec, ModelCapabilities, RuntimeConfigurable,
+        RuntimeKvConfig,
+    };
 
     #[test]
     fn recognizes_causal_and_seq2seq_token_input_names() {
@@ -961,5 +1020,160 @@ mod tests {
         assert!(is_token_input_name("model.input_ids"));
         assert!(is_token_input_name("model.decoder_input_ids"));
         assert!(!is_token_input_name("encoder_input_ids"));
+    }
+
+    #[test]
+    fn recognizes_group_query_attention_variants() {
+        assert!(is_group_query_attention("group_query_attention"));
+        assert!(is_group_query_attention("group-query-attention"));
+        assert!(is_group_query_attention("Group Query Attention"));
+        assert!(is_group_query_attention("GQA"));
+        assert!(is_group_query_attention("grouped_query_attention"));
+        assert!(!is_group_query_attention("multi_head_attention"));
+        assert!(!is_group_query_attention("attention"));
+    }
+
+    #[test]
+    fn recognizes_fp16_dtype_variants() {
+        assert!(is_fp16_dtype("float16"));
+        assert!(is_fp16_dtype("FP16"));
+        assert!(is_fp16_dtype("half"));
+        assert!(!is_fp16_dtype("float32"));
+        assert!(!is_fp16_dtype("int8"));
+    }
+
+    fn empty_metadata() -> InferenceMetadata {
+        InferenceMetadata {
+            required_capabilities: vec![],
+            model: None,
+            kv_cache: None,
+            quantization: None,
+            pipeline: None,
+            strategy: None,
+            speculative: None,
+            structured_output: None,
+            hardware_requirements: None,
+        }
+    }
+
+    fn gqa_attention() -> AttentionConfig {
+        AttentionConfig {
+            attention_type: "group_query_attention".to_string(),
+            num_kv_heads: Some(2),
+            num_attention_heads: Some(14),
+            head_dim: Some(64),
+            sliding_window: None,
+            fallback_behavior: None,
+        }
+    }
+
+    #[test]
+    fn shared_kv_from_gqa_fp16_native_dtype() {
+        let metadata = InferenceMetadata {
+            model: Some(ModelCapabilities {
+                attention: Some(gqa_attention()),
+                max_sequence_length: Some(4096),
+                speculative: None,
+                runtime_configurable: None,
+            }),
+            kv_cache: Some(KvCacheSpec {
+                native_dtype: Some("float16".to_string()),
+                quantization_tolerance: None,
+                sensitive_layers: None,
+                operations: None,
+            }),
+            ..empty_metadata()
+        };
+        assert_eq!(shared_kv_buffer_len_from_metadata(&metadata), Some(4096));
+    }
+
+    #[test]
+    fn shared_kv_from_gqa_fp16_runtime_configurable_dtype() {
+        let metadata = InferenceMetadata {
+            model: Some(ModelCapabilities {
+                attention: Some(gqa_attention()),
+                max_sequence_length: Some(2048),
+                speculative: None,
+                runtime_configurable: Some(RuntimeConfigurable {
+                    kv_cache: Some(RuntimeKvConfig {
+                        dtype: vec!["float32".to_string(), "float16".to_string()],
+                    }),
+                    prefix_cache: None,
+                    continuous_batching: None,
+                    chunked_prefill: None,
+                }),
+            }),
+            kv_cache: None,
+            ..empty_metadata()
+        };
+        assert_eq!(shared_kv_buffer_len_from_metadata(&metadata), Some(2048));
+    }
+
+    #[test]
+    fn no_shared_kv_when_not_gqa() {
+        let metadata = InferenceMetadata {
+            model: Some(ModelCapabilities {
+                attention: Some(AttentionConfig {
+                    attention_type: "multi_head_attention".to_string(),
+                    ..gqa_attention()
+                }),
+                max_sequence_length: Some(4096),
+                speculative: None,
+                runtime_configurable: None,
+            }),
+            kv_cache: Some(KvCacheSpec {
+                native_dtype: Some("float16".to_string()),
+                quantization_tolerance: None,
+                sensitive_layers: None,
+                operations: None,
+            }),
+            ..empty_metadata()
+        };
+        assert_eq!(shared_kv_buffer_len_from_metadata(&metadata), None);
+    }
+
+    #[test]
+    fn no_shared_kv_when_not_fp16() {
+        let metadata = InferenceMetadata {
+            model: Some(ModelCapabilities {
+                attention: Some(gqa_attention()),
+                max_sequence_length: Some(4096),
+                speculative: None,
+                runtime_configurable: None,
+            }),
+            kv_cache: Some(KvCacheSpec {
+                native_dtype: Some("float32".to_string()),
+                quantization_tolerance: None,
+                sensitive_layers: None,
+                operations: None,
+            }),
+            ..empty_metadata()
+        };
+        assert_eq!(shared_kv_buffer_len_from_metadata(&metadata), None);
+    }
+
+    #[test]
+    fn no_shared_kv_when_max_sequence_length_absent() {
+        let metadata = InferenceMetadata {
+            model: Some(ModelCapabilities {
+                attention: Some(gqa_attention()),
+                max_sequence_length: None,
+                speculative: None,
+                runtime_configurable: None,
+            }),
+            kv_cache: Some(KvCacheSpec {
+                native_dtype: Some("float16".to_string()),
+                quantization_tolerance: None,
+                sensitive_layers: None,
+                operations: None,
+            }),
+            ..empty_metadata()
+        };
+        assert_eq!(shared_kv_buffer_len_from_metadata(&metadata), None);
+    }
+
+    #[test]
+    fn no_shared_kv_when_metadata_empty() {
+        assert_eq!(shared_kv_buffer_len_from_metadata(&empty_metadata()), None);
     }
 }
