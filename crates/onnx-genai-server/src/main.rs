@@ -29,9 +29,9 @@ struct Cli {
     #[arg(long, env = "ONNX_GENAI_MAX_SESSIONS", default_value_t = 256)]
     max_sessions: usize,
 
-    /// Maximum active plus queued generation requests. Falls back to ONNX_GENAI_MAX_PENDING.
-    #[arg(long, env = "ONNX_GENAI_MAX_PENDING", default_value_t = 256)]
-    max_pending: usize,
+    /// Maximum active plus queued generation requests. Falls back to ONNX_GENAI_MAX_QUEUE_DEPTH.
+    #[arg(long, env = "ONNX_GENAI_MAX_QUEUE_DEPTH", default_value_t = 256)]
+    max_queue_depth: usize,
 }
 
 #[tokio::main]
@@ -47,7 +47,7 @@ async fn main() -> anyhow::Result<()> {
         ServerConfig {
             max_output_tokens: cli.max_output_tokens,
             max_sessions: cli.max_sessions,
-            max_pending: cli.max_pending,
+            max_queue_depth: cli.max_queue_depth,
         },
     )?;
     tracing::info!(addr = %cli.addr, model = state.model_id(), "starting onnx-genai server");

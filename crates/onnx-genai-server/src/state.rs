@@ -15,7 +15,7 @@ use crate::{
 
 const DEFAULT_MAX_OUTPUT_TOKENS: usize = 4096;
 const DEFAULT_MAX_SESSIONS: usize = 256;
-const DEFAULT_MAX_PENDING: usize = 256;
+const DEFAULT_MAX_QUEUE_DEPTH: usize = 256;
 const DEFAULT_MAX_BATCH: usize = 4;
 
 #[derive(Clone)]
@@ -39,7 +39,7 @@ pub struct ServerConfig {
     pub max_output_tokens: usize,
     pub max_sessions: usize,
     /// Maximum generation requests admitted to the driver, including active and queued work.
-    pub max_pending: usize,
+    pub max_queue_depth: usize,
 }
 
 impl Default for ServerConfig {
@@ -47,7 +47,7 @@ impl Default for ServerConfig {
         Self {
             max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
             max_sessions: DEFAULT_MAX_SESSIONS,
-            max_pending: DEFAULT_MAX_PENDING,
+            max_queue_depth: DEFAULT_MAX_QUEUE_DEPTH,
         }
     }
 }
@@ -60,8 +60,8 @@ impl ServerConfig {
         if self.max_sessions == 0 {
             anyhow::bail!("max_sessions must be greater than zero");
         }
-        if self.max_pending == 0 {
-            anyhow::bail!("max_pending must be greater than zero");
+        if self.max_queue_depth == 0 {
+            anyhow::bail!("max_queue_depth must be greater than zero");
         }
         Ok(self)
     }
@@ -197,7 +197,7 @@ impl AppState {
         let engine = Engine::from_pipeline_dir(model_dir, EngineConfig::default())?;
         Ok(Self {
             model_id,
-            engine: EngineDriver::start_pipeline(engine, config.max_pending),
+            engine: EngineDriver::start_pipeline(engine, config.max_queue_depth),
             tokenizer: Arc::new(tokenizer),
             chat_template: chat_template.map(Arc::new),
             sessions: SessionRegistry::new(config.max_sessions),
@@ -243,7 +243,7 @@ impl AppState {
         let fim_config = engine.fim_config().cloned();
         Self {
             model_id,
-            engine: EngineDriver::start(engine, DEFAULT_MAX_BATCH, config.max_pending),
+            engine: EngineDriver::start(engine, DEFAULT_MAX_BATCH, config.max_queue_depth),
             tokenizer: Arc::new(tokenizer),
             chat_template: chat_template.map(Arc::new),
             sessions: SessionRegistry::new(config.max_sessions),

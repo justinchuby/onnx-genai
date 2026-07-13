@@ -822,6 +822,101 @@ async fn status_reports_sane_server_fields() {
     assert!(body["total_tokens"].is_u64());
 }
 
+#[tokio::test]
+async fn debug_endpoints_expose_config_sessions_cache_and_trace_state() {
+    let router = app(tiny_state());
+
+    let config = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/debug/config")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(config.status(), StatusCode::OK);
+    let config: Value =
+        serde_json::from_slice(&to_bytes(config.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(config["model_id"], "tiny-llm");
+    assert_eq!(config["max_queue_depth"], 256);
+    assert_eq!(config["pipeline"], false);
+
+    let created = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/sessions")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::OK);
+    let created: Value =
+        serde_json::from_slice(&to_bytes(created.into_body(), usize::MAX).await.unwrap()).unwrap();
+
+    let sessions = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/debug/sessions")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(sessions.status(), StatusCode::OK);
+    let sessions: Value =
+        serde_json::from_slice(&to_bytes(sessions.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert!(
+        sessions["sessions"]
+            .as_array()
+            .unwrap()
+            .contains(&created["id"])
+    );
+
+    let cache = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/debug/kv")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(cache.status(), StatusCode::OK);
+    let cache: Value =
+        serde_json::from_slice(&to_bytes(cache.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert!(cache["prefix_cache_hits"].is_u64());
+    assert!(cache["pending_queue_depth"].is_u64());
+    assert!(cache["available_admission_slots"].is_u64());
+
+    let trace = router
+        .oneshot(
+            Request::builder()
+                .uri("/v1/debug/trace")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(trace.status(), StatusCode::OK);
+    let trace: Value =
+        serde_json::from_slice(&to_bytes(trace.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(trace["tracing_span"], "http.request");
+    assert!(trace["latest_trace_id"].is_string());
+    assert!(
+        trace["perfetto_export"]
+            .as_str()
+            .unwrap()
+            .contains("not implemented")
+    );
+}
+
 #[cfg(feature = "metrics")]
 #[tokio::test]
 async fn metrics_exposes_prometheus_families_and_request_counter_increments() {
@@ -1036,7 +1131,7 @@ fn stop_boundary_buffer_suppresses_matched_stop_sequence() {
 }
 
 #[tokio::test]
-async fn generation_over_capacity_returns_429_with_retry_after() {
+async fn queue_depth_admission_limit_returns_429_with_retry_after() {
     let model_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
     let state = AppState::load_with_config(
         &model_dir,
@@ -1044,7 +1139,7 @@ async fn generation_over_capacity_returns_429_with_retry_after() {
         ServerConfig {
             max_output_tokens: 16,
             max_sessions: 8,
-            max_pending: 1,
+            max_queue_depth: 1,
         },
     )
     .unwrap();

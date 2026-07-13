@@ -91,9 +91,9 @@ struct DriverRoute {
 unsafe impl Send for EngineOwner {}
 
 impl EngineDriver {
-    pub(crate) fn start(engine: Engine, max_batch: usize, max_pending: usize) -> Self {
-        let (commands, rx) = mpsc::channel(max_pending);
-        let generation_capacity = Arc::new(Semaphore::new(max_pending));
+    pub(crate) fn start(engine: Engine, max_batch: usize, max_queue_depth: usize) -> Self {
+        let (commands, rx) = mpsc::channel(max_queue_depth);
+        let generation_capacity = Arc::new(Semaphore::new(max_queue_depth));
         let owner = EngineOwner(EngineBackend::Single(Box::new(engine)));
         thread::Builder::new()
             .name("onnx-genai-batch-driver".to_string())
@@ -105,9 +105,9 @@ impl EngineDriver {
         }
     }
 
-    pub(crate) fn start_pipeline(engine: PipelineEngine, max_pending: usize) -> Self {
-        let (commands, rx) = mpsc::channel(max_pending);
-        let generation_capacity = Arc::new(Semaphore::new(max_pending));
+    pub(crate) fn start_pipeline(engine: PipelineEngine, max_queue_depth: usize) -> Self {
+        let (commands, rx) = mpsc::channel(max_queue_depth);
+        let generation_capacity = Arc::new(Semaphore::new(max_queue_depth));
         let owner = EngineOwner(EngineBackend::Pipeline(Box::new(engine)));
         thread::Builder::new()
             .name("onnx-genai-pipeline-driver".to_string())

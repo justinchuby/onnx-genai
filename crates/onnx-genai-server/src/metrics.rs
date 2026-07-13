@@ -8,7 +8,7 @@ use std::fmt::Write;
 
 use axum::http::StatusCode;
 
-const ENDPOINTS: [&str; 9] = [
+const ENDPOINTS: [&str; 13] = [
     "/health",
     "/v1/models",
     "/v1/sessions",
@@ -17,6 +17,10 @@ const ENDPOINTS: [&str; 9] = [
     "/v1/chat/completions",
     "/v1/status",
     "/metrics",
+    "/v1/debug/config",
+    "/v1/debug/sessions",
+    "/v1/debug/kv",
+    "/v1/debug/trace",
     "unknown",
 ];
 const STATUS_CODES: usize = 600;
@@ -154,6 +158,10 @@ pub(crate) fn request_started() -> u64 {
     REGISTRY.trace_ids.fetch_add(1, Ordering::Relaxed)
 }
 
+pub(crate) fn latest_trace_id() -> u64 {
+    REGISTRY.trace_ids.load(Ordering::Relaxed).saturating_sub(1)
+}
+
 pub(crate) fn generation_queued() {
     REGISTRY.pending.fetch_add(1, Ordering::Relaxed);
 }
@@ -186,6 +194,10 @@ pub(crate) fn snapshot() -> MetricsSnapshot {
     MetricsSnapshot {
         active_sessions: REGISTRY.active_sessions.load(Ordering::Relaxed),
         pending_requests: REGISTRY.pending.load(Ordering::Relaxed),
+        current_batch_size: REGISTRY.batch_size.load(Ordering::Relaxed),
+        prefix_cache_hits: REGISTRY.prefix_cache_hits.load(Ordering::Relaxed),
+        prefix_cache_lookups: REGISTRY.prefix_cache_lookups.load(Ordering::Relaxed),
+        rejections: REGISTRY.rejections.load(Ordering::Relaxed),
         total_requests: REGISTRY
             .requests
             .iter()
@@ -201,6 +213,10 @@ pub(crate) struct MetricsSnapshot {
     pub(crate) pending_requests: u64,
     pub(crate) total_requests: u64,
     pub(crate) total_tokens: u64,
+    pub(crate) current_batch_size: u64,
+    pub(crate) prefix_cache_hits: u64,
+    pub(crate) prefix_cache_lookups: u64,
+    pub(crate) rejections: u64,
 }
 
 #[cfg(feature = "metrics")]
@@ -349,7 +365,11 @@ fn endpoint_index(path: &str) -> usize {
         "/v1/chat/completions" => 5,
         "/v1/status" => 6,
         "/metrics" => 7,
-        _ => 8,
+        "/v1/debug/config" => 8,
+        "/v1/debug/sessions" => 9,
+        "/v1/debug/kv" => 10,
+        "/v1/debug/trace" => 11,
+        _ => 12,
     }
 }
 

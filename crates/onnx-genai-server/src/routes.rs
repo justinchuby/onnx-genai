@@ -42,6 +42,11 @@ const MAX_SESSION_ID_LEN: usize = 128;
 const OVERLOAD_RETRY_AFTER_SECS: u64 = 1;
 const MAX_CHAT_TOP_LOGPROBS: usize = 20;
 const MAX_COMPLETION_LOGPROBS: usize = 5;
+#[cfg(feature = "profiling")]
+const TRACE_EXPORT_STATUS: &str =
+    "profiling hooks compiled; Perfetto and OTLP export are not implemented";
+#[cfg(not(feature = "profiling"))]
+const TRACE_EXPORT_STATUS: &str = "profiling hooks disabled; rebuild with --features profiling (Perfetto and OTLP export are not implemented)";
 
 #[derive(Debug, Serialize)]
 pub(crate) struct ModelsResponse {
@@ -73,6 +78,43 @@ pub(crate) struct StatusResponse {
     pending_queue_depth: u64,
     total_requests: u64,
     total_tokens: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct DebugConfigResponse {
+    model_id: String,
+    pipeline: bool,
+    max_output_tokens: usize,
+    max_sessions: usize,
+    max_queue_depth: usize,
+    model_max_context: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct DebugSessionsResponse {
+    active_sessions: u64,
+    max_sessions: usize,
+    sessions: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct DebugKvResponse {
+    prefix_cache_hits: u64,
+    prefix_cache_lookups: u64,
+    prefix_cache_hit_rate: f64,
+    active_batch_size: u64,
+    pending_queue_depth: u64,
+    available_admission_slots: usize,
+    rejected_requests: u64,
+    engine_kv_introspection: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct DebugTraceResponse {
+    tracing_span: &'static str,
+    latest_trace_id: String,
+    perfetto_export: &'static str,
+    otlp_export: &'static str,
 }
 
 #[derive(Debug, Serialize)]
@@ -218,6 +260,61 @@ pub(crate) async fn status(State(state): State<AppState>) -> Json<StatusResponse
         pending_queue_depth: snapshot.pending_requests,
         total_requests: snapshot.total_requests,
         total_tokens: snapshot.total_tokens,
+    })
+}
+
+pub(crate) async fn debug_config(State(state): State<AppState>) -> Json<DebugConfigResponse> {
+    Json(DebugConfigResponse {
+        model_id: state.model_id,
+        pipeline: state.pipeline,
+        max_output_tokens: state.config.max_output_tokens,
+        max_sessions: state.config.max_sessions,
+        max_queue_depth: state.config.max_queue_depth,
+        model_max_context: state.model_max_context,
+    })
+}
+
+pub(crate) async fn debug_sessions(
+    State(state): State<AppState>,
+) -> Result<Json<DebugSessionsResponse>, ApiError> {
+    let snapshot = crate::metrics::snapshot();
+    let sessions = state
+        .sessions
+        .client_ids()
+        .map_err(|err| ApiError::internal(format!("session registry failed: {err}")))?;
+    Ok(Json(DebugSessionsResponse {
+        active_sessions: snapshot.active_sessions,
+        max_sessions: state.sessions.max_sessions(),
+        sessions,
+    }))
+}
+
+pub(crate) async fn debug_kv(State(state): State<AppState>) -> Json<DebugKvResponse> {
+    let snapshot = crate::metrics::snapshot();
+    let prefix_cache_hit_rate = if snapshot.prefix_cache_lookups == 0 {
+        0.0
+    } else {
+        snapshot.prefix_cache_hits as f64 / snapshot.prefix_cache_lookups as f64
+    };
+    Json(DebugKvResponse {
+        prefix_cache_hits: snapshot.prefix_cache_hits,
+        prefix_cache_lookups: snapshot.prefix_cache_lookups,
+        prefix_cache_hit_rate,
+        active_batch_size: snapshot.current_batch_size,
+        pending_queue_depth: snapshot.pending_requests,
+        available_admission_slots: state.engine.generation_capacity.available_permits(),
+        rejected_requests: snapshot.rejections,
+        engine_kv_introspection: "unavailable: engine does not yet expose KV page statistics",
+    })
+}
+
+pub(crate) async fn debug_trace() -> Json<DebugTraceResponse> {
+    let latest_trace_id = crate::metrics::latest_trace_id();
+    Json(DebugTraceResponse {
+        tracing_span: "http.request",
+        latest_trace_id: format!("{latest_trace_id:016x}"),
+        perfetto_export: TRACE_EXPORT_STATUS,
+        otlp_export: TRACE_EXPORT_STATUS,
     })
 }
 

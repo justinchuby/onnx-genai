@@ -113,6 +113,20 @@ impl SessionRegistry {
         getrandom::fill(&mut bytes).context("OS CSPRNG failed")?;
         Ok(format!("sess-{}", hex_token(&bytes)))
     }
+
+    pub(crate) fn client_ids(&self) -> anyhow::Result<Vec<String>> {
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("session registry mutex poisoned"))?;
+        let mut ids = inner.sessions.keys().cloned().collect::<Vec<_>>();
+        ids.sort_unstable();
+        Ok(ids)
+    }
+
+    pub(crate) fn max_sessions(&self) -> usize {
+        self.max_sessions
+    }
 }
 
 impl Drop for SessionRegistry {

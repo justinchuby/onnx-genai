@@ -2,6 +2,8 @@
 //!
 //! The default-on `metrics` feature exposes the atomic registry at `GET /metrics`;
 //! disable it with `--no-default-features` when Prometheus exposition is not needed.
+//! `GET /v1/debug/trace` reports tracing integration status, but Perfetto and OTLP
+//! trace export are intentionally not implemented in this crate yet.
 
 use std::{net::SocketAddr, time::Instant};
 
@@ -45,6 +47,10 @@ pub fn app(state: AppState) -> Router {
         .route("/health", get(routes::health))
         .route("/v1/models", get(routes::models))
         .route("/v1/status", get(routes::status))
+        .route("/v1/debug/config", get(routes::debug_config))
+        .route("/v1/debug/sessions", get(routes::debug_sessions))
+        .route("/v1/debug/kv", get(routes::debug_kv))
+        .route("/v1/debug/trace", get(routes::debug_trace))
         .route("/v1/sessions", post(routes::create_session))
         .route("/v1/sessions/{id}", delete(routes::delete_session))
         .route("/v1/completions", post(routes::completions))
