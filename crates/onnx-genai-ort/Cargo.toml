@@ -9,6 +9,7 @@ keywords = ["onnx", "runtime", "inference", "ffi"]
 categories = ["api-bindings", "science"]
 
 [dependencies]
+half = "2"
 minijinja = { version = "2", features = ["json"] }
 onnx-genai-metadata = { workspace = true }
 onnx-genai-ort-sys = { workspace = true }

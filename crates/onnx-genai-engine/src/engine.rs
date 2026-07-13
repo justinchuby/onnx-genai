@@ -151,7 +151,9 @@ impl Engine {
             .model
             .as_ref()
             .and_then(|model| model.max_sequence_length);
-        let decode_path = detect_model_decode_path(&session, metadata_max_context)?;
+        let genai_config =
+            crate::genai_config::load_genai_config_from_model_dir(&model_directory.root)?;
+        let decode_path = detect_model_decode_path(&session, metadata_max_context, genai_config)?;
         let tokenizer = Tokenizer::from_file(&model_directory.tokenizer_path)
             .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {}", e))?;
         let fim_config = load_fim_config_from_model_dir(&model_directory.root)?;
@@ -165,7 +167,8 @@ impl Engine {
                 session_options.clone(),
             )
             .map_err(|e| anyhow::anyhow!("Failed to load draft ORT session: {}", e))?;
-            let draft_decode_path = detect_model_decode_path(&draft_session, metadata_max_context)?;
+            let draft_decode_path =
+                detect_model_decode_path(&draft_session, metadata_max_context, None)?;
             let draft_kv_model = infer_kv_model_info(&draft_session, config.page_size)?;
             let draft_kv_cache = if let Some(kv_model) = &draft_kv_model {
                 PagedKvCache::new_with_tensor_config(kv_model.tensor_config, config.num_gpu_pages)

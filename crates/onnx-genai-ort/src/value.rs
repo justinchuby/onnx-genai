@@ -223,6 +223,28 @@ impl Value {
         tensor_data_to_vec(self.ptr.as_ptr(), self.numel())
     }
 
+    /// Copy tensor data out as f32 values, widening Float16 losslessly.
+    ///
+    /// Float32 tensors are copied directly; Float16 tensors are upcast via the
+    /// IEEE-754 half → single conversion. Used by decode/logits/hidden-state
+    /// readers that must consume fp16 GroupQueryAttention (GQA) outputs on the
+    /// host without a separate device conversion pass.
+    pub fn to_vec_f32_lossy(&self) -> Result<Vec<f32>> {
+        match self.dtype {
+            DataType::Float32 => self.to_vec_f32(),
+            DataType::Float16 => {
+                let bits: Vec<u16> = tensor_data_to_vec(self.ptr.as_ptr(), self.numel())?;
+                Ok(bits
+                    .into_iter()
+                    .map(|value| half::f16::from_bits(value).to_f32())
+                    .collect())
+            }
+            other => Err(OrtError::InvalidArgument(format!(
+                "cannot widen {other:?} tensor to f32"
+            ))),
+        }
+    }
+
     /// Copy Float16 tensor data out as IEEE-754 half-precision bit patterns.
     pub fn to_vec_f16_bits(&self) -> Result<Vec<u16>> {
         if self.dtype != DataType::Float16 {

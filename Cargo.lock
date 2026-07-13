@@ -1557,6 +1557,7 @@ dependencies = [
 name = "onnx-genai-ort"
 version = "0.1.0"
 dependencies = [
+ "half",
  "minijinja",
  "onnx-genai-metadata",
  "onnx-genai-ort-sys",

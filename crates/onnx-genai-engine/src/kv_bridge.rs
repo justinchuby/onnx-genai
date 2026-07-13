@@ -71,8 +71,8 @@ pub(crate) fn infer_kv_model_info(
         .collect::<Vec<_>>();
     let mut layers = Vec::with_capacity(key_outputs.len());
     for (key, value) in key_outputs.iter().zip(value_outputs.iter()) {
-        if key.dtype != DataType::Float32 || value.dtype != DataType::Float32 {
-            anyhow::bail!("KV present outputs must be Float32");
+        if !is_supported_kv_dtype(key.dtype) || !is_supported_kv_dtype(value.dtype) {
+            anyhow::bail!("KV present outputs must be Float32 or Float16");
         }
         let key_past = matching_past_input(&key.name, &kv_inputs)
             .with_context(|| format!("missing past input for present output '{}'", key.name))?
@@ -95,9 +95,9 @@ pub(crate) fn infer_kv_model_info(
 }
 
 pub(crate) fn infer_kv_heads_and_head_dim(info: &TensorInfo) -> anyhow::Result<(usize, usize)> {
-    if info.dtype != DataType::Float32 || info.shape.len() < 3 {
+    if !is_supported_kv_dtype(info.dtype) || info.shape.len() < 3 {
         anyhow::bail!(
-            "present KV output '{}' must be Float32 rank >= 3, got {:?} {:?}",
+            "present KV output '{}' must be Float32 or Float16 rank >= 3, got {:?} {:?}",
             info.name,
             info.dtype,
             info.shape
@@ -120,6 +120,17 @@ pub(crate) fn infer_kv_heads_and_head_dim(info: &TensorInfo) -> anyhow::Result<(
     Ok((num_kv_heads, head_dim))
 }
 
+/// KV present/past tensor element types the runtime can consume.
+///
+/// The host paged-mirror path ([`mirror_present_kv_to_pages`]) only reads fp32
+/// data, but fp16 KV is valid for on-device / share-buffer decode runners that
+/// never round-trip KV through the host cache. Accepting both here unblocks
+/// loading fp16 GroupQueryAttention (GQA) WebGPU exports while keeping the fp32
+/// legacy path intact.
+fn is_supported_kv_dtype(dtype: DataType) -> bool {
+    matches!(dtype, DataType::Float32 | DataType::Float16)
+}
+
 pub(crate) fn mirror_present_kv_to_pages(
     session: &Session,
     kv_model: &KvModelInfo,
@@ -135,6 +146,16 @@ pub(crate) fn mirror_present_kv_to_pages(
         .enumerate()
         .map(|(idx, name)| (name.as_str(), idx))
         .collect::<HashMap<_, _>>();
+    if let Some(layer) = kv_model.layers.first()
+        && let Some(&idx) = output_lookup.get(layer.key_present.as_str())
+        && outputs[idx].dtype() != DataType::Float32
+    {
+        anyhow::bail!(
+            "host KV mirroring requires Float32 present KV, but '{}' is {:?}; fp16/share-buffer KV must use a device-resident decode runner",
+            layer.key_present,
+            outputs[idx].dtype()
+        );
+    }
     let layer_data = kv_model
         .layers
         .iter()
@@ -556,6 +577,13 @@ mod tests {
         assert_eq!(past_shape(&[-1, 2, -1, 8], 3).unwrap(), [1, 2, 3, 8]);
         assert_eq!(row_major_strides(&[1, 2, 3, 4]), [24, 12, 4, 1]);
 
+        // fp16 present KV is accepted for on-device / share-buffer decode runners.
+        let fp16 = TensorInfo {
+            dtype: DataType::Float16,
+            ..valid.clone()
+        };
+        assert_eq!(infer_kv_heads_and_head_dim(&fp16).unwrap(), (2, 8));
+
         let wrong_dtype = TensorInfo {
             dtype: DataType::Int64,
             ..valid.clone()
@@ -564,7 +592,7 @@ mod tests {
             infer_kv_heads_and_head_dim(&wrong_dtype)
                 .unwrap_err()
                 .to_string()
-                .contains("must be Float32 rank >= 3")
+                .contains("must be Float32 or Float16 rank >= 3")
         );
         let unknown_head_dim = TensorInfo {
             shape: vec![-1, 2, -1, -1],

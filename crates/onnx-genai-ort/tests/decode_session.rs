@@ -49,6 +49,18 @@ fn fp16_value_round_trips_bits() {
 }
 
 #[test]
+fn to_vec_f32_lossy_widens_fp16_and_passes_through_fp32() {
+    // 0.0, 1.0, -2.0, 65504.0 (fp16 max) as IEEE-754 half bit patterns.
+    let bits = vec![0x0000, 0x3c00, 0xc000, 0x7bff];
+    let fp16 = Value::from_slice_f16_bits(&bits, &[2, 2]).expect("f16 tensor");
+    let widened = fp16.to_vec_f32_lossy().expect("fp16 widen");
+    assert_eq!(widened, vec![0.0_f32, 1.0, -2.0, 65504.0]);
+
+    let fp32 = Value::from_slice_f32(&[0.5, -1.25], &[2]).expect("f32 tensor");
+    assert_eq!(fp32.to_vec_f32_lossy().expect("f32 passthrough"), vec![0.5, -1.25]);
+}
+
+#[test]
 fn bound_decode_logits_match_naive_repass() {
     let _guard = ort_test_lock().lock().expect("ORT test lock");
     let session = load_session();

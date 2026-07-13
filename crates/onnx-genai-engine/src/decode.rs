@@ -480,6 +480,7 @@ pub(crate) fn draft_decode_input_tokens(
 pub(crate) fn detect_model_decode_path(
     session: &Session,
     metadata_max_context: Option<usize>,
+    genai_config: Option<crate::genai_config::GenaiRuntimeConfig>,
 ) -> anyhow::Result<ModelDecodePath> {
     if let Some(signature) = StaticCacheDecodeSession::detect(session)? {
         return Ok(ModelDecodePath::StaticCache {
@@ -493,6 +494,27 @@ pub(crate) fn detect_model_decode_path(
         .iter()
         .any(|info| is_present_output(&info.name));
     if has_kv_inputs || has_present_outputs {
+        // A `genai_config.json` `past_present_share_buffer` declaration (e.g. the
+        // fp16 GroupQueryAttention WebGPU export) is authoritative: the model
+        // owns a single max-length KV buffer on-device that must be aliased
+        // present->past across steps. Its `max_length` (falling back to
+        // `context_length` or inference-metadata context) pre-sizes that buffer.
+        let config_share_buffer = genai_config
+            .and_then(|config| config.past_present_share_buffer)
+            .unwrap_or(false);
+        let config_max_len = genai_config.and_then(|config| config.effective_max_length());
+        if config_share_buffer {
+            let max_len = config_max_len.or(metadata_max_context).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "genai_config.json declares past_present_share_buffer but no max_length, context_length, or metadata max_sequence_length to size the shared KV buffer"
+                )
+            })?;
+            return Ok(ModelDecodePath::PastPresent {
+                shared_buffer: true,
+                max_len: Some(max_len),
+            });
+        }
+
         let shared_buffer =
             session.past_present_share_buffer_supported() && metadata_max_context.is_some();
         return Ok(ModelDecodePath::PastPresent {
@@ -685,7 +707,7 @@ fn extract_next_token_logits_from_outputs(
         .context("logits output index was out of range")?;
     let shape = logits.shape();
     let data = logits
-        .to_vec_f32()
+        .to_vec_f32_lossy()
         .map_err(|e| anyhow::anyhow!("Failed to read logits tensor: {}", e))?;
 
     match shape {
@@ -722,7 +744,7 @@ fn extract_last_hidden(
         .context("hidden-state output index was out of range")?;
     let shape = value.shape();
     let data = value
-        .to_vec_f32()
+        .to_vec_f32_lossy()
         .map_err(|error| anyhow::anyhow!("Failed to read target hidden-state tensor: {error}"))?;
     match shape {
         [hidden] if *hidden > 0 => Ok(data),
@@ -763,7 +785,7 @@ pub(crate) fn extract_logits_sequence(
         .context("logits output index was out of range")?;
     let shape = logits.shape();
     let data = logits
-        .to_vec_f32()
+        .to_vec_f32_lossy()
         .map_err(|e| anyhow::anyhow!("Failed to read logits tensor: {}", e))?;
 
     match shape {
@@ -799,7 +821,7 @@ fn extract_logits_value_next(logits: &Value) -> anyhow::Result<Vec<f32>> {
 fn extract_logits_value_sequence(logits: &Value) -> anyhow::Result<Vec<Vec<f32>>> {
     let shape = logits.shape();
     let data = logits
-        .to_vec_f32()
+        .to_vec_f32_lossy()
         .map_err(|e| anyhow::anyhow!("Failed to read logits tensor: {}", e))?;
 
     match shape {
