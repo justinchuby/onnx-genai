@@ -107,6 +107,13 @@ pub struct DecodeSession<'a> {
     current_kv: HashMap<String, Arc<Value>>,
     current_len: usize,
     mode: DecodeKvMode,
+    /// Owned device allocator that backs the shared-buffer KV `Value`s in
+    /// `current_kv`. OrtValues created through an allocator free their memory
+    /// via that allocator on release, so it MUST outlive the `Value`s. This
+    /// field is declared after `current_kv` so Rust drops the KV `Value`s first
+    /// and releases this allocator afterwards; releasing it earlier caused a
+    /// use-after-free SIGSEGV at session close.
+    kv_allocator: Option<crate::Allocator>,
 }
 
 struct StaticCachePair {
@@ -178,6 +185,7 @@ impl<'a> DecodeSession<'a> {
             current_kv: HashMap::new(),
             current_len: 0,
             mode,
+            kv_allocator: None,
         };
         if mode == DecodeKvMode::SharedBuffer {
             let max_length = options.max_length.ok_or_else(|| {
@@ -462,6 +470,7 @@ impl<'a> DecodeSession<'a> {
                 &cpu_allocator
             }
         };
+        let mut allocated = Vec::with_capacity(self.kv_pairs.len());
         for pair in &self.kv_pairs {
             let mut shape = pair.input.shape.clone();
             for (axis, dim) in shape.iter_mut().enumerate() {
@@ -476,11 +485,20 @@ impl<'a> DecodeSession<'a> {
                     )));
                 }
             }
-            self.current_kv.insert(
+            allocated.push((
                 pair.past.clone(),
                 Arc::new(Value::empty_in(&shape, pair.input.dtype, allocator)?),
-            );
+            ));
         }
+        // The `allocator` borrow of `device_allocator` ends here; retain the
+        // owned device allocator so it outlives the KV `Value`s it just backed
+        // (see `DecodeSession::kv_allocator`). Moving the wrapper does not change
+        // the underlying `OrtAllocator*` the `Value`s reference. The CPU fallback
+        // allocator is the process-owned default and needs no retention.
+        for (past, value) in allocated {
+            self.current_kv.insert(past, value);
+        }
+        self.kv_allocator = device_allocator;
         Ok(())
     }
 }
