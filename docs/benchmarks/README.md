@@ -15,7 +15,16 @@ of Ollama CPU. It does not win universally: LM Studio leads long-context decode
 160.17 to 115.19 tok/s, while Foundry Local's ORT CPU model leads both decode
 cases at 202.67 and 165.77 tok/s.
 
-The current honest checkpoint is
+The current **H200 CUDA / GPU** checkpoint is
+[`2026-07-13-H200-cuda-onnxgenai-vs-ollama-foundry.md`](2026-07-13-H200-cuda-onnxgenai-vs-ollama-foundry.md).
+With CUDA-graph decode capture and a vectorized greedy argmax, onnx-genai CUDA
+reaches 481 tok/s decode with 68 ms TTFT on Qwen2.5-0.5B (1024 greedy tokens):
+it beats Foundry Local on every axis and ties Ollama Q4_K_M on end-to-end total
+latency (2199 vs 2185 ms), winning TTFT (−59%) while trailing steady-state
+decode by ~5%. Reproduce via the
+[H200 CUDA runbook](H200-CUDA-runbook.md).
+
+The current Mac GPU checkpoint is
 [`2026-07-12-JustindeMacBook-Pro-q4-gqa-webgpu.md`](2026-07-12-JustindeMacBook-Pro-q4-gqa-webgpu.md).
 It is the first correctness-verified, same-source GPU comparison with both Q4
 `MatMulNBits` weights and on-device `GroupQueryAttention`: 30.52/29.21 tok/s

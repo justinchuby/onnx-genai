@@ -247,11 +247,17 @@ impl Value {
         match self.dtype {
             DataType::Float32 => self.to_vec_f32(),
             DataType::Float16 => {
-                let bits: Vec<u16> = tensor_data_to_vec(self.ptr.as_ptr(), self.numel())?;
-                Ok(bits
-                    .into_iter()
-                    .map(|value| half::f16::from_bits(value).to_f32())
-                    .collect())
+                let numel = self.numel();
+                let data = tensor_data_ptr(self.ptr.as_ptr())?;
+                // SAFETY: an fp16 tensor holds `numel` contiguous u16 elements at
+                // `data`, valid until this Value is released; we only read here.
+                let bits = unsafe { std::slice::from_raw_parts(data.cast::<u16>(), numel) };
+                // Reinterpret the raw bits as f16 and widen with half's vectorized
+                // slice conversion (hardware F16C when available), which is far
+                // faster than a per-element `from_bits().to_f32()` scalar loop on
+                // the hot logits path (~152K elements per decode step).
+                let halves: &[half::f16] = half::slice::HalfBitsSliceExt::reinterpret_cast(bits);
+                Ok(half::slice::HalfFloatSliceExt::to_f32_vec(halves))
             }
             other => Err(OrtError::InvalidArgument(format!(
                 "cannot widen {other:?} tensor to f32"
@@ -293,6 +299,91 @@ impl Value {
     /// decode-session diagnostics that need to verify buffer reuse.
     pub fn data_ptr_addr(&self) -> Result<usize> {
         Ok(tensor_data_ptr(self.ptr.as_ptr())? as usize)
+    }
+
+    /// Overwrite the leading `data.len()` Int64 elements of this tensor in
+    /// place, leaving the tensor's OrtValue (and its buffer address) unchanged.
+    ///
+    /// This is the update primitive for the static-shape captured decode loop:
+    /// the persistent `input_ids` / `position_ids` / `attention_mask` buffers
+    /// keep the fixed device/host addresses that a captured CUDA graph replays
+    /// against, while their contents change every token. `data.len()` may be
+    /// smaller than the tensor to update only a prefix (e.g. the valid region
+    /// of a max-length attention mask).
+    pub fn write_i64_prefix(&self, data: &[i64]) -> Result<()> {
+        if self.dtype != DataType::Int64 {
+            return Err(OrtError::InvalidArgument(format!(
+                "write_i64_prefix requires an Int64 tensor, got {:?}",
+                self.dtype
+            )));
+        }
+        if data.len() > self.numel() {
+            return Err(OrtError::InvalidArgument(format!(
+                "write_i64_prefix length {} exceeds tensor capacity {}",
+                data.len(),
+                self.numel()
+            )));
+        }
+        let dst = tensor_data_ptr(self.ptr.as_ptr())?.cast::<i64>();
+        // SAFETY: `dst` points to at least `numel()` contiguous i64 elements
+        // owned by this tensor; we write only the first `data.len()` of them.
+        unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), dst, data.len()) };
+        Ok(())
+    }
+
+    /// Set `count` consecutive `Int64` elements starting at `start` to `value`,
+    /// in place, without allocating a temporary buffer.
+    ///
+    /// Companion to [`write_i64_prefix`](Self::write_i64_prefix) for the
+    /// captured-decode attention mask: the mask's valid region grows by one
+    /// element per token, so each step fills only the newly-valid tail
+    /// (typically a single element) instead of rewriting the whole prefix —
+    /// keeping the captured-decode step O(1) rather than O(context).
+    pub fn fill_i64_range(&self, start: usize, count: usize, value: i64) -> Result<()> {
+        if self.dtype != DataType::Int64 {
+            return Err(OrtError::InvalidArgument(format!(
+                "fill_i64_range requires an Int64 tensor, got {:?}",
+                self.dtype
+            )));
+        }
+        let end = start.checked_add(count).ok_or_else(|| {
+            OrtError::InvalidArgument("fill_i64_range range overflows usize".into())
+        })?;
+        if end > self.numel() {
+            return Err(OrtError::InvalidArgument(format!(
+                "fill_i64_range end {} exceeds tensor capacity {}",
+                end,
+                self.numel()
+            )));
+        }
+        if count == 0 {
+            return Ok(());
+        }
+        let base = tensor_data_ptr(self.ptr.as_ptr())?.cast::<i64>();
+        // SAFETY: `[start, start+count)` lies within the `numel()` contiguous
+        // i64 elements owned by this tensor (checked above), so each written
+        // element is in bounds.
+        unsafe {
+            let dst = base.add(start);
+            for offset in 0..count {
+                dst.add(offset).write(value);
+            }
+        }
+        Ok(())
+    }
+
+    /// Deep-copy this tensor into a fresh host-owned [`Value`] with its own
+    /// buffer. Used to snapshot a persistent captured-decode output buffer so
+    /// the caller can consume it while the original is reused on the next step.
+    pub fn clone_owned(&self) -> Result<Value> {
+        match self.dtype {
+            DataType::Float32 => Value::from_vec_f32(self.to_vec_f32()?, &self.shape),
+            DataType::Float16 => Value::from_vec_f16_bits(self.to_vec_f16_bits()?, &self.shape),
+            DataType::Int64 => Value::from_vec_i64(self.to_vec_i64()?, &self.shape),
+            other => Err(OrtError::InvalidArgument(format!(
+                "cannot clone tensor with dtype {other:?}"
+            ))),
+        }
     }
 
     /// Zero one row of a rank-3 row-major tensor shaped `[B, N, D]`.

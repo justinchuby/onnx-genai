@@ -167,6 +167,10 @@ pub struct Session {
     /// Execution providers requested for this session (priority order). Used to
     /// decide whether device-resident KV buffers can be allocated.
     execution_providers: Vec<ExecutionProvider>,
+    /// Whether the session was created with EP graph capture enabled
+    /// (CUDA `enable_cuda_graph=1`). Decode runners use this to drive the
+    /// static-shape captured-graph replay path.
+    graph_capture: bool,
 }
 
 impl Session {
@@ -236,6 +240,7 @@ impl Session {
             inputs,
             outputs,
             execution_providers: effective_providers,
+            graph_capture: options.graph_capture,
         })
     }
 
@@ -306,6 +311,90 @@ impl Session {
         crate::error::check_status(unsafe {
             run(self.ptr.as_ptr(), std::ptr::null(), binding.as_ptr())
         })
+    }
+
+    /// Whether this session was created with EP graph capture enabled.
+    pub fn graph_capture(&self) -> bool {
+        self.graph_capture
+    }
+
+    /// The CUDA device id this session runs on, if a CUDA EP was requested.
+    pub fn cuda_device_id(&self) -> Option<i32> {
+        self.execution_providers.iter().find_map(|provider| {
+            if let ExecutionProvider::Cuda { device_id } = provider {
+                Some(*device_id)
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Run inference using pre-bound I/O, selecting a CUDA-graph annotation.
+    ///
+    /// `graph_annotation_id` maps to the `gpu_graph_id` run-config entry: `-1`
+    /// runs without capture or replay (used for prompt/prefill steps whose
+    /// shapes differ), while a stable non-negative id captures the graph on the
+    /// first run of that shape and replays it on subsequent runs. This is how
+    /// the static-shape decode loop replays a single captured decode graph while
+    /// leaving the variable-shape prefill uncaptured.
+    pub fn run_with_binding_graph(
+        &self,
+        binding: &IoBinding,
+        graph_annotation_id: i32,
+    ) -> Result<()> {
+        let api = crate::error::api()?;
+        let run = api
+            .RunWithBinding
+            .ok_or(OrtError::ApiUnavailable("RunWithBinding"))?;
+        let create_opts = api
+            .CreateRunOptions
+            .ok_or(OrtError::ApiUnavailable("CreateRunOptions"))?;
+        let add_entry = api
+            .AddRunConfigEntry
+            .ok_or(OrtError::ApiUnavailable("AddRunConfigEntry"))?;
+        let release_opts = api
+            .ReleaseRunOptions
+            .ok_or(OrtError::ApiUnavailable("ReleaseRunOptions"))?;
+
+        let mut run_options = std::ptr::null_mut();
+        // SAFETY: `run_options` is a valid out-parameter, released below.
+        crate::error::check_status(unsafe { create_opts(&mut run_options) })?;
+        let run_options = NonNull::new(run_options).ok_or(OrtError::NullPointer)?;
+
+        let result = (|| {
+            let key = CString::new("gpu_graph_id").expect("literal has no NUL");
+            let value =
+                CString::new(graph_annotation_id.to_string()).expect("integer string has no NUL");
+            // SAFETY: run options handle and NUL-terminated strings are valid.
+            crate::error::check_status(unsafe {
+                add_entry(run_options.as_ptr(), key.as_ptr(), value.as_ptr())
+            })?;
+            // SAFETY: session, run options, and binding are valid ORT handles.
+            crate::error::check_status(unsafe {
+                run(self.ptr.as_ptr(), run_options.as_ptr(), binding.as_ptr())
+            })
+        })();
+
+        // SAFETY: `run_options` was created above and is released exactly once.
+        unsafe { release_opts(run_options.as_ptr()) };
+        result
+    }
+
+    /// Release a previously captured CUDA graph so the next run of the matching
+    /// annotation id re-captures instead of replaying.
+    ///
+    /// A captured graph replays against the exact device buffer addresses seen
+    /// at capture time. When the [`Session`] is reused across independent
+    /// generations (the server binds a fresh prefill each request), the next
+    /// generation must re-capture rather than replay a stale graph, so callers
+    /// release the captured decode graph on reset.
+    pub fn release_captured_graph(&self, graph_annotation_id: i32) -> Result<()> {
+        let api = crate::error::api()?;
+        let Some(release) = api.SessionReleaseCapturedGraph else {
+            return Ok(());
+        };
+        // SAFETY: `self.ptr` is a valid session handle for the session lifetime.
+        crate::error::check_status(unsafe { release(self.ptr.as_ptr(), graph_annotation_id) })
     }
 
     /// Get input names.

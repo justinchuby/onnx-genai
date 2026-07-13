@@ -15,6 +15,27 @@ use std::sync::Arc;
 
 use crate::{DataType, IoBinding, MemoryInfo, OrtError, Result, Session, TensorInfo, Value};
 
+/// Prompt and prefill runs use CUDA-graph annotation id `-1` (no capture) so
+/// only the fixed-shape decode step is captured and replayed. Each
+/// [`DecodeSession`] that enables capture claims a process-unique positive id
+/// (see [`next_capture_graph_id`]) so that reusing the underlying ORT session
+/// for a new generation never re-captures a different graph under an id ORT
+/// already holds — which corrupts ORT's per-id CUDA-graph bookkeeping.
+static NEXT_CAPTURE_GRAPH_ID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(1);
+
+fn next_capture_graph_id() -> i32 {
+    // Ids must be unique across concurrently-live sessions and strictly positive
+    // so they never collide with the `-1` no-capture sentinel. Masking off the
+    // sign bit keeps them positive and unique within each 2^31 cycle; the lone
+    // zero per cycle is remapped. A wrap would only reuse an id after 2^31
+    // generations, by which point the prior holder is long dropped.
+    let raw = NEXT_CAPTURE_GRAPH_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    match raw & i32::MAX {
+        0 => i32::MAX,
+        id => id,
+    }
+}
+
 /// KV binding strategy selected for a decode session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DecodeKvMode {
@@ -107,6 +128,58 @@ pub struct DecodeSession<'a> {
     current_kv: HashMap<String, Arc<Value>>,
     current_len: usize,
     mode: DecodeKvMode,
+    /// Owned device allocator that backs the shared-buffer KV `Value`s in
+    /// `current_kv`. OrtValues created through an allocator free their memory
+    /// via that allocator on release, so it MUST outlive the `Value`s. This
+    /// field is declared after `current_kv` so Rust drops the KV `Value`s first
+    /// and releases this allocator afterwards; releasing it earlier caused a
+    /// use-after-free SIGSEGV at session close.
+    kv_allocator: Option<crate::Allocator>,
+    /// Static-shape captured-decode state, populated lazily on the first
+    /// single-token step when the session has CUDA graph capture enabled.
+    /// Holds the persistent, fixed-address I/O buffers a captured graph replays
+    /// against: `input_ids [1,1]`, `position_ids [1,1]`, a max-length
+    /// `attention_mask [1, max_len]`, and the `logits [1,1,vocab]` output.
+    capture: Option<CaptureState>,
+    /// Fixed KV capacity (shared-buffer `max_length`), needed to size the
+    /// captured attention mask. `None` outside shared-buffer mode.
+    max_length: Option<usize>,
+    /// Whether the persistent captured-decode I/O is currently bound. Captured
+    /// graphs require stable bindings across replays, so we bind the persistent
+    /// buffers once and only rebind after a non-captured step clears them.
+    capture_bound: bool,
+    /// Process-unique CUDA-graph annotation id claimed lazily when this session
+    /// first captures its decode graph. `None` until the first captured step.
+    capture_graph_id: Option<i32>,
+}
+
+/// Persistent I/O buffers for the static-shape captured decode graph.
+struct CaptureState {
+    input_ids: Value,
+    position_ids: Value,
+    attention_mask: Value,
+    logits: Value,
+    mask_len: usize,
+    /// Number of leading `attention_mask` entries currently set to 1. The valid
+    /// region only grows within a generation, so each step fills just the delta
+    /// `[mask_valid_len, valid_len)` instead of rewriting the whole prefix,
+    /// keeping the captured-decode step O(1) rather than O(context). Reset to 0
+    /// by [`DecodeSession::reset_captured_mask`] on rewind/reset.
+    mask_valid_len: usize,
+}
+
+impl Drop for DecodeSession<'_> {
+    fn drop(&mut self) {
+        // If this session captured a decode graph, release it now — while this
+        // session's fixed-address I/O buffers are still alive (fields are
+        // dropped after this method returns). The captured graph references
+        // those buffers; leaving it registered on the shared ORT session would
+        // let a later release clean up a graph whose buffers were already freed,
+        // corrupting the heap.
+        if let Some(graph_id) = self.capture_graph_id {
+            let _ = self.session.release_captured_graph(graph_id);
+        }
+    }
 }
 
 struct StaticCachePair {
@@ -178,6 +251,11 @@ impl<'a> DecodeSession<'a> {
             current_kv: HashMap::new(),
             current_len: 0,
             mode,
+            kv_allocator: None,
+            capture: None,
+            max_length: None,
+            capture_bound: false,
+            capture_graph_id: None,
         };
         if mode == DecodeKvMode::SharedBuffer {
             let max_length = options.max_length.ok_or_else(|| {
@@ -186,6 +264,7 @@ impl<'a> DecodeSession<'a> {
                 )
             })?;
             this.allocate_shared_buffers(options.batch_size, max_length)?;
+            this.max_length = Some(max_length);
         }
         Ok(this)
     }
@@ -225,12 +304,28 @@ impl<'a> DecodeSession<'a> {
             ));
         }
 
+        // Static-shape captured decode fast path: once the prompt has been
+        // consumed, every decode step feeds one token with fixed-shape inputs
+        // and fixed-address KV buffers, so a single CUDA graph can be captured
+        // and replayed to eliminate per-kernel launch overhead.
+        if self.mode == DecodeKvMode::SharedBuffer
+            && self.session.graph_capture()
+            && new_input_ids.len() == 1
+            && self.current_len > 0
+        {
+            return self.step_captured(new_input_ids[0], attention_mask, position_ids[0]);
+        }
+
         let input_ids = Value::from_slice_i64(new_input_ids, &[1, seq_len])?;
         let attention_mask = Value::from_slice_i64(attention_mask, &[1, total_len])?;
         let position_ids = Value::from_slice_i64(position_ids, &[1, seq_len])?;
 
         let bind_span = crate::prof_span!("ort.bind_inputs");
         self.binding.clear()?;
+        // This step re-binds fresh per-step Values, so any persistent captured
+        // binding is now stale and must be re-established before the next
+        // captured step.
+        self.capture_bound = false;
         self.bind_standard_inputs(&input_ids, &attention_mask, &position_ids)?;
         self.bind_kv_inputs()?;
         let mut borrowed_outputs = Vec::new();
@@ -255,7 +350,14 @@ impl<'a> DecodeSession<'a> {
 
         {
             let _run_span = crate::prof_span!("ort.session_run");
-            self.session.run_with_binding(&self.binding)?;
+            // When graph capture is enabled, prompt/prefill runs use annotation
+            // -1 so ORT executes them normally instead of capturing them as the
+            // (differently-shaped) decode graph.
+            if self.session.graph_capture() {
+                self.session.run_with_binding_graph(&self.binding, -1)?;
+            } else {
+                self.session.run_with_binding(&self.binding)?;
+            }
         }
         let _extract_span = crate::prof_span!("ort.extract_outputs");
         let mut logits = None;
@@ -276,6 +378,150 @@ impl<'a> DecodeSession<'a> {
             .checked_add(new_input_ids.len())
             .ok_or_else(|| OrtError::InvalidArgument("decode length overflow".into()))?;
         logits.ok_or_else(|| OrtError::InvalidArgument("model did not produce logits".into()))
+    }
+
+    /// Single-token decode step replayed through a captured CUDA graph.
+    ///
+    /// All inputs are bound to persistent, fixed-address buffers whose shapes
+    /// never change across steps: `input_ids [1,1]`, `position_ids [1,1]`, and a
+    /// full-capacity `attention_mask [1, max_len]` whose leading `valid_len`
+    /// entries are 1 (the model derives GQA sequence lengths from the mask, so
+    /// the trailing zeros mask the unused KV-buffer tail). KV buffers are the
+    /// same fixed shared buffers bound in place as both past inputs and present
+    /// outputs. Logits are written into a persistent output buffer. The first
+    /// such step captures the graph; subsequent steps replay it.
+    fn step_captured(
+        &mut self,
+        token: i64,
+        attention_mask: &[i64],
+        position: i64,
+    ) -> Result<Value> {
+        self.ensure_capture_state()?;
+        // Move the capture buffers out of `self` for the duration of the step so
+        // the `&mut self` bind helpers don't alias the borrow; restore on the
+        // success path (an error aborts generation and drops the state).
+        let mut cap = self.capture.take().expect("capture state initialized");
+        let valid_len = attention_mask.len();
+        if valid_len > cap.mask_len {
+            return Err(OrtError::InvalidArgument(format!(
+                "attention length {valid_len} exceeds captured mask capacity {}",
+                cap.mask_len
+            )));
+        }
+        cap.input_ids.write_i64_prefix(&[token])?;
+        cap.position_ids.write_i64_prefix(&[position])?;
+        // The mask's valid region only grows within a generation (rewind/reset
+        // clear it), and prior entries are already 1, so fill just the newly
+        // valid tail — typically a single element — keeping this step O(1) in
+        // context rather than rewriting (and heap-allocating) the whole prefix.
+        if valid_len > cap.mask_valid_len {
+            cap.attention_mask.fill_i64_range(
+                cap.mask_valid_len,
+                valid_len - cap.mask_valid_len,
+                1,
+            )?;
+        } else if valid_len < cap.mask_valid_len {
+            // Defensive: a shrink without an intervening reset — clear the tail
+            // that is no longer valid so it does not leak into this step.
+            cap.attention_mask
+                .fill_i64_range(valid_len, cap.mask_valid_len - valid_len, 0)?;
+        }
+        cap.mask_valid_len = valid_len;
+
+        // Re-bind the persistent buffers every step. ORT keys its stable
+        // internal device input buffers off the binding and re-copies the bound
+        // CPU inputs host->device on each Run; a captured graph replays against
+        // those stable device buffers. Binding only once would freeze the device
+        // inputs at their first-step values (the graph does not re-copy CPU
+        // inputs on replay), so the model would repeat a single token.
+        let bind_span = crate::prof_span!("ort.bind_inputs");
+        self.binding.clear()?;
+        self.bind_standard_inputs(&cap.input_ids, &cap.attention_mask, &cap.position_ids)?;
+        self.bind_kv_inputs()?;
+        for output in self.session.output_names() {
+            if let Some(pair) = self.kv_pairs.iter().find(|pair| pair.present == *output) {
+                let value = self.current_kv.get(&pair.past).ok_or_else(|| {
+                    OrtError::InvalidArgument(format!(
+                        "missing shared KV buffer for '{}'",
+                        pair.past
+                    ))
+                })?;
+                self.binding.bind_output(output, value)?;
+            } else if is_logits_output(output) {
+                self.binding.bind_output(output, &cap.logits)?;
+            } else {
+                self.binding
+                    .bind_output_to_device(output, &MemoryInfo::cpu()?)?;
+            }
+        }
+        drop(bind_span);
+
+        {
+            let _run_span = crate::prof_span!("ort.session_run");
+            let graph_id = self
+                .capture_graph_id
+                .expect("capture graph id assigned in ensure_capture_state");
+            self.session
+                .run_with_binding_graph(&self.binding, graph_id)?;
+        }
+        // A graph is now captured under `capture_graph_id`; mark it so reset /
+        // rewind / drop release it before this session's buffers are freed.
+        self.capture_bound = true;
+        self.current_len = self
+            .current_len
+            .checked_add(1)
+            .ok_or_else(|| OrtError::InvalidArgument("decode length overflow".into()))?;
+
+        // Copy the persistent logits buffer into an owned Value so the caller
+        // can consume it while the captured buffer is reused next step.
+        let _extract_span = crate::prof_span!("ort.extract_outputs");
+        let logits = cap.logits.clone_owned();
+        self.capture = Some(cap);
+        logits
+    }
+
+    /// Lazily allocate the persistent captured-decode I/O buffers.
+    fn ensure_capture_state(&mut self) -> Result<()> {
+        if self.capture.is_some() {
+            return Ok(());
+        }
+        let mask_len = self.max_length.ok_or_else(|| {
+            OrtError::InvalidArgument("captured decode requires max_length".into())
+        })?;
+        let logits_info = self
+            .session
+            .outputs()
+            .iter()
+            .find(|info| is_logits_output(&info.name))
+            .ok_or_else(|| OrtError::InvalidArgument("model exposes no logits output".into()))?;
+        let vocab = logits_info
+            .shape
+            .last()
+            .copied()
+            .filter(|dim| *dim > 0)
+            .ok_or_else(|| {
+                OrtError::InvalidArgument("logits output has no static vocab dim".into())
+            })?;
+
+        let input_ids = Value::from_vec_i64(vec![0i64], &[1, 1])?;
+        let position_ids = Value::from_vec_i64(vec![0i64], &[1, 1])?;
+        let attention_mask = Value::from_vec_i64(vec![0i64; mask_len], &[1, mask_len as i64])?;
+        let logits = Value::empty(&[1, 1, vocab], logits_info.dtype)?;
+
+        // Claim a process-unique annotation id so this session captures its own
+        // graph rather than re-capturing under an id ORT may still hold from a
+        // prior generation on the same underlying ORT session.
+        self.capture_graph_id = Some(next_capture_graph_id());
+
+        self.capture = Some(CaptureState {
+            input_ids,
+            position_ids,
+            attention_mask,
+            logits,
+            mask_len,
+            mask_valid_len: 0,
+        });
+        Ok(())
     }
 
     /// Rewind to a smaller logical KV length.
@@ -301,6 +547,7 @@ impl<'a> DecodeSession<'a> {
                 self.current_kv.clear();
             }
             self.current_len = 0;
+            self.invalidate_captured_graph();
             return Ok(());
         }
         if self.mode == DecodeKvMode::ZeroCopyRebind {
@@ -373,7 +620,42 @@ impl<'a> DecodeSession<'a> {
             self.current_kv = rewound;
         }
         self.current_len = target_len;
+        // The captured attention mask relies on the valid region growing
+        // monotonically, so a rewind must clear the now-invalid tail and drop
+        // the captured graph so the next step re-captures at the new position.
+        self.invalidate_captured_graph();
+        self.reset_captured_mask()?;
         Ok(())
+    }
+
+    /// Zero the valid region of the persistent captured attention mask, if
+    /// allocated, and reset the valid-length counter. Called on rewind/reset so
+    /// a shorter or restarted sequence never sees stale ones in the trailing
+    /// (masked-out) region. Only the previously-valid prefix is cleared — the
+    /// rest is already zero — so this stays O(previous context), not O(max_len).
+    fn reset_captured_mask(&mut self) -> Result<()> {
+        if let Some(cap) = self.capture.as_mut() {
+            cap.attention_mask
+                .fill_i64_range(0, cap.mask_valid_len, 0)?;
+            cap.mask_valid_len = 0;
+        }
+        Ok(())
+    }
+
+    /// Release any captured decode graph and force the next captured step to
+    /// re-capture under a fresh annotation id. A captured CUDA graph replays
+    /// against the exact buffers/positions seen at capture time; after a reset
+    /// or rewind the sequence structure changes, so the stale graph must not be
+    /// replayed. A fresh id avoids re-capturing under an id ORT may still hold.
+    fn invalidate_captured_graph(&mut self) {
+        if self.capture_bound {
+            if let Some(graph_id) = self.capture_graph_id {
+                let _ = self.session.release_captured_graph(graph_id);
+            }
+            // Re-capture under a new id if this session keeps decoding.
+            self.capture_graph_id = Some(next_capture_graph_id());
+            self.capture_bound = false;
+        }
     }
 
     /// Reset the decode cursor and drop zero-copy-rebind KV state.
@@ -382,6 +664,8 @@ impl<'a> DecodeSession<'a> {
             self.current_kv.clear();
         }
         self.current_len = 0;
+        self.invalidate_captured_graph();
+        let _ = self.reset_captured_mask();
     }
 
     /// Export the current KV cache as owned, session-independent CPU tensors.
@@ -538,6 +822,7 @@ impl<'a> DecodeSession<'a> {
                 &cpu_allocator
             }
         };
+        let mut allocated = Vec::with_capacity(self.kv_pairs.len());
         for pair in &self.kv_pairs {
             let mut shape = pair.input.shape.clone();
             for (axis, dim) in shape.iter_mut().enumerate() {
@@ -552,11 +837,20 @@ impl<'a> DecodeSession<'a> {
                     )));
                 }
             }
-            self.current_kv.insert(
+            allocated.push((
                 pair.past.clone(),
                 Arc::new(Value::empty_in(&shape, pair.input.dtype, allocator)?),
-            );
+            ));
         }
+        // The `allocator` borrow of `device_allocator` ends here; retain the
+        // owned device allocator so it outlives the KV `Value`s it just backed
+        // (see `DecodeSession::kv_allocator`). Moving the wrapper does not change
+        // the underlying `OrtAllocator*` the `Value`s reference. The CPU fallback
+        // allocator is the process-owned default and needs no retention.
+        for (past, value) in allocated {
+            self.current_kv.insert(past, value);
+        }
+        self.kv_allocator = device_allocator;
         Ok(())
     }
 }

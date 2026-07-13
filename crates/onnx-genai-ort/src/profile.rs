@@ -12,8 +12,9 @@
 //! detokenization). See `docs/benchmarks` and the CPU profiling decision note.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Returns whether profiling is enabled, reading `ONNX_GENAI_PROFILE` once.
 pub fn enabled() -> bool {
@@ -49,29 +50,149 @@ pub fn record(stage: &'static str, nanos: u128) {
     }
 }
 
+/// Path to write a Chrome Trace Event (Perfetto) timeline to, from
+/// `ONNX_GENAI_TRACE`. When set, each [`Span`] emits one timestamped
+/// `complete` event so the run can be opened in <https://ui.perfetto.dev>.
+fn trace_path() -> Option<&'static str> {
+    static PATH: OnceLock<Option<String>> = OnceLock::new();
+    PATH.get_or_init(|| {
+        std::env::var("ONNX_GENAI_TRACE")
+            .ok()
+            .filter(|value| !value.is_empty())
+    })
+    .as_deref()
+}
+
+/// Whether timeline tracing is enabled (a non-empty `ONNX_GENAI_TRACE`).
+pub fn tracing_enabled() -> bool {
+    trace_path().is_some()
+}
+
+/// The common time origin for trace timestamps, fixed on first use so the
+/// first recorded event starts near t=0 on the Perfetto timeline.
+fn trace_epoch() -> Instant {
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    *EPOCH.get_or_init(Instant::now)
+}
+
+/// One recorded timeline event, rendered later as a Chrome `X` (complete) event.
+struct TraceEvent {
+    name: &'static str,
+    tid: u64,
+    ts_us: u64,
+    dur_us: u64,
+}
+
+/// Bound on retained events so a very long run cannot grow memory without limit.
+const MAX_TRACE_EVENTS: usize = 1_000_000;
+
+fn trace_sink() -> &'static Mutex<Vec<TraceEvent>> {
+    static SINK: OnceLock<Mutex<Vec<TraceEvent>>> = OnceLock::new();
+    SINK.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// A small, stable per-thread id for the trace's thread lanes.
+fn thread_trace_id() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    thread_local! {
+        static TID: u64 = NEXT.fetch_add(1, Ordering::Relaxed);
+    }
+    TID.with(|id| *id)
+}
+
+/// Record a single timeline event. No-op unless tracing is enabled.
+fn record_trace(stage: &'static str, start: Instant, dur: Duration) {
+    if !tracing_enabled() {
+        return;
+    }
+    let ts_us = start.saturating_duration_since(trace_epoch()).as_micros() as u64;
+    let event = TraceEvent {
+        name: stage,
+        tid: thread_trace_id(),
+        ts_us,
+        dur_us: dur.as_micros() as u64,
+    };
+    if let Ok(mut sink) = trace_sink().lock() {
+        if sink.len() >= MAX_TRACE_EVENTS {
+            return;
+        }
+        sink.push(event);
+    }
+}
+
+/// Write the accumulated timeline to the `ONNX_GENAI_TRACE` path as a Chrome
+/// Trace Event Format JSON document, openable in <https://ui.perfetto.dev> or
+/// `chrome://tracing`. No-op (returns `Ok(())`) when tracing is disabled.
+///
+/// The span category is the stage-name prefix before the first `.` (e.g.
+/// `ort`, `engine`, `loop`), so Perfetto can colour and group lanes by
+/// subsystem. All events share one pid; each OS thread that opened a span gets
+/// its own tid lane.
+pub fn write_trace() -> std::io::Result<()> {
+    let Some(path) = trace_path() else {
+        return Ok(());
+    };
+    let events = match trace_sink().lock() {
+        Ok(sink) => sink,
+        Err(_) => return Ok(()),
+    };
+    let trace_events: Vec<serde_json::Value> = events
+        .iter()
+        .map(|event| {
+            let category = event.name.split('.').next().unwrap_or(event.name);
+            serde_json::json!({
+                "name": event.name,
+                "cat": category,
+                "ph": "X",
+                "ts": event.ts_us,
+                "dur": event.dur_us,
+                "pid": 1,
+                "tid": event.tid,
+            })
+        })
+        .collect();
+    let doc = serde_json::json!({
+        "traceEvents": trace_events,
+        "displayTimeUnit": "ms",
+    });
+    std::fs::write(path, serde_json::to_vec(&doc)?)?;
+    Ok(())
+}
+
 /// A scoped timer that records its lifetime to `stage` on drop.
 pub struct Span {
     stage: &'static str,
     start: Instant,
-    active: bool,
+    /// Whether aggregate profiling (`ONNX_GENAI_PROFILE`) is active.
+    aggregate: bool,
+    /// Whether timeline tracing (`ONNX_GENAI_TRACE`) is active.
+    trace: bool,
 }
 
 impl Span {
-    /// Start a span. Cheap and inert when profiling is disabled.
+    /// Start a span. Cheap and inert when neither profiling nor tracing is on.
     #[must_use]
     pub fn new(stage: &'static str) -> Self {
         Self {
             stage,
             start: Instant::now(),
-            active: enabled(),
+            aggregate: enabled(),
+            trace: tracing_enabled(),
         }
     }
 }
 
 impl Drop for Span {
     fn drop(&mut self) {
-        if self.active {
-            record(self.stage, self.start.elapsed().as_nanos());
+        if !self.aggregate && !self.trace {
+            return;
+        }
+        let elapsed = self.start.elapsed();
+        if self.aggregate {
+            record(self.stage, elapsed.as_nanos());
+        }
+        if self.trace {
+            record_trace(self.stage, self.start, elapsed);
         }
     }
 }
@@ -84,10 +205,13 @@ macro_rules! prof_span {
     };
 }
 
-/// Clear all accumulated stage statistics.
+/// Clear all accumulated stage statistics and any recorded timeline events.
 pub fn reset() {
     if let Ok(mut reg) = registry().lock() {
         reg.clear();
+    }
+    if let Ok(mut sink) = trace_sink().lock() {
+        sink.clear();
     }
 }
 

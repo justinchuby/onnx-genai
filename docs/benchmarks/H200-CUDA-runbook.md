@@ -358,6 +358,23 @@ flag set used for the measured run.
 - [ ] Benchmark run; report written; SHA + versions + settings recorded.
 - [ ] LM Studio config restored, temporary hard-links removed (see §9).
 
+### Reference result (H200, Qwen2.5-0.5B, greedy, 1024 output tokens)
+
+HTTP streaming, `ONNX_GENAI_EP=cuda ONNX_GENAI_DEVICE_KV=1 ONNX_GENAI_CUDA_GRAPH=1`,
+Foundry `cuda-gpu-4` variant, Ollama Q4_K_M all-layers-on-GPU:
+
+| runtime | TTFT ms | decode tok/s | total ms |
+|---|--:|--:|--:|
+| **onnx-genai CUDA** | **60.5** | 483.3 | **2178.6** |
+| Foundry Local | 134.3 | 452.9 | 2393.9 |
+| Ollama Q4_K_M | 163.5 | 506.0 | 2185.4 |
+
+onnx-genai wins end-to-end latency (best TTFT + lowest total wall time) and beats
+Foundry on every axis; it trails Ollama's hand-tuned llama.cpp Q4_K_M GEMV by ~4.5%
+on steady-state decode tok/s (the remaining gap is inside ORT's int4 MatMulNBits
+kernel, which is weight-bandwidth bound). Progression this cycle: HTTP decode
+402 → 471 (CUDA graph) → 483 tok/s (vectorized greedy argmax).
+
 ---
 
 ## 8. Troubleshooting
@@ -368,7 +385,8 @@ flag set used for the measured run.
 | `"CUDA support not compiled in; rebuild with --features cuda"` | binary built without the cuda feature | rebuild with `--features onnx-genai-ort/cuda` |
 | **Garbled tokens on H200, coherent on CPU** | Hopper/ORT CUDA kernel or fragile device-KV/graph path | §6 isolation: disable `ONNX_GENAI_CUDA_GRAPH` then `ONNX_GENAI_DEVICE_KV`; confirm base EP first |
 | SIGSEGV during longer generations with `ONNX_GENAI_DEVICE_KV=1` | in-place share-buffer device tensor bug (seen on ORT 1.27 WebGPU; validate CUDA analog) | set `ONNX_GENAI_DEVICE_KV=0` (CPU-allocated KV) and report; device-KV is experimental/opt-in |
-| CUDA graph gives no speedup or errors | growing `attention_mask` each step breaks stable-address replay | benchmark with `ONNX_GENAI_CUDA_GRAPH=0`; graph capture needs fixed-capacity padded mask/device-resident I/O |
+| CUDA graph gives no speedup or errors | growing `attention_mask` each step breaks stable-address replay | `ONNX_GENAI_CUDA_GRAPH=1` now captures a static-shape decode graph (fixed-capacity padded mask + fixed-address `input_ids`/`position_ids`/logits + device-resident shared-buffer KV) and replays it via the `gpu_graph_id` run-config. Requires `ONNX_GENAI_DEVICE_KV=1` (share-buffer KV); prefill stays uncaptured (`gpu_graph_id=-1`). |
+| CUDA graph crashes (heap/illegal access) after the first generation on a reused server session | ORT mishandles re-capturing a new graph under a `gpu_graph_id` it still holds | fixed: each generation claims a process-unique annotation id and releases it on reset/rewind/drop while its buffers are still alive — no action needed on current `main` |
 | `onnx.checker` fails on the model | missing GatherBlockQuantized shape/type stamp | use `int/cuda-stacked` @ 380acf2+; it stamps the op |
 | `build-gguf: unrecognized --runtime onnx-genai` | flag not yet on your branch | emit `inference_metadata.yaml` separately via `feat/onnx-genai-metadata-export`, copy into package |
 | Mobius weight-shape validation error on Q4_K_M | older Mobius normalizer | use #399 (Q4_K normalization → MatMulNBits) or fall back to Q4_0 and note it |
