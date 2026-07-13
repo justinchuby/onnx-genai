@@ -730,7 +730,13 @@ pub(crate) fn detect_model_decode_path(
         // while the runtime manages the KV buffer itself, giving O(1)/token KV
         // instead of the growing `ZeroCopyRebind` path whose per-token cost
         // scales with context. `shared_kv_max_len` pre-sizes that buffer.
-        if let Some(max_len) = shared_kv_max_len {
+        // The current Metal plugin GQA kernel uses the graph's growing
+        // past/present shape contract. Binding the runtime's fixed-capacity
+        // shared buffer makes the plugin request capacity + sequence_length
+        // elements and fails ORT's pre-bound output-size check.
+        if let Some(max_len) = shared_kv_max_len
+            && !session.is_metal()
+        {
             return Ok(ModelDecodePath::PastPresent {
                 shared_buffer: true,
                 max_len: Some(max_len),
@@ -738,8 +744,9 @@ pub(crate) fn detect_model_decode_path(
             });
         }
 
-        let shared_buffer =
-            session.past_present_share_buffer_supported() && metadata_max_context.is_some();
+        let shared_buffer = !session.is_metal()
+            && session.past_present_share_buffer_supported()
+            && metadata_max_context.is_some();
         return Ok(ModelDecodePath::PastPresent {
             shared_buffer,
             max_len: metadata_max_context.filter(|_| shared_buffer),

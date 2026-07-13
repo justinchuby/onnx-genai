@@ -410,6 +410,13 @@ impl Session {
             .any(|provider| matches!(provider, ExecutionProvider::Cuda { .. }))
     }
 
+    /// Whether the plugin Metal execution provider is active for this session.
+    pub fn is_metal(&self) -> bool {
+        self.execution_providers
+            .iter()
+            .any(|provider| matches!(provider, ExecutionProvider::Metal))
+    }
+
     /// Create a device-resident allocator for KV buffers, if this session runs
     /// on an execution provider that owns device memory (CUDA or WebGPU).
     ///
