@@ -29,7 +29,7 @@ _Last updated: 2026-07-13_
 | 31 | Observability | 🟡 Partial | `/metrics` + `/v1/status` + trace ids + `/v1/debug/*` ✅; Perfetto/OTLP export (feature-gated stub) = #13 |
 | 32 | Metrics API | ✅ Done | |
 | 34 | Cluster/session router | ❌ Missing | |
-| 35 | Native preprocessing | ✅ Done | `onnx-genai-preprocess`: image (bicubic/CLIP + tiling none/fixed_grid/dynamic_anyres) + audio log-mel; audio wired (#12). Multi-tile prompt token-expansion library (`expand_image_placeholders`) ✅; caller wiring (server/engine splice) = follow-up |
+| 35 | Native preprocessing | ✅ Done | `onnx-genai-preprocess`: image (bicubic/CLIP + tiling none/fixed_grid/dynamic_anyres) + audio log-mel; audio wired (#12). Multi-tile prompt token-expansion library (`expand_image_placeholders`, thumbnail-order-safe) ✅; engine count-based expansion + server tile-count seam wired (#14) ✅ |
 | 36 | Backpressure/lifecycle | ✅ Done | admission cap + 429 ✅; configurable `max_queue_depth` (CLI/env) + 429 Retry-After ✅ |
 | 37 | Model lifecycle mgmt | ❌ Missing | single model at startup; #9 |
 | 38 | Distributed KV connector | ❌ Missing | local tiered KV only |
