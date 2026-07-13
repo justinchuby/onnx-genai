@@ -112,14 +112,23 @@ pub(crate) fn step_decode_loop<B: DecodeLoopBackend>(
         generated_text: state.generated_text.clone(),
         step: state.step,
     };
-    let mut logits = backend.next_logits()?;
-    let token_id =
-        select_next_token_with_rng(&mut logits, &context, options, chain, &mut state.rng);
+    let mut logits = {
+        let _span = onnx_genai_ort::prof_span!("loop.next_logits");
+        backend.next_logits()?
+    };
+    let token_id = {
+        let _span = onnx_genai_ort::prof_span!("loop.sampling");
+        select_next_token_with_rng(&mut logits, &context, options, chain, &mut state.rng)
+    };
     if let (Some(top_logprobs), Some(logprobs)) = (options.top_logprobs, state.logprobs.as_mut()) {
         logprobs.push(logprob_for_token(&logits, token_id, top_logprobs));
     }
-    backend.commit_token(token_id)?;
+    {
+        let _span = onnx_genai_ort::prof_span!("loop.commit_token");
+        backend.commit_token(token_id)?;
+    }
 
+    let _commit_span = onnx_genai_ort::prof_span!("loop.commit_selected");
     if let Some(finish_reason) = commit_selected_token(
         state,
         backend.processor_prompt_tokens(),
@@ -151,9 +160,12 @@ pub(crate) fn commit_selected_token(
     callback: Option<&mut GenerateTokenCallback<'_>>,
 ) -> anyhow::Result<Option<FinishReason>> {
     state.generated_tokens.push(token_id);
-    let token_text = tokenizer
-        .decode(&[token_id])
-        .map_err(|e| anyhow::anyhow!("Failed to detokenize token {token_id}: {}", e))?;
+    let token_text = {
+        let _span = onnx_genai_ort::prof_span!("loop.detokenize");
+        tokenizer
+            .decode(&[token_id])
+            .map_err(|e| anyhow::anyhow!("Failed to detokenize token {token_id}: {}", e))?
+    };
     state.generated_text.push_str(&token_text);
     let context = ProcessorContext {
         prompt_tokens,

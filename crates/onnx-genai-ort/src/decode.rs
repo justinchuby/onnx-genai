@@ -229,6 +229,7 @@ impl<'a> DecodeSession<'a> {
         let attention_mask = Value::from_slice_i64(attention_mask, &[1, total_len])?;
         let position_ids = Value::from_slice_i64(position_ids, &[1, seq_len])?;
 
+        let bind_span = crate::prof_span!("ort.bind_inputs");
         self.binding.clear()?;
         self.bind_standard_inputs(&input_ids, &attention_mask, &position_ids)?;
         self.bind_kv_inputs()?;
@@ -250,8 +251,13 @@ impl<'a> DecodeSession<'a> {
                     .bind_output_to_device(output, &MemoryInfo::cpu()?)?;
             }
         }
+        drop(bind_span);
 
-        self.session.run_with_binding(&self.binding)?;
+        {
+            let _run_span = crate::prof_span!("ort.session_run");
+            self.session.run_with_binding(&self.binding)?;
+        }
+        let _extract_span = crate::prof_span!("ort.extract_outputs");
         let mut logits = None;
         if self.mode == DecodeKvMode::SharedBuffer {
             let outputs = self.binding.output_values_or_borrowed(&borrowed_outputs)?;

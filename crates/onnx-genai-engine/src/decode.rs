@@ -85,6 +85,7 @@ impl DecodeBackend for DecodeSession<'static> {
             .map(|pos| i64::try_from(pos).context("position id exceeds i64 range"))
             .collect::<anyhow::Result<Vec<_>>>()?;
         let logits = self.step(&input_ids, &attention_mask, &position_ids)?;
+        let _extract = onnx_genai_ort::prof_span!("engine.logits_to_vec");
         extract_logits_value_sequence(&logits)
     }
 

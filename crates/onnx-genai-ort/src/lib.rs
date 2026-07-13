@@ -16,6 +16,7 @@ pub mod env;
 pub mod error;
 pub mod loader;
 pub mod mtp;
+pub mod profile;
 pub mod session;
 pub mod tokenizer;
 pub mod value;

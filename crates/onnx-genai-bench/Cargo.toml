@@ -31,3 +31,7 @@ harness = false
 name = "model"
 harness = false
 required-features = ["bench-ort"]
+
+[[bin]]
+name = "profile_decode"
+required-features = ["bench-ort"]

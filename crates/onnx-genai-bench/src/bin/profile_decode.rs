@@ -1,0 +1,136 @@
+//! Direct-engine decode profiler.
+//!
+//! Loads a model with the real `onnx-genai` engine (no HTTP/SSE), runs a fixed
+//! number of decode steps, and prints the env-gated per-stage profiler report.
+//! This isolates the per-token decode cost inside our runtime so it can be
+//! attributed to ORT kernel time (`ort.session_run`) versus our orchestration
+//! (tensor binding, KV rotation, logits copy, sampling, detokenization).
+//!
+//! Usage:
+//!   ONNX_GENAI_PROFILE=1 cargo run --release -p onnx-genai-bench \
+//!     --features bench-ort --bin profile_decode -- \
+//!     --model models/qwen2.5-0.5b-q4-onnx-fixed --tokens 128 [--threads N] \
+//!     [--prompt "..."] [--warmups 1] [--runs 1]
+
+use std::path::PathBuf;
+use std::time::Instant;
+
+use onnx_genai_engine::{Engine, EngineConfig, GenerateRequest};
+use onnx_genai_ort::{SessionOptions, profile};
+
+struct Args {
+    model: PathBuf,
+    tokens: usize,
+    threads: Option<i32>,
+    prompt: String,
+    warmups: usize,
+    runs: usize,
+}
+
+fn parse_args() -> Args {
+    let mut model = PathBuf::from("models/qwen2.5-0.5b-q4-onnx-fixed");
+    let mut tokens = 128usize;
+    let mut threads: Option<i32> = None;
+    let mut prompt = String::from(
+        "You are a helpful assistant. Write a short paragraph about the history of computing.",
+    );
+    let mut warmups = 1usize;
+    let mut runs = 1usize;
+
+    let mut it = std::env::args().skip(1);
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--model" => model = PathBuf::from(it.next().expect("--model needs a value")),
+            "--tokens" => tokens = it.next().and_then(|v| v.parse().ok()).expect("--tokens N"),
+            "--threads" => {
+                threads = Some(it.next().and_then(|v| v.parse().ok()).expect("--threads N"));
+            }
+            "--prompt" => prompt = it.next().expect("--prompt needs a value"),
+            "--warmups" => warmups = it.next().and_then(|v| v.parse().ok()).expect("--warmups N"),
+            "--runs" => runs = it.next().and_then(|v| v.parse().ok()).expect("--runs N"),
+            other => panic!("unknown arg: {other}"),
+        }
+    }
+
+    Args {
+        model,
+        tokens,
+        threads,
+        prompt,
+        warmups,
+        runs,
+    }
+}
+
+fn build_engine(args: &Args) -> Engine {
+    match args.threads {
+        Some(n) => Engine::from_dir_with_session_options(
+            &args.model,
+            EngineConfig::default(),
+            SessionOptions::default().with_intra_op_threads(n),
+        ),
+        None => Engine::from_dir(&args.model, EngineConfig::default()),
+    }
+    .expect("model must load")
+}
+
+fn request(prompt: &str, tokens: usize) -> GenerateRequest {
+    let mut request = GenerateRequest::new(prompt.to_string());
+    request.options.max_new_tokens = tokens;
+    request.options.temperature = 0.0;
+    request.options.stop_on_eos = false;
+    request
+}
+
+fn main() {
+    let args = parse_args();
+    println!(
+        "profile_decode: model={} tokens={} threads={:?} warmups={} runs={} profile_enabled={}",
+        args.model.display(),
+        args.tokens,
+        args.threads,
+        args.warmups,
+        args.runs,
+        profile::enabled()
+    );
+
+    let mut engine = build_engine(&args);
+
+    for _ in 0..args.warmups {
+        let result = engine
+            .generate(request(&args.prompt, args.tokens))
+            .expect("warmup generate");
+        std::hint::black_box(&result);
+    }
+
+    // Discard warmup measurements; only the measured runs count.
+    profile::reset();
+
+    let mut total_tokens = 0u64;
+    let start = Instant::now();
+    for _ in 0..args.runs {
+        let result = engine
+            .generate(request(&args.prompt, args.tokens))
+            .expect("measured generate");
+        total_tokens += result.token_ids.len() as u64;
+        std::hint::black_box(&result);
+    }
+    let elapsed = start.elapsed();
+
+    let per_token_us = (elapsed.as_secs_f64() * 1_000_000.0) / total_tokens.max(1) as f64;
+    let tok_per_s = total_tokens as f64 / elapsed.as_secs_f64();
+    println!(
+        "\nwall: {:.3} ms over {} tokens ({} run(s)) -> {:.2} tok/s, {:.2} us/token\n",
+        elapsed.as_secs_f64() * 1000.0,
+        total_tokens,
+        args.runs,
+        tok_per_s,
+        per_token_us
+    );
+
+    if profile::enabled() {
+        println!("{}", profile::report(total_tokens));
+    } else {
+        println!("(set ONNX_GENAI_PROFILE=1 for the per-stage breakdown)");
+    }
+}

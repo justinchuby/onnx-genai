@@ -527,12 +527,25 @@ impl RawSessionOptions {
             // SAFETY: `this.ptr` is a valid session options handle.
             crate::error::check_status(unsafe { set_opt(this.ptr.as_ptr(), level) })?;
         }
-        if options.intra_op_num_threads > 0
+        // Resolve the effective intra-op thread count. An explicit
+        // `with_intra_op_threads(n)` (n > 0) always wins so exact-equality tests
+        // keep forcing single-thread ORT. When the caller left it at the default
+        // (0 = "ORT decides"), `ONNX_GENAI_INTRA_OP_THREADS` may override it.
+        // This is the profiler-identified lever: ORT's default oversubscribes
+        // Apple-silicon efficiency cores (10-thread decode is ~2x slower than a
+        // 6-8 performance-core config), so operators can pin it without a code
+        // change. See the CPU decode profiling decision note.
+        let effective_intra_op = if options.intra_op_num_threads > 0 {
+            options.intra_op_num_threads
+        } else {
+            intra_op_threads_from_env().unwrap_or(0)
+        };
+        if effective_intra_op > 0
             && let Some(set_threads) = api.SetIntraOpNumThreads
         {
             // SAFETY: `this.ptr` is a valid session options handle.
             crate::error::check_status(unsafe {
-                set_threads(this.ptr.as_ptr(), options.intra_op_num_threads)
+                set_threads(this.ptr.as_ptr(), effective_intra_op)
             })?;
         }
         if options.inter_op_num_threads > 0
@@ -612,6 +625,27 @@ fn parse_cuda_device_id(value: &str) -> Option<i32> {
         .parse::<i32>()
         .ok()
         .filter(|device_id| *device_id >= 0)
+}
+
+/// Optional intra-op thread override from `ONNX_GENAI_INTRA_OP_THREADS`.
+///
+/// Only consulted when the caller left `intra_op_num_threads` at the default
+/// (0 = "ORT decides"); an explicit `with_intra_op_threads` always wins. A
+/// positive integer pins the ORT intra-op pool. This is the profiler-identified
+/// CPU decode lever: ORT's default oversubscribes Apple-silicon efficiency
+/// cores, so a 10-thread decode measured ~2x slower than a 6-8 performance-core
+/// config. Invalid or non-positive values are ignored with a warning.
+fn intra_op_threads_from_env() -> Option<i32> {
+    let value = std::env::var("ONNX_GENAI_INTRA_OP_THREADS").ok()?;
+    match value.trim().parse::<i32>() {
+        Ok(threads) if threads > 0 => Some(threads),
+        _ => {
+            tracing::warn!(
+                "Ignoring invalid ONNX_GENAI_INTRA_OP_THREADS={value}; expected a positive integer"
+            );
+            None
+        }
+    }
 }
 
 /// Whether to disable WebGPU validation. Default true (safe overhead
