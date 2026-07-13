@@ -1,88 +1,89 @@
 # Cross-runtime benchmarks
 
-These reports compare onnx-genai with local llama.cpp-based runtimes through their common
-OpenAI-compatible streaming HTTP API. The goal is to make the question “is onnx-genai
-faster?” reproducible on any machine rather than relying on isolated best-case numbers.
+These reports compare onnx-genai with LM Studio through their OpenAI-compatible
+streaming APIs. The primary periodic comparison is GPU-to-GPU: ONNX Runtime
+WebGPU EP versus LM Studio's llama.cpp Metal backend. Ollama is not part of the
+primary comparison.
 
 ## Methodology
 
-- Primary comparisons use one SHA-256-identified GGUF file as the source for every
-  runtime. llama.cpp runtimes load that file directly; Mobius converts those same bytes
-  to ONNX with `--keep-quantized`, preserving transformer projection weights as
-  `MatMulNBits`.
-- Common model family and size: Qwen2.5-0.5B-Instruct.
-- Fixed explicit system prompt plus committed short- and long-context prompts.
-- Greedy generation: `temperature=0`, `top_p=1`, `seed=0`, normally 64 output tokens.
+- Model family and size: Qwen2.5-0.5B-Instruct.
+- Fixed system prompt plus committed short- and long-context prompts.
+- Greedy generation: `temperature=0`, `top_p=1`, `seed=0`, normally 64 tokens.
 - One discarded warmup and five measured runs by default.
-- Reports show median and interpolated p90.
-- TTFT runs from request start to the first non-empty streamed content event.
-- Decode throughput excludes TTFT.
-- Total latency runs through stream completion.
-- Estimated prefill throughput is rendered prompt tokens divided by TTFT. It includes HTTP,
-  scheduling, template processing, and first-token decode, so it is not a kernel-only metric.
-- Benchmarks use realistic runtime-default threading. The ORT single-thread setting required
-  by exact-equality tests is intentionally not used.
+- Reports show median and interpolated p90 for TTFT, decode throughput, total
+  latency, and estimated API-level prefill throughput.
+- Run on a quiet machine with stable power and record the GPU, execution
+  provider, model format, quantization, hashes, context limit, and runtime
+  versions.
 
-Run on a quiet machine with a stable power profile. Record the same commit, toolchain,
-execution provider, model format, quantization, context limit, and runtime settings.
+## Primary GPU-to-GPU comparison
 
-## Primary fair comparison: same-source GGUF
+The intended 1:1 path uses:
 
-The verified periodic benchmark currently uses the official Q4_0 file. Q4_K_M is
-preferred for typical llama.cpp deployment, but the current Mobius Qwen conversion fails
-with a quantized weight-shape mismatch, so do not silently substitute or fabricate a
-Q4_K_M result.
+- `models/qwen2.5-0.5b-q4-onnx/`: 168 Q4_0 `MatMulNBits` projections.
+- `models/gguf/qwen2.5-0.5b-instruct-q4_0.gguf`: the exact source GGUF loaded
+  by LM Studio.
 
-```bash
-mkdir -p models/gguf
-curl -L --fail -o models/gguf/qwen2.5-0.5b-instruct-q4_0.gguf \
-  https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q4_0.gguf
-shasum -a 256 models/gguf/qwen2.5-0.5b-instruct-q4_0.gguf
-```
-
-The expected SHA-256 for the verified file is
+The verified GGUF SHA-256 is
 `7671c0c304e6ce5a7fc577bcb12aba01e2c155cc2efd29b2213c95b18edaf6ed`.
+Do not re-download or reconvert when these files are already present.
 
-Convert it with Mobius. `--keep-quantized` is required; without it the command
-dequantizes the model and the comparison is invalid.
+### Q4 WebGPU correctness gate
 
-```bash
-cd /Users/justinc/Documents/GitHub/mobius
-PYTHONPATH=src conda run -n onnx python -m mobius build-gguf \
-  /Users/justinc/Documents/GitHub/onnx-genai/models/gguf/qwen2.5-0.5b-instruct-q4_0.gguf \
-  --output /Users/justinc/Documents/GitHub/onnx-genai/models/qwen2.5-0.5b-q4-onnx \
-  --keep-quantized
-```
-
-Require the `Quantized mode: preserving GGUF quantization as MatMulNBits...` message and
-verify the graph contains `com.microsoft.MatMulNBits` nodes. Copy the matching Qwen
-tokenizer package files into the output directory, then start onnx-genai:
+Before benchmarking, start the Q4 ONNX model with WebGPU:
 
 ```bash
 cd /Users/justinc/Documents/GitHub/onnx-genai
-cp models/qwen2.5-0.5b/{tokenizer.json,tokenizer_config.json,vocab.json,merges.txt,genai_config.json} \
-  models/qwen2.5-0.5b-q4-onnx/
-ONNX_GENAI_EP=cpu cargo run --release -p onnx-genai-server -- \
+ONNX_GENAI_EP=webgpu cargo run --release -p onnx-genai-server -- \
   --model models/qwen2.5-0.5b-q4-onnx \
-  --model-id qwen2.5-0.5b-q4-1to1 \
+  --model-id qwen2.5-0.5b-q4-webgpu \
   --addr 127.0.0.1:8080
 ```
 
-Import the same file into Ollama:
+On 2026-07-12, ORT 1.27 assigned all 168 original quantized projections to
+WebGPU, after optimization into 51 `MatMulNBits`, 23 `MatMulNBitsQkv`, and 24
+`MatMulNBitsMlp` nodes. It did not fall back those matmuls to CPU. However, the
+model produced the same invalid text on CPU and WebGPU, so the Q4 graph failed
+the correctness gate and was not performance-benchmarked. See
+`2026-07-12-JustindeMacBook-Pro-webgpu.md`.
+
+### fp16 WebGPU fallback
+
+Build a non-quantized fp16 model:
 
 ```bash
-mkdir -p models/benchmarks
-printf 'FROM %s\n' "$PWD/models/gguf/qwen2.5-0.5b-instruct-q4_0.gguf" \
-  > models/benchmarks/Modelfile.q4-1to1
-ollama create qwen05-q4-1to1 -f models/benchmarks/Modelfile.q4-1to1
+cd /Users/justinc/Documents/GitHub/onnx-genai
+DTYPE=f16 OUT_DIR="$PWD/models/qwen2.5-0.5b-f16" scripts/build_qwen.sh
 ```
 
-Ensure the Ollama service is running (`ollama serve` when it is not managed by the OS).
-
-LM Studio CLI versions that do not accept arbitrary paths require the file in their model
-directory. A hard link keeps the bytes identical without another copy:
+The runtime currently requires fp32 logits and dynamic KV API tensors. Wrap the
+fp16 graph with boundary casts while leaving all weights and internal matmuls
+fp16; the exact Python command is recorded in the dated report. Start it with:
 
 ```bash
+ONNX_GENAI_EP=webgpu cargo run --release -p onnx-genai-server -- \
+  --model models/qwen2.5-0.5b-f16-webgpu \
+  --model-id qwen2.5-0.5b-f16-webgpu \
+  --addr 127.0.0.1:8080
+```
+
+This fallback is **fp16 ONNX on WebGPU versus Q4_0 GGUF on Metal**. It is a
+GPU-to-GPU runtime comparison, not quantization parity.
+
+## LM Studio
+
+Back up LM Studio state before changing it. Hard-link the already downloaded
+GGUF so LM Studio reads the same inode, then load it with full Metal offload:
+
+```bash
+cd /Users/justinc/Documents/GitHub/onnx-genai
+rm -rf models/.scratch/lmstudio-backup
+mkdir -p models/.scratch/lmstudio-backup
+cp -pR "$HOME/.cache/lm-studio/.internal" \
+  models/.scratch/lmstudio-backup/internal
+cp -p "$HOME/.cache/lm-studio/settings.json" \
+  models/.scratch/lmstudio-backup/settings.json
 LM_DIR="$HOME/.cache/lm-studio/models/Qwen/Qwen2.5-0.5B-Instruct-GGUF"
 mkdir -p "$LM_DIR"
 ln models/gguf/qwen2.5-0.5b-instruct-q4_0.gguf \
@@ -90,56 +91,39 @@ ln models/gguf/qwen2.5-0.5b-instruct-q4_0.gguf \
 lms server start -p 1234
 lms load 'qwen2.5-0.5b-instruct@q4_0' \
   --gpu max --context-length 2048 --parallel 1 \
-  --identifier qwen05-q4-1to1 -y
+  --no-speculative-draft-mtp \
+  --identifier qwen05-q4-webgpu-bench -y
 ```
-
-Current Mobius preserves the 168 transformer projection matrices as Q4_0 but dequantizes
-the quantized token embedding and output head to fp32. Record this importer limitation in
-every report until those tensors are preserved too. Also record that ORT CPU EP versus
-llama.cpp Metal compares deployable runtime/backend stacks, not an identical device EP.
 
 ## Run and save a report
 
+`scripts/compare_runtimes.sh` now targets only onnx-genai and LM Studio:
+
 ```bash
-ONNX_RUNTIME='onnx-genai|http://127.0.0.1:8080/v1|qwen2.5-0.5b-q4-1to1|same-source ONNX MatMulNBits Q4_0|CPU EP; ORT default threads' \
-OLLAMA_RUNTIME='Ollama (llama.cpp)|http://127.0.0.1:11434/v1|qwen05-q4-1to1:latest|exact source GGUF Q4_0|Metal/default threads' \
-LM_STUDIO_RUNTIME='LM Studio|http://127.0.0.1:1234/v1|qwen05-q4-1to1|exact source GGUF Q4_0|Metal; context=2048; parallel=1' \
+cd /Users/justinc/Documents/GitHub/onnx-genai
+RUNS=5 WARMUPS=1 MAX_TOKENS=64 \
+OUTPUT=docs/benchmarks/2026-07-12-JustindeMacBook-Pro-webgpu.md \
+ONNX_RUNTIME='onnx-genai|http://127.0.0.1:8080/v1|qwen2.5-0.5b-f16-webgpu|ONNX fp16 weights; fp32 logits/KV API casts|WebGPU EP; ORT 1.27.0; default threads' \
+LM_STUDIO_RUNTIME='LM Studio|http://127.0.0.1:1234/v1|qwen05-q4-webgpu-bench|exact source GGUF Q4_0|llama.cpp Metal 2.24.0; GPU=max; context=2048; parallel=1; speculation=off' \
 scripts/compare_runtimes.sh
 ```
 
-The harness probes `/v1/models`, skips unavailable runtimes clearly, and writes
-`docs/benchmarks/YYYY-MM-DD-HOSTNAME.md`. For a longer periodic run:
+After the run, unload the benchmark model, stop the server, remove the temporary
+hard link, and restore the saved LM Studio configuration:
 
 ```bash
-RUNS=10 WARMUPS=2 \
-ONNX_RUNTIME='onnx-genai|http://127.0.0.1:8080/v1|qwen2.5-0.5b-q4-1to1|same-source ONNX MatMulNBits Q4_0|CPU EP; ORT default threads' \
-OLLAMA_RUNTIME='Ollama (llama.cpp)|http://127.0.0.1:11434/v1|qwen05-q4-1to1:latest|exact source GGUF Q4_0|Metal/default threads' \
-LM_STUDIO_RUNTIME='LM Studio|http://127.0.0.1:1234/v1|qwen05-q4-1to1|exact source GGUF Q4_0|Metal; context=2048; parallel=1' \
-scripts/compare_runtimes.sh
+lms unload --all
+lms server stop
+rm -f "$HOME/.cache/lm-studio/models/Qwen/Qwen2.5-0.5B-Instruct-GGUF/qwen2.5-0.5b-instruct-q4_0.gguf"
+rm -rf "$HOME/.cache/lm-studio/.internal"
+cp -pR models/.scratch/lmstudio-backup/internal \
+  "$HOME/.cache/lm-studio/.internal"
+cp -p models/.scratch/lmstudio-backup/settings.json \
+  "$HOME/.cache/lm-studio/settings.json"
+rm -rf models/.scratch/lmstudio-backup
 ```
 
-Runtime model IDs, formats, quantizations, and settings are configurable through
-`ONNX_RUNTIME`, `OLLAMA_RUNTIME`, and `LM_STUDIO_RUNTIME`; see
-`crates/onnx-genai-bench/README.md`.
-
-The canonical same-source invocation is shown in
-`2026-07-12-JustindeMacBook-Pro-1to1-q4.md`.
-
-## Fairness caveats
-
-Never call a run 1:1 unless all runtimes derive from the same SHA-256-identified source
-file and the report states exactly which tensors retain quantization after conversion.
-API-level TTFT includes transport and scheduling. These single-request results do not
-measure concurrent serving throughput.
-
-The earlier `2026-07-12-JustindeMacBook-Pro.md` report is a deployment baseline only:
-fp32 ONNX versus Q8_0 GGUF. Keep it as a labeled historical footnote, not the primary
-runtime comparison.
-
-## Add another machine
-
-1. Check out the same commit and use the same prompts and run counts.
-2. Start equivalent model variants and record exact runtime versions/settings.
-3. Run the same-source invocation above.
-4. Review the generated metadata and add an honest verdict plus optimization follow-ups.
-5. Keep the generated `YYYY-MM-DD-HOSTNAME.md` file; do not overwrite another machine's run.
+The historical CPU-EP Q4 baseline is
+`2026-07-12-JustindeMacBook-Pro-1to1-q4.md`. Its decode rates were 43.78 tok/s
+short and 40.66 tok/s long. The new WebGPU report compares against those values
+directly, while noting that the Q4 graph's output is not correctness-valid.
