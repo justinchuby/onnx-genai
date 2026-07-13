@@ -516,6 +516,7 @@ pub(crate) async fn audio_transcriptions(
                     endpoint: input.endpoint,
                     data: input.data,
                     shape: input.shape,
+                    num_tiles: None,
                 }),
             )
             .await
@@ -866,6 +867,7 @@ async fn run_chat_completion(
             endpoint: image.endpoint,
             data: image.data,
             shape: image.shape,
+            num_tiles: Some(image.num_tiles),
         })
     } else if let Some(audio) = input_audio.first() {
         Some(preprocess_chat_audio(audio, &state)?)
@@ -1014,6 +1016,7 @@ async fn stream_chat_completion(
             endpoint: image.endpoint,
             data: image.data,
             shape: image.shape,
+            num_tiles: Some(image.num_tiles),
         })
     } else if let Some(audio) = input_audio.first() {
         Some(preprocess_chat_audio(audio, &state)?)
@@ -1230,6 +1233,7 @@ fn preprocess_chat_audio(
         endpoint: input.endpoint,
         data: input.data,
         shape: input.shape,
+        num_tiles: None,
     })
 }
 

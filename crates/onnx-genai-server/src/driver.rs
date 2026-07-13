@@ -19,6 +19,10 @@ pub(crate) struct PipelineInputTensor {
     pub(crate) endpoint: String,
     pub(crate) data: Vec<f32>,
     pub(crate) shape: Vec<i64>,
+    /// Number of preprocessed image tiles, if this tensor represents a vision input.
+    ///
+    /// `None` for audio or other non-vision inputs that do not require placeholder expansion.
+    pub(crate) num_tiles: Option<usize>,
 }
 
 #[derive(Clone)]
@@ -529,7 +533,13 @@ fn run_pipeline_generation(
     let mut metrics = GenerationMetrics::start();
     let pipeline_request = match input {
         Some(input) => match Value::from_vec_f32(input.data, &input.shape) {
-            Ok(value) => PipelineGenerateRequest::new(request).with_input(input.endpoint, value),
+            Ok(value) => {
+                let mut req = PipelineGenerateRequest::new(request).with_input(input.endpoint, value);
+                if let Some(num_tiles) = input.num_tiles {
+                    req = req.with_image_tile_count(num_tiles);
+                }
+                req
+            }
             Err(err) => {
                 let _ = events.try_send(DriverEvent::Error(format!(
                     "failed to create pipeline input tensor: {err}"

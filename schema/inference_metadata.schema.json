@@ -961,6 +961,17 @@
         "strategy": {
           "description": "Loop and execution strategy for the pipeline.",
           "$ref": "#/$defs/PipelineStrategy"
+        },
+        "vision": {
+          "description": "Vision-language model token-expansion contract.\n\nWhen present, the engine uses these fields to replace each image\nplaceholder token in the prompt with `tokens_per_tile * num_tiles`\ncopies of that token before KV-cache allocation.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PipelineVisionConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "required": [
@@ -1125,6 +1136,29 @@
         "name",
         "strategy"
       ]
+    },
+    "PipelineVisionConfig": {
+      "description": "Image placeholder token-expansion contract for encoder-free VLM pipelines.\n\nBoth fields must be set together; declaring only one is allowed for\nforward compatibility but will cause an engine error at generation time\nwhen `num_image_tiles` is supplied.",
+      "type": "object",
+      "properties": {
+        "image_placeholder_token_id": {
+          "description": "Token ID of the image placeholder in the tokenized prompt.\n\nThe engine replaces every occurrence of this token with the expanded\nimage token sequence before sequence-length and KV-cache sizing.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "tokens_per_tile": {
+          "description": "Number of image tokens each tile expands to.\n\nThe total expansion per placeholder is `tokens_per_tile * num_tiles`.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 1
+        }
+      }
     },
     "Precision": {
       "description": "Weight precision and quantization-recipe vocabulary.",

@@ -12,6 +12,7 @@ use crate::{GeneratePrompt, GenerateRequest, GenerateResult, GenerateTokenCallba
 use anyhow::Context;
 use onnx_genai_metadata::{
     DataflowEdge, PhaseRunOn, PipelineSpec, PipelineStrategy, PipelineStrategyKind,
+    PipelineVisionConfig,
 };
 use onnx_genai_ort::{PipelineModels, Session, SessionOptions, Tokenizer, Value};
 use std::collections::{BTreeSet, HashMap};
@@ -143,6 +144,12 @@ impl PipelineEngine {
         // `num_image_tiles` before DecodeState/KV allocation. The server vision
         // seam should pass ImageTensor::num_tiles via with_image_tile_count().
 
+        let prompt_tokens = expand_image_placeholders_count_based(
+            prompt_tokens,
+            pipeline_request.num_image_tiles,
+            self.models.directory.spec.vision.as_ref(),
+        )?;
+
         let mut tensors = pipeline_request.inputs;
         self.run_prompt_phase_components(&mut tensors)?;
         let decoder_extras = self.decoder_extra_inputs(&tensors)?;
@@ -270,6 +277,92 @@ fn tokenize_with(tokenizer: &Tokenizer, prompt: &GeneratePrompt) -> anyhow::Resu
             .encode(text)
             .map_err(|e| anyhow::anyhow!("Failed to tokenize prompt: {}", e)),
     }
+}
+
+/// Expand each image placeholder token in `prompt_tokens` into
+/// `tokens_per_tile * num_tiles` copies of that same token.
+///
+/// Returns the input unchanged when `num_image_tiles` is `None`.
+///
+/// Errors when:
+/// - `num_image_tiles` is `Some` but the pipeline metadata declares no vision
+///   contract (`image_placeholder_token_id` or `tokens_per_tile` missing).
+/// - The placeholder token ID does not fit in `TokenId` (u32).
+/// - The prompt contains no placeholder tokens.
+/// - Arithmetic would overflow.
+fn expand_image_placeholders_count_based(
+    prompt_tokens: Vec<TokenId>,
+    num_image_tiles: Option<usize>,
+    vision: Option<&PipelineVisionConfig>,
+) -> anyhow::Result<Vec<TokenId>> {
+    let num_tiles = match num_image_tiles {
+        None => return Ok(prompt_tokens),
+        Some(n) => n,
+    };
+
+    let (placeholder_i64, tokens_per_tile) = match vision {
+        Some(v) => match (v.image_placeholder_token_id, v.tokens_per_tile) {
+            (Some(id), Some(tpt)) => (id, tpt),
+            _ => anyhow::bail!(
+                "image tile count supplied but pipeline metadata vision contract is incomplete: \
+                 both image_placeholder_token_id and tokens_per_tile must be set"
+            ),
+        },
+        None => anyhow::bail!(
+            "image tile count supplied but pipeline metadata declares no vision section; \
+             add pipeline.vision with image_placeholder_token_id and tokens_per_tile"
+        ),
+    };
+
+    let placeholder_id: TokenId = u32::try_from(placeholder_i64)
+        .with_context(|| {
+            format!(
+                "image_placeholder_token_id {placeholder_i64} is out of range for token ID (u32)"
+            )
+        })?;
+
+    let placeholder_count = prompt_tokens
+        .iter()
+        .filter(|&&t| t == placeholder_id)
+        .count();
+    if placeholder_count == 0 {
+        anyhow::bail!(
+            "num_image_tiles supplied but prompt contains no image placeholder token \
+             (id={placeholder_id}); the prompt must contain exactly one placeholder"
+        );
+    }
+
+    let expansion: usize = tokens_per_tile
+        .checked_mul(num_tiles)
+        .context("image token expansion overflow: tokens_per_tile * num_image_tiles is too large")?;
+
+    // Each placeholder expands to `expansion` copies; non-placeholder tokens are kept.
+    let new_len = prompt_tokens
+        .len()
+        .checked_sub(placeholder_count)
+        .and_then(|base| {
+            placeholder_count
+                .checked_mul(expansion)
+                .and_then(|added| base.checked_add(added))
+        })
+        .context("expanded prompt token sequence length overflows")?;
+
+    let mut expanded = Vec::new();
+    expanded
+        .try_reserve_exact(new_len)
+        .context("failed to allocate expanded prompt token sequence")?;
+
+    for token in prompt_tokens {
+        if token == placeholder_id {
+            for _ in 0..expansion {
+                expanded.push(placeholder_id);
+            }
+        } else {
+            expanded.push(token);
+        }
+    }
+
+    Ok(expanded)
 }
 
 struct PipelineDecodeLoopBackend<'a> {
@@ -533,6 +626,7 @@ mod tests {
                     },
                 ),
             ]),
+            vision: None,
         };
 
         let plan = PipelinePlan::from_spec(&spec)?;
@@ -546,5 +640,82 @@ mod tests {
         );
         assert_eq!(routed[0].from, "vision_encoder.image_features");
         Ok(())
+    }
+
+    fn vision_config(placeholder_id: i64, tpt: usize) -> PipelineVisionConfig {
+        PipelineVisionConfig {
+            image_placeholder_token_id: Some(placeholder_id),
+            tokens_per_tile: Some(tpt),
+        }
+    }
+
+    #[test]
+    fn image_placeholder_expansion_replaces_tokens() {
+        // [1, PLACEHOLDER, 2] with 2 tiles × 3 tokens/tile → [1, IMG, IMG, IMG, IMG, IMG, IMG, 2]
+        let tokens: Vec<TokenId> = vec![1, 100, 2];
+        let cfg = vision_config(100, 3);
+        let expanded =
+            expand_image_placeholders_count_based(tokens, Some(2), Some(&cfg)).unwrap();
+        assert_eq!(expanded, vec![1, 100, 100, 100, 100, 100, 100, 2]);
+    }
+
+    #[test]
+    fn image_placeholder_expansion_multiple_placeholders() {
+        // Two placeholders each with 1 tile × 4 tokens/tile
+        let tokens: Vec<TokenId> = vec![100, 5, 100];
+        let cfg = vision_config(100, 4);
+        let expanded =
+            expand_image_placeholders_count_based(tokens, Some(1), Some(&cfg)).unwrap();
+        // Each placeholder → 4 copies
+        assert_eq!(expanded, vec![100, 100, 100, 100, 5, 100, 100, 100, 100]);
+    }
+
+    #[test]
+    fn image_placeholder_expansion_none_tiles_is_noop() {
+        let tokens: Vec<TokenId> = vec![1, 100, 2];
+        let cfg = vision_config(100, 256);
+        let result = expand_image_placeholders_count_based(tokens.clone(), None, Some(&cfg)).unwrap();
+        assert_eq!(result, tokens);
+    }
+
+    #[test]
+    fn image_placeholder_expansion_no_vision_config_with_tiles_errors() {
+        let tokens: Vec<TokenId> = vec![1, 100, 2];
+        let err =
+            expand_image_placeholders_count_based(tokens, Some(1), None).unwrap_err();
+        assert!(err.to_string().contains("no vision section"));
+    }
+
+    #[test]
+    fn image_placeholder_expansion_incomplete_contract_errors() {
+        let tokens: Vec<TokenId> = vec![1, 100, 2];
+        let cfg = PipelineVisionConfig {
+            image_placeholder_token_id: Some(100),
+            tokens_per_tile: None,
+        };
+        let err =
+            expand_image_placeholders_count_based(tokens, Some(1), Some(&cfg)).unwrap_err();
+        assert!(err.to_string().contains("vision contract is incomplete"));
+    }
+
+    #[test]
+    fn image_placeholder_expansion_missing_placeholder_errors() {
+        let tokens: Vec<TokenId> = vec![1, 2, 3];
+        let cfg = vision_config(100, 4);
+        let err =
+            expand_image_placeholders_count_based(tokens, Some(1), Some(&cfg)).unwrap_err();
+        assert!(err.to_string().contains("no image placeholder token"));
+    }
+
+    #[test]
+    fn image_placeholder_expansion_negative_id_errors() {
+        let tokens: Vec<TokenId> = vec![1, 2];
+        let cfg = PipelineVisionConfig {
+            image_placeholder_token_id: Some(-1),
+            tokens_per_tile: Some(4),
+        };
+        let err =
+            expand_image_placeholders_count_based(tokens, Some(1), Some(&cfg)).unwrap_err();
+        assert!(err.to_string().contains("out of range"));
     }
 }

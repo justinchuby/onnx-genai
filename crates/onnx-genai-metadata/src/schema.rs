@@ -345,6 +345,34 @@ pub struct PipelineSpec {
     /// Optional per-component phase gating, keyed by component name.
     #[serde(default)]
     pub phases: BTreeMap<String, PhaseConfig>,
+
+    /// Vision-language model token-expansion contract.
+    ///
+    /// When present, the engine uses these fields to replace each image
+    /// placeholder token in the prompt with `tokens_per_tile * num_tiles`
+    /// copies of that token before KV-cache allocation.
+    #[serde(default)]
+    pub vision: Option<PipelineVisionConfig>,
+}
+
+/// Image placeholder token-expansion contract for encoder-free VLM pipelines.
+///
+/// Both fields must be set together; declaring only one is allowed for
+/// forward compatibility but will cause an engine error at generation time
+/// when `num_image_tiles` is supplied.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+pub struct PipelineVisionConfig {
+    /// Token ID of the image placeholder in the tokenized prompt.
+    ///
+    /// The engine replaces every occurrence of this token with the expanded
+    /// image token sequence before sequence-length and KV-cache sizing.
+    pub image_placeholder_token_id: Option<i64>,
+
+    /// Number of image tokens each tile expands to.
+    ///
+    /// The total expansion per placeholder is `tokens_per_tile * num_tiles`.
+    #[schemars(range(min = 1))]
+    pub tokens_per_tile: Option<usize>,
 }
 
 /// One executable ONNX model in a pipeline.

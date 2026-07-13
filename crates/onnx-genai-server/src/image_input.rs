@@ -11,6 +11,8 @@ pub(crate) struct ImageTensor {
     pub(crate) endpoint: String,
     pub(crate) shape: Vec<i64>,
     pub(crate) data: Vec<f32>,
+    /// Total number of preprocessed tiles in this tensor batch.
+    pub(crate) num_tiles: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -55,6 +57,7 @@ pub(crate) async fn load_and_preprocess(
         endpoint: spec.endpoint.clone(),
         shape: tensor.shape,
         data: tensor.data,
+        num_tiles: tensor.num_tiles,
     })
 }
 

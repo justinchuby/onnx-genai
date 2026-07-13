@@ -58,6 +58,7 @@ pub(crate) trait DecodeBackend {
     }
 }
 
+#[allow(clippy::large_enum_variant)]
 enum DecodeRunner {
     StaticCache(StaticCacheDecodeSession<'static>),
     PastPresent(DecodeSession<'static>),

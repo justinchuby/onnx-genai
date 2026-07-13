@@ -1226,3 +1226,44 @@ async fn stalled_output_route_does_not_block_another_completion() {
         .expect("fast request failed");
     assert_eq!(fast_result.token_ids.len(), 2);
 }
+
+#[test]
+fn pipeline_input_tensor_carries_num_tiles_for_image() {
+    use crate::driver::PipelineInputTensor;
+
+    let tensor = PipelineInputTensor {
+        endpoint: "encoder.pixel_values".to_string(),
+        data: vec![0.0; 12],
+        shape: vec![1, 3, 2, 2],
+        num_tiles: Some(4),
+    };
+    assert_eq!(tensor.num_tiles, Some(4));
+}
+
+#[test]
+fn pipeline_input_tensor_num_tiles_none_for_audio() {
+    use crate::driver::PipelineInputTensor;
+
+    let tensor = PipelineInputTensor {
+        endpoint: "encoder.audio_features".to_string(),
+        data: vec![0.0; 8],
+        shape: vec![1, 2, 4],
+        num_tiles: None,
+    };
+    assert_eq!(tensor.num_tiles, None);
+}
+
+#[tokio::test]
+async fn image_load_and_preprocess_populates_num_tiles() {
+    let spec = crate::image_input::VisionInputSpec::from_input(
+        "encoder.pixel_values".to_string(),
+        // shape [N, C, H, W] — N is the batch/tile dimension
+        &[1, 3, 4, 4],
+    )
+    .expect("valid spec");
+    let tensor = crate::image_input::load_and_preprocess(&[tiny_png_data_uri()], &spec)
+        .await
+        .expect("preprocess succeeds");
+    // The preprocessor always produces at least one tile.
+    assert!(tensor.num_tiles >= 1, "num_tiles must be at least 1");
+}

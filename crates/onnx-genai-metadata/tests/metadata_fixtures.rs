@@ -188,3 +188,69 @@ fn pipeline_validation_rejects_cycles() {
             .any(|error| error.contains("contains a cycle"))
     );
 }
+
+#[test]
+fn pipeline_vision_config_round_trips_via_json() {
+    use onnx_genai_metadata::PipelineVisionConfig;
+
+    let json = r#"{"image_placeholder_token_id": 32000, "tokens_per_tile": 256}"#;
+    let decoded: PipelineVisionConfig = serde_json::from_str(json).expect("deserializes");
+    assert_eq!(decoded.image_placeholder_token_id, Some(32000_i64));
+    assert_eq!(decoded.tokens_per_tile, Some(256_usize));
+
+    let round_tripped: PipelineVisionConfig =
+        serde_json::from_str(&serde_json::to_string(&serde_json::from_str::<serde_json::Value>(json).unwrap()).unwrap())
+            .expect("value round-trip");
+    assert_eq!(round_tripped, decoded);
+}
+
+#[test]
+fn pipeline_vision_config_round_trips_via_yaml() {
+    use onnx_genai_metadata::PipelineVisionConfig;
+
+    let yaml = "image_placeholder_token_id: -1\ntokens_per_tile: 64\n";
+    let decoded: PipelineVisionConfig = serde_yaml::from_str(yaml).expect("deserializes");
+    assert_eq!(decoded.image_placeholder_token_id, Some(-1_i64));
+    assert_eq!(decoded.tokens_per_tile, Some(64_usize));
+}
+
+#[test]
+fn pipeline_vision_config_optional_fields_round_trip_to_none() {
+    use onnx_genai_metadata::PipelineVisionConfig;
+
+    let json = r#"{}"#;
+    let decoded: PipelineVisionConfig = serde_json::from_str(json).expect("deserializes");
+    assert_eq!(decoded.image_placeholder_token_id, None);
+    assert_eq!(decoded.tokens_per_tile, None);
+}
+
+#[test]
+fn pipeline_spec_vision_field_round_trips() {
+    use onnx_genai_metadata::PipelineVisionConfig;
+
+    let yaml = "
+pipeline:
+  models:
+    decoder:
+      filename: decoder.onnx
+      type: decoder
+      tokenizer: tokenizer.json
+  strategy:
+    kind: autoregressive
+    decoder: decoder
+  vision:
+    image_placeholder_token_id: 32000
+    tokens_per_tile: 256
+";
+    let metadata: onnx_genai_metadata::InferenceMetadata =
+        serde_yaml::from_str(yaml).expect("parses");
+    let spec = metadata.pipeline.expect("pipeline section");
+    let vision = spec.vision.expect("vision section");
+    assert_eq!(
+        vision,
+        PipelineVisionConfig {
+            image_placeholder_token_id: Some(32000),
+            tokens_per_tile: Some(256),
+        }
+    );
+}
