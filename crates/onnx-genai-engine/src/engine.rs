@@ -111,10 +111,33 @@ impl Engine {
         let model_directory = ModelDirectory::load(model_dir)
             .map_err(|e| anyhow::anyhow!("Failed to resolve model directory: {}", e))?;
 
-        // Load metadata
+        // Initialize scheduler
+        let scheduler = Scheduler::new(config.scheduler);
+
+        let environment = Environment::new("onnx-genai-engine")
+            .map_err(|e| anyhow::anyhow!("Failed to create ORT environment: {}", e))?;
+        let session = Session::new(
+            &environment,
+            &model_directory.model_path,
+            session_options.clone(),
+        )
+        .map_err(|e| anyhow::anyhow!("Failed to load ORT session: {}", e))?;
+
+        // Resolve inference metadata. Our own `inference_metadata.yaml` is the
+        // canonical source of truth. When a model ships without it (e.g. the
+        // onnxruntime-genai / Foundry Local models, which carry only a
+        // `genai_config.json`), fall back to converting that config into native
+        // metadata so share-buffer-capable GQA models still get the O(1)/token
+        // decode path instead of the growing rebind path.
         let metadata = if let Some(metadata_path) = &model_directory.metadata_path {
             onnx_genai_metadata::load_metadata(metadata_path)
                 .map_err(|e| anyhow::anyhow!("Failed to load metadata: {}", e))?
+        } else if let Some(compat) = genai_config_compat_metadata(&model_directory.root, &session)?
+        {
+            tracing::info!(
+                "No inference_metadata.yaml found; derived inference metadata from genai_config.json (onnxruntime-genai compatibility)"
+            );
+            compat
         } else {
             tracing::warn!("No inference metadata found, using defaults");
             InferenceMetadata {
@@ -136,17 +159,6 @@ impl Engine {
             anyhow::bail!("Unsupported capabilities: {:?}", unsupported);
         }
 
-        // Initialize scheduler
-        let scheduler = Scheduler::new(config.scheduler);
-
-        let environment = Environment::new("onnx-genai-engine")
-            .map_err(|e| anyhow::anyhow!("Failed to create ORT environment: {}", e))?;
-        let session = Session::new(
-            &environment,
-            &model_directory.model_path,
-            session_options.clone(),
-        )
-        .map_err(|e| anyhow::anyhow!("Failed to load ORT session: {}", e))?;
         let metadata_max_context = metadata
             .model
             .as_ref()
@@ -1160,6 +1172,28 @@ impl DecodeLoopBackend for SessionDecodeLoopBackend<'_> {
         self.scheduler.advance(self.session_id);
         Ok(())
     }
+}
+
+/// Best-effort native metadata derived from an onnxruntime-genai
+/// `genai_config.json` in `model_dir`, used only when no
+/// `inference_metadata.yaml` is present. Returns `Ok(None)` when there is no
+/// `genai_config.json`. The KV cache native dtype is read from the loaded
+/// session's KV inputs, since it is not present in `genai_config.json`.
+fn genai_config_compat_metadata(
+    model_dir: &Path,
+    session: &Session,
+) -> anyhow::Result<Option<InferenceMetadata>> {
+    let kv_native_dtype = session
+        .inputs()
+        .iter()
+        .find(|info| crate::decode::is_kv_input(&info.name))
+        .and_then(|info| match info.dtype {
+            DataType::Float16 => Some("float16"),
+            DataType::Float32 => Some("float32"),
+            _ => None,
+        });
+    onnx_genai_genai_config::inference_metadata_from_dir(model_dir, kv_native_dtype)
+        .map_err(|e| anyhow::anyhow!("Failed to convert genai_config.json: {}", e))
 }
 
 fn read_f32_weights(path: &Path) -> anyhow::Result<Vec<f32>> {

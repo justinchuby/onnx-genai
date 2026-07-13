@@ -10,6 +10,7 @@ categories = ["science", "text-processing"]
 
 [dependencies]
 onnx-genai-metadata = { workspace = true }
+onnx-genai-genai-config = { workspace = true }
 onnx-genai-kv = { workspace = true }
 onnx-genai-scheduler = { workspace = true }
 onnx-genai-ort = { workspace = true }
