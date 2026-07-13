@@ -36,3 +36,7 @@ Batched-driver DoS hardening is canonical: admission is bounded by `max_pending`
 - Server split (#2) and legacy completions/FIM endpoint (#4) are canonical decisions.
 - OpenAI surface now includes chat, tools, FIM via `/v1/completions`, image input parts for `/v1/chat/completions`, and streaming.
 - Vision routing accepts data URI / bounded HTTP(S) images and routes VLM pipeline requests; real quality depends on Pris delivering a mobius CLIP+decoder VLM package.
+
+## 2026-07-12T17:30:00-07:00 — Vision fidelity and audio endpoints logged
+- Metadata-driven vision preprocessing and OpenAI-compatible `input_audio` plus `/v1/audio/transcriptions` routing are now canonical.
+- Real audio/vision quality remains gated on production Mobius model packages and complete processor metadata.

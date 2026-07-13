@@ -99,3 +99,101 @@ Canonical, append-only record of accepted team decisions. Only the Coordinator (
 **By:** Scribe
 **What:** CI clippy is blocking and must run as `cargo clippy --workspace --all-targets -- -D warnings`. Real-model exact-equality tests that compare floating-point generation outputs should force ORT single-thread execution with `intra_op_threads=1` to avoid reduction-order tie flakes; production defaults remain unchanged.
 **Why:** Future agents need to treat clippy warnings as build failures and keep deterministic exact-equality tests stable across ORT scheduling differences.
+
+---
+
+### 2026-07-12: EAGLE-3 hidden-state and draft-state contract
+**By:** Batty
+**What:** Added `SpeculativeMode::Eagle3(Eagle3Config)` with exactly three ordered target hidden outputs (low, middle, high). The engine extracts each output's last-token row into the optional `SpeculativeProposerContext::target_hidden_layers`; `Eagle3Proposer` concatenates them for `fused_hidden`, uses the high layer as the initial `recycled_hidden`, then feeds each `next_hidden` output back autoregressively. The ORT `Eagle3DecodeSession` matches the committed fixture's `inputs_embeds`/`fused_hidden`/`recycled_hidden`/KV inputs and `draft_logits`/`next_hidden`/present-KV outputs. Accept and rewind reset draft-only state because every verification pass supplies a fresh target anchor.
+**Why:** EAGLE-3 requires multi-layer verifier features rather than MTP's single last-layer hidden state, while optional context fields preserve other proposer behavior. Resetting between verification passes prevents rejected draft features or KV from becoming stale. The tiny fixture exercises a 48-wide fused input and hidden recycling, but its generated attention-mask path only runs with empty past (`HiddenThreaded`), its 16-logit reduced vocabulary has no mapping artifact, and it is not packaged with a target model exposing three matching hidden outputs plus target embedding weights. A fuller end-to-end fixture should support non-empty draft KV, include those verifier outputs and exact embedding weights, and provide draft-to-target vocabulary mapping when IDs are not identity-mapped.
+
+---
+
+### 2026-07-12T16:26:00-07:00: Add opt-in engine token logprobs
+**By:** Batty
+**What:** `GenerateOptions::top_logprobs: Option<usize>` enables logprob capture; `None` is disabled. `GenerateResult::logprobs` is `Option<Vec<TokenLogprob>>`, where each entry contains `token_id`, the chosen token's `logprob`, and descending `top: Vec<(TokenId, f32)>`. The top list contains the requested highest-probability tokens and always includes the chosen token. Values are natural-log softmax probabilities computed from finite logits after the complete processor chain, including temperature and sampling filters, exactly matching the distribution used to select the token.
+**Why:** The engine must expose confidence data without allocations or log-softmax work for default requests. Rachael should map these entries to chat `choices[].logprobs.content[]` records (token text, chosen logprob, and `top_logprobs`) and legacy completions `choices[].logprobs` arrays/maps, using tokenizer-decoded token ids; streaming should attach each token's metadata to its corresponding chunk.
+
+---
+
+### 2026-07-12T16:16:00-07:00: Restore real categorical sampling
+**By:** Batty
+**What:** Fixed every engine generation path that passed a hardcoded `0.0` to categorical sampling. The engine now uses `rand` with an optional `GenerateOptions::seed`, advances a per-request RNG for each sampled token, and maintains independently seeded RNG state per static/continuous batch row using `seed + row_index`. Greedy selection still routes through `GreedySampler`, does not draw from the RNG, and retains its previous deterministic output.
+**Why:** A zero inverse-CDF target always selected the first eligible token, making temperature, top-p, top-k, and min-p sampling deterministic and distributionally wrong. A 100,000-draw fixed-seed test for logits `[0, 1, 2]` passed with every empirical frequency within one percentage point of the expected softmax probabilities (approximately 9.00%, 24.47%, and 66.52%); seed reproducibility, seed sensitivity, greedy non-advancement, and independent seedable batch rows are also covered.
+
+---
+
+### 2026-07-12T16:40:00-07:00: Make ORT compaction comparisons tolerant and serialized
+**By:** Deckard
+**What:** Audited every real-model session in `crates/onnx-genai-ort/tests/decode_session.rs`: `load_session` and all three direct `Session::new` sites already use `deterministic_session_options()` with `intra_op_threads=1`, including the compaction test's individual traces, full-batch reference, compacted batch, and admitted replacement path. The remaining flaky comparisons were batched forwards versus batch-one individual forwards, whose GEMM reduction structures can differ despite single-thread execution. Those comparisons now require every logit to be within `1e-4`; differing argmaxes are accepted only when both outputs show the competing logits are tied within that tolerance. Compacted-versus-full-batch output still uses the tighter existing `1e-5` comparison. The five ORT-heavy tests in the file also share a mutex because concurrent test execution reproduced an ORT session-initialization race; the pure tensor round-trip test remains parallel.
+**Why:** The test verifies that compaction preserves active-row numerical outputs and token choice, not bit-identical results between structurally different batch-one and batched matrix operations. Single-threading fixes reduction-order scheduling nondeterminism, tolerance handles legitimate batch-shape floating-point differences near ties, and serialization prevents independent ORT session setup in this test binary from racing. Final validation completed with 15/15 consecutive `cargo test -p onnx-genai-ort --test decode_session` runs and 8/8 consecutive full-parallel `cargo test --workspace` runs, all with zero failures. `cargo fmt --all -- --check` and `cargo clippy --workspace --all-targets -- -D warnings` also passed.
+
+---
+
+### 2026-07-12: Use LLaVA best-resolution scoring and tile-aware preprocess results
+**By:** Deckard
+**What:** `dynamic_anyres` treats each configured aspect ratio as a columns-by-rows tile grid, ignores grids whose local tile count exceeds `max_tiles`, then maximizes effective source pixels after an aspect-preserving fit and minimizes wasted canvas pixels, with configuration order as the final tie-breaker. Tiled output places an optional global thumbnail first, followed by row-major local tiles. `ImageTensor` now reports total and per-image tile counts, original sizes, and exposes each tile's normalized contiguous data.
+**Why:** This matches the established LLaVA/Gemma any-resolution selection behavior, keeps tile ordering deterministic, and gives callers the post-preprocessing tile count needed to expand image tokens and allocate KV cache capacity.
+
+---
+
+### 2026-07-12T16:46:00-07:00: Paged / block-table KV cache in Mobius
+**By:** Deckard
+**What:** In the separate `onnxruntime/mobius` repo, branch `feat/paged-cache` was pushed and draft PR https://github.com/onnxruntime/mobius/pull/395 opened. The implementation adds a paged-cache static-cache variant using standard ONNX ops: `PagedCacheState`, `ScatterND` writes into K/V pools, `Gather` assembles logical pages, `Attention` consumes gathered K/V with `nonpad_kv_seqlen`, and CLI/task flags expose `--paged-cache`, `--page-size`, and `--num-pages`. The onnx-genai runtime-side contract is single active sequence (`batch == 1`) with `key_pool.{i}` / `value_pool.{i}` `[num_pages,page_size,kv_hidden]`, `block_table [num_blocks]`, `slot_mapping [seq_len]`, and `nonpad_kv_seqlen [batch]`; outputs are `logits` plus updated pools. Validation covered graph structure, shape inference, MoE/dense paths, scatter/gather parity, and checker runs; end-to-end paged execution remains CUDA-kernel gated and multi-sequence batching is TODO.
+**Why:** This gives onnx-genai a concrete Mobius export format for paged/block-table attention that supports non-contiguous KV pools and RadixAttention-style shared pages while staying within standard opset-24 graph constructs.
+
+---
+
+### 2026-07-12T16:12:00-07:00: Extract native preprocessing into a dedicated crate
+**By:** Deckard
+**What:** Added publishable `onnx-genai-preprocess` with public `audio` and `image` modules. Audio exposes `LogMelExtractor` and `decode_wav_pcm16`; image exposes `ImagePreprocessor`, `ImagePreprocessConfig`, layout/resize/normalization types, and tensor output. Whisper log-mel/WAV code moved from the facade, while image decode/resize/crop/normalize and §35 metadata resolution moved from the server. `onnx-genai` re-exports the crate as `onnx_genai::preprocess`; the server retains only bounded data-URI/HTTP loading and calls the crate.
+**Why:** Native §35 preprocessing must be reusable by server and CLI without ORT Extensions or embedding model transformations in transport/facade crates. The implementations and their tests moved unchanged in behavior, preserving audio features and image tensor results.
+
+---
+
+### 2026-07-12T16:22:00-07:00: Raise kv_bridge deterministic coverage
+**By:** Pris
+**What:** Added four deterministic `kv_bridge` unit-test entry points covering past/present metadata inference, static-cache exclusion, present-KV token extraction and paged mirroring, materialization back into ORT past tensors, prefix-page attachment/reuse, page selection, rewind/clear/error branches, overmaterialized target trimming, and both static-cache and past/present decode-runner rewind paths. Real-model cases use `tiny-llm` and `tiny-llm-scatter` with `intra_op_threads=1`, are serialized into one model-backed test, and passed five repeated runs. Comparable LLVM coverage moved `kv_bridge.rs` from 30.48% to 94.51% lines (27.70% to 89.31% regions); observed full-workspace line coverage moved from 74.53% to 77.27% (+2.74 points). The after snapshot also contains concurrent unrelated server/preprocessing edits, so the overall delta is observational rather than isolated. `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`, and fmt pass. No engine bug was found for Batty.
+**Why:** `kv_bridge.rs` was the largest high-value engine coverage gap. These tests exercise the bridge's real tensor layouts, paged-cache data preservation, prefix reuse, materialization, rewind behavior, and failure handling without changing production logic.
+
+---
+
+### 2026-07-12T16:26:00-07:00: Establish Whisper encoder-decoder model contract
+**By:** Pris
+**What:** Mobius supports `--task speech-to-text` (also auto-selected for `model_type=whisper`) and emits `encoder/model.onnx` plus `decoder/model.onnx`. The generic encoder contract is `input_features: fp32[B, num_mel_bins, audio_seq_len] -> encoder_hidden_states: fp32[B, audio_seq_len/2, d_model]`; the generated `openai/whisper-tiny` graph exposes `[B,80,audio_seq_len] -> [B,1500,384]` and therefore expects the standard 3000-frame input. Its decoder takes `decoder_input_ids: i64[B,S]`, `encoder_hidden_states: fp32[B,E,384]`, `position_ids: i64[B,S]`, and four layers of self-attention `past_key_values.{layer}.{key,value}: fp32[B,6,P,64]`, producing `logits: fp32[B,S,51865]` and `present.{layer}.{key,value}: fp32[B,6,P+S,64]`. Mobius recomputes cross-attention K/V from `encoder_hidden_states` on each decoder call; it does not expose separate cross-attention KV cache ports.
+**Why:** Added a 80-mel, 8-frame synthetic package under `tests/fixtures/tiny-whisper/`, generated reproducibly by `scripts/build_tiny_whisper.py` with onnx-ir. Its composite metadata runs the encoder once at `prompt_only`, routes `encoder.encoder_hidden_states` to `decoder.encoder_hidden_states`, and runs the decoder autoregressively. PipelineEngine already routes this cross-attention tensor as a persistent decoder extra; the only engine gap was recognizing Mobius' `decoder_input_ids` token-input name, so decode input matching now accepts that alias. An ignored WAV -> native log-mel -> pipeline -> token test verifies the complete contract.
+
+---
+
+### 2026-07-12T16:54:00-07:00: Add OpenAI-compatible audio input and transcription routing
+**By:** Rachael
+**What:** `/v1/chat/completions` accepts one `{type:"input_audio",input_audio:{data,format}}` part with base64 PCM16 WAV data; MP3 currently returns HTTP 400. Added `POST /v1/audio/transcriptions` multipart handling for `file` plus optional `model`, `language`, and `response_format=json|text`. Audio pipeline startup detects a Float32 `input_features` encoder input, derives its mel/frame shape, preprocesses WAV audio with `onnx-genai-preprocess` log-mel extraction, and supplies the tensor to the existing encoder-to-decoder `PipelineEngine`. Decoder prompts use Whisper start/language/transcribe/no-timestamps tokens when present, and output token ids are decoded by the pipeline tokenizer.
+**Why:** This exposes both requested OpenAI audio surfaces without changing engine or ORT ownership. Requests against non-audio models return HTTP 400, generation remains bounded by request/server/pipeline token caps, and the tiny Whisper fixture validates routing. A real Whisper package still needs production encoder/decoder weights, a complete Whisper tokenizer with language/task special tokens and EOS configuration, fixed 30-second `[1,80,3000]` (or model-declared) feature input, and model-appropriate chunking/timestamp behavior for long audio and accurate transcription.
+
+---
+
+### 2026-07-12T16:30:00-07:00: Make vision preprocessing metadata-driven
+**By:** Rachael
+**What:** Server vision preprocessing now reads `preprocessing.image` metadata for resize size/mode, crop, interpolation, and per-channel mean/std normalization. Bicubic maps to the image crate's Catmull-Rom filter; supported resize paths are shortest-edge plus center crop, fixed resize, and longest-edge plus padding. Defaults are model input dimensions, shortest-edge center crop, bicubic interpolation, and `[0, 1]` normalization when metadata is absent.
+**Why:** CLIP and other vision encoders require their exported processor geometry and normalization for faithful embeddings, while metadata-driven parameters avoid baking one model's constants into the server and retain compatibility with legacy pipeline packages.
+
+---
+
+### 2026-07-12T16:20:00-07:00: DESIGN §1-§38 implementation audit
+**By:** Roy
+**What:** Read-only audit found core generation, serving, KV, scheduler, metadata, ORT wrapper, tools, grammar constraints, FIM, batching, metrics, and most native preprocessing architecture implemented. Remaining or partial gaps cluster around `/v1/embeddings`, logprobs, multi-model lifecycle, EAGLE-3 proposer completion, audio/Whisper surface, debug/Perfetto/OTLP, image preprocessing fidelity, diffusion, cluster routing, external KV connectors, and metadata-declared queue-depth backpressure. The audit prioritized backlog: embeddings, logprobs, model lifecycle, EAGLE-3, audio endpoints, native log-mel, debug/profiling, image preprocessing fidelity, fp8 KV, diffusion, cluster router, language diffusion, real Mobius VLM/ASR packages, distributed KV, and queue-depth metadata. `cargo test --workspace` passed during the read-only validation.
+**Why:** Future routing should focus on the remaining high-value OpenAI-compatible runtime gaps rather than re-auditing already completed design sections. Audio was architecturally feasible through the existing encoder-decoder pipeline once native mel preprocessing and a Mobius Whisper package exist.
+
+---
+
+### 2026-07-12T16:30:00-07:00: Add native Whisper log-mel preprocessing
+**By:** Sebastian
+**What:** Added reusable `onnx_genai::preprocess::audio` APIs. `LogMelExtractor` resamples mono f32 PCM to 16 kHz, computes a centered STFT with a periodic Hann window (`n_fft=400`, `hop=160`), applies Slaney-normalized 80- or 128-bin mel filters over 0–8 kHz, then applies Whisper's log10, max-minus-8 clamp, and `(x+4)/4` normalization. Dynamic extraction returns `[1, n_mels, n_frames]`; fixed extraction pads/truncates to 30 seconds and returns `[1, n_mels, 3000]`. `decode_wav_pcm16` decodes 16-bit integer PCM WAV and averages channels to mono.
+**Why:** This provides the pure-Rust, ORT-Extensions-free DSP foundation required by issue #11 in the facade crate so CLI and server integrations can share it. Issue #12 must next accept audio content, decode WAV bytes (MP3 remains deferred), construct `input_features`, route them through a Whisper encoder/decoder pipeline, and map transcription output to the API.
+
+---
+
+### 2026-07-12: Add an OpenAI HTTP cross-runtime benchmark harness
+**By:** Sebastian
+**What:** Added a Rust comparison binary plus `scripts/compare_runtimes.sh` to probe onnx-genai, Ollama, and LM Studio, then measure fixed Qwen2.5-0.5B-Instruct short/long prompts with greedy streaming TTFT, decode throughput, total latency, and estimated prefill throughput. The Apple M1 Max baseline used onnx-genai's 1.98 GB f32 dynamic-cache ONNX model on CPU and identical 531.1 MB Q8_0 GGUF bytes in Ollama and LM Studio.
+**Why:** A common API-level harness with warmups, median/p90, exact runtime/model labels, machine metadata, graceful skips, and saved Markdown reports makes periodic comparisons reproducible and prevents cherry-picked claims. The baseline verdict is that onnx-genai is currently slower on every reported median metric; quantized/fused ONNX execution, persistent IoBinding/KV reuse, and prefill/thread/cache-shape tuning are the next priorities.

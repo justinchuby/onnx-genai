@@ -48,3 +48,7 @@ Prompt-lookup speculation and `MtpProposer` are accepted canonical runtime miles
 - Decode ownership is canonical: ORT owns forward execution plus KV buffers/cursors/rewind; engine owns generation policy, loops, stopping, constraints, logical KV policy, and `DecodeBackend`.
 - CI clippy is blocking with `cargo clippy --workspace --all-targets -- -D warnings`.
 - Engine `kv_bridge` is the largest coverage gap; future EAGLE-3 proposer work should preserve the ORT/engine boundary.
+
+## 2026-07-12T17:30:00-07:00 — EAGLE/logprobs/sampling batch logged
+- EAGLE-3 hidden-state contract, opt-in engine token logprobs, and real categorical sampling with per-request seedable RNG are now canonical decisions.
+- Future server work should map engine `TokenLogprob` data onto OpenAI chat/completions logprob surfaces.

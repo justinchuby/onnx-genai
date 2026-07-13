@@ -22,3 +22,7 @@ Sebastian's perf review is now in decisions. §26 should prioritize active-row c
 - `onnx-genai-bench` and `scripts/run_benchmarks.sh` are canonical for device-comparable Criterion runs; preserve stable scenario names and machine metadata.
 - Observability core is canonical: atomic metrics, `/metrics`, `/v1/status`, request spans, trace IDs, driver/session/token/TTFT/latency/cache-hit/429 counters.
 - Perfetto, OTLP, and full debug endpoints remain future work.
+
+## 2026-07-12T17:30:00-07:00 — Audio DSP and cross-runtime benchmarks logged
+- Native Whisper log-mel preprocessing and the OpenAI HTTP cross-runtime benchmark harness are canonical.
+- True 1:1 GGUF benchmarking remains in progress and was intentionally not logged as complete.

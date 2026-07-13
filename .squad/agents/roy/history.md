@@ -25,3 +25,6 @@ Roy's Phase 4, tool-use/grammar, and long-context plans were executed: pipeline 
 
 ## 2026-07-12T13:14:00-07:00 — Architecture review merged
 Roy's workspace review is now in decisions: crate split is sound, but engine.rs must be decomposed and §26 needs an engine loop/channel plus DecodeBackend before true batching. §27/§28 need SpeculativeProposer/verifier seams.
+
+## 2026-07-12T17:30:00-07:00 — DESIGN audit merged
+- Roy's §1-§38 audit is now canonical; remaining high-value gaps include embeddings, logprobs, model lifecycle, EAGLE-3 completion, audio/Whisper polish, debug/profiling, and real multimodal packages.

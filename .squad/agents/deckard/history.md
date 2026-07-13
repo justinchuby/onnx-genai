@@ -42,3 +42,7 @@ Deckard's GPU EP, batched static-cache decode, and ORT checksum notes are now in
 
 ### 2026-07-12T14:50:00-07:00
 Published v0.1.0 release path is canonical: `.github/workflows/publish.yml` uses crates env, CARGO_REGISTRY_TOKEN, leaves-first order, idempotent skip-if-published checks with UA header. CI is live with fmt/build/test blocking and clippy non-blocking. Speculator discovery and MTP ORT execution are recorded.
+
+## 2026-07-12T17:30:00-07:00 — Preprocess, tiling, compaction, and Mobius paged-cache logged
+- `onnx-genai-preprocess`, metadata-driven/LLaVA-style image tiling, tolerant serialized ORT compaction tests, and Mobius paged-cache draft PR #395 are now recorded.
+- Future onnx-genai paged attention should drive Mobius `key_pool`/`value_pool`, `block_table`, `slot_mapping`, and `nonpad_kv_seqlen` contracts.
