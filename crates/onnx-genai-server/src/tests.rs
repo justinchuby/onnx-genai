@@ -1,5 +1,7 @@
 use crate::{
-    AppState, ChatCompletionRequest, CompletionRequest, ServerConfig, app, build_generate_request,
+    AppState, ChatCompletionRequest, CompletionRequest, EmbeddingEncodingFormat, EmbeddingInput,
+    EmbeddingRequest, EmbeddingResponse, EmbeddingUsage, EmbeddingVector, ServerConfig, app,
+    build_generate_request,
     driver::{DriverCommand, EngineDriver},
     routes::{CompletionGeneration, collect_generation_result, prepare_completion},
     sse::StopBoundaryBuffer,
@@ -143,6 +145,155 @@ fn transcription_json_response_has_openai_shape() {
         serde_json::to_value(response).unwrap(),
         json!({"text": "hello"})
     );
+}
+
+#[test]
+fn embedding_request_accepts_openai_input_variants_and_defaults_to_float() {
+    let single: EmbeddingRequest = serde_json::from_value(json!({
+        "model": "embedder",
+        "input": "hello"
+    }))
+    .unwrap();
+    assert!(matches!(single.input, EmbeddingInput::String(_)));
+    assert_eq!(single.encoding_format, EmbeddingEncodingFormat::Float);
+
+    let strings: EmbeddingRequest = serde_json::from_value(json!({
+        "model": "embedder",
+        "input": ["hello", "world"],
+        "encoding_format": "base64",
+        "dimensions": 64
+    }))
+    .unwrap();
+    assert!(matches!(strings.input, EmbeddingInput::Strings(_)));
+    assert_eq!(strings.encoding_format, EmbeddingEncodingFormat::Base64);
+    assert_eq!(strings.dimensions, Some(64));
+
+    let tokens: EmbeddingRequest = serde_json::from_value(json!({
+        "model": "embedder",
+        "input": [[1, 2], [3, 4]]
+    }))
+    .unwrap();
+    assert!(matches!(tokens.input, EmbeddingInput::TokenArrays(_)));
+
+    assert!(
+        serde_json::from_value::<EmbeddingRequest>(json!({
+            "model": "embedder",
+            "input": "hello",
+            "encoding_format": "hex"
+        }))
+        .is_err()
+    );
+}
+
+#[test]
+fn embedding_response_serializes_float_and_base64_vectors() {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+
+    let float = EmbeddingResponse {
+        object: "list",
+        data: vec![crate::EmbeddingData {
+            object: "embedding",
+            embedding: EmbeddingVector::from_floats(
+                vec![1.0, -2.0],
+                EmbeddingEncodingFormat::Float,
+            ),
+            index: 0,
+        }],
+        model: "embedder".to_string(),
+        usage: EmbeddingUsage {
+            prompt_tokens: 2,
+            total_tokens: 2,
+        },
+    };
+    let float = serde_json::to_value(float).unwrap();
+    assert_eq!(float["object"], "list");
+    assert_eq!(float["data"][0]["object"], "embedding");
+    assert_eq!(float["data"][0]["embedding"], json!([1.0, -2.0]));
+    assert_eq!(float["data"][0]["index"], 0);
+    assert_eq!(float["model"], "embedder");
+    assert_eq!(
+        float["usage"],
+        json!({"prompt_tokens": 2, "total_tokens": 2})
+    );
+
+    let base64 = EmbeddingVector::from_floats(vec![1.0, -2.0], EmbeddingEncodingFormat::Base64);
+    let encoded = serde_json::to_value(base64).unwrap();
+    let expected = STANDARD.encode(
+        [1.0_f32, -2.0_f32]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect::<Vec<_>>(),
+    );
+    assert_eq!(encoded, expected);
+}
+
+#[tokio::test]
+async fn embeddings_validate_input_then_report_engine_api_gap() {
+    let router = app(tiny_state());
+    for input in [
+        json!("hello"),
+        json!(["hello", "world"]),
+        json!([[1, 2], [3, 4]]),
+    ] {
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/embeddings")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "model": "tiny-llm",
+                            "input": input,
+                            "encoding_format": "base64"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("single-pass hidden-state or pooled-output API"),
+            "{body}"
+        );
+    }
+
+    for (body, message) in [
+        (
+            json!({"model": "tiny-llm", "input": []}),
+            "embedding input array must not be empty",
+        ),
+        (
+            json!({"model": "tiny-llm", "input": "hello", "dimensions": 0}),
+            "dimensions must be greater than zero",
+        ),
+    ] {
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/embeddings")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["message"], message);
+    }
 }
 
 #[tokio::test]

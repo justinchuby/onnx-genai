@@ -30,8 +30,9 @@ use crate::{
     types::{
         AudioTranscriptionResponse, ChatChoice, ChatCompletionRequest, ChatCompletionResponse,
         ChatMessage, ChatMessageContent, ChatMessageToolCall, ChatMessageToolCallFunction,
-        ChatTool, CompletionChoice, CompletionRequest, CompletionResponse, InputAudio, StopInput,
-        ToolChoice, ToolChoiceMode, Usage,
+        ChatTool, CompletionChoice, CompletionRequest, CompletionResponse, EmbeddingInput,
+        EmbeddingRequest, EmbeddingResponse, InputAudio, StopInput, ToolChoice, ToolChoiceMode,
+        Usage,
     },
 };
 
@@ -144,6 +145,14 @@ impl ApiError {
             status: StatusCode::TOO_MANY_REQUESTS,
             message: message.into(),
             retry_after_secs: Some(OVERLOAD_RETRY_AFTER_SECS),
+        }
+    }
+
+    fn not_implemented(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::NOT_IMPLEMENTED,
+            message: message.into(),
+            retry_after_secs: None,
         }
     }
 }
@@ -302,6 +311,19 @@ pub(crate) async fn completions(
     }
 }
 
+pub(crate) async fn embeddings(
+    State(state): State<AppState>,
+    Json(request): Json<EmbeddingRequest>,
+) -> Result<Json<EmbeddingResponse>, ApiError> {
+    validate_embedding_request(&request, &state.tokenizer)?;
+
+    Err(ApiError::not_implemented(format!(
+        "model '{}' cannot produce embeddings: onnx-genai-engine does not yet expose a \
+         single-pass hidden-state or pooled-output API",
+        state.model_id
+    )))
+}
+
 pub(crate) async fn audio_transcriptions(
     State(state): State<AppState>,
     mut multipart: Multipart,
@@ -411,6 +433,63 @@ pub(crate) async fn audio_transcriptions(
         )
             .into_response()),
         _ => unreachable!("response format validated before generation"),
+    }
+}
+
+fn validate_embedding_request(
+    request: &EmbeddingRequest,
+    tokenizer: &Tokenizer,
+) -> Result<(), ApiError> {
+    if request.model.trim().is_empty() {
+        return Err(ApiError::bad_request("model must not be empty"));
+    }
+    if request.dimensions == Some(0) {
+        return Err(ApiError::bad_request(
+            "dimensions must be greater than zero",
+        ));
+    }
+
+    let validate_tokens = |tokens: &[u32]| {
+        if tokens.is_empty() {
+            Err(ApiError::bad_request(
+                "embedding input must contain at least one token",
+            ))
+        } else {
+            Ok(())
+        }
+    };
+    match &request.input {
+        EmbeddingInput::String(input) => {
+            let tokens = tokenizer.encode(input).map_err(|err| {
+                ApiError::bad_request(format!("input tokenization failed: {err}"))
+            })?;
+            validate_tokens(&tokens)
+        }
+        EmbeddingInput::Strings(inputs) => {
+            if inputs.is_empty() {
+                return Err(ApiError::bad_request(
+                    "embedding input array must not be empty",
+                ));
+            }
+            for input in inputs {
+                let tokens = tokenizer.encode(input).map_err(|err| {
+                    ApiError::bad_request(format!("input tokenization failed: {err}"))
+                })?;
+                validate_tokens(&tokens)?;
+            }
+            Ok(())
+        }
+        EmbeddingInput::TokenArrays(inputs) => {
+            if inputs.is_empty() {
+                return Err(ApiError::bad_request(
+                    "embedding input array must not be empty",
+                ));
+            }
+            for tokens in inputs {
+                validate_tokens(tokens)?;
+            }
+            Ok(())
+        }
     }
 }
 

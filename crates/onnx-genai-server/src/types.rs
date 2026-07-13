@@ -2,6 +2,77 @@ use onnx_genai::StopSequence;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Deserialize)]
+pub struct EmbeddingRequest {
+    pub model: String,
+    pub input: EmbeddingInput,
+    #[serde(default)]
+    pub encoding_format: EmbeddingEncodingFormat,
+    #[serde(default)]
+    pub dimensions: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum EmbeddingInput {
+    String(String),
+    Strings(Vec<String>),
+    TokenArrays(Vec<Vec<u32>>),
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum EmbeddingEncodingFormat {
+    #[default]
+    Float,
+    Base64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct EmbeddingResponse {
+    pub object: &'static str,
+    pub data: Vec<EmbeddingData>,
+    pub model: String,
+    pub usage: EmbeddingUsage,
+}
+
+#[derive(Debug, Serialize)]
+pub struct EmbeddingData {
+    pub object: &'static str,
+    pub embedding: EmbeddingVector,
+    pub index: usize,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+pub enum EmbeddingVector {
+    Float(Vec<f32>),
+    Base64(String),
+}
+
+impl EmbeddingVector {
+    pub fn from_floats(values: Vec<f32>, format: EmbeddingEncodingFormat) -> Self {
+        match format {
+            EmbeddingEncodingFormat::Float => Self::Float(values),
+            EmbeddingEncodingFormat::Base64 => {
+                use base64::{Engine as _, engine::general_purpose::STANDARD};
+
+                let mut bytes = Vec::with_capacity(values.len() * size_of::<f32>());
+                for value in values {
+                    bytes.extend_from_slice(&value.to_le_bytes());
+                }
+                Self::Base64(STANDARD.encode(bytes))
+            }
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct EmbeddingUsage {
+    pub prompt_tokens: usize,
+    pub total_tokens: usize,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct ChatCompletionRequest {
     pub model: String,
     pub messages: Vec<ChatMessage>,

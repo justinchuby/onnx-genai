@@ -34,8 +34,10 @@ pub use types::{
     AudioTranscriptionResponse, ChatChoice, ChatCompletionRequest, ChatCompletionResponse,
     ChatMessage, ChatMessageContent, ChatMessageContentPart, ChatMessageToolCall,
     ChatMessageToolCallFunction, ChatTool, ChatToolFunction, CompletionChoice, CompletionRequest,
-    CompletionResponse, ImageUrl, InputAudio, ResponseFormat, ResponseFormatType, StopInput,
-    ToolChoice, ToolChoiceFunction, ToolChoiceMode, ToolChoiceSpecific, Usage,
+    CompletionResponse, EmbeddingData, EmbeddingEncodingFormat, EmbeddingInput, EmbeddingRequest,
+    EmbeddingResponse, EmbeddingUsage, EmbeddingVector, ImageUrl, InputAudio, ResponseFormat,
+    ResponseFormatType, StopInput, ToolChoice, ToolChoiceFunction, ToolChoiceMode,
+    ToolChoiceSpecific, Usage,
 };
 
 pub fn app(state: AppState) -> Router {
@@ -46,6 +48,7 @@ pub fn app(state: AppState) -> Router {
         .route("/v1/sessions", post(routes::create_session))
         .route("/v1/sessions/{id}", delete(routes::delete_session))
         .route("/v1/completions", post(routes::completions))
+        .route("/v1/embeddings", post(routes::embeddings))
         .route(
             "/v1/audio/transcriptions",
             post(routes::audio_transcriptions).layer(DefaultBodyLimit::max(25 * 1024 * 1024)),
