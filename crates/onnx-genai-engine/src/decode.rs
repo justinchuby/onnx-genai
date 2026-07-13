@@ -291,9 +291,34 @@ pub(crate) fn next_session_token_logits_and_hidden(
     state: &mut EngineSession,
     hidden_output: &str,
 ) -> anyhow::Result<(Vec<f32>, Vec<f32>)> {
+    let (logits, mut hidden) = next_session_token_logits_and_hiddens(
+        session,
+        kv_model,
+        kv_cache,
+        seq,
+        state,
+        &[hidden_output.to_string()],
+    )?;
+    Ok((
+        logits,
+        hidden
+            .pop()
+            .context("target model did not produce the requested hidden state")?,
+    ))
+}
+
+pub(crate) fn next_session_token_logits_and_hiddens(
+    session: &Session,
+    kv_model: Option<&KvModelInfo>,
+    kv_cache: &mut PagedKvCache,
+    seq: SessionId,
+    state: &mut EngineSession,
+    hidden_outputs: &[String],
+) -> anyhow::Result<(Vec<f32>, Vec<Vec<f32>>)> {
     if state.decode_state.has_runner() {
         anyhow::bail!(
-            "MTP requires the target hidden-state output '{hidden_output}', which is not exposed by the optimized decode runner; initialize the target with the legacy output-preserving decode path"
+            "speculative hidden-state outputs {:?} are not exposed by the optimized decode runner; initialize the target with the legacy output-preserving decode path",
+            hidden_outputs
         );
     }
     let (input_tokens, past_len) = session_decode_input_tokens(state)?;
@@ -312,7 +337,10 @@ pub(crate) fn next_session_token_logits_and_hidden(
         state.kv_token_count += input_len;
     }
     let logits = extract_next_token_logits_from_outputs(session, &outputs)?;
-    let hidden = extract_last_hidden(session, &outputs, hidden_output)?;
+    let hidden = hidden_outputs
+        .iter()
+        .map(|output| extract_last_hidden(session, &outputs, output))
+        .collect::<anyhow::Result<Vec<_>>>()?;
     Ok((logits, hidden))
 }
 

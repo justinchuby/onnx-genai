@@ -23,10 +23,10 @@ pub mod speculative;
 
 pub use batched::{ContinuousBatchEvent, ContinuousBatchHandle, ContinuousBatchManager};
 pub use engine::{
-    Engine, EngineConfig, FinishReason, GenerateConstraint, GenerateOptions, GeneratePrompt,
-    GenerateRequest, GenerateResult, GenerateToken, GenerateTokenCallback, MtpConfig,
-    PrioritizedGenerateRequest, PrioritizedGenerateResult, ScheduledGenerateArrival, SessionId,
-    SpeculativeMode, TokenLogprob,
+    Eagle3Config, Engine, EngineConfig, FinishReason, GenerateConstraint, GenerateOptions,
+    GeneratePrompt, GenerateRequest, GenerateResult, GenerateToken, GenerateTokenCallback,
+    MtpConfig, PrioritizedGenerateRequest, PrioritizedGenerateResult, ScheduledGenerateArrival,
+    SessionId, SpeculativeMode, TokenLogprob,
 };
 pub use fim::{FimConfig, FimFormat};
 pub use logits::{
@@ -36,7 +36,7 @@ pub use logits::{
 pub use pipeline::{PipelineEngine, PipelineGenerateRequest, PipelineTensors};
 pub use sampling::{CategoricalSampler, GreedySampler, Sampler};
 pub use speculative::{
-    LinearEmbedder, LinearLmHead, LmHead, MtpProposer, NgramProposer, SpeculativeAcceptContext,
-    SpeculativeProposal, SpeculativeProposer, SpeculativeProposerContext, SpeculativeStats,
-    TokenEmbedder, argmax,
+    Eagle3Proposer, LinearEmbedder, LinearLmHead, LmHead, MtpProposer, NgramProposer,
+    SpeculativeAcceptContext, SpeculativeProposal, SpeculativeProposer, SpeculativeProposerContext,
+    SpeculativeStats, TokenEmbedder, argmax,
 };

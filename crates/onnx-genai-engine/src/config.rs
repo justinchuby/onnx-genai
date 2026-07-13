@@ -2,7 +2,7 @@
 
 use crate::logits::{StopSequence, TokenId};
 use onnx_genai_kv::SequenceId;
-use onnx_genai_ort::MtpDraftKvMode;
+use onnx_genai_ort::{Eagle3DraftKvMode, MtpDraftKvMode};
 use onnx_genai_scheduler::{Priority, SchedulerConfig};
 use std::path::PathBuf;
 
@@ -33,6 +33,29 @@ pub struct MtpConfig {
     pub num_speculative_tokens: usize,
 }
 
+/// Files and target-model outputs required for EAGLE-3 speculation.
+///
+/// EAGLE-3 consumes exactly three target hidden-state outputs (low, middle,
+/// high), concatenates their last-token rows, and autoregressively recycles the
+/// draft head's own hidden output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Eagle3Config {
+    /// ONNX model containing the EAGLE-3 draft head.
+    pub head_model: PathBuf,
+    /// Low, middle, and high target hidden-state output names, in that order.
+    pub target_hidden_outputs: Vec<String>,
+    /// Raw little-endian f32 target embedding weights in `[vocab, hidden]` order.
+    pub embedding_weights: PathBuf,
+    /// Target vocabulary size used by the shared embedding table.
+    pub vocab_size: usize,
+    /// Width of each target hidden state and token embedding.
+    pub hidden_size: usize,
+    /// EAGLE-3 head cache strategy.
+    pub kv_mode: Eagle3DraftKvMode,
+    /// Number of speculative tokens produced after the guaranteed target token.
+    pub num_speculative_tokens: usize,
+}
+
 /// Built-in speculative candidate source.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum SpeculativeMode {
@@ -50,6 +73,8 @@ pub enum SpeculativeMode {
     },
     /// Propose from a target hidden state with an external MTP head.
     Mtp(MtpConfig),
+    /// Propose autoregressively from fused low/middle/high target hidden states.
+    Eagle3(Eagle3Config),
 }
 
 /// Identifier for a persistent generation session.
@@ -237,6 +262,9 @@ impl GenerateOptions {
         if let Some(SpeculativeMode::Mtp(config)) = &self.speculative_mode {
             validate_mtp_config(config)?;
         }
+        if let Some(SpeculativeMode::Eagle3(config)) = &self.speculative_mode {
+            validate_eagle3_config(config)?;
+        }
         Ok(())
     }
 }
@@ -250,6 +278,26 @@ pub(crate) fn validate_mtp_config(config: &MtpConfig) -> anyhow::Result<()> {
     }
     if config.num_speculative_tokens == 0 {
         anyhow::bail!("MTP num_speculative_tokens must be greater than zero");
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_eagle3_config(config: &Eagle3Config) -> anyhow::Result<()> {
+    if config.target_hidden_outputs.len() != 3
+        || config
+            .target_hidden_outputs
+            .iter()
+            .any(|name| name.is_empty())
+    {
+        anyhow::bail!(
+            "EAGLE-3 target_hidden_outputs must contain exactly three non-empty low/middle/high output names"
+        );
+    }
+    if config.vocab_size == 0 || config.hidden_size == 0 {
+        anyhow::bail!("EAGLE-3 vocab_size and hidden_size must be greater than zero");
+    }
+    if config.num_speculative_tokens == 0 {
+        anyhow::bail!("EAGLE-3 num_speculative_tokens must be greater than zero");
     }
     Ok(())
 }

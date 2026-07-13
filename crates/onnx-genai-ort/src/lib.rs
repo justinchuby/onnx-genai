@@ -11,6 +11,7 @@ pub mod allocator;
 pub mod binding;
 pub mod chat_template;
 pub mod decode;
+pub mod eagle3;
 pub mod env;
 pub mod error;
 pub mod loader;
@@ -26,6 +27,10 @@ pub use decode::{
     BatchedStaticCacheDecodeSession, DecodeKvMode, DecodeSession, DecodeSessionOptions,
     StaticCacheBindingMode, StaticCacheBufferInfo, StaticCacheDecodeOptions,
     StaticCacheDecodeSession, StaticCacheSignature,
+};
+pub use eagle3::{
+    Eagle3DecodeOptions, Eagle3DecodeSession, Eagle3DraftKvMode, Eagle3HeadSignature,
+    Eagle3StepOutput,
 };
 pub use env::Environment;
 pub use error::{OrtError, Result};

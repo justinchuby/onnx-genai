@@ -22,14 +22,15 @@ use anyhow::Context;
 use onnx_genai_kv::{KvCacheOps, PagedKvCache, PrefixCache};
 use onnx_genai_metadata::InferenceMetadata;
 use onnx_genai_ort::{
-    DataType, Environment, ModelDirectory, MtpDecodeSession, Session, SessionOptions, Tokenizer,
+    DataType, Eagle3DecodeSession, Environment, ModelDirectory, MtpDecodeSession, Session,
+    SessionOptions, Tokenizer,
 };
 use onnx_genai_scheduler::{Priority, Scheduler};
 use std::collections::HashMap;
 use std::path::Path;
 
 pub use crate::config::{
-    EngineConfig, FinishReason, GenerateConstraint, GenerateOptions, GeneratePrompt,
+    Eagle3Config, EngineConfig, FinishReason, GenerateConstraint, GenerateOptions, GeneratePrompt,
     GenerateRequest, GenerateResult, GenerateToken, GenerateTokenCallback, MtpConfig,
     PrioritizedGenerateRequest, PrioritizedGenerateResult, ScheduledGenerateArrival, SessionId,
     SpeculativeMode, TokenLogprob,
@@ -62,6 +63,8 @@ pub struct Engine {
     pub(crate) draft: Option<DraftModel>,
     /// Optional MTP head and target-side projections.
     pub(crate) mtp: Option<MtpModel>,
+    /// Optional EAGLE-3 head and target-side embedding.
+    pub(crate) eagle3: Option<Eagle3Model>,
     /// Tokenizer loaded from the model directory.
     pub(crate) tokenizer: Tokenizer,
     /// Auto-detected fill-in-the-middle token configuration.
@@ -81,6 +84,15 @@ pub(crate) struct MtpModel {
     pub(crate) lm_head: LinearLmHead,
     pub(crate) hidden_output: String,
     pub(crate) kv_mode: onnx_genai_ort::MtpDraftKvMode,
+    pub(crate) num_speculative_tokens: usize,
+}
+
+pub(crate) struct Eagle3Model {
+    pub(crate) config: Eagle3Config,
+    pub(crate) session: Box<Session>,
+    pub(crate) embedder: LinearEmbedder,
+    pub(crate) hidden_outputs: Vec<String>,
+    pub(crate) kv_mode: onnx_genai_ort::Eagle3DraftKvMode,
     pub(crate) num_speculative_tokens: usize,
 }
 
@@ -251,6 +263,85 @@ impl Engine {
         } else {
             None
         };
+        let eagle3 = if let SpeculativeMode::Eagle3(eagle_config) = &speculative_mode {
+            crate::config::validate_eagle3_config(eagle_config)?;
+            for output_name in &eagle_config.target_hidden_outputs {
+                let hidden_output = session
+                    .outputs()
+                    .iter()
+                    .find(|output| output.name == *output_name)
+                    .with_context(|| {
+                        format!(
+                            "EAGLE-3 target model must expose hidden-state output '{output_name}'"
+                        )
+                    })?;
+                if hidden_output.dtype != DataType::Float32 {
+                    anyhow::bail!(
+                        "EAGLE-3 target hidden-state output '{}' must be Float32, got {:?}",
+                        hidden_output.name,
+                        hidden_output.dtype
+                    );
+                }
+                if hidden_output.shape.last().copied().filter(|dim| *dim > 0)
+                    != Some(eagle_config.hidden_size as i64)
+                {
+                    anyhow::bail!(
+                        "EAGLE-3 target hidden-state output '{}' shape {:?} does not end in configured hidden size {}",
+                        hidden_output.name,
+                        hidden_output.shape,
+                        eagle_config.hidden_size
+                    );
+                }
+            }
+            let head_session = Session::new(
+                &environment,
+                &eagle_config.head_model,
+                session_options.clone(),
+            )
+            .map_err(|error| anyhow::anyhow!("Failed to load EAGLE-3 head: {error}"))?;
+            let head_signature = Eagle3DecodeSession::detect(&head_session)
+                .map_err(|error| anyhow::anyhow!("Failed to inspect EAGLE-3 head: {error}"))?
+                .context("configured EAGLE-3 head model does not expose EAGLE-3 head I/O")?;
+            if head_signature.hidden_size != eagle_config.hidden_size {
+                anyhow::bail!(
+                    "EAGLE-3 head hidden size {} does not match configured target hidden size {}",
+                    head_signature.hidden_size,
+                    eagle_config.hidden_size
+                );
+            }
+            let expected_fused =
+                eagle_config.hidden_size * eagle_config.target_hidden_outputs.len();
+            if head_signature.fused_hidden_size != expected_fused {
+                anyhow::bail!(
+                    "EAGLE-3 head fused hidden size {} does not match three target layers totaling {}",
+                    head_signature.fused_hidden_size,
+                    expected_fused
+                );
+            }
+            if head_signature.draft_vocab_size > eagle_config.vocab_size {
+                anyhow::bail!(
+                    "EAGLE-3 draft vocabulary {} exceeds target embedding vocabulary {}",
+                    head_signature.draft_vocab_size,
+                    eagle_config.vocab_size
+                );
+            }
+            let embedding = read_f32_weights(&eagle_config.embedding_weights)?;
+            Some(Eagle3Model {
+                config: eagle_config.clone(),
+                session: Box::new(head_session),
+                embedder: LinearEmbedder::new(
+                    embedding,
+                    eagle_config.vocab_size,
+                    eagle_config.hidden_size,
+                )
+                .map_err(|error| anyhow::anyhow!("Invalid EAGLE-3 embedding weights: {error}"))?,
+                hidden_outputs: eagle_config.target_hidden_outputs.clone(),
+                kv_mode: eagle_config.kv_mode,
+                num_speculative_tokens: eagle_config.num_speculative_tokens,
+            })
+        } else {
+            None
+        };
 
         Ok(Self {
             metadata,
@@ -265,6 +356,7 @@ impl Engine {
             session: Box::new(session),
             draft,
             mtp,
+            eagle3,
             tokenizer,
             fim_config,
             num_speculative_tokens: config.num_speculative_tokens.max(1),
@@ -610,7 +702,10 @@ impl Engine {
     }
 
     fn new_target_decode_state(&self) -> anyhow::Result<DecodeState> {
-        if matches!(&self.speculative_mode, SpeculativeMode::Mtp(_)) {
+        if matches!(
+            &self.speculative_mode,
+            SpeculativeMode::Mtp(_) | SpeculativeMode::Eagle3(_)
+        ) {
             DecodeState::new(&self.session)
         } else {
             DecodeState::new_for_path(&self.session, &self.decode_path)

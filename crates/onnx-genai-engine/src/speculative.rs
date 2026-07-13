@@ -7,7 +7,8 @@
 use crate::TokenId;
 use crate::decode::{
     extract_logits_sequence, next_session_token_logits, next_session_token_logits_and_hidden,
-    propose_draft_tokens, run_decode_session_logits, run_decode_step,
+    next_session_token_logits_and_hiddens, propose_draft_tokens, run_decode_session_logits,
+    run_decode_step,
 };
 use crate::decode_loop::{
     DecodeLoopState, commit_selected_token, logprob_for_token, reached_context_limit,
@@ -27,7 +28,9 @@ use crate::{
 };
 use anyhow::Context;
 use onnx_genai_kv::KvCacheOps;
-use onnx_genai_ort::{MtpDecodeOptions, MtpDecodeSession, Session};
+use onnx_genai_ort::{
+    Eagle3DecodeOptions, Eagle3DecodeSession, MtpDecodeOptions, MtpDecodeSession, Session,
+};
 
 /// Produces a target-model token embedding for an MTP proposal step.
 pub trait TokenEmbedder {
@@ -182,6 +185,10 @@ pub struct SpeculativeProposerContext<'a> {
     pub chain: &'a ProcessorChain,
     /// Target decoder's last hidden state, when required by the proposer.
     pub target_hidden: Option<&'a [f32]>,
+    /// Target decoder's selected low/middle/high last-token hidden states.
+    ///
+    /// EAGLE-3 concatenates these in order to form its `fused_hidden` input.
+    pub target_hidden_layers: Option<&'a [Vec<f32>]>,
     /// Target model's unprocessed greedy next token.
     pub guaranteed_token: Option<TokenId>,
 }
@@ -397,6 +404,118 @@ where
     }
 }
 
+/// EAGLE-3 proposer backed by an autoregressive ORT draft-head session.
+pub struct Eagle3Proposer<'a, E = LinearEmbedder> {
+    session: Eagle3DecodeSession<'a>,
+    embedder: E,
+}
+
+impl<'a, E> Eagle3Proposer<'a, E>
+where
+    E: TokenEmbedder,
+{
+    pub fn new(
+        head: &'a Session,
+        options: Eagle3DecodeOptions,
+        embedder: E,
+    ) -> anyhow::Result<Self> {
+        let session = Eagle3DecodeSession::new(head, options)
+            .map_err(|error| anyhow::anyhow!("Failed to create EAGLE-3 decode session: {error}"))?;
+        if session.signature().hidden_size != embedder.hidden_size() {
+            anyhow::bail!(
+                "EAGLE-3 head hidden size {} does not match target embedding hidden size {}",
+                session.signature().hidden_size,
+                embedder.hidden_size()
+            );
+        }
+        Ok(Self { session, embedder })
+    }
+}
+
+impl<E> SpeculativeProposer for Eagle3Proposer<'_, E>
+where
+    E: TokenEmbedder,
+{
+    fn propose(
+        &mut self,
+        context: &SpeculativeProposerContext<'_>,
+    ) -> anyhow::Result<SpeculativeProposal> {
+        let layers = context
+            .target_hidden_layers
+            .context("EAGLE-3 proposer requires low/middle/high target hidden states")?;
+        let guaranteed_token = context
+            .guaranteed_token
+            .context("EAGLE-3 proposer requires the target model's greedy next token")?;
+        let hidden_size = self.session.signature().hidden_size;
+        if layers.len() != 3 || layers.iter().any(|layer| layer.len() != hidden_size) {
+            anyhow::bail!(
+                "EAGLE-3 requires exactly three target hidden states of width {hidden_size}"
+            );
+        }
+        let mut fused_hidden = Vec::with_capacity(self.session.signature().fused_hidden_size);
+        for layer in layers {
+            fused_hidden.extend_from_slice(layer);
+        }
+        if fused_hidden.len() != self.session.signature().fused_hidden_size {
+            anyhow::bail!(
+                "fused target hidden length {} != EAGLE-3 head fused hidden {}",
+                fused_hidden.len(),
+                self.session.signature().fused_hidden_size
+            );
+        }
+        let mut running_hidden = context
+            .target_hidden
+            .map(<[f32]>::to_vec)
+            .unwrap_or_else(|| layers[2].clone());
+        if running_hidden.len() != hidden_size {
+            anyhow::bail!(
+                "EAGLE-3 recycled target hidden length {} != hidden {hidden_size}",
+                running_hidden.len()
+            );
+        }
+
+        self.session.reset();
+        let draft_count = context.width.saturating_sub(1);
+        let mut tokens = Vec::with_capacity(draft_count + 1);
+        tokens.push(guaranteed_token);
+        let mut previous_token = guaranteed_token;
+        let mut embedding = vec![0.0f32; hidden_size];
+        for step in 0..draft_count {
+            self.embedder.embed(previous_token, &mut embedding)?;
+            let position = i64::try_from(context.context_tokens.len() + step)
+                .context("EAGLE-3 position exceeds i64")?;
+            let output = self
+                .session
+                .step(&embedding, &fused_hidden, &running_hidden, position)
+                .map_err(|error| anyhow::anyhow!("EAGLE-3 proposal step failed: {error}"))?;
+            let token = TokenId::try_from(
+                argmax(&output.logits).context("EAGLE-3 head produced empty draft logits")?,
+            )
+            .context("EAGLE-3 token id exceeds u32 range")?;
+            tokens.push(token);
+            previous_token = token;
+            running_hidden = output.hidden;
+        }
+        Ok(SpeculativeProposal::linear(tokens))
+    }
+
+    fn accept(&mut self, _context: &SpeculativeAcceptContext<'_>) -> anyhow::Result<()> {
+        // Every verification pass receives a fresh target low/mid/high anchor.
+        // Keeping draft-only KV across passes would make rejected features stale.
+        self.session.reset();
+        Ok(())
+    }
+
+    fn rewind(&mut self, _target_tokens: &[TokenId]) -> anyhow::Result<()> {
+        self.session.reset();
+        Ok(())
+    }
+
+    fn name(&self) -> &str {
+        "eagle3"
+    }
+}
+
 pub(crate) struct DraftModelProposer<'a> {
     draft_model: &'a mut DraftModel,
     draft_state: &'a mut DraftSession,
@@ -488,6 +607,10 @@ impl Engine {
             SpeculativeMode::Mtp(config) => {
                 self.mtp.as_ref().is_some_and(|mtp| mtp.config == config)
             }
+            SpeculativeMode::Eagle3(config) => self
+                .eagle3
+                .as_ref()
+                .is_some_and(|eagle3| eagle3.config == config),
         };
         mode_available
             // Grammar processors carry per-request parser state; draft/verify
@@ -524,6 +647,17 @@ impl Engine {
                             .unwrap_or(mtp.num_speculative_tokens)
                     })
                     .context("MTP speculation requested without a loaded MTP head")?
+                    + 1
+            }
+            SpeculativeMode::Eagle3(_) => {
+                self.eagle3
+                    .as_ref()
+                    .map(|eagle3| {
+                        options
+                            .num_speculative_tokens
+                            .unwrap_or(eagle3.num_speculative_tokens)
+                    })
+                    .context("EAGLE-3 speculation requested without a loaded EAGLE-3 head")?
                     + 1
             }
             _ => options
@@ -564,7 +698,7 @@ impl Engine {
 
             let base_len = state.tokens.len();
             let base_generated_len = generated_tokens.len();
-            let (mut base_logits, target_hidden) =
+            let (mut base_logits, target_hidden, target_hidden_layers) =
                 if let SpeculativeMode::Mtp(_) = &speculative_mode {
                     let hidden_output = self
                         .mtp
@@ -580,7 +714,27 @@ impl Engine {
                         state,
                         &hidden_output,
                     )?;
-                    (logits, Some(hidden))
+                    (logits, Some(hidden), None)
+                } else if let SpeculativeMode::Eagle3(_) = &speculative_mode {
+                    let hidden_outputs = self
+                        .eagle3
+                        .as_ref()
+                        .context("EAGLE-3 speculation requested without a loaded EAGLE-3 head")?
+                        .hidden_outputs
+                        .clone();
+                    let (logits, layers) = next_session_token_logits_and_hiddens(
+                        &self.session,
+                        self.kv_model.as_ref(),
+                        &mut self.kv_cache,
+                        session_id,
+                        state,
+                        &hidden_outputs,
+                    )?;
+                    let last_hidden = layers
+                        .last()
+                        .cloned()
+                        .context("EAGLE-3 target hidden-state list was empty")?;
+                    (logits, Some(last_hidden), Some(layers))
                 } else {
                     (
                         next_session_token_logits(
@@ -590,6 +744,7 @@ impl Engine {
                             session_id,
                             state,
                         )?,
+                        None,
                         None,
                     )
                 };
@@ -610,6 +765,7 @@ impl Engine {
                 options,
                 chain,
                 target_hidden: target_hidden.as_deref(),
+                target_hidden_layers: target_hidden_layers.as_deref(),
                 guaranteed_token,
             };
             let draft_tokens = match &speculative_mode {
@@ -645,6 +801,22 @@ impl Engine {
                         },
                         mtp.embedder.clone(),
                         mtp.lm_head.clone(),
+                    )?
+                    .propose(&proposer_context)?
+                    .tokens
+                }
+                SpeculativeMode::Eagle3(_) => {
+                    let eagle3 = self
+                        .eagle3
+                        .as_ref()
+                        .context("EAGLE-3 speculation requested without a loaded EAGLE-3 head")?;
+                    Eagle3Proposer::new(
+                        &eagle3.session,
+                        Eagle3DecodeOptions {
+                            kv_mode: eagle3.kv_mode,
+                            batch_size: 1,
+                        },
+                        eagle3.embedder.clone(),
                     )?
                     .propose(&proposer_context)?
                     .tokens
@@ -926,7 +1098,7 @@ mod tests {
     use super::*;
     use onnx_genai_ort::{Environment, SessionOptions};
     use std::path::Path;
-    use std::sync::OnceLock;
+    use std::sync::{Mutex, OnceLock};
 
     struct StubProposer {
         tokens: Vec<TokenId>,
@@ -976,6 +1148,7 @@ mod tests {
             options: &options,
             chain: &chain,
             target_hidden: None,
+            target_hidden_layers: None,
             guaranteed_token: None,
         })?;
         proposer.accept(&SpeculativeAcceptContext {
@@ -1005,6 +1178,7 @@ mod tests {
             options: &options,
             chain: &chain,
             target_hidden: None,
+            target_hidden_layers: None,
             guaranteed_token: None,
         })?;
 
@@ -1034,6 +1208,7 @@ mod tests {
             options: &options,
             chain: &chain,
             target_hidden: None,
+            target_hidden_layers: None,
             guaranteed_token: None,
         };
         let mut proposer = NgramProposer::new(2, 4)?;
@@ -1059,6 +1234,7 @@ mod tests {
             options: &options,
             chain: &chain,
             target_hidden: None,
+            target_hidden_layers: None,
             guaranteed_token: None,
         })?;
         assert_eq!(proposal.tokens, vec![3, 4]);
@@ -1073,6 +1249,7 @@ mod tests {
             options: &options,
             chain: &chain,
             target_hidden: None,
+            target_hidden_layers: None,
             guaranteed_token: None,
         })?;
         assert_eq!(proposal.tokens, vec![3]);
@@ -1090,6 +1267,24 @@ mod tests {
                 (bits as f32 / u32::MAX as f32) * 2.0 - 1.0
             })
             .collect()
+    }
+
+    fn eagle3_test_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn load_eagle3_head() -> anyhow::Result<Session> {
+        static ENVIRONMENT: OnceLock<Environment> = OnceLock::new();
+        let environment = ENVIRONMENT
+            .get_or_init(|| Environment::new("engine-eagle3-test").expect("environment"));
+        let head_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/tiny-eagle3/model.onnx");
+        Ok(Session::new(
+            environment,
+            &head_path,
+            SessionOptions::default().with_intra_op_threads(1),
+        )?)
     }
 
     #[test]
@@ -1128,6 +1323,7 @@ mod tests {
             options: &options,
             chain: &chain,
             target_hidden: Some(&hidden),
+            target_hidden_layers: None,
             guaranteed_token: Some(guaranteed),
         })?;
 
@@ -1136,6 +1332,89 @@ mod tests {
         assert_eq!(proposal.tokens.len(), 5);
         assert_eq!(proposal.tokens.first(), Some(&guaranteed));
         assert_eq!(proposal.tokens, vec![guaranteed, 27, 11, 2, 27]);
+        Ok(())
+    }
+
+    #[test]
+    fn eagle3_proposer_loads_fixture_and_returns_shape_correct_proposal() -> anyhow::Result<()> {
+        const HIDDEN: usize = 16;
+        const VOCAB: usize = 32;
+        let _guard = eagle3_test_lock()
+            .lock()
+            .map_err(|_| anyhow::anyhow!("EAGLE-3 test lock poisoned"))?;
+        let head = load_eagle3_head()?;
+        let embedder =
+            LinearEmbedder::new(lcg_weights(0x5555_6666, VOCAB * HIDDEN), VOCAB, HIDDEN)?;
+        let layers = vec![
+            lcg_weights(0x1000_0001, HIDDEN),
+            lcg_weights(0x2000_0002, HIDDEN),
+            lcg_weights(0x3000_0003, HIDDEN),
+        ];
+        let options = GenerateOptions::default();
+        let chain = ProcessorChain::new();
+        let mut proposer = Eagle3Proposer::new(&head, Eagle3DecodeOptions::default(), embedder)?;
+        let proposal = proposer.propose(&SpeculativeProposerContext {
+            width: 4,
+            context_tokens: &[1, 2],
+            generated_tokens: &[],
+            generated_text: "",
+            first_step: 0,
+            options: &options,
+            chain: &chain,
+            target_hidden: Some(&layers[2]),
+            target_hidden_layers: Some(&layers),
+            guaranteed_token: Some(7),
+        })?;
+
+        assert_eq!(proposer.name(), "eagle3");
+        assert_eq!(proposal.tokens.len(), 4);
+        assert_eq!(proposal.tokens.first(), Some(&7));
+        assert!(proposal.tokens.iter().all(|&token| token < VOCAB as u32));
+        assert!(proposal.positions.is_none());
+        assert!(proposal.tree.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn eagle3_proposer_accept_then_propose_resets_draft_state() -> anyhow::Result<()> {
+        const HIDDEN: usize = 16;
+        const VOCAB: usize = 32;
+        let _guard = eagle3_test_lock()
+            .lock()
+            .map_err(|_| anyhow::anyhow!("EAGLE-3 test lock poisoned"))?;
+        let head = load_eagle3_head()?;
+        let embedder =
+            LinearEmbedder::new(lcg_weights(0x7777_8888, VOCAB * HIDDEN), VOCAB, HIDDEN)?;
+        let layers = vec![
+            lcg_weights(0x4000_0004, HIDDEN),
+            lcg_weights(0x5000_0005, HIDDEN),
+            lcg_weights(0x6000_0006, HIDDEN),
+        ];
+        let options = GenerateOptions::default();
+        let chain = ProcessorChain::new();
+        let context = SpeculativeProposerContext {
+            width: 3,
+            context_tokens: &[4, 5, 6],
+            generated_tokens: &[],
+            generated_text: "",
+            first_step: 0,
+            options: &options,
+            chain: &chain,
+            target_hidden: Some(&layers[2]),
+            target_hidden_layers: Some(&layers),
+            guaranteed_token: Some(9),
+        };
+        let mut proposer = Eagle3Proposer::new(&head, Eagle3DecodeOptions::default(), embedder)?;
+
+        let first = proposer.propose(&context)?;
+        proposer.accept(&SpeculativeAcceptContext {
+            accepted_prefix_len: 2,
+            committed_tokens: &first.tokens[..2],
+            target_tokens: &[4, 5, 6, first.tokens[0], first.tokens[1]],
+        })?;
+        let second = proposer.propose(&context)?;
+
+        assert_eq!(first, second);
         Ok(())
     }
 
@@ -1153,10 +1432,32 @@ mod tests {
         });
         let selected = match mode {
             SpeculativeMode::Mtp(_) => "mtp",
+            SpeculativeMode::Eagle3(_) => "eagle3",
             SpeculativeMode::DraftModel => "draft_model",
             SpeculativeMode::PromptLookup { .. } => "prompt_lookup",
             SpeculativeMode::None => "none",
         };
         assert_eq!(selected, "mtp");
+    }
+
+    #[test]
+    fn eagle3_mode_selects_eagle3_proposer_contract() {
+        let mode = SpeculativeMode::Eagle3(crate::config::Eagle3Config {
+            head_model: "eagle3.onnx".into(),
+            target_hidden_outputs: vec!["low".into(), "mid".into(), "high".into()],
+            embedding_weights: "embed.f32".into(),
+            vocab_size: 32,
+            hidden_size: 16,
+            kv_mode: onnx_genai_ort::Eagle3DraftKvMode::HiddenThreaded,
+            num_speculative_tokens: 4,
+        });
+        let selected = match mode {
+            SpeculativeMode::Eagle3(_) => "eagle3",
+            SpeculativeMode::Mtp(_) => "mtp",
+            SpeculativeMode::DraftModel => "draft_model",
+            SpeculativeMode::PromptLookup { .. } => "prompt_lookup",
+            SpeculativeMode::None => "none",
+        };
+        assert_eq!(selected, "eagle3");
     }
 }
