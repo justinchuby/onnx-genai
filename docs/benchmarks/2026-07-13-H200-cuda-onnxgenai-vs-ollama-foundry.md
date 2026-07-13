@@ -12,9 +12,11 @@ and vectorized-argmax work landed on `fix/cuda-shared-buffer-kv`.
   1024 greedy tokens): our far lower prefill/TTFT cancels Ollama's faster
   steady-state decode.
 - On **steady-state decode tok/s** onnx-genai trails Ollama's hand-tuned Q4_K_M
-  GEMV by ~5% (481 vs 507). The gap is entirely inside ORT's int4 `MatMulNBits`
-  kernel (weight-bandwidth bound) and is not reachable from the prebuilt ORT
-  1.27 dylib we link.
+  GEMV by ~5% (481 vs 507). The gap is **not** weight-bandwidth in the
+  `MatMulNBits` kernel (a from-source ORT 1.28 build with the TRT-LLM `fpA_intB`
+  fast path does not help — see the update below); it is dominated by ORT running
+  ~366 small kernels/token that underfill the H200 SMs. Closing it needs operator
+  fusion, not a faster int4 kernel.
 - This cycle moved onnx-genai HTTP decode **402 → 471 → 481 tok/s**
   (CUDA graph, then vectorized greedy argmax).
 
@@ -82,10 +84,38 @@ re-bound every step). See the runbook §8 troubleshooting.
 
 ## What would close the last 5% on decode
 
-- The lever is ORT's CUDA `MatMulNBits` int4 GEMV, which is weight-bandwidth
-  bound and ~10× above the raw H200 bandwidth floor for these weights. Beating
-  llama.cpp Q4_K_M needs a faster fused dequant+GEMV kernel — **requires a from-
-  source ORT CUDA build**, not the prebuilt dylib.
+### Update (2026-07-13): the ORT int4 kernel knobs are exhausted
+
+A from-source ORT **1.28** CUDA build (SM90a, `onnxruntime_USE_FPA_INTB_GEMM=ON`)
+was built and benchmarked to test the two candidate kernel levers. Both are
+**dead ends** for a 0.5B model on H200:
+
+| lever | result |
+|---|---|
+| `accuracy_level=4` (int8/SDOT) | **no-op on CUDA** — the CUDA `MatMulNBits` ctor never reads it; compute is always in activation dtype (fp16). CPU-only win. A/B confirmed (495.3 vs 493.1). |
+| TRT-LLM `fpA_intB` fast path (`ORT_FPA_INTB_GEMM`) | **no help / crashes.** Built a `block_size=128` int4 model (from Qwen GPTQ-Int4, symmetric, N%64==0) that satisfies the fast-path gate. `=2` (GEMV) is ~5% *slower* (431 vs 454); `=1`/`=4` **crash** at prefill (`fpA_intB_gemv/dispatcher.h:387 unsupported m`) because CUTLASS has no GEMM tile for our tiny N (128/224) and the fallback picks the GEMV kernel for m≥16. |
+| ORT 1.27 → 1.28 default kernel | **neutral** — ~486 tok/s on both at 1024 tokens. |
+
+The TRT-LLM `fpA_intB` kernels are tuned for **large-N** LLMs; our N=128/224/896
+shapes are too small to benefit.
+
+### The real bottleneck is kernel count, not weight bandwidth
+
+`session_run` ≈ 1800 µs/token, but Qwen-0.5B's int4 weights are only ~0.4 GB →
+~83 µs at H200's 4.8 TB/s HBM3e. **We are not weight-bandwidth bound.** The time
+is dominated by **~366 tiny kernels/token** that each underfill the 132 SMs and
+serialize on one stream. CUDA graph already removes the *launch* overhead
+(443 → 475 tok/s, `session_run` 1941 → 1802 µs) but cannot fix per-kernel SM
+underutilization. That is precisely llama.cpp's edge: far fewer, fused, larger
+kernels. Closing the last ~4% needs **operator fusion / a fused-attention path**,
+not a faster `MatMulNBits` — a much larger effort than any env-var or kernel swap.
+
 - A cheaper in-tree option: an fp16-argmax fast path that skips the 79 µs
   `logits_to_vec` conversion for pure-greedy requests (~+15 tok/s), at the cost
   of a greedy-only code path with fp16 NaN-handling care.
+
+### Bottom line
+
+On the metric that matters — end-to-end latency — we are already at parity with
+Ollama and win decisively on TTFT. The decode gap is ~4% and only recoverable
+via custom fused kernels, not via ORT's existing int4 knobs.
