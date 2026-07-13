@@ -28,6 +28,11 @@ pub struct PipelineGenerateRequest {
     pub request: GenerateRequest,
     /// External tensors keyed by `component.input_name`.
     pub inputs: PipelineTensors,
+    /// Number of image tiles represented by the external vision tensor.
+    ///
+    /// This is known only after preprocessing and must be supplied before
+    /// decoder KV allocation for encoder-free multimodal pipelines.
+    pub num_image_tiles: Option<usize>,
 }
 
 impl PipelineGenerateRequest {
@@ -35,11 +40,17 @@ impl PipelineGenerateRequest {
         Self {
             request,
             inputs: HashMap::new(),
+            num_image_tiles: None,
         }
     }
 
     pub fn with_input(mut self, endpoint: impl Into<String>, value: Value) -> Self {
         self.inputs.insert(endpoint.into(), value);
+        self
+    }
+
+    pub fn with_image_tile_count(mut self, num_image_tiles: usize) -> Self {
+        self.num_image_tiles = Some(num_image_tiles);
         self
     }
 }
@@ -124,6 +135,13 @@ impl PipelineEngine {
         if prompt_tokens.is_empty() {
             anyhow::bail!("prompt must contain at least one token");
         }
+        if pipeline_request.num_image_tiles == Some(0) {
+            anyhow::bail!("image tile count must be greater than zero");
+        }
+        // TODO(#14): Pipeline metadata must declare the image placeholder token
+        // and tokens-per-tile contract. Expand that placeholder here using
+        // `num_image_tiles` before DecodeState/KV allocation. The server vision
+        // seam should pass ImageTensor::num_tiles via with_image_tile_count().
 
         let mut tensors = pipeline_request.inputs;
         self.run_prompt_phase_components(&mut tensors)?;
