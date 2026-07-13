@@ -34,7 +34,7 @@ _Last updated: 2026-07-13_
 | 37 | Model lifecycle mgmt | ❌ Missing | single model at startup; #9 |
 | 38 | Distributed KV connector | ❌ Missing | local tiered KV only |
 | 39 | Paged/radix attention | 🟡 Upstream | Mobius block-table KV graph (Option C, std ops) = draft PR onnxruntime/mobius#395; runtime wiring pending |
-| 40 | Sliding window attention | ❌ Missing | new design section; long context on limited HW — not yet implemented |
+| 40 | Sliding window attention | 🟡 Partial | Contiguous single-window SWA (metadata `sliding_window` + KV `apply_sliding_window` + windowed decode) ✅; **attention-sink tokens (StreamingLLM §40.4)** ✅ token-exact `[0,sink)∪[window_start,len)`; per-layer hybrid (§40.3) + discontinuous `position_ids` (§40.8) declined pending Mobius/ORT |
 
 ## Open backlog (GitHub issues)
 
