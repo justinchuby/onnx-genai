@@ -12,6 +12,7 @@ pub enum ExecutionProvider {
     Cpu,
     WebGpu,
     Cuda { device_id: i32 },
+    Metal,
     DirectML { device_id: i32 },
     CoreML,
     Qnn,
@@ -178,7 +179,7 @@ impl Session {
             )));
         }
 
-        let session_options = RawSessionOptions::new(&options)?;
+        let session_options = RawSessionOptions::new(env, &options)?;
         let path_c = CString::new(path.to_string_lossy().as_bytes())
             .map_err(|_| OrtError::InvalidArgument("model path contains NUL".into()))?;
         let mut ptr = std::ptr::null_mut();
@@ -198,12 +199,12 @@ impl Session {
         });
         let mut effective_providers = options.execution_providers.clone();
         if let Err(err) = create_result {
-            if requested_non_cpu_provider(&options) {
+            if requested_non_cpu_provider(&options) && !requested_strict_provider(&options) {
                 tracing::warn!(
                     "ORT session creation failed with requested execution provider(s): {err}; retrying with CPU"
                 );
                 let cpu_options = SessionOptions::cpu();
-                let cpu_session_options = RawSessionOptions::new(&cpu_options)?;
+                let cpu_session_options = RawSessionOptions::new(env, &cpu_options)?;
                 ptr = std::ptr::null_mut();
                 // SAFETY: same invariants as above, with fresh CPU-only options.
                 crate::error::check_status(unsafe {
@@ -505,7 +506,7 @@ struct RawSessionOptions {
 }
 
 impl RawSessionOptions {
-    fn new(options: &SessionOptions) -> Result<Self> {
+    fn new(env: &Environment, options: &SessionOptions) -> Result<Self> {
         let api = crate::error::api()?;
         let create = api
             .CreateSessionOptions
@@ -557,7 +558,7 @@ impl RawSessionOptions {
             })?;
         }
 
-        append_execution_providers(this.ptr.as_ptr(), options)?;
+        append_execution_providers(env, this.ptr.as_ptr(), options)?;
         apply_webgpu_provider_options(this.ptr.as_ptr(), options)?;
 
         Ok(this)
@@ -576,10 +577,11 @@ fn execution_providers_from_env() -> Option<Vec<ExecutionProvider>> {
         "cuda" => ExecutionProvider::Cuda {
             device_id: cuda_device_id_from_env(),
         },
+        "metal" => ExecutionProvider::Metal,
         "coreml" | "core-ml" | "core_ml" => ExecutionProvider::CoreML,
         other => {
             tracing::warn!(
-                "Ignoring unsupported ONNX_GENAI_EP={other}; expected cpu, webgpu, cuda, or coreml"
+                "Ignoring unsupported ONNX_GENAI_EP={other}; expected cpu, webgpu, cuda, metal, or coreml"
             );
             ExecutionProvider::Cpu
         }
@@ -592,6 +594,13 @@ fn requested_non_cpu_provider(options: &SessionOptions) -> bool {
         .execution_providers
         .iter()
         .any(|provider| !matches!(provider, ExecutionProvider::Cpu))
+}
+
+fn requested_strict_provider(options: &SessionOptions) -> bool {
+    options
+        .execution_providers
+        .iter()
+        .any(|provider| matches!(provider, ExecutionProvider::Metal))
 }
 
 fn env_flag_enabled(name: &str) -> bool {
@@ -727,6 +736,7 @@ fn add_session_config_entry(
 }
 
 fn append_execution_providers(
+    env: &Environment,
     session_options: *mut onnx_genai_ort_sys::OrtSessionOptions,
     options: &SessionOptions,
 ) -> Result<()> {
@@ -735,12 +745,19 @@ fn append_execution_providers(
         Vec::new()
     });
     for provider in &options.execution_providers {
-        append_execution_provider(session_options, provider, options.graph_capture, &available)?;
+        append_execution_provider(
+            env,
+            session_options,
+            provider,
+            options.graph_capture,
+            &available,
+        )?;
     }
     Ok(())
 }
 
 fn append_execution_provider(
+    env: &Environment,
     session_options: *mut onnx_genai_ort_sys::OrtSessionOptions,
     provider: &ExecutionProvider,
     graph_capture: bool,
@@ -773,6 +790,7 @@ fn append_execution_provider(
                 ))
             }
         }
+        ExecutionProvider::Metal => append_metal_execution_provider(env, session_options),
         ExecutionProvider::CoreML => append_named_execution_provider(
             session_options,
             "CoreML",
@@ -788,6 +806,120 @@ fn append_execution_provider(
             Ok(())
         }
     }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn append_metal_execution_provider(
+    env: &Environment,
+    session_options: *mut onnx_genai_ort_sys::OrtSessionOptions,
+) -> Result<()> {
+    const REGISTRATION_NAME: &str = "MetalEP";
+
+    let plugin_path = metal_plugin_path()?;
+    env.register_execution_provider_library(REGISTRATION_NAME, &plugin_path)?;
+
+    let api = crate::error::api()?;
+    let get_ep_devices = api
+        .GetEpDevices
+        .ok_or(OrtError::ApiUnavailable("GetEpDevices"))?;
+    let ep_name = api
+        .EpDevice_EpName
+        .ok_or(OrtError::ApiUnavailable("EpDevice_EpName"))?;
+    let append = api
+        .SessionOptionsAppendExecutionProvider_V2
+        .ok_or(OrtError::ApiUnavailable(
+            "SessionOptionsAppendExecutionProvider_V2",
+        ))?;
+
+    let mut ep_devices = std::ptr::null();
+    let mut ep_device_count = 0;
+    // SAFETY: the environment is live, and both output pointers are valid.
+    crate::error::check_status(unsafe {
+        get_ep_devices(env.as_ptr(), &mut ep_devices, &mut ep_device_count)
+    })?;
+    if ep_devices.is_null() {
+        return Err(OrtError::InvalidArgument(
+            "MetalEP registered but ONNX Runtime returned no execution provider devices".into(),
+        ));
+    }
+
+    let mut selected = Vec::new();
+    for index in 0..ep_device_count {
+        // SAFETY: ORT returned an array containing `ep_device_count` entries.
+        let device = unsafe { *ep_devices.add(index) };
+        if device.is_null() {
+            continue;
+        }
+        // SAFETY: `device` is owned by the environment and valid while it is live.
+        let name_ptr = unsafe { ep_name(device) };
+        if !name_ptr.is_null()
+            // SAFETY: ORT execution provider names are NUL-terminated strings.
+            && unsafe { CStr::from_ptr(name_ptr) }.to_bytes() == REGISTRATION_NAME.as_bytes()
+        {
+            selected.push(device);
+        }
+    }
+    if selected.is_empty() {
+        return Err(OrtError::InvalidArgument(
+            "MetalEP device not found after registering the onnxruntime-mps plugin".into(),
+        ));
+    }
+
+    // SAFETY: the selected devices belong to this live environment, the session
+    // options handle is valid, and no provider-specific options are required.
+    crate::error::check_status(unsafe {
+        append(
+            session_options,
+            env.as_ptr().cast_mut(),
+            selected.as_ptr(),
+            selected.len(),
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
+        )
+    })?;
+    tracing::info!(
+        plugin = %plugin_path.display(),
+        devices = selected.len(),
+        "Enabled ONNX Runtime Metal plugin execution provider"
+    );
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn metal_plugin_path() -> Result<std::path::PathBuf> {
+    const HELP: &str = "set ONNX_GENAI_METAL_EP_LIB to the built onnxruntime-mps plugin";
+    let value = std::env::var_os("ONNX_GENAI_METAL_EP_LIB")
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| OrtError::InvalidArgument(HELP.into()))?;
+    let path = std::path::PathBuf::from(value);
+    if !path.is_absolute() {
+        return Err(OrtError::InvalidArgument(format!(
+            "ONNX_GENAI_METAL_EP_LIB must be an absolute path; {HELP}"
+        )));
+    }
+    if !path.is_file() {
+        return Err(OrtError::InvalidArgument(format!(
+            "Metal execution provider library not found at {}; {HELP}",
+            path.display()
+        )));
+    }
+    path.canonicalize().map_err(|err| {
+        OrtError::InvalidArgument(format!(
+            "could not resolve ONNX_GENAI_METAL_EP_LIB={}: {err}; {HELP}",
+            path.display()
+        ))
+    })
+}
+
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+fn append_metal_execution_provider(
+    _env: &Environment,
+    _session_options: *mut onnx_genai_ort_sys::OrtSessionOptions,
+) -> Result<()> {
+    Err(OrtError::InvalidArgument(
+        "Metal execution provider is supported only on macOS arm64".into(),
+    ))
 }
 
 #[cfg(feature = "cuda")]
@@ -1147,6 +1279,7 @@ mod tests {
     #[test]
     fn cuda_request_requires_compile_time_feature() {
         let error = append_execution_provider(
+            &Environment::new("cuda-feature-test").expect("environment"),
             std::ptr::null_mut(),
             &ExecutionProvider::Cuda { device_id: 0 },
             false,

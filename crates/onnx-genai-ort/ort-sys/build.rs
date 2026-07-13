@@ -35,6 +35,7 @@ const ORT_ARCHIVE_CHECKSUMS: &[(&str, &str)] = &[
 ];
 
 fn main() {
+    println!("cargo:rerun-if-env-changed=ONNX_GENAI_METAL_EP_LIB");
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
 
     // Find ORT installation
@@ -83,6 +84,16 @@ fn main() {
 }
 
 fn find_ort_root() -> PathBuf {
+    // A plugin EP must use the same ORT dylib as the host process. When the
+    // Metal plugin is selected at build/run time, prefer the ORT installation
+    // recorded in the plugin's Mach-O dependencies.
+    if target_os() == "macos"
+        && target_arch() == "aarch64"
+        && let Some(root) = metal_plugin_ort_root()
+    {
+        return root;
+    }
+
     // 1. ORT_LIB_DIR — just the lib directory, infer root
     if let Ok(lib_dir) = env::var("ORT_LIB_DIR") {
         let lib_path = PathBuf::from(&lib_dir);
@@ -151,6 +162,43 @@ fn find_ort_root() -> PathBuf {
 
     download_prebuilt(&download_dir);
     download_dir
+}
+
+fn metal_plugin_ort_root() -> Option<PathBuf> {
+    let plugin = PathBuf::from(env::var_os("ONNX_GENAI_METAL_EP_LIB")?);
+    if !plugin.is_file() {
+        return None;
+    }
+    let output = std::process::Command::new("otool")
+        .arg("-L")
+        .arg(&plugin)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8(output.stdout).ok()?;
+    let runtime = stdout
+        .lines()
+        .skip(1)
+        .filter_map(|line| line.split_whitespace().next())
+        .map(PathBuf::from)
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("libonnxruntime") && name.ends_with(".dylib"))
+                && path.is_absolute()
+                && path.is_file()
+        })?;
+    let root = runtime.parent()?.parent()?.to_path_buf();
+    if !root.join("include").join("onnxruntime_c_api.h").is_file() {
+        return None;
+    }
+    println!(
+        "cargo:warning=using ONNX Runtime from Metal plugin dependency: {}",
+        runtime.display()
+    );
+    Some(root)
 }
 
 fn download_prebuilt(target_dir: &Path) {
