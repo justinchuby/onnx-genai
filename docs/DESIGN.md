@@ -183,6 +183,53 @@ pub struct KvQuantConfig {
 
 Quantize on write (when appending to cache), dequantize on read (when feeding to attention). Sensitive layers bypass quantization.
 
+#### 3.2.5 Heterogeneous Head Dimensions
+
+Modern models (e.g. Gemma 4) break the assumption that all layers share the same KV head configuration.
+Different layer types use different `head_dim` and `num_kv_heads`:
+
+| Layer type | head_dim | GQA ratio (Q:KV) | KV bytes/token/head (bf16) |
+|---|---|---|---|
+| Sliding window | 256 | moderate | 1024 |
+| Global attention | 512 | 8:1 (aggressive) | 2048 |
+
+The global layers use a higher GQA ratio to compensate for caching the full sequence,
+while sliding window layers only cache a local window and can afford more KV heads.
+
+**Impact on page design:**
+
+The current `Page` struct assumes uniform `[num_heads, page_size, head_dim]` across all layers.
+With heterogeneous heads, we need per-layer-group configuration:
+
+```rust
+/// KV shape configuration for a group of layers that share the same head layout.
+pub struct LayerKvConfig {
+    pub head_dim: usize,
+    pub num_kv_heads: usize,
+    /// Which layer indices use this config
+    pub layer_indices: Vec<usize>,
+    /// Page size in tokens — may differ per group to align memory
+    pub page_size: usize,
+}
+
+/// Model-level KV configuration, parsed from model config / inference metadata.
+pub struct ModelKvConfig {
+    pub layer_groups: Vec<LayerKvConfig>,
+}
+```
+
+**Consequences:**
+
+- **Page pools are per-group, not global.** Each `LayerKvConfig` gets its own free list and page size,
+  since pages for 256-dim heads and 512-dim heads are different sizes and not interchangeable.
+- **Memory budgeting must account for the mix.** A model with 10 sliding + 50 global layers
+  has asymmetric memory per token: `10 × 1024 + 50 × 2048` bytes (bf16, per KV head).
+- **Block size alignment.** vLLM solves this by giving different `block_size` to each attention type
+  so that physical pages are the same byte size. We should support the same strategy:
+  e.g. `block_size=32` for 256-dim heads, `block_size=16` for 512-dim heads → both ~16 KB per page.
+- **Prefix cache keys remain token-based** and are unaffected — heterogeneity is a storage concern,
+  not a matching concern.
+
 ### 3.3 Prefix Cache
 
 **Responsibility:** Detect and share common prefixes across sequences to avoid redundant computation.
