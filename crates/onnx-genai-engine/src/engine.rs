@@ -55,8 +55,6 @@ pub struct Engine {
     pub(crate) scheduler: Scheduler,
     /// Persistent multi-turn session state, keyed by session id.
     pub(crate) sessions: HashMap<SessionId, EngineSession>,
-    /// ORT environment kept alive for the session.
-    pub(crate) _environment: Environment,
     /// ORT session for decoder execution.
     pub(crate) session: Box<Session>,
     /// Optional draft model used by the speculative decoding path.
@@ -77,6 +75,12 @@ pub struct Engine {
     pub(crate) speculative_mode: SpeculativeMode,
     /// Diagnostics from the most recent generation call.
     pub(crate) last_speculative_stats: SpeculativeStats,
+    /// ORT environment — MUST be the LAST field so it (and the plugin EP factory it owns via
+    /// RegisterExecutionProviderLibrary) drops AFTER every Session/draft/mtp/eagle3 field above.
+    /// Rust drops struct fields in declaration order; if the env dropped first, ORT would tear down
+    /// the plugin EP factory before the sessions, causing a teardown use-after-free (segfault) in
+    /// the Metal/MLX plugin EP's allocator/data-transfer/context release path.
+    pub(crate) _environment: Environment,
 }
 
 pub(crate) struct MtpModel {
