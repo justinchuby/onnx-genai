@@ -11,7 +11,7 @@ _Last updated: 2026-07-13_
 | § | Feature | Status | Notes |
 |---|---------|--------|-------|
 | 1–8 | Vision, architecture, core components, data flow, concurrency, model dir, crates, deps | ✅ Done | |
-| 9 | API surface | 🟡 Partial | chat/completions/models/sessions/status/metrics/audio/embeddings(#7 scaffold)/logprobs(#8) ✅; `/v1/debug/*` (#13) pending |
+| 9 | API surface | 🟡 Partial | chat/completions/models/sessions/status/metrics/audio/embeddings(#7 scaffold)/logprobs(#8) ✅; `/v1/debug/*` (config/sessions/kv/trace) ✅; Perfetto/OTLP export (#13) deferred |
 | 11,12,15 | Testing, design decisions | ✅ Done | coverage ~77% |
 | 16 | Quantized models | ✅ Done | EP select + int8 KV; fp8 KV = #15 |
 | 17 | Diffusion pipeline (image) | ❌ Missing | #16 |
@@ -26,11 +26,11 @@ _Last updated: 2026-07-13_
 | 27 | Multi-token speculative | ✅ Done | draft + prompt-lookup + MTP + EAGLE-3 |
 | 28 | vLLM speculator compat | ✅ Done | config auto-discovery + EAGLE-3 proposer |
 | 29 | Language diffusion | ❌ Missing | large |
-| 31 | Observability | 🟡 Partial | `/metrics` + `/v1/status` + trace ids ✅; Perfetto/OTLP/debug = #13 |
+| 31 | Observability | 🟡 Partial | `/metrics` + `/v1/status` + trace ids + `/v1/debug/*` ✅; Perfetto/OTLP export (feature-gated stub) = #13 |
 | 32 | Metrics API | ✅ Done | |
 | 34 | Cluster/session router | ❌ Missing | |
 | 35 | Native preprocessing | ✅ Done | `onnx-genai-preprocess`: image (bicubic/CLIP + tiling none/fixed_grid/dynamic_anyres) + audio log-mel; audio wired (#12). Multi-tile prompt token-expansion = documented follow-up |
-| 36 | Backpressure/lifecycle | 🟡 Partial | admission cap + 429 ✅; queue-depth config pending |
+| 36 | Backpressure/lifecycle | ✅ Done | admission cap + 429 ✅; configurable `max_queue_depth` (CLI/env) + 429 Retry-After ✅ |
 | 37 | Model lifecycle mgmt | ❌ Missing | single model at startup; #9 |
 | 38 | Distributed KV connector | ❌ Missing | local tiered KV only |
 | 39 | Paged/radix attention | 🟡 Upstream | Mobius block-table KV graph (Option C, std ops) = draft PR onnxruntime/mobius#395; runtime wiring pending |
