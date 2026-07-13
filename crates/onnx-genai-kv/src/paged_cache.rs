@@ -351,6 +351,32 @@ impl PagedKvCache {
         } else {
             // First activation: window pages currently begin right after the
             // soon-to-be-pinned sink pages.
+            //
+            // Validate the first-activation invariant (debug builds only):
+            //  1. The sequence must already hold at least `sink_pages` allocated
+            //     pages so the sink prefix can be pinned without additional
+            //     allocation.
+            //  2. The candidate window start must not regress into the sink
+            //     region (already guaranteed by the `keep_from <= sink_len_target`
+            //     guard above, but made explicit here for auditing).
+            let page_count = self
+                .page_table
+                .get_sequence(seq)
+                .map_or(0, |p| p.len());
+            debug_assert!(
+                page_count >= sink_pages,
+                "SWA sink first-activation: sequence has only {page_count} page(s) \
+                 but sink_tokens={sink_tokens} requires {sink_pages} sink page(s) \
+                 (page_size={page_size}); the sequence must have advanced past the \
+                 sink boundary before sinks can activate"
+            );
+            debug_assert!(
+                keep_from >= sink_len_target,
+                "SWA sink first-activation: window keep_from ({keep_from}) precedes \
+                 the pinned sink boundary ({sink_len_target}); this case must be \
+                 caught by the no-gap guard above \
+                 (sink_tokens={sink_tokens}, page_size={page_size})"
+            );
             sink_len_target
         };
         let new_window_start = (keep_from / page_size) * page_size;
@@ -585,8 +611,12 @@ impl PagedKvCache {
 impl KvCacheOps for PagedKvCache {
     fn rewind_to(&mut self, seq: SequenceId, position: usize) -> Result<(), KvError> {
         let retained_start = self.retained_start(seq)?;
+        let sink = self.sink_len(seq)?;
         let length = self.len(seq)?;
-        if position < retained_start {
+        // Positions in the pinned sink prefix [0, sink) are physically retained
+        // and are valid rewind targets. Only the evicted gap
+        // [sink, retained_start) must be rejected.
+        if position < retained_start && (sink == 0 || position >= sink) {
             return Err(KvError::PositionEvicted {
                 position,
                 retained_start,
@@ -621,6 +651,14 @@ impl KvCacheOps for PagedKvCache {
             }
         }
         self.page_table.set_sequence_len(seq, position);
+
+        // Rewinding into the pinned sink prefix discards the entire window and
+        // any remaining sink pages beyond `position`. Reset gap bookkeeping so
+        // the truncated sequence is treated as a plain contiguous prefix.
+        if position < sink {
+            self.page_table.set_sequence_sink_len(seq, 0);
+            self.page_table.set_sequence_start(seq, 0);
+        }
 
         Ok(())
     }
@@ -968,6 +1006,61 @@ mod tests {
             cache.rewind_to(seq, 5),
             Err(KvError::PositionEvicted { position: 5, .. })
         ));
+    }
+
+    #[test]
+    fn rewind_into_sink_discards_window_and_resets_gap_bookkeeping() {
+        // page_size=2; sink_tokens=2 (1 pinned sink page); window=3.
+        // After sinks activate the retained set is [0,2) ∪ [keep_from, len).
+        // Rewinding to a position inside the sink prefix (<2) must:
+        //   - discard all window pages,
+        //   - truncate the sink pages to what is needed,
+        //   - reset sink_len and retained_start to 0 (plain contiguous prefix).
+        let mut cache = PagedKvCache::new_with_tensor_config(config(), 16);
+        let seq = cache.create_sequence();
+        for position in 0..10 {
+            let token = layers(position as f32 * 1000.0);
+            cache
+                .append_token_kv(seq, &borrowed_layers(&token))
+                .unwrap();
+        }
+        // len=10, keep_from=7 → sinks=[0,2), window=[8,10) (page-aligned).
+        cache.apply_sliding_window_with_sinks(seq, 3, 2).unwrap();
+        assert_eq!(cache.page_table.sequence_sink_len(seq), Some(2));
+        let retained_start = cache.retained_start(seq).unwrap();
+        assert!(retained_start > 2, "gap must be open for the test to be meaningful");
+
+        // Positions in the evicted gap are still rejected.
+        assert!(matches!(
+            cache.rewind_to(seq, 4),
+            Err(KvError::PositionEvicted { position: 4, .. })
+        ));
+
+        // Rewind to position 1 (inside sink prefix).
+        cache.rewind_to(seq, 1).unwrap();
+        // Length is now 1.
+        assert_eq!(cache.len(seq).unwrap(), 1);
+        // sink_len and retained_start reset: no gap, plain contiguous prefix.
+        assert_eq!(cache.page_table.sequence_sink_len(seq), Some(0));
+        assert_eq!(cache.retained_start(seq).unwrap(), 0);
+        // Only the first page (which covers positions 0 and 1) remains; the
+        // window pages were freed.
+        assert_eq!(cache.page_table.get_sequence(seq).unwrap().len(), 1);
+        // Materialized buffer holds exactly token 0.
+        let m = cache.materialize_sequence(seq).unwrap();
+        assert_eq!(m.sink_len, 0);
+        assert_eq!(m.start_position, 0);
+        assert_eq!(m.sequence_len, 1);
+        assert_materialized_order(&cache, seq, &[0.0]);
+
+        // After rewind the sequence is usable as a normal contiguous prefix:
+        // appending a token and materializing produces two tokens.
+        let token = layers(99000.0);
+        cache
+            .append_token_kv(seq, &borrowed_layers(&token))
+            .unwrap();
+        assert_eq!(cache.len(seq).unwrap(), 2);
+        assert_materialized_order(&cache, seq, &[0.0, 99000.0]);
     }
 
     #[test]

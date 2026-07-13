@@ -198,6 +198,17 @@ impl Engine {
             )
             .map_err(|e| anyhow::anyhow!("Failed to load draft ORT session: {}", e))?;
             let draft_decode_path =
+                // Draft models are loaded with sliding_window=None and sink_tokens=0:
+                // draft architectures are typically distinct from the target (e.g. a
+                // smaller model with a full KV cache) and declare their own attention
+                // constraints through their own inference metadata. Even if the target
+                // uses SWA + attention sinks (sink_tokens > 0), propagating the
+                // target's sink_tokens to the draft would be a silent no-op — all
+                // sink/window management is gated on `sliding_window.is_some()`, which
+                // is None here — and it would mask a future bug if a windowed draft
+                // path were introduced without explicitly loading draft metadata.
+                // If a draft model needs its own SWA + sinks, load its
+                // inference_metadata.yaml and pass the values from there.
                 detect_model_decode_path(&draft_session, metadata_max_context, None, None, 0)?;
             let draft_kv_model = infer_kv_model_info(&draft_session, config.page_size, onnx_genai_kv::KvDType::F32)?;
             let draft_kv_cache = if let Some(kv_model) = &draft_kv_model {
