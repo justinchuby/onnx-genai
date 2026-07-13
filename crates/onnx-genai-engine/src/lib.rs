@@ -9,6 +9,7 @@
 
 pub(crate) mod batched;
 pub mod config;
+pub(crate) mod connector_bridge;
 pub(crate) mod decode;
 pub(crate) mod decode_loop;
 pub mod embedding;
@@ -27,11 +28,13 @@ pub use embedding::{EmbeddingOptions, EmbeddingPooling};
 pub use engine::{
     Eagle3Config, Engine, EngineConfig, FinishReason, GenerateConstraint,
     GenerateOptions, GeneratePrompt, GenerateRequest, GenerateResult, GenerateToken,
-    GenerateTokenCallback, MtpConfig, PrioritizedGenerateRequest, PrioritizedGenerateResult,
+    GenerateTokenCallback, KvConnectorBackend, KvConnectorConfig, MtpConfig,
+    PrioritizedGenerateRequest, PrioritizedGenerateResult,
     ScheduledGenerateArrival, SessionId, SharedKvBinding, SharedKvProposerConfig, SpeculativeMode,
     TokenLogprob,
 };
-pub use onnx_genai_kv::KvDType;
+pub use connector_bridge::{ConnectorLookupOutcome, ConnectorStats};
+pub use onnx_genai_kv::{CachePriority, KvDType, LocalTieredConfig};
 pub use fim::{FimConfig, FimFormat};
 pub use logits::{
     Constraint, ConstraintProcessor, JsonConstraint, LogitProcessor, ProcessorChain,

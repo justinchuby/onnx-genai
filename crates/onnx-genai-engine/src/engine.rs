@@ -1,6 +1,7 @@
 //! Main generation engine.
 
 use crate::FimConfig;
+use crate::connector_bridge::ConnectorBridge;
 use crate::decode::{
     DecodeState, ModelDecodePath, detect_model_decode_path, next_session_token_logits,
 };
@@ -19,7 +20,7 @@ use crate::processors::{
 use crate::sampling::SamplingRng;
 use crate::session::{ActiveGenerate, DraftModel, DraftSession, EngineSession};
 use anyhow::Context;
-use onnx_genai_kv::{KvCacheOps, PagedKvCache, PrefixCache};
+use onnx_genai_kv::{KvCacheOps, LocalTieredConnector, PagedKvCache, PrefixCache};
 use onnx_genai_metadata::InferenceMetadata;
 use onnx_genai_ort::{
     DataType, Eagle3DecodeSession, Environment, SharedKvProposerSession, ModelDirectory,
@@ -28,13 +29,16 @@ use onnx_genai_ort::{
 use onnx_genai_scheduler::{Priority, Scheduler};
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 
 pub use crate::config::{
-    Eagle3Config, EngineConfig, FinishReason, SharedKvProposerConfig, GenerateConstraint,
+    Eagle3Config, EngineConfig, FinishReason, KvConnectorBackend, KvConnectorConfig,
+    SharedKvProposerConfig, GenerateConstraint,
     GenerateOptions, GeneratePrompt, GenerateRequest, GenerateResult, GenerateToken,
     GenerateTokenCallback, MtpConfig, PrioritizedGenerateRequest, PrioritizedGenerateResult,
     ScheduledGenerateArrival, SessionId, SharedKvBinding, SpeculativeMode, TokenLogprob,
 };
+pub use crate::connector_bridge::{ConnectorLookupOutcome, ConnectorStats};
 use crate::speculative::{LinearEmbedder, LinearLmHead, SpeculativeStats};
 
 /// The generation engine.
@@ -75,6 +79,9 @@ pub struct Engine {
     pub(crate) speculative_mode: SpeculativeMode,
     /// Diagnostics from the most recent generation call.
     pub(crate) last_speculative_stats: SpeculativeStats,
+    /// Optional distributed KV connector bridge (DESIGN §38, K3). Inert when
+    /// configured as `Null` (the default), preserving in-process-only behavior.
+    pub(crate) connector: ConnectorBridge,
     /// ORT environment — MUST be the LAST field so it (and the plugin EP factory it owns via
     /// RegisterExecutionProviderLibrary) drops AFTER every Session/draft/mtp/eagle3 field above.
     /// Rust drops struct fields in declaration order; if the env dropped first, ORT would tear down
@@ -475,6 +482,12 @@ impl Engine {
             None
         };
 
+        let connector = build_connector_bridge(
+            &config.kv_connector,
+            &model_directory,
+            kv_model.as_ref(),
+        )?;
+
         Ok(Self {
             metadata,
             kv_cache,
@@ -495,6 +508,7 @@ impl Engine {
             num_speculative_tokens: config.num_speculative_tokens.max(1),
             speculative_mode,
             last_speculative_stats: SpeculativeStats::default(),
+            connector,
         })
     }
 
@@ -507,6 +521,15 @@ impl Engine {
     /// Speculative verification diagnostics from the most recent generation.
     pub fn last_speculative_stats(&self) -> SpeculativeStats {
         self.last_speculative_stats
+    }
+
+    /// External KV connector activity from the most recent generation.
+    ///
+    /// Reflects lookups, would-be prefix extensions (materialization deferred in
+    /// K3), and chunk stores. Returns [`ConnectorStats::default`] when no
+    /// connector is configured.
+    pub fn last_connector_stats(&self) -> ConnectorStats {
+        self.connector.stats().clone()
     }
 
     /// Generate the middle text for a fill-in-the-middle request.
@@ -955,6 +978,9 @@ impl Engine {
         state: &mut EngineSession,
         prompt_tokens: &[TokenId],
     ) -> anyhow::Result<usize> {
+        if self.connector.is_active() {
+            self.connector.reset_stats();
+        }
         let same_session_hit_len = if state.decode_state.has_runner() {
             state.decode_state.runner_len().min(state.tokens.len())
         } else if state.decode_state.use_kv {
@@ -1036,7 +1062,18 @@ impl Engine {
         } else {
             state.tokens.extend_from_slice(prompt_tokens);
         }
-        Ok(same_session_hit_len.max(cross_session_hit_len))
+        let in_process_hit = same_session_hit_len.max(cross_session_hit_len);
+
+        // K3: consult the external connector for prefix reuse *beyond* the
+        // in-process hit. This currently reports the opportunity (and drives the
+        // fetch-vs-recompute decision) but does not shorten prefill, because
+        // materializing fetched KV into the paged cache is deferred (see
+        // `ConnectorBridge::lookup_extension`). Returning `in_process_hit`
+        // unchanged keeps generation output exactly correct.
+        if self.connector.is_active() {
+            let _ = self.connector.lookup_extension(prompt_tokens, in_process_hit);
+        }
+        Ok(in_process_hit)
     }
 
     fn prepare_active_generate(
@@ -1184,6 +1221,14 @@ impl Engine {
         state: &EngineSession,
         prompt_len: usize,
     ) -> anyhow::Result<()> {
+        // K3: push the freshly computed, resident KV chunks to the external
+        // connector for future cross-session / cross-node reuse. This is
+        // independent of the in-process caches below and is a no-op for the
+        // default `Null` connector.
+        if self.connector.is_active() {
+            self.connector
+                .store_prefix(&state.tokens, state.kv_token_count);
+        }
         if state.decode_state.uses_token_prefix_cache() {
             if prompt_len > 0 && prompt_len <= state.kv_token_count {
                 self.insert_token_prefix(&state.tokens[..prompt_len]);
@@ -1370,6 +1415,56 @@ fn detect_target_hidden_output(session: &Session, hidden_size: usize) -> Option<
                     == Some(hidden_size as i64)
         })
         .map(|output| output.name.clone())
+}
+
+/// Stable, opaque model identity derived from the model directory name.
+///
+/// Used only to namespace connector cache keys when the caller does not supply
+/// an explicit `model_id`. It is never interpreted or branched on.
+fn default_connector_model_id(model_directory: &ModelDirectory) -> String {
+    model_directory
+        .root
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "onnx-genai-model".to_string())
+}
+
+/// Build the engine's KV connector bridge from generic, model-agnostic config.
+fn build_connector_bridge(
+    config: &KvConnectorConfig,
+    model_directory: &ModelDirectory,
+    kv_model: Option<&KvModelInfo>,
+) -> anyhow::Result<ConnectorBridge> {
+    match &config.backend {
+        KvConnectorBackend::Null => Ok(ConnectorBridge::null()),
+        KvConnectorBackend::LocalTiered(local_config) => {
+            let connector = LocalTieredConnector::new(local_config.clone()).map_err(|error| {
+                anyhow::anyhow!("failed to build LocalTiered KV connector: {error}")
+            })?;
+            let model_id = config
+                .model_id
+                .clone()
+                .unwrap_or_else(|| default_connector_model_id(model_directory));
+            let chunk_size = if config.chunk_size == 0 {
+                onnx_genai_kv::DEFAULT_CHUNK_SIZE
+            } else {
+                config.chunk_size
+            };
+            let num_layers = kv_model
+                .map(|model| model.tensor_config.num_layers)
+                .unwrap_or(1)
+                .max(1);
+            ConnectorBridge::new(
+                Arc::new(connector),
+                model_id,
+                chunk_size,
+                0..num_layers,
+                config.store_priority,
+                config.recompute_ms_per_token,
+            )
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1867,6 +1962,111 @@ mod tests {
             engine.generate_fim("fn add(a: i32, b: i32) -> i32 {\n    ", "\n}", options)?;
 
         assert!(!result.token_ids.is_empty());
+        Ok(())
+    }
+
+    fn local_tiered_engine_config(chunk_size: usize) -> EngineConfig {
+        EngineConfig {
+            kv_connector: KvConnectorConfig {
+                backend: KvConnectorBackend::LocalTiered(onnx_genai_kv::LocalTieredConfig {
+                    chunk_size,
+                    page_size: chunk_size,
+                    ..onnx_genai_kv::LocalTieredConfig::default()
+                }),
+                chunk_size,
+                ..KvConnectorConfig::default()
+            },
+            ..EngineConfig::default()
+        }
+    }
+
+    #[test]
+    fn null_connector_default_leaves_behavior_unchanged() -> anyhow::Result<()> {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/tiny-llm")
+            .canonicalize()?;
+        let mut baseline = Engine::from_dir(&fixture, EngineConfig::default())?;
+        assert!(!baseline.connector.is_active());
+
+        let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(vec![2, 4, 3, 5, 6, 7, 8, 9]));
+        request.options.max_new_tokens = 3;
+        request.options.temperature = 0.0;
+        request.options.stop_on_eos = false;
+
+        let result = baseline.generate(request)?;
+        // With the default Null connector, no external activity happens at all.
+        assert_eq!(baseline.last_connector_stats(), ConnectorStats::default());
+        assert_eq!(result.token_ids.len(), 3);
+        Ok(())
+    }
+
+    #[test]
+    fn local_tiered_connector_stores_prefill_chunks() -> anyhow::Result<()> {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/tiny-llm")
+            .canonicalize()?;
+        let mut engine = Engine::from_dir(&fixture, local_tiered_engine_config(2))?;
+        assert!(engine.connector.is_active());
+
+        let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(vec![2, 4, 3, 5, 6, 7, 8, 9]));
+        request.options.max_new_tokens = 3;
+        request.options.temperature = 0.0;
+        request.options.stop_on_eos = false;
+
+        let baseline_ids = {
+            let mut baseline = Engine::from_dir(&fixture, EngineConfig::default())?;
+            baseline.generate(request.clone())?.token_ids
+        };
+
+        let result = engine.generate(request)?;
+
+        // Store-after-prefill ran: complete chunks were pushed to the connector.
+        assert!(
+            engine.last_connector_stats().stores > 0,
+            "expected connector store path to push chunks, got {:?}",
+            engine.last_connector_stats()
+        );
+        // The connector must not perturb generated output (materialization is
+        // deferred; the store path is a pure side effect).
+        assert_eq!(result.token_ids, baseline_ids);
+        Ok(())
+    }
+
+    #[test]
+    fn local_tiered_connector_reports_would_be_prefix_extension() -> anyhow::Result<()> {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/tiny-llm")
+            .canonicalize()?;
+        let mut engine = Engine::from_dir(&fixture, local_tiered_engine_config(2))?;
+
+        // First request populates the connector with the prompt's KV chunks.
+        let mut warm = GenerateRequest::new(GeneratePrompt::TokenIds(vec![10, 11, 12, 13, 14, 15]));
+        warm.options.max_new_tokens = 1;
+        warm.options.temperature = 0.0;
+        warm.options.stop_on_eos = false;
+        engine.generate(warm)?;
+        assert!(engine.last_connector_stats().stores > 0);
+
+        // Drop the in-process token-prefix cache so the connector is the only
+        // source of cross-session reuse, isolating the connector lookup path.
+        engine.token_prefix_cache.clear();
+        engine.prefix_cache = PrefixCache::new();
+
+        let mut reuse = GenerateRequest::new(GeneratePrompt::TokenIds(vec![10, 11, 12, 13, 14, 15]));
+        reuse.options.max_new_tokens = 1;
+        reuse.options.temperature = 0.0;
+        reuse.options.stop_on_eos = false;
+        engine.generate(reuse)?;
+
+        let stats = engine.last_connector_stats();
+        // The connector recognized the previously stored chunks as reusable.
+        assert!(
+            stats.would_extend_tokens > 0 && stats.chunk_hits > 0,
+            "expected connector to report a would-be extension, got {stats:?}"
+        );
+        // Materialization is deferred in K3: nothing is actually fetched, so
+        // prefill is not shortened and correctness is preserved.
+        assert_eq!(stats.fetched_tokens, 0);
         Ok(())
     }
 }

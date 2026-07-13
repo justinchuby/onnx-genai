@@ -1,7 +1,7 @@
 //! Public generation API types and configuration.
 
 use crate::logits::{StopSequence, TokenId};
-use onnx_genai_kv::{KvDType, SequenceId};
+use onnx_genai_kv::{CachePriority, DEFAULT_CHUNK_SIZE, KvDType, LocalTieredConfig, SequenceId};
 use onnx_genai_ort::{Eagle3DraftKvMode, MtpDraftKvMode};
 use onnx_genai_scheduler::{Priority, SchedulerConfig};
 use std::path::PathBuf;
@@ -117,6 +117,54 @@ pub enum SpeculativeMode {
 /// Identifier for a persistent generation session.
 pub type SessionId = SequenceId;
 
+/// Distributed KV connector backend selection (DESIGN §38, K3).
+///
+/// Model-agnostic by construction: a backend carries only its own generic
+/// settings, never per-model branches. `Null` is the default and reproduces the
+/// engine's in-process-only prefix reuse exactly.
+#[derive(Debug, Clone, Default)]
+pub enum KvConnectorBackend {
+    /// No external connector: KV lives only in the local paged cache.
+    #[default]
+    Null,
+    /// Single-node tiered (GPU→CPU, optional disk) connector.
+    LocalTiered(LocalTieredConfig),
+}
+
+/// Generic configuration for wiring a [`KvCacheConnector`](onnx_genai_kv::KvCacheConnector)
+/// into the engine (DESIGN §38, K3).
+///
+/// Every field is a backend-neutral parameter. `model_id` only namespaces cache
+/// keys (opaque; never interpreted); when `None` the engine derives a stable id
+/// from the model directory.
+#[derive(Debug, Clone)]
+pub struct KvConnectorConfig {
+    /// Which connector backend to use. Defaults to [`KvConnectorBackend::Null`].
+    pub backend: KvConnectorBackend,
+    /// Opaque model identity used to namespace cache keys. `None` => derived
+    /// from the model directory name.
+    pub model_id: Option<String>,
+    /// Tokens per cached chunk for keying. `0` => [`DEFAULT_CHUNK_SIZE`].
+    pub chunk_size: usize,
+    /// Priority applied to chunks stored to the connector.
+    pub store_priority: CachePriority,
+    /// Estimated prefill recompute cost per token (ms), used as the
+    /// fetch-vs-recompute baseline against a location's `estimated_load_ms`.
+    pub recompute_ms_per_token: f64,
+}
+
+impl Default for KvConnectorConfig {
+    fn default() -> Self {
+        Self {
+            backend: KvConnectorBackend::Null,
+            model_id: None,
+            chunk_size: DEFAULT_CHUNK_SIZE,
+            store_priority: CachePriority::Session,
+            recompute_ms_per_token: 0.05,
+        }
+    }
+}
+
 /// Engine configuration.
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
@@ -140,6 +188,9 @@ pub struct EngineConfig {
     /// Float16) is independent of this setting; the cache quantises/
     /// dequantises internally.  Defaults to `KvDType::F32` (no quantisation).
     pub kv_cache_dtype: KvDType,
+    /// Optional distributed KV connector (DESIGN §38). Defaults to
+    /// [`KvConnectorBackend::Null`], which preserves in-process-only behavior.
+    pub kv_connector: KvConnectorConfig,
 }
 
 impl Default for EngineConfig {
@@ -152,6 +203,7 @@ impl Default for EngineConfig {
             num_speculative_tokens: 4,
             speculative_mode: SpeculativeMode::None,
             kv_cache_dtype: KvDType::F32,
+            kv_connector: KvConnectorConfig::default(),
         }
     }
 }
