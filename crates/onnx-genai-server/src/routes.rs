@@ -14,7 +14,7 @@ use onnx_genai::{
     FinishReason, GenerateOptions, GeneratePrompt, GenerateRequest, GenerateResult, SessionId,
     StopSequence,
 };
-use onnx_genai_engine::{GenerateConstraint, TokenLogprob};
+use onnx_genai_engine::{EmbeddingOptions, GenerateConstraint, TokenLogprob};
 use onnx_genai_ort::{ChatMessage as TemplateChatMessage, ChatTemplate, Tokenizer};
 use serde::Serialize;
 use tokio::sync::mpsc;
@@ -31,9 +31,9 @@ use crate::{
         AudioTranscriptionResponse, ChatChoice, ChatCompletionRequest, ChatCompletionResponse,
         ChatLogprobs, ChatMessage, ChatMessageContent, ChatMessageToolCall,
         ChatMessageToolCallFunction, ChatTokenLogprob, ChatTool, ChatTopLogprob, CompletionChoice,
-        CompletionLogprobs, CompletionRequest, CompletionResponse, EmbeddingInput,
-        EmbeddingRequest, EmbeddingResponse, InputAudio, StopInput, ToolChoice, ToolChoiceMode,
-        Usage,
+        CompletionLogprobs, CompletionRequest, CompletionResponse, EmbeddingData, EmbeddingInput,
+        EmbeddingRequest, EmbeddingResponse, EmbeddingUsage, EmbeddingVector, InputAudio,
+        StopInput, ToolChoice, ToolChoiceMode, Usage,
     },
 };
 
@@ -190,14 +190,6 @@ impl ApiError {
             status: StatusCode::TOO_MANY_REQUESTS,
             message: message.into(),
             retry_after_secs: Some(OVERLOAD_RETRY_AFTER_SECS),
-        }
-    }
-
-    fn not_implemented(message: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::NOT_IMPLEMENTED,
-            message: message.into(),
-            retry_after_secs: None,
         }
     }
 }
@@ -417,11 +409,54 @@ pub(crate) async fn embeddings(
 ) -> Result<Json<EmbeddingResponse>, ApiError> {
     validate_embedding_request(&request, &state.tokenizer)?;
 
-    Err(ApiError::not_implemented(format!(
-        "model '{}' cannot produce embeddings: onnx-genai-engine does not yet expose a \
-         single-pass hidden-state or pooled-output API",
-        state.model_id
-    )))
+    let encoding_format = request.encoding_format;
+    let model = request.model.clone();
+
+    let inputs: Vec<Vec<u32>> = match request.input {
+        EmbeddingInput::String(text) => {
+            let tokens = state.tokenizer.encode(&text).map_err(|err| {
+                ApiError::internal(format!("input tokenization failed: {err}"))
+            })?;
+            vec![tokens]
+        }
+        EmbeddingInput::Strings(texts) => {
+            let mut all = Vec::with_capacity(texts.len());
+            for text in &texts {
+                let tokens = state.tokenizer.encode(text).map_err(|err| {
+                    ApiError::internal(format!("input tokenization failed: {err}"))
+                })?;
+                all.push(tokens);
+            }
+            all
+        }
+        EmbeddingInput::TokenArrays(arrays) => arrays,
+    };
+
+    let total_tokens: usize = inputs.iter().map(|ids| ids.len()).sum();
+
+    let mut data = Vec::with_capacity(inputs.len());
+    for (index, input_ids) in inputs.into_iter().enumerate() {
+        let vector = state
+            .engine
+            .embed(input_ids, EmbeddingOptions::default())
+            .await
+            .map_err(|err| ApiError::internal(format!("embedding failed: {err}")))?;
+        data.push(EmbeddingData {
+            object: "embedding",
+            embedding: EmbeddingVector::from_floats(vector, encoding_format),
+            index,
+        });
+    }
+
+    Ok(Json(EmbeddingResponse {
+        object: "list",
+        data,
+        model,
+        usage: EmbeddingUsage {
+            prompt_tokens: total_tokens,
+            total_tokens,
+        },
+    }))
 }
 
 pub(crate) async fn audio_transcriptions(

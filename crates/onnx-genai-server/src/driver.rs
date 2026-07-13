@@ -2,10 +2,10 @@ use std::{collections::HashMap, sync::Arc, thread};
 
 use anyhow::Context;
 use onnx_genai::{
-    Engine, GenerateOptions, GenerateRequest, GenerateResult, GenerateToken, SessionId,
+    Engine, GenerateOptions, GenerateRequest, GenerateResult, GenerateToken, SessionId, TokenId,
 };
 use onnx_genai_engine::{
-    ContinuousBatchEvent, ContinuousBatchManager, FimConfig, PipelineEngine,
+    ContinuousBatchEvent, ContinuousBatchManager, EmbeddingOptions, FimConfig, PipelineEngine,
     PipelineGenerateRequest,
 };
 use onnx_genai_ort::Value;
@@ -60,6 +60,11 @@ pub(crate) enum DriverCommand {
         options: Box<GenerateOptions>,
         events: mpsc::Sender<DriverEvent>,
         permit: OwnedSemaphorePermit,
+    },
+    Embed {
+        input_ids: Vec<TokenId>,
+        options: EmbeddingOptions,
+        reply: tokio::sync::oneshot::Sender<anyhow::Result<Vec<f32>>>,
     },
 }
 
@@ -249,6 +254,24 @@ impl EngineDriver {
         }
         Ok(rx)
     }
+
+    pub(crate) async fn embed(
+        &self,
+        input_ids: Vec<TokenId>,
+        options: EmbeddingOptions,
+    ) -> anyhow::Result<Vec<f32>> {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        self.commands
+            .send(DriverCommand::Embed {
+                input_ids,
+                options,
+                reply,
+            })
+            .await
+            .map_err(|_| anyhow::anyhow!("engine driver stopped"))?;
+        rx.await
+            .map_err(|_| anyhow::anyhow!("engine driver stopped"))?
+    }
 }
 
 fn run_engine_driver(owner: EngineOwner, rx: mpsc::Receiver<DriverCommand>, max_batch: usize) {
@@ -298,6 +321,11 @@ fn run_pipeline_driver(engine: &mut PipelineEngine, mut rx: mpsc::Receiver<Drive
                 let _ = events.try_send(DriverEvent::Error(
                     "invalid generation route for pipeline model".to_string(),
                 ));
+            }
+            DriverCommand::Embed { reply, .. } => {
+                let _ = reply.send(Err(anyhow::anyhow!(
+                    "embeddings are not supported by pipeline models"
+                )));
             }
         }
     }
@@ -519,6 +547,13 @@ fn handle_driver_command(engine: &mut Engine, command: DriverCommand) {
             let _ = events.try_send(DriverEvent::Error(
                 "invalid pipeline generation route for single model".to_string(),
             ));
+        }
+        DriverCommand::Embed {
+            input_ids,
+            options,
+            reply,
+        } => {
+            let _ = reply.send(engine.embed_with_options(&input_ids, options));
         }
     }
 }

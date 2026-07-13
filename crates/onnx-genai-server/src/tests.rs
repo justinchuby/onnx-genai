@@ -510,7 +510,7 @@ fn embedding_response_serializes_float_and_base64_vectors() {
 }
 
 #[tokio::test]
-async fn embeddings_validate_input_then_report_engine_api_gap() {
+async fn embeddings_valid_inputs_fail_on_logits_only_model() {
     let router = app(tiny_state());
     for input in [
         json!("hello"),
@@ -537,14 +537,16 @@ async fn embeddings_validate_input_then_report_engine_api_gap() {
             .await
             .unwrap();
 
-        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+        // tiny-llm is a logits-only model; the engine rejects embedding requests
+        // with a descriptive error rather than NOT_IMPLEMENTED.
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let body: Value = serde_json::from_slice(&body).unwrap();
         assert!(
             body["error"]["message"]
                 .as_str()
                 .unwrap()
-                .contains("single-pass hidden-state or pooled-output API"),
+                .contains("hidden-state output"),
             "{body}"
         );
     }
@@ -576,6 +578,103 @@ async fn embeddings_validate_input_then_report_engine_api_gap() {
         let body: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body["error"]["message"], message);
     }
+}
+
+#[tokio::test]
+async fn embeddings_success_path_returns_openai_compatible_response() {
+    let model_dir =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-mtp-full");
+    let state = AppState::load(&model_dir, Some("tiny-mtp-full".to_string()))
+        .expect("load tiny-mtp-full fixture");
+    let router = app(state);
+
+    // Single string input → one embedding entry
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/embeddings")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "tiny-mtp-full",
+                        "input": "hello"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+    assert_eq!(body["object"], "list");
+    assert_eq!(body["model"], "tiny-mtp-full");
+    let data = body["data"].as_array().unwrap();
+    assert_eq!(data.len(), 1);
+    assert_eq!(data[0]["object"], "embedding");
+    assert_eq!(data[0]["index"], 0);
+    assert!(data[0]["embedding"].is_array());
+    assert!(!data[0]["embedding"].as_array().unwrap().is_empty());
+    let usage = &body["usage"];
+    assert!(usage["prompt_tokens"].as_u64().unwrap() > 0);
+    assert_eq!(usage["prompt_tokens"], usage["total_tokens"]);
+
+    // Array of strings → one entry per input, indices in order, correct token count
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/embeddings")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "tiny-mtp-full",
+                        "input": ["hello", "world"]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+    let data = body["data"].as_array().unwrap();
+    assert_eq!(data.len(), 2);
+    assert_eq!(data[0]["index"], 0);
+    assert_eq!(data[1]["index"], 1);
+
+    // base64 encoding format → embedding is a string, not an array
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/embeddings")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "tiny-mtp-full",
+                        "input": "hello",
+                        "encoding_format": "base64"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+    assert!(body["data"][0]["embedding"].is_string());
 }
 
 #[tokio::test]
