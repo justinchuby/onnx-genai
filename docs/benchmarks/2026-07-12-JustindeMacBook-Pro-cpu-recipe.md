@@ -118,6 +118,49 @@ The Foundry comparison identifies another decode opportunity: pack Q/K/V into
 one quantized projection, matching its 121-node graph instead of Mobius's 169
 separate quantized matmuls.
 
+## Long-context decode regression: root cause and fix (2026-07-12, Sebastian)
+
+The long-context decode drop (158.6 short → 115.2 long, while LM Studio *rose*
+156 → 160) was **ours**, and it was a **runtime KV-path selection bug**, not a
+model-build defect.
+
+**Root cause — growing KV cache.** The CPU-recipe model is a
+GroupQueryAttention export with a *growing* KV contract: `past_key_values.N`
+is `[batch, 2, past_sequence_len, 64]` and `present.N` is
+`[batch, 2, past_sequence_len + sequence_len, 64]`, fp32 KV, no static-cache
+signature and no `past_present_share_buffer` ORT metadata. Our runtime's
+share-buffer gate (`shared_kv_buffer_len_from_metadata`) only admitted **GQA +
+fp16** KV, so this **GQA + fp32** model fell through to the growing
+`DecodeKvMode::ZeroCopyRebind` path. There, every decode step reallocates a
+`present` of size `past+1` and concatenates the entire past KV into it before
+rebinding it as the next `past` — **O(context) memory traffic per token**, so
+per-token cost scales with context.
+
+**Profiler evidence (decode-only, `long_context_bench`, M1 Max, default
+threads):**
+
+| context depth | growing KV (before) | shared-buffer (after) |
+|---|---:|---:|
+| 1–64 | 5.33 ms/tok (187.6 tok/s) | 4.43 ms/tok (226.0 tok/s) |
+| 859–922 (benchmark long depth) | **8.94 ms/tok (111.9 tok/s)** | **6.33 ms/tok (158.1 tok/s)** |
+
+RSS grew 312→360 MB under the growing path and stayed flat under shared-buffer,
+confirming per-step KV reallocation. The 111.9 tok/s growing-path number
+reproduces the 115.2 tok/s measured here.
+
+**Fix.** `crates/onnx-genai-engine/src/decode.rs` now admits **fp16 *or* fp32**
+GQA KV to the runtime-owned shared-buffer path (the ORT GQA kernel supports
+`past_present_share_buffer` for both). The engine now routes this model to
+`PastPresent { shared_buffer: true, max_len: Some(4096) }` (O(1)/token KV,
+`present.*` aliased onto one max-length `past_key_values.*` buffer). The greedy
+token trace is **bit-identical** to the growing path, and output stays coherent.
+
+**Result:** long-context decode **111.9 → 158.1 tok/s (+41%)**, closing the gap
+to LM Studio (160.2) and near Foundry (165.8); short context also improves
+slightly with no regression. The remaining CPU gap vs Foundry is now prefill/
+TTFT and the 169-vs-121 Q/K/V MatMul packing. See
+`.squad/decisions/inbox/sebastian-long-context.md`.
+
 ## Reproduce
 
 ### Build the CPU recipe
@@ -196,3 +239,23 @@ manager.start_web_service()
   --runtime 'Ollama CPU|http://127.0.0.1:11434/v1|qwen2.5:0.5b-q4-cpu-recipe-bench|exact source GGUF Q4_0|Ollama 0.12.6; num_gpu 0; 100% CPU' \
   --runtime 'Foundry Local CPU|http://127.0.0.1:5273/v1|qwen2.5-0.5b-instruct-generic-cpu|ONNX int4: 121 MatMulNBits acc4; fp32 embedding|Foundry Local SDK 1.2.3; ORT 1.26.0; CPU EP'
 ```
+
+### Reproduce the long-context KV diagnostic
+
+Decode-only per-context-depth timing (growing KV vs shared-buffer), on the same
+`DecodeSession` the engine uses:
+
+```bash
+cargo build --release -p onnx-genai-ort --example long_context_bench
+# growing KV (pre-fix default for fp32 GQA):
+./target/release/examples/long_context_bench \
+  --model models/qwen2.5-0.5b-cpu-recipe --mode past-present \
+  --max-tokens 950 --buckets 64,858,922
+# runtime-owned shared buffer (post-fix path):
+./target/release/examples/long_context_bench \
+  --model models/qwen2.5-0.5b-cpu-recipe --mode shared \
+  --max-tokens 950 --buckets 64,858,922
+```
+
+The `token_trace` line is identical across both modes (correctness), while
+`avg_ms_per_token` in the `859,922` bucket drops from ~8.9 ms to ~6.3 ms.

@@ -722,12 +722,14 @@ pub(crate) fn detect_model_decode_path(
             });
         }
         // Our own `InferenceMetadata` (from `inference_metadata.yaml`) can declare
-        // that the runtime owns a single max-length device-resident KV buffer that
-        // is aliased `present.*` -> `past_key_values.*` across decode steps
-        // (share-buffer) — for example the fp16 GroupQueryAttention WebGPU export.
-        // We honor that here in place of onnxruntime-genai's `genai_config.json`:
-        // the GQA op computes attention on-device while the runtime manages the KV
-        // buffer itself. `shared_kv_max_len` pre-sizes that buffer.
+        // that the runtime owns a single max-length KV buffer that is aliased
+        // `present.*` -> `past_key_values.*` across decode steps (share-buffer) —
+        // for example the fp16 GroupQueryAttention WebGPU export or the fp32
+        // GroupQueryAttention CPU recipe. We honor that here in place of
+        // onnxruntime-genai's `genai_config.json`: the GQA op computes attention
+        // while the runtime manages the KV buffer itself, giving O(1)/token KV
+        // instead of the growing `ZeroCopyRebind` path whose per-token cost
+        // scales with context. `shared_kv_max_len` pre-sizes that buffer.
         if let Some(max_len) = shared_kv_max_len {
             return Ok(ModelDecodePath::PastPresent {
                 shared_buffer: true,
@@ -772,19 +774,24 @@ pub(crate) fn sliding_window_from_metadata(
 /// runtime always owns/manages the KV cache; the GQA op is used only for
 /// on-device attention compute. We infer runtime-owned share-buffer KV from:
 ///   * `model.attention.type` == group-query attention, plus
-///   * an fp16 native KV dtype (`kv_cache.native_dtype` or
-///     `model.runtime_configurable.kv_cache.dtype`), plus
+///   * a group-query-attention (GQA) `model.attention.type`, plus
+///   * a share-buffer-compatible native KV dtype — float16 (WebGPU) or float32
+///     (CPU/CUDA) — via `kv_cache.native_dtype` or
+///     `model.runtime_configurable.kv_cache.dtype`, plus
 ///   * a declared `model.max_sequence_length` (used to pre-size the buffer).
 ///
-/// Non-GQA / fp32 / static-cache / CPU models return `None` and keep their
-/// existing decode paths unchanged.
+/// Non-GQA / static-cache / unsupported-dtype models return `None` and keep
+/// their existing decode paths unchanged. fp32 GQA (the CPU recipe) previously
+/// fell through to the growing `ZeroCopyRebind` path, which reprocessed the KV
+/// each step and made per-token cost scale with context; it now shares one
+/// max-length buffer for O(1)/token KV, matching the fp16 GQA path.
 pub(crate) fn shared_kv_buffer_len_from_metadata(metadata: &InferenceMetadata) -> Option<usize> {
     let model = metadata.model.as_ref()?;
     let attention = model.attention.as_ref()?;
     if !is_group_query_attention(&attention.attention_type) {
         return None;
     }
-    if !metadata_kv_is_fp16(metadata) {
+    if !metadata_kv_is_share_buffer_dtype(metadata) {
         return None;
     }
     model.max_sequence_length
@@ -799,28 +806,32 @@ fn is_group_query_attention(attention_type: &str) -> bool {
     )
 }
 
-/// Whether the model declares an fp16 native KV cache, via either
-/// `kv_cache.native_dtype` or `model.runtime_configurable.kv_cache.dtype`.
-fn metadata_kv_is_fp16(metadata: &InferenceMetadata) -> bool {
-    let native_fp16 = metadata
+/// Whether the model declares a share-buffer-compatible native KV cache dtype,
+/// via either `kv_cache.native_dtype` or
+/// `model.runtime_configurable.kv_cache.dtype`. The ORT GroupQueryAttention
+/// kernel supports `past_present_share_buffer` for both float16 and float32 KV,
+/// so both dtypes are eligible for the runtime-owned shared KV buffer.
+fn metadata_kv_is_share_buffer_dtype(metadata: &InferenceMetadata) -> bool {
+    let native = metadata
         .kv_cache
         .as_ref()
         .and_then(|kv| kv.native_dtype.as_deref())
-        .is_some_and(is_fp16_dtype);
-    let runtime_fp16 = metadata
+        .is_some_and(is_share_buffer_kv_dtype);
+    let runtime = metadata
         .model
         .as_ref()
         .and_then(|model| model.runtime_configurable.as_ref())
         .and_then(|runtime| runtime.kv_cache.as_ref())
-        .is_some_and(|kv| kv.dtype.iter().any(|dtype| is_fp16_dtype(dtype)));
-    native_fp16 || runtime_fp16
+        .is_some_and(|kv| kv.dtype.iter().any(|dtype| is_share_buffer_kv_dtype(dtype)));
+    native || runtime
 }
 
-/// Whether a dtype string denotes 16-bit floating point.
-fn is_fp16_dtype(dtype: &str) -> bool {
+/// Whether a dtype string denotes a KV dtype the share-buffer GQA path supports
+/// (16- or 32-bit floating point).
+fn is_share_buffer_kv_dtype(dtype: &str) -> bool {
     matches!(
         dtype.to_ascii_lowercase().as_str(),
-        "float16" | "fp16" | "half"
+        "float16" | "fp16" | "half" | "float32" | "fp32" | "float"
     )
 }
 
@@ -1324,8 +1335,9 @@ pub(crate) fn is_gather_out_of_bounds(message: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_step_layout, is_fp16_dtype, is_group_query_attention, is_token_input_name,
-        shared_kv_buffer_len_from_metadata, slice_value_axis, sliding_window_from_metadata,
+        decode_step_layout, is_group_query_attention, is_share_buffer_kv_dtype,
+        is_token_input_name, shared_kv_buffer_len_from_metadata, slice_value_axis,
+        sliding_window_from_metadata,
     };
     use onnx_genai_metadata::{
         AttentionConfig, InferenceMetadata, KvCacheSpec, ModelCapabilities, RuntimeConfigurable,
@@ -1354,12 +1366,15 @@ mod tests {
     }
 
     #[test]
-    fn recognizes_fp16_dtype_variants() {
-        assert!(is_fp16_dtype("float16"));
-        assert!(is_fp16_dtype("FP16"));
-        assert!(is_fp16_dtype("half"));
-        assert!(!is_fp16_dtype("float32"));
-        assert!(!is_fp16_dtype("int8"));
+    fn recognizes_share_buffer_kv_dtype_variants() {
+        assert!(is_share_buffer_kv_dtype("float16"));
+        assert!(is_share_buffer_kv_dtype("FP16"));
+        assert!(is_share_buffer_kv_dtype("half"));
+        assert!(is_share_buffer_kv_dtype("float32"));
+        assert!(is_share_buffer_kv_dtype("FP32"));
+        assert!(is_share_buffer_kv_dtype("float"));
+        assert!(!is_share_buffer_kv_dtype("int8"));
+        assert!(!is_share_buffer_kv_dtype("bfloat16"));
     }
 
     fn empty_metadata() -> InferenceMetadata {
@@ -1453,7 +1468,9 @@ mod tests {
     }
 
     #[test]
-    fn no_shared_kv_when_not_fp16() {
+    fn shared_kv_from_gqa_fp32_native_dtype() {
+        // The CPU recipe declares fp32 GQA KV; it must take the shared-buffer
+        // path (O(1)/token) rather than the growing ZeroCopyRebind path.
         let metadata = InferenceMetadata {
             model: Some(ModelCapabilities {
                 attention: Some(gqa_attention()),
@@ -1463,6 +1480,26 @@ mod tests {
             }),
             kv_cache: Some(KvCacheSpec {
                 native_dtype: Some("float32".to_string()),
+                quantization_tolerance: None,
+                sensitive_layers: None,
+                operations: None,
+            }),
+            ..empty_metadata()
+        };
+        assert_eq!(shared_kv_buffer_len_from_metadata(&metadata), Some(4096));
+    }
+
+    #[test]
+    fn no_shared_kv_when_unsupported_kv_dtype() {
+        let metadata = InferenceMetadata {
+            model: Some(ModelCapabilities {
+                attention: Some(gqa_attention()),
+                max_sequence_length: Some(4096),
+                speculative: None,
+                runtime_configurable: None,
+            }),
+            kv_cache: Some(KvCacheSpec {
+                native_dtype: Some("int8".to_string()),
                 quantization_tolerance: None,
                 sensitive_layers: None,
                 operations: None,

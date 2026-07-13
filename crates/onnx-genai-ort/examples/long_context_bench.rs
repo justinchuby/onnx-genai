@@ -25,6 +25,7 @@ enum Mode {
     Auto,
     Static,
     PastPresent,
+    Shared,
 }
 
 #[derive(Debug, Default)]
@@ -43,12 +44,13 @@ fn main() -> onnx_genai_ort::Result<()> {
 
     match args.mode {
         Mode::Static => run_static(&session, &args)?,
-        Mode::PastPresent => run_past_present(&session, &args)?,
+        Mode::PastPresent => run_past_present(&session, &args, false)?,
+        Mode::Shared => run_past_present(&session, &args, true)?,
         Mode::Auto => {
             if StaticCacheDecodeSession::detect(&session)?.is_some() {
                 run_static(&session, &args)?;
             } else {
-                run_past_present(&session, &args)?;
+                run_past_present(&session, &args, false)?;
             }
         }
     }
@@ -112,8 +114,17 @@ fn run_static(session: &Session, args: &Args) -> onnx_genai_ort::Result<()> {
     Ok(())
 }
 
-fn run_past_present(session: &Session, args: &Args) -> onnx_genai_ort::Result<()> {
-    let mut decode = DecodeSession::new(session, DecodeSessionOptions::default())?;
+fn run_past_present(session: &Session, args: &Args, shared_buffer: bool) -> onnx_genai_ort::Result<()> {
+    let options = if shared_buffer {
+        DecodeSessionOptions {
+            batch_size: 1,
+            max_length: Some(args.max_tokens.max(1)),
+            past_present_share_buffer: Some(true),
+        }
+    } else {
+        DecodeSessionOptions::default()
+    };
+    let mut decode = DecodeSession::new(session, options)?;
     println!(
         "mode=past-present kv_mode={:?} initial_rss_mb={:.1}",
         decode.mode(),
@@ -124,6 +135,7 @@ fn run_past_present(session: &Session, args: &Args) -> onnx_genai_ort::Result<()
     let mut peak_rss = rss_mb();
     let mut rss_samples = Vec::new();
     let mut token = args.prompt_token;
+    let mut token_trace = Vec::new();
 
     for position in 0..target_steps {
         let attention_mask = vec![1; position + 1];
@@ -132,6 +144,9 @@ fn run_past_present(session: &Session, args: &Args) -> onnx_genai_ort::Result<()
         let elapsed = started.elapsed();
         record(&mut buckets, position + 1, elapsed);
         token = argmax(&logits)? as i64;
+        if token_trace.len() < 24 {
+            token_trace.push(token);
+        }
         maybe_sample_rss(
             args.rss_every,
             position + 1,
@@ -142,6 +157,7 @@ fn run_past_present(session: &Session, args: &Args) -> onnx_genai_ort::Result<()
 
     println!("final_len={}", decode.past_len());
     println!("final_token={token}");
+    println!("token_trace={token_trace:?}");
     println!("peak_rss_mb={peak_rss:.1}");
     println!("rss_samples={rss_samples:?}");
     print_buckets(&buckets);
@@ -177,6 +193,7 @@ fn parse_args() -> onnx_genai_ort::Result<Args> {
                     "auto" => Mode::Auto,
                     "static" | "static-cache" => Mode::Static,
                     "past-present" | "past" => Mode::PastPresent,
+                    "shared" | "shared-buffer" => Mode::Shared,
                     other => return Err(invalid(format!("invalid mode '{other}'"))),
                 };
             }
