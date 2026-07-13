@@ -160,6 +160,12 @@ struct CaptureState {
     attention_mask: Value,
     logits: Value,
     mask_len: usize,
+    /// Number of leading `attention_mask` entries currently set to 1. The valid
+    /// region only grows within a generation, so each step fills just the delta
+    /// `[mask_valid_len, valid_len)` instead of rewriting the whole prefix,
+    /// keeping the captured-decode step O(1) rather than O(context). Reset to 0
+    /// by [`DecodeSession::reset_captured_mask`] on rewind/reset.
+    mask_valid_len: usize,
 }
 
 impl Drop for DecodeSession<'_> {
@@ -394,7 +400,7 @@ impl<'a> DecodeSession<'a> {
         // Move the capture buffers out of `self` for the duration of the step so
         // the `&mut self` bind helpers don't alias the borrow; restore on the
         // success path (an error aborts generation and drops the state).
-        let cap = self.capture.take().expect("capture state initialized");
+        let mut cap = self.capture.take().expect("capture state initialized");
         let valid_len = attention_mask.len();
         if valid_len > cap.mask_len {
             return Err(OrtError::InvalidArgument(format!(
@@ -404,11 +410,23 @@ impl<'a> DecodeSession<'a> {
         }
         cap.input_ids.write_i64_prefix(&[token])?;
         cap.position_ids.write_i64_prefix(&[position])?;
-        // The mask is zero-initialized and valid_len grows monotonically within
-        // a generation, so writing the leading ones each step keeps the trailing
-        // (unused) region zeroed without a full rewrite.
-        cap.attention_mask
-            .write_i64_prefix(&vec![1i64; valid_len])?;
+        // The mask's valid region only grows within a generation (rewind/reset
+        // clear it), and prior entries are already 1, so fill just the newly
+        // valid tail — typically a single element — keeping this step O(1) in
+        // context rather than rewriting (and heap-allocating) the whole prefix.
+        if valid_len > cap.mask_valid_len {
+            cap.attention_mask.fill_i64_range(
+                cap.mask_valid_len,
+                valid_len - cap.mask_valid_len,
+                1,
+            )?;
+        } else if valid_len < cap.mask_valid_len {
+            // Defensive: a shrink without an intervening reset — clear the tail
+            // that is no longer valid so it does not leak into this step.
+            cap.attention_mask
+                .fill_i64_range(valid_len, cap.mask_valid_len - valid_len, 0)?;
+        }
+        cap.mask_valid_len = valid_len;
 
         // Re-bind the persistent buffers every step. ORT keys its stable
         // internal device input buffers off the binding and re-copies the bound
@@ -501,6 +519,7 @@ impl<'a> DecodeSession<'a> {
             attention_mask,
             logits,
             mask_len,
+            mask_valid_len: 0,
         });
         Ok(())
     }
@@ -609,13 +628,16 @@ impl<'a> DecodeSession<'a> {
         Ok(())
     }
 
-    /// Zero the persistent captured attention mask, if allocated. Called on
-    /// rewind/reset so a shorter or restarted sequence never sees stale ones in
-    /// the trailing (masked-out) region.
-    fn reset_captured_mask(&self) -> Result<()> {
-        if let Some(cap) = self.capture.as_ref() {
+    /// Zero the valid region of the persistent captured attention mask, if
+    /// allocated, and reset the valid-length counter. Called on rewind/reset so
+    /// a shorter or restarted sequence never sees stale ones in the trailing
+    /// (masked-out) region. Only the previously-valid prefix is cleared — the
+    /// rest is already zero — so this stays O(previous context), not O(max_len).
+    fn reset_captured_mask(&mut self) -> Result<()> {
+        if let Some(cap) = self.capture.as_mut() {
             cap.attention_mask
-                .write_i64_prefix(&vec![0i64; cap.mask_len])?;
+                .fill_i64_range(0, cap.mask_valid_len, 0)?;
+            cap.mask_valid_len = 0;
         }
         Ok(())
     }

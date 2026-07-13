@@ -331,6 +331,47 @@ impl Value {
         Ok(())
     }
 
+    /// Set `count` consecutive `Int64` elements starting at `start` to `value`,
+    /// in place, without allocating a temporary buffer.
+    ///
+    /// Companion to [`write_i64_prefix`](Self::write_i64_prefix) for the
+    /// captured-decode attention mask: the mask's valid region grows by one
+    /// element per token, so each step fills only the newly-valid tail
+    /// (typically a single element) instead of rewriting the whole prefix —
+    /// keeping the captured-decode step O(1) rather than O(context).
+    pub fn fill_i64_range(&self, start: usize, count: usize, value: i64) -> Result<()> {
+        if self.dtype != DataType::Int64 {
+            return Err(OrtError::InvalidArgument(format!(
+                "fill_i64_range requires an Int64 tensor, got {:?}",
+                self.dtype
+            )));
+        }
+        let end = start.checked_add(count).ok_or_else(|| {
+            OrtError::InvalidArgument("fill_i64_range range overflows usize".into())
+        })?;
+        if end > self.numel() {
+            return Err(OrtError::InvalidArgument(format!(
+                "fill_i64_range end {} exceeds tensor capacity {}",
+                end,
+                self.numel()
+            )));
+        }
+        if count == 0 {
+            return Ok(());
+        }
+        let base = tensor_data_ptr(self.ptr.as_ptr())?.cast::<i64>();
+        // SAFETY: `[start, start+count)` lies within the `numel()` contiguous
+        // i64 elements owned by this tensor (checked above), so each written
+        // element is in bounds.
+        unsafe {
+            let dst = base.add(start);
+            for offset in 0..count {
+                dst.add(offset).write(value);
+            }
+        }
+        Ok(())
+    }
+
     /// Deep-copy this tensor into a fresh host-owned [`Value`] with its own
     /// buffer. Used to snapshot a persistent captured-decode output buffer so
     /// the caller can consume it while the original is reused on the next step.
