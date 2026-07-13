@@ -2,7 +2,7 @@ use std::{path::Path, sync::Arc, time::Instant};
 
 use anyhow::Context;
 use onnx_genai::{Engine, EngineConfig};
-use onnx_genai_engine::FimConfig;
+use onnx_genai_engine::{FimConfig, KvDType};
 use onnx_genai_metadata::PipelineStrategy;
 use onnx_genai_ort::{
     ChatTemplate, DataType, ModelDirectory, PipelineModelDirectory, PipelineModels, Tokenizer,
@@ -17,6 +17,21 @@ const DEFAULT_MAX_OUTPUT_TOKENS: usize = 4096;
 const DEFAULT_MAX_SESSIONS: usize = 256;
 const DEFAULT_MAX_QUEUE_DEPTH: usize = 256;
 const DEFAULT_MAX_BATCH: usize = 4;
+
+/// Parse a user-supplied KV cache dtype string.
+///
+/// Extends `KvDType::from_metadata_name` with the terse `"f32"` alias that is
+/// the canonical default for the `--kv-cache-dtype` flag.
+pub fn parse_kv_cache_dtype(s: &str) -> Result<KvDType, String> {
+    let lower = s.trim().to_ascii_lowercase();
+    let normalised = match lower.as_str() {
+        "f32" => "float32",
+        other => other,
+    };
+    KvDType::from_metadata_name(normalised).map_err(|_| {
+        format!("invalid KV cache dtype '{s}'; accepted values: f32, int8, fp8_e4m3fn, fp8_e5m2")
+    })
+}
 
 #[derive(Clone)]
 pub struct AppState {
@@ -34,7 +49,7 @@ pub struct AppState {
     pub(crate) started_at: Instant,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct ServerConfig {
     pub max_output_tokens: usize,
     pub max_sessions: usize,
@@ -45,6 +60,8 @@ pub struct ServerConfig {
     /// expose server internals and should only be used on loopback-bound instances or
     /// behind an authenticated reverse proxy.
     pub enable_debug_endpoints: bool,
+    /// Engine configuration, including KV cache storage dtype.
+    pub engine_config: EngineConfig,
 }
 
 impl Default for ServerConfig {
@@ -54,6 +71,7 @@ impl Default for ServerConfig {
             max_sessions: DEFAULT_MAX_SESSIONS,
             max_queue_depth: DEFAULT_MAX_QUEUE_DEPTH,
             enable_debug_endpoints: false,
+            engine_config: EngineConfig::default(),
         }
     }
 }
@@ -109,7 +127,7 @@ impl AppState {
 
         let tokenizer = Tokenizer::from_file(&model_directory.tokenizer_path)
             .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {}", e))?;
-        let engine = Engine::from_dir(model_dir, EngineConfig::default())?;
+        let engine = Engine::from_dir(model_dir, config.engine_config.clone())?;
         Ok(Self::new_with_template_and_config(
             model_id,
             engine,
@@ -200,7 +218,7 @@ impl AppState {
         };
         drop(models);
 
-        let engine = Engine::from_pipeline_dir(model_dir, EngineConfig::default())?;
+        let engine = Engine::from_pipeline_dir(model_dir, config.engine_config.clone())?;
         Ok(Self {
             model_id,
             engine: EngineDriver::start_pipeline(engine, config.max_queue_depth),

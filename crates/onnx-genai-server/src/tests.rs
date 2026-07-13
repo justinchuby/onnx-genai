@@ -1290,6 +1290,7 @@ async fn queue_depth_admission_limit_returns_429_with_retry_after() {
             max_sessions: 8,
             max_queue_depth: 1,
             enable_debug_endpoints: false,
+            ..ServerConfig::default()
         },
     )
     .unwrap();
@@ -1416,4 +1417,69 @@ async fn image_load_and_preprocess_populates_num_tiles() {
         .expect("preprocess succeeds");
     // The preprocessor always produces at least one tile.
     assert!(tensor.num_tiles >= 1, "num_tiles must be at least 1");
+}
+
+// ── KV cache dtype CLI/env surface tests ─────────────────────────────────────
+
+/// Parse each accepted KV-cache dtype string using the same function that the
+/// server binary uses (`parse_kv_cache_dtype`), and verify that the result is
+/// threaded through `ServerConfig.engine_config.kv_cache_dtype`.
+#[test]
+fn kv_cache_dtype_parses_all_accepted_values() {
+    use crate::state::parse_kv_cache_dtype;
+    use onnx_genai_engine::KvDType;
+
+    for (input, expected) in [
+        ("f32", KvDType::F32),
+        ("fp32", KvDType::F32),
+        ("float32", KvDType::F32),
+        ("int8", KvDType::Int8),
+        ("fp8_e4m3fn", KvDType::Fp8E4M3Fn),
+        ("float8_e4m3fn", KvDType::Fp8E4M3Fn),
+        ("fp8_e5m2", KvDType::Fp8E5M2),
+        ("float8_e5m2", KvDType::Fp8E5M2),
+    ] {
+        let parsed = parse_kv_cache_dtype(input)
+            .unwrap_or_else(|_| panic!("expected '{input}' to parse successfully"));
+        assert_eq!(
+            parsed, expected,
+            "'{input}' should parse to {expected:?}"
+        );
+    }
+}
+
+#[test]
+fn kv_cache_dtype_rejects_garbage_values() {
+    use crate::state::parse_kv_cache_dtype;
+
+    for bad in ["fp4", "nope", "", "int4", "float64"] {
+        assert!(
+            parse_kv_cache_dtype(bad).is_err(),
+            "'{bad}' should be rejected as an invalid KV dtype"
+        );
+    }
+}
+
+#[test]
+fn server_config_engine_config_kv_cache_dtype_defaults_to_f32() {
+    use onnx_genai_engine::KvDType;
+    let config = ServerConfig::default();
+    assert_eq!(
+        config.engine_config.kv_cache_dtype,
+        KvDType::F32,
+        "default ServerConfig must use F32 KV storage"
+    );
+}
+
+#[test]
+fn server_config_engine_config_kv_cache_dtype_can_be_set() {
+    use onnx_genai_engine::KvDType;
+    let config = ServerConfig {
+        engine_config: EngineConfig {
+            kv_cache_dtype: KvDType::Fp8E4M3Fn,
+            ..EngineConfig::default()
+        },
+        ..ServerConfig::default()
+    };
+    assert_eq!(config.engine_config.kv_cache_dtype, KvDType::Fp8E4M3Fn);
 }

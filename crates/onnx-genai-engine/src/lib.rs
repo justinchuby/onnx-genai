@@ -30,6 +30,7 @@ pub use engine::{
     MtpConfig, PrioritizedGenerateRequest, PrioritizedGenerateResult, ScheduledGenerateArrival,
     SessionId, SpeculativeMode, TokenLogprob,
 };
+pub use onnx_genai_kv::KvDType;
 pub use fim::{FimConfig, FimFormat};
 pub use logits::{
     Constraint, ConstraintProcessor, JsonConstraint, LogitProcessor, ProcessorChain,

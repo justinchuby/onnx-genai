@@ -26,6 +26,7 @@ pub(crate) struct KvLayerIo {
 pub(crate) fn infer_kv_model_info(
     session: &Session,
     page_size: usize,
+    dtype: KvDType,
 ) -> anyhow::Result<Option<KvModelInfo>> {
     let mut key_outputs = Vec::new();
     let mut value_outputs = Vec::new();
@@ -61,7 +62,7 @@ pub(crate) fn infer_kv_model_info(
         num_kv_heads,
         head_dim,
         page_size,
-        dtype: KvDType::F32,
+        dtype,
     };
     let kv_inputs = session
         .inputs()
@@ -547,7 +548,7 @@ mod tests {
     {
         let _guard = model_test_lock();
         let (_environment, session) = load_session("tiny-llm")?;
-        let info = infer_kv_model_info(&session, 4)?.expect("past/present KV model");
+        let info = infer_kv_model_info(&session, 4, KvDType::F32)?.expect("past/present KV model");
         assert_eq!(
             info.tensor_config,
             PageTensorConfig {
@@ -564,7 +565,7 @@ mod tests {
         assert_eq!(info.layers[0].value_past, "past_key_values.0.value");
 
         let (_environment, static_session) = load_session("tiny-llm-scatter")?;
-        assert!(infer_kv_model_info(&static_session, 4)?.is_none());
+        assert!(infer_kv_model_info(&static_session, 4, KvDType::F32)?.is_none());
         Ok(())
     }
 
@@ -642,7 +643,7 @@ mod tests {
     fn mirrors_present_append_range_into_paged_cache() -> anyhow::Result<()> {
         let _guard = model_test_lock();
         let (_environment, session) = load_session("tiny-llm")?;
-        let model = infer_kv_model_info(&session, 2)?.unwrap();
+        let model = infer_kv_model_info(&session, 2, KvDType::F32)?.unwrap();
         let mut cache = PagedKvCache::new_with_tensor_config(model.tensor_config, 4);
         let seq = cache.create_sequence();
 
@@ -685,7 +686,7 @@ mod tests {
     fn materializes_past_values_in_model_input_layout() -> anyhow::Result<()> {
         let _guard = model_test_lock();
         let (_environment, session) = load_session("tiny-llm")?;
-        let model = infer_kv_model_info(&session, 2)?.unwrap();
+        let model = infer_kv_model_info(&session, 2, KvDType::F32)?.unwrap();
         let materialized = onnx_genai_kv::MaterializedKv {
             start_position: 0,
             sink_len: 0,
@@ -746,7 +747,7 @@ mod tests {
     fn rewinds_materialized_ort_past_and_handles_edge_branches() -> anyhow::Result<()> {
         let _guard = model_test_lock();
         let (_environment, session) = load_session("tiny-llm")?;
-        let model = infer_kv_model_info(&session, 2)?.unwrap();
+        let model = infer_kv_model_info(&session, 2, KvDType::F32)?.unwrap();
         let mut cache = PagedKvCache::new_with_tensor_config(model.tensor_config, 8);
         let seq = cache.create_sequence();
         for base in [0.0, 10.0, 20.0] {
@@ -948,5 +949,47 @@ mod tests {
         rewinds_materialized_ort_past_and_handles_edge_branches()?;
         rewinds_static_and_past_present_decode_runners()?;
         rewinds_target_state_and_trims_overmaterialized_kv()
+    }
+
+    /// Build a minimal TensorInfo set that looks like a past/present KV model and
+    /// verify that `infer_kv_model_info` propagates the requested storage dtype
+    /// directly into `PageTensorConfig.dtype` without any special-casing.
+    ///
+    /// These tests use the real tiny-llm fixture so that `Session::inputs/outputs`
+    /// are fully populated; the dtype under test is a storage-layer knob that does
+    /// not touch the model I/O schema.
+    fn infer_kv_model_info_propagates_dtype_to_page_tensor_config(
+        dtype: KvDType,
+    ) -> anyhow::Result<()> {
+        let _guard = model_test_lock();
+        let (_environment, session) = load_session("tiny-llm")?;
+        let info = infer_kv_model_info(&session, 4, dtype)?
+            .expect("tiny-llm exposes past/present KV outputs");
+        assert_eq!(
+            info.tensor_config.dtype,
+            dtype,
+            "PageTensorConfig.dtype must equal the requested storage dtype"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn configured_dtype_f32_flows_into_page_tensor_config() -> anyhow::Result<()> {
+        infer_kv_model_info_propagates_dtype_to_page_tensor_config(KvDType::F32)
+    }
+
+    #[test]
+    fn configured_dtype_fp8_e4m3fn_flows_into_page_tensor_config() -> anyhow::Result<()> {
+        infer_kv_model_info_propagates_dtype_to_page_tensor_config(KvDType::Fp8E4M3Fn)
+    }
+
+    #[test]
+    fn configured_dtype_fp8_e5m2_flows_into_page_tensor_config() -> anyhow::Result<()> {
+        infer_kv_model_info_propagates_dtype_to_page_tensor_config(KvDType::Fp8E5M2)
+    }
+
+    #[test]
+    fn configured_dtype_int8_flows_into_page_tensor_config() -> anyhow::Result<()> {
+        infer_kv_model_info_propagates_dtype_to_page_tensor_config(KvDType::Int8)
     }
 }

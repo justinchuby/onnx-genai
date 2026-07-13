@@ -1,7 +1,7 @@
 //! Public generation API types and configuration.
 
 use crate::logits::{StopSequence, TokenId};
-use onnx_genai_kv::SequenceId;
+use onnx_genai_kv::{KvDType, SequenceId};
 use onnx_genai_ort::{Eagle3DraftKvMode, MtpDraftKvMode};
 use onnx_genai_scheduler::{Priority, SchedulerConfig};
 use std::path::PathBuf;
@@ -96,6 +96,13 @@ pub struct EngineConfig {
     /// Default speculative source. For compatibility, a configured
     /// `draft_model` selects `DraftModel` when this remains `None`.
     pub speculative_mode: SpeculativeMode,
+    /// Storage dtype for the host-side paged KV cache mirror.
+    ///
+    /// Controls how KV tensors are stored in the paged cache after being
+    /// written from model outputs. The model's own I/O dtype (Float32 /
+    /// Float16) is independent of this setting; the cache quantises/
+    /// dequantises internally.  Defaults to `KvDType::F32` (no quantisation).
+    pub kv_cache_dtype: KvDType,
 }
 
 impl Default for EngineConfig {
@@ -107,6 +114,7 @@ impl Default for EngineConfig {
             draft_model: None,
             num_speculative_tokens: 4,
             speculative_mode: SpeculativeMode::None,
+            kv_cache_dtype: KvDType::F32,
         }
     }
 }

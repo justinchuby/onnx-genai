@@ -1,7 +1,8 @@
 use std::{net::SocketAddr, path::PathBuf};
 
 use clap::Parser;
-use onnx_genai_server::{AppState, ServerConfig, serve};
+use onnx_genai_engine::KvDType;
+use onnx_genai_server::{AppState, ServerConfig, parse_kv_cache_dtype, serve};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -37,6 +38,17 @@ struct Cli {
     /// servers or behind an authenticated proxy. Falls back to ONNX_GENAI_DEBUG_ENDPOINTS=1.
     #[arg(long, env = "ONNX_GENAI_DEBUG_ENDPOINTS")]
     enable_debug_endpoints: bool,
+
+    /// Storage dtype for the host-side paged KV cache mirror.
+    /// Accepted values: f32, int8, fp8_e4m3fn, fp8_e5m2.
+    /// Falls back to ONNX_GENAI_KV_CACHE_DTYPE. Defaults to f32 (no quantisation).
+    #[arg(
+        long,
+        env = "ONNX_GENAI_KV_CACHE_DTYPE",
+        value_parser = parse_kv_cache_dtype,
+        default_value = "f32"
+    )]
+    kv_cache_dtype: KvDType,
 }
 
 #[tokio::main]
@@ -54,6 +66,10 @@ async fn main() -> anyhow::Result<()> {
             max_sessions: cli.max_sessions,
             max_queue_depth: cli.max_queue_depth,
             enable_debug_endpoints: cli.enable_debug_endpoints,
+            engine_config: onnx_genai_engine::EngineConfig {
+                kv_cache_dtype: cli.kv_cache_dtype,
+                ..Default::default()
+            },
         },
     )?;
     tracing::info!(addr = %cli.addr, model = state.model_id(), "starting onnx-genai server");

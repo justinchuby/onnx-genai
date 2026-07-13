@@ -120,6 +120,7 @@ async fn chat_completions_rejects_max_tokens_over_server_cap() {
         max_sessions: 8,
         max_queue_depth: 8,
         enable_debug_endpoints: false,
+        ..ServerConfig::default()
     })
     .await;
     let response = app
@@ -183,6 +184,7 @@ async fn sessions_are_lru_evicted_at_configured_cap() {
         max_sessions: 2,
         max_queue_depth: 8,
         enable_debug_endpoints: false,
+        ..ServerConfig::default()
     })
     .await;
     let first = create_http_session(app.clone()).await;

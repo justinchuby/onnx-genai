@@ -179,7 +179,7 @@ impl Engine {
         let tokenizer = Tokenizer::from_file(&model_directory.tokenizer_path)
             .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {}", e))?;
         let fim_config = load_fim_config_from_model_dir(&model_directory.root)?;
-        let kv_model = infer_kv_model_info(&session, config.page_size)?;
+        let kv_model = infer_kv_model_info(&session, config.page_size, config.kv_cache_dtype)?;
         let draft = if let Some(draft_model_path) = &config.draft_model {
             let draft_directory = ModelDirectory::load(draft_model_path)
                 .map_err(|e| anyhow::anyhow!("Failed to resolve draft model directory: {}", e))?;
@@ -191,7 +191,7 @@ impl Engine {
             .map_err(|e| anyhow::anyhow!("Failed to load draft ORT session: {}", e))?;
             let draft_decode_path =
                 detect_model_decode_path(&draft_session, metadata_max_context, None, None, 0)?;
-            let draft_kv_model = infer_kv_model_info(&draft_session, config.page_size)?;
+            let draft_kv_model = infer_kv_model_info(&draft_session, config.page_size, onnx_genai_kv::KvDType::F32)?;
             let draft_kv_cache = if let Some(kv_model) = &draft_kv_model {
                 PagedKvCache::new_with_tensor_config(kv_model.tensor_config, config.num_gpu_pages)
             } else {

@@ -96,7 +96,7 @@ impl PipelineEngine {
         let decoder = models
             .session(&plan.decoder)
             .with_context(|| format!("pipeline decoder '{}' was not loaded", plan.decoder))?;
-        let _kv_model = infer_kv_model_info(decoder, config.page_size)?;
+        let _kv_model = infer_kv_model_info(decoder, config.page_size, config.kv_cache_dtype)?;
         let decoder_state = DecodeState::new(decoder)?;
         let tokenizer_component = plan.decoder.clone();
         Ok(Self {
