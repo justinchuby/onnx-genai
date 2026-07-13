@@ -23,7 +23,7 @@ _Last updated: 2026-07-13_
 | 24 | Sampling policy | ✅ Done | full sampler suite; **real RNG fixed 2026-07-12** |
 | 25 | Extensibility | ✅ Done | DecodeBackend/SpeculativeProposer/Sampler traits |
 | 26 | Multi-agent serving | ✅ Done | batched continuous serving (~6× throughput) |
-| 27 | Multi-token speculative | ✅ Done | draft + prompt-lookup + MTP + EAGLE-3 |
+| 27 | Multi-token speculative | ✅ Done | draft + prompt-lookup + MTP + EAGLE-3 + **Gemma4 assistant (shared-KV proposer)** |
 | 28 | vLLM speculator compat | ✅ Done | config auto-discovery + EAGLE-3 proposer |
 | 29 | Language diffusion | ❌ Missing | large |
 | 31 | Observability | 🟡 Partial | `/metrics` + `/v1/status` + trace ids + `/v1/debug/*` ✅; Perfetto/OTLP export (feature-gated stub) = #13 |
@@ -57,6 +57,8 @@ _Follow-ups:_ SWA hardening nits (Chew): first-activation `debug_assert`, rewind
 ### Gemma4 multimodal export — scoped (2026-07-13, Sapper); NOT a small patch
 
 > **UPDATE 2026-07-13 (session 2, active):** Now being pushed forward per user ("don't be daunted — change whatever's needed, including the mobius PR"). Focus first on **Gemma4 speculative decoding**, which maps onto our existing MTP/EAGLE-3 proposer infra (§27/§28 ✅) rather than greenfield. Mobius already has `src/mobius/models/gemma4_assistant.py`. Two scoping agents mapping the exact runtime-proposer contract + mobius emitter gap; implementation to follow in BOTH repos (runtime + mobius `--runtime onnx-genai` emitter, PR #398).
+
+> **LANDED 2026-07-13:** Gemma4 assistant speculative decoding is a **new shared-KV proposer type** (NOT MTP/EAGLE-3): the 4-layer assistant shares slices of the target's paged KV (`shared_kv.{sliding,full}_attention.*`), has its own internal lm_head (`logits`), and threads `projected_state` (`inputs_embeds = concat(prev,cur)` of backbone-hidden vectors). Runtime slice landed (metadata `ProposalType::Gemma4Assistant` + parser, `Gemma4AssistantDecodeSession` in ort, `Gemma4AssistantProposer` + KV-slice sharing in engine, metadata-driven activation, non-runner decode path). Synthetic `onnx_ir` fixture proves speculative output is **token-identical to plain greedy** (`tests/gemma4_assistant_full.rs`). Mobius exporter landed on branch `onnxruntime/mobius:feat/gemma4-assistant-onnx-genai` (off PR #398): emits the `speculative:` block + copies tokenizer. **Remaining for real E2B/12B run:** export gated Google weights on a high-mem CUDA host + accuracy/speedup validation; refine multi-layer shared-KV binding (runtime currently binds one representative target layer per group).
 
 Scoped the "export Gemma4 E2B/12B via Mobius and smoke-test through onnx-genai" ask. It is **blocked on major runtime + Mobius work**, not a metadata one-liner:
 
