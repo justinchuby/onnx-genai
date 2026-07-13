@@ -7,6 +7,14 @@ primary comparison.
 
 ## Current-state comparison
 
+The definitive CPU recipe comparison is
+[`2026-07-12-JustindeMacBook-Pro-cpu-recipe.md`](2026-07-12-JustindeMacBook-Pro-cpu-recipe.md).
+The combined `accuracy_level=4` plus quantized embedding/head model reaches
+158.62 tok/s on the short prompt: 2.0% ahead of LM Studio CPU and 20.0% ahead
+of Ollama CPU. It does not win universally: LM Studio leads long-context decode
+160.17 to 115.19 tok/s, while Foundry Local's ORT CPU model leads both decode
+cases at 202.67 and 165.77 tok/s.
+
 The current honest checkpoint is
 [`2026-07-12-JustindeMacBook-Pro-q4-gqa-webgpu.md`](2026-07-12-JustindeMacBook-Pro-q4-gqa-webgpu.md).
 It is the first correctness-verified, same-source GPU comparison with both Q4
