@@ -8,6 +8,10 @@ repository.workspace = true
 keywords = ["onnx", "runtime", "inference", "ffi"]
 categories = ["api-bindings", "science"]
 
+[features]
+default = []
+cuda = []
+
 [dependencies]
 half = "2"
 minijinja = { version = "2", features = ["json"] }

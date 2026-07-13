@@ -12,6 +12,8 @@ categories = ["web-programming::http-server", "science"]
 default = ["metrics"]
 # Exposes the allocation-free atomic registry at GET /metrics in Prometheus format.
 metrics = []
+# Enables the ORT CUDA execution provider (build on a CUDA host, e.g. H200).
+cuda = ["onnx-genai-ort/cuda"]
 
 [dependencies]
 onnx-genai = { workspace = true }

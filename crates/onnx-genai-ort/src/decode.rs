@@ -440,7 +440,7 @@ impl<'a> DecodeSession<'a> {
     fn allocate_shared_buffers(&mut self, batch_size: i64, max_length: usize) -> Result<()> {
         let max_length = i64::try_from(max_length)
             .map_err(|_| OrtError::InvalidArgument("max_length exceeds i64".into()))?;
-        // Prefer a device-resident (e.g. WebGPU) allocator so the runtime-owned
+        // Prefer a device-resident (e.g. CUDA/WebGPU) allocator so the runtime-owned
         // max-length KV buffers live on the EP device. Bound as both
         // `past_key_values.*` inputs and `present.*` outputs, the KV cache then
         // stays on-device across decode steps (present aliased in place onto

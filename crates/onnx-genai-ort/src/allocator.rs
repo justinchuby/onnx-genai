@@ -59,6 +59,7 @@ impl MemoryInfo {
     }
 
     /// Create CUDA device memory info.
+    #[cfg(feature = "cuda")]
     pub fn cuda(device_id: i32) -> Result<Self> {
         Self::new_device("Cuda", device_id, MemoryType::Default)
     }
@@ -206,9 +207,7 @@ impl Allocator {
         // SAFETY: `session` is a valid ORT session pointer and `memory_info` is a
         // valid handle; `ptr` is an out-parameter. On success ORT transfers an
         // owned allocator that this wrapper releases in Drop.
-        crate::error::check_status(unsafe {
-            create(session, memory_info.as_ptr(), &mut ptr)
-        })?;
+        crate::error::check_status(unsafe { create(session, memory_info.as_ptr(), &mut ptr) })?;
         Ok(Self {
             ptr,
             memory_info,

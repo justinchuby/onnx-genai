@@ -112,7 +112,7 @@ impl Value {
 
     /// Create an uninitialized tensor value on the memory owned by `allocator`.
     ///
-    /// When `allocator` is a device allocator (e.g. the WebGPU EP's
+    /// When `allocator` is a device allocator (e.g. CUDA or the WebGPU EP's
     /// `WebGPU_Buffer` allocator from [`crate::Allocator::for_session_device`]),
     /// the tensor is device-resident: binding it as both a `past_key_values.*`
     /// input and `present.*` output keeps the KV cache on-device across decode

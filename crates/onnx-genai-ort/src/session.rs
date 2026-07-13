@@ -29,11 +29,11 @@ pub struct SessionOptions {
     pub intra_op_num_threads: i32,
     /// Number of inter-op threads.
     pub inter_op_num_threads: i32,
-    /// Enable ORT WebGPU graph capture (`enableGraphCapture=1`). Only applied
-    /// when a WebGPU execution provider is selected. Graph capture requires
-    /// stable input/output buffer addresses and shapes across runs, which the
-    /// device-resident persistent KV IoBinding provides for KV tensors.
-    pub webgpu_graph_capture: bool,
+    /// Enable execution-provider graph capture. Applied as WebGPU
+    /// `enableGraphCapture=1` or CUDA `enable_cuda_graph=1`. Graph capture
+    /// requires stable input/output buffer addresses and shapes across runs,
+    /// which the device-resident persistent KV IoBinding provides for KV tensors.
+    pub graph_capture: bool,
     /// Disable WebGPU/Dawn validation (`validationMode=disabled`). Only applied
     /// when a WebGPU execution provider is selected. Validation is a
     /// debug-oriented overhead layer; disabling it is safe for trusted graphs.
@@ -58,7 +58,7 @@ impl SessionOptions {
             optimization_level: 99,
             intra_op_num_threads: 0, // ORT decides
             inter_op_num_threads: 0,
-            webgpu_graph_capture: false,
+            graph_capture: false,
             webgpu_disable_validation: false,
         }
     }
@@ -79,15 +79,22 @@ impl SessionOptions {
             .any(|provider| matches!(provider, ExecutionProvider::WebGpu))
     }
 
-    /// Turn on the WebGPU performance provider options that are safe by default
-    /// once a WebGPU EP is selected: validation is disabled (pure overhead
-    /// reduction) and graph capture follows `ONNX_GENAI_WEBGPU_GRAPH_CAPTURE`
-    /// (default off, since it requires fully stable I/O across runs).
+    fn selects_cuda(&self) -> bool {
+        self.execution_providers
+            .iter()
+            .any(|provider| matches!(provider, ExecutionProvider::Cuda { .. }))
+    }
+
+    /// Apply provider performance defaults. WebGPU validation is disabled (pure
+    /// overhead reduction), while graph capture follows the selected EP's
+    /// provider-specific environment flag and remains off by default.
     fn apply_provider_defaults(&mut self) {
         if self.selects_webgpu() {
             self.webgpu_disable_validation = webgpu_disable_validation_from_env();
-            self.webgpu_graph_capture = webgpu_graph_capture_from_env();
         }
+        self.graph_capture = (self.selects_webgpu()
+            && env_flag_enabled("ONNX_GENAI_WEBGPU_GRAPH_CAPTURE"))
+            || (self.selects_cuda() && env_flag_enabled("ONNX_GENAI_CUDA_GRAPH"));
     }
 
     /// Set the number of ORT intra-op threads.
@@ -395,23 +402,54 @@ impl Session {
             .any(|provider| matches!(provider, ExecutionProvider::WebGpu))
     }
 
+    /// Whether a CUDA execution provider is (effectively) active for this session.
+    pub fn is_cuda(&self) -> bool {
+        self.execution_providers
+            .iter()
+            .any(|provider| matches!(provider, ExecutionProvider::Cuda { .. }))
+    }
+
     /// Create a device-resident allocator for KV buffers, if this session runs
-    /// on an execution provider that owns device memory (currently WebGPU).
+    /// on an execution provider that owns device memory (CUDA or WebGPU).
     ///
     /// Returns `Ok(None)` for CPU/unsupported EPs, so callers keep using the CPU
     /// allocator. If a device EP is selected but ORT cannot produce a matching
     /// allocator (e.g. the EP silently fell back to CPU), the error is logged
     /// and `Ok(None)` is returned so decode still works via CPU buffers.
     pub(crate) fn device_kv_allocator(&self) -> Result<Option<Allocator>> {
-        if !self.is_webgpu() {
+        if !self.is_webgpu() && !self.is_cuda() {
             return Ok(None);
         }
         if !device_kv_enabled_from_env() {
-            // Default path: device-resident KV is opt-in because ORT 1.27's
-            // WebGPU EP segfaults on externally pre-allocated device KV tensors
-            // bound as a persistent in-place share-buffer (see decision file).
             return Ok(None);
         }
+
+        #[cfg(feature = "cuda")]
+        if let Some(device_id) = self.execution_providers.iter().find_map(|provider| {
+            if let ExecutionProvider::Cuda { device_id } = provider {
+                Some(*device_id)
+            } else {
+                None
+            }
+        }) {
+            let memory_info = MemoryInfo::cuda(device_id)?;
+            return match Allocator::for_session_device(self.ptr.as_ptr(), memory_info) {
+                Ok(allocator) => {
+                    tracing::info!(
+                        device_id,
+                        "ONNX_GENAI_DEVICE_KV=1: allocating shared GQA KV on CUDA"
+                    );
+                    Ok(Some(allocator))
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        "Could not create CUDA device KV allocator for device {device_id} ({err}); falling back to CPU KV buffers"
+                    );
+                    Ok(None)
+                }
+            };
+        }
+
         let memory_info = match MemoryInfo::webgpu() {
             Ok(info) => info,
             Err(err) => {
@@ -522,10 +560,13 @@ fn execution_providers_from_env() -> Option<Vec<ExecutionProvider>> {
     let provider = match value.trim().to_ascii_lowercase().as_str() {
         "" | "cpu" => ExecutionProvider::Cpu,
         "webgpu" | "web-gpu" | "web_gpu" => ExecutionProvider::WebGpu,
+        "cuda" => ExecutionProvider::Cuda {
+            device_id: cuda_device_id_from_env(),
+        },
         "coreml" | "core-ml" | "core_ml" => ExecutionProvider::CoreML,
         other => {
             tracing::warn!(
-                "Ignoring unsupported ONNX_GENAI_EP={other}; expected cpu, webgpu, or coreml"
+                "Ignoring unsupported ONNX_GENAI_EP={other}; expected cpu, webgpu, cuda, or coreml"
             );
             ExecutionProvider::Cpu
         }
@@ -540,14 +581,37 @@ fn requested_non_cpu_provider(options: &SessionOptions) -> bool {
         .any(|provider| !matches!(provider, ExecutionProvider::Cpu))
 }
 
-fn webgpu_graph_capture_from_env() -> bool {
-    match std::env::var("ONNX_GENAI_WEBGPU_GRAPH_CAPTURE") {
+fn env_flag_enabled(name: &str) -> bool {
+    match std::env::var(name) {
         Ok(value) => matches!(
             value.trim().to_ascii_lowercase().as_str(),
             "1" | "true" | "yes" | "on"
         ),
         Err(_) => false,
     }
+}
+
+fn cuda_device_id_from_env() -> i32 {
+    let Ok(value) = std::env::var("ONNX_GENAI_CUDA_DEVICE") else {
+        return 0;
+    };
+    match parse_cuda_device_id(&value) {
+        Some(device_id) => device_id,
+        None => {
+            tracing::warn!(
+                "Ignoring invalid ONNX_GENAI_CUDA_DEVICE={value}; expected a non-negative integer, using device 0"
+            );
+            0
+        }
+    }
+}
+
+fn parse_cuda_device_id(value: &str) -> Option<i32> {
+    value
+        .trim()
+        .parse::<i32>()
+        .ok()
+        .filter(|device_id| *device_id >= 0)
 }
 
 /// Whether to disable WebGPU validation. Default true (safe overhead
@@ -599,7 +663,7 @@ fn apply_webgpu_provider_options(
             "disabled",
         )?;
     }
-    if options.webgpu_graph_capture {
+    if options.graph_capture {
         add_session_config_entry(
             session_options,
             "ep.webgpuexecutionprovider.enableGraphCapture",
@@ -625,9 +689,7 @@ fn add_session_config_entry(
         .map_err(|_| OrtError::InvalidArgument("session config value contains NUL".into()))?;
     // SAFETY: `session_options` is a valid handle; both C strings are
     // NUL-terminated and live for the call.
-    crate::error::check_status(unsafe {
-        add(session_options, key_c.as_ptr(), value_c.as_ptr())
-    })
+    crate::error::check_status(unsafe { add(session_options, key_c.as_ptr(), value_c.as_ptr()) })
 }
 
 fn append_execution_providers(
@@ -639,7 +701,7 @@ fn append_execution_providers(
         Vec::new()
     });
     for provider in &options.execution_providers {
-        append_execution_provider(session_options, provider, &available)?;
+        append_execution_provider(session_options, provider, options.graph_capture, &available)?;
     }
     Ok(())
 }
@@ -647,6 +709,7 @@ fn append_execution_providers(
 fn append_execution_provider(
     session_options: *mut onnx_genai_ort_sys::OrtSessionOptions,
     provider: &ExecutionProvider,
+    graph_capture: bool,
     available: &[String],
 ) -> Result<()> {
     match provider {
@@ -658,6 +721,24 @@ fn append_execution_provider(
             &[],
             available,
         ),
+        ExecutionProvider::Cuda { device_id } => {
+            #[cfg(feature = "cuda")]
+            {
+                append_cuda_execution_provider(
+                    session_options,
+                    *device_id,
+                    graph_capture,
+                    available,
+                )
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                let _ = (session_options, device_id, graph_capture, available);
+                Err(OrtError::InvalidArgument(
+                    "CUDA support not compiled in; rebuild with --features cuda".into(),
+                ))
+            }
+        }
         ExecutionProvider::CoreML => append_named_execution_provider(
             session_options,
             "CoreML",
@@ -669,6 +750,104 @@ fn append_execution_provider(
             tracing::warn!(
                 "Execution provider {:?} is not wired in onnx-genai-ort; falling back to CPU",
                 other
+            );
+            Ok(())
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn append_cuda_execution_provider(
+    session_options: *mut onnx_genai_ort_sys::OrtSessionOptions,
+    device_id: i32,
+    graph_capture: bool,
+    available: &[String],
+) -> Result<()> {
+    const PROVIDER_NAME: &str = "CUDAExecutionProvider";
+    if !provider_is_available(PROVIDER_NAME, available) {
+        tracing::warn!(
+            "Requested ONNX Runtime execution provider CUDA is unavailable in this build; falling back to CPU. Available providers: {:?}",
+            available
+        );
+        return Ok(());
+    }
+
+    let api = crate::error::api()?;
+    let create = api
+        .CreateCUDAProviderOptions
+        .ok_or(OrtError::ApiUnavailable("CreateCUDAProviderOptions"))?;
+    let update = api
+        .UpdateCUDAProviderOptions
+        .ok_or(OrtError::ApiUnavailable("UpdateCUDAProviderOptions"))?;
+    let append =
+        api.SessionOptionsAppendExecutionProvider_CUDA_V2
+            .ok_or(OrtError::ApiUnavailable(
+                "SessionOptionsAppendExecutionProvider_CUDA_V2",
+            ))?;
+    let release = api
+        .ReleaseCUDAProviderOptions
+        .ok_or(OrtError::ApiUnavailable("ReleaseCUDAProviderOptions"))?;
+
+    let mut cuda_options = std::ptr::null_mut();
+    // SAFETY: `cuda_options` is a valid out-parameter and is released below.
+    crate::error::check_status(unsafe { create(&mut cuda_options) })?;
+    let result = (|| {
+        let device_id = device_id.to_string();
+        let mut provider_options = vec![("device_id", device_id.as_str())];
+        if graph_capture {
+            provider_options.push(("enable_cuda_graph", "1"));
+        }
+        let option_keys = provider_options
+            .iter()
+            .map(|(key, _)| {
+                CString::new(*key).map_err(|_| {
+                    OrtError::InvalidArgument("CUDA provider option key contains NUL".into())
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let option_values = provider_options
+            .iter()
+            .map(|(_, value)| {
+                CString::new(*value).map_err(|_| {
+                    OrtError::InvalidArgument("CUDA provider option value contains NUL".into())
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let option_key_ptrs = option_keys
+            .iter()
+            .map(|key| key.as_ptr())
+            .collect::<Vec<_>>();
+        let option_value_ptrs = option_values
+            .iter()
+            .map(|value| value.as_ptr())
+            .collect::<Vec<_>>();
+        // SAFETY: the CUDA options handle and all C string arrays are valid for
+        // the calls; `session_options` is a live mutable session-options handle.
+        crate::error::check_status(unsafe {
+            update(
+                cuda_options,
+                option_key_ptrs.as_ptr(),
+                option_value_ptrs.as_ptr(),
+                provider_options.len(),
+            )
+        })?;
+        crate::error::check_status(unsafe { append(session_options, cuda_options) })
+    })();
+    // SAFETY: `cuda_options` was created above and is released exactly once.
+    unsafe { release(cuda_options) };
+
+    match result {
+        Ok(()) => {
+            tracing::info!(
+                device_id,
+                graph_capture,
+                "Enabled ONNX Runtime CUDA execution provider"
+            );
+            Ok(())
+        }
+        Err(err) => {
+            tracing::warn!(
+                "Failed to enable ONNX Runtime CUDA execution provider: {err}; falling back to CPU"
             );
             Ok(())
         }
@@ -909,4 +1088,41 @@ fn tensor_info_from_type_info(
     crate::error::check_status(unsafe { get_dims(tensor_info, shape.as_mut_ptr(), dim_count) })?;
 
     Ok((dtype, shape))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_cuda_device_ids() {
+        assert_eq!(parse_cuda_device_id("0"), Some(0));
+        assert_eq!(parse_cuda_device_id(" 7 "), Some(7));
+        assert_eq!(parse_cuda_device_id("-1"), None);
+        assert_eq!(parse_cuda_device_id("gpu0"), None);
+    }
+
+    #[test]
+    fn recognizes_cuda_provider_names() {
+        let available = vec!["CUDAExecutionProvider".to_string()];
+        assert!(provider_is_available("CUDAExecutionProvider", &available));
+        assert!(provider_is_available("CUDA", &available));
+    }
+
+    #[cfg(not(feature = "cuda"))]
+    #[test]
+    fn cuda_request_requires_compile_time_feature() {
+        let error = append_execution_provider(
+            std::ptr::null_mut(),
+            &ExecutionProvider::Cuda { device_id: 0 },
+            false,
+            &[],
+        )
+        .expect_err("CUDA must be rejected without the cargo feature");
+        assert!(
+            error
+                .to_string()
+                .contains("CUDA support not compiled in; rebuild with --features cuda")
+        );
+    }
 }

@@ -57,7 +57,10 @@ fn to_vec_f32_lossy_widens_fp16_and_passes_through_fp32() {
     assert_eq!(widened, vec![0.0_f32, 1.0, -2.0, 65504.0]);
 
     let fp32 = Value::from_slice_f32(&[0.5, -1.25], &[2]).expect("f32 tensor");
-    assert_eq!(fp32.to_vec_f32_lossy().expect("f32 passthrough"), vec![0.5, -1.25]);
+    assert_eq!(
+        fp32.to_vec_f32_lossy().expect("f32 passthrough"),
+        vec![0.5, -1.25]
+    );
 }
 
 #[test]
