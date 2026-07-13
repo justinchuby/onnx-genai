@@ -50,3 +50,6 @@ Published v0.1.0 release path is canonical: `.github/workflows/publish.yml` uses
 
 ## 2026-07-13T18:30:00Z — Review/fix batch
 - Owned Sapper's reviewer-lockout follow-up and landed `8a0cf4b`, making thumbnail token/pixel order authoritative from tensor layout.
+
+## 2026-07-13T20:55:00Z — §37/#9 model lifecycle read-only scope
+- Scoped issue #9 model lifecycle architecture (read-only). Produced milestone plan M1–M4: M1 ModelHandle/Registry extraction, M2 real routing errors, M3 load/unload (RwLock), M4 status field. Saved to session files. Zhora independently implemented M1 in the same batch.

@@ -73,3 +73,9 @@ Prompt-lookup speculation and `MtpProposer` are accepted canonical runtime miles
 
 ## 2026-07-13T18:30:00Z — Review/fix batch
 - Landed initial issue #14 vision token-expansion wiring as `79a030a`; Luv later rejected multi-image accounting/guard gaps, so reviewer lockout applied and Leon owned the fix.
+
+## 2026-07-13T20:55:00Z — SWA/sink hardening nits (Chew review fixes)
+- Added two first-activation debug_assert! calls in paged_cache.rs: page_count >= sink_pages and keep_from >= sink_len_target.
+- Fixed rewind_to correctness bug: was rejecting valid positions in pinned sink prefix [0, sink_len). Guard updated to allow [0, sink) rewinds; resets sink_len/retained_start to 0 when rewinding behind sink. New test: rewind_into_sink_discards_window_and_resets_gap_bookkeeping.
+- Documented draft sink_tokens=0 rationale in engine.rs: no-op without sliding_window; drafts have independent KV constraints; correct fix path is loading draft's own inference_metadata.
+- Commit: 4e51d59. Tests and clippy clean.
