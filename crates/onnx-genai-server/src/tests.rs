@@ -1186,13 +1186,15 @@ async fn vision_request_routes_through_tiny_vlm_pipeline() {
 #[test]
 fn completion_suffix_maps_to_fim_generation() {
     let model_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
-    let mut state = AppState::load(&model_dir, Some("tiny-llm".to_string())).expect("load fixture");
-    state.fim_config = Some(onnx_genai_engine::FimConfig {
-        prefix_token: "<PRE>".to_string(),
-        middle_token: "<MID>".to_string(),
-        suffix_token: "<SUF>".to_string(),
-        format: onnx_genai_engine::FimFormat::PSM,
-    });
+    let state = AppState::load(&model_dir, Some("tiny-llm".to_string()))
+        .expect("load fixture")
+        .with_default_fim_config(Some(onnx_genai_engine::FimConfig {
+            prefix_token: "<PRE>".to_string(),
+            middle_token: "<MID>".to_string(),
+            suffix_token: "<SUF>".to_string(),
+            format: onnx_genai_engine::FimFormat::PSM,
+        }));
+    let handle = state.registry.resolve("").unwrap();
     let request: CompletionRequest = serde_json::from_value(json!({
         "model": "tiny-llm",
         "prompt": "prefix",
@@ -1204,7 +1206,7 @@ fn completion_suffix_maps_to_fim_generation() {
     }))
     .unwrap();
 
-    let prepared = prepare_completion(&request, &state).unwrap();
+    let prepared = prepare_completion(&request, &handle).unwrap();
     match prepared.generation {
         CompletionGeneration::Fim {
             prefix,
@@ -1225,13 +1227,14 @@ fn completion_suffix_maps_to_fim_generation() {
 #[tokio::test]
 async fn completion_suffix_uses_fim_and_returns_text_completion() {
     let model_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
-    let mut state = AppState::load(&model_dir, Some("tiny-llm".to_string())).expect("load fixture");
-    state.fim_config = Some(onnx_genai_engine::FimConfig {
-        prefix_token: "<PRE>".to_string(),
-        middle_token: "<MID>".to_string(),
-        suffix_token: "<SUF>".to_string(),
-        format: onnx_genai_engine::FimFormat::PSM,
-    });
+    let state = AppState::load(&model_dir, Some("tiny-llm".to_string()))
+        .expect("load fixture")
+        .with_default_fim_config(Some(onnx_genai_engine::FimConfig {
+            prefix_token: "<PRE>".to_string(),
+            middle_token: "<MID>".to_string(),
+            suffix_token: "<SUF>".to_string(),
+            format: onnx_genai_engine::FimFormat::PSM,
+        }));
 
     let response = app(state)
         .oneshot(
@@ -1294,7 +1297,8 @@ async fn queue_depth_admission_limit_returns_429_with_retry_after() {
         },
     )
     .unwrap();
-    let _occupied = state
+    let handle = state.registry.resolve("").unwrap();
+    let _occupied = handle
         .engine
         .generation_capacity
         .clone()

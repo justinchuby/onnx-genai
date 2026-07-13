@@ -1,5 +1,6 @@
 use std::{
     convert::Infallible,
+    sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -21,7 +22,9 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::{
-    driver::{DriverEvent, GenerateSubmitError, PipelineInputTensor},
+    driver::{DriverEvent, EngineDriver, GenerateSubmitError, PipelineInputTensor},
+    registry::ModelHandle,
+    session::SessionRegistry,
     sse::{
         StopBoundaryBuffer, completion_chunk, completion_done_chunk, content_chunk, done_chunk,
         role_chunk, send_completion_stream_chunk, send_stream_chunk, tool_calls_chunk,
@@ -225,19 +228,24 @@ fn map_generate_submit_error(err: GenerateSubmitError) -> ApiError {
 pub(crate) async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
     Json(HealthResponse {
         status: "ok",
-        model: state.model_id,
+        model: state.registry.default_id().unwrap_or_default().to_string(),
     })
 }
 
 pub(crate) async fn models(State(state): State<AppState>) -> Json<ModelsResponse> {
     Json(ModelsResponse {
         object: "list",
-        data: vec![ModelObject {
-            id: state.model_id,
-            object: "model",
-            created: now_unix(),
-            owned_by: "onnx-genai",
-        }],
+        data: state
+            .registry
+            .ids()
+            .into_iter()
+            .map(|id| ModelObject {
+                id,
+                object: "model",
+                created: now_unix(),
+                owned_by: "onnx-genai",
+            })
+            .collect(),
     })
 }
 
@@ -247,7 +255,7 @@ pub(crate) async fn status(State(state): State<AppState>) -> Json<StatusResponse
         status: "ready",
         version: env!("CARGO_PKG_VERSION"),
         uptime_seconds: state.started_at.elapsed().as_secs(),
-        model_id: state.model_id,
+        model_id: state.registry.default_id().unwrap_or_default().to_string(),
         active_sessions: snapshot.active_sessions,
         pending_queue_depth: snapshot.pending_requests,
         total_requests: snapshot.total_requests,
@@ -256,13 +264,17 @@ pub(crate) async fn status(State(state): State<AppState>) -> Json<StatusResponse
 }
 
 pub(crate) async fn debug_config(State(state): State<AppState>) -> Json<DebugConfigResponse> {
+    let handle = state
+        .registry
+        .resolve("")
+        .expect("at least one model is loaded");
     Json(DebugConfigResponse {
-        model_id: state.model_id,
-        pipeline: state.pipeline,
+        model_id: handle.id.clone(),
+        pipeline: handle.pipeline,
         max_output_tokens: state.config.max_output_tokens,
         max_sessions: state.config.max_sessions,
         max_queue_depth: state.config.max_queue_depth,
-        model_max_context: state.model_max_context,
+        model_max_context: handle.model_max_context,
     })
 }
 
@@ -282,6 +294,10 @@ pub(crate) async fn debug_sessions(
 }
 
 pub(crate) async fn debug_kv(State(state): State<AppState>) -> Json<DebugKvResponse> {
+    let handle = state
+        .registry
+        .resolve("")
+        .expect("at least one model is loaded");
     let snapshot = crate::metrics::snapshot();
     let prefix_cache_hit_rate = if snapshot.prefix_cache_lookups == 0 {
         0.0
@@ -294,7 +310,7 @@ pub(crate) async fn debug_kv(State(state): State<AppState>) -> Json<DebugKvRespo
         prefix_cache_hit_rate,
         active_batch_size: snapshot.current_batch_size,
         pending_queue_depth: snapshot.pending_requests,
-        available_admission_slots: state.engine.generation_capacity.available_permits(),
+        available_admission_slots: handle.engine.generation_capacity.available_permits(),
         rejected_requests: snapshot.rejections,
         engine_kv_introspection: "unavailable: engine does not yet expose KV page statistics",
     })
@@ -325,7 +341,11 @@ pub(crate) async fn prometheus_metrics() -> Response {
 pub(crate) async fn create_session(
     State(state): State<AppState>,
 ) -> Result<Json<SessionResponse>, ApiError> {
-    if state.pipeline {
+    let handle = state
+        .registry
+        .resolve("")
+        .ok_or_else(|| ApiError::internal("no model loaded"))?;
+    if handle.pipeline {
         return Err(ApiError::bad_request(
             "sessions are not supported by pipeline models",
         ));
@@ -334,7 +354,7 @@ pub(crate) async fn create_session(
         .sessions
         .next_client_id()
         .map_err(|err| ApiError::internal(format!("session id generation failed: {err}")))?;
-    let engine_session_id = state
+    let engine_session_id = handle
         .engine
         .create_session()
         .await
@@ -344,7 +364,7 @@ pub(crate) async fn create_session(
         .sessions
         .insert(client_id.clone(), engine_session_id)
         .map_err(|err| ApiError::internal(format!("session registry failed: {err}")))?;
-    close_evicted_session(&state, evicted).await?;
+    close_evicted_session(&handle.engine, evicted).await?;
 
     Ok(Json(SessionResponse {
         id: client_id,
@@ -356,13 +376,17 @@ pub(crate) async fn delete_session(
     State(state): State<AppState>,
     AxumPath(client_id): AxumPath<String>,
 ) -> Result<StatusCode, ApiError> {
+    let handle = state
+        .registry
+        .resolve("")
+        .ok_or_else(|| ApiError::internal("no model loaded"))?;
     let engine_session_id = state
         .sessions
         .remove(&client_id)
         .map_err(|err| ApiError::internal(format!("session registry failed: {err}")))?
         .ok_or_else(|| ApiError::not_found(format!("session {client_id} not found")))?;
 
-    state
+    handle
         .engine
         .close_session(engine_session_id)
         .await
@@ -376,14 +400,18 @@ pub(crate) async fn completions(
     headers: HeaderMap,
     Json(request): Json<CompletionRequest>,
 ) -> Result<Response, ApiError> {
-    if state.pipeline {
+    let handle = state
+        .registry
+        .resolve(&request.model)
+        .ok_or_else(|| ApiError::internal("no model loaded"))?;
+    if handle.pipeline {
         return Err(ApiError::bad_request(
             "/v1/completions is not supported by pipeline models",
         ));
     }
     validate_completion_request(&request, &state.config)?;
     let session_id = session_id_from_headers(&headers)?;
-    if request.suffix.is_some() && state.fim_config.is_none() {
+    if request.suffix.is_some() && handle.fim_config.is_none() {
         return Err(ApiError::bad_request(
             "FIM is not supported by this model because its tokenizer configuration does not declare recognized FIM tokens",
         ));
@@ -395,11 +423,11 @@ pub(crate) async fn completions(
     }
 
     if request.stream {
-        Ok(stream_completion(state, request, session_id)
+        Ok(stream_completion(state, handle, request, session_id)
             .await?
             .into_response())
     } else {
-        Ok(Json(run_completion(state, request, session_id).await?).into_response())
+        Ok(Json(run_completion(state, handle, request, session_id).await?).into_response())
     }
 }
 
@@ -407,14 +435,18 @@ pub(crate) async fn embeddings(
     State(state): State<AppState>,
     Json(request): Json<EmbeddingRequest>,
 ) -> Result<Json<EmbeddingResponse>, ApiError> {
-    validate_embedding_request(&request, &state.tokenizer)?;
+    let handle = state
+        .registry
+        .resolve(&request.model)
+        .ok_or_else(|| ApiError::internal("no model loaded"))?;
+    validate_embedding_request(&request, &handle.tokenizer)?;
 
     let encoding_format = request.encoding_format;
     let model = request.model.clone();
 
     let inputs: Vec<Vec<u32>> = match request.input {
         EmbeddingInput::String(text) => {
-            let tokens = state.tokenizer.encode(&text).map_err(|err| {
+            let tokens = handle.tokenizer.encode(&text).map_err(|err| {
                 ApiError::internal(format!("input tokenization failed: {err}"))
             })?;
             vec![tokens]
@@ -422,7 +454,7 @@ pub(crate) async fn embeddings(
         EmbeddingInput::Strings(texts) => {
             let mut all = Vec::with_capacity(texts.len());
             for text in &texts {
-                let tokens = state.tokenizer.encode(text).map_err(|err| {
+                let tokens = handle.tokenizer.encode(text).map_err(|err| {
                     ApiError::internal(format!("input tokenization failed: {err}"))
                 })?;
                 all.push(tokens);
@@ -436,7 +468,7 @@ pub(crate) async fn embeddings(
 
     let mut data = Vec::with_capacity(inputs.len());
     for (index, input_ids) in inputs.into_iter().enumerate() {
-        let vector = state
+        let vector = handle
             .engine
             .embed(input_ids, EmbeddingOptions::default())
             .await
@@ -467,6 +499,7 @@ pub(crate) async fn audio_transcriptions(
     let mut filename = None;
     let mut language = None;
     let mut response_format = "json".to_string();
+    let mut model_name = String::new();
 
     while let Some(field) = multipart
         .next_field()
@@ -498,7 +531,7 @@ pub(crate) async fn audio_transcriptions(
                 })?;
             }
             "model" => {
-                let _ = field
+                model_name = field
                     .text()
                     .await
                     .map_err(|err| ApiError::bad_request(format!("invalid model field: {err}")))?;
@@ -506,6 +539,11 @@ pub(crate) async fn audio_transcriptions(
             _ => {}
         }
     }
+
+    let handle = state
+        .registry
+        .resolve(&model_name)
+        .ok_or_else(|| ApiError::internal("no model loaded"))?;
 
     let bytes = file.ok_or_else(|| ApiError::bad_request("multipart field 'file' is required"))?;
     if !matches!(response_format.as_str(), "json" | "text") {
@@ -521,7 +559,7 @@ pub(crate) async fn audio_transcriptions(
             "MP3 audio is not supported yet; provide a PCM16 WAV file",
         ));
     }
-    let spec = state
+    let spec = handle
         .audio_input
         .as_ref()
         .ok_or_else(|| ApiError::bad_request("this model does not support audio transcription"))?;
@@ -531,19 +569,19 @@ pub(crate) async fn audio_transcriptions(
         .max_tokens
         .unwrap_or(state.config.max_output_tokens)
         .min(state.config.max_output_tokens);
-    let token_ids = audio_decoder_prompt(&state.tokenizer, language.as_deref())?;
+    let token_ids = audio_decoder_prompt(&handle.tokenizer, language.as_deref())?;
     let prompt_tokens = token_ids.len();
     let request = GenerateRequest {
         prompt: GeneratePrompt::TokenIds(token_ids),
         options: GenerateOptions {
             max_new_tokens: max_tokens,
             temperature: 0.0,
-            max_context: state.model_max_context,
+            max_context: handle.model_max_context,
             ..GenerateOptions::default()
         },
     };
     let result = collect_generation_result(
-        state
+        handle
             .engine
             .generate_pipeline(
                 request,
@@ -631,6 +669,7 @@ fn validate_embedding_request(
 
 async fn run_completion(
     state: AppState,
+    handle: Arc<ModelHandle>,
     request: CompletionRequest,
     client_session_id: Option<String>,
 ) -> Result<CompletionResponse, ApiError> {
@@ -638,15 +677,15 @@ async fn run_completion(
     let created = now_unix();
     let model = request.model.clone();
     let requested_logprobs = request.logprobs;
-    let tokenizer = state.tokenizer.clone();
-    let prepared = prepare_completion(&request, &state)?;
+    let tokenizer = handle.tokenizer.clone();
+    let prepared = prepare_completion(&request, &handle)?;
     enforce_context_cap(
         prepared.prompt_tokens,
         request.max_tokens,
-        state.model_max_context,
+        handle.model_max_context,
     )?;
     let result = collect_generation_result(
-        submit_completion(&state, prepared.generation, client_session_id.as_deref()).await?,
+        submit_completion(&handle, &state.sessions, prepared.generation, client_session_id.as_deref()).await?,
     )
     .await
     .map_err(|err| ApiError::internal(format!("generation failed: {err}")))?;
@@ -676,6 +715,7 @@ async fn run_completion(
 
 async fn stream_completion(
     state: AppState,
+    handle: Arc<ModelHandle>,
     request: CompletionRequest,
     client_session_id: Option<String>,
 ) -> Result<Sse<ReceiverStream<Result<Event, Infallible>>>, ApiError> {
@@ -683,20 +723,20 @@ async fn stream_completion(
     let created = now_unix();
     let model = request.model.clone();
     let requested_logprobs = request.logprobs;
-    let tokenizer = state.tokenizer.clone();
+    let tokenizer = handle.tokenizer.clone();
     let user_stop_sequences = request
         .stop
         .clone()
         .map(StopInput::into_texts)
         .unwrap_or_default();
-    let prepared = prepare_completion(&request, &state)?;
+    let prepared = prepare_completion(&request, &handle)?;
     enforce_context_cap(
         prepared.prompt_tokens,
         request.max_tokens,
-        state.model_max_context,
+        handle.model_max_context,
     )?;
     let mut driver_rx =
-        submit_completion(&state, prepared.generation, client_session_id.as_deref()).await?;
+        submit_completion(&handle, &state.sessions, prepared.generation, client_session_id.as_deref()).await?;
     crate::metrics::add_prompt_tokens(prepared.prompt_tokens);
     let (tx, rx) = mpsc::channel(16);
 
@@ -796,9 +836,13 @@ pub(crate) async fn chat_completions(
     headers: HeaderMap,
     Json(request): Json<ChatCompletionRequest>,
 ) -> Result<Response, ApiError> {
+    let handle = state
+        .registry
+        .resolve(&request.model)
+        .ok_or_else(|| ApiError::internal("no model loaded"))?;
     validate_request(&request, &state.config)?;
     let session_id = session_id_from_headers(&headers)?;
-    if state.pipeline && session_id.is_some() {
+    if handle.pipeline && session_id.is_some() {
         return Err(ApiError::bad_request(
             "X-Session-Id is not supported by pipeline models",
         ));
@@ -815,41 +859,42 @@ pub(crate) async fn chat_completions(
             "only one input_audio content part is supported per request",
         ));
     }
-    if !image_urls.is_empty() && !state.pipeline {
+    if !image_urls.is_empty() && !handle.pipeline {
         return Err(ApiError::bad_request(
             "this model does not support image input",
         ));
     }
-    if !image_urls.is_empty() && state.vision_input.is_none() {
+    if !image_urls.is_empty() && handle.vision_input.is_none() {
         return Err(ApiError::bad_request(
             "this pipeline model does not support image input",
         ));
     }
-    if !input_audio.is_empty() && !state.pipeline {
+    if !input_audio.is_empty() && !handle.pipeline {
         return Err(ApiError::bad_request(
             "this model does not support audio input",
         ));
     }
-    if !input_audio.is_empty() && state.audio_input.is_none() {
+    if !input_audio.is_empty() && handle.audio_input.is_none() {
         return Err(ApiError::bad_request(
             "this pipeline model does not support audio input",
         ));
     }
     if request.stream {
         Ok(
-            stream_chat_completion(state, request, session_id, image_urls, input_audio)
+            stream_chat_completion(state, handle, request, session_id, image_urls, input_audio)
                 .await?
                 .into_response(),
         )
     } else {
         let response =
-            run_chat_completion(state, request, session_id, image_urls, input_audio).await?;
+            run_chat_completion(state, handle, request, session_id, image_urls, input_audio).await?;
         Ok(Json(response).into_response())
     }
 }
 
 async fn run_chat_completion(
     state: AppState,
+    handle: Arc<ModelHandle>,
     request: ChatCompletionRequest,
     client_session_id: Option<String>,
     image_urls: Vec<String>,
@@ -861,27 +906,27 @@ async fn run_chat_completion(
     let requested_top_logprobs = request
         .logprobs
         .then_some(request.top_logprobs.unwrap_or(0));
-    let tokenizer = state.tokenizer.clone();
+    let tokenizer = handle.tokenizer.clone();
     let mut prepared = prepare_generate_request(
         &request,
-        &state.tokenizer,
-        state.chat_template.as_deref(),
+        &handle.tokenizer,
+        handle.chat_template.as_deref(),
         client_session_id.is_some(),
     )
     .map_err(|err| ApiError::internal(format!("prompt tokenization failed: {err}")))?;
     if !input_audio.is_empty() {
-        prepared = prepare_audio_generate_request(&request, &state.tokenizer)?;
+        prepared = prepare_audio_generate_request(&request, &handle.tokenizer)?;
     }
     enforce_context_cap(
         prepared.prompt_tokens,
         request.max_tokens,
-        state.model_max_context,
+        handle.model_max_context,
     )?;
     let prompt_tokens = prepared.prompt_tokens;
     let mut generation_request = prepared.request;
-    generation_request.options.max_context = state.model_max_context;
+    generation_request.options.max_context = handle.model_max_context;
     let session_lookup = if let Some(id) = client_session_id.as_deref() {
-        Some(get_or_create_session(&state, id).await?)
+        Some(get_or_create_session(&handle.engine, &state.sessions, id).await?)
     } else {
         None
     };
@@ -891,7 +936,7 @@ async fn run_chat_completion(
     let pipeline_input = if !image_urls.is_empty() {
         let image = crate::image_input::load_and_preprocess(
             &image_urls,
-            state
+            handle
                 .vision_input
                 .as_ref()
                 .expect("vision input checked before generation"),
@@ -905,18 +950,18 @@ async fn run_chat_completion(
             num_tiles: Some(image.num_tiles),
         })
     } else if let Some(audio) = input_audio.first() {
-        Some(preprocess_chat_audio(audio, &state)?)
+        Some(preprocess_chat_audio(audio, &handle)?)
     } else {
         None
     };
-    let result = collect_generation_result(if state.pipeline {
-        state
+    let result = collect_generation_result(if handle.pipeline {
+        handle
             .engine
             .generate_pipeline(generation_request, pipeline_input)
             .await
             .map_err(map_generate_submit_error)?
     } else {
-        state
+        handle
             .engine
             .generate(session_lookup, generation_request)
             .await
@@ -928,7 +973,7 @@ async fn run_chat_completion(
 
     let session_token_count = if let Some(engine_session_id) = session_for_count {
         Some(
-            state
+            handle
                 .engine
                 .session_token_count(engine_session_id)
                 .await
@@ -996,6 +1041,7 @@ async fn run_chat_completion(
 
 async fn stream_chat_completion(
     state: AppState,
+    handle: Arc<ModelHandle>,
     request: ChatCompletionRequest,
     client_session_id: Option<String>,
     image_urls: Vec<String>,
@@ -1007,7 +1053,7 @@ async fn stream_chat_completion(
     let requested_top_logprobs = request
         .logprobs
         .then_some(request.top_logprobs.unwrap_or(0));
-    let tokenizer = state.tokenizer.clone();
+    let tokenizer = handle.tokenizer.clone();
     let user_stop_sequences = request
         .stop
         .clone()
@@ -1015,32 +1061,32 @@ async fn stream_chat_completion(
         .unwrap_or_default();
     let mut prepared = prepare_generate_request(
         &request,
-        &state.tokenizer,
-        state.chat_template.as_deref(),
+        &handle.tokenizer,
+        handle.chat_template.as_deref(),
         client_session_id.is_some(),
     )
     .map_err(|err| ApiError::internal(format!("prompt tokenization failed: {err}")))?;
     if !input_audio.is_empty() {
-        prepared = prepare_audio_generate_request(&request, &state.tokenizer)?;
+        prepared = prepare_audio_generate_request(&request, &handle.tokenizer)?;
     }
     enforce_context_cap(
         prepared.prompt_tokens,
         request.max_tokens,
-        state.model_max_context,
+        handle.model_max_context,
     )?;
     let wants_json_object = request.wants_json_object();
     let mut generation_request = prepared.request;
-    generation_request.options.max_context = state.model_max_context;
+    generation_request.options.max_context = handle.model_max_context;
     let (tx, rx) = mpsc::channel(16);
     let session_lookup = if let Some(id) = client_session_id.as_deref() {
-        Some(get_or_create_session(&state, id).await?)
+        Some(get_or_create_session(&handle.engine, &state.sessions, id).await?)
     } else {
         None
     };
     let pipeline_input = if !image_urls.is_empty() {
         let image = crate::image_input::load_and_preprocess(
             &image_urls,
-            state
+            handle
                 .vision_input
                 .as_ref()
                 .expect("vision input checked before generation"),
@@ -1054,18 +1100,18 @@ async fn stream_chat_completion(
             num_tiles: Some(image.num_tiles),
         })
     } else if let Some(audio) = input_audio.first() {
-        Some(preprocess_chat_audio(audio, &state)?)
+        Some(preprocess_chat_audio(audio, &handle)?)
     } else {
         None
     };
-    let mut driver_rx = if state.pipeline {
-        state
+    let mut driver_rx = if handle.pipeline {
+        handle
             .engine
             .generate_pipeline(generation_request, pipeline_input)
             .await
             .map_err(map_generate_submit_error)?
     } else {
-        state
+        handle
             .engine
             .generate(session_lookup, generation_request)
             .await
@@ -1254,11 +1300,11 @@ pub(crate) async fn collect_generation_result(
 
 fn preprocess_chat_audio(
     input: &InputAudio,
-    state: &AppState,
+    handle: &ModelHandle,
 ) -> Result<PipelineInputTensor, ApiError> {
     let bytes = crate::audio_input::decode_chat_audio(input)
         .map_err(|err| ApiError::bad_request(format!("invalid audio input: {err}")))?;
-    let spec = state
+    let spec = handle
         .audio_input
         .as_ref()
         .expect("audio input checked before generation");
@@ -1481,35 +1527,35 @@ fn session_id_from_headers(headers: &HeaderMap) -> Result<Option<String>, ApiErr
     Ok(Some(session_id.to_string()))
 }
 
-async fn get_or_create_session(state: &AppState, client_id: &str) -> Result<SessionId, ApiError> {
-    if let Some(engine_session_id) = state
-        .sessions
+async fn get_or_create_session(
+    engine: &EngineDriver,
+    sessions: &SessionRegistry,
+    client_id: &str,
+) -> Result<SessionId, ApiError> {
+    if let Some(engine_session_id) = sessions
         .get(client_id)
         .map_err(|err| ApiError::internal(format!("session registry failed: {err}")))?
     {
         return Ok(engine_session_id);
     }
 
-    let engine_session_id = state
-        .engine
+    let engine_session_id = engine
         .create_session()
         .await
         .map_err(|err| ApiError::internal(format!("session create failed: {err}")))?;
-    let evicted = state
-        .sessions
+    let evicted = sessions
         .insert(client_id.to_string(), engine_session_id)
         .map_err(|err| ApiError::internal(format!("session registry failed: {err}")))?;
-    close_evicted_session(state, evicted).await?;
+    close_evicted_session(engine, evicted).await?;
     Ok(engine_session_id)
 }
 
 async fn close_evicted_session(
-    state: &AppState,
+    engine: &EngineDriver,
     evicted: Option<SessionId>,
 ) -> Result<(), ApiError> {
     if let Some(evicted) = evicted {
-        state
-            .engine
+        engine
             .close_session(evicted)
             .await
             .map_err(|err| ApiError::internal(format!("evicted session close failed: {err}")))?;
@@ -1526,17 +1572,17 @@ pub fn build_generate_request(request: &ChatCompletionRequest) -> GenerateReques
 
 pub(crate) fn prepare_completion(
     request: &CompletionRequest,
-    state: &AppState,
+    handle: &ModelHandle,
 ) -> Result<PreparedCompletion, ApiError> {
-    let mut options = build_completion_options(request, &state.tokenizer);
-    options.max_context = state.model_max_context;
+    let mut options = build_completion_options(request, &handle.tokenizer);
+    options.max_context = handle.model_max_context;
     if let Some(suffix) = request.suffix.as_ref() {
-        let fim_config = state
+        let fim_config = handle
             .fim_config
             .as_ref()
             .ok_or_else(|| ApiError::bad_request("FIM is not supported by this model"))?;
         let prompt = fim_config.format_prompt(&request.prompt, suffix);
-        let prompt_tokens = tokenize_prompt(&state.tokenizer, &prompt)?;
+        let prompt_tokens = tokenize_prompt(&handle.tokenizer, &prompt)?;
         Ok(PreparedCompletion {
             generation: CompletionGeneration::Fim {
                 prefix: request.prompt.clone(),
@@ -1546,7 +1592,7 @@ pub(crate) fn prepare_completion(
             prompt_tokens,
         })
     } else {
-        let token_ids = state
+        let token_ids = handle
             .tokenizer
             .encode(&request.prompt)
             .map_err(|err| ApiError::internal(format!("prompt tokenization failed: {err}")))?;
@@ -1562,18 +1608,19 @@ pub(crate) fn prepare_completion(
 }
 
 async fn submit_completion(
-    state: &AppState,
+    handle: &ModelHandle,
+    sessions: &SessionRegistry,
     generation: CompletionGeneration,
     client_session_id: Option<&str>,
 ) -> Result<mpsc::Receiver<DriverEvent>, ApiError> {
     match generation {
         CompletionGeneration::Plain(request) => {
             let session_id = if let Some(id) = client_session_id {
-                Some(get_or_create_session(state, id).await?)
+                Some(get_or_create_session(&handle.engine, sessions, id).await?)
             } else {
                 None
             };
-            state
+            handle
                 .engine
                 .generate(session_id, request)
                 .await
@@ -1584,11 +1631,11 @@ async fn submit_completion(
             suffix,
             options,
         } => {
-            let fim_config = state
+            let fim_config = handle
                 .fim_config
                 .clone()
                 .ok_or_else(|| ApiError::bad_request("FIM is not supported by this model"))?;
-            state
+            handle
                 .engine
                 .generate_fim(prefix, suffix, fim_config, options)
                 .await

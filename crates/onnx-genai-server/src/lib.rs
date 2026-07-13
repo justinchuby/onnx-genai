@@ -21,6 +21,7 @@ mod audio_input;
 mod driver;
 mod image_input;
 mod metrics;
+mod registry;
 mod routes;
 mod session;
 mod sse;

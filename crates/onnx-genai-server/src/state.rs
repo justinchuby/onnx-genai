@@ -2,14 +2,20 @@ use std::{path::Path, sync::Arc, time::Instant};
 
 use anyhow::Context;
 use onnx_genai::{Engine, EngineConfig};
-use onnx_genai_engine::{FimConfig, KvDType};
+use onnx_genai_engine::KvDType;
 use onnx_genai_metadata::PipelineStrategy;
 use onnx_genai_ort::{
     ChatTemplate, DataType, ModelDirectory, PipelineModelDirectory, PipelineModels, Tokenizer,
 };
 
+#[cfg(test)]
+use onnx_genai_engine::FimConfig;
+
 use crate::{
-    audio_input::AudioInputSpec, driver::EngineDriver, image_input::VisionInputSpec,
+    audio_input::AudioInputSpec,
+    driver::EngineDriver,
+    image_input::VisionInputSpec,
+    registry::{ModelHandle, ModelRegistry},
     session::SessionRegistry,
 };
 
@@ -35,17 +41,9 @@ pub fn parse_kv_cache_dtype(s: &str) -> Result<KvDType, String> {
 
 #[derive(Clone)]
 pub struct AppState {
-    pub(crate) model_id: String,
-    pub(crate) engine: EngineDriver,
-    pub(crate) tokenizer: Arc<Tokenizer>,
-    pub(crate) chat_template: Option<Arc<ChatTemplate>>,
+    pub(crate) registry: ModelRegistry,
     pub(crate) sessions: SessionRegistry,
     pub(crate) config: ServerConfig,
-    pub(crate) model_max_context: Option<usize>,
-    pub(crate) fim_config: Option<FimConfig>,
-    pub(crate) pipeline: bool,
-    pub(crate) vision_input: Option<VisionInputSpec>,
-    pub(crate) audio_input: Option<AudioInputSpec>,
     pub(crate) started_at: Instant,
 }
 
@@ -219,18 +217,23 @@ impl AppState {
         drop(models);
 
         let engine = Engine::from_pipeline_dir(model_dir, config.engine_config.clone())?;
-        Ok(Self {
+        let handle = ModelHandle::new(
             model_id,
-            engine: EngineDriver::start_pipeline(engine, config.max_queue_depth),
-            tokenizer: Arc::new(tokenizer),
-            chat_template: chat_template.map(Arc::new),
-            sessions: SessionRegistry::new(config.max_sessions),
-            config,
+            EngineDriver::start_pipeline(engine, config.max_queue_depth),
+            Arc::new(tokenizer),
+            chat_template.map(Arc::new),
             model_max_context,
-            fim_config: None,
-            pipeline: true,
+            None,
+            true,
             vision_input,
             audio_input,
+        );
+        let mut registry = ModelRegistry::new();
+        registry.insert(Arc::new(handle));
+        Ok(Self {
+            registry,
+            sessions: SessionRegistry::new(config.max_sessions),
+            config,
             started_at: Instant::now(),
         })
     }
@@ -265,24 +268,55 @@ impl AppState {
     ) -> Self {
         let config = config.validate().expect("validated server config");
         let fim_config = engine.fim_config().cloned();
-        Self {
+        let engine_driver = EngineDriver::start(engine, DEFAULT_MAX_BATCH, config.max_queue_depth);
+        let handle = ModelHandle::new(
             model_id,
-            engine: EngineDriver::start(engine, DEFAULT_MAX_BATCH, config.max_queue_depth),
-            tokenizer: Arc::new(tokenizer),
-            chat_template: chat_template.map(Arc::new),
-            sessions: SessionRegistry::new(config.max_sessions),
-            config,
+            engine_driver,
+            Arc::new(tokenizer),
+            chat_template.map(Arc::new),
             model_max_context,
             fim_config,
-            pipeline: false,
-            vision_input: None,
-            audio_input: None,
+            false,
+            None,
+            None,
+        );
+        let mut registry = ModelRegistry::new();
+        registry.insert(Arc::new(handle));
+        Self {
+            registry,
+            sessions: SessionRegistry::new(config.max_sessions),
+            config,
             started_at: Instant::now(),
         }
     }
 
+    /// Returns the id of the first loaded model, for use in log messages and the CLI.
     pub fn model_id(&self) -> &str {
-        &self.model_id
+        self.registry.default_id().unwrap_or("onnx-genai-model")
+    }
+}
+
+#[cfg(test)]
+impl AppState {
+    /// Replace the fim_config of the default (sole) loaded model.
+    ///
+    /// Used in tests that need FIM without a real model that declares FIM tokens.
+    pub(crate) fn with_default_fim_config(mut self, fim_config: Option<FimConfig>) -> Self {
+        let id = self
+            .registry
+            .default_id()
+            .expect("registry must have a model")
+            .to_string();
+        let old_arc = self
+            .registry
+            .models
+            .remove(&id)
+            .expect("default model must exist");
+        let old = Arc::try_unwrap(old_arc)
+            .unwrap_or_else(|_| panic!("unique handle ownership during test setup"));
+        let new_handle = Arc::new(ModelHandle { fim_config, ..old });
+        self.registry.insert(new_handle);
+        self
     }
 }
 
