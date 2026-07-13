@@ -49,3 +49,7 @@ htmlcov/
 .squad/.cache/
 # Squad: SubSquad activation file (local to this machine)
 .squad-workstream
+
+# Local H200 CUDA benchmark artifacts
+.ort-cuda-1.27/
+.cudaenv.sh
