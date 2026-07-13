@@ -117,10 +117,7 @@ pub(crate) fn default_sampler_for_options(
 /// `f32::max` propagates the non-NaN operand, so NaNs are ignored exactly as in
 /// the scalar version; an all-NaN (or empty) input yields token 0.
 pub fn sample_greedy(logits: &[f32]) -> u32 {
-    let max_logit = logits
-        .iter()
-        .copied()
-        .fold(f32::NEG_INFINITY, f32::max);
+    let max_logit = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     if max_logit == f32::NEG_INFINITY {
         // Empty input, all-NaN, or all -inf: token 0 (matches the first
         // element the scalar running-best scan would have selected).

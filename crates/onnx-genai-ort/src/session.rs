@@ -363,8 +363,8 @@ impl Session {
 
         let result = (|| {
             let key = CString::new("gpu_graph_id").expect("literal has no NUL");
-            let value = CString::new(graph_annotation_id.to_string())
-                .expect("integer string has no NUL");
+            let value =
+                CString::new(graph_annotation_id.to_string()).expect("integer string has no NUL");
             // SAFETY: run options handle and NUL-terminated strings are valid.
             crate::error::check_status(unsafe {
                 add_entry(run_options.as_ptr(), key.as_ptr(), value.as_ptr())
@@ -394,9 +394,7 @@ impl Session {
             return Ok(());
         };
         // SAFETY: `self.ptr` is a valid session handle for the session lifetime.
-        crate::error::check_status(unsafe {
-            release(self.ptr.as_ptr(), graph_annotation_id)
-        })
+        crate::error::check_status(unsafe { release(self.ptr.as_ptr(), graph_annotation_id) })
     }
 
     /// Get input names.

@@ -407,7 +407,8 @@ impl<'a> DecodeSession<'a> {
         // The mask is zero-initialized and valid_len grows monotonically within
         // a generation, so writing the leading ones each step keeps the trailing
         // (unused) region zeroed without a full rewrite.
-        cap.attention_mask.write_i64_prefix(&vec![1i64; valid_len])?;
+        cap.attention_mask
+            .write_i64_prefix(&vec![1i64; valid_len])?;
 
         // Re-bind the persistent buffers every step. ORT keys its stable
         // internal device input buffers off the binding and re-copies the bound
@@ -466,9 +467,9 @@ impl<'a> DecodeSession<'a> {
         if self.capture.is_some() {
             return Ok(());
         }
-        let mask_len = self
-            .max_length
-            .ok_or_else(|| OrtError::InvalidArgument("captured decode requires max_length".into()))?;
+        let mask_len = self.max_length.ok_or_else(|| {
+            OrtError::InvalidArgument("captured decode requires max_length".into())
+        })?;
         let logits_info = self
             .session
             .outputs()
@@ -480,7 +481,9 @@ impl<'a> DecodeSession<'a> {
             .last()
             .copied()
             .filter(|dim| *dim > 0)
-            .ok_or_else(|| OrtError::InvalidArgument("logits output has no static vocab dim".into()))?;
+            .ok_or_else(|| {
+                OrtError::InvalidArgument("logits output has no static vocab dim".into())
+            })?;
 
         let input_ids = Value::from_vec_i64(vec![0i64], &[1, 1])?;
         let position_ids = Value::from_vec_i64(vec![0i64], &[1, 1])?;
@@ -611,7 +614,8 @@ impl<'a> DecodeSession<'a> {
     /// the trailing (masked-out) region.
     fn reset_captured_mask(&self) -> Result<()> {
         if let Some(cap) = self.capture.as_ref() {
-            cap.attention_mask.write_i64_prefix(&vec![0i64; cap.mask_len])?;
+            cap.attention_mask
+                .write_i64_prefix(&vec![0i64; cap.mask_len])?;
         }
         Ok(())
     }
