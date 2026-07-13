@@ -30,6 +30,7 @@ mod state;
 mod types;
 
 pub use models_config::{ModelsConfig, ModelSpec, from_models_dir};
+pub use registry::EvictionPolicy;
 pub use routes::{
     ParsedAssistantOutput, build_generate_request, build_prompt, parse_assistant_output,
     parse_tool_calls,
@@ -65,6 +66,15 @@ pub fn app(state: AppState) -> Router {
             .route("/v1/debug/sessions", get(routes::debug_sessions))
             .route("/v1/debug/kv", get(routes::debug_kv))
             .route("/v1/debug/trace", get(routes::debug_trace));
+    }
+    if state.config.enable_admin_endpoints {
+        router = router
+            .route("/v1/admin/models", get(routes::admin_list_models))
+            .route(
+                "/v1/admin/models/{id}/load",
+                post(routes::admin_load_model),
+            )
+            .route("/v1/admin/models/{id}", delete(routes::admin_unload_model));
     }
     #[cfg(feature = "metrics")]
     let router = router.route("/metrics", get(routes::prometheus_metrics));

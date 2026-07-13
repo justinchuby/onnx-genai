@@ -10,7 +10,8 @@
 //! [[models]]
 //! id    = "my-embedder"
 //! path  = "/models/my-embedder"
-//! # eager defaults to true; set false to declare the model without loading it at startup (M3+)
+//! # eager defaults to true; set false to declare the model without loading it at
+//! # startup — it is lazily loaded on first request.
 //! eager = false
 //! ```
 //!
@@ -46,9 +47,8 @@ pub struct ModelSpec {
     /// Filesystem path to the model directory.
     pub path: PathBuf,
     /// If `true` (the default), the model is loaded immediately at server startup.
-    /// If `false`, the model is recorded as available but not loaded; actual lazy
-    /// loading is implemented in M3+.  For M2 all specs are loaded eagerly regardless
-    /// of this flag — a `false` value is accepted but treated as `true`.
+    /// If `false`, the model is recorded as available but not loaded; it is lazily
+    /// loaded on the first request that routes to it (or via the admin load endpoint).
     #[serde(default = "default_true")]
     pub eager: bool,
 }

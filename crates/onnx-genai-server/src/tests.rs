@@ -1660,7 +1660,7 @@ async fn single_model_startup_still_works_via_load_with_config() {
             .expect("single-model load must still work");
     // Registry has exactly one entry with the expected id.
     assert_eq!(state.registry.ids().len(), 1);
-    assert_eq!(state.registry.default_id(), Some("tiny-llm"));
+    assert_eq!(state.registry.default_id().as_deref(), Some("tiny-llm"));
 
     let resp = app(state)
         .oneshot(
@@ -1682,4 +1682,264 @@ async fn single_model_startup_still_works_via_load_with_config() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+}
+
+// ── M3: runtime load/unload + LRU eviction + lazy load tests ─────────────────
+
+/// Build a two-model state where `model-a` is eager and `model-b` is lazy.
+/// Both are backed by the tiny-llm fixture. `config` lets callers toggle admin
+/// endpoints and the loaded-model cap.
+fn lazy_state(config: ServerConfig) -> AppState {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
+    let specs = vec![
+        ModelSpec { id: "model-a".to_string(), path: path.clone(), eager: true },
+        ModelSpec { id: "model-b".to_string(), path: path.clone(), eager: false },
+    ];
+    AppState::load_from_specs(specs, config).expect("load lazy two-model state")
+}
+
+fn chat_request(model: &str) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            json!({
+                "model": model,
+                "messages": [{"role": "user", "content": "hello"}],
+                "max_tokens": 1,
+                "temperature": 0.0
+            })
+            .to_string(),
+        ))
+        .unwrap()
+}
+
+async fn json_body(resp: axum::response::Response) -> Value {
+    serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap()
+}
+
+#[tokio::test]
+async fn lazy_model_is_loaded_on_first_request() {
+    let state = lazy_state(ServerConfig::default());
+    // Only the eager model is loaded at startup.
+    assert_eq!(state.registry.ids(), vec!["model-a"]);
+    assert!(state.registry.contains_available("model-b"));
+
+    // Routing to the lazy model triggers a load and succeeds.
+    let resp = app(state.clone())
+        .oneshot(chat_request("model-b"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["model"], "model-b");
+
+    // The shared registry now has both models loaded.
+    let mut ids = state.registry.ids();
+    ids.sort();
+    assert_eq!(ids, vec!["model-a", "model-b"]);
+}
+
+#[tokio::test]
+async fn admin_load_then_route_to_lazy_model() {
+    let state = lazy_state(ServerConfig {
+        enable_admin_endpoints: true,
+        ..ServerConfig::default()
+    });
+
+    // Admin-load the lazy model.
+    let resp = app(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/admin/models/model-b/load")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(state.registry.resolve("model-b").is_some());
+
+    // Subsequent routing works without re-loading.
+    let resp = app(state.clone())
+        .oneshot(chat_request("model-b"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn admin_unload_then_lazy_reload() {
+    let state = lazy_state(ServerConfig {
+        enable_admin_endpoints: true,
+        ..ServerConfig::default()
+    });
+    // Unload the eager, default model.
+    let resp = app(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/v1/admin/models/model-a")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert!(state.registry.resolve("model-a").is_none());
+    // The spec is retained for lazy reload.
+    assert!(state.registry.contains_available("model-a"));
+
+    // A subsequent request for the default (empty model) lazily reloads it.
+    let resp = app(state.clone())
+        .oneshot(chat_request(""))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(state.registry.resolve("model-a").is_some());
+}
+
+#[tokio::test]
+async fn admin_unload_unknown_model_returns_404() {
+    let state = lazy_state(ServerConfig {
+        enable_admin_endpoints: true,
+        ..ServerConfig::default()
+    });
+    // model-b is available but not loaded → unload is a 404.
+    let resp = app(state)
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/v1/admin/models/model-b")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn admin_load_unknown_model_returns_404() {
+    let state = lazy_state(ServerConfig {
+        enable_admin_endpoints: true,
+        ..ServerConfig::default()
+    });
+    let resp = app(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/admin/models/no-such-model/load")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn max_loaded_models_evicts_least_recently_used() {
+    let state = lazy_state(ServerConfig {
+        enable_admin_endpoints: true,
+        max_loaded_models: Some(1),
+        ..ServerConfig::default()
+    });
+    // model-a is loaded at startup (cap = 1).
+    assert_eq!(state.registry.ids(), vec!["model-a"]);
+
+    // Loading model-b must evict model-a to respect the cap.
+    let resp = app(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/admin/models/model-b/load")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(state.registry.ids(), vec!["model-b"], "model-a should be evicted");
+    assert!(state.registry.contains_available("model-a"));
+}
+
+#[tokio::test]
+async fn admin_list_reports_loaded_and_available() {
+    let state = lazy_state(ServerConfig {
+        enable_admin_endpoints: true,
+        ..ServerConfig::default()
+    });
+    let resp = app(state)
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/v1/admin/models")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    let entries = body["data"].as_array().unwrap();
+    assert_eq!(entries.len(), 2);
+    let a = entries.iter().find(|e| e["id"] == "model-a").unwrap();
+    let b = entries.iter().find(|e| e["id"] == "model-b").unwrap();
+    assert_eq!(a["loaded"], true);
+    assert_eq!(a["is_default"], true);
+    assert!(a["last_request_at"].is_number());
+    assert_eq!(b["loaded"], false);
+    assert_eq!(b["is_default"], false);
+    assert!(b["last_request_at"].is_null());
+}
+
+#[tokio::test]
+async fn admin_endpoints_return_404_when_gate_is_off() {
+    // Admin endpoints disabled (default): routes are not mounted.
+    let state = lazy_state(ServerConfig::default());
+    for (method, uri) in [
+        ("GET", "/v1/admin/models"),
+        ("POST", "/v1/admin/models/model-b/load"),
+        ("DELETE", "/v1/admin/models/model-a"),
+    ] {
+        let resp = app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "{method} {uri} must 404 when admin endpoints are disabled"
+        );
+    }
+}
+
+#[tokio::test]
+async fn concurrent_lazy_loads_of_same_id_load_once() {
+    let state = lazy_state(ServerConfig::default());
+    // Fire many concurrent requests for the same lazy model.
+    let mut handles = Vec::new();
+    for _ in 0..8 {
+        let state = state.clone();
+        handles.push(tokio::spawn(async move {
+            app(state).oneshot(chat_request("model-b")).await.unwrap().status()
+        }));
+    }
+    for handle in handles {
+        assert_eq!(handle.await.unwrap(), StatusCode::OK);
+    }
+    // Exactly one loaded instance of model-b exists in the registry.
+    assert!(state.registry.resolve("model-b").is_some());
+    let mut ids = state.registry.ids();
+    ids.sort();
+    assert_eq!(ids, vec!["model-a", "model-b"]);
 }

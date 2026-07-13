@@ -16,7 +16,7 @@ use crate::{
     driver::EngineDriver,
     image_input::VisionInputSpec,
     models_config::ModelSpec,
-    registry::{ModelHandle, ModelRegistry},
+    registry::{EvictionPolicy, ModelHandle, ModelRegistry},
     session::SessionRegistry,
 };
 
@@ -59,6 +59,17 @@ pub struct ServerConfig {
     /// expose server internals and should only be used on loopback-bound instances or
     /// behind an authenticated reverse proxy.
     pub enable_debug_endpoints: bool,
+    /// Enable the /v1/admin/models/* runtime model-management endpoints. Off by
+    /// default; enable with `--enable-admin-endpoints` or `ONNX_GENAI_ADMIN_ENDPOINTS=1`.
+    /// These endpoints load and unload models at runtime and should only be exposed
+    /// on loopback-bound instances or behind an authenticated reverse proxy.
+    pub enable_admin_endpoints: bool,
+    /// Maximum number of models kept loaded in memory at once. `None` (the default)
+    /// means unlimited. When set, loading an additional model beyond the cap evicts
+    /// the least-recently-used loaded model (never dropping below one model).
+    pub max_loaded_models: Option<usize>,
+    /// Policy used to pick an eviction victim when `max_loaded_models` is exceeded.
+    pub eviction_policy: EvictionPolicy,
     /// Engine configuration, including KV cache storage dtype.
     pub engine_config: EngineConfig,
 }
@@ -70,6 +81,9 @@ impl Default for ServerConfig {
             max_sessions: DEFAULT_MAX_SESSIONS,
             max_queue_depth: DEFAULT_MAX_QUEUE_DEPTH,
             enable_debug_endpoints: false,
+            enable_admin_endpoints: false,
+            max_loaded_models: None,
+            eviction_policy: EvictionPolicy::Lru,
             engine_config: EngineConfig::default(),
         }
     }
@@ -86,6 +100,9 @@ impl ServerConfig {
         if self.max_queue_depth == 0 {
             anyhow::bail!("max_queue_depth must be greater than zero");
         }
+        if self.max_loaded_models == Some(0) {
+            anyhow::bail!("max_loaded_models must be greater than zero when set");
+        }
         Ok(self)
     }
 }
@@ -96,7 +113,8 @@ impl AppState {
 
     /// Load a single model from `model_dir`, wrapping it in a one-entry registry.
     ///
-    /// This is the single-`--model` startup path.  Behaviour is identical to M1.
+    /// This is the single-`--model` startup path.  The model is recorded as an
+    /// eager spec so it is both loaded at startup and reloadable after an unload.
     pub fn load_with_config(
         model_dir: &Path,
         model_id: Option<String>,
@@ -104,9 +122,12 @@ impl AppState {
     ) -> anyhow::Result<Self> {
         let config = config.validate()?;
         let model_id = model_id.unwrap_or_else(|| infer_model_id(model_dir));
-        let handle = load_one_handle(model_dir, model_id, &config)?;
-        let mut registry = ModelRegistry::new();
-        registry.insert(handle);
+        let spec = ModelSpec {
+            id: model_id,
+            path: model_dir.to_path_buf(),
+            eager: true,
+        };
+        let registry = ModelRegistry::from_specs(std::slice::from_ref(&spec), config.clone())?;
         Ok(Self {
             registry,
             sessions: SessionRegistry::new(config.max_sessions),
@@ -117,29 +138,17 @@ impl AppState {
 
     /// Load multiple models from a list of `ModelSpec`s and build a multi-entry registry.
     ///
-    /// **M2 loading strategy:** all specs are loaded eagerly at startup, regardless of
-    /// the `eager` flag.  Specs with `eager = false` are accepted without error but
-    /// treated the same as `eager = true`; true lazy-loading is deferred to M3.
+    /// **M3 loading strategy:** every spec is recorded as available.  Specs with
+    /// `eager = true` are loaded at startup; `eager = false` specs are lazily loaded
+    /// on first request.  The first spec becomes the default model.
     ///
-    /// Fails fast if any spec fails to load.
+    /// Fails fast if any eager spec fails to load.
     pub fn load_from_specs(specs: Vec<ModelSpec>, config: ServerConfig) -> anyhow::Result<Self> {
         if specs.is_empty() {
             anyhow::bail!("at least one model spec is required");
         }
         let config = config.validate()?;
-        let mut registry = ModelRegistry::new();
-        for spec in &specs {
-            tracing::info!(id = %spec.id, path = %spec.path.display(), "loading model");
-            let handle = load_one_handle(&spec.path, spec.id.clone(), &config)
-                .with_context(|| {
-                    format!(
-                        "failed to load model '{}' from '{}'",
-                        spec.id,
-                        spec.path.display()
-                    )
-                })?;
-            registry.insert(handle);
-        }
+        let registry = ModelRegistry::from_specs(&specs, config.clone())?;
         Ok(Self {
             registry,
             sessions: SessionRegistry::new(config.max_sessions),
@@ -190,8 +199,7 @@ impl AppState {
             None,
             None,
         );
-        let mut registry = ModelRegistry::new();
-        registry.insert(Arc::new(handle));
+        let registry = ModelRegistry::from_handle(Arc::new(handle), config.clone());
         Self {
             registry,
             sessions: SessionRegistry::new(config.max_sessions),
@@ -201,8 +209,10 @@ impl AppState {
     }
 
     /// Returns the id of the first loaded model, for use in log messages and the CLI.
-    pub fn model_id(&self) -> &str {
-        self.registry.default_id().unwrap_or("onnx-genai-model")
+    pub fn model_id(&self) -> String {
+        self.registry
+            .default_id()
+            .unwrap_or_else(|| "onnx-genai-model".to_string())
     }
 }
 
@@ -211,23 +221,8 @@ impl AppState {
     /// Replace the fim_config of the default (sole) loaded model.
     ///
     /// Used in tests that need FIM without a real model that declares FIM tokens.
-    pub(crate) fn with_default_fim_config(mut self, fim_config: Option<FimConfig>) -> Self {
-        let id = self
-            .registry
-            .default_id()
-            .expect("registry must have a model")
-            .to_string();
-        let old_arc = self
-            .registry
-            .models
-            .remove(&id)
-            .expect("default model must exist");
-        let old = Arc::try_unwrap(old_arc)
-            .unwrap_or_else(|_| panic!("unique handle ownership during test setup"));
-        let new_handle = Arc::new(ModelHandle { fim_config, ..old });
-        // Reinsert directly: `id` is already recorded in `order` and `default_id`;
-        // only the map value needs updating, so bypass `insert`'s order-tracking.
-        self.registry.models.insert(id, new_handle);
+    pub(crate) fn with_default_fim_config(self, fim_config: Option<FimConfig>) -> Self {
+        self.registry.set_default_fim_config(fim_config);
         self
     }
 }
@@ -276,15 +271,16 @@ fn load_model_max_context(metadata_path: Option<&Path>) -> anyhow::Result<Option
     Ok(metadata.model.and_then(|model| model.max_sequence_length))
 }
 
-/// Load one model (plain or pipeline) from `model_dir` and return a ready handle.
+/// Build one model handle (plain or pipeline) from a `ModelSpec`.
 ///
-/// `config` must already be validated.  This is the shared inner loader used by
-/// both `load_with_config` (single-model path) and `load_from_specs` (multi-model path).
-fn load_one_handle(
-    model_dir: &Path,
-    model_id: String,
-    config: &ServerConfig,
-) -> anyhow::Result<Arc<ModelHandle>> {
+/// `config` must already be validated.  This is the single shared construction
+/// path used by both startup (`ModelRegistry::from_specs`) and runtime lazy
+/// loading (`ModelRegistry::load`).  It is a **blocking** function (it calls
+/// `Engine::from_dir`, which takes seconds) and must therefore be invoked from a
+/// blocking context (e.g. at startup or via `tokio::task::spawn_blocking`).
+pub(crate) fn build_handle(spec: &ModelSpec, config: &ServerConfig) -> anyhow::Result<ModelHandle> {
+    let model_dir = spec.path.as_path();
+    let model_id = spec.id.clone();
     let model_directory = ModelDirectory::load(model_dir)
         .map_err(|e| anyhow::anyhow!("Failed to resolve model directory: {}", e))?;
     let model_max_context = load_model_max_context(model_directory.metadata_path.as_deref())?;
@@ -299,14 +295,14 @@ fn load_one_handle(
         .as_ref()
         .is_some_and(|metadata| metadata.pipeline.is_some())
     {
-        return load_pipeline_handle(model_dir, model_id, config, model_max_context, chat_template);
+        return build_pipeline_handle(model_dir, model_id, config, model_max_context, chat_template);
     }
     let tokenizer = Tokenizer::from_file(&model_directory.tokenizer_path)
         .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {}", e))?;
     let engine = Engine::from_dir(model_dir, config.engine_config.clone())?;
     let fim_config = engine.fim_config().cloned();
     let engine_driver = EngineDriver::start(engine, DEFAULT_MAX_BATCH, config.max_queue_depth);
-    Ok(Arc::new(ModelHandle::new(
+    Ok(ModelHandle::new(
         model_id,
         engine_driver,
         Arc::new(tokenizer),
@@ -316,16 +312,16 @@ fn load_one_handle(
         false,
         None,
         None,
-    )))
+    ))
 }
 
-fn load_pipeline_handle(
+fn build_pipeline_handle(
     model_dir: &Path,
     model_id: String,
     config: &ServerConfig,
     model_max_context: Option<usize>,
     chat_template: Option<ChatTemplate>,
-) -> anyhow::Result<Arc<ModelHandle>> {
+) -> anyhow::Result<ModelHandle> {
     let directory = PipelineModelDirectory::load(model_dir)
         .map_err(|e| anyhow::anyhow!("Failed to resolve pipeline directory: {e}"))?;
     let tokenizer_path = directory
@@ -400,7 +396,7 @@ fn load_pipeline_handle(
     drop(models);
 
     let engine = Engine::from_pipeline_dir(model_dir, config.engine_config.clone())?;
-    Ok(Arc::new(ModelHandle::new(
+    Ok(ModelHandle::new(
         model_id,
         EngineDriver::start_pipeline(engine, config.max_queue_depth),
         Arc::new(tokenizer),
@@ -410,5 +406,5 @@ fn load_pipeline_handle(
         true,
         vision_input,
         audio_input,
-    )))
+    ))
 }

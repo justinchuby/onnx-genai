@@ -63,6 +63,18 @@ struct Cli {
     #[arg(long, env = "ONNX_GENAI_DEBUG_ENDPOINTS")]
     enable_debug_endpoints: bool,
 
+    /// Enable /v1/admin/models/* runtime model-management endpoints (load, unload, list).
+    /// Off by default. Use only on loopback-bound servers or behind an authenticated proxy.
+    /// Falls back to ONNX_GENAI_ADMIN_ENDPOINTS=1.
+    #[arg(long, env = "ONNX_GENAI_ADMIN_ENDPOINTS")]
+    enable_admin_endpoints: bool,
+
+    /// Maximum number of models kept loaded in memory at once. When exceeded, loading
+    /// another model evicts the least-recently-used one (never below one model).
+    /// Omit for unlimited. Falls back to ONNX_GENAI_MAX_LOADED_MODELS.
+    #[arg(long, env = "ONNX_GENAI_MAX_LOADED_MODELS")]
+    max_loaded_models: Option<usize>,
+
     /// Storage dtype for the host-side paged KV cache mirror.
     /// Accepted values: f32, int8, fp8_e4m3fn, fp8_e5m2.
     /// Falls back to ONNX_GENAI_KV_CACHE_DTYPE. Defaults to f32 (no quantisation).
@@ -88,6 +100,9 @@ async fn main() -> anyhow::Result<()> {
         max_sessions: cli.max_sessions,
         max_queue_depth: cli.max_queue_depth,
         enable_debug_endpoints: cli.enable_debug_endpoints,
+        enable_admin_endpoints: cli.enable_admin_endpoints,
+        max_loaded_models: cli.max_loaded_models,
+        eviction_policy: Default::default(),
         engine_config: onnx_genai_engine::EngineConfig {
             kv_cache_dtype: cli.kv_cache_dtype,
             ..Default::default()

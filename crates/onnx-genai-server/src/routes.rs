@@ -121,6 +121,28 @@ pub(crate) struct DebugTraceResponse {
 }
 
 #[derive(Debug, Serialize)]
+pub(crate) struct AdminModelObject {
+    id: String,
+    loaded: bool,
+    is_default: bool,
+    /// Epoch-millisecond timestamp of the last request routed to this model,
+    /// present only while the model is loaded.
+    last_request_at: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct AdminModelsResponse {
+    object: &'static str,
+    data: Vec<AdminModelObject>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct AdminLoadResponse {
+    id: String,
+    loaded: bool,
+}
+
+#[derive(Debug, Serialize)]
 pub(crate) struct SessionResponse {
     id: String,
     object: &'static str,
@@ -227,24 +249,35 @@ fn map_generate_submit_error(err: GenerateSubmitError) -> ApiError {
 
 /// Route a request to the correct loaded model.
 ///
-/// - **Non-empty `requested`** — resolves the exact id.  Returns a 404 if that id
-///   is not loaded; does NOT fall back to the default model, so callers can trust
-///   that the returned handle is the one they asked for.
-/// - **Empty `requested`** — falls back to the first/default loaded model,
-///   preserving the single-model UX where clients omit or leave `model` blank.
-fn resolve_model(
+/// - **Non-empty `requested`** — resolves the exact id.  If the model is
+///   configured but not currently loaded, it is lazily loaded (blocking the
+///   request until ready).  Returns a 404 only if the id is not configured at
+///   all; never falls back to the default model for a named request.
+/// - **Empty `requested`** — falls back to the default model, lazily loading it
+///   if necessary, preserving the single-model UX where clients omit `model`.
+async fn resolve_model(
     registry: &crate::registry::ModelRegistry,
     requested: &str,
 ) -> Result<Arc<ModelHandle>, ApiError> {
-    if requested.trim().is_empty() {
-        registry
-            .resolve("")
-            .ok_or_else(|| ApiError::internal("no model loaded"))
-    } else {
-        registry.resolve(requested).ok_or_else(|| {
-            ApiError::not_found(format!("model '{requested}' not found"))
-        })
+    // Fast path: already loaded (handles empty -> default).
+    if let Some(handle) = registry.resolve(requested) {
+        return Ok(handle);
     }
+    // Determine the concrete id to lazily load.
+    let id = if requested.trim().is_empty() {
+        registry
+            .default_id()
+            .ok_or_else(|| ApiError::internal("no model loaded"))?
+    } else {
+        requested.to_string()
+    };
+    if !registry.contains_available(&id) {
+        return Err(ApiError::not_found(format!("model '{requested}' not found")));
+    }
+    registry
+        .load(&id)
+        .await
+        .map_err(|err| ApiError::internal(format!("failed to load model '{id}': {err}")))
 }
 
 pub(crate) async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
@@ -348,6 +381,59 @@ pub(crate) async fn debug_trace() -> Json<DebugTraceResponse> {
     })
 }
 
+/// `GET /v1/admin/models` — list every configured model with loaded/available
+/// status and, for loaded models, the last-request timestamp.
+pub(crate) async fn admin_list_models(
+    State(state): State<AppState>,
+) -> Json<AdminModelsResponse> {
+    let data = state
+        .registry
+        .statuses()
+        .into_iter()
+        .map(|status| AdminModelObject {
+            id: status.id,
+            loaded: status.loaded,
+            is_default: status.is_default,
+            last_request_at: status.last_request_at,
+        })
+        .collect();
+    Json(AdminModelsResponse {
+        object: "list",
+        data,
+    })
+}
+
+/// `POST /v1/admin/models/{id}/load` — load a configured model.  404 if the id is
+/// unknown, 500 if the model fails to build.
+pub(crate) async fn admin_load_model(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<AdminLoadResponse>, ApiError> {
+    if !state.registry.contains_available(&id) {
+        return Err(ApiError::not_found(format!("model '{id}' not found")));
+    }
+    state
+        .registry
+        .load(&id)
+        .await
+        .map_err(|err| ApiError::internal(format!("failed to load model '{id}': {err}")))?;
+    Ok(Json(AdminLoadResponse { id, loaded: true }))
+}
+
+/// `DELETE /v1/admin/models/{id}` — unload a loaded model.  The spec is kept
+/// available so the model can be lazily reloaded on a later request.  404 if the
+/// model is not currently loaded.
+pub(crate) async fn admin_unload_model(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<StatusCode, ApiError> {
+    state
+        .registry
+        .unload(&id)
+        .map_err(|_| ApiError::not_found(format!("model '{id}' is not loaded")))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 #[cfg(feature = "metrics")]
 pub(crate) async fn prometheus_metrics() -> Response {
     (
@@ -422,7 +508,7 @@ pub(crate) async fn completions(
     headers: HeaderMap,
     Json(request): Json<CompletionRequest>,
 ) -> Result<Response, ApiError> {
-    let handle = resolve_model(&state.registry, &request.model)?;
+    let handle = resolve_model(&state.registry, &request.model).await?;
     if handle.pipeline {
         return Err(ApiError::bad_request(
             "/v1/completions is not supported by pipeline models",
@@ -454,7 +540,7 @@ pub(crate) async fn embeddings(
     State(state): State<AppState>,
     Json(request): Json<EmbeddingRequest>,
 ) -> Result<Json<EmbeddingResponse>, ApiError> {
-    let handle = resolve_model(&state.registry, &request.model)?;
+    let handle = resolve_model(&state.registry, &request.model).await?;
     validate_embedding_request(&request, &handle.tokenizer)?;
 
     let encoding_format = request.encoding_format;
@@ -556,7 +642,7 @@ pub(crate) async fn audio_transcriptions(
         }
     }
 
-    let handle = resolve_model(&state.registry, &model_name)?;
+    let handle = resolve_model(&state.registry, &model_name).await?;
 
     let bytes = file.ok_or_else(|| ApiError::bad_request("multipart field 'file' is required"))?;
     if !matches!(response_format.as_str(), "json" | "text") {
@@ -849,7 +935,7 @@ pub(crate) async fn chat_completions(
     headers: HeaderMap,
     Json(request): Json<ChatCompletionRequest>,
 ) -> Result<Response, ApiError> {
-    let handle = resolve_model(&state.registry, &request.model)?;
+    let handle = resolve_model(&state.registry, &request.model).await?;
     validate_request(&request, &state.config)?;
     let session_id = session_id_from_headers(&headers)?;
     if handle.pipeline && session_id.is_some() {
