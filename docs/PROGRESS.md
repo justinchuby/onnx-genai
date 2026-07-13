@@ -4,7 +4,7 @@ Tracks implementation status of `docs/DESIGN.md` (§1–§40). Updated as work l
 
 **Published:** `onnx-genai` v0.1.0 + 8 sub-crates on crates.io. CI (fmt/build/test/**blocking clippy**) + scheduled `cargo-audit`. Coverage ~77% line.
 
-_Last updated: 2026-07-12_
+_Last updated: 2026-07-13_
 
 ## Status by design section
 
@@ -63,4 +63,6 @@ Complete runtime built from scaffold + published: generation (greedy/speculative
   - How CPU is achieved: `accuracy_level=4` (int8 MLAS path, 2.3×) + quantized head (#401) + quantized embedding (#400) + in-place O(1)/token GQA KV (fp32-GQA gate fix). Orchestration is ~1% (98.9% ort.session_run); session persistent, KV Arc-rotated.
   - **CUDA (H200):** `--features cuda`, device-resident KV + `enable_cuda_graph`. Runbook committed.
   - **🍎 Metal/MPS EP (`../onnxruntime-mps`):** custom Apple Metal ORT plugin EP, empty→working in-session. Skeleton→kernels (366/393 on GPU)→subgraph fusion (366→27)→GQA kernel (→1 subgraph)→uint4 bandwidth loads→**prefill GEMM** (simdgroup_matrix; Metal prefill now BEATS CPU at 256/512-tok: 242 vs 276, 560 vs 570 — unblocks GPU-prefill/CPU-decode hybrid). **Decode 11.3→133 tok/s**, coherent, wired `ONNX_GENAI_EP=metal`. Fixed critical MRR MTLBuffer leak (was crashing machine) + added a **leak-regression test** (currentAllocatedSize, self-verified) & Metal validation harness. **Modular op-architecture** designed: registry keyed by (domain,op_type,opset), dtype-traits + MSL templates, **bf16 verified available**; ~90 Mobius ops enumerated (13 done) — migration + full coverage next. Team: Nabil/Mariette/Coco/Freysa.
+    - **MLX evaluation (Phase-0):** NO-GO on full-swap / `onnxruntime-mlx` rename (decode only 1.02–1.09×, below 1.25× bar — batch-1 graph-rebuild overhead cancels the win), but **GO on MLX-prefill** (2.5–3× TTFT, compute-bound, scales with context). Quant maps losslessly (ONNX (q-8)·scale → MLX affine, err 2.3e-8). Backend flag-gated (`ORT_MPS_ENABLE_MLX` build + `ONNX_GENAI_METAL_EP_MLX=1`), default OFF.
+    - **🎯 MLX-prefill / hand-decode hybrid (landed, flag-gated):** M-based routing inside the one fused decoder subgraph — prefill (M≥threshold) → MLX, decode (M==1) → hand kernels, **sharing the same com.microsoft.GQA KV layout with zero boundary conversion**. Hybrid token stream **byte-identical to all-hand-kernel Metal** (coherence PASS, KV handoff clean). **TTFT 2.8× faster than hand / 3.3× faster than CPU @256-tok**, decode parity → lower total latency (beats all-hand both lengths; beats CPU long-prompt). Memory 0.12 MiB/7 cycles. Threshold via `ONNX_GENAI_METAL_EP_MLX_PREFILL_MIN` (default 8). Recommended default Metal-EP path once the `mlx-c` dep is accepted; keep hand kernels for decode (1.25× decode bar unmet).
   - Config standard: `schemars` JSON Schema (Draft 2020-12). Mobius PRs #397-402 open (#399 rebased/mergeable), #395 draft.
