@@ -153,7 +153,10 @@ fn map_loader_error(err: &onnx_runtime_loader::LoaderError) -> OrtErrorCode {
         }
         L::ExternalDataNotFound { .. } => OrtErrorCode::NoSuchFile,
         L::ProtobufParse(_) => OrtErrorCode::InvalidProtobuf,
-        L::Ir(_) | L::GraphBuild(_) => OrtErrorCode::InvalidGraph,
+        L::ExternalDataPath { .. }
+        | L::EpContextPath { .. }
+        | L::Ir(_)
+        | L::GraphBuild(_) => OrtErrorCode::InvalidGraph,
         _ => OrtErrorCode::Fail,
     }
 }

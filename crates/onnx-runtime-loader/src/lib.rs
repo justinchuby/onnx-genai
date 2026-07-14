@@ -52,6 +52,8 @@ pub mod proto;
 pub mod weights;
 pub mod writer;
 
+mod pathsafe;
+
 pub use encoder::{
     encode_model, encode_model_proto, write_model, Model, ModelMetadata, DEFAULT_IR_VERSION,
 };

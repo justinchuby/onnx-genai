@@ -17,12 +17,12 @@
 //! which is out of scope here (owned by the session + ep-api).
 
 use std::fs::File;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use memmap2::Mmap;
 use onnx_runtime_ir::{Attribute, Graph, Node, NodeId, ValueId};
 
-use crate::LoaderError;
+use crate::{pathsafe::guarded_join, LoaderError};
 
 /// The op type of an EPContext node. Shared with the §55.4 writer so the dump
 /// path never re-invents the literal.
@@ -259,30 +259,8 @@ pub fn resolve_ep_context(
 /// paths, filesystem roots/prefixes, and any `..` component before joining the
 /// stored location to the model directory.
 fn resolve_external_path(model_dir: &Path, rel: &str) -> Result<PathBuf, LoaderError> {
-    let rel_path = Path::new(rel);
-    if rel_path.is_absolute() {
-        return Err(LoaderError::EpContextPath {
-            path: rel.to_string(),
-            reason: "absolute paths are not allowed",
-        });
-    }
-    for comp in rel_path.components() {
-        match comp {
-            Component::ParentDir => {
-                return Err(LoaderError::EpContextPath {
-                    path: rel.to_string(),
-                    reason: "parent-directory (`..`) traversal is not allowed",
-                });
-            }
-            Component::RootDir | Component::Prefix(_) => {
-                return Err(LoaderError::EpContextPath {
-                    path: rel.to_string(),
-                    reason: "absolute / rooted paths are not allowed",
-                });
-            }
-            // CurDir (`.`) and Normal segments are safe.
-            _ => {}
-        }
-    }
-    Ok(model_dir.join(rel_path))
+    guarded_join(model_dir, rel).map_err(|reason| LoaderError::EpContextPath {
+        path: rel.to_string(),
+        reason,
+    })
 }

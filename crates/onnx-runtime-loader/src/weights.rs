@@ -8,13 +8,13 @@
 
 use std::collections::HashMap;
 use std::fs::File;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use memmap2::Mmap;
 use onnx_runtime_ir::{DataType, TensorData, ValueId, WeightRef};
 
 use crate::proto::onnx::{tensor_proto, ModelProto, TensorProto};
-use crate::LoaderError;
+use crate::{pathsafe::guarded_join, LoaderError};
 
 /// A resolved set of initializer weights, keyed by the value they populate,
 /// plus the live memory maps backing any external data files.
@@ -162,31 +162,10 @@ fn resolve_initializer(
 /// Join an external-data location onto `model_dir`, rejecting paths that can
 /// escape the model directory.
 fn resolve_external_path(model_dir: &Path, location: &str) -> Result<PathBuf, LoaderError> {
-    let rel_path = Path::new(location);
-    if rel_path.is_absolute() {
-        return Err(LoaderError::ExternalDataPath {
-            path: location.to_string(),
-            reason: "absolute paths are not allowed",
-        });
-    }
-    for component in rel_path.components() {
-        match component {
-            Component::ParentDir => {
-                return Err(LoaderError::ExternalDataPath {
-                    path: location.to_string(),
-                    reason: "parent-directory (`..`) traversal is not allowed",
-                });
-            }
-            Component::RootDir | Component::Prefix(_) => {
-                return Err(LoaderError::ExternalDataPath {
-                    path: location.to_string(),
-                    reason: "absolute / rooted paths are not allowed",
-                });
-            }
-            Component::CurDir | Component::Normal(_) => {}
-        }
-    }
-    Ok(model_dir.join(rel_path))
+    guarded_join(model_dir, location).map_err(|reason| LoaderError::ExternalDataPath {
+        path: location.to_string(),
+        reason,
+    })
 }
 
 /// Convert a `TensorProto`'s payload into an IR [`TensorData`] with raw
