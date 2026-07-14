@@ -516,28 +516,30 @@ impl Session {
     /// the EP's `present.*` output; when FALSE, decode must fall back to the
     /// growing `ZeroCopyRebind` path.
     ///
-    /// WHY: CPU, CUDA and WebGPU EPs consume a fixed-capacity present binding
-    /// correctly and use the shared buffer successfully today. The external
-    /// Metal plugin's growing-shape GQA kernel instead requests
+    /// WHY: CPU, CUDA and WebGPU are the only EPs verified to consume a
+    /// fixed-capacity present binding correctly and use the shared buffer
+    /// successfully today. The external Metal plugin's growing-shape GQA kernel
+    /// instead requests
     /// `capacity + sequence_length` elements at bind time, which fails ORT's
     /// pre-bound output-size check and crashed Metal E2E (see the KV notes in
     /// `onnx-genai-engine`'s `detect_model_decode_path`). Metal therefore
     /// declares NO fixed-capacity present support by default, preserving today's
-    /// `ZeroCopyRebind` behavior. Concentrating this EP-identity knowledge in a
-    /// single semantic capability keeps `is_metal()` out of decode business
-    /// logic (RULES.md §2).
+    /// `ZeroCopyRebind` behavior. Any unverified current or future EP also
+    /// defaults to NO, preventing a new provider from reintroducing this crash
+    /// class. Concentrating this EP-identity knowledge in a single semantic
+    /// capability keeps `is_metal()` out of decode business logic (RULES.md §2).
     ///
-    /// HOW: Non-Metal EPs return TRUE. The Metal plugin returns FALSE unless the
-    /// operator explicitly opts in via
+    /// HOW: The CPU, CUDA, and WebGPU allowlist returns TRUE. Everything else,
+    /// including Metal, returns FALSE unless the operator explicitly opts in via
     /// `ONNX_GENAI_SHARED_KV_PRESENT_BINDING=1` (see
     /// [`shared_kv_present_binding_opt_in_from_env`]), which lets the default
     /// flip to enabled once the MLX/Metal EP is verified on real Apple-silicon
     /// hardware — with no further code change.
     pub fn supports_fixed_capacity_present_binding(&self) -> bool {
-        if self.is_metal() {
-            return shared_kv_present_binding_opt_in_from_env();
-        }
-        true
+        fixed_capacity_present_binding_supported(
+            &self.execution_providers,
+            shared_kv_present_binding_opt_in_from_env(),
+        )
     }
 
     /// Create a device-resident allocator for KV buffers, if this session runs
@@ -816,8 +818,8 @@ fn device_kv_enabled_from_env() -> bool {
     }
 }
 
-/// Explicit operator opt-in that lets the Metal plugin EP participate in the
-/// fixed-capacity, pre-bound present-output (SharedBuffer) decode path.
+/// Explicit operator opt-in that lets an otherwise unverified EP participate in
+/// the fixed-capacity, pre-bound present-output (SharedBuffer) decode path.
 ///
 /// WHAT: Reads `ONNX_GENAI_SHARED_KV_PRESENT_BINDING` and returns TRUE for the
 /// usual truthy values (`1`/`true`/`yes`/`on`), FALSE otherwise (including
@@ -825,13 +827,13 @@ fn device_kv_enabled_from_env() -> bool {
 ///
 /// WHY: The Metal plugin's growing-shape GQA kernel currently fails ORT's
 /// pre-bound present-output size check, so Metal defaults to the safe
-/// `ZeroCopyRebind` path. This flag exists so that once the MLX/Metal EP is
-/// verified on real Apple-silicon hardware, the SharedBuffer path can be enabled
-/// for Metal without a code change.
+/// `ZeroCopyRebind` path. This flag exists so that once the MLX/Metal EP, or
+/// another EP, is verified, the SharedBuffer path can be enabled without a code
+/// change.
 ///
 /// HOW: Consumed only by
-/// [`Session::supports_fixed_capacity_present_binding`]; it has no effect on
-/// non-Metal EPs, which already declare the capability unconditionally.
+/// [`Session::supports_fixed_capacity_present_binding`]; it overrides the
+/// conservative capability allowlist.
 fn shared_kv_present_binding_opt_in_from_env() -> bool {
     match std::env::var("ONNX_GENAI_SHARED_KV_PRESENT_BINDING") {
         Ok(value) => matches!(
@@ -840,6 +842,21 @@ fn shared_kv_present_binding_opt_in_from_env() -> bool {
         ),
         Err(_) => false,
     }
+}
+
+/// Resolve fixed-capacity present binding from the verified EP capability
+/// allowlist, with an explicit operator override for unverified EPs.
+fn fixed_capacity_present_binding_supported(providers: &[ExecutionProvider], opt_in: bool) -> bool {
+    opt_in
+        || !providers.is_empty()
+            && providers.iter().all(|provider| {
+                matches!(
+                    provider,
+                    ExecutionProvider::Cpu
+                        | ExecutionProvider::Cuda { .. }
+                        | ExecutionProvider::WebGpu
+                )
+            })
 }
 
 /// Apply WebGPU EP provider options via session config entries.
@@ -1017,7 +1034,8 @@ fn append_metal_execution_provider(
     }
     if selected.is_empty() {
         return Err(OrtError::InvalidArgument(
-            "MLXExecutionProvider device not found after registering the onnxruntime-mlx plugin".into(),
+            "MLXExecutionProvider device not found after registering the onnxruntime-mlx plugin"
+                .into(),
         ));
     }
 
@@ -1429,6 +1447,34 @@ mod tests {
         let available = vec!["CUDAExecutionProvider".to_string()];
         assert!(provider_is_available("CUDAExecutionProvider", &available));
         assert!(provider_is_available("CUDA", &available));
+    }
+
+    #[test]
+    fn fixed_capacity_present_binding_uses_allowlist_or_opt_in() {
+        assert!(fixed_capacity_present_binding_supported(
+            &[ExecutionProvider::Cpu],
+            false
+        ));
+        assert!(fixed_capacity_present_binding_supported(
+            &[ExecutionProvider::Cuda { device_id: 0 }],
+            false
+        ));
+        assert!(fixed_capacity_present_binding_supported(
+            &[ExecutionProvider::WebGpu],
+            false
+        ));
+        assert!(!fixed_capacity_present_binding_supported(
+            &[ExecutionProvider::Metal],
+            false
+        ));
+        assert!(!fixed_capacity_present_binding_supported(
+            &[ExecutionProvider::CoreML],
+            false
+        ));
+        assert!(fixed_capacity_present_binding_supported(
+            &[ExecutionProvider::Metal],
+            true
+        ));
     }
 
     #[cfg(not(feature = "cuda"))]
