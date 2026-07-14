@@ -46,6 +46,18 @@ pub enum TracerError {
         /// directory, disk full, …).
         source: io::Error,
     },
+    /// A CUPTI (GPU kernel tracing) operation failed.
+    ///
+    /// Only produced by the `cupti` feature. Carries the CUPTI operation that
+    /// failed and a fully actionable message (RULES.md #1) — GPU tracing is
+    /// optional, so callers can also choose to proceed without it.
+    #[cfg(feature = "cupti")]
+    Cupti {
+        /// The CUPTI operation that failed (e.g. `"cuptiActivityFlushAll"`).
+        op: &'static str,
+        /// A human- and agent-actionable description of the failure and fix.
+        message: String,
+    },
 }
 
 impl fmt::Display for TracerError {
@@ -80,6 +92,8 @@ impl fmt::Display for TracerError {
                  path).",
                 path.display()
             ),
+            #[cfg(feature = "cupti")]
+            TracerError::Cupti { op: _, message } => write!(f, "{message}"),
         }
     }
 }
@@ -90,6 +104,8 @@ impl std::error::Error for TracerError {
             TracerError::UnsupportedFormat { .. } => None,
             TracerError::Serialize { source, .. } => Some(source),
             TracerError::Write { source, .. } => Some(source),
+            #[cfg(feature = "cupti")]
+            TracerError::Cupti { .. } => None,
         }
     }
 }

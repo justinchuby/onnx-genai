@@ -57,13 +57,14 @@ impl fmt::Display for TraceFormat {
 /// once the executor is wired in (§48.5); it is stored on the
 /// [`TraceContext`](crate::TraceContext) today so callers can set intent, and
 /// consumers can honor it as instrumentation lands.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum TraceVerbosity {
     /// Only high-level scheduling/placement decisions (cheapest).
     Decisions,
     /// Decisions plus per-op execution spans.
     Ops,
     /// Everything: ops, transfers, counters, and fine-grained internals.
+    #[default]
     Full,
 }
 
@@ -76,12 +77,6 @@ impl TraceVerbosity {
     #[must_use]
     pub fn includes(self, other: TraceVerbosity) -> bool {
         other <= self
-    }
-}
-
-impl Default for TraceVerbosity {
-    fn default() -> Self {
-        TraceVerbosity::Full
     }
 }
 

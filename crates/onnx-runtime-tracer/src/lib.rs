@@ -7,9 +7,13 @@
 //! [`TraceCollector`] (or a [`CompositeCollector`] fan-out to several at once).
 //!
 //! It is a **foundational** crate, like [`onnx-runtime-ir`]: pure, safe Rust
-//! (`#![forbid(unsafe_code)]`) with no dependency on the ORT / genai stack, so
-//! any layer (runtime executor, EPs, or the genai engine) can adopt it and
-//! share the exact same [`TraceContext`] type and one timeline (§48.2).
+//! (`#![forbid(unsafe_code)]` on every default build) with no dependency on the
+//! ORT / genai stack, so any layer (runtime executor, EPs, or the genai engine)
+//! can adopt it and share the exact same [`TraceContext`] type and one timeline
+//! (§48.2). The one exception is the optional `cupti` feature, whose GPU-kernel
+//! collector needs `unsafe` FFI/dlopen; enabling it relaxes the crate attribute
+//! to `#![cfg_attr(not(feature = "cupti"), forbid(unsafe_code))]`, confining all
+//! `unsafe` to [`cupti`].
 //!
 //! ## Architecture
 //!
@@ -82,7 +86,7 @@
 //! | `chrome` | | Names the always-available Chrome JSON backend (no dep). |
 //! | `itt` | | Capability flag for the future Intel ITT collector ([`itt`], stub). |
 //! | `otel` | | Capability flag for the future OpenTelemetry export. |
-//! | `cupti` | | Capability flag for the future dlopen'd CUPTI collector. |
+//! | `cupti` | | GPU kernel tracing via a runtime-`dlopen`'d CUPTI Activity API collector ([`cupti`]). |
 //!
 //! The crate compiles with default features, with `--no-default-features`, and
 //! with any combination of the above.
@@ -90,13 +94,14 @@
 //! ## Scope (Phase 2)
 //!
 //! This crate ships the standalone collector architecture + Chrome/JSONL/
-//! Perfetto export. It is intentionally **not** wired into the session executor
-//! yet (§48.5), and the ITT (§48.8.2), CUPTI (§48.8.3/§49), and OpenTelemetry
-//! backends are declared but deferred to later phases.
+//! Perfetto export, plus the `cupti` GPU-kernel collector (Activity-API path,
+//! §48.8.3/§49). It is intentionally **not** wired into the session executor
+//! yet (§48.5); the ITT (§48.8.2) and OpenTelemetry backends are declared but
+//! deferred, and CUPTI PM-counter metrics (§49.3) are a documented Phase-2 stub.
 //!
 //! [`onnx-runtime-ir`]: https://docs.rs/onnx-runtime-ir
 
-#![forbid(unsafe_code)]
+#![cfg_attr(not(feature = "cupti"), forbid(unsafe_code))]
 #![warn(missing_docs)]
 
 pub mod args;
@@ -111,6 +116,9 @@ pub mod jsonl;
 
 #[cfg(feature = "itt")]
 pub mod itt;
+
+#[cfg(feature = "cupti")]
+pub mod cupti;
 
 #[cfg(feature = "perfetto")]
 pub mod perfetto;

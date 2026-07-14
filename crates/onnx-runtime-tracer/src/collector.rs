@@ -377,9 +377,7 @@ impl TraceCollector for CompositeCollector {
         let mut first_err = None;
         for collector in &self.collectors {
             if let Err(err) = collector.flush() {
-                if first_err.is_none() {
-                    first_err = Some(err);
-                }
+                first_err.get_or_insert(err);
             }
         }
         match first_err {
