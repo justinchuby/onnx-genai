@@ -248,16 +248,12 @@ fn download_prebuilt(target_dir: &Path) {
             std::fs::rename(&extracted, target_dir).unwrap();
         }
     } else {
-        // zip on Windows
-        let status = std::process::Command::new("unzip")
-            .arg(&download_path)
-            .arg("-d")
-            .arg(parent_dir)
-            .status()
-            .expect("Failed to run unzip");
-        if !status.success() {
-            panic!("Failed to extract ORT archive");
-        }
+        // .zip (Windows). Extract with the pure-Rust `zip` crate instead of
+        // shelling out to an external `unzip` binary, which is not present on a
+        // clean Windows host and would fail the native build before compilation
+        // (docs/CROSS_PLATFORM.md, "ORT Windows bootstrap"). This path is
+        // identical on Linux/macOS/Windows and needs no external tool.
+        extract_zip(&download_path, parent_dir);
         let extracted = parent_dir.join(format!("onnxruntime-{}-{}", os, ORT_VERSION));
         if extracted.exists() {
             if target_dir.exists() {
@@ -269,6 +265,100 @@ fn download_prebuilt(target_dir: &Path) {
 
     // Cleanup
     let _ = std::fs::remove_file(&download_path);
+}
+
+/// Extract a `.zip` archive into `dest_dir` using the pure-Rust `zip` crate.
+///
+/// Portable across Linux/macOS/Windows with no external `unzip` binary. The
+/// output tree mirrors what `unzip -d dest_dir archive` produced: every archive
+/// entry is written verbatim under `dest_dir`, preserving the archive's internal
+/// directory layout (e.g. the top-level `onnxruntime-<os>-<version>/` folder the
+/// rest of the build later renames into place). Unix permission bits are
+/// preserved when the archive records them so extracted shared libraries keep
+/// their mode; this is a no-op on Windows.
+fn extract_zip(archive_path: &Path, dest_dir: &Path) {
+    let file = std::fs::File::open(archive_path).unwrap_or_else(|err| {
+        panic!(
+            "Failed to open downloaded ORT archive {} for extraction: {err}. \
+             Delete it and re-run to re-download, or set ORT_ROOT to a local \
+             ONNX Runtime installation to skip the download entirely.",
+            archive_path.display()
+        )
+    });
+    let mut zip = zip::ZipArchive::new(file).unwrap_or_else(|err| {
+        panic!(
+            "Failed to read ORT zip archive {}: {err}. The download may be \
+             truncated or corrupt; delete it and re-run, or set ORT_ROOT to a \
+             local ONNX Runtime installation.",
+            archive_path.display()
+        )
+    });
+
+    for i in 0..zip.len() {
+        let mut entry = zip.by_index(i).unwrap_or_else(|err| {
+            panic!(
+                "Failed to read entry #{i} of ORT zip {}: {err}. The archive may \
+                 be corrupt; delete it and re-run, or set ORT_ROOT to a local \
+                 ONNX Runtime installation.",
+                archive_path.display()
+            )
+        });
+
+        // `enclosed_name` rejects absolute paths and `..` traversal, guarding
+        // against zip-slip writes outside `dest_dir`.
+        let Some(rel_path) = entry.enclosed_name() else {
+            panic!(
+                "ORT zip {} contains an unsafe entry path {:?}; refusing to \
+                 extract outside {}.",
+                archive_path.display(),
+                entry.name(),
+                dest_dir.display()
+            )
+        };
+        let out_path = dest_dir.join(rel_path);
+
+        if entry.is_dir() {
+            std::fs::create_dir_all(&out_path).unwrap_or_else(|err| {
+                panic!(
+                    "Failed to create directory {} while extracting {}: {err}",
+                    out_path.display(),
+                    archive_path.display()
+                )
+            });
+        } else {
+            if let Some(parent) = out_path.parent() {
+                std::fs::create_dir_all(parent).unwrap_or_else(|err| {
+                    panic!(
+                        "Failed to create directory {} while extracting {}: {err}",
+                        parent.display(),
+                        archive_path.display()
+                    )
+                });
+            }
+            let mut out_file = std::fs::File::create(&out_path).unwrap_or_else(|err| {
+                panic!(
+                    "Failed to create file {} while extracting {}: {err}",
+                    out_path.display(),
+                    archive_path.display()
+                )
+            });
+            std::io::copy(&mut entry, &mut out_file).unwrap_or_else(|err| {
+                panic!(
+                    "Failed to write extracted file {} from {}: {err}",
+                    out_path.display(),
+                    archive_path.display()
+                )
+            });
+
+            // Preserve recorded unix permissions (e.g. executable bit on shared
+            // objects). No-op on Windows, where zip entries carry no unix mode.
+            #[cfg(unix)]
+            if let Some(mode) = entry.unix_mode() {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&out_path, std::fs::Permissions::from_mode(mode));
+            }
+        }
+    }
 }
 
 fn prebuilt_target() -> (&'static str, &'static str) {

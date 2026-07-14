@@ -75,6 +75,20 @@ mod onednn {
             link_openmp();
         }
 
+        // The GNU C++/OpenMP runtimes (libstdc++/libgomp) do not exist under the
+        // MSVC toolchain. When targeting MSVC we emit no explicit runtime libs
+        // (the linker supplies them); make the human requirement explicit so a
+        // Windows build of the non-default `onednn` feature is auditable.
+        if target_env() == "msvc" {
+            println!(
+                "cargo:warning=onednn feature on MSVC: the C++ runtime (msvcprt) \
+                 and OpenMP (vcomp, via cl.exe /openmp) are linked automatically, \
+                 so no stdc++/gomp is emitted. Supply a oneDNN static lib built \
+                 with MSVC (matching DNNL_CPU_RUNTIME). If your prebuilt oneDNN \
+                 uses Intel OpenMP, set ONEDNN_OMP_LIB (e.g. libiomp5md) to link it."
+            );
+        }
+
         generate_bindings(&header, &dst);
     }
 
@@ -115,18 +129,50 @@ mod onednn {
     }
 
     fn link_cxx_stdlib() {
-        // Match the host toolchain's C++ runtime for the static oneDNN objects.
-        if cfg!(target_os = "macos") {
-            println!("cargo:rustc-link-lib=c++");
-        } else {
-            println!("cargo:rustc-link-lib=stdc++");
+        // oneDNN is C++, so its static objects need the target toolchain's C++
+        // runtime linked. The correct library name is toolchain-specific, so
+        // gate strictly by the *target* env/os (build.rs runs on the host, so we
+        // must read CARGO_CFG_* rather than use host-based `cfg!`):
+        //   - macOS (clang):    libc++     -> link "c++"
+        //   - Linux/other GNU:  libstdc++  -> link "stdc++"   (unchanged)
+        //   - Windows MSVC:     msvcprt/vcruntime is linked automatically by the
+        //                       MSVC linker; emitting "stdc++"/"c++" would break
+        //                       the link, so we emit nothing.
+        match (target_os().as_str(), target_env().as_str()) {
+            ("macos", _) => println!("cargo:rustc-link-lib=c++"),
+            (_, "msvc") => { /* MSVC C++ runtime linked automatically */ }
+            _ => println!("cargo:rustc-link-lib=stdc++"),
         }
     }
 
     fn link_openmp() {
-        // GCC/Clang OpenMP runtime. Overridable via ONEDNN_OMP_LIB for hosts
-        // that ship libiomp5/libomp under a different name.
-        let omp = env::var("ONEDNN_OMP_LIB").unwrap_or_else(|_| "gomp".to_string());
-        println!("cargo:rustc-link-lib={omp}");
+        // Link the OpenMP runtime matching the target toolchain (oneDNN's OMP CPU
+        // runtime needs it). An explicit ONEDNN_OMP_LIB override always wins, on
+        // every target, for hosts that ship the runtime under a different name.
+        if let Ok(omp) = env::var("ONEDNN_OMP_LIB") {
+            println!("cargo:rustc-link-lib={omp}");
+            return;
+        }
+
+        // Default names are toolchain-specific:
+        //   - GNU (Linux):   libgomp -> "gomp"  (unchanged from prior behavior)
+        //   - macOS clang:   libomp  -> "omp"   (LLVM/Homebrew libomp)
+        //   - Windows MSVC:  vcomp (MSVC OpenMP) is linked automatically when
+        //                    oneDNN is compiled with cl.exe /openmp, so emit
+        //                    nothing. Set ONEDNN_OMP_LIB (e.g. libiomp5md) if a
+        //                    prebuilt oneDNN needs Intel OpenMP instead.
+        match (target_os().as_str(), target_env().as_str()) {
+            (_, "msvc") => { /* vcomp linked automatically via /openmp */ }
+            ("macos", _) => println!("cargo:rustc-link-lib=omp"),
+            _ => println!("cargo:rustc-link-lib=gomp"),
+        }
+    }
+
+    fn target_os() -> String {
+        env::var("CARGO_CFG_TARGET_OS").unwrap_or_default()
+    }
+
+    fn target_env() -> String {
+        env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default()
     }
 }
