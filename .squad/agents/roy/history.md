@@ -36,3 +36,11 @@ Roy's workspace review is now in decisions: crate split is sound, but engine.rs 
 ## 2026-07-14T02:37:00Z — ORT2 Phase 1 foundation merged
 - **Commit:** 203161c — 6 crates scaffolded, `onnx-runtime-ir` with 34 passing tests
 - IR gaps flagged by Deckard (Track A): `DataType::from_onnx` fp8/int4 numbering vs ONNX spec, no `DataType::Undefined`, no unknown-rank `Shape` sentinel. Roy to address before quantized-model work.
+
+## 2026-07-14T05:04:00Z — ORT2 session executor + dynshape merged (Track D)
+
+- **squad/ort2-session** (24b8129): Sequential CPU executor — topo-order dispatch, shape-keyed kernel cache, `view_bounds` gate on all views before dispatch, Miri-clean borrow strategy. 8/8 tests. Reviewed 🟢 Chew + 🟡 Holden.
+- **squad/ort2-session-dynshape** (da8eab3): Runtime symbolic-shape resolution — `bind_symbols`/`resolve_all`/`ensure_buffer` pipeline; buffer reuse on same shape, realloc on change; cache keyed on resolved shapes. 14/14 tests; Miri-clean. Reviewed 🟡 Holden.
+- Open advisories (non-blocking): Holden A1 (mid-run error-path buffer leak), H-D1 (unchecked shape-multiply), Chew A2 (gappy-optional input compaction).
+- Loader gap flagged to Deckard: shape rules for `Attention`/`EmbedLayerNormalization` needed before full bert_toy run.
+- Softmax opset-12 guard (from Chew ep-cpu review) assigned Roy/Deckard (Batty locked).

@@ -97,3 +97,10 @@ Prompt-lookup speculation and `MtpProposer` are accepted canonical runtime miles
 - **ep-api (65ec9f6):** DeviceBuffer ownership hardening, DLPack alignment (byte_offset, i64 strides), Cost non_exhaustive. Reviewed 🟡 Holden. 17 tests.
 - **ep-cpu (ea30279):** CpuExecutionProvider + 7 Phase-1 pure-Rust kernels (MatMul, Add, Relu, Reshape, Transpose, Gather, LayerNorm). Reviewed 🟡 Chew + 🟡 Holden. 39 tests.
 - Track D (session) must call `strided::view_in_bounds` before kernel dispatch; kernels trust caller for storage bounds.
+
+## 2026-07-14T05:04:00Z — ORT2 capi Track E + ep-cpu +17 kernels merged
+
+- **squad/ort2-capi** (8c9c8fc): Phase-1 C ABI — opaque handles, null-guarded, catch_unwind-fenced, atomic `ort2_run` commit, `SessionError→OrtErrorCode` mapping. 12/12 tests; Miri-clean. Closes Phase 1. Reviewed 🟢 Holden.
+- **squad/ort2-epcpu-ops** (e485a83): +17 bert_toy kernels — Sub/Mul/Div/Pow/Min, Sqrt/Erf/Tanh, Cast, ReduceMean, Softmax, Shape, Unsqueeze, Expand, Slice, Constant, Gemm. 90/90 tests; no new deps. Reviewed 🟡 Chew.
+- Softmax uses opset-13 per-axis semantics (correct for bert_toy last-axis; opset-12 coerce guard advisory assigned Roy/Deckard — Batty locked on this advisory).
+- Loader gaps flagged (Slice/Expand/Constant shape inference) → addressed by Deckard b6f032e.

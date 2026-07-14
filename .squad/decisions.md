@@ -630,3 +630,85 @@ correctness is unaffected. Not chased further here (would risk the pass bar).
 **What:** Made `input_embedding.f32` a first-class Mobius export artifact. New `_find_scaled_token_embedding(target_model, hidden_size)` locates the token-embedding `Gather` + post-`Mul` scale from the **target graph** — nothing hardcoded (vocab, hidden, scale all read from graph). New `write_input_embedding_artifact` writes `weight * scale` as raw little-endian f32 `[vocab, hidden]` (1.6 GB for Gemma4 E2B). `speculative.input_embedding` emitted in `_speculative_block`, `generate_merged_inference_metadata`, and YAML serializer. `write_merged_inference_metadata` gained optional `target_model` param. Scale is read from the graph's f16 `Mul` constant (`39.1875` for Gemma4 E2B); differs from Leon's manual `sqrt(1536) = 39.1918` by 1.1e-4 (within one f16 ULP) — negligible acceptance impact. 23 integration tests pass. No engine code touched.
 **Why:** Leon's engine fix requires `speculative.input_embedding` in the package. Durable export means `Engine::from_dir` works with no manual extraction steps.
 
+
+---
+
+### 2026-07-14: `onnx-runtime-session` — sequential CPU executor (Track D)
+**By:** Roy (Lead)
+**Commit:** 24b8129 | **Reviewed:** 🟢 Chew (numerics) + 🟡 Holden (safety)
+**What:** `SessionBuilder::build()` drives loader → EP init → buffer allocation (one `DeviceBuffer` per value, sized from static IR shapes) → kernel compile into a shape-keyed `(NodeId, input_shapes)` cache. `run(inputs)` validates dtype+shape, copies input bytes, walks topo order materializing contiguous `TensorView`/`TensorMut` over each buffer, runs `view_bounds` gate before every dispatch, then collects owned output `Tensor`s. Borrow/aliasing strategy: output buffers removed from map before dispatch (SSA guarantees disjoint), reinserted after; Miri-clean. `Tensor` lives in this crate (Phase-1 CPU; flag for move to shared crate before ep-cuda). 8/8 tests pass; clippy clean.
+**Why:** Ties loader + ep-api + ep-cpu into a running inference session. Remaining gaps for BERT milestone: dynamic shapes, op coverage (op set now supplied by ep-cpu expansion), C-API, conformance gate.
+
+---
+
+### 2026-07-14: `onnx-runtime-session` — runtime symbolic-shape resolution (Track D, dynshape)
+**By:** Roy (Lead)
+**Commit:** da8eab3 | **Reviewed:** 🟡 Holden (safety)
+**What:** `run()` now resolves concrete shapes at run time: (1) `bind_symbols` — walks declared loader shape dim-by-dim against actual input shapes, binding `Dim::Symbolic(s) → usize`; rank/static mismatch and symbol conflict are errors. (2) `resolve_all` — substitutes bindings into every value's loader shape; unbound symbol → `UnresolvedShape`. (3) `size_buffers`/`ensure_buffer` — reuse buffer if `buffer_shapes[vid] == dims`, else dealloc + realloc. Kernel cache keyed on resolved (concrete) input shapes; same shapes → hit + reuse; new shape → re-validate + recompile. Static graphs are the zero-symbol special case. 14/14 tests pass; Miri-clean including multi-batch realloc/reuse (`symbolic_batch_matmul_chain_runs_for_multiple_shapes`).
+**Why:** BERT inputs carry symbolic dims (`batch`, `seq_len`). Static-only executor could not run real models. Loader (Deckard) owns shape inference; session owns symbol→concrete resolution — the design seam is intentional. Loader gaps for `Attention`/`EmbedLayerNormalization` shape rules flagged for Deckard.
+
+---
+
+### 2026-07-14: `onnx-runtime-capi` — Phase-1 Tier-1 C ABI (Track E)
+**By:** Batty (Engine Dev)
+**Commit:** 8c9c8fc | **Reviewed:** 🟢 Holden (safety)
+**What:** `extern "C"` surface wrapping `onnx-runtime-session`. Opaque handles (`OrtSession`, `OrtValue`, `OrtStatus`) via `Box::into_raw`/`Box::from_raw`. Entry points: `ort2_create_session`, `ort2_release_session`, `ort2_create_tensor` (validates dtype + exact byte-len), `ort2_release_value`, `ort2_run` (atomic commit — all outputs built before any slot written; on error: pre-nulled + freed), `ort2_get_tensor_{dtype,rank,shape,data}`, status accessors. `crate-type = ["lib"]` (cdylib deferred to Phase 2 OrtGetApiBase vtable). Every fallible body wrapped in `catch_unwind` via `guard` helper; every pointer null-checked. `SessionError → OrtErrorCode` mapping covers NoSuchFile/InvalidProtobuf/InvalidArgument/NotImplemented/EpFail/InvalidGraph/Fail. 12/12 tests pass; Miri-clean (`-Zmiri-disable-isolation`).
+**Why:** Closes Phase 1. Thin, model-agnostic C marshalling layer; no hardcoded shapes/ops. Once `onnx-runtime-session` runs a full BERT graph, the C ABI drives it with no changes needed here.
+
+---
+
+### 2026-07-14: `onnx-runtime-ep-cpu` — +17 BERT kernels (op expansion for bert_toy)
+**By:** Batty (Engine Dev)
+**Commit:** e485a83 | **Reviewed:** 🟡 Chew (numerics)
+**What:** 17 new kernels added to `onnx-runtime-ep-cpu`, all registered in `PHASE1_OPS` via `build_cpu_registry`. Elementwise binary: `Sub`, `Mul`, `Div`, `Pow`, `Min` (via existing `broadcast_apply`). Unary: `Sqrt`, `Erf` (A&S 7.1.26 in f64, max abs err 1.39e-7), `Tanh`. Type: `Cast` (fixed-width numeric dtypes, float→int truncates, NaN→bool = true). Reduction: `ReduceMean` (multi-axis, keepdims). Shape/movement: `Shape`, `Unsqueeze`, `Expand`, `Slice` (opset-10 input-driven, negative/stepped ranges). Constant: `Constant` (value/value_float(s)/value_int(s)). GEMM: `Gemm` (transA/transB, alpha/beta, bias broadcast). Dtype-generic byte movers (`elem_size`, `to_dense_bytes`, `write_dense_bytes`) added to `kernels/mod.rs`. 90 tests pass; clippy clean; no new dependencies. Softmax intentionally uses opset-13 per-axis semantics (identical to opset-12 coerce on last axis — all bert_toy Softmax nodes). Loader gaps flagged: `Slice`/`Expand`/`Constant` shape inference needed (owner: Deckard).
+**Why:** Supplies the op coverage gap for the BERT-on-CPU milestone; executor needs no changes.
+
+---
+
+### 2026-07-14: `onnx-runtime-loader` — const-fold-lite shape inference (Slice/Expand/Constant)
+**By:** Deckard (Systems Dev)
+**Commit:** b6f032e | **Reviewed:** 🟢 Gaff (correctness)
+**What:** Bounded partial evaluator (`ConstEnv: HashMap<ValueId, KnownVal>`) filled in topo order alongside existing shape rules. `KnownVal` = rank-0/1 integer tensor with `IntElem::Const(i64) | IntElem::Sym(SymbolId)`. Bound: rank ≤ 1, numel ≤ 1024 (`MAX_FOLD_ELEMS`), integers/bools only. Value-propagation ops: `Constant`, `Shape` (emits Sym for symbolic dims), `Identity`, `Cast` (integral only), `Unsqueeze`, `Squeeze`, `Concat`, `Gather` (axis-0, 1-D), `Slice` (opset-10), `Reshape`, `Add`/`Sub`/`Mul`/`Div`/`Min`/`Max` (any symbolic operand → fresh symbol). Shape rules added: `Reshape` (symbolic-aware), `Slice` (rank-preserving, symbolic bounds), `Expand` (broadcast vs const/sym target). On `bert_toy_optimized.onnx`: unresolved values 135→50; all 50 residuals are genuine rank-0 scalar `Constant`s. No `UnresolvedShape` for any structural op. Position-slice chain stays symbolic (data-dependent, by design). 27/27 tests pass (including `bert_toy_optimized_every_value_resolves` on real model); clippy clean; `#![forbid(unsafe_code)]` retained; public API unchanged.
+**Why:** Session executor errors `UnresolvedShape` for any value the loader leaves shape-less. Batty's ep-cpu data-movement kernels require pre-allocated output views with correct shapes.
+
+---
+
+### 2026-07-14: Chew review — session executor Track D (🟢)
+**By:** Chew (correctness/numerics reviewer)
+**Target:** `squad/ort2-session` @ `edbc3fd` | **Verdict:** 🟢 SHIP-with-minor-advisories
+**What:** Verified topological order (Kahn's algorithm, min-heap tie-break, cycle detection), value dependency resolution (one buffer per `ValueId`, SSA-disjoint), view materialization (contiguous strides, zero offset correct for dedicated per-value buffers), initializer/input binding (dtype+shape validated), output collection (correct prefix slice), shape-keyed cache (no collision — fresh `NodeId` per node). Test references hand-verified in Python (MatMul→Add→LayerNorm→Relu chain). Advisories (non-blocking): optional-input compaction may shift positional alignment for gappy-optional ops; cache key omits dtypes. No correctness bug found.
+
+---
+
+### 2026-07-14: Holden review — session executor Track D (🟡)
+**By:** Holden (safety/soundness reviewer)
+**Target:** `squad/ort2-session` @ `edbc3fd` | **Verdict:** 🟡 SHIP-with-advisories
+**What:** All 5 invariants held: (1) view bounds gated on every input + output before dispatch via `view_bounds`+`?`; (2) single-free via `Option::take` in `Tensor::drop`, `drain` in `Executor::drop`; (3) no cross-EP free — allocator carried on returned `Tensor`; (4) copy size validated before `copy_nonoverlapping`; (5) host malloc is global. Aliasing claim verified: in-place ops cause `CycleDetected` at build. Miri clean. Advisories: A1 — mid-run error path leaks output buffers (`DeviceBuffer` has no `Drop`); A2 — unchecked i64 arithmetic in `view_in_bounds` (theoretical overflow); A3 — cache key omits dtypes. None blocking.
+
+---
+
+### 2026-07-14: Holden review — session dynshape (🟡)
+**By:** Holden (safety/soundness reviewer)
+**Target:** `squad/ort2-session-dynshape` | **Verdict:** 🟡 SHIP-with-advisories
+**What:** Invariant #1 (view bounds) holds against new run-scoped buffers — gate keys off real `buf.len()` not assumed shape, so even stale `buffer_shapes` cannot bypass it. Buffer-reuse cannot yield undersized-but-passing buffer (two independent layers: correct sizing + real-length gate). No new aliasing introduced. Single-free/no-leak on re-allocation — `deallocate(old)` before `allocate`, Miri-clean across batch 2→3→2 reuse test. 14/14 tests pass. Advisories: H-D1 — unchecked `dims.iter().product()` overflows mod 2⁶⁴ and gate is congruent (very low reachability); H-D2 — stale `buffer_shapes` if `allocate` fails post-dealloc (clean error, not UB); Holden-A1 (pre-existing) — mid-run error-path buffer leak unchanged.
+
+---
+
+### 2026-07-14: Holden review — C ABI Track E (🟢)
+**By:** Holden (safety/soundness reviewer)
+**Target:** `squad/ort2-capi` | **Verdict:** 🟢 SHIP
+**What:** Verified all 6 FFI soundness axes: (1) null-guards on every handle and pointer before deref, returning `InvalidArgument`; (2) every fallible body in `catch_unwind` via `guard`; (3) `Box::into_raw`/`Box::from_raw` once each, null-tolerant releases, atomic commit in `ort2_run`; (4) `create_tensor` validates `data_len == storage_bytes(numel)` before slice construction; (5) `CStr::from_ptr(..).to_str()` with UTF-8 error → `InvalidArgument`; (6) 12/12 tests pass, Miri clean. Advisories (non-blocking): A1 — release fns not in `guard` (panic-free today but relies on `Drop` invariants); A2 — `storage_bytes` unchecked multiply (only reached inside `guard`, bounded by prior validation).
+
+---
+
+### 2026-07-14: Chew review — ep-cpu BERT kernels +17 (🟡)
+**By:** Chew (correctness/numerics reviewer)
+**Target:** `squad/ort2-epcpu-ops` @ `4f2465e` | **Verdict:** 🟡 SHIP-with-advisories
+**What:** 90/90 tests pass. No blocking numeric bug for bert_toy. Independently verified: Softmax stability vector `[1000,1001,1002]→[0.090,0.245,0.665]` ✓; broadcast `[3,1]·[1,4]→[3,4]` ✓; Erf max abs err 1.39e-7 ✓; Gemm `[[58,64],[139,154]]` ✓. Elementwise binaries, ReduceMean, Gemm, Slice, Cast, data-movement kernels spec-faithful. Advisories: A1 — Softmax uses opset-13 per-axis (bit-identical to opset-12 coerce only on last axis; bert_toy Softmax all last-axis but model not in-repo — conformance harness must confirm); A2 — `Min` uses `f32::min` (returns non-NaN; ONNX propagates NaN — no bert_toy impact); A3 — Cast float→int saturates on overflow vs ORT UB (documented, no bert_toy impact). Non-blocking hardening for A1 (opset<13 guard when axis≠rank-1) assigned to Roy or Deckard.
+
+---
+
+### 2026-07-14: Gaff review — loader const-fold-lite shape inference (🟢)
+**By:** Gaff (correctness reviewer)
+**Target:** `squad/ort2-loader-shapeinfer` | **Verdict:** 🟢 SHIP
+**What:** No wrong constant found. Every fold aborts via `?`/`None` on missing/non-integer/unfolded operands — never invents a constant. Verified: Gather symbolic index → `None` ✓; Slice requires `all_const` starts/ends ✓; Concat requires all inputs in env ✓; binop any-Sym → fresh symbol (unit-tested) ✓; Reshape handles -1/0 correctly ✓; Slice clamp math correct ✓. Symbolic identities propagate via interned `SymbolId`. Bounds enforced at every entry point. `bert_toy_optimized_every_value_resolves` ran on real model (257 KB, not skipped) — no `UnresolvedShape` on structural ops; position-slice chain correctly symbolic. Advisories: A1 — `Div` truncates toward zero vs floor for negative operands (no positive-dim impact; elem_to_dim maps negatives to fresh symbol); A2 — `Shape` of unresolved input folds to rank-0 (pre-existing, no bert_toy impact). 27/27 tests pass.

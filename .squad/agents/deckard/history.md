@@ -82,3 +82,9 @@ Verdict: 🟢 **SHIP**.
 - **ort2-loader (7e0e367):** ONNX→IR pipeline with protox, graph_builder, mmap weights, shape_inference. 15 tests. Reviewed 🟡 Gaff.
 - **loader-weights (dd5297d):** `load_model_with_weights` → `Arc<WeightStore>`, norm_axis off-by-one fix. 18 tests. Reviewed 🟡 Gaff.
 - **Perfetto #13 review (8d1bf3d):** 🟢 SHIP — all 6 security/correctness criteria pass (gate parity, no data leak via `&'static str`, refactor safe, honest empty, OTLP deferred, model-agnostic).
+
+## 2026-07-14T05:04:00Z — ORT2 loader const-fold-lite shape inference merged
+
+- **squad/ort2-loader-shapeinfer** (b6f032e): Bounded partial evaluator (`ConstEnv`, `KnownVal`, `IntElem::Const|Sym`). Value-prop ops: Constant/Shape/Gather/Slice/Concat/Reshape/elementwise-int. bert_toy: 135→50 unresolved values; all residuals are scalar Constants; no structural op left shape-less. 27/27 tests (real model test not skipped). Reviewed 🟢 Gaff.
+- Open: loader shape rules for `Attention` + `EmbedLayerNormalization` needed before full bert_toy session run (flagged by Roy session dynshape note).
+- Gaff advisory A1: `Div` truncates vs floor for negative operands (no current impact).

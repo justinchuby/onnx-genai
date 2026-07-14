@@ -16,3 +16,9 @@ Recurring audit convention is canonical: `.github/workflows/audit.yml` runs week
 ## 2026-07-14T02:37:00Z — Reviewed ep-api + ep-cpu (safety)
 - **ep-api (65ec9f6):** 🟡 safety — DeviceBuffer ownership, Send/Sync soundness, unsafe construction contracts.
 - **ep-cpu (ea30279):** 🟡 safety — strided::view_in_bounds enforcement, isolated unsafe blocks (aligned alloc/dealloc, copy_nonoverlapping, two strided accessors), no cross-EP free.
+
+## 2026-07-14T05:04:00Z — ORT2 safety reviews: session base + dynshape + capi
+
+- **squad/ort2-session** review (🟡): All 5 invariants held (view bounds, single-free, no cross-EP free, copy size ≤ min(src,dst), host-global). Aliasing: in-place ops cause CycleDetected at build. Miri clean. Advisories: A1 mid-run error-path buffer leak; A2 unchecked i64 in `view_in_bounds`; A3 cache key omits dtypes.
+- **squad/ort2-session-dynshape** review (🟡): Invariant #1 holds against run-scoped buffers (gate keys off real `buf.len()`). Single-free on realloc verified. 14/14 Miri-clean. Advisories: H-D1 unchecked shape-multiply overflow; H-D2 stale buffer_shapes if allocate fails post-dealloc; Holden-A1 (pre-existing) mid-run leak unchanged.
+- **squad/ort2-capi** review (🟢): All 6 FFI axes pass. 12/12 Miri-clean. Advisories: A1 release fns not in guard; A2 storage_bytes unchecked multiply (bounded by prior validation).

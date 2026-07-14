@@ -48,3 +48,8 @@ Reviewed Leon's K4 real KV byte materialization (commit `786e268`, read-only, Le
 ## 2026-07-14T02:37:00Z — Reviewed ep-cpu + speculative fix
 - **ep-cpu (ea30279):** 🟡 numerics review — signed off on naive GEMM correctness, int4/uint4 `storage_bytes`, LayerNorm population variance.
 - **gemma4-accept (8089a1f):** 🟡 numerics review — signed off on `inputs_embeds` concat fix, LinearEmbedder scale application, acceptance metrics.
+
+## 2026-07-14T05:04:00Z — ORT2 reviews: session Track D + ep-cpu +17 kernels
+
+- **squad/ort2-session** review (🟢): Verified topo-sort correctness, value dep resolution, view materialization, initializer/input binding, cache key collision-free. Hand-verified test references in Python. Minor advisories: gappy-optional compaction, cache key omits dtypes.
+- **squad/ort2-epcpu-ops** review (🟡): 90/90 tests pass. Independently verified softmax stability, broadcast, Erf accuracy, Gemm. No blocking numeric bug for bert_toy. Advisories: Softmax opset-12 guard (assign Roy/Deckard), Min NaN propagation, Cast overflow saturation vs UB (documented). Conformance harness must confirm last-axis Softmax assumption.

@@ -16,3 +16,7 @@ Gaff's review is now in decisions: engine.rs is a ~3,300-line god module. Refact
 ## 2026-07-14T02:37:00Z — Reviewed ort2-loader + loader-weights
 - **ort2-loader (7e0e367):** 🟡 — ONNX→IR pipeline, protox build, mmap weights, shape inference.
 - **loader-weights (dd5297d):** 🟡 — WeightStore re-export, norm_axis fix.
+
+## 2026-07-14T05:04:00Z — ORT2 review: loader const-fold-lite shape inference
+
+- **squad/ort2-loader-shapeinfer** review (🟢 SHIP): No wrong constant found — every fold aborts via `?`/`None` on unknown/non-integer operands; symbolic operands degrade to fresh symbols; bounds enforced at all entry points. `bert_toy_optimized_every_value_resolves` ran on real model (257 KB, not skipped) — passed. All 27/27 tests green. Advisories: A1 `Div` truncation vs floor for negative operands (no positive-dim impact); A2 `Shape` of unresolved input folds to rank-0 (pre-existing).
