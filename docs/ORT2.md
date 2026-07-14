@@ -5604,7 +5604,69 @@ This ensures:
 - **Rust/C++ users** get minimal binary size and dependency footprint by default
 - **Everyone** can opt-in to exactly what they need without rebuilding the world
 
-#### 48.8.9 Design Decisions
+#### 48.8.9 Feature Placement: Where Each Backend Lives
+
+Not all tracing backends belong in the same crate. Key distinction:
+
+- **ITT = software annotation** — marks any code path (optimizer, scheduler, EP dispatch,
+  loader, memory planner). Belongs in **tracer crate** itself because it instruments the
+  entire runtime, not just one EP.
+
+- **CUPTI = hardware collection** — only meaningful with NVIDIA GPU hardware. Belongs in
+  **ep-cuda crate** which activates the tracer's `cupti` feature.
+
+```
+onnx-runtime-tracer
+├── feature "perfetto" (default)    → Perfetto protobuf export
+├── feature "itt"                   → Intel ITT API (ittapi crate)
+│   └── IttCollector annotates ALL TraceEvents:
+│       optimizer passes, memory planning, loader, scheduler,
+│       CPU EP dispatch, GPU EP dispatch — everything.
+│       (~50KB binary overhead, zero runtime cost without VTune)
+├── feature "cupti"                 → CUPTI collector interface + dlopen shim
+│   └── Only compiled when activated by ep-cuda
+└── feature "chrome"                → Chrome Trace JSON
+
+onnx-runtime-ep-cuda
+├── depends on: tracer = { features = ["cupti"] }   ← activates CUPTI code
+│   └── dlopen libcupti.so at runtime (graceful if absent)
+├── owns: GPU kernel correlation, activity buffer management
+└── reason: CUPTI only exists on NVIDIA hardware
+
+onnx-runtime-ep-cpu
+├── depends on: tracer (no extra features needed)
+│   └── ITT already covers CPU EP dispatch via tracer-level annotation
+└── does NOT need to explicitly pull ITT — tracer handles it
+```
+
+**Why ITT ≠ CUPTI placement:**
+
+| Aspect | ITT | CUPTI |
+|--------|-----|-------|
+| What it does | Annotates code ("this region is MatMul") | Collects HW counters (kernel time, occupancy) |
+| Scope | All code paths (CPU, GPU, optimizer, scheduler) | GPU kernels only |
+| Hardware dependency | None (works everywhere) | Requires NVIDIA GPU + driver |
+| Binary cost | ~50KB (ittapi static lib) | ~0 (dlopen, no link-time cost) |
+| Placement | **tracer crate** | **ep-cuda crate** (activates tracer/cupti feature) |
+
+**Python wheel implications:**
+
+```
+nxrt (base wheel, CPU-only, ~5MB):
+  tracer with [perfetto, itt, chrome] ← ITT included, zero cost
+  NO cupti code compiled
+
+nxrt[cuda12] (GPU extras):
+  ep-cuda activates tracer/cupti feature
+  dlopen libcupti.so at runtime
+```
+
+This means:
+- CPU-only users get VTune support for free (ITT in base package)
+- CUPTI code never touches a non-GPU build
+- GPU users get both ITT + CUPTI automatically
+
+#### 48.8.10 Design Decisions
 
 | Decision | Choice | Rationale |
 |----------|--------|----------|
