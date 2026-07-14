@@ -1,7 +1,7 @@
 [package]
 name = "onnx-runtime-loader"
 description = "ONNX protobuf loader for the ORT 2.0 runtime: model parsing, weight mmap, and shape inference into onnx-runtime-ir"
-version = "0.1.0-dev.0"
+version = "0.1.0-dev.1"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true

@@ -1,7 +1,7 @@
 [package]
 name = "onnx-runtime-ep-api"
 description = "Execution Provider API for the ORT 2.0 runtime: ExecutionProvider and Kernel traits, OpRegistry, and the ORT graph ABI bridge"
-version = "0.1.0-dev.0"
+version = "0.1.0-dev.1"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true

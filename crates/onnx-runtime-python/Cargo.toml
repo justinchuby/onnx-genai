@@ -5,7 +5,7 @@
 # wheel — see README.md and docs/PIPELINE.md §12.4.
 [package]
 name = "onnx-runtime-python"
-version = "0.1.0-dev.0"
+version = "0.1.0-dev.1"
 edition = "2024"
 license = "MIT"
 authors = ["Justin Chu"]

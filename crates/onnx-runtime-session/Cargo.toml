@@ -1,7 +1,7 @@
 [package]
 name = "onnx-runtime-session"
 description = "Session and inference API for the ORT 2.0 runtime: intent-based SessionBuilder and sequential executor (skeleton)"
-version = "0.1.0-dev.0"
+version = "0.1.0-dev.1"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
