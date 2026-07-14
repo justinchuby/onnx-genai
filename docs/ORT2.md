@@ -551,6 +551,13 @@ pub trait ExecutionProvider: Send + Sync {
 }
 
 /// Opaque EP-compiled artifact. Serializable to/from disk.
+///
+/// This is the **runtime form** of a compiled-EP context. Its **on-disk /
+/// interchange form** is the ORT `EPContext` contrib node (domain
+/// `com.microsoft`) that embeds this blob directly in an ONNX graph — see
+/// §55 for the full node schema, the load/dump paths, and the exact mapping
+/// between this struct's `data`/`ep_name`/`ep_version` fields and the node's
+/// `ep_cache_context`/`source`/`ep_sdk_version` attributes.
 pub struct EpContext {
     /// EP that produced this context.
     pub ep_name: String,
@@ -2585,6 +2592,31 @@ crate-type = ["cdylib"]
 
 Unimplemented functions return `ORT_NOT_IMPLEMENTED` status.
 
+### 21.4 EPContext Session Options (ORT-compatible)
+
+To be a true drop-in, the C API must honor ORT's `EPContext`-generation session
+options so ORT tooling (e.g. `onnxruntime.tools` context-cache dumping, QNN/OpenVINO
+AOT scripts) works unchanged. These are set via `AddSessionConfigEntry` /
+`AppendExecutionProvider` string key-values and are parsed into `SessionOptions`
+(§20.5) fields consumed by the dump path (§55.4):
+
+| Session-option key      | Type   | Default          | Meaning                                                              |
+|-------------------------|--------|------------------|----------------------------------------------------------------------|
+| `ep.context_enable`     | int    | `0`              | `1` = after compile, dump a context-cache `*_ctx.onnx` model.        |
+| `ep.context_file_path`  | string | `<orig>_ctx.onnx`| Output path for the generated context model.                         |
+| `ep.context_embed_mode` | int    | `1`              | `1` = embed blob in node; `0` = write external file, store its path. |
+
+```rust
+// Parsed in the capi layer, stored on SessionOptions, read by the writer (§55.4).
+pub struct EpContextGenOptions {
+    pub enable: bool,           // ep.context_enable
+    pub file_path: Option<PathBuf>, // ep.context_file_path (default: <orig>_ctx.onnx)
+    pub embed_mode: EmbedMode,  // ep.context_embed_mode → Embedded | ExternalFile
+}
+```
+
+Unknown/unsupported EP keys are ignored (never error), matching ORT semantics.
+
 ---
 
 ## 22. Error Types
@@ -4471,6 +4503,17 @@ Cached load:   load_plan(50ms) → mmap_weights(10ms) → warm_kernels(50ms) = ~
                                                                     7x faster
 ```
 
+> **Relationship to the on-disk `EPContext` node (§55).** This cache is our
+> *internal, host-local* cold-start artifact keyed on `hash(model + device +
+> options + runtime_version)` — it caches the *whole compiled plan* and is not
+> portable across machines or ORT-compatible tools. ORT's `EPContext` contrib
+> node (§55) is the *portable, in-graph* form of a single EP's compiled context:
+> it travels inside the `*_ctx.onnx` model and is consumed by any ORT-compatible
+> runtime. The two are complementary — when an EP's `save_context()` produces an
+> `EpContext`, its `data` blob can be stored both here (fast local reload) and,
+> when `ep.context_enable` is set, serialized into an `EPContext` node for
+> portable distribution.
+
 ### 41.3 CLI
 
 ```bash
@@ -5722,7 +5765,246 @@ pip install ort2 --no-deps
 
 ---
 
-## 55. Phased Roadmap
+## 55. EPContext Node — On-Disk Compiled-EP Interchange
+
+### 55.1 What & Why
+
+Compiled/hardware EPs (QNN, OpenVINO, TensorRT, Vitis AI, and eventually our own
+CUDA EP) pay a large **convert + compile** cost the first time they see a
+subgraph: parsing the ONNX partition, lowering it to the vendor IR, and invoking
+the vendor AOT compiler (QNN graph prepare, OpenVINO blob compile, TRT engine
+build). This can be **seconds to minutes** and often needs the vendor SDK/toolchain
+present on the deployment box — unacceptable for edge/serverless startup and
+awkward for shipping.
+
+ORT solves this with the **`EPContext` node**: an ONNX contrib operator
+(domain `com.microsoft`) that embeds a **pre-compiled EP binary directly inside
+the ONNX model graph**. The generating run partitions the graph, compiles each
+subgraph, and rewrites the model so each compiled partition becomes a single
+`EPContext` node carrying the vendor blob (or a path to it). On subsequent loads
+the EP recognizes the node and **loads the blob directly**, skipping
+convert+compile entirely.
+
+This is a first-class item for us because *the EP ecosystem is the moat* (§1):
+being able to **consume** ORT-produced `*_ctx.onnx` models and **generate** them
+in the exact ORT format is what lets our runtime slot into existing vendor
+tooling and existing pre-compiled model artifacts without re-compilation.
+
+> **Two forms of one thing.** §4 already defines an internal
+> `EpContext { ep_name, ep_version, data, covered_nodes, device_fingerprint }`
+> (the **runtime form** produced by `Ep::save_context()` / consumed by
+> `Ep::load_context()`), and §41 defines a host-local **compilation cache**.
+> The `EPContext` node defined here is the **on-disk / interchange form**: the
+> serialized, in-graph, tool-portable representation of that same compiled
+> context. §55.3 and §55.4 define the exact mapping between them.
+
+### 55.2 Op Schema (ORT `com.microsoft::EPContext`)
+
+Authoritative source: ORT [*EP Context Design*](https://onnxruntime.ai/docs/execution-providers/EP-Context-Design.html).
+
+- **Op:** `EPContext`, **domain:** `com.microsoft`.
+- **Inputs / outputs:** **variadic**. An `EPContext` node *replaces a partitioned
+  subgraph*, so its inputs/outputs are exactly that subgraph's boundary tensors
+  (in order). The runtime must not assume any fixed arity.
+- **Attributes:**
+
+| Attribute             | Type    | Default | Meaning                                                                                                                                                                     |
+|-----------------------|---------|---------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `main_context`        | int64   | `1`     | `1` = this node references EP-context content holding the graph for **this** node. `0` = the graph comes from **another** node whose `main_context=1` (some EPs pack multiple graphs into one primary context blob).                     |
+| `ep_cache_context`    | string  | —       | If `embed_mode=1`: the context **payload** (the compiled blob bytes). If `embed_mode=0`: the **path** to the context file, relative to the ONNX model file.                |
+| `embed_mode`          | int64   | `1`     | `1` = `ep_cache_context` holds the payload inline. `0` = `ep_cache_context` holds an external file path.                                                                    |
+| `ep_sdk_version`      | string  | opt     | SDK/toolchain version that generated the node (invalidation / diagnostics).                                                                                                |
+| `onnx_model_filename` | string  | opt     | Original ONNX model filename.                                                                                                                                              |
+| `hardware_architecture` | string | opt    | Target hardware architecture the blob was compiled for.                                                                                                                    |
+| `partition_name`      | string  | opt     | Name of the ORT-partitioned graph this node represents.                                                                                                                    |
+| `source`              | string  | opt     | **Unique EP-defined key** identifying which EP owns/consumes this node. ORT hosts multiple `EPContext` nodes for different EPs in one model and dispatches on this key. E.g. the QNN EP only accepts nodes with `source` = `QNN` / `QnnExecutionProvider`; the OpenVINO EP only accepts `source` = `OpenVINOExecutionProvider`. **Dispatch MUST key on this attribute — no hardcoded EP names in the runtime.** |
+| `notes`               | string  | opt     | Free-form notes.                                                                                                                                                           |
+| `max_size`            | int64   | `0`     | Optional size hint for the context payload.                                                                                                                                |
+
+- **Generation session options** (see §21.4 for the C-API surface):
+  - `ep.context_enable` (int, `1` dumps a context-cache model),
+  - `ep.context_file_path` (default `<orig>_ctx.onnx`),
+  - `ep.context_embed_mode` (int, embed vs external).
+
+### 55.3 Consuming (Load Path)
+
+**Loader recognition & IR representation (`onnx-runtime-loader`).** The protobuf
+parser (§19) already builds a `Node` per `NodeProto` with `op_type`, `domain`, and
+attributes. An `EPContext` node is *just a node* with `domain =
+"com.microsoft"`, `op_type = "EPContext"`, variadic i/o, and the attributes
+above — no special IR node kind is required. The loader adds a typed *view* over
+that node so downstream crates don't re-parse attributes, and resolves the blob
+source at load time:
+
+```rust
+/// Typed view over a com.microsoft::EPContext node in the Graph IR.
+/// Backed by the ordinary Node + its attributes — no separate IR node kind.
+pub struct EpContextNode<'g> {
+    pub node: NodeId,
+    pub source: Option<&'g str>,      // `source` attr — the dispatch key (§55.6)
+    pub main_context: bool,           // main_context != 0
+    pub embed_mode: EmbedMode,        // Embedded | ExternalFile
+    pub sdk_version: Option<&'g str>,
+    pub partition_name: Option<&'g str>,
+    // variadic boundary tensors come straight from node.inputs / node.outputs
+}
+
+pub enum EmbedMode { Embedded, ExternalFile }
+
+/// Where the compiled blob physically lives after load-time resolution.
+pub enum EpContextBlob {
+    /// embed_mode=1: bytes owned inline (copied out of ep_cache_context).
+    Embedded(Vec<u8>),
+    /// embed_mode=0: mmap of an external file resolved *relative to the model dir*.
+    External { path: PathBuf, map: Mmap },
+}
+
+impl Loader {
+    /// Resolve the payload for one EPContext node. For embed_mode=0 the path in
+    /// `ep_cache_context` is joined onto the model directory (same rule as
+    /// external initializer data, §19.2) and mmap'd read-only.
+    fn resolve_ep_context(&self, model_dir: &Path, n: &EpContextNode) -> Result<EpContextBlob>;
+}
+```
+
+Key loader rules:
+
+- `embed_mode=0` paths are resolved **relative to the ONNX model file** (identical
+  policy to external-weight resolution, §19.2) and **mmap'd / read lazily** — the
+  blob is never eagerly copied into the graph.
+- The loader does **not** interpret the blob; it is opaque vendor bytes.
+- Shape inference (§19.3) treats `EPContext` as opaque: output shapes come from
+  the model's `value_info` / graph outputs, not from op-specific inference.
+
+**Dispatch & execution (`onnx-runtime-session` + `onnx-runtime-ep-api`).** During
+placement, an `EPContext` node bypasses the cost model (like `claim_nodes`, §4.1):
+it is handed to the EP whose declared `source` key matches the node's `source`
+attribute, via a **`source`-keyed registry** (§55.6). That EP turns the on-disk
+node into the internal runtime form and restores it:
+
+```rust
+// The on-disk node → internal EpContext (§4) → EP restore.
+fn dispatch_ep_context(reg: &EpContextRegistry, node: &EpContextNode, blob: EpContextBlob)
+    -> Result<()>
+{
+    let ep = reg.claim(node.source)          // §55.6 — match on `source`, never a hardcoded name
+        .ok_or(Error::NoEpForContext { source: node.source.map(str::to_owned) })?;
+
+    // Serialized (on-disk) form → runtime form expected by Ep::load_context (§4).
+    let ctx = EpContext {
+        ep_name: ep.name().to_string(),
+        ep_version: node.sdk_version.unwrap_or_default().to_string(), // ← ep_sdk_version
+        data: match blob {                                            // ← ep_cache_context
+            EpContextBlob::Embedded(b) => b,
+            EpContextBlob::External { map, .. } => map[..].to_vec(),
+        },
+        covered_nodes: vec![node.node],       // this node's boundary == the partition
+        device_fingerprint: String::new(),    // filled/validated by the EP
+    };
+    ep.load_context(&ctx)                      // EP skips convert+compile
+}
+```
+
+**`main_context` multi-graph referencing.** Some EPs (notably QNN) pack multiple
+compiled graphs into one primary context binary. Nodes with `main_context=1`
+*own* the payload; nodes with `main_context=0` **reference** a sibling primary
+node's already-loaded context (matched by `source` + `partition_name`). The
+session loads all `main_context=1` blobs first (deduplicating identical
+`ep_cache_context` payloads), then resolves `main_context=0` nodes against the
+context the owning EP already holds — no second blob load.
+
+### 55.4 Generating (Dump Path)
+
+When `ep.context_enable` is set (§21.4), after the session partitions the graph and
+each EP compiles its claimed subgraph, the session asks every participating EP for
+its compiled context and **serializes it back into `EPContext` nodes** in a new
+`*_ctx.onnx` model:
+
+```
+compile subgraphs → for each compiled partition:
+    ctx: EpContext = ep.save_context()?          // §4 runtime form
+    build EPContext NodeProto:
+        domain     = "com.microsoft"
+        op_type    = "EPContext"
+        input/output = partition boundary tensors (variadic, in order)
+        source            = ep.context_source_key()   // EP's own `source` key (§55.6)
+        ep_sdk_version    = ctx.ep_version
+        partition_name    = <partition id>
+        main_context      = 1
+        embed_mode        = options.embed_mode
+        ep_cache_context  = match embed_mode {
+            Embedded     => ctx.data (inline bytes),
+            ExternalFile => write ctx.data to "<model_stem>_<source>_<part>.bin"
+                            next to the ctx model; store the RELATIVE path string,
+        }
+→ replace the compiled subgraph in the ModelProto with the EPContext node
+→ serialize to options.file_path (default "<orig>_ctx.onnx")
+```
+
+Ownership: the **writer lives in `onnx-runtime-loader`** (it already owns
+ONNX↔IR protobuf serialization and external-data file I/O), driven by
+`onnx-runtime-session` (which owns compilation, partition boundaries, and the
+`ep.context_*` options). For `embed_mode=0`, the loader writes the external
+binary next to the ctx model and stores the **relative** path in
+`ep_cache_context`, mirroring the §19.2 external-data convention so the produced
+model round-trips through §55.3's load path (and through upstream ORT).
+
+### 55.5 C-API Surface
+
+The `ep.context_enable` / `ep.context_file_path` / `ep.context_embed_mode`
+session options are exposed through the ORT-compatible C API so existing ORT
+tooling that dumps context-cache models works unchanged against
+`libonnxruntime.so`. See **§21.4** for the key table and the parsed
+`EpContextGenOptions` struct.
+
+### 55.6 Model-Agnostic Dispatch (Hard Rule)
+
+EP selection for an `EPContext` node is **always** by the node's `source`
+attribute, resolved through a registry — **never** by hardcoded EP names or
+string-matching vendor identifiers in the runtime. Each EP declares the
+`source` key(s) it accepts; the registry maps key → EP. This keeps the runtime
+generalizable and config-driven: adding a new compiled EP requires no change to
+loader/session dispatch code.
+
+```rust
+/// Registry mapping an EPContext `source` key → the EP that owns it.
+/// EPs register the key(s) they accept; dispatch is a pure lookup.
+pub struct EpContextRegistry {
+    by_source: HashMap<String, EpId>,   // e.g. "QNN"/"QnnExecutionProvider" → qnn ep
+}
+
+impl EpContextRegistry {
+    /// EP declares which `source` key(s) it consumes (from EP config, not code).
+    pub fn register(&mut self, ep: EpId, source_keys: &[String]);
+    /// Look up the EP for a node's `source` attribute. None ⇒ node unclaimed.
+    pub fn claim(&self, source: Option<&str>) -> Option<EpId>;
+}
+```
+
+An `EPContext` node whose `source` matches no registered EP is **unclaimed**: the
+session surfaces a clear error (`NoEpForContext { source }`) rather than guessing —
+the model requires an EP that is not loaded.
+
+### 55.7 Crate Responsibilities & Phasing
+
+| Crate                    | Responsibility                                                                                             |
+|--------------------------|-----------------------------------------------------------------------------------------------------------|
+| `onnx-runtime-loader`    | Recognize `com.microsoft::EPContext` nodes; `EpContextNode` view; resolve `embed_mode=0` paths (rel. to model) + mmap; **writer** for the `*_ctx.onnx` dump path (§55.4) incl. external-blob files. |
+| `onnx-runtime-ep-api`    | `EpContextRegistry` (`source`-keyed); the on-disk-node ↔ internal `EpContext` mapping contract; EP declares accepted `source` keys + `save_context()`/`load_context()` (already in §4). |
+| `onnx-runtime-session`   | Bypass placement for `EPContext` nodes; drive `main_context=1/0` resolution + dedup; own `ep.context_*` options and drive the dump path during compile. |
+| `onnx-runtime-capi`      | Parse `ep.context_enable`/`ep.context_file_path`/`ep.context_embed_mode` session options (§21.4).         |
+
+**Roadmap placement: Phase 2 (§56)**, alongside *Legacy EP loading (dlopen +
+vtable)* and the *ORT Graph ABI bridge* — `EPContext` is precisely the mechanism
+by which compiled/legacy EPs interoperate with our runtime. It is **foundational
+for the CUDA/QNN/OpenVINO/TensorRT EPs** even though **no Phase-1 EP consumes it**
+(the pure-Rust CPU EP has no compile step). Building the loader recognition,
+`source`-keyed dispatch, and the dump/writer path in Phase 2 means the first
+compiled EP lands into an already-working context-cache pipeline.
+
+---
+
+## 56. Phased Roadmap
 
 ### Phase 1: Foundation (8-12 weeks)
 - [ ] `onnx-runtime-ir`: Graph IR with all types, validation, mutation API
@@ -5738,6 +6020,7 @@ _Depends on: Phase 1 complete_
 - [ ] `onnx-runtime-ep-cuda`: CUDA EP with cuBLAS GEMM + CuTe LayerNorm/GELU
 - [ ] `onnx-runtime-ep-api`: ORT Graph ABI bridge for legacy plugin EPs
 - [ ] Legacy EP loading (dlopen + vtable)
+- [ ] **EPContext node support (§55): loader recognition + IR representation, `source`-keyed EP dispatch (ep-api/session), embed/external blob resolution, and the `*_ctx.onnx` writer for `ep.context_enable` (loader/session), plus `ep.context_*` C-API session options (§21.4).** Foundational for the compiled EPs (CUDA/QNN/OpenVINO/TensorRT); no Phase-1 EP consumes it yet.
 - [ ] `onnx-runtime-cost-model`: Static cost formulas + device profiles
 - [ ] `onnx-runtime-optimizer`: ConstantFolding, DeadNodeElimination, OpFusion, AttentionFusion
 - [ ] Layout propagation pass
