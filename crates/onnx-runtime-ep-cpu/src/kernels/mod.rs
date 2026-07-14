@@ -26,12 +26,22 @@ use onnx_runtime_ir::DataType;
 use crate::strided::{elem_offset, next_index, numel};
 
 pub mod add;
+pub mod cast;
+pub mod constant;
+pub mod elementwise;
+pub mod expand;
 pub mod gather;
+pub mod gemm;
 pub mod layernorm;
 pub mod matmul;
+pub mod reduce;
 pub mod relu;
 pub mod reshape;
+pub mod shape;
+pub mod slice;
+pub mod softmax;
 pub mod transpose;
+pub mod unsqueeze;
 
 /// The set of ops the CPU EP implements for the Phase-1 BERT-on-CPU milestone.
 pub const PHASE1_OPS: &[&str] = &[
@@ -42,6 +52,28 @@ pub const PHASE1_OPS: &[&str] = &[
     "Transpose",
     "Gather",
     "LayerNormalization",
+    // Elementwise binary (numpy broadcasting).
+    "Sub",
+    "Mul",
+    "Div",
+    "Pow",
+    "Min",
+    // Elementwise unary.
+    "Sqrt",
+    "Erf",
+    "Tanh",
+    "Cast",
+    // Reduction / normalization.
+    "ReduceMean",
+    "Softmax",
+    // Shape / data movement.
+    "Shape",
+    "Unsqueeze",
+    "Expand",
+    "Slice",
+    "Constant",
+    // GEMM.
+    "Gemm",
 ];
 
 /// Whether `op_type` is one of the Phase-1 ops the CPU EP can run.
@@ -77,6 +109,40 @@ pub fn build_cpu_registry() -> OpRegistry {
         OpKey::new("LayerNormalization", "", 1),
         Box::new(layernorm::LayerNormFactory),
     );
+    // Elementwise binary broadcasting ops.
+    reg.register(OpKey::new("Sub", "", 1), Box::new(elementwise::SubFactory));
+    reg.register(OpKey::new("Mul", "", 1), Box::new(elementwise::MulFactory));
+    reg.register(OpKey::new("Div", "", 1), Box::new(elementwise::DivFactory));
+    reg.register(OpKey::new("Pow", "", 1), Box::new(elementwise::PowFactory));
+    reg.register(OpKey::new("Min", "", 1), Box::new(elementwise::MinFactory));
+    // Elementwise unary ops.
+    reg.register(OpKey::new("Sqrt", "", 1), Box::new(elementwise::SqrtFactory));
+    reg.register(OpKey::new("Erf", "", 1), Box::new(elementwise::ErfFactory));
+    reg.register(OpKey::new("Tanh", "", 1), Box::new(elementwise::TanhFactory));
+    reg.register(OpKey::new("Cast", "", 1), Box::new(cast::CastFactory));
+    // Reduction / normalization.
+    reg.register(
+        OpKey::new("ReduceMean", "", 1),
+        Box::new(reduce::ReduceMeanFactory),
+    );
+    reg.register(
+        OpKey::new("Softmax", "", 1),
+        Box::new(softmax::SoftmaxFactory),
+    );
+    // Shape / data movement.
+    reg.register(OpKey::new("Shape", "", 1), Box::new(shape::ShapeFactory));
+    reg.register(
+        OpKey::new("Unsqueeze", "", 1),
+        Box::new(unsqueeze::UnsqueezeFactory),
+    );
+    reg.register(OpKey::new("Expand", "", 1), Box::new(expand::ExpandFactory));
+    reg.register(OpKey::new("Slice", "", 1), Box::new(slice::SliceFactory));
+    reg.register(
+        OpKey::new("Constant", "", 1),
+        Box::new(constant::ConstantFactory),
+    );
+    // GEMM.
+    reg.register(OpKey::new("Gemm", "", 1), Box::new(gemm::GemmFactory));
     reg
 }
 
@@ -193,6 +259,97 @@ pub fn write_dense_f32(out: &mut TensorMut, data: &[f32]) -> Result<()> {
     Ok(())
 }
 
+/// The fixed element byte-width of `dtype`. Errors for variable-width
+/// ([`DataType::String`]) and sub-byte-packed (`Int4`/`Uint4`) types, which the
+/// dtype-generic byte movers below cannot address one-element-at-a-time.
+pub fn elem_size(dtype: DataType) -> Result<usize> {
+    let size = dtype.byte_size();
+    if size == 0 {
+        return Err(EpError::InvalidTensorView {
+            reason: format!("dtype {dtype:?} has no fixed-width byte layout"),
+        });
+    }
+    Ok(size)
+}
+
+/// Materialize any fixed-width view into a dense, row-major byte buffer,
+/// applying the view's strides and byte offset. This is the dtype-agnostic
+/// counterpart to [`to_dense_f32`]: it copies raw element bytes without
+/// interpreting them, so it serves the pure data-movement ops (Unsqueeze,
+/// Expand, Slice, Cast source read) uniformly across dtypes.
+pub fn to_dense_bytes(view: &TensorView) -> Result<Vec<u8>> {
+    view.validate()?;
+    let esize = elem_size(view.dtype)?;
+    let n = numel(view.shape);
+    let mut out = vec![0u8; n * esize];
+    if n == 0 {
+        return Ok(out);
+    }
+    // Byte origin of the element at logical index 0 (applies `byte_offset`).
+    let origin = view.data_ptr::<u8>();
+    let mut idx = vec![0usize; view.shape.len()];
+    let mut w = 0usize;
+    loop {
+        let elem_off = elem_offset(view.strides, &idx);
+        let byte_off = elem_off * esize as isize;
+        // SAFETY: `origin` is the byte origin of a validated view; `elem_off` is
+        // an in-shape element offset, so `byte_off .. byte_off + esize` lies
+        // within the extent the view describes (bounds-checked against the
+        // backing allocation by the EP per invariant #1). `out[w..w + esize]` is
+        // a fresh, uniquely-owned buffer. The regions do not overlap.
+        unsafe {
+            std::ptr::copy_nonoverlapping(origin.offset(byte_off), out.as_mut_ptr().add(w), esize);
+        }
+        w += esize;
+        if !next_index(view.shape, &mut idx) {
+            break;
+        }
+    }
+    Ok(out)
+}
+
+/// Write a dense, row-major byte buffer into `out`, applying the output view's
+/// strides and byte offset. `data.len()` must equal `numel(out) * elem_size`.
+/// The dtype-agnostic counterpart to [`write_dense_f32`].
+pub fn write_dense_bytes(out: &mut TensorMut, data: &[u8]) -> Result<()> {
+    out.validate()?;
+    let esize = elem_size(out.dtype)?;
+    let n = numel(out.shape);
+    if data.len() != n * esize {
+        return Err(EpError::KernelFailed(format!(
+            "output byte count {} does not match produced {}",
+            n * esize,
+            data.len()
+        )));
+    }
+    if n == 0 {
+        return Ok(());
+    }
+    let origin = out.data_ptr_mut::<u8>();
+    let strides = out.strides;
+    let shape = out.shape;
+    let mut idx = vec![0usize; shape.len()];
+    let mut r = 0usize;
+    loop {
+        let elem_off = elem_offset(strides, &idx);
+        let byte_off = elem_off * esize as isize;
+        // SAFETY: `origin` is the byte origin of a validated output view;
+        // `byte_off .. byte_off + esize` is an in-shape offset lying within the
+        // extent the view describes (bounds-checked by the EP per invariant #1).
+        // Each destination range is written exactly once because the row-major
+        // walk visits every logical index once; source and destination buffers
+        // are distinct.
+        unsafe {
+            std::ptr::copy_nonoverlapping(data.as_ptr().add(r), origin.offset(byte_off), esize);
+        }
+        r += esize;
+        if !next_index(shape, &mut idx) {
+            break;
+        }
+    }
+    Ok(())
+}
+
 /// Error out unless `got == want`.
 fn require_dtype(got: DataType, want: DataType, ctx: &str) -> Result<()> {
     if got != want {
@@ -271,10 +428,48 @@ pub(crate) mod testutil {
             }
         }
 
+        pub fn i32(shape: &[usize], data: &[i32]) -> Self {
+            let strides = compute_contiguous_strides(shape);
+            let mut bytes = Vec::with_capacity(data.len() * 4);
+            for v in data {
+                bytes.extend_from_slice(&v.to_le_bytes());
+            }
+            Self {
+                bytes,
+                shape: shape.to_vec(),
+                strides,
+                dtype: DataType::Int32,
+            }
+        }
+
+        pub fn bool_(shape: &[usize], data: &[bool]) -> Self {
+            let strides = compute_contiguous_strides(shape);
+            let bytes = data.iter().map(|&b| b as u8).collect();
+            Self {
+                bytes,
+                shape: shape.to_vec(),
+                strides,
+                dtype: DataType::Bool,
+            }
+        }
+
         /// A zero-filled f32 output buffer of `shape`.
         pub fn zeros_f32(shape: &[usize]) -> Self {
             let n: usize = shape.iter().product();
             Self::f32(shape, &vec![0.0; n])
+        }
+
+        /// A zero-filled output buffer of `shape` with element type `dtype`.
+        pub fn zeros(dtype: DataType, shape: &[usize]) -> Self {
+            let n: usize = shape.iter().product();
+            let strides = compute_contiguous_strides(shape);
+            let esize = dtype.byte_size();
+            Self {
+                bytes: vec![0u8; n * esize],
+                shape: shape.to_vec(),
+                strides,
+                dtype,
+            }
         }
 
         /// Override strides/shape to expose the same bytes as a strided view
@@ -310,6 +505,24 @@ pub(crate) mod testutil {
                 .chunks_exact(4)
                 .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                 .collect()
+        }
+
+        pub fn to_i64(&self) -> Vec<i64> {
+            self.bytes
+                .chunks_exact(8)
+                .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
+                .collect()
+        }
+
+        pub fn to_i32(&self) -> Vec<i32> {
+            self.bytes
+                .chunks_exact(4)
+                .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect()
+        }
+
+        pub fn to_bool(&self) -> Vec<bool> {
+            self.bytes.iter().map(|&b| b != 0).collect()
         }
     }
 }
