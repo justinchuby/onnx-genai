@@ -7,7 +7,7 @@
 //! numeric result against a reference computed here in the test.
 
 use onnx_runtime_ir::{
-    static_shape, Attribute, DataType, Graph, Node, NodeId, Shape, TensorData, ValueId, WeightRef,
+    static_shape, Attribute, DataType, Dim, Graph, Node, NodeId, Shape, TensorData, ValueId, WeightRef,
 };
 use onnx_runtime_session::{InferenceSession, Tensor};
 
@@ -142,6 +142,41 @@ fn if_executes_selected_branch_and_captures_outer_value() {
         assert_eq!(stats.subgraph_builds, (run + 1) as u64);
         assert_eq!(stats.subgraph_runs, (run + 1) as u64);
     }
+}
+
+#[test]
+fn if_rebuilds_subgraph_for_shape_varying_capture() {
+    // Consecutive runs bind this captured value to distinct concrete shapes.
+    let mut g = new_parent();
+    let batch = g.intern_symbol("batch");
+    let shape = vec![Dim::Symbolic(batch)];
+    let cond = input(&mut g, "cond", DataType::Bool, &[]);
+    let x = g.create_named_value("X", DataType::Float32, shape.clone());
+    g.add_input(x);
+    let y = g.create_named_value("Y", DataType::Float32, shape);
+    let node = control_flow_node(&mut g, "If", vec![Some(cond)], vec![y], &[]);
+
+    let mut branch = Graph::new();
+    let x = capture(&mut branch, "X", DataType::Float32, &[1]);
+    let out = op(&mut branch, "Identity", &[x], Some("branch_out"), DataType::Float32, &[1], &[]);
+    branch.add_output(out);
+    register(&mut g, node, "then_branch", branch);
+    register(&mut g, node, "else_branch", if_branch("Identity"));
+    g.add_output(y);
+
+    let mut session = InferenceSession::from_graph(g).expect("build session");
+    let cond_t = Tensor::from_raw(DataType::Bool, vec![], &[1]).unwrap();
+    for (values, expected_shape) in [(&[1.0, 2.0][..], vec![2]), (&[3.0, 4.0, 5.0][..], vec![3])] {
+        let x_t = Tensor::from_f32(&expected_shape, values).unwrap();
+        let outs = session.run(&[("cond", &cond_t), ("X", &x_t)]).expect("run");
+        assert_eq!(outs[0].shape, expected_shape);
+        assert_eq!(outs[0].to_vec_f32(), values);
+    }
+
+    let stats = session.control_flow_stats();
+    assert!(stats.subgraph_builds > 1, "shape changes must rebuild the subgraph executor");
+    assert_eq!(stats.subgraph_builds, 2);
+    assert_eq!(stats.subgraph_runs, 2);
 }
 
 // --- Loop -------------------------------------------------------------------
