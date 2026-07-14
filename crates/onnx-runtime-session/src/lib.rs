@@ -20,6 +20,11 @@ use std::path::{Path, PathBuf};
 use onnx_runtime_ir::{DataType, DeviceType, Shape};
 
 pub use error::SessionError;
+pub use executor::CacheStats;
+pub use tensor::Tensor;
+
+mod executor;
+mod tensor;
 
 mod error {
     /// Errors produced by the session layer.
@@ -34,6 +39,32 @@ mod error {
         #[error("unknown session option: {key}")]
         UnknownOption { key: String },
 
+        #[error("no model source: set a path or bytes on the builder")]
+        NoModelSource,
+
+        #[error("op type not supported by any available EP: {op_type}")]
+        UnsupportedOp { op_type: String },
+
+        #[error("value has a non-static (symbolic) shape, unsupported by the Phase-1 executor: {value}")]
+        DynamicShape { value: String },
+
+        #[error("input {name}: dtype mismatch (expected {expected}, got {got})")]
+        DtypeMismatch {
+            name: String,
+            expected: String,
+            got: String,
+        },
+
+        #[error("input {name}: shape mismatch (expected {expected:?}, got {got:?})")]
+        ShapeMismatch {
+            name: String,
+            expected: Vec<usize>,
+            got: Vec<usize>,
+        },
+
+        #[error("internal executor error: {0}")]
+        Internal(String),
+
         #[error(transparent)]
         Load(#[from] onnx_runtime_loader::LoaderError),
 
@@ -42,6 +73,9 @@ mod error {
 
         #[error(transparent)]
         Ir(#[from] onnx_runtime_ir::IrError),
+
+        #[error(transparent)]
+        Graph(#[from] onnx_runtime_ir::GraphError),
     }
 
     /// Session `Result` alias.
@@ -49,19 +83,6 @@ mod error {
 }
 
 use error::Result;
-
-/// An owned tensor handed to / returned from [`InferenceSession::run`].
-///
-/// Placeholder owned tensor for the Phase 1 skeleton; the full device-aware
-/// `Tensor` (DLPack import/export, strided layout — §5.3/§5.4) is a downstream
-/// deliverable.
-#[derive(Clone, Debug)]
-pub struct Tensor {
-    pub dtype: DataType,
-    pub shape: Vec<usize>,
-    /// Raw little-endian element bytes.
-    pub data: Vec<u8>,
-}
 
 /// Metadata describing a model input or output (§20.2).
 #[derive(Clone, Debug)]
@@ -147,17 +168,33 @@ impl SessionBuilder {
     }
 
     /// Build the session: load → detect device → optimize → compile → allocate.
+    ///
+    /// Phase 1: device selection is CPU-only (`auto_detect` yields the CPU EP),
+    /// the optimize stage is a no-op, and "compile" resolves a kernel per node
+    /// into the shape-keyed cache.
     pub fn build(self) -> Result<InferenceSession> {
-        let _ = (
-            self.model_path,
-            self.model_bytes,
-            self.device,
-            self.memory_limit,
-            self.enable_profiling,
-            self.warmup_shapes,
-            self.options,
-        );
-        todo!("ort2-session: load model, select EPs, optimize, compile, allocate buffers")
+        // Phase 1 recognizes no session options; reject any provided key so
+        // typos surface instead of being silently ignored (no compat shim).
+        if let Some(key) = self.options.keys().next() {
+            return Err(SessionError::UnknownOption { key: key.clone() });
+        }
+        // `memory_limit`, `enable_profiling`, and non-CPU `device` preferences
+        // are accepted but not yet acted on in Phase 1 (CPU-only executor).
+        let _ = (self.device, self.memory_limit, self.enable_profiling);
+
+        let (graph, weights) = match (self.model_path, self.model_bytes) {
+            (Some(path), _) => onnx_runtime_loader::load_model_with_weights(path)?,
+            (None, Some(bytes)) => {
+                onnx_runtime_loader::load_model_bytes_with_weights(&bytes, ".")?
+            }
+            (None, None) => return Err(SessionError::NoModelSource),
+        };
+
+        let mut session = InferenceSession::from_parts(graph, weights)?;
+        if !self.warmup_shapes.is_empty() {
+            session.warmup(&self.warmup_shapes)?;
+        }
+        Ok(session)
     }
 }
 
@@ -165,6 +202,21 @@ impl SessionBuilder {
 pub struct InferenceSession {
     inputs: Vec<IoMeta>,
     outputs: Vec<IoMeta>,
+    exec: executor::Executor,
+}
+
+fn io_meta(graph: &onnx_runtime_ir::Graph, values: &[onnx_runtime_ir::ValueId]) -> Vec<IoMeta> {
+    values
+        .iter()
+        .map(|&vid| {
+            let v = graph.value(vid);
+            IoMeta {
+                name: v.name.clone().unwrap_or_default(),
+                dtype: v.dtype,
+                shape: v.shape.clone(),
+            }
+        })
+        .collect()
 }
 
 impl InferenceSession {
@@ -178,15 +230,38 @@ impl InferenceSession {
         Self::builder().model_bytes(bytes).build()
     }
 
+    /// Build a session directly from an in-memory IR [`Graph`](onnx_runtime_ir::Graph).
+    ///
+    /// Initializer bytes are read from the graph's inline [`WeightRef`]s, so no
+    /// on-disk model or weight store is required. Useful for programmatically
+    /// constructed graphs and tests.
+    pub fn from_graph(graph: onnx_runtime_ir::Graph) -> Result<Self> {
+        Self::from_parts(graph, std::sync::Arc::new(onnx_runtime_loader::WeightStore::new()))
+    }
+
+    fn from_parts(
+        graph: onnx_runtime_ir::Graph,
+        weights: std::sync::Arc<onnx_runtime_loader::WeightStore>,
+    ) -> Result<Self> {
+        let inputs = io_meta(&graph, &graph.inputs);
+        let outputs = io_meta(&graph, &graph.outputs);
+        let ep = executor::auto_detect_cpu_ep()?;
+        let exec = executor::Executor::build(graph, weights, ep)?;
+        Ok(Self {
+            inputs,
+            outputs,
+            exec,
+        })
+    }
+
     /// Start a configuration builder.
     pub fn builder() -> SessionBuilder {
         SessionBuilder::new()
     }
 
-    /// Run inference with named inputs.
+    /// Run inference with named inputs, returning the graph outputs in order.
     pub fn run(&mut self, inputs: &[(&str, &Tensor)]) -> Result<Vec<Tensor>> {
-        let _ = inputs;
-        todo!("ort2-session: sequential executor over the compiled graph")
+        self.exec.run(inputs)
     }
 
     /// Input metadata.
@@ -199,10 +274,24 @@ impl InferenceSession {
         &self.outputs
     }
 
-    /// Pre-compile kernels for common shapes to avoid first-inference latency.
+    /// Kernel-cache statistics (§11.1); useful to observe warmup/run reuse.
+    pub fn cache_stats(&self) -> CacheStats {
+        self.exec.cache_stats()
+    }
+
+    /// Pre-compile kernels for common shapes to avoid first-inference latency
+    /// (§11.3). Phase-1 minimal: the compiled plan's shapes already key the
+    /// cache, so this repopulates it for the plan; `shapes` are validated to
+    /// name real inputs.
     pub fn warmup(&mut self, shapes: &[WarmupShape]) -> Result<()> {
-        let _ = shapes;
-        todo!("ort2-session: run dummy inferences to populate the kernel cache")
+        for ws in shapes {
+            if !self.inputs.iter().any(|m| m.name == ws.input_name) {
+                return Err(SessionError::InputNotFound {
+                    name: ws.input_name.clone(),
+                });
+            }
+        }
+        self.exec.warmup()
     }
 }
 
