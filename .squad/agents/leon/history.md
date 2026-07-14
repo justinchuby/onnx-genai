@@ -38,3 +38,11 @@ Reviewed by Deckard: 🟢 SHIP. Advisory: prefix-independent hash = K4-materiali
 - To complete: give `KvTensorRef`/`FetchedKv` a real device-tensor handle; store real KV bytes in `store`; in `lookup_extension` after a hit, copy fetched KV pages into the engine's paged cache and extend `prefix_cache_hit_len`.
 - **Prerequisite invariant now met:** `KvCacheKey` equality ⟹ identical prefix through that chunk (Zhora fixed prefix-dependent hash, commit ac12480).
 
+## 2026-07-13T23:50:16Z — §38 K4: Real KV byte materialization
+
+**Commit:** 786e268
+
+Replaced `KvTensorRef { size_bytes }` placeholder with `KvPayload` carrying real f32 KV bytes in head-major `[num_kv_heads, num_tokens, head_dim]` layout. Wired extract-on-store (`export_runner_kv` → `chunk_payload_from_exported` → `store_prefix_with`) and inject-on-lookup (`fetch_extension` → `past_kv_from_payloads` → `import_runner_kv`) gated by f32 + ZeroCopyRebind + fresh-session. Gold test `local_tiered_connector_fetch_reuse_is_token_identical` proves token-identical output to full recompute. 73 kv + 104 engine tests pass; clippy clean. §38 PROGRESS.md → ✅ Done (coordinator commit bc7ecb6).
+
+Chew reviewed (read-only, 🟡 SHIP-with-advisories): layout correctness confirmed. Advisories routed to Pris (A1: multi-layer fixture) and Batty (A2: graceful recompute fallback).
+

@@ -79,3 +79,7 @@ Prompt-lookup speculation and `MtpProposer` are accepted canonical runtime miles
 - Fixed rewind_to correctness bug: was rejecting valid positions in pinned sink prefix [0, sink_len). Guard updated to allow [0, sink) rewinds; resets sink_len/retained_start to 0 when rewinding behind sink. New test: rewind_into_sink_discards_window_and_resets_gap_bookkeeping.
 - Documented draft sink_tokens=0 rationale in engine.rs: no-op without sliding_window; drafts have independent KV constraints; correct fix path is loading draft's own inference_metadata.
 - Commit: 4e51d59. Tests and clippy clean.
+
+## 2026-07-13T23:50:16Z — Pending: A2 graceful recompute fallback (from Chew's K4 review)
+
+**Advisory A2 (owner: Batty):** In `try_connector_kv_injection` (`engine.rs`), a failure from `past_kv_from_payloads`/`import_runner_kv` currently propagates via `?` and hard-fails the entire `generate` call. The path is tightly gated (f32 + ZeroCopyRebind + fresh session + successful fetch), so severity is low. Recommended fix: catch the error and return `Ok(None)` to gracefully fall back to full recompute instead of aborting generation. This matches the spirit of the existing `load_materialized_past` fallback pattern.

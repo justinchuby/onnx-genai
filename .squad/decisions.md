@@ -433,6 +433,110 @@ builds. Commit: 2667b3d.
 
 ---
 
+### 2026-07-13: §38 K4 — real cross-session KV materialization (runner-path f32)
+
+**By:** Leon
+
+**What:**
+- **Host KV payload contract.** Replaced the `KvTensorRef { size_bytes }`
+  placeholder with a real owned host payload in the kv crate:
+  `KvPayload { num_tokens, num_layers, num_kv_heads, head_dim, dtype (F32),
+  layers: Vec<KvLayerPayload { key: Vec<f32>, value: Vec<f32> }> }`. Each
+  per-layer key/value is a contiguous f32 buffer in **head-major
+  `[num_kv_heads, num_tokens, head_dim]`** layout; element `(h, t, d)` lives at
+  `(h * num_tokens + t) * head_dim + d`. This mirrors `MaterializedLayerKv`
+  sliced to the chunk's token range and matches the past-tensor layout
+  `[1, num_kv_heads, seq, head_dim]` that `load_materialized_past`/`past_shape`
+  already use, so extract→store→fetch→inject is byte-exact. `byte_size()` and
+  `is_well_formed()` give honest size accounting and reject malformed payloads.
+  The kv crate stays ORT/engine-free — it treats the payload as typed host data
+  (f32 + dims), opaque in meaning.
+- **Connector retention.** `KvStoreEntry.kv_data: KvPayload` and
+  `FetchedKv.payload: KvPayload`. `LocalTieredConnector::store` validates and
+  RETAINS the real f32 bytes keyed by `KvCacheKey` (both tiers are host RAM in
+  this runtime), sizing accounting from `payload.byte_size()`; `fetch` returns
+  the stored payload; `lookup`/`locate`/eviction/priority bookkeeping unchanged.
+  `NullConnector` stores nothing / fetches `NotFound`.
+- **Store-extract (engine).** After prefill, `insert_cached_prefixes` →
+  `store_connector_prefix` exports the decode runner's KV
+  (`DecodeState::export_runner_kv`, ZeroCopyRebind `PastPresent` only), slices
+  each COMPLETE chunk's token range into a `KvPayload`
+  (`chunk_payload_from_exported`, robust to arbitrary tensor axis order via
+  `extract_present_token`), and stores it at the configured `CachePriority` via
+  the new `ConnectorBridge::store_prefix_with(tokens, resident_len, extract)`.
+  Partial trailing chunk skipped; extraction/store failures are logged & skipped.
+- **Fetch-inject (engine).** `prepare_session_prefix` →
+  `try_connector_kv_injection`: for a freshly started session on a ZeroCopyRebind
+  f32 runner with `in_process_hit == 0` and `kv_token_count == 0`, calls
+  `ConnectorBridge::fetch_extension(prompt, boundary=0, max_tokens=prompt_len-1,
+  Cpu)`. That walks contiguous chunk hits from the boundary, honoring the
+  fetch-vs-recompute gate (`estimated_load_ms <= num_tokens * recompute_ms_per_token`),
+  stops at the first miss/costly/fetch-fail (never fakes a hit), and caps at
+  `prompt_len-1` so ≥1 token is always left to feed. The fetched payloads are
+  assembled into full `[num_kv_heads, total, head_dim]` past tensors
+  (`past_kv_from_payloads`) and injected via `DecodeState::import_runner_kv`,
+  then `state.kv_token_count = total` so prefill (driven by `kv_token_count`)
+  genuinely skips those tokens. `import_kv` independently validates dtype/seq so
+  a mismatch errors safely instead of corrupting output.
+- **Live vs deferred.** LIVE: end-to-end cross-session f32 KV reuse on the
+  ZeroCopyRebind `PastPresent` runner path for freshly started sessions, proven
+  token-identical to full recompute. DEFERRED (precise TODOs): fp8 compression on
+  the stored path (`TODO(K4-fp8)` in local_tiered.rs — f32 round-trip first),
+  non-f32 dtypes (fp16/int8 — skipped via `kv_model_past_is_f32`), continuing
+  (non-empty) sessions (`import_kv` replaces rather than appends), and the
+  non-runner/paged decode path (tiny-llm and current KV models use the runner).
+
+**Why:**
+Makes §38 real: the connector now carries and reuses actual KV bytes across
+sessions/nodes, genuinely shortening prefill instead of only reporting the
+opportunity. Correctness rests on the prefix-dependent chunk hash (commit
+ac12480): equal `KvCacheKey` ⟹ identical token sequence from position 0 through
+the chunk end, so KV fetched for a key was computed under an identical prefix and
+injecting it at the same absolute positions (RoPE-rotated K included) is valid.
+The head-major payload layout is symmetric with the engine's existing
+extract/inject contract, making the round-trip byte-exact; every injection is
+gated (f32 + ZeroCopyRebind + started-empty) and defensively validated, so the
+connector can only ever shorten prefill when the result is provably identical to
+recompute — it never fakes a hit.
+
+---
+
+### 2026-07-13: §38 K4 review — real KV byte materialization for the KvCacheConnector
+
+**By:** Chew
+
+**Verdict:** 🟡 SHIP-with-advisories (ships as-is now; advisories are non-gating follow-ups for a different agent — NOT Leon). No corruption risk found; core numerics/layout correctness is sound and proven end-to-end.
+
+**What:** Independent numerics/memory-layout review of commit `786e268` (author Leon, locked out). Read-only. Focused on byte-layout symmetry, false-hit prevention, the fetch-vs-recompute gate, deferred-path safety, and gold-test rigor.
+
+**Findings (by review focus):**
+
+1. **Byte-layout symmetry — CORRECT (the #1 risk, cleared).**
+   - Extract (`chunk_payload_from_exported`, kv_bridge.rs:544) reads present KV via `extract_present_token`, which normalizes the model's *native* tensor axis order (`kv_tensor_axes`) into a canonical per-token `[head, head_dim]` buffer (`src = head*head_dim+dim`), then writes head-major `[num_kv_heads, num_tokens, head_dim]` (`dst = (head*num_tokens+t)*head_dim+dim`).
+   - Inject (`past_kv_from_payloads`, kv_bridge.rs:637-643) reads the same head-major payload layout and writes `[num_kv_heads, total_len, head_dim]` (`dst = (head*total_len + relative_start + t)*head_dim + dim`), shaped by `past_shape`.
+   - This is **byte-identical** to `PagedKvCache::materialize_sequence` (`paged_cache.rs:217`: `dst = (head*len + token_pos)*head_dim + dim`) which feeds the existing `load_materialized_past`. Extract, inject, `MaterializedLayerKv`, and the `[1, num_kv_heads, seq, head_dim]` past-tensor contract all agree. `KvPayload::is_well_formed` + `import_kv`'s per-tensor dtype+seq-axis validation add defense in depth. No transpose/stride mismatch.
+
+2. **No false hits — CORRECT.** `key_for` → `TokenChunk::to_key` sets `chunk_hash = self.hash`, the cumulative rolling FNV-1a threaded by `chunk_tokens` (Zhora's prefix-dependence commit). Equal `KvCacheKey` ⟹ identical prefix `0..chunk_end`, so injecting fetched KV at absolute positions is byte-exact and cannot place RoPE-rotated K at a divergent prefix. `fetch_extension` builds keys straight from `chunk_tokens(prompt_tokens)`, so the invariant is relied on directly.
+
+3. **Fetch-vs-recompute gate — CORRECT, no off-by-one.** `fetch_extension` requires a chunk-aligned `boundary`, only accepts *full* chunks (`chunk.tokens.len() == chunk_size`, drops the trailing partial), walks a strictly contiguous run (breaks on first miss/costly/fetch-fail), enforces `fetched_tokens + num_tokens > max_tokens ⇒ break`, and re-validates `payload.num_tokens == num_tokens`. Caller sets `max_tokens = prompt_len - 1`, so `fetched_tokens < prompt_len` always (≥1 token left to feed the decoder), plus a pop-trailing safety net. Chunks are contiguous from 0 with no gaps, so the assembled `[0,total)` past tensor is fully covered (no zero-filled holes).
+
+4. **Deferred-path safety — CORRECT, all SAFELY no-op (no half-injection).**
+   - Non-runner / paged / shared-buffer / static-cache: `runner_supports_kv_handoff()` gates BOTH store and inject → skipped; paged path still uses unchanged `load_materialized_past`.
+   - Continuing / non-empty session: `kv_token_count != 0` (and `in_process_hit != 0`) ⇒ inject returns `None`; `import_kv` replaces (never appends).
+   - Non-f32 dtype: `kv_model_past_is_f32` (checks the model's real past-input dtype, not the coarser `KvDType`) gates both halves; the only `to_vec_f32_lossy` call sits behind that guard, so it is always lossless.
+   - fp8: `TODO(K4-fp8)` stores honest full f32 bytes (`byte_size`) and round-trips f32 correctly — deferral affects size savings only, not correctness. FP8 codec still exercised.
+
+5. **Gold test — RIGOROUS on the dimensions that matter.** `local_tiered_connector_fetch_reuse_is_token_identical` clears BOTH in-process caches (`token_prefix_cache` + `prefix_cache`) to simulate a fresh node, asserts `fetched_tokens > 0 && chunk_hits > 0 && fetched_tokens < prompt.len()`, AND asserts token-identical output vs a fresh `EngineConfig::default()` (Null) full recompute. Fixture `tiny-llm` exercises num_kv_heads=2, head_dim=8, num_tokens=2/chunk, and 2 contiguous chunks injected (relative_start 0 and 2) — a head/token/dim transpose bug WOULD surface. (Gap: see advisory A1.)
+
+**Advisories (non-blocking follow-ups; owner is NOT Leon):**
+- **A1 — [Test rigor] Owner: Pris (Tester).** The `tiny-llm` fixture has `num_hidden_layers = 1`, so cross-layer ordering (the 4th criterion) is not exercised. Layer handling is name-keyed and symmetric (export and inject both iterate `kv_model.layers` in order), so risk is low, but a multi-layer gold fixture would close the last layout dimension.
+- **A2 — [Robustness] Owner: Batty (Engine Dev).** In `try_connector_kv_injection`, a `past_kv_from_payloads`/`import_runner_kv` failure propagates via `?` and hard-fails the whole `generate` instead of gracefully falling back to recompute. It is tightly gated (only reached after f32 + fresh-session + successful fetch) and shares failure behavior with the existing `load_materialized_past` path, so severity is low — but a graceful `Ok(None)` fallback on import error would be strictly safer.
+- **A3 — [Informational, out of K4 scope].** Both inject and the pre-existing `load_materialized_past` assume the KV sequence axis is at rank-2 (`past_shape`). A model with a nonstandard axis order would mismatch — a shared, pre-existing limitation, not a K4 regression; `import_kv`'s seq-axis check would catch it (loudly, per A2).
+
+**Why:** The K4 correctness contract ("extract→store→fetch→inject round-trips byte-identical to full recompute") holds: layout indexing is symmetric across all four sites (extract, inject, `materialize_sequence`, past-tensor shape), prefix-dependent keys prevent injecting KV for a divergent prefix, the fetch gate never over-fetches, every deferred path is a gated no-op rather than a half-injection, and the gold test proves token-identical output on a real model with non-trivial head/dim/token/multi-chunk dimensions. The two advisories are hardening/coverage improvements, neither of which can silently corrupt output.
+
+---
+
 ### 2026-07-13: KvCacheKey chunk hash is now prefix-dependent (cumulative FNV state)
 
 **By:** Zhora
