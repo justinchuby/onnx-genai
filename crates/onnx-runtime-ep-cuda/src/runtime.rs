@@ -1,7 +1,7 @@
-//! Shared CUDA runtime state: the driver context, its default stream, and the
-//! cuBLASLt handle. One [`CudaRuntime`] is created per [`CudaExecutionProvider`]
-//! and shared (via `Arc`) into every kernel the provider hands out, so the whole
-//! EP drives a single device + stream + library handle.
+//! Shared CUDA runtime state: the driver context, its default stream, and vendor
+//! library backends. One [`CudaRuntime`] is created per
+//! [`CudaExecutionProvider`] and shared (via `Arc`) into every kernel the
+//! provider hands out, so the whole EP drives a single device + stream.
 
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -13,13 +13,15 @@ use cudarc::driver::{CudaContext, CudaFunction, CudaModule, CudaStream};
 use onnx_runtime_ep_api::Result;
 
 use crate::blas::CublasLt;
+use crate::cudnn::CudnnBackend;
 use crate::error::{driver_err, nvrtc_err};
 
-/// Device context + stream + cuBLASLt handle shared across the EP's kernels.
+/// Device context, stream, and vendor-library backends shared across the EP.
 pub struct CudaRuntime {
     context: Arc<CudaContext>,
     stream: Arc<CudaStream>,
     blas: CublasLt,
+    cudnn: CudnnBackend,
     ordinal: u32,
     /// Cache of NVRTC-compiled modules, keyed by a stable module name, so each
     /// runtime compiles a given kernel (e.g. the fused attention softmax) at
@@ -44,10 +46,12 @@ impl CudaRuntime {
             CudaContext::new(ordinal as usize).map_err(|e| driver_err("CudaContext::new", e))?;
         let stream = context.default_stream();
         let blas = CublasLt::new()?;
+        let cudnn = CudnnBackend::new(stream.clone());
         Ok(Self {
             context,
             stream,
             blas,
+            cudnn,
             ordinal,
             modules: Mutex::new(HashMap::new()),
         })
@@ -61,6 +65,11 @@ impl CudaRuntime {
     /// The cuBLASLt handle.
     pub fn blas(&self) -> &CublasLt {
         &self.blas
+    }
+
+    /// The lazily initialized cuDNN backend bound to this runtime's stream.
+    pub fn cudnn(&self) -> &CudnnBackend {
+        &self.cudnn
     }
 
     /// The raw CUDA stream the EP submits work on.

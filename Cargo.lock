@@ -1929,6 +1929,7 @@ name = "onnx-runtime-ep-cuda"
 version = "0.1.0-dev.1"
 dependencies = [
  "cudarc",
+ "half",
  "onnx-runtime-ep-api",
  "onnx-runtime-ir",
  "thiserror 2.0.18",

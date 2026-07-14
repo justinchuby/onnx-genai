@@ -55,6 +55,7 @@
 //! dereferenced on the host.
 
 pub mod blas;
+pub mod cudnn;
 pub mod error;
 pub mod kernels;
 pub mod provider;

@@ -20,6 +20,22 @@ pub(crate) fn cublas_err(context: &str, e: cudarc::cublaslt::result::CublasError
     EpError::KernelFailed(format!("cuda_ep: {context}: cuBLASLt error: {e:?}"))
 }
 
+/// Wrap a cudarc **cuDNN** error with actionable context.
+pub(crate) fn cudnn_err(context: &str, e: cudarc::cudnn::CudnnError) -> EpError {
+    EpError::KernelFailed(format!("cuda_ep: {context}: cuDNN error: {e:?}"))
+}
+
+/// Report that the dynamically-loaded cuDNN runtime is unavailable.
+pub(crate) fn cudnn_unavailable() -> EpError {
+    EpError::KernelFailed(
+        "cuda_ep: cuDNN (libcudnn.so.9 / cudnn64_9.dll) was not found at runtime. \
+         Install it with 'pip install nvidia-cudnn-cu13' or \
+         'conda install -c nvidia cudnn', or add the cuDNN library directory to \
+         the platform library search path."
+            .into(),
+    )
+}
+
 /// Wrap a cudarc **NVRTC** compile error with actionable context. NVRTC failures
 /// carry the compiler log, which is the single most useful artefact for fixing a
 /// bad kernel source, so it is surfaced verbatim (RULES.md #1: what/why/how).
