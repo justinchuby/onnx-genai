@@ -3398,7 +3398,256 @@ image = ort2.load("sdxl.onnx", priority="background", options={"memory.gpu_budge
 
 ---
 
-## 32. Phased Roadmap
+## 32. Unified Memory Budget & GenAI Coordination
+
+### 32.1 Problem
+
+Two independent allocators (runtime for weights/activations, GenAI for KV cache)
+don't know each other's usage → combined they OOM.
+
+**Design: KV cache stays in GenAI layer (owns the semantics), but both layers
+share a single memory budget with pressure-based coordination.**
+
+### 32.2 Shared Budget Interface
+
+```rust
+/// Shared device memory budget. Runtime creates it; consumers register partitions.
+pub struct DeviceMemoryBudget {
+    device: DeviceId,
+    total_bytes: usize,
+    partitions: Vec<MemoryPartition>,
+}
+
+pub struct MemoryPartition {
+    name: String,                        // "weights", "kv_cache", "activations", "scratch"
+    used: Arc<AtomicUsize>,              // owner updates this
+    min_bytes: usize,                    // guaranteed minimum (never shrink below)
+    max_bytes: usize,                    // hard ceiling
+    priority: EvictionPriority,          // who shrinks first under pressure
+    on_pressure: Box<dyn Fn(PressureEvent) -> ShrinkResult + Send>,
+}
+
+pub enum PressureEvent {
+    /// Another partition needs memory. Can you release some?
+    ShrinkRequest { needed_bytes: usize, urgency: Urgency },
+    /// You're approaching max. Proactive eviction recommended.
+    ApproachingMax { remaining_bytes: usize },
+}
+
+pub enum ShrinkResult {
+    /// Released this many bytes.
+    Released(usize),
+    /// Can't release right now (in use).
+    Unavailable,
+    /// Released partially.
+    Partial(usize),
+}
+
+pub enum Urgency {
+    /// Best-effort, async is fine.
+    Low,
+    /// Need it soon (within next few ms).
+    Medium,
+    /// Blocking on this. Synchronous eviction required.
+    High,
+}
+```
+
+### 32.3 Adaptive Budget Strategy (Smart)
+
+Instead of static percentages, observe actual serving patterns and adapt:
+
+```rust
+pub struct AdaptiveBudgetManager {
+    /// Historical usage samples per partition.
+    history: HashMap<String, UsageHistory>,
+    /// Current allocation.
+    current: BudgetAllocation,
+    /// Rebalance interval.
+    rebalance_every: Duration,
+}
+
+struct UsageHistory {
+    /// Rolling window of peak usage per time interval.
+    peaks: VecDeque<(Instant, usize)>,
+    /// P95 usage over recent window.
+    p95_usage: usize,
+    /// Growth rate (bytes/sec) — predicts future need.
+    growth_rate: f64,
+    /// Utilization ratio (actual_used / allocated).
+    utilization: f64,
+}
+
+impl AdaptiveBudgetManager {
+    /// Called periodically. Observes usage patterns, rebalances.
+    fn rebalance(&mut self) {
+        for (name, history) in &self.history {
+            let partition = self.current.get_mut(name);
+
+            // Under-utilized? Shrink soft limit, give to others.
+            if history.utilization < 0.5 {
+                let excess = partition.allocated - history.p95_usage;
+                partition.soft_limit -= excess * 50 / 100;  // give back 50% of excess
+            }
+
+            // Growing fast? Proactively expand before it hits pressure.
+            if history.growth_rate > 0.0 {
+                let predicted_need = history.p95_usage + 
+                    (history.growth_rate * self.rebalance_every.as_secs_f64()) as usize;
+                partition.soft_limit = max(partition.soft_limit, predicted_need);
+            }
+        }
+    }
+}
+```
+
+**Serving pattern awareness:**
+
+```rust
+/// The budget manager understands common serving phases:
+pub enum ServingPhase {
+    /// Prefill: activation-heavy, KV growing fast, weights static.
+    /// Strategy: give activations more room, allow KV to grow.
+    Prefill,
+    /// Decode: activation small (single token), KV stable/slow-growing, weights hot.
+    /// Strategy: maximize weights on GPU for decode throughput.
+    Decode,
+    /// Idle: no active requests.
+    /// Strategy: preload weights for next request, keep hot KV pages.
+    Idle,
+    /// Batch transition: new batch arriving, old batch finishing.
+    /// Strategy: prepare for burst of KV allocation.
+    BatchTransition,
+}
+
+impl AdaptiveBudgetManager {
+    /// Phase detection from runtime signals.
+    fn detect_phase(&self) -> ServingPhase {
+        let kv_growth = self.history["kv_cache"].growth_rate;
+        let activation_usage = self.history["activations"].utilization;
+        let active_requests = self.request_count();
+
+        if active_requests == 0 { return ServingPhase::Idle; }
+        if activation_usage > 0.7 && kv_growth > 1_000_000.0 {
+            return ServingPhase::Prefill;  // high activation + KV growing fast
+        }
+        ServingPhase::Decode  // steady state
+    }
+
+    /// Adjust budget based on detected phase.
+    fn apply_phase_policy(&mut self, phase: ServingPhase) {
+        match phase {
+            ServingPhase::Prefill => {
+                // Activations need more space. Temporarily shrink weight budget.
+                // KV is growing — don't evict KV pages right now.
+                self.shift_budget("weights", "activations", /* up to */ 20_pct);
+            }
+            ServingPhase::Decode => {
+                // Activations tiny (one token). Maximize weights on GPU.
+                // KV stable — can reclaim from activation budget.
+                self.shift_budget("activations", "weights", /* up to */ 15_pct);
+            }
+            ServingPhase::Idle => {
+                // Prefetch weights for likely next request.
+                // Keep recently-used KV pages (might get continued).
+                self.prefetch_hot_weights();
+            }
+            ServingPhase::BatchTransition => {
+                // Burst KV allocation coming. Pre-evict low-priority KV pages.
+                self.preemptive_kv_eviction();
+            }
+        }
+    }
+}
+```
+
+### 32.4 Coordination Protocol
+
+```
+Example: Decode → Prefill transition (new long-context request arrives)
+
+1. GenAI scheduler: new request, context_len=32K, estimated KV = 2GB
+2. GenAI → budget.reserve("kv_cache", 2GB, Urgency::Medium)
+3. Budget manager: current phase=Decode, KV has 500MB free, need 1.5GB more
+4. Budget → detect phase shift to Prefill
+5. Budget → weights.on_pressure(ShrinkRequest { 1GB, Medium })
+   → runtime offloads 1GB of offloadable weights to CPU
+6. Budget → activations.on_pressure(ShrinkRequest { 500MB, Medium })
+   → runtime shrinks activation arena (no active prefill yet)
+7. Budget grants 2GB to kv_cache partition
+8. GenAI allocates KV pages on GPU
+9. Prefill runs (activations now need space too)
+10. Budget: activations partition requests from kv_cache slack
+    → KV growth slows during prefill compute → grants temporarily
+```
+
+### 32.5 GenAI Integration Point
+
+```rust
+// In onnx-genai-engine:
+impl GenAiEngine {
+    pub fn new(session: &InferenceSession) -> Self {
+        let budget = session.device_memory_budget();
+
+        // Register KV cache as a budget partition
+        budget.register(MemoryPartition {
+            name: "kv_cache".into(),
+            used: self.kv_cache.usage_counter(),
+            min_bytes: 256 * MB,  // at least 256MB guaranteed
+            max_bytes: budget.total() * 60 / 100,
+            priority: EvictionPriority::Medium,  // evict before weights, after scratch
+            on_pressure: Box::new(|event| {
+                match event {
+                    PressureEvent::ShrinkRequest { needed_bytes, .. } => {
+                        let evicted = self.kv_cache.evict_lru(needed_bytes);
+                        ShrinkResult::Released(evicted)
+                    }
+                    _ => ShrinkResult::Unavailable,
+                }
+            }),
+        });
+    }
+}
+```
+
+### 32.6 User API
+
+```python
+# Zero-config: adaptive budget (default)
+session = ort2.load("model.onnx")
+
+# Hint expected workload (helps initial budget planning)
+session = ort2.load("model.onnx", options={
+    "memory.expected_context_len": "32768",  # expect 32K context
+    "memory.expected_batch_size": "8",       # expect 8 concurrent requests
+})
+
+# Override KV cache ceiling
+session = ort2.load("model.onnx", options={
+    "memory.kv_cache_max_gb": "6",
+})
+
+# Monitor budget live (for dashboards)
+budget = session.memory_budget()
+print(budget.partitions())  
+# {'weights': {used: 4.2GB, limit: 6GB}, 'kv_cache': {used: 2.1GB, limit: 5GB}, ...}
+```
+
+### 32.7 Design Choices
+
+| Choice | Decision | Rationale |
+|--------|----------|----------|
+| KV cache stays in GenAI layer | **Yes** | Semantic ownership (page table, prefix tree, per-request lifecycle). |
+| Unified budget interface | **Yes** | Single source of truth for device memory. No independent OOM. |
+| Adaptive (not static) | **Yes (default)** | Serving patterns change dynamically. Static splits waste memory. |
+| Phase-aware rebalancing | **Yes** | Prefill vs decode have fundamentally different memory profiles. |
+| Pressure protocol (not centralized control) | **Yes** | Each partition knows how to shrink itself best. Budget just coordinates. |
+| Workload hints | **Optional** | Helps initial allocation but adaptive catches up quickly. |
+| Budget observable (API) | **Yes** | Users/dashboards can monitor partition usage in real time. |
+
+---
+
+## 33. Phased Roadmap
 
 ### Phase 1: Foundation (8-12 weeks)
 - [ ] `onnx-runtime-ir`: Graph IR with all types, validation, mutation API
