@@ -120,42 +120,60 @@ fn record_trace(stage: &'static str, start: Instant, dur: Duration) {
     }
 }
 
-/// Write the accumulated timeline to the `ONNX_GENAI_TRACE` path as a Chrome
-/// Trace Event Format JSON document, openable in <https://ui.perfetto.dev> or
-/// `chrome://tracing`. No-op (returns `Ok(())`) when tracing is disabled.
+/// Build the accumulated timeline as a Chrome Trace Event Format (Perfetto)
+/// JSON document, openable in <https://ui.perfetto.dev> or `chrome://tracing`.
 ///
 /// The span category is the stage-name prefix before the first `.` (e.g.
 /// `ort`, `engine`, `loop`), so Perfetto can colour and group lanes by
 /// subsystem. All events share one pid; each OS thread that opened a span gets
-/// its own tid lane.
+/// its own tid lane. Returns an empty (but well-formed) `traceEvents` array
+/// when no spans have been recorded — the profiler only fills the in-memory
+/// sink while `ONNX_GENAI_TRACE` is set, so callers get an honest empty trace
+/// rather than fabricated events.
+///
+/// The recorded events carry only stage names and timing — never session IDs,
+/// prompt text, or other user data — so the document is safe to expose without
+/// redaction.
+#[must_use]
+pub fn trace_document() -> serde_json::Value {
+    let trace_events: Vec<serde_json::Value> = match trace_sink().lock() {
+        Ok(events) => events
+            .iter()
+            .map(|event| {
+                let category = event.name.split('.').next().unwrap_or(event.name);
+                serde_json::json!({
+                    "name": event.name,
+                    "cat": category,
+                    "ph": "X",
+                    "ts": event.ts_us,
+                    "dur": event.dur_us,
+                    "pid": 1,
+                    "tid": event.tid,
+                })
+            })
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    serde_json::json!({
+        "traceEvents": trace_events,
+        "displayTimeUnit": "ms",
+    })
+}
+
+/// Number of timeline events currently retained in the in-memory sink.
+#[must_use]
+pub fn trace_event_count() -> usize {
+    trace_sink().lock().map(|sink| sink.len()).unwrap_or(0)
+}
+
+/// Write the accumulated timeline to the `ONNX_GENAI_TRACE` path as a Chrome
+/// Trace Event Format (Perfetto) JSON document. No-op (returns `Ok(())`) when
+/// tracing is disabled. See [`trace_document`] for the emitted schema.
 pub fn write_trace() -> std::io::Result<()> {
     let Some(path) = trace_path() else {
         return Ok(());
     };
-    let events = match trace_sink().lock() {
-        Ok(sink) => sink,
-        Err(_) => return Ok(()),
-    };
-    let trace_events: Vec<serde_json::Value> = events
-        .iter()
-        .map(|event| {
-            let category = event.name.split('.').next().unwrap_or(event.name);
-            serde_json::json!({
-                "name": event.name,
-                "cat": category,
-                "ph": "X",
-                "ts": event.ts_us,
-                "dur": event.dur_us,
-                "pid": 1,
-                "tid": event.tid,
-            })
-        })
-        .collect();
-    let doc = serde_json::json!({
-        "traceEvents": trace_events,
-        "displayTimeUnit": "ms",
-    });
-    std::fs::write(path, serde_json::to_vec(&doc)?)?;
+    std::fs::write(path, serde_json::to_vec(&trace_document())?)?;
     Ok(())
 }
 

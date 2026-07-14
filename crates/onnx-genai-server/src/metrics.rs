@@ -8,7 +8,7 @@ use std::fmt::Write;
 
 use axum::http::StatusCode;
 
-const ENDPOINTS: [&str; 13] = [
+const ENDPOINTS: [&str; 14] = [
     "/health",
     "/v1/models",
     "/v1/sessions",
@@ -21,6 +21,7 @@ const ENDPOINTS: [&str; 13] = [
     "/v1/debug/sessions",
     "/v1/debug/kv",
     "/v1/debug/trace",
+    "/v1/debug/trace/perfetto",
     "unknown",
 ];
 const STATUS_CODES: usize = 600;
@@ -361,8 +362,9 @@ fn endpoint_index(path: &str) -> usize {
         "/v1/debug/config" => 8,
         "/v1/debug/sessions" => 9,
         "/v1/debug/kv" => 10,
+        "/v1/debug/trace/perfetto" => 12,
         "/v1/debug/trace" => 11,
-        _ => 12,
+        _ => 13,
     }
 }
 

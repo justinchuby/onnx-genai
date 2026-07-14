@@ -45,11 +45,13 @@ const MAX_SESSION_ID_LEN: usize = 128;
 const OVERLOAD_RETRY_AFTER_SECS: u64 = 1;
 const MAX_CHAT_TOP_LOGPROBS: usize = 20;
 const MAX_COMPLETION_LOGPROBS: usize = 5;
-#[cfg(feature = "profiling")]
-const TRACE_EXPORT_STATUS: &str =
-    "profiling hooks compiled; Perfetto and OTLP export are not implemented";
-#[cfg(not(feature = "profiling"))]
-const TRACE_EXPORT_STATUS: &str = "profiling hooks disabled; rebuild with --features profiling (Perfetto and OTLP export are not implemented)";
+/// Path of the downloadable Perfetto trace endpoint, reported by the trace
+/// status endpoint so clients can discover the export without guessing.
+const PERFETTO_EXPORT_PATH: &str = "/v1/debug/trace/perfetto";
+/// OTLP span export is intentionally deferred (see issue #13); the status
+/// endpoint reports this honestly rather than pretending it works.
+const OTLP_EXPORT_STATUS: &str =
+    "deferred: OTLP span export is not implemented (Perfetto export is available at /v1/debug/trace/perfetto)";
 
 #[derive(Debug, Serialize)]
 pub(crate) struct ModelsResponse {
@@ -137,8 +139,24 @@ pub(crate) struct DebugKvResponse {
 pub(crate) struct DebugTraceResponse {
     tracing_span: &'static str,
     latest_trace_id: String,
-    perfetto_export: &'static str,
+    /// Discovery info for the Perfetto (Chrome Trace Event Format) export.
+    perfetto_export: PerfettoExportInfo,
     otlp_export: &'static str,
+}
+
+/// Discovery payload describing the downloadable Perfetto trace export.
+#[derive(Debug, Serialize)]
+pub(crate) struct PerfettoExportInfo {
+    /// Endpoint that serves the Perfetto/Chrome-trace JSON document.
+    endpoint: &'static str,
+    /// Number of timeline events currently retained in the in-memory sink.
+    recorded_events: usize,
+    /// Whether the profiler is actively collecting spans into the sink. Spans
+    /// are only recorded while `ONNX_GENAI_TRACE` is set; when unset the export
+    /// is a well-formed but empty trace.
+    collecting: bool,
+    /// Human-readable note describing how to populate the trace.
+    note: &'static str,
 }
 
 #[derive(Debug, Serialize)]
@@ -425,12 +443,50 @@ pub(crate) async fn debug_kv(State(state): State<AppState>) -> Json<DebugKvRespo
 
 pub(crate) async fn debug_trace() -> Json<DebugTraceResponse> {
     let latest_trace_id = crate::metrics::latest_trace_id();
+    let recorded_events = onnx_genai_ort::profile::trace_event_count();
+    let collecting = onnx_genai_ort::profile::tracing_enabled();
     Json(DebugTraceResponse {
         tracing_span: "http.request",
         latest_trace_id: format!("{latest_trace_id:016x}"),
-        perfetto_export: TRACE_EXPORT_STATUS,
-        otlp_export: TRACE_EXPORT_STATUS,
+        perfetto_export: PerfettoExportInfo {
+            endpoint: PERFETTO_EXPORT_PATH,
+            recorded_events,
+            collecting,
+            note: "GET the endpoint for a Chrome Trace Event Format document (open in https://ui.perfetto.dev). Run with ONNX_GENAI_TRACE set to collect decode spans.",
+        },
+        otlp_export: OTLP_EXPORT_STATUS,
     })
+}
+
+/// `GET /v1/debug/trace/perfetto` — download the accumulated decode-timeline as
+/// a Chrome Trace Event Format (Perfetto) JSON document.
+///
+/// The document is built from the process-global profiler sink in
+/// `onnx-genai-ort`, which records real ORT `session.run` timings and engine
+/// step spans while `ONNX_GENAI_TRACE` is set. When no spans have been
+/// recorded the response is a well-formed but empty trace (`traceEvents: []`) —
+/// never fabricated events. The recorded events carry only stage names and
+/// timings (no session IDs or user data), so no redaction is required.
+pub(crate) async fn debug_trace_perfetto() -> Response {
+    let document = onnx_genai_ort::profile::trace_document();
+    let body = match serde_json::to_vec(&document) {
+        Ok(body) => body,
+        Err(err) => {
+            return ApiError::internal(format!("failed to serialize Perfetto trace: {err}"))
+                .into_response();
+        }
+    };
+    (
+        [
+            (header::CONTENT_TYPE, HeaderValue::from_static("application/json")),
+            (
+                header::CONTENT_DISPOSITION,
+                HeaderValue::from_static("attachment; filename=\"onnx-genai-trace.json\""),
+            ),
+        ],
+        body,
+    )
+        .into_response()
 }
 
 /// `GET /v1/admin/models` — list every configured model with loaded/available
