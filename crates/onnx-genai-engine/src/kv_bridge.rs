@@ -103,7 +103,7 @@ pub(crate) fn infer_kv_model_info(
     let mut layers = Vec::with_capacity(key_outputs.len());
     for (key, value) in key_outputs.iter().zip(value_outputs.iter()) {
         if !is_supported_kv_dtype(key.dtype) || !is_supported_kv_dtype(value.dtype) {
-            anyhow::bail!("KV present outputs must be Float32 or Float16");
+            anyhow::bail!("KV present outputs must be Float32, Float16, or BFloat16");
         }
         let key_past = matching_past_input(&key.name, &kv_inputs)
             .with_context(|| format!("missing past input for present output '{}'", key.name))?
@@ -152,7 +152,7 @@ pub(crate) fn layer_configs_from_key_outputs(
 pub(crate) fn infer_kv_heads_and_head_dim(info: &TensorInfo) -> anyhow::Result<(usize, usize)> {
     if !is_supported_kv_dtype(info.dtype) || info.shape.len() < 3 {
         anyhow::bail!(
-            "present KV output '{}' must be Float32 or Float16 rank >= 3, got {:?} {:?}",
+            "present KV output '{}' must be Float32, Float16, or BFloat16 rank >= 3, got {:?} {:?}",
             info.name,
             info.dtype,
             info.shape
@@ -177,10 +177,14 @@ pub(crate) fn infer_kv_heads_and_head_dim(info: &TensorInfo) -> anyhow::Result<(
 
 /// KV present/past tensor element types the runtime can consume.
 ///
-/// The host paged-mirror path widens fp16 values to fp32 page storage. Shared
-/// buffers keep their native dtype and never round-trip through the host cache.
+/// The host paged-mirror path widens 16-bit float values to fp32 page storage.
+/// Shared buffers keep their native dtype and never round-trip through the host
+/// cache.
 fn is_supported_kv_dtype(dtype: DataType) -> bool {
-    matches!(dtype, DataType::Float32 | DataType::Float16)
+    matches!(
+        dtype,
+        DataType::Float32 | DataType::Float16 | DataType::BFloat16
+    )
 }
 
 pub(crate) fn mirror_present_kv_to_pages(
@@ -914,7 +918,7 @@ mod tests {
             infer_kv_heads_and_head_dim(&wrong_dtype)
                 .unwrap_err()
                 .to_string()
-                .contains("must be Float32 or Float16 rank >= 3")
+                .contains("must be Float32, Float16, or BFloat16 rank >= 3")
         );
         let unknown_head_dim = TensorInfo {
             shape: vec![-1, 2, -1, -1],

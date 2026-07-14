@@ -216,7 +216,7 @@ fn insert_opt(map: &mut Map<String, Value>, key: &str, value: Option<usize>) {
 fn is_share_buffer_kv_dtype(dtype: &str) -> bool {
     matches!(
         dtype.to_ascii_lowercase().as_str(),
-        "float16" | "fp16" | "half" | "float32" | "fp32" | "float"
+        "float16" | "fp16" | "half" | "bfloat16" | "bf16" | "float32" | "fp32" | "float"
     )
 }
 
@@ -274,6 +274,18 @@ mod tests {
                 .as_ref()
                 .and_then(|kv| kv.native_dtype.as_deref()),
             Some("float16")
+        );
+    }
+
+    #[test]
+    fn converts_and_enables_share_buffer_with_bf16() {
+        let cfg = qwen_config();
+        let md = cfg.to_inference_metadata(Some("bfloat16")).unwrap();
+        assert_eq!(
+            md.kv_cache
+                .as_ref()
+                .and_then(|kv| kv.native_dtype.as_deref()),
+            Some("bfloat16")
         );
     }
 

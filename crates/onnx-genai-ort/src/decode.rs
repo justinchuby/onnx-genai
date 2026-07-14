@@ -584,6 +584,11 @@ impl<'a> DecodeSession<'a> {
                         let prefix = copy_prefix(&data, owner_shape, shape);
                         Value::from_vec_f16_bits(prefix, shape)
                     }
+                    DataType::BFloat16 => {
+                        let data = value.to_vec_bf16_bits()?;
+                        let prefix = copy_prefix(&data, owner_shape, shape);
+                        Value::from_vec_bf16_bits(prefix, shape)
+                    }
                     dtype => Err(OrtError::InvalidArgument(format!(
                         "cannot rewind KV tensor with dtype {dtype:?}"
                     ))),
@@ -1999,9 +2004,12 @@ fn infer_kv_pairs(session: &Session) -> Result<Vec<KvPair>> {
             .find(|input| input.name == *past_name)
             .expect("past name came from session inputs")
             .clone();
-        if input.dtype != DataType::Float32 && input.dtype != DataType::Float16 {
+        if !matches!(
+            input.dtype,
+            DataType::Float32 | DataType::Float16 | DataType::BFloat16
+        ) {
             return Err(OrtError::InvalidArgument(format!(
-                "KV input '{}' must be Float32 or Float16, got {:?}",
+                "KV input '{}' must be Float32, Float16, or BFloat16, got {:?}",
                 input.name, input.dtype
             )));
         }
@@ -2055,6 +2063,7 @@ fn clone_value_to_owned(value: &Value) -> Result<Value> {
     match value.dtype() {
         DataType::Float32 => Value::from_vec_f32(value.to_vec_f32()?, &shape),
         DataType::Float16 => Value::from_vec_f16_bits(value.to_vec_f16_bits()?, &shape),
+        DataType::BFloat16 => Value::from_vec_bf16_bits(value.to_vec_bf16_bits()?, &shape),
         dtype => Err(OrtError::InvalidArgument(format!(
             "cannot export/clone KV tensor with dtype {dtype:?}"
         ))),
@@ -2204,9 +2213,12 @@ fn static_cache_suffix(name: &str, prefix: &str) -> Option<usize> {
 }
 
 fn validate_static_cache_tensor(info: &TensorInfo) -> Result<()> {
-    if info.dtype != DataType::Float32 && info.dtype != DataType::Float16 {
+    if !matches!(
+        info.dtype,
+        DataType::Float32 | DataType::Float16 | DataType::BFloat16
+    ) {
         return Err(OrtError::InvalidArgument(format!(
-            "static-cache tensor '{}' must be Float32 or Float16, got {:?}",
+            "static-cache tensor '{}' must be Float32, Float16, or BFloat16, got {:?}",
             info.name, info.dtype
         )));
     }
@@ -2260,6 +2272,7 @@ fn zeroed_value(shape: &[i64], dtype: DataType) -> Result<Value> {
     match dtype {
         DataType::Float32 => Value::from_vec_f32(vec![0.0; numel], shape),
         DataType::Float16 => Value::from_vec_f16_bits(vec![0; numel], shape),
+        DataType::BFloat16 => Value::from_vec_bf16_bits(vec![0; numel], shape),
         dtype => Err(OrtError::InvalidArgument(format!(
             "cannot allocate static-cache tensor with dtype {dtype:?}"
         ))),

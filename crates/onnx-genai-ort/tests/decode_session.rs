@@ -49,12 +49,28 @@ fn fp16_value_round_trips_bits() {
 }
 
 #[test]
-fn to_vec_f32_lossy_widens_fp16_and_passes_through_fp32() {
+fn bf16_value_round_trips_bits() {
+    let bits = vec![0x0000, 0x3f80, 0xc000, 0x7f7f];
+    let value = Value::from_slice_bf16_bits(&bits, &[2, 2]).expect("bf16 tensor");
+    assert_eq!(value.dtype(), DataType::BFloat16);
+    assert_eq!(value.shape(), &[2, 2]);
+    assert_eq!(value.to_vec_bf16_bits().expect("bf16 bits"), bits);
+}
+
+#[test]
+fn to_vec_f32_lossy_widens_16_bit_floats_and_passes_through_fp32() {
     // 0.0, 1.0, -2.0, 65504.0 (fp16 max) as IEEE-754 half bit patterns.
     let bits = vec![0x0000, 0x3c00, 0xc000, 0x7bff];
     let fp16 = Value::from_slice_f16_bits(&bits, &[2, 2]).expect("f16 tensor");
     let widened = fp16.to_vec_f32_lossy().expect("fp16 widen");
     assert_eq!(widened, vec![0.0_f32, 1.0, -2.0, 65504.0]);
+
+    let bf16 = Value::from_slice_bf16_bits(&[0x0000, 0x3f80, 0xc000, 0x7f7f], &[2, 2])
+        .expect("bf16 tensor");
+    assert_eq!(
+        bf16.to_vec_f32_lossy().expect("bf16 widen"),
+        vec![0.0_f32, 1.0, -2.0, 3.389_531_4e38]
+    );
 
     let fp32 = Value::from_slice_f32(&[0.5, -1.25], &[2]).expect("f32 tensor");
     assert_eq!(
@@ -124,9 +140,7 @@ fn exported_kv_handoff_continues_decode_identically() {
 
     let mut decode =
         DecodeSession::new(&session, DecodeSessionOptions::default()).expect("decode session");
-    decode
-        .import_kv(prompt.len(), handoff)
-        .expect("import kv");
+    decode.import_kv(prompt.len(), handoff).expect("import kv");
     assert_eq!(decode.past_len(), prompt.len());
 
     for (offset, token) in continuation.iter().enumerate() {

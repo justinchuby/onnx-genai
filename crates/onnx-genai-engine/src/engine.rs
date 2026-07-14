@@ -1488,6 +1488,7 @@ fn genai_config_compat_metadata(
         .find(|info| crate::decode::is_kv_input(&info.name))
         .and_then(|info| match info.dtype {
             DataType::Float16 => Some("float16"),
+            DataType::BFloat16 => Some("bfloat16"),
             DataType::Float32 => Some("float32"),
             _ => None,
         });
