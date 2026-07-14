@@ -923,3 +923,38 @@ fn initializer_backed_input_is_not_dangling() {
     onnx_runtime_loader::load_model_bytes(&bytes)
         .expect("initializer-backed input must load without a dangling-ref error");
 }
+
+/// Node order in an ONNX graph need not be topological. A consumer listed
+/// before its producer is still sourced and must not be flagged as dangling.
+#[test]
+fn out_of_order_dag_input_is_not_dangling() {
+    let graph = onnx::GraphProto {
+        input: vec![value_info("X", 1, &[Dimlike::Static(4)])],
+        output: vec![value_info("Y", 1, &[Dimlike::Static(4)])],
+        node: vec![
+            node("Identity", &["produced_later"], &["Y"]),
+            node("Identity", &["X"], &["produced_later"]),
+        ],
+        ..Default::default()
+    };
+    let bytes = model(graph, 17);
+    onnx_runtime_loader::load_model_bytes(&bytes)
+        .expect("out-of-order DAG must load without a dangling-ref error");
+}
+
+/// An empty input name is ONNX's convention for an omitted optional input. The
+/// graph builder converts it to `None`, so dangling-reference validation must
+/// ignore it.
+#[test]
+fn omitted_optional_input_is_not_dangling() {
+    let graph = onnx::GraphProto {
+        input: vec![value_info("X", 1, &[Dimlike::Static(4)])],
+        output: vec![value_info("Y", 1, &[Dimlike::Static(4)])],
+        initializer: vec![f32_initializer("max", &[])],
+        node: vec![node("Clip", &["X", "", "max"], &["Y"])],
+        ..Default::default()
+    };
+    let bytes = model(graph, 17);
+    onnx_runtime_loader::load_model_bytes(&bytes)
+        .expect("omitted optional input must load without a dangling-ref error");
+}
