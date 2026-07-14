@@ -47,3 +47,7 @@ Recurring audit convention is canonical: `.github/workflows/audit.yml` runs week
 - **Key checks:** All 8 real-dtype decode sites confirmed fail-closed via `decode_dtype`. No surviving `unwrap_or(Float32)` on real-dtype sites. Signature changes `-> Result<…>` with `?`; transactional-on-failure preserved. Proto bump correct. Full ORT2 suite (262 tests) green debug+release. bert_toy PASS max_abs 1.192e-7. Non-blocking advisory: present-but-UNDEFINED elem_type=0 on value-info now rejected (correct fail-close for typed I/O).
 
 - 2026-07-14T19:05:00Z — Rejected sentinel-leaking UnsupportedOp diagnostics, then approved the final enriched-error plus loader fail-fast validation solution merged in `00cda89`. Also reviewed pipeline API seams GREEN.
+
+
+## 2026-07-14T20:05:00Z — Loader validation review
+Reviewed Batty's unified load-time `validate_model()` checks for unsupported control flow and dangling tensor references 🟢. Both disk/bytes and session load paths are covered; merged as `2a99eec`.

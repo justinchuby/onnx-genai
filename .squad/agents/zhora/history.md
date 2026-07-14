@@ -80,3 +80,7 @@ Next: §34 router epic (R1/R2/R3) has kicked off.
 - `GET /v1/debug/trace/perfetto` → Chrome Trace Event Format document, gated same as sibling debug routes.
 - No data leak (`&'static str` stage names only), honest empty case, OTLP deferred.
 - Metrics ENDPOINTS extended to 14 entries.
+
+
+## 2026-07-14T20:05:00Z — Upstream ONNX suite review
+Reviewed Fido's `cbourjau/onnx-tests` nxrt adapter and reproduction docs 🟡. The adapter is correct; 158 pass / 1,038 fail / 2 skip across 1,198 cases accurately reflects current CPU EP gaps. Merged as `d61cc97`.

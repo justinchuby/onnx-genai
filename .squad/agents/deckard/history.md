@@ -84,3 +84,7 @@ Reviewed Leon's DRY refactor of the external-path traversal guard (commit `e60dd
 ## 2026-07-14T14:50:00Z — deckard-23: Crate-name reservation prep (8988abd) 🔴 LOCKED OUT
 
 Set all 8 `onnx-runtime-*` crates to `0.1.0-dev.0`; exact-pinned workspace deps to `=0.1.0-dev.0`; created `docs/CRATE_RESERVATION.md` runbook; workspace version and `onnx-genai` crates untouched. Commit `8988abd`. **Reviewer: roy-22 🔴 RED** — documented publish order created a shape-inference ↔ loader cycle. **LOCKED OUT** of revising this artifact; revision reassigned to Leon (leon-17), who fixed it in `183a876`.
+
+
+## 2026-07-14T20:05:00Z — Identity follow-up review
+Reviewed Joshi's CPU Identity String rejection and bf16/f16/i32 bit-exact coverage 🟢. Change merged to `origin/main` as `da95a8a`; explicit String rejection prevents zero-byte silent data loss.

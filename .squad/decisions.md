@@ -1237,3 +1237,22 @@ Session unit (`option_tests`), session e2e (`tests/epcontext.rs`: byte-exact non
 **By:** Sebastian
 **What:** DESIGN.md §26.11 defines engine-level per-device byte-denominated VRAM, host-RAM, and optional disk-spill limits with live transactional reconfiguration. Bytes are authoritative and page/token budgets are derived; lowering drives existing eviction tiers and rolls back if unsatisfiable, while raising admits queued work without eviction. YAML, Rust, planned PyO3 APIs, snapshots, metrics, and actionable over-budget errors are specified.
 **Why:** Existing static page/token budgets did not provide the user-facing live resource controls needed across sessions and memory tiers.
+
+
+### 2026-07-14: Fail-fast load-time validation for unsupported/malformed graphs
+
+**By:** Batty
+
+**What:** Extended load-time validation into a cohesive `validate_model()` entry point used by both disk/bytes and session load paths. It rejects subgraph-bearing control-flow operations with `UnsupportedControlFlow` and unresolved node inputs with `DanglingTensorRef`, using actionable load-time diagnostics. Empty graphs, per-kernel coverage checks, shape-dependent legality, and invariants already enforced by `Graph::validate` remain deliberately outside this seam.
+
+**Why:** Unsupported or malformed models must fail at load time rather than silently losing behavior, panicking during inference, or failing lazily after session creation.
+
+### 2026-07-14: Run upstream cbourjau/onnx-tests through the nxrt Python binding
+**By:** Fido
+**What:** Keep the upstream adapter at `crates/onnx-runtime-python/tests/nxrt_runtime.py`, explicitly selecting `CPUExecutionProvider`, preserving model output order, and converting outputs to NumPy. At upstream commit `856e89b`, 1,198 cases across 112 operators yielded 158 pass, 1,038 fail, and 2 skip; 17 operators had at least one passing case and none passed every dtype case.
+**Why:** Native upstream pytest/Hypothesis coverage gives a reproducible, honest inventory of nxrt CPU breadth gaps without a fork or pixi dependency.
+
+### 2026-07-14: CPU Identity rejects String tensor views
+**By:** Joshi
+**What:** CPU `Identity` remains a raw-byte copy for runtime-view-compatible dtypes but explicitly rejects `DataType::String` with an actionable error.
+**Why:** String payloads are out-of-band and have no fixed-width runtime view; rejecting them prevents silent data loss until execution-time String representation is defined.
