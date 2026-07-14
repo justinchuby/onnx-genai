@@ -585,3 +585,1006 @@ tokens ⟹ different key) and `chunk_hash_shared_prefix_still_collides`
 (identical prefix ⟹ identical keys through the shared boundary, diverging after).
 Commit: ac12480.
 
+
+---
+
+### 2026-07-14: Implementation plan — real Gemma-4 E2B shared-KV speculative decoding end-to-end on CUDA
+**By:** Roy
+**What:** A concrete, model-agnostic decomposition to make a **real** Gemma-4 E2B `*-assistant` shared-KV speculative run pass through onnx-genai on CUDA, proving speculative output is token-identical to plain greedy with a measurable speedup. Design/plan only — no implementation in this entry. Everything is driven by `inference_metadata.yaml`; no model-name branches in the runtime. Generalizes to Gemma-3 12B and any per-layer-embedding / two-model-split model.
+**Why:** The runtime shared-KV proposer path is complete and token-identity-proven on a synthetic fixture, but that fixture uses a **uniform** head_dim and a self-referential assistant with no real target. Four blockers stand between us and a real E2B run. This plan picks the simplest export shape, isolates the one deep runtime blocker, and sequences the work so implementers don't collide.
+
+---
+
+#### 0. Investigation findings (verified in-tree, cited)
+
+**Runtime shared-KV path is already wired and generic:**
+- `engine.rs:409-484` loads the assistant Session, HARD-REQUIRES a target session output that is **Float32** and whose last dim == `backbone_hidden_size` (1536), then validates the assistant signature/vocab/shared_kv groups.
+- `engine.rs:1494-1534` `shared_kv_mode_from_metadata` + `detect_target_hidden_output`: the target hidden output name is **auto-detected** as "the first Float32 output ending in `backbone_hidden_size`, excluding `logits`". So the target export only has to *emit* an f32 `[.., 1536]` output — no new metadata key needed.
+- `speculative.rs:843-902` the target is run via `next_session_token_logits_and_hidden(...)` which uses `run_decode_step` (`decode.rs:1021`) — this feeds **`input_ids`** / attention_mask / position_ids / past-KV only. The assistant is seeded from the returned hidden and threads its own `projected_state` (`speculative.rs:549-600`).
+- `parser.rs:108-157` `resolve_shared_kv`: canonical wire schema is `proposal_type: shared_kv`, `model`, `backbone_hidden_size`, `vocab_size`, `projected_state_output` (assistant output, default `projected_state`), `logits_output`, `shared_kv[]` groups (`name` + `target_layers`). Malformed → degrades to `Unknown`, never aborts load.
+
+**Single-model target IS feasible for E2B (this is the key finding):**
+- Mobius already has `Gemma4TextCausalLMTask` (`mobius/src/mobius/tasks/_gemma4.py:100-161`): `input_ids → logits + present KV`, with the correct **dual head_dim** KV cache (`_make_gemma4_kv_cache_inputs`, lines 40-95: local/sliding = `head_dim` 256, global/full = `global_head_dim` 512, last `num_kv_shared_layers` layers share K,V so only `num_hidden_layers - num_kv_shared_layers` KV entries are exported).
+- `mobius/src/mobius/models/gemma4.py:1546-1593`: in **text-only (single-model) mode the per-layer embeddings are computed inside the graph from `input_ids`** (`embed_tokens_per_layer` fused table, or split tables when `split_per_layer_embedding` is set). The embed-split (separate embedding pre-model feeding `inputs_embeds` + `per_layer_inputs`) is only used for the VLM decoder path. **So E2B text decode does not need an embedding pre-model** — a single `input_ids → (logits, KV)` graph is sufficient.
+- The one thing `Gemma4TextCausalLMTask` does **not** emit today is the f32 hidden output. That is a small, additive Mobius change.
+
+**The one deep runtime blocker — mixed per-layer head_dim (Sapper's blocker #4) — is real and untested:**
+- `paged_cache.rs:30-45` `MaterializedKv` carries a **single** `num_kv_heads` and `head_dim` for all layers. `MaterializedLayerKv` (lines 22-26) carries only key/value buffers, no per-layer dims.
+- `kv_bridge.rs:62-66` `infer_kv_model_info` reads head_dim/num_kv_heads from **layer 0 only** and builds one uniform `PageTensorConfig` for every layer.
+- `speculative.rs:1246-1253` `shared_kv_proposer_slices` fills every group's `SharedKvInput` with the same global `materialized.head_dim` / `materialized.num_kv_heads`.
+- The existing token-identity fixture (`scripts/build_tiny_gemma4_assistant.py:47`) uses `HEAD_DIM = 8` for **both** the sliding (layer 0) and full (layer 1) layers — so mixed head_dim is **never exercised**. E2B needs 256 (sliding) vs 512 (full). This uniform assumption breaks E2B on the paged path.
+- Consequence worth stating plainly: because the paged cache is populated for every GQA model (`engine.rs:202,243`), heterogeneous head_dim blocks **even plain greedy** E2B on the paged path — *unless* we add a contiguous-KV fallback (see §3d). The contiguous ORT past→present threading in `run_decode_step` (`decode.rs:1107-1117`) is head_dim-agnostic (opaque per-name ORT values) and does NOT use the paged cache; only shared-KV slicing (`materialize_sequence`) requires paging.
+
+**Pipeline orchestrator is not the right vehicle here:**
+- `pipeline.rs:451-473` `PipelinePlan::from_spec` only runs `PhaseRunOn::PromptOnly` components before the decode loop; `EveryStep`/`OnDemand` components are explicitly ignored (line 466). `PipelineEngine` is also a *separate* engine from the speculative `Engine` and cannot compose with the shared-KV proposer. So an embed-split target (which would need the embedding model re-run **every** decode step) is **not** expressible today and would be a large new effort. Choosing the single-model target avoids this entirely.
+
+---
+
+#### 1. Recommended export shape — SINGLE-MODEL target
+
+Export the E2B decoder as a **single** `input_ids → (logits, projected_state, present KV)` graph via `Gemma4TextCausalLMTask`, extended to also emit the f32 hidden. This plugs straight into the existing shared-KV speculative path (which feeds `input_ids`) with **zero** new orchestration. Do **not** pursue the embed-split pipeline for E2B text decode.
+
+**Mobius changes (Sapper):**
+1. Add a Float32 hidden output to `Gemma4TextCausalLMTask.build` (and its module forward): expose the backbone last hidden state `[batch, seq, backbone_hidden_size=1536]`, **cast to Float32** even in an f16 graph, named e.g. `projected_state` (any name works — the runtime auto-detects by dtype+last-dim). It must be numerically the state that seeds the assistant, i.e. the same space the assistant's `post_projection` produces (`mobius/src/mobius/models/gemma4_assistant.py:14-16, 211`). Confirm against HF reference whether that is the raw post-norm `last_hidden_state` or a projected variant; the E2E parity gate (§5) is the arbiter.
+2. Keep the dual-head_dim KV export as-is (`_make_gemma4_kv_cache_inputs`) — the runtime work in §3 will consume it.
+3. Contingency: if the fused per-layer embedding table `[V, L*D]` trips a 2 GB protobuf / `max_buffer_size` limit, use `split_per_layer_embedding` (split tables) — **still a single `input_ids` graph**, so the runtime is unaffected. Only if Mobius is *forced* to emit a separate embedding pre-model do we fall back to the (much larger) embed-split runtime effort; treat that as out of scope for this cycle.
+
+**Why single-model:** avoids embed-split orchestration, avoids `EveryStep` pipeline support, reuses the proven `run_decode_step` input_ids path, and keeps the target a drop-in for `detect_target_hidden_output`.
+
+---
+
+#### 2. Merged package + metadata schema (fully generic)
+
+Directory layout (single loadable model dir; the assistant is a subdir):
+
+```
+gemma4-e2b-onnx/
+  model.onnx                     # TARGET: input_ids -> logits, projected_state(f32,1536), present.{i}.{key,value}
+  model.onnx.data                # external weights if >2GB
+  inference_metadata.yaml        # single merged metadata (below)
+  tokenizer.json / tokenizer_config.json / special_tokens_map.json
+  assistant/
+    model.onnx                   # ASSISTANT: inputs_embeds[B,q,2H], shared_kv.*.{key,value}, position_ids,
+    model.onnx.data              #            attention_mask -> logits, projected_state[B,q,1536]
+```
+
+Single merged `inference_metadata.yaml` (generic — no model names, no hardcoded layer logic; all shapes/wiring declared):
+
+```yaml
+model:
+  file: model.onnx
+  # normal decoder-only declarations (vocab, max_sequence_length, attention/sliding_window, kv layout...)
+speculative:
+  proposal_type: shared_kv
+  model: assistant/model.onnx        # relative to package root; resolved by parser.rs:143 (model_dir.join)
+  num_speculative_tokens: 3
+  backbone_hidden_size: 1536
+  vocab_size: 262144
+  projected_state_output: projected_state   # ASSISTANT output threaded forward
+  logits_output: logits
+  shared_kv:
+    - name: sliding_attention
+      target_layers: [0, 1, 2]     # indices into the TARGET's EXPORTED KV layers (post kv-sharing)
+    - name: full_attention
+      target_layers: [3]
+```
+
+Notes:
+- The target hidden output name is **not** in the schema by design (auto-detected). No schema change is required — `SpeculatorConfig`/`SharedKvGroup` (`schema.rs:68-148`) already cover everything.
+- `target_layers` must be interpreted as indices into the target's **exported** KV cache (after `num_kv_shared_layers` folding), because that is what `materialize_sequence` returns. Document this contract in the schema doc-comment so 12B (different layer counts) stays generic.
+- Mobius emitter (`integrations/onnx_genai`) must: copy target + assistant graphs into the layout above, write the single merged metadata, copy the tokenizer once. This is additive to the already-landed `shared_kv` emitter (decisions 2026-07-13, commit 498ecf0).
+
+---
+
+#### 3. Runtime changes — file-by-file (generic / config-driven)
+
+**(a) Run the target — NO change needed.** Single-model `input_ids` target already runs through `run_decode_step` (`decode.rs:1021`) and `next_session_token_logits_and_hidden` (`decode.rs:501`). The embed-split path is avoided, so `decode.rs:1083` extra-input routing and `pipeline.rs` are untouched.
+
+**(b) Expose `projected_state` to seed the assistant — NO change needed.** `detect_target_hidden_output` (`engine.rs:1522-1534`) auto-finds the f32 `[..,1536]` output; `engine.rs:413-439` validates dtype/last-dim. Requirement is entirely on the Mobius side (emit it f32). Verify the target's f16 graph casts this one output to f32.
+
+**(c) Mixed per-layer head_dim in shared-KV slicing — THE runtime work (generic).** Make the paged KV cache and the slicer per-layer-head_dim aware, driven by the target's own KV output shapes (never by model name):
+- `crates/onnx-genai-kv/src/paged_cache.rs` — extend `MaterializedKv` / `MaterializedLayerKv` to carry **per-layer** `num_kv_heads` + `head_dim` (or return them per layer). `page_table.rs` page sizing must support per-layer tensor geometry (heterogeneous `PageTensorConfig` per layer).
+- `crates/onnx-genai-engine/src/kv_bridge.rs:62-97` — `infer_kv_model_info` must build a **per-layer** tensor config from each KV output's shape, not from `key_outputs[0]` alone. Also fold `num_kv_shared_layers`: exported KV entries number `num_hidden_layers - num_kv_shared_layers`; `target_layers` indices map onto exported entries.
+- `crates/onnx-genai-engine/src/speculative.rs:1246-1253` — `shared_kv_proposer_slices` must read `head_dim`/`num_kv_heads` from the **specific** target layer referenced by each group's `target_layers.last()`, not from a single global `materialized.head_dim`.
+- Keep it structural: dims come from ONNX I/O shapes + metadata `shared_kv.target_layers`. This generalizes to 12B (more layers, same 256/512 split) automatically.
+
+**(d) Contiguous-KV fallback for plain greedy (de-risks §3c and gives Milestone A).** Add a path where, if the target's KV is head_dim-heterogeneous and speculation is **off**, the engine skips the paged mirror and uses the head_dim-agnostic contiguous ORT past→present threading already in `run_decode_step` (`decode.rs:1107-1117`). Simplest lever: have `infer_kv_model_info` signal "not paged-representable" (return `None`/a flag) for heterogeneous layers so `next_session_token_logits` (`decode.rs:474-497`) advances the sequence without paging. This lets us prove single-model E2B greedy on CUDA **before** the heterogeneous paged cache lands. (Same crate as §3c — see serialization below.)
+
+No changes to `schema.rs`/`parser.rs` are anticipated (existing fields suffice). If the `target_layers`→exported-KV-index contract needs a doc-comment, that is a metadata-crate touch — keep it isolated.
+
+---
+
+#### 4. Work decomposition — owners, sequencing, crate-collision flags
+
+| ID | Item | Owner | Crate / repo | Parallel? |
+|----|------|-------|--------------|-----------|
+| **W1** | Single-model E2B target export: add f32 `projected_state` output to `Gemma4TextCausalLMTask`; merged package + single merged `inference_metadata.yaml` emitter (§1, §2). | **Sapper** | Mobius (separate repo) | ✅ Fully parallel with all runtime work |
+| **W2** | Heterogeneous per-layer head_dim paged cache: `MaterializedKv`/`MaterializedLayerKv` per-layer dims, `page_table.rs` per-layer geometry (§3c). | **Batty** | `onnx-genai-kv` | ✅ Parallel with W1; **W3 depends on its API** |
+| **W3** | Engine consume per-layer geometry: `kv_bridge.rs` per-layer tensor config + `num_kv_shared_layers` fold; `speculative.rs` per-layer slice dims (§3c). | **Leon** | `onnx-genai-engine` | ⛔ After W2 API; **same crate as W4** |
+| **W4** | Contiguous-KV fallback for heterogeneous plain greedy (§3d). | **Batty** or **Leon** | `onnx-genai-engine` | ⛔ **SAME CRATE as W3 — must serialize** |
+| **W5a** | Fixture builder: extend `build_tiny_gemma4_assistant.py` to MIXED head_dim (e.g. sliding=8, full=16) so slicing is exercised. | **Pris** | `scripts/` (Python) | ✅ Parallel with W1/W2 |
+| **W5b** | Rust token-identity regression on the mixed-head_dim fixture + real E2B E2E gate script (§5). | **Pris** | `onnx-genai-engine/tests` | ⛔ After W3+W4 land (same crate build) |
+
+**Serialization rules (avoid build races):**
+- **`onnx-genai-engine` is the hot crate:** W3, W4, and W5b all touch it — they MUST land in sequence, not concurrently. Order: W3 → W4 → W5b.
+- **`onnx-genai-kv` (W2)** can start immediately in parallel, but publish the `MaterializedKv` API shape early so Leon can code W3 against it; W3 compiles only once W2 lands.
+- **Mobius (W1)** and the **Python fixture builder (W5a)** are fully parallel with everything (no Rust-crate contention).
+
+**Critical path:** W2 → W3 → W4 → W5b (Rust). W1 (Sapper) runs alongside and must finish before the **real** E2E gate can execute, but not before the fixture regression.
+
+---
+
+#### 5. Acceptance test — the real E2E gate + regression plan
+
+**Real gate (the milestone that counts):**
+- Load the merged E2B package (§2) with **CUDA EP**, real E2B + real assistant weights.
+- Run the same prompts twice: (i) plain greedy (speculation off), (ii) shared-KV speculative (`num_speculative_tokens: 3`), both `temperature=0`, `greedy=true`.
+- **Assert token-identical** output sequences (speculative == greedy) — every drafted token is target-verified, so identity is the correctness invariant.
+- **Measure tok/s** for both; require speculative tok/s > greedy tok/s (report acceptance rate via `last_speculative_stats`).
+- Stage it as a gated, feature-flagged / `#[ignore]`-by-default integration test (weights are large, CUDA-only) plus a runnable script under `scripts/` mirroring the `gemma4_assistant_full.rs` structure.
+
+**Regression / fixture tests (CPU, in CI):**
+- W5a mixed-head_dim tiny fixture (sliding head_dim ≠ full head_dim) → extend `gemma4_assistant_full.rs` to assert speculative == greedy on it. This closes the coverage gap that today's uniform-head_dim fixture leaves open.
+- Add a unit test for `infer_kv_model_info` per-layer geometry (heterogeneous head_dim + `num_kv_shared_layers` fold) and for `shared_kv_proposer_slices` picking the correct per-layer dims.
+- Keep the existing uniform fixture green (no regression to MTP/EAGLE-3/draft paths).
+
+---
+
+#### 6. Risks / unknowns + fallback
+
+1. **Heterogeneous paged KV cache is the deep item (W2/W3).** Page allocation, per-layer KV-dtype/quant, and the present→page mirror all currently assume a uniform head_dim. This is more than a day of work and is the single biggest schedule risk.
+   - **Fallback / minimal REAL milestone:** ship §3d first and land **Milestone A = single-model E2B greedy on CUDA via contiguous KV** (proves the export, the f32 `projected_state`, tokenizer, CUDA EP, and correct greedy text) *without* speculation. Then **Milestone B = heterogeneous paged cache → shared-KV speculative token-identity + speedup**. Milestone A is achievable quickly once W1 lands and de-risks the whole export/metadata surface.
+2. **`projected_state` numeric definition.** Whether the seed hidden is raw post-norm `last_hidden_state` or a projected variant matching the assistant's `post_projection` is a model-parity detail; a wrong choice stays greedy-correct (target verifies) but tanks acceptance (no speedup). The §5 tok/s check is the detector; resolve against the HF reference during W1.
+3. **f16 target ↔ f32 seed.** The graph is f16 but the runtime hard-requires the hidden output f32. Confirm Mobius casts exactly that one output and that assistant `inputs_embeds` (f16) tolerates the f32→f16 round-trip without acceptance collapse.
+4. **`num_kv_shared_layers` index mapping.** `target_layers` must index the *exported* KV entries (post-sharing), not raw model layers. Off-by-one here silently reads the wrong layer's KV → low acceptance, not a crash. Cover with a unit test.
+5. **Per-layer embedding table size.** Fused `[V=262144, L*D]` may exceed 2 GB / `max_buffer_size`, forcing external-data or `split_per_layer_embedding`. Both stay single-graph `input_ids`, so runtime-neutral — but adds export complexity/time for Sapper.
+6. **CUDA GQA fusion + sliding window.** The assistant's `attention_mask` drives GQA `local_window_size` for sliding layers; verify the CUDA GQA-fused build masks the sliding cache correctly (the mask governs, per the assistant task doc-comment). If CUDA GQA fusion misbehaves, fall back to the standard-Attention build for the first real run.
+7. **Is a real E2B run > 1 day?** Yes — the heterogeneous paged cache (W2+W3) plus real-weight CUDA bring-up realistically exceeds a day. **Minimal real milestone this cycle = Milestone A (single-model E2B greedy on CUDA).** Speculative token-identity + speedup (Milestone B) follows once the heterogeneous cache lands. If W2/W3 slip, there is no need for a "smaller per-layer-embed model" fallback — the single-model path already sidesteps embed-split; the only thing gating Milestone B is the heterogeneous cache, which the mixed-head_dim tiny fixture (W5a) lets us build and prove **without** real weights.
+
+**Why:** Locks the team onto the simplest viable export (single-model, not embed-split), isolates the one genuinely hard runtime change (heterogeneous per-layer head_dim KV), gives a fast honest first milestone (E2B greedy on CUDA), and sequences same-crate work (`onnx-genai-engine`: W3→W4→W5b) to avoid build races while Mobius (W1) and the kv crate (W2) proceed in parallel.
+
+---
+
+### 2026-07-13: Gemma4 E2B shared-KV speculative export + E2E smoke-test attempt
+**By:** Sapper
+**What:**
+- Ran the Mobius `gemma4-assistant` export for `google/gemma-4-E2B-it-assistant`
+  (`--runtime onnx-genai --dtype f16 --ep cuda`). Succeeded → `~/gemma4-e2b-assistant-onnx`
+  (374M). Emitted `inference_metadata.yaml` with a correct, GENERIC `speculative:`
+  block: `proposal_type: shared_kv`, backbone_hidden_size 1536, vocab 262144,
+  projected_state_output/logits_output, and `shared_kv` groups
+  (sliding_attention→target_layers [0,1,2], full_attention→[3]). No model-name
+  hardcoding — matches the runtime `SpeculatorConfig`/`SharedKvGroup` schema.
+- Confirmed the onnx-genai runtime shared-KV proposer path is complete and
+  model-agnostic: `ProposalType::SharedKv` (schema.rs), metadata auto-config via
+  `shared_kv_mode_from_metadata` + `detect_target_hidden_output` (engine.rs:1494,1523),
+  `SharedKvProposerConfig`/`SharedKvBinding` (config.rs), proposer loop +
+  `shared_kv_proposer_slices` (speculative.rs:1222). Existing integration test
+  `gemma4_assistant_full.rs` asserts speculative == plain-greedy token-identity.
+
+**Blockers preventing a REAL Gemma-4 E2B end-to-end run this session (honest):**
+1. **Target not runnable in onnx-genai.** Gemma-4 E2B is a multimodal `gemma4`
+   checkpoint whose decoder is a two-model split taking `inputs_embeds` +
+   `per_layer_inputs` (confirmed both in Mobius `Gemma4Task` and the existing
+   ort-genai `justinchuby/gemma-4-E2B-it-ONNX` genai_config). The onnx-genai
+   single-model decode path feeds `input_ids` (decode.rs:1044-1084). A pipeline
+   orchestrator exists (pipeline.rs) but is NOT integrated with the shared-KV
+   speculative path, and Mobius emits no `pipeline:` section.
+2. **Target hidden output missing.** The runtime seeds the assistant from a
+   Float32 target hidden output of size backbone_hidden_size=1536
+   (engine.rs:413-439 / detect_target_hidden_output). No Mobius Gemma4 decoder
+   task exports this.
+3. **No combined package.** `mobius build --task gemma4-assistant` emits an
+   assistant-ONLY package: `model:` block describes the assistant and
+   `speculative.model` self-references `model.onnx`. The runtime needs a combined
+   dir (target `model.onnx` + `assistant/model.onnx` + merged metadata whose
+   `model:` block is the TARGET and `speculative.model` = `assistant/model.onnx`).
+4. **Mixed per-layer head_dim.** E2B target KV is 256 (sliding) / 512 (global)
+   with num_kv_heads=1; `shared_kv_proposer_slices` uses a single
+   `materialized.head_dim`/`num_kv_heads` per group (speculative.rs:1236-1253) —
+   needs verification it yields correct per-layer dims for each representative
+   layer.
+
+**Why:** The export side that is in Sapper's scope (assistant export + generic
+speculative metadata) is validated and correct. A real-E2B E2E run additionally
+requires runtime work (embedding→decoder pipeline execution fused with the
+shared-KV speculator, combined-package + pipeline metadata emission, target
+hidden-output export) that spans the engine/KV owners and is a multi-session
+effort. Reported honestly rather than faked.
+
+---
+
+### 2026-07-14: W2 — Heterogeneous per-layer KV geometry in `onnx-genai-kv`
+
+**By:** Batty (Engine Dev)
+**What:** Made the paged KV cache carry **per-layer** `num_kv_heads` + `head_dim`
+so layers with different geometry (e.g. Gemma-4 E2B: sliding/local head_dim 256,
+full/global head_dim 512) round-trip correctly. Model-agnostic: geometry comes
+from `LayerTensorConfig` values supplied by the caller (from ONNX KV I/O shapes),
+never from model names. No hardcoded 256/512. Generalizes to Gemma-3 12B (more
+layers, same split) automatically.
+**Why:** Blocker #4 in Roy's E2B plan (§0, §3c, W2). The paged cache previously
+assumed a uniform head_dim inferred from layer 0, which breaks E2B.
+
+**Staging note (IMPORTANT for Leon / W3):** This is intra-feature staging, NOT a
+released-API back-compat shim. The uniform `MaterializedKv::num_kv_heads` /
+`MaterializedKv::head_dim` fields are **temporarily retained**, populated from
+layer 0, so existing `onnx-genai-engine` callers (`kv_bridge.rs`,
+`speculative.rs`) still build unchanged. Every such retention is marked
+`// TODO(W3): remove uniform accessors after engine migrates to per-layer`.
+`cargo build -p onnx-genai-engine` confirmed still compiles.
+
+---
+
+#### New public API surface (verbatim signatures) — code W3 against this
+
+```rust
+// crates/onnx-genai-kv/src/page_table.rs
+
+/// KV tensor geometry (num_kv_heads × head_dim) for a single layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LayerTensorConfig {
+    pub num_kv_heads: usize,
+    pub head_dim: usize,
+}
+impl LayerTensorConfig {
+    pub const fn new(num_kv_heads: usize, head_dim: usize) -> Self;
+    pub const fn f32_len_per_token(self) -> usize;   // num_kv_heads * head_dim
+    pub const fn validate(self) -> bool;
+}
+
+// PageTensorConfig is UNCHANGED (still Copy, 5 uniform fields) so engine struct
+// literals keep compiling. New helper:
+impl PageTensorConfig {
+    pub fn to_layer_configs(self) -> Vec<LayerTensorConfig>; // uniform repeated
+}
+
+// PageTable gains an authoritative per-layer geometry vec + accessor:
+pub struct PageTable {
+    // ...
+    pub tensor_config: Option<PageTensorConfig>,  // now = layer-0 geometry when heterogeneous
+    pub layer_configs: Vec<LayerTensorConfig>,    // NEW: len == num_layers, empty when no storage
+    // ...
+}
+impl PageTable {
+    pub fn new_with_layer_configs(
+        page_size: usize, num_gpu_pages: usize,
+        dtype: KvDType, layer_configs: Vec<LayerTensorConfig>,
+    ) -> Self;
+    pub fn new_with_layer_quant_config(
+        page_size: usize, num_gpu_pages: usize,
+        dtype: KvDType, layer_configs: Vec<LayerTensorConfig>, quant_config: KvQuantConfig,
+    ) -> Result<Self, KvError>;
+    pub fn layer_config(&self, layer: usize) -> Option<LayerTensorConfig>;
+}
+// REMOVED: PageTable::tensor_offset(..) and Page::value_at(config, offset).
+// Page now exposes explicit per-slot addressing (internal-only, kv crate):
+//   Page::value_at_slot(page_size, head_dim, component, head, token_offset, dim) -> f32
+//   Page::write_head_token(page_size, head_dim, component, head, token_offset, &[f32])
+```
+
+```rust
+// crates/onnx-genai-kv/src/paged_cache.rs
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MaterializedLayerKv {
+    pub key: Vec<f32>,
+    pub value: Vec<f32>,
+    pub num_kv_heads: usize,   // NEW: per-layer geometry
+    pub head_dim: usize,       // NEW: per-layer geometry
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MaterializedKv {
+    pub start_position: usize,
+    pub sink_len: usize,
+    pub sequence_len: usize,
+    pub num_kv_heads: usize,   // TODO(W3): uniform, = layers[0].num_kv_heads
+    pub head_dim: usize,       // TODO(W3): uniform, = layers[0].head_dim
+    pub layers: Vec<MaterializedLayerKv>,
+}
+
+impl PagedKvCache {
+    pub fn new_with_layer_tensor_configs(
+        page_size: usize, dtype: KvDType,
+        layer_configs: Vec<LayerTensorConfig>, num_gpu_pages: usize,
+    ) -> Self;
+    pub fn new_with_layer_quant_config(
+        page_size: usize, dtype: KvDType,
+        layer_configs: Vec<LayerTensorConfig>, quant_config: KvQuantConfig, num_gpu_pages: usize,
+    ) -> Result<Self, KvError>;
+    // existing constructors (new, new_with_tensor_config, new_with_quant_config,
+    // new_with_metadata) unchanged — they build a uniform layer_configs internally.
+}
+```
+
+Re-exported from the crate root (`lib.rs`): `LayerTensorConfig`.
+
+#### W3 guidance (Leon)
+- In `kv_bridge.rs::infer_kv_model_info`, build `Vec<LayerTensorConfig>` from each
+  KV output's shape (not `key_outputs[0]` alone), fold `num_kv_shared_layers`, and
+  construct the cache via `PagedKvCache::new_with_layer_tensor_configs` /
+  `new_with_layer_quant_config`. Keep a representative `PageTensorConfig` on
+  `KvModelInfo` if convenient (it now reports layer-0 geometry).
+- In `speculative.rs::shared_kv_proposer_slices`, read per-group dims from
+  `materialized.layers[target_layers.last()].{num_kv_heads,head_dim}` instead of
+  the global `materialized.{num_kv_heads,head_dim}`.
+- Engine **tests** that struct-literal `MaterializedLayerKv { key, value }`
+  (e.g. `kv_bridge.rs` ~L883) now need the two new fields — update them in W3.
+  (`cargo build -p onnx-genai-engine` was not affected; only `cargo test` is.)
+- Once all engine consumers use `layers[i]`, delete the `TODO(W3)` uniform
+  `MaterializedKv::num_kv_heads`/`head_dim` fields.
+
+#### Files changed
+- `crates/onnx-genai-kv/src/page_table.rs`: `LayerTensorConfig`; per-layer page
+  storage sizing in `Page::new`; `value_at`→`value_at_slot` and per-layer
+  `write_head_token`; removed uniform `tensor_offset`/`component_len`; added
+  `layer_configs` field + `new_with_layer_configs`/`new_with_layer_quant_config`/
+  `layer_config`; unified internal `build()`.
+- `crates/onnx-genai-kv/src/paged_cache.rs`: per-layer `MaterializedLayerKv`;
+  per-layer `write_token_kv`/`materialize_sequence`/`validate_layers`; new
+  `PagedKvCache` per-layer constructors; 4 new heterogeneous unit tests.
+- `crates/onnx-genai-kv/src/lib.rs`: export `LayerTensorConfig`.
+
+#### Validation
+- `cargo test -p onnx-genai-kv --lib` → 78 passed (74 existing + 4 new).
+- `cargo build -p onnx-genai-engine` → compiles (staging shim confirmed).
+- `cargo clippy -p onnx-genai-kv --lib --tests -- -D warnings` → clean.
+
+New tests: `heterogeneous_per_layer_geometry_round_trips_within_a_page`,
+`..._across_page_boundaries`, `heterogeneous_quantized_per_layer_geometry_round_trips_within_tolerance`,
+`heterogeneous_write_rejects_wrong_per_layer_length` (layers use head_dim 8 vs 16,
+num_kv_heads 2 vs 3 — asserts per-layer buffer lengths and head-major values).
+
+---
+
+### 2026-07-14: W1 — Gemma-4 E2B single-model merged shared-KV export (Mobius side)
+
+**By:** Sapper
+**Status:** DONE (export + I/O verified). Real onnx-genai CUDA inference is W3/W4 (runtime), not run here.
+
+**What:** Produced the merged, single-model Gemma-4 E2B onnx-genai package the
+runtime consumes for shared-KV speculative decoding, per Roy's plan
+(`roy-gemma4-e2b-realrun-plan.md` §1/§2). Fully parallel with the runtime team.
+
+**Merged package:** `~/gemma4-e2b-onnx/`
+```
+gemma4-e2b-onnx/
+  model.onnx (+ model.onnx.data, 10.3 GB f16)   # TARGET: input_ids -> logits, projected_state(f32,1536), present.{0..14}.{key,value}
+  inference_metadata.yaml                        # SINGLE merged metadata (model: TARGET, speculative.model: assistant/model.onnx)
+  tokenizer.json, tokenizer_config.json
+  assistant/model.onnx (+ .data, 359 MB)         # the E2B-it-assistant export (unchanged; my model changes don't touch it)
+```
+(No `special_tokens_map.json` — the E2B HF snapshot doesn't ship one; optional.)
+
+**Verified I/O signatures (onnx + onnxruntime InferenceSession):**
+- TARGET inputs: `input_ids` INT64[batch, sequence_len]; `attention_mask` INT64;
+  `past_key_values.{0..14}.{key,value}` f16 — sliding head_dim 256 at layers
+  [0,1,2,3,5,6,7,8,10,11,12,13], full head_dim 512 at [4,9,14], num_kv_heads=1.
+  (`position_ids` is pruned as unused under the GQA-fused RoPE path — same as the
+  assistant export, which the runtime already tolerates.)
+- TARGET outputs: `logits` f16[batch,seq,262144]; **`projected_state` FLOAT32
+  [batch,seq,1536]** (cast to f32 even in the f16 graph); `present.{0..14}` with
+  the matching dual head_dim.
+- ASSISTANT inputs: `inputs_embeds` f16[batch,q_len,3072=2*1536]; `attention_mask`;
+  `shared_kv.sliding_attention.{key,value}` f16[.,1,.,256];
+  `shared_kv.full_attention.{key,value}` f16[.,1,.,512].
+- ASSISTANT outputs: `logits` f16[.,q_len,262144]; `projected_state` f16[.,q_len,1536].
+
+**projected_state numeric choice (§1 / risk #2):** The target's seed hidden =
+the backbone **post-norm `last_hidden_state`** (output of `self.model.norm`,
+before `lm_head`), cast to f32. This is the space the assistant's
+`post_projection` reproduces and the natural seed the drafter consumes. Greedy
+correctness holds regardless (target verifies every draft token); the choice only
+affects acceptance rate / speedup, which the §5 tok/s gate arbitrates.
+**How to flip:** in `Gemma4CausalLMModel.forward` (mobius `models/gemma4.py`),
+`hidden_states` returned when `return_hidden_states=True` is the post-norm state.
+To try a pre-norm or projected variant, return the alternate tensor there (or add
+a projection before the `op.Cast(..., FLOAT)` in `Gemma4TextCausalLMTask.build`).
+
+**KEY CORRECTION vs Roy §2 illustration — target_layers are TARGET-folded:**
+E2B target = 35 layers, `num_kv_shared_layers=20` → 15 exported KV entries. A
+KV-shared layer borrows K,V from the **last non-shared layer of the same type**
+(mobius `gemma4.py:679-696`), and the runtime keys each shared_kv group off
+`target_layers.last()` (`speculative.rs:1237`). So the merged metadata's
+shared_kv indexes the target's **exported** layers, NOT the assistant's 4 layers:
+```
+shared_kv:
+  - name: sliding_attention
+    target_layers: [0, 1, 2, 3, 5, 6, 7, 8, 10, 11, 12, 13]   # .last()=13 (sliding KV source)
+  - name: full_attention
+    target_layers: [4, 9, 14]                                  # .last()=14 (full KV source)
+```
+Roy's [0,1,2]/[3] example was the assistant/tiny-fixture illustration; using it
+for the real merged target would make the full group borrow a **sliding** layer
+(head_dim 256≠512) → wrong KV / crash. The new emitter derives this generically
+from `layer_types` + `num_kv_shared_layers`, so 12B works unchanged.
+
+**Mobius changes** — branch `feat/gemma4-assistant-onnx-genai`, commit **8c77d78**:
+- `models/gemma4.py`: `Gemma4CausalLMModel.forward(..., return_hidden_states=False)`
+  returns the post-norm last_hidden_state.
+- `tasks/_gemma4.py`: `Gemma4TextCausalLMTask` emits f32 `projected_state`.
+- `_registry.py`: `_TEXT_ONLY_MODEL_TYPE["gemma4"] = "gemma4_text"` so
+  `--text-only` builds the single-model text decoder of the multimodal checkpoint.
+- `integrations/onnx_genai/inference_metadata.py` (+ `__init__.py`):
+  `generate/write_merged_inference_metadata` + `_folded_shared_kv_groups`
+  (target-folded shared_kv). Generic — no model names.
+- Tests added; `inference_metadata_test.py` 20/20 pass; tasks+integration+registry
+  162/162 pass. (3 `gemma4_test.py` failures are pre-existing: missing
+  `onnxruntime_easy` harness, identical with my changes stashed.)
+
+**Export command (target):**
+`python3 -m mobius build --model google/gemma-4-E2B-it --text-only --runtime onnx-genai --dtype f16 --ep cuda --external-data onnx ~/gemma4-e2b-onnx`
+Then assistant copied into `assistant/` and merged metadata written via
+`write_merged_inference_metadata(target_cfg, assistant_cfg, ...)`.
+
+**Notes / for W2-W4:**
+- Model size 10.3 GB (fused per-layer embedding table [262144, 35*256] ≈ 4.7 GB
+  dominates); external-data handles the >2 GB protobuf limit — no
+  `split_per_layer_embedding` needed. Disk after: 93 GB free on /home.
+- The f16 target's single f32 output is the seed; the assistant tolerates the
+  f32→f16 round-trip (risk #3) — parity is the tok/s gate's call.
+- I did NOT touch onnx-genai (W1 is Mobius-only). onnx-genai currently shows
+  W2 (onnx-genai-kv) edits from Batty — not mine; leaving for the coordinator.
+
+**Why:** Locks in the simplest viable export (single-model, not embed-split),
+emits the runtime's required f32 seed hidden with zero new metadata keys, and
+fixes the target_layers→exported-KV mapping so the real E2B (and 12B) wire
+correctly for shared-KV speculative decoding.
+
+---
+
+### 2026-07-14: W3 — Engine consumes per-layer KV geometry; staging shim removed
+
+**By:** Leon (Engine Dev — KV & Buffers)
+**What:** Migrated `onnx-genai-engine` off Batty's W2 uniform-field staging shim
+onto real per-layer KV geometry, and deleted the shim. The paged KV cache is now
+built from a per-layer `Vec<LayerTensorConfig>` derived structurally from each
+exported present-KV output shape, so heterogeneous head_dim models (Gemma-4 E2B
+sliding=256 / full=512, and Gemma-3 12B by extension) page and slice correctly.
+Fully model-agnostic — no model names, no hardcoded 256/512; dims come from ONNX
+I/O shapes + `shared_kv.target_layers` metadata.
+**Why:** Roy's E2B plan §3c / W3. Closes blocker #4's engine half after W2 landed
+the kv-crate half.
+
+#### Files changed
+- `crates/onnx-genai-kv/src/paged_cache.rs` — **shim removal**: deleted the
+  uniform `MaterializedKv::num_kv_heads` / `MaterializedKv::head_dim` fields and
+  the `uniform_heads`/`uniform_head_dim` computation in `materialize_sequence`;
+  removed the shim assertions from `heterogeneous_per_layer_geometry_round_trips_within_a_page`.
+  Per-layer geometry now lives only on `MaterializedLayerKv`.
+- `crates/onnx-genai-engine/src/kv_bridge.rs`
+  - `KvModelInfo` gained `layer_configs: Vec<LayerTensorConfig>` (one per exported
+    KV layer) + a `layer_tensor_config(layer)` accessor. `tensor_config` is kept
+    only as a representative (layer-0) view for uniform-only consumers
+    (`num_layers`/`dtype`, connector `KvPayload`).
+  - `infer_kv_model_info` builds per-layer configs via new pure helper
+    `layer_configs_from_key_outputs(&[TensorInfo])` (reads each exported present-key
+    output's shape) instead of `key_outputs[0]` alone.
+  - `mirror_present_kv_to_pages` now extracts each layer's present token with that
+    layer's own `layer_tensor_config(idx)` (was uniform `tensor_config`).
+  - New unit test `layer_configs_are_built_per_exported_kv_layer_with_shared_layer_fold`
+    (heterogeneous head_dim + `num_kv_shared_layers` fold + target_layers mapping);
+    extended the uniform infer test to assert `layer_configs`.
+  - Updated the `MaterializedKv`/`MaterializedLayerKv` test literal for the new API.
+- `crates/onnx-genai-engine/src/engine.rs` — target and draft paged caches now
+  constructed via `PagedKvCache::new_with_layer_tensor_configs(page_size, dtype,
+  layer_configs, num_gpu_pages)` (was `new_with_tensor_config`).
+- `crates/onnx-genai-engine/src/speculative.rs` — extracted
+  `shared_kv_slices_from_materialized(groups, &MaterializedKv)`; each group now
+  reads `num_kv_heads`/`head_dim` from `materialized.layers[target_layers.last()]`
+  (the specific target layer) instead of the removed global fields. New unit test
+  `shared_kv_slices_pick_per_layer_geometry` (2×8 sliding vs 3×16 full + OOB error).
+
+#### Shim removal — confirmed
+`MaterializedKv::num_kv_heads` / `MaterializedKv::head_dim` are **fully deleted**.
+No engine or kv reader references them; the only per-layer dims are on
+`MaterializedLayerKv`. `grep` across the workspace for the uniform fields returns
+nothing but the (unchanged) `PageTensorConfig`/`LayerTensorConfig`/`KvPayload`
+fields, which are legitimately uniform.
+
+#### `num_kv_shared_layers` → exported-index mapping (assumption)
+The ONNX graph exports only `num_hidden_layers - num_kv_shared_layers` present-KV
+entries (the last N layers reuse an earlier layer's K/V), named contiguously
+`present.{0..M-1}`. `infer_kv_model_info` sorts by parsed layer index and produces
+exactly M `LayerTensorConfig`s. Metadata `shared_kv.target_layers` indices are
+therefore interpreted as **direct indices into the exported (post-sharing) KV
+list** — `target_layers.last()` selects `materialized.layers[idx]`. No extra
+offset is applied because the export has already folded the shared layers. This
+is the contract documented in Roy §2/§0 and Batty's W3 guidance. **Assumption:**
+the exported present outputs are contiguously numbered from 0 with no gaps for the
+shared layers; Sapper's real E2B export (W1) will confirm the exact naming. If the
+export instead emits sparse indices (e.g. skips the shared positions), the fold
+would need index remapping — flag for W5b's real-fixture gate.
+
+#### Validation (all clean)
+- `cargo test -p onnx-genai-kv --lib` → **78 passed** (shim removal, no regressions).
+- `cargo test -p onnx-genai-engine --lib` → **107 passed, 1 ignored** (incl. 2 new
+  per-layer unit tests).
+- `cargo test -p onnx-genai-engine --test gemma4_assistant_full --test gemma4_assistant_metadata_smoke`
+  → **2 passed** (uniform shared-KV still token-identical — no regression).
+- `cargo clippy -p onnx-genai-kv -p onnx-genai-engine --lib --tests -- -D warnings`
+  → **clean**.
+- `gemma4_assistant_mixed` (`#[ignore]`d, W5b) still **compiles**; not enabled.
+- `cargo build --workspace` → green.
+
+**Do NOT commit** — coordinator lands combined W2+W3. Next in the serialized
+`onnx-genai-engine` chain: W4 (contiguous-KV greedy fallback) → W5b (enable the
+mixed fixture regression + real E2E gate).
+
+---
+
+### 2026-07-14: W2+W3 per-layer KV geometry review
+
+**By:** Chew (numerics/correctness reviewer)
+**What:** 🟡 **SHIP-with-advisories** — commit `9db1a3c` correctly implements
+heterogeneous per-layer head_dim for the paged cache + shared-KV speculative
+path. All five correctness questions pass for the real E2B export (15 contiguous
+present.{0..14}, sliding hd256 / full hd512). One **non-gating** advisory: the
+external-KV-**connector** payload path in `kv_bridge.rs` still uses uniform
+layer-0 geometry and would corrupt a heterogeneous model *if* the connector is
+enabled — but it is dead code for E2B (connector defaults to `Null`). Ship W2+W3;
+track the connector path before enabling it on any mixed-geometry model.
+
+**Why (file:line evidence):**
+
+**Q1 — Per-layer byte extraction: CORRECT.**
+- `mirror_present_kv_to_pages` extracts each layer with *that* layer's config, not
+  a global one: `kv_bridge.rs:232-236` uses `kv_model.layer_tensor_config(layer_idx)`
+  and passes it to `extract_present_token`, which sizes/loops on the per-layer
+  `config.num_kv_heads/head_dim` (`kv_bridge.rs:262-264`, axes via
+  `kv_tensor_axes` `:505-513`). `layer_data` iterates `kv_model.layers` in order
+  (`:201-225`) so `layer_idx` aligns with `layer_configs[idx]`.
+- Materialize path reads each layer's own `head_dim` from `layer_out.head_dim`
+  (`paged_cache.rs:287-306`) and calls `page.value_at_slot(page_size, head_dim, …)`
+  — no layer-0/global head_dim survives.
+
+**Q2 — `target_layers.last()` geometry + OOB guard: CORRECT & GUARDED.**
+- `shared_kv_slices_from_materialized` picks dims from the specific target layer:
+  `speculative.rs:1279-1288` reads `layer.num_kv_heads`/`layer.head_dim` from
+  `materialized.layers.get(layer_idx)`. For E2B: sliding `.last()=13`→hd256,
+  full `.last()=14`→hd512.
+- OOB is a hard error, not a silent misread: `.get(layer_idx).with_context(…)`
+  (`speculative.rs:1279-1284`) returns `Err` for any index ≥ layer count; covered
+  by the new `target_layers: vec![9]` assertion (`speculative.rs:1394-1398`).
+
+**Q3 — Page sizing is per-layer: CORRECT.**
+- `Page::new` iterates `layer_configs` and sizes each component from its own geom:
+  `page_table.rs:369-395` (`component_len = geom.num_kv_heads * page_size *
+  geom.head_dim`, `scale_slots = geom.num_kv_heads * page_size`), accumulating
+  distinct `data_offset`/`scale_offset` per component. Full layers therefore get
+  2× the bytes of sliding layers. `allocate` rebuilds pages from the same
+  `self.layer_configs` (`page_table.rs:770-774`). No uniform-sizing path remains
+  (`component_len(config)` helper deleted, old `tensor_offset` removed
+  `page_table.rs:925-931`).
+
+**Q4 — Shim fully removed: CONFIRMED.**
+- `MaterializedKv` no longer carries `num_kv_heads`/`head_dim` (`paged_cache.rs:36-50`,
+  `:314-320`). Workspace grep for uniform reads on a materialized cache returns
+  only `.layers[i].{num_kv_heads,head_dim}` (per-layer, in tests). Old `value_at`
+  / `tensor_offset` callers: none. `MaterializedLayerKv` is the sole geometry
+  carrier.
+
+**Q5 — Write/read byte symmetry for both head_dims: CORRECT.**
+- Write (`write_head_token`, `page_table.rs:474-476`) and read (`value_at_slot`,
+  `page_table.rs:433-435`) both compute `within = head*head_len +
+  token_offset*head_dim + dim` with `head_len = page_size*head_dim` using the
+  **passed per-layer** `head_dim`/`page_size`, indexing the same
+  `storage_layout[component]` slab whose offsets were laid out per-layer. Quant
+  scale index `head*page_size + token_offset` matches on both sides. Round-trip
+  proven for f32 (within/across pages) and fp8 in the three new kv tests
+  (`paged_cache.rs:961-1058`).
+
+**Contract vs Sapper W1 export: SATISFIED.**
+- Runtime reads geometry structurally from each present-key shape
+  (`layer_configs_from_key_outputs`, `kv_bridge.rs:139-146`), never from the
+  misleading top-level `model.attention.head_dim: 256`. `layer_configs` and
+  `layers` are both built from the same index-sorted `key_outputs`
+  (`kv_bridge.rs:76`, `:86`, `:103-119`), so `shared_kv.target_layers` index the
+  exported (KV-share-folded) list directly with no offset. Both target/draft
+  paged caches are built via `new_with_layer_tensor_configs(page_size, dtype,
+  layer_configs, …)` (`engine.rs:227-231`, `:249-256`).
+
+**ADVISORY (non-gating) — connector KvPayload path is uniform-only.**
+- `chunk_payload_from_exported` (`kv_bridge.rs:596-632`) and
+  `past_kv_from_payloads` (`kv_bridge.rs:649-701`) size/extract **all** layers
+  with a single `config.num_kv_heads/head_dim` (layer-0 / `kv_model.tensor_config`,
+  `engine.rs:1316-1319`, `:1342`, `:1164`). On a heterogeneous model this would
+  read full layers (hd512) as hd256 and mis-shape past tensors → corrupt KV.
+- **Why non-gating:** both call sites are reachable only under
+  `self.connector.is_active()` (`engine.rs:1091`; `store_connector_prefix`
+  gated by a non-`Null` backend `:1316-1321`), and `KvConnectorBackend` defaults
+  to `Null` (`config.rs:127,159`). For the E2B shared-KV run no connector is
+  configured, so this is dead code. It is also pre-existing and explicitly
+  documented as a "uniform-only consumer" in Leon's note — not a regression from
+  this commit.
+- **Follow-up owner:** the K-series / connector path owner (DESIGN §38) — NOT
+  Batty or Leon. Recommend Roy assign a per-layer refactor of
+  `chunk_payload_from_exported` / `past_kv_from_payloads` (thread
+  `layer_tensor_config(idx)` like `mirror_present_kv_to_pages` does) as a gate
+  **before** enabling any external KV connector on a heterogeneous model. Suggest
+  tagging alongside the W5b mixed-fixture gate.
+
+**Verdict: 🟡 SHIP-with-advisories.** W2+W3 paged-cache + shared-KV geometry is
+byte-correct for the real E2B export; land it. Connector path advisory is the
+only open item and is currently inert.
+
+---
+
+### 2026-07-14: Pris W5a — mixed-head_dim Gemma4-assistant fixture
+
+**Date:** 2026-07-14
+**By:** Pris (Tester)
+**Status:** complete — fixture generated, existing suite green
+
+---
+
+## What was done
+
+Extended the tiny Gemma4-assistant fixture builder to emit a **second** fixture with
+**mixed per-layer KV head_dim**, mirroring Gemma-4 E2B's 256 (sliding) / 512 (full)
+split at tiny scale. The original uniform-head_dim fixture
+(`tests/fixtures/tiny-gemma4-assistant`, `HEAD_DIM=8` for every layer) is **not
+changed** — all existing tests continue to pass.
+
+---
+
+## Files changed / added
+
+| File | Change |
+|------|--------|
+| `scripts/build_tiny_gemma4_assistant_mixed.py` | **New** — the mixed-head_dim fixture builder |
+| `tests/fixtures/tiny-gemma4-assistant-mixed/model.onnx` | **New** — target ONNX with heterogeneous KV dims |
+| `tests/fixtures/tiny-gemma4-assistant-mixed/assistant/model.onnx` | **New** — assistant ONNX with heterogeneous shared-KV inputs |
+| `tests/fixtures/tiny-gemma4-assistant-mixed/tokenizer.json` | **New** — copied from `tiny-llm` |
+| `tests/fixtures/tiny-gemma4-assistant-mixed/manifest.json` | **New** — full layer→head_dim + shape documentation |
+| `crates/onnx-genai-engine/tests/gemma4_assistant_mixed.rs` | **New** — W5b placeholder test (`#[ignore]`) |
+
+---
+
+## Fixture path
+
+```
+tests/fixtures/tiny-gemma4-assistant-mixed/
+  model.onnx
+  tokenizer.json
+  manifest.json
+  assistant/
+    model.onnx
+```
+
+---
+
+## Layer → head_dim map (for W5b assertions)
+
+| Layer index | Group name          | head_dim | Mirrors E2B |
+|-------------|---------------------|----------|-------------|
+| 0           | `sliding_attention` | **8**    | 256         |
+| 1           | `full_attention`    | **16**   | 512         |
+
+Other fixture constants: `VOCAB=32`, `HIDDEN=16` (backbone hidden size), `KV_HEADS=2`, `NUM_LAYERS=2`.
+
+---
+
+## KV output shapes (target `model.onnx`)
+
+| Output name       | Shape                                | head_dim |
+|-------------------|--------------------------------------|----------|
+| `present.0.key`   | `[batch, 2, total_seq_len, 8]`       | 8        |
+| `present.0.value` | `[batch, 2, total_seq_len, 8]`       | 8        |
+| `present.1.key`   | `[batch, 2, total_seq_len, 16]`      | 16       |
+| `present.1.value` | `[batch, 2, total_seq_len, 16]`      | 16       |
+| `logits`          | `[batch, sequence_len, 32]`          | —        |
+| `hidden_states.0` | `[batch, sequence_len, 16]`  (f32)   | —        |
+
+---
+
+## Assistant shared-KV input shapes (`assistant/model.onnx`)
+
+| Input name                          | Shape                       | head_dim |
+|-------------------------------------|-----------------------------|----------|
+| `shared_kv.sliding_attention.key`   | `[batch, 2, kv_len, 8]`     | 8        |
+| `shared_kv.sliding_attention.value` | `[batch, 2, kv_len, 8]`     | 8        |
+| `shared_kv.full_attention.key`      | `[batch, 2, kv_len, 16]`    | 16       |
+| `shared_kv.full_attention.value`    | `[batch, 2, kv_len, 16]`    | 16       |
+
+---
+
+## W5b placeholder
+
+`crates/onnx-genai-engine/tests/gemma4_assistant_mixed.rs` contains
+`gemma4_assistant_mixed_speculative_matches_plain_greedy` decorated with:
+
+```rust
+#[ignore = "enable after W3 per-layer paged cache lands (see roy-gemma4-e2b-realrun-plan.md §4 W3)"]
+```
+
+The test asserts speculative == greedy token-identity on the mixed fixture. It
+will not build-break or suite-break in any branch.
+
+**To enable after W3 lands:** remove the `#[ignore]` attribute. No fixture
+regeneration needed — the data is already committed. Confirm on CPU.
+
+The assertion that must pass:
+- `actual.token_ids == expected.token_ids`
+- `stats.proposed_tokens > 0` (proposer was active)
+- `stats.verification_steps > 0`
+
+The key runtime fix required (W3): `shared_kv_proposer_slices` in
+`speculative.rs:1246-1253` must read `head_dim`/`num_kv_heads` from the
+**per-layer** paged config for the specific target layer referenced by each
+group's `target_layers.last()`, not from a single global `materialized.head_dim`.
+
+---
+
+## Validation
+
+- Builder runs cleanly: `python3 scripts/build_tiny_gemma4_assistant_mixed.py` ✅
+- Mixed dims confirmed: layer 0 KV outputs have `head_dim=8`, layer 1 have `head_dim=16` (verified via `onnx_ir` I/O shape inspection) ✅
+- Existing suite: `cargo test -p onnx-genai-engine --lib` → 105 passed, 0 failed ✅
+- Existing integration tests: `gemma4_assistant_full` + `gemma4_assistant_metadata_smoke` → 2 passed ✅
+- New placeholder: `gemma4_assistant_mixed` → 0 passed, 1 ignored (correctly skipped) ✅
+
+---
+
+### 2026-07-14: K4 Multi-Layer KV Coverage — Pris decision note
+
+**Date:** 2026-07-14  
+**Author:** Pris (Tester)  
+**Advisory:** Chew review A1, §38 K4
+
+## What was missing
+
+The existing gold test `engine::tests::local_tiered_connector_fetch_reuse_is_token_identical`
+and all related connector round-trip tests use a **1-layer** fixture (tiny-llm),
+so the `layer_idx*2 = K, layer_idx*2+1 = V` packing contract and multi-layer
+ordering were entirely untested. A transpose or layer-index bug would not have
+been caught.
+
+## What I added
+
+Two synthetic unit tests, no ONNX model needed, no production-behavior changes.
+
+### 1. `local_tiered::tests::multi_layer_store_fetch_preserves_exact_per_layer_kv_ordering`
+
+**File:** `crates/onnx-genai-kv/src/local_tiered.rs`
+
+- Builds a `KvPayload` with **3 layers, 2 kv_heads, 3 tokens, 4 head_dim**
+  in head-major `[num_kv_heads, num_tokens, head_dim]` layout.
+- Pattern: `key[l][(h·T+t)·D+d] = 1000·l + 100·h + 10·t + d` (positive);
+  `val[l][(h·T+t)·D+d] = -(1000·l + 100·h + 10·t + d)` (negative).
+- Stores in `LocalTieredConnector`, fetches back, asserts layer-by-layer exact
+  equality on both K and V slots.
+- Catches: layer swap, K/V slot swap, head/token/dim transposition.
+
+### 2. `kv_bridge::tests::chunk_payload_from_exported_multilayer_preserves_layer_head_token_dim_ordering`
+
+**File:** `crates/onnx-genai-engine/src/kv_bridge.rs`
+
+- Constructs 3 `ExportedLayerKv` values with shape `[1, 2, 8, 4]`
+  (batch=1, 2 kv_heads, 8 tokens total, 4 head_dim).
+- Same position-encoding pattern as above.
+- Calls `chunk_payload_from_exported(&exported, config, chunk_start=3, num_tokens=4)`.
+  `chunk_start=3` ensures `token_pos ≥ 3` on all steps, cleanly exercising the
+  sequence-axis detection in `kv_tensor_axes` (avoids the benign batch/sequence
+  ambiguity that occurs only at `token_pos=0`).
+- Asserts every `(layer, K/V, head, chunk-token, dim)` cell matches the expected
+  value derived from the encoding formula.
+- No ORT runtime needed — pure unit test within the engine crate.
+
+## No production bug found
+
+The implementation is correct. The `token_pos=0` ambiguity in `kv_tensor_axes`
+is benign by construction (batch index 0 always gives the correct offset), and
+all extraction logic for `token_pos ≥ 1` is correct. This was purely a
+**test gap**, not a defect.
+
+## Test results
+
+```
+cargo test -p onnx-genai-kv --lib        → 74 passed, 0 failed
+cargo test -p onnx-genai-engine --lib    → 105 passed, 0 failed, 1 ignored
+cargo clippy -p onnx-genai-kv -p onnx-genai-engine --lib --tests -- -D warnings → clean
+```
+
+## Files changed
+
+- `crates/onnx-genai-kv/src/local_tiered.rs` — added 1 `#[tokio::test]`
+- `crates/onnx-genai-engine/src/kv_bridge.rs` — added 1 `#[test]`
+- `.squad/decisions/inbox/pris-k4-multilayer-test.md` — this note
+
+---
+
+### 2026-07-14: Milestone A ACHIEVED — real Gemma4 E2B target model, greedy decode, on CUDA
+
+**By:** Sapper
+**Status:** ✅ SUCCESS. The real 10.3 GB E2B `model.onnx` loads and generates coherent text on the H200 via the CUDA EP, target-only greedy (no speculation).
+
+---
+
+#### Result
+
+- Prompt `"<bos>The capital of France is"` → **`Paris.`**
+- Prompt `"<bos>Once upon a time, in a small village nestled deep in the mountains, there lived a young blacksmith named"` → coherent multi-paragraph story ("Elara. Elara was known throughout the village not just for her skill with the hammer and anvil, but also for her gentle spirit... a traveler, cloaked against the wind, carrying a mysterious satchel."). 160 tokens, fully coherent.
+
+#### CUDA EP evidence (user directive 确保用cuda ep)
+
+- Forced via `ONNX_GENAI_EP=cuda` (`session.rs:668 execution_providers_from_env`). Built `--features cuda` (see build-wiring note below).
+- **nvidia-smi during generation: peak 19,127 MiB VRAM** (baseline ~6 GB from another process → ~13 GB is our f16 model + ORT/cuDNN workspace) and **peak 83% GPU compute utilization**. Definitively on-GPU, not a silent CPU fallback.
+- ORT emitted `VerifyEachNodeIsAssignedToAnEp` (CUDA EP active; only shape ops on CPU as expected). No "falling back to CPU" warning.
+
+#### Performance (target-only greedy, ~160 tok, short context)
+
+- **Plain contiguous past→present KV path (`shared_buffer:false`): ~166 tok/s decode** (159 tokens in 0.957 s; load+prefill ~4.8 s).
+- O(1) share-buffer path (`shared_buffer:true`, `max_len=4096`): ~48.6 tok/s at this length — slower only because it computes attention over the full 4096-capacity buffer every step; it wins at long context. Output byte-identical to the growing path.
+
+---
+
+#### Root cause of initial garbage output — MISSING BOS (a W1 packaging gap, NOT head_dim)
+
+First runs produced degenerate `" France is France is..."`. **This was NOT the heterogeneous head_dim / KV cache** (contrary to the pre-run hypothesis). Root cause: the package tokenizer does **not** auto-prepend `<bos>`:
+- `tokenizer_config.json` has no `add_bos_token`; `tokenizer.json` `post_processor` (TemplateProcessing) adds nothing.
+- Gemma degenerates hard without BOS. Prepending the literal `<bos>` special token to the prompt immediately produced coherent output.
+- **Action for W1/export:** fix the shipped package tokenizer to auto-add BOS (set `add_bos_token: true` and/or a TemplateProcessing single-template that inserts `<bos>`). Until then, callers must prepend `<bos>`.
+
+#### Heterogeneous head_dim (256 sliding / 512 full at layers 4,9,14) — WORKS on the greedy path
+
+Confirmed empirically in BOTH the plain growing path AND the share-buffer path: identical coherent output. Roy's §0 prediction holds — plain greedy uses the head_dim-agnostic contiguous ORT past→present threading (`decode.rs:1107-1117`, opaque per-name values) and does **not** materialize from the paged cache, so the uniform-`head_dim` paged-cache assumption (`kv_bridge.rs infer_kv_model_info`, `paged_cache.rs MaterializedKv`) is never exercised by target-only greedy. **No W4 contiguous-KV fallback was needed for Milestone A.** That fallback is still required for Milestone B (shared-KV speculative), which slices the paged cache.
+
+---
+
+#### How target-only greedy was isolated from the speculative auto-path (config-driven, no model hardcoding)
+
+The shipped merged `inference_metadata.yaml` carries a `speculative:` block. With `EngineConfig::default()`, `engine.rs:266-269 shared_kv_mode_from_metadata` auto-adopts `SpeculativeMode::SharedKv` (Milestone B path) whenever that block is present. To run TARGET-ONLY, I pointed the runtime at a sibling "view" directory `~/gemma4-e2b-onnx-target/`:
+- Symlinks to the same `model.onnx`(+`.data`), `tokenizer.json`, `tokenizer_config.json` (no 10 GB copy).
+- A **stripped** `inference_metadata.yaml` with **no `speculative:` block** (so `detect_speculator` returns None → no speculative path) and **no share-buffer hints** (no `max_sequence_length`, no kv dtype → `shared_kv_buffer_len_from_metadata` returns None → `detect_model_decode_path` yields the plain contiguous `PastPresent{shared_buffer:false}`). Also dropped `sliding_window` (with it present + a share-buffer hint, `decode.rs:819-822` bails; sliding vs full attention is identical for ≤512-token greedy anyway).
+
+No model names or Gemma-specific logic in runtime code — purely metadata/config-driven.
+
+---
+
+#### Reproduce
+
+`scripts/run_target_greedy_cuda.sh` (uncommitted, left for coordinator review). It builds the target-only view dir + stripped metadata, builds `--features cuda`, sets `ONNX_GENAI_EP=cuda`, and generates. Env knobs: `SRC`, `TARGET_DIR`, `PROMPT`, `MAX_NEW_TOKENS`.
+
+#### One required code change (uncommitted, working tree)
+
+`crates/onnx-genai/Cargo.toml`: added a passthrough feature so the CLI can enable CUDA:
+```
+[features]
+default = []
+cuda = ["onnx-genai-ort/cuda"]
+```
+The CLI crate previously had no `cuda` feature, so `cargo build -p onnx-genai --features cuda` failed ("does not contain this feature"). This 3-line addition is the minimal fix; feature unification routes it to the single `onnx-genai-ort` build. Recommend committing this — the CLI is otherwise unable to select CUDA. (Left unstaged per task instructions.)
+
+#### Follow-ups for the team
+
+1. **W1/export:** ship a BOS-adding tokenizer in the E2B package (blocks coherent output for any BOS-sensitive model otherwise).
+2. **Milestone B (Roy §3d "W4 contiguous-KV fallback"):** still needed — shared-KV speculative slices the paged cache, whose per-layer geometry is inferred from layer 0 only (`kv_bridge.rs`, `paged_cache.rs MaterializedKv` single head_dim; `speculative.rs:1246-1253` reuses one global head_dim). Heterogeneous 256/512 will trip there.
+3. Consider a first-class "target-only" / "disable speculative" `EngineConfig` switch so proving a target doesn't require a stripped-metadata view dir.
+
+---
+
+### 2026-07-14: Milestone B — Milestone B — real Gemma4 E2B shared-KV speculative decode on CUDA (Leon)
+
+## Result: PASS (token-identity) ✅
+
+Ran the FULL merged package `~/gemma4-e2b-onnx/` (10.3GB E2B target + 359MB
+assistant drafter) on CUDA (H200), shared-KV speculative path auto-selected from
+the `speculative:` metadata block.
+
+- **Token-identity: TRUE** — shared-KV speculative decode is token-for-token
+  identical to plain target-only greedy on the REAL heterogeneous per-layer
+  head_dim weights (sliding hd256 / full hd512). Verified on two prompts
+  (64 and 96 tokens). This is the Milestone B correctness pass bar.
+- **CUDA EP verified** — ~34 GB peak VRAM, up to 50% GPU util during the run,
+  no ORT CPU-fallback error (only the benign "shape ops on CPU" warning).
+- **Coherent text**, e.g. `"<bos>The capital of France is"` → `" Paris.\n"`;
+  a Rayleigh-scattering paragraph for the sky-blue prompt.
+
+## Speedup + acceptance (release build, H200)
+
+| prompt | greedy tok/s | spec tok/s | speedup | acceptance | multi-accept |
+|--------|-------------:|-----------:|--------:|-----------:|-------------:|
+| capital-of-France (64) | 105.5 | 56.2 | 0.53x | 25.4% | 0 |
+| sky-blue (96)          | 110.9 | 60.0 | 0.54x | 25.3% | 0 |
+
+Speculative is currently **slower** on this model. Acceptance is ~25% with
+`multi_token_accepts == 0`: the drafter's FIRST proposed token is accepted every
+step (the shared-KV benefit), but it never gets 2+ tokens ahead, so each step
+commits ~2 tokens while paying K draft forwards + host-side KV materialization.
+Per the mission, token-identity (not speedup) is the pass bar, which is met.
+
+Likely acceptance ceiling = the `projected_state` hidden space (Sapper chose the
+backbone post-norm last_hidden_state, f32). The drafter threads its OWN
+`projected_state` output into the next `inputs_embeds`; after the first token the
+threaded state drifts from the space the assistant was trained on, so tokens 2..K
+miss. This is a speedup limiter only — the target verifies every token, so greedy
+correctness is unaffected. Not chased further here (would risk the pass bar).
+
+## Engine/ORT changes made (config-driven, model-agnostic, no hardcoding)
+
+1. `decode.rs::detect_model_decode_path` — sliding-window models now take the
+   bounded paged sliding-window path (`shared_buffer: false`) even when they also
+   declare a share-buffer-eligible KV dtype. Previously bailed ("append-only
+   shared KV buffer" guard), which blocked every fp16 GQA SWA model (Gemma-style,
+   incl. the real E2B target: `sliding_window: 512` + `kv_cache fp16`). The
+   append-only single buffer can't express windowed eviction, so it is skipped in
+   favor of the paged windowed path, not refused.
+2. `shared_kv_proposer.rs` — made dtype-agnostic. The real assistant's
+   `inputs_embeds` and `shared_kv.*` inputs are Float16 (was hardcoded Float32).
+   Activation dtype is now taken from `inputs_embeds`; shared-KV inputs must match
+   it; float outputs are read via a lossless f16→f32 widening.
+3. `value.rs` — added `Value::from_f32_slice_as(data, shape, dtype)` (f32 binds
+   directly, f16 narrows per-element). Shared by the proposer and kv_bridge.
+4. `kv_bridge.rs::load_materialized_past` — injects the target's past KV in the
+   graph's declared past-input dtype (f16 for E2B) instead of hardcoded f32. For
+   an fp16 model this is the exact inverse of the fp16→f32 widening done when
+   mirroring present KV, so no precision is lost.
+5. `onnx-genai-engine/Cargo.toml` — added a `cuda` feature forwarding to
+   `onnx-genai-ort/cuda` (mirrors the CLI passthrough), so the engine's own tests
+   can exercise the CUDA EP.
+6. `tests/milestone_b_real.rs` — env-gated (`ONNX_GENAI_MB_FULL` /
+   `ONNX_GENAI_MB_TARGET`), `#[ignore]`d real-model harness that asserts
+   token-identity and reports acceptance/speedup. No-ops without the env vars, so
+   CI stays hermetic.
+
+## Validation
+
+- `cargo test -p onnx-genai-engine --lib` (107 passed) + `--test
+  gemma4_assistant_full` + `--test gemma4_assistant_metadata_smoke` — all green.
+  Updated one lib test (`windowed_past_present_keeps_absolute_positions_with_bounded_past`)
+  that asserted the removed bail; it now asserts the paged windowed path.
+- `cargo clippy -p onnx-genai-engine --lib --tests` (+`--features cuda`) and
+  `-p onnx-genai-ort` — clean under `-D warnings`.
+
+## Follow-ups (not blocking)
+
+- Speedup: investigate the `projected_state` hidden-space / threading to lift
+  acceptance beyond the first token; and reduce per-step host-side KV
+  materialization overhead on the shared-KV verify path.
+
+---
+
+### 2026-07-14: Milestone B engine fixes review (10f82b3)
+**By:** Chew (numerics/correctness reviewer)
+**What:** 🟢 **SHIP.** Leon's fp16 shared-KV speculative decode changes are correct, config-driven, and model-agnostic. The decode-path change is narrower than it looks (it only converts a former bail into the path SWA models already used) and does not touch non-SWA models. All fp16↔f32 conversions are lossless in the required directions and layout-preserving. No new hardcoded dtype or model assumptions. Verified READ-ONLY (git show / view / grep); did not build/test/clippy per instruction.
+
+---
+
+**Why (file:line evidence):**
+
+**1. decode.rs path selection — SAFE for models other than E2B.**
+- `crates/onnx-genai-engine/src/decode.rs:817-841`. Old code: `if sliding_window.is_some() && shared_kv_max_len.is_some() { bail }` then `if sliding_window.is_some() { return paged windowed }`. New code drops the bail; `if sliding_window.is_some()` now unconditionally returns `PastPresent { shared_buffer: false, sliding_window, sink_tokens }`, logging a debug when `shared_kv_max_len` is also set.
+- **Blast radius is bounded to SWA models only.** Any model with `sliding_window == None` never enters this branch and reaches the unchanged share-buffer logic at `decode.rs:850-873` exactly as before — so non-SWA share-buffer models are **not** diverted (the stated regression risk does not occur). The only behavioral delta is: `sliding_window.is_some() && shared_kv_max_len.is_some()` now takes the paged windowed path instead of erroring, and `sliding_window.is_some()` alone was already on that same path pre-commit. The rationale is sound: an append-only single shared buffer genuinely cannot express windowed eviction, so the paged path is the correct destination for every fp16/fp32 GQA SWA model — config-driven off `sliding_window` metadata, no hardcoded model names (`sliding_window_from_metadata`, `decode.rs:882-895`).
+- **StaticCache still guards SWA first** (`decode.rs:801-810`): a SWA model that also matches the static-cache signature still bails there, unaffected.
+
+**2. Updated lib test asserts the CORRECT path, not made-to-pass.**
+- `kv_bridge.rs:1199-1210`. Was `assert!(detect_model_decode_path(&session, Some(16), Some(16), Some(2), 0).is_err())`. Now asserts `Ok(PastPresent { shared_buffer: false, max_len: None, sliding_window: Some(2), sink_tokens: None })`. I checked each field against the code: `shared_window=Some(2)` is passed through; `sink_tokens=0` → `(0 > 0).then_some(...)` = `None` (`decode.rs:840`); `max_len: None` and `shared_buffer: false` are literals on that return. The assertion is exact and correct. That `Ok(...)` also proves `StaticCacheDecodeSession::detect` returns `None` for the test session (else it would bail at `decode.rs:803`), consistent with the returned variant.
+
+**3. shared_kv_proposer.rs — dtype-agnostic, widening in the right direction.**
+- Activation dtype is derived from the graph (`float_dtype = embeds_input.dtype`, `shared_kv_proposer.rs:330`) and propagated to `signature.dtype` (:356) and to `shared_kv_specs(session, float_dtype)` which requires every `shared_kv.*` input to match it (:387-392) — internal-consistency check, no assumed dtype.
+- Inputs bind via `Value::from_f32_slice_as(..., self.signature.dtype)` (:174, :212, :215): f32 → direct copy, f16 → per-element narrow. Narrowing f32 host activations to an fp16 graph input is required (not a lossy bug) — it reproduces what a native fp16 model consumes.
+- Outputs read via `to_vec_f32_lossy()` (`:466`, and `value.rs:268-296`): f32 direct, f16 widened losslessly through the `half` crate. Engine-facing API stays f32 regardless of graph dtype. Direction is correct (widen on read, narrow on write).
+
+**4. value.rs from_f32_slice_as — narrowing correct, f32 path is a plain copy.**
+- `value.rs:164-179`. `Float32` → `from_slice_f32` (plain copy, no reinterpret). `Float16` → `half::f16::from_f32(x).to_bits()` per element (IEEE-754 round-to-nearest-even), collected into a `Vec<u16>` of length `numel`, then `from_vec_f16_bits` which validates `shape` against `data.len()` (`value.rs:203-217`). Element count is preserved (one u16 per input f32), so **no byte-count/stride bug** and no transpose — shape and data ordering are identical to the previous `from_vec_f32` call site.
+
+**5. kv_bridge.rs load_materialized_past — widen/narrow are true inverses.**
+- Mirror (capture): `mirror_present_kv_to_pages` reads present KV via `to_vec_f32_lossy()` (`kv_bridge.rs:208,217`) → fp16→f32 is exact. Paged storage holds f32.
+- Inject: `load_materialized_past` narrows back with `from_f32_slice_as(&materialized.layers[idx].{key,value}, &shape, {key,value}_dtype)` where the dtype is the graph's declared **past-input** dtype (`kv_bridge.rs:326-341`). For an fp16 model the stored f32 values are exactly fp16-representable (they originated from fp16 present outputs and are only copied/indexed by `extract_present_token`, no arithmetic), so round-to-nearest narrowing returns the identical fp16 bits → **lossless round-trip**. Shape comes from `past_shape(...)` (`:308-322`), unchanged from before, so no layout/stride change — the commit only swapped the final `Value` dtype, keeping shape and f32 ordering. Using the past-input dtype (not present-output) is the correct model contract and remains exact even in the mixed case (fp16-origin value into an f32 past input).
+
+**6. Cargo.toml — trivial passthrough confirmed.**
+- `crates/onnx-genai-engine/Cargo.toml`: `cuda = ["onnx-genai-ort/cuda"]` under a new `[features]` block with `default = []`. Exactly the requested passthrough.
+
+**No remaining hardcoded dtype/model assumptions in scope.** Grep for `Float32`/`from_vec_f32` shows the only remaining hardcoded-f32 injection is `past_kv_from_payloads` (`kv_bridge.rs:719-722`) — the *connector* KV-fetch path, which is explicitly and pre-existingly guarded by `kv_model_past_is_f32` (`kv_bridge.rs:732-748`, "Non-f32 KV ... is skipped so a dtype mismatch can never corrupt injected output"). That path is out of scope for the shared-KV speculative feature and correctly gated; not a regression.
+
+**milestone_b_real.rs** is `#[ignore]`d and no-ops without `ONNX_GENAI_MB_*` env vars (`milestone_b_real.rs:39-49`), config-driven (prompt/budget/paths from env), no model-specific logic — CI stays hermetic.
+
+---
+
+**Non-gating advisories (do not block ship):**
+- **[nit, arguably an improvement]** `detect_shared_kv_proposer` reordered so the embeds/logits/projected dtype check (`:322`) now runs *before* the `shared_kv.is_empty()` early-return (`:332`). A graph carrying the exact proposer I/O signature (`inputs_embeds` + `logits` + `projected_state`, no `mtp_hidden`) but with a non-float dtype and zero `shared_kv.*` inputs would now surface an `Err` where it previously returned `Ok(None)`. This is a near-impossible collision (that signature is proposer-specific) and the new behavior is more correct (a malformed proposer should error, not be silently ignored), so it is not a concern — just noted for awareness. Owner if ever revisited: Leon.
+- Follow-ups from Leon's decision note (speculative currently 0.53x, ~25% acceptance, `multi_token_accepts == 0` due to `projected_state` hidden-space drift) are speedup-only and do not affect greedy/token-identity correctness — the target verifies every token. Out of scope for this correctness review.
+
+**Verdict: 🟢 SHIP.** Token-identity is the Milestone B pass bar and the numerics support it: every fp16↔f32 conversion is exact in its required direction, the paged-path round-trip is a true inverse for fp16 KV, and the path-selection change cannot regress non-SWA models.

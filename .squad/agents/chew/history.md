@@ -32,3 +32,15 @@ Reviewed Leon's K4 real KV byte materialization (commit `786e268`, read-only, Le
 - **Advisory A1 → Pris:** `tiny-llm` fixture is single-layer; add multi-layer gold fixture to close cross-layer ordering dimension.
 - **Advisory A2 → Batty:** `try_connector_kv_injection` should gracefully fall back (`Ok(None)`) on `import_runner_kv` failure instead of hard-failing `generate`.
 
+
+## 2026-07-14T00-49-37Z — Gemma4 E2B real-run batch (reviews)
+
+**W2+W3 per-layer KV geometry review (commit 9db1a3c)**
+- Verdict: 🟡 SHIP-with-advisories
+- Confirmed: per-layer byte extraction, `target_layers.last()` OOB guard, per-layer page sizing, shim removal, write/read byte symmetry for hd256 and hd512
+- Advisory: connector KvPayload path uniform-only — dead code for E2B but must be fixed before enabling connector on heterogeneous model
+
+**Milestone B engine fixes review (commit 10f82b3)**
+- Verdict: 🟢 SHIP
+- Confirmed: fp16↔f32 lossless in required directions, SWA decode-path change bounded to SWA models only, updated lib test correct, widen/narrow are true inverses for past KV, `milestone_b_real.rs` CI-hermetic
+- Nit: `detect_shared_kv_proposer` reorder (non-gating, more correct behavior)

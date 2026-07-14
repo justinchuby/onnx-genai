@@ -83,3 +83,12 @@ Prompt-lookup speculation and `MtpProposer` are accepted canonical runtime miles
 ## 2026-07-13T23:50:16Z — Pending: A2 graceful recompute fallback (from Chew's K4 review)
 
 **Advisory A2 (owner: Batty):** In `try_connector_kv_injection` (`engine.rs`), a failure from `past_kv_from_payloads`/`import_runner_kv` currently propagates via `?` and hard-fails the entire `generate` call. The path is tightly gated (f32 + ZeroCopyRebind + fresh session + successful fetch), so severity is low. Recommended fix: catch the error and return `Ok(None)` to gracefully fall back to full recompute instead of aborting generation. This matches the spirit of the existing `load_materialized_past` fallback pattern.
+
+## 2026-07-14T00-49-37Z — Gemma4 E2B real-run batch (W2)
+
+**W2 — Heterogeneous per-layer KV geometry** (commit 9db1a3c, combined with Leon W3)
+- Added `LayerTensorConfig` to `onnx-genai-kv`; paged KV cache now carries per-layer `num_kv_heads`+`head_dim`
+- `new_with_layer_configs` / `new_with_layer_quant_config` constructors; `MaterializedLayerKv` with per-layer dims
+- Left uniform staging shim for Leon to remove in W3
+- `cargo test -p onnx-genai-kv --lib` → 78 passed (4 new heterogeneous tests)
+- **Chew review:** 🟡 SHIP-with-advisories — advisory: connector KvPayload path still uniform-only (dead code for E2B, fix before enabling on any mixed-geometry model)

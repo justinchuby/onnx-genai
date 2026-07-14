@@ -46,3 +46,18 @@ Replaced `KvTensorRef { size_bytes }` placeholder with `KvPayload` carrying real
 
 Chew reviewed (read-only, 🟡 SHIP-with-advisories): layout correctness confirmed. Advisories routed to Pris (A1: multi-layer fixture) and Batty (A2: graceful recompute fallback).
 
+
+## 2026-07-14T00-49-37Z — Gemma4 E2B real-run batch (W3 + Milestone B)
+
+**W3 — Engine per-layer KV migration; shim removed** (commit 9db1a3c with Batty)
+- `kv_bridge.rs`: `layer_configs_from_key_outputs` builds per-layer configs; `mirror_present_kv_to_pages` uses per-layer config
+- `engine.rs`: both paged caches use `new_with_layer_tensor_configs`
+- `speculative.rs`: `shared_kv_slices_from_materialized` reads per-group dims from `materialized.layers[target_layers.last()]`
+- Deleted `MaterializedKv::num_kv_heads/head_dim` uniform shim; 2 new per-layer unit tests
+- `cargo test -p onnx-genai-engine --lib` → 107 passed
+
+**Milestone B — Real Gemma4 E2B shared-KV speculative on CUDA** (commit 10f82b3)
+- Token-identical to greedy on real heterogeneous weights (hd256/hd512), H200 CUDA ✅
+- Engine fixes: SWA paged windowed path; dtype-agnostic proposer (f16↔f32); `Value::from_f32_slice_as`; past KV injected in graph dtype; `cuda` feature passthrough; `tests/milestone_b_real.rs`
+- **Chew review:** 🟢 SHIP
+- **Perf note:** 0.53× (acceptance ~25%, `multi_token_accepts==0`) — projected_state hidden-space; correctness unaffected; speedup follow-up deferred
