@@ -5485,7 +5485,48 @@ session = ort2.load("model.onnx", options={
 
 ---
 
-## 53. Phased Roadmap
+## 53. Weight Loading
+
+### 53.1 Supported Formats
+
+| Format | Priority | Notes |
+|--------|----------|-------|
+| **Safetensors** | Primary | mmap-friendly, zero-copy, header-indexed. Preferred for new models. |
+| **ONNX external data** | Required | Standard ONNX pattern (model.onnx + model.onnx.data). Must support. |
+| GGUF | Phase 5 | llama.cpp compat. Lower priority. |
+
+### 53.2 Loading Strategy
+
+```rust
+pub enum WeightLoadStrategy {
+    /// mmap entire file. OS handles page-in on demand.
+    /// Best for: safetensors, large models, SSD-backed tiering.
+    Mmap,
+    /// Eager read into arena. Best for: small models, GPU-only.
+    Eager,
+    /// Lazy: only load tensor when first accessed (triggered by placement plan).
+    /// Best for: offloaded models where not all weights go to GPU.
+    Lazy,
+}
+
+impl WeightLoader {
+    /// Load from safetensors (mmap, header gives tensor offsets).
+    pub fn load_safetensors(path: &Path, strategy: WeightLoadStrategy) -> Result<WeightStore>;
+
+    /// Load from ONNX external data (model.onnx.data or multiple .bin files).
+    pub fn load_onnx_external(model_path: &Path, data_paths: &[PathBuf], strategy: WeightLoadStrategy) -> Result<WeightStore>;
+}
+```
+
+### 53.3 Lazy Loading + Tiered Memory Integration
+
+With lazy loading, weights start on SSD/disk. The paged memory system (§33) pages them
+into RAM/VRAM on first access. Combined with placement plan: only weights assigned to
+GPU tier get eagerly loaded; CPU/SSD-tier weights stay lazy until needed.
+
+---
+
+## 54. Phased Roadmap
 
 ### Phase 1: Foundation (8-12 weeks)
 - [ ] `onnx-runtime-ir`: Graph IR with all types, validation, mutation API
