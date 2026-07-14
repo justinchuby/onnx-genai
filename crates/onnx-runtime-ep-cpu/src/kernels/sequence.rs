@@ -100,7 +100,8 @@ impl Kernel for RangeKernel {
                     ));
                 }
                 let count = float_range_count(start, limit, delta)?;
-                let out: Vec<f32> = (0..count).map(|i| start + i as f32 * delta).collect();
+                let mut out = alloc_range_output::<f32>(count)?;
+                out.extend((0..count).map(|i| start + i as f32 * delta));
                 write_dense_f32(&mut outputs[0], &out)
             }
             DataType::Int64 => {
@@ -115,13 +116,12 @@ impl Kernel for RangeKernel {
                     ));
                 }
                 let count = int_range_count(start, limit, delta)?;
-                let out: Result<Vec<i64>> = (0..count)
-                    .map(|i| {
-                        i64::try_from(start as i128 + i as i128 * delta as i128)
-                            .map_err(|_| EpError::KernelFailed("Range: value overflow".into()))
-                    })
-                    .collect();
-                let out = out?;
+                let mut out = alloc_range_output::<i64>(count)?;
+                for i in 0..count {
+                    let v = i64::try_from(start as i128 + i as i128 * delta as i128)
+                        .map_err(|_| EpError::KernelFailed("Range: value overflow".into()))?;
+                    out.push(v);
+                }
                 let bytes: Vec<u8> = out.iter().flat_map(|v| v.to_le_bytes()).collect();
                 write_dense_bytes(&mut outputs[0], &bytes)
             }
@@ -231,6 +231,32 @@ fn int_range_count(start: i64, limit: i64, delta: i64) -> Result<usize> {
     })
 }
 
+/// Validate a Range output's element count against byte addressability and
+/// pre-allocate its backing buffer without ever panicking.
+///
+/// `count * size_of::<T>()` must not exceed `isize::MAX` (the largest size any
+/// Rust allocation can address); otherwise `Vec` allocation/index math would
+/// panic on user-controlled inputs. We check the bound up front and fall back
+/// to `try_reserve` so an over-large request fails as a clean kernel error.
+fn alloc_range_output<T>(count: usize) -> Result<Vec<T>> {
+    let elem = std::mem::size_of::<T>();
+    let bytes = count.checked_mul(elem);
+    if bytes.is_none_or(|b| b > isize::MAX as usize) {
+        return Err(EpError::KernelFailed(format!(
+            "Range output too large: {count} elements ({} bytes) exceeds addressable limit",
+            bytes.map_or_else(|| "overflow".to_string(), |b| b.to_string()),
+        )));
+    }
+    let mut out = Vec::new();
+    out.try_reserve(count).map_err(|_| {
+        EpError::KernelFailed(format!(
+            "Range output too large: failed to allocate {count} elements ({} bytes)",
+            count * elem,
+        ))
+    })?;
+    Ok(out)
+}
+
 fn scan<T: Copy + Default>(
     values: &mut [T],
     shape: &[usize],
@@ -329,6 +355,21 @@ mod tests {
         assert_eq!(y.to_f32().len(), 2);
         assert_eq!(y.to_f32().first(), Some(&16_777_216.));
         assert_eq!(y.to_f32().last(), Some(&16_777_216.));
+    }
+    #[test]
+    fn range_int64_overflow_returns_error() {
+        // count ~= i64::MAX elements; count * size_of::<i64>() overflows the
+        // addressable-byte limit, so the kernel must return an Err before any
+        // allocation is attempted instead of panicking.
+        let a = Owned::i64(&[], &[0]);
+        let b = Owned::i64(&[], &[i64::MAX]);
+        let d = Owned::i64(&[], &[1]);
+        let mut y = Owned::zeros(DataType::Int64, &[1]);
+        let result = RangeKernel.execute(&[a.view(), b.view(), d.view()], &mut [y.view_mut()]);
+        assert!(
+            matches!(result, Err(EpError::KernelFailed(_))),
+            "expected KernelFailed, got {result:?}"
+        );
     }
     #[test]
     fn cumsum_reverse_exclusive() {
