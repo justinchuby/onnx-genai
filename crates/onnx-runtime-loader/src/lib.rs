@@ -97,6 +97,36 @@ mod error {
             domain: String,
         },
 
+        #[error(
+            "unsupported ONNX model: operator {domain}::{op_type} at node {node} carries a \
+             subgraph attribute '{attr}' (control-flow / nested-graph op). RULES #1: this runtime \
+             (ep-cpu) does not execute subgraph-bearing ops such as If/Loop/Scan yet, so the model \
+             cannot be run as-is. Expected: a flat graph with no nested subgraphs; to proceed, \
+             lower/unroll the control flow (e.g. export without dynamic loops) or wait for \
+             control-flow support"
+        )]
+        UnsupportedControlFlow {
+            op_type: String,
+            node: String,
+            domain: String,
+            attr: String,
+        },
+
+        #[error(
+            "illegal ONNX model: operator {domain}::{op_type} at node {node} consumes tensor \
+             '{tensor}', but no producer exists — it is not a graph input, not an initializer, and \
+             not produced by any upstream node. RULES #1: every consumed tensor must be sourced; \
+             the graph is structurally malformed. Expected: add '{tensor}' as a graph input or \
+             initializer, or add a node that produces it; if this is a file, the model is invalid \
+             per the ONNX spec"
+        )]
+        DanglingTensorRef {
+            op_type: String,
+            node: String,
+            domain: String,
+            tensor: String,
+        },
+
         #[error("external data file not found: {path}")]
         ExternalDataNotFound { path: PathBuf },
 
@@ -204,6 +234,8 @@ fn build_from_bytes_with_weights(
         name_map,
     } = graph_builder::build_graph(&model)?;
 
+    // Fail-fast legality check that needs no weights: reject illegal opset
+    // imports before we touch the (potentially large) weight files.
     validate_opset_imports(&graph)?;
 
     let store = weights::load_weights(&model, model_dir, &name_map)?;
@@ -211,6 +243,12 @@ fn build_from_bytes_with_weights(
     for (&vid, weight) in &store.weights {
         graph.set_initializer(vid, weight.clone());
     }
+
+    // Full fail-fast validation once initializers are attached (so
+    // initializer-backed values are recognized as sourced). Rejects
+    // statically-knowable unsupported/illegal constructs before shape
+    // inference or execution — see [`validate_model`].
+    validate_model(&graph)?;
 
     // Static/symbolic shape inference (the loader owns this seam). Run the
     // extensible per-op registry over the fully-built graph — inputs,
@@ -225,6 +263,131 @@ fn build_from_bytes_with_weights(
     registry.infer_graph(&mut graph, &opset_imports, MergePolicy::Permissive)?;
 
     Ok((graph, Arc::new(store)))
+}
+
+/// Fail-fast, load-time validation of everything statically knowable to be
+/// illegal or unsupported (RULES #1: fail at *load*, never via a silent
+/// sentinel at run time).
+///
+/// This is the single cohesive entry point wired into **both** load paths — the
+/// disk/bytes loader ([`build_from_bytes_with_weights`]) and the session's
+/// programmatic entry ([`onnx_runtime_session`]'s `from_parts`/`from_graph`) —
+/// so the checks cannot drift between the two. It runs, in order:
+///
+/// 1. [`validate_opset_imports`] — every node's domain must declare an opset.
+/// 2. [`validate_no_control_flow`] — reject subgraph-bearing ops (If/Loop/Scan
+///    and any op carrying a `GraphProto` attribute) the CPU EP cannot execute.
+/// 3. [`validate_no_dangling_refs`] — every consumed tensor must be sourced
+///    (graph input, initializer, or an upstream node output).
+///
+/// Each rejection names the offending node/op/tensor and explains what is
+/// expected. No sentinel defaults, no silent skips.
+///
+/// Structural invariants that the IR builder already enforces via
+/// [`onnx_runtime_ir::Graph::validate`] at build time — duplicate output
+/// names, dangling value ids, producer/consumer link consistency, and data
+/// dependency cycles — are intentionally *not* re-checked here to avoid drift;
+/// this function adds the checks that path does not cover.
+pub fn validate_model(graph: &Graph) -> Result<(), LoaderError> {
+    validate_opset_imports(graph)?;
+    validate_no_control_flow(graph)?;
+    validate_no_dangling_refs(graph)?;
+    Ok(())
+}
+
+/// Human-readable node label for diagnostics: the quoted ONNX node name, or a
+/// synthetic `<unnamed node #id>` when the model left it blank.
+fn node_label(node: &onnx_runtime_ir::Node) -> String {
+    if node.name.is_empty() {
+        format!("<unnamed node #{}>", node.id.0)
+    } else {
+        format!("{:?}", node.name)
+    }
+}
+
+/// Canonical display domain for a node (`""` renders as `ai.onnx`).
+fn display_domain(domain: &str) -> String {
+    if domain.is_empty() {
+        "ai.onnx".to_string()
+    } else {
+        domain.to_string()
+    }
+}
+
+/// Reject subgraph-bearing (control-flow) ops the runtime cannot execute.
+///
+/// The CPU EP has no kernels for `If`/`Loop`/`Scan` and never descends into a
+/// nested [`onnx_runtime_ir::Attribute::Graph`]/`Graphs` body, so a model that
+/// carries one would either fail lazily at run time or — worse — silently skip
+/// the subgraph. We reject it at load with a message naming the offending node
+/// and its subgraph attribute. Detection is by the presence of a `Graph`/
+/// `Graphs` attribute, so it also catches custom ops that smuggle subgraphs.
+pub fn validate_no_control_flow(graph: &Graph) -> Result<(), LoaderError> {
+    use onnx_runtime_ir::Attribute;
+
+    for (_, node) in graph.nodes.iter() {
+        // Report attributes in a deterministic order for stable diagnostics.
+        let mut subgraph_attrs: Vec<&String> = node
+            .attributes
+            .iter()
+            .filter(|(_, v)| matches!(v, Attribute::Graph(_) | Attribute::Graphs(_)))
+            .map(|(k, _)| k)
+            .collect();
+        subgraph_attrs.sort();
+        if let Some(attr) = subgraph_attrs.first() {
+            return Err(LoaderError::UnsupportedControlFlow {
+                op_type: node.op_type.clone(),
+                node: node_label(node),
+                domain: display_domain(&node.domain),
+                attr: (*attr).clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Reject graphs with a node input that has no source.
+///
+/// The graph builder materializes an unresolved input name as a fresh named
+/// value with no producer (see `graph_builder::get_or_create`); such a value is
+/// legal only if it is a graph input or an initializer. Any other producer-less
+/// consumed value is a dangling reference — a structurally malformed graph that
+/// [`onnx_runtime_ir::Graph::validate`] does not catch (it only requires graph
+/// *outputs* to be sourced, not node inputs). We reject it at load, naming the
+/// offending node and tensor.
+///
+/// Must run after initializers are attached to `graph.initializers` so
+/// initializer-backed inputs are recognized as sourced.
+pub fn validate_no_dangling_refs(graph: &Graph) -> Result<(), LoaderError> {
+    use std::collections::HashSet;
+
+    let graph_inputs: HashSet<_> = graph.inputs.iter().copied().collect();
+
+    for (_, node) in graph.nodes.iter() {
+        for vid in node.input_values() {
+            let Some(value) = graph.values.get(vid) else {
+                // A dangling value id is caught by IR-level structural
+                // validation; nothing to report here.
+                continue;
+            };
+            let is_sourced = value.producer.is_some()
+                || graph_inputs.contains(&vid)
+                || graph.initializers.contains_key(&vid);
+            if !is_sourced {
+                let tensor = value
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| format!("<anonymous value #{}>", vid.0));
+                return Err(LoaderError::DanglingTensorRef {
+                    op_type: node.op_type.clone(),
+                    node: node_label(node),
+                    domain: display_domain(&node.domain),
+                    tensor,
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Reject graphs whose nodes use an operator domain without importing its opset.

@@ -630,7 +630,7 @@ impl InferenceSession {
         model_dir: &Path,
         ep_context_config: EpContextDumpConfig,
     ) -> Result<Self> {
-        onnx_runtime_loader::validate_opset_imports(&graph)?;
+        onnx_runtime_loader::validate_model(&graph)?;
 
         let inputs = io_meta(&graph, &graph.inputs);
         let outputs = io_meta(&graph, &graph.outputs);

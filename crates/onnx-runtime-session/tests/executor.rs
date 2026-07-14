@@ -623,3 +623,53 @@ fn symbolic_input_static_dim_mismatch_is_rejected() {
         "expected ShapeMismatch on the static dim, got {err:?}"
     );
 }
+
+/// A control-flow op carrying a subgraph body is rejected at session-build time
+/// (from_graph path), mirroring the disk loader — the CPU EP cannot execute
+/// nested graphs, so we fail fast with a RULES #1 message instead of lazily at
+/// run time or silently skipping the subgraph.
+#[test]
+fn from_graph_rejects_control_flow_subgraph_at_build() {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let cond = input(&mut graph, "cond", DataType::Bool, &[1]);
+    let y = graph.create_named_value("y", DataType::Float32, static_shape([1]));
+    let mut node = Node::new(NodeId(0), "If", vec![Some(cond)], vec![y]);
+    node.name = "control_flow_if".to_string();
+    node.attributes
+        .insert("then_branch".to_string(), Attribute::Graph(Box::new(Graph::new())));
+    graph.insert_node(node);
+    graph.add_output(y);
+
+    let message = match InferenceSession::from_graph(graph) {
+        Err(err) => err.to_string(),
+        Ok(_) => panic!("control-flow subgraph unexpectedly built"),
+    };
+    assert!(message.contains("If"), "{message}");
+    assert!(message.contains("then_branch"), "{message}");
+    assert!(message.contains("control-flow"), "{message}");
+    assert!(message.contains("RULES #1"), "{message}");
+}
+
+/// A node consuming an unsourced tensor is rejected at session-build time.
+#[test]
+fn from_graph_rejects_dangling_tensor_reference_at_build() {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let x = input(&mut graph, "x", DataType::Float32, &[2]);
+    // `z` is created but never sourced (no input, initializer, or producer).
+    let z = graph.create_named_value("z", DataType::Float32, static_shape([2]));
+    let y = graph.create_named_value("y", DataType::Float32, static_shape([2]));
+    let mut node = Node::new(NodeId(0), "Add", vec![Some(x), Some(z)], vec![y]);
+    node.name = "dangling_add".to_string();
+    graph.insert_node(node);
+    graph.add_output(y);
+
+    let message = match InferenceSession::from_graph(graph) {
+        Err(err) => err.to_string(),
+        Ok(_) => panic!("dangling reference unexpectedly built"),
+    };
+    assert!(message.contains("'z'"), "{message}");
+    assert!(message.contains("Add"), "{message}");
+    assert!(message.contains("RULES #1"), "{message}");
+}

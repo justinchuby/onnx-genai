@@ -85,6 +85,17 @@ fn int_attr(name: &str, v: i64) -> onnx::AttributeProto {
     }
 }
 
+/// A `GRAPH` (subgraph body) attribute — the control-flow construct the CPU EP
+/// cannot execute.
+fn graph_attr(name: &str, subgraph: onnx::GraphProto) -> onnx::AttributeProto {
+    onnx::AttributeProto {
+        name: name.to_string(),
+        r#type: onnx::attribute_proto::AttributeType::Graph as i32,
+        g: Some(subgraph),
+        ..Default::default()
+    }
+}
+
 fn node_attrs(
     op: &str,
     inputs: &[&str],
@@ -820,4 +831,95 @@ fn bert_toy_optimized_every_value_resolves() {
             Dim::Static(8),
         ]
     );
+}
+
+// --- fail-fast load-time validation (RULES #1) ---
+
+/// A control-flow op carrying a subgraph body (`If`/`Loop`/`Scan`) is rejected
+/// at load: the CPU EP cannot execute nested graphs, so we fail fast with a
+/// message naming the node, op, domain, and subgraph attribute.
+#[test]
+fn control_flow_subgraph_op_is_rejected_at_load() {
+    let subgraph = onnx::GraphProto {
+        output: vec![value_info("then_out", 1, &[Dimlike::Static(1)])],
+        node: vec![node("Identity", &["cond"], &["then_out"])],
+        ..Default::default()
+    };
+    let mut if_node = node_attrs("If", &["cond"], &["Y"], vec![graph_attr("then_branch", subgraph)]);
+    if_node.name = "control_flow_if".to_string();
+
+    let graph = onnx::GraphProto {
+        input: vec![value_info("cond", 9, &[Dimlike::Static(1)])], // BOOL
+        output: vec![value_info("Y", 1, &[Dimlike::Static(1)])],
+        node: vec![if_node],
+        ..Default::default()
+    };
+    let bytes = model(graph, 17);
+
+    let error = onnx_runtime_loader::load_model_bytes(&bytes).unwrap_err();
+    assert!(
+        matches!(
+            &error,
+            LoaderError::UnsupportedControlFlow { op_type, node, domain, attr }
+                if op_type == "If"
+                    && node == "\"control_flow_if\""
+                    && domain == "ai.onnx"
+                    && attr == "then_branch"
+        ),
+        "got {error:?}"
+    );
+    let message = error.to_string();
+    assert!(message.contains("If"), "{message}");
+    assert!(message.contains("then_branch"), "{message}");
+    assert!(message.contains("RULES #1"), "{message}");
+    assert!(message.contains("control-flow"), "{message}");
+}
+
+/// A node consuming a tensor that is neither a graph input, an initializer, nor
+/// produced by any upstream node is a dangling reference — rejected at load with
+/// a message naming the node and the missing tensor.
+#[test]
+fn dangling_tensor_reference_is_rejected_at_load() {
+    // Add(X, Z) -> Y, where Z is undefined (no input, initializer, or producer).
+    let mut add = node("Add", &["X", "Z"], &["Y"]);
+    add.name = "dangling_add".to_string();
+    let graph = onnx::GraphProto {
+        input: vec![value_info("X", 1, &[Dimlike::Static(2)])],
+        output: vec![value_info("Y", 1, &[Dimlike::Static(2)])],
+        node: vec![add],
+        ..Default::default()
+    };
+    let bytes = model(graph, 17);
+
+    let error = onnx_runtime_loader::load_model_bytes(&bytes).unwrap_err();
+    assert!(
+        matches!(
+            &error,
+            LoaderError::DanglingTensorRef { op_type, node, tensor, .. }
+                if op_type == "Add" && node == "\"dangling_add\"" && tensor == "Z"
+        ),
+        "got {error:?}"
+    );
+    let message = error.to_string();
+    assert!(message.contains("'Z'"), "{message}");
+    assert!(message.contains("Add"), "{message}");
+    assert!(message.contains("RULES #1"), "{message}");
+    assert!(message.contains("no producer exists"), "{message}");
+}
+
+/// An initializer-backed node input is a legitimate source and must NOT be
+/// flagged as a dangling reference (regression guard against false positives:
+/// the dangling check runs only after initializers are attached).
+#[test]
+fn initializer_backed_input_is_not_dangling() {
+    let graph = onnx::GraphProto {
+        input: vec![value_info("X", 1, &[Dimlike::Static(4)])],
+        output: vec![value_info("Y", 1, &[Dimlike::Static(4)])],
+        initializer: vec![f32_initializer("B", &[4])],
+        node: vec![node("Add", &["X", "B"], &["Y"])],
+        ..Default::default()
+    };
+    let bytes = model(graph, 17);
+    onnx_runtime_loader::load_model_bytes(&bytes)
+        .expect("initializer-backed input must load without a dangling-ref error");
 }
