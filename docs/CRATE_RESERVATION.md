@@ -29,6 +29,12 @@ cargo publish -p onnx-runtime-capi
 Wait for each version to appear in the crates.io index before publishing the
 next crate that depends on it; propagation can take a short time.
 
+`onnx-runtime-shape-inference` has a test-only dependency on
+`onnx-runtime-loader` that is intentionally path-only, with no version. Cargo
+omits that dev-dependency from the published manifest, breaking the otherwise
+cyclic publish requirement while preserving local tests. This is why shape
+inference can be published before the loader in the order above.
+
 For a real release, replace each crate's explicit `0.1.0-dev.0` version with
 the chosen stable version, update all eight workspace dependency pins to the
 same exact version, rebuild, and publish again in this order. Published

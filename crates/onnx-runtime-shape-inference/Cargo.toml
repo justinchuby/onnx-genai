@@ -13,4 +13,4 @@ onnx-runtime-ir = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
-onnx-runtime-loader = { workspace = true }
+onnx-runtime-loader = { path = "../onnx-runtime-loader" }
