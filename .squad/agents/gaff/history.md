@@ -20,3 +20,7 @@ Gaff's review is now in decisions: engine.rs is a ~3,300-line god module. Refact
 ## 2026-07-14T05:04:00Z — ORT2 review: loader const-fold-lite shape inference
 
 - **squad/ort2-loader-shapeinfer** review (🟢 SHIP): No wrong constant found — every fold aborts via `?`/`None` on unknown/non-integer operands; symbolic operands degrade to fresh symbols; bounds enforced at all entry points. `bert_toy_optimized_every_value_resolves` ran on real model (257 KB, not skipped) — passed. All 27/27 tests green. Advisories: A1 `Div` truncation vs floor for negative operands (no positive-dim impact); A2 `Shape` of unresolved input folds to rank-0 (pre-existing).
+
+## 2026-07-14T07:20:00Z — ORT2 shape-inference crate review
+
+- **gaff-6:** Reviewed `onnx-runtime-shape-inference` registry dispatch, topo driver, shape-data side-table, and public API. 🟢 APPROVE. Ran 4 integrity probes: registry opset boundaries correct, driver transactional (no half-annotated state on error), shape-data per-call HashMap (no stale leakage), API minimal and panic-free. IR contract NOT modified — zero lines changed in `onnx-runtime-ir`. Roy not locked out.

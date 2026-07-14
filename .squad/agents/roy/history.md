@@ -51,3 +51,6 @@ Roy's workspace review is now in decisions: crate split is sound, but engine.rs 
 - **fact-checker** found one required fix: §21.4 `ep.context_embed_mode` default stated as `1`, ORT runtime default is `0`.
 - **roy-11:** Applied correction (§21.4 default 1→0; `EpContextGenOptions.embed_mode` → `ExternalFile`) + TOC update. Merged to main: **cf614e4** (current HEAD).
 - Roy-12 in flight: updating docs/ORT2.md §15 (CuTe Kernel Strategy) with CUDA EP stack decision — not yet landed.
+- **roy-12:** Updated docs/ORT2.md §15 (CUDA EP Kernel Strategy — cudarc + cuBLASLt + CuTe + cuDNN/FA3 stack; cuTile deferred Phase 3). Doc-only commit `edd2b3a`, merged to main.
+- **roy-13:** Authored `crates/onnx-runtime-shape-inference` on `squad/ort2-shape-inference`. Extensible per-op registry, DimExpr symbolic polynomial, shape-DATA propagation, 40+ handlers, bert_toy fully resolves. 56 tests green. Sent to review. Chew (🔴 FusedMatMul) + Holden (🔴 DimExpr overflow) rejected; Gaff (🟢 registry/driver/API) approved. Roy locked out per reviewer-protocol — Deckard assigned fix. Post-fix re-reviews both 🟢. Merged to main: **4d24634** (feat) + **f9b5caa** (fix).
+- Roy is currently in flight wiring shape-inference into loader/session — not yet landed.

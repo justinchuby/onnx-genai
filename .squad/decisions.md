@@ -822,3 +822,52 @@ correctness is unaffected. Not chased further here (would risk the pass bar).
 **Why:** Research-grade evaluation with dated citations. cuTile disqualified for primary H100/H200 (SM90) target. cudarc+cuBLASLt+CuTe stack is production-proven.
 
 ---
+
+### 2026-07-14: `onnx-runtime-shape-inference` — new crate landed
+**By:** Roy (ORT2 architect) — `squad/ort2-shape-inference`
+**What:** New pure-Rust crate implementing general symbolic shape inference over frozen `onnx-runtime-ir` Graph. 4 pillars: (1) extensible per-op registry keyed `(domain, op_type)` → version-sorted handlers; (2) `DimExpr` canonical integer polynomial (`BTreeMap<monomial, coeff>`) with checked_div for exact symbolic division; (3) shape-DATA propagation side-table tracking `Shape→Gather→Concat→Reshape` chains; (4) Strict/Permissive merge policies. 40+ op handlers including com.microsoft FusedMatMul, Conv/pool family, all transformer ops. `bert_toy_fully_resolves` (384-node graph, `num_unresolved()==0`). `#![forbid(unsafe_code)]`, 56 tests, clippy clean. Does NOT modify `onnx-runtime-ir`. IR-helper proposal deferred. Stopgaps (loader const-fold-lite, session JIT) left in place pending wiring.
+**Why:** General extensible symbolic shape engine needed as foundation for planner/allocator/cost-model work; stopgaps are bounded hacks.
+
+---
+
+### 2026-07-14: Chew review — shape-inference op correctness (🔴 REJECT)
+**By:** Chew (correctness reviewer) — `squad/ort2-shape-inference` (42 tests green at review time)
+**Verdict:** 🔴 REJECT — one blocking defect: `com.microsoft::FusedMatMul` reused plain `matmul` handler, ignoring `transA`/`transB`/`transBatch` attrs. `A=[8,64]·B=[32,64]ᵀ` (transB=1) produced `[8,64]` + spurious contraction error (correct: `[8,32]`). Fix assigned to **Deckard** (Roy locked out as author). All other ops HELD correct: MatMul, Gemm, broadcast ops, all movement/norm/pool/data handlers. Non-blocking advisories: (a) Reduce opset-18 unresolved-axes degrades to reduce-all; (b) Concat/Cast shape-data dtype hard-coded Int64; (c) GatherElements doc comment misleading.
+**Why:** FusedMatMul with transB=1 is pervasive in ORT-optimized transformer attention graphs; wrong shape silently corrupts every downstream op.
+
+---
+
+### 2026-07-14: Holden review — shape-inference DimExpr soundness (🔴 REJECT)
+**By:** Holden (soundness reviewer) — `squad/ort2-shape-inference`
+**Verdict:** 🔴 REJECT — one real soundness bug: `DimExpr` `add`/`sub`/`mul` used unchecked i64 arithmetic. Debug build panics on `2^80` product (e.g. Size of large tensor); release build wraps to bogus concrete dim. Secondary: `checked_div` `coeff % div_coeff` / `coeff / div_coeff` unguarded against `i64::MIN / -1` overflow-panic. Fix assigned to **Deckard**. All other items HELD: canonicalization uniqueness, checked_div correctness, fresh-symbol range safety (anon floor > 0x8000_0000), merge-policy soundness, ShapeData 1024-elem cap, `#![forbid(unsafe_code)]`, miri clean. Advisory: `fresh_symbol` counter unchecked `+=1` (adversarial exhaustion).
+**Why:** i64 wrap can silently write a wrong concrete dimension without error; debug panic is reachable on normal large tensors.
+
+---
+
+### 2026-07-14: Gaff review — shape-inference registry/driver/API (🟢 APPROVE)
+**By:** Gaff (graph-integrity / API-design) — `squad/ort2-shape-inference` (4 integrity probes)
+**Verdict:** 🟢 APPROVE. Registry dispatch (domain normalization, opset boundary, duplicate-replace), topo-order driver (correct read-before-write, field-level write-back via `value_mut`, multi-output, transactional on failure — proven by probe), shape-data side-table integrity (per-call HashMap, no cross-call stale leakage), API design (`InferenceRegistry`/`infer_graph`/`infer_node`, `thiserror` errors, no panic in public paths) all HELD. IR contract NOT modified. `onnx-runtime-ir` diff is zero lines. Roy not locked out. Fix agent NOT required.
+**Why:** Structural/API correctness is separate concern from per-op formulas (Chew) and algebra soundness (Holden).
+
+---
+
+### 2026-07-14: Deckard fix — shape-inference (FusedMatMul transpose + DimExpr overflow)
+**By:** Deckard (Roy locked out per reviewer-protocol) — commit `09988f3` on `squad/ort2-shape-inference`
+**What (blocking fix 1 — Chew 🔴):** New dedicated `fused_matmul` handler reads `transA`/`transB`/`transBatchA`/`transBatchB` (ORT's real A/B-suffixed names) and `alpha` (shape-neutral). `apply_fused_trans` reorders operands to plain `[batch…, row, col]` mirroring ORT `FusedMatMulShapeInference` in contrib_defs.cc; then calls shared `matmul_shape`. Rank-≤1 unchanged (matches ORT). 7 new FusedMatMul tests. **What (blocking fix 2 — Holden 🔴):** All `DimExpr` combiners use `checked_*`; overflow degrades to `DimExpr::overflow()` sentinel (poisoning, no alias via fresh-symbol bypass of intern cache). `checked_div` guards `i64::MIN/-1`. `ConstantOfShape` numel uses `checked_mul` fold. **Advisories applied:** `broadcast_dim` Permissive→fresh symbol; `fresh_symbol` saturating_add; Concat/Cast dtype from first operand; GatherElements doc corrected; Reduce opset-18 unresolved axes. **Result:** 69 tests green debug+release, clippy clean.
+**Why:** Both 🔴 rejects fully addressed; advisory items applied opportunistically.
+
+---
+
+### 2026-07-14: Chew re-review — shape-inference FusedMatMul fix (🟢 SHIP)
+**By:** Chew (correctness reviewer) — commit `09988f3`, fix author Deckard
+**Verdict:** 🟢 SHIP — 🔴 blocker fully resolved. Dedicated `fused_matmul` handler verified line-for-line against ORT contrib_defs.cc: batch prefix (`trans_batch?1:0` .. `trans_batch?rank-1:rank-2`), row (`trans?rank-1:(trans_batch?0:rank-2)`), col (`trans?(trans_batch?0:rank-2):rank-1`), rank-≤1 unchanged. Cited case `[8,64]·[32,64]ᵀ → [8,32]` correct. 7 new FusedMatMul tests pass. All 3 advisories applied. **69 tests / 0 failed.** Roy and Deckard both locked out of this artifact for any future revision cycle.
+**Why:** Required re-review after 🔴 reject; confirms fix matches ORT upstream source exactly.
+
+---
+
+### 2026-07-14: Holden re-review — shape-inference DimExpr overflow fix (🟢 GREEN)
+**By:** Holden (soundness reviewer) — commit `09988f3`, fix author Deckard
+**Verdict:** 🟢 GREEN — rejection fully addressed, no new soundness bug. Every combiner overflow-safe (add/sub/mul all `checked_*`). Overflow-degrade contract sound: `overflow()` sentinel has `overflow:true`, `as_const`/`as_symbol` both return `None`, poison propagates, **no symbol aliasing** (`SymbolInterner::lower` checks `is_overflow()` first → fresh symbol, bypasses equality cache). `checked_div` guards `i64::MIN/-1`. `ConstantOfShape` numel fold can't overflow first. `broadcast_dim` degrade-to-fresh correct. `fresh_symbol` saturating_add. **69 tests green debug AND release.** Non-blocking advisory: `movement.rs` slice-index normalization uses raw i64 on attribute-supplied indices (pre-existing, not a regression from `09988f3`; filed as follow-up).
+**Why:** Required re-review after 🔴 reject; confirms no wrap, no debug panic, no bogus alias on new overflow path.
+
+---

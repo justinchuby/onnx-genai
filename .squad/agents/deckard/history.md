@@ -97,3 +97,7 @@ Verdict: 🟢 **SHIP**.
   - **Layer C** (`onnx-runtime-ep-cpu/src/strided.rs::view_in_bounds`): i128 address math with `checked_mul`/`checked_add`; overflow → `EpError::InvalidTensorView`.
 - 4 new regression tests; all crate tests + bert_toy green; clippy clean; no new `unsafe`.
 - Holden re-review (holden-7): **🟡 SHIP**. Cherry-picked to main: **dbf2d70**, **9dcdc04**, **f749012**.
+
+## 2026-07-14T07:20:00Z — ORT2 shape-inference fix (deckard-10)
+
+- **deckard-10:** Fix owner for `onnx-runtime-shape-inference` after dual 🔴 reject (Chew: FusedMatMul; Holden: DimExpr overflow). Roy locked out. Applied two blocking fixes: (1) dedicated `fused_matmul` handler matching ORT contrib_defs.cc line-for-line; (2) all DimExpr combiners use `checked_*` with `overflow()` sentinel / degrade-to-fresh-symbol contract. Also applied all advisories (broadcast_dim fresh-symbol, saturating_add, Concat/Cast dtype, GatherElements doc, Reduce opset-18 axes). Commit `09988f3`. 69 tests green debug+release. Both re-reviews 🟢. Crate merged to main: **4d24634** + **f9b5caa**. Deckard now locked out of shape-inference artifact.

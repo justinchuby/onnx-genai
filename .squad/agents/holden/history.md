@@ -29,3 +29,8 @@ Recurring audit convention is canonical: `.github/workflows/audit.yml` runs week
 - Prior 🔴 cleared: all three fix layers (dtype.rs checked_storage_bytes, executor.rs both alloc sites, strided.rs i128 address math) confirmed correct. Original exploit vector `[2^61]`×f64 dead — `ShapeOverflow` at allocation before any buffer exists.
 - **Verdict: 🟡 SHIP-with-advisories.** Residual advisories A1 (peripheral panic paths → graceful error) and C1 (addressed_elem_range i64 before i128 widening) are memory-safe non-blocking; suggested fast-follow owner: Leon (neither Deckard nor Batty).
 - Fix cherry-picked to main: dbf2d70, 9dcdc04, f749012.
+
+## 2026-07-14T07:20:00Z — ORT2 shape-inference crate review cycle
+
+- **holden-8:** Reviewed `onnx-runtime-shape-inference` DimExpr symbolic-algebra soundness. 🔴 REJECT — `DimExpr` `add`/`sub`/`mul` used unchecked i64: debug panics, release wraps to bogus dim on large tensors (`2^80` product). Secondary: `checked_div` unguarded against `i64::MIN/-1`. All other items HELD. Fix assigned to Deckard.
+- **holden-9:** Re-reviewed Deckard's overflow fix (`09988f3`). 🟢 GREEN — all combiners use `checked_*`; `overflow()` sentinel never aliases (SymbolInterner bypasses cache); poison propagates; no wrap in debug or release. 69 tests green debug+release. Advisory noted: `movement.rs` slice-index raw i64 (pre-existing, filed as follow-up).

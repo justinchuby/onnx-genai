@@ -53,3 +53,8 @@ Reviewed Leon's K4 real KV byte materialization (commit `786e268`, read-only, Le
 
 - **squad/ort2-session** review (🟢): Verified topo-sort correctness, value dep resolution, view materialization, initializer/input binding, cache key collision-free. Hand-verified test references in Python. Minor advisories: gappy-optional compaction, cache key omits dtypes.
 - **squad/ort2-epcpu-ops** review (🟡): 90/90 tests pass. Independently verified softmax stability, broadcast, Erf accuracy, Gemm. No blocking numeric bug for bert_toy. Advisories: Softmax opset-12 guard (assign Roy/Deckard), Min NaN propagation, Cast overflow saturation vs UB (documented). Conformance harness must confirm last-axis Softmax assumption.
+
+## 2026-07-14T07:20:00Z — ORT2 shape-inference crate review cycle
+
+- **chew-15:** Reviewed `onnx-runtime-shape-inference` op-rule correctness. 🔴 REJECT — `com.microsoft::FusedMatMul` reused plain `matmul`, ignoring `transA`/`transB`/`transBatch`. Common `transB=1` case (`[8,64]·[32,64]ᵀ`) produced `[8,64]` instead of `[8,32]`. All other 40+ op handlers HELD correct. Three non-blocking advisories. Fix assigned to Deckard (Roy locked out).
+- **chew-16:** Re-reviewed Deckard's FusedMatMul fix (`09988f3`). 🟢 SHIP — handler verified line-for-line against ORT contrib_defs.cc. Cited case correct, 7 new tests pass, all advisories applied. 69/69 tests green. Roy and Deckard both locked out of this artifact.
