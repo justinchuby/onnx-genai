@@ -122,9 +122,14 @@ pub struct EpContextPartition<'a> {
 /// # Errors
 ///
 /// Beyond the loader I/O / encoding errors, this returns
-/// [`LoaderError::EpContext`] if two partitions share the **same** `source`
-/// **and** `partition_name` (an ambiguous request), or if a partition has no
-/// covered nodes.
+/// [`LoaderError::EpContext`] if a partition has no covered nodes.
+///
+/// Two partitions may legitimately share the same `source` and
+/// `partition_name` (a single EP can emit multiple compiled primary
+/// partitions, including multiple unnamed ones). The per-partition index in
+/// the sidecar filename keeps their blobs distinct, and the §55.3 consume path
+/// loads each `main_context=1` node independently, so such duplicates are not
+/// rejected here.
 ///
 /// If [`EpContextDumpConfig::enable`] is `false` this writes **nothing** (no
 /// sidecars, no ctx model) and returns the path it *would* have written to, so a
@@ -142,21 +147,6 @@ pub fn dump_ep_context(
     // construction regardless of how the caller gates.
     if !config.enable {
         return Ok(out_path);
-    }
-
-    // Reject an ambiguous request: the same (source, partition_name) identity
-    // appearing twice cannot be disambiguated on reload (both nodes would carry
-    // identical dispatch keys), so fail loudly rather than silently alias.
-    let mut identities: HashSet<(&str, &str)> = HashSet::with_capacity(partitions.len());
-    for part in partitions {
-        if !identities.insert((part.source, part.partition_name)) {
-            return Err(LoaderError::EpContext(format!(
-                "EPContext dump: duplicate partition identity (source {:?}, \
-                 partition_name {:?}) — distinct partitions must have distinct \
-                 (source, partition_name) keys",
-                part.source, part.partition_name
-            )));
-        }
     }
 
     let out_dir = out_path

@@ -316,15 +316,24 @@ fn disabled_config_writes_nothing() {
     assert!(entries.is_empty(), "disabled config writes no files at all");
 }
 
-/// **B1 exact-identity guard** — two partitions sharing the SAME `source` AND
-/// `partition_name` are an ambiguous request (both nodes would carry identical
-/// dispatch keys) and must be rejected rather than silently aliasing.
+/// **Deckard re-review regression** — a single EP can legitimately emit MULTIPLE
+/// compiled PRIMARY partitions (`main_context=1`) sharing the SAME `source` and
+/// the SAME (here empty/omitted) `partition_name`. Such duplicates are NOT an
+/// error: the injective per-partition index keeps their sidecars distinct, and
+/// the §55.3 consume path loads every `main_context=1` node independently. This
+/// asserts both distinct-index sidecars exist and each node reloads ITS OWN blob
+/// byte-exact — the case v2's blanket `(source, partition_name)` rejection wrongly
+/// blocked.
 #[test]
-fn duplicate_partition_identity_is_rejected() {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("writer_dup_identity");
+fn duplicate_primary_identity_round_trips_external() {
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("writer_dup_primary");
     std::fs::create_dir_all(&dir).unwrap();
     let orig = dir.join("m.onnx");
-    let payload = blob();
+
+    // Distinct non-UTF-8 blobs so a byte-exact round-trip is provable.
+    let b0: Vec<u8> = vec![0x00, 0x80, 0xFF, 0xC3, 0x28, 0x01];
+    let b1: Vec<u8> = vec![0x7F, 0xFE, 0xBE, 0xEF, 0x00, 0x42];
+    assert_ne!(b0, b1);
 
     let (g, p0, p1) = two_partition_graph();
     let model = Model::new(&g);
@@ -333,32 +342,57 @@ fn duplicate_partition_identity_is_rejected() {
         file_path: None,
         embed_mode: 0,
     };
+    // Same source, same (empty) partition_name, both primary — a legitimate
+    // multi-partition EP dump.
     let parts = [
         EpContextPartition {
             source: "EpA",
             ep_sdk_version: "",
-            partition_name: "same",
+            partition_name: "",
             main_context: true,
-            blob: &payload,
+            blob: &b0,
             covered_nodes: &p0,
         },
         EpContextPartition {
             source: "EpA",
             ep_sdk_version: "",
-            partition_name: "same",
+            partition_name: "",
             main_context: true,
-            blob: &payload,
+            blob: &b1,
             covered_nodes: &p1,
         },
     ];
 
-    let err = onnx_runtime_loader::dump_ep_context(&model, &orig, &parts, &config)
-        .expect_err("duplicate identity must be rejected");
-    let msg = format!("{err}");
-    assert!(
-        msg.contains("duplicate partition identity"),
-        "clear error, got: {msg}"
-    );
+    let out = onnx_runtime_loader::dump_ep_context(&model, &orig, &parts, &config)
+        .expect("duplicate primary identities dump without rejection");
+
+    // Two DISTINCT sidecars written, disambiguated purely by partition index.
+    let s0 = dir.join("m_ctx_p0_EpA.bin");
+    let s1 = dir.join("m_ctx_p1_EpA.bin");
+    assert!(s0.exists(), "partition-0 sidecar exists");
+    assert!(s1.exists(), "partition-1 sidecar exists");
+    assert_ne!(s0, s1, "distinct p{{index}} filenames despite identical identity");
+    assert_eq!(std::fs::read(&s0).unwrap(), b0, "sidecar 0 holds blob 0");
+    assert_eq!(std::fs::read(&s1).unwrap(), b1, "sidecar 1 holds blob 1");
+
+    // Reload through the consume path: each primary node resolves to its OWN blob.
+    let g2 = load_model(&out).expect("reload");
+    let mut nodes: Vec<_> = ep_context_nodes(&g2).collect();
+    assert_eq!(nodes.len(), 2, "both primary nodes present");
+    for n in &nodes {
+        assert!(n.main_context, "both nodes are primary");
+        assert_eq!(n.source, Some("EpA"));
+        assert_eq!(n.embed_mode, EmbedMode::ExternalFile);
+    }
+    // Identify each reloaded node by its boundary output name (partition 0
+    // produces "A", partition 1 produces "B") so we can tie each to its own blob.
+    nodes.sort_by_key(|n| name_of(&g2, n.outputs()[0]));
+
+    let r0 = resolve_ep_context(&dir, &nodes[0]).expect("resolve blob 0");
+    let r1 = resolve_ep_context(&dir, &nodes[1]).expect("resolve blob 1");
+    assert_eq!(r0.bytes(), &b0[..], "node 0 reloads its own blob (r0 == b0)");
+    assert_eq!(r1.bytes(), &b1[..], "node 1 reloads its own blob (r1 == b1)");
+    assert_ne!(r0.bytes(), r1.bytes(), "distinct blobs preserved (r0 != r1)");
 }
 
 /// **Gaff advisory B** — hostile `source`/`partition_name` strings (`/`, `\`,
