@@ -4580,7 +4580,218 @@ ort2 serve model.onnx --metrics-port 9090
 
 ---
 
-## 46. Phased Roadmap
+## 46. Execution Trace Log (Debug Mode)
+
+### 46.1 Purpose
+
+When something goes wrong (wrong output, slow inference, mysterious OOM), users need to
+**replay what happened** step by step. Not just timing (profiling) but full execution history:
+what was computed, what shapes flowed where, what decisions the runtime made.
+
+### 46.2 Design: Structured Execution Journal
+
+```rust
+/// Enable with: options={"debug.trace_log": "/tmp/ort2-trace.jsonl"}
+/// or: ORT2_TRACE_LOG=/tmp/ort2-trace.jsonl
+/// or: session.enable_trace_log("/tmp/trace.jsonl")
+pub struct TraceLogger {
+    output: BufWriter<File>,  // append-only JSONL
+    verbosity: TraceVerbosity,
+    /// Capture tensor values (expensive! only for small models/debugging)
+    capture_values: bool,
+}
+
+pub enum TraceVerbosity {
+    /// Decisions only: placement, optimization, memory planning.
+    /// Small file. Good for "why is it slow?" questions.
+    Decisions,
+    /// + Per-op execution with shapes and timing.
+    /// Medium file. Good for "which op is wrong?" questions.
+    Ops,
+    /// + Tensor values (inputs/outputs of each op).
+    /// HUGE file. Good for "where does the numerical error start?" questions.
+    /// Only enable for small models or specific nodes.
+    Full,
+}
+```
+
+### 46.3 What's Logged (JSONL format, one event per line)
+
+```jsonl
+{"ts":0,"phase":"load","event":"model_loaded","path":"model.onnx","opset":22,"nodes":4821,"weights_gb":140.0}
+{"ts":5,"phase":"optimize","event":"pass_start","pass":"ConstantFolding","nodes_before":4821}
+{"ts":12,"phase":"optimize","event":"pass_done","pass":"ConstantFolding","nodes_after":4650,"eliminated":171}
+{"ts":13,"phase":"optimize","event":"fusion","pattern":"MatMul+BiasAdd+Gelu→BiasGelu","nodes":["layer.0.mlp.fc1","layer.0.mlp.bias","layer.0.mlp.gelu"],"fused_to":"layer.0.mlp.BiasGelu"}
+{"ts":50,"phase":"placement","event":"ilp_solved","solve_time_ms":23,"cost":1847.3,"gpu_nodes":3200,"cpu_nodes":1450}
+{"ts":51,"phase":"placement","event":"node_placed","node":"layer.0.attn.gqa","device":"gpu:0","reason":"force_hint"}
+{"ts":52,"phase":"placement","event":"node_placed","node":"layer.31.mlp.down","device":"cpu","reason":"gpu_full"}
+{"ts":100,"phase":"memory","event":"plan_done","arena_gpu_mb":8192,"arena_cpu_mb":24000,"aliases":342}
+{"ts":101,"phase":"memory","event":"weight_placed","tensor":"layer.0.attn.q_proj.weight","size_mb":128,"tier":"vram","priority":1}
+{"ts":102,"phase":"memory","event":"weight_placed","tensor":"layer.31.mlp.gate.weight","size_mb":256,"tier":"ram","priority":78}
+{"ts":200,"phase":"run","run_id":1,"event":"run_start","inputs":{"input_ids":[1,128]}}
+{"ts":201,"phase":"run","event":"kernel_exec","node":"layer.0.attn.q_proj","op":"MatMul","kernel":"cublas_gemm","device":"gpu:0","input_shapes":[[1,128,4096],[4096,4096]],"output_shape":[1,128,4096],"duration_us":85}
+{"ts":202,"phase":"run","event":"buffer_reuse","tensor":"layer.0.attn.output","shape":[1,128,4096],"hit":true}
+{"ts":203,"phase":"run","event":"prefetch","tensor":"layer.1.attn.q_proj.weight","from":"ram","to":"vram","size_mb":128,"async":true}
+{"ts":500,"phase":"run","event":"pressure","partition":"kv_cache","used_mb":5200,"soft_limit_mb":5000,"action":"evict_lru","evicted_pages":4}
+{"ts":800,"phase":"run","run_id":1,"event":"run_done","duration_ms":12.3,"output_shapes":{"logits":[1,128,32000]}}
+```
+
+**Full verbosity adds tensor values (opt-in per node):**
+```jsonl
+{"ts":201,"phase":"run","event":"kernel_exec","node":"layer.0.attn.q_proj","values":{"input_0":"tensor:sha256:a3f2...(saved to /tmp/ort2-tensors/run1_node0_in0.npy)","output_0":"tensor:sha256:b7e1...(saved to /tmp/ort2-tensors/run1_node0_out0.npy)"}}
+```
+
+### 46.4 User API
+
+```python
+import ort2
+
+# Enable via context manager
+with ort2.trace_log("/tmp/debug.jsonl", verbosity="ops") as log:
+    session = ort2.load("model.onnx")
+    output = session.run(input_ids=data)
+# File ready for inspection
+
+# Or session-level (persistent)
+session = ort2.load("model.onnx", options={
+    "debug.trace_log": "/tmp/trace.jsonl",
+    "debug.trace_verbosity": "ops",       # decisions | ops | full
+    "debug.capture_values": "layer.5.*",  # only capture values for layer 5
+})
+
+# Or env var (no code change needed!)
+# ORT2_TRACE_LOG=/tmp/trace.jsonl ORT2_TRACE_VERBOSITY=ops python run.py
+```
+
+```bash
+# CLI: run with tracing
+ort2 run model.onnx --input data.npz --trace-log /tmp/trace.jsonl --trace-verbosity ops
+
+# Analyze the trace
+ort2 trace analyze /tmp/trace.jsonl
+
+┌───────────────────────────────────────────────────────┐
+│  Trace Analysis: /tmp/trace.jsonl                       │
+├───────────────────────────────────────────────────────┤
+│  Total runs: 1                                          │
+│  Total duration: 12.3ms                                 │
+│                                                         │
+│  Top 5 slowest ops:                                     │
+│    1. layer.15.attn.gqa  (GroupQueryAttention)  2.1ms   │
+│    2. layer.0.mlp.gate   (MatMul)              1.8ms   │
+│    3. layer.0.attn.gqa   (GroupQueryAttention)  1.6ms   │
+│    4. layer.1.mlp.gate   (MatMul)              1.5ms   │
+│    5. layer.1.attn.gqa   (GroupQueryAttention)  1.4ms   │
+│                                                         │
+│  Memory events: 3 pressure, 4 pages evicted             │
+│  Offloads: 2.3GB weights RAM→GPU prefetched             │
+│  Buffer reuse rate: 94%                                 │
+│                                                         │
+│  ⚠️  Bottleneck: layer.15.attn.gqa is 2x slower than    │
+│     other GQA ops. Possible cause: KV pages were        │
+│     evicted and re-fetched during this layer.           │
+└───────────────────────────────────────────────────────┘
+
+# Compare two traces (e.g. before/after optimization)
+ort2 trace diff trace_v1.jsonl trace_v2.jsonl
+
+# Find where numerical divergence starts (full verbosity)
+ort2 trace bisect trace_ours.jsonl trace_ort.jsonl
+  → "Divergence starts at node layer.5.attn.gqa (output differs by 1e-3)"
+```
+
+### 46.5 Trace Replay (Offline Debugging)
+
+The trace log is **replayable** — contains enough info to reconstruct what happened
+without re-running the model:
+
+```python
+# Load and query trace programmatically
+trace = ort2.TraceLog.load("/tmp/trace.jsonl")
+
+# Query specific events
+for event in trace.filter(phase="run", event="pressure"):
+    print(f"Pressure at {event.ts}ms: {event.partition} used {event.used_mb}MB")
+
+# Get execution timeline for a specific node
+node_events = trace.node_history("layer.15.attn.gqa")
+print(node_events)
+# [KernelExec(duration=2.1ms, inputs=[[1,128,4096]], prefetch_stall=0.8ms)]
+
+# Export to DataFrame for analysis
+df = trace.to_dataframe()
+df.groupby("op")["duration_us"].describe()
+```
+
+### 46.6 Automatic Diagnosis
+
+The trace analyzer can **automatically identify common problems:**
+
+```rust
+pub struct AutoDiagnosis {
+    pub issues: Vec<DiagnosedIssue>,
+}
+
+pub struct DiagnosedIssue {
+    pub severity: Severity,  // info, warning, critical
+    pub category: IssueCategory,
+    pub description: String,
+    pub evidence: Vec<TraceEvent>,
+    pub suggestion: String,
+}
+
+pub enum IssueCategory {
+    /// An op is much slower than expected (outlier detection).
+    SlowOp,
+    /// Frequent memory pressure events → thrashing.
+    MemoryThrashing,
+    /// Prefetch not hiding transfer latency (compute < transfer).
+    PrefetchStall,
+    /// Buffer reallocations (shape instability).
+    ShapeInstability,
+    /// CUDA graph not captured (shape keeps changing).
+    NoCudaGraph,
+    /// Weight on wrong tier (hot weight on CPU).
+    SuboptimalPlacement,
+    /// Numerical divergence from reference.
+    NumericalDivergence,
+}
+```
+
+```bash
+$ ort2 trace diagnose /tmp/trace.jsonl
+
+⚠️  Memory thrashing detected
+   Evidence: 12 pressure events in 500ms, same pages evicted and re-fetched
+   Root cause: KV cache and weights competing for last 2GB of VRAM
+   Fix: increase memory.vram_limit_gb or reduce context length
+
+⚠️  Prefetch stall on layers 13-20
+   Evidence: 0.8ms stall per layer waiting for weight transfer
+   Root cause: compute time (0.5ms) < transfer time (1.3ms) for these layers
+   Fix: keep these layers' weights on GPU (use placement hint "force")
+
+ℹ️  CUDA graph not captured
+   Evidence: shapes changed 3 times in first 10 runs
+   Root cause: variable sequence length inputs
+   Fix: use padding to stabilize shapes, or set vmap.batch_size=static
+```
+
+### 46.7 Design Choices
+
+| Choice | Decision | Rationale |
+|--------|----------|----------|
+| Format | JSONL (one event per line) | Streamable, grep-friendly, easy to parse |
+| Activation by default | **Off** | Zero overhead unless opted in |
+| Env var activation | **Yes** (`ORT2_TRACE_LOG`) | Debug without code change |
+| Value capture | **Opt-in per node** | Full capture = huge files; selective = manageable |
+| Auto-diagnosis | **Yes** | Most users can't read raw traces; give them answers |
+| Trace diff/bisect tools | **Yes** | Essential for "our output differs from ORT" bugs |
+| Replayable | **Yes** | Offline debugging without model/hardware access |
+
+---
+
+## 47. Phased Roadmap
 
 ### Phase 1: Foundation (8-12 weeks)
 - [ ] `onnx-runtime-ir`: Graph IR with all types, validation, mutation API
