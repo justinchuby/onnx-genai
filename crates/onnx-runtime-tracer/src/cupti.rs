@@ -152,7 +152,7 @@ unsafe impl Sync for CuptiApi {}
 /// The `Err` arm retains the searched paths and the underlying loader error so
 /// the explicit-request path can produce an actionable [`TracerError`]
 /// (RULES.md #1) instead of a silent `None`.
-static CUPTI_LIBRARY: OnceLock<std::result::Result<libloading::Library, CuptiLoadError>> =
+static CUPTI_LIBRARY: OnceLock<std::result::Result<LoadedCuptiLibrary, CuptiLoadError>> =
     OnceLock::new();
 
 /// Extra library search roots injected by an embedding runtime (e.g. the PyO3
@@ -171,6 +171,13 @@ struct CuptiLoadError {
     cause: String,
 }
 
+/// A loaded libcupti together with the paths tried through the successful
+/// candidate, retained for missing-symbol diagnostics.
+struct LoadedCuptiLibrary {
+    library: libloading::Library,
+    attempted: Vec<PathBuf>,
+}
+
 /// Inject extra library search roots (typically Python `sys.path` entries and
 /// the loaded extension module's directory) that the CUPTI loader should probe
 /// for the pip layout `<root>/nvidia/cuda_cupti/lib/libcupti.so*`.
@@ -184,16 +191,18 @@ pub fn set_search_paths(paths: Vec<PathBuf>) {
     let _ = INJECTED_SEARCH_PATHS.set(paths);
 }
 
-fn cupti_library() -> std::result::Result<&'static libloading::Library, &'static CuptiLoadError> {
+fn cupti_library() -> std::result::Result<&'static LoadedCuptiLibrary, &'static CuptiLoadError> {
     CUPTI_LIBRARY
         .get_or_init(|| {
             let candidates = libcupti_candidates();
             let mut last_error = None;
+            let mut attempted = Vec::new();
             for path in &candidates {
+                attempted.push(path.clone());
                 // SAFETY: loading a shared library runs its initializers;
                 // libcupti is a well-behaved NVIDIA library.
                 match unsafe { libloading::Library::new(path) } {
-                    Ok(library) => return Ok(library),
+                    Ok(library) => return Ok(LoadedCuptiLibrary { library, attempted }),
                     Err(error) => last_error = Some(error.to_string()),
                 }
             }
@@ -205,6 +214,25 @@ fn cupti_library() -> std::result::Result<&'static libloading::Library, &'static
             })
         })
         .as_ref()
+}
+
+fn required_symbol<T: Copy>(loaded: &LoadedCuptiLibrary, name: &'static [u8]) -> Result<T> {
+    // SAFETY: callers provide the exact C signature declared by CUPTI. The
+    // copied function pointer remains valid because the library is never
+    // unloaded.
+    unsafe { loaded.library.get::<T>(name) }
+        .map(|symbol| *symbol)
+        .map_err(|error| {
+            let symbol = String::from_utf8_lossy(name.strip_suffix(&[0]).unwrap_or(name));
+            TracerError::CuptiUnavailable {
+                attempted: loaded.attempted.clone(),
+                cause: format!(
+                    "libcupti was found and loaded, but the required CUPTI Activity API \
+                     symbol `{symbol}` is missing or unusable ({error}) — the installed \
+                     libcupti is likely too old for CUDA 13",
+                ),
+            }
+        })
 }
 
 /// Build the runtime search list for CUDA 13 CUPTI.
@@ -314,23 +342,7 @@ impl CuptiApi {
         // requested CUPTI Activity API).
         macro_rules! symbol {
             ($ty:ty, $name:literal) => {{
-                let name = $name;
-                // SAFETY: each symbol is resolved with the exact C signature
-                // declared in cupti_activity.h; we copy out the plain function
-                // pointer (`*sym`). The pointers stay valid because `lib` is
-                // never unloaded.
-                *unsafe { lib.get::<$ty>(name) }.map_err(|error| {
-                    let symbol = String::from_utf8_lossy(&name[..name.len() - 1]);
-                    TracerError::CuptiUnavailable {
-                        attempted: Vec::new(),
-                        cause: format!(
-                            "libcupti was found and loaded, but the required CUPTI \
-                             Activity API symbol `{symbol}` is missing or unusable \
-                             ({error}) — the installed libcupti is likely too old for \
-                             CUDA 13",
-                        ),
-                    }
-                })?
+                required_symbol::<$ty>(lib, $name)?
             }};
         }
 
@@ -1192,6 +1204,40 @@ mod tests {
             // The variant carries structured, debuggable context.
             assert!(matches!(err, TracerError::CuptiUnavailable { .. }));
         }
+    }
+
+    #[test]
+    fn missing_symbol_error_retains_loaded_path_and_underlying_error() {
+        let loaded_path = PathBuf::from("libc.so.6");
+        // SAFETY: libc is loaded only to exercise a real failed dlsym.
+        let library =
+            unsafe { libloading::Library::new(&loaded_path) }.expect("load libc for symbol test");
+        let loaded = LoadedCuptiLibrary {
+            library,
+            attempted: vec![loaded_path.clone()],
+        };
+        let missing_symbol = b"nxrt_cupti_symbol_that_does_not_exist\0";
+
+        let err = match required_symbol::<unsafe extern "C" fn()>(&loaded, missing_symbol) {
+            Ok(_) => panic!("test symbol unexpectedly resolved"),
+            Err(err) => err,
+        };
+        let msg = err.to_string();
+
+        assert!(msg.contains("CUPTI") && msg.to_lowercase().contains("gpu"), "WHAT missing: {msg}");
+        assert!(msg.contains("CUDA-13") || msg.contains("CUDA 13"), "WHY missing: {msg}");
+        assert!(msg.contains("pip install nvidia-cuda-cupti-cu13"), "HOW missing: {msg}");
+        assert!(msg.contains("libc.so.6"), "loaded path missing: {msg}");
+        assert!(
+            msg.contains("nxrt_cupti_symbol_that_does_not_exist"),
+            "symbol name missing: {msg}"
+        );
+        assert!(msg.contains("undefined symbol"), "underlying symbol error missing: {msg}");
+        assert!(matches!(
+            err,
+            TracerError::CuptiUnavailable { attempted, .. }
+                if attempted == vec![loaded_path]
+        ));
     }
 
     #[test]
