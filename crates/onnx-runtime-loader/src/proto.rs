@@ -1,22 +1,22 @@
 //! ONNX protobuf decoding (§19.1).
 //!
-//! In the full implementation this module wraps `prost`-generated types from
-//! `onnx.proto3` (built via a `build.rs`). For the Phase 1 skeleton it exposes
-//! only the decode entry point.
+//! The `onnx` submodule contains the `prost`-generated types compiled from the
+//! vendored `proto/onnx.proto3` (see `build.rs`). [`decode_model`] parses a
+//! serialized `ModelProto` from bytes.
+
+use prost::Message;
 
 use crate::LoaderError;
 
-/// A decoded ONNX `ModelProto`. Placeholder until the `prost` types land.
-#[derive(Debug, Default)]
-pub struct ModelProto {
-    pub ir_version: i64,
-    pub producer_name: String,
-    /// Opset imports as (domain, version) pairs.
-    pub opset_import: Vec<(String, i64)>,
+/// The `prost`-generated ONNX protobuf types (package `onnx`).
+#[allow(clippy::all, missing_docs, non_snake_case)]
+pub mod onnx {
+    include!(concat!(env!("OUT_DIR"), "/onnx.rs"));
 }
 
-/// Decode a `ModelProto` from protobuf bytes.
+pub use onnx::ModelProto;
+
+/// Decode a [`ModelProto`] from serialized protobuf bytes.
 pub fn decode_model(bytes: &[u8]) -> Result<ModelProto, LoaderError> {
-    let _ = bytes;
-    todo!("ort2-loader: prost-decode onnx.ModelProto")
+    ModelProto::decode(bytes).map_err(|e| LoaderError::ProtobufParse(e.to_string()))
 }
