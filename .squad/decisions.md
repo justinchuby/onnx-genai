@@ -1143,3 +1143,31 @@ Session unit (`option_tests`), session e2e (`tests/epcontext.rs`: byte-exact non
 **What:** Direct shape-inference packaging against crates.io currently fails because the preceding IR crate version is not yet published (not in the registry). This is expected — the runbook's documented publish sequence (ir first, then shape-inference) must be followed; packaging any crate before its registry prerequisites are uploaded will fail.
 **Why recorded:** Operational note for whoever executes the crates.io reservation upload. Not a code defect.
 
+
+### 2026-07-14T15:57:00Z: Merge — bf16 decode + shared KV (external team, `232eae5`)
+**By:** Squad (Coordinator), reviewed by bf16review (code-review) — 🟢 GREEN
+**What:** Cherry-picked the external team's `feat/bf16-e2e-decode` (`206fa9c`) onto main as `232eae5`. Adds bf16 value support in `onnx-genai-ort/src/value.rs` (stored as u16 bits, widened via `half::bf16`, never via f16 reinterpret) and bf16 shared-KV plumbing in `onnx-genai-engine/src/decode.rs`. Built + tested locally with ORT 1.27 (`.ort-cuda-1.27/root`): `cargo test -p onnx-genai-ort -p onnx-genai-engine -p onnx-genai-genai-config` all pass incl. `bf16_value_round_trips_bits`, `converts_and_enables_share_buffer_with_bf16`.
+**Why:** User: "另一个团队做了一个bf16的支持 你fetch一下然后merge进main，可以code review 有问题就改." Reviewer verified element-granular copy/slice/concat, sound unsafe u16 slices; informational finding: bf16 is share-buffer-eligible but spec-decode shared-KV paths still gate Float32|Float16 only (fails closed cleanly). External branch left intact (another team owns it).
+
+---
+
+### 2026-07-14T15:57:00Z: Design merged — `docs/PIPELINE.md` HF-parity pipeline/generate API (`f944037`)
+**By:** Squad (Coordinator); authors Zhora → Holden×2; reviewer Rachael (🔴→🔴→🟡)
+**What:** Merged the HuggingFace-parity pipeline/generate design as a 3-commit linear chain (`d214ba2`+`56ec3cd`+`f944037`). Defines `TemplateFallback{Default,Error,CallerHandles}`, requires two NEW public ORT-crate APIs as implementation follow-ups: `ChatTemplate::builtin_default()` (§6.2.1/D2a) and `Engine::tokenize`/`embed_text`. Python bindings: abi3 `cp310-abi3` + abi3t `cp315t`, min Python 3.10.
+**Why:** User asked for a transformers-like pipeline/generate API. Reviewer-rejection lockout honored: Roy then Zhora locked out across the cycle; Holden (3rd author) resolved both buildability blockers (private-ORT-internals citation → new public accessor; wheel tag cp312→cp310-abi3) and the final wording nit.
+
+---
+
+### 2026-07-14T15:57:00Z: Merge — generic CPU GEMM + feature-gated oneDNN backend (`d9976df`, ORT2 §25.2)
+**By:** Squad (Coordinator); author Pris; reviewer Bryant — 🟢 GREEN
+**What:** Cherry-picked `67a3688` → `d9976df`. Adds `backend.rs` (`CpuBackend{OneDnn,Generic}` + auto-detect), a blocked+rayon generic GEMM (MC=64/KC=256/MR=NR=4×4, `par_chunks_mut` disjoint C slices, no unsafe; ~1.6× over naive, maxdiff 8.4e-5), and a feature-gated oneDNN backend (submodule `third_party/onednn` @ v3.9.2, cmake static build, `dnnl_sgemm`). 118 tests pass on default and `--features onednn`.
+**Why:** User directive "onednn cpu" + "onednn要submodule吗?" → YES, submodule matching `third_party/cpuinfo`. KEY: `dnnl_sgemm` is ROW-major (transa=transb='N', lda=k, ldb=n, ldc=n) — do NOT apply the cuBLAS Cᵀ=BᵀAᵀ operand-swap on CPU. `onednn` is a NON-default feature so the crates.io-published surface stays pure-Rust.
+
+---
+
+### 2026-07-14T15:57:00Z: Merge — CUPTI GPU kernel collector via runtime dlopen (`f5a87c1`, §48.8.3/§49)
+**By:** Squad (Coordinator); author Sebastian; reviewer Tyrell — 🟢 GREEN
+**What:** Cherry-picked `2dfcb59` → `f5a87c1`. Adds `onnx-runtime-tracer` CUPTI collector behind feature `cupti=["dep:libloading"]`; crate attr became `#![cfg_attr(not(feature="cupti"), forbid(unsafe_code))]`, unsafe confined to `cupti.rs`. Reads GPU kernel records from the `#[repr(C,packed)]` prefix of `CUpti_ActivityKernel` via `addr_of!`+`read_unaligned` (ABI-stable — CUPTI only appends fields). libcupti dlopen'd once into a `OnceLock`, NEVER dlclose'd (avoids at-exit SIGSEGV vs the CUPTI worker thread). Graceful degradation proven; offline `--features cupti` builds; live dlopen smoke shows available=true.
+**Why:** §49 unified-tracing GPU collector. Reviewer verified `read_unaligned` packed-prefix field-for-field against real `cupti_activity.h` `CUpti_ActivityKernel10` — ABI-stable, no UB.
+
+---
