@@ -69,7 +69,9 @@ fn build_graph_proto(
         if init.name.is_empty() {
             continue;
         }
-        let dtype = DataType::from_onnx(init.data_type).unwrap_or(DataType::Float32);
+        let dtype = decode_dtype(init.data_type, || {
+            format!("initializer '{}'", init.name)
+        })?;
         let dims: Vec<usize> = init.dims.iter().map(|&d| d.max(0) as usize).collect();
         let shape: Shape = dims.into_iter().map(Dim::Static).collect();
         let vid = graph.create_named_value(init.name.clone(), dtype, shape);
@@ -85,7 +87,7 @@ fn build_graph_proto(
         if names.contains_key(&vi.name) {
             continue; // initializer-backed constant input
         }
-        let (dtype, shape) = value_info_type(graph, vi);
+        let (dtype, shape) = value_info_type(graph, vi)?;
         let vid = graph.create_named_value(vi.name.clone(), dtype, shape);
         names.insert(vi.name.clone(), vid);
         if is_top_level {
@@ -98,7 +100,7 @@ fn build_graph_proto(
         if vi.name.is_empty() || names.contains_key(&vi.name) {
             continue;
         }
-        let (dtype, shape) = value_info_type(graph, vi);
+        let (dtype, shape) = value_info_type(graph, vi)?;
         let vid = graph.create_named_value(vi.name.clone(), dtype, shape);
         names.insert(vi.name.clone(), vid);
     }
@@ -109,7 +111,7 @@ fn build_graph_proto(
             continue;
         }
         if !names.contains_key(&vi.name) {
-            let (dtype, shape) = value_info_type(graph, vi);
+            let (dtype, shape) = value_info_type(graph, vi)?;
             let vid = graph.create_named_value(vi.name.clone(), dtype, shape);
             names.insert(vi.name.clone(), vid);
         }
@@ -217,39 +219,62 @@ fn get_or_create(
     vid
 }
 
+/// Decode a raw ONNX `TensorProto.DataType` integer into an IR [`DataType`],
+/// failing closed when the runtime does not model the type. This prevents an
+/// unmodeled dtype (e.g. `COMPLEX64` = 14) from being silently mislabeled as
+/// `Float32` at any tensor-type decode site (§19.1).
+fn decode_dtype(
+    raw: i32,
+    context: impl FnOnce() -> String,
+) -> Result<DataType, LoaderError> {
+    DataType::from_onnx(raw).ok_or_else(|| LoaderError::UnsupportedDataType {
+        raw,
+        context: context(),
+    })
+}
+
 /// Extract `(dtype, shape)` from a `ValueInfoProto`'s tensor type, interning
 /// symbolic dims into `graph` by name.
-fn value_info_type(graph: &mut Graph, vi: &onnx::ValueInfoProto) -> (DataType, Shape) {
+fn value_info_type(
+    graph: &mut Graph,
+    vi: &onnx::ValueInfoProto,
+) -> Result<(DataType, Shape), LoaderError> {
     match vi.r#type.as_ref() {
-        Some(tp) => type_proto_to_dtype_shape(graph, tp),
-        None => (DataType::Float32, Vec::new()),
+        Some(tp) => type_proto_to_dtype_shape(graph, tp, &vi.name),
+        // A value-info with no type at all is genuinely untyped, not an
+        // unmodeled dtype: keep the tensor-centric placeholder default.
+        None => Ok((DataType::Float32, Vec::new())),
     }
 }
 
-fn type_proto_to_dtype_shape(graph: &mut Graph, tp: &onnx::TypeProto) -> (DataType, Shape) {
+fn type_proto_to_dtype_shape(
+    graph: &mut Graph,
+    tp: &onnx::TypeProto,
+    name: &str,
+) -> Result<(DataType, Shape), LoaderError> {
     match tp.value.as_ref() {
         Some(type_proto::Value::TensorType(t)) => {
-            let dtype = DataType::from_onnx(t.elem_type).unwrap_or(DataType::Float32);
+            let dtype = decode_dtype(t.elem_type, || format!("value-info '{name}'"))?;
             let shape = t
                 .shape
                 .as_ref()
                 .map(|s| tensor_shape_to_shape(graph, s))
                 .unwrap_or_default();
-            (dtype, shape)
+            Ok((dtype, shape))
         }
         Some(type_proto::Value::SparseTensorType(t)) => {
-            let dtype = DataType::from_onnx(t.elem_type).unwrap_or(DataType::Float32);
+            let dtype = decode_dtype(t.elem_type, || format!("value-info '{name}'"))?;
             let shape = t
                 .shape
                 .as_ref()
                 .map(|s| tensor_shape_to_shape(graph, s))
                 .unwrap_or_default();
-            (dtype, shape)
+            Ok((dtype, shape))
         }
         // Non-tensor containers (sequence/map/optional): the IR value model is
         // tensor-centric; record a placeholder type. These do not occur in the
         // Phase-1 (BERT) op set.
-        _ => (DataType::Float32, Vec::new()),
+        _ => Ok((DataType::Float32, Vec::new())),
     }
 }
 
@@ -320,7 +345,7 @@ fn convert_attribute(
             Attribute::Graphs(subs)
         }
         AT::TypeProto => match ap.tp.as_ref() {
-            Some(tp) => Attribute::TypeProto(convert_type_proto(graph, tp)),
+            Some(tp) => Attribute::TypeProto(convert_type_proto(graph, tp)?),
             None => return Ok(None),
         },
         // Field-presence fallback when `type` is UNDEFINED.
@@ -362,15 +387,18 @@ fn convert_attribute(
 }
 
 fn convert_tensor(t: &onnx::TensorProto) -> Result<TensorData, LoaderError> {
-    let dtype = DataType::from_onnx(t.data_type).unwrap_or(DataType::Float32);
+    let dtype = decode_dtype(t.data_type, || format!("attribute tensor '{}'", t.name))?;
     let dims: Vec<usize> = t.dims.iter().map(|&d| d.max(0) as usize).collect();
     tensor_data_from_proto(t, dtype, &dims)
 }
 
-fn convert_type_proto(graph: &mut Graph, tp: &onnx::TypeProto) -> TypeProto {
-    match tp.value.as_ref() {
+fn convert_type_proto(
+    graph: &mut Graph,
+    tp: &onnx::TypeProto,
+) -> Result<TypeProto, LoaderError> {
+    let ty = match tp.value.as_ref() {
         Some(type_proto::Value::TensorType(t)) => {
-            let dtype = DataType::from_onnx(t.elem_type).unwrap_or(DataType::Float32);
+            let dtype = decode_dtype(t.elem_type, || "type-proto attribute (tensor)".to_string())?;
             let shape = t
                 .shape
                 .as_ref()
@@ -379,7 +407,8 @@ fn convert_type_proto(graph: &mut Graph, tp: &onnx::TypeProto) -> TypeProto {
             TypeProto::Tensor { dtype, shape }
         }
         Some(type_proto::Value::SparseTensorType(t)) => {
-            let dtype = DataType::from_onnx(t.elem_type).unwrap_or(DataType::Float32);
+            let dtype =
+                decode_dtype(t.elem_type, || "type-proto attribute (sparse tensor)".to_string())?;
             let shape = t
                 .shape
                 .as_ref()
@@ -392,6 +421,7 @@ fn convert_type_proto(graph: &mut Graph, tp: &onnx::TypeProto) -> TypeProto {
                 .elem_type
                 .as_ref()
                 .map(|e| convert_type_proto(graph, e))
+                .transpose()?
                 .unwrap_or(TypeProto::Tensor {
                     dtype: DataType::Float32,
                     shape: Vec::new(),
@@ -403,6 +433,7 @@ fn convert_type_proto(graph: &mut Graph, tp: &onnx::TypeProto) -> TypeProto {
                 .elem_type
                 .as_ref()
                 .map(|e| convert_type_proto(graph, e))
+                .transpose()?
                 .unwrap_or(TypeProto::Tensor {
                     dtype: DataType::Float32,
                     shape: Vec::new(),
@@ -410,11 +441,12 @@ fn convert_type_proto(graph: &mut Graph, tp: &onnx::TypeProto) -> TypeProto {
             TypeProto::Optional(Box::new(inner))
         }
         Some(type_proto::Value::MapType(m)) => {
-            let key = DataType::from_onnx(m.key_type).unwrap_or(DataType::Int64);
+            let key = decode_dtype(m.key_type, || "type-proto attribute (map key)".to_string())?;
             let value = m
                 .value_type
                 .as_ref()
                 .map(|e| convert_type_proto(graph, e))
+                .transpose()?
                 .unwrap_or(TypeProto::Tensor {
                     dtype: DataType::Float32,
                     shape: Vec::new(),
@@ -428,5 +460,6 @@ fn convert_type_proto(graph: &mut Graph, tp: &onnx::TypeProto) -> TypeProto {
             dtype: DataType::Float32,
             shape: Vec::new(),
         },
-    }
+    };
+    Ok(ty)
 }

@@ -80,6 +80,9 @@ mod error {
         #[error("graph construction failed: {0}")]
         GraphBuild(String),
 
+        #[error("unsupported ONNX data_type {raw} at {context}")]
+        UnsupportedDataType { raw: i32, context: String },
+
         #[error("shape inference failed: {0}")]
         ShapeInference(#[from] onnx_runtime_shape_inference::ShapeInferError),
 

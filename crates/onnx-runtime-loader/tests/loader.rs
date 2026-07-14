@@ -307,6 +307,71 @@ fn unknown_initializer_dtype_is_load_error() {
     }
 }
 
+/// A value-info (graph input) whose tensor `elem_type` is an unmodeled ONNX
+/// dtype must fail closed with a clean `LoaderError`, never a silent Float32.
+#[test]
+fn unknown_value_info_dtype_is_load_error() {
+    // 14 = COMPLEX64 (unsupported); 99 = out-of-range/future value.
+    for bad in [14i32, 99] {
+        let g = onnx::GraphProto {
+            input: vec![value_info("X", bad, &[Dimlike::Static(2)])],
+            output: vec![value_info("Y", 1, &[Dimlike::Static(2)])],
+            node: vec![node("Identity", &["X"], &["Y"])],
+            ..Default::default()
+        };
+        let bytes = model(g, 17);
+        let err = onnx_runtime_loader::load_model_bytes(&bytes)
+            .expect_err("unknown value-info elem_type must be a load error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("data_type") && msg.contains("value-info"),
+            "error should flag the value-info dtype, got: {msg}"
+        );
+        assert!(
+            msg.contains(&bad.to_string()),
+            "error should mention the raw dtype {bad}, got: {msg}"
+        );
+    }
+}
+
+/// A `Constant` node's inline tensor `value` attribute whose `data_type` is an
+/// unmodeled ONNX dtype must fail closed, never be silently mislabeled Float32.
+#[test]
+fn unknown_attribute_tensor_dtype_is_load_error() {
+    for bad in [14i32, 99] {
+        let t = onnx::TensorProto {
+            name: "k".to_string(),
+            data_type: bad,
+            dims: vec![1],
+            raw_data: vec![0u8; 8],
+            ..Default::default()
+        };
+        let attr = onnx::AttributeProto {
+            name: "value".to_string(),
+            r#type: onnx::attribute_proto::AttributeType::Tensor as i32,
+            t: Some(t),
+            ..Default::default()
+        };
+        let g = onnx::GraphProto {
+            output: vec![value_info("C", 1, &[Dimlike::Static(1)])],
+            node: vec![node_attrs("Constant", &[], &["C"], vec![attr])],
+            ..Default::default()
+        };
+        let bytes = model(g, 17);
+        let err = onnx_runtime_loader::load_model_bytes(&bytes)
+            .expect_err("unknown attribute-tensor data_type must be a load error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("data_type") && msg.contains("attribute tensor"),
+            "error should flag the attribute tensor dtype, got: {msg}"
+        );
+        assert!(
+            msg.contains(&bad.to_string()),
+            "error should mention the raw dtype {bad}, got: {msg}"
+        );
+    }
+}
+
 /// A node attribute whose type is a tensor/type-proto list (which the IR does
 /// not model) must error rather than be silently dropped.
 #[test]

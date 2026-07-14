@@ -102,11 +102,12 @@ fn resolve_initializer(
     init: &TensorProto,
     model_dir: &Path,
 ) -> Result<WeightRef, LoaderError> {
-    let dtype = DataType::from_onnx(init.data_type)
-        .ok_or_else(|| LoaderError::GraphBuild(format!(
-            "initializer {:?} has unsupported data_type {}",
-            init.name, init.data_type
-        )))?;
+    let dtype = DataType::from_onnx(init.data_type).ok_or_else(|| {
+        LoaderError::UnsupportedDataType {
+            raw: init.data_type,
+            context: format!("initializer {:?}", init.name),
+        }
+    })?;
     let dims: Vec<usize> = init.dims.iter().map(|&d| d.max(0) as usize).collect();
 
     if init.data_location == tensor_proto::DataLocation::External as i32 {
