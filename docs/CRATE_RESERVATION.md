@@ -1,22 +1,28 @@
 # Reserving the `onnx-runtime-*` Crates
 
-All eight crates use version `0.1.0-dev.0`. Their internal dependencies are
+All nine crates use version `0.1.0-dev.0`. Their internal dependencies are
 exact-pinned to that version, so they must be published in dependency order:
 
 1. `onnx-runtime-ir`
-2. `onnx-runtime-shape-inference`
-3. `onnx-runtime-loader`
-4. `onnx-runtime-optimizer`
-5. `onnx-runtime-ep-api`
-6. `onnx-runtime-ep-cpu`
-7. `onnx-runtime-session`
-8. `onnx-runtime-capi`
+2. `onnx-runtime-tracer`
+3. `onnx-runtime-shape-inference`
+4. `onnx-runtime-loader`
+5. `onnx-runtime-optimizer`
+6. `onnx-runtime-ep-api`
+7. `onnx-runtime-ep-cpu`
+8. `onnx-runtime-session`
+9. `onnx-runtime-capi`
+
+`onnx-runtime-tracer` is a **foundational** crate like `onnx-runtime-ir`: it
+has **no internal (`onnx-runtime-*`) dependencies** (only `serde`/`serde_json`),
+so it can be published as early as slot 2, before anything depends on it.
 
 Authenticate with either `cargo login <token>` or by setting
 `CARGO_REGISTRY_TOKEN`. Then run:
 
 ```sh
 cargo publish -p onnx-runtime-ir
+cargo publish -p onnx-runtime-tracer
 cargo publish -p onnx-runtime-shape-inference
 cargo publish -p onnx-runtime-loader
 cargo publish -p onnx-runtime-optimizer
@@ -36,6 +42,6 @@ cyclic publish requirement while preserving local tests. This is why shape
 inference can be published before the loader in the order above.
 
 For a real release, replace each crate's explicit `0.1.0-dev.0` version with
-the chosen stable version, update all eight workspace dependency pins to the
+the chosen stable version, update all nine workspace dependency pins to the
 same exact version, rebuild, and publish again in this order. Published
 prerelease versions are immutable and remain on crates.io.

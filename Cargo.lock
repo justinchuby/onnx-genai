@@ -1853,6 +1853,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "onnx-runtime-tracer"
+version = "0.1.0-dev.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "oorandom"
 version = "11.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
