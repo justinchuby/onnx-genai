@@ -9,7 +9,8 @@ use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, Ten
 use onnx_runtime_ir::Node;
 
 use super::add::broadcast_apply;
-use super::{check_arity, to_dense_f32, write_dense_f32};
+use super::check_arity;
+use crate::dtype::{to_dense_f32_widen, write_dense_f32_narrow};
 
 /// f32 Gemm kernel carrying its scalar/transpose attributes.
 pub struct GemmKernel {
@@ -41,8 +42,8 @@ impl KernelFactory for GemmFactory {
 impl Kernel for GemmKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         check_arity("Gemm", inputs, outputs, 2, 3, 1)?;
-        let a = to_dense_f32(&inputs[0])?;
-        let b = to_dense_f32(&inputs[1])?;
+        let a = to_dense_f32_widen("Gemm", &inputs[0])?;
+        let b = to_dense_f32_widen("Gemm", &inputs[1])?;
         let a_shape = inputs[0].shape;
         let b_shape = inputs[1].shape;
         if a_shape.len() != 2 || b_shape.len() != 2 {
@@ -101,12 +102,12 @@ impl Kernel for GemmKernel {
 
         // Optional bias: Y += beta * C, with C broadcast to [M,N].
         if inputs.len() == 3 && self.beta != 0.0 {
-            let c = to_dense_f32(&inputs[2])?;
+            let c = to_dense_f32_widen("Gemm", &inputs[2])?;
             let beta = self.beta;
             broadcast_apply(&c, inputs[2].shape, &[m, n], |idx, v| out[idx] += beta * v)?;
         }
 
-        write_dense_f32(&mut outputs[0], &out)
+        write_dense_f32_narrow("Gemm", &mut outputs[0], &out)
     }
 
     fn supports_strided_input(&self, _input_idx: usize) -> bool {
@@ -206,5 +207,41 @@ mod tests {
         gemm(1.0, 1.0, false, false, &a, &b, Some(&c), &mut out);
         // 1*2 + 1*3 = 5, + 100 = 105
         assert_eq!(out.to_f32(), vec![105.]);
+    }
+
+    #[test]
+    fn gemm_f16_with_bias() {
+        use onnx_runtime_ir::DataType;
+        let a = Owned::f16(&[2, 3], &[1., 2., 3., 4., 5., 6.]);
+        let b = Owned::f16(&[3, 2], &[7., 8., 9., 10., 11., 12.]);
+        let c = Owned::f16(&[2], &[10., 20.]);
+        let mut out = Owned::zeros(DataType::Float16, &[2, 2]);
+        GemmKernel {
+            alpha: 1.0,
+            beta: 1.0,
+            trans_a: false,
+            trans_b: false,
+        }
+        .execute(&[a.view(), b.view(), c.view()], &mut [out.view_mut()])
+        .unwrap();
+        // [[58,64],[139,154]] + [[10,20],[10,20]]
+        assert_eq!(out.to_f16_as_f32(), vec![68., 84., 149., 174.]);
+    }
+
+    #[test]
+    fn gemm_bf16_plain() {
+        use onnx_runtime_ir::DataType;
+        let a = Owned::bf16(&[2, 3], &[1., 2., 3., 4., 5., 6.]);
+        let b = Owned::bf16(&[3, 2], &[7., 8., 9., 10., 11., 12.]);
+        let mut out = Owned::zeros(DataType::BFloat16, &[2, 2]);
+        GemmKernel {
+            alpha: 1.0,
+            beta: 1.0,
+            trans_a: false,
+            trans_b: false,
+        }
+        .execute(&[a.view(), b.view()], &mut [out.view_mut()])
+        .unwrap();
+        assert_eq!(out.to_bf16_as_f32(), vec![58., 64., 139., 154.]);
     }
 }

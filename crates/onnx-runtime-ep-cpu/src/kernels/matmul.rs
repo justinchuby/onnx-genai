@@ -20,8 +20,9 @@ use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, Ten
 use onnx_runtime_ir::{broadcast_shapes, compute_contiguous_strides, Node};
 use rayon::prelude::*;
 
-use super::{check_arity, to_dense_f32, write_dense_f32};
+use super::check_arity;
 use crate::backend::CpuBackend;
+use crate::dtype::{to_dense_f32_widen, write_dense_f32_narrow};
 use crate::strided::{next_index, numel};
 
 /// Stateless f32 MatMul kernel.
@@ -150,9 +151,10 @@ impl Kernel for MatMulKernel {
         check_arity("MatMul", inputs, outputs, 2, 2, 1)?;
         let out = matmul_dense(&inputs[0], &inputs[1])?;
         // If either operand was 1-D, the corresponding size-1 axis is squeezed
-        // out of the result; `write_dense_f32` uses the output view's own shape,
-        // so the dense buffer already matches element-for-element.
-        write_dense_f32(&mut outputs[0], &out)
+        // out of the result; the narrowing writer uses the output view's own
+        // shape and dtype (f32/f16/bf16/f64), so the buffer matches element for
+        // element and rounds to the requested precision.
+        write_dense_f32_narrow("MatMul", &mut outputs[0], &out)
     }
 
     fn supports_strided_input(&self, _input_idx: usize) -> bool {
@@ -167,11 +169,13 @@ impl Kernel for MatMulKernel {
 /// Compute `A @ B` (numpy semantics: batched, broadcast leading dims, 1-D
 /// operand promotion) into a dense row-major `Vec<f32>`.
 ///
-/// Shared by [`MatMulKernel`] and the fused `FusedMatMulBias` kernel so both go
-/// through exactly one GEMM implementation.
+/// Operands may be any float dtype (`f32`/`f16`/`bf16`/`f64`); low/medium
+/// precision inputs are widened to `f32` and the GEMM accumulates in `f32`
+/// (standard mixed-precision matmul). Shared by [`MatMulKernel`] and the fused
+/// `FusedMatMulBias` kernel so both go through exactly one GEMM implementation.
 pub(crate) fn matmul_dense(a: &TensorView, b: &TensorView) -> Result<Vec<f32>> {
-    let a_dense = to_dense_f32(a)?;
-    let b_dense = to_dense_f32(b)?;
+    let a_dense = to_dense_f32_widen("MatMul", a)?;
+    let b_dense = to_dense_f32_widen("MatMul", b)?;
 
     // Promote 1-D operands per numpy matmul: a [K] -> [1,K] (drop row after),
     // b [K] -> [K,1] (drop col after).
@@ -345,6 +349,43 @@ mod tests {
             .unwrap();
         // [1*7+2*9+3*11, 1*8+2*10+3*12] = [58, 64]
         assert_eq!(out.to_f32(), vec![58., 64.]);
+    }
+
+    #[test]
+    fn matmul_f16_accumulates_in_f32() {
+        // A[2,3] @ B[3,2] in f16; compute widens to f32, result rounds to f16.
+        let a = Owned::f16(&[2, 3], &[1., 2., 3., 4., 5., 6.]);
+        let b = Owned::f16(&[3, 2], &[7., 8., 9., 10., 11., 12.]);
+        let mut out = Owned::zeros(onnx_runtime_ir::DataType::Float16, &[2, 2]);
+        MatMulKernel
+            .execute(&[a.view(), b.view()], &mut [out.view_mut()])
+            .unwrap();
+        assert_eq!(out.to_f16_as_f32(), vec![58., 64., 139., 154.]);
+    }
+
+    #[test]
+    fn matmul_bf16_batched() {
+        let a = Owned::bf16(&[2, 2, 2], &[1., 2., 3., 4., 5., 6., 7., 8.]);
+        let b = Owned::bf16(&[2, 2, 2], &[1., 0., 0., 1., 2., 0., 0., 2.]);
+        let mut out = Owned::zeros(onnx_runtime_ir::DataType::BFloat16, &[2, 2, 2]);
+        MatMulKernel
+            .execute(&[a.view(), b.view()], &mut [out.view_mut()])
+            .unwrap();
+        assert_eq!(
+            out.to_bf16_as_f32(),
+            vec![1., 2., 3., 4., 10., 12., 14., 16.]
+        );
+    }
+
+    #[test]
+    fn matmul_rejects_integer_dtype_with_rule1() {
+        let a = Owned::i32(&[2, 2], &[1, 2, 3, 4]);
+        let b = Owned::i32(&[2, 2], &[1, 0, 0, 1]);
+        let mut out = Owned::zeros(onnx_runtime_ir::DataType::Int32, &[2, 2]);
+        let err = MatMulKernel
+            .execute(&[a.view(), b.view()], &mut [out.view_mut()])
+            .unwrap_err();
+        assert!(format!("{err}").contains("WHAT"));
     }
 
     #[test]

@@ -503,6 +503,78 @@ pub(crate) mod testutil {
             }
         }
 
+        /// An f16 buffer built by rounding `data` (given in f32) to half.
+        pub fn f16(shape: &[usize], data: &[f32]) -> Self {
+            let strides = compute_contiguous_strides(shape);
+            let mut bytes = Vec::with_capacity(data.len() * 2);
+            for &v in data {
+                bytes.extend_from_slice(&half::f16::from_f32(v).to_le_bytes());
+            }
+            Self {
+                bytes,
+                shape: shape.to_vec(),
+                strides,
+                dtype: DataType::Float16,
+            }
+        }
+
+        /// An f16 buffer built from raw 16-bit patterns (for adversarial
+        /// NaN/inf/denormal cases that must survive without f32-reinterpret).
+        pub fn f16_bits(shape: &[usize], bits: &[u16]) -> Self {
+            let strides = compute_contiguous_strides(shape);
+            let mut bytes = Vec::with_capacity(bits.len() * 2);
+            for &b in bits {
+                bytes.extend_from_slice(&b.to_le_bytes());
+            }
+            Self {
+                bytes,
+                shape: shape.to_vec(),
+                strides,
+                dtype: DataType::Float16,
+            }
+        }
+
+        /// A bf16 buffer built by rounding `data` (given in f32) to bfloat16.
+        pub fn bf16(shape: &[usize], data: &[f32]) -> Self {
+            let strides = compute_contiguous_strides(shape);
+            let mut bytes = Vec::with_capacity(data.len() * 2);
+            for &v in data {
+                bytes.extend_from_slice(&half::bf16::from_f32(v).to_le_bytes());
+            }
+            Self {
+                bytes,
+                shape: shape.to_vec(),
+                strides,
+                dtype: DataType::BFloat16,
+            }
+        }
+
+        /// A bf16 buffer built from raw 16-bit patterns.
+        pub fn bf16_bits(shape: &[usize], bits: &[u16]) -> Self {
+            let strides = compute_contiguous_strides(shape);
+            let mut bytes = Vec::with_capacity(bits.len() * 2);
+            for &b in bits {
+                bytes.extend_from_slice(&b.to_le_bytes());
+            }
+            Self {
+                bytes,
+                shape: shape.to_vec(),
+                strides,
+                dtype: DataType::BFloat16,
+            }
+        }
+
+        /// A u8 buffer.
+        pub fn u8(shape: &[usize], data: &[u8]) -> Self {
+            let strides = compute_contiguous_strides(shape);
+            Self {
+                bytes: data.to_vec(),
+                shape: shape.to_vec(),
+                strides,
+                dtype: DataType::Uint8,
+            }
+        }
+
         pub fn bool_(shape: &[usize], data: &[bool]) -> Self {
             let strides = compute_contiguous_strides(shape);
             let bytes = data.iter().map(|&b| b as u8).collect();
@@ -584,6 +656,35 @@ pub(crate) mod testutil {
 
         pub fn to_bool(&self) -> Vec<bool> {
             self.bytes.iter().map(|&b| b != 0).collect()
+        }
+
+        /// Widen an f16 buffer to f32 for comparison.
+        pub fn to_f16_as_f32(&self) -> Vec<f32> {
+            self.bytes
+                .chunks_exact(2)
+                .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
+                .collect()
+        }
+
+        /// The raw 16-bit patterns of an f16/bf16 buffer (to assert no
+        /// f32-reinterpret corruption of NaN/inf/denormal inputs).
+        pub fn to_u16_bits(&self) -> Vec<u16> {
+            self.bytes
+                .chunks_exact(2)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .collect()
+        }
+
+        /// Widen a bf16 buffer to f32 for comparison.
+        pub fn to_bf16_as_f32(&self) -> Vec<f32> {
+            self.bytes
+                .chunks_exact(2)
+                .map(|c| half::bf16::from_le_bytes([c[0], c[1]]).to_f32())
+                .collect()
+        }
+
+        pub fn to_u8(&self) -> Vec<u8> {
+            self.bytes.clone()
         }
     }
 }

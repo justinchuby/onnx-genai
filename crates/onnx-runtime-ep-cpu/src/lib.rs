@@ -27,6 +27,7 @@
 //! dense `Vec<f32>` buffers produced by the two audited accessors in [`kernels`].
 
 pub mod backend;
+pub mod dtype;
 pub mod kernels;
 pub mod provider;
 pub mod strided;

@@ -12,6 +12,7 @@ categories = ["science", "hardware-support"]
 onnx-runtime-ir = { workspace = true }
 onnx-runtime-ep-api = { workspace = true }
 thiserror = { workspace = true }
+half = "2"
 rayon = "1"
 # Pure-Rust libm (no FFI, no `cc`): supplies the correctly-rounded `erf` used by
 # the `Erf` op and the fused `Gelu` kernel. A polynomial approximation was ~1e-9

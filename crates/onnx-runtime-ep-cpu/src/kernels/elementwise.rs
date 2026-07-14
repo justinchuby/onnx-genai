@@ -17,9 +17,11 @@
 use onnx_runtime_ep_api::{Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ir::Node;
 
-use super::add::broadcast_apply;
-use super::{check_arity, to_dense_f32, write_dense_f32};
+use super::add::{broadcast_apply, require_same_dtype};
+use super::check_arity;
+use crate::dtype::{to_dense, to_dense_float, write_dense, write_dense_float, ComputeDomain, FloatElem, NumericElem};
 use crate::strided::numel;
+use crate::{dispatch_arith, dispatch_float};
 
 /// The combining operation for a binary elementwise kernel.
 #[derive(Clone, Copy)]
@@ -46,30 +48,18 @@ impl BinOp {
         }
     }
 
-    /// Fold `acc` (accumulated left value) with a new operand `v`.
-    fn apply(self, acc: f32, v: f32) -> f32 {
+    /// Fold `acc` (accumulated left value) with a new operand `v`, in the
+    /// element's compute domain. NaN-propagation for `Min`/`Max` and integer
+    /// wrapping/divide semantics live in [`ComputeDomain`], so this stays a thin
+    /// dtype-generic dispatch.
+    fn apply<C: ComputeDomain>(self, acc: C, v: C) -> C {
         match self {
-            BinOp::Sub => acc - v,
-            BinOp::Mul => acc * v,
-            BinOp::Div => acc / v,
-            BinOp::Pow => acc.powf(v),
-            // ONNX Min/Max propagate NaN (numpy `minimum`/`maximum` semantics).
-            // Rust's `f32::min`/`f32::max` SUPPRESS NaN (return the non-NaN
-            // operand), so guard explicitly before delegating.
-            BinOp::Min => {
-                if acc.is_nan() || v.is_nan() {
-                    f32::NAN
-                } else {
-                    acc.min(v)
-                }
-            }
-            BinOp::Max => {
-                if acc.is_nan() || v.is_nan() {
-                    f32::NAN
-                } else {
-                    acc.max(v)
-                }
-            }
+            BinOp::Sub => acc.c_sub(v),
+            BinOp::Mul => acc.c_mul(v),
+            BinOp::Div => acc.c_div(v),
+            BinOp::Pow => acc.c_pow(v),
+            BinOp::Min => acc.c_min(v),
+            BinOp::Max => acc.c_max(v),
         }
     }
 }
@@ -106,30 +96,41 @@ impl Kernel for BinaryKernel {
             _ => (2, 2),
         };
         check_arity(self.op.name(), inputs, outputs, min_in, max_in, 1)?;
-
-        let out_shape = outputs[0].shape.to_vec();
-        let n = numel(&out_shape);
-        let mut out = vec![0.0f32; n];
-
-        // Seed the accumulator from the first operand (broadcast to the output).
-        let first = to_dense_f32(&inputs[0])?;
-        broadcast_apply(&first, inputs[0].shape, &out_shape, |i, v| out[i] = v)?;
-
-        // Fold each remaining operand with the op's combiner.
-        for input in &inputs[1..] {
-            let rhs = to_dense_f32(input)?;
-            let op = self.op;
-            broadcast_apply(&rhs, input.shape, &out_shape, |i, v| {
-                out[i] = op.apply(out[i], v)
-            })?;
-        }
-
-        write_dense_f32(&mut outputs[0], &out)
+        let op = self.op;
+        dispatch_arith!(inputs[0].dtype, op.name(), T => binary_typed::<T>(op, inputs, outputs))
     }
 
     fn supports_strided_input(&self, _input_idx: usize) -> bool {
         true
     }
+}
+
+/// Dtype-generic binary/variadic fold: seed from the first operand, then fold
+/// each remaining operand with the op's combiner, all in `T`'s compute domain.
+fn binary_typed<T: NumericElem>(
+    op: BinOp,
+    inputs: &[TensorView],
+    outputs: &mut [TensorMut],
+) -> Result<()> {
+    let out_shape = outputs[0].shape.to_vec();
+    let n = numel(&out_shape);
+    let mut acc = vec![T::Acc::default(); n];
+
+    // Seed the accumulator from the first operand (broadcast to the output).
+    let first = to_dense::<T>(&inputs[0])?;
+    broadcast_apply(&first, inputs[0].shape, &out_shape, |i, v| acc[i] = v.to_acc())?;
+
+    // Fold each remaining operand with the op's combiner.
+    for input in &inputs[1..] {
+        require_same_dtype(op.name(), input, T::DTYPE)?;
+        let rhs = to_dense::<T>(input)?;
+        broadcast_apply(&rhs, input.shape, &out_shape, |i, v| {
+            acc[i] = op.apply(acc[i], v.to_acc())
+        })?;
+    }
+
+    let out: Vec<T> = acc.into_iter().map(T::from_acc).collect();
+    write_dense::<T>(&mut outputs[0], &out)
 }
 
 /// The per-element operation for a unary elementwise kernel.
@@ -182,14 +183,29 @@ unary_factory!(TanhFactory, UnOp::Tanh);
 impl Kernel for UnaryKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         check_arity(self.op.name(), inputs, outputs, 1, 1, 1)?;
-        let x = to_dense_f32(&inputs[0])?;
-        let y: Vec<f32> = x.iter().map(|&v| self.op.apply(v)).collect();
-        write_dense_f32(&mut outputs[0], &y)
+        let op = self.op;
+        dispatch_float!(inputs[0].dtype, op.name(), T => unary_typed::<T>(op, inputs, outputs))
     }
 
     fn supports_strided_input(&self, _input_idx: usize) -> bool {
         true
     }
+}
+
+/// Dtype-generic unary map: widen each element to `f32`, apply the (unchanged)
+/// f32 transcendental, narrow back. Float dtypes only (ONNX defines `Sqrt`,
+/// `Erf`, `Tanh` over float16/float/double/bfloat16).
+fn unary_typed<T: FloatElem>(
+    op: UnOp,
+    inputs: &[TensorView],
+    outputs: &mut [TensorMut],
+) -> Result<()> {
+    let x = to_dense_float::<T>(&inputs[0])?;
+    let y: Vec<T> = x
+        .iter()
+        .map(|&v| T::from_f32(op.apply(v.to_f32())))
+        .collect();
+    write_dense_float::<T>(&mut outputs[0], &y)
 }
 
 /// Gauss error function. Delegates to the pure-Rust `libm::erf`, which is the
@@ -393,5 +409,120 @@ mod tests {
         assert!((erf(0.5) - 0.520_499_877_813_046_5).abs() < 1e-12);
         assert!((erf(1.0) - 0.842_700_792_949_714_9).abs() < 1e-12);
         assert!((erf(2.0) - 0.995_322_265_018_952_7).abs() < 1e-12);
+    }
+
+    // --- dtype coverage ----------------------------------------------------
+
+    use onnx_runtime_ir::DataType;
+
+    #[test]
+    fn mul_f16_computes_in_f32() {
+        let a = Owned::f16(&[3, 1], &[1., 2., 3.]);
+        let b = Owned::f16(&[1, 4], &[10., 20., 30., 40.]);
+        let mut out = Owned::zeros(DataType::Float16, &[3, 4]);
+        BinaryKernel { op: BinOp::Mul }
+            .execute(&[a.view(), b.view()], &mut [out.view_mut()])
+            .unwrap();
+        assert_eq!(
+            out.to_f16_as_f32(),
+            vec![10., 20., 30., 40., 20., 40., 60., 80., 30., 60., 90., 120.]
+        );
+    }
+
+    #[test]
+    fn sub_bf16() {
+        let a = Owned::bf16(&[2, 2], &[10., 20., 30., 40.]);
+        let b = Owned::bf16(&[2, 2], &[1., 2., 3., 4.]);
+        let mut out = Owned::zeros(DataType::BFloat16, &[2, 2]);
+        BinaryKernel { op: BinOp::Sub }
+            .execute(&[a.view(), b.view()], &mut [out.view_mut()])
+            .unwrap();
+        assert_eq!(out.to_bf16_as_f32(), vec![9., 18., 27., 36.]);
+    }
+
+    #[test]
+    fn div_int32_truncates_and_guards_zero() {
+        // Integer Div is truncating; divide-by-zero yields 0 (not a panic).
+        let a = Owned::i32(&[3], &[7, -7, 5]);
+        let b = Owned::i32(&[3], &[2, 2, 0]);
+        let mut out = Owned::zeros(DataType::Int32, &[3]);
+        BinaryKernel { op: BinOp::Div }
+            .execute(&[a.view(), b.view()], &mut [out.view_mut()])
+            .unwrap();
+        assert_eq!(out.to_i32(), vec![3, -3, 0]);
+    }
+
+    #[test]
+    fn min_max_f16_propagate_nan() {
+        // NaN pattern 0x7E00 in f16; Min/Max must propagate it.
+        let a = Owned::f16_bits(&[2], &[0x7E00, 0x4000 /* 2.0 */]);
+        let b = Owned::f16(&[2], &[1.0, 5.0]);
+        let mut mn = Owned::zeros(DataType::Float16, &[2]);
+        let mut mx = Owned::zeros(DataType::Float16, &[2]);
+        BinaryKernel { op: BinOp::Min }
+            .execute(&[a.view(), b.view()], &mut [mn.view_mut()])
+            .unwrap();
+        BinaryKernel { op: BinOp::Max }
+            .execute(&[a.view(), b.view()], &mut [mx.view_mut()])
+            .unwrap();
+        // Position 0 is NaN in both.
+        assert_eq!(mn.to_u16_bits()[0] & 0x7C00, 0x7C00);
+        assert_ne!(mn.to_u16_bits()[0] & 0x03FF, 0);
+        assert_eq!(mn.to_f16_as_f32()[1], 2.0);
+        assert_eq!(mx.to_f16_as_f32()[1], 5.0);
+    }
+
+    #[test]
+    fn sqrt_f16_and_bf16() {
+        let a16 = Owned::f16(&[3], &[4., 9., 16.]);
+        let mut o16 = Owned::zeros(DataType::Float16, &[3]);
+        UnaryKernel { op: UnOp::Sqrt }
+            .execute(&[a16.view()], &mut [o16.view_mut()])
+            .unwrap();
+        assert_eq!(o16.to_f16_as_f32(), vec![2., 3., 4.]);
+
+        let ab = Owned::bf16(&[3], &[4., 9., 16.]);
+        let mut ob = Owned::zeros(DataType::BFloat16, &[3]);
+        UnaryKernel { op: UnOp::Sqrt }
+            .execute(&[ab.view()], &mut [ob.view_mut()])
+            .unwrap();
+        assert_eq!(ob.to_bf16_as_f32(), vec![2., 3., 4.]);
+    }
+
+    #[test]
+    fn tanh_f16_matches_f32_within_tolerance() {
+        let a = Owned::f16(&[3], &[0., 1., -1.]);
+        let mut out = Owned::zeros(DataType::Float16, &[3]);
+        UnaryKernel { op: UnOp::Tanh }
+            .execute(&[a.view()], &mut [out.view_mut()])
+            .unwrap();
+        let r = out.to_f16_as_f32();
+        assert!(r[0].abs() < 1e-2);
+        assert!((r[1] - 0.7616).abs() < 1e-2);
+        assert!((r[2] + 0.7616).abs() < 1e-2);
+    }
+
+    #[test]
+    fn erf_bf16_reaches_dtype_without_touching_formula() {
+        // Erf's numeric formula is unchanged; the dtype dispatch simply widens.
+        let a = Owned::bf16(&[2], &[0., 1.]);
+        let mut out = Owned::zeros(DataType::BFloat16, &[2]);
+        UnaryKernel { op: UnOp::Erf }
+            .execute(&[a.view()], &mut [out.view_mut()])
+            .unwrap();
+        let r = out.to_bf16_as_f32();
+        assert!(r[0].abs() < 1e-2);
+        assert!((r[1] - 0.8427).abs() < 5e-2); // bf16 has ~3 significant digits
+    }
+
+    #[test]
+    fn sqrt_rejects_integer_dtype_with_rule1() {
+        let a = Owned::i32(&[2], &[4, 9]);
+        let mut out = Owned::zeros(DataType::Int32, &[2]);
+        let err = UnaryKernel { op: UnOp::Sqrt }
+            .execute(&[a.view()], &mut [out.view_mut()])
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("WHAT") && msg.contains("HOW"));
     }
 }
