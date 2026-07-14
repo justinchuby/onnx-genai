@@ -1,0 +1,23 @@
+[package]
+name = "onnx-runtime-ep-cuda"
+description = "CUDA execution provider for the ORT 2.0 runtime (Phase 2a: cudarc + cuBLASLt MatMul; custom fused kernels deferred)"
+version = "0.1.0-dev.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords = ["onnx", "cuda", "execution-provider", "cublaslt", "runtime"]
+categories = ["science", "hardware-support"]
+
+[dependencies]
+onnx-runtime-ir = { workspace = true }
+onnx-runtime-ep-api = { workspace = true }
+thiserror = { workspace = true }
+
+# cudarc: pure-Rust CUDA bindings (docs/ORT2.md §15.2). Pinned to the CUDA 13.0
+# API set (the runtime libs on the target host are libcublasLt.so.13 / cudart 13)
+# and `dynamic-loading` so `cargo build` needs NO CUDA toolkit — the driver and
+# cuBLASLt are dlopen'd at runtime. `f16` pulls in `half` for f16/bf16 GEMM.
+[dependencies.cudarc]
+version = "0.19"
+default-features = false
+features = ["std", "driver", "cublaslt", "f16", "cuda-13000", "dynamic-loading"]

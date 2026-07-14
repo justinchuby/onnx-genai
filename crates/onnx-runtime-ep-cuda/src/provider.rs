@@ -1,0 +1,210 @@
+//! The [`CudaExecutionProvider`]: a GPU execution provider backed by cudarc +
+//! cuBLASLt (`docs/ORT2.md` §15). Phase 2a wires standard GEMM (`MatMul`) only;
+//! everything else returns an actionable "not implemented in CUDA EP Phase 2a"
+//! error rather than silently falling back or panicking.
+//!
+//! # Memory & safety model
+//!
+//! Mirrors the ep-api safety contract used by the CPU EP, but the buffers live
+//! in **device** memory:
+//!
+//! 1. **Owner-frees** — every [`allocate`](CudaExecutionProvider::allocate)
+//!    (`cuMemAlloc`) pairs with exactly one
+//!    [`deallocate`](CudaExecutionProvider::deallocate) (`cuMemFree`).
+//!    [`onnx_runtime_ep_api::DeviceBuffer`] has no `Drop`, so a dropped handle
+//!    leaks but never double-frees.
+//! 2. **No cross-EP free** — `deallocate`/`copy` assert the buffer's device
+//!    matches this EP's `CUDA:ordinal`.
+//! 3. **Bounds** — `copy` rejects a `size` larger than either endpoint.
+//! 4. **Opaque device pointers** — a CUDA device pointer is *not* host-
+//!    dereferenceable; it only travels between `allocate`, `copy`, and kernels,
+//!    exactly as [`onnx_runtime_ep_api::DeviceBuffer`] documents for CUDA.
+
+use std::sync::Arc;
+
+use onnx_runtime_ep_api::{
+    Cost, DeviceBuffer, EpConfig, EpError, ExecutionProvider, Fence, Kernel, KernelMatch,
+    OpRegistry, Result,
+};
+use onnx_runtime_ir::{DeviceId, DeviceType, Node, Shape, TensorLayout};
+
+use crate::kernels::build_cuda_registry;
+use crate::runtime::{cuptr, raw_ptr, CudaRuntime};
+
+/// CUDA execution provider (Phase 2a: cudarc + cuBLASLt GEMM).
+///
+/// Unlike the always-available CPU EP, this provider needs a real device, so
+/// [`CudaExecutionProvider::new`] is **fallible** — it returns an error when no
+/// CUDA device is present or the driver / cuBLASLt cannot be loaded. Callers on
+/// a machine without a GPU should treat that error as "CUDA EP unavailable".
+pub struct CudaExecutionProvider {
+    device: DeviceId,
+    runtime: Arc<CudaRuntime>,
+    initialized: bool,
+    registry: OpRegistry,
+}
+
+impl std::fmt::Debug for CudaExecutionProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CudaExecutionProvider")
+            .field("device", &self.device)
+            .field("initialized", &self.initialized)
+            .field("registered_ops", &self.registry.len())
+            .finish()
+    }
+}
+
+impl CudaExecutionProvider {
+    /// Construct a CUDA EP bound to `CUDA:ordinal` with the Phase-2a kernels
+    /// registered. Fails if the device or CUDA libraries are unavailable.
+    pub fn new(ordinal: u32) -> Result<Self> {
+        let runtime = Arc::new(CudaRuntime::new(ordinal)?);
+        let registry = build_cuda_registry(runtime.clone());
+        Ok(Self {
+            device: DeviceId::cuda(ordinal),
+            runtime,
+            initialized: false,
+            registry,
+        })
+    }
+
+    /// Construct a CUDA EP on the default device (`CUDA:0`).
+    pub fn new_default() -> Result<Self> {
+        Self::new(0)
+    }
+
+    /// Borrow the CUDA op registry (shared with the session layer).
+    pub fn registry(&self) -> &OpRegistry {
+        &self.registry
+    }
+
+    /// Borrow the shared CUDA runtime (context + stream + cuBLASLt handle).
+    pub fn runtime(&self) -> &Arc<CudaRuntime> {
+        &self.runtime
+    }
+}
+
+impl ExecutionProvider for CudaExecutionProvider {
+    fn name(&self) -> &str {
+        "cuda_ep"
+    }
+
+    fn device_type(&self) -> DeviceType {
+        DeviceType::Cuda
+    }
+
+    fn device_id(&self) -> DeviceId {
+        self.device
+    }
+
+    fn initialize(&mut self, _config: &EpConfig) -> Result<()> {
+        // The context, stream, and cuBLASLt handle are created eagerly in
+        // `new`; binding here confirms the device is reachable on this thread.
+        self.runtime.bind()?;
+        self.initialized = true;
+        Ok(())
+    }
+
+    fn shutdown(&mut self) -> Result<()> {
+        self.initialized = false;
+        Ok(())
+    }
+
+    fn supports_op(&self, op: &Node, shapes: &[Shape], _layouts: &[TensorLayout]) -> KernelMatch {
+        // Model-agnostic: keyed on (op_type, domain) via the registry, the same
+        // single source of truth the CPU EP uses. Phase 2a registers `MatMul`
+        // only; anything else is Unsupported so placement routes it elsewhere
+        // (typically the CPU EP) instead of hard-failing at dispatch.
+        if !self.registry.supports(&op.op_type, &op.domain) {
+            return KernelMatch::Unsupported;
+        }
+        let output_layouts = vec![TensorLayout::contiguous(); op.outputs.len()];
+        let elems: u64 = shapes
+            .iter()
+            .map(|s| {
+                s.iter()
+                    .map(|d| d.as_static().unwrap_or(1) as u64)
+                    .product::<u64>()
+            })
+            .sum();
+        // GPU compute is cheap per element but launch latency is high; bias the
+        // rough estimate accordingly so tiny ops still prefer the CPU EP. The
+        // real cost model lands in Phase 2.
+        let cost = Cost::new(elems as f64 * 0.01, elems as f64 * 0.01, 0.0)
+            .with_launch_us(10.0)
+            .with_bytes_moved(elems.saturating_mul(4));
+        KernelMatch::Supported {
+            cost,
+            required_input_layouts: None,
+            output_layouts,
+        }
+    }
+
+    fn get_kernel(&self, op: &Node, shapes: &[Vec<usize>], opset: u64) -> Result<Box<dyn Kernel>> {
+        let factory = self
+            .registry
+            .lookup(&op.op_type, &op.domain, opset)
+            .ok_or_else(|| EpError::NoEpForOp {
+                op_type: op.op_type.clone(),
+            })?;
+        factory.create(op, shapes)
+    }
+
+    fn allocate(&self, size: usize, alignment: usize) -> Result<DeviceBuffer> {
+        if alignment == 0 || !alignment.is_power_of_two() {
+            return Err(EpError::AlignmentError);
+        }
+        // cuMemAlloc returns at least 256-byte-aligned device pointers, which
+        // satisfies any realistic tensor alignment; we still record the
+        // requested `alignment` on the handle for symmetry with the CPU EP.
+        let dptr = self.runtime.alloc_raw(size)?;
+        // SAFETY: `dptr` is a fresh, unique, non-null device allocation of
+        // >= `size` bytes owned by this EP and freed exactly once in
+        // `deallocate`. It is a device address, never dereferenced on the host.
+        Ok(unsafe { DeviceBuffer::from_raw_parts(raw_ptr(dptr), self.device, size, alignment) })
+    }
+
+    fn deallocate(&self, buffer: DeviceBuffer) -> Result<()> {
+        assert_eq!(
+            buffer.device(),
+            self.device,
+            "cuda_ep: refusing to deallocate a buffer from device {:?}",
+            buffer.device()
+        );
+        let dptr = cuptr(buffer.into_raw());
+        // SAFETY: `dptr` came from this EP's `alloc_raw`; `into_raw` consumed the
+        // owning handle so no alias remains, and this is its single free.
+        unsafe { self.runtime.free_raw(dptr) }
+    }
+
+    fn copy(&self, src: &DeviceBuffer, dst: &mut DeviceBuffer, size: usize) -> Result<()> {
+        assert_eq!(src.device(), self.device, "cuda_ep::copy: foreign src buffer");
+        assert_eq!(dst.device(), self.device, "cuda_ep::copy: foreign dst buffer");
+        if size > src.len() || size > dst.len() {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep::copy: size {size} exceeds src {} or dst {}",
+                src.len(),
+                dst.len()
+            )));
+        }
+        if size == 0 {
+            return Ok(());
+        }
+        let src_p = cuptr(src.as_ptr());
+        let dst_p = cuptr(dst.as_mut_ptr());
+        // SAFETY: both endpoints are live device allocations of >= `size` bytes
+        // (checked) on this EP's device; `dst` is `&mut` so it cannot alias `src`.
+        unsafe { self.runtime.dtod(src_p, dst_p, size) }
+    }
+
+    fn copy_async(&self, src: &DeviceBuffer, dst: &mut DeviceBuffer, size: usize) -> Result<Fence> {
+        // Phase 2a: perform the copy synchronously and return a signalled fence.
+        // A true stream-ordered async copy + event fence lands in Phase 2b.
+        self.copy(src, dst, size)?;
+        Ok(Fence::default())
+    }
+
+    fn sync(&self) -> Result<()> {
+        self.runtime.synchronize()
+    }
+}

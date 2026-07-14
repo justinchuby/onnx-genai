@@ -22,6 +22,7 @@ members = [
     "crates/onnx-runtime-optimizer",
     "crates/onnx-runtime-ep-api",
     "crates/onnx-runtime-ep-cpu",
+    "crates/onnx-runtime-ep-cuda",
     "crates/onnx-runtime-session",
     "crates/onnx-runtime-capi",
     "crates/onnx-runtime-tracer",
@@ -54,6 +55,7 @@ onnx-runtime-shape-inference = { path = "crates/onnx-runtime-shape-inference", v
 onnx-runtime-optimizer = { path = "crates/onnx-runtime-optimizer", version = "=0.1.0-dev.0" }
 onnx-runtime-ep-api = { path = "crates/onnx-runtime-ep-api", version = "=0.1.0-dev.0" }
 onnx-runtime-ep-cpu = { path = "crates/onnx-runtime-ep-cpu", version = "=0.1.0-dev.0" }
+onnx-runtime-ep-cuda = { path = "crates/onnx-runtime-ep-cuda", version = "=0.1.0-dev.0" }
 onnx-runtime-session = { path = "crates/onnx-runtime-session", version = "=0.1.0-dev.0" }
 onnx-runtime-capi = { path = "crates/onnx-runtime-capi", version = "=0.1.0-dev.0" }
 onnx-runtime-tracer = { path = "crates/onnx-runtime-tracer", version = "=0.1.0-dev.0" }
