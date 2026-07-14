@@ -3133,7 +3133,272 @@ session = ort2.load("model.onnx", options={
 
 ---
 
-## 30. Phased Roadmap
+## 31. Multi-Session Resource Coordination & Multi-GPU
+
+### 31.1 Problem
+
+Multiple sessions compete for GPU resources:
+- User loads Llama-70B (chat) + Whisper (transcription) + SDXL (image gen)
+- Multi-GPU systems need intelligent placement
+- Single large models need sharding across devices
+
+ORT today: each session is isolated, no coordination. OOM if combined usage exceeds device.
+
+### 31.2 Resource Broker (Global Coordinator)
+
+```rust
+/// Global singleton — coordinates all sessions on this host.
+pub struct ResourceBroker {
+    /// All active sessions and their resource claims.
+    sessions: RwLock<HashMap<SessionId, ResourceClaim>>,
+    /// Per-device state (capacity, usage, temperature).
+    devices: Vec<DeviceState>,
+    /// Scheduling policy.
+    policy: AllocationPolicy,
+    /// Communication backends (NCCL, Gloo).
+    comm: Box<dyn CommBackend>,
+}
+
+pub struct ResourceClaim {
+    session_id: SessionId,
+    priority: SessionPriority,
+    gpu_bytes_used: usize,
+    placement: PlacementPlan,
+    active: bool,
+    last_active: Instant,
+}
+
+pub enum SessionPriority {
+    /// Real-time interactive (chat decode). Never preempt.
+    Realtime,
+    /// Foreground batch (user waiting).
+    Foreground,
+    /// Background (async generation).
+    Background,
+    /// Idle (loaded, not running). First to evict.
+    Idle,
+}
+
+pub enum AllocationPolicy {
+    /// First come first served.
+    Fcfs,
+    /// Priority-based preemption. High steals from low.
+    Priority,
+    /// Fair share. Proportional budget per session.
+    FairShare,
+    /// Weighted allocation.
+    Weighted { weights: HashMap<SessionId, f32> },
+}
+```
+
+**Preemption logic (priority-based):**
+```rust
+impl ResourceBroker {
+    fn reclaim_memory(&mut self, needed: usize, requestor: &ResourceClaim) -> Result<()> {
+        // 1. Evict idle sessions (offload to CPU)
+        // 2. Shrink background sessions (reduce GPU budget)
+        // 3. If requestor is Realtime, preempt Foreground
+        // 4. Requestor itself offloads (never OOM)
+        Ok(())
+    }
+}
+```
+
+### 31.3 Multi-GPU: Parallel Strategies
+
+Three orthogonal strategies, composable:
+
+```rust
+pub enum ParallelStrategy {
+    /// Tensor Parallelism: split weight matrices across GPUs.
+    /// Each GPU holds a slice of every layer. AllReduce after parallel regions.
+    Tensor { degree: usize },
+
+    /// Pipeline Parallelism: different layers on different GPUs.
+    /// Micro-batching hides pipeline bubbles.
+    Pipeline { stages: Vec<LayerRange> },
+
+    /// Data Parallelism: model replicated, different inputs per replica.
+    /// For throughput (batch serving), not single-request latency.
+    Data { replicas: usize },
+
+    /// Hybrid: TP within node + PP across nodes (Megatron-style).
+    Hybrid { tp_degree: usize, pp_stages: Vec<LayerRange> },
+}
+```
+
+**Tensor Parallelism (most common for LLM inference):**
+```
+Original:  Q = X @ W_q         (X: [B,S,H], W_q: [H,H])
+TP=2:      Q_0 = X @ W_q[:,:H/2]   → GPU 0
+           Q_1 = X @ W_q[:,H/2:]   → GPU 1
+           ... attention independently per shard ...
+           O = AllReduce(O_0, O_1)  → synchronization point
+```
+
+### 31.4 IR Sharding Annotations
+
+Our IR supports per-tensor sharding specs:
+
+```rust
+/// How a tensor is distributed across devices.
+#[derive(Clone, Debug)]
+pub enum ShardingSpec {
+    /// Not sharded. Full tensor on one device.
+    Replicated,
+    /// Split along one axis across devices.
+    Split {
+        axis: usize,
+        num_shards: usize,
+        device_map: Vec<DeviceId>,
+    },
+    /// Partial result needing collective to materialize (after TP matmul).
+    Partial {
+        reduce_op: ReduceOp,
+        devices: Vec<DeviceId>,
+    },
+}
+
+/// Sharding annotation on an IR node.
+pub struct NodeSharding {
+    input_specs: Vec<ShardingSpec>,
+    output_specs: Vec<ShardingSpec>,
+}
+
+/// Communication ops inserted by the sharding pass.
+pub enum CommOp {
+    AllReduce { group: Vec<DeviceId>, op: ReduceOp },
+    AllGather { axis: usize, group: Vec<DeviceId> },
+    ReduceScatter { axis: usize, group: Vec<DeviceId>, op: ReduceOp },
+    PipelineSend { from: DeviceId, to: DeviceId, tensor: TensorId },
+    PipelineRecv { from: DeviceId, to: DeviceId, shape: Shape },
+}
+```
+
+### 31.5 Sharding Pass (Optimizer)
+
+Automatic sharding: given a strategy, annotate IR and insert communication ops:
+
+```rust
+pub struct ShardingPass {
+    strategy: ParallelStrategy,
+    devices: Vec<DeviceId>,
+}
+
+impl OptimizerPass for ShardingPass {
+    fn run(&self, graph: &mut Graph) -> Result<()> {
+        match &self.strategy {
+            ParallelStrategy::Tensor { degree } => {
+                // Split MatMul weights along columns (or rows)
+                // Insert AllReduce after parallel matmul
+                for node in graph.nodes_by_type("MatMul") {
+                    self.shard_matmul(graph, node, *degree)?;
+                }
+            }
+            ParallelStrategy::Pipeline { stages } => {
+                // Partition graph by layer range
+                // Insert Send/Recv at stage boundaries
+                for (i, range) in stages.iter().enumerate() {
+                    self.assign_stage(graph, range, self.devices[i])?;
+                }
+            }
+            ParallelStrategy::Data { .. } => {
+                // No IR change — scheduler handles replication
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+}
+```
+
+### 31.6 Communication Backend
+
+```rust
+pub trait CommBackend: Send + Sync {
+    fn all_reduce(&self, tensor: &mut Tensor, op: ReduceOp, group: &CommGroup) -> Result<()>;
+    fn all_gather(&self, input: &Tensor, output: &mut Tensor, group: &CommGroup) -> Result<()>;
+    fn reduce_scatter(&self, tensor: &mut Tensor, op: ReduceOp, group: &CommGroup) -> Result<()>;
+    fn send(&self, tensor: &Tensor, dest: DeviceId) -> Result<()>;
+    fn recv(&self, tensor: &mut Tensor, src: DeviceId) -> Result<()>;
+}
+
+/// NCCL for multi-GPU on same node (NVLink/PCIe).
+pub struct NcclBackend { /* ncclComm_t per device pair */ }
+
+/// Gloo for CPU fallback / multi-node.
+pub struct GlooBackend { /* ... */ }
+```
+
+### 31.7 Multi-Model on Multi-GPU (Placement)
+
+ResourceBroker assigns sessions to devices:
+
+```rust
+impl ResourceBroker {
+    fn assign_devices(&self, session: &SessionBuilder) -> Vec<DeviceId> {
+        let model_size = session.estimated_memory();
+        // Strategy: bin-pack models onto fewest GPUs
+        // or spread for thermal/bandwidth balance
+        self.bin_pack_or_spread(model_size)
+    }
+}
+```
+
+Example: 4x RTX 4090 (24GB each)
+```
+Llama-70B (TP=4):  GPU 0-3 each hold 1/4 of weights
+Llama-8B:          GPU 0 (fits entirely, shares with Llama-70B shard)
+SDXL:              GPU 1 (background, preemptable)
+```
+
+### 31.8 User API
+
+```python
+import ort2
+
+# Auto: single model, best available device(s)
+session = ort2.load("model.onnx")
+
+# Tensor parallelism (split across 4 GPUs)
+session = ort2.load("llama-70b.onnx", options={
+    "parallel.strategy": "tensor",
+    "parallel.degree": "4",
+})
+
+# Pipeline parallelism (explicit layer→GPU mapping)
+session = ort2.load("llama-70b.onnx", options={
+    "parallel.strategy": "pipeline",
+    "parallel.stages": "0-15:gpu:0,16-31:gpu:1",
+})
+
+# Data parallelism (throughput mode for serving)
+session = ort2.load("model.onnx", options={
+    "parallel.strategy": "data",
+    "parallel.replicas": "4",
+})
+
+# Multi-session priority management
+chat = ort2.load("llama.onnx", priority="realtime", options={"memory.gpu_budget_mb": "10000"})
+image = ort2.load("sdxl.onnx", priority="background", options={"memory.gpu_budget_mb": "6000"})
+```
+
+### 31.9 Design Choices
+
+| Choice | Decision | Rationale |
+|--------|----------|----------|
+| Global resource broker | **Yes** | Sessions must coordinate, not fight. |
+| Priority-based preemption | **Yes** | Realtime chat > background image gen. |
+| IR sharding annotations | **Yes** | TP/PP need IR-level tensor distribution info. |
+| Sharding as optimizer pass | **Yes** | Clean separation: user says "TP=4", pass does the work. |
+| NCCL for multi-GPU comm | **Yes** | Industry standard. NVLink bandwidth critical for TP. |
+| Automatic TP degree selection | **Stretch goal** | Start with explicit, later auto-detect optimal degree. |
+| DP handled by scheduler | **Yes** | No IR change needed — just replicate and split batches. |
+| Multi-node support | **Phase 5+** | Focus on single-node multi-GPU first. |
+
+---
+
+## 32. Phased Roadmap
 
 ### Phase 1: Foundation (8-12 weeks)
 - [ ] `onnx-runtime-ir`: Graph IR with all types, validation, mutation API
