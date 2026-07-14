@@ -712,3 +712,113 @@ correctness is unaffected. Not chased further here (would risk the pass bar).
 **By:** Gaff (correctness reviewer)
 **Target:** `squad/ort2-loader-shapeinfer` | **Verdict:** 🟢 SHIP
 **What:** No wrong constant found. Every fold aborts via `?`/`None` on missing/non-integer/unfolded operands — never invents a constant. Verified: Gather symbolic index → `None` ✓; Slice requires `all_const` starts/ends ✓; Concat requires all inputs in env ✓; binop any-Sym → fresh symbol (unit-tested) ✓; Reshape handles -1/0 correctly ✓; Slice clamp math correct ✓. Symbolic identities propagate via interned `SymbolId`. Bounds enforced at every entry point. `bert_toy_optimized_every_value_resolves` ran on real model (257 KB, not skipped) — no `UnresolvedShape` on structural ops; position-slice chain correctly symbolic. Advisories: A1 — `Div` truncates toward zero vs floor for negative operands (no positive-dim impact; elem_to_dim maps negatives to fresh symbol); A2 — `Shape` of unresolved input folds to rank-0 (pre-existing, no bert_toy impact). 27/27 tests pass.
+
+### 2026-07-14: ORT2 must support ORT's EPContext node (com.microsoft)
+**By:** Coordinator (Justin Chu)
+**What:** ORT2 must support ORT's on-disk EPContext contrib operator (domain com.microsoft, variadic inputs/outputs) — distinct from the internal `EpContext` cache struct. Scope: (1) Loader parses EPContext attrs (main_context, ep_cache_context, embed_mode, ep_sdk_version, hardware_architecture, partition_name, source, notes, max_size); (2) Session/EP-API dispatches an EPContext node to the EP whose `source` attribute matches, feeding blob to the EP's load_context path; (3) Generation via ep.context_enable / ep.context_file_path / ep.context_embed_mode session options; (4) C-API surfaces those options. Model-agnostic: dispatch by `source` attribute only — no hardcoded EP names. Roy to author design in docs/ORT2.md (branch squad/ort2-epcontext-design).
+**Why:** Central to EP ecosystem interoperability. ORT2 must consume/emit pre-compiled EP-binary models that the ORT ecosystem produces (QNN, OpenVINO, TensorRT, etc.).
+
+---
+
+### 2026-07-14: ORT2 shape inference reference: onnx-shape-inference
+**By:** Coordinator (Justin Chu)
+**What:** Shape inference (optimizer `ShapeInference` pass + evolution of `onnx-runtime-loader/src/shape_inference.rs`) must follow patterns from https://github.com/justinchuby/onnx-shape-inference: (1) extensible per-op registry keyed by (domain, op_type, opset_version); (2) symbolic dim arithmetic (SymPy-style expr trees over `Dim::Symbolic`); (3) shape DATA propagation as first-class subsystem tracking known values of shape tensors through Shape→Slice→Concat→Reshape chains; (4) strict/permissive merge policies for unifying inferred vs declared shapes.
+**Why:** User-designated reference. Keeps inference extensible, opset-aware, model-agnostic, and feeds the optimizer richer shape info.
+
+---
+
+### 2026-07-14: ORT2 `onnx-runtime-optimizer` — Phase-2 optimizer crate
+**By:** Roy (Lead)
+**What:** New `crates/onnx-runtime-optimizer/` crate (`#![forbid(unsafe_code)]`, depends only on `onnx-runtime-ir`). Implements `OptimizationPass` trait + `PassContext` (empty, `#[non_exhaustive]`) + `run_passes` + `OptimizerError`, and three passes: `ConstantFolding` (integer only, ≤1024 elems, checked arithmetic, fixpoint; folds `Constant`/`Shape`/integer binops), `DeadNodeElimination` (backward reachability from outputs), `OpFusion` (escape-safety rule: non-final matched outputs must stay within matched set; reuses final `ValueId`; patterns: MatMul+Add+Relu→FusedGemm, MatMul+Add→FusedMatMulBias, 9-op LayerNorm). Default pipeline: ConstantFolding → DCE → OpFusion. bert_toy: 384→278 nodes, 0 Constants, 32 FusedMatMulBias; LayerNorm fusion correctly declines (DAG-shaped shared `mean`). 26 unit + 1 real-model integration tests; clippy clean.
+**Why:** Foundation for all Phase-2+ graph rewriting; pass contract and fusion safety invariant locked before more passes added.
+
+---
+
+### 2026-07-14: Gaff review — optimizer structural integrity (🟢)
+**By:** Gaff (graph/IR integrity reviewer)
+**Target:** `squad/ort2-optimizer` @ `87a16d9` | **Verdict:** 🟢 SHIP
+**What:** All 6 integrity checks HELD. Node removal/GC via `remove_node` correct; fusion removes last-first, reuses final `ValueId`; ConstantFolding `needed` guard prevents stale initializer; arena safety (stale-id checked before deref); DCE+fusion interaction verified adversarially. `Graph::validate()` postcondition verified as genuinely biting (injected dangling edges and bogus consumer links → `Err`). 27 tests pass; clippy clean. Advisories (non-blocking): A1 — external-input ordering structural not schema-aware; A2 — validate() debug-only (intentional per §18.1).
+
+---
+
+### 2026-07-14: Chew review — optimizer correctness (🟡)
+**By:** Chew (correctness reviewer)
+**Target:** `squad/ort2-optimizer` @ `87a16d9` | **Verdict:** 🟡 SHIP-with-advisories
+**What:** All three passes semantics-correct. OpFusion escape-safety invariant correct (necessary-and-correct condition for not deleting an observed value). ConstantFolding never folds non-const inputs, checked arithmetic (overflow aborts, not wraps), fixpoint correct. DCE from outputs (never from inputs). bert_toy verified: 384→278 nodes, 0 Constants, 32 FusedMatMulBias, validate() clean. Advisories: A1 — fused ops emitted in default ONNX domain (must use private domain e.g. com.ort2.fused before any kernel binds; tie refinement to kernel introduction); A2 — greedy spine matcher under-fuses on multi-successor (never miscompiles); A3 — single-output final-node restriction.
+
+---
+
+### 2026-07-14: Roy — BERT-toy conformance milestone ACHIEVED
+**By:** Roy (Lead)
+**Branch:** `squad/ort2-bert-conformance`
+**What:** `bert_toy_optimized.onnx` (opset 12, 384 nodes) runs end-to-end through `onnx-runtime-session` on CPU and matches onnxruntime 1.27.0/CPUEP. Max error: prediction_scores 1.19e-7 (tolerance 2e-3), seq_relationship_score 6.05e-9. Zero Phase-1 cross-crate bugs. One session-local fix: position-embedding Slice takes a data-dependent `Shape→Cast→Min→Cast` extent requiring JIT dynamic-shape resolution in the executor — model-agnostic (dispatch on op type only; ops without JIT resolution surface `UnresolvedShape`). 15 tests pass; Miri clean.
+**Why:** Phase-1 exit milestone. Proves the full stack (loader, ep-cpu, ep-api, session) composes correctly on a real transformer with correct numerics.
+
+---
+
+### 2026-07-14: Chew review — BERT conformance JIT output sizing (🟡)
+**By:** Chew (correctness reviewer)
+**Target:** `squad/ort2-bert-conformance` | **Verdict:** 🟡 SHIP-with-advisories
+**What:** Slice sizer is character-for-character mirror of Slice kernel — buffer always equals what kernel writes. `buffer_as_i64` LE decode correct. JIT loop ordering correct. Conformance harness sound (allclose semantics, both outputs, deterministic inputs). Advisories: A1 — Slice count math duplicated verbatim (extract shared `slice_axis_count` helper — structural risk of silent drift); A2 — pre-existing degenerate Slice corner (not BERT-impacting); A3 — multi-output index robustness when extending beyond Slice; A4 — tolerance comment vs allclose code mismatch.
+
+---
+
+### 2026-07-14: Holden review — BERT conformance JIT alloc/dealloc (🟡)
+**By:** Holden (safety/soundness reviewer)
+**Target:** `squad/ort2-bert-conformance` | **Verdict:** 🟡 SHIP-with-advisories
+**What:** All 4 soundness invariants HELD. view_in_bounds gate on every input+output before dispatch including JIT-sized outputs (JIT sizes first, gate validates JIT shapes against JIT-resized buffers). No use-after-free (error path exits before dealloc/alloc loop). dealloc-before-alloc ordering safe (no live `TensorView` aliasing freed buffer). No new `unsafe`. Miri clean (0 UB; -Zmiri-disable-isolation for disk-read conformance test). Advisories: H-D1 carry-over (unchecked dims.product + storage_bytes in JIT path — same as ensure_buffer; non-regression); multi-output index panic when op returns fewer shapes than outputs.
+
+---
+
+### 2026-07-14: Batty — ep-cpu + session Phase-1 hardening (6 advisories + capi fix)
+**By:** Batty (Engine Dev)
+**What:** (1) Softmax opset≤12 vs ≥13 dual semantics via `coerce_2d` flag + dual registry (SoftmaxLegacy@1, Softmax@13); `effective_opset` plumbed end-to-end. (2) Min/Max NaN-propagation — explicit `is_nan()` guard before `f32::min/max`. (3) Cast saturate — `num_to_int!` macro converting directly to target type (no i64-intermediate-then-wrap). (4) `checked_numel` + `SessionError::ShapeOverflow` at both alloc sites (H-D1 preliminary). (5) Multi-output `dynamic_output_shapes` guard (`OutputShapeCountMismatch` before index). (6) Slice geometry extracted to shared `slice_plan` + `slice_axes_steps` helper (kernel + sizer share one impl). Also fixed capi `map_session_error` non-exhaustive match — added explicit arms for `SymbolConflict/RankMismatch/UnresolvedShape/ShapeOverflow/OutputShapeCountMismatch` (no catch-all `_`); all-crate build restored.
+**Why:** Real correctness gaps (wrong Softmax for non-last-axis opset≤12, NaN swallowed, Cast garbage, panic on future multi-output op) closed before more models arrive. Holden's `view_in_bounds` gate preserved untouched.
+
+---
+
+### 2026-07-14: Holden review — ep-cpu hardening (🔴 → Deckard)
+**By:** Holden (safety/soundness reviewer)
+**Target:** `squad/ort2-hardening` @ merge-base vs main | **Verdict:** 🔴 REJECTED
+**What:** Checks 2–6 HELD (view_in_bounds gate intact, multi-output guard, opset plumbing, capi FFI, tests/clippy/Miri). Check 1 FAILED: `checked_numel` closed dims-product overflow but `DataType::storage_bytes(numel)` still computed `count * byte_size` unchecked. Shape `[2^61]` of f64: checked_numel OK (=2^61), storage_bytes wraps to 0, `.max(1)`→1-byte alloc; `view_in_bounds` i64 gate also wraps → passes → heap OOB in release. **Batty locked out of H-D1 storage-sizing artifact. Fix assigned to Deckard** (or another non-Batty implementer). Re-review by Holden required before merge.
+**Why:** Unchecked overflow reaching allocation = 🔴 per soundness rubric; exact H-D1 class.
+
+---
+
+### 2026-07-14: Deckard — H-D1 three-layer overflow fix
+**By:** Deckard (Systems Dev)
+**Commits (cherry-picked to main):** dbf2d70, 9dcdc04, f749012
+**What:** Layer A (`dtype.rs`): `DataType::checked_storage_bytes(count) -> Option<usize>` — `div_ceil(2)` for sub-byte, `checked_mul(byte_size())` for fixed-width; `storage_bytes` reimplemented on top with `.expect`. Layer B (`executor.rs`): `checked_storage_bytes` helper → `SessionError::ShapeOverflow`; both `ensure_buffer` and JIT alloc routed through it; `.max(1)` after checked multiply. Layer C (`strided.rs::view_in_bounds`): address range computed in i128 with `checked_mul`/`checked_add`; overflow → `EpError::InvalidTensorView`. 4 new regression tests; all crate tests + bert_toy green; clippy clean; no new `unsafe`.
+**Why:** Closes H-D1 end-to-end at all three layers identified by Holden's 🔴.
+
+---
+
+### 2026-07-14: Holden re-review — H-D1 fix (🟡 SHIP)
+**By:** Holden (safety/soundness reviewer)
+**Target:** `squad/ort2-hardening` @ `852f262` | **Verdict:** 🟡 SHIP-with-advisories (prior 🔴 cleared)
+**What:** All three fix layers HELD. Layer A: `checked_storage_bytes` correct, regression tests pass. Layer B: both alloc sites checked; `.max(1)` after multiply. Layer C: i128 address math cannot itself overflow (inputs bounded by i64/usize; max value ~2^127 < i128::MAX). Original exploit vector (`[2^61]`×f64) → `ShapeOverflow` at allocation; regression test `bounds_reject_overflowing_address_math` confirms. Tests/clippy clean; Miri unavailable (component not installed). Residual advisories (non-blocking, memory-safe): A1 — `storage_bytes` panics (not graceful error) at capi:350, weights.rs:133, tensor.rs:from_raw_in (caught by catch_unwind; fast-follow owner: Leon); C1 — `addressed_elem_range` min/max accumulated in i64 before i128 widening (adversarial-strides only, not reachable via static shapes).
+**Why:** H-D1 heap-OOB fully closed end-to-end. Residual advisories are fail-closed memory-safe nits.
+
+---
+
+### 2026-07-14: Chew review — ep-cpu hardening (🟢)
+**By:** Chew (correctness/numerics reviewer)
+**Target:** `squad/ort2-hardening` @ `830086e` | **Verdict:** 🟢 GREEN
+**What:** All 6 fixes compute ONNX-correct results. Softmax dual semantics numerically verified for [2,2] axis-0 (legacy=[0.032,0.087,0.237,0.644] sums-to-1; per-axis=[0.119,0.119,0.881,0.881] column-wise). Min/Max NaN-propagating `combine()` correct. Cast `num_to_int!` converts directly to target type (no i64 wrap). slice_plan dedup byte-identical to prior inline. capi exhaustive match reasonable (caller-error vs internal-error arms). All tests pass; clippy clean. No lockout.
+
+---
+
+### 2026-07-14: Fact-check — EPContext node design docs/ORT2.md §55 (🟡 one required fix)
+**By:** Fact Checker
+**Target:** `squad/ort2-epcontext-design` @ `c48f5c4` | **Verdict:** 🟡 SHIP-with-one-required-fix
+**What:** Op schema §55.2 — all 10 attributes exact vs contrib_defs.cc (names, types, defaults). Session-option key strings exact vs `onnxruntime_session_options_config_keys.h`. embed_mode semantics correct. main_context semantics correct. Model-agnostic dispatch verified (EpContextRegistry keyed by source string, no hardcoded EP names in dispatch path). ❌ Required fix: §21.4 `ep.context_embed_mode` default stated as `1`; ORT runtime default is `0` (`ep_context_options.cc:40`; header: "0: external file (default)"). Roy must change §21.4 default 1→0 and align `EpContextGenOptions.embed_mode` to `ExternalFile`. Do NOT change §55.2 op-attribute default (`1`) — that is correct. Advisory: TOC not updated for §55/§56 renumber (pre-existing mismatch). Roy not locked out — single-cell fix.
+**Why:** Spec must match ORT runtime default to avoid silent wrong behavior when ep.context_embed_mode is unset.
+
+---
+
+### 2026-07-14: CUDA EP kernel stack decided (Phase 2)
+**By:** Coordinator (Justin Chu directive; cuda-kernel-research agent, opus-4.8)
+**What:** Phase-2 `onnx-runtime-ep-cuda` kernel stack: **Foundation** — `cudarc` (Rust CUDA 11.4–13.3 bindings; HuggingFace Candle GPU backend). **Standard GEMM** — cuBLASLt via `cudarc::cublaslt` (fused epilogue GEMM+Bias+Activation since CUDA 12.0). **Custom fused kernels** (LayerNorm/RMSNorm, RoPE, softmax, elementwise fusions) — CuTe (CUTLASS 3.x C++ templates) → `extern "C"` launchers compiled by `nvcc` in `build.rs`, linked as static lib; `#if __CUDA_ARCH__>=900` SM90 gate with SM80 fallback. **Attention** — Phase 2a: cuDNN fused SDPA via `cudarc::cudnn`; Phase 2b: FlashAttention-3 via `flash_attn_shim.cu` C shim around Tri Dao's `hopper/` csrc. **Trivial elementwise** — NVRTC PTX via `cudarc::nvrtc`. **cuTile DEFERRED to Phase 3**: no Hopper (SM90) support in CUDA 13.1 (Ampere/Ada/Blackwell only), Python-only, no Rust path. Re-evaluate when Hopper ships + C++ path lands (~CUDA 14.x / 2027). Rejected: Rust-CUDA (nightly-only, no CUTLASS), Triton AOT (Python dep), TileLang/Mojo (Python). All custom kernels MUST be shape-driven, dtype-parameterized, arch-gated — no hardcoded model constants. Next: Roy updates docs/ORT2.md §15 after EPContext-design branch merges.
+**Why:** Research-grade evaluation with dated citations. cuTile disqualified for primary H100/H200 (SM90) target. cudarc+cuBLASLt+CuTe stack is production-proven.
+
+---

@@ -22,3 +22,10 @@ Recurring audit convention is canonical: `.github/workflows/audit.yml` runs week
 - **squad/ort2-session** review (🟡): All 5 invariants held (view bounds, single-free, no cross-EP free, copy size ≤ min(src,dst), host-global). Aliasing: in-place ops cause CycleDetected at build. Miri clean. Advisories: A1 mid-run error-path buffer leak; A2 unchecked i64 in `view_in_bounds`; A3 cache key omits dtypes.
 - **squad/ort2-session-dynshape** review (🟡): Invariant #1 holds against run-scoped buffers (gate keys off real `buf.len()`). Single-free on realloc verified. 14/14 Miri-clean. Advisories: H-D1 unchecked shape-multiply overflow; H-D2 stale buffer_shapes if allocate fails post-dealloc; Holden-A1 (pre-existing) mid-run leak unchanged.
 - **squad/ort2-capi** review (🟢): All 6 FFI axes pass. 12/12 Miri-clean. Advisories: A1 release fns not in guard; A2 storage_bytes unchecked multiply (bounded by prior validation).
+
+## 2026-07-14T06:06:00Z — H-D1 Re-Review (holden-7) → 🟡 SHIP
+
+- **holden-7:** Re-reviewed Deckard's H-D1 fix on `squad/ort2-hardening` @ 852f262.
+- Prior 🔴 cleared: all three fix layers (dtype.rs checked_storage_bytes, executor.rs both alloc sites, strided.rs i128 address math) confirmed correct. Original exploit vector `[2^61]`×f64 dead — `ShapeOverflow` at allocation before any buffer exists.
+- **Verdict: 🟡 SHIP-with-advisories.** Residual advisories A1 (peripheral panic paths → graceful error) and C1 (addressed_elem_range i64 before i128 widening) are memory-safe non-blocking; suggested fast-follow owner: Leon (neither Deckard nor Batty).
+- Fix cherry-picked to main: dbf2d70, 9dcdc04, f749012.

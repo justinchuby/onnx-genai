@@ -88,3 +88,12 @@ Verdict: 🟢 **SHIP**.
 - **squad/ort2-loader-shapeinfer** (b6f032e): Bounded partial evaluator (`ConstEnv`, `KnownVal`, `IntElem::Const|Sym`). Value-prop ops: Constant/Shape/Gather/Slice/Concat/Reshape/elementwise-int. bert_toy: 135→50 unresolved values; all residuals are scalar Constants; no structural op left shape-less. 27/27 tests (real model test not skipped). Reviewed 🟢 Gaff.
 - Open: loader shape rules for `Attention` + `EmbedLayerNormalization` needed before full bert_toy session run (flagged by Roy session dynshape note).
 - Gaff advisory A1: `Div` truncates vs floor for negative operands (no current impact).
+
+## 2026-07-14T06:06:00Z — H-D1 Three-Layer Overflow Fix (cherry-picked to main)
+
+- After Holden's 🔴 rejection of Batty's preliminary checked_numel work (Batty locked out of H-D1 artifact), Deckard authored the three-layer fix:
+  - **Layer A** (`onnx-runtime-ir/src/dtype.rs`): `DataType::checked_storage_bytes(count) -> Option<usize>` — sub-byte div_ceil + `checked_mul`; `storage_bytes` reimplemented on top with `.expect`.
+  - **Layer B** (`onnx-runtime-session/src/executor.rs`): `checked_storage_bytes` helper → `SessionError::ShapeOverflow`; both `ensure_buffer` and JIT alloc routed through it; `.max(1)` after checked multiply.
+  - **Layer C** (`onnx-runtime-ep-cpu/src/strided.rs::view_in_bounds`): i128 address math with `checked_mul`/`checked_add`; overflow → `EpError::InvalidTensorView`.
+- 4 new regression tests; all crate tests + bert_toy green; clippy clean; no new `unsafe`.
+- Holden re-review (holden-7): **🟡 SHIP**. Cherry-picked to main: **dbf2d70**, **9dcdc04**, **f749012**.

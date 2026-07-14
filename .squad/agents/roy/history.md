@@ -44,3 +44,10 @@ Roy's workspace review is now in decisions: crate split is sound, but engine.rs 
 - Open advisories (non-blocking): Holden A1 (mid-run error-path buffer leak), H-D1 (unchecked shape-multiply), Chew A2 (gappy-optional input compaction).
 - Loader gap flagged to Deckard: shape rules for `Attention`/`EmbedLayerNormalization` needed before full bert_toy run.
 - Softmax opset-12 guard (from Chew ep-cpu review) assigned Roy/Deckard (Batty locked).
+
+## 2026-07-14T06:06:00Z — EPContext Design + embed_mode Fix (roy-10, roy-11)
+
+- **roy-10:** Authored docs/ORT2.md §55 (EPContext node design) on branch `squad/ort2-epcontext-design` @ c48f5c4. Covered op schema (all 10 attrs), embed_mode/main_context semantics, session-option keys, model-agnostic dispatch via EpContextRegistry. Merged to main: **96f1ed4**.
+- **fact-checker** found one required fix: §21.4 `ep.context_embed_mode` default stated as `1`, ORT runtime default is `0`.
+- **roy-11:** Applied correction (§21.4 default 1→0; `EpContextGenOptions.embed_mode` → `ExternalFile`) + TOC update. Merged to main: **cf614e4** (current HEAD).
+- Roy-12 in flight: updating docs/ORT2.md §15 (CuTe Kernel Strategy) with CUDA EP stack decision — not yet landed.

@@ -104,3 +104,17 @@ Prompt-lookup speculation and `MtpProposer` are accepted canonical runtime miles
 - **squad/ort2-epcpu-ops** (e485a83): +17 bert_toy kernels — Sub/Mul/Div/Pow/Min, Sqrt/Erf/Tanh, Cast, ReduceMean, Softmax, Shape, Unsqueeze, Expand, Slice, Constant, Gemm. 90/90 tests; no new deps. Reviewed 🟡 Chew.
 - Softmax uses opset-13 per-axis semantics (correct for bert_toy last-axis; opset-12 coerce guard advisory assigned Roy/Deckard — Batty locked on this advisory).
 - Loader gaps flagged (Slice/Expand/Constant shape inference) → addressed by Deckard b6f032e.
+
+## 2026-07-14T06:06:00Z — Phase-1 Hardening: 6 Advisories Closed + capi Fix
+
+- Closed 6 deferred LOW-severity advisories from Phase-1 reviews (Chew + Holden):
+  1. Softmax opset≤12 vs ≥13 dual semantics (coerce_2d + dual registry SoftmaxLegacy@1/Softmax@13; effective_opset plumbed)
+  2. Min/Max NaN-propagation (explicit is_nan() guard)
+  3. Cast saturate: num_to_int! macro directly to target type
+  4. checked_numel + SessionError::ShapeOverflow at both alloc sites (H-D1 preliminary)
+  5. Multi-output dynamic_output_shapes guard (OutputShapeCountMismatch)
+  6. Slice geometry extracted to shared slice_plan helper
+- Fixed capi map_session_error non-exhaustive match (SymbolConflict/RankMismatch/UnresolvedShape/ShapeOverflow/OutputShapeCountMismatch arms added; no catch-all _).
+- **Holden review (🔴):** checked_numel closed dims-product overflow but storage_bytes(numel) still unchecked → heap OOB for [2^61]×f64. **Batty locked out of H-D1 storage-sizing artifact**; fix reassigned to Deckard.
+- **Chew review (🟢):** All 6 fixes numerics-correct.
+- Deckard completed H-D1 fix; Holden re-reviewed → **🟡 SHIP**; merged to main.
