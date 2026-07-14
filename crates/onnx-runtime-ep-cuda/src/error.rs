@@ -36,15 +36,15 @@ pub(crate) fn nvrtc_err(context: &str, e: cudarc::nvrtc::CompileError) -> EpErro
     EpError::KernelFailed(format!("cuda_ep: {context}: {detail}"))
 }
 
-/// Build a "not implemented in this slice" error for an op/dtype/rank the
-/// CUDA EP does **not** yet cover. The message is deliberately explicit that
-/// this is Phase-2a scope, so callers get an actionable next step rather than a
-/// silent fallback or a panic.
+/// Build a "not implemented on CUDA yet" error for an op/dtype/rank/layout the
+/// CUDA EP does **not** cover in the current slice. The message is deliberately
+/// explicit and actionable (RULES.md #1: what/why/how) — it names the missing
+/// case and points at the coverage roadmap and the CPU-EP fallback, rather than
+/// silently falling back or panicking.
 pub(crate) fn not_implemented(what: impl std::fmt::Display) -> EpError {
     EpError::KernelFailed(format!(
-        "cuda_ep: {what} is not implemented in CUDA EP Phase 2a \
-         (cudarc + cuBLASLt GEMM only). Custom fused kernels (norms, RoPE, \
-         softmax, attention), NVRTC elementwise, and FP8 are deferred to a \
-         later slice; run this op on the CPU EP for now."
+        "cuda_ep: {what} is not yet implemented on the CUDA EP. See \
+         docs/CUDA_COVERAGE.md for the op → backend roadmap; this op/case can run \
+         on the CPU EP in the meantime."
     ))
 }

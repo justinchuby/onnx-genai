@@ -4,18 +4,28 @@
 //! §56 Phase 2). It implements [`onnx_runtime_ep_api::ExecutionProvider`] on top
 //! of [`cudarc`] (driver + cuBLASLt), mirroring the structure of the CPU EP.
 //!
-//! ## Phase 2a scope — cuBLASLt GEMM + SDPA/GQA attention baseline
+//! ## Scope — cuBLASLt GEMM family + NVRTC elementwise + SDPA/GQA attention
 //!
-//! This slice wires the foundation (device context, stream, allocator, H2D/D2H/
-//! D2D copies), **standard GEMM** (`MatMul`) via `cudarc::cublaslt`, and the
-//! **scaled-dot-product / grouped-query attention** baseline (`Attention`) built
-//! from cuBLAS batched GEMMs around a runtime-compiled (NVRTC) fused softmax —
-//! the §13.3 `Kernel` binding a cuDNN-fused SDPA / FlashAttention-3 shim drops in
-//! behind later. Other design kernels are staged into subsequent slices:
+//! This EP wires the foundation (device context, stream, allocator, H2D/D2H/
+//! D2D copies) and covers, keyed on `(op_type, domain)` via the shared
+//! [`onnx_runtime_ep_api::OpRegistry`]:
 //!
-//! * **Phase 2b:** cuDNN-fused SDPA / FlashAttention-3 (behind the same
-//!   attention binding), paged-KV (§13.4), custom fused kernels (LayerNorm/
-//!   RMSNorm, residual+norm, RoPE) via CuTe/`extern "C"`, and FP8 GEMM.
+//! * **GEMM family** — `MatMul` and `Gemm` via `cudarc::cublaslt` (`Gemm` adds a
+//!   fused NVRTC `β·C` broadcast-bias epilogue).
+//! * **Elementwise** — unary activations (`Relu`, `Sqrt`, `Erf`, `Tanh`,
+//!   `Sigmoid`, and `com.microsoft` `Gelu`) and equal-shape binary ops (`Add`,
+//!   `Sub`, `Mul`, `Div`, `Pow`, `Min`, `Max`) via runtime-compiled (NVRTC) f32
+//!   pointwise kernels — kept as our own kernels so they can later fuse into a
+//!   GEMM epilogue or an elementwise chain (RULES.md #4).
+//! * **Attention** — the scaled-dot-product / grouped-query attention baseline
+//!   (`Attention`, `com.microsoft`) built from cuBLAS batched GEMMs around a
+//!   runtime-compiled fused softmax — the §13.3 `Kernel` binding a cuDNN-fused
+//!   SDPA / FlashAttention-3 shim drops in behind later.
+//!
+//! The full op → backend mapping matrix, remaining coverage, and the
+//! prioritised custom-kernel candidate list live in `docs/CUDA_COVERAGE.md`.
+//! Roadmap ops not yet wired (cuDNN softmax/norm, cub reductions, data-movement,
+//! FP8, FlashAttention-3) return an actionable [`onnx_runtime_ep_api::EpError`].
 //!
 //! No `.cu` sources and no `nvcc`/`build.rs` compile step exist in this crate:
 //! `cudarc` is used in its **dynamic-loading** configuration, so `cargo build`
@@ -51,6 +61,6 @@ pub mod provider;
 pub mod runtime;
 
 pub use kernels::attention::AttentionKernel;
-pub use kernels::{build_cuda_registry, CUDA_PHASE2A_OPS};
+pub use kernels::{build_cuda_registry, CUDA_COVERED_OPS};
 pub use provider::CudaExecutionProvider;
 pub use runtime::CudaRuntime;

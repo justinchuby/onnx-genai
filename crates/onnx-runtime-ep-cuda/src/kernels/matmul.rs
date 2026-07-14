@@ -217,13 +217,13 @@ mod tests {
         let msg = format!("{e}");
         assert!(msg.contains("inner dimensions disagree"), "{msg}");
         // A genuine mistake, not a deferred feature.
-        assert!(!msg.contains("Phase 2a"), "{msg}");
+        assert!(!msg.contains("not yet implemented"), "{msg}");
     }
 
     #[test]
     fn dims_broadcast_batch_is_deferred() {
         let e = gemm_dims(&[1, 2, 3], &[5, 3, 4]).unwrap_err();
-        assert!(format!("{e}").contains("Phase 2a"));
+        assert!(format!("{e}").contains("not yet implemented"));
     }
 
     #[test]
@@ -231,7 +231,7 @@ mod tests {
         let e = gemm_dims(&[2, 2, 2, 2], &[2, 2, 2, 2]).unwrap_err();
         let msg = format!("{e}");
         assert!(msg.contains("4D x 4D"), "{msg}");
-        assert!(msg.contains("Phase 2a"), "{msg}");
+        assert!(msg.contains("not yet implemented"), "{msg}");
     }
 
     #[test]
@@ -242,6 +242,6 @@ mod tests {
         let e = gemm_dtype(DataType::Int64).unwrap_err();
         let msg = format!("{e}");
         assert!(msg.contains("dtype Int64"), "{msg}");
-        assert!(msg.contains("Phase 2a"), "{msg}");
+        assert!(msg.contains("not yet implemented"), "{msg}");
     }
 }

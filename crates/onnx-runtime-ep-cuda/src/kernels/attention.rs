@@ -563,7 +563,17 @@ mod tests {
     use super::*;
 
     fn rt() -> Option<Arc<CudaRuntime>> {
-        CudaRuntime::new(0).ok().map(Arc::new)
+        // `CudaRuntime::new` may *panic* (not just `Err`) when a CUDA library is
+        // absent: cudarc's dynamic loader `expect()`s the shared object on first
+        // use. Catch that so these GPU-gated tests skip cleanly on a host without
+        // libcuda/libcublasLt, instead of failing the CPU-only suite.
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let runtime = std::panic::catch_unwind(|| CudaRuntime::new(0).ok().map(Arc::new))
+            .ok()
+            .flatten();
+        std::panic::set_hook(prev);
+        runtime
     }
 
     #[test]
