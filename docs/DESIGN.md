@@ -8224,3 +8224,509 @@ Total:            ~17ms  (3ms margin)
 | ORT wrapper (§18) | Same C API, different EPs (TensorRT for Jetson) |
 | Model lifecycle (§37) | Hot-swap policy model (transfer learning, fine-tuned version) |
 | Backpressure (§36) | N/A for single-stream control, but relevant for multi-camera preprocessing |
+
+---
+
+## 42. Bring Your Own Sampler & Speculator (Plugin API)
+
+### 42.1 Motivation
+
+Users want to:
+- Implement custom sampling strategies (e.g. Mirostat, min-P, locally typical, DRY penalty)
+- Bring their own draft model / speculator (e.g. EAGLE heads, Medusa, custom n-gram)
+- Swap acceptance rules (e.g. speculative with temperature, top-k spec sampling)
+- Do all of this **without forking onnx-genai**
+
+### 42.2 Custom Sampler Plugin
+
+Currently sampling is an internal step after LogitProcessor chain. We make it pluggable:
+
+```rust
+/// The Sampler trait: given processed logits, produce token(s).
+/// Users implement this to bring their own sampling logic.
+pub trait Sampler: Send + Sync {
+    /// Sample one or more tokens from logits.
+    /// `context` provides sequence state (past tokens, RNG, etc.)
+    fn sample(&self, logits: &[f32], context: &SamplerContext) -> SamplerOutput;
+
+    /// Human-readable name (for tracing/debug).
+    fn name(&self) -> &str;
+
+    /// Called at start of each sequence (reset RNG, clear state).
+    fn reset(&mut self) {}
+
+    /// Optional: declare what metadata you need from context.
+    fn required_context(&self) -> SamplerRequirements {
+        SamplerRequirements::default()
+    }
+}
+
+pub struct SamplerContext<'a> {
+    /// Full generated sequence so far.
+    pub past_tokens: &'a [TokenId],
+    /// Vocab size.
+    pub vocab_size: usize,
+    /// Per-sequence RNG (deterministic if seed is set).
+    pub rng: &'a mut dyn RngCore,
+    /// Token frequencies in this sequence (for penalty-based samplers).
+    pub token_counts: &'a HashMap<TokenId, u32>,
+    /// Step number in this sequence.
+    pub step: usize,
+    /// User-provided sampler config (arbitrary JSON).
+    pub config: &'a serde_json::Value,
+}
+
+pub struct SamplerOutput {
+    /// Selected token(s). Usually 1, but batch-draft samplers may emit multiple.
+    pub tokens: Vec<TokenId>,
+    /// Optional: probabilities of selected tokens (for speculative verification).
+    pub probs: Option<Vec<f32>>,
+    /// Optional: metadata for tracing/debugging.
+    pub metadata: Option<serde_json::Value>,
+}
+
+pub struct SamplerRequirements {
+    /// Need full logits (not just top-K filtered)?
+    pub full_logits: bool,
+    /// Need token frequency counts?
+    pub token_counts: bool,
+    /// Need the log-probabilities (softmax already applied)?
+    pub log_probs: bool,
+}
+```
+
+**Built-in samplers (implement the same trait):**
+
+```rust
+pub struct DefaultSampler {
+    pub temperature: f32,
+    pub top_p: f32,
+    pub top_k: usize,
+}
+
+pub struct MirostatSampler {
+    pub tau: f32,       // target surprise
+    pub eta: f32,       // learning rate
+    mu: f32,            // internal state (surprise estimate)
+}
+
+pub struct MinPSampler {
+    pub min_p: f32,     // minimum probability threshold (relative to top token)
+}
+
+pub struct GreedySampler;
+
+pub struct BeamSampler {
+    pub beam_width: usize,
+    pub length_penalty: f32,
+}
+```
+
+### 42.3 Custom Speculator Plugin
+
+Make `DraftProducer` a trait instead of a closed enum:
+
+```rust
+/// Trait for speculative decoding draft producers.
+/// Implement this to bring your own speculator.
+pub trait DraftProducer: Send + Sync {
+    /// Produce K draft tokens given current sequence state.
+    /// Returns draft tokens and optionally their probabilities.
+    fn draft(
+        &mut self,
+        context: &DraftContext,
+    ) -> Result<DraftOutput>;
+
+    /// Human-readable name.
+    fn name(&self) -> &str;
+
+    /// How many tokens this producer typically drafts per step.
+    fn tokens_per_step(&self) -> usize;
+
+    /// Does this producer need its own KV cache? (DraftModel: yes, Ngram: no)
+    fn has_own_state(&self) -> bool;
+
+    /// Reset state (e.g. on new sequence or after rejection).
+    fn reset(&mut self) {}
+
+    /// Rewind state to position (after partial acceptance).
+    fn rewind_to(&mut self, position: usize) -> Result<()> { Ok(()) }
+}
+
+pub struct DraftContext<'a> {
+    /// Tokens generated so far.
+    pub sequence: &'a [TokenId],
+    /// Current KV cache position.
+    pub kv_position: usize,
+    /// Sampler to use for draft token selection (may differ from target sampler).
+    pub sampler: &'a dyn Sampler,
+    /// Access to the prompt (for n-gram matching).
+    pub prompt_tokens: &'a [TokenId],
+    /// RNG for draft sampling.
+    pub rng: &'a mut dyn RngCore,
+}
+
+pub struct DraftOutput {
+    /// Draft tokens (length = tokens_per_step or less if early termination).
+    pub tokens: Vec<TokenId>,
+    /// Draft token probabilities (required for rejection sampling acceptance).
+    pub probs: Option<Vec<f32>>,
+    /// Tree structure (for tree-based speculative decoding).
+    pub tree: Option<DraftTree>,
+}
+
+/// For tree-structured speculation (Medusa, EAGLE).
+pub struct DraftTree {
+    /// Each node: (token, parent_index, probability)
+    pub nodes: Vec<(TokenId, Option<usize>, f32)>,
+}
+```
+
+**Built-in producers (implement the same trait):**
+
+```rust
+/// Small draft model (separate ONNX model, own KV cache).
+pub struct DraftModelProducer {
+    session: InferenceSession,
+    kv_cache: Box<dyn KvCacheOps>,
+    tokens_per_step: usize,
+}
+
+/// N-gram matching from prompt/generated text (stateless, no model needed).
+pub struct NgramProducer {
+    min_match: usize,
+    max_draft: usize,
+    window: usize,
+}
+
+/// Multi-Token Prediction heads (extra linear layers on same model).
+pub struct MtpProducer {
+    head_names: Vec<String>,  // names of the MTP output heads in the ONNX model
+}
+
+/// EAGLE-style autoregressive draft with feature reuse.
+pub struct EagleProducer {
+    eagle_session: InferenceSession,
+    tree_width: usize,
+    tree_depth: usize,
+}
+
+/// Medusa heads (parallel independent heads, tree verification).
+pub struct MedusaProducer {
+    head_count: usize,
+    top_k_per_head: usize,
+    tree_config: TreeConfig,
+}
+```
+
+### 42.4 Custom Acceptance Rule
+
+```rust
+/// How to decide which draft tokens to accept.
+pub trait AcceptanceRule: Send + Sync {
+    /// Given target probs and draft probs at each position,
+    /// decide how many tokens to accept.
+    fn accept(
+        &self,
+        draft_tokens: &[TokenId],
+        draft_probs: &[f32],
+        target_probs: &[Vec<f32>],  // target model's full distribution at each position
+        rng: &mut dyn RngCore,
+    ) -> AcceptanceResult;
+
+    fn name(&self) -> &str;
+}
+
+pub struct AcceptanceResult {
+    /// Number of draft tokens accepted (0..=K).
+    pub accepted_count: usize,
+    /// The correction token (sampled from adjusted distribution after last accepted).
+    pub correction_token: Option<TokenId>,
+}
+
+// Built-in:
+pub struct GreedyAcceptance;          // accept while draft == argmax(target)
+pub struct RejectionSampling;         // standard speculative sampling (DeepMind)
+pub struct TypicalAcceptance {        // accept if within typical set
+    pub threshold: f32,
+}
+pub struct TopKSpecAcceptance {       // accept if draft token in target's top-K
+    pub k: usize,
+}
+```
+
+### 42.5 Registration API
+
+```rust
+impl GenAiEngine {
+    /// Register a custom sampler (replaces default sampling step).
+    pub fn set_sampler(&mut self, sampler: Box<dyn Sampler>);
+
+    /// Register a custom draft producer (enables speculative decoding).
+    pub fn set_speculator(&mut self, producer: Box<dyn DraftProducer>);
+
+    /// Register a custom acceptance rule.
+    pub fn set_acceptance_rule(&mut self, rule: Box<dyn AcceptanceRule>);
+
+    /// Register a custom logit processor (added to chain).
+    pub fn add_logit_processor(&mut self, processor: Box<dyn LogitProcessor>);
+
+    /// Remove a logit processor by name.
+    pub fn remove_logit_processor(&mut self, name: &str);
+}
+```
+
+### 42.6 Python Plugin API
+
+```python
+import ort2
+from ort2 import Sampler, DraftProducer, AcceptanceRule
+
+# --- Custom Sampler ---
+class MirostatV2Sampler(Sampler):
+    def __init__(self, tau=5.0, eta=0.1):
+        self.tau = tau
+        self.eta = eta
+        self.mu = 2 * tau  # initial surprise target
+
+    def sample(self, logits, context):
+        # Mirostat v2: maintain target surprise level
+        probs = softmax(logits)
+        sorted_probs = sorted(enumerate(probs), key=lambda x: -x[1])
+
+        # Find cutoff where surprise exceeds mu
+        cumulative_surprise = 0
+        candidates = []
+        for idx, prob in sorted_probs:
+            surprise = -math.log2(prob)
+            if surprise > self.mu and candidates:
+                break
+            candidates.append((idx, prob))
+
+        # Sample from candidates
+        token = weighted_random(candidates, context.rng)
+
+        # Update mu (learning rate adjustment)
+        token_surprise = -math.log2(probs[token])
+        self.mu -= self.eta * (token_surprise - self.tau)
+
+        return SamplerOutput(tokens=[token])
+
+    def name(self):
+        return "mirostat_v2"
+
+    def reset(self):
+        self.mu = 2 * self.tau
+
+
+# --- Custom Speculator ---
+class LookbackSpeculator(DraftProducer):
+    """Draft by finding repeated patterns in the generated text."""
+
+    def __init__(self, window=100, max_draft=5):
+        self.window = window
+        self.max_draft = max_draft
+
+    def draft(self, context):
+        # Look for the longest suffix match in past tokens
+        seq = context.sequence
+        suffix_len = 1
+        best_match_pos = None
+        best_match_len = 0
+
+        for start in range(max(0, len(seq) - self.window), len(seq) - 1):
+            match_len = 0
+            for i in range(min(self.max_draft + 1, len(seq) - start)):
+                if seq[start + i] == seq[-(suffix_len) + i] if ... :
+                    match_len += 1
+                else:
+                    break
+            if match_len > best_match_len:
+                best_match_pos = start
+                best_match_len = match_len
+
+        if best_match_pos and best_match_len > 0:
+            # Draft the tokens that followed the match
+            draft_start = best_match_pos + suffix_len
+            draft_tokens = seq[draft_start:draft_start + self.max_draft]
+            return DraftOutput(tokens=draft_tokens)
+
+        return DraftOutput(tokens=[])  # no match, skip speculation
+
+    def name(self):
+        return "lookback_speculator"
+
+    def tokens_per_step(self):
+        return self.max_draft
+
+    def has_own_state(self):
+        return False  # stateless
+
+
+# --- Custom Acceptance Rule ---
+class RelaxedAcceptance(AcceptanceRule):
+    """Accept draft token if it's in target's top-K."""
+
+    def __init__(self, k=10):
+        self.k = k
+
+    def accept(self, draft_tokens, draft_probs, target_probs, rng):
+        accepted = 0
+        for i, token in enumerate(draft_tokens):
+            top_k_tokens = sorted(range(len(target_probs[i])),
+                                  key=lambda t: -target_probs[i][t])[:self.k]
+            if token in top_k_tokens:
+                accepted += 1
+            else:
+                break
+        return AcceptanceResult(accepted_count=accepted)
+
+    def name(self):
+        return "relaxed_top_k"
+
+
+# --- Usage ---
+engine = ort2.GenAiEngine("model.onnx")
+
+# Plug in custom sampler
+engine.set_sampler(MirostatV2Sampler(tau=5.0, eta=0.1))
+
+# Plug in custom speculator + acceptance
+engine.set_speculator(LookbackSpeculator(window=200, max_draft=8))
+engine.set_acceptance_rule(RelaxedAcceptance(k=5))
+
+# Or bring a ONNX draft model:
+eagle_model = ort2.load("eagle_head.onnx")
+engine.set_speculator(ort2.EagleProducer(eagle_model, tree_depth=3, tree_width=4))
+
+# Generate (uses custom plugins transparently)
+for token in engine.generate_stream("Hello, world"):
+    print(token, end="")
+```
+
+### 42.7 Dynamic Swap (Hot-Reload)
+
+Plugins can be swapped at runtime without rebuilding the session:
+
+```rust
+impl GenAiEngine {
+    /// Swap sampler between requests (e.g. per-user sampling config).
+    /// Thread-safe: takes effect on next generate() call.
+    pub fn swap_sampler(&self, sampler: Box<dyn Sampler>);
+
+    /// Swap speculator (e.g. switch from ngram to draft model after warmup).
+    pub fn swap_speculator(&self, producer: Box<dyn DraftProducer>);
+
+    /// Disable speculation (fallback to normal decode).
+    pub fn disable_speculation(&self);
+}
+```
+
+Use case: serving system switches speculation strategy per-request based on
+request characteristics (short output → ngram, long output → draft model).
+
+### 42.8 vLLM Speculators Compatibility
+
+Many speculators are trained as separate small models (EAGLE, Medusa, draft models).
+We support loading them as ONNX:
+
+```python
+# Load a vLLM-compatible speculator checkpoint (converted to ONNX)
+speculator = ort2.load_speculator("eagle_head.onnx", kind="eagle")
+engine.set_speculator(speculator)
+
+# Or Medusa heads (multiple heads in one model)
+speculator = ort2.load_speculator("medusa_heads.onnx", kind="medusa",
+                                   tree_width=4, tree_depth=3)
+engine.set_speculator(speculator)
+```
+
+### 42.9 LogitProcessor Registration (Enhanced)
+
+Logit processors were already a trait (§3.6), but we add:
+
+```rust
+/// Enhanced: processors can declare ordering constraints.
+pub trait LogitProcessor: Send + Sync {
+    fn process(&self, logits: &mut [f32], context: &ProcessorContext);
+    fn name(&self) -> &str;
+
+    /// Where in the chain this processor should run.
+    /// Default: after built-in processors.
+    fn ordering(&self) -> ProcessorOrdering {
+        ProcessorOrdering::After("temperature")  // run after temperature by default
+    }
+
+    /// Can this processor be applied in parallel with others? (optimization)
+    fn is_independent(&self) -> bool { false }
+}
+
+pub enum ProcessorOrdering {
+    /// Run before a named processor.
+    Before(&'static str),
+    /// Run after a named processor.
+    After(&'static str),
+    /// Run at a specific position (0 = first).
+    Position(usize),
+    /// Run last (after all others).
+    Last,
+}
+```
+
+```python
+# Python custom logit processor
+class DryPenaltyProcessor(ort2.LogitProcessor):
+    """Don't Repeat Yourself: penalize repeated n-gram patterns."""
+
+    def __init__(self, penalty=1.0, allowed_length=2, sequence_breakers=None):
+        self.penalty = penalty
+        self.allowed_length = allowed_length
+        self.sequence_breakers = sequence_breakers or ["\n", ".", "!", "?"]
+
+    def process(self, logits, context):
+        # Find repeated n-grams and penalize continuation tokens
+        for n in range(self.allowed_length + 1, min(20, len(context.past_tokens))):
+            suffix = context.past_tokens[-n:]
+            # Find prior occurrences of this suffix
+            for i in range(len(context.past_tokens) - n):
+                if context.past_tokens[i:i+n] == suffix:
+                    # Penalize the token that followed this pattern before
+                    next_token = context.past_tokens[i + n] if i + n < len(context.past_tokens) else None
+                    if next_token is not None:
+                        logits[next_token] -= self.penalty * (n - self.allowed_length)
+
+    def name(self):
+        return "dry_penalty"
+
+    def ordering(self):
+        return ProcessorOrdering.Before("temperature")  # apply before temperature
+
+
+engine.add_logit_processor(DryPenaltyProcessor(penalty=1.5))
+```
+
+### 42.10 Changes Required to Current Design
+
+| Component | Current | Change Needed |
+|-----------|---------|---------------|
+| `DraftProducer` | Closed enum | → `dyn DraftProducer` trait (open, pluggable) |
+| Sampling step | Hardcoded (temperature→top-p→sample) | → `dyn Sampler` trait call |
+| `AcceptanceRule` | Closed enum | → `dyn AcceptanceRule` trait |
+| `LogitProcessor` ordering | Linear vec (manual ordering) | → Ordering constraints (`Before`/`After`) |
+| `GenAiEngine` | Owns all components directly | → Holds `Box<dyn T>` for sampler/speculator/acceptance |
+| Python bindings | N/A | → PyO3 trait objects for Sampler/DraftProducer/AcceptanceRule |
+| Hot-swap | N/A | → `ArcSwap<dyn T>` for lock-free runtime replacement |
+| Speculator lifecycle | Tied to engine | → Independent (own KV cache, own session if model-based) |
+
+### 42.11 Design Choices
+
+| Choice | Decision | Rationale |
+|--------|----------|-----------|
+| Sampler as trait | **Yes** | Open set — new sampling algorithms appear frequently |
+| Speculator as trait | **Yes** | EAGLE/Medusa/MTP/custom all have different architectures |
+| Acceptance as trait | **Yes** | Research area — new rules outperform rejection sampling |
+| Hot-swap at runtime | **Yes** | Serving systems need per-request strategy selection |
+| Python plugin support | **Yes** | Most researchers prototype in Python |
+| Ordering constraints | **Yes** | LogitProcessor order matters semantically |
+| Tree speculation support | **Yes** | Medusa/EAGLE use tree verification (higher acceptance rate) |
+| Built-in defaults | **Yes** | DefaultSampler + NgramProducer + RejectionSampling for zero-config |
