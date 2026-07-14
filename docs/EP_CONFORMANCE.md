@@ -250,3 +250,46 @@ Kernels are f32 (plus bool for Not/Where condition; byte-agnostic for
 Concat/Squeeze/Size/Where). f16/f64/int dtype coverage is a separate wave.
 Output shapes are supplied by `onnx-runtime-shape-inference`; these kernels
 write into pre-shaped output views.
+
+## ONNX backend test (`onnx.backend.test`)
+
+Run on **2026-07-14** with ONNX 1.22.0 against the nxrt wheel built from commit
+`f2dd92d`. The runner exposes the official node-model group only, avoiding
+offline model downloads. ONNX generates both CPU and CUDA variants; nxrt's
+CPU-only backend executes the 1,765 CPU cases and skips all 1,765 CUDA cases.
+
+| Scope | Pass | Fail | Skip | Total |
+|---|---:|---:|---:|---:|
+| CPU node cases | 130 | 1,635 | 0 | 1,765 |
+| CUDA variants (unsupported device) | 0 | 0 | 1,765 | 1,765 |
+| **Collected node cases** | **130** | **1,635** | **1,765** | **3,530** |
+
+The largest failing test-name/operator families are Attention (128), reduction
+operators (123), CastLike (110), SoftmaxCrossEntropyLoss (68), Cast (58),
+Resize (39), LayerNormalization (38), RMSNormalization (38),
+NegativeLogLikelihoodLoss (36), and pooling (AveragePool 20, MaxPool 19).
+These are coverage counts, not expected failures: the suite remains unfiltered
+so newly implemented kernels turn red cases green without maintaining an xfail
+list.
+
+Two representative failures confirm that the count measures nxrt gaps rather
+than adapter wiring errors:
+
+- `test_abs_cpu` fails while preparing the session because no CPU EP kernel is
+  registered for `ai.onnx::Abs` at opset 13.
+- `test_add_int16_cpu` reaches the Add kernel, then reports that its f32 input
+  path expected Float32 but received Int16.
+
+The exact pass/fail/skip test-name set is recorded in
+`crates/onnx-runtime-python/conformance/onnx_backend_node_results.txt`. Re-run
+with:
+
+```bash
+export PATH=/home/justinchu/.conda/envs/onnx/bin:$PATH
+cd /path/to/onnx-genai/crates/onnx-runtime-python
+maturin build --release
+python -m pip install --force-reinstall \
+  ../../target/wheels/nxrt-*cp310-abi3*.whl
+python -m pytest tests/test_onnx_backend.py -q \
+  --junitxml=../../target/onnx-backend-test/junit.xml
+```
