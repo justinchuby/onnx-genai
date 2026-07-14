@@ -123,13 +123,14 @@ fn map_session_error(err: &SessionError) -> OrtErrorCode {
         | E::DtypeMismatch { .. }
         | E::ShapeMismatch { .. }
         | E::UnknownOption { .. }
+        | E::InvalidOption { .. }
         | E::DynamicShape { .. }
         | E::SymbolConflict { .. }
         | E::RankMismatch { .. } => OrtErrorCode::InvalidArgument,
         E::NoModelSource => OrtErrorCode::NoModel,
         E::UnsupportedOp { .. } => OrtErrorCode::NotImplemented,
         E::Ep(_) => OrtErrorCode::EpFail,
-        E::Ir(_) | E::Graph(_) => OrtErrorCode::InvalidGraph,
+        E::Ir(_) | E::Graph(_) | E::Optimize(_) | E::ShapeInfer(_) => OrtErrorCode::InvalidGraph,
         E::Load(load) => map_loader_error(load),
         E::NotInitialized
         | E::Internal(_)

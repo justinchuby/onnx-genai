@@ -11,6 +11,8 @@ categories = ["science", "api-bindings"]
 [dependencies]
 onnx-runtime-ir = { workspace = true }
 onnx-runtime-loader = { workspace = true }
+onnx-runtime-shape-inference = { workspace = true }
+onnx-runtime-optimizer = { workspace = true }
 onnx-runtime-ep-api = { workspace = true }
 onnx-runtime-ep-cpu = { workspace = true }
 thiserror = { workspace = true }

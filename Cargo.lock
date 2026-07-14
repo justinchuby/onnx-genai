@@ -1838,6 +1838,8 @@ dependencies = [
  "onnx-runtime-ep-cpu",
  "onnx-runtime-ir",
  "onnx-runtime-loader",
+ "onnx-runtime-optimizer",
+ "onnx-runtime-shape-inference",
  "thiserror 2.0.18",
 ]
 

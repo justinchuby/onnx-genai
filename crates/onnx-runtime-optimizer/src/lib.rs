@@ -41,7 +41,7 @@ mod pass;
 pub use constant_folding::ConstantFolding;
 pub use dead_node::DeadNodeElimination;
 pub use error::{OptimizerError, Result};
-pub use fusion::{FusionPattern, OpFusion, PatternMatch, default_fusion_patterns};
+pub use fusion::{CONTRIB_DOMAIN, FusionPattern, OpFusion, PatternMatch, default_fusion_patterns};
 pub use pass::{OptimizationPass, PassContext, run_passes};
 
 /// The device-independent Phase-1 pass pipeline, in run order.

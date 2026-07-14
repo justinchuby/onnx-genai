@@ -39,6 +39,13 @@ mod error {
         #[error("unknown session option: {key}")]
         UnknownOption { key: String },
 
+        #[error("invalid value {value:?} for session option {key:?}: expected one of {expected}")]
+        InvalidOption {
+            key: String,
+            value: String,
+            expected: String,
+        },
+
         #[error("no model source: set a path or bytes on the builder")]
         NoModelSource,
 
@@ -107,6 +114,12 @@ mod error {
 
         #[error(transparent)]
         Graph(#[from] onnx_runtime_ir::GraphError),
+
+        #[error(transparent)]
+        Optimize(#[from] onnx_runtime_optimizer::OptimizerError),
+
+        #[error(transparent)]
+        ShapeInfer(#[from] onnx_runtime_shape_inference::ShapeInferError),
     }
 
     /// Session `Result` alias.
@@ -143,6 +156,60 @@ pub enum DevicePreference {
 pub struct WarmupShape {
     pub input_name: String,
     pub shape: Vec<usize>,
+}
+
+/// Graph-optimization level for the session's `optimize` pipeline stage
+/// (`docs/ORT2.md` §18). Selected via the generic `"optimization"` session
+/// option (see [`SessionBuilder::option`]).
+///
+/// The default is [`OptimizationLevel::None`]: with optimization off the graph
+/// reaches the executor exactly as the loader produced it, so default runtime
+/// behavior is byte-identical to a build with no optimizer wired in at all.
+///
+/// This is a generic, model-agnostic knob — no level ever special-cases a model
+/// name or op. Higher levels simply enable more of the device-independent pass
+/// pipeline from [`onnx_runtime_optimizer`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum OptimizationLevel {
+    /// No passes — the `optimize` stage is a no-op (default).
+    #[default]
+    None,
+    /// Structure-preserving passes only: constant folding then dead-node
+    /// elimination. No operator fusion, so the op set the executor sees is a
+    /// subset of the loaded graph's.
+    Basic,
+    /// The full device-independent pipeline: constant folding, dead-node
+    /// elimination, and operator fusion (which can introduce fused
+    /// `com.microsoft` contrib ops such as `LayerNormalization`).
+    All,
+}
+
+impl OptimizationLevel {
+    /// Parse the `"optimization"` option value. Accepts `"none"`, `"basic"`,
+    /// and `"all"` (case-insensitive).
+    fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "none" | "off" | "0" => Some(Self::None),
+            "basic" => Some(Self::Basic),
+            "all" => Some(Self::All),
+            _ => None,
+        }
+    }
+
+    /// The optimizer passes this level enables, in pipeline order. Empty for
+    /// [`OptimizationLevel::None`].
+    fn passes(self) -> Vec<Box<dyn onnx_runtime_optimizer::OptimizationPass>> {
+        use onnx_runtime_optimizer::{ConstantFolding, DeadNodeElimination, OpFusion};
+        match self {
+            Self::None => Vec::new(),
+            Self::Basic => vec![Box::new(ConstantFolding), Box::new(DeadNodeElimination)],
+            Self::All => vec![
+                Box::new(ConstantFolding),
+                Box::new(DeadNodeElimination),
+                Box::new(OpFusion::new()),
+            ],
+        }
+    }
 }
 
 /// Builder for advanced session configuration (§20.6).
@@ -192,28 +259,78 @@ impl SessionBuilder {
         self
     }
 
-    /// Set a namespaced option. Unknown keys are rejected at [`Self::build`].
+    /// Set a namespaced option. Unknown keys — and unknown values for a known
+    /// key — are rejected at [`Self::build`].
+    ///
+    /// # Recognized options
+    ///
+    /// | Key            | Values                     | Default  | Effect |
+    /// |----------------|----------------------------|----------|--------|
+    /// | `"optimization"` | `"none"`, `"basic"`, `"all"` | `"none"` | Graph optimization level (see [`OptimizationLevel`]). |
+    ///
+    /// `"optimization"` = `"none"` (the default) leaves the loaded graph
+    /// untouched, so behavior is byte-identical to a runtime with no optimizer.
+    /// `"basic"` runs constant folding + dead-node elimination; `"all"` adds
+    /// operator fusion. When any pass runs, the session re-runs shape inference
+    /// on the rewritten graph before compiling so fused/introduced nodes get
+    /// inferred shapes.
     pub fn option(mut self, key: &str, value: &str) -> Self {
         self.options.insert(key.to_string(), value.to_string());
         self
     }
 
+    /// Resolve the `"optimization"` option to an [`OptimizationLevel`], rejecting
+    /// any unknown option key or unparseable value.
+    fn optimization_level(options: &HashMap<String, String>) -> Result<OptimizationLevel> {
+        let mut level = OptimizationLevel::None;
+        for (key, value) in options {
+            match key.as_str() {
+                "optimization" => {
+                    level = OptimizationLevel::parse(value).ok_or_else(|| {
+                        SessionError::InvalidOption {
+                            key: key.clone(),
+                            value: value.clone(),
+                            expected: "none, basic, all".to_string(),
+                        }
+                    })?;
+                }
+                // No compat shim: an unrecognized key is a typo, not a silent
+                // no-op.
+                _ => return Err(SessionError::UnknownOption { key: key.clone() }),
+            }
+        }
+        Ok(level)
+    }
+
     /// Build the session: load → detect device → optimize → compile → allocate.
     ///
-    /// Phase 1: device selection is CPU-only (`auto_detect` yields the CPU EP),
-    /// the optimize stage is a no-op, and "compile" resolves a kernel per node
-    /// into the shape-keyed cache.
+    /// The `optimize` stage is driven by the `"optimization"` session option and
+    /// defaults to [`OptimizationLevel::None`] (a no-op), so the default path is
+    /// byte-identical to loading straight into the executor. When optimization
+    /// is enabled the pipeline is:
+    ///
+    /// ```text
+    /// load (+ loader shape inference)
+    ///   → run optimizer passes (constant-fold / DCE / fusion)
+    ///   → re-run shape inference on the rewritten graph
+    ///   → compile (kernel per node) → allocate
+    /// ```
+    ///
+    /// The re-inference step is essential: fusion can replace a multi-op
+    /// decomposition (e.g. the 9-op LayerNorm) with a single fused node whose
+    /// output has no inferred shape yet, and the compile/execute stages require
+    /// every value to carry a resolved shape.
+    ///
+    /// Device selection is CPU-only (`auto_detect` yields the CPU EP), and
+    /// "compile" resolves a kernel per node into the shape-keyed cache.
     pub fn build(self) -> Result<InferenceSession> {
-        // Phase 1 recognizes no session options; reject any provided key so
-        // typos surface instead of being silently ignored (no compat shim).
-        if let Some(key) = self.options.keys().next() {
-            return Err(SessionError::UnknownOption { key: key.clone() });
-        }
+        let level = Self::optimization_level(&self.options)?;
+
         // `memory_limit`, `enable_profiling`, and non-CPU `device` preferences
         // are accepted but not yet acted on in Phase 1 (CPU-only executor).
         let _ = (self.device, self.memory_limit, self.enable_profiling);
 
-        let (graph, weights) = match (self.model_path, self.model_bytes) {
+        let (mut graph, weights) = match (self.model_path, self.model_bytes) {
             (Some(path), _) => onnx_runtime_loader::load_model_with_weights(path)?,
             (None, Some(bytes)) => {
                 onnx_runtime_loader::load_model_bytes_with_weights(&bytes, ".")?
@@ -221,12 +338,55 @@ impl SessionBuilder {
             (None, None) => return Err(SessionError::NoModelSource),
         };
 
+        // Optimize stage. Off by default; only runs when a level is selected.
+        optimize_graph(&mut graph, level)?;
+
         let mut session = InferenceSession::from_parts(graph, weights)?;
         if !self.warmup_shapes.is_empty() {
             session.warmup(&self.warmup_shapes)?;
         }
         Ok(session)
     }
+}
+
+/// Run the optimizer passes selected by `level`, then re-run shape inference so
+/// any node fusion introduced (whose outputs the loader never saw) gets a fully
+/// inferred shape/dtype before compile.
+///
+/// A no-op when `level` is [`OptimizationLevel::None`] — the graph is returned
+/// untouched and no re-inference runs, keeping the default path byte-identical.
+fn optimize_graph(graph: &mut onnx_runtime_ir::Graph, level: OptimizationLevel) -> Result<()> {
+    let passes = level.passes();
+    if passes.is_empty() {
+        return Ok(());
+    }
+
+    onnx_runtime_optimizer::run_passes(
+        graph,
+        &passes,
+        &onnx_runtime_optimizer::PassContext::new(),
+    )?;
+
+    // Fusion emits fused ops in the `com.microsoft` contrib domain; make sure
+    // that domain is imported so shape-inference and kernel dispatch pick the
+    // contrib-registered rules (they register from opset 1, but recording the
+    // import keeps the graph self-consistent and future-proofs versioned rules).
+    graph
+        .opset_imports
+        .entry(onnx_runtime_optimizer::CONTRIB_DOMAIN.to_string())
+        .or_insert(1);
+
+    // Re-infer shapes over the rewritten graph: fused nodes' outputs (and any
+    // value whose producer changed) must be re-resolved before compile.
+    let registry = onnx_runtime_shape_inference::InferenceRegistry::default_registry();
+    let opset_imports = graph.opset_imports.clone();
+    registry.infer_graph(
+        graph,
+        &opset_imports,
+        onnx_runtime_shape_inference::MergePolicy::Permissive,
+    )?;
+
+    Ok(())
 }
 
 /// A loaded model ready to run inference (§20.2).
@@ -331,4 +491,58 @@ impl InferenceSession {
 /// This is the primary entry point — no configuration required.
 pub fn load(path: impl AsRef<Path>) -> Result<InferenceSession> {
     InferenceSession::load(path)
+}
+
+#[cfg(test)]
+mod option_tests {
+    use super::*;
+
+    fn opts(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn optimization_defaults_to_none_when_unset() {
+        let level = SessionBuilder::optimization_level(&opts(&[])).unwrap();
+        assert_eq!(level, OptimizationLevel::None);
+    }
+
+    #[test]
+    fn optimization_parses_known_values() {
+        for (v, want) in [
+            ("none", OptimizationLevel::None),
+            ("off", OptimizationLevel::None),
+            ("BASIC", OptimizationLevel::Basic),
+            ("All", OptimizationLevel::All),
+        ] {
+            let level = SessionBuilder::optimization_level(&opts(&[("optimization", v)])).unwrap();
+            assert_eq!(level, want, "value {v:?}");
+        }
+    }
+
+    #[test]
+    fn unknown_option_key_is_rejected() {
+        let err = SessionBuilder::optimization_level(&opts(&[("optimisation", "all")])).unwrap_err();
+        assert!(matches!(err, SessionError::UnknownOption { key } if key == "optimisation"));
+    }
+
+    #[test]
+    fn invalid_optimization_value_is_rejected() {
+        let err =
+            SessionBuilder::optimization_level(&opts(&[("optimization", "aggressive")])).unwrap_err();
+        assert!(matches!(
+            err,
+            SessionError::InvalidOption { key, value, .. } if key == "optimization" && value == "aggressive"
+        ));
+    }
+
+    #[test]
+    fn none_level_selects_no_passes() {
+        assert!(OptimizationLevel::None.passes().is_empty());
+        assert_eq!(OptimizationLevel::Basic.passes().len(), 2);
+        assert_eq!(OptimizationLevel::All.passes().len(), 3);
+    }
 }
