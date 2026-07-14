@@ -5297,6 +5297,281 @@ If GitHub Copilot is adding Perfetto support, we ensure:
 3. Support `trace_processor` SQL queries for custom analysis
 4. Shared `flow_id` namespace for cross-tool correlation
 
+### 48.8 Multi-Backend Architecture
+
+One instrumentation point, multiple consumers. Code never knows which backends are active.
+
+```
+trace_event!("MatMul_0", ...)      ← single annotation in code
+         │
+         ▼
+  ┌─────────────────────────┐
+  │   TraceContext           │
+  │   (single emit point)    │
+  └────────────┬────────────┘
+               │ fan-out via CompositeCollector
+    ┌──────────┼──────────────┬────────────────┬─────────────┐
+    ▼          ▼              ▼                ▼             ▼
+ Perfetto   Chrome JSON    ITT API          CUPTI        Custom
+ Collector  Collector      Collector        Collector    (OTel, webhook)
+    │          │              │                │
+    ▼          ▼              ▼                ▼
+ .perfetto   trace.json    VTune/Inspector  GPU kernel   Datadog/etc.
+```
+
+#### 48.8.1 CompositeCollector
+
+```rust
+/// Fan-out: emit one event to multiple backends simultaneously.
+pub struct CompositeCollector {
+    collectors: Vec<Box<dyn TraceCollector>>,
+}
+
+impl CompositeCollector {
+    pub fn new() -> Self {
+        Self { collectors: Vec::new() }
+    }
+
+    pub fn add(&mut self, collector: Box<dyn TraceCollector>) {
+        self.collectors.push(collector);
+    }
+}
+
+impl TraceCollector for CompositeCollector {
+    fn emit(&self, event: &TraceEvent) {
+        for collector in &self.collectors {
+            collector.emit(event);
+        }
+    }
+
+    fn flush(&self) -> Result<()> {
+        for collector in &self.collectors {
+            collector.flush()?;
+        }
+        Ok(())
+    }
+}
+```
+
+#### 48.8.2 ITT Collector (Intel VTune / Inspector)
+
+Bridges our `TraceEvent` into Intel ITT API annotations. When VTune is attached, events
+become visible in its timeline. When not attached, ITT stubs out to zero overhead.
+
+Dependency: `ittapi` crate (official Rust bindings from `intel/ittapi`, on crates.io).
+
+```rust
+use ittapi::{Domain, Task, StringHandle};
+
+pub struct IttCollector {
+    domain: Domain,
+    /// Pre-registered string handles (ITT perf requirement).
+    string_cache: DashMap<String, StringHandle>,
+}
+
+impl IttCollector {
+    pub fn new(domain_name: &str) -> Self {
+        Self {
+            domain: Domain::new(domain_name),
+            string_cache: DashMap::new(),
+        }
+    }
+
+    fn get_or_create_handle(&self, name: &str) -> StringHandle {
+        self.string_cache
+            .entry(name.to_string())
+            .or_insert_with(|| StringHandle::new(&self.domain, name))
+            .clone()
+    }
+}
+
+impl TraceCollector for IttCollector {
+    fn emit(&self, event: &TraceEvent) {
+        match event.phase {
+            TracePhase::Begin => {
+                let handle = self.get_or_create_handle(&event.name);
+                Task::begin(&self.domain, handle);
+            }
+            TracePhase::End => {
+                Task::end(&self.domain);
+            }
+            TracePhase::Instant => {
+                let handle = self.get_or_create_handle(&event.name);
+                ittapi::marker(&self.domain, handle);
+            }
+            _ => {} // counters — no direct ITT equivalent
+        }
+    }
+
+    fn flush(&self) -> Result<()> {
+        Ok(()) // ITT doesn't need explicit flush
+    }
+}
+```
+
+ITT also provides **JIT Profiling API** — useful for reporting NVRTC-compiled kernels
+and dynamically generated code to VTune:
+
+```rust
+// When we JIT-compile an elementwise kernel via NVRTC:
+ittapi::jit::notify_code_loaded(
+    "fused_gelu_silu_fp16",   // symbol name VTune will show
+    code_ptr,                  // pointer to compiled code
+    code_size,                 // code size in bytes
+);
+```
+
+#### 48.8.3 CUPTI Collector
+
+Wraps §49 `CuptiProfiler` as a `TraceCollector`. On dispatch events, registers
+correlation IDs. On flush, injects GPU kernel records back into the Perfetto trace.
+
+```rust
+pub struct CuptiCollector {
+    profiler: CuptiProfiler,
+}
+
+impl TraceCollector for CuptiCollector {
+    fn emit(&self, event: &TraceEvent) {
+        // Register correlation on kernel dispatch
+        if event.category == "compute" && event.phase == TracePhase::Begin {
+            if let Some(node_id) = event.node_id {
+                let corr_id = current_cuda_correlation_id();
+                self.profiler.correlate(corr_id, node_id, &event.name);
+            }
+        }
+    }
+
+    fn flush(&self) -> Result<()> {
+        // Flush CUPTI activity buffers → GPU kernel events
+        // These merge into the Perfetto trace as gpu.stream* tracks
+        let _gpu_records = self.profiler.stop_and_flush()?;
+        Ok(())
+    }
+}
+```
+
+#### 48.8.4 Provider Registry (Plugin System)
+
+```rust
+/// Extensible registry of tracing backends.
+pub struct TracerRegistry {
+    factories: HashMap<String, Box<dyn CollectorFactory>>,
+}
+
+pub trait CollectorFactory: Send + Sync {
+    /// Try to create. Returns None if backend unavailable on this system.
+    /// (No CUPTI on AMD, no ITT without VTune installed, etc.)
+    fn try_create(&self) -> Result<Option<Box<dyn TraceCollector>>>;
+}
+
+impl TracerRegistry {
+    pub fn new() -> Self {
+        let mut reg = Self { factories: HashMap::new() };
+        // Built-in providers
+        reg.register("perfetto", Box::new(PerfettoFactory));
+        reg.register("chrome", Box::new(ChromeJsonFactory));
+        reg.register("jsonl", Box::new(JsonlFactory));
+        reg.register("itt", Box::new(IttFactory));       // Intel VTune
+        reg.register("cupti", Box::new(CuptiFactory));   // NVIDIA GPU
+        reg.register("noop", Box::new(NoopFactory));
+        reg
+    }
+
+    pub fn register(&mut self, name: &str, factory: Box<dyn CollectorFactory>) {
+        self.factories.insert(name.to_string(), factory);
+    }
+
+    /// Build a CompositeCollector from a list of backend names.
+    pub fn build(&self, backends: &[&str]) -> Result<CompositeCollector> {
+        let mut composite = CompositeCollector::new();
+        for name in backends {
+            let factory = self.factories.get(*name)
+                .ok_or_else(|| Error::UnknownBackend(name.to_string()))?;
+            if let Some(collector) = factory.try_create()? {
+                composite.add(collector);
+            }
+            // try_create returns None → gracefully skipped
+        }
+        Ok(composite)
+    }
+}
+```
+
+#### 48.8.5 User API
+
+```python
+import nxrt
+
+# Default: Perfetto only
+session = nxrt.load("model.onnx")
+
+# Multiple backends
+session = nxrt.load("model.onnx", options={
+    "trace.backends": "perfetto,itt",           # Perfetto + VTune
+    # or all:
+    "trace.backends": "perfetto,itt,cupti",     # all three
+})
+
+# Runtime dynamic
+with nxrt.profiler.profile(backends=["perfetto", "itt", "cupti"]) as prof:
+    session.run(inputs)
+prof.export_perfetto("trace.perfetto")  # Perfetto file includes GPU kernel tracks
+# VTune (if attached) already captured ITT events live
+```
+
+```bash
+# CLI
+nxrt profile model.onnx --backends perfetto,itt --output trace.perfetto
+
+# With VTune collection wrapping us:
+vtune -collect hotspots -- nxrt run model.onnx --input data.npz
+# → VTune sees op-level task annotations via ITT automatically
+```
+
+#### 48.8.6 Cargo Features (Optional Dependencies)
+
+```toml
+# crates/onnx-runtime-tracer/Cargo.toml
+[features]
+default = ["perfetto"]
+perfetto = ["dep:prost"]       # Perfetto protobuf serialization
+itt = ["dep:ittapi"]           # Intel ITT API (VTune/Inspector)
+cupti = []                     # CUPTI is dlopen'd, no link-time dep
+chrome = []                    # Chrome Trace JSON (always available, no extra dep)
+otel = ["dep:opentelemetry"]   # OpenTelemetry export (stretch)
+
+[dependencies]
+ittapi = { version = "0.4", optional = true }
+prost = { version = "0.13", optional = true }
+opentelemetry = { version = "0.27", optional = true }
+```
+
+#### 48.8.7 Zero-Overhead Guarantee
+
+| Backend | No collector attached | Collector attached | Overhead source |
+|---------|----------------------|-------------------|------------------|
+| Perfetto | Skip (TraceContext::noop) | 3-5% | Protobuf serialization |
+| ITT | 0% (stub functions) | 2-4% | VTune data collection |
+| CUPTI | 0% (not dlopen'd) | 2-5% (activity) | GPU activity buffer copy |
+| Chrome JSON | Skip | 5-8% | JSON formatting |
+
+When `TraceContext::noop()` is active (no profiling), the entire trace path compiles
+down to a no-op branch prediction. In release builds with LTO, the compiler eliminates
+dead code paths for disabled features.
+
+#### 48.8.8 Design Decisions
+
+| Decision | Choice | Rationale |
+|----------|--------|----------|
+| Single emit point | **Yes** (TraceEvent) | Code annotates once, backends are config |
+| Fan-out vs select-one | **Fan-out** (CompositeCollector) | Multiple tools simultaneously is normal workflow |
+| ITT as optional feature | **Yes** (cargo feature `itt`) | Don't pull ittapi for non-Intel targets |
+| CUPTI as dlopen | **Yes** (no link-time dep) | Works on machines without NVIDIA drivers |
+| Registry extensible | **Yes** (CollectorFactory trait) | Third-party: OpenTelemetry, Datadog, custom |
+| Provider unavailable | **Graceful skip** (try_create → None) | Don't crash if user requests "cupti" on AMD |
+| String handle caching (ITT) | **Yes** (DashMap) | ITT perf requirement: pre-register strings |
+
 ---
 
 ## 49. CUPTI Integration (GPU Kernel-Level Tracing)
