@@ -19,12 +19,13 @@ perfetto = ["dep:prost"]
 # exists so the backend can be named/selected uniformly (§48.8.4/§48.8.6); the
 # `chrome` module is compiled unconditionally.
 chrome = []
-# Intel ITT (VTune/Inspector) backend (§48.8.2). Declared as a capability flag
-# gating a documented stub module (`src/itt.rs`). The upstream `ittapi` crate is
-# intentionally NOT pulled yet: this build is offline and `ittapi` is not
-# vendored, and the real collector body (which needs live VTune) is a later
-# phase. When implemented this becomes `itt = ["dep:ittapi"]`.
-itt = []
+# Intel ITT (VTune/Inspector) backend (§48.8.2). Bridges TraceEvents into Intel
+# ITT task annotations via the official `ittapi` crate (which links the static
+# `ittnotify` C library, compiled from vendored source — no system dependency).
+# Implemented in `src/itt.rs` with NO `unsafe` in this crate: all FFI is confined
+# to `ittapi`, so `forbid(unsafe_code)` stays active for this feature. When no
+# ITT collector (VTune) is attached, every annotation is an inert stub.
+itt = ["dep:ittapi"]
 # OpenTelemetry export (stretch, §48.8.6). Declared as an empty capability flag
 # for the same offline/deferred reasons as `itt`; becomes
 # `otel = ["dep:opentelemetry"]` when implemented.
@@ -45,6 +46,11 @@ prost = { version = "0.13", optional = true }
 # Runtime dlopen/dlsym of libcupti for the `cupti` feature. Pure Rust, no
 # link-time CUDA dependency; only pulled in when `cupti` is enabled.
 libloading = { version = "0.8", optional = true }
+# Intel ITT (VTune/Inspector) task annotations for the `itt` feature. Links the
+# static `ittnotify` C library (built from vendored source by `ittapi-sys` via
+# `cc`, no system/`protoc` dependency); only pulled in when `itt` is enabled. The
+# crate exposes a safe API, so this crate needs no `unsafe` of its own.
+ittapi = { version = "0.5", optional = true }
 
 [dev-dependencies]
 # Used only by the `perfetto` feature's export test to decode and validate the

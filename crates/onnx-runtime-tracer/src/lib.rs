@@ -84,7 +84,7 @@
 //! |---------|---------|--------|
 //! | `perfetto` | ✅ | Perfetto protobuf export via `prost` ([`perfetto`]). |
 //! | `chrome` | | Names the always-available Chrome JSON backend (no dep). |
-//! | `itt` | | Capability flag for the future Intel ITT collector ([`itt`], stub). |
+//! | `itt` | | Intel ITT (VTune/Inspector) task annotations via `ittapi` ([`itt`]). |
 //! | `otel` | | Capability flag for the future OpenTelemetry export. |
 //! | `cupti` | | GPU kernel tracing via a runtime-`dlopen`'d CUPTI Activity API collector ([`cupti`]). |
 //!
@@ -94,10 +94,11 @@
 //! ## Scope (Phase 2)
 //!
 //! This crate ships the standalone collector architecture + Chrome/JSONL/
-//! Perfetto export, plus the `cupti` GPU-kernel collector (Activity-API path,
-//! §48.8.3/§49). It is intentionally **not** wired into the session executor
-//! yet (§48.5); the ITT (§48.8.2) and OpenTelemetry backends are declared but
-//! deferred, and CUPTI PM-counter metrics (§49.3) are a documented Phase-2 stub.
+//! Perfetto export, the `cupti` GPU-kernel collector (Activity-API path,
+//! §48.8.3/§49), and the `itt` VTune/Inspector collector (§48.8.2). It is
+//! intentionally **not** wired into the session executor yet (§48.5); the
+//! OpenTelemetry backend is declared but deferred, and CUPTI PM-counter metrics
+//! (§49.3) are a documented Phase-2 stub.
 //!
 //! [`onnx-runtime-ir`]: https://docs.rs/onnx-runtime-ir
 
