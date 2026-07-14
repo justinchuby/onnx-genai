@@ -613,7 +613,7 @@ extern "C" {
 ```
 
 ```rust
-// crates/ort-ep-cpu/src/kernels/matmul.rs
+// crates/onnx-runtime-ep-cpu/src/kernels/matmul.rs
 extern "C" {
     fn cpu_matmul_execute(
         a: *const f32, a_shape: *const i64, a_ndim: c_int, a_strides: *const i64,
@@ -1586,7 +1586,7 @@ impl OptimizationPass for AttentionFusionPass {
 ### 13.3 Flash Attention Kernel Binding (CUDA)
 
 ```rust
-// In ort-ep-cuda
+// In onnx-runtime-ep-cuda
 pub struct FlashAttentionKernel {
     causal: bool,
     num_heads: usize,
@@ -2195,7 +2195,7 @@ pub extern "C" fn OrtGetApiBase() -> *const OrtApiBase {
 ```
 
 ```toml
-# crates/ort-capi/Cargo.toml
+# crates/onnx-runtime-capi/Cargo.toml
 [lib]
 name = "onnxruntime"
 crate-type = ["cdylib"]
@@ -2307,18 +2307,18 @@ onnx-genai/                               (monorepo)
 │   │  ── Runtime layer (new — ORT 2.0) ──
 │   ├── onnx-ir2/                         # Graph IR, types, shapes, strides, layout
 │   │                                     # (named onnx-ir2 because onnx-ir is taken)
-│   ├── ort-loader/                       # ONNX protobuf → IR, weight mmap
-│   ├── ort-optimizer/                    # Optimization passes pipeline
-│   ├── ort-cost-model/                   # Cost estimation, calibration
-│   ├── ort-memory/                       # Arena allocator, memory planner
-│   ├── ort-scheduler/                    # Async DAG executor, streams, fences
-│   ├── ort-ep-api/                       # ExecutionProvider trait + ORT ABI bridge
-│   ├── ort-ep-cpu/                       # CPU EP (oneDNN, C++ FFI) — we maintain
-│   ├── ort-ep-cuda/                      # CUDA EP (CuTe + cuBLAS) — we maintain
-│   ├── ort-session/                      # Session builder, inference API
-│   ├── ort-profiler/                     # Tracing, Chrome Trace, memory debugger
-│   ├── ort-capi/                         # C ABI: libonnxruntime.so drop-in
-│   ├── ort-autotuner/                    # Agent-driven optimization loop
+│   ├── onnx-runtime-loader/                       # ONNX protobuf → IR, weight mmap
+│   ├── onnx-runtime-optimizer/                    # Optimization passes pipeline
+│   ├── onnx-runtime-cost-model/                   # Cost estimation, calibration
+│   ├── onnx-runtime-memory/                       # Arena allocator, memory planner
+│   ├── onnx-runtime-scheduler/                    # Async DAG executor, streams, fences
+│   ├── onnx-runtime-ep-api/                       # ExecutionProvider trait + ORT ABI bridge
+│   ├── onnx-runtime-ep-cpu/                       # CPU EP (oneDNN, C++ FFI) — we maintain
+│   ├── onnx-runtime-ep-cuda/                      # CUDA EP (CuTe + cuBLAS) — we maintain
+│   ├── onnx-runtime-session/                      # Session builder, inference API
+│   ├── onnx-runtime-profiler/                     # Tracing, Chrome Trace, memory debugger
+│   ├── onnx-runtime-capi/                         # C ABI: libonnxruntime.so drop-in
+│   ├── onnx-runtime-autotuner/                    # Agent-driven optimization loop
 │   │
 │   │  ── GenAI layer (existing) ──
 │   ├── onnx-genai/                      # Main crate / facade
@@ -2348,7 +2348,7 @@ onnx-genai/                               (monorepo)
 └── Cargo.toml                            # Workspace
 
 EP compatibility:
-  - ort-ep-cpu, ort-ep-cuda: we write and maintain (ported from ORT C++)
+  - onnx-runtime-ep-cpu, onnx-runtime-ep-cuda: we write and maintain (ported from ORT C++)
   - MLX EP: Justin's existing implementation (separate or merged later)
   - QNN, OpenVINO, WebGPU, CoreML, ROCm, etc.: loaded as legacy ORT
     plugin EPs via dlopen + C ABI bridge. We don't write these —
@@ -2364,7 +2364,7 @@ GenAI crates are backend-agnostic:
 [features]
 default = ["backend-ort"]
 backend-ort = ["dep:onnx-genai-ort"]      # upstream ORT via C API
-backend-ort2 = ["dep:ort-session"]        # our runtime
+backend-ort2 = ["dep:onnx-runtime-session"]        # our runtime
 ```
 
 ```rust
@@ -2412,9 +2412,9 @@ result = tuner.auto_tune({"input_ids": input_array}, max_iterations=20)
 ### 24.2 Per-EP Packages
 
 Each EP is a separate pip package:
-- `pip install ort-ep-cuda`
-- `pip install ort-ep-mlx`
-- `pip install ort-ep-webgpu`
+- `pip install onnx-runtime-ep-cuda`
+- `pip install onnx-runtime-ep-mlx`
+- `pip install onnx-runtime-ep-webgpu`
 
 ```python
 # Each EP package exports:
@@ -2481,11 +2481,11 @@ If an EP fails at runtime:
 ### 27.1 Unit Tests (per crate)
 
 ```rust
-// ort-ir: graph construction, topological sort, validation
-// ort-optimizer: each pass in isolation with small test graphs
-// ort-cost-model: cost formula correctness
-// ort-memory: arena allocation, aliasing correctness
-// ort-scheduler: DAG execution ordering, fence semantics
+// onnx-ir2: graph construction, topological sort, validation
+// onnx-runtime-optimizer: each pass in isolation with small test graphs
+// onnx-runtime-cost-model: cost formula correctness
+// onnx-runtime-memory: arena allocation, aliasing correctness
+// onnx-runtime-scheduler: DAG execution ordering, fence semantics
 ```
 
 ### 27.2 Integration Tests
@@ -2555,35 +2555,35 @@ pub fn conformance_test(model_path: &Path, inputs: &[Tensor], tolerance: f64) ->
 
 ### Phase 1: Foundation (8-12 weeks)
 - [ ] `onnx-ir2`: Graph IR with all types, validation, mutation API
-- [ ] `ort-loader`: ONNX protobuf parser, shape inference, weight mmap (safetensors + external data)
-- [ ] `ort-ep-api`: ExecutionProvider trait, Kernel trait, OpRegistry
-- [ ] `ort-ep-cpu`: Basic ops (MatMul, Add, Relu, Reshape, Transpose, Gather, LayerNorm) via oneDNN
-- [ ] `ort-session`: SessionBuilder, sequential executor (no async), basic Run API
-- [ ] `ort-capi`: OrtGetApiBase + CreateSession + Run (Tier 1 C API)
+- [ ] `onnx-runtime-loader`: ONNX protobuf parser, shape inference, weight mmap (safetensors + external data)
+- [ ] `onnx-runtime-ep-api`: ExecutionProvider trait, Kernel trait, OpRegistry
+- [ ] `onnx-runtime-ep-cpu`: Basic ops (MatMul, Add, Relu, Reshape, Transpose, Gather, LayerNorm) via oneDNN
+- [ ] `onnx-runtime-session`: SessionBuilder, sequential executor (no async), basic Run API
+- [ ] `onnx-runtime-capi`: OrtGetApiBase + CreateSession + Run (Tier 1 C API)
 - [ ] **Milestone: run BERT on CPU, output matches ORT**
 
 ### Phase 2: Multi-Device + EPs (8-12 weeks)
 _Depends on: Phase 1 complete_
-- [ ] `ort-ep-cuda`: CUDA EP with cuBLAS GEMM + CuTe LayerNorm/GELU
-- [ ] `ort-ep-api`: ORT Graph ABI bridge for legacy plugin EPs
+- [ ] `onnx-runtime-ep-cuda`: CUDA EP with cuBLAS GEMM + CuTe LayerNorm/GELU
+- [ ] `onnx-runtime-ep-api`: ORT Graph ABI bridge for legacy plugin EPs
 - [ ] Legacy EP loading (dlopen + vtable)
-- [ ] `ort-cost-model`: Static cost formulas + device profiles
-- [ ] `ort-optimizer`: ConstantFolding, DeadNodeElimination, OpFusion, AttentionFusion
+- [ ] `onnx-runtime-cost-model`: Static cost formulas + device profiles
+- [ ] `onnx-runtime-optimizer`: ConstantFolding, DeadNodeElimination, OpFusion, AttentionFusion
 - [ ] Layout propagation pass
 - [ ] Placement optimizer (greedy first, ILP stretch goal)
-- [ ] `ort-scheduler`: Async DAG executor with streams + fences
+- [ ] `onnx-runtime-scheduler`: Async DAG executor with streams + fences
 - [ ] Transfer insertion pass + async transfer
 - [ ] **Milestone: run Llama on CUDA EP, 2+ EPs in one graph**
 
 ### Phase 3: Performance (6-10 weeks)
 _Depends on: Phase 2 complete_
-- [ ] `ort-memory`: Arena allocator, lifetime analysis, buffer aliasing, in-place detection
+- [ ] `onnx-runtime-memory`: Arena allocator, lifetime analysis, buffer aliasing, in-place detection
 - [ ] Double-buffered async transfers
 - [ ] CUDA graph capture for decode step
 - [ ] Compute-communication overlap (micro-chunking)
 - [ ] FlashAttention integration (flash-attn library binding)
 - [ ] CuTe kernels: FusedResidualLayerNorm, RoPE, FusedGEMM+Bias+Act
-- [ ] `ort-profiler`: Chrome Trace + Perfetto export, cross-device timeline
+- [ ] `onnx-runtime-profiler`: Chrome Trace + Perfetto export, cross-device timeline
 - [ ] Cost model calibration + profiling feedback loop
 - [ ] Dynamic shape kernel cache + bucketing
 - [ ] ILP placement optimizer (HiGHS integration)
@@ -2592,8 +2592,8 @@ _Depends on: Phase 2 complete_
 ### Phase 4: GenAI Integration (4-8 weeks)
 _Depends on: Phase 3 compute kernels working_
 - [ ] `backend-ort2` feature flag in onnx-genai-engine
-- [ ] KV cache on ort-memory arenas
-- [ ] Continuous batching through ort-scheduler
+- [ ] KV cache on onnx-runtime-memory arenas
+- [ ] Continuous batching through onnx-runtime-scheduler
 - [ ] Paged FlashAttention with block table
 - [ ] End-to-end: ONNX model → GenAI server, zero ORT dependency
 - [ ] **Milestone: onnx-genai-server runs Llama with backend-ort2**
@@ -2601,7 +2601,7 @@ _Depends on: Phase 3 compute kernels working_
 ### Phase 5: Ecosystem (ongoing)
 _Depends on: Phase 2 C API working_
 - [ ] Python bindings (`ort2` + per-EP packages)
-- [ ] `ort-autotuner`: Agent-driven optimization loop
+- [ ] `onnx-runtime-autotuner`: Agent-driven optimization loop
 - [ ] More EP crates: mlx, coreml, webgpu, qnn, openvino, rocm
 - [ ] GGUF weight loading
 - [ ] Conformance test suite (top 50 HuggingFace models)
