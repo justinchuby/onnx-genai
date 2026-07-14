@@ -1,0 +1,16 @@
+[package]
+name = "onnx-runtime-eager"
+description = "Eager (single-op) execution engine for the ORT 2.0 runtime: dispatch individual ONNX ops to EP kernels without building a graph (docs/EAGER.md)"
+version = "0.1.0-dev.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords = ["onnx", "eager", "dispatch", "inference", "runtime"]
+categories = ["science", "algorithms"]
+
+[dependencies]
+onnx-runtime-ir = { workspace = true }
+onnx-runtime-ep-api = { workspace = true }
+onnx-runtime-ep-cpu = { workspace = true }
+onnx-runtime-shape-inference = { workspace = true }
+thiserror = { workspace = true }

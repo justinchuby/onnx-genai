@@ -1815,6 +1815,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "onnx-runtime-eager"
+version = "0.1.0-dev.0"
+dependencies = [
+ "onnx-runtime-ep-api",
+ "onnx-runtime-ep-cpu",
+ "onnx-runtime-ir",
+ "onnx-runtime-shape-inference",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "onnx-runtime-ep-api"
 version = "0.1.0-dev.0"
 dependencies = [

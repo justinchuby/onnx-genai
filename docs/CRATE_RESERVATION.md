@@ -1,6 +1,6 @@
 # Reserving the `onnx-runtime-*` Crates
 
-All eleven crates use version `0.1.0-dev.0`. Their internal dependencies are
+All twelve crates use version `0.1.0-dev.0`. Their internal dependencies are
 exact-pinned to that version, so they must be published in dependency order:
 
 1. `onnx-runtime-ir`
@@ -12,8 +12,9 @@ exact-pinned to that version, so they must be published in dependency order:
 7. `onnx-runtime-ep-api`
 8. `onnx-runtime-ep-cpu`
 9. `onnx-runtime-ep-cuda`
-10. `onnx-runtime-session`
-11. `onnx-runtime-capi`
+10. `onnx-runtime-eager`
+11. `onnx-runtime-session`
+12. `onnx-runtime-capi`
 
 `onnx-runtime-cpuinfo` and `onnx-runtime-tracer` are **foundational** crates
 like `onnx-runtime-ir`: they have **no internal (`onnx-runtime-*`)
@@ -33,6 +34,7 @@ cargo publish -p onnx-runtime-optimizer
 cargo publish -p onnx-runtime-ep-api
 cargo publish -p onnx-runtime-ep-cpu
 cargo publish -p onnx-runtime-ep-cuda
+cargo publish -p onnx-runtime-eager
 cargo publish -p onnx-runtime-session
 cargo publish -p onnx-runtime-capi
 ```
@@ -74,6 +76,6 @@ external dependency is **`cudarc`** (pinned to the `0.19` line), used with
   will change the publish story and must be revisited here.
 
 For a real release, replace each crate's explicit `0.1.0-dev.0` version with
-the chosen stable version, update all eleven workspace dependency pins to the
+the chosen stable version, update all twelve workspace dependency pins to the
 same exact version, rebuild, and publish again in this order. Published
 prerelease versions are immutable and remain on crates.io.
