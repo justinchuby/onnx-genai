@@ -34,6 +34,7 @@ pub mod fused_attention;
 pub mod fused_gemm;
 pub mod fused_matmul_bias;
 pub mod gather;
+pub mod gelu;
 pub mod gemm;
 pub mod layernorm;
 pub mod matmul;
@@ -144,6 +145,13 @@ pub fn build_cpu_registry() -> OpRegistry {
     reg.register(
         OpKey::new("FusedAttention", "com.microsoft", 1),
         Box::new(fused_attention::FusedAttentionFactory),
+    );
+    // The optimizer's exact-GELU fusion emits `com.microsoft::Gelu`; bind its
+    // CPU kernel in the same contrib domain (there is no standard-domain `Gelu`
+    // op, so it is registered only under `com.microsoft`).
+    reg.register(
+        OpKey::new("Gelu", "com.microsoft", 1),
+        Box::new(gelu::GeluFactory),
     );
     // Elementwise binary broadcasting ops.
     reg.register(OpKey::new("Sub", "", 1), Box::new(elementwise::SubFactory));
@@ -597,10 +605,11 @@ mod tests {
         let reg = build_cpu_registry();
         // Every Phase-1 op has at least one factory, and each resolves at a
         // modern opset. `Softmax` is registered twice (legacy v1 + per-axis
-        // v13), and `LayerNormalization`, `FusedMatMulBias`, `FusedGemm` and
-        // `FusedAttention` add contrib (`com.microsoft`) entries, so the entry
-        // count is five more than the op-name count.
-        assert_eq!(reg.len(), PHASE1_OPS.len() + 5);
+        // v13), and `LayerNormalization`, `FusedMatMulBias`, `FusedGemm`,
+        // `FusedAttention` and the fused exact-GELU `Gelu` add contrib
+        // (`com.microsoft`) entries, so the entry count is six more than the
+        // op-name count.
+        assert_eq!(reg.len(), PHASE1_OPS.len() + 6);
         for op in PHASE1_OPS {
             assert!(reg.lookup(op, "", 21).is_some(), "missing factory for {op}");
         }
@@ -618,6 +627,10 @@ mod tests {
         // The `MatMul + Add + Relu` fusion's contrib op now has a CPU kernel.
         assert!(reg.supports("FusedGemm", "com.microsoft"));
         assert!(reg.lookup("FusedGemm", "com.microsoft", 1).is_some());
+        // The exact-GELU fusion's contrib op has a CPU kernel (contrib-only).
+        assert!(reg.supports("Gelu", "com.microsoft"));
+        assert!(reg.lookup("Gelu", "com.microsoft", 1).is_some());
+        assert!(reg.lookup("Gelu", "", 21).is_none());
     }
 
     #[test]

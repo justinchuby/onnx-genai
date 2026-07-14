@@ -195,7 +195,10 @@ impl Kernel for UnaryKernel {
 /// Gauss error function via Abramowitz & Stegun 7.1.26, evaluated in `f64`.
 /// Max absolute error ≈ 1.5e-7 — below f32 resolution over the whole range.
 /// Odd symmetry (`erf(-x) = -erf(x)`) is applied explicitly.
-fn erf(x: f64) -> f64 {
+///
+/// Shared with the fused `Gelu` kernel (`kernels::gelu`) so both the standalone
+/// `Erf` op and the fused GELU compute bit-identical error-function values.
+pub(crate) fn erf(x: f64) -> f64 {
     if x.is_nan() {
         return f64::NAN;
     }

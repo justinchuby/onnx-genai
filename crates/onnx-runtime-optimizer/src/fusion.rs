@@ -81,6 +81,20 @@ use crate::pass::{OptimizationPass, PassContext};
 /// *domain*, independent of any particular model.
 pub const CONTRIB_DOMAIN: &str = "com.microsoft";
 
+/// `√2`, the exact-GELU inner divisor (`Erf(X / √2)`).
+const SQRT_2: f32 = std::f32::consts::SQRT_2;
+/// `1/√2`, the equivalent inner *multiplier* encoding (`Mul(X, 1/√2)`).
+const FRAC_1_SQRT_2: f32 = std::f32::consts::FRAC_1_SQRT_2;
+
+/// Whether `a` matches an expected exact-GELU structural constant. The GELU
+/// constants (`0.5`, `1.0`, `√2`, `1/√2`, `2.0`) are all small and exactly
+/// representable-ish in f32; the tolerance only absorbs f32 rounding of `√2`
+/// / `1/√2`, never a numerically different coefficient — an off constant
+/// **declines** rather than silently fuses a wrong decomposition.
+fn approx(a: f32, expected: f32) -> bool {
+    (a - expected).abs() <= 1e-6 * expected.abs().max(1.0)
+}
+
 /// The inputs and attributes of a fused node: `(inputs, attributes)`.
 type FusedNodeSpec = (Vec<Option<ValueId>>, HashMap<String, Attribute>);
 
@@ -112,6 +126,13 @@ pub enum RewriteKind {
     /// matched `MatMul → (Mul|Div) → [Add] → Softmax → MatMul` core (see
     /// [`FusionPattern::attention_spec`]).
     Attention,
+    /// Schema-aware exact-GELU rewrite: emit `[X]` with no attributes, extracted
+    /// from the matched Erf decomposition
+    /// `0.5·X · (1 + Erf(X / √2))` — a diamond whose single external input `X`
+    /// feeds both the `Erf` branch and the outer half-scale (see
+    /// [`FusionPattern::gelu_spec`]). Only the exact (`Erf`) form is recognized;
+    /// the `tanh`-approximation FastGelu is out of scope.
+    Gelu,
 }
 
 /// A fusion rule: an op-type sequence rewritten to a single replacement op.
@@ -175,6 +196,21 @@ impl FusionPattern {
         }
     }
 
+    /// The schema-aware exact-GELU pattern: the `Erf` decomposition
+    /// `0.5·X · (1 + Erf(X / √2))` rewritten to a `com.microsoft::Gelu` node
+    /// with the single input `[X]` and no attributes. Anchored on the `Erf`
+    /// (see [`Self::try_match_gelu`]).
+    pub fn gelu() -> Self {
+        Self {
+            name: "Gelu".to_string(),
+            // Descriptive only; the DAG-aware matcher does the real recognition.
+            // `Erf` is the anchor.
+            ops: ["Erf"].iter().map(|s| s.to_string()).collect(),
+            replacement: "Gelu".to_string(),
+            kind: RewriteKind::Gelu,
+        }
+    }
+
     /// This pattern's name.
     pub fn pattern_name(&self) -> &str {
         &self.name
@@ -193,6 +229,7 @@ impl FusionPattern {
             let m = match self.kind {
                 RewriteKind::LayerNorm => self.try_match_layernorm(graph, start),
                 RewriteKind::Attention => self.try_match_attention(graph, start),
+                RewriteKind::Gelu => self.try_match_gelu(graph, start),
                 RewriteKind::Structural => self.try_match_from(graph, start),
             };
             if let Some(m) = m {
@@ -388,6 +425,17 @@ impl FusionPattern {
     /// just packages the parsed pieces into a [`PatternMatch`].
     fn try_match_attention(&self, graph: &Graph, start: NodeId) -> Option<PatternMatch> {
         let p = self.try_parse_attention(graph, start)?;
+        Some(PatternMatch {
+            nodes: p.nodes,
+            external_inputs: p.external_inputs,
+            output: p.output,
+        })
+    }
+
+    /// DAG-aware exact-GELU matcher anchored on the `Erf` node. Packages the
+    /// parsed pieces from [`Self::try_parse_gelu`] into a [`PatternMatch`].
+    fn try_match_gelu(&self, graph: &Graph, start: NodeId) -> Option<PatternMatch> {
+        let p = self.try_parse_gelu(graph, start)?;
         Some(PatternMatch {
             nodes: p.nodes,
             external_inputs: p.external_inputs,
@@ -665,6 +713,163 @@ impl FusionPattern {
         Some((inputs, attributes))
     }
 
+    /// Parse (and fully validate) the exact-GELU `Erf` decomposition anchored on
+    /// the `Erf` node `erf_start`, or `None` to **decline-to-fuse** when any
+    /// structural or numeric assumption cannot be proven from the graph.
+    /// Model-agnostic: purely structural / constant checks.
+    ///
+    /// Recognizes the diamond `out = (0.5·X) · (1 + Erf(X / √2))`, i.e.
+    /// `X → Div(X, √2) → Erf → Add(·, 1) → Mul(0.5·X, ·)` where the SAME `X`
+    /// also feeds `0.5·X = Mul(X, 0.5)`. The equivalent constant encodings
+    /// (`Mul(X, 1/√2)` for the inner scale, `Div(X, 2)` for the half scale) are
+    /// accepted too, since they are numerically identical.
+    ///
+    /// Decline guards (each returns `None`):
+    /// * anchor is not a single-in/single-out `Erf`;
+    /// * the `Erf` input is not `X / √2` (`Div(X, √2)` or `Mul(X, 1/√2)` with a
+    ///   concrete scalar f32 constant);
+    /// * the `Erf` output is not consumed by an `Add(erf, 1.0)` (`1.0` a
+    ///   concrete scalar constant);
+    /// * that `Add`'s output is not consumed by a `Mul` whose other operand is
+    ///   `0.5·X` (`Mul(X, 0.5)` or `Div(X, 2.0)`);
+    /// * the `0.5·X` operand's `X` is **not the same value** that feeds the
+    ///   `Erf` branch (the diamond is not closed);
+    /// * any interior value escapes the matched region, the matched nodes are
+    ///   not all distinct, or the fused output would not survive removal.
+    fn try_parse_gelu(&self, graph: &Graph, erf_start: NodeId) -> Option<GeluParts> {
+        // Anchor: a single-in/single-out `Erf`.
+        let erf = graph.try_node(erf_start)?;
+        if !Self::op_matches(erf, "Erf") || erf.inputs.len() != 1 || erf.outputs.len() != 1 {
+            return None;
+        }
+        let erf_in = erf.inputs[0]?;
+        let erf_out = erf.outputs[0];
+
+        // Backward: `erf_in = X / √2`, via `Div(X, √2)` or `Mul(X, 1/√2)`.
+        let inner_id = graph.value(erf_in).producer?;
+        let inner = graph.node(inner_id);
+        if inner.outputs.first() != Some(&erf_in) {
+            return None;
+        }
+        let x = Self::parse_scaled(graph, inner, &[("Div", SQRT_2), ("Mul", FRAC_1_SQRT_2)])?;
+
+        // Forward: `erf_out` consumed by `Add(erf_out, 1.0)`.
+        let add1_id = Self::find_consumer(graph, erf_out, "Add")?;
+        let add1 = graph.node(add1_id);
+        if add1.inputs.len() != 2 || add1.outputs.len() != 1 {
+            return None;
+        }
+        let one = add1.input_values().find(|&v| v != erf_out)?;
+        if !approx(read_scalar_const_f32(graph, one)?, 1.0) {
+            return None;
+        }
+        let add1_out = add1.outputs[0];
+
+        // Forward: `add1_out` consumed by `Mul(0.5·X, add1_out)`.
+        let outer_id = Self::find_consumer(graph, add1_out, "Mul")?;
+        let outer = graph.node(outer_id);
+        if outer.inputs.len() != 2 || outer.outputs.len() != 1 {
+            return None;
+        }
+        let half = outer.input_values().find(|&v| v != add1_out)?;
+        let output = outer.outputs[0];
+
+        // The half-scale operand must be `0.5·X` (`Mul(X, 0.5)` or `Div(X, 2.0)`)
+        // over the SAME `X` that feeds the `Erf` branch — this closes the
+        // diamond and confirms a real GELU, not a coincidental op sequence.
+        let half_id = graph.value(half).producer?;
+        let half_node = graph.node(half_id);
+        if half_node.outputs.first() != Some(&half) {
+            return None;
+        }
+        let x2 = Self::parse_scaled(graph, half_node, &[("Mul", 0.5), ("Div", 2.0)])?;
+        if x2 != x {
+            return None;
+        }
+
+        // Canonical node order (anchor first): [Erf, inner, Add, outer, half].
+        let nodes = vec![erf_start, inner_id, add1_id, outer_id, half_id];
+        let matched_set: HashSet<NodeId> = nodes.iter().copied().collect();
+        if matched_set.len() != nodes.len() {
+            return None;
+        }
+
+        // Safety rule: every matched node except the final `outer` `Mul` must
+        // have all outputs consumed solely within the matched set (no external
+        // consumer, no graph output).
+        let escapes = nodes.iter().any(|&nid| {
+            nid != outer_id
+                && graph.node(nid).outputs.iter().any(|&o| {
+                    graph.outputs.contains(&o)
+                        || graph
+                            .value(o)
+                            .consumers
+                            .iter()
+                            .any(|c| !matched_set.contains(c))
+                })
+        });
+        if escapes {
+            return None;
+        }
+
+        // The fused output (outer's single output) must survive removal.
+        let out_val = graph.value(output);
+        let survives = graph.outputs.contains(&output)
+            || out_val.consumers.iter().any(|c| !matched_set.contains(c));
+        if !survives {
+            return None;
+        }
+
+        Some(GeluParts {
+            nodes,
+            x,
+            output,
+            external_inputs: vec![x],
+        })
+    }
+
+    /// If `node` computes `x · k` (`Mul`) or `x / k` (`Div`) for one of the
+    /// allowed `(op_type, constant)` forms, return the data operand `x`. The
+    /// constant must be a **strict scalar** f32 initializer approximately equal
+    /// to the expected value. `Mul` is commutative (the constant may be either
+    /// operand); `Div` is not (the constant must be the divisor). Any other
+    /// shape → `None`.
+    fn parse_scaled(graph: &Graph, node: &Node, forms: &[(&str, f32)]) -> Option<ValueId> {
+        if node.inputs.len() != 2 || node.outputs.len() != 1 {
+            return None;
+        }
+        let a = node.inputs[0]?;
+        let b = node.inputs[1]?;
+        for &(op, k) in forms {
+            if !Self::op_matches(node, op) {
+                continue;
+            }
+            // The scalar constant is valid as the second operand for both forms
+            // (the `Div` divisor, or a `Mul` factor); `Mul` is commutative, so
+            // it may additionally be the first operand.
+            if read_scalar_const_f32(graph, b).is_some_and(|c| approx(c, k)) {
+                return Some(a);
+            }
+            if op == "Mul" && read_scalar_const_f32(graph, a).is_some_and(|c| approx(c, k)) {
+                return Some(b);
+            }
+        }
+        None
+    }
+
+    /// Extract the schema-conformant `[X]` input (no attributes) for a matched
+    /// exact-GELU decomposition, or `None` to decline. Re-parses from the anchor
+    /// (`m.nodes[0]`, the `Erf`) so the spec is single-sourced with the matcher,
+    /// and confirms the re-parse covers exactly the same node set.
+    fn gelu_spec(&self, graph: &Graph, m: &PatternMatch) -> Option<FusedNodeSpec> {
+        let start = *m.nodes.first()?;
+        let p = self.try_parse_gelu(graph, start)?;
+        if p.nodes != m.nodes {
+            return None;
+        }
+        Some((vec![Some(p.x)], HashMap::new()))
+    }
+
     /// Attempt to grow a match whose first node is `start`.
     fn try_match_from(&self, graph: &Graph, start: NodeId) -> Option<PatternMatch> {
         let start_node = graph.try_node(start)?;
@@ -765,6 +970,7 @@ impl FusionPattern {
         match self.kind {
             RewriteKind::LayerNorm => self.layernorm_spec(graph, m).is_some(),
             RewriteKind::Attention => self.attention_spec(graph, m).is_some(),
+            RewriteKind::Gelu => self.gelu_spec(graph, m).is_some(),
             RewriteKind::Structural => {
                 // The MatMul+Add → FusedMatMulBias and MatMul+Add+Relu →
                 // FusedGemm rewrites both need a bias broadcast guard (the
@@ -847,6 +1053,9 @@ impl FusionPattern {
                 .ok_or_else(|| crate::error::OptimizerError::Fusion(self.name.clone()))?,
             RewriteKind::Attention => self
                 .attention_spec(graph, m)
+                .ok_or_else(|| crate::error::OptimizerError::Fusion(self.name.clone()))?,
+            RewriteKind::Gelu => self
+                .gelu_spec(graph, m)
                 .ok_or_else(|| crate::error::OptimizerError::Fusion(self.name.clone()))?,
         };
 
@@ -1007,7 +1216,19 @@ struct AttnParts {
     external_inputs: Vec<ValueId>,
 }
 
-/// Read a **strict scalar** (exactly one element) inline f32 initializer, or
+/// The parsed pieces of a matched exact-GELU decomposition (see
+/// [`FusionPattern::try_parse_gelu`]).
+#[derive(Clone, Debug)]
+struct GeluParts {
+    /// All matched node ids, canonical order (anchor first):
+    /// `[erf, inner_scale, add_one, outer_mul, half_scale]`.
+    nodes: Vec<NodeId>,
+    /// The single external input `X` (feeds both the `Erf` branch and `0.5·X`).
+    x: ValueId,
+    /// The fused node's output (the outer `Mul`'s single output).
+    output: ValueId,
+    external_inputs: Vec<ValueId>,
+}
 /// `None`. Stricter than [`read_scalar_f32`]: the score scale must be a genuine
 /// scalar, so a multi-element initializer (whose first element we'd otherwise
 /// silently read) is declined.
@@ -1044,8 +1265,7 @@ fn is_last2_swap_perm(perm: &[i64]) -> bool {
 /// The default device-independent fusion patterns.
 ///
 /// Ordered most-specific-first so `MatMul+Add+Relu` is captured before the
-/// shorter `MatMul+Add`. Deferred to Phase 2b/3: `Residual+LayerNorm`, `GELU`,
-/// and attention fusion (see [`AttentionFusionPass` in §13.2 of the design]).
+/// shorter `MatMul+Add`. `Residual+LayerNorm` remains deferred to Phase 2b/3.
 pub fn default_fusion_patterns() -> Vec<FusionPattern> {
     vec![
         // Attention first: the SDPA core consumes plain MatMul/Softmax nodes, so
@@ -1054,6 +1274,7 @@ pub fn default_fusion_patterns() -> Vec<FusionPattern> {
         FusionPattern::attention(),
         FusionPattern::new("MatMul+Bias+Relu", &["MatMul", "Add", "Relu"], "FusedGemm"),
         FusionPattern::layernorm(),
+        FusionPattern::gelu(),
         FusionPattern::new("MatMul+Bias", &["MatMul", "Add"], "FusedMatMulBias"),
     ]
 }
@@ -1989,5 +2210,171 @@ mod tests {
         assert!(g.nodes.values().all(|n| n.op_type != "FusedAttention"));
         assert!(g.nodes.values().any(|n| n.op_type == "Softmax"));
         assert_eq!(g.num_nodes(), before);
+    }
+
+    /// Build the exact-GELU `Erf` decomposition `0.5·x·(1 + erf(x / √2))` over a
+    /// single graph input `x`, with the constants materialized as scalar
+    /// initializers. `inner`/`half` select the constant encoding to emit so the
+    /// equivalent forms can be exercised.
+    fn gelu_graph(inner_div_sqrt2: bool, half_mul: bool) -> Graph {
+        let mut g = Graph::new();
+        g.opset_imports.insert(String::new(), 17);
+        let x = val(&mut g, "x");
+        g.add_input(x);
+
+        // half = 0.5 * x  (via Mul(x, 0.5) or Div(x, 2.0)).
+        let half = val(&mut g, "half");
+        if half_mul {
+            let c = scalar_init(&mut g, "c_half", 0.5);
+            g.insert_node(Node::new(NodeId(0), "Mul", vec![Some(x), Some(c)], vec![half]));
+        } else {
+            let c = scalar_init(&mut g, "c_two", 2.0);
+            g.insert_node(Node::new(NodeId(0), "Div", vec![Some(x), Some(c)], vec![half]));
+        }
+
+        // scaled = x / √2  (via Div(x, √2) or Mul(x, 1/√2)).
+        let scaled = val(&mut g, "scaled");
+        if inner_div_sqrt2 {
+            let c = scalar_init(&mut g, "c_sqrt2", std::f32::consts::SQRT_2);
+            g.insert_node(Node::new(NodeId(0), "Div", vec![Some(x), Some(c)], vec![scaled]));
+        } else {
+            let c = scalar_init(&mut g, "c_isqrt2", std::f32::consts::FRAC_1_SQRT_2);
+            g.insert_node(Node::new(NodeId(0), "Mul", vec![Some(x), Some(c)], vec![scaled]));
+        }
+
+        let e = val(&mut g, "e");
+        g.insert_node(Node::new(NodeId(0), "Erf", vec![Some(scaled)], vec![e]));
+        let one = scalar_init(&mut g, "c_one", 1.0);
+        let a = val(&mut g, "a");
+        g.insert_node(Node::new(NodeId(0), "Add", vec![Some(e), Some(one)], vec![a]));
+        let out = val(&mut g, "out");
+        g.insert_node(Node::new(NodeId(0), "Mul", vec![Some(half), Some(a)], vec![out]));
+        g.add_output(out);
+        g
+    }
+
+    #[test]
+    fn fuses_gelu_div_sqrt2() {
+        let mut g = gelu_graph(true, true);
+        assert_eq!(g.num_nodes(), 5);
+        OpFusion::new().run(&mut g, &PassContext::new()).unwrap();
+        let gelu: Vec<_> = g.nodes.values().filter(|n| n.op_type == "Gelu").collect();
+        assert_eq!(gelu.len(), 1, "the Erf decomposition must fuse to one Gelu");
+        let fused = gelu[0];
+        assert_eq!(fused.domain, CONTRIB_DOMAIN);
+        assert_eq!(fused.inputs.len(), 1, "Gelu takes the single input x");
+        assert!(fused.attributes.is_empty(), "exact Gelu has no attributes");
+        // Single input is the graph input `x`.
+        let x = g.values.iter().find(|(_, v)| v.name.as_deref() == Some("x")).map(|(id, _)| id).unwrap();
+        assert_eq!(fused.inputs[0], Some(x));
+        assert_eq!(fused.outputs, g.outputs);
+        assert!(g.nodes.values().all(|n| n.op_type != "Erf"));
+        assert!(g.validate().is_ok());
+    }
+
+    #[test]
+    fn fuses_gelu_mul_reciprocal_and_div_two() {
+        // Equivalent encodings: inner Mul(x, 1/√2), half Div(x, 2.0).
+        let mut g = gelu_graph(false, false);
+        OpFusion::new().run(&mut g, &PassContext::new()).unwrap();
+        assert_eq!(
+            g.nodes.values().filter(|n| n.op_type == "Gelu").count(),
+            1,
+            "the reciprocal/half-divisor encoding must also fuse"
+        );
+        assert!(g.validate().is_ok());
+    }
+
+    #[test]
+    fn declines_gelu_wrong_inner_constant() {
+        // Div by 2.0 instead of √2 is not x/√2 → decline.
+        let mut g = Graph::new();
+        g.opset_imports.insert(String::new(), 17);
+        let x = val(&mut g, "x");
+        g.add_input(x);
+        let half = val(&mut g, "half");
+        let ch = scalar_init(&mut g, "c_half", 0.5);
+        g.insert_node(Node::new(NodeId(0), "Mul", vec![Some(x), Some(ch)], vec![half]));
+        let scaled = val(&mut g, "scaled");
+        let cbad = scalar_init(&mut g, "c_bad", 2.0);
+        g.insert_node(Node::new(NodeId(0), "Div", vec![Some(x), Some(cbad)], vec![scaled]));
+        let e = val(&mut g, "e");
+        g.insert_node(Node::new(NodeId(0), "Erf", vec![Some(scaled)], vec![e]));
+        let one = scalar_init(&mut g, "c_one", 1.0);
+        let a = val(&mut g, "a");
+        g.insert_node(Node::new(NodeId(0), "Add", vec![Some(e), Some(one)], vec![a]));
+        let out = val(&mut g, "out");
+        g.insert_node(Node::new(NodeId(0), "Mul", vec![Some(half), Some(a)], vec![out]));
+        g.add_output(out);
+
+        let before = g.num_nodes();
+        OpFusion::new().run(&mut g, &PassContext::new()).unwrap();
+        assert!(g.nodes.values().all(|n| n.op_type != "Gelu"));
+        assert!(g.nodes.values().any(|n| n.op_type == "Erf"));
+        assert_eq!(g.num_nodes(), before);
+    }
+
+    #[test]
+    fn declines_gelu_wrong_half_constant() {
+        // Mul(x, 0.4) instead of 0.5 → decline.
+        let mut g = gelu_graph(true, true);
+        // Rewrite the half Mul's constant initializer to 0.4.
+        let ch = g.values.iter().find(|(_, v)| v.name.as_deref() == Some("c_half")).map(|(id, _)| id).unwrap();
+        g.set_initializer(
+            ch,
+            WeightRef::Inline(TensorData::from_raw(DataType::Float32, vec![], 0.4f32.to_le_bytes().to_vec())),
+        );
+        let before = g.num_nodes();
+        OpFusion::new().run(&mut g, &PassContext::new()).unwrap();
+        assert!(g.nodes.values().all(|n| n.op_type != "Gelu"));
+        assert_eq!(g.num_nodes(), before);
+    }
+
+    #[test]
+    fn declines_gelu_when_half_uses_different_x() {
+        // The `0.5··` operand uses a DIFFERENT value than the Erf branch, so the
+        // diamond is not closed → decline.
+        let mut g = Graph::new();
+        g.opset_imports.insert(String::new(), 17);
+        let x = val(&mut g, "x");
+        let y = val(&mut g, "y");
+        g.add_input(x);
+        g.add_input(y);
+        let half = val(&mut g, "half");
+        let ch = scalar_init(&mut g, "c_half", 0.5);
+        // half = 0.5 * y   (NOT x)
+        g.insert_node(Node::new(NodeId(0), "Mul", vec![Some(y), Some(ch)], vec![half]));
+        let scaled = val(&mut g, "scaled");
+        let cs = scalar_init(&mut g, "c_sqrt2", std::f32::consts::SQRT_2);
+        g.insert_node(Node::new(NodeId(0), "Div", vec![Some(x), Some(cs)], vec![scaled]));
+        let e = val(&mut g, "e");
+        g.insert_node(Node::new(NodeId(0), "Erf", vec![Some(scaled)], vec![e]));
+        let one = scalar_init(&mut g, "c_one", 1.0);
+        let a = val(&mut g, "a");
+        g.insert_node(Node::new(NodeId(0), "Add", vec![Some(e), Some(one)], vec![a]));
+        let out = val(&mut g, "out");
+        g.insert_node(Node::new(NodeId(0), "Mul", vec![Some(half), Some(a)], vec![out]));
+        g.add_output(out);
+
+        OpFusion::new().run(&mut g, &PassContext::new()).unwrap();
+        assert!(g.nodes.values().all(|n| n.op_type != "Gelu"));
+        assert!(g.nodes.values().any(|n| n.op_type == "Erf"));
+    }
+
+    #[test]
+    fn declines_gelu_when_interior_escapes() {
+        // The Erf output feeds an extra external consumer, so fusing would
+        // delete an observed value → decline.
+        let mut g = gelu_graph(true, true);
+        let e = g.values.iter().find(|(_, v)| v.name.as_deref() == Some("e")).map(|(id, _)| id).unwrap();
+        let side = val(&mut g, "side");
+        g.insert_node(Node::new(NodeId(0), "Erf", vec![Some(e)], vec![side]));
+        g.add_output(side);
+
+        OpFusion::new().run(&mut g, &PassContext::new()).unwrap();
+        assert!(
+            g.nodes.values().all(|n| n.op_type != "Gelu"),
+            "must not fuse when an interior value escapes"
+        );
     }
 }

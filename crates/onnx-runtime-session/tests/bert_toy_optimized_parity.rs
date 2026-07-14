@@ -19,9 +19,10 @@
 //!   operator **fusion**. On this model fusion collapses each LayerNorm
 //!   decomposition into a single schema-conformant
 //!   `com.microsoft::LayerNormalization`, every MatMul+Add into
-//!   `com.microsoft::FusedMatMulBias`, and each self-attention SDPA core into a
-//!   `com.microsoft::FusedAttention`, all backed by CPU kernels, so the fused
-//!   graph runs end-to-end and matches the reference. See
+//!   `com.microsoft::FusedMatMulBias`, each self-attention SDPA core into a
+//!   `com.microsoft::FusedAttention`, and each feed-forward exact-GELU `Erf`
+//!   decomposition into a `com.microsoft::Gelu`, all backed by CPU kernels, so
+//!   the fused graph runs end-to-end and matches the reference. See
 //!   `full_optimization_fusion_path_matches_reference_and_default` (numerics)
 //!   and `full_optimization_actually_fuses_layernorm_and_matmul_bias` (proof the
 //!   fusions actually fire on the loaded graph).
@@ -320,5 +321,20 @@ fn full_optimization_actually_fuses_layernorm_and_matmul_bias() {
         count(&graph, "Softmax"),
         0,
         "no Softmax should survive: all belonged to fused attention cores"
+    );
+
+    // Each feed-forward block's exact-GELU `Erf` decomposition
+    // (0.5·x·(1 + Erf(x / √2))) fuses into one com.microsoft::Gelu, leaving no
+    // standalone Erf behind. bert_toy has 6 GELUs (one per FFN block).
+    let gelu_after = count(&graph, "Gelu");
+    eprintln!("bert_toy fusion counts: Gelu={gelu_after}");
+    assert_eq!(
+        gelu_after, 6,
+        "every GELU decomposition must fuse to one Gelu (bert_toy has 6)"
+    );
+    assert_eq!(
+        count(&graph, "Erf"),
+        0,
+        "no Erf should survive: all belonged to fused GELUs"
     );
 }
