@@ -9,17 +9,21 @@
 //!
 //! ## Graph I/O (structural signature)
 //!
+//! Float tensors may be Float32 or Float16; the activation dtype is taken from
+//! `inputs_embeds` and the shared-KV inputs must match it. Outputs are widened
+//! to f32 on read, so the engine-facing API stays f32 regardless of graph dtype.
+//!
 //! Inputs:
-//! - `inputs_embeds`                       `f32 [B, q, 2*H]`
+//! - `inputs_embeds`                       `[B, q, 2*H]`
 //!   concat of (previous `projected_state`, current `projected_state`).
 //! - `position_ids`                        `i64 [B, q]`
 //! - `attention_mask`                      `i64 [B, kv_len]`
-//! - `shared_kv.<group>.key` / `.value`    `f32 [B, kv_heads, kv_len, head_dim]`
+//! - `shared_kv.<group>.key` / `.value`    `[B, kv_heads, kv_len, head_dim]`
 //!   slices of the target model's KV buffer (one pair per attention type).
 //!
 //! Outputs:
-//! - `logits`                              `f32 [B, q, vocab]`
-//! - `projected_state`                     `f32 [B, q, H]`
+//! - `logits`                              `[B, q, vocab]`
+//! - `projected_state`                     `[B, q, H]`
 //!
 //! [`SharedKvProposerSession`] owns exactly one forward pass. It does not
 //! select tokens, thread `projected_state`, or extract the target KV slices;
@@ -167,7 +171,7 @@ impl<'a> SharedKvProposerSession<'a> {
             .map_err(|_| OrtError::InvalidArgument("seq_len exceeds i64".into()))?;
 
         let embeds =
-            Value::from_slice_f32(inputs_embeds, &[self.batch_size, seq_i64, width as i64])?;
+            Value::from_f32_slice_as(inputs_embeds, &[self.batch_size, seq_i64, width as i64], self.signature.dtype)?;
 
         // Build the shared-KV tensors, validating them against the graph specs.
         let mut kv_values = Vec::with_capacity(self.signature.shared_kv.len() * 2);
@@ -205,11 +209,11 @@ impl<'a> SharedKvProposerSession<'a> {
             ];
             kv_values.push((
                 spec.key_input.clone(),
-                Value::from_slice_f32(&input.key, &shape)?,
+                Value::from_f32_slice_as(&input.key, &shape, self.signature.dtype)?,
             ));
             kv_values.push((
                 spec.value_input.clone(),
-                Value::from_slice_f32(&input.value, &shape)?,
+                Value::from_f32_slice_as(&input.value, &shape, self.signature.dtype)?,
             ));
         }
         if mask_len == 0 {
@@ -299,24 +303,33 @@ fn detect_shared_kv_proposer(
         .outputs()
         .iter()
         .any(|output| matches_name(&output.name, "mtp_hidden"));
-    let shared_kv = shared_kv_specs(session)?;
-
     let (Some(embeds_input), Some(logits_output), Some(projected_output)) =
         (embeds_input, logits_output, projected_output)
     else {
         return Ok(None);
     };
-    if has_mtp_hidden || shared_kv.is_empty() {
+    if has_mtp_hidden {
         return Ok(None);
     }
 
+    // The proposer's float tensors may be either Float32 or Float16 (fp16 KV
+    // exports, e.g. the real Gemma4 E2B assistant, feed the shared KV and
+    // `inputs_embeds` as half precision). The activation dtype is taken from
+    // `inputs_embeds`; shared-KV inputs must match it, while the float outputs
+    // are read back through a lossless f16->f32 widening so logits/projected
+    // state stay f32 on the engine-facing API regardless of the graph dtype.
     for info in [embeds_input, logits_output, projected_output] {
-        if info.dtype != DataType::Float32 {
+        if !is_supported_float(info.dtype) {
             return Err(OrtError::InvalidArgument(format!(
-                "shared-KV proposer tensor '{}' must be Float32, got {:?}",
+                "shared-KV proposer tensor '{}' must be Float32 or Float16, got {:?}",
                 info.name, info.dtype
             )));
         }
+    }
+    let float_dtype = embeds_input.dtype;
+    let shared_kv = shared_kv_specs(session, float_dtype)?;
+    if shared_kv.is_empty() {
+        return Ok(None);
     }
 
     let backbone_hidden_size = last_positive_dim(&projected_output.shape).ok_or_else(|| {
@@ -340,7 +353,7 @@ fn detect_shared_kv_proposer(
         inputs_embeds_width,
         vocab_size,
         shared_kv,
-        dtype: DataType::Float32,
+        dtype: float_dtype,
     };
     let io = SharedKvProposerIo {
         embeds_input: embeds_input.name.clone(),
@@ -361,17 +374,21 @@ fn detect_shared_kv_proposer(
 }
 
 /// Discover `shared_kv.<name>.{key,value}` input pairs, grouped by `<name>`.
-fn shared_kv_specs(session: &Session) -> Result<Vec<SharedKvSpec>> {
+///
+/// Every shared-KV input must be a rank-4 float tensor matching `float_dtype`
+/// (the assistant's activation dtype, taken from `inputs_embeds`), so f16 and
+/// f32 KV exports are both accepted as long as they are internally consistent.
+fn shared_kv_specs(session: &Session, float_dtype: DataType) -> Result<Vec<SharedKvSpec>> {
     let mut keys: BTreeMap<String, &crate::TensorInfo> = BTreeMap::new();
     let mut values: BTreeMap<String, &crate::TensorInfo> = BTreeMap::new();
     for input in session.inputs() {
         let Some((group, kind)) = shared_kv_group(&input.name) else {
             continue;
         };
-        if input.dtype != DataType::Float32 {
+        if input.dtype != float_dtype {
             return Err(OrtError::InvalidArgument(format!(
-                "shared_kv input '{}' must be Float32, got {:?}",
-                input.name, input.dtype
+                "shared_kv input '{}' must match the assistant activation dtype {:?}, got {:?}",
+                input.name, float_dtype, input.dtype
             )));
         }
         if input.shape.len() != 4 {
@@ -447,7 +464,7 @@ fn last_positive_dim(shape: &[i64]) -> Option<usize> {
 }
 
 fn last_row_f32(value: &Value, width: usize) -> Result<Vec<f32>> {
-    let data = value.to_vec_f32()?;
+    let data = value.to_vec_f32_lossy()?;
     if width == 0 || data.len() < width || !data.len().is_multiple_of(width) {
         return Err(OrtError::InvalidArgument(format!(
             "shared-KV proposer output length {} is not a positive multiple of width {width}",
@@ -455,4 +472,9 @@ fn last_row_f32(value: &Value, width: usize) -> Result<Vec<f32>> {
         )));
     }
     Ok(data[data.len() - width..].to_vec())
+}
+
+/// Whether `dtype` is a float type the shared-KV proposer can bind/read.
+fn is_supported_float(dtype: DataType) -> bool {
+    matches!(dtype, DataType::Float32 | DataType::Float16)
 }

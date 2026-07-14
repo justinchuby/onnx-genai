@@ -155,6 +155,28 @@ impl Value {
         Self::from_vec_f16_bits(data.to_vec(), shape)
     }
 
+    /// Create a CPU float tensor of `dtype` from f32 host data.
+    ///
+    /// Float32 binds directly; Float16 narrows each element via the IEEE-754
+    /// single -> half conversion. Used to feed f32 host buffers (materialized KV,
+    /// projected-state activations) into graphs whose float inputs are fp16,
+    /// keeping the engine-facing data path f32 regardless of the graph dtype.
+    pub fn from_f32_slice_as(data: &[f32], shape: &[i64], dtype: DataType) -> Result<Self> {
+        match dtype {
+            DataType::Float32 => Self::from_slice_f32(data, shape),
+            DataType::Float16 => {
+                let bits: Vec<u16> = data
+                    .iter()
+                    .map(|&x| half::f16::from_f32(x).to_bits())
+                    .collect();
+                Self::from_vec_f16_bits(bits, shape)
+            }
+            other => Err(OrtError::InvalidArgument(format!(
+                "cannot build a {other:?} tensor from f32 data"
+            ))),
+        }
+    }
+
     /// Create a tensor from i64 data (for input_ids, attention_mask).
     pub fn from_slice_i64(data: &[i64], shape: &[i64]) -> Result<Self> {
         Self::from_vec_i64(data.to_vec(), shape)

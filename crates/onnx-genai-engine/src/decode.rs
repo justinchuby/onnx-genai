@@ -816,13 +816,21 @@ pub(crate) fn detect_model_decode_path(
         .iter()
         .any(|info| is_present_output(&info.name));
     if has_kv_inputs || has_present_outputs {
-        if sliding_window.is_some() && shared_kv_max_len.is_some() {
-            anyhow::bail!(
-                "sliding-window GroupQueryAttention cannot use the current append-only shared KV buffer; Mobius must emit `local_window_size` plus a bounded circular-cache/write-offset contract"
-            );
-        }
         if sliding_window.is_some() {
-            // The model graph remains responsible for local-attention masking.
+            // Sliding-window models take the bounded paged past/present path
+            // (`shared_buffer: false`); the graph remains responsible for
+            // local-attention masking while the runtime applies windowed KV
+            // eviction on the paged cache. A declared share-buffer-eligible KV
+            // dtype (`shared_kv_max_len`) only enables the append-only single
+            // shared buffer, which cannot express windowed eviction, so it is
+            // intentionally skipped here in favor of the windowed paged path
+            // rather than refused — this keeps every fp16/fp32 GQA SWA model
+            // (Gemma/Mistral-style) on a supported decode path.
+            if shared_kv_max_len.is_some() {
+                tracing::debug!(
+                    "model declares both sliding_window and a share-buffer KV dtype; using the bounded paged sliding-window path and skipping the append-only shared KV buffer"
+                );
+            }
             // This path bounds the runtime-owned past tensors and preserves
             // absolute position_ids while the graph applies its trained window.
             return Ok(ModelDecodePath::PastPresent {

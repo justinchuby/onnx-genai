@@ -299,6 +299,11 @@ pub(crate) fn load_materialized_past(
         .iter()
         .map(|info| (info.name.as_str(), info.shape.as_slice()))
         .collect::<HashMap<_, _>>();
+    let input_dtypes = session
+        .inputs()
+        .iter()
+        .map(|info| (info.name.as_str(), info.dtype))
+        .collect::<HashMap<_, _>>();
     decode_state.past.clear();
     for (idx, layer) in kv_model.layers.iter().enumerate() {
         let key_shape = past_shape(
@@ -315,13 +320,25 @@ pub(crate) fn load_materialized_past(
                 .context("missing value past input shape")?,
             materialized.sequence_len,
         )?;
+        // Paged storage holds KV widened to f32; narrow back to the graph's
+        // declared past-input dtype (e.g. fp16 GQA exports) so the injected KV
+        // matches the model contract. For an fp16 model this is the exact
+        // inverse of the fp16->f32 widening done when mirroring present KV.
+        let key_dtype = input_dtypes
+            .get(layer.key_past.as_str())
+            .copied()
+            .context("missing key past input dtype")?;
+        let value_dtype = input_dtypes
+            .get(layer.value_past.as_str())
+            .copied()
+            .context("missing value past input dtype")?;
         decode_state.past.insert(
             layer.key_past.clone(),
-            Value::from_vec_f32(materialized.layers[idx].key.clone(), &key_shape)?,
+            Value::from_f32_slice_as(&materialized.layers[idx].key, &key_shape, key_dtype)?,
         );
         decode_state.past.insert(
             layer.value_past.clone(),
-            Value::from_vec_f32(materialized.layers[idx].value.clone(), &value_shape)?,
+            Value::from_f32_slice_as(&materialized.layers[idx].value, &value_shape, value_dtype)?,
         );
     }
     Ok(())
@@ -1179,7 +1196,19 @@ mod tests {
         run_decode_step(&session, &mut state, &[3], 2)?;
         assert_eq!(state.retained_kv_len(3), 2);
         assert!(state.past.values().all(|value| value.shape()[2] == 2));
-        assert!(detect_model_decode_path(&session, Some(16), Some(16), Some(2), 0).is_err());
+        // A declared share-buffer KV dtype (shared_kv_max_len = Some) does not
+        // override sliding-window attention: the model still takes the bounded
+        // paged sliding-window path (shared_buffer: false), since the append-only
+        // single shared buffer cannot express windowed eviction.
+        assert!(matches!(
+            detect_model_decode_path(&session, Some(16), Some(16), Some(2), 0)?,
+            ModelDecodePath::PastPresent {
+                shared_buffer: false,
+                max_len: None,
+                sliding_window: Some(2),
+                sink_tokens: None,
+            }
+        ));
         Ok(())
     }
 

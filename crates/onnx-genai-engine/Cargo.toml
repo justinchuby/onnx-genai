@@ -8,6 +8,13 @@ repository.workspace = true
 keywords = ["onnx", "llm", "inference", "genai"]
 categories = ["science", "text-processing"]
 
+[features]
+default = []
+# Forwards to `onnx-genai-ort/cuda` so the CUDA execution provider is compiled
+# in. Runtime EP selection still goes through `ONNX_GENAI_EP`; without this
+# feature a `cuda` request silently falls back to CPU.
+cuda = ["onnx-genai-ort/cuda"]
+
 [dependencies]
 onnx-genai-metadata = { workspace = true }
 onnx-genai-genai-config = { workspace = true }
