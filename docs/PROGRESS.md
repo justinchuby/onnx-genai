@@ -2,9 +2,9 @@
 
 Tracks implementation status of `docs/DESIGN.md` (§1–§40). Updated as work lands.
 
-**Published:** `onnx-genai` v0.1.0 + 8 sub-crates on crates.io. CI (fmt/build/test/**blocking clippy**) + scheduled `cargo-audit`. Coverage ~77% line.
+**Published:** `onnx-genai` v0.1.0 + 8 sub-crates on crates.io; the `onnx-runtime-*` layer (including `onnx-runtime-tracer`) is released as v0.1.0-dev.1. CI (fmt/build/test/**blocking clippy**) + scheduled `cargo-audit`. Coverage ~77% line.
 
-_Last updated: 2026-07-14 — includes a full Design → Implementation Gap Analysis (see section below)._
+_Last updated: 2026-07-14 — includes the Design → Implementation Gap Analysis and the latest ORT2 CPU, scheduler, CUDA, Sequence, packaging, and CI landings (see below)._
 
 ## ORT 2.0 — from-scratch Rust ONNX runtime (`docs/ORT2.md`, big design — steady progress)
 
@@ -132,6 +132,14 @@ Evidence-based audit of `docs/DESIGN.md` (engine) + `docs/ORT2.md` (nxrt runtime
 ## Recently completed (this session)
 
 Complete runtime built from scaffold + published: generation (greedy/speculative draft+prompt-lookup+MTP), samplers, FIM, grammar, tool use (Hermes-verified), chat templates, multi-session + prefix cache, paged/tiered/int8 KV, long-context O(1)/token static-cache, batched multi-agent serving, OpenAI HTTP (chat/completions/vision/streaming/sessions), observability, benchmarks (`onnx-genai-bench`), `onnx-genai-preprocess` crate, security hardening, CI + audits. **Fixed: categorical sampling had no RNG (always token 0).**
+
+### 2026-07-14 — ORT2 landing changelog
+
+- **Release:** published `onnx-runtime-*` v0.1.0-dev.1, including `onnx-runtime-tracer`; the MLX EP can now depend on the tracer crate.
+- **CPU coverage:** added 12 unary/activation operators, increasing the recorded CPU backend baseline from 130 to roughly 360 passing cases.
+- **Scheduler:** added a cloneable global cross-session `ByteBudget` shared by schedulers for byte-based KV admission and swap-in accounting.
+- **CUDA and Sequence:** documented the verified library-first CUDA strategy; CUDA Wave 3 expanded `ep-cuda` from 27 to 48 ops and its grid-stride indexing is 64-bit safe. Added a copy-free, race-free Sequence value type with eight Sequence ops; `SplitToSequence` rank-gates scalar versus 1-D splits and `SequenceInsert` enforces homogeneous elements.
+- **Packaging and CI:** `nxrt[cuda]` now resolves the real unsuffixed CUDA-13 NVIDIA wheels. CI remains multi-platform: portable Linux/Windows/macOS gates plus Linux/Windows CUDA-compile coverage.
 
 ## Design-backlog push (2026-07-13, session 2)
 
