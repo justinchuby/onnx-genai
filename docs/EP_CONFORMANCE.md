@@ -212,3 +212,41 @@ Unique, Where, and Xor.
 The result is intentionally not normalized with expected-failure files: it is
 the current ep-cpu coverage picture. `conformance/summarize_junit.py` prints
 the reproducible per-operator pass/fail/skip table from the JUnit report.
+
+### Op-coverage wave (2026-07-14)
+
+Registered 25 new ai.onnx operators as dedicated ep-cpu kernels (new files
+`unary_math.rs`, `reduce_ops.rs`, `concat.rs`, `movement_ops.rs`, `logical.rs`,
+`where_op.rs`). Before/after measured in the same environment (upstream commit
+`856e89bcd3d2ee3cb31c7bf88b5706dec00eba5c`, 100 Hypothesis examples, `-n 8`):
+
+| Measure | Before | After | Delta |
+|---|---:|---:|---:|
+| dtype/opset pytest cases passing | 158 | 228 | +70 |
+
+Per-operator additions (all previously "no CPU kernel registered"):
+
+| Operator | Pass | Fail | Notes |
+|---|---:|---:|---|
+| Size | 13 | 0 | byte-agnostic, all dtypes |
+| Concat | 12 | 1 | byte-agnostic; 1 fail = size-0 upstream ref bug |
+| Squeeze | 12 | 1 | byte-agnostic (axes-as-input, opset-13) |
+| Where | 12 | 1 | byte-agnostic broadcasting select |
+| ReduceMax | 2 | 17 | f32; axes-as-input/attr, keepdims, noop |
+| ReduceMin | 2 | 17 | f32 |
+| ReduceSum | 1 | 6 | f32 |
+| ReduceProd | 1 | 6 | f32 |
+| ReduceL2 | 1 | 6 | f32 |
+| ReduceSumSquare | 1 | 6 | f32 |
+| Abs | 1 | 10 | f32 (non-f32 dtypes = Luv's wave) |
+| Neg | 1 | 6 | f32 |
+| Sign | 1 | 10 | f32; ONNX sign(0)=0, sign(NaN)=NaN |
+| Reciprocal, Exp, Log, Sin, Cos, Ceil, Floor, Round, Sigmoid | 1 each | 2 each | f32; Round = round-half-to-even |
+| Not | 1 | 0 | bool |
+| Softplus | 0 | 3 | f32 kernel is numerically stable; upstream naive ref overflows to inf on extreme input (e.g. softplus(89)), an inherent reference-overflow mismatch like Add's 1/11 |
+| Flatten | 0 | 13 | kernel correct; upstream `op_flatten.py` reference crashes on size-0 arrays |
+
+Kernels are f32 (plus bool for Not/Where condition; byte-agnostic for
+Concat/Squeeze/Size/Where). f16/f64/int dtype coverage is a separate wave.
+Output shapes are supplied by `onnx-runtime-shape-inference`; these kernels
+write into pre-shaped output views.

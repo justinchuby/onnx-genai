@@ -29,6 +29,7 @@ use crate::strided::{elem_offset, next_index, numel};
 
 pub mod add;
 pub mod cast;
+pub mod concat;
 pub mod constant;
 pub mod elementwise;
 pub mod expand;
@@ -40,17 +41,22 @@ pub mod gelu;
 pub mod gemm;
 pub mod identity;
 pub mod layernorm;
+pub mod logical;
 pub mod matmul;
+pub mod movement_ops;
 #[cfg(feature = "onednn")]
 pub mod onednn;
 pub mod reduce;
+pub mod reduce_ops;
 pub mod relu;
 pub mod reshape;
 pub mod shape;
 pub mod slice;
 pub mod softmax;
 pub mod transpose;
+pub mod unary_math;
 pub mod unsqueeze;
+pub mod where_op;
 
 /// The set of ops the CPU EP implements for the Phase-1 BERT-on-CPU milestone.
 pub const PHASE1_OPS: &[&str] = &[
@@ -73,8 +79,31 @@ pub const PHASE1_OPS: &[&str] = &[
     "Erf",
     "Tanh",
     "Cast",
+    // Additional elementwise unary math (unary_math.rs).
+    "Abs",
+    "Neg",
+    "Reciprocal",
+    "Exp",
+    "Log",
+    "Sign",
+    "Floor",
+    "Ceil",
+    "Round",
+    "Sin",
+    "Cos",
+    "Sigmoid",
+    "Softplus",
+    // Logical / selection.
+    "Not",
+    "Where",
     // Reduction / normalization.
     "ReduceMean",
+    "ReduceSum",
+    "ReduceMax",
+    "ReduceMin",
+    "ReduceProd",
+    "ReduceSumSquare",
+    "ReduceL2",
     "Softmax",
     // Shape / data movement.
     "Shape",
@@ -83,6 +112,10 @@ pub const PHASE1_OPS: &[&str] = &[
     "Slice",
     "Constant",
     "Identity",
+    "Concat",
+    "Flatten",
+    "Squeeze",
+    "Size",
     // GEMM.
     "Gemm",
 ];
@@ -204,6 +237,78 @@ pub fn build_cpu_registry() -> OpRegistry {
     );
     // GEMM.
     reg.register(OpKey::new("Gemm", "", 1), Box::new(gemm::GemmFactory));
+    // --- Additional ep-cpu op coverage (op-coverage wave) ---------------------
+    // Elementwise unary math (f32). Additive, default-domain-only registrations.
+    reg.register(OpKey::new("Abs", "", 1), Box::new(unary_math::AbsFactory));
+    reg.register(OpKey::new("Neg", "", 1), Box::new(unary_math::NegFactory));
+    reg.register(
+        OpKey::new("Reciprocal", "", 1),
+        Box::new(unary_math::ReciprocalFactory),
+    );
+    reg.register(OpKey::new("Exp", "", 1), Box::new(unary_math::ExpFactory));
+    reg.register(OpKey::new("Log", "", 1), Box::new(unary_math::LogFactory));
+    reg.register(OpKey::new("Sign", "", 1), Box::new(unary_math::SignFactory));
+    reg.register(
+        OpKey::new("Floor", "", 1),
+        Box::new(unary_math::FloorFactory),
+    );
+    reg.register(OpKey::new("Ceil", "", 1), Box::new(unary_math::CeilFactory));
+    reg.register(
+        OpKey::new("Round", "", 1),
+        Box::new(unary_math::RoundFactory),
+    );
+    reg.register(OpKey::new("Sin", "", 1), Box::new(unary_math::SinFactory));
+    reg.register(OpKey::new("Cos", "", 1), Box::new(unary_math::CosFactory));
+    reg.register(
+        OpKey::new("Sigmoid", "", 1),
+        Box::new(unary_math::SigmoidFactory),
+    );
+    reg.register(
+        OpKey::new("Softplus", "", 1),
+        Box::new(unary_math::SoftplusFactory),
+    );
+    // Logical / selection.
+    reg.register(OpKey::new("Not", "", 1), Box::new(logical::NotFactory));
+    reg.register(OpKey::new("Where", "", 1), Box::new(where_op::WhereFactory));
+    // Reductions (axes attribute or opset-13/18 axes input).
+    reg.register(
+        OpKey::new("ReduceSum", "", 1),
+        Box::new(reduce_ops::ReduceSumFactory),
+    );
+    reg.register(
+        OpKey::new("ReduceMax", "", 1),
+        Box::new(reduce_ops::ReduceMaxFactory),
+    );
+    reg.register(
+        OpKey::new("ReduceMin", "", 1),
+        Box::new(reduce_ops::ReduceMinFactory),
+    );
+    reg.register(
+        OpKey::new("ReduceProd", "", 1),
+        Box::new(reduce_ops::ReduceProdFactory),
+    );
+    reg.register(
+        OpKey::new("ReduceSumSquare", "", 1),
+        Box::new(reduce_ops::ReduceSumSquareFactory),
+    );
+    reg.register(
+        OpKey::new("ReduceL2", "", 1),
+        Box::new(reduce_ops::ReduceL2Factory),
+    );
+    // Shape / data movement (dtype-agnostic byte movers).
+    reg.register(OpKey::new("Concat", "", 1), Box::new(concat::ConcatFactory));
+    reg.register(
+        OpKey::new("Flatten", "", 1),
+        Box::new(movement_ops::FlattenFactory),
+    );
+    reg.register(
+        OpKey::new("Squeeze", "", 1),
+        Box::new(movement_ops::SqueezeFactory),
+    );
+    reg.register(
+        OpKey::new("Size", "", 1),
+        Box::new(movement_ops::SizeFactory),
+    );
     reg
 }
 
@@ -751,3 +856,4 @@ mod tests {
         view_in_bounds(v.shape, v.strides, v.byte_offset, 4, a.bytes.len()).unwrap();
     }
 }
+
