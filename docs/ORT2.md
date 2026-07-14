@@ -2305,8 +2305,8 @@ onnx-genai/                               (monorepo)
 ├── crates/
 │   │
 │   │  ── Runtime layer (new — ORT 2.0) ──
-│   ├── onnx-ir2/                         # Graph IR, types, shapes, strides, layout
-│   │                                     # (named onnx-ir2 because onnx-ir is taken)
+│   ├── onnx-runtime-ir/                         # Graph IR, types, shapes, strides, layout
+│   │                                     # (named onnx-runtime-ir because onnx-ir is taken)
 │   ├── onnx-runtime-loader/                       # ONNX protobuf → IR, weight mmap
 │   ├── onnx-runtime-optimizer/                    # Optimization passes pipeline
 │   ├── onnx-runtime-cost-model/                   # Cost estimation, calibration
@@ -2481,7 +2481,7 @@ If an EP fails at runtime:
 ### 27.1 Unit Tests (per crate)
 
 ```rust
-// onnx-ir2: graph construction, topological sort, validation
+// onnx-runtime-ir: graph construction, topological sort, validation
 // onnx-runtime-optimizer: each pass in isolation with small test graphs
 // onnx-runtime-cost-model: cost formula correctness
 // onnx-runtime-memory: arena allocation, aliasing correctness
@@ -2554,7 +2554,7 @@ pub fn conformance_test(model_path: &Path, inputs: &[Tensor], tolerance: f64) ->
 ## 29. Phased Roadmap
 
 ### Phase 1: Foundation (8-12 weeks)
-- [ ] `onnx-ir2`: Graph IR with all types, validation, mutation API
+- [ ] `onnx-runtime-ir`: Graph IR with all types, validation, mutation API
 - [ ] `onnx-runtime-loader`: ONNX protobuf parser, shape inference, weight mmap (safetensors + external data)
 - [ ] `onnx-runtime-ep-api`: ExecutionProvider trait, Kernel trait, OpRegistry
 - [ ] `onnx-runtime-ep-cpu`: Basic ops (MatMul, Add, Relu, Reshape, Transpose, Gather, LayerNorm) via oneDNN
