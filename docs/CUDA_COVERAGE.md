@@ -105,18 +105,18 @@ not yet wired) · **🔬 custom** (needs a fused NVRTC/CUTLASS kernel).
 
 | Op | Domain | Status | Backend | Notes |
 |----|--------|--------|---------|-------|
-| `Softmax` (v1 & v13) | `` | ✅ | **NVRTC-custom** (fused block reduction) | Per-axis, numerically stable (subtract row max). Legacy coerce-to-2D at opset ≤ 12, single-axis at opset ≥ 13 (registry picks by `since_version`). Kept as our own kernel (not cuDNN) so it stays fusable — the attention path already embeds exactly this reduction (`softmax.rs`). |
+| `Softmax` (v1 & v13) | `` | ✅ | **cuDNN** `cudnnSoftmaxForward` | `ACCURATE` algorithm, f32/f16/bf16. Legacy coerce-to-2D uses INSTANCE mode; opset ≥ 13 uses a 4-D channel view for exact single-axis semantics. Falls back to the prior NVRTC kernel for f32 when cuDNN is unavailable. |
 | `LayerNormalization` | `` / `com.microsoft` | ✅ | **NVRTC-custom** (fused) | Mean/var + normalize + affine in **one** pass over one HBM read — beats a cuDNN reduce + separate pointwise affine. Population stats, optional `Mean`/`InvStdDev` outputs, arbitrary `axis` (`normalization.rs`). f32. |
 | `SkipLayerNormalization` | `com.microsoft` | ✅ | **NVRTC-custom** (fused) | `LayerNorm(input + skip + bias)·γ + β` — the residual add is fused into the norm, saving a whole tensor round-trip. Optional `beta`/`bias` inputs, optional `mean`/`inv_std`/`input_skip_bias_sum` outputs (`normalization.rs`). f32. |
 | `RMSNormalization` / `SimplifiedLayerNormalization` | `` / `com.microsoft` | ✅ | **NVRTC-custom** (fused) | Root-mean-square scale, no mean subtraction (LLaMA-family norm). Optional `InvStdDev` output, arbitrary `axis` (`normalization.rs`). f32. |
-| `ReduceMean` | `` | ✅ | **NVRTC block reduction** (cub-class) | See reductions below. |
+| `ReduceMean` | `` | ✅ | **cuDNN** `cudnnReduceTensor` | See reductions below. |
 
 ### Reductions
 
 | Op | Domain | Status | Backend | Notes |
 |----|--------|--------|---------|-------|
-| `ReduceSum` | `` | ✅ | **NVRTC block reduction** (cub-class) | Arbitrary axes (attribute or opset-13+ input), `keepdims`, `noop_with_empty_axes`, negative axes. Exact base/delta offset split → one block per output element (`reduce.rs`). f32. |
-| `ReduceMean` | `` | ✅ | **NVRTC block reduction** (cub-class) | As `ReduceSum`, dividing by the group size. |
+| `ReduceSum` | `` | ✅ | **cuDNN** `cudnnReduceTensor` (ADD) | Arbitrary axes (attribute or opset-13+ input), `keepdims`, `noop_with_empty_axes`, negative axes; f32/f16/bf16. RAII workspace, no indices. Falls back to the prior NVRTC f32 kernel when cuDNN is unavailable. |
+| `ReduceMean` | `` | ✅ | **cuDNN** `cudnnReduceTensor` (AVG) | Same shape/axis handling and fallback as `ReduceSum`. |
 | `ReduceMax` | `` | ✅ | **NVRTC block reduction** (cub-class) | As above; NaN-propagating (numpy / CPU-EP semantics). |
 | `ReduceMin` | `` | ✅ | **NVRTC block reduction** (cub-class) | As above; NaN-propagating. |
 

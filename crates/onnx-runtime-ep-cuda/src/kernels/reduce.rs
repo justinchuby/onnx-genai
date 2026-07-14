@@ -1,8 +1,9 @@
-//! f32 **reductions** on the GPU — `ReduceSum`, `ReduceMean`, `ReduceMax`,
-//! `ReduceMin` — over arbitrary axes with `keepdims`
+//! GPU **reductions** over arbitrary axes with `keepdims`
 //! (`docs/CUDA_COVERAGE.md`, "Normalization & softmax" / reduce rows).
 //!
-//! ## Backend choice — block reduction (cub-class), and *why*
+//! `ReduceSum` and `ReduceMean` use `cudnnReduceTensor` for f32/f16/bf16.
+//! Their previous f32 NVRTC block reduction remains the runtime fallback when
+//! cuDNN is absent. `ReduceMax`/`ReduceMin` continue to use NVRTC.
 //!
 //! `cub::DeviceReduce` / `DeviceSegmentedReduce` are the vendor primitives for
 //! reductions, and a segmented block reduction is exactly the shape they use.
@@ -47,8 +48,9 @@ use cudarc::driver::{LaunchConfig, PushKernelArg};
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ir::{DataType, Node};
 
+use crate::cudnn::{CudnnBufferPair, CudnnReduceOp, TensorDescriptorSpec};
 use crate::error::{driver_err, not_implemented};
-use crate::runtime::{cuptr, CudaRuntime};
+use crate::runtime::{CudaRuntime, cuptr};
 
 /// NVRTC source: one block per output element, reducing over its group of
 /// `reduce_count` elements addressed by `base_off[o] + delta_off[r]`.
@@ -137,6 +139,14 @@ impl ReduceOp {
             ReduceOp::Min => (2, 0),
         }
     }
+
+    fn cudnn_op(self) -> Option<CudnnReduceOp> {
+        match self {
+            ReduceOp::Sum => Some(CudnnReduceOp::Add),
+            ReduceOp::Mean => Some(CudnnReduceOp::Average),
+            ReduceOp::Max | ReduceOp::Min => None,
+        }
+    }
 }
 
 /// A resolved reduction: which axes are reduced, plus the derived
@@ -163,6 +173,51 @@ fn contiguous_strides(shape: &[usize]) -> Vec<i64> {
     strides
 }
 
+fn contiguous_strides_usize(shape: &[usize]) -> Vec<usize> {
+    let mut strides = vec![0usize; shape.len()];
+    let mut acc = 1usize;
+    for d in (0..shape.len()).rev() {
+        strides[d] = acc;
+        acc *= shape[d];
+    }
+    strides
+}
+
+fn reduced_output_shape(in_shape: &[usize], reduce: &[bool], keepdims: bool) -> Vec<usize> {
+    let mut out_shape = Vec::with_capacity(in_shape.len());
+    for (dim, &is_reduced) in in_shape.iter().zip(reduce) {
+        if is_reduced {
+            if keepdims {
+                out_shape.push(1);
+            }
+        } else {
+            out_shape.push(*dim);
+        }
+    }
+    out_shape
+}
+
+/// Build same-rank input/output descriptors; squeezed ONNX output dimensions
+/// remain size-one in cuDNN because this preserves the same contiguous storage.
+pub(crate) fn cudnn_reduce_specs(
+    dtype: DataType,
+    in_shape: &[usize],
+    reduce: &[bool],
+) -> Result<(TensorDescriptorSpec, TensorDescriptorSpec)> {
+    let cudnn_out_shape: Vec<usize> = in_shape
+        .iter()
+        .zip(reduce)
+        .map(|(&dim, &is_reduced)| if is_reduced { 1 } else { dim })
+        .collect();
+    let input = TensorDescriptorSpec::new(dtype, in_shape, &contiguous_strides_usize(in_shape))?;
+    let output = TensorDescriptorSpec::new(
+        dtype,
+        &cudnn_out_shape,
+        &contiguous_strides_usize(&cudnn_out_shape),
+    )?;
+    Ok((input, output))
+}
+
 /// Build the [`ReductionPlan`] for `in_shape`, a `reduce[d]` mask, and
 /// `keepdims`. The `base`/`delta` split is exact because row-major strides are
 /// independent per axis (see the module docs).
@@ -181,16 +236,7 @@ pub(crate) fn build_plan(in_shape: &[usize], reduce: &[bool], keepdims: bool) ->
 
     // Output shape: kept dims in order; reduced dims become size-1 (keepdims) or
     // are squeezed out.
-    let mut out_shape = Vec::with_capacity(rank);
-    for d in 0..rank {
-        if reduce[d] {
-            if keepdims {
-                out_shape.push(1);
-            }
-        } else {
-            out_shape.push(in_shape[d]);
-        }
-    }
+    let out_shape = reduced_output_shape(in_shape, reduce, keepdims);
 
     ReductionPlan {
         base,
@@ -361,16 +407,25 @@ impl ReduceKernel {
             )));
         }
         let x = &inputs[0];
-        if x.dtype != DataType::Float32 {
+        let cudnn_op = self.op.cudnn_op();
+        let supported_dtype = if cudnn_op.is_some() {
+            matches!(
+                x.dtype,
+                DataType::Float32 | DataType::Float16 | DataType::BFloat16
+            )
+        } else {
+            x.dtype == DataType::Float32
+        };
+        if !supported_dtype {
             return Err(not_implemented(format!(
-                "{op} with input dtype {:?} (this slice is f32-only)",
+                "{op} with input dtype {:?} (sum/mean support f32/f16/bf16; max/min are f32)",
                 x.dtype
             )));
         }
-        if outputs[0].dtype != DataType::Float32 {
-            return Err(not_implemented(format!(
-                "{op} with output dtype {:?} (this slice is f32-only)",
-                outputs[0].dtype
+        if outputs[0].dtype != x.dtype {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep {op}: output dtype {:?} must equal input dtype {:?}",
+                outputs[0].dtype, x.dtype
             )));
         }
         if !x.is_contiguous() || !outputs[0].is_contiguous() {
@@ -388,16 +443,56 @@ impl ReduceKernel {
             self.axes_attr.clone()
         };
         let reduce = resolve_reduce_mask(op, &axes_raw, rank, self.noop_with_empty_axes)?;
-        let plan = build_plan(x.shape, &reduce, self.keepdims);
+        let expected_shape = reduced_output_shape(x.shape, &reduce, self.keepdims);
 
-        if outputs[0].shape != plan.out_shape.as_slice() {
+        if outputs[0].shape != expected_shape.as_slice() {
             return Err(EpError::KernelFailed(format!(
                 "cuda_ep {op}: output shape {:?} does not match the reduced shape {:?} \
                  (axes {:?}, keepdims {})",
-                outputs[0].shape, plan.out_shape, axes_raw, self.keepdims
+                outputs[0].shape, expected_shape, axes_raw, self.keepdims
             )));
         }
 
+        if x.numel() == 0 || outputs[0].numel() == 0 {
+            return Ok(());
+        }
+
+        if !reduce.iter().any(|&axis| axis) || rank == 0 {
+            let src = cuptr(x.data_ptr::<u8>() as *const c_void);
+            let dst = cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void);
+            if src != dst {
+                // SAFETY: identity reduction has equal input/output storage size.
+                unsafe { self.runtime.dtod(src, dst, x.byte_size()) }?;
+            }
+            return Ok(());
+        }
+
+        if let Some(cudnn_op) = cudnn_op {
+            if self.runtime.cudnn().is_available() {
+                let (input_spec, output_spec) = cudnn_reduce_specs(x.dtype, x.shape, &reduce)?;
+                let x_ptr = cuptr(x.data_ptr::<u8>() as *const c_void);
+                let y_ptr = cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void);
+                self.runtime.cudnn().with_handle(|handle| {
+                    handle.reduce(
+                        &input_spec,
+                        &output_spec,
+                        cudnn_op,
+                        CudnnBufferPair {
+                            input: x_ptr,
+                            output: y_ptr,
+                            input_numel: x.numel(),
+                            output_numel: outputs[0].numel(),
+                        },
+                    )
+                })?;
+                return self.runtime.synchronize();
+            }
+            if x.dtype != DataType::Float32 {
+                return self.runtime.cudnn().with_handle(|_| Ok(()));
+            }
+        }
+
+        let plan = build_plan(x.shape, &reduce, self.keepdims);
         let out_count = plan.base.len();
         let reduce_count = plan.delta.len();
         if out_count == 0 || reduce_count == 0 {
@@ -447,13 +542,17 @@ impl ReduceKernel {
         unsafe { self.runtime.htod(base_bytes, base_buf) }?;
         unsafe { self.runtime.htod(delta_bytes, delta_buf) }?;
 
-        let out_i = i32::try_from(out_count)
-            .map_err(|_| EpError::KernelFailed(format!("cuda_ep {op}: {out_count} outputs exceed i32")))?;
-        let red_i = i32::try_from(reduce_count).map_err(|_| {
-            EpError::KernelFailed(format!("cuda_ep {op}: reduction group {reduce_count} exceeds i32"))
+        let out_i = i32::try_from(out_count).map_err(|_| {
+            EpError::KernelFailed(format!("cuda_ep {op}: {out_count} outputs exceed i32"))
         })?;
-        let grid = u32::try_from(out_count)
-            .map_err(|_| EpError::KernelFailed(format!("cuda_ep {op}: {out_count} blocks exceed u32")))?;
+        let red_i = i32::try_from(reduce_count).map_err(|_| {
+            EpError::KernelFailed(format!(
+                "cuda_ep {op}: reduction group {reduce_count} exceeds i32"
+            ))
+        })?;
+        let grid = u32::try_from(out_count).map_err(|_| {
+            EpError::KernelFailed(format!("cuda_ep {op}: {out_count} blocks exceed u32"))
+        })?;
         let (op_tag, is_mean) = self.op.kernel_tags();
 
         let x_ptr = cuptr(x.data_ptr::<u8>() as *const c_void);
@@ -584,5 +683,23 @@ mod tests {
         assert_eq!(ReduceOp::Mean.kernel_tags(), (0, 1));
         assert_eq!(ReduceOp::Max.kernel_tags(), (1, 0));
         assert_eq!(ReduceOp::Min.kernel_tags(), (2, 0));
+    }
+
+    #[test]
+    fn cudnn_op_mapping_only_ports_sum_and_mean() {
+        assert_eq!(ReduceOp::Sum.cudnn_op(), Some(CudnnReduceOp::Add));
+        assert_eq!(ReduceOp::Mean.cudnn_op(), Some(CudnnReduceOp::Average));
+        assert_eq!(ReduceOp::Max.cudnn_op(), None);
+        assert_eq!(ReduceOp::Min.cudnn_op(), None);
+    }
+
+    #[test]
+    fn cudnn_specs_keep_reduced_axes_as_size_one() {
+        let (input, output) =
+            cudnn_reduce_specs(DataType::BFloat16, &[2, 3, 4], &[true, false, true]).unwrap();
+        assert_eq!(input.dims(), &[1, 2, 3, 4]);
+        assert_eq!(input.strides(), &[24, 12, 4, 1]);
+        assert_eq!(output.dims(), &[1, 1, 3, 1]);
+        assert_eq!(output.strides(), &[3, 3, 1, 1]);
     }
 }

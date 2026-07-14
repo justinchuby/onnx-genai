@@ -8,8 +8,12 @@
 use std::marker::PhantomData;
 use std::sync::{Arc, Mutex};
 
-use cudarc::cudnn::{Cudnn, CudnnDataType, TensorDescriptor, sys};
-use cudarc::driver::CudaStream;
+use cudarc::cudnn::{
+    Cudnn, CudnnDataType, NoIndices, ReduceTensor, ReductionDescriptor, SoftmaxForward,
+    TensorDescriptor, sys,
+};
+use cudarc::driver::sys::CUdeviceptr;
+use cudarc::driver::{CudaStream, DevicePtr, DevicePtrMut, DeviceSlice, SyncOnDrop};
 use half::{bf16, f16};
 use onnx_runtime_ep_api::{EpError, Result};
 use onnx_runtime_ir::DataType;
@@ -22,6 +26,68 @@ pub enum CudnnTensorType {
     F32,
     F16,
     Bf16,
+}
+
+/// ONNX softmax layouts mapped to cuDNN's two supported reduction modes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CudnnSoftmaxMode {
+    /// Legacy ONNX Softmax: one flattened trailing instance per leading row.
+    Instance,
+    /// Opset-13 Softmax: reduce the channel dimension at each outer/inner point.
+    Channel,
+}
+
+impl CudnnSoftmaxMode {
+    fn as_raw(self) -> sys::cudnnSoftmaxMode_t {
+        match self {
+            Self::Instance => sys::cudnnSoftmaxMode_t::CUDNN_SOFTMAX_MODE_INSTANCE,
+            Self::Channel => sys::cudnnSoftmaxMode_t::CUDNN_SOFTMAX_MODE_CHANNEL,
+        }
+    }
+}
+
+/// cuDNN reductions used by the library-first CUDA kernels.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CudnnReduceOp {
+    Add,
+    Average,
+}
+
+impl CudnnReduceOp {
+    fn as_raw(self) -> sys::cudnnReduceTensorOp_t {
+        match self {
+            Self::Add => sys::cudnnReduceTensorOp_t::CUDNN_REDUCE_TENSOR_ADD,
+            Self::Average => sys::cudnnReduceTensorOp_t::CUDNN_REDUCE_TENSOR_AVG,
+        }
+    }
+}
+
+/// Raw EP buffers and element counts for one cuDNN operation.
+#[derive(Clone, Copy, Debug)]
+pub struct CudnnBufferPair {
+    pub input: CUdeviceptr,
+    pub output: CUdeviceptr,
+    pub input_numel: usize,
+    pub output_numel: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ReductionScratchSizes {
+    workspace_bytes: usize,
+    indices_bytes: usize,
+}
+
+impl ReductionScratchSizes {
+    fn no_indices(workspace_bytes: usize) -> Self {
+        Self {
+            workspace_bytes,
+            indices_bytes: 0,
+        }
+    }
+
+    fn workspace_allocation_bytes(self) -> usize {
+        self.workspace_bytes.max(1)
+    }
 }
 
 impl CudnnTensorType {
@@ -180,6 +246,7 @@ impl CudnnTensorDescriptor<'_> {
 /// Exclusive, lifetime-bound access to the cuDNN handle.
 pub struct CudnnHandle<'handle> {
     handle: &'handle Arc<Cudnn>,
+    stream: &'handle Arc<CudaStream>,
 }
 
 impl CudnnHandle<'_> {
@@ -207,6 +274,173 @@ impl CudnnHandle<'_> {
             inner,
             _handle: PhantomData,
         })
+    }
+
+    /// Execute numerically-stable cuDNN softmax on raw EP device buffers.
+    pub fn softmax(
+        &self,
+        spec: &TensorDescriptorSpec,
+        mode: CudnnSoftmaxMode,
+        buffers: CudnnBufferPair,
+    ) -> Result<()> {
+        let descriptor = self.tensor_descriptor(spec)?;
+        match &descriptor.inner {
+            TensorDescriptorInner::F32(desc) => {
+                self.softmax_t(desc, mode, buffers, (1.0f32, 0.0f32))
+            }
+            TensorDescriptorInner::F16(desc) => self.softmax_t(
+                desc,
+                mode,
+                buffers,
+                (f16::from_f32(1.0), f16::from_f32(0.0)),
+            ),
+            TensorDescriptorInner::Bf16(desc) => self.softmax_t(
+                desc,
+                mode,
+                buffers,
+                (bf16::from_f32(1.0), bf16::from_f32(0.0)),
+            ),
+        }
+    }
+
+    fn softmax_t<T: CudnnDataType + Copy>(
+        &self,
+        descriptor: &TensorDescriptor<T>,
+        mode: CudnnSoftmaxMode,
+        buffers: CudnnBufferPair,
+        scaling: (T, T),
+    ) -> Result<()> {
+        let softmax = self
+            .handle
+            .create_softmax::<T>(mode.as_raw())
+            .map_err(|e| cudnn_err("creating softmax operation", e))?;
+        let op = SoftmaxForward {
+            softmax: &softmax,
+            x: descriptor,
+            y: descriptor,
+        };
+        let input = RawDevice::<T>::new(buffers.input, buffers.input_numel, self.stream.clone());
+        let mut output =
+            RawDevice::<T>::new(buffers.output, buffers.output_numel, self.stream.clone());
+        // SAFETY: the descriptor dtype/layout matches both raw buffers, which
+        // are live EP allocations containing `numel` elements.
+        unsafe {
+            op.launch(
+                scaling,
+                sys::cudnnSoftmaxAlgorithm_t::CUDNN_SOFTMAX_ACCURATE,
+                &input,
+                &mut output,
+            )
+        }
+        .map_err(|e| cudnn_err("cudnnSoftmaxForward", e))
+    }
+
+    /// Query scratch space and execute a no-indices cuDNN tensor reduction.
+    pub fn reduce(
+        &self,
+        input_spec: &TensorDescriptorSpec,
+        output_spec: &TensorDescriptorSpec,
+        op: CudnnReduceOp,
+        buffers: CudnnBufferPair,
+    ) -> Result<()> {
+        let input = self.tensor_descriptor(input_spec)?;
+        let output = self.tensor_descriptor(output_spec)?;
+        match (&input.inner, &output.inner) {
+            (TensorDescriptorInner::F32(a), TensorDescriptorInner::F32(c)) => {
+                self.reduce_t(a, c, op, buffers, (1.0f32, 0.0f32))
+            }
+            (TensorDescriptorInner::F16(a), TensorDescriptorInner::F16(c)) => {
+                self.reduce_t(a, c, op, buffers, (f16::from_f32(1.0), f16::from_f32(0.0)))
+            }
+            (TensorDescriptorInner::Bf16(a), TensorDescriptorInner::Bf16(c)) => self.reduce_t(
+                a,
+                c,
+                op,
+                buffers,
+                (bf16::from_f32(1.0), bf16::from_f32(0.0)),
+            ),
+            _ => Err(EpError::KernelFailed(
+                "cuda_ep: cuDNN reduction input/output descriptor dtypes differ".into(),
+            )),
+        }
+    }
+
+    fn reduce_t<T: CudnnDataType + Copy>(
+        &self,
+        a: &TensorDescriptor<T>,
+        c: &TensorDescriptor<T>,
+        reduce_op: CudnnReduceOp,
+        buffers: CudnnBufferPair,
+        scaling: (T, T),
+    ) -> Result<()> {
+        let descriptor: ReductionDescriptor<T, NoIndices> = self
+            .handle
+            .create_reduction_no_indices::<T>(
+                reduce_op.as_raw(),
+                sys::cudnnNanPropagation_t::CUDNN_PROPAGATE_NAN,
+            )
+            .map_err(|e| cudnn_err("creating reduction descriptor", e))?;
+        let op = ReduceTensor {
+            reduce: &descriptor,
+            a,
+            c,
+        };
+        let scratch = ReductionScratchSizes::no_indices(
+            op.get_workspace_size()
+                .map_err(|e| cudnn_err("cudnnGetReductionWorkspaceSize", e))?,
+        );
+        debug_assert_eq!(scratch.indices_bytes, 0);
+        let mut workspace = self
+            .stream
+            .alloc_zeros::<u8>(scratch.workspace_allocation_bytes())
+            .map_err(|e| driver_err("allocating cuDNN reduction workspace", e))?;
+        let input = RawDevice::<T>::new(buffers.input, buffers.input_numel, self.stream.clone());
+        let mut output =
+            RawDevice::<T>::new(buffers.output, buffers.output_numel, self.stream.clone());
+        // SAFETY: descriptors and raw buffers have matching dtypes/layouts;
+        // workspace is at least the size returned by cuDNN and indices are off.
+        unsafe { op.launch(&mut workspace, scaling, &input, &mut output) }
+            .map_err(|e| cudnn_err("cudnnReduceTensor", e))
+    }
+}
+
+struct RawDevice<T> {
+    ptr: CUdeviceptr,
+    len: usize,
+    stream: Arc<CudaStream>,
+    _type: PhantomData<T>,
+}
+
+impl<T> RawDevice<T> {
+    fn new(ptr: CUdeviceptr, len: usize, stream: Arc<CudaStream>) -> Self {
+        Self {
+            ptr,
+            len,
+            stream,
+            _type: PhantomData,
+        }
+    }
+}
+
+impl<T> DeviceSlice<T> for RawDevice<T> {
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn stream(&self) -> &Arc<CudaStream> {
+        &self.stream
+    }
+}
+
+impl<T> DevicePtr<T> for RawDevice<T> {
+    fn device_ptr<'a>(&'a self, _stream: &'a CudaStream) -> (CUdeviceptr, SyncOnDrop<'a>) {
+        (self.ptr, SyncOnDrop::Record(None))
+    }
+}
+
+impl<T> DevicePtrMut<T> for RawDevice<T> {
+    fn device_ptr_mut<'a>(&'a mut self, _stream: &'a CudaStream) -> (CUdeviceptr, SyncOnDrop<'a>) {
+        (self.ptr, SyncOnDrop::Record(None))
     }
 }
 
@@ -260,7 +494,15 @@ impl CudnnBackend {
         let handle = handle.as_ref().ok_or_else(|| {
             EpError::KernelFailed("cuda_ep: cuDNN handle initialization produced no handle".into())
         })?;
-        operation(CudnnHandle { handle })
+        operation(CudnnHandle {
+            handle,
+            stream: &self.stream,
+        })
+    }
+
+    /// Cheap loader probe used to select an existing non-cuDNN fallback.
+    pub fn is_available(&self) -> bool {
+        cudnn_library_present()
     }
 }
 
@@ -376,6 +618,35 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("libcudnn.so.9"));
         assert!(message.contains("pip install nvidia-cudnn-cu13"));
+    }
+
+    #[test]
+    fn maps_softmax_modes_and_reduce_ops() {
+        assert_eq!(
+            CudnnSoftmaxMode::Instance.as_raw(),
+            sys::cudnnSoftmaxMode_t::CUDNN_SOFTMAX_MODE_INSTANCE
+        );
+        assert_eq!(
+            CudnnSoftmaxMode::Channel.as_raw(),
+            sys::cudnnSoftmaxMode_t::CUDNN_SOFTMAX_MODE_CHANNEL
+        );
+        assert_eq!(
+            CudnnReduceOp::Add.as_raw(),
+            sys::cudnnReduceTensorOp_t::CUDNN_REDUCE_TENSOR_ADD
+        );
+        assert_eq!(
+            CudnnReduceOp::Average.as_raw(),
+            sys::cudnnReduceTensorOp_t::CUDNN_REDUCE_TENSOR_AVG
+        );
+    }
+
+    #[test]
+    fn reduction_workspace_query_result_is_raii_allocatable() {
+        let zero = ReductionScratchSizes::no_indices(0);
+        assert_eq!(zero.workspace_allocation_bytes(), 1);
+        assert_eq!(zero.indices_bytes, 0);
+        let nonzero = ReductionScratchSizes::no_indices(4096);
+        assert_eq!(nonzero.workspace_allocation_bytes(), 4096);
     }
 
     #[test]

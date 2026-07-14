@@ -47,15 +47,15 @@ use pointwise::{
 /// * **Attention** — the SDPA/GQA baseline (`com.microsoft` domain; cuBLAS
 ///   batched GEMM + NVRTC softmax), the §13.3 binding a cuDNN-fused SDPA /
 ///   FlashAttention-3 shim drops in behind.
-/// * **Softmax** — standalone axis-reduction softmax (fused NVRTC block
-///   reduction; legacy coerce-to-2D at opset ≤ 12, per-axis at opset ≥ 13).
+/// * **Softmax** — cuDNN `cudnnSoftmaxForward` (f32/f16/bf16; legacy
+///   coerce-to-2D at opset ≤ 12, per-axis at opset ≥ 13), with f32 NVRTC fallback.
 /// * **Normalization** — fused NVRTC `LayerNormalization` (ai.onnx +
 ///   `com.microsoft`), `RMSNormalization` / `SimplifiedLayerNormalization`, and
 ///   `SkipLayerNormalization` (residual add fused into the norm).
 /// * **Cast / CastLike** — NVRTC element-wise dtype conversion (f32/f64/f16/bf16/
 ///   int8-64/uint8-64/bool).
-/// * **Reductions** — `ReduceSum`, `ReduceMean`, `ReduceMax`, `ReduceMin`
-///   (NVRTC block reduction; arbitrary axes, keepdims, opset-18 axes-as-input).
+/// * **Reductions** — cuDNN `ReduceSum`/`ReduceMean` (f32/f16/bf16, f32 NVRTC
+///   fallback) plus NVRTC `ReduceMax`/`ReduceMin`; arbitrary axes and keepdims.
 /// * **Pointwise unary math** — `Abs`, `Neg`, `Reciprocal`, `Exp`, `Log`,
 ///   `Sign`, `Floor`, `Ceil`, `Round`, `Sin`, `Cos`, `Softplus` (NVRTC f32,
 ///   formulas matched to the CPU EP `unary_math.rs`).
@@ -143,9 +143,8 @@ pub fn build_cuda_registry(runtime: Arc<CudaRuntime>) -> OpRegistry {
 
     // ── CUDA Wave 2 — transformer-critical ops (see docs/CUDA_COVERAGE.md) ──
 
-    // Softmax (fused NVRTC block reduction). Legacy coerce-to-2D at opset ≤ 12,
-    // per-axis at opset ≥ 13 — the registry picks the highest `since_version`
-    // ≤ opset, mirroring the CPU EP.
+    // Softmax (cuDNN, with f32 NVRTC fallback). Legacy coerce-to-2D at opset
+    // ≤ 12, per-axis at opset ≥ 13.
     reg.register(
         OpKey::new("Softmax", "", 1),
         Box::new(softmax::SoftmaxLegacyFactory {
@@ -203,7 +202,7 @@ pub fn build_cuda_registry(runtime: Arc<CudaRuntime>) -> OpRegistry {
         );
     }
 
-    // Reductions (NVRTC block reduction; cub-class segmented reduce shape).
+    // Reductions (sum/mean cuDNN with f32 NVRTC fallback; max/min NVRTC).
     reg.register(
         OpKey::new("ReduceSum", "", 1),
         Box::new(reduce::ReduceSumFactory {

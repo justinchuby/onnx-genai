@@ -1,17 +1,10 @@
-//! Standalone axis-reduction **Softmax** on the GPU via a runtime-compiled
-//! (NVRTC) fused block-reduction kernel (`docs/CUDA_COVERAGE.md`, "Normalization
-//! & softmax" row).
+//! Standalone axis-reduction **Softmax** on the GPU via
+//! `cudnnSoftmaxForward`, with the previous f32 NVRTC kernel retained as a
+//! compatibility fallback when the dynamically-loaded cuDNN runtime is absent.
 //!
-//! ## Backend choice — custom NVRTC (not cuDNN), and *why*
-//!
-//! cuDNN has `cudnnSoftmaxForward`, but a fused warp/block-reduction softmax is
-//! the standard high-performance form and — unlike an opaque cuDNN call — stays
-//! **ours** so it can later fuse with a producer (the attention path already
-//! embeds exactly this reduction inline). The kernel is numerically stable
-//! (subtract the row max, exponentiate, normalize) and is a memory-bandwidth-
-//! bound single-block-per-row reduction, matching a PyTorch softmax kernel's
-//! shape. This mirrors `crates/onnx-runtime-ep-cpu/src/kernels/softmax.rs`
-//! element-for-element so CPU/CUDA placement is interchangeable.
+//! cuDNN uses its `ACCURATE` algorithm for numerically-stable f32/f16/bf16
+//! execution and supplies the broad-device compatibility required by the
+//! library-first CUDA strategy. The fallback mirrors the CPU EP for f32.
 //!
 //! ## Arbitrary axis
 //!
@@ -42,8 +35,9 @@ use cudarc::driver::{LaunchConfig, PushKernelArg};
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ir::{DataType, Node};
 
+use crate::cudnn::{CudnnBufferPair, CudnnSoftmaxMode, TensorDescriptorSpec};
 use crate::error::{driver_err, not_implemented};
-use crate::runtime::{cuptr, CudaRuntime};
+use crate::runtime::{CudaRuntime, cuptr};
 
 /// NVRTC source: numerically-stable f32 softmax over the middle (`axis_dim`)
 /// dimension of an `[outer, axis_dim, inner]` view. One block per `(o, i)`
@@ -159,11 +153,7 @@ pub struct SoftmaxKernel {
 /// Resolve the `[outer, axis_dim, inner]` view for a `shape` + normalized
 /// `axis`, honouring the opset `coerce_2d` mode. Pure host arithmetic — unit
 /// tested without a GPU.
-pub(crate) fn softmax_view(
-    shape: &[usize],
-    axis: usize,
-    coerce_2d: bool,
-) -> (usize, usize, usize) {
+pub(crate) fn softmax_view(shape: &[usize], axis: usize, coerce_2d: bool) -> (usize, usize, usize) {
     if coerce_2d {
         // opset ≤ 12: `[prod(shape[..axis]), prod(shape[axis..])]`; trailing
         // block is contiguous so `inner == 1`.
@@ -177,6 +167,24 @@ pub(crate) fn softmax_view(
         let inner: usize = shape[axis + 1..].iter().product();
         (outer, axis_dim, inner)
     }
+}
+
+/// Build the explicit 4-D cuDNN view and mode for ONNX softmax semantics.
+pub(crate) fn cudnn_softmax_spec(
+    dtype: DataType,
+    outer: usize,
+    axis_dim: usize,
+    inner: usize,
+    coerce_2d: bool,
+) -> Result<(TensorDescriptorSpec, CudnnSoftmaxMode)> {
+    let dims = [outer, axis_dim, inner, 1];
+    let strides = [axis_dim * inner, inner, 1, 1];
+    let mode = if coerce_2d {
+        CudnnSoftmaxMode::Instance
+    } else {
+        CudnnSoftmaxMode::Channel
+    };
+    Ok((TensorDescriptorSpec::new(dtype, &dims, &strides)?, mode))
 }
 
 /// Normalize a possibly-negative `axis` against `rank`, rejecting out-of-range
@@ -202,16 +210,19 @@ impl SoftmaxKernel {
             )));
         }
         let x = &inputs[0];
-        if x.dtype != DataType::Float32 {
+        if !matches!(
+            x.dtype,
+            DataType::Float32 | DataType::Float16 | DataType::BFloat16
+        ) {
             return Err(not_implemented(format!(
-                "Softmax with input dtype {:?} (this slice is f32-only; f16/bf16 pending)",
+                "Softmax with input dtype {:?} (cuDNN supports f32/f16/bf16)",
                 x.dtype
             )));
         }
-        if outputs[0].dtype != DataType::Float32 {
-            return Err(not_implemented(format!(
-                "Softmax with output dtype {:?} (this slice is f32-only)",
-                outputs[0].dtype
+        if outputs[0].dtype != x.dtype {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep Softmax: output dtype {:?} must equal input dtype {:?}",
+                outputs[0].dtype, x.dtype
             )));
         }
         if !x.is_contiguous() || !outputs[0].is_contiguous() {
@@ -241,6 +252,43 @@ impl SoftmaxKernel {
             return Ok(());
         }
 
+        if self.runtime.cudnn().is_available() {
+            let (spec, mode) = cudnn_softmax_spec(x.dtype, outer, axis_dim, inner, self.coerce_2d)?;
+            let x_ptr = cuptr(x.data_ptr::<u8>() as *const c_void);
+            let y_ptr = cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void);
+            self.runtime.cudnn().with_handle(|handle| {
+                handle.softmax(
+                    &spec,
+                    mode,
+                    CudnnBufferPair {
+                        input: x_ptr,
+                        output: y_ptr,
+                        input_numel: x.numel(),
+                        output_numel: outputs[0].numel(),
+                    },
+                )
+            })?;
+            return self.runtime.synchronize();
+        }
+
+        if x.dtype != DataType::Float32 {
+            // Entering `with_handle` produces the backend's actionable missing
+            // runtime error for dtypes that have no handwritten fallback.
+            return self.runtime.cudnn().with_handle(|_| Ok(()));
+        }
+
+        self.run_nvrtc_f32(x, outputs, outer, axis_dim, inner, groups)
+    }
+
+    fn run_nvrtc_f32(
+        &self,
+        x: &TensorView,
+        outputs: &mut [TensorMut],
+        outer: usize,
+        axis_dim: usize,
+        inner: usize,
+        groups: usize,
+    ) -> Result<()> {
         let (outer_i, axis_i, inner_i) = (
             i32::try_from(outer).map_err(|_| dim_overflow("outer", outer))?,
             i32::try_from(axis_dim).map_err(|_| dim_overflow("axis_dim", axis_dim))?,
@@ -276,7 +324,9 @@ impl SoftmaxKernel {
 }
 
 fn dim_overflow(name: &str, v: usize) -> EpError {
-    EpError::KernelFailed(format!("cuda_ep Softmax: {name} ({v}) exceeds the i32 kernel bound"))
+    EpError::KernelFailed(format!(
+        "cuda_ep Softmax: {name} ({v}) exceeds the i32 kernel bound"
+    ))
 }
 
 impl Kernel for SoftmaxKernel {
@@ -319,6 +369,19 @@ mod tests {
             softmax_view(&[2, 3, 4], 2, true),
             softmax_view(&[2, 3, 4], 2, false)
         );
+    }
+
+    #[test]
+    fn cudnn_layout_selects_onnx_semantics() {
+        let (v13, mode) = cudnn_softmax_spec(DataType::Float16, 2, 3, 4, false).unwrap();
+        assert_eq!(mode, CudnnSoftmaxMode::Channel);
+        assert_eq!(v13.dims(), &[2, 3, 4, 1]);
+        assert_eq!(v13.strides(), &[12, 4, 1, 1]);
+
+        let (legacy, mode) = cudnn_softmax_spec(DataType::BFloat16, 2, 12, 1, true).unwrap();
+        assert_eq!(mode, CudnnSoftmaxMode::Instance);
+        assert_eq!(legacy.dims(), &[2, 12, 1, 1]);
+        assert_eq!(legacy.strides(), &[12, 1, 1, 1]);
     }
 
     #[test]
