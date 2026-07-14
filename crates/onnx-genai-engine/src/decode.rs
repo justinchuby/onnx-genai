@@ -849,13 +849,10 @@ pub(crate) fn detect_model_decode_path(
         // while the runtime manages the KV buffer itself, giving O(1)/token KV
         // instead of the growing `ZeroCopyRebind` path whose per-token cost
         // scales with context. `shared_kv_max_len` pre-sizes that buffer.
-        // The current Metal plugin GQA kernel uses the graph's growing
-        // past/present shape contract. Binding the runtime's fixed-capacity
-        // shared buffer makes the plugin request capacity + sequence_length
-        // elements and fails ORT's pre-bound output-size check.
-        if let Some(max_len) = shared_kv_max_len
-            && !session.is_metal()
-        {
+        if let (DecodeKvMode::SharedBuffer, Some(max_len)) = (
+            decode_kv_mode_from_shared_buffer_len(shared_kv_max_len),
+            shared_kv_max_len,
+        ) {
             return Ok(ModelDecodePath::PastPresent {
                 shared_buffer: true,
                 max_len: Some(max_len),
@@ -864,9 +861,8 @@ pub(crate) fn detect_model_decode_path(
             });
         }
 
-        let shared_buffer = !session.is_metal()
-            && session.past_present_share_buffer_supported()
-            && metadata_max_context.is_some();
+        let shared_buffer =
+            session.past_present_share_buffer_supported() && metadata_max_context.is_some();
         return Ok(ModelDecodePath::PastPresent {
             shared_buffer,
             max_len: metadata_max_context.filter(|_| shared_buffer),
@@ -934,6 +930,21 @@ pub(crate) fn shared_kv_buffer_len_from_metadata(metadata: &InferenceMetadata) -
         return None;
     }
     model.max_sequence_length
+}
+
+/// Resolve the low-level decode KV mode requested by native inference metadata.
+///
+/// This is deliberately independent of execution-provider identity: metadata
+/// describes the model's past/present aliasing contract, which every provider
+/// must receive unchanged.
+pub(crate) fn decode_kv_mode_from_shared_buffer_len(
+    shared_kv_buffer_len: Option<usize>,
+) -> DecodeKvMode {
+    if shared_kv_buffer_len.is_some() {
+        DecodeKvMode::SharedBuffer
+    } else {
+        DecodeKvMode::ZeroCopyRebind
+    }
 }
 
 /// Whether an `attention.type` string denotes group-query attention (GQA).
@@ -1567,15 +1578,16 @@ pub(crate) fn is_gather_out_of_bounds(message: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_step_layout, is_group_query_attention, is_share_buffer_kv_dtype,
-        is_token_input_name, shared_kv_buffer_len_from_metadata, slice_value_axis,
-        sliding_window_from_metadata,
+        decode_kv_mode_from_shared_buffer_len, decode_step_layout, is_group_query_attention,
+        is_share_buffer_kv_dtype, is_token_input_name, shared_kv_buffer_len_from_metadata,
+        slice_value_axis, sliding_window_from_metadata,
     };
+    use onnx_genai_genai_config::GenAiConfig;
     use onnx_genai_metadata::{
         AttentionConfig, InferenceMetadata, KvCacheSpec, ModelCapabilities, RuntimeConfigurable,
         RuntimeKvConfig,
     };
-    use onnx_genai_ort::Value;
+    use onnx_genai_ort::{DecodeKvMode, Value};
 
     #[test]
     fn recognizes_causal_and_seq2seq_token_input_names() {
@@ -1654,6 +1666,35 @@ mod tests {
             ..empty_metadata()
         };
         assert_eq!(shared_kv_buffer_len_from_metadata(&metadata), Some(4096));
+    }
+
+    #[test]
+    fn genai_share_buffer_metadata_resolves_shared_mode_for_mlx_without_ep_gate() {
+        let config: GenAiConfig = serde_json::from_str(
+            r#"{
+                "model": {
+                    "context_length": 4096,
+                    "decoder": {
+                        "head_size": 64,
+                        "num_attention_heads": 14,
+                        "num_key_value_heads": 2,
+                        "num_hidden_layers": 24
+                    }
+                },
+                "search": { "past_present_share_buffer": true }
+            }"#,
+        )
+        .expect("valid share-buffer genai_config");
+        let metadata = config
+            .to_inference_metadata(Some("float16"))
+            .expect("share-buffer metadata");
+
+        // No provider is an input to resolution: Metal/MLX must select the
+        // identical mode as CPU and CUDA for this metadata contract.
+        assert_eq!(
+            decode_kv_mode_from_shared_buffer_len(shared_kv_buffer_len_from_metadata(&metadata)),
+            DecodeKvMode::SharedBuffer
+        );
     }
 
     #[test]
