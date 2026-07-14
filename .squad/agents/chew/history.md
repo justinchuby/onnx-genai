@@ -99,3 +99,6 @@ Non-author review of `squad/ort2-epcontext-session` @ `d59edc5` (author: Batty).
 **Verdict: 🟡 Yellow — approve with test advisories:**
 1. Add positive executor-bypass test with a claimed mock EP
 2. Assert full EpContext struct fields, not only ctx.data
+
+## 2026-07-14T16:20:00Z — CAPI DanglingEpContext regression fix (chew-24)
+Fixed pre-existing non-exhaustive match in `onnx-runtime-capi`: mapped `SessionError::DanglingEpContext` → `OrtErrorCode::InvalidGraph`. Regression introduced when the EPContext consume-path merge added the new variant on main. Retained explicit exhaustive match for compile-time guard. Found via full cross-crate build gate. Commit d3f0c0a.

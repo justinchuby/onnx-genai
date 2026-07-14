@@ -84,3 +84,7 @@ Chew reviewed (read-only, 🟡 SHIP-with-advisories): layout correctness confirm
 - Added `fuses_layernorm_split_chain` (isolated 10-op positive test) and `declines_layernorm_when_numerator_sub_reversed` (adversarial decline test).
 - `DRIFT_ATOL = 1e-5` scoped to all-vs-opt-off only; conformance tolerance (2e-3) unchanged.
 - Merged to main `a02d46e`. Gaff (gaff-10) 🟢 APPROVE.
+
+## 2026-07-14T16:20:00Z — onnx-encoder v1 block + v2 approval (leon-12, leon-13)
+**leon-12:** 🔴 BLOCK on encoder v1 — generic `encode_attribute` branched on op/attribute-name literals (`is_ep_context_op`, `"ep_cache_context"`) in the generic layer, violating §55.6 model-agnostic hard rule. Named Deckard as revision owner; Roy locked out of encoder artifact.
+**leon-13:** 🟢 APPROVE on encoder v2 (`55c7608` over `9ffd65c`) — blocking violation fully resolved; no `ep_cache_context` or `is_ep_context_op` in generic encode/decode layers; byte-exact round-trip via generic STRING path confirmed. 31 loader + 34 session + 40 IR tests green.

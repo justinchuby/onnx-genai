@@ -44,3 +44,6 @@ Gaff's review is now in decisions: engine.rs is a ~3,300-line god module. Refact
 **gaff-10a — Leon LayerNorm order guard:** 🟢 APPROVE. Guard structural/model-agnostic; non-tautological positive + adversarial coverage; drift and reference bounds separate; 31→33 tests; debug+release+clippy green.
 
 **gaff-10b — Roy EPContext loader LOAD path:** 🟢 APPROVE. Opaque blob preservation byte-for-exact-byte (scoped to `is_ep_context_op && ep_cache_context` only); path-safety rejects before join; mmap unsafe follows weights.rs idiom; 7/7 epcontext + 15/15 loader tests green; clippy clean.
+
+## 2026-07-14T16:20:00Z — onnx-encoder v1 review (gaff-11)
+Reviewed Roy's ONNX encoder v1 (`9ffd65c`). 🟢 GREEN — round-trip fidelity and prost encoding correct for Phase-1/2 scope. Real BERT fixture (257 KB) byte-exact. 4 non-blocking advisories: A1 subgraph formal I/O silently omitted (recommend guard), A2 model metadata silently defaulted, A3 STRING byte-exact doc nuance, A4 external re-inlining bloat. Did not identify the §55.6 model-agnostic violation (found by Leon). Not locked out.

@@ -77,3 +77,6 @@ Hardened LayerNorm (axis/epsilon/structure guards) and MatMul+Add (trailing-broa
 - 7 new tests green debug + release. Loader writer (§55.4) is a later task.
 - Merged to main `d18a8a3` (part 1). Gaff (gaff-10) 🟢 APPROVE.
 - **Integration note:** session integrator should use `source_key` (not `source`) in `EpError::NoEpForContext` (Deckard's ep-api, thiserror 2.0 constraint).
+
+## 2026-07-14T16:20:00Z — onnx-encoder v1 (roy-18)
+Authored ONNX encoder v1: `crates/onnx-runtime-loader/src/encoder.rs` (+518), `tests/encoder.rs` (+488). Model-agnostic inverse of the loader decode path. Byte-exact round-trip on synthetic + real BERT 257 KB fixture. Gaff: 🟢 (4 non-blocking advisories). Leon: 🔴 BLOCK — `is_ep_context_op` + `"ep_cache_context"` literal in generic attribute layer violates §55.6. Locked out of the encoder artifact for this cycle; Deckard assigned as revision owner. v2 implemented by Deckard (commit de7ccce).

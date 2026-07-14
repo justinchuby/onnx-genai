@@ -1264,3 +1264,72 @@ Requires `Sub` input[0] == X and input[1] == mean; exactly-binary arity enforced
 **Review — Deckard (deckard-15):** 🟡 YELLOW — approve with advisories. Phase-1-before-Phase-2 ordering enforced on materialized Vec (graph order irrelevant). DuplicateContextSource and NoEpForContext propagate with real (never guessed) source key. Dedup keyed on (source, bytes) — different sources/binaries never collapsed, shared packed binary loads exactly once. main_context=0 references resolve by (source, partition_name) with DanglingEpContext; no second blob load. Path-traversal guard on consume path, tested. Four non-blocking advisories: (A1) covered_nodes omits deduped sibling primary NodeId; (A2) duplicate (source,partition_name) primaries silently accepted; (A3) returned EpContextPlacement discarded by session (executor self-contained); (A4) add session-level path-traversal test. No blocking defect.
 
 **Review — Chew (chew-23):** 🟡 YELLOW — approve with test advisories. Model-agnostic dispatch confirmed (zero hardcoded vendor names in non-test code; QNN literal only in unclaimed fixture). No CPU fall-through: all session construction paths converge on `from_parts` which calls `load_ep_context_nodes` before `Executor::build`; EPContext nodes skipped by `is_ep_context_op` predicate. 7/7 session epcontext tests + clippy pass. Non-blocking: (1) add positive executor-bypass regression test with claimed mock EP; (2) assert full EpContext fields (ep_name, ep_version, covered_nodes, fingerprint), not only ctx.data.
+
+---
+
+### 2026-07-14: ONNX encoder (IR → ModelProto → bytes) — ORT2 §55.3/§55.4 foundation
+
+**Author:** Roy (roy-18, opus-4.8)
+**Artifact:** `crates/onnx-runtime-loader/src/encoder.rs` (+518 lines), `crates/onnx-runtime-loader/tests/encoder.rs` (+488 lines)
+**Branch:** `squad/ort2-onnx-encoder` (base `46f2861`)
+**Final merge commit:** `de7ccce` (merged as `55c7608` after Deckard's v2 revision)
+**Cycle:** v1 authored by Roy → 🟢 Gaff → 🔴 Leon (BLOCK) → v2 by Deckard → 🟢 Leon re-review
+
+#### What landed (v2 — Deckard's revision)
+
+New module `crates/onnx-runtime-loader/src/encoder.rs` — the model-agnostic inverse of `graph_builder` + `weights`. Pure, safe `prost` encoding (no new `unsafe`).
+
+**Public API:**
+- `ModelMetadata` — model-level metadata (ir_version default 10, producer fields, graph name, metadata_props).
+- `Model<'a>` — holds `&Graph`, `ModelMetadata`, and optional `&WeightStore`.
+- `encode_model(&Model) -> Result<Vec<u8>, LoaderError>` — serialize to bytes.
+- `write_model(&Model, path) -> Result<(), LoaderError>` — serialize to file.
+- `encode_model_proto(&Model) -> Result<ModelProto, LoaderError>` — returns ModelProto before serialization (integration seam for §55.4 EPContext writer).
+- `DEFAULT_IR_VERSION: i64 = 10`.
+
+**IR change (v2):** `Attribute::String(String)` → `Attribute::String(Vec<u8>)` and `Attribute::Strings(Vec<String>)` → `Attribute::Strings(Vec<Vec<u8>>)` for byte-preserving STRING attributes. `as_str()` now returns `Option<&str>` (checked UTF-8); `as_bytes()` added for raw access.
+
+**Byte-exact round-trip:** nodes (op_type, domain, I/O order incl. skipped optionals, doc_string, all attributes), initializers (all dtypes, raw little-endian), model metadata (opsets, ir_version, producer fields, metadata_props), symbolic/static dims. Output deterministic (opsets sorted by domain, initializers by value id, attributes by name, nodes by id).
+
+**Fields not encoded:** per-node name (IR has none), TrainingInfoProto, FunctionProto, sparse initializers, quantization annotations, subgraph formal I/O (guard: `encode_attribute` errors on Graph/Graphs attributes rather than emitting a truncated subgraph).
+
+#### v1 blocking violation (Leon/leon-12)
+
+Roy's v1 encoder violated §55.6 model-agnostic hard rule: `encode_node` called `is_ep_context_op` and `encode_attribute` branched on literal `"ep_cache_context"` with UINT8 tensor. The generic attribute layer must contain no op/attribute-name literals. Revision assigned to Deckard (Roy locked out of the encoder artifact for this cycle).
+
+#### Deckard's v2 fix (Option A — byte-preserving STRING in IR)
+
+Root cause: decode path used `String::from_utf8_lossy` for ONNX STRING attributes, forcing Roy to special-case the binary EPContext blob as a UINT8 tensor in decode and then reverse it in encode. Deckard eliminated both special cases by making `Attribute::String` hold `Vec<u8>` throughout the IR. The generic encode/decode layers copy STRING bytes verbatim with no conditional dispatch on op or attribute name. The EPContext consumer (`epcontext.rs`) reads the blob from `Attribute::String` raw bytes directly.
+
+#### Non-blocking advisories (Gaff/gaff-11)
+
+- **A1** — subgraph formal I/O silently omitted (v2 now errors on Graph/Graphs attributes instead).
+- **A2** — model metadata silently defaulted when `.with_metadata()` not called (now documented explicitly).
+- **A3** — STRING byte-exact doc nuance (first decode from original file is lossy for non-routed strings; ep_cache_context is exempt via generic raw bytes in v2).
+- **A4** — external re-inlining bloats output for large models (values intact; `ExternalDataPolicy` recommended as follow-up).
+
+#### Follow-up flags
+
+1. External-data preservation on write (`ExternalDataPolicy` in `Model`/`EncodeOptions`).
+2. `embed_mode=0` external blob file naming/writing (writer policy; encoder receives path string directly).
+3. Subgraph I/O round-trip (needed before any Loop/If/Scan model is encoded).
+4. `encode_model_proto` is the §55.4 writer integration seam (load → partition/compile → build EPContext NodeProto → splice → serialize).
+
+#### Verification (v2)
+
+```
+cargo test -p onnx-runtime-loader      # 9 encoder + 15 loader + 7 epcontext — green
+cargo test -p onnx-runtime-session     # 34 tests — green (incl. 7 EPContext consume/dedup)
+cargo test -p onnx-runtime-ir          # 40 tests — green
+cargo clippy -p onnx-runtime-loader --all-targets -- -D warnings  # clean
+```
+
+---
+
+### 2026-07-14: Map SessionError::DanglingEpContext → OrtErrorCode::InvalidGraph in CAPI
+
+**Author:** Chew (chew-24, gpt-5.6-sol)
+**Artifact:** `onnx-runtime-capi` error mapping
+**Commit:** `d3f0c0a`
+**What:** Added explicit mapping of `SessionError::DanglingEpContext` to `OrtErrorCode::InvalidGraph` in the non-exhaustive match in the CAPI layer. Retains an explicitly exhaustive `SessionError` match to preserve compile-time guard against future unhandled variants.
+**Why:** `DanglingEpContext` (a structurally invalid model reference — `main_context=0` EPContext node with no primary to resolve to) aligns with the existing IR/graph/optimizer/shape-inference error classification. Found via a full cross-crate build gate after the EPContext consume-path merge introduced the new variant on main.

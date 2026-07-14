@@ -136,3 +136,6 @@ Verified all assigned axes: two-phase ordering enforced on materialized Vec (gra
 - A2: duplicate (source,partition_name) primaries silently accepted (no diagnostic)
 - A3: returned EpContextPlacement discarded by session
 - A4: add session-level path-traversal test
+
+## 2026-07-14T16:20:00Z — onnx-encoder v2 revision (deckard-16)
+Assigned as revision owner after Leon blocked Roy's v1 for §55.6 model-agnostic violation. Chose Option A: make `Attribute::String` hold `Vec<u8>` throughout the IR, eliminating decode-side and encode-side EPContext special-cases entirely. Changes: IR `node.rs` (String→Vec<u8>, as_str checked, as_bytes added), `graph_builder.rs` (deleted UINT8 special-case, verbatim bytes), `encoder.rs` (deleted is_ep_ctx + op branch, generic STRING, Graph/Graphs guard), `epcontext.rs` (reads from Attribute::String raw bytes). Tests: 9 encoder + 15 loader + 7 epcontext + 34 session + 40 IR all green. Commit 55c7608, merged as de7ccce. Approved by Leon (leon-13).
