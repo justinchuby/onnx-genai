@@ -3647,7 +3647,940 @@ print(budget.partitions())
 
 ---
 
-## 33. Phased Roadmap
+## 33. Unified Paged Memory (All Tiers)
+
+### 33.1 Design
+
+All memory (VRAM, unified memory, RAM, SSD) is managed as a single paged virtual address space.
+Same page abstraction everywhere. Pages migrate transparently between tiers.
+
+```rust
+pub struct UnifiedPageTable {
+    pages: Vec<PageEntry>,
+    page_size: usize,  // 2MB default (matches CUDA huge page / OS huge page)
+}
+
+pub struct PageEntry {
+    id: PageId,
+    location: PageLocation,
+    content: PageContent,
+    last_access: Instant,
+    access_count: u32,
+    dirty: bool,
+    migration_state: MigrationState,
+}
+
+pub enum PageLocation {
+    Vram { device: u32, offset: usize },
+    UnifiedMemory { offset: usize },       // Apple Silicon / iGPU shared memory
+    Ram { host_ptr: *mut u8 },
+    Ssd { file: FileId, offset: u64 },     // mmap'd NVMe
+    InFlight { from: Tier, to: Tier },     // migration in progress
+}
+
+pub enum PageContent {
+    Weight { tensor_id: TensorId, shard_index: usize },
+    KvCache { layer: u32, block_id: u32 },
+    Activation { node_id: NodeId },
+    Scratch,
+}
+
+pub enum Tier {
+    Vram,
+    UnifiedMemory,
+    Ram,
+    Ssd,
+}
+```
+
+### 33.2 Tier-Specific Behavior
+
+| Tier | Bandwidth | Latency | Migration Cost | Notes |
+|------|-----------|---------|----------------|-------|
+| VRAM (HBM) | ~2 TB/s | ~ns | — | Fastest. Primary compute tier. |
+| Unified Memory | ~200 GB/s | ~ns | Zero (remap only) | Apple Silicon, iGPU. No copy needed. |
+| RAM (DDR5) | ~50 GB/s | ~100ns | DMA H2D/D2H | Standard offload target. |
+| SSD (NVMe) | ~7 GB/s | ~10µs | Async page-in/out | For 405B on laptop. |
+
+**Unified Memory special case:** On Apple Silicon / iGPUs with shared memory,
+no DMA copy needed. "Migration" is just changing memory protection flags:
+
+```rust
+impl PageMigrator {
+    fn migrate(&self, page: PageId, target: Tier) -> Result<()> {
+        match (self.current_tier(page), target) {
+            (Tier::Ram, Tier::Vram) => self.dma_h2d_async(page),
+            (Tier::Vram, Tier::Ram) => self.dma_d2h_async(page),
+            (Tier::Ram, Tier::UnifiedMemory) | (Tier::UnifiedMemory, Tier::Ram) => {
+                self.remap_permissions(page);  // zero-copy, just access flags
+            }
+            (Tier::Ssd, target) => self.async_page_in(page, target),
+            (source, Tier::Ssd) => self.async_page_out(page, source),
+            _ => Ok(())
+        }
+    }
+}
+```
+
+### 33.3 Per-Tier Usage Limits
+
+Users can cap each tier independently:
+
+```python
+session = ort2.load("model.onnx", options={
+    "memory.vram_limit_gb": "12",       # max 12GB VRAM (leave room for other apps)
+    "memory.ram_limit_gb": "32",        # max 32GB RAM
+    "memory.ssd_limit_gb": "100",       # max 100GB SSD
+    "memory.ssd_path": "/mnt/nvme/ort_cache",  # where to store pages on disk
+    "memory.unified_memory_limit_gb": "24",    # for Apple Silicon
+})
+```
+
+```rust
+pub struct TierLimits {
+    pub vram_bytes: Option<usize>,
+    pub unified_memory_bytes: Option<usize>,
+    pub ram_bytes: Option<usize>,
+    pub ssd_bytes: Option<usize>,
+    pub ssd_path: Option<PathBuf>,
+}
+```
+
+---
+
+## 34. Model Resource Estimation
+
+### 34.1 Purpose
+
+Before loading a model, users need to know: "Can my hardware run this? How fast?"
+
+### 34.2 CLI
+
+```bash
+$ ort2 inspect model.onnx
+
+┌─────────────────────────────────────────────────────────┐
+│  Model: Llama-3.1-70B-Instruct (FP16)                   │
+├─────────────────────────────────────────────────────────┤
+│  Weights:           140.0 GB (FP16)                      │
+│  Opset:             22                                   │
+│  Nodes:             4,821                                │
+│  Parameters:        70.6B                                │
+├─────────────────────────────────────────────────────────┤
+│  MEMORY ESTIMATE (context_len=4096, batch=1)             │
+│  ──────────────────────────────────────────────────── │
+│  Weights:             140.0 GB                           │
+│  KV Cache (peak):      5.2 GB                           │
+│  Activations (peak):   1.8 GB                           │
+│  Scratch:              0.3 GB                            │
+│  TOTAL:              147.3 GB                            │
+├─────────────────────────────────────────────────────────┤
+│  YOUR HARDWARE                                           │
+│  ──────────────────────────────────────────────────── │
+│  GPU: RTX 4090 (24 GB)                                   │
+│  RAM: 64 GB                                              │
+│  NVMe: 2 TB                                              │
+├─────────────────────────────────────────────────────────┤
+│  PLACEMENT PLAN                                          │
+│  ──────────────────────────────────────────────────── │
+│  VRAM:  24.0 GB → layers 0-12 weights + KV + activations │
+│  RAM:   50.2 GB → layers 13-79 weights                   │
+│  SSD:    0.0 GB → (not needed)                           │
+│                                                          │
+│  ⚡ Estimated performance:                                │
+│    Prefill (4096 tokens):  ~3.2 sec                      │
+│    Decode (per token):     ~180 ms                       │
+│    Tokens/sec:             ~5.5 tok/s                    │
+│                                                          │
+│  💡 Tip: Use INT4 quantization for ~4x memory reduction   │
+│     → would fit entirely in VRAM (~35 GB)                │
+└─────────────────────────────────────────────────────────┘
+
+$ ort2 inspect model.onnx --context-len 32768 --batch 8 --json
+# Outputs structured JSON for programmatic use
+```
+
+### 34.3 Python API
+
+```python
+import ort2
+
+# Estimate without loading (fast — only reads metadata + weight sizes)
+estimate = ort2.estimate("model.onnx", context_len=4096, batch_size=1)
+print(estimate)
+# ResourceEstimate(
+#   weights_gb=140.0, kv_cache_gb=5.2, activations_gb=1.8,
+#   total_gb=147.3, fits_in_vram=False,
+#   placement_plan=PlacementPlan(vram=24GB, ram=50GB, ssd=0),
+#   estimated_tok_per_sec=5.5,
+#   suggestions=["Use INT4 quantization to fit in VRAM"]
+# )
+
+# Check if a specific config is feasible
+ort2.estimate("model.onnx", context_len=128000, batch_size=32,
+             hardware={"vram_gb": 80, "ram_gb": 256})
+```
+
+### 34.4 Estimation Logic
+
+```rust
+pub struct ResourceEstimate {
+    pub weights_bytes: usize,
+    pub kv_cache_bytes: usize,       // f(num_layers, num_heads, head_dim, context_len, batch)
+    pub activation_peak_bytes: usize, // f(hidden_size, context_len, batch) — max across layers
+    pub scratch_bytes: usize,         // workspace for kernels (e.g. cuBLAS)
+    pub total_bytes: usize,
+    pub placement_plan: PlacementPlan,
+    pub estimated_latency: LatencyEstimate,
+    pub suggestions: Vec<String>,
+}
+
+impl ResourceEstimator {
+    pub fn estimate(model_path: &Path, params: &EstimateParams) -> Result<ResourceEstimate> {
+        // Fast path: read only model metadata + weight tensor shapes
+        // No weight loading, no graph optimization
+        let meta = quick_metadata_scan(model_path)?;
+
+        let weights = meta.total_weight_bytes();
+        let kv = estimate_kv_cache(
+            meta.num_layers, meta.num_kv_heads, meta.head_dim,
+            params.context_len, params.batch_size, meta.kv_dtype,
+        );
+        let activations = estimate_peak_activation(
+            meta.hidden_size, params.context_len, params.batch_size,
+        );
+
+        // Generate placement plan against detected/specified hardware
+        let plan = plan_placement(weights, kv, activations, &params.hardware);
+
+        // Estimate latency from cost model (bandwidth + FLOPs)
+        let latency = estimate_latency(&plan, &meta, params);
+
+        // Generate actionable suggestions
+        let suggestions = generate_suggestions(&plan, &meta);
+
+        Ok(ResourceEstimate { weights, kv, activations, .. })
+    }
+}
+```
+
+---
+
+## 35. Error Recovery & Debug Experience
+
+### 35.1 Philosophy
+
+**Errors should feel like a helpful colleague explaining what went wrong,
+not a stack trace from hell.**
+
+Every error message answers three questions:
+1. **What** went wrong (specific, not generic)
+2. **Why** it happened (root cause, not symptom)
+3. **How** to fix it (actionable suggestion)
+
+### 35.2 Error Types
+
+```rust
+pub struct RuntimeError {
+    pub kind: ErrorKind,
+    pub message: String,
+    pub context: ErrorContext,
+    pub suggestion: Option<String>,
+    pub docs_url: Option<String>,
+}
+
+pub struct ErrorContext {
+    /// Which op/node triggered this.
+    pub node_name: Option<String>,
+    pub op_type: Option<String>,
+    /// Input shapes at the point of failure.
+    pub input_shapes: Vec<(String, Vec<usize>)>,
+    /// What was expected.
+    pub expected: Option<String>,
+    /// What was received.
+    pub actual: Option<String>,
+}
+
+pub enum ErrorKind {
+    // --- Recoverable (runtime continues) ---
+    /// Shape mismatch on input.
+    ShapeMismatch,
+    /// Data type mismatch.
+    DtypeMismatch,
+    /// Timeout on inference (configurable deadline).
+    Timeout,
+    /// Model file not found or corrupted.
+    ModelLoad,
+    /// Unknown op (no kernel registered).
+    UnsupportedOp,
+    /// Resource exhaustion (handled by offloading, but reported).
+    ResourcePressure,
+
+    // --- Fatal (session must be recreated) ---
+    /// CUDA context corrupted (sticky error from kernel crash).
+    DeviceContextCorrupt,
+    /// Hardware failure (ECC, device lost).
+    HardwareFailure,
+    /// Internal bug (invariant violated). Always include repro info.
+    InternalError,
+}
+```
+
+### 35.3 Example Error Messages
+
+```
+❌ Shape mismatch on input "input_ids"
+
+  Expected: [batch_size, sequence_length] with dtype int64
+  Got:      [1, 128, 768] with dtype float32
+            ^^^^^^^^^^^
+            3 dimensions, expected 2
+
+  This looks like you're passing hidden states instead of token IDs.
+  input_ids should be integer token IDs from your tokenizer.
+
+  Docs: https://ort2.dev/errors/shape-mismatch
+```
+
+```
+❌ Unsupported operator: "com.microsoft.NewFancyOp" (version 2)
+
+  This model uses a Microsoft contrib op that our runtime doesn't implement yet.
+
+  Options:
+  1. Use backend="ort" to run this model on upstream ORT
+  2. Register a custom op: session.register_custom_ops("path/to/plugin.so")
+  3. Open an issue: https://github.com/justinchuby/onnx-genai/issues/new
+
+  Node: "model.layers.5.mlp.NewFancyOp"
+  Required by: 3 nodes in the graph
+```
+
+```
+⚠️  GPU memory pressure (using 23.1/24.0 GB)
+
+  Offloading 2.3 GB of weights from GPU to CPU RAM.
+  Performance may decrease ~15% for affected layers (13-24).
+
+  To avoid this:
+  • Use INT4 quantization: ort2 quantize model.onnx --bits 4
+  • Reduce context length (current: 32768)
+  • Set memory.gpu_budget_mb to reserve space: options={"memory.gpu_budget_mb": "20000"}
+```
+
+### 35.4 CUDA Error Recovery
+
+```rust
+impl InferenceSession {
+    fn run_with_recovery(&mut self, inputs: &[(&str, &Tensor)]) -> Result<Vec<Tensor>> {
+        match self.run_inner(inputs) {
+            Ok(result) => Ok(result),
+            Err(e) if e.is_cuda_context_corrupt() => {
+                // CUDA errors are sticky. Must reset context.
+                tracing::error!("CUDA context corrupt. Recovering...");
+                self.reset_cuda_context()?;
+                // Retry once. If it fails again, return fatal error.
+                self.run_inner(inputs)
+            }
+            Err(e) => Err(e)
+        }
+    }
+
+    fn reset_cuda_context(&mut self) -> Result<()> {
+        // 1. Destroy current CUDA context
+        // 2. Create fresh context
+        // 3. Reload weights from checkpoint (weights are on CPU/SSD anyway)
+        // 4. Rebuild execution plan
+        // User sees: one failed request, next request works.
+        Ok(())
+    }
+}
+```
+
+### 35.5 Hardware Degradation
+
+```rust
+pub enum HardwareEvent {
+    ThermalThrottle { device: DeviceId, temp_celsius: u32 },
+    EccError { device: DeviceId, count: u32 },
+    NvLinkFailure { device_a: DeviceId, device_b: DeviceId },
+    DeviceLost { device: DeviceId },
+}
+
+impl ResourceBroker {
+    fn handle_hardware_event(&mut self, event: HardwareEvent) {
+        match event {
+            HardwareEvent::DeviceLost { device } => {
+                // 1. Mark device unavailable
+                // 2. Replan all sessions that used this device
+                // 3. Continue serving on remaining devices (degraded)
+                // 4. Alert operator
+                // NEVER crash the server.
+            }
+            HardwareEvent::ThermalThrottle { device, temp } => {
+                // Reduce load on this device, shift work to cooler devices
+                self.reduce_device_load(device, 50 /* percent */);
+            }
+            _ => {}
+        }
+    }
+}
+```
+
+---
+
+## 36. Determinism & Reproducibility
+
+```python
+session = ort2.load("model.onnx", options={
+    "execution.deterministic": "true",
+})
+```
+
+| Source of Non-Determinism | Deterministic Path | Cost |
+|---|---|---|
+| cuBLAS workspace algorithms | Force deterministic algorithm | ~5-10% slower |
+| Atomic reductions (LayerNorm, Softmax) | Sequential reduction | ~10-20% slower |
+| FlashAttention warp scheduling | Use deterministic FA variant | ~5% slower |
+| Thread scheduling (CPU) | Pin to fixed thread order | Minimal |
+
+When `deterministic=true`: same input → **bit-exact** same output, every time.
+Default is `false` (performance over reproducibility).
+
+---
+
+## 37. VMap (Auto-Batching)
+
+### 37.1 Problem
+
+Many ONNX models are exported with `batch_size=1`. Users want to run batch=8/16/32
+without re-exporting. JAX's `vmap` solves this at the framework level.
+
+### 37.2 Design: Graph-Level VMap Pass
+
+```rust
+/// VMap: vectorize a batch_size=1 graph to arbitrary batch size.
+/// Analogous to JAX's vmap — maps a function over a batch dimension.
+pub struct VMapPass {
+    /// Which inputs get the new batch dimension.
+    batched_inputs: Vec<String>,
+    /// Target batch size (or dynamic).
+    batch_size: BatchSize,
+    /// Which axis is the batch axis (default: 0).
+    batch_axis: usize,
+}
+
+pub enum BatchSize {
+    Static(usize),   // compile-time known (enables more optimization)
+    Dynamic,         // symbolic, determined at runtime
+}
+
+impl OptimizerPass for VMapPass {
+    fn run(&self, graph: &mut Graph) -> Result<()> {
+        // For each node, determine how to vectorize:
+        for node in graph.nodes_topo() {
+            match self.vectorize_rule(node) {
+                VMapRule::Broadcast => {
+                    // Op naturally broadcasts (Add, Mul, etc.)
+                    // Just update shape annotations
+                    self.update_shapes(node, self.batch_size);
+                }
+                VMapRule::BatchMatMul => {
+                    // MatMul [B,M,K] x [K,N] → batched GEMM
+                    self.promote_to_batched_gemm(node);
+                }
+                VMapRule::Replicate => {
+                    // Non-batchable op (rare): replicate for each batch element
+                    self.replicate_op(node, self.batch_size);
+                }
+                VMapRule::Reshape => {
+                    // Reshape/Squeeze/Unsqueeze: adjust shape constants
+                    self.adjust_shape_constants(node);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+enum VMapRule {
+    /// Op broadcasts naturally over batch dim (elementwise, reduction with keepdim).
+    Broadcast,
+    /// MatMul promotes to batched GEMM.
+    BatchMatMul,
+    /// Can't vectorize. Replicate the op per batch element (fallback).
+    Replicate,
+    /// Shape manipulation: adjust constants to account for batch dim.
+    Reshape,
+}
+```
+
+### 37.3 How It Works (Example)
+
+```
+Original graph (batch=1):
+  input: [1, 128, 4096]
+  MatMul: [1, 128, 4096] @ [4096, 4096] → [1, 128, 4096]
+  LayerNorm: [1, 128, 4096] → [1, 128, 4096]
+
+After VMap(batch_size=8):
+  input: [8, 128, 4096]
+  MatMul: [8, 128, 4096] @ [4096, 4096] → [8, 128, 4096]  (batched GEMM)
+  LayerNorm: [8, 128, 4096] → [8, 128, 4096]  (broadcasts over batch)
+```
+
+Most transformer ops naturally support batch dimension. The hard cases:
+- **Reshape with hardcoded shapes** → VMap rewrites shape constants
+- **Gather with batch-dependent indices** → adjust index offsets
+- **Custom ops** → fallback to Replicate (run N times)
+
+### 37.4 User API
+
+```python
+# Load batch=1 model, run with batch=8
+session = ort2.load("model.onnx", options={
+    "vmap.batch_size": "8",           # static batch
+    "vmap.batch_inputs": "input_ids,attention_mask",  # which inputs are batched
+})
+# Now session.run accepts [8, seq_len] inputs
+
+# Dynamic batching (batch size varies per call)
+session = ort2.load("model.onnx", options={
+    "vmap.batch_size": "dynamic",
+    "vmap.max_batch": "32",           # pre-compile up to 32
+})
+
+# Programmatic (Rust)
+let session = InferenceSession::builder()
+    .model("model.onnx")
+    .vmap(VMapConfig {
+        batch_size: BatchSize::Static(8),
+        batched_inputs: vec!["input_ids".into(), "attention_mask".into()],
+        batch_axis: 0,
+    })
+    .build()?;
+```
+
+### 37.5 Difficulty Assessment
+
+| Op Category | VMap Difficulty | Notes |
+|---|---|---|
+| Elementwise (Add, Mul, Gelu) | Trivial | Natural broadcast |
+| MatMul/Gemm | Easy | Batched GEMM (cuBLAS supports natively) |
+| LayerNorm/RMSNorm | Easy | Operates on last dims, batch is first |
+| Attention (GQA/MHA) | Easy | Already batch-aware |
+| Reshape/Squeeze/Unsqueeze | Medium | Must rewrite shape constants |
+| Gather/ScatterND | Medium | Index offsets need adjustment |
+| Control flow (If/Loop) | Hard | Must unroll or replicate |
+| Custom ops | Hard | Fallback to replicate |
+
+For transformer models: **95%+ of ops vmap trivially.** Main complexity is
+shape-manipulation ops with hardcoded constants.
+
+---
+
+## 38. Prefill/Decode Execution Mode
+
+### 38.1 Decision: Unified Dual-Track (not split sessions)
+
+Same session, two execution tracks optimized for different compute profiles:
+
+```rust
+pub struct DualTrackScheduler {
+    prefill_track: ExecutionTrack,  // compute-bound, large GEMM
+    decode_track: ExecutionTrack,   // memory-bound, CUDA graph replay
+    shared: Arc<SharedState>,       // weights + KV cache (zero-copy between tracks)
+}
+
+pub enum PrefillDecodeMode {
+    /// Default: unified session, chunked prefill interleaved with decode.
+    Unified { prefill_chunk_size: usize },
+    /// Multi-node: separate devices for prefill vs decode. KV shipped over network.
+    Disaggregated { prefill_devices: Vec<DeviceId>, decode_devices: Vec<DeviceId> },
+}
+```
+
+Chunked prefill prevents head-of-line blocking:
+```
+Time: [prefill chunk 512 tok][decode batch][prefill chunk 512][decode batch]...
+→ decode latency stays bounded even during long prefills
+```
+
+### 38.2 Multi-Session Scheduling
+
+When multiple sessions share the same runtime, the **ResourceBroker** arbitrates:
+
+```rust
+impl ResourceBroker {
+    /// Sessions request execution slots. Broker decides who runs when.
+    fn schedule_next(&mut self) -> ScheduleDecision {
+        // Priority queue: realtime decode > foreground prefill > background
+        // Within same priority: round-robin fairness
+        // Preemption: realtime can interrupt background mid-chunk
+
+        let candidates: Vec<_> = self.sessions
+            .iter()
+            .filter(|s| s.has_pending_work())
+            .sorted_by_key(|s| s.priority)
+            .collect();
+
+        if let Some(realtime) = candidates.iter().find(|s| s.priority == Realtime && s.needs_decode()) {
+            // Realtime decode always goes first (latency-sensitive)
+            return ScheduleDecision::RunDecode(realtime.id);
+        }
+
+        // Fair scheduling among same-priority sessions
+        self.round_robin_among(candidates)
+    }
+}
+
+pub struct SessionResourceRequest {
+    session_id: SessionId,
+    /// What this session wants to do next.
+    work_type: WorkType,
+    /// How much GPU time it needs (estimated ms).
+    estimated_duration_ms: f64,
+    /// Memory it will allocate during this step.
+    memory_delta: isize,
+}
+
+pub enum WorkType {
+    /// Prefill chunk (compute-heavy, known duration).
+    Prefill { tokens: usize },
+    /// Decode step (fast, latency-critical).
+    Decode { batch_size: usize },
+    /// Background (optimization, weight loading).
+    Background,
+}
+```
+
+**Session requests resources via the broker:**
+```rust
+impl InferenceSession {
+    /// Before running, session checks in with broker.
+    fn request_execution_slot(&self) -> Result<ExecutionGrant> {
+        let request = SessionResourceRequest {
+            session_id: self.id,
+            work_type: self.next_work_type(),
+            estimated_duration_ms: self.estimate_next_step_ms(),
+            memory_delta: self.estimate_memory_delta(),
+        };
+
+        // Broker may:
+        // - Grant immediately (resources available)
+        // - Queue (higher priority session running)
+        // - Shrink this session's budget first, then grant
+        self.broker.request(request)
+    }
+}
+
+pub enum ExecutionGrant {
+    /// Go ahead. You have this much time and memory.
+    Granted { time_budget_ms: f64, memory_budget: usize },
+    /// Wait. Another session has priority.
+    Queued { position: usize, estimated_wait_ms: f64 },
+    /// You need to shrink first. Release this much memory.
+    ShrinkFirst { release_bytes: usize },
+}
+```
+
+---
+
+## 39. Streaming (Runtime ↔ GenAI Integration)
+
+### 39.1 Streaming is GenAI-Layer Concern
+
+The runtime itself doesn't "stream tokens" — it runs one forward pass and returns
+a tensor. Streaming is the GenAI engine calling runtime repeatedly in a decode loop.
+
+But the runtime needs to support **efficient repeated execution** that enables streaming:
+
+```rust
+/// Runtime provides: fast repeated execution with minimal overhead.
+impl InferenceSession {
+    /// Hot path for decode loop. Reuses buffers, replays CUDA graph.
+    /// This IS the streaming primitive — GenAI calls it once per token.
+    fn run_decode_step(&mut self, inputs: &[(&str, &Tensor)]) -> Result<Vec<Tensor>>;
+}
+
+/// GenAI layer wraps this in streaming:
+impl GenAiEngine {
+    pub fn generate_stream(
+        &mut self,
+        prompt_tokens: &[u32],
+        callback: impl FnMut(StreamEvent) -> ControlFlow,
+    ) -> Result<()> {
+        // Prefill
+        self.prefill(prompt_tokens)?;
+        callback(StreamEvent::PrefillDone { tokens: prompt_tokens.len() });
+
+        // Decode loop (streaming)
+        loop {
+            let logits = self.session.run_decode_step(&self.decode_inputs())?;
+            let token = self.sample(&logits);
+            if token == self.eos_token { break; }
+
+            match callback(StreamEvent::Token { token, text: self.decode(token) }) {
+                ControlFlow::Continue => {}
+                ControlFlow::Break => break,  // user cancelled
+            }
+        }
+        Ok(())
+    }
+}
+```
+
+### 39.2 What Runtime Provides for Streaming Performance
+
+| Feature | Purpose |
+|---------|--------|
+| Buffer reuse (§20.3) | No malloc per decode step |
+| CUDA graph replay | Near-zero launch overhead per step |
+| `run_decode_step()` fast path | Skip input validation on hot path |
+| Async KV cache append | Overlap KV write with next step's compute |
+
+---
+
+## 40. Concurrency Model & Thread Safety
+
+### 40.1 Design
+
+`session.run()` takes `&mut self` (single-threaded per session instance).
+For concurrent serving: lightweight clones share weights, independent buffers.
+
+```rust
+impl InferenceSession {
+    /// Lightweight clone: Arc-shared weights, independent activation/scratch buffers.
+    /// Use for multi-threaded serving (one clone per worker thread).
+    pub fn clone_for_concurrency(&self) -> Self {
+        Self {
+            weights: Arc::clone(&self.weights),        // shared, read-only
+            execution_plan: Arc::clone(&self.plan),    // shared, immutable
+            activation_buffers: ActivationBuffers::new_independent(),  // per-clone
+            scratch: ScratchSpace::new(),              // per-clone
+            output_cache: OutputBufferCache::new(),    // per-clone
+            profiling: self.profiling.clone(),         // shared collector
+        }
+    }
+}
+
+/// Serving pattern:
+let base_session = InferenceSession::load("model.onnx")?;
+let pool: Vec<_> = (0..num_workers)
+    .map(|_| base_session.clone_for_concurrency())
+    .collect();
+
+// Each worker thread owns its clone. No locks on the hot path.
+pool.par_iter_mut().zip(requests).for_each(|(session, req)| {
+    session.run(&req.inputs).unwrap();
+});
+```
+
+### 40.2 What's Shared vs Independent
+
+| Component | Shared (Arc) | Independent (per-clone) |
+|-----------|:---:|:---:|
+| Model weights | ✅ | |
+| Execution plan | ✅ | |
+| KV cache | | ✅ (per-request) |
+| Activation buffers | | ✅ |
+| Scratch space | | ✅ |
+| Output buffer cache | | ✅ |
+| Profiling collector | ✅ | |
+| Resource claim (broker) | ✅ | |
+
+---
+
+## 41. Compilation Cache (Cold Start)
+
+### 41.1 Problem
+
+Cold start: load model → optimize → plan placement → compile kernels → first run.
+Serverless: every cold start costs 500ms-5s. Unacceptable.
+
+### 41.2 Persistent Cache
+
+```rust
+pub struct CompilationCache {
+    cache_dir: PathBuf,  // default: ~/.cache/ort2/
+}
+
+impl CompilationCache {
+    /// Cache key = hash(model_bytes + device_profile + options + runtime_version)
+    fn cache_key(model: &[u8], device: &DeviceProfile, options: &SessionOptions) -> CacheKey {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(model);
+        hasher.update(&device.fingerprint());
+        hasher.update(&options.fingerprint());
+        hasher.update(env!("CARGO_PKG_VERSION").as_bytes());
+        CacheKey(hasher.finalize())
+    }
+
+    /// Save compiled plan after first load.
+    fn save(&self, key: CacheKey, plan: &CompiledPlan) -> Result<()>;
+
+    /// Load cached plan. Returns None if cache miss or invalidated.
+    fn load(&self, key: CacheKey) -> Option<CompiledPlan>;
+}
+
+pub struct CompiledPlan {
+    pub optimized_graph: SerializedGraph,
+    pub placement: PlacementPlan,
+    pub memory_offsets: AotMemoryPlan,
+    pub kernel_selections: HashMap<NodeId, KernelId>,
+    pub cuda_graph_regions: Vec<CudaGraphRegion>,
+}
+```
+
+**Performance:**
+```
+First load:    load(200ms) → optimize(300ms) → plan(100ms) → compile(200ms) = ~800ms
+Cached load:   load_plan(50ms) → mmap_weights(10ms) → warm_kernels(50ms) = ~110ms
+                                                                    7x faster
+```
+
+### 41.3 CLI
+
+```bash
+# Pre-compile (e.g. in Docker build step)
+ort2 compile model.onnx --output model.ort2plan --device gpu
+
+# Load pre-compiled (instant)
+ort2 run model.ort2plan --input data.npz
+
+# Cache management
+ort2 cache list
+ort2 cache clear
+ort2 cache clear --older-than 30d
+```
+
+---
+
+## 42. Model Security
+
+```rust
+pub enum ModelTrustLevel {
+    /// Fully trusted. Allow custom ops, dlopen, native EPs.
+    Trusted,
+    /// Internal. Allow known custom op domains only.
+    Internal { allowed_domains: HashSet<String> },
+    /// Untrusted (user-uploaded). Sandboxed execution.
+    Untrusted,
+}
+
+pub struct SecurityPolicy {
+    trust_level: ModelTrustLevel,
+    max_model_bytes: usize,         // DoS prevention
+    max_tensor_bytes: usize,        // OOM bomb prevention
+    max_nodes: usize,               // graph complexity limit
+    allow_external_data: bool,      // can model reference external files?
+    allow_custom_ops: bool,         // can model use dlopen'd ops?
+}
+```
+
+`Untrusted` mode: no `dlopen`, no external data references, tensor size limits,
+graph complexity limits. Safe for serving user-uploaded models.
+
+---
+
+## 43. Metrics & Observability
+
+Beyond per-request profiling, production needs aggregated metrics:
+
+```rust
+pub struct RuntimeMetrics {
+    // Latency
+    pub inference_latency_p50_us: f64,
+    pub inference_latency_p99_us: f64,
+    pub prefill_latency_p50_us: f64,
+    pub decode_step_latency_p50_us: f64,
+
+    // Throughput
+    pub requests_total: u64,
+    pub tokens_generated_total: u64,
+    pub tokens_per_second: f64,
+
+    // Resource utilization
+    pub gpu_utilization_pct: f64,
+    pub gpu_memory_used_bytes: usize,
+    pub kv_cache_hit_rate: f64,       // prefix cache effectiveness
+    pub buffer_reuse_rate: f64,
+
+    // Health
+    pub errors_total: u64,
+    pub pressure_events_total: u64,
+    pub offload_bytes_total: u64,
+    pub recovery_count: u64,          // CUDA context resets
+}
+
+impl InferenceSession {
+    /// Prometheus-compatible metrics export.
+    pub fn metrics(&self) -> RuntimeMetrics;
+
+    /// OpenTelemetry integration.
+    pub fn otel_meter(&self) -> &Meter;
+}
+```
+
+```python
+# Python
+metrics = session.metrics()
+print(f"P99 latency: {metrics.inference_latency_p99_us / 1000:.1f}ms")
+print(f"Throughput: {metrics.tokens_per_second:.1f} tok/s")
+print(f"KV cache hit rate: {metrics.kv_cache_hit_rate:.1%}")
+```
+
+```bash
+# Prometheus endpoint (for serving)
+ort2 serve model.onnx --metrics-port 9090
+# GET http://localhost:9090/metrics → prometheus text format
+```
+
+---
+
+## 44. Testing Strategy
+
+```
+┌──────────────────────────────────────────────────────┐
+│ L1: Unit tests per kernel (inputs → expected output)    │
+├──────────────────────────────────────────────────────┤
+│ L2: Conformance — top 50 HuggingFace models vs ORT      │
+│     allclose(our_output, ort_output, atol=1e-5)         │
+├──────────────────────────────────────────────────────┤
+│ L3: Differential fuzzing (random shapes + inputs)       │
+├──────────────────────────────────────────────────────┤
+│ L4: Stress — 10K concurrent requests, memory leaks      │
+├──────────────────────────────────────────────────────┤
+│ L5: Chaos — kill GPU, corrupt input, disk full          │
+├──────────────────────────────────────────────────────┤
+│ L6: Perf regression CI (latency/throughput benchmarks)  │
+└──────────────────────────────────────────────────────┘
+```
+
+---
+
+## 45. Design Choices (Comprehensive)
+
+| # | Choice | Decision | Rationale |
+|---|--------|----------|----------|
+| 1 | Unified paged memory | **Yes** | VRAM/Unified/RAM/SSD as single page table. Pages migrate transparently. |
+| 2 | Per-tier user limits | **Yes** | Users can cap each tier independently. |
+| 3 | VMap (auto-batching) | **Yes** | Graph-level vectorization pass. batch=1 model → batch=N without re-export. |
+| 4 | Prefill/Decode split | **No (unified dual-track)** | Same session, two exec tracks. Disaggregated only for multi-node. |
+| 5 | Multi-session broker scheduling | **Yes** | Sessions request execution grants. Broker arbitrates by priority + fairness. |
+| 6 | Model resource estimation | **Yes (CLI + API)** | `ort2 inspect` and `ort2.estimate()` before loading. |
+| 7 | Streaming at runtime level | **No** | Runtime provides efficient repeated execution. Streaming is GenAI concern. |
+| 8 | Error message quality | **Yes (first-class)** | Every error: what/why/how-to-fix + docs link. |
+| 9 | CUDA error recovery | **Yes** | Context reset + session rebuild. One bad request doesn't kill server. |
+| 10 | Deterministic mode | **Yes (opt-in)** | `deterministic=true` → bit-exact, 10-20% slower. |
+| 11 | Compilation cache | **Yes** | Persistent on-disk cache. 7x faster cold start on cache hit. |
+| 12 | Model security levels | **Yes** | Trusted/Internal/Untrusted. Untrusted = no dlopen, size limits. |
+| 13 | Prometheus metrics | **Yes** | Aggregated runtime metrics for production monitoring. |
+| 14 | Hardware degradation handling | **Yes** | Never crash. Degrade gracefully, replan, alert. |
+
+---
+
+## 46. Phased Roadmap
 
 ### Phase 1: Foundation (8-12 weeks)
 - [ ] `onnx-runtime-ir`: Graph IR with all types, validation, mutation API
