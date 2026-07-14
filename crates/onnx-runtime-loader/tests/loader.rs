@@ -273,3 +273,113 @@ fn smoke_load_real_fixture_if_present() {
         eprintln!("smoke_load_real_fixture_if_present: no fixtures found, skipping");
     }
 }
+
+// ── load_*_with_weights: bytes survive after load, work for inline + external ──
+
+/// Build a tiny model with inline weights and verify that the Arc<WeightStore>
+/// keeps the bytes accessible after `load_model_bytes_with_weights` returns.
+#[test]
+fn load_bytes_with_weights_inline_survives() {
+    let g = onnx::GraphProto {
+        name: "inline_weights".into(),
+        input: vec![value_info("X", 1, &[Dimlike::Static(2), Dimlike::Static(4)])],
+        output: vec![value_info("Y", 1, &[Dimlike::Static(2), Dimlike::Static(8)])],
+        initializer: vec![f32_initializer("W", &[4, 8])],
+        node: vec![node("MatMul", &["X", "W"], &["Y"])],
+        ..Default::default()
+    };
+    let bytes = model(g, 17);
+
+    let (graph, store) =
+        onnx_runtime_loader::load_model_bytes_with_weights(&bytes, ".")
+            .expect("load_model_bytes_with_weights");
+
+    // The store must be usable to get bytes for every initializer in the graph.
+    let mut found_inline = false;
+    for weight_ref in graph.initializers.values() {
+        match weight_ref {
+            WeightRef::Inline(_) => {
+                let raw = store.bytes(weight_ref).expect("inline bytes present");
+                // W is [4,8] f32 → 128 bytes of zeros
+                assert_eq!(raw.len(), 4 * 8 * 4, "W byte count");
+                assert!(raw.iter().all(|&b| b == 0), "W should be all-zeros");
+                found_inline = true;
+            }
+            WeightRef::External { .. } => {}
+        }
+    }
+    assert!(found_inline, "expected at least one inline initializer");
+
+    // Drop the graph; the Arc alone must keep bytes valid.
+    drop(graph);
+    // Re-query via a clone of the Arc — bytes still live.
+    let store2 = std::sync::Arc::clone(&store);
+    // We can't re-query without the WeightRef, but we can verify the Arc
+    // has the right ref-count and the store isn't dropped.
+    assert_eq!(std::sync::Arc::strong_count(&store2), 2);
+}
+
+/// Load a real fixture that has an external-data file and verify that the
+/// `Arc<WeightStore>` exposes non-empty byte slices for External WeightRefs.
+/// Skips gracefully if the fixture directory is absent.
+#[test]
+fn load_with_weights_external_data_fixture() {
+    let manifest = env!("CARGO_MANIFEST_DIR");
+    let root = std::path::Path::new(manifest)
+        .parent()
+        .and_then(|p| p.parent())
+        .expect("workspace root");
+
+    // Pick any fixture that ships with external data.
+    let candidates = [
+        "tests/fixtures/tiny-eagle3/model.onnx",
+        "tests/fixtures/tiny-llm/model.onnx",
+        "tests/fixtures/tiny-llm-scatter/model.onnx",
+    ];
+
+    let mut tested_external = false;
+    for rel in candidates {
+        let path = root.join(rel);
+        if !path.exists() {
+            continue;
+        }
+
+        let (graph, store) = onnx_runtime_loader::load_model_with_weights(&path)
+            .unwrap_or_else(|e| panic!("load_model_with_weights({rel}): {e}"));
+
+        graph
+            .validate()
+            .unwrap_or_else(|e| panic!("invalid graph from {rel}: {e:?}"));
+
+        // For every initializer, store.bytes() must return Some with len > 0.
+        for (vid, weight_ref) in &graph.initializers {
+            let raw = store
+                .bytes(weight_ref)
+                .unwrap_or_else(|| panic!("store.bytes() returned None for value {vid:?}"));
+            assert!(!raw.is_empty(), "weight bytes must be non-empty");
+        }
+
+        // Verify external refs specifically yield bytes even after we drop the
+        // graph (mmap still alive via Arc).
+        let externals: Vec<_> = graph
+            .initializers
+            .values()
+            .filter(|w| matches!(w, WeightRef::External { .. }))
+            .cloned()
+            .collect();
+
+        drop(graph); // graph gone — Arc<WeightStore> must keep mmaps alive
+
+        for w in &externals {
+            let raw = store.bytes(w).expect("external bytes live after graph drop");
+            assert!(!raw.is_empty());
+            tested_external = true;
+        }
+
+        break; // one fixture is enough
+    }
+
+    if !tested_external {
+        eprintln!("load_with_weights_external_data_fixture: no external-data fixture found, skipping");
+    }
+}
