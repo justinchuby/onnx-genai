@@ -76,3 +76,11 @@ Chew reviewed (read-only, 🟡 SHIP-with-advisories): layout correctness confirm
 - **Work:** Added `LoaderError::UnsupportedDataType { raw, context }` + `decode_dtype` helper. All 8 real-dtype sites now fail closed: initializer value, value-info TensorType/SparseTensorType, convert_tensor Constant/attribute, convert_type_proto Tensor/SparseTensor/Map key. Preserved intentional non-dtype defaults. Bumped proto with FLOAT4E2M1=23 (doc only). Added 2 new loader tests.
 - **Result:** loader 15 + ir 40 tests green debug+release; bert_toy conformance PASS max_abs 1.192e-7; clippy clean.
 - **Review:** Holden holden-12 → 🟢 GREEN. Merged to main (`a822a21` → `06a2423`).
+
+## 2026-07-14T14:35:00Z — leon-11: LayerNorm operand-order guard merged
+
+- Closed A-CHEW-1, A2, A3 from chew-21/deckard-13 reviews of batty-14 (DAG-aware matcher).
+- Added operand-order guard to `layernorm_spec`: both centering `Sub(x, mean)` nodes must have input[0]==X, input[1]==mean (exactly-binary; else decline). Closes sign-flip over-match on 9-op and 10-op paths.
+- Added `fuses_layernorm_split_chain` (isolated 10-op positive test) and `declines_layernorm_when_numerator_sub_reversed` (adversarial decline test).
+- `DRIFT_ATOL = 1e-5` scoped to all-vs-opt-off only; conformance tolerance (2e-3) unchanged.
+- Merged to main `a02d46e`. Gaff (gaff-10) 🟢 APPROVE.

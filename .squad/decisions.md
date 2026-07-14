@@ -1127,3 +1127,107 @@ assumptions can't be proven. Addresses Chew F1/F2/F3/F4 and Gaff Finding 5.
 **Review — Deckard (deckard-13):** 🟢 APPROVE. A1 genuinely closed (real loaded-model e2e test). Parity honest/load-bearing. All numbers reproduced exactly (debug + release). No regression (FusedMatMulBias 32×, all prior decline tests pass).
 - **A2 (non-blocking):** 10-op split-diff shape has no isolated synthetic optimizer unit test.
 - **A3 (non-blocking):** vs-opt-off drift ceiling 2e-3 vs actual 1.4e-7 (~4 orders of margin); consider tightening to 1e-5.
+
+---
+
+### 2026-07-14: ORT2 LayerNorm centering operand-ORDER guard + split-shape unit test + tightened drift ceiling
+
+**By:** Leon (ORT2 optimizer engineer)
+**Branch:** `squad/ort2-layernorm-order-guard` → merged main `a02d46e`
+**Closes:** A-CHEW-1 (Sub operand-order sign-flip over-match), A2 (isolated 10-op unit test), A3 (drift ceiling tighten) from chew-21 + deckard-13 reviews of batty-14.
+
+**Problem.** `layernorm_spec` validated centering `Sub` nodes by operand *membership* but not *order*. A reversed `Sub(mean, x)` satisfies membership and was silently rewritten to a `LayerNormalization` that computes `+(x − mean)/std` — a **sign-flipped** result. Chew confirmed this fired on both the 10-op split path and the base 9-op matcher.
+
+**Fix — operand-order guard (A-CHEW-1):** After the existing "same X" membership guard, added:
+```rust
+let subtracts_x_minus_mean = |sub: &Node| -> bool {
+    matches!(sub.inputs.as_slice(), [Some(a), Some(b)] if *a == x && *b == mean)
+};
+if !subtracts_x_minus_mean(sub_pow) || !subtracts_x_minus_mean(sub_div) {
+    return None;
+}
+```
+Requires `Sub` input[0] == X and input[1] == mean; exactly-binary arity enforced. Reversed or ambiguous → decline (no rewrite). Tightens both 9-op and 10-op paths (shared-Sub 9-op: `sub_div == sub_pow`, checked once).
+
+**Fix — isolated 10-op unit test (A2):** Synthetic `layernorm_split_graph(bool)` helper (two distinct `Sub(x, mean)` nodes) + test `fuses_layernorm_split_chain` asserting exactly one `com.microsoft::LayerNormalization`, `[X, Scale, B]`, `axis = -1`, folded epsilon.
+
+**Fix — adversarial decline test (A-CHEW-1):** `declines_layernorm_when_numerator_sub_reversed` — 10-op graph with numerator `Sub(mean, x)`; asserts no fusion, all 10 ops retained.
+
+**Fix — tighten drift ceiling (A3):** Introduced `const DRIFT_ATOL: f32 = 1e-5` scoped to all-vs-opt-off assertion only; vs-reference conformance tolerance (2e-3 atol/rtol) unchanged.
+
+**Verification:** 33 optimizer tests (+2) green debug + release; clippy clean; bert_toy still fuses 12× LayerNormalization + 32× FusedMatMulBias; parity all/ref 1.043e-7, all/off 1.416e-7 (< 1e-5 ceiling).
+
+**Review — Gaff (gaff-10):** 🟢 APPROVE. Guard structural/model-agnostic (`fusion.rs:625-635`); non-tautological positive and adversarial coverage (`fusion.rs:1055-1121`); drift and reference bounds remain separate; 31→33 optimizer tests; debug + release green; clippy `-D warnings` clean; `#![forbid(unsafe_code)]` intact.
+
+---
+
+### 2026-07-14: EPContext §55 loader LOAD path — `EpContextNode` view, blob resolution, path-safety
+
+**By:** Roy (ORT2 loader)
+**Branch:** `squad/ort2-epcontext-loader` → merged main `d18a8a3` (part 1)
+**Scope:** `crates/onnx-runtime-loader` — §55.3 load path only. Runtime `EpContext` type + `EpContextRegistry` are Deckard's (ep-api, below).
+
+**New module `epcontext.rs`:**
+
+1. **`EpContextNode<'g>`** — typed view over IR `Node`; recognizes `op_type == "EPContext"` && `domain == "com.microsoft"`. Fields: `node`, `source` (§55.6 dispatch key, `Option<&str>`), `main_context` (default `true` when absent), `embed_mode` (`EmbedMode`), `sdk_version`, `partition_name`. Variadic i/o read directly (`inputs()`/`outputs()`), no arity assumed.
+
+2. **Enums:** `EmbedMode { Embedded, ExternalFile }` (default `Embedded`; `0`→External, fail-closed); `EpContextBlob { Embedded(Vec<u8>), External { path, map: Mmap } }` with uniform `bytes()` accessor.
+
+3. **Recognition helpers:** `ep_context_nodes`, `ep_context_node_ids`, `is_ep_context_op` — free functions, IR crate untouched.
+
+4. **`resolve_ep_context(model_dir, node) -> Result<EpContextBlob>`:**
+   - `embed_mode=1`: `Embedded(bytes.to_vec())` from `ep_cache_context`.
+   - `embed_mode=0`: UTF-8 relative path + traversal guard + `Mmap::map` read-only → `External { path, map }`. Blob bytes opaque — loader never interprets them.
+
+5. **Lossless opaque blob:** `graph_builder` special-cases `ep_cache_context` on EPContext nodes, storing raw bytes as `UINT8 Attribute::Tensor` instead of `String::from_utf8_lossy` (which would corrupt binary vendor blobs). Verified by round-trip test with `0x00/0x80/0xFE/0xFF/0xC3 0x28` payload.
+
+6. **Path-safety:** `resolve_external_path` rejects `is_absolute()`, `Component::ParentDir` (`..`), `Component::RootDir | Prefix` before `join` — lexically contained. Tests: `../evil.bin` and `/etc/passwd` both rejected. Existing `weights.rs` §19.2 guard gap noted as follow-up.
+
+7. **Shape inference:** EPContext unregistered → `InferenceRegistry` leaves unresolved without error; declared output shapes preserved verbatim through `infer_graph`. Asserted by test.
+
+8. **New `LoaderError` variants:** `EpContext(String)`, `EpContextPath { path, reason }`.
+
+9. **Tests:** 7 tests (embedded non-UTF8 blob, external mmap, attribute defaults, explicit attrs + variadic i/o, `../evil.bin` reject, `/etc/passwd` reject, output shape preserved). All green debug + release. Existing 15 loader tests + bert_toy conformance unaffected.
+
+**Review — Gaff (gaff-10):** 🟢 APPROVE. Opaque blob preservation byte-for-exact-byte verified (scope-gated to `is_ep_context_op && attr == "ep_cache_context"`, no regression to other attrs/nodes). Path-safety rejects before join (not after canonicalize) — strictly more protective than weights.rs. mmap unsafe follows weights.rs idiom, no new unsafe. 7/7 epcontext tests + 15/15 loader suite + doctests green; clippy `-D warnings` clean.
+
+---
+
+### 2026-07-14: EPContext §55 ep-api contract — runtime `EpContext`, source-keyed registry, trait methods
+
+**By:** Deckard (ORT2 ep-api)
+**Branch:** `squad/ort2-epcontext-epapi` → merged main `d18a8a3` (part 2)
+**Scope:** `crates/onnx-runtime-ep-api` — §55.1 / §55.3 dispatch / §55.6 / §55.7. Loader-side is Roy's (above).
+
+**New module `epcontext.rs`:**
+
+1. **`EpContext`** (in-memory §4/§55.1 form):
+   ```rust
+   pub struct EpContext {
+       pub ep_name: String,
+       pub ep_version: String,        // maps to ep_sdk_version attr
+       pub data: Vec<u8>,             // opaque blob; maps to ep_cache_context
+       pub covered_nodes: Vec<NodeId>,
+       pub device_fingerprint: String,
+   }
+   ```
+   Derives `Clone, Debug, Default, PartialEq, Eq`; ctor `EpContext::new(..)`.
+
+2. **`EpContextRegistry`** (§55.6): `register(ep, source_keys)` / `claim(source: Option<&str>) -> Option<EpId>`. **Reject-duplicate policy:** second EP on existing key → `EpError::DuplicateContextSource`; same `(key, ep)` re-declare is idempotent. Rationale: two EPs on one source is a config error; last-writer-wins creates order-dependent non-determinism.
+
+3. **Trait methods on `ExecutionProvider`** — all have safe defaults (existing EPs compile unchanged):
+   - `fn context_source_keys(&self) -> Vec<String> { Vec::new() }`
+   - `fn save_context(&self) -> Result<EpContext>` → default `Err(UnsupportedContext)`
+   - `fn load_context(&self, ctx: &EpContext) -> Result<()>` → default `Err(UnsupportedContext)`
+
+4. **`build_ep_context_registry(eps)`** — pure builder; iterates EPs, reads `context_source_keys()`, skips empty-key EPs, propagates `DuplicateContextSource`.
+
+5. **New `EpError` variants:** `NoEpForContext { source_key: Option<String> }`, `UnsupportedContext { ep: String }`, `DuplicateContextSource { source_key, existing, new }`.
+
+6. **⚠️ Naming note for session integrator:** error field is `source_key` (not `source`) — `thiserror` 2.0 auto-treats a field literally named `source` as the `std::error::Error` cause, which `Option<String>` cannot satisfy. Session code: `EpError::NoEpForContext { source_key: node.source.map(str::to_owned) }`.
+
+7. **Shared-checkout race (post-merge note):** deckard-14's commit was recovered from a dangling object after a force-push; parallel commit-producing agents need separate worktrees to avoid this. Lesson logged.
+
+**Verification:** 22 unit + 4 lib ep-api tests green debug + release; ep-cpu 3+11 and session 11 tests unchanged; clippy `-D warnings` clean; no new unsafe.
+
+**Review — Chew (chew-22):** 🟢 APPROVE. Model-agnostic dispatch confirmed (zero hardcoded vendor names in non-test code; `claim` is pure lookup). Reject-duplicate semantics correct and documented. Trait defaults preserve object-safety and don't break existing EPs (ep-cpu 105 + session 12+1+3+11 tests green). `EpContext` struct matches §55.1 field-for-field; save→load round-trip verified. `source_key` naming correct for thiserror 2.0.18. No 🔴 blockers.

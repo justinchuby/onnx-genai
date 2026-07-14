@@ -114,3 +114,13 @@ Read-only review of Roy's decline-to-fuse guards. Both over-decline and under-de
 
 ## 2026-07-14 — deckard-13: Review ORT2 LayerNorm e2e (batty-14)
 Read-only review of Batty's DAG-aware matcher. A1 genuinely closed (real loaded-model e2e test). Parity honest/load-bearing. All numbers reproduced exactly. 🟢 APPROVE. A2: no isolated 10-op unit test. A3: drift ceiling 2e-3 vs actual 1.4e-7.
+
+## 2026-07-14T14:35:00Z — deckard-14: EPContext §55 ep-api contract merged
+
+- `EpContext` struct (§55.1), `EpContextRegistry` (source-keyed, reject-duplicate policy), `build_ep_context_registry` builder.
+- Three `ExecutionProvider` trait methods with safe defaults — ep-cpu + all existing EPs compile unchanged.
+- New `EpError` variants: `NoEpForContext { source_key }`, `UnsupportedContext { ep }`, `DuplicateContextSource { source_key, existing, new }`.
+- `source_key` field name (not `source`) required by thiserror 2.0.18.
+- 22 unit + 4 lib tests green; ep-cpu + session suites unchanged; clippy clean; no new unsafe.
+- Merged to main `d18a8a3` (part 2). Chew (chew-22) 🟢 APPROVE.
+- ⚠️ Shared-checkout race during this task: commit recovered from dangling object after force-push. Lesson: parallel commit-producing agents must use separate worktrees.

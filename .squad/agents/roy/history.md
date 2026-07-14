@@ -68,3 +68,12 @@ Roy's workspace review is now in decisions: crate split is sound, but engine.rs 
 
 ## 2026-07-14 — roy-16: ORT2 fusion decline-to-fuse guards
 Hardened LayerNorm (axis/epsilon/structure guards) and MatMul+Add (trailing-broadcast bias guard) in `fusion.rs` to decline-to-fuse when assumptions unproven. 5 new unit tests. Deckard (deckard-12) 🟢 approved. bert_toy 32× FusedMatMulBias preserved; `"all"` vs off 0.0, vs ref 1.192e-7. Merged main `8f222bd`.
+
+## 2026-07-14T14:35:00Z — roy-17: EPContext §55 loader LOAD path merged
+
+- New `crates/onnx-runtime-loader/src/epcontext.rs`: `EpContextNode<'g>` typed view, `EmbedMode`, `EpContextBlob { Embedded(Vec<u8>), External { path, map: Mmap } }`, `resolve_ep_context`.
+- Lossless binary blob: `graph_builder` special-cases `ep_cache_context` → UINT8 tensor storage (avoids `from_utf8_lossy` corruption).
+- Path-traversal guard: rejects absolute, `..` parent-dir, and root/prefix components before `join`.
+- 7 new tests green debug + release. Loader writer (§55.4) is a later task.
+- Merged to main `d18a8a3` (part 1). Gaff (gaff-10) 🟢 APPROVE.
+- **Integration note:** session integrator should use `source_key` (not `source`) in `EpError::NoEpForContext` (Deckard's ep-api, thiserror 2.0 constraint).

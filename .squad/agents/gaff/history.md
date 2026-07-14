@@ -38,3 +38,9 @@ Gaff's review is now in decisions: engine.rs is a ~3,300-line god module. Refact
 - **Verdict:** 🟡 Approve with required follow-up.
 - **Key confirmed:** Kernel numerics correct ✅; `matmul_dense` extraction no regression ✅; shape rule consistent ✅; registry/dispatch consistent ✅; operand-order ROBUST (not baked to bert_toy) ✅.
 - **Gap (G1):** MatMul+Add fusion has no shape guard — silent-wrong when bias operand would expand matmul output. Owner: Roy/Deckard (Batty locked out).
+
+## 2026-07-14T14:35:00Z — gaff-10: Reviewed leon-11 (LayerNorm order guard) + roy-17 (EPContext loader)
+
+**gaff-10a — Leon LayerNorm order guard:** 🟢 APPROVE. Guard structural/model-agnostic; non-tautological positive + adversarial coverage; drift and reference bounds separate; 31→33 tests; debug+release+clippy green.
+
+**gaff-10b — Roy EPContext loader LOAD path:** 🟢 APPROVE. Opaque blob preservation byte-for-exact-byte (scoped to `is_ep_context_op && ep_cache_context` only); path-safety rejects before join; mmap unsafe follows weights.rs idiom; 7/7 epcontext + 15/15 loader tests green; clippy clean.

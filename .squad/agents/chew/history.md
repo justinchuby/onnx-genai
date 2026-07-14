@@ -78,3 +78,11 @@ Reviewed Leon's K4 real KV byte materialization (commit `786e268`, read-only, Le
 
 ## 2026-07-14 — chew-21: Review ORT2 DAG-aware LayerNorm (batty-14)
 Reviewed matcher internals; authored adversarial probes (different_x, reversed, 9op_reversed). 🟢 APPROVE. A-CHEW-1 (pre-existing): Sub operand order not asserted — reversed Sub over-matches with sign-flip, but reproduced identically on base 9-op matcher. Recommend follow-up (Roy/Deckard/Leon; Batty locked out).
+
+## 2026-07-14T14:35:00Z — chew-22: Reviewed deckard-14 (EPContext ep-api contract)
+
+🟢 APPROVE. Model-agnostic dispatch verified (zero hardcoded vendor names); reject-duplicate semantics correct (non-transactional, callers treat duplicate as fatal); trait defaults object-safe; ep-cpu 105 + session tests green unchanged; `source_key` naming confirmed for thiserror 2.0.18; no new unsafe.
+
+**Non-blocking advisories logged (for session integrator):**
+- A-CHEW-1: `register` non-transactional; treat `DuplicateContextSource` as fatal.
+- A-CHEW-2: Use `source_key` (not `source`) in `NoEpForContext`; map ONNX `source` attr → `claim`.
