@@ -32,6 +32,23 @@ impl Engine {
         self.embed_with_options(input_ids, EmbeddingOptions::default())
     }
 
+    /// Tokenize `text` with the model's tokenizer, then produce a mean-pooled
+    /// embedding without normalization.
+    pub fn embed_text(&mut self, text: &str) -> anyhow::Result<Vec<f32>> {
+        self.embed_text_with_options(text, EmbeddingOptions::default())
+    }
+
+    /// Tokenize `text` with the model's tokenizer, then produce a pooled
+    /// embedding from the model's per-token hidden-state output.
+    pub fn embed_text_with_options(
+        &mut self,
+        text: &str,
+        options: EmbeddingOptions,
+    ) -> anyhow::Result<Vec<f32>> {
+        let input_ids = self.tokenize(text)?;
+        self.embed_with_options(&input_ids, options)
+    }
+
     /// Produce a pooled embedding from the model's per-token hidden-state output.
     pub fn embed_with_options(
         &mut self,
@@ -390,6 +407,40 @@ mod tests {
             engine.embed(&[]).unwrap_err().to_string(),
             "embedding input must contain at least one token"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn tokenize_round_trips_and_matches_internal_path() -> anyhow::Result<()> {
+        let _guard = model_test_lock();
+        let engine = engine("tiny-mtp-full")?;
+        let ids = engine.tokenize("hello world")?;
+        assert!(!ids.is_empty(), "tokenizer produced no ids");
+        // The public seam must agree with the tokenizer path the engine owns.
+        let expected = engine.tokenizer.encode("hello world")?;
+        assert_eq!(ids, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn embed_text_agrees_with_tokenize_then_embed() -> anyhow::Result<()> {
+        let _guard = model_test_lock();
+        let mut engine = engine("tiny-mtp-full")?;
+        let text = "hello world";
+        let ids = engine.tokenize(text)?;
+
+        let options = EmbeddingOptions {
+            pooling: EmbeddingPooling::Mean,
+            normalize: true,
+            hidden_state_output: None,
+        };
+        let via_ids = engine.embed_with_options(&ids, options.clone())?;
+        let via_text = engine.embed_text_with_options(text, options)?;
+        assert_close(&via_text, &via_ids);
+
+        let default_via_ids = engine.embed(&ids)?;
+        let default_via_text = engine.embed_text(text)?;
+        assert_close(&default_via_text, &default_via_ids);
         Ok(())
     }
 }

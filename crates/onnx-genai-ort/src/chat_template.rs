@@ -119,6 +119,18 @@ impl ChatMessage {
 }
 
 impl ChatTemplate {
+    /// A `ChatTemplate` backed by the built-in default (`DEFAULT_CHAT_TEMPLATE`).
+    ///
+    /// Model-independent — needs no model directory. Rendering this template is
+    /// identical to what [`ChatTemplate::from_model_dir`] yields when a model ships
+    /// no `chat_template.jinja` and no `chat_template` in `tokenizer_config.json`:
+    /// it emits `role: content` lines plus an optional `assistant:` generation prompt.
+    pub fn builtin_default() -> Self {
+        Self {
+            template: DEFAULT_CHAT_TEMPLATE.to_string(),
+        }
+    }
+
     /// Load `chat_template.jinja` or `tokenizer_config.json` from a model directory.
     ///
     /// A standalone `chat_template.jinja` takes precedence to match ORT-GenAI.
@@ -183,5 +195,49 @@ impl ChatTemplate {
                 add_generation_prompt => add_generation_prompt,
             })
             .map_err(|err| OrtError::InvalidArgument(format!("chat template render failed: {err}")))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_messages() -> Vec<ChatMessage> {
+        vec![
+            ChatMessage::system("be brief"),
+            ChatMessage::user("hello"),
+        ]
+    }
+
+    #[test]
+    fn builtin_default_matches_from_model_dir_default_path() {
+        // A directory with no template files yields the built-in default from
+        // `from_model_dir`; a non-existent path exercises that same fallback
+        // without touching the filesystem.
+        let from_dir =
+            ChatTemplate::from_model_dir(Path::new("nonexistent-model-dir-for-test")).unwrap();
+        let builtin = ChatTemplate::builtin_default();
+
+        let messages = sample_messages();
+        for add_generation_prompt in [false, true] {
+            assert_eq!(
+                builtin.render(&messages, None, add_generation_prompt).unwrap(),
+                from_dir.render(&messages, None, add_generation_prompt).unwrap(),
+            );
+        }
+    }
+
+    #[test]
+    fn builtin_default_renders_role_content_lines_and_generation_prompt() {
+        let messages = sample_messages();
+        let without = ChatTemplate::builtin_default()
+            .render(&messages, None, false)
+            .unwrap();
+        assert_eq!(without, "system: be brief\nuser: hello\n");
+
+        let with = ChatTemplate::builtin_default()
+            .render(&messages, None, true)
+            .unwrap();
+        assert_eq!(with, "system: be brief\nuser: hello\nassistant: ");
     }
 }

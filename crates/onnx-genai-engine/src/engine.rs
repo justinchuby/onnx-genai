@@ -989,6 +989,21 @@ impl Engine {
         }
     }
 
+    /// Tokenize `text` with the model's own tokenizer.
+    ///
+    /// This is the public tokenization seam used by higher-level pipelines to
+    /// convert prompt text into token ids (e.g. to compute prompt length or
+    /// `max_length`, or to feed [`Engine::embed`] and the generation APIs). It
+    /// uses the same tokenizer path as the engine's internal prompt handling.
+    pub fn tokenize(&self, text: &str) -> anyhow::Result<Vec<TokenId>> {
+        self.tokenizer.encode(text).map_err(|e| {
+            anyhow::anyhow!(
+                "failed to tokenize input text with the model's tokenizer: {e}; \
+                 verify the model directory contains a valid tokenizer.json"
+            )
+        })
+    }
+
     fn tokenize_prompt(&self, prompt: &GeneratePrompt) -> anyhow::Result<Vec<TokenId>> {
         match prompt {
             GeneratePrompt::TokenIds(tokens) => Ok(tokens.clone()),
