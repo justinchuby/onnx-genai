@@ -45,11 +45,15 @@ use onnx_runtime_shape_inference::{InferenceRegistry, MergePolicy};
 
 use crate::graph_builder::BuiltGraph;
 
+pub mod encoder;
 pub mod epcontext;
 pub mod graph_builder;
 pub mod proto;
 pub mod weights;
 
+pub use encoder::{
+    encode_model, encode_model_proto, write_model, Model, ModelMetadata, DEFAULT_IR_VERSION,
+};
 pub use epcontext::{
     ep_context_node_ids, ep_context_nodes, is_ep_context_op, resolve_ep_context, EmbedMode,
     EpContextBlob, EpContextNode,
