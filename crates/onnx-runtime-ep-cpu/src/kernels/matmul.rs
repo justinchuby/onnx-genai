@@ -49,72 +49,7 @@ fn gemm(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usize) {
 impl Kernel for MatMulKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         check_arity("MatMul", inputs, outputs, 2, 2, 1)?;
-        let a_dense = to_dense_f32(&inputs[0])?;
-        let b_dense = to_dense_f32(&inputs[1])?;
-
-        // Promote 1-D operands per numpy matmul: a [K] -> [1,K] (drop row after),
-        // b [K] -> [K,1] (drop col after).
-        let a_raw = inputs[0].shape;
-        let b_raw = inputs[1].shape;
-        let a_1d = a_raw.len() == 1;
-        let b_1d = b_raw.len() == 1;
-        let a_shape: Vec<usize> = if a_1d { vec![1, a_raw[0]] } else { a_raw.to_vec() };
-        let b_shape: Vec<usize> = if b_1d { vec![b_raw[0], 1] } else { b_raw.to_vec() };
-
-        if a_shape.len() < 2 || b_shape.len() < 2 {
-            return Err(EpError::KernelFailed(
-                "MatMul: operands must be at least 1-D".into(),
-            ));
-        }
-
-        let m = a_shape[a_shape.len() - 2];
-        let k = a_shape[a_shape.len() - 1];
-        let k2 = b_shape[b_shape.len() - 2];
-        let n = b_shape[b_shape.len() - 1];
-        if k != k2 {
-            return Err(EpError::KernelFailed(format!(
-                "MatMul: inner dims disagree ({k} vs {k2})"
-            )));
-        }
-
-        // Broadcast the batch (leading) dimensions.
-        let a_batch = &a_shape[..a_shape.len() - 2];
-        let b_batch = &b_shape[..b_shape.len() - 2];
-        let batch_shape = broadcast_shapes(a_batch, b_batch)?;
-        let batch_count = numel(&batch_shape);
-
-        let a_batch_strides = compute_contiguous_strides(a_batch);
-        let b_batch_strides = compute_contiguous_strides(b_batch);
-        let a_mat = m * k;
-        let b_mat = k * n;
-        let c_mat = m * n;
-
-        let mut out = vec![0.0f32; batch_count.max(1) * c_mat];
-
-        if batch_shape.is_empty() {
-            // No batch dims: a single matmul.
-            gemm(&a_dense, &b_dense, &mut out, m, k, n);
-        } else {
-            let mut bidx = vec![0usize; batch_shape.len()];
-            let mut b_out = 0usize;
-            loop {
-                let a_off = broadcast_offset(&bidx, a_batch, &a_batch_strides) * a_mat;
-                let b_off = broadcast_offset(&bidx, b_batch, &b_batch_strides) * b_mat;
-                gemm(
-                    &a_dense[a_off..a_off + a_mat],
-                    &b_dense[b_off..b_off + b_mat],
-                    &mut out[b_out * c_mat..b_out * c_mat + c_mat],
-                    m,
-                    k,
-                    n,
-                );
-                b_out += 1;
-                if !next_index(&batch_shape, &mut bidx) {
-                    break;
-                }
-            }
-        }
-
+        let out = matmul_dense(&inputs[0], &inputs[1])?;
         // If either operand was 1-D, the corresponding size-1 axis is squeezed
         // out of the result; `write_dense_f32` uses the output view's own shape,
         // so the dense buffer already matches element-for-element.
@@ -128,6 +63,81 @@ impl Kernel for MatMulKernel {
     fn estimated_flops(&self) -> Option<u64> {
         None
     }
+}
+
+/// Compute `A @ B` (numpy semantics: batched, broadcast leading dims, 1-D
+/// operand promotion) into a dense row-major `Vec<f32>`.
+///
+/// Shared by [`MatMulKernel`] and the fused `FusedMatMulBias` kernel so both go
+/// through exactly one GEMM implementation.
+pub(crate) fn matmul_dense(a: &TensorView, b: &TensorView) -> Result<Vec<f32>> {
+    let a_dense = to_dense_f32(a)?;
+    let b_dense = to_dense_f32(b)?;
+
+    // Promote 1-D operands per numpy matmul: a [K] -> [1,K] (drop row after),
+    // b [K] -> [K,1] (drop col after).
+    let a_raw = a.shape;
+    let b_raw = b.shape;
+    let a_1d = a_raw.len() == 1;
+    let b_1d = b_raw.len() == 1;
+    let a_shape: Vec<usize> = if a_1d { vec![1, a_raw[0]] } else { a_raw.to_vec() };
+    let b_shape: Vec<usize> = if b_1d { vec![b_raw[0], 1] } else { b_raw.to_vec() };
+
+    if a_shape.len() < 2 || b_shape.len() < 2 {
+        return Err(EpError::KernelFailed(
+            "MatMul: operands must be at least 1-D".into(),
+        ));
+    }
+
+    let m = a_shape[a_shape.len() - 2];
+    let k = a_shape[a_shape.len() - 1];
+    let k2 = b_shape[b_shape.len() - 2];
+    let n = b_shape[b_shape.len() - 1];
+    if k != k2 {
+        return Err(EpError::KernelFailed(format!(
+            "MatMul: inner dims disagree ({k} vs {k2})"
+        )));
+    }
+
+    // Broadcast the batch (leading) dimensions.
+    let a_batch = &a_shape[..a_shape.len() - 2];
+    let b_batch = &b_shape[..b_shape.len() - 2];
+    let batch_shape = broadcast_shapes(a_batch, b_batch)?;
+    let batch_count = numel(&batch_shape);
+
+    let a_batch_strides = compute_contiguous_strides(a_batch);
+    let b_batch_strides = compute_contiguous_strides(b_batch);
+    let a_mat = m * k;
+    let b_mat = k * n;
+    let c_mat = m * n;
+
+    let mut out = vec![0.0f32; batch_count.max(1) * c_mat];
+
+    if batch_shape.is_empty() {
+        // No batch dims: a single matmul.
+        gemm(&a_dense, &b_dense, &mut out, m, k, n);
+    } else {
+        let mut bidx = vec![0usize; batch_shape.len()];
+        let mut b_out = 0usize;
+        loop {
+            let a_off = broadcast_offset(&bidx, a_batch, &a_batch_strides) * a_mat;
+            let b_off = broadcast_offset(&bidx, b_batch, &b_batch_strides) * b_mat;
+            gemm(
+                &a_dense[a_off..a_off + a_mat],
+                &b_dense[b_off..b_off + b_mat],
+                &mut out[b_out * c_mat..b_out * c_mat + c_mat],
+                m,
+                k,
+                n,
+            );
+            b_out += 1;
+            if !next_index(&batch_shape, &mut bidx) {
+                break;
+            }
+        }
+    }
+
+    Ok(out)
 }
 
 /// Element offset of batch index `bidx` into a batch of shape `batch`,

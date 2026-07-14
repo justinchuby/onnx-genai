@@ -349,9 +349,16 @@ mod tests {
         assert!(ep.supports_op(&fused, &[], &[]).is_supported());
         assert!(ep.get_kernel(&fused, &[], 1).is_ok());
 
-        // A non-standard fused op with no kernel is still rejected in that
-        // domain — support is keyed on (op_type, domain) via the registry.
-        let mut unknown = Node::new(onnx_runtime_ir::NodeId(1), "FusedMatMulBias", vec![], vec![]);
+        // The fused `FusedMatMulBias` (MatMul+Add) now has a contrib-domain
+        // kernel, so it is supported and instantiable.
+        let mut fmb = Node::new(onnx_runtime_ir::NodeId(1), "FusedMatMulBias", vec![], vec![]);
+        fmb.domain = "com.microsoft".to_string();
+        assert!(ep.supports_op(&fmb, &[], &[]).is_supported());
+        assert!(ep.get_kernel(&fmb, &[], 1).is_ok());
+
+        // A fused op with no kernel yet (e.g. `FusedGemm`, the MatMul+Add+Relu
+        // fusion) is still rejected — support is keyed on (op_type, domain).
+        let mut unknown = Node::new(onnx_runtime_ir::NodeId(2), "FusedGemm", vec![], vec![]);
         unknown.domain = "com.microsoft".to_string();
         assert!(!ep.supports_op(&unknown, &[], &[]).is_supported());
     }

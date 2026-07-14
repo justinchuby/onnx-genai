@@ -37,17 +37,25 @@
 //! domain (where the `FusedMatMul`/`LayerNormalization` contrib variants live),
 //! so our IR stays interoperable with ORT-exported models and wider tooling.
 //!
-//! Kernel dispatch (`onnx-runtime-ep-cpu`) binds these by `(domain, op_type)`:
-//! only `LayerNormalization` currently has a CPU kernel (registered under both
-//! the default and the contrib domain); `FusedMatMulBias`/`FusedGemm` have no
-//! kernel yet — this pass only rewrites the graph. Providing those kernels is
-//! Phase-2/3 work. Likewise the generic external-input ordering is *structural*,
-//! not schema-aware; a schema-aware reorder (e.g. ONNX `LayerNormalization`'s
-//! `(X, Scale, B)`) is a later refinement and does not affect graph validity.
+//! Kernel dispatch (`onnx-runtime-ep-cpu`) binds these by `(domain, op_type)`.
+//! `LayerNormalization` and `FusedMatMulBias` both have CPU kernels (registered
+//! under the contrib domain); `FusedGemm` (MatMul+Add+Relu) is a graph-only
+//! rewrite with no kernel yet — it is emitted but unexercised by the current
+//! validation target (BERT uses GELU/Erf, not Relu), so its kernel is deferred.
+//!
+//! ## Schema-aware rewrites
+//!
+//! Most patterns use a *structural* rewrite: the fused node's inputs are the
+//! matched region's external inputs in first-seen order, which happens to match
+//! the kernel signature for `FusedMatMulBias` (`[A, B, bias]`). The LayerNorm
+//! fusion is instead **schema-aware** (see [`RewriteKind::LayerNorm`]): it emits
+//! a node with inputs exactly `[X, Scale, B]` and synthesizes the `axis` /
+//! `epsilon` attributes the kernel reads, extracting them from the matched
+//! subgraph (the `ReduceMean` axes and the `var + eps` constant).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
-use onnx_runtime_ir::{Graph, Node, NodeId, ValueId};
+use onnx_runtime_ir::{Attribute, DataType, Graph, Node, NodeId, ValueId, WeightRef};
 
 use crate::error::Result;
 use crate::pass::{OptimizationPass, PassContext};
@@ -62,8 +70,10 @@ use crate::pass::{OptimizationPass, PassContext};
 /// *domain*, independent of any particular model.
 pub const CONTRIB_DOMAIN: &str = "com.microsoft";
 
-/// A matched occurrence of a [`FusionPattern`] in a graph.
-#[derive(Clone, Debug)]
+/// The inputs and attributes of a fused node: `(inputs, attributes)`.
+type FusedNodeSpec = (Vec<Option<ValueId>>, HashMap<String, Attribute>);
+
+/// A matched occurrence of a [`FusionPattern`] in a graph.#[derive(Clone, Debug)]
 pub struct PatternMatch {
     /// Matched node ids, in op-sequence order.
     pub nodes: Vec<NodeId>,
@@ -76,23 +86,62 @@ pub struct PatternMatch {
     pub output: ValueId,
 }
 
+/// How a matched pattern is rewritten into its fused node.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RewriteKind {
+    /// The fused node's inputs are the matched region's external inputs in
+    /// first-seen order (e.g. `MatMul(A,B)+bias` → `FusedMatMulBias[A, B, bias]`).
+    Structural,
+    /// Schema-aware LayerNorm rewrite: emit `[X, Scale, B]` plus the `axis` and
+    /// `epsilon` attributes the kernel reads, extracted from the matched
+    /// 9-op decomposition (see [`FusionPattern::layernorm_node`]).
+    LayerNorm,
+}
+
 /// A fusion rule: an op-type sequence rewritten to a single replacement op.
 #[derive(Clone, Debug)]
 pub struct FusionPattern {
     name: String,
     ops: Vec<String>,
     replacement: String,
+    kind: RewriteKind,
 }
 
 impl FusionPattern {
-    /// A new pattern matching `ops` in sequence, replaced by `replacement`.
+    /// A new *structural* pattern matching `ops` in sequence, replaced by
+    /// `replacement`. The fused node's inputs are the matched region's external
+    /// inputs in first-seen order.
     pub fn new(name: &str, ops: &[&str], replacement: &str) -> Self {
         assert!(!ops.is_empty(), "fusion pattern must have at least one op");
         Self {
             name: name.to_string(),
             ops: ops.iter().map(|s| s.to_string()).collect(),
             replacement: replacement.to_string(),
+            kind: RewriteKind::Structural,
         }
+    }
+
+    /// The schema-aware LayerNorm pattern: the canonical 9-op decomposition
+    /// (`ReduceMean, Sub, Pow, ReduceMean, Add, Sqrt, Div, Mul, Add`) rewritten
+    /// to a `com.microsoft::LayerNormalization` node with inputs `[X, Scale, B]`
+    /// and synthesized `axis`/`epsilon` attributes.
+    pub fn layernorm() -> Self {
+        Self {
+            name: "LayerNorm".to_string(),
+            ops: [
+                "ReduceMean", "Sub", "Pow", "ReduceMean", "Add", "Sqrt", "Div", "Mul", "Add",
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+            replacement: "LayerNormalization".to_string(),
+            kind: RewriteKind::LayerNorm,
+        }
+    }
+
+    /// This pattern's rewrite kind.
+    pub fn kind(&self) -> RewriteKind {
+        self.kind
     }
 
     /// This pattern's name.
@@ -203,6 +252,16 @@ impl FusionPattern {
     pub fn apply_fusion(&self, graph: &mut Graph, m: &PatternMatch) -> Result<()> {
         let output = m.output;
 
+        // For schema-aware rewrites, extract the kernel-signature inputs and
+        // attributes *before* the matched nodes are removed.
+        let (inputs, attributes) = match self.kind {
+            RewriteKind::Structural => (
+                m.external_inputs.iter().map(|&v| Some(v)).collect(),
+                HashMap::new(),
+            ),
+            RewriteKind::LayerNorm => self.layernorm_node(graph, m)?,
+        };
+
         // Remove in reverse (last-first): a node's consumers are gone before it,
         // so intermediate values are cleanly garbage-collected. `output` itself
         // survives because it is a graph output or has an external consumer.
@@ -214,13 +273,91 @@ impl FusionPattern {
             return Err(crate::error::OptimizerError::Fusion(self.name.clone()));
         }
 
-        let inputs: Vec<Option<ValueId>> = m.external_inputs.iter().map(|&v| Some(v)).collect();
         let mut fused = Node::new(NodeId(0), self.replacement.clone(), inputs, vec![output]);
+        fused.attributes = attributes;
         // Emit the fused op in the private contrib domain so it never collides
         // with standard `ai.onnx` ops and dispatch stays keyed on (domain, op).
         fused.domain = CONTRIB_DOMAIN.to_string();
         graph.insert_node(fused);
         Ok(())
+    }
+
+    /// Extract the schema-conformant `[X, Scale, B]` inputs and the
+    /// `axis`/`epsilon` attributes for a matched LayerNorm decomposition.
+    ///
+    /// The chain nodes are, in order:
+    /// `0:ReduceMean(x) → mean`, `1:Sub(x, mean) → diff`, `2:Pow(diff, 2) → sq`,
+    /// `3:ReduceMean(sq) → var`, `4:Add(var, eps) → vare`, `5:Sqrt → std`,
+    /// `6:Div(diff, std) → norm`, `7:Mul(norm, Scale) → scaled`,
+    /// `8:Add(scaled, B) → out`.
+    ///
+    /// * **X** is the `Sub` operand that is not the first `ReduceMean`'s output.
+    /// * **Scale** is the `Mul` operand that is not the `Div` output.
+    /// * **B** is the final `Add` operand that is not the `Mul` output.
+    /// * **epsilon** is read from the constant `Add`-before-`Sqrt` operand that
+    ///   is not the second `ReduceMean`'s output (folded to an initializer by the
+    ///   preceding `ConstantFolding` pass); it falls back to the ONNX default
+    ///   `1e-5` only if that operand is not a readable f32 constant.
+    /// * **axis** is the first entry of the first `ReduceMean`'s `axes`
+    ///   attribute (default `-1`).
+    fn layernorm_node(
+        &self,
+        graph: &Graph,
+        m: &PatternMatch,
+    ) -> Result<FusedNodeSpec> {
+        let fail = || crate::error::OptimizerError::Fusion(self.name.clone());
+        let nodes = &m.nodes;
+        if nodes.len() != 9 {
+            return Err(fail());
+        }
+        let rm1 = graph.node(nodes[0]);
+        let sub = graph.node(nodes[1]);
+        let rm2 = graph.node(nodes[3]);
+        let add_eps = graph.node(nodes[4]);
+        let div = graph.node(nodes[6]);
+        let mul = graph.node(nodes[7]);
+        let final_add = graph.node(nodes[8]);
+
+        let mean = rm1.outputs[0];
+        let var = rm2.outputs[0];
+        let norm = div.outputs[0];
+        let scaled = mul.outputs[0];
+
+        let x = sub.input_values().find(|&v| v != mean).ok_or_else(fail)?;
+        let scale = mul.input_values().find(|&v| v != norm).ok_or_else(fail)?;
+        let bias = final_add
+            .input_values()
+            .find(|&v| v != scaled)
+            .ok_or_else(fail)?;
+
+        let epsilon = add_eps
+            .input_values()
+            .find(|&v| v != var)
+            .and_then(|eps_val| read_scalar_f32(graph, eps_val))
+            .unwrap_or(1e-5);
+
+        let axis = rm1
+            .attr("axes")
+            .and_then(Attribute::as_ints)
+            .and_then(|a| a.first().copied())
+            .unwrap_or(-1);
+
+        let mut attributes = HashMap::new();
+        attributes.insert("axis".to_string(), Attribute::Int(axis));
+        attributes.insert("epsilon".to_string(), Attribute::Float(epsilon));
+
+        Ok((vec![Some(x), Some(scale), Some(bias)], attributes))
+    }
+}
+
+/// Read a scalar (or leading) f32 element from an inline float initializer, if
+/// `value` is backed by one. Used to fold a constant `epsilon` into an attribute.
+fn read_scalar_f32(graph: &Graph, value: ValueId) -> Option<f32> {
+    match graph.initializers.get(&value)? {
+        WeightRef::Inline(t) if t.dtype == DataType::Float32 && t.data.len() >= 4 => {
+            Some(f32::from_le_bytes(t.data[0..4].try_into().ok()?))
+        }
+        _ => None,
     }
 }
 
@@ -232,13 +369,7 @@ impl FusionPattern {
 pub fn default_fusion_patterns() -> Vec<FusionPattern> {
     vec![
         FusionPattern::new("MatMul+Bias+Relu", &["MatMul", "Add", "Relu"], "FusedGemm"),
-        FusionPattern::new(
-            "LayerNorm",
-            &[
-                "ReduceMean", "Sub", "Pow", "ReduceMean", "Add", "Sqrt", "Div", "Mul", "Add",
-            ],
-            "LayerNormalization",
-        ),
+        FusionPattern::layernorm(),
         FusionPattern::new("MatMul+Bias", &["MatMul", "Add"], "FusedMatMulBias"),
     ]
 }
@@ -287,7 +418,7 @@ impl OptimizationPass for OpFusion {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use onnx_runtime_ir::{DataType, Node, NodeId, static_shape};
+    use onnx_runtime_ir::{DataType, Node, NodeId, TensorData, static_shape};
 
     fn val(g: &mut Graph, name: &str) -> ValueId {
         g.create_named_value(name, DataType::Float32, static_shape([4]))
@@ -395,7 +526,13 @@ mod tests {
     }
 
     /// Build the canonical 9-op LayerNorm decomposition over `x`.
+    ///
+    /// `eps` is an inline f32 initializer (as it would be after `ConstantFolding`
+    /// materializes the `var + eps` constant) so the schema-aware rewrite can
+    /// fold it into the `epsilon` attribute; the `ReduceMean` nodes carry an
+    /// `axes = [-1]` attribute so `axis` extraction is exercised too.
     fn layernorm_graph() -> Graph {
+        const EPS: f32 = 1e-12;
         let mut g = Graph::new();
         g.opset_imports.insert(String::new(), 17);
         let x = val(&mut g, "x");
@@ -405,18 +542,32 @@ mod tests {
         let bias = val(&mut g, "bias");
         g.add_input(x);
         g.add_input(two);
-        g.add_input(eps);
+        g.set_initializer(
+            eps,
+            WeightRef::Inline(TensorData::from_raw(
+                DataType::Float32,
+                vec![],
+                EPS.to_le_bytes().to_vec(),
+            )),
+        );
         g.add_input(scale);
         g.add_input(bias);
 
+        let reduce_mean = |g: &mut Graph, input: ValueId, out: ValueId| {
+            let mut n = Node::new(NodeId(0), "ReduceMean", vec![Some(input)], vec![out]);
+            n.attributes.insert("axes".into(), Attribute::Ints(vec![-1]));
+            n.attributes.insert("keepdims".into(), Attribute::Int(1));
+            g.insert_node(n);
+        };
+
         let mean = val(&mut g, "mean");
-        g.insert_node(Node::new(NodeId(0), "ReduceMean", vec![Some(x)], vec![mean]));
+        reduce_mean(&mut g, x, mean);
         let diff = val(&mut g, "diff");
         g.insert_node(Node::new(NodeId(0), "Sub", vec![Some(x), Some(mean)], vec![diff]));
         let sq = val(&mut g, "sq");
         g.insert_node(Node::new(NodeId(0), "Pow", vec![Some(diff), Some(two)], vec![sq]));
         let var = val(&mut g, "var");
-        g.insert_node(Node::new(NodeId(0), "ReduceMean", vec![Some(sq)], vec![var]));
+        reduce_mean(&mut g, sq, var);
         let vare = val(&mut g, "vare");
         g.insert_node(Node::new(NodeId(0), "Add", vec![Some(var), Some(eps)], vec![vare]));
         let std = val(&mut g, "std");
@@ -447,14 +598,41 @@ mod tests {
         assert_eq!(g.num_nodes(), 9);
         assert!(g.validate().is_ok());
 
+        // Record the value ids the schema-aware rewrite must reference.
+        let vid = |name: &str| {
+            g.values
+                .iter()
+                .find(|(_, v)| v.name.as_deref() == Some(name))
+                .map(|(id, _)| id)
+                .unwrap()
+        };
+        let x = vid("x");
+        let scale = vid("scale");
+        let bias = vid("bias");
+
         OpFusion::new().run(&mut g, &PassContext::new()).unwrap();
 
         assert_eq!(g.num_nodes(), 1, "9-op chain collapses to one node");
         let fused = g.nodes.values().next().unwrap();
         assert_eq!(fused.op_type, "LayerNormalization");
         assert_eq!(fused.domain, CONTRIB_DOMAIN);
-        // Structural external inputs: x, two, eps, scale, bias.
-        assert_eq!(fused.inputs.len(), 5);
+        // Schema-conformant inputs: exactly [X, Scale, B] — NOT the intermediate
+        // pow-exponent / epsilon tensors.
+        assert_eq!(fused.inputs, vec![Some(x), Some(scale), Some(bias)]);
+        // Synthesized attributes read by the kernel.
+        assert_eq!(
+            fused.attr("axis").and_then(Attribute::as_int),
+            Some(-1),
+            "axis extracted from ReduceMean axes"
+        );
+        let eps = fused
+            .attr("epsilon")
+            .and_then(Attribute::as_float)
+            .expect("epsilon attribute present");
+        assert!(
+            (eps - 1e-12).abs() < 1e-18,
+            "epsilon extracted from the var+eps constant, got {eps}"
+        );
         assert_eq!(fused.outputs, g.outputs);
         assert!(g.validate().is_ok());
     }
@@ -479,7 +657,7 @@ mod tests {
         let mut g = layernorm_graph();
         // Remove the last Add by rebuilding: easier to just check a shorter
         // pattern doesn't accidentally match — assert Sub alone isn't fused.
-        let p = FusionPattern::new("LayerNorm", &["ReduceMean", "Sub", "Pow", "ReduceMean", "Add", "Sqrt", "Div", "Mul", "Add"], "LayerNormalization");
+        let p = FusionPattern::layernorm();
         // Break the chain: give `diff` an external consumer so the safety rule
         // trips (Sub is a non-final matched node).
         let diff = g

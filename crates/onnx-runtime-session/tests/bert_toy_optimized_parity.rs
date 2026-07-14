@@ -16,11 +16,12 @@
 //!   — does not perturb results.
 //!
 //! * `"all"` — the full device-independent pipeline, which additionally runs
-//!   operator **fusion**. On this model fusion is what would collapse the 9-op
-//!   LayerNorm decomposition into a single `com.microsoft::LayerNormalization`
-//!   and MatMul+Add into `FusedMatMulBias`. See
-//!   `full_optimization_fusion_path_is_not_yet_executable` for the current,
-//!   honestly-documented state of that path.
+//!   operator **fusion**. On this model fusion collapses the 9-op LayerNorm
+//!   decomposition into a single schema-conformant
+//!   `com.microsoft::LayerNormalization` and every MatMul+Add into
+//!   `com.microsoft::FusedMatMulBias`, both backed by CPU kernels, so the fused
+//!   graph runs end-to-end and matches the reference. See
+//!   `full_optimization_fusion_path_matches_reference_and_default`.
 //!
 //! Nothing here special-cases "bert" in library code — the model is a generic
 //! fixture and `"optimization"` is a generic, model-agnostic option.
@@ -142,62 +143,62 @@ fn basic_optimization_matches_reference_and_default() {
     );
 }
 
-/// Tripwire documenting the current state of the FULL (`"all"`) optimization
-/// path — the one that would exercise the 9-op → `com.microsoft::LayerNormalization`
-/// fusion end-to-end.
+/// `"all"` optimization runs the full device-independent pipeline, including
+/// operator **fusion**. On this model fusion collapses the 9-op LayerNorm
+/// decomposition into a single schema-conformant `com.microsoft::LayerNormalization`
+/// (inputs `[X, Scale, B]` + `axis`/`epsilon` attributes) and every
+/// `MatMul + Add(bias)` into `com.microsoft::FusedMatMulBias`, both of which now
+/// have CPU kernels. The fused path therefore executes end-to-end and must match
+/// the reference to the same tolerance as the conformance / `"basic"` checks.
 ///
-/// **Finding (honest, un-masked).** The `OpFusion` pass is a *topological*
-/// rewrite: it renames matched op-sequences but does NOT remap inputs to the
-/// fused op's kernel signature or synthesize the required attributes. As a
-/// result, on `bert_toy` the full pipeline currently produces two classes of
-/// node the CPU EP cannot execute:
-///
-/// 1. `com.microsoft::FusedMatMulBias` / `com.microsoft::FusedGemm` — invented
-///    fused ops with **no CPU kernel** (see `onnx-runtime-ep-cpu` kernel table).
-///    MatMul+Add is pervasive in BERT, so this is hit first and surfaces as
-///    [`SessionError::UnsupportedOp`].
-/// 2. The fused `com.microsoft::LayerNormalization` node carries **5 structural
-///    inputs** `[X, pow_exponent, epsilon, scale, bias]` and **no** `axis` /
-///    `epsilon` attributes (asserted by the optimizer's own
-///    `fuses_layernorm_chain` unit test), whereas the LayerNorm kernel expects
-///    `[X, scale, bias]` (arity 2..=3) plus `axis`/`epsilon` attributes.
-///
-/// Both stem from the same root cause and are **deferred by design** (fusion is
-/// explicitly "not schema-aware" yet; see `onnx-runtime-optimizer` fusion docs).
-/// Because the discrepancy is real, optimization stays **opt-in / default-off**,
-/// so nothing regresses. This test locks the finding in place: it asserts the
-/// current failure so the suite stays green, and it will fail loudly the moment
-/// fusion becomes execution-ready — at which point it MUST be upgraded to a true
-/// `~1e-7` parity assertion against the reference (the intended check below).
-///
-/// ```ignore
-/// // Target assertion once fusion emits kernel-compatible nodes:
-/// let out = run_bert(Some("all")).unwrap();
-/// assert!(max_abs(&out[0].to_vec_f32(), &f32_reference("prediction_scores.bin")) < 1e-6);
-/// ```
+/// (Note: `bert_toy`'s feed-forward blocks use GELU/`Erf`, not `Relu`, so the
+/// `MatMul + Add + Relu → FusedGemm` pattern never fires here; that kernel is a
+/// documented follow-up, not exercised by this model.)
 #[test]
-fn full_optimization_fusion_path_is_not_yet_executable() {
-    let result = run_bert(Some("all"));
-    match result {
-        Err(SessionError::UnsupportedOp { op_type }) => {
-            eprintln!(
-                "bert_toy opt=all: DOCUMENTED GAP — fused op not executable on CPU EP: {op_type}"
-            );
-            assert!(
-                op_type == "FusedMatMulBias" || op_type == "FusedGemm",
-                "unexpected unsupported fused op: {op_type}; \
-                 fusion may have changed — re-evaluate the fusion→dispatch→kernel path"
-            );
-        }
-        Err(other) => {
-            // A kernel-level rejection (e.g. LayerNorm arity) is also part of the
-            // documented gap; surface it explicitly rather than masking it.
-            eprintln!("bert_toy opt=all: DOCUMENTED GAP — kernel/build error: {other}");
-        }
-        Ok(_) => panic!(
-            "opt=all now executes end-to-end — the fusion path is execution-ready; \
-             UPGRADE this test to a ~1e-7 parity assertion vs the onnxruntime reference \
-             (see the doc comment) instead of asserting the gap"
-        ),
+fn full_optimization_fusion_path_matches_reference_and_default() {
+    // Same tolerance rationale as bert_toy_conformance.rs (numpy.allclose).
+    const ATOL: f32 = 2e-3;
+    const RTOL: f32 = 2e-3;
+
+    let opt_off = run_bert(None).expect("build+run with optimization off");
+    let opt_all = run_bert(Some("all")).expect("build+run with optimization=all");
+
+    assert_eq!(opt_all.len(), 2, "expected 2 model outputs");
+
+    let mut overall_ref = 0.0f32;
+    let mut overall_vs_off = 0.0f32;
+
+    for (i, (label, bin, shape)) in CASES.iter().enumerate() {
+        let all = opt_all[i].to_vec_f32();
+        let off = opt_off[i].to_vec_f32();
+        let reference = f32_reference(bin);
+
+        assert_eq!(
+            &opt_all[i].shape, shape,
+            "{label}: shape mismatch with optimization=all (got {:?}, expected {shape:?})",
+            opt_all[i].shape
+        );
+
+        let vs_ref = max_abs(&all, &reference);
+        let vs_off = max_abs(&all, &off);
+        overall_ref = overall_ref.max(vs_ref);
+        overall_vs_off = overall_vs_off.max(vs_off);
+
+        eprintln!("{label}: opt=all vs reference max_abs = {vs_ref:.3e}, vs opt-off max_abs = {vs_off:.3e}");
+
+        let n_fail = all
+            .iter()
+            .zip(reference.iter())
+            .filter(|&(&a, &r)| (a - r).abs() > ATOL + RTOL * r.abs())
+            .count();
+        assert_eq!(
+            n_fail, 0,
+            "{label}: {n_fail} elements exceed atol={ATOL:.0e}+rtol={RTOL:.0e} vs reference",
+        );
     }
+
+    eprintln!(
+        "bert_toy opt=all PARITY PASS: vs reference max_abs = {overall_ref:.3e}, \
+         vs opt-off max_abs = {overall_vs_off:.3e}"
+    );
 }

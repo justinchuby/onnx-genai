@@ -146,6 +146,20 @@ fn matmul_shape(
     Ok(shape)
 }
 
+/// `com.microsoft::FusedMatMulBias`: the optimizer's `MatMul(A, B) + bias`
+/// fusion. The bias is numpy-broadcast onto the matmul result, so the output
+/// shape is exactly `MatMul(A, B)`'s shape — the plain-MatMul rule applies.
+pub fn fused_matmul_bias(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
+    let a = ctx.input_shape(0).map(<[DimExpr]>::to_vec);
+    let b = ctx.input_shape(1).map(<[DimExpr]>::to_vec);
+    let dtype = ctx.input_dtype(0);
+    if let (Some(a), Some(b), Some(dtype)) = (a, b, dtype) {
+        let shape = matmul_shape(ctx, &a, &b, "FusedMatMulBias")?;
+        ctx.set_output(0, dtype, shape);
+    }
+    Ok(())
+}
+
 /// `Gemm(A, B, C?)`: `Y = alpha * A' * B' + beta * C`, output `[M, N]`.
 pub fn gemm(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
     let a = ctx.input_shape(0).map(<[DimExpr]>::to_vec);
@@ -186,4 +200,6 @@ pub fn register(reg: &mut InferenceRegistry) {
     reg.register("", "Gemm", 1, gemm);
     // com.microsoft fused matmul honors transA/transB/transBatch attributes.
     reg.register("com.microsoft", "FusedMatMul", 1, fused_matmul);
+    // The optimizer's MatMul+Add(bias) fusion: output shape == MatMul's.
+    reg.register("com.microsoft", "FusedMatMulBias", 1, fused_matmul_bias);
 }

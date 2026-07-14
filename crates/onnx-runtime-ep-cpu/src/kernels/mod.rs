@@ -30,6 +30,7 @@ pub mod cast;
 pub mod constant;
 pub mod elementwise;
 pub mod expand;
+pub mod fused_matmul_bias;
 pub mod gather;
 pub mod gemm;
 pub mod layernorm;
@@ -117,6 +118,13 @@ pub fn build_cpu_registry() -> OpRegistry {
     reg.register(
         OpKey::new("LayerNormalization", "com.microsoft", 1),
         Box::new(layernorm::LayerNormFactory),
+    );
+    // The optimizer's `MatMul + Add(bias)` fusion emits `FusedMatMulBias` in the
+    // contrib domain; bind its kernel there so dispatch resolves the fused op by
+    // (domain, op_type). It reuses the shared MatMul GEMM + broadcast-Add.
+    reg.register(
+        OpKey::new("FusedMatMulBias", "com.microsoft", 1),
+        Box::new(fused_matmul_bias::FusedMatMulBiasFactory),
     );
     // Elementwise binary broadcasting ops.
     reg.register(OpKey::new("Sub", "", 1), Box::new(elementwise::SubFactory));
@@ -570,10 +578,10 @@ mod tests {
         let reg = build_cpu_registry();
         // Every Phase-1 op has at least one factory, and each resolves at a
         // modern opset. `Softmax` is registered twice (legacy v1 + per-axis
-        // v13) and `LayerNormalization` is registered in both the default and
-        // the `com.microsoft` contrib domain, so the entry count is two more
-        // than the op-name count.
-        assert_eq!(reg.len(), PHASE1_OPS.len() + 2);
+        // v13), and `LayerNormalization` and `FusedMatMulBias` add contrib
+        // (`com.microsoft`) entries, so the entry count is three more than the
+        // op-name count.
+        assert_eq!(reg.len(), PHASE1_OPS.len() + 3);
         for op in PHASE1_OPS {
             assert!(reg.lookup(op, "", 21).is_some(), "missing factory for {op}");
         }
@@ -586,7 +594,8 @@ mod tests {
         assert!(reg.lookup("LayerNormalization", "com.microsoft", 1).is_some());
         assert!(reg.supports("LayerNormalization", "com.microsoft"));
         assert!(reg.supports("MatMul", "ai.onnx"));
-        assert!(!reg.supports("FusedMatMulBias", "com.microsoft"));
+        // The `MatMul + Add` fusion's contrib op now has a CPU kernel.
+        assert!(reg.supports("FusedMatMulBias", "com.microsoft"));
     }
 
     #[test]
