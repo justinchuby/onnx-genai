@@ -58,6 +58,22 @@ pub enum TracerError {
         /// A human- and agent-actionable description of the failure and fix.
         message: String,
     },
+    /// GPU tracing was **explicitly requested** but the CUPTI runtime could not
+    /// be loaded or used on this machine.
+    ///
+    /// Only produced by the `cupti` feature, and only on the explicit-request
+    /// path (availability probing / factory auto-selection still degrades
+    /// quietly to "unavailable"). Carries the attempted library paths and the
+    /// underlying loader/symbol error so the failure is debuggable, and its
+    /// [`Display`](fmt::Display) spells out what/why/how-to-fix per RULES.md #1.
+    #[cfg(feature = "cupti")]
+    CuptiUnavailable {
+        /// The library paths that were searched for `libcupti`.
+        attempted: Vec<PathBuf>,
+        /// The underlying loader or missing-symbol error that made CUPTI
+        /// unusable.
+        cause: String,
+    },
 }
 
 impl fmt::Display for TracerError {
@@ -94,6 +110,30 @@ impl fmt::Display for TracerError {
             ),
             #[cfg(feature = "cupti")]
             TracerError::Cupti { op: _, message } => write!(f, "{message}"),
+            #[cfg(feature = "cupti")]
+            TracerError::CuptiUnavailable { attempted, cause } => {
+                let searched = if attempted.is_empty() {
+                    "(no candidate paths were available)".to_string()
+                } else {
+                    attempted
+                        .iter()
+                        .map(|p| p.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+                write!(
+                    f,
+                    "GPU kernel tracing was requested but the CUPTI runtime could not \
+                     be loaded or used: {cause}. GPU tracing requires the CUDA-13 \
+                     CUPTI runtime library (libcupti.so.13), which nxrt dlopen's at \
+                     run time. Install it with `pip install nvidia-cuda-cupti-cu13` \
+                     (the CUPTI major version must match your CUDA major version and \
+                     NVIDIA driver — cu13 pairs with CUDA 13); on a system CUDA \
+                     toolkit make sure its `libcupti.so.13` is on the loader path. \
+                     Searched: {searched}. GPU tracing is optional — omit the CUPTI \
+                     tracing request to run without it."
+                )
+            }
         }
     }
 }
@@ -106,6 +146,8 @@ impl std::error::Error for TracerError {
             TracerError::Write { source, .. } => Some(source),
             #[cfg(feature = "cupti")]
             TracerError::Cupti { .. } => None,
+            #[cfg(feature = "cupti")]
+            TracerError::CuptiUnavailable { .. } => None,
         }
     }
 }

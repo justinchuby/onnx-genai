@@ -148,16 +148,61 @@ unsafe impl Sync for CuptiApi {}
 
 /// The dlopen'd libcupti, loaded at most once and kept mapped for the entire
 /// process. See [`CuptiApi`] for why it must never be unloaded.
-static CUPTI_LIBRARY: OnceLock<Option<libloading::Library>> = OnceLock::new();
+///
+/// The `Err` arm retains the searched paths and the underlying loader error so
+/// the explicit-request path can produce an actionable [`TracerError`]
+/// (RULES.md #1) instead of a silent `None`.
+static CUPTI_LIBRARY: OnceLock<std::result::Result<libloading::Library, CuptiLoadError>> =
+    OnceLock::new();
 
-fn cupti_library() -> Option<&'static libloading::Library> {
+/// Extra library search roots injected by an embedding runtime (e.g. the PyO3
+/// Python binding feeding real `sys.path` / the extension's site-packages) so
+/// pip-installed CUPTI is found even when `VIRTUAL_ENV`/`PYTHONPATH` are unset.
+///
+/// Populate this via [`set_search_paths`] **before** any tracing is initialized,
+/// because [`CUPTI_LIBRARY`] caches the discovery result on first use.
+static INJECTED_SEARCH_PATHS: OnceLock<Vec<PathBuf>> = OnceLock::new();
+
+/// Why libcupti could not be loaded, retained for an actionable diagnostic.
+struct CuptiLoadError {
+    /// Every path we attempted to `dlopen`, in order.
+    attempted: Vec<PathBuf>,
+    /// The last underlying loader error (or a note if there were no candidates).
+    cause: String,
+}
+
+/// Inject extra library search roots (typically Python `sys.path` entries and
+/// the loaded extension module's directory) that the CUPTI loader should probe
+/// for the pip layout `<root>/nvidia/cuda_cupti/lib/libcupti.so*`.
+///
+/// This is the runtime-agnostic seam the Python binding uses: the tracer never
+/// depends on PyO3, it just accepts a plain `Vec<PathBuf>`. Call this **once, at
+/// import/startup time, before any tracing begins** — the loader caches its
+/// discovery on first use, so paths injected afterwards are ignored. Repeated
+/// calls after the first are no-ops.
+pub fn set_search_paths(paths: Vec<PathBuf>) {
+    let _ = INJECTED_SEARCH_PATHS.set(paths);
+}
+
+fn cupti_library() -> std::result::Result<&'static libloading::Library, &'static CuptiLoadError> {
     CUPTI_LIBRARY
         .get_or_init(|| {
-            libcupti_candidates()
-                .into_iter()
+            let candidates = libcupti_candidates();
+            let mut last_error = None;
+            for path in &candidates {
                 // SAFETY: loading a shared library runs its initializers;
                 // libcupti is a well-behaved NVIDIA library.
-                .find_map(|path| unsafe { libloading::Library::new(path) }.ok())
+                match unsafe { libloading::Library::new(path) } {
+                    Ok(library) => return Ok(library),
+                    Err(error) => last_error = Some(error.to_string()),
+                }
+            }
+            Err(CuptiLoadError {
+                cause: last_error.unwrap_or_else(|| {
+                    "no libcupti candidate paths were available to try".to_string()
+                }),
+                attempted: candidates,
+            })
         })
         .as_ref()
 }
@@ -166,11 +211,27 @@ fn cupti_library() -> Option<&'static libloading::Library> {
 ///
 /// In addition to the normal loader path, NVIDIA's pip package installs CUPTI
 /// below `site-packages/nvidia/cuda_cupti/lib`. Python locations are derived at
-/// runtime from explicit environment hints, `PYTHONPATH`, and likely interpreter
-/// prefixes; no build-machine path is embedded in the binary.
+/// runtime from injected `sys.path` roots (see [`set_search_paths`]), explicit
+/// environment hints, `PYTHONPATH`, and likely interpreter prefixes; no
+/// build-machine path is embedded in the binary.
 fn libcupti_candidates() -> Vec<PathBuf> {
+    let injected = INJECTED_SEARCH_PATHS.get().map(Vec::as_slice).unwrap_or(&[]);
+    collect_libcupti_candidates(injected)
+}
+
+/// The pure, testable core of [`libcupti_candidates`]: given explicitly injected
+/// site-packages roots, plus the process environment, produce the ordered list
+/// of `libcupti` paths to try.
+fn collect_libcupti_candidates(injected: &[PathBuf]) -> Vec<PathBuf> {
     let mut candidates = LIBCUPTI_SONAMES.iter().map(PathBuf::from).collect::<Vec<_>>();
     let mut site_packages = Vec::new();
+
+    // Injected roots (e.g. the Python interpreter's real `sys.path` and the
+    // loaded extension's own directory) come first. They are the reliable
+    // mechanism for an unactivated venv — where `VIRTUAL_ENV` is unset and
+    // `/proc/self/exe` resolves to the base interpreter — and for user-site
+    // (`~/.local/.../site-packages`) installs.
+    site_packages.extend(injected.iter().cloned());
 
     if let Some(paths) = std::env::var_os("NXRT_PYTHON_SITE_PACKAGES") {
         site_packages.extend(std::env::split_paths(&paths));
@@ -230,36 +291,81 @@ fn push_pip_cupti_candidates(site_packages: &Path, candidates: &mut Vec<PathBuf>
 impl CuptiApi {
     /// Resolve every CUPTI symbol we need from the process-lifetime library.
     /// Returns `None` (never an error) if the library or **any** required symbol
-    /// is absent, so the caller can degrade gracefully.
+    /// is absent, so an **availability probe** can degrade gracefully.
+    ///
+    /// The explicit-request path uses [`require`](CuptiApi::require) instead,
+    /// which preserves the actionable diagnostic.
     fn load() -> Option<Arc<CuptiApi>> {
-        let lib = cupti_library()?;
+        Self::require().ok()
+    }
 
-        // SAFETY: each symbol is resolved with the exact C signature declared in
-        // cupti_activity.h; we copy out the plain function pointer (`*sym`). The
-        // pointers stay valid because `lib` is never unloaded.
-        unsafe {
-            let activity_enable = *lib.get::<FnActivityEnable>(b"cuptiActivityEnable\0").ok()?;
-            let activity_disable =
-                *lib.get::<FnActivityDisable>(b"cuptiActivityDisable\0").ok()?;
-            let activity_register_callbacks = *lib
-                .get::<FnActivityRegisterCallbacks>(b"cuptiActivityRegisterCallbacks\0")
-                .ok()?;
-            let activity_flush_all =
-                *lib.get::<FnActivityFlushAll>(b"cuptiActivityFlushAll\0").ok()?;
-            let activity_get_next_record = *lib
-                .get::<FnActivityGetNextRecord>(b"cuptiActivityGetNextRecord\0")
-                .ok()?;
-            let get_timestamp = *lib.get::<FnGetTimestamp>(b"cuptiGetTimestamp\0").ok()?;
+    /// Resolve every CUPTI symbol, returning an actionable [`TracerError`]
+    /// (RULES.md #1) when the library cannot be loaded or a required symbol is
+    /// missing. Use this on the explicit "start GPU tracing" path so the user
+    /// gets a what/why/how-to-fix message instead of a silent no-op.
+    fn require() -> Result<Arc<CuptiApi>> {
+        let lib = cupti_library().map_err(|error| TracerError::CuptiUnavailable {
+            attempted: error.attempted.clone(),
+            cause: error.cause.clone(),
+        })?;
 
-            Some(Arc::new(CuptiApi {
-                activity_enable,
-                activity_disable,
-                activity_register_callbacks,
-                activity_flush_all,
-                activity_get_next_record,
-                get_timestamp,
-            }))
+        // Resolve a single symbol, mapping a missing/unusable entry point into
+        // an actionable error that names it (usually a libcupti too old for the
+        // requested CUPTI Activity API).
+        macro_rules! symbol {
+            ($ty:ty, $name:literal) => {{
+                let name = $name;
+                // SAFETY: each symbol is resolved with the exact C signature
+                // declared in cupti_activity.h; we copy out the plain function
+                // pointer (`*sym`). The pointers stay valid because `lib` is
+                // never unloaded.
+                *unsafe { lib.get::<$ty>(name) }.map_err(|error| {
+                    let symbol = String::from_utf8_lossy(&name[..name.len() - 1]);
+                    TracerError::CuptiUnavailable {
+                        attempted: Vec::new(),
+                        cause: format!(
+                            "libcupti was found and loaded, but the required CUPTI \
+                             Activity API symbol `{symbol}` is missing or unusable \
+                             ({error}) — the installed libcupti is likely too old for \
+                             CUDA 13",
+                        ),
+                    }
+                })?
+            }};
         }
+
+        let activity_enable = symbol!(FnActivityEnable, b"cuptiActivityEnable\0");
+        let activity_disable = symbol!(FnActivityDisable, b"cuptiActivityDisable\0");
+        let activity_register_callbacks =
+            symbol!(FnActivityRegisterCallbacks, b"cuptiActivityRegisterCallbacks\0");
+        let activity_flush_all = symbol!(FnActivityFlushAll, b"cuptiActivityFlushAll\0");
+        let activity_get_next_record =
+            symbol!(FnActivityGetNextRecord, b"cuptiActivityGetNextRecord\0");
+        let get_timestamp = symbol!(FnGetTimestamp, b"cuptiGetTimestamp\0");
+
+        Ok(Arc::new(CuptiApi {
+            activity_enable,
+            activity_disable,
+            activity_register_callbacks,
+            activity_flush_all,
+            activity_get_next_record,
+            get_timestamp,
+        }))
+    }
+}
+
+/// Build the actionable "CUPTI was explicitly requested but is unavailable"
+/// error (RULES.md #1). Reuses [`CuptiApi::require`]'s captured detail (attempted
+/// paths + loader/symbol cause) so the message is debuggable.
+fn cupti_unavailable_error() -> TracerError {
+    match CuptiApi::require() {
+        // A profiler with `available == false` implies loading failed, so this
+        // arm is only reached on a genuine race where CUPTI just became usable.
+        Ok(_) => TracerError::CuptiUnavailable {
+            attempted: Vec::new(),
+            cause: "CUPTI became available after the profiler reported it absent".to_string(),
+        },
+        Err(error) => error,
     }
 }
 
@@ -625,6 +731,30 @@ impl CuptiProfiler {
         })
     }
 
+    /// Initialize a profiler for an **explicit** GPU-tracing request, returning
+    /// an actionable [`TracerError::CuptiUnavailable`] (RULES.md #1) when CUPTI
+    /// cannot be loaded.
+    ///
+    /// Use this — not [`new`](CuptiProfiler::new) — when the user has explicitly
+    /// asked for CUPTI/GPU tracing and a silent "unavailable" would be wrong.
+    /// [`new`](CuptiProfiler::new) remains the graceful availability probe for
+    /// capability detection and factory auto-selection.
+    ///
+    /// # Errors
+    ///
+    /// [`TracerError::CuptiUnavailable`] if `libcupti` is missing, unusable, or
+    /// too old — the message names the attempted paths, the underlying cause,
+    /// and the `pip install nvidia-cuda-cupti-cu13` fix.
+    pub fn require() -> Result<Self> {
+        let api = CuptiApi::require()?;
+        Ok(Self {
+            available: true,
+            api: Some(api),
+            shared: SharedState::new(),
+            tracing: Mutex::new(false),
+        })
+    }
+
     /// Whether CUPTI was successfully dlopen'd and all required symbols
     /// resolved.
     #[must_use]
@@ -635,14 +765,19 @@ impl CuptiProfiler {
     /// Start Activity-API tracing (the low-overhead mode, §49.6).
     ///
     /// Enables the kernel/memcpy/memset activity kinds and registers the buffer
-    /// callbacks. A no-op when CUPTI is unavailable.
+    /// callbacks. This is an **explicit tracing request**: if CUPTI is
+    /// unavailable it returns an actionable [`TracerError::CuptiUnavailable`]
+    /// (RULES.md #1) rather than silently succeeding, so the caller learns what
+    /// to install. Availability probing that must degrade quietly should check
+    /// [`available`](CuptiProfiler::available) first.
     ///
     /// # Errors
     ///
+    /// [`TracerError::CuptiUnavailable`] if CUPTI could not be loaded, or
     /// [`TracerError::Cupti`] if a CUPTI call reports a non-success status.
     pub fn start_activity_tracing(&self) -> Result<()> {
         let Some(api) = self.api.as_ref() else {
-            return Ok(());
+            return Err(cupti_unavailable_error());
         };
 
         {
@@ -823,12 +958,18 @@ pub struct CuptiCollector {
 }
 
 impl CuptiCollector {
-    /// Create a collector and, if CUPTI is available, start Activity-API
-    /// tracing. When CUPTI is unavailable the collector is inert (every method
-    /// is a no-op), so it is always safe to construct.
+    /// Create a collector and start Activity-API tracing.
+    ///
+    /// This is an **explicit** GPU-tracing request: when CUPTI is unavailable it
+    /// returns an actionable [`TracerError::CuptiUnavailable`] (RULES.md #1)
+    /// naming the `pip install nvidia-cuda-cupti-cu13` fix. Callers that want the
+    /// graceful "skip if absent" behavior (auto-selection) should go through
+    /// [`CuptiFactory::try_create`], which returns `Ok(None)` when CUPTI is
+    /// missing.
     ///
     /// # Errors
     ///
+    /// [`TracerError::CuptiUnavailable`] if CUPTI is not present/usable, or
     /// [`TracerError::Cupti`] if CUPTI is present but tracing could not be
     /// started.
     pub fn new() -> Result<Self> {
@@ -992,41 +1133,121 @@ mod tests {
     }
 
     #[test]
-    fn factory_unavailable_returns_none_gracefully() {
-        // On a box without CUPTI this must be Ok(None), never an error.
-        let result = CuptiFactory.try_create().expect("try_create never errors on absence");
+    fn collector_construction_is_graceful_or_actionable() {
+        // The factory is the graceful auto-selection path: absent CUPTI must be
+        // Ok(None), present CUPTI Ok(Some).
+        let factory = CuptiFactory.try_create().expect("factory never errors on absence");
         let profiler = CuptiProfiler::new().unwrap();
         if profiler.available() {
-            assert!(result.is_some(), "collector expected when CUPTI is present");
+            assert!(factory.is_some(), "collector expected when CUPTI is present");
+            // Explicit construction succeeds and emit/flush do not panic.
+            let collector = CuptiCollector::new().expect("collector construction with CUPTI");
+            let event = TraceEvent {
+                name: "MatMul_0".to_string(),
+                cat: "compute".to_string(),
+                ph: TracePhase::Begin,
+                ts: 0,
+                dur: None,
+                pid: 1,
+                tid: 1,
+                scope: None,
+                args: Some(json!({ "node_id": 7, "correlation_id": 42 })),
+            };
+            collector.emit(&event);
+            collector.flush().expect("flush is graceful");
         } else {
-            assert!(result.is_none(), "graceful skip expected when CUPTI is absent");
+            assert!(factory.is_none(), "graceful skip expected when CUPTI is absent");
+            // But the explicit collector path surfaces the actionable error.
+            let err = CuptiCollector::new().err().expect("explicit request must error when absent");
+            assert!(err.to_string().contains("nvidia-cuda-cupti-cu13"), "actionable: {err}");
         }
     }
 
     #[test]
-    fn collector_is_inert_without_cupti() {
-        let collector = CuptiCollector::new().expect("collector construction is graceful");
-        // Emitting a compute Begin with correlation ids must not panic.
-        let event = TraceEvent {
-            name: "MatMul_0".to_string(),
-            cat: "compute".to_string(),
-            ph: TracePhase::Begin,
-            ts: 0,
-            dur: None,
-            pid: 1,
-            tid: 1,
-            scope: None,
-            args: Some(json!({ "node_id": 7, "correlation_id": 42 })),
-        };
-        collector.emit(&event);
-        collector.flush().expect("flush is graceful");
-        if !collector.available() {
-            assert!(collector.gpu_records().is_empty());
+    fn explicit_request_errors_actionably_when_unavailable() {
+        // On a host without a usable CUPTI, the explicit "start GPU trace" paths
+        // must return a what/why/how-to-fix diagnostic (RULES.md #1), never a
+        // silent success or a bare `None`.
+        let profiler = CuptiProfiler::new().unwrap();
+        if profiler.available() {
+            // A real CUPTI is present (GPU host); nothing to assert here.
+            return;
         }
+
+        for err in [
+            profiler.start_activity_tracing().err().expect("start must error when absent"),
+            CuptiProfiler::require().err().expect("require must error when absent"),
+            cupti_unavailable_error(),
+        ] {
+            let msg = err.to_string();
+            // WHAT: names CUPTI / GPU tracing as the thing that failed.
+            assert!(
+                msg.contains("CUPTI") && msg.to_lowercase().contains("gpu"),
+                "WHAT missing: {msg}"
+            );
+            // WHY: GPU tracing needs the CUDA-13 CUPTI runtime.
+            assert!(msg.contains("CUDA-13") || msg.contains("CUDA 13"), "WHY missing: {msg}");
+            // HOW: the concrete pip fix, version-matched.
+            assert!(msg.contains("pip install nvidia-cuda-cupti-cu13"), "HOW missing: {msg}");
+            // The variant carries structured, debuggable context.
+            assert!(matches!(err, TracerError::CuptiUnavailable { .. }));
+        }
+    }
+
+    #[test]
+    fn availability_probe_degrades_quietly() {
+        // The probe path (new / available / factory) must NEVER error, so a
+        // CPU/normal run that only asks "is CUPTI here?" is unaffected.
+        let profiler = CuptiProfiler::new().expect("new is a graceful probe");
+        assert_eq!(profiler.available(), profiler.api.is_some());
+        let _ = CuptiFactory.try_create().expect("factory auto-selection never errors");
+    }
+
+    #[test]
+    fn injected_site_packages_are_probed_with_pip_layout() {
+        // Fix #2: a pip-style env where VIRTUAL_ENV/PYTHONPATH are irrelevant —
+        // discovery must still find libcupti under an injected site-packages
+        // root using the standard `nvidia/cuda_cupti/lib` layout.
+        let base = std::env::temp_dir().join(format!(
+            "nxrt-cupti-discovery-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let lib_dir = base.join("nvidia/cuda_cupti/lib");
+        std::fs::create_dir_all(&lib_dir).expect("create dummy site-packages layout");
+        let dummy = lib_dir.join("libcupti.so.13");
+        std::fs::write(&dummy, b"not a real library").expect("write dummy libcupti");
+
+        let candidates = collect_libcupti_candidates(std::slice::from_ref(&base));
+
+        assert!(
+            candidates.contains(&dummy),
+            "injected site-packages libcupti not discovered: {candidates:?}"
+        );
+        assert!(dummy.exists(), "dummy libcupti should exist on disk for the probe");
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn set_search_paths_injects_into_discovery() {
+        // The runtime-agnostic seam the Python binding uses: injected paths feed
+        // the OnceLock-backed discovery. Only one test sets the global.
+        let base = std::env::temp_dir().join(format!("nxrt-cupti-inject-{}", std::process::id()));
+        set_search_paths(vec![base.clone()]);
+        let expected = base.join("nvidia/cuda_cupti/lib/libcupti.so.13");
+        assert!(
+            libcupti_candidates().contains(&expected),
+            "set_search_paths did not reach the discovery list",
+        );
     }
 
     #[test]
     fn emit_registers_correlation_when_ids_present() {
+        // Requires a live CUPTI (explicit construction now errors otherwise).
+        if !CuptiProfiler::new().unwrap().available() {
+            return;
+        }
         let collector = CuptiCollector::new().unwrap();
         let event = TraceEvent {
             name: "Gemm_3".to_string(),

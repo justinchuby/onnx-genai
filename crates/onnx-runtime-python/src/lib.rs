@@ -541,9 +541,61 @@ fn cupti_available() -> bool {
     onnx_runtime_tracer::cupti::CuptiProfiler::new().is_ok_and(|profiler| profiler.available())
 }
 
+/// Feed the CUPTI loader the interpreter's real search paths at import time.
+///
+/// The tracer dlopen's `libcupti` lazily and caches the discovery result, so we
+/// must inject before any tracing begins. We hand it the live `sys.path` (which
+/// reflects the real venv/user-site even when `VIRTUAL_ENV`/`PYTHONPATH` are
+/// unset and `/proc/self/exe` is the base interpreter) plus this extension's own
+/// directory and its parent, so pip-installed `nvidia-cuda-cupti-cu13` sitting
+/// beside nxrt is found with zero setup. The tracer probes each root for the
+/// pip layout `<root>/nvidia/cuda_cupti/lib/libcupti.so*`.
+///
+/// Best-effort: any lookup failure is ignored (env hints remain as fallback).
+#[cfg(feature = "cuda")]
+fn inject_cupti_search_paths(m: &Bound<'_, PyModule>) {
+    use std::path::PathBuf;
+
+    let mut paths: Vec<PathBuf> = Vec::new();
+
+    // The loaded extension module's own directory (…/site-packages/nxrt/…) and
+    // its parent (the site-packages root where `nvidia/` is a sibling).
+    if let Ok(file) = m.getattr("__file__")
+        && let Ok(file) = file.extract::<String>()
+    {
+        let path = PathBuf::from(file);
+        if let Some(dir) = path.parent() {
+            paths.push(dir.to_path_buf());
+            if let Some(parent) = dir.parent() {
+                paths.push(parent.to_path_buf());
+            }
+        }
+    }
+
+    if let Ok(sys) = m.py().import("sys")
+        && let Ok(sys_path) = sys.getattr("path")
+        && let Ok(iter) = sys_path.try_iter()
+    {
+        for entry in iter.flatten() {
+            if let Ok(entry) = entry.extract::<String>()
+                && !entry.is_empty()
+            {
+                paths.push(PathBuf::from(entry));
+            }
+        }
+    }
+
+    onnx_runtime_tracer::cupti::set_search_paths(paths);
+}
+
 /// The `nxrt` Python module.
 #[pymodule]
 fn nxrt(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    // Inject the interpreter's real library search paths before anything can
+    // trigger CUPTI discovery (its OnceLock caches on first use).
+    #[cfg(feature = "cuda")]
+    inject_cupti_search_paths(m);
+
     m.add("__version__", VERSION)?;
     let doc = "nxrt — Python binding for the nxrt ONNX runtime (onnxruntime-compatible InferenceSession).";
     m.add("__doc__", PyString::new(m.py(), doc))?;
