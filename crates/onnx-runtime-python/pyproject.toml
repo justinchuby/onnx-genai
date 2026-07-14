@@ -29,9 +29,16 @@ dynamic = ["version"]
 [project.optional-dependencies]
 # bfloat16 numpy interop (nxrt only needs this to *return* bf16 outputs).
 bfloat16 = ["ml_dtypes"]
-# Runtime CUPTI library for CUDA wheels. Kept as an extra because CPU-only
-# wheels must not install NVIDIA packages.
-cuda = ["nvidia-cuda-cupti-cu13"]
+# Runtime NVIDIA libraries for CUDA wheels, so `nxrt[cuda]` needs no CUDA toolkit.
+# This opt-in extra keeps CPU/macOS wheels from pulling NVIDIA packages; the CUDA
+# driver (`libcuda.so.1`) remains a host prerequisite. These wheels target Linux/Windows.
+# Add nvidia-cudnn-cu13 and nvidia-curand when the cuDNN backend lands.
+cuda = [
+    "nvidia-cuda-runtime>=13",
+    "nvidia-cublas>=13", # provides libcublas + libcublasLt (cuBLASLt MatMul)
+    "nvidia-cuda-nvrtc>=13", # runtime NVRTC compilation of fused/pointwise kernels
+    "nvidia-cuda-cupti>=13", # GPU kernel tracing (tracer cupti feature)
+]
 
 [project.urls]
 repository = "https://github.com/justinchuby/onnx-genai"

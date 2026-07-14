@@ -159,50 +159,45 @@ Goal: `pip install nxrt[cuda]` (or a `nxrt-cuda` wheel) gives a working CUDA EP
 with **no manual CUDA toolkit install** — exactly like `pip install torch`,
 which pulls `nvidia-*` wheels and dlopens them from `site-packages`.
 
-### 4.1 Python deps — the `nvidia-*-cu13` wheel set
+### 4.1 Python deps — CUDA 13 runtime wheels
 
 Declare the NVIDIA-published redistributable wheels under the `cuda` extra
-(match the `cudarc` `cuda-13000` pin → `cu13`, cuDNN v9). These are exactly the
-wheels torch depends on:
+(matching the `cudarc` `cuda-13000` pin). The CUDA EP currently dlopens only
+the following runtime libraries:
 
 | Runtime lib (Linux soname) | PyPI wheel | Why we need it |
 |----------------------------|-----------|----------------|
-| `libcudart.so.13` | `nvidia-cuda-runtime-cu13` | CUDA runtime (cudarc `runtime`). |
-| `libcublas.so.13`, `libcublasLt.so.13` | `nvidia-cublas-cu13` | GEMM (landed). |
-| `libcudnn*.so.9` | `nvidia-cudnn-cu13` | softmax/reduce/conv/pool/act/norm (new). |
-| `libcurand.so.10` | `nvidia-curand-cu13` | RNG (Dropout/RandomNormal, future). |
-| `libnvrtc.so.13` | `nvidia-cuda-nvrtc-cu13` | runtime kernel compile (elementwise/norm/cast). |
-| `libcupti.so.13` | `nvidia-cuda-cupti-cu13` | GPU tracing (already declared). |
-| (CCCL headers) | `nvidia-cuda-cccl-cu13` | *only if* we NVRTC-compile cub templates (stretch). |
+| `libcudart.so.13` | `nvidia-cuda-runtime>=13` | CUDA runtime (cudarc `runtime`). |
+| `libcublas.so.13`, `libcublasLt.so.13` | `nvidia-cublas>=13` | GEMM (landed). |
+| `libnvrtc.so.13` | `nvidia-cuda-nvrtc>=13` | runtime kernel compile (elementwise/norm/cast). |
+| `libcupti.so.13` | `nvidia-cuda-cupti>=13` | GPU tracing (tracer `cupti` feature). |
 | **`libcuda.so.1` (driver)** | **NOT on PyPI** | comes from the user's NVIDIA driver — the one documented prerequisite, same as torch. |
 
-**pyproject change (describe for a follow-up agent — keep additive/minimal):**
-extend the existing `cuda` extra. Current:
+The planned cuDNN backend will additionally need `nvidia-cudnn-cu13` for
+`libcudnn*.so.9` and `nvidia-curand` for `libcurand.so.10`; do not add either
+until that backend lands. `nvidia-cuda-cccl` is only needed if we NVRTC-compile
+cub templates (stretch).
 
-```toml
-cuda = ["nvidia-cuda-cupti-cu13"]
-```
-
-Target:
+The `cuda` extra is:
 
 ```toml
 cuda = [
-    "nvidia-cuda-runtime-cu13",
-    "nvidia-cublas-cu13",
-    "nvidia-cudnn-cu13",
-    "nvidia-curand-cu13",
-    "nvidia-cuda-nvrtc-cu13",
-    "nvidia-cuda-cupti-cu13",
+    "nvidia-cuda-runtime>=13",
+    "nvidia-cublas>=13",
+    "nvidia-cuda-nvrtc>=13",
+    "nvidia-cuda-cupti>=13",
 ]
 ```
 
-**Version pinning approach:** pin to the `cu13` major line and floor each wheel
-to the minimum version whose soname major matches what cudarc dlopens
-(`>=x,<y+1` compatible-release style, e.g. `nvidia-cudnn-cu13>=9,<10`). Do **not**
+**Warning:** the `-cu13`-suffixed variants are deprecated source-only
+placeholders and must not be used, except for `nvidia-cudnn-cu13`. Do **not**
 hard-pin exact patch versions — that fights pip resolution when a user also has
-torch installed (torch pins its own `nvidia-*`; overlapping compatible ranges
-let one shared copy satisfy both). Verify the actually-dlopen'd sonames at
-build/audit time so the list matches reality (don't over/under-declare).
+torch installed. Verify the actually-dlopen'd sonames at build/audit time so the
+list matches reality (don't over/under-declare).
+
+The verified wheels have Linux x86_64 and Windows x86_64 wheels. macOS has no
+CUDA; because this is an opt-in extra, plain `pip install nxrt` leaves CPU and
+macOS users unaffected.
 
 ### 4.2 Runtime discovery — generalize Leon's CUPTI resolver into a shared nvidia-lib resolver
 
@@ -306,9 +301,9 @@ once at module init (before any dlopen, since discovery caches in a `OnceLock`).
    `collect_libcupti_candidates` into a shared resolver (system → pip
    site-packages → conda; per-component subdir map; cross-platform soname
    table; actionable missing-lib errors). Extend the PyO3 injector to feed it.
-3. **`pyproject-cuda-extra-nvidia-wheels`** — expand the `cuda` extra to the full
-   `nvidia-*-cu13` set (§4.1) with compatible-release pins; audit dlopen'd
-   sonames match.
+3. **`pyproject-cuda-extra-nvidia-wheels`** — keep the `cuda` extra aligned
+   with the runtime libraries currently dlopen'd (§4.1); add cuDNN/curand only
+   when that backend lands, and audit dlopen'd sonames match.
 4. **`softmax-to-cudnn`** — move standalone `Softmax` to `cudnnSoftmaxForward`;
    keep NVRTC softmax only inside attention.
 5. **`reduce-to-cudnn`** — move `ReduceSum`/`ReduceMean` to `cudnnReduceTensor`;
@@ -340,5 +335,5 @@ where-not-fused, attention) and reserve NVRTC for the two cases where it's
 strictly better: ops with no library (elementwise/pointwise/cast — the same
 choice PyTorch's nvFuser makes) and measurable fusions (fused norms, RoPE, GEMM
 epilogues, flash attention). Zero-setup is achieved the PyTorch way: depend on
-the `nvidia-*-cu13` PyPI wheels and dlopen them from `site-packages`/Conda via a
-generalized version of Leon's CUPTI resolver.
+the NVIDIA CUDA 13 PyPI runtime wheels and dlopen them from
+`site-packages`/Conda via a generalized version of Leon's CUPTI resolver.
