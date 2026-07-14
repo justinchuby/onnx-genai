@@ -1,0 +1,12 @@
+[package]
+name = "onnx-runtime-ir"
+description = "Graph IR for the ORT 2.0 runtime: types, symbolic shapes, strided layouts, device placement, and a mutable graph model"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords = ["onnx", "ir", "graph", "inference", "runtime"]
+categories = ["science", "data-structures"]
+
+[dependencies]
+thiserror = { workspace = true }
