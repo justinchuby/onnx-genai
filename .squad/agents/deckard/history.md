@@ -101,3 +101,10 @@ Verdict: 🟢 **SHIP**.
 ## 2026-07-14T07:20:00Z — ORT2 shape-inference fix (deckard-10)
 
 - **deckard-10:** Fix owner for `onnx-runtime-shape-inference` after dual 🔴 reject (Chew: FusedMatMul; Holden: DimExpr overflow). Roy locked out. Applied two blocking fixes: (1) dedicated `fused_matmul` handler matching ORT contrib_defs.cc line-for-line; (2) all DimExpr combiners use `checked_*` with `overflow()` sentinel / degrade-to-fresh-symbol contract. Also applied all advisories (broadcast_dim fresh-symbol, saturating_add, Concat/Cast dtype, GatherElements doc, Reduce opset-18 axes). Commit `09988f3`. 69 tests green debug+release. Both re-reviews 🟢. Crate merged to main: **4d24634** + **f9b5caa**. Deckard now locked out of shape-inference artifact.
+
+## 2026-07-14T08:40:00Z — ORT2 IR dtype hardening (deckard-11, merged 909f0a0)
+
+- **deckard-11:** Fixed two wrong `DataType` discriminants: `Float8E5M2: 18→19`; `Uint4: 23→21`. Added `Float8E4M3FNUZ=18`, `Float8E5M2FNUZ=20`, `Float4E2M1=23` (sub-byte, `bit_size=4`, `is_float=true`, `byte_size=0`, `checked_storage_bytes=count.div_ceil(2)`). Updated all classifiers and `from_onnx`/`to_onnx`. Hardened unmodeled list/sparse attrs from silent `Ok(None)` to `Err(LoaderError::GraphBuild(...))`. Documented unknown-rank Shape gap in `shape.rs` (deferred — frozen IR). 243 tests green debug+release; clippy clean. `bert_toy` conformance unaffected.
+- **Why critical:** Silent `Float4E2M1(23)→Uint4` corrupt-decode and `Uint4(21)→None` load failure are real hazards for the Gemma quantized-model path.
+- **Reviews:** Chew (chew-18) 🟢 APPROVE; Holden (holden-11) 🟡 APPROVE-WITH-FOLLOW-UP. Merged to main: **909f0a0**.
+- **Deckard locked out** of IR dtype artifact; follow-up `.unwrap_or(Float32)` fix at value-info/attr-tensor sites owned by Roy/Batty/Leon (Leon in flight, not yet landed).

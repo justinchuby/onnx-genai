@@ -54,3 +54,10 @@ Roy's workspace review is now in decisions: crate split is sound, but engine.rs 
 - **roy-12:** Updated docs/ORT2.md §15 (CUDA EP Kernel Strategy — cudarc + cuBLASLt + CuTe + cuDNN/FA3 stack; cuTile deferred Phase 3). Doc-only commit `edd2b3a`, merged to main.
 - **roy-13:** Authored `crates/onnx-runtime-shape-inference` on `squad/ort2-shape-inference`. Extensible per-op registry, DimExpr symbolic polynomial, shape-DATA propagation, 40+ handlers, bert_toy fully resolves. 56 tests green. Sent to review. Chew (🔴 FusedMatMul) + Holden (🔴 DimExpr overflow) rejected; Gaff (🟢 registry/driver/API) approved. Roy locked out per reviewer-protocol — Deckard assigned fix. Post-fix re-reviews both 🟢. Merged to main: **4d24634** (feat) + **f9b5caa** (fix).
 - Roy is currently in flight wiring shape-inference into loader/session — not yet landed.
+
+## 2026-07-14T08:40:00Z — ORT2 shape-inference wiring (roy-14, merged 98a3310)
+
+- **roy-14:** Wired `onnx-runtime-shape-inference` into the loader. Loader now owns static shape inference: `build_from_bytes_with_weights` runs `registry.infer_graph(MergePolicy::Permissive)` after graph build. Deleted `const-fold-lite` `shape_inference.rs` (~1.1k LOC, `KnownVal`/`ConstEnv` pass) — no shim, pre-release. Session JIT (`dynamic_output_shapes`) retained as fallback for data-dependent extents.
+- **broadcast_dim fix:** Changed `context.rs` `broadcast_dim` to keep the smaller `SymbolId` representative (not mint fresh) when two symbolic dims meet at a broadcast axis. Fixes Expand-contamination regression (`bert_toy` UnresolvedShape for value `"106"`). Matches ORT symbolic inference ("keep representative"). Added `add_two_distinct_symbols_keeps_named_representative` test.
+- **Verification:** `bert_toy` conformance max_abs 1.192e-7 (unchanged). Full ORT2 suite green debug+release.
+- **Reviews:** Chew (chew-17) 🟢; Holden (holden-10) 🟢. Merged to main: **98a3310**.

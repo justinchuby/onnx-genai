@@ -871,3 +871,49 @@ correctness is unaffected. Not chased further here (would risk the pass bar).
 **Why:** Required re-review after 🔴 reject; confirms no wrap, no debug panic, no bogus alias on new overflow path.
 
 ---
+
+---
+
+### 2026-07-14: ORT2 shape-inference wiring — loader owns static inference; const-fold-lite retired (Roy, roy-14)
+**By:** Roy (ORT2 architect) — merged `98a3310`
+**What:** Wired `onnx-runtime-shape-inference` into the loader. `build_from_bytes_with_weights` now calls `registry.infer_graph(...)` with `MergePolicy::Permissive` after graph build. Loader gained `LoaderError::ShapeInference(#[from] ...)`. Deleted `crates/onnx-runtime-loader/src/shape_inference.rs` (~1.1k LOC `const-fold-lite` `KnownVal`/`ConstEnv` pass) — no back-compat shim (pre-release). Session JIT (`dynamic_output_shapes`) retained as fallback for genuinely data-dependent extents. Fixed `broadcast_dim` in `context.rs` to keep the smaller `SymbolId` representative (not mint fresh) when two symbolic dims meet at a broadcast axis — fixes Expand-contamination regression where data-dependent `from_slice_01` symbols contaminated downstream values. Added `add_two_distinct_symbols_keeps_named_representative` test. `bert_toy` conformance: max_abs 1.192e-7 (unchanged).
+**Why:** Loader now owns static shape inference as the architectural seam. const-fold-lite was strictly subsumed by the general crate.
+
+---
+
+### 2026-07-14: ORT2 shape-inference wiring — correctness/conformance review 🟢 (Chew, chew-17)
+**By:** Chew (ORT2 correctness reviewer) — reviewed `f4141b9`
+**Verdict:** 🟢 GREEN — SHIP
+**What:** Broadcast-semantics change conformance-safe (smaller-id always prefers pre-existing session-bindable graph symbol due to `ANON_SYMBOL_FLOOR=0x8000_0000` invariant). const-fold-lite deletion safe (no persistent `env`; optimizer has independent pass). Declared-shape merge preserved. `bert_toy` conformance unchanged (1.192e-7). All op rules pass (52 tests). Advisories: A1 — `broadcast_dim` comment framing slightly misleading ("named" should be "lower-id graph"); A2 — `merge_shapes` both-symbolic keeps inferred over declared (pre-existing, harmless).
+**Why:** Required review; confirms no conformance regression.
+
+---
+
+### 2026-07-14: ORT2 shape-inference wiring — soundness review 🟢 (Holden, holden-10)
+**By:** Holden (ORT2 soundness reviewer) — reviewed `f4141b9`
+**Verdict:** 🟢 GREEN
+**What:** Symbol-unification sound (overflow sentinel blocks `as_symbol()`, so `broadcast_dim` representative arm unreachable for overflow exprs; deterministic/order-independent; single topo-pass so no convergence issue). Loader seam transactional (graph mutated only after full write-back; on error graph dropped, never half-mutated). JIT fallback byte-for-byte unchanged (only comment diff in executor.rs). No regressions to `view_in_bounds`/`checked_storage_bytes`/unsafe. Full ORT2 suite green debug+release (0 failures). Advisory: fail-fast coupling — a false-positive op-rule error under Permissive now blocks the load; Chew's op-formula pass should confirm none fire on BERT/opset-12.
+**Why:** Required review; confirms soundness.
+
+---
+
+### 2026-07-14: ORT2 IR dtype hardening — ONNX numbering fix + float8/float4 + unknown handling (Deckard, deckard-11)
+**By:** Deckard — merged `909f0a0`
+**What:** Fixed two wrong `DataType` discriminants in `crates/onnx-runtime-ir/src/dtype.rs`: `Float8E5M2: 18→19`; `Uint4: 23→21`. Added `Float8E4M3FNUZ=18`, `Float8E5M2FNUZ=20`, `Float4E2M1=23` (sub-byte, `bit_size=4`, `is_float=true`, `checked_storage_bytes=count.div_ceil(2)`). All classifiers (`is_float`, `is_int`, `is_sub_byte`, `byte_size`, `bit_size`) and `from_onnx`/`to_onnx` updated. Loader attribute decode: hardened `TENSORS|SPARSE_TENSOR|SPARSE_TENSORS|TYPE_PROTOS` from silent `Ok(None)` to `Err(LoaderError::GraphBuild(...))`. Unknown-rank `Shape` gap documented (fixing requires `Value::shape: Option<Shape>` across frozen IR — deferred). Full ORT2 suite 243 tests green debug+release.
+**Why:** Silent `Float4E2M1(23)→Uint4` corrupt-decode and `Uint4(21)→None` load failure are critical bugs for the Gemma quantized-model path.
+
+---
+
+### 2026-07-14: ORT2 IR dtype hardening — numbering correctness review 🟢 (Chew, chew-18)
+**By:** Chew (ORT2 correctness reviewer) — reviewed `f965f0b`
+**Verdict:** 🟢 APPROVE
+**What:** Every discriminant independently verified against ONNX `TensorProto.DataType` spec (all 21 variants, rows 1–23 excl. COMPLEX). `to_onnx = self as i32` from `#[repr(u8)]` confirmed correct. `is_float` includes Float4E2M1 and all float8s; `is_int` excludes them. `byte_size=0`/`bit_size=4`/`checked_storage_bytes=div_ceil(2)` for Float4E2M1 correct. Round-trip and unknown-value tests comprehensive. Advisory: vendored `onnx.proto3` stops at INT4=22 — `FLOAT4E2M1=23` not in-repo; verified against upstream onnx/onnx instead (onnx#4728). Recommended follow-up: bump vendored proto. Owner: Roy/Batty/Leon (Deckard locked out).
+**Why:** Required review; confirms numbering correct.
+
+---
+
+### 2026-07-14: ORT2 IR dtype hardening — soundness review 🟡 (Holden, holden-11)
+**By:** Holden (ORT2 soundness reviewer) — reviewed `f965f0b`
+**Verdict:** 🟡 APPROVE-WITH-FOLLOW-UP
+**What:** Sub-byte Float4E2M1 routes through `div_ceil(2)` path (never unchecked multiply). Float8-FNUZ normal 1-byte path. `#![forbid(unsafe_code)]` intact. No new unsafe/unwrap/panic. Fail-closed attr hardening safe (GRAPH/GRAPHS/TENSOR/TypeProto still handled). Residual gap: `value-info` and `attribute-tensor` decode sites (`graph_builder.rs:232,241,357,365,374`) still use `.unwrap_or(Float32)` — silent mislabel for COMPLEX64/future dtypes. Deckard's PROGRESS.md claim "loader surfaces as LoaderError" is accurate only for initializer weights (weights.rs), not these sites. Required follow-up before complex/unmodeled-dtype milestone: make these sites return `Result`. Owner: Roy/Batty/Leon. ORT2 suite 300 tests green debug+release.
+**Why:** Required review; net soundness improvement with non-blocking residual gap.

@@ -58,3 +58,8 @@ Reviewed Leon's K4 real KV byte materialization (commit `786e268`, read-only, Le
 
 - **chew-15:** Reviewed `onnx-runtime-shape-inference` op-rule correctness. 🔴 REJECT — `com.microsoft::FusedMatMul` reused plain `matmul`, ignoring `transA`/`transB`/`transBatch`. Common `transB=1` case (`[8,64]·[32,64]ᵀ`) produced `[8,64]` instead of `[8,32]`. All other 40+ op handlers HELD correct. Three non-blocking advisories. Fix assigned to Deckard (Roy locked out).
 - **chew-16:** Re-reviewed Deckard's FusedMatMul fix (`09988f3`). 🟢 SHIP — handler verified line-for-line against ORT contrib_defs.cc. Cited case correct, 7 new tests pass, all advisories applied. 69/69 tests green. Roy and Deckard both locked out of this artifact.
+
+## 2026-07-14T08:40:00Z — ORT2 shape-inference wiring + IR dtype hardening reviews
+
+- **chew-17:** Reviewed Roy's shape-inference wiring (`f4141b9`). 🟢 GREEN. Broadcast change conformance-safe (ANON_SYMBOL_FLOOR invariant — smaller-id always prefers session-bindable graph symbol). const-fold-lite deletion safe. `bert_toy` 1.192e-7 unchanged. 52 op-rule tests pass. Two non-blocking advisories (doc phrasing; pre-existing merge_shapes both-symbolic arm).
+- **chew-18:** Reviewed Deckard's IR dtype hardening (`f965f0b`). 🟢 APPROVE. All 21 discriminants independently verified against ONNX spec. `to_onnx = self as i32` correct. All classifiers correct for new variants (Float8E4M3FNUZ, Float8E5M2FNUZ, Float4E2M1). Round-trip and unknown tests comprehensive. Advisory: vendored proto stale (stops at INT4=22, missing FLOAT4E2M1=23 — no runtime bug since from_onnx reads raw int). Recommended follow-up: bump vendored proto (owner: Roy/Batty/Leon).
