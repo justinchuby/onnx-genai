@@ -1007,5 +1007,95 @@ mod tests {
             other => panic!("expected LocalCpu, got {other:?}"),
         }
     }
+
+    /// K4 multi-layer coverage: store and fetch a payload with **3 layers,
+    /// 2 kv_heads, 3 tokens, 4 head_dim**, filled with a distinct
+    /// position-encoding pattern so that a layer swap, K/V slot swap, or any
+    /// [head, token, dim] transposition produces a detectable value mismatch.
+    ///
+    /// Layout contract under test (head-major, matches [`KvPayload`] doc):
+    ///   `key[l][(h*T + t)*D + d]  = 1000·l + 100·h + 10·t + d`  (positive)
+    ///   `val[l][(h*T + t)*D + d]  = -(1000·l + 100·h + 10·t + d)` (negative)
+    ///
+    /// The existing gold test exercises only a **1-layer** tiny-llm fixture, so a
+    /// transposition or layer-index bug in the connector would not be caught there.
+    #[tokio::test]
+    async fn multi_layer_store_fetch_preserves_exact_per_layer_kv_ordering() {
+        const NUM_LAYERS: usize = 3;
+        const NUM_KV_HEADS: usize = 2;
+        const NUM_TOKENS: usize = 3;
+        const HEAD_DIM: usize = 4;
+        let per = NUM_KV_HEADS * NUM_TOKENS * HEAD_DIM;
+
+        let original = KvPayload {
+            num_tokens: NUM_TOKENS,
+            num_layers: NUM_LAYERS,
+            num_kv_heads: NUM_KV_HEADS,
+            head_dim: HEAD_DIM,
+            dtype: KvPayloadDtype::F32,
+            layers: (0..NUM_LAYERS)
+                .map(|l| {
+                    let mut k = vec![0.0_f32; per];
+                    let mut v = vec![0.0_f32; per];
+                    for h in 0..NUM_KV_HEADS {
+                        for t in 0..NUM_TOKENS {
+                            for d in 0..HEAD_DIM {
+                                let idx = (h * NUM_TOKENS + t) * HEAD_DIM + d;
+                                let sig = (1000 * l + 100 * h + 10 * t + d) as f32;
+                                k[idx] = sig;
+                                v[idx] = -sig;
+                            }
+                        }
+                    }
+                    KvLayerPayload { key: k, value: v }
+                })
+                .collect(),
+        };
+        assert!(original.is_well_formed());
+
+        let cfg = LocalTieredConfig {
+            chunk_size: NUM_TOKENS,
+            page_size: NUM_TOKENS,
+            hot_capacity: 4,
+            max_cached_pages: 100,
+            compression: CompressionFormat::None,
+            disk_backend: None,
+            bytes_per_page: 1024,
+            cpu_load_ms_per_page: 1.0,
+        };
+        let conn = LocalTieredConnector::new(cfg).unwrap();
+        let k = KvCacheKey {
+            model_id: "test-model".to_string(),
+            layer_range: 0..NUM_LAYERS,
+            chunk_hash: 0xDEAD_BEEF,
+            chunk_index: 0,
+            num_tokens: NUM_TOKENS as u32,
+        };
+        conn.store(KvStoreEntry {
+            key: k.clone(),
+            kv_data: original.clone(),
+            priority: CachePriority::Session,
+            ttl: None,
+        })
+        .await
+        .unwrap();
+
+        let fetched = conn.fetch(&k, Device::Gpu(0)).await.unwrap();
+        assert_eq!(
+            fetched.payload.num_layers, NUM_LAYERS,
+            "layer count must survive the round-trip"
+        );
+        // Layer-by-layer, K-slot vs V-slot assertion: any swap is caught.
+        for l in 0..NUM_LAYERS {
+            assert_eq!(
+                fetched.payload.layers[l].key, original.layers[l].key,
+                "layer {l} key bytes differ after LocalTieredConnector round-trip"
+            );
+            assert_eq!(
+                fetched.payload.layers[l].value, original.layers[l].value,
+                "layer {l} value bytes differ after LocalTieredConnector round-trip"
+            );
+        }
+    }
 }
 

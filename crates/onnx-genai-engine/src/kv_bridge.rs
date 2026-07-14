@@ -1179,4 +1179,100 @@ mod tests {
     fn configured_dtype_int8_flows_into_page_tensor_config() -> anyhow::Result<()> {
         infer_kv_model_info_propagates_dtype_to_page_tensor_config(KvDType::Int8)
     }
+
+    /// K4 multi-layer coverage: directly exercise [`chunk_payload_from_exported`]
+    /// with **3 synthetic exported layers** (2 kv_heads, 4 head_dim, 8-token total
+    /// exported window, chunk covering positions 3-6) and verify that every
+    /// (layer, K/V slot, head, chunk-relative token, dim) cell is byte-identical
+    /// to the input after extraction.
+    ///
+    /// Choosing `chunk_start = 3` ensures `token_pos ≥ 3` on every step, which
+    /// prevents the benign batch-vs-sequence axis ambiguity in [`kv_tensor_axes`]
+    /// for `token_pos == 0` and exercises the full code path cleanly.
+    ///
+    /// Pattern:
+    ///   `key[l][h][t][d]  = 1000·l + 100·h + 10·t + d`  (absolute token `t`)
+    ///   `val[l][h][t][d]  = -(1000·l + 100·h + 10·t + d)`
+    ///
+    /// Any layer swap, K/V swap, or [head, token, dim] transposition produces a
+    /// value that differs from the expected → the mismatch is always detectable.
+    #[test]
+    fn chunk_payload_from_exported_multilayer_preserves_layer_head_token_dim_ordering() {
+        const NUM_LAYERS: usize = 3;
+        const NUM_KV_HEADS: usize = 2;
+        const TOTAL_SEQ: usize = 8;
+        const HEAD_DIM: usize = 4;
+        const CHUNK_START: usize = 3;
+        const NUM_TOKENS: usize = 4; // covers absolute positions 3,4,5,6
+
+        let config = PageTensorConfig {
+            num_layers: NUM_LAYERS,
+            num_kv_heads: NUM_KV_HEADS,
+            head_dim: HEAD_DIM,
+            page_size: NUM_TOKENS,
+            dtype: KvDType::F32,
+        };
+
+        // Shape [1, NUM_KV_HEADS, TOTAL_SEQ, HEAD_DIM] — standard past-KV form.
+        let shape = vec![1_i64, NUM_KV_HEADS as i64, TOTAL_SEQ as i64, HEAD_DIM as i64];
+        let exported: Vec<ExportedLayerKv> = (0..NUM_LAYERS)
+            .map(|l| {
+                // flat index: h*TOTAL_SEQ*HEAD_DIM + t*HEAD_DIM + d  (batch=0 → 0 offset)
+                let size = NUM_KV_HEADS * TOTAL_SEQ * HEAD_DIM;
+                let mut key = vec![0.0_f32; size];
+                let mut value = vec![0.0_f32; size];
+                for h in 0..NUM_KV_HEADS {
+                    for t in 0..TOTAL_SEQ {
+                        for d in 0..HEAD_DIM {
+                            let flat = h * TOTAL_SEQ * HEAD_DIM + t * HEAD_DIM + d;
+                            let sig = (1000 * l + 100 * h + 10 * t + d) as f32;
+                            key[flat] = sig;
+                            value[flat] = -sig;
+                        }
+                    }
+                }
+                ExportedLayerKv {
+                    key,
+                    key_shape: shape.clone(),
+                    value,
+                    value_shape: shape.clone(),
+                }
+            })
+            .collect();
+
+        let payload =
+            chunk_payload_from_exported(&exported, config, CHUNK_START, NUM_TOKENS).unwrap();
+
+        assert_eq!(payload.num_layers, NUM_LAYERS);
+        assert_eq!(payload.num_kv_heads, NUM_KV_HEADS);
+        assert_eq!(payload.num_tokens, NUM_TOKENS);
+        assert_eq!(payload.head_dim, HEAD_DIM);
+        assert!(payload.is_well_formed());
+
+        for l in 0..NUM_LAYERS {
+            for h in 0..NUM_KV_HEADS {
+                for t in 0..NUM_TOKENS {
+                    let abs_t = CHUNK_START + t; // absolute token index
+                    for d in 0..HEAD_DIM {
+                        let idx = (h * NUM_TOKENS + t) * HEAD_DIM + d;
+                        let expected = (1000 * l + 100 * h + 10 * abs_t + d) as f32;
+                        assert_eq!(
+                            payload.layers[l].key[idx],
+                            expected,
+                            "layer={l} head={h} token={t}(abs={abs_t}) dim={d}: key mismatch \
+                             (got {}, expected {expected})",
+                            payload.layers[l].key[idx]
+                        );
+                        assert_eq!(
+                            payload.layers[l].value[idx],
+                            -expected,
+                            "layer={l} head={h} token={t}(abs={abs_t}) dim={d}: value mismatch \
+                             (got {}, expected {expected})",
+                            payload.layers[l].value[idx]
+                        );
+                    }
+                }
+            }
+        }
+    }
 }
