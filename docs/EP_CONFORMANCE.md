@@ -99,12 +99,10 @@ remediation (for example, choose an EP that registers the op or implement the
 kernel). Improving `SessionError::UnsupportedOp` to carry and display that
 context is a follow-up exposed by this harness.
 
-## Scale-up plan
+## Next steps
 
-1. Add an nxrt runtime adapter to the suite's existing `RUN_CANDIDATE`/pytest
-   path, backed by this same process bridge, so its normal parametrization,
-   xfail/skip files, shrinking, and repeated Hypothesis examples produce the
-   full `ai.onnx` matrix.
+1. Add per-EP expected-failure profiles and CI around the Python adapter
+   described below, while retaining unfiltered runs as the coverage baseline.
 2. Stop stripping `Identity` once the CPU EP implements it; until then, keep the
    transformation narrowly limited to output-only wrappers.
 3. Add explicit profiles per EP: supported opsets, dtypes, shape constraints,
@@ -115,9 +113,102 @@ context is a follow-up exposed by this harness.
    missing suite generators upstream.
 5. Include contrib-domain fused registrations in a separate optimizer/fusion
    profile; they are not `ai.onnx` operators.
-6. Add `--ep cpu|cuda` after `InferenceSession` exposes explicit provider
-   selection. The current construction path hard-codes CPU auto-detection, so
-   selecting `onnx-runtime-ep-cuda` is not yet an honest runner option. On an
-   H200 CI worker, build the CUDA EP, select it through that API, reuse the same
-   model/tensor protocol and Python comparisons, and publish a separate
-   per-CUDA-EP report rather than silently falling back to CPU.
+6. Build a CUDA-enabled wheel on an H200 CI worker, select
+   `CUDAExecutionProvider` explicitly through the adapter, and publish a
+   separate CUDA report rather than silently falling back to CPU.
+
+## Upstream onnx-tests (cbourjau)
+
+This is a separate, broader result from the 28-case bespoke process runner
+above. The upstream repository's normal `tests/` tree was run directly with
+pytest through
+`crates/onnx-runtime-python/tests/nxrt_runtime.py::run_nxrt`. The adapter uses
+the Python binding, explicitly selects `CPUExecutionProvider`, and returns
+ordered NumPy outputs using the suite's runtime contract.
+
+### Run and headline
+
+Run on 2026-07-14 against upstream commit
+`856e89bcd3d2ee3cb31c7bf88b5706dec00eba5c`, using the suite's default 100
+Hypothesis examples:
+
+```bash
+export PATH=/home/justinchu/.conda/envs/onnx/bin:$PATH
+cd /path/outside/onnx-tests-upstream
+python -m pip install -e . \
+  "hypothesis>=6.130.4" "spox>=0.16" "ndonnx>=0.10.1" \
+  "pytest-xdist>=3.8,<4"
+PYTHONPATH=/path/to/onnx-genai/crates/onnx-runtime-python/tests \
+RUN_CANDIDATE=nxrt_runtime.run_nxrt \
+python -m pytest tests -q -n 8 --dist loadfile \
+  --junitxml=nxrt-junit.xml
+```
+
+| Measure | Pass | Fail | Skip | Total |
+|---|---:|---:|---:|---:|
+| dtype/opset pytest cases | 158 | 1,038 | 2 | 1,198 |
+| operator names with that overall status | 0 | 112 | 0 | 112 |
+
+An operator is counted as failed in the second row if any of its dtype/opset
+cases failed. Seventeen operators had at least one passing case: Add, Cast,
+Div, Expand, Identity, MatMul, Max, Min, Mul, Pow, Relu, Reshape, Softmax,
+Sqrt, Sub, Tanh, and Transpose. The two skips are the suite's undefined
+bool-to-string and string-to-bool Cast cases.
+
+### Failure coverage
+
+| Failure class | Cases | Operators |
+|---|---:|---|
+| No CPU kernel registered | 784 | 90 operators listed below |
+| Registered kernel is float32-only | 167 | Add, Div, Erf, Gather, MatMul, Max, Min, Mul, Pow, Relu, Reshape, Softmax, Sqrt, Sub, Tanh, Transpose |
+| Kernel execution gap | 35 | Cast (Float16/Uint64 conversions), Slice (negative-axis and empty-output handling) |
+| String tensor/binding gap | 29 | Cast, Expand, Gather, Identity, Reshape, Slice, Transpose |
+| Modern input signature unsupported | 20 | ReduceMean (axes input), Unsqueeze (axes input) |
+| Value mismatch | 2 | Erf near zero (absolute error `1e-9` with upstream `atol=0`); Slice |
+| Upstream generator failure | 1 | Gather can generate an empty axis, then constructs `max_value=-1 < min_value=0` |
+
+The operators with a registered or partially working path break down as
+follows (counts are dtype/opset pytest cases):
+
+| Operator | Pass | Fail | Skip | Failure reason |
+|---|---:|---:|---:|---|
+| Add | 1 | 10 | 0 | non-float32 dtypes |
+| Cast | 120 | 47 | 2 | Float16/Uint64 conversions and strings |
+| Div | 1 | 10 | 0 | non-float32 dtypes |
+| Erf | 0 | 3 | 0 | float16/64 unsupported; float32 near-zero mismatch |
+| Expand | 12 | 1 | 0 | strings |
+| Gather | 0 | 13 | 0 | non-float32/string dtypes; upstream empty-axis generator error |
+| Identity | 12 | 1 | 0 | Python string output conversion |
+| MatMul | 1 | 6 | 0 | non-float32 dtypes |
+| Max | 1 | 10 | 0 | non-float32 dtypes |
+| Min | 1 | 10 | 0 | non-float32 dtypes |
+| Mul | 1 | 10 | 0 | non-float32 dtypes |
+| Pow | 1 | 54 | 0 | non-float32 input combinations |
+| ReduceMean | 0 | 7 | 0 | opset-18 axes input |
+| Relu | 1 | 6 | 0 | non-float32 dtypes |
+| Reshape | 1 | 12 | 0 | non-float32/string dtypes |
+| Slice | 0 | 13 | 0 | negative axis, empty output, value mismatch, strings |
+| Softmax | 1 | 2 | 0 | float16/64 unsupported |
+| Sqrt | 1 | 2 | 0 | float16/64 unsupported |
+| Sub | 1 | 10 | 0 | non-float32 dtypes |
+| Tanh | 1 | 2 | 0 | float16/64 unsupported |
+| Transpose | 1 | 12 | 0 | non-float32/string dtypes |
+| Unsqueeze | 0 | 13 | 0 | opset-13 axes input |
+
+The 90 fully unsupported operator names are:
+
+Abs, Acos, Acosh, And, ArgMax, ArgMin, Asin, Asinh, Atan, Atanh, AveragePool,
+BitShift, BitwiseAnd, BitwiseNot, BitwiseOr, BitwiseXor, Ceil, Celu, Clip,
+Compress, Concat, ConstantOfShape, Conv, ConvInteger, Cos, Cosh, CumSum,
+DepthToSpace, Det, Einsum, Elu, Equal, Exp, EyeLike, Flatten, Floor,
+GatherElements, Gelu, Greater, GreaterOrEqual, HardSigmoid, HardSwish, Hardmax,
+IsInf, IsNaN, LeakyRelu, Less, LessOrEqual, Log, LogSoftmax, Mean, Mish, Mod,
+Neg, NonZero, Not, Or, PRelu, Pad, Reciprocal, ReduceL1, ReduceL2,
+ReduceLogSum, ReduceLogSumExp, ReduceMax, ReduceMin, ReduceProd, ReduceSum,
+ReduceSumSquare, Round, Selu, Shrink, Sigmoid, Sign, Sin, Sinh, Size, Softplus,
+Softsign, SpaceToDepth, Split, Squeeze, Sum, Tan, ThresholdedRelu, Tile, Trilu,
+Unique, Where, and Xor.
+
+The result is intentionally not normalized with expected-failure files: it is
+the current ep-cpu coverage picture. `conformance/summarize_junit.py` prints
+the reproducible per-operator pass/fail/skip table from the JUnit report.

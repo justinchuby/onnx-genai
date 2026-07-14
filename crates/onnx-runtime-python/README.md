@@ -129,10 +129,10 @@ export PYTHONPATH=/path/to/onnx-genai/crates/onnx-runtime-python/tests
 RUN_CANDIDATE=nxrt_runtime.run_nxrt pytest tests/ -q
 ```
 
-Ops nxrt's CPU EP implements pass against `onnx.reference.ReferenceEvaluator`;
-ops it does not yet implement fail with an **actionable** nxrt error naming the
-operator, so the suite report cleanly separates "wrong answer" from "not yet
-implemented". This crate also ships a focused, self-contained slice in
+Ops nxrt's CPU EP implements can be compared with
+`onnx.reference.ReferenceEvaluator`; unsupported ops fail with an
+**actionable** nxrt error naming the operator. This crate also ships a focused,
+self-contained slice in
 `tests/test_conformance.py` (runs a handful of supported ops through the same
 generators) and API/error-quality tests in `tests/test_api.py`:
 
@@ -144,6 +144,7 @@ pytest crates/onnx-runtime-python/tests/ -q
 24 tests pass standalone (offline); the conformance suite (~10 property-based op
 tests) additionally runs when `onnx-tests` is installed, for 34 total.
 
-Full-matrix conformance over the entire ONNX opset is the documented scale-up
-step (`RUN_CANDIDATE=nxrt_runtime.run_nxrt` over the whole `onnx-tests/tests`
-tree), gated on the CPU EP's op coverage growing.
+The full upstream matrix has also been run. See
+[`conformance/README.md`](conformance/README.md) and
+[`docs/EP_CONFORMANCE.md`](../../docs/EP_CONFORMANCE.md) for reproducible
+commands and the current CPU pass/fail/skip results.

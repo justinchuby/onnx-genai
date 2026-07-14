@@ -25,7 +25,17 @@ def run_nxrt(model: onnx.ModelProto) -> dict[str, np.ndarray]:
     The model must carry all its data as constants/initializers (the onnx-tests
     contract), so the input feed is empty.
     """
-    sess = nxrt.InferenceSession(model.SerializeToString())
+    sess = nxrt.InferenceSession(
+        model.SerializeToString(), providers=["CPUExecutionProvider"]
+    )
     output_names = [o.name for o in sess.get_outputs()]
-    outputs = sess.run(None, {})
-    return {name: value for name, value in zip(output_names, outputs)}
+    outputs = sess.run(output_names, {})
+    if len(outputs) != len(output_names):
+        raise RuntimeError(
+            "nxrt returned an unexpected number of outputs: "
+            f"model declares {len(output_names)}, runtime returned {len(outputs)}"
+        )
+    return {
+        name: np.asarray(value)
+        for name, value in zip(output_names, outputs, strict=True)
+    }
