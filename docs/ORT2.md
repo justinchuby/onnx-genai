@@ -5541,6 +5541,9 @@ cupti = []                     # CUPTI is dlopen'd, no link-time dep
 chrome = []                    # Chrome Trace JSON (always available, no extra dep)
 otel = ["dep:opentelemetry"]   # OpenTelemetry export (stretch)
 
+# Python builds enable all tracing by default (batteries-included)
+python-default = ["perfetto", "itt", "cupti", "chrome"]
+
 [dependencies]
 ittapi = { version = "0.4", optional = true }
 prost = { version = "0.13", optional = true }
@@ -5560,7 +5563,48 @@ When `TraceContext::noop()` is active (no profiling), the entire trace path comp
 down to a no-op branch prediction. In release builds with LTO, the compiler eliminates
 dead code paths for disabled features.
 
-#### 48.8.8 Design Decisions
+#### 48.8.8 Build-Target Defaults
+
+Different build targets have different tracing defaults:
+
+| Build target | Default tracing features | Rationale |
+|-------------|-------------------------|----------|
+| **Python (`pip install nxrt`)** | `perfetto + itt + cupti + chrome` | Batteries-included. Users expect profiling to just work. Binary size is less critical for Python packages. |
+| **Rust crate (`cargo add nxrt`)** | `perfetto` only | Minimal dependencies by default. Users opt-in to `itt`/`cupti` via cargo features. |
+| **C/C++ static lib** | None (noop) | Embedders control what they link. Opt-in via cmake flags: `-DNXRT_TRACE_ITT=ON`, `-DNXRT_TRACE_CUPTI=ON`. |
+
+**Python bindings (maturin):**
+```toml
+# bindings/python/Cargo.toml
+[dependencies]
+onnx-runtime-tracer = { path = "../../crates/onnx-runtime-tracer", features = ["python-default"] }
+```
+
+**Rust library users:**
+```toml
+# User's Cargo.toml — opt in to what they need
+[dependencies]
+nxrt = { version = "0.1", features = ["itt", "cupti"] }
+```
+
+**C/C++ build (cmake):**
+```bash
+# Minimal (no tracing overhead)
+cmake -DNXRT_TRACE=OFF ..
+
+# With ITT (VTune support)
+cmake -DNXRT_TRACE_ITT=ON ..
+
+# Full profiling
+cmake -DNXRT_TRACE_ITT=ON -DNXRT_TRACE_CUPTI=ON -DNXRT_TRACE_PERFETTO=ON ..
+```
+
+This ensures:
+- **Python users** get the best out-of-box experience (profiling works immediately)
+- **Rust/C++ users** get minimal binary size and dependency footprint by default
+- **Everyone** can opt-in to exactly what they need without rebuilding the world
+
+#### 48.8.9 Design Decisions
 
 | Decision | Choice | Rationale |
 |----------|--------|----------|
