@@ -1,0 +1,318 @@
+//! Integration tests for the sequential CPU executor (Track D).
+//!
+//! Each test hand-builds a small [`Graph`] via the IR API, runs it through the
+//! public [`InferenceSession`] surface, and asserts the output matches a
+//! reference computed here in the test. Nothing below names a model or bakes in
+//! a fixed shape path — the executor is exercised as a generic Graph runner.
+
+use onnx_runtime_ir::{
+    static_shape, Attribute, DataType, Graph, Node, NodeId, TensorData, ValueId, WeightRef,
+};
+use onnx_runtime_session::{InferenceSession, Tensor, WarmupShape};
+
+// --- graph construction helpers --------------------------------------------
+
+fn f32_bytes(data: &[f32]) -> Vec<u8> {
+    data.iter().flat_map(|v| v.to_le_bytes()).collect()
+}
+
+/// Add an inline f32 initializer, returning its value id.
+fn f32_init(g: &mut Graph, name: &str, dims: &[usize], data: &[f32]) -> ValueId {
+    let vid = g.create_named_value(name, DataType::Float32, static_shape(dims.iter().copied()));
+    g.set_initializer(
+        vid,
+        WeightRef::Inline(TensorData::from_raw(
+            DataType::Float32,
+            dims.to_vec(),
+            f32_bytes(data),
+        )),
+    );
+    vid
+}
+
+/// Add a named graph input, returning its value id.
+fn input(g: &mut Graph, name: &str, dtype: DataType, dims: &[usize]) -> ValueId {
+    let vid = g.create_named_value(name, dtype, static_shape(dims.iter().copied()));
+    g.add_input(vid);
+    vid
+}
+
+/// Insert an op node producing a single output value of the given shape/dtype.
+fn op(
+    g: &mut Graph,
+    op_type: &str,
+    inputs: &[ValueId],
+    out_dtype: DataType,
+    out_dims: &[usize],
+    attrs: &[(&str, Attribute)],
+) -> ValueId {
+    let out = g.create_value(out_dtype, static_shape(out_dims.iter().copied()));
+    let mut node = Node::new(
+        NodeId(0),
+        op_type,
+        inputs.iter().map(|&v| Some(v)).collect(),
+        vec![out],
+    );
+    for (k, v) in attrs {
+        node.attributes.insert((*k).to_string(), v.clone());
+    }
+    g.insert_node(node);
+    out
+}
+
+// --- reference implementations ---------------------------------------------
+
+fn ref_matmul(a: &[f32], m: usize, k: usize, b: &[f32], n: usize) -> Vec<f32> {
+    let mut out = vec![0.0f32; m * n];
+    for i in 0..m {
+        for j in 0..n {
+            let mut acc = 0.0f32;
+            for p in 0..k {
+                acc += a[i * k + p] * b[p * n + j];
+            }
+            out[i * n + j] = acc;
+        }
+    }
+    out
+}
+
+fn ref_add_rowvec(m: &[f32], rows: usize, cols: usize, bias: &[f32]) -> Vec<f32> {
+    let mut out = vec![0.0f32; rows * cols];
+    for r in 0..rows {
+        for c in 0..cols {
+            out[r * cols + c] = m[r * cols + c] + bias[c];
+        }
+    }
+    out
+}
+
+fn ref_layernorm_last(
+    x: &[f32],
+    rows: usize,
+    cols: usize,
+    scale: &[f32],
+    bias: &[f32],
+    eps: f32,
+) -> Vec<f32> {
+    let mut out = vec![0.0f32; rows * cols];
+    for r in 0..rows {
+        let row = &x[r * cols..r * cols + cols];
+        let mean = row.iter().sum::<f32>() / cols as f32;
+        let var = row.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / cols as f32;
+        let inv = 1.0 / (var + eps).sqrt();
+        for c in 0..cols {
+            out[r * cols + c] = (row[c] - mean) * inv * scale[c] + bias[c];
+        }
+    }
+    out
+}
+
+fn ref_relu(x: &[f32]) -> Vec<f32> {
+    x.iter().map(|&v| v.max(0.0)).collect()
+}
+
+fn assert_close(got: &[f32], want: &[f32]) {
+    assert_eq!(got.len(), want.len(), "length mismatch");
+    for (i, (g, w)) in got.iter().zip(want).enumerate() {
+        assert!((g - w).abs() < 1e-4, "element {i}: got {g}, want {w}");
+    }
+}
+
+// --- tests ------------------------------------------------------------------
+
+/// MatMul → Add → LayerNormalization → Relu, a realistic multi-node chain.
+#[test]
+fn matmul_add_layernorm_relu_chain_matches_reference() {
+    // Dimensions: X[2,3] · W[3,4] → [2,4], + bias[4], layernorm last axis, relu.
+    let x_data = [0.5f32, -1.0, 2.0, 1.5, 0.0, -0.5];
+    let w_data = [
+        0.1f32, 0.2, -0.3, 0.4, //
+        -0.5, 0.6, 0.7, -0.8, //
+        0.9, -1.0, 0.2, 0.3,
+    ];
+    let bias = [0.1f32, -0.2, 0.3, 0.05];
+    let scale = [1.2f32, 0.8, 1.0, 0.5];
+    let ln_bias = [0.0f32, 0.1, -0.1, 0.2];
+
+    let mut g = Graph::new();
+    let x = input(&mut g, "X", DataType::Float32, &[2, 3]);
+    let w = f32_init(&mut g, "W", &[3, 4], &w_data);
+    let m = op(&mut g, "MatMul", &[x, w], DataType::Float32, &[2, 4], &[]);
+    let b = f32_init(&mut g, "B", &[4], &bias);
+    let a = op(&mut g, "Add", &[m, b], DataType::Float32, &[2, 4], &[]);
+    let s = f32_init(&mut g, "Scale", &[4], &scale);
+    let bn = f32_init(&mut g, "LnBias", &[4], &ln_bias);
+    let l = op(
+        &mut g,
+        "LayerNormalization",
+        &[a, s, bn],
+        DataType::Float32,
+        &[2, 4],
+        &[("axis", Attribute::Int(-1))],
+    );
+    let y = op(&mut g, "Relu", &[l], DataType::Float32, &[2, 4], &[]);
+    g.add_output(y);
+
+    let mut session = InferenceSession::from_graph(g).expect("build session");
+
+    let x_tensor = Tensor::from_f32(&[2, 3], &x_data).unwrap();
+    let outputs = session.run(&[("X", &x_tensor)]).expect("run");
+    assert_eq!(outputs.len(), 1);
+
+    // Reference.
+    let m_ref = ref_matmul(&x_data, 2, 3, &w_data, 4);
+    let a_ref = ref_add_rowvec(&m_ref, 2, 4, &bias);
+    let l_ref = ref_layernorm_last(&a_ref, 2, 4, &scale, &ln_bias, 1e-5);
+    let y_ref = ref_relu(&l_ref);
+
+    assert_close(&outputs[0].to_vec_f32(), &y_ref);
+    assert_eq!(outputs[0].shape, vec![2, 4]);
+}
+
+/// Gather (embedding lookup) → Transpose, exercising an integer-index op and a
+/// layout-permuting op in one graph.
+#[test]
+fn gather_then_transpose_matches_reference() {
+    // Embedding table [4,3]; gather rows [2,0,3] → [3,3]; transpose → [3,3]^T.
+    let table = [
+        0.0f32, 1.0, 2.0, //
+        3.0, 4.0, 5.0, //
+        6.0, 7.0, 8.0, //
+        9.0, 10.0, 11.0,
+    ];
+    let idx = [2i64, 0, 3];
+
+    let mut g = Graph::new();
+    let data = f32_init(&mut g, "Table", &[4, 3], &table);
+    let indices = input(&mut g, "Idx", DataType::Int64, &[3]);
+    let gathered = op(
+        &mut g,
+        "Gather",
+        &[data, indices],
+        DataType::Float32,
+        &[3, 3],
+        &[("axis", Attribute::Int(0))],
+    );
+    let transposed = op(
+        &mut g,
+        "Transpose",
+        &[gathered],
+        DataType::Float32,
+        &[3, 3],
+        &[("perm", Attribute::Ints(vec![1, 0]))],
+    );
+    g.add_output(transposed);
+
+    let mut session = InferenceSession::from_graph(g).expect("build session");
+    let idx_tensor = Tensor::from_i64(&[3], &idx).unwrap();
+    let outputs = session.run(&[("Idx", &idx_tensor)]).expect("run");
+
+    // Reference: gather rows then transpose 3x3.
+    let mut gathered_ref = Vec::new();
+    for &i in &idx {
+        let base = i as usize * 3;
+        gathered_ref.extend_from_slice(&table[base..base + 3]);
+    }
+    let mut want = vec![0.0f32; 9];
+    for r in 0..3 {
+        for c in 0..3 {
+            want[c * 3 + r] = gathered_ref[r * 3 + c];
+        }
+    }
+    assert_close(&outputs[0].to_vec_f32(), &want);
+}
+
+/// The shape-keyed kernel cache is populated once and reused on every run: hits
+/// grow while the compiled-entry count and miss count stay fixed (§11.1).
+#[test]
+fn shape_keyed_cache_is_reused_across_runs() {
+    let mut g = Graph::new();
+    let x = input(&mut g, "X", DataType::Float32, &[2, 2]);
+    let w = f32_init(&mut g, "W", &[2, 2], &[1.0, 0.0, 0.0, 1.0]);
+    let m = op(&mut g, "MatMul", &[x, w], DataType::Float32, &[2, 2], &[]);
+    let y = op(&mut g, "Relu", &[m], DataType::Float32, &[2, 2], &[]);
+    g.add_output(y);
+
+    let mut session = InferenceSession::from_graph(g).expect("build");
+
+    // After build (compile pass): every node compiled once, no hits.
+    let after_build = session.cache_stats();
+    assert_eq!(after_build.entries, 2, "two nodes compiled");
+    assert_eq!(after_build.misses, 2);
+    assert_eq!(after_build.hits, 0);
+
+    let x_tensor = Tensor::from_f32(&[2, 2], &[1.0, 2.0, 3.0, 4.0]).unwrap();
+
+    let out1 = session.run(&[("X", &x_tensor)]).unwrap();
+    let after_run1 = session.cache_stats();
+    assert_eq!(after_run1.entries, 2, "no new entries on run");
+    assert_eq!(after_run1.misses, 2, "no recompilation");
+    assert_eq!(after_run1.hits, 2, "each node served from cache");
+
+    let out2 = session.run(&[("X", &x_tensor)]).unwrap();
+    let after_run2 = session.cache_stats();
+    assert_eq!(after_run2.entries, 2);
+    assert_eq!(after_run2.misses, 2);
+    assert_eq!(after_run2.hits, 4, "second run hit the cache again");
+
+    // Identity matmul + relu of [1,2,3,4] → [1,2,3,4].
+    assert_close(&out1[0].to_vec_f32(), &[1.0, 2.0, 3.0, 4.0]);
+    assert_close(&out2[0].to_vec_f32(), &[1.0, 2.0, 3.0, 4.0]);
+}
+
+/// `warmup` names must reference real inputs; a bad name is rejected, a good
+/// one keeps the cache warm.
+#[test]
+fn warmup_validates_input_names() {
+    let mut g = Graph::new();
+    let x = input(&mut g, "X", DataType::Float32, &[1, 2]);
+    let y = op(&mut g, "Relu", &[x], DataType::Float32, &[1, 2], &[]);
+    g.add_output(y);
+
+    let mut session = InferenceSession::from_graph(g).unwrap();
+    assert!(session
+        .warmup(&[WarmupShape {
+            input_name: "nope".into(),
+            shape: vec![1, 2],
+        }])
+        .is_err());
+    assert!(session
+        .warmup(&[WarmupShape {
+            input_name: "X".into(),
+            shape: vec![1, 2],
+        }])
+        .is_ok());
+}
+
+/// A missing required input is reported, not silently defaulted.
+#[test]
+fn missing_input_is_rejected() {
+    let mut g = Graph::new();
+    let x = input(&mut g, "X", DataType::Float32, &[1, 2]);
+    let y = op(&mut g, "Relu", &[x], DataType::Float32, &[1, 2], &[]);
+    g.add_output(y);
+
+    let mut session = InferenceSession::from_graph(g).unwrap();
+    let err = session.run(&[]).unwrap_err();
+    assert!(matches!(
+        err,
+        onnx_runtime_session::SessionError::InputNotFound { .. }
+    ));
+}
+
+/// A shape-mismatched input tensor is rejected before dispatch.
+#[test]
+fn input_shape_mismatch_is_rejected() {
+    let mut g = Graph::new();
+    let x = input(&mut g, "X", DataType::Float32, &[2, 2]);
+    let y = op(&mut g, "Relu", &[x], DataType::Float32, &[2, 2], &[]);
+    g.add_output(y);
+
+    let mut session = InferenceSession::from_graph(g).unwrap();
+    let wrong = Tensor::from_f32(&[3, 2], &[0.0; 6]).unwrap();
+    let err = session.run(&[("X", &wrong)]).unwrap_err();
+    assert!(matches!(
+        err,
+        onnx_runtime_session::SessionError::ShapeMismatch { .. }
+    ));
+}
