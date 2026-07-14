@@ -326,4 +326,62 @@ mod tests {
         // [1*7+2*9+3*11, 1*8+2*10+3*12] = [58, 64]
         assert_eq!(out.to_f32(), vec![58., 64.]);
     }
+
+    #[test]
+    #[allow(clippy::needless_range_loop)]
+    fn matmul_generic_block_boundaries_match_naive_reference() {
+        const SHAPES: &[(usize, usize, usize)] = &[
+            (65, 257, 70),
+            (128, 300, 200),
+            (100, 64, 4),
+            (4, 256, 4),
+            (1, 512, 1),
+            (200, 1, 200),
+        ];
+        const ABS_TOLERANCE: f32 = 1e-3;
+
+        let mut state = 0x1234_5678_u32;
+        let mut next_f32 = || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            ((state >> 8) as f32 / 16_777_216.0 - 0.5) * 0.25
+        };
+
+        let mut overall_max_abs_error = 0.0f32;
+        for &(m, k, n) in SHAPES {
+            let a_data: Vec<f32> = (0..m * k).map(|_| next_f32()).collect();
+            let b_data: Vec<f32> = (0..k * n).map(|_| next_f32()).collect();
+
+            let mut reference = vec![0.0f32; m * n];
+            for row in 0..m {
+                for col in 0..n {
+                    let mut sum = 0.0f32;
+                    for depth in 0..k {
+                        sum += a_data[row * k + depth] * b_data[depth * n + col];
+                    }
+                    reference[row * n + col] = sum;
+                }
+            }
+
+            let a = Owned::f32(&[m, k], &a_data);
+            let b = Owned::f32(&[k, n], &b_data);
+            let mut out = Owned::zeros_f32(&[m, n]);
+            MatMulKernel
+                .execute(&[a.view(), b.view()], &mut [out.view_mut()])
+                .unwrap();
+
+            let actual = out.to_f32();
+            let max_abs_error = actual
+                .iter()
+                .zip(&reference)
+                .map(|(actual, expected)| (actual - expected).abs())
+                .fold(0.0f32, f32::max);
+            overall_max_abs_error = overall_max_abs_error.max(max_abs_error);
+            assert!(
+                max_abs_error <= ABS_TOLERANCE,
+                "{m}x{k} @ {k}x{n}: max abs error {max_abs_error} exceeds {ABS_TOLERANCE}"
+            );
+        }
+
+        println!("generic MatMul max abs error: {overall_max_abs_error}");
+    }
 }
