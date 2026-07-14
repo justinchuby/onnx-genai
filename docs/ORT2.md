@@ -2756,6 +2756,12 @@ pub fn conformance_test(model_path: &Path, inputs: &[Tensor], tolerance: f64) ->
 | ONNX external data | **Yes, required** | All large models use it. Mandatory from Phase 1. |
 | Custom Ops | **Yes, via C ABI** | Support ORT Extensions registration mechanism through the same C ABI bridge. |
 
+| Execution hints | **Yes** | Users can provide placement/memory hints via builder, options, or model metadata. Hints bias the optimizer (soft preference) unless marked as Force (hard constraint). |
+| IoBinding as user API | **No** | Buffer reuse is internal. Session auto-reuses output buffers on stable shapes, auto-captures CUDA graph after 3 stable runs. Users use DLPack for explicit buffer control. |
+| Precompiled plans | **Yes** | AOT compilation à la ExecuTorch: partition + optimize + serialize plan. Instant reload without re-optimization. |
+| AOT memory plan | **Yes** | Pre-compute tensor offsets at compile time. Runtime = one malloc + offset table. Zero allocation overhead. |
+| Quantization as EP concern | **Yes** | EPs handle quantized tensors natively (fused dequant+compute). No separate quantization pass. |
+
 ## 29. Open Questions
 
 1. **JIT compilation** — Cranelift/LLVM for custom fused kernels? Or leave to EPs?
