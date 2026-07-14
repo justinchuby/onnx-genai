@@ -63,3 +63,13 @@ Reviewed Roy's ONNX encoder v1 (`9ffd65c`). 🟢 GREEN — round-trip fidelity a
 - **Added:** `duplicate_primary_identity_round_trips_external` — two same-source/same-(empty)-name primaries, distinct non-UTF-8 blobs, external mode → `m_ctx_p0_EpA.bin`/`m_ctx_p1_EpA.bin` distinct; each reloaded byte-exact.
 - **Kept intact:** B1 injective `_p{index}_` sidecar names; A1 enable-gating; A2 NodeId seam doc; sanitizer test.
 - **Commit:** `0fa025e` (= `6e65e85`). **deckard-19 🟢 APPROVE.** Final merged commit on main.
+
+## 2026-07-14T18:55:00Z — gaff-14: Review EPContext §55.5 capi FFI + e2e round-trip (chew-25)
+
+Non-author review of `squad/ort2-epctx-options` @ `3e8dbde`. Scope: capi FFI memory safety + e2e correctness.
+
+- Audited four new capi entry points: null handling PASS, invalid UTF-8 PASS, ownership/lifetime PASS (borrow-not-consume), panics across FFI PASS (all in `guard`).
+- E2e: byte-exact non-UTF-8 round-trip via mock EP confirmed; disabled path writes nothing confirmed.
+- **Verdict: 🟢 GREEN** — 2 non-blocking advisories:
+  - A1: No negative FFI tests for null/invalid-UTF-8 into `ort2_add_session_config_entry` (coverage gap only).
+  - A2: Released-handle reuse unguarded — by design, matches existing opaque-handle contract.

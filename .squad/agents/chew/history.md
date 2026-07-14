@@ -102,3 +102,13 @@ Non-author review of `squad/ort2-epcontext-session` @ `d59edc5` (author: Batty).
 
 ## 2026-07-14T16:20:00Z — CAPI DanglingEpContext regression fix (chew-24)
 Fixed pre-existing non-exhaustive match in `onnx-runtime-capi`: mapped `SessionError::DanglingEpContext` → `OrtErrorCode::InvalidGraph`. Regression introduced when the EPContext consume-path merge added the new variant on main. Retained explicit exhaustive match for compile-time guard. Found via full cross-crate build gate. Commit d3f0c0a.
+
+## 2026-07-14T18:55:00Z — chew-25: EPContext §21.4/§55.5 options wired end-to-end (author)
+
+Authored `squad/ort2-epctx-options` (off `origin/main` `0fa025e`). Commit `3e8dbde` → cherry-picked to main as `c3d454c`.
+
+- Implemented `SessionBuilder::parse_options` (one validating pass; three `ep.context_*` keys + existing optimization; unknown→`UnknownOption`, bad value→`InvalidOption`).
+- Implemented `InferenceSession::export_ep_context` + `pub(crate)` `Executor::graph()`/`weights()` compiler-integration seam.
+- Added capi surface: `OrtSessionOptions` opaque handle + `ort2_create/release_session_options` + `ort2_add_session_config_entry` + `ort2_create_session_with_options`.
+- All gates green. EPContext §55 now complete end-to-end.
+- Reviewers: gaff-14 🟢 (2 non-blocking advisories: A1 negative FFI tests, A2 handle-reuse by design), deckard-20 🟢 (no regressions, no advisories).

@@ -61,3 +61,14 @@ B1 resolved, but blanket `(source, partition_name)` duplicate-identity rejection
 
 ## 2026-07-14T18:00:00Z — deckard-19: EPContext writer v3 re-review (🟢 APPROVE)
 Gaff's v3 @ `6e65e85`. Regression closed: no duplicate-identity rejection; `duplicate_primary_identity_round_trips_external` passes; B1/A1/A2/sanitizer intact. All suites + clippy + 8-crate build PASS. Final merged commit on main: `0fa025e`.
+
+## 2026-07-14T18:55:00Z — deckard-20: Review EPContext §55.5 parse_options + model-agnosticism + export seam (chew-25)
+
+Non-author review of `squad/ort2-epctx-options` @ `3e8dbde95effb006b28d117e3f8c5491d464e95f`. Scope: parse_options refactor regression, §21.4 validation, model-agnosticism, export seam.
+
+- parse_options refactor: no regression — all previously recognized keys preserved; optimization behavior identical.
+- §21.4 validation: fail-closed for all three keys; all parse-and-reject paths tested.
+- Model-agnosticism: grep confirmed no model/vendor/op literals in production `src/`.
+- Export seam: `export_ep_context` correct; disabled path side-effect-free; `TODO(compiler)` seam correctly placed; executor accessors immutable `pub(crate)`.
+- C API: no divergent option logic; verbatim forwarding only.
+- **Verdict: 🟢 APPROVE** — no regressions, no advisories.
