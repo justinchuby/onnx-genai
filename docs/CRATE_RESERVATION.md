@@ -42,6 +42,11 @@ cargo publish -p onnx-runtime-capi
 Wait for each version to appear in the crates.io index before publishing the
 next crate that depends on it; propagation can take a short time.
 
+> **`onnx-runtime-python`** is intentionally **not** in this list. It is a
+> `cdylib` PyO3 extension (`publish = false`) distributed as the `nxrt` **wheel
+> on PyPI** via `maturin`, not as a crate on crates.io — see
+> `crates/onnx-runtime-python/README.md`.
+
 `onnx-runtime-shape-inference` has a test-only dependency on
 `onnx-runtime-loader` that is intentionally path-only, with no version. Cargo
 omits that dev-dependency from the published manifest, breaking the otherwise

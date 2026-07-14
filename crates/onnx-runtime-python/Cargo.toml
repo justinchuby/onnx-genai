@@ -1,0 +1,39 @@
+# PyO3 extension module exposing the nxrt runtime to Python as `nxrt`.
+#
+# Wheels: standard stable-ABI (`abi3`, tag `cp310-abi3`, min Python 3.10) built
+# from the `abi3-py310` PyO3 feature, plus a separate free-threaded (`abi3t`)
+# wheel — see README.md and docs/PIPELINE.md §12.4.
+[package]
+name = "onnx-runtime-python"
+version = "0.1.0-dev.0"
+edition = "2024"
+license = "MIT"
+authors = ["Justin Chu"]
+repository = "https://github.com/justinchuby/onnx-genai"
+description = "Python (PyO3/abi3) binding for the nxrt ONNX runtime — exposes InferenceSession"
+publish = false
+
+[lib]
+# The importable Python module is `nxrt` (not the crate name); maturin reads
+# this to name the compiled extension.
+name = "nxrt"
+crate-type = ["cdylib"]
+
+[dependencies]
+onnx-runtime-session = { workspace = true }
+onnx-runtime-ep-cpu = { workspace = true }
+onnx-runtime-ir = { workspace = true }
+# Optional CUDA execution provider, gated behind the `cuda` feature so the
+# default build stays offline / pure-Rust (CPU only).
+onnx-runtime-ep-cuda = { workspace = true, optional = true }
+
+[dependencies.pyo3]
+version = "0.23"
+# `extension-module` — link against the interpreter at load time, not build time.
+# `abi3-py310` — build against CPython's stable/limited API pinned to 3.10, so a
+# single wheel (`cp310-abi3`) loads on CPython 3.10 through 3.14+.
+features = ["extension-module", "abi3-py310"]
+
+[features]
+default = []
+cuda = ["dep:onnx-runtime-ep-cuda"]

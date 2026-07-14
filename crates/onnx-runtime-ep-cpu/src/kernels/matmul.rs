@@ -210,7 +210,15 @@ pub(crate) fn matmul_dense(a: &TensorView, b: &TensorView) -> Result<Vec<f32>> {
     let b_mat = k * n;
     let c_mat = m * n;
 
-    let mut out = vec![0.0f32; batch_count.max(1) * c_mat];
+    let mut out = vec![0.0f32; batch_count * c_mat];
+
+    // Any zero dimension (batch, M, or N) yields an empty result — matching
+    // numpy/ONNX reference semantics. Return before the compute loop, which
+    // otherwise runs once even for a zero-sized batch (a `loop { … } while`) and
+    // would index into empty operand slices.
+    if out.is_empty() {
+        return Ok(out);
+    }
 
     if batch_shape.is_empty() {
         // No batch dims: a single matmul.
@@ -257,6 +265,18 @@ fn broadcast_offset(bidx: &[usize], batch: &[usize], batch_strides: &[i64]) -> u
 mod tests {
     use super::*;
     use crate::kernels::testutil::Owned;
+
+    #[test]
+    fn matmul_zero_batch_returns_empty_without_panicking() {
+        // Regression: a zero-sized batch dim (broadcast to a 0-length result)
+        // used to run the compute loop once and index empty operand slices,
+        // panicking. It must return an empty buffer instead (numpy/ONNX
+        // reference semantics).
+        let a = Owned::f32(&[0, 1, 1], &[]);
+        let b = Owned::f32(&[0, 1, 1], &[]);
+        let out = matmul_dense(&a.view(), &b.view()).unwrap();
+        assert!(out.is_empty());
+    }
 
     #[test]
     fn matmul_2x3_times_3x2() {

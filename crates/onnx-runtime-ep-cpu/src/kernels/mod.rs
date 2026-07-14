@@ -38,6 +38,7 @@ pub mod fused_matmul_bias;
 pub mod gather;
 pub mod gelu;
 pub mod gemm;
+pub mod identity;
 pub mod layernorm;
 pub mod matmul;
 #[cfg(feature = "onednn")]
@@ -81,6 +82,7 @@ pub const PHASE1_OPS: &[&str] = &[
     "Expand",
     "Slice",
     "Constant",
+    "Identity",
     // GEMM.
     "Gemm",
 ];
@@ -169,7 +171,11 @@ pub fn build_cpu_registry() -> OpRegistry {
     reg.register(OpKey::new("Erf", "", 1), Box::new(elementwise::ErfFactory));
     reg.register(OpKey::new("Tanh", "", 1), Box::new(elementwise::TanhFactory));
     reg.register(OpKey::new("Cast", "", 1), Box::new(cast::CastFactory));
-    // Reduction / normalization.
+    // Identity: dtype-agnostic passthrough (raw byte copy).
+    reg.register(
+        OpKey::new("Identity", "", 1),
+        Box::new(identity::IdentityFactory),
+    );
     reg.register(
         OpKey::new("ReduceMean", "", 1),
         Box::new(reduce::ReduceMeanFactory),

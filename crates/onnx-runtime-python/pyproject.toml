@@ -1,0 +1,42 @@
+# nxrt — Python packaging via maturin.
+#
+# Standard wheel: stable ABI `abi3`, tagged `cp310-abi3` (min Python 3.10),
+# buildable with any interpreter >= 3.10. Free-threaded `abi3t` wheels are a
+# separate build path — see README.md "abi3 vs abi3t" and docs/PIPELINE.md §12.4.
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[project]
+name = "nxrt"
+description = "Python binding for the nxrt ONNX runtime — onnxruntime-compatible InferenceSession"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Justin Chu" }]
+readme = "README.md"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Rust",
+    "License :: OSI Approved :: MIT License",
+]
+dependencies = ["numpy>=1.21"]
+dynamic = ["version"]
+
+[project.optional-dependencies]
+# bfloat16 numpy interop (nxrt only needs this to *return* bf16 outputs).
+bfloat16 = ["ml_dtypes"]
+
+[project.urls]
+repository = "https://github.com/justinchuby/onnx-genai"
+
+[tool.maturin]
+# The importable module is `nxrt` (set via [lib].name in Cargo.toml).
+manifest-path = "Cargo.toml"
+# Build the stable-ABI wheel. `abi3-py310` pins Py_LIMITED_API to 3.10 so the
+# wheel is tagged cp310-abi3 and loads on CPython 3.10+ from a single build.
+features = ["pyo3/abi3-py310"]
+strip = true

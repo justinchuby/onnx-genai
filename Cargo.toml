@@ -27,6 +27,7 @@ members = [
     "crates/onnx-runtime-session",
     "crates/onnx-runtime-capi",
     "crates/onnx-runtime-tracer",
+    "crates/onnx-runtime-python",
 ]
 
 [workspace.package]
