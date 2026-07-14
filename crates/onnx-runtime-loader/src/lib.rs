@@ -85,6 +85,9 @@ mod error {
         #[error("external data file not found: {path}")]
         ExternalDataNotFound { path: PathBuf },
 
+        #[error("external data path rejected ({reason}): {path}")]
+        ExternalDataPath { path: String, reason: &'static str },
+
         #[error("weight mmap failed: {0}")]
         Mmap(String),
 

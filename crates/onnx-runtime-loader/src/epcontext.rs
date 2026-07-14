@@ -255,11 +255,9 @@ pub fn resolve_ep_context(
 /// Join a relative external-context path onto `model_dir`, rejecting anything
 /// that escapes the model directory (§55.3 path-safety).
 ///
-/// External-weight resolution (`weights.rs` §19.2) blindly `join`s the stored
-/// `location`; it does **not** guard traversal. For untrusted `*_ctx.onnx`
-/// interchange models we add a minimal guard here: absolute paths, filesystem
-/// roots/prefixes, and any `..` component are rejected. (This guard is noted in
-/// the decision record so the equivalent guard can be added to `weights.rs`.)
+/// Like external-weight resolution (`weights.rs` §19.2), this rejects absolute
+/// paths, filesystem roots/prefixes, and any `..` component before joining the
+/// stored location to the model directory.
 fn resolve_external_path(model_dir: &Path, rel: &str) -> Result<PathBuf, LoaderError> {
     let rel_path = Path::new(rel);
     if rel_path.is_absolute() {
