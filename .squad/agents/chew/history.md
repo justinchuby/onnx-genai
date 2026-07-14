@@ -86,3 +86,16 @@ Reviewed matcher internals; authored adversarial probes (different_x, reversed, 
 **Non-blocking advisories logged (for session integrator):**
 - A-CHEW-1: `register` non-transactional; treat `DuplicateContextSource` as fatal.
 - A-CHEW-2: Use `source_key` (not `source`) in `NoEpForContext`; map ONNX `source` attr → `claim`.
+
+## 2026-07-14T15:00:00Z — chew-23: Review EPContext CONSUME path (batty-15)
+
+Non-author review of `squad/ort2-epcontext-session` @ `d59edc5` (author: Batty). Focused on model-agnosticism, placement/execution bypass safety, test quality, unsafe/clippy.
+
+- Model-agnostic confirmed: zero hardcoded vendor names in production code; QNN literal only in unclaimed fixture
+- No CPU fall-through: all session construction paths call `load_ep_context_nodes` before `Executor::build`; EPContext nodes skipped by `is_ep_context_op`; no path to CPU kernel dispatch
+- Test quality: non-UTF8 byte exactness, CARGO_TARGET_TMPDIR, MockCompiledEp genuinely invoked, error tests on concrete variants/fields
+- No new unsafe; git diff --check clean; 34 tests pass; clippy exit 0
+
+**Verdict: 🟡 Yellow — approve with test advisories:**
+1. Add positive executor-bypass test with a claimed mock EP
+2. Assert full EpContext struct fields, not only ctx.data

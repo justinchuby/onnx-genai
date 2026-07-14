@@ -124,3 +124,15 @@ Read-only review of Batty's DAG-aware matcher. A1 genuinely closed (real loaded-
 - 22 unit + 4 lib tests green; ep-cpu + session suites unchanged; clippy clean; no new unsafe.
 - Merged to main `d18a8a3` (part 2). Chew (chew-22) 🟢 APPROVE.
 - ⚠️ Shared-checkout race during this task: commit recovered from dangling object after force-push. Lesson: parallel commit-producing agents must use separate worktrees.
+
+## 2026-07-14T15:00:00Z — deckard-15: Review EPContext CONSUME path (batty-15)
+
+Non-author review of `squad/ort2-epcontext-session` @ `d59edc5`. Reproduced: 7 session epcontext + 11 executor + 7 loader epcontext tests all pass.
+
+Verified all assigned axes: two-phase ordering enforced on materialized Vec (graph-order irrelevant); DuplicateContextSource and NoEpForContext carry real source key; dedup keyed on (source, bytes); main_context=0 resolves by (source, partition_name) with DanglingEpContext + no second blob load; path-traversal guard on consume path tested.
+
+**Verdict: 🟡 approve with 4 non-blocking advisories:**
+- A1: covered_nodes omits deduped sibling primary NodeId
+- A2: duplicate (source,partition_name) primaries silently accepted (no diagnostic)
+- A3: returned EpContextPlacement discarded by session
+- A4: add session-level path-traversal test

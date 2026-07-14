@@ -1231,3 +1231,36 @@ Requires `Sub` input[0] == X and input[1] == mean; exactly-binary arity enforced
 **Verification:** 22 unit + 4 lib ep-api tests green debug + release; ep-cpu 3+11 and session 11 tests unchanged; clippy `-D warnings` clean; no new unsafe.
 
 **Review — Chew (chew-22):** 🟢 APPROVE. Model-agnostic dispatch confirmed (zero hardcoded vendor names in non-test code; `claim` is pure lookup). Reject-duplicate semantics correct and documented. Trait defaults preserve object-safety and don't break existing EPs (ep-cpu 105 + session 12+1+3+11 tests green). `EpContext` struct matches §55.1 field-for-field; save→load round-trip verified. `source_key` naming correct for thiserror 2.0.18. No 🔴 blockers.
+
+---
+
+### 2026-07-14: EPContext session CONSUME path — bypass-placement dispatch + main_context resolution/dedup
+
+**By:** Batty (ORT2 session)
+**Branch:** `squad/ort2-epcontext-session` → merged main `46f2861`
+**Scope:** `crates/onnx-runtime-session` only (§55.3 dispatch/execution + `main_context`; the session row of §55.7). Loader (`EpContextNode`/`EpContextBlob`/`resolve_ep_context`) is Roy's; ep-api (`EpContext`/`EpContextRegistry`/trait methods) is Deckard's — both used via public APIs, unmodified. The `*_ctx.onnx` writer/dump path (§55.4) is a separate follow-up and is NOT built here.
+
+**New module `session/src/epcontext.rs`**, re-exported from `lib.rs`:
+
+1. **Public entry point:** `load_ep_context_nodes(graph, model_dir, eps) -> Result<EpContextPlacement>` where `EpContextPlacement { handled: Vec<NodeId> }` lists nodes that bypassed placement.
+
+2. **Dispatch flow (§55.3, model-agnostic — pure `source`-key lookup, §55.6):**
+   - Enumerate `ep_context_nodes(&graph)` (Roy). Empty → no-op early return.
+   - Build `EpContextRegistry` via `build_ep_context_registry(eps)` (Deckard) — propagates `EpError::DuplicateContextSource`.
+   - Phase 1 (main_context=true): `registry.claim(node.source)` → `EpError::NoEpForContext { source_key }` if unclaimed (real key, never guessed). `resolve_ep_context` → `ep.load_context(ctx)`.
+   - **Payload dedup:** `HashSet<(Option<source>, Vec<u8>)>` gates `load_context` — identical packed binaries load exactly once.
+   - Phase 2 (main_context=false): resolve by `(source, partition_name)` against loaded primaries — no second blob load. Missing primary → `SessionError::DanglingEpContext`.
+
+3. **Executor bypass:** `executor.rs` skips EPContext nodes via `is_ep_context_op(op_type, domain)` — never reaches CPU EP kernel dispatch.
+
+4. **Model-dir threading:** `SessionBuilder::build` retains model directory and threads it into `load_ep_context_nodes` so `embed_mode=0` external blob paths resolve relative to model file (per §19.2).
+
+5. **New `SessionError` variant:** `DanglingEpContext { source_key, partition_name }`. Field named `source_key` (not `source`) per thiserror 2.0 constraint.
+
+6. **Error taxonomy:** `EpError::DuplicateContextSource` (config), `EpError::NoEpForContext { source_key }` (unloaded EP), `SessionError::DanglingEpContext { source_key, partition_name }` (bad reference).
+
+7. **Tests:** 7 new tests in `tests/epcontext.rs` (MockCompiledEp): embed round-trip, external .bin round-trip, unclaimed QNN → NoEpForContext, main_context dedup + reference resolution, dangling reference, duplicate-source rejected, session-level unclaimed-node rejection. All green debug + release. Clippy -D warnings clean.
+
+**Review — Deckard (deckard-15):** 🟡 YELLOW — approve with advisories. Phase-1-before-Phase-2 ordering enforced on materialized Vec (graph order irrelevant). DuplicateContextSource and NoEpForContext propagate with real (never guessed) source key. Dedup keyed on (source, bytes) — different sources/binaries never collapsed, shared packed binary loads exactly once. main_context=0 references resolve by (source, partition_name) with DanglingEpContext; no second blob load. Path-traversal guard on consume path, tested. Four non-blocking advisories: (A1) covered_nodes omits deduped sibling primary NodeId; (A2) duplicate (source,partition_name) primaries silently accepted; (A3) returned EpContextPlacement discarded by session (executor self-contained); (A4) add session-level path-traversal test. No blocking defect.
+
+**Review — Chew (chew-23):** 🟡 YELLOW — approve with test advisories. Model-agnostic dispatch confirmed (zero hardcoded vendor names in non-test code; QNN literal only in unclaimed fixture). No CPU fall-through: all session construction paths converge on `from_parts` which calls `load_ep_context_nodes` before `Executor::build`; EPContext nodes skipped by `is_ep_context_op` predicate. 7/7 session epcontext tests + clippy pass. Non-blocking: (1) add positive executor-bypass regression test with claimed mock EP; (2) assert full EpContext fields (ep_name, ep_version, covered_nodes, fingerprint), not only ctx.data.
