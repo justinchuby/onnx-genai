@@ -100,7 +100,7 @@ fn unsupported_op_error_is_actionable() {
     graph.opset_imports.insert(String::new(), 17);
     let x = input(&mut graph, "x", DataType::Float32, &[1]);
     let y = graph.create_named_value("y", DataType::Float32, static_shape([1]));
-    let mut node = Node::new(NodeId(0), "Sigmoid", vec![Some(x)], vec![y]);
+    let mut node = Node::new(NodeId(0), "Conv", vec![Some(x)], vec![y]);
     node.name = "unsupported_activation".to_string();
     graph.insert_node(node);
     graph.add_output(y);
@@ -109,7 +109,7 @@ fn unsupported_op_error_is_actionable() {
         Err(err) => err.to_string(),
         Ok(_) => panic!("unsupported operator unexpectedly built"),
     };
-    assert!(message.contains("Sigmoid"), "{message}");
+    assert!(message.contains("Conv"), "{message}");
     assert!(message.contains("ai.onnx"), "{message}");
     assert!(message.contains("unsupported_activation"), "{message}");
     assert!(message.contains("opset 17"), "{message}");
@@ -125,7 +125,7 @@ fn unsupported_op_error_formats_unnamed_node_gracefully() {
     let y = graph.create_named_value("y", DataType::Float32, static_shape([1]));
     graph.insert_node(Node::new(
         NodeId(0),
-        "Sigmoid",
+        "Conv",
         vec![Some(x)],
         vec![y],
     ));
