@@ -744,7 +744,96 @@ pub fn broadcast_shapes(a: &[usize], b: &[usize]) -> Result<Vec<usize>> {
 }
 ```
 
-### 5.3 TensorView / TensorMut (Zero-Copy Views)
+### 5.3 DLPack Tensor Sharing
+
+DLPack is the standard for zero-copy tensor sharing across frameworks (PyTorch, JAX, CuPy, TVM).
+Our `Tensor` natively supports DLPack import/export.
+
+```rust
+use dlpack_sys::{DLManagedTensor, DLTensor, DLDevice, DLDataType};
+
+impl Tensor {
+    /// Export as DLPack managed tensor. Zero-copy — caller gets a view.
+    /// The Tensor must outlive the DLManagedTensor (prevented via ref-counted handle).
+    pub fn to_dlpack(&self) -> DLManagedTensor {
+        DLManagedTensor {
+            dl_tensor: DLTensor {
+                data: self.data.as_ptr() as *mut c_void,
+                device: self.device.to_dl_device(),
+                ndim: self.shape.len() as i32,
+                dtype: self.dtype.to_dl_dtype(),
+                shape: self.shape.as_ptr() as *mut i64,
+                strides: self.strides.as_ptr() as *mut i64,
+                byte_offset: self.offset as u64,
+            },
+            manager_ctx: Arc::into_raw(self.handle.clone()) as *mut c_void,
+            deleter: Some(prevent_free_fn),
+        }
+    }
+
+    /// Import from DLPack. Zero-copy — we take ownership of the managed tensor.
+    pub fn from_dlpack(managed: DLManagedTensor) -> Self {
+        let dl = &managed.dl_tensor;
+        let shape: Vec<usize> = unsafe {
+            slice::from_raw_parts(dl.shape, dl.ndim as usize)
+        }.iter().map(|&x| x as usize).collect();
+
+        let strides = if dl.strides.is_null() {
+            TensorLayout::compute_contiguous_strides(&shape)
+        } else {
+            unsafe { slice::from_raw_parts(dl.strides, dl.ndim as usize) }.to_vec()
+        };
+
+        Self {
+            data: DevicePtr::from_raw(dl.data),
+            dtype: DataType::from_dl_dtype(dl.dtype),
+            shape,
+            strides,
+            device: DeviceId::from_dl_device(dl.device),
+            offset: dl.byte_offset as usize,
+            _dlpack_handle: Some(managed), // prevent deleter until we're done
+        }
+    }
+}
+
+impl DeviceId {
+    pub fn to_dl_device(&self) -> DLDevice {
+        DLDevice {
+            device_type: match self.device_type {
+                DeviceType::Cpu => 1,      // kDLCPU
+                DeviceType::Cuda => 2,     // kDLCUDA
+                DeviceType::Rocm => 10,    // kDLROCM
+                DeviceType::Mlx => 1,      // Metal UMA appears as CPU
+                DeviceType::WebGpu => 15,  // kDLWebGPU (proposed)
+                _ => 1,
+            },
+            device_id: self.index as i32,
+        }
+    }
+
+    pub fn from_dl_device(dl: DLDevice) -> Self {
+        let device_type = match dl.device_type {
+            1 => DeviceType::Cpu,
+            2 => DeviceType::Cuda,
+            10 => DeviceType::Rocm,
+            _ => DeviceType::Custom(dl.device_type as u32),
+        };
+        Self { device_type, index: dl.device_id as u32 }
+    }
+}
+```
+
+**Use cases:**
+- **EP boundary:** EPs exchange tensors via DLPack instead of custom formats
+- **Python zero-copy:** `session.run_from_dlpack(torch_tensor)` — no memcpy
+- **Output sharing:** `torch.from_dlpack(output)` — user gets GPU tensor directly
+- **Cross-framework pipelines:** JAX preprocessing → our inference → PyTorch postprocessing
+
+**DLPack v1.0 stream semantics:** The `dl_tensor.device` includes stream info for
+proper synchronization. When importing a CUDA tensor from PyTorch, we record its
+stream and insert a fence before using it on our compute stream.
+
+### 5.4 TensorView / TensorMut (Zero-Copy Views)
 
 ```rust
 /// Immutable view of a tensor on any device. No ownership of data.
