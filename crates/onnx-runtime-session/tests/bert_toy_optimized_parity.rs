@@ -176,6 +176,11 @@ fn full_optimization_fusion_path_matches_reference_and_default() {
     // Same tolerance rationale as bert_toy_conformance.rs (numpy.allclose).
     const ATOL: f32 = 2e-3;
     const RTOL: f32 = 2e-3;
+    // The vs-opt-off DRIFT ceiling is independent of (and far tighter than) the
+    // vs-reference conformance tolerance. LayerNorm fusion perturbs numerics by
+    // only a few ULPs (actual drift ~1.4e-7), so bound it at 1e-5 — tight enough
+    // to catch a subtle future numeric regression, with comfortable headroom.
+    const DRIFT_ATOL: f32 = 1e-5;
 
     let opt_off = run_bert(None).expect("build+run with optimization off");
     let opt_all = run_bert(Some("all")).expect("build+run with optimization=all");
@@ -227,10 +232,12 @@ fn full_optimization_fusion_path_matches_reference_and_default() {
     );
     // LayerNorm fusion changes numerics by only a few ULPs, so opt=all stays
     // extremely close to opt-off — but is NOT byte-identical (the fused kernel
-    // reduces differently). Bound the drift tightly instead of asserting 0.0.
+    // reduces differently). Bound the drift tightly (1e-5, ~2 orders above the
+    // observed ~1.4e-7) so a subtle future numeric regression is caught, without
+    // loosening the vs-reference conformance tolerance.
     assert!(
-        overall_vs_off < ATOL,
-        "opt=all must stay within atol={ATOL:.0e} of opt-off (got {overall_vs_off:.3e})"
+        overall_vs_off < DRIFT_ATOL,
+        "opt=all must stay within drift atol={DRIFT_ATOL:.0e} of opt-off (got {overall_vs_off:.3e})"
     );
 }
 

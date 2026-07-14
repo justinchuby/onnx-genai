@@ -621,6 +621,19 @@ impl FusionPattern {
         if !sub_div.input_values().any(|v| v == x) {
             return None;
         }
+
+        // Operand-ORDER guard: each centering `Sub` must compute `diff = x - mean`
+        // (minuend `x` first, subtrahend `mean` second), NOT `mean - x`. Membership
+        // alone (checked above) would accept a reversed `Sub(mean, x)` and silently
+        // rewrite it to a sign-flipped LayerNormalization. `Sub` is exactly binary,
+        // so require input[0] == X and input[1] == mean on BOTH the variance-branch
+        // and numerator-branch Subs. Ambiguous arity (not exactly two inputs) → decline.
+        let subtracts_x_minus_mean = |sub: &Node| -> bool {
+            matches!(sub.inputs.as_slice(), [Some(a), Some(b)] if *a == x && *b == mean)
+        };
+        if !subtracts_x_minus_mean(sub_pow) || !subtracts_x_minus_mean(sub_div) {
+            return None;
+        }
         let scale = mul.input_values().find(|&v| v != norm)?;
         let bias = final_add.input_values().find(|&v| v != scaled)?;
 
@@ -943,6 +956,169 @@ mod tests {
         assert_eq!(ln_after, 1);
         assert_eq!(rm_before, 2);
         assert_eq!(rm_after, 0);
+    }
+
+    /// Build the 10-op split-diff LayerNorm decomposition over `x` (the
+    /// `bert_toy`-style variant): the variance branch and the numerator branch
+    /// each get their **own** distinct `Sub` node instead of sharing one `diff`.
+    /// `mean` therefore fans out to two Subs and `x` to two Subs. When
+    /// `reverse_num_sub` is true the numerator `Sub` is emitted reversed as
+    /// `Sub(mean, x)` (an adversarial sign-flip) to exercise the operand-order
+    /// guard.
+    fn layernorm_split_graph(reverse_num_sub: bool) -> Graph {
+        const EPS: f32 = 1e-12;
+        let mut g = Graph::new();
+        g.opset_imports.insert(String::new(), 17);
+        let x = val(&mut g, "x");
+        let two = val(&mut g, "two");
+        let eps = val(&mut g, "eps");
+        let scale = val(&mut g, "scale");
+        let bias = val(&mut g, "bias");
+        g.add_input(x);
+        g.add_input(two);
+        g.set_initializer(
+            eps,
+            WeightRef::Inline(TensorData::from_raw(
+                DataType::Float32,
+                vec![],
+                EPS.to_le_bytes().to_vec(),
+            )),
+        );
+        g.add_input(scale);
+        g.add_input(bias);
+
+        let reduce_mean = |g: &mut Graph, input: ValueId, out: ValueId| {
+            let mut n = Node::new(NodeId(0), "ReduceMean", vec![Some(input)], vec![out]);
+            n.attributes.insert("axes".into(), Attribute::Ints(vec![-1]));
+            n.attributes.insert("keepdims".into(), Attribute::Int(1));
+            g.insert_node(n);
+        };
+
+        let mean = val(&mut g, "mean");
+        reduce_mean(&mut g, x, mean);
+        // Variance-branch Sub: always the canonical `x - mean`.
+        let diff_pow = val(&mut g, "diff_pow");
+        g.insert_node(Node::new(
+            NodeId(0),
+            "Sub",
+            vec![Some(x), Some(mean)],
+            vec![diff_pow],
+        ));
+        // Numerator-branch Sub: a SECOND, distinct node. Reversed operands when
+        // `reverse_num_sub` (adversarial `mean - x`), else canonical `x - mean`.
+        let diff_div = val(&mut g, "diff_div");
+        let num_inputs = if reverse_num_sub {
+            vec![Some(mean), Some(x)]
+        } else {
+            vec![Some(x), Some(mean)]
+        };
+        g.insert_node(Node::new(NodeId(0), "Sub", num_inputs, vec![diff_div]));
+
+        let sq = val(&mut g, "sq");
+        g.insert_node(Node::new(
+            NodeId(0),
+            "Pow",
+            vec![Some(diff_pow), Some(two)],
+            vec![sq],
+        ));
+        let var = val(&mut g, "var");
+        reduce_mean(&mut g, sq, var);
+        let vare = val(&mut g, "vare");
+        g.insert_node(Node::new(NodeId(0), "Add", vec![Some(var), Some(eps)], vec![vare]));
+        let std = val(&mut g, "std");
+        g.insert_node(Node::new(NodeId(0), "Sqrt", vec![Some(vare)], vec![std]));
+        let norm = val(&mut g, "norm");
+        g.insert_node(Node::new(
+            NodeId(0),
+            "Div",
+            vec![Some(diff_div), Some(std)],
+            vec![norm],
+        ));
+        let scaled = val(&mut g, "scaled");
+        g.insert_node(Node::new(
+            NodeId(0),
+            "Mul",
+            vec![Some(norm), Some(scale)],
+            vec![scaled],
+        ));
+        let out = val(&mut g, "out");
+        g.insert_node(Node::new(
+            NodeId(0),
+            "Add",
+            vec![Some(scaled), Some(bias)],
+            vec![out],
+        ));
+        g.add_output(out);
+        g
+    }
+
+    #[test]
+    fn fuses_layernorm_split_chain() {
+        // Isolated optimizer-layer coverage for the 10-op split-diff shape
+        // (previously only exercised end-to-end via the bert_toy model).
+        let mut g = layernorm_split_graph(false);
+        assert_eq!(g.num_nodes(), 10, "split-diff shape has two distinct Subs");
+        assert!(g.validate().is_ok());
+
+        let vid = |name: &str| {
+            g.values
+                .iter()
+                .find(|(_, v)| v.name.as_deref() == Some(name))
+                .map(|(id, _)| id)
+                .unwrap()
+        };
+        let x = vid("x");
+        let scale = vid("scale");
+        let bias = vid("bias");
+
+        OpFusion::new().run(&mut g, &PassContext::new()).unwrap();
+
+        assert_eq!(g.num_nodes(), 1, "10-op split chain collapses to one node");
+        let fused = g.nodes.values().next().unwrap();
+        assert_eq!(fused.op_type, "LayerNormalization");
+        assert_eq!(fused.domain, CONTRIB_DOMAIN);
+        // Schema-conformant inputs: exactly [X, Scale, B].
+        assert_eq!(fused.inputs, vec![Some(x), Some(scale), Some(bias)]);
+        assert_eq!(
+            fused.attr("axis").and_then(Attribute::as_int),
+            Some(-1),
+            "axis extracted from ReduceMean axes"
+        );
+        let eps = fused
+            .attr("epsilon")
+            .and_then(Attribute::as_float)
+            .expect("epsilon attribute present");
+        assert!(
+            (eps - 1e-12).abs() < 1e-18,
+            "epsilon extracted from the var+eps constant, got {eps}"
+        );
+        assert_eq!(fused.outputs, g.outputs);
+        assert!(g.validate().is_ok());
+    }
+
+    #[test]
+    fn declines_layernorm_when_numerator_sub_reversed() {
+        // A-CHEW-1 adversarial: the numerator diamond centers with a REVERSED
+        // `Sub(mean, x)` = -(x - mean). Membership of {x, mean} still holds, but
+        // the operand-order guard must DECLINE (else the rewrite silently produces
+        // a sign-flipped LayerNormalization). Ops must be left untouched.
+        let mut g = layernorm_split_graph(true);
+        assert_eq!(g.num_nodes(), 10);
+        assert!(g.validate().is_ok());
+
+        OpFusion::new().run(&mut g, &PassContext::new()).unwrap();
+
+        assert!(
+            g.nodes.values().all(|n| n.op_type != "LayerNormalization"),
+            "reversed Sub(mean, x) must NOT fuse — sign-flip over-match"
+        );
+        assert_eq!(g.num_nodes(), 10, "all 10 ops remain (declined)");
+        assert_eq!(
+            g.nodes.values().filter(|n| n.op_type == "Sub").count(),
+            2,
+            "both centering Subs preserved"
+        );
+        assert!(g.validate().is_ok());
     }
 
     #[test]
