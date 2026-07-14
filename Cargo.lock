@@ -1693,6 +1693,56 @@ dependencies = [
 ]
 
 [[package]]
+name = "onnx-runtime-capi"
+version = "0.1.0"
+dependencies = [
+ "onnx-runtime-session",
+]
+
+[[package]]
+name = "onnx-runtime-ep-api"
+version = "0.1.0"
+dependencies = [
+ "onnx-runtime-ir",
+ "thiserror",
+]
+
+[[package]]
+name = "onnx-runtime-ep-cpu"
+version = "0.1.0"
+dependencies = [
+ "onnx-runtime-ep-api",
+ "onnx-runtime-ir",
+ "thiserror",
+]
+
+[[package]]
+name = "onnx-runtime-ir"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+]
+
+[[package]]
+name = "onnx-runtime-loader"
+version = "0.1.0"
+dependencies = [
+ "onnx-runtime-ir",
+ "thiserror",
+]
+
+[[package]]
+name = "onnx-runtime-session"
+version = "0.1.0"
+dependencies = [
+ "onnx-runtime-ep-api",
+ "onnx-runtime-ep-cpu",
+ "onnx-runtime-ir",
+ "onnx-runtime-loader",
+ "thiserror",
+]
+
+[[package]]
 name = "oorandom"
 version = "11.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"

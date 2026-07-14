@@ -1,0 +1,15 @@
+[package]
+name = "onnx-runtime-capi"
+description = "C ABI for the ORT 2.0 runtime: a libonnxruntime.so drop-in surface (skeleton)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords = ["onnx", "capi", "ffi", "inference", "runtime"]
+categories = ["science", "api-bindings"]
+
+[lib]
+crate-type = ["lib"]
+
+[dependencies]
+onnx-runtime-session = { workspace = true }

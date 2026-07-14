@@ -1,0 +1,13 @@
+[package]
+name = "onnx-runtime-ep-api"
+description = "Execution Provider API for the ORT 2.0 runtime: ExecutionProvider and Kernel traits, OpRegistry, and the ORT graph ABI bridge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords = ["onnx", "execution-provider", "kernel", "inference", "runtime"]
+categories = ["science", "hardware-support"]
+
+[dependencies]
+onnx-runtime-ir = { workspace = true }
+thiserror = { workspace = true }

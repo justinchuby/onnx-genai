@@ -1,0 +1,16 @@
+[package]
+name = "onnx-runtime-session"
+description = "Session and inference API for the ORT 2.0 runtime: intent-based SessionBuilder and sequential executor (skeleton)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords = ["onnx", "session", "inference", "runtime"]
+categories = ["science", "api-bindings"]
+
+[dependencies]
+onnx-runtime-ir = { workspace = true }
+onnx-runtime-loader = { workspace = true }
+onnx-runtime-ep-api = { workspace = true }
+onnx-runtime-ep-cpu = { workspace = true }
+thiserror = { workspace = true }
