@@ -1776,7 +1776,7 @@ dependencies = [
 
 [[package]]
 name = "onnx-runtime-capi"
-version = "0.1.0"
+version = "0.1.0-dev.0"
 dependencies = [
  "onnx-runtime-ir",
  "onnx-runtime-loader",
@@ -1786,7 +1786,7 @@ dependencies = [
 
 [[package]]
 name = "onnx-runtime-ep-api"
-version = "0.1.0"
+version = "0.1.0-dev.0"
 dependencies = [
  "onnx-runtime-ir",
  "thiserror 2.0.18",
@@ -1794,7 +1794,7 @@ dependencies = [
 
 [[package]]
 name = "onnx-runtime-ep-cpu"
-version = "0.1.0"
+version = "0.1.0-dev.0"
 dependencies = [
  "onnx-runtime-ep-api",
  "onnx-runtime-ir",
@@ -1803,14 +1803,14 @@ dependencies = [
 
 [[package]]
 name = "onnx-runtime-ir"
-version = "0.1.0"
+version = "0.1.0-dev.0"
 dependencies = [
  "thiserror 2.0.18",
 ]
 
 [[package]]
 name = "onnx-runtime-loader"
-version = "0.1.0"
+version = "0.1.0-dev.0"
 dependencies = [
  "memmap2",
  "onnx-runtime-ir",
@@ -1823,7 +1823,7 @@ dependencies = [
 
 [[package]]
 name = "onnx-runtime-optimizer"
-version = "0.1.0"
+version = "0.1.0-dev.0"
 dependencies = [
  "onnx-runtime-ir",
  "onnx-runtime-loader",
@@ -1832,7 +1832,7 @@ dependencies = [
 
 [[package]]
 name = "onnx-runtime-session"
-version = "0.1.0"
+version = "0.1.0-dev.0"
 dependencies = [
  "onnx-runtime-ep-api",
  "onnx-runtime-ep-cpu",
@@ -1845,7 +1845,7 @@ dependencies = [
 
 [[package]]
 name = "onnx-runtime-shape-inference"
-version = "0.1.0"
+version = "0.1.0-dev.0"
 dependencies = [
  "onnx-runtime-ir",
  "onnx-runtime-loader",
