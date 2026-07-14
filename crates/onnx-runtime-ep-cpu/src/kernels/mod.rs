@@ -27,6 +27,7 @@ use onnx_runtime_ir::DataType;
 
 use crate::strided::{elem_offset, next_index, numel};
 
+pub mod activations;
 pub mod add;
 pub mod cast;
 pub mod concat;
@@ -93,6 +94,18 @@ pub const PHASE1_OPS: &[&str] = &[
     "Cos",
     "Sigmoid",
     "Softplus",
+    "Acos",
+    "Acosh",
+    "Asin",
+    "Asinh",
+    "Atan",
+    "Atanh",
+    "Cosh",
+    "Sinh",
+    "Tan",
+    "Elu",
+    "LeakyRelu",
+    "HardSigmoid",
     // Logical / selection.
     "Not",
     "Where",
@@ -134,10 +147,7 @@ pub fn is_phase1_op(op_type: &str) -> bool {
 /// kernels can be added alongside these.
 pub fn build_cpu_registry() -> OpRegistry {
     let mut reg = OpRegistry::new();
-    reg.register(
-        OpKey::new("MatMul", "", 1),
-        Box::new(matmul::MatMulFactory),
-    );
+    reg.register(OpKey::new("MatMul", "", 1), Box::new(matmul::MatMulFactory));
     reg.register(OpKey::new("Add", "", 1), Box::new(add::AddFactory));
     reg.register(OpKey::new("Relu", "", 1), Box::new(relu::ReluFactory));
     reg.register(
@@ -200,9 +210,15 @@ pub fn build_cpu_registry() -> OpRegistry {
     reg.register(OpKey::new("Min", "", 1), Box::new(elementwise::MinFactory));
     reg.register(OpKey::new("Max", "", 1), Box::new(elementwise::MaxFactory));
     // Elementwise unary ops.
-    reg.register(OpKey::new("Sqrt", "", 1), Box::new(elementwise::SqrtFactory));
+    reg.register(
+        OpKey::new("Sqrt", "", 1),
+        Box::new(elementwise::SqrtFactory),
+    );
     reg.register(OpKey::new("Erf", "", 1), Box::new(elementwise::ErfFactory));
-    reg.register(OpKey::new("Tanh", "", 1), Box::new(elementwise::TanhFactory));
+    reg.register(
+        OpKey::new("Tanh", "", 1),
+        Box::new(elementwise::TanhFactory),
+    );
     reg.register(OpKey::new("Cast", "", 1), Box::new(cast::CastFactory));
     // Identity: dtype-agnostic passthrough (raw byte copy).
     reg.register(
@@ -266,6 +282,33 @@ pub fn build_cpu_registry() -> OpRegistry {
     reg.register(
         OpKey::new("Softplus", "", 1),
         Box::new(unary_math::SoftplusFactory),
+    );
+    reg.register(OpKey::new("Acos", "", 1), Box::new(unary_math::AcosFactory));
+    reg.register(
+        OpKey::new("Acosh", "", 1),
+        Box::new(unary_math::AcoshFactory),
+    );
+    reg.register(OpKey::new("Asin", "", 1), Box::new(unary_math::AsinFactory));
+    reg.register(
+        OpKey::new("Asinh", "", 1),
+        Box::new(unary_math::AsinhFactory),
+    );
+    reg.register(OpKey::new("Atan", "", 1), Box::new(unary_math::AtanFactory));
+    reg.register(
+        OpKey::new("Atanh", "", 1),
+        Box::new(unary_math::AtanhFactory),
+    );
+    reg.register(OpKey::new("Cosh", "", 1), Box::new(unary_math::CoshFactory));
+    reg.register(OpKey::new("Sinh", "", 1), Box::new(unary_math::SinhFactory));
+    reg.register(OpKey::new("Tan", "", 1), Box::new(unary_math::TanFactory));
+    reg.register(OpKey::new("Elu", "", 1), Box::new(activations::EluFactory));
+    reg.register(
+        OpKey::new("LeakyRelu", "", 1),
+        Box::new(activations::LeakyReluFactory),
+    );
+    reg.register(
+        OpKey::new("HardSigmoid", "", 1),
+        Box::new(activations::HardSigmoidFactory),
     );
     // Logical / selection.
     reg.register(OpKey::new("Not", "", 1), Box::new(logical::NotFactory));
@@ -555,7 +598,7 @@ pub(crate) mod testutil {
     //! Helpers to build owning-buffer-backed views for kernel unit tests.
 
     use onnx_runtime_ep_api::{DevicePtr, DevicePtrMut, TensorMut, TensorView};
-    use onnx_runtime_ir::{compute_contiguous_strides, DataType, DeviceId};
+    use onnx_runtime_ir::{DataType, DeviceId, compute_contiguous_strides};
 
     /// A dense f32 buffer plus the shape/stride metadata a view needs.
     pub struct Owned {
@@ -835,7 +878,10 @@ mod tests {
         assert!(reg.lookup("Conv", "", 21).is_none());
         // The fused contrib-domain LayerNormalization resolves to the same
         // kernel as the standard default-domain op.
-        assert!(reg.lookup("LayerNormalization", "com.microsoft", 1).is_some());
+        assert!(
+            reg.lookup("LayerNormalization", "com.microsoft", 1)
+                .is_some()
+        );
         assert!(reg.supports("LayerNormalization", "com.microsoft"));
         assert!(reg.supports("MatMul", "ai.onnx"));
         // The `MatMul + Add` fusion's contrib op now has a CPU kernel.
@@ -856,4 +902,3 @@ mod tests {
         view_in_bounds(v.shape, v.strides, v.byte_offset, 4, a.bytes.len()).unwrap();
     }
 }
-

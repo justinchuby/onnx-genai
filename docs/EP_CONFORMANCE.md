@@ -253,6 +253,18 @@ write into pre-shaped output views.
 
 ## ONNX backend test (`onnx.backend.test`)
 
+### CPU unary and activation coverage (2026-07-14)
+
+Hythe added default-domain CPU registrations for `Acos`, `Acosh`, `Asin`,
+`Asinh`, `Atan`, `Atanh`, `Cosh`, `Sinh`, `Tan`, `Elu`, `LeakyRelu`, and
+`HardSigmoid`. The trigonometric kernels use the Rust `f32` intrinsics; the
+activation kernels honor ONNX's `alpha`/`beta` defaults and attributes.
+
+Using the command in the Run section after building and installing the local
+wheel, the CPU node-case result increased from the recorded **130/1,765** to
+**360/1,765** passing cases (1,405 failures). CUDA remained 1,765 skipped
+cases. This comparison uses ONNX 1.22.0 and the unfiltered node-model group.
+
 Run on **2026-07-14** with ONNX 1.22.0 against the nxrt wheel built from commit
 `f2dd92d`. The runner exposes the official node-model group only, avoiding
 offline model downloads. ONNX generates both CPU and CUDA variants; nxrt's

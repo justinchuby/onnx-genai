@@ -40,6 +40,15 @@ enum MathOp {
     Cos,
     Sigmoid,
     Softplus,
+    Acos,
+    Acosh,
+    Asin,
+    Asinh,
+    Atan,
+    Atanh,
+    Cosh,
+    Sinh,
+    Tan,
 }
 
 impl MathOp {
@@ -58,6 +67,15 @@ impl MathOp {
             MathOp::Cos => "Cos",
             MathOp::Sigmoid => "Sigmoid",
             MathOp::Softplus => "Softplus",
+            MathOp::Acos => "Acos",
+            MathOp::Acosh => "Acosh",
+            MathOp::Asin => "Asin",
+            MathOp::Asinh => "Asinh",
+            MathOp::Atan => "Atan",
+            MathOp::Atanh => "Atanh",
+            MathOp::Cosh => "Cosh",
+            MathOp::Sinh => "Sinh",
+            MathOp::Tan => "Tan",
         }
     }
 
@@ -78,6 +96,15 @@ impl MathOp {
             MathOp::Cos => x.cos(),
             MathOp::Sigmoid => sigmoid(x),
             MathOp::Softplus => softplus(x),
+            MathOp::Acos => x.acos(),
+            MathOp::Acosh => x.acosh(),
+            MathOp::Asin => x.asin(),
+            MathOp::Asinh => x.asinh(),
+            MathOp::Atan => x.atan(),
+            MathOp::Atanh => x.atanh(),
+            MathOp::Cosh => x.cosh(),
+            MathOp::Sinh => x.sinh(),
+            MathOp::Tan => x.tan(),
         }
     }
 }
@@ -140,6 +167,15 @@ math_factory!(SinFactory, MathOp::Sin);
 math_factory!(CosFactory, MathOp::Cos);
 math_factory!(SigmoidFactory, MathOp::Sigmoid);
 math_factory!(SoftplusFactory, MathOp::Softplus);
+math_factory!(AcosFactory, MathOp::Acos);
+math_factory!(AcoshFactory, MathOp::Acosh);
+math_factory!(AsinFactory, MathOp::Asin);
+math_factory!(AsinhFactory, MathOp::Asinh);
+math_factory!(AtanFactory, MathOp::Atan);
+math_factory!(AtanhFactory, MathOp::Atanh);
+math_factory!(CoshFactory, MathOp::Cosh);
+math_factory!(SinhFactory, MathOp::Sinh);
+math_factory!(TanFactory, MathOp::Tan);
 
 impl Kernel for UnaryMathKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
