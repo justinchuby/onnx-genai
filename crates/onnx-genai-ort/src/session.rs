@@ -506,6 +506,40 @@ impl Session {
             .any(|provider| matches!(provider, ExecutionProvider::Metal))
     }
 
+    /// Whether this session's execution provider can accept the runtime-owned,
+    /// fixed-capacity present (KV) buffer as a *pre-bound* `present.*` output.
+    ///
+    /// WHAT: Reports whether the active EP honors ORT's pre-bound,
+    /// fixed-capacity present-output contract that the O(1)/token
+    /// [`ModelDecodePath::PastPresent`](crate) SharedBuffer decode path depends
+    /// on. When TRUE, decode may bind the runtime-owned max-length KV buffer as
+    /// the EP's `present.*` output; when FALSE, decode must fall back to the
+    /// growing `ZeroCopyRebind` path.
+    ///
+    /// WHY: CPU, CUDA and WebGPU EPs consume a fixed-capacity present binding
+    /// correctly and use the shared buffer successfully today. The external
+    /// Metal plugin's growing-shape GQA kernel instead requests
+    /// `capacity + sequence_length` elements at bind time, which fails ORT's
+    /// pre-bound output-size check and crashed Metal E2E (see the KV notes in
+    /// `onnx-genai-engine`'s `detect_model_decode_path`). Metal therefore
+    /// declares NO fixed-capacity present support by default, preserving today's
+    /// `ZeroCopyRebind` behavior. Concentrating this EP-identity knowledge in a
+    /// single semantic capability keeps `is_metal()` out of decode business
+    /// logic (RULES.md §2).
+    ///
+    /// HOW: Non-Metal EPs return TRUE. The Metal plugin returns FALSE unless the
+    /// operator explicitly opts in via
+    /// `ONNX_GENAI_SHARED_KV_PRESENT_BINDING=1` (see
+    /// [`shared_kv_present_binding_opt_in_from_env`]), which lets the default
+    /// flip to enabled once the MLX/Metal EP is verified on real Apple-silicon
+    /// hardware — with no further code change.
+    pub fn supports_fixed_capacity_present_binding(&self) -> bool {
+        if self.is_metal() {
+            return shared_kv_present_binding_opt_in_from_env();
+        }
+        true
+    }
+
     /// Create a device-resident allocator for KV buffers, if this session runs
     /// on an execution provider that owns device memory (CUDA or WebGPU).
     ///
@@ -774,6 +808,32 @@ fn webgpu_disable_validation_from_env() -> bool {
 /// `.squad/decisions/inbox/leon-device-resident-kv.md`.
 fn device_kv_enabled_from_env() -> bool {
     match std::env::var("ONNX_GENAI_DEVICE_KV") {
+        Ok(value) => matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+        Err(_) => false,
+    }
+}
+
+/// Explicit operator opt-in that lets the Metal plugin EP participate in the
+/// fixed-capacity, pre-bound present-output (SharedBuffer) decode path.
+///
+/// WHAT: Reads `ONNX_GENAI_SHARED_KV_PRESENT_BINDING` and returns TRUE for the
+/// usual truthy values (`1`/`true`/`yes`/`on`), FALSE otherwise (including
+/// unset).
+///
+/// WHY: The Metal plugin's growing-shape GQA kernel currently fails ORT's
+/// pre-bound present-output size check, so Metal defaults to the safe
+/// `ZeroCopyRebind` path. This flag exists so that once the MLX/Metal EP is
+/// verified on real Apple-silicon hardware, the SharedBuffer path can be enabled
+/// for Metal without a code change.
+///
+/// HOW: Consumed only by
+/// [`Session::supports_fixed_capacity_present_binding`]; it has no effect on
+/// non-Metal EPs, which already declare the capability unconditionally.
+fn shared_kv_present_binding_opt_in_from_env() -> bool {
+    match std::env::var("ONNX_GENAI_SHARED_KV_PRESENT_BINDING") {
         Ok(value) => matches!(
             value.trim().to_ascii_lowercase().as_str(),
             "1" | "true" | "yes" | "on"

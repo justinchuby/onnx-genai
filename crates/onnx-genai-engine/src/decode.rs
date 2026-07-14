@@ -849,8 +849,16 @@ pub(crate) fn detect_model_decode_path(
         // while the runtime manages the KV buffer itself, giving O(1)/token KV
         // instead of the growing `ZeroCopyRebind` path whose per-token cost
         // scales with context. `shared_kv_max_len` pre-sizes that buffer.
+        //
+        // The SharedBuffer path is taken only when the metadata requests it AND
+        // the session's EP declares it can accept the runtime-owned
+        // fixed-capacity present buffer as a pre-bound output. This capability
+        // predicate (not `is_metal()`) is the sole gate: the Metal plugin
+        // declares no such support by default, so it stays on `ZeroCopyRebind`
+        // until opted in — see `Session::supports_fixed_capacity_present_binding`.
+        let supports_present_binding = session.supports_fixed_capacity_present_binding();
         if let (DecodeKvMode::SharedBuffer, Some(max_len)) = (
-            decode_kv_mode_from_shared_buffer_len(shared_kv_max_len),
+            decode_kv_mode_from_shared_buffer_len(shared_kv_max_len, supports_present_binding),
             shared_kv_max_len,
         ) {
             return Ok(ModelDecodePath::PastPresent {
@@ -861,8 +869,9 @@ pub(crate) fn detect_model_decode_path(
             });
         }
 
-        let shared_buffer =
-            session.past_present_share_buffer_supported() && metadata_max_context.is_some();
+        let shared_buffer = supports_present_binding
+            && session.past_present_share_buffer_supported()
+            && metadata_max_context.is_some();
         return Ok(ModelDecodePath::PastPresent {
             shared_buffer,
             max_len: metadata_max_context.filter(|_| shared_buffer),
@@ -932,15 +941,24 @@ pub(crate) fn shared_kv_buffer_len_from_metadata(metadata: &InferenceMetadata) -
     model.max_sequence_length
 }
 
-/// Resolve the low-level decode KV mode requested by native inference metadata.
+/// Resolve the low-level decode KV mode from native inference metadata and the
+/// session's present-binding capability.
 ///
-/// This is deliberately independent of execution-provider identity: metadata
-/// describes the model's past/present aliasing contract, which every provider
-/// must receive unchanged.
+/// This deliberately takes only two orthogonal inputs — the metadata's
+/// share-buffer request (`shared_kv_buffer_len`) and a single semantic
+/// capability bool (`supports_fixed_capacity_present_binding`) — rather than an
+/// execution-provider identity. Metadata describes the model's past/present
+/// aliasing contract (identical for every provider); the capability describes
+/// whether the active EP can accept the runtime-owned fixed-capacity present
+/// buffer as a pre-bound output. `SharedBuffer` is selected only when the
+/// metadata requests it AND the session declares the capability; otherwise the
+/// growing `ZeroCopyRebind` path is used. Keeping this pure keeps it testable
+/// without an ORT session and keeps EP-identity knowledge out of decode logic.
 pub(crate) fn decode_kv_mode_from_shared_buffer_len(
     shared_kv_buffer_len: Option<usize>,
+    supports_fixed_capacity_present_binding: bool,
 ) -> DecodeKvMode {
-    if shared_kv_buffer_len.is_some() {
+    if shared_kv_buffer_len.is_some() && supports_fixed_capacity_present_binding {
         DecodeKvMode::SharedBuffer
     } else {
         DecodeKvMode::ZeroCopyRebind
@@ -1689,11 +1707,47 @@ mod tests {
             .to_inference_metadata(Some("float16"))
             .expect("share-buffer metadata");
 
-        // No provider is an input to resolution: Metal/MLX must select the
-        // identical mode as CPU and CUDA for this metadata contract.
+        // The metadata contract is provider-independent: given a capable session
+        // (CPU/CUDA/WebGPU, or an opted-in Metal), this share-buffer metadata
+        // resolves to the SharedBuffer mode.
         assert_eq!(
-            decode_kv_mode_from_shared_buffer_len(shared_kv_buffer_len_from_metadata(&metadata)),
+            decode_kv_mode_from_shared_buffer_len(
+                shared_kv_buffer_len_from_metadata(&metadata),
+                true,
+            ),
             DecodeKvMode::SharedBuffer
+        );
+    }
+
+    #[test]
+    fn decode_kv_mode_gates_shared_buffer_on_present_binding_capability() {
+        // Share-buffer requested by metadata (Some(max_len)).
+        let requested = Some(4096usize);
+        // Metadata does NOT request share-buffer.
+        let not_requested: Option<usize> = None;
+
+        // Capable session (CPU/CUDA/WebGPU, or opted-in Metal) ⇒ SharedBuffer.
+        assert_eq!(
+            decode_kv_mode_from_shared_buffer_len(requested, true),
+            DecodeKvMode::SharedBuffer
+        );
+
+        // Metal-without-opt-in (capability FALSE) ⇒ ZeroCopyRebind, even though
+        // the metadata requested the shared buffer. This preserves today's Metal
+        // behavior and keeps `is_metal()` out of decode logic.
+        assert_eq!(
+            decode_kv_mode_from_shared_buffer_len(requested, false),
+            DecodeKvMode::ZeroCopyRebind
+        );
+
+        // No share-buffer request ⇒ ZeroCopyRebind regardless of capability.
+        assert_eq!(
+            decode_kv_mode_from_shared_buffer_len(not_requested, true),
+            DecodeKvMode::ZeroCopyRebind
+        );
+        assert_eq!(
+            decode_kv_mode_from_shared_buffer_len(not_requested, false),
+            DecodeKvMode::ZeroCopyRebind
         );
     }
 
