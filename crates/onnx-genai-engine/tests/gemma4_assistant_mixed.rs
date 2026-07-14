@@ -105,15 +105,13 @@ fn request() -> GenerateRequest {
 /// W5b: speculative decoding on the mixed-head_dim fixture must be token-identical
 /// to plain greedy.
 ///
-/// Blocked on W3 per-layer paged cache landing.  The KV slicer
-/// (`shared_kv_proposer_slices`) currently reads a single global head_dim from
-/// `materialized.head_dim`; it must instead index the per-layer config for the
-/// specific layer referenced by each `SharedKvGroup::target_layers.last()`.
+/// Per-layer paged cache (W3) has landed. This test exercises the mixed-head_dim
+/// path: the KV slicer must supply each shared-KV group with its correct per-layer
+/// head_dim (8 for sliding_attention, 16 for full_attention).
 ///
-/// When enabling: remove `#[ignore]` and confirm the test passes on CPU with the
-/// existing fixture data (no fixture regeneration needed).
+/// Fixture `tests/fixtures/tiny-gemma4-assistant-mixed/` now includes
+/// `input_embedding.f32` (VOCAB=32, HIDDEN=16, f32 little-endian).
 #[test]
-#[ignore = "enable after W3 per-layer paged cache lands (see roy-gemma4-e2b-realrun-plan.md §4 W3)"]
 fn gemma4_assistant_mixed_speculative_matches_plain_greedy() -> anyhow::Result<()> {
     let fixture = fixture()?;
     let mut baseline = engine(&fixture, SpeculativeMode::None)?;

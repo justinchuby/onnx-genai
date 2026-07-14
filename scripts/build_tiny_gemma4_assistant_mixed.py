@@ -358,6 +358,13 @@ def main() -> None:
     ir.save(assistant, str(assistant_dir / "model.onnx"))
     _copy_tokenizer(OUT_DIR / "tokenizer.json")
 
+    # The shared-KV proposer builds inputs_embeds from the target input-token
+    # embedding of the last token (concat(embed(last_token), hidden)). The tiny
+    # target uses `hidden_table` as its embedding — export it as raw little-endian
+    # f32 [VOCAB, HIDDEN] so the engine's LinearEmbedder / read_f32_weights loads it.
+    input_embedding = (_rng("hidden").standard_normal((VOCAB, HIDDEN)) * 0.02).astype("<f4")
+    (OUT_DIR / "input_embedding.f32").write_bytes(input_embedding.tobytes())
+
     manifest = {
         "generator": "scripts/build_tiny_gemma4_assistant_mixed.py",
         "seed": SEED,
