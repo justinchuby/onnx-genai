@@ -1467,6 +1467,14 @@
           "default": null,
           "minimum": 1
         },
+        "input_embedding": {
+          "description": "Relative path (from the model directory) to the target model's raw\ninput-token embedding table, as a little-endian f32 matrix in\n`[vocab_size, backbone_hidden_size]` order.\n\nThe `shared_kv` proposer builds each step's `inputs_embeds` as\n`concat(target_input_embedding(last_token), hidden)`, so it must be able\nto look up the target's input embedding of the last drafted/accepted\ntoken. Required for the `shared_kv` proposer.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
         "logits_output": {
           "description": "Name of the proposer's draft-distribution output.\n\nDefaults to `logits` for `shared_kv`.",
           "type": [

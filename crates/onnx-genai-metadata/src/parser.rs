@@ -40,6 +40,9 @@ pub struct SharedKvProposerSpec {
     pub projected_state_output: String,
     /// Name of the assistant's draft-distribution output.
     pub logits_output: String,
+    /// Absolute path to the target model's raw input-token embedding table
+    /// (`[vocab_size, backbone_hidden_size]` little-endian f32).
+    pub input_embedding: PathBuf,
     /// Shared-KV binding groups consumed by the assistant.
     pub shared_kv: Vec<SharedKvGroup>,
 }
@@ -124,6 +127,13 @@ fn resolve_shared_kv(
             "shared_kv metadata is missing `vocab_size`".into(),
         );
     };
+    let Some(input_embedding) = config.input_embedding.as_ref() else {
+        return SpeculatorProposerStatus::Unknown(
+            "shared_kv metadata is missing `input_embedding` (target input-token \
+             embedding table required to build the assistant's inputs_embeds)"
+                .into(),
+        );
+    };
     if config.shared_kv.is_empty() {
         return SpeculatorProposerStatus::Unknown(
             "shared_kv metadata declares no `shared_kv` binding groups".into(),
@@ -152,6 +162,7 @@ fn resolve_shared_kv(
             .logits_output
             .clone()
             .unwrap_or_else(|| "logits".to_string()),
+        input_embedding: model_dir.join(input_embedding),
         shared_kv: config.shared_kv.clone(),
     })
 }
@@ -248,6 +259,7 @@ speculative:
   vocab_size: 32
   projected_state_output: projected_state
   logits_output: logits
+  input_embedding: input_embedding.f32
   shared_kv:
     - name: sliding_attention
       target_layers: [0]
@@ -287,6 +299,10 @@ speculative:
         assert_eq!(spec.vocab_size, 32);
         assert_eq!(spec.projected_state_output, "projected_state");
         assert_eq!(spec.logits_output, "logits");
+        assert_eq!(
+            spec.input_embedding,
+            Path::new("/models/shared-kv/input_embedding.f32")
+        );
         assert_eq!(spec.shared_kv.len(), 2);
     }
 
@@ -338,6 +354,7 @@ speculative:
   model: assistant/model.onnx
   backbone_hidden_size: 8
   vocab_size: 16
+  input_embedding: input_embedding.f32
   shared_kv:
     - name: sliding_attention
       target_layers: [0]
@@ -355,6 +372,10 @@ speculative:
         };
         assert_eq!(spec.projected_state_output, "projected_state");
         assert_eq!(spec.logits_output, "logits");
+        assert_eq!(
+            spec.input_embedding,
+            Path::new("/models/shared-kv/input_embedding.f32")
+        );
         assert_eq!(spec.num_speculative_tokens, 4);
         assert_eq!(spec.shared_kv.len(), 1);
     }

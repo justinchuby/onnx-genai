@@ -116,6 +116,17 @@ pub struct SpeculatorConfig {
     #[serde(default)]
     pub logits_output: Option<String>,
 
+    /// Relative path (from the model directory) to the target model's raw
+    /// input-token embedding table, as a little-endian f32 matrix in
+    /// `[vocab_size, backbone_hidden_size]` order.
+    ///
+    /// The `shared_kv` proposer builds each step's `inputs_embeds` as
+    /// `concat(target_input_embedding(last_token), hidden)`, so it must be able
+    /// to look up the target's input embedding of the last drafted/accepted
+    /// token. Required for the `shared_kv` proposer.
+    #[serde(default)]
+    pub input_embedding: Option<String>,
+
     /// Shared-KV binding groups consumed by the proposer.
     ///
     /// Each group names an assistant input prefix

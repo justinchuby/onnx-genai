@@ -74,6 +74,7 @@ fn assistant_config(fixture: &Path) -> SharedKvProposerConfig {
     SharedKvProposerConfig {
         assistant_model: fixture.join("assistant/model.onnx"),
         target_hidden_output: "hidden_states.0".into(),
+        input_embedding_weights: fixture.join("input_embedding.f32"),
         backbone_hidden_size: 16,
         vocab_size: 32,
         num_speculative_tokens: 4,

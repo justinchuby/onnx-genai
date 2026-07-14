@@ -524,20 +524,30 @@ where
 /// The assistant owns no KV cache: it reads slices of the target model's paged
 /// KV cache through `shared_kv.*` inputs (provided via the proposer context) and
 /// carries its own internal `lm_head`. Each step consumes
-/// `inputs_embeds = concat(previous_projected_state, current_projected_state)`
-/// (each `H` wide), emits full draft `logits`, and threads its `projected_state`
-/// output forward. Step 0 seeds both projected states from the target's last
-/// hidden state.
+/// `inputs_embeds = concat(target_input_embedding(last_token), hidden)` (each `H`
+/// wide), emits full draft `logits`, and threads its `projected_state` output
+/// forward as the next step's `hidden`. The first step seeds `hidden` from the
+/// target's last hidden state and `last_token` from the last context token; the
+/// guaranteed target token is emitted for free and its assistant step only
+/// advances the threaded hidden state before real drafts begin.
 pub struct SharedKvProposer<'a> {
     session: SharedKvProposerSession<'a>,
+    embedder: &'a dyn TokenEmbedder,
 }
 
 impl<'a> SharedKvProposer<'a> {
-    pub fn new(model: &'a Session) -> anyhow::Result<Self> {
+    pub fn new(model: &'a Session, embedder: &'a dyn TokenEmbedder) -> anyhow::Result<Self> {
         let session = SharedKvProposerSession::new(model).map_err(|error| {
             anyhow::anyhow!("Failed to create shared-KV proposer decode session: {error}")
         })?;
-        Ok(Self { session })
+        let hidden_size = session.signature().backbone_hidden_size;
+        if embedder.hidden_size() != hidden_size {
+            anyhow::bail!(
+                "shared-KV proposer embedding hidden size {} != backbone hidden size {hidden_size}",
+                embedder.hidden_size()
+            );
+        }
+        Ok(Self { session, embedder })
     }
 
     /// Target backbone hidden size `H` expected by this assistant.
@@ -567,34 +577,58 @@ impl SpeculativeProposer for SharedKvProposer<'_> {
                 hidden.len()
             );
         }
+        let seed_token = context
+            .context_tokens
+            .last()
+            .copied()
+            .context("shared-KV proposer requires at least one context token")?;
 
         let draft_count = context.width.saturating_sub(1);
         let mut tokens = Vec::with_capacity(draft_count + 1);
         tokens.push(guaranteed_token);
 
-        // (prev, cur) projected states threaded across steps; both seed from the
-        // target's last hidden state before the assistant has produced any state.
-        let mut prev_state = hidden.to_vec();
-        let mut cur_state = hidden.to_vec();
+        // Reference contract (HF `SinglePositionMultiTokenCandidateGenerator`):
+        // each step feeds `inputs_embeds = concat(embed(last_token), hidden)`,
+        // where `embed` is the *target* model's raw input-token embedding and
+        // `hidden` is the target's last hidden state (step 0) or the assistant's
+        // own threaded `projected_state` (later steps). The RoPE position is held
+        // constant by the exported graph (derived from the shared-KV length), so
+        // the token embedding is the only per-step positional cue.
+        //
+        // The guaranteed target token is taken for free, but the assistant is
+        // still run once to advance the threaded hidden state to the position
+        // that follows it; that bootstrap step's own draft is discarded and
+        // `last_token` is pinned to the guaranteed token. Subsequent steps emit
+        // the real draft tokens.
+        let mut last_hidden = hidden.to_vec();
+        let mut last_token = seed_token;
         let mut inputs_embeds = vec![0.0f32; 2 * hidden_size];
-        for step in 0..draft_count {
-            inputs_embeds[..hidden_size].copy_from_slice(&prev_state);
-            inputs_embeds[hidden_size..].copy_from_slice(&cur_state);
-            let position = i64::try_from(context.context_tokens.len() + step)
-                .context("shared-KV proposer position exceeds i64")?;
+        let position = i64::try_from(context.context_tokens.len().saturating_sub(1))
+            .context("shared-KV proposer position exceeds i64")?;
+        for step in 0..context.width {
+            self.embedder
+                .embed(last_token, &mut inputs_embeds[..hidden_size])?;
+            inputs_embeds[hidden_size..].copy_from_slice(&last_hidden);
             let output = self
                 .session
                 .step(&inputs_embeds, position, shared_kv)
                 .map_err(|error| {
                     anyhow::anyhow!("shared-KV proposer proposal step failed: {error}")
                 })?;
-            let token = TokenId::try_from(
+            let drafted = TokenId::try_from(
                 argmax(&output.logits)
                     .context("shared-KV proposer produced empty draft logits")?,
             )
             .context("shared-KV proposer token id exceeds u32 range")?;
-            tokens.push(token);
-            prev_state = std::mem::replace(&mut cur_state, output.projected_state);
+            last_hidden = output.projected_state;
+            if step == 0 {
+                // Bootstrap: pin to the guaranteed target token so the drafts
+                // that follow condition on it exactly.
+                last_token = guaranteed_token;
+            } else {
+                tokens.push(drafted);
+                last_token = drafted;
+            }
         }
         Ok(SpeculativeProposal::linear(tokens))
     }
@@ -957,7 +991,7 @@ impl Engine {
                     let assistant = self.shared_kv_proposer.as_ref().context(
                         "shared-KV proposer speculation requested without a loaded proposer model",
                     )?;
-                    SharedKvProposer::new(&assistant.session)?
+                    SharedKvProposer::new(&assistant.session, &assistant.embedder)?
                         .propose(&proposer_context)?
                         .tokens
                 }
