@@ -6,9 +6,10 @@
 //! a fixed shape path — the executor is exercised as a generic Graph runner.
 
 use onnx_runtime_ir::{
-    static_shape, Attribute, DataType, Graph, Node, NodeId, TensorData, ValueId, WeightRef,
+    static_shape, Attribute, DataType, Dim, Graph, Node, NodeId, Shape, TensorData, ValueId,
+    WeightRef,
 };
-use onnx_runtime_session::{InferenceSession, Tensor, WarmupShape};
+use onnx_runtime_session::{InferenceSession, SessionError, Tensor, WarmupShape};
 
 // --- graph construction helpers --------------------------------------------
 
@@ -47,6 +48,37 @@ fn op(
     attrs: &[(&str, Attribute)],
 ) -> ValueId {
     let out = g.create_value(out_dtype, static_shape(out_dims.iter().copied()));
+    let mut node = Node::new(
+        NodeId(0),
+        op_type,
+        inputs.iter().map(|&v| Some(v)).collect(),
+        vec![out],
+    );
+    for (k, v) in attrs {
+        node.attributes.insert((*k).to_string(), v.clone());
+    }
+    g.insert_node(node);
+    out
+}
+
+/// Add a named graph input with an explicit (possibly symbolic) shape.
+fn input_shaped(g: &mut Graph, name: &str, dtype: DataType, shape: Shape) -> ValueId {
+    let vid = g.create_named_value(name, dtype, shape);
+    g.add_input(vid);
+    vid
+}
+
+/// Insert an op node whose single output carries an explicit (possibly
+/// symbolic) shape — mirroring what the loader's shape inference would produce.
+fn op_shaped(
+    g: &mut Graph,
+    op_type: &str,
+    inputs: &[ValueId],
+    out_dtype: DataType,
+    out_shape: Shape,
+    attrs: &[(&str, Attribute)],
+) -> ValueId {
+    let out = g.create_value(out_dtype, out_shape);
     let mut node = Node::new(
         NodeId(0),
         op_type,
@@ -315,4 +347,202 @@ fn input_shape_mismatch_is_rejected() {
         err,
         onnx_runtime_session::SessionError::ShapeMismatch { .. }
     ));
+}
+
+// --- dynamic (symbolic) shape tests ----------------------------------------
+
+/// A graph with a symbolic leading dim (`[batch, 4]` MatMul → Add → Relu) runs
+/// correctly for two *different* batch sizes in the same session: shapes resolve
+/// from the actual inputs, buffers re-size, and the kernel cache re-resolves for
+/// the new shape while reusing the plan for a repeated shape.
+#[test]
+fn symbolic_batch_matmul_chain_runs_for_multiple_shapes() {
+    let w_data = [
+        1.0f32, 0.0, 0.0, 0.0, //
+        0.0, 1.0, 0.0, 0.0, //
+        0.0, 0.0, 1.0, 0.0, //
+        0.0, 0.0, 0.0, 1.0,
+    ];
+    let bias = [0.5f32, -0.5, 1.0, -1.0];
+
+    let mut g = Graph::new();
+    let batch = g.intern_symbol("batch");
+    let sym_row = || vec![Dim::Symbolic(batch), Dim::Static(4)];
+
+    let x = input_shaped(&mut g, "X", DataType::Float32, sym_row());
+    let w = f32_init(&mut g, "W", &[4, 4], &w_data);
+    let m = op_shaped(&mut g, "MatMul", &[x, w], DataType::Float32, sym_row(), &[]);
+    let b = f32_init(&mut g, "B", &[4], &bias);
+    let a = op_shaped(&mut g, "Add", &[m, b], DataType::Float32, sym_row(), &[]);
+    let y = op_shaped(&mut g, "Relu", &[a], DataType::Float32, sym_row(), &[]);
+    g.add_output(y);
+
+    let mut session = InferenceSession::from_graph(g).expect("build symbolic session");
+
+    // A symbolic graph is not compiled at build (no concrete shapes yet).
+    let after_build = session.cache_stats();
+    assert_eq!(after_build.entries, 0, "no kernels compiled before first run");
+    assert_eq!(after_build.misses, 0);
+
+    let run_batch = |session: &mut InferenceSession, rows: usize, fill: f32| -> Vec<f32> {
+        let data: Vec<f32> = (0..rows * 4).map(|i| fill + i as f32).collect();
+        let x_tensor = Tensor::from_f32(&[rows, 4], &data).unwrap();
+        let out = session.run(&[("X", &x_tensor)]).expect("run");
+        assert_eq!(out[0].shape, vec![rows, 4]);
+        // Reference: identity matmul + row bias + relu.
+        let m_ref = ref_matmul(&data, rows, 4, &w_data, 4);
+        let a_ref = ref_add_rowvec(&m_ref, rows, 4, &bias);
+        let y_ref = ref_relu(&a_ref);
+        assert_close(&out[0].to_vec_f32(), &y_ref);
+        out[0].to_vec_f32()
+    };
+
+    // batch = 2 → first shape: three nodes compiled (misses), no hits.
+    run_batch(&mut session, 2, 0.0);
+    let s2 = session.cache_stats();
+    assert_eq!(s2.entries, 3, "three nodes compiled for batch=2");
+    assert_eq!(s2.misses, 3);
+    assert_eq!(s2.hits, 0);
+
+    // batch = 3 → new resolved shape: re-resolves + re-plans (3 more entries).
+    run_batch(&mut session, 3, 10.0);
+    let s3 = session.cache_stats();
+    assert_eq!(s3.entries, 6, "batch=3 adds three distinct shape-keyed entries");
+    assert_eq!(s3.misses, 6);
+    assert_eq!(s3.hits, 0);
+
+    // batch = 2 again → the batch=2 plan is reused (cache hits, no new entries).
+    run_batch(&mut session, 2, 100.0);
+    let s2b = session.cache_stats();
+    assert_eq!(s2b.entries, 6, "no new entries: batch=2 plan reused");
+    assert_eq!(s2b.misses, 6);
+    assert_eq!(s2b.hits, 3, "each node served from the batch=2 cache");
+}
+
+/// Two inputs share a symbol (`batch`); supplying them with *conflicting*
+/// concrete sizes is a resolution error, not a silently-wrong run.
+#[test]
+fn symbol_conflict_across_inputs_is_rejected() {
+    let mut g = Graph::new();
+    let batch = g.intern_symbol("batch");
+    let sym_row = || vec![Dim::Symbolic(batch), Dim::Static(4)];
+
+    let a = input_shaped(&mut g, "A", DataType::Float32, sym_row());
+    let b = input_shaped(&mut g, "B", DataType::Float32, sym_row());
+    let s = op_shaped(&mut g, "Add", &[a, b], DataType::Float32, sym_row(), &[]);
+    g.add_output(s);
+
+    let mut session = InferenceSession::from_graph(g).expect("build");
+
+    let a_t = Tensor::from_f32(&[2, 4], &[0.0; 8]).unwrap();
+    let b_t = Tensor::from_f32(&[3, 4], &[0.0; 12]).unwrap();
+    let err = session.run(&[("A", &a_t), ("B", &b_t)]).unwrap_err();
+    assert!(
+        matches!(err, SessionError::SymbolConflict { .. }),
+        "expected SymbolConflict, got {err:?}"
+    );
+
+    // Agreeing sizes resolve fine.
+    let a_ok = Tensor::from_f32(&[2, 4], &[1.0; 8]).unwrap();
+    let b_ok = Tensor::from_f32(&[2, 4], &[2.0; 8]).unwrap();
+    let out = session.run(&[("A", &a_ok), ("B", &b_ok)]).expect("run");
+    assert_close(&out[0].to_vec_f32(), &[3.0; 8]);
+    assert_eq!(out[0].shape, vec![2, 4]);
+}
+
+/// A value whose shape carries a symbol that no input binds cannot be sized:
+/// the session reports it as an uninferred shape naming the producing op,
+/// rather than guessing (the loader-shape-inference-gap signal, §5).
+#[test]
+fn unresolved_symbol_reports_uninferred_shape() {
+    let mut g = Graph::new();
+    let batch = g.intern_symbol("batch");
+    let ghost = g.intern_symbol("ghost"); // never appears on any input
+
+    let x = input_shaped(
+        &mut g,
+        "X",
+        DataType::Float32,
+        vec![Dim::Symbolic(batch), Dim::Static(4)],
+    );
+    // Relu output declares an unbindable symbol on its leading dim.
+    let y = op_shaped(
+        &mut g,
+        "Relu",
+        &[x],
+        DataType::Float32,
+        vec![Dim::Symbolic(ghost), Dim::Static(4)],
+        &[],
+    );
+    g.add_output(y);
+
+    let mut session = InferenceSession::from_graph(g).expect("build");
+    let x_t = Tensor::from_f32(&[2, 4], &[0.0; 8]).unwrap();
+    let err = session.run(&[("X", &x_t)]).unwrap_err();
+    assert!(
+        matches!(err, SessionError::UnresolvedShape { ref op, .. } if op == "Relu"),
+        "expected UnresolvedShape naming the producing op, got {err:?}"
+    );
+}
+
+/// A symbolic input supplied with the wrong rank is rejected before dispatch.
+#[test]
+fn symbolic_input_rank_mismatch_is_rejected() {
+    let mut g = Graph::new();
+    let batch = g.intern_symbol("batch");
+    let x = input_shaped(
+        &mut g,
+        "X",
+        DataType::Float32,
+        vec![Dim::Symbolic(batch), Dim::Static(4)],
+    );
+    let y = op_shaped(
+        &mut g,
+        "Relu",
+        &[x],
+        DataType::Float32,
+        vec![Dim::Symbolic(batch), Dim::Static(4)],
+        &[],
+    );
+    g.add_output(y);
+
+    let mut session = InferenceSession::from_graph(g).expect("build");
+    // Rank-3 tensor for a rank-2 declared input.
+    let wrong = Tensor::from_f32(&[2, 2, 4], &[0.0; 16]).unwrap();
+    let err = session.run(&[("X", &wrong)]).unwrap_err();
+    assert!(
+        matches!(err, SessionError::RankMismatch { .. }),
+        "expected RankMismatch, got {err:?}"
+    );
+}
+
+/// A static dim declared alongside a symbolic one must still match exactly.
+#[test]
+fn symbolic_input_static_dim_mismatch_is_rejected() {
+    let mut g = Graph::new();
+    let batch = g.intern_symbol("batch");
+    let x = input_shaped(
+        &mut g,
+        "X",
+        DataType::Float32,
+        vec![Dim::Symbolic(batch), Dim::Static(4)],
+    );
+    let y = op_shaped(
+        &mut g,
+        "Relu",
+        &[x],
+        DataType::Float32,
+        vec![Dim::Symbolic(batch), Dim::Static(4)],
+        &[],
+    );
+    g.add_output(y);
+
+    let mut session = InferenceSession::from_graph(g).expect("build");
+    // batch is free, but the trailing static dim (4) is violated (here 5).
+    let wrong = Tensor::from_f32(&[2, 5], &[0.0; 10]).unwrap();
+    let err = session.run(&[("X", &wrong)]).unwrap_err();
+    assert!(
+        matches!(err, SessionError::ShapeMismatch { .. }),
+        "expected ShapeMismatch on the static dim, got {err:?}"
+    );
 }

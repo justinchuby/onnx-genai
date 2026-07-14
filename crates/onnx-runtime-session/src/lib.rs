@@ -45,8 +45,27 @@ mod error {
         #[error("op type not supported by any available EP: {op_type}")]
         UnsupportedOp { op_type: String },
 
-        #[error("value has a non-static (symbolic) shape, unsupported by the Phase-1 executor: {value}")]
+        #[error("value has a non-static (symbolic) shape and no binding to resolve it: {value}")]
         DynamicShape { value: String },
+
+        #[error(
+            "symbol {symbol} bound to conflicting sizes {first} and {second} across bound inputs"
+        )]
+        SymbolConflict {
+            symbol: String,
+            first: usize,
+            second: usize,
+        },
+
+        #[error("input {name}: rank mismatch (graph declares rank {expected}, got {got})")]
+        RankMismatch {
+            name: String,
+            expected: usize,
+            got: usize,
+        },
+
+        #[error("no inferred shape for value {value} produced by op {op}")]
+        UnresolvedShape { value: String, op: String },
 
         #[error("input {name}: dtype mismatch (expected {expected}, got {got})")]
         DtypeMismatch {
