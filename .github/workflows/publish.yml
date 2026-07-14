@@ -25,19 +25,37 @@ jobs:
         run: |
           set -euo pipefail
 
-          version="$(cargo metadata --no-deps --format-version 1 |
-            python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')"
+          crate_version() {
+            local crate="$1"
+            cargo metadata --no-deps --format-version 1 |
+              python3 -c 'import json,sys; p=[x for x in json.load(sys.stdin)["packages"] if x["name"]==sys.argv[1]]; print(p[0]["version"] if p else "")' "$crate"
+          }
 
           crate_exists() {
+            local crate="$1"
+            local version
+            version="$(crate_version "$crate")"
+            if [[ -z "$version" ]]; then
+              echo "Failed to resolve the workspace version for $crate." >&2
+              exit 1
+            fi
+
             # crates.io returns 403 without a User-Agent, so the guard MUST send one.
             curl --fail --silent --show-error \
               -H "User-Agent: onnx-genai-publish (github-actions; justinchuby/onnx-genai)" \
-              "https://crates.io/api/v1/crates/$1/$version" >/dev/null 2>&1
+              "https://crates.io/api/v1/crates/$crate/$version" >/dev/null 2>&1
           }
 
           publish_crate() {
             local crate="$1"
+            local version
             local attempt
+
+            version="$(crate_version "$crate")"
+            if [[ -z "$version" ]]; then
+              echo "Failed to resolve the workspace version for $crate." >&2
+              return 1
+            fi
 
             if crate_exists "$crate"; then
               echo "$crate $version is already published; skipping."
@@ -74,6 +92,15 @@ jobs:
             echo "Failed to publish $crate $version after 6 attempts." >&2
             return 1
           }
+
+          publish_crate onnx-runtime-ir
+          publish_crate onnx-runtime-shape-inference
+          publish_crate onnx-runtime-loader
+          publish_crate onnx-runtime-optimizer
+          publish_crate onnx-runtime-ep-api
+          publish_crate onnx-runtime-ep-cpu
+          publish_crate onnx-runtime-session
+          publish_crate onnx-runtime-capi
 
           publish_crate onnx-genai-ort-sys
           publish_crate onnx-genai-metadata
