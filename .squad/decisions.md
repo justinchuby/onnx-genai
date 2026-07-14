@@ -975,3 +975,55 @@ correctness is unaffected. Not chased further here (would risk the pass bar).
 **Verdict:** 🟢 GREEN — dispatch set correct, normalization symmetric, no phantom kernel registration.
 
 **What:** Provider gate now accepts exactly the set of registered `(op_type, domain)` pairs via `registry.supports`. Enumerated registry: default-domain registrations == PHASE1_OPS (1:1 verified); `len() == PHASE1_OPS.len() + 2` invariant holds (Softmax-v13 + com.microsoft/LayerNorm, no extras). `ai.onnx`→`""` normalization applied at top of both `lookup` and `supports` — symmetric. Contrib opset: no import → `effective_opset` falls back to `u64::MAX`; `lookup` filters `since_version <= MAX`, picks v1 — no panic. Dual-domain LayerNorm: distinct `OpKey`s (domain differs), distinct HashMap entries, no overwrite; additive only. FusedMatMulBias/FusedGemm have no kernel in either domain; `supports()` returns false — rejected at placement, not execution. `is_phase1_op` kept as `pub` API (harmless). Debug+release all green; bert_toy PASS max_abs 1.192e-7; clippy clean.
+
+---
+
+### 2026-07-14: ORT2 session `optimize` stage activated (opt-in) (Roy, roy-15)
+**By:** Roy (ORT2 architect — session pipeline / loader=shape-inference / session=execute seam)
+**Branch:** `squad/ort2-session-optimize` (based on `6f2e518`) — merged to main `5a2d527`
+
+**What:** Wired `onnx-runtime-optimizer` into `onnx-runtime-session`'s `build()` pipeline as an explicit opt-in stage. Default behavior (`"optimization"="none"`) is byte-identical to before this change.
+
+**Option surface:** Key `"optimization"` via `SessionBuilder.option(key, value)`.
+- `"none"`/`"off"`/`"0"` → `OptimizationLevel::None` (**DEFAULT** — no-op, no optimizer call, no re-inference)
+- `"basic"` → ConstantFolding + DeadNodeElimination (structure-preserving, no new op types)
+- `"all"` → ConstantFolding + DeadNodeElimination + OpFusion (`optimizer::default_passes()`)
+- Unknown keys → `SessionError::UnknownOption`; unknown values → `SessionError::InvalidOption`.
+
+**Pipeline ordering:**
+```
+load (+ loader shape inference)
+  → optimize_graph(level)          [skipped entirely when level == None]
+  → add com.microsoft to opset_imports
+  → re-run infer_graph(Permissive) [only when passes ran]
+  → compile → allocate
+```
+
+**Conformance:**
+- DEFAULT (opt-off): `bert_toy_conformance` unchanged — max_abs **1.192e-7**. Byte-identical.
+- `basic` vs opt-off: max_abs **0.000e0** — byte-identical. Const-fold + DCE + re-inference inert.
+- `basic` vs onnxruntime reference: max_abs **1.192e-7** (same as opt-off).
+
+**Documented discrepancy — `all` path not yet executable:**
+`OpFusion` is schema-unaware: `FusedMatMulBias`/`FusedGemm` have no CPU kernel; fused `com.microsoft::LayerNormalization` carries 5-input signature incompatible with CPU kernel's 2-3 input arity. Fails cleanly with `SessionError::UnsupportedOp { op_type: "FusedMatMulBias" }` before any numerics. Optimization stays opt-in / default-off. Tripwire test `full_optimization_fusion_path_is_not_yet_executable` asserts the failure and fires loudly when fusion becomes executable. **Follow-up to Batty:** schema-aware `OpFusion` + `FusedMatMulBias`/`FusedGemm` CPU kernels (or gate those patterns).
+
+**Files touched:** `crates/onnx-runtime-session/Cargo.toml` (deps); `crates/onnx-runtime-session/src/lib.rs` (`OptimizationLevel` enum+parse, `SessionError` variants, `optimize_graph()`, `build()` rewrite, unit tests); `crates/onnx-runtime-optimizer/src/lib.rs` (re-export `CONTRIB_DOMAIN`); `crates/onnx-runtime-session/tests/bert_toy_optimized_parity.rs` (new); `docs/PROGRESS.md`.
+
+**Validation:** 53 tests green debug+release (optimizer 26+1, session 12+1+2+11). clippy clean. `#![forbid(unsafe_code)]` intact.
+
+---
+
+### 2026-07-14: ORT2 session `optimize` stage — correctness/conformance review 🟢 (Chew, chew-19)
+**By:** Chew (ORT2 correctness/conformance) — reviewed `c92a2f2`
+**Verdict:** 🟢 APPROVE
+
+**Scope:** `git diff 6f2e518...c92a2f2` — 7 files, +435/-12.
+
+**Findings:**
+1. **Default-off invariance** 🟢 — `optimize_graph()` returns `Ok(())` immediately when `level.passes()` is empty. No passes run, no `com.microsoft` opset import inserted, `infer_graph` NOT re-run. No unconditional second infer_graph. `bert_toy_conformance` unchanged: max_abs 1.192e-7 (debug+release).
+2. **`basic` parity is real** 🟢 — `basic` vs opt-off: max_abs 0.000e0 (byte-identical). `basic` vs onnxruntime: max_abs 1.192e-7. Output shapes correct ([1,8,99], [1,2]). No rounding drift.
+3. **Re-inference ordering sound** 🟢 — passes → opset import → re-infer on rewritten graph → `from_parts` consumes re-inferred graph. Compile/allocate see post-optimize shapes.
+4. **`all`-path gating clean** 🟢 — fails with `UnsupportedOp { op_type: "FusedMatMulBias" }` BEFORE numerics. Tripwire non-tautological: `Ok(_) => panic!` fires the moment fusion becomes executable; `Err(UnsupportedOp{op_type})` asserts `op_type ∈ {FusedMatMulBias, FusedGemm}`. No tolerance widened.
+5. **Suite/clippy/unsafe** 🟢 — full ORT2 suite green debug+release (all crates). clippy clean. No new `unsafe`.
+
+**Non-blocking note:** `Err(other) => {}` arm in tripwire accepts any non-`UnsupportedOp` error without asserting fusion-relatedness. Does not mask silent wrong numerics (the `Ok` arm guards correctness). Suggest future tightening.
