@@ -27,10 +27,14 @@ pub mod elementwise;
 pub mod gemm;
 pub mod matmul;
 pub mod normalization;
+pub mod pointwise;
 pub mod reduce;
 pub mod softmax;
 
 use elementwise::{BinaryFactory, BinaryOp, UnaryFactory, UnaryOp};
+use pointwise::{
+    CmpFactory, CmpOp, LogicalFactory, LogicalOp, NotFactory, UnaryMathFactory, UnaryMathOp,
+};
 
 /// The ops the CUDA EP implements today.
 ///
@@ -52,6 +56,12 @@ use elementwise::{BinaryFactory, BinaryOp, UnaryFactory, UnaryOp};
 ///   int8-64/uint8-64/bool).
 /// * **Reductions** — `ReduceSum`, `ReduceMean`, `ReduceMax`, `ReduceMin`
 ///   (NVRTC block reduction; arbitrary axes, keepdims, opset-18 axes-as-input).
+/// * **Pointwise unary math** — `Abs`, `Neg`, `Reciprocal`, `Exp`, `Log`,
+///   `Sign`, `Floor`, `Ceil`, `Round`, `Sin`, `Cos`, `Softplus` (NVRTC f32,
+///   formulas matched to the CPU EP `unary_math.rs`).
+/// * **Logical** — `Not` (bool), `And`, `Or`, `Xor` (bool, equal-shape).
+/// * **Comparison** — `Equal`, `Greater`, `Less`, `GreaterOrEqual`,
+///   `LessOrEqual` (f32 operands → bool, equal-shape).
 ///
 /// See `docs/CUDA_COVERAGE.md` for the full op → backend mapping matrix and the
 /// prioritised list of remaining / custom-kernel ops.
@@ -59,7 +69,9 @@ pub const CUDA_COVERED_OPS: &[&str] = &[
     "MatMul", "Gemm", "Relu", "Sqrt", "Erf", "Tanh", "Sigmoid", "Gelu", "Add", "Sub", "Mul", "Div",
     "Pow", "Min", "Max", "Attention", "Softmax", "LayerNormalization", "SkipLayerNormalization",
     "SimplifiedLayerNormalization", "RMSNormalization", "Cast", "CastLike", "ReduceSum",
-    "ReduceMean", "ReduceMax", "ReduceMin",
+    "ReduceMean", "ReduceMax", "ReduceMin", "Abs", "Neg", "Reciprocal", "Exp", "Log", "Sign",
+    "Floor", "Ceil", "Round", "Sin", "Cos", "Softplus", "Not", "And", "Or", "Xor", "Equal",
+    "Greater", "Less", "GreaterOrEqual", "LessOrEqual",
 ];
 
 /// Build an [`OpRegistry`] populated with the CUDA kernel factories.
@@ -217,6 +229,73 @@ pub fn build_cuda_registry(runtime: Arc<CudaRuntime>) -> OpRegistry {
         }),
     );
 
+    // ── CUDA Wave 3 — pointwise math / logical / comparison (pointwise.rs) ──
+
+    // Pointwise unary math (NVRTC f32; formulas matched to the CPU EP
+    // `unary_math.rs`). Standard domain, single input/output, equal shape.
+    for (op_type, op) in [
+        ("Abs", UnaryMathOp::Abs),
+        ("Neg", UnaryMathOp::Neg),
+        ("Reciprocal", UnaryMathOp::Reciprocal),
+        ("Exp", UnaryMathOp::Exp),
+        ("Log", UnaryMathOp::Log),
+        ("Sign", UnaryMathOp::Sign),
+        ("Floor", UnaryMathOp::Floor),
+        ("Ceil", UnaryMathOp::Ceil),
+        ("Round", UnaryMathOp::Round),
+        ("Sin", UnaryMathOp::Sin),
+        ("Cos", UnaryMathOp::Cos),
+        ("Softplus", UnaryMathOp::Softplus),
+    ] {
+        reg.register(
+            OpKey::new(op_type, "", 1),
+            Box::new(UnaryMathFactory {
+                op,
+                runtime: runtime.clone(),
+            }),
+        );
+    }
+
+    // Logical `Not` (bool → bool; matched to the CPU EP `logical.rs`).
+    reg.register(
+        OpKey::new("Not", "", 1),
+        Box::new(NotFactory {
+            runtime: runtime.clone(),
+        }),
+    );
+
+    // Logical binary (bool operands → bool; equal-shape, non-zero byte = true).
+    for (op_type, op) in [
+        ("And", LogicalOp::And),
+        ("Or", LogicalOp::Or),
+        ("Xor", LogicalOp::Xor),
+    ] {
+        reg.register(
+            OpKey::new(op_type, "", 1),
+            Box::new(LogicalFactory {
+                op,
+                runtime: runtime.clone(),
+            }),
+        );
+    }
+
+    // Comparison (f32 operands → bool; equal-shape, ONNX comparison semantics).
+    for (op_type, op) in [
+        ("Equal", CmpOp::Equal),
+        ("Greater", CmpOp::Greater),
+        ("Less", CmpOp::Less),
+        ("GreaterOrEqual", CmpOp::GreaterOrEqual),
+        ("LessOrEqual", CmpOp::LessOrEqual),
+    ] {
+        reg.register(
+            OpKey::new(op_type, "", 1),
+            Box::new(CmpFactory {
+                op,
+                runtime: runtime.clone(),
+            }),
+        );
+    }
+
     reg
 }
 
@@ -251,6 +330,20 @@ mod tests {
         let mut seen = std::collections::HashSet::new();
         for op in CUDA_COVERED_OPS {
             assert!(seen.insert(*op), "duplicate op {op} in CUDA_COVERED_OPS");
+        }
+    }
+
+    #[test]
+    fn wave3_pointwise_ops_are_listed_in_coverage() {
+        for op in [
+            "Abs", "Neg", "Reciprocal", "Exp", "Log", "Sign", "Floor", "Ceil", "Round", "Sin",
+            "Cos", "Softplus", "Not", "And", "Or", "Xor", "Equal", "Greater", "Less",
+            "GreaterOrEqual", "LessOrEqual",
+        ] {
+            assert!(
+                CUDA_COVERED_OPS.contains(&op),
+                "{op} missing from CUDA_COVERED_OPS"
+            );
         }
     }
 }

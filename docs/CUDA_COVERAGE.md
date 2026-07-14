@@ -62,6 +62,32 @@ not yet wired) · **🔬 custom** (needs a fused NVRTC/CUTLASS kernel).
 | `Tanh` | `` | ✅ | **NVRTC-custom** | f32 pointwise. |
 | `Sigmoid` | `` | ✅ | **NVRTC-custom** | f32 pointwise (bonus; not in CPU set yet). |
 | `Gelu` | `com.microsoft` | ✅ | **NVRTC-custom** | exact (erf) GELU, f32. Prime fusion target (GELU-bias GEMM epilogue). |
+| `Abs` | `` | ✅ | **NVRTC-custom** | f32 pointwise, `fabsf` (`pointwise.rs`; CPU `x.abs()`). |
+| `Neg` | `` | ✅ | **NVRTC-custom** | f32 pointwise, `-x`. |
+| `Reciprocal` | `` | ✅ | **NVRTC-custom** | f32 pointwise, `1/x`. |
+| `Exp` | `` | ✅ | **NVRTC-custom** | f32 pointwise, `expf` (CPU `x.exp()`). |
+| `Log` | `` | ✅ | **NVRTC-custom** | f32 pointwise, `logf` (natural log; CPU `x.ln()`). |
+| `Sign` | `` | ✅ | **NVRTC-custom** | f32 pointwise; NaN→NaN, `sign(0)=0` (matches CPU `sign()`). |
+| `Floor` | `` | ✅ | **NVRTC-custom** | f32 pointwise, `floorf`. |
+| `Ceil` | `` | ✅ | **NVRTC-custom** | f32 pointwise, `ceilf`. |
+| `Round` | `` | ✅ | **NVRTC-custom** | f32 pointwise, `rintf` — round-half-to-**even** (ONNX / CPU `round_ties_even`, **not** `roundf`). |
+| `Sin` | `` | ✅ | **NVRTC-custom** | f32 pointwise, `sinf`. |
+| `Cos` | `` | ✅ | **NVRTC-custom** | f32 pointwise, `cosf`. |
+| `Softplus` | `` | ✅ | **NVRTC-custom** | f32 pointwise, stable `max(x,0)+log1pf(expf(-\|x\|))` (matches CPU). |
+
+### Elementwise — logical / comparison
+
+| Op | Domain | Status | Backend | Notes |
+|----|--------|--------|---------|-------|
+| `Not` | `` | ✅ | **NVRTC-custom** | bool→bool, non-zero byte = true, canonical `1`/`0` out (matches CPU `logical.rs`). |
+| `And` | `` | ✅ | **NVRTC-custom** | bool operands → bool, **equal-shape**. Broadcasting ⏳. |
+| `Or` | `` | ✅ | **NVRTC-custom** | bool operands → bool, equal-shape. |
+| `Xor` | `` | ✅ | **NVRTC-custom** | bool operands → bool, equal-shape. |
+| `Equal` | `` | ✅ | **NVRTC-custom** | f32 operands → **bool**, equal-shape. ONNX comparison semantics. |
+| `Greater` | `` | ✅ | **NVRTC-custom** | f32 operands → bool, equal-shape. |
+| `Less` | `` | ✅ | **NVRTC-custom** | f32 operands → bool, equal-shape. |
+| `GreaterOrEqual` | `` | ✅ | **NVRTC-custom** | f32 operands → bool, equal-shape. |
+| `LessOrEqual` | `` | ✅ | **NVRTC-custom** | f32 operands → bool, equal-shape. |
 
 ### Elementwise — binary
 
@@ -130,6 +156,13 @@ slice = **2** (`MatMul`, `Attention`). CUDA **after** Wave 1 = **16**
 **27** (+ `Softmax`, `LayerNormalization`, `SkipLayerNormalization`,
 `SimplifiedLayerNormalization`/`RMSNormalization`, `Cast`, `CastLike`,
 `ReduceSum`, `ReduceMean`, `ReduceMax`, `ReduceMin`).
+
+CUDA **after Wave 3** = **48** (+ pointwise unary math `Abs`, `Neg`,
+`Reciprocal`, `Exp`, `Log`, `Sign`, `Floor`, `Ceil`, `Round`, `Sin`, `Cos`,
+`Softplus`; logical `Not`, `And`, `Or`, `Xor`; comparison `Equal`, `Greater`,
+`Less`, `GreaterOrEqual`, `LessOrEqual`). The unary-math formulas are matched
+exactly to the CPU EP (`unary_math.rs`); the comparison/logical ops follow
+canonical ONNX semantics (equal-shape; NumPy broadcasting deferred crate-wide).
 
 > **⚠️ Runtime/perf verification pending.** The Wave-2 kernels were written and
 > reviewed on a host with **only `libcuda`** (no cuBLASLt/cuDNN/NVRTC runtime,
