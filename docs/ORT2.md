@@ -4835,7 +4835,614 @@ $ ort2 trace diagnose /tmp/trace.jsonl
 
 ---
 
-## 48. Phased Roadmap
+## 48. Unified Tracing (GenAI + Runtime)
+
+### 48.1 Problem
+
+GenAI layer (scheduling, sampling, KV management) and runtime layer (kernel execution,
+memory, transfers) each have their own events. Without unified tracing, user sees two
+disconnected views and can't correlate "why was this decode step slow" with "because a
+page was being fetched".
+
+### 48.2 Shared Trace Context
+
+```rust
+/// Both layers share this. Single monotonic clock, single output sink.
+pub struct TraceContext {
+    clock: Arc<TraceClock>,
+    session_id: TraceSessionId,
+    collector: Arc<dyn TraceCollector>,
+    format: TraceFormat,
+}
+
+pub enum TraceFormat {
+    /// Chrome Trace JSON (backward compat, Perfetto reads it too).
+    ChromeJson,
+    /// Perfetto native protobuf (streaming, better for large traces).
+    PerfettoProto,
+    /// JSONL (our structured log format, grep-friendly).
+    Jsonl,
+}
+
+/// Both layers write to the same collector.
+pub trait TraceCollector: Send + Sync {
+    fn emit(&self, event: TraceEvent);
+    fn flush(&self) -> Result<()>;
+}
+
+impl TraceContext {
+    /// No-op context: zero overhead when tracing disabled.
+    pub fn noop() -> Self;
+}
+```
+
+### 48.3 Perfetto Track Layout
+
+When opened in Perfetto UI, the unified trace shows:
+
+```
+Process: ort2 (pid=1)
+├─ Thread: genai.scheduler      → request lifecycle, batch decisions
+├─ Thread: genai.sampler        → sampling, speculation, logit processing
+├─ Thread: genai.kv_cache       → page alloc/evict/migrate/prefix_match
+├─ Thread: runtime.compute      → kernel execution (per CUDA stream)
+├─ Thread: runtime.h2d          → host-to-device transfers
+├─ Thread: runtime.d2h          → device-to-host transfers
+├─ Thread: runtime.optimizer    → optimization passes (load-time only)
+├─ Counter: gpu_memory_mb       → continuous VRAM usage
+├─ Counter: kv_pages_gpu        → pages on GPU over time
+├─ Counter: batch_size          → active decode batch size
+├─ Counter: tokens_per_sec      → throughput
+└─ Counter: memory_pressure     → 0-1 pressure level
+```
+
+### 48.4 Flow Events (Data Dependency Arrows)
+
+Perfetto flow events draw arrows between related events across tracks:
+
+```rust
+pub struct FlowEvent {
+    flow_id: u64,
+    kind: FlowKind,  // Start, Step, End
+}
+
+// Visible arrows in Perfetto:
+// 1. prefetch(layer.5.weight) ──flow──→ kernel(layer.5.matmul)
+// 2. kv_append(req_42) ──flow──→ attention(req_42, next step)
+// 3. spec_draft ──flow──→ verify_batch ──flow──→ accept/reject
+// 4. pressure_event ──flow──→ evict_lru ──flow──→ page_migrate
+```
+
+### 48.5 Integration API
+
+```rust
+impl GenAiEngine {
+    pub fn new(session: InferenceSession, trace: Option<TraceContext>) -> Self {
+        let trace_ctx = trace.unwrap_or(TraceContext::noop());
+        // Pass same context to runtime
+        session.set_trace_context(trace_ctx.clone());
+        Self { session, trace: trace_ctx, .. }
+    }
+}
+
+impl InferenceSession {
+    /// Inject shared trace context (called by GenAI layer or user directly).
+    pub fn set_trace_context(&mut self, ctx: TraceContext);
+}
+```
+
+### 48.6 User API
+
+```python
+import ort2
+
+# Unified trace: one file, both layers
+with ort2.trace("/tmp/unified.perfetto", format="perfetto") as t:
+    engine = ort2.GenAiEngine("model.onnx", trace=t)
+    for token in engine.generate_stream("Hello"):
+        print(token, end="")
+# Open /tmp/unified.perfetto in Perfetto UI
+
+# Env var (no code change):
+# ORT2_TRACE=/tmp/trace.perfetto ORT2_TRACE_FORMAT=perfetto python serve.py
+```
+
+```bash
+# CLI
+ort2 run model.onnx --trace /tmp/trace.perfetto --trace-format perfetto
+
+# Merge with other Perfetto traces (e.g. from GitHub Copilot)
+# Both use standard perfetto.protos.Trace — can view side by side in Perfetto UI
+```
+
+### 48.7 Copilot Perfetto Compatibility
+
+If GitHub Copilot is adding Perfetto support, we ensure:
+1. Standard `perfetto.protos.Trace` protobuf format
+2. Track naming convention compatible for merged viewing
+3. Support `trace_processor` SQL queries for custom analysis
+4. Shared `flow_id` namespace for cross-tool correlation
+
+---
+
+## 49. LoRA Serving
+
+### 49.1 Problem
+
+Serving multiple fine-tuned adapters from one base model. Each user/request may need
+a different LoRA. Loading a full model per adapter = wasteful.
+
+### 49.2 Architecture
+
+```rust
+pub struct LoraManager {
+    /// Base model weights (shared across all requests).
+    base_weights: Arc<WeightStore>,
+    /// Loaded LoRA adapters (hot cache).
+    adapters: HashMap<AdapterId, LoraAdapter>,
+    /// Max adapters in GPU memory simultaneously.
+    max_active: usize,
+    /// LRU eviction for cold adapters.
+    lru: LruCache<AdapterId>,
+}
+
+pub struct LoraAdapter {
+    id: AdapterId,
+    /// LoRA A matrices (low-rank, per target module).
+    a_weights: HashMap<String, Tensor>,  // module_name → [rank, in_features]
+    /// LoRA B matrices.
+    b_weights: HashMap<String, Tensor>,  // module_name → [out_features, rank]
+    /// Scaling factor.
+    alpha: f32,
+    rank: usize,
+    /// Which modules this adapter targets.
+    target_modules: Vec<String>,
+}
+```
+
+### 49.3 Three Approaches
+
+**A. On-the-fly merge (simple, per-request overhead):**
+```rust
+/// Before inference: W_effective = W_base + (alpha/rank) * B @ A
+/// Modify weight in-place (or use separate buffer).
+impl LoraManager {
+    fn apply_lora(&self, base: &Tensor, adapter: &LoraAdapter, module: &str) -> Tensor {
+        let a = &adapter.a_weights[module];
+        let b = &adapter.b_weights[module];
+        let scale = adapter.alpha / adapter.rank as f32;
+        // base + scale * (B @ A)  — one extra matmul per adapted layer
+        base + scale * b.matmul(a)
+    }
+}
+```
+Pros: Simple, correct. Cons: Extra GEMM per layer per request.
+
+**B. Batched LoRA GEMM (vLLM's approach — multi-adapter in one kernel):**
+```rust
+/// Multiple requests in same batch, each with different adapter.
+/// Single CUDA kernel handles all adapters using indirect addressing.
+pub struct BatchedLoraKernel {
+    /// Per-request adapter index: batch[i] uses adapter_indices[i].
+    adapter_indices: Vec<u32>,
+    /// Stacked A matrices: [num_adapters, rank, in_features]
+    stacked_a: Tensor,
+    /// Stacked B matrices: [num_adapters, out_features, rank]
+    stacked_b: Tensor,
+}
+
+impl Kernel for BatchedLoraKernel {
+    fn execute(&self, ctx: &mut KernelContext) -> Result<()> {
+        // CUDA kernel:
+        // For each batch element i:
+        //   adapter = adapter_indices[i]
+        //   output[i] = base_output[i] + scale * stacked_b[adapter] @ (stacked_a[adapter] @ input[i])
+        // All in one kernel launch (no per-request overhead).
+    }
+}
+```
+Pros: Batch-efficient, one kernel for entire batch. Cons: Custom CUDA kernel needed.
+
+**C. Weight decomposition caching (pre-merge, amortized):**
+```rust
+/// For frequently-used adapters: pre-compute merged weight, cache it.
+impl LoraManager {
+    fn get_merged_weight(&mut self, module: &str, adapter: AdapterId) -> &Tensor {
+        self.merge_cache.get_or_insert((module, adapter), || {
+            let base = &self.base_weights[module];
+            let a = &self.adapters[adapter].a_weights[module];
+            let b = &self.adapters[adapter].b_weights[module];
+            base + (alpha / rank) * b.matmul(a)
+        })
+    }
+}
+```
+Pros: Zero per-request overhead for hot adapters. Cons: Memory (one full weight per adapter per module).
+
+### 49.4 Our Strategy: Hybrid
+
+```rust
+pub enum LoraStrategy {
+    /// Few adapters, high throughput: pre-merge weights.
+    PreMerge,
+    /// Many adapters, mixed batch: batched LoRA kernel.
+    BatchedKernel,
+    /// Fallback: on-the-fly merge.
+    OnTheFly,
+    /// Auto: choose based on adapter count and request patterns.
+    Auto,
+}
+```
+
+Auto logic:
+- ≤4 active adapters → PreMerge (fast, fits in memory)
+- 5-32 adapters, mixed batch → BatchedKernel
+- \>32 or cold adapters → OnTheFly for cold, BatchedKernel for hot
+
+### 49.5 User API
+
+```python
+engine = ort2.GenAiEngine("base_model.onnx")
+
+# Load adapters
+engine.load_lora("coding_assistant", "lora_coding.safetensors")
+engine.load_lora("creative_writer", "lora_creative.safetensors")
+
+# Per-request adapter selection
+output = engine.generate("Write a poem", lora="creative_writer")
+output = engine.generate("def quicksort", lora="coding_assistant")
+
+# Mixed batch (different adapters in same batch)
+batch = [
+    {"prompt": "Write a poem", "lora": "creative_writer"},
+    {"prompt": "def quicksort", "lora": "coding_assistant"},
+    {"prompt": "Hello", "lora": None},  # base model, no adapter
+]
+outputs = engine.generate_batch(batch)
+```
+
+---
+
+## 50. Async Output Processing
+
+### 50.1 Problem
+
+After sampling a token, several steps happen before the user sees it:
+1. Detokenization (token_id → text)
+2. Stop sequence checking
+3. Streaming response write
+4. Metrics update
+
+If these happen synchronously, they block the next decode step.
+vLLM found that detokenization alone can add 0.5-1ms per step.
+
+### 50.2 Design: Async Output Pipeline
+
+```rust
+pub struct AsyncOutputPipeline {
+    /// Channel: decode loop sends tokens, pipeline processes async.
+    sender: mpsc::Sender<OutputEvent>,
+    /// Background thread handles detokenization + streaming.
+    worker: JoinHandle<()>,
+}
+
+pub enum OutputEvent {
+    /// New token sampled. Needs detokenization.
+    Token { request_id: RequestId, token_id: TokenId, logprob: Option<f32> },
+    /// Sequence finished.
+    Done { request_id: RequestId, finish_reason: FinishReason },
+    /// Sequence aborted (cancelled, error).
+    Abort { request_id: RequestId, reason: String },
+}
+
+impl AsyncOutputPipeline {
+    fn worker_loop(receiver: mpsc::Receiver<OutputEvent>, tokenizer: Arc<Tokenizer>) {
+        for event in receiver {
+            match event {
+                OutputEvent::Token { request_id, token_id, logprob } => {
+                    // Detokenize (can be expensive for multi-byte UTF-8)
+                    let text = tokenizer.decode_incremental(request_id, token_id);
+                    // Check stop sequences
+                    let stopped = check_stop_sequences(&text, &request.stop);
+                    // Stream to client (non-blocking write to response channel)
+                    request.stream_sender.try_send(StreamChunk { text, logprob, stopped });
+                    // Update metrics
+                    metrics.tokens_generated.inc();
+                }
+                _ => { /* handle done/abort */ }
+            }
+        }
+    }
+}
+```
+
+**Decode loop (unblocked):**
+```rust
+impl GenAiEngine {
+    fn decode_step(&mut self) -> Result<()> {
+        // 1. Run model forward pass (GPU)
+        let logits = self.session.run_decode_step(&inputs)?;
+
+        // 2. Sample tokens (CPU, fast)
+        let tokens = self.sampler.sample_batch(&logits);
+
+        // 3. Send to async pipeline (non-blocking!)
+        for (req_id, token) in tokens {
+            self.output_pipeline.sender.send(OutputEvent::Token {
+                request_id: req_id, token_id: token, logprob: None,
+            })?;
+            // DON'T wait for detokenization. Next decode step starts immediately.
+        }
+
+        // 4. Immediately prepare next decode step
+        self.prepare_next_step(&tokens);
+        Ok(())
+    }
+}
+```
+
+**Gain:** Decode step latency reduced by 0.5-1ms (detokenize time no longer on critical path).
+
+---
+
+## 51. Recompute-Based Preemption
+
+### 51.1 Problem
+
+When a high-priority request arrives and GPU is full, we need to preempt a low-priority
+request. Current options:
+- **Swap KV to CPU** — works but expensive for long contexts (GBs of KV to transfer)
+- **Kill and requeue** — wastes all work done so far
+
+vLLM's third option: **Recompute** — drop KV, remember position, recompute from prompt when resumed.
+
+### 51.2 When Recompute Beats Swap
+
+```
+Swap cost:  KV_size × (D2H_time + H2D_time_later)
+Recompute cost: prompt_tokens × prefill_time_per_token
+
+Recompute wins when: prompt is short relative to KV size accumulated.
+Swap wins when: sequence has generated many tokens (KV large but prompt was short).
+```
+
+Break-even heuristic:
+```rust
+fn should_recompute(seq: &Sequence) -> bool {
+    let swap_cost_ms = seq.kv_size_bytes() as f64 / PCIE_BANDWIDTH_BYTES_PER_MS;
+    let recompute_cost_ms = seq.prompt_len() as f64 * PREFILL_MS_PER_TOKEN;
+    recompute_cost_ms < swap_cost_ms
+}
+```
+
+### 51.3 Design
+
+```rust
+pub enum PreemptionStrategy {
+    /// Swap KV to CPU. Resume by copying back.
+    Swap,
+    /// Drop KV entirely. Resume by recomputing from prompt.
+    Recompute,
+    /// Choose automatically based on cost comparison.
+    Auto,
+}
+
+pub struct PreemptedSequence {
+    request_id: RequestId,
+    strategy: PreemptionStrategy,
+    /// For Swap: KV pages stored on CPU.
+    swapped_pages: Option<Vec<CpuPage>>,
+    /// For Recompute: just remember the prompt + generated tokens so far.
+    checkpoint: SequenceCheckpoint,
+}
+
+pub struct SequenceCheckpoint {
+    /// Original prompt tokens.
+    prompt_tokens: Vec<TokenId>,
+    /// Tokens generated before preemption (will regenerate same with deterministic sampling).
+    generated_tokens: Vec<TokenId>,
+    /// Position to resume generation from.
+    resume_position: usize,
+    /// Sampler state at preemption point.
+    sampler_state: Option<SamplerCheckpoint>,
+}
+
+impl Scheduler {
+    fn preempt(&mut self, victim: &mut Sequence, strategy: PreemptionStrategy) {
+        match strategy {
+            PreemptionStrategy::Swap => {
+                // Copy KV pages to CPU
+                let pages = self.kv_cache.swap_to_cpu(victim.id);
+                self.preempted.push(PreemptedSequence {
+                    swapped_pages: Some(pages),
+                    checkpoint: victim.checkpoint(),
+                    ..
+                });
+            }
+            PreemptionStrategy::Recompute => {
+                // Just drop KV. Keep checkpoint (prompt + generated tokens).
+                self.kv_cache.free_all_pages(victim.id);
+                self.preempted.push(PreemptedSequence {
+                    swapped_pages: None,
+                    checkpoint: victim.checkpoint(),
+                    ..
+                });
+            }
+            PreemptionStrategy::Auto => {
+                let strat = if should_recompute(victim) {
+                    PreemptionStrategy::Recompute
+                } else {
+                    PreemptionStrategy::Swap
+                };
+                self.preempt(victim, strat);
+            }
+        }
+    }
+
+    fn resume(&mut self, preempted: PreemptedSequence) {
+        match preempted.strategy {
+            PreemptionStrategy::Swap => {
+                // Copy KV pages back from CPU
+                self.kv_cache.restore_from_cpu(preempted.swapped_pages.unwrap());
+            }
+            PreemptionStrategy::Recompute => {
+                // Re-run prefill on prompt + already-generated tokens
+                let full_input = [&preempted.checkpoint.prompt_tokens[..],
+                                  &preempted.checkpoint.generated_tokens[..]].concat();
+                self.schedule_prefill(preempted.request_id, &full_input);
+                // After prefill, resume decode from where we left off
+            }
+        }
+    }
+}
+```
+
+### 51.4 User Impact
+
+Transparent. User sees slightly higher latency on resumed request (recompute time),
+but the high-priority request got served immediately. No visible error or disconnect.
+
+---
+
+## 52. Frequency-Based Prefix Cache Eviction
+
+### 52.1 Problem
+
+LRU eviction for prefix cache is suboptimal:
+- A prompt prefix used 100 times but not in the last 5 seconds gets evicted
+- A one-off long prefix used once stays because it's recent
+
+### 52.2 Design: LRU + Frequency Hybrid (LFU-like)
+
+```rust
+pub struct PrefixCacheEviction {
+    policy: EvictionPolicy,
+}
+
+pub enum EvictionPolicy {
+    /// Pure LRU (simple, current default).
+    Lru,
+    /// Pure frequency (most popular stay).
+    Lfu,
+    /// Hybrid: score = frequency_weight * frequency + recency_weight * recency.
+    /// Similar to Redis's LFU or ARC (Adaptive Replacement Cache).
+    Hybrid {
+        frequency_weight: f32,  // default 0.6
+        recency_weight: f32,    // default 0.4
+        decay_period: Duration, // frequency decays over time (default 5 min)
+    },
+    /// Adaptive: auto-tune weights based on hit rate.
+    Adaptive,
+}
+
+pub struct CachedPrefix {
+    prefix_hash: u64,
+    pages: Vec<PageId>,
+    /// Access counter (with time decay).
+    frequency: DecayingCounter,
+    /// Last access time.
+    last_access: Instant,
+    /// Byte cost (longer prefix = more expensive to evict).
+    size_pages: usize,
+}
+
+/// Counter that decays over time (avoids stale frequency from old bursts).
+pub struct DecayingCounter {
+    count: f32,
+    last_decay: Instant,
+    half_life: Duration,  // e.g. 5 minutes
+}
+
+impl DecayingCounter {
+    fn increment(&mut self) {
+        self.apply_decay();
+        self.count += 1.0;
+    }
+
+    fn apply_decay(&mut self) {
+        let elapsed = self.last_decay.elapsed();
+        let decay_factor = 0.5_f32.powf(elapsed.as_secs_f32() / self.half_life.as_secs_f32());
+        self.count *= decay_factor;
+        self.last_decay = Instant::now();
+    }
+
+    fn value(&self) -> f32 {
+        // Apply decay lazily on read
+        let elapsed = self.last_decay.elapsed();
+        let decay_factor = 0.5_f32.powf(elapsed.as_secs_f32() / self.half_life.as_secs_f32());
+        self.count * decay_factor
+    }
+}
+
+impl PrefixCacheEviction {
+    fn eviction_score(&self, entry: &CachedPrefix) -> f64 {
+        match &self.policy {
+            EvictionPolicy::Hybrid { frequency_weight, recency_weight, .. } => {
+                let freq_score = entry.frequency.value() as f64;
+                let recency_score = 1.0 / (entry.last_access.elapsed().as_secs_f64() + 1.0);
+                // Also consider cost: larger prefixes are more expensive to recompute
+                let cost_factor = entry.size_pages as f64;
+
+                (*frequency_weight as f64 * freq_score
+                 + *recency_weight as f64 * recency_score)
+                * cost_factor
+            }
+            _ => { /* LRU or LFU */ 0.0 }
+        }
+    }
+
+    /// Evict entries with lowest score until target_pages freed.
+    fn evict(&mut self, cache: &mut Vec<CachedPrefix>, target_pages: usize) -> Vec<PageId> {
+        cache.sort_by(|a, b| self.eviction_score(a)
+            .partial_cmp(&self.eviction_score(b)).unwrap());
+
+        let mut freed = 0;
+        let mut evicted_pages = vec![];
+        while freed < target_pages && !cache.is_empty() {
+            let victim = cache.remove(0);  // lowest score
+            freed += victim.size_pages;
+            evicted_pages.extend(victim.pages);
+        }
+        evicted_pages
+    }
+}
+```
+
+### 52.3 Adaptive Policy
+
+```rust
+/// Auto-tune frequency vs recency weights based on observed hit rate.
+impl AdaptiveEviction {
+    fn adapt(&mut self, hit: bool) {
+        if hit {
+            // Hit came from a frequent prefix → boost frequency weight
+            if self.last_hit_was_frequent {
+                self.frequency_weight = (self.frequency_weight + 0.01).min(0.9);
+                self.recency_weight = 1.0 - self.frequency_weight;
+            }
+        } else {
+            // Miss: recently evicted prefix was needed → boost recency weight
+            self.recency_weight = (self.recency_weight + 0.01).min(0.9);
+            self.frequency_weight = 1.0 - self.recency_weight;
+        }
+    }
+}
+```
+
+### 52.4 User API
+
+```python
+session = ort2.load("model.onnx", options={
+    "cache.eviction_policy": "hybrid",      # lru | lfu | hybrid | adaptive
+    "cache.frequency_weight": "0.6",
+    "cache.recency_weight": "0.4",
+    "cache.frequency_decay_minutes": "5",   # half-life for frequency counter
+})
+```
+
+---
+
+## 53. Phased Roadmap
 
 ### Phase 1: Foundation (8-12 weeks)
 - [ ] `onnx-runtime-ir`: Graph IR with all types, validation, mutation API
