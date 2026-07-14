@@ -61,9 +61,13 @@ pub struct Eagle3Config {
 ///
 /// The proposer is a shared-KV draft: it owns no KV cache and instead reads
 /// slices of the target model's paged KV cache. It carries its own internal
-/// `lm_head`, so no external embedding/LM-head weights are required. Step 0
-/// seeds `inputs_embeds` from the target's last hidden state; every later step
-/// threads the proposer's own `projected_state`.
+/// `lm_head`, but it does *not* own an input embedding table: each step builds
+/// `inputs_embeds = concat(target_input_embedding(last_token), hidden)`, so the
+/// engine supplies the target's raw input-token embedding via
+/// [`SharedKvProposerConfig::input_embedding_weights`]. The first step seeds
+/// `hidden` from the target's last hidden state and `last_token` from the last
+/// context token; every later step threads the proposer's own `projected_state`
+/// and the previously drafted token.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SharedKvProposerConfig {
     /// ONNX model containing the shared-KV proposer graph.
@@ -71,6 +75,10 @@ pub struct SharedKvProposerConfig {
     /// Target decoder output containing `[batch, sequence, hidden]` states,
     /// used to seed the first assistant step. Must be Float32.
     pub target_hidden_output: String,
+    /// Raw little-endian f32 target input-token embedding weights in
+    /// `[vocab_size, backbone_hidden_size]` order, used to build the token-
+    /// embedding half of each step's `inputs_embeds`.
+    pub input_embedding_weights: PathBuf,
     /// Target backbone hidden size `H`.
     pub backbone_hidden_size: usize,
     /// Vocabulary size of the assistant's own `logits` output.

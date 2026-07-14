@@ -67,6 +67,7 @@ speculative:
   vocab_size: 32
   projected_state_output: projected_state
   logits_output: logits
+  input_embedding: input_embedding.f32
   shared_kv:
     - name: sliding_attention
       target_layers: [0]

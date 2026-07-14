@@ -113,6 +113,9 @@ pub(crate) struct Eagle3Model {
 pub(crate) struct SharedKvProposerModel {
     pub(crate) config: SharedKvProposerConfig,
     pub(crate) session: Box<Session>,
+    /// Target input-token embedding table, used to build the token-embedding
+    /// half of each draft step's `inputs_embeds`.
+    pub(crate) embedder: LinearEmbedder,
     pub(crate) num_speculative_tokens: usize,
 }
 
@@ -487,9 +490,19 @@ impl Engine {
                     );
                 }
             }
+            let embedding = read_f32_weights(&assistant_config.input_embedding_weights)?;
+            let embedder = LinearEmbedder::new(
+                embedding,
+                assistant_config.vocab_size,
+                assistant_config.backbone_hidden_size,
+            )
+            .map_err(|error| {
+                anyhow::anyhow!("Invalid shared-KV proposer input embedding weights: {error}")
+            })?;
             Some(SharedKvProposerModel {
                 config: assistant_config.clone(),
                 session: Box::new(assistant_session),
+                embedder,
                 num_speculative_tokens: assistant_config.num_speculative_tokens,
             })
         } else {
@@ -1525,6 +1538,7 @@ fn shared_kv_mode_from_metadata(
     Some(SpeculativeMode::SharedKv(SharedKvProposerConfig {
         assistant_model: spec.model,
         target_hidden_output,
+        input_embedding_weights: spec.input_embedding,
         backbone_hidden_size: spec.backbone_hidden_size,
         vocab_size: spec.vocab_size,
         num_speculative_tokens: spec.num_speculative_tokens,
