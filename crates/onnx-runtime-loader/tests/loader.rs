@@ -835,23 +835,72 @@ fn bert_toy_optimized_every_value_resolves() {
 
 // --- fail-fast load-time validation (RULES #1) ---
 
-/// A control-flow op carrying a subgraph body (`If`/`Loop`/`Scan`) is rejected
-/// at load: the CPU EP cannot execute nested graphs, so we fail fast with a
-/// message naming the node, op, domain, and subgraph attribute.
+/// The implemented subgraph-bearing control-flow ops (`If`/`Loop`/`Scan`) now
+/// load successfully — the executor runs their nested bodies recursively — so
+/// validation must *accept* them rather than reject at load.
 #[test]
-fn control_flow_subgraph_op_is_rejected_at_load() {
+fn implemented_control_flow_ops_load() {
+    for (op, attr) in [("If", "then_branch"), ("Loop", "body"), ("Scan", "body")] {
+        let subgraph = onnx::GraphProto {
+            output: vec![value_info("body_out", 1, &[Dimlike::Static(1)])],
+            node: vec![node("Identity", &["cond"], &["body_out"])],
+            ..Default::default()
+        };
+        let mut attrs = vec![graph_attr(attr, subgraph)];
+        // If needs both branches; give a matching else_branch too.
+        if op == "If" {
+            let else_g = onnx::GraphProto {
+                output: vec![value_info("body_out", 1, &[Dimlike::Static(1)])],
+                node: vec![node("Identity", &["cond"], &["body_out"])],
+                ..Default::default()
+            };
+            attrs.push(graph_attr("else_branch", else_g));
+        }
+        if op == "Scan" {
+            attrs.push(int_attr("num_scan_inputs", 1));
+        }
+        let mut cf_node = node_attrs(op, &["cond"], &["Y"], attrs);
+        cf_node.name = format!("cf_{op}");
+
+        let graph = onnx::GraphProto {
+            input: vec![value_info("cond", 9, &[Dimlike::Static(1)])], // BOOL
+            output: vec![value_info("Y", 1, &[Dimlike::Static(1)])],
+            node: vec![cf_node],
+            ..Default::default()
+        };
+        let bytes = model(graph, 17);
+        // Validation must not reject the implemented control-flow op. (Shape
+        // inference of the body is deferred to execution, so we only assert the
+        // load-time legality gate does not error with UnsupportedControlFlow.)
+        let result = onnx_runtime_loader::load_model_bytes(&bytes);
+        if let Err(LoaderError::UnsupportedControlFlow { op_type, .. }) = &result {
+            panic!("{op_type} must be accepted at load, but was rejected");
+        }
+    }
+}
+
+/// A subgraph-bearing op that is *not* one of the implemented control-flow ops
+/// (here a custom op smuggling a `Graph` attribute) is still rejected at load
+/// with an actionable message naming the node, op, domain, and attribute.
+#[test]
+fn unimplemented_control_flow_subgraph_op_is_rejected_at_load() {
     let subgraph = onnx::GraphProto {
         output: vec![value_info("then_out", 1, &[Dimlike::Static(1)])],
         node: vec![node("Identity", &["cond"], &["then_out"])],
         ..Default::default()
     };
-    let mut if_node = node_attrs("If", &["cond"], &["Y"], vec![graph_attr("then_branch", subgraph)]);
-    if_node.name = "control_flow_if".to_string();
+    let mut cf_node = node_attrs(
+        "SequenceMap",
+        &["cond"],
+        &["Y"],
+        vec![graph_attr("body", subgraph)],
+    );
+    cf_node.name = "control_flow_seqmap".to_string();
 
     let graph = onnx::GraphProto {
         input: vec![value_info("cond", 9, &[Dimlike::Static(1)])], // BOOL
         output: vec![value_info("Y", 1, &[Dimlike::Static(1)])],
-        node: vec![if_node],
+        node: vec![cf_node],
         ..Default::default()
     };
     let bytes = model(graph, 17);
@@ -861,16 +910,16 @@ fn control_flow_subgraph_op_is_rejected_at_load() {
         matches!(
             &error,
             LoaderError::UnsupportedControlFlow { op_type, node, domain, attr }
-                if op_type == "If"
-                    && node == "\"control_flow_if\""
+                if op_type == "SequenceMap"
+                    && node == "\"control_flow_seqmap\""
                     && domain == "ai.onnx"
-                    && attr == "then_branch"
+                    && attr == "body"
         ),
         "got {error:?}"
     );
     let message = error.to_string();
-    assert!(message.contains("If"), "{message}");
-    assert!(message.contains("then_branch"), "{message}");
+    assert!(message.contains("SequenceMap"), "{message}");
+    assert!(message.contains("body"), "{message}");
     assert!(message.contains("RULES #1"), "{message}");
     assert!(message.contains("control-flow"), "{message}");
 }

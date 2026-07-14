@@ -624,29 +624,32 @@ fn symbolic_input_static_dim_mismatch_is_rejected() {
     );
 }
 
-/// A control-flow op carrying a subgraph body is rejected at session-build time
-/// (from_graph path), mirroring the disk loader — the CPU EP cannot execute
-/// nested graphs, so we fail fast with a RULES #1 message instead of lazily at
-/// run time or silently skipping the subgraph.
+/// A subgraph-bearing op the CPU EP cannot execute (anything other than the
+/// implemented `If`/`Loop`/`Scan`) is rejected at session-build time
+/// (from_graph path), mirroring the disk loader — we fail fast with a RULES #1
+/// message instead of lazily at run time or silently skipping the subgraph.
+/// The three implemented control-flow ops are covered by `tests/control_flow.rs`.
 #[test]
-fn from_graph_rejects_control_flow_subgraph_at_build() {
+fn from_graph_rejects_unimplemented_control_flow_subgraph_at_build() {
     let mut graph = Graph::new();
     graph.opset_imports.insert(String::new(), 17);
-    let cond = input(&mut graph, "cond", DataType::Bool, &[1]);
+    let x = input(&mut graph, "x", DataType::Float32, &[1]);
     let y = graph.create_named_value("y", DataType::Float32, static_shape([1]));
-    let mut node = Node::new(NodeId(0), "If", vec![Some(cond)], vec![y]);
-    node.name = "control_flow_if".to_string();
+    // `SequenceMap` is a real ONNX subgraph-bearing op this runtime does not
+    // implement — it must still be rejected fast.
+    let mut node = Node::new(NodeId(0), "SequenceMap", vec![Some(x)], vec![y]);
+    node.name = "control_flow_seqmap".to_string();
     node.attributes
-        .insert("then_branch".to_string(), Attribute::Graph(Box::new(Graph::new())));
+        .insert("body".to_string(), Attribute::Graph(Box::new(Graph::new())));
     graph.insert_node(node);
     graph.add_output(y);
 
     let message = match InferenceSession::from_graph(graph) {
         Err(err) => err.to_string(),
-        Ok(_) => panic!("control-flow subgraph unexpectedly built"),
+        Ok(_) => panic!("unimplemented control-flow subgraph unexpectedly built"),
     };
-    assert!(message.contains("If"), "{message}");
-    assert!(message.contains("then_branch"), "{message}");
+    assert!(message.contains("SequenceMap"), "{message}");
+    assert!(message.contains("body"), "{message}");
     assert!(message.contains("control-flow"), "{message}");
     assert!(message.contains("RULES #1"), "{message}");
 }

@@ -99,11 +99,11 @@ mod error {
 
         #[error(
             "unsupported ONNX model: operator {domain}::{op_type} at node {node} carries a \
-             subgraph attribute '{attr}' (control-flow / nested-graph op). RULES #1: this runtime \
-             (ep-cpu) does not execute subgraph-bearing ops such as If/Loop/Scan yet, so the model \
-             cannot be run as-is. Expected: a flat graph with no nested subgraphs; to proceed, \
-             lower/unroll the control flow (e.g. export without dynamic loops) or wait for \
-             control-flow support"
+             subgraph attribute '{attr}' (control-flow / nested-graph op) that this runtime cannot \
+             execute. RULES #1: ep-cpu recursively executes the standard control-flow ops \
+             If/Loop/Scan (ai.onnx), but not {op_type}, so the model cannot be run as-is. \
+             Expected: express control flow with If/Loop/Scan, lower/unroll {op_type} into \
+             supported ops, or register a kernel able to execute its subgraph body"
         )]
         UnsupportedControlFlow {
             op_type: String,
@@ -275,8 +275,9 @@ fn build_from_bytes_with_weights(
 /// so the checks cannot drift between the two. It runs, in order:
 ///
 /// 1. [`validate_opset_imports`] — every node's domain must declare an opset.
-/// 2. [`validate_no_control_flow`] — reject subgraph-bearing ops (If/Loop/Scan
-///    and any op carrying a `GraphProto` attribute) the CPU EP cannot execute.
+/// 2. [`validate_no_control_flow`] — allow the implemented subgraph-bearing ops
+///    (`If`/`Loop`/`Scan`) and reject any other op carrying a `GraphProto`
+///    attribute the executor cannot run.
 /// 3. [`validate_no_dangling_refs`] — every consumed tensor must be sourced
 ///    (graph input, initializer, or an upstream node output).
 ///
@@ -316,34 +317,61 @@ fn display_domain(domain: &str) -> String {
 
 /// Reject subgraph-bearing (control-flow) ops the runtime cannot execute.
 ///
-/// The CPU EP has no kernels for `If`/`Loop`/`Scan` and never descends into a
-/// nested [`onnx_runtime_ir::Attribute::Graph`]/`Graphs` body, so a model that
-/// carries one would either fail lazily at run time or — worse — silently skip
-/// the subgraph. We reject it at load with a message naming the offending node
-/// and its subgraph attribute. Detection is by the presence of a `Graph`/
-/// `Graphs` attribute, so it also catches custom ops that smuggle subgraphs.
+/// The CPU executor implements the three standard subgraph-bearing control-flow
+/// ops — `If`, `Loop`, and `Scan` (default `ai.onnx` domain) — by recursively
+/// executing their nested [`onnx_runtime_ir::Attribute::Graph`]/`Graphs` bodies.
+/// Any *other* op that smuggles a subgraph attribute (a control-flow construct
+/// this runtime does not implement, or a custom op hiding a nested graph) is
+/// still rejected fast: the executor has no path to run it, so a silent skip or
+/// a late panic would be worse than a clear load-time error.
+///
+/// The check descends into every nested subgraph as well, so an unimplemented
+/// control-flow op buried inside an `If`/`Loop`/`Scan` body is caught at load
+/// rather than surfacing only when that branch/iteration executes.
 pub fn validate_no_control_flow(graph: &Graph) -> Result<(), LoaderError> {
     use onnx_runtime_ir::Attribute;
 
-    for (_, node) in graph.nodes.iter() {
-        // Report attributes in a deterministic order for stable diagnostics.
-        let mut subgraph_attrs: Vec<&String> = node
-            .attributes
-            .iter()
-            .filter(|(_, v)| matches!(v, Attribute::Graph(_) | Attribute::Graphs(_)))
-            .map(|(k, _)| k)
-            .collect();
-        subgraph_attrs.sort();
-        if let Some(attr) = subgraph_attrs.first() {
-            return Err(LoaderError::UnsupportedControlFlow {
-                op_type: node.op_type.clone(),
-                node: node_label(node),
-                domain: display_domain(&node.domain),
-                attr: (*attr).clone(),
-            });
-        }
+    fn is_default_domain(domain: &str) -> bool {
+        domain.is_empty() || domain == "ai.onnx"
     }
-    Ok(())
+
+    /// The standard subgraph-bearing ops the CPU executor can run recursively.
+    fn is_implemented_control_flow(op_type: &str, domain: &str) -> bool {
+        is_default_domain(domain) && matches!(op_type, "If" | "Loop" | "Scan")
+    }
+
+    fn check_graph(graph: &Graph) -> Result<(), LoaderError> {
+        for (_, node) in graph.nodes.iter() {
+            // Report attributes in a deterministic order for stable diagnostics.
+            let mut subgraph_attrs: Vec<&String> = node
+                .attributes
+                .iter()
+                .filter(|(_, v)| matches!(v, Attribute::Graph(_) | Attribute::Graphs(_)))
+                .map(|(k, _)| k)
+                .collect();
+            subgraph_attrs.sort();
+            if let Some(attr) = subgraph_attrs.first() {
+                // A subgraph body is fine when its owner is an implemented
+                // control-flow op; otherwise fail fast.
+                if !is_implemented_control_flow(&node.op_type, &node.domain) {
+                    return Err(LoaderError::UnsupportedControlFlow {
+                        op_type: node.op_type.clone(),
+                        node: node_label(node),
+                        domain: display_domain(&node.domain),
+                        attr: (*attr).clone(),
+                    });
+                }
+            }
+        }
+        // Descend into nested bodies so an unimplemented construct inside an
+        // implemented op's subgraph is still caught at load time.
+        for subgraph in graph.subgraphs.values() {
+            check_graph(subgraph)?;
+        }
+        Ok(())
+    }
+
+    check_graph(graph)
 }
 
 /// Reject graphs with a node input that has no source.

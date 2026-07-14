@@ -72,14 +72,33 @@ fn build_graph_proto(
         let dtype = decode_dtype(init.data_type, || {
             format!("initializer '{}'", init.name)
         })?;
-        let dims: Vec<usize> = init.dims.iter().map(|&d| d.max(0) as usize).collect();
-        let shape: Shape = dims.into_iter().map(Dim::Static).collect();
+        let dims_vec: Vec<usize> = init.dims.iter().map(|&d| d.max(0) as usize).collect();
+        let shape: Shape = dims_vec.iter().copied().map(Dim::Static).collect();
         let vid = graph.create_named_value(init.name.clone(), dtype, shape);
         names.insert(init.name.clone(), vid);
+        // Subgraph (non-top-level) initializers are not visited by the model's
+        // top-level weight loader (`weights::load_weights` only walks the root
+        // `GraphProto`), so a control-flow body's own constants would otherwise
+        // be producer-less values with no data — indistinguishable from an
+        // outer-scope capture, and unrunnable. Inline their bytes here so the
+        // subgraph is a self-contained runnable graph. Only inline-encoded
+        // initializers are supported inside subgraphs; an external-data body
+        // initializer is left unbound and surfaces as a clear missing-source
+        // error at execution rather than being silently mis-read.
+        if !is_top_level
+            && init.data_location != crate::proto::onnx::tensor_proto::DataLocation::External as i32
+        {
+            let td = crate::weights::tensor_data_from_proto(init, dtype, &dims_vec)?;
+            graph.set_initializer(vid, onnx_runtime_ir::WeightRef::Inline(td));
+        }
     }
 
     // 2. Graph inputs. Names that are also initializers are constants, not
-    //    real graph inputs (invariant §3.5.3).
+    //    real graph inputs (invariant §3.5.3). Both the top-level graph and
+    //    control-flow subgraph bodies record their formal input signature in
+    //    `graph.inputs`, in declared order: a subgraph body's formal parameters
+    //    (e.g. Loop's `iter_num`/`cond`/loop-carried, Scan's state/scan slices)
+    //    are bound positionally at execution, so their order must survive load.
     for vi in &gp.input {
         if vi.name.is_empty() {
             continue;
@@ -90,9 +109,7 @@ fn build_graph_proto(
         let (dtype, shape) = value_info_type(graph, vi)?;
         let vid = graph.create_named_value(vi.name.clone(), dtype, shape);
         names.insert(vi.name.clone(), vid);
-        if is_top_level {
-            graph.add_input(vid);
-        }
+        graph.add_input(vid);
     }
 
     // 3. Declared value_info type hints for interior values.
@@ -161,12 +178,14 @@ fn build_graph_proto(
         register_subgraphs(graph, nid);
     }
 
-    // 6. Register graph outputs in order.
-    if is_top_level {
-        for vi in &gp.output {
-            if let Some(&vid) = names.get(&vi.name) {
-                graph.add_output(vid);
-            }
+    // 6. Register graph outputs in order. Both the top-level graph and each
+    //    control-flow subgraph body record their formal output signature here,
+    //    in declared order: a body's outputs (e.g. Loop's
+    //    `cond_out`/loop-carried/scan-outputs) are consumed positionally by the
+    //    control-flow executor, so the order must survive load.
+    for vi in &gp.output {
+        if let Some(&vid) = names.get(&vi.name) {
+            graph.add_output(vid);
         }
     }
 
