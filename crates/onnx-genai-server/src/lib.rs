@@ -2,8 +2,10 @@
 //!
 //! The default-on `metrics` feature exposes the atomic registry at `GET /metrics`;
 //! disable it with `--no-default-features` when Prometheus exposition is not needed.
-//! `GET /v1/debug/trace` reports tracing integration status, but Perfetto and OTLP
-//! trace export are intentionally not implemented in this crate yet.
+//! `GET /v1/debug/trace` reports tracing integration status and links to the
+//! Perfetto export at `GET /v1/debug/trace/perfetto`, which serves the recorded
+//! decode timeline as a Chrome Trace Event Format document. OTLP span export is
+//! intentionally deferred (see issue #13).
 
 use std::{net::SocketAddr, time::Instant};
 
@@ -65,7 +67,11 @@ pub fn app(state: AppState) -> Router {
             .route("/v1/debug/config", get(routes::debug_config))
             .route("/v1/debug/sessions", get(routes::debug_sessions))
             .route("/v1/debug/kv", get(routes::debug_kv))
-            .route("/v1/debug/trace", get(routes::debug_trace));
+            .route("/v1/debug/trace", get(routes::debug_trace))
+            .route(
+                "/v1/debug/trace/perfetto",
+                get(routes::debug_trace_perfetto),
+            );
     }
     if state.config.enable_admin_endpoints {
         router = router

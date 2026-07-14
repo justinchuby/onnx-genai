@@ -1118,12 +1118,55 @@ async fn debug_endpoints_expose_config_sessions_cache_and_trace_state() {
         serde_json::from_slice(&to_bytes(trace.into_body(), usize::MAX).await.unwrap()).unwrap();
     assert_eq!(trace["tracing_span"], "http.request");
     assert!(trace["latest_trace_id"].is_string());
-    assert!(
-        trace["perfetto_export"]
-            .as_str()
-            .unwrap()
-            .contains("not implemented")
+    assert_eq!(
+        trace["perfetto_export"]["endpoint"],
+        "/v1/debug/trace/perfetto"
     );
+    assert!(trace["perfetto_export"]["recorded_events"].is_u64());
+    assert!(trace["perfetto_export"]["collecting"].is_boolean());
+    assert!(
+        trace["otlp_export"].as_str().unwrap().contains("deferred"),
+        "OTLP export must be reported as deferred"
+    );
+}
+
+#[tokio::test]
+async fn debug_trace_perfetto_returns_well_formed_chrome_trace() {
+    let router = app(tiny_state_with_debug());
+
+    let resp = router
+        .oneshot(
+            Request::builder()
+                .uri("/v1/debug/trace/perfetto")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
+        Some("application/json")
+    );
+    assert!(
+        resp.headers()
+            .get(header::CONTENT_DISPOSITION)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.contains("onnx-genai-trace.json")),
+        "Perfetto export must be served as a downloadable attachment"
+    );
+    let doc: Value =
+        serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+    // Chrome Trace Event Format: an object with a `traceEvents` array. It may be
+    // empty (no spans recorded in this process) but must be well-formed so it
+    // opens directly in https://ui.perfetto.dev.
+    assert!(
+        doc["traceEvents"].is_array(),
+        "Perfetto document must contain a traceEvents array"
+    );
+    assert_eq!(doc["displayTimeUnit"], "ms");
 }
 
 #[tokio::test]
@@ -1135,6 +1178,7 @@ async fn debug_endpoints_return_404_when_gate_is_off() {
         "/v1/debug/sessions",
         "/v1/debug/kv",
         "/v1/debug/trace",
+        "/v1/debug/trace/perfetto",
     ] {
         let resp = router
             .clone()
