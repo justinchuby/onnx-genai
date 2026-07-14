@@ -2670,7 +2670,7 @@ onnx-genai/                               (monorepo)
 │   ├── onnx-runtime-ep-cpu/                       # CPU EP (oneDNN, C++ FFI) — we maintain
 │   ├── onnx-runtime-ep-cuda/                      # CUDA EP (CuTe + cuBLAS) — we maintain
 │   ├── onnx-runtime-session/                      # Session builder, inference API
-│   ├── onnx-runtime-profiler/                     # Tracing, Chrome Trace, memory debugger
+│   ├── onnx-runtime-tracer/                       # Unified tracing (shared by runtime + genai)
 │   ├── onnx-runtime-capi/                         # C ABI: libonnxruntime.so drop-in
 │   ├── onnx-runtime-autotuner/                    # Agent-driven optimization loop
 │   │
@@ -4844,7 +4844,50 @@ memory, transfers) each have their own events. Without unified tracing, user see
 disconnected views and can't correlate "why was this decode step slow" with "because a
 page was being fetched".
 
-### 48.2 Shared Trace Context
+### 48.2 Crate: `onnx-runtime-tracer`
+
+Tracing is an **independent crate** shared by both layers. Minimal dependencies (only `tracing` + protobuf).
+
+```
+onnx-runtime-tracer        ← standalone, zero runtime dependency
+├── depended on by: onnx-runtime-session (runtime layer)
+├── depended on by: onnx-genai-engine (genai layer)
+└── depended on by: user code (custom collectors, analysis tools)
+```
+
+```toml
+# workspace Cargo.toml
+[workspace.dependencies]
+onnx-runtime-tracer = { path = "crates/onnx-runtime-tracer" }
+```
+
+**Crate contents:**
+```rust
+// crates/onnx-runtime-tracer/src/lib.rs
+pub struct TraceContext { .. }       // shared context (clock + collector + config)
+pub trait TraceCollector { .. }      // output sink trait
+pub struct TraceEvent { .. }         // unified event type
+pub enum TraceFormat { .. }          // ChromeJson | PerfettoProto | Jsonl
+pub enum TraceVerbosity { .. }       // Decisions | Ops | Full
+
+pub mod perfetto;                    // Perfetto proto serialization
+pub mod chrome;                      // Chrome Trace JSON serialization
+pub mod jsonl;                       // JSONL format
+pub mod diagnose;                    // Auto-diagnosis engine
+
+// Built-in collectors
+pub struct FileCollector { .. }      // append to file
+pub struct MemoryCollector { .. }    // collect in Vec (for API)
+pub struct NoopCollector;            // zero overhead (default)
+```
+
+**Why a separate crate (not inside runtime or genai):**
+- Type unification: both layers use the exact same `TraceContext` type
+- No circular dependency: tracer has zero knowledge of runtime or genai internals
+- User-extensible: users `impl TraceCollector` without importing heavy runtime deps
+- Compile speed: small crate, fast incremental builds
+
+### 48.3 Shared Trace Context
 
 ```rust
 /// Both layers share this. Single monotonic clock, single output sink.
@@ -5474,7 +5517,7 @@ _Depends on: Phase 2 complete_
 - [ ] Compute-communication overlap (micro-chunking)
 - [ ] FlashAttention integration (flash-attn library binding)
 - [ ] CuTe kernels: FusedResidualLayerNorm, RoPE, FusedGEMM+Bias+Act
-- [ ] `onnx-runtime-profiler`: Chrome Trace + Perfetto export, cross-device timeline
+- [ ] `onnx-runtime-tracer`: Unified tracing crate (TraceContext, collectors, Perfetto/Chrome/JSONL, auto-diagnosis)
 - [ ] Cost model calibration + profiling feedback loop
 - [ ] Dynamic shape kernel cache + bucketing
 - [ ] ILP placement optimizer (HiGHS integration)
