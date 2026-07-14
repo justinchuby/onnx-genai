@@ -115,6 +115,61 @@ fn unsupported_op_error_is_actionable() {
     assert!(message.contains("To fix:"), "{message}");
 }
 
+#[test]
+fn unsupported_op_error_formats_unnamed_node_gracefully() {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 0);
+    let x = input(&mut graph, "x", DataType::Float32, &[1]);
+    let y = graph.create_named_value("y", DataType::Float32, static_shape([1]));
+    graph.insert_node(Node::new(
+        NodeId(0),
+        "Sigmoid",
+        vec![Some(x)],
+        vec![y],
+    ));
+    graph.add_output(y);
+
+    let message = match InferenceSession::from_graph(graph) {
+        Err(err) => err.to_string(),
+        Ok(_) => panic!("unsupported operator unexpectedly built"),
+    };
+    assert!(
+        message.contains("node <unnamed node #0>, opset 0"),
+        "{message}"
+    );
+    assert!(!message.contains("node \"\""), "{message}");
+}
+
+#[test]
+fn unsupported_op_error_reports_undeclared_opset_without_sentinel() {
+    let mut graph = Graph::new();
+    let x = input(&mut graph, "x", DataType::Float32, &[1]);
+    let y = graph.create_named_value("y", DataType::Float32, static_shape([1]));
+    let mut node = Node::new(NodeId(0), "Sigmoid", vec![Some(x)], vec![y]);
+    node.name = "missing_opset_import".to_string();
+    graph.insert_node(node);
+    graph.add_output(y);
+
+    let message = match InferenceSession::from_graph(graph) {
+        Err(err) => err.to_string(),
+        Ok(_) => panic!("unsupported operator unexpectedly built"),
+    };
+    assert_eq!(
+        message,
+        "unsupported operator ai.onnx::Sigmoid: no available execution provider has a kernel; \
+         node \"missing_opset_import\", opset <undeclared>; consulted execution providers \
+         (priority order): cpu_ep. To fix: declare an opset_import for domain \"ai.onnx\" in the \
+         model, enable another EP that supports this operator and opset, convert or decompose the \
+         model operator, or file an nxrt issue with the model details"
+    );
+    assert!(message.contains("opset <undeclared>"), "{message}");
+    assert!(
+        message.contains("declare an opset_import for domain \"ai.onnx\" in the model"),
+        "{message}"
+    );
+    assert!(!message.contains("18446744073709551615"), "{message}");
+}
+
 // --- reference implementations ---------------------------------------------
 
 fn ref_matmul(a: &[f32], m: usize, k: usize, b: &[f32], n: usize) -> Vec<f32> {

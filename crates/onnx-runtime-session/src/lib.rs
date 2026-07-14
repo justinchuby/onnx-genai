@@ -31,7 +31,55 @@ mod epcontext;
 mod executor;
 mod tensor;
 
+/// Operator-set version associated with an operator dispatch failure.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OpsetVersion {
+    /// The model declares this version for the operator's domain.
+    Known(u64),
+    /// The model has no opset import for the operator's domain.
+    Undeclared,
+}
+
+impl std::fmt::Display for OpsetVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Known(version) => version.fmt(f),
+            Self::Undeclared => f.write_str("<undeclared>"),
+        }
+    }
+}
+
 mod error {
+    use super::OpsetVersion;
+
+    struct UnsupportedOpRemediation<'a> {
+        opset: OpsetVersion,
+        domain: &'a str,
+    }
+
+    impl std::fmt::Display for UnsupportedOpRemediation<'_> {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            if self.opset == OpsetVersion::Undeclared {
+                write!(
+                    f,
+                    "declare an opset_import for domain {:?} in the model, ",
+                    self.domain
+                )?;
+            }
+            f.write_str(
+                "enable another EP that supports this operator and opset, convert or decompose \
+                 the model operator, or file an nxrt issue with the model details",
+            )
+        }
+    }
+
+    fn unsupported_op_remediation(
+        opset: OpsetVersion,
+        domain: &str,
+    ) -> UnsupportedOpRemediation<'_> {
+        UnsupportedOpRemediation { opset, domain }
+    }
+
     /// Errors produced by the session layer.
     #[derive(Debug, thiserror::Error)]
     pub enum SessionError {
@@ -57,15 +105,14 @@ mod error {
         #[error(
             "unsupported operator {domain}::{op_type}: no available execution provider has a \
              kernel; node {node}, opset {opset}; consulted execution providers (priority order): \
-             {execution_providers}. To fix: enable another EP that supports this operator and \
-             opset, convert or decompose the model operator, or file an nxrt issue with the model \
-             details"
+             {execution_providers}. To fix: {remediation}",
+            remediation = unsupported_op_remediation(*.opset, .domain)
         )]
         UnsupportedOp {
             op_type: String,
             domain: String,
             node: String,
-            opset: u64,
+            opset: OpsetVersion,
             execution_providers: String,
         },
 
@@ -164,6 +211,11 @@ mod error {
                 format!("<unnamed node #{}>", node_id.0)
             } else {
                 format!("{:?}", node.name)
+            };
+            let opset = if opset == u64::MAX {
+                OpsetVersion::Undeclared
+            } else {
+                OpsetVersion::Known(opset)
             };
             Self::UnsupportedOp {
                 op_type: node.op_type.clone(),

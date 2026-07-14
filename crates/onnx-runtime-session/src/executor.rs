@@ -1035,6 +1035,9 @@ mod tests {
         let node = Node::new(NodeId(0), "Softmax", vec![], vec![]);
         assert_eq!(effective_opset(&graph, &node), 12);
 
+        graph.opset_imports.insert(String::new(), 0);
+        assert_eq!(effective_opset(&graph, &node), 0);
+
         // Missing import falls back to u64::MAX (assume latest).
         let empty = Graph::default();
         assert_eq!(effective_opset(&empty, &node), u64::MAX);
