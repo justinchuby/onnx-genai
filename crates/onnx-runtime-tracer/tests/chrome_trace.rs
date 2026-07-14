@@ -1,13 +1,16 @@
-//! Integration tests for `onnx-runtime-tracer`.
+//! Integration tests for the Chrome Trace export path via the collector
+//! architecture.
 //!
 //! These exercise the public API the way a runtime would: build spans across
-//! multiple threads, export to Chrome Trace JSON, and validate the exported
+//! multiple threads through a shared [`TraceContext`], capture into a
+//! [`MemoryCollector`], export to Chrome Trace JSON, and validate the exported
 //! document parses back and is schema-correct. Timing assertions are
 //! deliberately robust — we assert ordering and presence, never exact
 //! durations.
 
-use onnx_runtime_tracer::{Args, Event, Phase, Tracer};
+use onnx_runtime_tracer::{Args, MemoryCollector, TraceContext, TraceEvent, TraceFormat, TracePhase};
 use serde_json::Value;
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -22,23 +25,22 @@ fn parse_and_validate(json: &str) -> Vec<Value> {
     for event in &array {
         let obj = event.as_object().expect("each event is a JSON object");
         for key in ["name", "cat", "ph", "ts", "pid", "tid"] {
-            assert!(obj.contains_key(key), "event missing required key {key:?}: {obj:?}");
+            assert!(
+                obj.contains_key(key),
+                "event missing required key {key:?}: {obj:?}"
+            );
         }
-        // `ph` must be a known single-character phase code.
         let ph = obj["ph"].as_str().expect("ph is a string");
-        assert!(
-            Phase::from_code(ph).is_some(),
-            "unknown phase code {ph:?}"
-        );
+        assert!(TracePhase::from_code(ph).is_some(), "unknown phase code {ph:?}");
     }
     array
 }
 
 #[test]
 fn complete_event_has_expected_shape() {
-    let tracer = Tracer::new();
+    let (ctx, mem) = TraceContext::in_memory();
     let start = Instant::now();
-    tracer.complete(
+    ctx.complete(
         "MatMul_0",
         "compute",
         start,
@@ -50,7 +52,7 @@ fn complete_event_has_expected_shape() {
         ),
     );
 
-    let json = tracer.to_chrome_json();
+    let json = mem.to_chrome_json();
     let events = parse_and_validate(&json);
     assert_eq!(events.len(), 1);
 
@@ -66,9 +68,9 @@ fn complete_event_has_expected_shape() {
 
 #[test]
 fn round_trips_through_serde() {
-    let tracer = Tracer::new();
+    let (ctx, mem) = TraceContext::in_memory();
     let start = Instant::now();
-    tracer.complete(
+    ctx.complete(
         "transfer",
         "transfer",
         start,
@@ -76,11 +78,12 @@ fn round_trips_through_serde() {
         Some(Args::new().bytes(16_384).src("cuda:0").dst("cpu")),
     );
 
-    let json = tracer.to_chrome_json();
-    let parsed: Vec<Event> = serde_json::from_str(&json).expect("events must deserialize back");
+    let json = mem.to_chrome_json();
+    let parsed: Vec<TraceEvent> =
+        serde_json::from_str(&json).expect("events must deserialize back");
     assert_eq!(parsed.len(), 1);
     assert_eq!(parsed[0].name, "transfer");
-    assert_eq!(parsed[0].ph, Phase::Complete);
+    assert_eq!(parsed[0].ph, TracePhase::Complete);
     assert_eq!(parsed[0].dur, Some(200));
     let args = parsed[0].args.as_ref().expect("args preserved");
     assert_eq!(args["bytes"], 16_384);
@@ -90,48 +93,45 @@ fn round_trips_through_serde() {
 
 #[test]
 fn span_guard_records_on_drop_with_monotonic_ts_and_dur() {
-    let tracer = Tracer::new();
+    let (ctx, mem) = TraceContext::in_memory();
     {
-        let _s = tracer.span("layer_norm", "compute");
+        let _s = ctx.span("layer_norm", "compute");
         thread::sleep(Duration::from_millis(2));
     }
     {
-        let _s = tracer
+        let _s = ctx
             .span("softmax", "compute")
             .with_args(Args::new().device("cpu"));
         thread::sleep(Duration::from_millis(2));
     }
 
-    let events = tracer.events();
+    let events = mem.events();
     assert_eq!(events.len(), 2);
-    // Both are complete events with a recorded duration.
     for event in &events {
-        assert_eq!(event.ph, Phase::Complete);
+        assert_eq!(event.ph, TracePhase::Complete);
         assert!(event.dur.is_some());
     }
-    // Timestamps are monotonically non-decreasing in record order.
     assert!(events[0].ts <= events[1].ts);
-    // The second span's args survived.
     assert_eq!(events[1].args.as_ref().unwrap()["device"], "cpu");
 }
 
 #[test]
 fn explicit_finish_records_before_drop() {
-    let tracer = Tracer::new();
-    let span = tracer.span("prefill", "compute");
+    let (ctx, mem) = TraceContext::in_memory();
+    let span = ctx.span("prefill", "compute");
     span.finish();
-    assert_eq!(tracer.len(), 1);
-    assert_eq!(tracer.events()[0].name, "prefill");
+    assert_eq!(mem.len(), 1);
+    assert_eq!(mem.events()[0].name, "prefill");
 }
 
 #[test]
 fn multiple_threads_get_distinct_tids() {
-    let tracer = Tracer::new();
+    let (ctx, mem) = TraceContext::in_memory();
     let mut handles = Vec::new();
     for i in 0..4 {
-        let t = tracer.clone();
+        let c = ctx.clone();
         handles.push(thread::spawn(move || {
-            let _s = t.span(format!("op_{i}"), "compute");
+            let _s = c.span(format!("op_{i}"), "compute");
             thread::sleep(Duration::from_millis(1));
         }));
     }
@@ -139,20 +139,18 @@ fn multiple_threads_get_distinct_tids() {
         h.join().unwrap();
     }
 
-    let events = tracer.events();
+    let events = mem.events();
     assert_eq!(events.len(), 4);
 
-    let json = tracer.to_chrome_json();
+    let json = mem.to_chrome_json();
     let parsed = parse_and_validate(&json);
     assert_eq!(parsed.len(), 4);
 
-    // Every event shares the one process id.
-    let pid = tracer.pid();
+    let pid = ctx.pid();
     for event in &events {
         assert_eq!(event.pid, pid);
     }
 
-    // Four threads each recorded once, so we see four distinct tids.
     let mut tids: Vec<u64> = events.iter().map(|e| e.tid).collect();
     tids.sort_unstable();
     tids.dedup();
@@ -160,48 +158,69 @@ fn multiple_threads_get_distinct_tids() {
 }
 
 #[test]
-fn disabled_tracer_emits_nothing() {
-    let tracer = Tracer::disabled();
-    let start = Instant::now();
-    tracer.complete("x", "compute", start, Duration::from_micros(10), None);
-    tracer.instant("marker", "compute", None);
-    {
-        let _s = tracer.span("y", "compute");
-    }
-    tracer.set_process_name("nxrt");
+fn disabled_context_emits_nothing() {
+    let mem = Arc::new(MemoryCollector::new());
+    let ctx = TraceContext::with_collector(mem.clone(), TraceFormat::ChromeJson);
+    ctx.set_enabled(false);
 
-    assert!(tracer.is_empty());
-    assert_eq!(tracer.to_chrome_json(), "[]");
+    let start = Instant::now();
+    ctx.complete("x", "compute", start, Duration::from_micros(10), None);
+    ctx.instant("marker", "compute", None);
+    {
+        let _s = ctx.span("y", "compute");
+    }
+    ctx.set_process_name("nxrt");
+
+    assert!(mem.is_empty());
+    assert_eq!(mem.to_chrome_json(), "[]");
+}
+
+#[test]
+fn noop_context_records_nothing() {
+    let ctx = TraceContext::noop();
+    assert!(!ctx.is_enabled());
+    ctx.complete("x", "compute", Instant::now(), Duration::from_micros(1), None);
+    {
+        let _s = ctx.span("y", "compute");
+    }
+    // Even when force-enabled, the NoopCollector discards everything.
+    ctx.set_enabled(true);
+    {
+        let _s = ctx.span("z", "compute");
+    }
+    ctx.flush().expect("noop flush is infallible");
 }
 
 #[test]
 fn enable_flag_can_be_toggled_at_runtime() {
-    let tracer = Tracer::disabled();
+    let mem = Arc::new(MemoryCollector::new());
+    let ctx = TraceContext::with_collector(mem.clone(), TraceFormat::ChromeJson);
+    ctx.set_enabled(false);
     {
-        let _s = tracer.span("ignored", "compute");
+        let _s = ctx.span("ignored", "compute");
     }
-    assert!(tracer.is_empty());
+    assert!(mem.is_empty());
 
-    tracer.set_enabled(true);
+    ctx.set_enabled(true);
     {
-        let _s = tracer.span("recorded", "compute");
+        let _s = ctx.span("recorded", "compute");
     }
-    assert_eq!(tracer.len(), 1);
-    assert_eq!(tracer.events()[0].name, "recorded");
+    assert_eq!(mem.len(), 1);
+    assert_eq!(mem.events()[0].name, "recorded");
 
-    tracer.set_enabled(false);
+    ctx.set_enabled(false);
     {
-        let _s = tracer.span("ignored_again", "compute");
+        let _s = ctx.span("ignored_again", "compute");
     }
-    assert_eq!(tracer.len(), 1);
+    assert_eq!(mem.len(), 1);
 }
 
 #[test]
 fn metadata_events_name_process_and_thread() {
-    let tracer = Tracer::new();
-    tracer.set_process_name("nxrt");
-    tracer.set_thread_name("main");
-    tracer.complete(
+    let (ctx, mem) = TraceContext::in_memory();
+    ctx.set_process_name("nxrt");
+    ctx.set_thread_name("main");
+    ctx.complete(
         "op",
         "compute",
         Instant::now(),
@@ -209,10 +228,10 @@ fn metadata_events_name_process_and_thread() {
         None,
     );
 
-    let events = tracer.events();
-    let metadata: Vec<&Event> = events
+    let events = mem.events();
+    let metadata: Vec<&TraceEvent> = events
         .iter()
-        .filter(|e| e.ph == Phase::Metadata)
+        .filter(|e| e.ph == TracePhase::Metadata)
         .collect();
     assert_eq!(metadata.len(), 2);
 
@@ -223,89 +242,42 @@ fn metadata_events_name_process_and_thread() {
     let process = metadata.iter().find(|e| e.name == "process_name").unwrap();
     assert_eq!(process.args.as_ref().unwrap()["name"], "nxrt");
 
-    // Metadata events still validate as part of the exported array.
-    parse_and_validate(&tracer.to_chrome_json());
+    parse_and_validate(&mem.to_chrome_json());
 }
 
 #[test]
 fn instant_event_carries_thread_scope() {
-    let tracer = Tracer::new();
-    tracer.instant("checkpoint", "marker", Some(Args::new().with("step", 3)));
+    let (ctx, mem) = TraceContext::in_memory();
+    ctx.instant("checkpoint", "marker", Some(Args::new().with("step", 3)));
 
-    let events = tracer.events();
+    let events = mem.events();
     assert_eq!(events.len(), 1);
-    assert_eq!(events[0].ph, Phase::Instant);
+    assert_eq!(events[0].ph, TracePhase::Instant);
     assert_eq!(events[0].scope, Some('t'));
     assert_eq!(events[0].args.as_ref().unwrap()["step"], 3);
 
-    // The instant scope surfaces as the Chrome `s` field.
-    let json = tracer.to_chrome_json();
+    let json = mem.to_chrome_json();
     let value: Value = serde_json::from_str(&json).unwrap();
     assert_eq!(value[0]["s"], "t");
 }
 
 #[test]
-fn empty_tracer_exports_valid_empty_array() {
-    let tracer = Tracer::new();
-    let json = tracer.to_chrome_json();
+fn empty_collector_exports_valid_empty_array() {
+    let mem = MemoryCollector::new();
+    let json = mem.to_chrome_json();
     assert_eq!(json, "[]");
     let events = parse_and_validate(&json);
     assert!(events.is_empty());
 }
 
 #[test]
-fn write_chrome_json_round_trips_from_disk() {
-    let tracer = Tracer::new();
-    tracer.complete(
-        "op",
-        "compute",
-        Instant::now(),
-        Duration::from_micros(7),
-        Some(Args::new().device("cpu")),
-    );
-
-    // Use the cargo-provided temp dir, never /tmp.
-    let mut path = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
-    path.push("tracer_write_round_trip.json");
-    tracer.write_chrome_json(&path).expect("write should succeed");
-
-    let json = std::fs::read_to_string(&path).unwrap();
-    let events = parse_and_validate(&json);
-    assert_eq!(events.len(), 1);
-    assert_eq!(events[0]["args"]["device"], "cpu");
-
-    let _ = std::fs::remove_file(&path);
-}
-
-#[test]
-fn write_chrome_json_reports_path_on_failure() {
-    let tracer = Tracer::new();
-    // A path whose parent directory does not exist forces an I/O error.
-    let mut path = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
-    path.push("definitely-missing-subdir");
-    path.push("trace.json");
-
-    let err = tracer.write_chrome_json(&path).unwrap_err();
-    let message = err.to_string();
-    assert!(
-        message.contains("trace.json"),
-        "error message must name the path, got: {message}"
-    );
-    assert!(
-        message.contains("failed to write"),
-        "error message must say what failed, got: {message}"
-    );
-}
-
-#[test]
-fn clear_drops_events_but_keeps_timeline() {
-    let tracer = Tracer::new();
-    tracer.complete("a", "compute", Instant::now(), Duration::from_micros(1), None);
-    assert_eq!(tracer.len(), 1);
-    tracer.clear();
-    assert!(tracer.is_empty());
-    // Still usable after a clear.
-    tracer.complete("b", "compute", Instant::now(), Duration::from_micros(1), None);
-    assert_eq!(tracer.len(), 1);
-    assert_eq!(tracer.events()[0].name, "b");
+fn clear_drops_events_but_keeps_context_usable() {
+    let (ctx, mem) = TraceContext::in_memory();
+    ctx.complete("a", "compute", Instant::now(), Duration::from_micros(1), None);
+    assert_eq!(mem.len(), 1);
+    mem.clear();
+    assert!(mem.is_empty());
+    ctx.complete("b", "compute", Instant::now(), Duration::from_micros(1), None);
+    assert_eq!(mem.len(), 1);
+    assert_eq!(mem.events()[0].name, "b");
 }

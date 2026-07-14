@@ -1,9 +1,13 @@
-//! The trace event model — a typed mirror of the
-//! [Chrome Trace Event Format](https://docs.google.com/document/d/1CvAClvFfyA5R-PhYUmn5OOQtYMH4h6I0nSsKchNAySU/preview).
+//! The unified trace event model (§48.3).
 //!
-//! An exported trace is a JSON **array** of [`Event`] objects (the exact shape
-//! shown in `docs/ORT2.md` §17.2). Perfetto (<https://ui.perfetto.dev>) and
-//! `chrome://tracing` both ingest that array directly.
+//! [`TraceEvent`] is the single event type both the runtime and genai layers
+//! record. On the wire it serializes to the
+//! [Chrome Trace Event Format](https://docs.google.com/document/d/1CvAClvFfyA5R-PhYUmn5OOQtYMH4h6I0nSsKchNAySU/preview)
+//! object shape (the exact form in `docs/ORT2.md` §17.2), so a
+//! [`ChromeJson`](crate::TraceFormat::ChromeJson) or
+//! [`Jsonl`](crate::TraceFormat::Jsonl) export is just a serialization of these
+//! events, and the [`perfetto`](crate::perfetto) exporter maps the same fields
+//! into `perfetto.protos.Trace` packets.
 //!
 //! Only the fields the runtime actually uses are modelled. Optional fields
 //! (`dur`, `args`, `scope`) are omitted from the JSON when unset, keeping the
@@ -17,17 +21,17 @@ use std::fmt;
 
 /// The event phase — the `ph` field in Chrome Trace Event Format.
 ///
-/// Only the subset the runtime needs is modelled. [`Complete`](Phase::Complete)
+/// Only the subset the runtime needs is modelled. [`Complete`](TracePhase::Complete)
 /// (`"X"`) is the workhorse: a single self-contained event with a start `ts`
-/// and a `dur`. The begin/end pair and instant/metadata phases are provided
-/// for callers that need them.
+/// and a `dur`. The begin/end pair and instant/metadata phases are provided for
+/// callers that need them (and for backends such as ITT that pair begin/end).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum Phase {
+pub enum TracePhase {
     /// `"X"` — a complete event with a duration (`ts` .. `ts + dur`).
     Complete,
-    /// `"B"` — the begin of a duration event (paired with [`Phase::End`]).
+    /// `"B"` — the begin of a duration event (paired with [`TracePhase::End`]).
     Begin,
-    /// `"E"` — the end of a duration event (paired with [`Phase::Begin`]).
+    /// `"E"` — the end of a duration event (paired with [`TracePhase::Begin`]).
     End,
     /// `"i"` — an instant event with no duration.
     Instant,
@@ -35,16 +39,16 @@ pub enum Phase {
     Metadata,
 }
 
-impl Phase {
+impl TracePhase {
     /// The single-character Chrome Trace phase code.
     #[must_use]
     pub const fn code(self) -> &'static str {
         match self {
-            Phase::Complete => "X",
-            Phase::Begin => "B",
-            Phase::End => "E",
-            Phase::Instant => "i",
-            Phase::Metadata => "M",
+            TracePhase::Complete => "X",
+            TracePhase::Begin => "B",
+            TracePhase::End => "E",
+            TracePhase::Instant => "i",
+            TracePhase::Metadata => "M",
         }
     }
 
@@ -52,48 +56,53 @@ impl Phase {
     #[must_use]
     pub fn from_code(code: &str) -> Option<Self> {
         match code {
-            "X" => Some(Phase::Complete),
-            "B" => Some(Phase::Begin),
-            "E" => Some(Phase::End),
-            "i" => Some(Phase::Instant),
-            "M" => Some(Phase::Metadata),
+            "X" => Some(TracePhase::Complete),
+            "B" => Some(TracePhase::Begin),
+            "E" => Some(TracePhase::End),
+            "i" => Some(TracePhase::Instant),
+            "M" => Some(TracePhase::Metadata),
             _ => None,
         }
     }
 }
 
-impl Serialize for Phase {
+impl Serialize for TracePhase {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         serializer.serialize_str(self.code())
     }
 }
 
-impl<'de> Deserialize<'de> for Phase {
+impl<'de> Deserialize<'de> for TracePhase {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let code = String::deserialize(deserializer)?;
-        Phase::from_code(&code)
+        TracePhase::from_code(&code)
             .ok_or_else(|| de::Error::custom(format!("unknown Chrome trace phase code {code:?}")))
     }
 }
 
-/// A single Chrome Trace event.
+/// A single unified trace event.
 ///
-/// Timestamps ([`ts`](Event::ts)) and durations ([`dur`](Event::dur)) are in
-/// **microseconds** relative to the owning [`Tracer`](crate::Tracer)'s epoch.
-/// Construct events through the [`Tracer`](crate::Tracer) API rather than by
-/// hand where possible; the public fields exist so exported traces round-trip
-/// through `serde_json`.
+/// Timestamps ([`ts`](TraceEvent::ts)) and durations ([`dur`](TraceEvent::dur))
+/// are in **microseconds** relative to the owning
+/// [`TraceContext`](crate::TraceContext)'s [`TraceClock`](crate::TraceClock)
+/// epoch. Construct events through the [`TraceContext`](crate::TraceContext) API
+/// rather than by hand where possible; the public fields exist so exported
+/// traces round-trip through `serde_json`.
+///
+/// Note: data-dependency (`flow_id`) and GPU-kernel correlation (`node_id`)
+/// fields from §48.4 / §49 are intentionally **not** modelled yet — those land
+/// with the executor-wiring and CUPTI phases.
 #[derive(Clone, Debug, PartialEq)]
-pub struct Event {
+pub struct TraceEvent {
     /// Human-readable event name (e.g. `"MatMul_0"`).
     pub name: String,
     /// Category used for colouring/grouping lanes (e.g. `"compute"`).
     pub cat: String,
     /// The event phase.
-    pub ph: Phase,
-    /// Start timestamp in microseconds, relative to the tracer epoch.
+    pub ph: TracePhase,
+    /// Start timestamp in microseconds, relative to the clock epoch.
     pub ts: u64,
-    /// Duration in microseconds. Present only for [`Phase::Complete`].
+    /// Duration in microseconds. Present only for [`TracePhase::Complete`].
     pub dur: Option<u64>,
     /// Process id (lane group).
     pub pid: u64,
@@ -105,19 +114,17 @@ pub struct Event {
     pub args: Option<Value>,
 }
 
-impl Event {
-    /// Serialize this single event to a JSON object string.
-    ///
-    /// Rarely needed directly — callers usually export the whole trace via
-    /// [`Tracer::to_chrome_json`](crate::Tracer::to_chrome_json).
+impl TraceEvent {
+    /// Serialize this single event to a JSON object string (its Chrome Trace
+    /// wire shape). Used by the [`Jsonl`](crate::TraceFormat::Jsonl) exporter.
     #[must_use]
     pub fn to_json(&self) -> String {
-        // `Event` always serializes successfully, so the unwrap is infallible.
-        serde_json::to_string(self).expect("Event serialization is infallible")
+        // `TraceEvent` always serializes successfully, so the unwrap is infallible.
+        serde_json::to_string(self).expect("TraceEvent serialization is infallible")
     }
 }
 
-impl Serialize for Event {
+impl Serialize for TraceEvent {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         // Count only the fields we will actually emit so the struct length is
         // correct for formats that need it.
@@ -131,7 +138,7 @@ impl Serialize for Event {
         if self.args.is_some() {
             len += 1;
         }
-        let mut state = serializer.serialize_struct("Event", len)?;
+        let mut state = serializer.serialize_struct("TraceEvent", len)?;
         state.serialize_field("name", &self.name)?;
         state.serialize_field("cat", &self.cat)?;
         state.serialize_field("ph", &self.ph)?;
@@ -151,18 +158,18 @@ impl Serialize for Event {
     }
 }
 
-impl<'de> Deserialize<'de> for Event {
+impl<'de> Deserialize<'de> for TraceEvent {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         struct EventVisitor;
 
         impl<'de> Visitor<'de> for EventVisitor {
-            type Value = Event;
+            type Value = TraceEvent;
 
             fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
                 f.write_str("a Chrome Trace event object")
             }
 
-            fn visit_map<M: MapAccess<'de>>(self, mut map: M) -> Result<Event, M::Error> {
+            fn visit_map<M: MapAccess<'de>>(self, mut map: M) -> Result<TraceEvent, M::Error> {
                 let mut name = None;
                 let mut cat = None;
                 let mut ph = None;
@@ -192,7 +199,7 @@ impl<'de> Deserialize<'de> for Event {
                     }
                 }
 
-                Ok(Event {
+                Ok(TraceEvent {
                     name: name.ok_or_else(|| de::Error::missing_field("name"))?,
                     cat: cat.unwrap_or_default(),
                     ph: ph.ok_or_else(|| de::Error::missing_field("ph"))?,

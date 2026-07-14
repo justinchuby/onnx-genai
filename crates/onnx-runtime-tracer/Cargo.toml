@@ -1,6 +1,6 @@
 [package]
 name = "onnx-runtime-tracer"
-description = "Unified, pure-Rust tracing for the ORT 2.0 runtime: collect timed spans and export them as Chrome Trace Event Format JSON for Perfetto / chrome://tracing"
+description = "Unified, pure-Rust tracing for the ORT 2.0 runtime: a TraceCollector fan-out architecture (Noop/Memory/File/Composite) exporting Chrome Trace JSON, JSONL, and Perfetto protobuf for Perfetto / chrome://tracing"
 version = "0.1.0-dev.0"
 edition.workspace = true
 license.workspace = true
@@ -8,6 +8,39 @@ repository.workspace = true
 keywords = ["onnx", "tracing", "profiling", "perfetto", "chrome-trace"]
 categories = ["development-tools::profiling", "science"]
 
+[features]
+# Perfetto protobuf export is on by default — Perfetto is the primary viewer
+# (§48.6/§48.7) and `prost` is a small, pure-Rust dependency.
+default = ["perfetto"]
+# Real optional dependency: Perfetto native protobuf serialization via `prost`
+# (§48.8.6). Implemented in `src/perfetto.rs`.
+perfetto = ["dep:prost"]
+# Chrome Trace JSON — always available with no extra dependency. The feature
+# exists so the backend can be named/selected uniformly (§48.8.4/§48.8.6); the
+# `chrome` module is compiled unconditionally.
+chrome = []
+# Intel ITT (VTune/Inspector) backend (§48.8.2). Declared as a capability flag
+# gating a documented stub module (`src/itt.rs`). The upstream `ittapi` crate is
+# intentionally NOT pulled yet: this build is offline and `ittapi` is not
+# vendored, and the real collector body (which needs live VTune) is a later
+# phase. When implemented this becomes `itt = ["dep:ittapi"]`.
+itt = []
+# OpenTelemetry export (stretch, §48.8.6). Declared as an empty capability flag
+# for the same offline/deferred reasons as `itt`; becomes
+# `otel = ["dep:opentelemetry"]` when implemented.
+otel = []
+# CUPTI GPU kernel tracing (§48.8.3/§49). CUPTI is dlopen'd at runtime, so there
+# is no link-time dependency; declared only, body deferred to a later phase.
+cupti = []
+
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
+# Perfetto protobuf serialization. Pure Rust, no `protoc` required — the trace
+# schema subset is hand-written with `#[derive(prost::Message)]`.
+prost = { version = "0.13", optional = true }
+
+[dev-dependencies]
+# Used only by the `perfetto` feature's export test to decode and validate the
+# emitted `Trace` protobuf. Not part of the library's dependency surface.
+prost = "0.13"
