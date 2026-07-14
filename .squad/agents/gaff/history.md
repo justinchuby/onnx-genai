@@ -30,3 +30,11 @@ Gaff's review is now in decisions: engine.rs is a ~3,300-line god module. Refact
 - **Task:** Review Batty's fused-op contrib domain change on `squad/ort2-fused-domain` (`1e894de`). Verify dispatch/registry soundness.
 - **Verdict:** 🟢 GREEN — dispatch set correct, normalization symmetric, no phantom kernel registration.
 - **Key checks:** Provider gate accept set == registered (op_type, domain) pairs exactly; default-domain == PHASE1_OPS 1:1; len invariant holds. ai.onnx→"" normalization symmetric in both `lookup` and `supports`. Contrib opset u64::MAX → resolves v1, no panic. Dual-domain LayerNorm: distinct OpKey entries, no cross-domain resolution. FusedMatMulBias/FusedGemm: supports()=false in both domains → rejected at placement. Debug+release all green; bert_toy PASS max_abs 1.192e-7; clippy clean.
+
+## 2026-07-14T11:40:00Z — Review: ORT2 fusion-executable FusedMatMulBias (gaff-8)
+
+- **Reviewed:** `squad/ort2-fusion-executable` @ `0f4811e` (author: Batty).
+- **Scope:** FusedMatMulBias kernel numerics, shape rule, registry/dispatch, MatMul+Add operand-order generality.
+- **Verdict:** 🟡 Approve with required follow-up.
+- **Key confirmed:** Kernel numerics correct ✅; `matmul_dense` extraction no regression ✅; shape rule consistent ✅; registry/dispatch consistent ✅; operand-order ROBUST (not baked to bert_toy) ✅.
+- **Gap (G1):** MatMul+Add fusion has no shape guard — silent-wrong when bias operand would expand matmul output. Owner: Roy/Deckard (Batty locked out).

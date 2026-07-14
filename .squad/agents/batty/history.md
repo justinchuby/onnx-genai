@@ -125,3 +125,12 @@ Prompt-lookup speculation and `MtpProposer` are accepted canonical runtime miles
 - **Work:** Added `CONTRIB_DOMAIN = "com.microsoft"` in optimizer/fusion.rs; `apply_fusion` sets domain. Added `OpRegistry::supports(op_type, domain)` + `norm_domain` (ai.onnx↔"") to ep-api/registry.rs (applied in both `lookup` and `supports`). Registered com.microsoft/LayerNorm in ep-cpu (additive; same LayerNormFactory); updated len invariant (PHASE1_OPS+2). Changed provider.rs `supports_op` gate to `registry.supports`. Added com.microsoft LayerNorm shape rule in shape-inference. Left FusedMatMulBias/FusedGemm kernel-less in both domains (none existed).
 - **Result:** debug+release green optimizer(27)/ep-cpu(102)/ep-api(17)/shape-inference(70)/session(19). bert_toy conformance PASS max_abs 1.192e-7. clippy clean.
 - **Review:** Gaff gaff-7 → 🟢 GREEN. Merged to main (`8cab9d2`).
+
+## 2026-07-14T11:40:00Z — ORT2 fusion-executable (batty-13)
+
+- **Task:** Make `optimization="all"` executable + parity-correct on `bert_toy`.
+- **Delivered:** `0f4811e` → merged as `e9bf155` (cherry-pick to main).
+- **Changes:** Schema-aware LayerNorm fusion (`fusion.rs`), `FusedMatMulBias` CPU kernel (new file), shared `matmul_dense` extraction, `FusedMatMulBias` shape rule, tripwire → real parity assertion.
+- **Parity:** `opt=all` vs opt-off = 0.0 (byte-identical); vs reference = 1.192e-7 (unchanged). Full suite green debug+release.
+- **Reviews:** Chew 🟡 (F1: opset-18 axis-as-input; F2: non-f32 epsilon — both decline-to-fuse gaps); Gaff 🟡 (G1: MatMul+Add shape guard for bias-expanding Add).
+- **Batty locked out** of follow-ups F1, F2, G1. Owners: Roy/Deckard/Leon.

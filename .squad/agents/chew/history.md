@@ -67,3 +67,11 @@ Reviewed Leon's K4 real KV byte materialization (commit `786e268`, read-only, Le
 ## 2026-07-14T11:00:00Z — ORT2 session optimize review (chew-19)
 
 - **chew-19:** Reviewed Roy's session `optimize` stage activation (`c92a2f2`, `git diff 6f2e518...c92a2f2`, +435/-12). Verified: (1) default-off byte-invariant — `optimize_graph()` provably no-op for `None`, no unconditional re-infer, conformance unchanged 1.192e-7; (2) `basic` genuinely inert (0.0 vs opt-off, 1.192e-7 vs reference, output shapes correct); (3) re-inference ordering sound (passes → opset → re-infer → from_parts); (4) `all`-path fails cleanly before numerics, tripwire non-tautological; (5) suite green debug+release, clippy clean, no new unsafe. Non-blocking note: tripwire `Err(other)` arm could be tightened. 🟢 **APPROVE** — no fix owner required.
+
+## 2026-07-14T11:40:00Z — Review: ORT2 fusion-executable LayerNorm (chew-20)
+
+- **Reviewed:** `squad/ort2-fusion-executable` @ `0f4811e` (author: Batty).
+- **Scope:** Schema-aware LayerNorm fusion correctness + model-agnosticism.
+- **Verdict:** 🟡 Approve with follow-ups.
+- **Key confirmed:** Operand disambiguation order-independent/model-agnostic ✅; epsilon extraction robust ✅; parity real (0.0 vs off, 1.192e-7 vs ref) ✅; unit test asserts values not arity ✅.
+- **Follow-ups raised:** F1 (opset-18 axis-as-input → decline), F2 (non-f32 epsilon → decline), F3 (hard-error vs decline-match), F4 (nit: assert byte-identity). Owner: Roy/Deckard/Leon.

@@ -1027,3 +1027,60 @@ load (+ loader shape inference)
 5. **Suite/clippy/unsafe** 🟢 — full ORT2 suite green debug+release (all crates). clippy clean. No new `unsafe`.
 
 **Non-blocking note:** `Err(other) => {}` arm in tripwire accepts any non-`UnsupportedOp` error without asserting fusion-relatedness. Does not mask silent wrong numerics (the `Ok` arm guards correctness). Suggest future tightening.
+
+---
+
+### 2026-07-14: `optimization="all"` fusion path made executable + parity-correct on bert_toy (batty-13)
+**By:** Batty — `squad/ort2-fusion-executable` (base main `5a2d527`); merged as `e9bf155`
+
+**What:** Turned the previously-deferred `"all"` optimization path from "not executable" into a byte-identical, parity-validated path on `bert_toy`. Three coordinated changes: schema-aware LayerNorm fusion, a `FusedMatMulBias` CPU kernel (+ shape rule), and flipping the tripwire test into a real parity assertion.
+
+**Schema-aware LayerNorm fusion** (`onnx-runtime-optimizer/src/fusion.rs`): Added `RewriteKind {Structural, LayerNorm}` and `FusionPattern::layernorm()`. Emits `com.microsoft::LayerNormalization` with inputs `[X, Scale, B]` and attributes `axis` (from first ReduceMean axes attr) + `epsilon` (read as f32 from inline initializer via `read_scalar_f32`; falls back to 1e-5 if unreadable). `X = Sub operand ≠ rm1 output`; `Scale = Mul operand ≠ Div output`; `B = final-Add operand ≠ Mul output`. Order-independent disambiguation.
+
+**`FusedMatMulBias` CPU kernel** (`ep-cpu/src/kernels/fused_matmul_bias.rs`): `MatMul(A,B) + bias` (broadcast add), reusing new shared `matmul::matmul_dense` + `add::broadcast_apply`. Registered `("FusedMatMulBias","com.microsoft",1)`.
+
+**Shape rule** (`shape-inference/src/handlers/linalg.rs`): `fused_matmul_bias` output = MatMul(A,B) shape; registered under `com.microsoft`.
+
+**Tripwire → real parity**: `full_optimization_fusion_path_is_not_yet_executable` → `full_optimization_fusion_path_matches_reference_and_default`; asserts `"all"` runs and matches opt-off and reference at existing tolerance (2e-3 atol/rtol — not loosened).
+
+**Parity:** `opt=all` vs opt-off **0.0 (byte-identical)**; vs reference **1.192e-7**. Full suite green debug+release (optimizer 26, ep-cpu 105, shape-inference 70, session 26). Clippy clean. No new unsafe.
+
+**Deferred:** `FusedGemm` (MatMul+Add+Relu) — no Relu-terminated fusion in bert_toy; remains graph-only with no kernel.
+
+---
+
+### 2026-07-14: Review — schema-aware LayerNorm fusion correctness (chew-20)
+**By:** Chew (ORT2 correctness) — reviewed `squad/ort2-fusion-executable` @ `0f4811e`
+**Verdict:** 🟡 approve with follow-ups (non-blocking)
+
+**Verified correct:**
+1. Operand disambiguation is order-independent/model-agnostic (X/Scale/B selected by excluding interior tensors, not by position). Not baked to bert_toy. ✅
+2. Epsilon extraction robust for realistic f32 cases (`ConstantFolding` materializes `Constant` nodes to initializers before `OpFusion`). ✅
+3. `opt=all` parity real: 1.192e-7 vs reference, 0.0 vs opt-off. Tripwire is a real assertion; no tolerance loosened. ✅
+4. `fuses_layernorm_chain` unit test asserts `[X,Scale,B]` inputs + `axis=-1` + `epsilon≈1e-12` (values, not arity). ✅
+
+**Follow-ups (non-blocking):**
+- **F1** — axis silently defaults to `-1` when `axes` attribute is absent (opset-18 uses `axes` as input, not attribute). Non-last-axis LayerNorm at opset-18 would be silently wrong. Fix: read `axes` input initializer for opset-18 and validate contiguous-to-end; otherwise decline to fuse.
+- **F2** — epsilon silently defaults to `1e-5` if eps operand is not a readable f32 constant (e.g. fp16/fp64 model). Fix: decline to fuse instead of guessing.
+- **F3** — no positive data-flow guard (op-type sequence match without verifying interior data-flow). Pre-existing. Also `layernorm_node` returning `Err` hard-errors the whole pass via `?` rather than declining that one match.
+- **F4** — nit: `vs_off` byte-identity is observed (0.0) but not asserted. Consider `assert_eq!(overall_vs_off, 0.0)`.
+
+**Ownership:** F1/F2 first. Batty locked out (author); Roy/Deckard/Leon eligible.
+
+---
+
+### 2026-07-14: Review — FusedMatMulBias kernel, shape rule, registry, operand-order (gaff-8)
+**By:** Gaff (ORT2 kernel/registry/dispatch) — reviewed `squad/ort2-fusion-executable` @ `0f4811e`
+**Verdict:** 🟡 approve with required follow-up (non-blocking for bert_toy)
+
+**Verified correct:**
+1. FusedMatMulBias kernel numerics: `matmul_dense(A,B)` then `broadcast_apply(bias)` — full numpy batched/broadcast semantics. ✅
+2. Standalone MatMul refactor (`matmul_dense` extraction) byte-for-byte identical to old body; no regression (0.0 vs opt-off). ✅
+3. Shape rule consistent: delegates to `matmul_shape`, registered `("com.microsoft","FusedMatMulBias",1)`. ✅
+4. Registry/dispatch correct: `OpKey::new("FusedMatMulBias","com.microsoft",1)` registered; `supports()` true; `FusedGemm` intentionally not registered. Domain/op/key consistent across fusion↔kernel↔shape rule. ✅
+5. MatMul+Add operand-order generality ROBUST: first-seen ordering over `[MatMul, Add]` chain always yields `[A, B, bias]` regardless of whether Add is `Add(mm,bias)` or `Add(bias,mm)`. Not baked to bert_toy. ✅
+
+**Gap (required follow-up):**
+- **G1** — MatMul+Add fusion has no shape guard. An `Add` whose non-matmul operand expands the matmul output shape (more leading dims) fuses to a silent-wrong result: shape rule returns the matmul shape; `broadcast_apply` silently truncates the leading axis. Not exercised by bert_toy (standard bias-add / same-shape cases). Fix: narrow/guard `MatMul+Add → FusedMatMulBias` to decline when the Add's non-matmul operand would expand the matmul output shape. Fix owner: **Roy** or **Deckard** (Batty locked out).
+
+**Suite:** ep-cpu 105, optimizer 26, shape-inference 70, session 26 + bert_toy conformance + opt-parity — 0 failed. Clippy clean. No new unsafe.
