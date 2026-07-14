@@ -8,6 +8,10 @@ repository.workspace = true
 keywords = ["onnx", "llm", "inference", "genai"]
 categories = ["science", "text-processing"]
 
+[features]
+default = []
+cuda = ["onnx-genai-ort/cuda"]
+
 [dependencies]
 onnx-genai-metadata = { workspace = true }
 onnx-genai-kv = { workspace = true }
