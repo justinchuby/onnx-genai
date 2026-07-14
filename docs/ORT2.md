@@ -1849,41 +1849,29 @@ pub struct PassContext {
     pub cost_model: Arc<CostModel>,
     pub ep_registry: Arc<EpRegistry>,
     pub target_devices: Vec<DeviceId>,
-    pub optimization_level: OptimizationLevel,
 }
 
-pub enum OptimizationLevel {
-    /// No optimization (for debugging).
-    None,
-    /// Basic: constant folding, dead code elimination.
-    Basic,
-    /// Standard: + fusion, layout propagation, placement.
-    Standard,
-    /// Aggressive: + CUDA graph capture, overlap scheduling, auto-tuning.
-    Aggressive,
-}
-
-pub fn default_passes(level: OptimizationLevel) -> Vec<Box<dyn OptimizationPass>> {
-    let mut passes: Vec<Box<dyn OptimizationPass>> = vec![];
-    if level >= OptimizationLevel::Basic {
-        passes.push(Box::new(ConstantFolding));
-        passes.push(Box::new(ShapeInference));
-        passes.push(Box::new(DeadNodeElimination));
-    }
-    if level >= OptimizationLevel::Standard {
-        passes.push(Box::new(OpFusion));
-        passes.push(Box::new(AttentionFusionPass));
-        passes.push(Box::new(LayoutPropagation));
-        passes.push(Box::new(PlacementOptimizer::new()));
-        passes.push(Box::new(TransferInsertion));
-        passes.push(Box::new(InPlaceDetection));
-        passes.push(Box::new(MemoryPlanning));
-    }
-    if level >= OptimizationLevel::Aggressive {
-        passes.push(Box::new(CudaGraphRegionDetection));
-        passes.push(Box::new(OverlapScheduling));
-    }
-    passes
+/// No optimization levels — we always run the full pass pipeline.
+pub fn default_passes() -> Vec<Box<dyn OptimizationPass>> {
+    vec![
+        // Graph normalization
+        Box::new(ConstantFolding),
+        Box::new(ShapeInference),
+        Box::new(DeadNodeElimination),
+        // Fusion
+        Box::new(OpFusion),
+        Box::new(AttentionFusionPass),
+        // Layout and placement
+        Box::new(LayoutPropagation),
+        Box::new(PlacementOptimizer::new()),
+        Box::new(TransferInsertion),
+        // Memory
+        Box::new(InPlaceDetection),
+        Box::new(MemoryPlanning),
+        // Performance
+        Box::new(CudaGraphRegionDetection),
+        Box::new(OverlapScheduling),
+    ]
 }
 ```
 
@@ -2021,10 +2009,8 @@ pub fn run_shape_inference(mut graph: Graph) -> Result<Graph> {
 pub struct SessionBuilder {
     model_path: Option<PathBuf>,
     model_bytes: Option<Vec<u8>>,
-    optimization_level: OptimizationLevel,
     eps: Vec<Box<dyn ExecutionProvider>>,
     intra_threads: Option<usize>,
-    inter_threads: Option<usize>,
     memory_limit: Option<usize>,
     enable_profiling: bool,
     enable_cuda_graph: bool,
@@ -2036,16 +2022,14 @@ impl SessionBuilder {
     pub fn new() -> Self;
     pub fn with_model_path(self, path: impl AsRef<Path>) -> Self;
     pub fn with_model_bytes(self, bytes: Vec<u8>) -> Self;
-    pub fn with_optimization_level(self, level: OptimizationLevel) -> Self;
     pub fn with_ep(self, ep: Box<dyn ExecutionProvider>) -> Self;
     pub fn with_intra_threads(self, n: usize) -> Self;
-    pub fn with_inter_threads(self, n: usize) -> Self;
     pub fn with_memory_limit(self, bytes: usize) -> Self;
     pub fn with_profiling(self, enable: bool) -> Self;
     pub fn with_cuda_graph(self, enable: bool) -> Self;
     pub fn with_warmup(self, shapes: Vec<WarmupShape>) -> Self;
 
-    /// Build the session: load model → optimize → compile → allocate → warmup.
+    /// Build: load model → optimize (always full pipeline) → compile → allocate → warmup.
     pub fn build(self) -> Result<InferenceSession>;
 }
 ```
@@ -2453,15 +2437,24 @@ pub fn conformance_test(model_path: &Path, inputs: &[Tensor], tolerance: f64) ->
 
 ---
 
-## 28. Open Questions
+## 28. Resolved Decisions
 
-1. **Training support** — Do we ever need backward graph / gradient? Probably not for v1.
-2. **JIT compilation** — Cranelift/LLVM for custom fused kernels? Or leave to EPs?
-3. **Model format** — Own optimized format for faster loading? Or always from ONNX?
-4. **Minimum opset** — Opset 17+ (modern LLMs) vs opset 7+ (full ORT compat)?
-5. **Custom ops** — Support via same C ABI bridge (ORT Extensions)?
-6. **Tensor parallelism** — Built into runtime or left to GenAI layer?
-7. **Disaggregated prefill/decode** — Runtime-level support or application-level?
+| Decision | Resolution | Rationale |
+|----------|-----------|----------|
+| Training support | **No** | Out of scope. Inference-only runtime. |
+| Graph optimization levels | **No** | Always optimize. Single default pass pipeline. No user-facing knob. |
+| Parallel execution (inter-op) | **No** | ORT proved it doesn't help in practice; adds complexity for no gain. |
+| Shape inference | **Port from Python** | Justin has a working Python impl; port to Rust when ready. |
+| ONNX external data | **Yes, required** | All large models use it. Mandatory from Phase 1. |
+| Custom Ops | **Yes, via C ABI** | Support ORT Extensions registration mechanism through the same C ABI bridge. |
+
+## 29. Open Questions
+
+1. **JIT compilation** — Cranelift/LLVM for custom fused kernels? Or leave to EPs?
+2. **Model format** — Own optimized format for faster loading? Or always from ONNX?
+3. **Minimum opset** — Opset 17+ (modern LLMs) vs opset 7+ (full ORT compat)?
+4. **Tensor parallelism** — Built into runtime or left to GenAI layer?
+5. **Disaggregated prefill/decode** — Runtime-level support or application-level?
 
 ---
 
