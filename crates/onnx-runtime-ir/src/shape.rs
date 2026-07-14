@@ -47,9 +47,16 @@ impl From<SymbolId> for Dim {
 
 /// A tensor shape: an ordered list of [`Dim`]s.
 ///
-/// A rank-0 (scalar) shape is the empty vector. An unknown rank is represented
-/// separately by the absence of shape information at the type level; within the
-/// IR a `Shape` always has a known rank.
+/// A rank-0 (scalar) shape is the empty vector. The IR `Shape` therefore always
+/// denotes a *known* rank; it does not carry a distinct "unknown rank"
+/// inhabitant (ONNX `tensor_type.shape` entirely absent). The loader maps an
+/// absent `TensorShapeProto` to an empty `Shape`, so unknown-rank values are
+/// currently indistinguishable from rank-0 scalars — an accepted limitation for
+/// the dense fp / quantized models the runtime targets, where value types carry
+/// shapes. Distinguishing the two would require making `Value::shape` optional
+/// across the frozen IR contract and is deliberately out of scope here. Known,
+/// per-axis unknown *dimensions* (of a known rank) are fully modeled via
+/// [`Dim::Symbolic`].
 pub type Shape = Vec<Dim>;
 
 /// Convenience constructor for a fully-static shape.

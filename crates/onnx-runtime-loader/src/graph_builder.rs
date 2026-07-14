@@ -272,9 +272,10 @@ fn tensor_shape_to_shape(graph: &mut Graph, tsp: &TensorShapeProto) -> Shape {
         .collect()
 }
 
-/// Convert an `AttributeProto` to an IR `(name, Attribute)`. Returns `None` for
-/// attribute kinds the IR does not model (tensor/type-proto lists), which do
-/// not appear in the Phase-1 op set.
+/// Convert an `AttributeProto` to an IR `(name, Attribute)`. Returns `Ok(None)`
+/// for empty/absent attributes, and errors (rather than silently dropping) on
+/// tensor/sparse-tensor/type-proto **list** kinds the IR does not model, which
+/// do not appear in the Phase-1 op set.
 fn convert_attribute(
     graph: &mut Graph,
     ap: &AttributeProto,
@@ -347,8 +348,15 @@ fn convert_attribute(
                 return Ok(None);
             }
         }
-        // Tensor / sparse-tensor / type-proto lists: no IR variant.
-        _ => return Ok(None),
+        // Tensor / sparse-tensor / type-proto list attributes have no IR
+        // variant. Surface a clean error rather than silently dropping the
+        // attribute, which could otherwise mis-model an op (§19.1).
+        AT::Tensors | AT::SparseTensor | AT::SparseTensors | AT::TypeProtos => {
+            return Err(LoaderError::GraphBuild(format!(
+                "attribute {:?} has unmodeled type {:?}",
+                ap.name, ty
+            )));
+        }
     };
     Ok(Some((ap.name.clone(), attr)))
 }

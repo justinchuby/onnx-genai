@@ -279,6 +279,65 @@ fn reshape_uses_constant_shape_initializer() {
     );
 }
 
+// ── unknown / unmodeled protobuf enum handling ──────────────────────────────
+
+/// An initializer whose `data_type` is an unknown/unsupported ONNX integer
+/// must produce a clean `LoaderError`, never a panic or a silent Float32.
+#[test]
+fn unknown_initializer_dtype_is_load_error() {
+    // 14 = COMPLEX64 (unsupported); 99 = out-of-range/future value.
+    for bad in [14i32, 99] {
+        let mut init = f32_initializer("W", &[2, 2]);
+        init.data_type = bad;
+        let g = onnx::GraphProto {
+            input: vec![value_info("X", 1, &[Dimlike::Static(2), Dimlike::Static(2)])],
+            output: vec![value_info("Y", 1, &[Dimlike::Static(2), Dimlike::Static(2)])],
+            initializer: vec![init],
+            node: vec![node("Add", &["X", "W"], &["Y"])],
+            ..Default::default()
+        };
+        let bytes = model(g, 17);
+        let err = onnx_runtime_loader::load_model_bytes(&bytes)
+            .expect_err("unknown initializer data_type must be a load error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("data_type") || msg.contains(&bad.to_string()),
+            "error should mention the bad data_type, got: {msg}"
+        );
+    }
+}
+
+/// A node attribute whose type is a tensor/type-proto list (which the IR does
+/// not model) must error rather than be silently dropped.
+#[test]
+fn unmodeled_list_attribute_is_load_error() {
+    // AttributeType::TENSORS = 9.
+    let attr = onnx::AttributeProto {
+        name: "vals".to_string(),
+        r#type: onnx::attribute_proto::AttributeType::Tensors as i32,
+        tensors: vec![onnx::TensorProto {
+            data_type: 1,
+            dims: vec![1],
+            raw_data: vec![0u8; 4],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let g = onnx::GraphProto {
+        input: vec![value_info("X", 1, &[Dimlike::Static(2)])],
+        output: vec![value_info("Y", 1, &[Dimlike::Static(2)])],
+        node: vec![node_attrs("Identity", &["X"], &["Y"], vec![attr])],
+        ..Default::default()
+    };
+    let bytes = model(g, 17);
+    let err = onnx_runtime_loader::load_model_bytes(&bytes)
+        .expect_err("unmodeled list attribute must be a load error");
+    assert!(
+        err.to_string().contains("unmodeled"),
+        "error should flag the unmodeled attribute, got: {err}"
+    );
+}
+
 #[test]
 fn smoke_load_real_fixture_if_present() {
     // Repo fixtures live at <workspace>/tests/fixtures/*/model.onnx. They are

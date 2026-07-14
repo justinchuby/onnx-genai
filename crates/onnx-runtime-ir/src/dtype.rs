@@ -22,9 +22,12 @@ pub enum DataType {
     Uint64 = 13,
     BFloat16 = 16,
     Float8E4M3FN = 17,
-    Float8E5M2 = 18,
+    Float8E4M3FNUZ = 18,
+    Float8E5M2 = 19,
+    Float8E5M2FNUZ = 20,
+    Uint4 = 21,
     Int4 = 22,
-    Uint4 = 23,
+    Float4E2M1 = 23,
 }
 
 impl DataType {
@@ -39,8 +42,10 @@ impl DataType {
             | Self::Uint8
             | Self::Bool
             | Self::Float8E4M3FN
-            | Self::Float8E5M2 => 1,
-            Self::Int4 | Self::Uint4 => 0, // packed: 2 elements per byte
+            | Self::Float8E4M3FNUZ
+            | Self::Float8E5M2
+            | Self::Float8E5M2FNUZ => 1,
+            Self::Int4 | Self::Uint4 | Self::Float4E2M1 => 0, // packed: 2 elements per byte
             Self::String => 0,             // variable width
         }
     }
@@ -48,7 +53,7 @@ impl DataType {
     /// Bit size per element. Sub-byte types return their true width (e.g. 4).
     pub fn bit_size(self) -> usize {
         match self {
-            Self::Int4 | Self::Uint4 => 4,
+            Self::Int4 | Self::Uint4 | Self::Float4E2M1 => 4,
             other => other.byte_size() * 8,
         }
     }
@@ -62,7 +67,10 @@ impl DataType {
                 | Self::Float16
                 | Self::BFloat16
                 | Self::Float8E4M3FN
+                | Self::Float8E4M3FNUZ
                 | Self::Float8E5M2
+                | Self::Float8E5M2FNUZ
+                | Self::Float4E2M1
         )
     }
 
@@ -85,7 +93,7 @@ impl DataType {
 
     /// Whether elements are packed multiple-per-byte (4-bit types).
     pub fn is_sub_byte(self) -> bool {
-        matches!(self, Self::Int4 | Self::Uint4)
+        matches!(self, Self::Int4 | Self::Uint4 | Self::Float4E2M1)
     }
 
     /// Number of bytes needed to store `count` elements, accounting for
@@ -119,8 +127,10 @@ impl DataType {
 
     /// Convert from the raw ONNX `TensorProto.DataType` integer.
     ///
-    /// Returns `None` for `UNDEFINED` (0), complex types, and any value the
-    /// runtime does not model.
+    /// Returns `None` for `UNDEFINED` (0), the complex types `COMPLEX64` (14)
+    /// and `COMPLEX128` (15), and any out-of-range or future value the runtime
+    /// does not model. The discriminants below mirror the vendored
+    /// `onnx.proto3` `TensorProto.DataType` enum verbatim.
     pub fn from_onnx(raw: i32) -> Option<Self> {
         Some(match raw {
             1 => Self::Float32,
@@ -138,9 +148,12 @@ impl DataType {
             13 => Self::Uint64,
             16 => Self::BFloat16,
             17 => Self::Float8E4M3FN,
-            18 => Self::Float8E5M2,
+            18 => Self::Float8E4M3FNUZ,
+            19 => Self::Float8E5M2,
+            20 => Self::Float8E5M2FNUZ,
+            21 => Self::Uint4,
             22 => Self::Int4,
-            23 => Self::Uint4,
+            23 => Self::Float4E2M1,
             _ => return None,
         })
     }
@@ -202,6 +215,79 @@ mod tests {
         assert!(DataType::Int32.is_int());
         assert!(!DataType::Bool.is_int());
         assert!(DataType::Uint4.is_sub_byte());
+        // float8 / float4 variants are floats but not ints.
+        for dt in [
+            DataType::Float8E4M3FN,
+            DataType::Float8E4M3FNUZ,
+            DataType::Float8E5M2,
+            DataType::Float8E5M2FNUZ,
+            DataType::Float4E2M1,
+        ] {
+            assert!(dt.is_float(), "{dt:?} should be float");
+            assert!(!dt.is_int(), "{dt:?} should not be int");
+        }
+        // 4-bit types (incl. Float4E2M1) are sub-byte; float8s are full bytes.
+        assert!(DataType::Int4.is_sub_byte());
+        assert!(DataType::Float4E2M1.is_sub_byte());
+        assert!(!DataType::Float8E5M2.is_sub_byte());
+        assert!(!DataType::Float8E4M3FNUZ.is_sub_byte());
+    }
+
+    #[test]
+    fn float4_sub_byte_storage_rounds_up() {
+        assert_eq!(DataType::Float4E2M1.byte_size(), 0);
+        assert_eq!(DataType::Float4E2M1.bit_size(), 4);
+        assert_eq!(DataType::Float4E2M1.storage_bytes(4), 2);
+        assert_eq!(DataType::Float4E2M1.storage_bytes(5), 3);
+        assert_eq!(DataType::Float4E2M1.checked_storage_bytes(usize::MAX), Some(usize::MAX / 2 + 1));
+    }
+
+    #[test]
+    fn float8_variants_are_one_byte() {
+        for dt in [
+            DataType::Float8E4M3FN,
+            DataType::Float8E4M3FNUZ,
+            DataType::Float8E5M2,
+            DataType::Float8E5M2FNUZ,
+        ] {
+            assert_eq!(dt.byte_size(), 1, "{dt:?} should be 1 byte");
+            assert_eq!(dt.bit_size(), 8, "{dt:?} should be 8 bits");
+            assert!(!dt.is_sub_byte(), "{dt:?} is not packed");
+        }
+    }
+
+    /// Pins every `DataType` variant to its authoritative ONNX
+    /// `TensorProto.DataType` integer (vendored `onnx.proto3`). A regression
+    /// here silently corrupts weights, so the table is exhaustive.
+    #[test]
+    fn onnx_discriminants_match_spec() {
+        let table: &[(DataType, i32)] = &[
+            (DataType::Float32, 1),
+            (DataType::Uint8, 2),
+            (DataType::Int8, 3),
+            (DataType::Uint16, 4),
+            (DataType::Int16, 5),
+            (DataType::Int32, 6),
+            (DataType::Int64, 7),
+            (DataType::String, 8),
+            (DataType::Bool, 9),
+            (DataType::Float16, 10),
+            (DataType::Float64, 11),
+            (DataType::Uint32, 12),
+            (DataType::Uint64, 13),
+            (DataType::BFloat16, 16),
+            (DataType::Float8E4M3FN, 17),
+            (DataType::Float8E4M3FNUZ, 18),
+            (DataType::Float8E5M2, 19),
+            (DataType::Float8E5M2FNUZ, 20),
+            (DataType::Uint4, 21),
+            (DataType::Int4, 22),
+            (DataType::Float4E2M1, 23),
+        ];
+        for &(dt, raw) in table {
+            assert_eq!(dt.to_onnx(), raw, "{dt:?} to_onnx mismatch");
+            assert_eq!(DataType::from_onnx(raw), Some(dt), "from_onnx({raw}) mismatch");
+        }
     }
 
     #[test]
@@ -211,10 +297,20 @@ mod tests {
             DataType::Int64,
             DataType::BFloat16,
             DataType::Uint4,
+            DataType::Float4E2M1,
+            DataType::Float8E5M2FNUZ,
         ] {
             assert_eq!(DataType::from_onnx(dt.to_onnx()), Some(dt));
         }
-        assert_eq!(DataType::from_onnx(0), None);
-        assert_eq!(DataType::from_onnx(9999), None);
+    }
+
+    /// Unsupported / unknown raw values must return `None` (clean error path),
+    /// never a wrong variant or a panic.
+    #[test]
+    fn unknown_raw_values_return_none() {
+        // UNDEFINED, complex, and out-of-range/future values.
+        for raw in [0, 14, 15, 24, 100, 9999, -1, i32::MAX, i32::MIN] {
+            assert_eq!(DataType::from_onnx(raw), None, "raw {raw} should be None");
+        }
     }
 }
