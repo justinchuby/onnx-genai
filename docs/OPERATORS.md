@@ -268,9 +268,110 @@ macro_rules! register_kernels {
 ## 7. Tracing & Profiling (Everything is Traced)
 
 Every operation in the runtime emits structured traces via the `tracing` crate.
-Zero overhead when not collecting (compile-time feature gate `profiling`).
+**Always compiled in** (no feature gate). Tracing instrumentation is zero-cost when no
+subscriber is active — the `tracing` crate compiles spans to no-ops without a collector.
 
-**What's traced:**
+Users opt-in to **collecting** traces at runtime, not at compile time.
+
+### Profiling API (per-language idioms)
+
+**Rust (RAII guard):**
+```rust
+let session = InferenceSession::load("model.onnx")?;
+
+// Option 1: session-level toggle
+let session = InferenceSession::builder()
+    .model("model.onnx")
+    .profiling(true)  // enable collection
+    .build()?;
+let data = session.profiling_data();  // after runs
+session.export_profile("/tmp/trace.json")?;
+
+// Option 2: scoped profiling (like PyTorch)
+{
+    let _guard = ort2::profiler::record("/tmp/trace.json");
+    // everything in this scope is profiled
+    session.run(&inputs)?;
+    session.run(&inputs)?;
+}  // guard drops → flushes trace file
+
+// Option 3: global subscriber (for library integrators)
+ort2::profiler::install_global(ChromeTraceSubscriber::new("/tmp/trace.json"));
+```
+
+**Python (context manager, like `torch.profiler.profile`):**
+```python
+import ort2
+
+session = ort2.load("model.onnx")
+
+# Context manager — idiomatic Python
+with ort2.profiler.profile(output="/tmp/trace.json") as prof:
+    output = session.run(input_ids=data)
+    output = session.run(input_ids=data)
+# Exiting context → trace flushed to file
+
+# Access programmatically
+with ort2.profiler.profile() as prof:
+    session.run(input_ids=data)
+print(prof.summary())           # human-readable table
+prof.export_chrome_trace("trace.json")
+prof.export_perfetto("trace.perfetto")
+
+# Or decorate a function
+@ort2.profiler.trace
+def generate(session, prompt):
+    # ... all ops inside are traced
+    pass
+
+# Session-level (always-on for this session)
+session = ort2.load("model.onnx", profiling=True)
+session.run(input_ids=data)
+print(session.profiling_summary())
+```
+
+**C API (start/stop pattern):**
+```c
+// C: explicit start/stop (matches ORT's existing pattern)
+OrtStatus* status;
+status = OrtSessionStartProfiling(session, "/tmp/trace.json");
+// ... run inference ...
+status = OrtSessionStopProfiling(session);  // flushes
+
+// Or: get profile data as string
+char* profile_json = NULL;
+status = OrtSessionGetProfilingData(session, &profile_json);
+```
+
+**CLI:**
+```bash
+# Command-line profiling (wraps any model run)
+ort2 profile model.onnx --input data.npz --output trace.json --runs 10
+ort2 profile model.onnx --input data.npz --summary  # prints table to stdout
+```
+
+### What's Collected
+
+| Level | Spans | Default |
+|-------|-------|---------|
+| `ops` | Kernel executions only | ✅ (when profiling enabled) |
+| `detailed` | + memory alloc/free, buffer reuse, data transfers | opt-in |
+| `full` | + optimizer passes, placement decisions, CUDA launches | opt-in |
+
+```python
+# Control verbosity
+with ort2.profiler.profile(level="detailed") as prof:
+    session.run(input_ids=data)
+```
+
+### Output Formats
+
+| Format | Use case |
+|--------|----------|
+| Chrome Trace JSON | Open in chrome://tracing or Perfetto UI |
+| Perfetto protobuf | Native Perfetto (larger traces, streaming) |
+| Summary table | Quick terminal inspection |
+| Programmatic `Vec<TraceEvent>` | Custom analysis, cost model calibration |
 
 | Phase | Span/Event | Fields |
 |-------|-----------|--------|
