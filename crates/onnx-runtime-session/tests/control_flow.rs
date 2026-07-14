@@ -117,24 +117,30 @@ fn if_branch(bin_op: &str) -> Graph {
 
 #[test]
 fn if_executes_selected_branch_and_captures_outer_value() {
-    for (cond_val, expected) in [(true, [3.0f32, 4.0]), (false, [1.0f32, 2.0])] {
-        let mut g = new_parent();
-        let cond = input(&mut g, "cond", DataType::Bool, &[]);
-        let _x = input(&mut g, "X", DataType::Float32, &[2]);
-        let y = g.create_named_value("Y", DataType::Float32, static_shape([2]));
+    let mut g = new_parent();
+    let cond = input(&mut g, "cond", DataType::Bool, &[]);
+    let _x = input(&mut g, "X", DataType::Float32, &[2]);
+    let y = g.create_named_value("Y", DataType::Float32, static_shape([2]));
 
-        let node = control_flow_node(&mut g, "If", vec![Some(cond)], vec![y], &[]);
-        // then: X + 1, else: X - 1.
-        register(&mut g, node, "then_branch", if_branch("Add"));
-        register(&mut g, node, "else_branch", if_branch("Sub"));
-        g.add_output(y);
+    let node = control_flow_node(&mut g, "If", vec![Some(cond)], vec![y], &[]);
+    // then: X + 1, else: X - 1.
+    register(&mut g, node, "then_branch", if_branch("Add"));
+    register(&mut g, node, "else_branch", if_branch("Sub"));
+    g.add_output(y);
 
-        let mut session = InferenceSession::from_graph(g).expect("build session");
+    let mut session = InferenceSession::from_graph(g).expect("build session");
+    for (run, (cond_val, expected)) in [(true, [3.0f32, 4.0]), (false, [1.0f32, 2.0])]
+        .into_iter()
+        .enumerate()
+    {
         let cond_t = Tensor::from_raw(DataType::Bool, vec![], &[cond_val as u8]).unwrap();
         let x_t = Tensor::from_f32(&[2], &[2.0, 3.0]).unwrap();
         let outs = session.run(&[("cond", &cond_t), ("X", &x_t)]).expect("run");
         assert_eq!(outs.len(), 1);
         assert_eq!(outs[0].to_vec_f32(), expected.to_vec(), "cond={cond_val}");
+        let stats = session.control_flow_stats();
+        assert_eq!(stats.subgraph_builds, (run + 1) as u64);
+        assert_eq!(stats.subgraph_runs, (run + 1) as u64);
     }
 }
 
@@ -276,6 +282,8 @@ fn loop_many_iterations_accumulates_correctly() {
     let scan_vals = outs[1].to_vec_f32();
     assert_eq!(scan_vals.len(), n as usize);
     assert_eq!(scan_vals[n as usize - 1], 499_500.0);
+    assert_eq!(session.control_flow_stats().subgraph_builds, 1);
+    assert_eq!(session.control_flow_stats().subgraph_runs, n as u64);
 }
 
 // --- Scan -------------------------------------------------------------------
@@ -326,4 +334,6 @@ fn scan_forward_axis0_threads_state_and_stacks_outputs() {
     // Running sums: [1,2] -> [4,6] -> [9,12].
     assert_eq!(outs[0].to_vec_f32(), vec![9.0, 12.0]);
     assert_eq!(outs[1].to_vec_f32(), vec![1.0, 2.0, 4.0, 6.0, 9.0, 12.0]);
+    assert_eq!(session.control_flow_stats().subgraph_builds, 1);
+    assert_eq!(session.control_flow_stats().subgraph_runs, t as u64);
 }

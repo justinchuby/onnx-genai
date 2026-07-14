@@ -24,7 +24,7 @@ pub use epcontext::{
 };
 pub use onnx_runtime_loader::{EpContextDumpConfig, EpContextPartition, Model as EncoderModel};
 pub use error::SessionError;
-pub use executor::CacheStats;
+pub use executor::{CacheStats, ControlFlowStats};
 pub use tensor::Tensor;
 
 mod epcontext;
@@ -687,6 +687,12 @@ impl InferenceSession {
     /// Kernel-cache statistics (§11.1); useful to observe warmup/run reuse.
     pub fn cache_stats(&self) -> CacheStats {
         self.exec.cache_stats()
+    }
+
+    /// Control-flow subgraph build/run statistics. A Loop or Scan body with a
+    /// stable input-shape signature should build once and run many times.
+    pub fn control_flow_stats(&self) -> ControlFlowStats {
+        self.exec.control_flow_stats()
     }
 
     /// Pre-compile kernels for common shapes to avoid first-inference latency

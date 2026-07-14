@@ -198,6 +198,21 @@ impl Tensor {
         &host_bytes(self.buffer())[..n]
     }
 
+    /// Replace this tensor's logical bytes without reallocating its backing
+    /// buffer. Used by control-flow iteration inputs whose dtype/shape stay
+    /// constant while their values change.
+    pub(crate) fn overwrite_bytes(&mut self, bytes: &[u8]) -> Result<()> {
+        let expected = self.dtype.storage_bytes(self.numel());
+        if bytes.len() != expected {
+            return Err(SessionError::Internal(format!(
+                "Tensor::overwrite_bytes: got {} bytes for shape {:?} dtype {:?}, expected {expected}",
+                bytes.len(), self.shape, self.dtype
+            )));
+        }
+        let buffer = self.buffer.as_mut().expect("Tensor buffer taken only in Drop");
+        write_host(buffer, bytes)
+    }
+
     /// Copy out the elements as `f32`. Panics if the dtype is not `Float32`.
     pub fn to_vec_f32(&self) -> Vec<f32> {
         assert_eq!(self.dtype, DataType::Float32, "to_vec_f32 on non-f32 tensor");
