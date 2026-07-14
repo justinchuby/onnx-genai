@@ -229,6 +229,116 @@ fn substitute(shape: &Shape, bindings: &HashMap<SymbolId, usize>) -> Option<Vec<
         .collect()
 }
 
+/// Decode a host buffer's integer elements as `i64` for `dtype`, or `None` if
+/// the dtype is not an integer the shape math understands. Used to read the
+/// *values* of shape-defining inputs (e.g. `Slice` starts/ends) at run time.
+fn buffer_as_i64(buffer: &DeviceBuffer, dtype: DataType) -> Option<Vec<i64>> {
+    let bytes = crate::tensor::host_bytes(buffer);
+    match dtype {
+        DataType::Int64 => Some(
+            bytes
+                .chunks_exact(8)
+                .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
+                .collect(),
+        ),
+        DataType::Int32 => Some(
+            bytes
+                .chunks_exact(4)
+                .map(|c| i32::from_le_bytes(c.try_into().unwrap()) as i64)
+                .collect(),
+        ),
+        _ => None,
+    }
+}
+
+/// Compute the concrete output shapes of a *data-dependent* shape op from its
+/// already-resolved input shapes and the runtime *values* of its integer
+/// inputs. This is the executor's fallback for the rare value whose shape the
+/// loader's static (symbolic) inference could not pin down — e.g. a `Slice`
+/// whose `ends` is produced by a runtime `Shape → Min → Cast` chain, so its
+/// extent is only known once those upstream nodes have executed.
+///
+/// Model-agnostic: it dispatches on the op type alone. Returns `None` for ops
+/// this executor cannot resolve dynamically, which surfaces as
+/// [`SessionError::UnresolvedShape`] exactly as before.
+fn dynamic_output_shapes(
+    node: &Node,
+    input_shapes: &[Vec<usize>],
+    input_values: &[Option<Vec<i64>>],
+) -> Option<Vec<Vec<usize>>> {
+    match node.op_type.as_str() {
+        // Opset-10+ `Slice`: data, starts, ends, [axes], [steps] as inputs. The
+        // per-axis element count mirrors the `Slice` kernel's clamp semantics
+        // exactly (ONNX reference), so the buffer we size here matches what the
+        // kernel writes.
+        "Slice" => {
+            let data_shape = input_shapes.first()?;
+            let starts = input_values.get(1)?.as_ref()?;
+            let ends = input_values.get(2)?.as_ref()?;
+            let rank = data_shape.len();
+            let axes: Vec<i64> = match input_values.get(3).and_then(|v| v.as_ref()) {
+                Some(a) => a.clone(),
+                None => (0..starts.len() as i64).collect(),
+            };
+            let steps: Vec<i64> = match input_values.get(4).and_then(|v| v.as_ref()) {
+                Some(s) => s.clone(),
+                None => vec![1; starts.len()],
+            };
+            if starts.len() != ends.len()
+                || starts.len() != axes.len()
+                || starts.len() != steps.len()
+            {
+                return None;
+            }
+            let mut count: Vec<usize> = data_shape.clone();
+            for i in 0..starts.len() {
+                let raw_axis = axes[i];
+                let ax = if raw_axis < 0 {
+                    raw_axis + rank as i64
+                } else {
+                    raw_axis
+                };
+                if ax < 0 || ax as usize >= rank {
+                    return None;
+                }
+                let ax = ax as usize;
+                let d = data_shape[ax] as i64;
+                let s = steps[i];
+                if s == 0 {
+                    return None;
+                }
+                let mut b = starts[i];
+                let mut e = ends[i];
+                if b < 0 {
+                    b += d;
+                }
+                if e < 0 {
+                    e += d;
+                }
+                let (b, e) = if s < 0 {
+                    (b.clamp(0, d - 1), e.clamp(-1, d - 1))
+                } else {
+                    (b.clamp(0, d), e.clamp(0, d))
+                };
+                let c = if s > 0 {
+                    if e > b {
+                        ((e - b + s - 1) / s) as usize
+                    } else {
+                        0
+                    }
+                } else if b > e {
+                    ((b - e + (-s) - 1) / (-s)) as usize
+                } else {
+                    0
+                };
+                count[ax] = c;
+            }
+            Some(vec![count])
+        }
+        _ => None,
+    }
+}
+
 impl Executor {
     /// Compile a graph + weights into a runnable executor on the CPU EP.
     pub(crate) fn build(
@@ -386,9 +496,25 @@ impl Executor {
         Ok(resolved)
     }
 
+    /// Like [`Self::resolve_all`] but never errors: values whose shape stays
+    /// symbolic (a data-dependent extent the loader could not pin down) are
+    /// simply omitted, to be resolved just-in-time during execution once their
+    /// producing node's inputs are concrete.
+    fn resolve_soft(&self, bindings: &HashMap<SymbolId, usize>) -> HashMap<ValueId, Vec<usize>> {
+        let mut resolved = HashMap::with_capacity(self.value_shapes.len());
+        for (&vid, shape) in &self.value_shapes {
+            if let Some(dims) = substitute(shape, bindings) {
+                resolved.insert(vid, dims);
+            }
+        }
+        resolved
+    }
+
     /// Size (allocate or reuse) a backing buffer for every value from its
     /// resolved concrete shape. Initializers already hold their weights and are
-    /// left untouched.
+    /// left untouched. Values whose shape is not (yet) in `resolved` — the
+    /// data-dependent ones filled in during execution — are skipped here and
+    /// sized just-in-time in the run loop.
     fn size_buffers(&mut self, resolved: &HashMap<ValueId, Vec<usize>>) -> Result<()> {
         let vids: Vec<ValueId> = self.value_shapes.keys().copied().collect();
         for vid in vids {
@@ -396,7 +522,9 @@ impl Executor {
                 continue;
             }
             let dtype = self.value_dtypes[&vid];
-            let dims = resolved[&vid].clone();
+            let Some(dims) = resolved.get(&vid).cloned() else {
+                continue;
+            };
             self.ensure_buffer(vid, dtype, &dims)?;
         }
         Ok(())
@@ -540,8 +668,10 @@ impl Executor {
         }
 
         // Substitute the bindings into every value → concrete shapes, then size
-        // the run-scoped buffers from them (reused when unchanged).
-        let resolved = self.resolve_all(&bindings)?;
+        // the run-scoped buffers from them (reused when unchanged). Values with a
+        // data-dependent shape stay unresolved here and are filled in during the
+        // execution loop, once their producing node's inputs are concrete.
+        let mut resolved = self.resolve_soft(&bindings);
         self.size_buffers(&resolved)?;
 
         // --- Bind input bytes into their (now correctly sized) buffers ------
@@ -564,6 +694,57 @@ impl Executor {
 
         for np in &self.plan {
             let input_shapes = Self::node_input_shapes(np, &resolved);
+
+            // Data-dependent shapes: if any output's shape is still unresolved,
+            // compute it now from the concrete input shapes + the runtime values
+            // of this node's integer inputs (which upstream nodes have already
+            // produced), then size those buffers just-in-time.
+            if np.outputs.iter().any(|v| !resolved.contains_key(v)) {
+                let input_values: Vec<Option<Vec<i64>>> = np
+                    .inputs
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| {
+                        buffers
+                            .get(v)
+                            .and_then(|b| buffer_as_i64(b, np.input_dtypes[i]))
+                    })
+                    .collect();
+                let node = graph.node(np.node_id);
+                let out_shapes = dynamic_output_shapes(node, &input_shapes, &input_values)
+                    .ok_or_else(|| {
+                        let vid = np
+                            .outputs
+                            .iter()
+                            .find(|v| !resolved.contains_key(v))
+                            .copied()
+                            .unwrap_or(np.outputs[0]);
+                        let value = graph.value(vid);
+                        SessionError::UnresolvedShape {
+                            value: value
+                                .name
+                                .clone()
+                                .unwrap_or_else(|| format!("value#{}", vid.0)),
+                            op: node.op_type.clone(),
+                        }
+                    })?;
+                for (oi, &ovid) in np.outputs.iter().enumerate() {
+                    let dims = out_shapes[oi].clone();
+                    let need = np.output_dtypes[oi]
+                        .storage_bytes(dims.iter().product())
+                        .max(1);
+                    let fits = buffers.get(&ovid).map(|b| b.len() == need).unwrap_or(false);
+                    if !fits {
+                        if let Some(old) = buffers.remove(&ovid) {
+                            ep.deallocate(old)?;
+                        }
+                        let buf = ep.allocate(need, TensorLayout::contiguous().alignment)?;
+                        buffers.insert(ovid, buf);
+                    }
+                    resolved.insert(ovid, dims);
+                }
+            }
+
             let output_shapes = Self::node_output_shapes(np, &resolved);
 
             // Precompute contiguous strides for every input/output view; these

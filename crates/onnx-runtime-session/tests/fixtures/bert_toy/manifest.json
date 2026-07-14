@@ -1,0 +1,95 @@
+{
+  "model": "model.onnx",
+  "provider": "CPUExecutionProvider",
+  "onnxruntime_version": "1.27.0",
+  "batch": 1,
+  "seq": 8,
+  "inputs": [
+    {
+      "name": "input_ids",
+      "file": "input_ids.bin",
+      "dtype": "int64",
+      "shape": [
+        1,
+        8
+      ]
+    },
+    {
+      "name": "token_type_ids",
+      "file": "token_type_ids.bin",
+      "dtype": "int64",
+      "shape": [
+        1,
+        8
+      ]
+    },
+    {
+      "name": "input_mask",
+      "file": "input_mask.bin",
+      "dtype": "int64",
+      "shape": [
+        1,
+        8
+      ]
+    }
+  ],
+  "outputs": [
+    {
+      "name": "prediction_scores",
+      "file": "prediction_scores.bin",
+      "dtype": "float32",
+      "shape": [
+        1,
+        8,
+        99
+      ]
+    },
+    {
+      "name": "seq_relationship_score",
+      "file": "seq_relationship_score.bin",
+      "dtype": "float32",
+      "shape": [
+        1,
+        2
+      ]
+    }
+  ],
+  "input_values": {
+    "input_ids": [
+      [
+        7,
+        3,
+        19,
+        2,
+        25,
+        11,
+        0,
+        14
+      ]
+    ],
+    "token_type_ids": [
+      [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    ],
+    "input_mask": [
+      [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1
+      ]
+    ]
+  }
+}
