@@ -4,7 +4,7 @@ Tracks implementation status of `docs/DESIGN.md` (§1–§40). Updated as work l
 
 **Published:** `onnx-genai` v0.1.0 + 8 sub-crates on crates.io. CI (fmt/build/test/**blocking clippy**) + scheduled `cargo-audit`. Coverage ~77% line.
 
-_Last updated: 2026-07-13_
+_Last updated: 2026-07-14_
 
 ## Status by design section
 
@@ -23,7 +23,7 @@ _Last updated: 2026-07-13_
 | 24 | Sampling policy | ✅ Done | full sampler suite; **real RNG fixed 2026-07-12** |
 | 25 | Extensibility | ✅ Done | DecodeBackend/SpeculativeProposer/Sampler traits |
 | 26 | Multi-agent serving | ✅ Done | batched continuous serving (~6× throughput) |
-| 27 | Multi-token speculative | ✅ Done | draft + prompt-lookup + MTP + EAGLE-3 + **Gemma4 assistant (shared-KV proposer)** |
+| 27 | Multi-token speculative | ✅ Done | draft + prompt-lookup + MTP + EAGLE-3 + **Gemma4 assistant (shared-KV proposer)** — validated **token-identical on real Gemma4 E2B weights on CUDA/H200** (Milestone B, `10f82b3`); speculative speedup optimization (acceptance) is an open perf follow-up |
 | 28 | vLLM speculator compat | ✅ Done | config auto-discovery + EAGLE-3 proposer |
 | 29 | Language diffusion | ❌ Missing | large |
 | 31 | Observability | 🟡 Partial | `/metrics` + `/v1/status` + trace ids + `/v1/debug/*` ✅; Perfetto/OTLP export (feature-gated stub) = #13 |
@@ -61,6 +61,8 @@ _Follow-ups:_ SWA hardening nits (Chew): first-activation `debug_assert`, rewind
 > **UPDATE 2026-07-13 (session 2, active):** Now being pushed forward per user ("don't be daunted — change whatever's needed, including the mobius PR"). Focus first on **Gemma4 speculative decoding**, which maps onto our existing MTP/EAGLE-3 proposer infra (§27/§28 ✅) rather than greenfield. Mobius already has `src/mobius/models/gemma4_assistant.py`. Two scoping agents mapping the exact runtime-proposer contract + mobius emitter gap; implementation to follow in BOTH repos (runtime + mobius `--runtime onnx-genai` emitter, PR #398).
 
 > **LANDED 2026-07-13:** Gemma4 assistant speculative decoding is a **new shared-KV proposer type** (NOT MTP/EAGLE-3): the 4-layer assistant shares slices of the target's paged KV (`shared_kv.{sliding,full}_attention.*`), has its own internal lm_head (`logits`), and threads `projected_state` (`inputs_embeds = concat(prev,cur)` of backbone-hidden vectors). Runtime slice landed (metadata `ProposalType::Gemma4Assistant` + parser, `Gemma4AssistantDecodeSession` in ort, `Gemma4AssistantProposer` + KV-slice sharing in engine, metadata-driven activation, non-runner decode path). Synthetic `onnx_ir` fixture proves speculative output is **token-identical to plain greedy** (`tests/gemma4_assistant_full.rs`). Mobius exporter landed on branch `onnxruntime/mobius:feat/gemma4-assistant-onnx-genai` (off PR #398): emits the `speculative:` block + copies tokenizer. **Remaining for real E2B/12B run:** export gated Google weights on a high-mem CUDA host + accuracy/speedup validation; refine multi-layer shared-KV binding (runtime currently binds one representative target layer per group).
+
+> **REAL E2B RUN LANDED 2026-07-14 (Milestones A + B):** Real **Gemma4 E2B** exported via Mobius as a **single-model merged package** (target `input_ids→logits + projected_state f32[.,.,1536] + present.{0..14}`, plus `assistant/model.onnx`; Mobius `8c77d78`) and run end-to-end on **H200 via CUDA EP** (`ONNX_GENAI_EP=cuda`, verified 34 GB VRAM / no CPU fallback). Required heterogeneous **per-layer head_dim** KV cache (E2B sliding hd256 / full hd512 at layers [4,9,14]) — landed as `LayerTensorConfig` in kv + engine (commit `9db1a3c`, W2 Batty + W3 Leon, Chew 🟡). **Milestone A:** target-only greedy coherent (`"The capital of France is" → "Paris."`), ~166 tok/s (`abd0b7a` + `scripts/run_target_greedy_cuda.sh`). **Milestone B:** shared-KV **speculative decode token-for-token identical to greedy** on the real weights (commit `10f82b3`: SWA models take paged windowed path even with share-buffer dtype; dtype-agnostic proposer f16↔f32; `tests/milestone_b_real.rs` env-gated). Correctness ✅. **Open perf follow-up:** speculative is currently **0.53× (slower)** — acceptance ~25% with `multi_token_accepts=0`; the drafter never gets 2+ ahead. Diagnosed to the `projected_state` hidden-space choice (backbone post-norm `last_hidden_state`); affects speed only, not correctness. Also open: BOS-adding tokenizer in the package (Gemma degenerates without a prepended `<bos>`); §38 connector payload path still uniform-geometry (dead code for E2B, thread per-layer before enabling a connector on a mixed model).
 
 Scoped the "export Gemma4 E2B/12B via Mobius and smoke-test through onnx-genai" ask. It is **blocked on major runtime + Mobius work**, not a metadata one-liner:
 
