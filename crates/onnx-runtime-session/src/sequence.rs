@@ -178,7 +178,7 @@ impl SequenceValue {
         tensor: Arc<SeqTensor>,
         position: Option<i64>,
     ) -> SeqResult<SequenceValue> {
-        if !self.is_empty() && tensor.dtype != self.elem_dtype {
+        if tensor.dtype != self.elem_dtype {
             return Err(SeqOpError::new(
                 "SequenceInsert",
                 format!(
@@ -210,10 +210,12 @@ impl SequenceValue {
                 i as usize
             }
         };
-        let elem_dtype = if len == 0 { tensor.dtype } else { self.elem_dtype };
         let mut items = self.items.clone(); // Arc clones only — no bytes copied.
         items.insert(idx, tensor);
-        Ok(SequenceValue { elem_dtype, items })
+        Ok(SequenceValue {
+            elem_dtype: self.elem_dtype,
+            items,
+        })
     }
 
     /// `SequenceErase`: a **new** sequence with the element at `position`
@@ -459,6 +461,17 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.op, "SequenceInsert");
         assert!(err.reason.contains("does not match"));
+    }
+
+    #[test]
+    fn empty_sequence_insert_dtype_mismatch_is_actionable() {
+        let s = SequenceValue::empty(DataType::Float32);
+        let err = s
+            .insert(elem(DataType::Int64, &[1], &[0; 8]), None)
+            .unwrap_err();
+        assert_eq!(err.op, "SequenceInsert");
+        assert!(err.reason.contains("does not match"));
+        assert!(err.reason.contains("To fix"));
     }
 
     #[test]

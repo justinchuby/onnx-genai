@@ -1590,7 +1590,7 @@ impl Executor {
             Some(svid) => {
                 let sshape = resolved.get(&svid).cloned().unwrap_or_default();
                 let svals = self.read_i64_vec(svid, &sshape, op)?;
-                let is_scalar = sshape.iter().product::<usize>() <= 1 && sshape.len() <= 1;
+                let is_scalar = sshape.is_empty();
                 if is_scalar {
                     let chunk = *svals.first().ok_or_else(|| SessionError::SequenceOp {
                         op: op.to_string(),

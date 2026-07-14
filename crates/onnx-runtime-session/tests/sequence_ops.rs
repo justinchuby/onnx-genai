@@ -252,6 +252,80 @@ fn split_explicit_sizes() {
     assert_eq!(out[0].to_vec_f32(), vec![1., 2., 4., 5.]);
 }
 
+/// A rank-1 split tensor with one element is a sizes vector, not a scalar
+/// chunk-size input, and therefore must cover the whole split axis.
+#[test]
+fn split_one_element_1d_sizes_must_sum_to_axis() {
+    let mut g = Graph::new();
+    let data = f32_init(&mut g, "data", &[4], &[1., 2., 3., 4.]);
+    let split = i64_init(&mut g, "split", &[1], &[2]);
+    let seq = op(
+        &mut g,
+        "SplitToSequence",
+        &[data, split],
+        DataType::Float32,
+        &[],
+        &[],
+    );
+    let len = op(&mut g, "SequenceLength", &[seq], DataType::Int64, &[], &[]);
+    g.add_output(len);
+
+    let mut s = InferenceSession::from_graph(g).expect("build");
+    let err = s.run(&[]).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("sum to 2 but axis 0 has extent 4"), "msg: {msg}");
+    assert!(msg.contains("To fix"), "msg: {msg}");
+}
+
+/// A one-element rank-1 split vector is valid when its size is the full axis.
+#[test]
+fn split_one_element_1d_sizes_produces_one_chunk() {
+    let mut g = Graph::new();
+    let data = f32_init(&mut g, "data", &[1], &[42.]);
+    let split = i64_init(&mut g, "split", &[1], &[1]);
+    let seq = op(&mut g, "SplitToSequence", &[data, split], DataType::Float32, &[], &[]);
+    let idx = i64_init(&mut g, "idx", &[], &[0]);
+    let at = op(&mut g, "SequenceAt", &[seq, idx], DataType::Float32, &[1], &[]);
+    g.add_output(at);
+
+    let mut s = InferenceSession::from_graph(g).expect("build");
+    let out = s.run(&[]).expect("run");
+    assert_eq!(out[0].shape, vec![1]);
+    assert_eq!(out[0].to_vec_f32(), vec![42.]);
+}
+
+/// A rank-0 split tensor is the scalar chunk size, producing even chunks.
+#[test]
+fn split_scalar_chunk_size_produces_even_chunks() {
+    let mut g = Graph::new();
+    let data = f32_init(&mut g, "data", &[4], &[1., 2., 3., 4.]);
+    let split = i64_init(&mut g, "split", &[], &[2]);
+    let seq = op(&mut g, "SplitToSequence", &[data, split], DataType::Float32, &[], &[]);
+    let len = op(&mut g, "SequenceLength", &[seq], DataType::Int64, &[], &[]);
+    g.add_output(len);
+
+    let mut s = InferenceSession::from_graph(g).expect("build");
+    let out = s.run(&[]).expect("run");
+    assert_eq!(out[0].to_vec_i64(), vec![2]);
+}
+
+/// Scalar chunk sizes retain an uneven final chunk when they do not divide axis.
+#[test]
+fn split_scalar_chunk_size_keeps_uneven_final_chunk() {
+    let mut g = Graph::new();
+    let data = f32_init(&mut g, "data", &[4], &[1., 2., 3., 4.]);
+    let split = i64_init(&mut g, "split", &[], &[3]);
+    let seq = op(&mut g, "SplitToSequence", &[data, split], DataType::Float32, &[], &[]);
+    let idx = i64_init(&mut g, "idx", &[], &[1]);
+    let at = op(&mut g, "SequenceAt", &[seq, idx], DataType::Float32, &[1], &[]);
+    g.add_output(at);
+
+    let mut s = InferenceSession::from_graph(g).expect("build");
+    let out = s.run(&[]).expect("run");
+    assert_eq!(out[0].shape, vec![1]);
+    assert_eq!(out[0].to_vec_f32(), vec![4.]);
+}
+
 /// ConcatFromSequence with new_axis=1 stacks elements along a fresh axis.
 #[test]
 fn concat_new_axis_stacks() {
@@ -294,6 +368,30 @@ fn empty_then_insert() {
     let mut s = InferenceSession::from_graph(g).expect("build");
     let out = s.run(&[]).expect("run");
     assert_eq!(out[0].to_vec_f32(), vec![42.]);
+}
+
+/// SequenceEmpty's declared dtype must be preserved even before its first insert.
+#[test]
+fn empty_insert_mismatched_dtype_errors_actionably() {
+    let mut g = Graph::new();
+    let t = f32_init(&mut g, "t", &[1], &[42.]);
+    let seq = op(
+        &mut g,
+        "SequenceEmpty",
+        &[],
+        DataType::Int64,
+        &[],
+        &[("dtype", Attribute::Int(7))], // 7 == int64
+    );
+    let seq2 = op(&mut g, "SequenceInsert", &[seq, t], DataType::Int64, &[], &[]);
+    let len = op(&mut g, "SequenceLength", &[seq2], DataType::Int64, &[], &[]);
+    g.add_output(len);
+
+    let mut s = InferenceSession::from_graph(g).expect("build");
+    let err = s.run(&[]).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("does not match"), "msg: {msg}");
+    assert!(msg.contains("To fix"), "msg: {msg}");
 }
 
 /// Out-of-bounds SequenceAt is an actionable error (states valid range).
