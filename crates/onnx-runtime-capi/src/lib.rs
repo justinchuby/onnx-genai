@@ -130,7 +130,11 @@ fn map_session_error(err: &SessionError) -> OrtErrorCode {
         E::NoModelSource => OrtErrorCode::NoModel,
         E::UnsupportedOp { .. } => OrtErrorCode::NotImplemented,
         E::Ep(_) => OrtErrorCode::EpFail,
-        E::Ir(_) | E::Graph(_) | E::Optimize(_) | E::ShapeInfer(_) => OrtErrorCode::InvalidGraph,
+        E::DanglingEpContext { .. }
+        | E::Ir(_)
+        | E::Graph(_)
+        | E::Optimize(_)
+        | E::ShapeInfer(_) => OrtErrorCode::InvalidGraph,
         E::Load(load) => map_loader_error(load),
         E::NotInitialized
         | E::Internal(_)
@@ -707,8 +711,16 @@ mod tests {
     }
 
     #[test]
-    fn session_error_mapping_covers_shape_and_symbol_variants() {
+    fn session_error_mapping_covers_structural_and_shape_variants() {
         use onnx_runtime_session::SessionError as E;
+
+        assert_eq!(
+            map_session_error(&E::DanglingEpContext {
+                source_key: Some("QNN".into()),
+                partition_name: Some("encoder".into()),
+            }),
+            OrtErrorCode::InvalidGraph
+        );
 
         // Input-validation failures surface as INVALID_ARGUMENT, consistent
         // with the existing dtype/shape/rank mismatch mappings.
