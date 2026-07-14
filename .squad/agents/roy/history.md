@@ -32,3 +32,7 @@ Roy's workspace review is now in decisions: crate split is sound, but engine.rs 
 - Affinity weight fix (commit 54e5363): `Weighted` policy corrected from binary gate to continuous scoring bonus per §34.5. Formula: `kv_usage × kv_weight + normalized_queue × queue_weight − bonus`, where `bonus = affinity_weight` if affinity node and below overload threshold.
 - R3 hardening (commit a36cbbd, post Deckard 🟡 review): (1) concurrent poller via `join_all`; (2) miss-on-unknown-id; (3) 16 MiB response cap on session affinity capture; (4) rebalance overload guard (`least_loaded_node_below_threshold`). 73 tests total.
 
+
+## 2026-07-14T02:37:00Z — ORT2 Phase 1 foundation merged
+- **Commit:** 203161c — 6 crates scaffolded, `onnx-runtime-ir` with 34 passing tests
+- IR gaps flagged by Deckard (Track A): `DataType::from_onnx` fp8/int4 numbering vs ONNX spec, no `DataType::Undefined`, no unknown-rank `Shape` sentinel. Roy to address before quantized-model work.

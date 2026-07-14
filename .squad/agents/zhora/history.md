@@ -74,3 +74,9 @@ Next: §34 router epic (R1/R2/R3) has kicked off.
 - Blocked on `KvTensorRef` needing a real device-tensor handle (currently size-only placeholder).
 - The prefix-dependent-hash invariant is now in place. K4 implementor can trust `KvCacheKey` equality as proof of identical prefix.
 
+
+## 2026-07-14T02:37:00Z — Perfetto trace export #13 merged
+- **Commit:** 8d1bf3d — Reviewed 🟢 Deckard
+- `GET /v1/debug/trace/perfetto` → Chrome Trace Event Format document, gated same as sibling debug routes.
+- No data leak (`&'static str` stage names only), honest empty case, OTLP deferred.
+- Metrics ENDPOINTS extended to 14 entries.

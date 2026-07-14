@@ -77,3 +77,8 @@ Verdict: 🟢 **SHIP**.
 - **Prefix-dependent hash invariant now established** (Zhora, ac12480): `KvCacheKey` equality ⟹ identical prefix through that chunk. Safe to trust for copy-on-hit.
 - Lock discipline invariant: std guard in `ConnectorBridge` (if any) must NEVER be held across `.await`.
 
+
+## 2026-07-14T02:37:00Z — ort2-loader + loader-weights + Perfetto review
+- **ort2-loader (7e0e367):** ONNX→IR pipeline with protox, graph_builder, mmap weights, shape_inference. 15 tests. Reviewed 🟡 Gaff.
+- **loader-weights (dd5297d):** `load_model_with_weights` → `Arc<WeightStore>`, norm_axis off-by-one fix. 18 tests. Reviewed 🟡 Gaff.
+- **Perfetto #13 review (8d1bf3d):** 🟢 SHIP — all 6 security/correctness criteria pass (gate parity, no data leak via `&'static str`, refactor safe, honest empty, OTLP deferred, model-agnostic).

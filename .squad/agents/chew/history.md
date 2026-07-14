@@ -44,3 +44,7 @@ Reviewed Leon's K4 real KV byte materialization (commit `786e268`, read-only, Le
 - Verdict: 🟢 SHIP
 - Confirmed: fp16↔f32 lossless in required directions, SWA decode-path change bounded to SWA models only, updated lib test correct, widen/narrow are true inverses for past KV, `milestone_b_real.rs` CI-hermetic
 - Nit: `detect_shared_kv_proposer` reorder (non-gating, more correct behavior)
+
+## 2026-07-14T02:37:00Z — Reviewed ep-cpu + speculative fix
+- **ep-cpu (ea30279):** 🟡 numerics review — signed off on naive GEMM correctness, int4/uint4 `storage_bytes`, LayerNorm population variance.
+- **gemma4-accept (8089a1f):** 🟡 numerics review — signed off on `inputs_embeds` concat fix, LinearEmbedder scale application, acceptance metrics.

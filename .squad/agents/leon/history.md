@@ -61,3 +61,11 @@ Chew reviewed (read-only, 🟡 SHIP-with-advisories): layout correctness confirm
 - Engine fixes: SWA paged windowed path; dtype-agnostic proposer (f16↔f32); `Value::from_f32_slice_as`; past KV injected in graph dtype; `cuda` feature passthrough; `tests/milestone_b_real.rs`
 - **Chew review:** 🟢 SHIP
 - **Perf note:** 0.53× (acceptance ~25%, `multi_token_accepts==0`) — projected_state hidden-space; correctness unaffected; speedup follow-up deferred
+
+## 2026-07-14T02:37:00Z — Gemma4 speculative acceptance fix merged
+- **Commit:** 8089a1f (with Pris) — Reviewed 🟡 Chew
+- Root cause: engine fed `concat(prev_hidden, cur_hidden)` instead of `concat(embed(last_token), last_hidden)` to shared-KV proposer's `pre_projection`.
+- Fix: `speculative.input_embedding` field + `LinearEmbedder`; proposer rewritten to correct contract.
+- Result: acceptance 25% → 70.6%, multi_token_accepts 0 → 12/17, token-identity preserved.
+- Speculative still 0.58x; speedup is separate follow-up (lower N_spec or lighter lm_head).
+- Opened Sapper action item for durable Mobius export of `input_embedding.f32`.

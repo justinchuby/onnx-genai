@@ -49,3 +49,8 @@ Advanced fixture work is canonical: builders use onnxscript/onnx-ir, `tiny-mtp-f
 
 **Advisory A1 (owner: Pris):** The `tiny-llm` fixture used in `local_tiered_connector_fetch_reuse_is_token_identical` has `num_hidden_layers = 1`. Cross-layer ordering in the extract→store→fetch→inject round-trip is not yet exercised. Layer handling is name-keyed and symmetric (export and inject both iterate `kv_model.layers` in order), so risk is low — but a multi-layer gold fixture would close the last layout dimension of the K4 correctness proof.
 
+
+## 2026-07-14T02:37:00Z — Gemma4 speculative acceptance fix (co-author with Leon)
+- **Commit:** 8089a1f — Reviewed 🟡 Chew
+- Owned: fixture updates (W5a mixed-head_dim), K4 multi-layer KV coverage, Milestone B numerics sign-off.
+- Verified fp16↔f32 conversion exactness and paged-path round-trip is a true inverse for fp16 KV.

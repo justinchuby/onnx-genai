@@ -92,3 +92,8 @@ Prompt-lookup speculation and `MtpProposer` are accepted canonical runtime miles
 - Left uniform staging shim for Leon to remove in W3
 - `cargo test -p onnx-genai-kv --lib` → 78 passed (4 new heterogeneous tests)
 - **Chew review:** 🟡 SHIP-with-advisories — advisory: connector KvPayload path still uniform-only (dead code for E2B, fix before enabling on any mixed-geometry model)
+
+## 2026-07-14T02:37:00Z — ORT2 ep-api + ep-cpu merged
+- **ep-api (65ec9f6):** DeviceBuffer ownership hardening, DLPack alignment (byte_offset, i64 strides), Cost non_exhaustive. Reviewed 🟡 Holden. 17 tests.
+- **ep-cpu (ea30279):** CpuExecutionProvider + 7 Phase-1 pure-Rust kernels (MatMul, Add, Relu, Reshape, Transpose, Gather, LayerNorm). Reviewed 🟡 Chew + 🟡 Holden. 39 tests.
+- Track D (session) must call `strided::view_in_bounds` before kernel dispatch; kernels trust caller for storage bounds.

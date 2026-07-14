@@ -26,3 +26,10 @@ Added the preprocessing-side prompt token-expansion library for multi-tile VLM i
 - `scripts/run_target_greedy_cuda.sh` added
 
 **Follow-up needed:** fix E2B package tokenizer to auto-prepend BOS
+
+## 2026-07-14T02:37:00Z — Mobius input_embedding durable export
+- **Commit:** 2fed4f7 (mobius repo @ feat/gemma4-assistant-onnx-genai)
+- Implemented `_find_scaled_token_embedding` (reads scale from graph's post-embed `Mul`, not hardcoded), `write_input_embedding_artifact` (raw f32 [vocab, hidden], 1.6 GB for E2B).
+- `speculative.input_embedding` now emitted in YAML by default when target_model is supplied.
+- Scale: graph f16 `39.1875` vs Leon's manual `sqrt(1536)=39.1918`; 1.1e-4 difference, negligible.
+- 23 integration tests pass. Regenerated `~/gemma4-e2b-onnx/input_embedding.f32`.

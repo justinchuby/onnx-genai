@@ -12,3 +12,7 @@ Holden's unsafe/resource/supply-chain audit is now in decisions. Current unsafe 
 
 ### 2026-07-12T14:50:00-07:00
 Recurring audit convention is canonical: `.github/workflows/audit.yml` runs weekly and on dependency changes; fresh cargo-audit found 0 vulnerabilities. Continue periodic security review passes.
+
+## 2026-07-14T02:37:00Z — Reviewed ep-api + ep-cpu (safety)
+- **ep-api (65ec9f6):** 🟡 safety — DeviceBuffer ownership, Send/Sync soundness, unsafe construction contracts.
+- **ep-cpu (ea30279):** 🟡 safety — strided::view_in_bounds enforcement, isolated unsafe blocks (aligned alloc/dealloc, copy_nonoverlapping, two strided accessors), no cross-EP free.
