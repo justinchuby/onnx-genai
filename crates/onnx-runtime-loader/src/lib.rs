@@ -50,6 +50,7 @@ pub mod epcontext;
 pub mod graph_builder;
 pub mod proto;
 pub mod weights;
+pub mod writer;
 
 pub use encoder::{
     encode_model, encode_model_proto, write_model, Model, ModelMetadata, DEFAULT_IR_VERSION,
@@ -60,6 +61,7 @@ pub use epcontext::{
 };
 pub use error::LoaderError;
 pub use weights::WeightStore;
+pub use writer::{dump_ep_context, EpContextDumpConfig, EpContextPartition};
 
 mod error {
     use std::path::PathBuf;

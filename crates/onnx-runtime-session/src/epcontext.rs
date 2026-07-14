@@ -33,11 +33,14 @@
 //!    error rather than a silent skip.
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use onnx_runtime_ep_api::{EpContext, EpError, EpId, ExecutionProvider, build_ep_context_registry};
 use onnx_runtime_ir::{Graph, NodeId};
-use onnx_runtime_loader::{EpContextNode, ep_context_nodes, resolve_ep_context};
+use onnx_runtime_loader::{
+    EpContextDumpConfig, EpContextNode, EpContextPartition, Model, dump_ep_context,
+    ep_context_nodes, resolve_ep_context,
+};
 
 use crate::error::{Result, SessionError};
 
@@ -182,4 +185,92 @@ fn claim_ep<'e>(
             node.source
         ))
     })
+}
+
+// ── EPContext DUMP / WRITER path (§55.4) ──────────────────────────────────────
+
+/// One compiled partition the session hands to the EPContext writer (§55.4).
+///
+/// The session owns compilation and partition boundaries; it names the owning
+/// EP and the graph nodes that EP compiled. The driver ([`dump_session_ep_context`])
+/// pulls the compiled blob + SDK version from the EP via
+/// [`ExecutionProvider::save_context`] and the `source` key from
+/// [`ExecutionProvider::context_source_keys`] — nothing is hardcoded (§55.6).
+pub struct CompiledPartition<'a> {
+    /// The EP that compiled this partition (and owns its context).
+    pub ep: &'a dyn ExecutionProvider,
+    /// The ORT-partition name emitted as the node's `partition_name` attribute.
+    pub partition_name: String,
+    /// The graph nodes this partition covers (replaced by one EPContext node).
+    pub covered_nodes: Vec<NodeId>,
+}
+
+/// Drive the §55.4 dump path: serialise `model` to a `*_ctx.onnx` context-cache
+/// model, replacing each compiled `partition`'s subgraph with a single
+/// `com.microsoft::EPContext` node.
+///
+/// For each partition the driver calls [`ExecutionProvider::save_context`] to
+/// obtain the runtime context (blob + `ep_version`) and takes the EP's first
+/// declared [`ExecutionProvider::context_source_keys`] as the node's `source`
+/// key (§55.6 — model-agnostic; no vendor name is hardcoded here). It then hands
+/// the neutral partition views to the loader-owned writer
+/// ([`onnx_runtime_loader::dump_ep_context`]). Returns the written model path.
+///
+/// The caller gates on [`EpContextDumpConfig::enable`]; this function performs
+/// the dump whenever it is called.
+///
+/// # Errors
+///
+/// * [`EpError::UnsupportedContext`] — an EP with no compile step (its
+///   `save_context` default).
+/// * [`SessionError::Internal`] — an EP that participates in compilation but
+///   declares no `source` key (it cannot be dispatched on reload).
+/// * loader errors from the writer (I/O, encoding).
+pub fn dump_session_ep_context(
+    model: &Model,
+    orig_path: &Path,
+    partitions: &[CompiledPartition],
+    config: &EpContextDumpConfig,
+) -> Result<PathBuf> {
+    // Materialise each EP's runtime context first so the loader partition views
+    // can borrow its bytes / version for the duration of the dump.
+    struct Owned {
+        source: String,
+        ctx: EpContext,
+        partition_name: String,
+        covered_nodes: Vec<NodeId>,
+    }
+    let mut owned = Vec::with_capacity(partitions.len());
+    for part in partitions {
+        let ctx = part.ep.save_context()?;
+        let source = part.ep.context_source_keys().into_iter().next().ok_or_else(|| {
+            SessionError::Internal(format!(
+                "EP {:?} produced a context but declares no `source` key — the \
+                 EPContext node could not be dispatched on reload (§55.6)",
+                part.ep.name()
+            ))
+        })?;
+        owned.push(Owned {
+            source,
+            ctx,
+            partition_name: part.partition_name.clone(),
+            covered_nodes: part.covered_nodes.clone(),
+        });
+    }
+
+    let loader_parts: Vec<EpContextPartition<'_>> = owned
+        .iter()
+        .map(|o| EpContextPartition {
+            source: &o.source,
+            ep_sdk_version: &o.ctx.ep_version,
+            partition_name: &o.partition_name,
+            // The session emits primaries; multi-graph `main_context=0`
+            // referencing is an EP-packing concern handled on the load side.
+            main_context: true,
+            blob: &o.ctx.data,
+            covered_nodes: &o.covered_nodes,
+        })
+        .collect();
+
+    Ok(dump_ep_context(model, orig_path, &loader_parts, config)?)
 }

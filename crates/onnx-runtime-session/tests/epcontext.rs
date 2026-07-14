@@ -23,7 +23,13 @@ use onnx_runtime_ir::{
     Attribute, DataType, DeviceId, DeviceType, Graph, Node, NodeId, Shape,
     TensorLayout, ValueId, static_shape,
 };
-use onnx_runtime_session::{InferenceSession, SessionError, load_ep_context_nodes};
+use onnx_runtime_loader::{
+    EpContextDumpConfig, Model, ep_context_nodes as loader_ep_context_nodes, load_model,
+};
+use onnx_runtime_session::{
+    CompiledPartition, InferenceSession, SessionError, dump_session_ep_context,
+    load_ep_context_nodes,
+};
 
 // ── a pure-Rust mock compiled EP ──────────────────────────────────────────────
 
@@ -34,6 +40,10 @@ struct MockCompiledEp {
     keys: Vec<String>,
     /// Bytes received by each `load_context` call, in order.
     loaded: Mutex<Vec<Vec<u8>>>,
+    /// Compiled blob returned by `save_context` (the §55.4 dump path).
+    save_blob: Vec<u8>,
+    /// SDK/toolchain version returned by `save_context`.
+    save_version: String,
 }
 
 impl MockCompiledEp {
@@ -42,6 +52,19 @@ impl MockCompiledEp {
         Self {
             keys: vec!["MOCK".to_string()],
             loaded: Mutex::new(Vec::new()),
+            save_blob: Vec::new(),
+            save_version: String::new(),
+        }
+    }
+
+    /// A compiled EP that "compiles" a partition into `blob` (used by the §55.4
+    /// dump round-trip). `save_context` returns exactly these bytes.
+    fn compiling(blob: &[u8], version: &str) -> Self {
+        Self {
+            keys: vec!["MOCK".to_string()],
+            loaded: Mutex::new(Vec::new()),
+            save_blob: blob.to_vec(),
+            save_version: version.to_string(),
         }
     }
 
@@ -105,6 +128,16 @@ impl ExecutionProvider for MockCompiledEp {
 
     fn context_source_keys(&self) -> Vec<String> {
         self.keys.clone()
+    }
+
+    fn save_context(&self) -> EpResult<EpContext> {
+        Ok(EpContext::new(
+            self.name(),
+            self.save_version.clone(),
+            self.save_blob.clone(),
+            Vec::new(),
+            "mock-device",
+        ))
     }
 
     fn load_context(&self, ctx: &EpContext) -> EpResult<()> {
@@ -415,4 +448,173 @@ fn session_build_rejects_unclaimed_ep_context_node() {
         matches!(err, SessionError::Ep(EpError::NoEpForContext { .. })),
         "expected NoEpForContext, got {err:?}"
     );
+}
+
+// ── §55.4 DUMP / WRITER round-trip (the money test) ───────────────────────────
+
+/// A real two-`Relu` partition `X → Relu → H → Relu → Y` (no EPContext yet), plus
+/// the ids of the two nodes that form the partition the writer will replace.
+fn build_partition_graph() -> (Graph, Vec<NodeId>) {
+    let mut g = Graph::new();
+    g.opset_imports.insert(String::new(), 17);
+    let x = g.create_named_value("X", DataType::Float32, static_shape([2usize, 4]));
+    g.add_input(x);
+    let h = g.create_named_value("H", DataType::Float32, static_shape([2usize, 4]));
+    let id1 = g.insert_node(Node::new(NodeId(0), "Relu", vec![Some(x)], vec![h]));
+    let y = g.create_named_value("Y", DataType::Float32, static_shape([2usize, 4]));
+    let id2 = g.insert_node(Node::new(NodeId(0), "Relu", vec![Some(h)], vec![y]));
+    g.add_output(y);
+    (g, vec![id1, id2])
+}
+
+/// Names of a node's input value slots (skipped optionals become empty strings).
+fn input_names(g: &Graph, id: NodeId) -> Vec<String> {
+    g.node(id)
+        .inputs
+        .iter()
+        .map(|slot| match slot {
+            Some(v) => g.value(*v).name.clone().unwrap_or_default(),
+            None => String::new(),
+        })
+        .collect()
+}
+
+/// Names of a node's output values.
+fn output_names(g: &Graph, id: NodeId) -> Vec<String> {
+    g.node(id)
+        .outputs
+        .iter()
+        .map(|v| g.value(*v).name.clone().unwrap_or_default())
+        .collect()
+}
+
+/// A non-UTF-8 compiled blob so the round-trip proves byte-exact preservation.
+fn compiled_blob() -> Vec<u8> {
+    vec![0x00, 0x01, 0x80, 0xFE, 0xFF, b'c', b'x', 0xC3, 0x28, 0x00, 0x7F]
+}
+
+/// embed_mode=1 round-trip: dump → reload the `*_ctx.onnx` through the consume
+/// path → the exact (non-UTF-8) blob comes back and the partition boundary
+/// `X → EPContext → Y` is preserved.
+#[test]
+fn dump_embed_round_trip_is_byte_exact() {
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("epctx_dump_embed");
+    std::fs::create_dir_all(&dir).unwrap();
+    let orig = dir.join("mymodel.onnx");
+    let payload = compiled_blob();
+
+    let (g, covered) = build_partition_graph();
+    let ep = MockCompiledEp::compiling(&payload, "7.7.7");
+    let model = Model::new(&g);
+    let config = EpContextDumpConfig {
+        enable: true,
+        file_path: None,
+        embed_mode: 1,
+    };
+    let parts = [CompiledPartition {
+        ep: &ep,
+        partition_name: "part0".to_string(),
+        covered_nodes: covered,
+    }];
+
+    let out = dump_session_ep_context(&model, &orig, &parts, &config).expect("dump");
+    assert_eq!(out, dir.join("mymodel_ctx.onnx"), "default <stem>_ctx.onnx path");
+    assert!(out.exists(), "context model written");
+
+    // Reload the produced ctx model through the production loader.
+    let g2 = load_model(&out).expect("reload ctx model");
+
+    // Exactly one EPContext node replaced the two Relus.
+    let ids: Vec<NodeId> = loader_ep_context_nodes(&g2).map(|n| n.node).collect();
+    assert_eq!(ids.len(), 1, "the partition collapsed to one EPContext node");
+    let ep_id = ids[0];
+    assert_eq!(input_names(&g2, ep_id), vec!["X".to_string()], "boundary input");
+    assert_eq!(output_names(&g2, ep_id), vec!["Y".to_string()], "boundary output");
+    // No ordinary Relu survives — the subgraph was fully replaced.
+    assert!(
+        g2.nodes.values().all(|n| n.op_type == "EPContext"),
+        "only the EPContext node remains"
+    );
+
+    // Consume the reloaded model — the mock records the restored bytes.
+    let mock = MockCompiledEp::new();
+    let placement = load_ep_context_nodes(&g2, &dir, &eps(&mock)).expect("consume");
+    assert_eq!(placement.handled.len(), 1);
+    assert_eq!(
+        mock.loaded(),
+        vec![payload],
+        "the embedded blob round-tripped byte-exact"
+    );
+}
+
+/// embed_mode=0 round-trip: dump writes an external sidecar `.bin` next to the
+/// ctx model and stores the relative path; reload + consume reads that file back
+/// byte-exact.
+#[test]
+fn dump_external_round_trip_via_sidecar_bin() {
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("epctx_dump_external");
+    std::fs::create_dir_all(&dir).unwrap();
+    let orig = dir.join("net.onnx");
+    let payload = compiled_blob();
+
+    let (g, covered) = build_partition_graph();
+    let ep = MockCompiledEp::compiling(&payload, "3.1.4");
+    let model = Model::new(&g);
+    let config = EpContextDumpConfig {
+        enable: true,
+        file_path: None,
+        embed_mode: 0,
+    };
+    let parts = [CompiledPartition {
+        ep: &ep,
+        partition_name: "part0".to_string(),
+        covered_nodes: covered,
+    }];
+
+    let out = dump_session_ep_context(&model, &orig, &parts, &config).expect("dump");
+    assert_eq!(out, dir.join("net_ctx.onnx"));
+
+    // A sidecar `.bin` holding the blob was written next to the ctx model.
+    let sidecar = dir.join("net_ctx_MOCK_part0.bin");
+    assert!(sidecar.exists(), "external sidecar written next to ctx model");
+    assert_eq!(std::fs::read(&sidecar).unwrap(), payload, "sidecar holds the blob");
+
+    // Reload + consume: the external path resolves relative to the model dir.
+    let g2 = load_model(&out).expect("reload ctx model");
+    let mock = MockCompiledEp::new();
+    let placement = load_ep_context_nodes(&g2, &dir, &eps(&mock)).expect("consume");
+    assert_eq!(placement.handled.len(), 1);
+    assert_eq!(
+        mock.loaded(),
+        vec![payload],
+        "the external blob round-tripped byte-exact"
+    );
+}
+
+/// An explicit `file_path` overrides the default `<stem>_ctx.onnx` location.
+#[test]
+fn dump_honours_explicit_output_path() {
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("epctx_dump_explicit");
+    std::fs::create_dir_all(&dir).unwrap();
+    let orig = dir.join("src.onnx");
+    let explicit = dir.join("chosen_name.onnx");
+    let payload = compiled_blob();
+
+    let (g, covered) = build_partition_graph();
+    let ep = MockCompiledEp::compiling(&payload, "1.0.0");
+    let model = Model::new(&g);
+    let config = EpContextDumpConfig {
+        enable: true,
+        file_path: Some(explicit.clone()),
+        embed_mode: 1,
+    };
+    let parts = [CompiledPartition {
+        ep: &ep,
+        partition_name: "p".to_string(),
+        covered_nodes: covered,
+    }];
+
+    let out = dump_session_ep_context(&model, &orig, &parts, &config).expect("dump");
+    assert_eq!(out, explicit);
+    assert!(explicit.exists());
 }

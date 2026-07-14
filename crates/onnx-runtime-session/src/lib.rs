@@ -19,7 +19,10 @@ use std::path::{Path, PathBuf};
 
 use onnx_runtime_ir::{DataType, DeviceType, Shape};
 
-pub use epcontext::{EpContextPlacement, load_ep_context_nodes};
+pub use epcontext::{
+    CompiledPartition, EpContextPlacement, dump_session_ep_context, load_ep_context_nodes,
+};
+pub use onnx_runtime_loader::{EpContextDumpConfig, EpContextPartition, Model as EncoderModel};
 pub use error::SessionError;
 pub use executor::CacheStats;
 pub use tensor::Tensor;

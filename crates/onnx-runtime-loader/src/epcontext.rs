@@ -24,15 +24,18 @@ use onnx_runtime_ir::{Attribute, Graph, Node, NodeId, ValueId};
 
 use crate::LoaderError;
 
-/// The op type of an EPContext node.
-const EP_CONTEXT_OP: &str = "EPContext";
+/// The op type of an EPContext node. Shared with the §55.4 writer so the dump
+/// path never re-invents the literal.
+pub(crate) const EP_CONTEXT_OP: &str = "EPContext";
 /// The (single, non-aliased) domain EPContext nodes live in. The shape-inference
 /// registry only normalises the default ONNX domain (`ai.onnx` ⇄ `""`); there is
 /// no `com.microsoft` alias to normalise, so an exact match is correct (§55.3).
-const MS_DOMAIN: &str = "com.microsoft";
+/// Shared with the §55.4 writer (opset import + node domain).
+pub(crate) const MS_DOMAIN: &str = "com.microsoft";
 
-/// Attribute names (§55.2).
-mod attr {
+/// Attribute names (§55.2). Shared between the load path (this module) and the
+/// §55.4 dump path (`crate::writer`) so both sides key on identical strings.
+pub(crate) mod attr {
     pub const MAIN_CONTEXT: &str = "main_context";
     pub const EP_CACHE_CONTEXT: &str = "ep_cache_context";
     pub const EMBED_MODE: &str = "embed_mode";
