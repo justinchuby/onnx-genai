@@ -27,7 +27,7 @@ pub mod tensor;
 
 pub use epcontext::{build_ep_context_registry, EpContext, EpContextRegistry};
 pub use error::{EpError, Result};
-pub use kernel::{Cost, Kernel, KernelMatch};
+pub use kernel::{Cost, Kernel, KernelMatch, ViewOutput};
 pub use provider::{
     DeviceBuffer, EpConfig, EpId, ExecutionProvider, Fence, OptimizerPass, OrtPluginExport,
 };

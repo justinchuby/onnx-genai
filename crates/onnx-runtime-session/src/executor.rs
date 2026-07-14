@@ -43,7 +43,7 @@
 //! refuses to dispatch on failure. That check is the sole thing that makes
 //! ep-cpu's unchecked pointer derefs sound.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use onnx_runtime_ep_api::{
@@ -204,6 +204,46 @@ pub(crate) struct Executor {
     /// invocation's external input shapes differ from the ones it was compiled
     /// for (a shape-varying loop body — rare).
     subgraph_execs: HashMap<(NodeId, String), CompiledSubgraph>,
+    /// Run-scoped zero-copy **view** metadata (§5.4). A value id present here is
+    /// a strided view aliasing another value's buffer (a layout/movement-op
+    /// output such as `Slice`) rather than an owner in [`Self::buffers`]. Built
+    /// during the run loop and cleared at the start of every run.
+    views: HashMap<ValueId, ValueView>,
+    /// Run-scoped set of buffer-owning value ids that have ≥1 live view alias.
+    /// A pinned buffer must not be reused or deallocated for the remainder of
+    /// the run (conservative liveness: a source buffer outlives every view that
+    /// aliases it, guaranteeing no use-after-free). Cleared each run.
+    pinned: HashSet<ValueId>,
+}
+
+/// Run-scoped metadata for a zero-copy view value: it owns no buffer but
+/// borrows `source`'s buffer with the given (real, possibly non-contiguous or
+/// negative-strided) geometry. `strides`/`byte_offset` are expressed relative
+/// to `source`'s allocation base, so a view-of-a-view is flattened to a single
+/// hop whose `source` is always a real buffer owner (never itself a view).
+#[derive(Clone, Debug)]
+struct ValueView {
+    source: ValueId,
+    shape: Vec<usize>,
+    strides: Vec<i64>,
+    byte_offset: usize,
+}
+
+/// Per-input geometry the run loop resolves once per node: the raw base pointer
+/// of the backing (root) buffer plus the real view (shape, element strides —
+/// possibly non-contiguous or negative — and byte offset) to read it through.
+/// A plain owned value yields contiguous strides at offset 0; a view value
+/// yields its recorded strides/offset over its source buffer. `present` is false
+/// for an omitted optional input (an absent placeholder).
+struct InInfo {
+    present: bool,
+    dtype: DataType,
+    shape: Vec<usize>,
+    strides: Vec<i64>,
+    byte_offset: usize,
+    base_ptr: *const std::ffi::c_void,
+    /// Length in bytes of the backing (root) allocation, for the bounds gate.
+    root_len: usize,
 }
 
 /// A cached child executor for one control-flow subgraph body, plus the
@@ -250,6 +290,52 @@ fn view_bounds(
     }
     view_in_bounds(shape, strides, byte_offset, esize, buffer_len)?;
     Ok(())
+}
+
+/// Gather a strided view over `src` into a fresh contiguous row-major byte
+/// buffer. `strides` are in **elements** (may be negative); `byte_offset` is the
+/// byte position of the element origin within `src`. `esize` is the element
+/// size in bytes (fixed-width types only — callers exclude sub-byte dtypes).
+/// This is the materialization copy that turns a zero-copy view back into a
+/// contiguous tensor for a strided-unaware consumer or the output boundary.
+fn gather_view(
+    src: &[u8],
+    shape: &[usize],
+    strides: &[i64],
+    byte_offset: usize,
+    esize: usize,
+) -> Vec<u8> {
+    let n: usize = shape.iter().product();
+    let mut out = vec![0u8; n * esize];
+    if n == 0 {
+        return out;
+    }
+    let rank = shape.len();
+    let mut idx = vec![0usize; rank];
+    let mut w = 0usize;
+    loop {
+        let mut off = byte_offset as i64;
+        for d in 0..rank {
+            off += strides[d] * idx[d] as i64 * esize as i64;
+        }
+        let s = off as usize;
+        out[w..w + esize].copy_from_slice(&src[s..s + esize]);
+        w += esize;
+        // Advance the row-major index; stop when it wraps to all-zero.
+        let mut carried = true;
+        for axis in (0..rank).rev() {
+            idx[axis] += 1;
+            if idx[axis] < shape[axis] {
+                carried = false;
+                break;
+            }
+            idx[axis] = 0;
+        }
+        if carried {
+            break;
+        }
+    }
+    out
 }
 
 /// Element count of a shape with overflow checking. A malicious or corrupt
@@ -340,7 +426,13 @@ fn substitute(shape: &Shape, bindings: &HashMap<SymbolId, usize>) -> Option<Vec<
 /// the dtype is not an integer the shape math understands. Used to read the
 /// *values* of shape-defining inputs (e.g. `Slice` starts/ends) at run time.
 fn buffer_as_i64(buffer: &DeviceBuffer, dtype: DataType) -> Option<Vec<i64>> {
-    let bytes = crate::tensor::host_bytes(buffer);
+    bytes_as_i64(crate::tensor::host_bytes(buffer), dtype)
+}
+
+/// Decode raw little-endian integer bytes as `i64` for `dtype`, or `None` if the
+/// dtype is not an integer the shape math understands. Shared by the owned-buffer
+/// and materialized-view integer-input readers.
+fn bytes_as_i64(bytes: &[u8], dtype: DataType) -> Option<Vec<i64>> {
     match dtype {
         DataType::Int64 => Some(
             bytes
@@ -522,6 +614,8 @@ impl Executor {
             cache: KernelCache::default(),
             name_index,
             subgraph_execs: HashMap::new(),
+            views: HashMap::new(),
+            pinned: HashSet::new(),
         };
 
         // 5) Fully-static graphs are materialized eagerly (buffers + the whole
@@ -631,14 +725,6 @@ impl Executor {
             .iter()
             .map(|v| v.map(|vid| resolved[&vid].clone()).unwrap_or_default())
             .collect()
-    }
-
-    /// Resolved output shapes of a plan node, in positional order.
-    fn node_output_shapes(
-        plan: &NodePlan,
-        resolved: &HashMap<ValueId, Vec<usize>>,
-    ) -> Vec<Vec<usize>> {
-        plan.outputs.iter().map(|v| resolved[v].clone()).collect()
     }
 
     /// Populate the kernel cache for the compiled plan against `resolved` shapes.
@@ -777,6 +863,11 @@ impl Executor {
         inputs: &[(&str, &Tensor)],
         outer_scope: &HashMap<String, Tensor>,
     ) -> Result<Vec<Tensor>> {
+        // Zero-copy view metadata is run-scoped: a value that aliased another's
+        // buffer last run must not leak into this one (buffers may be resized).
+        self.views.clear();
+        self.pinned.clear();
+
         // --- Resolve shapes from the actual bound inputs --------------------
         let bindings = self.bind_symbols(inputs)?;
 
@@ -829,16 +920,15 @@ impl Executor {
         }
 
         // --- Collect graph outputs into owned tensors -----------------------
+        // A view output (a layout op whose result aliases an input buffer) is
+        // materialized to contiguous owned bytes here — external consumers and
+        // the Python/DLPack boundary expect contiguous tensors.
         let mut results = Vec::with_capacity(self.graph.outputs.len());
         for &vid in &self.graph.outputs {
             let dtype = self.value_dtypes[&vid];
             let shape = resolved[&vid].clone();
-            let buf = self.buffers.get(&vid).ok_or_else(|| {
-                SessionError::Internal(format!("output value#{} not produced", vid.0))
-            })?;
-            let n = dtype.storage_bytes(shape.iter().product());
-            let bytes = &host_bytes(buf)[..n];
-            results.push(Tensor::from_raw_in(self.ep.clone(), dtype, shape, bytes)?);
+            let bytes = self.contiguous_bytes(vid, &shape, dtype)?;
+            results.push(Tensor::from_raw_in(self.ep.clone(), dtype, shape, &bytes)?);
         }
         Ok(results)
     }
@@ -851,43 +941,40 @@ impl Executor {
         pi: usize,
         resolved: &mut HashMap<ValueId, Vec<usize>>,
     ) -> Result<()> {
-        // Disjoint-field borrows: the kernel is borrowed from `cache` while the
-        // buffers are touched in the same iteration.
-        let np = &self.plan[pi];
-        let graph = &self.graph;
-        let ep = self.ep.clone();
-        let cache = &mut self.cache;
-        let buffers = &mut self.buffers;
+        // Small owned copies of the plan facts so the buffer/view/cache fields
+        // can be mutated below without fighting a borrow of `self.plan`.
+        let node_id = self.plan[pi].node_id;
+        let inputs = self.plan[pi].inputs.clone();
+        let outputs = self.plan[pi].outputs.clone();
+        let input_dtypes = self.plan[pi].input_dtypes.clone();
+        let output_dtypes = self.plan[pi].output_dtypes.clone();
 
-        let input_shapes = Self::node_input_shapes(np, resolved);
+        let input_shapes: Vec<Vec<usize>> = inputs
+            .iter()
+            .map(|v| v.map(|vid| resolved[&vid].clone()).unwrap_or_default())
+            .collect();
 
         // Data-dependent shapes: if any output's shape is still unresolved,
-        // compute it now from the concrete input shapes + the runtime values
-        // of this node's integer inputs (which upstream nodes have already
-        // produced), then size those buffers just-in-time.
-        if np.outputs.iter().any(|v| !resolved.contains_key(v)) {
-            let input_values: Vec<Option<Vec<i64>>> = np
-                .inputs
+        // compute it now from the concrete input shapes + the runtime *values*
+        // of this node's integer inputs. Buffers are NOT sized here — a view
+        // output needs none, and the compute path sizes them just below.
+        if outputs.iter().any(|v| !resolved.contains_key(v)) {
+            let input_values: Vec<Option<Vec<i64>>> = inputs
                 .iter()
                 .enumerate()
                 .map(|(i, v)| {
-                    v.and_then(|vid| {
-                        buffers
-                            .get(&vid)
-                            .and_then(|b| buffer_as_i64(b, np.input_dtypes[i]))
-                    })
+                    v.and_then(|vid| self.input_i64(vid, &input_shapes[i], input_dtypes[i]))
                 })
                 .collect();
-            let node = graph.node(np.node_id);
+            let node = self.graph.node(node_id);
             let out_shapes = dynamic_output_shapes(node, &input_shapes, &input_values)
                 .ok_or_else(|| {
-                    let vid = np
-                        .outputs
+                    let vid = outputs
                         .iter()
                         .find(|v| !resolved.contains_key(v))
                         .copied()
-                        .unwrap_or(np.outputs[0]);
-                    let value = graph.value(vid);
+                        .unwrap_or(outputs[0]);
+                    let value = self.graph.value(vid);
                     SessionError::UnresolvedShape {
                         value: value
                             .name
@@ -896,138 +983,316 @@ impl Executor {
                         op: node.op_type.clone(),
                     }
                 })?;
-            // A future multi-output data-dependent op would misindex
-            // `out_shapes[oi]`; verify the sizer returned exactly one shape
-            // per output rather than panicking on a length mismatch.
-            if out_shapes.len() != np.outputs.len() {
+            if out_shapes.len() != outputs.len() {
                 return Err(SessionError::OutputShapeCountMismatch {
-                    op: node.op_type.clone(),
-                    expected: np.outputs.len(),
+                    op: self.graph.node(node_id).op_type.clone(),
+                    expected: outputs.len(),
                     got: out_shapes.len(),
                 });
             }
-            for (oi, &ovid) in np.outputs.iter().enumerate() {
-                let dims = out_shapes[oi].clone();
-                let numel = checked_numel(&dims, || format!("value#{}", ovid.0))?;
-                let need = checked_storage_bytes(
-                    np.output_dtypes[oi],
-                    numel,
-                    || format!("value#{}", ovid.0),
-                    &dims,
-                )?
-                .max(1);
-                let fits = buffers.get(&ovid).map(|b| b.len() == need).unwrap_or(false);
-                if !fits {
-                    if let Some(old) = buffers.remove(&ovid) {
-                        ep.deallocate(old)?;
-                    }
-                    let buf = ep.allocate(need, TensorLayout::contiguous().alignment)?;
-                    buffers.insert(ovid, buf);
-                }
-                resolved.insert(ovid, dims);
+            for (oi, &ovid) in outputs.iter().enumerate() {
+                resolved.insert(ovid, out_shapes[oi].clone());
             }
         }
 
-        let output_shapes = Self::node_output_shapes(np, resolved);
+        let output_shapes: Vec<Vec<usize>> =
+            outputs.iter().map(|v| resolved[v].clone()).collect();
 
-        // Precompute contiguous strides for every input/output view; these
-        // holders must outlive the views that borrow them.
-        let in_strides: Vec<Vec<i64>> = input_shapes
-            .iter()
-            .map(|s| compute_contiguous_strides(s))
-            .collect();
+        // Resolve each input's real geometry (root buffer + strides/offset) and
+        // bounds-check it. View inputs read through their recorded strides.
+        let mut in_infos: Vec<InInfo> = Vec::with_capacity(inputs.len());
+        for (i, slot) in inputs.iter().enumerate() {
+            let Some(vid) = *slot else {
+                in_infos.push(InInfo {
+                    present: false,
+                    dtype: input_dtypes[i],
+                    shape: Vec::new(),
+                    strides: Vec::new(),
+                    byte_offset: 0,
+                    base_ptr: std::ptr::null(),
+                    root_len: 0,
+                });
+                continue;
+            };
+            let root = self.root_of(vid);
+            let buf = self.buffers.get(&root).ok_or_else(|| {
+                SessionError::Internal(format!("missing buffer for input value#{}", vid.0))
+            })?;
+            let root_len = buf.len();
+            let base_ptr = buf.as_ptr();
+            let (shape, strides, byte_offset) = match self.views.get(&vid) {
+                Some(view) => (view.shape.clone(), view.strides.clone(), view.byte_offset),
+                None => {
+                    let shape = input_shapes[i].clone();
+                    let strides = compute_contiguous_strides(&shape);
+                    (shape, strides, 0)
+                }
+            };
+            view_bounds(&shape, &strides, byte_offset, input_dtypes[i], root_len)?;
+            in_infos.push(InInfo {
+                present: true,
+                dtype: input_dtypes[i],
+                shape,
+                strides,
+                byte_offset,
+                base_ptr,
+                root_len,
+            });
+        }
+
+        let ep = self.ep.clone();
+
+        // Bind the mutated fields as disjoint locals so `self` is never borrowed
+        // whole while the kernel (from `cache`) and the buffers/views are held.
+        let graph = &self.graph;
+        let cache = &mut self.cache;
+        let buffers = &mut self.buffers;
+        let buffer_shapes = &mut self.buffer_shapes;
+        let views_meta = &mut self.views;
+        let pinned = &mut self.pinned;
+
+        // Build the (possibly strided) input views once; they feed both the
+        // view-output probe and, on the compute path, the kernel itself.
+        let mut views: Vec<TensorView> = Vec::with_capacity(in_infos.len());
+        for info in &in_infos {
+            if !info.present {
+                views.push(TensorView::absent(info.dtype));
+                continue;
+            }
+            views.push(
+                TensorView::new(
+                    DevicePtr(info.base_ptr),
+                    info.dtype,
+                    &info.shape,
+                    &info.strides,
+                    onnx_runtime_ir::DeviceId::cpu(),
+                )
+                .with_byte_offset(info.byte_offset),
+            );
+        }
+
+        let node = graph.node(node_id);
+        let opset = effective_opset(graph, node);
+        let kernel = cache.get_or_create(node_id, node, &input_shapes, opset, &ep)?;
+
+        // --- Zero-copy view fast path ---------------------------------------
+        // Ask the kernel whether its outputs are strided views over its inputs
+        // (a layout/movement op such as Slice). If so, record view metadata
+        // aliasing the source buffer and skip compute + allocation entirely.
+        if let Some(specs) = kernel.view_outputs(&views, outputs.len()) {
+            drop(views);
+            if specs.len() != outputs.len() {
+                return Err(SessionError::Internal(format!(
+                    "op '{}' returned {} view outputs for {} outputs",
+                    node.op_type,
+                    specs.len(),
+                    outputs.len()
+                )));
+            }
+            for (oi, spec) in specs.into_iter().enumerate() {
+                let ovid = outputs[oi];
+                let Some(in_vid) = inputs.get(spec.input_index).copied().flatten() else {
+                    return Err(SessionError::Internal(format!(
+                        "op '{}' view output {} references invalid input index {}",
+                        node.op_type, oi, spec.input_index
+                    )));
+                };
+                let root = match views_meta.get(&in_vid) {
+                    Some(v) => v.source,
+                    None => in_vid,
+                };
+                let root_len = buffers.get(&root).map(|b| b.len()).ok_or_else(|| {
+                    SessionError::Internal(format!(
+                        "view source value#{} has no buffer",
+                        root.0
+                    ))
+                })?;
+                // Bounds-gate the composed view against the source allocation.
+                view_bounds(
+                    &spec.shape,
+                    &spec.strides,
+                    spec.byte_offset,
+                    output_dtypes[oi],
+                    root_len,
+                )?;
+                // The output becomes a view: drop any buffer it used to own so a
+                // later run re-sizes cleanly, then record the alias and pin the
+                // source (conservative liveness — a source with any live view is
+                // never reused/freed for the rest of the run; no use-after-free).
+                // A freshly-produced output can never already be pinned (its
+                // viewers run strictly after it under SSA topo order).
+                debug_assert!(
+                    !pinned.contains(&ovid),
+                    "value#{} is pinned as a live view source yet is being reproduced",
+                    ovid.0
+                );
+                if let Some(old) = buffers.remove(&ovid) {
+                    ep.deallocate(old)?;
+                }
+                buffer_shapes.remove(&ovid);
+                views_meta.insert(
+                    ovid,
+                    ValueView {
+                        source: root,
+                        shape: spec.shape.clone(),
+                        strides: spec.strides,
+                        byte_offset: spec.byte_offset,
+                    },
+                );
+                pinned.insert(root);
+                resolved.insert(ovid, spec.shape);
+            }
+            return Ok(());
+        }
+
+        // --- Compute path ----------------------------------------------------
+        // Size (allocate or reuse) each output's contiguous buffer, JIT-sizing
+        // data-dependent ones. A value that was a view on a prior run has no
+        // buffer here and is freshly allocated.
+        for (oi, &ovid) in outputs.iter().enumerate() {
+            let dims = &output_shapes[oi];
+            let numel = checked_numel(dims, || format!("value#{}", ovid.0))?;
+            let need = checked_storage_bytes(
+                output_dtypes[oi],
+                numel,
+                || format!("value#{}", ovid.0),
+                dims,
+            )?
+            .max(1);
+            let fits = buffers.get(&ovid).map(|b| b.len() == need).unwrap_or(false);
+            if !fits {
+                // Never free a buffer that has a live view alias (would dangle
+                // the viewer). Unreachable under SSA topo order, but enforced.
+                debug_assert!(
+                    !pinned.contains(&ovid),
+                    "value#{} is pinned as a live view source yet is being resized",
+                    ovid.0
+                );
+                if let Some(old) = buffers.remove(&ovid) {
+                    ep.deallocate(old)?;
+                }
+                let buf = ep.allocate(need, TensorLayout::contiguous().alignment)?;
+                buffers.insert(ovid, buf);
+            }
+        }
+
+        // Auto-materialization gate: a strided (view) input feeding a kernel
+        // that does not accept strided input on that slot is gathered into a
+        // private contiguous temp so contiguous-assuming kernels stay correct.
+        // Temps must outlive the views that borrow them.
+        let mut mat: Vec<Option<(Vec<u8>, Vec<i64>)>> = Vec::with_capacity(in_infos.len());
+        for (i, info) in in_infos.iter().enumerate() {
+            if !info.present {
+                mat.push(None);
+                continue;
+            }
+            let contiguous = onnx_runtime_ir::is_contiguous(&info.shape, &info.strides);
+            if contiguous || kernel.supports_strided_input(i) {
+                mat.push(None);
+                continue;
+            }
+            let esize = info.dtype.byte_size();
+            if esize == 0 {
+                return Err(SessionError::from(
+                    onnx_runtime_ep_api::EpError::InvalidTensorView {
+                        reason: format!(
+                            "cannot materialize sub-byte strided input {i} of op '{}'",
+                            node.op_type
+                        ),
+                    },
+                ));
+            }
+            let src = unsafe {
+                std::slice::from_raw_parts(info.base_ptr as *const u8, info.root_len)
+            };
+            let gathered = gather_view(src, &info.shape, &info.strides, info.byte_offset, esize);
+            let strides = compute_contiguous_strides(&info.shape);
+            mat.push(Some((gathered, strides)));
+        }
+
+        // Rebuild input views, swapping any materialized slot to its contiguous
+        // temp (offset 0, contiguous strides over the fresh buffer).
+        drop(views);
+        let mut views: Vec<TensorView> = Vec::with_capacity(in_infos.len());
+        for (i, info) in in_infos.iter().enumerate() {
+            if !info.present {
+                views.push(TensorView::absent(info.dtype));
+                continue;
+            }
+            match &mat[i] {
+                Some((buf, strides)) => views.push(TensorView::new(
+                    DevicePtr(buf.as_ptr() as *const std::ffi::c_void),
+                    info.dtype,
+                    &info.shape,
+                    strides,
+                    onnx_runtime_ir::DeviceId::cpu(),
+                )),
+                None => views.push(
+                    TensorView::new(
+                        DevicePtr(info.base_ptr),
+                        info.dtype,
+                        &info.shape,
+                        &info.strides,
+                        onnx_runtime_ir::DeviceId::cpu(),
+                    )
+                    .with_byte_offset(info.byte_offset),
+                ),
+            }
+        }
+
+        // Take output buffers out so they can be borrowed `&mut` disjointly from
+        // the input reads (SSA guarantees outputs are disjoint from inputs).
         let out_strides: Vec<Vec<i64>> = output_shapes
             .iter()
             .map(|s| compute_contiguous_strides(s))
             .collect();
-
-        // Input base pointers (raw, no lingering borrow) + bounds gate
-        // against the run-scoped resolved buffers. An omitted optional
-        // (`None`) slot has no buffer: it gets a null pointer and later
-        // becomes a `TensorView::absent` placeholder.
-        let mut in_ptrs: Vec<*const std::ffi::c_void> = Vec::with_capacity(np.inputs.len());
-        for (i, slot) in np.inputs.iter().enumerate() {
-            let Some(vid) = slot else {
-                in_ptrs.push(std::ptr::null());
-                continue;
-            };
-            let buf = buffers.get(vid).ok_or_else(|| {
-                SessionError::Internal(format!("missing buffer for input value#{}", vid.0))
-            })?;
-            view_bounds(
-                &input_shapes[i],
-                &in_strides[i],
-                0,
-                np.input_dtypes[i],
-                buf.len(),
-            )?;
-            in_ptrs.push(buf.as_ptr());
-        }
-
-        // Take output buffers out of the map so they can be borrowed `&mut`
-        // without conflicting with the input reads still in the map (SSA
-        // guarantees outputs are disjoint from inputs).
-        let mut out_bufs: Vec<(ValueId, DeviceBuffer)> = Vec::with_capacity(np.outputs.len());
-        for &vid in &np.outputs {
+        let mut out_bufs: Vec<(ValueId, DeviceBuffer)> = Vec::with_capacity(outputs.len());
+        for &vid in &outputs {
             let buf = buffers.remove(&vid).ok_or_else(|| {
                 SessionError::Internal(format!("missing buffer for output value#{}", vid.0))
             })?;
             out_bufs.push((vid, buf));
         }
-
-        // Build input views over the raw pointers. An omitted optional
-        // (`None`) slot becomes an absent placeholder that preserves
-        // positional arity for the kernel.
-        let mut views: Vec<TensorView> = Vec::with_capacity(np.inputs.len());
-        for i in 0..np.inputs.len() {
-            if np.inputs[i].is_none() {
-                views.push(TensorView::absent(np.input_dtypes[i]));
-                continue;
-            }
-            views.push(TensorView::new(
-                DevicePtr(in_ptrs[i]),
-                np.input_dtypes[i],
-                &input_shapes[i],
-                &in_strides[i],
-                onnx_runtime_ir::DeviceId::cpu(),
-            ));
-        }
-
-        // Build output views + bounds gate.
         let mut outs: Vec<TensorMut> = Vec::with_capacity(out_bufs.len());
         for (i, (_, buf)) in out_bufs.iter_mut().enumerate() {
             view_bounds(
                 &output_shapes[i],
                 &out_strides[i],
                 0,
-                np.output_dtypes[i],
+                output_dtypes[i],
                 buf.len(),
             )?;
             let ptr = buf.as_mut_ptr();
             outs.push(TensorMut::new(
                 DevicePtrMut(ptr),
-                np.output_dtypes[i],
+                output_dtypes[i],
                 &output_shapes[i],
                 &out_strides[i],
                 onnx_runtime_ir::DeviceId::cpu(),
             ));
         }
 
-        // Resolve the kernel (shape-keyed by the resolved input shapes) and
-        // dispatch.
-        let node = graph.node(np.node_id);
-        let opset = effective_opset(graph, node);
-        let kernel = cache.get_or_create(np.node_id, node, &input_shapes, opset, &ep)?;
         kernel.execute(&views, &mut outs)?;
 
-        // Drop the views (they borrow the holders/pointers) before moving
-        // the output buffers back into the map.
         drop(views);
         drop(outs);
         for (vid, buf) in out_bufs {
             buffers.insert(vid, buf);
         }
         Ok(())
+    }
+
+    /// Read the integer *values* of input `vid` as `i64`, materializing a view
+    /// first if needed. Used to resolve data-dependent output shapes (e.g. a
+    /// `Slice` whose `ends` is produced at runtime). Returns `None` if the value
+    /// has no readable buffer/view or its dtype is not an integer.
+    fn input_i64(&self, vid: ValueId, shape: &[usize], dtype: DataType) -> Option<Vec<i64>> {
+        if self.views.contains_key(&vid) {
+            let bytes = self.contiguous_bytes(vid, shape, dtype).ok()?;
+            bytes_as_i64(&bytes, dtype)
+        } else {
+            self.buffers.get(&vid).and_then(|b| buffer_as_i64(b, dtype))
+        }
     }
 }
 
@@ -1100,12 +1365,62 @@ impl Executor {
                 op: "<control-flow input>".to_string(),
             }
         })?;
-        let buf = self.buffers.get(&vid).ok_or_else(|| {
-            SessionError::Internal(format!("missing buffer for control-flow input value#{}", vid.0))
-        })?;
-        let n = dtype.storage_bytes(shape.iter().product());
-        let bytes = &host_bytes(buf)[..n];
-        Tensor::from_raw_in(self.ep.clone(), dtype, shape, bytes)
+        // A view value owns no buffer; materialize its strided bytes contiguous.
+        let bytes = self.contiguous_bytes(vid, &shape, dtype)?;
+        Tensor::from_raw_in(self.ep.clone(), dtype, shape, &bytes)
+    }
+
+    /// The buffer-owning (root) value backing `vid`: `vid` itself if it owns a
+    /// buffer, or the `source` recorded in its view metadata (always a root,
+    /// since views are flattened at creation).
+    fn root_of(&self, vid: ValueId) -> ValueId {
+        match self.views.get(&vid) {
+            Some(v) => v.source,
+            None => vid,
+        }
+    }
+
+    /// Contiguous row-major bytes of `vid` for `shape`/`dtype`, materializing a
+    /// view (strided gather over its source buffer) or truncating an owned
+    /// buffer to its logical size. This is the single materialization seam used
+    /// by the graph-output boundary and control-flow scope capture.
+    fn contiguous_bytes(
+        &self,
+        vid: ValueId,
+        shape: &[usize],
+        dtype: DataType,
+    ) -> Result<Vec<u8>> {
+        let numel: usize = shape.iter().product();
+        let n = dtype.storage_bytes(numel);
+        if let Some(view) = self.views.get(&vid) {
+            let buf = self.buffers.get(&view.source).ok_or_else(|| {
+                SessionError::Internal(format!(
+                    "view value#{} aliases missing source buffer value#{}",
+                    vid.0, view.source.0
+                ))
+            })?;
+            let esize = dtype.byte_size();
+            if esize == 0 {
+                // Sub-byte views are never created (Slice falls back to copy),
+                // so reaching here is an internal invariant violation.
+                return Err(SessionError::Internal(format!(
+                    "cannot materialize sub-byte view value#{}",
+                    vid.0
+                )));
+            }
+            Ok(gather_view(
+                host_bytes(buf),
+                &view.shape,
+                &view.strides,
+                view.byte_offset,
+                esize,
+            ))
+        } else {
+            let buf = self.buffers.get(&vid).ok_or_else(|| {
+                SessionError::Internal(format!("value#{} not produced", vid.0))
+            })?;
+            Ok(host_bytes(buf)[..n].to_vec())
+        }
     }
 
     /// Store a control-flow op's produced output `tensor` into this graph's
@@ -1155,7 +1470,9 @@ impl Executor {
     ) -> Result<HashMap<String, Tensor>> {
         let mut scope = outer_scope.clone();
         for (name, &vid) in &self.name_index {
-            if resolved.contains_key(&vid) && self.buffers.contains_key(&vid) {
+            let materialized =
+                self.buffers.contains_key(&vid) || self.views.contains_key(&vid);
+            if resolved.contains_key(&vid) && materialized {
                 scope.insert(name.clone(), self.value_tensor(vid, resolved)?);
             }
         }

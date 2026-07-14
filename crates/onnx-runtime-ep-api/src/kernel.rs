@@ -92,6 +92,29 @@ impl KernelMatch {
     }
 }
 
+/// A zero-copy **view output**: a kernel's declaration that one of its outputs
+/// is a strided view aliasing one of its inputs' buffers, rather than freshly
+/// computed bytes (`docs/ORT2.md` §5.4, lazy PyTorch-style views).
+///
+/// The `shape` / `strides` / `byte_offset` describe the output tensor relative
+/// to the **same base pointer** as the referenced input view (i.e. relative to
+/// the input's backing allocation, honoring any offset that input itself
+/// already carried). Strides are in **elements** and may be negative (DLPack).
+/// The executor records this metadata against the output value and does **not**
+/// allocate a buffer or invoke the compute path for that slot; the source
+/// buffer is kept alive until the view's consumers have run.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ViewOutput {
+    /// Positional index (into the kernel's `inputs`) of the aliased input.
+    pub input_index: usize,
+    /// Output shape.
+    pub shape: Vec<usize>,
+    /// Output element strides relative to the aliased input's base pointer.
+    pub strides: Vec<i64>,
+    /// Byte offset of the output element origin from the aliased input's base.
+    pub byte_offset: usize,
+}
+
 /// A kernel ready to execute a specific op with specific shapes (§4.2).
 pub trait Kernel: Send {
     /// Execute over device-resident inputs/outputs.
@@ -99,6 +122,23 @@ pub trait Kernel: Send {
 
     /// Estimated FLOPs, if known (for the cost model).
     fn estimated_flops(&self) -> Option<u64> {
+        None
+    }
+
+    /// Attempt to express this node's outputs as zero-copy [`ViewOutput`]s over
+    /// its inputs instead of computing bytes (the layout/movement-op fast path).
+    ///
+    /// `inputs` carries the real (possibly already-strided) input views and
+    /// `num_outputs` is the node's output arity. Returning:
+    /// * `None` — the default — means "compute normally": the executor allocates
+    ///   output buffers and calls [`Kernel::execute`].
+    /// * `Some(specs)` means every output is a view; `specs.len()` MUST equal
+    ///   `num_outputs`. A kernel that can view some but not all outputs must
+    ///   return `None` (all-or-nothing) so correctness never regresses.
+    ///
+    /// When `Some` is returned, [`Kernel::execute`] is **not** invoked.
+    fn view_outputs(&self, inputs: &[TensorView], num_outputs: usize) -> Option<Vec<ViewOutput>> {
+        let _ = (inputs, num_outputs);
         None
     }
 

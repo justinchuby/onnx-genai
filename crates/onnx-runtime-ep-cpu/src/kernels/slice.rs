@@ -6,7 +6,7 @@
 //! the different clamp bounds for positive vs. negative steps. The op moves raw
 //! element bytes and is dtype-agnostic.
 
-use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
+use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView, ViewOutput};
 use onnx_runtime_ir::{compute_contiguous_strides, Node};
 
 use super::{check_arity, elem_size, to_dense_bytes, to_dense_i64};
@@ -199,6 +199,79 @@ impl Kernel for SliceKernel {
     fn supports_strided_input(&self, _input_idx: usize) -> bool {
         true
     }
+
+    /// Zero-copy fast path: express the Slice result as a strided [`ViewOutput`]
+    /// over `data` (input 0) instead of gathering bytes. A pure sub-view — any
+    /// axis range with any step (positive, or negative → negative stride) — is a
+    /// linear reindexing of the input, so it needs no copy: the output shares
+    /// the input's buffer with adjusted shape/strides/offset. The executor keeps
+    /// that buffer alive until the view's consumers run and materializes to
+    /// contiguous only at a kernel that cannot take a strided input or at the
+    /// graph-output boundary.
+    ///
+    /// Falls back to the copy path (returns `None`) when the geometry cannot be
+    /// expressed as a view: sub-byte element types (no fixed-width element
+    /// stride), an empty (zero-count) axis, or any parameter read failure. This
+    /// is decided purely from `elem_size` and integer inputs — no dtype, vendor,
+    /// or model special-casing (RULES §2/§4).
+    fn view_outputs(&self, inputs: &[TensorView], num_outputs: usize) -> Option<Vec<ViewOutput>> {
+        if num_outputs != 1 || inputs.len() < 3 {
+            return None;
+        }
+        let data = &inputs[0];
+        // Sub-byte / variable-width types have no fixed-width element stride, so
+        // a byte-offset/element-stride view cannot address them: copy instead.
+        let esize = data.dtype.byte_size();
+        if esize == 0 {
+            return None;
+        }
+        let in_shape = data.shape;
+        let rank = in_shape.len();
+        // `data`'s own (possibly already strided) geometry — the view we emit is
+        // composed on top of it so a Slice-of-a-Slice stays a single view.
+        let in_strides = data.strides;
+        if in_strides.len() != rank {
+            return None;
+        }
+
+        let starts = to_dense_i64(&inputs[1]).ok()?;
+        let ends = to_dense_i64(&inputs[2]).ok()?;
+        let axes_in = if inputs.len() >= 4 && !inputs[3].is_absent() {
+            Some(to_dense_i64(&inputs[3]).ok()?)
+        } else {
+            None
+        };
+        let steps_in = if inputs.len() >= 5 && !inputs[4].is_absent() {
+            Some(to_dense_i64(&inputs[4]).ok()?)
+        } else {
+            None
+        };
+        let (axes, steps) = slice_axes_steps(starts.len(), axes_in.as_deref(), steps_in.as_deref());
+        let plan = slice_plan(in_shape, &starts, &ends, &axes, &steps).ok()?;
+
+        let mut out_shape = Vec::with_capacity(rank);
+        let mut out_strides = Vec::with_capacity(rank);
+        // Element offset of the sub-view origin from `data`'s element origin.
+        let mut origin_elems: i64 = 0;
+        for (d, p) in plan.iter().enumerate() {
+            // An empty axis makes offset math ambiguous (start clamps to the
+            // boundary); the copy path already handles empties — fall back.
+            if p.count == 0 {
+                return None;
+            }
+            out_shape.push(p.count);
+            out_strides.push(in_strides[d] * p.step);
+            origin_elems += in_strides[d] * p.start;
+        }
+        // Compose onto `data`'s existing byte offset so we alias its base buffer.
+        let byte_offset = (data.byte_offset as i64 + origin_elems * esize as i64) as usize;
+        Some(vec![ViewOutput {
+            input_index: 0,
+            shape: out_shape,
+            strides: out_strides,
+            byte_offset,
+        }])
+    }
 }
 
 #[cfg(test)]
@@ -388,5 +461,110 @@ mod tests {
             )
             .unwrap();
         assert_eq!(out.to_f32(), Vec::<f32>::new());
+    }
+
+    #[test]
+    fn view_output_axis0_positive_step_is_subview() {
+        // data [4,2] contiguous, slice rows [1:3] step 1 → view [2,2] over rows
+        // 1..3 (byte offset = 2 elems * 4 bytes = 8; strides unchanged [2,1]).
+        let data = Owned::f32(&[4, 2], &[1., 2., 3., 4., 5., 6., 7., 8.]);
+        let starts = Owned::i64(&[1], &[1]);
+        let ends = Owned::i64(&[1], &[3]);
+        let axes = Owned::i64(&[1], &[0]);
+        let vo = SliceKernel
+            .view_outputs(
+                &[data.view(), starts.view(), ends.view(), axes.view()],
+                1,
+            )
+            .expect("pure sub-view should be a view output");
+        assert_eq!(vo.len(), 1);
+        assert_eq!(vo[0].input_index, 0);
+        assert_eq!(vo[0].shape, vec![2, 2]);
+        assert_eq!(vo[0].strides, vec![2, 1]);
+        assert_eq!(vo[0].byte_offset, 8);
+    }
+
+    #[test]
+    fn view_output_step_two_scales_stride() {
+        // data [6] step 2 → view [3] stride 2 (elements), offset 0.
+        let data = Owned::f32(&[6], &[1., 2., 3., 4., 5., 6.]);
+        let starts = Owned::i64(&[1], &[0]);
+        let ends = Owned::i64(&[1], &[6]);
+        let axes = Owned::i64(&[1], &[0]);
+        let steps = Owned::i64(&[1], &[2]);
+        let vo = SliceKernel
+            .view_outputs(
+                &[
+                    data.view(),
+                    starts.view(),
+                    ends.view(),
+                    axes.view(),
+                    steps.view(),
+                ],
+                1,
+            )
+            .unwrap();
+        assert_eq!(vo[0].shape, vec![3]);
+        assert_eq!(vo[0].strides, vec![2]);
+        assert_eq!(vo[0].byte_offset, 0);
+    }
+
+    #[test]
+    fn view_output_negative_step_is_negative_stride() {
+        // data [5] reversed [4:-6:-1] → view [5] stride -1, origin at last elem
+        // (byte offset 4 elems * 4 bytes = 16).
+        let data = Owned::f32(&[5], &[1., 2., 3., 4., 5.]);
+        let starts = Owned::i64(&[1], &[4]);
+        let ends = Owned::i64(&[1], &[-6]);
+        let axes = Owned::i64(&[1], &[0]);
+        let steps = Owned::i64(&[1], &[-1]);
+        let vo = SliceKernel
+            .view_outputs(
+                &[
+                    data.view(),
+                    starts.view(),
+                    ends.view(),
+                    axes.view(),
+                    steps.view(),
+                ],
+                1,
+            )
+            .unwrap();
+        assert_eq!(vo[0].shape, vec![5]);
+        assert_eq!(vo[0].strides, vec![-1]);
+        assert_eq!(vo[0].byte_offset, 16);
+    }
+
+    #[test]
+    fn view_output_empty_slice_falls_back_to_copy() {
+        // A zero-count axis cannot be expressed as a view (ambiguous offset);
+        // the kernel must fall back to the copy path (returns None).
+        let data = Owned::f32(&[5], &[1., 2., 3., 4., 5.]);
+        let starts = Owned::i64(&[1], &[2]);
+        let ends = Owned::i64(&[1], &[2]);
+        assert!(SliceKernel
+            .view_outputs(&[data.view(), starts.view(), ends.view()], 1)
+            .is_none());
+    }
+
+    #[test]
+    fn view_output_composes_over_strided_input() {
+        // A Slice-of-a-Slice: input is already a strided view (a [3] stride-2
+        // view over a [6] buffer, offset 0 → elements 0,2,4). Slicing [1:3]
+        // step 1 must compose: origin advances by 1*stride=2 elems (offset 8),
+        // stride stays 2, shape [2] (picks original elements 2,4).
+        let strided = Owned::f32(&[6], &[1., 2., 3., 4., 5., 6.]).with_view(&[3], &[2]);
+        let starts = Owned::i64(&[1], &[1]);
+        let ends = Owned::i64(&[1], &[3]);
+        let axes = Owned::i64(&[1], &[0]);
+        let vo = SliceKernel
+            .view_outputs(
+                &[strided.view(), starts.view(), ends.view(), axes.view()],
+                1,
+            )
+            .unwrap();
+        assert_eq!(vo[0].shape, vec![2]);
+        assert_eq!(vo[0].strides, vec![2]);
+        assert_eq!(vo[0].byte_offset, 8);
     }
 }
