@@ -75,6 +75,26 @@ external dependency is **`cudarc`** (pinned to the `0.19` line), used with
   will introduce a compile step and a real build-host CUDA requirement; that
   will change the publish story and must be revisited here.
 
+## `onnx-runtime-ep-cpu` — `onednn` feature & publish considerations
+
+`onnx-runtime-ep-cpu` publishes as a **pure-Rust, offline** crate by default: its
+default GEMM backend is the Generic blocked/register-tiled, rayon-parallelized
+kernel (`docs/ORT2.md` §25.2), so `cargo publish`/`cargo build` need no external
+library, C++ toolchain, or network beyond crates.io.
+
+The non-default **`onednn`** feature links oneDNN statically for the x86 / ARM-server
+CPU GEMM path. It is intentionally **excluded from the default published surface**:
+
+- It requires the `third_party/onednn` git submodule (pinned to `v3.9.2`), which
+  crates.io cannot fetch — published `.crate` tarballs do not carry submodules.
+  Consumers who want the feature build from a git/workspace checkout with the
+  submodule initialized (`git submodule update --init --depth 1 third_party/onednn`).
+- Enabling it activates the optional `cmake`/`bindgen` build-dependencies and a
+  `build.rs` source build of oneDNN (static, CPU-only). With the feature off,
+  those build-dependencies are never compiled, keeping the default build offline.
+- Do **not** make `onednn` a default feature; doing so would break `cargo publish`
+  and any consumer that installs ep-cpu from crates.io.
+
 For a real release, replace each crate's explicit `0.1.0-dev.0` version with
 the chosen stable version, update all twelve workspace dependency pins to the
 same exact version, rebuild, and publish again in this order. Published

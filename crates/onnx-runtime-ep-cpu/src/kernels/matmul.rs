@@ -3,17 +3,25 @@
 //!
 //! ## Perf seam (Phase-1.5)
 //!
-//! The inner loop here is a **naive** triple-loop GEMM — correct, not fast.
-//! This is the single hottest kernel for transformer inference, so it is the
-//! prime target for the Phase-1.5 perf pass: replace [`gemm`] with a blocked /
-//! SIMD implementation (oneDNN via FFI, or a Rust BLAS such as `matrixmultiply`
-//! or `gemm`) behind this same [`Kernel`] impl. Nothing above the [`Kernel`]
-//! trait — not the provider, not the session — needs to change.
+//! The 2-D tile GEMM ([`gemm`]) dispatches on [`CpuBackend::auto_detect`]
+//! (`docs/ORT2.md` §25.2):
+//!
+//! * **Generic** (default, always compiled, offline): a blocked, register-tiled,
+//!   rayon-parallelized pure-Rust f32 GEMM ([`gemm_generic`]). It is the
+//!   correctness baseline and contains no `unsafe`.
+//! * **oneDNN** (non-default `onednn` feature): `dnnl_sgemm` via
+//!   [`crate::kernels::onednn`], statically linked.
+//!
+//! The batched / broadcast / 1-D-vector handling in [`matmul_dense`] is
+//! backend-agnostic; only the inner 2-D tile GEMM changes. Nothing above the
+//! [`Kernel`] trait — not the provider, not the session — needs to change.
 
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ir::{broadcast_shapes, compute_contiguous_strides, Node};
+use rayon::prelude::*;
 
 use super::{check_arity, to_dense_f32, write_dense_f32};
+use crate::backend::CpuBackend;
 use crate::strided::{next_index, numel};
 
 /// Stateless f32 MatMul kernel.
@@ -28,20 +36,111 @@ impl KernelFactory for MatMulFactory {
     }
 }
 
-/// Naive row-major GEMM: `c[m,n] = sum_k a[m,k] * b[k,n]` for a single 2-D tile.
+/// 2-D tile GEMM dispatch: `c[m,n] = sum_k a[m,k] * b[k,n]` (overwrite).
+///
 /// `a` is `m*k` row-major, `b` is `k*n` row-major, `c` is `m*n` row-major.
-fn gemm(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usize) {
-    for i in 0..m {
-        for p in 0..k {
-            let aik = a[i * k + p];
-            if aik == 0.0 {
-                continue;
+/// Picks the backend via [`CpuBackend::auto_detect`] (`docs/ORT2.md` §25.2):
+/// oneDNN when the `onednn` feature is compiled in, otherwise the pure-Rust
+/// blocked GEMM. The result is bit-plausible across backends within f32
+/// tolerance.
+fn gemm(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usize) -> Result<()> {
+    match CpuBackend::auto_detect() {
+        #[cfg(feature = "onednn")]
+        CpuBackend::OneDnn => crate::kernels::onednn::sgemm(a, b, c, m, k, n),
+        // Xnnpack / Accelerate placeholders (and Generic) share the pure-Rust
+        // kernel until their native backends are wired.
+        _ => {
+            gemm_generic(a, b, c, m, k, n);
+            Ok(())
+        }
+    }
+}
+
+// Register microkernel tile: MR rows x NR cols of C accumulated in registers.
+const MR: usize = 4;
+const NR: usize = 4;
+// Cache block over the K dimension so a panel of B stays resident in L1/L2
+// while a strip of C accumulates across it.
+const KC: usize = 256;
+// Row-block granularity handed to each rayon task.
+const MC: usize = 64;
+
+/// Pure-Rust blocked, register-tiled, rayon-parallelized f32 GEMM (the Generic
+/// backend). Overwrites `c` with `a @ b`.
+///
+/// Strategy: the outer M dimension is split into `MC`-row blocks distributed
+/// across the rayon thread pool. Each task blocks over K in `KC`-wide panels and
+/// walks N in `NR`-wide strips, accumulating an `MR x NR` register tile so the
+/// hot inner loop over the N strip autovectorizes. Contains no `unsafe`.
+fn gemm_generic(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usize) {
+    if m == 0 || n == 0 {
+        return;
+    }
+    // Parallelize over row blocks of C; each block owns a disjoint slice of `c`
+    // and reads shared, immutable `a`/`b`, so there is no aliasing.
+    c.par_chunks_mut(MC * n).enumerate().for_each(|(blk, c_block)| {
+        let i0 = blk * MC;
+        let rows = c_block.len() / n; // last block may be short
+        let a_block = &a[i0 * k..i0 * k + rows * k];
+        gemm_block(a_block, b, c_block, rows, k, n);
+    });
+}
+
+/// Compute `c_block[rows,n] = a_block[rows,k] @ b[k,n]` (overwrite) for one row
+/// block, blocking over K and register-tiling MR x NR.
+fn gemm_block(a: &[f32], b: &[f32], c: &mut [f32], rows: usize, k: usize, n: usize) {
+    for v in c.iter_mut() {
+        *v = 0.0;
+    }
+    let mut kk = 0;
+    while kk < k {
+        let kc = KC.min(k - kk);
+        let mut i = 0;
+        while i < rows {
+            let mr = MR.min(rows - i);
+            let mut j = 0;
+            while j < n {
+                let nr = NR.min(n - j);
+                micro_kernel(a, b, c, k, n, i, j, kk, kc, mr, nr);
+                j += NR;
             }
-            let a_row = &b[p * n..p * n + n];
-            let c_row = &mut c[i * n..i * n + n];
-            for j in 0..n {
-                c_row[j] += aik * a_row[j];
+            i += MR;
+        }
+        kk += KC;
+    }
+}
+
+/// Accumulate an `mr x nr` (≤ `MR x NR`) tile of C over the K-panel
+/// `[kk, kk+kc)`, adding into the existing `c` contents.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn micro_kernel(
+    a: &[f32],
+    b: &[f32],
+    c: &mut [f32],
+    k: usize,
+    n: usize,
+    i: usize,
+    j: usize,
+    kk: usize,
+    kc: usize,
+    mr: usize,
+    nr: usize,
+) {
+    let mut acc = [[0.0f32; NR]; MR];
+    for p in kk..kk + kc {
+        let brow = &b[p * n + j..p * n + j + nr];
+        for (ii, acc_row) in acc.iter_mut().enumerate().take(mr) {
+            let aik = a[(i + ii) * k + p];
+            for (jj, acc_v) in acc_row.iter_mut().enumerate().take(nr) {
+                *acc_v += aik * brow[jj];
             }
+        }
+    }
+    for (ii, acc_row) in acc.iter().enumerate().take(mr) {
+        let c_row = &mut c[(i + ii) * n + j..(i + ii) * n + j + nr];
+        for (jj, cv) in c_row.iter_mut().enumerate().take(nr) {
+            *cv += acc_row[jj];
         }
     }
 }
@@ -115,7 +214,7 @@ pub(crate) fn matmul_dense(a: &TensorView, b: &TensorView) -> Result<Vec<f32>> {
 
     if batch_shape.is_empty() {
         // No batch dims: a single matmul.
-        gemm(&a_dense, &b_dense, &mut out, m, k, n);
+        gemm(&a_dense, &b_dense, &mut out, m, k, n)?;
     } else {
         let mut bidx = vec![0usize; batch_shape.len()];
         let mut b_out = 0usize;
@@ -129,7 +228,7 @@ pub(crate) fn matmul_dense(a: &TensorView, b: &TensorView) -> Result<Vec<f32>> {
                 m,
                 k,
                 n,
-            );
+            )?;
             b_out += 1;
             if !next_index(&batch_shape, &mut bidx) {
                 break;

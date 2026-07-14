@@ -5,13 +5,15 @@
 //!
 //! ## Pure-Rust reference kernels (architecture decision)
 //!
-//! These are straightforward, **correct** pure-Rust kernels — naive loops, no
-//! FFI, no `cc`/oneDNN build dependency (oneDNN is not installed on the build
-//! host, and the Phase-1 exit bar is correctness, not throughput). Every kernel
-//! sits behind the [`Kernel`] trait, so a Phase-1.5 perf pass can swap in a
-//! blocked/SIMD GEMM (oneDNN, or a Rust BLAS such as `matrixmultiply`/`gemm`)
-//! for the hot kernels **without touching the EP contract or the session**. The
-//! seam is [`Kernel`] itself; see [`matmul`] for the specific hot spot.
+//! These are straightforward, **correct** pure-Rust kernels — the ops other than
+//! the GEMM hot spot use naive loops with no FFI or `cc` build dependency. The
+//! MatMul GEMM went through the Phase-1.5 perf pass (`docs/ORT2.md` §25.2): its
+//! default backend is a blocked, register-tiled, rayon-parallelized pure-Rust
+//! kernel, with an optional statically-linked oneDNN (`dnnl_sgemm`) backend
+//! behind the non-default `onednn` feature. Every kernel sits behind the
+//! [`Kernel`] trait, so backends swap in **without touching the EP contract or
+//! the session**. The seam is [`Kernel`] itself; see [`matmul`] for the hot spot
+//! and [`crate::backend`] for backend selection.
 //!
 //! ## Strided inputs
 //!
@@ -38,6 +40,8 @@ pub mod gelu;
 pub mod gemm;
 pub mod layernorm;
 pub mod matmul;
+#[cfg(feature = "onednn")]
+pub mod onednn;
 pub mod reduce;
 pub mod relu;
 pub mod reshape;
