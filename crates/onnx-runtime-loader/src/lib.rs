@@ -45,10 +45,15 @@ use onnx_runtime_shape_inference::{InferenceRegistry, MergePolicy};
 
 use crate::graph_builder::BuiltGraph;
 
+pub mod epcontext;
 pub mod graph_builder;
 pub mod proto;
 pub mod weights;
 
+pub use epcontext::{
+    ep_context_node_ids, ep_context_nodes, is_ep_context_op, resolve_ep_context, EmbedMode,
+    EpContextBlob, EpContextNode,
+};
 pub use error::LoaderError;
 pub use weights::WeightStore;
 
@@ -76,6 +81,12 @@ mod error {
 
         #[error("weight mmap failed: {0}")]
         Mmap(String),
+
+        #[error("EPContext node error: {0}")]
+        EpContext(String),
+
+        #[error("EPContext external path rejected ({reason}): {path}")]
+        EpContextPath { path: String, reason: &'static str },
 
         #[error("graph construction failed: {0}")]
         GraphBuild(String),

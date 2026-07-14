@@ -150,7 +150,23 @@ fn build_graph_proto(
         if !np.doc_string.is_empty() {
             node.doc_string = Some(np.doc_string.clone());
         }
+        // A `com.microsoft::EPContext` node's `ep_cache_context` attribute is an
+        // ONNX STRING attribute whose bytes are an *opaque* payload: for
+        // `embed_mode=1` the raw compiled vendor blob (arbitrary binary), for
+        // `embed_mode=0` a relative file path. Decoding it via lossy UTF-8 (as
+        // ordinary string attributes are) would corrupt binary blobs, so we
+        // preserve its exact bytes as a `UINT8` tensor. The typed EPContext view
+        // (`crate::epcontext`) reads these bytes back losslessly (§55.3).
+        let is_ep_ctx = crate::epcontext::is_ep_context_op(&np.op_type, &np.domain);
         for ap in &np.attribute {
+            if is_ep_ctx && ap.name == "ep_cache_context" {
+                let raw = ap.s.clone();
+                let dims = vec![raw.len()];
+                let td = TensorData::from_raw(DataType::Uint8, dims, raw);
+                node.attributes
+                    .insert(ap.name.clone(), Attribute::Tensor(td));
+                continue;
+            }
             if let Some((key, attr)) = convert_attribute(graph, ap)? {
                 node.attributes.insert(key, attr);
             }
