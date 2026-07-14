@@ -100,11 +100,32 @@ pub fn view_in_bounds(
         return Ok(());
     }
     let (min_elem, max_elem) = addressed_elem_range(shape, strides);
-    let esize = esize as i64;
-    let origin = byte_offset as i64;
-    let lo = origin + min_elem * esize;
-    let hi = origin + max_elem * esize + esize; // exclusive upper bound
-    if lo < 0 || hi > buffer_len as i64 {
+    // Compute the addressed byte range in i128 so the element→byte multiply and
+    // the origin offset can never wrap: a huge static shape whose
+    // `max_elem * esize` overflows i64 would otherwise wrap *below* buffer_len
+    // and silently pass this gate, then read/write out of bounds. Any overflow
+    // of even the i128 math is turned into a rejection, never a silent pass.
+    let esize = esize as i128;
+    let origin = byte_offset as i128;
+    let lo = (min_elem as i128)
+        .checked_mul(esize)
+        .and_then(|m| origin.checked_add(m));
+    let hi = (max_elem as i128)
+        .checked_mul(esize)
+        .and_then(|m| origin.checked_add(m))
+        .and_then(|h| h.checked_add(esize)); // exclusive upper bound
+    let (lo, hi) = match (lo, hi) {
+        (Some(lo), Some(hi)) => (lo, hi),
+        _ => {
+            return Err(EpError::InvalidTensorView {
+                reason: format!(
+                    "view address computation overflowed (shape {shape:?}, strides {strides:?}, \
+                     byte_offset {byte_offset}, esize {esize})"
+                ),
+            });
+        }
+    };
+    if lo < 0 || hi > buffer_len as i128 {
         return Err(EpError::InvalidTensorView {
             reason: format!(
                 "view addresses bytes [{lo}, {hi}) outside backing allocation [0, {buffer_len})"
@@ -172,5 +193,21 @@ mod tests {
     #[test]
     fn empty_tensor_is_in_bounds() {
         assert!(view_in_bounds(&[0, 5], &[5, 1], 0, 4, 0).is_ok());
+    }
+
+    /// H-D1 (bounds layer): a view whose `max_elem * esize` would overflow i64
+    /// must be REJECTED. The old i64 gate wrapped this product below
+    /// `buffer_len` and silently passed, enabling an out-of-bounds access on an
+    /// under-sized buffer. The i128 computation makes the wrap impossible.
+    #[test]
+    fn bounds_reject_overflowing_address_math() {
+        // max_elem = (2-1) * i64::MAX = i64::MAX; * esize (8) overflows i64.
+        let shape = [2usize];
+        let strides = [i64::MAX];
+        let err = view_in_bounds(&shape, &strides, 0, 8, 1024);
+        assert!(
+            err.is_err(),
+            "an address computation that overflows must be rejected, never wrap-passed"
+        );
     }
 }

@@ -238,6 +238,25 @@ fn checked_numel(dims: &[usize], value: impl FnOnce() -> String) -> Result<usize
     Ok(acc)
 }
 
+/// Byte size of `numel` elements of `dtype` with overflow checking. Even when
+/// the element *count* fits in `usize` (guarded by [`checked_numel`]), the
+/// element-count → bytes multiply can still wrap for a fixed-width dtype and
+/// under-size the backing buffer. Returns [`SessionError::ShapeOverflow`] so the
+/// caller allocates nothing rather than a wrapped, undersized buffer.
+fn checked_storage_bytes(
+    dtype: DataType,
+    numel: usize,
+    value: impl FnOnce() -> String,
+    dims: &[usize],
+) -> Result<usize> {
+    dtype
+        .checked_storage_bytes(numel)
+        .ok_or_else(|| SessionError::ShapeOverflow {
+            value: value(),
+            dims: dims.to_vec(),
+        })
+}
+
 /// The effective operator-set version governing `node` — the graph's imported
 /// opset for the node's domain. The default ONNX domain is spelled both `""`
 /// and `"ai.onnx"`; both map to the same import. When a graph omits the import
@@ -455,7 +474,7 @@ impl Executor {
             self.ep.deallocate(old)?;
         }
         let numel = checked_numel(dims, || format!("value#{}", vid.0))?;
-        let size = dtype.storage_bytes(numel);
+        let size = checked_storage_bytes(dtype, numel, || format!("value#{}", vid.0), dims)?;
         let buf = self
             .ep
             .allocate(size.max(1), TensorLayout::contiguous().alignment)?;
@@ -741,7 +760,13 @@ impl Executor {
                 for (oi, &ovid) in np.outputs.iter().enumerate() {
                     let dims = out_shapes[oi].clone();
                     let numel = checked_numel(&dims, || format!("value#{}", ovid.0))?;
-                    let need = np.output_dtypes[oi].storage_bytes(numel).max(1);
+                    let need = checked_storage_bytes(
+                        np.output_dtypes[oi],
+                        numel,
+                        || format!("value#{}", ovid.0),
+                        &dims,
+                    )?
+                    .max(1);
                     let fits = buffers.get(&ovid).map(|b| b.len() == need).unwrap_or(false);
                     if !fits {
                         if let Some(old) = buffers.remove(&ovid) {
@@ -936,6 +961,24 @@ mod tests {
             err,
             Err(SessionError::ShapeOverflow { .. })
         ));
+    }
+
+    /// H-D1 (byte layer): even when the element *count* fits in `usize`, the
+    /// count → bytes multiply can wrap for a fixed-width dtype. The allocation
+    /// path must report `ShapeOverflow` rather than under-allocating.
+    #[test]
+    fn checked_storage_bytes_detects_byte_overflow() {
+        // `usize::MAX / 4` elements fit in usize (pass checked_numel) but
+        // `* 8` bytes for Float64 wraps — this is the exploited under-alloc.
+        let numel = usize::MAX / 4;
+        let err = checked_storage_bytes(DataType::Float64, numel, || "value#9".into(), &[numel]);
+        assert!(matches!(err, Err(SessionError::ShapeOverflow { .. })));
+
+        // A well-formed size passes through unchanged.
+        assert_eq!(
+            checked_storage_bytes(DataType::Float32, 4, || "v".into(), &[4]).unwrap(),
+            16
+        );
     }
 
     /// The data-dependent shape sizer must return exactly one shape per output

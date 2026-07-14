@@ -90,11 +90,30 @@ impl DataType {
 
     /// Number of bytes needed to store `count` elements, accounting for
     /// sub-byte packing (two 4-bit elements per byte, rounded up).
+    ///
+    /// Panics on `usize` overflow of the `count * byte_size` product. Callers
+    /// that size heap allocations from an untrusted shape MUST use
+    /// [`DataType::checked_storage_bytes`] instead so a crafted static shape
+    /// cannot wrap the multiply and under-allocate.
     pub fn storage_bytes(self, count: usize) -> usize {
+        self.checked_storage_bytes(count)
+            .expect("storage_bytes overflow")
+    }
+
+    /// Number of bytes needed to store `count` elements, returning `None` when
+    /// the `count * byte_size` product overflows `usize`.
+    ///
+    /// This is the overflow-safe counterpart of [`DataType::storage_bytes`]:
+    /// even though an element *count* may fit in `usize`, the element-count →
+    /// bytes multiply can still wrap for a fixed-width dtype (e.g. `2^61`
+    /// elements of an 8-byte type). Allocation sites route through this so a
+    /// wrapped product becomes a clean error instead of a 1-byte allocation
+    /// followed by an out-of-bounds access.
+    pub fn checked_storage_bytes(self, count: usize) -> Option<usize> {
         if self.is_sub_byte() {
-            count.div_ceil(2)
+            Some(count.div_ceil(2))
         } else {
-            count * self.byte_size()
+            count.checked_mul(self.byte_size())
         }
     }
 
@@ -152,6 +171,28 @@ mod tests {
         assert_eq!(DataType::Int4.storage_bytes(4), 2);
         assert_eq!(DataType::Int4.storage_bytes(5), 3);
         assert_eq!(DataType::Float32.storage_bytes(4), 16);
+    }
+
+    #[test]
+    fn checked_storage_bytes_normal_counts() {
+        assert_eq!(DataType::Float32.checked_storage_bytes(4), Some(16));
+        assert_eq!(DataType::Float64.checked_storage_bytes(3), Some(24));
+        assert_eq!(DataType::Int4.checked_storage_bytes(5), Some(3));
+        assert_eq!(DataType::Bool.checked_storage_bytes(0), Some(0));
+    }
+
+    #[test]
+    fn checked_storage_bytes_detects_byte_overflow() {
+        // The element *count* fits in usize but count * byte_size wraps: this
+        // is the exploited path (a `[2^61]`-of-8-byte shape passes the numel
+        // check yet `2^61 * 8` wraps to 0 → 1-byte allocation).
+        assert_eq!(DataType::Float64.checked_storage_bytes(usize::MAX / 4), None);
+        assert_eq!(DataType::Int64.checked_storage_bytes(usize::MAX), None);
+        // Sub-byte packing can never overflow (div_ceil shrinks the count).
+        assert_eq!(
+            DataType::Int4.checked_storage_bytes(usize::MAX),
+            Some(usize::MAX / 2 + 1)
+        );
     }
 
     #[test]
