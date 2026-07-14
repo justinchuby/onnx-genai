@@ -4,6 +4,10 @@ use std::ffi::{CStr, CString};
 use std::path::Path;
 use std::ptr::NonNull;
 
+use onnx_genai_runtime_config::{
+    CudaDevice, ExecutionProvider as ConfigExecutionProvider, IntraOpThreads, runtime_config,
+};
+
 use crate::{Allocator, DataType, Environment, IoBinding, MemoryInfo, OrtError, Result, Value};
 
 /// Execution provider selection.
@@ -93,9 +97,8 @@ impl SessionOptions {
         if self.selects_webgpu() {
             self.webgpu_disable_validation = webgpu_disable_validation_from_env();
         }
-        self.graph_capture = (self.selects_webgpu()
-            && env_flag_enabled("ONNX_GENAI_WEBGPU_GRAPH_CAPTURE"))
-            || (self.selects_cuda() && env_flag_enabled("ONNX_GENAI_CUDA_GRAPH"));
+        self.graph_capture = (self.selects_webgpu() && runtime_config().webgpu_graph_capture)
+            || (self.selects_cuda() && runtime_config().cuda_graph);
     }
 
     /// Set the number of ORT intra-op threads.
@@ -702,16 +705,15 @@ impl RawSessionOptions {
 }
 
 fn execution_providers_from_env() -> Option<Vec<ExecutionProvider>> {
-    let value = std::env::var("ONNX_GENAI_EP").ok()?;
-    let provider = match value.trim().to_ascii_lowercase().as_str() {
-        "" | "cpu" => ExecutionProvider::Cpu,
-        "webgpu" | "web-gpu" | "web_gpu" => ExecutionProvider::WebGpu,
-        "cuda" => ExecutionProvider::Cuda {
+    let provider = match runtime_config().execution_provider.as_ref()? {
+        ConfigExecutionProvider::Cpu => ExecutionProvider::Cpu,
+        ConfigExecutionProvider::WebGpu => ExecutionProvider::WebGpu,
+        ConfigExecutionProvider::Cuda => ExecutionProvider::Cuda {
             device_id: cuda_device_id_from_env(),
         },
-        "metal" => ExecutionProvider::Metal,
-        "coreml" | "core-ml" | "core_ml" => ExecutionProvider::CoreML,
-        other => {
+        ConfigExecutionProvider::Metal => ExecutionProvider::Metal,
+        ConfigExecutionProvider::CoreMl => ExecutionProvider::CoreML,
+        ConfigExecutionProvider::Unsupported(other) => {
             tracing::warn!(
                 "Ignoring unsupported ONNX_GENAI_EP={other}; expected cpu, webgpu, cuda, metal, or coreml"
             );
@@ -735,37 +737,16 @@ fn requested_strict_provider(options: &SessionOptions) -> bool {
         .any(|provider| matches!(provider, ExecutionProvider::Metal))
 }
 
-fn env_flag_enabled(name: &str) -> bool {
-    match std::env::var(name) {
-        Ok(value) => matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
-        ),
-        Err(_) => false,
-    }
-}
-
 fn cuda_device_id_from_env() -> i32 {
-    let Ok(value) = std::env::var("ONNX_GENAI_CUDA_DEVICE") else {
-        return 0;
-    };
-    match parse_cuda_device_id(&value) {
-        Some(device_id) => device_id,
-        None => {
+    match &runtime_config().cuda_device {
+        CudaDevice::Id(device_id) => *device_id,
+        CudaDevice::Invalid(value) => {
             tracing::warn!(
                 "Ignoring invalid ONNX_GENAI_CUDA_DEVICE={value}; expected a non-negative integer, using device 0"
             );
             0
         }
     }
-}
-
-fn parse_cuda_device_id(value: &str) -> Option<i32> {
-    value
-        .trim()
-        .parse::<i32>()
-        .ok()
-        .filter(|device_id| *device_id >= 0)
 }
 
 /// Optional intra-op thread override from `ONNX_GENAI_INTRA_OP_THREADS`.
@@ -777,10 +758,10 @@ fn parse_cuda_device_id(value: &str) -> Option<i32> {
 /// cores, so a 10-thread decode measured ~2x slower than a 6-8 performance-core
 /// config. Invalid or non-positive values are ignored with a warning.
 fn intra_op_threads_from_env() -> Option<i32> {
-    let value = std::env::var("ONNX_GENAI_INTRA_OP_THREADS").ok()?;
-    match value.trim().parse::<i32>() {
-        Ok(threads) if threads > 0 => Some(threads),
-        _ => {
+    match &runtime_config().intra_op_threads {
+        IntraOpThreads::Unset => None,
+        IntraOpThreads::Count(threads) => Some(*threads),
+        IntraOpThreads::Invalid(value) => {
             tracing::warn!(
                 "Ignoring invalid ONNX_GENAI_INTRA_OP_THREADS={value}; expected a positive integer"
             );
@@ -792,13 +773,7 @@ fn intra_op_threads_from_env() -> Option<i32> {
 /// Whether to disable WebGPU validation. Default true (safe overhead
 /// reduction); set `ONNX_GENAI_WEBGPU_VALIDATION=1` to keep validation on.
 fn webgpu_disable_validation_from_env() -> bool {
-    match std::env::var("ONNX_GENAI_WEBGPU_VALIDATION") {
-        Ok(value) => !matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
-        ),
-        Err(_) => true,
-    }
+    !runtime_config().webgpu_validation
 }
 
 /// Whether device-resident KV buffers are enabled. Default **false**: on the
@@ -809,13 +784,7 @@ fn webgpu_disable_validation_from_env() -> bool {
 /// supports external device KV tensors. See
 /// `.squad/decisions/inbox/leon-device-resident-kv.md`.
 fn device_kv_enabled_from_env() -> bool {
-    match std::env::var("ONNX_GENAI_DEVICE_KV") {
-        Ok(value) => matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
-        ),
-        Err(_) => false,
-    }
+    runtime_config().device_kv
 }
 
 /// Explicit operator opt-in that lets an otherwise unverified EP participate in
@@ -835,13 +804,7 @@ fn device_kv_enabled_from_env() -> bool {
 /// [`Session::supports_fixed_capacity_present_binding`]; it overrides the
 /// conservative capability allowlist.
 fn shared_kv_present_binding_opt_in_from_env() -> bool {
-    match std::env::var("ONNX_GENAI_SHARED_KV_PRESENT_BINDING") {
-        Ok(value) => matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
-        ),
-        Err(_) => false,
-    }
+    runtime_config().shared_kv_present_binding
 }
 
 /// Resolve fixed-capacity present binding from the verified EP capability
@@ -1063,10 +1026,10 @@ fn append_metal_execution_provider(
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn metal_plugin_path() -> Result<std::path::PathBuf> {
     const HELP: &str = "set ONNX_GENAI_METAL_EP_LIB to the built onnxruntime-mlx plugin (libonnxruntime_mlx_ep.dylib)";
-    let value = std::env::var_os("ONNX_GENAI_METAL_EP_LIB")
-        .filter(|value| !value.is_empty())
+    let path = runtime_config()
+        .metal_ep_lib
+        .clone()
         .ok_or_else(|| OrtError::InvalidArgument(HELP.into()))?;
-    let path = std::path::PathBuf::from(value);
     if !path.is_absolute() {
         return Err(OrtError::InvalidArgument(format!(
             "ONNX_GENAI_METAL_EP_LIB must be an absolute path; {HELP}"
@@ -1433,14 +1396,6 @@ fn tensor_info_from_type_info(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn parses_cuda_device_ids() {
-        assert_eq!(parse_cuda_device_id("0"), Some(0));
-        assert_eq!(parse_cuda_device_id(" 7 "), Some(7));
-        assert_eq!(parse_cuda_device_id("-1"), None);
-        assert_eq!(parse_cuda_device_id("gpu0"), None);
-    }
 
     #[test]
     fn recognizes_cuda_provider_names() {

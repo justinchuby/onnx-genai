@@ -16,15 +16,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+use onnx_genai_runtime_config::runtime_config;
+
 /// Returns whether profiling is enabled, reading `ONNX_GENAI_PROFILE` once.
 pub fn enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        matches!(
-            std::env::var("ONNX_GENAI_PROFILE").ok().as_deref(),
-            Some("1") | Some("true") | Some("yes")
-        )
-    })
+    runtime_config().profile
 }
 
 #[derive(Default, Clone, Copy)]
@@ -53,14 +49,8 @@ pub fn record(stage: &'static str, nanos: u128) {
 /// Path to write a Chrome Trace Event (Perfetto) timeline to, from
 /// `ONNX_GENAI_TRACE`. When set, each [`Span`] emits one timestamped
 /// `complete` event so the run can be opened in <https://ui.perfetto.dev>.
-fn trace_path() -> Option<&'static str> {
-    static PATH: OnceLock<Option<String>> = OnceLock::new();
-    PATH.get_or_init(|| {
-        std::env::var("ONNX_GENAI_TRACE")
-            .ok()
-            .filter(|value| !value.is_empty())
-    })
-    .as_deref()
+fn trace_path() -> Option<&'static std::path::Path> {
+    runtime_config().trace.as_deref()
 }
 
 /// Whether timeline tracing is enabled (a non-empty `ONNX_GENAI_TRACE`).

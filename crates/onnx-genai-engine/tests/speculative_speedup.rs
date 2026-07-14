@@ -1,10 +1,8 @@
 use onnx_genai_engine::{Engine, EngineConfig, FinishReason, GeneratePrompt, GenerateRequest};
+use onnx_genai_runtime_config::runtime_config;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-const DEFAULT_PROMPT: &str = "Once upon a time, there was a small robot who";
-const DEFAULT_MAX_NEW_TOKENS: usize = 32;
-const DEFAULT_SPECULATIVE_K: usize = 4;
 const REQUIRED_SPEEDUP: f64 = 1.5;
 
 fn workspace_root() -> PathBuf {
@@ -12,12 +10,6 @@ fn workspace_root() -> PathBuf {
         .join("../..")
         .canonicalize()
         .expect("workspace root")
-}
-
-fn model_path(env_name: &str, default: &str) -> PathBuf {
-    std::env::var_os(env_name)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| workspace_root().join(default))
 }
 
 fn request(prompt: &str, max_new_tokens: usize, speculative_k: usize) -> GenerateRequest {
@@ -48,8 +40,15 @@ fn tokens_per_second(tokens: usize, elapsed: Duration) -> f64 {
 #[test]
 #[ignore = "requires real target/draft models under models/; run scripts/bench_speculative.sh"]
 fn speculative_decoding_exceeds_required_speedup_when_models_are_present() -> anyhow::Result<()> {
-    let target = model_path("ONNX_GENAI_SPEC_TARGET", "models/tinystories-33m");
-    let draft = model_path("ONNX_GENAI_SPEC_DRAFT", "models/tinystories-1m");
+    let config = runtime_config();
+    let target = config
+        .spec_target
+        .clone()
+        .unwrap_or_else(|| workspace_root().join("models/tinystories-33m"));
+    let draft = config
+        .spec_draft
+        .clone()
+        .unwrap_or_else(|| workspace_root().join("models/tinystories-1m"));
     if !target.exists() || !draft.exists() {
         eprintln!(
             "skipping speculative benchmark: target={} exists={} draft={} exists={}",
@@ -61,21 +60,13 @@ fn speculative_decoding_exceeds_required_speedup_when_models_are_present() -> an
         return Ok(());
     }
 
-    let prompt =
-        std::env::var("ONNX_GENAI_SPEC_PROMPT").unwrap_or_else(|_| DEFAULT_PROMPT.to_string());
-    let max_new_tokens = std::env::var("ONNX_GENAI_SPEC_MAX_NEW_TOKENS")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(DEFAULT_MAX_NEW_TOKENS);
-    let speculative_k = std::env::var("ONNX_GENAI_SPEC_K")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(DEFAULT_SPECULATIVE_K)
-        .max(1);
+    let prompt = &config.spec_prompt;
+    let max_new_tokens = config.spec_max_new_tokens;
+    let speculative_k = config.spec_k;
 
     let mut baseline = Engine::from_dir(&target, EngineConfig::default())?;
     let (baseline_tokens, baseline_finish, baseline_elapsed) =
-        timed_generate(&mut baseline, &prompt, max_new_tokens, speculative_k)?;
+        timed_generate(&mut baseline, prompt, max_new_tokens, speculative_k)?;
 
     let mut speculative = Engine::from_dir(
         &target,
@@ -86,7 +77,7 @@ fn speculative_decoding_exceeds_required_speedup_when_models_are_present() -> an
         },
     )?;
     let (spec_tokens, spec_finish, speculative_elapsed) =
-        timed_generate(&mut speculative, &prompt, max_new_tokens, speculative_k)?;
+        timed_generate(&mut speculative, prompt, max_new_tokens, speculative_k)?;
 
     assert_eq!(
         baseline_tokens, spec_tokens,
@@ -113,7 +104,7 @@ fn speculative_decoding_exceeds_required_speedup_when_models_are_present() -> an
         speculative_k
     );
 
-    if std::env::var_os("ONNX_GENAI_SPEC_ALLOW_SLOW").is_none() {
+    if !config.spec_allow_slow {
         assert!(
             speedup >= REQUIRED_SPEEDUP,
             "speculative decoding speedup {speedup:.3}x did not meet {REQUIRED_SPEEDUP:.1}x"

@@ -141,7 +141,10 @@ fn main() {
         match profile::write_trace() {
             Ok(()) => println!(
                 "wrote Perfetto timeline to {} (open at https://ui.perfetto.dev)",
-                std::env::var("ONNX_GENAI_TRACE").unwrap_or_default()
+                onnx_genai_runtime_config::runtime_config()
+                    .trace
+                    .as_deref()
+                    .map_or_else(String::new, |path| path.display().to_string())
             ),
             Err(err) => eprintln!("failed to write trace: {err}"),
         }

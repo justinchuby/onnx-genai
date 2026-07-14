@@ -24,6 +24,7 @@
 use std::time::Instant;
 
 use onnx_genai_engine::{Engine, EngineConfig, GeneratePrompt, GenerateRequest};
+use onnx_genai_runtime_config::runtime_config;
 
 fn request(prompt: &str, max_new_tokens: usize) -> GenerateRequest {
     let mut request = GenerateRequest::new(GeneratePrompt::Text(prompt.to_string()));
@@ -38,35 +39,31 @@ fn request(prompt: &str, max_new_tokens: usize) -> GenerateRequest {
 #[test]
 #[ignore = "requires real shared-KV speculative package via ONNX_GENAI_MB_* env vars"]
 fn shared_kv_speculative_matches_greedy_and_reports_speedup() -> anyhow::Result<()> {
-    let (Ok(full_dir), Ok(target_dir)) = (
-        std::env::var("ONNX_GENAI_MB_FULL"),
-        std::env::var("ONNX_GENAI_MB_TARGET"),
-    ) else {
+    let config = runtime_config();
+    let (Some(full_dir), Some(target_dir)) =
+        (config.mb_full.as_deref(), config.mb_target.as_deref())
+    else {
         eprintln!(
             "skipping: set ONNX_GENAI_MB_FULL (merged speculative package) and \
              ONNX_GENAI_MB_TARGET (target-only greedy view) to run this harness"
         );
         return Ok(());
     };
-    let prompt =
-        std::env::var("ONNX_GENAI_MB_PROMPT").unwrap_or_else(|_| "<bos>The capital of France is".to_string());
-    let max_new_tokens = std::env::var("ONNX_GENAI_MB_MAX")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(64);
+    let prompt = &config.mb_prompt;
+    let max_new_tokens = config.mb_max;
 
     // Plain greedy baseline: the target-only view carries no `speculative:`
     // block, so the engine decodes greedily with no draft model.
-    let mut baseline = Engine::from_dir(target_dir.as_ref(), EngineConfig::default())?;
+    let mut baseline = Engine::from_dir(target_dir, EngineConfig::default())?;
     let started = Instant::now();
-    let greedy = baseline.generate(request(&prompt, max_new_tokens))?;
+    let greedy = baseline.generate(request(prompt, max_new_tokens))?;
     let greedy_secs = started.elapsed().as_secs_f64();
 
     // Speculative: the merged package advertises the shared-KV proposer in its
     // metadata, so the default config auto-selects the shared-KV path.
-    let mut speculative = Engine::from_dir(full_dir.as_ref(), EngineConfig::default())?;
+    let mut speculative = Engine::from_dir(full_dir, EngineConfig::default())?;
     let started = Instant::now();
-    let spec = speculative.generate(request(&prompt, max_new_tokens))?;
+    let spec = speculative.generate(request(prompt, max_new_tokens))?;
     let spec_secs = started.elapsed().as_secs_f64();
     let stats = speculative.last_speculative_stats();
 

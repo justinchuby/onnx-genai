@@ -1718,6 +1718,7 @@ dependencies = [
  "onnx-genai-engine",
  "onnx-genai-kv",
  "onnx-genai-ort",
+ "onnx-genai-runtime-config",
  "serde_json",
  "tokenizers",
  "tokio",
@@ -1735,6 +1736,7 @@ dependencies = [
  "onnx-genai-metadata",
  "onnx-genai-ort",
  "onnx-genai-preprocess",
+ "onnx-genai-runtime-config",
  "onnx-genai-scheduler",
  "rand 0.9.5",
  "serde_json",
@@ -1785,6 +1787,7 @@ dependencies = [
  "minijinja",
  "onnx-genai-metadata",
  "onnx-genai-ort-sys",
+ "onnx-genai-runtime-config",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -1836,6 +1839,10 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
 ]
+
+[[package]]
+name = "onnx-genai-runtime-config"
+version = "0.1.0"
 
 [[package]]
 name = "onnx-genai-scheduler"

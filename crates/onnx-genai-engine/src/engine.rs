@@ -2098,11 +2098,14 @@ mod tests {
     #[test]
     #[ignore = "requires ONNX_GENAI_FIM_MODEL_DIR to point at a FIM-capable coder model"]
     fn fim_generation_runs_with_fim_capable_model() -> anyhow::Result<()> {
-        let Ok(model_dir) = std::env::var("ONNX_GENAI_FIM_MODEL_DIR") else {
+        let Some(model_dir) = onnx_genai_runtime_config::runtime_config()
+            .fim_model_dir
+            .as_deref()
+        else {
             eprintln!("set ONNX_GENAI_FIM_MODEL_DIR to a Qwen2.5-Coder/StarCoder-style model");
             return Ok(());
         };
-        let mut engine = Engine::from_dir(Path::new(&model_dir), EngineConfig::default())?;
+        let mut engine = Engine::from_dir(model_dir, EngineConfig::default())?;
         assert!(
             engine.fim_config().is_some(),
             "model tokenizer_config.json must expose recognized FIM tokens"

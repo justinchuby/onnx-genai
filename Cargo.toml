@@ -5,6 +5,7 @@ members = [
     "crates/onnx-genai-preprocess",
     "crates/onnx-genai-metadata",
     "crates/onnx-genai-genai-config",
+    "crates/onnx-genai-runtime-config",
     "crates/onnx-genai-kv",
     "crates/onnx-genai-scheduler",
     "crates/onnx-genai-engine",
@@ -43,6 +44,7 @@ onnx-genai = { path = "crates/onnx-genai", version = "0.1.0" }
 onnx-genai-preprocess = { path = "crates/onnx-genai-preprocess", version = "0.1.0" }
 onnx-genai-metadata = { path = "crates/onnx-genai-metadata", version = "0.1.0" }
 onnx-genai-genai-config = { path = "crates/onnx-genai-genai-config", version = "0.1.0" }
+onnx-genai-runtime-config = { path = "crates/onnx-genai-runtime-config", version = "0.1.0" }
 onnx-genai-kv = { path = "crates/onnx-genai-kv", version = "0.1.0" }
 onnx-genai-scheduler = { path = "crates/onnx-genai-scheduler", version = "0.1.0" }
 onnx-genai-engine = { path = "crates/onnx-genai-engine", version = "0.1.0" }

@@ -1,0 +1,9 @@
+[package]
+name = "onnx-genai-runtime-config"
+description = "Typed, process-wide runtime environment configuration for onnx-genai"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
