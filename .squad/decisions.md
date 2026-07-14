@@ -917,3 +917,61 @@ correctness is unaffected. Not chased further here (would risk the pass bar).
 **Verdict:** 🟡 APPROVE-WITH-FOLLOW-UP
 **What:** Sub-byte Float4E2M1 routes through `div_ceil(2)` path (never unchecked multiply). Float8-FNUZ normal 1-byte path. `#![forbid(unsafe_code)]` intact. No new unsafe/unwrap/panic. Fail-closed attr hardening safe (GRAPH/GRAPHS/TENSOR/TypeProto still handled). Residual gap: `value-info` and `attribute-tensor` decode sites (`graph_builder.rs:232,241,357,365,374`) still use `.unwrap_or(Float32)` — silent mislabel for COMPLEX64/future dtypes. Deckard's PROGRESS.md claim "loader surfaces as LoaderError" is accurate only for initializer weights (weights.rs), not these sites. Required follow-up before complex/unmodeled-dtype milestone: make these sites return `Result`. Owner: Roy/Batty/Leon. ORT2 suite 300 tests green debug+release.
 **Why:** Required review; net soundness improvement with non-blocking residual gap.
+
+---
+
+### 2026-07-14: Loader dtype-decode sites all fail closed (consolidate silent-Float32 fallbacks)
+**By:** Leon (leon-10, opus)
+**What:** Made every `DataType::from_onnx(raw) -> None` decode site in `onnx-runtime-loader` fail closed, closing the silent-wrong-type gap Deckard's weights-only hardening left behind. Two-part change:
+
+1. **Fail-close consolidation.** Added `LoaderError::UnsupportedDataType { raw: i32, context: String }` (`crates/onnx-runtime-loader/src/lib.rs`), a generalized variant carrying the raw ONNX i32 plus a context string. Migrated the existing weight path to it and converted all remaining silent `.unwrap_or(DataType::Float32)` (and the map-key `.unwrap_or(DataType::Int64)`) decode sites to it via a new `decode_dtype(raw, || context)` helper in `graph_builder.rs`. Call sites changed:
+   - `weights.rs` `resolve_initializer` — reworded to the new variant.
+   - `graph_builder.rs` initializer value — `context: "initializer '{name}'"`.
+   - `graph_builder.rs` `type_proto_to_dtype_shape` TensorType + SparseTensorType element type (value-info) — `context: "value-info '{name}'"`.
+   - `graph_builder.rs` `convert_tensor` (Constant/attribute inline tensors) — `context: "attribute tensor '{name}'"`.
+   - `graph_builder.rs` `convert_type_proto` TensorType + SparseTensorType element + MapType key.
+   - Preserved intentional non-dtype defaults (untyped value-info, non-tensor container placeholders).
+
+2. **Vendored proto bump (doc/consistency only).** `proto/onnx.proto3` `enum DataType` gained `FLOAT4E2M1 = 23`. No runtime behavior change.
+
+**Tests added:** `unknown_value_info_dtype_is_load_error` and `unknown_attribute_tensor_dtype_is_load_error` in `tests/loader.rs`. All 15 loader tests + 40 ir tests green debug+release. bert_toy conformance max_abs 1.192e-7.
+
+**Branch:** `squad/ort2-dtype-failclose` — merged `06a2423` → `a822a21`.
+
+**Why:** Holden's finding: value-info and attribute-tensor sites still silently relabeled unmodeled dtypes as Float32 after Deckard's weights-only hardening. Failing closed consistently at every decode site guarantees clean contextual errors.
+
+---
+
+### 2026-07-14: Loader dtype fail-close — soundness review 🟢 (Holden, holden-12)
+**By:** Holden (ORT2 soundness reviewer) — reviewed `a822a21`; verifying closure of own prior finding
+**Verdict:** 🟢 GREEN — finding fully closed, no over-reach, no regressions.
+
+**What:** Grepped entire loader crate. New `decode_dtype(raw, ctx) -> Result` helper routes all real-dtype decode sites. Every site confirmed fail-closed (initializer value, value-info TensorType/SparseTensorType elem, convert_tensor Constant/attribute inline tensors, convert_type_proto Tensor/SparseTensor elem + Map key). No surviving `unwrap_or(Float32)` on any real-dtype site. Intentional non-dtype defaults preserved (untyped value-info, non-tensor containers). `type_proto_to_dtype_shape`/`convert_type_proto`/`value_info_type` signature changes `-> Result<…>` with `?` propagation; transactional-on-failure preserved. Proto bump FLOAT4E2M1=23 unique, correct. Full debug+release ORT2 suite green (ir 40, loader 15+2 new tests, ep-cpu 101, optimizer 27, session 7+1+11, shape-inf 14+3+52, capi 4+9, ep-api 13+4). bert_toy conformance PASS max_abs 1.192e-7.
+
+**Minor advisory (non-blocking):** present-but-UNDEFINED (elem_type=0) on value-info now rejected (correct fail-close for typed I/O); canonical "untyped" models omit the type field and still load.
+
+---
+
+### 2026-07-14: Optimizer fused ops emitted in `com.microsoft` contrib domain; ep-cpu dispatch keyed by (domain, op_type)
+**By:** Batty (batty-12, opus)
+**Branch:** `squad/ort2-fused-domain` (based on main `06a2423`) — merged to main `8cab9d2`
+
+**What:** The optimizer fusion pass previously emitted fused ops in the reserved default ONNX domain (`""`/`ai.onnx`). Moved all optimizer-produced fused ops to `CONTRIB_DOMAIN = "com.microsoft"` and generalized ep-cpu kernel dispatch to key on `(domain, op_type)` via a new `OpRegistry::supports(op_type, domain)` method.
+
+**Domain chosen — `com.microsoft`:** established ONNX-ecosystem contrib domain where FusedMatMul/LayerNormalization/SkipLayerNormalization/SimplifiedLayerNormalization contrib variants already live. Shape-inference crate already registered handlers there. Interoperable with ORT-exported models.
+
+**Op map:** `LayerNormalization` — emitted by optimizer + runnable kernel; default-domain kernel/shape rule KEPT; `com.microsoft` bindings ADDED (additive). `FusedMatMulBias`/`FusedGemm` — no kernel exists in either domain; left without kernel (correct: kernel-less ops are rejected at placement).
+
+**Files touched:** `onnx-runtime-optimizer/src/fusion.rs` (CONTRIB_DOMAIN const, domain set on fused nodes); `onnx-runtime-ep-api/src/registry.rs` (supports() + norm_domain in both lookup+supports); `onnx-runtime-ep-cpu/src/kernels/mod.rs` (com.microsoft LayerNorm registration); `onnx-runtime-ep-cpu/src/provider.rs` (gate via registry.supports); `onnx-runtime-shape-inference/src/handlers/norm.rs` (com.microsoft LayerNorm rule).
+
+**Verify:** debug+release green for optimizer(27)/ep-cpu(102)/ep-api(17)/shape-inference(70)/session(19). bert_toy conformance max_abs 1.192e-7. clippy clean. `#![forbid(unsafe_code)]` intact.
+
+**Why:** Non-standard fused ops in `ai.onnx` cause opset-validation collision and ambiguous dispatch. A private contrib domain provides unambiguous dispatch keying, and centralizing support decisions on the registry is model-agnostic and future-proof.
+
+---
+
+### 2026-07-14: Fused-op contrib domain — dispatch/registry soundness review 🟢 (Gaff, gaff-7)
+**By:** Gaff (ORT2 registry/dispatch/API soundness) — reviewed `1e894de`
+**Verdict:** 🟢 GREEN — dispatch set correct, normalization symmetric, no phantom kernel registration.
+
+**What:** Provider gate now accepts exactly the set of registered `(op_type, domain)` pairs via `registry.supports`. Enumerated registry: default-domain registrations == PHASE1_OPS (1:1 verified); `len() == PHASE1_OPS.len() + 2` invariant holds (Softmax-v13 + com.microsoft/LayerNorm, no extras). `ai.onnx`→`""` normalization applied at top of both `lookup` and `supports` — symmetric. Contrib opset: no import → `effective_opset` falls back to `u64::MAX`; `lookup` filters `since_version <= MAX`, picks v1 — no panic. Dual-domain LayerNorm: distinct `OpKey`s (domain differs), distinct HashMap entries, no overwrite; additive only. FusedMatMulBias/FusedGemm have no kernel in either domain; `supports()` returns false — rejected at placement, not execution. `is_phase1_op` kept as `pub` API (harmless). Debug+release all green; bert_toy PASS max_abs 1.192e-7; clippy clean.

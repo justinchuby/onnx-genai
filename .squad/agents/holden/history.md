@@ -39,3 +39,9 @@ Recurring audit convention is canonical: `.github/workflows/audit.yml` runs week
 
 - **holden-10:** Reviewed Roy's shape-inference wiring (`f4141b9`). 🟢 GREEN. Symbol-unification sound (overflow sentinel gates representative arm; deterministic order-independent; single topo-pass). Loader seam transactional (graph mutated only after full write-back). JIT fallback comment-only diff. No regressions to view_in_bounds/checked_storage_bytes/unsafe. Full ORT2 suite green debug+release. Non-blocking advisory: stricter fail-fast coupling means op-rule false-positives now block load; Chew to confirm none fire on BERT/opset-12.
 - **holden-11:** Reviewed Deckard's IR dtype hardening (`f965f0b`). 🟡 APPROVE-WITH-FOLLOW-UP. Net soundness improvement; no regression; no new unsafe. Float4E2M1 routes through `div_ceil(2)` (overflow-safe). Fail-closed attr hardening safe. 300 tests green debug+release. **Required follow-up:** `graph_builder.rs` value-info (L232,241) and attribute-tensor (L357,365,374) still `.unwrap_or(Float32)` — silent mislabel for unmodeled dtypes. Deckard PROGRESS.md claim overstated. Owner: Roy/Batty/Leon before complex-dtype milestone.
+
+## 2026-07-14T10:00:00Z — ORT2 dtype fail-close review (holden-12)
+
+- **Task:** Review leon-10's dtype fail-close work on `squad/ort2-dtype-failclose` (`a822a21`). Verify closure of own prior holden-11 finding (value-info + attribute-tensor `.unwrap_or(Float32)` sites).
+- **Verdict:** 🟢 GREEN — finding fully closed, no over-reach, no regressions.
+- **Key checks:** All 8 real-dtype decode sites confirmed fail-closed via `decode_dtype`. No surviving `unwrap_or(Float32)` on real-dtype sites. Signature changes `-> Result<…>` with `?`; transactional-on-failure preserved. Proto bump correct. Full ORT2 suite (262 tests) green debug+release. bert_toy PASS max_abs 1.192e-7. Non-blocking advisory: present-but-UNDEFINED elem_type=0 on value-info now rejected (correct fail-close for typed I/O).

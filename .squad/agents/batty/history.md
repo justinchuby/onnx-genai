@@ -118,3 +118,10 @@ Prompt-lookup speculation and `MtpProposer` are accepted canonical runtime miles
 - **Holden review (🔴):** checked_numel closed dims-product overflow but storage_bytes(numel) still unchecked → heap OOB for [2^61]×f64. **Batty locked out of H-D1 storage-sizing artifact**; fix reassigned to Deckard.
 - **Chew review (🟢):** All 6 fixes numerics-correct.
 - Deckard completed H-D1 fix; Holden re-reviewed → **🟡 SHIP**; merged to main.
+
+## 2026-07-14T10:00:00Z — ORT2 fused-op contrib domain (batty-12)
+
+- **Task:** Move optimizer-emitted fused ops to `com.microsoft` contrib domain; generalize ep-cpu dispatch to key on `(domain, op_type)` via registry.
+- **Work:** Added `CONTRIB_DOMAIN = "com.microsoft"` in optimizer/fusion.rs; `apply_fusion` sets domain. Added `OpRegistry::supports(op_type, domain)` + `norm_domain` (ai.onnx↔"") to ep-api/registry.rs (applied in both `lookup` and `supports`). Registered com.microsoft/LayerNorm in ep-cpu (additive; same LayerNormFactory); updated len invariant (PHASE1_OPS+2). Changed provider.rs `supports_op` gate to `registry.supports`. Added com.microsoft LayerNorm shape rule in shape-inference. Left FusedMatMulBias/FusedGemm kernel-less in both domains (none existed).
+- **Result:** debug+release green optimizer(27)/ep-cpu(102)/ep-api(17)/shape-inference(70)/session(19). bert_toy conformance PASS max_abs 1.192e-7. clippy clean.
+- **Review:** Gaff gaff-7 → 🟢 GREEN. Merged to main (`8cab9d2`).

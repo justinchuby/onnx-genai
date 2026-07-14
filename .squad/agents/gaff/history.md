@@ -24,3 +24,9 @@ Gaff's review is now in decisions: engine.rs is a ~3,300-line god module. Refact
 ## 2026-07-14T07:20:00Z — ORT2 shape-inference crate review
 
 - **gaff-6:** Reviewed `onnx-runtime-shape-inference` registry dispatch, topo driver, shape-data side-table, and public API. 🟢 APPROVE. Ran 4 integrity probes: registry opset boundaries correct, driver transactional (no half-annotated state on error), shape-data per-call HashMap (no stale leakage), API minimal and panic-free. IR contract NOT modified — zero lines changed in `onnx-runtime-ir`. Roy not locked out.
+
+## 2026-07-14T10:00:00Z — ORT2 fused-domain dispatch review (gaff-7)
+
+- **Task:** Review Batty's fused-op contrib domain change on `squad/ort2-fused-domain` (`1e894de`). Verify dispatch/registry soundness.
+- **Verdict:** 🟢 GREEN — dispatch set correct, normalization symmetric, no phantom kernel registration.
+- **Key checks:** Provider gate accept set == registered (op_type, domain) pairs exactly; default-domain == PHASE1_OPS 1:1; len invariant holds. ai.onnx→"" normalization symmetric in both `lookup` and `supports`. Contrib opset u64::MAX → resolves v1, no panic. Dual-domain LayerNorm: distinct OpKey entries, no cross-domain resolution. FusedMatMulBias/FusedGemm: supports()=false in both domains → rejected at placement. Debug+release all green; bert_toy PASS max_abs 1.192e-7; clippy clean.

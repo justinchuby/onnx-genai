@@ -69,3 +69,10 @@ Chew reviewed (read-only, 🟡 SHIP-with-advisories): layout correctness confirm
 - Result: acceptance 25% → 70.6%, multi_token_accepts 0 → 12/17, token-identity preserved.
 - Speculative still 0.58x; speedup is separate follow-up (lower N_spec or lighter lm_head).
 - Opened Sapper action item for durable Mobius export of `input_embedding.f32`.
+
+## 2026-07-14T10:00:00Z — ORT2 dtype fail-close (leon-10)
+
+- **Task:** Close silent-Float32 fallback gap identified by Holden's holden-11 finding. Make all `DataType::from_onnx(raw)->None` decode sites in `onnx-runtime-loader` fail closed.
+- **Work:** Added `LoaderError::UnsupportedDataType { raw, context }` + `decode_dtype` helper. All 8 real-dtype sites now fail closed: initializer value, value-info TensorType/SparseTensorType, convert_tensor Constant/attribute, convert_type_proto Tensor/SparseTensor/Map key. Preserved intentional non-dtype defaults. Bumped proto with FLOAT4E2M1=23 (doc only). Added 2 new loader tests.
+- **Result:** loader 15 + ir 40 tests green debug+release; bert_toy conformance PASS max_abs 1.192e-7; clippy clean.
+- **Review:** Holden holden-12 → 🟢 GREEN. Merged to main (`a822a21` → `06a2423`).
