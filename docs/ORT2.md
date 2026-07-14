@@ -530,6 +530,16 @@ pub trait ExecutionProvider: Send + Sync {
     /// Export this EP as an ORT-compatible C ABI plugin.
     /// Allows this EP to be loaded by upstream ORT.
     fn as_ort_plugin(&self) -> Option<OrtPluginExport> { None }
+
+    /// EP-specific graph optimization passes.
+    /// Runs after generic optimizer, before placement.
+    /// Use for EP-specific fusions (e.g. QNN subgraph fusion, TRT layer fusion).
+    fn custom_passes(&self) -> Vec<Box<dyn OptimizerPass>> { vec![] }
+
+    /// EP can claim specific nodes it wants to handle.
+    /// Claimed nodes bypass cost-model placement and go directly to this EP.
+    /// Use for EPs that know better than the cost model (e.g. entire subgraph offload).
+    fn claim_nodes(&self, graph: &Graph) -> Vec<NodeId> { vec![] }
 }
 
 /// Macro: generate ORT C ABI export for any EP crate.
@@ -4791,7 +4801,41 @@ $ ort2 trace diagnose /tmp/trace.jsonl
 
 ---
 
-## 47. Phased Roadmap
+## 47. Identified Gaps & Roadmap Additions
+
+### From vLLM:
+- [ ] **LoRA serving** — per-request adapter selection, multi-LoRA batched GEMM
+- [ ] **Async output processing** — detokenize pipeline doesn't block decode loop
+- [ ] **Recompute-based preemption** — drop KV and recompute (faster than swap to CPU for short sequences)
+- [ ] **Multi-LoRA batching** — single CUDA kernel handles different adapters in same batch
+- [ ] **Frequency-based prefix cache eviction** — complement LRU with usage frequency
+- [ ] **Speculative decode batch scheduling** — draft batch independent of target batch
+
+### Quantization:
+- [ ] **FP8 (E4M3/E5M2)** — H100/H200 feature, fused FP8 GEMM kernels
+- [ ] **Dynamic quantization (activation)** — runtime calibration for activation quantization
+- [ ] **GGUF format loading** — direct weight loading from GGUF files (llama.cpp compat)
+- [ ] **GPTQ/AWQ validation** — verify group_size and packing compat with MatMulNBits
+
+### Custom EP:
+- [ ] **EP custom optimization passes** — EPs register their own fusion patterns
+- [ ] **EP node claiming API** — QNN/TRT style "I want these nodes" (fallback when cost model insufficient)
+
+### Trace & Profiling:
+- [ ] **Page migration events** — full detail: page_id, content, from/to tier, duration, reason, overlap info
+- [ ] **Counter tracks (Perfetto)** — continuous GPU mem, KV growth, pressure level
+- [ ] **Flow events** — data dependency arrows (prefetch H2D → consuming kernel)
+- [ ] **CUPTI integration (stretch)** — GPU kernel timing, SM occupancy, memory throughput
+- [ ] **Roofline analysis per-op** — classify compute-bound vs memory-bound automatically
+- [ ] **Pipeline bubble detection** — idle time in PP stages
+- [ ] **Communication/compute overlap ratio** — % of transfer hidden by compute
+
+### GenAI:
+- [ ] **Component-level device placement** — vision encoder on GPU:0, LLM on GPU:1 (via existing hints, needs GenAI pipeline awareness)
+
+---
+
+## 48. Phased Roadmap
 
 ### Phase 1: Foundation (8-12 weeks)
 - [ ] `onnx-runtime-ir`: Graph IR with all types, validation, mutation API
