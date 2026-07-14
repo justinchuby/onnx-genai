@@ -1971,6 +1971,7 @@ dependencies = [
  "onnx-runtime-ep-cuda",
  "onnx-runtime-ir",
  "onnx-runtime-session",
+ "onnx-runtime-tracer",
  "pyo3",
 ]
 

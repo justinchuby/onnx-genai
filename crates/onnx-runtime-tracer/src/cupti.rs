@@ -49,6 +49,7 @@ use std::alloc::{Layout, alloc, dealloc};
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::os::raw::c_char;
+use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -89,15 +90,9 @@ const ACTIVITY_RECORD_ALIGNMENT: usize = 8;
 /// larger buffer is simpler and fine for Phase 1).
 const ACTIVITY_BUFFER_SIZE: usize = 8 * 1024 * 1024;
 
-/// Candidate `libcupti` sonames, tried in order. A bare `libcupti.so` only
-/// exists when the CUPTI *devel* package is installed, so the versioned names
-/// are tried too.
-const LIBCUPTI_CANDIDATES: &[&str] = &[
-    "libcupti.so",
-    "libcupti.so.13",
-    "libcupti.so.12",
-    "libcupti.so.11",
-];
+/// CUDA 13 CUPTI sonames, tried through the platform loader before pip-wheel
+/// paths. The unversioned name is a fallback for toolkit/devel installations.
+const LIBCUPTI_SONAMES: &[&str] = &["libcupti.so.13", "libcupti.so"];
 
 // --- FFI signatures ----------------------------------------------------------
 
@@ -158,13 +153,78 @@ static CUPTI_LIBRARY: OnceLock<Option<libloading::Library>> = OnceLock::new();
 fn cupti_library() -> Option<&'static libloading::Library> {
     CUPTI_LIBRARY
         .get_or_init(|| {
-            LIBCUPTI_CANDIDATES
-                .iter()
+            libcupti_candidates()
+                .into_iter()
                 // SAFETY: loading a shared library runs its initializers;
                 // libcupti is a well-behaved NVIDIA library.
-                .find_map(|name| unsafe { libloading::Library::new(name) }.ok())
+                .find_map(|path| unsafe { libloading::Library::new(path) }.ok())
         })
         .as_ref()
+}
+
+/// Build the runtime search list for CUDA 13 CUPTI.
+///
+/// In addition to the normal loader path, NVIDIA's pip package installs CUPTI
+/// below `site-packages/nvidia/cuda_cupti/lib`. Python locations are derived at
+/// runtime from explicit environment hints, `PYTHONPATH`, and likely interpreter
+/// prefixes; no build-machine path is embedded in the binary.
+fn libcupti_candidates() -> Vec<PathBuf> {
+    let mut candidates = LIBCUPTI_SONAMES.iter().map(PathBuf::from).collect::<Vec<_>>();
+    let mut site_packages = Vec::new();
+
+    if let Some(paths) = std::env::var_os("NXRT_PYTHON_SITE_PACKAGES") {
+        site_packages.extend(std::env::split_paths(&paths));
+    }
+    if let Some(paths) = std::env::var_os("PYTHONPATH") {
+        site_packages.extend(std::env::split_paths(&paths));
+    }
+
+    let mut prefixes = ["VIRTUAL_ENV", "CONDA_PREFIX", "PYTHONHOME"]
+        .into_iter()
+        .filter_map(std::env::var_os)
+        .map(PathBuf::from)
+        .collect::<Vec<_>>();
+    if let Some(argv0) = std::env::args_os().next().map(PathBuf::from)
+        && let Some(prefix) = argv0.parent().and_then(Path::parent)
+    {
+        prefixes.push(prefix.to_path_buf());
+    }
+    if let Ok(executable) = std::env::current_exe()
+        && let Some(prefix) = executable.parent().and_then(Path::parent)
+    {
+        prefixes.push(prefix.to_path_buf());
+    }
+
+    for prefix in prefixes {
+        discover_site_packages(&prefix, &mut site_packages);
+    }
+    for root in site_packages {
+        push_pip_cupti_candidates(&root, &mut candidates);
+    }
+    candidates
+}
+
+fn discover_site_packages(prefix: &Path, roots: &mut Vec<PathBuf>) {
+    for lib_dir in [prefix.join("lib"), prefix.join("lib64"), prefix.join("local/lib")] {
+        let Ok(entries) = std::fs::read_dir(lib_dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            if entry.file_name().to_string_lossy().starts_with("python") {
+                roots.push(entry.path().join("site-packages"));
+            }
+        }
+    }
+}
+
+fn push_pip_cupti_candidates(site_packages: &Path, candidates: &mut Vec<PathBuf>) {
+    let library_dir = site_packages.join("nvidia/cuda_cupti/lib");
+    for soname in LIBCUPTI_SONAMES {
+        let candidate = library_dir.join(soname);
+        if !candidates.contains(&candidate) {
+            candidates.push(candidate);
+        }
+    }
 }
 
 impl CuptiApi {
@@ -883,6 +943,23 @@ mod tests {
         // `available` must be a coherent flag (true only if the api loaded).
         let profiler = CuptiProfiler::new().expect("CuptiProfiler::new is infallible");
         assert_eq!(profiler.available(), profiler.api.is_some());
+    }
+
+    #[test]
+    fn pip_wheel_candidates_use_cuda_13_layout() {
+        let mut candidates = Vec::new();
+        push_pip_cupti_candidates(Path::new("/venv/lib/python3.12/site-packages"), &mut candidates);
+        assert_eq!(
+            candidates,
+            vec![
+                PathBuf::from(
+                    "/venv/lib/python3.12/site-packages/nvidia/cuda_cupti/lib/libcupti.so.13"
+                ),
+                PathBuf::from(
+                    "/venv/lib/python3.12/site-packages/nvidia/cuda_cupti/lib/libcupti.so"
+                ),
+            ]
+        );
     }
 
     #[test]

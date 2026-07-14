@@ -531,6 +531,16 @@ fn get_available_providers() -> Vec<String> {
     available_providers().iter().map(|s| s.to_string()).collect()
 }
 
+/// Return whether CUDA 13 CUPTI can be loaded for GPU tracing.
+///
+/// Absence or version mismatch is intentionally reported as `false`, not an
+/// import error, so CUDA wheels remain importable on driverless machines.
+#[cfg(feature = "cuda")]
+#[pyfunction]
+fn cupti_available() -> bool {
+    onnx_runtime_tracer::cupti::CuptiProfiler::new().is_ok_and(|profiler| profiler.available())
+}
+
 /// The `nxrt` Python module.
 #[pymodule]
 fn nxrt(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -540,5 +550,7 @@ fn nxrt(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<InferenceSession>()?;
     m.add_class::<NodeArg>()?;
     m.add_function(wrap_pyfunction!(get_available_providers, m)?)?;
+    #[cfg(feature = "cuda")]
+    m.add_function(wrap_pyfunction!(cupti_available, m)?)?;
     Ok(())
 }

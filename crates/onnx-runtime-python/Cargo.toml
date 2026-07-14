@@ -26,6 +26,9 @@ onnx-runtime-ir = { workspace = true }
 # Optional CUDA execution provider, gated behind the `cuda` feature so the
 # default build stays offline / pure-Rust (CPU only).
 onnx-runtime-ep-cuda = { workspace = true, optional = true }
+# GPU tracing is part of CUDA wheels only. CUPTI remains runtime-loaded, so this
+# dependency does not add a link-time CUDA toolkit requirement.
+onnx-runtime-tracer = { workspace = true, optional = true }
 
 [dependencies.pyo3]
 version = "0.23"
@@ -36,4 +39,8 @@ features = ["extension-module", "abi3-py310"]
 
 [features]
 default = []
-cuda = ["dep:onnx-runtime-ep-cuda"]
+cuda = [
+    "dep:onnx-runtime-ep-cuda",
+    "dep:onnx-runtime-tracer",
+    "onnx-runtime-tracer/cupti",
+]

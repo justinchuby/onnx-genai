@@ -60,6 +60,21 @@ offline). `"CUDAExecutionProvider"` is available **only** when the crate is
 built with the `cuda` Cargo feature; requesting an unknown or unbuilt provider
 raises a `ValueError` that lists what this build supports.
 
+### GPU tracing (CUPTI) in the CUDA wheel
+
+GPU kernel tracing is enabled by default when the wheel is built with
+`maturin build --release --features cuda`; the CPU wheel keeps the tracer and
+CUPTI loader disabled. Install the CUDA runtime extra with `pip install
+nxrt[cuda]`, or install `nvidia-cuda-cupti-cu13` alongside a locally built CUDA
+wheel. The loader checks both normal system library paths and the package's
+`site-packages/nvidia/cuda_cupti/lib` directory. CUDA builds also expose
+`nxrt.cupti_available() -> bool`.
+
+The NVIDIA driver (`libcuda.so.1`) is still required to capture GPU activity,
+and CUPTI's major version must match the CUDA 13 build. A missing driver,
+missing CUPTI library, or version mismatch makes `cupti_available()` return
+`False` and tracing skip gracefully; it never prevents `import nxrt`.
+
 ### Supported dtypes
 
 numpy ⇆ nxrt covers `bool`, `int8/16/32/64`, `uint8/16/32/64`, `float16`,

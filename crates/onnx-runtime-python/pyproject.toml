@@ -29,6 +29,9 @@ dynamic = ["version"]
 [project.optional-dependencies]
 # bfloat16 numpy interop (nxrt only needs this to *return* bf16 outputs).
 bfloat16 = ["ml_dtypes"]
+# Runtime CUPTI library for CUDA wheels. Kept as an extra because CPU-only
+# wheels must not install NVIDIA packages.
+cuda = ["nvidia-cuda-cupti-cu13"]
 
 [project.urls]
 repository = "https://github.com/justinchuby/onnx-genai"

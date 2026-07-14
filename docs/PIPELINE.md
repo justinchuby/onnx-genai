@@ -967,6 +967,19 @@ Rationale: one `abi3` wheel tagged at its 3.10 floor spans CPython 3.10→3.14+ 
 minimizing the build matrix and install surprises, while the free-threaded ecosystem's separate ABI
 requires its own `abi3t` artifact rather than overloading the standard wheel.
 
+#### GPU tracing (CUPTI) in the CUDA wheel
+
+Building `nxrt` with `maturin build --release --features cuda` enables CUPTI GPU tracing by default;
+the CPU wheel does not compile the tracer or its dynamic loader. CUDA wheel installs should use the
+`cuda` extra (`pip install nxrt[cuda]`), which supplies the CUDA-13-matched
+`nvidia-cuda-cupti-cu13` runtime package. For a locally built wheel, install that package explicitly.
+
+The loader uses `dlopen` and checks both the system loader path and
+`site-packages/nvidia/cuda_cupti/lib/libcupti.so.13` (with `libcupti.so` as a fallback), so the wheel
+remains importable on non-NVIDIA and driverless machines. Actual tracing still requires the NVIDIA
+driver (`libcuda.so.1`), and CUPTI's major version must match CUDA 13; absence or mismatch causes a
+graceful tracing skip rather than a panic or Python import error.
+
 ---
 
 ## 13. Server De-duplication Plan
