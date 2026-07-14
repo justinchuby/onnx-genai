@@ -175,6 +175,49 @@ pub fn fused_gemm(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
     Ok(())
 }
 
+/// `com.microsoft::FusedAttention`: the optimizer's SDPA-core fusion
+/// (`MatMul(Q, Kᵀ) → scale → [+mask] → Softmax → MatMul(·, V)`). The output
+/// shape is exactly that of the final `MatMul(probs, V)`: `Q`'s leading/batch
+/// dims and `[seq_q, head_dim_v]`.
+///
+/// We reproduce the two-matmul shape flow symbolically so symbolic batch/seq
+/// dims propagate and the contraction dims are checked. The `k_transposed`
+/// attribute mirrors the kernel: when unset (`0`) the `K` input is
+/// `[…, seq_k, head_dim]` and is transposed to form `Kᵀ`; when set (`1`) `K` is
+/// already `[…, head_dim, seq_k]` and used as-is. `scale` only rescales values
+/// (no shape effect) and the optional additive `mask` broadcasts into the
+/// scores, so neither changes the output shape.
+pub fn fused_attention(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
+    let q = ctx.input_shape(0).map(<[DimExpr]>::to_vec);
+    let k = ctx.input_shape(1).map(<[DimExpr]>::to_vec);
+    let v = ctx.input_shape(2).map(<[DimExpr]>::to_vec);
+    let dtype = ctx.input_dtype(0);
+    let (Some(q), Some(k), Some(v), Some(dtype)) = (q, k, v, dtype) else {
+        return Ok(());
+    };
+    let k_transposed = ctx
+        .node
+        .attr("k_transposed")
+        .and_then(Attribute::as_int)
+        .unwrap_or(0)
+        != 0;
+    // K^T: when K is not pre-transposed, swap its trailing two dims.
+    let k_eff = if k_transposed {
+        k
+    } else if k.len() >= 2 {
+        let mut kt = k.clone();
+        let r = kt.len();
+        kt.swap(r - 2, r - 1);
+        kt
+    } else {
+        k
+    };
+    let scores = matmul_shape(ctx, &q, &k_eff, "FusedAttention")?;
+    let shape = matmul_shape(ctx, &scores, &v, "FusedAttention")?;
+    ctx.set_output(0, dtype, shape);
+    Ok(())
+}
+
 /// `Gemm(A, B, C?)`: `Y = alpha * A' * B' + beta * C`, output `[M, N]`.
 pub fn gemm(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
     let a = ctx.input_shape(0).map(<[DimExpr]>::to_vec);
@@ -220,4 +263,6 @@ pub fn register(reg: &mut InferenceRegistry) {
     // The optimizer's MatMul+Add(bias)+Relu fusion: output shape == MatMul's
     // (bias broadcasts, Relu is elementwise).
     reg.register("com.microsoft", "FusedGemm", 1, fused_gemm);
+    // The optimizer's SDPA-core fusion: output shape == MatMul(probs, V)'s.
+    reg.register("com.microsoft", "FusedAttention", 1, fused_attention);
 }

@@ -30,6 +30,7 @@ pub mod cast;
 pub mod constant;
 pub mod elementwise;
 pub mod expand;
+pub mod fused_attention;
 pub mod fused_gemm;
 pub mod fused_matmul_bias;
 pub mod gather;
@@ -134,6 +135,15 @@ pub fn build_cpu_registry() -> OpRegistry {
     reg.register(
         OpKey::new("FusedGemm", "com.microsoft", 1),
         Box::new(fused_gemm::FusedGemmFactory),
+    );
+    // The optimizer's SDPA-core fusion (MatMul(QKᵀ) → scale → [+mask] → Softmax
+    // → MatMul(·V)) emits `FusedAttention` in the contrib domain; bind its
+    // kernel there so dispatch resolves the fused op by (domain, op_type). It
+    // reuses the shared MatMul GEMM (twice), broadcast-Add (mask) and the
+    // extracted last-axis softmax helper.
+    reg.register(
+        OpKey::new("FusedAttention", "com.microsoft", 1),
+        Box::new(fused_attention::FusedAttentionFactory),
     );
     // Elementwise binary broadcasting ops.
     reg.register(OpKey::new("Sub", "", 1), Box::new(elementwise::SubFactory));
@@ -587,10 +597,10 @@ mod tests {
         let reg = build_cpu_registry();
         // Every Phase-1 op has at least one factory, and each resolves at a
         // modern opset. `Softmax` is registered twice (legacy v1 + per-axis
-        // v13), and `LayerNormalization`, `FusedMatMulBias` and `FusedGemm` add
-        // contrib (`com.microsoft`) entries, so the entry count is four more
-        // than the op-name count.
-        assert_eq!(reg.len(), PHASE1_OPS.len() + 4);
+        // v13), and `LayerNormalization`, `FusedMatMulBias`, `FusedGemm` and
+        // `FusedAttention` add contrib (`com.microsoft`) entries, so the entry
+        // count is five more than the op-name count.
+        assert_eq!(reg.len(), PHASE1_OPS.len() + 5);
         for op in PHASE1_OPS {
             assert!(reg.lookup(op, "", 21).is_some(), "missing factory for {op}");
         }

@@ -363,6 +363,18 @@ mod tests {
         assert!(ep.supports_op(&fg, &[], &[]).is_supported());
         assert!(ep.get_kernel(&fg, &[], 1).is_ok());
 
+        // The fused `FusedAttention` (SDPA core) is supported in the contrib
+        // domain; its factory needs the synthesized `scale` attribute to
+        // instantiate.
+        let mut fa = Node::new(onnx_runtime_ir::NodeId(4), "FusedAttention", vec![], vec![]);
+        fa.domain = "com.microsoft".to_string();
+        assert!(ep.supports_op(&fa, &[], &[]).is_supported());
+        fa.attributes.insert(
+            "scale".to_string(),
+            onnx_runtime_ir::Attribute::Float(0.5),
+        );
+        assert!(ep.get_kernel(&fa, &[], 1).is_ok());
+
         // A contrib op with no kernel is still rejected — support is keyed on
         // (op_type, domain).
         let mut unknown = Node::new(onnx_runtime_ir::NodeId(3), "NotARealFusedOp", vec![], vec![]);

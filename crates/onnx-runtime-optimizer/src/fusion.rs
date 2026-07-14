@@ -107,6 +107,11 @@ pub enum RewriteKind {
     /// `epsilon` attributes the kernel reads, extracted from the matched
     /// 9-op decomposition (see [`FusionPattern::layernorm_spec`]).
     LayerNorm,
+    /// Schema-aware SDPA rewrite: emit `[Q, K, V]` (+ optional `[mask]`) plus
+    /// the concrete `scale` and `k_transposed` attributes, extracted from the
+    /// matched `MatMul → (Mul|Div) → [Add] → Softmax → MatMul` core (see
+    /// [`FusionPattern::attention_spec`]).
+    Attention,
 }
 
 /// A fusion rule: an op-type sequence rewritten to a single replacement op.
@@ -155,6 +160,21 @@ impl FusionPattern {
         self.kind
     }
 
+    /// The schema-aware SDPA-core pattern, rewritten to a
+    /// `com.microsoft::FusedAttention` node with inputs `[Q, K, V]` (+ optional
+    /// `[mask]`) and synthesized `scale`/`k_transposed` attributes. Anchored on
+    /// the `Softmax` (see [`Self::try_match_attention`]).
+    pub fn attention() -> Self {
+        Self {
+            name: "Attention".to_string(),
+            // The op list is descriptive only; the DAG-aware matcher does the
+            // real recognition. Softmax is the anchor.
+            ops: ["Softmax"].iter().map(|s| s.to_string()).collect(),
+            replacement: "FusedAttention".to_string(),
+            kind: RewriteKind::Attention,
+        }
+    }
+
     /// This pattern's name.
     pub fn pattern_name(&self) -> &str {
         &self.name
@@ -172,6 +192,7 @@ impl FusionPattern {
         for start in graph.nodes.keys() {
             let m = match self.kind {
                 RewriteKind::LayerNorm => self.try_match_layernorm(graph, start),
+                RewriteKind::Attention => self.try_match_attention(graph, start),
                 RewriteKind::Structural => self.try_match_from(graph, start),
             };
             if let Some(m) = m {
@@ -357,6 +378,293 @@ impl FusionPattern {
         None
     }
 
+    /// DAG-aware SDPA-core matcher anchored on the `Softmax`.
+    ///
+    /// Recognizes the scaled-dot-product-attention core
+    /// `MatMul(Q, Kside) → (Mul|Div by scalar) → [Add(mask)] → Softmax(axis=-1)
+    /// → MatMul(probs, V)` and rewrites it to a single
+    /// `com.microsoft::FusedAttention[Q, K, V, (mask)]`. All recognition and
+    /// every decline guard live in [`Self::try_parse_attention`]; this wrapper
+    /// just packages the parsed pieces into a [`PatternMatch`].
+    fn try_match_attention(&self, graph: &Graph, start: NodeId) -> Option<PatternMatch> {
+        let p = self.try_parse_attention(graph, start)?;
+        Some(PatternMatch {
+            nodes: p.nodes,
+            external_inputs: p.external_inputs,
+            output: p.output,
+        })
+    }
+
+    /// Parse (and fully validate) the SDPA core anchored on the `Softmax` node
+    /// `sm_start`, or `None` to **decline-to-fuse** when any structural or
+    /// numeric assumption cannot be proven from the graph. Model-agnostic:
+    /// purely structural / constant checks, no model-specific names.
+    ///
+    /// Decline guards (each returns `None`):
+    /// * anchor is not a single-in/single-out `Softmax`, or its `axis` is not
+    ///   provably the **last** axis (absent axis or non-last → decline; never
+    ///   guess the opset default);
+    /// * the softmax output is not the **left** operand of a following `MatMul`
+    ///   (the `probs · V` product);
+    /// * the score scaling is not a `Mul`/`Div` by a **concrete scalar f32
+    ///   constant** whose other operand is a `MatMul` output;
+    /// * an intervening `Add` (mask) whose scaled-scores branch can't be
+    ///   uniquely identified (both or neither operand parse as the score
+    ///   scaling);
+    /// * any interior value escapes the matched region (consumed outside it or
+    ///   is a graph output), or the matched nodes are not all distinct, or the
+    ///   fused output would not survive removal.
+    fn try_parse_attention(&self, graph: &Graph, sm_start: NodeId) -> Option<AttnParts> {
+        // Anchor: a Softmax normalizing over its LAST axis.
+        let sm = graph.try_node(sm_start)?;
+        if !Self::op_matches(sm, "Softmax") || sm.inputs.len() != 1 || sm.outputs.len() != 1 {
+            return None;
+        }
+        let sm_in = sm.inputs[0]?;
+        let sm_out = sm.outputs[0];
+        let rank = graph.value(sm_in).shape.len();
+        if rank == 0 {
+            return None;
+        }
+        // Require an explicit `axis` that resolves to the last dim. An absent
+        // axis is the opset default (1 for ≤12, -1 for ≥13) — not provably the
+        // last axis on a >2-D tensor — so we decline rather than guess.
+        let axis = sm.attr("axis").and_then(Attribute::as_int)?;
+        let axis = if axis < 0 { axis + rank as i64 } else { axis };
+        if axis != rank as i64 - 1 {
+            return None;
+        }
+
+        // Forward: out = probs · V. `sm_out` must be the LEFT operand of a
+        // following MatMul (matmul is not commutative; a right-operand softmax
+        // would be `V · probs`, a different op → decline).
+        let out_mm = graph
+            .value(sm_out)
+            .consumers
+            .iter()
+            .copied()
+            .find(|&c| {
+                let n = graph.node(c);
+                Self::op_matches(n, "MatMul") && n.inputs.first() == Some(&Some(sm_out))
+            })?;
+        let out_mm_node = graph.node(out_mm);
+        if out_mm_node.inputs.len() != 2 || out_mm_node.outputs.len() != 1 {
+            return None;
+        }
+        let v = out_mm_node.inputs[1]?;
+        let output = out_mm_node.outputs[0];
+
+        // Backward: the Softmax input is produced either directly by the score
+        // scaling, or by a mask `Add` sitting between the scaling and Softmax.
+        let sm_in_prod = graph.value(sm_in).producer?;
+        let prod = graph.node(sm_in_prod);
+        let (scale_out, mask, mask_add) =
+            if Self::op_matches(prod, "Add") && prod.inputs.len() == 2 {
+                let a = prod.inputs[0]?;
+                let b = prod.inputs[1]?;
+                // The scaled-scores operand is the one whose producer parses as
+                // the score scaling (`Mul`/`Div` scalar of a MatMul output);
+                // the other operand is the additive mask. Exactly one must
+                // qualify — otherwise the dataflow is ambiguous → decline.
+                let a_scale = graph
+                    .value(a)
+                    .producer
+                    .is_some_and(|p| Self::parse_scale(graph, p).is_some());
+                let b_scale = graph
+                    .value(b)
+                    .producer
+                    .is_some_and(|p| Self::parse_scale(graph, p).is_some());
+                match (a_scale, b_scale) {
+                    (true, false) => (a, Some(b), Some(sm_in_prod)),
+                    (false, true) => (b, Some(a), Some(sm_in_prod)),
+                    _ => return None,
+                }
+            } else {
+                (sm_in, None, None)
+            };
+
+        // Score scaling: `scores * c` (Mul) or `scores / c` (Div), c a concrete
+        // scalar f32 constant, `scores` a MatMul output.
+        let scale_node_id = graph.value(scale_out).producer?;
+        let scale_node = graph.node(scale_node_id);
+        if scale_node.outputs.len() != 1 || scale_node.outputs[0] != scale_out {
+            return None;
+        }
+        let (scores_out, scale) = Self::parse_scale(graph, scale_node_id)?;
+
+        // Score MatMul: scores = Q · Kside. `parse_scale` already proved the
+        // producer is a MatMul; re-fetch it and read its operands.
+        let score_mm_id = graph.value(scores_out).producer?;
+        let score_mm = graph.node(score_mm_id);
+        if !Self::op_matches(score_mm, "MatMul")
+            || score_mm.inputs.len() != 2
+            || score_mm.outputs.len() != 1
+            || score_mm.outputs[0] != scores_out
+        {
+            return None;
+        }
+        let q = score_mm.inputs[0]?;
+        let k_side = score_mm.inputs[1]?;
+
+        // K handling: optionally absorb a clean single-consumer last-two-axis
+        // `Transpose` that produced Kᵀ; otherwise pass Kside through as an
+        // already-transposed K.
+        let (k, k_transposed, transpose_node) = Self::attention_k(graph, k_side, score_mm_id);
+
+        // Matched nodes, canonical order (anchor first): the four core ops then
+        // the optional mask `Add` and optional absorbed `Transpose`.
+        let mut nodes = vec![sm_start, score_mm_id, scale_node_id, out_mm];
+        if let Some(ma) = mask_add {
+            nodes.push(ma);
+        }
+        if let Some(t) = transpose_node {
+            nodes.push(t);
+        }
+        let matched_set: HashSet<NodeId> = nodes.iter().copied().collect();
+        if matched_set.len() != nodes.len() {
+            return None;
+        }
+
+        // Safety rule: every matched node except `out_mm` must have all outputs
+        // consumed solely within the matched set (no external consumer, no
+        // graph output) — fusion must not delete a value observed elsewhere.
+        let escapes = nodes.iter().any(|&nid| {
+            nid != out_mm
+                && graph.node(nid).outputs.iter().any(|&o| {
+                    graph.outputs.contains(&o)
+                        || graph
+                            .value(o)
+                            .consumers
+                            .iter()
+                            .any(|c| !matched_set.contains(c))
+                })
+        });
+        if escapes {
+            return None;
+        }
+
+        // The fused output (out_mm's single output) must survive removal.
+        let out_val = graph.value(output);
+        let survives = graph.outputs.contains(&output)
+            || out_val.consumers.iter().any(|c| !matched_set.contains(c));
+        if !survives {
+            return None;
+        }
+
+        // Schema-order external inputs: [Q, K, V] (+ mask).
+        let mut external = vec![q, k, v];
+        if let Some(m) = mask {
+            external.push(m);
+        }
+
+        Some(AttnParts {
+            nodes,
+            q,
+            k,
+            v,
+            mask,
+            scale,
+            k_transposed,
+            output,
+            external_inputs: external,
+        })
+    }
+
+    /// Parse a score-scaling node into `(scores_value, scale_multiplier)`, or
+    /// `None` if it is not a `Mul`/`Div` by a **concrete scalar f32 constant**
+    /// whose other operand is produced by a `MatMul`. `Div(scores, c)` yields
+    /// `1/c` (declining `c == 0`); `Mul` yields `c`. The scores-must-be-a-MatMul
+    /// check is what disambiguates the scaled branch from the mask branch (a
+    /// mask precompute is often itself a `Mul`, but not of a MatMul output).
+    fn parse_scale(graph: &Graph, node_id: NodeId) -> Option<(ValueId, f32)> {
+        let n = graph.node(node_id);
+        if n.inputs.len() != 2 || n.outputs.len() != 1 {
+            return None;
+        }
+        let (scores_out, scale) = if Self::op_matches(n, "Div") {
+            let num = n.inputs[0]?;
+            let den = n.inputs[1]?;
+            let c = read_scalar_const_f32(graph, den)?;
+            if c == 0.0 {
+                return None;
+            }
+            (num, 1.0 / c)
+        } else if Self::op_matches(n, "Mul") {
+            let x = n.inputs[0]?;
+            let y = n.inputs[1]?;
+            match (
+                read_scalar_const_f32(graph, x),
+                read_scalar_const_f32(graph, y),
+            ) {
+                (None, Some(c)) => (x, c),
+                (Some(c), None) => (y, c),
+                // both const (fold elsewhere) or neither const → not a scale.
+                _ => return None,
+            }
+        } else {
+            return None;
+        };
+        // The scaled operand must be a MatMul output (the score product).
+        let prod = graph.value(scores_out).producer?;
+        if !Self::op_matches(graph.node(prod), "MatMul") {
+            return None;
+        }
+        Some((scores_out, scale))
+    }
+
+    /// Decide the fused node's `K` input and `k_transposed` flag. If `k_side`
+    /// (the score MatMul's second operand) is produced by a clean last-two-axis
+    /// `Transpose` consumed **only** by the score MatMul, absorb it: `K` becomes
+    /// the transpose's input in `[…, seq_k, head_dim]` layout and the kernel
+    /// transposes internally (`k_transposed = false`, transpose node removed).
+    /// Otherwise `K = k_side` is used as-is as an already-transposed Kᵀ
+    /// (`k_transposed = true`, nothing absorbed).
+    fn attention_k(
+        graph: &Graph,
+        k_side: ValueId,
+        score_mm_id: NodeId,
+    ) -> (ValueId, bool, Option<NodeId>) {
+        if let Some(t_id) = graph.value(k_side).producer {
+            let t = graph.node(t_id);
+            if Self::op_matches(t, "Transpose")
+                && t.inputs.len() == 1
+                && t.outputs.len() == 1
+                && t.outputs[0] == k_side
+                && graph.value(k_side).consumers.as_slice() == [score_mm_id]
+                && let Some(perm) = t.attr("perm").and_then(Attribute::as_ints)
+                && is_last2_swap_perm(perm)
+                && let Some(kin) = t.inputs[0]
+            {
+                return (kin, false, Some(t_id));
+            }
+        }
+        (k_side, true, None)
+    }
+
+    /// Extract the `[Q, K, V]` (+ optional `[mask]`) inputs and the
+    /// `scale`/`k_transposed` attributes for a matched SDPA core, or `None` to
+    /// decline. Re-parses from the anchor (`m.nodes[0]`, the Softmax) so the
+    /// spec is single-sourced with the matcher, and confirms the re-parse
+    /// covers exactly the same node set.
+    fn attention_spec(&self, graph: &Graph, m: &PatternMatch) -> Option<FusedNodeSpec> {
+        let start = *m.nodes.first()?;
+        let p = self.try_parse_attention(graph, start)?;
+        if p.nodes != m.nodes {
+            return None;
+        }
+        let mut inputs: Vec<Option<ValueId>> = vec![Some(p.q), Some(p.k), Some(p.v)];
+        if let Some(mask) = p.mask {
+            inputs.push(Some(mask));
+        }
+        let mut attributes = HashMap::new();
+        attributes.insert("scale".to_string(), Attribute::Float(p.scale));
+        attributes.insert(
+            "k_transposed".to_string(),
+            Attribute::Int(if p.k_transposed { 1 } else { 0 }),
+        );
+        Some((inputs, attributes))
+    }
+
     /// Attempt to grow a match whose first node is `start`.
     fn try_match_from(&self, graph: &Graph, start: NodeId) -> Option<PatternMatch> {
         let start_node = graph.try_node(start)?;
@@ -456,6 +764,7 @@ impl FusionPattern {
     fn match_is_fusable(&self, graph: &Graph, m: &PatternMatch) -> bool {
         match self.kind {
             RewriteKind::LayerNorm => self.layernorm_spec(graph, m).is_some(),
+            RewriteKind::Attention => self.attention_spec(graph, m).is_some(),
             RewriteKind::Structural => {
                 // The MatMul+Add → FusedMatMulBias and MatMul+Add+Relu →
                 // FusedGemm rewrites both need a bias broadcast guard (the
@@ -535,6 +844,9 @@ impl FusionPattern {
             ),
             RewriteKind::LayerNorm => self
                 .layernorm_spec(graph, m)
+                .ok_or_else(|| crate::error::OptimizerError::Fusion(self.name.clone()))?,
+            RewriteKind::Attention => self
+                .attention_spec(graph, m)
                 .ok_or_else(|| crate::error::OptimizerError::Fusion(self.name.clone()))?,
         };
 
@@ -677,6 +989,58 @@ fn read_scalar_f32(graph: &Graph, value: ValueId) -> Option<f32> {
     }
 }
 
+/// The parsed pieces of a matched SDPA core (see
+/// [`FusionPattern::try_parse_attention`]).
+#[derive(Clone, Debug)]
+struct AttnParts {
+    /// All matched node ids, canonical order (anchor first):
+    /// `[softmax, score_mm, scale_node, out_mm]` then optional `mask_add` and
+    /// optional absorbed `transpose`.
+    nodes: Vec<NodeId>,
+    q: ValueId,
+    k: ValueId,
+    v: ValueId,
+    mask: Option<ValueId>,
+    scale: f32,
+    k_transposed: bool,
+    output: ValueId,
+    external_inputs: Vec<ValueId>,
+}
+
+/// Read a **strict scalar** (exactly one element) inline f32 initializer, or
+/// `None`. Stricter than [`read_scalar_f32`]: the score scale must be a genuine
+/// scalar, so a multi-element initializer (whose first element we'd otherwise
+/// silently read) is declined.
+fn read_scalar_const_f32(graph: &Graph, value: ValueId) -> Option<f32> {
+    match graph.initializers.get(&value)? {
+        WeightRef::Inline(t) if t.dtype == DataType::Float32 => {
+            let numel: usize = t.dims.iter().product();
+            if numel != 1 || t.data.len() < 4 {
+                return None;
+            }
+            Some(f32::from_le_bytes(t.data[0..4].try_into().ok()?))
+        }
+        _ => None,
+    }
+}
+
+/// Whether `perm` is a clean "swap the last two axes" permutation
+/// (`[0, 1, …, r-3, r-1, r-2]`) for a rank-`perm.len()` tensor. Any other
+/// permutation (including one that also moves batch/head axes) is not a plain
+/// Kᵀ and is left un-absorbed.
+fn is_last2_swap_perm(perm: &[i64]) -> bool {
+    let r = perm.len();
+    if r < 2 {
+        return false;
+    }
+    for (i, &p) in perm.iter().enumerate().take(r - 2) {
+        if p != i as i64 {
+            return false;
+        }
+    }
+    perm[r - 2] == (r - 1) as i64 && perm[r - 1] == (r - 2) as i64
+}
+
 /// The default device-independent fusion patterns.
 ///
 /// Ordered most-specific-first so `MatMul+Add+Relu` is captured before the
@@ -684,6 +1048,10 @@ fn read_scalar_f32(graph: &Graph, value: ValueId) -> Option<f32> {
 /// and attention fusion (see [`AttentionFusionPass` in §13.2 of the design]).
 pub fn default_fusion_patterns() -> Vec<FusionPattern> {
     vec![
+        // Attention first: the SDPA core consumes plain MatMul/Softmax nodes, so
+        // recognize it before the MatMul+Add(+Relu) rewrites can claim any of
+        // its MatMuls.
+        FusionPattern::attention(),
         FusionPattern::new("MatMul+Bias+Relu", &["MatMul", "Add", "Relu"], "FusedGemm"),
         FusionPattern::layernorm(),
         FusionPattern::new("MatMul+Bias", &["MatMul", "Add"], "FusedMatMulBias"),
@@ -1342,5 +1710,284 @@ mod tests {
         assert_eq!(g.num_nodes(), 2, "unknown matmul shape must NOT fuse");
         assert!(g.nodes.values().all(|n| n.op_type != "FusedMatMulBias"));
         assert!(g.validate().is_ok());
+    }
+
+    #[test]
+    fn declines_fused_gemm_when_bias_expands() {
+        // Roy's FusedGemm review advisory, locked in: a MatMul+Add+Relu whose
+        // bias EXPANDS the matmul output (extra leading/batch dim) must DECLINE
+        // to FusedGemm exactly like the FusedMatMulBias case — the trailing Relu
+        // is shape-neutral, so the same non-expanding-bias guard applies. MatMul
+        // output is [4]; bias [2, 4] would broadcast the result up to [2, 4].
+        let mut g = Graph::new();
+        g.opset_imports.insert(String::new(), 17);
+        let a = g.create_named_value("a", DataType::Float32, static_shape([4, 4]));
+        let w = g.create_named_value("w", DataType::Float32, static_shape([4]));
+        let bias = g.create_named_value("bias", DataType::Float32, static_shape([2, 4]));
+        g.add_input(a);
+        g.add_input(w);
+        g.add_input(bias);
+        let m = g.create_named_value("m", DataType::Float32, static_shape([4]));
+        g.insert_node(Node::new(NodeId(0), "MatMul", vec![Some(a), Some(w)], vec![m]));
+        let biased = g.create_named_value("biased", DataType::Float32, static_shape([2, 4]));
+        g.insert_node(Node::new(NodeId(0), "Add", vec![Some(m), Some(bias)], vec![biased]));
+        let out = g.create_named_value("out", DataType::Float32, static_shape([2, 4]));
+        g.insert_node(Node::new(NodeId(0), "Relu", vec![Some(biased)], vec![out]));
+        g.add_output(out);
+
+        assert_eq!(g.num_nodes(), 3);
+        OpFusion::new().run(&mut g, &PassContext::new()).unwrap();
+        assert_eq!(g.num_nodes(), 3, "expanding bias must NOT fuse to FusedGemm");
+        assert!(g.nodes.values().any(|n| n.op_type == "MatMul"));
+        assert!(g.nodes.values().any(|n| n.op_type == "Add"));
+        assert!(g.nodes.values().any(|n| n.op_type == "Relu"));
+        assert!(g.nodes.values().all(|n| n.op_type != "FusedGemm"));
+        assert!(g.validate().is_ok());
+    }
+
+    // --- AttentionFusion (SDPA core) ------------------------------------------
+
+    /// Add a strict-scalar f32 initializer, returning its value id.
+    fn scalar_init(g: &mut Graph, name: &str, v: f32) -> ValueId {
+        let vid = g.create_named_value(name, DataType::Float32, Vec::new());
+        g.set_initializer(
+            vid,
+            WeightRef::Inline(TensorData::from_raw(
+                DataType::Float32,
+                vec![],
+                v.to_le_bytes().to_vec(),
+            )),
+        );
+        vid
+    }
+
+    fn fval(g: &mut Graph, name: &str, dims: &[usize]) -> ValueId {
+        g.create_named_value(name, DataType::Float32, static_shape(dims.iter().copied()))
+    }
+
+    /// Look up a value id by name (test convenience).
+    fn value_id(g: &Graph, name: &str) -> ValueId {
+        g.values
+            .iter()
+            .find(|(_, v)| v.name.as_deref() == Some(name))
+            .map(|(id, _)| id)
+            .unwrap_or_else(|| panic!("no value named {name}"))
+    }
+
+    /// Build an SDPA core graph `Softmax((Q·Kᵀ)/c [+ mask], axis=-1) · V` with
+    /// rank-4 `[1, 2, seq, dim]` tensors, K supplied pre-transposed as
+    /// `[1, 2, d, sk]` (so `k_transposed` should resolve to 1). `masked` adds an
+    /// additive mask; `axis` is the Softmax reduction axis.
+    fn sdpa_graph(masked: bool, axis: i64) -> Graph {
+        let mut g = Graph::new();
+        g.opset_imports.insert(String::new(), 12);
+        let q = fval(&mut g, "Q", &[1, 2, 3, 4]);
+        let kt = fval(&mut g, "K", &[1, 2, 4, 3]); // pre-transposed [d=4, sk=3]
+        let v = fval(&mut g, "V", &[1, 2, 3, 4]);
+        g.add_input(q);
+        g.add_input(kt);
+        g.add_input(v);
+        let c = scalar_init(&mut g, "scale_c", 2.0);
+
+        let scores = fval(&mut g, "scores", &[1, 2, 3, 3]);
+        g.insert_node(Node::new(NodeId(0), "MatMul", vec![Some(q), Some(kt)], vec![scores]));
+        let scaled = fval(&mut g, "scaled", &[1, 2, 3, 3]);
+        g.insert_node(Node::new(NodeId(0), "Div", vec![Some(scores), Some(c)], vec![scaled]));
+
+        let sm_in = if masked {
+            let mask = fval(&mut g, "mask", &[1, 1, 3, 3]);
+            g.add_input(mask);
+            let masked_v = fval(&mut g, "masked", &[1, 2, 3, 3]);
+            g.insert_node(Node::new(
+                NodeId(0),
+                "Add",
+                vec![Some(scaled), Some(mask)],
+                vec![masked_v],
+            ));
+            masked_v
+        } else {
+            scaled
+        };
+
+        let probs = fval(&mut g, "probs", &[1, 2, 3, 3]);
+        let mut sm = Node::new(NodeId(0), "Softmax", vec![Some(sm_in)], vec![probs]);
+        sm.attributes.insert("axis".into(), Attribute::Int(axis));
+        g.insert_node(sm);
+        let out = fval(&mut g, "out", &[1, 2, 3, 4]);
+        g.insert_node(Node::new(NodeId(0), "MatMul", vec![Some(probs), Some(v)], vec![out]));
+        g.add_output(out);
+        g
+    }
+
+    fn fused_attention_node(g: &Graph) -> Option<&Node> {
+        g.nodes.values().find(|n| n.op_type == "FusedAttention")
+    }
+
+    #[test]
+    fn fuses_sdpa_unmasked_pretransposed_k() {
+        let mut g = sdpa_graph(false, 3);
+        let q = value_id(&g, "Q");
+        let k = value_id(&g, "K");
+        let v = value_id(&g, "V");
+        OpFusion::new().run(&mut g, &PassContext::new()).unwrap();
+
+        // Exactly one FusedAttention; no surviving Softmax/MatMul/Div.
+        assert_eq!(
+            g.nodes.values().filter(|n| n.op_type == "FusedAttention").count(),
+            1
+        );
+        assert!(g.nodes.values().all(|n| n.op_type != "Softmax"));
+        assert!(g.nodes.values().all(|n| n.op_type != "MatMul"));
+        assert!(g.nodes.values().all(|n| n.op_type != "Div"));
+
+        let fa = fused_attention_node(&g).unwrap();
+        assert_eq!(fa.domain, CONTRIB_DOMAIN);
+        assert_eq!(fa.inputs, vec![Some(q), Some(k), Some(v)]);
+        // scale = 1/c = 1/2 = 0.5; K used as-is → k_transposed = 1.
+        assert_eq!(fa.attr("scale").and_then(Attribute::as_float), Some(0.5));
+        assert_eq!(fa.attr("k_transposed").and_then(Attribute::as_int), Some(1));
+        assert!(g.validate().is_ok());
+    }
+
+    #[test]
+    fn fuses_sdpa_masked() {
+        let mut g = sdpa_graph(true, 3);
+        let (q, k, v, mask) = (
+            value_id(&g, "Q"),
+            value_id(&g, "K"),
+            value_id(&g, "V"),
+            value_id(&g, "mask"),
+        );
+        OpFusion::new().run(&mut g, &PassContext::new()).unwrap();
+
+        assert_eq!(
+            g.nodes.values().filter(|n| n.op_type == "FusedAttention").count(),
+            1
+        );
+        assert!(g.nodes.values().all(|n| n.op_type != "Softmax"));
+        assert!(g.nodes.values().all(|n| n.op_type != "Add"));
+        let fa = fused_attention_node(&g).unwrap();
+        // Mask appended as the 4th input.
+        assert_eq!(fa.inputs, vec![Some(q), Some(k), Some(v), Some(mask)]);
+        assert_eq!(fa.attr("k_transposed").and_then(Attribute::as_int), Some(1));
+        assert!(g.validate().is_ok());
+    }
+
+    #[test]
+    fn fuses_sdpa_absorbing_clean_transpose_sets_k_transposed_0() {
+        // K is supplied in natural [1,2,3,4] layout and transposed to Kᵀ by a
+        // clean last-two-axis Transpose (perm [0,1,3,2]) consumed only by the
+        // score MatMul. The matcher absorbs it: K input becomes the natural K
+        // and k_transposed = 0 (kernel transposes internally).
+        let mut g = Graph::new();
+        g.opset_imports.insert(String::new(), 12);
+        let q = fval(&mut g, "Q", &[1, 2, 3, 4]);
+        let k = fval(&mut g, "K", &[1, 2, 3, 4]); // natural [sk=3, d=4]
+        let v = fval(&mut g, "V", &[1, 2, 3, 4]);
+        g.add_input(q);
+        g.add_input(k);
+        g.add_input(v);
+        let c = scalar_init(&mut g, "scale_c", 4.0);
+
+        let kt = fval(&mut g, "Kt", &[1, 2, 4, 3]);
+        let mut tr = Node::new(NodeId(0), "Transpose", vec![Some(k)], vec![kt]);
+        tr.attributes.insert("perm".into(), Attribute::Ints(vec![0, 1, 3, 2]));
+        g.insert_node(tr);
+        let scores = fval(&mut g, "scores", &[1, 2, 3, 3]);
+        g.insert_node(Node::new(NodeId(0), "MatMul", vec![Some(q), Some(kt)], vec![scores]));
+        let scaled = fval(&mut g, "scaled", &[1, 2, 3, 3]);
+        g.insert_node(Node::new(NodeId(0), "Div", vec![Some(scores), Some(c)], vec![scaled]));
+        let probs = fval(&mut g, "probs", &[1, 2, 3, 3]);
+        let mut sm = Node::new(NodeId(0), "Softmax", vec![Some(scaled)], vec![probs]);
+        sm.attributes.insert("axis".into(), Attribute::Int(-1));
+        g.insert_node(sm);
+        let out = fval(&mut g, "out", &[1, 2, 3, 4]);
+        g.insert_node(Node::new(NodeId(0), "MatMul", vec![Some(probs), Some(v)], vec![out]));
+        g.add_output(out);
+
+        OpFusion::new().run(&mut g, &PassContext::new()).unwrap();
+        assert!(g.nodes.values().all(|n| n.op_type != "Transpose"), "clean Kᵀ Transpose absorbed");
+        let fa = fused_attention_node(&g).unwrap();
+        assert_eq!(fa.inputs, vec![Some(q), Some(k), Some(v)], "K input is the natural (un-transposed) K");
+        assert_eq!(fa.attr("k_transposed").and_then(Attribute::as_int), Some(0));
+        // scale = 1/4 = 0.25.
+        assert_eq!(fa.attr("scale").and_then(Attribute::as_float), Some(0.25));
+        assert!(g.validate().is_ok());
+    }
+
+    #[test]
+    fn declines_sdpa_when_softmax_axis_not_last() {
+        // axis 1 on a rank-4 score tensor is not the last axis → decline.
+        let mut g = sdpa_graph(false, 1);
+        let before = g.num_nodes();
+        OpFusion::new().run(&mut g, &PassContext::new()).unwrap();
+        assert!(g.nodes.values().all(|n| n.op_type != "FusedAttention"));
+        assert!(g.nodes.values().any(|n| n.op_type == "Softmax"));
+        assert_eq!(g.num_nodes(), before, "no fusion when axis is not last");
+    }
+
+    #[test]
+    fn declines_sdpa_when_scale_is_not_scalar_constant() {
+        // The score-scaling divisor is a runtime graph input (not a constant),
+        // so the scale can't be folded to a concrete f32 → decline.
+        let mut g = Graph::new();
+        g.opset_imports.insert(String::new(), 12);
+        let q = fval(&mut g, "Q", &[1, 2, 3, 4]);
+        let kt = fval(&mut g, "K", &[1, 2, 4, 3]);
+        let v = fval(&mut g, "V", &[1, 2, 3, 4]);
+        let c = fval(&mut g, "scale_c", &[]); // runtime input, NOT an initializer
+        g.add_input(q);
+        g.add_input(kt);
+        g.add_input(v);
+        g.add_input(c);
+        let scores = fval(&mut g, "scores", &[1, 2, 3, 3]);
+        g.insert_node(Node::new(NodeId(0), "MatMul", vec![Some(q), Some(kt)], vec![scores]));
+        let scaled = fval(&mut g, "scaled", &[1, 2, 3, 3]);
+        g.insert_node(Node::new(NodeId(0), "Div", vec![Some(scores), Some(c)], vec![scaled]));
+        let probs = fval(&mut g, "probs", &[1, 2, 3, 3]);
+        let mut sm = Node::new(NodeId(0), "Softmax", vec![Some(scaled)], vec![probs]);
+        sm.attributes.insert("axis".into(), Attribute::Int(3));
+        g.insert_node(sm);
+        let out = fval(&mut g, "out", &[1, 2, 3, 4]);
+        g.insert_node(Node::new(NodeId(0), "MatMul", vec![Some(probs), Some(v)], vec![out]));
+        g.add_output(out);
+
+        let before = g.num_nodes();
+        OpFusion::new().run(&mut g, &PassContext::new()).unwrap();
+        assert!(g.nodes.values().all(|n| n.op_type != "FusedAttention"));
+        assert_eq!(g.num_nodes(), before, "non-constant scale must NOT fuse");
+    }
+
+    #[test]
+    fn declines_sdpa_when_softmax_is_right_operand_of_output_matmul() {
+        // out = V · probs (softmax output is the RIGHT operand) is not `probs·V`
+        // SDPA — the matcher requires the softmax output be the LEFT operand.
+        let mut g = Graph::new();
+        g.opset_imports.insert(String::new(), 12);
+        let q = fval(&mut g, "Q", &[1, 2, 3, 4]);
+        let kt = fval(&mut g, "K", &[1, 2, 4, 3]);
+        let v = fval(&mut g, "V", &[1, 2, 3, 3]);
+        g.add_input(q);
+        g.add_input(kt);
+        g.add_input(v);
+        let c = scalar_init(&mut g, "scale_c", 2.0);
+        let scores = fval(&mut g, "scores", &[1, 2, 3, 3]);
+        g.insert_node(Node::new(NodeId(0), "MatMul", vec![Some(q), Some(kt)], vec![scores]));
+        let scaled = fval(&mut g, "scaled", &[1, 2, 3, 3]);
+        g.insert_node(Node::new(NodeId(0), "Div", vec![Some(scores), Some(c)], vec![scaled]));
+        let probs = fval(&mut g, "probs", &[1, 2, 3, 3]);
+        let mut sm = Node::new(NodeId(0), "Softmax", vec![Some(scaled)], vec![probs]);
+        sm.attributes.insert("axis".into(), Attribute::Int(3));
+        g.insert_node(sm);
+        let out = fval(&mut g, "out", &[1, 2, 3, 3]);
+        // Reversed operand order: V · probs.
+        g.insert_node(Node::new(NodeId(0), "MatMul", vec![Some(v), Some(probs)], vec![out]));
+        g.add_output(out);
+
+        let before = g.num_nodes();
+        OpFusion::new().run(&mut g, &PassContext::new()).unwrap();
+        assert!(g.nodes.values().all(|n| n.op_type != "FusedAttention"));
+        assert!(g.nodes.values().any(|n| n.op_type == "Softmax"));
+        assert_eq!(g.num_nodes(), before);
     }
 }

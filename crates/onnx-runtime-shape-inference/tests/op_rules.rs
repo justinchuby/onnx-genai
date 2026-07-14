@@ -288,6 +288,70 @@ fn fused_gemm_batched_symbolic_shape() {
 }
 
 #[test]
+fn fused_attention_pretransposed_k_concrete() {
+    // com.microsoft::FusedAttention with k_transposed=1: K is already
+    // [batch, heads, head_dim, seq_k]. Output == MatMul(probs, V) shape =
+    // Q's leading dims + [seq_q, head_dim_v].
+    // Q [2,4,3,8], K^T [2,4,8,5], V [2,4,5,16] -> out [2,4,3,16].
+    let n = with_attr(
+        with_domain(node("FusedAttention", 3, 1), "com.microsoft"),
+        "k_transposed",
+        Attribute::Int(1),
+    );
+    let outs = run(
+        &n,
+        vec![
+            f32in(vec![c(2), c(4), c(3), c(8)]),
+            f32in(vec![c(2), c(4), c(8), c(5)]),
+            f32in(vec![c(2), c(4), c(5), c(16)]),
+        ],
+        1,
+    );
+    assert_eq!(out_shape(&outs), vec![c(2), c(4), c(3), c(16)]);
+    assert_eq!(out_dtype(&outs), DataType::Float32);
+}
+
+#[test]
+fn fused_attention_internal_transpose_k_concrete() {
+    // k_transposed unset/0: K is [batch, heads, seq_k, head_dim] and the rule
+    // transposes its last two dims to form Kᵀ before the score MatMul.
+    // Q [2,4,3,8], K [2,4,5,8], V [2,4,5,16] -> out [2,4,3,16].
+    let n = with_domain(node("FusedAttention", 3, 1), "com.microsoft");
+    let outs = run(
+        &n,
+        vec![
+            f32in(vec![c(2), c(4), c(3), c(8)]),
+            f32in(vec![c(2), c(4), c(5), c(8)]),
+            f32in(vec![c(2), c(4), c(5), c(16)]),
+        ],
+        1,
+    );
+    assert_eq!(out_shape(&outs), vec![c(2), c(4), c(3), c(16)]);
+}
+
+#[test]
+fn fused_attention_symbolic_batch_and_mask() {
+    // Symbolic batch carries through; the optional 4th (mask) input is
+    // shape-neutral. Q [B,4,S,8], K^T [B,4,8,S], V [B,4,S,8] -> out [B,4,S,8].
+    let n = with_attr(
+        with_domain(node("FusedAttention", 4, 1), "com.microsoft"),
+        "k_transposed",
+        Attribute::Int(1),
+    );
+    let outs = run(
+        &n,
+        vec![
+            f32in(vec![sym(1), c(4), sym(2), c(8)]),
+            f32in(vec![sym(1), c(4), c(8), sym(2)]),
+            f32in(vec![sym(1), c(4), sym(2), c(8)]),
+            f32in(vec![sym(1), c(1), c(1), sym(2)]),
+        ],
+        1,
+    );
+    assert_eq!(out_shape(&outs), vec![sym(1), c(4), sym(2), c(8)]);
+}
+
+#[test]
 fn add_broadcast_concrete() {
     let n = node("Add", 2, 1);
     let outs = run(

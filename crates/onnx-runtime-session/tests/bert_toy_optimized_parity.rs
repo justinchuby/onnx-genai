@@ -18,8 +18,9 @@
 //! * `"all"` — the full device-independent pipeline, which additionally runs
 //!   operator **fusion**. On this model fusion collapses each LayerNorm
 //!   decomposition into a single schema-conformant
-//!   `com.microsoft::LayerNormalization` and every MatMul+Add into
-//!   `com.microsoft::FusedMatMulBias`, both backed by CPU kernels, so the fused
+//!   `com.microsoft::LayerNormalization`, every MatMul+Add into
+//!   `com.microsoft::FusedMatMulBias`, and each self-attention SDPA core into a
+//!   `com.microsoft::FusedAttention`, all backed by CPU kernels, so the fused
 //!   graph runs end-to-end and matches the reference. See
 //!   `full_optimization_fusion_path_matches_reference_and_default` (numerics)
 //!   and `full_optimization_actually_fuses_layernorm_and_matmul_bias` (proof the
@@ -178,9 +179,10 @@ fn full_optimization_fusion_path_matches_reference_and_default() {
     const ATOL: f32 = 2e-3;
     const RTOL: f32 = 2e-3;
     // The vs-opt-off DRIFT ceiling is independent of (and far tighter than) the
-    // vs-reference conformance tolerance. LayerNorm fusion perturbs numerics by
-    // only a few ULPs (actual drift ~1.4e-7), so bound it at 1e-5 — tight enough
-    // to catch a subtle future numeric regression, with comfortable headroom.
+    // vs-reference conformance tolerance. LayerNorm AND the new SDPA/attention
+    // fusion each perturb numerics by only a few ULPs (actual combined drift
+    // ~1.4e-7), so bound it at 1e-5 — tight enough to catch a subtle future
+    // numeric regression, with comfortable headroom.
     const DRIFT_ATOL: f32 = 1e-5;
 
     let opt_off = run_bert(None).expect("build+run with optimization off");
@@ -231,11 +233,11 @@ fn full_optimization_fusion_path_matches_reference_and_default() {
         overall_ref < ATOL,
         "opt=all must match the reference within atol={ATOL:.0e} (got {overall_ref:.3e})"
     );
-    // LayerNorm fusion changes numerics by only a few ULPs, so opt=all stays
-    // extremely close to opt-off — but is NOT byte-identical (the fused kernel
-    // reduces differently). Bound the drift tightly (1e-5, ~2 orders above the
-    // observed ~1.4e-7) so a subtle future numeric regression is caught, without
-    // loosening the vs-reference conformance tolerance.
+    // LayerNorm and SDPA/attention fusion change numerics by only a few ULPs, so
+    // opt=all stays extremely close to opt-off — but is NOT byte-identical (the
+    // fused kernels reduce differently). Bound the drift tightly (1e-5, ~2 orders
+    // above the observed ~1.4e-7) so a subtle future numeric regression is
+    // caught, without loosening the vs-reference conformance tolerance.
     assert!(
         overall_vs_off < DRIFT_ATOL,
         "opt=all must stay within drift atol={DRIFT_ATOL:.0e} of opt-off (got {overall_vs_off:.3e})"
@@ -285,9 +287,10 @@ fn full_optimization_actually_fuses_layernorm_and_matmul_bias() {
 
     let ln_after = count(&graph, "LayerNormalization");
     let mm_after = count(&graph, "FusedMatMulBias");
+    let attn_after = count(&graph, "FusedAttention");
     eprintln!(
         "bert_toy fusion counts: LayerNormalization={ln_after} (expected {expected_layernorms}), \
-         FusedMatMulBias={mm_after}"
+         FusedMatMulBias={mm_after}, FusedAttention={attn_after}"
     );
 
     // Every LayerNorm region fused, leaving no stray ReduceMean behind.
@@ -304,5 +307,18 @@ fn full_optimization_actually_fuses_layernorm_and_matmul_bias() {
     assert_eq!(
         mm_after, 32,
         "MatMul+Add → FusedMatMulBias must stay at 32 fusions"
+    );
+
+    // Each of the 5 self-attention blocks' SDPA core (QKᵀ·scale + mask →
+    // Softmax → ·V) fuses into one com.microsoft::FusedAttention, leaving no
+    // standalone Softmax behind.
+    assert_eq!(
+        attn_after, 5,
+        "every SDPA core must fuse to one FusedAttention (bert_toy has 5)"
+    );
+    assert_eq!(
+        count(&graph, "Softmax"),
+        0,
+        "no Softmax should survive: all belonged to fused attention cores"
     );
 }

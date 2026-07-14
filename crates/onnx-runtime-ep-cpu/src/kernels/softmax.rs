@@ -65,7 +65,18 @@ impl KernelFactory for SoftmaxLegacyFactory {
 /// stride-`inner` interleaving: element `a` of slice `(o, i)` lives at
 /// `o·axis_dim·inner + a·inner + i`. With `inner == 1` this is a plain
 /// row-major softmax; with `inner > 1` it reduces along an interior axis.
-fn softmax_slices(x: &[f32], out: &mut [f32], outer: usize, axis_dim: usize, inner: usize) {
+///
+/// Shared with the `FusedAttention` kernel (`kernels::fused_attention`), which
+/// softmaxes the last axis of the scaled/masked scores as its middle stage —
+/// reusing this single numerically-stable implementation instead of duplicating
+/// the max-subtract/exp/normalize loop.
+pub(crate) fn softmax_slices(
+    x: &[f32],
+    out: &mut [f32],
+    outer: usize,
+    axis_dim: usize,
+    inner: usize,
+) {
     for o in 0..outer {
         for i in 0..inner {
             let base = o * axis_dim * inner + i;
