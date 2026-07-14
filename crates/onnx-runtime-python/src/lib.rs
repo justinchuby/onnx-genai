@@ -54,10 +54,10 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// the crate is compiled with the `cuda` feature (so the list never advertises a
 /// provider the wheel cannot honor — `RULES.md` §2/§5).
 fn available_providers() -> Vec<&'static str> {
-    let mut v = Vec::new();
     #[cfg(feature = "cuda")]
-    v.push("CUDAExecutionProvider");
-    v.push("CPUExecutionProvider");
+    let v = vec!["CUDAExecutionProvider", "CPUExecutionProvider"];
+    #[cfg(not(feature = "cuda"))]
+    let v = vec!["CPUExecutionProvider"];
     v
 }
 

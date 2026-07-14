@@ -141,6 +141,9 @@ maturin develop
 pytest crates/onnx-runtime-python/tests/ -q
 ```
 
+24 tests pass standalone (offline); the conformance suite (~10 property-based op
+tests) additionally runs when `onnx-tests` is installed, for 34 total.
+
 Full-matrix conformance over the entire ONNX opset is the documented scale-up
 step (`RUN_CANDIDATE=nxrt_runtime.run_nxrt` over the whole `onnx-tests/tests`
 tree), gated on the CPU EP's op coverage growing.
