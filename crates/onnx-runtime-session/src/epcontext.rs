@@ -216,8 +216,9 @@ pub struct CompiledPartition<'a> {
 /// the neutral partition views to the loader-owned writer
 /// ([`onnx_runtime_loader::dump_ep_context`]). Returns the written model path.
 ///
-/// The caller gates on [`EpContextDumpConfig::enable`]; this function performs
-/// the dump whenever it is called.
+/// If [`EpContextDumpConfig::enable`] is `false` this is a no-op: it does **not**
+/// call any EP's `save_context`, writes no files, and returns the path it *would*
+/// have written to — so a disabled config has no side effects by construction.
 ///
 /// # Errors
 ///
@@ -232,6 +233,13 @@ pub fn dump_session_ep_context(
     partitions: &[CompiledPartition],
     config: &EpContextDumpConfig,
 ) -> Result<PathBuf> {
+    // Honour `ep.context_enable` before any side effect (no `save_context`, no
+    // I/O): a disabled config is a no-op. Delegate the would-be path to the
+    // loader so both drivers agree on the default `<stem>_ctx.onnx` location.
+    if !config.enable {
+        return Ok(dump_ep_context(model, orig_path, &[], config)?);
+    }
+
     // Materialise each EP's runtime context first so the loader partition views
     // can borrow its bytes / version for the duration of the dump.
     struct Owned {

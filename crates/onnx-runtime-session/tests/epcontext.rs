@@ -575,7 +575,7 @@ fn dump_external_round_trip_via_sidecar_bin() {
     assert_eq!(out, dir.join("net_ctx.onnx"));
 
     // A sidecar `.bin` holding the blob was written next to the ctx model.
-    let sidecar = dir.join("net_ctx_MOCK_part0.bin");
+    let sidecar = dir.join("net_ctx_p0_MOCK_part0.bin");
     assert!(sidecar.exists(), "external sidecar written next to ctx model");
     assert_eq!(std::fs::read(&sidecar).unwrap(), payload, "sidecar holds the blob");
 
@@ -617,4 +617,36 @@ fn dump_honours_explicit_output_path() {
     let out = dump_session_ep_context(&model, &orig, &parts, &config).expect("dump");
     assert_eq!(out, explicit);
     assert!(explicit.exists());
+}
+
+/// A1 regression: a disabled config (`enable = false`) is a no-op at the session
+/// driver level too — no ctx model is written and no EP `save_context` side
+/// effect occurs. The returned path is the would-be location but nothing exists.
+#[test]
+fn dump_disabled_config_is_a_no_op() {
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("epctx_dump_disabled");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let orig = dir.join("mymodel.onnx");
+    let payload = compiled_blob();
+
+    let (g, covered) = build_partition_graph();
+    let ep = MockCompiledEp::compiling(&payload, "7.7.7");
+    let model = Model::new(&g);
+    let config = EpContextDumpConfig {
+        enable: false,
+        file_path: None,
+        embed_mode: 0,
+    };
+    let parts = [CompiledPartition {
+        ep: &ep,
+        partition_name: "part0".to_string(),
+        covered_nodes: covered,
+    }];
+
+    let out = dump_session_ep_context(&model, &orig, &parts, &config).expect("dump");
+    assert_eq!(out, dir.join("mymodel_ctx.onnx"), "returns the would-be path");
+    assert!(!out.exists(), "disabled config writes no ctx model");
+    let entries: Vec<_> = std::fs::read_dir(&dir).unwrap().collect();
+    assert!(entries.is_empty(), "disabled config writes no files at all");
 }

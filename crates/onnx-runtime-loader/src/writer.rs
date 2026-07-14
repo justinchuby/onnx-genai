@@ -46,9 +46,9 @@ use crate::LoaderError;
 /// and tested standalone.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EpContextDumpConfig {
-    /// `ep.context_enable` — whether to dump a context-cache model at all. The
-    /// caller gates on this; [`dump_ep_context`] itself performs the dump
-    /// unconditionally when invoked.
+    /// `ep.context_enable` — whether to dump a context-cache model at all. When
+    /// `false`, [`dump_ep_context`] is a no-op: it writes no sidecars and no ctx
+    /// model, so a disabled config is safe by construction.
     pub enable: bool,
     /// `ep.context_file_path` — the output model path. `None` defaults to
     /// `<orig_stem>_ctx.onnx` beside the source model.
@@ -113,12 +113,22 @@ pub struct EpContextPartition<'a> {
 /// * The output path is `config.file_path` if set, else `<orig_stem>_ctx.onnx`
 ///   beside `orig_path`.
 /// * For `embed_mode = 0` each partition's blob is written to a sidecar
-///   `<ctx_stem>_<source>_<partition>.bin` **next to the output model** and the
-///   node stores that filename as a **relative** path (resolved back relative to
-///   the model dir by the §55.3 load path).
+///   `<ctx_stem>_p{index}_<source>_<partition>.bin` **next to the output model**
+///   and the node stores that filename as a **relative** path (resolved back
+///   relative to the model dir by the §55.3 load path). The partition **index**
+///   makes the filename injective: two partitions with different identities can
+///   never alias the same file even when their sanitised components collide.
 ///
-/// The caller gates on [`EpContextDumpConfig::enable`]; this function performs
-/// the dump whenever it is called.
+/// # Errors
+///
+/// Beyond the loader I/O / encoding errors, this returns
+/// [`LoaderError::EpContext`] if two partitions share the **same** `source`
+/// **and** `partition_name` (an ambiguous request), or if a partition has no
+/// covered nodes.
+///
+/// If [`EpContextDumpConfig::enable`] is `false` this writes **nothing** (no
+/// sidecars, no ctx model) and returns the path it *would* have written to, so a
+/// disabled config is a no-op by construction.
 pub fn dump_ep_context(
     model: &Model,
     orig_path: &Path,
@@ -126,6 +136,29 @@ pub fn dump_ep_context(
     config: &EpContextDumpConfig,
 ) -> Result<PathBuf, LoaderError> {
     let out_path = resolve_output_path(orig_path, config);
+
+    // Honour `ep.context_enable`: a disabled config produces no files and no ctx
+    // model. Return early *before* any side effect so the dump is safe by
+    // construction regardless of how the caller gates.
+    if !config.enable {
+        return Ok(out_path);
+    }
+
+    // Reject an ambiguous request: the same (source, partition_name) identity
+    // appearing twice cannot be disambiguated on reload (both nodes would carry
+    // identical dispatch keys), so fail loudly rather than silently alias.
+    let mut identities: HashSet<(&str, &str)> = HashSet::with_capacity(partitions.len());
+    for part in partitions {
+        if !identities.insert((part.source, part.partition_name)) {
+            return Err(LoaderError::EpContext(format!(
+                "EPContext dump: duplicate partition identity (source {:?}, \
+                 partition_name {:?}) — distinct partitions must have distinct \
+                 (source, partition_name) keys",
+                part.source, part.partition_name
+            )));
+        }
+    }
+
     let out_dir = out_path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -142,8 +175,8 @@ pub fn dump_ep_context(
         .entry(MS_DOMAIN.to_string())
         .or_insert(1);
 
-    for part in partitions {
-        splice_partition(&mut graph, &out_dir, &out_path, config, part)?;
+    for (index, part) in partitions.iter().enumerate() {
+        splice_partition(&mut graph, &out_dir, &out_path, config, index, part)?;
     }
 
     let out_model = Model {
@@ -166,6 +199,7 @@ fn splice_partition(
     out_dir: &Path,
     out_path: &Path,
     config: &EpContextDumpConfig,
+    index: usize,
     part: &EpContextPartition,
 ) -> Result<(), LoaderError> {
     let covered: HashSet<NodeId> = part.covered_nodes.iter().copied().collect();
@@ -179,7 +213,7 @@ fn splice_partition(
     // Build the ep_cache_context payload (inline bytes or a relative sidecar
     // path), writing the external `.bin` next to the output model when needed.
     let ep_cache_context = if config.is_external() {
-        let rel = sidecar_filename(out_path, part.source, part.partition_name);
+        let rel = sidecar_filename(out_path, index, part.source, part.partition_name);
         let sidecar = out_dir.join(&rel);
         std::fs::write(&sidecar, part.blob).map_err(|source| LoaderError::Io {
             path: sidecar,
@@ -241,6 +275,17 @@ fn splice_partition(
 ///
 /// Both are deduped preserving first-seen order, iterating covered nodes in
 /// ascending [`NodeId`] for deterministic output.
+///
+/// # Boundary-ordering ABI (compiler-integration seam)
+///
+/// The variadic input/output order of the emitted EPContext node is reconstructed
+/// here purely from **ascending `NodeId`** over the covered set. This is
+/// deterministic and correct for the current caller, but node-id order is **not**
+/// an explicit, versioned ABI — a future compiler that emits its own canonical
+/// boundary ordering (or relies on a specific i/o slot layout) must not silently
+/// assume this ordering. If/when compiler integration lands, make the intended
+/// boundary order an explicit contract between the partitioner and this seam
+/// rather than depending on `NodeId` allocation order.
 fn partition_boundary(
     graph: &Graph,
     covered: &HashSet<NodeId>,
@@ -303,10 +348,18 @@ fn resolve_output_path(orig_path: &Path, config: &EpContextDumpConfig) -> PathBu
 }
 
 /// Sidecar `.bin` filename for an external blob (§55.4):
-/// `<ctx_stem>_<source>_<partition>.bin`, with `source`/`partition` sanitised to
-/// filesystem-safe characters. Returned as a bare filename (relative to the
-/// model dir, per the §55.3 external-path policy).
-fn sidecar_filename(out_path: &Path, source: &str, partition: &str) -> String {
+/// `<ctx_stem>_p{index}_<source>_<partition>.bin`, with `source`/`partition`
+/// sanitised to filesystem-safe characters. Returned as a bare filename
+/// (relative to the model dir, per the §55.3 external-path policy).
+///
+/// The `index` (the partition's position within this dump call) is an
+/// **injective** disambiguator: [`sanitize_component`] is non-injective (it maps
+/// every disallowed char to `_`), so two partitions with different identities —
+/// e.g. sources `Vendor/EP` and `Vendor_EP` — sanitise to the same components
+/// and would otherwise collide onto one file, silently overwriting each other's
+/// blob. Prefixing the distinct partition index guarantees a distinct filename
+/// per partition, so every EPContext node stores the path of *its own* blob.
+fn sidecar_filename(out_path: &Path, index: usize, source: &str, partition: &str) -> String {
     let stem = out_path
         .file_stem()
         .and_then(|s| s.to_str())
@@ -314,9 +367,9 @@ fn sidecar_filename(out_path: &Path, source: &str, partition: &str) -> String {
     let src = sanitize_component(source);
     let part = sanitize_component(partition);
     if part.is_empty() {
-        format!("{stem}_{src}.bin")
+        format!("{stem}_p{index}_{src}.bin")
     } else {
-        format!("{stem}_{src}_{part}.bin")
+        format!("{stem}_p{index}_{src}_{part}.bin")
     }
 }
 

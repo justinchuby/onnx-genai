@@ -110,7 +110,7 @@ fn external_dump_writes_sidecar_and_round_trips() {
     };
 
     let out = onnx_runtime_loader::dump_ep_context(&model, &orig, &[part], &config).expect("dump");
-    let sidecar = dir.join("m_ctx_Vendor_EP_p1.bin");
+    let sidecar = dir.join("m_ctx_p0_Vendor_EP_p1.bin");
     assert!(sidecar.exists(), "sanitised sidecar written next to ctx model");
     assert_eq!(std::fs::read(&sidecar).unwrap(), payload);
 
@@ -186,4 +186,237 @@ fn multiple_partitions_each_become_one_node() {
     assert_eq!(blobs[0], b0);
     assert_eq!(nodes[1].source, Some("EpB"));
     assert_eq!(blobs[1], b1);
+}
+
+/// Two independent partitions producing `X → Relu → A` and `X → Neg → B` graph
+/// outputs; returns the graph plus the two single-node partitions.
+fn two_partition_graph() -> (Graph, Vec<NodeId>, Vec<NodeId>) {
+    let mut g = Graph::new();
+    g.opset_imports.insert(String::new(), 17);
+    let x = g.create_named_value("X", DataType::Float32, static_shape([4usize]));
+    g.add_input(x);
+    let a = g.create_named_value("A", DataType::Float32, static_shape([4usize]));
+    let n1 = g.insert_node(Node::new(NodeId(0), "Relu", vec![Some(x)], vec![a]));
+    let b = g.create_named_value("B", DataType::Float32, static_shape([4usize]));
+    let n2 = g.insert_node(Node::new(NodeId(0), "Neg", vec![Some(x)], vec![b]));
+    g.add_output(a);
+    g.add_output(b);
+    (g, vec![n1], vec![n2])
+}
+
+/// **B1 regression** — two EXTERNAL-mode partitions whose `source` strings are
+/// DISTINCT but SANITISE TO THE SAME component (`Vendor/EP` vs `Vendor_EP`) with
+/// identical `partition_name` must NOT alias the same sidecar. The partition
+/// index disambiguates the filename, so both `.bin` files exist, are distinct,
+/// and each EPContext node reloads ITS OWN blob byte-exact through the consume
+/// path. Before the fix both nodes stored `m_ctx_Vendor_EP_p1.bin` and the
+/// second write truncated the first — data loss.
+#[test]
+fn external_dump_colliding_sanitised_sources_do_not_alias() {
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("writer_external_collide");
+    std::fs::create_dir_all(&dir).unwrap();
+    let orig = dir.join("m.onnx");
+
+    // Distinct non-UTF-8 blobs so a byte-exact round-trip is provable.
+    let b0: Vec<u8> = vec![0x00, 0x80, 0xFF, 0xC3, 0x28, 0x01];
+    let b1: Vec<u8> = vec![0x7F, 0xFE, 0xBE, 0xEF, 0x00, 0x42];
+    assert_ne!(b0, b1);
+
+    let (g, p0, p1) = two_partition_graph();
+    let model = Model::new(&g);
+    let config = EpContextDumpConfig {
+        enable: true,
+        file_path: None,
+        embed_mode: 0,
+    };
+    // Both sanitise to `Vendor_EP`; same partition_name `p1`. Only the identity
+    // (raw source) differs.
+    let parts = [
+        EpContextPartition {
+            source: "Vendor/EP",
+            ep_sdk_version: "",
+            partition_name: "p1",
+            main_context: true,
+            blob: &b0,
+            covered_nodes: &p0,
+        },
+        EpContextPartition {
+            source: "Vendor_EP",
+            ep_sdk_version: "",
+            partition_name: "p1",
+            main_context: true,
+            blob: &b1,
+            covered_nodes: &p1,
+        },
+    ];
+
+    let out = onnx_runtime_loader::dump_ep_context(&model, &orig, &parts, &config).expect("dump");
+
+    // Two DISTINCT sidecars written (index-disambiguated), each holding its blob.
+    let s0 = dir.join("m_ctx_p0_Vendor_EP_p1.bin");
+    let s1 = dir.join("m_ctx_p1_Vendor_EP_p1.bin");
+    assert!(s0.exists(), "partition-0 sidecar exists");
+    assert!(s1.exists(), "partition-1 sidecar exists");
+    assert_ne!(s0, s1, "filenames are distinct despite identical sanitised parts");
+    assert_eq!(std::fs::read(&s0).unwrap(), b0, "sidecar 0 holds blob 0");
+    assert_eq!(std::fs::read(&s1).unwrap(), b1, "sidecar 1 holds blob 1");
+
+    // Reload: each EPContext node must resolve to ITS OWN blob byte-exact.
+    let g2 = load_model(&out).expect("reload");
+    let mut nodes: Vec<_> = ep_context_nodes(&g2).collect();
+    assert_eq!(nodes.len(), 2);
+    // `Vendor/EP` ('/'=0x2F) sorts before `Vendor_EP` ('_'=0x5F).
+    nodes.sort_by_key(|n| n.source.map(str::to_owned));
+    assert_eq!(nodes[0].source, Some("Vendor/EP"));
+    assert_eq!(nodes[1].source, Some("Vendor_EP"));
+    assert_eq!(nodes[0].embed_mode, EmbedMode::ExternalFile);
+    assert_eq!(nodes[1].embed_mode, EmbedMode::ExternalFile);
+
+    let r0 = resolve_ep_context(&dir, &nodes[0]).expect("resolve blob 0");
+    let r1 = resolve_ep_context(&dir, &nodes[1]).expect("resolve blob 1");
+    assert_eq!(r0.bytes(), &b0[..], "node 0 reloads its own blob");
+    assert_eq!(r1.bytes(), &b1[..], "node 1 reloads its own blob");
+    assert_ne!(r0.bytes(), r1.bytes(), "no aliasing — distinct blobs preserved");
+}
+
+/// **A1 regression** — a disabled config (`enable = false`) must be a no-op: no
+/// ctx model and no sidecars are written. The returned path is the *would-be*
+/// output location but nothing is created on disk.
+#[test]
+fn disabled_config_writes_nothing() {
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("writer_disabled");
+    // Start from a clean directory so we can assert emptiness.
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let orig = dir.join("m.onnx");
+    let payload = blob();
+
+    let (g, covered) = partition_graph();
+    let model = Model::new(&g);
+    let config = EpContextDumpConfig {
+        enable: false,
+        file_path: None,
+        embed_mode: 0,
+    };
+    let part = EpContextPartition {
+        source: "VendorEP",
+        ep_sdk_version: "1.0",
+        partition_name: "p0",
+        main_context: true,
+        blob: &payload,
+        covered_nodes: &covered,
+    };
+
+    let out = onnx_runtime_loader::dump_ep_context(&model, &orig, &[part], &config).expect("dump");
+    assert_eq!(out, dir.join("m_ctx.onnx"), "returns the would-be path");
+    assert!(!out.exists(), "disabled config writes no ctx model");
+
+    // The directory holds nothing (no ctx model, no sidecars).
+    let entries: Vec<_> = std::fs::read_dir(&dir).unwrap().collect();
+    assert!(entries.is_empty(), "disabled config writes no files at all");
+}
+
+/// **B1 exact-identity guard** — two partitions sharing the SAME `source` AND
+/// `partition_name` are an ambiguous request (both nodes would carry identical
+/// dispatch keys) and must be rejected rather than silently aliasing.
+#[test]
+fn duplicate_partition_identity_is_rejected() {
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("writer_dup_identity");
+    std::fs::create_dir_all(&dir).unwrap();
+    let orig = dir.join("m.onnx");
+    let payload = blob();
+
+    let (g, p0, p1) = two_partition_graph();
+    let model = Model::new(&g);
+    let config = EpContextDumpConfig {
+        enable: true,
+        file_path: None,
+        embed_mode: 0,
+    };
+    let parts = [
+        EpContextPartition {
+            source: "EpA",
+            ep_sdk_version: "",
+            partition_name: "same",
+            main_context: true,
+            blob: &payload,
+            covered_nodes: &p0,
+        },
+        EpContextPartition {
+            source: "EpA",
+            ep_sdk_version: "",
+            partition_name: "same",
+            main_context: true,
+            blob: &payload,
+            covered_nodes: &p1,
+        },
+    ];
+
+    let err = onnx_runtime_loader::dump_ep_context(&model, &orig, &parts, &config)
+        .expect_err("duplicate identity must be rejected");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("duplicate partition identity"),
+        "clear error, got: {msg}"
+    );
+}
+
+/// **Gaff advisory B** — hostile `source`/`partition_name` strings (`/`, `\`,
+/// `..`, NUL) must never yield a path separator, traversal, or otherwise unsafe
+/// sidecar filename. The stored path stays a bare relative filename and still
+/// round-trips through the traversal-guarded consume path.
+#[test]
+fn hostile_source_strings_sanitise_to_safe_bare_filename() {
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("writer_hostile");
+    std::fs::create_dir_all(&dir).unwrap();
+    let orig = dir.join("m.onnx");
+    let payload = blob();
+
+    let (g, covered) = partition_graph();
+    let model = Model::new(&g);
+    let config = EpContextDumpConfig {
+        enable: true,
+        file_path: None,
+        embed_mode: 0,
+    };
+    // Every hostile char (`/`, `\`, `..`, NUL) must be neutralised to `_`.
+    let part = EpContextPartition {
+        source: "a/b\\c..d\0e",
+        ep_sdk_version: "",
+        partition_name: "..",
+        main_context: true,
+        blob: &payload,
+        covered_nodes: &covered,
+    };
+
+    let out = onnx_runtime_loader::dump_ep_context(&model, &orig, &[part], &config).expect("dump");
+
+    // Exactly one sidecar, and its name is a single safe path component.
+    let bins: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.ends_with(".bin"))
+        .collect();
+    assert_eq!(bins.len(), 1, "one sidecar written");
+    let name = &bins[0];
+    assert!(!name.contains('/'), "no unix separator: {name}");
+    assert!(!name.contains('\\'), "no windows separator: {name}");
+    assert!(!name.contains('\0'), "no NUL: {name}");
+    assert!(
+        !Path::new(name).components().any(|c| matches!(c, std::path::Component::ParentDir)),
+        "no `..` traversal component: {name}"
+    );
+    assert_eq!(
+        Path::new(name).components().count(),
+        1,
+        "sidecar name is a single bare component: {name}"
+    );
+
+    // Still round-trips through the traversal-guarded consume path byte-exact.
+    let g2 = load_model(&out).expect("reload");
+    let nodes: Vec<_> = ep_context_nodes(&g2).collect();
+    assert_eq!(nodes.len(), 1);
+    let resolved = resolve_ep_context(&dir, &nodes[0]).expect("resolve blob");
+    assert_eq!(resolved.bytes(), &payload[..]);
 }
