@@ -30,6 +30,8 @@ impl ArenaKey for NodeId {
 #[derive(Clone, Debug)]
 pub struct Node {
     pub id: NodeId,
+    /// Optional ONNX node name (`""` means unnamed).
+    pub name: String,
     pub op_type: String,
     /// Operator domain (`""` == the default ONNX domain).
     pub domain: String,
@@ -53,6 +55,7 @@ impl Node {
     ) -> Self {
         Self {
             id,
+            name: String::new(),
             op_type: op_type.into(),
             domain: String::new(),
             inputs,

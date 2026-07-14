@@ -146,9 +146,7 @@ impl KernelCache {
                 ep.supports_op(node, &shape_dims, &layouts),
                 KernelMatch::Supported { .. }
             ) {
-                return Err(SessionError::UnsupportedOp {
-                    op_type: node.op_type.clone(),
-                });
+                return Err(SessionError::unsupported_op(node, node_id, opset, ep.name()));
             }
             let kernel = ep.get_kernel(node, input_shapes, opset)?;
             self.entries.insert(key.clone(), kernel);

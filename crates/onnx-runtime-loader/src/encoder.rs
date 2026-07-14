@@ -36,7 +36,6 @@
 //! The IR `Graph` does not model these, so they cannot be reproduced and are
 //! emitted empty / default:
 //!
-//! * per-node `name` (the IR [`Node`](onnx_runtime_ir::Node) has no name field);
 //! * `TrainingInfoProto`, `FunctionProto`, sparse initializers, quantization
 //!   annotations (not represented in the IR);
 //! * control-flow **subgraph** formal `input`/`output` lists — the load path
@@ -301,7 +300,7 @@ fn encode_node(graph: &Graph, node: &Node) -> Result<NodeProto, LoaderError> {
     Ok(NodeProto {
         input,
         output,
-        name: String::new(),
+        name: node.name.clone(),
         op_type: node.op_type.clone(),
         domain: node.domain.clone(),
         attribute,

@@ -18,11 +18,8 @@ fn main() {
     let case_dir = PathBuf::from(&args[2]);
     match run(&model, &case_dir) {
         Ok(count) => println!("OK\t{count} outputs"),
-        Err(RunnerError::Session(SessionError::UnsupportedOp { op_type })) => {
-            println!(
-                "UNSUPPORTED_OP\top type not supported by any available EP: {op_type}; \
-                 the selected execution provider has no registered kernel for this operator"
-            );
+        Err(RunnerError::Session(err @ SessionError::UnsupportedOp { .. })) => {
+            println!("UNSUPPORTED_OP\t{err}");
             std::process::exit(2);
         }
         Err(err) => {

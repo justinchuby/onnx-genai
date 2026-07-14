@@ -146,6 +146,7 @@ fn build_graph_proto(
             .collect();
 
         let mut node = Node::new(NodeId(0), np.op_type.clone(), inputs, outputs);
+        node.name = np.name.clone();
         node.domain = np.domain.clone();
         if !np.doc_string.is_empty() {
             node.doc_string = Some(np.doc_string.clone());

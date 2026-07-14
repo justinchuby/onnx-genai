@@ -92,6 +92,29 @@ fn op_shaped(
     out
 }
 
+#[test]
+fn unsupported_op_error_is_actionable() {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let x = input(&mut graph, "x", DataType::Float32, &[1]);
+    let y = graph.create_named_value("y", DataType::Float32, static_shape([1]));
+    let mut node = Node::new(NodeId(0), "Sigmoid", vec![Some(x)], vec![y]);
+    node.name = "unsupported_activation".to_string();
+    graph.insert_node(node);
+    graph.add_output(y);
+
+    let message = match InferenceSession::from_graph(graph) {
+        Err(err) => err.to_string(),
+        Ok(_) => panic!("unsupported operator unexpectedly built"),
+    };
+    assert!(message.contains("Sigmoid"), "{message}");
+    assert!(message.contains("ai.onnx"), "{message}");
+    assert!(message.contains("unsupported_activation"), "{message}");
+    assert!(message.contains("opset 17"), "{message}");
+    assert!(message.contains("cpu_ep"), "{message}");
+    assert!(message.contains("To fix:"), "{message}");
+}
+
 // --- reference implementations ---------------------------------------------
 
 fn ref_matmul(a: &[f32], m: usize, k: usize, b: &[f32], n: usize) -> Vec<f32> {

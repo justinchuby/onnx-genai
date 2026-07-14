@@ -54,8 +54,20 @@ mod error {
         #[error("no model source: set a path or bytes on the builder")]
         NoModelSource,
 
-        #[error("op type not supported by any available EP: {op_type}")]
-        UnsupportedOp { op_type: String },
+        #[error(
+            "unsupported operator {domain}::{op_type}: no available execution provider has a \
+             kernel; node {node}, opset {opset}; consulted execution providers (priority order): \
+             {execution_providers}. To fix: enable another EP that supports this operator and \
+             opset, convert or decompose the model operator, or file an nxrt issue with the model \
+             details"
+        )]
+        UnsupportedOp {
+            op_type: String,
+            domain: String,
+            node: String,
+            opset: u64,
+            execution_providers: String,
+        },
 
         #[error("value has a non-static (symbolic) shape and no binding to resolve it: {value}")]
         DynamicShape { value: String },
@@ -134,6 +146,33 @@ mod error {
 
         #[error(transparent)]
         ShapeInfer(#[from] onnx_runtime_shape_inference::ShapeInferError),
+    }
+
+    impl SessionError {
+        pub(crate) fn unsupported_op(
+            node: &onnx_runtime_ir::Node,
+            node_id: onnx_runtime_ir::NodeId,
+            opset: u64,
+            execution_providers: impl Into<String>,
+        ) -> Self {
+            let domain = if node.domain.is_empty() {
+                "ai.onnx".to_string()
+            } else {
+                node.domain.clone()
+            };
+            let node_display = if node.name.is_empty() {
+                format!("<unnamed node #{}>", node_id.0)
+            } else {
+                format!("{:?}", node.name)
+            };
+            Self::UnsupportedOp {
+                op_type: node.op_type.clone(),
+                domain,
+                node: node_display,
+                opset,
+                execution_providers: execution_providers.into(),
+            }
+        }
     }
 
     /// Session `Result` alias.
