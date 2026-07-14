@@ -29,6 +29,7 @@ pub use tensor::Tensor;
 
 mod epcontext;
 mod executor;
+mod sequence;
 mod tensor;
 
 /// Operator-set version associated with an operator dispatch failure.
@@ -166,6 +167,11 @@ mod error {
 
         #[error("internal executor error: {0}")]
         Internal(String),
+
+        #[error(
+            "Sequence op {op}: {reason}"
+        )]
+        SequenceOp { op: String, reason: String },
 
         #[error(
             "EPContext reference node (main_context=0) has no matching primary \

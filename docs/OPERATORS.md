@@ -97,6 +97,24 @@ plugin EPs (via C ABI bridge) handle them.
 | NMS (NonMaxSuppression) | 10 | Detection models. |
 | RoiAlign | 10 | |
 
+### Tier 3b: Sequence ops (sequence-of-tensors container type)
+
+Implemented by the CPU session executor (not leaf EP kernels): a `Sequence`
+value is an ordered, homogeneously-typed list of tensors handled directly by the
+executor, exactly like the control-flow ops. See §6.9 for the copy-free /
+race-free design.
+
+| Op | Since Opset | Notes |
+|----|-------------|-------|
+| SequenceEmpty | 11 | `dtype` attr (default float32). |
+| SequenceConstruct | 11 | N tensors → sequence; **shares** input element `Arc`s. |
+| SequenceInsert | 11 | Position optional (default append); new list shares element `Arc`s. |
+| SequenceErase | 11 | Position optional (default last); new list shares surviving `Arc`s. |
+| SequenceAt | 11 | Negative index allowed; returns a **shared** element (no deep copy). |
+| SequenceLength | 11 | → int64 scalar. |
+| SplitToSequence | 11 | `axis`, `keepdims`; explicit/scalar `split`; single-alloc slices. |
+| ConcatFromSequence | 11 | `axis`, `new_axis` (stack); single-alloc output. |
+
 ---
 
 ## 2. Microsoft Contrib Ops (`com.microsoft` domain)
@@ -265,7 +283,47 @@ macro_rules! register_kernels {
 
 **Adding a new kernel = one file + one register line.** No touching core runtime code.
 
-## 7. Tracing & Profiling (Everything is Traced)
+### 6.9 Sequence ops: copy-free & race-free container semantics
+
+ONNX `Sequence*` ops operate on a *sequence-of-tensors* container value, which a
+tensor-in/tensor-out `Kernel` cannot represent. They are therefore handled
+directly by the session executor (like `If`/`Loop`/`Scan`), routed by
+`is_sequence_op` — **no EP kernel-registry entry**, so they never collide with
+tensor-kernel registration.
+
+**No copy.** A sequence stores its elements as `Arc`-shared **immutable**
+tensors (`SeqTensor`). Every value-semantic op returns a *new* list that
+**shares the surviving element `Arc`s** with the source (persistent-data-
+structure style) — only handles (a refcount bump) are cloned, never element
+bytes:
+
+- `SequenceConstruct` shares the input element `Arc`s.
+- `SequenceInsert` / `SequenceErase` build a new `Vec<Arc<SeqTensor>>` that
+  shares every unchanged element with the input.
+- `SequenceAt` returns the **shared element `Arc`** and backs its output tensor
+  value with that same allocation (`seq_elem_values`), so a downstream kernel
+  reads it through a zero-copy `TensorView`; bytes are materialized only at the
+  graph-output boundary.
+
+The only unavoidable copies are boundary crossings: a *tensor → sequence* entry
+(a produced `DeviceBuffer`, reused across runs, cannot be aliased, so its bytes
+are moved into the element `Arc` exactly once) and the single-alloc data
+movement of `SplitToSequence` / `ConcatFromSequence` (`ConcatFromSequence`
+necessarily allocates its output once and memcpies each element in exactly
+once). This contrasts with stock ORT, whose `SequenceInsert`/`Erase`/`At`
+deep-copy element data on every mutation.
+
+**No race.** `SeqTensor` is immutable after construction and shared read-only
+through `Arc` (no interior mutability), so concurrent readers of a shared
+sequence/element cannot race — the only cross-thread state is `Arc`'s atomic
+refcount. `SequenceValue: Send + Sync` is asserted by a unit test, and a
+concurrency smoke test runs many threads reading one shared sequence.
+
+The proof that no deep copy occurs is a unit test asserting `Arc::ptr_eq` (and
+data-pointer equality) between an element inserted into a sequence and the same
+element returned by `SequenceAt` after intervening `insert`/`erase`.
+
+
 
 Every operation in the runtime emits structured traces via the `tracing` crate.
 **Always compiled in** (no feature gate). Tracing instrumentation is zero-cost when no

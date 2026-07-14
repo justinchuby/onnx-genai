@@ -305,3 +305,43 @@ python -m pip install --force-reinstall \
 python -m pytest tests/test_onnx_backend.py -q \
   --junitxml=../../target/onnx-backend-test/junit.xml
 ```
+
+## Sequence ops — copy-free, race-free container type (2026-07-14)
+
+Added the ONNX *sequence-of-tensors* runtime value type and its core ops to the
+session executor (not EP kernels — a `Kernel` sees only tensor views):
+`SequenceEmpty`, `SequenceConstruct`, `SequenceInsert`, `SequenceErase`,
+`SequenceAt`, `SequenceLength`, `SplitToSequence`, `ConcatFromSequence`. Routed
+by `is_sequence_op`, mirroring the `If`/`Loop`/`Scan` control-flow path, so there
+is **no** EP kernel-registry entry to conflict with tensor-op registration.
+
+**Design (see `docs/OPERATORS.md` §6.9):**
+
+- **No copy.** Elements are `Arc`-shared immutable `SeqTensor`s. Insert/erase/
+  construct produce a new list that *shares* the surviving element `Arc`s
+  (persistent-structure update); `SequenceAt` returns the shared element and
+  backs its output tensor value with the same allocation (`seq_elem_values`),
+  read zero-copy by downstream kernels. Only boundary crossings copy: the
+  tensor→sequence entry (one move into the element `Arc`) and the single-alloc
+  `Split`/`Concat` data movement.
+- **No race.** Immutable elements shared read-only through `Arc`, no interior
+  mutability → concurrent readers cannot race. `SequenceValue: Send + Sync`.
+
+**Tests (all green):**
+
+- 15 unit tests in `sequence.rs`, including the **no-copy proof**
+  (`at_returns_shared_handle_no_copy` asserts `Arc::ptr_eq` + data-pointer
+  equality between the inserted element and the `SequenceAt` result after
+  intervening insert/erase), an `Arc`-strong-count sharing test, a **concurrency
+  smoke test** (8 threads reading one shared sequence), and a `Send + Sync`
+  assertion.
+- 13 end-to-end integration tests in `tests/sequence_ops.rs` exercising each op
+  through the public `InferenceSession` surface (construct/at, negative index,
+  insert position + default append, erase, length, split (default/keepdims=0/
+  explicit sizes), concat (existing axis + `new_axis=1` stack), a no-copy
+  round-trip feeding `Identity`, and actionable out-of-bounds / sequence-graph-
+  output error paths).
+
+Deferred follow-up: `SplitToSequence` currently emits single-alloc contiguous
+slices; making split outputs true strided *views* over the input (on top of the
+zero-copy strided-view foundation) is a future optimization.
