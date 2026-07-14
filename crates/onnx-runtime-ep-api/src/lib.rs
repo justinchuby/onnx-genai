@@ -14,15 +14,18 @@
 //! * [`provider`] — [`ExecutionProvider`], [`EpConfig`], device buffers/fences.
 //! * [`kernel`] — [`Kernel`] trait, [`KernelMatch`], [`Cost`].
 //! * [`registry`] — [`OpRegistry`], [`OpKey`], [`KernelFactory`], [`EpRegistry`].
+//! * [`epcontext`] — [`EpContext`] runtime form + `source`-keyed [`EpContextRegistry`] (§55).
 //! * [`tensor`] — [`TensorView`] / [`TensorMut`] zero-copy device views.
 //! * [`abi`] — ORT graph ABI bridge for legacy plugin EPs (Phase 2).
 
 pub mod abi;
+pub mod epcontext;
 pub mod kernel;
 pub mod provider;
 pub mod registry;
 pub mod tensor;
 
+pub use epcontext::{build_ep_context_registry, EpContext, EpContextRegistry};
 pub use error::{EpError, Result};
 pub use kernel::{Cost, Kernel, KernelMatch};
 pub use provider::{
@@ -67,6 +70,22 @@ mod error {
 
         #[error("EP not initialized")]
         NotInitialized,
+
+        #[error("no EP is registered for EPContext source key {source_key:?}")]
+        NoEpForContext { source_key: Option<String> },
+
+        #[error("EP {ep} does not support EPContext save/load")]
+        UnsupportedContext { ep: String },
+
+        #[error(
+            "duplicate EPContext source key {source_key:?}: already registered to {existing:?}, \
+             cannot re-register to {new:?}"
+        )]
+        DuplicateContextSource {
+            source_key: String,
+            existing: crate::provider::EpId,
+            new: crate::provider::EpId,
+        },
 
         #[error(transparent)]
         Ir(#[from] onnx_runtime_ir::IrError),

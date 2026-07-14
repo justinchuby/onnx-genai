@@ -5,7 +5,8 @@ use std::ptr::NonNull;
 
 use onnx_runtime_ir::{DeviceId, DeviceType, Graph, Node, NodeId, Shape, TensorLayout};
 
-use crate::error::Result;
+use crate::error::{EpError, Result};
+use crate::epcontext::EpContext;
 use crate::kernel::{Kernel, KernelMatch};
 
 /// Index of an EP within an [`crate::registry::EpRegistry`].
@@ -232,6 +233,34 @@ pub trait ExecutionProvider: Send + Sync {
     fn claim_nodes(&self, graph: &Graph) -> Vec<NodeId> {
         let _ = graph;
         Vec::new()
+    }
+
+    /// The `EPContext` node `source` key(s) this EP accepts for compiled-context
+    /// dispatch (`docs/ORT2.md` §55.6). The keys come from the EP's own
+    /// config/data — **never** hardcoded in loader/session dispatch. An empty
+    /// list (the default) means the EP does not participate in `EPContext`
+    /// (e.g. the pure-Rust CPU EP has no compile step).
+    fn context_source_keys(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// Produce the runtime [`EpContext`] for this EP's freshly compiled subgraph
+    /// (the §55.4 dump path calls this). Default: unsupported — an EP with no
+    /// compile step returns [`EpError::UnsupportedContext`].
+    fn save_context(&self) -> Result<EpContext> {
+        Err(EpError::UnsupportedContext {
+            ep: self.name().to_string(),
+        })
+    }
+
+    /// Restore this EP from a runtime [`EpContext`], skipping convert+compile
+    /// (the §55.3 load path calls this). Default: unsupported — an EP that does
+    /// not consume `EPContext` returns [`EpError::UnsupportedContext`].
+    fn load_context(&self, ctx: &EpContext) -> Result<()> {
+        let _ = ctx;
+        Err(EpError::UnsupportedContext {
+            ep: self.name().to_string(),
+        })
     }
 }
 
