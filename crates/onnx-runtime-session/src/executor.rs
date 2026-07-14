@@ -412,6 +412,14 @@ impl Executor {
         let mut plan = Vec::with_capacity(order.len());
         for &nid in &order {
             let node = graph.node(nid);
+            // EPContext nodes are pre-compiled: they bypass placement and were
+            // already restored through their owning EP by the session's
+            // consume path (§55.3). They must never be resolved as ordinary
+            // kernels — the CPU EP has no `EPContext` kernel — so skip them
+            // here.
+            if onnx_runtime_loader::is_ep_context_op(&node.op_type, &node.domain) {
+                continue;
+            }
             let inputs: Vec<ValueId> = node.input_values().collect();
             let outputs: Vec<ValueId> = node.outputs.clone();
             let input_dtypes: Vec<DataType> = inputs.iter().map(|v| value_dtypes[v]).collect();

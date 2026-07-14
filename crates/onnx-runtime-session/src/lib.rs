@@ -19,10 +19,12 @@ use std::path::{Path, PathBuf};
 
 use onnx_runtime_ir::{DataType, DeviceType, Shape};
 
+pub use epcontext::{EpContextPlacement, load_ep_context_nodes};
 pub use error::SessionError;
 pub use executor::CacheStats;
 pub use tensor::Tensor;
 
+mod epcontext;
 mod executor;
 mod tensor;
 
@@ -102,6 +104,15 @@ mod error {
 
         #[error("internal executor error: {0}")]
         Internal(String),
+
+        #[error(
+            "EPContext reference node (main_context=0) has no matching primary \
+             (source={source_key:?}, partition_name={partition_name:?})"
+        )]
+        DanglingEpContext {
+            source_key: Option<String>,
+            partition_name: Option<String>,
+        },
 
         #[error(transparent)]
         Load(#[from] onnx_runtime_loader::LoaderError),
@@ -330,10 +341,21 @@ impl SessionBuilder {
         // are accepted but not yet acted on in Phase 1 (CPU-only executor).
         let _ = (self.device, self.memory_limit, self.enable_profiling);
 
-        let (mut graph, weights) = match (self.model_path, self.model_bytes) {
-            (Some(path), _) => onnx_runtime_loader::load_model_with_weights(path)?,
+        let (mut graph, weights, model_dir) = match (self.model_path, self.model_bytes) {
+            (Some(path), _) => {
+                // The EPContext load path resolves `embed_mode=0` external blob
+                // paths relative to the model file's directory (§55.3), so
+                // retain it (same base dir the loader used for external data).
+                let model_dir = path
+                    .parent()
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(|| PathBuf::from("."));
+                let (g, w) = onnx_runtime_loader::load_model_with_weights(path)?;
+                (g, w, model_dir)
+            }
             (None, Some(bytes)) => {
-                onnx_runtime_loader::load_model_bytes_with_weights(&bytes, ".")?
+                let (g, w) = onnx_runtime_loader::load_model_bytes_with_weights(&bytes, ".")?;
+                (g, w, PathBuf::from("."))
             }
             (None, None) => return Err(SessionError::NoModelSource),
         };
@@ -341,7 +363,7 @@ impl SessionBuilder {
         // Optimize stage. Off by default; only runs when a level is selected.
         optimize_graph(&mut graph, level)?;
 
-        let mut session = InferenceSession::from_parts(graph, weights)?;
+        let mut session = InferenceSession::from_parts(graph, weights, &model_dir)?;
         if !self.warmup_shapes.is_empty() {
             session.warmup(&self.warmup_shapes)?;
         }
@@ -427,16 +449,38 @@ impl InferenceSession {
     /// on-disk model or weight store is required. Useful for programmatically
     /// constructed graphs and tests.
     pub fn from_graph(graph: onnx_runtime_ir::Graph) -> Result<Self> {
-        Self::from_parts(graph, std::sync::Arc::new(onnx_runtime_loader::WeightStore::new()))
+        // No on-disk model: `embed_mode=0` external EPContext blobs resolve
+        // relative to the current directory (consistent with the loader's
+        // in-memory `base_dir` default).
+        Self::from_parts(
+            graph,
+            std::sync::Arc::new(onnx_runtime_loader::WeightStore::new()),
+            Path::new("."),
+        )
     }
 
     fn from_parts(
         graph: onnx_runtime_ir::Graph,
         weights: std::sync::Arc<onnx_runtime_loader::WeightStore>,
+        model_dir: &Path,
     ) -> Result<Self> {
         let inputs = io_meta(&graph, &graph.inputs);
         let outputs = io_meta(&graph, &graph.outputs);
         let ep = executor::auto_detect_cpu_ep()?;
+
+        // EPContext consume path (§55.3): restore any pre-compiled EP contexts
+        // before building the executor. Dispatch is a pure `source`-key lookup
+        // over the session's registered EPs (Phase 1: the CPU EP only, which
+        // declares no `source` keys — so a model that carries EPContext nodes
+        // for an unloaded compiled EP fails with a clear `NoEpForContext`). The
+        // executor then bypasses these nodes (they are pre-compiled, never run
+        // as ordinary kernels).
+        let eps: [(
+            onnx_runtime_ep_api::EpId,
+            &dyn onnx_runtime_ep_api::ExecutionProvider,
+        ); 1] = [(onnx_runtime_ep_api::EpId(0), ep.as_ref())];
+        epcontext::load_ep_context_nodes(&graph, model_dir, &eps)?;
+
         let exec = executor::Executor::build(graph, weights, ep)?;
         Ok(Self {
             inputs,
