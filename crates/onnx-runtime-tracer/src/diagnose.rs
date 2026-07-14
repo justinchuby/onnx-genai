@@ -52,6 +52,7 @@
 //! }
 //! ```
 
+use crate::args::{ARG_CHOSEN_KERNEL, ARG_FASTPATH_REJECTED_REASON, ARG_OPTIMIZED_CANDIDATE};
 use crate::event::{TraceEvent, TracePhase};
 use std::collections::BTreeMap;
 use std::fmt;
@@ -508,6 +509,11 @@ pub enum IssueCategory {
     ShapeInstability,
     /// *Live.* Shapes keep changing, preventing CUDA-graph capture.
     NoCudaGraph,
+    /// *Live (data-conditional).* An op had an **optimized kernel available**
+    /// (e.g. FlashAttention / fused SDPA / fused GEMM) but the runtime took the
+    /// generic fallback instead. Fires when a kernel/EP reports the rejection
+    /// via [`report_missed_fastpath`] / [`Args::missed_fastpath`](crate::Args::missed_fastpath).
+    MissedFastPath,
     /// *Hook (needs placement/tier data).* Hot weight on the wrong device tier.
     SuboptimalPlacement,
     /// *Hook (needs a reference run).* Output diverges numerically.
@@ -610,6 +616,7 @@ impl AutoDiagnosis {
         detect_no_cuda_graph(events, &mut issues);
         detect_memory_thrashing(events, cfg, &mut issues);
         detect_prefetch_stall(events, &mut issues);
+        detect_missed_fastpath(events, &mut issues);
         // TODO(§46.6): SuboptimalPlacement needs weight-tier/hotness metadata
         // and NumericalDivergence needs a reference run — neither is present in
         // the trace stream yet. See `detect_suboptimal_placement` /
@@ -967,6 +974,167 @@ fn is_pressure_event(e: &TraceEvent) -> bool {
             || s.contains("oom")
     };
     e.cat.eq_ignore_ascii_case("memory") && (hay(&e.name) || hay(&e.cat)) || hay(&e.name)
+}
+
+// --- MissedFastPath ----------------------------------------------------------
+
+/// MissedFastPath: an op had an optimized kernel available but the runtime ran
+/// the generic fallback. *Data-conditional*: fires only for events a kernel/EP
+/// explicitly tagged with the missed-fast-path contract
+/// ([`ARG_FASTPATH_REJECTED_REASON`] + [`ARG_OPTIMIZED_CANDIDATE`], normally via
+/// [`report_missed_fastpath`] / [`Args::missed_fastpath`](crate::Args::missed_fastpath)).
+///
+/// Renders the full RULES.md #1 contract: **WHAT** op + which optimized kernel
+/// was skipped, **WHY** (the reason string + the fallback that ran), and
+/// **HOW** to hit the fast path (a fix derived from the reason).
+fn detect_missed_fastpath(events: &[TraceEvent], out: &mut Vec<DiagnosedIssue>) {
+    for ev in events {
+        let Some(reason) = arg_str(ev, ARG_FASTPATH_REJECTED_REASON) else {
+            continue;
+        };
+        let candidate = arg_str(ev, ARG_OPTIMIZED_CANDIDATE).unwrap_or("an optimized kernel");
+        let chosen = arg_str(ev, ARG_CHOSEN_KERNEL);
+        let node = if ev.name.is_empty() { "op" } else { ev.name.as_str() };
+
+        let (severity, fix) = fastpath_fix(reason, candidate);
+
+        let chosen_note = chosen
+            .map(|c| format!(" the runtime ran the '{c}' fallback instead."))
+            .unwrap_or_else(|| " the runtime ran a generic fallback instead.".to_string());
+
+        out.push(DiagnosedIssue {
+            severity,
+            category: IssueCategory::MissedFastPath,
+            description: format!(
+                "Missed fast path on '{node}': '{candidate}' available but not used"
+            ),
+            evidence_summary: format!(
+                "'{node}' could have used the optimized '{candidate}' kernel, but{chosen_note} \
+                 Reason the fast path was rejected: {reason}."
+            ),
+            root_cause: format!(
+                "The runtime evaluated '{candidate}' for '{node}' and rejected it because: \
+                 {reason}. A rejected fast path means the op fell back to a slower generic \
+                 kernel that does the same math with more time/memory."
+            ),
+            evidence: vec![ev.clone()],
+            suggestion: fix,
+        });
+    }
+}
+
+/// Map a fast-path rejection reason to a severity and an actionable fix.
+///
+/// Known reason keywords get a tailored fix; anything else falls back to a
+/// generic-but-actionable suggestion so the finding is never a dead end.
+/// Reasons indicating the input is simply below a fast-path threshold are
+/// [`Severity::Info`] (expected/benign); everything else is a
+/// [`Severity::Warning`] the user can usually act on.
+fn fastpath_fix(reason: &str, candidate: &str) -> (Severity, String) {
+    let r = reason.to_ascii_lowercase();
+    if r.contains("threshold") || r.contains("too small") || r.contains("below") {
+        return (
+            Severity::Info,
+            format!(
+                "Expected: the input is below '{candidate}'s fast-path threshold, so the generic \
+                 kernel is the right choice here. Batch or grow the workload to cross the \
+                 threshold if you want '{candidate}' to engage."
+            ),
+        );
+    }
+    let fix = if r.contains("dtype") || r.contains("precision") || r.contains("fp32") {
+        format!(
+            "'{candidate}' supports a narrower dtype set. Cast the op's inputs to a supported \
+             dtype (commonly fp16/bf16) — e.g. run the model in half precision — so '{candidate}' \
+             can take the inputs."
+        )
+    } else if r.contains("head_dim") || r.contains("multiple") || r.contains("align") {
+        format!(
+            "'{candidate}' needs an aligned shape (e.g. head_dim a multiple of 8). Pad the \
+             offending dimension up to the required alignment so '{candidate}' accepts it."
+        )
+    } else if r.contains("mask") {
+        format!(
+            "'{candidate}' does not support this mask form. Use a supported mask (e.g. a plain \
+             causal/boolean mask) or fold the mask into the score bias so '{candidate}' applies."
+        )
+    } else if r.contains("ep not enabled") || r.contains("provider") || r.contains("disabled") {
+        format!(
+            "'{candidate}' lives on an EP that is not enabled. Enable the execution provider that \
+             owns '{candidate}' (and confirm the device/build supports it) so the op is placed on \
+             the fast path."
+        )
+    } else {
+        format!(
+            "Adjust the op so it satisfies '{candidate}'s requirements ({reason}); compare its \
+             Args (dtype/shapes/mask/device) against a call that does hit '{candidate}'."
+        )
+    };
+    (Severity::Warning, fix)
+}
+
+/// Report — from a kernel or EP — that an **optimized kernel existed** for an op
+/// but was **not** selected, so [`AutoDiagnosis`] can surface a
+/// [`MissedFastPath`](IssueCategory::MissedFastPath) issue (§46.6).
+///
+/// This is the one-call emission API kernel authors should use at the point
+/// they decide to fall back. It emits an instant `"fastpath"` event named after
+/// the node, carrying the [`missed_fastpath`](crate::Args::missed_fastpath)
+/// contract args. No-op when `ctx` is disabled.
+///
+/// * `node` — the op/node name (e.g. `"FusedAttention_3"`).
+/// * `candidate` — the optimized kernel that could have run (e.g.
+///   `"FlashAttention"`).
+/// * `reason` — **why** it was skipped (e.g. `"unsupported dtype fp16"`,
+///   `"head_dim=100 not a multiple of 8"`, `"mask shape not supported"`,
+///   `"EP not enabled"`, `"shape too small — below fast-path threshold"`).
+/// * `chosen` — the fallback kernel that actually ran (e.g. `"generic f32 SDPA"`).
+///
+/// # Example
+///
+/// ```
+/// use onnx_runtime_tracer::TraceContext;
+/// use onnx_runtime_tracer::diagnose::{report_missed_fastpath, AutoDiagnosis, IssueCategory};
+///
+/// let (ctx, mem) = TraceContext::in_memory();
+/// // At a kernel's fallback point:
+/// report_missed_fastpath(
+///     &ctx,
+///     "FusedAttention_3",
+///     "FlashAttention",
+///     "unsupported dtype fp32 (fast path is fp16/bf16 only)",
+///     "generic f32 SDPA",
+/// );
+/// let diag = AutoDiagnosis::analyze(&mem.events());
+/// assert!(diag.issues.iter().any(|i| i.category == IssueCategory::MissedFastPath));
+/// ```
+///
+/// # Follow-up seams (real emission sites still to wire)
+///
+/// The tracer is not yet threaded into the CPU/CUDA kernels (§48.5), so the
+/// concrete fallback points below should call this helper once a `TraceContext`
+/// is available to them:
+///
+/// * `onnx-runtime-ep-cpu` `FusedAttentionKernel` — currently f32-only (it
+///   `to_dense_f32`-converts): for fp16/bf16 inputs it should report the
+///   FlashAttention/fused-SDPA fast path as rejected with reason
+///   `"unsupported dtype"`.
+/// * `onnx-runtime-ep-cpu` MatMul/GEMM backend selection (`CpuBackend`) — when
+///   it falls back from a `oneDNN`/vendor GEMM to the `Generic` blocked kernel.
+/// * `onnx-runtime-ep-cuda` attention selection — when a masked/odd-shaped
+///   attention cannot use the fused cuBLAS/flash path.
+pub fn report_missed_fastpath(
+    ctx: &crate::TraceContext,
+    node: impl Into<String>,
+    candidate: impl Into<String>,
+    reason: impl Into<String>,
+    chosen: impl Into<String>,
+) {
+    if !ctx.is_enabled() {
+        return;
+    }
+    let args = crate::Args::new().missed_fastpath(candidate, reason, chosen);
+    ctx.instant(node, "fastpath", Some(args));
 }
 
 // --- Args helpers ------------------------------------------------------------
@@ -1379,5 +1547,124 @@ mod tests {
         assert_eq!(Precision::from_str_lenient("FLOAT"), Precision::Fp32);
         assert_eq!(Precision::from_str_lenient("bf16"), Precision::Fp16);
         assert_eq!(Precision::from_str_lenient("garbage"), Precision::Fp16);
+    }
+
+    // ---- MissedFastPath -----------------------------------------------------
+
+    /// Build an instant-phase event carrying the missed-fast-path contract args,
+    /// as `report_missed_fastpath` would emit.
+    fn fastpath_ev(name: &str, candidate: &str, reason: &str, chosen: &str) -> TraceEvent {
+        TraceEvent {
+            name: name.to_string(),
+            cat: "fastpath".to_string(),
+            ph: TracePhase::Instant,
+            ts: 0,
+            dur: None,
+            pid: 1,
+            tid: 1,
+            scope: Some('t'),
+            args: Some(Args::new().missed_fastpath(candidate, reason, chosen).into_value()),
+        }
+    }
+
+    #[test]
+    fn missed_fastpath_renders_full_contract() {
+        let events = vec![fastpath_ev(
+            "FusedAttention_3",
+            "FlashAttention",
+            "unsupported dtype fp32 (fast path is fp16/bf16 only)",
+            "generic f32 SDPA",
+        )];
+        let d = AutoDiagnosis::analyze(&events);
+        let issue = d
+            .issues
+            .iter()
+            .find(|i| i.category == IssueCategory::MissedFastPath)
+            .expect("MissedFastPath issue expected");
+        assert_eq!(issue.severity, Severity::Warning);
+
+        let rendered = issue.render();
+        // WHAT: names the node and the optimized kernel that was skipped.
+        assert!(rendered.contains("FusedAttention_3"));
+        assert!(rendered.contains("FlashAttention"));
+        // WHY: the reason + the fallback that ran.
+        assert!(rendered.contains("unsupported dtype fp32"));
+        assert!(rendered.contains("generic f32 SDPA"));
+        // HOW: a dtype-specific, actionable fix.
+        assert!(rendered.to_lowercase().contains("cast"));
+        assert!(rendered.to_lowercase().contains("dtype"));
+    }
+
+    #[test]
+    fn missed_fastpath_alignment_reason_suggests_padding() {
+        let events = vec![fastpath_ev(
+            "Attention_7",
+            "FusedSDPA",
+            "head_dim=100 not a multiple of 8",
+            "generic attention",
+        )];
+        let d = AutoDiagnosis::analyze(&events);
+        let issue = d
+            .issues
+            .iter()
+            .find(|i| i.category == IssueCategory::MissedFastPath)
+            .expect("MissedFastPath issue expected");
+        assert_eq!(issue.severity, Severity::Warning);
+        assert!(issue.suggestion.to_lowercase().contains("pad"));
+    }
+
+    #[test]
+    fn missed_fastpath_below_threshold_is_info() {
+        let events = vec![fastpath_ev(
+            "MatMul_1",
+            "oneDNN GEMM",
+            "shape too small — below fast-path threshold",
+            "generic blocked GEMM",
+        )];
+        let d = AutoDiagnosis::analyze(&events);
+        let issue = d
+            .issues
+            .iter()
+            .find(|i| i.category == IssueCategory::MissedFastPath)
+            .expect("MissedFastPath issue expected");
+        // Below-threshold fallback is expected/benign, not a warning.
+        assert_eq!(issue.severity, Severity::Info);
+        assert!(issue.suggestion.to_lowercase().contains("threshold"));
+    }
+
+    #[test]
+    fn missed_fastpath_helper_emits_detectable_event() {
+        let (ctx, mem) = crate::TraceContext::in_memory();
+        report_missed_fastpath(
+            &ctx,
+            "FusedAttention_0",
+            "FlashAttention",
+            "EP not enabled",
+            "generic f32 SDPA",
+        );
+        let d = AutoDiagnosis::analyze(&mem.events());
+        let issue = d
+            .issues
+            .iter()
+            .find(|i| i.category == IssueCategory::MissedFastPath)
+            .expect("MissedFastPath issue expected from helper");
+        assert!(issue.suggestion.to_lowercase().contains("enable"));
+    }
+
+    #[test]
+    fn missed_fastpath_helper_is_noop_when_disabled() {
+        let ctx = crate::TraceContext::noop();
+        let (_ctx2, mem) = crate::TraceContext::in_memory();
+        // Disabled context records nothing.
+        report_missed_fastpath(&ctx, "Op", "Fast", "reason", "fallback");
+        assert!(AutoDiagnosis::analyze(&mem.events()).is_healthy());
+    }
+
+    #[test]
+    fn no_missed_fastpath_without_reason_arg() {
+        // A plain op (no fastpath_rejected_reason) must not raise the issue.
+        let events = vec![ev("MatMul_0", 50, Some(Args::new().device("cpu")))];
+        let d = AutoDiagnosis::analyze(&events);
+        assert!(!d.issues.iter().any(|i| i.category == IssueCategory::MissedFastPath));
     }
 }

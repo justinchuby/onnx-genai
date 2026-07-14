@@ -125,7 +125,7 @@ pub mod cupti;
 #[cfg(feature = "perfetto")]
 pub mod perfetto;
 
-pub use args::Args;
+pub use args::{ARG_CHOSEN_KERNEL, ARG_FASTPATH_REJECTED_REASON, ARG_OPTIMIZED_CANDIDATE, Args};
 pub use clock::{TraceClock, TraceSessionId};
 pub use collector::{
     CompositeCollector, DEFAULT_MAX_EVENTS, FileCollector, MemoryCollector, NoopCollector,
@@ -135,6 +135,7 @@ pub use context::{SpanGuard, TraceContext};
 pub use diagnose::{
     AutoDiagnosis, BoundType, DiagnosedIssue, DiagnosisConfig, IssueCategory, KernelSample,
     Precision, RooflineAnalyzer, RooflineResult, Severity, render_roofline_report,
+    report_missed_fastpath,
 };
 pub use error::{Result, TracerError};
 pub use event::{TraceEvent, TracePhase};

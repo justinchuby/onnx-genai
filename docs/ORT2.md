@@ -5206,6 +5206,9 @@ pub enum IssueCategory {
     ShapeInstability,
     /// CUDA graph not captured (shape keeps changing).
     NoCudaGraph,
+    /// An optimized kernel existed (e.g. FlashAttention / fused SDPA / fused
+    /// GEMM) but the runtime took the generic fallback instead.
+    MissedFastPath,
     /// Weight on wrong tier (hot weight on CPU).
     SuboptimalPlacement,
     /// Numerical divergence from reference.
@@ -5221,6 +5224,14 @@ $ nxrt trace diagnose /tmp/trace.jsonl
    Root cause: KV cache and weights competing for last 2GB of VRAM
    Fix: increase memory.vram_limit_gb or reduce context length
 
+⚠️  Missed fast path on 'FusedAttention_3': 'FlashAttention' available but not used
+   Evidence: 'FusedAttention_3' could have used the optimized 'FlashAttention'
+             kernel, but the runtime ran the 'generic f32 SDPA' fallback instead.
+             Reason the fast path was rejected: unsupported dtype fp32.
+   Root cause: the runtime evaluated 'FlashAttention' and rejected it because the
+               op fell back to a slower generic kernel doing the same math.
+   Fix: cast the op's inputs to a supported dtype (fp16/bf16) so FlashAttention engages
+
 ⚠️  Prefetch stall on layers 13-20
    Evidence: 0.8ms stall per layer waiting for weight transfer
    Root cause: compute time (0.5ms) < transfer time (1.3ms) for these layers
@@ -5231,6 +5242,62 @@ $ nxrt trace diagnose /tmp/trace.jsonl
    Root cause: variable sequence length inputs
    Fix: use padding to stabilize shapes, or set vmap.batch_size=static
 ```
+
+#### 46.6.1 MissedFastPath emission contract
+
+When an op **has** an optimized kernel (FlashAttention, fused SDPA, a fused/
+vendor GEMM, …) but the runtime does **not** take it, that must be *loud* in the
+trace — a silent fallback is exactly the kind of invisible perf cliff RULES.md #1
+forbids. `MissedFastPath` is **data-conditional**: the kernel/EP that owns the
+fast-vs-fallback decision reports the rejection at the point it falls back, and
+`AutoDiagnosis` turns that into a WHAT/WHY/HOW issue.
+
+**Trace-arg keys** (stable convention any EP populates on the op's event):
+
+| Key | Const | Meaning |
+|-----|-------|---------|
+| `optimized_candidate` | `ARG_OPTIMIZED_CANDIDATE` | the optimized kernel that *could* have run (e.g. `"FlashAttention"`) |
+| `fastpath_rejected_reason` | `ARG_FASTPATH_REJECTED_REASON` | **why** it was skipped (drives the fix + severity) |
+| `chosen_kernel` | `ARG_CHOSEN_KERNEL` | the fallback that actually ran (e.g. `"generic f32 SDPA"`) |
+
+An event carrying `fastpath_rejected_reason` (plus, ideally, `optimized_candidate`)
+is a missed-fast-path signal; the event `name` is the op/node name.
+
+**Kernel helper API** — kernel authors emit the contract in one call at the
+fallback point:
+
+```rust
+use onnx_runtime_tracer::report_missed_fastpath;
+
+// Inside a kernel, when it decides to fall back:
+report_missed_fastpath(
+    &ctx,                                     // the shared TraceContext
+    "FusedAttention_3",                       // op / node name
+    "FlashAttention",                         // optimized candidate
+    "unsupported dtype fp32 (fast path is fp16/bf16 only)", // reason
+    "generic f32 SDPA",                       // chosen fallback
+);
+```
+
+Or attach the same keys to an existing op span:
+
+```rust
+span.set_args(Args::new().missed_fastpath("FlashAttention", reason, "generic f32 SDPA"));
+```
+
+**Reason → fix/severity mapping.** `AutoDiagnosis` derives the fix from reason
+keywords: `dtype`/`precision` → cast to a supported dtype; `head_dim`/`multiple`/
+`align` → pad to the required alignment; `mask` → use a supported mask form;
+`EP not enabled`/`provider`/`disabled` → enable the owning EP; `threshold`/
+`too small`/`below` → **`Info`** (an expected, benign fallback); anything else →
+a generic-but-actionable fix. All non-threshold reasons are `Warning`.
+
+**Follow-up seams (real emission sites to wire once the tracer is threaded into
+kernels, §48.5):** `ep-cpu` `FusedAttentionKernel` (f32-only today → report for
+fp16/bf16 inputs), `ep-cpu` `CpuBackend` GEMM selection (oneDNN/vendor →
+`Generic` fallback), `ep-cuda` attention selection (masked/odd-shaped → no fused
+cuBLAS/flash path).
+
 
 ### 46.7 Design Choices
 

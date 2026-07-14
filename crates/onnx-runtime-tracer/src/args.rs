@@ -24,6 +24,19 @@
 
 use serde_json::{Map, Value};
 
+/// Trace-arg key naming the optimized kernel that *could* have run for an op
+/// but was not selected — the "missed fast path" contract (§46.6). See
+/// [`Args::missed_fastpath`].
+pub const ARG_OPTIMIZED_CANDIDATE: &str = "optimized_candidate";
+
+/// Trace-arg key carrying **why** an optimized fast path was rejected (§46.6).
+/// See [`Args::missed_fastpath`].
+pub const ARG_FASTPATH_REJECTED_REASON: &str = "fastpath_rejected_reason";
+
+/// Trace-arg key naming the fallback kernel that actually ran when a fast path
+/// was rejected (§46.6). See [`Args::missed_fastpath`].
+pub const ARG_CHOSEN_KERNEL: &str = "chosen_kernel";
+
 /// A builder for the JSON `args` object attached to a trace event.
 ///
 /// Cheap to construct (`Args::new` allocates an empty map) and cheap to move.
@@ -74,6 +87,58 @@ impl Args {
     #[must_use]
     pub fn flops(self, flops: u64) -> Self {
         self.with("flops", flops)
+    }
+
+    /// Record that an **optimized kernel existed** for this op but was **not**
+    /// selected (the "missed fast path" contract, §46.6).
+    ///
+    /// `candidate` names the optimized kernel that *could* have run (e.g.
+    /// `"FlashAttention"`, `"FusedSDPA"`, `"oneDNN GEMM"`); `reason` says **why**
+    /// it was skipped (e.g. `"unsupported dtype fp16"`,
+    /// `"head_dim=100 not a multiple of 8"`, `"EP not enabled"`,
+    /// `"shape too small — below fast-path threshold"`); `chosen` names the
+    /// fallback kernel that actually ran (e.g. `"generic f32 SDPA"`).
+    ///
+    /// This sets the three canonical keys — [`ARG_OPTIMIZED_CANDIDATE`],
+    /// [`ARG_FASTPATH_REJECTED_REASON`], and [`ARG_CHOSEN_KERNEL`] — that
+    /// [`AutoDiagnosis`](crate::diagnose::AutoDiagnosis) scans for to raise a
+    /// [`MissedFastPath`](crate::diagnose::IssueCategory::MissedFastPath) issue.
+    /// Kernels/EPs should prefer the [`report_missed_fastpath`](crate::diagnose::report_missed_fastpath)
+    /// helper, which builds this and emits the event in one call.
+    #[must_use]
+    pub fn missed_fastpath(
+        self,
+        candidate: impl Into<String>,
+        reason: impl Into<String>,
+        chosen: impl Into<String>,
+    ) -> Self {
+        self.optimized_candidate(candidate)
+            .fastpath_rejected_reason(reason)
+            .chosen_kernel(chosen)
+    }
+
+    /// Name the optimized kernel that *could* have run for this op
+    /// ([`ARG_OPTIMIZED_CANDIDATE`]). Part of the missed-fast-path contract; see
+    /// [`missed_fastpath`](Args::missed_fastpath).
+    #[must_use]
+    pub fn optimized_candidate(self, candidate: impl Into<String>) -> Self {
+        self.with(ARG_OPTIMIZED_CANDIDATE, candidate.into())
+    }
+
+    /// Record **why** the optimized fast path was rejected
+    /// ([`ARG_FASTPATH_REJECTED_REASON`]). Part of the missed-fast-path
+    /// contract; see [`missed_fastpath`](Args::missed_fastpath).
+    #[must_use]
+    pub fn fastpath_rejected_reason(self, reason: impl Into<String>) -> Self {
+        self.with(ARG_FASTPATH_REJECTED_REASON, reason.into())
+    }
+
+    /// Name the fallback kernel that actually ran ([`ARG_CHOSEN_KERNEL`]). Part
+    /// of the missed-fast-path contract; see
+    /// [`missed_fastpath`](Args::missed_fastpath).
+    #[must_use]
+    pub fn chosen_kernel(self, chosen: impl Into<String>) -> Self {
+        self.with(ARG_CHOSEN_KERNEL, chosen.into())
     }
 
     /// Record the source endpoint of a transfer, e.g. `"cuda:0"`.
