@@ -2761,6 +2761,7 @@ pub fn conformance_test(model_path: &Path, inputs: &[Tensor], tolerance: f64) ->
 | Precompiled plans | **Yes** | AOT compilation à la ExecuTorch: partition + optimize + serialize plan. Instant reload without re-optimization. |
 | AOT memory plan | **Yes** | Pre-compute tensor offsets at compile time. Runtime = one malloc + offset table. Zero allocation overhead. |
 | Quantization as EP concern | **Yes** | EPs handle quantized tensors natively (fused dequant+compute). No separate quantization pass. |
+| TensorRT-RTX EP as test target | **Yes** | NVIDIA's [TensorRT-RTX EP](https://github.com/NVIDIA/TensorRT-RTX-EP-ABI) — ABI-stable ORT plugin EP for RTX GPUs. Use as compatibility test target for our legacy EP loading (dlopen + C ABI bridge). If we can load and run TRT-RTX EP unchanged, our ABI bridge is correct. |
 
 ## 29. Open Questions
 
