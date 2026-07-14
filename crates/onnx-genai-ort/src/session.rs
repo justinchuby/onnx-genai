@@ -794,11 +794,12 @@ fn device_kv_enabled_from_env() -> bool {
 /// usual truthy values (`1`/`true`/`yes`/`on`), FALSE otherwise (including
 /// unset).
 ///
-/// WHY: The Metal plugin's growing-shape GQA kernel currently fails ORT's
-/// pre-bound present-output size check, so Metal defaults to the safe
-/// `ZeroCopyRebind` path. This flag exists so that once the MLX/Metal EP, or
-/// another EP, is verified, the SharedBuffer path can be enabled without a code
-/// change.
+/// WHY: The verified-EP allowlist in [`fixed_capacity_present_binding_supported`]
+/// gates the SharedBuffer path. The Metal plugin EP now implements the
+/// fixed-capacity in-place-write GQA contract and is on that allowlist, so this
+/// flag is no longer needed for Metal. It remains a global operator override so
+/// an as-yet-unverified EP (e.g. CoreML) can opt into SharedBuffer without a
+/// code change.
 ///
 /// HOW: Consumed only by
 /// [`Session::supports_fixed_capacity_present_binding`]; it overrides the
@@ -818,6 +819,11 @@ fn fixed_capacity_present_binding_supported(providers: &[ExecutionProvider], opt
                     ExecutionProvider::Cpu
                         | ExecutionProvider::Cuda { .. }
                         | ExecutionProvider::WebGpu
+                        // The MLX plugin EP implements the fixed-capacity in-place-write GQA
+                        // contract (writes new K/V at the valid-past offset, emits `present` at
+                        // the buffer's full capacity), so Metal accepts the runtime-owned shared
+                        // present buffer like CPU/CUDA/WebGPU — no `is_metal()` in decode logic.
+                        | ExecutionProvider::Metal
                 )
             })
 }
@@ -1418,7 +1424,7 @@ mod tests {
             &[ExecutionProvider::WebGpu],
             false
         ));
-        assert!(!fixed_capacity_present_binding_supported(
+        assert!(fixed_capacity_present_binding_supported(
             &[ExecutionProvider::Metal],
             false
         ));
