@@ -108,3 +108,9 @@ Verdict: 🟢 **SHIP**.
 - **Why critical:** Silent `Float4E2M1(23)→Uint4` corrupt-decode and `Uint4(21)→None` load failure are real hazards for the Gemma quantized-model path.
 - **Reviews:** Chew (chew-18) 🟢 APPROVE; Holden (holden-11) 🟡 APPROVE-WITH-FOLLOW-UP. Merged to main: **909f0a0**.
 - **Deckard locked out** of IR dtype artifact; follow-up `.unwrap_or(Float32)` fix at value-info/attr-tensor sites owned by Roy/Batty/Leon (Leon in flight, not yet landed).
+
+## 2026-07-14 — deckard-12: Review ORT2 fusion guards (roy-16)
+Read-only review of Roy's decline-to-fuse guards. Both over-decline and under-decline hunts clear. 🟢 APPROVE. Advisory A1: bert_toy LayerNorm never fused e2e (pre-existing escape-rule block on 10-op split-diff variant).
+
+## 2026-07-14 — deckard-13: Review ORT2 LayerNorm e2e (batty-14)
+Read-only review of Batty's DAG-aware matcher. A1 genuinely closed (real loaded-model e2e test). Parity honest/load-bearing. All numbers reproduced exactly. 🟢 APPROVE. A2: no isolated 10-op unit test. A3: drift ceiling 2e-3 vs actual 1.4e-7.

@@ -1084,3 +1084,46 @@ load (+ loader shape inference)
 - **G1** — MatMul+Add fusion has no shape guard. An `Add` whose non-matmul operand expands the matmul output shape (more leading dims) fuses to a silent-wrong result: shape rule returns the matmul shape; `broadcast_apply` silently truncates the leading axis. Not exercised by bert_toy (standard bias-add / same-shape cases). Fix: narrow/guard `MatMul+Add → FusedMatMulBias` to decline when the Add's non-matmul operand would expand the matmul output shape. Fix owner: **Roy** or **Deckard** (Batty locked out).
 
 **Suite:** ep-cpu 105, optimizer 26, shape-inference 70, session 26 + bert_toy conformance + opt-parity — 0 failed. Clippy clean. No new unsafe.
+
+---
+
+### 2026-07-14: ORT2 fusion decline-to-fuse guards (harden `optimization="all"`)
+
+**By:** Roy (ORT2 optimizer/loader)
+**Branch:** `squad/ort2-fusion-guards` → merged main `8f222bd`
+
+**What:** Hardened both fusions in `crates/onnx-runtime-optimizer/src/fusion.rs` to
+**decline-to-fuse** (leave the original ops) whenever their structural/shape
+assumptions can't be proven. Addresses Chew F1/F2/F3/F4 and Gaff Finding 5.
+
+- **LayerNorm** — axis: single concrete from `axes` attr only (axes-as-input/multi-axis/absent → decline); epsilon: concrete f32 scalar constant only (no silent 1e-5); positive structural guard confirming interior data-flow; declining returns `None` via `layernorm_spec` (Option) → fixpoint loop skips (no `?`-propagated hard error).
+- **MatMul+Add → FusedMatMulBias** — new `matmul_bias_broadcast_ok` guard: only fuse when bias is a valid trailing broadcast of the matmul output; expanding/unknown shapes → decline.
+- **Parity nit (F4):** `assert_eq!(overall_vs_off, 0.0)` for both `"all"` and `"basic"` vs opt-off.
+- `bert_toy` still fuses 32× FusedMatMulBias; `"all"` vs opt-off **0.0**, vs reference **1.192e-7**. New 5 decline/positive unit tests.
+
+**Review:** Deckard (deckard-12) — 🟢 APPROVE. Guards correct in both directions (32× FusedMatMulBias preserved, edge cases decline, tests non-tautological, suite green debug+release).
+
+**Advisory A1 (pre-existing, non-blocking):** `bert_toy` LayerNorm never fused e2e — 0 of 12 LN regions fuse due to pre-existing escape rule blocking the 10-op split-diff DAG variant. Addressed by Arc 2 below.
+
+---
+
+### 2026-07-14: ORT2 LayerNorm fusion now fires end-to-end on bert_toy (DAG-aware matcher)
+
+**By:** Batty (ORT2 optimizer/fusion engineer)
+**Branch:** `squad/ort2-layernorm-e2e` → merged main `1817890`
+**Closes:** Deckard advisory A1 from deckard-12 review
+
+**Root cause diagnosed:** `bert_toy`'s LayerNorm is a **10-op split-diff variant** — the exporter emits two distinct `Sub(x, mean)` nodes (one for variance branch `#50`, one for numerator branch `#54`) instead of CSE-reusing a single diff. The shared `mean` node has two Sub consumers, causing the escape rule (`fusion.rs:190-206`) to reject the match; the structural guard also fails because `Div` reads a different Sub's output.
+
+**Fix:** New **DAG-aware matcher** `FusionPattern::try_match_layernorm` anchored on the `mean` ReduceMean, collecting all `Sub(x, mean)` consumers and following both variance (`Sub→Pow→ReduceMean→Add(eps)→Sqrt`) and numerator (`Sub→Div→Mul→Add`) branches. Accepts both canonical **9-op** (shared Sub) and **10-op** (split Sub) shapes. `layernorm_spec` generalized to 9-or-10 nodes with a "same X" guard. Linear matcher `try_match_from` retained only for MatMul+Add (unchanged). All prior decline guards preserved verbatim.
+
+**Parity updated honestly:** `"all"` vs-opt-off `assert_eq!(…,0.0)` replaced with tight `< atol` drift bound (fused LN kernel reduces in one pass → few-ULP delta). `"basic"` keeps exact `assert_eq!(overall_vs_off, 0.0)`. New e2e test `full_optimization_actually_fuses_layernorm_and_matmul_bias` loads real bert_toy and asserts 12× LayerNormalization / 0 surviving ReduceMean / 32× FusedMatMulBias.
+
+**Parity numbers:** `"all"` vs reference **1.043e-7**, vs opt-off **1.416e-7**; `"basic"` vs reference **1.192e-7**, vs opt-off **0.0**. Tolerance (atol/rtol 2e-3) not loosened.
+
+**Review — Chew (chew-21):** 🟢 APPROVE. DAG matcher correct; over-match declines verified via adversarial probes (`different_x` → declines; `reversed_sub` → fuses, confirming A-CHEW-1 is PRE-EXISTING); 31 optimizer tests + 3 session tests green.
+- **A-CHEW-1 (pre-existing, non-blocking):** Sub operand order not checked — `Sub(mean, x)` over-matches with sign-flip. Reproduced identically on base 9-op matcher. Recommend follow-up (owner Roy/Deckard/Leon; Batty locked out).
+
+**Review — Deckard (deckard-13):** 🟢 APPROVE. A1 genuinely closed (real loaded-model e2e test). Parity honest/load-bearing. All numbers reproduced exactly (debug + release). No regression (FusedMatMulBias 32×, all prior decline tests pass).
+- **A2 (non-blocking):** 10-op split-diff shape has no isolated synthetic optimizer unit test.
+- **A3 (non-blocking):** vs-opt-off drift ceiling 2e-3 vs actual 1.4e-7 (~4 orders of margin); consider tightening to 1e-5.

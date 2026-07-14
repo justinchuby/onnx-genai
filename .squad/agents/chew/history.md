@@ -75,3 +75,6 @@ Reviewed Leon's K4 real KV byte materialization (commit `786e268`, read-only, Le
 - **Verdict:** 🟡 Approve with follow-ups.
 - **Key confirmed:** Operand disambiguation order-independent/model-agnostic ✅; epsilon extraction robust ✅; parity real (0.0 vs off, 1.192e-7 vs ref) ✅; unit test asserts values not arity ✅.
 - **Follow-ups raised:** F1 (opset-18 axis-as-input → decline), F2 (non-f32 epsilon → decline), F3 (hard-error vs decline-match), F4 (nit: assert byte-identity). Owner: Roy/Deckard/Leon.
+
+## 2026-07-14 — chew-21: Review ORT2 DAG-aware LayerNorm (batty-14)
+Reviewed matcher internals; authored adversarial probes (different_x, reversed, 9op_reversed). 🟢 APPROVE. A-CHEW-1 (pre-existing): Sub operand order not asserted — reversed Sub over-matches with sign-flip, but reproduced identically on base 9-op matcher. Recommend follow-up (Roy/Deckard/Leon; Batty locked out).

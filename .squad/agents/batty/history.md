@@ -134,3 +134,6 @@ Prompt-lookup speculation and `MtpProposer` are accepted canonical runtime miles
 - **Parity:** `opt=all` vs opt-off = 0.0 (byte-identical); vs reference = 1.192e-7 (unchanged). Full suite green debug+release.
 - **Reviews:** Chew 🟡 (F1: opset-18 axis-as-input; F2: non-f32 epsilon — both decline-to-fuse gaps); Gaff 🟡 (G1: MatMul+Add shape guard for bias-expanding Add).
 - **Batty locked out** of follow-ups F1, F2, G1. Owners: Roy/Deckard/Leon.
+
+## 2026-07-14 — batty-14: ORT2 DAG-aware LayerNorm e2e fusion
+Diagnosed bert_toy LayerNorm as 10-op split-diff variant. Added `try_match_layernorm` DAG-aware matcher (9-op + 10-op); `layernorm_spec` generalized to 9-or-10 nodes with same-X guard. Now 12× LayerNormalization + 32× FusedMatMulBias. `"all"` vs ref 1.043e-7, vs off 1.416e-7. Chew (chew-21) and Deckard (deckard-13) both 🟢 approved. Merged main `1817890`.
