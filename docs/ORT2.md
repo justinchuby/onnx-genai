@@ -127,8 +127,37 @@ The GenAI layer (KV cache, batching, speculative decoding, serving) is covered i
 - Rich type system: strided layouts, symbolic dims, device placement on every value
 - Compatible surface: expose ORT graph ABI to plugin EPs via zero-copy view adapters
 - Optimizable: SSA-like, immutable after optimization (shared across threads via `Arc`)
-- Inspired by [onnx-ir](https://github.com/onnx/ir-py)
 - Support subgraphs (control flow: If, Loop, Scan)
+
+**Reference implementation:** [onnx-ir](https://github.com/onnx/ir-py) (`pip install onnx-ir`)
+
+The Python `onnx-ir` package (authored by Justin) defines the canonical IR design we port to Rust.
+Key concepts to preserve:
+
+| onnx-ir (Python) | onnx-runtime-ir (Rust) | Notes |
+|------------------|------------------------|-------|
+| `ir.Graph` | `Graph` | Node arena + value arena + I/O lists |
+| `ir.Node` | `Node` | Op + inputs (optional) + outputs + attrs |
+| `ir.Value` | `Value` | Typed, shaped, tracks producer/consumers |
+| `ir.Attr` / `ir.RefAttr` | `Attribute` | All ONNX attr types |
+| `ir.Tensor` / `ir.ExternalTensor` | `WeightRef` + mmap | Lazy-loaded, memory-mapped |
+| `ir.TypeProto` / `ir.Type` | `DataType` + `Shape` | Split into concrete types |
+| `ir.Shape` with symbolic dims | `Shape` = `Vec<Dim>` | `Dim::Symbolic(SymbolId)` |
+| `ir.Graph.topological_sort()` | `Graph::topological_order()` | Kahn's algorithm |
+| `ir.passes.*` | `onnx-runtime-optimizer` passes | Separate crate |
+| `ir.traversal` | `Graph::predecessors/successors` | Graph query API |
+
+**What we add beyond onnx-ir:**
+- Strided `TensorLayout` on every value (onnx-ir doesn't track physical layout)
+- `DeviceId` placement annotation (for multi-device)
+- Mutation API for optimization passes (onnx-ir is mostly immutable)
+- ORT Graph ABI bridge (C-compatible projection for plugin EPs)
+- Memory format / alignment annotations
+
+**What we intentionally don't port:**
+- Python-specific conveniences (e.g. `__repr__`, numpy interop)
+- ONNX checker/validator (we have our own `Graph::validate()`)
+- Serialization back to protobuf (we only load, never save ONNX)
 
 ### 3.2 Core Types
 
