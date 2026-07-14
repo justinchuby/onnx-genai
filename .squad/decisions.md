@@ -923,3 +923,65 @@ Session unit (`option_tests`), session e2e (`tests/epcontext.rs`: byte-exact non
 - Executor accessors immutable, `pub(crate)`, borrow from `&self`; weights remain `Arc`-owned.
 
 `cargo test -p onnx-runtime-session` — PASS (unit 18, conformance 1, opt-parity 3, EPContext 13, executor 11). `cargo test -p onnx-runtime-capi` — PASS (unit 4, integration 13). Clippy + eight-crate build PASS.
+
+---
+
+### 2026-07-14T13:55:00Z: External-data path-traversal guard in weights loader (§19.2)
+
+**By:** Deckard (deckard-21, gpt-5.6-sol)
+**Commit:** `ba3f67a` (cherry-picked from `340d7b0`)
+**What:** External initializer `location` fields are now rejected before mmap if they contain absolute/rooted paths or any `..` component, via a new `LoaderError::ExternalDataPath { path, reason }` variant. The guard (`resolve_external_path`) lives in `weights.rs` and mirrors the pre-existing guard in `epcontext.rs` without sharing code, preserving distinct error provenance.
+**Why:** Untrusted ONNX external-data locations could escape the model directory and mmap arbitrary files; this brings the weights loader into security parity with the EPContext guard (§55 load path). The stale "TODO: add guard to weights.rs" note in the epcontext doc comment is cleaned up.
+**Tests:** 4 new tests in `external_data_paths.rs` — rejection of absolute and `..`-traversal paths (unix-gated for absolute), positive round-trip for top-level and nested legit paths.
+**Status:** MERGED to origin/main.
+
+---
+
+### 2026-07-14T13:55:00Z: Review — external-data path-traversal guard (Gaff, gaff-15)
+
+**By:** Gaff (gaff-15, opus) — non-author reviewer
+**Target:** commit `340d7b0` (author Deckard) — `crates/onnx-runtime-loader`
+**Verdict:** 🟡 YELLOW — APPROVE with 3 non-blocking advisories
+
+**Key findings (all PASS):**
+- Completeness: exactly two untrusted read sites in the loader (`weights.rs:131` external initializer location, `epcontext.rs:241` sidecar) — both now guarded.
+- Lexical correctness: absolute, `../x`, `a/../../x`, and any `..` component rejected; `weights.bin`, `./weights.bin`, `subdir/weights.bin` allowed. Verified by throwaway probe.
+- Error handling / TOCTOU: guard fires before `store.mmap_file` — reject-before-open, no partial side effect.
+- capi `map_loader_error` wildcard: new variant handled correctly via `_ => Fail`; build passes.
+- Test quality: asserts specific `LoaderError::ExternalDataPath` variant AND echoed `path`; positive test uses real bytes in `CARGO_TARGET_TMPDIR`.
+- Build/clippy/conformance: all green.
+
+**Advisories (non-blocking — follow-up notes):**
+1. **(Lexical-only guard / symlinks not resolved):** a `Normal` component that is a symlink to `/etc` would escape at the OS level. Parity with epcontext guard; accepted. Defense-in-depth: `canonicalize + starts_with(model_dir)`.
+2. **(capi explicit variant mapping):** `L::ExternalDataPath { .. } => OrtErrorCode::InvalidGraph` (or `Fail`) would be more self-documenting than the wildcard catch-all in `map_loader_error`.
+3. **(DRY — `resolve_external_path` duplicated):** `weights.rs` and `epcontext.rs` have near-verbatim guards differing only in error variant. Consider a shared `path_safety` helper (closure/enum for error kind) so future hardening (e.g. symlink resolution) is done once.
+
+---
+
+### 2026-07-14T13:55:00Z: FusedGemm (MatMul+Add+Relu) CPU kernel + shape rule + executable parity
+
+**By:** Batty (batty-17, opus)
+**Commit:** `4916618` (cherry-picked from `9e302a6`)
+**What:** Added the `com.microsoft::FusedGemm` CPU kernel (`ep-cpu/src/kernels/fused_gemm.rs`) — `Relu(MatMul(A,B)+bias)` — reusing the shared `matmul_dense` GEMM, `broadcast_apply` bias-add, and a new shared `relu::relu_in_place` helper; registered under `("FusedGemm","com.microsoft",1)`. Added a matching shape-inference rule (`shape-inference/src/handlers/linalg.rs`). Extended the fusion bias-broadcast decline-guard in `optimizer/src/fusion.rs` to cover `FusedGemm` alongside `FusedMatMulBias`. Added a synthetic end-to-end parity test (`session/tests/fused_gemm_parity.rs`) — `optimization="none"` vs `"all"` are byte-identical (max_abs 0.0); the fused graph contains exactly 1 `FusedGemm` / 0 stray MatMul+Add+Relu.
+**Why:** Completes the fusion trio — `FusedGemm` was registered/emitted by the optimizer but had no kernel or shape rule, so `optimization="all"` on a MatMul+Add+Relu graph would hit `UnsupportedOp`. `bert_toy` uses GELU/Erf (no Relu) so a synthetic test is the only way to exercise the fused path end-to-end.
+**Status:** MERGED to origin/main. **Fusion trio complete: LayerNorm ✅ / FusedMatMulBias ✅ / FusedGemm ✅ (all executable).**
+
+---
+
+### 2026-07-14T13:55:00Z: Review — FusedGemm kernel + shape rule + parity (Roy, roy-19)
+
+**By:** Roy (roy-19, opus) — non-author reviewer
+**Target:** commit `9e302a6` (author Batty)
+**Verdict:** 🟢 GREEN — approve, no blocking issues
+
+**Key findings (all PASS):**
+- Fusion-guard generalization: `matmul_bias_broadcast_ok` reads `m.nodes.first()` (MatMul) and `m.nodes.get(1)` (Add) — correct for both 2-node (FusedMatMulBias) and 3-node (FusedGemm) cases. Trailing Relu (node 2) is shape-neutral and correctly ignored by the guard. Verified with a throwaway expanding-bias probe (guard declines; reverted — not committed).
+- bert_toy unchanged: all `bert_toy_*` session tests green; FusedGemm never fires on bert_toy (no Relu in FFN).
+- Kernel correctness: `FusedGemm::execute` = `matmul_dense(A,B)` → `broadcast_apply(bias)` in place → `relu_in_place(&mut out)`. Stage order is exactly `Relu(MatMul + bias)`. Byte-identical to FusedMatMulBias plus one trailing `relu_in_place`.
+- Shape rule: delegates to `matmul_shape` (output == MatMul(A,B)); bias broadcasts; Relu shape-neutral. Registered under `com.microsoft` v1.
+- Synthetic parity test quality: tight 1e-6 atol; pre-Relu has negatives so Relu actually clamps; graph asserts 1 FusedGemm / 0 standalone MatMul+Add+Relu.
+- No new `unsafe`; `#![forbid(unsafe_code)]` intact in optimizer + shape-inference.
+- Build/clippy/all-crate: green.
+
+**Advisory (non-blocking):**
+- Consider adding a permanent 3-node `FusedGemm` expanding-bias decline test (mirroring `declines_matmul_add_when_bias_expands`) so the guard generalization is regression-protected in-repo, not just via throwaway. Purely additive; not required for approval.

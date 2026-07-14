@@ -72,3 +72,7 @@ Non-author review of `squad/ort2-epctx-options` @ `3e8dbde95effb006b28d117e3f8c5
 - Export seam: `export_ep_context` correct; disabled path side-effect-free; `TODO(compiler)` seam correctly placed; executor accessors immutable `pub(crate)`.
 - C API: no divergent option logic; verbatim forwarding only.
 - **Verdict: 🟢 APPROVE** — no regressions, no advisories.
+
+## 2026-07-14T13:55:00Z — deckard-21: External-data path-traversal guard (weights loader §19.2)
+
+Authored the traversal guard for the weights loader's untrusted external-data read path. `resolve_external_path` in `weights.rs` rejects absolute, rooted, and `..`-traversing `location` fields before mmap; new `LoaderError::ExternalDataPath { path, reason }` variant. 4 tests. Mirrors epcontext guard without coupling error types. Cleaned up stale epcontext TODO. Commit `340d7b0` → cherry-picked to main as `ba3f67a`. **Reviewer: gaff-15 🟡** (3 non-blocking advisories: symlinks/lexical-only, capi mapping, DRY).

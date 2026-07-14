@@ -73,3 +73,7 @@ Non-author review of `squad/ort2-epctx-options` @ `3e8dbde`. Scope: capi FFI mem
 - **Verdict: 🟢 GREEN** — 2 non-blocking advisories:
   - A1: No negative FFI tests for null/invalid-UTF-8 into `ort2_add_session_config_entry` (coverage gap only).
   - A2: Released-handle reuse unguarded — by design, matches existing opaque-handle contract.
+
+## 2026-07-14T13:55:00Z — gaff-15: Review — external-data path-traversal guard (deckard-21)
+
+Security review of `weights.rs` traversal guard (commit `340d7b0`). Audited all untrusted-path-to-mmap sites in the loader (2 total, both now guarded); verified lexical correctness via throwaway probe; checked TOCTOU, capi wildcard, test quality. **Verdict: 🟡 YELLOW approve.** 3 non-blocking advisories: (1) lexical-only/symlinks — accepted, parity with epcontext; (2) capi `ExternalDataPath → InvalidGraph` explicit arm; (3) DRY — `resolve_external_path` duplicated in `weights.rs`/`epcontext.rs`. Build + clippy + conformance all green.

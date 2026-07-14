@@ -80,3 +80,7 @@ Hardened LayerNorm (axis/epsilon/structure guards) and MatMul+Add (trailing-broa
 
 ## 2026-07-14T16:20:00Z — onnx-encoder v1 (roy-18)
 Authored ONNX encoder v1: `crates/onnx-runtime-loader/src/encoder.rs` (+518), `tests/encoder.rs` (+488). Model-agnostic inverse of the loader decode path. Byte-exact round-trip on synthetic + real BERT 257 KB fixture. Gaff: 🟢 (4 non-blocking advisories). Leon: 🔴 BLOCK — `is_ep_context_op` + `"ep_cache_context"` literal in generic attribute layer violates §55.6. Locked out of the encoder artifact for this cycle; Deckard assigned as revision owner. v2 implemented by Deckard (commit de7ccce).
+
+## 2026-07-14T13:55:00Z — roy-19: Review — FusedGemm kernel + parity (batty-17)
+
+Reviewed Batty's FusedGemm work (commit `9e302a6`). Verified fusion-guard generalization with a throwaway expanding-bias probe (guard declines correctly; probe reverted). bert_toy unchanged and green. Kernel stage order `Relu(MatMul + bias)` correct; byte-identical to FusedMatMulBias + `relu_in_place`. Shape rule delegates to `matmul_shape`. Synthetic parity test high quality (tight 1e-6 atol, Relu actually clamps negatives). 8-crate build + clippy + all suites green. **Verdict: 🟢 GREEN approve.** Advisory: add permanent 3-node FusedGemm expanding-bias decline test for in-repo regression protection.

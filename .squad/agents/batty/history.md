@@ -76,3 +76,7 @@ Diagnosed bert_toy LayerNorm as 10-op split-diff variant. Added `try_match_layer
 - **Reviews**: gaff-12 🟢 (advisories A+B); deckard-17 🔴 B1 data-loss — non-injective sidecar names silently overwrite partition blobs.
 - **LOCKED OUT** of this artifact after deckard-17 rejection. Leon owned v2 revision; Gaff owned v3 revision.
 - Final commit on main: `0fa025e` (gaff-13 v3).
+
+## 2026-07-14T13:55:00Z — batty-17: FusedGemm CPU kernel + shape rule + synthetic parity (Phase-2 optimizer)
+
+Implemented the last deferred item of the Phase-2 optimizer: `com.microsoft::FusedGemm` CPU kernel (`ep-cpu/src/kernels/fused_gemm.rs`) = `Relu(MatMul(A,B)+bias)` reusing `matmul_dense`, `broadcast_apply`, and new shared `relu::relu_in_place`; registered `("FusedGemm","com.microsoft",1)`. Shape-inference handler in `linalg.rs` (output == MatMul shape; bias broadcasts; Relu shape-neutral). Extended bias-broadcast decline-guard in `fusion.rs` to cover `FusedGemm`. Synthetic parity test `fused_gemm_parity.rs`: max_abs 0.0 fused vs unfused; asserts 1 FusedGemm / 0 stray nodes. Commit `9e302a6` → cherry-picked to main as `4916618`. **Reviewer: roy-19 🟢** (1 advisory: add permanent expanding-bias decline test). **Fusion trio COMPLETE: LayerNorm ✅ / FusedMatMulBias ✅ / FusedGemm ✅.**
