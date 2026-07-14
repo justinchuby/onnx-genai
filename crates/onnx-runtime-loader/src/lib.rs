@@ -3,17 +3,37 @@
 //! Loads ONNX models from disk into the [`onnx_runtime_ir::Graph`] IR
 //! (see `docs/ORT2.md` §19).
 //!
-//! Pipeline ([`load_model`]):
+//! Pipeline ([`load_model`] / [`load_model_with_weights`]):
 //! 1. [`proto`] — decode the ONNX protobuf (`prost` types generated from the
 //!    vendored `onnx.proto3`) into a `ModelProto`.
 //! 2. [`graph_builder`] — build an [`onnx_runtime_ir::Graph`] (nodes, values,
 //!    symbolic dim interning, opset imports), upholding the §3.5 invariants.
 //! 3. [`weights`] — resolve inline and external initializer data (external
-//!    files are memory-mapped).
+//!    files are memory-mapped into a [`WeightStore`]).
 //! 4. [`shape_inference`] — best-effort static/symbolic shape propagation over
 //!    the BERT op set.
+//!
+//! ## Obtaining weight bytes at session time
+//!
+//! Use [`load_model_with_weights`] (or [`load_model_bytes_with_weights`]) to
+//! receive both the [`Graph`] and an [`Arc<WeightStore>`]. Then, given any
+//! [`onnx_runtime_ir::WeightRef`] stored in `graph.initializers`, call
+//! [`WeightStore::bytes`] to get the raw little-endian byte slice:
+//!
+//! ```ignore
+//! let (graph, store) = load_model_with_weights("model.onnx")?;
+//! for (vid, weight_ref) in &graph.initializers {
+//!     let bytes: &[u8] = store.bytes(weight_ref).expect("weight bytes live");
+//!     // ... hand bytes to a kernel
+//! }
+//! ```
+//!
+//! The `Arc` keeps all memory maps alive as long as any clone of it exists, so
+//! kernel dispatch can store `Arc<WeightStore>` alongside the `Graph` without
+//! lifetime coupling.
 
 use std::path::Path;
+use std::sync::Arc;
 
 use onnx_runtime_ir::Graph;
 
@@ -25,6 +45,7 @@ pub mod shape_inference;
 pub mod weights;
 
 pub use error::LoaderError;
+pub use weights::WeightStore;
 
 mod error {
     use std::path::PathBuf;
@@ -64,25 +85,73 @@ mod error {
 /// Runs the full pipeline: parse → build → load weights → shape inference.
 /// External initializer data is resolved relative to the model file's
 /// directory.
+///
+/// # Note on external weights
+///
+/// The returned `Graph` stores [`onnx_runtime_ir::WeightRef::External`]
+/// descriptors (path / offset / length) for weights held in external data
+/// files, but the memory maps that back those bytes are **dropped** when this
+/// function returns. Callers that need to read external weight bytes must
+/// either re-map the files themselves or use [`load_model_with_weights`] which
+/// keeps the maps alive via the returned [`Arc<WeightStore>`].
 pub fn load_model(path: impl AsRef<Path>) -> Result<Graph, LoaderError> {
+    Ok(load_model_with_weights(path)?.0)
+}
+
+/// Load a model from an in-memory protobuf buffer, producing a [`Graph`].
+///
+/// External initializer data (if any) is resolved relative to the current
+/// working directory.
+///
+/// # Note on external weights
+///
+/// Same caveat as [`load_model`]: external weight bytes are not accessible
+/// from the returned `Graph` alone. Use [`load_model_bytes_with_weights`] to
+/// keep them live.
+pub fn load_model_bytes(bytes: &[u8]) -> Result<Graph, LoaderError> {
+    Ok(load_model_bytes_with_weights(bytes, Path::new("."))?.0)
+}
+
+/// Load a model from a filesystem path, returning both the [`Graph`] and the
+/// live [`WeightStore`] that backs all initializer data.
+///
+/// The [`Arc<WeightStore>`] keeps every external-data memory map alive for as
+/// long as any clone of the `Arc` exists. At session time, given a
+/// [`onnx_runtime_ir::WeightRef`] from `graph.initializers`, call
+/// [`WeightStore::bytes`] to obtain the raw little-endian byte slice — this
+/// works for both [`WeightRef::Inline`] and [`WeightRef::External`] weights.
+///
+/// External initializer data is resolved relative to the model file's
+/// directory.
+pub fn load_model_with_weights(
+    path: impl AsRef<Path>,
+) -> Result<(Graph, Arc<WeightStore>), LoaderError> {
     let path = path.as_ref();
     let bytes = std::fs::read(path).map_err(|source| LoaderError::Io {
         path: path.to_path_buf(),
         source,
     })?;
     let model_dir = path.parent().unwrap_or_else(|| Path::new("."));
-    build_from_bytes(&bytes, model_dir)
+    build_from_bytes_with_weights(&bytes, model_dir)
 }
 
-/// Load a model from an in-memory protobuf buffer.
+/// Load a model from an in-memory protobuf buffer, returning both the
+/// [`Graph`] and the live [`WeightStore`] that backs all initializer data.
 ///
-/// External initializer data (if any) is resolved relative to the current
-/// working directory.
-pub fn load_model_bytes(bytes: &[u8]) -> Result<Graph, LoaderError> {
-    build_from_bytes(bytes, Path::new("."))
+/// External initializer data (if any) is resolved relative to `base_dir`.
+/// The [`Arc<WeightStore>`] keeps every memory map alive for as long as any
+/// clone of the `Arc` exists.
+pub fn load_model_bytes_with_weights(
+    bytes: &[u8],
+    base_dir: impl AsRef<Path>,
+) -> Result<(Graph, Arc<WeightStore>), LoaderError> {
+    build_from_bytes_with_weights(bytes, base_dir.as_ref())
 }
 
-fn build_from_bytes(bytes: &[u8], model_dir: &Path) -> Result<Graph, LoaderError> {
+fn build_from_bytes_with_weights(
+    bytes: &[u8],
+    model_dir: &Path,
+) -> Result<(Graph, Arc<WeightStore>), LoaderError> {
     let model = proto::decode_model(bytes)?;
     let BuiltGraph {
         mut graph,
@@ -90,10 +159,11 @@ fn build_from_bytes(bytes: &[u8], model_dir: &Path) -> Result<Graph, LoaderError
     } = graph_builder::build_graph(&model)?;
 
     let store = weights::load_weights(&model, model_dir, &name_map)?;
-    for (vid, weight) in store.weights {
-        graph.set_initializer(vid, weight);
+    // Copy descriptors into the graph; the store's mmaps stay alive via Arc.
+    for (&vid, weight) in &store.weights {
+        graph.set_initializer(vid, weight.clone());
     }
 
     let graph = shape_inference::run_shape_inference(graph)?;
-    Ok(graph)
+    Ok((graph, Arc::new(store)))
 }

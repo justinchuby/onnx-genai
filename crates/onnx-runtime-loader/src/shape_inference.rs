@@ -195,11 +195,18 @@ fn axis_attr(attrs: &HashMap<String, Attribute>, name: &str, default: i64) -> i6
     attrs.get(name).and_then(Attribute::as_int).unwrap_or(default)
 }
 
+/// Normalise a signed `axis` attribute to a `usize` index into a shape of
+/// `rank` dimensions.
+///
+/// Negative values wrap around (e.g., -1 → rank-1).  Positive values are
+/// clamped to `rank.saturating_sub(1)` — not `rank` — so that callers such as
+/// `gather` and `concat` that index `shape[axis]` or `shape[axis+1..]` cannot
+/// panic on a malformed `axis == rank` value from the model proto.
 fn norm_axis(axis: i64, rank: usize) -> usize {
     if axis < 0 {
         (axis + rank as i64).max(0) as usize
     } else {
-        (axis as usize).min(rank)
+        (axis as usize).min(rank.saturating_sub(1))
     }
 }
 
@@ -545,5 +552,18 @@ mod tests {
     #[test]
     fn dispatch_unknown_op_returns_none() {
         assert!(infer_op_shapes("SomeCustomOp", "", &[s(&[2, 2])], &HashMap::new()).is_none());
+    }
+
+    #[test]
+    fn norm_axis_clamps_at_rank_minus_one() {
+        // A malformed axis == rank used to clamp to `rank`, which would cause
+        // an index panic in `gather` / `concat`. It must now clamp to rank-1.
+        assert_eq!(norm_axis(3, 3), 2, "axis == rank should clamp to rank-1");
+        assert_eq!(norm_axis(10, 3), 2, "axis >> rank should clamp to rank-1");
+        // Negative axes still wrap correctly.
+        assert_eq!(norm_axis(-1, 4), 3);
+        assert_eq!(norm_axis(-4, 4), 0);
+        // rank == 0 edge: saturating_sub avoids underflow.
+        assert_eq!(norm_axis(0, 0), 0);
     }
 }
