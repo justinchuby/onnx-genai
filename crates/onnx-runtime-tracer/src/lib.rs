@@ -110,6 +110,7 @@ pub mod chrome;
 pub mod clock;
 pub mod collector;
 pub mod context;
+pub mod diagnose;
 pub mod error;
 pub mod event;
 pub mod format;
@@ -131,6 +132,10 @@ pub use collector::{
     TraceCollector,
 };
 pub use context::{SpanGuard, TraceContext};
+pub use diagnose::{
+    AutoDiagnosis, BoundType, DiagnosedIssue, DiagnosisConfig, IssueCategory, KernelSample,
+    Precision, RooflineAnalyzer, RooflineResult, Severity, render_roofline_report,
+};
 pub use error::{Result, TracerError};
 pub use event::{TraceEvent, TracePhase};
 pub use format::{TraceFormat, TraceVerbosity};
