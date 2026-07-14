@@ -62,6 +62,9 @@ mod error {
         #[error("allocation alignment mismatch")]
         AlignmentError,
 
+        #[error("invalid tensor view: {reason}")]
+        InvalidTensorView { reason: String },
+
         #[error("EP not initialized")]
         NotInitialized,
 
