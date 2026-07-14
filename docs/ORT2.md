@@ -2219,6 +2219,135 @@ impl OutputBufferCache {
 
 User sees none of this. They just call `session.run()` and it's fast.
 
+### 20.4 Execution Hints
+
+Users can provide placement/memory/scheduling hints to bias the optimizer.
+Hints are loaded from three sources (in priority order, later overrides earlier):
+
+1. **Embedded in `inference_metadata.yaml`** (model author distributes with model)
+2. **Standalone `execution_hints.json`** (user places next to model file)
+3. **Programmatic via builder API** (highest priority)
+
+Schema: [`schema/execution_hints.schema.json`](../schema/execution_hints.schema.json)
+
+**File discovery:**
+```
+model.onnx
+inference_metadata.yaml          # may contain "execution_hints" key
+execution_hints.json             # standalone override (optional)
+```
+
+The loader checks for `execution_hints.json` in the same directory as the model.
+If both exist, they are merged (standalone file wins on conflicts).
+
+**Example `execution_hints.json`:**
+```json
+{
+  "placement": [
+    {
+      "selector": { "pattern": "layers.*.attention.*" },
+      "device": { "type": "gpu" },
+      "strength": "force",
+      "reason": "Attention must colocate with KV cache on GPU"
+    },
+    {
+      "selector": { "pattern": "layers.0.*", "op_types": ["Embedding"] },
+      "device": { "type": "cpu" },
+      "strength": "prefer",
+      "reason": "Embedding is memory-bound, CPU has more bandwidth"
+    },
+    {
+      "selector": { "layer_range": { "start": 24, "end": 31 } },
+      "device": { "type": "cpu" },
+      "strength": "prefer",
+      "reason": "Last 8 layers offloadable when GPU memory is tight"
+    }
+  ],
+  "memory": [
+    {
+      "action": "pin",
+      "selector": { "pattern": "kv_cache*" },
+      "reason": "KV cache must never be evicted"
+    },
+    {
+      "action": "low_priority",
+      "selector": { "pattern": "layers.*.mlp.gate_proj.weight" },
+      "reason": "MoE inactive expert weights can be evicted first"
+    },
+    {
+      "action": "arena_size",
+      "device": { "type": "gpu", "index": 0 },
+      "bytes": 4294967296,
+      "reason": "Reserve 4GB scratch arena on GPU 0"
+    }
+  ],
+  "scheduling": [
+    {
+      "action": "cuda_graph_region",
+      "selector": { "pattern": "layers.*" },
+      "reason": "Entire transformer stack is CUDA-graph-capturable"
+    },
+    {
+      "action": "overlap",
+      "selector": { "op_types": ["AllReduce"] },
+      "chunk_size": 4,
+      "reason": "Overlap all-reduce with next layer compute"
+    }
+  ]
+}
+```
+
+**Example embedded in `inference_metadata.yaml`:**
+```yaml
+# ... other metadata ...
+execution_hints:
+  placement:
+    - selector: { pattern: "layers.*.attention.*" }
+      device: { type: gpu }
+      strength: force
+  memory:
+    - action: pin
+      selector: { pattern: "kv_cache*" }
+```
+
+**Programmatic (Rust):**
+```rust
+use onnx_runtime_session::{PlacementHint, NodeSelector, DeviceTarget, HintStrength};
+
+let session = InferenceSession::builder()
+    .model("model.onnx")
+    .placement_hint(PlacementHint {
+        selector: NodeSelector::pattern("layers.*.attention.*"),
+        device: DeviceTarget::gpu(0),
+        strength: HintStrength::Force,
+    })
+    .memory_hint(MemoryHint::pin("kv_cache*"))
+    .build()?;
+```
+
+**Programmatic (Python):**
+```python
+session = ort2.load("model.onnx", hints={
+    "placement": [
+        {"selector": {"pattern": "layers.*.attention.*"}, "device": {"type": "gpu"}, "strength": "force"},
+    ],
+    "memory": [
+        {"action": "pin", "selector": {"pattern": "kv_cache*"}},
+    ],
+})
+```
+
+**How hints affect the optimizer:**
+
+| Strength | Effect on ILP cost model |
+|----------|-------------------------|
+| `prefer` | 10× cost penalty for violating the hint |
+| `force` | Hard constraint in ILP (infinite cost / constraint equation) |
+
+The optimizer always finds a valid plan — `prefer` hints can be overridden
+if the total cost would be absurd. `force` hints are never violated
+(build fails with an error if the forced placement is infeasible).
+
 ### 20.4 Device Selection (Intent-Based)
 
 ```rust
