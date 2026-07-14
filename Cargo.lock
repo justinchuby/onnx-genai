@@ -1814,6 +1814,7 @@ version = "0.1.0"
 dependencies = [
  "memmap2",
  "onnx-runtime-ir",
+ "onnx-runtime-shape-inference",
  "prost",
  "prost-build",
  "protox",

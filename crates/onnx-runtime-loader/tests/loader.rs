@@ -422,7 +422,7 @@ fn load_with_weights_external_data_fixture() {
     }
 }
 
-// ── shape inference: Constant / value-propagation ("const-fold-lite") ──────────
+// ── shape inference: Constant / value (shape-data) propagation ─────────────────
 
 #[test]
 fn constant_infers_shape_dtype_and_value() {

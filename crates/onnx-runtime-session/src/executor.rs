@@ -26,9 +26,11 @@
 //! materialized once at build.
 //!
 //! The session does **not** infer op output shapes — that is the loader's job
-//! (`onnx-runtime-loader::shape_inference`). If a value's loader shape still
-//! contains an unbound symbol after substitution, the session cannot size its
-//! buffer and reports [`SessionError::UnresolvedShape`] naming the value and its
+//! (the loader runs `onnx-runtime-shape-inference` at load time). If a value's
+//! loader shape still contains an unbound symbol after substitution, the
+//! session resolves genuinely data-dependent extents just-in-time during
+//! execution (see [`dynamic_output_shapes`]); anything it still cannot size is
+//! reported as [`SessionError::UnresolvedShape`] naming the value and its
 //! producing op, rather than guessing.
 //!
 //! ## Holden's precondition (ep-api safety review #1) — enforced here

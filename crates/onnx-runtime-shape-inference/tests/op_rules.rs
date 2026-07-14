@@ -287,6 +287,23 @@ fn add_symbolic_vs_concrete_prefers_concrete() {
 }
 
 #[test]
+fn add_two_distinct_symbols_keeps_named_representative() {
+    // Broadcasting a data-dependent/anonymous symbol (high-range id, as minted
+    // by inference for an unresolved extent) against a named graph symbol
+    // (low-range id) must re-unify onto the *named* one — never a fresh symbol
+    // — so the session can bind it. This is the invariant that keeps a
+    // `Shape`-driven `Expand`/`Add` chain resolvable end-to-end.
+    let named = sym(1);
+    let anon = sym(0x8000_0000);
+    let n = node("Add", 2, 1);
+    // Order-independent: named wins whether it is the left or the right operand.
+    let outs = run(&n, vec![f32in(vec![anon.clone()]), f32in(vec![named.clone()])], 13);
+    assert_eq!(out_shape(&outs), vec![named.clone()]);
+    let outs = run(&n, vec![f32in(vec![named.clone()]), f32in(vec![anon])], 13);
+    assert_eq!(out_shape(&outs), vec![named]);
+}
+
+#[test]
 fn div_strict_incompatible_broadcast_errors() {
     let n = node("Div", 2, 1);
     let reg = InferenceRegistry::default_registry();

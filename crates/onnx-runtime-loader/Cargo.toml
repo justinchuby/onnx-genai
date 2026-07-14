@@ -10,6 +10,7 @@ categories = ["science", "parser-implementations"]
 
 [dependencies]
 onnx-runtime-ir = { workspace = true }
+onnx-runtime-shape-inference = { workspace = true }
 thiserror = { workspace = true }
 prost = "0.13"
 memmap2 = "0.9"

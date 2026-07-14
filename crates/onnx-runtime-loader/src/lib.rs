@@ -10,8 +10,13 @@
 //!    symbolic dim interning, opset imports), upholding the §3.5 invariants.
 //! 3. [`weights`] — resolve inline and external initializer data (external
 //!    files are memory-mapped into a [`WeightStore`]).
-//! 4. [`shape_inference`] — best-effort static/symbolic shape propagation over
-//!    the BERT op set.
+//! 4. Static/symbolic shape inference via
+//!    [`onnx-runtime-shape-inference`](onnx_runtime_shape_inference): the loader
+//!    owns the "loader = shape-inference" seam, so after the [`Graph`] is built
+//!    (with initializers applied) it runs the extensible per-op registry to
+//!    populate every value's shape and dtype. Values that cannot be resolved
+//!    statically (genuinely data-dependent extents) are left symbolic for the
+//!    session to resolve just-in-time.
 //!
 //! ## Obtaining weight bytes at session time
 //!
@@ -36,12 +41,12 @@ use std::path::Path;
 use std::sync::Arc;
 
 use onnx_runtime_ir::Graph;
+use onnx_runtime_shape_inference::{InferenceRegistry, MergePolicy};
 
 use crate::graph_builder::BuiltGraph;
 
 pub mod graph_builder;
 pub mod proto;
-pub mod shape_inference;
 pub mod weights;
 
 pub use error::LoaderError;
@@ -74,6 +79,9 @@ mod error {
 
         #[error("graph construction failed: {0}")]
         GraphBuild(String),
+
+        #[error("shape inference failed: {0}")]
+        ShapeInference(#[from] onnx_runtime_shape_inference::ShapeInferError),
 
         #[error(transparent)]
         Ir(#[from] onnx_runtime_ir::IrError),
@@ -164,6 +172,17 @@ fn build_from_bytes_with_weights(
         graph.set_initializer(vid, weight.clone());
     }
 
-    let graph = shape_inference::run_shape_inference(graph)?;
+    // Static/symbolic shape inference (the loader owns this seam). Run the
+    // extensible per-op registry over the fully-built graph — inputs,
+    // initializers, and node outputs — to populate every value's shape and
+    // dtype. `Permissive`: prefer the more specific dim on a benign
+    // disagreement and keep going, and reconcile graph outputs with their
+    // declared shapes rather than clobbering them. Values that stay symbolic
+    // (genuinely data-dependent extents) are left for the session's JIT
+    // fallback to resolve at run time.
+    let registry = InferenceRegistry::default_registry();
+    let opset_imports = graph.opset_imports.clone();
+    registry.infer_graph(&mut graph, &opset_imports, MergePolicy::Permissive)?;
+
     Ok((graph, Arc::new(store)))
 }

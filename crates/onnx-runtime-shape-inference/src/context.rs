@@ -281,9 +281,10 @@ impl<'a> InferenceContext<'a> {
         self.interner.fresh_dim()
     }
 
-    /// Broadcast two shapes under NumPy rules, minting fresh symbols where two
-    /// distinct symbolic dims must be unified. Errors only under
-    /// [`MergePolicy::Strict`] on a concrete incompatibility.
+    /// Broadcast two shapes under NumPy rules. Where two distinct symbolic dims
+    /// must be unified, keeps a deterministic representative symbol (see
+    /// [`broadcast_dim`](Self::broadcast_dim)) rather than minting a fresh one.
+    /// Errors only under [`MergePolicy::Strict`] on a concrete incompatibility.
     pub fn broadcast(
         &mut self,
         a: &[DimExpr],
@@ -335,9 +336,24 @@ impl<'a> InferenceContext<'a> {
             // must broadcast up to it, or the model is invalid).
             (Some(_), None) => Ok(a.clone()),
             (None, Some(_)) => Ok(b.clone()),
-            // Two distinct symbolic dims: we cannot prove equality, so mint a
-            // fresh unifying symbol.
-            (None, None) => Ok(self.fresh_dim()),
+            // Two distinct symbolic dims. In a valid model they must be equal at
+            // this position (or one is 1), so keeping a single *representative*
+            // symbol — rather than minting a fresh one no downstream consumer
+            // could ever bind — is both conformance-safe and what reference
+            // symbolic inference (onnxruntime) does. When both are bare symbols
+            // we keep the one with the smaller id, which deterministically
+            // prefers a named graph symbol (low-range, e.g. `batch`/`seq`) over
+            // an anonymous fresh one (allocated at/above `0x8000_0000`); this is
+            // what lets a data-dependent extent re-unify with the graph's real
+            // dims (e.g. a `Shape`-driven `Expand` target). A derived expression
+            // (not a bare symbol) has no id to compare, so it stays a fresh
+            // opaque symbol — the honest "unknown".
+            (None, None) => match (a.as_symbol(), b.as_symbol()) {
+                (Some(sa), Some(sb)) => {
+                    Ok(if sa.0 <= sb.0 { a.clone() } else { b.clone() })
+                }
+                _ => Ok(self.fresh_dim()),
+            },
         }
     }
 }
