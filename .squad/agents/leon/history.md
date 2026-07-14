@@ -102,3 +102,11 @@ Chew reviewed (read-only, 🟡 SHIP-with-advisories): layout correctness confirm
 ## 2026-07-14T14:50:00Z — leon-15: DRY external-path guard + explicit capi mapping (d6854c9)
 
 Closed Gaff advisories B and C from the external-data path-traversal review. Created `crates/onnx-runtime-loader/src/pathsafe.rs` with a shared `guarded_join` helper (behavior-identical to both prior local guards: rejects absolute, rooted, `..`-traversing paths; allows `CurDir` and nested normal components). Both `weights.rs` and `epcontext.rs` route through `guarded_join`, retaining distinct `LoaderError::ExternalDataPath` / `LoaderError::EpContextPath` variants. `map_loader_error` in `capi` now explicitly maps both variants to `OrtErrorCode::InvalidGraph`. Commit `e60dd6b` → cherry-picked to main as `d6854c9`. **Reviewer: deckard-22 🟢** (behavior-identical, both sites guarded, variants preserved, builds + tests + clippy green).
+
+## 2026-07-14T14:50:00Z — leon-16: Product rename ort2 → nxrt (C-ABI symbols, 43292ee)
+
+Renamed all 17 `ort2_*` `extern "C"` symbols to `nxrt_*` in `onnx-runtime-capi/src/lib.rs` + `tests/capi.rs` + intra-doc links. Zero `ort2_` remaining in `crates/`. Preserved `docs/ORT2.md` path citations and `"ort2-session"`/`"ort2-ep-api"` label strings (out of scope). No alias shims (pre-release). Commit `43292ee`. **Reviewer: gaff-16 🟢.**
+
+## 2026-07-14T14:50:00Z — leon-17: Fix — break shape-inference-loader publish cycle (183a876)
+
+Revision owner after Deckard (deckard-23) was locked out following roy-22 🔴 rejection. Made `onnx-runtime-shape-inference`'s dev-dep on `onnx-runtime-loader` path-only (no version) so `cargo publish` omits it from the packaged manifest. Verified cycle broken (packaged manifest: loader absent). 75 shape-inference tests pass. Runbook updated with path-only rationale and valid publish order. Commit `183a876`. **Reviewer: roy-23 🟢.**

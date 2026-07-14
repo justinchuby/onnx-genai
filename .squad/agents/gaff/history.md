@@ -77,3 +77,7 @@ Non-author review of `squad/ort2-epctx-options` @ `3e8dbde`. Scope: capi FFI mem
 ## 2026-07-14T13:55:00Z — gaff-15: Review — external-data path-traversal guard (deckard-21)
 
 Security review of `weights.rs` traversal guard (commit `340d7b0`). Audited all untrusted-path-to-mmap sites in the loader (2 total, both now guarded); verified lexical correctness via throwaway probe; checked TOCTOU, capi wildcard, test quality. **Verdict: 🟡 YELLOW approve.** 3 non-blocking advisories: (1) lexical-only/symlinks — accepted, parity with epcontext; (2) capi `ExternalDataPath → InvalidGraph` explicit arm; (3) DRY — `resolve_external_path` duplicated in `weights.rs`/`epcontext.rs`. Build + clippy + conformance all green.
+
+## 2026-07-14T14:50:00Z — gaff-16: Review — nxrt C-ABI symbol rename (leon-16)
+
+Non-author review of Leon's `ort2_*` → `nxrt_*` C-ABI rename. Verified both files become byte-identical to their parents when `nxrt_` normalized back to `ort2_`; zero `ort2_` remaining in `crates/`; preserved legacy text limited to unchanged citations and intentional label strings; no alias shims or dangling intra-doc links. Eight-crate build + 17 capi tests + rustdoc: all PASS. **Verdict: 🟢 GREEN.**

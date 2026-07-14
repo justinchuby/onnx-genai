@@ -88,3 +88,15 @@ Reviewed Batty's FusedGemm work (commit `9e302a6`). Verified fusion-guard genera
 ## 2026-07-14T14:50:00Z — roy-20: Review — AttentionFusion matcher/guards (batty-18)
 
 Reviewed Batty's `com.microsoft::FusedAttention` matcher in `fusion.rs` (optimizer/matcher half; kernel/shape = Chew). Built and ran 4 adversarial decline tests: classifier-head-bias-softmax, scaled-by-relu-not-qk, ambiguous-both-scaled, interior-value-escape — all correctly declined. Verified all decline guards return None (no silent defaults), both Div/Mul scale forms correct, k_transposed contract agrees with kernel, bert_toy fuse + conformance held, Roy's folded FusedGemm decline test present and asserting correctly. Optimizer 40 + session 18 + ep-cpu 5 fused_attention tests; 8-crate build; clippy clean. **Verdict: 🟢 APPROVE.** Non-blocking follow-up: document/test rank-2 FusedAttention equivalence (semantics-preserving, not a bug).
+
+## 2026-07-14T14:50:00Z — roy-21: Review — GELU fusion (batty-19)
+
+Reviewed Batty's GELU Erf-decomposition fusion. Verified DAG matcher guards (constant values ±1e-6, same-`ValueId` diamond closure), absence of misfires, bert_toy results (6 fusions, 0 Erf surviving), parity within bounds, all test suites green. **Verdict: 🟢 GREEN.** Advisory (pre-existing, not batty-19's): `optimizer/src/fusion.rs:101` inert `#[derive(Clone, Debug)]` glued into doc-comment since `e9bf155`; harmless, fix separately (optimizer-infra owner).
+
+## 2026-07-14T14:50:00Z — roy-22: Review — crate-name-reservation prep (deckard-23) 🔴 RED
+
+Reviewed Deckard's crate-name-reservation prep. Rejected: `docs/CRATE_RESERVATION.md` documented an invalid publish order (shape-inference before loader, but shape-inference had a dev-dep on loader — a publication cycle). All other checks passed (versions, pins, no-genai-deps, build, IR dry-run). Deckard locked out per Reviewer Rejection Protocol; revision reassigned to Leon (leon-17).
+
+## 2026-07-14T14:50:00Z — roy-23: Re-review — crate-reservation cycle fix (leon-17) 🟢 GREEN
+
+Cleared the earlier 🔴. Verified packaged shape-inference manifest has empty `[dev-dependencies]` section (no loader); all 8 versions/pins correct; 75 tests pass; IR dry-run succeeds; runbook updated. **Verdict: 🟢 GREEN.** Advisory: direct shape-inference packaging will fail until IR is in the registry (expected per documented sequence).

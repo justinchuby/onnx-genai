@@ -80,3 +80,7 @@ Authored the traversal guard for the weights loader's untrusted external-data re
 ## 2026-07-14T14:50:00Z — deckard-22: Review — DRY guard refactor + capi mapping (leon-15)
 
 Reviewed Leon's DRY refactor of the external-path traversal guard (commit `e60dd6b`). Verified `pathsafe::guarded_join` is behavior-identical to both prior local guards; both `weights.rs` and `epcontext.rs` exclusively route through it; distinct error variants preserved; capi explicit mapping correct; no new unsafe. All targeted builds, tests, clippy green. **Verdict: 🟢 APPROVE** — no revision required.
+
+## 2026-07-14T14:50:00Z — deckard-23: Crate-name reservation prep (8988abd) 🔴 LOCKED OUT
+
+Set all 8 `onnx-runtime-*` crates to `0.1.0-dev.0`; exact-pinned workspace deps to `=0.1.0-dev.0`; created `docs/CRATE_RESERVATION.md` runbook; workspace version and `onnx-genai` crates untouched. Commit `8988abd`. **Reviewer: roy-22 🔴 RED** — documented publish order created a shape-inference ↔ loader cycle. **LOCKED OUT** of revising this artifact; revision reassigned to Leon (leon-17), who fixed it in `183a876`.

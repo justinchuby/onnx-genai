@@ -1080,3 +1080,66 @@ Session unit (`option_tests`), session e2e (`tests/epcontext.rs`: byte-exact non
 **Build/test:** optimizer 40 + session 18 + ep-cpu 5 fused_attention tests all green. clippy -D warnings clean.
 
 **Non-blocking follow-up:** Matcher doesn't require rank-4. On a rank-2 QKᵀ-style SDPA the kernel computes the identical value (semantics-preserving). Consider a note/test documenting rank-2 equivalence if desired. NOT required for approval.
+
+---
+
+### 2026-07-14T14:50:00Z: GELU (Erf-based) fusion — fuse GELU Erf decomposition into com.microsoft::Gelu
+**By:** Batty (batty-19, claude-opus)
+**Commit:** `8e8d806` | **Reviewed:** Roy (roy-21, claude-opus) 🟢 GREEN
+**What:** New `RewriteKind::Gelu` DAG matcher in `optimizer/src/fusion.rs` matching bert_toy's diamond `Mul(X,0.5)` × `(1+Erf(Div(X,√2)))`. Emits `com.microsoft::Gelu` v1 (single input, no attrs). New CPU kernel `ep-cpu/src/kernels/gelu.rs` reusing the `erf` helper (made `pub(crate)`). Registered `("Gelu","com.microsoft",1)`. Shape-inference already covered Gelu as a shape-preserving unary (no change needed). Decline guards: constants must be provably 1/√2, 0.5, 1.0 within 1e-6; diamond closure requires half's X == Erf-branch X (same `ValueId`). FastGelu/tanh out of scope.
+**Why:** Closes the final Phase-2 optimizer OpFusion item on bert_toy. GELU/Erf is the dominant nonlinearity in bert_toy FFN layers; fusing eliminates 6 decomposed op chains.
+**Results:** Fires 6× on bert_toy, 0 Erf surviving. LayerNorm=12 / FusedMatMulBias=32 / FusedAttention=5 unchanged. Parity: synthetic fused-vs-unfused 3.353e-8, fused-vs-hand 0.0; bert_toy vs-reference 1.192e-7 (bound 2e-3); drift 1.416e-7 (DRIFT_ATOL 1e-5). Tests: optimizer 46, ep-cpu 115, session parity all green. Tolerances NOT loosened.
+
+---
+
+### 2026-07-14T14:50:00Z: Advisory — optimizer/src/fusion.rs:101 inert `#[derive(Clone, Debug)]` (Roy A2)
+**By:** Roy (roy-21, claude-opus) — non-blocking advisory captured during Gelu fusion review
+**What:** `optimizer/src/fusion.rs:101` has `#[derive(Clone, Debug)]` glued into a doc-comment line (introduced by `e9bf155`), making the derive INERT/no-op. `PatternMatch` is never cloned or debugged today — harmless, but the derive provides no benefit.
+**Why recorded:** Pre-existing (not introduced by batty-19). optimizer-infra owner should fix separately; not required before Gelu approval.
+
+---
+
+### 2026-07-14T14:50:00Z: Product rename ort2 → nxrt (C-ABI symbols)
+**By:** Leon (leon-16, gpt-5.6-sol)
+**Commit:** `43292ee` | **Reviewed:** Gaff (gaff-16, gpt-5.6-sol) 🟢 GREEN
+**What:** Renamed all 17 capi `extern "C"` symbols `ort2_*` → `nxrt_*` (the public C import name) in `onnx-runtime-capi/src/lib.rs` + `tests/capi.rs` + intra-doc links. Zero `ort2_` left in capi (and repo-wide `crates/`). Deliberately KEPT: `docs/ORT2.md` path citations in `//!` comments (user reverted that filename) and the `"ort2-session"`/`"ort2-ep-api"` todo-label strings (out of scope). No alias shims (pre-release).
+**Why:** User renamed the product/import name from "ort2" to "nxrt" in the design docs (commit `0b2ddd7`); the C-ABI surface must match. Rust crate names stay `onnx-runtime-*`.
+
+---
+
+### 2026-07-14T14:50:00Z: Review — nxrt C-ABI symbol rename (Gaff, gaff-16)
+**By:** Gaff (gaff-16, gpt-5.6-sol) — non-author reviewer
+**Target:** commit `dbaee6a` (author Leon) | **Verdict:** 🟢 GREEN
+**What:** Both changed files become byte-identical to their parents when `nxrt_` is normalized back to `ort2_`, confirming no signature, body, safety, ABI-attribute, or test-behavior changes. `ort2_` has zero matches in both `crates/onnx-runtime-capi/` and all of `crates/`. Preserved legacy text limited to unchanged `docs/ORT2.md` citations and three intentional `ort2-session`/`ort2-ep-api` labels. No alias shims or dangling `ort2_*` intra-doc links remain. Eight-crate build, `onnx-runtime-capi` tests (17 passed), and targeted rustdoc build all succeeded.
+
+---
+
+### 2026-07-14T14:50:00Z: Reserve the `onnx-runtime-*` crate names with a prerelease
+**By:** Deckard (deckard-23, gpt-5.6-sol)
+**Commits:** `8988abd` (prep) + `183a876` (cycle fix by Leon leon-17) | **Reviewed:** Roy (roy-22) 🔴 RED → Roy (roy-23) 🟢 GREEN after fix
+**What:** Set the eight `onnx-runtime-*` crates to `0.1.0-dev.0`; exact-pinned inter-crate workspace deps to `=0.1.0-dev.0` (a plain `^0.1.0` excludes prereleases under Cargo SemVer). Workspace package version stays `0.1.0`; `onnx-genai` crates untouched and none depend on `onnx-runtime-*`. New runbook `docs/CRATE_RESERVATION.md`. Actual upload remains blocked until a crates.io token is provided.
+**Why:** A prerelease reserves the intended crate names without changing the workspace-wide version, while exact pins make prerelease dependency resolution unambiguous.
+
+---
+
+### 2026-07-14T14:50:00Z: Review — crate-name-reservation prep (Roy, roy-22) — 🔴 REJECTED
+**By:** Roy (roy-22, gpt-5.6-sol) — non-author reviewer
+**Target:** commit `075622f` (author Deckard) | **Verdict:** 🔴 RED
+**What:** Rejected because `docs/CRATE_RESERVATION.md` documented an invalid publish order. `onnx-runtime-loader` has a normal dep on `onnx-runtime-shape-inference`, and `onnx-runtime-shape-inference` had a dev-dependency on `onnx-runtime-loader`; the documented order published shape-inference before loader, which is a publication cycle. All other checks passed: versions, exact pins, no genai deps, eight-crate build, IR dry-run.
+**Outcome:** Deckard locked out of revising this artifact per Reviewer Rejection Protocol. Revision assigned to Leon (leon-17).
+
+---
+
+### 2026-07-14T14:50:00Z: Fix — break shape-inference-loader publish cycle (Leon, leon-17 → 183a876)
+**By:** Leon (leon-17, gpt-5.6-sol)
+**Commit:** `183a876` | **Reviewed:** Roy (roy-23, gpt-5.6-sol) 🟢 GREEN
+**What:** Made `onnx-runtime-shape-inference`'s dev-dependency on `onnx-runtime-loader` path-only (no version field), so `cargo publish` omits it from the packaged manifest. Packaged manifest confirmed: loader ABSENT from shape-inference's dev-deps. 75 shape-inference tests still pass including loader-backed `bert_toy_fully_resolves`. Valid publish order: ir → shape-inference → loader → optimizer → ep-api → ep-cpu → session → capi. Runbook `docs/CRATE_RESERVATION.md` updated. IR publish dry-run succeeds.
+**Why:** Breaks the shape-inference ↔ loader cycle blocking crate-name reservation. Deckard locked out; Leon as revision owner.
+
+---
+
+### 2026-07-14T14:50:00Z: Advisory — shape-inference direct packaging requires IR published first (Roy, roy-23)
+**By:** Roy (roy-23, gpt-5.6-sol) — non-blocking advisory from cycle-fix re-review
+**What:** Direct shape-inference packaging against crates.io currently fails because the preceding IR crate version is not yet published (not in the registry). This is expected — the runbook's documented publish sequence (ir first, then shape-inference) must be followed; packaging any crate before its registry prerequisites are uploaded will fail.
+**Why recorded:** Operational note for whoever executes the crates.io reservation upload. Not a code defect.
+
