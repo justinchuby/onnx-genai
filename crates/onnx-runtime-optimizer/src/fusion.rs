@@ -4,12 +4,20 @@
 //! ## Matching model
 //!
 //! A [`FusionPattern`] is an ordered op sequence plus a replacement op type.
-//! [`FusionPattern::find_match`] walks the graph forward from each candidate
-//! start node, following producer→consumer ("spine") edges: node `i+1` of the
-//! match must consume an output of node `i`. Extra data edges *back* to
-//! already-matched nodes are allowed, which is what lets the 9-op LayerNorm
-//! decomposition (whose `Sub` result feeds both `Pow` and `Div`) match even
-//! though it is a DAG, not a strict chain.
+//! **Structural** patterns (MatMul+Add, MatMul+Add+Relu) use
+//! [`FusionPattern::try_match_from`], which walks the graph forward from each
+//! candidate start node following producer→consumer ("spine") edges: node `i+1`
+//! of the match must consume an output of node `i`. Extra data edges *back* to
+//! already-matched nodes are allowed.
+//!
+//! The **LayerNorm** rewrite instead uses a dedicated DAG-aware matcher
+//! ([`FusionPattern::try_match_layernorm`]): a real LayerNorm decomposition is a
+//! diamond whose `mean` feeds both a variance branch and a numerator branch, and
+//! some exporters emit two distinct `Sub(x, mean)` nodes rather than reusing one
+//! `diff`, so a single linear successor-walk can't express it. The matcher
+//! anchors on the `mean` `ReduceMean` and follows both branches to the final
+//! `Add`, accepting both the canonical 9-op (shared `Sub`) and the 10-op
+//! split-`Sub` shapes.
 //!
 //! ## Safety rule (never change numerics-visible semantics)
 //!
@@ -150,9 +158,20 @@ impl FusionPattern {
     }
 
     /// Find the next occurrence of this pattern, scanning nodes in id order.
+    ///
+    /// [`RewriteKind::LayerNorm`] uses a dedicated DAG-aware matcher
+    /// ([`Self::try_match_layernorm`]) because a real LayerNorm decomposition is
+    /// a diamond DAG whose `mean` feeds two branches (variance + numerator) and
+    /// may even use two distinct `Sub(x, mean)` nodes; the linear successor-walk
+    /// used by the structural patterns can't express that. All structural
+    /// patterns (MatMul+Add, MatMul+Add+Relu) keep the linear-chain matcher.
     pub fn find_match(&self, graph: &Graph) -> Option<PatternMatch> {
         for start in graph.nodes.keys() {
-            if let Some(m) = self.try_match_from(graph, start) {
+            let m = match self.kind {
+                RewriteKind::LayerNorm => self.try_match_layernorm(graph, start),
+                RewriteKind::Structural => self.try_match_from(graph, start),
+            };
+            if let Some(m) = m {
                 return Some(m);
             }
         }
@@ -162,6 +181,177 @@ impl FusionPattern {
     /// Whether `node` is a standard-domain op named `op`.
     fn op_matches(node: &Node, op: &str) -> bool {
         node.op_type == op && matches!(node.domain.as_str(), "" | "ai.onnx")
+    }
+
+    /// The first consumer of `value` whose op is `op` (standard domain).
+    fn find_consumer(graph: &Graph, value: ValueId, op: &str) -> Option<NodeId> {
+        graph
+            .value(value)
+            .consumers
+            .iter()
+            .copied()
+            .find(|&c| Self::op_matches(graph.node(c), op))
+    }
+
+    /// DAG-aware LayerNorm matcher anchored on the *mean* `ReduceMean` node.
+    ///
+    /// Real LayerNorm decompositions are a diamond, not a chain: the mean feeds
+    /// both the variance branch (`Sub → Pow → ReduceMean → Add(eps) → Sqrt`) and
+    /// the numerator branch (`Sub → Div`). Some exporters (e.g. the one that
+    /// produced `bert_toy`) emit **two distinct `Sub(x, mean)` nodes** — one per
+    /// branch — instead of reusing a single `diff`, so the region is 10 ops and
+    /// the shared `mean` value is consumed by two Subs. Both shapes are matched
+    /// here; the canonical single-`Sub` diamond is the 9-op special case where
+    /// the two branches share one `Sub`.
+    ///
+    /// The returned [`PatternMatch::nodes`] are in a fixed canonical order the
+    /// schema extractor relies on:
+    /// `[mean_rm, sub_pow, pow, var_rm, add_eps, sqrt, div, mul, final_add]`,
+    /// with `sub_div` appended as a 10th node only when the numerator uses a
+    /// distinct `Sub`. Fusion is declined (via [`Self::layernorm_spec`]) unless
+    /// every schema assumption (single concrete `axis`, constant f32 `epsilon`,
+    /// interior data-flow) is provable.
+    fn try_match_layernorm(&self, graph: &Graph, start: NodeId) -> Option<PatternMatch> {
+        let mean_rm = graph.try_node(start)?;
+        if !Self::op_matches(mean_rm, "ReduceMean") || mean_rm.outputs.len() != 1 {
+            return None;
+        }
+        let mean = mean_rm.outputs[0];
+
+        // Every `Sub` that consumes `mean` (i.e. computes `x - mean`). One in the
+        // canonical diamond, two in the split-diff variant.
+        let subs: Vec<NodeId> = graph
+            .value(mean)
+            .consumers
+            .iter()
+            .copied()
+            .filter(|&c| {
+                let n = graph.node(c);
+                Self::op_matches(n, "Sub") && n.input_values().any(|v| v == mean)
+            })
+            .collect();
+
+        // Try each Sub as the *variance* diff source (feeding `Pow`).
+        for &sub_pow in &subs {
+            let sp = graph.node(sub_pow);
+            if sp.outputs.len() != 1 {
+                continue;
+            }
+            let diff_pow = sp.outputs[0];
+            // Variance branch: Pow → ReduceMean → Add(eps) → Sqrt.
+            let Some(pow) = Self::find_consumer(graph, diff_pow, "Pow") else {
+                continue;
+            };
+            let sq = graph.node(pow).outputs[0];
+            let Some(var_rm) = Self::find_consumer(graph, sq, "ReduceMean") else {
+                continue;
+            };
+            let var = graph.node(var_rm).outputs[0];
+            let Some(add_eps) = Self::find_consumer(graph, var, "Add") else {
+                continue;
+            };
+            let vare = graph.node(add_eps).outputs[0];
+            let Some(sqrt) = Self::find_consumer(graph, vare, "Sqrt") else {
+                continue;
+            };
+            let std = graph.node(sqrt).outputs[0];
+            // Numerator branch: Div(diff, std) → Mul(scale) → Add(bias).
+            let Some(div) = Self::find_consumer(graph, std, "Div") else {
+                continue;
+            };
+            let dn = graph.node(div);
+            // The numerator is the Div operand that isn't `std`; it must be the
+            // output of a `Sub(x, mean)` (the same or a sibling of `sub_pow`).
+            let Some(num) = dn.input_values().find(|&v| v != std) else {
+                continue;
+            };
+            let Some(&sub_div) = subs.iter().find(|&&s| graph.node(s).outputs[0] == num) else {
+                continue;
+            };
+            let norm = dn.outputs[0];
+            let Some(mul) = Self::find_consumer(graph, norm, "Mul") else {
+                continue;
+            };
+            let scaled = graph.node(mul).outputs[0];
+            let Some(final_add) = Self::find_consumer(graph, scaled, "Add") else {
+                continue;
+            };
+
+            // Canonical node order (see doc). Append `sub_div` iff distinct.
+            let mut nodes = vec![
+                start, sub_pow, pow, var_rm, add_eps, sqrt, div, mul, final_add,
+            ];
+            if sub_div != sub_pow {
+                nodes.push(sub_div);
+            }
+            let matched_set: HashSet<NodeId> = nodes.iter().copied().collect();
+            // All matched nodes must be distinct (no accidental aliasing).
+            if matched_set.len() != nodes.len() {
+                continue;
+            }
+
+            // Safety rule: no matched node except `final_add` may have an output
+            // that escapes the matched set (external consumer or graph output).
+            let escapes = nodes.iter().any(|&nid| {
+                nid != final_add
+                    && graph.node(nid).outputs.iter().any(|&out| {
+                        graph.outputs.contains(&out)
+                            || graph
+                                .value(out)
+                                .consumers
+                                .iter()
+                                .any(|c| !matched_set.contains(c))
+                    })
+            });
+            if escapes {
+                continue;
+            }
+
+            // The fused node reuses `final_add`'s single output; it must survive
+            // removal (graph output or an external consumer).
+            let fa = graph.node(final_add);
+            if fa.outputs.len() != 1 {
+                continue;
+            }
+            let output = fa.outputs[0];
+            let out_val = graph.value(output);
+            let survives = graph.outputs.contains(&output)
+                || out_val.consumers.iter().any(|c| !matched_set.contains(c));
+            if !survives {
+                continue;
+            }
+
+            // External inputs in first-seen order (X, Scale, B, plus constants).
+            let produced: HashSet<ValueId> = nodes
+                .iter()
+                .flat_map(|&n| graph.node(n).outputs.iter().copied())
+                .collect();
+            let mut external = Vec::new();
+            let mut seen = HashSet::new();
+            for &nid in &nodes {
+                for iv in graph.node(nid).input_values() {
+                    if produced.contains(&iv) {
+                        continue;
+                    }
+                    if seen.insert(iv) {
+                        external.push(iv);
+                    }
+                }
+            }
+
+            let matched = PatternMatch {
+                nodes,
+                external_inputs: external,
+                output,
+            };
+
+            // Decline unless every schema assumption is provable.
+            if self.layernorm_spec(graph, &matched).is_none() {
+                continue;
+            }
+            return Some(matched);
+        }
+        None
     }
 
     /// Attempt to grow a match whose first node is `start`.
@@ -362,41 +552,51 @@ impl FusionPattern {
     /// Extract the schema-conformant `[X, Scale, B]` inputs and the
     /// `axis`/`epsilon` attributes for a matched LayerNorm decomposition, or
     /// `None` if any schema-aware assumption can't be proven — in which case the
-    /// pattern **declines to fuse** and the 9 original ops are kept intact.
+    /// pattern **declines to fuse** and the original ops are kept intact.
     ///
-    /// The chain nodes are, in order:
-    /// `0:ReduceMean(x) → mean`, `1:Sub(x, mean) → diff`, `2:Pow(diff, 2) → sq`,
-    /// `3:ReduceMean(sq) → var`, `4:Add(var, eps) → vare`, `5:Sqrt → std`,
-    /// `6:Div(diff, std) → norm`, `7:Mul(norm, Scale) → scaled`,
-    /// `8:Add(scaled, B) → out`.
+    /// The matched nodes are in the canonical order produced by
+    /// [`Self::try_match_layernorm`]:
+    /// `0:ReduceMean(x) → mean`, `1:Sub(x, mean) → diff_pow`,
+    /// `2:Pow(diff_pow, 2) → sq`, `3:ReduceMean(sq) → var`,
+    /// `4:Add(var, eps) → vare`, `5:Sqrt → std`, `6:Div(diff_div, std) → norm`,
+    /// `7:Mul(norm, Scale) → scaled`, `8:Add(scaled, B) → out`, and an optional
+    /// `9:Sub(x, mean) → diff_div` — present only when the numerator uses a
+    /// **second, distinct** `Sub` (the `bert_toy`-style split-diff variant). In
+    /// the canonical 9-op diamond the single `Sub` feeds both branches, so
+    /// `diff_div == diff_pow`.
     ///
-    /// * **X** is the `Sub` operand that is not the first `ReduceMean`'s output;
-    ///   **Scale** the `Mul` operand that is not the `Div` output; **B** the
-    ///   final `Add` operand that is not the `Mul` output. This disambiguation is
-    ///   order-independent (never baked to a particular exporter's operand order).
+    /// * **X** is the (shared) `Sub` operand that is not `mean`; **Scale** the
+    ///   `Mul` operand that is not the `Div` output; **B** the final `Add`
+    ///   operand that is not the `Mul` output. Order-independent disambiguation.
     /// * **axis** must resolve to a *single concrete* axis read from the first
-    ///   `ReduceMean`'s `axes` **attribute**. If `axes` is supplied as an *input*
-    ///   (opset ≥ 18), is multi-axis, or is absent, the axis can't be pinned down
-    ///   → decline (never silently assume `-1`).
-    /// * **epsilon** must be readable as a concrete f32 scalar constant. Constant
-    ///   folding runs before fusion, so a real LayerNorm's eps is a folded inline
-    ///   initializer; if it can't be read as an f32 → decline (never silently
-    ///   assume `1e-5`).
+    ///   `ReduceMean`'s `axes` **attribute** (axes-as-input / multi-axis / absent
+    ///   → decline; never silently assume `-1`).
+    /// * **epsilon** must be readable as a concrete f32 scalar constant (else
+    ///   decline; never silently assume `1e-5`).
     fn layernorm_spec(&self, graph: &Graph, m: &PatternMatch) -> Option<FusedNodeSpec> {
         let nodes = &m.nodes;
-        if nodes.len() != 9 {
+        if nodes.len() != 9 && nodes.len() != 10 {
             return None;
         }
         let rm1 = graph.node(nodes[0]);
-        let sub = graph.node(nodes[1]);
+        let sub_pow = graph.node(nodes[1]);
+        let pow = graph.node(nodes[2]);
         let rm2 = graph.node(nodes[3]);
         let add_eps = graph.node(nodes[4]);
         let div = graph.node(nodes[6]);
         let mul = graph.node(nodes[7]);
         let final_add = graph.node(nodes[8]);
+        // The numerator `Sub` is a distinct 10th node in the split-diff variant,
+        // otherwise it is the same `Sub` that feeds the variance branch.
+        let sub_div = if nodes.len() == 10 {
+            graph.node(nodes[9])
+        } else {
+            sub_pow
+        };
 
         let mean = rm1.outputs[0];
-        let diff = sub.outputs[0];
+        let diff_pow = sub_pow.outputs[0];
+        let diff_div = sub_div.outputs[0];
         let var = rm2.outputs[0];
         let norm = div.outputs[0];
         let scaled = mul.outputs[0];
@@ -404,8 +604,10 @@ impl FusionPattern {
         // Positive structural guard: confirm the interior data-flow really is the
         // LayerNorm decomposition, not just a coincidental op-type sequence. Each
         // consumer must actually read the interior tensor it is meant to consume.
-        if !sub.input_values().any(|v| v == mean)
-            || !div.input_values().any(|v| v == diff)
+        if !sub_pow.input_values().any(|v| v == mean)
+            || !sub_div.input_values().any(|v| v == mean)
+            || !pow.input_values().any(|v| v == diff_pow)
+            || !div.input_values().any(|v| v == diff_div)
             || !mul.input_values().any(|v| v == norm)
             || !final_add.input_values().any(|v| v == scaled)
         {
@@ -413,8 +615,12 @@ impl FusionPattern {
         }
 
         // Order-independent X/Scale/B disambiguation: each picks the operand that
-        // is NOT the matched interior tensor.
-        let x = sub.input_values().find(|&v| v != mean)?;
+        // is NOT the matched interior tensor. Both `Sub`s must subtract `mean`
+        // from the *same* `X`.
+        let x = sub_pow.input_values().find(|&v| v != mean)?;
+        if !sub_div.input_values().any(|v| v == x) {
+            return None;
+        }
         let scale = mul.input_values().find(|&v| v != norm)?;
         let bias = final_add.input_values().find(|&v| v != scaled)?;
 

@@ -16,12 +16,14 @@
 //!   — does not perturb results.
 //!
 //! * `"all"` — the full device-independent pipeline, which additionally runs
-//!   operator **fusion**. On this model fusion collapses the 9-op LayerNorm
+//!   operator **fusion**. On this model fusion collapses each LayerNorm
 //!   decomposition into a single schema-conformant
 //!   `com.microsoft::LayerNormalization` and every MatMul+Add into
 //!   `com.microsoft::FusedMatMulBias`, both backed by CPU kernels, so the fused
 //!   graph runs end-to-end and matches the reference. See
-//!   `full_optimization_fusion_path_matches_reference_and_default`.
+//!   `full_optimization_fusion_path_matches_reference_and_default` (numerics)
+//!   and `full_optimization_actually_fuses_layernorm_and_matmul_bias` (proof the
+//!   fusions actually fire on the loaded graph).
 //!
 //! Nothing here special-cases "bert" in library code — the model is a generic
 //! fixture and `"optimization"` is a generic, model-agnostic option.
@@ -151,12 +153,20 @@ fn basic_optimization_matches_reference_and_default() {
 }
 
 /// `"all"` optimization runs the full device-independent pipeline, including
-/// operator **fusion**. On this model fusion collapses the 9-op LayerNorm
+/// operator **fusion**. On this model fusion collapses each LayerNorm
 /// decomposition into a single schema-conformant `com.microsoft::LayerNormalization`
 /// (inputs `[X, Scale, B]` + `axis`/`epsilon` attributes) and every
 /// `MatMul + Add(bias)` into `com.microsoft::FusedMatMulBias`, both of which now
 /// have CPU kernels. The fused path therefore executes end-to-end and must match
 /// the reference to the same tolerance as the conformance / `"basic"` checks.
+///
+/// Unlike `MatMul + Add → FusedMatMulBias` (byte-identical to the original ops),
+/// the fused `LayerNormalization` kernel accumulates mean/variance in a single
+/// pass, so its result differs from the 10-op decomposition by a few ULPs. The
+/// fused `"all"` graph is therefore **not** byte-identical to opt-off — it is
+/// close to it, and (the load-bearing check) close to the onnxruntime reference,
+/// both well within the conformance tolerance. We assert against the reference,
+/// not against opt-off byte-identity.
 ///
 /// (Note: `bert_toy`'s feed-forward blocks use GELU/`Erf`, not `Relu`, so the
 /// `MatMul + Add + Relu → FusedGemm` pattern never fires here; that kernel is a
@@ -209,11 +219,82 @@ fn full_optimization_fusion_path_matches_reference_and_default() {
          vs opt-off max_abs = {overall_vs_off:.3e}"
     );
 
-    // Fusion must be numerically transparent: the fused graph is byte-identical
-    // to the optimization-off graph (0.0 across every output element). Lock this
-    // in as a real assertion, not just a print.
+    // The load-bearing correctness bound: the fused graph matches the committed
+    // onnxruntime reference to the conformance tolerance.
+    assert!(
+        overall_ref < ATOL,
+        "opt=all must match the reference within atol={ATOL:.0e} (got {overall_ref:.3e})"
+    );
+    // LayerNorm fusion changes numerics by only a few ULPs, so opt=all stays
+    // extremely close to opt-off — but is NOT byte-identical (the fused kernel
+    // reduces differently). Bound the drift tightly instead of asserting 0.0.
+    assert!(
+        overall_vs_off < ATOL,
+        "opt=all must stay within atol={ATOL:.0e} of opt-off (got {overall_vs_off:.3e})"
+    );
+}
+
+/// End-to-end proof the schema-aware fusions actually **fire on the real loaded
+/// `bert_toy` graph** — not just on synthetic unit fixtures. Loads the model
+/// through the production loader, runs the same `"all"` optimizer pipeline the
+/// session uses (constant-fold → DCE → fusion), and asserts the fused op counts.
+///
+/// This is the coverage gap Deckard's advisory A1 flagged: the LayerNorm
+/// schema-aware path was previously exercised only by unit tests because
+/// `bert_toy`'s LayerNorm uses two distinct `Sub(x, mean)` nodes, which the old
+/// linear-chain matcher rejected. The DAG-aware matcher now fuses it.
+#[test]
+fn full_optimization_actually_fuses_layernorm_and_matmul_bias() {
+    use onnx_runtime_optimizer::{
+        ConstantFolding, DeadNodeElimination, OpFusion, PassContext, run_passes,
+    };
+
+    let model_path = fixture_dir().join("model.onnx");
+    let mut graph = onnx_runtime_loader::load_model(&model_path).expect("load bert_toy");
+
+    let count = |g: &onnx_runtime_ir::Graph, op: &str| -> usize {
+        g.nodes.values().filter(|n| n.op_type == op).count()
+    };
+
+    // Before fusion: raw decomposition, no fused ops.
+    let ln_chains_before = count(&graph, "ReduceMean");
+    assert_eq!(count(&graph, "LayerNormalization"), 0);
+    assert_eq!(count(&graph, "FusedMatMulBias"), 0);
+    // Each LayerNorm region has two ReduceMean ops (mean + variance).
     assert_eq!(
-        overall_vs_off, 0.0,
-        "opt=all must be byte-identical to opt-off (fusion is numerically transparent)"
+        ln_chains_before % 2,
+        0,
+        "expected an even ReduceMean count (2 per LayerNorm region)"
+    );
+    let expected_layernorms = ln_chains_before / 2;
+
+    let passes: Vec<Box<dyn onnx_runtime_optimizer::OptimizationPass>> = vec![
+        Box::new(ConstantFolding),
+        Box::new(DeadNodeElimination),
+        Box::new(OpFusion::new()),
+    ];
+    run_passes(&mut graph, &passes, &PassContext::new()).expect("run optimizer passes");
+
+    let ln_after = count(&graph, "LayerNormalization");
+    let mm_after = count(&graph, "FusedMatMulBias");
+    eprintln!(
+        "bert_toy fusion counts: LayerNormalization={ln_after} (expected {expected_layernorms}), \
+         FusedMatMulBias={mm_after}"
+    );
+
+    // Every LayerNorm region fused, leaving no stray ReduceMean behind.
+    assert_eq!(
+        ln_after, expected_layernorms,
+        "every LayerNorm decomposition must fuse to one LayerNormalization"
+    );
+    assert_eq!(
+        count(&graph, "ReduceMean"),
+        0,
+        "no ReduceMean should survive: all belonged to fused LayerNorms"
+    );
+    // Regression guard: MatMul+Add fusion must be unaffected (still 32×).
+    assert_eq!(
+        mm_after, 32,
+        "MatMul+Add → FusedMatMulBias must stay at 32 fusions"
     );
 }
