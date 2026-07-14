@@ -1,0 +1,12 @@
+[package]
+name = "onnx-runtime-cpuinfo"
+version = "0.1.0"
+edition = "2024"
+description = "CPU hardware detection via pytorch/cpuinfo FFI bindings"
+license = "MIT"
+
+[dependencies]
+
+[build-dependencies]
+cmake = "0.1"
+bindgen = "0.70"
