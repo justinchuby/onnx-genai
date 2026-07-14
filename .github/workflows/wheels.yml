@@ -1,0 +1,133 @@
+name: Build and publish Python wheels
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_cuda:
+        description: Build separate CUDA wheel artifacts (Linux/Windows only)
+        type: boolean
+        default: false
+      publish:
+        description: Publish CPU wheels to PyPI after building
+        type: boolean
+        default: false
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  cpu-wheels:
+    name: CPU wheel (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x86_64
+            os: ubuntu-latest
+            archs: x86_64
+          - name: Windows AMD64
+            os: windows-latest
+            archs: AMD64
+          # macos-15-intel is GitHub's final hosted Intel runner line.
+          - name: macOS x86_64
+            os: macos-15-intel
+            archs: x86_64
+          # macos-14 is the GitHub-hosted Apple Silicon runner.
+          - name: macOS arm64
+            os: macos-14
+            archs: arm64
+    runs-on: ${{ matrix.os }}
+    env:
+      CIBW_ARCHS: ${{ matrix.archs }}
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build and smoke-test CPU wheel
+        uses: pypa/cibuildwheel@v4.1.0
+        with:
+          package-dir: crates/onnx-runtime-python
+          output-dir: wheelhouse
+
+      - name: Upload CPU wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: cpu-wheels-${{ matrix.os }}-${{ matrix.archs }}
+          path: wheelhouse/*.whl
+          if-no-files-found: error
+
+  cuda-wheels:
+    name: CUDA wheel scaffold (${{ matrix.name }})
+    if: github.event_name == 'workflow_dispatch' && inputs.build_cuda
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x86_64
+            os: ubuntu-latest
+            archs: x86_64
+          - name: Windows AMD64
+            os: windows-latest
+            archs: AMD64
+    runs-on: ${{ matrix.os }}
+    env:
+      CIBW_ARCHS: ${{ matrix.archs }}
+      # Pass the optional Cargo feature through cibuildwheel's PEP 517 frontend.
+      CIBW_CONFIG_SETTINGS: "build-args='--features cuda'"
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - uses: dtolnay/rust-toolchain@stable
+
+      # The CUDA EP dynamically loads CUDA, so compilation needs no GPU. Release
+      # promotion still requires CUDA-enabled self-hosted runners to verify the
+      # driver/toolkit and nvidia-*-cu13 dependency set end to end.
+      - name: Build and import-test CUDA wheel
+        uses: pypa/cibuildwheel@v4.1.0
+        with:
+          package-dir: crates/onnx-runtime-python
+          output-dir: wheelhouse
+
+      # CUDA and CPU currently share the nxrt distribution name and wheel tag.
+      # Keep CUDA artifacts separate until release engineering chooses a distinct
+      # distribution name, version suffix/index, and GPU validation environment.
+      - name: Upload CUDA wheel candidate
+        uses: actions/upload-artifact@v4
+        with:
+          name: cuda-wheels-${{ matrix.os }}-${{ matrix.archs }}
+          path: wheelhouse/*.whl
+          if-no-files-found: error
+
+  publish-cpu:
+    name: Publish CPU wheels
+    if: >-
+      startsWith(github.ref, 'refs/tags/v') ||
+      (github.event_name == 'workflow_dispatch' && inputs.publish)
+    needs: cpu-wheels
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+
+    steps:
+      - name: Download CPU wheels
+        uses: actions/download-artifact@v4
+        with:
+          pattern: cpu-wheels-*
+          path: wheelhouse
+          merge-multiple: true
+
+      - name: Publish with PyPI Trusted Publishing
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: wheelhouse

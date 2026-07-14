@@ -40,3 +40,15 @@ manifest-path = "Cargo.toml"
 # wheel is tagged cp310-abi3 and loads on CPython 3.10+ from a single build.
 features = ["pyo3/abi3-py310"]
 strip = true
+
+[tool.cibuildwheel]
+# One stable-ABI build per platform; maturin emits cp310-abi3 from this CPython
+# 3.10 build, and that wheel remains installable on later CPython versions.
+build = "cp310-*"
+skip = "*-musllinux_*"
+test-command = 'python -c "import nxrt"'
+
+[tool.cibuildwheel.linux]
+# Linux wheel builds run inside a manylinux container, so provision Rust there.
+before-all = "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal"
+environment = { PATH = "$HOME/.cargo/bin:$PATH" }

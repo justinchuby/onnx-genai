@@ -10,8 +10,8 @@ permissions:
   contents: read
 
 jobs:
-  rust:
-    name: Rust
+  rust-quality:
+    name: Rust quality
     runs-on: ubuntu-latest
     env:
       CARGO_TERM_COLOR: always
@@ -26,11 +26,75 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
-      - name: Run clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Run clippy on the portable runtime
+        run: >-
+          cargo clippy --locked --all-targets
+          -p onnx-runtime-ir
+          -p onnx-runtime-ep-api
+          -p onnx-runtime-ep-cpu
+          -p onnx-runtime-loader
+          -p onnx-runtime-session
+          -p onnx-runtime-tracer
+          -- -D warnings
 
-      - name: Build workspace
-        run: cargo build --workspace
+  rust-portable:
+    name: Rust (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x86_64
+            os: ubuntu-latest
+          - name: Windows x86_64
+            os: windows-latest
+          # macos-latest is the standard GitHub-hosted Apple Silicon runner.
+          - name: macOS arm64
+            os: macos-latest
+    runs-on: ${{ matrix.os }}
+    env:
+      CARGO_TERM_COLOR: always
 
-      - name: Test workspace
-        run: cargo test --workspace
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # Keep this list on the pure/offline runtime path. A workspace build also
+      # selects ort-sys, whose bootstrap downloads the native ORT distribution.
+      - name: Test portable CPU runtime
+        run: >-
+          cargo test --locked
+          -p onnx-runtime-ir
+          -p onnx-runtime-ep-api
+          -p onnx-runtime-ep-cpu
+          -p onnx-runtime-loader
+          -p onnx-runtime-session
+          -p onnx-runtime-tracer
+
+  cuda-compile:
+    name: CUDA compile (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x86_64
+            os: ubuntu-latest
+          - name: Windows x86_64
+            os: windows-latest
+    runs-on: ${{ matrix.os }}
+    env:
+      CARGO_TERM_COLOR: always
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # CUDA uses dynamic loading, so compile coverage needs no GPU or toolkit.
+      # This lane intentionally excludes macOS, where CUDA is unsupported.
+      - name: Check CUDA execution provider and Python feature
+        run: >-
+          cargo check --locked
+          -p onnx-runtime-ep-cuda
+          -p onnx-runtime-python
+          --features onnx-runtime-python/cuda
