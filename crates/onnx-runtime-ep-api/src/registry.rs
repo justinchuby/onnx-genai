@@ -27,6 +27,13 @@ impl OpKey {
     }
 }
 
+/// Normalise the default ONNX domain: the empty string and `"ai.onnx"` name the
+/// same (standard) domain. Contrib domains (e.g. `"com.microsoft"`) are left
+/// untouched. Keeps dispatch keyed on `(op_type, domain)` model-agnostically.
+fn norm_domain(domain: &str) -> &str {
+    if domain == "ai.onnx" { "" } else { domain }
+}
+
 /// Creates kernels for a specific op.
 pub trait KernelFactory: Send + Sync {
     fn create(&self, node: &Node, input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>>;
@@ -51,6 +58,7 @@ impl OpRegistry {
     /// Look up the best matching factory: the highest `since_version` that is
     /// `<= opset` for the given `(op_type, domain)`.
     pub fn lookup(&self, op_type: &str, domain: &str, opset: u64) -> Option<&dyn KernelFactory> {
+        let domain = norm_domain(domain);
         self.entries
             .iter()
             .filter(|(k, _)| {
@@ -58,6 +66,18 @@ impl OpRegistry {
             })
             .max_by_key(|(k, _)| k.since_version)
             .map(|(_, f)| f.as_ref())
+    }
+
+    /// Whether any factory is registered for `(op_type, domain)`, ignoring the
+    /// opset version. Used by providers to answer "is this an op/domain we
+    /// support?" without a concrete opset in hand (`supports_op`). Keeps the
+    /// support decision keyed on `(op_type, domain)` via the registry rather
+    /// than a hardcoded op/domain whitelist.
+    pub fn supports(&self, op_type: &str, domain: &str) -> bool {
+        let domain = norm_domain(domain);
+        self.entries
+            .keys()
+            .any(|k| k.op_type == op_type && k.domain == domain)
     }
 
     /// Number of registered entries.

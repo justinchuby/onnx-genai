@@ -27,12 +27,23 @@
 //!
 //! ## Kernel note
 //!
-//! The fused op types produced here (`LayerNormalization`, `FusedMatMulBias`,
-//! `FusedGemm`) may not have an `onnx-runtime-ep-cpu` kernel yet — this pass
-//! only rewrites the graph. Providing kernels is Phase-2/3 work. Likewise the
-//! generic external-input ordering is *structural*, not schema-aware; a
-//! schema-aware reorder (e.g. ONNX `LayerNormalization`'s `(X, Scale, B)`) is a
-//! later refinement and does not affect graph validity.
+//! The optimizer-produced fused op types (`LayerNormalization`,
+//! `FusedMatMulBias`, `FusedGemm`) are emitted in the private contrib domain
+//! [`CONTRIB_DOMAIN`] (`com.microsoft`), **not** the reserved default ONNX
+//! domain. `FusedMatMulBias`/`FusedGemm` are invented (non-standard) ops, so
+//! putting them in `ai.onnx` would collide with standard-op opset validation and
+//! make kernel dispatch ambiguous; a private contrib domain is the only
+//! unambiguous key. `com.microsoft` is the established ONNX-ecosystem contrib
+//! domain (where the `FusedMatMul`/`LayerNormalization` contrib variants live),
+//! so our IR stays interoperable with ORT-exported models and wider tooling.
+//!
+//! Kernel dispatch (`onnx-runtime-ep-cpu`) binds these by `(domain, op_type)`:
+//! only `LayerNormalization` currently has a CPU kernel (registered under both
+//! the default and the contrib domain); `FusedMatMulBias`/`FusedGemm` have no
+//! kernel yet — this pass only rewrites the graph. Providing those kernels is
+//! Phase-2/3 work. Likewise the generic external-input ordering is *structural*,
+//! not schema-aware; a schema-aware reorder (e.g. ONNX `LayerNormalization`'s
+//! `(X, Scale, B)`) is a later refinement and does not affect graph validity.
 
 use std::collections::HashSet;
 
@@ -40,6 +51,16 @@ use onnx_runtime_ir::{Graph, Node, NodeId, ValueId};
 
 use crate::error::Result;
 use crate::pass::{OptimizationPass, PassContext};
+
+/// The private contrib domain under which the optimizer emits every fused op.
+///
+/// `com.microsoft` is the established ONNX-ecosystem contrib domain; keeping our
+/// fused ops there (rather than the reserved `""`/`ai.onnx` domain) avoids
+/// colliding with standard-op opset validation, keeps kernel dispatch keyed
+/// unambiguously on `(domain, op_type)`, and stays interoperable with
+/// ORT-exported models. This is model-agnostic: it is a property of the op
+/// *domain*, independent of any particular model.
+pub const CONTRIB_DOMAIN: &str = "com.microsoft";
 
 /// A matched occurrence of a [`FusionPattern`] in a graph.
 #[derive(Clone, Debug)]
@@ -194,7 +215,10 @@ impl FusionPattern {
         }
 
         let inputs: Vec<Option<ValueId>> = m.external_inputs.iter().map(|&v| Some(v)).collect();
-        let fused = Node::new(NodeId(0), self.replacement.clone(), inputs, vec![output]);
+        let mut fused = Node::new(NodeId(0), self.replacement.clone(), inputs, vec![output]);
+        // Emit the fused op in the private contrib domain so it never collides
+        // with standard `ai.onnx` ops and dispatch stays keyed on (domain, op).
+        fused.domain = CONTRIB_DOMAIN.to_string();
         graph.insert_node(fused);
         Ok(())
     }
@@ -297,6 +321,7 @@ mod tests {
         assert_eq!(g.num_nodes(), 1);
         let fused = g.nodes.values().next().unwrap();
         assert_eq!(fused.op_type, "FusedMatMulBias");
+        assert_eq!(fused.domain, CONTRIB_DOMAIN);
         // Inputs are [a, w, bias].
         assert_eq!(fused.inputs.len(), 3);
         assert!(g.validate().is_ok());
@@ -325,7 +350,9 @@ mod tests {
 
         OpFusion::new().run(&mut g, &PassContext::new()).unwrap();
         assert_eq!(g.num_nodes(), 1);
-        assert_eq!(g.nodes.values().next().unwrap().op_type, "FusedGemm");
+        let fused = g.nodes.values().next().unwrap();
+        assert_eq!(fused.op_type, "FusedGemm");
+        assert_eq!(fused.domain, CONTRIB_DOMAIN);
         assert!(g.validate().is_ok());
     }
 
@@ -425,6 +452,7 @@ mod tests {
         assert_eq!(g.num_nodes(), 1, "9-op chain collapses to one node");
         let fused = g.nodes.values().next().unwrap();
         assert_eq!(fused.op_type, "LayerNormalization");
+        assert_eq!(fused.domain, CONTRIB_DOMAIN);
         // Structural external inputs: x, two, eps, scale, bias.
         assert_eq!(fused.inputs.len(), 5);
         assert_eq!(fused.outputs, g.outputs);

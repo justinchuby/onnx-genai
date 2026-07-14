@@ -31,7 +31,7 @@ use onnx_runtime_ep_api::{
 };
 use onnx_runtime_ir::{DeviceId, DeviceType, Node, Shape, TensorLayout};
 
-use crate::kernels::{build_cpu_registry, is_phase1_op};
+use crate::kernels::build_cpu_registry;
 
 /// CPU execution provider. Always available; the fallback EP for any op.
 ///
@@ -101,8 +101,12 @@ impl ExecutionProvider for CpuExecutionProvider {
     }
 
     fn supports_op(&self, op: &Node, shapes: &[Shape], _layouts: &[TensorLayout]) -> KernelMatch {
-        // Model-agnostic: keyed purely by op type. Default ONNX domain only.
-        if !op.domain.is_empty() || !is_phase1_op(&op.op_type) {
+        // Model-agnostic: keyed on (op_type, domain) via the registry — the
+        // single source of truth for "is this an op/domain we support". This
+        // accepts standard default-domain (`""`/`ai.onnx`) ops and any contrib
+        // ops (e.g. fused `com.microsoft` ops) the registry knows, without a
+        // hardcoded op/domain whitelist.
+        if !self.registry.supports(&op.op_type, &op.domain) {
             return KernelMatch::Unsupported;
         }
         // The reference kernels produce contiguous row-major outputs and accept
@@ -333,5 +337,22 @@ mod tests {
         assert!(ep.supports_op(&mm, &[], &[]).is_supported());
         let conv = Node::new(onnx_runtime_ir::NodeId(1), "Conv", vec![], vec![]);
         assert!(!ep.supports_op(&conv, &[], &[]).is_supported());
+    }
+
+    #[test]
+    fn supports_fused_contrib_domain_layernorm() {
+        let ep = CpuExecutionProvider::new();
+        // The optimizer emits fused LayerNormalization in `com.microsoft`; the
+        // EP must accept it (bound to the same kernel as the standard op).
+        let mut fused = Node::new(onnx_runtime_ir::NodeId(0), "LayerNormalization", vec![], vec![]);
+        fused.domain = "com.microsoft".to_string();
+        assert!(ep.supports_op(&fused, &[], &[]).is_supported());
+        assert!(ep.get_kernel(&fused, &[], 1).is_ok());
+
+        // A non-standard fused op with no kernel is still rejected in that
+        // domain — support is keyed on (op_type, domain) via the registry.
+        let mut unknown = Node::new(onnx_runtime_ir::NodeId(1), "FusedMatMulBias", vec![], vec![]);
+        unknown.domain = "com.microsoft".to_string();
+        assert!(!ep.supports_op(&unknown, &[], &[]).is_supported());
     }
 }

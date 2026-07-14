@@ -110,6 +110,10 @@ pub fn reduce(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
 /// Register the normalisation/reduction family.
 pub fn register(reg: &mut InferenceRegistry) {
     reg.register("", "LayerNormalization", 1, layer_norm);
+    // The optimizer emits fused `LayerNormalization` in the `com.microsoft`
+    // contrib domain; register the same rule there so the fused op's shape
+    // still resolves (identical output-shape semantics as the standard op).
+    reg.register("com.microsoft", "LayerNormalization", 1, layer_norm);
     reg.register("com.microsoft", "SkipLayerNormalization", 1, layer_norm);
     reg.register(
         "com.microsoft",

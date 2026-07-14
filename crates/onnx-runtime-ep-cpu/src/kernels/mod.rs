@@ -110,6 +110,14 @@ pub fn build_cpu_registry() -> OpRegistry {
         OpKey::new("LayerNormalization", "", 1),
         Box::new(layernorm::LayerNormFactory),
     );
+    // The optimizer emits fused `LayerNormalization` in the private contrib
+    // domain (`com.microsoft`); bind the same kernel there so dispatch resolves
+    // the fused op by (domain, op_type). The default-domain registration above
+    // still serves standard ONNX `LayerNormalization`.
+    reg.register(
+        OpKey::new("LayerNormalization", "com.microsoft", 1),
+        Box::new(layernorm::LayerNormFactory),
+    );
     // Elementwise binary broadcasting ops.
     reg.register(OpKey::new("Sub", "", 1), Box::new(elementwise::SubFactory));
     reg.register(OpKey::new("Mul", "", 1), Box::new(elementwise::MulFactory));
@@ -562,8 +570,10 @@ mod tests {
         let reg = build_cpu_registry();
         // Every Phase-1 op has at least one factory, and each resolves at a
         // modern opset. `Softmax` is registered twice (legacy v1 + per-axis
-        // v13), so the entry count is one more than the op-name count.
-        assert_eq!(reg.len(), PHASE1_OPS.len() + 1);
+        // v13) and `LayerNormalization` is registered in both the default and
+        // the `com.microsoft` contrib domain, so the entry count is two more
+        // than the op-name count.
+        assert_eq!(reg.len(), PHASE1_OPS.len() + 2);
         for op in PHASE1_OPS {
             assert!(reg.lookup(op, "", 21).is_some(), "missing factory for {op}");
         }
@@ -571,6 +581,12 @@ mod tests {
         assert!(reg.lookup("Softmax", "", 12).is_some());
         assert!(reg.lookup("Softmax", "", 13).is_some());
         assert!(reg.lookup("Conv", "", 21).is_none());
+        // The fused contrib-domain LayerNormalization resolves to the same
+        // kernel as the standard default-domain op.
+        assert!(reg.lookup("LayerNormalization", "com.microsoft", 1).is_some());
+        assert!(reg.supports("LayerNormalization", "com.microsoft"));
+        assert!(reg.supports("MatMul", "ai.onnx"));
+        assert!(!reg.supports("FusedMatMulBias", "com.microsoft"));
     }
 
     #[test]
