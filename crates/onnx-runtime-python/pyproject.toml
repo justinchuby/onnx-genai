@@ -59,6 +59,12 @@ skip = "*-musllinux_*"
 test-command = 'python -c "import nxrt"'
 
 [tool.cibuildwheel.linux]
-# Linux wheel builds run inside a manylinux container, so provision Rust there.
-before-all = "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal"
+# Linux wheel builds run inside a manylinux container, so provision Rust and
+# CMake for the bundled oneDNN source build. The image provides GCC/libgomp.
+before-all = "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal && python3 -m pip install cmake"
 environment = { PATH = "$HOME/.cargo/bin:$PATH" }
+
+[tool.cibuildwheel.macos]
+# Apple Clang does not bundle OpenMP. Use oneDNN's sequential runtime while
+# retaining its SIMD kernels; nxrt's higher-level Rayon parallelism remains.
+environment = { ONEDNN_CPU_RUNTIME = "SEQ" }

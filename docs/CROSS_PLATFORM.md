@@ -18,6 +18,12 @@ availability accurately. Missing CUDA must produce either `available == false`
 or an actionable error that says what was missing, why it is needed, and how to
 install/select CPU instead; it must not panic or silently execute on CPU.
 
+Linux and macOS `nxrt` wheels bundle a static oneDNN build and enable the
+oneDNN CPU backend by default, following the PyTorch-style wheel model. The
+Cargo/crates.io surface remains pure Rust by default because `onednn` stays a
+non-default feature. Windows wheels remain on the generic CPU backend until
+oneDNN's MSVC C++ and OpenMP linkage is wired.
+
 ## Findings
 
 | Severity | Area | File:line | Issue | Recommended fix |

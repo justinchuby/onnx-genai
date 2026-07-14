@@ -39,6 +39,7 @@ features = ["extension-module", "abi3-py310"]
 
 [features]
 default = []
+onednn = ["onnx-runtime-ep-cpu/onednn"]
 cuda = [
     "dep:onnx-runtime-ep-cuda",
     "dep:onnx-runtime-tracer",

@@ -28,20 +28,27 @@ jobs:
           - name: Linux x86_64
             os: ubuntu-latest
             archs: x86_64
+            cibw_config_settings: "build-args='--features onednn'"
           - name: Windows AMD64
             os: windows-latest
             archs: AMD64
+            cibw_config_settings: ""
           # macos-15-intel is GitHub's final hosted Intel runner line.
           - name: macOS x86_64
             os: macos-15-intel
             archs: x86_64
+            cibw_config_settings: "build-args='--features onednn'"
           # macos-14 is the GitHub-hosted Apple Silicon runner.
           - name: macOS arm64
             os: macos-14
             archs: arm64
+            cibw_config_settings: "build-args='--features onednn'"
     runs-on: ${{ matrix.os }}
     env:
       CIBW_ARCHS: ${{ matrix.archs }}
+      # maturin adds this Cargo feature to [tool.maturin].features (abi3-py310).
+      # The empty Windows value is a no-op, so that wheel keeps default features.
+      CIBW_CONFIG_SETTINGS: ${{ matrix.cibw_config_settings }}
 
     steps:
       - uses: actions/checkout@v4
