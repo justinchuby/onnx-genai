@@ -1,27 +1,30 @@
 # Reserving the `onnx-runtime-*` Crates
 
-All nine crates use version `0.1.0-dev.0`. Their internal dependencies are
+All ten crates use version `0.1.0-dev.0`. Their internal dependencies are
 exact-pinned to that version, so they must be published in dependency order:
 
 1. `onnx-runtime-ir`
-2. `onnx-runtime-tracer`
-3. `onnx-runtime-shape-inference`
-4. `onnx-runtime-loader`
-5. `onnx-runtime-optimizer`
-6. `onnx-runtime-ep-api`
-7. `onnx-runtime-ep-cpu`
-8. `onnx-runtime-session`
-9. `onnx-runtime-capi`
+2. `onnx-runtime-cpuinfo`
+3. `onnx-runtime-tracer`
+4. `onnx-runtime-shape-inference`
+5. `onnx-runtime-loader`
+6. `onnx-runtime-optimizer`
+7. `onnx-runtime-ep-api`
+8. `onnx-runtime-ep-cpu`
+9. `onnx-runtime-session`
+10. `onnx-runtime-capi`
 
-`onnx-runtime-tracer` is a **foundational** crate like `onnx-runtime-ir`: it
-has **no internal (`onnx-runtime-*`) dependencies** (only `serde`/`serde_json`),
-so it can be published as early as slot 2, before anything depends on it.
+`onnx-runtime-cpuinfo` and `onnx-runtime-tracer` are **foundational** crates
+like `onnx-runtime-ir`: they have **no internal (`onnx-runtime-*`)
+dependencies**, so they can be published early, before anything depends on
+them.
 
 Authenticate with either `cargo login <token>` or by setting
 `CARGO_REGISTRY_TOKEN`. Then run:
 
 ```sh
 cargo publish -p onnx-runtime-ir
+cargo publish -p onnx-runtime-cpuinfo
 cargo publish -p onnx-runtime-tracer
 cargo publish -p onnx-runtime-shape-inference
 cargo publish -p onnx-runtime-loader
@@ -42,6 +45,6 @@ cyclic publish requirement while preserving local tests. This is why shape
 inference can be published before the loader in the order above.
 
 For a real release, replace each crate's explicit `0.1.0-dev.0` version with
-the chosen stable version, update all nine workspace dependency pins to the
+the chosen stable version, update all ten workspace dependency pins to the
 same exact version, rebuild, and publish again in this order. Published
 prerelease versions are immutable and remain on crates.io.

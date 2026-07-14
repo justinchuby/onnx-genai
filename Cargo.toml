@@ -16,6 +16,7 @@ members = [
 
     # ── ORT 2.0 runtime layer (new — see docs/ORT2.md) ──
     "crates/onnx-runtime-ir",
+    "crates/onnx-runtime-cpuinfo",
     "crates/onnx-runtime-loader",
     "crates/onnx-runtime-shape-inference",
     "crates/onnx-runtime-optimizer",
@@ -47,6 +48,7 @@ onnx-genai-ort-sys = { path = "crates/onnx-genai-ort/ort-sys", version = "0.1.0"
 
 # ORT 2.0 runtime layer (new)
 onnx-runtime-ir = { path = "crates/onnx-runtime-ir", version = "=0.1.0-dev.0" }
+onnx-runtime-cpuinfo = { path = "crates/onnx-runtime-cpuinfo", version = "=0.1.0-dev.0" }
 onnx-runtime-loader = { path = "crates/onnx-runtime-loader", version = "=0.1.0-dev.0" }
 onnx-runtime-shape-inference = { path = "crates/onnx-runtime-shape-inference", version = "=0.1.0-dev.0" }
 onnx-runtime-optimizer = { path = "crates/onnx-runtime-optimizer", version = "=0.1.0-dev.0" }
