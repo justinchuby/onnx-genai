@@ -141,6 +141,13 @@ fn basic_optimization_matches_reference_and_default() {
         "bert_toy opt=basic PARITY PASS: vs reference max_abs = {overall_ref:.3e}, \
          vs opt-off max_abs = {overall_vs_off:.3e}"
     );
+
+    // `basic` (constant-fold + DCE) is structure-preserving, so it must be
+    // byte-identical to the optimization-off graph. Lock it in as an assertion.
+    assert_eq!(
+        overall_vs_off, 0.0,
+        "opt=basic must be byte-identical to opt-off (structure-preserving passes)"
+    );
 }
 
 /// `"all"` optimization runs the full device-independent pipeline, including
@@ -200,5 +207,13 @@ fn full_optimization_fusion_path_matches_reference_and_default() {
     eprintln!(
         "bert_toy opt=all PARITY PASS: vs reference max_abs = {overall_ref:.3e}, \
          vs opt-off max_abs = {overall_vs_off:.3e}"
+    );
+
+    // Fusion must be numerically transparent: the fused graph is byte-identical
+    // to the optimization-off graph (0.0 across every output element). Lock this
+    // in as a real assertion, not just a print.
+    assert_eq!(
+        overall_vs_off, 0.0,
+        "opt=all must be byte-identical to opt-off (fusion is numerically transparent)"
     );
 }

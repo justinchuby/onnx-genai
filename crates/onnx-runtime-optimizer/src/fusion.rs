@@ -94,7 +94,7 @@ pub enum RewriteKind {
     Structural,
     /// Schema-aware LayerNorm rewrite: emit `[X, Scale, B]` plus the `axis` and
     /// `epsilon` attributes the kernel reads, extracted from the matched
-    /// 9-op decomposition (see [`FusionPattern::layernorm_node`]).
+    /// 9-op decomposition (see [`FusionPattern::layernorm_spec`]).
     LayerNorm,
 }
 
@@ -240,11 +240,86 @@ impl FusionPattern {
             }
         }
 
-        Some(PatternMatch {
+        let matched = PatternMatch {
             nodes: chain,
             external_inputs: external,
             output,
-        })
+        };
+
+        // Decline-to-fuse: never return a match whose rewrite assumptions can't
+        // be *proven* from the graph. Declining here (rather than erroring later
+        // in `apply_fusion`) leaves the original ops in place and lets the
+        // fixpoint loop skip this occurrence instead of aborting the whole pass.
+        if !self.match_is_fusable(graph, &matched) {
+            return None;
+        }
+
+        Some(matched)
+    }
+
+    /// Whether a matched occurrence may be fused, or must **decline-to-fuse**
+    /// because a rewrite assumption can't be proven from the graph. Model-
+    /// agnostic: purely structural / shape checks, no model-specific logic.
+    fn match_is_fusable(&self, graph: &Graph, m: &PatternMatch) -> bool {
+        match self.kind {
+            RewriteKind::LayerNorm => self.layernorm_spec(graph, m).is_some(),
+            RewriteKind::Structural => {
+                // Only the MatMul+Add → FusedMatMulBias rewrite needs a bias
+                // broadcast guard; other structural rewrites are unconstrained.
+                if self.replacement == "FusedMatMulBias" {
+                    self.matmul_bias_broadcast_ok(graph, m)
+                } else {
+                    true
+                }
+            }
+        }
+    }
+
+    /// Decline the `MatMul + Add → FusedMatMulBias` fusion unless the `Add`'s
+    /// non-matmul (bias) operand broadcasts *into* the MatMul output shape
+    /// **without expanding it** — i.e. the bias is a valid trailing broadcast of
+    /// the matmul output (`[N]`, `[1, N]`, same-shape, scalar, …).
+    ///
+    /// A standalone `Add` broadcasts *both* operands up to their joint shape, so
+    /// a bias with extra leading dims, or a batch axis where the output is
+    /// extent-1, would grow the semantic result. The fused kernel and shape rule
+    /// instead assume the output equals the *matmul* shape and right-align the
+    /// bias, silently truncating the excess — wrong values *and* a too-small
+    /// output. We therefore only fuse when every overlapping axis is provably
+    /// non-expanding (identical dim, or bias extent 1). Any unknown/symbolic dim
+    /// that can't be proven equal makes us decline conservatively.
+    fn matmul_bias_broadcast_ok(&self, graph: &Graph, m: &PatternMatch) -> bool {
+        // The matched pattern is `[MatMul, Add]`; the MatMul output is the
+        // intermediate value the Add consumes, and the other Add operand is bias.
+        let [matmul, add] = m.nodes.as_slice() else {
+            return false;
+        };
+        let mm_out = graph.node(*matmul).outputs[0];
+        let Some(bias) = graph.node(*add).input_values().find(|&v| v != mm_out) else {
+            return false;
+        };
+        let mm_shape = &graph.value(mm_out).shape;
+        let bias_shape = &graph.value(bias).shape;
+
+        // More bias dims than the output → leading dims would expand the result.
+        if bias_shape.len() > mm_shape.len() {
+            return false;
+        }
+        // Right-align the bias against the output; every overlapping axis must be
+        // provably non-expanding: identical extent, or bias extent 1 (which just
+        // broadcasts up into the existing output dim).
+        let offset = mm_shape.len() - bias_shape.len();
+        for (i, &bdim) in bias_shape.iter().enumerate() {
+            let mdim = mm_shape[offset + i];
+            if bdim == mdim {
+                continue;
+            }
+            if bdim.as_static() == Some(1) {
+                continue;
+            }
+            return false;
+        }
+        true
     }
 
     /// Apply a match: remove the matched nodes and insert the replacement,
@@ -259,7 +334,9 @@ impl FusionPattern {
                 m.external_inputs.iter().map(|&v| Some(v)).collect(),
                 HashMap::new(),
             ),
-            RewriteKind::LayerNorm => self.layernorm_node(graph, m)?,
+            RewriteKind::LayerNorm => self
+                .layernorm_spec(graph, m)
+                .ok_or_else(|| crate::error::OptimizerError::Fusion(self.name.clone()))?,
         };
 
         // Remove in reverse (last-first): a node's consumers are gone before it,
@@ -283,7 +360,9 @@ impl FusionPattern {
     }
 
     /// Extract the schema-conformant `[X, Scale, B]` inputs and the
-    /// `axis`/`epsilon` attributes for a matched LayerNorm decomposition.
+    /// `axis`/`epsilon` attributes for a matched LayerNorm decomposition, or
+    /// `None` if any schema-aware assumption can't be proven — in which case the
+    /// pattern **declines to fuse** and the 9 original ops are kept intact.
     ///
     /// The chain nodes are, in order:
     /// `0:ReduceMean(x) → mean`, `1:Sub(x, mean) → diff`, `2:Pow(diff, 2) → sq`,
@@ -291,24 +370,22 @@ impl FusionPattern {
     /// `6:Div(diff, std) → norm`, `7:Mul(norm, Scale) → scaled`,
     /// `8:Add(scaled, B) → out`.
     ///
-    /// * **X** is the `Sub` operand that is not the first `ReduceMean`'s output.
-    /// * **Scale** is the `Mul` operand that is not the `Div` output.
-    /// * **B** is the final `Add` operand that is not the `Mul` output.
-    /// * **epsilon** is read from the constant `Add`-before-`Sqrt` operand that
-    ///   is not the second `ReduceMean`'s output (folded to an initializer by the
-    ///   preceding `ConstantFolding` pass); it falls back to the ONNX default
-    ///   `1e-5` only if that operand is not a readable f32 constant.
-    /// * **axis** is the first entry of the first `ReduceMean`'s `axes`
-    ///   attribute (default `-1`).
-    fn layernorm_node(
-        &self,
-        graph: &Graph,
-        m: &PatternMatch,
-    ) -> Result<FusedNodeSpec> {
-        let fail = || crate::error::OptimizerError::Fusion(self.name.clone());
+    /// * **X** is the `Sub` operand that is not the first `ReduceMean`'s output;
+    ///   **Scale** the `Mul` operand that is not the `Div` output; **B** the
+    ///   final `Add` operand that is not the `Mul` output. This disambiguation is
+    ///   order-independent (never baked to a particular exporter's operand order).
+    /// * **axis** must resolve to a *single concrete* axis read from the first
+    ///   `ReduceMean`'s `axes` **attribute**. If `axes` is supplied as an *input*
+    ///   (opset ≥ 18), is multi-axis, or is absent, the axis can't be pinned down
+    ///   → decline (never silently assume `-1`).
+    /// * **epsilon** must be readable as a concrete f32 scalar constant. Constant
+    ///   folding runs before fusion, so a real LayerNorm's eps is a folded inline
+    ///   initializer; if it can't be read as an f32 → decline (never silently
+    ///   assume `1e-5`).
+    fn layernorm_spec(&self, graph: &Graph, m: &PatternMatch) -> Option<FusedNodeSpec> {
         let nodes = &m.nodes;
         if nodes.len() != 9 {
-            return Err(fail());
+            return None;
         }
         let rm1 = graph.node(nodes[0]);
         let sub = graph.node(nodes[1]);
@@ -319,34 +396,45 @@ impl FusionPattern {
         let final_add = graph.node(nodes[8]);
 
         let mean = rm1.outputs[0];
+        let diff = sub.outputs[0];
         let var = rm2.outputs[0];
         let norm = div.outputs[0];
         let scaled = mul.outputs[0];
 
-        let x = sub.input_values().find(|&v| v != mean).ok_or_else(fail)?;
-        let scale = mul.input_values().find(|&v| v != norm).ok_or_else(fail)?;
-        let bias = final_add
-            .input_values()
-            .find(|&v| v != scaled)
-            .ok_or_else(fail)?;
+        // Positive structural guard: confirm the interior data-flow really is the
+        // LayerNorm decomposition, not just a coincidental op-type sequence. Each
+        // consumer must actually read the interior tensor it is meant to consume.
+        if !sub.input_values().any(|v| v == mean)
+            || !div.input_values().any(|v| v == diff)
+            || !mul.input_values().any(|v| v == norm)
+            || !final_add.input_values().any(|v| v == scaled)
+        {
+            return None;
+        }
 
-        let epsilon = add_eps
-            .input_values()
-            .find(|&v| v != var)
-            .and_then(|eps_val| read_scalar_f32(graph, eps_val))
-            .unwrap_or(1e-5);
+        // Order-independent X/Scale/B disambiguation: each picks the operand that
+        // is NOT the matched interior tensor.
+        let x = sub.input_values().find(|&v| v != mean)?;
+        let scale = mul.input_values().find(|&v| v != norm)?;
+        let bias = final_add.input_values().find(|&v| v != scaled)?;
 
-        let axis = rm1
-            .attr("axes")
-            .and_then(Attribute::as_ints)
-            .and_then(|a| a.first().copied())
-            .unwrap_or(-1);
+        // epsilon guard: must be a concrete f32 scalar constant (no 1e-5 default).
+        let eps_val = add_eps.input_values().find(|&v| v != var)?;
+        let epsilon = read_scalar_f32(graph, eps_val)?;
+
+        // axis guard: a single concrete axis from the ReduceMean `axes` ATTRIBUTE.
+        // Absent (axes-as-input at opset ≥ 18, or reduce-all) or multi-axis →
+        // decline rather than silently defaulting to `-1`.
+        let axes = rm1.attr("axes").and_then(Attribute::as_ints)?;
+        let [axis] = axes else {
+            return None;
+        };
 
         let mut attributes = HashMap::new();
-        attributes.insert("axis".to_string(), Attribute::Int(axis));
+        attributes.insert("axis".to_string(), Attribute::Int(*axis));
         attributes.insert("epsilon".to_string(), Attribute::Float(epsilon));
 
-        Ok((vec![Some(x), Some(scale), Some(bias)], attributes))
+        Some((vec![Some(x), Some(scale), Some(bias)], attributes))
     }
 }
 
@@ -706,5 +794,162 @@ mod tests {
         assert_eq!(m.nodes.len(), 2);
         assert_eq!(m.external_inputs.len(), 3);
         assert_eq!(p.pattern_name(), "MatMul+Bias");
+    }
+
+    #[test]
+    fn declines_layernorm_when_axes_is_input() {
+        // Opset-18 style: `ReduceMean` takes `axes` as an INPUT, not an
+        // attribute. The axis can't be pinned to a single concrete value from an
+        // attribute, so the fusion must DECLINE and leave all 9 ops intact
+        // (never silently assume axis = -1).
+        let mut g = layernorm_graph();
+        let mean = g
+            .values
+            .iter()
+            .find(|(_, v)| v.name.as_deref() == Some("mean"))
+            .map(|(id, _)| id)
+            .unwrap();
+        let rm1 = g.value(mean).producer.unwrap();
+        // Drop the `axes` attribute and feed axes in as an initializer INPUT.
+        g.node_mut(rm1).attributes.remove("axes");
+        let axes_in = g.create_named_value("axes_in", DataType::Int64, static_shape([1]));
+        g.set_initializer(
+            axes_in,
+            WeightRef::Inline(TensorData::from_raw(
+                DataType::Int64,
+                vec![1],
+                (-1i64).to_le_bytes().to_vec(),
+            )),
+        );
+        g.node_mut(rm1).inputs.push(Some(axes_in));
+        g.value_mut(axes_in).consumers.push(rm1);
+        assert!(g.validate().is_ok());
+
+        assert_eq!(g.num_nodes(), 9);
+        OpFusion::new().run(&mut g, &PassContext::new()).unwrap();
+        assert_eq!(
+            g.num_nodes(),
+            9,
+            "axes-as-input LayerNorm must NOT fuse — all original ops kept"
+        );
+        assert!(
+            g.nodes.values().all(|n| n.op_type != "LayerNormalization"),
+            "no fused LayerNormalization must be emitted"
+        );
+        assert_eq!(
+            g.nodes.values().filter(|n| n.op_type == "ReduceMean").count(),
+            2,
+            "both ReduceMean ops remain"
+        );
+        assert!(g.validate().is_ok());
+    }
+
+    #[test]
+    fn declines_layernorm_when_epsilon_not_constant() {
+        // If epsilon is a runtime graph INPUT (not a folded f32 initializer) it
+        // can't be read as a concrete scalar → DECLINE rather than silently
+        // substituting the ONNX default 1e-5.
+        let mut g = layernorm_graph();
+        let eps = g
+            .values
+            .iter()
+            .find(|(_, v)| v.name.as_deref() == Some("eps"))
+            .map(|(id, _)| id)
+            .unwrap();
+        // Turn the eps initializer into a plain runtime graph input.
+        g.initializers.remove(&eps);
+        g.add_input(eps);
+        assert!(g.validate().is_ok());
+
+        assert_eq!(g.num_nodes(), 9);
+        OpFusion::new().run(&mut g, &PassContext::new()).unwrap();
+        assert_eq!(
+            g.num_nodes(),
+            9,
+            "non-constant epsilon LayerNorm must NOT fuse"
+        );
+        assert!(g.nodes.values().all(|n| n.op_type != "LayerNormalization"));
+        assert!(g.validate().is_ok());
+    }
+
+    #[test]
+    fn declines_matmul_add_when_bias_expands() {
+        // MatMul output is [4]; the Add's bias is [2, 4], whose extra leading dim
+        // would broadcast the result UP to [2, 4]. The fused kernel/shape rule
+        // assume the output equals the matmul shape and would silently truncate,
+        // so the fusion must DECLINE and keep the original MatMul + Add.
+        let mut g = Graph::new();
+        g.opset_imports.insert(String::new(), 17);
+        let a = g.create_named_value("a", DataType::Float32, static_shape([4, 4]));
+        let w = g.create_named_value("w", DataType::Float32, static_shape([4]));
+        let bias = g.create_named_value("bias", DataType::Float32, static_shape([2, 4]));
+        g.add_input(a);
+        g.add_input(w);
+        g.add_input(bias);
+        let m = g.create_named_value("m", DataType::Float32, static_shape([4]));
+        g.insert_node(Node::new(NodeId(0), "MatMul", vec![Some(a), Some(w)], vec![m]));
+        let out = g.create_named_value("out", DataType::Float32, static_shape([2, 4]));
+        g.insert_node(Node::new(NodeId(0), "Add", vec![Some(m), Some(bias)], vec![out]));
+        g.add_output(out);
+
+        assert_eq!(g.num_nodes(), 2);
+        OpFusion::new().run(&mut g, &PassContext::new()).unwrap();
+        assert_eq!(g.num_nodes(), 2, "expanding bias must NOT fuse");
+        assert!(g.nodes.values().any(|n| n.op_type == "MatMul"));
+        assert!(g.nodes.values().any(|n| n.op_type == "Add"));
+        assert!(g.nodes.values().all(|n| n.op_type != "FusedMatMulBias"));
+        assert!(g.validate().is_ok());
+    }
+
+    #[test]
+    fn fuses_matmul_add_with_trailing_broadcast_bias() {
+        // A `[1, 4]` bias broadcasts INTO a `[3, 4]` matmul output without
+        // expanding it, so the guard must still allow this common case to fuse.
+        let mut g = Graph::new();
+        g.opset_imports.insert(String::new(), 17);
+        let a = g.create_named_value("a", DataType::Float32, static_shape([3, 4]));
+        let w = g.create_named_value("w", DataType::Float32, static_shape([4, 4]));
+        let bias = g.create_named_value("bias", DataType::Float32, static_shape([1, 4]));
+        g.add_input(a);
+        g.add_input(w);
+        g.add_input(bias);
+        let m = g.create_named_value("m", DataType::Float32, static_shape([3, 4]));
+        g.insert_node(Node::new(NodeId(0), "MatMul", vec![Some(a), Some(w)], vec![m]));
+        let out = g.create_named_value("out", DataType::Float32, static_shape([3, 4]));
+        g.insert_node(Node::new(NodeId(0), "Add", vec![Some(m), Some(bias)], vec![out]));
+        g.add_output(out);
+
+        OpFusion::new().run(&mut g, &PassContext::new()).unwrap();
+        assert_eq!(g.num_nodes(), 1, "trailing-broadcast bias must fuse");
+        assert_eq!(
+            g.nodes.values().next().unwrap().op_type,
+            "FusedMatMulBias"
+        );
+        assert!(g.validate().is_ok());
+    }
+
+    #[test]
+    fn declines_matmul_add_when_shape_unknown() {
+        // If the matmul output shape can't be resolved (empty/unknown), the guard
+        // can't prove the bias is non-expanding → DECLINE conservatively.
+        let mut g = Graph::new();
+        g.opset_imports.insert(String::new(), 17);
+        let a = g.create_named_value("a", DataType::Float32, Vec::new());
+        let w = g.create_named_value("w", DataType::Float32, Vec::new());
+        let bias = g.create_named_value("bias", DataType::Float32, static_shape([4]));
+        g.add_input(a);
+        g.add_input(w);
+        g.add_input(bias);
+        // `m` has an unknown (empty) shape.
+        let m = g.create_named_value("m", DataType::Float32, Vec::new());
+        g.insert_node(Node::new(NodeId(0), "MatMul", vec![Some(a), Some(w)], vec![m]));
+        let out = g.create_named_value("out", DataType::Float32, static_shape([4]));
+        g.insert_node(Node::new(NodeId(0), "Add", vec![Some(m), Some(bias)], vec![out]));
+        g.add_output(out);
+
+        OpFusion::new().run(&mut g, &PassContext::new()).unwrap();
+        assert_eq!(g.num_nodes(), 2, "unknown matmul shape must NOT fuse");
+        assert!(g.nodes.values().all(|n| n.op_type != "FusedMatMulBias"));
+        assert!(g.validate().is_ok());
     }
 }
