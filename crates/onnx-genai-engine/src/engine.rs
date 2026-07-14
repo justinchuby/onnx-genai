@@ -224,7 +224,12 @@ impl Engine {
                 detect_model_decode_path(&draft_session, metadata_max_context, None, None, 0)?;
             let draft_kv_model = infer_kv_model_info(&draft_session, config.page_size, onnx_genai_kv::KvDType::F32)?;
             let draft_kv_cache = if let Some(kv_model) = &draft_kv_model {
-                PagedKvCache::new_with_tensor_config(kv_model.tensor_config, config.num_gpu_pages)
+                PagedKvCache::new_with_layer_tensor_configs(
+                    kv_model.tensor_config.page_size,
+                    kv_model.tensor_config.dtype,
+                    kv_model.layer_configs.clone(),
+                    config.num_gpu_pages,
+                )
             } else {
                 PagedKvCache::new(config.page_size, config.num_gpu_pages)
             };
@@ -240,7 +245,15 @@ impl Engine {
         let kv_cache = if let Some(kv_model) = &kv_model {
             // The paged tensor layout is derived from present-KV outputs: each
             // layer has key/value tensors shaped like [batch, kv_heads, seq, head_dim].
-            PagedKvCache::new_with_tensor_config(kv_model.tensor_config, config.num_gpu_pages)
+            // Per-layer geometry (heterogeneous head_dim across layers, e.g. the
+            // Gemma-4 sliding/full split) is fed from the model's own KV output
+            // shapes so mixed-geometry models page correctly.
+            PagedKvCache::new_with_layer_tensor_configs(
+                kv_model.tensor_config.page_size,
+                kv_model.tensor_config.dtype,
+                kv_model.layer_configs.clone(),
+                config.num_gpu_pages,
+            )
         } else {
             PagedKvCache::new(config.page_size, config.num_gpu_pages)
         };

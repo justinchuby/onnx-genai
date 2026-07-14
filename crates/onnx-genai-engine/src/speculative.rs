@@ -1231,28 +1231,7 @@ impl Engine {
             .kv_cache
             .materialize_sequence(session_id)
             .map_err(|e| anyhow::anyhow!("Failed to materialize target KV for shared_kv: {}", e))?;
-        let num_layers = materialized.layers.len();
-        let mut slices = Vec::with_capacity(assistant.config.shared_kv.len());
-        for group in &assistant.config.shared_kv {
-            let layer_idx = group.target_layers.last().copied().with_context(|| {
-                format!("shared_kv group '{}' has no target layers", group.name)
-            })?;
-            let layer = materialized.layers.get(layer_idx).with_context(|| {
-                format!(
-                    "shared_kv group '{}' references target layer {} but only {} layers exist",
-                    group.name, layer_idx, num_layers
-                )
-            })?;
-            slices.push(SharedKvInput {
-                name: group.name.clone(),
-                key: layer.key.clone(),
-                value: layer.value.clone(),
-                kv_heads: materialized.num_kv_heads,
-                kv_len: materialized.sequence_len,
-                head_dim: materialized.head_dim,
-            });
-        }
-        Ok(slices)
+        shared_kv_slices_from_materialized(&assistant.config.shared_kv, &materialized)
     }
 
     pub(crate) fn sync_draft_to_target(&mut self, state: &mut EngineSession) -> anyhow::Result<()> {
@@ -1281,12 +1260,124 @@ impl Engine {
     }
 }
 
+/// Slice a materialized target KV cache into per-group `shared_kv.*` proposer
+/// inputs, reading each group's `num_kv_heads`/`head_dim` from the **specific**
+/// target layer it references (the last listed `target_layers` index) rather
+/// than a single global geometry. This makes heterogeneous per-layer head_dim
+/// models (e.g. Gemma-4 sliding vs full) bind correctly.
+pub(crate) fn shared_kv_slices_from_materialized(
+    groups: &[crate::config::SharedKvBinding],
+    materialized: &onnx_genai_kv::MaterializedKv,
+) -> anyhow::Result<Vec<SharedKvInput>> {
+    let num_layers = materialized.layers.len();
+    let mut slices = Vec::with_capacity(groups.len());
+    for group in groups {
+        let layer_idx = group
+            .target_layers
+            .last()
+            .copied()
+            .with_context(|| format!("shared_kv group '{}' has no target layers", group.name))?;
+        let layer = materialized.layers.get(layer_idx).with_context(|| {
+            format!(
+                "shared_kv group '{}' references target layer {} but only {} layers exist",
+                group.name, layer_idx, num_layers
+            )
+        })?;
+        slices.push(SharedKvInput {
+            name: group.name.clone(),
+            key: layer.key.clone(),
+            value: layer.value.clone(),
+            kv_heads: layer.num_kv_heads,
+            kv_len: materialized.sequence_len,
+            head_dim: layer.head_dim,
+        });
+    }
+    Ok(slices)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use onnx_genai_ort::{Environment, SessionOptions};
     use std::path::Path;
     use std::sync::{Mutex, OnceLock};
+
+    /// The shared-KV slicer must read each group's `num_kv_heads`/`head_dim`
+    /// from the specific target layer it references, not a single global value.
+    /// With a heterogeneous cache (layer 0: 2×8 sliding, layer 1: 3×16 full),
+    /// the sliding group must bind 8-dim slices and the full group 16-dim, each
+    /// with its layer's own head count and buffer.
+    #[test]
+    fn shared_kv_slices_pick_per_layer_geometry() -> anyhow::Result<()> {
+        use crate::config::SharedKvBinding;
+        use onnx_genai_kv::{MaterializedKv, MaterializedLayerKv};
+
+        let seq_len = 2;
+        // Layer 0 (sliding): num_kv_heads=2, head_dim=8 → 2*2*8 = 32 floats.
+        let sliding_key: Vec<f32> = (0..2 * seq_len * 8).map(|v| v as f32).collect();
+        let sliding_value: Vec<f32> = (0..2 * seq_len * 8).map(|v| (v + 1000) as f32).collect();
+        // Layer 1 (full): num_kv_heads=3, head_dim=16 → 3*2*16 = 96 floats.
+        let full_key: Vec<f32> = (0..3 * seq_len * 16).map(|v| (v + 2000) as f32).collect();
+        let full_value: Vec<f32> = (0..3 * seq_len * 16).map(|v| (v + 3000) as f32).collect();
+
+        let materialized = MaterializedKv {
+            start_position: 0,
+            sink_len: 0,
+            sequence_len: seq_len,
+            layers: vec![
+                MaterializedLayerKv {
+                    key: sliding_key.clone(),
+                    value: sliding_value.clone(),
+                    num_kv_heads: 2,
+                    head_dim: 8,
+                },
+                MaterializedLayerKv {
+                    key: full_key.clone(),
+                    value: full_value.clone(),
+                    num_kv_heads: 3,
+                    head_dim: 16,
+                },
+            ],
+        };
+
+        let groups = vec![
+            SharedKvBinding {
+                name: "sliding_attention".into(),
+                target_layers: vec![0],
+            },
+            SharedKvBinding {
+                name: "full_attention".into(),
+                target_layers: vec![1],
+            },
+        ];
+
+        let slices = shared_kv_slices_from_materialized(&groups, &materialized)?;
+        assert_eq!(slices.len(), 2);
+
+        let sliding = &slices[0];
+        assert_eq!(sliding.name, "sliding_attention");
+        assert_eq!(sliding.kv_heads, 2, "sliding group must use layer 0 heads");
+        assert_eq!(sliding.head_dim, 8, "sliding group must use layer 0 head_dim");
+        assert_eq!(sliding.kv_len, seq_len);
+        assert_eq!(sliding.key, sliding_key);
+        assert_eq!(sliding.value, sliding_value);
+
+        let full = &slices[1];
+        assert_eq!(full.name, "full_attention");
+        assert_eq!(full.kv_heads, 3, "full group must use layer 1 heads");
+        assert_eq!(full.head_dim, 16, "full group must use layer 1 head_dim");
+        assert_eq!(full.kv_len, seq_len);
+        assert_eq!(full.key, full_key);
+        assert_eq!(full.value, full_value);
+
+        // An out-of-range target layer is a clear error, not a silent misread.
+        let bad = vec![SharedKvBinding {
+            name: "oob".into(),
+            target_layers: vec![9],
+        }];
+        assert!(shared_kv_slices_from_materialized(&bad, &materialized).is_err());
+        Ok(())
+    }
 
     struct StubProposer {
         tokens: Vec<TokenId>,

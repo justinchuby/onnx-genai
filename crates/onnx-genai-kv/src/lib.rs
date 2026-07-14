@@ -38,7 +38,8 @@ pub use connector::{
 pub use fp8::{Fp8Format, decode_f32 as decode_fp8, encode_f32 as encode_fp8};
 pub use local_tiered::{DiskTierConfig, LocalTieredConfig, LocalTieredConnector};
 pub use page_table::{
-    KvDType, KvKind, KvQuantConfig, LayerKvDType, Page, PageId, PageTable, PageTensorConfig,
+    KvDType, KvKind, KvQuantConfig, LayerKvDType, LayerTensorConfig, Page, PageId, PageTable,
+    PageTensorConfig,
 };
 pub use paged_cache::{LayerKv, MaterializedKv, MaterializedLayerKv, PagedKvCache};
 pub use prefix_cache::PrefixCache;

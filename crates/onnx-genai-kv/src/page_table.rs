@@ -230,7 +230,46 @@ fn resolve_layer_index(layer: i32, num_layers: usize) -> Result<usize, KvError> 
     Ok(resolved as usize)
 }
 
+/// KV tensor geometry (`num_kv_heads` × `head_dim`) for a single layer.
+///
+/// Different transformer layers may declare different geometry (e.g. Gemma-4
+/// E2B uses `head_dim` 256 for sliding/local layers and 512 for full/global
+/// layers). The page table stores one of these per layer so that page sizing,
+/// writes, and materialization all use the correct per-layer byte stride.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LayerTensorConfig {
+    pub num_kv_heads: usize,
+    pub head_dim: usize,
+}
+
+impl LayerTensorConfig {
+    pub const fn new(num_kv_heads: usize, head_dim: usize) -> Self {
+        Self {
+            num_kv_heads,
+            head_dim,
+        }
+    }
+
+    /// Number of f32 scalars for one token of this layer's key (or value).
+    pub const fn f32_len_per_token(self) -> usize {
+        self.num_kv_heads * self.head_dim
+    }
+
+    pub const fn validate(self) -> bool {
+        self.num_kv_heads > 0 && self.head_dim > 0
+    }
+}
+
 /// Tensor geometry and scalar type for one physical page.
+///
+/// This is the *uniform* descriptor: it assumes every layer shares
+/// `num_kv_heads`/`head_dim`. Heterogeneous models are configured through
+/// [`PagedKvCache::new_with_layer_tensor_configs`](crate::PagedKvCache) /
+/// [`PageTable::new_with_layer_configs`], which carry a per-layer
+/// [`LayerTensorConfig`]. When a heterogeneous cache is built, its retained
+/// `PageTensorConfig` reports layer 0's geometry so uniform callers keep
+/// compiling; the authoritative per-layer geometry lives in
+/// [`PageTable::layer_configs`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PageTensorConfig {
     pub num_layers: usize,
@@ -252,6 +291,11 @@ impl PageTensorConfig {
 
     pub fn validate(self) -> bool {
         self.num_layers > 0 && self.num_kv_heads > 0 && self.head_dim > 0 && self.page_size > 0
+    }
+
+    /// Expand this uniform descriptor into one [`LayerTensorConfig`] per layer.
+    pub fn to_layer_configs(self) -> Vec<LayerTensorConfig> {
+        vec![LayerTensorConfig::new(self.num_kv_heads, self.head_dim); self.num_layers]
     }
 }
 
@@ -310,7 +354,8 @@ impl Page {
     fn new(
         id: PageId,
         device: Device,
-        config: Option<PageTensorConfig>,
+        page_size: usize,
+        layer_configs: &[LayerTensorConfig],
         quant_config: Option<&KvQuantConfig>,
     ) -> Self {
         let mut storage_layout = Vec::new();
@@ -318,9 +363,14 @@ impl Page {
         let mut quantized_len = 0;
         let mut fp8_len = 0;
         let mut scale_len = 0;
-        if let (Some(config), Some(quant_config)) = (config, quant_config) {
-            let component_len = config.num_kv_heads * config.page_size * config.head_dim;
-            for layer in 0..config.num_layers {
+        if let Some(quant_config) = quant_config
+            && !layer_configs.is_empty()
+        {
+            for (layer, geom) in layer_configs.iter().enumerate() {
+                // Per-layer geometry: heterogeneous head_dim / num_kv_heads mean
+                // each component (layer, key|value) can have a different length.
+                let component_len = geom.num_kv_heads * page_size * geom.head_dim;
+                let scale_slots = geom.num_kv_heads * page_size;
                 for kind in [KvKind::Key, KvKind::Value] {
                     let dtype = quant_config.dtype(layer, kind);
                     storage_layout.push(ComponentStorage {
@@ -334,11 +384,11 @@ impl Page {
                         KvDType::F32 => data_len += component_len,
                         KvDType::Int8 => {
                             quantized_len += component_len;
-                            scale_len += config.num_kv_heads * config.page_size;
+                            scale_len += scale_slots;
                         }
                         KvDType::Fp8E4M3Fn | KvDType::Fp8E5M2 => {
                             fp8_len += component_len;
-                            scale_len += config.num_kv_heads * config.page_size;
+                            scale_len += scale_slots;
                         }
                     }
                 }
@@ -366,26 +416,35 @@ impl Page {
         self.quant_scales.fill(1.0);
     }
 
-    pub fn value_at(&self, config: PageTensorConfig, offset: usize) -> f32 {
-        let component_len = component_len(config);
-        let component = offset / component_len;
-        let component_offset = offset % component_len;
-        let head_len = config.page_size * config.head_dim;
-        let head = component_offset / head_len;
-        let token = (component_offset % head_len) / config.head_dim;
+    /// Read one scalar for `(component, head, token_offset, dim)`.
+    ///
+    /// `component` is the flat K/V component index `layer * 2 + kv`
+    /// (`0 = key`, `1 = value`). `head_dim` is this layer's head dimension, so
+    /// heterogeneous-geometry layers each address their own component slab.
+    pub fn value_at_slot(
+        &self,
+        page_size: usize,
+        head_dim: usize,
+        component: usize,
+        head: usize,
+        token_offset: usize,
+        dim: usize,
+    ) -> f32 {
         let storage = self.storage_layout[component];
+        let head_len = page_size * head_dim;
+        let within = head * head_len + token_offset * head_dim + dim;
         match storage.dtype {
-            KvDType::F32 => self.data[storage.data_offset + component_offset],
+            KvDType::F32 => self.data[storage.data_offset + within],
             KvDType::Int8 => {
                 let scale =
-                    self.quant_scales[storage.scale_offset + head * config.page_size + token];
-                f32::from(self.quantized_data[storage.quantized_offset + component_offset]) * scale
+                    self.quant_scales[storage.scale_offset + head * page_size + token_offset];
+                f32::from(self.quantized_data[storage.quantized_offset + within]) * scale
             }
             KvDType::Fp8E4M3Fn | KvDType::Fp8E5M2 => {
                 let scale =
-                    self.quant_scales[storage.scale_offset + head * config.page_size + token];
+                    self.quant_scales[storage.scale_offset + head * page_size + token_offset];
                 decode_fp8(
-                    self.fp8_data[storage.fp8_offset + component_offset],
+                    self.fp8_data[storage.fp8_offset + within],
                     storage.dtype.fp8_format().expect("fp8 dtype"),
                 ) * scale
             }
@@ -395,24 +454,26 @@ impl Page {
     /// Store one token's `head_dim` values for a single `(component, head)` slot.
     ///
     /// `component` is the flat K/V component index `layer * 2 + kv` (`0 = key`,
-    /// `1 = value`). For quantized components this computes a per-`(head, token)`
-    /// scale from *only* this token's values and writes only this token's bytes,
-    /// so previously-stored tokens in the page are never dequantized or
-    /// requantized. This bounds the quantization error to a single round-trip per
-    /// KV write regardless of how full the page is.
+    /// `1 = value`). `head_dim`/`page_size` are this layer's geometry, so
+    /// heterogeneous-geometry layers write into their own component slab. For
+    /// quantized components this computes a per-`(head, token)` scale from
+    /// *only* this token's values and writes only this token's bytes, so
+    /// previously-stored tokens in the page are never dequantized or
+    /// requantized. This bounds the quantization error to a single round-trip
+    /// per KV write regardless of how full the page is.
     pub fn write_head_token(
         &mut self,
-        config: PageTensorConfig,
+        page_size: usize,
+        head_dim: usize,
         component: usize,
         head: usize,
         token_offset: usize,
         values: &[f32],
     ) {
-        debug_assert_eq!(values.len(), config.head_dim);
+        debug_assert_eq!(values.len(), head_dim);
         let storage = self.storage_layout[component];
-        let head_len = config.page_size * config.head_dim;
-        let within = head * head_len + token_offset * config.head_dim;
-        let head_dim = config.head_dim;
+        let head_len = page_size * head_dim;
+        let within = head * head_len + token_offset * head_dim;
         match storage.dtype {
             KvDType::F32 => {
                 let offset = storage.data_offset + within;
@@ -420,8 +481,7 @@ impl Page {
             }
             KvDType::Int8 => {
                 let scale = quant_scale(values, 127.0);
-                self.quant_scales[storage.scale_offset + head * config.page_size + token_offset] =
-                    scale;
+                self.quant_scales[storage.scale_offset + head * page_size + token_offset] = scale;
                 let offset = storage.quantized_offset + within;
                 for (output, value) in self.quantized_data[offset..offset + head_dim]
                     .iter_mut()
@@ -433,8 +493,7 @@ impl Page {
             KvDType::Fp8E4M3Fn | KvDType::Fp8E5M2 => {
                 let format = storage.dtype.fp8_format().expect("fp8 dtype");
                 let scale = quant_scale(values, format.max_finite());
-                self.quant_scales[storage.scale_offset + head * config.page_size + token_offset] =
-                    scale;
+                self.quant_scales[storage.scale_offset + head * page_size + token_offset] = scale;
                 let offset = storage.fp8_offset + within;
                 for (output, value) in self.fp8_data[offset..offset + head_dim]
                     .iter_mut()
@@ -451,10 +510,6 @@ impl Page {
             .iter()
             .any(|storage| storage.dtype.is_quantized())
     }
-}
-
-const fn component_len(config: PageTensorConfig) -> usize {
-    config.num_kv_heads * config.page_size * config.head_dim
 }
 
 /// Symmetric quantization scale for one token/head slice: the max absolute
@@ -496,7 +551,16 @@ pub struct PageTable {
     /// Tokens per page.
     pub page_size: usize,
     /// Optional tensor storage layout.
+    ///
+    /// For heterogeneous-geometry caches this reports layer 0's geometry (so
+    /// uniform callers keep working); the authoritative per-layer geometry is
+    /// [`PageTable::layer_configs`].
     pub tensor_config: Option<PageTensorConfig>,
+    /// Authoritative per-layer KV geometry (`num_kv_heads`/`head_dim`).
+    ///
+    /// Empty when no tensor storage is configured. Length equals the layer
+    /// count and every layer may declare a different `head_dim`/`num_kv_heads`.
+    pub layer_configs: Vec<LayerTensorConfig>,
     /// Per-layer key/value precision policy.
     pub quant_config: Option<KvQuantConfig>,
     /// Monotonic clock for LRU.
@@ -541,6 +605,75 @@ impl PageTable {
         ))
     }
 
+    /// Build a page table with **heterogeneous** per-layer KV geometry.
+    ///
+    /// Each entry in `layer_configs` declares that layer's `num_kv_heads`/
+    /// `head_dim`; layers may differ (e.g. sliding layers use a smaller
+    /// `head_dim` than full/global layers). Every layer uses `dtype`.
+    pub fn new_with_layer_configs(
+        page_size: usize,
+        num_gpu_pages: usize,
+        dtype: KvDType,
+        layer_configs: Vec<LayerTensorConfig>,
+    ) -> Self {
+        let quant_config = KvQuantConfig::homogeneous(dtype, layer_configs.len());
+        Self::new_with_layer_storage(page_size, num_gpu_pages, dtype, layer_configs, quant_config)
+    }
+
+    /// Heterogeneous per-layer geometry with an explicit KV precision policy.
+    pub fn new_with_layer_quant_config(
+        page_size: usize,
+        num_gpu_pages: usize,
+        dtype: KvDType,
+        layer_configs: Vec<LayerTensorConfig>,
+        quant_config: KvQuantConfig,
+    ) -> Result<Self, KvError> {
+        if quant_config.num_layers() != layer_configs.len() {
+            return Err(KvError::InvalidQuantizationConfig(
+                "quantization layer count must match per-layer tensor config".to_owned(),
+            ));
+        }
+        Ok(Self::new_with_layer_storage(
+            page_size,
+            num_gpu_pages,
+            dtype,
+            layer_configs,
+            quant_config,
+        ))
+    }
+
+    fn new_with_layer_storage(
+        page_size: usize,
+        num_gpu_pages: usize,
+        dtype: KvDType,
+        layer_configs: Vec<LayerTensorConfig>,
+        quant_config: KvQuantConfig,
+    ) -> Self {
+        assert!(!layer_configs.is_empty(), "layer_configs must be non-empty");
+        assert!(
+            layer_configs.iter().all(|geom| geom.validate()),
+            "invalid per-layer tensor config"
+        );
+        // Retain a representative uniform descriptor (layer 0 geometry) so
+        // uniform callers that read `tensor_config` keep working.
+        // TODO(W3): remove uniform `tensor_config` accessor after engine
+        // migrates to per-layer geometry.
+        let representative = PageTensorConfig {
+            num_layers: layer_configs.len(),
+            num_kv_heads: layer_configs[0].num_kv_heads,
+            head_dim: layer_configs[0].head_dim,
+            page_size,
+            dtype,
+        };
+        Self::build(
+            page_size,
+            num_gpu_pages,
+            Some(representative),
+            layer_configs,
+            Some(quant_config),
+        )
+    }
+
     fn new_with_storage(
         page_size: usize,
         num_gpu_pages: usize,
@@ -554,14 +687,38 @@ impl PageTable {
             );
             assert!(config.validate(), "invalid page tensor config");
         }
+        let layer_configs = tensor_config
+            .map(PageTensorConfig::to_layer_configs)
+            .unwrap_or_default();
+        Self::build(
+            page_size,
+            num_gpu_pages,
+            tensor_config,
+            layer_configs,
+            quant_config,
+        )
+    }
 
+    fn build(
+        page_size: usize,
+        num_gpu_pages: usize,
+        tensor_config: Option<PageTensorConfig>,
+        layer_configs: Vec<LayerTensorConfig>,
+        quant_config: Option<KvQuantConfig>,
+    ) -> Self {
         let mut pages = HashMap::new();
         let mut free_pages = vec![];
         for i in 0..num_gpu_pages {
             let id = i as PageId;
             pages.insert(
                 id,
-                Page::new(id, Device::Gpu(0), tensor_config, quant_config.as_ref()),
+                Page::new(
+                    id,
+                    Device::Gpu(0),
+                    page_size,
+                    &layer_configs,
+                    quant_config.as_ref(),
+                ),
             );
             free_pages.push(id);
         }
@@ -578,6 +735,7 @@ impl PageTable {
             free_pages: free_map,
             page_size,
             tensor_config,
+            layer_configs,
             quant_config,
             clock: 0,
             hot_capacity: num_gpu_pages,
@@ -612,7 +770,8 @@ impl PageTable {
             let mut page = Page::new(
                 page_id,
                 device,
-                self.tensor_config,
+                self.page_size,
+                &self.layer_configs,
                 self.quant_config.as_ref(),
             );
             page.ref_count = 1;
@@ -766,31 +925,10 @@ impl PageTable {
         Ok(victim_id)
     }
 
-    pub fn tensor_offset(
-        &self,
-        layer: usize,
-        kind: KvKind,
-        head: usize,
-        token_offset: usize,
-        dim: usize,
-    ) -> Option<usize> {
-        let config = self.tensor_config?;
-        if layer >= config.num_layers
-            || head >= config.num_kv_heads
-            || token_offset >= config.page_size
-            || dim >= config.head_dim
-        {
-            return None;
-        }
-        let kv = match kind {
-            KvKind::Key => 0,
-            KvKind::Value => 1,
-        };
-        Some(
-            ((((layer * 2 + kv) * config.num_kv_heads + head) * config.page_size + token_offset)
-                * config.head_dim)
-                + dim,
-        )
+    /// Per-layer KV geometry for `layer`, or `None` when out of range or when
+    /// no tensor storage is configured.
+    pub fn layer_config(&self, layer: usize) -> Option<LayerTensorConfig> {
+        self.layer_configs.get(layer).copied()
     }
 
     /// Remove a sequence and return its pages.

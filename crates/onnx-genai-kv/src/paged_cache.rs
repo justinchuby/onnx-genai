@@ -2,7 +2,7 @@
 
 use crate::{
     CacheCheckpoint, Device, EvictionPolicy, KvCacheOps, KvError, SequenceId,
-    page_table::{KvKind, KvQuantConfig, PageId, PageTable, PageTensorConfig},
+    page_table::{KvQuantConfig, LayerTensorConfig, PageId, PageTable, PageTensorConfig},
 };
 use onnx_genai_metadata::KvCacheSpec;
 
@@ -18,11 +18,17 @@ pub struct LayerKv<'a> {
 /// Materialized K/V tensors for one layer over a sequence.
 ///
 /// `key` and `value` are contiguous f32 buffers with shape
-/// `[num_kv_heads, sequence_len, head_dim]`.
+/// `[num_kv_heads, sequence_len, head_dim]` using this layer's own geometry.
+/// Different layers may declare different `num_kv_heads`/`head_dim` (e.g.
+/// Gemma-4 E2B sliding vs full layers), so the geometry is carried per layer.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MaterializedLayerKv {
     pub key: Vec<f32>,
     pub value: Vec<f32>,
+    /// This layer's KV head count.
+    pub num_kv_heads: usize,
+    /// This layer's head dimension.
+    pub head_dim: usize,
 }
 
 /// Materialized K/V tensors for all layers over a sequence.
@@ -39,8 +45,9 @@ pub struct MaterializedKv {
     /// Number of leading attention-sink tokens in the buffer (0 if contiguous).
     pub sink_len: usize,
     pub sequence_len: usize,
-    pub num_kv_heads: usize,
-    pub head_dim: usize,
+    /// Per-layer materialized K/V. Each layer carries its own
+    /// `num_kv_heads`/`head_dim`, so heterogeneous geometry (e.g. Gemma-4 E2B
+    /// sliding vs full head_dim) round-trips without a uniform assumption.
     pub layers: Vec<MaterializedLayerKv>,
 }
 
@@ -80,6 +87,48 @@ impl PagedKvCache {
                 config.page_size,
                 num_gpu_pages,
                 config,
+                quant_config,
+            )?,
+            next_seq_id: 0,
+        })
+    }
+
+    /// Create a tensor cache with **heterogeneous** per-layer KV geometry.
+    ///
+    /// Each entry in `layer_configs` declares that layer's `num_kv_heads`/
+    /// `head_dim`; layers may differ (e.g. Gemma-4 E2B sliding vs full
+    /// layers). `page_size` is tokens-per-page and `dtype` the KV precision.
+    pub fn new_with_layer_tensor_configs(
+        page_size: usize,
+        dtype: crate::KvDType,
+        layer_configs: Vec<LayerTensorConfig>,
+        num_gpu_pages: usize,
+    ) -> Self {
+        Self {
+            page_table: PageTable::new_with_layer_configs(
+                page_size,
+                num_gpu_pages,
+                dtype,
+                layer_configs,
+            ),
+            next_seq_id: 0,
+        }
+    }
+
+    /// Heterogeneous per-layer geometry with an explicit KV precision policy.
+    pub fn new_with_layer_quant_config(
+        page_size: usize,
+        dtype: crate::KvDType,
+        layer_configs: Vec<LayerTensorConfig>,
+        quant_config: KvQuantConfig,
+        num_gpu_pages: usize,
+    ) -> Result<Self, KvError> {
+        Ok(Self {
+            page_table: PageTable::new_with_layer_quant_config(
+                page_size,
+                num_gpu_pages,
+                dtype,
+                layer_configs,
                 quant_config,
             )?,
             next_seq_id: 0,
@@ -126,11 +175,13 @@ impl PagedKvCache {
         position: usize,
         layers: &[LayerKv<'_>],
     ) -> Result<(), KvError> {
-        let config = self
-            .page_table
-            .tensor_config
-            .ok_or(KvError::TensorStorageNotConfigured)?;
-        self.validate_layers(config, layers)?;
+        if self.page_table.tensor_config.is_none() {
+            return Err(KvError::TensorStorageNotConfigured);
+        }
+        // Per-layer geometry: each layer may declare its own num_kv_heads/head_dim.
+        let layer_configs = self.page_table.layer_configs.clone();
+        let page_size = self.page_table.page_size;
+        self.validate_layers(&layer_configs, layers)?;
 
         let len = self.len(seq)?;
         let start = self.retained_start(seq)?;
@@ -161,12 +212,27 @@ impl PagedKvCache {
                 .get_mut(&page_id)
                 .ok_or(KvError::PageNotFound(page_id))?;
             for (layer_idx, layer) in layers.iter().enumerate() {
-                for head in 0..config.num_kv_heads {
-                    let src = head * config.head_dim;
-                    let key = &layer.key[src..src + config.head_dim];
-                    let value = &layer.value[src..src + config.head_dim];
-                    page.write_head_token(config, layer_idx * 2, head, token_offset, key);
-                    page.write_head_token(config, layer_idx * 2 + 1, head, token_offset, value);
+                let geom = layer_configs[layer_idx];
+                for head in 0..geom.num_kv_heads {
+                    let src = head * geom.head_dim;
+                    let key = &layer.key[src..src + geom.head_dim];
+                    let value = &layer.value[src..src + geom.head_dim];
+                    page.write_head_token(
+                        page_size,
+                        geom.head_dim,
+                        layer_idx * 2,
+                        head,
+                        token_offset,
+                        key,
+                    );
+                    page.write_head_token(
+                        page_size,
+                        geom.head_dim,
+                        layer_idx * 2 + 1,
+                        head,
+                        token_offset,
+                        value,
+                    );
                 }
             }
             page.filled = page.filled.max(token_offset + 1);
@@ -181,10 +247,11 @@ impl PagedKvCache {
 
     /// Materialize a sequence's paged K/V data into contiguous per-layer buffers.
     pub fn materialize_sequence(&self, seq: SequenceId) -> Result<MaterializedKv, KvError> {
-        let config = self
-            .page_table
-            .tensor_config
-            .ok_or(KvError::TensorStorageNotConfigured)?;
+        if self.page_table.tensor_config.is_none() {
+            return Err(KvError::TensorStorageNotConfigured);
+        }
+        let layer_configs = &self.page_table.layer_configs;
+        let page_size = self.page_table.page_size;
         let start = self.retained_start(seq)?;
         let sink = self.sink_len(seq)?;
         let end = self.len(seq)?;
@@ -194,17 +261,22 @@ impl PagedKvCache {
             .page_table
             .get_sequence(seq)
             .ok_or(KvError::SequenceNotFound(seq))?;
-        let per_layer_len = config.num_kv_heads * len * config.head_dim;
-        let mut layers = (0..config.num_layers)
-            .map(|_| MaterializedLayerKv {
-                key: vec![0.0; per_layer_len],
-                value: vec![0.0; per_layer_len],
+        let mut layers = layer_configs
+            .iter()
+            .map(|geom| {
+                let per_layer_len = geom.num_kv_heads * len * geom.head_dim;
+                MaterializedLayerKv {
+                    key: vec![0.0; per_layer_len],
+                    value: vec![0.0; per_layer_len],
+                    num_kv_heads: geom.num_kv_heads,
+                    head_dim: geom.head_dim,
+                }
             })
             .collect::<Vec<_>>();
 
         for token_pos in 0..len {
-            let page_index = token_pos / config.page_size;
-            let token_offset = token_pos % config.page_size;
+            let page_index = token_pos / page_size;
+            let token_offset = token_pos % page_size;
             let page_id = pages[page_index];
             let page = self
                 .page_table
@@ -212,30 +284,37 @@ impl PagedKvCache {
                 .get(&page_id)
                 .ok_or(KvError::PageNotFound(page_id))?;
             for (layer_idx, layer_out) in layers.iter_mut().enumerate() {
-                for head in 0..config.num_kv_heads {
-                    for dim in 0..config.head_dim {
-                        let dst = (head * len + token_pos) * config.head_dim + dim;
-                        let key_src = self
-                            .page_table
-                            .tensor_offset(layer_idx, KvKind::Key, head, token_offset, dim)
-                            .expect("validated offset");
-                        let value_src = self
-                            .page_table
-                            .tensor_offset(layer_idx, KvKind::Value, head, token_offset, dim)
-                            .expect("validated offset");
-                        layer_out.key[dst] = page.value_at(config, key_src);
-                        layer_out.value[dst] = page.value_at(config, value_src);
+                let head_dim = layer_out.head_dim;
+                for head in 0..layer_out.num_kv_heads {
+                    for dim in 0..head_dim {
+                        let dst = (head * len + token_pos) * head_dim + dim;
+                        layer_out.key[dst] = page.value_at_slot(
+                            page_size,
+                            head_dim,
+                            layer_idx * 2,
+                            head,
+                            token_offset,
+                            dim,
+                        );
+                        layer_out.value[dst] = page.value_at_slot(
+                            page_size,
+                            head_dim,
+                            layer_idx * 2 + 1,
+                            head,
+                            token_offset,
+                            dim,
+                        );
                     }
                 }
             }
         }
 
+        // Per-layer geometry lives on each `MaterializedLayerKv`; the
+        // materialized cache no longer carries a uniform num_kv_heads/head_dim.
         Ok(MaterializedKv {
             start_position: start,
             sink_len: sink,
             sequence_len: len,
-            num_kv_heads: config.num_kv_heads,
-            head_dim: config.head_dim,
             layers,
         })
     }
@@ -476,20 +555,19 @@ impl PagedKvCache {
 
     fn validate_layers(
         &self,
-        config: PageTensorConfig,
+        layer_configs: &[LayerTensorConfig],
         layers: &[LayerKv<'_>],
     ) -> Result<(), KvError> {
-        if layers.len() != config.num_layers {
+        if layers.len() != layer_configs.len() {
             return Err(KvError::InvalidTensorShape("wrong number of layers"));
         }
-        let expected = config.f32_len_per_token_per_layer();
-        if layers
-            .iter()
-            .any(|layer| layer.key.len() != expected || layer.value.len() != expected)
-        {
-            return Err(KvError::InvalidTensorShape(
-                "layer key/value length must be num_kv_heads * head_dim",
-            ));
+        for (layer, geom) in layers.iter().zip(layer_configs) {
+            let expected = geom.f32_len_per_token();
+            if layer.key.len() != expected || layer.value.len() != expected {
+                return Err(KvError::InvalidTensorShape(
+                    "layer key/value length must be num_kv_heads * head_dim",
+                ));
+            }
         }
         Ok(())
     }
@@ -827,6 +905,186 @@ mod tests {
                 "idx {idx}: actual {actual}, expected {expected}, diff {diff}, tolerance {tolerance}"
             );
         }
+    }
+
+    /// Two layers with different geometry: sliding-style (head_dim 8) and
+    /// full-style (head_dim 16), also with different `num_kv_heads`.
+    fn heterogeneous_layer_configs() -> Vec<LayerTensorConfig> {
+        vec![
+            LayerTensorConfig::new(2, 8),
+            LayerTensorConfig::new(3, 16),
+        ]
+    }
+
+    /// Build one token of per-layer K/V for `heterogeneous_layer_configs`,
+    /// filling each scalar with a deterministic, per-(token, layer, index) value.
+    fn hetero_token(configs: &[LayerTensorConfig], token: usize) -> Vec<(Vec<f32>, Vec<f32>)> {
+        configs
+            .iter()
+            .enumerate()
+            .map(|(layer, geom)| {
+                let per_layer = geom.f32_len_per_token();
+                let key = (0..per_layer)
+                    .map(|i| (token * 1000 + layer * 100 + i) as f32)
+                    .collect::<Vec<f32>>();
+                let value = key.iter().map(|k| k + 500.0).collect();
+                (key, value)
+            })
+            .collect()
+    }
+
+    /// Expected head-major `[num_kv_heads, num_tokens, head_dim]` per-layer
+    /// buffer for a set of input tokens (key selects .0, value selects .1).
+    fn expected_head_major(
+        configs: &[LayerTensorConfig],
+        tokens: &[Vec<(Vec<f32>, Vec<f32>)>],
+        layer: usize,
+        want_value: bool,
+    ) -> Vec<f32> {
+        let geom = configs[layer];
+        let num_tokens = tokens.len();
+        let mut out = vec![0.0; geom.num_kv_heads * num_tokens * geom.head_dim];
+        for (t, token) in tokens.iter().enumerate() {
+            let (key, value) = &token[layer];
+            let src = if want_value { value } else { key };
+            for head in 0..geom.num_kv_heads {
+                for dim in 0..geom.head_dim {
+                    let dst = (head * num_tokens + t) * geom.head_dim + dim;
+                    out[dst] = src[head * geom.head_dim + dim];
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn heterogeneous_per_layer_geometry_round_trips_within_a_page() {
+        let configs = heterogeneous_layer_configs();
+        let mut cache = PagedKvCache::new_with_layer_tensor_configs(
+            4,
+            KvDType::F32,
+            configs.clone(),
+            8,
+        );
+        let seq = cache.create_sequence();
+        let token = hetero_token(&configs, 0);
+        cache
+            .append_token_kv(seq, &borrowed_layers(&token))
+            .unwrap();
+
+        let materialized = cache.materialize_sequence(seq).unwrap();
+        assert_eq!(materialized.sequence_len, 1);
+        assert_eq!(materialized.layers.len(), 2);
+
+        // Per-layer geometry is carried on each layer, not uniformly.
+        assert_eq!(materialized.layers[0].num_kv_heads, 2);
+        assert_eq!(materialized.layers[0].head_dim, 8);
+        assert_eq!(materialized.layers[1].num_kv_heads, 3);
+        assert_eq!(materialized.layers[1].head_dim, 16);
+
+        // Per-layer byte correctness: buffer lengths follow each layer's own
+        // geometry (num_kv_heads * seq_len * head_dim), not a uniform value.
+        assert_eq!(materialized.layers[0].key.len(), 2 * 8);
+        assert_eq!(materialized.layers[1].key.len(), 3 * 16);
+        assert_eq!(&materialized.layers[0].key, &token[0].0);
+        assert_eq!(&materialized.layers[0].value, &token[0].1);
+        assert_eq!(&materialized.layers[1].key, &token[1].0);
+        assert_eq!(&materialized.layers[1].value, &token[1].1);
+    }
+
+    #[test]
+    fn heterogeneous_per_layer_geometry_round_trips_across_page_boundaries() {
+        let configs = heterogeneous_layer_configs();
+        // page_size 2 with 3 tokens forces a second page.
+        let mut cache = PagedKvCache::new_with_layer_tensor_configs(
+            2,
+            KvDType::F32,
+            configs.clone(),
+            8,
+        );
+        let seq = cache.create_sequence();
+        let tokens = (0..3)
+            .map(|t| hetero_token(&configs, t))
+            .collect::<Vec<_>>();
+        for token in &tokens {
+            cache
+                .append_token_kv(seq, &borrowed_layers(token))
+                .unwrap();
+        }
+        assert_eq!(cache.page_table.get_sequence(seq).unwrap().len(), 2);
+
+        let materialized = cache.materialize_sequence(seq).unwrap();
+        assert_eq!(materialized.sequence_len, 3);
+        for layer in 0..configs.len() {
+            let geom = configs[layer];
+            assert_eq!(materialized.layers[layer].num_kv_heads, geom.num_kv_heads);
+            assert_eq!(materialized.layers[layer].head_dim, geom.head_dim);
+            assert_eq!(
+                materialized.layers[layer].key.len(),
+                geom.num_kv_heads * 3 * geom.head_dim
+            );
+            assert_eq!(
+                materialized.layers[layer].key,
+                expected_head_major(&configs, &tokens, layer, false)
+            );
+            assert_eq!(
+                materialized.layers[layer].value,
+                expected_head_major(&configs, &tokens, layer, true)
+            );
+        }
+    }
+
+    #[test]
+    fn heterogeneous_quantized_per_layer_geometry_round_trips_within_tolerance() {
+        let configs = heterogeneous_layer_configs();
+        let mut cache = PagedKvCache::new_with_layer_quant_config(
+            2,
+            KvDType::Fp8E4M3Fn,
+            configs.clone(),
+            crate::KvQuantConfig::homogeneous(KvDType::Fp8E4M3Fn, configs.len()),
+            8,
+        )
+        .unwrap();
+        let seq = cache.create_sequence();
+        let tokens = (0..3)
+            .map(|t| hetero_token(&configs, t))
+            .collect::<Vec<_>>();
+        for token in &tokens {
+            cache
+                .append_token_kv(seq, &borrowed_layers(token))
+                .unwrap();
+        }
+
+        let materialized = cache.materialize_sequence(seq).unwrap();
+        for layer in 0..configs.len() {
+            let expected_k = expected_head_major(&configs, &tokens, layer, false);
+            let expected_v = expected_head_major(&configs, &tokens, layer, true);
+            // FP8 is lossy; assert within a relative tolerance of the max value.
+            let tolerance = expected_k.iter().cloned().fold(0.0_f32, f32::max) * 0.1;
+            assert_close(&materialized.layers[layer].key, &expected_k, tolerance);
+            assert_close(&materialized.layers[layer].value, &expected_v, tolerance);
+        }
+    }
+
+    #[test]
+    fn heterogeneous_write_rejects_wrong_per_layer_length() {
+        let configs = heterogeneous_layer_configs();
+        let mut cache = PagedKvCache::new_with_layer_tensor_configs(
+            2,
+            KvDType::F32,
+            configs.clone(),
+            8,
+        );
+        let seq = cache.create_sequence();
+        // Layer 1 expects 48 scalars (3 heads * 16); give it a layer-0-sized
+        // buffer (16) to prove per-layer validation, not a uniform check.
+        let mut token = hetero_token(&configs, 0);
+        token[1].0.truncate(16);
+        token[1].1.truncate(16);
+        assert!(matches!(
+            cache.append_token_kv(seq, &borrowed_layers(&token)),
+            Err(KvError::InvalidTensorShape(_))
+        ));
     }
 
     #[test]

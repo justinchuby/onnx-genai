@@ -6,16 +6,40 @@ use crate::logits::TokenId;
 use crate::session::{DraftModel, DraftSession, EngineSession};
 use anyhow::Context;
 use onnx_genai_kv::{
-    KvCacheOps, KvDType, KvLayerPayload, KvPayload, KvPayloadDtype, LayerKv, PageId,
-    PageTensorConfig, PagedKvCache,
+    KvCacheOps, KvDType, KvLayerPayload, KvPayload, KvPayloadDtype, LayerKv, LayerTensorConfig,
+    PageId, PageTensorConfig, PagedKvCache,
 };
 use onnx_genai_ort::{DataType, Session, TensorInfo, Value};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
 pub(crate) struct KvModelInfo {
+    /// Representative (layer-0) geometry. Authoritative for `num_layers`,
+    /// `page_size` and `dtype`; the `num_kv_heads`/`head_dim` fields mirror
+    /// layer 0 and are only valid to read directly for uniform models. Use
+    /// [`KvModelInfo::layer_configs`] / [`KvModelInfo::layer_tensor_config`] for
+    /// per-layer geometry.
     pub(crate) tensor_config: PageTensorConfig,
+    /// Per-layer KV geometry, indexed identically to [`KvModelInfo::layers`].
+    /// Length equals the number of exported KV layers (post kv-sharing).
+    pub(crate) layer_configs: Vec<LayerTensorConfig>,
     pub(crate) layers: Vec<KvLayerIo>,
+}
+
+impl KvModelInfo {
+    /// The tensor config for a single exported KV layer, carrying that layer's
+    /// own `num_kv_heads`/`head_dim` while inheriting the shared `num_layers`,
+    /// `page_size` and `dtype`.
+    pub(crate) fn layer_tensor_config(&self, layer: usize) -> PageTensorConfig {
+        let geom = self.layer_configs[layer];
+        PageTensorConfig {
+            num_layers: self.tensor_config.num_layers,
+            num_kv_heads: geom.num_kv_heads,
+            head_dim: geom.head_dim,
+            page_size: self.tensor_config.page_size,
+            dtype: self.tensor_config.dtype,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -59,11 +83,14 @@ pub(crate) fn infer_kv_model_info(
         );
     }
 
-    let (num_kv_heads, head_dim) = infer_kv_heads_and_head_dim(&key_outputs[0])?;
+    let layer_configs = layer_configs_from_key_outputs(&key_outputs)?;
+    // Representative geometry (layer 0). The paged cache is built from the full
+    // per-layer `layer_configs` below; `tensor_config` remains a single-value
+    // view for uniform-only consumers (connector payloads, num_layers/dtype).
     let config = PageTensorConfig {
         num_layers: key_outputs.len(),
-        num_kv_heads,
-        head_dim,
+        num_kv_heads: layer_configs[0].num_kv_heads,
+        head_dim: layer_configs[0].head_dim,
         page_size,
         dtype,
     };
@@ -94,8 +121,32 @@ pub(crate) fn infer_kv_model_info(
 
     Ok(Some(KvModelInfo {
         tensor_config: config,
+        layer_configs,
         layers,
     }))
+}
+
+/// Build the per-layer KV geometry from each exported present-KV output shape.
+///
+/// The returned vector has one [`LayerTensorConfig`] per exported KV layer, in
+/// the same order as `key_outputs` (sorted by layer index). Because a model
+/// exports only `num_hidden_layers - num_kv_shared_layers` KV entries — the last
+/// `num_kv_shared_layers` layers reuse an earlier layer's K/V — this vector's
+/// length equals the number of *exported* KV entries, and metadata
+/// `shared_kv.target_layers` indices map directly onto these positions (post
+/// kv-sharing). Different layers may declare different head_dim (e.g. Gemma-4
+/// sliding=256 vs full=512); geometry is read structurally from the ONNX I/O
+/// shapes, never from model names.
+pub(crate) fn layer_configs_from_key_outputs(
+    key_outputs: &[TensorInfo],
+) -> anyhow::Result<Vec<LayerTensorConfig>> {
+    key_outputs
+        .iter()
+        .map(|info| {
+            let (num_kv_heads, head_dim) = infer_kv_heads_and_head_dim(info)?;
+            Ok(LayerTensorConfig::new(num_kv_heads, head_dim))
+        })
+        .collect()
 }
 
 pub(crate) fn infer_kv_heads_and_head_dim(info: &TensorInfo) -> anyhow::Result<(usize, usize)> {
@@ -177,10 +228,12 @@ pub(crate) fn mirror_present_kv_to_pages(
         let token_pos = past_len + offset;
         let owned_layers = layer_data
             .iter()
-            .map(|(key, key_shape, value, value_shape)| {
+            .enumerate()
+            .map(|(layer_idx, (key, key_shape, value, value_shape))| {
+                let layer_config = kv_model.layer_tensor_config(layer_idx);
                 Ok((
-                    extract_present_token(key, key_shape, kv_model.tensor_config, token_pos)?,
-                    extract_present_token(value, value_shape, kv_model.tensor_config, token_pos)?,
+                    extract_present_token(key, key_shape, layer_config, token_pos)?,
+                    extract_present_token(value, value_shape, layer_config, token_pos)?,
                 ))
             })
             .collect::<anyhow::Result<Vec<(Vec<f32>, Vec<f32>)>>>()?;
@@ -750,10 +803,70 @@ mod tests {
         assert_eq!(info.layers[0].value_present, "present.0.value");
         assert_eq!(info.layers[0].key_past, "past_key_values.0.key");
         assert_eq!(info.layers[0].value_past, "past_key_values.0.value");
+        // Per-layer geometry for a uniform model is a single-entry vector equal
+        // to the representative config's num_kv_heads/head_dim.
+        assert_eq!(
+            info.layer_configs,
+            vec![onnx_genai_kv::LayerTensorConfig::new(2, 8)]
+        );
 
         let (_environment, static_session) = load_session("tiny-llm-scatter")?;
         assert!(infer_kv_model_info(&static_session, 4, KvDType::F32)?.is_none());
         Ok(())
+    }
+
+    /// Per-layer geometry construction for a heterogeneous model, plus the
+    /// `num_kv_shared_layers` fold. A model with `num_hidden_layers = 4` and
+    /// `num_kv_shared_layers = 1` exports only `4 - 1 = 3` KV entries; the last
+    /// full-attention layer here uses a larger head_dim (16) than the sliding
+    /// layers (8), mirroring Gemma-4 E2B's 256/512 split at tiny scale.
+    ///
+    /// The resulting `layer_configs` therefore has exactly 3 entries (one per
+    /// exported KV output), and metadata `shared_kv.target_layers` indices map
+    /// directly onto these positions — index 2 selects the full layer's (3, 16)
+    /// geometry, never the sliding layers' (2, 8). An off-by-one in this mapping
+    /// would silently read the wrong layer's geometry.
+    #[test]
+    fn layer_configs_are_built_per_exported_kv_layer_with_shared_layer_fold() {
+        // 3 EXPORTED present-key outputs = num_hidden_layers(4) - num_kv_shared_layers(1).
+        let key_outputs = vec![
+            TensorInfo {
+                name: "present.0.key".into(),
+                dtype: DataType::Float32,
+                shape: vec![-1, 2, -1, 8], // sliding: num_kv_heads=2, head_dim=8
+            },
+            TensorInfo {
+                name: "present.1.key".into(),
+                dtype: DataType::Float32,
+                shape: vec![-1, 2, -1, 8], // sliding: num_kv_heads=2, head_dim=8
+            },
+            TensorInfo {
+                name: "present.2.key".into(),
+                dtype: DataType::Float16,
+                shape: vec![-1, 3, -1, 16], // full: num_kv_heads=3, head_dim=16
+            },
+        ];
+
+        let configs = layer_configs_from_key_outputs(&key_outputs).unwrap();
+        assert_eq!(
+            configs,
+            vec![
+                onnx_genai_kv::LayerTensorConfig::new(2, 8),
+                onnx_genai_kv::LayerTensorConfig::new(2, 8),
+                onnx_genai_kv::LayerTensorConfig::new(3, 16),
+            ],
+            "one LayerTensorConfig per EXPORTED KV layer, with per-layer head_dim"
+        );
+        // Exported-entry count equals the folded layer count, not num_hidden_layers.
+        assert_eq!(configs.len(), 3);
+
+        // shared_kv.target_layers index the EXPORTED entries directly: the
+        // full-attention group's last target layer (2) must pick (3, 16).
+        let full_group_target: usize = *[0usize, 1, 2].last().unwrap();
+        assert_eq!(configs[full_group_target].num_kv_heads, 3);
+        assert_eq!(configs[full_group_target].head_dim, 16);
+        // A sliding group targeting layer 0 must pick (2, 8), not the full geometry.
+        assert_eq!(configs[0].head_dim, 8);
     }
 
     #[test]
@@ -878,11 +991,11 @@ mod tests {
             start_position: 0,
             sink_len: 0,
             sequence_len: 2,
-            num_kv_heads: 2,
-            head_dim: 8,
             layers: vec![MaterializedLayerKv {
                 key: (0..32).map(|value| value as f32).collect(),
                 value: (100..132).map(|value| value as f32).collect(),
+                num_kv_heads: 2,
+                head_dim: 8,
             }],
         };
         let mut state = DecodeState::new(&session)?;
