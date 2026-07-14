@@ -168,29 +168,41 @@ impl Kernel for SliceKernel {
 
         // Per-axis (start, step, count) — the single shared geometry helper.
         let plan = slice_plan(in_shape, &starts, &ends, &axes, &steps)?;
-        let start: Vec<i64> = plan.iter().map(|p| p.start).collect();
-        let step: Vec<i64> = plan.iter().map(|p| p.step).collect();
-        let count: Vec<usize> = plan.iter().map(|p| p.count).collect();
-
-        let out_shape = count;
-        let in_strides = compute_contiguous_strides(in_shape);
+        let out_shape: Vec<_> = plan.iter().map(|p| p.count).collect();
         let n = numel(&out_shape);
         let mut out = vec![0u8; n * esize];
-        if n > 0 {
-            let mut idx = vec![0usize; rank];
-            let mut w = 0usize;
-            loop {
-                let mut in_off = 0i64;
-                for d in 0..rank {
-                    let coord = start[d] + step[d] * idx[d] as i64;
-                    in_off += in_strides[d] * coord;
-                }
-                let s = in_off as usize * esize;
-                out[w..w + esize].copy_from_slice(&src[s..s + esize]);
-                w += esize;
-                if !next_index(&out_shape, &mut idx) {
-                    break;
-                }
+        if n == 0 {
+            return super::write_dense_bytes(&mut outputs[0], &out);
+        }
+
+        // A full, unit-stride suffix remains contiguous in the dense source.
+        // Copy each such suffix as one byte run rather than gathering its
+        // elements individually. This covers the common case of slicing one of
+        // the leading dimensions while retaining all trailing dimensions.
+        let mut contiguous_suffix = rank;
+        while contiguous_suffix > 0 {
+            let p = plan[contiguous_suffix - 1];
+            if p.start != 0 || p.step != 1 || p.count != in_shape[contiguous_suffix - 1] {
+                break;
+            }
+            contiguous_suffix -= 1;
+        }
+        let inner_elems = numel(&in_shape[contiguous_suffix..]);
+        let inner_bytes = inner_elems * esize;
+        let outer_shape = &out_shape[..contiguous_suffix];
+        let in_strides = compute_contiguous_strides(in_shape);
+        let mut idx = vec![0usize; contiguous_suffix];
+        let mut w = 0usize;
+        loop {
+            let mut in_off = 0i64;
+            for d in 0..contiguous_suffix {
+                in_off += in_strides[d] * (plan[d].start + plan[d].step * idx[d] as i64);
+            }
+            let s = in_off as usize * esize;
+            out[w..w + inner_bytes].copy_from_slice(&src[s..s + inner_bytes]);
+            w += inner_bytes;
+            if !next_index(outer_shape, &mut idx) {
+                break;
             }
         }
         super::write_dense_bytes(&mut outputs[0], &out)
@@ -419,6 +431,25 @@ mod tests {
             )
             .unwrap();
         assert_eq!(out.to_f32(), vec![1., 3., 5.]);
+    }
+
+    #[test]
+    fn slice_large_contiguous_tail() {
+        // Slice leading rows only, retaining a 256x64 trailing region. The
+        // kernel copies each retained row as one contiguous byte run.
+        let values: Vec<f32> = (0..3 * 256 * 64).map(|i| i as f32).collect();
+        let data = Owned::f32(&[3, 256, 64], &values);
+        let starts = Owned::i64(&[1], &[1]);
+        let ends = Owned::i64(&[1], &[3]);
+        let axes = Owned::i64(&[1], &[0]);
+        let mut out = Owned::zeros_f32(&[2, 256, 64]);
+        SliceKernel
+            .execute(
+                &[data.view(), starts.view(), ends.view(), axes.view()],
+                &mut [out.view_mut()],
+            )
+            .unwrap();
+        assert_eq!(out.to_f32(), values[256 * 64..]);
     }
 
     #[test]
