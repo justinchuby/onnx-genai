@@ -482,9 +482,11 @@ optional generation prompt (`chat_template.rs:12–13`) — so a zero-argument a
 sufficient and `render_messages` does **not** need a `model_dir` parameter to serve
 `TemplateFallback::Default`. Under that fallback with `template == None`, `render_messages`
 calls `ChatTemplate::builtin_default()` and renders through the existing `ChatTemplate::render`
-(`chat_template.rs:159`). This keeps the shared-renderer seam coherent: every render path —
-model template, built-in default, and caller fallback — flows through the one ort
-`ChatTemplate::render` entry point, and the engine crate never touches ort internals.
+(`chat_template.rs:159`). The three fallback branches are distinct: `Default` renders ORT's
+built-in default via `ChatTemplate::builtin_default()` and `ChatTemplate::render`; `Error` returns
+an actionable error per RULES.md #1; and `CallerHandles` returns
+`RenderedPrompt::NoModelTemplate`, after which the caller (for example, the server) supplies its
+own prompt build via `build_prompt` (§13.2) without going through `ChatTemplate::render`.
 
 ### 6.3 `ChatPipeline` — the facade consumer of the seam
 
