@@ -25,7 +25,7 @@ The GenAI layer (KV cache, batching, speculative decoding, serving) is covered i
 12. [Weight Loading and Storage](#12-weight-loading-and-storage)
 13. [Flash Attention Integration](#13-flash-attention-integration)
 14. [CUDA Graph Capture](#14-cuda-graph-capture)
-15. [CuTe Kernel Strategy](#15-cute-kernel-strategy)
+15. [CUDA EP Kernel Strategy](#15-cuda-ep-kernel-strategy)
 16. [Auto-Tuning Agent Interface](#16-auto-tuning-agent-interface)
 17. [Debugging and Profiling](#17-debugging-and-profiling)
 18. [Optimization Passes](#18-optimization-passes)
@@ -1770,70 +1770,279 @@ impl InferenceSession {
 
 ---
 
-## 15. CuTe Kernel Strategy
+## 15. CUDA EP Kernel Strategy
 
-### 15.1 What is CuTe
+> **Status:** DECIDED (2026-07, Roy + coordinator, from a decision-grade research pass with
+> dated citations). This section specifies *how* the CUDA EP (`onnx-runtime-ep-cuda`, §56 Phase 2)
+> actually talks to the GPU — the layer the rest of the design previously under-specified. No
+> hand-wavy "call CUDA"; every op has a named implementation and a named Rust binding path.
 
-CuTe (CUDA Tile) is CUTLASS 3.x's core abstraction. It models:
+### 15.1 Decision Summary
+
+The CUDA EP is a **pure-Rust crate** (no Python runtime dependency in the shipping binary). It
+reaches the GPU through **one foundation crate (`cudarc`)** plus **`extern "C"` FFI to custom
+`.cu` kernels** compiled by `nvcc` in `build.rs`. The stack, by responsibility:
+
+| Layer | Choice | Role |
+|-------|--------|------|
+| **Foundation / driver + vendor libs** | **`cudarc`** | Driver, runtime, streams, memory, CUDA-graph capture; typed bindings to cuBLAS/cuBLASLt/cuDNN/NCCL/NVRTC |
+| **Standard GEMM** (prefill batched, decode GEMV, FP8/FP16/BF16) | **cuBLASLt** via `cudarc::cublaslt` | Battle-tested, auto-tuned; fused GEMM+Bias+Activation epilogue |
+| **Custom fused ops** (norms, RoPE, softmax, residual+norm, elementwise fusion) | **CuTe (CUTLASS 3.x C++)** → `extern "C"` → static lib | Hopper WGMMA/TMA; fusions no vendor lib provides |
+| **Attention** | Phase 2a **cuDNN fused SDPA** → Phase 2b **FlashAttention-3** C shim | Clean baseline first, peak-H100 later (§13) |
+| **Trivial elementwise** | **NVRTC** via `cudarc::nvrtc` | Runtime PTX compile for simple ops — no build step |
+| *Supplemental (optional)* | *ThunderKittens* (header-only Hopper DSL) | For specific Hopper attention/SSM kernels where more ergonomic than raw CuTe |
+
+**cuTile is explicitly deferred to Phase 3** (§15.8) — it has no Hopper/SM90 support and is
+Python-only today, both disqualifying for an H100/H200-first, pure-Rust runtime.
+
+Primary hardware target is **Hopper (SM90, H100/H200)**, with an **Ampere (SM80) fallback path**
+on every custom kernel via `#if __CUDA_ARCH__ >= 900` arch-gating.
+
+**Model-agnostic HARD RULE (project-wide, applies to every kernel below):** all custom kernels
+MUST be **shape-driven, dtype-parameterized (C++ templates), and architecture-gated**. There are
+**no hardcoded `num_heads` / `head_dim` / model constants** anywhere in a kernel. Attention
+parameters (`causal`, `num_heads`, `head_dim`, `scale`) are **runtime arguments**, never
+compile-time constants — exactly as the existing `FlashAttentionKernel::new(causal, num_heads,
+head_dim)` binding already models them (§13.3). CuTe C++ templates enforce this naturally
+(template parameters over shapes/dtypes); cuBLASLt and cuDNN are already shape-generic.
+
+### 15.2 Foundation: `cudarc`
+
+[`cudarc`](https://github.com/chelsea0x3b/cudarc) is the best-in-class Rust CUDA binding and the
+**core dependency of `onnx-runtime-ep-cuda`**. It is the foundation of HuggingFace Candle's GPU
+backend, is actively maintained, and covers **CUDA 11.4 → 13.3** (feature-flagged).
+
+- **Driver / runtime:** device, context, stream, event, memory (alloc/copy/pinned) — all of §9
+  (async transfer) and §14 (CUDA-graph capture, via `cudarc::driver` stream-capture APIs).
+- **Vendor libraries as typed bindings:** cuBLAS, **cuBLASLt**, **cuDNN** (8.x/9.x), NCCL (future
+  multi-GPU, §10), cuRAND/cuSolver/cuSparse, and **NVRTC** (`compile_ptx`).
+- **Three-level API** per library: `sys` (raw bindgen FFI), `result` (Result-returning), `safe`
+  (ergonomic RAII). The EP uses `safe` by default and drops to `result`/`sys` only where a needed
+  entry point isn't yet wrapped.
+- **Dynamic linking by default** (no build-time CUDA toolkit required to `cargo build` the crate
+  metadata); static linking supported.
+
+This replaces any bespoke driver FFI: the EP does **not** hand-roll `cuMemAlloc`/`cuLaunchKernel`
+bindings — it consumes `cudarc` and reserves hand-written FFI strictly for our own `extern "C"`
+kernel launchers (§15.4) and the FA3 shim (§13, §15.5).
+
+### 15.3 Standard GEMM: cuBLASLt
+
+All standard GEMM paths route to **cuBLASLt** (`cudarc::cublaslt`), preferred over plain cuBLAS
+because of its **fused epilogue**:
+
+- `cublasLtMatmul` with `CUBLASLT_MATMUL_DESC_EPILOGUE` fuses **GEMM + Bias + Activation**
+  (`CUBLASLT_EPILOGUE_BIAS_GELU`, `..._BIAS_RELU`, `..._BIAS_SILU`) in one launch — natively since
+  **CUDA 12.0**. This subsumes the design's earlier "Fused GEMM+Bias+Act" CuTe entry for the
+  standard-shape case.
+- **FP8** (E4M3/E5M2) GEMM with per-tensor / per-token scaling on Hopper, plus FP16/BF16 — all
+  auto-tuned, production-mature (TensorRT-LLM, FasterTransformer).
+- **Batched GEMM** for prefill; **GEMV** (M=1) for decode routes here first and is profiled — a
+  custom CuTe decode kernel is written **only if** profiling shows cuBLASLt tall-skinny GEMV is a
+  bottleneck.
+
+| Op | cuBLASLt path |
+|----|---------------|
+| GEMM (FP16/BF16/FP8, prefill batched) | `cublasLtMatmul` / batched |
+| GEMM + Bias + GELU/SiLU/ReLU (fused) | `CUBLASLT_EPILOGUE_BIAS_*` |
+| GEMV (M=1 decode) | `cublasLtMatmul` (profile; custom fallback) |
+| FP8 GEMM (H100) | cuBLASLt FP8 path |
+
+### 15.4 Custom Fused Kernels: CuTe (CUTLASS 3.x)
+
+CuTe — CUTLASS 3.x's C++ template/layout abstraction — is the **custom-kernel path**, not the
+whole story. It owns the fusions no vendor library provides. CUTLASS is production-mature (in use
+since 2017; underpins cuDNN/TensorRT) and gives **first-class Hopper SM90 support**.
+
+CuTe models:
 - **Layouts** as algebraic objects (compose, divide, complement)
 - **Tiling** as layout transformations
-- **Data movement** (shared memory staging, register tiling, TMA) as layout operations
+- **Data movement** (shared-memory staging, register tiling, TMA) as layout operations
 
-### 15.2 When to Use CuTe vs cuBLAS/cuDNN
+**Which ops go to CuTe** (vs vendor libs):
 
-| Op | Strategy | Reason |
-|----|----------|--------|
-| GEMM (standard shapes) | cuBLAS | Battle-tested, auto-tuned |
-| Fused GEMM+Bias+Act | CuTe | Custom fusion, cuBLAS can't fuse |
-| FlashAttention | flash-attn library | Specialized, heavily optimized |
-| LayerNorm | CuTe | Simple enough, good learning exercise |
-| RoPE | CuTe | Element-wise with position-dependent pattern |
-| Quantized MatMul (INT4×FP16) | CuTe | Custom dequant+GEMM fusion |
-| Residual+LayerNorm fusion | CuTe | Cross-op fusion not in cuDNN |
+| Op | Implementation | Reason |
+|----|----------------|--------|
+| GEMM (standard shapes) | cuBLASLt (§15.3) | Battle-tested, auto-tuned |
+| GEMM+Bias+Act (standard) | cuBLASLt epilogue (§15.3) | Vendor-fused since CUDA 12.0 |
+| LayerNorm / RMSNorm | CuTe + warp reduction, one template per dtype | Not in cuBLAS |
+| Residual + LayerNorm (fused) | CuTe | Cross-op fusion, not in cuDNN |
+| RoPE | Custom CUDA C (position-indexed elementwise) | Simple; no CUTLASS needed |
+| Softmax | Custom CUDA C (online / safe-softmax) | Not in cuBLAS |
+| Quantized MatMul (INT4×FP16) | CuTe (dequant+GEMM fusion) | Custom fusion |
+| Attention | cuDNN / FA3 (§13, §15.5) | Specialized — not hand-rolled in CuTe |
 
-### 15.3 CuTe Kernel Example: Fused Residual + LayerNorm
+**Rust consumption pattern** (the design's chosen path — `native-eps/cuda/` C++ kernels, §56):
+
+1. **Instantiate** the CUTLASS kernel variant in a `.cu` file with **template** type/shape params.
+2. **Export** an `extern "C"` launcher, e.g. `void launch_fused_residual_layernorm(...)`.
+3. **Compile** via `nvcc` in `build.rs` with `-gencode arch=compute_90,code=sm_90` (+ SM89/SM80).
+4. **Archive** into a static `libcuda_kernels.a`; `cargo:rustc-link-lib=static=cuda_kernels`.
+5. **Declare** matching `extern "C"` signatures in Rust and call them from the EP kernels.
 
 ```cpp
-// native-eps/cuda/src/kernels/fused_residual_layernorm.cu
+// native-eps/cuda/src/fused_residual_layernorm.cu
 #include <cute/tensor.hpp>
 
-template<int kBlockSize = 1024>
+// dtype-parameterized (T), shape-driven (hidden_size is a runtime arg) — no model constants.
+template<typename T, int kBlockSize = 1024>
 __global__ void fused_residual_layernorm(
-    float const* residual,   // [batch, seq, hidden]
-    float const* input,      // [batch, seq, hidden]
-    float const* gamma,      // [hidden]
-    float const* beta,       // [hidden]
-    float* output,           // [batch, seq, hidden]
-    int hidden_size,
-    float eps
+    T const* residual,   // [batch, seq, hidden]
+    T const* input,      // [batch, seq, hidden]
+    T const* gamma,      // [hidden]
+    T const* beta,       // [hidden]
+    T*       output,     // [batch, seq, hidden]
+    int      hidden_size,
+    float    eps
 ) {
     using namespace cute;
-    // Each thread block handles one (batch, seq) position
-    int idx = blockIdx.x;
+    int idx = blockIdx.x;                                   // one (batch, seq) row per block
+    auto layout = make_layout(make_shape(hidden_size));     // CuTe layout over the hidden dim
+    // fused residual add → mean/var in registers → normalize → gamma/beta → write.
+    // No intermediate buffer for the residual add.
+}
 
-    // CuTe layout for the hidden dimension
-    auto layout = make_layout(make_shape(hidden_size));
+// extern "C" launcher (the Rust FFI boundary). Dtype is dispatched at runtime.
+extern "C" void launch_fused_residual_layernorm(
+    const void* residual, const void* input,
+    const void* gamma, const void* beta, void* output,
+    int batch_seq, int hidden_size, float eps, int dtype, cudaStream_t stream);
+```
 
-    // Load residual + input (fused add)
-    // Compute mean and variance in registers
-    // Normalize and apply gamma/beta
-    // Write output
-    // All in one kernel — no intermediate buffer for residual add
+#### Hopper-specific: TMA + WGMMA (with SM80 fallback)
+
+On SM90 (H100/H200), CuTe gives direct access to **TMA** (Tensor Memory Accelerator — async
+global→shared copy without occupying warps) and **WGMMA** (Warpgroup MMA — async warpgroup GEMM).
+Every such kernel is **arch-gated** so it still runs on Ampere:
+
+```cpp
+#if __CUDA_ARCH__ >= 900
+    // Hopper path: TMA async copy + WGMMA
+    auto tma_load = make_tma_copy(SM90_TMA_LOAD{}, source_tensor, smem_layout);
+    cute::copy(tma_load, source_tensor, shared_tensor);   // global → shared, frees warps
+#else
+    // Ampere (SM80) fallback: cp.async + mma.sync
+#endif
+```
+
+### 15.5 Attention (phased) — reconciles with §13
+
+Attention is **not** hand-written in CuTe. It follows the phasing already introduced in §13, now
+pinned to concrete Rust bindings:
+
+- **Phase 2a — cuDNN fused SDPA** via `cudarc::cudnn`. cuDNN 9.x exposes fused Scaled-Dot-Product
+  Attention through a clean **C API** (GQA, causal mask, sliding window, FP8 on H100). This is the
+  **fast-to-integrate baseline** — good enough throughput, no custom build step. (cuDNN wrapping in
+  `cudarc` is less mature than cuBLAS; the EP drops to the `result`/`sys` layer where needed.)
+  Limitation: no paged-KV out of the box.
+- **Phase 2b — FlashAttention-3** (Tri Dao, Hopper). Peak H100 attention (~1.5–2× FA2), FP8,
+  GQA, **paged-KV**. FA3 ships no official C ABI or Rust crate, so we vendor its `hopper/` csrc and
+  add a **hand-written `flash_attn_shim.cu`** `extern "C"` wrapper (excluding the PyTorch-dependent
+  files), compiled as part of `native-eps/cuda/`. This is the **biggest build-complexity item in
+  the stack** — a one-time investment. This is the runtime behind the existing §13.3
+  `FlashAttentionKernel` binding and the §13.4 `PagedFlashAttention` path; FA3 is **Hopper-only**,
+  so non-Hopper deployments fall back to the Phase 2a cuDNN SDPA path.
+
+See §13 for the fusion pass, the `FlashAttentionKernel` binding, and paged-KV integration — this
+section only fixes *which library* fulfills them. `FlashAttentionKernel::new(causal, num_heads,
+head_dim)` already takes these as **runtime** arguments and satisfies the §15.1 hard rule.
+
+### 15.6 Trivial Elementwise: NVRTC
+
+Simple standalone elementwise ops (GELU/SiLU standalone, add/mul/scale, casts) can skip the build
+step entirely: `cudarc::nvrtc::compile_ptx(src)` compiles a CUDA-C source string to PTX **at
+runtime** and launches it. Used for ops too trivial to warrant a `.cu` file in the static lib;
+fused elementwise variants still go to a `.cu`/CuTe kernel.
+
+### 15.7 "If We Start Phase 2 Tomorrow" — Crate Layout & Build Sketch
+
+```
+onnx-runtime-ep-cuda/
+├── build.rs                  # nvcc: native-eps/cuda/*.cu → libcuda_kernels.a
+├── Cargo.toml                # cudarc = { features = ["cuda-12090","cublas","cublaslt","cudnn","nccl"] }
+└── src/
+    ├── provider.rs           # CudaExecutionProvider (cudarc::driver device/context)
+    ├── allocator.rs          # device allocator (cudarc)
+    ├── stream.rs             # stream + CUDA-graph capture (cudarc)
+    └── kernels/
+        ├── gemm.rs           # cuBLASLt via cudarc::cublaslt::safe
+        ├── attention.rs      # Phase 2a cuDNN SDPA; Phase 2b flash_attn_shim FFI
+        ├── fused.rs          # extern "C" FFI → libcuda_kernels.a (CuTe kernels)
+        └── elementwise.rs    # NVRTC via cudarc::nvrtc for trivial ops
+
+native-eps/cuda/
+├── include/kernels.h         # extern "C" launcher declarations
+└── src/
+    ├── fused_residual_layernorm.cu   # CuTe (SM90 TMA path + SM80 fallback)
+    ├── rms_norm.cu                   # CuTe, dtype-templated
+    ├── rope.cu                       # custom CUDA C (elementwise, position-indexed)
+    ├── softmax.cu                    # custom CUDA C (online/safe softmax)
+    ├── gelu_silu.cu                  # standalone elementwise (or NVRTC)
+    └── flash_attn_shim.cu            # Phase 2b: extern "C" shim around FA3 hopper/ csrc
+```
+
+```rust
+// build.rs sketch — nvcc-compile each .cu with CUTLASS headers, multi-arch, archive.
+fn main() {
+    let nvcc = std::env::var("NVCC").unwrap_or_else(|_| "nvcc".into());
+    for src in glob("native-eps/cuda/src/*.cu") {
+        Command::new(&nvcc).args([
+            "-O3", "-std=c++17",
+            "-gencode", "arch=compute_90,code=sm_90",   // Hopper H100/H200 (primary)
+            "-gencode", "arch=compute_89,code=sm_89",   // Ada L40
+            "-gencode", "arch=compute_80,code=sm_80",   // Ampere A100 (fallback)
+            "--include-path", "third_party/cutlass/include",
+            "-c", &src, "-o", &obj,
+        ]).status().unwrap();
+    }
+    // archive objs → libcuda_kernels.a
+    println!("cargo:rustc-link-lib=static=cuda_kernels");
+    println!("cargo:rustc-link-lib=dylib=cudart");
 }
 ```
 
-### 15.4 Hopper-Specific: TMA + WGMMA
+Build-complexity note: CUTLASS template instantiation compiles slowly (minutes/kernel) — mitigate
+with `sccache`/`ccache`. `cudarc` needs no C++ build for vendor libs. The FA3 shim (§15.5) is the
+one heavyweight, one-time integration.
 
-For SM90 (H100/H200), CuTe provides direct access to:
-- **TMA** (Tensor Memory Accelerator): async global→shared copy without using warps
-- **WGMMA** (Warpgroup Matrix Multiply-Accumulate): fused shared-memory GEMM
+### 15.8 cuTile — Deferred to Phase 3
 
-```cpp
-// Hopper TMA example via CuTe
-auto tma_load = make_tma_copy(SM90_TMA_LOAD{}, source_tensor, smem_layout);
-// Issues async load from global → shared, freeing warps for compute
-cute::copy(tma_load, source_tensor, shared_tensor);
-```
+Justin asked whether the Phase-2 CUDA EP should use NVIDIA **cuTile** "or a better choice." The
+answer: **not cuTile for Phase 2.** NVIDIA CUDA Tile launched with **CUDA 13.1** (a tile-first
+Python DSL over a new "CUDA Tile IR", philosophically closer to Triton than to CUTLASS CuTe). Two
+disqualifiers for this project:
+
+1. **No Hopper / SM90 support.** The CUDA 13.1 blog states CUDA Tile "is supported on NVIDIA
+   Ampere, NVIDIA Ada and NVIDIA Blackwell (compute capability 8.x, 10.x, 11.x and 12.x) products
+   only"; the `tileiras` compiler (v13.2) "only supports Blackwell GPU and Ampere/Ada GPU. Hopper
+   GPU will be supported in the coming versions"
+   ([NVIDIA CUDA 13.1 blog, 2025](https://developer.nvidia.com/blog/nvidia-cuda-13-1-powers-next-gen-gpu-programming-with-nvidia-cuda-tile-and-performance-gains/);
+   [NVIDIA/cutile-python README, 2025](https://github.com/nvidia/cutile-python)). Hopper = SM90 =
+   CC 9.x = **our primary H100/H200 target** — directly excluded.
+2. **Python-only; no C++ or Rust path.** cuTile Python is the sole user-facing interface; the blog
+   notes a C++ implementation is only "planned for a future CUDA release," with no Rust path and a
+   Python + `tileiras` runtime dependency — **incompatible with a pure-Rust shipping binary.**
+
+**Re-evaluate cuTile in Phase 3** when (a) Hopper support ships, (b) a C++ / standalone-AOT path
+lands, and (c) production adoption appears — earliest realistic window ~CUDA 14.x / 2027.
+
+#### Also watched for Phase 3 (not adopted for Phase 2)
+
+- **CuTe DSL (CUTLASS 4.x Python).** CUTLASS 4.6.1 (July 2026) adds a Python DSL and an
+  **experimental `cute.compile_to` AOT path** to "build customized compile-execute pipelines
+  outside of Python" ([CUTLASS README, 2026](https://github.com/NVIDIA/cutlass)); FlashAttention-4
+  is authored in it. The DSL graduates beta "by end of summer 2026." This *could* one day let
+  CuTe-DSL kernels be AOT-compiled and linked into a Rust runtime — **watch for Phase 3.** For
+  Phase 2 it is ignored: **CUTLASS 3.x C++ templates are sufficient and production-proven.**
+
+#### Explicitly rejected for production (Phase 2)
+
+- **Rust-CUDA / `rustc_codegen_nvvm`** — revived but self-described "early development" (bugs,
+  breaking changes), requires Rust **nightly**, no CUTLASS/WGMMA/TMA integration. Not for a
+  shipping runtime.
+- **Triton AOT (NVIDIA)** — the AOT path is experimental/fragile and drags a Python
+  compile→`.so`→dlopen dependency. Skip.
+- **TileLang / Mojo** — Python-only authoring, no Rust/C++ AOT path. Out of scope.
 
 ---
 
@@ -2739,7 +2948,7 @@ onnx-genai/                               (monorepo)
 │   ├── onnx-runtime-scheduler/                    # Async DAG executor, streams, fences
 │   ├── onnx-runtime-ep-api/                       # ExecutionProvider trait + ORT ABI bridge
 │   ├── onnx-runtime-ep-cpu/                       # CPU EP (oneDNN, C++ FFI) — we maintain
-│   ├── onnx-runtime-ep-cuda/                      # CUDA EP (CuTe + cuBLAS) — we maintain
+│   ├── onnx-runtime-ep-cuda/                      # CUDA EP (cudarc + cuBLASLt + CuTe; §15) — we maintain
 │   ├── onnx-runtime-session/                      # Session builder, inference API
 │   ├── onnx-runtime-tracer/                       # Unified tracing (shared by runtime + genai)
 │   ├── onnx-runtime-capi/                         # C ABI: libonnxruntime.so drop-in
@@ -6034,7 +6243,7 @@ compiled EP lands into an already-working context-cache pipeline.
 
 ### Phase 2: Multi-Device + EPs (8-12 weeks)
 _Depends on: Phase 1 complete_
-- [ ] `onnx-runtime-ep-cuda`: CUDA EP with cuBLAS GEMM + CuTe LayerNorm/GELU
+- [ ] `onnx-runtime-ep-cuda`: CUDA EP on the **§15 kernel stack** — `cudarc` foundation, cuBLASLt GEMM (fused epilogue), CuTe custom kernels (LayerNorm/RMSNorm/RoPE/softmax) via `extern "C"` FFI, cuDNN fused SDPA for attention (Phase 2a). _cuTile deferred to Phase 3 (no Hopper/SM90, Python-only — §15.8)._
 - [ ] `onnx-runtime-ep-api`: ORT Graph ABI bridge for legacy plugin EPs
 - [ ] Legacy EP loading (dlopen + vtable)
 - [ ] **EPContext node support (§55): loader recognition + IR representation, `source`-keyed EP dispatch (ep-api/session), embed/external blob resolution, and the `*_ctx.onnx` writer for `ep.context_enable` (loader/session), plus `ep.context_*` C-API session options (§21.4).** Foundational for the compiled EPs (CUDA/QNN/OpenVINO/TensorRT); no Phase-1 EP consumes it yet.
