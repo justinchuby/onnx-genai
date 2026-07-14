@@ -914,8 +914,8 @@ pub(crate) fn sink_tokens_from_metadata(metadata: &InferenceMetadata) -> usize {
 /// on-device attention compute. We infer runtime-owned share-buffer KV from:
 ///   * `model.attention.type` == group-query attention, plus
 ///   * a group-query-attention (GQA) `model.attention.type`, plus
-///   * a share-buffer-compatible native KV dtype — float16 (WebGPU) or float32
-///     (CPU/CUDA) — via `kv_cache.native_dtype` or
+///   * a share-buffer-compatible native KV dtype — float16, bfloat16, or
+///     float32 — via `kv_cache.native_dtype` or
 ///     `model.runtime_configurable.kv_cache.dtype`, plus
 ///   * a declared `model.max_sequence_length` (used to pre-size the buffer).
 ///
@@ -948,8 +948,8 @@ fn is_group_query_attention(attention_type: &str) -> bool {
 /// Whether the model declares a share-buffer-compatible native KV cache dtype,
 /// via either `kv_cache.native_dtype` or
 /// `model.runtime_configurable.kv_cache.dtype`. The ORT GroupQueryAttention
-/// kernel supports `past_present_share_buffer` for both float16 and float32 KV,
-/// so both dtypes are eligible for the runtime-owned shared KV buffer.
+/// kernel supports `past_present_share_buffer` for float16, bfloat16, and
+/// float32 KV, so all three dtypes are eligible for the shared KV buffer.
 fn metadata_kv_is_share_buffer_dtype(metadata: &InferenceMetadata) -> bool {
     let native = metadata
         .kv_cache
@@ -970,7 +970,7 @@ fn metadata_kv_is_share_buffer_dtype(metadata: &InferenceMetadata) -> bool {
 fn is_share_buffer_kv_dtype(dtype: &str) -> bool {
     matches!(
         dtype.to_ascii_lowercase().as_str(),
-        "float16" | "fp16" | "half" | "float32" | "fp32" | "float"
+        "float16" | "fp16" | "half" | "bfloat16" | "bf16" | "float32" | "fp32" | "float"
     )
 }
 
@@ -1325,9 +1325,12 @@ fn is_token_input_name(lower_name: &str) -> bool {
 }
 
 fn empty_past_value(info: &TensorInfo) -> anyhow::Result<Value> {
-    if !matches!(info.dtype, DataType::Float32 | DataType::Float16) {
+    if !matches!(
+        info.dtype,
+        DataType::Float32 | DataType::Float16 | DataType::BFloat16
+    ) {
         anyhow::bail!(
-            "KV input '{}' must be Float32 or Float16, got {:?}",
+            "KV input '{}' must be Float32, Float16, or BFloat16, got {:?}",
             info.name,
             info.dtype
         );
@@ -1361,6 +1364,7 @@ fn empty_past_value(info: &TensorInfo) -> anyhow::Result<Value> {
     match info.dtype {
         DataType::Float32 => Value::from_slice_f32(&[], &shape),
         DataType::Float16 => Value::from_vec_f16_bits(Vec::new(), &shape),
+        DataType::BFloat16 => Value::from_vec_bf16_bits(Vec::new(), &shape),
         _ => unreachable!("dtype checked above"),
     }
     .map_err(|e| anyhow::anyhow!("Failed to create empty KV input '{}': {}", info.name, e))
@@ -1372,6 +1376,8 @@ pub(crate) fn clone_value(value: &Value) -> anyhow::Result<Value> {
             .map_err(|e| anyhow::anyhow!("Failed to clone Float32 ORT value: {}", e)),
         DataType::Float16 => Value::from_vec_f16_bits(value.to_vec_f16_bits()?, value.shape())
             .map_err(|e| anyhow::anyhow!("Failed to clone Float16 ORT value: {}", e)),
+        DataType::BFloat16 => Value::from_vec_bf16_bits(value.to_vec_bf16_bits()?, value.shape())
+            .map_err(|e| anyhow::anyhow!("Failed to clone BFloat16 ORT value: {}", e)),
         DataType::Int64 => Value::from_slice_i64(&value.to_vec_i64()?, value.shape())
             .map_err(|e| anyhow::anyhow!("Failed to clone Int64 ORT value: {}", e)),
         dtype => anyhow::bail!("unsupported cached ORT value dtype: {:?}", dtype),
@@ -1422,6 +1428,10 @@ fn slice_value_axis(value: &Value, axis: usize, start: usize, len: usize) -> any
         ),
         DataType::Float16 => Value::from_vec_f16_bits(
             copy_axis_slice(&value.to_vec_f16_bits()?, shape, axis, start, len),
+            &output_shape,
+        ),
+        DataType::BFloat16 => Value::from_vec_bf16_bits(
+            copy_axis_slice(&value.to_vec_bf16_bits()?, shape, axis, start, len),
             &output_shape,
         ),
         dtype => anyhow::bail!("cannot slice cached KV tensor with dtype {dtype:?}"),
@@ -1491,6 +1501,16 @@ fn concat_value_axis(first: &Value, second: &Value, axis: usize) -> anyhow::Resu
             interleave(
                 &first.to_vec_f16_bits()?,
                 &second.to_vec_f16_bits()?,
+                first_shape,
+                second_shape,
+                axis,
+            ),
+            &output_shape,
+        ),
+        DataType::BFloat16 => Value::from_vec_bf16_bits(
+            interleave(
+                &first.to_vec_bf16_bits()?,
+                &second.to_vec_bf16_bits()?,
                 first_shape,
                 second_shape,
                 axis,
@@ -1585,8 +1605,9 @@ mod tests {
         assert!(is_share_buffer_kv_dtype("float32"));
         assert!(is_share_buffer_kv_dtype("FP32"));
         assert!(is_share_buffer_kv_dtype("float"));
+        assert!(is_share_buffer_kv_dtype("bfloat16"));
+        assert!(is_share_buffer_kv_dtype("BF16"));
         assert!(!is_share_buffer_kv_dtype("int8"));
-        assert!(!is_share_buffer_kv_dtype("bfloat16"));
     }
 
     fn empty_metadata() -> InferenceMetadata {
@@ -1693,6 +1714,26 @@ mod tests {
             }),
             kv_cache: Some(KvCacheSpec {
                 native_dtype: Some("float32".to_string()),
+                quantization_tolerance: None,
+                sensitive_layers: None,
+                operations: None,
+            }),
+            ..empty_metadata()
+        };
+        assert_eq!(shared_kv_buffer_len_from_metadata(&metadata), Some(4096));
+    }
+
+    #[test]
+    fn shared_kv_from_gqa_bf16_native_dtype() {
+        let metadata = InferenceMetadata {
+            model: Some(ModelCapabilities {
+                attention: Some(gqa_attention()),
+                max_sequence_length: Some(4096),
+                speculative: None,
+                runtime_configurable: None,
+            }),
+            kv_cache: Some(KvCacheSpec {
+                native_dtype: Some("bfloat16".to_string()),
                 quantization_tolerance: None,
                 sensitive_layers: None,
                 operations: None,

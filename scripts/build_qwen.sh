@@ -5,6 +5,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MOBIUS_DIR="${MOBIUS_DIR:-/Users/justinc/Documents/GitHub/mobius}"
 MODEL_ID="${MODEL_ID:-Qwen/Qwen2.5-0.5B-Instruct}"
 DTYPE="${DTYPE:-f32}"
+EP="${EP:-default}"
 STATIC_CACHE="${STATIC_CACHE:-${SCATTER_CACHE:-0}}"
 MAX_SEQ_LEN="${MAX_SEQ_LEN:-2048}"
 
@@ -26,5 +27,6 @@ python -m mobius build \
   --model "$MODEL_ID" \
   "$OUT_DIR" \
   --dtype "$DTYPE" \
+  --ep "$EP" \
   "${CACHE_ARGS[@]}" \
   --runtime ort-genai

@@ -155,6 +155,11 @@ impl Value {
         Self::from_vec_f16_bits(data.to_vec(), shape)
     }
 
+    /// Create a CPU BFloat16 tensor from bfloat16 bit patterns.
+    pub fn from_slice_bf16_bits(data: &[u16], shape: &[i64]) -> Result<Self> {
+        Self::from_vec_bf16_bits(data.to_vec(), shape)
+    }
+
     /// Create a CPU float tensor of `dtype` from f32 host data.
     ///
     /// Float32 binds directly; Float16 narrows each element via the IEEE-754
@@ -170,6 +175,13 @@ impl Value {
                     .map(|&x| half::f16::from_f32(x).to_bits())
                     .collect();
                 Self::from_vec_f16_bits(bits, shape)
+            }
+            DataType::BFloat16 => {
+                let bits: Vec<u16> = data
+                    .iter()
+                    .map(|&x| half::bf16::from_f32(x).to_bits())
+                    .collect();
+                Self::from_vec_bf16_bits(bits, shape)
             }
             other => Err(OrtError::InvalidArgument(format!(
                 "cannot build a {other:?} tensor from f32 data"
@@ -212,6 +224,23 @@ impl Value {
             ptr,
             shape: shape.to_vec(),
             dtype: DataType::Float16,
+            backing: TensorBacking::F16(data),
+        })
+    }
+
+    /// Create a CPU BFloat16 tensor from owned bfloat16 bit patterns.
+    pub fn from_vec_bf16_bits(mut data: Vec<u16>, shape: &[i64]) -> Result<Self> {
+        validate_shape(shape, Some(data.len()))?;
+        let ptr = create_tensor_with_data(
+            data.as_mut_ptr().cast(),
+            data.len() * std::mem::size_of::<u16>(),
+            shape,
+            DataType::BFloat16,
+        )?;
+        Ok(Self {
+            ptr,
+            shape: shape.to_vec(),
+            dtype: DataType::BFloat16,
             backing: TensorBacking::F16(data),
         })
     }
@@ -281,6 +310,11 @@ impl Value {
                 let halves: &[half::f16] = half::slice::HalfBitsSliceExt::reinterpret_cast(bits);
                 Ok(half::slice::HalfFloatSliceExt::to_f32_vec(halves))
             }
+            DataType::BFloat16 => Ok(self
+                .to_vec_bf16_bits()?
+                .into_iter()
+                .map(|bits| half::bf16::from_bits(bits).to_f32())
+                .collect()),
             other => Err(OrtError::InvalidArgument(format!(
                 "cannot widen {other:?} tensor to f32"
             ))),
@@ -292,6 +326,17 @@ impl Value {
         if self.dtype != DataType::Float16 {
             return Err(OrtError::InvalidArgument(format!(
                 "requested Float16 data from {:?} tensor",
+                self.dtype
+            )));
+        }
+        tensor_data_to_vec(self.ptr.as_ptr(), self.numel())
+    }
+
+    /// Copy BFloat16 tensor data out as bfloat16 bit patterns.
+    pub fn to_vec_bf16_bits(&self) -> Result<Vec<u16>> {
+        if self.dtype != DataType::BFloat16 {
+            return Err(OrtError::InvalidArgument(format!(
+                "requested BFloat16 data from {:?} tensor",
                 self.dtype
             )));
         }
@@ -401,6 +446,7 @@ impl Value {
         match self.dtype {
             DataType::Float32 => Value::from_vec_f32(self.to_vec_f32()?, &self.shape),
             DataType::Float16 => Value::from_vec_f16_bits(self.to_vec_f16_bits()?, &self.shape),
+            DataType::BFloat16 => Value::from_vec_bf16_bits(self.to_vec_bf16_bits()?, &self.shape),
             DataType::Int64 => Value::from_vec_i64(self.to_vec_i64()?, &self.shape),
             other => Err(OrtError::InvalidArgument(format!(
                 "cannot clone tensor with dtype {other:?}"
@@ -440,7 +486,7 @@ impl Value {
                     // row-major allocation, and ORT returned a mutable data pointer.
                     unsafe { std::slice::from_raw_parts_mut(ptr.add(start), row_len) }.fill(0.0);
                 }
-                DataType::Float16 => {
+                DataType::Float16 | DataType::BFloat16 => {
                     let ptr = tensor_data_ptr(self.ptr.as_ptr())?.cast::<u16>();
                     // SAFETY: same bounds/invariants as the Float32 branch.
                     unsafe { std::slice::from_raw_parts_mut(ptr.add(start), row_len) }.fill(0);
@@ -511,7 +557,7 @@ impl Value {
                         std::slice::from_raw_parts_mut(ptr, prefix.len()).copy_from_slice(&prefix);
                     }
                 }
-                DataType::Float16 => {
+                DataType::Float16 | DataType::BFloat16 => {
                     let ptr = tensor_data_ptr(self.ptr.as_ptr())?.cast::<u16>();
                     let mut prefix = Vec::with_capacity(sources.len() * row_len);
                     for &src in sources {
