@@ -12,7 +12,7 @@ use onnx_runtime_ir::{Attribute, DataType};
 use crate::context::InferenceContext;
 use crate::dim_expr::DimExpr;
 use crate::error::ShapeInferError;
-use crate::handlers::{norm_axis, norm_insert_axis};
+use crate::handlers::norm_axis;
 use crate::registry::InferenceRegistry;
 use crate::shape_data::ShapeData;
 
@@ -214,9 +214,16 @@ fn unsqueeze_common(
         return Ok(());
     };
     let out_rank = t.rank() + axes.len();
+    // ONNX Unsqueeze axes index positions in the *output* tensor (accepted
+    // range `[-output_rank, output_rank-1]`), so normalize against `out_rank`,
+    // not the input rank — otherwise a high axis (e.g. 3 into a rank-2 input)
+    // is wrongly clamped and the size-1 dims land in the wrong slots.
     let norm: Vec<usize> = axes
         .iter()
-        .map(|&a| norm_insert_axis(a, t.rank()))
+        .map(|&a| {
+            let a = if a < 0 { a + out_rank as i64 } else { a };
+            a.clamp(0, out_rank as i64 - 1) as usize
+        })
         .collect();
     let mut out = Vec::with_capacity(out_rank);
     let mut src = t.shape.iter();

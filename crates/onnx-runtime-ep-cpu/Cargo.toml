@@ -13,6 +13,10 @@ onnx-runtime-ir = { workspace = true }
 onnx-runtime-ep-api = { workspace = true }
 thiserror = { workspace = true }
 rayon = "1"
+# Pure-Rust libm (no FFI, no `cc`): supplies the correctly-rounded `erf` used by
+# the `Erf` op and the fused `Gelu` kernel. A polynomial approximation was ~1e-9
+# off near zero and failed the upstream conformance suite's tight tolerance.
+libm = "0.2"
 
 [features]
 # oneDNN CPU GEMM backend (docs/ORT2.md §25.2). NON-default: it requires the

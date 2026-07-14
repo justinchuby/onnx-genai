@@ -140,6 +140,33 @@ impl<'a> TensorView<'a> {
         }
     }
 
+    /// Construct an **absent** view: the positional placeholder an executor
+    /// passes for an *omitted optional input* (an ONNX empty-string input name).
+    /// It carries a null pointer and an empty shape so it can never be read as a
+    /// real tensor — kernels test [`TensorView::is_absent`] before touching an
+    /// optional slot. This preserves positional arity so a later present input
+    /// (e.g. `Slice`'s `steps` when `axes` is omitted) is not misread as the
+    /// omitted one.
+    pub fn absent(dtype: DataType) -> Self {
+        Self {
+            data: DevicePtr(std::ptr::null()),
+            dtype,
+            shape: &[],
+            strides: &[],
+            byte_offset: 0,
+            device: DeviceId::cpu(),
+            _marker: PhantomData,
+        }
+    }
+
+    /// Whether this view is the [`TensorView::absent`] placeholder for an
+    /// omitted optional input (null backing pointer). Kernels with optional
+    /// inputs check this to distinguish "input not supplied" from a real,
+    /// possibly-empty, tensor.
+    pub fn is_absent(&self) -> bool {
+        self.data.is_null()
+    }
+
     /// Set the DLPack-style byte offset of the element origin.
     pub fn with_byte_offset(mut self, byte_offset: usize) -> Self {
         self.byte_offset = byte_offset;

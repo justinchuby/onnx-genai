@@ -10,9 +10,9 @@
 //! * **Unary** — `Sqrt`, `Erf`, `Tanh`: a straight per-element map.
 //!
 //! Numerics target ONNX/NumPy exactly. `Erf` has no `std` intrinsic, so it uses
-//! the Abramowitz & Stegun 7.1.26 rational approximation evaluated in `f64`
-//! (max absolute error ≈ 1.5e-7, comfortably below f32 resolution), keeping the
-//! crate FFI-free per the module-level architecture note.
+//! the pure-Rust `libm::erf` (the correctly-rounded Sun/FreeBSD algorithm),
+//! keeping the crate FFI-free (libm is pure Rust, no `cc`) while matching the
+//! ONNX reference to < 1 ulp near zero.
 
 use onnx_runtime_ep_api::{Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ir::Node;
@@ -192,9 +192,11 @@ impl Kernel for UnaryKernel {
     }
 }
 
-/// Gauss error function via Abramowitz & Stegun 7.1.26, evaluated in `f64`.
-/// Max absolute error ≈ 1.5e-7 — below f32 resolution over the whole range.
-/// Odd symmetry (`erf(-x) = -erf(x)`) is applied explicitly.
+/// Gauss error function. Delegates to the pure-Rust `libm::erf`, which is the
+/// correctly-rounded (< 1 ulp) Sun/FreeBSD algorithm — the same one the C
+/// standard library and ONNX reference runtimes use. An earlier polynomial
+/// (Abramowitz & Stegun 7.1.26) was ~1e-9 off near zero and failed the upstream
+/// conformance suite's tight (`atol=0`) tolerance. NaN propagates.
 ///
 /// Shared with the fused `Gelu` kernel (`kernels::gelu`) so both the standalone
 /// `Erf` op and the fused GELU compute bit-identical error-function values.
@@ -202,19 +204,7 @@ pub(crate) fn erf(x: f64) -> f64 {
     if x.is_nan() {
         return f64::NAN;
     }
-    let sign = if x < 0.0 { -1.0 } else { 1.0 };
-    let x = x.abs();
-    // Constants from A&S 7.1.26.
-    const A1: f64 = 0.254_829_592;
-    const A2: f64 = -0.284_496_736;
-    const A3: f64 = 1.421_413_741;
-    const A4: f64 = -1.453_152_027;
-    const A5: f64 = 1.061_405_429;
-    const P: f64 = 0.327_591_1;
-    let t = 1.0 / (1.0 + P * x);
-    let poly = ((((A5 * t + A4) * t + A3) * t + A2) * t + A1) * t;
-    let y = 1.0 - poly * (-x * x).exp();
-    sign * y
+    libm::erf(x)
 }
 
 #[cfg(test)]
@@ -383,5 +373,25 @@ mod tests {
         assert!((erf(6.0) - 1.0).abs() < 1e-6);
         assert!((erf(-6.0) + 1.0).abs() < 1e-6);
         assert!(erf(f64::NAN).is_nan());
+    }
+
+    #[test]
+    fn erf_near_zero_high_accuracy() {
+        // The A&S 7.1.26 approximation was ~1e-9 off near zero; libm::erf is
+        // correctly rounded. Check tight agreement against reference values
+        // (erf(x) ≈ 2/√π · x for tiny x).
+        let two_over_sqrt_pi = 1.128_379_167_095_512_6_f64;
+        for &x in &[1e-3_f64, 1e-4, 1e-5, 1e-6, 1e-7, 1e-9] {
+            let expected = two_over_sqrt_pi * x - two_over_sqrt_pi * x * x * x / 3.0;
+            assert!(
+                (erf(x) - expected).abs() < 1e-15,
+                "erf({x}) = {}, expected ≈ {expected}",
+                erf(x)
+            );
+        }
+        // A few tabulated exact values to full f64 precision.
+        assert!((erf(0.5) - 0.520_499_877_813_046_5).abs() < 1e-12);
+        assert!((erf(1.0) - 0.842_700_792_949_714_9).abs() < 1e-12);
+        assert!((erf(2.0) - 0.995_322_265_018_952_7).abs() < 1e-12);
     }
 }

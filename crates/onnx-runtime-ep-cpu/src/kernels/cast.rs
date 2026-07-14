@@ -106,6 +106,21 @@ impl Kernel for CastKernel {
         let to = self.to.ok_or_else(|| {
             EpError::KernelFailed("Cast: missing or unsupported `to` attribute".into())
         })?;
+        // Cast to/from STRING is a real ONNX feature, but the ep-cpu stores
+        // string tensors out-of-band (String has no fixed-width raw byte
+        // layout), so the byte-oriented conversion table below cannot produce or
+        // consume them. Reject explicitly (RULE #1) instead of emitting garbage.
+        if to == DataType::String || inputs[0].dtype == DataType::String {
+            return Err(EpError::KernelFailed(format!(
+                "Cast: string conversion (from {:?} to {to:?}) is unsupported on the CPU \
+                 execution provider. WHY: ep-cpu stores string tensors out-of-band and Cast \
+                 here operates on fixed-width numeric bytes, so a string source or target has \
+                 no raw layout to read or write. HOW: keep Cast between numeric/bool dtypes on \
+                 ep-cpu, or perform string (de)serialization outside the graph before running \
+                 it on this provider.",
+                inputs[0].dtype
+            )));
+        }
         if outputs[0].dtype != to {
             return Err(EpError::KernelFailed(format!(
                 "Cast: output dtype {:?} does not match `to` {to:?}",
@@ -311,5 +326,33 @@ mod tests {
         let mut out = Owned::zeros(DataType::Int64, &[1]);
         let err = CastKernel { to: None }.execute(&[a.view()], &mut [out.view_mut()]);
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn cast_to_string_is_rejected_with_actionable_error() {
+        // ep-cpu has no raw string layout: Cast to String must fail loudly
+        // (RULE #1) rather than produce garbage.
+        let a = Owned::f32(&[1], &[1.0]);
+        let mut out = Owned::zeros(DataType::String, &[1]);
+        let err = CastKernel {
+            to: Some(DataType::String),
+        }
+        .execute(&[a.view()], &mut [out.view_mut()]);
+        let msg = format!("{}", err.unwrap_err());
+        assert!(msg.contains("string conversion"), "message was: {msg}");
+        assert!(msg.contains("HOW:"), "message must be actionable: {msg}");
+    }
+
+    #[test]
+    fn cast_from_string_is_rejected_with_actionable_error() {
+        // Casting a String source is equally unsupported on ep-cpu.
+        let a = Owned::zeros(DataType::String, &[1]);
+        let mut out = Owned::zeros(DataType::Float32, &[1]);
+        let err = CastKernel {
+            to: Some(DataType::Float32),
+        }
+        .execute(&[a.view()], &mut [out.view_mut()]);
+        let msg = format!("{}", err.unwrap_err());
+        assert!(msg.contains("string conversion"), "message was: {msg}");
     }
 }

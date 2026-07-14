@@ -1914,6 +1914,7 @@ version = "0.1.0-dev.0"
 dependencies = [
  "bindgen 0.71.1",
  "cmake",
+ "libm",
  "onnx-runtime-ep-api",
  "onnx-runtime-ir",
  "rayon",

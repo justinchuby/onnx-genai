@@ -25,14 +25,6 @@ pub(crate) fn norm_axis(axis: i64, rank: usize) -> usize {
     a.clamp(0, r.saturating_sub(1)) as usize
 }
 
-/// Normalise an axis used as an *insertion* point (e.g. `Unsqueeze`), where the
-/// valid range is `0..=rank` (one past the end is allowed).
-pub(crate) fn norm_insert_axis(axis: i64, rank: usize) -> usize {
-    let r = rank as i64;
-    let a = if axis < 0 { axis + r + 1 } else { axis };
-    a.clamp(0, r) as usize
-}
-
 /// Populate `registry` with every built-in rule.
 pub fn register_all(registry: &mut InferenceRegistry) {
     elementwise::register(registry);

@@ -66,11 +66,16 @@ use crate::tensor::{host_bytes, write_host, Tensor};
 #[derive(Debug)]
 pub(crate) struct NodePlan {
     pub node_id: NodeId,
-    /// Present (non-skipped) input value ids, in positional order.
-    pub inputs: Vec<ValueId>,
+    /// Positional input value ids in ONNX signature order. An omitted optional
+    /// input (ONNX empty-string input name → `None` slot) is preserved as
+    /// `None` so a later present input is never misread as the omitted one
+    /// (e.g. `Slice(data, starts, ends, "", steps)`). Trailing `None`s are
+    /// trimmed — a truly absent trailing optional simply lowers the arity.
+    pub inputs: Vec<Option<ValueId>>,
     /// Output value ids, in positional order.
     pub outputs: Vec<ValueId>,
-    /// Element types of the present inputs.
+    /// Element types of the inputs, positional (matches `inputs`). A `None`
+    /// input slot carries a placeholder dtype that kernels never read.
     pub input_dtypes: Vec<DataType>,
     /// Element types of the outputs.
     pub output_dtypes: Vec<DataType>,
@@ -427,9 +432,20 @@ impl Executor {
             if onnx_runtime_loader::is_ep_context_op(&node.op_type, &node.domain) {
                 continue;
             }
-            let inputs: Vec<ValueId> = node.input_values().collect();
+            // Preserve positional input arity: keep interior `None` (omitted
+            // optional) slots so a later present input is not misread as the
+            // omitted one, but trim trailing `None`s (a trailing omitted
+            // optional just lowers the arity, matching ONNX semantics).
+            let mut slots: Vec<Option<ValueId>> = node.inputs.clone();
+            while matches!(slots.last(), Some(None)) {
+                slots.pop();
+            }
+            let inputs = slots;
             let outputs: Vec<ValueId> = node.outputs.clone();
-            let input_dtypes: Vec<DataType> = inputs.iter().map(|v| value_dtypes[v]).collect();
+            let input_dtypes: Vec<DataType> = inputs
+                .iter()
+                .map(|v| v.map(|vid| value_dtypes[&vid]).unwrap_or(DataType::Float32))
+                .collect();
             let output_dtypes: Vec<DataType> = outputs.iter().map(|v| value_dtypes[v]).collect();
             plan.push(NodePlan {
                 node_id: nid,
@@ -564,12 +580,17 @@ impl Executor {
         Ok(())
     }
 
-    /// Resolved input shapes of a plan node, in positional order.
+    /// Resolved input shapes of a plan node, in positional order. An omitted
+    /// optional input (`None` slot) has no shape; it takes an empty shape,
+    /// which the run loop only ever pairs with an absent placeholder view.
     fn node_input_shapes(
         plan: &NodePlan,
         resolved: &HashMap<ValueId, Vec<usize>>,
     ) -> Vec<Vec<usize>> {
-        plan.inputs.iter().map(|v| resolved[v].clone()).collect()
+        plan.inputs
+            .iter()
+            .map(|v| v.map(|vid| resolved[&vid].clone()).unwrap_or_default())
+            .collect()
     }
 
     /// Resolved output shapes of a plan node, in positional order.
@@ -754,9 +775,11 @@ impl Executor {
                     .iter()
                     .enumerate()
                     .map(|(i, v)| {
-                        buffers
-                            .get(v)
-                            .and_then(|b| buffer_as_i64(b, np.input_dtypes[i]))
+                        v.and_then(|vid| {
+                            buffers
+                                .get(&vid)
+                                .and_then(|b| buffer_as_i64(b, np.input_dtypes[i]))
+                        })
                     })
                     .collect();
                 let node = graph.node(np.node_id);
@@ -823,10 +846,16 @@ impl Executor {
                 .collect();
 
             // Input base pointers (raw, no lingering borrow) + bounds gate
-            // against the run-scoped resolved buffers.
+            // against the run-scoped resolved buffers. An omitted optional
+            // (`None`) slot has no buffer: it gets a null pointer and later
+            // becomes a `TensorView::absent` placeholder.
             let mut in_ptrs: Vec<*const std::ffi::c_void> = Vec::with_capacity(np.inputs.len());
-            for (i, &vid) in np.inputs.iter().enumerate() {
-                let buf = buffers.get(&vid).ok_or_else(|| {
+            for (i, slot) in np.inputs.iter().enumerate() {
+                let Some(vid) = slot else {
+                    in_ptrs.push(std::ptr::null());
+                    continue;
+                };
+                let buf = buffers.get(vid).ok_or_else(|| {
                     SessionError::Internal(format!("missing buffer for input value#{}", vid.0))
                 })?;
                 view_bounds(
@@ -850,9 +879,15 @@ impl Executor {
                 out_bufs.push((vid, buf));
             }
 
-            // Build input views over the raw pointers.
+            // Build input views over the raw pointers. An omitted optional
+            // (`None`) slot becomes an absent placeholder that preserves
+            // positional arity for the kernel.
             let mut views: Vec<TensorView> = Vec::with_capacity(np.inputs.len());
             for i in 0..np.inputs.len() {
+                if np.inputs[i].is_none() {
+                    views.push(TensorView::absent(np.input_dtypes[i]));
+                    continue;
+                }
                 views.push(TensorView::new(
                     DevicePtr(in_ptrs[i]),
                     np.input_dtypes[i],

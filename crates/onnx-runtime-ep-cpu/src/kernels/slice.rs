@@ -149,12 +149,16 @@ impl Kernel for SliceKernel {
 
         let starts = to_dense_i64(&inputs[1])?;
         let ends = to_dense_i64(&inputs[2])?;
-        let axes_in = if inputs.len() >= 4 {
+        // `axes` and `steps` are optional. An omitted optional input arrives as
+        // an absent placeholder (ONNX empty-string input name), which preserves
+        // positional arity — so `Slice(data, starts, ends, "", steps)` correctly
+        // reads `steps` from slot 4 rather than misreading it as `axes`.
+        let axes_in = if inputs.len() >= 4 && !inputs[3].is_absent() {
             Some(to_dense_i64(&inputs[3])?)
         } else {
             None
         };
-        let steps_in = if inputs.len() >= 5 {
+        let steps_in = if inputs.len() >= 5 && !inputs[4].is_absent() {
             Some(to_dense_i64(&inputs[4])?)
         } else {
             None
@@ -317,5 +321,72 @@ mod tests {
             )
             .unwrap();
         assert_eq!(out.to_i64(), vec![2, 3, 5, 6]);
+    }
+
+    #[test]
+    fn slice_omitted_axes_with_present_steps() {
+        // Slice(data, starts, ends, "", steps): axes omitted (absent placeholder)
+        // but steps supplied. The absent slot must NOT cause `steps` to be read
+        // as `axes`. data [6], [0:6:2] over default axis 0 -> [1,3,5].
+        let data = Owned::f32(&[6], &[1., 2., 3., 4., 5., 6.]);
+        let starts = Owned::i64(&[1], &[0]);
+        let ends = Owned::i64(&[1], &[6]);
+        let steps = Owned::i64(&[1], &[2]);
+        let mut out = Owned::zeros_f32(&[3]);
+        SliceKernel
+            .execute(
+                &[
+                    data.view(),
+                    starts.view(),
+                    ends.view(),
+                    TensorView::absent(onnx_runtime_ir::DataType::Int64),
+                    steps.view(),
+                ],
+                &mut [out.view_mut()],
+            )
+            .unwrap();
+        assert_eq!(out.to_f32(), vec![1., 3., 5.]);
+    }
+
+    #[test]
+    fn slice_negative_axis_with_steps() {
+        // Negative axis (-1) addressing the last dim, with a negative step.
+        // data [2,4], axis -1, [3:-5:-1] reverses each row -> [2,4] reversed cols.
+        let data = Owned::f32(&[2, 4], &[1., 2., 3., 4., 5., 6., 7., 8.]);
+        let starts = Owned::i64(&[1], &[3]);
+        let ends = Owned::i64(&[1], &[-5]);
+        let axes = Owned::i64(&[1], &[-1]);
+        let steps = Owned::i64(&[1], &[-1]);
+        let mut out = Owned::zeros_f32(&[2, 4]);
+        SliceKernel
+            .execute(
+                &[
+                    data.view(),
+                    starts.view(),
+                    ends.view(),
+                    axes.view(),
+                    steps.view(),
+                ],
+                &mut [out.view_mut()],
+            )
+            .unwrap();
+        assert_eq!(out.to_f32(), vec![4., 3., 2., 1., 8., 7., 6., 5.]);
+    }
+
+    #[test]
+    fn slice_empty_output() {
+        // A start == end slice yields a zero-length axis (empty output). The
+        // kernel must produce an empty buffer without indexing errors.
+        let data = Owned::f32(&[5], &[1., 2., 3., 4., 5.]);
+        let starts = Owned::i64(&[1], &[2]);
+        let ends = Owned::i64(&[1], &[2]);
+        let mut out = Owned::zeros_f32(&[0]);
+        SliceKernel
+            .execute(
+                &[data.view(), starts.view(), ends.view()],
+                &mut [out.view_mut()],
+            )
+            .unwrap();
+        assert_eq!(out.to_f32(), Vec::<f32>::new());
     }
 }
