@@ -13,3 +13,8 @@ crate-type = ["lib"]
 
 [dependencies]
 onnx-runtime-session = { workspace = true }
+onnx-runtime-ir = { workspace = true }
+onnx-runtime-loader = { workspace = true }
+
+[dev-dependencies]
+prost = "0.13"

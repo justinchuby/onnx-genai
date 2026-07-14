@@ -1778,7 +1778,10 @@ dependencies = [
 name = "onnx-runtime-capi"
 version = "0.1.0"
 dependencies = [
+ "onnx-runtime-ir",
+ "onnx-runtime-loader",
  "onnx-runtime-session",
+ "prost",
 ]
 
 [[package]]
