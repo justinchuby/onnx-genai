@@ -1,0 +1,16 @@
+[package]
+name = "onnx-runtime-optimizer"
+description = "Device-independent graph→graph optimization passes for the ORT 2.0 runtime: dead-node elimination, bounded constant folding, and op fusion over onnx-runtime-ir"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords = ["onnx", "optimizer", "fusion", "inference", "runtime"]
+categories = ["science", "compilers"]
+
+[dependencies]
+onnx-runtime-ir = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+onnx-runtime-loader = { workspace = true }

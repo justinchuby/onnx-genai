@@ -1821,6 +1821,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "onnx-runtime-optimizer"
+version = "0.1.0"
+dependencies = [
+ "onnx-runtime-ir",
+ "onnx-runtime-loader",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "onnx-runtime-session"
 version = "0.1.0"
 dependencies = [
