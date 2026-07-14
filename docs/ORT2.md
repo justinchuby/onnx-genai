@@ -2896,13 +2896,244 @@ pub fn conformance_test(model_path: &Path, inputs: &[Tensor], tolerance: f64) ->
 
 1. **JIT compilation** — Cranelift/LLVM for custom fused kernels? Or leave to EPs?
 2. **Model format** — Own optimized format for faster loading? Or always from ONNX?
-3. **Minimum opset** — Opset 17+ (modern LLMs) vs opset 7+ (full ORT compat)?
+3. ~~**Minimum opset** — Opset 17+ (modern LLMs) vs opset 7+ (full ORT compat)?~~ **Resolved: opset 17 minimum.**
 4. **Tensor parallelism** — Built into runtime or left to GenAI layer?
 5. **Disaggregated prefill/decode** — Runtime-level support or application-level?
 
 ---
 
-## 29. Phased Roadmap
+## 30. Memory Tiering & Offloading
+
+**Design principle: VRAM is a cache, not a hard requirement. Any model runs on any hardware — only speed differs.**
+
+### 30.1 Problem
+
+ORT today: model doesn't fit in GPU → OOM crash. Unacceptable.
+
+Our guarantee: **never OOM.** Auto-degrade to slower tiers when VRAM is insufficient.
+
+### 30.2 Memory Hierarchy
+
+```
+Tier 0: GPU HBM     — ~2 TB/s bandwidth, 16-80 GB capacity
+Tier 1: CPU DRAM    — ~50 GB/s bandwidth, 64-512 GB capacity
+Tier 2: NVMe/Disk   — ~7 GB/s bandwidth, TB+ capacity (mmap)
+```
+
+The runtime treats these as a unified address space with different costs.
+
+### 30.3 Architecture
+
+```rust
+pub struct TieredMemoryManager {
+    /// Tiers ordered by speed (fastest first).
+    tiers: Vec<MemoryTier>,
+    /// Weight placement: which tier each tensor lives on.
+    placement: HashMap<TensorId, TierPlacement>,
+    /// Prefetch queue: async bring-to-GPU requests.
+    prefetch_queue: VecDeque<PrefetchRequest>,
+    /// Memory pressure monitor.
+    pressure: MemoryPressureMonitor,
+}
+
+pub struct MemoryTier {
+    kind: TierKind,             // GpuHbm, CpuDram, Disk
+    capacity_bytes: usize,
+    used: AtomicUsize,
+    bandwidth_gbps: f64,        // for cost model
+    allocator: Box<dyn Allocator>,
+}
+
+pub enum TierPlacement {
+    /// Fits in GPU. Happy path, zero overhead.
+    Resident { device: DeviceId },
+    /// In CPU RAM, streamed to GPU on demand.
+    Offloaded { host_ptr: *mut u8, size: usize },
+    /// On disk, mmap'd on demand (extreme case: 405B on laptop).
+    DiskBacked { path: PathBuf, offset: u64, size: usize },
+}
+```
+
+### 30.4 Three Offloading Mechanisms
+
+#### A. Weight Offloading (static, decided at load time)
+
+On model load, place weights by priority until GPU budget is filled:
+
+```rust
+fn plan_weight_placement(model: &Model, gpu_budget: usize) -> PlacementPlan {
+    let mut weights: Vec<_> = model.weights()
+        .map(|w| (w.id, w.size, compute_priority(w)))
+        .collect();
+    // Priority: attention weights > MLP weights > embeddings > lm_head
+    weights.sort_by(|a, b| b.2.cmp(&a.2));
+
+    let mut gpu_used = 0;
+    let mut plan = PlacementPlan::new();
+
+    for (id, size, _priority) in &weights {
+        if gpu_used + size <= gpu_budget {
+            plan.place(*id, Tier::Gpu);
+            gpu_used += size;
+        } else {
+            plan.place(*id, Tier::Cpu);  // spill to CPU
+        }
+    }
+    plan
+}
+```
+
+Priority heuristic (customizable via `execution_hints.json` or `onnx_runtime.memory.priority`):
+1. Attention Q/K/V projections (hot in decode loop)
+2. MLP gate/up/down projections
+3. Embedding table (one lookup per token, memory-bound anyway)
+4. LM head (only used once at end)
+
+#### B. Activation Offloading (dynamic, during execution)
+
+For long-sequence prefill where activations exceed GPU memory:
+
+```rust
+fn execute_with_activation_spill(&mut self, layers: &[Layer]) -> Result<()> {
+    for (i, layer) in layers.iter().enumerate() {
+        // Async prefetch next layer's weights (overlaps with current compute)
+        if i + 1 < layers.len() {
+            self.prefetch_weights_async(i + 1);
+        }
+
+        // Execute current layer
+        let activation = layer.execute(&self.current_activation)?;
+
+        // If memory pressure high, spill activation to CPU
+        if self.pressure.gpu_utilization() > 0.90 {
+            self.spill_activation_to_cpu(&activation);
+        }
+
+        self.current_activation = activation;
+    }
+    Ok(())
+}
+```
+
+#### C. KV Cache Offloading (incremental, per-page eviction)
+
+Long context: KV cache is the biggest VRAM consumer. Page-granularity eviction:
+
+```rust
+impl PagedKvCache {
+    /// Evict least-recently-used pages to CPU when GPU pages exhausted.
+    fn ensure_capacity(&mut self, pages_needed: usize) {
+        while self.gpu_pages_free() < pages_needed {
+            let victim = self.lru_page();
+            self.async_move_page_to_cpu(victim);
+        }
+    }
+
+    /// Before attention: prefetch needed KV pages back to GPU.
+    fn prefetch_for_attention(&mut self, page_indices: &[PageId]) {
+        for &page_id in page_indices {
+            if self.page_location(page_id) == Tier::Cpu {
+                self.async_move_page_to_gpu(page_id);
+            }
+        }
+    }
+}
+```
+
+### 30.5 Overlap: Hiding Transfer Latency
+
+Offloading doesn't mean stalling — **prefetch overlaps with compute:**
+
+```
+Timeline (layer-pipeline offloading):
+
+GPU compute:  [== Layer N ==]  [== Layer N+1 ==]  [== Layer N+2 ==]
+H2D stream:        [-- prefetch N+1 weights --]  [-- prefetch N+2 --]
+D2H stream:   [-- spill N-1 activation --]
+
+If compute time > transfer time: zero visible overhead.
+If not: partially hidden, still better than blocking.
+```
+
+Implementation: separate CUDA streams for compute vs transfer, fence synchronization:
+
+```rust
+pub struct OverlappedExecutor {
+    compute_stream: CudaStream,
+    h2d_stream: CudaStream,      // host-to-device transfers
+    d2h_stream: CudaStream,      // device-to-host spills
+}
+
+impl OverlappedExecutor {
+    fn execute_layer(&mut self, layer: usize) {
+        // Fence: wait for prefetch of this layer's weights
+        self.h2d_stream.record_event(&self.prefetch_done[layer]);
+        self.compute_stream.wait_event(&self.prefetch_done[layer]);
+
+        // Compute on compute stream
+        self.compute_stream.launch_kernels(&self.layers[layer]);
+
+        // Async prefetch next layer (doesn't block compute)
+        self.h2d_stream.copy_h2d(&self.weights[layer + 1]);
+
+        // Async spill current activation if needed
+        if self.should_spill() {
+            self.d2h_stream.copy_d2h(&self.activations[layer]);
+        }
+    }
+}
+```
+
+### 30.6 Performance Expectation
+
+| Scenario | Relative Speed | What's happening |
+|----------|---------------|------------------|
+| 100% GPU-resident | 1.0× | Ideal |
+| 30% weights on CPU | ~0.7× | Prefetch mostly hidden by compute |
+| 70% weights on CPU | ~0.3-0.4× | Transfer becomes bottleneck |
+| Activation spill | ~0.5× | Extra D2H + H2D per layer |
+| KV pages on CPU | ~0.7-0.9× | Only evicted pages need fetch |
+| 100% CPU (no GPU) | ~0.05-0.1× | Fallback, but it runs |
+
+### 30.7 User API
+
+```python
+# Zero-config: auto-detect GPU capacity, auto-offload if needed
+session = ort2.load("llama-70b.onnx")  # 16GB GPU? Fine. Auto-offloads.
+
+# Explicit memory limit (leave room for other processes)
+session = ort2.load("model.onnx", memory_limit=12 * GB)
+
+# Force full offload (CPU-only mode)
+session = ort2.load("model.onnx", device="cpu")
+```
+
+Namespaced options for fine control:
+```python
+session = ort2.load("model.onnx", options={
+    "memory.gpu_budget_mb": "12000",       # 12GB GPU budget
+    "memory.offload_strategy": "layerwise", # vs "tensorwise"
+    "memory.prefetch_layers": "2",          # prefetch 2 layers ahead
+    "memory.kv_gpu_pages": "1024",          # max KV pages on GPU
+    "memory.activation_spill": "auto",      # auto/always/never
+})
+```
+
+### 30.8 Design Choices
+
+| Choice | Decision | Rationale |
+|--------|----------|----------|
+| Never OOM | **Yes** | Core guarantee. Runtime degrades gracefully. |
+| Weight placement at load time | **Yes (static)** | Avoids runtime jitter. Re-plan only on explicit resize. |
+| Activation spill | **Dynamic** | Can't predict at load time (depends on input shapes). |
+| KV cache eviction | **LRU per-page** | Matches paged attention. Old context evicted first. |
+| Overlap compute + transfer | **Always** | Separate streams, fence sync. Zero overhead when compute-bound. |
+| Disk tier (mmap) | **Tier 2 fallback** | For 405B on 32GB RAM laptops. Not primary path. |
+| Offload granularity | **Per-layer (weights), per-page (KV), per-tensor (activation)** | Each has different lifecycle. |
+
+---
+
+## 30. Phased Roadmap
 
 ### Phase 1: Foundation (8-12 weeks)
 - [ ] `onnx-runtime-ir`: Graph IR with all types, validation, mutation API
