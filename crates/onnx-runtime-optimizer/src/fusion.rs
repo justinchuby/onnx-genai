@@ -46,10 +46,13 @@
 //! so our IR stays interoperable with ORT-exported models and wider tooling.
 //!
 //! Kernel dispatch (`onnx-runtime-ep-cpu`) binds these by `(domain, op_type)`.
-//! `LayerNormalization` and `FusedMatMulBias` both have CPU kernels (registered
-//! under the contrib domain); `FusedGemm` (MatMul+Add+Relu) is a graph-only
-//! rewrite with no kernel yet — it is emitted but unexercised by the current
-//! validation target (BERT uses GELU/Erf, not Relu), so its kernel is deferred.
+//! `LayerNormalization`, `FusedMatMulBias` and `FusedGemm` all have CPU kernels
+//! (registered under the contrib domain). `FusedGemm` (MatMul+Add+Relu) is not
+//! exercised by the current model-level validation target (BERT uses GELU/Erf,
+//! not Relu), so it is instead validated by the synthetic end-to-end parity
+//! test in `crates/onnx-runtime-session/tests/fused_gemm_parity.rs`, which
+//! builds a MatMul→Add→Relu graph and checks the fused single-pass output
+//! against the unfused reference.
 //!
 //! ## Schema-aware rewrites
 //!
@@ -454,9 +457,11 @@ impl FusionPattern {
         match self.kind {
             RewriteKind::LayerNorm => self.layernorm_spec(graph, m).is_some(),
             RewriteKind::Structural => {
-                // Only the MatMul+Add → FusedMatMulBias rewrite needs a bias
-                // broadcast guard; other structural rewrites are unconstrained.
-                if self.replacement == "FusedMatMulBias" {
+                // The MatMul+Add → FusedMatMulBias and MatMul+Add+Relu →
+                // FusedGemm rewrites both need a bias broadcast guard (the
+                // trailing Relu is elementwise and shape-neutral); other
+                // structural rewrites are unconstrained.
+                if self.replacement == "FusedMatMulBias" || self.replacement == "FusedGemm" {
                     self.matmul_bias_broadcast_ok(graph, m)
                 } else {
                     true
@@ -465,10 +470,13 @@ impl FusionPattern {
         }
     }
 
-    /// Decline the `MatMul + Add → FusedMatMulBias` fusion unless the `Add`'s
-    /// non-matmul (bias) operand broadcasts *into* the MatMul output shape
-    /// **without expanding it** — i.e. the bias is a valid trailing broadcast of
-    /// the matmul output (`[N]`, `[1, N]`, same-shape, scalar, …).
+    /// Decline the `MatMul + Add → FusedMatMulBias` (and
+    /// `MatMul + Add + Relu → FusedGemm`) fusion unless the `Add`'s non-matmul
+    /// (bias) operand broadcasts *into* the MatMul output shape **without
+    /// expanding it** — i.e. the bias is a valid trailing broadcast of the
+    /// matmul output (`[N]`, `[1, N]`, same-shape, scalar, …). The optional
+    /// trailing `Relu` is elementwise and shape-neutral, so the same guard
+    /// applies to both fusions.
     ///
     /// A standalone `Add` broadcasts *both* operands up to their joint shape, so
     /// a bias with extra leading dims, or a batch axis where the output is
@@ -479,13 +487,14 @@ impl FusionPattern {
     /// non-expanding (identical dim, or bias extent 1). Any unknown/symbolic dim
     /// that can't be proven equal makes us decline conservatively.
     fn matmul_bias_broadcast_ok(&self, graph: &Graph, m: &PatternMatch) -> bool {
-        // The matched pattern is `[MatMul, Add]`; the MatMul output is the
-        // intermediate value the Add consumes, and the other Add operand is bias.
-        let [matmul, add] = m.nodes.as_slice() else {
+        // The matched pattern starts with `[MatMul, Add, ...]` (an optional
+        // trailing `Relu` for FusedGemm). The MatMul output is the intermediate
+        // value the Add consumes, and the other Add operand is bias.
+        let (Some(&matmul), Some(&add)) = (m.nodes.first(), m.nodes.get(1)) else {
             return false;
         };
-        let mm_out = graph.node(*matmul).outputs[0];
-        let Some(bias) = graph.node(*add).input_values().find(|&v| v != mm_out) else {
+        let mm_out = graph.node(matmul).outputs[0];
+        let Some(bias) = graph.node(add).input_values().find(|&v| v != mm_out) else {
             return false;
         };
         let mm_shape = &graph.value(mm_out).shape;

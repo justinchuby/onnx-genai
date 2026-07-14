@@ -5,6 +5,14 @@ use onnx_runtime_ir::Node;
 
 use super::{check_arity, to_dense_f32, write_dense_f32};
 
+/// Apply `max(0, x)` in place. Shared with the fused `FusedGemm` kernel so the
+/// ReLU activation has a single source of truth.
+pub(crate) fn relu_in_place(data: &mut [f32]) {
+    for v in data.iter_mut() {
+        *v = v.max(0.0);
+    }
+}
+
 /// Stateless f32 ReLU kernel.
 pub struct ReluKernel;
 
@@ -21,7 +29,8 @@ impl Kernel for ReluKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         check_arity("Relu", inputs, outputs, 1, 1, 1)?;
         let x = to_dense_f32(&inputs[0])?;
-        let y: Vec<f32> = x.iter().map(|&v| v.max(0.0)).collect();
+        let mut y = x;
+        relu_in_place(&mut y);
         write_dense_f32(&mut outputs[0], &y)
     }
 

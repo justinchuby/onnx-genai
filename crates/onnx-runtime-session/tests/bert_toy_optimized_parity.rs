@@ -169,8 +169,9 @@ fn basic_optimization_matches_reference_and_default() {
 /// not against opt-off byte-identity.
 ///
 /// (Note: `bert_toy`'s feed-forward blocks use GELU/`Erf`, not `Relu`, so the
-/// `MatMul + Add + Relu → FusedGemm` pattern never fires here; that kernel is a
-/// documented follow-up, not exercised by this model.)
+/// `MatMul + Add + Relu → FusedGemm` pattern never fires here. That kernel now
+/// exists and is validated by the synthetic end-to-end parity test in
+/// `fused_gemm_parity.rs`, since no model in this suite contains the Relu form.)
 #[test]
 fn full_optimization_fusion_path_matches_reference_and_default() {
     // Same tolerance rationale as bert_toy_conformance.rs (numpy.allclose).

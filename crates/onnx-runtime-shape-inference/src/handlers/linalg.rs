@@ -160,6 +160,21 @@ pub fn fused_matmul_bias(ctx: &mut InferenceContext) -> Result<(), ShapeInferErr
     Ok(())
 }
 
+/// `com.microsoft::FusedGemm`: the optimizer's `Relu(MatMul(A, B) + bias)`
+/// fusion. The bias is numpy-broadcast onto the matmul result and `Relu` is
+/// elementwise, so the output shape is exactly `MatMul(A, B)`'s shape — the
+/// plain-MatMul rule applies.
+pub fn fused_gemm(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
+    let a = ctx.input_shape(0).map(<[DimExpr]>::to_vec);
+    let b = ctx.input_shape(1).map(<[DimExpr]>::to_vec);
+    let dtype = ctx.input_dtype(0);
+    if let (Some(a), Some(b), Some(dtype)) = (a, b, dtype) {
+        let shape = matmul_shape(ctx, &a, &b, "FusedGemm")?;
+        ctx.set_output(0, dtype, shape);
+    }
+    Ok(())
+}
+
 /// `Gemm(A, B, C?)`: `Y = alpha * A' * B' + beta * C`, output `[M, N]`.
 pub fn gemm(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
     let a = ctx.input_shape(0).map(<[DimExpr]>::to_vec);
@@ -202,4 +217,7 @@ pub fn register(reg: &mut InferenceRegistry) {
     reg.register("com.microsoft", "FusedMatMul", 1, fused_matmul);
     // The optimizer's MatMul+Add(bias) fusion: output shape == MatMul's.
     reg.register("com.microsoft", "FusedMatMulBias", 1, fused_matmul_bias);
+    // The optimizer's MatMul+Add(bias)+Relu fusion: output shape == MatMul's
+    // (bias broadcasts, Relu is elementwise).
+    reg.register("com.microsoft", "FusedGemm", 1, fused_gemm);
 }

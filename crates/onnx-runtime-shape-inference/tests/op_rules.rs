@@ -253,7 +253,39 @@ fn fused_matmul_trans_batch_a_moves_leading_axis() {
     assert_eq!(out_shape(&outs), vec![c(2), c(4), c(16)]);
 }
 
+#[test]
+fn fused_gemm_output_equals_matmul_shape() {
+    // com.microsoft::FusedGemm = Relu(MatMul(A, B) + bias); output shape is the
+    // plain MatMul shape (bias broadcasts, Relu is elementwise).
+    let n = with_domain(node("FusedGemm", 3, 1), "com.microsoft");
+    let outs = run(
+        &n,
+        vec![
+            f32in(vec![c(2), c(3)]),
+            f32in(vec![c(3), c(4)]),
+            f32in(vec![c(4)]),
+        ],
+        1,
+    );
+    assert_eq!(out_shape(&outs), vec![c(2), c(4)]);
+    assert_eq!(out_dtype(&outs), DataType::Float32);
+}
 
+#[test]
+fn fused_gemm_batched_symbolic_shape() {
+    // Batched, symbolic leading dim carries through unchanged.
+    let n = with_domain(node("FusedGemm", 3, 1), "com.microsoft");
+    let outs = run(
+        &n,
+        vec![
+            f32in(vec![sym(1), c(8), c(64)]),
+            f32in(vec![c(64), c(32)]),
+            f32in(vec![c(32)]),
+        ],
+        1,
+    );
+    assert_eq!(out_shape(&outs), vec![sym(1), c(8), c(32)]);
+}
 
 #[test]
 fn add_broadcast_concrete() {
