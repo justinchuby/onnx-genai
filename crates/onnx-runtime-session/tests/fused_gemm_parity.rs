@@ -74,6 +74,7 @@ fn op(
 /// the `Relu` actually clamps (proving the fused activation runs).
 fn build_model_bytes() -> Vec<u8> {
     let mut g = Graph::new();
+    g.opset_imports.insert(String::new(), 17);
 
     // X @ W = [[1,2,3],[4,5,6]] @ [[1,-1],[1,-1],[1,-1]] = [[6,-6],[15,-15]].
     // + bias [0.5, 1.0] -> [[6.5, -5.0], [15.5, -14.0]].

@@ -194,6 +194,8 @@ fn add_epctx_node(
 /// A fresh graph with a single `X` input `[2,4]`.
 fn graph_with_input() -> (Graph, ValueId) {
     let mut g = Graph::new();
+    g.opset_imports
+        .insert("com.microsoft".to_string(), 1);
     let x = g.create_named_value("X", DataType::Float32, static_shape([2usize, 4]));
     g.add_input(x);
     (g, x)

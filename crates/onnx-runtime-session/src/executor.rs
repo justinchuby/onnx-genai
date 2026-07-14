@@ -259,10 +259,8 @@ fn checked_storage_bytes(
 
 /// The effective operator-set version governing `node` — the graph's imported
 /// opset for the node's domain. The default ONNX domain is spelled both `""`
-/// and `"ai.onnx"`; both map to the same import. When a graph omits the import
-/// (should not happen for a loaded model), fall back to `u64::MAX` so ops with a
-/// single registration still resolve and opset-specialized ops pick their
-/// newest kernel.
+/// and `"ai.onnx"`; both map to the same import. Loader and programmatic session
+/// entry points validate this invariant before executor construction.
 fn effective_opset(graph: &Graph, node: &Node) -> u64 {
     let domain = node.domain.as_str();
     graph
@@ -278,7 +276,18 @@ fn effective_opset(graph: &Graph, node: &Node) -> u64 {
             }
         })
         .copied()
-        .unwrap_or(u64::MAX)
+        .unwrap_or_else(|| {
+            unreachable!(
+                "internal invariant violated: node #{} ({}::{}) has no opset import",
+                node.id.0,
+                if node.domain.is_empty() {
+                    "ai.onnx"
+                } else {
+                    &node.domain
+                },
+                node.op_type
+            )
+        })
 }
 
 /// Substitute concrete symbol bindings into a (possibly symbolic) shape.
@@ -1038,8 +1047,14 @@ mod tests {
         graph.opset_imports.insert(String::new(), 0);
         assert_eq!(effective_opset(&graph, &node), 0);
 
-        // Missing import falls back to u64::MAX (assume latest).
-        let empty = Graph::default();
-        assert_eq!(effective_opset(&empty, &node), u64::MAX);
+    }
+
+    #[test]
+    #[should_panic(expected = "internal invariant violated")]
+    fn effective_opset_requires_validated_import() {
+        effective_opset(
+            &Graph::default(),
+            &Node::new(NodeId(0), "Softmax", vec![], vec![]),
+        );
     }
 }

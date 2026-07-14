@@ -501,6 +501,7 @@ fn uint8_opaque_initializer_round_trips_byte_exact() {
 
     let payload = opaque_blob();
     let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
     let blob = graph.create_named_value("blob", DataType::Uint8, vec![payload.len().into()]);
     graph.set_initializer(
         blob,
@@ -543,6 +544,7 @@ fn initializer_only_graph_round_trips() {
 
     let raw: Vec<u8> = [1.0f32, 2.0, 3.0, 4.0].iter().flat_map(|v| v.to_le_bytes()).collect();
     let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
     let w = graph.create_named_value("W", DataType::Float32, vec![2usize.into(), 2usize.into()]);
     graph.set_initializer(
         w,

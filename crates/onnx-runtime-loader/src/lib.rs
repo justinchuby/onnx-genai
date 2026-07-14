@@ -84,6 +84,19 @@ mod error {
         #[error("unsupported opset: domain={domain}, version={version}")]
         UnsupportedOpset { domain: String, version: u64 },
 
+        #[error(
+            "illegal ONNX model: operator {domain}::{op_type} at node {node} uses domain \
+             '{domain}' but no corresponding opset_import is declared. RULES #1: the model must \
+             declare an opset_import for domain '{domain}'; if you built this graph \
+             programmatically, add it before loading; if this is a file, the model is \
+             malformed/invalid per the ONNX spec"
+        )]
+        MissingOpsetImport {
+            op_type: String,
+            node: String,
+            domain: String,
+        },
+
         #[error("external data file not found: {path}")]
         ExternalDataNotFound { path: PathBuf },
 
@@ -191,6 +204,8 @@ fn build_from_bytes_with_weights(
         name_map,
     } = graph_builder::build_graph(&model)?;
 
+    validate_opset_imports(&graph)?;
+
     let store = weights::load_weights(&model, model_dir, &name_map)?;
     // Copy descriptors into the graph; the store's mmaps stay alive via Arc.
     for (&vid, weight) in &store.weights {
@@ -210,4 +225,47 @@ fn build_from_bytes_with_weights(
     registry.infer_graph(&mut graph, &opset_imports, MergePolicy::Permissive)?;
 
     Ok((graph, Arc::new(store)))
+}
+
+/// Reject graphs whose nodes use an operator domain without importing its opset.
+///
+/// ONNX treats `""` and `"ai.onnx"` as equivalent spellings of the default
+/// domain. Model-level imports also govern nodes nested in subgraphs.
+pub fn validate_opset_imports(graph: &Graph) -> Result<(), LoaderError> {
+    fn has_import(imports: &std::collections::HashMap<String, u64>, domain: &str) -> bool {
+        imports.contains_key(domain)
+            || (domain.is_empty() && imports.contains_key("ai.onnx"))
+            || (domain == "ai.onnx" && imports.contains_key(""))
+    }
+
+    fn validate_graph(
+        graph: &Graph,
+        imports: &std::collections::HashMap<String, u64>,
+    ) -> Result<(), LoaderError> {
+        for (_, node) in graph.nodes.iter() {
+            if !has_import(imports, &node.domain) {
+                let domain = if node.domain.is_empty() {
+                    "ai.onnx".to_string()
+                } else {
+                    node.domain.clone()
+                };
+                let node_name = if node.name.is_empty() {
+                    format!("<unnamed node #{}>", node.id.0)
+                } else {
+                    format!("{:?}", node.name)
+                };
+                return Err(LoaderError::MissingOpsetImport {
+                    op_type: node.op_type.clone(),
+                    node: node_name,
+                    domain,
+                });
+            }
+        }
+        for subgraph in graph.subgraphs.values() {
+            validate_graph(subgraph, imports)?;
+        }
+        Ok(())
+    }
+
+    validate_graph(graph, &graph.opset_imports)
 }

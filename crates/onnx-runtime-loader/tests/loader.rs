@@ -7,7 +7,7 @@
 use prost::Message;
 
 use onnx_runtime_ir::{DataType, Dim, Graph, WeightRef};
-use onnx_runtime_loader::proto::onnx;
+use onnx_runtime_loader::{proto::onnx, LoaderError};
 
 // --- proto construction helpers ---
 
@@ -137,6 +137,72 @@ fn find(graph: &Graph, name: &str) -> onnx_runtime_ir::ValueId {
 }
 
 // --- tests ---
+
+#[test]
+fn missing_opset_import_is_rejected_before_inference() {
+    let mut sigmoid = node("Sigmoid", &["X"], &["Y"]);
+    sigmoid.name = "missing_default_import".to_string();
+    let graph = onnx::GraphProto {
+        input: vec![value_info("X", 1, &[Dimlike::Static(1)])],
+        output: vec![value_info("Y", 1, &[Dimlike::Static(1)])],
+        node: vec![sigmoid],
+        ..Default::default()
+    };
+    let bytes = onnx::ModelProto {
+        ir_version: 8,
+        graph: Some(graph),
+        ..Default::default()
+    }
+    .encode_to_vec();
+
+    let error = onnx_runtime_loader::load_model_bytes(&bytes).unwrap_err();
+    assert!(matches!(
+        &error,
+        LoaderError::MissingOpsetImport {
+            op_type,
+            node,
+            domain,
+        } if op_type == "Sigmoid"
+            && node == "\"missing_default_import\""
+            && domain == "ai.onnx"
+    ));
+    let message = error.to_string();
+    assert!(message.contains("Sigmoid"), "{message}");
+    assert!(message.contains("ai.onnx"), "{message}");
+    assert!(
+        message.contains("if you built this graph programmatically, add it before loading"),
+        "{message}"
+    );
+    assert!(!message.contains("18446744073709551615"), "{message}");
+}
+
+#[test]
+fn default_domain_spellings_share_one_opset_import() {
+    for (node_domain, import_domain) in [("", "ai.onnx"), ("ai.onnx", "")] {
+        let mut identity = node("Identity", &["X"], &["Y"]);
+        identity.domain = node_domain.to_string();
+        let graph = onnx::GraphProto {
+            input: vec![value_info("X", 1, &[Dimlike::Static(1)])],
+            output: vec![value_info("Y", 1, &[Dimlike::Static(1)])],
+            node: vec![identity],
+            ..Default::default()
+        };
+        let bytes = onnx::ModelProto {
+            ir_version: 8,
+            opset_import: vec![onnx::OperatorSetIdProto {
+                domain: import_domain.to_string(),
+                version: 17,
+            }],
+            graph: Some(graph),
+            ..Default::default()
+        }
+        .encode_to_vec();
+
+        onnx_runtime_loader::load_model_bytes(&bytes).unwrap_or_else(|error| {
+            panic!("node domain {node_domain:?}, import {import_domain:?}: {error}")
+        });
+    }
+}
 
 #[test]
 fn matmul_add_layernorm_chain() {

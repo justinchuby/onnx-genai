@@ -47,6 +47,7 @@ fn op(
     out_dims: &[usize],
     attrs: &[(&str, Attribute)],
 ) -> ValueId {
+    g.opset_imports.entry(String::new()).or_insert(17);
     let out = g.create_value(out_dtype, static_shape(out_dims.iter().copied()));
     let mut node = Node::new(
         NodeId(0),
@@ -78,6 +79,7 @@ fn op_shaped(
     out_shape: Shape,
     attrs: &[(&str, Attribute)],
 ) -> ValueId {
+    g.opset_imports.entry(String::new()).or_insert(17);
     let out = g.create_value(out_dtype, out_shape);
     let mut node = Node::new(
         NodeId(0),
@@ -141,7 +143,7 @@ fn unsupported_op_error_formats_unnamed_node_gracefully() {
 }
 
 #[test]
-fn unsupported_op_error_reports_undeclared_opset_without_sentinel() {
+fn from_graph_rejects_missing_opset_import_at_load_time() {
     let mut graph = Graph::new();
     let x = input(&mut graph, "x", DataType::Float32, &[1]);
     let y = graph.create_named_value("y", DataType::Float32, static_shape([1]));
@@ -152,21 +154,18 @@ fn unsupported_op_error_reports_undeclared_opset_without_sentinel() {
 
     let message = match InferenceSession::from_graph(graph) {
         Err(err) => err.to_string(),
-        Ok(_) => panic!("unsupported operator unexpectedly built"),
+        Ok(_) => panic!("illegal graph unexpectedly built"),
     };
     assert_eq!(
         message,
-        "unsupported operator ai.onnx::Sigmoid: no available execution provider has a kernel; \
-         node \"missing_opset_import\", opset <undeclared>; consulted execution providers \
-         (priority order): cpu_ep. To fix: declare an opset_import for domain \"ai.onnx\" in the \
-         model, enable another EP that supports this operator and opset, convert or decompose the \
-         model operator, or file an nxrt issue with the model details"
+        "illegal ONNX model: operator ai.onnx::Sigmoid at node \"missing_opset_import\" uses \
+         domain 'ai.onnx' but no corresponding opset_import is declared. RULES #1: the model must \
+         declare an opset_import for domain 'ai.onnx'; if you built this graph programmatically, \
+         add it before loading; if this is a file, the model is malformed/invalid per the ONNX spec"
     );
-    assert!(message.contains("opset <undeclared>"), "{message}");
-    assert!(
-        message.contains("declare an opset_import for domain \"ai.onnx\" in the model"),
-        "{message}"
-    );
+    assert!(message.contains("Sigmoid"), "{message}");
+    assert!(message.contains("ai.onnx"), "{message}");
+    assert!(message.contains("RULES #1"), "{message}");
     assert!(!message.contains("18446744073709551615"), "{message}");
 }
 

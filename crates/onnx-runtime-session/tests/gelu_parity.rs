@@ -68,6 +68,7 @@ fn op(g: &mut Graph, op_type: &str, name: &str, inputs: &[ValueId], out_dims: &[
 /// `Constant` nodes into inline weights).
 fn build_model_bytes() -> Vec<u8> {
     let mut g = Graph::new();
+    g.opset_imports.insert(String::new(), 17);
 
     let x = g.create_named_value("X", DataType::Float32, static_shape([2, 3]));
     g.add_input(x);
