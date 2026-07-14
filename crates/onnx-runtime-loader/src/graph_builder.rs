@@ -4,13 +4,421 @@
 //! stable value ids, unique node outputs (SSA), source values for inputs and
 //! initializers, and interning symbolic dims that share a protobuf name.
 
-use onnx_runtime_ir::Graph;
+use std::collections::HashMap;
 
-use crate::proto::ModelProto;
+use onnx_runtime_ir::{
+    Attribute, DataType, Dim, Graph, Node, NodeId, Shape, TensorData, TypeProto, ValueId,
+};
+
+use crate::proto::onnx::{
+    self, attribute_proto, tensor_shape_proto, type_proto, AttributeProto, GraphProto, ModelProto,
+    TensorShapeProto,
+};
+use crate::weights::tensor_data_from_proto;
 use crate::LoaderError;
 
-/// Build the IR graph (without weights or shape inference yet).
-pub fn build_graph(model: &ModelProto) -> Result<Graph, LoaderError> {
-    let _ = model;
-    todo!("ort2-loader: build IR Graph from GraphProto (nodes, values, symbols, opsets)")
+/// The result of building a graph: the IR graph plus the mapping from ONNX
+/// tensor names to the value ids they were assigned (needed by the weight
+/// loader).
+pub struct BuiltGraph {
+    pub graph: Graph,
+    pub name_map: HashMap<String, ValueId>,
+}
+
+/// Build the IR graph (nodes, values, symbols, opsets) from a `ModelProto`.
+///
+/// Weights and shape inference are applied by later pipeline stages.
+pub fn build_graph(model: &ModelProto) -> Result<BuiltGraph, LoaderError> {
+    let mut graph = Graph::new();
+
+    // Opset imports: domain -> version.
+    for opset in &model.opset_import {
+        if opset.version > 0 {
+            graph
+                .opset_imports
+                .insert(opset.domain.clone(), opset.version as u64);
+        }
+    }
+
+    let graph_proto = model
+        .graph
+        .as_ref()
+        .ok_or_else(|| LoaderError::GraphBuild("ModelProto has no graph".into()))?;
+
+    let name_map = build_graph_proto(&mut graph, graph_proto, true)?;
+
+    graph
+        .validate()
+        .map_err(|errs| LoaderError::GraphBuild(format!("{errs:?}")))?;
+
+    Ok(BuiltGraph { graph, name_map })
+}
+
+/// Populate `graph` from a `GraphProto`. When `is_top_level` is true, inputs
+/// and outputs are registered as graph I/O. Returns the name→value map for the
+/// values created in this graph scope.
+fn build_graph_proto(
+    graph: &mut Graph,
+    gp: &GraphProto,
+    is_top_level: bool,
+) -> Result<HashMap<String, ValueId>, LoaderError> {
+    let mut names: HashMap<String, ValueId> = HashMap::new();
+
+    // 1. Initializers: fully-typed source values (producer = None).
+    for init in &gp.initializer {
+        if init.name.is_empty() {
+            continue;
+        }
+        let dtype = DataType::from_onnx(init.data_type).unwrap_or(DataType::Float32);
+        let dims: Vec<usize> = init.dims.iter().map(|&d| d.max(0) as usize).collect();
+        let shape: Shape = dims.into_iter().map(Dim::Static).collect();
+        let vid = graph.create_named_value(init.name.clone(), dtype, shape);
+        names.insert(init.name.clone(), vid);
+    }
+
+    // 2. Graph inputs. Names that are also initializers are constants, not
+    //    real graph inputs (invariant §3.5.3).
+    for vi in &gp.input {
+        if vi.name.is_empty() {
+            continue;
+        }
+        if names.contains_key(&vi.name) {
+            continue; // initializer-backed constant input
+        }
+        let (dtype, shape) = value_info_type(graph, vi);
+        let vid = graph.create_named_value(vi.name.clone(), dtype, shape);
+        names.insert(vi.name.clone(), vid);
+        if is_top_level {
+            graph.add_input(vid);
+        }
+    }
+
+    // 3. Declared value_info type hints for interior values.
+    for vi in &gp.value_info {
+        if vi.name.is_empty() || names.contains_key(&vi.name) {
+            continue;
+        }
+        let (dtype, shape) = value_info_type(graph, vi);
+        let vid = graph.create_named_value(vi.name.clone(), dtype, shape);
+        names.insert(vi.name.clone(), vid);
+    }
+
+    // 4. Graph outputs: typed values that a node will later produce by name.
+    for vi in &gp.output {
+        if vi.name.is_empty() {
+            continue;
+        }
+        if !names.contains_key(&vi.name) {
+            let (dtype, shape) = value_info_type(graph, vi);
+            let vid = graph.create_named_value(vi.name.clone(), dtype, shape);
+            names.insert(vi.name.clone(), vid);
+        }
+    }
+
+    // 5. Nodes: wire inputs/outputs, converting attributes.
+    for np in &gp.node {
+        let inputs: Vec<Option<ValueId>> = np
+            .input
+            .iter()
+            .map(|name| {
+                if name.is_empty() {
+                    None
+                } else {
+                    Some(get_or_create(graph, &mut names, name))
+                }
+            })
+            .collect();
+
+        let outputs: Vec<ValueId> = np
+            .output
+            .iter()
+            .map(|name| {
+                if name.is_empty() {
+                    // An omitted (unused) optional output: give it an anonymous
+                    // value to preserve positional arity.
+                    graph.create_value(DataType::Float32, Vec::new())
+                } else {
+                    get_or_create(graph, &mut names, name)
+                }
+            })
+            .collect();
+
+        let mut node = Node::new(NodeId(0), np.op_type.clone(), inputs, outputs);
+        node.domain = np.domain.clone();
+        if !np.doc_string.is_empty() {
+            node.doc_string = Some(np.doc_string.clone());
+        }
+        for ap in &np.attribute {
+            if let Some((key, attr)) = convert_attribute(graph, ap)? {
+                node.attributes.insert(key, attr);
+            }
+        }
+
+        let nid = graph.insert_node(node);
+        register_subgraphs(graph, nid);
+    }
+
+    // 6. Register graph outputs in order.
+    if is_top_level {
+        for vi in &gp.output {
+            if let Some(&vid) = names.get(&vi.name) {
+                graph.add_output(vid);
+            }
+        }
+    }
+
+    Ok(names)
+}
+
+/// After a node is inserted, move any `Graph`/`Graphs` attribute bodies into the
+/// graph's `subgraphs` index so traversal/validation can reach them (§3.3).
+fn register_subgraphs(graph: &mut Graph, nid: NodeId) {
+    let attrs: Vec<(String, usize)> = graph
+        .node(nid)
+        .attributes
+        .iter()
+        .filter_map(|(k, v)| match v {
+            Attribute::Graph(_) => Some((k.clone(), 1)),
+            Attribute::Graphs(gs) => Some((k.clone(), gs.len())),
+            _ => None,
+        })
+        .collect();
+    for (key, count) in attrs {
+        match graph.node(nid).attributes.get(&key) {
+            Some(Attribute::Graph(g)) => {
+                let sub = (**g).clone();
+                graph.subgraphs.insert((nid, key), sub);
+            }
+            Some(Attribute::Graphs(_)) => {
+                for i in 0..count {
+                    if let Some(Attribute::Graphs(gs)) = graph.node(nid).attributes.get(&key) {
+                        let sub = gs[i].clone();
+                        graph.subgraphs.insert((nid, format!("{key}[{i}]")), sub);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Fetch the value id for `name`, creating a placeholder value if it does not
+/// exist yet (interior SSA value with as-yet-unknown type).
+fn get_or_create(
+    graph: &mut Graph,
+    names: &mut HashMap<String, ValueId>,
+    name: &str,
+) -> ValueId {
+    if let Some(&vid) = names.get(name) {
+        return vid;
+    }
+    let vid = graph.create_named_value(name.to_string(), DataType::Float32, Vec::new());
+    names.insert(name.to_string(), vid);
+    vid
+}
+
+/// Extract `(dtype, shape)` from a `ValueInfoProto`'s tensor type, interning
+/// symbolic dims into `graph` by name.
+fn value_info_type(graph: &mut Graph, vi: &onnx::ValueInfoProto) -> (DataType, Shape) {
+    match vi.r#type.as_ref() {
+        Some(tp) => type_proto_to_dtype_shape(graph, tp),
+        None => (DataType::Float32, Vec::new()),
+    }
+}
+
+fn type_proto_to_dtype_shape(graph: &mut Graph, tp: &onnx::TypeProto) -> (DataType, Shape) {
+    match tp.value.as_ref() {
+        Some(type_proto::Value::TensorType(t)) => {
+            let dtype = DataType::from_onnx(t.elem_type).unwrap_or(DataType::Float32);
+            let shape = t
+                .shape
+                .as_ref()
+                .map(|s| tensor_shape_to_shape(graph, s))
+                .unwrap_or_default();
+            (dtype, shape)
+        }
+        Some(type_proto::Value::SparseTensorType(t)) => {
+            let dtype = DataType::from_onnx(t.elem_type).unwrap_or(DataType::Float32);
+            let shape = t
+                .shape
+                .as_ref()
+                .map(|s| tensor_shape_to_shape(graph, s))
+                .unwrap_or_default();
+            (dtype, shape)
+        }
+        // Non-tensor containers (sequence/map/optional): the IR value model is
+        // tensor-centric; record a placeholder type. These do not occur in the
+        // Phase-1 (BERT) op set.
+        _ => (DataType::Float32, Vec::new()),
+    }
+}
+
+/// Convert an ONNX `TensorShapeProto` to an IR [`Shape`], interning dim-params
+/// by name (invariant §3.5.4) and allocating fresh anonymous symbols for
+/// unknown dims.
+fn tensor_shape_to_shape(graph: &mut Graph, tsp: &TensorShapeProto) -> Shape {
+    tsp.dim
+        .iter()
+        .map(|d| match d.value.as_ref() {
+            Some(tensor_shape_proto::dimension::Value::DimValue(v)) if *v >= 0 => {
+                Dim::Static(*v as usize)
+            }
+            Some(tensor_shape_proto::dimension::Value::DimParam(name)) if !name.is_empty() => {
+                Dim::Symbolic(graph.intern_symbol(name))
+            }
+            // Unknown dim (no value, negative, or empty param): fresh symbol.
+            _ => Dim::Symbolic(graph.create_symbol(None)),
+        })
+        .collect()
+}
+
+/// Convert an `AttributeProto` to an IR `(name, Attribute)`. Returns `None` for
+/// attribute kinds the IR does not model (tensor/type-proto lists), which do
+/// not appear in the Phase-1 op set.
+fn convert_attribute(
+    graph: &mut Graph,
+    ap: &AttributeProto,
+) -> Result<Option<(String, Attribute)>, LoaderError> {
+    use attribute_proto::AttributeType as AT;
+
+    // Determine the attribute kind, falling back to field-presence heuristics
+    // for IR<0.0.2 protos where `type` may be unset.
+    let ty = AT::try_from(ap.r#type).unwrap_or(AT::Undefined);
+
+    let attr = match ty {
+        AT::Float => Attribute::Float(ap.f),
+        AT::Int => Attribute::Int(ap.i),
+        AT::String => Attribute::String(String::from_utf8_lossy(&ap.s).into_owned()),
+        AT::Floats => Attribute::Floats(ap.floats.clone()),
+        AT::Ints => Attribute::Ints(ap.ints.clone()),
+        AT::Strings => Attribute::Strings(
+            ap.strings
+                .iter()
+                .map(|b| String::from_utf8_lossy(b).into_owned())
+                .collect(),
+        ),
+        AT::Tensor => match ap.t.as_ref() {
+            Some(t) => Attribute::Tensor(convert_tensor(t)?),
+            None => return Ok(None),
+        },
+        AT::Graph => match ap.g.as_ref() {
+            Some(g) => {
+                let mut sub = Graph::new();
+                build_graph_proto(&mut sub, g, false)?;
+                Attribute::Graph(Box::new(sub))
+            }
+            None => return Ok(None),
+        },
+        AT::Graphs => {
+            let mut subs = Vec::new();
+            for g in &ap.graphs {
+                let mut sub = Graph::new();
+                build_graph_proto(&mut sub, g, false)?;
+                subs.push(sub);
+            }
+            Attribute::Graphs(subs)
+        }
+        AT::TypeProto => match ap.tp.as_ref() {
+            Some(tp) => Attribute::TypeProto(convert_type_proto(graph, tp)),
+            None => return Ok(None),
+        },
+        // Field-presence fallback when `type` is UNDEFINED.
+        AT::Undefined => {
+            if let Some(t) = ap.t.as_ref() {
+                Attribute::Tensor(convert_tensor(t)?)
+            } else if !ap.floats.is_empty() {
+                Attribute::Floats(ap.floats.clone())
+            } else if !ap.ints.is_empty() {
+                Attribute::Ints(ap.ints.clone())
+            } else if !ap.strings.is_empty() {
+                Attribute::Strings(
+                    ap.strings
+                        .iter()
+                        .map(|b| String::from_utf8_lossy(b).into_owned())
+                        .collect(),
+                )
+            } else if !ap.s.is_empty() {
+                Attribute::String(String::from_utf8_lossy(&ap.s).into_owned())
+            } else if ap.i != 0 {
+                Attribute::Int(ap.i)
+            } else if ap.f != 0.0 {
+                Attribute::Float(ap.f)
+            } else {
+                return Ok(None);
+            }
+        }
+        // Tensor / sparse-tensor / type-proto lists: no IR variant.
+        _ => return Ok(None),
+    };
+    Ok(Some((ap.name.clone(), attr)))
+}
+
+fn convert_tensor(t: &onnx::TensorProto) -> Result<TensorData, LoaderError> {
+    let dtype = DataType::from_onnx(t.data_type).unwrap_or(DataType::Float32);
+    let dims: Vec<usize> = t.dims.iter().map(|&d| d.max(0) as usize).collect();
+    tensor_data_from_proto(t, dtype, &dims)
+}
+
+fn convert_type_proto(graph: &mut Graph, tp: &onnx::TypeProto) -> TypeProto {
+    match tp.value.as_ref() {
+        Some(type_proto::Value::TensorType(t)) => {
+            let dtype = DataType::from_onnx(t.elem_type).unwrap_or(DataType::Float32);
+            let shape = t
+                .shape
+                .as_ref()
+                .map(|s| tensor_shape_to_shape(graph, s))
+                .unwrap_or_default();
+            TypeProto::Tensor { dtype, shape }
+        }
+        Some(type_proto::Value::SparseTensorType(t)) => {
+            let dtype = DataType::from_onnx(t.elem_type).unwrap_or(DataType::Float32);
+            let shape = t
+                .shape
+                .as_ref()
+                .map(|s| tensor_shape_to_shape(graph, s))
+                .unwrap_or_default();
+            TypeProto::SparseTensor { dtype, shape }
+        }
+        Some(type_proto::Value::SequenceType(s)) => {
+            let inner = s
+                .elem_type
+                .as_ref()
+                .map(|e| convert_type_proto(graph, e))
+                .unwrap_or(TypeProto::Tensor {
+                    dtype: DataType::Float32,
+                    shape: Vec::new(),
+                });
+            TypeProto::Sequence(Box::new(inner))
+        }
+        Some(type_proto::Value::OptionalType(o)) => {
+            let inner = o
+                .elem_type
+                .as_ref()
+                .map(|e| convert_type_proto(graph, e))
+                .unwrap_or(TypeProto::Tensor {
+                    dtype: DataType::Float32,
+                    shape: Vec::new(),
+                });
+            TypeProto::Optional(Box::new(inner))
+        }
+        Some(type_proto::Value::MapType(m)) => {
+            let key = DataType::from_onnx(m.key_type).unwrap_or(DataType::Int64);
+            let value = m
+                .value_type
+                .as_ref()
+                .map(|e| convert_type_proto(graph, e))
+                .unwrap_or(TypeProto::Tensor {
+                    dtype: DataType::Float32,
+                    shape: Vec::new(),
+                });
+            TypeProto::Map {
+                key,
+                value: Box::new(value),
+            }
+        }
+        None => TypeProto::Tensor {
+            dtype: DataType::Float32,
+            shape: Vec::new(),
+        },
+    }
 }
