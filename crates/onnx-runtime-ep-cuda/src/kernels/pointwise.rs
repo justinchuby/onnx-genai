@@ -77,10 +77,10 @@ fn require_contiguous(op: &str, name: &str, contiguous: bool) -> Result<()> {
     Ok(())
 }
 
-/// `n` as `i32` (the kernels take an `int` count), or an actionable overflow.
-fn count_i32(op: &str, n: usize) -> Result<i32> {
-    i32::try_from(n)
-        .map_err(|_| EpError::KernelFailed(format!("cuda_ep {op}: {n} elements exceed i32")))
+/// `n` as `u64`, matching the kernels' `unsigned long long` count parameter.
+fn count_u64(op: &str, n: usize) -> Result<u64> {
+    u64::try_from(n)
+        .map_err(|_| EpError::KernelFailed(format!("cuda_ep {op}: {n} elements exceed u64")))
 }
 
 // ===========================================================================
@@ -92,67 +92,67 @@ fn count_i32(op: &str, n: usize) -> Result<i32> {
 /// `log1pf`, …) with no header include. Each formula is annotated with the exact
 /// CPU-EP expression it mirrors (`unary_math.rs`).
 const UNARY_MATH_SRC: &str = r#"
-extern "C" __global__ void abs_f32(const float* x, float* y, const int n) {
+extern "C" __global__ void abs_f32(const float* x, float* y, const unsigned long long n) {
     // CPU: x.abs()
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x)
+    for (unsigned long long i = blockIdx.x*blockDim.x + threadIdx.x; i < n; i += (unsigned long long)gridDim.x * blockDim.x)
         y[i] = fabsf(x[i]);
 }
-extern "C" __global__ void neg_f32(const float* x, float* y, const int n) {
+extern "C" __global__ void neg_f32(const float* x, float* y, const unsigned long long n) {
     // CPU: -x
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x)
+    for (unsigned long long i = blockIdx.x*blockDim.x + threadIdx.x; i < n; i += (unsigned long long)gridDim.x * blockDim.x)
         y[i] = -x[i];
 }
-extern "C" __global__ void reciprocal_f32(const float* x, float* y, const int n) {
+extern "C" __global__ void reciprocal_f32(const float* x, float* y, const unsigned long long n) {
     // CPU: 1.0 / x
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x)
+    for (unsigned long long i = blockIdx.x*blockDim.x + threadIdx.x; i < n; i += (unsigned long long)gridDim.x * blockDim.x)
         y[i] = 1.0f / x[i];
 }
-extern "C" __global__ void exp_f32(const float* x, float* y, const int n) {
+extern "C" __global__ void exp_f32(const float* x, float* y, const unsigned long long n) {
     // CPU: x.exp()
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x)
+    for (unsigned long long i = blockIdx.x*blockDim.x + threadIdx.x; i < n; i += (unsigned long long)gridDim.x * blockDim.x)
         y[i] = expf(x[i]);
 }
-extern "C" __global__ void log_f32(const float* x, float* y, const int n) {
+extern "C" __global__ void log_f32(const float* x, float* y, const unsigned long long n) {
     // CPU: x.ln()  (natural log)
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x)
+    for (unsigned long long i = blockIdx.x*blockDim.x + threadIdx.x; i < n; i += (unsigned long long)gridDim.x * blockDim.x)
         y[i] = logf(x[i]);
 }
-extern "C" __global__ void sign_f32(const float* x, float* y, const int n) {
+extern "C" __global__ void sign_f32(const float* x, float* y, const unsigned long long n) {
     // CPU sign(): NaN -> NaN, >0 -> 1, <0 -> -1, else 0 (so sign(0)=0, sign(-0)=0).
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
+    for (unsigned long long i = blockIdx.x*blockDim.x + threadIdx.x; i < n; i += (unsigned long long)gridDim.x * blockDim.x) {
         float v = x[i];
         y[i] = (v != v) ? v : ((v > 0.0f) ? 1.0f : ((v < 0.0f) ? -1.0f : 0.0f));
     }
 }
-extern "C" __global__ void floor_f32(const float* x, float* y, const int n) {
+extern "C" __global__ void floor_f32(const float* x, float* y, const unsigned long long n) {
     // CPU: x.floor()
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x)
+    for (unsigned long long i = blockIdx.x*blockDim.x + threadIdx.x; i < n; i += (unsigned long long)gridDim.x * blockDim.x)
         y[i] = floorf(x[i]);
 }
-extern "C" __global__ void ceil_f32(const float* x, float* y, const int n) {
+extern "C" __global__ void ceil_f32(const float* x, float* y, const unsigned long long n) {
     // CPU: x.ceil()
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x)
+    for (unsigned long long i = blockIdx.x*blockDim.x + threadIdx.x; i < n; i += (unsigned long long)gridDim.x * blockDim.x)
         y[i] = ceilf(x[i]);
 }
-extern "C" __global__ void round_f32(const float* x, float* y, const int n) {
+extern "C" __global__ void round_f32(const float* x, float* y, const unsigned long long n) {
     // CPU: x.round_ties_even() (banker's rounding = ONNX round-half-to-even).
     // rintf rounds to nearest, ties-to-even under the default rounding mode.
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x)
+    for (unsigned long long i = blockIdx.x*blockDim.x + threadIdx.x; i < n; i += (unsigned long long)gridDim.x * blockDim.x)
         y[i] = rintf(x[i]);
 }
-extern "C" __global__ void sin_f32(const float* x, float* y, const int n) {
+extern "C" __global__ void sin_f32(const float* x, float* y, const unsigned long long n) {
     // CPU: x.sin()
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x)
+    for (unsigned long long i = blockIdx.x*blockDim.x + threadIdx.x; i < n; i += (unsigned long long)gridDim.x * blockDim.x)
         y[i] = sinf(x[i]);
 }
-extern "C" __global__ void cos_f32(const float* x, float* y, const int n) {
+extern "C" __global__ void cos_f32(const float* x, float* y, const unsigned long long n) {
     // CPU: x.cos()
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x)
+    for (unsigned long long i = blockIdx.x*blockDim.x + threadIdx.x; i < n; i += (unsigned long long)gridDim.x * blockDim.x)
         y[i] = cosf(x[i]);
 }
-extern "C" __global__ void softplus_f32(const float* x, float* y, const int n) {
+extern "C" __global__ void softplus_f32(const float* x, float* y, const unsigned long long n) {
     // CPU: x.max(0.0) + (-x.abs()).exp().ln_1p()  (numerically stable softplus).
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
+    for (unsigned long long i = blockIdx.x*blockDim.x + threadIdx.x; i < n; i += (unsigned long long)gridDim.x * blockDim.x) {
         float v = x[i];
         y[i] = fmaxf(v, 0.0f) + log1pf(expf(-fabsf(v)));
     }
@@ -261,7 +261,7 @@ impl UnaryMathKernel {
         }
 
         let n = x.numel();
-        let n_i = count_i32(op, n)?;
+        let n_u64 = count_u64(op, n)?;
         let x_ptr = cuptr(x.data_ptr::<u8>() as *const c_void);
         let y_ptr = cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void);
 
@@ -275,10 +275,11 @@ impl UnaryMathKernel {
         };
         let stream = self.runtime.stream();
         let mut builder = stream.launch_builder(&func);
-        builder.arg(&x_ptr).arg(&y_ptr).arg(&n_i);
+        builder.arg(&x_ptr).arg(&y_ptr).arg(&n_u64);
         // SAFETY: `func` is the compiled unary-math entry; the (const float*,
-        // float*, int) argument list matches its signature; `x_ptr`/`y_ptr` are
-        // live device allocations of `n` f32 elements (bounds validated above).
+        // float*, unsigned long long) argument list matches its signature;
+        // `x_ptr`/`y_ptr` are live device allocations of `n` f32 elements, and
+        // the u64 count and indexing cover their validated bounds without overflow.
         unsafe { builder.launch(cfg) }
             .map_err(|e| driver_err(&format!("launch {}", self.op.entry()), e))?;
         self.runtime.synchronize()
@@ -306,9 +307,9 @@ impl Kernel for UnaryMathKernel {
 /// NVRTC source: boolean negation over raw bytes. Matches the CPU EP
 /// (`logical.rs`): a non-zero byte is `true`, output is canonical `1`/`0`.
 const NOT_SRC: &str = r#"
-extern "C" __global__ void not_bool(const unsigned char* x, unsigned char* y, const int n) {
+extern "C" __global__ void not_bool(const unsigned char* x, unsigned char* y, const unsigned long long n) {
     // CPU: u8::from(b == 0)
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x)
+    for (unsigned long long i = blockIdx.x*blockDim.x + threadIdx.x; i < n; i += (unsigned long long)gridDim.x * blockDim.x)
         y[i] = (x[i] == 0) ? 1 : 0;
 }
 "#;
@@ -358,7 +359,7 @@ impl NotKernel {
         }
 
         let n = x.numel();
-        let n_i = count_i32("Not", n)?;
+        let n_u64 = count_u64("Not", n)?;
         let x_ptr = cuptr(x.data_ptr::<u8>() as *const c_void);
         let y_ptr = cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void);
 
@@ -370,10 +371,11 @@ impl NotKernel {
         };
         let stream = self.runtime.stream();
         let mut builder = stream.launch_builder(&func);
-        builder.arg(&x_ptr).arg(&y_ptr).arg(&n_i);
+        builder.arg(&x_ptr).arg(&y_ptr).arg(&n_u64);
         // SAFETY: `func` is the compiled `not_bool` entry; the (const uchar*,
-        // uchar*, int) argument list matches its signature; both pointers are
-        // live device allocations of `n` 1-byte bool elements (validated above).
+        // uchar*, unsigned long long) argument list matches its signature; both
+        // pointers are live device allocations of `n` 1-byte bool elements, and
+        // the u64 count and indexing cover their validated bounds without overflow.
         unsafe { builder.launch(cfg) }.map_err(|e| driver_err("launch not_bool", e))?;
         self.runtime.synchronize()
     }
@@ -400,24 +402,24 @@ impl Kernel for NotKernel {
 /// NVRTC source: one `extern "C"` kernel per comparison op — two f32 operands,
 /// a 1-byte bool output (canonical `1`/`0`), per ONNX comparison semantics.
 const CMP_SRC: &str = r#"
-extern "C" __global__ void equal_f32(const float* a, const float* b, unsigned char* y, const int n) {
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x)
+extern "C" __global__ void equal_f32(const float* a, const float* b, unsigned char* y, const unsigned long long n) {
+    for (unsigned long long i = blockIdx.x*blockDim.x + threadIdx.x; i < n; i += (unsigned long long)gridDim.x * blockDim.x)
         y[i] = (a[i] == b[i]) ? 1 : 0;
 }
-extern "C" __global__ void greater_f32(const float* a, const float* b, unsigned char* y, const int n) {
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x)
+extern "C" __global__ void greater_f32(const float* a, const float* b, unsigned char* y, const unsigned long long n) {
+    for (unsigned long long i = blockIdx.x*blockDim.x + threadIdx.x; i < n; i += (unsigned long long)gridDim.x * blockDim.x)
         y[i] = (a[i] > b[i]) ? 1 : 0;
 }
-extern "C" __global__ void less_f32(const float* a, const float* b, unsigned char* y, const int n) {
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x)
+extern "C" __global__ void less_f32(const float* a, const float* b, unsigned char* y, const unsigned long long n) {
+    for (unsigned long long i = blockIdx.x*blockDim.x + threadIdx.x; i < n; i += (unsigned long long)gridDim.x * blockDim.x)
         y[i] = (a[i] < b[i]) ? 1 : 0;
 }
-extern "C" __global__ void greater_equal_f32(const float* a, const float* b, unsigned char* y, const int n) {
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x)
+extern "C" __global__ void greater_equal_f32(const float* a, const float* b, unsigned char* y, const unsigned long long n) {
+    for (unsigned long long i = blockIdx.x*blockDim.x + threadIdx.x; i < n; i += (unsigned long long)gridDim.x * blockDim.x)
         y[i] = (a[i] >= b[i]) ? 1 : 0;
 }
-extern "C" __global__ void less_equal_f32(const float* a, const float* b, unsigned char* y, const int n) {
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x)
+extern "C" __global__ void less_equal_f32(const float* a, const float* b, unsigned char* y, const unsigned long long n) {
+    for (unsigned long long i = blockIdx.x*blockDim.x + threadIdx.x; i < n; i += (unsigned long long)gridDim.x * blockDim.x)
         y[i] = (a[i] <= b[i]) ? 1 : 0;
 }
 "#;
@@ -463,16 +465,16 @@ impl CmpOp {
 /// NVRTC source: one `extern "C"` kernel per logical op — two bool operands (a
 /// non-zero byte is `true`, matching the CPU `Not`), 1-byte bool output.
 const LOGICAL_SRC: &str = r#"
-extern "C" __global__ void and_bool(const unsigned char* a, const unsigned char* b, unsigned char* y, const int n) {
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x)
+extern "C" __global__ void and_bool(const unsigned char* a, const unsigned char* b, unsigned char* y, const unsigned long long n) {
+    for (unsigned long long i = blockIdx.x*blockDim.x + threadIdx.x; i < n; i += (unsigned long long)gridDim.x * blockDim.x)
         y[i] = ((a[i] != 0) && (b[i] != 0)) ? 1 : 0;
 }
-extern "C" __global__ void or_bool(const unsigned char* a, const unsigned char* b, unsigned char* y, const int n) {
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x)
+extern "C" __global__ void or_bool(const unsigned char* a, const unsigned char* b, unsigned char* y, const unsigned long long n) {
+    for (unsigned long long i = blockIdx.x*blockDim.x + threadIdx.x; i < n; i += (unsigned long long)gridDim.x * blockDim.x)
         y[i] = ((a[i] != 0) || (b[i] != 0)) ? 1 : 0;
 }
-extern "C" __global__ void xor_bool(const unsigned char* a, const unsigned char* b, unsigned char* y, const int n) {
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x)
+extern "C" __global__ void xor_bool(const unsigned char* a, const unsigned char* b, unsigned char* y, const unsigned long long n) {
+    for (unsigned long long i = blockIdx.x*blockDim.x + threadIdx.x; i < n; i += (unsigned long long)gridDim.x * blockDim.x)
         y[i] = ((a[i] != 0) != (b[i] != 0)) ? 1 : 0;
 }
 "#;
@@ -612,7 +614,7 @@ impl BinaryPredKernel {
         }
 
         let n = a.numel();
-        let n_i = count_i32(op, n)?;
+        let n_u64 = count_u64(op, n)?;
         let a_ptr = cuptr(a.data_ptr::<u8>() as *const c_void);
         let b_ptr = cuptr(b.data_ptr::<u8>() as *const c_void);
         let y_ptr = cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void);
@@ -625,11 +627,11 @@ impl BinaryPredKernel {
         };
         let stream = self.runtime.stream();
         let mut builder = stream.launch_builder(&func);
-        builder.arg(&a_ptr).arg(&b_ptr).arg(&y_ptr).arg(&n_i);
+        builder.arg(&a_ptr).arg(&b_ptr).arg(&y_ptr).arg(&n_u64);
         // SAFETY: `func` is the compiled predicate entry; its argument list is
-        // (const T*, const T*, unsigned char*, int) where T is f32 or uchar per
-        // `kind` — matching the validated operand/output dtypes; all three
-        // pointers are live device allocations of `n` elements (validated above).
+        // (const T*, const T*, unsigned char*, unsigned long long) where T is f32
+        // or uchar per `kind` — matching the validated operand/output dtypes; all
+        // pointers cover `n` elements, with a matching u64 count and indexing.
         unsafe { builder.launch(cfg) }
             .map_err(|e| driver_err(&format!("launch {}", self.entry), e))?;
         self.runtime.synchronize()
@@ -791,8 +793,32 @@ mod tests {
     }
 
     #[test]
-    fn count_i32_rejects_overflow() {
-        assert!(count_i32("Exp", (i32::MAX as usize) + 1).is_err());
-        assert_eq!(count_i32("Exp", 10).unwrap(), 10);
+    fn near_i32_max_uses_u64_count_and_indexing() {
+        let near_i32_max = (i32::MAX as usize) + 1;
+        let count: u64 = count_u64("Exp", near_i32_max).unwrap();
+        assert_eq!(count, (i32::MAX as u64) + 1);
+
+        const LOOP: &str = "for (unsigned long long i = blockIdx.x*blockDim.x + threadIdx.x; i < n; i += (unsigned long long)gridDim.x * blockDim.x)";
+        for (name, source, kernel_count) in [
+            ("unary", UNARY_MATH_SRC, 12),
+            ("Not", NOT_SRC, 1),
+            ("comparison", CMP_SRC, 5),
+            ("logical", LOGICAL_SRC, 3),
+        ] {
+            assert_eq!(
+                source.matches("const unsigned long long n)").count(),
+                kernel_count,
+                "{name} count parameters must be unsigned 64-bit"
+            );
+            assert_eq!(
+                source.matches(LOOP).count(),
+                kernel_count,
+                "{name} kernels must use unsigned 64-bit grid-stride indexing"
+            );
+            assert!(
+                !source.contains("const int n)") && !source.contains("for (int i"),
+                "{name} source regressed to signed 32-bit indexing"
+            );
+        }
     }
 }
