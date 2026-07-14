@@ -6,12 +6,22 @@ Tracks implementation status of `docs/DESIGN.md` (§1–§40). Updated as work l
 
 _Last updated: 2026-07-14_
 
+## ORT 2.0 — from-scratch Rust ONNX runtime (`docs/ORT2.md`, big design — steady progress)
+
+New parallel track (user co-designed the design with the team). Goal: a from-scratch Rust ONNX runtime living in this monorepo — own strided IR (symbolic shapes + device placement first-class), plugin-EP contract that preserves the ORT graph ABI (the EP ecosystem is the moat), cost-model-driven placement, async executor. Backend swap via a `backend-ort2` feature in `onnx-genai-engine`. Roadmap: `docs/ORT2-IMPL-PLAN.md`.
+
+- **Phase 1 foundation ✅ landed (`203161c`, Roy/Lead):** 6 `onnx-runtime-*` crates scaffolded (additive; no existing crate touched). **`onnx-runtime-ir` fully implemented** (`#![forbid(unsafe_code)]`, **34 passing tests**) — the frozen public contract: `DataType` (ONNX-numbered, sub-byte packing), symbolic `Shape`/`Dim`/`SymbolConstraints`, strided `TensorLayout`/`MemoryFormat` + broadcast math, first-class `DeviceId`, arena `Graph` with edge-consistent mutation, deterministic Kahn `topological_order`, `validate`, `IrError`/`GraphError`. `loader`/`ep-api`/`ep-cpu`/`session`/`capi` are compiling skeletons.
+- **Phase 1 fan-out (in flight):** Track A `onnx-runtime-loader` (Deckard — proto/graph-builder/weights/BERT-scoped shape-inference) + Track B `onnx-runtime-ep-api` (Batty — DeviceBuffer/Send-Sync safety, DLPack alignment) building in parallel against the IR contract. Then C `ep-cpu` (oneDNN FFI) → D `session` (executor) → E `capi`. **Phase-1 exit milestone:** run BERT on CPU, output matches upstream ORT.
+- **Open design questions (Roy assumed reasonable defaults, proceeding; flagged for user):** owned device-aware `Tensor` placement (assumed placeholder in `session`; likely a shared `onnx-runtime-tensor` crate before ep-cpu wires real memory), `OrtGraphView` in `ep-api::abi` (not IR, needs `unsafe` FFI), protobuf via vendored `onnx.proto3`+`prost-build`, sub-byte `byte_size`→use `storage_bytes`, `capi` crate-type stays `lib` until entry points land.
+
+
+
 ## Status by design section
 
 | § | Feature | Status | Notes |
 |---|---------|--------|-------|
 | 1–8 | Vision, architecture, core components, data flow, concurrency, model dir, crates, deps | ✅ Done | |
-| 9 | API surface | 🟡 Partial | chat/completions/models/sessions/status/metrics/audio ✅; `/v1/embeddings` (#7) ✅ wired to engine pooled-embedding API; logprobs(#8) ✅; `/v1/debug/*` (config/sessions/kv/trace) ✅; Perfetto/OTLP export (#13) deferred |
+| 9 | API surface | 🟡 Partial | chat/completions/models/sessions/status/metrics/audio ✅; `/v1/embeddings` (#7) ✅ wired to engine pooled-embedding API; logprobs(#8) ✅; `/v1/debug/*` (config/sessions/kv/trace) ✅; **Perfetto trace export (#13) ✅** at `/v1/debug/trace/perfetto` (static-str-only event names, gate-parity, model-agnostic; OTLP explicitly deferred) — Zhora, reviewed 🟢 Deckard, merged `8d1bf3d` |
 | 11,12,15 | Testing, design decisions | ✅ Done | coverage ~77% |
 | 16 | Quantized models | ✅ Done | EP select + int8 KV; fp8/int8 KV **storage now selectable** end-to-end (#15) via `--kv-cache-dtype`/`ONNX_GENAI_KV_CACHE_DTYPE` (f32/int8/fp8_e4m3fn/fp8_e5m2) → `PageTensorConfig.dtype` |
 | 17 | Diffusion pipeline (image) | ❌ Missing | #16 |
@@ -23,10 +33,10 @@ _Last updated: 2026-07-14_
 | 24 | Sampling policy | ✅ Done | full sampler suite; **real RNG fixed 2026-07-12** |
 | 25 | Extensibility | ✅ Done | DecodeBackend/SpeculativeProposer/Sampler traits |
 | 26 | Multi-agent serving | ✅ Done | batched continuous serving (~6× throughput) |
-| 27 | Multi-token speculative | ✅ Done | draft + prompt-lookup + MTP + EAGLE-3 + **Gemma4 assistant (shared-KV proposer)** — validated **token-identical on real Gemma4 E2B weights on CUDA/H200** (Milestone B, `10f82b3`); speculative speedup optimization (acceptance) is an open perf follow-up |
+| 27 | Multi-token speculative | ✅ Done | draft + prompt-lookup + MTP + EAGLE-3 + **Gemma4 assistant (shared-KV proposer)** — validated **token-identical on real Gemma4 E2B weights on CUDA/H200** (Milestone B, `10f82b3`). **Acceptance bug root-caused + fixed** (Leon, branch `squad/gemma4-accept`, review in flight): assistant needs `inputs_embeds=concat(target_input_embedding(last_token), last_hidden)`; engine had fed two backbone-hidden vectors → deterministic `multi_token_accepts=0`. Fix adds optional `input_embedding` metadata field + `LinearEmbedder`. **acceptance 25%→70.6%, multi_token_accepts 0→12/17**, still token-identical. Raw speedup still <1× (drafter lm_head compute cost) — separate perf follow-up |
 | 28 | vLLM speculator compat | ✅ Done | config auto-discovery + EAGLE-3 proposer |
 | 29 | Language diffusion | ❌ Missing | large |
-| 31 | Observability | 🟡 Partial | `/metrics` + `/v1/status` + trace ids + `/v1/debug/*` ✅; Perfetto/OTLP export (feature-gated stub) = #13 |
+| 31 | Observability | 🟡 Partial | `/metrics` + `/v1/status` + trace ids + `/v1/debug/*` ✅; **Perfetto/Chrome trace export (#13) ✅** (`/v1/debug/trace/perfetto`, JSON download, empty-honest); OTLP still deferred |
 | 32 | Metrics API | ✅ Done | |
 | 34 | Cluster/session router | ✅ Done | New `onnx-genai-router` crate (§34): R1 server `GET /v1/status` node-status contract (model-agnostic `--node-id`); R2 pure core — YAML `RouterConfig`, `RoutingPolicy` (affinity→prefix→least-loaded + Weighted w/ scored `affinity_weight` bonus), session/prefix affinity maps, migration accounting; R3 runnable binary — hyper/axum reverse proxy (streams SSE, strips hop-by-hop, 16 MiB caps), `/router/{status,sessions,metrics,drain,rebalance}`, concurrent `/v1/status` poller w/ health-miss demotion, Prometheus metrics, SIGINT drain. Model-agnostic (opaque node/session ids); no ORT/engine deps. Reviews: Chew 🟡→fixed (f32 contract, affinity_weight), Deckard 🟡→fixed (concurrent poller, rebalance overload guard). 73+4 tests |
 | 35 | Native preprocessing | ✅ Done | `onnx-genai-preprocess`: image (bicubic/CLIP + tiling none/fixed_grid/dynamic_anyres) + audio log-mel; audio wired (#12). Multi-tile prompt token-expansion library (`expand_image_placeholders`, thumbnail-order-safe) ✅; engine count-based expansion + server tile-count seam wired (#14) ✅ |
@@ -38,7 +48,7 @@ _Last updated: 2026-07-14_
 
 ## Open backlog (GitHub issues)
 
-- **#7** `/v1/embeddings` ✅ (wired to `Engine::embed_with_options` via `DriverCommand::Embed`) · **#8** logprobs ✅ (opt-in per-token + top_logprobs, chat+completions, streaming + speculative paths) · **#9** model lifecycle/multi-model · **#13** debug endpoints + Perfetto · **#15** fp8 KV quant ✅ (selectable fp8/int8 host-mirror storage) · **#16** image diffusion.
+- **#7** `/v1/embeddings` ✅ (wired to `Engine::embed_with_options` via `DriverCommand::Embed`) · **#8** logprobs ✅ (opt-in per-token + top_logprobs, chat+completions, streaming + speculative paths) · **#9** model lifecycle/multi-model · **#13** debug endpoints + **Perfetto ✅ (merged `8d1bf3d`)** · **#15** fp8 KV quant ✅ (selectable fp8/int8 host-mirror storage) · **#16** image diffusion.
 - Closed: **#2** server split · **#3** decode ownership · **#4** FIM endpoint · **#5** benchmarks · **#10** EAGLE-3 proposer · **#11** audio log-mel preprocessing · **#12** audio input · **#14** vision preprocessing/tiling.
 
 ## Recently completed (this session)
