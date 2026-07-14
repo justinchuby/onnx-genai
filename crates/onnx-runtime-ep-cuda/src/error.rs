@@ -20,6 +20,22 @@ pub(crate) fn cublas_err(context: &str, e: cudarc::cublaslt::result::CublasError
     EpError::KernelFailed(format!("cuda_ep: {context}: cuBLASLt error: {e:?}"))
 }
 
+/// Wrap a cudarc **NVRTC** compile error with actionable context. NVRTC failures
+/// carry the compiler log, which is the single most useful artefact for fixing a
+/// bad kernel source, so it is surfaced verbatim (RULES.md #1: what/why/how).
+pub(crate) fn nvrtc_err(context: &str, e: cudarc::nvrtc::CompileError) -> EpError {
+    let detail = match &e {
+        cudarc::nvrtc::CompileError::CompileError { nvrtc, log, .. } => {
+            format!(
+                "NVRTC compilation failed ({nvrtc:?}); compiler log:\n{}",
+                log.to_string_lossy()
+            )
+        }
+        other => format!("NVRTC error: {other:?}"),
+    };
+    EpError::KernelFailed(format!("cuda_ep: {context}: {detail}"))
+}
+
 /// Build a "not implemented in this slice" error for an op/dtype/rank the
 /// CUDA EP does **not** yet cover. The message is deliberately explicit that
 /// this is Phase-2a scope, so callers get an actionable next step rather than a

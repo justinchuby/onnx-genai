@@ -335,3 +335,167 @@ pub unsafe fn gemm(
 
     Ok(())
 }
+
+/// A single (non-batched) **column-major, native cuBLAS** GEMM request:
+/// `C = alpha · op(A) · op(B) + beta · C`, with all shapes and leading
+/// dimensions expressed in cuBLAS's own column-major terms.
+///
+/// The plain-`MatMul` path in [`gemm`] realises row-major ONNX semantics via
+/// the operand-swap identity and never needs an explicit transpose. The
+/// attention kernel, however, forms `Q·Kᵀ` (one transposed operand) and `P·V`
+/// (no transpose) directly, so it drives cuBLASLt at this lower, unambiguous
+/// column-major level and computes the leading dims / transpose flags itself
+/// (see `kernels::attention` for the row-major → column-major derivation of
+/// each GEMM). `alpha` lets the QKᵀ stage fold in the softmax `scale` for free.
+pub struct GemmEx {
+    pub dtype: GemmDtype,
+    /// Apply `opᵀ` to A (`CUBLAS_OP_T`) instead of `op` (`CUBLAS_OP_N`).
+    pub transa: bool,
+    pub transb: bool,
+    /// cuBLAS column-major result dims: `C` is `m × n`, contraction `k`.
+    pub m: usize,
+    pub n: usize,
+    pub k: usize,
+    pub alpha: f32,
+    pub beta: f32,
+    pub a: CUdeviceptr,
+    pub lda: usize,
+    pub b: CUdeviceptr,
+    pub ldb: usize,
+    pub c: CUdeviceptr,
+    pub ldc: usize,
+}
+
+// cublasOperation_t is a plain C `enum` (4-byte int): CUBLAS_OP_N = 0, _T = 1.
+// The cuBLASLt `sys` layer does not re-export it, so we pass the raw code.
+const CUBLAS_OP_N: i32 = 0;
+const CUBLAS_OP_T: i32 = 1;
+
+impl MatmulDesc {
+    /// Set the `CUBLASLT_MATMUL_DESC_TRANSA` / `TRANSB` operation for an operand.
+    fn set_transpose(
+        &self,
+        attr: sys::cublasLtMatmulDescAttributes_t,
+        transpose: bool,
+    ) -> Result<()> {
+        let op: i32 = if transpose { CUBLAS_OP_T } else { CUBLAS_OP_N };
+        // SAFETY: `self.0` is a live desc; the buffer is a local `i32` matching
+        // the 4-byte `cublasOperation_t` the attribute expects.
+        unsafe {
+            result::set_matmul_desc_attribute(
+                self.0,
+                attr,
+                (&op) as *const i32 as *const c_void,
+                std::mem::size_of::<i32>(),
+            )
+            .map_err(|e| cublas_err("set MATMUL_DESC_TRANS", e))
+        }
+    }
+}
+
+/// Execute one column-major `C = alpha·op(A)·op(B) + beta·C` on `stream`.
+///
+/// # Safety
+///
+/// * `handle` must be a live cuBLASLt handle.
+/// * `p.a`, `p.b`, `p.c` must be live device allocations large enough for the
+///   stated shapes / leading dims and `p.dtype`.
+/// * `workspace` must be a live device allocation of `workspace_bytes`.
+/// * `stream` must be valid and its owning context current on this thread.
+/// * `p.c` must not alias `p.a` or `p.b`.
+pub unsafe fn gemm_ex(
+    handle: &CublasLt,
+    stream: cudarc::driver::sys::CUstream,
+    p: &GemmEx,
+    workspace: CUdeviceptr,
+    workspace_bytes: usize,
+) -> Result<()> {
+    if p.m == 0 || p.n == 0 || p.k == 0 {
+        return Err(EpError::KernelFailed(format!(
+            "cuda_ep attention GEMM: degenerate dims M={} N={} K={}",
+            p.m, p.n, p.k
+        )));
+    }
+
+    let dt = p.dtype.data_type();
+
+    // Layout dims describe each operand **as stored** (before op): a
+    // transposed operand is physically `k × m` (A) / `n × k` (B).
+    let (a_rows, a_cols) = if p.transa {
+        (p.k as u64, p.m as u64)
+    } else {
+        (p.m as u64, p.k as u64)
+    };
+    let (b_rows, b_cols) = if p.transb {
+        (p.n as u64, p.k as u64)
+    } else {
+        (p.k as u64, p.n as u64)
+    };
+
+    let a_layout = MatrixLayout::new(dt, a_rows, a_cols, p.lda as i64)?;
+    let b_layout = MatrixLayout::new(dt, b_rows, b_cols, p.ldb as i64)?;
+    let c_layout = MatrixLayout::new(dt, p.m as u64, p.n as u64, p.ldc as i64)?;
+
+    let desc = MatmulDesc::new(p.dtype.compute_type(), sys::cudaDataType_t::CUDA_R_32F)?;
+    desc.set_transpose(
+        sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSA,
+        p.transa,
+    )?;
+    desc.set_transpose(
+        sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSB,
+        p.transb,
+    )?;
+
+    let pref = MatmulPref::new(workspace_bytes)?;
+
+    // SAFETY: all descriptor/layout handles are live for the call.
+    let heuristic = unsafe {
+        result::get_matmul_algo_heuristic(
+            handle.handle,
+            desc.0,
+            a_layout.0,
+            b_layout.0,
+            c_layout.0,
+            c_layout.0,
+            pref.0,
+        )
+    }
+    .map_err(|e| {
+        cublas_err(
+            &format!(
+                "no cuBLASLt algorithm for attention GEMM M={} N={} K={} transa={} transb={} dtype={:?}",
+                p.m, p.n, p.k, p.transa, p.transb, p.dtype
+            ),
+            e,
+        )
+    })?;
+
+    let alpha = p.alpha;
+    let beta = p.beta;
+
+    // SAFETY: layouts/desc/algo live; a/b/c/workspace are caller-guaranteed live
+    // device allocations of the right size; stream valid; C aliases neither.
+    unsafe {
+        result::matmul(
+            handle.handle,
+            desc.0,
+            (&alpha) as *const f32 as *const c_void,
+            (&beta) as *const f32 as *const c_void,
+            p.a as *const c_void,
+            a_layout.0,
+            p.b as *const c_void,
+            b_layout.0,
+            p.c as *const c_void,
+            c_layout.0,
+            p.c as *mut c_void,
+            c_layout.0,
+            (&heuristic.algo) as *const sys::cublasLtMatmulAlgo_t,
+            workspace as *mut c_void,
+            workspace_bytes,
+            stream as sys::cudaStream_t,
+        )
+    }
+    .map_err(|e| cublas_err("cublasLtMatmul (attention)", e))?;
+
+    Ok(())
+}

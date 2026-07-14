@@ -17,7 +17,10 @@ thiserror = { workspace = true }
 # API set (the runtime libs on the target host are libcublasLt.so.13 / cudart 13)
 # and `dynamic-loading` so `cargo build` needs NO CUDA toolkit — the driver and
 # cuBLASLt are dlopen'd at runtime. `f16` pulls in `half` for f16/bf16 GEMM.
+# `nvrtc` compiles the fused attention softmax kernel from a CUDA-C source
+# string to PTX at runtime (libnvrtc dlopen'd), preserving the no-build-time-
+# toolkit property.
 [dependencies.cudarc]
 version = "0.19"
 default-features = false
-features = ["std", "driver", "cublaslt", "f16", "cuda-13000", "dynamic-loading"]
+features = ["std", "driver", "cublaslt", "nvrtc", "f16", "cuda-13000", "dynamic-loading"]

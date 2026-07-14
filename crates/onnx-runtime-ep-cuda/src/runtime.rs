@@ -3,16 +3,17 @@
 //! and shared (via `Arc`) into every kernel the provider hands out, so the whole
 //! EP drives a single device + stream + library handle.
 
+use std::collections::HashMap;
 use std::ffi::c_void;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use cudarc::driver::sys::CUdeviceptr;
-use cudarc::driver::{CudaContext, CudaStream};
+use cudarc::driver::{CudaContext, CudaFunction, CudaModule, CudaStream};
 
 use onnx_runtime_ep_api::Result;
 
 use crate::blas::CublasLt;
-use crate::error::driver_err;
+use crate::error::{driver_err, nvrtc_err};
 
 /// Device context + stream + cuBLASLt handle shared across the EP's kernels.
 pub struct CudaRuntime {
@@ -20,6 +21,10 @@ pub struct CudaRuntime {
     stream: Arc<CudaStream>,
     blas: CublasLt,
     ordinal: u32,
+    /// Cache of NVRTC-compiled modules, keyed by a stable module name, so each
+    /// runtime compiles a given kernel (e.g. the fused attention softmax) at
+    /// most once and reuses the loaded module for every kernel invocation.
+    modules: Mutex<HashMap<&'static str, Arc<CudaModule>>>,
 }
 
 impl std::fmt::Debug for CudaRuntime {
@@ -44,6 +49,7 @@ impl CudaRuntime {
             stream,
             blas,
             ordinal,
+            modules: Mutex::new(HashMap::new()),
         })
     }
 
@@ -60,6 +66,49 @@ impl CudaRuntime {
     /// The raw CUDA stream the EP submits work on.
     pub fn stream_ptr(&self) -> cudarc::driver::sys::CUstream {
         self.stream.cu_stream()
+    }
+
+    /// The EP's compute stream (for `launch_builder`-based kernel launches).
+    pub fn stream(&self) -> &Arc<CudaStream> {
+        &self.stream
+    }
+
+    /// Get a [`CudaFunction`] for entry point `entry` in the NVRTC module named
+    /// `module_key`, compiling `src` to PTX and loading it on first use and
+    /// reusing the cached module thereafter.
+    ///
+    /// The compile targets `compute_90` (Hopper / SM90, our H200) but PTX is
+    /// forward-compatible, so the module still loads on newer architectures. An
+    /// NVRTC failure surfaces the compiler log via [`nvrtc_err`] (RULES.md #1).
+    pub fn nvrtc_function(
+        &self,
+        module_key: &'static str,
+        src: &str,
+        entry: &str,
+    ) -> Result<CudaFunction> {
+        self.bind()?;
+        let module = {
+            let mut cache = self.modules.lock().expect("cuda_ep module cache poisoned");
+            if let Some(m) = cache.get(module_key) {
+                m.clone()
+            } else {
+                let opts = cudarc::nvrtc::CompileOptions {
+                    arch: Some("compute_90"),
+                    ..Default::default()
+                };
+                let ptx = cudarc::nvrtc::compile_ptx_with_opts(src, opts)
+                    .map_err(|e| nvrtc_err(&format!("compiling NVRTC module '{module_key}'"), e))?;
+                let m = self
+                    .context
+                    .load_module(ptx)
+                    .map_err(|e| driver_err(&format!("loading NVRTC module '{module_key}'"), e))?;
+                cache.insert(module_key, m.clone());
+                m
+            }
+        };
+        module
+            .load_function(entry)
+            .map_err(|e| driver_err(&format!("loading NVRTC function '{entry}'"), e))
     }
 
     /// Bind this runtime's context to the calling thread. Required before any
