@@ -8479,8 +8479,8 @@ impl GenAiEngine {
 ### 42.6 Python Plugin API
 
 ```python
-import ort2
-from ort2 import Sampler, DraftProducer, AcceptanceRule
+import nxrt
+from nxrt import Sampler, DraftProducer, AcceptanceRule
 
 # --- Custom Sampler ---
 class MirostatV2Sampler(Sampler):
@@ -8586,7 +8586,7 @@ class RelaxedAcceptance(AcceptanceRule):
 
 
 # --- Usage ---
-engine = ort2.GenAiEngine("model.onnx")
+engine = nxrt.GenAiEngine("model.onnx")
 
 # Plug in custom sampler
 engine.set_sampler(MirostatV2Sampler(tau=5.0, eta=0.1))
@@ -8596,8 +8596,8 @@ engine.set_speculator(LookbackSpeculator(window=200, max_draft=8))
 engine.set_acceptance_rule(RelaxedAcceptance(k=5))
 
 # Or bring a ONNX draft model:
-eagle_model = ort2.load("eagle_head.onnx")
-engine.set_speculator(ort2.EagleProducer(eagle_model, tree_depth=3, tree_width=4))
+eagle_model = nxrt.load("eagle_head.onnx")
+engine.set_speculator(nxrt.EagleProducer(eagle_model, tree_depth=3, tree_width=4))
 
 # Generate (uses custom plugins transparently)
 for token in engine.generate_stream("Hello, world"):
@@ -8632,11 +8632,11 @@ We support loading them as ONNX:
 
 ```python
 # Load a vLLM-compatible speculator checkpoint (converted to ONNX)
-speculator = ort2.load_speculator("eagle_head.onnx", kind="eagle")
+speculator = nxrt.load_speculator("eagle_head.onnx", kind="eagle")
 engine.set_speculator(speculator)
 
 # Or Medusa heads (multiple heads in one model)
-speculator = ort2.load_speculator("medusa_heads.onnx", kind="medusa",
+speculator = nxrt.load_speculator("medusa_heads.onnx", kind="medusa",
                                    tree_width=4, tree_depth=3)
 engine.set_speculator(speculator)
 ```
@@ -8675,7 +8675,7 @@ pub enum ProcessorOrdering {
 
 ```python
 # Python custom logit processor
-class DryPenaltyProcessor(ort2.LogitProcessor):
+class DryPenaltyProcessor(nxrt.LogitProcessor):
     """Don't Repeat Yourself: penalize repeated n-gram patterns."""
 
     def __init__(self, penalty=1.0, allowed_length=2, sequence_breakers=None):

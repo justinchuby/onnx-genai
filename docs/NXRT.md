@@ -1,4 +1,4 @@
-# ORT 2.0 — Runtime Design Document
+# nxrt — Runtime Design Document
 
 > A Rust-based ONNX runtime built into onnx-genai. First-class plugin EP compatibility,
 > strided layout, global-optimal device placement, async data transfer, and exceptional
@@ -2188,19 +2188,19 @@ impl ReplayCapture {
 
 ```bash
 # Profile a model
-ort2 profile model.onnx --inputs input.npz --runs 100 --output trace.json
+nxrt profile model.onnx --inputs input.npz --runs 100 --output trace.json
 
 # Compare two runs
-ort2 compare trace_before.json trace_after.json
+nxrt compare trace_before.json trace_after.json
 
 # Dump graph at each optimization stage
-ort2 dump-passes model.onnx --format dot --output-dir passes/
+nxrt dump-passes model.onnx --format dot --output-dir passes/
 
 # Memory analysis
-ort2 memory model.onnx --inputs input.npz --output memory_report.json
+nxrt memory model.onnx --inputs input.npz --output memory_report.json
 
 # Validate (check output matches ORT)
-ort2 validate model.onnx --inputs input.npz --reference-output ort_output.npz --tolerance 1e-5
+nxrt validate model.onnx --inputs input.npz --reference-output ort_output.npz --tolerance 1e-5
 ```
 
 ---
@@ -2395,7 +2395,7 @@ session = ort.InferenceSession("model.onnx", opts, providers=["CUDAExecutionProv
 output = session.run(None, {"input_ids": data})
 
 # Ours (intent-based, zero-config):
-session = ort2.load("model.onnx")
+session = nxrt.load("model.onnx")
 output = session.run(input_ids=data)
 ```
 
@@ -2581,7 +2581,7 @@ let session = InferenceSession::builder()
 
 **Programmatic (Python):**
 ```python
-session = ort2.load("model.onnx", hints={
+session = nxrt.load("model.onnx", hints={
     "placement": [
         {"selector": {"pattern": "layers.*.attention.*"}, "device": {"type": "gpu"}, "strength": "force"},
     ],
@@ -2729,17 +2729,17 @@ fn auto_detect_device() -> Vec<Box<dyn ExecutionProvider>> {
 ### 20.8 Python API
 
 ```python
-import ort2
+import nxrt
 
 # Zero-config:
-session = ort2.load("model.onnx")
+session = nxrt.load("model.onnx")
 output = session.run(input_ids=input_array)
 
 # Device preference:
-session = ort2.load("model.onnx", device="gpu")
+session = nxrt.load("model.onnx", device="gpu")
 
 # Namespaced options:
-session = ort2.load("model.onnx",
+session = nxrt.load("model.onnx",
     device="gpu:1",
     memory_limit=4 * 1024**3,
     options={
@@ -2972,7 +2972,7 @@ onnx-genai/                               (monorepo)
 │   └── cuda/                             # C++ CUDA kernels (CuTe + cuBLAS FFI)
 │
 ├── bindings/
-│   └── python/                           # PyO3: ort2 + per-EP packages
+│   └── python/                           # PyO3: nxrt + per-EP packages
 │
 ├── docs/
 │   ├── DESIGN.md                         # GenAI layer design
@@ -2998,7 +2998,7 @@ GenAI crates are backend-agnostic:
 [features]
 default = ["backend-ort"]
 backend-ort = ["dep:onnx-genai-ort"]      # upstream ORT via C API
-backend-ort2 = ["dep:onnx-runtime-session"]        # our runtime
+backend-nxrt = ["dep:onnx-runtime-session"]        # our runtime
 ```
 
 ```rust
@@ -3018,16 +3018,16 @@ pub trait BackendSession: Send {
 
 ## 24. Python Bindings
 
-### 24.1 Main Package: `ort2`
+### 24.1 Main Package: `nxrt`
 
 ```python
-import ort2
+import nxrt
 from ort_ep_cuda import CudaEp
 
 # Create session with our runtime
-session = ort2.InferenceSession(
+session = nxrt.InferenceSession(
     "model.onnx",
-    providers=[CudaEp(device_id=0), ort2.CpuEp()],
+    providers=[CudaEp(device_id=0), nxrt.CpuEp()],
     optimization_level="aggressive",
 )
 
@@ -3039,7 +3039,7 @@ report = session.profile({"input_ids": input_array}, num_runs=10)
 print(report.bottlenecks)
 
 # Auto-tune
-tuner = ort2.AutoTuner(session)
+tuner = nxrt.AutoTuner(session)
 result = tuner.auto_tune({"input_ids": input_array}, max_iterations=20)
 ```
 
@@ -3145,7 +3145,7 @@ fn test_bert_inference() {
 /// Tolerance: fp32 atol=1e-5, fp16 atol=1e-3.
 pub fn conformance_test(model_path: &Path, inputs: &[Tensor], tolerance: f64) -> Result<()> {
     let ort_output = run_with_upstream_ort(model_path, inputs)?;
-    let our_output = run_with_ort2(model_path, inputs)?;
+    let our_output = run_with_nxrt(model_path, inputs)?;
     for (ort_t, our_t) in ort_output.iter().zip(our_output.iter()) {
         assert_tensors_close(ort_t, our_t, tolerance)?;
     }
@@ -3389,18 +3389,18 @@ impl OverlappedExecutor {
 
 ```python
 # Zero-config: auto-detect GPU capacity, auto-offload if needed
-session = ort2.load("llama-70b.onnx")  # 16GB GPU? Fine. Auto-offloads.
+session = nxrt.load("llama-70b.onnx")  # 16GB GPU? Fine. Auto-offloads.
 
 # Explicit memory limit (leave room for other processes)
-session = ort2.load("model.onnx", memory_limit=12 * GB)
+session = nxrt.load("model.onnx", memory_limit=12 * GB)
 
 # Force full offload (CPU-only mode)
-session = ort2.load("model.onnx", device="cpu")
+session = nxrt.load("model.onnx", device="cpu")
 ```
 
 Namespaced options for fine control:
 ```python
-session = ort2.load("model.onnx", options={
+session = nxrt.load("model.onnx", options={
     "memory.gpu_budget_mb": "12000",       # 12GB GPU budget
     "memory.offload_strategy": "layerwise", # vs "tensorwise"
     "memory.prefetch_layers": "2",          # prefetch 2 layers ahead
@@ -3645,32 +3645,32 @@ SDXL:              GPU 1 (background, preemptable)
 ### 31.8 User API
 
 ```python
-import ort2
+import nxrt
 
 # Auto: single model, best available device(s)
-session = ort2.load("model.onnx")
+session = nxrt.load("model.onnx")
 
 # Tensor parallelism (split across 4 GPUs)
-session = ort2.load("llama-70b.onnx", options={
+session = nxrt.load("llama-70b.onnx", options={
     "parallel.strategy": "tensor",
     "parallel.degree": "4",
 })
 
 # Pipeline parallelism (explicit layer→GPU mapping)
-session = ort2.load("llama-70b.onnx", options={
+session = nxrt.load("llama-70b.onnx", options={
     "parallel.strategy": "pipeline",
     "parallel.stages": "0-15:gpu:0,16-31:gpu:1",
 })
 
 # Data parallelism (throughput mode for serving)
-session = ort2.load("model.onnx", options={
+session = nxrt.load("model.onnx", options={
     "parallel.strategy": "data",
     "parallel.replicas": "4",
 })
 
 # Multi-session priority management
-chat = ort2.load("llama.onnx", priority="realtime", options={"memory.gpu_budget_mb": "10000"})
-image = ort2.load("sdxl.onnx", priority="background", options={"memory.gpu_budget_mb": "6000"})
+chat = nxrt.load("llama.onnx", priority="realtime", options={"memory.gpu_budget_mb": "10000"})
+image = nxrt.load("sdxl.onnx", priority="background", options={"memory.gpu_budget_mb": "6000"})
 ```
 
 ### 31.9 Design Choices
@@ -3904,16 +3904,16 @@ impl GenAiEngine {
 
 ```python
 # Zero-config: adaptive budget (default)
-session = ort2.load("model.onnx")
+session = nxrt.load("model.onnx")
 
 # Hint expected workload (helps initial budget planning)
-session = ort2.load("model.onnx", options={
+session = nxrt.load("model.onnx", options={
     "memory.expected_context_len": "32768",  # expect 32K context
     "memory.expected_batch_size": "8",       # expect 8 concurrent requests
 })
 
 # Override KV cache ceiling
-session = ort2.load("model.onnx", options={
+session = nxrt.load("model.onnx", options={
     "memory.kv_cache_max_gb": "6",
 })
 
@@ -4017,7 +4017,7 @@ impl PageMigrator {
 Users can cap each tier independently:
 
 ```python
-session = ort2.load("model.onnx", options={
+session = nxrt.load("model.onnx", options={
     "memory.vram_limit_gb": "12",       # max 12GB VRAM (leave room for other apps)
     "memory.ram_limit_gb": "32",        # max 32GB RAM
     "memory.ssd_limit_gb": "100",       # max 100GB SSD
@@ -4047,7 +4047,7 @@ Before loading a model, users need to know: "Can my hardware run this? How fast?
 ### 34.2 CLI
 
 ```bash
-$ ort2 inspect model.onnx
+$ nxrt inspect model.onnx
 
 ┌─────────────────────────────────────────────────────────┐
 │  Model: Llama-3.1-70B-Instruct (FP16)                   │
@@ -4086,17 +4086,17 @@ $ ort2 inspect model.onnx
 │     → would fit entirely in VRAM (~35 GB)                │
 └─────────────────────────────────────────────────────────┘
 
-$ ort2 inspect model.onnx --context-len 32768 --batch 8 --json
+$ nxrt inspect model.onnx --context-len 32768 --batch 8 --json
 # Outputs structured JSON for programmatic use
 ```
 
 ### 34.3 Python API
 
 ```python
-import ort2
+import nxrt
 
 # Estimate without loading (fast — only reads metadata + weight sizes)
-estimate = ort2.estimate("model.onnx", context_len=4096, batch_size=1)
+estimate = nxrt.estimate("model.onnx", context_len=4096, batch_size=1)
 print(estimate)
 # ResourceEstimate(
 #   weights_gb=140.0, kv_cache_gb=5.2, activations_gb=1.8,
@@ -4107,7 +4107,7 @@ print(estimate)
 # )
 
 # Check if a specific config is feasible
-ort2.estimate("model.onnx", context_len=128000, batch_size=32,
+nxrt.estimate("model.onnx", context_len=128000, batch_size=32,
              hardware={"vram_gb": 80, "ram_gb": 256})
 ```
 
@@ -4229,7 +4229,7 @@ pub enum ErrorKind {
   This looks like you're passing hidden states instead of token IDs.
   input_ids should be integer token IDs from your tokenizer.
 
-  Docs: https://ort2.dev/errors/shape-mismatch
+  Docs: https://nxrt.dev/errors/shape-mismatch
 ```
 
 ```
@@ -4253,7 +4253,7 @@ pub enum ErrorKind {
   Performance may decrease ~15% for affected layers (13-24).
 
   To avoid this:
-  • Use INT4 quantization: ort2 quantize model.onnx --bits 4
+  • Use INT4 quantization: nxrt quantize model.onnx --bits 4
   • Reduce context length (current: 32768)
   • Set memory.gpu_budget_mb to reserve space: options={"memory.gpu_budget_mb": "20000"}
 ```
@@ -4322,7 +4322,7 @@ impl ResourceBroker {
 ## 36. Determinism & Reproducibility
 
 ```python
-session = ort2.load("model.onnx", options={
+session = nxrt.load("model.onnx", options={
     "execution.deterministic": "true",
 })
 ```
@@ -4428,14 +4428,14 @@ Most transformer ops naturally support batch dimension. The hard cases:
 
 ```python
 # Load batch=1 model, run with batch=8
-session = ort2.load("model.onnx", options={
+session = nxrt.load("model.onnx", options={
     "vmap.batch_size": "8",           # static batch
     "vmap.batch_inputs": "input_ids,attention_mask",  # which inputs are batched
 })
 # Now session.run accepts [8, seq_len] inputs
 
 # Dynamic batching (batch size varies per call)
-session = ort2.load("model.onnx", options={
+session = nxrt.load("model.onnx", options={
     "vmap.batch_size": "dynamic",
     "vmap.max_batch": "32",           # pre-compile up to 32
 })
@@ -4692,7 +4692,7 @@ Serverless: every cold start costs 500ms-5s. Unacceptable.
 
 ```rust
 pub struct CompilationCache {
-    cache_dir: PathBuf,  // default: ~/.cache/ort2/
+    cache_dir: PathBuf,  // default: ~/.cache/nxrt/
 }
 
 impl CompilationCache {
@@ -4744,15 +4744,15 @@ Cached load:   load_plan(50ms) → mmap_weights(10ms) → warm_kernels(50ms) = ~
 
 ```bash
 # Pre-compile (e.g. in Docker build step)
-ort2 compile model.onnx --output model.ort2plan --device gpu
+nxrt compile model.onnx --output model.nxrtplan --device gpu
 
 # Load pre-compiled (instant)
-ort2 run model.ort2plan --input data.npz
+nxrt run model.nxrtplan --input data.npz
 
 # Cache management
-ort2 cache list
-ort2 cache clear
-ort2 cache clear --older-than 30d
+nxrt cache list
+nxrt cache clear
+nxrt cache clear --older-than 30d
 ```
 
 ---
@@ -4833,7 +4833,7 @@ print(f"KV cache hit rate: {metrics.kv_cache_hit_rate:.1%}")
 
 ```bash
 # Prometheus endpoint (for serving)
-ort2 serve model.onnx --metrics-port 9090
+nxrt serve model.onnx --metrics-port 9090
 # GET http://localhost:9090/metrics → prometheus text format
 ```
 
@@ -4869,7 +4869,7 @@ ort2 serve model.onnx --metrics-port 9090
 | 3 | VMap (auto-batching) | **Yes** | Graph-level vectorization pass. batch=1 model → batch=N without re-export. |
 | 4 | Prefill/Decode split | **No (unified dual-track)** | Same session, two exec tracks. Disaggregated only for multi-node. |
 | 5 | Multi-session broker scheduling | **Yes** | Sessions request execution grants. Broker arbitrates by priority + fairness. |
-| 6 | Model resource estimation | **Yes (CLI + API)** | `ort2 inspect` and `ort2.estimate()` before loading. |
+| 6 | Model resource estimation | **Yes (CLI + API)** | `nxrt inspect` and `nxrt.estimate()` before loading. |
 | 7 | Streaming at runtime level | **No** | Runtime provides efficient repeated execution. Streaming is GenAI concern. |
 | 8 | Error message quality | **Yes (first-class)** | Every error: what/why/how-to-fix + docs link. |
 | 9 | CUDA error recovery | **Yes** | Context reset + session rebuild. One bad request doesn't kill server. |
@@ -4892,8 +4892,8 @@ what was computed, what shapes flowed where, what decisions the runtime made.
 ### 46.2 Design: Structured Execution Journal
 
 ```rust
-/// Enable with: options={"debug.trace_log": "/tmp/ort2-trace.jsonl"}
-/// or: ORT2_TRACE_LOG=/tmp/ort2-trace.jsonl
+/// Enable with: options={"debug.trace_log": "/tmp/nxrt-trace.jsonl"}
+/// or: ORT2_TRACE_LOG=/tmp/nxrt-trace.jsonl
 /// or: session.enable_trace_log("/tmp/trace.jsonl")
 pub struct TraceLogger {
     output: BufWriter<File>,  // append-only JSONL
@@ -4939,22 +4939,22 @@ pub enum TraceVerbosity {
 
 **Full verbosity adds tensor values (opt-in per node):**
 ```jsonl
-{"ts":201,"phase":"run","event":"kernel_exec","node":"layer.0.attn.q_proj","values":{"input_0":"tensor:sha256:a3f2...(saved to /tmp/ort2-tensors/run1_node0_in0.npy)","output_0":"tensor:sha256:b7e1...(saved to /tmp/ort2-tensors/run1_node0_out0.npy)"}}
+{"ts":201,"phase":"run","event":"kernel_exec","node":"layer.0.attn.q_proj","values":{"input_0":"tensor:sha256:a3f2...(saved to /tmp/nxrt-tensors/run1_node0_in0.npy)","output_0":"tensor:sha256:b7e1...(saved to /tmp/nxrt-tensors/run1_node0_out0.npy)"}}
 ```
 
 ### 46.4 User API
 
 ```python
-import ort2
+import nxrt
 
 # Enable via context manager
-with ort2.trace_log("/tmp/debug.jsonl", verbosity="ops") as log:
-    session = ort2.load("model.onnx")
+with nxrt.trace_log("/tmp/debug.jsonl", verbosity="ops") as log:
+    session = nxrt.load("model.onnx")
     output = session.run(input_ids=data)
 # File ready for inspection
 
 # Or session-level (persistent)
-session = ort2.load("model.onnx", options={
+session = nxrt.load("model.onnx", options={
     "debug.trace_log": "/tmp/trace.jsonl",
     "debug.trace_verbosity": "ops",       # decisions | ops | full
     "debug.capture_values": "layer.5.*",  # only capture values for layer 5
@@ -4966,10 +4966,10 @@ session = ort2.load("model.onnx", options={
 
 ```bash
 # CLI: run with tracing
-ort2 run model.onnx --input data.npz --trace-log /tmp/trace.jsonl --trace-verbosity ops
+nxrt run model.onnx --input data.npz --trace-log /tmp/trace.jsonl --trace-verbosity ops
 
 # Analyze the trace
-ort2 trace analyze /tmp/trace.jsonl
+nxrt trace analyze /tmp/trace.jsonl
 
 ┌───────────────────────────────────────────────────────┐
 │  Trace Analysis: /tmp/trace.jsonl                       │
@@ -4994,10 +4994,10 @@ ort2 trace analyze /tmp/trace.jsonl
 └───────────────────────────────────────────────────────┘
 
 # Compare two traces (e.g. before/after optimization)
-ort2 trace diff trace_v1.jsonl trace_v2.jsonl
+nxrt trace diff trace_v1.jsonl trace_v2.jsonl
 
 # Find where numerical divergence starts (full verbosity)
-ort2 trace bisect trace_ours.jsonl trace_ort.jsonl
+nxrt trace bisect trace_ours.jsonl trace_ort.jsonl
   → "Divergence starts at node layer.5.attn.gqa (output differs by 1e-3)"
 ```
 
@@ -5008,7 +5008,7 @@ without re-running the model:
 
 ```python
 # Load and query trace programmatically
-trace = ort2.TraceLog.load("/tmp/trace.jsonl")
+trace = nxrt.TraceLog.load("/tmp/trace.jsonl")
 
 # Query specific events
 for event in trace.filter(phase="run", event="pressure"):
@@ -5060,7 +5060,7 @@ pub enum IssueCategory {
 ```
 
 ```bash
-$ ort2 trace diagnose /tmp/trace.jsonl
+$ nxrt trace diagnose /tmp/trace.jsonl
 
 ⚠️  Memory thrashing detected
    Evidence: 12 pressure events in 500ms, same pages evicted and re-fetched
@@ -5215,7 +5215,7 @@ impl TraceContext {
 When opened in Perfetto UI, the unified trace shows:
 
 ```
-Process: ort2 (pid=1)
+Process: nxrt (pid=1)
 ├─ Thread: genai.scheduler      → request lifecycle, batch decisions
 ├─ Thread: genai.sampler        → sampling, speculation, logit processing
 ├─ Thread: genai.kv_cache       → page alloc/evict/migrate/prefix_match
@@ -5268,11 +5268,11 @@ impl InferenceSession {
 ### 48.6 User API
 
 ```python
-import ort2
+import nxrt
 
 # Unified trace: one file, both layers
-with ort2.trace("/tmp/unified.perfetto", format="perfetto") as t:
-    engine = ort2.GenAiEngine("model.onnx", trace=t)
+with nxrt.trace("/tmp/unified.perfetto", format="perfetto") as t:
+    engine = nxrt.GenAiEngine("model.onnx", trace=t)
     for token in engine.generate_stream("Hello"):
         print(token, end="")
 # Open /tmp/unified.perfetto in Perfetto UI
@@ -5283,7 +5283,7 @@ with ort2.trace("/tmp/unified.perfetto", format="perfetto") as t:
 
 ```bash
 # CLI
-ort2 run model.onnx --trace /tmp/trace.perfetto --trace-format perfetto
+nxrt run model.onnx --trace /tmp/trace.perfetto --trace-format perfetto
 
 # Merge with other Perfetto traces (e.g. from GitHub Copilot)
 # Both use standard perfetto.protos.Trace — can view side by side in Perfetto UI
@@ -5416,7 +5416,7 @@ Auto logic:
 ### 49.5 User API
 
 ```python
-engine = ort2.GenAiEngine("base_model.onnx")
+engine = nxrt.GenAiEngine("base_model.onnx")
 
 # Load adapters
 engine.load_lora("coding_assistant", "lora_coding.safetensors")
@@ -5766,7 +5766,7 @@ impl AdaptiveEviction {
 ### 52.4 User API
 
 ```python
-session = ort2.load("model.onnx", options={
+session = nxrt.load("model.onnx", options={
     "cache.eviction_policy": "hybrid",      # lru | lfu | hybrid | adaptive
     "cache.frequency_weight": "0.6",
     "cache.recency_weight": "0.4",
@@ -5934,7 +5934,7 @@ Users shouldn't have to guess which features they need:
 
 ```bash
 # Analyze model and output the minimal feature set
-$ ort2 features model.onnx
+$ nxrt features model.onnx
 
 Required features for model.onnx:
   kernels-math         (MatMul, Add, Mul, Sub, Div)
@@ -5965,18 +5965,18 @@ Estimated binary size: ~8 MB (vs ~45 MB full)
 
 ```bash
 # Base package (CPU, transformer kernels)
-pip install ort2
+pip install nxrt
 
 # With CUDA
-pip install ort2[cuda]          # pulls onnx-runtime-ep-cuda wheel
+pip install nxrt[cuda]          # pulls onnx-runtime-ep-cuda wheel
 
 # With specific EP
-pip install ort2[mlx]           # Apple Silicon
-pip install ort2[webgpu]        # WebGPU
-pip install ort2[qnn]           # Qualcomm
+pip install nxrt[mlx]           # Apple Silicon
+pip install nxrt[webgpu]        # WebGPU
+pip install nxrt[qnn]           # Qualcomm
 
 # Minimal (no optional deps)
-pip install ort2 --no-deps
+pip install nxrt --no-deps
 ```
 
 ### 54.7 Design Choices
@@ -5985,7 +5985,7 @@ pip install ort2 --no-deps
 |--------|----------|----------|
 | Feature flags (not runtime config) | **Yes** | Dead code elimination at compile time. Actual binary size reduction. |
 | Kernel groups (not individual by default) | **Yes** | Practical granularity. Individual kernels as escape hatch. |
-| Model-driven feature detection | **Yes** | Users shouldn't guess. `ort2 features` tells them exactly what's needed. |
+| Model-driven feature detection | **Yes** | Users shouldn't guess. `nxrt features` tells them exactly what's needed. |
 | Missing kernel = clear compile-like error | **Yes** | Not a silent wrong result. Tells you what feature to add. |
 | Default = full | **Yes** | Most users want everything. Minimal is opt-in. |
 
@@ -6271,16 +6271,16 @@ _Depends on: Phase 2 complete_
 
 ### Phase 4: GenAI Integration (4-8 weeks)
 _Depends on: Phase 3 compute kernels working_
-- [ ] `backend-ort2` feature flag in onnx-genai-engine
+- [ ] `backend-nxrt` feature flag in onnx-genai-engine
 - [ ] KV cache on onnx-runtime-memory arenas
 - [ ] Continuous batching through onnx-runtime-scheduler
 - [ ] Paged FlashAttention with block table
 - [ ] End-to-end: ONNX model → GenAI server, zero ORT dependency
-- [ ] **Milestone: onnx-genai-server runs Llama with backend-ort2**
+- [ ] **Milestone: onnx-genai-server runs Llama with backend-nxrt**
 
 ### Phase 5: Ecosystem (ongoing)
 _Depends on: Phase 2 C API working_
-- [ ] Python bindings (`ort2` + per-EP packages)
+- [ ] Python bindings (`nxrt` + per-EP packages)
 - [ ] `onnx-runtime-autotuner`: Agent-driven optimization loop
 - [ ] More EP crates: mlx, coreml, webgpu, qnn, openvino, rocm
 - [ ] GGUF weight loading
