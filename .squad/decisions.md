@@ -1333,3 +1333,161 @@ cargo clippy -p onnx-runtime-loader --all-targets -- -D warnings  # clean
 **Commit:** `d3f0c0a`
 **What:** Added explicit mapping of `SessionError::DanglingEpContext` to `OrtErrorCode::InvalidGraph` in the non-exhaustive match in the CAPI layer. Retains an explicitly exhaustive `SessionError` match to preserve compile-time guard against future unhandled variants.
 **Why:** `DanglingEpContext` (a structurally invalid model reference — `main_context=0` EPContext node with no primary to resolve to) aligns with the existing IR/graph/optimizer/shape-inference error classification. Found via a full cross-crate build gate after the EPContext consume-path merge introduced the new variant on main.
+
+
+---
+
+### 2026-07-14T16:30:00Z: EPContext §55.4 WRITER / DUMP path (loader-owned, session-driven) — v1
+
+**By:** Batty (batty-16)
+**Commit:** `206742e`
+**What:** Implemented the EPContext dump/write path — the inverse of the consume path. After an EP compiles a partition, produces `<orig_stem>_ctx.onnx` with the compiled subgraph replaced by a single `com.microsoft::EPContext` node carrying the vendor blob.
+**Why:** §55.4 requirement. Enables EP compilation caching and model portability.
+
+#### API
+
+```rust
+pub struct EpContextDumpConfig { pub enable: bool; pub file_path: Option<PathBuf>; pub embed_mode: u8 }
+pub struct EpContextPartition<'a> { source, ep_sdk_version, partition_name, main_context, blob, covered_nodes }
+pub fn dump_ep_context(model, orig_path, partitions, config) -> Result<PathBuf, LoaderError>
+pub fn dump_session_ep_context(model, orig_path, partitions, config) -> Result<PathBuf>
+```
+
+#### Key design decisions
+- **Model-agnostic**: reuses loader's existing EPContext constants (`EP_CONTEXT_OP`, `MS_DOMAIN`); no new op/vendor/model literals in production code.
+- **embed_mode=1 (default)**: blob inlined via `Attribute::String(Vec<u8>)` — byte-exact, no UTF-8 decode.
+- **embed_mode=0**: sidecar `<ctx_stem>_<source>_<partition>.bin`; source/partition sanitized `[A-Za-z0-9._-]`, non-matching → `_`. Relative filename stored in node.
+- **Boundary computation**: inputs/outputs determined deterministically from ascending NodeId; optional slots preserved.
+- **Crate layering**: session driver bridges ep-api → loader; loader has no ep-api dependency.
+- **Tests**: 3 loader (embed round-trip, external sidecar, two-partition), 3 session (embed byte-exact, external, explicit file_path override).
+
+#### Follow-ups
+- SessionBuilder + capi options → `EpContextDumpConfig`
+- Real compile/partition wiring (CUDA/QNN)
+- Multi-graph `main_context=0` extension
+
+---
+
+### 2026-07-14T16:45:00Z: EPContext §55.4 writer v1 review (Gaff, gaff-12)
+
+**By:** Gaff (gaff-12, reviewer)
+**What:** 🟢 GREEN — byte-exact round-trip both modes; sidecar sanitizer resists path traversal. Two non-blocking advisories.
+**Why:** Non-author review of batty-16 writer v1 @ `7eb30ff`.
+
+#### Confirmed
+- embed_mode=1: `Attribute::String(Vec<u8>)` verbatim; non-UTF-8 blobs byte-exact (test blobs contain `0x80`, `0xFF`, `0xC3`, `0x28`).
+- embed_mode=0: `fs::write` verbatim; consume path mmaps back. Round-trip verified.
+- `sidecar_filename` sanitizer: every char not `[A-Za-z0-9._-]` → `_`; hostile inputs (`../../etc/passwd`, `..`, NUL, `\`, `/abs`, `....//`) all yield in-directory filenames; no `ParentDir`/`RootDir`/`Prefix` components.
+- Node boundary preserved: `X→EPContext→Y` after splice; `ins==["X"]`, `outs==["Y"]`; only EPContext node remains.
+- All tests reproduced: `cargo test -p onnx-runtime-loader` (15+3 ok); `cargo test -p onnx-runtime-session` (10 ok).
+
+#### Advisories (non-blocking)
+- **A**: Sidecar collision on duplicate sanitized (source, partition_name) — later write silently overwrites. Suggest `_<index>_` disambiguator.
+- **B**: Sanitizer test covers only `/`; add regression for `..`, NUL, `\`.
+
+---
+
+### 2026-07-14T16:45:00Z: EPContext §55.4 writer v1 re-review (Deckard, deckard-17)
+
+**By:** Deckard (deckard-17, reviewer)
+**What:** 🔴 **BLOCK** — B1: non-injective sidecar names silently overwrite a partition's blob (data loss). Revision owner: **Leon** (Batty locked out of this artifact).
+**Why:** Non-author review of batty-16 writer v1.
+
+#### Blocking finding
+- **B1**: `sidecar_filename` (`writer.rs:305-320`) uses only `<ctx_stem>_<sanitized source>_<sanitized partition>.bin`. `sanitize_component` is non-injective: `source="Vendor/EP"` and `source="Vendor_EP"` both → `Vendor_EP`; same `partition_name` → identical filename. Second `fs::write` (writer.rs:181-188) truncates first blob; both nodes store same relative path → `resolve_ep_context` returns wrong blob for both. §55.4 byte-exact round-trip violated for legal model-agnostic EP key.
+- **Fix required**: injective/hashed identity or collision detection + disambiguation; add two-partition external-mode round-trip test with colliding sanitized components.
+- **Test gap**: external test covers only one partition; multi-partition test uses embedded mode.
+
+#### Non-blocking (A1, A2)
+- A1: `enable` flag ignored — both dump functions write files even when `enable=false`.
+- A2: `partition_boundary` ascending-NodeId order undocumented as ABI.
+
+#### Passing scope
+- Model-agnosticism ✅; API/seam ✅; subgraph replacement ✅; consume-path symmetry ✅ (except B1).
+
+---
+
+### 2026-07-14T17:30:00Z: EPContext §55.4 writer v2 — collision fix + enable-gating (Leon, leon-14)
+
+**By:** Leon (leon-14, revision owner)
+**Commit:** `7a01f5f` (= `d9a4b6f` on branch)
+**What:** Fixed B1 data-loss sidecar aliasing; folded in A1 enable-gating and A2 seam documentation.
+**Why:** Deckard deckard-17 🔴 BLOCK; Batty locked out. Leon owns revision.
+
+#### B1 fix
+- Sidecar filename now: `<ctx_stem>_p{index}_<sanitized source>_<sanitized partition>.bin`. Partition index from `enumerate()` is injective and deterministic within one dump call — even colliding sanitized components produce distinct files. Each EPContext node stores the filename of its OWN blob.
+- **Exact-identity guard**: two partitions sharing the same `source` AND `partition_name` rejected with `LoaderError::EpContext("duplicate partition identity …")`.
+
+#### A1 fix
+- `dump_ep_context`: if `!config.enable`, returns path and writes nothing (no sidecars, no model, no side effects before any I/O).
+- `dump_session_ep_context`: short-circuits before calling any EP's `save_context`.
+
+#### A2 doc
+- Added doc-comment on `partition_boundary` seam: NodeId order is not a versioned ABI; integration owner must verify or extend.
+
+#### Tests added
+- `external_dump_colliding_sanitised_sources_do_not_alias` (B1 regression): `Vendor/EP` vs `Vendor_EP`, same partition_name, distinct non-UTF-8 blobs → `p0`/`p1` sidecars distinct; each node resolves its own blob byte-exact.
+- `disabled_config_writes_nothing`; `duplicate_partition_identity_is_rejected`; `hostile_source_strings_sanitise_to_safe_bare_filename`.
+- Session: `dump_disabled_config_is_a_no_op`.
+
+---
+
+### 2026-07-14T17:45:00Z: EPContext §55.4 writer v2 re-review (Deckard, deckard-18)
+
+**By:** Deckard (deckard-18, re-reviewer)
+**What:** 🔴 **BLOCK** — B1 resolved, but exact-identity rejection OVER-FIRES on legitimate distinct primary partitions. Revision owner: **Gaff** (Batty and Leon locked out).
+**Why:** Re-review of leon-14 writer v2.
+
+#### B1: resolved ✅
+- `enumerate()` provides unique index per partition → `_p{index}_` sidecar names cannot repeat within one dump call.
+- B1 regression test reproduced: `1 passed; 0 failed`.
+- Hostile-string sanitizer and traversal guard intact.
+
+#### Blocking regression
+- v2 blanket-rejects any repeated `(source, partition_name)` pair (`writer.rs:147-160`).
+- `partition_name` is optional; an EP can legitimately emit multiple unnamed primary partitions (`main_context=1`).
+- Consume path (`session/src/epcontext.rs:109-142`) loads every `main_context=1` node independently; duplicate primary identities are fully loadable with injective sidecar names keeping blobs distinct.
+- Session writer emits EVERY partition as `main_context=true` → two distinct same-EP unnamed partitions are wrongly rejected.
+- The rejection test (`loader/tests/writer.rs:319-362`) codifies a false restriction.
+
+#### A1: verified ✅; all other suites pass.
+
+---
+
+### 2026-07-14T17:50:00Z: EPContext §55.4 writer v3 — over-broad rejection removed (Gaff, gaff-13)
+
+**By:** Gaff (gaff-13, revision owner)
+**Commit:** `0fa025e` (= `6e65e85` on branch)
+**What:** Removed the blanket `(source, partition_name)` duplicate-primary rejection introduced in v2. Added positive round-trip proof for two same-source primaries.
+**Why:** Deckard deckard-18 🔴 BLOCK. Batty and Leon locked out.
+
+#### Change
+- Deleted duplicate-identity `HashSet<(&str, &str)>` guard and loop from `dump_ep_context`.
+- Updated `# Errors` doc-comment: two partitions may legitimately share `source`+`partition_name` (safe because of injective per-partition sidecar index + independent consume-path loading).
+- Deleted `duplicate_partition_identity_is_rejected` test.
+- Added `duplicate_primary_identity_round_trips_external`: two `main_context=true` partitions, same `source="EpA"`, empty `partition_name`, distinct non-UTF-8 blobs, external mode → `m_ctx_p0_EpA.bin`/`m_ctx_p1_EpA.bin` exist with own blobs; reload via `load_model → ep_context_nodes → resolve_ep_context` confirms `r0==b0`, `r1==b1`, `r0!=r1`.
+
+#### Kept intact
+- B1 injective sidecar filenames; A1 enable-gating; A2 NodeId-order seam doc; broadened sanitizer test.
+
+---
+
+### 2026-07-14T18:00:00Z: EPContext §55.4 writer v3 re-review (Deckard, deckard-19)
+
+**By:** Deckard (deckard-19, re-reviewer)
+**What:** 🟢 **APPROVE** — regression closed; all green.
+**Why:** Re-review of gaff-13 writer v3 @ `6e65e85`.
+
+#### Findings
+- No `HashSet<(&str, &str)>`, `(part.source, part.partition_name)` insertion, or `"duplicate partition identity"` rejection remains in `writer.rs`. API now explicitly permits repeated identities at `writer.rs:124-132`.
+- `duplicate_primary_identity_round_trips_external` passes: two same-identity primaries round-trip byte-exact through external mode; `m_ctx_p0_EpA.bin`/`m_ctx_p1_EpA.bin` confirmed distinct.
+- B1 still fixed: `_p{index}_` sidecar names at `writer.rs:168-169, 205-212`; sanitizer-collision regression (`tests/writer.rs:207-279`) passes.
+- A1/A2/sanitizer all intact and verified.
+
+#### Verification
+- `cargo test -p onnx-runtime-loader`: PASS (encoder 9, EPContext 7, loader 15, writer 7; 0 failed).
+- `cargo test -p onnx-runtime-session`: PASS (unit 12, conformance 1, optimizer parity 3, EPContext 11, executor 11; 0 failed).
+- `cargo clippy -p onnx-runtime-loader -p onnx-runtime-session --all-targets -- -D warnings`: PASS.
+- Eight-crate `cargo build`: PASS.
+
+**Final merged commit on main: `0fa025e`.**

@@ -66,3 +66,13 @@ Diagnosed bert_toy LayerNorm as 10-op split-diff variant. Added `try_match_layer
 - 7 new tests (MockCompiledEp): embed/external round-trip, unclaimed/dedup/dangling/dup-source/session-level. All green; clippy clean; no new unsafe.
 - Merged to main `46f2861`. Reviews: Deckard (deckard-15) 🟡, Chew (chew-23) 🟡.
 - Advisory owners (Batty locked out): A1 covered_nodes dedup gap; A2 duplicate primary detection; A4 session-level traversal test (owner: Pris per Chew).
+
+## 2026-07-14T18:20:00Z — batty-16: ORT2 EPContext §55.4 writer v1
+
+- **Task:** Implement EPContext dump/write path — the inverse of the consume path (batty-15).
+- **Delivered:** `206742e` — `dump_ep_context`, `EpContextDumpConfig`, `EpContextPartition`, embed+external sidecar, subgraph replacement, 3 loader + 3 session tests.
+- **Model-agnostic**: reuses loader's existing constants; no new op/vendor literals in production code.
+- **embed_mode=1**: `Attribute::String(Vec<u8>)` byte-exact; **embed_mode=0**: sidecar beside model, bare relative filename.
+- **Reviews**: gaff-12 🟢 (advisories A+B); deckard-17 🔴 B1 data-loss — non-injective sidecar names silently overwrite partition blobs.
+- **LOCKED OUT** of this artifact after deckard-17 rejection. Leon owned v2 revision; Gaff owned v3 revision.
+- Final commit on main: `0fa025e` (gaff-13 v3).

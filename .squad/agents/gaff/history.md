@@ -47,3 +47,19 @@ Gaff's review is now in decisions: engine.rs is a ~3,300-line god module. Refact
 
 ## 2026-07-14T16:20:00Z — onnx-encoder v1 review (gaff-11)
 Reviewed Roy's ONNX encoder v1 (`9ffd65c`). 🟢 GREEN — round-trip fidelity and prost encoding correct for Phase-1/2 scope. Real BERT fixture (257 KB) byte-exact. 4 non-blocking advisories: A1 subgraph formal I/O silently omitted (recommend guard), A2 model metadata silently defaulted, A3 STRING byte-exact doc nuance, A4 external re-inlining bloat. Did not identify the §55.6 model-agnostic violation (found by Leon). Not locked out.
+
+## 2026-07-14T16:45:00Z — gaff-12: Review EPContext §55.4 writer v1 (batty-16)
+
+- **Reviewed:** `squad/ort2-epctx-writer` @ `7eb30ff` (author: Batty). Scope: round-trip fidelity + path/security safety.
+- **Verdict:** 🟢 GREEN — byte-exact both modes; sidecar sanitizer resists path traversal. No blocking findings.
+- **Confirmed**: embed non-UTF-8 byte-exact; external sidecar verbatim write+mmap; hostile inputs (traversal sequences, NUL, `\`) all sanitized to in-directory filenames; node boundary `X→EPContext→Y` preserved.
+- **Advisory A**: sidecar collision on duplicate sanitized (source, partition_name) — suggested index disambiguator. **Advisory B**: sanitizer test covers only `/`.
+- Reproduced: loader 15+3 ok; session 10 ok.
+
+## 2026-07-14T17:50:00Z — gaff-13: EPContext §55.4 writer v3 (revision owner, deckard-18 named)
+
+- **Task:** Fix deckard-18's 🔴 blocking regression — remove over-broad `(source, partition_name)` duplicate-primary rejection from leon-14 v2. Batty and Leon locked out.
+- **Change:** Deleted blanket `HashSet<(&str, &str)>` guard in `dump_ep_context`; updated `# Errors` doc-comment; deleted `duplicate_partition_identity_is_rejected` test.
+- **Added:** `duplicate_primary_identity_round_trips_external` — two same-source/same-(empty)-name primaries, distinct non-UTF-8 blobs, external mode → `m_ctx_p0_EpA.bin`/`m_ctx_p1_EpA.bin` distinct; each reloaded byte-exact.
+- **Kept intact:** B1 injective `_p{index}_` sidecar names; A1 enable-gating; A2 NodeId seam doc; sanitizer test.
+- **Commit:** `0fa025e` (= `6e65e85`). **deckard-19 🟢 APPROVE.** Final merged commit on main.

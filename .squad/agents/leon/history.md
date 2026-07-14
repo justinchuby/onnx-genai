@@ -88,3 +88,13 @@ Chew reviewed (read-only, 🟡 SHIP-with-advisories): layout correctness confirm
 ## 2026-07-14T16:20:00Z — onnx-encoder v1 block + v2 approval (leon-12, leon-13)
 **leon-12:** 🔴 BLOCK on encoder v1 — generic `encode_attribute` branched on op/attribute-name literals (`is_ep_context_op`, `"ep_cache_context"`) in the generic layer, violating §55.6 model-agnostic hard rule. Named Deckard as revision owner; Roy locked out of encoder artifact.
 **leon-13:** 🟢 APPROVE on encoder v2 (`55c7608` over `9ffd65c`) — blocking violation fully resolved; no `ep_cache_context` or `is_ep_context_op` in generic encode/decode layers; byte-exact round-trip via generic STRING path confirmed. 31 loader + 34 session + 40 IR tests green.
+
+## 2026-07-14T17:30:00Z — leon-14: EPContext §55.4 writer v2 (revision owner, deckard-17 named)
+
+- **Task:** Fix B1 data-loss sidecar aliasing from deckard-17's 🔴 rejection of batty-16. Batty locked out.
+- **B1 fix:** Sidecar filename now `<ctx_stem>_p{index}_<sanitized source>_<sanitized partition>.bin`. Partition index from `enumerate()` is injective and deterministic — colliding sanitized names produce distinct files.
+- **A1 fix:** Both `dump_ep_context` and `dump_session_ep_context` short-circuit on `!config.enable` with zero side effects.
+- **A2:** Added doc-comment on `partition_boundary` seam: NodeId order not a versioned ABI.
+- **Exact-identity guard (introduced, later removed):** Same (source, partition_name) twice → `LoaderError::EpContext("duplicate partition identity …")`.
+- **Commit:** `7a01f5f` (= `d9a4b6f`).
+- **Review:** deckard-18 🔴 BLOCK — B1 resolved but identity rejection over-fires on legitimate distinct primaries. **Leon locked out.** Gaff named as next revision owner.
