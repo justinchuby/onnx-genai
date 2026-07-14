@@ -2779,6 +2779,10 @@ impl MemoryBudget {
 3. Preempt running standard sessions (recompute from last checkpoint)
 4. Never touch interactive sessions unless OOM
 
+These page-based budgets are driven by the byte-denominated, user-tunable ceilings in
+§26.11 (Resource Governor): the governor derives `total_pages` / `interactive_reserve`
+from `vram_limit` and invokes these same tiers when a limit is lowered at runtime.
+
 ### 26.5 Batched Prefill (Chunked)
 
 When multiple agents start simultaneously (e.g., Flightdeck spawns 5 workers):
@@ -2951,6 +2955,389 @@ serving:
     enabled: true
     min_refcount_to_pin: 2     # pin after 2+ sessions use same prefix
 ```
+
+### 26.11 Resource Governor (User-Controllable Dynamic Budgets)
+
+Everything above expresses memory budgets in **pages and tokens** (`total_pages`,
+`max_total_tokens`, `max_pages_per_session`) fixed at startup. That is the right
+*internal* currency, but it is not how a user thinks about a machine. A user thinks
+in **absolute bytes**: *"use at most 8 GB of VRAM and 16 GB of host RAM for this
+model, and let me turn that down while a game is running."* The **Resource Governor**
+is the engine-level component that owns those user-facing byte budgets, maps them
+down onto the existing page/token machinery, and lets the user **adjust them live**.
+
+It does not replace the §26.4 `MemoryBudget` or the §3.2.3 tiered store — it sits
+**above** them as the single source of truth for *how many bytes we are allowed to
+use per tier*, and drives them:
+
+```
+        ┌──────────────────────────────────────────────┐
+        │  ResourceGovernor  (engine-level, 1 per device)│  ← user sets bytes here
+        │  vram_limit / host_ram_limit / disk_spill_limit│
+        └───────────────┬───────────────────────────────┘
+                        │ derives (bytes → pages/tokens)
+          ┌─────────────┼──────────────────────────┐
+          ▼             ▼                           ▼
+   MemoryBudget    Tiered Store (§3.2.3)     Scheduler (§26.4/§26.7)
+   total_pages     GPU HBM ↔ RAM ↔ SSD       admission / eviction
+   (§26.4)         per-tier byte ceilings
+```
+
+The byte limit is authoritative; **pages are derived**, never the reverse.
+
+#### 26.11.1 User-Facing Limit Model
+
+The user sets an absolute, per-tier ceiling. Each limit is expressible three ways —
+absolute bytes, a fraction of auto-detected device capacity, or `Auto` (the default):
+
+```rust
+/// A single resource ceiling, resolved against detected device capacity.
+#[derive(Debug, Clone, Copy)]
+pub enum ResourceLimit {
+    /// Absolute ceiling, e.g. `Bytes(8 << 30)` for 8 GiB.
+    Bytes(u64),
+    /// Fraction of detected tier capacity, e.g. `Fraction(0.9)` = 90% of total VRAM.
+    Fraction(f32),
+    /// Auto-detect a sane default (see below).
+    Auto,
+}
+
+/// User-facing resource budget for one engine on one device.
+#[derive(Debug, Clone)]
+pub struct ResourceLimits {
+    /// Accelerator memory ceiling (the "hot" tier — GPU HBM / NPU / iGPU).
+    pub vram_limit: ResourceLimit,
+    /// Host RAM ceiling for the "warm" offload tier (§3.2.3).
+    pub host_ram_limit: ResourceLimit,
+    /// Optional ceiling for the "cold" SSD spill tier. `None` disables disk spill.
+    pub disk_spill_limit: Option<ResourceLimit>,
+}
+
+impl Default for ResourceLimits {
+    fn default() -> Self {
+        Self {
+            // 90% of detected accelerator memory, leaving headroom for the
+            // driver, display, and other processes.
+            vram_limit: ResourceLimit::Fraction(0.90),
+            // 25% of detected host RAM for the warm offload tier.
+            host_ram_limit: ResourceLimit::Fraction(0.25),
+            // Disk spill off by default (opt-in — it trades latency for capacity).
+            disk_spill_limit: None,
+        }
+    }
+}
+```
+
+**Capacity detection is model- and vendor-neutral** (RULES.md #2). The governor asks
+each tier's capacity provider for total/free bytes — accelerator memory via the active
+EP's device query, host RAM via the OS, disk via the spill directory's filesystem —
+and never hardcodes a vendor or device name. We speak of *accelerator* / *device*, not
+any specific GPU brand.
+
+**Mapping bytes → pages (the core reconciliation with §26.4).** The byte ceiling is
+resolved to a concrete `resolved_vram_bytes`, from which a *hot-tier KV byte budget* is
+derived by subtracting the non-KV components the §33 gauges already decompose:
+
+```rust
+/// Derive the page/token budget (§26.4) from a resolved byte ceiling.
+fn derive_kv_budget(resolved_vram_bytes: u64, m: &VramBreakdown, kv: &ModelKvConfig)
+    -> DerivedBudget
+{
+    // Reserve the fixed, non-KV VRAM consumers first (see §33.6 gauges).
+    let reserved = m.model_weights_bytes      // static weights
+                 + m.activations_bytes        // peak activation working set
+                 + m.ort_overhead_bytes;      // arena / session / EP overhead
+    // Whatever remains is the KV cache byte budget.
+    let kv_bytes = resolved_vram_bytes.saturating_sub(reserved);
+    // Convert to pages using the per-layer-group page byte size (§3.2.5 —
+    // heterogeneous head dims mean pages differ in size, so budget in bytes
+    // then floor-divide per group).
+    let total_pages = kv.pages_for_bytes(kv_bytes);
+    // Token budget for the scheduler (§3.4.2) is pages × page_size (per group).
+    let max_total_tokens = kv.tokens_for_pages(total_pages);
+    DerivedBudget { kv_bytes, total_pages, max_total_tokens, reserved_bytes: reserved }
+}
+```
+
+`total_pages` and `max_total_tokens` computed here are exactly the fields consumed by
+§26.4 `MemoryBudget` and §3.4.2 `SchedulerConfig` — the governor **writes** them; it
+does not introduce a parallel budget. If `derive_kv_budget` yields a KV budget too
+small to hold even one page (weights alone exceed the ceiling), that is a startup error
+with the full what/why/how contract (see §26.11.5).
+
+#### 26.11.2 Runtime Adjustability
+
+The governor is reconfigurable **live**, mid-session, without restarting the engine or
+dropping sessions unnecessarily:
+
+```rust
+impl ResourceGovernor {
+    /// Replace the entire limit set atomically. Re-derives page/token budgets,
+    /// then reconciles current usage against the new ceilings.
+    pub fn reconfigure(&self, limits: ResourceLimits) -> Result<ReconfigureOutcome, ResourceError>;
+
+    /// Convenience shims (map onto `reconfigure`).
+    pub fn set_vram_limit(&self, limit: ResourceLimit) -> Result<ReconfigureOutcome, ResourceError>;
+    pub fn set_host_ram_limit(&self, limit: ResourceLimit) -> Result<ReconfigureOutcome, ResourceError>;
+    pub fn set_disk_spill_limit(&self, limit: Option<ResourceLimit>) -> Result<ReconfigureOutcome, ResourceError>;
+
+    /// Current resolved ceilings and live usage per tier.
+    pub fn snapshot(&self) -> GovernorSnapshot;
+}
+
+/// What a reconfigure actually did.
+pub struct ReconfigureOutcome {
+    pub tier: Tier,
+    pub old_limit_bytes: u64,
+    pub new_limit_bytes: u64,
+    pub evicted_sessions: Vec<SessionId>,   // if lowered
+    pub bytes_reclaimed: u64,
+    pub swapped_in_sessions: Vec<SessionId>, // if raised
+}
+```
+
+**Semantics when a limit is LOWERED below current usage.** The governor re-derives the
+page budget, updates §26.4 `MemoryBudget.total_pages`, and if live usage now exceeds the
+new ceiling it drives the **existing §26.4 eviction tiers in order** until usage is under
+the new ceiling — no new eviction machinery is invented:
+
+1. Drop **background** sessions' KV (cheap to re-prefill).
+2. Offload **paused standard** sessions' KV to the warm tier (§3.2.3 CPU RAM) — subject
+   to the `host_ram_limit` also having headroom; if not, cascade to the cold tier or to
+   step 3.
+3. Preempt **running standard** sessions (recompute from last checkpoint on resume).
+4. **Interactive** sessions and the `interactive_reserve` are touched last, only if the
+   new ceiling is below even the reserved floor.
+
+The call **blocks until the engine is under the new ceiling or the tiers are exhausted**.
+Reconfigure is transactional: if the target cannot be met even after exhausting evictable
+tiers (e.g. the user asks for a VRAM limit below the pinned weights + interactive
+reserve), the governor **rejects the change, restores the previous ceiling**, and returns
+`ResourceError::CannotSatisfyLoweredLimit { .. }` (§26.11.5) rather than leaving the
+engine wedged in an impossible state. Lowering is best-effort-then-atomic: we try hard,
+but we never half-apply.
+
+**Semantics when a limit is RAISED.** The governor recomputes a larger page budget,
+raises `MemoryBudget.total_pages`, and admits more work: queued sessions become eligible,
+and KV previously offloaded to the warm/cold tiers is eligible to **swap back in** on
+next touch (or eagerly, up to the new headroom). Raising never evicts.
+
+**Thread-safety & placement.** The governor is **engine-level, one per device**, shared
+across all sessions (it spans cross-session scheduling — see §26.11.3). Limits are held
+behind an `ArcSwap<ResolvedLimits>` for lock-free reads on the hot admission path;
+`reconfigure` serializes writers with a mutex and coordinates with the scheduler so a
+lowering does not race concurrent allocations (new allocations observe the tightened
+ceiling immediately; the eviction sweep then reclaims the overage).
+
+#### 26.11.3 Interaction with Cross-Session Scheduling
+
+There is **exactly one governor per device**, and it is the global arbiter: the sum of
+all sessions' live usage is what it measures against `vram_limit`. A single runaway
+session therefore **cannot** blow the global VRAM budget — its allocations go through the
+same §26.4 `can_allocate` gate, which the governor now bounds in bytes.
+
+Per-session sub-limits nest **under** the global ceiling. `SessionConfig.max_pages`
+(§26.3) is reinterpreted as an *optional per-session cap that must be ≤ the derived global
+budget*; the governor rejects a per-session limit that exceeds the global ceiling with an
+actionable error. The `interactive_reserve` (§26.4) is carved out of the **derived** page
+budget, so lowering `vram_limit` shrinks both the shared pool and the reserve
+proportionally (the reserve fraction is preserved; its absolute size tracks the ceiling).
+
+```rust
+/// Global vs per-session reconciliation (invariant checked on every reconfigure).
+///   sum(session.max_pages or actual) ≤ budget.total_pages
+///   interactive_reserve = round(reserve_fraction × budget.total_pages)
+///   every per-session cap ≤ budget.total_pages − interactive_reserve
+```
+
+#### 26.11.4 Config & Programmatic Surfaces
+
+**YAML** (extends the §26.10 `memory:` block; byte-denominated keys are the new source of
+truth, `total_gpu_pages` becomes an optional *override/cap* rather than the primary knob):
+
+```yaml
+# server_config.yaml
+serving:
+  memory:
+    # --- Resource Governor: user-facing byte budgets (source of truth) ---
+    limits:
+      vram_limit: "8GiB"          # absolute; or "0.9" (fraction of detected VRAM); or "auto"
+      host_ram_limit: "16GiB"     # warm offload tier ceiling
+      disk_spill_limit: null      # cold tier; null = disabled (default)
+      allow_runtime_override: true # permit set_vram_limit / API reconfigure at runtime
+
+    # --- Derived / advanced (optional; clamp the governor's derivation) ---
+    interactive_reserve_pct: 20
+    eviction_policy: priority_then_lru
+    offload_to_cpu: true          # enables tier-2 offload on lowering
+    # total_gpu_pages: 2048       # optional hard cap; governor uses min(derived, this)
+```
+
+Byte strings accept `KiB/MiB/GiB` (binary) and `KB/MB/GB` (decimal); a bare float in
+`[0,1]` is a fraction; `"auto"` selects the default. Parsing rejects out-of-range
+fractions and unknown units with a what/why/how error (RULES.md #1).
+
+**Rust API** (already sketched above). The governor is reachable from the engine handle:
+
+```rust
+let engine = GenAiEngine::load(model, EngineConfig { limits, .. })?;
+engine.governor().set_vram_limit(ResourceLimit::Bytes(6 << 30))?; // turn down to 6 GiB live
+let snap = engine.governor().snapshot();
+println!("VRAM {} / {} bytes, headroom {}", snap.vram.used, snap.vram.limit, snap.vram.headroom);
+```
+
+**Python binding** (planned PyO3 surface — the user explicitly wants a tunable knob; must
+translate errors per RULES.md #1 into a dedicated exception, not a bare `RuntimeError`):
+
+```python
+engine.set_vram_limit("6GiB")          # or engine.set_vram_limit(0.75) for a fraction
+engine.set_host_ram_limit(8 * 1024**3)
+snap = engine.resource_snapshot()      # dict: per-tier used / limit / headroom bytes
+# Lowering below current usage raises nxrt.ResourceLimitError with .requested,
+# .available, .breakdown, and .suggestions attributes (see §26.11.5).
+```
+
+#### 26.11.5 Error & Debug Experience (RULES.md #1)
+
+This is the most important part. Over-budget and cannot-satisfy conditions must hold the
+user's hand — state **what** was requested vs available, **why** it cannot be satisfied
+(with the live tier breakdown reusing the §33.6 gauge decomposition), and **how** to fix
+it with concrete, numeric next steps.
+
+```rust
+/// Byte-denominated resource breakdown at the moment of failure (mirrors §33.6 gauges).
+#[derive(Debug, Clone)]
+pub struct VramBreakdown {
+    pub model_weights_bytes: u64,
+    pub kv_cache_bytes: u64,
+    pub activations_bytes: u64,
+    pub ort_overhead_bytes: u64,
+    pub total_bytes: u64,
+}
+
+#[derive(Debug)]
+pub enum ResourceError {
+    /// Allocation would exceed the current VRAM ceiling.
+    VramOverBudget {
+        requested_bytes: u64,
+        limit_bytes: u64,
+        available_bytes: u64,       // limit − in-use, after eviction attempts
+        breakdown: VramBreakdown,   // where the memory currently is
+        tier: Tier,
+        suggestions: Vec<Remedy>,   // rendered as the "how to fix" block
+    },
+    /// A lowering request cannot be met even after exhausting evictable tiers.
+    CannotSatisfyLoweredLimit {
+        requested_limit_bytes: u64,
+        floor_bytes: u64,           // weights + interactive_reserve + overhead
+        breakdown: VramBreakdown,
+        reclaimable_bytes: u64,     // what eviction *could* free
+        suggestions: Vec<Remedy>,
+    },
+    /// A per-session cap exceeds the global derived budget (§26.11.3).
+    SessionLimitExceedsGlobal { session: SessionId, requested_pages: usize, global_pages: usize },
+    /// Config parse problems (bad unit, out-of-range fraction, negative bytes).
+    InvalidLimitSpec { key: String, value: String, reason: String, examples: Vec<String> },
+}
+
+/// A concrete, actionable remedy the user can apply (rendered into the message).
+pub enum Remedy {
+    RaiseLimitTo(u64),
+    ReduceMaxTotalTokens { from: u32, to: u32 },
+    EnableCpuOffload,
+    EnableDiskSpill,
+    UseSmallerOrMoreQuantizedModel,
+    ReduceConcurrentSessions { from: usize, to: usize },
+}
+```
+
+`Display` for these enums renders the full contract. A verbatim sample of the
+`VramOverBudget` message a user sees when a lowered ceiling can't hold the working set:
+
+```
+error: VRAM budget exceeded — cannot admit this request within the 6.00 GiB limit.
+
+  what:  requested 512.0 MiB of KV cache; only 128.0 MiB is available under the limit.
+  why:   the 6.00 GiB VRAM ceiling is already 6.00 GiB committed on device "accelerator:0":
+           model weights ....... 4.10 GiB   (static, cannot evict)
+           KV cache ............ 1.35 GiB   (18 sessions; 512.0 MiB pinned as interactive reserve)
+           activations ......... 0.38 GiB   (peak working set)
+           runtime overhead .... 0.17 GiB   (arena + session + EP)
+         eviction reclaimed 0 B: all remaining KV belongs to interactive sessions
+         which the reserve policy protects.
+  how:   pick one —
+           • raise the VRAM limit to at least 6.38 GiB  (engine.set_vram_limit("6.38GiB"))
+           • lower max_total_tokens from 8192 to ~6100  (frees ~384 MiB of KV)
+           • enable CPU offload (memory.offload_to_cpu: true) to spill KV to host RAM
+           • load a smaller or more-quantized model variant (e.g. Q4 instead of Q8)
+```
+
+The `CannotSatisfyLoweredLimit` message follows the same shape, but its "why" reports the
+`floor_bytes` (weights + reserve + overhead) that the requested ceiling sits below, and
+its "how" leads with *raise the target to at least `floor_bytes`* plus model-shrink
+options. Never emit a bare "out of memory" or a leaked allocator string.
+
+Across FFI these map to a stable `nxrt_*` error code **and** the full rendered message
+(RULES.md #1); the PyO3 layer surfaces them as `nxrt.ResourceLimitError` carrying
+`requested`, `available`, `breakdown`, and `suggestions` as structured fields for
+AI-agent consumers.
+
+#### 26.11.6 Observability
+
+The governor exposes the user ceiling and live headroom alongside the existing §33.6
+breakdown gauges, so a user (or agent) can see how close they are to their own limit:
+
+```
+# Existing (§33.6) — where the bytes are:
+onnx_genai_vram_model_weights_bytes       gauge
+onnx_genai_vram_kv_cache_bytes            gauge
+onnx_genai_vram_activations_bytes         gauge
+onnx_genai_vram_ort_overhead_bytes        gauge
+onnx_genai_vram_total_bytes               gauge
+
+# New — the user ceiling and headroom (per tier, labeled by device/tier):
+onnx_genai_vram_limit_bytes               gauge  # current resolved VRAM ceiling
+onnx_genai_vram_headroom_bytes            gauge  # limit − total (may go negative pre-eviction)
+onnx_genai_host_ram_limit_bytes           gauge  # warm-tier ceiling
+onnx_genai_host_ram_used_bytes            gauge  # KV offloaded to host RAM
+onnx_genai_host_ram_headroom_bytes        gauge
+onnx_genai_disk_spill_limit_bytes         gauge  # cold-tier ceiling (0 if disabled)
+onnx_genai_disk_spill_used_bytes          gauge
+onnx_genai_governor_reconfigure_total     counter # label: direction=raise|lower, outcome=ok|rejected
+onnx_genai_governor_evicted_bytes_total   counter # bytes reclaimed by lowering-driven eviction
+```
+
+`vram_headroom_bytes = vram_limit_bytes − vram_total_bytes`; a persistently near-zero or
+negative headroom is the signal that a user should raise their limit or shrink their
+workload. `GovernorSnapshot` returns the same numbers programmatically for the Rust and
+Python surfaces.
+
+#### 26.11.7 Implementation Phasing
+
+The governor **builds on** components that are, as of this writing, DESIGN-only and not
+yet implemented — it does not require them to ship first, but its full behavior is gated
+on them:
+
+- [ ] **Capacity detection** — per-tier total/free byte query (accelerator via EP device
+      query, host via OS, disk via filesystem), vendor-neutral. *(new, small)*
+- [ ] **Byte ↔ page mapping** — `ModelKvConfig::pages_for_bytes` / `tokens_for_pages`
+      honoring heterogeneous per-group page sizes (§3.2.5), and `derive_kv_budget` using
+      the §33.6 breakdown. *(new — the core reconciliation)*
+- [ ] **`ResourceGovernor` type** — `ResourceLimits` resolution, `ArcSwap` ceilings,
+      `snapshot`. Depends on **KvCacheManager / tiered store (§3.2.3)** and
+      **`MemoryBudget` (§26.4)** existing. *(new)*
+- [ ] **Live `reconfigure` eviction path** — driving the §26.4 eviction tiers to reach a
+      lowered ceiling transactionally, and swap-in on raise. Depends on eviction/offload
+      (§26.4) being implemented. *(new — the other core piece)*
+- [ ] **Error surfaces** — `ResourceError` displays + `Remedy` rendering; FFI code+message
+      mapping; PyO3 `ResourceLimitError`. *(new, per RULES.md #1)*
+- [ ] **Config + gauges** — YAML `limits:` block parsing; `..._limit_bytes` /
+      `..._headroom_bytes` gauges wired into §33.6 exposition.
+
+The two genuinely new pieces are the **byte↔page mapping** and the **live-reconfigure
+eviction path**; the rest is surfacing and wiring over machinery already specified in
+§3.2.3 and §26.4. Everything stays model-agnostic and vendor-neutral (RULES.md #2): no
+hardcoded device or model names, capacity detected generically per tier.
 
 ---
 
@@ -5625,7 +6012,7 @@ onnx_genai_vram_total_bytes               gauge  # total GPU memory used
 # onnxruntime.dll size, total deployment size
 ```
 
-This gives users (and us) transparency into where memory goes — and helps identify optimization targets.
+This gives users (and us) transparency into where memory goes — and helps identify optimization targets. The user-facing byte ceilings and per-tier headroom gauges that build on this decomposition are specified in §26.11.6.
 
 ---
 
