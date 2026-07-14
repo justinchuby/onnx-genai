@@ -278,9 +278,12 @@ impl SessionBuilder {
     ///
     /// # Recognized options
     ///
-    /// | Key            | Values                     | Default  | Effect |
-    /// |----------------|----------------------------|----------|--------|
-    /// | `"optimization"` | `"none"`, `"basic"`, `"all"` | `"none"` | Graph optimization level (see [`OptimizationLevel`]). |
+    /// | Key                     | Values                       | Default  | Effect |
+    /// |-------------------------|------------------------------|----------|--------|
+    /// | `"optimization"`        | `"none"`, `"basic"`, `"all"` | `"none"` | Graph optimization level (see [`OptimizationLevel`]). |
+    /// | `"ep.context_enable"`   | `"0"`/`"1"`/`"false"`/`"true"` | `"0"`  | Dump a `*_ctx.onnx` EPContext model after compile (§21.4 / §55.4). |
+    /// | `"ep.context_file_path"`| any path                     | `<orig>_ctx.onnx` | Output path for the generated context model. |
+    /// | `"ep.context_embed_mode"`| `"0"` (external) / `"1"` (embed) | `"1"` | How the compiled blob is stored in each EPContext node. |
     ///
     /// `"optimization"` = `"none"` (the default) leaves the loaded graph
     /// untouched, so behavior is byte-identical to a runtime with no optimizer.
@@ -293,10 +296,26 @@ impl SessionBuilder {
         self
     }
 
-    /// Resolve the `"optimization"` option to an [`OptimizationLevel`], rejecting
-    /// any unknown option key or unparseable value.
-    fn optimization_level(options: &HashMap<String, String>) -> Result<OptimizationLevel> {
+    /// Parse every set session option in a single pass, rejecting any unknown
+    /// key or unparseable value up front (no silent compat shim — an
+    /// unrecognized key is a typo, never a no-op). Returns the resolved
+    /// [`OptimizationLevel`] and the EPContext dump config (§21.4 / §55.5)
+    /// driven by the `ep.context_*` keys.
+    ///
+    /// # Recognized keys
+    ///
+    /// * `"optimization"` → [`OptimizationLevel`] (`none` / `basic` / `all`).
+    /// * `"ep.context_enable"` → [`EpContextDumpConfig::enable`]
+    ///   (`1`/`0`/`true`/`false`, case-insensitive).
+    /// * `"ep.context_file_path"` → [`EpContextDumpConfig::file_path`] (an empty
+    ///   value clears it back to the `<orig>_ctx.onnx` default).
+    /// * `"ep.context_embed_mode"` → [`EpContextDumpConfig::embed_mode`]
+    ///   (`0` external file / `1` embed; any other value is rejected).
+    fn parse_options(
+        options: &HashMap<String, String>,
+    ) -> Result<(OptimizationLevel, EpContextDumpConfig)> {
         let mut level = OptimizationLevel::None;
+        let mut ctx = EpContextDumpConfig::default();
         for (key, value) in options {
             match key.as_str() {
                 "optimization" => {
@@ -308,12 +327,26 @@ impl SessionBuilder {
                         }
                     })?;
                 }
+                "ep.context_enable" => {
+                    ctx.enable = parse_bool_option(key, value)?;
+                }
+                "ep.context_file_path" => {
+                    // Empty/unset ⇒ None (fall back to `<orig>_ctx.onnx`).
+                    ctx.file_path = if value.trim().is_empty() {
+                        None
+                    } else {
+                        Some(PathBuf::from(value))
+                    };
+                }
+                "ep.context_embed_mode" => {
+                    ctx.embed_mode = parse_embed_mode(key, value)?;
+                }
                 // No compat shim: an unrecognized key is a typo, not a silent
                 // no-op.
                 _ => return Err(SessionError::UnknownOption { key: key.clone() }),
             }
         }
-        Ok(level)
+        Ok((level, ctx))
     }
 
     /// Build the session: load → detect device → optimize → compile → allocate.
@@ -338,7 +371,7 @@ impl SessionBuilder {
     /// Device selection is CPU-only (`auto_detect` yields the CPU EP), and
     /// "compile" resolves a kernel per node into the shape-keyed cache.
     pub fn build(self) -> Result<InferenceSession> {
-        let level = Self::optimization_level(&self.options)?;
+        let (level, ep_context_config) = Self::parse_options(&self.options)?;
 
         // `memory_limit`, `enable_profiling`, and non-CPU `device` preferences
         // are accepted but not yet acted on in Phase 1 (CPU-only executor).
@@ -366,11 +399,44 @@ impl SessionBuilder {
         // Optimize stage. Off by default; only runs when a level is selected.
         optimize_graph(&mut graph, level)?;
 
-        let mut session = InferenceSession::from_parts(graph, weights, &model_dir)?;
+        let mut session =
+            InferenceSession::from_parts(graph, weights, &model_dir, ep_context_config)?;
         if !self.warmup_shapes.is_empty() {
             session.warmup(&self.warmup_shapes)?;
         }
         Ok(session)
+    }
+}
+
+/// Parse a boolean-ish session-option value (§21.4). Accepts `1`/`0` and
+/// `true`/`false` (case-insensitive), mirroring how ORT's C API treats its
+/// `int`-typed `ep.context_enable` flag while also allowing the textual form.
+/// Any other value is a typo, surfaced as [`SessionError::InvalidOption`].
+fn parse_bool_option(key: &str, value: &str) -> Result<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" => Ok(true),
+        "0" | "false" => Ok(false),
+        _ => Err(SessionError::InvalidOption {
+            key: key.to_string(),
+            value: value.to_string(),
+            expected: "0, 1, true, false".to_string(),
+        }),
+    }
+}
+
+/// Parse the `ep.context_embed_mode` option (§21.4): `0` = external sidecar
+/// file, `1` = embed the blob inline. Any other value is rejected with
+/// [`SessionError::InvalidOption`] (mirroring [`OptimizationLevel::parse`]'s
+/// fail-closed rejection rather than silently clamping).
+fn parse_embed_mode(key: &str, value: &str) -> Result<u8> {
+    match value.trim() {
+        "0" => Ok(0),
+        "1" => Ok(1),
+        _ => Err(SessionError::InvalidOption {
+            key: key.to_string(),
+            value: value.to_string(),
+            expected: "0, 1".to_string(),
+        }),
     }
 }
 
@@ -419,6 +485,10 @@ pub struct InferenceSession {
     inputs: Vec<IoMeta>,
     outputs: Vec<IoMeta>,
     exec: executor::Executor,
+    /// EPContext dump config parsed from the `ep.context_*` session options
+    /// (§21.4). Drives [`InferenceSession::export_ep_context`]; disabled by
+    /// default so an ordinary session never touches the dump path.
+    ep_context_config: EpContextDumpConfig,
 }
 
 fn io_meta(graph: &onnx_runtime_ir::Graph, values: &[onnx_runtime_ir::ValueId]) -> Vec<IoMeta> {
@@ -459,6 +529,7 @@ impl InferenceSession {
             graph,
             std::sync::Arc::new(onnx_runtime_loader::WeightStore::new()),
             Path::new("."),
+            EpContextDumpConfig::default(),
         )
     }
 
@@ -466,6 +537,7 @@ impl InferenceSession {
         graph: onnx_runtime_ir::Graph,
         weights: std::sync::Arc<onnx_runtime_loader::WeightStore>,
         model_dir: &Path,
+        ep_context_config: EpContextDumpConfig,
     ) -> Result<Self> {
         let inputs = io_meta(&graph, &graph.inputs);
         let outputs = io_meta(&graph, &graph.outputs);
@@ -489,6 +561,7 @@ impl InferenceSession {
             inputs,
             outputs,
             exec,
+            ep_context_config,
         })
     }
 
@@ -531,6 +604,60 @@ impl InferenceSession {
         }
         self.exec.warmup()
     }
+
+    /// The EPContext dump configuration parsed from the `ep.context_*` session
+    /// options (§21.4). Disabled by default.
+    pub fn ep_context_config(&self) -> &EpContextDumpConfig {
+        &self.ep_context_config
+    }
+
+    /// The session's (post-optimize) compiled graph.
+    ///
+    /// This is the graph the executor runs and the same one
+    /// [`Self::export_ep_context`] serialises — a caller identifying the
+    /// [`NodeId`](onnx_runtime_ir::NodeId)s of a compiled partition (the
+    /// [`CompiledPartition::covered_nodes`]) must read them from here so they
+    /// reference the exact nodes the exporter will splice out. This is the
+    /// compiler-integration seam: a real compiling EP inspects this graph to
+    /// choose the subgraphs it claims.
+    pub fn graph(&self) -> &onnx_runtime_ir::Graph {
+        self.exec.graph()
+    }
+
+    /// Export a `com.microsoft::EPContext` context-cache model for this session
+    /// (§55.4 dump path), driven by the `ep.context_*` session options
+    /// ([`Self::ep_context_config`]).
+    ///
+    /// `orig_path` is the source model path the default output location
+    /// (`<orig>_ctx.onnx`) is derived from when `ep.context_file_path` is unset.
+    /// `partitions` are the EP-compiled partitions to serialise — each names the
+    /// [`ExecutionProvider`](onnx_runtime_ep_api::ExecutionProvider) that
+    /// compiled it, so the driver pulls the blob + SDK version via
+    /// [`save_context`](onnx_runtime_ep_api::ExecutionProvider::save_context) and
+    /// the `source` key via
+    /// [`context_source_keys`](onnx_runtime_ep_api::ExecutionProvider::context_source_keys)
+    /// (§55.6 — nothing is hardcoded).
+    ///
+    /// When `ep.context_enable` is `false` (the default) this is a **no-op**: no
+    /// EP `save_context` is called and no files are written; it returns the path
+    /// it *would* have written to.
+    ///
+    /// # Compiler-integration seam
+    ///
+    /// The Phase-1 CPU EP has **no compile step**, so no real EP yet yields
+    /// [`CompiledPartition`]s — `partitions` is therefore supplied by the
+    /// caller (proven end-to-end with a mock compiling EP in the crate tests).
+    /// TODO(compiler): when a real compiling EP lands, collect its partitions
+    /// from the compile/placement stage and call this internally at build time
+    /// so a session created with `ep.context_enable=1` dumps automatically.
+    pub fn export_ep_context(
+        &self,
+        orig_path: &Path,
+        partitions: &[CompiledPartition],
+    ) -> Result<PathBuf> {
+        let model = EncoderModel::new(self.exec.graph()).with_weights(self.exec.weights().as_ref());
+        dump_session_ep_context(&model, orig_path, partitions, &self.ep_context_config)
+    }
 }
 
 /// Load a model. Auto-detects the best available hardware (§20.2).
@@ -551,10 +678,17 @@ mod option_tests {
             .collect()
     }
 
+    fn level_of(pairs: &[(&str, &str)]) -> Result<OptimizationLevel> {
+        SessionBuilder::parse_options(&opts(pairs)).map(|(level, _)| level)
+    }
+
+    fn ctx_of(pairs: &[(&str, &str)]) -> Result<EpContextDumpConfig> {
+        SessionBuilder::parse_options(&opts(pairs)).map(|(_, ctx)| ctx)
+    }
+
     #[test]
     fn optimization_defaults_to_none_when_unset() {
-        let level = SessionBuilder::optimization_level(&opts(&[])).unwrap();
-        assert_eq!(level, OptimizationLevel::None);
+        assert_eq!(level_of(&[]).unwrap(), OptimizationLevel::None);
     }
 
     #[test]
@@ -565,21 +699,19 @@ mod option_tests {
             ("BASIC", OptimizationLevel::Basic),
             ("All", OptimizationLevel::All),
         ] {
-            let level = SessionBuilder::optimization_level(&opts(&[("optimization", v)])).unwrap();
-            assert_eq!(level, want, "value {v:?}");
+            assert_eq!(level_of(&[("optimization", v)]).unwrap(), want, "value {v:?}");
         }
     }
 
     #[test]
     fn unknown_option_key_is_rejected() {
-        let err = SessionBuilder::optimization_level(&opts(&[("optimisation", "all")])).unwrap_err();
+        let err = level_of(&[("optimisation", "all")]).unwrap_err();
         assert!(matches!(err, SessionError::UnknownOption { key } if key == "optimisation"));
     }
 
     #[test]
     fn invalid_optimization_value_is_rejected() {
-        let err =
-            SessionBuilder::optimization_level(&opts(&[("optimization", "aggressive")])).unwrap_err();
+        let err = level_of(&[("optimization", "aggressive")]).unwrap_err();
         assert!(matches!(
             err,
             SessionError::InvalidOption { key, value, .. } if key == "optimization" && value == "aggressive"
@@ -591,5 +723,79 @@ mod option_tests {
         assert!(OptimizationLevel::None.passes().is_empty());
         assert_eq!(OptimizationLevel::Basic.passes().len(), 2);
         assert_eq!(OptimizationLevel::All.passes().len(), 3);
+    }
+
+    // ── EPContext dump options (§21.4 / §55.5) ────────────────────────────────
+
+    #[test]
+    fn ep_context_defaults_to_disabled() {
+        let ctx = ctx_of(&[]).unwrap();
+        assert_eq!(ctx, EpContextDumpConfig::default());
+        assert!(!ctx.enable);
+        assert_eq!(ctx.file_path, None);
+        assert_eq!(ctx.embed_mode, 1);
+    }
+
+    #[test]
+    fn ep_context_enable_parses_bool_forms() {
+        for (v, want) in [
+            ("1", true),
+            ("0", false),
+            ("true", true),
+            ("TRUE", true),
+            ("false", false),
+            ("False", false),
+        ] {
+            let ctx = ctx_of(&[("ep.context_enable", v)]).unwrap();
+            assert_eq!(ctx.enable, want, "value {v:?}");
+        }
+    }
+
+    #[test]
+    fn ep_context_enable_rejects_garbage() {
+        let err = ctx_of(&[("ep.context_enable", "yes")]).unwrap_err();
+        assert!(matches!(
+            err,
+            SessionError::InvalidOption { key, value, .. }
+                if key == "ep.context_enable" && value == "yes"
+        ));
+    }
+
+    #[test]
+    fn ep_context_file_path_parses_and_empty_clears() {
+        let ctx = ctx_of(&[("ep.context_file_path", "/out/net_ctx.onnx")]).unwrap();
+        assert_eq!(ctx.file_path, Some(PathBuf::from("/out/net_ctx.onnx")));
+
+        // Empty value falls back to the `<orig>_ctx.onnx` default (None).
+        let ctx = ctx_of(&[("ep.context_file_path", "")]).unwrap();
+        assert_eq!(ctx.file_path, None);
+    }
+
+    #[test]
+    fn ep_context_embed_mode_parses_and_rejects() {
+        assert_eq!(ctx_of(&[("ep.context_embed_mode", "0")]).unwrap().embed_mode, 0);
+        assert_eq!(ctx_of(&[("ep.context_embed_mode", "1")]).unwrap().embed_mode, 1);
+
+        let err = ctx_of(&[("ep.context_embed_mode", "2")]).unwrap_err();
+        assert!(matches!(
+            err,
+            SessionError::InvalidOption { key, value, expected }
+                if key == "ep.context_embed_mode" && value == "2" && expected == "0, 1"
+        ));
+    }
+
+    #[test]
+    fn ep_context_options_combine_with_optimization() {
+        let (level, ctx) = SessionBuilder::parse_options(&opts(&[
+            ("optimization", "all"),
+            ("ep.context_enable", "1"),
+            ("ep.context_file_path", "/tmp/out_ctx.onnx"),
+            ("ep.context_embed_mode", "0"),
+        ]))
+        .unwrap();
+        assert_eq!(level, OptimizationLevel::All);
+        assert!(ctx.enable);
+        assert_eq!(ctx.file_path, Some(PathBuf::from("/tmp/out_ctx.onnx")));
+        assert_eq!(ctx.embed_mode, 0);
     }
 }

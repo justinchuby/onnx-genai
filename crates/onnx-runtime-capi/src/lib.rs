@@ -34,7 +34,7 @@ use std::ffi::{c_char, c_void, CStr, CString};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr;
 
-use onnx_runtime_session::{InferenceSession, SessionError, Tensor};
+use onnx_runtime_session::{InferenceSession, SessionBuilder, SessionError, Tensor};
 
 // ---------------------------------------------------------------------------
 // Status codes (§22)
@@ -277,8 +277,150 @@ pub unsafe extern "C" fn ort2_release_session(session: *mut OrtSession) {
 }
 
 // ---------------------------------------------------------------------------
-// OrtValue — opaque wrapper over Tensor
+// OrtSessionOptions — string key/value session configuration (§21.4 / §55.5)
 // ---------------------------------------------------------------------------
+
+/// Opaque session-options handle: an ordered bag of string key/value config
+/// entries set via [`ort2_add_session_config_entry`] (ORT's
+/// `AddSessionConfigEntry`) and consumed by [`ort2_create_session_with_options`].
+///
+/// This is the C-API path by which ORT tooling sets the `ep.context_*` options
+/// (§21.4) that drive the EPContext dump: the entries are forwarded verbatim to
+/// [`SessionBuilder::option`], so their parsing/validation lives in one place
+/// (the session layer) and the C API adds no divergent option logic.
+#[derive(Default)]
+pub struct OrtSessionOptions {
+    entries: Vec<(String, String)>,
+}
+
+/// Create an empty session-options handle, writing it to `*out`.
+///
+/// On success returns null and `*out` holds a handle to release with
+/// [`ort2_release_session_options`].
+///
+/// # Safety
+/// `out` must be a non-null, writable, well-aligned pointer to a
+/// `*mut OrtSessionOptions` slot.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ort2_create_session_options(
+    out: *mut *mut OrtSessionOptions,
+) -> *mut OrtStatus {
+    guard(|| {
+        if out.is_null() {
+            return Err((OrtErrorCode::InvalidArgument, "out pointer is null".into()));
+        }
+        // SAFETY: `out` is non-null and writable per the precondition.
+        unsafe { *out = Box::into_raw(Box::new(OrtSessionOptions::default())) };
+        Ok(())
+    })
+}
+
+/// Free a session-options handle from [`ort2_create_session_options`].
+/// Null-tolerant. Must be called *exactly once* per non-null handle.
+///
+/// # Safety
+/// `options`, if non-null, must be an unreleased handle from
+/// [`ort2_create_session_options`]. After this call the pointer is dangling.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ort2_release_session_options(options: *mut OrtSessionOptions) {
+    if options.is_null() {
+        return;
+    }
+    // SAFETY: non-null and an unreleased handle per the precondition.
+    drop(unsafe { Box::from_raw(options) });
+}
+
+/// Add a string key/value config entry to `options` (ORT's
+/// `AddSessionConfigEntry`). The entry is stored verbatim and only validated
+/// when a session is built from these options — an unknown key or invalid value
+/// surfaces then as `InvalidArgument` (mirroring [`SessionBuilder::build`]).
+///
+/// The `ep.context_enable` / `ep.context_file_path` / `ep.context_embed_mode`
+/// keys (§21.4) reach the session's EPContext dump config this way.
+///
+/// # Safety
+/// * `options` must be a non-null, unreleased handle from
+///   [`ort2_create_session_options`].
+/// * `key` and `value` must be non-null pointers to NUL-terminated, valid UTF-8
+///   C strings.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ort2_add_session_config_entry(
+    options: *mut OrtSessionOptions,
+    key: *const c_char,
+    value: *const c_char,
+) -> *mut OrtStatus {
+    guard(|| {
+        if options.is_null() {
+            return Err((OrtErrorCode::InvalidArgument, "options handle is null".into()));
+        }
+        if key.is_null() || value.is_null() {
+            return Err((OrtErrorCode::InvalidArgument, "key or value pointer is null".into()));
+        }
+        // SAFETY: non-null handle per the precondition.
+        let options = unsafe { &mut *options };
+        // SAFETY: non-null NUL-terminated C strings per the precondition.
+        let key = unsafe { CStr::from_ptr(key) }
+            .to_str()
+            .map_err(|_| (OrtErrorCode::InvalidArgument, "key is not valid UTF-8".into()))?;
+        let value = unsafe { CStr::from_ptr(value) }
+            .to_str()
+            .map_err(|_| (OrtErrorCode::InvalidArgument, "value is not valid UTF-8".into()))?;
+        options.entries.push((key.to_string(), value.to_string()));
+        Ok(())
+    })
+}
+
+/// Create a session from an on-disk model path, applying the string key/value
+/// config entries in `options` (§21.4 / §55.5). Each entry is forwarded to
+/// [`SessionBuilder::option`], so option parsing/validation is the session
+/// layer's (an unknown key or bad value fails here as `InvalidArgument`).
+///
+/// `options` may be null, in which case this behaves like
+/// [`ort2_create_session`] (no extra options).
+///
+/// # Safety
+/// * `model_path` must be a non-null pointer to a NUL-terminated, valid UTF-8
+///   C string.
+/// * `options`, if non-null, must be an unreleased handle from
+///   [`ort2_create_session_options`].
+/// * `out` must be a non-null, writable, well-aligned pointer to a
+///   `*mut OrtSession` slot.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ort2_create_session_with_options(
+    model_path: *const c_char,
+    options: *const OrtSessionOptions,
+    out: *mut *mut OrtSession,
+) -> *mut OrtStatus {
+    guard(|| {
+        if out.is_null() {
+            return Err((OrtErrorCode::InvalidArgument, "out pointer is null".into()));
+        }
+        // SAFETY: `out` is non-null and writable per the precondition.
+        unsafe { *out = ptr::null_mut() };
+        if model_path.is_null() {
+            return Err((OrtErrorCode::InvalidArgument, "model_path is null".into()));
+        }
+        // SAFETY: non-null NUL-terminated C string per the precondition.
+        let path = unsafe { CStr::from_ptr(model_path) }
+            .to_str()
+            .map_err(|_| (OrtErrorCode::InvalidArgument, "model_path is not valid UTF-8".into()))?;
+
+        let mut builder = SessionBuilder::new().model(path);
+        if !options.is_null() {
+            // SAFETY: non-null and an unreleased handle per the precondition.
+            for (key, value) in &unsafe { &*options }.entries {
+                builder = builder.option(key, value);
+            }
+        }
+
+        let inner = builder.build().map_err(session_err)?;
+        let handle = Box::into_raw(Box::new(OrtSession { inner }));
+        // SAFETY: `out` validated non-null and writable above.
+        unsafe { *out = handle };
+        Ok(())
+    })
+}
+
 
 /// Opaque tensor value handle wrapping an owned [`Tensor`].
 pub struct OrtValue {

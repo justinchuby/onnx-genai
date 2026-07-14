@@ -590,6 +590,19 @@ impl Executor {
         self.cache.stats()
     }
 
+    /// The compiled graph, retained for the §55.4 EPContext dump path: the
+    /// exporter needs the (post-optimize) graph to serialise a `*_ctx.onnx`
+    /// context-cache model with compiled partitions spliced out.
+    pub(crate) fn graph(&self) -> &Graph {
+        &self.graph
+    }
+
+    /// Live weight bytes backing the graph, needed alongside [`Self::graph`] so
+    /// the EPContext dump can encode initializers into the context model.
+    pub(crate) fn weights(&self) -> &Arc<WeightStore> {
+        &self._weights
+    }
+
     /// Warmup: re-touch the shape-keyed cache for the compiled plan so the first
     /// real `run` sees only cache hits (§11.3). Only meaningful for fully-static
     /// graphs, whose plan shapes are known at build; symbolic graphs cannot be

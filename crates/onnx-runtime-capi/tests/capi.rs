@@ -12,10 +12,12 @@ use std::path::PathBuf;
 use std::ptr;
 
 use onnx_runtime_capi::{
-    ort2_create_session, ort2_create_tensor, ort2_get_error_code, ort2_get_error_message,
-    ort2_get_tensor_data, ort2_get_tensor_dtype, ort2_get_tensor_rank, ort2_get_tensor_shape,
-    ort2_release_session, ort2_release_status, ort2_release_value, ort2_run, OrtErrorCode,
-    OrtSession, OrtValue,
+    ort2_add_session_config_entry, ort2_create_session, ort2_create_session_options,
+    ort2_create_session_with_options, ort2_create_tensor, ort2_get_error_code,
+    ort2_get_error_message, ort2_get_tensor_data, ort2_get_tensor_dtype, ort2_get_tensor_rank,
+    ort2_get_tensor_shape, ort2_release_session, ort2_release_session_options,
+    ort2_release_status, ort2_release_value, ort2_run, OrtErrorCode, OrtSession,
+    OrtSessionOptions, OrtValue,
 };
 use onnx_runtime_loader::proto::onnx;
 use prost::Message;
@@ -463,4 +465,115 @@ fn accessors_reject_null_value_handle() {
     let status = unsafe { ort2_get_tensor_data(ptr::null(), &mut data, &mut len) };
     assert!(!status.is_null());
     unsafe { ort2_release_status(status) };
+}
+
+// --- session-options / ep.context_* config plumbing (§21.4 / §55.5) --------
+
+/// Creating a session through `ort2_create_session_with_options` with the
+/// `ep.context_*` keys set forwards them to the `SessionBuilder` and succeeds —
+/// the options reach the session layer through the C-ABI string key/value path.
+#[test]
+fn create_session_with_ep_context_options_succeeds() {
+    let path = write_model("epctx_opts");
+    let c_path = cstring(path.to_str().unwrap());
+
+    let mut options: *mut OrtSessionOptions = ptr::null_mut();
+    let status = unsafe { ort2_create_session_options(&mut options) };
+    assert!(status.is_null(), "create_session_options should succeed");
+    assert!(!options.is_null());
+
+    for (k, v) in [
+        ("ep.context_enable", "1"),
+        ("ep.context_file_path", ""),
+        ("ep.context_embed_mode", "1"),
+    ] {
+        let ck = cstring(k);
+        let cv = cstring(v);
+        let status =
+            unsafe { ort2_add_session_config_entry(options, ck.as_ptr(), cv.as_ptr()) };
+        assert!(status.is_null(), "add_session_config_entry({k}) should succeed");
+    }
+
+    let mut session: *mut OrtSession = ptr::null_mut();
+    let status =
+        unsafe { ort2_create_session_with_options(c_path.as_ptr(), options, &mut session) };
+    assert!(status.is_null(), "create_session_with_options should succeed");
+    assert!(!session.is_null());
+
+    unsafe { ort2_release_session(session) };
+    unsafe { ort2_release_session_options(options) };
+}
+
+/// An unknown config key surfaces as `InvalidArgument` at session build — the
+/// C API adds no divergent option logic; validation is the session layer's.
+#[test]
+fn create_session_with_unknown_option_is_invalid_argument() {
+    let path = write_model("epctx_bad_key");
+    let c_path = cstring(path.to_str().unwrap());
+
+    let mut options: *mut OrtSessionOptions = ptr::null_mut();
+    let status = unsafe { ort2_create_session_options(&mut options) };
+    assert!(status.is_null());
+
+    let ck = cstring("ep.context_enabel"); // typo
+    let cv = cstring("1");
+    let status = unsafe { ort2_add_session_config_entry(options, ck.as_ptr(), cv.as_ptr()) };
+    assert!(status.is_null(), "adding an entry never validates");
+
+    let mut session: *mut OrtSession = ptr::null_mut();
+    let status =
+        unsafe { ort2_create_session_with_options(c_path.as_ptr(), options, &mut session) };
+    assert!(!status.is_null(), "unknown key must fail at build");
+    assert_eq!(
+        unsafe { ort2_get_error_code(status) },
+        OrtErrorCode::InvalidArgument
+    );
+    assert!(session.is_null());
+
+    unsafe { ort2_release_status(status) };
+    unsafe { ort2_release_session_options(options) };
+}
+
+/// An invalid `ep.context_embed_mode` value is rejected as `InvalidArgument`.
+#[test]
+fn create_session_with_invalid_embed_mode_is_invalid_argument() {
+    let path = write_model("epctx_bad_embed");
+    let c_path = cstring(path.to_str().unwrap());
+
+    let mut options: *mut OrtSessionOptions = ptr::null_mut();
+    let status = unsafe { ort2_create_session_options(&mut options) };
+    assert!(status.is_null());
+
+    let ck = cstring("ep.context_embed_mode");
+    let cv = cstring("2"); // only 0/1 are valid
+    let status = unsafe { ort2_add_session_config_entry(options, ck.as_ptr(), cv.as_ptr()) };
+    assert!(status.is_null());
+
+    let mut session: *mut OrtSession = ptr::null_mut();
+    let status =
+        unsafe { ort2_create_session_with_options(c_path.as_ptr(), options, &mut session) };
+    assert!(!status.is_null(), "invalid embed_mode must fail at build");
+    assert_eq!(
+        unsafe { ort2_get_error_code(status) },
+        OrtErrorCode::InvalidArgument
+    );
+
+    unsafe { ort2_release_status(status) };
+    unsafe { ort2_release_session_options(options) };
+}
+
+/// A null options handle makes `create_session_with_options` behave like the
+/// plain `create_session` (no extra options).
+#[test]
+fn create_session_with_null_options_is_like_plain_create() {
+    let path = write_model("epctx_null_opts");
+    let c_path = cstring(path.to_str().unwrap());
+
+    let mut session: *mut OrtSession = ptr::null_mut();
+    let status = unsafe {
+        ort2_create_session_with_options(c_path.as_ptr(), ptr::null(), &mut session)
+    };
+    assert!(status.is_null(), "null options should still build");
+    assert!(!session.is_null());
+    unsafe { ort2_release_session(session) };
 }

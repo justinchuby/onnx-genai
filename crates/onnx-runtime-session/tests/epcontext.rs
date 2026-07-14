@@ -650,3 +650,128 @@ fn dump_disabled_config_is_a_no_op() {
     let entries: Vec<_> = std::fs::read_dir(&dir).unwrap().collect();
     assert!(entries.is_empty(), "disabled config writes no files at all");
 }
+
+// ── §21.4 / §55.5 end-to-end through the public builder ───────────────────────
+
+/// End-to-end via the public `SessionBuilder`: the `ep.context_*` options are
+/// parsed into the session's dump config, and `export_ep_context` — driven by a
+/// **mock compiling EP** (Phase-1 CPU EP has no compile step) — writes a
+/// `*_ctx.onnx` at the configured `ep.context_file_path` whose embedded,
+/// non-UTF-8 blob reloads through the consume path byte-exact.
+#[test]
+fn builder_options_drive_export_byte_exact() {
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("epctx_builder_e2e");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // Write the original (two-Relu) model to disk.
+    let orig = dir.join("orig.onnx");
+    let (g, _covered_in_g) = build_partition_graph();
+    let bytes = onnx_runtime_loader::encode_model(&Model::new(&g)).expect("encode");
+    std::fs::write(&orig, &bytes).unwrap();
+
+    // Configured output path for the context model.
+    let ctx_out = dir.join("explicit_ctx.onnx");
+
+    // Build the session through the public builder, setting the ep.context_*
+    // options as string key/values (exactly the C-API path forwards).
+    let session = InferenceSession::builder()
+        .model(&orig)
+        .option("ep.context_enable", "1")
+        .option("ep.context_file_path", ctx_out.to_str().unwrap())
+        .option("ep.context_embed_mode", "1")
+        .build()
+        .expect("build session");
+
+    // The options parsed into the session's dump config.
+    let cfg = session.ep_context_config();
+    assert!(cfg.enable);
+    assert_eq!(cfg.file_path.as_deref(), Some(ctx_out.as_path()));
+    assert_eq!(cfg.embed_mode, 1);
+
+    // Identify the compiled partition's nodes from the session's own graph
+    // (the compiler-integration seam). Here: both Relus.
+    let covered: Vec<NodeId> = session
+        .graph()
+        .nodes
+        .iter()
+        .filter(|(_, n)| n.op_type == "Relu")
+        .map(|(id, _)| id)
+        .collect();
+    assert_eq!(covered.len(), 2, "two Relus form the partition");
+
+    // A mock EP that "compiled" the partition into a known non-UTF-8 blob.
+    let payload = compiled_blob();
+    let ep = MockCompiledEp::compiling(&payload, "5.5.5");
+    let parts = [CompiledPartition {
+        ep: &ep,
+        partition_name: "part0".to_string(),
+        covered_nodes: covered,
+    }];
+
+    // Export honours ep.context_enable + ep.context_file_path.
+    let out = session.export_ep_context(&orig, &parts).expect("export");
+    assert_eq!(out, ctx_out, "export writes to the configured file_path");
+    assert!(out.exists(), "context model written");
+
+    // Reload + consume: the embedded blob round-trips byte-exact.
+    let g2 = load_model(&out).expect("reload ctx model");
+    let ids: Vec<NodeId> = loader_ep_context_nodes(&g2).map(|n| n.node).collect();
+    assert_eq!(ids.len(), 1, "the partition collapsed to one EPContext node");
+
+    let mock = MockCompiledEp::new();
+    let placement = load_ep_context_nodes(&g2, &dir, &eps(&mock)).expect("consume");
+    assert_eq!(placement.handled.len(), 1);
+    assert_eq!(
+        mock.loaded(),
+        vec![payload],
+        "the exported blob round-tripped byte-exact through the builder path"
+    );
+}
+
+/// A session built with `ep.context_enable=0` (the default) writes **no** file
+/// when `export_ep_context` is called — the disabled config is a no-op even
+/// though a mock compiling EP is supplied.
+#[test]
+fn builder_disabled_export_writes_nothing() {
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("epctx_builder_disabled");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let orig = dir.join("orig.onnx");
+    let (g, _c) = build_partition_graph();
+    let bytes = onnx_runtime_loader::encode_model(&Model::new(&g)).expect("encode");
+    std::fs::write(&orig, &bytes).unwrap();
+
+    // No ep.context_* options → disabled by default.
+    let session = InferenceSession::builder()
+        .model(&orig)
+        .build()
+        .expect("build session");
+    assert!(!session.ep_context_config().enable);
+
+    let covered: Vec<NodeId> = session
+        .graph()
+        .nodes
+        .iter()
+        .filter(|(_, n)| n.op_type == "Relu")
+        .map(|(id, _)| id)
+        .collect();
+    let ep = MockCompiledEp::compiling(&compiled_blob(), "0.0.0");
+    let parts = [CompiledPartition {
+        ep: &ep,
+        partition_name: "p".to_string(),
+        covered_nodes: covered,
+    }];
+
+    let out = session.export_ep_context(&orig, &parts).expect("export no-op");
+    assert_eq!(out, dir.join("orig_ctx.onnx"), "returns the would-be path");
+    assert!(!out.exists(), "disabled config writes no ctx model");
+
+    // Only the original model exists in the dir.
+    let names: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names, vec!["orig.onnx".to_string()], "no extra files written");
+}
