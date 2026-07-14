@@ -5526,7 +5526,181 @@ GPU tier get eagerly loaded; CPU/SSD-tier weights stay lazy until needed.
 
 ---
 
-## 54. Phased Roadmap
+## 54. Minimal Build & Binary Size Control
+
+### 54.1 Problem
+
+Full runtime with all kernels, all EPs, tracer, and diagnostics = large binary.
+Edge/mobile/WASM/embedded users need minimal builds. Server users want everything.
+
+### 54.2 Design: Feature Flags + Kernel Selection
+
+**Cargo features (compile-time):**
+
+```toml
+# crates/onnx-runtime-session/Cargo.toml
+[features]
+default = ["full"]
+
+# Presets
+full = ["kernels-all", "tracer", "cuda", "diagnostics"]
+minimal = []  # bare minimum: IR + loader + CPU matmul + session API
+server = ["full", "metrics", "lora"]
+edge = ["kernels-transformer", "quantization"]
+
+# Kernel groups
+kernels-all = ["kernels-math", "kernels-attention", "kernels-normalization", "kernels-activation", "kernels-tensor", "kernels-quantization", "kernels-vision", "kernels-control"]
+kernels-transformer = ["kernels-math", "kernels-attention", "kernels-normalization", "kernels-activation", "kernels-tensor", "kernels-quantization"]
+kernels-math = []        # MatMul, Add, Mul, Gemm
+kernels-attention = []   # GQA, MHA, RotaryEmbedding
+kernels-normalization = [] # LayerNorm, RMSNorm, GroupNorm
+kernels-activation = []  # Gelu, FastGelu, BiasGelu, Sigmoid, Relu
+kernels-tensor = []      # Reshape, Transpose, Gather, Concat, Slice
+kernels-quantization = [] # DequantizeLinear, MatMulNBits
+kernels-vision = []      # Conv, Pool, Resize, BatchNorm
+kernels-control = []     # If, Loop, Where
+
+# Individual kernel (escape hatch for extreme minimal)
+kernel-matmul = []
+kernel-add = []
+kernel-gqa = []
+kernel-layernorm = []
+# ... etc
+
+# Components
+tracer = ["dep:onnx-runtime-tracer"]
+diagnostics = ["tracer"]  # auto-diagnosis needs tracer
+metrics = []              # Prometheus/OTEL
+cuda = ["dep:onnx-runtime-ep-cuda"]
+lora = []
+vmap = []                 # Auto-batching pass
+```
+
+**Example builds:**
+
+```bash
+# Full server build (everything)
+cargo build --release  # default = full
+
+# Minimal LLM inference (transformer kernels only, no vision, no tracer)
+cargo build --release --no-default-features --features "kernels-transformer"
+
+# Extreme minimal (only MatMul + Add + LayerNorm + Reshape — for a custom tiny model)
+cargo build --release --no-default-features --features "kernel-matmul,kernel-add,kernel-layernorm,kernels-tensor"
+
+# Edge device (transformer + quantization, no CUDA, no tracer)
+cargo build --release --no-default-features --features "edge"
+
+# WASM (no filesystem, no CUDA, minimal kernels)
+cargo build --release --target wasm32-unknown-unknown --no-default-features --features "kernels-transformer"
+```
+
+### 54.3 Kernel Registry (Conditional Compilation)
+
+```rust
+// crates/onnx-runtime-ep-cpu/src/kernels/mod.rs
+
+pub fn register_all(registry: &mut KernelRegistry) {
+    #[cfg(feature = "kernels-math")]
+    {
+        registry.register(Box::new(MatMulKernel::new()));
+        registry.register(Box::new(AddKernel::new()));
+        registry.register(Box::new(MulKernel::new()));
+        registry.register(Box::new(GemmKernel::new()));
+    }
+
+    #[cfg(feature = "kernels-attention")]
+    {
+        registry.register(Box::new(GroupQueryAttentionKernel::new()));
+        registry.register(Box::new(MultiHeadAttentionKernel::new()));
+        registry.register(Box::new(RotaryEmbeddingKernel::new()));
+    }
+
+    #[cfg(feature = "kernels-normalization")]
+    {
+        registry.register(Box::new(LayerNormKernel::new()));
+        registry.register(Box::new(RmsNormKernel::new()));
+    }
+
+    // ... etc
+}
+```
+
+**Missing kernel at runtime = clear error (not silent failure):**
+```
+❌ Unsupported operator: "Conv" (opset 22)
+
+  This build was compiled without vision kernels.
+  Add feature "kernels-vision" to enable Conv support.
+
+  Build command: cargo build --features "kernels-vision"
+  Or use the "full" preset: cargo build --features "full"
+```
+
+### 54.4 Model-Driven Minimal Build (CLI Tool)
+
+Users shouldn't have to guess which features they need:
+
+```bash
+# Analyze model and output the minimal feature set
+$ ort2 features model.onnx
+
+Required features for model.onnx:
+  kernels-math         (MatMul, Add, Mul, Sub, Div)
+  kernels-attention    (GroupQueryAttention, RotaryEmbedding)
+  kernels-normalization (SimplifiedLayerNormalization)
+  kernels-activation   (FastGelu, BiasSplitGelu)
+  kernels-tensor       (Reshape, Transpose, Gather, Concat)
+  kernels-quantization (MatMulNBits, DequantizeLinear)
+
+Minimal build command:
+  cargo build --release --no-default-features \
+    --features "kernels-math,kernels-attention,kernels-normalization,kernels-activation,kernels-tensor,kernels-quantization"
+
+Estimated binary size: ~8 MB (vs ~45 MB full)
+```
+
+### 54.5 Binary Size Estimates
+
+| Build | Estimated Size | Use Case |
+|-------|---------------|----------|
+| `full` (all kernels + CUDA + tracer + diagnostics) | ~45 MB | Server |
+| `kernels-transformer` (LLM, no vision) | ~15 MB | LLM-only deployment |
+| `edge` (transformer + quant, no tracer) | ~12 MB | Edge device |
+| `minimal` + specific kernels | ~5-8 MB | Embedded / WASM |
+| `minimal` only (IR + loader + session) | ~2 MB | Custom EP only (all compute delegated) |
+
+### 54.6 Python Wheel Strategy
+
+```bash
+# Base package (CPU, transformer kernels)
+pip install ort2
+
+# With CUDA
+pip install ort2[cuda]          # pulls onnx-runtime-ep-cuda wheel
+
+# With specific EP
+pip install ort2[mlx]           # Apple Silicon
+pip install ort2[webgpu]        # WebGPU
+pip install ort2[qnn]           # Qualcomm
+
+# Minimal (no optional deps)
+pip install ort2 --no-deps
+```
+
+### 54.7 Design Choices
+
+| Choice | Decision | Rationale |
+|--------|----------|----------|
+| Feature flags (not runtime config) | **Yes** | Dead code elimination at compile time. Actual binary size reduction. |
+| Kernel groups (not individual by default) | **Yes** | Practical granularity. Individual kernels as escape hatch. |
+| Model-driven feature detection | **Yes** | Users shouldn't guess. `ort2 features` tells them exactly what's needed. |
+| Missing kernel = clear compile-like error | **Yes** | Not a silent wrong result. Tells you what feature to add. |
+| Default = full | **Yes** | Most users want everything. Minimal is opt-in. |
+
+---
+
+## 55. Phased Roadmap
 
 ### Phase 1: Foundation (8-12 weeks)
 - [ ] `onnx-runtime-ir`: Graph IR with all types, validation, mutation API
