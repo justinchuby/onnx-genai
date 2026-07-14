@@ -54,11 +54,12 @@ Use `doc_string` as fallback or external `execution_hints.json`.
 
 | Key | Type | Description | Example |
 |-----|------|-------------|---------|
-| `onnx_runtime.num_layers` | int | Total transformer layers (enables layer-range hints) | `"32"` |
-| `onnx_runtime.layer_pattern` | string | Naming pattern for layer nodes | `"layers.{}.attention"`, `"model.layers.{}"` |
+| `onnx_runtime.model.num_layers` | int | Total transformer layers (enables layer-range hints) | `"32"` |
+| `onnx_runtime.model.layer_pattern` | string | Naming pattern for layer nodes | `"layers.{}.attention"`, `"model.layers.{}"` |
+| `onnx_runtime.model.architecture` | string | Model architecture hint | `"llama"`, `"phi"`, `"gemma"` |
 | `onnx_runtime.memory.arena_gpu_mb` | int | Suggested GPU arena size (MB) | `"4096"` |
 | `onnx_runtime.memory.arena_cpu_mb` | int | Suggested CPU arena size (MB) | `"8192"` |
-| `onnx_runtime.prefetch` | string | Comma-separated tensor names to prefetch | `"embed_tokens.weight,lm_head.weight"` |
+| `onnx_runtime.memory.prefetch` | string | Comma-separated tensor names to prefetch | `"embed_tokens.weight,lm_head.weight"` |
 | `onnx_runtime.version` | string | Metadata schema version | `"1"` |
 
 ### Layer-Based Hints (using `onnx_runtime.layer`)
@@ -100,8 +101,8 @@ A Llama-3 model exported by Mobius might have:
 ```
 ModelProto.metadata_props:
   onnx_runtime.version = "1"
-  onnx_runtime.num_layers = "32"
-  onnx_runtime.layer_pattern = "model.layers.{}"
+  onnx_runtime.model.num_layers = "32"
+  onnx_runtime.model.layer_pattern = "model.layers.{}"
 
 Node "model.layers.0.self_attn.q_proj" metadata_props:
   onnx_runtime.layer = "0"
