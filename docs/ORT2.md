@@ -2215,41 +2215,38 @@ impl From<&Error> for OrtErrorCode {
 onnx-genai/                               (monorepo)
 ├── crates/
 │   │
-│   │  ── Runtime layer ──
-│   ├── ort-ir/                           # Graph IR, types, shapes, strides
+│   │  ── Runtime layer (new — ORT 2.0) ──
+│   ├── onnx-ir2/                         # Graph IR, types, shapes, strides, layout
+│   │                                     # (named onnx-ir2 because onnx-ir is taken)
 │   ├── ort-loader/                       # ONNX protobuf → IR, weight mmap
 │   ├── ort-optimizer/                    # Optimization passes pipeline
 │   ├── ort-cost-model/                   # Cost estimation, calibration
 │   ├── ort-memory/                       # Arena allocator, memory planner
 │   ├── ort-scheduler/                    # Async DAG executor, streams, fences
 │   ├── ort-ep-api/                       # ExecutionProvider trait + ORT ABI bridge
+│   ├── ort-ep-cpu/                       # CPU EP (oneDNN, C++ FFI) — we maintain
+│   ├── ort-ep-cuda/                      # CUDA EP (CuTe + cuBLAS) — we maintain
 │   ├── ort-session/                      # Session builder, inference API
 │   ├── ort-profiler/                     # Tracing, Chrome Trace, memory debugger
 │   ├── ort-capi/                         # C ABI: libonnxruntime.so drop-in
 │   ├── ort-autotuner/                    # Agent-driven optimization loop
 │   │
-│   │  ── EP crates (each independently publishable) ──
-│   ├── ort-ep-cpu/                       # CPU EP (oneDNN, C++ FFI)
-│   ├── ort-ep-cuda/                      # CUDA EP (CuTe + cuBLAS, C++ FFI)
-│   ├── ort-ep-rocm/                      # ROCm EP
-│   ├── ort-ep-webgpu/                    # WebGPU EP (via wgpu)
-│   ├── ort-ep-coreml/                    # CoreML EP
-│   ├── ort-ep-mlx/                       # MLX EP (Apple Silicon)
-│   ├── ort-ep-qnn/                       # Qualcomm QNN EP
-│   ├── ort-ep-openvino/                  # OpenVINO EP
-│   │
 │   │  ── GenAI layer (existing) ──
-│   ├── onnx-genai-kv/                   # KV cache
+│   ├── onnx-genai/                      # Main crate / facade
 │   ├── onnx-genai-engine/               # Batching, speculative, pipeline
+│   ├── onnx-genai-kv/                   # KV cache (paged, tiered, heterogeneous)
 │   ├── onnx-genai-server/               # OpenAI HTTP API
 │   ├── onnx-genai-router/               # Multi-node routing
-│   ├── onnx-genai-ort/                  # ORT C API bindings (→ replaced by ort-session)
+│   ├── onnx-genai-scheduler/            # GenAI scheduling
+│   ├── onnx-genai-ort/                  # ORT C API bindings (current backend)
 │   ├── onnx-genai-metadata/             # inference_metadata.yaml schema
-│   └── ...
+│   ├── onnx-genai-preprocess/           # Image/tokenizer preprocessing
+│   ├── onnx-genai-genai-config/         # GenAI config
+│   └── onnx-genai-bench/               # Benchmark tools
 │
 ├── native-eps/
-│   ├── cpu/                              # C++ CPU kernels (oneDNN)
-│   └── cuda/                             # C++ CUDA kernels (CuTe + cuBLAS)
+│   ├── cpu/                              # C++ CPU kernels (oneDNN FFI)
+│   └── cuda/                             # C++ CUDA kernels (CuTe + cuBLAS FFI)
 │
 ├── bindings/
 │   └── python/                           # PyO3: ort2 + per-EP packages
@@ -2260,6 +2257,13 @@ onnx-genai/                               (monorepo)
 │   └── PROGRESS.md
 │
 └── Cargo.toml                            # Workspace
+
+EP compatibility:
+  - ort-ep-cpu, ort-ep-cuda: we write and maintain (ported from ORT C++)
+  - MLX EP: Justin's existing implementation (separate or merged later)
+  - QNN, OpenVINO, WebGPU, CoreML, ROCm, etc.: loaded as legacy ORT
+    plugin EPs via dlopen + C ABI bridge. We don't write these —
+    we just implement the host-side ABI so they load and run.
 ```
 
 ### 23.1 Backend Feature Flag
@@ -2461,7 +2465,7 @@ pub fn conformance_test(model_path: &Path, inputs: &[Tensor], tolerance: f64) ->
 ## 29. Phased Roadmap
 
 ### Phase 1: Foundation (8-12 weeks)
-- [ ] `ort-ir`: Graph IR with all types, validation, mutation API
+- [ ] `onnx-ir2`: Graph IR with all types, validation, mutation API
 - [ ] `ort-loader`: ONNX protobuf parser, shape inference, weight mmap (safetensors + external data)
 - [ ] `ort-ep-api`: ExecutionProvider trait, Kernel trait, OpRegistry
 - [ ] `ort-ep-cpu`: Basic ops (MatMul, Add, Relu, Reshape, Transpose, Gather, LayerNorm) via oneDNN
