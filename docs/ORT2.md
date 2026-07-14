@@ -3071,13 +3071,167 @@ session = ort.InferenceSession("model.onnx")  # uses our runtime transparently
 
 ## 25. Platform Support
 
+### 25.1 Platform × EP Matrix
+
 | Platform | EP crates available | Weight mmap | CUDA Graph | Notes |
 |----------|-------------------|-------------|------------|-------|
 | Linux x64 | cpu, cuda, rocm, openvino, qnn, webgpu | ✅ | ✅ | Primary |
 | macOS arm64 | cpu, mlx, coreml, webgpu | ✅ | ❌ | MLX for GPU |
 | Windows x64 | cpu, cuda, openvino, webgpu | ✅ | ✅ | |
-| Linux arm64 | cpu, qnn, webgpu | ✅ | ❌ | Edge |
+| Linux arm64 | cpu, qnn, webgpu | ✅ | ❌ | Edge / server |
+| Android (ARM) | cpu-mobile, qnn, webgpu | ✅ | ❌ | XNNPACK backend |
+| iOS (ARM) | cpu-apple, coreml, metal | ✅ | ❌ | Accelerate + Metal |
 | Web (WASM) | webgpu | ❌ (fetch) | ❌ | wasm-bindgen |
+
+### 25.2 CPU Backend Strategy
+
+| Target | Backend | Rationale |
+|--------|---------|----------|
+| x86 (Intel/AMD) | **oneDNN** | Best-in-class. AMX/AVX-512/VNNI. Battle-tested. |
+| ARM server (Neoverse) | **oneDNN** | Has NEON/SVE paths. Single dep covers x86+ARM server. |
+| ARM mobile (Android) | **XNNPACK** | Lightweight (~1MB), int8 optimized, low startup. oneDNN too heavy for mobile. |
+| Apple Silicon | **Accelerate** (vDSP/BNNS) | System framework, zero-dep, Apple-tuned. |
+| Fallback | **Generic Rust** | Pure Rust kernels. Slow but compiles anywhere. Correctness baseline. |
+
+**oneDNN scope:** Covers x86 + ARM server (Linux/Windows). We link it statically in the
+cpu EP crate. Mobile and Apple go through separate lighter backends.
+
+**XNNPACK scope:** Android only. Google-maintained, TFLite's CPU backend.
+Small binary, fast startup, excellent int8/fp16 on Cortex-A cores.
+
+```rust
+// crates/onnx-runtime-ep-cpu/src/backend.rs
+pub enum CpuBackend {
+    OneDnn,       // x86 + ARM server
+    Xnnpack,      // Android mobile
+    Accelerate,   // macOS / iOS
+    Generic,      // fallback
+}
+
+impl CpuBackend {
+    pub fn auto_detect() -> Self {
+        #[cfg(target_os = "android")]
+        { Self::Xnnpack }
+        #[cfg(target_os = "macos")]
+        { Self::Accelerate }
+        #[cfg(target_os = "ios")]
+        { Self::Accelerate }
+        #[cfg(all(not(target_os = "android"), not(target_os = "macos"), not(target_os = "ios")))]
+        {
+            if has_onednn() { Self::OneDnn } else { Self::Generic }
+        }
+    }
+}
+```
+
+### 25.3 GPU Backend Strategy
+
+| Target | EP | Approach | Status |
+|--------|-----|---------|--------|
+| NVIDIA | `onnx-runtime-ep-cuda` | cuBLAS + CuTe + FA3 (§15) | Designed |
+| Apple GPU | `onnx-runtime-ep-mlx` | MLX kernels, Metal shaders | **183/202 ops** ✅ |
+| AMD GPU (ROCm) | `onnx-runtime-ep-rocm` | **hipify from CUDA EP** | Planned |
+| Intel GPU (Arc/Xe) | **OpenVINO plugin EP** | Don't write ourselves | Plugin |
+| Mobile GPU (Mali/Adreno) | **QNN plugin EP** or WebGPU | Don't write ourselves | Plugin |
+
+### 25.4 ROCm Strategy: Hipify, Don't Rewrite
+
+ROCm EP = CUDA EP mechanically translated. Minimize manual work:
+
+```bash
+# hipify-perl converts CUDA API calls → HIP API calls
+hipify-perl ep-cuda/src/kernels/*.cu → ep-rocm/src/kernels/*.cu
+
+# API mapping (1:1 in most cases):
+# cuBLAS      → hipBLAS (same API shape)
+# cudaMalloc  → hipMalloc
+# cudaStream  → hipStream
+# CUPTI       → rocTracer (profiling)
+# cuDNN       → MIOpen (not 1:1, needs adaptation)
+# CUTLASS     → composable_kernel (AMD's equivalent, needs manual port)
+```
+
+**What hipifies cleanly (auto-convert):**
+- Memory management (malloc/free/memcpy)
+- Stream management
+- cuBLAS GEMM calls → hipBLAS
+- Simple CUDA C kernels (elementwise, reduction)
+- Launch configuration (grid, block)
+
+**What needs manual work:**
+- cuDNN SDPA → MIOpen attention (different API surface)
+- CuTe/CUTLASS kernels → composable_kernel or hand-port
+- FlashAttention → use AMD's [flash-attention fork](https://github.com/ROCm/flash-attention)
+- CUPTI → rocTracer (different profiling model)
+
+**Implementation plan:**
+```
+Phase 1: hipify basic kernels + hipBLAS GEMM → run BERT on ROCm
+Phase 2: MIOpen attention → run LLM decode
+Phase 3: AMD flash-attention fork → full LLM serving
+```
+
+**Build system:**
+```rust
+// crates/onnx-runtime-ep-rocm/build.rs
+fn main() {
+    // hipcc compiles .cu files (HIP understands CUDA syntax)
+    let hipcc = env::var("HIPCC").unwrap_or_else(|_| "hipcc".into());
+    for src in glob("src/kernels/*.cu") {
+        Command::new(&hipcc).args([
+            "-O3", "--std=c++17",
+            "--offload-arch=gfx942",  // MI300X
+            "--offload-arch=gfx90a",  // MI250X
+            "-c", &src, "-o", &obj,
+        ]).status().unwrap();
+    }
+    println!("cargo:rustc-link-lib=static=hip_kernels");
+    println!("cargo:rustc-link-lib=dylib=hipblas");
+    println!("cargo:rustc-link-lib=dylib=amdhip64");
+}
+```
+
+**Goal:** Keep ep-rocm as a thin translation layer over ep-cuda. When CUDA EP gets a
+new kernel, running hipify + minimal fixup produces the ROCm version. No parallel
+development — **CUDA leads, ROCm follows mechanically.**
+
+### 25.5 Apple Strategy: MLX EP (Already In Progress)
+
+MLX EP is authored separately (183/202 ai.onnx ops complete). It uses:
+- Metal compute shaders for GPU kernels
+- Metal Performance Shaders (MPS) for GEMM/Conv
+- Unified memory (no explicit H2D/D2H — Apple's advantage)
+
+CPU path on Apple: Accelerate framework (BNNS for NN ops, vDSP for signal).
+
+### 25.6 Plugin EPs (Don't Write, Just Load)
+
+These EPs are maintained by hardware vendors. We preserve ORT's plugin ABI (§21)
+so they load without modification:
+
+| Plugin EP | Vendor | Targets | Notes |
+|-----------|--------|---------|-------|
+| OpenVINO | Intel | Intel CPU/GPU/NPU | Best path for Intel discrete GPU (Arc) |
+| QNN | Qualcomm | Snapdragon NPU/GPU | Android mobile AI |
+| CoreML | Apple | Apple NPU (ANE) | iOS/macOS neural engine |
+| TensorRT | NVIDIA | NVIDIA GPU | Alternative to our CUDA EP (user choice) |
+| WebGPU | W3C | Browser + cross-platform | Portable but slower |
+
+We don't write these — we ensure our EP plugin interface (§4, §21) is compatible
+so vendor-maintained shared libraries work unchanged.
+
+### 25.7 Design Decisions
+
+| Decision | Choice | Rationale |
+|----------|--------|----------|
+| CPU: single backend vs multi | **Multi** (oneDNN/XNNPACK/Accelerate) | No single lib covers all targets well |
+| Mobile CPU | **XNNPACK** not oneDNN | oneDNN binary too large, startup too slow for mobile |
+| Apple CPU | **Accelerate** not oneDNN | System framework, zero dep, Apple-tuned |
+| ROCm approach | **Hipify from CUDA** | Minimize parallel development. CUDA leads. |
+| ROCm attention | **AMD flash-attention fork** | Don't hand-write; AMD maintains their own |
+| Intel GPU | **OpenVINO plugin** | Intel maintains it; we just load it |
+| Mobile GPU | **QNN plugin / WebGPU** | Fragmented landscape; vendor plugins win |
+| Plugin EP compat | **ORT ABI compatible** | Reuse existing vendor effort |
 
 ---
 
