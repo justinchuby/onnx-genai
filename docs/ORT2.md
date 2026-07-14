@@ -2121,68 +2121,203 @@ pub fn run_shape_inference(mut graph: Graph) -> Result<Graph> {
 
 ## 20. Session API
 
-### 20.1 SessionBuilder
+### 20.1 Design Philosophy
+
+**Zero-config by default.** The user should never need to know what an "Execution Provider" is.
+The runtime auto-detects available hardware and picks the best execution strategy.
+
+Comparison with ORT:
+```python
+# ORT (verbose, implementation-leaking):
+opts = ort.SessionOptions()
+opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+session = ort.InferenceSession("model.onnx", opts, providers=["CUDAExecutionProvider"])
+output = session.run(None, {"input_ids": data})
+
+# Ours (intent-based, zero-config):
+session = ort2.load("model.onnx")
+output = session.run(input_ids=data)
+```
+
+### 20.2 Core API
+
+```rust
+/// Load a model. Auto-detects best available hardware.
+/// This is the primary entry point. No configuration needed.
+pub fn load(path: impl AsRef<Path>) -> Result<InferenceSession> {
+    InferenceSession::builder()
+        .model(path)
+        .build()
+}
+
+pub struct InferenceSession { /* ... */ }
+
+impl InferenceSession {
+    /// Primary entry point: load model with auto-detected best device.
+    pub fn load(path: impl AsRef<Path>) -> Result<Self> {
+        Self::builder().model(path).build()
+    }
+
+    /// Load from bytes (e.g. embedded model, downloaded from network).
+    pub fn load_bytes(bytes: &[u8]) -> Result<Self> {
+        Self::builder().model_bytes(bytes).build()
+    }
+
+    /// Builder for advanced configuration.
+    pub fn builder() -> SessionBuilder {
+        SessionBuilder::new()
+    }
+
+    /// Run inference. Inputs by name.
+    pub fn run(&mut self, inputs: &[(&str, &Tensor)]) -> Result<Vec<Tensor>>;
+
+    /// Run with pre-bound I/O (zero-copy, for hot loops).
+    pub fn run_with_binding(&mut self, binding: &IoBinding) -> Result<()>;
+
+    /// Run from DLPack tensors (zero-copy from PyTorch/JAX).
+    pub fn run_from_dlpack(&mut self, inputs: &[(&str, DLManagedTensor)]) -> Result<Vec<Tensor>>;
+
+    /// Input/output metadata.
+    pub fn inputs(&self) -> &[IoMeta];
+    pub fn outputs(&self) -> &[IoMeta];
+}
+
+pub struct IoMeta {
+    pub name: String,
+    pub dtype: DataType,
+    pub shape: Shape,  // may have symbolic dims
+}
+```
+
+### 20.3 Device Selection (Intent-Based, Not EP-Based)
+
+Users express **what they want**, not **how to get it**:
 
 ```rust
 pub struct SessionBuilder {
     model_path: Option<PathBuf>,
     model_bytes: Option<Vec<u8>>,
-    eps: Vec<Box<dyn ExecutionProvider>>,
-    intra_threads: Option<usize>,
+    device: DevicePreference,
     memory_limit: Option<usize>,
     enable_profiling: bool,
-    enable_cuda_graph: bool,
     warmup_shapes: Vec<WarmupShape>,
-    upload_strategy: UploadStrategy,
+}
+
+/// What the user actually cares about.
+#[derive(Default)]
+pub enum DevicePreference {
+    /// Auto-detect best available. This is the default.
+    /// Priority: CUDA > MLX > ROCm > CPU
+    #[default]
+    Auto,
+    /// Prefer GPU (any kind: CUDA, ROCm, MLX, WebGPU).
+    Gpu,
+    /// Prefer specific GPU by index (for multi-GPU systems).
+    GpuIndex(u32),
+    /// Force CPU only.
+    Cpu,
+    /// Explicit device (escape hatch for power users).
+    Specific(DeviceId),
 }
 
 impl SessionBuilder {
     pub fn new() -> Self;
-    pub fn with_model_path(self, path: impl AsRef<Path>) -> Self;
-    pub fn with_model_bytes(self, bytes: Vec<u8>) -> Self;
-    pub fn with_ep(self, ep: Box<dyn ExecutionProvider>) -> Self;
-    pub fn with_intra_threads(self, n: usize) -> Self;
-    pub fn with_memory_limit(self, bytes: usize) -> Self;
-    pub fn with_profiling(self, enable: bool) -> Self;
-    pub fn with_cuda_graph(self, enable: bool) -> Self;
-    pub fn with_warmup(self, shapes: Vec<WarmupShape>) -> Self;
+    pub fn model(self, path: impl AsRef<Path>) -> Self;
+    pub fn model_bytes(self, bytes: &[u8]) -> Self;
 
-    /// Build: load model → optimize (always full pipeline) → compile → allocate → warmup.
+    /// Set device preference. Default: Auto (best available).
+    pub fn device(self, pref: DevicePreference) -> Self;
+
+    /// Set memory limit (for device memory budgeting).
+    pub fn memory_limit(self, bytes: usize) -> Self;
+
+    /// Enable profiling for this session.
+    pub fn profiling(self, enable: bool) -> Self;
+
+    /// Pre-compile kernels for expected shapes (avoid first-run latency).
+    pub fn warmup(self, shapes: Vec<WarmupShape>) -> Self;
+
+    /// Build: load → detect device → optimize → compile → allocate.
     pub fn build(self) -> Result<InferenceSession>;
 }
 ```
 
-### 20.2 InferenceSession
+### 20.4 Auto-Detection Logic
 
 ```rust
-pub struct InferenceSession {
-    model: Arc<ModelInstance>,
-    scratch: ArenaAllocator,
-    plan: PlacementPlan,
-    memory_plan: MemoryPlan,
-    executor: DagExecutor,
-    cuda_graph: Option<CudaGraphCapture>,
-    profiler: Option<Profiler>,
-    run_count: u64,
+/// Called during build() when DevicePreference::Auto.
+fn auto_detect_device() -> Vec<Box<dyn ExecutionProvider>> {
+    let mut eps: Vec<Box<dyn ExecutionProvider>> = vec![];
+
+    // Try CUDA
+    if let Ok(cuda) = CudaEp::detect() {
+        eps.push(Box::new(cuda));
+    }
+    // Try MLX (macOS Apple Silicon)
+    #[cfg(target_os = "macos")]
+    if let Ok(mlx) = MlxEp::detect() {
+        eps.push(Box::new(mlx));
+    }
+    // Try ROCm
+    if let Ok(rocm) = detect_legacy_ep("libonnxruntime_rocm.so") {
+        eps.push(rocm);
+    }
+    // CPU always available as fallback
+    eps.push(Box::new(CpuEp::new()));
+
+    eps
 }
+```
 
-impl InferenceSession {
-    /// Run inference with named inputs.
-    pub fn run(&mut self, inputs: &[(&str, &Tensor)]) -> Result<Vec<Tensor>>;
+The user never sees EP names. The runtime just does the right thing.
 
-    /// Run with IoBinding (pre-allocated outputs, zero-copy).
-    pub fn run_with_binding(&mut self, binding: &IoBinding) -> Result<()>;
+### 20.5 Python API
 
-    /// Get input/output metadata.
-    pub fn input_names(&self) -> &[String];
-    pub fn output_names(&self) -> &[String];
-    pub fn input_shapes(&self) -> &[Shape];
-    pub fn output_shapes(&self) -> &[Shape];
-}
+```python
+import ort2
 
-pub struct IoBinding {
-    pub inputs: HashMap<String, DeviceBuffer>,
-    pub outputs: HashMap<String, DeviceBuffer>,
+# Simplest possible:
+session = ort2.load("model.onnx")
+output = session.run(input_ids=input_array)
+
+# With device preference:
+session = ort2.load("model.onnx", device="gpu")
+
+# With memory limit:
+session = ort2.load("model.onnx", memory_limit=4 * 1024**3)  # 4GB
+
+# Advanced (explicit builder):
+session = ort2.Session.builder() \
+    .model("model.onnx") \
+    .device("gpu:1") \
+    .profiling(True) \
+    .build()
+
+# Zero-copy from PyTorch:
+import torch
+tensor = torch.randn(1, 128, device="cuda")
+output = session.run(input_ids=tensor)  # auto DLPack, no copy
+
+# Zero-copy output to PyTorch:
+import torch
+result = session.run(input_ids=data)
+torch_tensor = torch.from_dlpack(result["logits"])  # no copy
+```
+
+### 20.6 IoBinding (Hot Path, Zero-Copy)
+
+For repeated inference with same-shaped inputs (e.g. LLM decode loop),
+pre-allocate and reuse buffers:
+
+```rust
+let mut binding = session.create_binding()?;
+binding.bind_input("input_ids", &input_buffer)?;
+binding.bind_output("logits", &output_buffer)?;
+
+// Hot loop — no allocation, no name lookup
+for token in 0..max_tokens {
+    session.run_with_binding(&binding)?;
+    // output_buffer already contains the logits
 }
 ```
 
