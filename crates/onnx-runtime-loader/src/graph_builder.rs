@@ -150,23 +150,7 @@ fn build_graph_proto(
         if !np.doc_string.is_empty() {
             node.doc_string = Some(np.doc_string.clone());
         }
-        // A `com.microsoft::EPContext` node's `ep_cache_context` attribute is an
-        // ONNX STRING attribute whose bytes are an *opaque* payload: for
-        // `embed_mode=1` the raw compiled vendor blob (arbitrary binary), for
-        // `embed_mode=0` a relative file path. Decoding it via lossy UTF-8 (as
-        // ordinary string attributes are) would corrupt binary blobs, so we
-        // preserve its exact bytes as a `UINT8` tensor. The typed EPContext view
-        // (`crate::epcontext`) reads these bytes back losslessly (§55.3).
-        let is_ep_ctx = crate::epcontext::is_ep_context_op(&np.op_type, &np.domain);
         for ap in &np.attribute {
-            if is_ep_ctx && ap.name == "ep_cache_context" {
-                let raw = ap.s.clone();
-                let dims = vec![raw.len()];
-                let td = TensorData::from_raw(DataType::Uint8, dims, raw);
-                node.attributes
-                    .insert(ap.name.clone(), Attribute::Tensor(td));
-                continue;
-            }
             if let Some((key, attr)) = convert_attribute(graph, ap)? {
                 node.attributes.insert(key, attr);
             }
@@ -330,15 +314,13 @@ fn convert_attribute(
     let attr = match ty {
         AT::Float => Attribute::Float(ap.f),
         AT::Int => Attribute::Int(ap.i),
-        AT::String => Attribute::String(String::from_utf8_lossy(&ap.s).into_owned()),
+        // STRING attributes are arbitrary byte strings on the wire (an opaque
+        // blob, a path, or text). Preserve the exact bytes rather than lossily
+        // decoding as UTF-8, so encode is a byte-exact inverse of decode.
+        AT::String => Attribute::String(ap.s.clone()),
         AT::Floats => Attribute::Floats(ap.floats.clone()),
         AT::Ints => Attribute::Ints(ap.ints.clone()),
-        AT::Strings => Attribute::Strings(
-            ap.strings
-                .iter()
-                .map(|b| String::from_utf8_lossy(b).into_owned())
-                .collect(),
-        ),
+        AT::Strings => Attribute::Strings(ap.strings.clone()),
         AT::Tensor => match ap.t.as_ref() {
             Some(t) => Attribute::Tensor(convert_tensor(t)?),
             None => return Ok(None),
@@ -373,14 +355,9 @@ fn convert_attribute(
             } else if !ap.ints.is_empty() {
                 Attribute::Ints(ap.ints.clone())
             } else if !ap.strings.is_empty() {
-                Attribute::Strings(
-                    ap.strings
-                        .iter()
-                        .map(|b| String::from_utf8_lossy(b).into_owned())
-                        .collect(),
-                )
+                Attribute::Strings(ap.strings.clone())
             } else if !ap.s.is_empty() {
-                Attribute::String(String::from_utf8_lossy(&ap.s).into_owned())
+                Attribute::String(ap.s.clone())
             } else if ap.i != 0 {
                 Attribute::Int(ap.i)
             } else if ap.f != 0.0 {

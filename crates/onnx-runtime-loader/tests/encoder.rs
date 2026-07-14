@@ -10,7 +10,7 @@ use std::collections::HashMap;
 
 use prost::Message;
 
-use onnx_runtime_ir::{Attribute, DataType, Dim, Graph};
+use onnx_runtime_ir::{Attribute, Dim, Graph};
 use onnx_runtime_loader::proto::onnx;
 use onnx_runtime_loader::{
     encode_model, encode_model_proto, load_model_bytes_with_weights, write_model, Model,
@@ -322,13 +322,13 @@ fn round_trip_structural_and_byte_exact() {
     let ep1 = graph1.node(find_ep_node(&graph1));
     let ep2 = graph2.node(find_ep_node(&graph2));
 
-    // ep_cache_context is preserved as a UINT8 tensor with byte-exact payload.
+    // ep_cache_context is preserved as a raw-bytes STRING attribute, byte-exact
+    // — through the generic string-bytes path, with no op-specific handling.
     match ep2.attr("ep_cache_context") {
-        Some(Attribute::Tensor(t)) => {
-            assert_eq!(t.dtype, DataType::Uint8);
-            assert_eq!(t.data, opaque_blob(), "opaque blob must be byte-exact");
+        Some(Attribute::String(bytes)) => {
+            assert_eq!(bytes, &opaque_blob(), "opaque blob must be byte-exact");
         }
-        other => panic!("ep_cache_context should be a UINT8 tensor, got {other:?}"),
+        other => panic!("ep_cache_context should be a STRING attribute, got {other:?}"),
     }
 
     assert_eq!(ep2.attr("alpha").and_then(Attribute::as_float), Some(0.25));
@@ -340,14 +340,18 @@ fn round_trip_structural_and_byte_exact() {
         other => panic!("scales should be Floats, got {other:?}"),
     }
     match ep2.attr("tags") {
-        Some(Attribute::Strings(v)) => assert_eq!(v, &vec!["alpha".to_string(), "beta".into()]),
+        Some(Attribute::Strings(v)) => assert_eq!(
+            v,
+            &vec![b"alpha".to_vec(), b"beta".to_vec()],
+            "string-list bytes must survive round-trip"
+        ),
         other => panic!("tags should be Strings, got {other:?}"),
     }
 
-    // The first decode's EPContext attributes match the second decode's exactly
-    // for the values we care about (proves no drift across the round-trip).
+    // The first decode's EPContext opaque payload matches the second decode's
+    // exactly (proves no drift across the round-trip).
     match (ep1.attr("ep_cache_context"), ep2.attr("ep_cache_context")) {
-        (Some(Attribute::Tensor(a)), Some(Attribute::Tensor(b))) => assert_eq!(a.data, b.data),
+        (Some(Attribute::String(a)), Some(Attribute::String(b))) => assert_eq!(a, b),
         _ => panic!("ep_cache_context missing"),
     }
 }
@@ -485,4 +489,96 @@ fn write_model_produces_reloadable_file() {
     assert_eq!(op_types(&graph1), op_types(&graph2));
 
     let _ = std::fs::remove_file(&path);
+}
+
+// ── boundary / generic-path tests ─────────────────────────────────────────────
+
+/// A `UINT8` opaque tensor **initializer** must round-trip byte-exact through the
+/// generic tensor path (no op knowledge). Complements the STRING-attribute path.
+#[test]
+fn uint8_opaque_initializer_round_trips_byte_exact() {
+    use onnx_runtime_ir::{DataType, Node, NodeId, TensorData, WeightRef};
+
+    let payload = opaque_blob();
+    let mut graph = Graph::new();
+    let blob = graph.create_named_value("blob", DataType::Uint8, vec![payload.len().into()]);
+    graph.set_initializer(
+        blob,
+        WeightRef::Inline(TensorData::from_raw(
+            DataType::Uint8,
+            vec![payload.len()],
+            payload.clone(),
+        )),
+    );
+    let out = graph.create_named_value("out", DataType::Uint8, vec![payload.len().into()]);
+    graph.insert_node(Node::new(NodeId(0), "Identity", vec![Some(blob)], vec![out]));
+    graph.add_output(out);
+
+    let bytes = encode_model(&Model::new(&graph)).expect("encode");
+    let (graph2, store2) = load_model_bytes_with_weights(&bytes, ".").expect("decode");
+
+    let init = initializer_bytes(&graph2, &store2);
+    assert_eq!(
+        init.get("blob"),
+        Some(&payload),
+        "UINT8 opaque initializer must be byte-exact"
+    );
+}
+
+/// An empty graph (no nodes, no initializers, no I/O) encodes and reloads.
+#[test]
+fn empty_graph_round_trips() {
+    let graph = Graph::new();
+    let bytes = encode_model(&Model::new(&graph)).expect("encode empty");
+    let (graph2, _store2) = load_model_bytes_with_weights(&bytes, ".").expect("decode empty");
+    assert_eq!(graph2.num_nodes(), 0);
+    assert!(graph2.initializers.is_empty());
+}
+
+/// A graph whose only computation forwards an initializer round-trips byte-exact
+/// (the initializer is the sole data source).
+#[test]
+fn initializer_only_graph_round_trips() {
+    use onnx_runtime_ir::{DataType, Node, NodeId, TensorData, WeightRef};
+
+    let raw: Vec<u8> = [1.0f32, 2.0, 3.0, 4.0].iter().flat_map(|v| v.to_le_bytes()).collect();
+    let mut graph = Graph::new();
+    let w = graph.create_named_value("W", DataType::Float32, vec![2usize.into(), 2usize.into()]);
+    graph.set_initializer(
+        w,
+        WeightRef::Inline(TensorData::from_raw(DataType::Float32, vec![2, 2], raw.clone())),
+    );
+    let out = graph.create_named_value("out", DataType::Float32, vec![2usize.into(), 2usize.into()]);
+    graph.insert_node(Node::new(NodeId(0), "Identity", vec![Some(w)], vec![out]));
+    graph.add_output(out);
+
+    let bytes = encode_model(&Model::new(&graph)).expect("encode");
+    let (graph2, store2) = load_model_bytes_with_weights(&bytes, ".").expect("decode");
+    assert_eq!(graph2.num_nodes(), 1);
+    assert_eq!(initializer_bytes(&graph2, &store2).get("W"), Some(&raw));
+}
+
+/// A2: encoding a control-flow subgraph attribute must error cleanly rather than
+/// silently emit a subgraph with a truncated I/O signature (the load path does
+/// not round-trip nested-graph formal I/O).
+#[test]
+fn encoding_subgraph_attribute_errors_cleanly() {
+    use onnx_runtime_ir::{Attribute, DataType, Node, NodeId};
+
+    let mut graph = Graph::new();
+    let x = graph.create_named_value("x", DataType::Float32, vec![1usize.into()]);
+    let y = graph.create_named_value("y", DataType::Float32, vec![1usize.into()]);
+    graph.add_input(x);
+    graph.add_output(y);
+    let mut node = Node::new(NodeId(0), "If", vec![Some(x)], vec![y]);
+    node.attributes
+        .insert("then_branch".into(), Attribute::Graph(Box::new(Graph::new())));
+    graph.insert_node(node);
+
+    let err = encode_model(&Model::new(&graph)).expect_err("must reject subgraph");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("subgraph") && msg.contains("unsupported"),
+        "error should explain subgraph encoding is unsupported, got: {msg}"
+    );
 }

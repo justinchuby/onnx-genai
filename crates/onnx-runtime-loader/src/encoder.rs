@@ -21,15 +21,15 @@
 //! * opset imports, `ir_version`, producer fields, model `doc_string`,
 //!   `metadata_props`.
 //!
-//! ### EPContext opaque blob (critical, §55.3/§55.4)
+//! ### STRING attributes are byte-preserving (§55.3/§55.4)
 //!
-//! The load path stores an `EPContext` node's `ep_cache_context` attribute — an
-//! ONNX `STRING` attribute whose bytes are an *opaque* compiled-vendor blob or a
-//! relative path — losslessly as a `UINT8` tensor, so lossy UTF-8 decoding never
-//! corrupts a binary blob. The encoder performs the exact inverse: it writes
-//! that `UINT8` tensor back out as a `STRING` attribute (`AttributeProto.s`) with
-//! its bytes intact, so the produced model both round-trips through the load path
-//! and matches what upstream ORT emits.
+//! ONNX `STRING` attributes are arbitrary byte strings — a compiled-vendor blob,
+//! a relative path, or text — that are not guaranteed to be valid UTF-8. The IR
+//! stores them as raw bytes ([`Attribute::String`](onnx_runtime_ir::Attribute)),
+//! so both decode and encode round-trip the bytes exactly with **zero** op or
+//! attribute-name knowledge. The `EPContext` `ep_cache_context` opaque blob is
+//! preserved purely by this generic mechanism — the encoder contains no
+//! op-specific branch.
 //!
 //! ## Fields deliberately not encoded
 //!
@@ -40,8 +40,10 @@
 //! * `TrainingInfoProto`, `FunctionProto`, sparse initializers, quantization
 //!   annotations (not represented in the IR);
 //! * control-flow **subgraph** formal `input`/`output` lists — the load path
-//!   does not register them as graph I/O for nested graphs, so only the
-//!   subgraph's nodes / value_info are re-emitted. (No Phase-1 op uses these.)
+//!   does not register them as graph I/O for nested graphs. Rather than silently
+//!   emit a subgraph with a truncated signature, [`encode_attribute`] returns a
+//!   clean "unsupported" error for any `Graph`/`Graphs` attribute (no Phase-1 op
+//!   uses control-flow subgraphs).
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -122,6 +124,13 @@ pub struct Model<'a> {
 
 impl<'a> Model<'a> {
     /// A model over `graph` with default metadata and no external weight store.
+    ///
+    /// **Note on defaulted metadata:** the load path does not preserve
+    /// model-level metadata (it keeps only `opset_imports` on the `Graph`), so a
+    /// model built this way stamps [`DEFAULT_IR_VERSION`] and empty producer /
+    /// version / `metadata_props` fields. A rewrite path that must reproduce the
+    /// original model faithfully should capture the source metadata and pass it
+    /// via [`Model::with_metadata`] rather than relying on these defaults.
     pub fn new(graph: &'a Graph) -> Self {
         Self {
             graph,
@@ -280,15 +289,13 @@ fn encode_node(graph: &Graph, node: &Node) -> Result<NodeProto, LoaderError> {
         .map(|&vid| value_name(graph, vid).unwrap_or_default().to_string())
         .collect();
 
-    let is_ep_ctx = crate::epcontext::is_ep_context_op(&node.op_type, &node.domain);
-
     // Sort attributes by name so the encoding is deterministic (the IR stores
     // them in a HashMap).
     let mut keys: Vec<&String> = node.attributes.keys().collect();
     keys.sort();
     let mut attribute = Vec::with_capacity(keys.len());
     for key in keys {
-        attribute.push(encode_attribute(graph, key, &node.attributes[key], is_ep_ctx)?);
+        attribute.push(encode_attribute(graph, key, &node.attributes[key])?);
     }
 
     Ok(NodeProto {
@@ -309,7 +316,6 @@ fn encode_attribute(
     graph: &Graph,
     name: &str,
     attr: &Attribute,
-    is_ep_ctx: bool,
 ) -> Result<AttributeProto, LoaderError> {
     let mut ap = AttributeProto {
         name: name.to_string(),
@@ -325,7 +331,7 @@ fn encode_attribute(
             ap.r#type = AttributeType::Float as i32;
         }
         Attribute::String(s) => {
-            ap.s = s.clone().into_bytes();
+            ap.s = s.clone();
             ap.r#type = AttributeType::String as i32;
         }
         Attribute::Ints(v) => {
@@ -337,32 +343,25 @@ fn encode_attribute(
             ap.r#type = AttributeType::Floats as i32;
         }
         Attribute::Strings(v) => {
-            ap.strings = v.iter().map(|s| s.clone().into_bytes()).collect();
+            ap.strings = v.clone();
             ap.r#type = AttributeType::Strings as i32;
         }
         Attribute::Tensor(t) => {
-            // Inverse of the load path's EPContext special-case: an
-            // `ep_cache_context` payload is held in the IR as an opaque UINT8
-            // tensor but is an ONNX STRING attribute on the wire. Emit its bytes
-            // back into `AttributeProto.s` byte-exactly (§55.3/§55.4).
-            if is_ep_ctx && name == "ep_cache_context" && t.dtype == DataType::Uint8 {
-                ap.s = t.data.clone();
-                ap.r#type = AttributeType::String as i32;
-            } else {
-                ap.t = Some(encode_tensor(t));
-                ap.r#type = AttributeType::Tensor as i32;
-            }
+            ap.t = Some(encode_tensor(t));
+            ap.r#type = AttributeType::Tensor as i32;
         }
-        Attribute::Graph(g) => {
-            ap.g = Some(encode_graph_proto(g, None, false, "")?);
-            ap.r#type = AttributeType::Graph as i32;
-        }
-        Attribute::Graphs(gs) => {
-            ap.graphs = gs
-                .iter()
-                .map(|g| encode_graph_proto(g, None, false, ""))
-                .collect::<Result<_, _>>()?;
-            ap.r#type = AttributeType::Graphs as i32;
+        Attribute::Graph(_) | Attribute::Graphs(_) => {
+            // The load path does not register a nested subgraph's formal
+            // `input`/`output` lists (only its nodes / value_info survive), so a
+            // control-flow subgraph cannot be re-emitted with a faithful
+            // signature. Fail cleanly rather than silently emit a subgraph with a
+            // truncated I/O contract. (No Phase-1 op uses control-flow
+            // subgraphs; see the module docs.)
+            return Err(LoaderError::GraphBuild(format!(
+                "attribute {name:?}: encoding control-flow subgraph attributes is \
+                 unsupported (nested-graph formal I/O is not round-tripped by the \
+                 load path)"
+            )));
         }
         Attribute::TypeProto(tp) => {
             ap.tp = Some(encode_type_proto(graph, tp));

@@ -20,7 +20,7 @@ use onnx_runtime_ep_api::{
     KernelMatch, Result as EpResult,
 };
 use onnx_runtime_ir::{
-    Attribute, DataType, DeviceId, DeviceType, Graph, Node, NodeId, Shape, TensorData,
+    Attribute, DataType, DeviceId, DeviceType, Graph, Node, NodeId, Shape,
     TensorLayout, ValueId, static_shape,
 };
 use onnx_runtime_session::{InferenceSession, SessionError, load_ep_context_nodes};
@@ -116,9 +116,9 @@ impl ExecutionProvider for MockCompiledEp {
 
 // ── IR construction helpers ───────────────────────────────────────────────────
 
-/// A `String`-valued attribute.
+/// A `String`-valued attribute (stored as raw bytes in the IR).
 fn s_attr(v: &str) -> Attribute {
-    Attribute::String(v.to_string())
+    Attribute::String(v.as_bytes().to_vec())
 }
 
 /// An `Int`-valued attribute.
@@ -126,15 +126,12 @@ fn i_attr(v: i64) -> Attribute {
     Attribute::Int(v)
 }
 
-/// An embedded `ep_cache_context` payload, stored losslessly as a `UINT8`
-/// tensor attribute — exactly how the loader's `graph_builder` preserves the
-/// opaque binary blob (so arbitrary, non-UTF-8 bytes round-trip).
+/// An embedded `ep_cache_context` payload, stored as a raw-bytes STRING
+/// attribute — exactly how the loader's `graph_builder` now preserves the opaque
+/// binary blob generically (so arbitrary, non-UTF-8 bytes round-trip byte-exact
+/// with no op-specific handling).
 fn embedded_blob_attr(bytes: &[u8]) -> Attribute {
-    Attribute::Tensor(TensorData::from_raw(
-        DataType::Uint8,
-        vec![bytes.len()],
-        bytes.to_vec(),
-    ))
+    Attribute::String(bytes.to_vec())
 }
 
 /// Insert a `com.microsoft::EPContext` node `X → EPContext → Y_<tag>` with the

@@ -167,15 +167,14 @@ impl<'g> EpContextNode<'g> {
         self.inner
     }
 
-    /// Raw `ep_cache_context` bytes, if present. The loader preserves this
-    /// attribute's bytes losslessly as a `UINT8` tensor (see
-    /// `graph_builder`), because the payload for `embed_mode = 1` is an opaque
-    /// binary blob that must not be mangled by UTF-8 decoding. A plain string
-    /// attribute is accepted as a fallback (e.g. a hand-built graph).
+    /// Raw `ep_cache_context` bytes, if present. STRING attributes are stored in
+    /// the IR as raw bytes (see `Attribute::String`), so a binary payload is
+    /// never mangled by UTF-8 decoding. A `UINT8`/opaque tensor is accepted as a
+    /// fallback (e.g. a hand-built graph) (§55.3).
     fn ep_cache_context_bytes(&self) -> Option<&'g [u8]> {
         match self.inner.attributes.get(attr::EP_CACHE_CONTEXT)? {
+            Attribute::String(s) => Some(s),
             Attribute::Tensor(t) => Some(&t.data),
-            Attribute::String(s) => Some(s.as_bytes()),
             _ => None,
         }
     }

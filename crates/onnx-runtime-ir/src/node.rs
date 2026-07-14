@@ -80,10 +80,17 @@ impl Node {
 pub enum Attribute {
     Int(i64),
     Float(f32),
-    String(String),
+    /// An ONNX `STRING` attribute. Stored as **raw bytes**, not `String`, so
+    /// that the load/dump path round-trips the payload byte-exactly: ONNX
+    /// `STRING` attributes are arbitrary byte strings (e.g. an opaque compiled
+    /// blob) that are not guaranteed to be valid UTF-8. Use [`Attribute::as_str`]
+    /// to view the bytes as UTF-8 text when that is meaningful.
+    String(Vec<u8>),
     Ints(Vec<i64>),
     Floats(Vec<f32>),
-    Strings(Vec<String>),
+    /// An ONNX `STRINGS` attribute — a list of raw byte strings (see
+    /// [`Attribute::String`] for why bytes rather than `String`).
+    Strings(Vec<Vec<u8>>),
     Tensor(TensorData),
     SparseTensor(SparseTensorData),
     /// A subgraph body (control-flow ops: If/Loop/Scan). Stored inline; the
@@ -110,8 +117,19 @@ impl Attribute {
         }
     }
 
-    /// The `&str` value, if this is an [`Attribute::String`].
+    /// The value as UTF-8 text, if this is an [`Attribute::String`] whose bytes
+    /// are valid UTF-8. Returns `None` for a non-string attribute or for string
+    /// bytes that are not valid UTF-8 (e.g. an opaque binary payload).
     pub fn as_str(&self) -> Option<&str> {
+        match self {
+            Attribute::String(v) => std::str::from_utf8(v).ok(),
+            _ => None,
+        }
+    }
+
+    /// The raw bytes of an [`Attribute::String`], regardless of whether they are
+    /// valid UTF-8. Returns `None` for any other attribute kind.
+    pub fn as_bytes(&self) -> Option<&[u8]> {
         match self {
             Attribute::String(v) => Some(v),
             _ => None,
