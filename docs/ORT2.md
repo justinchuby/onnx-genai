@@ -2126,11 +2126,17 @@ pub fn run_shape_inference(mut graph: Graph) -> Result<Graph> {
 **Zero-config by default.** The user should never need to know what an "Execution Provider" is.
 The runtime auto-detects available hardware and picks the best execution strategy.
 
+**No IoBinding.** Buffer reuse is an internal optimization, not a user-facing API.
+The session automatically reuses output buffers when shapes don't change, and captures
+CUDA graphs when it detects stable shapes. Users who need explicit buffer control
+pass pre-allocated tensors via DLPack.
+
 Comparison with ORT:
 ```python
 # ORT (verbose, implementation-leaking):
 opts = ort.SessionOptions()
 opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+opts.intra_op_num_threads = 4
 session = ort.InferenceSession("model.onnx", opts, providers=["CUDAExecutionProvider"])
 output = session.run(None, {"input_ids": data})
 
@@ -2150,15 +2156,13 @@ pub fn load(path: impl AsRef<Path>) -> Result<InferenceSession> {
         .build()
 }
 
-pub struct InferenceSession { /* ... */ }
-
 impl InferenceSession {
-    /// Primary entry point: load model with auto-detected best device.
+    /// Primary entry point.
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
         Self::builder().model(path).build()
     }
 
-    /// Load from bytes (e.g. embedded model, downloaded from network).
+    /// Load from bytes.
     pub fn load_bytes(bytes: &[u8]) -> Result<Self> {
         Self::builder().model_bytes(bytes).build()
     }
@@ -2171,10 +2175,8 @@ impl InferenceSession {
     /// Run inference. Inputs by name.
     pub fn run(&mut self, inputs: &[(&str, &Tensor)]) -> Result<Vec<Tensor>>;
 
-    /// Run with pre-bound I/O (zero-copy, for hot loops).
-    pub fn run_with_binding(&mut self, binding: &IoBinding) -> Result<()>;
-
     /// Run from DLPack tensors (zero-copy from PyTorch/JAX).
+    /// Also supports pre-allocated output tensors for manual buffer control.
     pub fn run_from_dlpack(&mut self, inputs: &[(&str, DLManagedTensor)]) -> Result<Vec<Tensor>>;
 
     /// Input/output metadata.
@@ -2185,13 +2187,119 @@ impl InferenceSession {
 pub struct IoMeta {
     pub name: String,
     pub dtype: DataType,
-    pub shape: Shape,  // may have symbolic dims
+    pub shape: Shape,
 }
 ```
 
-### 20.3 Device Selection (Intent-Based, Not EP-Based)
+### 20.3 Internal Buffer Reuse (replaces IoBinding)
 
-Users express **what they want**, not **how to get it**:
+IoBinding is an **implementation detail**, not a user API. The session manages it internally:
+
+```rust
+/// Internal: tracks output buffers for reuse across runs.
+struct OutputBufferCache {
+    /// Last-used output buffers, keyed by output name.
+    buffers: HashMap<String, DeviceBuffer>,
+    /// Shape of last run (for reuse check).
+    last_shapes: HashMap<String, Vec<usize>>,
+    /// Number of consecutive runs with same shapes (for CUDA graph trigger).
+    stable_shape_count: u32,
+}
+
+impl OutputBufferCache {
+    /// If shape matches last run, reuse the buffer. Otherwise reallocate.
+    fn get_or_allocate(&mut self, name: &str, shape: &[usize], dtype: DataType, device: &dyn ExecutionProvider) -> Result<&mut DeviceBuffer>;
+
+    /// After N consecutive stable-shape runs, trigger CUDA graph capture.
+    fn should_capture_cuda_graph(&self) -> bool {
+        self.stable_shape_count >= 3
+    }
+}
+```
+
+User sees none of this. They just call `session.run()` and it's fast.
+
+### 20.4 Device Selection (Intent-Based)
+
+```rust
+/// What the user cares about.
+#[derive(Default)]
+pub enum DevicePreference {
+    /// Auto-detect best available. Priority: CUDA > MLX > ROCm > CPU.
+    #[default]
+    Auto,
+    /// Prefer GPU (any kind).
+    Gpu,
+    /// Specific GPU index (multi-GPU).
+    GpuIndex(u32),
+    /// Force CPU.
+    Cpu,
+    /// Explicit device (escape hatch).
+    Specific(DeviceId),
+}
+```
+
+### 20.5 Session Options (Three Tiers)
+
+**Tier 1: Zero-config (99% of users)**
+```rust
+let session = InferenceSession::load("model.onnx")?;
+```
+
+**Tier 2: Common needs (fluent API)**
+```rust
+let session = InferenceSession::builder()
+    .model("model.onnx")
+    .device(DevicePreference::Gpu)
+    .memory_limit(4 * GB)
+    .profiling(true)
+    .build()?;
+```
+
+**Tier 3: Namespaced key-value options (power users / escape hatch)**
+```rust
+let session = InferenceSession::builder()
+    .model("model.onnx")
+    .option("cuda.use_tf32", "true")
+    .option("cuda.device_id", "1")
+    .option("cpu.threads", "8")
+    .option("memory.arena_size", "2G")
+    .option("memory.weight_upload", "lazy")
+    .option("profiler.output", "/tmp/trace.json")
+    .option("custom_ops.library", "/path/to/custom_ops.so")
+    .build()?;
+```
+
+All options are namespaced with dot notation:
+
+| Namespace | Keys | Default | Notes |
+|-----------|------|---------|-------|
+| `cuda.*` | `use_tf32`, `device_id`, `arena_mb` | tf32=true, device=0 | CUDA-specific tuning |
+| `cpu.*` | `threads`, `pin_memory` | threads=physical_cores | CPU EP config |
+| `memory.*` | `arena_size`, `weight_upload` | auto, eager | Memory management |
+| `profiler.*` | `output`, `mode` | off | Profiling config |
+| `custom_ops.*` | `library` | none | Custom op registration |
+| `scheduler.*` | `cuda_graph`, `overlap` | auto, auto | Execution strategy |
+
+**What we delete from ORT (auto-decided, never exposed):**
+
+| ORT Option | Our Decision |
+|------------|-------------|
+| `graph_optimization_level` | Always optimize. Not configurable. |
+| `inter_op_num_threads` | No inter-op parallelism. Deleted. |
+| `enable_mem_pattern` | Always on. |
+| `enable_cpu_mem_arena` | Always on. |
+| `execution_mode` | Sequential only. |
+| `optimized_model_filepath` | Don't export optimized models. |
+| `log_severity_level` | Use `RUST_LOG` env var (tracing crate standard). |
+| `providers` list | DevicePreference auto-selects. |
+| `session_log_id` | Auto-generated. |
+| `session_log_verbosity_level` | Use `RUST_LOG`. |
+
+**Principle:** If the best value can be auto-determined, don't expose it.
+If it must be exposed, namespace it clearly.
+
+### 20.6 SessionBuilder
 
 ```rust
 pub struct SessionBuilder {
@@ -2201,124 +2309,67 @@ pub struct SessionBuilder {
     memory_limit: Option<usize>,
     enable_profiling: bool,
     warmup_shapes: Vec<WarmupShape>,
-}
-
-/// What the user actually cares about.
-#[derive(Default)]
-pub enum DevicePreference {
-    /// Auto-detect best available. This is the default.
-    /// Priority: CUDA > MLX > ROCm > CPU
-    #[default]
-    Auto,
-    /// Prefer GPU (any kind: CUDA, ROCm, MLX, WebGPU).
-    Gpu,
-    /// Prefer specific GPU by index (for multi-GPU systems).
-    GpuIndex(u32),
-    /// Force CPU only.
-    Cpu,
-    /// Explicit device (escape hatch for power users).
-    Specific(DeviceId),
+    options: HashMap<String, String>,  // namespaced key-value
 }
 
 impl SessionBuilder {
     pub fn new() -> Self;
     pub fn model(self, path: impl AsRef<Path>) -> Self;
     pub fn model_bytes(self, bytes: &[u8]) -> Self;
-
-    /// Set device preference. Default: Auto (best available).
     pub fn device(self, pref: DevicePreference) -> Self;
-
-    /// Set memory limit (for device memory budgeting).
     pub fn memory_limit(self, bytes: usize) -> Self;
-
-    /// Enable profiling for this session.
     pub fn profiling(self, enable: bool) -> Self;
-
-    /// Pre-compile kernels for expected shapes (avoid first-run latency).
     pub fn warmup(self, shapes: Vec<WarmupShape>) -> Self;
+
+    /// Namespaced option. Unknown keys are rejected at build() time.
+    pub fn option(self, key: &str, value: &str) -> Self;
 
     /// Build: load → detect device → optimize → compile → allocate.
     pub fn build(self) -> Result<InferenceSession>;
 }
 ```
 
-### 20.4 Auto-Detection Logic
+### 20.7 Auto-Detection Logic
 
 ```rust
-/// Called during build() when DevicePreference::Auto.
 fn auto_detect_device() -> Vec<Box<dyn ExecutionProvider>> {
     let mut eps: Vec<Box<dyn ExecutionProvider>> = vec![];
-
-    // Try CUDA
-    if let Ok(cuda) = CudaEp::detect() {
-        eps.push(Box::new(cuda));
-    }
-    // Try MLX (macOS Apple Silicon)
+    if let Ok(cuda) = CudaEp::detect() { eps.push(Box::new(cuda)); }
     #[cfg(target_os = "macos")]
-    if let Ok(mlx) = MlxEp::detect() {
-        eps.push(Box::new(mlx));
-    }
-    // Try ROCm
-    if let Ok(rocm) = detect_legacy_ep("libonnxruntime_rocm.so") {
-        eps.push(rocm);
-    }
-    // CPU always available as fallback
-    eps.push(Box::new(CpuEp::new()));
-
+    if let Ok(mlx) = MlxEp::detect() { eps.push(Box::new(mlx)); }
+    if let Ok(rocm) = detect_legacy_ep("libonnxruntime_rocm.so") { eps.push(rocm); }
+    eps.push(Box::new(CpuEp::new()));  // always available
     eps
 }
 ```
 
-The user never sees EP names. The runtime just does the right thing.
-
-### 20.5 Python API
+### 20.8 Python API
 
 ```python
 import ort2
 
-# Simplest possible:
+# Zero-config:
 session = ort2.load("model.onnx")
 output = session.run(input_ids=input_array)
 
-# With device preference:
+# Device preference:
 session = ort2.load("model.onnx", device="gpu")
 
-# With memory limit:
-session = ort2.load("model.onnx", memory_limit=4 * 1024**3)  # 4GB
+# Namespaced options:
+session = ort2.load("model.onnx",
+    device="gpu:1",
+    memory_limit=4 * 1024**3,
+    options={
+        "cuda.use_tf32": "true",
+        "profiler.output": "/tmp/trace.json",
+    },
+)
 
-# Advanced (explicit builder):
-session = ort2.Session.builder() \
-    .model("model.onnx") \
-    .device("gpu:1") \
-    .profiling(True) \
-    .build()
-
-# Zero-copy from PyTorch:
+# Zero-copy PyTorch:
 import torch
 tensor = torch.randn(1, 128, device="cuda")
-output = session.run(input_ids=tensor)  # auto DLPack, no copy
-
-# Zero-copy output to PyTorch:
-import torch
-result = session.run(input_ids=data)
-torch_tensor = torch.from_dlpack(result["logits"])  # no copy
-```
-
-### 20.6 IoBinding (Hot Path, Zero-Copy)
-
-For repeated inference with same-shaped inputs (e.g. LLM decode loop),
-pre-allocate and reuse buffers:
-
-```rust
-let mut binding = session.create_binding()?;
-binding.bind_input("input_ids", &input_buffer)?;
-binding.bind_output("logits", &output_buffer)?;
-
-// Hot loop — no allocation, no name lookup
-for token in 0..max_tokens {
-    session.run_with_binding(&binding)?;
-    // output_buffer already contains the logits
-}
+output = session.run(input_ids=tensor)  # DLPack, no copy
+torch_output = torch.from_dlpack(output["logits"])  # no copy
 ```
 
 ---
