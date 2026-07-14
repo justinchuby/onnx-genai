@@ -123,13 +123,19 @@ fn map_session_error(err: &SessionError) -> OrtErrorCode {
         | E::DtypeMismatch { .. }
         | E::ShapeMismatch { .. }
         | E::UnknownOption { .. }
-        | E::DynamicShape { .. } => OrtErrorCode::InvalidArgument,
+        | E::DynamicShape { .. }
+        | E::SymbolConflict { .. }
+        | E::RankMismatch { .. } => OrtErrorCode::InvalidArgument,
         E::NoModelSource => OrtErrorCode::NoModel,
         E::UnsupportedOp { .. } => OrtErrorCode::NotImplemented,
         E::Ep(_) => OrtErrorCode::EpFail,
         E::Ir(_) | E::Graph(_) => OrtErrorCode::InvalidGraph,
         E::Load(load) => map_loader_error(load),
-        E::NotInitialized | E::Internal(_) => OrtErrorCode::Fail,
+        E::NotInitialized
+        | E::Internal(_)
+        | E::UnresolvedShape { .. }
+        | E::ShapeOverflow { .. }
+        | E::OutputShapeCountMismatch { .. } => OrtErrorCode::Fail,
     }
 }
 
@@ -697,5 +703,54 @@ mod tests {
         assert!(!msg.is_null());
         // Releasing null is a no-op (idempotent guard against double-free).
         unsafe { ort2_release_status(ptr::null_mut()) };
+    }
+
+    #[test]
+    fn session_error_mapping_covers_shape_and_symbol_variants() {
+        use onnx_runtime_session::SessionError as E;
+
+        // Input-validation failures surface as INVALID_ARGUMENT, consistent
+        // with the existing dtype/shape/rank mismatch mappings.
+        assert_eq!(
+            map_session_error(&E::SymbolConflict {
+                symbol: "N".into(),
+                first: 2,
+                second: 3,
+            }),
+            OrtErrorCode::InvalidArgument
+        );
+        assert_eq!(
+            map_session_error(&E::RankMismatch {
+                name: "x".into(),
+                expected: 2,
+                got: 3,
+            }),
+            OrtErrorCode::InvalidArgument
+        );
+
+        // Internal shape-resolution failures are not caused by caller
+        // arguments, so they map to FAIL.
+        assert_eq!(
+            map_session_error(&E::UnresolvedShape {
+                value: "y".into(),
+                op: "Reshape".into(),
+            }),
+            OrtErrorCode::Fail
+        );
+        assert_eq!(
+            map_session_error(&E::ShapeOverflow {
+                value: "y".into(),
+                dims: vec![usize::MAX, 2],
+            }),
+            OrtErrorCode::Fail
+        );
+        assert_eq!(
+            map_session_error(&E::OutputShapeCountMismatch {
+                op: "NonZero".into(),
+                expected: 1,
+                got: 2,
+            }),
+            OrtErrorCode::Fail
+        );
     }
 }
