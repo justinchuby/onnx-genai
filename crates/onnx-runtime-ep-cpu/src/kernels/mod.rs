@@ -41,6 +41,7 @@ pub mod gather;
 pub mod gelu;
 pub mod gemm;
 pub mod identity;
+pub mod indexing;
 pub mod layernorm;
 pub mod logical;
 pub mod matmul;
@@ -51,6 +52,8 @@ pub mod reduce;
 pub mod reduce_ops;
 pub mod relu;
 pub mod reshape;
+pub mod selection;
+pub mod sequence;
 pub mod shape;
 pub mod slice;
 pub mod softmax;
@@ -129,6 +132,16 @@ pub const PHASE1_OPS: &[&str] = &[
     "Flatten",
     "Squeeze",
     "Size",
+    "GatherElements",
+    "GatherND",
+    "Tile",
+    "Range",
+    "CumSum",
+    "Clip",
+    "ArgMax",
+    "ArgMin",
+    "TopK",
+    "NonZero",
     // GEMM.
     "Gemm",
 ];
@@ -351,6 +364,39 @@ pub fn build_cpu_registry() -> OpRegistry {
     reg.register(
         OpKey::new("Size", "", 1),
         Box::new(movement_ops::SizeFactory),
+    );
+    // Indexed data movement and sequence construction.
+    reg.register(
+        OpKey::new("GatherElements", "", 11),
+        Box::new(indexing::GatherElementsFactory),
+    );
+    reg.register(
+        OpKey::new("GatherND", "", 11),
+        Box::new(indexing::GatherNDFactory),
+    );
+    reg.register(OpKey::new("Tile", "", 6), Box::new(sequence::TileFactory));
+    reg.register(
+        OpKey::new("Range", "", 11),
+        Box::new(sequence::RangeFactory),
+    );
+    reg.register(
+        OpKey::new("CumSum", "", 11),
+        Box::new(sequence::CumSumFactory),
+    );
+    // Value selection.
+    reg.register(OpKey::new("Clip", "", 1), Box::new(selection::ClipFactory));
+    reg.register(
+        OpKey::new("ArgMax", "", 1),
+        Box::new(selection::ArgMaxFactory),
+    );
+    reg.register(
+        OpKey::new("ArgMin", "", 1),
+        Box::new(selection::ArgMinFactory),
+    );
+    reg.register(OpKey::new("TopK", "", 10), Box::new(selection::TopKFactory));
+    reg.register(
+        OpKey::new("NonZero", "", 9),
+        Box::new(selection::NonZeroFactory),
     );
     reg
 }
