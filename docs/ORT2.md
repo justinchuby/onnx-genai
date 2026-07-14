@@ -540,6 +540,28 @@ pub trait ExecutionProvider: Send + Sync {
     /// Claimed nodes bypass cost-model placement and go directly to this EP.
     /// Use for EPs that know better than the cost model (e.g. entire subgraph offload).
     fn claim_nodes(&self, graph: &Graph) -> Vec<NodeId> { vec![] }
+
+    /// Save EP-compiled context (TensorRT engines, QNN graphs, etc.).
+    /// Serialized into the compilation cache (§41) so subsequent loads
+    /// skip EP-side compilation entirely.
+    fn save_context(&self) -> Result<Option<EpContext>> { Ok(None) }
+
+    /// Restore EP context from cache. EP can skip its compilation step.
+    fn load_context(&mut self, ctx: &EpContext) -> Result<()> { Ok(()) }
+}
+
+/// Opaque EP-compiled artifact. Serializable to/from disk.
+pub struct EpContext {
+    /// EP that produced this context.
+    pub ep_name: String,
+    /// EP version (invalidate cache if EP version changes).
+    pub ep_version: String,
+    /// Opaque compiled blob (TRT engine, QNN context binary, etc.).
+    pub data: Vec<u8>,
+    /// Nodes this context covers (for partial graph compilation).
+    pub covered_nodes: Vec<NodeId>,
+    /// Hardware fingerprint (invalidate if hardware changes).
+    pub device_fingerprint: String,
 }
 
 /// Macro: generate ORT C ABI export for any EP crate.
