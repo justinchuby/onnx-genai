@@ -2,8 +2,6 @@
 //! `Where`. Binary/variadic integer ops also propagate shape-data so arithmetic
 //! *on* shape vectors (e.g. `Concat`-of-dims + 1) resolves symbolically.
 
-use onnx_runtime_ir::DataType;
-
 use crate::context::InferenceContext;
 use crate::dim_expr::DimExpr;
 use crate::error::ShapeInferError;
@@ -125,8 +123,10 @@ fn binary_shape_data(op: &str, a: Option<&ShapeData>, b: Option<&ShapeData>) -> 
     } else {
         vec![elems.len()]
     };
+    // Carry the operands' integer dtype rather than assuming Int64 (a shape
+    // chain may be Int32); the values are identical, only the label differs.
     Some(ShapeData {
-        dtype: DataType::Int64,
+        dtype: a.dtype,
         dims,
         elems,
     })

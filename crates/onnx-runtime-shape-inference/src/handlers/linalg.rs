@@ -1,5 +1,7 @@
 //! Linear-algebra rules: `MatMul` (NumPy semantics) and `Gemm`.
 
+use onnx_runtime_ir::Attribute;
+
 use crate::context::InferenceContext;
 use crate::dim_expr::DimExpr;
 use crate::error::ShapeInferError;
@@ -11,10 +13,81 @@ pub fn matmul(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
     let b = ctx.input_shape(1).map(<[DimExpr]>::to_vec);
     let dtype = ctx.input_dtype(0);
     if let (Some(a), Some(b), Some(dtype)) = (a, b, dtype) {
-        let shape = matmul_shape(ctx, &a, &b)?;
+        let shape = matmul_shape(ctx, &a, &b, "MatMul")?;
         ctx.set_output(0, dtype, shape);
     }
     Ok(())
+}
+
+/// `com.microsoft.FusedMatMul`: MatMul with optional pre-transposition of the
+/// last two dims (`transA`/`transB`) and batch-axis relocation
+/// (`transBatchA`/`transBatchB`), plus a shape-neutral `alpha` scale.
+///
+/// ORT emits this op throughout optimized transformer graphs (MatMul+Transpose
+/// fusion in attention QKᵀ and post-transpose FC layers). We reorder each
+/// operand's dims into the plain `[batch…, row, col]` layout per the contrib
+/// spec, then reuse [`matmul_shape`] so all the 1-D promotion, batch broadcast,
+/// and contraction-mismatch checking that plain MatMul does still applies.
+/// `alpha` only scales values, so it has no shape effect and is ignored.
+pub fn fused_matmul(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
+    let a = ctx.input_shape(0).map(<[DimExpr]>::to_vec);
+    let b = ctx.input_shape(1).map(<[DimExpr]>::to_vec);
+    let dtype = ctx.input_dtype(0);
+    let (Some(a), Some(b), Some(dtype)) = (a, b, dtype) else {
+        return Ok(());
+    };
+    let flag = |name: &str| {
+        ctx.node
+            .attr(name)
+            .and_then(Attribute::as_int)
+            .unwrap_or(0)
+            != 0
+    };
+    let a_eff = apply_fused_trans(&a, flag("transA"), flag("transBatchA"));
+    let b_eff = apply_fused_trans(&b, flag("transB"), flag("transBatchB"));
+    let shape = matmul_shape(ctx, &a_eff, &b_eff, "FusedMatMul")?;
+    ctx.set_output(0, dtype, shape);
+    Ok(())
+}
+
+/// Reorder a FusedMatMul operand's dims into the plain-MatMul `[batch…, row,
+/// col]` layout given its `trans` / `trans_batch` flags.
+///
+/// Mirrors ORT's `FusedMatMulShapeInference` (contrib_defs.cc): `trans` swaps
+/// the trailing row/col pair; `trans_batch` relocates the *leading* batch axis
+/// into the row slot (moving the remaining leading dims `1..rank-1` into the
+/// batch prefix). A rank-≤1 (vector) operand is returned unchanged — numpy
+/// transpose of a vector is a no-op, matching ORT which forces the flags off.
+fn apply_fused_trans(raw: &[DimExpr], trans: bool, trans_batch: bool) -> Vec<DimExpr> {
+    let rank = raw.len();
+    if rank < 2 {
+        return raw.to_vec();
+    }
+    let mut out = Vec::with_capacity(rank);
+    // Batch prefix: dims `1..rank-1` when relocating the leading batch axis,
+    // else the leading `0..rank-2`.
+    let (start, end) = if trans_batch {
+        (1, rank - 1)
+    } else {
+        (0, rank - 2)
+    };
+    out.extend_from_slice(&raw[start..end]);
+    // Row (M) then col (K) indices, per ORT's dim-selection expressions.
+    let row_idx = if trans {
+        rank - 1
+    } else if trans_batch {
+        0
+    } else {
+        rank - 2
+    };
+    let col_idx = if trans {
+        if trans_batch { 0 } else { rank - 2 }
+    } else {
+        rank - 1
+    };
+    out.push(raw[row_idx].clone());
+    out.push(raw[col_idx].clone());
+    out
 }
 
 /// Compute the output shape of `A @ B` following `numpy.matmul`.
@@ -22,10 +95,11 @@ fn matmul_shape(
     ctx: &mut InferenceContext,
     a: &[DimExpr],
     b: &[DimExpr],
+    op: &str,
 ) -> Result<Vec<DimExpr>, ShapeInferError> {
     if a.is_empty() || b.is_empty() {
         return Err(ShapeInferError::Invalid {
-            op: "MatMul".into(),
+            op: op.into(),
             detail: "operands must have rank ≥ 1".into(),
         });
     }
@@ -57,7 +131,7 @@ fn matmul_shape(
         && ka != kb
     {
         return Err(ShapeInferError::Invalid {
-            op: "MatMul".into(),
+            op: op.into(),
             detail: format!("contraction mismatch: {ka} vs {kb}"),
         });
     }
@@ -110,6 +184,6 @@ pub fn gemm(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
 pub fn register(reg: &mut InferenceRegistry) {
     reg.register("", "MatMul", 1, matmul);
     reg.register("", "Gemm", 1, gemm);
-    // com.microsoft fused matmul variants share MatMul's output shape.
-    reg.register("com.microsoft", "FusedMatMul", 1, matmul);
+    // com.microsoft fused matmul honors transA/transB/transBatch attributes.
+    reg.register("com.microsoft", "FusedMatMul", 1, fused_matmul);
 }

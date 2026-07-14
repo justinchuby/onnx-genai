@@ -58,20 +58,29 @@ pub fn reduce(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
         .unwrap_or(0)
         != 0;
 
-    // Axes: attribute first, then a shape-data input (opset-18 form).
-    let axes_raw: Option<Vec<i64>> = ctx
+    // Axes: attribute first (opset ≤17), then a shape-data input (opset-18).
+    let axes_attr: Option<Vec<i64>> = ctx
         .node
         .attr("axes")
         .and_then(|a| a.as_ints())
-        .map(<[i64]>::to_vec)
-        .or_else(|| {
-            ctx.input_shape_data(1).and_then(|sd| {
-                sd.elems
-                    .iter()
-                    .map(|e| e.as_const())
-                    .collect::<Option<Vec<i64>>>()
-            })
-        });
+        .map(<[i64]>::to_vec);
+    let axes_raw: Option<Vec<i64>> = axes_attr.clone().or_else(|| {
+        ctx.input_shape_data(1).and_then(|sd| {
+            sd.elems
+                .iter()
+                .map(|e| e.as_const())
+                .collect::<Option<Vec<i64>>>()
+        })
+    });
+
+    // Distinguish a genuinely-absent/empty axes list from an axes *input* that
+    // is present but unresolved (missing or symbolic shape-data). In the latter
+    // case we cannot know which axes are reduced — nor, under
+    // `noop_with_empty_axes`, whether this node is a no-op — so leaving the
+    // output unresolved is more honest than fabricating a reduce-all shape.
+    if axes_raw.is_none() && axes_attr.is_none() && ctx.has_input(1) {
+        return Ok(());
+    }
 
     let axes: Vec<usize> = match axes_raw {
         Some(a) if !a.is_empty() => a.into_iter().map(|ax| norm_axis(ax, rank.max(1))).collect(),

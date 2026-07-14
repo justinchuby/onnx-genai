@@ -95,7 +95,10 @@ impl SymbolInterner {
     /// Mint a brand-new opaque symbol (not tied to any expression).
     pub fn fresh_symbol(&mut self) -> SymbolId {
         let id = SymbolId(self.next);
-        self.next += 1;
+        // Saturating rather than wrapping: exhausting the u32 symbol space is
+        // adversarial/pathological, but must never wrap `next` back into the
+        // range of already-minted ids (which would alias symbols).
+        self.next = self.next.saturating_add(1);
         self.fresh.push(id);
         id
     }
@@ -108,6 +111,11 @@ impl SymbolInterner {
     /// Lower a [`DimExpr`] to an IR [`Dim`], interning derived expressions to a
     /// stable fresh symbol.
     pub fn lower(&mut self, expr: &DimExpr) -> Dim {
+        // An overflowed (unknown) expression has no representable value and must
+        // not alias other overflows via the cache: mint a distinct fresh symbol.
+        if expr.is_overflow() {
+            return Dim::Symbolic(self.fresh_symbol());
+        }
         if let Some(n) = expr.as_const() {
             if n >= 0 {
                 return Dim::Static(n as usize);
@@ -315,8 +323,12 @@ impl<'a> InferenceContext<'a> {
                         detail: format!("incompatible broadcast dims {x} and {y}"),
                     })
                 } else {
-                    // Permissive: the larger extent wins.
-                    Ok(DimExpr::constant(x.max(y)))
+                    // Permissive: two provably-unequal, non-1 concrete extents
+                    // are genuinely incompatible. Rather than fabricate a
+                    // `max(x, y)` that matches neither operand, degrade to a
+                    // fresh symbol (an honest "unknown") so we never assert a
+                    // bogus concrete dimension.
+                    Ok(self.fresh_dim())
                 }
             }
             // A concrete non-`1` extent dominates a symbolic one (the symbol

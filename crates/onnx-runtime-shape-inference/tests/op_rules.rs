@@ -51,6 +51,11 @@ fn with_attr(mut n: Node, name: &str, attr: Attribute) -> Node {
     n
 }
 
+fn with_domain(mut n: Node, domain: &str) -> Node {
+    n.domain = domain.to_string();
+    n
+}
+
 fn run(n: &Node, inputs: Vec<NodeIo>, opset: u64) -> Vec<NodeIo> {
     run_policy(n, inputs, opset, MergePolicy::Permissive)
 }
@@ -163,7 +168,92 @@ fn gemm_transb() {
     assert_eq!(out_shape(&outs), vec![c(8), c(32)]);
 }
 
-// --- broadcasting binary --------------------------------------------------
+// --- FusedMatMul (com.microsoft) ------------------------------------------
+
+/// A `com.microsoft::FusedMatMul` node with the given int attributes.
+fn fused_matmul_node(attrs: &[(&str, i64)]) -> Node {
+    let mut n = with_domain(node("FusedMatMul", 2, 1), "com.microsoft");
+    for &(name, v) in attrs {
+        n = with_attr(n, name, Attribute::Int(v));
+    }
+    n
+}
+
+#[test]
+fn fused_matmul_transb() {
+    // The exact case Chew cited: A [8,64] · B [32,64]^T -> [8,32]. The plain
+    // matmul reuse produced the wrong [8,64]; the dedicated handler is correct.
+    let n = fused_matmul_node(&[("transB", 1)]);
+    let outs = run(&n, vec![f32in(vec![c(8), c(64)]), f32in(vec![c(32), c(64)])], 1);
+    assert_eq!(out_shape(&outs), vec![c(8), c(32)]);
+}
+
+#[test]
+fn fused_matmul_transa() {
+    // A supplied as [K, M] = [64, 8], transA=1 -> M=8; B [64, 32] -> [8, 32].
+    let n = fused_matmul_node(&[("transA", 1)]);
+    let outs = run(&n, vec![f32in(vec![c(64), c(8)]), f32in(vec![c(64), c(32)])], 1);
+    assert_eq!(out_shape(&outs), vec![c(8), c(32)]);
+}
+
+#[test]
+fn fused_matmul_transa_and_transb() {
+    // A [K,M]=[64,8] transA, B [N,K]=[32,64] transB -> [8, 32].
+    let n = fused_matmul_node(&[("transA", 1), ("transB", 1)]);
+    let outs = run(&n, vec![f32in(vec![c(64), c(8)]), f32in(vec![c(32), c(64)])], 1);
+    assert_eq!(out_shape(&outs), vec![c(8), c(32)]);
+}
+
+#[test]
+fn fused_matmul_batched_transb() {
+    // Batched: A [N,8,64] · B [N,32,64]^T -> [N,8,32] (symbolic batch preserved).
+    let n = fused_matmul_node(&[("transB", 1)]);
+    let outs = run(
+        &n,
+        vec![
+            f32in(vec![sym(0), c(8), c(64)]),
+            f32in(vec![sym(0), c(32), c(64)]),
+        ],
+        1,
+    );
+    assert_eq!(out_shape(&outs), vec![sym(0), c(8), c(32)]);
+}
+
+#[test]
+fn fused_matmul_plain_matches_matmul() {
+    // With no transpose flags, FusedMatMul must equal plain MatMul.
+    let n = fused_matmul_node(&[]);
+    let outs = run(&n, vec![f32in(vec![c(2), c(3)]), f32in(vec![c(3), c(4)])], 1);
+    assert_eq!(out_shape(&outs), vec![c(2), c(4)]);
+}
+
+#[test]
+fn fused_matmul_alpha_is_shape_neutral() {
+    // `alpha` scales values only; it must not affect the output shape.
+    let mut n = fused_matmul_node(&[("transB", 1)]);
+    n = with_attr(n, "alpha", Attribute::Float(2.0));
+    let outs = run(&n, vec![f32in(vec![c(8), c(64)]), f32in(vec![c(32), c(64)])], 1);
+    assert_eq!(out_shape(&outs), vec![c(8), c(32)]);
+}
+
+#[test]
+fn fused_matmul_trans_batch_a_moves_leading_axis() {
+    // transBatchA relocates the leading axis into the row (M) slot:
+    // A [4, 2, 8] -> effective [2, 4, 8] (batch=2, M=4, K=8);
+    // B [2, 8, 16] -> [2, 4, 16].
+    let n = fused_matmul_node(&[("transBatchA", 1)]);
+    let outs = run(
+        &n,
+        vec![
+            f32in(vec![c(4), c(2), c(8)]),
+            f32in(vec![c(2), c(8), c(16)]),
+        ],
+        1,
+    );
+    assert_eq!(out_shape(&outs), vec![c(2), c(4), c(16)]);
+}
+
+
 
 #[test]
 fn add_broadcast_concrete() {
@@ -251,6 +341,49 @@ fn reshape_symbolic_target_dim() {
     let outs = run(&n, vec![f32in(vec![sym(0), c(8), c(16)]), target], 13);
     // -1 = (N*8*16)/N = 128
     assert_eq!(out_shape(&outs), vec![sym(0), c(128)]);
+}
+
+#[test]
+fn reshape_overflowing_total_degrades_to_symbol() {
+    // Regression (Holden): an input whose concrete element count is 2^80
+    // overflows i64. The inferred `-1` dim must degrade to a fresh symbol, not
+    // panic (debug) and not wrap to a bogus static 0 (release).
+    let n = node("Reshape", 2, 1);
+    let big = c(1 << 20);
+    let target = sd_vec(vec![c(-1)]);
+    let outs = run(
+        &n,
+        vec![
+            f32in(vec![big.clone(), big.clone(), big.clone(), big]),
+            target,
+        ],
+        13,
+    );
+    let out = out_shape(&outs);
+    assert_eq!(out.len(), 1);
+    // Fresh symbol (anon range), never a concrete 0 or negative dim.
+    assert_eq!(out[0].as_const(), None);
+    assert!(out[0].as_symbol().is_some());
+}
+
+#[test]
+fn size_overflowing_total_is_not_bogus() {
+    // `Size` over a 2^80-element tensor overflows i64; the shape-data scalar it
+    // emits must be an unknown (overflow) dim, never a wrapped concrete value.
+    let n = node("Size", 1, 1);
+    let big = c(1 << 20);
+    let outs = run(
+        &n,
+        vec![f32in(vec![big.clone(), big.clone(), big.clone(), big])],
+        13,
+    );
+    let sd = outs[0]
+        .shape_data
+        .as_ref()
+        .expect("Size emits shape-data");
+    assert_eq!(sd.elems.len(), 1);
+    assert!(sd.elems[0].is_overflow());
+    assert_eq!(sd.elems[0].as_const(), None);
 }
 
 // --- Transpose ------------------------------------------------------------

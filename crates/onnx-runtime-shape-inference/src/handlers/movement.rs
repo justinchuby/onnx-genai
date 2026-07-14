@@ -305,11 +305,17 @@ pub fn concat(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
 /// Concatenate shape-data operands (scalars contribute one element each).
 fn concat_shape_data(ctx: &InferenceContext, present: &[usize]) -> Option<ShapeData> {
     let mut elems = Vec::new();
-    for &i in present {
+    // Carry the operands' actual integer dtype rather than assuming Int64: a
+    // shape-computation chain may run on Int32 dims.
+    let mut dtype = DataType::Int64;
+    for (k, &i) in present.iter().enumerate() {
         let sd = ctx.input_shape_data(i)?;
+        if k == 0 {
+            dtype = sd.dtype;
+        }
         elems.extend(sd.elems.iter().cloned());
     }
-    Some(ShapeData::vector(DataType::Int64, elems))
+    Some(ShapeData::vector(dtype, elems))
 }
 
 /// `Slice` (opset ≥ 10 input-driven, with an opset < 10 attribute fallback).
@@ -541,8 +547,9 @@ fn gather_shape_data(ctx: &InferenceContext) -> Option<ShapeData> {
     }
 }
 
-/// `GatherElements`/`GatherND`-lite: output shape follows the indices; dtype of
-/// the data.
+/// `GatherElements`: the output shape follows the indices tensor; dtype of the
+/// data. (Not `GatherND` — this is the elementwise gather whose output rank
+/// equals the indices' rank.)
 pub fn gather_elements(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
     let dtype = ctx.input_dtype(0);
     let idx_shape = ctx.input_shape(1).map(<[DimExpr]>::to_vec);

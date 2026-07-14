@@ -23,6 +23,24 @@
 //! represent exactly (floor division by a symbol, non-exact division) surface
 //! as `None`, and the caller falls back to a fresh opaque symbol — the same
 //! permissive degrade the reference implementation uses.
+//!
+//! # Overflow contract
+//!
+//! Coefficients are `i64`. A pathological (but not necessarily malicious) graph
+//! can drive a concrete total past `i64::MAX` — e.g. a `Size`/`Reshape` product
+//! over four `2^20` dims is `2^80`. Every coefficient combiner
+//! ([`add`](DimExpr::add), [`sub`](DimExpr::sub), [`mul`](DimExpr::mul)) is
+//! therefore **checked**: on overflow it does **not** panic (as unchecked debug
+//! arithmetic would) and does **not** wrap to a bogus — possibly zero or
+//! negative — static dim (as unchecked release arithmetic would). Instead the
+//! result **degrades to an opaque unknown** ([`DimExpr::overflow`]): an
+//! expression that reports as neither a constant nor a bare symbol, poisons any
+//! further arithmetic it participates in, and lowers to a *fresh* symbol (see
+//! [`crate::context::SymbolInterner::lower`]). This matches the crate's
+//! permissive philosophy: a single pathological dim degrades to "unknown"
+//! rather than aborting whole-graph inference. [`checked_div`](DimExpr::checked_div)
+//! likewise returns `None` on overflow (including the `i64::MIN / -1` edge) so
+//! the caller degrades to a fresh symbol.
 
 use std::collections::BTreeMap;
 
@@ -36,9 +54,15 @@ type Monomial = Vec<u32>;
 ///
 /// Invariant: `terms` never contains a zero coefficient, and every key
 /// ([`Monomial`]) is sorted ascending. The empty map is the integer `0`.
+///
+/// The `overflow` flag marks an expression whose exact value could not be
+/// represented because a coefficient combiner exceeded `i64` range. Such an
+/// expression is an opaque unknown (see the module-level overflow contract):
+/// it is never a constant or bare symbol, and it lowers to a fresh symbol.
 #[derive(Clone, PartialEq, Eq, Hash, Debug, Default)]
 pub struct DimExpr {
     terms: BTreeMap<Monomial, i64>,
+    overflow: bool,
 }
 
 impl DimExpr {
@@ -48,18 +72,43 @@ impl DimExpr {
         if n != 0 {
             terms.insert(Vec::new(), n);
         }
-        Self { terms }
+        Self {
+            terms,
+            overflow: false,
+        }
     }
 
     /// A single symbolic dimension.
     pub fn symbol(s: SymbolId) -> Self {
         let mut terms = BTreeMap::new();
         terms.insert(vec![s.0], 1);
-        Self { terms }
+        Self {
+            terms,
+            overflow: false,
+        }
+    }
+
+    /// An opaque unknown produced by an arithmetic overflow. See the
+    /// module-level overflow contract. It reports as neither a constant nor a
+    /// bare symbol, poisons any arithmetic it participates in, and lowers to a
+    /// fresh symbol.
+    pub fn overflow() -> Self {
+        Self {
+            terms: BTreeMap::new(),
+            overflow: true,
+        }
+    }
+
+    /// Whether this expression is the overflow/unknown sentinel.
+    pub fn is_overflow(&self) -> bool {
+        self.overflow
     }
 
     /// The integer value, if this expression is a pure constant (includes `0`).
     pub fn as_const(&self) -> Option<i64> {
+        if self.overflow {
+            return None;
+        }
         match self.terms.len() {
             0 => Some(0),
             1 => self.terms.get(&Vec::new()).copied(),
@@ -70,7 +119,7 @@ impl DimExpr {
     /// The single symbol, if this expression is exactly one symbol with
     /// coefficient `1` (e.g. a bare `Dim::Symbolic` round-trips through this).
     pub fn as_symbol(&self) -> Option<SymbolId> {
-        if self.terms.len() != 1 {
+        if self.overflow || self.terms.len() != 1 {
             return None;
         }
         let (mono, &coeff) = self.terms.iter().next()?;
@@ -93,35 +142,80 @@ impl DimExpr {
     }
 
     /// `self + other`.
+    ///
+    /// Overflow-safe: an out-of-range coefficient sum degrades the result to
+    /// [`DimExpr::overflow`] (never panics, never wraps). See the module-level
+    /// overflow contract.
     pub fn add(&self, other: &DimExpr) -> DimExpr {
+        if self.overflow || other.overflow {
+            return DimExpr::overflow();
+        }
         let mut terms = self.terms.clone();
         for (mono, &coeff) in &other.terms {
-            *terms.entry(mono.clone()).or_insert(0) += coeff;
+            let slot = terms.entry(mono.clone()).or_insert(0);
+            match slot.checked_add(coeff) {
+                Some(v) => *slot = v,
+                None => return DimExpr::overflow(),
+            }
         }
-        DimExpr { terms }.prune()
+        DimExpr {
+            terms,
+            overflow: false,
+        }
+        .prune()
     }
 
     /// `self - other`.
+    ///
+    /// Overflow-safe: see [`add`](DimExpr::add).
     pub fn sub(&self, other: &DimExpr) -> DimExpr {
+        if self.overflow || other.overflow {
+            return DimExpr::overflow();
+        }
         let mut terms = self.terms.clone();
         for (mono, &coeff) in &other.terms {
-            *terms.entry(mono.clone()).or_insert(0) -= coeff;
+            let slot = terms.entry(mono.clone()).or_insert(0);
+            match slot.checked_sub(coeff) {
+                Some(v) => *slot = v,
+                None => return DimExpr::overflow(),
+            }
         }
-        DimExpr { terms }.prune()
+        DimExpr {
+            terms,
+            overflow: false,
+        }
+        .prune()
     }
 
     /// `self * other`.
+    ///
+    /// Overflow-safe: an out-of-range coefficient product or accumulation
+    /// degrades the result to [`DimExpr::overflow`]. See [`add`](DimExpr::add).
     pub fn mul(&self, other: &DimExpr) -> DimExpr {
+        if self.overflow || other.overflow {
+            return DimExpr::overflow();
+        }
         let mut terms: BTreeMap<Monomial, i64> = BTreeMap::new();
         for (a_mono, &a_c) in &self.terms {
             for (b_mono, &b_c) in &other.terms {
+                let Some(prod) = a_c.checked_mul(b_c) else {
+                    return DimExpr::overflow();
+                };
                 let mut mono = a_mono.clone();
                 mono.extend_from_slice(b_mono);
                 mono.sort_unstable();
-                *terms.entry(mono).or_insert(0) += a_c * b_c;
+                let slot = terms.entry(mono).or_insert(0);
+                match slot.checked_add(prod) {
+                    Some(v) => *slot = v,
+                    None => return DimExpr::overflow(),
+                }
             }
         }
-        DimExpr { terms }.prune()
+        DimExpr {
+            terms,
+            overflow: false,
+        }
+        .prune()
     }
 
     /// `self / other`, only when the division is *exact*.
@@ -133,6 +227,11 @@ impl DimExpr {
     /// dividing by a multi-term polynomial, or a non-exact quotient — returns
     /// `None` so the caller can degrade to a fresh symbol.
     pub fn checked_div(&self, other: &DimExpr) -> Option<DimExpr> {
+        // A poisoned operand has no representable value: degrade (caller mints a
+        // fresh symbol on `None`).
+        if self.overflow || other.overflow {
+            return None;
+        }
         if self.terms.is_empty() {
             return Some(DimExpr::constant(0));
         }
@@ -146,7 +245,10 @@ impl DimExpr {
         }
         let mut out: BTreeMap<Monomial, i64> = BTreeMap::new();
         for (mono, &coeff) in &self.terms {
-            if coeff % div_coeff != 0 {
+            // `checked_rem`/`checked_div` guard the `i64::MIN / -1` overflow
+            // (divisor coefficients can be negative via `sub`): `None` degrades
+            // to a fresh symbol rather than panicking.
+            if coeff.checked_rem(div_coeff)? != 0 {
                 return None;
             }
             // Subtract the divisor's symbol multiset from this monomial.
@@ -155,9 +257,15 @@ impl DimExpr {
                 let pos = remaining.iter().position(|s| s == sym)?;
                 remaining.remove(pos);
             }
-            out.insert(remaining, coeff / div_coeff);
+            out.insert(remaining, coeff.checked_div(div_coeff)?);
         }
-        Some(DimExpr { terms: out }.prune())
+        Some(
+            DimExpr {
+                terms: out,
+                overflow: false,
+            }
+            .prune(),
+        )
     }
 
     /// The product of a slice of expressions (`1` for an empty slice).
@@ -278,5 +386,43 @@ mod tests {
             DimExpr::from(Dim::Symbolic(SymbolId(9))).as_symbol(),
             Some(SymbolId(9))
         );
+    }
+
+    #[test]
+    fn mul_overflow_degrades_to_unknown() {
+        // A 2^80-scale product (four 2^20 dims) exceeds i64: no panic (as debug
+        // unchecked arithmetic would) and no wrap-to-zero (as release would).
+        let big = DimExpr::constant(1 << 20);
+        let total = DimExpr::product(&[big.clone(), big.clone(), big.clone(), big]);
+        assert!(total.is_overflow());
+        assert_eq!(total.as_const(), None); // never a bogus concrete dim
+        assert_eq!(total.as_symbol(), None);
+    }
+
+    #[test]
+    fn add_and_sub_overflow_degrade() {
+        let max = DimExpr::constant(i64::MAX);
+        assert!(max.add(&DimExpr::constant(1)).is_overflow());
+        let min = DimExpr::constant(i64::MIN);
+        assert!(min.sub(&DimExpr::constant(1)).is_overflow());
+    }
+
+    #[test]
+    fn overflow_poisons_further_arithmetic() {
+        let poisoned = DimExpr::overflow();
+        assert!(poisoned.add(&DimExpr::constant(1)).is_overflow());
+        assert!(poisoned.mul(&DimExpr::constant(2)).is_overflow());
+        assert!(poisoned.sub(&DimExpr::constant(3)).is_overflow());
+        assert!(poisoned.checked_div(&DimExpr::constant(4)).is_none());
+        // An overflowed divisor also degrades.
+        assert!(DimExpr::constant(8).checked_div(&poisoned).is_none());
+    }
+
+    #[test]
+    fn checked_div_guards_i64_min_over_neg_one() {
+        // i64::MIN / -1 overflows; the guard degrades to None rather than panic.
+        let num = DimExpr::constant(i64::MIN);
+        let div = DimExpr::constant(-1);
+        assert!(num.checked_div(&div).is_none());
     }
 }

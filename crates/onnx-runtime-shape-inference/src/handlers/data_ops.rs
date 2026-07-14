@@ -112,8 +112,16 @@ pub fn constant_of_shape(ctx: &mut InferenceContext) -> Result<(), ShapeInferErr
             fill,
             numel_known && (dtype.is_int() || dtype == DataType::Bool),
         ) {
-            let numel: i64 = shape.iter().filter_map(|d| d.as_const()).product();
-            if (0..=1024).contains(&numel) {
+            // Overflow-safe product: a pathological shape whose element count
+            // exceeds i64 degrades to "no shape-data" rather than panicking or
+            // wrapping (mirrors the DimExpr overflow contract).
+            let numel: Option<i64> = shape
+                .iter()
+                .filter_map(|d| d.as_const())
+                .try_fold(1i64, |acc, d| acc.checked_mul(d));
+            if let Some(numel) = numel
+                && (0..=1024).contains(&numel)
+            {
                 let elems = vec![fill; numel as usize];
                 ctx.set_output_shape_data(0, ShapeData::vector(dtype, elems));
             }
