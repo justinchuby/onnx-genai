@@ -79,9 +79,26 @@ not yet wired) · **🔬 custom** (needs a fused NVRTC/CUTLASS kernel).
 
 | Op | Domain | Status | Backend | Notes |
 |----|--------|--------|---------|-------|
-| `Softmax` (v1 & v13) | `` | ⏳ | **cuDNN** (`cudnnSoftmaxForward`) *or* NVRTC | Per-axis, numerically stable. A reusable NVRTC softmax already exists inside `attention.rs` — extract it as a standalone `Softmax` kernel; cuDNN for large rows. |
-| `LayerNormalization` | `` / `com.microsoft` | 🔬 | **NVRTC-custom** (fused) | Mean/var + affine in one pass beats a cuDNN call + separate affine; classic fusion win. |
-| `ReduceMean` | `` | ⏳ | **cub** (`DeviceReduce`) / NVRTC | Multi-axis, keepdims. cub segmented reduce for the reduced axis. |
+| `Softmax` (v1 & v13) | `` | ✅ | **NVRTC-custom** (fused block reduction) | Per-axis, numerically stable (subtract row max). Legacy coerce-to-2D at opset ≤ 12, single-axis at opset ≥ 13 (registry picks by `since_version`). Kept as our own kernel (not cuDNN) so it stays fusable — the attention path already embeds exactly this reduction (`softmax.rs`). |
+| `LayerNormalization` | `` / `com.microsoft` | ✅ | **NVRTC-custom** (fused) | Mean/var + normalize + affine in **one** pass over one HBM read — beats a cuDNN reduce + separate pointwise affine. Population stats, optional `Mean`/`InvStdDev` outputs, arbitrary `axis` (`normalization.rs`). f32. |
+| `SkipLayerNormalization` | `com.microsoft` | ✅ | **NVRTC-custom** (fused) | `LayerNorm(input + skip + bias)·γ + β` — the residual add is fused into the norm, saving a whole tensor round-trip. Optional `beta`/`bias` inputs, optional `mean`/`inv_std`/`input_skip_bias_sum` outputs (`normalization.rs`). f32. |
+| `RMSNormalization` / `SimplifiedLayerNormalization` | `` / `com.microsoft` | ✅ | **NVRTC-custom** (fused) | Root-mean-square scale, no mean subtraction (LLaMA-family norm). Optional `InvStdDev` output, arbitrary `axis` (`normalization.rs`). f32. |
+| `ReduceMean` | `` | ✅ | **NVRTC block reduction** (cub-class) | See reductions below. |
+
+### Reductions
+
+| Op | Domain | Status | Backend | Notes |
+|----|--------|--------|---------|-------|
+| `ReduceSum` | `` | ✅ | **NVRTC block reduction** (cub-class) | Arbitrary axes (attribute or opset-13+ input), `keepdims`, `noop_with_empty_axes`, negative axes. Exact base/delta offset split → one block per output element (`reduce.rs`). f32. |
+| `ReduceMean` | `` | ✅ | **NVRTC block reduction** (cub-class) | As `ReduceSum`, dividing by the group size. |
+| `ReduceMax` | `` | ✅ | **NVRTC block reduction** (cub-class) | As above; NaN-propagating (numpy / CPU-EP semantics). |
+| `ReduceMin` | `` | ✅ | **NVRTC block reduction** (cub-class) | As above; NaN-propagating. |
+
+> **Why NVRTC block reduction, not cub?** cub's `DeviceSegmentedReduce` is the
+> vendor primitive, and our kernel matches its shape (one block per output
+> element, cooperative shared-memory tree reduce over that element's group). We
+> keep it as an NVRTC kernel so the crate stays toolkit-free (no `nvcc`/`build.rs`);
+> the offset tables let it handle any axis set / rank without special-casing.
 
 ### Attention
 
@@ -94,7 +111,8 @@ not yet wired) · **🔬 custom** (needs a fused NVRTC/CUTLASS kernel).
 
 | Op | Domain | Status | Backend | Notes |
 |----|--------|--------|---------|-------|
-| `Cast` | `` | ⏳ | **NVRTC-custom** | dtype conversion pointwise kernel (fixed-width numeric + bf16/f16). |
+| `Cast` | `` | ✅ | **NVRTC-custom** | Element-wise dtype conversion; f32/f64/f16/bf16/int8-64/uint8-64/bool, ONNX saturating float→int. Two NVRTC modules keep f16/bf16 (which need NVRTC's built-in `cuda_fp16.h`/`cuda_bf16.h`) out of the common integer/f32 path (`cast.rs`). |
+| `CastLike` | `` | ✅ | **NVRTC-custom** | Same kernel as `Cast`; target dtype taken from the output tensor. |
 | `Identity` | `` | ⏳ | **memcpy** (D2D) | Straight device copy; dtype-agnostic. |
 | `Reshape` | `` | ⏳ | **view rewrite** | Metadata-only when contiguous; else materialise. |
 | `Transpose` | `` | ⏳ | **NVRTC-custom** / cuBLAS | Tiled-transpose kernel (or fold into a consumer's GEMM `op`). |
@@ -105,10 +123,20 @@ not yet wired) · **🔬 custom** (needs a fused NVRTC/CUTLASS kernel).
 | `Slice` | `` | ⏳ | **NVRTC-custom** | Strided/stepped copy (opset-10 input-driven ranges). |
 | `Constant` | `` | ⏳ | **host + H2D** | Upload the constant to device once. |
 
-**Score:** reference set (unique op types) = **31**. CUDA **before** this slice =
-**2** (`MatMul`, `Attention`). CUDA **after** = **16**
+**Score:** reference set (unique op types) = **31**. CUDA **before** the Wave-1
+slice = **2** (`MatMul`, `Attention`). CUDA **after** Wave 1 = **16**
 (`MatMul`, `Gemm`, `Relu`, `Sqrt`, `Erf`, `Tanh`, `Sigmoid`, `Gelu`, `Add`,
-`Sub`, `Mul`, `Div`, `Pow`, `Min`, `Max`, `Attention`).
+`Sub`, `Mul`, `Div`, `Pow`, `Min`, `Max`, `Attention`). CUDA **after Wave 2** =
+**27** (+ `Softmax`, `LayerNormalization`, `SkipLayerNormalization`,
+`SimplifiedLayerNormalization`/`RMSNormalization`, `Cast`, `CastLike`,
+`ReduceSum`, `ReduceMean`, `ReduceMax`, `ReduceMin`).
+
+> **⚠️ Runtime/perf verification pending.** The Wave-2 kernels were written and
+> reviewed on a host with **only `libcuda`** (no cuBLASLt/cuDNN/NVRTC runtime,
+> no `nvcc`), so they compile + pass GPU-free unit tests but have **not** been
+> executed or benchmarked. Numerical correctness rests on the stable formulas
+> cited in each kernel's comments (matched to the CPU EP). Runtime + perf
+> validation must happen on an H200.
 
 ---
 

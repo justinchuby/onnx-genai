@@ -22,9 +22,13 @@ use onnx_runtime_ep_api::{OpKey, OpRegistry};
 use crate::runtime::CudaRuntime;
 
 pub mod attention;
+pub mod cast;
 pub mod elementwise;
 pub mod gemm;
 pub mod matmul;
+pub mod normalization;
+pub mod reduce;
+pub mod softmax;
 
 use elementwise::{BinaryFactory, BinaryOp, UnaryFactory, UnaryOp};
 
@@ -39,12 +43,23 @@ use elementwise::{BinaryFactory, BinaryOp, UnaryFactory, UnaryOp};
 /// * **Attention** — the SDPA/GQA baseline (`com.microsoft` domain; cuBLAS
 ///   batched GEMM + NVRTC softmax), the §13.3 binding a cuDNN-fused SDPA /
 ///   FlashAttention-3 shim drops in behind.
+/// * **Softmax** — standalone axis-reduction softmax (fused NVRTC block
+///   reduction; legacy coerce-to-2D at opset ≤ 12, per-axis at opset ≥ 13).
+/// * **Normalization** — fused NVRTC `LayerNormalization` (ai.onnx +
+///   `com.microsoft`), `RMSNormalization` / `SimplifiedLayerNormalization`, and
+///   `SkipLayerNormalization` (residual add fused into the norm).
+/// * **Cast / CastLike** — NVRTC element-wise dtype conversion (f32/f64/f16/bf16/
+///   int8-64/uint8-64/bool).
+/// * **Reductions** — `ReduceSum`, `ReduceMean`, `ReduceMax`, `ReduceMin`
+///   (NVRTC block reduction; arbitrary axes, keepdims, opset-18 axes-as-input).
 ///
 /// See `docs/CUDA_COVERAGE.md` for the full op → backend mapping matrix and the
 /// prioritised list of remaining / custom-kernel ops.
 pub const CUDA_COVERED_OPS: &[&str] = &[
     "MatMul", "Gemm", "Relu", "Sqrt", "Erf", "Tanh", "Sigmoid", "Gelu", "Add", "Sub", "Mul", "Div",
-    "Pow", "Min", "Max", "Attention",
+    "Pow", "Min", "Max", "Attention", "Softmax", "LayerNormalization", "SkipLayerNormalization",
+    "SimplifiedLayerNormalization", "RMSNormalization", "Cast", "CastLike", "ReduceSum",
+    "ReduceMean", "ReduceMax", "ReduceMin",
 ];
 
 /// Build an [`OpRegistry`] populated with the CUDA kernel factories.
@@ -113,5 +128,129 @@ pub fn build_cuda_registry(runtime: Arc<CudaRuntime>) -> OpRegistry {
             runtime: runtime.clone(),
         }),
     );
+
+    // ── CUDA Wave 2 — transformer-critical ops (see docs/CUDA_COVERAGE.md) ──
+
+    // Softmax (fused NVRTC block reduction). Legacy coerce-to-2D at opset ≤ 12,
+    // per-axis at opset ≥ 13 — the registry picks the highest `since_version`
+    // ≤ opset, mirroring the CPU EP.
+    reg.register(
+        OpKey::new("Softmax", "", 1),
+        Box::new(softmax::SoftmaxLegacyFactory {
+            runtime: runtime.clone(),
+        }),
+    );
+    reg.register(
+        OpKey::new("Softmax", "", 13),
+        Box::new(softmax::SoftmaxFactory {
+            runtime: runtime.clone(),
+        }),
+    );
+
+    // LayerNormalization (fused NVRTC). Standard domain + the optimizer's
+    // `com.microsoft` fused form share identical semantics.
+    for domain in ["", "com.microsoft"] {
+        reg.register(
+            OpKey::new("LayerNormalization", domain, 1),
+            Box::new(normalization::LayerNormFactory {
+                runtime: runtime.clone(),
+            }),
+        );
+    }
+
+    // RMSNormalization (fused NVRTC, no mean subtraction): the ai.onnx op and the
+    // `com.microsoft` `SimplifiedLayerNormalization` are the same computation.
+    reg.register(
+        OpKey::new("SimplifiedLayerNormalization", "com.microsoft", 1),
+        Box::new(normalization::RmsNormFactory {
+            runtime: runtime.clone(),
+        }),
+    );
+    reg.register(
+        OpKey::new("RMSNormalization", "", 1),
+        Box::new(normalization::RmsNormFactory {
+            runtime: runtime.clone(),
+        }),
+    );
+
+    // SkipLayerNormalization (fused residual add + layernorm).
+    reg.register(
+        OpKey::new("SkipLayerNormalization", "com.microsoft", 1),
+        Box::new(normalization::SkipLayerNormFactory {
+            runtime: runtime.clone(),
+        }),
+    );
+
+    // Cast / CastLike (NVRTC element-wise dtype conversion).
+    for op_type in ["Cast", "CastLike"] {
+        reg.register(
+            OpKey::new(op_type, "", 1),
+            Box::new(cast::CastFactory {
+                runtime: runtime.clone(),
+            }),
+        );
+    }
+
+    // Reductions (NVRTC block reduction; cub-class segmented reduce shape).
+    reg.register(
+        OpKey::new("ReduceSum", "", 1),
+        Box::new(reduce::ReduceSumFactory {
+            runtime: runtime.clone(),
+        }),
+    );
+    reg.register(
+        OpKey::new("ReduceMean", "", 1),
+        Box::new(reduce::ReduceMeanFactory {
+            runtime: runtime.clone(),
+        }),
+    );
+    reg.register(
+        OpKey::new("ReduceMax", "", 1),
+        Box::new(reduce::ReduceMaxFactory {
+            runtime: runtime.clone(),
+        }),
+    );
+    reg.register(
+        OpKey::new("ReduceMin", "", 1),
+        Box::new(reduce::ReduceMinFactory {
+            runtime: runtime.clone(),
+        }),
+    );
+
     reg
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CUDA_COVERED_OPS;
+
+    #[test]
+    fn wave2_ops_are_listed_in_coverage() {
+        for op in [
+            "Softmax",
+            "LayerNormalization",
+            "SkipLayerNormalization",
+            "SimplifiedLayerNormalization",
+            "RMSNormalization",
+            "Cast",
+            "CastLike",
+            "ReduceSum",
+            "ReduceMean",
+            "ReduceMax",
+            "ReduceMin",
+        ] {
+            assert!(
+                CUDA_COVERED_OPS.contains(&op),
+                "{op} missing from CUDA_COVERED_OPS"
+            );
+        }
+    }
+
+    #[test]
+    fn covered_ops_have_no_duplicates() {
+        let mut seen = std::collections::HashSet::new();
+        for op in CUDA_COVERED_OPS {
+            assert!(seen.insert(*op), "duplicate op {op} in CUDA_COVERED_OPS");
+        }
+    }
 }
