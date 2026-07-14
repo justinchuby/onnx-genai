@@ -54,3 +54,5 @@ Advanced fixture work is canonical: builders use onnxscript/onnx-ir, `tiny-mtp-f
 - **Commit:** 8089a1f — Reviewed 🟡 Chew
 - Owned: fixture updates (W5a mixed-head_dim), K4 multi-layer KV coverage, Milestone B numerics sign-off.
 - Verified fp16↔f32 conversion exactness and paged-path round-trip is a true inverse for fp16 KV.
+
+- 2026-07-14T19:05:00Z — Reviewed Ana's `nxrt` PyO3 FFI/abi3 binding; verdict GREEN. Binding merged in `878559f`.

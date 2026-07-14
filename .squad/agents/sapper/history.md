@@ -33,3 +33,5 @@ Added the preprocessing-side prompt token-expansion library for multi-tile VLM i
 - `speculative.input_embedding` now emitted in YAML by default when target_model is supplied.
 - Scale: graph f16 `39.1875` vs Leon's manual `sqrt(1536)=39.1918`; 1.1e-4 difference, negligible.
 - 23 integration tests pass. Regenerated `~/gemma4-e2b-onnx/input_embedding.f32`.
+
+- 2026-07-14T19:05:00Z — ITT tracer collector review by Joshi recorded GREEN for commit `977a50b`; unsafe prohibition, nesting, bounded domain lifetime, graceful degradation, feature hygiene, and all gates verified.

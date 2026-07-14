@@ -1171,3 +1171,69 @@ Session unit (`option_tests`), session e2e (`tests/epcontext.rs`: byte-exact non
 **Why:** §49 unified-tracing GPU collector. Reviewer verified `read_unaligned` packed-prefix field-for-field against real `cupti_activity.h` `CUpti_ActivityKernel10` — ABI-stable, no UB.
 
 ---
+
+
+### 2026-07-14: nxrt Python binding (`crates/onnx-runtime-python`)
+**By:** Ana
+**What:** Added the PyO3/maturin `nxrt` wheel crate with abi3 cp310 default and documented abi3t support, an onnxruntime-shaped `InferenceSession` API, buffer-protocol numpy interop, actionable Python exception mapping, and `onnx-tests` integration. The conformance work also added CPU Identity, made zero-batch MatMul return an empty result instead of panicking, and preserved NaNs in Relu.
+**Why:** Provide a safe Python entry point while using conformance to expose and fix real CPU EP correctness gaps. Validation reached 34 Python tests and 120 CPU EP tests; CUDA execution and executed abi3t validation remain follow-ups.
+
+### 2026-07-14: Tracer auto-diagnosis and roofline analysis
+**By:** Coco
+**What:** Added an infallible pure-Rust tracer diagnosis module with actionable WHAT/WHY/HOW findings, robust slow-op and shape-instability detection, conditional memory-thrashing and prefetch-stall detection, and roofline classification through `KernelSample`. Missing metrics produce `Indeterminate`, never fabricated zeroes or division failures.
+**Why:** Fit diagnosis to trace data available today while retaining a seam for future CUPTI counters. Suboptimal placement and numerical-divergence remain documented hooks.
+
+### 2026-07-14T18:05:00Z: Fail-fast model validation at load time
+**By:** Justin Chu (@justinchuby)
+**What:** Models missing required opset imports, malformed graphs, and statically knowable illegal/unsupported structures must fail during loading with actionable errors. Missing opsets must never leak a `u64::MAX` sentinel into user-facing runtime errors; executor handling is an unreachable invariant backstop.
+**Why:** Invalid models must be rejected at their source rather than surfacing confusing failures deep in execution.
+
+### 2026-07-14T17:30:00Z: Tracer must diagnose missed optimized-kernel paths
+**By:** Justin Chu (@justinchuby)
+**What:** AutoDiagnosis must prominently report when an available optimized kernel was rejected and a slower path ran, including the exact shape, dtype, layout, opset, EP-capability, attribute, precision, or feature-gate disqualifier and a concrete remediation. EP/executor selection must emit rejection metadata at selection time.
+**Why:** Silent fallback is a major performance cliff and the rejection reason cannot be reconstructed reliably after execution.
+
+### 2026-07-14: Pipeline API seams
+**By:** Freysa
+**What:** Added `ChatTemplate::builtin_default`, public `Engine::tokenize`, and `Engine::embed_text`/`embed_text_with_options` as additive foundations for PIPELINE.md. The default template reuses the existing constant; text embedding composes the public tokenizer with existing embedding paths; tokenizer errors identify `tokenizer.json` remediation.
+**Why:** The future pipeline facade needs stable prompt-length/tokenization and one-call text-to-embedding seams without exposing the private prompt tokenizer.
+
+### 2026-07-14: Preserve node identity in unsupported-op errors
+**By:** Gaff
+**What:** Proposed preserving ONNX node names and enriching `SessionError::UnsupportedOp` with normalized domain, node identity, opset, consulted EPs, and remediation.
+**Status:** 🔴 Original implementation rejected because its missing-opset path leaked the internal `u64::MAX` sentinel. The node-identity and actionable legal-unsupported-op portions were retained through the later fail-fast loader solution.
+
+### 2026-07-14T16:55:00Z: Review — pipeline API seams
+**By:** Holden
+**Target:** Freysa commit `ecba2c1` | **Verdict:** 🟢 GREEN
+**What:** Verified default-template reuse/equivalence, shared tokenizer behavior, private `tokenize_prompt`, embedding composition, actionable tokenizer errors, builds, clippy, and four new tests. The 18 full engine-suite failures were pre-existing missing-fixture failures.
+
+### 2026-07-14T16:15:00Z: Review — ITT tracer collector
+**By:** Joshi
+**Target:** Sapper commit `977a50b` | **Verdict:** 🟢 GREEN
+**What:** Verified unsafe remains forbidden for `itt`, per-thread nested task balancing is sound, process-lifetime domain leaks are bounded and deduplicated, unattached collectors degrade inertly, feature composition is clean, and all default/itt/cupti build-test-clippy gates pass. The safe ittapi-based deviation from the design sketch is justified.
+
+### 2026-07-14: Missing opset imports fail during model load
+**By:** Leon
+**What:** Added shared `onnx_runtime_loader::validate_opset_imports` validation for file loading and `InferenceSession::from_graph`, including nested subgraphs and `""`/`"ai.onnx"` domain equivalence. Missing imports now return actionable `LoaderError::MissingOpsetImport`; executor lookup treats absence as an unreachable invariant.
+**Why:** ONNX requires every used domain to be imported, so malformed models must fail before weights, inference, placement, or execution.
+
+### 2026-07-14: Process bridge for per-EP ONNX conformance
+**By:** Mariette
+**What:** Use a dependency-free Rust session example, a Python `cbourjau/onnx-tests` driver, and a compact binary tensor interchange. The offline CPU baseline covers all 25 `PHASE1_OPS`; explicit CUDA selection follows when the session exposes an EP-selection seam.
+**Why:** The process boundary keeps Python/Hypothesis out of nxrt while exercising the real loader/session/EP stack and scaling to future EPs.
+
+### 2026-07-14: Explicit undeclared-opset representation
+**By:** Rachael
+**What:** Replaced user-facing sentinel rendering with `OpsetVersion::{Known, Undeclared}` and graceful unnamed-node text in unsupported-op diagnostics.
+**Status:** Superseded for normal user paths by Leon's loader fail-fast validation; the explicit representation documents the defensive runtime distinction and avoids ever displaying `u64::MAX`.
+
+### 2026-07-14T16:45:00Z: Review — CUDA EP Phase-2a SDPA/GQA attention
+**By:** Roy
+**Target:** Deckard commit `5655297` | **Verdict:** 🟢 GREEN
+**What:** Re-derived cuBLAS transpose/layout algebra, GQA head mapping, causal cross-attention indexing, softmax numerics, FFI safety/cleanup, and actionable errors. H200 GPU tests passed for MHA, causal MHA, GQA, and masked cross-attention with maximum absolute error below `2e-7`; build, clippy, and tests passed.
+
+### 2026-07-14: User-controllable dynamic Resource Governor
+**By:** Sebastian
+**What:** DESIGN.md §26.11 defines engine-level per-device byte-denominated VRAM, host-RAM, and optional disk-spill limits with live transactional reconfiguration. Bytes are authoritative and page/token budgets are derived; lowering drives existing eviction tiers and rolls back if unsatisfiable, while raising admits queued work without eviction. YAML, Rust, planned PyO3 APIs, snapshots, metrics, and actionable over-budget errors are specified.
+**Why:** Existing static page/token budgets did not provide the user-facing live resource controls needed across sessions and memory tiers.

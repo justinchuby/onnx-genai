@@ -81,3 +81,5 @@ Security review of `weights.rs` traversal guard (commit `340d7b0`). Audited all 
 ## 2026-07-14T14:50:00Z — gaff-16: Review — nxrt C-ABI symbol rename (leon-16)
 
 Non-author review of Leon's `ort2_*` → `nxrt_*` C-ABI rename. Verified both files become byte-identical to their parents when `nxrt_` normalized back to `ort2_`; zero `ort2_` remaining in `crates/`; preserved legacy text limited to unchanged citations and intentional label strings; no alias shims or dangling intra-doc links. Eight-crate build + 17 capi tests + rustdoc: all PASS. **Verdict: 🟢 GREEN.**
+
+- 2026-07-14T19:05:00Z — UnsupportedOp enrichment was rejected because `u64::MAX` leaked as a user-facing opset. Useful node/domain/EP context survived; missing imports are now rejected during loading by Leon's merged validation.

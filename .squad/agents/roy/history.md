@@ -100,3 +100,5 @@ Reviewed Deckard's crate-name-reservation prep. Rejected: `docs/CRATE_RESERVATIO
 ## 2026-07-14T14:50:00Z — roy-23: Re-review — crate-reservation cycle fix (leon-17) 🟢 GREEN
 
 Cleared the earlier 🔴. Verified packaged shape-inference manifest has empty `[dev-dependencies]` section (no loader); all 8 versions/pins correct; 75 tests pass; IR dry-run succeeds; runbook updated. **Verdict: 🟢 GREEN.** Advisory: direct shape-inference packaging will fail until IR is in the registry (expected per documented sequence).
+
+- 2026-07-14T19:05:00Z — CUDA EP Phase-2a SDPA/GQA attention review recorded GREEN: layout algebra, GQA mapping, causal indexing, numerics, safety, and H200 GPU results verified for Deckard commit `5655297`.

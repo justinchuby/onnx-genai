@@ -110,3 +110,5 @@ Renamed all 17 `ort2_*` `extern "C"` symbols to `nxrt_*` in `onnx-runtime-capi/s
 ## 2026-07-14T14:50:00Z — leon-17: Fix — break shape-inference-loader publish cycle (183a876)
 
 Revision owner after Deckard (deckard-23) was locked out following roy-22 🔴 rejection. Made `onnx-runtime-shape-inference`'s dev-dep on `onnx-runtime-loader` path-only (no version) so `cargo publish` omits it from the packaged manifest. Verified cycle broken (packaged manifest: loader absent). 75 shape-inference tests pass. Runbook updated with path-only rationale and valid publish order. Commit `183a876`. **Reviewer: roy-23 🟢.**
+
+- 2026-07-14T19:05:00Z — Loader opset-import validation for file/from-parts paths and nested subgraphs merged in `00cda89`; executor sentinel path is now an unreachable invariant. Holden final review GREEN.

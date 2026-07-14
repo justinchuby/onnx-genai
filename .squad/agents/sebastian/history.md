@@ -39,3 +39,5 @@ Sebastian's perf review is now in decisions. §26 should prioritize active-row c
 - **Graph diff:** FL fuses Q/K/V into one MatMulNBits (N=1152) → 121 MatMulNBits / 299 nodes vs our 169 / 394 (48 fewer dispatches/token). But decode is bandwidth-bound (M=1), so fused QKV is **decode-neutral** — measured neutral. Low priority for CPU decode; prefill-only.
 - **Task B (FL C++):** FL sets **zero custom ORT SessionOptions** — delegates to onnxruntime-genai (`genai_model_instance.cc:29-58`); IO binding + `past_present_share_buffer` are inside that lib. Our runtime already matches (ORT_ENABLE_ALL, IO binding, shared-KV). No missing session option.
 - **No code change** (none warranted). Follow-ups: warmup discipline + server startup priming (Leon/Seb), TTFT/prefill ~2-4% residual (Leon), fused-QKV low-prio (Sapper). Doc: `docs/benchmarks/2026-07-13-foundry-local-analysis.md`; decision inbox `sebastian-foundry-analysis.md`. Did NOT commit.
+
+- 2026-07-14T19:05:00Z — DESIGN.md §26.11 Resource Governor merged in `d6736e1`, specifying live byte-denominated VRAM/RAM limits, transactional lowering, and actionable over-budget errors.

@@ -55,3 +55,5 @@ Batched-driver DoS hardening is canonical: admission is bounded by `max_pending`
 - Routing parity now holds across all four inference endpoints.
 - §37 / Issue #9 epic fully complete.
 - Next: §34 router epic (R1/R2/R3) has kicked off.
+
+- 2026-07-14T19:05:00Z — Revised unsupported-op diagnostics to explicit `OpsetVersion::{Known, Undeclared}` and graceful unnamed nodes. Final loader fail-fast validation makes undeclared opsets unreachable on normal paths.

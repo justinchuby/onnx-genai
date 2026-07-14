@@ -116,3 +116,5 @@ Authored `squad/ort2-epctx-options` (off `origin/main` `0fa025e`). Commit `3e8db
 ## 2026-07-14T14:50:00Z — chew-26: Review — AttentionFusion kernel/numerics/shape (batty-18)
 
 Reviewed Batty's `com.microsoft::FusedAttention` kernel, softmax helper extraction, shape rule, and parity test (kernel/shape/numerics half; optimizer/matcher = Roy). Verified: `softmax_slices` is a pure visibility change (body unchanged); scale-before-mask-before-softmax order correct; both k_transposed branches compute Q·Kᵀ correctly; batched leading dims and mask broadcast correct; hand-derived unmasked pre-transposed test numerics match. k_transposed matcher↔kernel contract consistent. Shape rule mirrors k_transposed swap; 3 shape tests correct. Parity test ATOL=1e-6 (not loosened), non-tautological. Zero new unsafe; `#![forbid(unsafe_code)]` intact. ep-cpu 113 + shape 57 + session all green; clippy -D warnings clean. **Verdict: 🟢 GREEN — approve.** No revision required.
+
+- 2026-07-14T19:05:00Z — Fixed clippy findings and corrected pytest count for the Python binding; changes included in merged commit `878559f`.
