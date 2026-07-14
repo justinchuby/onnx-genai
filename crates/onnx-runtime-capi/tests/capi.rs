@@ -12,11 +12,11 @@ use std::path::PathBuf;
 use std::ptr;
 
 use onnx_runtime_capi::{
-    ort2_add_session_config_entry, ort2_create_session, ort2_create_session_options,
-    ort2_create_session_with_options, ort2_create_tensor, ort2_get_error_code,
-    ort2_get_error_message, ort2_get_tensor_data, ort2_get_tensor_dtype, ort2_get_tensor_rank,
-    ort2_get_tensor_shape, ort2_release_session, ort2_release_session_options,
-    ort2_release_status, ort2_release_value, ort2_run, OrtErrorCode, OrtSession,
+    nxrt_add_session_config_entry, nxrt_create_session, nxrt_create_session_options,
+    nxrt_create_session_with_options, nxrt_create_tensor, nxrt_get_error_code,
+    nxrt_get_error_message, nxrt_get_tensor_data, nxrt_get_tensor_dtype, nxrt_get_tensor_rank,
+    nxrt_get_tensor_shape, nxrt_release_session, nxrt_release_session_options,
+    nxrt_release_status, nxrt_release_value, nxrt_run, OrtErrorCode, OrtSession,
     OrtSessionOptions, OrtValue,
 };
 use onnx_runtime_loader::proto::onnx;
@@ -139,7 +139,7 @@ fn full_roundtrip_matches_reference() {
 
     // Create session.
     let mut session: *mut OrtSession = ptr::null_mut();
-    let status = unsafe { ort2_create_session(c_path.as_ptr(), &mut session) };
+    let status = unsafe { nxrt_create_session(c_path.as_ptr(), &mut session) };
     assert!(status.is_null(), "create_session should succeed");
     assert!(!session.is_null());
 
@@ -149,7 +149,7 @@ fn full_roundtrip_matches_reference() {
     let x_shape = [2i64, 3];
     let mut x_value: *mut OrtValue = ptr::null_mut();
     let status = unsafe {
-        ort2_create_tensor(
+        nxrt_create_tensor(
             x_bytes.as_ptr() as *const c_void,
             x_bytes.len(),
             x_shape.as_ptr(),
@@ -169,7 +169,7 @@ fn full_roundtrip_matches_reference() {
     let output_names = [out_name.as_ptr()];
     let mut out_value: *mut OrtValue = ptr::null_mut();
     let status = unsafe {
-        ort2_run(
+        nxrt_run(
             session,
             input_names.as_ptr(),
             input_values.as_ptr(),
@@ -184,24 +184,24 @@ fn full_roundtrip_matches_reference() {
 
     // Read output dtype.
     let mut dtype: i32 = -1;
-    let status = unsafe { ort2_get_tensor_dtype(out_value, &mut dtype) };
+    let status = unsafe { nxrt_get_tensor_dtype(out_value, &mut dtype) };
     assert!(status.is_null());
     assert_eq!(dtype, FLOAT);
 
     // Read output rank + shape.
     let mut rank: usize = 0;
-    let status = unsafe { ort2_get_tensor_rank(out_value, &mut rank) };
+    let status = unsafe { nxrt_get_tensor_rank(out_value, &mut rank) };
     assert!(status.is_null());
     assert_eq!(rank, 2);
     let mut dims = vec![0i64; rank];
-    let status = unsafe { ort2_get_tensor_shape(out_value, dims.as_mut_ptr(), rank) };
+    let status = unsafe { nxrt_get_tensor_shape(out_value, dims.as_mut_ptr(), rank) };
     assert!(status.is_null());
     assert_eq!(dims, vec![2, 2]);
 
     // Read output data + assert against reference.
     let mut data_ptr: *const c_void = ptr::null();
     let mut data_len: usize = 0;
-    let status = unsafe { ort2_get_tensor_data(out_value, &mut data_ptr, &mut data_len) };
+    let status = unsafe { nxrt_get_tensor_data(out_value, &mut data_ptr, &mut data_len) };
     assert!(status.is_null());
     assert_eq!(data_len, 4 * 4); // 4 f32
     let out_bytes = unsafe { std::slice::from_raw_parts(data_ptr as *const u8, data_len) };
@@ -216,9 +216,9 @@ fn full_roundtrip_matches_reference() {
 
     // Release everything (each exactly once).
     unsafe {
-        ort2_release_value(out_value);
-        ort2_release_value(x_value);
-        ort2_release_session(session);
+        nxrt_release_value(out_value);
+        nxrt_release_value(x_value);
+        nxrt_release_session(session);
     }
 }
 
@@ -228,7 +228,7 @@ fn null_session_handle_is_invalid_argument_not_crash() {
     let output_names = [out_name.as_ptr()];
     let mut out_value: *mut OrtValue = ptr::null_mut();
     let status = unsafe {
-        ort2_run(
+        nxrt_run(
             ptr::null_mut(), // null session
             ptr::null(),
             ptr::null(),
@@ -240,15 +240,15 @@ fn null_session_handle_is_invalid_argument_not_crash() {
     };
     assert!(!status.is_null(), "null session must produce a status");
     assert_eq!(
-        unsafe { ort2_get_error_code(status) },
+        unsafe { nxrt_get_error_code(status) },
         OrtErrorCode::InvalidArgument
     );
     // Message is a readable C string.
-    let msg = unsafe { ort2_get_error_message(status) };
+    let msg = unsafe { nxrt_get_error_message(status) };
     assert!(!msg.is_null());
     let _ = unsafe { CStr::from_ptr(msg) }.to_str().unwrap();
     assert!(out_value.is_null(), "out slot must be pre-nulled on error");
-    unsafe { ort2_release_status(status) };
+    unsafe { nxrt_release_status(status) };
 }
 
 #[test]
@@ -258,7 +258,7 @@ fn create_tensor_wrong_byte_len_is_rejected() {
     let shape = [2i64, 3];
     let mut value: *mut OrtValue = ptr::null_mut();
     let status = unsafe {
-        ort2_create_tensor(
+        nxrt_create_tensor(
             bytes.as_ptr() as *const c_void,
             bytes.len(),
             shape.as_ptr(),
@@ -269,11 +269,11 @@ fn create_tensor_wrong_byte_len_is_rejected() {
     };
     assert!(!status.is_null(), "byte-len mismatch must error");
     assert_eq!(
-        unsafe { ort2_get_error_code(status) },
+        unsafe { nxrt_get_error_code(status) },
         OrtErrorCode::InvalidArgument
     );
     assert!(value.is_null(), "no value produced on error");
-    unsafe { ort2_release_status(status) };
+    unsafe { nxrt_release_status(status) };
 }
 
 #[test]
@@ -281,19 +281,19 @@ fn null_out_pointers_are_rejected() {
     // create_session with a null out pointer.
     let path = write_model("null_out");
     let c_path = cstring(path.to_str().unwrap());
-    let status = unsafe { ort2_create_session(c_path.as_ptr(), ptr::null_mut()) };
+    let status = unsafe { nxrt_create_session(c_path.as_ptr(), ptr::null_mut()) };
     assert!(!status.is_null());
     assert_eq!(
-        unsafe { ort2_get_error_code(status) },
+        unsafe { nxrt_get_error_code(status) },
         OrtErrorCode::InvalidArgument
     );
-    unsafe { ort2_release_status(status) };
+    unsafe { nxrt_release_status(status) };
 
     // create_tensor with a null out pointer.
     let bytes = [0u8; 4];
     let shape = [1i64];
     let status = unsafe {
-        ort2_create_tensor(
+        nxrt_create_tensor(
             bytes.as_ptr() as *const c_void,
             bytes.len(),
             shape.as_ptr(),
@@ -304,24 +304,24 @@ fn null_out_pointers_are_rejected() {
     };
     assert!(!status.is_null());
     assert_eq!(
-        unsafe { ort2_get_error_code(status) },
+        unsafe { nxrt_get_error_code(status) },
         OrtErrorCode::InvalidArgument
     );
-    unsafe { ort2_release_status(status) };
+    unsafe { nxrt_release_status(status) };
 }
 
 #[test]
 fn nonexistent_model_path_is_no_such_file() {
     let c_path = cstring("/no/such/path/definitely_missing_model.onnx");
     let mut session: *mut OrtSession = ptr::null_mut();
-    let status = unsafe { ort2_create_session(c_path.as_ptr(), &mut session) };
+    let status = unsafe { nxrt_create_session(c_path.as_ptr(), &mut session) };
     assert!(!status.is_null());
     assert_eq!(
-        unsafe { ort2_get_error_code(status) },
+        unsafe { nxrt_get_error_code(status) },
         OrtErrorCode::NoSuchFile
     );
     assert!(session.is_null());
-    unsafe { ort2_release_status(status) };
+    unsafe { nxrt_release_status(status) };
 }
 
 #[test]
@@ -329,14 +329,14 @@ fn unknown_output_name_is_rejected() {
     let path = write_model("bad_output");
     let c_path = cstring(path.to_str().unwrap());
     let mut session: *mut OrtSession = ptr::null_mut();
-    let status = unsafe { ort2_create_session(c_path.as_ptr(), &mut session) };
+    let status = unsafe { nxrt_create_session(c_path.as_ptr(), &mut session) };
     assert!(status.is_null());
 
     let x_bytes = [0u8; 24];
     let x_shape = [2i64, 3];
     let mut x_value: *mut OrtValue = ptr::null_mut();
     unsafe {
-        ort2_create_tensor(
+        nxrt_create_tensor(
             x_bytes.as_ptr() as *const c_void,
             x_bytes.len(),
             x_shape.as_ptr(),
@@ -353,7 +353,7 @@ fn unknown_output_name_is_rejected() {
     let output_names = [bogus.as_ptr()];
     let mut out_value: *mut OrtValue = ptr::null_mut();
     let status = unsafe {
-        ort2_run(
+        nxrt_run(
             session,
             input_names.as_ptr(),
             input_values.as_ptr(),
@@ -365,15 +365,15 @@ fn unknown_output_name_is_rejected() {
     };
     assert!(!status.is_null());
     assert_eq!(
-        unsafe { ort2_get_error_code(status) },
+        unsafe { nxrt_get_error_code(status) },
         OrtErrorCode::InvalidArgument
     );
     assert!(out_value.is_null());
 
     unsafe {
-        ort2_release_status(status);
-        ort2_release_value(x_value);
-        ort2_release_session(session);
+        nxrt_release_status(status);
+        nxrt_release_value(x_value);
+        nxrt_release_session(session);
     }
 }
 
@@ -382,7 +382,7 @@ fn shape_mismatch_input_is_rejected_at_run() {
     let path = write_model("shape_mismatch");
     let c_path = cstring(path.to_str().unwrap());
     let mut session: *mut OrtSession = ptr::null_mut();
-    let status = unsafe { ort2_create_session(c_path.as_ptr(), &mut session) };
+    let status = unsafe { nxrt_create_session(c_path.as_ptr(), &mut session) };
     assert!(status.is_null());
 
     // Model expects X[2,3]; hand it a well-formed but wrong-shaped [3,3].
@@ -390,7 +390,7 @@ fn shape_mismatch_input_is_rejected_at_run() {
     let x_shape = [3i64, 3];
     let mut x_value: *mut OrtValue = ptr::null_mut();
     let status = unsafe {
-        ort2_create_tensor(
+        nxrt_create_tensor(
             x_bytes.as_ptr() as *const c_void,
             x_bytes.len(),
             x_shape.as_ptr(),
@@ -408,7 +408,7 @@ fn shape_mismatch_input_is_rejected_at_run() {
     let output_names = [out_name.as_ptr()];
     let mut out_value: *mut OrtValue = ptr::null_mut();
     let status = unsafe {
-        ort2_run(
+        nxrt_run(
             session,
             input_names.as_ptr(),
             input_values.as_ptr(),
@@ -420,15 +420,15 @@ fn shape_mismatch_input_is_rejected_at_run() {
     };
     assert!(!status.is_null(), "shape mismatch must error");
     assert_eq!(
-        unsafe { ort2_get_error_code(status) },
+        unsafe { nxrt_get_error_code(status) },
         OrtErrorCode::InvalidArgument
     );
     assert!(out_value.is_null());
 
     unsafe {
-        ort2_release_status(status);
-        ort2_release_value(x_value);
-        ort2_release_session(session);
+        nxrt_release_status(status);
+        nxrt_release_value(x_value);
+        nxrt_release_session(session);
     }
 }
 
@@ -438,38 +438,38 @@ fn release_is_null_tolerant() {
     // is what makes the idiomatic `release(x); x = NULL;` guard against
     // double-release: a second release simply sees null.
     unsafe {
-        ort2_release_session(ptr::null_mut());
-        ort2_release_value(ptr::null_mut());
-        ort2_release_status(ptr::null_mut());
+        nxrt_release_session(ptr::null_mut());
+        nxrt_release_value(ptr::null_mut());
+        nxrt_release_status(ptr::null_mut());
     }
 }
 
 #[test]
 fn accessors_reject_null_value_handle() {
     let mut dtype = 0i32;
-    let status = unsafe { ort2_get_tensor_dtype(ptr::null(), &mut dtype) };
+    let status = unsafe { nxrt_get_tensor_dtype(ptr::null(), &mut dtype) };
     assert!(!status.is_null());
     assert_eq!(
-        unsafe { ort2_get_error_code(status) },
+        unsafe { nxrt_get_error_code(status) },
         OrtErrorCode::InvalidArgument
     );
-    unsafe { ort2_release_status(status) };
+    unsafe { nxrt_release_status(status) };
 
     let mut rank = 0usize;
-    let status = unsafe { ort2_get_tensor_rank(ptr::null(), &mut rank) };
+    let status = unsafe { nxrt_get_tensor_rank(ptr::null(), &mut rank) };
     assert!(!status.is_null());
-    unsafe { ort2_release_status(status) };
+    unsafe { nxrt_release_status(status) };
 
     let mut data: *const c_void = ptr::null();
     let mut len = 0usize;
-    let status = unsafe { ort2_get_tensor_data(ptr::null(), &mut data, &mut len) };
+    let status = unsafe { nxrt_get_tensor_data(ptr::null(), &mut data, &mut len) };
     assert!(!status.is_null());
-    unsafe { ort2_release_status(status) };
+    unsafe { nxrt_release_status(status) };
 }
 
 // --- session-options / ep.context_* config plumbing (§21.4 / §55.5) --------
 
-/// Creating a session through `ort2_create_session_with_options` with the
+/// Creating a session through `nxrt_create_session_with_options` with the
 /// `ep.context_*` keys set forwards them to the `SessionBuilder` and succeeds —
 /// the options reach the session layer through the C-ABI string key/value path.
 #[test]
@@ -478,7 +478,7 @@ fn create_session_with_ep_context_options_succeeds() {
     let c_path = cstring(path.to_str().unwrap());
 
     let mut options: *mut OrtSessionOptions = ptr::null_mut();
-    let status = unsafe { ort2_create_session_options(&mut options) };
+    let status = unsafe { nxrt_create_session_options(&mut options) };
     assert!(status.is_null(), "create_session_options should succeed");
     assert!(!options.is_null());
 
@@ -490,18 +490,18 @@ fn create_session_with_ep_context_options_succeeds() {
         let ck = cstring(k);
         let cv = cstring(v);
         let status =
-            unsafe { ort2_add_session_config_entry(options, ck.as_ptr(), cv.as_ptr()) };
+            unsafe { nxrt_add_session_config_entry(options, ck.as_ptr(), cv.as_ptr()) };
         assert!(status.is_null(), "add_session_config_entry({k}) should succeed");
     }
 
     let mut session: *mut OrtSession = ptr::null_mut();
     let status =
-        unsafe { ort2_create_session_with_options(c_path.as_ptr(), options, &mut session) };
+        unsafe { nxrt_create_session_with_options(c_path.as_ptr(), options, &mut session) };
     assert!(status.is_null(), "create_session_with_options should succeed");
     assert!(!session.is_null());
 
-    unsafe { ort2_release_session(session) };
-    unsafe { ort2_release_session_options(options) };
+    unsafe { nxrt_release_session(session) };
+    unsafe { nxrt_release_session_options(options) };
 }
 
 /// An unknown config key surfaces as `InvalidArgument` at session build — the
@@ -512,26 +512,26 @@ fn create_session_with_unknown_option_is_invalid_argument() {
     let c_path = cstring(path.to_str().unwrap());
 
     let mut options: *mut OrtSessionOptions = ptr::null_mut();
-    let status = unsafe { ort2_create_session_options(&mut options) };
+    let status = unsafe { nxrt_create_session_options(&mut options) };
     assert!(status.is_null());
 
     let ck = cstring("ep.context_enabel"); // typo
     let cv = cstring("1");
-    let status = unsafe { ort2_add_session_config_entry(options, ck.as_ptr(), cv.as_ptr()) };
+    let status = unsafe { nxrt_add_session_config_entry(options, ck.as_ptr(), cv.as_ptr()) };
     assert!(status.is_null(), "adding an entry never validates");
 
     let mut session: *mut OrtSession = ptr::null_mut();
     let status =
-        unsafe { ort2_create_session_with_options(c_path.as_ptr(), options, &mut session) };
+        unsafe { nxrt_create_session_with_options(c_path.as_ptr(), options, &mut session) };
     assert!(!status.is_null(), "unknown key must fail at build");
     assert_eq!(
-        unsafe { ort2_get_error_code(status) },
+        unsafe { nxrt_get_error_code(status) },
         OrtErrorCode::InvalidArgument
     );
     assert!(session.is_null());
 
-    unsafe { ort2_release_status(status) };
-    unsafe { ort2_release_session_options(options) };
+    unsafe { nxrt_release_status(status) };
+    unsafe { nxrt_release_session_options(options) };
 }
 
 /// An invalid `ep.context_embed_mode` value is rejected as `InvalidArgument`.
@@ -541,25 +541,25 @@ fn create_session_with_invalid_embed_mode_is_invalid_argument() {
     let c_path = cstring(path.to_str().unwrap());
 
     let mut options: *mut OrtSessionOptions = ptr::null_mut();
-    let status = unsafe { ort2_create_session_options(&mut options) };
+    let status = unsafe { nxrt_create_session_options(&mut options) };
     assert!(status.is_null());
 
     let ck = cstring("ep.context_embed_mode");
     let cv = cstring("2"); // only 0/1 are valid
-    let status = unsafe { ort2_add_session_config_entry(options, ck.as_ptr(), cv.as_ptr()) };
+    let status = unsafe { nxrt_add_session_config_entry(options, ck.as_ptr(), cv.as_ptr()) };
     assert!(status.is_null());
 
     let mut session: *mut OrtSession = ptr::null_mut();
     let status =
-        unsafe { ort2_create_session_with_options(c_path.as_ptr(), options, &mut session) };
+        unsafe { nxrt_create_session_with_options(c_path.as_ptr(), options, &mut session) };
     assert!(!status.is_null(), "invalid embed_mode must fail at build");
     assert_eq!(
-        unsafe { ort2_get_error_code(status) },
+        unsafe { nxrt_get_error_code(status) },
         OrtErrorCode::InvalidArgument
     );
 
-    unsafe { ort2_release_status(status) };
-    unsafe { ort2_release_session_options(options) };
+    unsafe { nxrt_release_status(status) };
+    unsafe { nxrt_release_session_options(options) };
 }
 
 /// A null options handle makes `create_session_with_options` behave like the
@@ -571,9 +571,9 @@ fn create_session_with_null_options_is_like_plain_create() {
 
     let mut session: *mut OrtSession = ptr::null_mut();
     let status = unsafe {
-        ort2_create_session_with_options(c_path.as_ptr(), ptr::null(), &mut session)
+        nxrt_create_session_with_options(c_path.as_ptr(), ptr::null(), &mut session)
     };
     assert!(status.is_null(), "null options should still build");
     assert!(!session.is_null());
-    unsafe { ort2_release_session(session) };
+    unsafe { nxrt_release_session(session) };
 }

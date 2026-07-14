@@ -1,7 +1,7 @@
 //! # `onnx-runtime-capi`
 //!
 //! The C ABI layer for the ORT 2.0 runtime (see `docs/ORT2.md` §21). This is
-//! Phase 1, **Tier 1**: a clean, direct `extern "C"` surface (`ort2_*` names)
+//! Phase 1, **Tier 1**: a clean, direct `extern "C"` surface (`nxrt_*` names)
 //! that lets a C caller load a model, build input tensors, run inference, and
 //! read outputs back. It is a thin marshalling layer over
 //! [`onnx_runtime_session`] — nothing here is model-, op-, or shape-specific.
@@ -17,7 +17,7 @@
 //!
 //! * **Opaque handles** ([`OrtSession`], [`OrtValue`], [`OrtStatus`]) are
 //!   created with [`Box::into_raw`] and freed with [`Box::from_raw`] *exactly
-//!   once* by the matching `ort2_release_*`. After release the caller must drop
+//!   once* by the matching `nxrt_release_*`. After release the caller must drop
 //!   its copy of the pointer; reusing it is a use-after-free the API cannot
 //!   detect (the standard C ownership contract). `release` is null-tolerant, so
 //!   the idiomatic `release(x); x = NULL;` makes double-release unreachable.
@@ -28,7 +28,7 @@
 //!   status instead of unwinding into C (which is undefined behavior).
 //! * **Status convention**: fallible functions return `*mut OrtStatus` —
 //!   `null` on success, an owned status the caller must
-//!   [`ort2_release_status`] on error.
+//!   [`nxrt_release_status`] on error.
 
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -66,7 +66,7 @@ const VERSION: &[u8] = concat!(env!("CARGO_PKG_VERSION"), "\0").as_bytes();
 /// The returned pointer is valid for the lifetime of the process and must not
 /// be freed by the caller.
 #[unsafe(no_mangle)]
-pub extern "C" fn ort2_get_version_string() -> *const c_char {
+pub extern "C" fn nxrt_get_version_string() -> *const c_char {
     VERSION.as_ptr() as *const c_char
 }
 
@@ -76,7 +76,7 @@ pub extern "C" fn ort2_get_version_string() -> *const c_char {
 
 /// An owned error status: a code plus a NUL-terminated message. Returned from
 /// fallible entry points as `*mut OrtStatus` (null == success). The caller owns
-/// any non-null status and must free it with [`ort2_release_status`].
+/// any non-null status and must free it with [`nxrt_release_status`].
 pub struct OrtStatus {
     code: OrtErrorCode,
     message: CString,
@@ -173,7 +173,7 @@ fn session_err(err: SessionError) -> (OrtErrorCode, String) {
 /// `status`, if non-null, must be a pointer returned by this library and not
 /// yet released.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ort2_get_error_code(status: *const OrtStatus) -> OrtErrorCode {
+pub unsafe extern "C" fn nxrt_get_error_code(status: *const OrtStatus) -> OrtErrorCode {
     if status.is_null() {
         return OrtErrorCode::Ok;
     }
@@ -188,9 +188,9 @@ pub unsafe extern "C" fn ort2_get_error_code(status: *const OrtStatus) -> OrtErr
 /// # Safety
 /// `status`, if non-null, must be a pointer returned by this library and not
 /// yet released. The returned pointer must not be freed by the caller and must
-/// not be used after [`ort2_release_status`] frees `status`.
+/// not be used after [`nxrt_release_status`] frees `status`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ort2_get_error_message(status: *const OrtStatus) -> *const c_char {
+pub unsafe extern "C" fn nxrt_get_error_message(status: *const OrtStatus) -> *const c_char {
     if status.is_null() {
         return c"".as_ptr();
     }
@@ -207,7 +207,7 @@ pub unsafe extern "C" fn ort2_get_error_message(status: *const OrtStatus) -> *co
 /// not already been released. After this call the pointer is dangling and must
 /// not be used again.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ort2_release_status(status: *mut OrtStatus) {
+pub unsafe extern "C" fn nxrt_release_status(status: *mut OrtStatus) {
     if status.is_null() {
         return;
     }
@@ -230,7 +230,7 @@ pub struct OrtSession {
 /// to `*out` on success. Wraps [`InferenceSession::load`] (auto CPU device).
 ///
 /// On success returns null and `*out` holds a handle to release with
-/// [`ort2_release_session`]. On error returns a status and leaves `*out` null.
+/// [`nxrt_release_session`]. On error returns a status and leaves `*out` null.
 ///
 /// # Safety
 /// * `model_path` must be a non-null pointer to a NUL-terminated C string that
@@ -238,7 +238,7 @@ pub struct OrtSession {
 /// * `out` must be a non-null, writable, well-aligned pointer to a
 ///   `*mut OrtSession` slot.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ort2_create_session(
+pub unsafe extern "C" fn nxrt_create_session(
     model_path: *const c_char,
     out: *mut *mut OrtSession,
 ) -> *mut OrtStatus {
@@ -264,14 +264,14 @@ pub unsafe extern "C" fn ort2_create_session(
     })
 }
 
-/// Free a session created by [`ort2_create_session`]. Null-tolerant. Must be
+/// Free a session created by [`nxrt_create_session`]. Null-tolerant. Must be
 /// called *exactly once* per non-null session.
 ///
 /// # Safety
-/// `session`, if non-null, must be a handle from [`ort2_create_session`] that
+/// `session`, if non-null, must be a handle from [`nxrt_create_session`] that
 /// has not already been released. After this call the pointer is dangling.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ort2_release_session(session: *mut OrtSession) {
+pub unsafe extern "C" fn nxrt_release_session(session: *mut OrtSession) {
     if session.is_null() {
         return;
     }
@@ -284,8 +284,8 @@ pub unsafe extern "C" fn ort2_release_session(session: *mut OrtSession) {
 // ---------------------------------------------------------------------------
 
 /// Opaque session-options handle: an ordered bag of string key/value config
-/// entries set via [`ort2_add_session_config_entry`] (ORT's
-/// `AddSessionConfigEntry`) and consumed by [`ort2_create_session_with_options`].
+/// entries set via [`nxrt_add_session_config_entry`] (ORT's
+/// `AddSessionConfigEntry`) and consumed by [`nxrt_create_session_with_options`].
 ///
 /// This is the C-API path by which ORT tooling sets the `ep.context_*` options
 /// (§21.4) that drive the EPContext dump: the entries are forwarded verbatim to
@@ -299,13 +299,13 @@ pub struct OrtSessionOptions {
 /// Create an empty session-options handle, writing it to `*out`.
 ///
 /// On success returns null and `*out` holds a handle to release with
-/// [`ort2_release_session_options`].
+/// [`nxrt_release_session_options`].
 ///
 /// # Safety
 /// `out` must be a non-null, writable, well-aligned pointer to a
 /// `*mut OrtSessionOptions` slot.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ort2_create_session_options(
+pub unsafe extern "C" fn nxrt_create_session_options(
     out: *mut *mut OrtSessionOptions,
 ) -> *mut OrtStatus {
     guard(|| {
@@ -318,14 +318,14 @@ pub unsafe extern "C" fn ort2_create_session_options(
     })
 }
 
-/// Free a session-options handle from [`ort2_create_session_options`].
+/// Free a session-options handle from [`nxrt_create_session_options`].
 /// Null-tolerant. Must be called *exactly once* per non-null handle.
 ///
 /// # Safety
 /// `options`, if non-null, must be an unreleased handle from
-/// [`ort2_create_session_options`]. After this call the pointer is dangling.
+/// [`nxrt_create_session_options`]. After this call the pointer is dangling.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ort2_release_session_options(options: *mut OrtSessionOptions) {
+pub unsafe extern "C" fn nxrt_release_session_options(options: *mut OrtSessionOptions) {
     if options.is_null() {
         return;
     }
@@ -343,11 +343,11 @@ pub unsafe extern "C" fn ort2_release_session_options(options: *mut OrtSessionOp
 ///
 /// # Safety
 /// * `options` must be a non-null, unreleased handle from
-///   [`ort2_create_session_options`].
+///   [`nxrt_create_session_options`].
 /// * `key` and `value` must be non-null pointers to NUL-terminated, valid UTF-8
 ///   C strings.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ort2_add_session_config_entry(
+pub unsafe extern "C" fn nxrt_add_session_config_entry(
     options: *mut OrtSessionOptions,
     key: *const c_char,
     value: *const c_char,
@@ -379,17 +379,17 @@ pub unsafe extern "C" fn ort2_add_session_config_entry(
 /// layer's (an unknown key or bad value fails here as `InvalidArgument`).
 ///
 /// `options` may be null, in which case this behaves like
-/// [`ort2_create_session`] (no extra options).
+/// [`nxrt_create_session`] (no extra options).
 ///
 /// # Safety
 /// * `model_path` must be a non-null pointer to a NUL-terminated, valid UTF-8
 ///   C string.
 /// * `options`, if non-null, must be an unreleased handle from
-///   [`ort2_create_session_options`].
+///   [`nxrt_create_session_options`].
 /// * `out` must be a non-null, writable, well-aligned pointer to a
 ///   `*mut OrtSession` slot.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ort2_create_session_with_options(
+pub unsafe extern "C" fn nxrt_create_session_with_options(
     model_path: *const c_char,
     options: *const OrtSessionOptions,
     out: *mut *mut OrtSession,
@@ -463,7 +463,7 @@ fn shape_numel(shape: &[i64]) -> Result<usize, (OrtErrorCode, String)> {
 /// * `data` must point to `data_len` readable bytes (may be null iff
 ///   `data_len == 0`). The bytes are copied; the caller retains ownership.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ort2_create_tensor(
+pub unsafe extern "C" fn nxrt_create_tensor(
     data: *const c_void,
     data_len: usize,
     shape: *const i64,
@@ -529,15 +529,15 @@ pub unsafe extern "C" fn ort2_create_tensor(
     })
 }
 
-/// Free a value created by [`ort2_create_tensor`] or returned from
-/// [`ort2_run`]. Null-tolerant. Must be called *exactly once* per non-null
+/// Free a value created by [`nxrt_create_tensor`] or returned from
+/// [`nxrt_run`]. Null-tolerant. Must be called *exactly once* per non-null
 /// value.
 ///
 /// # Safety
 /// `value`, if non-null, must be a handle produced by this library that has not
 /// already been released. After this call the pointer is dangling.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ort2_release_value(value: *mut OrtValue) {
+pub unsafe extern "C" fn nxrt_release_value(value: *mut OrtValue) {
     if value.is_null() {
         return;
     }
@@ -551,7 +551,7 @@ pub unsafe extern "C" fn ort2_release_value(value: *mut OrtValue) {
 /// * `value` must be a non-null, unreleased [`OrtValue`] handle.
 /// * `out` must be a non-null, writable, well-aligned `*mut i32`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ort2_get_tensor_dtype(
+pub unsafe extern "C" fn nxrt_get_tensor_dtype(
     value: *const OrtValue,
     out: *mut i32,
 ) -> *mut OrtStatus {
@@ -574,7 +574,7 @@ pub unsafe extern "C" fn ort2_get_tensor_dtype(
 /// * `value` must be a non-null, unreleased [`OrtValue`] handle.
 /// * `out` must be a non-null, writable, well-aligned `*mut usize`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ort2_get_tensor_rank(
+pub unsafe extern "C" fn nxrt_get_tensor_rank(
     value: *const OrtValue,
     out: *mut usize,
 ) -> *mut OrtStatus {
@@ -592,7 +592,7 @@ pub unsafe extern "C" fn ort2_get_tensor_rank(
 }
 
 /// Copy the value's dimensions into the caller's `out_dims` buffer. `rank` must
-/// equal the value's rank (query it first with [`ort2_get_tensor_rank`]); a
+/// equal the value's rank (query it first with [`nxrt_get_tensor_rank`]); a
 /// mismatch is rejected as an error.
 ///
 /// # Safety
@@ -600,7 +600,7 @@ pub unsafe extern "C" fn ort2_get_tensor_rank(
 /// * `out_dims` must point to `rank` writable, well-aligned `i64` slots (may be
 ///   null iff `rank == 0`).
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ort2_get_tensor_shape(
+pub unsafe extern "C" fn nxrt_get_tensor_shape(
     value: *const OrtValue,
     out_dims: *mut i64,
     rank: usize,
@@ -641,7 +641,7 @@ pub unsafe extern "C" fn ort2_get_tensor_shape(
 /// * `out_len` must be a non-null, writable `*mut usize`.
 /// * The returned pointer must not be used after the value is released.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ort2_get_tensor_data(
+pub unsafe extern "C" fn nxrt_get_tensor_data(
     value: *const OrtValue,
     out_data: *mut *const c_void,
     out_len: *mut usize,
@@ -693,7 +693,7 @@ pub unsafe extern "C" fn ort2_get_tensor_data(
 ///   be null iff `n_outputs == 0`).
 #[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
-pub unsafe extern "C" fn ort2_run(
+pub unsafe extern "C" fn nxrt_run(
     session: *mut OrtSession,
     input_names: *const *const c_char,
     input_values: *const *const OrtValue,
@@ -831,7 +831,7 @@ mod tests {
     #[test]
     fn version_is_nul_terminated() {
         assert_eq!(*VERSION.last().unwrap(), 0);
-        let ptr = ort2_get_version_string();
+        let ptr = nxrt_get_version_string();
         assert!(!ptr.is_null());
     }
 
@@ -846,13 +846,13 @@ mod tests {
     fn null_status_accessors_are_ok() {
         // A null status means "no error" by convention.
         assert_eq!(
-            unsafe { ort2_get_error_code(ptr::null()) },
+            unsafe { nxrt_get_error_code(ptr::null()) },
             OrtErrorCode::Ok
         );
-        let msg = unsafe { ort2_get_error_message(ptr::null()) };
+        let msg = unsafe { nxrt_get_error_message(ptr::null()) };
         assert!(!msg.is_null());
         // Releasing null is a no-op (idempotent guard against double-free).
-        unsafe { ort2_release_status(ptr::null_mut()) };
+        unsafe { nxrt_release_status(ptr::null_mut()) };
     }
 
     #[test]
