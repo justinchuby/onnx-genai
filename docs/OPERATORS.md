@@ -67,7 +67,7 @@ plugin EPs (via C ABI bridge) handle them.
 | Resize | 10 | Vision, diffusion (upsampling). |
 | Pad | 11 | |
 | Flatten | 9 | |
-| MatMulInteger | 10 | INT8 quantized matmul. |
+| MatMulNBits (contrib) | — | INT4 quantized matmul (replaces MatMulInteger). |
 | DequantizeLinear | 10 | INT4/INT8 weight dequantization. |
 | QuantizeLinear | 10 | Activation quantization. |
 | QLinearMatMul | 10 | Quantized matmul. |
@@ -192,7 +192,133 @@ Models with opset < 17 should be upgraded with `onnx.version_converter` before u
 For each op, we implement the **latest semantics** and provide backward-compat shims
 for older opset versions where behavior differs (e.g. Reshape axis handling, Reduce* keepdims default).
 
-## 6. Custom Ops Extension Point
+## 6. Kernel Architecture (Modular)
+
+Each op kernel is a standalone module. Easy to add, replace, or benchmark independently.
+
+```
+crates/onnx-runtime-ep-cpu/src/kernels/
+├── mod.rs              # KernelRegistry: name → factory
+├── math/
+│   ├── matmul.rs       # one file = one kernel
+│   ├── add.rs
+│   ├── gemm.rs
+│   └── mod.rs
+├── activation/
+│   ├── gelu.rs
+│   ├── fast_gelu.rs
+│   ├── sigmoid.rs
+│   └── mod.rs
+├── normalization/
+│   ├── layer_norm.rs
+│   ├── rms_norm.rs
+│   ├── group_norm.rs
+│   └── mod.rs
+├── attention/
+│   ├── group_query_attention.rs
+│   ├── multi_head_attention.rs
+│   ├── rotary_embedding.rs
+│   └── mod.rs
+├── quantization/
+│   ├── dequantize_linear.rs
+│   ├── matmul_nbits.rs
+│   └── mod.rs
+├── tensor/
+│   ├── reshape.rs
+│   ├── transpose.rs
+│   ├── gather.rs
+│   ├── concat.rs
+│   ├── slice.rs
+│   └── mod.rs
+└── control/
+    ├── where_op.rs
+    ├── if_op.rs
+    └── mod.rs
+```
+
+**Kernel trait (every kernel implements this):**
+```rust
+pub trait Kernel: Send + Sync {
+    /// Kernel name for registry + tracing.
+    fn name(&self) -> &'static str;
+
+    /// Op type(s) this kernel handles.
+    fn op_types(&self) -> &[&'static str];
+
+    /// Execute. All inputs/outputs are pre-allocated TensorViews.
+    fn execute(&self, ctx: &mut KernelContext) -> Result<()>;
+
+    /// Can this kernel handle the given node? (dtype/attribute check)
+    fn can_handle(&self, node: &NodeView) -> bool;
+
+    /// Estimated FLOPs for cost model (optional).
+    fn estimate_flops(&self, shapes: &[&Shape]) -> Option<u64> { None }
+}
+
+/// Registration macro — one line per kernel.
+macro_rules! register_kernels {
+    ($registry:expr, $($kernel:ty),* $(,)?) => {
+        $( $registry.register(Box::new(<$kernel>::new())); )*
+    };
+}
+```
+
+**Adding a new kernel = one file + one register line.** No touching core runtime code.
+
+## 7. Tracing & Profiling (Everything is Traced)
+
+Every operation in the runtime emits structured traces via the `tracing` crate.
+Zero overhead when not collecting (compile-time feature gate `profiling`).
+
+**What's traced:**
+
+| Phase | Span/Event | Fields |
+|-------|-----------|--------|
+| Model load | `model.load` | path, size_bytes, opset, num_nodes |
+| Graph optimization | `optimizer.pass` | pass_name, nodes_before, nodes_after, duration_us |
+| Operator fusion | `optimizer.fusion` | pattern, matched_nodes, fused_op |
+| Device placement (ILP) | `placement.solve` | num_nodes, num_devices, solve_time_us, cost |
+| Memory planning | `memory.plan` | arena_size, num_tensors, aliases_found, peak_bytes |
+| AOT compilation | `compile.plan` | kernels_compiled, total_time_ms |
+| Hint resolution | `hints.resolve` | source, num_hints, conflicts |
+| **Kernel execution** | `kernel.execute` | op_type, kernel_name, node_name, device, duration_us |
+| Kernel launch (CUDA) | `kernel.cuda_launch` | grid, block, shared_mem, stream |
+| Memory alloc/free | `memory.alloc` / `memory.free` | size, device, arena, offset |
+| Data transfer | `transfer.h2d` / `transfer.d2h` | size_bytes, duration_us, bandwidth_gbps |
+| CUDA graph | `cuda_graph.capture` / `.replay` | num_nodes, capture_time_us |
+| Buffer reuse | `buffer.reuse` / `buffer.reallocate` | tensor, shape, hit |
+| Session run | `session.run` | run_id, total_duration_us, num_ops |
+
+**Output formats:**
+- **Chrome Trace (JSON):** `option("profiler.output", "/tmp/trace.json")` → open in `chrome://tracing` or Perfetto
+- **Programmatic:** `session.profiling_data()` returns structured `Vec<TraceEvent>`
+- **Live (tracing subscriber):** `RUST_LOG=onnx_runtime=trace` for stderr, or custom subscriber
+
+**Example trace output (Chrome Trace format):**
+```json
+[
+  {"name": "session.run", "ph": "B", "ts": 0, "pid": 1},
+  {"name": "kernel.execute", "ph": "X", "ts": 5, "dur": 120, "args": {"op": "MatMul", "kernel": "cublas_gemm", "node": "layers.0.attn.q_proj", "device": "gpu:0"}},
+  {"name": "kernel.execute", "ph": "X", "ts": 130, "dur": 85, "args": {"op": "GroupQueryAttention", "kernel": "flash_attention_v3", "node": "layers.0.attn.gqa", "device": "gpu:0"}},
+  {"name": "buffer.reuse", "ph": "i", "ts": 215, "args": {"tensor": "logits", "hit": true}},
+  {"name": "session.run", "ph": "E", "ts": 500, "pid": 1}
+]
+```
+
+**Cost model uses real traces for auto-tuning:**
+```rust
+impl CostModel {
+    /// Update cost estimates from actual execution traces.
+    /// Called after warmup runs to replace heuristic estimates with measured data.
+    pub fn calibrate_from_traces(&mut self, traces: &[TraceEvent]) {
+        for event in traces.iter().filter(|e| e.name == "kernel.execute") {
+            self.update_kernel_cost(event.op_type, event.device, event.duration_us);
+        }
+    }
+}
+```
+
+## 8. Custom Ops Extension Point
 
 Users can register additional ops via the C ABI custom op interface (same mechanism as ORT Extensions):
 
