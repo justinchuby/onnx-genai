@@ -1841,6 +1841,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "onnx-runtime-shape-inference"
+version = "0.1.0"
+dependencies = [
+ "onnx-runtime-ir",
+ "onnx-runtime-loader",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "oorandom"
 version = "11.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"

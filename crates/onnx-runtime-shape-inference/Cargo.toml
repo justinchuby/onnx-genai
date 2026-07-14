@@ -1,0 +1,16 @@
+[package]
+name = "onnx-runtime-shape-inference"
+description = "Symbolic shape inference for the ORT 2.0 runtime: an extensible, opset-aware per-op registry with symbolic dimension arithmetic and shape-data propagation over onnx-runtime-ir graphs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords = ["onnx", "shape-inference", "symbolic", "inference", "runtime"]
+categories = ["science", "algorithms"]
+
+[dependencies]
+onnx-runtime-ir = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+onnx-runtime-loader = { workspace = true }
