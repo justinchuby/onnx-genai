@@ -198,7 +198,12 @@ pub trait ExecutionProvider: Send + Sync {
     fn supports_op(&self, op: &Node, shapes: &[Shape], layouts: &[TensorLayout]) -> KernelMatch;
 
     /// Get or create a kernel for `op` specialized to concrete `shapes`.
-    fn get_kernel(&self, op: &Node, shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>>;
+    ///
+    /// `opset` is the effective operator-set version for `op`'s domain in the
+    /// owning graph. EPs use it to select opset-specialized kernels (e.g. the
+    /// opset-13 per-axis vs. the legacy opset-<13 2D-coercion `Softmax`).
+    fn get_kernel(&self, op: &Node, shapes: &[Vec<usize>], opset: u64)
+        -> Result<Box<dyn Kernel>>;
 
     /// Allocate device memory.
     fn allocate(&self, size: usize, alignment: usize) -> Result<DeviceBuffer>;

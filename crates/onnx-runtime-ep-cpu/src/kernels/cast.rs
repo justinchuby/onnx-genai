@@ -1,8 +1,10 @@
 //! `Cast`: convert a tensor between element types (`docs/ORT2.md` §4.4).
 //!
 //! Numeric semantics follow ONNX / C++ `static_cast`:
-//! * float → integer truncates toward zero (Rust's `as` also saturates on
-//!   overflow, which only differs from ORT for out-of-range inputs);
+//! * float → integer truncates toward zero and **saturates** out-of-range
+//!   values to the target integer's bounds (ONNX Cast semantics; NaN → 0),
+//!   converting straight to the target type so narrow targets clamp rather than
+//!   wrap;
 //! * any numeric → `bool` is `x != 0` (NaN casts to `true`);
 //! * integer → integer is a width-narrowing/widening reinterpret (`as`);
 //! * float ↔ float rounds to the nearest representable value.
@@ -34,6 +36,8 @@ impl Num {
     }
 
     /// Truncate toward zero into an `i64` lane (float) or pass through (int).
+    /// Rust's `f as i64` saturates out-of-range floats to `i64::MIN/MAX` and
+    /// maps NaN to 0 — exactly ONNX Cast's float→int saturation.
     fn to_i64(self) -> i64 {
         match self {
             Num::F(f) => f as i64,
@@ -48,6 +52,34 @@ impl Num {
         }
     }
 }
+
+/// Convert a [`Num`] to a narrower integer target with ONNX Cast semantics:
+/// a **float** source saturates directly to the *target* type (Rust `as`
+/// clamps out-of-range floats and maps NaN to 0), while an **integer** source
+/// wraps (two's-complement `static_cast`, matching ORT's int→int Cast).
+///
+/// The distinction matters for out-of-range floats: routing them through an
+/// `i64` intermediate first would saturate to the i64 range and then *wrap*
+/// into the narrow type, yielding a garbage value instead of the saturated one.
+macro_rules! num_to_int {
+    ($name:ident, $ty:ty) => {
+        impl Num {
+            fn $name(self) -> $ty {
+                match self {
+                    Num::F(f) => f as $ty,
+                    Num::I(i) => i as $ty,
+                }
+            }
+        }
+    };
+}
+
+num_to_int!(to_i32, i32);
+num_to_int!(to_i16, i16);
+num_to_int!(to_i8, i8);
+num_to_int!(to_u8, u8);
+num_to_int!(to_u16, u16);
+num_to_int!(to_u32, u32);
 
 /// Cast kernel carrying the target dtype (`None` until the `to` attribute is
 /// resolved; execution errors if it was absent).
@@ -151,12 +183,12 @@ fn write_num(out: &mut Vec<u8>, n: Num, dtype: DataType) -> Result<()> {
         DataType::Float32 => out.extend_from_slice(&(n.to_f64() as f32).to_le_bytes()),
         DataType::Float64 => out.extend_from_slice(&n.to_f64().to_le_bytes()),
         DataType::Int64 => out.extend_from_slice(&n.to_i64().to_le_bytes()),
-        DataType::Int32 => out.extend_from_slice(&(n.to_i64() as i32).to_le_bytes()),
-        DataType::Int16 => out.extend_from_slice(&(n.to_i64() as i16).to_le_bytes()),
-        DataType::Int8 => out.extend_from_slice(&(n.to_i64() as i8).to_le_bytes()),
-        DataType::Uint8 => out.push(n.to_i64() as u8),
-        DataType::Uint16 => out.extend_from_slice(&(n.to_i64() as u16).to_le_bytes()),
-        DataType::Uint32 => out.extend_from_slice(&(n.to_i64() as u32).to_le_bytes()),
+        DataType::Int32 => out.extend_from_slice(&n.to_i32().to_le_bytes()),
+        DataType::Int16 => out.extend_from_slice(&n.to_i16().to_le_bytes()),
+        DataType::Int8 => out.extend_from_slice(&n.to_i8().to_le_bytes()),
+        DataType::Uint8 => out.push(n.to_u8()),
+        DataType::Uint16 => out.extend_from_slice(&n.to_u16().to_le_bytes()),
+        DataType::Uint32 => out.extend_from_slice(&n.to_u32().to_le_bytes()),
         DataType::Bool => out.push(n.is_nonzero() as u8),
         other => {
             return Err(EpError::KernelFailed(format!(
@@ -235,6 +267,42 @@ mod tests {
         let mut out = Owned::zeros(DataType::Float32, &[3]);
         cast(DataType::Float32, &a, &mut out);
         assert_eq!(out.to_f32(), vec![-4.0, 0.0, 11.0]);
+    }
+
+    #[test]
+    fn f32_out_of_range_saturates_to_target_int() {
+        // A float far outside i32/i16/i8 range must SATURATE to the target's
+        // bound, not wrap. The old i64-intermediate path wrapped narrow targets.
+        let big = 1.0e20_f32;
+        let neg = -1.0e20_f32;
+
+        let a = Owned::f32(&[2], &[big, neg]);
+        let mut i32out = Owned::zeros(DataType::Int32, &[2]);
+        cast(DataType::Int32, &a, &mut i32out);
+        assert_eq!(i32out.to_i32(), vec![i32::MAX, i32::MIN]);
+
+        let mut i64out = Owned::zeros(DataType::Int64, &[2]);
+        cast(DataType::Int64, &a, &mut i64out);
+        assert_eq!(i64out.to_i64(), vec![i64::MAX, i64::MIN]);
+    }
+
+    #[test]
+    fn f32_out_of_range_saturates_unsigned() {
+        // Negative and over-range floats clamp to [0, u8::MAX] for uint8.
+        let a = Owned::f32(&[3], &[-5.0, 300.0, 42.0]);
+        let mut out = Owned::zeros(DataType::Uint8, &[3]);
+        cast(DataType::Uint8, &a, &mut out);
+        // uint8 lane holds the saturated values one byte each.
+        assert_eq!(out.bytes, vec![0u8, 255u8, 42u8]);
+    }
+
+    #[test]
+    fn nan_casts_to_zero_int() {
+        // ONNX Cast maps NaN → 0 for integer targets (Rust `as` does the same).
+        let a = Owned::f32(&[1], &[f32::NAN]);
+        let mut out = Owned::zeros(DataType::Int32, &[1]);
+        cast(DataType::Int32, &a, &mut out);
+        assert_eq!(out.to_i32(), vec![0]);
     }
 
     #[test]

@@ -123,6 +123,7 @@ impl KernelCache {
         node_id: NodeId,
         node: &Node,
         input_shapes: &[Vec<usize>],
+        opset: u64,
         ep: &CpuExecutionProvider,
     ) -> Result<&dyn onnx_runtime_ep_api::Kernel> {
         let key = KernelKey {
@@ -147,7 +148,7 @@ impl KernelCache {
                     op_type: node.op_type.clone(),
                 });
             }
-            let kernel = ep.get_kernel(node, input_shapes)?;
+            let kernel = ep.get_kernel(node, input_shapes, opset)?;
             self.entries.insert(key.clone(), kernel);
             self.misses += 1;
         }
@@ -217,6 +218,50 @@ fn view_bounds(
     Ok(())
 }
 
+/// Element count of a shape with overflow checking. A malicious or corrupt
+/// shape whose dims multiply past `usize::MAX` would silently wrap under a plain
+/// `iter().product()`, under-sizing the backing buffer. Returns
+/// [`SessionError::ShapeOverflow`] instead so the caller allocates nothing.
+fn checked_numel(dims: &[usize], value: impl FnOnce() -> String) -> Result<usize> {
+    let mut acc = 1usize;
+    for &d in dims {
+        acc = match acc.checked_mul(d) {
+            Some(n) => n,
+            None => {
+                return Err(SessionError::ShapeOverflow {
+                    value: value(),
+                    dims: dims.to_vec(),
+                })
+            }
+        };
+    }
+    Ok(acc)
+}
+
+/// The effective operator-set version governing `node` — the graph's imported
+/// opset for the node's domain. The default ONNX domain is spelled both `""`
+/// and `"ai.onnx"`; both map to the same import. When a graph omits the import
+/// (should not happen for a loaded model), fall back to `u64::MAX` so ops with a
+/// single registration still resolve and opset-specialized ops pick their
+/// newest kernel.
+fn effective_opset(graph: &Graph, node: &Node) -> u64 {
+    let domain = node.domain.as_str();
+    graph
+        .opset_imports
+        .get(domain)
+        .or_else(|| {
+            if domain.is_empty() {
+                graph.opset_imports.get("ai.onnx")
+            } else if domain == "ai.onnx" {
+                graph.opset_imports.get("")
+            } else {
+                None
+            }
+        })
+        .copied()
+        .unwrap_or(u64::MAX)
+}
+
 /// Substitute concrete symbol bindings into a (possibly symbolic) shape.
 /// Returns `None` if any dim is a symbol with no binding.
 fn substitute(shape: &Shape, bindings: &HashMap<SymbolId, usize>) -> Option<Vec<usize>> {
@@ -275,64 +320,17 @@ fn dynamic_output_shapes(
             let data_shape = input_shapes.first()?;
             let starts = input_values.get(1)?.as_ref()?;
             let ends = input_values.get(2)?.as_ref()?;
-            let rank = data_shape.len();
-            let axes: Vec<i64> = match input_values.get(3).and_then(|v| v.as_ref()) {
-                Some(a) => a.clone(),
-                None => (0..starts.len() as i64).collect(),
-            };
-            let steps: Vec<i64> = match input_values.get(4).and_then(|v| v.as_ref()) {
-                Some(s) => s.clone(),
-                None => vec![1; starts.len()],
-            };
-            if starts.len() != ends.len()
-                || starts.len() != axes.len()
-                || starts.len() != steps.len()
-            {
-                return None;
-            }
-            let mut count: Vec<usize> = data_shape.clone();
-            for i in 0..starts.len() {
-                let raw_axis = axes[i];
-                let ax = if raw_axis < 0 {
-                    raw_axis + rank as i64
-                } else {
-                    raw_axis
-                };
-                if ax < 0 || ax as usize >= rank {
-                    return None;
-                }
-                let ax = ax as usize;
-                let d = data_shape[ax] as i64;
-                let s = steps[i];
-                if s == 0 {
-                    return None;
-                }
-                let mut b = starts[i];
-                let mut e = ends[i];
-                if b < 0 {
-                    b += d;
-                }
-                if e < 0 {
-                    e += d;
-                }
-                let (b, e) = if s < 0 {
-                    (b.clamp(0, d - 1), e.clamp(-1, d - 1))
-                } else {
-                    (b.clamp(0, d), e.clamp(0, d))
-                };
-                let c = if s > 0 {
-                    if e > b {
-                        ((e - b + s - 1) / s) as usize
-                    } else {
-                        0
-                    }
-                } else if b > e {
-                    ((b - e + (-s) - 1) / (-s)) as usize
-                } else {
-                    0
-                };
-                count[ax] = c;
-            }
+            let (axes, steps) = onnx_runtime_ep_cpu::slice_axes_steps(
+                starts.len(),
+                input_values.get(3).and_then(|v| v.as_deref()),
+                input_values.get(4).and_then(|v| v.as_deref()),
+            );
+            // Reuse the exact kernel geometry helper so the buffer we size here
+            // always matches what the Slice kernel writes. Any error (length
+            // mismatch, out-of-range axis, zero step) means "cannot resolve".
+            let plan =
+                onnx_runtime_ep_cpu::slice_plan(data_shape, starts, ends, &axes, &steps).ok()?;
+            let count: Vec<usize> = plan.iter().map(|p| p.count).collect();
             Some(vec![count])
         }
         _ => None,
@@ -456,7 +454,7 @@ impl Executor {
         if let Some(old) = self.buffers.remove(&vid) {
             self.ep.deallocate(old)?;
         }
-        let numel: usize = dims.iter().product();
+        let numel = checked_numel(dims, || format!("value#{}", vid.0))?;
         let size = dtype.storage_bytes(numel);
         let buf = self
             .ep
@@ -552,7 +550,9 @@ impl Executor {
             let node_id = self.plan[i].node_id;
             let input_shapes = Self::node_input_shapes(&self.plan[i], resolved);
             let node = self.graph.node(node_id);
-            self.cache.get_or_create(node_id, node, &input_shapes, &self.ep)?;
+            let opset = effective_opset(&self.graph, node);
+            self.cache
+                .get_or_create(node_id, node, &input_shapes, opset, &self.ep)?;
         }
         Ok(())
     }
@@ -728,11 +728,20 @@ impl Executor {
                             op: node.op_type.clone(),
                         }
                     })?;
+                // A future multi-output data-dependent op would misindex
+                // `out_shapes[oi]`; verify the sizer returned exactly one shape
+                // per output rather than panicking on a length mismatch.
+                if out_shapes.len() != np.outputs.len() {
+                    return Err(SessionError::OutputShapeCountMismatch {
+                        op: node.op_type.clone(),
+                        expected: np.outputs.len(),
+                        got: out_shapes.len(),
+                    });
+                }
                 for (oi, &ovid) in np.outputs.iter().enumerate() {
                     let dims = out_shapes[oi].clone();
-                    let need = np.output_dtypes[oi]
-                        .storage_bytes(dims.iter().product())
-                        .max(1);
+                    let numel = checked_numel(&dims, || format!("value#{}", ovid.0))?;
+                    let need = np.output_dtypes[oi].storage_bytes(numel).max(1);
                     let fits = buffers.get(&ovid).map(|b| b.len() == need).unwrap_or(false);
                     if !fits {
                         if let Some(old) = buffers.remove(&ovid) {
@@ -821,7 +830,8 @@ impl Executor {
             // Resolve the kernel (shape-keyed by the resolved input shapes) and
             // dispatch.
             let node = graph.node(np.node_id);
-            let kernel = cache.get_or_create(np.node_id, node, &input_shapes, &ep)?;
+            let opset = effective_opset(graph, node);
+            let kernel = cache.get_or_create(np.node_id, node, &input_shapes, opset, &ep)?;
             kernel.execute(&views, &mut outs)?;
 
             // Drop the views (they borrow the holders/pointers) before moving
@@ -908,5 +918,61 @@ mod tests {
 
         let unbound = vec![Dim::Symbolic(SymbolId(1)), Dim::Static(4)];
         assert_eq!(substitute(&unbound, &bindings), None);
+    }
+
+    /// H-D1: element-count multiplication must be overflow-checked so a huge or
+    /// malicious shape reports `ShapeOverflow` instead of wrapping `usize` and
+    /// under-sizing the buffer.
+    #[test]
+    fn checked_numel_detects_overflow() {
+        // Well-formed shapes multiply normally.
+        assert_eq!(checked_numel(&[2, 3, 4], || "v".into()).unwrap(), 24);
+        assert_eq!(checked_numel(&[], || "v".into()).unwrap(), 1);
+
+        // A product past usize::MAX overflows.
+        let huge = [usize::MAX, 2];
+        let err = checked_numel(&huge, || "value#9".into());
+        assert!(matches!(
+            err,
+            Err(SessionError::ShapeOverflow { .. })
+        ));
+    }
+
+    /// The data-dependent shape sizer must return exactly one shape per output
+    /// so the run loop's `out_shapes[oi]` indexing can never misindex. Slice is
+    /// single-output, so it returns a 1-element Vec; the run loop additionally
+    /// guards the count (see `OutputShapeCountMismatch`).
+    #[test]
+    fn dynamic_output_shapes_slice_is_single_output() {
+        let node = Node::new(NodeId(0), "Slice", vec![], vec![]);
+        let input_shapes = vec![vec![4usize, 2]];
+        let input_values = vec![
+            None,           // data (unused by sizer)
+            Some(vec![1]),  // starts
+            Some(vec![3]),  // ends
+            Some(vec![0]),  // axes
+            Some(vec![1]),  // steps
+        ];
+        let out = dynamic_output_shapes(&node, &input_shapes, &input_values).unwrap();
+        assert_eq!(out.len(), 1, "Slice must resolve exactly one output shape");
+        assert_eq!(out[0], vec![2, 2]);
+
+        // An op the sizer cannot resolve returns None (surfaces as UnresolvedShape).
+        let other = Node::new(NodeId(1), "Conv", vec![], vec![]);
+        assert!(dynamic_output_shapes(&other, &input_shapes, &input_values).is_none());
+    }
+
+    /// The effective opset is read from the graph's import for the op's domain,
+    /// with the default and `ai.onnx` spellings treated as one.
+    #[test]
+    fn effective_opset_reads_graph_import() {
+        let mut graph = Graph::default();
+        graph.opset_imports.insert(String::new(), 12);
+        let node = Node::new(NodeId(0), "Softmax", vec![], vec![]);
+        assert_eq!(effective_opset(&graph, &node), 12);
+
+        // Missing import falls back to u64::MAX (assume latest).
+        let empty = Graph::default();
+        assert_eq!(effective_opset(&empty, &node), u64::MAX);
     }
 }

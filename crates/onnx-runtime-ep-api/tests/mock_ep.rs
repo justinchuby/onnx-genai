@@ -86,10 +86,10 @@ impl ExecutionProvider for MockEp {
         }
     }
 
-    fn get_kernel(&self, op: &Node, shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
+    fn get_kernel(&self, op: &Node, shapes: &[Vec<usize>], opset: u64) -> Result<Box<dyn Kernel>> {
         let factory = self
             .registry
-            .lookup(&op.op_type, &op.domain, 17)
+            .lookup(&op.op_type, &op.domain, opset)
             .expect("supports_op should gate this");
         factory.create(op, shapes)
     }
@@ -159,7 +159,7 @@ fn mock_ep_supports_and_builds_kernel() {
     let m = ep.supports_op(&node, &shapes, &layouts);
     assert!(m.is_supported());
 
-    let kernel = ep.get_kernel(&node, &[vec![2, 3], vec![2, 3]]).unwrap();
+    let kernel = ep.get_kernel(&node, &[vec![2, 3], vec![2, 3]], 17).unwrap();
     assert_eq!(kernel.estimated_flops(), Some(0));
     kernel.execute(&[], &mut []).unwrap();
 }

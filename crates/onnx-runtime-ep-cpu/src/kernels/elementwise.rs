@@ -30,6 +30,8 @@ enum BinOp {
     Pow,
     /// Variadic minimum (ONNX `Min` accepts 1..N inputs).
     Min,
+    /// Variadic maximum (ONNX `Max` accepts 1..N inputs).
+    Max,
 }
 
 impl BinOp {
@@ -40,6 +42,7 @@ impl BinOp {
             BinOp::Div => "Div",
             BinOp::Pow => "Pow",
             BinOp::Min => "Min",
+            BinOp::Max => "Max",
         }
     }
 
@@ -50,7 +53,23 @@ impl BinOp {
             BinOp::Mul => acc * v,
             BinOp::Div => acc / v,
             BinOp::Pow => acc.powf(v),
-            BinOp::Min => acc.min(v),
+            // ONNX Min/Max propagate NaN (numpy `minimum`/`maximum` semantics).
+            // Rust's `f32::min`/`f32::max` SUPPRESS NaN (return the non-NaN
+            // operand), so guard explicitly before delegating.
+            BinOp::Min => {
+                if acc.is_nan() || v.is_nan() {
+                    f32::NAN
+                } else {
+                    acc.min(v)
+                }
+            }
+            BinOp::Max => {
+                if acc.is_nan() || v.is_nan() {
+                    f32::NAN
+                } else {
+                    acc.max(v)
+                }
+            }
         }
     }
 }
@@ -77,12 +96,13 @@ binary_factory!(MulFactory, BinOp::Mul);
 binary_factory!(DivFactory, BinOp::Div);
 binary_factory!(PowFactory, BinOp::Pow);
 binary_factory!(MinFactory, BinOp::Min);
+binary_factory!(MaxFactory, BinOp::Max);
 
 impl Kernel for BinaryKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         // Min/Max are variadic (1..N); the rest are strictly binary.
         let (min_in, max_in) = match self.op {
-            BinOp::Min => (1, usize::MAX),
+            BinOp::Min | BinOp::Max => (1, usize::MAX),
             _ => (2, 2),
         };
         check_arity(self.op.name(), inputs, outputs, min_in, max_in, 1)?;
@@ -274,6 +294,46 @@ mod tests {
             .unwrap();
         // min(a,3,4) elementwise: min(5,3,4)=3, min(1,3,4)=1, min(8,3,4)=3, min(2,3,4)=2
         assert_eq!(out.to_f32(), vec![3., 1., 3., 2.]);
+    }
+
+    #[test]
+    fn min_propagates_nan() {
+        // ONNX Min propagates NaN (numpy semantics) — unlike Rust's f32::min
+        // which would return the non-NaN operand. NaN in ANY position wins.
+        let a = Owned::f32(&[3], &[f32::NAN, 2.0, 5.0]);
+        let b = Owned::f32(&[3], &[1.0, f32::NAN, 3.0]);
+        let mut out = Owned::zeros_f32(&[3]);
+        run_bin(BinOp::Min, &a, &b, &mut out);
+        let r = out.to_f32();
+        assert!(r[0].is_nan(), "NaN in lhs must propagate");
+        assert!(r[1].is_nan(), "NaN in rhs must propagate");
+        assert_eq!(r[2], 3.0);
+    }
+
+    #[test]
+    fn max_propagates_nan_and_reduces() {
+        // Max mirrors Min: elementwise maximum, NaN-propagating, variadic.
+        let a = Owned::f32(&[3], &[f32::NAN, 2.0, 5.0]);
+        let b = Owned::f32(&[3], &[1.0, f32::NAN, 3.0]);
+        let mut out = Owned::zeros_f32(&[3]);
+        run_bin(BinOp::Max, &a, &b, &mut out);
+        let r = out.to_f32();
+        assert!(r[0].is_nan(), "NaN in lhs must propagate");
+        assert!(r[1].is_nan(), "NaN in rhs must propagate");
+        assert_eq!(r[2], 5.0);
+    }
+
+    #[test]
+    fn max_variadic_three_inputs() {
+        let a = Owned::f32(&[2, 2], &[5., 1., 8., 2.]);
+        let b = Owned::f32(&[2, 2], &[3., 3., 3., 3.]);
+        let c = Owned::f32(&[1], &[4.]);
+        let mut out = Owned::zeros_f32(&[2, 2]);
+        BinaryKernel { op: BinOp::Max }
+            .execute(&[a.view(), b.view(), c.view()], &mut [out.view_mut()])
+            .unwrap();
+        // max(a,3,4): max(5,3,4)=5, max(1,3,4)=4, max(8,3,4)=8, max(2,3,4)=4
+        assert_eq!(out.to_f32(), vec![5., 4., 8., 4.]);
     }
 
     #[test]

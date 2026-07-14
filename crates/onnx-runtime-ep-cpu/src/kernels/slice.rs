@@ -15,6 +15,121 @@ use crate::strided::{next_index, numel};
 /// Stateless Slice kernel.
 pub struct SliceKernel;
 
+/// The resolved per-axis Slice plan for one axis: the first source coordinate,
+/// the step, and the number of output elements.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SliceAxisPlan {
+    pub start: i64,
+    pub step: i64,
+    pub count: usize,
+}
+
+/// Compute the per-axis Slice plan (start, step, output-count) for every axis of
+/// a rank-`in_shape.len()` input under opset-10+ semantics. `axes` and `steps`
+/// must already be resolved to the same length as `starts`/`ends`. Non-sliced
+/// axes take their full extent (`start = 0`, `step = 1`, `count = dim`).
+///
+/// This is the single source of truth for Slice output geometry — the CPU
+/// [`SliceKernel`] and the session executor's data-dependent shape sizer both
+/// call it, so the buffer the session sizes can never drift from what the
+/// kernel writes. Clamping follows the ONNX reference exactly (negative
+/// indices, negative steps, and step-sign-dependent bounds).
+pub fn slice_plan(
+    in_shape: &[usize],
+    starts: &[i64],
+    ends: &[i64],
+    axes: &[i64],
+    steps: &[i64],
+) -> Result<Vec<SliceAxisPlan>> {
+    let rank = in_shape.len();
+    if starts.len() != ends.len() || starts.len() != axes.len() || starts.len() != steps.len() {
+        return Err(EpError::KernelFailed(
+            "Slice: starts/ends/axes/steps length mismatch".into(),
+        ));
+    }
+    let mut plan = vec![
+        SliceAxisPlan {
+            start: 0,
+            step: 1,
+            count: 0,
+        };
+        rank
+    ];
+    for (ax, p) in plan.iter_mut().enumerate() {
+        p.count = in_shape[ax];
+    }
+    for i in 0..starts.len() {
+        let raw_axis = axes[i];
+        let ax = if raw_axis < 0 {
+            raw_axis + rank as i64
+        } else {
+            raw_axis
+        };
+        if ax < 0 || ax as usize >= rank {
+            return Err(EpError::KernelFailed(format!(
+                "Slice: axis {raw_axis} out of range for rank {rank}"
+            )));
+        }
+        let ax = ax as usize;
+        let d = in_shape[ax] as i64;
+        let s = steps[i];
+        if s == 0 {
+            return Err(EpError::KernelFailed("Slice: step must be non-zero".into()));
+        }
+        let mut b = starts[i];
+        let mut e = ends[i];
+        if b < 0 {
+            b += d;
+        }
+        if e < 0 {
+            e += d;
+        }
+        // Clamp bounds differ by step sign (ONNX reference semantics).
+        let (b, e) = if s < 0 {
+            (b.clamp(0, d - 1), e.clamp(-1, d - 1))
+        } else {
+            (b.clamp(0, d), e.clamp(0, d))
+        };
+        // Element count along this axis under `step`.
+        let c = if s > 0 {
+            if e > b {
+                ((e - b + s - 1) / s) as usize
+            } else {
+                0
+            }
+        } else if b > e {
+            ((b - e + (-s) - 1) / (-s)) as usize
+        } else {
+            0
+        };
+        plan[ax] = SliceAxisPlan {
+            start: b,
+            step: s,
+            count: c,
+        };
+    }
+    Ok(plan)
+}
+
+/// Resolve the optional `axes` / `steps` Slice inputs to full-length vectors,
+/// defaulting `axes` to `0..starts_len` and `steps` to all-ones. Shared so the
+/// kernel and the executor's sizer resolve defaults identically.
+pub fn slice_axes_steps(
+    starts_len: usize,
+    axes: Option<&[i64]>,
+    steps: Option<&[i64]>,
+) -> (Vec<i64>, Vec<i64>) {
+    let axes = match axes {
+        Some(a) => a.to_vec(),
+        None => (0..starts_len as i64).collect(),
+    };
+    let steps = match steps {
+        Some(s) => s.to_vec(),
+        None => vec![1; starts_len],
+    };
+    (axes, steps)
+}
+
 /// Factory for [`SliceKernel`] (opset-10+ takes all parameters as inputs).
 pub struct SliceFactory;
 
@@ -34,71 +149,24 @@ impl Kernel for SliceKernel {
 
         let starts = to_dense_i64(&inputs[1])?;
         let ends = to_dense_i64(&inputs[2])?;
-        let axes: Vec<i64> = if inputs.len() >= 4 {
-            to_dense_i64(&inputs[3])?
+        let axes_in = if inputs.len() >= 4 {
+            Some(to_dense_i64(&inputs[3])?)
         } else {
-            (0..starts.len() as i64).collect()
+            None
         };
-        let steps: Vec<i64> = if inputs.len() >= 5 {
-            to_dense_i64(&inputs[4])?
+        let steps_in = if inputs.len() >= 5 {
+            Some(to_dense_i64(&inputs[4])?)
         } else {
-            vec![1; starts.len()]
+            None
         };
-        if starts.len() != ends.len() || starts.len() != axes.len() || starts.len() != steps.len() {
-            return Err(EpError::KernelFailed(
-                "Slice: starts/ends/axes/steps length mismatch".into(),
-            ));
-        }
+        let (axes, steps) =
+            slice_axes_steps(starts.len(), axes_in.as_deref(), steps_in.as_deref());
 
-        // Per-axis (start, step, count). Non-sliced axes take the full extent.
-        let mut start = vec![0i64; rank];
-        let mut step = vec![1i64; rank];
-        let mut count: Vec<usize> = in_shape.to_vec();
-
-        for i in 0..starts.len() {
-            let raw_axis = axes[i];
-            let ax = if raw_axis < 0 { raw_axis + rank as i64 } else { raw_axis };
-            if ax < 0 || ax as usize >= rank {
-                return Err(EpError::KernelFailed(format!(
-                    "Slice: axis {raw_axis} out of range for rank {rank}"
-                )));
-            }
-            let ax = ax as usize;
-            let d = in_shape[ax] as i64;
-            let s = steps[i];
-            if s == 0 {
-                return Err(EpError::KernelFailed("Slice: step must be non-zero".into()));
-            }
-            let mut b = starts[i];
-            let mut e = ends[i];
-            if b < 0 {
-                b += d;
-            }
-            if e < 0 {
-                e += d;
-            }
-            // Clamp bounds differ by step sign (ONNX reference semantics).
-            let (b, e) = if s < 0 {
-                (b.clamp(0, d - 1), e.clamp(-1, d - 1))
-            } else {
-                (b.clamp(0, d), e.clamp(0, d))
-            };
-            // Element count along this axis under `step`.
-            let c = if s > 0 {
-                if e > b {
-                    ((e - b + s - 1) / s) as usize
-                } else {
-                    0
-                }
-            } else if b > e {
-                ((b - e + (-s) - 1) / (-s)) as usize
-            } else {
-                0
-            };
-            start[ax] = b;
-            step[ax] = s;
-            count[ax] = c;
-        }
+        // Per-axis (start, step, count) — the single shared geometry helper.
+        let plan = slice_plan(in_shape, &starts, &ends, &axes, &steps)?;
+        let start: Vec<i64> = plan.iter().map(|p| p.start).collect();
+        let step: Vec<i64> = plan.iter().map(|p| p.step).collect();
+        let count: Vec<usize> = plan.iter().map(|p| p.count).collect();
 
         let out_shape = count;
         let in_strides = compute_contiguous_strides(in_shape);
@@ -133,6 +201,25 @@ impl Kernel for SliceKernel {
 mod tests {
     use super::*;
     use crate::kernels::testutil::Owned;
+
+    #[test]
+    fn slice_plan_matches_reference_geometry() {
+        // Rank-2 input, slice axis 0 [1:3] step 1 → axis 0 count 2, axis 1 full.
+        let plan = slice_plan(&[4, 2], &[1], &[3], &[0], &[1]).unwrap();
+        assert_eq!(
+            plan,
+            vec![
+                SliceAxisPlan { start: 1, step: 1, count: 2 },
+                SliceAxisPlan { start: 0, step: 1, count: 2 },
+            ]
+        );
+        // Negative step reverses: [4:-6:-1] over dim 5 → all 5 elements reversed.
+        let rev = slice_plan(&[5], &[4], &[-6], &[0], &[-1]).unwrap();
+        assert_eq!(rev, vec![SliceAxisPlan { start: 4, step: -1, count: 5 }]);
+        // Zero step and length mismatch are rejected.
+        assert!(slice_plan(&[5], &[0], &[5], &[0], &[0]).is_err());
+        assert!(slice_plan(&[5], &[0, 1], &[5], &[0], &[1]).is_err());
+    }
 
     #[test]
     fn slice_basic_axis0() {

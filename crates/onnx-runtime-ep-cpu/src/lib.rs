@@ -29,3 +29,5 @@ pub mod provider;
 pub mod strided;
 
 pub use provider::CpuExecutionProvider;
+
+pub use kernels::slice::{slice_axes_steps, slice_plan, SliceAxisPlan};

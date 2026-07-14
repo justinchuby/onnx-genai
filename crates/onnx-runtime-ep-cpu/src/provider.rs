@@ -129,12 +129,14 @@ impl ExecutionProvider for CpuExecutionProvider {
         }
     }
 
-    fn get_kernel(&self, op: &Node, shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
-        // Highest applicable opset wins; we register at since_version 1, so a
-        // max lookup selects our kernels regardless of the graph's opset.
+    fn get_kernel(&self, op: &Node, shapes: &[Vec<usize>], opset: u64) -> Result<Box<dyn Kernel>> {
+        // Select the highest registered `since_version` that is <= the graph's
+        // effective opset for this op's domain. Ops with a single registration
+        // (since_version 1) always match; opset-specialized ops (e.g. Softmax,
+        // registered at both 1 and 13) get the version-correct kernel.
         let factory = self
             .registry
-            .lookup(&op.op_type, &op.domain, u64::MAX)
+            .lookup(&op.op_type, &op.domain, opset)
             .ok_or_else(|| EpError::NoEpForOp {
                 op_type: op.op_type.clone(),
             })?;
@@ -318,10 +320,10 @@ mod tests {
         let ep = CpuExecutionProvider::new();
         for (i, op) in crate::kernels::PHASE1_OPS.iter().enumerate() {
             let node = Node::new(onnx_runtime_ir::NodeId(i as u32), *op, vec![], vec![]);
-            assert!(ep.get_kernel(&node, &[]).is_ok(), "no kernel for {op}");
+            assert!(ep.get_kernel(&node, &[], 17).is_ok(), "no kernel for {op}");
         }
         let bad = Node::new(onnx_runtime_ir::NodeId(99), "Conv", vec![], vec![]);
-        assert!(ep.get_kernel(&bad, &[]).is_err());
+        assert!(ep.get_kernel(&bad, &[], 17).is_err());
     }
 
     #[test]

@@ -1,16 +1,22 @@
-//! `Softmax`: numerically stable softmax over a single axis for f32
-//! (`docs/ORT2.md` §4.4).
+//! `Softmax`: numerically stable softmax for f32 (`docs/ORT2.md` §4.4).
 //!
-//! ## Opset-12 axis semantics (decision)
+//! ## Two opset semantics (both implemented, selected by opset)
 //!
-//! This kernel treats `axis` (default 1, negatives allowed) as **the single
-//! reduction axis** — softmax is normalized along that one axis, matching the
-//! opset-13+ definition. It deliberately does **not** implement the legacy
-//! opset-<13 "coerce to 2D `[d0..axis, axis..]`" behavior. For the Phase-1
-//! BERT target every `Softmax` reduces over the last axis, where the coerce and
-//! per-axis definitions coincide exactly, so this matches ORT for the milestone
-//! model. (See the decision note for the caveat about non-last-axis opset-12
-//! graphs.)
+//! ONNX changed `Softmax`'s definition at opset 13:
+//!
+//! * **opset ≥ 13** ([`SoftmaxKernel`] with `coerce_2d = false`): `axis` is the
+//!   single reduction axis — softmax is normalized along that one axis.
+//! * **opset ≤ 12** ([`SoftmaxKernel`] with `coerce_2d = true`): the input is
+//!   coerced to a 2D matrix `[d_0·…·d_{axis-1}, d_axis·…·d_{n-1}]` and softmax
+//!   is taken over each row (the *entire* flattened trailing block), not just
+//!   the `axis` dimension.
+//!
+//! The two definitions coincide exactly when `axis` is the last dimension
+//! (every trailing block is then a single axis). They diverge for `axis != last`,
+//! so applying the opset-13 kernel to an opset-12 node silently produced wrong
+//! results — the advisory this kernel now closes. The registry keys the two
+//! factories at `since_version` 1 (legacy) and 13 (per-axis); the provider's
+//! opset-aware lookup selects the correct one.
 //!
 //! Stability: each reduction slice subtracts its max before `exp`, so large
 //! logits (e.g. masked-attention `-inf`/`1e9` fills) never overflow.
@@ -21,18 +27,66 @@ use onnx_runtime_ir::Node;
 use super::{check_arity, to_dense_f32, write_dense_f32};
 use crate::strided::numel;
 
-/// f32 Softmax kernel carrying the raw `axis` attribute.
+/// f32 Softmax kernel carrying the raw `axis` attribute and the opset semantics.
 pub struct SoftmaxKernel {
     axis: i64,
+    /// `true` for opset ≤ 12 (coerce-to-2D over the flattened trailing block);
+    /// `false` for opset ≥ 13 (normalize over the single `axis`).
+    coerce_2d: bool,
 }
 
-/// Factory reading `axis` (default 1).
+/// Factory for the opset ≥ 13 per-axis `Softmax` (`axis` default 1).
 pub struct SoftmaxFactory;
+
+/// Factory for the legacy opset ≤ 12 coerce-to-2D `Softmax` (`axis` default 1).
+pub struct SoftmaxLegacyFactory;
 
 impl KernelFactory for SoftmaxFactory {
     fn create(&self, node: &Node, _shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
         let axis = node.attr("axis").and_then(|a| a.as_int()).unwrap_or(1);
-        Ok(Box::new(SoftmaxKernel { axis }))
+        Ok(Box::new(SoftmaxKernel {
+            axis,
+            coerce_2d: false,
+        }))
+    }
+}
+
+impl KernelFactory for SoftmaxLegacyFactory {
+    fn create(&self, node: &Node, _shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
+        let axis = node.attr("axis").and_then(|a| a.as_int()).unwrap_or(1);
+        Ok(Box::new(SoftmaxKernel {
+            axis,
+            coerce_2d: true,
+        }))
+    }
+}
+
+/// Softmax `n` independent contiguous rows of `axis_dim` elements each over the
+/// stride-`inner` interleaving: element `a` of slice `(o, i)` lives at
+/// `o·axis_dim·inner + a·inner + i`. With `inner == 1` this is a plain
+/// row-major softmax; with `inner > 1` it reduces along an interior axis.
+fn softmax_slices(x: &[f32], out: &mut [f32], outer: usize, axis_dim: usize, inner: usize) {
+    for o in 0..outer {
+        for i in 0..inner {
+            let base = o * axis_dim * inner + i;
+            let mut max = f32::NEG_INFINITY;
+            for a in 0..axis_dim {
+                let v = x[base + a * inner];
+                if v > max {
+                    max = v;
+                }
+            }
+            let mut sum = 0.0f32;
+            for a in 0..axis_dim {
+                let e = (x[base + a * inner] - max).exp();
+                out[base + a * inner] = e;
+                sum += e;
+            }
+            let inv = 1.0 / sum;
+            for a in 0..axis_dim {
+                out[base + a * inner] *= inv;
+            }
+        }
     }
 }
 
@@ -60,37 +114,21 @@ impl Kernel for SoftmaxKernel {
         }
         let axis = axis as usize;
 
-        // View the tensor as [outer, axis_dim, inner] with the reduction over
-        // the middle axis; every (outer, inner) pair is an independent slice.
-        let axis_dim = shape[axis];
-        let outer: usize = shape[..axis].iter().product();
-        let inner: usize = shape[axis + 1..].iter().product();
-
         let mut out = vec![0.0f32; numel(shape)];
-        for o in 0..outer {
-            for i in 0..inner {
-                let base = o * axis_dim * inner + i;
-                // max over the slice for numerical stability.
-                let mut max = f32::NEG_INFINITY;
-                for a in 0..axis_dim {
-                    let v = x[base + a * inner];
-                    if v > max {
-                        max = v;
-                    }
-                }
-                // exp(x - max) and running sum.
-                let mut sum = 0.0f32;
-                for a in 0..axis_dim {
-                    let e = (x[base + a * inner] - max).exp();
-                    out[base + a * inner] = e;
-                    sum += e;
-                }
-                // normalize.
-                let inv = 1.0 / sum;
-                for a in 0..axis_dim {
-                    out[base + a * inner] *= inv;
-                }
-            }
+        if self.coerce_2d {
+            // opset ≤ 12: coerce to 2D `[d_0·…·d_{axis-1}, d_axis·…·d_{n-1}]`
+            // and softmax each row over the whole flattened trailing block.
+            let rows: usize = shape[..axis].iter().product();
+            let cols: usize = shape[axis..].iter().product();
+            // Trailing block is contiguous, so `inner == 1`.
+            softmax_slices(&x, &mut out, rows, cols, 1);
+        } else {
+            // opset ≥ 13: normalize over the single `axis`, viewing the tensor
+            // as `[outer, axis_dim, inner]`.
+            let axis_dim = shape[axis];
+            let outer: usize = shape[..axis].iter().product();
+            let inner: usize = shape[axis + 1..].iter().product();
+            softmax_slices(&x, &mut out, outer, axis_dim, inner);
         }
         write_dense_f32(&mut outputs[0], &out)
     }
@@ -106,9 +144,21 @@ mod tests {
     use crate::kernels::testutil::Owned;
 
     fn run(axis: i64, x: &Owned, out: &mut Owned) {
-        SoftmaxKernel { axis }
-            .execute(&[x.view()], &mut [out.view_mut()])
-            .unwrap();
+        SoftmaxKernel {
+            axis,
+            coerce_2d: false,
+        }
+        .execute(&[x.view()], &mut [out.view_mut()])
+        .unwrap();
+    }
+
+    fn run_legacy(axis: i64, x: &Owned, out: &mut Owned) {
+        SoftmaxKernel {
+            axis,
+            coerce_2d: true,
+        }
+        .execute(&[x.view()], &mut [out.view_mut()])
+        .unwrap();
     }
 
     fn approx(a: &[f32], b: &[f32]) {
@@ -174,5 +224,50 @@ mod tests {
         let r = out.to_f32();
         // row [1,2] and row [3,4] both softmax to [0.26894, 0.73106].
         approx(&r, &[0.268_941_43, 0.731_058_6, 0.268_941_43, 0.731_058_6]);
+    }
+
+    #[test]
+    fn softmax_opset12_axis0_coerces_to_single_row() {
+        // [2,2], axis 0. opset≤12 coerces to `[1, 4]` (rows before axis 0 = 1)
+        // and softmaxes the ENTIRE flattened tensor as one row — unlike the
+        // opset-13 per-axis (column-wise) definition.
+        let x = Owned::f32(&[2, 2], &[1., 2., 3., 4.]);
+        let mut out = Owned::zeros_f32(&[2, 2]);
+        run_legacy(0, &x, &mut out);
+        let r = out.to_f32();
+        approx(&r, &[0.032_058_6, 0.087_144_32, 0.236_882_82, 0.643_914_2]);
+        // The whole tensor is one softmax row → all elements sum to 1.
+        assert!((r.iter().sum::<f32>() - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn softmax_opset12_differs_from_opset13_when_axis_not_last() {
+        // Same [2,2] axis-0 input: the opset-13 per-axis kernel normalizes each
+        // column independently, so the two definitions must disagree here.
+        let x = Owned::f32(&[2, 2], &[1., 2., 3., 4.]);
+        let mut per_axis = Owned::zeros_f32(&[2, 2]);
+        let mut legacy = Owned::zeros_f32(&[2, 2]);
+        run(0, &x, &mut per_axis);
+        run_legacy(0, &x, &mut legacy);
+        // opset-13: each column [1,3] and [2,4] → [0.11920, 0.88080].
+        approx(
+            &per_axis.to_f32(),
+            &[0.119_202_92, 0.119_202_92, 0.880_797_1, 0.880_797_1],
+        );
+        // The two kernels genuinely diverge (the bug this fix closes).
+        let (a, b) = (per_axis.to_f32(), legacy.to_f32());
+        assert!(a.iter().zip(&b).any(|(x, y)| (x - y).abs() > 1e-3));
+    }
+
+    #[test]
+    fn softmax_opset12_matches_opset13_on_last_axis() {
+        // When axis == last dim, the coerce-to-2D and per-axis definitions
+        // coincide exactly — the BERT-attention case.
+        let x = Owned::f32(&[2, 3], &[1., 2., 3., 4., 5., 6.]);
+        let mut per_axis = Owned::zeros_f32(&[2, 3]);
+        let mut legacy = Owned::zeros_f32(&[2, 3]);
+        run(-1, &x, &mut per_axis);
+        run_legacy(-1, &x, &mut legacy);
+        approx(&per_axis.to_f32(), &legacy.to_f32());
     }
 }

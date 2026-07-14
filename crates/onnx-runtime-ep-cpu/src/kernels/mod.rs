@@ -58,6 +58,7 @@ pub const PHASE1_OPS: &[&str] = &[
     "Div",
     "Pow",
     "Min",
+    "Max",
     // Elementwise unary.
     "Sqrt",
     "Erf",
@@ -115,6 +116,7 @@ pub fn build_cpu_registry() -> OpRegistry {
     reg.register(OpKey::new("Div", "", 1), Box::new(elementwise::DivFactory));
     reg.register(OpKey::new("Pow", "", 1), Box::new(elementwise::PowFactory));
     reg.register(OpKey::new("Min", "", 1), Box::new(elementwise::MinFactory));
+    reg.register(OpKey::new("Max", "", 1), Box::new(elementwise::MaxFactory));
     // Elementwise unary ops.
     reg.register(OpKey::new("Sqrt", "", 1), Box::new(elementwise::SqrtFactory));
     reg.register(OpKey::new("Erf", "", 1), Box::new(elementwise::ErfFactory));
@@ -125,8 +127,14 @@ pub fn build_cpu_registry() -> OpRegistry {
         OpKey::new("ReduceMean", "", 1),
         Box::new(reduce::ReduceMeanFactory),
     );
+    // Softmax: legacy coerce-to-2D at opset ≤ 12, per-axis at opset ≥ 13. The
+    // provider's opset-aware lookup selects the version-correct kernel.
     reg.register(
         OpKey::new("Softmax", "", 1),
+        Box::new(softmax::SoftmaxLegacyFactory),
+    );
+    reg.register(
+        OpKey::new("Softmax", "", 13),
         Box::new(softmax::SoftmaxFactory),
     );
     // Shape / data movement.
@@ -552,10 +560,16 @@ mod tests {
     #[test]
     fn registry_has_all_phase1_ops() {
         let reg = build_cpu_registry();
-        assert_eq!(reg.len(), PHASE1_OPS.len());
+        // Every Phase-1 op has at least one factory, and each resolves at a
+        // modern opset. `Softmax` is registered twice (legacy v1 + per-axis
+        // v13), so the entry count is one more than the op-name count.
+        assert_eq!(reg.len(), PHASE1_OPS.len() + 1);
         for op in PHASE1_OPS {
             assert!(reg.lookup(op, "", 21).is_some(), "missing factory for {op}");
         }
+        // Softmax selects legacy at opset ≤ 12 and per-axis at opset ≥ 13.
+        assert!(reg.lookup("Softmax", "", 12).is_some());
+        assert!(reg.lookup("Softmax", "", 13).is_some());
         assert!(reg.lookup("Conv", "", 21).is_none());
     }
 

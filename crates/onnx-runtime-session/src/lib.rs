@@ -67,6 +67,18 @@ mod error {
         #[error("no inferred shape for value {value} produced by op {op}")]
         UnresolvedShape { value: String, op: String },
 
+        #[error("shape element count overflows usize for value {value} (dims {dims:?})")]
+        ShapeOverflow { value: String, dims: Vec<usize> },
+
+        #[error(
+            "op {op} produced {got} data-dependent output shape(s) but has {expected} output(s)"
+        )]
+        OutputShapeCountMismatch {
+            op: String,
+            expected: usize,
+            got: usize,
+        },
+
         #[error("input {name}: dtype mismatch (expected {expected}, got {got})")]
         DtypeMismatch {
             name: String,
