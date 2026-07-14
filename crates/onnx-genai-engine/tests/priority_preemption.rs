@@ -18,6 +18,7 @@ fn priority_config() -> EngineConfig {
             max_total_tokens: 1024,
             priority_policy: PriorityPolicy::Priority,
             preemption_policy: PreemptionPolicy::Swap,
+            bytes_per_token: None,
         },
         ..Default::default()
     }

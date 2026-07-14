@@ -2783,6 +2783,17 @@ These page-based budgets are driven by the byte-denominated, user-tunable ceilin
 §26.11 (Resource Governor): the governor derives `total_pages` / `interactive_reserve`
 from `vram_limit` and invokes these same tiers when a limit is lowered at runtime.
 
+**Implementation status.** The cross-session *byte* accounting primitive underneath this
+budget has landed as `onnx-genai-scheduler`'s `byte_budget::ByteBudget` — a cloneable,
+thread-safe, dynamically-reconfigurable byte ceiling shared across every scheduler/session
+on a device (DESIGN §26.11.3). `Scheduler::with_byte_budget` gates admission and swap-in on
+it, reserving each sequence's worst-case KV footprint (`(prompt + max_tokens) *
+bytes_per_token`, the byte cost supplied per model — RULES #2) and releasing on completion
+or preemption; over-budget rejections carry the RULES #1 what/why/how shortfall.
+`ByteBudget::reconfigure` reports the overage a lowered limit must evict without evicting
+itself. Still pending: the §26.11 governor that *derives* the byte limit from resolved VRAM
+and drives the eviction tiers above on live reconfigure (see PROGRESS.md items 10–11).
+
 ### 26.5 Batched Prefill (Chunked)
 
 When multiple agents start simultaneously (e.g., Flightdeck spawns 5 workers):
