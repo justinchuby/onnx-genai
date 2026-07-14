@@ -41,6 +41,12 @@ The GenAI layer (KV cache, batching, speculative decoding, serving) is covered i
 28. [Open Questions](#28-open-questions)
 29. [Phased Roadmap](#29-phased-roadmap)
 
+<!-- NOTE: entries 1–29 above predate later sections; the body currently runs to §56.
+     Full TOC reconciliation is tracked separately. New sections are appended below. -->
+
+55. [EPContext Node — On-Disk Compiled-EP Interchange](#55-epcontext-node--on-disk-compiled-ep-interchange)
+56. [Phased Roadmap](#56-phased-roadmap)
+
 ---
 
 ## 1. Design Principles
@@ -2604,7 +2610,17 @@ AOT scripts) works unchanged. These are set via `AddSessionConfigEntry` /
 |-------------------------|--------|------------------|----------------------------------------------------------------------|
 | `ep.context_enable`     | int    | `0`              | `1` = after compile, dump a context-cache `*_ctx.onnx` model.        |
 | `ep.context_file_path`  | string | `<orig>_ctx.onnx`| Output path for the generated context model.                         |
-| `ep.context_embed_mode` | int    | `1`              | `1` = embed blob in node; `0` = write external file, store its path. |
+| `ep.context_embed_mode` | int    | `0`              | `0` = write external file, store its path; `1` = embed blob in node. |
+
+> **Two distinct `embed_mode` defaults — do not conflate them.** The *session
+> option* `ep.context_embed_mode` that drives **generation** defaults to **`0`**
+> (external file) in ORT (`ep_context_options.cc`). The *op attribute*
+> `embed_mode` baked into an on-disk `EPContext` node defaults to **`1`**
+> (payload inline) when the attribute is absent (§55.2). In other words: when you
+> ask ORT to *generate* a context model without specifying a mode, it writes an
+> **external** blob; but when you *read* an EPContext node whose `embed_mode`
+> attribute is missing, you assume the payload is **inline**. The two `1`↔`0`
+> defaults are intentional and independent.
 
 ```rust
 // Parsed in the capi layer, stored on SessionOptions, read by the writer (§55.4).
@@ -2612,6 +2628,7 @@ pub struct EpContextGenOptions {
     pub enable: bool,           // ep.context_enable
     pub file_path: Option<PathBuf>, // ep.context_file_path (default: <orig>_ctx.onnx)
     pub embed_mode: EmbedMode,  // ep.context_embed_mode → Embedded | ExternalFile
+                                //   (session-option default = ExternalFile, i.e. 0)
 }
 ```
 
