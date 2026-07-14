@@ -4,7 +4,7 @@
 > without building a graph. PyTorch-style experience with ONNX op semantics.
 
 **Scope:** Python API design, Rust implementation, opset versioning, custom domains, subgraph ops.
-Complements [ORT2.md](./NXRT.md) §20 (Session API) and §24 (Python Bindings).
+Complements [ORT2.md](./ORT2.md) §20 (Session API) and §24 (Python Bindings).
 
 ---
 
