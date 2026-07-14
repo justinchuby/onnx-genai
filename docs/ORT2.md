@@ -41,7 +41,7 @@ The GenAI layer (KV cache, batching, speculative decoding, serving) is covered i
 28. [Open Questions](#28-open-questions)
 29. [Phased Roadmap](#29-phased-roadmap)
 
-<!-- NOTE: entries 1–29 above predate later sections; the body currently runs to §56.
+<!-- NOTE: entries 1–29 above predate later sections; the body currently runs to §58.
      Full TOC reconciliation is tracked separately. New sections are appended below. -->
 
 55. [EPContext Node — On-Disk Compiled-EP Interchange](#55-epcontext-node--on-disk-compiled-ep-interchange)
@@ -561,7 +561,7 @@ pub trait ExecutionProvider: Send + Sync {
 /// This is the **runtime form** of a compiled-EP context. Its **on-disk /
 /// interchange form** is the ORT `EPContext` contrib node (domain
 /// `com.microsoft`) that embeds this blob directly in an ONNX graph — see
-/// §55 for the full node schema, the load/dump paths, and the exact mapping
+/// §57 for the full node schema, the load/dump paths, and the exact mapping
 /// between this struct's `data`/`ep_name`/`ep_version` fields and the node's
 /// `ep_cache_context`/`source`/`ep_sdk_version` attributes.
 pub struct EpContext {
@@ -2813,7 +2813,7 @@ To be a true drop-in, the C API must honor ORT's `EPContext`-generation session
 options so ORT tooling (e.g. `onnxruntime.tools` context-cache dumping, QNN/OpenVINO
 AOT scripts) works unchanged. These are set via `AddSessionConfigEntry` /
 `AppendExecutionProvider` string key-values and are parsed into `SessionOptions`
-(§20.5) fields consumed by the dump path (§55.4):
+(§20.5) fields consumed by the dump path (§57.4):
 
 | Session-option key      | Type   | Default          | Meaning                                                              |
 |-------------------------|--------|------------------|----------------------------------------------------------------------|
@@ -2825,14 +2825,14 @@ AOT scripts) works unchanged. These are set via `AddSessionConfigEntry` /
 > option* `ep.context_embed_mode` that drives **generation** defaults to **`0`**
 > (external file) in ORT (`ep_context_options.cc`). The *op attribute*
 > `embed_mode` baked into an on-disk `EPContext` node defaults to **`1`**
-> (payload inline) when the attribute is absent (§55.2). In other words: when you
+> (payload inline) when the attribute is absent (§57.2). In other words: when you
 > ask ORT to *generate* a context model without specifying a mode, it writes an
 > **external** blob; but when you *read* an EPContext node whose `embed_mode`
 > attribute is missing, you assume the payload is **inline**. The two `1`↔`0`
 > defaults are intentional and independent.
 
 ```rust
-// Parsed in the capi layer, stored on SessionOptions, read by the writer (§55.4).
+// Parsed in the capi layer, stored on SessionOptions, read by the writer (§57.4).
 pub struct EpContextGenOptions {
     pub enable: bool,           // ep.context_enable
     pub file_path: Option<PathBuf>, // ep.context_file_path (default: <orig>_ctx.onnx)
@@ -4729,11 +4729,11 @@ Cached load:   load_plan(50ms) → mmap_weights(10ms) → warm_kernels(50ms) = ~
                                                                     7x faster
 ```
 
-> **Relationship to the on-disk `EPContext` node (§55).** This cache is our
+> **Relationship to the on-disk `EPContext` node (§57).** This cache is our
 > *internal, host-local* cold-start artifact keyed on `hash(model + device +
 > options + runtime_version)` — it caches the *whole compiled plan* and is not
 > portable across machines or ORT-compatible tools. ORT's `EPContext` contrib
-> node (§55) is the *portable, in-graph* form of a single EP's compiled context:
+> node (§57) is the *portable, in-graph* form of a single EP's compiled context:
 > it travels inside the `*_ctx.onnx` model and is consumed by any ORT-compatible
 > runtime. The two are complementary — when an EP's `save_context()` produces an
 > `EpContext`, its `data` blob can be stored both here (fast local reload) and,
@@ -5116,7 +5116,7 @@ $ nxrt trace diagnose /tmp/trace.jsonl
 - [ ] **Page migration events** — full detail: page_id, content, from/to tier, duration, reason, overlap info
 - [ ] **Counter tracks (Perfetto)** — continuous GPU mem, KV growth, pressure level
 - [ ] **Flow events** — data dependency arrows (prefetch H2D → consuming kernel)
-- [ ] **CUPTI integration (stretch)** — GPU kernel timing, SM occupancy, memory throughput
+- [x] **CUPTI integration (§49)** — GPU kernel timing, SM occupancy, memory throughput
 - [ ] **Roofline analysis per-op** — classify compute-bound vs memory-bound automatically
 - [ ] **Pipeline bubble detection** — idle time in PP stages
 - [ ] **Communication/compute overlap ratio** — % of transfer hidden by compute
@@ -5299,9 +5299,832 @@ If GitHub Copilot is adding Perfetto support, we ensure:
 
 ---
 
-## 49. LoRA Serving
+## 49. CUPTI Integration (GPU Kernel-Level Tracing)
 
 ### 49.1 Problem
+
+§48 Unified Tracing captures **runtime-level** events (which op ran, how long the dispatch took,
+transfer scheduling). But it doesn't see **inside** the GPU kernel:
+
+- Actual kernel execution time (not just dispatch→completion wall clock)
+- SM occupancy (are we warp-limited or register-limited?)
+- Memory throughput (are we hitting theoretical bandwidth?)
+- Warp stall reasons (memory latency, execution dependency, barrier)
+- Tensor Core utilization (are we actually using TC?)
+
+Without this, the auto-tuner (§16) can detect *which* op is slow but can't diagnose *why*.
+
+### 49.2 Architecture
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│                    nxrt Profiling Stack                       │
+├──────────────────────────────────────────────────────────────┤
+│  §48 Unified Tracing (runtime layer)                         │
+│    op dispatch, transfers, scheduling, KV cache events       │
+├──────────────────────────────────────────────────────────────┤
+│  §49 CUPTI Layer (GPU hardware)            ← THIS SECTION    │
+│    kernel timing, occupancy, memory BW, warp stalls          │
+├──────────────────────────────────────────────────────────────┤
+│  CUPTI Activity API + Callback API (NVIDIA driver)           │
+└──────────────────────────────────────────────────────────────┘
+```
+
+Two CUPTI APIs we use:
+
+1. **Activity API** — async buffer of completed GPU activities (kernel, memcpy, memset)
+   Low overhead (~2-5%), always-on capable for production profiling.
+
+2. **Callback API** — synchronous hooks on kernel launch (for correlating dispatch → kernel)
+   Higher overhead, used only in detailed profiling mode.
+
+### 49.3 Rust Integration
+
+```rust
+// crates/onnx-runtime-tracer/src/cupti.rs
+
+use std::ffi::c_void;
+
+/// CUPTI profiling session. Wraps the CUPTI Activity API.
+pub struct CuptiProfiler {
+    /// Whether CUPTI is available (dlopen'd at runtime, not linked).
+    available: bool,
+    /// Activity buffer pool.
+    buffer_pool: BufferPool,
+    /// Correlation map: correlationId → (NodeId, op_type)
+    correlation_map: DashMap<u32, KernelCorrelation>,
+    /// Collected kernel records.
+    records: Mutex<Vec<GpuKernelRecord>>,
+}
+
+/// One GPU kernel execution record.
+#[derive(Debug, Clone)]
+pub struct GpuKernelRecord {
+    /// Correlation back to runtime op dispatch.
+    pub node_id: Option<NodeId>,
+    pub op_type: String,
+    /// Kernel identity.
+    pub kernel_name: String,
+    /// Timing (GPU clock, nanoseconds).
+    pub start_ns: u64,
+    pub end_ns: u64,
+    pub duration_ns: u64,
+    /// Launch config.
+    pub grid: (u32, u32, u32),
+    pub block: (u32, u32, u32),
+    pub shared_memory_bytes: u32,
+    pub registers_per_thread: u32,
+    /// Stream.
+    pub stream_id: u32,
+    /// Occupancy (computed from launch config + device props).
+    pub theoretical_occupancy: f32,   // 0.0 - 1.0
+    pub achieved_occupancy: Option<f32>,  // requires metric collection
+}
+
+/// Hardware performance metrics (from CUPTI Profiling API / PM sampling).
+#[derive(Debug, Clone)]
+pub struct GpuKernelMetrics {
+    pub kernel_name: String,
+    pub node_id: Option<NodeId>,
+    /// Compute
+    pub sm_efficiency: f32,           // % of SMs active
+    pub achieved_occupancy: f32,      // % of max warps
+    pub tensor_core_utilization: f32, // % of TC active cycles
+    pub flop_count_sp: u64,           // single-precision FLOPs
+    pub flop_count_hp: u64,           // half-precision FLOPs
+    /// Memory
+    pub dram_read_bytes: u64,
+    pub dram_write_bytes: u64,
+    pub dram_throughput_pct: f32,     // % of theoretical peak
+    pub l2_hit_rate: f32,
+    /// Stall reasons
+    pub stall_memory_dependency: f32, // % cycles stalled on memory
+    pub stall_execution_dependency: f32,
+    pub stall_barrier: f32,
+    pub stall_not_selected: f32,
+}
+
+impl CuptiProfiler {
+    /// Initialize. Attempts dlopen of libcupti.so at runtime.
+    /// Returns Ok with available=false if CUPTI not present (graceful degradation).
+    pub fn new() -> Result<Self> {
+        let available = unsafe { try_load_cupti() };
+        Ok(Self {
+            available,
+            buffer_pool: BufferPool::new(8, 1 << 20), // 8 buffers × 1MB
+            correlation_map: DashMap::new(),
+            records: Mutex::new(Vec::new()),
+        })
+    }
+
+    /// Start activity tracing (low overhead mode).
+    pub fn start_activity_tracing(&mut self) -> Result<()> {
+        if !self.available { return Ok(()); }
+        // Enable: CUPTI_ACTIVITY_KIND_KERNEL, CUPTI_ACTIVITY_KIND_MEMCPY,
+        //         CUPTI_ACTIVITY_KIND_MEMSET, CUPTI_ACTIVITY_KIND_OVERHEAD
+        unsafe {
+            cupti_activity_enable(CUPTI_ACTIVITY_KIND_KERNEL)?;
+            cupti_activity_enable(CUPTI_ACTIVITY_KIND_MEMCPY)?;
+            cupti_activity_register_callbacks(
+                Self::buffer_requested,
+                Self::buffer_completed,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Stop tracing and flush remaining buffers.
+    pub fn stop_and_flush(&mut self) -> Result<Vec<GpuKernelRecord>> {
+        if !self.available { return Ok(vec![]); }
+        unsafe { cupti_activity_flush_all()?; }
+        let records = std::mem::take(self.records.lock().unwrap().as_mut());
+        Ok(records)
+    }
+
+    /// Register a kernel launch correlation (called from EP dispatch).
+    pub fn correlate(&self, correlation_id: u32, node_id: NodeId, op_type: &str) {
+        self.correlation_map.insert(correlation_id, KernelCorrelation {
+            node_id,
+            op_type: op_type.to_string(),
+        });
+    }
+
+    /// Collect detailed metrics for specific kernels (higher overhead).
+    /// Uses CUPTI Profiling API (range-based, replay mode).
+    pub fn collect_metrics(
+        &self,
+        kernel_names: &[&str],
+        metrics: &[CuptiMetric],
+        num_runs: usize,
+    ) -> Result<Vec<GpuKernelMetrics>> {
+        // CUPTI Profiling API requires kernel replay for counter collection
+        // 1. Create profiler config with requested metrics
+        // 2. Begin pass (may need multiple passes for many metrics)
+        // 3. Run kernels (caller invokes model execution)
+        // 4. End pass, decode counters
+        todo!()
+    }
+}
+
+/// Metrics we can request from CUPTI Profiling API.
+pub enum CuptiMetric {
+    SmEfficiency,
+    AchievedOccupancy,
+    TensorCoreUtilization,
+    DramThroughput,
+    L2HitRate,
+    WarpStallReasons,
+    FlopCount,
+}
+```
+
+### 49.4 Correlation: Runtime Op → GPU Kernel
+
+The key challenge is linking runtime-level op dispatch to CUPTI's kernel records:
+
+```rust
+// In EP dispatch (onnx-runtime-ep-cuda)
+impl CudaExecutionProvider {
+    fn execute_kernel(&self, node: &Node, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+        // Get CUPTI correlation ID from current CUDA context
+        let correlation_id = cuda_get_next_correlation_id();
+
+        // Register correlation before launch
+        if let Some(profiler) = self.cupti_profiler.as_ref() {
+            profiler.correlate(correlation_id, node.id, &node.op_type);
+        }
+
+        // Launch kernel (CUPTI automatically tags it with correlation_id)
+        self.kernels[&node.op_type].launch(inputs, outputs, self.stream)?;
+
+        Ok(())
+    }
+}
+```
+
+In Perfetto output, this gives us nested spans:
+```
+[runtime.compute]  ──── MatMul_0 (dispatch, 55μs) ────
+[runtime.gpu]          ── volta_sgemm_128x64 (kernel, 42μs) ──
+                              ↑ correlated via correlation_id
+```
+
+### 49.5 Roofline Analysis (Auto-Classification)
+
+```rust
+/// Automatically classify each kernel as compute-bound or memory-bound.
+pub struct RooflineAnalyzer {
+    /// Device peak performance.
+    peak_flops_fp16: f64,      // e.g. 312 TFLOPS for H100 TC
+    peak_flops_fp32: f64,      // e.g. 67 TFLOPS for H100
+    peak_bandwidth: f64,        // e.g. 3.35 TB/s for H100 HBM3e
+}
+
+#[derive(Debug, Clone)]
+pub struct RooflineResult {
+    pub kernel_name: String,
+    pub node_id: NodeId,
+    /// Arithmetic intensity: FLOPs / bytes accessed
+    pub arithmetic_intensity: f64,
+    /// Achieved performance
+    pub achieved_tflops: f64,
+    /// Classification
+    pub bound: BoundType,
+    /// How far from roofline (1.0 = at roofline, 0.5 = half of peak)
+    pub efficiency: f64,
+    /// Actionable suggestion
+    pub suggestion: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum BoundType {
+    ComputeBound,     // AI > ridge point → limited by FLOPS
+    MemoryBound,      // AI < ridge point → limited by bandwidth
+    LaunchBound,      // kernel too short, dominated by launch overhead
+    Balanced,         // near ridge point
+}
+
+impl RooflineAnalyzer {
+    pub fn analyze(&self, metrics: &GpuKernelMetrics) -> RooflineResult {
+        let bytes_accessed = metrics.dram_read_bytes + metrics.dram_write_bytes;
+        let flops = metrics.flop_count_hp + metrics.flop_count_sp;
+        let ai = flops as f64 / bytes_accessed.max(1) as f64;
+
+        // Ridge point: where compute ceiling meets memory ceiling
+        let ridge_point = self.peak_flops_fp16 / self.peak_bandwidth;
+
+        let bound = if ai > ridge_point * 1.2 {
+            BoundType::ComputeBound
+        } else if ai < ridge_point * 0.8 {
+            BoundType::MemoryBound
+        } else {
+            BoundType::Balanced
+        };
+
+        let theoretical_peak = if ai > ridge_point {
+            self.peak_flops_fp16
+        } else {
+            ai * self.peak_bandwidth
+        };
+        let achieved = flops as f64 / metrics.duration_ns as f64 * 1e9;
+        let efficiency = achieved / theoretical_peak;
+
+        let suggestion = match bound {
+            BoundType::MemoryBound if efficiency < 0.5 => {
+                Some("Memory-bound with low bandwidth utilization. Consider: \
+                      (1) fuse with adjacent ops to reduce memory traffic, \
+                      (2) use in-place operations, (3) quantize to reduce data size".into())
+            }
+            BoundType::ComputeBound if efficiency < 0.5 => {
+                Some("Compute-bound with low SM utilization. Consider: \
+                      (1) increase occupancy (reduce registers/shared mem), \
+                      (2) use Tensor Cores (fp16/bf16/int8), \
+                      (3) increase tile size for better data reuse".into())
+            }
+            BoundType::LaunchBound => {
+                Some("Kernel too short — launch overhead dominates. \
+                      Consider: (1) fuse with neighbors, (2) CUDAGraph capture".into())
+            }
+            _ => None,
+        };
+
+        RooflineResult { kernel_name: metrics.kernel_name.clone(), node_id: metrics.node_id.unwrap(), arithmetic_intensity: ai, achieved_tflops: achieved / 1e12, bound, efficiency, suggestion }
+    }
+}
+```
+
+### 49.6 Profiling Modes
+
+| Mode | Overhead | What you get | Use case |
+|------|----------|-------------|----------|
+| **Off** | 0% | Nothing | Production |
+| **Activity** | 2-5% | Kernel timing + memcpy + correlation | Default profiling (`nxrt profile`) |
+| **Detailed** | 10-30% | Activity + occupancy + basic metrics | Bottleneck diagnosis |
+| **Metrics** | 50-200% (replay) | Full PM counters (roofline, stalls, TC util) | Deep optimization |
+
+```python
+import nxrt
+
+session = nxrt.load("model.onnx", device="cuda")
+
+# Activity mode (low overhead)
+with nxrt.profiler.profile(gpu="activity") as prof:
+    session.run(inputs)
+prof.export_perfetto("trace.perfetto")
+
+# Detailed mode
+with nxrt.profiler.profile(gpu="detailed") as prof:
+    session.run(inputs)
+for kernel in prof.gpu_kernels():
+    print(f"{kernel.op_type}: {kernel.duration_ns/1000:.1f}μs, occupancy={kernel.theoretical_occupancy:.0%}")
+
+# Metrics mode (roofline)
+with nxrt.profiler.profile(gpu="metrics", metrics=["roofline"]) as prof:
+    session.run(inputs)  # may run multiple times internally (CUPTI replay)
+for r in prof.roofline():
+    print(f"{r.kernel_name}: AI={r.arithmetic_intensity:.1f}, {r.bound}, efficiency={r.efficiency:.0%}")
+    if r.suggestion:
+        print(f"  → {r.suggestion}")
+```
+
+### 49.7 CLI Integration
+
+```bash
+# Quick profile (activity mode)
+nxrt profile model.onnx --inputs data.npz --gpu activity --output trace.perfetto
+
+# Roofline analysis
+nxrt profile model.onnx --inputs data.npz --gpu metrics --roofline
+# Output:
+#   MatMul_0    : AI=128.5  compute-bound  efficiency=72%
+#   LayerNorm_3 : AI=2.1    memory-bound   efficiency=45% → fuse with residual add
+#   Softmax_1   : AI=3.8    memory-bound   efficiency=61%
+#   Add_7       : AI=0.25   launch-bound   → CUDAGraph or fuse
+
+# Top-N slowest GPU kernels
+nxrt profile model.onnx --inputs data.npz --gpu detailed --top 10
+```
+
+### 49.8 Perfetto Integration
+
+CUPTI data merges into the same Perfetto trace as §48:
+
+```
+Process: nxrt (pid=1)
+├─ Thread: genai.scheduler        → request lifecycle
+├─ Thread: runtime.compute         → op dispatch (§48)
+├─ Thread: runtime.gpu.stream0     → GPU kernel execution (§49, CUPTI)  ← NEW
+├─ Thread: runtime.gpu.stream1     → GPU memcpy (§49, CUPTI)            ← NEW
+├─ Counter: gpu.sm_occupancy       → achieved occupancy over time        ← NEW
+├─ Counter: gpu.memory_bw_util     → % of peak HBM bandwidth            ← NEW
+├─ Counter: gpu.tensor_core_util   → TC utilization                      ← NEW
+└─ Flow: dispatch → kernel         → correlation arrows                  ← NEW
+```
+
+### 49.9 Dynamic Loading (No Hard Dependency)
+
+```rust
+/// CUPTI is dlopen'd at runtime. Runtime works without it.
+pub struct CuptiLibrary {
+    lib: Option<libloading::Library>,
+    // Function pointers (populated on successful dlopen)
+    activity_enable: Option<unsafe extern "C" fn(kind: u32) -> u32>,
+    activity_flush: Option<unsafe extern "C" fn(flag: u32) -> u32>,
+    // ...
+}
+
+impl CuptiLibrary {
+    pub fn try_load() -> Self {
+        let lib = unsafe { libloading::Library::new("libcupti.so") }
+            .or_else(|_| unsafe { libloading::Library::new("libcupti.dylib") })
+            .ok();
+        // Resolve symbols if loaded...
+        Self { lib, /* ... */ }
+    }
+
+    pub fn is_available(&self) -> bool { self.lib.is_some() }
+}
+```
+
+### 49.10 Design Decisions
+
+| Decision | Choice | Rationale |
+|----------|--------|----------|
+| Hard link vs dlopen | **dlopen** | Runtime works on machines without CUDA/CUPTI |
+| Activity API vs Callback | **Activity primary** + callback for correlation | Activity is lower overhead |
+| Metrics collection | **Replay-based** (CUPTI Profiling API) | Counters require kernel replay; explicit opt-in |
+| Roofline auto-analysis | **Yes** | Key output for auto-tuner (§16) |
+| Integration with §48 | **Same Perfetto trace** | One file, unified view |
+| Correlation mechanism | **CUPTI correlation_id** mapped to NodeId | Standard CUPTI approach |
+| Overhead guarantee | **Activity < 5%** in default profiling | Usable in near-production |
+
+---
+
+## 50. CPU Hardware Detection (cpuinfo)
+
+### 50.1 Problem
+
+The CPU EP needs to select optimal kernel implementations at runtime:
+- AVX-512 VNNI matmul vs AVX2+FMA vs NEON
+- Tile sizes tuned to L2/L3 cache capacity
+- Thread pool affinity respecting core topology (P-cores vs E-cores, NUMA)
+- AMX (Sapphire Rapids+) detection for int8/bf16 matmul
+
+Without hardware detection, we either ship the lowest-common-denominator kernel
+or require users to set flags manually.
+
+### 50.2 Detection Layer
+
+```rust
+// crates/onnx-runtime-cpuinfo/src/lib.rs
+
+/// CPU hardware capabilities, detected once at initialization.
+/// Thread-safe, immutable after init.
+#[derive(Debug, Clone)]
+pub struct CpuInfo {
+    // === ISA Features ===
+    pub isa: IsaFeatures,
+    // === Cache Hierarchy ===
+    pub caches: Vec<CacheLevel>,
+    // === Core Topology ===
+    pub topology: CpuTopology,
+    // === Vendor / Microarchitecture ===
+    pub vendor: CpuVendor,
+    pub microarch: Microarchitecture,
+    pub model_name: String,
+}
+
+/// Instruction set features.
+#[derive(Debug, Clone, Default)]
+pub struct IsaFeatures {
+    // x86
+    pub avx: bool,
+    pub avx2: bool,
+    pub fma: bool,
+    pub avx512f: bool,
+    pub avx512bw: bool,
+    pub avx512vnni: bool,      // int8 dot product
+    pub avx512bf16: bool,      // bf16 support
+    pub amx_int8: bool,        // Sapphire Rapids+ tile matmul
+    pub amx_bf16: bool,
+    pub amx_fp16: bool,        // Granite Rapids+
+    // ARM
+    pub neon: bool,
+    pub sve: bool,
+    pub sve2: bool,
+    pub sve_bitwidth: Option<u32>,  // 128/256/512
+    pub dotprod: bool,          // SDOT/UDOT (int8)
+    pub fp16_arith: bool,       // FEAT_FP16 (native f16 compute)
+    pub i8mm: bool,             // int8 matrix multiply
+    pub bf16: bool,             // FEAT_BF16
+    pub sme: bool,              // Scalable Matrix Extension (Apple M4+, Arm v9.2)
+}
+
+/// Cache level information.
+#[derive(Debug, Clone)]
+pub struct CacheLevel {
+    pub level: u8,              // 1, 2, 3
+    pub kind: CacheKind,        // Instruction, Data, Unified
+    pub size_bytes: usize,      // total size
+    pub line_size: usize,       // typically 64 bytes
+    pub associativity: u8,
+    pub shared_by_cores: usize, // how many cores share this cache
+}
+
+/// Core topology.
+#[derive(Debug, Clone)]
+pub struct CpuTopology {
+    pub physical_cores: usize,
+    pub logical_cores: usize,
+    pub packages: usize,            // sockets
+    pub cores: Vec<CoreInfo>,
+    pub numa_nodes: Vec<NumaNode>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CoreInfo {
+    pub core_id: usize,
+    pub package_id: usize,
+    pub core_type: CoreType,        // Performance / Efficiency / Unknown
+    pub logical_processors: Vec<usize>,  // hyperthreads on this core
+    pub l2_cache_id: usize,         // which L2 this core uses
+    pub l3_cache_id: Option<usize>, // which L3 (NUMA-aware)
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum CoreType {
+    Performance,  // P-core (Intel hybrid), Firestorm (Apple)
+    Efficiency,   // E-core (Intel hybrid), Icestorm (Apple)
+    Unknown,      // homogeneous or undetectable
+}
+
+#[derive(Debug, Clone)]
+pub struct NumaNode {
+    pub node_id: usize,
+    pub core_ids: Vec<usize>,
+    pub memory_size_bytes: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum CpuVendor {
+    Intel, Amd, Apple, Arm, Qualcomm, Unknown(String),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Microarchitecture {
+    // Intel
+    SapphireRapids, GraniteRapids, RaptorLake, AlderLake,
+    // AMD
+    Zen4, Zen5,
+    // Apple
+    M1, M2, M3, M4,
+    // ARM
+    CortexA78, CortexX4, Neoverse_V2,
+    // Other
+    Unknown,
+}
+```
+
+### 50.3 Detection Implementation
+
+```rust
+impl CpuInfo {
+    /// Detect all CPU info. Called once at runtime init.
+    /// Platform-specific internals:
+    ///   - x86: CPUID instruction (leaf 0, 1, 4, 7, 11, ...)
+    ///   - ARM Linux: /proc/cpuinfo + HWCAP/HWCAP2 from getauxval()
+    ///   - ARM macOS: sysctlbyname("hw.optional.*")
+    ///   - Cache: CPUID leaf 4 (x86), sysfs /sys/devices/system/cpu/cpu0/cache/ (Linux)
+    pub fn detect() -> Self {
+        #[cfg(target_arch = "x86_64")]
+        { Self::detect_x86() }
+        #[cfg(target_arch = "aarch64")]
+        { Self::detect_arm() }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn detect_x86() -> Self {
+        use std::arch::x86_64::__cpuid;
+
+        // Leaf 0: vendor string
+        let leaf0 = unsafe { __cpuid(0) };
+        let vendor = parse_vendor(leaf0.ebx, leaf0.ecx, leaf0.edx);
+
+        // Leaf 1: family/model/stepping
+        let leaf1 = unsafe { __cpuid(1) };
+        let microarch = identify_microarch(vendor, leaf1.eax);
+
+        // Leaf 7: extended features (AVX2, AVX512, AMX)
+        let leaf7 = unsafe { __cpuid(7) };
+        let isa = IsaFeatures {
+            avx2: leaf7.ebx & (1 << 5) != 0,
+            avx512f: leaf7.ebx & (1 << 16) != 0,
+            avx512vnni: leaf7.ecx & (1 << 11) != 0,
+            amx_int8: leaf7.edx & (1 << 25) != 0,
+            amx_bf16: leaf7.edx & (1 << 22) != 0,
+            // ...
+            ..Default::default()
+        };
+
+        // Leaf 4: cache topology
+        let caches = detect_x86_caches();
+
+        // Leaf 0xB/0x1F: core topology
+        let topology = detect_x86_topology();
+
+        Self { isa, caches, topology, vendor, microarch, model_name: read_brand_string() }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn detect_arm() -> Self {
+        #[cfg(target_os = "linux")]
+        {
+            // getauxval(AT_HWCAP) / AT_HWCAP2 for ISA features
+            // /sys/devices/system/cpu/ for topology
+            // /proc/cpuinfo for model name
+            todo!()
+        }
+        #[cfg(target_os = "macos")]
+        {
+            // sysctlbyname for everything
+            // hw.optional.arm.FEAT_FP16, hw.optional.arm.FEAT_BF16, etc.
+            // hw.perflevel0.physicalcpu (P-cores), hw.perflevel1.physicalcpu (E-cores)
+            todo!()
+        }
+    }
+}
+```
+
+### 50.4 Usage in CPU EP
+
+```rust
+// crates/onnx-runtime-ep-cpu/src/provider.rs
+
+impl CpuExecutionProvider {
+    pub fn new() -> Self {
+        let cpu = CpuInfo::detect();
+
+        // Select kernel variants based on detected ISA
+        let matmul_kernel = if cpu.isa.amx_int8 {
+            MatMulKernel::Amx
+        } else if cpu.isa.avx512vnni {
+            MatMulKernel::Avx512Vnni
+        } else if cpu.isa.avx2 && cpu.isa.fma {
+            MatMulKernel::Avx2Fma
+        } else if cpu.isa.neon && cpu.isa.dotprod {
+            MatMulKernel::NeonDotprod
+        } else {
+            MatMulKernel::Generic
+        };
+
+        // Configure tiling based on cache hierarchy
+        let l2_size = cpu.caches.iter()
+            .find(|c| c.level == 2 && c.kind != CacheKind::Instruction)
+            .map(|c| c.size_bytes)
+            .unwrap_or(256 * 1024);
+
+        let tile_config = TileConfig::optimal_for_cache(l2_size);
+
+        // Configure thread pool based on topology
+        let thread_pool = ThreadPoolConfig {
+            num_threads: cpu.topology.physical_cores,  // no HT by default
+            pin_to_cores: true,
+            prefer_p_cores: true,  // Intel hybrid: use P-cores for compute
+            numa_aware: cpu.topology.numa_nodes.len() > 1,
+        };
+
+        Self { cpu, matmul_kernel, tile_config, thread_pool, /* ... */ }
+    }
+}
+```
+
+### 50.5 Usage in Cost Model (§6)
+
+```rust
+// Inform the cost model with detected hardware capabilities
+impl CostModel {
+    pub fn from_detected_hardware(cpu: &CpuInfo, gpu: Option<&GpuInfo>) -> Self {
+        let cpu_profile = DeviceProfile {
+            // Estimate peak throughput from microarchitecture
+            compute_throughput: estimate_cpu_peak_flops(cpu),
+            // Estimate memory bandwidth from DDR generation + channels
+            memory_bandwidth: estimate_cpu_bandwidth(cpu),
+            // Cache-aware: operations fitting in L2 are faster
+            cache_hierarchy: cpu.caches.clone(),
+        };
+        // ...
+    }
+}
+
+fn estimate_cpu_peak_flops(cpu: &CpuInfo) -> HashMap<DataType, f64> {
+    let cores = cpu.topology.physical_cores as f64;
+    let freq_ghz = 3.5; // TODO: read from sysfs or estimate from microarch
+
+    let mut throughput = HashMap::new();
+
+    if cpu.isa.avx512f {
+        // AVX-512: 32 fp32 FMA/cycle/core (2 FMA units × 16 elements)
+        throughput.insert(DataType::Float32, cores * freq_ghz * 32.0 * 1e9);
+    } else if cpu.isa.avx2 && cpu.isa.fma {
+        // AVX2+FMA: 16 fp32 FMA/cycle/core (2 FMA units × 8 elements)
+        throughput.insert(DataType::Float32, cores * freq_ghz * 16.0 * 1e9);
+    }
+
+    if cpu.isa.amx_int8 {
+        // AMX: 2048 int8 ops/cycle (16×64 tile, 1 tile/cycle)
+        throughput.insert(DataType::Int8, cores * freq_ghz * 2048.0 * 1e9);
+    }
+
+    throughput
+}
+```
+
+### 50.6 Tiling Strategy (Cache-Aware)
+
+```rust
+pub struct TileConfig {
+    pub tile_m: usize,
+    pub tile_n: usize,
+    pub tile_k: usize,
+}
+
+impl TileConfig {
+    /// Choose tile sizes so that working set fits in L2.
+    /// Goal: A_tile + B_tile + C_tile ≤ L2_size × occupancy_target
+    pub fn optimal_for_cache(l2_bytes: usize) -> Self {
+        // Target: use ~75% of L2 for tiles (leave room for other data)
+        let budget = l2_bytes * 3 / 4;
+
+        // For fp32 GEMM: A[M,K] + B[K,N] + C[M,N] in bytes
+        // Heuristic: square-ish tiles, K=256 is good for most architectures
+        let tile_k = 256;
+        // Remaining budget split between M and N dimensions
+        // (M*K + K*N + M*N) * 4 bytes ≤ budget
+        // For simplicity: M=N, solve (2*M*K + M*M)*4 ≤ budget
+        let m = ((budget / 4 - tile_k * tile_k) as f64 / (2.0 * tile_k as f64)).sqrt() as usize;
+        let tile_m = m.clamp(32, 512).next_power_of_two();
+        let tile_n = tile_m;
+
+        Self { tile_m, tile_n, tile_k }
+    }
+}
+```
+
+### 50.7 Thread Pool Topology Awareness
+
+```rust
+pub struct TopologyAwareThreadPool {
+    /// Worker threads, pinned to cores.
+    workers: Vec<WorkerThread>,
+    /// Scheduling: NUMA-local work first.
+    scheduler: WorkScheduler,
+}
+
+impl TopologyAwareThreadPool {
+    pub fn from_cpu_info(cpu: &CpuInfo, config: &ThreadPoolConfig) -> Self {
+        let mut workers = Vec::new();
+
+        // Sort cores: P-cores first (Intel hybrid)
+        let mut cores: Vec<_> = cpu.topology.cores.iter().collect();
+        if config.prefer_p_cores {
+            cores.sort_by_key(|c| match c.core_type {
+                CoreType::Performance => 0,
+                CoreType::Unknown => 1,
+                CoreType::Efficiency => 2,
+            });
+        }
+
+        // Spawn workers on selected cores
+        for core in cores.iter().take(config.num_threads) {
+            let worker = WorkerThread::spawn_pinned(core.logical_processors[0]);
+            workers.push(worker);
+        }
+
+        Self {
+            workers,
+            scheduler: WorkScheduler::new(cpu.topology.numa_nodes.clone()),
+        }
+    }
+
+    /// Parallel MatMul: partition M dimension across workers.
+    /// NUMA-aware: each worker operates on memory local to its NUMA node.
+    pub fn parallel_matmul(
+        &self,
+        a: &TensorView,  // [M, K]
+        b: &TensorView,  // [K, N]
+        c: &mut TensorMut,  // [M, N]
+        tile_config: &TileConfig,
+    ) {
+        let m = a.shape()[0];
+        let chunk_size = m.div_ceil(self.workers.len());
+
+        self.scheduler.parallel_for(0..m, chunk_size, |worker_id, range| {
+            // Each worker processes its chunk of M rows
+            tiled_matmul_chunk(a, b, c, range, tile_config);
+        });
+    }
+}
+```
+
+### 50.8 Library Choice
+
+| Option | Pros | Cons | Decision |
+|--------|------|------|----------|
+| **pytorch/cpuinfo (C)** | Battle-tested, covers edge cases, mock tests | C FFI, extra dependency, may be stale | Reference, not direct dep |
+| **raw-cpuid (Rust)** | Pure Rust, x86 only, well maintained | No ARM, no topology | Use for x86 CPUID |
+| **std::arch::is_*_detected!** | Stdlib, zero dep | Features only, no cache/topology | Supplement |
+| **sysfs/procfs parsing** | Full topology on Linux | Linux-only, parsing brittle | Linux topology backend |
+| **sysctlbyname** | Full info on macOS | macOS-only | macOS backend |
+| **Our own crate** | Exactly what we need, Rust-native | Dev effort | ✅ Decision |
+
+**Decision:** Write our own `onnx-runtime-cpuinfo` crate.
+- Use `raw-cpuid` for x86 CPUID leaves (don't reinvent leaf parsing)
+- Use `std::arch` macros as cross-check
+- Linux topology from sysfs, macOS from sysctl
+- Inspired by pytorch/cpuinfo's structure but Rust-native, no C FFI
+- Focus on what we need: ISA, cache, topology. Skip SoC identification for phones.
+
+### 50.9 Crate Structure
+
+```
+crates/onnx-runtime-cpuinfo/
+├── Cargo.toml
+└── src/
+    ├── lib.rs              # CpuInfo + public types
+    ├── isa.rs              # IsaFeatures detection
+    ├── cache.rs            # Cache hierarchy detection
+    ├── topology.rs         # Core topology, NUMA
+    ├── vendor.rs           # Vendor + microarch identification
+    ├── x86/
+    │   ├── mod.rs
+    │   ├── cpuid.rs        # Raw CPUID leaf access (uses raw-cpuid crate)
+    │   └── topology.rs     # x86-specific topology (leaf 0xB, 0x1F)
+    ├── arm/
+    │   ├── mod.rs
+    │   ├── linux.rs        # /proc/cpuinfo + getauxval + sysfs
+    │   └── macos.rs        # sysctlbyname
+    └── tests/
+        ├── mock_sapphire_rapids.rs
+        ├── mock_apple_m4.rs
+        └── mock_neoverse_v2.rs
+```
+
+### 50.10 Design Decisions
+
+| Decision | Choice | Rationale |
+|----------|--------|----------|
+| Own crate vs cpuinfo FFI | **Own crate** | Pure Rust, no C build complexity, exactly our needs |
+| Detection timing | **Once at init** (lazy_static/OnceLock) | Immutable after detection, zero runtime overhead |
+| Fallback on unknown | **Conservative defaults** | Unknown CPU → generic kernels, default tile sizes. Never crash. |
+| P/E core detection | **Yes** | Intel 12th+ gen and Apple Silicon need this for thread scheduling |
+| NUMA awareness | **Yes** | Multi-socket servers are deployment targets |
+| Mock testing | **Yes** (inject fake CPUID) | Can't run CI on every microarchitecture |
+
+---
+
+## 51. LoRA Serving
+
+### 51.1 Problem
 
 Serving multiple fine-tuned adapters from one base model. Each user/request may need
 a different LoRA. Loading a full model per adapter = wasteful.
@@ -5437,7 +6260,7 @@ outputs = engine.generate_batch(batch)
 
 ---
 
-## 50. Async Output Processing
+## 52. Async Output Processing
 
 ### 50.1 Problem
 
@@ -5519,7 +6342,7 @@ impl GenAiEngine {
 
 ---
 
-## 51. Recompute-Based Preemption
+## 53. Recompute-Based Preemption
 
 ### 51.1 Problem
 
@@ -5638,7 +6461,7 @@ but the high-priority request got served immediately. No visible error or discon
 
 ---
 
-## 52. Frequency-Based Prefix Cache Eviction
+## 54. Frequency-Based Prefix Cache Eviction
 
 ### 52.1 Problem
 
@@ -5776,7 +6599,7 @@ session = nxrt.load("model.onnx", options={
 
 ---
 
-## 53. Weight Loading
+## 55. Weight Loading
 
 ### 53.1 Supported Formats
 
@@ -5817,7 +6640,7 @@ GPU tier get eagerly loaded; CPU/SSD-tier weights stay lazy until needed.
 
 ---
 
-## 54. Minimal Build & Binary Size Control
+## 56. Minimal Build & Binary Size Control
 
 ### 54.1 Problem
 
@@ -5991,7 +6814,7 @@ pip install nxrt --no-deps
 
 ---
 
-## 55. EPContext Node — On-Disk Compiled-EP Interchange
+## 57. EPContext Node — On-Disk Compiled-EP Interchange
 
 ### 55.1 What & Why
 
@@ -6022,7 +6845,7 @@ tooling and existing pre-compiled model artifacts without re-compilation.
 > `Ep::load_context()`), and §41 defines a host-local **compilation cache**.
 > The `EPContext` node defined here is the **on-disk / interchange form**: the
 > serialized, in-graph, tool-portable representation of that same compiled
-> context. §55.3 and §55.4 define the exact mapping between them.
+> context. §57.3 and §57.4 define the exact mapping between them.
 
 ### 55.2 Op Schema (ORT `com.microsoft::EPContext`)
 
@@ -6067,7 +6890,7 @@ source at load time:
 /// Backed by the ordinary Node + its attributes — no separate IR node kind.
 pub struct EpContextNode<'g> {
     pub node: NodeId,
-    pub source: Option<&'g str>,      // `source` attr — the dispatch key (§55.6)
+    pub source: Option<&'g str>,      // `source` attr — the dispatch key (§57.6)
     pub main_context: bool,           // main_context != 0
     pub embed_mode: EmbedMode,        // Embedded | ExternalFile
     pub sdk_version: Option<&'g str>,
@@ -6105,7 +6928,7 @@ Key loader rules:
 **Dispatch & execution (`onnx-runtime-session` + `onnx-runtime-ep-api`).** During
 placement, an `EPContext` node bypasses the cost model (like `claim_nodes`, §4.1):
 it is handed to the EP whose declared `source` key matches the node's `source`
-attribute, via a **`source`-keyed registry** (§55.6). That EP turns the on-disk
+attribute, via a **`source`-keyed registry** (§57.6). That EP turns the on-disk
 node into the internal runtime form and restores it:
 
 ```rust
@@ -6113,7 +6936,7 @@ node into the internal runtime form and restores it:
 fn dispatch_ep_context(reg: &EpContextRegistry, node: &EpContextNode, blob: EpContextBlob)
     -> Result<()>
 {
-    let ep = reg.claim(node.source)          // §55.6 — match on `source`, never a hardcoded name
+    let ep = reg.claim(node.source)          // §57.6 — match on `source`, never a hardcoded name
         .ok_or(Error::NoEpForContext { source: node.source.map(str::to_owned) })?;
 
     // Serialized (on-disk) form → runtime form expected by Ep::load_context (§4).
@@ -6153,7 +6976,7 @@ compile subgraphs → for each compiled partition:
         domain     = "com.microsoft"
         op_type    = "EPContext"
         input/output = partition boundary tensors (variadic, in order)
-        source            = ep.context_source_key()   // EP's own `source` key (§55.6)
+        source            = ep.context_source_key()   // EP's own `source` key (§57.6)
         ep_sdk_version    = ctx.ep_version
         partition_name    = <partition id>
         main_context      = 1
@@ -6173,7 +6996,7 @@ ONNX↔IR protobuf serialization and external-data file I/O), driven by
 `ep.context_*` options). For `embed_mode=0`, the loader writes the external
 binary next to the ctx model and stores the **relative** path in
 `ep_cache_context`, mirroring the §19.2 external-data convention so the produced
-model round-trips through §55.3's load path (and through upstream ORT).
+model round-trips through §57.3's load path (and through upstream ORT).
 
 ### 55.5 C-API Surface
 
@@ -6215,7 +7038,7 @@ the model requires an EP that is not loaded.
 
 | Crate                    | Responsibility                                                                                             |
 |--------------------------|-----------------------------------------------------------------------------------------------------------|
-| `onnx-runtime-loader`    | Recognize `com.microsoft::EPContext` nodes; `EpContextNode` view; resolve `embed_mode=0` paths (rel. to model) + mmap; **writer** for the `*_ctx.onnx` dump path (§55.4) incl. external-blob files. |
+| `onnx-runtime-loader`    | Recognize `com.microsoft::EPContext` nodes; `EpContextNode` view; resolve `embed_mode=0` paths (rel. to model) + mmap; **writer** for the `*_ctx.onnx` dump path (§57.4) incl. external-blob files. |
 | `onnx-runtime-ep-api`    | `EpContextRegistry` (`source`-keyed); the on-disk-node ↔ internal `EpContext` mapping contract; EP declares accepted `source` keys + `save_context()`/`load_context()` (already in §4). |
 | `onnx-runtime-session`   | Bypass placement for `EPContext` nodes; drive `main_context=1/0` resolution + dedup; own `ep.context_*` options and drive the dump path during compile. |
 | `onnx-runtime-capi`      | Parse `ep.context_enable`/`ep.context_file_path`/`ep.context_embed_mode` session options (§21.4).         |
@@ -6230,7 +7053,7 @@ compiled EP lands into an already-working context-cache pipeline.
 
 ---
 
-## 56. Phased Roadmap
+## 58. Phased Roadmap
 
 ### Phase 1: Foundation (8-12 weeks)
 - [ ] `onnx-runtime-ir`: Graph IR with all types, validation, mutation API
@@ -6246,7 +7069,7 @@ _Depends on: Phase 1 complete_
 - [ ] `onnx-runtime-ep-cuda`: CUDA EP on the **§15 kernel stack** — `cudarc` foundation, cuBLASLt GEMM (fused epilogue), CuTe custom kernels (LayerNorm/RMSNorm/RoPE/softmax) via `extern "C"` FFI, cuDNN fused SDPA for attention (Phase 2a). _cuTile deferred to Phase 3 (no Hopper/SM90, Python-only — §15.8)._
 - [ ] `onnx-runtime-ep-api`: ORT Graph ABI bridge for legacy plugin EPs
 - [ ] Legacy EP loading (dlopen + vtable)
-- [ ] **EPContext node support (§55): loader recognition + IR representation, `source`-keyed EP dispatch (ep-api/session), embed/external blob resolution, and the `*_ctx.onnx` writer for `ep.context_enable` (loader/session), plus `ep.context_*` C-API session options (§21.4).** Foundational for the compiled EPs (CUDA/QNN/OpenVINO/TensorRT); no Phase-1 EP consumes it yet.
+- [ ] **EPContext node support (§57): loader recognition + IR representation, `source`-keyed EP dispatch (ep-api/session), embed/external blob resolution, and the `*_ctx.onnx` writer for `ep.context_enable` (loader/session), plus `ep.context_*` C-API session options (§21.4).** Foundational for the compiled EPs (CUDA/QNN/OpenVINO/TensorRT); no Phase-1 EP consumes it yet.
 - [ ] `onnx-runtime-cost-model`: Static cost formulas + device profiles
 - [ ] `onnx-runtime-optimizer`: ConstantFolding, DeadNodeElimination, OpFusion, AttentionFusion
 - [ ] Layout propagation pass
