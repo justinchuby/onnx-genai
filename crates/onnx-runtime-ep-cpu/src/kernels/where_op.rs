@@ -7,7 +7,7 @@
 //! **dtype-agnostic** across every fixed-width `x`/`y` dtype.
 
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
-use onnx_runtime_ir::{compute_contiguous_strides, DataType, Node};
+use onnx_runtime_ir::{DataType, Node, compute_contiguous_strides};
 
 use super::{check_arity, elem_size, to_dense_bytes, write_dense_bytes};
 use crate::strided::{next_index, numel};
@@ -129,10 +129,7 @@ mod tests {
 
     fn run(cond: &Owned, x: &Owned, y: &Owned, out: &mut Owned) {
         WhereKernel
-            .execute(
-                &[cond.view(), x.view(), y.view()],
-                &mut [out.view_mut()],
-            )
+            .execute(&[cond.view(), x.view(), y.view()], &mut [out.view_mut()])
             .unwrap();
     }
 

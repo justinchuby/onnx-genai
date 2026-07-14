@@ -16,7 +16,7 @@
 //! either a retained size-1 dim (keepdims) or nothing (squeezed).
 
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
-use onnx_runtime_ir::{compute_contiguous_strides, Node};
+use onnx_runtime_ir::{Node, compute_contiguous_strides};
 
 use super::{check_arity, to_dense_f32, to_dense_i64, write_dense_f32};
 use crate::strided::{next_index, numel};
@@ -314,7 +314,10 @@ mod tests {
             keepdims: true,
             noop_with_empty_axes: true,
         }
-        .execute(&[x.view(), Owned::i64(&[0], &[]).view()], &mut [out.view_mut()])
+        .execute(
+            &[x.view(), Owned::i64(&[0], &[]).view()],
+            &mut [out.view_mut()],
+        )
         .unwrap();
         assert_eq!(out.to_f32(), vec![1., 4., 9.]);
     }
@@ -329,7 +332,10 @@ mod tests {
             keepdims: true,
             noop_with_empty_axes: true,
         }
-        .execute(&[x.view(), Owned::i64(&[0], &[]).view()], &mut [out.view_mut()])
+        .execute(
+            &[x.view(), Owned::i64(&[0], &[]).view()],
+            &mut [out.view_mut()],
+        )
         .unwrap();
         assert_eq!(out.to_f32(), vec![1., 2., 3.]);
     }

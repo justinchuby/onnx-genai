@@ -321,6 +321,20 @@ mod tests {
         assert_eq!(y.to_i64(), vec![2, 0]);
     }
     #[test]
+    fn argmin_keepdims_selects_last_tie() {
+        let x = Owned::f32(&[2, 3], &[3., 1., 1., 2., 0., 0.]);
+        let mut y = Owned::zeros(DataType::Int64, &[2, 1]);
+        ArgKernel {
+            op: ArgOp::Min,
+            axis: 1,
+            keepdims: true,
+            select_last_index: true,
+        }
+        .execute(&[x.view()], &mut [y.view_mut()])
+        .unwrap();
+        assert_eq!(y.to_i64(), vec![2, 2]);
+    }
+    #[test]
     fn topk_and_nonzero() {
         let x = Owned::f32(&[4], &[2., 5., 1., 4.]);
         let k = Owned::i64(&[], &[2]);

@@ -126,50 +126,98 @@ pub trait FloatElem: Copy {
 impl NumericElem for f32 {
     const DTYPE: DataType = DataType::Float32;
     type Acc = f32;
-    #[inline] fn to_acc(self) -> f32 { self }
-    #[inline] fn from_acc(a: f32) -> Self { a }
+    #[inline]
+    fn to_acc(self) -> f32 {
+        self
+    }
+    #[inline]
+    fn from_acc(a: f32) -> Self {
+        a
+    }
 }
 impl FloatElem for f32 {
     const DTYPE: DataType = DataType::Float32;
-    #[inline] fn to_f32(self) -> f32 { self }
-    #[inline] fn from_f32(f: f32) -> Self { f }
+    #[inline]
+    fn to_f32(self) -> f32 {
+        self
+    }
+    #[inline]
+    fn from_f32(f: f32) -> Self {
+        f
+    }
 }
 
 // --- f64 -------------------------------------------------------------------
 impl NumericElem for f64 {
     const DTYPE: DataType = DataType::Float64;
     type Acc = f64;
-    #[inline] fn to_acc(self) -> f64 { self }
-    #[inline] fn from_acc(a: f64) -> Self { a }
+    #[inline]
+    fn to_acc(self) -> f64 {
+        self
+    }
+    #[inline]
+    fn from_acc(a: f64) -> Self {
+        a
+    }
 }
 impl FloatElem for f64 {
     const DTYPE: DataType = DataType::Float64;
-    #[inline] fn to_f32(self) -> f32 { self as f32 }
-    #[inline] fn from_f32(f: f32) -> Self { f as f64 }
+    #[inline]
+    fn to_f32(self) -> f32 {
+        self as f32
+    }
+    #[inline]
+    fn from_f32(f: f32) -> Self {
+        f as f64
+    }
 }
 
 // --- f16 / bf16 (2-byte LE storage; compute in f32) ------------------------
 impl NumericElem for half::f16 {
     const DTYPE: DataType = DataType::Float16;
     type Acc = f32;
-    #[inline] fn to_acc(self) -> f32 { self.to_f32() }
-    #[inline] fn from_acc(a: f32) -> Self { half::f16::from_f32(a) }
+    #[inline]
+    fn to_acc(self) -> f32 {
+        self.to_f32()
+    }
+    #[inline]
+    fn from_acc(a: f32) -> Self {
+        half::f16::from_f32(a)
+    }
 }
 impl FloatElem for half::f16 {
     const DTYPE: DataType = DataType::Float16;
-    #[inline] fn to_f32(self) -> f32 { half::f16::to_f32(self) }
-    #[inline] fn from_f32(f: f32) -> Self { half::f16::from_f32(f) }
+    #[inline]
+    fn to_f32(self) -> f32 {
+        half::f16::to_f32(self)
+    }
+    #[inline]
+    fn from_f32(f: f32) -> Self {
+        half::f16::from_f32(f)
+    }
 }
 impl NumericElem for half::bf16 {
     const DTYPE: DataType = DataType::BFloat16;
     type Acc = f32;
-    #[inline] fn to_acc(self) -> f32 { self.to_f32() }
-    #[inline] fn from_acc(a: f32) -> Self { half::bf16::from_f32(a) }
+    #[inline]
+    fn to_acc(self) -> f32 {
+        self.to_f32()
+    }
+    #[inline]
+    fn from_acc(a: f32) -> Self {
+        half::bf16::from_f32(a)
+    }
 }
 impl FloatElem for half::bf16 {
     const DTYPE: DataType = DataType::BFloat16;
-    #[inline] fn to_f32(self) -> f32 { half::bf16::to_f32(self) }
-    #[inline] fn from_f32(f: f32) -> Self { half::bf16::from_f32(f) }
+    #[inline]
+    fn to_f32(self) -> f32 {
+        half::bf16::to_f32(self)
+    }
+    #[inline]
+    fn from_f32(f: f32) -> Self {
+        half::bf16::from_f32(f)
+    }
 }
 
 // --- integers (compute in themselves) --------------------------------------
@@ -318,18 +366,54 @@ pub fn unsupported_dtype(op: &str, dtype: DataType) -> EpError {
 macro_rules! dispatch_arith {
     ($dtype:expr, $op:expr, $T:ident => $body:expr) => {{
         match $dtype {
-            ::onnx_runtime_ir::DataType::Float32 => { type $T = f32; $body }
-            ::onnx_runtime_ir::DataType::Float16 => { type $T = half::f16; $body }
-            ::onnx_runtime_ir::DataType::BFloat16 => { type $T = half::bf16; $body }
-            ::onnx_runtime_ir::DataType::Float64 => { type $T = f64; $body }
-            ::onnx_runtime_ir::DataType::Int8 => { type $T = i8; $body }
-            ::onnx_runtime_ir::DataType::Int16 => { type $T = i16; $body }
-            ::onnx_runtime_ir::DataType::Int32 => { type $T = i32; $body }
-            ::onnx_runtime_ir::DataType::Int64 => { type $T = i64; $body }
-            ::onnx_runtime_ir::DataType::Uint8 => { type $T = u8; $body }
-            ::onnx_runtime_ir::DataType::Uint16 => { type $T = u16; $body }
-            ::onnx_runtime_ir::DataType::Uint32 => { type $T = u32; $body }
-            ::onnx_runtime_ir::DataType::Uint64 => { type $T = u64; $body }
+            ::onnx_runtime_ir::DataType::Float32 => {
+                type $T = f32;
+                $body
+            }
+            ::onnx_runtime_ir::DataType::Float16 => {
+                type $T = half::f16;
+                $body
+            }
+            ::onnx_runtime_ir::DataType::BFloat16 => {
+                type $T = half::bf16;
+                $body
+            }
+            ::onnx_runtime_ir::DataType::Float64 => {
+                type $T = f64;
+                $body
+            }
+            ::onnx_runtime_ir::DataType::Int8 => {
+                type $T = i8;
+                $body
+            }
+            ::onnx_runtime_ir::DataType::Int16 => {
+                type $T = i16;
+                $body
+            }
+            ::onnx_runtime_ir::DataType::Int32 => {
+                type $T = i32;
+                $body
+            }
+            ::onnx_runtime_ir::DataType::Int64 => {
+                type $T = i64;
+                $body
+            }
+            ::onnx_runtime_ir::DataType::Uint8 => {
+                type $T = u8;
+                $body
+            }
+            ::onnx_runtime_ir::DataType::Uint16 => {
+                type $T = u16;
+                $body
+            }
+            ::onnx_runtime_ir::DataType::Uint32 => {
+                type $T = u32;
+                $body
+            }
+            ::onnx_runtime_ir::DataType::Uint64 => {
+                type $T = u64;
+                $body
+            }
             other => Err($crate::dtype::unsupported_dtype($op, other)),
         }
     }};
@@ -341,10 +425,22 @@ macro_rules! dispatch_arith {
 macro_rules! dispatch_float {
     ($dtype:expr, $op:expr, $T:ident => $body:expr) => {{
         match $dtype {
-            ::onnx_runtime_ir::DataType::Float32 => { type $T = f32; $body }
-            ::onnx_runtime_ir::DataType::Float16 => { type $T = half::f16; $body }
-            ::onnx_runtime_ir::DataType::BFloat16 => { type $T = half::bf16; $body }
-            ::onnx_runtime_ir::DataType::Float64 => { type $T = f64; $body }
+            ::onnx_runtime_ir::DataType::Float32 => {
+                type $T = f32;
+                $body
+            }
+            ::onnx_runtime_ir::DataType::Float16 => {
+                type $T = half::f16;
+                $body
+            }
+            ::onnx_runtime_ir::DataType::BFloat16 => {
+                type $T = half::bf16;
+                $body
+            }
+            ::onnx_runtime_ir::DataType::Float64 => {
+                type $T = f64;
+                $body
+            }
             other => Err($crate::dtype::unsupported_dtype($op, other)),
         }
     }};

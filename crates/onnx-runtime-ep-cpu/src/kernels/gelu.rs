@@ -87,7 +87,10 @@ mod tests {
             .execute(&[a.view()], &mut [out.view_mut()])
             .unwrap();
         // Transposed read order: [-1, 2, 1, -2].
-        let expect: Vec<f32> = [-1.0f32, 2.0, 1.0, -2.0].iter().map(|&v| reference(v)).collect();
+        let expect: Vec<f32> = [-1.0f32, 2.0, 1.0, -2.0]
+            .iter()
+            .map(|&v| reference(v))
+            .collect();
         assert_eq!(out.to_f32(), expect);
     }
 }

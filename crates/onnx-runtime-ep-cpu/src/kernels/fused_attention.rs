@@ -31,7 +31,7 @@
 use onnx_runtime_ep_api::{
     DeviceId, EpError, Kernel, KernelFactory, Result, TensorMut, TensorView,
 };
-use onnx_runtime_ir::{broadcast_shapes, compute_contiguous_strides, DataType, Node};
+use onnx_runtime_ir::{DataType, Node, broadcast_shapes, compute_contiguous_strides};
 
 use super::add::broadcast_apply;
 use super::matmul::matmul_dense;
@@ -88,8 +88,7 @@ fn matmul_result_shape(a: &[usize], b: &[usize], stage: &str) -> Result<Vec<usiz
             "FusedAttention: {stage} contraction mismatch ({ka} vs {kb})"
         )));
     }
-    let mut shape = broadcast_shapes(&a[..a.len() - 2], &b[..b.len() - 2])
-        .map_err(EpError::Ir)?;
+    let mut shape = broadcast_shapes(&a[..a.len() - 2], &b[..b.len() - 2]).map_err(EpError::Ir)?;
     shape.push(m);
     shape.push(n);
     Ok(shape)
@@ -229,7 +228,10 @@ mod tests {
     fn approx(a: &[f32], b: &[f32], atol: f32) {
         assert_eq!(a.len(), b.len(), "length mismatch");
         for (i, (x, y)) in a.iter().zip(b).enumerate() {
-            assert!((x - y).abs() < atol, "element {i}: {x} vs {y} ({a:?} vs {b:?})");
+            assert!(
+                (x - y).abs() < atol,
+                "element {i}: {x} vs {y} ({a:?} vs {b:?})"
+            );
         }
     }
 

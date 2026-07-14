@@ -17,7 +17,7 @@
 //! [`Kernel`] trait — not the provider, not the session — needs to change.
 
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
-use onnx_runtime_ir::{broadcast_shapes, compute_contiguous_strides, Node};
+use onnx_runtime_ir::{Node, broadcast_shapes, compute_contiguous_strides};
 use rayon::prelude::*;
 
 use super::check_arity;
@@ -79,12 +79,14 @@ fn gemm_generic(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usiz
     }
     // Parallelize over row blocks of C; each block owns a disjoint slice of `c`
     // and reads shared, immutable `a`/`b`, so there is no aliasing.
-    c.par_chunks_mut(MC * n).enumerate().for_each(|(blk, c_block)| {
-        let i0 = blk * MC;
-        let rows = c_block.len() / n; // last block may be short
-        let a_block = &a[i0 * k..i0 * k + rows * k];
-        gemm_block(a_block, b, c_block, rows, k, n);
-    });
+    c.par_chunks_mut(MC * n)
+        .enumerate()
+        .for_each(|(blk, c_block)| {
+            let i0 = blk * MC;
+            let rows = c_block.len() / n; // last block may be short
+            let a_block = &a[i0 * k..i0 * k + rows * k];
+            gemm_block(a_block, b, c_block, rows, k, n);
+        });
 }
 
 /// Compute `c_block[rows,n] = a_block[rows,k] @ b[k,n]` (overwrite) for one row
@@ -183,8 +185,16 @@ pub(crate) fn matmul_dense(a: &TensorView, b: &TensorView) -> Result<Vec<f32>> {
     let b_raw = b.shape;
     let a_1d = a_raw.len() == 1;
     let b_1d = b_raw.len() == 1;
-    let a_shape: Vec<usize> = if a_1d { vec![1, a_raw[0]] } else { a_raw.to_vec() };
-    let b_shape: Vec<usize> = if b_1d { vec![b_raw[0], 1] } else { b_raw.to_vec() };
+    let a_shape: Vec<usize> = if a_1d {
+        vec![1, a_raw[0]]
+    } else {
+        a_raw.to_vec()
+    };
+    let b_shape: Vec<usize> = if b_1d {
+        vec![b_raw[0], 1]
+    } else {
+        b_raw.to_vec()
+    };
 
     if a_shape.len() < 2 || b_shape.len() < 2 {
         return Err(EpError::KernelFailed(
@@ -320,10 +330,7 @@ mod tests {
             .execute(&[a.view(), b.view()], &mut [out.view_mut()])
             .unwrap();
         // batch0: A@I = A; batch1: [[5,6],[7,8]]*2 = [[10,12],[14,16]]
-        assert_eq!(
-            out.to_f32(),
-            vec![1., 2., 3., 4., 10., 12., 14., 16.]
-        );
+        assert_eq!(out.to_f32(), vec![1., 2., 3., 4., 10., 12., 14., 16.]);
     }
 
     #[test]

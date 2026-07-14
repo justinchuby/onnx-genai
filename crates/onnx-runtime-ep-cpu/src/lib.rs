@@ -32,7 +32,7 @@ pub mod kernels;
 pub mod provider;
 pub mod strided;
 
-pub use backend::{has_onednn, CpuBackend};
+pub use backend::{CpuBackend, has_onednn};
 pub use provider::CpuExecutionProvider;
 
-pub use kernels::slice::{slice_axes_steps, slice_plan, SliceAxisPlan};
+pub use kernels::slice::{SliceAxisPlan, slice_axes_steps, slice_plan};

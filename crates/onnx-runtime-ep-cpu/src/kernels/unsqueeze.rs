@@ -27,7 +27,10 @@ pub struct UnsqueezeFactory;
 
 impl KernelFactory for UnsqueezeFactory {
     fn create(&self, node: &Node, _shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
-        let axes = node.attr("axes").and_then(|a| a.as_ints()).map(|v| v.to_vec());
+        let axes = node
+            .attr("axes")
+            .and_then(|a| a.as_ints())
+            .map(|v| v.to_vec());
         Ok(Box::new(UnsqueezeKernel { axes }))
     }
 }
@@ -108,9 +111,11 @@ mod tests {
     fn unsqueeze_missing_axes_errors() {
         let x = Owned::f32(&[3], &[1., 2., 3.]);
         let mut out = Owned::zeros_f32(&[1, 3]);
-        assert!(UnsqueezeKernel { axes: None }
-            .execute(&[x.view()], &mut [out.view_mut()])
-            .is_err());
+        assert!(
+            UnsqueezeKernel { axes: None }
+                .execute(&[x.view()], &mut [out.view_mut()])
+                .is_err()
+        );
     }
 
     #[test]
@@ -143,8 +148,10 @@ mod tests {
         let x = Owned::f32(&[3], &[1., 2., 3.]);
         let axes = Owned::i64(&[2], &[0, 1]);
         let mut out = Owned::zeros_f32(&[1, 3]);
-        assert!(UnsqueezeKernel { axes: None }
-            .execute(&[x.view(), axes.view()], &mut [out.view_mut()])
-            .is_err());
+        assert!(
+            UnsqueezeKernel { axes: None }
+                .execute(&[x.view(), axes.view()], &mut [out.view_mut()])
+                .is_err()
+        );
     }
 }

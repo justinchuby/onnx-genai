@@ -2,7 +2,7 @@
 //! order; it defaults to reversing all axes (`docs/ORT2.md` §4.4).
 
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
-use onnx_runtime_ir::{compute_contiguous_strides, Node};
+use onnx_runtime_ir::{Node, compute_contiguous_strides};
 
 use super::{check_arity, to_dense_f32, write_dense_f32};
 use crate::strided::{next_index, numel};

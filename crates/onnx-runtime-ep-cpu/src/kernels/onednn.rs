@@ -30,7 +30,14 @@ mod ffi {
 /// order"), so no `Cᵀ = Bᵀ·Aᵀ` operand swap is needed — our row-major operands
 /// map straight through with `transa = transb = 'N'`, `lda = k`, `ldb = n`,
 /// `ldc = n`. (Verified against the MatMul kernel tests.)
-pub(crate) fn sgemm(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usize) -> Result<()> {
+pub(crate) fn sgemm(
+    a: &[f32],
+    b: &[f32],
+    c: &mut [f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<()> {
     // Guard the buffer/shape contract before crossing FFI (RULES #1: fail
     // closed on invalid input with an actionable message rather than reading
     // out of bounds inside C).
@@ -54,7 +61,11 @@ pub(crate) fn sgemm(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: 
     }
 
     // Row-major mapping: A is m×k (lda=k), B is k×n (ldb=n), C is m×n (ldc=n).
-    let (mm, nn, kk) = (m as ffi::dnnl_dim_t, n as ffi::dnnl_dim_t, k as ffi::dnnl_dim_t);
+    let (mm, nn, kk) = (
+        m as ffi::dnnl_dim_t,
+        n as ffi::dnnl_dim_t,
+        k as ffi::dnnl_dim_t,
+    );
     let lda = k as ffi::dnnl_dim_t;
     let ldb = n as ffi::dnnl_dim_t;
     let ldc = n as ffi::dnnl_dim_t;

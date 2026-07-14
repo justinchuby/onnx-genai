@@ -7,7 +7,7 @@
 //! it. It moves raw element bytes and is therefore dtype-agnostic.
 
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
-use onnx_runtime_ir::{compute_contiguous_strides, Node};
+use onnx_runtime_ir::{Node, compute_contiguous_strides};
 
 use super::{check_arity, elem_size, to_dense_bytes, write_dense_bytes};
 use crate::strided::{next_index, numel};

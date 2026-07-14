@@ -33,7 +33,9 @@ impl Kernel for GatherKernel {
         let idx_shape = inputs[1].shape;
         let rank = data_shape.len();
         if rank == 0 {
-            return Err(EpError::KernelFailed("Gather: data must have rank >= 1".into()));
+            return Err(EpError::KernelFailed(
+                "Gather: data must have rank >= 1".into(),
+            ));
         }
 
         // Normalize axis into [0, rank).

@@ -6,8 +6,10 @@
 //! the different clamp bounds for positive vs. negative steps. The op moves raw
 //! element bytes and is dtype-agnostic.
 
-use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView, ViewOutput};
-use onnx_runtime_ir::{compute_contiguous_strides, Node};
+use onnx_runtime_ep_api::{
+    EpError, Kernel, KernelFactory, Result, TensorMut, TensorView, ViewOutput,
+};
+use onnx_runtime_ir::{Node, compute_contiguous_strides};
 
 use super::{check_arity, elem_size, to_dense_bytes, to_dense_i64};
 use crate::strided::{next_index, numel};
@@ -163,8 +165,7 @@ impl Kernel for SliceKernel {
         } else {
             None
         };
-        let (axes, steps) =
-            slice_axes_steps(starts.len(), axes_in.as_deref(), steps_in.as_deref());
+        let (axes, steps) = slice_axes_steps(starts.len(), axes_in.as_deref(), steps_in.as_deref());
 
         // Per-axis (start, step, count) — the single shared geometry helper.
         let plan = slice_plan(in_shape, &starts, &ends, &axes, &steps)?;
@@ -298,13 +299,28 @@ mod tests {
         assert_eq!(
             plan,
             vec![
-                SliceAxisPlan { start: 1, step: 1, count: 2 },
-                SliceAxisPlan { start: 0, step: 1, count: 2 },
+                SliceAxisPlan {
+                    start: 1,
+                    step: 1,
+                    count: 2
+                },
+                SliceAxisPlan {
+                    start: 0,
+                    step: 1,
+                    count: 2
+                },
             ]
         );
         // Negative step reverses: [4:-6:-1] over dim 5 → all 5 elements reversed.
         let rev = slice_plan(&[5], &[4], &[-6], &[0], &[-1]).unwrap();
-        assert_eq!(rev, vec![SliceAxisPlan { start: 4, step: -1, count: 5 }]);
+        assert_eq!(
+            rev,
+            vec![SliceAxisPlan {
+                start: 4,
+                step: -1,
+                count: 5
+            }]
+        );
         // Zero step and length mismatch are rejected.
         assert!(slice_plan(&[5], &[0], &[5], &[0], &[0]).is_err());
         assert!(slice_plan(&[5], &[0, 1], &[5], &[0], &[1]).is_err());
@@ -503,10 +519,7 @@ mod tests {
         let ends = Owned::i64(&[1], &[3]);
         let axes = Owned::i64(&[1], &[0]);
         let vo = SliceKernel
-            .view_outputs(
-                &[data.view(), starts.view(), ends.view(), axes.view()],
-                1,
-            )
+            .view_outputs(&[data.view(), starts.view(), ends.view(), axes.view()], 1)
             .expect("pure sub-view should be a view output");
         assert_eq!(vo.len(), 1);
         assert_eq!(vo[0].input_index, 0);
@@ -573,9 +586,11 @@ mod tests {
         let data = Owned::f32(&[5], &[1., 2., 3., 4., 5.]);
         let starts = Owned::i64(&[1], &[2]);
         let ends = Owned::i64(&[1], &[2]);
-        assert!(SliceKernel
-            .view_outputs(&[data.view(), starts.view(), ends.view()], 1)
-            .is_none());
+        assert!(
+            SliceKernel
+                .view_outputs(&[data.view(), starts.view(), ends.view()], 1)
+                .is_none()
+        );
     }
 
     #[test]

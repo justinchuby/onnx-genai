@@ -200,4 +200,14 @@ mod tests {
             .unwrap();
         assert_eq!(out.to_f32(), vec![2., 3., 4., 5.]);
     }
+    #[test]
+    fn gather_nd_with_batch_dims() {
+        let x = Owned::f32(&[2, 2, 2], &[0., 1., 2., 3., 4., 5., 6., 7.]);
+        let i = Owned::i64(&[2, 2, 1], &[1, 0, 0, 1]);
+        let mut out = Owned::zeros_f32(&[2, 2, 2]);
+        GatherNDKernel { batch_dims: 1 }
+            .execute(&[x.view(), i.view()], &mut [out.view_mut()])
+            .unwrap();
+        assert_eq!(out.to_f32(), vec![2., 3., 0., 1., 4., 5., 6., 7.]);
+    }
 }

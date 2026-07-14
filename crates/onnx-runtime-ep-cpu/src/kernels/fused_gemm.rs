@@ -80,7 +80,10 @@ mod tests {
         use crate::kernels::matmul::MatMulKernel;
         use crate::kernels::relu::ReluKernel;
         let a = Owned::f32(&[2, 4], &[1., -2., 3., -4., 5., -6., 7., -8.]);
-        let b = Owned::f32(&[4, 3], &[1., -2., 3., -4., 5., -6., 7., -8., 9., -10., 11., -12.]);
+        let b = Owned::f32(
+            &[4, 3],
+            &[1., -2., 3., -4., 5., -6., 7., -8., 9., -10., 11., -12.],
+        );
         let bias = Owned::f32(&[3], &[0.5, -100.0, 2.0]);
 
         // Reference: MatMul -> Add -> Relu.

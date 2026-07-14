@@ -12,7 +12,7 @@
 //! from the end.
 
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
-use onnx_runtime_ir::{compute_contiguous_strides, Node};
+use onnx_runtime_ir::{Node, compute_contiguous_strides};
 
 use super::{check_arity, to_dense_f32, to_dense_i64, write_dense_f32};
 use crate::strided::{next_index, numel};
@@ -32,7 +32,10 @@ pub struct ReduceMeanFactory;
 
 impl KernelFactory for ReduceMeanFactory {
     fn create(&self, node: &Node, _shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
-        let axes = node.attr("axes").and_then(|a| a.as_ints()).map(|v| v.to_vec());
+        let axes = node
+            .attr("axes")
+            .and_then(|a| a.as_ints())
+            .map(|v| v.to_vec());
         let keepdims = node.attr("keepdims").and_then(|a| a.as_int()).unwrap_or(1) != 0;
         let noop_with_empty_axes = node
             .attr("noop_with_empty_axes")
@@ -279,7 +282,10 @@ mod tests {
             noop_with_empty_axes: false,
         }
         .execute(
-            &[x.view(), TensorView::absent(onnx_runtime_ir::DataType::Int64)],
+            &[
+                x.view(),
+                TensorView::absent(onnx_runtime_ir::DataType::Int64),
+            ],
             &mut [out.view_mut()],
         )
         .unwrap();

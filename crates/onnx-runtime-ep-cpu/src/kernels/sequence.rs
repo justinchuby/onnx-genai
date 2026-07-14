@@ -99,12 +99,8 @@ impl Kernel for RangeKernel {
                         "Range: delta must not be zero".into(),
                     ));
                 }
-                let mut out = Vec::new();
-                let mut value = start;
-                while (delta > 0. && value < limit) || (delta < 0. && value > limit) {
-                    out.push(value);
-                    value += delta;
-                }
+                let count = float_range_count(start, limit, delta)?;
+                let out: Vec<f32> = (0..count).map(|i| start + i as f32 * delta).collect();
                 write_dense_f32(&mut outputs[0], &out)
             }
             DataType::Int64 => {
@@ -118,14 +114,14 @@ impl Kernel for RangeKernel {
                         "Range: delta must not be zero".into(),
                     ));
                 }
-                let mut out = Vec::new();
-                let mut value = start;
-                while (delta > 0 && value < limit) || (delta < 0 && value > limit) {
-                    out.push(value);
-                    value = value
-                        .checked_add(delta)
-                        .ok_or_else(|| EpError::KernelFailed("Range: value overflow".into()))?;
-                }
+                let count = int_range_count(start, limit, delta)?;
+                let out: Result<Vec<i64>> = (0..count)
+                    .map(|i| {
+                        i64::try_from(start as i128 + i as i128 * delta as i128)
+                            .map_err(|_| EpError::KernelFailed("Range: value overflow".into()))
+                    })
+                    .collect();
+                let out = out?;
                 let bytes: Vec<u8> = out.iter().flat_map(|v| v.to_le_bytes()).collect();
                 write_dense_bytes(&mut outputs[0], &bytes)
             }
@@ -208,6 +204,33 @@ impl Kernel for CumSumKernel {
         true
     }
 }
+
+fn float_range_count(start: f32, limit: f32, delta: f32) -> Result<usize> {
+    let count = ((limit - start) / delta).ceil().max(0.0);
+    if !count.is_finite() || count >= usize::MAX as f32 {
+        return Err(EpError::KernelFailed(
+            "Range: element count exceeds addressable memory".into(),
+        ));
+    }
+    Ok(count as usize)
+}
+
+fn int_range_count(start: i64, limit: i64, delta: i64) -> Result<usize> {
+    let count = if delta > 0 && start < limit {
+        let distance = limit as i128 - start as i128;
+        (distance + delta as i128 - 1) / delta as i128
+    } else if delta < 0 && start > limit {
+        let distance = start as i128 - limit as i128;
+        let step = -(delta as i128);
+        (distance + step - 1) / step
+    } else {
+        0
+    };
+    usize::try_from(count).map_err(|_| {
+        EpError::KernelFailed("Range: element count exceeds addressable memory".into())
+    })
+}
+
 fn scan<T: Copy + Default>(
     values: &mut [T],
     shape: &[usize],
@@ -271,6 +294,41 @@ mod tests {
             .execute(&[a.view(), b.view(), d.view()], &mut [y.view_mut()])
             .unwrap();
         assert_eq!(y.to_i64(), vec![5, 3, 1]);
+    }
+    #[test]
+    fn range_float32_generates_by_index() {
+        let a = Owned::f32(&[], &[0.]);
+        let b = Owned::f32(&[], &[1.]);
+        let d = Owned::f32(&[], &[0.25]);
+        let mut y = Owned::zeros_f32(&[4]);
+        RangeKernel
+            .execute(&[a.view(), b.view(), d.view()], &mut [y.view_mut()])
+            .unwrap();
+        assert_eq!(y.to_f32(), vec![0., 0.25, 0.5, 0.75]);
+    }
+    #[test]
+    fn range_float32_descending() {
+        let a = Owned::f32(&[], &[1.]);
+        let b = Owned::f32(&[], &[-0.1]);
+        let d = Owned::f32(&[], &[-0.25]);
+        let mut y = Owned::zeros_f32(&[5]);
+        RangeKernel
+            .execute(&[a.view(), b.view(), d.view()], &mut [y.view_mut()])
+            .unwrap();
+        assert_eq!(y.to_f32(), vec![1., 0.75, 0.5, 0.25, 0.]);
+    }
+    #[test]
+    fn range_float32_no_progress_terminates() {
+        let a = Owned::f32(&[], &[16_777_216.]);
+        let b = Owned::f32(&[], &[16_777_218.]);
+        let d = Owned::f32(&[], &[1.]);
+        let mut y = Owned::zeros_f32(&[2]);
+        RangeKernel
+            .execute(&[a.view(), b.view(), d.view()], &mut [y.view_mut()])
+            .unwrap();
+        assert_eq!(y.to_f32().len(), 2);
+        assert_eq!(y.to_f32().first(), Some(&16_777_216.));
+        assert_eq!(y.to_f32().last(), Some(&16_777_216.));
     }
     #[test]
     fn cumsum_reverse_exclusive() {

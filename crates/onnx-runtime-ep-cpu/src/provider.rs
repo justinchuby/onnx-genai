@@ -22,7 +22,7 @@
 //! 5. **Thread-affine allocators** — N/A: host `malloc` addresses are portable,
 //!    so `DeviceBuffer` is soundly `Send`/`Sync` (documented in ep-api).
 
-use std::alloc::{alloc, dealloc, Layout};
+use std::alloc::{Layout, alloc, dealloc};
 use std::ffi::c_void;
 
 use onnx_runtime_ep_api::{
@@ -196,8 +196,16 @@ impl ExecutionProvider for CpuExecutionProvider {
 
     fn copy(&self, src: &DeviceBuffer, dst: &mut DeviceBuffer, size: usize) -> Result<()> {
         // Invariant #3: both endpoints must belong to this EP.
-        assert_eq!(src.device(), self.device, "cpu_ep::copy: foreign src buffer");
-        assert_eq!(dst.device(), self.device, "cpu_ep::copy: foreign dst buffer");
+        assert_eq!(
+            src.device(),
+            self.device,
+            "cpu_ep::copy: foreign src buffer"
+        );
+        assert_eq!(
+            dst.device(),
+            self.device,
+            "cpu_ep::copy: foreign dst buffer"
+        );
         // Invariant #4: never read/write past either endpoint.
         if size > src.len() || size > dst.len() {
             return Err(EpError::KernelFailed(format!(
@@ -344,14 +352,24 @@ mod tests {
         let ep = CpuExecutionProvider::new();
         // The optimizer emits fused LayerNormalization in `com.microsoft`; the
         // EP must accept it (bound to the same kernel as the standard op).
-        let mut fused = Node::new(onnx_runtime_ir::NodeId(0), "LayerNormalization", vec![], vec![]);
+        let mut fused = Node::new(
+            onnx_runtime_ir::NodeId(0),
+            "LayerNormalization",
+            vec![],
+            vec![],
+        );
         fused.domain = "com.microsoft".to_string();
         assert!(ep.supports_op(&fused, &[], &[]).is_supported());
         assert!(ep.get_kernel(&fused, &[], 1).is_ok());
 
         // The fused `FusedMatMulBias` (MatMul+Add) now has a contrib-domain
         // kernel, so it is supported and instantiable.
-        let mut fmb = Node::new(onnx_runtime_ir::NodeId(1), "FusedMatMulBias", vec![], vec![]);
+        let mut fmb = Node::new(
+            onnx_runtime_ir::NodeId(1),
+            "FusedMatMulBias",
+            vec![],
+            vec![],
+        );
         fmb.domain = "com.microsoft".to_string();
         assert!(ep.supports_op(&fmb, &[], &[]).is_supported());
         assert!(ep.get_kernel(&fmb, &[], 1).is_ok());
@@ -369,15 +387,18 @@ mod tests {
         let mut fa = Node::new(onnx_runtime_ir::NodeId(4), "FusedAttention", vec![], vec![]);
         fa.domain = "com.microsoft".to_string();
         assert!(ep.supports_op(&fa, &[], &[]).is_supported());
-        fa.attributes.insert(
-            "scale".to_string(),
-            onnx_runtime_ir::Attribute::Float(0.5),
-        );
+        fa.attributes
+            .insert("scale".to_string(), onnx_runtime_ir::Attribute::Float(0.5));
         assert!(ep.get_kernel(&fa, &[], 1).is_ok());
 
         // A contrib op with no kernel is still rejected — support is keyed on
         // (op_type, domain).
-        let mut unknown = Node::new(onnx_runtime_ir::NodeId(3), "NotARealFusedOp", vec![], vec![]);
+        let mut unknown = Node::new(
+            onnx_runtime_ir::NodeId(3),
+            "NotARealFusedOp",
+            vec![],
+            vec![],
+        );
         unknown.domain = "com.microsoft".to_string();
         assert!(!ep.supports_op(&unknown, &[], &[]).is_supported());
     }

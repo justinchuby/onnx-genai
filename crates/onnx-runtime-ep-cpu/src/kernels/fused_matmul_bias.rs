@@ -60,10 +60,7 @@ mod tests {
         let bias = Owned::f32(&[2], &[10., 20.]);
         let mut out = Owned::zeros_f32(&[2, 2]);
         FusedMatMulBiasKernel
-            .execute(
-                &[a.view(), b.view(), bias.view()],
-                &mut [out.view_mut()],
-            )
+            .execute(&[a.view(), b.view(), bias.view()], &mut [out.view_mut()])
             .unwrap();
         assert_eq!(out.to_f32(), vec![68., 84., 149., 174.]);
     }
@@ -89,10 +86,7 @@ mod tests {
 
         let mut out = Owned::zeros_f32(&[2, 3]);
         FusedMatMulBiasKernel
-            .execute(
-                &[a.view(), b.view(), bias.view()],
-                &mut [out.view_mut()],
-            )
+            .execute(&[a.view(), b.view(), bias.view()], &mut [out.view_mut()])
             .unwrap();
         assert_eq!(out.to_f32(), expect);
     }
@@ -105,10 +99,7 @@ mod tests {
         let bias = Owned::f32(&[2], &[100., 200.]);
         let mut out = Owned::zeros_f32(&[2, 2, 2]);
         FusedMatMulBiasKernel
-            .execute(
-                &[a.view(), b.view(), bias.view()],
-                &mut [out.view_mut()],
-            )
+            .execute(&[a.view(), b.view(), bias.view()], &mut [out.view_mut()])
             .unwrap();
         // Identity matmul leaves A; add [100,200] across the last axis.
         assert_eq!(

@@ -19,7 +19,9 @@ use onnx_runtime_ir::Node;
 
 use super::add::{broadcast_apply, require_same_dtype};
 use super::check_arity;
-use crate::dtype::{to_dense, to_dense_float, write_dense, write_dense_float, ComputeDomain, FloatElem, NumericElem};
+use crate::dtype::{
+    ComputeDomain, FloatElem, NumericElem, to_dense, to_dense_float, write_dense, write_dense_float,
+};
 use crate::strided::numel;
 use crate::{dispatch_arith, dispatch_float};
 
@@ -118,7 +120,9 @@ fn binary_typed<T: NumericElem>(
 
     // Seed the accumulator from the first operand (broadcast to the output).
     let first = to_dense::<T>(&inputs[0])?;
-    broadcast_apply(&first, inputs[0].shape, &out_shape, |i, v| acc[i] = v.to_acc())?;
+    broadcast_apply(&first, inputs[0].shape, &out_shape, |i, v| {
+        acc[i] = v.to_acc()
+    })?;
 
     // Fold each remaining operand with the op's combiner.
     for input in &inputs[1..] {
@@ -296,10 +300,7 @@ mod tests {
         let c = Owned::f32(&[1], &[4.]); // broadcast scalar-ish
         let mut out = Owned::zeros_f32(&[2, 2]);
         BinaryKernel { op: BinOp::Min }
-            .execute(
-                &[a.view(), b.view(), c.view()],
-                &mut [out.view_mut()],
-            )
+            .execute(&[a.view(), b.view(), c.view()], &mut [out.view_mut()])
             .unwrap();
         // min(a,3,4) elementwise: min(5,3,4)=3, min(1,3,4)=1, min(8,3,4)=3, min(2,3,4)=2
         assert_eq!(out.to_f32(), vec![3., 1., 3., 2.]);

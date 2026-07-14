@@ -3,11 +3,11 @@
 //! §4.4).
 
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
-use onnx_runtime_ir::{compute_contiguous_strides, DataType, Node};
+use onnx_runtime_ir::{DataType, Node, compute_contiguous_strides};
 
 use super::check_arity;
 use crate::dispatch_arith;
-use crate::dtype::{to_dense, write_dense, ComputeDomain, NumericElem};
+use crate::dtype::{ComputeDomain, NumericElem, to_dense, write_dense};
 use crate::strided::{next_index, numel};
 
 /// Stateless broadcasting Add kernel (dtype-generic).
