@@ -985,3 +985,98 @@ Session unit (`option_tests`), session e2e (`tests/epcontext.rs`: byte-exact non
 
 **Advisory (non-blocking):**
 - Consider adding a permanent 3-node `FusedGemm` expanding-bias decline test (mirroring `declines_matmul_add_when_bias_expands`) so the guard generalization is regression-protected in-repo, not just via throwaway. Purely additive; not required for approval.
+
+---
+
+### 2026-07-14T14:50:00Z: DRY external-path guard + explicit capi mapping — Gaff advisories B/C (Leon, d6854c9)
+**By:** Leon
+**What:** Added a shared `guarded_join` helper in a new `pathsafe.rs` module, used by both `weights.rs` and `epcontext.rs` while preserving their distinct error variants (`LoaderError::ExternalDataPath` / `LoaderError::EpContextPath`). Explicitly mapped both path errors to the C API `InvalidGraph` status in `map_loader_error`.
+**Why:** Closes Gaff advisories B (explicit capi mapping) and C (DRY guard) from the external-data path-traversal review with a behavior-identical refactor. `guarded_join` rejects absolute, rooted, `..`-traversing, and parent-dir paths; allows `CurDir` and nested normal components. No new unsafe; existing mmap unsafe blocks untouched.
+**Commit:** `e60dd6b` → cherry-picked to main as `d6854c9`.
+**Review:** Deckard (deckard-22) 🟢 — behavior-identical, both sites guarded, variants preserved, all builds + tests green.
+
+---
+
+### 2026-07-14T14:50:00Z: Review — DRY guard refactor + capi mapping (Deckard, deckard-22)
+**By:** Deckard
+**Verdict:** 🟢 APPROVE
+
+**Findings:**
+- `pathsafe::guarded_join` is behavior-identical to both prior guards: rejects absolute paths, every `ParentDir` component (including net-inside paths), roots/prefixes; allows `CurDir` and normal nested; returns `base.join(rel_path)`.
+- Both `weights.rs` and `epcontext.rs` exclusively route external locations through `guarded_join`; no alternate unguarded `.join` path remains.
+- Distinct errors preserved: `LoaderError::ExternalDataPath` / `LoaderError::EpContextPath` with original path and reason unchanged.
+- C API mapping explicitly classifies both path variants as `InvalidGraph`, consistent with sibling graph/IR structural failures.
+- No new unsafe; no model-specific behavior; no back-compat shim.
+
+**Verification:** `cargo test -p onnx-runtime-loader -p onnx-runtime-capi` — passed; 8-crate `cargo build` — passed; `cargo clippy -p onnx-runtime-loader -p onnx-runtime-capi --all-targets -- -D warnings` — passed; `cargo test -p onnx-runtime-session` — passed.
+
+**Decision:** Approve commit `e60dd6b`; no revision required.
+
+---
+
+### 2026-07-14T14:50:00Z: AttentionFusion — fuse SDPA core into com.microsoft::FusedAttention (Batty, 64edd75)
+**By:** Batty
+**What:** Fused the scaled-dot-product-attention CORE (`MatMul(Q,Kᵀ)·scale[+mask]→Softmax(axis=-1)→MatMul(·,V)`) into a new `com.microsoft::FusedAttention` node with a CPU kernel and shape rule. This completes the Phase-2 optimizer OpFusion + AttentionFusion sub-items.
+
+**Fused node contract (`com.microsoft::FusedAttention` v1):**
+- Inputs: `[Q, K, V]` + optional `[mask]` (iff chain had a mask Add).
+- Attributes: `scale` (f32), `k_transposed` (int 0/1: 1=K already Kᵀ; 0=kernel transposes internally).
+- Output: final `probs·V` value (original output value id, downstream wiring preserved).
+
+**Key matcher guards (decline-to-fuse — never guess defaults):**
+- Anchor: single-in/single-out Softmax with explicit `axis` resolving to last dim (absent → decline).
+- Softmax output must be LEFT operand of the ·V MatMul.
+- Scale must be `Mul`/`Div` by a concrete scalar f32 (strict `numel==1` inline initializer); its non-const operand must be a MatMul output.
+- If mask Add sits between scaling and Softmax, exactly one operand must parse as scaled-scores (both/neither → decline).
+- No interior matched value may escape the region.
+
+**Files:** `ep-cpu/src/kernels/fused_attention.rs` (kernel + 5 unit tests), `session/tests/fused_attention_parity.rs`, `optimizer/src/fusion.rs` (`RewriteKind::Attention`, matcher + Roy's expanding-bias FusedGemm decline test folded in), `shape-inference/src/handlers/linalg.rs` (shape rule), plus wiring in `mod.rs`, `provider.rs`, `op_rules.rs`, `bert_toy_optimized_parity.rs`.
+
+**Results on bert_toy:** 5 FusedAttention, 0 surviving Softmax; LayerNorm=12/FusedMatMulBias=32 unaffected. vs onnxruntime reference max_abs **1.043e-7** (bound 2e-3); vs opt-off drift **1.416e-7** (DRIFT_ATOL 1e-5). `"basic"` byte-identical to opt-off.
+
+**Commit:** `39a23c8` → cherry-picked to main as `64edd75`.
+**Reviews:** Roy (roy-20) 🟢 (matcher robustness; 4 adversarial declines) + Chew (chew-26) 🟢 (kernel numerics hand-verified; parity 1e-6).
+
+**Follow-up note (Roy, non-blocking):** The matcher enforces last-axis softmax + structural equivalence but not rank-4. On a rank-2 scaled-bias-softmax head with a QKᵀ-style MatMul it could emit FusedAttention — this is semantics-preserving (kernel computes the identical value), but consider a note/test documenting rank-2 equivalence if desired.
+
+---
+
+### 2026-07-14T14:50:00Z: Review — AttentionFusion kernel/numerics/shape (Chew, chew-26)
+**By:** Chew (NON-AUTHOR reviewer — kernel/shape/numerics half)
+**Artifact:** commit 39a23c8 (author Batty)
+**Verdict:** 🟢 GREEN — approve
+
+**Key findings:**
+1. `softmax_slices` extraction: purely a visibility change (`fn` → `pub(crate) fn`), body byte-for-byte unchanged. No regression. ✅
+2. Kernel numeric correctness: scale-before-mask-before-softmax order correct; both k_transposed branches compute Q·Kᵀ correctly; batched leading dims via `matmul_dense`+`broadcast_shapes`; mask broadcast `[b,1,1,s]→[b,h,sq,sk]` correct. Hand-derived unmasked pre-transposed test confirmed numerically. ✅
+3. Unit tests hand-computable and non-tautological: 5 ep-cpu tests check concrete values against independent triple-loop references. ✅
+4. k_transposed matcher↔kernel agreement consistent: both paths yield Q·Kᵀ. ✅
+5. Shape rule correct and registered: mirrors k_transposed swap, `matmul_shape(q,k_eff)→matmul_shape(scores,v)`. 3 shape tests correct. ✅
+6. Parity test quality HIGH, tight, non-tautological: ATOL=1e-6 (not loosened), both masked+unmasked, compares against distinct standalone-kernel path. ✅
+7. Safety: zero new `unsafe` blocks; `#![forbid(unsafe_code)]` intact in ir/optimizer/shape-inference crates. ✅
+
+**Build/test:** ep-cpu 113 + shape op_rules 57 + session (fused_attention_parity 2/2, bert_toy_optimized_parity 3/3) all green. clippy -D warnings clean.
+
+---
+
+### 2026-07-14T14:50:00Z: Review — AttentionFusion optimizer/matcher (Roy, roy-20)
+**By:** Roy (NON-AUTHOR reviewer — optimizer/matcher half)
+**Artifact:** commit 39a23c8 (author Batty)
+**Verdict:** 🟢 APPROVE
+
+**Key findings:**
+1. Matcher misfire test — CANNOT MISFIRE (adversarial-tested). Four adversarial graphs all correctly declined:
+   - Classifier head with bias (`MatMul(x,W)+b→Softmax→MatMul`): both Add operands fail parse_scale → decline. ✅
+   - Full SDPA silhouette but scaled tensor is Relu output (not QKᵀ): parse_scale MatMul check → decline. ✅
+   - Ambiguous mask (`Add(Div(MM1,c1),Div(MM2,c2))`): both operands parse as scale → decline. ✅
+   - Interior value escapes (probs is graph output): escape guard → decline. ✅
+2. Decline-guard soundness: every required guard returns None/declines; no silent defaults anywhere. ✅
+3. Both scale forms (Div and Mul) correctly handled. ✅
+4. k_transposed matcher↔kernel contracts agree (verified both sides). ✅
+5. bert_toy fuse + conformance held: FusedAttention=5, Softmax=0; parity within ATOL. ✅
+6. Roy's folded FusedGemm advisory: `declines_fused_gemm_when_bias_expands` test present and asserts a decline. ✅
+7. Model-agnostic; no new unsafe in matcher. ✅
+
+**Build/test:** optimizer 40 + session 18 + ep-cpu 5 fused_attention tests all green. clippy -D warnings clean.
+
+**Non-blocking follow-up:** Matcher doesn't require rank-4. On a rank-2 QKᵀ-style SDPA the kernel computes the identical value (semantics-preserving). Consider a note/test documenting rank-2 equivalence if desired. NOT required for approval.

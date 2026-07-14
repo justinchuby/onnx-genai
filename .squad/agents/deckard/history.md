@@ -76,3 +76,7 @@ Non-author review of `squad/ort2-epctx-options` @ `3e8dbde95effb006b28d117e3f8c5
 ## 2026-07-14T13:55:00Z — deckard-21: External-data path-traversal guard (weights loader §19.2)
 
 Authored the traversal guard for the weights loader's untrusted external-data read path. `resolve_external_path` in `weights.rs` rejects absolute, rooted, and `..`-traversing `location` fields before mmap; new `LoaderError::ExternalDataPath { path, reason }` variant. 4 tests. Mirrors epcontext guard without coupling error types. Cleaned up stale epcontext TODO. Commit `340d7b0` → cherry-picked to main as `ba3f67a`. **Reviewer: gaff-15 🟡** (3 non-blocking advisories: symlinks/lexical-only, capi mapping, DRY).
+
+## 2026-07-14T14:50:00Z — deckard-22: Review — DRY guard refactor + capi mapping (leon-15)
+
+Reviewed Leon's DRY refactor of the external-path traversal guard (commit `e60dd6b`). Verified `pathsafe::guarded_join` is behavior-identical to both prior local guards; both `weights.rs` and `epcontext.rs` exclusively route through it; distinct error variants preserved; capi explicit mapping correct; no new unsafe. All targeted builds, tests, clippy green. **Verdict: 🟢 APPROVE** — no revision required.

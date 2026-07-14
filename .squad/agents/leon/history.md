@@ -98,3 +98,7 @@ Chew reviewed (read-only, 🟡 SHIP-with-advisories): layout correctness confirm
 - **Exact-identity guard (introduced, later removed):** Same (source, partition_name) twice → `LoaderError::EpContext("duplicate partition identity …")`.
 - **Commit:** `7a01f5f` (= `d9a4b6f`).
 - **Review:** deckard-18 🔴 BLOCK — B1 resolved but identity rejection over-fires on legitimate distinct primaries. **Leon locked out.** Gaff named as next revision owner.
+
+## 2026-07-14T14:50:00Z — leon-15: DRY external-path guard + explicit capi mapping (d6854c9)
+
+Closed Gaff advisories B and C from the external-data path-traversal review. Created `crates/onnx-runtime-loader/src/pathsafe.rs` with a shared `guarded_join` helper (behavior-identical to both prior local guards: rejects absolute, rooted, `..`-traversing paths; allows `CurDir` and nested normal components). Both `weights.rs` and `epcontext.rs` route through `guarded_join`, retaining distinct `LoaderError::ExternalDataPath` / `LoaderError::EpContextPath` variants. `map_loader_error` in `capi` now explicitly maps both variants to `OrtErrorCode::InvalidGraph`. Commit `e60dd6b` → cherry-picked to main as `d6854c9`. **Reviewer: deckard-22 🟢** (behavior-identical, both sites guarded, variants preserved, builds + tests + clippy green).
