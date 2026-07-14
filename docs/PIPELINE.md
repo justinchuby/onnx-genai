@@ -393,7 +393,9 @@ pub enum TemplateFallback {
     /// a chat model without any template is a configuration problem worth surfacing.
     #[default]
     Error,
-    /// Use ORT's built-in `DEFAULT_CHAT_TEMPLATE` (opt-in convenience).
+    /// Render with ORT's built-in default template (opt-in convenience), obtained via the
+    /// new public `ChatTemplate::builtin_default()` accessor (§6.2.1) — *not* by reaching
+    /// into ORT's private `DEFAULT_CHAT_TEMPLATE` const.
     Default,
     /// Report "no model template"; the *caller* renders its own fallback. This is the
     /// mode the server selects so it keeps `build_prompt` (`routes.rs:2066`) with its
@@ -450,6 +452,39 @@ Notes:
   an actionable message per RULES.md #1 (`chat_template.rs`-style context: which model dir, that
   neither `chat_template.jinja` nor a `tokenizer_config.json` `chat_template` was found, and how to
   supply one).
+
+### 6.2.1 Required ort-crate change: expose the built-in default template
+
+`TemplateFallback::Default` renders with ORT's built-in default when a model ships no template.
+That default currently lives **inside** the ort crate and is unreachable from the engine crate,
+so the seam as drawn is not buildable without a small ort-crate addition:
+
+- `DEFAULT_CHAT_TEMPLATE` is a **private** module const (`chat_template.rs:12`).
+- `ChatTemplate`'s `template` field is **private** (`chat_template.rs:17–19`), and the only
+  constructor is `ChatTemplate::from_model_dir` (`chat_template.rs:125`), which requires a model
+  directory on disk and only yields the default as a side effect of finding *nothing*
+  (`chat_template.rs:149–151`). There is **no** public string/`Default` constructor.
+
+The design therefore requires **one minimal, explicit ort-crate addition** — the same
+"engine/ort-crate change required" convention this doc uses for the §8.1 tokenization seam:
+
+```rust
+// crates/onnx-genai-ort/src/chat_template.rs (new public accessor on ChatTemplate)
+impl ChatTemplate {
+    /// A `ChatTemplate` backed by ORT's built-in default (`DEFAULT_CHAT_TEMPLATE`).
+    /// Model-independent — needs no model directory.
+    pub fn builtin_default() -> Self;
+}
+```
+
+The built-in default is **model-independent** — it only emits `role: content` lines plus an
+optional generation prompt (`chat_template.rs:12–13`) — so a zero-argument accessor is
+sufficient and `render_messages` does **not** need a `model_dir` parameter to serve
+`TemplateFallback::Default`. Under that fallback with `template == None`, `render_messages`
+calls `ChatTemplate::builtin_default()` and renders through the existing `ChatTemplate::render`
+(`chat_template.rs:159`). This keeps the shared-renderer seam coherent: every render path —
+model template, built-in default, and caller fallback — flows through the one ort
+`ChatTemplate::render` entry point, and the engine crate never touches ort internals.
 
 ### 6.3 `ChatPipeline` — the facade consumer of the seam
 
@@ -907,25 +942,28 @@ already set for the binding layer (`docs/EAGER.md` §11–12, `docs/ORT2.md` §2
 
 - **Minimum Python: 3.10.** `nxrt` requires Python **≥ 3.10** (`requires-python = ">=3.10"`). No
   support for 3.9 or earlier.
-- **Standard wheels use the stable ABI (`abi3`).** We build a **single `abi3` wheel** with the
-  **py312 wheel target** (the wheel is tagged `cp312-abi3-…`) and a compile-time **support floor of
-  `abi3-py310`** — i.e. PyO3's `abi3-py310` feature, so one `abi3` wheel loads on CPython 3.10, 3.11,
-  3.12, 3.13, and 3.14 without rebuilding per minor version. (`abi3` = CPython's stable ABI /
-  limited API.)
+- **Standard wheels use the stable ABI (`abi3`).** We ship a **single `abi3` wheel** tagged
+  **`cp310-abi3`**. In a stable-ABI tag the `cp310` denotes the **minimum** CPython the wheel loads
+  on — *not* the interpreter it was built with — so one wheel installs on CPython 3.10, 3.11, 3.12,
+  3.13, and 3.14 without rebuilding per minor version. It is compiled against the limited API pinned
+  to 3.10 (`Py_LIMITED_API = 0x030A0000`, i.e. PyO3's `abi3-py310` feature) and may be **built with
+  any interpreter ≥ 3.10** (e.g. `maturin build --interpreter python3.12`); the build interpreter
+  does **not** change the `cp310-abi3` tag. A `cp312-abi3` tag would be **wrong** with a 3.10 floor:
+  it refuses to install on CPython 3.10 and 3.11. (`abi3` = CPython's stable ABI / limited API.)
 - **Free-threaded builds ship SEPARATE `abi3t` wheels.** The free-threaded (no-GIL / `Py_GIL_DISABLED`)
   interpreter is **not** ABI-compatible with the standard `abi3` wheel, so we publish **distinct
   `abi3t` wheels targeting py315** (tagged for the free-threaded `t` ABI, e.g. `cp315t`). These are
   built and released alongside the standard `abi3` wheels; a free-threaded interpreter picks up the
   `abi3t` wheel, a standard interpreter picks up the `abi3` wheel.
 
-| Wheel | ABI | Wheel target | Support floor | Interpreter |
+| Wheel | ABI | Wheel tag | Limited-API floor | Interpreter |
 |---|---|---|---|---|
-| standard | `abi3` (stable ABI) | py312 (`cp312-abi3`) | `abi3-py310` | CPython 3.10–3.14 (GIL) |
-| free-threaded | `abi3t` | py315 (`cp315t`) | free-threaded 3.15 | free-threaded CPython |
+| standard | `abi3` (stable ABI) | `cp310-abi3` | `Py_LIMITED_API` = 3.10 (`abi3-py310`) | CPython 3.10–3.14+ (GIL) |
+| free-threaded | `abi3t` | `cp315t` | free-threaded 3.15 | free-threaded CPython |
 
-Rationale: one `abi3` wheel spanning 3.10→3.14 minimizes the build matrix and install surprises,
-while the free-threaded ecosystem's separate ABI requires its own `abi3t` artifact rather than
-overloading the standard wheel.
+Rationale: one `abi3` wheel tagged at its 3.10 floor spans CPython 3.10→3.14+ from a single build,
+minimizing the build matrix and install surprises, while the free-threaded ecosystem's separate ABI
+requires its own `abi3t` artifact rather than overloading the standard wheel.
 
 ---
 
@@ -1015,6 +1053,10 @@ message conversion, and `add_generation_prompt`, shared by the server and the `C
   (no ORT default), and `render_messages` honors `TemplateFallback::{Error, Default, CallerHandles}`.
   The server uses `CallerHandles` to preserve its tool-aware `build_prompt` fallback; the facade
   defaults to `Error`. This makes the server change behavior-preserving (§2.4.1, §13.3).
+  `TemplateFallback::Default` requires **one minimal ort-crate addition** — a public
+  `ChatTemplate::builtin_default()` accessor — because ORT's `DEFAULT_CHAT_TEMPLATE` const and
+  `ChatTemplate.template` field are private (`chat_template.rs:12`, `17–19`); the built-in default
+  is model-independent, so no `model_dir` is threaded through `render_messages` (§6.2.1).
 - **D3 — No new inference machinery.** Facade is a thin wrapper; all sampling/streaming/FIM/
   embedding behavior is the existing engine's. The one required engine-crate addition is a public
   **tokenization seam** for feature extraction (`Engine::embed_text` / `Engine::tokenize`, §8.1),
@@ -1028,8 +1070,9 @@ message conversion, and `add_generation_prompt`, shared by the server and the `C
   so no legacy aliases.
 - **D6 — Python package `nxrt`, `abi3`/`abi3t`, Python ≥ 3.10.** Already decided in EAGER.md/ORT2.md;
   GenAI API attaches there, defaulting to a `nxrt.genai` submodule with `pipeline`/`generate` also
-  re-exported top-level. Wheels: standard **`abi3`** (py312 target, `abi3-py310` floor) + separate
-  free-threaded **`abi3t`** (py315 target); minimum Python **3.10** (§12.4).
+  re-exported top-level. Wheels: standard **`abi3`** (tagged `cp310-abi3`, `Py_LIMITED_API` = 3.10 /
+  `abi3-py310` floor, buildable with any interpreter ≥ 3.10) + separate free-threaded **`abi3t`**
+  (py315 target, `cp315t`); minimum Python **3.10** (§12.4).
 - **D7 — v1 task list:** `text-generation`, `chat`/`conversational`, `feature-extraction`
   (embeddings), `fill-in-the-middle`. Enum + `…Pipeline` types are extensible for `fill-mask` /
   `token-classification` later. The `task::TextGenerationPipeline`/`ChatPipeline` names do **not**
