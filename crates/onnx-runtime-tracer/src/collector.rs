@@ -238,9 +238,15 @@ impl FileCollector {
     ///
     /// # Errors
     ///
-    /// Returns [`TracerError::Write`] if the file cannot be created — the
-    /// message names the path and a concrete remediation.
+    /// Returns [`TracerError::UnsupportedFormat`] if Perfetto protobuf output
+    /// was requested in a build without the `perfetto` cargo feature, or
+    /// [`TracerError::Write`] if the file cannot be created. Both errors explain
+    /// how to fix the configuration.
     pub fn new(path: impl AsRef<Path>, format: TraceFormat) -> Result<Self> {
+        if format == TraceFormat::PerfettoProto && !cfg!(feature = "perfetto") {
+            return Err(TracerError::UnsupportedFormat { format });
+        }
+
         let path = path.as_ref().to_path_buf();
         std::fs::File::create(&path).map_err(|source| TracerError::Write {
             path: path.clone(),
@@ -281,12 +287,12 @@ impl FileCollector {
                 {
                     crate::perfetto::to_perfetto_proto(events, None)
                 }
-                // Without the `perfetto` feature we cannot emit protobuf; fall
-                // back to Chrome JSON (which Perfetto also reads) so no trace is
-                // ever silently lost.
                 #[cfg(not(feature = "perfetto"))]
                 {
-                    crate::chrome::to_chrome_json(events).into_bytes()
+                    unreachable!(
+                        "FileCollector::new rejects PerfettoProto when the `perfetto` \
+                         cargo feature is disabled"
+                    )
                 }
             }
         }

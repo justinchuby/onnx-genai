@@ -19,6 +19,11 @@ pub type Result<T> = std::result::Result<T, TracerError>;
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum TracerError {
+    /// The requested trace format is unavailable in this crate build.
+    UnsupportedFormat {
+        /// The format the caller requested.
+        format: TraceFormat,
+    },
     /// A trace could not be serialized to its target [`TraceFormat`].
     ///
     /// For the built-in [`TraceEvent`](crate::TraceEvent) model this is
@@ -46,6 +51,15 @@ pub enum TracerError {
 impl fmt::Display for TracerError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            TracerError::UnsupportedFormat { format } => write!(
+                f,
+                "cannot create a FileCollector for {format} output: Perfetto protobuf \
+                 output requires the `perfetto` cargo feature, which is not enabled \
+                 in this build. Enable the `perfetto` feature (it is enabled by \
+                 default, so avoid `--no-default-features` or add it explicitly), \
+                 or use `TraceFormat::ChromeJson`; Perfetto UI \
+                 (https://ui.perfetto.dev) loads Chrome JSON directly too."
+            ),
             TracerError::Serialize { format, source } => write!(
                 f,
                 "failed to serialize the {format} trace: {source}. \
@@ -73,6 +87,7 @@ impl fmt::Display for TracerError {
 impl std::error::Error for TracerError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            TracerError::UnsupportedFormat { .. } => None,
             TracerError::Serialize { source, .. } => Some(source),
             TracerError::Write { source, .. } => Some(source),
         }

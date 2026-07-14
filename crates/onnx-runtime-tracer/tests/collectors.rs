@@ -162,3 +162,35 @@ fn file_collector_reports_path_on_unwritable_target() {
         "error must offer a remediation, got: {message}"
     );
 }
+
+#[cfg(feature = "perfetto")]
+#[test]
+fn file_collector_accepts_perfetto_proto_when_feature_is_enabled() {
+    let path =
+        std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("perfetto_enabled.perfetto");
+
+    let collector = FileCollector::new(&path, TraceFormat::PerfettoProto)
+        .expect("the default `perfetto` feature should enable Perfetto protobuf output");
+    assert_eq!(collector.format(), TraceFormat::PerfettoProto);
+
+    let _ = std::fs::remove_file(path);
+}
+
+#[cfg(not(feature = "perfetto"))]
+#[test]
+fn file_collector_rejects_perfetto_proto_when_feature_is_disabled() {
+    let path =
+        std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("perfetto_disabled.perfetto");
+
+    let err = FileCollector::new(&path, TraceFormat::PerfettoProto).unwrap_err();
+    let message = err.to_string();
+    assert!(
+        message.contains("`perfetto` cargo feature")
+            && message.contains("not enabled in this build"),
+        "error must explain why Perfetto protobuf is unavailable, got: {message}"
+    );
+    assert!(
+        message.contains("TraceFormat::ChromeJson") && message.contains("ui.perfetto.dev"),
+        "error must offer the ChromeJson remedy and explain Perfetto UI support, got: {message}"
+    );
+}
