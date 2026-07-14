@@ -4,9 +4,20 @@ version = "0.1.0-dev.1"
 edition = "2024"
 description = "CPU hardware detection via pytorch/cpuinfo FFI bindings"
 license = "MIT"
+repository = "https://github.com/justinchuby/onnx-genai"
+exclude = [
+    "vendor/cpuinfo/test/**",
+    "vendor/cpuinfo/bench/**",
+    "vendor/cpuinfo/tools/**",
+    "vendor/cpuinfo/.git",
+    "vendor/cpuinfo/**/*.a",
+    "vendor/cpuinfo/**/*.o",
+]
 
 [dependencies]
+thiserror = { workspace = true }
 
 [build-dependencies]
 cmake = "0.1"
-bindgen = "0.70"
+bindgen = "0.71"
+cc = "1"

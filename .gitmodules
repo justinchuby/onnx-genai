@@ -1,5 +1,5 @@
-[submodule "third_party/cpuinfo"]
-	path = third_party/cpuinfo
+[submodule "crates/onnx-runtime-cpuinfo/vendor/cpuinfo"]
+	path = crates/onnx-runtime-cpuinfo/vendor/cpuinfo
 	url = https://github.com/pytorch/cpuinfo.git
 [submodule "third_party/onednn"]
 	path = third_party/onednn
