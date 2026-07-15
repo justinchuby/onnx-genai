@@ -31,6 +31,9 @@ members = [
     "crates/onnx-runtime-tracer",
     "crates/onnx-runtime-python",
     "crates/onnx-runtime-dlpack",
+
+    # ── onnx-rs standard library (new — see docs/ONNX_RS.md) ──
+    "crates/onnx-rs",
 ]
 
 [workspace.package]
@@ -68,6 +71,9 @@ onnx-runtime-session = { path = "crates/onnx-runtime-session", version = "=0.1.0
 onnx-runtime-capi = { path = "crates/onnx-runtime-capi", version = "=0.1.0-dev.2" }
 onnx-runtime-tracer = { path = "crates/onnx-runtime-tracer", version = "=0.1.0-dev.2" }
 onnx-runtime-dlpack = { path = "crates/onnx-runtime-dlpack", version = "=0.1.0-dev.2" }
+
+# onnx-rs standard library (new — see docs/ONNX_RS.md)
+onnx-rs = { path = "crates/onnx-rs", version = "=0.1.0-dev.2" }
 
 # External
 tokenizers = "0.21"

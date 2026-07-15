@@ -1852,6 +1852,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "onnx-rs"
+version = "0.1.0-dev.2"
+dependencies = [
+ "onnx-runtime-ir",
+ "onnx-runtime-loader",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "onnx-runtime-capi"
 version = "0.1.0-dev.2"
 dependencies = [

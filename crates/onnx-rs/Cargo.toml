@@ -1,0 +1,14 @@
+[package]
+name = "onnx-rs"
+description = "Pure-Rust ONNX standard library: model I/O, textual dump, and an extensible validator, built on the shared onnx-runtime-ir IR (see docs/ONNX_RS.md)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords = ["onnx", "protobuf", "validation", "ir"]
+categories = ["science", "parser-implementations"]
+
+[dependencies]
+onnx-runtime-ir = { workspace = true }
+onnx-runtime-loader = { workspace = true }
+thiserror = { workspace = true }
