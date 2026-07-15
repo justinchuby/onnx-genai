@@ -1,11 +1,13 @@
 //! GPU numeric parity tests for cuBLASLt bias/activation GEMM epilogues.
 
-use onnx_runtime_ep_api::{DevicePtr, DevicePtrMut, ExecutionProvider, TensorMut, TensorView};
-use onnx_runtime_ep_cuda::CudaExecutionProvider;
+use onnx_runtime_ep_api::{
+    DevicePtr, DevicePtrMut, ExecutionProvider, KernelMatch, TensorMut, TensorView,
+};
 use onnx_runtime_ep_cuda::runtime::cuptr;
+use onnx_runtime_ep_cuda::CudaExecutionProvider;
 use onnx_runtime_ir::{
-    Attribute, DataType, Graph, Node, NodeId, as_static_shape, compute_contiguous_strides,
-    static_shape,
+    as_static_shape, compute_contiguous_strides, static_shape, Attribute, DataType, Graph, Node,
+    NodeId, TensorLayout,
 };
 use onnx_runtime_loader::Model;
 
@@ -13,6 +15,7 @@ fn build_model(
     op_type: &str,
     a_shape: &[usize],
     b_shape: &[usize],
+    bias_shape: &[usize],
     out_shape: &[usize],
     attributes: &[(&str, Attribute)],
 ) -> (Graph, NodeId) {
@@ -28,7 +31,11 @@ fn build_model(
         DataType::Float32,
         static_shape(b_shape.iter().copied()),
     );
-    let bias = graph.create_named_value("bias", DataType::Float32, static_shape([out_shape[1]]));
+    let bias = graph.create_named_value(
+        "bias",
+        DataType::Float32,
+        static_shape(bias_shape.iter().copied()),
+    );
     for value in [a, b, bias] {
         graph.add_input(value);
     }
@@ -225,7 +232,7 @@ fn fused_matmul_bias_matches_matmul_then_bias() {
     let a = [0.5, -1.0, 2.0, 1.5, 0.25, -0.75];
     let b = [1.0, 0.5, -2.0, -1.0, 3.0, 0.25, 2.0, -0.5, 1.25];
     let bias = [0.25, -1.5, 2.0];
-    let (graph, node) = build_model("FusedMatMulBias", &[2, 3], &[3, 3], &[2, 3], &[]);
+    let (graph, node) = build_model("FusedMatMulBias", &[2, 3], &[3, 3], &[3], &[2, 3], &[]);
     let model = Model::new(&graph);
     let got = run_model(&ep, &model, node, &a, &b, &bias);
     let expected = reference_gemm(&a, &b, &bias, [2, 3], [3, 3], false, false, 1.0);
@@ -248,7 +255,7 @@ fn fused_gemm_relu_bias_matches_reference_with_transpose_and_alpha() {
         ("transA", Attribute::Int(1)),
         ("transB", Attribute::Int(1)),
     ];
-    let (graph, node) = build_model("FusedGemm", &[3, 2], &[4, 3], &[2, 4], &attrs);
+    let (graph, node) = build_model("FusedGemm", &[3, 2], &[4, 3], &[4], &[2, 4], &attrs);
     let model = Model::new(&graph);
     let got = run_model(&ep, &model, node, &a, &b, &bias);
     let mut expected = reference_gemm(&a, &b, &bias, [3, 2], [4, 3], true, true, 0.75);
@@ -267,7 +274,7 @@ fn fused_gemm_gelu_bias_matches_tanh_reference() {
     let b = [1.0, -0.5, 0.25, -1.5, 0.75, 2.0];
     let bias = [-0.25, 0.5];
     let attrs = [("activation", Attribute::String(b"Gelu".to_vec()))];
-    let (graph, node) = build_model("FusedGemm", &[2, 3], &[3, 2], &[2, 2], &attrs);
+    let (graph, node) = build_model("FusedGemm", &[2, 3], &[3, 2], &[2], &[2, 2], &attrs);
     let model = Model::new(&graph);
     let got = run_model(&ep, &model, node, &a, &b, &bias);
     let mut expected = reference_gemm(&a, &b, &bias, [2, 3], [3, 2], false, false, 1.0);
@@ -279,4 +286,38 @@ fn fused_gemm_gelu_bias_matches_tanh_reference() {
             as f32;
     });
     assert_close("FusedGemm GELU_BIAS (tanh)", &got, &expected, 2e-6);
+}
+
+#[test]
+fn placement_declines_broadcast_bias_and_batched_matmul() {
+    let Some(ep) = cuda_ep() else {
+        return;
+    };
+
+    for op_type in ["FusedMatMulBias", "FusedGemm"] {
+        for (a_shape, b_shape, bias_shape, out_shape, expected) in [
+            (&[2, 3][..], &[3, 4][..], &[4][..], &[2, 4][..], true),
+            (&[2, 3][..], &[3, 4][..], &[][..], &[2, 4][..], false),
+            (&[2, 3][..], &[3, 4][..], &[1, 4][..], &[2, 4][..], false),
+            (&[2, 3][..], &[3, 4][..], &[2, 4][..], &[2, 4][..], false),
+            (&[2, 2, 3][..], &[3, 4][..], &[4][..], &[2, 2, 4][..], false),
+        ] {
+            let (graph, node_id) =
+                build_model(op_type, a_shape, b_shape, bias_shape, out_shape, &[]);
+            let node = graph.node(node_id);
+            let shapes: Vec<_> = node
+                .input_values()
+                .map(|value| graph.value(value).shape.clone())
+                .collect();
+            let layouts = vec![TensorLayout::contiguous(); shapes.len()];
+            assert_eq!(
+                matches!(
+                    ep.supports_op(node, &shapes, &layouts),
+                    KernelMatch::Supported { .. }
+                ),
+                expected,
+                "unexpected {op_type} placement for A={a_shape:?}, B={b_shape:?}, bias={bias_shape:?}"
+            );
+        }
+    }
 }

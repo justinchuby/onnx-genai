@@ -29,7 +29,7 @@ use onnx_runtime_ep_api::{
 use onnx_runtime_ir::{DeviceId, DeviceType, Node, Shape, TensorLayout};
 
 use crate::kernels::build_cuda_registry;
-use crate::runtime::{CudaRuntime, cuptr, raw_ptr};
+use crate::runtime::{cuptr, raw_ptr, CudaRuntime};
 
 /// CUDA execution provider (Phase 2a: cudarc + cuBLASLt GEMM).
 ///
@@ -116,6 +116,12 @@ impl ExecutionProvider for CudaExecutionProvider {
         // only; anything else is Unsupported so placement routes it elsewhere
         // (typically the CPU EP) instead of hard-failing at dispatch.
         if !self.registry.supports(&op.op_type, &op.domain) {
+            return KernelMatch::Unsupported;
+        }
+        if matches!(op.op_type.as_str(), "FusedMatMulBias" | "FusedGemm")
+            && op.domain == "com.microsoft"
+            && !crate::kernels::fused_gemm::supports_shapes(op, shapes)
+        {
             return KernelMatch::Unsupported;
         }
         let output_layouts = vec![TensorLayout::contiguous(); op.outputs.len()];

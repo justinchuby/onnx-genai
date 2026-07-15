@@ -9,11 +9,11 @@ use std::ffi::c_void;
 use std::sync::Arc;
 
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
-use onnx_runtime_ir::{DataType, Node};
+use onnx_runtime_ir::{DataType, Node, Shape};
 
-use crate::blas::{GemmDtype, GemmEpilogue, GemmEpilogueKind, GemmEx, WORKSPACE_BYTES, gemm_ex};
+use crate::blas::{gemm_ex, GemmDtype, GemmEpilogue, GemmEpilogueKind, GemmEx, WORKSPACE_BYTES};
 use crate::error::not_implemented;
-use crate::runtime::{CudaRuntime, cuptr};
+use crate::runtime::{cuptr, CudaRuntime};
 
 use super::gemm::plan_gemm;
 
@@ -96,6 +96,34 @@ fn parse_activation(activation: &str) -> Result<GemmEpilogueKind> {
             )));
         }
     }
+}
+
+pub(crate) fn supports_shapes(node: &Node, shapes: &[Shape]) -> bool {
+    let [a, b, bias] = shapes else {
+        return false;
+    };
+    if a.len() != 2 || b.len() != 2 || bias.len() != 1 {
+        return false;
+    }
+
+    let (trans_a, trans_b) = if node.op_type == "FusedGemm" {
+        (
+            node.attr("transA")
+                .and_then(|attr| attr.as_int())
+                .unwrap_or(0)
+                != 0,
+            node.attr("transB")
+                .and_then(|attr| attr.as_int())
+                .unwrap_or(0)
+                != 0,
+        )
+    } else {
+        (false, false)
+    };
+    let a_k = if trans_a { a[0] } else { a[1] };
+    let (b_k, n) = if trans_b { (b[1], b[0]) } else { (b[0], b[1]) };
+
+    a_k == b_k && bias[0] == n
 }
 
 struct FusedEpilogueKernel {
