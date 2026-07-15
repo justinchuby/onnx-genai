@@ -26,3 +26,7 @@ At 2026-07-14T19:05:00Z, fixed clippy findings and corrected Python pytest count
 ## 2026-07-15T01:52:00Z — Session update
 
 - Delivered DLPack zero-copy export (`6fdccc8`): C ABI plus Python NxrtValue `__dlpack__`/`__dlpack_device__`.
+
+## 2026-07-15T00:00:00Z — Cross-agent session update
+
+- Delivered contrib fused transformer kernels; follow-up review fixes for SkipLayerNormalization/SimplifiedLayerNormalization merged in the opset coverage wave.

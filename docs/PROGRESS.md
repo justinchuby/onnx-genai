@@ -139,6 +139,15 @@ Evidence-based audit of `docs/DESIGN.md` (engine) + `docs/ORT2.md` (nxrt runtime
 
 ## Recently completed (this session)
 
+### 2026-07-15 — Runtime API, validation, and opset coverage wave
+
+- **Ergonomic callable API ✅:** `nxrt.load`, callable `InferenceSession`, `Outputs`, tensor-like values, and pre-run output-name validation landed; `bind_outputs` is a lock-free immutable `BoundSession` proxy, preserving ORT-compatible `run()` behavior.
+- **CUDA DLPack zero-copy ✅ (transport boundary):** CUDA `kDLCUDA` import/export now preserves raw device identity and zero-copy ownership safely. The present executor remains CPU-only, so device-resident execution/host reads fail cleanly rather than imply CUDA execution.
+- **Loader legality validation ✅:** raw-model SSA/ref-attribute/IR/opset/shadowing checks, post-initializer graph validation, no artificial upper IR-version ceiling, and model-local-function inlining landed.
+- **Standard LLM ops ✅:** standard-domain `Gelu` (v20), `RMSNormalization` (v23), `RotaryEmbedding` (v23), and `Swish` (v24) now have CPU kernels and aligned shape inference.
+- **Opset 17–26 coverage substantially advanced:** added `Split`, `Pad`, `ConstantOfShape`, `Sum`, `Mean`, `LogSoftmax`, `CastLike`, `BiasGelu`, `FastGelu`, `QuickGelu`, `SkipLayerNormalization`, and `SimplifiedLayerNormalization`, plus C1 shape handling for ArgMax/ArgMin, TopK, Tile, Range, CumSum, GatherND, NonZero, and trig/activation unaries.
+
+
 Complete runtime built from scaffold + published: generation (greedy/speculative draft+prompt-lookup+MTP), samplers, FIM, grammar, tool use (Hermes-verified), chat templates, multi-session + prefix cache, paged/tiered/int8 KV, long-context O(1)/token static-cache, batched multi-agent serving, OpenAI HTTP (chat/completions/vision/streaming/sessions), observability, benchmarks (`onnx-genai-bench`), `onnx-genai-preprocess` crate, security hardening, CI + audits. **Fixed: categorical sampling had no RNG (always token 0).**
 
 ### 2026-07-14 — ORT2 landing changelog

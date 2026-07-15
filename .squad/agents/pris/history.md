@@ -58,3 +58,7 @@ Advanced fixture work is canonical: builders use onnxscript/onnx-ir, `tiny-mtp-f
 - 2026-07-14T19:05:00Z — Reviewed Ana's `nxrt` PyO3 FFI/abi3 binding; verdict GREEN. Binding merged in `878559f`.
 
 - 2026-07-15 — Performed third review of Range hardening; advisory outcome recorded for `29f0772`.
+
+## 2026-07-15T00:00:00Z — Cross-agent session update
+
+- Hardened the Range Float32 parity regression test; included in the opset-coverage consolidation.

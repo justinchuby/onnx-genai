@@ -41,3 +41,7 @@ Sebastian's perf review is now in decisions. §26 should prioritize active-row c
 - **No code change** (none warranted). Follow-ups: warmup discipline + server startup priming (Leon/Seb), TTFT/prefill ~2-4% residual (Leon), fused-QKV low-prio (Sapper). Doc: `docs/benchmarks/2026-07-13-foundry-local-analysis.md`; decision inbox `sebastian-foundry-analysis.md`. Did NOT commit.
 
 - 2026-07-14T19:05:00Z — DESIGN.md §26.11 Resource Governor merged in `d6736e1`, specifying live byte-denominated VRAM/RAM limits, transactional lowering, and actionable over-budget errors.
+
+## 2026-07-15T00:00:00Z — Cross-agent session update
+
+- Validated non-empty IR>=3 opset imports while preserving custom-only models; merged in the loader legality stack.

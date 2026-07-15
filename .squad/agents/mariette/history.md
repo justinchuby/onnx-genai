@@ -6,3 +6,7 @@ Hired as a Metal/MPS kernel engineer for the new Apple Metal EP for ONNX Runtime
 - 2026-07-14T19:05:00Z — Offline per-EP ONNX conformance harness and `docs/EP_CONFORMANCE.md` merged to origin/main in `1dfab0d`; process-bridge design recorded in decisions.
 
 - 2026-07-15 — Vendored cpuinfo beneath its crate so cargo publish succeeds (merged `65cc851`).
+
+## 2026-07-15T00:00:00Z — Cross-agent session update
+
+- Applied final CUDA DLPack review fixes and documented the honest CPU-executor boundary; merged in the GPU-DLPack wave.

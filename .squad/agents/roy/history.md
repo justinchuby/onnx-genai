@@ -22,3 +22,7 @@ Authored §55 design, corrected external-file default, and implemented the loade
 
 ### Packaging and review protocol
 Rejected the original crate-reservation runbook due to a publication cycle; Deckard was locked out and Leon's path-only dev-dependency fix passed re-review. Recent CUDA Phase-2a SDPA/GQA review was green, including layout, GQA mapping, causal indexing, numerics, safety, and H200 execution.
+
+## 2026-07-15T00:00:00Z — Cross-agent session update
+
+- Hardened CUDA DLPack commit validation to compare raw device identity; GPU review findings are incorporated in the final DLPack wave.

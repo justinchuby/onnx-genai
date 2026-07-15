@@ -88,3 +88,7 @@ Reviewed Fido's `cbourjau/onnx-tests` nxrt adapter and reproduction docs 🟡. T
 ## 2026-07-15T01:52:00Z — Session update
 
 - Closed the weight-streaming soundness gap (`e0c9669`): only producer-less initializers can be borrowed; loader rejects initializer/output reuse.
+
+## 2026-07-15T00:00:00Z — Cross-agent session update
+
+- Consolidated DLPack import hardening and Sum/Mean/LogSoftmax/CastLike coverage; merged in the July 15 DLPack and coverage waves.

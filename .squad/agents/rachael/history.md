@@ -61,3 +61,7 @@ Batched-driver DoS hardening is canonical: admission is bounded by `max_pending`
 ## 2026-07-15T01:52:00Z — Session update
 
 - Delivered zero-copy mmap initializer borrowing (`3df84d0`). The later producer-aliasing soundness restriction was landed by Zhora.
+
+## 2026-07-15T00:00:00Z — Cross-agent session update
+
+- Made incomplete graph construction crate-private so full validation follows initializer attachment; merged in loader validation.

@@ -92,3 +92,7 @@ Reviewed Joshi's CPU Identity String rejection and bf16/f16/i32 bit-exact covera
 ## 2026-07-15T01:52:00Z — Session update
 
 - Reviewed Rachael’s zero-copy weight streaming 🟡; a subsequent producer-aliasing gap was corrected by Zhora before final acceptance.
+
+## 2026-07-15T00:00:00Z — Cross-agent session update
+
+- Revised loader validation/inliner behavior and LLM-op shape/kernel fixes; merged across the validation and standard-ops workstreams.

@@ -800,3 +800,36 @@ CHANNEL/AVG results match element-for-element.
 **Why:** `Sinh` is implemented by the CPU coverage wave; `Det` remains unregistered, so the test continues to exercise the actionable unsupported-operation error path.
 
 #### Source: `taffey-unsupported-op-test.md`
+
+
+---
+
+## 2026-07-15 — Ergo API
+
+**What:** The PyO3 `nxrt` extension now exposes `nxrt.load(...)`, callable `InferenceSession`, ordered/keyword/mapping feed dispatch, `Outputs`, tensor-like `NxrtValue`, and input/output-name helpers while preserving ORT-compatible `run()` APIs. Explicit output selections are validated before execution. `bind_outputs` is an immutable, lock-free `BoundSession` proxy whose output subset is passed per call; it never mutates session state, so concurrent threads and async use cannot clobber one another.
+
+**Why:** This adds a convenient, single-artifact API without duplicating feed/DLPack logic or changing compatibility behavior. Up-front output-name errors are actionable, and a per-call proxy is the safe composable alternative to global mutable selection. (Joi, Luv, Gaff; merged `5a8a269`, `5b2d565`, `fdc11b1`.)
+
+## 2026-07-15 — DLPack / GPU interop
+
+**What:** CPU DLPack import borrows contiguous row-major producer buffers with ownership guards, final-commit capsule consumption, checked shape/alignment arithmetic, pointer-identity coverage, and GIL-safe exactly-once foreign deleters; unsupported inputs retain copy fallback. CUDA `kDLCUDA` import/export preserves device ordinal and pointer identity, with stream synchronization on export. Commit validation compares the advertised and capsule **raw** `(device_type, device_id)` before normalization. The runtime explicitly rejects device-resident input or host reads at the current CPU-executor boundary rather than panicking or implying CUDA execution.
+
+**Why:** Zero-copy interop must be safe across Python lifetimes and foreign/untrusted capsules, and a normalized device comparison could silently accept mismatches. CUDA transport is useful now, but full CUDA-session execution remains a separate epic; execution-dependent GPU tests are retained as xfail specifications. (Freysa, Zhora, Zuben, Mariette, Roy; merged `cc50ca1`, `50030fa`, `57843ee`.)
+
+## 2026-07-15 — Loader validation and model legality
+
+**What:** Raw-model legality validation now rejects ambiguous duplicate SSA producers, executable unresolved `ref_attr_name`, invalid low IR versions, empty IR>=3 imports, invalid scope shadows, and unsourced graph outputs, while deliberately excluding lint-only checks. There is no upper IR-version ceiling: future IR versions load unless a concrete unsupported feature requires a gate. Structural graph validation runs only after initializers attach; `build_graph` is crate-private. Model-local `FunctionProto` calls are inlined with recursive attribute binding, lexical scope/capture renaming, globally fresh names, alias identities, sparse-initializer handling, recursion/arity checks, and canonical default-domain opset merging. Custom-only non-empty opset imports are valid; synthesized default-domain identities add one appropriate default import.
+
+**Why:** Validate semantics before IR information is coalesced, but validate the fully assembled graph to avoid rejecting legal initializer-backed values. ONNX evolution is broadly backward compatible, and default-domain spellings `""` and `ai.onnx` must not create duplicate imports. (Hodge, Deckard, Rachael, Sebastian, Wallace, Sapper, Howie; merged `98c6c00`–`051e0a5`.)
+
+## 2026-07-15 — Standard LLM operators
+
+**What:** Standard-domain CPU kernels and aligned shape rules landed for `Gelu` (v20), `RMSNormalization` (v23), `RotaryEmbedding` (v23), and `Swish` (v24). They are f32 reference kernels with exact/tanh GELU, NumPy-style unidirectional RMS scale broadcast, axis validation, RoPE 3D/4D and cache layouts, checked cache-offset arithmetic, position validation, and stable Swish. `Gelu` shape registration begins at v20 rather than v1.
+
+**Why:** Transformer exports need standard ai.onnx primitives with kernel/shape membership kept in lockstep. The follow-up review corrected scale broadcasting, invalid axes, empty/overflowing RoPE accesses, and version registration without changing verified core math. (Joshi, Deckard, Sapper; merged `923c8bd`, `0549e1f`, `9fe94d4`.)
+
+## 2026-07-15 — Opset 17–26 coverage
+
+**What:** CPU coverage added `Split`, `Pad`, `ConstantOfShape`, `Sum`, `Mean`, `LogSoftmax`, `CastLike`, com.microsoft `BiasGelu`, `FastGelu`, `QuickGelu`, `SkipLayerNormalization`, and `SimplifiedLayerNormalization`; fused normalization honors independent absent beta/bias, requested output arity, axis, and inverse-std output. C1 shape rules now cover ArgMax/ArgMin, TopK, Tile, Range, CumSum, GatherND, NonZero, and relevant trig/activation unaries. Float `ShapeData` enables Range inference, with f32 arithmetic intentionally matching the CPU kernel. `Attention` v23/v24 coverage was hardened for overflow-safe scaling, scalar masks, softcap, v24 mode semantics, and `nonpad_kv_seqlen` causal **and** unconditional padding masks. The activation-memory planner also landed as a deterministic, executor-unwired IR planning crate.
+
+**Why:** These C1/C2 dispatch and inference gaps blocked a large conformance wave; shape contracts must match actual kernel/version behavior. The static registration-vs-schema audit alone over-reports stale operators because old kernels can implement later migrations, so kernel↔shape comm-diff is the real gap signal. Numerical and optional-slot fixes preserve spec behavior rather than broadening unsupported types. (Wallace, Zhora, Cotton, Chew, Nandez, Freysa, Deckard, Sapper, Pris, Kaiser; merged through `7c06c39`.)
