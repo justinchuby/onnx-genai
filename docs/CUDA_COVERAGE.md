@@ -58,6 +58,13 @@ not yet wired) · **🔬 custom** (needs a fused NVRTC/CUTLASS kernel).
 |----|--------|--------|---------|-----------------------|
 | `Conv` | `` | ✅ | **cuDNN** | 2-D dense NCHW f32/f16/bf16; strides, dilation, groups, symmetric explicit padding, `VALID`, symmetric `SAME_UPPER`/`SAME_LOWER`, and optional fused channel bias. Asymmetric padding is rejected explicitly. Fused bias+identity forces `CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_PRECOMP_GEMM`; other paths use v7 heuristics and queried workspace. |
 
+### Pooling
+
+| Op | Domain | Status | Backend | Notes / justification |
+|----|--------|--------|---------|-----------------------|
+| `MaxPool` | `` | ✅ | **cuDNN** `cudnnPoolingForward` | 2-D NCHW f32/f16/bf16; kernel, strides, symmetric explicit padding, `VALID`, and symmetric `SAME_UPPER`/`SAME_LOWER`. `ceil_mode=1`, dilated pooling, asymmetric padding, and the optional ONNX Indices output are rejected explicitly. |
+| `AveragePool` | `` | ✅ | **cuDNN** `cudnnPoolingForward` | Same geometry/dtypes; `count_include_pad` maps to cuDNN include/exclude-padding modes. `ceil_mode=1` and asymmetric padding are rejected explicitly. |
+
 ### Elementwise — unary / activations
 
 | Op | Domain | Status | Backend | Notes |
@@ -144,24 +151,24 @@ counts:
 |---------|------:|
 | CPU registry `(domain, op_type)` pairs | **103** |
 | CPU standard-domain (`ai.onnx`) op types | **93** |
-| CUDA registry `(domain, op_type)` pairs | **56** |
-| CUDA advertised op names | **55** |
-| CPU pairs implemented by CUDA in the same domain | **45 / 103** |
-| CPU standard-domain op types implemented by CUDA | **41 / 93** |
+| CUDA registry `(domain, op_type)` pairs | **58** |
+| CUDA advertised op names | **57** |
+| CPU pairs implemented by CUDA in the same domain | **47 / 103** |
+| CPU standard-domain op types implemented by CUDA | **43 / 93** |
 
-The **41 shared `ai.onnx` ops** are: `Abs`, `Add`, `Cast`, `CastLike`, `Ceil`,
-`Clip`, `Cos`, `Div`, `Elu`, `Equal`, `Erf`, `Exp`, `Floor`, `Gemm`,
+The **43 shared `ai.onnx` ops** are: `Abs`, `Add`, `AveragePool`, `Cast`, `CastLike`,
+`Ceil`, `Clip`, `Cos`, `Div`, `Elu`, `Equal`, `Erf`, `Exp`, `Floor`, `Gemm`,
 `HardSigmoid`, `LayerNormalization`, `LeakyRelu`, `Log`, `MatMul`, `Max`, `Min`,
-`Mul`, `Neg`, `Not`, `Pow`, `RMSNormalization`, `Reciprocal`, `ReduceMax`,
+`MaxPool`, `Mul`, `Neg`, `Not`, `Pow`, `RMSNormalization`, `Reciprocal`, `ReduceMax`,
 `ReduceMean`, `ReduceMin`, `ReduceSum`, `Relu`, `Round`, `Sigmoid`, `Sign`,
 `Sin`, `Softmax`, `Softplus`, `Sqrt`, `Sub`, and `Tanh`.
 
-The **52 CPU `ai.onnx` gaps** are: `Acos`, `Acosh`, `ArgMax`, `ArgMin`, `Asin`,
-`Asinh`, `Atan`, `Atanh`, `Attention`, `AveragePool`, `Concat`, `Constant`,
+The **50 CPU `ai.onnx` gaps** are: `Acos`, `Acosh`, `ArgMax`, `ArgMin`, `Asin`,
+`Asinh`, `Atan`, `Atanh`, `Attention`, `Concat`, `Constant`,
 `ConstantOfShape`, `Cosh`, `CumSum`, `DequantizeLinear`,
 `DynamicQuantizeLinear`, `Expand`, `Flatten`, `Gather`, `GatherElements`,
 `GatherND`, `Gelu`, `GlobalAveragePool`, `GlobalMaxPool`, `Identity`,
-`LogSoftmax`, `MaxPool`, `Mean`, `NonZero`, `Pad`, `QuantizeLinear`, `Range`,
+`LogSoftmax`, `Mean`, `NonZero`, `Pad`, `QuantizeLinear`, `Range`,
 `ReduceL2`, `ReduceProd`, `ReduceSumSquare`, `Reshape`, `RotaryEmbedding`,
 `Shape`, `Sinh`, `Size`, `Slice`, `Split`, `Squeeze`, `Sum`, `Swish`, `Tan`,
 `Tile`, `TopK`, `Transpose`, `Unsqueeze`, and `Where`.
@@ -179,7 +186,7 @@ by the CPU EP are `And`, `Conv`, `Greater`, `GreaterOrEqual`, `Less`,
 | Backend | CPU-covered gaps mapped here | Rationale |
 |---------|------------------------------|-----------|
 | **cuBLASLt** | `FusedMatMulBias`, `FusedGemm`; `BiasGelu`/`FastGelu`/`QuickGelu` where expressible as an epilogue | GEMM+bias/activation belongs in the matrix multiply epilogue. |
-| **cuDNN** | `AveragePool`, `MaxPool`, `GlobalAveragePool`, `GlobalMaxPool`, `LogSoftmax`, `ReduceL2`, `ReduceProd`, `ReduceSumSquare` | Vendor-tuned pooling, normalization/softmax, and reduction primitives. |
+| **cuDNN** | `GlobalAveragePool`, `GlobalMaxPool`, `LogSoftmax`, `ReduceL2`, `ReduceProd`, `ReduceSumSquare` | Vendor-tuned pooling, normalization/softmax, and reduction primitives. |
 | **CUTLASS / cuDNN SDPA** | standard `Attention`, `FusedAttention` | Flash/SDPA implementation avoids materialising the O(S²) score tensor. |
 | **cub/thrust via NVRTC (CCCL headers)** | `ArgMax`, `ArgMin`, `TopK`, `CumSum`, `NonZero` | Scan/select/sort/reduction primitives; cudarc has no dlopen-able cub/thrust API. |
 | **NVRTC-custom** | remaining unary math (`Acos`…`Tan`, `Swish`), quantize/dequantize, `Where`, `RotaryEmbedding`, indexed/strided movement (`Gather*`, `Slice`, `Tile`, `Expand`, `Transpose`, `Concat`, `Pad`, `Split`, `Range`) | Pointwise or index-transform work with no suitable runtime library; RoPE is a justified fusion kernel. |
@@ -192,6 +199,10 @@ CUDA 13.0 host; broader performance validation remains separate.
 The cuDNN Conv pass raises the advertised set to **55** op names and is
 GPU-validated for padded f32, grouped/strided f32, padded f16, and numerically checked
 dilated convolution on H200.
+
+The cuDNN pooling pass raises the advertised set to **57** op names and is
+GPU-validated on H200 for 2×2 stride-2 MaxPool in f32/f16 and padded AveragePool
+with both include-padding and exclude-padding divisor modes.
 
 The pointwise dtype/broadcast pass is GPU-validated on H200 for f16 and bf16
 `Add`/`Sub`/`Mul`/`Div`, `[4,1,3]` with `[1,5,3]` NumPy broadcasting, and

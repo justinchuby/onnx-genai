@@ -9,8 +9,8 @@ use std::marker::PhantomData;
 use std::sync::{Arc, Mutex};
 
 use cudarc::cudnn::{
-    ConvBiasActivationForward, ConvForward, Cudnn, CudnnDataType, NoIndices, ReduceTensor,
-    ReductionDescriptor, SoftmaxForward, TensorDescriptor, sys,
+    ConvBiasActivationForward, ConvForward, Cudnn, CudnnDataType, NoIndices, PoolingForward,
+    ReduceTensor, ReductionDescriptor, SoftmaxForward, TensorDescriptor, sys,
 };
 use cudarc::driver::sys::CUdeviceptr;
 use cudarc::driver::{CudaStream, DevicePtr, DevicePtrMut, DeviceSlice, SyncOnDrop};
@@ -97,6 +97,42 @@ pub struct CudnnConvBuffers {
     pub filter_numel: usize,
     pub bias_numel: usize,
     pub output_numel: usize,
+}
+
+/// cuDNN pooling mode selected from the ONNX operator and its attributes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CudnnPoolingMode {
+    Max,
+    AverageIncludePadding,
+    AverageExcludePadding,
+}
+
+impl CudnnPoolingMode {
+    fn as_raw(self) -> sys::cudnnPoolingMode_t {
+        match self {
+            Self::Max => sys::cudnnPoolingMode_t::CUDNN_POOLING_MAX,
+            Self::AverageIncludePadding => {
+                sys::cudnnPoolingMode_t::CUDNN_POOLING_AVERAGE_COUNT_INCLUDE_PADDING
+            }
+            Self::AverageExcludePadding => {
+                sys::cudnnPoolingMode_t::CUDNN_POOLING_AVERAGE_COUNT_EXCLUDE_PADDING
+            }
+        }
+    }
+}
+
+/// Validated 2-D NCHW pooling geometry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CudnnPoolingSpec {
+    pub dtype: CudnnTensorType,
+    pub input_dims: [i32; 4],
+    pub input_strides: [i32; 4],
+    pub output_dims: [i32; 4],
+    pub output_strides: [i32; 4],
+    pub window: [i32; 2],
+    pub pads: [i32; 2],
+    pub strides: [i32; 2],
+    pub mode: CudnnPoolingMode,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -578,6 +614,61 @@ impl CudnnHandle<'_> {
             .map_err(|e| cudnn_err("cudnnConvolutionForward", e))
         }
     }
+
+    /// Execute 2-D NCHW pooling using cuDNN's descriptor-based forward API.
+    pub fn pool2d(&self, spec: &CudnnPoolingSpec, buffers: CudnnBufferPair) -> Result<()> {
+        match spec.dtype {
+            CudnnTensorType::F32 => self.pool2d_t::<f32>(spec, buffers, (1.0f32, 0.0f32)),
+            CudnnTensorType::F16 => {
+                self.pool2d_t::<f16>(spec, buffers, (f16::from_f32(1.0), f16::from_f32(0.0)))
+            }
+            CudnnTensorType::Bf16 => {
+                self.pool2d_t::<bf16>(spec, buffers, (bf16::from_f32(1.0), bf16::from_f32(0.0)))
+            }
+        }
+    }
+
+    fn pool2d_t<T: CudnnDataType + Copy>(
+        &self,
+        spec: &CudnnPoolingSpec,
+        buffers: CudnnBufferPair,
+        scaling: (T, T),
+    ) -> Result<()> {
+        let input = self
+            .handle
+            .create_4d_tensor_ex::<T>(spec.input_dims, spec.input_strides)
+            .map_err(|e| cudnn_err("creating pooling input descriptor", e))?;
+        let output = self
+            .handle
+            .create_4d_tensor_ex::<T>(spec.output_dims, spec.output_strides)
+            .map_err(|e| cudnn_err("creating pooling output descriptor", e))?;
+        let pooling = self
+            .handle
+            .create_poolingnd::<T>(
+                &spec.window,
+                &spec.pads,
+                &spec.strides,
+                spec.mode.as_raw(),
+                sys::cudnnNanPropagation_t::CUDNN_PROPAGATE_NAN,
+            )
+            .map_err(|e| {
+                cudnn_err(
+                    "cudnnCreatePoolingDescriptor / cudnnSetPoolingNdDescriptor",
+                    e,
+                )
+            })?;
+        let op = PoolingForward {
+            pooling: &pooling,
+            x: &input,
+            y: &output,
+        };
+        let input = RawDevice::<T>::new(buffers.input, buffers.input_numel, self.stream.clone());
+        let mut output =
+            RawDevice::<T>::new(buffers.output, buffers.output_numel, self.stream.clone());
+        // SAFETY: the descriptors exactly describe the live EP allocations.
+        unsafe { op.launch(scaling, &input, &mut output) }
+            .map_err(|e| cudnn_err("cudnnPoolingForward", e))
+    }
 }
 
 struct RawDevice<T> {
@@ -813,6 +904,18 @@ mod tests {
         assert_eq!(
             CudnnReduceOp::Average.as_raw(),
             sys::cudnnReduceTensorOp_t::CUDNN_REDUCE_TENSOR_AVG
+        );
+        assert_eq!(
+            CudnnPoolingMode::Max.as_raw(),
+            sys::cudnnPoolingMode_t::CUDNN_POOLING_MAX
+        );
+        assert_eq!(
+            CudnnPoolingMode::AverageIncludePadding.as_raw(),
+            sys::cudnnPoolingMode_t::CUDNN_POOLING_AVERAGE_COUNT_INCLUDE_PADDING
+        );
+        assert_eq!(
+            CudnnPoolingMode::AverageExcludePadding.as_raw(),
+            sys::cudnnPoolingMode_t::CUDNN_POOLING_AVERAGE_COUNT_EXCLUDE_PADDING
         );
     }
 

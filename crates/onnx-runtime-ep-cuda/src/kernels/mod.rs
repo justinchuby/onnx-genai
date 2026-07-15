@@ -30,6 +30,7 @@ pub mod gemm;
 pub mod matmul;
 pub mod normalization;
 pub mod pointwise;
+pub mod pooling;
 pub mod reduce;
 pub mod softmax;
 
@@ -59,6 +60,7 @@ use pointwise::{
 ///   int8-64/uint8-64/bool).
 /// * **Reductions** — cuDNN `ReduceSum`/`ReduceMean` (f32/f16/bf16, f32 NVRTC
 ///   fallback) plus NVRTC `ReduceMax`/`ReduceMin`; arbitrary axes and keepdims.
+/// * **Pooling** — cuDNN `MaxPool`/`AveragePool` for 2-D NCHW f32/f16/bf16.
 /// * **Pointwise unary math** — `Abs`, `Neg`, `Reciprocal`, `Exp`, `Log`,
 ///   `Sign`, `Floor`, `Ceil`, `Round`, `Sin`, `Cos`, `Softplus` (NVRTC
 ///   f32/f16/bf16, formulas matched to the CPU EP `unary_math.rs`).
@@ -72,6 +74,8 @@ pub const CUDA_COVERED_OPS: &[&str] = &[
     "MatMul",
     "Gemm",
     "Conv",
+    "MaxPool",
+    "AveragePool",
     "Relu",
     "Sqrt",
     "Erf",
@@ -152,6 +156,18 @@ pub fn build_cuda_registry(runtime: Arc<CudaRuntime>) -> OpRegistry {
             runtime: runtime.clone(),
         }),
     );
+    for (op_type, kind) in [
+        ("MaxPool", pooling::PoolKind::Max),
+        ("AveragePool", pooling::PoolKind::Average),
+    ] {
+        reg.register(
+            OpKey::new(op_type, "", 1),
+            Box::new(pooling::PoolFactory {
+                kind,
+                runtime: runtime.clone(),
+            }),
+        );
+    }
 
     // Elementwise unary activations (NVRTC f32/f16/bf16 pointwise). `Gelu` is a
     // `com.microsoft` contrib op; the rest are standard-domain.
@@ -450,6 +466,16 @@ mod tests {
             "Softsign",
             "Selu",
         ] {
+            assert!(
+                CUDA_COVERED_OPS.contains(&op),
+                "{op} missing from CUDA_COVERED_OPS"
+            );
+        }
+    }
+
+    #[test]
+    fn cudnn_pooling_ops_are_listed_in_coverage() {
+        for op in ["MaxPool", "AveragePool"] {
             assert!(
                 CUDA_COVERED_OPS.contains(&op),
                 "{op} missing from CUDA_COVERED_OPS"
