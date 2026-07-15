@@ -56,6 +56,12 @@ jobs:
             local crate="$1"
             local version
             local attempt
+            local failures=0
+            local rate_limit_waits=0
+            local retry_after
+            local target
+            local now
+            local wait_s
 
             version="$(crate_version "$crate")"
             if [[ -z "$version" ]]; then
@@ -68,7 +74,8 @@ jobs:
               return
             fi
 
-            for attempt in 1 2 3 4 5 6; do
+            while [[ "$failures" -lt 6 ]]; do
+              attempt=$((failures + 1))
               echo "Publishing $crate $version (attempt $attempt/6)"
               if out="$(cargo publish --locked -p "$crate" 2>&1)"; then
                 echo "$out"
@@ -89,7 +96,34 @@ jobs:
                 return
               fi
 
-              if [[ "$attempt" -lt 6 ]]; then
+              if echo "$out" | grep -qiE "too many|rate.?limit|status 429"; then
+                if [[ "$rate_limit_waits" -ge 6 ]]; then
+                  echo "Failed to publish $crate $version after 6 rate-limit waits." >&2
+                  return 1
+                fi
+                rate_limit_waits=$((rate_limit_waits + 1))
+                retry_after="$(printf '%s' "$out" | sed -n 's/.*try again after \(.*\) and see.*/\1/p' | head -1)"
+                if [[ -z "$retry_after" ]]; then
+                  retry_after="$(printf '%s' "$out" | sed -n 's/.*try again after \([^.]*\)\..*/\1/p' | head -1)"
+                fi
+                target="$(date -u -d "$retry_after" +%s 2>/dev/null || echo 0)"
+                now="$(date -u +%s)"
+                if (( target > now )); then
+                  wait_s=$((target - now + 20))
+                  if (( wait_s > 1800 )); then
+                    wait_s=1800
+                  fi
+                  echo "Rate limited; sleeping ${wait_s}s until ${retry_after} before retrying $crate."
+                else
+                  wait_s=120
+                  echo "Rate limited; could not parse retry time; sleeping ${wait_s}s before retrying $crate."
+                fi
+                sleep "$wait_s"
+                continue
+              fi
+
+              failures=$((failures + 1))
+              if [[ "$failures" -lt 6 ]]; then
                 echo "Publish failed; waiting for the crates.io index before retrying."
                 sleep 30
               fi
