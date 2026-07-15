@@ -68,3 +68,9 @@ environment = { PATH = "$HOME/.cargo/bin:$PATH" }
 # Apple Clang does not bundle OpenMP. Use oneDNN's sequential runtime while
 # retaining its SIMD kernels; nxrt's higher-level Rayon parallelism remains.
 environment = { ONEDNN_CPU_RUNTIME = "SEQ" }
+
+[tool.cibuildwheel.windows]
+# Use the sequential runtime for the first MSVC wheel pass to avoid OpenMP
+# runtime/linker variability. Windows OMP or TBB remains a future optimization;
+# nxrt's higher-level Rayon parallelism still operates across kernels.
+environment = { ONEDNN_CPU_RUNTIME = "SEQ" }

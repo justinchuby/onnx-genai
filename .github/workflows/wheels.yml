@@ -32,7 +32,7 @@ jobs:
           - name: Windows AMD64
             os: windows-latest
             archs: AMD64
-            cibw_config_settings: ""
+            cibw_config_settings: "build-args='--features onednn'"
           # macos-15-intel is GitHub's final hosted Intel runner line.
           - name: macOS x86_64
             os: macos-15-intel
@@ -47,7 +47,7 @@ jobs:
     env:
       CIBW_ARCHS: ${{ matrix.archs }}
       # maturin adds this Cargo feature to [tool.maturin].features (abi3-py310).
-      # The empty Windows value is a no-op, so that wheel keeps default features.
+      # Every CPU wheel bundles the feature-gated oneDNN backend.
       CIBW_CONFIG_SETTINGS: ${{ matrix.cibw_config_settings }}
 
     steps:
