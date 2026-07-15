@@ -25,7 +25,7 @@ pub use epcontext::{
 pub use onnx_runtime_loader::{EpContextDumpConfig, EpContextPartition, Model as EncoderModel};
 pub use error::SessionError;
 pub use executor::{CacheStats, ControlFlowStats};
-pub use tensor::Tensor;
+pub use tensor::{Tensor, cpu_allocator};
 
 mod epcontext;
 mod executor;

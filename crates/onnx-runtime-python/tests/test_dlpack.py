@@ -258,3 +258,181 @@ def test_run_with_values_output_selection_by_name():
     x = np.arange(3, dtype=np.float32)
     (v,) = sess.run_with_values(["Y"], {"X": x})
     np.testing.assert_array_equal(np.from_dlpack(v), x)
+
+
+# --------------------------------------------------------------------------- #
+# Zero-copy IMPORT (feeding inputs): nxrt borrows a DLPack producer's buffer
+# --------------------------------------------------------------------------- #
+
+def _add_bias_model(dtype: int, shape) -> bytes:
+    """``Identity`` is enough to route an input value through to an output."""
+    return _identity_model(dtype, shape)
+
+
+def test_numpy_input_is_imported_and_runs():
+    # numpy ≥ 1.23 arrays expose __dlpack__, so this exercises the zero-copy
+    # import path (falling back to copy only if that path declined).
+    sess = nxrt.InferenceSession(_identity_model(TensorProto.FLOAT, [2, 3]))
+    x = np.arange(6, dtype=np.float32).reshape(2, 3)
+    (y,) = sess.run(None, {"X": x})
+    np.testing.assert_array_equal(y, x)
+
+
+class _DLDevice(ctypes.Structure):
+    _fields_ = [("device_type", ctypes.c_int), ("device_id", ctypes.c_int)]
+
+
+class _DLDataType(ctypes.Structure):
+    _fields_ = [("code", ctypes.c_uint8), ("bits", ctypes.c_uint8), ("lanes", ctypes.c_uint16)]
+
+
+class _DLTensor(ctypes.Structure):
+    _fields_ = [
+        ("data", ctypes.c_void_p),
+        ("device", _DLDevice),
+        ("ndim", ctypes.c_int),
+        ("dtype", _DLDataType),
+        ("shape", ctypes.POINTER(ctypes.c_int64)),
+        ("strides", ctypes.POINTER(ctypes.c_int64)),
+        ("byte_offset", ctypes.c_uint64),
+    ]
+
+
+class _DLManagedTensorVersioned(ctypes.Structure):
+    _fields_ = [
+        ("major", ctypes.c_uint32),
+        ("minor", ctypes.c_uint32),
+        ("manager_ctx", ctypes.c_void_p),
+        ("deleter", ctypes.c_void_p),
+        ("flags", ctypes.c_uint64),
+        ("dl_tensor", _DLTensor),
+    ]
+
+
+_DELETER_FUNC = ctypes.CFUNCTYPE(None, ctypes.POINTER(_DLManagedTensorVersioned))
+_PyCapsule_New = ctypes.pythonapi.PyCapsule_New
+_PyCapsule_New.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p]
+_PyCapsule_New.restype = ctypes.py_object
+
+
+class _NumpyDLPackProducer:
+    """A minimal DLPack producer that borrows a float32 numpy array's buffer.
+
+    Installs a Python deleter that increments ``flag[0]`` so a test can prove
+    nxrt (a) read *this* buffer and (b) took ownership of the managed tensor and
+    called the deleter exactly once — i.e. it borrowed, it did not copy.
+    """
+
+    def __init__(self, arr: np.ndarray, flag: list):
+        assert arr.dtype == np.float32 and arr.flags["C_CONTIGUOUS"]
+        self.arr = arr  # keep the borrowed buffer alive
+        self.flag = flag
+        self._shape = (ctypes.c_int64 * arr.ndim)(*arr.shape)
+
+        def _del(_mptr):
+            flag[0] += 1
+
+        self._del_cb = _DELETER_FUNC(_del)  # keep callback alive
+        m = _DLManagedTensorVersioned()
+        m.major, m.minor = 1, 0
+        m.manager_ctx = None
+        m.deleter = ctypes.cast(self._del_cb, ctypes.c_void_p)
+        m.flags = 0
+        m.dl_tensor.data = arr.ctypes.data
+        m.dl_tensor.device = _DLDevice(K_DL_CPU, 0)
+        m.dl_tensor.ndim = arr.ndim
+        m.dl_tensor.dtype = _DLDataType(2, 32, 1)  # kDLFloat / 32-bit
+        m.dl_tensor.shape = self._shape
+        m.dl_tensor.strides = None  # C-contiguous
+        m.dl_tensor.byte_offset = 0
+        self._m = m  # keep the struct alive until the deleter runs
+
+    def __dlpack_device__(self):
+        return (K_DL_CPU, 0)
+
+    def __dlpack__(self, stream=None, max_version=None, dl_device=None, copy=None):
+        return _PyCapsule_New(ctypes.addressof(self._m), b"dltensor_versioned", None)
+
+
+def test_custom_producer_buffer_is_borrowed_and_deleter_called_once():
+    x = np.array([10.0, 20.0, 30.0, 40.0], dtype=np.float32)
+    flag = [0]
+    prod = _NumpyDLPackProducer(x, flag)
+    sess = nxrt.InferenceSession(_identity_model(TensorProto.FLOAT, [4]))
+    (y,) = sess.run(None, {"X": prod})
+    # nxrt read *our* borrowed buffer (no copy at import).
+    np.testing.assert_array_equal(y, x)
+    gc.collect()
+    # nxrt owned the managed tensor and released it exactly once.
+    assert flag[0] == 1, f"expected one deleter call, got {flag[0]}"
+
+
+def test_borrow_reflects_source_mutation_before_run():
+    # Because nxrt borrows the producer's buffer, mutating it up to the moment
+    # of `run` is visible — a copy taken at import time would not see this.
+    x = np.zeros(4, dtype=np.float32)
+    flag = [0]
+    prod = _NumpyDLPackProducer(x, flag)
+    sess = nxrt.InferenceSession(_identity_model(TensorProto.FLOAT, [4]))
+    x[:] = [1.0, 2.0, 3.0, 4.0]  # mutate the borrowed source before running
+    (y,) = sess.run(None, {"X": prod})
+    np.testing.assert_array_equal(y, [1.0, 2.0, 3.0, 4.0])
+
+
+def test_many_import_drop_cycles_no_double_free():
+    # Shake out the capsule handshake / deleter path: many import+drop cycles
+    # must not crash, leak, or double-free.
+    sess = nxrt.InferenceSession(_identity_model(TensorProto.FLOAT, [3]))
+    for i in range(300):
+        x = np.arange(3, dtype=np.float32) + i
+        flag = [0]
+        prod = _NumpyDLPackProducer(x, flag)
+        (y,) = sess.run(None, {"X": prod})
+        np.testing.assert_array_equal(y, x)
+        gc.collect()
+        assert flag[0] == 1
+
+
+def test_noncontiguous_input_falls_back_to_copy():
+    # A transposed (non-C-contiguous) view is not borrowable; nxrt must fall
+    # back to the copy path and still produce the correct result.
+    base = np.arange(6, dtype=np.float32).reshape(2, 3)
+    xt = base.T  # shape (3, 2), F-contiguous
+    assert not xt.flags["C_CONTIGUOUS"]
+    sess = nxrt.InferenceSession(_identity_model(TensorProto.FLOAT, [3, 2]))
+    (y,) = sess.run(None, {"X": xt})
+    np.testing.assert_array_equal(y, xt)
+
+
+def test_sliced_input_falls_back_to_copy():
+    base = np.arange(12, dtype=np.float32).reshape(3, 4)
+    view = base[:, 1:3]  # non-contiguous slice
+    assert not view.flags["C_CONTIGUOUS"]
+    sess = nxrt.InferenceSession(_identity_model(TensorProto.FLOAT, [3, 2]))
+    (y,) = sess.run(None, {"X": view})
+    np.testing.assert_array_equal(y, view)
+
+
+def test_unsupported_dtype_input_raises_actionable_error():
+    sess = nxrt.InferenceSession(_identity_model(TensorProto.FLOAT, [2]))
+    with pytest.raises((TypeError, ValueError)):
+        sess.run(None, {"X": np.array([1 + 2j, 3 + 4j], dtype=np.complex64)})
+
+
+def test_torch_tensor_input_is_imported_and_runs():
+    torch = pytest.importorskip("torch")
+    x = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+    sess = nxrt.InferenceSession(_identity_model(TensorProto.FLOAT, [2, 3]))
+    (y,) = sess.run(None, {"X": x})
+    np.testing.assert_array_equal(y, x.numpy())
+
+
+def test_torch_input_zero_copy_write_through():
+    # Prove the input borrow aliases torch's storage: mutating the torch tensor
+    # before run is visible in the result.
+    torch = pytest.importorskip("torch")
+    x = torch.zeros(4, dtype=torch.float32)
+    sess = nxrt.InferenceSession(_identity_model(TensorProto.FLOAT, [4]))
+    x[:] = torch.tensor([5.0, 6.0, 7.0, 8.0])
+    (y,) = sess.run(None, {"X": x})
+    np.testing.assert_array_equal(y, [5.0, 6.0, 7.0, 8.0])

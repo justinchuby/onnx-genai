@@ -46,6 +46,16 @@ pub(crate) fn shared_cpu_ep() -> Arc<CpuExecutionProvider> {
     .clone()
 }
 
+/// The shared CPU execution provider as an [`ExecutionProvider`] trait object.
+///
+/// Exposed so callers building a [`Tensor`] from *borrowed* host memory (e.g.
+/// the Python binding's zero-copy DLPack import) can supply the allocator
+/// [`Tensor::from_borrowed_parts_with_guard`] requires. Because a borrowed
+/// buffer is never actually freed by the EP, any CPU provider suffices.
+pub fn cpu_allocator() -> Arc<dyn ExecutionProvider> {
+    shared_cpu_ep()
+}
+
 /// Borrow the raw bytes of a host-accessible device buffer.
 ///
 /// # Safety
@@ -118,6 +128,17 @@ pub struct Tensor {
     buffer: Option<DeviceBuffer>,
     /// The EP that allocated [`Tensor::buffer`] and must deallocate it.
     allocator: Arc<dyn ExecutionProvider>,
+    /// Optional opaque guard that owns *foreign* memory this tensor merely
+    /// borrows (e.g. a DLPack `DLManagedTensor` imported zero-copy). It is
+    /// `None` for every tensor that owns its own allocation. When present,
+    /// [`Tensor::buffer`] is a **borrowed** [`DeviceBuffer`] aliasing memory the
+    /// guard is responsible for releasing; the guard's own `Drop` runs the
+    /// foreign deleter exactly once. [`Drop`] takes it **after** the buffer is
+    /// deallocated (a no-op for borrowed buffers) so the memory is never freed
+    /// while the buffer still aliases it. The concrete type lives in the caller
+    /// crate (the Python binding) — this crate only stores and drops it, so it
+    /// stays free of DLPack ABI knowledge.
+    import_guard: Option<Box<dyn core::any::Any + Send + Sync>>,
 }
 
 impl Tensor {
@@ -150,6 +171,7 @@ impl Tensor {
             device: buffer.device(),
             buffer: Some(buffer),
             allocator,
+            import_guard: None,
         })
     }
 
@@ -179,6 +201,53 @@ impl Tensor {
     /// The device this tensor lives on.
     pub fn device(&self) -> DeviceId {
         self.device
+    }
+
+    /// Wrap **foreign, borrowed** memory in a `Tensor`, with an opaque `guard`
+    /// that releases the foreign allocation when the tensor is dropped.
+    ///
+    /// This is the zero-copy *import* constructor: `buffer` must be a
+    /// **borrowed** [`DeviceBuffer`] (built via
+    /// [`DeviceBuffer::from_borrowed_parts`]) aliasing memory owned by whatever
+    /// `guard` boxes up — for a DLPack import, `guard` owns the foreign
+    /// `DLManagedTensor` and its `Drop` calls that tensor's `deleter` exactly
+    /// once. Because the buffer is borrowed, the owning EP's `deallocate` is a
+    /// no-op for it, so the *only* thing that frees the aliased memory is the
+    /// guard.
+    ///
+    /// # Ordering invariant
+    ///
+    /// [`Drop`] deallocates `buffer` (a no-op for a borrowed buffer) and only
+    /// **then** drops the guard, so the guard's deleter never runs while the
+    /// buffer still aliases the foreign memory. Do not rely on the guard freeing
+    /// anything the buffer still points at before `drop` completes.
+    ///
+    /// # Panics
+    ///
+    /// Panics (debug builds) if `buffer` is not borrowed — an owned buffer here
+    /// would be double-freed (once by the EP, once by the guard).
+    pub fn from_borrowed_parts_with_guard(
+        allocator: Arc<dyn ExecutionProvider>,
+        dtype: DataType,
+        shape: Vec<usize>,
+        layout: TensorLayout,
+        buffer: DeviceBuffer,
+        guard: Box<dyn core::any::Any + Send + Sync>,
+    ) -> Self {
+        debug_assert!(
+            buffer.is_borrowed(),
+            "from_borrowed_parts_with_guard requires a borrowed DeviceBuffer; \
+             an owned buffer would be freed twice (EP deallocate + guard)"
+        );
+        Self {
+            dtype,
+            shape,
+            layout,
+            device: buffer.device(),
+            buffer: Some(buffer),
+            allocator,
+            import_guard: Some(guard),
+        }
     }
 
     /// Number of elements.
@@ -266,5 +335,59 @@ impl Drop for Tensor {
             // double-frees.
             let _ = self.allocator.deallocate(buffer);
         }
+        // Release any foreign (DLPack-imported) allocation *after* the buffer
+        // aliasing it has been handed back to the EP. For a borrowed buffer the
+        // `deallocate` above is a no-op, so this guard's `Drop` (which runs the
+        // foreign deleter) is the sole owner that frees the memory — and it must
+        // run last, once the buffer no longer aliases it. `None` for tensors
+        // that own their allocation.
+        let _ = self.import_guard.take();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::raw::c_void;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A guard whose `Drop` bumps a shared counter — stands in for the DLPack
+    /// deleter the Python binding boxes into an imported tensor.
+    struct CountingGuard(Arc<AtomicUsize>);
+    impl Drop for CountingGuard {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn borrowed_guard_ctor_runs_guard_exactly_once_on_drop() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        // Some real host memory the borrowed buffer can alias.
+        let mut backing = [1.0f32, 2.0, 3.0, 4.0];
+        let ptr = backing.as_mut_ptr() as *mut c_void;
+        // SAFETY: `backing` outlives the tensor built below; 16 bytes, 4-aligned.
+        let buffer = unsafe {
+            DeviceBuffer::from_borrowed_parts(ptr, DeviceId::cpu(), backing.len() * 4, 4)
+        };
+        assert!(buffer.is_borrowed());
+
+        let guard = Box::new(CountingGuard(drops.clone()));
+        let tensor = Tensor::from_borrowed_parts_with_guard(
+            shared_cpu_ep(),
+            DataType::Float32,
+            vec![4],
+            TensorLayout::contiguous(),
+            buffer,
+            guard,
+        );
+
+        // The tensor aliases the backing store without copying it.
+        assert_eq!(tensor.as_bytes().len(), 16);
+        assert_eq!(tensor.to_vec_f32(), vec![1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(drops.load(Ordering::SeqCst), 0, "guard alive while tensor is");
+
+        drop(tensor);
+        assert_eq!(drops.load(Ordering::SeqCst), 1, "guard runs exactly once on drop");
     }
 }

@@ -1961,6 +1961,7 @@ name = "onnx-runtime-python"
 version = "0.1.0-dev.1"
 dependencies = [
  "onnx-runtime-dlpack",
+ "onnx-runtime-ep-api",
  "onnx-runtime-ep-cpu",
  "onnx-runtime-ep-cuda",
  "onnx-runtime-ir",

@@ -447,6 +447,201 @@ pub unsafe fn release_versioned(managed: *mut DLManagedTensorVersioned) {
     }
 }
 
+// ── Import side ────────────────────────────────────────────────────────────
+//
+// The mirror of the export path: given a *foreign* `*mut DLManagedTensor` a
+// producer handed us (via a `"dltensor"` PyCapsule, say), read its fields
+// without copying and take ownership of its `deleter` so we free the borrowed
+// allocation exactly once when we are done. The capsule-name handshake that
+// guards against a double free lives in the consumer (the Python binding); this
+// crate only provides the ABI-level field reads and the single-call deleter
+// guard, staying PyO3-free.
+
+/// A borrowed, non-owning read of a foreign [`DLTensor`]'s fields.
+///
+/// All pointers alias the producer's memory; the struct copies only the small
+/// scalar header fields and borrows the `shape`/`strides` arrays as slices tied
+/// to the lifetime of the managed tensor the view was read from. It carries no
+/// ownership — freeing the backing allocation is the job of a
+/// [`ManagedTensorOwner`] built from the same pointer.
+#[derive(Clone, Copy, Debug)]
+pub struct BorrowedDlpack<'a> {
+    /// Base pointer of the allocation (element origin is `data + byte_offset`).
+    pub data: *mut c_void,
+    /// Where the memory lives.
+    pub device: DLDevice,
+    /// Element type.
+    pub dtype: DLDataType,
+    /// Number of dimensions.
+    pub ndim: i32,
+    /// Shape entries (`ndim` of them).
+    pub shape: &'a [i64],
+    /// Element-count strides, or `None` for row-major contiguous.
+    pub strides: Option<&'a [i64]>,
+    /// Byte offset from `data` to the first element.
+    pub byte_offset: u64,
+}
+
+/// Read the fields of a foreign [`DLManagedTensor`] into a [`BorrowedDlpack`]
+/// **without copying** the payload.
+///
+/// # Safety
+///
+/// `managed` must be a live, non-null pointer to a well-formed
+/// [`DLManagedTensor`] whose `dl_tensor.shape` (and, when non-null,
+/// `dl_tensor.strides`) point to at least `ndim` valid `i64` entries. The
+/// returned slices borrow that producer memory, so the caller must keep the
+/// managed tensor alive for the borrow's lifetime `'a`.
+pub unsafe fn borrowed_view<'a>(managed: *const DLManagedTensor) -> BorrowedDlpack<'a> {
+    // SAFETY: caller guarantees `managed` is live and well-formed; we read the
+    // interior `dl_tensor` and reconstitute the shape/stride slices from its
+    // pointers + `ndim`, which the caller guarantees are valid for `ndim`.
+    unsafe {
+        let t = &(*managed).dl_tensor;
+        borrowed_view_from_tensor(t)
+    }
+}
+
+/// Versioned analogue of [`borrowed_view`].
+///
+/// # Safety
+///
+/// As [`borrowed_view`], but `managed` points to a [`DLManagedTensorVersioned`].
+pub unsafe fn borrowed_view_versioned<'a>(
+    managed: *const DLManagedTensorVersioned,
+) -> BorrowedDlpack<'a> {
+    // SAFETY: caller guarantees `managed` is live and well-formed.
+    unsafe {
+        let t = &(*managed).dl_tensor;
+        borrowed_view_from_tensor(t)
+    }
+}
+
+/// Shared field-read for both managed-tensor flavours.
+///
+/// # Safety
+///
+/// `t` must point to a live [`DLTensor`] whose `shape`/`strides` obey the
+/// invariants documented on [`borrowed_view`].
+unsafe fn borrowed_view_from_tensor<'a>(t: &DLTensor) -> BorrowedDlpack<'a> {
+    let ndim = t.ndim;
+    let n = if ndim > 0 { ndim as usize } else { 0 };
+    // SAFETY: caller guarantees `shape` covers `ndim` entries; `n == 0` yields
+    // an empty slice from a possibly-null pointer, which `from_raw_parts`
+    // permits only for a non-null dangling pointer — so guard the empty case.
+    let shape: &[i64] = if n == 0 || t.shape.is_null() {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(t.shape, n) }
+    };
+    let strides: Option<&[i64]> = if t.strides.is_null() || n == 0 {
+        None
+    } else {
+        // SAFETY: non-null strides cover `ndim` entries per the DLPack ABI.
+        Some(unsafe { std::slice::from_raw_parts(t.strides, n) })
+    };
+    BorrowedDlpack {
+        data: t.data,
+        device: t.device,
+        dtype: t.dtype,
+        ndim,
+        shape,
+        strides,
+        byte_offset: t.byte_offset,
+    }
+}
+
+/// Single-call owner of a *foreign* [`DLManagedTensor`]: on drop it invokes the
+/// producer's `deleter` exactly once, releasing the borrowed allocation.
+///
+/// A consumer that has committed to the DLPack import handshake (taken the
+/// `DLManagedTensor*` out of a `"dltensor"` capsule and renamed the capsule to
+/// `"used_dltensor"`) builds one of these to become the sole party responsible
+/// for the deleter. Dropping it — typically as the `import_guard` inside a
+/// higher-level tensor — is what frees the memory the imported view borrowed.
+pub struct ManagedTensorOwner {
+    managed: *mut DLManagedTensor,
+}
+
+// SAFETY: `ManagedTensorOwner` is just a raw pointer whose only use is calling
+// the producer's `deleter` once on drop. DLPack requires the deleter be callable
+// from whichever thread ends up owning the tensor; nxrt only ever moves the
+// owner into a `Tensor` and drops it single-threaded, and never dereferences the
+// aliased payload through this type. Moving the raw pointer across threads is
+// therefore sound.
+unsafe impl Send for ManagedTensorOwner {}
+// SAFETY: the only shared (`&self`) operation is `as_ptr`, which copies the
+// pointer value without dereferencing it — no interior mutability, no data race.
+// The single deleter call happens in `Drop`, which has exclusive `&mut self`.
+// Sharing a reference across threads is thus sound. `Sync` is required so a
+// `Tensor` holding this guard stays `Sync` (the Python `NxrtValue` pyclass needs
+// it).
+unsafe impl Sync for ManagedTensorOwner {}
+
+impl ManagedTensorOwner {
+    /// Take ownership of a foreign managed tensor's `deleter`.
+    ///
+    /// # Safety
+    ///
+    /// `managed` must be a live, non-null `*mut DLManagedTensor` whose `deleter`
+    /// has **not** run and for which this owner is the *sole* party that will
+    /// ever call it (the capsule rename in the DLPack handshake establishes
+    /// this). Calling `new` twice for the same pointer, or building an owner for
+    /// a capsule still named `"dltensor"` that Python may also finalize, would
+    /// double-free.
+    pub unsafe fn new(managed: *mut DLManagedTensor) -> Self {
+        Self { managed }
+    }
+
+    /// The managed pointer this owner will delete (for reading fields before
+    /// drop). Borrowing it does not transfer ownership.
+    pub fn as_ptr(&self) -> *mut DLManagedTensor {
+        self.managed
+    }
+}
+
+impl Drop for ManagedTensorOwner {
+    fn drop(&mut self) {
+        // SAFETY: by `new`'s contract we are the sole owner of a live, not-yet-
+        // deleted managed tensor, so calling its deleter here runs it exactly
+        // once. `release` null-checks and no-ops a null deleter.
+        unsafe { release(self.managed) }
+    }
+}
+
+/// Versioned analogue of [`ManagedTensorOwner`].
+pub struct ManagedTensorVersionedOwner {
+    managed: *mut DLManagedTensorVersioned,
+}
+
+// SAFETY: identical reasoning to `ManagedTensorOwner`'s `Send` impl.
+unsafe impl Send for ManagedTensorVersionedOwner {}
+// SAFETY: identical reasoning to `ManagedTensorOwner`'s `Sync` impl.
+unsafe impl Sync for ManagedTensorVersionedOwner {}
+
+impl ManagedTensorVersionedOwner {
+    /// Take ownership of a foreign *versioned* managed tensor's `deleter`.
+    ///
+    /// # Safety
+    ///
+    /// As [`ManagedTensorOwner::new`], for a `*mut DLManagedTensorVersioned`.
+    pub unsafe fn new(managed: *mut DLManagedTensorVersioned) -> Self {
+        Self { managed }
+    }
+
+    /// The versioned managed pointer this owner will delete.
+    pub fn as_ptr(&self) -> *mut DLManagedTensorVersioned {
+        self.managed
+    }
+}
+
+impl Drop for ManagedTensorVersionedOwner {
+    fn drop(&mut self) {
+        // SAFETY: sole owner of a live, not-yet-deleted versioned tensor.
+        unsafe { release_versioned(self.managed) }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -648,5 +843,145 @@ mod tests {
             assert_eq!((*managed).flags & DLPACK_FLAG_BITMASK_READ_ONLY, DLPACK_FLAG_BITMASK_READ_ONLY);
             release_versioned(managed);
         }
+    }
+
+    // ── Import-side tests ──────────────────────────────────────────────────
+
+    /// A fake foreign producer: a boxed backing buffer + shape whose `deleter`
+    /// increments a static counter, so we can prove the import owner calls it
+    /// exactly once.
+    struct FakeProducer {
+        _backing: Vec<u8>,
+        shape: Vec<i64>,
+    }
+
+    static IMPORT_DROPS: AtomicUsize = AtomicUsize::new(0);
+
+    unsafe extern "C" fn fake_deleter(managed: *mut DLManagedTensor) {
+        if managed.is_null() {
+            return;
+        }
+        // SAFETY: `manager_ctx` is the `Box::into_raw(FakeProducer)` we stored
+        // in `make_fake_managed`; rebox + drop frees it exactly once.
+        unsafe {
+            let ctx = (*managed).manager_ctx as *mut FakeProducer;
+            if !ctx.is_null() {
+                drop(Box::from_raw(ctx));
+            }
+            // The managed tensor header itself is a separate leaked box.
+            drop(Box::from_raw(managed));
+        }
+        IMPORT_DROPS.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Build a heap `*mut DLManagedTensor` that mimics what torch/numpy hand us.
+    fn make_fake_managed(shape: Vec<i64>) -> *mut DLManagedTensor {
+        let numel: usize = shape.iter().map(|&d| d as usize).product();
+        let mut producer = Box::new(FakeProducer { _backing: vec![0u8; numel * 4], shape });
+        let data = producer._backing.as_mut_ptr() as *mut c_void;
+        let shape_ptr = producer.shape.as_mut_ptr();
+        let ndim = producer.shape.len() as i32;
+        let ctx = Box::into_raw(producer);
+        let managed = Box::new(DLManagedTensor {
+            dl_tensor: DLTensor {
+                data,
+                device: DLDevice { device_type: DL_CPU, device_id: 0 },
+                ndim,
+                dtype: DLDataType { code: DL_FLOAT, bits: 32, lanes: 1 },
+                shape: shape_ptr,
+                strides: std::ptr::null_mut(),
+                byte_offset: 0,
+            },
+            manager_ctx: ctx as *mut c_void,
+            deleter: Some(fake_deleter),
+        });
+        Box::into_raw(managed)
+    }
+
+    #[test]
+    fn borrowed_view_reads_fields() {
+        let managed = make_fake_managed(vec![2, 3]);
+        // SAFETY: `managed` is a live fake we just built; freed via the owner.
+        unsafe {
+            let view = borrowed_view(managed);
+            assert_eq!(view.ndim, 2);
+            assert_eq!(view.shape, &[2, 3]);
+            assert!(view.strides.is_none(), "null strides read as contiguous");
+            assert_eq!(view.device.device_type, DL_CPU);
+            assert_eq!(view.dtype.code, DL_FLOAT);
+            assert_eq!(view.dtype.bits, 32);
+            assert_eq!(view.byte_offset, 0);
+            assert!(!view.data.is_null());
+            // Consume it to run the deleter.
+            let _owner = ManagedTensorOwner::new(managed);
+        }
+    }
+
+    #[test]
+    fn owner_calls_foreign_deleter_exactly_once() {
+        IMPORT_DROPS.store(0, Ordering::SeqCst);
+        let managed = make_fake_managed(vec![4]);
+        // SAFETY: single owner of a live fake managed tensor.
+        let owner = unsafe { ManagedTensorOwner::new(managed) };
+        assert_eq!(IMPORT_DROPS.load(Ordering::SeqCst), 0);
+        drop(owner);
+        assert_eq!(IMPORT_DROPS.load(Ordering::SeqCst), 1, "deleter ran once");
+    }
+
+    static IMPORT_DROPS_V: AtomicUsize = AtomicUsize::new(0);
+
+    unsafe extern "C" fn fake_deleter_versioned(managed: *mut DLManagedTensorVersioned) {
+        if managed.is_null() {
+            return;
+        }
+        // SAFETY: mirror of `fake_deleter` for the versioned header.
+        unsafe {
+            let ctx = (*managed).manager_ctx as *mut FakeProducer;
+            if !ctx.is_null() {
+                drop(Box::from_raw(ctx));
+            }
+            drop(Box::from_raw(managed));
+        }
+        IMPORT_DROPS_V.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn make_fake_managed_versioned(shape: Vec<i64>) -> *mut DLManagedTensorVersioned {
+        let numel: usize = shape.iter().map(|&d| d as usize).product();
+        let mut producer = Box::new(FakeProducer { _backing: vec![0u8; numel * 4], shape });
+        let data = producer._backing.as_mut_ptr() as *mut c_void;
+        let shape_ptr = producer.shape.as_mut_ptr();
+        let ndim = producer.shape.len() as i32;
+        let ctx = Box::into_raw(producer);
+        let managed = Box::new(DLManagedTensorVersioned {
+            version: DLPackVersion { major: DLPACK_MAJOR_VERSION, minor: DLPACK_MINOR_VERSION },
+            manager_ctx: ctx as *mut c_void,
+            deleter: Some(fake_deleter_versioned),
+            flags: 0,
+            dl_tensor: DLTensor {
+                data,
+                device: DLDevice { device_type: DL_CPU, device_id: 0 },
+                ndim,
+                dtype: DLDataType { code: DL_FLOAT, bits: 32, lanes: 1 },
+                shape: shape_ptr,
+                strides: std::ptr::null_mut(),
+                byte_offset: 0,
+            },
+        });
+        Box::into_raw(managed)
+    }
+
+    #[test]
+    fn versioned_owner_calls_foreign_deleter_exactly_once() {
+        IMPORT_DROPS_V.store(0, Ordering::SeqCst);
+        let managed = make_fake_managed_versioned(vec![2, 2]);
+        // SAFETY: live versioned fake; read fields then own + drop.
+        unsafe {
+            let view = borrowed_view_versioned(managed);
+            assert_eq!(view.shape, &[2, 2]);
+            let owner = ManagedTensorVersionedOwner::new(managed);
+            assert_eq!(IMPORT_DROPS_V.load(Ordering::SeqCst), 0);
+            drop(owner);
+        }
+        assert_eq!(IMPORT_DROPS_V.load(Ordering::SeqCst), 1, "versioned deleter ran once");
     }
 }

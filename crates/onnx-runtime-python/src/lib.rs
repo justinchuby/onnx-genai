@@ -401,7 +401,15 @@ impl InferenceSession {
                     "unknown input {name:?} in input_feed. Model inputs are: {known:?}"
                 )));
             }
-            let tensor = numpy_to_tensor(py, np, &name, &value)?;
+            // Prefer a zero-copy DLPack borrow when the value exposes the
+            // producer protocol (torch.Tensor, numpy ≥ 1.23, …) and lives on a
+            // CPU, contiguous buffer; otherwise fall back to the numpy copy
+            // path. This keeps `run()`/`run_with_values()` transparently
+            // zero-copy for supported inputs without changing their contract.
+            let tensor = match dlpack::tensor_from_dlpack(py, &value)? {
+                Some(t) => t,
+                None => numpy_to_tensor(py, np, &name, &value)?,
+            };
             owned.push((name, tensor));
         }
 

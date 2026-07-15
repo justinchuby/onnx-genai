@@ -22,6 +22,7 @@ crate-type = ["cdylib"]
 [dependencies]
 onnx-runtime-session = { workspace = true }
 onnx-runtime-ep-cpu = { workspace = true }
+onnx-runtime-ep-api = { workspace = true }
 onnx-runtime-ir = { workspace = true }
 onnx-runtime-dlpack = { workspace = true }
 # Optional CUDA execution provider, gated behind the `cuda` feature so the
