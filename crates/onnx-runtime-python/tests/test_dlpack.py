@@ -11,6 +11,7 @@ when those packages are absent.
 
 from __future__ import annotations
 
+import ctypes
 import gc
 
 import numpy as np
@@ -81,6 +82,52 @@ def test_mutating_numpy_view_writes_through_in_place():
     arr[0, 0] = 12345.0
     # .numpy() copies *from the same underlying buffer*, so the write is visible.
     assert v.numpy()[0, 0] == 12345.0
+
+
+def test_zero_element_dlpack_exports_null_data():
+    """DLPack requires NULL data even though nxrt allocates a non-empty buffer."""
+
+    class DLDevice(ctypes.Structure):
+        _fields_ = [("device_type", ctypes.c_int), ("device_id", ctypes.c_int)]
+
+    class DLDataType(ctypes.Structure):
+        _fields_ = [
+            ("code", ctypes.c_uint8),
+            ("bits", ctypes.c_uint8),
+            ("lanes", ctypes.c_uint16),
+        ]
+
+    class DLTensor(ctypes.Structure):
+        _fields_ = [
+            ("data", ctypes.c_void_p),
+            ("device", DLDevice),
+            ("ndim", ctypes.c_int),
+            ("dtype", DLDataType),
+            ("shape", ctypes.POINTER(ctypes.c_int64)),
+            ("strides", ctypes.POINTER(ctypes.c_int64)),
+            ("byte_offset", ctypes.c_uint64),
+        ]
+
+    class DLManagedTensorVersioned(ctypes.Structure):
+        _fields_ = [
+            ("major", ctypes.c_uint32),
+            ("minor", ctypes.c_uint32),
+            ("manager_ctx", ctypes.c_void_p),
+            ("deleter", ctypes.c_void_p),
+            ("flags", ctypes.c_uint64),
+            ("dl_tensor", DLTensor),
+        ]
+
+    v = _run_value(TensorProto.FLOAT, [0, 3], np.empty((0, 3), dtype=np.float32))
+    capsule = v.__dlpack__(max_version=(1, 0))
+    get_pointer = ctypes.pythonapi.PyCapsule_GetPointer
+    get_pointer.argtypes = [ctypes.py_object, ctypes.c_char_p]
+    get_pointer.restype = ctypes.c_void_p
+    managed = ctypes.cast(
+        get_pointer(capsule, b"dltensor_versioned"),
+        ctypes.POINTER(DLManagedTensorVersioned),
+    )
+    assert managed.contents.dl_tensor.data is None
 
 
 # --------------------------------------------------------------------------- #

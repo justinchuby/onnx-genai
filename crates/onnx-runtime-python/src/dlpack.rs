@@ -224,6 +224,10 @@ impl NxrtValue {
     ///   the writable flag, so the borrowed array is mutable in place; otherwise
     ///   it falls back to the universally-consumed unversioned `DLManagedTensor`
     ///   (`"dltensor"`), which some importers surface as read-only.
+    ///
+    /// The returned view aliases this tensor's storage: consumer writes are
+    /// visible in place by design. A DLPack read-only flag could be offered as a
+    /// future opt-in, but this export remains writable.
     #[pyo3(signature = (stream=None, max_version=None, dl_device=None, copy=None))]
     fn __dlpack__(
         &self,
@@ -281,23 +285,31 @@ impl NxrtValue {
         // into the exporter below keeps this address valid for the capsule's
         // life, independent of this `NxrtValue`.
         let keep_alive = self.tensor.clone();
-        let data = keep_alive.as_bytes().as_ptr() as *mut c_void;
+        let data = if keep_alive.numel() == 0 {
+            std::ptr::null_mut()
+        } else {
+            keep_alive.as_bytes().as_ptr() as *mut c_void
+        };
         let shape: Vec<i64> = keep_alive.shape.iter().map(|&d| d as i64).collect();
 
         if use_versioned {
             // Row-major contiguous → empty strides → null strides. `read_only =
             // false`: nxrt owns a writable host buffer and hands out a genuine
             // mutable borrow.
-            let managed = onnx_runtime_dlpack::export_versioned(
-                Box::new(keep_alive),
-                data,
-                device,
-                dtype,
-                shape,
-                Vec::new(),
-                0,
-                false,
-            );
+            // SAFETY: the Arc moved into `keep_alive` owns `data`'s allocation
+            // through the managed tensor's deleter; shape/strides describe it.
+            let managed = unsafe {
+                onnx_runtime_dlpack::export_versioned(
+                    Box::new(keep_alive),
+                    data,
+                    device,
+                    dtype,
+                    shape,
+                    Vec::new(),
+                    0,
+                    false,
+                )
+            };
             // SAFETY: `managed` is a live versioned export pointer; the name is
             // NUL-terminated; the destructor matches the capsule ABI and only
             // runs on capsules of this exact shape. On creation failure Python
@@ -320,15 +332,19 @@ impl NxrtValue {
         // Unversioned fallback: wrap the raw `DLManagedTensor*` in a `"dltensor"`
         // PyCapsule. The capsule's stored pointer IS the `DLManagedTensor*` (not
         // a pointer to it), as consumers require.
-        let managed = onnx_runtime_dlpack::export(
-            Box::new(keep_alive),
-            data,
-            device,
-            dtype,
-            shape,
-            Vec::new(),
-            0,
-        );
+        // SAFETY: the Arc moved into `keep_alive` owns `data`'s allocation
+        // through the managed tensor's deleter; shape/strides describe it.
+        let managed = unsafe {
+            onnx_runtime_dlpack::export(
+                Box::new(keep_alive),
+                data,
+                device,
+                dtype,
+                shape,
+                Vec::new(),
+                0,
+            )
+        };
 
         // SAFETY: `managed` is a live export pointer we just created; `DLTENSOR`
         // is a valid NUL-terminated name; `dlpack_capsule_destructor` matches

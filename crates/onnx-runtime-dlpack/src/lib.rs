@@ -27,6 +27,11 @@
 //! `byte_offset`, element-count `strides` (`i64`, negative allowed), `device`,
 //! `dtype` — so export is a field-wise shim, never a copy.
 
+#[cfg(target_endian = "big")]
+compile_error!(
+    "onnx-runtime-dlpack export assumes little-endian byte storage; big-endian targets need a native-endian conversion"
+);
+
 use std::any::Any;
 use std::ffi::c_void;
 
@@ -212,10 +217,20 @@ unsafe extern "C" fn owner_deleter(managed: *mut DLManagedTensor) {
 /// via the DLPack protocol; if it is never consumed, the caller must invoke the
 /// tensor's `deleter` (see [`release`]) to avoid a leak.
 ///
+/// # Safety
+///
+/// The caller must guarantee that `data` plus `byte_offset` points to a valid
+/// allocation of the described `shape` and `dtype`, and that allocation remains
+/// alive until the returned manager's `deleter` runs. Moving the allocation's
+/// owner into `keep_alive` typically provides this guarantee. `shape.len()` must
+/// equal the exported `ndim`; if `strides` is non-empty, it must contain exactly
+/// one stride per shape dimension.
+///
 /// # Panics
 ///
-/// Never. All pointer setup is internal and the inputs are moved, not aliased.
-pub fn export(
+/// Panics if `shape.len()` does not fit DLPack's `i32` `ndim`, or if non-empty
+/// `strides` does not have one entry per shape dimension.
+pub unsafe fn export(
     keep_alive: Box<dyn Any + Send>,
     data: *mut c_void,
     device: DLDevice,
@@ -224,7 +239,18 @@ pub fn export(
     strides: Vec<i64>,
     byte_offset: u64,
 ) -> *mut DLManagedTensor {
-    let ndim = shape.len() as i32;
+    assert!(
+        i32::try_from(shape.len()).is_ok(),
+        "DLPack ndim exceeds i32::MAX: {}",
+        shape.len()
+    );
+    assert!(
+        strides.is_empty() || strides.len() == shape.len(),
+        "DLPack strides length ({}) must equal shape length ({})",
+        strides.len(),
+        shape.len()
+    );
+    let ndim = i32::try_from(shape.len()).expect("shape length was validated above");
     let mut owner = Box::new(ManagedOwner {
         _keep_alive: keep_alive,
         shape,
@@ -328,8 +354,22 @@ unsafe extern "C" fn owner_deleter_versioned(managed: *mut DLManagedTensorVersio
 /// versioned struct so `flags` can be carried. `read_only` sets
 /// [`DLPACK_FLAG_BITMASK_READ_ONLY`]; pass `false` to let consumers import the
 /// buffer as writable (the whole point of a mutable zero-copy borrow).
+///
+/// # Safety
+///
+/// The caller must guarantee that `data` plus `byte_offset` points to a valid
+/// allocation of the described `shape` and `dtype`, and that allocation remains
+/// alive until the returned manager's `deleter` runs. Moving the allocation's
+/// owner into `keep_alive` typically provides this guarantee. `shape.len()` must
+/// equal the exported `ndim`; if `strides` is non-empty, it must contain exactly
+/// one stride per shape dimension.
+///
+/// # Panics
+///
+/// Panics if `shape.len()` does not fit DLPack's `i32` `ndim`, or if non-empty
+/// `strides` does not have one entry per shape dimension.
 #[allow(clippy::too_many_arguments)] // mirrors the DLPack field set 1:1; grouping into a struct would only obscure it
-pub fn export_versioned(
+pub unsafe fn export_versioned(
     keep_alive: Box<dyn Any + Send>,
     data: *mut c_void,
     device: DLDevice,
@@ -339,7 +379,18 @@ pub fn export_versioned(
     byte_offset: u64,
     read_only: bool,
 ) -> *mut DLManagedTensorVersioned {
-    let ndim = shape.len() as i32;
+    assert!(
+        i32::try_from(shape.len()).is_ok(),
+        "DLPack ndim exceeds i32::MAX: {}",
+        shape.len()
+    );
+    assert!(
+        strides.is_empty() || strides.len() == shape.len(),
+        "DLPack strides length ({}) must equal shape length ({})",
+        strides.len(),
+        shape.len()
+    );
+    let ndim = i32::try_from(shape.len()).expect("shape length was validated above");
     let flags = if read_only { DLPACK_FLAG_BITMASK_READ_ONLY } else { 0 };
     let mut owner = Box::new(ManagedOwnerVersioned {
         _keep_alive: keep_alive,
@@ -437,15 +488,18 @@ mod tests {
     fn export_sets_fields_and_interior_pointers() {
         let mut data = [1u8, 2, 3, 4];
         let ptr = data.as_mut_ptr() as *mut c_void;
-        let managed = export(
-            Box::new(()),
-            ptr,
-            DLDevice { device_type: DL_CPU, device_id: 0 },
-            DLDataType { code: DL_UINT, bits: 8, lanes: 1 },
-            vec![2, 2],
-            vec![],
-            0,
-        );
+        // SAFETY: `data` remains live until `release` below.
+        let managed = unsafe {
+            export(
+                Box::new(()),
+                ptr,
+                DLDevice { device_type: DL_CPU, device_id: 0 },
+                DLDataType { code: DL_UINT, bits: 8, lanes: 1 },
+                vec![2, 2],
+                vec![],
+                0,
+            )
+        };
         // SAFETY: `managed` is the just-returned live export pointer.
         unsafe {
             let t = &(*managed).dl_tensor;
@@ -473,15 +527,18 @@ mod tests {
         // Arc so we can observe strong count going to zero on deletion.
         let owner = Arc::new(Tracker);
         let mut byte = [0u8];
-        let managed = export(
-            Box::new(owner.clone()),
-            byte.as_mut_ptr() as *mut c_void,
-            DLDevice { device_type: DL_CPU, device_id: 0 },
-            DLDataType { code: DL_UINT, bits: 8, lanes: 1 },
-            vec![1],
-            vec![],
-            0,
-        );
+        // SAFETY: `byte` remains live until `release` below.
+        let managed = unsafe {
+            export(
+                Box::new(owner.clone()),
+                byte.as_mut_ptr() as *mut c_void,
+                DLDevice { device_type: DL_CPU, device_id: 0 },
+                DLDataType { code: DL_UINT, bits: 8, lanes: 1 },
+                vec![1],
+                vec![],
+                0,
+            )
+        };
         assert_eq!(Arc::strong_count(&owner), 2, "export holds a reference");
         assert_eq!(DROPS.load(Ordering::SeqCst), 0);
 
@@ -497,15 +554,18 @@ mod tests {
     #[test]
     fn strides_round_trip_when_non_empty() {
         let mut data = [0u8; 8];
-        let managed = export(
-            Box::new(()),
-            data.as_mut_ptr() as *mut c_void,
-            DLDevice { device_type: DL_CPU, device_id: 0 },
-            DLDataType { code: DL_INT, bits: 32, lanes: 1 },
-            vec![2, 1],
-            vec![1, 2],
-            0,
-        );
+        // SAFETY: `data` remains live until `release` below.
+        let managed = unsafe {
+            export(
+                Box::new(()),
+                data.as_mut_ptr() as *mut c_void,
+                DLDevice { device_type: DL_CPU, device_id: 0 },
+                DLDataType { code: DL_INT, bits: 32, lanes: 1 },
+                vec![2, 1],
+                vec![1, 2],
+                0,
+            )
+        };
         // SAFETY: live export pointer.
         unsafe {
             let t = &(*managed).dl_tensor;
@@ -513,6 +573,24 @@ mod tests {
             assert_eq!(std::slice::from_raw_parts(t.strides, 2), &[1, 2]);
             release(managed);
         }
+    }
+
+    #[test]
+    #[should_panic(expected = "DLPack strides length")]
+    fn export_rejects_mismatched_non_empty_strides() {
+        let mut data = [0u8; 1];
+        // SAFETY: this call must panic before returning a managed pointer.
+        let _ = unsafe {
+            export(
+                Box::new(()),
+                data.as_mut_ptr() as *mut c_void,
+                DLDevice { device_type: DL_CPU, device_id: 0 },
+                DLDataType { code: DL_UINT, bits: 8, lanes: 1 },
+                vec![1, 1],
+                vec![1],
+                0,
+            )
+        };
     }
 
     #[test]
@@ -525,16 +603,19 @@ mod tests {
             }
         }
         let mut byte = [7u8];
-        let managed = export_versioned(
-            Box::new(Tracker),
-            byte.as_mut_ptr() as *mut c_void,
-            DLDevice { device_type: DL_CPU, device_id: 0 },
-            DLDataType { code: DL_UINT, bits: 8, lanes: 1 },
-            vec![1],
-            vec![],
-            0,
-            false,
-        );
+        // SAFETY: `byte` remains live until `release_versioned` below.
+        let managed = unsafe {
+            export_versioned(
+                Box::new(Tracker),
+                byte.as_mut_ptr() as *mut c_void,
+                DLDevice { device_type: DL_CPU, device_id: 0 },
+                DLDataType { code: DL_UINT, bits: 8, lanes: 1 },
+                vec![1],
+                vec![],
+                0,
+                false,
+            )
+        };
         // SAFETY: live versioned export pointer.
         unsafe {
             assert_eq!((*managed).version.major, DLPACK_MAJOR_VERSION);
@@ -549,16 +630,19 @@ mod tests {
     #[test]
     fn versioned_read_only_sets_flag() {
         let mut byte = [0u8];
-        let managed = export_versioned(
-            Box::new(()),
-            byte.as_mut_ptr() as *mut c_void,
-            DLDevice { device_type: DL_CPU, device_id: 0 },
-            DLDataType { code: DL_UINT, bits: 8, lanes: 1 },
-            vec![1],
-            vec![],
-            0,
-            true,
-        );
+        // SAFETY: `byte` remains live until `release_versioned` below.
+        let managed = unsafe {
+            export_versioned(
+                Box::new(()),
+                byte.as_mut_ptr() as *mut c_void,
+                DLDevice { device_type: DL_CPU, device_id: 0 },
+                DLDataType { code: DL_UINT, bits: 8, lanes: 1 },
+                vec![1],
+                vec![],
+                0,
+                true,
+            )
+        };
         // SAFETY: live versioned export pointer.
         unsafe {
             assert_eq!((*managed).flags & DLPACK_FLAG_BITMASK_READ_ONLY, DLPACK_FLAG_BITMASK_READ_ONLY);
