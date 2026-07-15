@@ -386,29 +386,28 @@ impl Kernel for GroupQueryAttentionKernel {
                 &positions,
                 self.rotary_interleaved,
             )?;
-            let k_positions: Vec<usize> = past_lengths
-                .iter()
-                .flat_map(|&past| (0..k.seq).map(move |s| past + s))
-                .collect();
             rotate(
                 &mut k,
                 &cos,
                 &sin,
                 cos_view.shape[0],
-                &k_positions,
+                &positions,
                 self.rotary_interleaved,
             )?;
         }
 
         let cache_dim = q.dim;
+        let present_sequence_length = past_key.as_ref().map_or(total_sequence_length, |cache| {
+            cache.seq.max(total_sequence_length)
+        });
         let mut present_k =
-            vec![0.0; q.batch * self.kv_num_heads * total_sequence_length * cache_dim];
+            vec![0.0; q.batch * self.kv_num_heads * present_sequence_length * cache_dim];
         let mut present_v = vec![0.0; present_k.len()];
         for b in 0..q.batch {
             for h in 0..self.kv_num_heads {
                 for s in 0..past_lengths[b] {
                     for d in 0..cache_dim {
-                        let dst = ((b * self.kv_num_heads + h) * total_sequence_length + s)
+                        let dst = ((b * self.kv_num_heads + h) * present_sequence_length + s)
                             * cache_dim
                             + d;
                         present_k[dst] = past_key.as_ref().unwrap().at(b, h, s, d);
@@ -417,7 +416,7 @@ impl Kernel for GroupQueryAttentionKernel {
                 }
                 for s in 0..k.seq {
                     for d in 0..cache_dim {
-                        let dst = ((b * self.kv_num_heads + h) * total_sequence_length
+                        let dst = ((b * self.kv_num_heads + h) * present_sequence_length
                             + past_lengths[b]
                             + s)
                             * cache_dim
@@ -431,6 +430,7 @@ impl Kernel for GroupQueryAttentionKernel {
 
         let scale = self
             .scale
+            .filter(|&scale| scale != 0.0)
             .unwrap_or_else(|| 1.0 / (cache_dim as f32).sqrt());
         let group = self.num_heads / self.kv_num_heads;
         let mut y_bhsd = vec![0.0; q.batch * self.num_heads * q.seq * v.dim];
@@ -448,7 +448,7 @@ impl Kernel for GroupQueryAttentionKernel {
                     for ks in local_start..=causal_limit {
                         let mut score = 0.0;
                         for d in 0..cache_dim {
-                            let ki = ((b * self.kv_num_heads + kvh) * total_sequence_length + ks)
+                            let ki = ((b * self.kv_num_heads + kvh) * present_sequence_length + ks)
                                 * cache_dim
                                 + d;
                             score += q.at(b, qh, qs, d) * present_k[ki];
@@ -472,7 +472,7 @@ impl Kernel for GroupQueryAttentionKernel {
                     for d in 0..v.dim {
                         let mut value = 0.0;
                         for (ks, probability) in scores.iter().enumerate() {
-                            let vi = ((b * self.kv_num_heads + kvh) * total_sequence_length + ks)
+                            let vi = ((b * self.kv_num_heads + kvh) * present_sequence_length + ks)
                                 * v.dim
                                 + d;
                             value += (*probability / sum) * present_v[vi];
@@ -614,6 +614,37 @@ mod tests {
         }
     }
 
+    fn reference_rope_bsh(
+        input: &[f32],
+        seq: usize,
+        heads: usize,
+        positions: &[usize],
+        cos: &[f32],
+        sin: &[f32],
+    ) -> Vec<f32> {
+        let mut output = input.to_vec();
+        for s in 0..seq {
+            for h in 0..heads {
+                let base = (s * heads + h) * 2;
+                let (x0, x1) = (input[base], input[base + 1]);
+                output[base] = cos[positions[s]] * x0 - sin[positions[s]] * x1;
+                output[base + 1] = sin[positions[s]] * x0 + cos[positions[s]] * x1;
+            }
+        }
+        output
+    }
+
+    fn bsh_to_bnsh(input: &[f32], seq: usize, heads: usize) -> Vec<f32> {
+        let mut output = vec![0.0; input.len()];
+        for s in 0..seq {
+            for h in 0..heads {
+                output[(h * seq + s) * 2..(h * seq + s + 1) * 2]
+                    .copy_from_slice(&input[(s * heads + h) * 2..(s * heads + h + 1) * 2]);
+            }
+        }
+        output
+    }
+
     #[test]
     fn prefill_gqa_grouping_and_causal_match_reference() {
         let q = vec![
@@ -693,6 +724,52 @@ mod tests {
     }
 
     #[test]
+    fn decode_preserves_fixed_cache_capacity_and_appends_at_logical_length() {
+        let q = vec![1., 0., 1., 0., 0., 1., 0., 1.];
+        let past_k = vec![
+            1., 0., 0., 1., 91., 92., 93., 94., 95., 96., 10., 0., 0., 10., 81., 82., 83., 84.,
+            85., 86.,
+        ];
+        let past_v = vec![
+            1., 2., 3., 4., 71., 72., 73., 74., 75., 76., 10., 20., 30., 40., 61., 62., 63., 64.,
+            65., 66.,
+        ];
+        let cur_k = vec![1., 1., 10., 10.];
+        let cur_v = vec![5., 6., 50., 60.];
+        let expected_k = vec![
+            1., 0., 0., 1., 1., 1., 0., 0., 0., 0., 10., 0., 0., 10., 10., 10., 0., 0., 0., 0.,
+        ];
+        let expected_v = vec![
+            1., 2., 3., 4., 5., 6., 0., 0., 0., 0., 10., 20., 30., 40., 50., 60., 0., 0., 0., 0.,
+        ];
+        let mut out = Owned::zeros_f32(&[1, 1, 8]);
+        let mut pk = Owned::zeros_f32(&[1, 2, 5, 2]);
+        let mut pv = Owned::zeros_f32(&[1, 2, 5, 2]);
+        gqa_kernel(&[])
+            .execute(
+                &[
+                    Owned::f32(&[1, 1, 8], &q).view(),
+                    Owned::f32(&[1, 1, 4], &cur_k).view(),
+                    Owned::f32(&[1, 1, 4], &cur_v).view(),
+                    Owned::f32(&[1, 2, 5, 2], &past_k).view(),
+                    Owned::f32(&[1, 2, 5, 2], &past_v).view(),
+                    Owned::i32(&[1], &[2]).view(),
+                    Owned::i32(&[], &[3]).view(),
+                ],
+                &mut [out.view_mut(), pk.view_mut(), pv.view_mut()],
+            )
+            .unwrap();
+        assert_eq!(pk.shape, vec![1, 2, 5, 2]);
+        assert_eq!(pv.shape, vec![1, 2, 5, 2]);
+        close(&pk.to_f32(), &expected_k);
+        close(&pv.to_f32(), &expected_v);
+        close(
+            &out.to_f32(),
+            &reference(&q, &expected_k, &expected_v, 1, 5, 2),
+        );
+    }
+
+    #[test]
     fn rotary_path_matches_rotated_reference() {
         let q = vec![1., 2., 3., 4., 5., 6., 7., 8.];
         let k = vec![1., 2., 3., 4.];
@@ -721,6 +798,47 @@ mod tests {
             .unwrap();
         let _ = k_rot_bsh;
         close(&out.to_f32(), &reference(&q_rot, &k_rot_bnsh, &v, 1, 1, 0));
+    }
+
+    #[test]
+    fn rotary_explicit_position_ids_apply_to_query_and_key() {
+        let q = vec![
+            1., 2., 2., -1., -1., 3., 4., 2., 3., -2., 1., 4., -3., 1., 2., 5.,
+        ];
+        let k = vec![2., 1., -1., 3., 4., -2., 2., 5.];
+        let v = vec![1., 2., 10., 20., 3., 4., 30., 40.];
+        let angles = [0.0_f32, 0.2, 0.7, 1.1, 1.6];
+        let cos: Vec<f32> = angles.iter().map(|angle| angle.cos()).collect();
+        let sin: Vec<f32> = angles.iter().map(|angle| angle.sin()).collect();
+        let positions = [2_usize, 4];
+        let q_rot = reference_rope_bsh(&q, 2, 4, &positions, &cos, &sin);
+        let k_rot_bsh = reference_rope_bsh(&k, 2, 2, &positions, &cos, &sin);
+        let k_rot_bnsh = bsh_to_bnsh(&k_rot_bsh, 2, 2);
+        let v_bnsh = bsh_to_bnsh(&v, 2, 2);
+        let mut out = Owned::zeros_f32(&[1, 2, 8]);
+        let mut present_k = Owned::zeros_f32(&[1, 2, 2, 2]);
+        gqa_kernel(&[("do_rotary", Attribute::Int(1))])
+            .execute(
+                &[
+                    Owned::f32(&[1, 2, 8], &q).view(),
+                    Owned::f32(&[1, 2, 4], &k).view(),
+                    Owned::f32(&[1, 2, 4], &v).view(),
+                    absent(),
+                    absent(),
+                    Owned::i32(&[1], &[1]).view(),
+                    Owned::i32(&[], &[2]).view(),
+                    Owned::f32(&[5, 1], &cos).view(),
+                    Owned::f32(&[5, 1], &sin).view(),
+                    Owned::i64(&[1, 2], &[2, 4]).view(),
+                ],
+                &mut [out.view_mut(), present_k.view_mut()],
+            )
+            .unwrap();
+        close(&present_k.to_f32(), &k_rot_bnsh);
+        close(
+            &out.to_f32(),
+            &reference(&q_rot, &k_rot_bnsh, &v_bnsh, 2, 2, 0),
+        );
     }
 
     #[test]
@@ -793,5 +911,36 @@ mod tests {
             0.,
         ];
         close(&out.to_f32(), &expected);
+    }
+
+    #[test]
+    fn explicit_zero_scale_matches_default_scale() {
+        let q = [
+            1., 0., 1., 0., 1., 0., 1., 0., 1., 0., 1., 0., 1., 0., 1., 0.,
+        ];
+        let k = [0., 0., 0., 0., 4., 0., 4., 0.];
+        let v = [1., 0., 1., 0., 9., 0., 9., 0.];
+        let run = |attrs: &[(&str, Attribute)]| {
+            let mut out = Owned::zeros_f32(&[1, 2, 8]);
+            gqa_kernel(attrs)
+                .execute(
+                    &[
+                        Owned::f32(&[1, 2, 8], &q).view(),
+                        Owned::f32(&[1, 2, 4], &k).view(),
+                        Owned::f32(&[1, 2, 4], &v).view(),
+                        absent(),
+                        absent(),
+                        Owned::i32(&[1], &[1]).view(),
+                        Owned::i32(&[], &[2]).view(),
+                    ],
+                    &mut [out.view_mut()],
+                )
+                .unwrap();
+            out.to_f32()
+        };
+        let default = run(&[]);
+        let zero = run(&[("scale", Attribute::Float(0.0))]);
+        close(&zero, &default);
+        assert!(zero[8] > 8.0, "zero scale produced uniform attention");
     }
 }
