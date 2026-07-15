@@ -1,0 +1,400 @@
+//! Attribute-driven f32 activation kernels (CUDA Wave 4).
+
+use std::ffi::c_void;
+use std::sync::Arc;
+
+use cudarc::driver::{LaunchConfig, PushKernelArg};
+use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
+use onnx_runtime_ir::{DataType, Node};
+
+use crate::error::{driver_err, not_implemented};
+use crate::runtime::{CudaRuntime, cuptr};
+
+const BLOCK: u32 = 256;
+const MODULE: &str = "wave4_activations_f32";
+
+const SRC: &str = r#"
+extern "C" __global__ void leaky_relu_f32(
+    const float* x, float* y, const int n, const float alpha, const float unused) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
+        float v = x[i];
+        y[i] = v >= 0.0f ? v : alpha * v;
+    }
+}
+extern "C" __global__ void elu_f32(
+    const float* x, float* y, const int n, const float alpha, const float unused) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
+        float v = x[i];
+        y[i] = v >= 0.0f ? v : alpha * expm1f(v);
+    }
+}
+extern "C" __global__ void hard_sigmoid_f32(
+    const float* x, float* y, const int n, const float alpha, const float beta) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
+        float v = alpha * x[i] + beta;
+        y[i] = isnan(v) ? v : (v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v));
+    }
+}
+extern "C" __global__ void clip_f32(
+    const float* x, float* y, const int n, const float min_value, const float max_value) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
+        float v = x[i];
+        y[i] = isnan(v) ? v : fminf(fmaxf(v, min_value), max_value);
+    }
+}
+extern "C" __global__ void softsign_f32(
+    const float* x, float* y, const int n, const float unused0, const float unused1) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
+        float v = x[i];
+        y[i] = v / (1.0f + fabsf(v));
+    }
+}
+extern "C" __global__ void selu_f32(
+    const float* x, float* y, const int n, const float alpha, const float gamma) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
+        float v = x[i];
+        y[i] = gamma * (v >= 0.0f ? v : alpha * expm1f(v));
+    }
+}
+"#;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ActivationOp {
+    LeakyRelu { alpha: f32 },
+    Elu { alpha: f32 },
+    HardSigmoid { alpha: f32, beta: f32 },
+    Clip { min: f32, max: f32 },
+    Softsign,
+    Selu { alpha: f32, gamma: f32 },
+}
+
+impl ActivationOp {
+    fn entry(self) -> &'static str {
+        match self {
+            Self::LeakyRelu { .. } => "leaky_relu_f32",
+            Self::Elu { .. } => "elu_f32",
+            Self::HardSigmoid { .. } => "hard_sigmoid_f32",
+            Self::Clip { .. } => "clip_f32",
+            Self::Softsign => "softsign_f32",
+            Self::Selu { .. } => "selu_f32",
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::LeakyRelu { .. } => "LeakyRelu",
+            Self::Elu { .. } => "Elu",
+            Self::HardSigmoid { .. } => "HardSigmoid",
+            Self::Clip { .. } => "Clip",
+            Self::Softsign => "Softsign",
+            Self::Selu { .. } => "Selu",
+        }
+    }
+
+    fn params(self) -> (f32, f32) {
+        match self {
+            Self::LeakyRelu { alpha } | Self::Elu { alpha } => (alpha, 0.0),
+            Self::HardSigmoid { alpha, beta } => (alpha, beta),
+            Self::Clip { min, max } => (min, max),
+            Self::Softsign => (0.0, 0.0),
+            Self::Selu { alpha, gamma } => (alpha, gamma),
+        }
+    }
+}
+
+pub struct ActivationFactory {
+    pub name: &'static str,
+    pub runtime: Arc<CudaRuntime>,
+}
+
+impl KernelFactory for ActivationFactory {
+    fn create(&self, node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
+        let op = activation_from_node(self.name, node)?;
+        Ok(Box::new(ActivationKernel {
+            op,
+            runtime: self.runtime.clone(),
+        }))
+    }
+}
+
+fn activation_from_node(name: &str, node: &Node) -> Result<ActivationOp> {
+    Ok(match name {
+        "LeakyRelu" => ActivationOp::LeakyRelu {
+            alpha: node
+                .attr("alpha")
+                .and_then(|a| a.as_float())
+                .unwrap_or(0.01),
+        },
+        "Elu" => ActivationOp::Elu {
+            alpha: node.attr("alpha").and_then(|a| a.as_float()).unwrap_or(1.0),
+        },
+        "HardSigmoid" => ActivationOp::HardSigmoid {
+            alpha: node.attr("alpha").and_then(|a| a.as_float()).unwrap_or(0.2),
+            beta: node.attr("beta").and_then(|a| a.as_float()).unwrap_or(0.5),
+        },
+        "Clip" => ActivationOp::Clip {
+            min: node
+                .attr("min")
+                .and_then(|a| a.as_float())
+                .unwrap_or(f32::NEG_INFINITY),
+            max: node
+                .attr("max")
+                .and_then(|a| a.as_float())
+                .unwrap_or(f32::INFINITY),
+        },
+        "Softsign" => ActivationOp::Softsign,
+        "Selu" => ActivationOp::Selu {
+            alpha: node
+                .attr("alpha")
+                .and_then(|a| a.as_float())
+                .unwrap_or(1.67326),
+            gamma: node
+                .attr("gamma")
+                .and_then(|a| a.as_float())
+                .unwrap_or(1.0507),
+        },
+        other => {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep: unknown activation factory {other}"
+            )));
+        }
+    })
+}
+
+#[derive(Debug)]
+struct ActivationKernel {
+    op: ActivationOp,
+    runtime: Arc<CudaRuntime>,
+}
+
+impl ActivationKernel {
+    fn read_scalar(&self, name: &str, input: &TensorView) -> Result<f32> {
+        require_f32(self.op.name(), name, input.dtype)?;
+        require_contiguous(self.op.name(), name, input.is_contiguous())?;
+        if input.numel() != 1 {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep Clip: {name} must contain one f32 value, got {}",
+                input.numel()
+            )));
+        }
+        let mut bytes = [0u8; 4];
+        // SAFETY: dtype and numel checks above prove the device allocation covers
+        // one f32 (four bytes).
+        unsafe {
+            self.runtime
+                .dtoh(&mut bytes, cuptr(input.data_ptr::<u8>() as *const c_void))?
+        };
+        Ok(f32::from_ne_bytes(bytes))
+    }
+
+    fn run(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+        let op = self.op.name();
+        let valid_arity = if matches!(self.op, ActivationOp::Clip { .. }) {
+            (1..=3).contains(&inputs.len())
+        } else {
+            inputs.len() == 1
+        };
+        if !valid_arity || outputs.len() != 1 {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep {op}: expected {} input(s) and 1 output, got {} and {}",
+                if op == "Clip" { "1-3" } else { "1" },
+                inputs.len(),
+                outputs.len()
+            )));
+        }
+
+        let x = &inputs[0];
+        require_f32(op, "input", x.dtype)?;
+        require_f32(op, "output", outputs[0].dtype)?;
+        require_contiguous(op, "input", x.is_contiguous())?;
+        require_contiguous(op, "output", outputs[0].is_contiguous())?;
+        if outputs[0].shape != x.shape {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep {op}: output shape {:?} must equal input shape {:?}",
+                outputs[0].shape, x.shape
+            )));
+        }
+
+        let (mut p0, mut p1) = self.op.params();
+        if matches!(self.op, ActivationOp::Clip { .. }) {
+            if inputs.len() > 1 {
+                p0 = self.read_scalar("min", &inputs[1])?;
+            }
+            if inputs.len() > 2 {
+                p1 = self.read_scalar("max", &inputs[2])?;
+            }
+            if p0 > p1 {
+                return Err(EpError::KernelFailed(
+                    "cuda_ep Clip: min must not exceed max".into(),
+                ));
+            }
+        }
+
+        let n = x.numel();
+        let n_i = i32::try_from(n)
+            .map_err(|_| EpError::KernelFailed(format!("cuda_ep {op}: {n} elements exceed i32")))?;
+        let x_ptr = cuptr(x.data_ptr::<u8>() as *const c_void);
+        let y_ptr = cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void);
+        let func = self.runtime.nvrtc_function(MODULE, SRC, self.op.entry())?;
+        let cfg = LaunchConfig {
+            grid_dim: (grid_for(n), 1, 1),
+            block_dim: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut builder = self.runtime.stream().launch_builder(&func);
+        builder.arg(&x_ptr).arg(&y_ptr).arg(&n_i).arg(&p0).arg(&p1);
+        // SAFETY: every entry in SRC has the same (x, y, n, p0, p1) signature;
+        // x/y cover n contiguous f32 elements, validated above.
+        unsafe { builder.launch(cfg) }
+            .map_err(|e| driver_err(&format!("launch {}", self.op.entry()), e))?;
+        self.runtime.synchronize()
+    }
+}
+
+impl Kernel for ActivationKernel {
+    fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+        self.run(inputs, outputs)
+    }
+
+    fn supports_strided_input(&self, _idx: usize) -> bool {
+        false
+    }
+
+    fn cuda_graph_compatible(&self) -> bool {
+        !matches!(self.op, ActivationOp::Clip { .. })
+    }
+}
+
+fn grid_for(n: usize) -> u32 {
+    const MAX_BLOCKS: usize = 65_535;
+    n.div_ceil(BLOCK as usize).clamp(1, MAX_BLOCKS) as u32
+}
+
+fn require_f32(op: &str, name: &str, dtype: DataType) -> Result<()> {
+    if dtype != DataType::Float32 {
+        return Err(not_implemented(format!(
+            "{op} with {name} dtype {dtype:?} (Wave-4 activations are f32-only)"
+        )));
+    }
+    Ok(())
+}
+
+fn require_contiguous(op: &str, name: &str, contiguous: bool) -> Result<()> {
+    if !contiguous {
+        return Err(not_implemented(format!(
+            "{op} with a non-contiguous (strided) {name}; materialise it before the op"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use onnx_runtime_ir::{Attribute, NodeId};
+
+    fn node(op: &str) -> Node {
+        Node::new(NodeId(0), op, vec![], vec![])
+    }
+
+    #[test]
+    fn entries_are_present_in_nvrtc_source() {
+        for op in [
+            ActivationOp::LeakyRelu { alpha: 0.01 },
+            ActivationOp::Elu { alpha: 1.0 },
+            ActivationOp::HardSigmoid {
+                alpha: 0.2,
+                beta: 0.5,
+            },
+            ActivationOp::Clip {
+                min: f32::NEG_INFINITY,
+                max: f32::INFINITY,
+            },
+            ActivationOp::Softsign,
+            ActivationOp::Selu {
+                alpha: 1.67326,
+                gamma: 1.0507,
+            },
+        ] {
+            assert!(SRC.contains(op.entry()), "missing {}", op.entry());
+        }
+    }
+
+    #[test]
+    fn defaults_and_attributes_match_cpu_references() {
+        assert_eq!(
+            activation_from_node("LeakyRelu", &node("LeakyRelu")).unwrap(),
+            ActivationOp::LeakyRelu { alpha: 0.01 }
+        );
+        assert_eq!(
+            activation_from_node("Elu", &node("Elu")).unwrap(),
+            ActivationOp::Elu { alpha: 1.0 }
+        );
+        assert_eq!(
+            activation_from_node("HardSigmoid", &node("HardSigmoid")).unwrap(),
+            ActivationOp::HardSigmoid {
+                alpha: 0.2,
+                beta: 0.5
+            }
+        );
+        assert_eq!(
+            activation_from_node("Selu", &node("Selu")).unwrap(),
+            ActivationOp::Selu {
+                alpha: 1.67326,
+                gamma: 1.0507
+            }
+        );
+        let mut leaky = node("LeakyRelu");
+        leaky
+            .attributes
+            .insert("alpha".into(), Attribute::Float(0.25));
+        assert_eq!(
+            activation_from_node("LeakyRelu", &leaky).unwrap(),
+            ActivationOp::LeakyRelu { alpha: 0.25 }
+        );
+
+        let mut elu = node("Elu");
+        elu.attributes
+            .insert("alpha".into(), Attribute::Float(0.75));
+        assert_eq!(
+            activation_from_node("Elu", &elu).unwrap(),
+            ActivationOp::Elu { alpha: 0.75 }
+        );
+
+        let mut hard = node("HardSigmoid");
+        hard.attributes
+            .insert("alpha".into(), Attribute::Float(0.3));
+        hard.attributes.insert("beta".into(), Attribute::Float(0.4));
+        assert_eq!(
+            activation_from_node("HardSigmoid", &hard).unwrap(),
+            ActivationOp::HardSigmoid {
+                alpha: 0.3,
+                beta: 0.4
+            }
+        );
+
+        let mut clip = node("Clip");
+        clip.attributes.insert("min".into(), Attribute::Float(-2.0));
+        clip.attributes.insert("max".into(), Attribute::Float(3.0));
+        assert_eq!(
+            activation_from_node("Clip", &clip).unwrap(),
+            ActivationOp::Clip {
+                min: -2.0,
+                max: 3.0
+            }
+        );
+
+        let mut selu = node("Selu");
+        selu.attributes
+            .insert("alpha".into(), Attribute::Float(1.5));
+        selu.attributes
+            .insert("gamma".into(), Attribute::Float(1.1));
+        assert_eq!(
+            activation_from_node("Selu", &selu).unwrap(),
+            ActivationOp::Selu {
+                alpha: 1.5,
+                gamma: 1.1
+            }
+        );
+    }
+}

@@ -21,6 +21,7 @@ use onnx_runtime_ep_api::{OpKey, OpRegistry};
 
 use crate::runtime::CudaRuntime;
 
+pub mod activations;
 pub mod attention;
 pub mod cast;
 pub mod elementwise;
@@ -31,6 +32,7 @@ pub mod pointwise;
 pub mod reduce;
 pub mod softmax;
 
+use activations::ActivationFactory;
 use elementwise::{BinaryFactory, BinaryOp, UnaryFactory, UnaryOp};
 use pointwise::{
     CmpFactory, CmpOp, LogicalFactory, LogicalOp, NotFactory, UnaryMathFactory, UnaryMathOp,
@@ -66,12 +68,60 @@ use pointwise::{
 /// See `docs/CUDA_COVERAGE.md` for the full op → backend mapping matrix and the
 /// prioritised list of remaining / custom-kernel ops.
 pub const CUDA_COVERED_OPS: &[&str] = &[
-    "MatMul", "Gemm", "Relu", "Sqrt", "Erf", "Tanh", "Sigmoid", "Gelu", "Add", "Sub", "Mul", "Div",
-    "Pow", "Min", "Max", "Attention", "Softmax", "LayerNormalization", "SkipLayerNormalization",
-    "SimplifiedLayerNormalization", "RMSNormalization", "Cast", "CastLike", "ReduceSum",
-    "ReduceMean", "ReduceMax", "ReduceMin", "Abs", "Neg", "Reciprocal", "Exp", "Log", "Sign",
-    "Floor", "Ceil", "Round", "Sin", "Cos", "Softplus", "Not", "And", "Or", "Xor", "Equal",
-    "Greater", "Less", "GreaterOrEqual", "LessOrEqual",
+    "MatMul",
+    "Gemm",
+    "Relu",
+    "Sqrt",
+    "Erf",
+    "Tanh",
+    "Sigmoid",
+    "Gelu",
+    "Add",
+    "Sub",
+    "Mul",
+    "Div",
+    "Pow",
+    "Min",
+    "Max",
+    "Attention",
+    "Softmax",
+    "LayerNormalization",
+    "SkipLayerNormalization",
+    "SimplifiedLayerNormalization",
+    "RMSNormalization",
+    "Cast",
+    "CastLike",
+    "ReduceSum",
+    "ReduceMean",
+    "ReduceMax",
+    "ReduceMin",
+    "Abs",
+    "Neg",
+    "Reciprocal",
+    "Exp",
+    "Log",
+    "Sign",
+    "Floor",
+    "Ceil",
+    "Round",
+    "Sin",
+    "Cos",
+    "Softplus",
+    "Not",
+    "And",
+    "Or",
+    "Xor",
+    "Equal",
+    "Greater",
+    "Less",
+    "GreaterOrEqual",
+    "LessOrEqual",
+    "LeakyRelu",
+    "Elu",
+    "HardSigmoid",
+    "Clip",
+    "Softsign",
+    "Selu",
 ];
 
 /// Build an [`OpRegistry`] populated with the CUDA kernel factories.
@@ -109,6 +159,24 @@ pub fn build_cuda_registry(runtime: Arc<CudaRuntime>) -> OpRegistry {
             OpKey::new(op_type, domain, 1),
             Box::new(UnaryFactory {
                 op,
+                runtime: runtime.clone(),
+            }),
+        );
+    }
+
+    // CUDA Wave 4 — attribute-driven f32 activations.
+    for op_type in [
+        "LeakyRelu",
+        "Elu",
+        "HardSigmoid",
+        "Clip",
+        "Softsign",
+        "Selu",
+    ] {
+        reg.register(
+            OpKey::new(op_type, "", 1),
+            Box::new(ActivationFactory {
+                name: op_type,
                 runtime: runtime.clone(),
             }),
         );
@@ -335,9 +403,44 @@ mod tests {
     #[test]
     fn wave3_pointwise_ops_are_listed_in_coverage() {
         for op in [
-            "Abs", "Neg", "Reciprocal", "Exp", "Log", "Sign", "Floor", "Ceil", "Round", "Sin",
-            "Cos", "Softplus", "Not", "And", "Or", "Xor", "Equal", "Greater", "Less",
-            "GreaterOrEqual", "LessOrEqual",
+            "Abs",
+            "Neg",
+            "Reciprocal",
+            "Exp",
+            "Log",
+            "Sign",
+            "Floor",
+            "Ceil",
+            "Round",
+            "Sin",
+            "Cos",
+            "Softplus",
+            "Not",
+            "And",
+            "Or",
+            "Xor",
+            "Equal",
+            "Greater",
+            "Less",
+            "GreaterOrEqual",
+            "LessOrEqual",
+        ] {
+            assert!(
+                CUDA_COVERED_OPS.contains(&op),
+                "{op} missing from CUDA_COVERED_OPS"
+            );
+        }
+    }
+
+    #[test]
+    fn wave4_activations_are_listed_in_coverage() {
+        for op in [
+            "LeakyRelu",
+            "Elu",
+            "HardSigmoid",
+            "Clip",
+            "Softsign",
+            "Selu",
         ] {
             assert!(
                 CUDA_COVERED_OPS.contains(&op),

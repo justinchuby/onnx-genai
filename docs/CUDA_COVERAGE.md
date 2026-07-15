@@ -74,6 +74,12 @@ not yet wired) · **🔬 custom** (needs a fused NVRTC/CUTLASS kernel).
 | `Sin` | `` | ✅ | **NVRTC-custom** | f32 pointwise, `sinf`. |
 | `Cos` | `` | ✅ | **NVRTC-custom** | f32 pointwise, `cosf`. |
 | `Softplus` | `` | ✅ | **NVRTC-custom** | f32 pointwise, stable `max(x,0)+log1pf(expf(-\|x\|))` (matches CPU). |
+| `LeakyRelu` | `` | ✅ | **NVRTC-custom** | f32; `x >= 0 ? x : alpha*x`, default `alpha=0.01`. |
+| `Elu` | `` | ✅ | **NVRTC-custom** | f32; `x >= 0 ? x : alpha*expm1(x)`, default `alpha=1`. |
+| `HardSigmoid` | `` | ✅ | **NVRTC-custom** | f32; `clamp(alpha*x+beta,0,1)`, defaults `alpha=0.2`, `beta=0.5`; preserves NaN. |
+| `Clip` | `` | ✅ | **NVRTC-custom** | f32; attribute bounds or scalar min/max inputs, unbounded defaults, NaN-preserving. |
+| `Softsign` | `` | ✅ | **NVRTC-custom** | f32; `x/(1+abs(x))`. |
+| `Selu` | `` | ✅ | **NVRTC-custom** | f32; `gamma*(x >= 0 ? x : alpha*expm1(x))`, defaults `alpha=1.67326`, `gamma=1.0507`. |
 
 ### Elementwise — logical / comparison
 
@@ -149,27 +155,60 @@ not yet wired) · **🔬 custom** (needs a fused NVRTC/CUTLASS kernel).
 | `Slice` | `` | ⏳ | **NVRTC-custom** | Strided/stepped copy (opset-10 input-driven ranges). |
 | `Constant` | `` | ⏳ | **host + H2D** | Upload the constant to device once. |
 
-**Score:** reference set (unique op types) = **31**. CUDA **before** the Wave-1
-slice = **2** (`MatMul`, `Attention`). CUDA **after** Wave 1 = **16**
-(`MatMul`, `Gemm`, `Relu`, `Sqrt`, `Erf`, `Tanh`, `Sigmoid`, `Gelu`, `Add`,
-`Sub`, `Mul`, `Div`, `Pow`, `Min`, `Max`, `Attention`). CUDA **after Wave 2** =
-**27** (+ `Softmax`, `LayerNormalization`, `SkipLayerNormalization`,
-`SimplifiedLayerNormalization`/`RMSNormalization`, `Cast`, `CastLike`,
-`ReduceSum`, `ReduceMean`, `ReduceMax`, `ReduceMin`).
+## Source-derived coverage audit (2026-07-15)
 
-CUDA **after Wave 3** = **48** (+ pointwise unary math `Abs`, `Neg`,
-`Reciprocal`, `Exp`, `Log`, `Sign`, `Floor`, `Ceil`, `Round`, `Sin`, `Cos`,
-`Softplus`; logical `Not`, `And`, `Or`, `Xor`; comparison `Equal`, `Greater`,
-`Less`, `GreaterOrEqual`, `LessOrEqual`). The unary-math formulas are matched
-exactly to the CPU EP (`unary_math.rs`); the comparison/logical ops follow
-canonical ONNX semantics (equal-shape; NumPy broadcasting deferred crate-wide).
+This snapshot is derived directly from `build_cpu_registry`,
+`build_cuda_registry`, and `CUDA_COVERED_OPS`, rather than the historical wave
+counts:
 
-> **⚠️ Runtime/perf verification pending.** The Wave-2 kernels were written and
-> reviewed on a host with **only `libcuda`** (no cuBLASLt/cuDNN/NVRTC runtime,
-> no `nvcc`), so they compile + pass GPU-free unit tests but have **not** been
-> executed or benchmarked. Numerical correctness rests on the stable formulas
-> cited in each kernel's comments (matched to the CPU EP). Runtime + perf
-> validation must happen on an H200.
+| Measure | Count |
+|---------|------:|
+| CPU registry `(domain, op_type)` pairs | **103** |
+| CPU standard-domain (`ai.onnx`) op types | **93** |
+| CUDA registry `(domain, op_type)` pairs | **55** |
+| CUDA advertised op names | **54** |
+| CPU pairs implemented by CUDA in the same domain | **45 / 103** |
+| CPU standard-domain op types implemented by CUDA | **41 / 93** |
+
+The **41 shared `ai.onnx` ops** are: `Abs`, `Add`, `Cast`, `CastLike`, `Ceil`,
+`Clip`, `Cos`, `Div`, `Elu`, `Equal`, `Erf`, `Exp`, `Floor`, `Gemm`,
+`HardSigmoid`, `LayerNormalization`, `LeakyRelu`, `Log`, `MatMul`, `Max`, `Min`,
+`Mul`, `Neg`, `Not`, `Pow`, `RMSNormalization`, `Reciprocal`, `ReduceMax`,
+`ReduceMean`, `ReduceMin`, `ReduceSum`, `Relu`, `Round`, `Sigmoid`, `Sign`,
+`Sin`, `Softmax`, `Softplus`, `Sqrt`, `Sub`, and `Tanh`.
+
+The **52 CPU `ai.onnx` gaps** are: `Acos`, `Acosh`, `ArgMax`, `ArgMin`, `Asin`,
+`Asinh`, `Atan`, `Atanh`, `Attention`, `AveragePool`, `Concat`, `Constant`,
+`ConstantOfShape`, `Cosh`, `CumSum`, `DequantizeLinear`,
+`DynamicQuantizeLinear`, `Expand`, `Flatten`, `Gather`, `GatherElements`,
+`GatherND`, `Gelu`, `GlobalAveragePool`, `GlobalMaxPool`, `Identity`,
+`LogSoftmax`, `MaxPool`, `Mean`, `NonZero`, `Pad`, `QuantizeLinear`, `Range`,
+`ReduceL2`, `ReduceProd`, `ReduceSumSquare`, `Reshape`, `RotaryEmbedding`,
+`Shape`, `Sinh`, `Size`, `Slice`, `Split`, `Squeeze`, `Sum`, `Swish`, `Tan`,
+`Tile`, `TopK`, `Transpose`, `Unsqueeze`, and `Where`.
+
+For `com.microsoft`, CUDA matches four CPU pairs (`Gelu`,
+`LayerNormalization`, `SimplifiedLayerNormalization`, `SkipLayerNormalization`);
+CPU-only gaps are `BiasGelu`, `FastGelu`, `FusedAttention`, `FusedGemm`,
+`FusedMatMulBias`, and `QuickGelu`. CUDA additionally exposes
+`com.microsoft::Attention`. CUDA standard-domain extras not currently registered
+by the CPU EP are `And`, `Greater`, `GreaterOrEqual`, `Less`, `LessOrEqual`,
+`Or`, `Selu`, `Softsign`, and `Xor`.
+
+### Library mapping for the remaining CPU gaps
+
+| Backend | CPU-covered gaps mapped here | Rationale |
+|---------|------------------------------|-----------|
+| **cuBLASLt** | `FusedMatMulBias`, `FusedGemm`; `BiasGelu`/`FastGelu`/`QuickGelu` where expressible as an epilogue | GEMM+bias/activation belongs in the matrix multiply epilogue. |
+| **cuDNN** | `AveragePool`, `MaxPool`, `GlobalAveragePool`, `GlobalMaxPool`, `LogSoftmax`, `ReduceL2`, `ReduceProd`, `ReduceSumSquare` | Vendor-tuned pooling, normalization/softmax, and reduction primitives. |
+| **CUTLASS / cuDNN SDPA** | standard `Attention`, `FusedAttention` | Flash/SDPA implementation avoids materialising the O(S²) score tensor. |
+| **cub/thrust via NVRTC (CCCL headers)** | `ArgMax`, `ArgMin`, `TopK`, `CumSum`, `NonZero` | Scan/select/sort/reduction primitives; cudarc has no dlopen-able cub/thrust API. |
+| **NVRTC-custom** | remaining unary math (`Acos`…`Tan`, `Swish`), quantize/dequantize, `Where`, `RotaryEmbedding`, indexed/strided movement (`Gather*`, `Slice`, `Tile`, `Expand`, `Transpose`, `Concat`, `Pad`, `Split`, `Range`) | Pointwise or index-transform work with no suitable runtime library; RoPE is a justified fusion kernel. |
+| **view / memcpy / host** | `Identity`, `Reshape`, `Flatten`, `Squeeze`, `Unsqueeze`, `Shape`, `Size`, `Constant`, `ConstantOfShape` | Metadata-only views, raw D2D copies, or small host-generated tensors. |
+
+Wave 4 raises the advertised CUDA set from **48 to 54** op names. Its six
+activations are GPU-validated against independent CPU formulas on the local
+CUDA 13.0 host; broader performance validation remains separate.
 
 ---
 
