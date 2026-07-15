@@ -626,8 +626,36 @@ pub enum KernelMatch {
         required_input_layouts: Option<Vec<TensorLayout>>,
         output_layouts: Vec<TensorLayout>,
     },
+    /// Can run this op IF runtime applies specified transforms first.
+    ConditionalSupport {
+        cost: Cost,
+        prerequisites: Vec<Prerequisite>,
+        required_input_layouts: Option<Vec<TensorLayout>>,
+        output_layouts: Vec<TensorLayout>,
+    },
     Unsupported,
 }
+
+/// Something the runtime must do before the EP can handle this op/subgraph.
+pub enum Prerequisite {
+    /// Fuse these ops into a single call to EP.
+    FuseOps { pattern: FusionPattern },
+    /// Insert a cast op on the specified input.
+    CastInput { input_idx: usize, target_dtype: DataType },
+    /// Decompose this op into simpler ops the EP supports individually.
+    DecomposeOp { into: Vec<OpSignature> },
+    /// Apply a custom graph transform (EP provides the pass).
+    CustomTransform { pass_id: &'static str },
+    /// Requires minimum batch size for efficiency (else fall back to another EP).
+    MinBatchSize(usize),
+}
+```
+
+> The ILP solver (§7) accounts for prerequisite costs when evaluating conditional EP claims.
+> If the prerequisite cost + kernel cost is still lower than alternative EPs, the runtime
+> applies the transforms and assigns to this EP.
+
+```rust
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum DeviceType {
@@ -998,12 +1026,17 @@ pub struct MakeContiguous;  // Pseudo-op: copies strided tensor to contiguous bu
 
 ### 6.1 Role
 
-Single source of truth for all optimization decisions. No hidden heuristics.
+Single source of truth for all **compile-time** optimization decisions. No hidden heuristics.
+
+> **Disambiguation:** This section defines `PlacementCostModel`, the compile-time cost model
+> used for graph partitioning and device placement. See SCHEDULING.md §4 for the runtime
+> scheduling cost model (`SchedulingCostModel`) which consumes estimates produced by this
+> compile-time model.
 
 ### 6.2 Structure
 
 ```rust
-pub struct CostModel {
+pub struct PlacementCostModel {
     device_profiles: HashMap<DeviceId, DeviceProfile>,
     transfer_matrix: TransferCostMatrix,
     layout_costs: LayoutCostTable,
@@ -1033,7 +1066,7 @@ pub struct TransferProfile {
 ### 6.3 Concrete Cost Formulas
 
 ```rust
-impl CostModel {
+impl PlacementCostModel {
     /// MatMul cost: 2*M*N*K FLOPs. Memory-bound if arithmetic intensity < device ratio.
     pub fn matmul_cost(&self, m: usize, n: usize, k: usize, dtype: DataType, device: DeviceId) -> Cost {
         let flops = 2 * m * n * k;
@@ -1085,7 +1118,7 @@ pub struct CalibrationData {
     pub measurements: HashMap<(OpKey, DeviceId, Vec<Vec<usize>>), Duration>,
 }
 
-impl CostModel {
+impl PlacementCostModel {
     /// Run a calibration pass: execute each op once, measure actual time.
     pub fn calibrate(&mut self, graph: &Graph, session: &InferenceSession,
                      inputs: &[Tensor]) -> Result<CalibrationData>;
@@ -1130,7 +1163,7 @@ Linearization (since x*x is quadratic):
 
 ```rust
 pub struct PlacementOptimizer {
-    cost_model: Arc<CostModel>,
+    cost_model: Arc<PlacementCostModel>,
 }
 
 impl PlacementOptimizer {
@@ -2059,7 +2092,7 @@ profile → analyze → suggest → apply → verify.
 pub struct AutoTuner {
     session: InferenceSession,
     profiler: Profiler,
-    cost_model: CostModel,
+    cost_model: PlacementCostModel,
     history: Vec<TuningStep>,
 }
 
@@ -2218,7 +2251,7 @@ pub trait OptimizationPass: Send + Sync {
 }
 
 pub struct PassContext {
-    pub cost_model: Arc<CostModel>,
+    pub cost_model: Arc<PlacementCostModel>,
     pub ep_registry: Arc<EpRegistry>,
     pub target_devices: Vec<DeviceId>,
 }
@@ -2754,6 +2787,39 @@ tensor = torch.randn(1, 128, device="cuda")
 output = session.run(input_ids=tensor)  # DLPack, no copy
 torch_output = torch.from_dlpack(output["logits"])  # no copy
 ```
+
+---
+
+### 20.9 Session Lifecycle
+
+```rust
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SessionState {
+    Ready,       // Compiled, weights not loaded
+    Active,      // Weights resident, workspace allocated, can execute
+    Hibernated,  // Compiled graph retained, weights paged out, workspace freed
+    Terminated,  // All resources released
+}
+
+impl InferenceSession {
+    pub fn state(&self) -> SessionState;
+
+    /// Transition Ready/Hibernated → Active.
+    /// Pages weights in via the paged memory system, allocates workspace.
+    pub async fn wake(&mut self) -> Result<(), SessionError>;
+
+    /// Transition Active → Hibernated.
+    /// Frees workspace, hints pager to deprioritize weight pages.
+    /// Compiled graph and metadata retained (no recompilation on wake).
+    pub async fn hibernate(&mut self) -> Result<(), SessionError>;
+
+    /// Transition any → Terminated. Releases all resources.
+    pub fn terminate(&mut self);
+}
+```
+
+> **Phase 1** implements only Ready→Active (via `load()`). Hibernate/wake are Phase 3+
+> features. See SCHEDULING.md for the server-level scheduler that drives these transitions.
 
 ---
 
@@ -4192,6 +4258,102 @@ pub struct TierLimits {
 
 ---
 
+### 33.4 Unified Memory Ownership
+
+nxrt owns ALL device memory through a single global allocator per device. There is no
+split ownership between the runtime and higher layers (genai-engine, server).
+
+#### Allocation Hierarchy
+
+```
+┌─────────────────────────────────────────────────┐
+│         Global Device Memory Budget              │
+│         (owned by nxrt MemoryManager)            │
+├─────────────────────────────────────────────────┤
+│  ┌──────────┐  ┌──────────┐  ┌──────────────┐  │
+│  │ Weight   │  │ KV Cache │  │ Workspace/   │  │
+│  │ Pages    │  │ Pages    │  │ Scratch      │  │
+│  └──────────┘  └──────────┘  └──────────────┘  │
+│         All backed by UnifiedPageTable           │
+└─────────────────────────────────────────────────┘
+```
+
+#### Ownership Rules
+
+1. **nxrt is the sole allocator.** No layer above nxrt calls cudaMalloc/MTLDevice.newBuffer directly.
+2. **Higher layers request memory through the pager API:**
+   - genai-engine requests KV cache pages via `PagePool::allocate()`
+   - Session workspace allocated via arena from the global budget
+   - Weight pages managed by session lifecycle (load/hibernate/wake)
+3. **The pager makes eviction decisions globally** — it can evict weight pages to make room
+   for KV cache pages, or vice versa, based on priority signals from the scheduler.
+4. **Budget partitioning is soft, not hard.** No fixed split between weights/KV/workspace.
+   The pager dynamically balances based on demand.
+
+#### Scheduler-Facing Pager API
+
+```rust
+pub trait PagerSchedulerAPI {
+    /// Hint: this session is going to sleep. Its pages are low-priority for eviction.
+    async fn deprioritize_session(&self, session: SessionId);
+
+    /// Hint: this session is waking. Page in its weights with high priority.
+    async fn prioritize_session(&self, session: SessionId);
+
+    /// Block until critical pages for a session are resident.
+    async fn await_critical_resident(&self, session: SessionId, critical_set: &PageSet) -> Result<()>;
+
+    /// Query current memory pressure (0.0 = empty, 1.0 = full).
+    fn memory_pressure(&self, device: DeviceId) -> f32;
+
+    /// Set budget limit (scheduler can shrink/grow budget dynamically).
+    fn set_budget(&self, device: DeviceId, max_bytes: usize);
+}
+```
+
+#### KV Cache Connector Integration
+
+External KV cache managers (LMCache, Redis-backed stores, distributed caches) integrate
+as **offload storage backends** below the pager — they never allocate device memory directly.
+
+```rust
+/// Connector manages offload storage (host/disk/remote), not device memory.
+/// The pager owns all device pages; connectors handle persistence and retrieval.
+pub trait KvCacheConnector: Send + Sync {
+    /// Pager evicts a KV page → connector stores it offload.
+    async fn store(&self, key: KvCacheKey, data: &[u8]) -> Result<()>;
+
+    /// Pager needs to page-in → connector retrieves the data.
+    async fn fetch(&self, key: KvCacheKey) -> Result<Option<Vec<u8>>>;
+
+    /// Prefix cache lookup: does this token sequence have pre-computed KV?
+    async fn lookup(&self, prefix: &[u32]) -> Result<Option<KvCacheKey>>;
+
+    /// Connector requests device-side prefetch (e.g., predicted next prefix).
+    /// Pager decides whether to grant based on memory pressure.
+    async fn request_prefetch(&self, key: KvCacheKey) -> Result<PrefetchGrant>;
+}
+
+pub enum PrefetchGrant {
+    /// Approved: pager allocated a page and will fill it.
+    Granted { page_id: PageId },
+    /// Denied: memory pressure too high, try again later.
+    Denied { reason: &'static str },
+    /// Deferred: queued for prefetch when pressure drops.
+    Deferred,
+}
+```
+
+**Ownership invariant:** Connectors never call `cudaMalloc` / `MTLDevice::newBuffer` /
+equivalent. All device pages flow through `PagerSchedulerAPI`. Connectors own only
+host-side or remote storage.
+
+> This resolves the genai↔ORT2 ownership question: nxrt owns memory, genai-engine is a
+> client that requests pages through the pager API. External KV connectors are storage
+> backends below the pager, not competing allocators.
+
+---
+
 ## 34. Model Resource Estimation
 
 ### 34.1 Purpose
@@ -4657,7 +4819,7 @@ When multiple sessions share the same runtime, the **ResourceBroker** arbitrates
 ```rust
 impl ResourceBroker {
     /// Sessions request execution slots. Broker decides who runs when.
-    fn schedule_next(&mut self) -> ScheduleDecision {
+    fn schedule_next(&mut self) -> DispatchDecision {
         // Priority queue: realtime decode > foreground prefill > background
         // Within same priority: round-robin fairness
         // Preemption: realtime can interrupt background mid-chunk
@@ -4670,7 +4832,7 @@ impl ResourceBroker {
 
         if let Some(realtime) = candidates.iter().find(|s| s.priority == Realtime && s.needs_decode()) {
             // Realtime decode always goes first (latency-sensitive)
-            return ScheduleDecision::RunDecode(realtime.id);
+            return DispatchDecision::RunDecode(realtime.id);
         }
 
         // Fair scheduling among same-priority sessions
@@ -4727,6 +4889,11 @@ pub enum ExecutionGrant {
     ShrinkFirst { release_bytes: usize },
 }
 ```
+
+> **Note:** The ResourceBroker operates at the intra-process level among already-active
+> sessions sharing a device. It does NOT make lifecycle decisions (hibernate/wake/terminate)
+> — those are made by the server-level scheduler (see SCHEDULING.md §6). A session must be
+> in `Active` state before it can request execution slots from the broker.
 
 ---
 
@@ -6544,7 +6711,7 @@ impl CpuExecutionProvider {
 
 ```rust
 // Inform the cost model with detected hardware capabilities
-impl CostModel {
+impl PlacementCostModel {
     pub fn from_detected_hardware(cpu: &CpuInfo, gpu: Option<&GpuInfo>) -> Self {
         let cpu_profile = DeviceProfile {
             // Estimate peak throughput from microarchitecture

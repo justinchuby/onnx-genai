@@ -291,6 +291,8 @@ with nxrt.opset(18):
 out = nxrt.dispatch("Resize", [x, roi, scales, sizes], opset=11)
 ```
 
+> **Note:** `dispatch()` accepts any opset version for forward compatibility, but kernel availability follows OPERATORS.md — minimum supported opset is 17. Lower opset versions will use the opset-17 kernel semantics (backward-compatible per ONNX spec).
+
 **Priority:** `dispatch(opset=N)` > `with nxrt.opset(N)` > `nxrt.default_opset`
 
 ### 5.3 Context Manager Implementation
@@ -732,6 +734,11 @@ pub trait KernelFactory: Send + Sync {
 ///
 /// Manages EP registry, kernel cache, device detection, and opset resolution.
 /// One per process, thread-safe via internal locking.
+///
+/// Note: EagerContext maintains its own EP instances independent of any InferenceSession
+/// in the same process. To share EP resources (e.g., avoid double CUDA initialization),
+/// use `EagerContext::from_session_eps()` (planned, not yet implemented). This is a known
+/// limitation in Phase 1.
 pub struct EagerContext {
     /// Available EPs, auto-detected at initialization.
     eps: Vec<Arc<dyn ExecutionProvider>>,

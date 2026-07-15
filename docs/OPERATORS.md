@@ -24,9 +24,14 @@ plugin EPs (via C ABI bridge) handle them.
 | Sub | 7 | |
 | Div | 7 | |
 | Sqrt | 6 | RMSNorm. |
+| Neg | 6 | Arithmetic negation. |
+| Abs | 6 | Absolute value. |
+| Log | 6 | Natural logarithm. |
+| Exp | 6 | Exponential. |
 | Pow | 7 | |
 | Relu | 6 | Activation. |
 | Sigmoid | 6 | Gating (SwiGLU). |
+| SiLU | — | Composite: x × Sigmoid(x). Implemented as fused kernel, not a standard ONNX op. |
 | Tanh | 6 | GELU approximation. |
 | Gelu | 20 | Added in opset 20. |
 | Erf | 9 | GELU exact. |
@@ -79,7 +84,9 @@ plugin EPs (via C ABI bridge) handle them.
 | ScatterElements | 11 | |
 | Trilu | 14 | Causal mask generation. |
 | RotaryEmbedding | 22 | Added in opset 22 (ONNX standard). |
-| Attention | 23–26 | Standard SDPA (MHA/GQA/MQA, KV cache, causal, softcap). CPU kernel implemented for opsets 23–26. Opset 24 adds the `nonpad_kv_seqlen` external-cache causal offset and swaps `qk_matmul_output_mode` 1↔2 (handled per registered version). Scaling folds `sqrt(scale)` into Q and K to avoid overflow. |
+
+> **Note:** RotaryEmbedding exists in both standard ONNX (opset 22+) and com.microsoft contrib domain. Prefer standard domain when target opset ≥ 22. Contrib variant retained for backward compatibility with older models.
+| Attention | — | Not standard yet; we use contrib version. |
 
 ### Tier 3: Nice to have (broader model support)
 
@@ -96,24 +103,6 @@ plugin EPs (via C ABI bridge) handle them.
 | Unique | 11 | |
 | NMS (NonMaxSuppression) | 10 | Detection models. |
 | RoiAlign | 10 | |
-
-### Tier 3b: Sequence ops (sequence-of-tensors container type)
-
-Implemented by the CPU session executor (not leaf EP kernels): a `Sequence`
-value is an ordered, homogeneously-typed list of tensors handled directly by the
-executor, exactly like the control-flow ops. See §6.9 for the copy-free /
-race-free design.
-
-| Op | Since Opset | Notes |
-|----|-------------|-------|
-| SequenceEmpty | 11 | `dtype` attr (default float32). |
-| SequenceConstruct | 11 | N tensors → sequence; **shares** input element `Arc`s. |
-| SequenceInsert | 11 | Position optional (default append); new list shares element `Arc`s. |
-| SequenceErase | 11 | Position optional (default last); new list shares surviving `Arc`s. |
-| SequenceAt | 11 | Negative index allowed; returns a **shared** element (no deep copy). |
-| SequenceLength | 11 | → int64 scalar. |
-| SplitToSequence | 11 | `axis`, `keepdims`; explicit/scalar `split`; single-alloc slices. |
-| ConcatFromSequence | 11 | `axis`, `new_axis` (stack); single-alloc output. |
 
 ---
 
@@ -202,29 +191,6 @@ Phase 5 (Full coverage):
 - Microsoft contrib: https://github.com/microsoft/onnxruntime/blob/main/docs/ContribOperators.md
 - Our implementation: `native-eps/cpu/src/kernels/` and `native-eps/cuda/src/kernels/`
 
-## 4a. Model-Local Functions (`FunctionProto`)
-
-A model may declare reusable subgraphs as `FunctionProto`s in
-`ModelProto.functions`. A node whose `(domain, op_type, overload)` matches a
-declared function's `(domain, name, overload)` is a **function call**.
-
-We do **not** implement kernels for functions. Instead the loader *inlines*
-every function call into its primitive body at load time
-(`onnx-runtime-loader`'s `function_inline` module), so the executor only ever
-sees ops it has kernels for. Inlining:
-
-- remaps the function's formal inputs/outputs to the call-site actuals and
-  freshens all internal value names per instantiation (no collisions);
-- binds `ref_attr_name` attributes from the call site, falling back to the
-  function's declared defaults, and errors on a missing **required** attribute;
-- recurses to a fixpoint through nested function calls and control-flow
-  (If/Loop/Scan) subgraph bodies, rejecting true recursion;
-- merges each function's `opset_import` into the model's, taking the highest
-  version per domain.
-
-This covers model-local functions only; standard ONNX function libraries beyond
-those declared in the model are not expanded.
-
 ## 5. Minimum Opset Version Policy
 
 We support **opset 17 as minimum** (introduced LayerNormalization as standard op).
@@ -306,47 +272,7 @@ macro_rules! register_kernels {
 
 **Adding a new kernel = one file + one register line.** No touching core runtime code.
 
-### 6.9 Sequence ops: copy-free & race-free container semantics
-
-ONNX `Sequence*` ops operate on a *sequence-of-tensors* container value, which a
-tensor-in/tensor-out `Kernel` cannot represent. They are therefore handled
-directly by the session executor (like `If`/`Loop`/`Scan`), routed by
-`is_sequence_op` — **no EP kernel-registry entry**, so they never collide with
-tensor-kernel registration.
-
-**No copy.** A sequence stores its elements as `Arc`-shared **immutable**
-tensors (`SeqTensor`). Every value-semantic op returns a *new* list that
-**shares the surviving element `Arc`s** with the source (persistent-data-
-structure style) — only handles (a refcount bump) are cloned, never element
-bytes:
-
-- `SequenceConstruct` shares the input element `Arc`s.
-- `SequenceInsert` / `SequenceErase` build a new `Vec<Arc<SeqTensor>>` that
-  shares every unchanged element with the input.
-- `SequenceAt` returns the **shared element `Arc`** and backs its output tensor
-  value with that same allocation (`seq_elem_values`), so a downstream kernel
-  reads it through a zero-copy `TensorView`; bytes are materialized only at the
-  graph-output boundary.
-
-The only unavoidable copies are boundary crossings: a *tensor → sequence* entry
-(a produced `DeviceBuffer`, reused across runs, cannot be aliased, so its bytes
-are moved into the element `Arc` exactly once) and the single-alloc data
-movement of `SplitToSequence` / `ConcatFromSequence` (`ConcatFromSequence`
-necessarily allocates its output once and memcpies each element in exactly
-once). This contrasts with stock ORT, whose `SequenceInsert`/`Erase`/`At`
-deep-copy element data on every mutation.
-
-**No race.** `SeqTensor` is immutable after construction and shared read-only
-through `Arc` (no interior mutability), so concurrent readers of a shared
-sequence/element cannot race — the only cross-thread state is `Arc`'s atomic
-refcount. `SequenceValue: Send + Sync` is asserted by a unit test, and a
-concurrency smoke test runs many threads reading one shared sequence.
-
-The proof that no deep copy occurs is a unit test asserting `Arc::ptr_eq` (and
-data-pointer equality) between an element inserted into a sequence and the same
-element returned by `SequenceAt` after intervening `insert`/`erase`.
-
-
+## 7. Tracing & Profiling (Everything is Traced)
 
 Every operation in the runtime emits structured traces via the `tracing` crate.
 **Always compiled in** (no feature gate). Tracing instrumentation is zero-cost when no
