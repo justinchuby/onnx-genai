@@ -15,9 +15,12 @@ use onnx_genai::{
     FinishReason, GenerateOptions, GeneratePrompt, GenerateRequest, GenerateResult, SessionId,
     StopSequence,
 };
-use onnx_genai_engine::{EmbeddingOptions, GenerateConstraint, TokenLogprob};
+use onnx_genai_engine::{
+    EmbeddingOptions, EngineGovernorError, GenerateConstraint, GovernorSnapshot, ResourceLimit,
+    TokenLogprob, parse_resource_limit,
+};
 use onnx_genai_ort::{ChatMessage as TemplateChatMessage, ChatTemplate, Tokenizer};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -50,8 +53,7 @@ const MAX_COMPLETION_LOGPROBS: usize = 5;
 const PERFETTO_EXPORT_PATH: &str = "/v1/debug/trace/perfetto";
 /// OTLP span export is intentionally deferred (see issue #13); the status
 /// endpoint reports this honestly rather than pretending it works.
-const OTLP_EXPORT_STATUS: &str =
-    "deferred: OTLP span export is not implemented (Perfetto export is available at /v1/debug/trace/perfetto)";
+const OTLP_EXPORT_STATUS: &str = "deferred: OTLP span export is not implemented (Perfetto export is available at /v1/debug/trace/perfetto)";
 
 #[derive(Debug, Serialize)]
 pub(crate) struct ModelsResponse {
@@ -133,6 +135,50 @@ pub(crate) struct DebugKvResponse {
     available_admission_slots: usize,
     rejected_requests: u64,
     engine_kv_introspection: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct ResourcesResponse {
+    configured_limits: ConfiguredResourceLimits,
+    resolved_limits: ResolvedResourceLimits,
+    derived_kv_budget: DerivedKvBudget,
+    vram: ResourceTier,
+    host_ram: ResourceTier,
+    disk_spill: Option<ResourceTier>,
+}
+
+#[derive(Debug, Serialize)]
+struct ConfiguredResourceLimits {
+    vram: String,
+    host_ram: String,
+    disk_spill: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ResolvedResourceLimits {
+    vram_bytes: u64,
+    host_ram_bytes: u64,
+    disk_spill_bytes: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+struct DerivedKvBudget {
+    bytes: u64,
+    total_pages: u64,
+    max_total_tokens: u64,
+    reserved_bytes: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct ResourceTier {
+    used: u64,
+    limit: u64,
+    headroom: u64,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct SetVramLimitRequest {
+    limit: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -249,6 +295,22 @@ impl ApiError {
         }
     }
 
+    fn forbidden(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::FORBIDDEN,
+            message: message.into(),
+            retry_after_secs: None,
+        }
+    }
+
+    fn conflict(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
+            message: message.into(),
+            retry_after_secs: None,
+        }
+    }
+
     fn too_many_requests(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::TOO_MANY_REQUESTS,
@@ -311,7 +373,9 @@ async fn resolve_model(
         requested.to_string()
     };
     if !registry.contains_available(&id) {
-        return Err(ApiError::not_found(format!("model '{requested}' not found")));
+        return Err(ApiError::not_found(format!(
+            "model '{requested}' not found"
+        )));
     }
     registry
         .load(&id)
@@ -365,7 +429,7 @@ pub(crate) async fn status(State(state): State<AppState>) -> Json<NodeStatus> {
         queue_depth: u32::try_from(snapshot.pending_requests).unwrap_or(u32::MAX),
         // Real: aggregate active sessions across the node.
         active_sessions: u32::try_from(snapshot.active_sessions).unwrap_or(u32::MAX),
-        paused_sessions: 0,     // not yet tracked (no preemption/pause state exposed)
+        paused_sessions: 0, // not yet tracked (no preemption/pause state exposed)
         tokens_per_second: 0.0, // not yet tracked (only cumulative token totals recorded)
         batch_utilization: 0.0, // not yet tracked (max batch size not surfaced to the server)
         // Per-session detail: session ids are real (redacted, since full ids are
@@ -379,8 +443,8 @@ pub(crate) async fn status(State(state): State<AppState>) -> Json<NodeStatus> {
             .map(|id| SessionStatus {
                 id,
                 priority: "unknown".to_string(), // not yet tracked
-                kv_pages: 0,                      // not yet tracked
-                state: "unknown".to_string(),     // not yet tracked
+                kv_pages: 0,                     // not yet tracked
+                state: "unknown".to_string(),    // not yet tracked
             })
             .collect(),
         // System-prompt prefix hashes are not yet surfaced by the engine.
@@ -441,6 +505,43 @@ pub(crate) async fn debug_kv(State(state): State<AppState>) -> Json<DebugKvRespo
     })
 }
 
+pub(crate) async fn resources(
+    State(state): State<AppState>,
+) -> Result<Json<ResourcesResponse>, ApiError> {
+    let handle = state
+        .registry
+        .resolve("")
+        .ok_or_else(|| ApiError::internal("no model loaded"))?;
+    let snapshot = handle
+        .engine
+        .resource_snapshot()
+        .await
+        .map_err(|err| ApiError::internal(format!("resource snapshot failed: {err}")))?;
+    Ok(Json(snapshot.into()))
+}
+
+pub(crate) async fn admin_set_vram_limit(
+    State(state): State<AppState>,
+    Json(request): Json<SetVramLimitRequest>,
+) -> Result<Json<ResourcesResponse>, ApiError> {
+    let limit = parse_resource_limit(&request.limit)
+        .map_err(|err| ApiError::bad_request(err.to_string()))?;
+    let handle = state
+        .registry
+        .resolve("")
+        .ok_or_else(|| ApiError::internal("no model loaded"))?;
+    let snapshot = handle
+        .engine
+        .set_vram_limit(limit)
+        .await
+        .map_err(|err| ApiError::internal(format!("resource override failed: {err}")))?
+        .map_err(|err| match err {
+            EngineGovernorError::RuntimeOverrideDisabled => ApiError::forbidden(err.to_string()),
+            EngineGovernorError::Resource(_) => ApiError::conflict(err.to_string()),
+        })?;
+    Ok(Json(snapshot.into()))
+}
+
 pub(crate) async fn debug_trace() -> Json<DebugTraceResponse> {
     let latest_trace_id = crate::metrics::latest_trace_id();
     let recorded_events = onnx_genai_ort::profile::trace_event_count();
@@ -478,7 +579,10 @@ pub(crate) async fn debug_trace_perfetto() -> Response {
     };
     (
         [
-            (header::CONTENT_TYPE, HeaderValue::from_static("application/json")),
+            (
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            ),
             (
                 header::CONTENT_DISPOSITION,
                 HeaderValue::from_static("attachment; filename=\"onnx-genai-trace.json\""),
@@ -491,9 +595,7 @@ pub(crate) async fn debug_trace_perfetto() -> Response {
 
 /// `GET /v1/admin/models` — list every configured model with loaded/available
 /// status and, for loaded models, the last-request timestamp.
-pub(crate) async fn admin_list_models(
-    State(state): State<AppState>,
-) -> Json<AdminModelsResponse> {
+pub(crate) async fn admin_list_models(State(state): State<AppState>) -> Json<AdminModelsResponse> {
     let data = state
         .registry
         .statuses()
@@ -543,15 +645,68 @@ pub(crate) async fn admin_unload_model(
 }
 
 #[cfg(feature = "metrics")]
-pub(crate) async fn prometheus_metrics() -> Response {
+pub(crate) async fn prometheus_metrics(State(state): State<AppState>) -> Response {
+    let mut output = crate::metrics::encode_prometheus();
+    if let Some(handle) = state.registry.resolve("")
+        && let Ok(snapshot) = handle.engine.resource_snapshot().await
+    {
+        output.push_str(&crate::metrics::encode_resource_governor(&snapshot));
+    }
     (
         [(
             header::CONTENT_TYPE,
             "text/plain; version=0.0.4; charset=utf-8",
         )],
-        crate::metrics::encode_prometheus(),
+        output,
     )
         .into_response()
+}
+
+impl From<GovernorSnapshot> for ResourcesResponse {
+    fn from(snapshot: GovernorSnapshot) -> Self {
+        Self {
+            configured_limits: ConfiguredResourceLimits {
+                vram: format_resource_limit(snapshot.configured_limits.vram_limit),
+                host_ram: format_resource_limit(snapshot.configured_limits.host_ram_limit),
+                disk_spill: snapshot
+                    .configured_limits
+                    .disk_spill_limit
+                    .map(format_resource_limit),
+            },
+            resolved_limits: ResolvedResourceLimits {
+                vram_bytes: snapshot.resolved_limits.vram_bytes,
+                host_ram_bytes: snapshot.resolved_limits.host_ram_bytes,
+                disk_spill_bytes: snapshot.resolved_limits.disk_spill_bytes,
+            },
+            derived_kv_budget: DerivedKvBudget {
+                bytes: snapshot.derived_budget.kv_bytes,
+                total_pages: snapshot.derived_budget.total_pages,
+                max_total_tokens: snapshot.derived_budget.max_total_tokens,
+                reserved_bytes: snapshot.derived_budget.reserved_bytes,
+            },
+            vram: ResourceTier::from(snapshot.vram),
+            host_ram: ResourceTier::from(snapshot.host_ram),
+            disk_spill: snapshot.disk_spill.map(ResourceTier::from),
+        }
+    }
+}
+
+impl From<onnx_genai::scheduler::TierSnapshot> for ResourceTier {
+    fn from(snapshot: onnx_genai::scheduler::TierSnapshot) -> Self {
+        Self {
+            used: snapshot.used,
+            limit: snapshot.limit,
+            headroom: snapshot.headroom,
+        }
+    }
+}
+
+fn format_resource_limit(limit: ResourceLimit) -> String {
+    match limit {
+        ResourceLimit::Bytes(bytes) => bytes.to_string(),
+        ResourceLimit::Fraction(fraction) => fraction.to_string(),
+        ResourceLimit::Auto => "auto".to_string(),
+    }
 }
 
 pub(crate) async fn create_session(
@@ -656,9 +811,10 @@ pub(crate) async fn embeddings(
 
     let inputs: Vec<Vec<u32>> = match request.input {
         EmbeddingInput::String(text) => {
-            let tokens = handle.tokenizer.encode(&text).map_err(|err| {
-                ApiError::internal(format!("input tokenization failed: {err}"))
-            })?;
+            let tokens = handle
+                .tokenizer
+                .encode(&text)
+                .map_err(|err| ApiError::internal(format!("input tokenization failed: {err}")))?;
             vec![tokens]
         }
         EmbeddingInput::Strings(texts) => {
@@ -889,7 +1045,13 @@ async fn run_completion(
         handle.model_max_context,
     )?;
     let result = collect_generation_result(
-        submit_completion(&handle, &state.sessions, prepared.generation, client_session_id.as_deref()).await?,
+        submit_completion(
+            &handle,
+            &state.sessions,
+            prepared.generation,
+            client_session_id.as_deref(),
+        )
+        .await?,
     )
     .await
     .map_err(|err| ApiError::internal(format!("generation failed: {err}")))?;
@@ -939,8 +1101,13 @@ async fn stream_completion(
         request.max_tokens,
         handle.model_max_context,
     )?;
-    let mut driver_rx =
-        submit_completion(&handle, &state.sessions, prepared.generation, client_session_id.as_deref()).await?;
+    let mut driver_rx = submit_completion(
+        &handle,
+        &state.sessions,
+        prepared.generation,
+        client_session_id.as_deref(),
+    )
+    .await?;
     crate::metrics::add_prompt_tokens(prepared.prompt_tokens);
     let (tx, rx) = mpsc::channel(16);
 
@@ -1088,7 +1255,8 @@ pub(crate) async fn chat_completions(
         )
     } else {
         let response =
-            run_chat_completion(state, handle, request, session_id, image_urls, input_audio).await?;
+            run_chat_completion(state, handle, request, session_id, image_urls, input_audio)
+                .await?;
         Ok(Json(response).into_response())
     }
 }

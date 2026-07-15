@@ -5,8 +5,8 @@ use onnx_genai::{
     Engine, GenerateOptions, GenerateRequest, GenerateResult, GenerateToken, SessionId, TokenId,
 };
 use onnx_genai_engine::{
-    ContinuousBatchEvent, ContinuousBatchManager, EmbeddingOptions, FimConfig, PipelineEngine,
-    PipelineGenerateRequest,
+    ContinuousBatchEvent, ContinuousBatchManager, EmbeddingOptions, EngineGovernorError, FimConfig,
+    GovernorSnapshot, PipelineEngine, PipelineGenerateRequest, ResourceLimit,
 };
 use onnx_genai_ort::Value;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
@@ -65,6 +65,13 @@ pub(crate) enum DriverCommand {
         input_ids: Vec<TokenId>,
         options: EmbeddingOptions,
         reply: tokio::sync::oneshot::Sender<anyhow::Result<Vec<f32>>>,
+    },
+    ResourceSnapshot(tokio::sync::oneshot::Sender<anyhow::Result<GovernorSnapshot>>),
+    SetVramLimit {
+        limit: ResourceLimit,
+        reply: tokio::sync::oneshot::Sender<
+            anyhow::Result<Result<GovernorSnapshot, EngineGovernorError>>,
+        >,
     },
 }
 
@@ -272,6 +279,29 @@ impl EngineDriver {
         rx.await
             .map_err(|_| anyhow::anyhow!("engine driver stopped"))?
     }
+
+    pub(crate) async fn resource_snapshot(&self) -> anyhow::Result<GovernorSnapshot> {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        self.commands
+            .send(DriverCommand::ResourceSnapshot(reply))
+            .await
+            .map_err(|_| anyhow::anyhow!("engine driver stopped"))?;
+        rx.await
+            .map_err(|_| anyhow::anyhow!("engine driver stopped"))?
+    }
+
+    pub(crate) async fn set_vram_limit(
+        &self,
+        limit: ResourceLimit,
+    ) -> anyhow::Result<Result<GovernorSnapshot, EngineGovernorError>> {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        self.commands
+            .send(DriverCommand::SetVramLimit { limit, reply })
+            .await
+            .map_err(|_| anyhow::anyhow!("engine driver stopped"))?;
+        rx.await
+            .map_err(|_| anyhow::anyhow!("engine driver stopped"))?
+    }
 }
 
 fn run_engine_driver(owner: EngineOwner, rx: mpsc::Receiver<DriverCommand>, max_batch: usize) {
@@ -325,6 +355,16 @@ fn run_pipeline_driver(engine: &mut PipelineEngine, mut rx: mpsc::Receiver<Drive
             DriverCommand::Embed { reply, .. } => {
                 let _ = reply.send(Err(anyhow::anyhow!(
                     "embeddings are not supported by pipeline models"
+                )));
+            }
+            DriverCommand::ResourceSnapshot(reply) => {
+                let _ = reply.send(Err(anyhow::anyhow!(
+                    "resource governor is not available for pipeline models"
+                )));
+            }
+            DriverCommand::SetVramLimit { reply, .. } => {
+                let _ = reply.send(Err(anyhow::anyhow!(
+                    "resource governor is not available for pipeline models"
                 )));
             }
         }
@@ -555,6 +595,15 @@ fn handle_driver_command(engine: &mut Engine, command: DriverCommand) {
         } => {
             let _ = reply.send(engine.embed_with_options(&input_ids, options));
         }
+        DriverCommand::ResourceSnapshot(reply) => {
+            let _ = reply.send(Ok(engine.resource_snapshot()));
+        }
+        DriverCommand::SetVramLimit { limit, reply } => {
+            let result = engine
+                .set_vram_limit(limit)
+                .map(|_| engine.resource_snapshot());
+            let _ = reply.send(Ok(result));
+        }
     }
 }
 
@@ -569,7 +618,8 @@ fn run_pipeline_generation(
     let pipeline_request = match input {
         Some(input) => match Value::from_vec_f32(input.data, &input.shape) {
             Ok(value) => {
-                let mut req = PipelineGenerateRequest::new(request).with_input(input.endpoint, value);
+                let mut req =
+                    PipelineGenerateRequest::new(request).with_input(input.endpoint, value);
                 if let Some(num_tiles) = input.num_tiles {
                     req = req.with_image_tile_count(num_tiles);
                 }

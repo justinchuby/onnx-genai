@@ -31,7 +31,7 @@ mod sse;
 mod state;
 mod types;
 
-pub use models_config::{ModelsConfig, ModelSpec, from_models_dir};
+pub use models_config::{ModelSpec, ModelsConfig, from_models_dir};
 pub use registry::EvictionPolicy;
 pub use routes::{
     ParsedAssistantOutput, build_generate_request, build_prompt, parse_assistant_output,
@@ -53,6 +53,7 @@ pub fn app(state: AppState) -> Router {
         .route("/health", get(routes::health))
         .route("/v1/models", get(routes::models))
         .route("/v1/status", get(routes::status))
+        .route("/v1/resources", get(routes::resources))
         .route("/v1/sessions", post(routes::create_session))
         .route("/v1/sessions/{id}", delete(routes::delete_session))
         .route("/v1/completions", post(routes::completions))
@@ -76,11 +77,12 @@ pub fn app(state: AppState) -> Router {
     if state.config.enable_admin_endpoints {
         router = router
             .route("/v1/admin/models", get(routes::admin_list_models))
+            .route("/v1/admin/models/{id}/load", post(routes::admin_load_model))
+            .route("/v1/admin/models/{id}", delete(routes::admin_unload_model))
             .route(
-                "/v1/admin/models/{id}/load",
-                post(routes::admin_load_model),
-            )
-            .route("/v1/admin/models/{id}", delete(routes::admin_unload_model));
+                "/v1/admin/resources/vram-limit",
+                post(routes::admin_set_vram_limit),
+            );
     }
     #[cfg(feature = "metrics")]
     let router = router.route("/metrics", get(routes::prometheus_metrics));

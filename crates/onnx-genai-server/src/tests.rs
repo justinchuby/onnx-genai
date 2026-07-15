@@ -35,6 +35,23 @@ fn tiny_state_with_debug() -> AppState {
     .expect("load fixture with debug")
 }
 
+fn resource_state(allow_runtime_override: bool) -> AppState {
+    let model_dir =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-mtp-full");
+    let mut engine_config = EngineConfig::default();
+    engine_config.allow_runtime_override = allow_runtime_override;
+    AppState::load_with_config(
+        &model_dir,
+        Some("tiny-mtp-full".to_string()),
+        ServerConfig {
+            enable_admin_endpoints: true,
+            engine_config,
+            ..ServerConfig::default()
+        },
+    )
+    .expect("load resource API fixture")
+}
+
 fn sse_json_events(body: &[u8]) -> Vec<Value> {
     std::str::from_utf8(body)
         .unwrap()
@@ -614,8 +631,7 @@ async fn embeddings_success_path_returns_openai_compatible_response() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let body: Value =
-        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
-            .unwrap();
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
     assert_eq!(body["object"], "list");
     assert_eq!(body["model"], "tiny-mtp-full");
     let data = body["data"].as_array().unwrap();
@@ -649,8 +665,7 @@ async fn embeddings_success_path_returns_openai_compatible_response() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let body: Value =
-        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
-            .unwrap();
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
     let data = body["data"].as_array().unwrap();
     assert_eq!(data.len(), 2);
     assert_eq!(data[0]["index"], 0);
@@ -677,8 +692,7 @@ async fn embeddings_success_path_returns_openai_compatible_response() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let body: Value =
-        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
-            .unwrap();
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
     assert!(body["data"][0]["embedding"].is_string());
 }
 
@@ -1081,9 +1095,9 @@ async fn debug_endpoints_expose_config_sessions_cache_and_trace_state() {
     );
     // Redacted form starts with "sess-" and ends with "…"
     assert!(
-        session_list
-            .iter()
-            .any(|v| v.as_str().is_some_and(|s| s.starts_with("sess-") && s.ends_with('…'))),
+        session_list.iter().any(|v| v
+            .as_str()
+            .is_some_and(|s| s.starts_with("sess-") && s.ends_with('…'))),
         "expected a redacted session entry (sess-<prefix>…) in debug/sessions"
     );
 
@@ -1182,12 +1196,7 @@ async fn debug_endpoints_return_404_when_gate_is_off() {
     ] {
         let resp = router
             .clone()
-            .oneshot(
-                Request::builder()
-                    .uri(*path)
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(Request::builder().uri(*path).body(Body::empty()).unwrap())
             .await
             .unwrap();
         assert_eq!(
@@ -1257,11 +1266,107 @@ async fn metrics_exposes_prometheus_families_and_request_counter_increments() {
     assert!(body.contains("onnx_genai_batch_size_current"));
     assert!(body.contains("onnx_genai_prefix_cache_hit_rate"));
     assert!(body.contains("onnx_genai_rejections_total"));
+    assert!(body.contains("onnxgenai_vram_used_bytes"));
+    assert!(body.contains("onnxgenai_vram_limit_bytes"));
+    assert!(body.contains("onnxgenai_host_ram_used_bytes"));
+    assert!(body.contains("onnxgenai_host_ram_limit_bytes"));
+    assert!(body.contains("onnxgenai_kv_budget_bytes"));
     let after_health = prometheus_sample(
         &body,
         "onnx_genai_requests_total{endpoint=\"/health\",status=\"200\"}",
     );
     assert!(after_health >= before_health + 2);
+}
+
+#[tokio::test]
+async fn resources_get_and_admin_vram_override_report_governor_state() {
+    let router = app(resource_state(true));
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/resources")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    for key in [
+        "configured_limits",
+        "resolved_limits",
+        "derived_kv_budget",
+        "vram",
+        "host_ram",
+        "disk_spill",
+    ] {
+        assert!(body.get(key).is_some(), "missing resource key {key}");
+    }
+    for key in ["used", "limit", "headroom"] {
+        assert!(body["vram"].get(key).is_some(), "missing VRAM key {key}");
+        assert!(
+            body["host_ram"].get(key).is_some(),
+            "missing host RAM key {key}"
+        );
+    }
+
+    let impossible = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/admin/resources/vram-limit")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(json!({"limit": "1"}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(impossible.status(), StatusCode::CONFLICT);
+    let impossible = json_body(impossible).await;
+    assert!(
+        impossible["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("cannot satisfy lowered resource limit")
+    );
+
+    let valid = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/admin/resources/vram-limit")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(json!({"limit": "auto"}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(valid.status(), StatusCode::OK);
+    assert!(json_body(valid).await["vram"]["limit"].is_number());
+}
+
+#[tokio::test]
+async fn admin_vram_override_requires_engine_runtime_override() {
+    let response = app(resource_state(false))
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/admin/resources/vram-limit")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(json!({"limit": "auto"}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert!(
+        json_body(response).await["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("allow_runtime_override")
+    );
 }
 
 #[cfg(feature = "metrics")]
@@ -1577,10 +1682,7 @@ fn kv_cache_dtype_parses_all_accepted_values() {
     ] {
         let parsed = parse_kv_cache_dtype(input)
             .unwrap_or_else(|_| panic!("expected '{input}' to parse successfully"));
-        assert_eq!(
-            parsed, expected,
-            "'{input}' should parse to {expected:?}"
-        );
+        assert_eq!(parsed, expected, "'{input}' should parse to {expected:?}");
     }
 }
 
@@ -1625,11 +1727,18 @@ fn server_config_engine_config_kv_cache_dtype_can_be_set() {
 /// Load the tiny-llm fixture twice under two different ids to exercise
 /// multi-model routing without requiring a second distinct fixture.
 fn two_model_state() -> AppState {
-    let path =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
     let specs = vec![
-        ModelSpec { id: "model-a".to_string(), path: path.clone(), eager: true },
-        ModelSpec { id: "model-b".to_string(), path: path.clone(), eager: true },
+        ModelSpec {
+            id: "model-a".to_string(),
+            path: path.clone(),
+            eager: true,
+        },
+        ModelSpec {
+            id: "model-b".to_string(),
+            path: path.clone(),
+            eager: true,
+        },
     ];
     AppState::load_from_specs(specs, ServerConfig::default()).expect("load two tiny-llm fixtures")
 }
@@ -1745,8 +1854,14 @@ async fn models_endpoint_lists_all_loaded_models() {
         .iter()
         .map(|obj| obj["id"].as_str().unwrap())
         .collect();
-    assert!(ids.contains(&"model-a"), "model-a not in /v1/models: {body}");
-    assert!(ids.contains(&"model-b"), "model-b not in /v1/models: {body}");
+    assert!(
+        ids.contains(&"model-a"),
+        "model-a not in /v1/models: {body}"
+    );
+    assert!(
+        ids.contains(&"model-b"),
+        "model-b not in /v1/models: {body}"
+    );
     assert_eq!(ids.len(), 2);
 }
 
@@ -1778,11 +1893,13 @@ async fn unknown_model_returns_404_on_completions_endpoint() {
 async fn single_model_startup_still_works_via_load_with_config() {
     // Regression guard: the existing load_with_config / single-model path must
     // behave identically to M1.
-    let model_dir =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
-    let state =
-        AppState::load_with_config(&model_dir, Some("tiny-llm".to_string()), ServerConfig::default())
-            .expect("single-model load must still work");
+    let model_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
+    let state = AppState::load_with_config(
+        &model_dir,
+        Some("tiny-llm".to_string()),
+        ServerConfig::default(),
+    )
+    .expect("single-model load must still work");
     // Registry has exactly one entry with the expected id.
     assert_eq!(state.registry.ids().len(), 1);
     assert_eq!(state.registry.default_id().as_deref(), Some("tiny-llm"));
@@ -1817,8 +1934,16 @@ async fn single_model_startup_still_works_via_load_with_config() {
 fn lazy_state(config: ServerConfig) -> AppState {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
     let specs = vec![
-        ModelSpec { id: "model-a".to_string(), path: path.clone(), eager: true },
-        ModelSpec { id: "model-b".to_string(), path: path.clone(), eager: false },
+        ModelSpec {
+            id: "model-a".to_string(),
+            path: path.clone(),
+            eager: true,
+        },
+        ModelSpec {
+            id: "model-b".to_string(),
+            path: path.clone(),
+            eager: false,
+        },
     ];
     AppState::load_from_specs(specs, config).expect("load lazy two-model state")
 }
@@ -1918,10 +2043,7 @@ async fn admin_unload_then_lazy_reload() {
     assert!(state.registry.contains_available("model-a"));
 
     // A subsequent request for the default (empty model) lazily reloads it.
-    let resp = app(state.clone())
-        .oneshot(chat_request(""))
-        .await
-        .unwrap();
+    let resp = app(state.clone()).oneshot(chat_request("")).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     assert!(state.registry.resolve("model-a").is_some());
 }
@@ -1987,7 +2109,11 @@ async fn max_loaded_models_evicts_least_recently_used() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    assert_eq!(state.registry.ids(), vec!["model-b"], "model-a should be evicted");
+    assert_eq!(
+        state.registry.ids(),
+        vec!["model-b"],
+        "model-a should be evicted"
+    );
     assert!(state.registry.contains_available("model-a"));
 }
 
@@ -2029,6 +2155,7 @@ async fn admin_endpoints_return_404_when_gate_is_off() {
         ("GET", "/v1/admin/models"),
         ("POST", "/v1/admin/models/model-b/load"),
         ("DELETE", "/v1/admin/models/model-a"),
+        ("POST", "/v1/admin/resources/vram-limit"),
     ] {
         let resp = app(state.clone())
             .oneshot(
@@ -2110,7 +2237,11 @@ async fn concurrent_lazy_loads_of_same_id_load_once() {
     for _ in 0..8 {
         let state = state.clone();
         handles.push(tokio::spawn(async move {
-            app(state).oneshot(chat_request("model-b")).await.unwrap().status()
+            app(state)
+                .oneshot(chat_request("model-b"))
+                .await
+                .unwrap()
+                .status()
         }));
     }
     for handle in handles {

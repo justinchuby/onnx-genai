@@ -7,6 +7,8 @@ use std::{
 use std::fmt::Write;
 
 use axum::http::StatusCode;
+#[cfg(feature = "metrics")]
+use onnx_genai_engine::GovernorSnapshot;
 
 const ENDPOINTS: [&str; 14] = [
     "/health",
@@ -307,6 +309,74 @@ pub(crate) fn encode_prometheus() -> String {
         "onnx_genai_rejections_total",
         "HTTP requests rejected for overload.",
         REGISTRY.rejections.load(Ordering::Relaxed),
+    );
+    output
+}
+
+#[cfg(feature = "metrics")]
+pub(crate) fn encode_resource_governor(snapshot: &GovernorSnapshot) -> String {
+    let mut output = String::new();
+    gauge(
+        &mut output,
+        "onnxgenai_vram_used_bytes",
+        "VRAM currently used.",
+        snapshot.vram.used,
+    );
+    gauge(
+        &mut output,
+        "onnxgenai_vram_limit_bytes",
+        "Configured VRAM ceiling.",
+        snapshot.vram.limit,
+    );
+    gauge(
+        &mut output,
+        "onnxgenai_vram_headroom_bytes",
+        "VRAM bytes below the configured ceiling.",
+        snapshot.vram.headroom,
+    );
+    gauge(
+        &mut output,
+        "onnxgenai_host_ram_used_bytes",
+        "Host RAM currently used.",
+        snapshot.host_ram.used,
+    );
+    gauge(
+        &mut output,
+        "onnxgenai_host_ram_limit_bytes",
+        "Configured host RAM ceiling.",
+        snapshot.host_ram.limit,
+    );
+    gauge(
+        &mut output,
+        "onnxgenai_host_ram_headroom_bytes",
+        "Host RAM bytes below the configured ceiling.",
+        snapshot.host_ram.headroom,
+    );
+    if let Some(disk) = snapshot.disk_spill {
+        gauge(
+            &mut output,
+            "onnxgenai_disk_spill_used_bytes",
+            "Disk spill currently used.",
+            disk.used,
+        );
+        gauge(
+            &mut output,
+            "onnxgenai_disk_spill_limit_bytes",
+            "Configured disk spill ceiling.",
+            disk.limit,
+        );
+        gauge(
+            &mut output,
+            "onnxgenai_disk_spill_headroom_bytes",
+            "Disk spill bytes below the configured ceiling.",
+            disk.headroom,
+        );
+    }
+    gauge(
+        &mut output,
+        "onnxgenai_kv_budget_bytes",
+        "Derived VRAM budget available to KV cache.",
+        snapshot.derived_budget.kv_bytes,
     );
     output
 }
