@@ -30,9 +30,9 @@ use cudarc::driver::{LaunchConfig, PushKernelArg};
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ir::{DataType, Node};
 
-use crate::blas::{gemm_ex, GemmDtype, GemmEx, WORKSPACE_BYTES};
+use crate::blas::{GemmDtype, GemmEx, WORKSPACE_BYTES, gemm_ex};
 use crate::error::{driver_err, not_implemented};
-use crate::runtime::{cuptr, CudaRuntime};
+use crate::runtime::{CudaRuntime, cuptr};
 
 /// NVRTC source for the fused `beta·C` bias epilogue. `C` is addressed through
 /// two broadcast strides (`0` for a size-1 dim), so one kernel covers scalar,
@@ -162,7 +162,7 @@ fn bias_strides(c: &[usize], m: usize, n: usize) -> Result<(i32, i32)> {
             return Err(not_implemented(format!(
                 "Gemm bias C rank {} (bias must broadcast to [M,N]; rank <= 2)",
                 c.len()
-            )))
+            )));
         }
     };
     if (cr != 1 && cr != m) || (cc != 1 && cc != n) {

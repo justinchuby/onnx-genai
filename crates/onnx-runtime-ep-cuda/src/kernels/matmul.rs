@@ -20,7 +20,7 @@ use onnx_runtime_ir::{DataType, Node};
 
 use crate::blas::{self, GemmDtype, GemmParams, WORKSPACE_BYTES};
 use crate::error::not_implemented;
-use crate::runtime::{cuptr, CudaRuntime};
+use crate::runtime::{CudaRuntime, cuptr};
 
 /// Factory for [`MatMulKernel`]; carries the shared CUDA runtime.
 pub struct MatMulFactory {

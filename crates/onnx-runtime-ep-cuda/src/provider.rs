@@ -29,7 +29,7 @@ use onnx_runtime_ep_api::{
 use onnx_runtime_ir::{DeviceId, DeviceType, Node, Shape, TensorLayout};
 
 use crate::kernels::build_cuda_registry;
-use crate::runtime::{cuptr, raw_ptr, CudaRuntime};
+use crate::runtime::{CudaRuntime, cuptr, raw_ptr};
 
 /// CUDA execution provider (Phase 2a: cudarc + cuBLASLt GEMM).
 ///
@@ -184,8 +184,16 @@ impl ExecutionProvider for CudaExecutionProvider {
     }
 
     fn copy(&self, src: &DeviceBuffer, dst: &mut DeviceBuffer, size: usize) -> Result<()> {
-        assert_eq!(src.device(), self.device, "cuda_ep::copy: foreign src buffer");
-        assert_eq!(dst.device(), self.device, "cuda_ep::copy: foreign dst buffer");
+        assert_eq!(
+            src.device(),
+            self.device,
+            "cuda_ep::copy: foreign src buffer"
+        );
+        assert_eq!(
+            dst.device(),
+            self.device,
+            "cuda_ep::copy: foreign dst buffer"
+        );
         if size > src.len() || size > dst.len() {
             return Err(EpError::KernelFailed(format!(
                 "cuda_ep::copy: size {size} exceeds src {} or dst {}",

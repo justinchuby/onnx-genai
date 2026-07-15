@@ -17,7 +17,7 @@ use onnx_runtime_ep_api::{
 };
 use onnx_runtime_ep_cuda::runtime::cuptr;
 use onnx_runtime_ep_cuda::{AttentionKernel, CudaExecutionProvider};
-use onnx_runtime_ir::{compute_contiguous_strides, DataType, DeviceId};
+use onnx_runtime_ir::{DataType, DeviceId, compute_contiguous_strides};
 use std::sync::Arc;
 
 fn f32_bytes(v: &[f32]) -> &[u8] {
@@ -139,9 +139,7 @@ fn run_gpu_attention(
         let buf = ep.allocate(std::mem::size_of_val(data), 256).unwrap();
         // SAFETY: buffer sized for the byte slice we copy in.
         unsafe {
-            runtime
-                .htod(f32_bytes(data), cuptr(buf.as_ptr()))
-                .unwrap();
+            runtime.htod(f32_bytes(data), cuptr(buf.as_ptr())).unwrap();
         }
         Buf(buf)
     };
@@ -159,9 +157,27 @@ fn run_gpu_attention(
     let v_str = compute_contiguous_strides(v_shape);
     let o_str = compute_contiguous_strides(out_shape);
 
-    let qv = TensorView::new(DevicePtr(q_buf.0.as_ptr()), DataType::Float32, q_shape, &q_str, dev);
-    let kv = TensorView::new(DevicePtr(k_buf.0.as_ptr()), DataType::Float32, k_shape, &k_str, dev);
-    let vv = TensorView::new(DevicePtr(v_buf.0.as_ptr()), DataType::Float32, v_shape, &v_str, dev);
+    let qv = TensorView::new(
+        DevicePtr(q_buf.0.as_ptr()),
+        DataType::Float32,
+        q_shape,
+        &q_str,
+        dev,
+    );
+    let kv = TensorView::new(
+        DevicePtr(k_buf.0.as_ptr()),
+        DataType::Float32,
+        k_shape,
+        &k_str,
+        dev,
+    );
+    let vv = TensorView::new(
+        DevicePtr(v_buf.0.as_ptr()),
+        DataType::Float32,
+        v_shape,
+        &v_str,
+        dev,
+    );
 
     let mask_str = mask_shape.map(compute_contiguous_strides);
     let mut inputs = vec![qv, kv, vv];
@@ -236,9 +252,21 @@ fn attention_f32_on_gpu_matches_cpu_reference() {
         let k = fill(b * h * s * d, 2);
         let v = fill(b * h * s * d, 3);
         let got = run_gpu_attention(
-            &ep, &runtime, &q, &k, &v, None,
-            &[b, h, s, d], &[b, h, s, d], &[b, h, s, d], None, &[b, h, s, d],
-            h, h, false, Some(scale),
+            &ep,
+            &runtime,
+            &q,
+            &k,
+            &v,
+            None,
+            &[b, h, s, d],
+            &[b, h, s, d],
+            &[b, h, s, d],
+            None,
+            &[b, h, s, d],
+            h,
+            h,
+            false,
+            Some(scale),
         );
         let want = cpu_reference(&q, &k, &v, b, h, h, s, s, d, scale, false, None);
         let err = max_abs_err(&got, &want);
@@ -254,9 +282,21 @@ fn attention_f32_on_gpu_matches_cpu_reference() {
         let k = fill(b * h * s * d, 20);
         let v = fill(b * h * s * d, 30);
         let got = run_gpu_attention(
-            &ep, &runtime, &q, &k, &v, None,
-            &[b, h, s, d], &[b, h, s, d], &[b, h, s, d], None, &[b, h, s, d],
-            h, h, true, Some(scale),
+            &ep,
+            &runtime,
+            &q,
+            &k,
+            &v,
+            None,
+            &[b, h, s, d],
+            &[b, h, s, d],
+            &[b, h, s, d],
+            None,
+            &[b, h, s, d],
+            h,
+            h,
+            true,
+            Some(scale),
         );
         let want = cpu_reference(&q, &k, &v, b, h, h, s, s, d, scale, true, None);
         let err = max_abs_err(&got, &want);
@@ -272,9 +312,21 @@ fn attention_f32_on_gpu_matches_cpu_reference() {
         let k = fill(b * hkv * s * d, 5);
         let v = fill(b * hkv * s * d, 6);
         let got = run_gpu_attention(
-            &ep, &runtime, &q, &k, &v, None,
-            &[b, hq, s, d], &[b, hkv, s, d], &[b, hkv, s, d], None, &[b, hq, s, d],
-            hq, hkv, true, Some(scale),
+            &ep,
+            &runtime,
+            &q,
+            &k,
+            &v,
+            None,
+            &[b, hq, s, d],
+            &[b, hkv, s, d],
+            &[b, hkv, s, d],
+            None,
+            &[b, hq, s, d],
+            hq,
+            hkv,
+            true,
+            Some(scale),
         );
         let want = cpu_reference(&q, &k, &v, b, hq, hkv, s, s, d, scale, true, None);
         let err = max_abs_err(&got, &want);
@@ -300,13 +352,27 @@ fn attention_f32_on_gpu_matches_cpu_reference() {
             }
         }
         let got = run_gpu_attention(
-            &ep, &runtime, &q, &k, &v, Some(&mask),
-            &[b, hq, sq, d], &[b, hkv, sk, d], &[b, hkv, sk, d], Some(&[sq, sk]), &[b, hq, sq, d],
-            hq, hkv, false, Some(scale),
+            &ep,
+            &runtime,
+            &q,
+            &k,
+            &v,
+            Some(&mask),
+            &[b, hq, sq, d],
+            &[b, hkv, sk, d],
+            &[b, hkv, sk, d],
+            Some(&[sq, sk]),
+            &[b, hq, sq, d],
+            hq,
+            hkv,
+            false,
+            Some(scale),
         );
         let want = cpu_reference(&q, &k, &v, b, hq, hkv, sq, sk, d, scale, false, Some(&mask));
         let err = max_abs_err(&got, &want);
-        println!("case4 GQA+mask xattn  Sq={sq} Sk={sk} Hq={hq} Hkv={hkv} D={d}  max_abs_err={err:e}");
+        println!(
+            "case4 GQA+mask xattn  Sq={sq} Sk={sk} Hq={hq} Hkv={hkv} D={d}  max_abs_err={err:e}"
+        );
         assert!(err < tol, "GQA+mask err {err:e} >= {tol:e}");
     }
 
@@ -335,9 +401,27 @@ fn attention_rejects_unsupported_dtype_and_rank() {
     let mut out = ep.allocate(256, 256).unwrap();
     let shape3 = [1usize, 4, 16];
     let s3 = compute_contiguous_strides(&shape3);
-    let qv = TensorView::new(DevicePtr(buf.as_ptr()), DataType::Float32, &shape3, &s3, dev);
-    let kv = TensorView::new(DevicePtr(buf.as_ptr()), DataType::Float32, &shape3, &s3, dev);
-    let vv = TensorView::new(DevicePtr(buf.as_ptr()), DataType::Float32, &shape3, &s3, dev);
+    let qv = TensorView::new(
+        DevicePtr(buf.as_ptr()),
+        DataType::Float32,
+        &shape3,
+        &s3,
+        dev,
+    );
+    let kv = TensorView::new(
+        DevicePtr(buf.as_ptr()),
+        DataType::Float32,
+        &shape3,
+        &s3,
+        dev,
+    );
+    let vv = TensorView::new(
+        DevicePtr(buf.as_ptr()),
+        DataType::Float32,
+        &shape3,
+        &s3,
+        dev,
+    );
     let ov = TensorMut::new(
         DevicePtrMut(out.as_mut_ptr()),
         DataType::Float32,
@@ -351,7 +435,10 @@ fn attention_rejects_unsupported_dtype_and_rank() {
         .expect_err("rank-3 attention must be rejected in Phase 2a");
     let msg = format!("{err}");
     println!("rank error: {msg}");
-    assert!(msg.contains("Phase 2a") || msg.contains("Phase-2a"), "{msg}");
+    assert!(
+        msg.contains("Phase 2a") || msg.contains("Phase-2a"),
+        "{msg}"
+    );
 
     ep.deallocate(buf).unwrap();
     ep.deallocate(out).unwrap();

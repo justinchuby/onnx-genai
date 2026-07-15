@@ -31,7 +31,7 @@ use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, Ten
 use onnx_runtime_ir::{DataType, Node};
 
 use crate::error::{driver_err, not_implemented};
-use crate::runtime::{cuptr, CudaRuntime};
+use crate::runtime::{CudaRuntime, cuptr};
 
 /// Threads per block for the 1-D pointwise grids (a full warp-multiple block).
 const BLOCK: u32 = 256;
@@ -259,9 +259,8 @@ impl UnaryKernel {
         }
 
         let n = x.numel();
-        let n_i = i32::try_from(n).map_err(|_| {
-            EpError::KernelFailed(format!("cuda_ep {op}: {n} elements exceed i32"))
-        })?;
+        let n_i = i32::try_from(n)
+            .map_err(|_| EpError::KernelFailed(format!("cuda_ep {op}: {n} elements exceed i32")))?;
         let x_ptr = cuptr(x.data_ptr::<u8>() as *const c_void);
         let y_ptr = cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void);
 
@@ -358,9 +357,8 @@ impl BinaryKernel {
         }
 
         let n = a.numel();
-        let n_i = i32::try_from(n).map_err(|_| {
-            EpError::KernelFailed(format!("cuda_ep {op}: {n} elements exceed i32"))
-        })?;
+        let n_i = i32::try_from(n)
+            .map_err(|_| EpError::KernelFailed(format!("cuda_ep {op}: {n} elements exceed i32")))?;
         let a_ptr = cuptr(a.data_ptr::<u8>() as *const c_void);
         let b_ptr = cuptr(b.data_ptr::<u8>() as *const c_void);
         let y_ptr = cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void);

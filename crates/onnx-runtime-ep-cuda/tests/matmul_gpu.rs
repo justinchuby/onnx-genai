@@ -10,9 +10,9 @@
 //!   LD_LIBRARY_PATH=/path/to/cuda/lib cargo test -p onnx-runtime-ep-cuda
 
 use onnx_runtime_ep_api::{DevicePtr, DevicePtrMut, ExecutionProvider, TensorMut, TensorView};
-use onnx_runtime_ep_cuda::runtime::cuptr;
 use onnx_runtime_ep_cuda::CudaExecutionProvider;
-use onnx_runtime_ir::{compute_contiguous_strides, DataType, DeviceId, Node, NodeId};
+use onnx_runtime_ep_cuda::runtime::cuptr;
+use onnx_runtime_ir::{DataType, DeviceId, Node, NodeId, compute_contiguous_strides};
 
 /// Reinterpret an `&[f32]` as its little-endian bytes (host side).
 fn f32_bytes(v: &[f32]) -> &[u8] {
@@ -134,7 +134,10 @@ fn matmul_f32_on_gpu_matches_cpu_reference() {
     let expected = cpu_reference(&a, &b, 1, 2, 3, 2);
     println!("case1 gpu={got:?} expected={expected:?}");
     assert_eq!(expected, vec![58., 64., 139., 154.], "reference sanity");
-    assert!(approx_eq(&got, &expected, 1e-4), "gpu {got:?} vs {expected:?}");
+    assert!(
+        approx_eq(&got, &expected, 1e-4),
+        "gpu {got:?} vs {expected:?}"
+    );
 
     // Case 2: fractional f32 values — this WOULD fail under a TF32 compute type
     // (~1e-3 error), so passing at 1e-4 proves we requested true fp32.
@@ -198,8 +201,20 @@ fn matmul_rejects_unsupported_rank_and_dtype() {
     let a_str = compute_contiguous_strides(&a_shape);
     let b_str = compute_contiguous_strides(&b_shape);
     let o_str = compute_contiguous_strides(&out_shape);
-    let av = TensorView::new(DevicePtr(a_buf.as_ptr()), DataType::Float32, &a_shape, &a_str, dev);
-    let bv = TensorView::new(DevicePtr(b_buf.as_ptr()), DataType::Float32, &b_shape, &b_str, dev);
+    let av = TensorView::new(
+        DevicePtr(a_buf.as_ptr()),
+        DataType::Float32,
+        &a_shape,
+        &a_str,
+        dev,
+    );
+    let bv = TensorView::new(
+        DevicePtr(b_buf.as_ptr()),
+        DataType::Float32,
+        &b_shape,
+        &b_str,
+        dev,
+    );
     let ov = TensorMut::new(
         DevicePtrMut(c_buf.as_mut_ptr()),
         DataType::Float32,

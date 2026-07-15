@@ -42,7 +42,7 @@ use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, Ten
 use onnx_runtime_ir::{DataType, Node};
 
 use crate::error::{driver_err, not_implemented};
-use crate::runtime::{cuptr, CudaRuntime};
+use crate::runtime::{CudaRuntime, cuptr};
 
 /// Threads per block for the 1-D pointwise grids (a full warp-multiple block).
 const BLOCK: u32 = 256;
@@ -265,9 +265,9 @@ impl UnaryMathKernel {
         let x_ptr = cuptr(x.data_ptr::<u8>() as *const c_void);
         let y_ptr = cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void);
 
-        let func = self
-            .runtime
-            .nvrtc_function(UNARY_MATH_MODULE, UNARY_MATH_SRC, self.op.entry())?;
+        let func =
+            self.runtime
+                .nvrtc_function(UNARY_MATH_MODULE, UNARY_MATH_SRC, self.op.entry())?;
         let cfg = LaunchConfig {
             grid_dim: (grid_for(n), 1, 1),
             block_dim: (BLOCK, 1, 1),
@@ -363,7 +363,9 @@ impl NotKernel {
         let x_ptr = cuptr(x.data_ptr::<u8>() as *const c_void);
         let y_ptr = cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void);
 
-        let func = self.runtime.nvrtc_function(NOT_MODULE, NOT_SRC, "not_bool")?;
+        let func = self
+            .runtime
+            .nvrtc_function(NOT_MODULE, NOT_SRC, "not_bool")?;
         let cfg = LaunchConfig {
             grid_dim: (grid_for(n), 1, 1),
             block_dim: (BLOCK, 1, 1),
@@ -619,7 +621,9 @@ impl BinaryPredKernel {
         let b_ptr = cuptr(b.data_ptr::<u8>() as *const c_void);
         let y_ptr = cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void);
 
-        let func = self.runtime.nvrtc_function(self.module, self.src, self.entry)?;
+        let func = self
+            .runtime
+            .nvrtc_function(self.module, self.src, self.entry)?;
         let cfg = LaunchConfig {
             grid_dim: (grid_for(n), 1, 1),
             block_dim: (BLOCK, 1, 1),
@@ -716,7 +720,10 @@ mod tests {
     fn round_uses_ties_to_even_intrinsic() {
         // ONNX Round is round-half-to-even; `roundf` (half-away-from-zero) would
         // be wrong, so the kernel must use `rintf`.
-        assert!(UNARY_MATH_SRC.contains("rintf(x[i])"), "Round must use rintf");
+        assert!(
+            UNARY_MATH_SRC.contains("rintf(x[i])"),
+            "Round must use rintf"
+        );
         assert!(
             !UNARY_MATH_SRC.contains("roundf("),
             "Round must not use half-away-from-zero roundf"
@@ -726,7 +733,10 @@ mod tests {
     #[test]
     fn sign_handles_nan_and_zero_like_cpu() {
         // NaN -> NaN (v != v guard) and the zero case falls through to 0.0f.
-        assert!(UNARY_MATH_SRC.contains("(v != v) ? v"), "sign must guard NaN");
+        assert!(
+            UNARY_MATH_SRC.contains("(v != v) ? v"),
+            "sign must guard NaN"
+        );
     }
 
     #[test]

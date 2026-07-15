@@ -17,7 +17,12 @@ fn bytes_to_f32(bytes: &[u8]) -> Vec<f32> {
         .collect()
 }
 
-fn run(ep: &CudaExecutionProvider, node: &Node, x: &[f32], bounds: Option<(f32, f32)>) -> Vec<f32> {
+fn run(
+    ep: &CudaExecutionProvider,
+    node: &Node,
+    x: &[f32],
+    bounds: Option<(Option<f32>, Option<f32>)>,
+) -> Vec<f32> {
     let rt = ep.runtime();
     let dev: DeviceId = ep.device_id();
     let shape = [x.len()];
@@ -46,18 +51,22 @@ fn run(ep: &CudaExecutionProvider, node: &Node, x: &[f32], bounds: Option<(f32, 
     let scalar_shape: [usize; 0] = [];
     let scalar_strides: [i64; 0] = [];
     if let Some((min, max)) = bounds {
-        for value in [min, max] {
-            let buf = ep.allocate(4, 256).unwrap();
-            // SAFETY: buf is a four-byte allocation for one f32.
-            unsafe { rt.htod(f32_bytes(&[value]), cuptr(buf.as_ptr())).unwrap() };
-            inputs.push(TensorView::new(
-                DevicePtr(buf.as_ptr()),
-                DataType::Float32,
-                &scalar_shape,
-                &scalar_strides,
-                dev,
-            ));
-            bound_buffers.push(buf);
+        for bound in [min, max] {
+            if let Some(value) = bound {
+                let buf = ep.allocate(4, 256).unwrap();
+                // SAFETY: buf is a four-byte allocation for one f32.
+                unsafe { rt.htod(f32_bytes(&[value]), cuptr(buf.as_ptr())).unwrap() };
+                inputs.push(TensorView::new(
+                    DevicePtr(buf.as_ptr()),
+                    DataType::Float32,
+                    &scalar_shape,
+                    &scalar_strides,
+                    dev,
+                ));
+                bound_buffers.push(buf);
+            } else if max.is_some() {
+                inputs.push(TensorView::absent(DataType::Float32));
+            }
         }
     }
 
@@ -118,7 +127,7 @@ fn wave4_activations_match_cpu_references() {
         &x.map(|v| (0.2 * v + 0.5).clamp(0.0, 1.0)),
     );
     assert_close(
-        &run(&ep, &node("Clip"), &x, Some((-1.0, 1.0))),
+        &run(&ep, &node("Clip"), &x, Some((Some(-1.0), Some(1.0)))),
         &x.map(|v| v.clamp(-1.0, 1.0)),
     );
     assert_close(
@@ -129,4 +138,42 @@ fn wave4_activations_match_cpu_references() {
         &run(&ep, &node("Selu"), &x, None),
         &x.map(|v| 1.0507 * if v >= 0.0 { v } else { 1.67326 * v.exp_m1() }),
     );
+}
+
+#[test]
+fn clip_optional_bounds_match_cpu_reference() {
+    let ep = match std::panic::catch_unwind(CudaExecutionProvider::new_default) {
+        Ok(Ok(ep)) => ep,
+        Ok(Err(error)) => {
+            eprintln!("skip: no CUDA GPU/runtime available ({error})");
+            return;
+        }
+        Err(_) => {
+            eprintln!("skip: CUDA runtime library loading panicked (library unavailable)");
+            return;
+        }
+    };
+    let x = [
+        f32::NEG_INFINITY,
+        -3.0,
+        -1.0,
+        0.5,
+        2.0,
+        f32::INFINITY,
+        f32::NAN,
+    ];
+    let clip = Node::new(NodeId(0), "Clip", vec![], vec![]);
+    let cases = [
+        (Some((Some(-1.0), Some(1.0))), -1.0, 1.0),
+        (Some((Some(-1.0), None)), -1.0, f32::MAX),
+        (Some((None, Some(1.0))), f32::MIN, 1.0),
+        (None, f32::MIN, f32::MAX),
+    ];
+
+    for (bounds, min, max) in cases {
+        assert_close(
+            &run(&ep, &clip, &x, bounds),
+            &x.map(|value| value.clamp(min, max)),
+        );
+    }
 }

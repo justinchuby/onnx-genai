@@ -44,7 +44,7 @@ use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, Ten
 use onnx_runtime_ir::{DataType, Node};
 
 use crate::error::{driver_err, not_implemented};
-use crate::runtime::{cuptr, CudaRuntime};
+use crate::runtime::{CudaRuntime, cuptr};
 
 /// Threads per block for the 1-D pointwise cast grid.
 const BLOCK: u32 = 256;
@@ -266,7 +266,9 @@ impl CastKernel {
             (
                 CAST_HALF_MODULE,
                 "cast_half",
-                format!("#include <cuda_fp16.h>\n#include <cuda_bf16.h>\n{CAST_HELPERS}{CAST_HALF_ENTRY}"),
+                format!(
+                    "#include <cuda_fp16.h>\n#include <cuda_bf16.h>\n{CAST_HELPERS}{CAST_HALF_ENTRY}"
+                ),
             )
         } else {
             (

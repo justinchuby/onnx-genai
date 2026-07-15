@@ -63,9 +63,9 @@ use cudarc::driver::{LaunchConfig, PushKernelArg};
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ir::{DataType, Node};
 
-use crate::blas::{gemm_ex, GemmDtype, GemmEx, WORKSPACE_BYTES};
+use crate::blas::{GemmDtype, GemmEx, WORKSPACE_BYTES, gemm_ex};
 use crate::error::{driver_err, not_implemented};
-use crate::runtime::{cuptr, CudaRuntime};
+use crate::runtime::{CudaRuntime, cuptr};
 
 /// NVRTC source for the fused, numerically-stable softmax over the last (keys)
 /// axis of the score matrix, with `causal` + optional additive `mask` folded in.
@@ -273,8 +273,12 @@ impl AttentionKernel {
         let mask = inputs.get(3);
 
         // Phase-2a is f32-only (fp16 SDPA arrives with cuDNN in Phase 2b).
-        for (name, dt) in [("Q", q.dtype), ("K", k.dtype), ("V", v.dtype), ("O", outputs[0].dtype)]
-        {
+        for (name, dt) in [
+            ("Q", q.dtype),
+            ("K", k.dtype),
+            ("V", v.dtype),
+            ("O", outputs[0].dtype),
+        ] {
             if dt != DataType::Float32 {
                 return Err(not_implemented(format!(
                     "Attention with {name} dtype {dt:?} (Phase-2a baseline is f32-only)"
@@ -375,10 +379,7 @@ impl AttentionKernel {
                         batch * self.num_heads
                     )));
                 }
-                (
-                    cuptr(m.data_ptr::<u8>() as *const c_void),
-                    planes as i32,
-                )
+                (cuptr(m.data_ptr::<u8>() as *const c_void), planes as i32)
             }
         };
 
@@ -396,8 +397,20 @@ impl AttentionKernel {
         let workspace = self.runtime.alloc_raw(WORKSPACE_BYTES)?;
 
         let result = self.run_stages(
-            batch, sq, sk, d, group, scale, q_base, k_base, v_base, o_base, scores_buf, workspace,
-            mask_ptr, mask_planes,
+            batch,
+            sq,
+            sk,
+            d,
+            group,
+            scale,
+            q_base,
+            k_base,
+            v_base,
+            o_base,
+            scores_buf,
+            workspace,
+            mask_ptr,
+            mask_planes,
         );
 
         // Always release scratch + workspace, even on failure.
@@ -475,12 +488,8 @@ impl AttentionKernel {
         let nrows_i = i32::try_from(nrows).map_err(|_| {
             EpError::KernelFailed(format!("cuda_ep Attention: {nrows} score rows exceed i32"))
         })?;
-        let (sk_i, sq_i, heads_i, batch_i) = (
-            sk as i32,
-            sq as i32,
-            self.num_heads as i32,
-            batch as i32,
-        );
+        let (sk_i, sq_i, heads_i, batch_i) =
+            (sk as i32, sq as i32, self.num_heads as i32, batch as i32);
         let causal_i: i32 = self.causal.into();
         let stream_ref = self.runtime.stream();
         // Device pointers are passed by value (as u64) — a CUDA pointer kernel
@@ -499,8 +508,7 @@ impl AttentionKernel {
         // SAFETY: `func` is the compiled softmax entry; the argument list and
         // its ABI match the kernel signature; `scores_buf`/`mask_ptr` are live
         // device allocations sized for [nrows, sk] / the mask planes.
-        unsafe { builder.launch(cfg) }
-            .map_err(|e| driver_err("launch attn_softmax_f32", e))?;
+        unsafe { builder.launch(cfg) }.map_err(|e| driver_err("launch attn_softmax_f32", e))?;
 
         // Stage 3: per-head O = P·V.  Column-major C[D,Sq] = Vᵀ·Pᵀ.
         for b in 0..batch {

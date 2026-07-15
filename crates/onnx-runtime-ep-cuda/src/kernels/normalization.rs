@@ -41,7 +41,7 @@ use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, Ten
 use onnx_runtime_ir::{DataType, Node};
 
 use crate::error::{driver_err, not_implemented};
-use crate::runtime::{cuptr, CudaRuntime};
+use crate::runtime::{CudaRuntime, cuptr};
 
 use super::softmax::resolve_axis;
 
@@ -264,7 +264,9 @@ fn require_contiguous(op: &str, name: &str, contiguous: bool) -> Result<()> {
 }
 
 fn dim_overflow(op: &str, name: &str, v: usize) -> EpError {
-    EpError::KernelFailed(format!("cuda_ep {op}: {name} ({v}) exceeds the i32 kernel bound"))
+    EpError::KernelFailed(format!(
+        "cuda_ep {op}: {name} ({v}) exceeds the i32 kernel bound"
+    ))
 }
 
 // ───────────────────────────── LayerNormalization ──────────────────────────
@@ -374,9 +376,9 @@ impl LayerNormKernel {
         let eps = self.epsilon;
         let groups_i = groups_u_i32(groups_u);
 
-        let func =
-            self.runtime
-                .nvrtc_function(LAYERNORM_MODULE, LAYERNORM_SRC, "layernorm_f32")?;
+        let func = self
+            .runtime
+            .nvrtc_function(LAYERNORM_MODULE, LAYERNORM_SRC, "layernorm_f32")?;
         let cfg = launch_cfg(groups_u);
         let stream = self.runtime.stream();
         let mut builder = stream.launch_builder(&func);

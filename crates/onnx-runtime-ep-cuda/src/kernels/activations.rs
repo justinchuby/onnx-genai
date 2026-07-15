@@ -136,11 +136,11 @@ fn activation_from_node(name: &str, node: &Node) -> Result<ActivationOp> {
             min: node
                 .attr("min")
                 .and_then(|a| a.as_float())
-                .unwrap_or(f32::NEG_INFINITY),
+                .unwrap_or(f32::MIN),
             max: node
                 .attr("max")
                 .and_then(|a| a.as_float())
-                .unwrap_or(f32::INFINITY),
+                .unwrap_or(f32::MAX),
         },
         "Softsign" => ActivationOp::Softsign,
         "Selu" => ActivationOp::Selu {
@@ -217,11 +217,13 @@ impl ActivationKernel {
 
         let (mut p0, mut p1) = self.op.params();
         if matches!(self.op, ActivationOp::Clip { .. }) {
-            if inputs.len() > 1 {
-                p0 = self.read_scalar("min", &inputs[1])?;
+            // Optional inputs retain their positional slots, so max may be
+            // present at index 2 while the min placeholder at index 1 is absent.
+            if let Some(min) = inputs.get(1).filter(|input| !input.is_absent()) {
+                p0 = self.read_scalar("min", min)?;
             }
-            if inputs.len() > 2 {
-                p1 = self.read_scalar("max", &inputs[2])?;
+            if let Some(max) = inputs.get(2).filter(|input| !input.is_absent()) {
+                p1 = self.read_scalar("max", max)?;
             }
             if p0 > p1 {
                 return Err(EpError::KernelFailed(
@@ -307,8 +309,8 @@ mod tests {
                 beta: 0.5,
             },
             ActivationOp::Clip {
-                min: f32::NEG_INFINITY,
-                max: f32::INFINITY,
+                min: f32::MIN,
+                max: f32::MAX,
             },
             ActivationOp::Softsign,
             ActivationOp::Selu {
@@ -335,6 +337,13 @@ mod tests {
             ActivationOp::HardSigmoid {
                 alpha: 0.2,
                 beta: 0.5
+            }
+        );
+        assert_eq!(
+            activation_from_node("Clip", &node("Clip")).unwrap(),
+            ActivationOp::Clip {
+                min: f32::MIN,
+                max: f32::MAX
             }
         );
         assert_eq!(

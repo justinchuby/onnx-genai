@@ -62,6 +62,6 @@ pub mod provider;
 pub mod runtime;
 
 pub use kernels::attention::AttentionKernel;
-pub use kernels::{build_cuda_registry, CUDA_COVERED_OPS};
+pub use kernels::{CUDA_COVERED_OPS, build_cuda_registry};
 pub use provider::CudaExecutionProvider;
 pub use runtime::CudaRuntime;
