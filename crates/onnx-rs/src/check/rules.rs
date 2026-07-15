@@ -36,39 +36,19 @@ impl ValidationRule for MissingOpsetImportRule {
     }
 
     fn check(&self, model: &Model, _ctx: &ValidationContext) -> Vec<Violation> {
-        let graph = &model.graph;
         // Pre-normalise the declared import domains once.
-        let declared: std::collections::HashSet<&str> = graph
+        let declared: std::collections::HashSet<&str> = model
+            .graph
             .opset_imports
             .keys()
             .map(|d| normalize_domain(d))
             .collect();
-
-        let mut violations = Vec::new();
-        for (_nid, node) in graph.nodes.iter() {
-            let domain = normalize_domain(&node.domain);
-            if !declared.contains(domain) {
-                violations.push(Violation {
-                    rule_id: self.id().to_string(),
-                    severity: self.severity(),
-                    message: format!(
-                        "node '{}' ({}) uses domain '{}' but no matching opset_import is declared",
-                        node_label(node),
-                        node.op_type,
-                        if node.domain.is_empty() {
-                            "ai.onnx"
-                        } else {
-                            &node.domain
-                        },
-                    ),
-                    location: ViolationLocation::Node {
-                        graph_name: model.metadata.graph_name.clone(),
-                        node_name: node_label(node),
-                    },
-                });
-            }
-        }
-        violations
+        check_graph_opset_imports(
+            &model.graph,
+            &model.metadata.graph_name,
+            &declared,
+            self.id(),
+        )
     }
 }
 
@@ -86,30 +66,76 @@ impl ValidationRule for DuplicateValueNameRule {
     }
 
     fn check(&self, model: &Model, _ctx: &ValidationContext) -> Vec<Violation> {
-        let mut counts: HashMap<&str, usize> = HashMap::new();
-        for (_vid, value) in model.graph.values.iter() {
-            if let Some(name) = value.name.as_deref()
-                && !name.is_empty()
-            {
-                *counts.entry(name).or_insert(0) += 1;
-            }
-        }
-
-        let mut dups: Vec<(&str, usize)> =
-            counts.into_iter().filter(|(_, count)| *count > 1).collect();
-        dups.sort_by(|a, b| a.0.cmp(b.0));
-
-        dups.into_iter()
-            .map(|(name, count)| Violation {
-                rule_id: self.id().to_string(),
-                severity: self.severity(),
-                message: format!("value name '{}' is used by {} distinct values", name, count),
-                location: ViolationLocation::Value {
-                    value_name: name.to_string(),
-                },
-            })
-            .collect()
+        check_graph_duplicate_names(&model.graph, self.id())
     }
+}
+
+fn check_graph_opset_imports(
+    graph: &Graph,
+    graph_name: &str,
+    declared: &std::collections::HashSet<&str>,
+    rule_id: &str,
+) -> Vec<Violation> {
+    let mut violations = Vec::new();
+    for (_nid, node) in graph.nodes.iter() {
+        let domain = normalize_domain(&node.domain);
+        if !declared.contains(domain) {
+            violations.push(Violation {
+                rule_id: rule_id.to_string(),
+                severity: Severity::Error,
+                message: format!(
+                    "node '{}' ({}) uses domain '{}' but no matching opset_import is declared",
+                    node_label(node),
+                    node.op_type,
+                    if node.domain.is_empty() {
+                        "ai.onnx"
+                    } else {
+                        &node.domain
+                    },
+                ),
+                location: ViolationLocation::Node {
+                    graph_name: graph_name.to_string(),
+                    node_name: node_label(node),
+                },
+            });
+        }
+    }
+    for subgraph in graph.subgraphs.values() {
+        violations.extend(check_graph_opset_imports(
+            subgraph, graph_name, declared, rule_id,
+        ));
+    }
+    violations
+}
+
+fn check_graph_duplicate_names(graph: &Graph, rule_id: &str) -> Vec<Violation> {
+    let mut counts: HashMap<&str, usize> = HashMap::new();
+    for (_vid, value) in graph.values.iter() {
+        if let Some(name) = value.name.as_deref()
+            && !name.is_empty()
+        {
+            *counts.entry(name).or_insert(0) += 1;
+        }
+    }
+
+    let mut dups: Vec<(&str, usize)> = counts.into_iter().filter(|(_, count)| *count > 1).collect();
+    dups.sort_by(|a, b| a.0.cmp(b.0));
+
+    let mut violations: Vec<Violation> = dups
+        .into_iter()
+        .map(|(name, count)| Violation {
+            rule_id: rule_id.to_string(),
+            severity: Severity::Error,
+            message: format!("value name '{}' is used by {} distinct values", name, count),
+            location: ViolationLocation::Value {
+                value_name: name.to_string(),
+            },
+        })
+        .collect();
+    for subgraph in graph.subgraphs.values() {
+        violations.extend(check_graph_duplicate_names(subgraph, rule_id));
+    }
+    violations
 }
 
 /// The dataflow graph must be acyclic (ONNX_RS §8.2 `GraphAcyclicRule`). Wraps
@@ -161,7 +187,26 @@ fn node_label(node: &onnx_runtime_ir::Node) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use onnx_runtime_ir::{DataType, Node, NodeId, static_shape};
+    use onnx_runtime_ir::{Attribute, DataType, Node, NodeId, static_shape};
+
+    fn nested_model(subgraph: Graph) -> Model {
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 21);
+        let cond = graph.create_named_value("cond", DataType::Bool, static_shape([]));
+        let out = graph.create_named_value("out", DataType::Float32, static_shape([1]));
+        graph.add_input(cond);
+        let mut node = Node::new(NodeId(0), "If", vec![Some(cond)], vec![out]);
+        node.attributes.insert(
+            "then_branch".into(),
+            Attribute::Graph(Box::new(subgraph.clone())),
+        );
+        let node_id = graph.insert_node(node);
+        graph
+            .subgraphs
+            .insert((node_id, "then_branch".into()), subgraph);
+        graph.add_output(out);
+        Model::new(graph)
+    }
 
     #[test]
     fn missing_opset_import_is_flagged() {
@@ -217,5 +262,54 @@ mod tests {
                 value_name: "dup".to_string()
             }
         );
+    }
+
+    #[test]
+    fn duplicate_value_name_inside_subgraph_is_flagged() {
+        let mut subgraph = Graph::new();
+        subgraph.create_named_value("nested_dup", DataType::Float32, static_shape([1]));
+        subgraph.create_named_value("nested_dup", DataType::Float32, static_shape([1]));
+
+        let result = nested_model(subgraph).validate();
+        assert!(result.violations.iter().any(|violation| {
+            violation.rule_id == "structure.duplicate_value_name"
+                && violation.location
+                    == ViolationLocation::Value {
+                        value_name: "nested_dup".into(),
+                    }
+        }));
+    }
+
+    #[test]
+    fn missing_opset_import_inside_subgraph_is_flagged() {
+        let mut subgraph = Graph::new();
+        let x = subgraph.create_named_value("x", DataType::Float32, static_shape([1]));
+        let y = subgraph.create_named_value("y", DataType::Float32, static_shape([1]));
+        subgraph.add_input(x);
+        let mut node = Node::new(NodeId(0), "Custom", vec![Some(x)], vec![y]);
+        node.domain = "example.custom".into();
+        subgraph.insert_node(node);
+        subgraph.add_output(y);
+
+        let result = nested_model(subgraph).validate();
+        assert!(
+            result
+                .violations
+                .iter()
+                .any(|violation| violation.rule_id == "ir.opset_import_present")
+        );
+    }
+
+    #[test]
+    fn valid_nested_model_passes() {
+        let mut subgraph = Graph::new();
+        let x = subgraph.create_named_value("x", DataType::Float32, static_shape([1]));
+        let y = subgraph.create_named_value("y", DataType::Float32, static_shape([1]));
+        subgraph.add_input(x);
+        subgraph.insert_node(Node::new(NodeId(0), "Relu", vec![Some(x)], vec![y]));
+        subgraph.add_output(y);
+
+        let result = nested_model(subgraph).validate();
+        assert!(result.is_valid(), "{:?}", result.violations);
     }
 }

@@ -13,8 +13,8 @@ use prost::Message;
 use onnx_runtime_ir::{Attribute, Dim, Graph};
 use onnx_runtime_loader::proto::onnx;
 use onnx_runtime_loader::{
-    encode_model, encode_model_proto, load_model_bytes_with_weights, write_model, Model,
-    ModelMetadata, WeightStore,
+    Model, ModelMetadata, WeightStore, encode_model, encode_model_proto,
+    load_model_bytes_with_weights, write_model,
 };
 
 // ── proto construction helpers ────────────────────────────────────────────────
@@ -25,7 +25,7 @@ enum Dimlike {
 }
 
 fn tensor_type(elem_type: i32, dims: &[Dimlike]) -> onnx::TypeProto {
-    use onnx::tensor_shape_proto::{dimension::Value as DV, Dimension};
+    use onnx::tensor_shape_proto::{Dimension, dimension::Value as DV};
     let dim = dims
         .iter()
         .map(|d| Dimension {
@@ -37,10 +37,12 @@ fn tensor_type(elem_type: i32, dims: &[Dimlike]) -> onnx::TypeProto {
         })
         .collect();
     onnx::TypeProto {
-        value: Some(onnx::type_proto::Value::TensorType(onnx::type_proto::Tensor {
-            elem_type,
-            shape: Some(onnx::TensorShapeProto { dim }),
-        })),
+        value: Some(onnx::type_proto::Value::TensorType(
+            onnx::type_proto::Tensor {
+                elem_type,
+                shape: Some(onnx::TensorShapeProto { dim }),
+            },
+        )),
         ..Default::default()
     }
 }
@@ -137,7 +139,11 @@ fn bytes_attr(name: &str, bytes: &[u8]) -> onnx::AttributeProto {
     }
 }
 
-fn epctx_node(inputs: &[&str], outputs: &[&str], attrs: Vec<onnx::AttributeProto>) -> onnx::NodeProto {
+fn epctx_node(
+    inputs: &[&str],
+    outputs: &[&str],
+    attrs: Vec<onnx::AttributeProto>,
+) -> onnx::NodeProto {
     onnx::NodeProto {
         op_type: "EPContext".into(),
         domain: "com.microsoft".into(),
@@ -153,7 +159,9 @@ fn epctx_node(inputs: &[&str], outputs: &[&str], attrs: Vec<onnx::AttributeProto
 /// An opaque binary blob including bytes that are NOT valid UTF-8 (0x00, 0x80,
 /// 0xFF, a lone 0xC3 continuation) — proves the encoder preserves it byte-exact.
 fn opaque_blob() -> Vec<u8> {
-    vec![0x00, 0x01, 0x80, 0xFE, 0xFF, b'v', b'1', 0x00, 0xC3, 0x28, 0x7F]
+    vec![
+        0x00, 0x01, 0x80, 0xFE, 0xFF, b'v', b'1', 0x00, 0xC3, 0x28, 0x7F,
+    ]
 }
 
 /// Build a diverse model exercising: symbolic dims, float/int64 initializers
@@ -163,8 +171,13 @@ fn opaque_blob() -> Vec<u8> {
 fn build_model_bytes() -> Vec<u8> {
     // W: float32 [4,3] with distinct byte pattern; B: float32 [3]; idx: int64 [2]
     // (unused, present to exercise int64 initializer byte-exactness).
-    let w_raw: Vec<u8> = (0..12u32).flat_map(|i| (i as f32 * 0.25).to_le_bytes()).collect();
-    let b_raw: Vec<u8> = [1.5f32, -2.5, 3.0].iter().flat_map(|v| v.to_le_bytes()).collect();
+    let w_raw: Vec<u8> = (0..12u32)
+        .flat_map(|i| (i as f32 * 0.25).to_le_bytes())
+        .collect();
+    let b_raw: Vec<u8> = [1.5f32, -2.5, 3.0]
+        .iter()
+        .flat_map(|v| v.to_le_bytes())
+        .collect();
     let idx_raw: Vec<u8> = [7i64, -9].iter().flat_map(|v| v.to_le_bytes()).collect();
 
     let graph = onnx::GraphProto {
@@ -298,10 +311,18 @@ fn round_trip_structural_and_byte_exact() {
 
     // Graph I/O names identical.
     let io_names = |g: &Graph, ids: &[onnx_runtime_ir::ValueId]| -> Vec<String> {
-        ids.iter().map(|&v| g.value(v).name.clone().unwrap()).collect()
+        ids.iter()
+            .map(|&v| g.value(v).name.clone().unwrap())
+            .collect()
     };
-    assert_eq!(io_names(&graph1, &graph1.inputs), io_names(&graph2, &graph2.inputs));
-    assert_eq!(io_names(&graph1, &graph1.outputs), io_names(&graph2, &graph2.outputs));
+    assert_eq!(
+        io_names(&graph1, &graph1.inputs),
+        io_names(&graph2, &graph2.inputs)
+    );
+    assert_eq!(
+        io_names(&graph1, &graph1.outputs),
+        io_names(&graph2, &graph2.outputs)
+    );
 
     // Opset imports identical.
     assert_eq!(graph1.opset_imports, graph2.opset_imports);
@@ -314,7 +335,10 @@ fn round_trip_structural_and_byte_exact() {
 
     // A symbolic input dim ("batch") survives as symbolic; the static dim stays.
     let x1 = graph2.value(graph2.inputs[0]);
-    assert!(matches!(x1.shape[0], Dim::Symbolic(_)), "batch stays symbolic");
+    assert!(
+        matches!(x1.shape[0], Dim::Symbolic(_)),
+        "batch stays symbolic"
+    );
     assert_eq!(x1.shape[1], Dim::Static(4));
 
     // EPContext attributes: opaque blob byte-exact, and every attribute kind
@@ -333,8 +357,14 @@ fn round_trip_structural_and_byte_exact() {
 
     assert_eq!(ep2.attr("alpha").and_then(Attribute::as_float), Some(0.25));
     assert_eq!(ep2.attr("k").and_then(Attribute::as_int), Some(42));
-    assert_eq!(ep2.attr("shape_hint").and_then(Attribute::as_ints), Some(&[2, 3, 5][..]));
-    assert_eq!(ep2.attr("source").and_then(Attribute::as_str), Some("VendorEP"));
+    assert_eq!(
+        ep2.attr("shape_hint").and_then(Attribute::as_ints),
+        Some(&[2, 3, 5][..])
+    );
+    assert_eq!(
+        ep2.attr("source").and_then(Attribute::as_str),
+        Some("VendorEP")
+    );
     match ep2.attr("scales") {
         Some(Attribute::Floats(v)) => assert_eq!(v, &vec![0.5, 1.5, -2.0]),
         other => panic!("scales should be Floats, got {other:?}"),
@@ -382,8 +412,15 @@ fn encoded_ep_cache_context_is_a_string_attribute_on_the_wire() {
         onnx::attribute_proto::AttributeType::String as i32,
         "ep_cache_context must be a STRING attribute on the wire"
     );
-    assert_eq!(attr.s, opaque_blob(), "STRING attribute bytes must be byte-exact");
-    assert!(attr.t.is_none(), "must not be emitted as a tensor attribute");
+    assert_eq!(
+        attr.s,
+        opaque_blob(),
+        "STRING attribute bytes must be byte-exact"
+    );
+    assert!(
+        attr.t.is_none(),
+        "must not be emitted as a tensor attribute"
+    );
 }
 
 #[test]
@@ -400,7 +437,9 @@ fn model_metadata_round_trips_through_proto() {
         graph_name: "g".into(),
         metadata_props: vec![("k1".into(), "v1".into()), ("k2".into(), "v2".into())],
     };
-    let model = Model::new(&graph1).with_weights(&store1).with_metadata(meta);
+    let model = Model::new(&graph1)
+        .with_weights(&store1)
+        .with_metadata(meta);
     let bytes2 = encode_model(&model).expect("encode");
 
     let proto = onnx::ModelProto::decode(&bytes2[..]).expect("decode proto");
@@ -455,7 +494,11 @@ fn real_fixture_round_trips_if_present() {
             graph2.num_nodes(),
             "node count mismatch for {rel}"
         );
-        assert_eq!(op_types(&graph1), op_types(&graph2), "op_types mismatch for {rel}");
+        assert_eq!(
+            op_types(&graph1),
+            op_types(&graph2),
+            "op_types mismatch for {rel}"
+        );
         assert_eq!(
             initializer_bytes(&graph1, &store1),
             initializer_bytes(&graph2, &store2),
@@ -480,11 +523,9 @@ fn write_model_produces_reloadable_file() {
     let path = dir.join("roundtrip_model.onnx");
     write_model(&model, &path).expect("write");
 
-    let (graph2, _store2) = load_model_bytes_with_weights(
-        &std::fs::read(&path).expect("read back"),
-        ".",
-    )
-    .expect("reload");
+    let (graph2, _store2) =
+        load_model_bytes_with_weights(&std::fs::read(&path).expect("read back"), ".")
+            .expect("reload");
     assert_eq!(graph1.num_nodes(), graph2.num_nodes());
     assert_eq!(op_types(&graph1), op_types(&graph2));
 
@@ -512,7 +553,12 @@ fn uint8_opaque_initializer_round_trips_byte_exact() {
         )),
     );
     let out = graph.create_named_value("out", DataType::Uint8, vec![payload.len().into()]);
-    graph.insert_node(Node::new(NodeId(0), "Identity", vec![Some(blob)], vec![out]));
+    graph.insert_node(Node::new(
+        NodeId(0),
+        "Identity",
+        vec![Some(blob)],
+        vec![out],
+    ));
     graph.add_output(out);
 
     let bytes = encode_model(&Model::new(&graph)).expect("encode");
@@ -542,15 +588,23 @@ fn empty_graph_round_trips() {
 fn initializer_only_graph_round_trips() {
     use onnx_runtime_ir::{DataType, Node, NodeId, TensorData, WeightRef};
 
-    let raw: Vec<u8> = [1.0f32, 2.0, 3.0, 4.0].iter().flat_map(|v| v.to_le_bytes()).collect();
+    let raw: Vec<u8> = [1.0f32, 2.0, 3.0, 4.0]
+        .iter()
+        .flat_map(|v| v.to_le_bytes())
+        .collect();
     let mut graph = Graph::new();
     graph.opset_imports.insert(String::new(), 17);
     let w = graph.create_named_value("W", DataType::Float32, vec![2usize.into(), 2usize.into()]);
     graph.set_initializer(
         w,
-        WeightRef::Inline(TensorData::from_raw(DataType::Float32, vec![2, 2], raw.clone())),
+        WeightRef::Inline(TensorData::from_raw(
+            DataType::Float32,
+            vec![2, 2],
+            raw.clone(),
+        )),
     );
-    let out = graph.create_named_value("out", DataType::Float32, vec![2usize.into(), 2usize.into()]);
+    let out =
+        graph.create_named_value("out", DataType::Float32, vec![2usize.into(), 2usize.into()]);
     graph.insert_node(Node::new(NodeId(0), "Identity", vec![Some(w)], vec![out]));
     graph.add_output(out);
 
@@ -560,27 +614,115 @@ fn initializer_only_graph_round_trips() {
     assert_eq!(initializer_bytes(&graph2, &store2).get("W"), Some(&raw));
 }
 
-/// A2: encoding a control-flow subgraph attribute must error cleanly rather than
-/// silently emit a subgraph with a truncated I/O signature (the load path does
-/// not round-trip nested-graph formal I/O).
 #[test]
-fn encoding_subgraph_attribute_errors_cleanly() {
-    use onnx_runtime_ir::{Attribute, DataType, Node, NodeId};
+fn control_flow_subgraphs_round_trip() {
+    let branch = |name: &str, op: &str| onnx::GraphProto {
+        name: name.into(),
+        output: vec![value_info("branch_out", 1, &[Dimlike::Static(2)])],
+        node: vec![
+            node("Relu", &["x"], &["activated"]),
+            node(op, &["activated"], &["branch_out"]),
+        ],
+        ..Default::default()
+    };
+    let graph = onnx::GraphProto {
+        name: "control_flow".into(),
+        input: vec![
+            value_info("cond", 9, &[]),
+            value_info("x", 1, &[Dimlike::Static(2)]),
+        ],
+        output: vec![value_info("y", 1, &[Dimlike::Static(2)])],
+        node: vec![onnx::NodeProto {
+            name: "choose".into(),
+            op_type: "If".into(),
+            input: vec!["cond".into()],
+            output: vec!["y".into()],
+            attribute: vec![
+                onnx::AttributeProto {
+                    name: "then_branch".into(),
+                    r#type: onnx::attribute_proto::AttributeType::Graph as i32,
+                    g: Some(branch("then", "Identity")),
+                    ..Default::default()
+                },
+                onnx::AttributeProto {
+                    name: "else_branch".into(),
+                    r#type: onnx::attribute_proto::AttributeType::Graph as i32,
+                    g: Some(branch("else", "Neg")),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let proto = onnx::ModelProto {
+        ir_version: 10,
+        opset_import: vec![onnx::OperatorSetIdProto {
+            domain: String::new(),
+            version: 21,
+        }],
+        graph: Some(graph),
+        ..Default::default()
+    };
+
+    let (graph1, store1) =
+        load_model_bytes_with_weights(&proto.encode_to_vec(), ".").expect("decode control flow");
+    let bytes =
+        encode_model(&Model::new(&graph1).with_weights(&store1)).expect("encode control flow");
+    let (graph2, _) = load_model_bytes_with_weights(&bytes, ".").expect("re-decode control flow");
+
+    let if_node = graph2.nodes.iter().next().expect("If node").1;
+    for attr_name in ["then_branch", "else_branch"] {
+        let subgraph = graph2
+            .subgraphs
+            .get(&(if_node.id, attr_name.to_string()))
+            .expect("indexed branch");
+        assert!(subgraph.inputs.is_empty(), "{attr_name} input signature");
+        assert_eq!(subgraph.outputs.len(), 1, "{attr_name} output signature");
+        assert_eq!(subgraph.num_nodes(), 2, "{attr_name} body");
+    }
+}
+
+#[test]
+fn graphs_attribute_encodes_every_indexed_body() {
+    use onnx_runtime_ir::{DataType, Node, NodeId};
+
+    let body = |op: &str| {
+        let mut graph = Graph::new();
+        let input = graph.create_named_value("in", DataType::Float32, vec![1usize.into()]);
+        let output = graph.create_named_value("out", DataType::Float32, vec![1usize.into()]);
+        graph.add_input(input);
+        graph.insert_node(Node::new(NodeId(0), op, vec![Some(input)], vec![output]));
+        graph.add_output(output);
+        graph
+    };
 
     let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 21);
     let x = graph.create_named_value("x", DataType::Float32, vec![1usize.into()]);
     let y = graph.create_named_value("y", DataType::Float32, vec![1usize.into()]);
     graph.add_input(x);
-    graph.add_output(y);
-    let mut node = Node::new(NodeId(0), "If", vec![Some(x)], vec![y]);
-    node.attributes
-        .insert("then_branch".into(), Attribute::Graph(Box::new(Graph::new())));
-    graph.insert_node(node);
-
-    let err = encode_model(&Model::new(&graph)).expect_err("must reject subgraph");
-    let msg = err.to_string();
-    assert!(
-        msg.contains("subgraph") && msg.contains("unsupported"),
-        "error should explain subgraph encoding is unsupported, got: {msg}"
+    let mut node = Node::new(NodeId(0), "Custom", vec![Some(x)], vec![y]);
+    node.attributes.insert(
+        "bodies".into(),
+        Attribute::Graphs(vec![Graph::new(), Graph::new()]),
     );
+    let node_id = graph.insert_node(node);
+    graph
+        .subgraphs
+        .insert((node_id, "bodies[0]".into()), body("Relu"));
+    graph
+        .subgraphs
+        .insert((node_id, "bodies[1]".into()), body("Neg"));
+    graph.add_output(y);
+
+    let proto = encode_model_proto(&Model::new(&graph)).expect("encode Graphs attribute");
+    let attribute = &proto.graph.unwrap().node[0].attribute[0];
+    assert_eq!(
+        attribute.r#type,
+        onnx::attribute_proto::AttributeType::Graphs as i32
+    );
+    assert_eq!(attribute.graphs.len(), 2);
+    assert_eq!(attribute.graphs[0].node[0].op_type, "Relu");
+    assert_eq!(attribute.graphs[1].node[0].op_type, "Neg");
 }

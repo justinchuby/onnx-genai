@@ -42,11 +42,8 @@
 //!   function call into its primitive body before the IR is built — but the IR
 //!   `Graph` does not retain the original `FunctionProto` declarations, so they
 //!   are not re-emitted here;
-//! * control-flow **subgraph** formal `input`/`output` lists — the load path
-//!   does not register them as graph I/O for nested graphs. Rather than silently
-//!   emit a subgraph with a truncated signature, [`encode_attribute`] returns a
-//!   clean "unsupported" error for any `Graph`/`Graphs` attribute (no Phase-1 op
-//!   uses control-flow subgraphs).
+//! * nested `GraphProto.name` values — the IR does not retain graph names for
+//!   control-flow bodies, so nested graphs are emitted with an empty name.
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -57,13 +54,13 @@ use onnx_runtime_ir::{
     Attribute, DataType, Dim, Graph, Node, Shape, TensorData, TypeProto, ValueId, WeightRef,
 };
 
+use crate::LoaderError;
 use crate::proto::onnx::{
-    self, attribute_proto::AttributeType, tensor_shape_proto, type_proto, AttributeProto,
-    GraphProto, ModelProto, NodeProto, OperatorSetIdProto, StringStringEntryProto, TensorProto,
-    TensorShapeProto, ValueInfoProto,
+    self, AttributeProto, GraphProto, ModelProto, NodeProto, OperatorSetIdProto,
+    StringStringEntryProto, TensorProto, TensorShapeProto, ValueInfoProto,
+    attribute_proto::AttributeType, tensor_shape_proto, type_proto,
 };
 use crate::weights::WeightStore;
-use crate::LoaderError;
 
 /// Default ONNX `ir_version` stamped when [`ModelMetadata`] does not override it
 /// (IR version 10, the version paired with opset 21).
@@ -273,7 +270,7 @@ fn encode_graph_proto(
     // 4. Nodes, in ascending node-id (== load) order.
     let mut node = Vec::with_capacity(graph.num_nodes());
     for (_, n) in graph.nodes.iter() {
-        node.push(encode_node(graph, n)?);
+        node.push(encode_node(graph, n, weights)?);
     }
 
     Ok(GraphProto {
@@ -288,7 +285,11 @@ fn encode_graph_proto(
 }
 
 /// Encode a single node into a `NodeProto`.
-fn encode_node(graph: &Graph, node: &Node) -> Result<NodeProto, LoaderError> {
+fn encode_node(
+    graph: &Graph,
+    node: &Node,
+    weights: Option<&WeightStore>,
+) -> Result<NodeProto, LoaderError> {
     let input: Vec<String> = node
         .inputs
         .iter()
@@ -309,7 +310,13 @@ fn encode_node(graph: &Graph, node: &Node) -> Result<NodeProto, LoaderError> {
     keys.sort();
     let mut attribute = Vec::with_capacity(keys.len());
     for key in keys {
-        attribute.push(encode_attribute(graph, key, &node.attributes[key])?);
+        attribute.push(encode_attribute(
+            graph,
+            node,
+            key,
+            &node.attributes[key],
+            weights,
+        )?);
     }
 
     Ok(NodeProto {
@@ -328,8 +335,10 @@ fn encode_node(graph: &Graph, node: &Node) -> Result<NodeProto, LoaderError> {
 /// discriminator to match the populated field (required for IR ≥ 0.0.2).
 fn encode_attribute(
     graph: &Graph,
+    node: &Node,
     name: &str,
     attr: &Attribute,
+    weights: Option<&WeightStore>,
 ) -> Result<AttributeProto, LoaderError> {
     let mut ap = AttributeProto {
         name: name.to_string(),
@@ -364,18 +373,25 @@ fn encode_attribute(
             ap.t = Some(encode_tensor(t));
             ap.r#type = AttributeType::Tensor as i32;
         }
-        Attribute::Graph(_) | Attribute::Graphs(_) => {
-            // The load path does not register a nested subgraph's formal
-            // `input`/`output` lists (only its nodes / value_info survive), so a
-            // control-flow subgraph cannot be re-emitted with a faithful
-            // signature. Fail cleanly rather than silently emit a subgraph with a
-            // truncated I/O contract. (No Phase-1 op uses control-flow
-            // subgraphs; see the module docs.)
-            return Err(LoaderError::GraphBuild(format!(
-                "attribute {name:?}: encoding control-flow subgraph attributes is \
-                 unsupported (nested-graph formal I/O is not round-tripped by the \
-                 load path)"
-            )));
+        Attribute::Graph(inline) => {
+            let subgraph = graph
+                .subgraphs
+                .get(&(node.id, name.to_string()))
+                .unwrap_or(inline);
+            ap.g = Some(encode_graph_proto(subgraph, weights, false, "")?);
+            ap.r#type = AttributeType::Graph as i32;
+        }
+        Attribute::Graphs(inline) => {
+            ap.graphs = inline
+                .iter()
+                .enumerate()
+                .map(|(index, fallback)| {
+                    let key = (node.id, format!("{name}[{index}]"));
+                    let subgraph = graph.subgraphs.get(&key).unwrap_or(fallback);
+                    encode_graph_proto(subgraph, weights, false, "")
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            ap.r#type = AttributeType::Graphs as i32;
         }
         Attribute::TypeProto(tp) => {
             ap.tp = Some(encode_type_proto(graph, tp));
@@ -474,7 +490,7 @@ fn encode_tensor_type(graph: &Graph, dtype: DataType, shape: &Shape) -> onnx::Ty
 /// `dim_value`; symbolic dims are re-emitted by their interned name as
 /// `dim_param`, or as a valueless (unknown) dimension when unnamed.
 fn encode_shape(graph: &Graph, shape: &Shape) -> TensorShapeProto {
-    use tensor_shape_proto::{dimension::Value as DV, Dimension};
+    use tensor_shape_proto::{Dimension, dimension::Value as DV};
     let dim = shape
         .iter()
         .map(|d| {
@@ -508,12 +524,16 @@ fn encode_type_proto(graph: &Graph, tp: &TypeProto) -> onnx::TypeProto {
                 shape: Some(encode_shape(graph, shape)),
             })
         }
-        TypeProto::Sequence(inner) => type_proto::Value::SequenceType(Box::new(type_proto::Sequence {
-            elem_type: Some(Box::new(encode_type_proto(graph, inner))),
-        })),
-        TypeProto::Optional(inner) => type_proto::Value::OptionalType(Box::new(type_proto::Optional {
-            elem_type: Some(Box::new(encode_type_proto(graph, inner))),
-        })),
+        TypeProto::Sequence(inner) => {
+            type_proto::Value::SequenceType(Box::new(type_proto::Sequence {
+                elem_type: Some(Box::new(encode_type_proto(graph, inner))),
+            }))
+        }
+        TypeProto::Optional(inner) => {
+            type_proto::Value::OptionalType(Box::new(type_proto::Optional {
+                elem_type: Some(Box::new(encode_type_proto(graph, inner))),
+            }))
+        }
         TypeProto::Map { key, value } => type_proto::Value::MapType(Box::new(type_proto::Map {
             key_type: key.to_onnx(),
             value_type: Some(Box::new(encode_type_proto(graph, value))),

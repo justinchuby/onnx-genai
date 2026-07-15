@@ -199,9 +199,27 @@ fn print_node(out: &mut String, graph: &Graph, nid: NodeId, depth: usize, opts: 
         .collect();
     subgraph_attrs.sort();
     for attr_name in subgraph_attrs {
-        if let Some(sub) = graph.subgraphs.get(&(nid, attr_name.clone())) {
-            let _ = writeln!(out, "{}{} = graph", opts.indent.repeat(depth), attr_name);
-            print_graph(out, sub, "", depth, opts);
+        match &node.attributes[attr_name] {
+            Attribute::Graph(inline) => {
+                let sub = graph
+                    .subgraphs
+                    .get(&(nid, attr_name.clone()))
+                    .unwrap_or(inline);
+                let _ = writeln!(out, "{}{} = graph", pad, attr_name);
+                print_graph(out, sub, "", depth, opts);
+            }
+            Attribute::Graphs(inline) => {
+                for (index, fallback) in inline.iter().enumerate() {
+                    let indexed_name = format!("{attr_name}[{index}]");
+                    let sub = graph
+                        .subgraphs
+                        .get(&(nid, indexed_name.clone()))
+                        .unwrap_or(fallback);
+                    let _ = writeln!(out, "{}{} = graph", pad, indexed_name);
+                    print_graph(out, sub, "", depth, opts);
+                }
+            }
+            _ => {}
         }
     }
 }
@@ -386,5 +404,56 @@ mod tests {
         );
         // The raw bytes must never appear inline.
         assert!(!text.contains("\\x00"), "{text}");
+    }
+
+    fn unary_subgraph(input: &str, output: &str, op: &str) -> Graph {
+        let mut graph = Graph::new();
+        let x = graph.create_named_value(input, DataType::Float32, static_shape([2]));
+        let y = graph.create_named_value(output, DataType::Float32, static_shape([2]));
+        graph.add_input(x);
+        graph.insert_node(Node::new(NodeId(0), op, vec![Some(x)], vec![y]));
+        graph.add_output(y);
+        graph
+    }
+
+    #[test]
+    fn prints_single_and_list_subgraph_bodies() {
+        let then_branch = unary_subgraph("then_in", "then_out", "Relu");
+        let first_case = unary_subgraph("case0_in", "case0_out", "Neg");
+        let second_case = unary_subgraph("case1_in", "case1_out", "Identity");
+
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 21);
+        let cond = graph.create_named_value("cond", DataType::Bool, static_shape([]));
+        let out = graph.create_named_value("out", DataType::Float32, static_shape([2]));
+        graph.add_input(cond);
+        let mut node = Node::new(NodeId(0), "If", vec![Some(cond)], vec![out]);
+        node.attributes.insert(
+            "then_branch".into(),
+            Attribute::Graph(Box::new(then_branch.clone())),
+        );
+        node.attributes.insert(
+            "branches".into(),
+            Attribute::Graphs(vec![first_case.clone(), second_case.clone()]),
+        );
+        let node_id = graph.insert_node(node);
+        graph
+            .subgraphs
+            .insert((node_id, "then_branch".into()), then_branch);
+        graph
+            .subgraphs
+            .insert((node_id, "branches[0]".into()), first_case);
+        graph
+            .subgraphs
+            .insert((node_id, "branches[1]".into()), second_case);
+        graph.add_output(out);
+
+        let text = print(&Model::new(graph));
+        assert!(text.contains("then_branch = graph"), "{text}");
+        assert!(text.contains("then_out = Relu(then_in)"), "{text}");
+        assert!(text.contains("branches[0] = graph"), "{text}");
+        assert!(text.contains("case0_out = Neg(case0_in)"), "{text}");
+        assert!(text.contains("branches[1] = graph"), "{text}");
+        assert!(text.contains("case1_out = Identity(case1_in)"), "{text}");
     }
 }
