@@ -11,9 +11,11 @@ matrix multiplications.
 
 The recommended graph contract is:
 
-1. Keep the **model-specific router as an explicit ONNX subgraph**. It computes
-   `router_probs [tokens, experts]` with the exact model semantics (softmax, sigmoid,
-   bias correction, grouped selection, normalization, and so on).
+1. Keep the **model-specific router as an explicit ONNX subgraph**. It computes two
+   logically distinct `[tokens, experts]` tensors: `selection_scores`, including any
+   grouped-TopK or bias correction used to choose experts, and
+   `aggregation_weights`, containing the model-exact weights used to combine the
+   selected expert outputs.
 2. Make **`com.microsoft::QMoE` the primary quantized expert op** emitted by Mobius,
    with expert-major packed weights. Use `com.microsoft::MoE` for floating-point
    experts. These existing ONNX Runtime contrib schemas accept the input and router
@@ -165,10 +167,15 @@ Relevant existing seams are:
 - The scheduler owns admission, preemption, priorities, and batch formation
   ([`scheduler/lib.rs` lines 1-8](../crates/onnx-genai-scheduler/src/lib.rs#L1-L8),
   [`scheduler/lib.rs` lines 71-100](../crates/onnx-genai-scheduler/src/lib.rs#L71-L100)).
-- The Resource Governor already models VRAM, host RAM, optional disk, fixed weight
-  and activation reservations, and an authoritative KV byte budget
+- The Resource Governor has structures for VRAM, host RAM, optional disk, fixed
+  weight/activation/ORT reservations, and an authoritative KV byte budget
   ([`governor.rs` lines 1-5](../crates/onnx-genai-scheduler/src/governor.rs#L1-L5),
   [`governor.rs` lines 73-132](../crates/onnx-genai-scheduler/src/governor.rs#L73-L132)).
+  This accounting is **provisional**: the engine currently passes zero bytes for
+  model weights, activations, and ORT overhead, and KV disk spill is configuration
+  and health reporting only, not an implemented storage tier
+  ([`engine.rs` lines 78-88](../crates/onnx-genai-engine/src/engine.rs#L78-L88),
+  [`local_tiered.rs` lines 53-59](../crates/onnx-genai-kv/src/local_tiered.rs#L53-L59)).
 - `onnx-genai-kv` already has page tables, hot/cold promotion, LRU offload, and
   GPU/CPU/Disk tier concepts
   ([`kv/lib.rs` lines 1-8](../crates/onnx-genai-kv/src/lib.rs#L1-L8),
@@ -185,14 +192,17 @@ Mobius should emit:
 ```text
 hidden [T,H]
    │
-   ├── router subgraph ──> router_probs [T,E]
+   ├── router subgraph ──> selection_scores [T,E]
+   │                       aggregation_weights [T,E]
    │
    └────────────────────────────┐
-                                ▼
-  com.microsoft::QMoE(hidden, router_probs,
-                      fc1_weights, fc1_scales, [fc1_zero_points],
-                      fc2_weights, fc2_scales, [fc2_zero_points],
-                      [fc3_weights, fc3_scales, fc3_zero_points])
+                               ▼
+  com.microsoft::QMoE(hidden, selection_scores,
+                     fc1_weights, fc1_scales, [fc1_bias],
+                     fc2_weights, fc2_scales, [fc2_bias],
+                     [fc3_weights], [fc3_scales], [fc3_bias],
+                     [fc1_zero_points], [fc2_zero_points], [fc3_zero_points],
+                     aggregation_weights)
       attributes: k, expert_weight_bits=4, block_size,
                   activation_type, normalize_routing_weights,
                   swiglu_fusion
@@ -203,11 +213,37 @@ hidden [T,H]
 
 This aligns with the existing ORT schemas:
 
-- [`com.microsoft::MoE`](https://github.com/microsoft/onnxruntime/blob/a91b0b49cb0dc9670a8cf93263b3d79ce0dc79a5/docs/ContribOperators.md#commicrosoftmoe)
-  consumes `router_probs` and expert-major FC weights.
-- [`com.microsoft::QMoE`](https://github.com/microsoft/onnxruntime/blob/a91b0b49cb0dc9670a8cf93263b3d79ce0dc79a5/docs/ContribOperators.md#commicrosoftqmoe)
+- [`com.microsoft::MoE`](https://github.com/microsoft/onnxruntime/blob/rel-1.27.0/docs/ContribOperators.md#commicrosoftmoe)
+  consumes one router tensor and expert-major floating-point FC weights.
+- [`com.microsoft::QMoE`](https://github.com/microsoft/onnxruntime/blob/rel-1.27.0/docs/ContribOperators.md#commicrosoftqmoe)
   adds 2/4/8-bit packed expert weights, scales, optional zero points, block size,
-  and prepacked-layout control.
+  and a separate optional aggregation tensor.
+
+The ORT 1.27 `QMoE` positional input contract is exact and must not be compacted:
+
+```text
+ 0 input                    11 fc1_zero_points?       15 fc1_global_scale?
+ 1 router_probs             12 fc2_zero_points?       16 fc2_global_scale?
+ 2 fc1_experts_weights      13 fc3_zero_points?       17 fc1_act_scale?
+ 3 fc1_scales?              14 router_weights?        18 fc2_act_scale?
+ 4 fc1_experts_bias?                                  19 fc1_act_block_scale?
+ 5 fc2_experts_weights                                20 fc2_act_block_scale?
+ 6 fc2_scales?
+ 7 fc2_experts_bias?
+ 8 fc3_experts_weights?
+ 9 fc3_scales?
+10 fc3_experts_bias?
+```
+
+ONNX represents an omitted optional input before a later supplied input with an empty
+input name; exporters must preserve those placeholders. For example, an integer
+SwiGLU node with no biases or FC3 tensors, but with FC1/FC2 zero points and separate
+aggregation weights, uses:
+
+```text
+[input, selection_scores, fc1_w, fc1_s, "", fc2_w, fc2_s, "", "", "", "",
+ fc1_zp, fc2_zp, "", aggregation_weights]
+```
 
 For SwiGLU experts, Mobius should select one canonical layout and record it in graph
 attributes. Shared experts remain ordinary dense FFN nodes and are added to the
@@ -217,9 +253,30 @@ routed output. Dense-only early layers remain dense.
 
 Mixtral-style softmax top-k, DeepSeek-style sigmoid routing, grouped top-k,
 router-bias correction, and model-specific scaling are semantically different.
-Mobius should lower those operations faithfully into standard ONNX. `QMoE` receives
-the resulting probabilities and only owns selection, dispatch, expert FFN, and
-weighted reduction.
+Mobius should lower those operations faithfully into standard ONNX and keep selection
+separate from aggregation:
+
+- pass selection-preserving scores as QMoE input 1, `router_probs`; ORT uses it for
+  TopK. For grouped TopK, the explicit router must mask experts outside the chosen
+  groups/candidate set so QMoE's global TopK returns the same expert IDs;
+- pass `aggregation_weights` as optional input 14, `router_weights`; ORT gathers
+  values at the selected expert indices and uses them for reduction. Set
+  `normalize_routing_weights` to match the model (normally `0` when the tensor already
+  contains final weights); and
+- omit input 14 only when the same tensor is correct for both operations.
+
+This mapping represents DeepSeek `noaux_tc`, grouped-TopK, and bias-corrected
+selection without applying the selection-only bias to aggregation. `QMoE` owns TopK,
+dispatch, expert FFN, and weighted reduction, but not model-specific score formation.
+
+The float `com.microsoft::MoE` schema has no `router_weights`; its single input is
+softmaxed and used for both TopK and aggregation. An exact encoding is possible only
+when Mobius can construct selection-preserving logits: mask non-selected experts to
+`-inf`, put `log(aggregation_weight / row_sum)` at selected indices, and multiply the
+MoE output by `row_sum` outside the op if the desired positive weights are not
+normalized. If weights are not positive or this transformation cannot preserve the
+model contract, float `MoE` cannot represent the router exactly; Mobius must use the
+dense reference decomposition (or a future schema with separate IDs/weights).
 
 This split gives:
 
@@ -307,8 +364,9 @@ Integration points:
 - `crates/onnx-runtime-ep-cpu/src/kernels/selection.rs`: TopK reference behavior.
 - `.../gather.rs` and indexing/movement kernels: correctness building blocks.
 - `.../matmul.rs` / `gemm.rs`: dense grouped/batched baseline.
-- a future quantized kernel module: expert-batched int4 `QMoE`, reusing the same
-  packing contract as Mobius/`MatMulNBits`.
+- a future quantized kernel module: expert-batched int4 `QMoE`, using a conversion
+  established by the Phase 1 packing-validation gate rather than assuming that
+  Mobius/`MatMulNBits` storage is already identical.
 - `.../mod.rs`: register `com.microsoft::MoE` and `QMoE`.
 
 The CPU correctness kernel may initially gather into dense scratch buffers and call
@@ -332,7 +390,7 @@ The CUDA path needs:
 - token permutation and inverse permutation;
 - grouped GEMM (cuBLASLt grouped matmul where suitable, otherwise CUTLASS/custom
   grouped kernels);
-- int4 compressed-domain expert GEMM compatible with QMoE packing;
+- int4 compressed-domain expert GEMM consuming the validated QMoE packing;
 - fused activation and routing-weight application where profitable; and
 - asynchronous expert H2D copies on a transfer stream with event dependencies.
 
@@ -378,9 +436,13 @@ resident dense weights
 <= configured VRAM limit
 ```
 
-Today `VramBreakdown` reserves model weights, activations, and ORT overhead before
-deriving KV capacity. First-class MoE needs an explicit `hot_expert_bytes` component
-and coordinated rebalancing between expert and KV budgets. Lowering a ceiling must:
+`VramBreakdown` can reserve model weights, activations, and ORT overhead before
+deriving KV capacity, but those engine-supplied reservations are currently all zero.
+Therefore this design is not yet an enforceable whole-runtime memory ceiling. Phase 3
+must first connect real EP/model weight usage, activation/scratch high-water marks,
+and ORT/EP allocations to the governor, then add an explicit `hot_expert_bytes`
+component and coordinated rebalancing between expert and KV budgets. Lowering a
+ceiling must:
 
 1. cancel speculative prefetch reservations;
 2. evict unleased coldest experts;
@@ -450,8 +512,12 @@ experts. This requires an explicit distributed design and is not part of Phase 1
 
 ## 9. Quantization
 
-The preferred initial format is per-expert int4 weight-only quantization compatible
-with Mobius's existing `MatMulNBits` export and ORT `QMoE`:
+The preferred initial format is per-expert int4 weight-only quantization. Compatibility
+between Mobius's existing `MatMulNBits` export and ORT `QMoE` is a **Phase 1
+validation requirement**, not an established property. The gate must prove
+byte-for-byte weight and zero-point layout, transpose conventions, scale ordering,
+and CPU/CUDA prepacking behavior before buffers are reused or converted without a
+reference unpack/repack:
 
 - expert-major packed weights;
 - explicit block size;
@@ -494,15 +560,21 @@ memory concepts, not KV tensor formats or KV connector APIs.
 
 Deliverables:
 
-1. Mobius recognizes supported sparse FFN patterns and preserves the exact router.
+1. Mobius recognizes supported sparse FFN patterns and preserves separate selection
+   scores and aggregation weights for the exact router.
 2. Mobius emits `com.microsoft::MoE`/`QMoE` with canonical expert-major layout.
 3. Mobius can emit the decomposed dense reference graph.
 4. `docs/OPERATORS.md` lists MoE/QMoE capability and fallback behavior.
 5. Runtime capability checks fail clearly when no fused op or fallback is available.
 6. Tiny deterministic fixtures cover top-1/top-2, softmax and sigmoid routers,
-   shared expert, SwiGLU, empty experts, and int4 scales/zero points.
-7. Differential tests compare router probabilities, selected IDs/weights, layer
-   outputs, and final logits between source framework, dense fallback, and QMoE.
+   grouped/bias-corrected selection, shared expert, SwiGLU, empty experts, and int4
+   scales/zero points.
+7. Differential tests compare selection scores, aggregation weights, selected
+   IDs/weights, layer outputs, and final logits between source framework, dense
+   fallback, and QMoE.
+8. Packing tests prove Mobius `MatMulNBits` and ORT `QMoE` layouts byte-for-byte,
+   including transposes, zero points, and EP prepacking, or define an explicit
+   tested conversion when they differ.
 
 Acceptance gate: a small Mixtral/Qwen-MoE/DeepSeek-style fixture produces equivalent
 routes and logits through the dense fallback and fused ORT op. No offload or custom
@@ -529,13 +601,16 @@ measured benefit over the dense fallback at representative decode/prefill shapes
 
 Deliverables:
 
-1. Expert-major external-data paging and `ExpertStore` leases.
-2. VRAM/RAM/disk residency under Resource Governor sub-budgets.
-3. Heat-based caching, asynchronous transfer, and budgeted prefetch.
-4. Batch-union residency plans and scheduler affinity tie-breakers.
-5. Metrics for cache hit rate, transferred bytes, stalls, imbalance, and prefetch
+1. Real EP/model weight, activation/scratch, and ORT overhead accounting wired into
+   the Resource Governor; no zero-reservation placeholder accounting.
+2. Expert-major external-data paging and `ExpertStore` leases.
+3. VRAM/RAM/disk residency under Resource Governor sub-budgets; disk residency
+   requires an implemented backing store rather than `DiskTierConfig` alone.
+4. Heat-based caching, asynchronous transfer, and budgeted prefetch.
+5. Batch-union residency plans and scheduler affinity tie-breakers.
+6. Metrics for cache hit rate, transferred bytes, stalls, imbalance, and prefetch
    waste.
-6. Stress tests proving the configured VRAM ceiling is not exceeded.
+7. Stress tests proving the configured VRAM ceiling is not exceeded.
 
 Acceptance gate: models larger than VRAM run without changing routes/precision, hot
 working sets converge, and lowering the live ceiling causes deterministic demotion or
@@ -548,9 +623,10 @@ an actionable error rather than OOM.
    external-data/lazy-initializer extension or an engine-owned custom op.
 2. **Schema evolution:** is upstream `QMoE` sufficient for every target router/FFN
    layout, or is a second schema accepting preselected expert IDs and weights needed?
-3. **Packing compatibility:** Mobius `MatMulNBits` packing and ORT `QMoE` packing,
-   zero-point defaults, transpose conventions, and prepacked layouts must be proven
-   byte-for-byte.
+3. **Packing validation result:** Phase 1 must determine whether Mobius
+   `MatMulNBits` packing and ORT `QMoE` packing are byte-identical across zero-point
+   defaults, transpose conventions, and EP prepacked layouts; otherwise it must
+   specify and test the required conversion.
 4. **Numerical reproducibility:** grouped/batched kernels may change rounding versus
    per-token execution. Define tolerance and deterministic modes.
 5. **Budget arbitration:** static partitioning wastes memory; fully dynamic

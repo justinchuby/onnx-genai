@@ -9163,13 +9163,23 @@ is currently **NOT YET IMPLEMENTED**.
 
 Mobius should keep the model-specific router as an explicit ONNX subgraph and emit
 the existing `com.microsoft::MoE` or quantized `com.microsoft::QMoE` contrib op for
-expert dispatch and reduction. The router produces `[tokens, experts]` probabilities;
-the fused op owns top-k token permutation, grouped expert FFNs, and weighted scatter.
+expert dispatch and reduction. The router produces separate `[tokens, experts]`
+selection scores and aggregation weights. For `QMoE`, these map to positional inputs
+1 (`router_probs`, TopK selection) and 14 (`router_weights`, weighted reduction), with
+empty-name placeholders for skipped optional inputs. Grouped TopK is encoded by
+masking scores outside the router-selected groups/candidate set before QMoE's global
+TopK. This preserves grouped and bias-corrected/DeepSeek `noaux_tc` selection without
+contaminating aggregation.
 
-`QMoE` is the primary int4 representation, with expert-major packed weights, block
-scales, and optional zero points compatible with the existing Mobius
-`MatMulNBits` format. Shared experts remain ordinary dense FFN nodes. Router policy is
-not fused into the expert op because softmax, sigmoid, grouped top-k, bias correction,
+The float `MoE` op lacks `router_weights`; it can encode the split only when Mobius
+can form selection-preserving logits (masked non-selected experts plus log aggregation
+weights, with any row-sum scale applied after the op). Otherwise Mobius must use the
+dense reference fallback. `QMoE` is the primary int4 representation, with
+expert-major packed weights, block scales, and optional zero points. Phase 1 must
+prove byte-for-byte compatibility or define a tested conversion to the existing
+Mobius `MatMulNBits` format, including layouts, transposes, zero points, and EP
+prepacking. Shared experts remain ordinary dense FFN nodes. Router policy is not
+fused into the expert op because softmax, sigmoid, grouped top-k, bias correction,
 and scaling are model semantics that must remain visible and exact.
 
 Mobius must also provide a dense reference export using TopK/masks, per-expert
