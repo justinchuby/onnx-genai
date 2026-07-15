@@ -1,4 +1,4 @@
-//! Built-in validation rules for this first wave (ONNX_RS §8.2).
+//! Built-in validation rules (ONNX_RS §8.2).
 //!
 //! * [`MissingOpsetImportRule`] — every operator domain used by a node must have
 //!   a matching `opset_import` (§8.2 "IR rules").
@@ -6,10 +6,15 @@
 //!   "structural rules": unique value names / single producer).
 //! * [`GraphAcyclicRule`] — the dataflow graph must be acyclic (§8.2).
 //! * [`SchemaNodeConformsRule`] — nodes match their resolved operator schema.
+//! * [`InputOutputDeclaredRule`] — graph inputs and outputs are named, live values.
+//! * [`NoUnconnectedNodesRule`] — node inputs resolve to graph sources or producers.
+//! * [`TypeConstraintSatisfiedRule`] — node value types satisfy schema constraints.
+//! * [`InitializerTypeMatchesDeclaredRule`] — initializer and value dtypes agree.
+//! * [`IrVersionSupportedRule`] — the model declares a valid ONNX IR version.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-use onnx_runtime_ir::{Attribute, Graph};
+use onnx_runtime_ir::{Attribute, Graph, ValueId};
 
 use super::{Severity, ValidationContext, ValidationRule, Violation, ViolationLocation};
 use crate::model::Model;
@@ -67,6 +72,158 @@ impl ValidationRule for DuplicateValueNameRule {
     fn check(&self, model: &Model, _ctx: &ValidationContext) -> Vec<Violation> {
         check_graph_duplicate_names(&model.graph, self.id())
     }
+}
+
+/// Graph inputs and outputs must reference live, named values (ONNX_RS §8.2
+/// `InputOutputDeclaredRule`). The shared IR always carries dtype and shape for
+/// a live value, so liveness plus a non-empty ONNX name establishes declaration.
+pub struct InputOutputDeclaredRule;
+
+impl ValidationRule for InputOutputDeclaredRule {
+    fn id(&self) -> &str {
+        "structure.input_output_declared"
+    }
+
+    fn severity(&self) -> Severity {
+        Severity::Error
+    }
+
+    fn check(&self, model: &Model, _ctx: &ValidationContext) -> Vec<Violation> {
+        check_graph_io_declared(&model.graph, &model.metadata.graph_name, self.id())
+    }
+}
+
+/// Every present node input must be a graph input, initializer, or the output
+/// of a live node (ONNX_RS §8.2 `NoUnconnectedNodesRule`).
+pub struct NoUnconnectedNodesRule;
+
+impl ValidationRule for NoUnconnectedNodesRule {
+    fn id(&self) -> &str {
+        "structure.no_unconnected_nodes"
+    }
+
+    fn severity(&self) -> Severity {
+        Severity::Error
+    }
+
+    fn check(&self, model: &Model, _ctx: &ValidationContext) -> Vec<Violation> {
+        check_graph_connections(
+            &model.graph,
+            &model.metadata.graph_name,
+            self.id(),
+            &HashSet::new(),
+        )
+    }
+}
+
+fn check_graph_io_declared(graph: &Graph, graph_name: &str, rule_id: &str) -> Vec<Violation> {
+    let mut violations = Vec::new();
+    for (kind, ids) in [("input", &graph.inputs), ("output", &graph.outputs)] {
+        for &value_id in ids {
+            match graph.try_value(value_id) {
+                None => violations.push(Violation {
+                    rule_id: rule_id.to_string(),
+                    severity: Severity::Error,
+                    message: format!("graph {kind} references missing value id {}", value_id.0),
+                    location: ViolationLocation::Graph {
+                        graph_name: graph_name.to_string(),
+                    },
+                }),
+                Some(value) if value.name.as_deref().is_none_or(str::is_empty) => {
+                    violations.push(Violation {
+                        rule_id: rule_id.to_string(),
+                        severity: Severity::Error,
+                        message: format!(
+                            "graph {kind} value id {} has no declared name",
+                            value_id.0
+                        ),
+                        location: ViolationLocation::Value {
+                            value_name: value_label(value_id, value.name.as_deref()),
+                        },
+                    });
+                }
+                Some(_) => {}
+            }
+        }
+    }
+    for subgraph in graph.subgraphs.values() {
+        violations.extend(check_graph_io_declared(subgraph, graph_name, rule_id));
+    }
+    violations
+}
+
+fn check_graph_connections(
+    graph: &Graph,
+    graph_name: &str,
+    rule_id: &str,
+    outer_scope: &HashSet<String>,
+) -> Vec<Violation> {
+    let mut violations = Vec::new();
+    let inputs: HashSet<ValueId> = graph.inputs.iter().copied().collect();
+    for (_node_id, node) in graph.nodes.iter() {
+        for (index, value_id) in node.inputs.iter().enumerate() {
+            let Some(value_id) = value_id else { continue };
+            let problem = match graph.try_value(*value_id) {
+                None => Some(format!(
+                    "input {index} references missing value id {}",
+                    value_id.0
+                )),
+                Some(value)
+                    if value.producer.is_none()
+                        && !inputs.contains(value_id)
+                        && !graph.initializers.contains_key(value_id) =>
+                {
+                    (!value
+                        .name
+                        .as_ref()
+                        .is_some_and(|name| outer_scope.contains(name)))
+                    .then(|| {
+                        format!(
+                            "input {index} references '{}' which is neither a graph input, initializer, node output, nor outer-scope value",
+                            value_label(*value_id, value.name.as_deref())
+                        )
+                    })
+                }
+                Some(value)
+                    if value
+                        .producer
+                        .is_some_and(|producer| !graph.nodes.contains(producer)) =>
+                {
+                    Some(format!(
+                        "input {index} references '{}' whose producer is missing",
+                        value_label(*value_id, value.name.as_deref())
+                    ))
+                }
+                Some(_) => None,
+            };
+            if let Some(message) = problem {
+                violations.push(node_violation(
+                    rule_id,
+                    graph_name,
+                    node,
+                    format!("node '{}' {message}", node_label(node)),
+                ));
+            }
+        }
+    }
+    let mut visible_names = outer_scope.clone();
+    visible_names.extend(
+        graph
+            .values
+            .values()
+            .filter_map(|value| value.name.as_ref())
+            .filter(|name| !name.is_empty())
+            .cloned(),
+    );
+    for subgraph in graph.subgraphs.values() {
+        violations.extend(check_graph_connections(
+            subgraph,
+            graph_name,
+            rule_id,
+            &visible_names,
+        ));
+    }
+    violations
 }
 
 fn check_graph_opset_imports(
@@ -195,6 +352,226 @@ impl ValidationRule for SchemaNodeConformsRule {
             ctx,
             self.id(),
         )
+    }
+}
+
+/// Node input/output element types must satisfy and consistently bind the type
+/// variables declared by the resolved operator schema (ONNX_RS §8.2).
+pub struct TypeConstraintSatisfiedRule;
+
+impl ValidationRule for TypeConstraintSatisfiedRule {
+    fn id(&self) -> &str {
+        "schema.type_constraint_satisfied"
+    }
+
+    fn severity(&self) -> Severity {
+        Severity::Error
+    }
+
+    fn check(&self, model: &Model, ctx: &ValidationContext) -> Vec<Violation> {
+        check_graph_type_constraints(
+            &model.graph,
+            &model.graph.opset_imports,
+            &model.metadata.graph_name,
+            ctx,
+            self.id(),
+        )
+    }
+}
+
+fn check_graph_type_constraints(
+    graph: &Graph,
+    opset_imports: &HashMap<String, u64>,
+    graph_name: &str,
+    ctx: &ValidationContext,
+    rule_id: &str,
+) -> Vec<Violation> {
+    let mut violations = Vec::new();
+    for (_node_id, node) in graph.nodes.iter() {
+        let Some(opset) = imported_opset(opset_imports, &node.domain) else {
+            continue;
+        };
+        let Some(schema) = ctx.schemas().lookup(&node.op_type, &node.domain, opset) else {
+            continue;
+        };
+        let mut bindings = HashMap::new();
+        for (type_param, value_id) in schema_value_bindings(schema, node) {
+            let Some(value) = graph.try_value(value_id) else {
+                continue;
+            };
+            let Some(constraint) = schema
+                .type_constraints
+                .iter()
+                .find(|constraint| constraint.type_param == type_param)
+            else {
+                continue;
+            };
+            if !constraint.allowed.contains(&value.dtype) {
+                violations.push(node_violation(
+                    rule_id,
+                    graph_name,
+                    node,
+                    format!(
+                        "type parameter '{}' does not allow {:?} for value '{}'",
+                        type_param,
+                        value.dtype,
+                        value_label(value_id, value.name.as_deref())
+                    ),
+                ));
+                continue;
+            }
+            match bindings.entry(type_param) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(value.dtype);
+                }
+                std::collections::hash_map::Entry::Occupied(entry)
+                    if *entry.get() != value.dtype =>
+                {
+                    violations.push(node_violation(
+                        rule_id,
+                        graph_name,
+                        node,
+                        format!(
+                            "type parameter '{}' is bound to both {:?} and {:?}",
+                            type_param,
+                            entry.get(),
+                            value.dtype
+                        ),
+                    ));
+                }
+                std::collections::hash_map::Entry::Occupied(_) => {}
+            }
+        }
+    }
+    for subgraph in graph.subgraphs.values() {
+        violations.extend(check_graph_type_constraints(
+            subgraph,
+            opset_imports,
+            graph_name,
+            ctx,
+            rule_id,
+        ));
+    }
+    violations
+}
+
+fn schema_value_bindings<'a>(
+    schema: &'a OpSchema,
+    node: &'a onnx_runtime_ir::Node,
+) -> Vec<(&'a str, ValueId)> {
+    let mut bindings = Vec::new();
+    for (index, spec) in schema.inputs.iter().enumerate() {
+        let slots = if spec.variadic {
+            node.inputs.get(index..).unwrap_or_default()
+        } else {
+            node.inputs
+                .get(index..index.saturating_add(1))
+                .unwrap_or_default()
+        };
+        bindings.extend(
+            slots
+                .iter()
+                .filter_map(|slot| *slot)
+                .map(|value_id| (spec.type_str.as_str(), value_id)),
+        );
+    }
+    for (index, spec) in schema.outputs.iter().enumerate() {
+        let values = if spec.variadic {
+            node.outputs.get(index..).unwrap_or_default()
+        } else {
+            node.outputs
+                .get(index..index.saturating_add(1))
+                .unwrap_or_default()
+        };
+        bindings.extend(
+            values
+                .iter()
+                .copied()
+                .map(|value_id| (spec.type_str.as_str(), value_id)),
+        );
+    }
+    bindings
+}
+
+/// Initializer tensor element types must match their graph value declarations
+/// (ONNX_RS §8.2 `InitializerTypeMatchesDeclaredRule`).
+pub struct InitializerTypeMatchesDeclaredRule;
+
+impl ValidationRule for InitializerTypeMatchesDeclaredRule {
+    fn id(&self) -> &str {
+        "type.initializer_matches_declared"
+    }
+
+    fn severity(&self) -> Severity {
+        Severity::Error
+    }
+
+    fn check(&self, model: &Model, _ctx: &ValidationContext) -> Vec<Violation> {
+        check_graph_initializer_types(&model.graph, self.id())
+    }
+}
+
+fn check_graph_initializer_types(graph: &Graph, rule_id: &str) -> Vec<Violation> {
+    let mut violations = Vec::new();
+    for (&value_id, initializer) in &graph.initializers {
+        match graph.try_value(value_id) {
+            None => violations.push(Violation {
+                rule_id: rule_id.to_string(),
+                severity: Severity::Error,
+                message: format!("initializer references missing value id {}", value_id.0),
+                location: ViolationLocation::Value {
+                    value_name: format!("<value#{}>", value_id.0),
+                },
+            }),
+            Some(value) if value.dtype != initializer.dtype() => violations.push(Violation {
+                rule_id: rule_id.to_string(),
+                severity: Severity::Error,
+                message: format!(
+                    "initializer '{}' has dtype {:?} but its declared value type is {:?}",
+                    value_label(value_id, value.name.as_deref()),
+                    initializer.dtype(),
+                    value.dtype
+                ),
+                location: ViolationLocation::Value {
+                    value_name: value_label(value_id, value.name.as_deref()),
+                },
+            }),
+            Some(_) => {}
+        }
+    }
+    for subgraph in graph.subgraphs.values() {
+        violations.extend(check_graph_initializer_types(subgraph, rule_id));
+    }
+    violations
+}
+
+/// The ONNX IR version is required and starts at 1. There is deliberately no
+/// upper ceiling: newer IR versions are accepted unless a concrete incompatibility
+/// is known (ONNX_RS §8.2 `IrVersionSupportedRule`).
+pub struct IrVersionSupportedRule;
+
+impl ValidationRule for IrVersionSupportedRule {
+    fn id(&self) -> &str {
+        "ir.version_supported"
+    }
+
+    fn severity(&self) -> Severity {
+        Severity::Error
+    }
+
+    fn check(&self, model: &Model, _ctx: &ValidationContext) -> Vec<Violation> {
+        if model.metadata.ir_version >= 1 {
+            return Vec::new();
+        }
+        vec![Violation {
+            rule_id: self.id().to_string(),
+            severity: self.severity(),
+            message: format!(
+                "ir_version {} is invalid; ONNX IR versions start at 1",
+                model.metadata.ir_version
+            ),
+            location: ViolationLocation::Model,
+        }]
     }
 }
 
@@ -434,11 +811,18 @@ fn node_label(node: &onnx_runtime_ir::Node) -> String {
     }
 }
 
+fn value_label(value_id: ValueId, name: Option<&str>) -> String {
+    match name {
+        Some(name) if !name.is_empty() => name.to_string(),
+        _ => format!("<value#{}>", value_id.0),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::schema::SchemaRegistry;
-    use onnx_runtime_ir::{Attribute, DataType, Node, NodeId, static_shape};
+    use onnx_runtime_ir::{Attribute, DataType, Node, NodeId, TensorData, WeightRef, static_shape};
 
     fn if_model(subgraph: Graph, output_count: usize, include_else_branch: bool) -> Model {
         let mut graph = Graph::new();
@@ -509,9 +893,202 @@ mod tests {
             NodeId(0),
             op_type,
             input_ids.iter().copied().map(Some).collect(),
-            output_ids,
+            output_ids.clone(),
         ));
+        for input in input_ids {
+            graph.add_input(input);
+        }
+        for output in output_ids {
+            graph.add_output(output);
+        }
         Model::new(graph)
+    }
+
+    fn assert_error(rule_id: &str, violations: &[Violation], location: ViolationLocation) {
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert_eq!(violations[0].rule_id, rule_id);
+        assert_eq!(violations[0].severity, Severity::Error);
+        assert_eq!(violations[0].location, location);
+    }
+
+    #[test]
+    fn declared_graph_io_passes() {
+        let rule = InputOutputDeclaredRule;
+        let mut graph = Graph::new();
+        let input = graph.create_named_value("X", DataType::Float32, static_shape([1]));
+        let output = graph.create_named_value("Y", DataType::Float32, static_shape([1]));
+        graph.add_input(input);
+        graph.add_output(output);
+
+        assert!(
+            rule.check(&Model::new(graph), &ValidationContext::default())
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn unnamed_graph_io_is_flagged() {
+        let rule = InputOutputDeclaredRule;
+        let mut graph = Graph::new();
+        let input = graph.create_value(DataType::Float32, static_shape([1]));
+        graph.add_input(input);
+
+        let violations = rule.check(&Model::new(graph), &ValidationContext::default());
+        assert_error(
+            rule.id(),
+            &violations,
+            ViolationLocation::Value {
+                value_name: format!("<value#{}>", input.0),
+            },
+        );
+    }
+
+    #[test]
+    fn connected_node_inputs_pass() {
+        let rule = NoUnconnectedNodesRule;
+        let mut graph = Graph::new();
+        let input = graph.create_named_value("X", DataType::Float32, static_shape([1]));
+        let output = graph.create_named_value("Y", DataType::Float32, static_shape([1]));
+        graph.add_input(input);
+        let node_id = graph.insert_node(Node::new(
+            NodeId(0),
+            "Relu",
+            vec![Some(input)],
+            vec![output],
+        ));
+        let mut subgraph = Graph::new();
+        let capture = subgraph.create_named_value("X", DataType::Float32, static_shape([1]));
+        let subgraph_output =
+            subgraph.create_named_value("subgraph_output", DataType::Float32, static_shape([1]));
+        subgraph.insert_node(Node::new(
+            NodeId(0),
+            "Relu",
+            vec![Some(capture)],
+            vec![subgraph_output],
+        ));
+        graph.subgraphs.insert((node_id, "body".into()), subgraph);
+
+        assert!(
+            rule.check(&Model::new(graph), &ValidationContext::default())
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn undefined_node_input_is_flagged() {
+        let rule = NoUnconnectedNodesRule;
+        let mut graph = Graph::new();
+        let dangling = graph.create_named_value("dangling", DataType::Float32, static_shape([1]));
+        let output = graph.create_named_value("Y", DataType::Float32, static_shape([1]));
+        let mut node = Node::new(NodeId(0), "Relu", vec![Some(dangling)], vec![output]);
+        node.name = "relu".into();
+        graph.insert_node(node);
+
+        let violations = rule.check(&Model::new(graph), &ValidationContext::default());
+        assert_error(
+            rule.id(),
+            &violations,
+            ViolationLocation::Node {
+                graph_name: String::new(),
+                node_name: "relu".into(),
+            },
+        );
+    }
+
+    #[test]
+    fn schema_type_constraints_accept_consistent_allowed_types() {
+        let rule = TypeConstraintSatisfiedRule;
+        let model = one_node_model("Add", 2, 1);
+
+        assert!(rule.check(&model, &ValidationContext::default()).is_empty());
+    }
+
+    #[test]
+    fn schema_type_constraint_violation_is_flagged() {
+        let rule = TypeConstraintSatisfiedRule;
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 21);
+        let input = graph.create_named_value("X", DataType::Int64, static_shape([1]));
+        let output = graph.create_named_value("Y", DataType::Int64, static_shape([1]));
+        graph.add_input(input);
+        let mut node = Node::new(NodeId(0), "Relu", vec![Some(input)], vec![output]);
+        node.name = "relu".into();
+        graph.insert_node(node);
+        graph.add_output(output);
+
+        let violations = rule.check(&Model::new(graph), &ValidationContext::default());
+        assert!(
+            violations.iter().all(|violation| {
+                violation.rule_id == rule.id()
+                    && violation.severity == Severity::Error
+                    && violation.location
+                        == ViolationLocation::Node {
+                            graph_name: String::new(),
+                            node_name: "relu".into(),
+                        }
+            }),
+            "{violations:?}"
+        );
+        assert_eq!(violations.len(), 2);
+    }
+
+    #[test]
+    fn matching_initializer_type_passes() {
+        let rule = InitializerTypeMatchesDeclaredRule;
+        let mut graph = Graph::new();
+        let value = graph.create_named_value("W", DataType::Float32, static_shape([1]));
+        graph.set_initializer(
+            value,
+            WeightRef::Inline(TensorData::from_raw(DataType::Float32, vec![1], vec![0; 4])),
+        );
+
+        assert!(
+            rule.check(&Model::new(graph), &ValidationContext::default())
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn mismatched_initializer_type_is_flagged() {
+        let rule = InitializerTypeMatchesDeclaredRule;
+        let mut graph = Graph::new();
+        let value = graph.create_named_value("W", DataType::Float32, static_shape([1]));
+        graph.set_initializer(
+            value,
+            WeightRef::Inline(TensorData::from_raw(DataType::Int64, vec![1], vec![0; 8])),
+        );
+
+        let violations = rule.check(&Model::new(graph), &ValidationContext::default());
+        assert_error(
+            rule.id(),
+            &violations,
+            ViolationLocation::Value {
+                value_name: "W".into(),
+            },
+        );
+    }
+
+    #[test]
+    fn present_and_future_ir_versions_pass() {
+        let rule = IrVersionSupportedRule;
+        for ir_version in [1, 10, 999] {
+            let mut model = Model::new(Graph::new());
+            model.metadata.ir_version = ir_version;
+            assert!(
+                rule.check(&model, &ValidationContext::default()).is_empty(),
+                "ir_version {ir_version}"
+            );
+        }
+    }
+
+    #[test]
+    fn absent_ir_version_is_flagged() {
+        let rule = IrVersionSupportedRule;
+        let mut model = Model::new(Graph::new());
+        model.metadata.ir_version = 0;
+
+        let violations = rule.check(&model, &ValidationContext::default());
+        assert_error(rule.id(), &violations, ViolationLocation::Model);
     }
 
     #[test]

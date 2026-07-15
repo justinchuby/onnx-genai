@@ -813,6 +813,12 @@ impl ValidationResult {
 }
 ```
 
+Implementation status: the checker now includes the structural
+`InputOutputDeclaredRule` and `NoUnconnectedNodesRule`, schema-driven
+`TypeConstraintSatisfiedRule`, `InitializerTypeMatchesDeclaredRule`, and the
+lower-bound-only `IrVersionSupportedRule`. Operator existence, arity, and
+attribute checks remain grouped in `SchemaNodeConformsRule`.
+
 ### 8.3 Extensibility
 
 Users register custom rules for custom ops or organizational standards:

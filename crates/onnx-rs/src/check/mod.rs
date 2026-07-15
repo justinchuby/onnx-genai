@@ -14,7 +14,9 @@
 mod rules;
 
 pub use rules::{
-    DuplicateValueNameRule, GraphAcyclicRule, MissingOpsetImportRule, SchemaNodeConformsRule,
+    DuplicateValueNameRule, GraphAcyclicRule, InitializerTypeMatchesDeclaredRule,
+    InputOutputDeclaredRule, IrVersionSupportedRule, MissingOpsetImportRule,
+    NoUnconnectedNodesRule, SchemaNodeConformsRule, TypeConstraintSatisfiedRule,
 };
 
 use crate::model::Model;
@@ -147,7 +149,11 @@ impl OnnxChecker {
         checker.add_rule(DuplicateValueNameRule);
         checker.add_rule(GraphAcyclicRule);
         checker.add_rule(SchemaNodeConformsRule);
-        // FOLLOW-UP (ONNX_RS §8.2): add the remaining structural and type rules.
+        checker.add_rule(InputOutputDeclaredRule);
+        checker.add_rule(NoUnconnectedNodesRule);
+        checker.add_rule(TypeConstraintSatisfiedRule);
+        checker.add_rule(InitializerTypeMatchesDeclaredRule);
+        checker.add_rule(IrVersionSupportedRule);
         checker
     }
 
@@ -260,6 +266,11 @@ mod tests {
         assert!(ids.contains(&"structure.duplicate_value_name"));
         assert!(ids.contains(&"structure.graph_acyclic"));
         assert!(ids.contains(&"schema.node_conforms"));
+        assert!(ids.contains(&"structure.input_output_declared"));
+        assert!(ids.contains(&"structure.no_unconnected_nodes"));
+        assert!(ids.contains(&"schema.type_constraint_satisfied"));
+        assert!(ids.contains(&"type.initializer_matches_declared"));
+        assert!(ids.contains(&"ir.version_supported"));
     }
 
     #[test]
