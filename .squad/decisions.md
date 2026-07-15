@@ -876,3 +876,31 @@ CHANNEL/AVG results match element-for-element.
 **Reviews:** Roy 🟢 (ep-cpu); Rachael 🔴→🟢 (cuda, Clip fix by Leon); Holden 🔴→🟢 (onnx-rs, nested-graph fix by Zhora). Strict-lockout honored (Leon fixed Gaff's reject; Zhora fixed Deckard's reject).
 **Follow-ups:** onnx-rs not yet in publish.yml; onnx-rs Wave 2 (JSON/textproto/op-schema/version-converter/pybindings); stale CUDA matmul_rejects test assertion (pre-existing).
 **Sources:** `gaff-cuda-wave4.md`, `ripley-epcpu-backend-gaps.md`, `Holden-approve-zhora-s-onnx-rs-control-flow-fixes.md`.
+
+
+---
+
+## 2026-07-15 — Wave 2: CPU reductions, ONNX schemas, and CUDA pointwise dtypes
+
+### CPU EP reduction kernels (`b87aa27`)
+**What:** Added f32 `ReduceL1` (sum of absolute values), `ReduceLogSum` (log of sum), and max-stabilized `ReduceLogSumExp`, with matching shape-inference registration.
+
+**Corrective review:** Roy found two correctness issues. Leon, as the lockout revision owner, fixed omitted axes handling for opset 18 and `ReduceLogSumExp` behavior for `+∞` inputs (now yields `NaN` rather than a fabricated finite result). The `onnx-runtime-ep-cpu` unit suite passes **335** tests.
+
+**Why:** The reductions close static-shape backend coverage while keeping numerical behavior explicit at ONNX edge cases. ONNX backend CPU passes increased **720 → 735 (+15)**.
+
+### `onnx-rs` op-schema system (`8adee51`)
+**What:** Implemented `docs/ONNX_RS.md` §7 with embedded-YAML, owned `OpSchema` values; an opset-aware registry resolving the greatest `since_version` not exceeding the requested opset, with optional inclusive `until_version`; built-in schemas for `MatMul`, `Gemm`, `Add`, `Relu`, `Conv`, `Mul`, `Identity`, and `If`; and checker rule `schema.node_conforms`.
+
+**Corrective review:** Holden found that `If.else_branch` was incorrectly optional and that variadic minimum arity could not be represented. Deckard, as the lockout revision owner, made `else_branch` required and encoded variadic minimum arity in checking (including `If` output minimum arity 1). The `onnx-rs` suite passes **29** tests.
+
+**Why:** YAML remains the language-agnostic schema source while version resolution and checker conformance are deterministic.
+
+### CUDA pointwise f16/bf16 support (`f0c2890`)
+**What:** Expanded CUDA binary/broadcast pointwise, unary/math, and activation kernels to f16/bf16. Half values widen to f32 for computation and narrow once on store; binary operations use NumPy right-aligned broadcasting via zero-stride device metadata.
+
+**Validation:** GPU-validated on H200 and reviewed 🟢 by Rachael. The only remaining failure is the pre-existing stale `matmul_rejects` assertion, tracked separately.
+
+**Why:** This aligns CUDA pointwise dtype and broadcast behavior with CPU semantics without changing the NVRTC kernel architecture.
+
+**Sources:** `brion-epcpu-gaps-2.md`, `rutger-onnx-rs-schema.md`, `pris-cuda-pointwise-dtypes.md`; Wave-2 corrective review results supplied by the coordinator manifest.
