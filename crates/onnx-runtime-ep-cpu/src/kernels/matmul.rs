@@ -44,7 +44,14 @@ impl KernelFactory for MatMulFactory {
 /// oneDNN when the `onednn` feature is compiled in, otherwise the pure-Rust
 /// blocked GEMM. The result is bit-plausible across backends within f32
 /// tolerance.
-fn gemm(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usize) -> Result<()> {
+pub(crate) fn gemm(
+    a: &[f32],
+    b: &[f32],
+    c: &mut [f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<()> {
     match CpuBackend::auto_detect() {
         #[cfg(feature = "onednn")]
         CpuBackend::OneDnn => crate::kernels::onednn::sgemm(a, b, c, m, k, n),

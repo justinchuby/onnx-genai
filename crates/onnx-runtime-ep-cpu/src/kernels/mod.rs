@@ -49,6 +49,7 @@ pub mod layernorm;
 pub mod log_softmax;
 pub mod logical;
 pub mod matmul;
+pub mod matmul_nbits;
 pub mod moe;
 pub mod movement_ops;
 pub mod norm_ops;
@@ -195,6 +196,10 @@ pub fn is_phase1_op(op_type: &str) -> bool {
 pub fn build_cpu_registry() -> OpRegistry {
     let mut reg = OpRegistry::new();
     reg.register(OpKey::new("MatMul", "", 1), Box::new(matmul::MatMulFactory));
+    reg.register(
+        OpKey::new("MatMulNBits", "com.microsoft", 1),
+        Box::new(matmul_nbits::MatMulNBitsFactory),
+    );
     reg.register(OpKey::new("Add", "", 1), Box::new(add::AddFactory));
     reg.register(OpKey::new("Relu", "", 1), Box::new(relu::ReluFactory));
     reg.register(
@@ -1208,7 +1213,8 @@ mod tests {
         // InstanceNormalization and PRelu add one registration each, while
         // GroupNormalization adds opset-18 and opset-21 entries, for forty-seven
         // registrations over the Phase-1 op-name count in total.
-        assert_eq!(reg.len(), PHASE1_OPS.len() + 47);
+        // MatMulNBits adds one more contrib-domain registration.
+        assert_eq!(reg.len(), PHASE1_OPS.len() + 48);
         for op in PHASE1_OPS {
             assert!(reg.lookup(op, "", 21).is_some(), "missing factory for {op}");
         }
@@ -1217,6 +1223,7 @@ mod tests {
         assert!(reg.lookup("Softmax", "", 13).is_some());
         assert!(reg.lookup("LogSoftmax", "", 12).is_some());
         assert!(reg.lookup("LogSoftmax", "", 13).is_some());
+        assert!(reg.lookup("MatMulNBits", "com.microsoft", 1).is_some());
         assert!(reg.lookup("Conv", "", 21).is_none());
         // The fused contrib-domain LayerNormalization resolves to the same
         // kernel as the standard default-domain op.
