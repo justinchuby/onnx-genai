@@ -904,3 +904,24 @@ CHANNEL/AVG results match element-for-element.
 **Why:** This aligns CUDA pointwise dtype and broadcast behavior with CPU semantics without changing the NVRTC kernel architecture.
 
 **Sources:** `brion-epcpu-gaps-2.md`, `rutger-onnx-rs-schema.md`, `pris-cuda-pointwise-dtypes.md`; Wave-2 corrective review results supplied by the coordinator manifest.
+
+---
+
+## 2026-07-15 — Wave 3: CPU Softsign, FairShare, and ONNX-RS text parsing
+
+### CPU Softsign conformance (`1a1da3c`)
+**What:** Added the missing CPU `Softsign` unary kernel (`x / (1 + |x|)`), shape-inference registration, and unit coverage.
+
+**Why:** The requested structural operators (`Concat`, `Flatten`, `Squeeze`, `Unsqueeze`, `Size`, `Not`, and `Where`) were already registered, so adding only Softsign avoided duplicate work while closing the actual remaining backend gap. ONNX backend CPU coverage rose **735 → 737**; `onnx-runtime-ep-cpu` has **336** unit tests. Roy reviewed 🟢.
+
+### Deficit-weighted FairShare scheduling (`cd3ec2b`, `8b19f14`)
+**What:** Added `PriorityPolicy::FairShare`: deficit-weighted round-robin among Low, Normal, and High classes; configurable non-zero weights; FCFS within a class; admission of waiting and swapped requests; anti-starvation; and an idle-class credit cap.
+
+**Corrective review:** Tyrell rejected the initial implementation because `set_weight` reset only the modified class's deficit, leaving stale debt in other classes and allowing post-reconfiguration starvation. Keaton, as lockout revision owner, reset **all** class deficits on a weight change, used overflow-safe accumulators, and added a regression test. Tyrell re-reviewed 🟢; the scheduler suite has **20** tests.
+
+### ONNX-RS textual-format parser and publication (`ae5b282`, `8e4c475`)
+**What:** Added ONNX_RS §5.4 textual parsing (`text::parse_model`, `Model::from_text`) that reconstructs the shared `onnx-runtime-ir`, preserving domains/opsets, typed graph I/O, attributes, initializer references, and nested Graph/Graphs bodies. Added `onnx-rs` to the publish workflow after `onnx-runtime-ir` and `onnx-runtime-loader`, raising the CI publish set to **26** crates.
+
+**Corrective review:** Holden rejected the first version because empty typed lists were lossy and empty Graphs were dropped. Ripley, as lockout revision owner, added type-preserving empty-list syntax (for example `[]:floats`) including empty Graphs and variant-preserving round-trip tests. Holden re-reviewed 🟢; `onnx-rs` has **34** tests.
+
+**Sources:** `bryant-epcpu-gaps-3.md`, `sebastian-fairshare.md`, `zhora-onnx-rs-parseback.md`; Wave-3 correction outcomes supplied by the coordinator manifest.
