@@ -38,4 +38,8 @@ pub enum Error {
         /// Human-readable description of the malformed construct.
         message: String,
     },
+
+    /// An ONNX protobuf-JSON document could not be encoded or decoded.
+    #[error("ONNX JSON error: {0}")]
+    Json(String),
 }

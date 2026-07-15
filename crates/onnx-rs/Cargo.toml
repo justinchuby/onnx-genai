@@ -9,8 +9,11 @@ keywords = ["onnx", "protobuf", "validation", "ir"]
 categories = ["science", "parser-implementations"]
 
 [dependencies]
+base64 = "0.22"
 onnx-runtime-ir = { workspace = true }
 onnx-runtime-loader = { workspace = true }
+prost = "0.13"
 serde = { workspace = true }
+serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 thiserror = { workspace = true }

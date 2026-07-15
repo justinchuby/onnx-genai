@@ -49,6 +49,7 @@
 
 pub mod check;
 mod error;
+pub mod json;
 mod model;
 pub mod schema;
 pub mod text;
