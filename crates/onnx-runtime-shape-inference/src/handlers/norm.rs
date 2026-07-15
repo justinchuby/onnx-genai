@@ -30,6 +30,34 @@ pub fn layer_norm(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
     Ok(())
 }
 
+/// `SkipLayerNormalization` (com.microsoft): output 0 is the input shape;
+/// optional `mean` (1) and `inv_std_var` (2) are the input shape with the
+/// normalised last axis set to `1`; optional `input_skip_bias_sum` (3) is the
+/// full input shape (`X + skip + bias`). Only the outputs the node requests are
+/// emitted.
+pub fn skip_layer_norm(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
+    let Some(x) = ctx.input_type(0).cloned() else {
+        return Ok(());
+    };
+    ctx.set_output_type(0, x.clone());
+    let rank = x.rank();
+    let axis = norm_axis(-1, rank.max(1));
+    let mut reduced = x.shape.clone();
+    for d in reduced.iter_mut().skip(axis) {
+        *d = DimExpr::constant(1);
+    }
+    if ctx.num_outputs() > 1 {
+        ctx.set_output(1, x.dtype, reduced.clone());
+    }
+    if ctx.num_outputs() > 2 {
+        ctx.set_output(2, x.dtype, reduced);
+    }
+    if ctx.num_outputs() > 3 {
+        ctx.set_output_type(3, x);
+    }
+    Ok(())
+}
+
 /// `RMSNormalization`: output 0 is the input shape (single output, no optional
 /// mean/inv-std). Shape- and dtype-preserving like other norm ops.
 pub fn rms_norm(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
@@ -131,7 +159,7 @@ pub fn register(reg: &mut InferenceRegistry) {
     // contrib domain; register the same rule there so the fused op's shape
     // still resolves (identical output-shape semantics as the standard op).
     reg.register("com.microsoft", "LayerNormalization", 1, layer_norm);
-    reg.register("com.microsoft", "SkipLayerNormalization", 1, layer_norm);
+    reg.register("com.microsoft", "SkipLayerNormalization", 1, skip_layer_norm);
     reg.register(
         "com.microsoft",
         "SimplifiedLayerNormalization",

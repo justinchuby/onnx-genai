@@ -838,6 +838,29 @@ fn layer_norm_main_and_reduced_outputs() {
 }
 
 #[test]
+fn skip_layer_norm_emits_x_shaped_skip_bias_sum() {
+    // com.microsoft SkipLayerNormalization with all four outputs: output 0 and
+    // output 3 (input_skip_bias_sum) are X-shaped; mean/inv_std collapse last.
+    let n = with_domain(node("SkipLayerNormalization", 3, 4), "com.microsoft");
+    let outs = run(
+        &n,
+        vec![
+            f32in(vec![sym(0), c(8), c(768)]),
+            f32in(vec![sym(0), c(8), c(768)]),
+            f32in(vec![c(768)]),
+        ],
+        1,
+    );
+    assert_eq!(out_shape(&outs), vec![sym(0), c(8), c(768)]);
+    let mean = outs[1].type_info.as_ref().unwrap().shape.clone();
+    assert_eq!(mean, vec![sym(0), c(8), c(1)]);
+    let inv = outs[2].type_info.as_ref().unwrap().shape.clone();
+    assert_eq!(inv, vec![sym(0), c(8), c(1)]);
+    let skip_sum = outs[3].type_info.as_ref().unwrap().shape.clone();
+    assert_eq!(skip_sum, vec![sym(0), c(8), c(768)]);
+}
+
+#[test]
 fn rms_norm_passthrough() {
     // Single output equal to X (opset 23).
     let n = node("RMSNormalization", 2, 1);
