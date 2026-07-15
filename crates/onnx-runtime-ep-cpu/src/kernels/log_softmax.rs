@@ -53,9 +53,9 @@ fn log_softmax_slices(x: &[f32], out: &mut [f32], outer: usize, axis_dim: usize,
             for a in 0..axis_dim {
                 sum += (x[base + a * inner] - max).exp();
             }
-            let logsumexp = max + sum.ln();
+            let log_sum = sum.ln();
             for a in 0..axis_dim {
-                out[base + a * inner] = x[base + a * inner] - logsumexp;
+                out[base + a * inner] = (x[base + a * inner] - max) - log_sum;
             }
         }
     }
@@ -151,5 +151,25 @@ mod tests {
             &modern.to_f32()[..4],
             &[-2.126_928, -2.126_928, -0.126_928_05, -0.126_928_05],
         );
+    }
+
+    #[test]
+    fn log_softmax_is_translation_invariant_for_large_logits() {
+        let small = Owned::f32(&[2], &[0., 1.]);
+        let shifted = Owned::f32(&[2], &[1_000_000., 1_000_001.]);
+        let equal_large = Owned::f32(&[2], &[1e10, 1e10]);
+        let mut small_out = Owned::zeros_f32(&[2]);
+        let mut shifted_out = Owned::zeros_f32(&[2]);
+        let mut equal_large_out = Owned::zeros_f32(&[2]);
+
+        run(-1, false, &small, &mut small_out);
+        run(-1, false, &shifted, &mut shifted_out);
+        run(-1, false, &equal_large, &mut equal_large_out);
+
+        approx(&shifted_out.to_f32(), &small_out.to_f32());
+        approx(&equal_large_out.to_f32(), &[-core::f32::consts::LN_2; 2]);
+        for output in [&shifted_out, &equal_large_out] {
+            assert!((output.to_f32().iter().map(|v| v.exp()).sum::<f32>() - 1.0).abs() < 1e-6);
+        }
     }
 }

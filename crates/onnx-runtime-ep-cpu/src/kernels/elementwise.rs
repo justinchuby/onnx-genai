@@ -108,7 +108,14 @@ impl Kernel for BinaryKernel {
         };
         check_arity(self.op.name(), inputs, outputs, min_in, max_in, 1)?;
         let op = self.op;
-        dispatch_arith!(inputs[0].dtype, op.name(), T => binary_typed::<T>(op, inputs, outputs))
+        match op {
+            BinOp::Sum | BinOp::Mean => {
+                dispatch_float!(inputs[0].dtype, op.name(), T => binary_typed::<T>(op, inputs, outputs))
+            }
+            _ => {
+                dispatch_arith!(inputs[0].dtype, op.name(), T => binary_typed::<T>(op, inputs, outputs))
+            }
+        }
     }
 
     fn supports_strided_input(&self, _input_idx: usize) -> bool {
@@ -395,6 +402,18 @@ mod tests {
             out.to_f32(),
             vec![37., 40.666_668, 44.333_332, 38., 41.666_668, 45.333_332]
         );
+    }
+
+    #[test]
+    fn sum_rejects_integer_input() {
+        let input = Owned::i32(&[2], &[1, 2]);
+        let mut out = Owned::zeros(DataType::Int32, &[2]);
+        let error = BinaryKernel { op: BinOp::Sum }
+            .execute(&[input.view()], &mut [out.view_mut()])
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("Sum: unsupported element type Int32"));
     }
 
     #[test]
