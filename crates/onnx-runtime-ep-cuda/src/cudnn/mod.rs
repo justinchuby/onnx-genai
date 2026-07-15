@@ -495,15 +495,19 @@ impl CudnnHandle<'_> {
             w: &w_desc,
             y: &y_desc,
         };
-        let algo = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| op.pick_algorithm()))
-            .map_err(|_| {
-                EpError::KernelFailed(
-                    "cuda_ep Conv: cuDNN forward algorithm selection failed or returned no \
-                     usable algorithm"
-                        .into(),
-                )
-            })?
-            .map_err(|e| cudnn_err("cudnnGetConvolutionForwardAlgorithm_v7", e))?;
+        let algo = if buffers.bias.is_some() {
+            sys::cudnnConvolutionFwdAlgo_t::CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_PRECOMP_GEMM
+        } else {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| op.pick_algorithm()))
+                .map_err(|_| {
+                    EpError::KernelFailed(
+                        "cuda_ep Conv: cuDNN forward algorithm selection failed or returned no \
+                         usable algorithm"
+                            .into(),
+                    )
+                })?
+                .map_err(|e| cudnn_err("cudnnGetConvolutionForwardAlgorithm_v7", e))?
+        };
         let workspace_bytes = op
             .get_workspace_size(algo)
             .map_err(|e| cudnn_err("cudnnGetConvolutionForwardWorkspaceSize", e))?;

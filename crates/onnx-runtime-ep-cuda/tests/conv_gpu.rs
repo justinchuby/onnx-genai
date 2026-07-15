@@ -52,6 +52,7 @@ fn build_conv_model(
     dtype: DataType,
     strides: [i64; 2],
     pads: [i64; 4],
+    dilations: [i64; 2],
     group: i64,
 ) -> (Graph, NodeId) {
     let mut graph = Graph::new();
@@ -66,6 +67,8 @@ fn build_conv_model(
         .insert("strides".into(), Attribute::Ints(strides.to_vec()));
     conv.attributes
         .insert("pads".into(), Attribute::Ints(pads.to_vec()));
+    conv.attributes
+        .insert("dilations".into(), Attribute::Ints(dilations.to_vec()));
     conv.attributes
         .insert("group".into(), Attribute::Int(group));
     let node = graph.insert_node(conv);
@@ -82,6 +85,7 @@ fn cpu_conv(
     y_shape: [usize; 4],
     stride: [usize; 2],
     pad: [usize; 2],
+    dilation: [usize; 2],
     groups: usize,
 ) -> Vec<f32> {
     let mut y = vec![0.0; y_shape.iter().product()];
@@ -96,8 +100,8 @@ fn cpu_conv(
                         let ic = group * w_shape[1] + ic_local;
                         for kh in 0..w_shape[2] {
                             for kw in 0..w_shape[3] {
-                                let ih = oh * stride[0] + kh;
-                                let iw = ow * stride[1] + kw;
+                                let ih = oh * stride[0] + kh * dilation[0];
+                                let iw = ow * stride[1] + kw * dilation[1];
                                 if ih >= pad[0] && iw >= pad[1] {
                                     let ih = ih - pad[0];
                                     let iw = iw - pad[1];
@@ -240,6 +244,7 @@ fn cudnn_conv_matches_cpu_for_padding_groups_and_f16() {
         DataType::Float32,
         [1, 1],
         [1, 1, 1, 1],
+        [1, 1],
         1,
     );
     let model1 = Model::new(&g1);
@@ -251,6 +256,7 @@ fn cudnn_conv_matches_cpu_for_padding_groups_and_f16() {
         [1, 1, 5, 5],
         [1, 1, 3, 3],
         [1, 1, 5, 5],
+        [1, 1],
         [1, 1],
         [1, 1],
         1,
@@ -274,6 +280,7 @@ fn cudnn_conv_matches_cpu_for_padding_groups_and_f16() {
         DataType::Float32,
         [2, 2],
         [0, 0, 0, 0],
+        [1, 1],
         2,
     );
     let model2 = Model::new(&g2);
@@ -287,6 +294,7 @@ fn cudnn_conv_matches_cpu_for_padding_groups_and_f16() {
         [1, 4, 2, 2],
         [2, 2],
         [0, 0],
+        [1, 1],
         2,
     );
     assert_close(&got2, &expected2, 1e-4);
@@ -312,6 +320,7 @@ fn cudnn_conv_matches_cpu_for_padding_groups_and_f16() {
         DataType::Float16,
         [1, 1],
         [1, 1, 1, 1],
+        [1, 1],
         1,
     );
     let model3 = Model::new(&g3);
@@ -325,8 +334,56 @@ fn cudnn_conv_matches_cpu_for_padding_groups_and_f16() {
         [1, 1, 5, 5],
         [1, 1],
         [1, 1],
+        [1, 1],
         1,
     );
     assert_close(&got3, &expected3, 2e-2);
     println!("cuDNN Conv f32/f16 padded and grouped-strided cases passed");
+}
+
+#[test]
+fn cudnn_conv_matches_cpu_for_dilation() {
+    let ep = match std::panic::catch_unwind(CudaExecutionProvider::new_default) {
+        Ok(Ok(ep)) => ep,
+        Ok(Err(error)) => {
+            eprintln!("skip: no CUDA GPU/runtime available ({error})");
+            return;
+        }
+        Err(_) => {
+            eprintln!("skip: CUDA runtime library loading panicked");
+            return;
+        }
+    };
+
+    let x: Vec<f32> = (1..=49).map(|v| v as f32 / 10.0).collect();
+    let w = vec![1.0, 0.5, -1.0, 0.25, 0.0, -0.25, 1.0, -0.5, 0.75];
+    let bias = [0.125];
+    let (graph, node) = build_conv_model(
+        &[1, 1, 7, 7],
+        &[1, 1, 3, 3],
+        &[1, 1, 3, 3],
+        &w,
+        &bias,
+        DataType::Float32,
+        [1, 1],
+        [0, 0, 0, 0],
+        [2, 2],
+        1,
+    );
+    let model = Model::new(&graph);
+    let got = run_model(&ep, &model, node, &x);
+    let expected = cpu_conv(
+        &x,
+        &w,
+        &bias,
+        [1, 1, 7, 7],
+        [1, 1, 3, 3],
+        [1, 1, 3, 3],
+        [1, 1],
+        [0, 0],
+        [2, 2],
+        1,
+    );
+    assert_close(&got, &expected, 1e-4);
+    println!("cuDNN Conv dilations=[2, 2] case passed");
 }
