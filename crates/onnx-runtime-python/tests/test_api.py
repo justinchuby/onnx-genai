@@ -51,6 +51,27 @@ def test_session_metadata():
     assert sess.get_providers() == ["CPUExecutionProvider"]
 
 
+def test_model_metadata():
+    model = _single_op_model("Relu", TensorProto.FLOAT, [2, 3])
+    proto = onnx.load_model_from_string(model)
+    proto.producer_name = "nxrt-test"
+    proto.domain = "com.example"
+    proto.model_version = 7
+    proto.doc_string = "metadata regression test"
+    proto.graph.name = "metadata_graph"
+    entry = proto.metadata_props.add()
+    entry.key = "author"
+    entry.value = "rachael"
+
+    metadata = nxrt.InferenceSession(proto.SerializeToString()).get_modelmeta()
+    assert metadata.producer_name == "nxrt-test"
+    assert metadata.graph_name == "metadata_graph"
+    assert metadata.domain == "com.example"
+    assert metadata.description == "metadata regression test"
+    assert metadata.version == 7
+    assert metadata.custom_metadata_map == {"author": "rachael"}
+
+
 def test_load_from_path(tmp_path):
     model = _single_op_model("Relu", TensorProto.FLOAT, [2, 2])
     p = tmp_path / "relu.onnx"

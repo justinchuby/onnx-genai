@@ -22,7 +22,9 @@ use onnx_runtime_ir::{DataType, DeviceType, Shape};
 pub use epcontext::{
     CompiledPartition, EpContextPlacement, dump_session_ep_context, load_ep_context_nodes,
 };
-pub use onnx_runtime_loader::{EpContextDumpConfig, EpContextPartition, Model as EncoderModel};
+pub use onnx_runtime_loader::{
+    EpContextDumpConfig, EpContextPartition, Model as EncoderModel, ModelMetadata,
+};
 pub use error::SessionError;
 pub use executor::{CacheStats, ControlFlowStats};
 pub use tensor::{Tensor, cpu_allocator};
@@ -474,7 +476,7 @@ impl SessionBuilder {
         // are accepted but not yet acted on in Phase 1 (CPU-only executor).
         let _ = (self.device, self.memory_limit, self.enable_profiling);
 
-        let (mut graph, weights, model_dir) = match (self.model_path, self.model_bytes) {
+        let (mut graph, weights, model_dir, model_metadata) = match (self.model_path, self.model_bytes) {
             (Some(path), _) => {
                 // The EPContext load path resolves `embed_mode=0` external blob
                 // paths relative to the model file's directory (§55.3), so
@@ -483,12 +485,21 @@ impl SessionBuilder {
                     .parent()
                     .map(Path::to_path_buf)
                     .unwrap_or_else(|| PathBuf::from("."));
-                let (g, w) = onnx_runtime_loader::load_model_with_weights(path)?;
-                (g, w, model_dir)
+                let bytes = std::fs::read(&path).map_err(|source| {
+                    onnx_runtime_loader::LoaderError::Io {
+                        path: path.clone(),
+                        source,
+                    }
+                })?;
+                let metadata = model_metadata_from_bytes(&bytes)?;
+                let (g, w) =
+                    onnx_runtime_loader::load_model_bytes_with_weights(&bytes, &model_dir)?;
+                (g, w, model_dir, metadata)
             }
             (None, Some(bytes)) => {
+                let metadata = model_metadata_from_bytes(&bytes)?;
                 let (g, w) = onnx_runtime_loader::load_model_bytes_with_weights(&bytes, ".")?;
-                (g, w, PathBuf::from("."))
+                (g, w, PathBuf::from("."), metadata)
             }
             (None, None) => return Err(SessionError::NoModelSource),
         };
@@ -496,13 +507,36 @@ impl SessionBuilder {
         // Optimize stage. Off by default; only runs when a level is selected.
         optimize_graph(&mut graph, level)?;
 
-        let mut session =
-            InferenceSession::from_parts(graph, weights, &model_dir, ep_context_config)?;
+        let mut session = InferenceSession::from_parts(
+            graph,
+            weights,
+            &model_dir,
+            ep_context_config,
+            model_metadata,
+        )?;
         if !self.warmup_shapes.is_empty() {
             session.warmup(&self.warmup_shapes)?;
         }
         Ok(session)
     }
+}
+
+fn model_metadata_from_bytes(bytes: &[u8]) -> Result<ModelMetadata> {
+    let model = onnx_runtime_loader::proto::decode_model(bytes)?;
+    Ok(ModelMetadata {
+        ir_version: model.ir_version,
+        producer_name: model.producer_name,
+        producer_version: model.producer_version,
+        domain: model.domain,
+        model_version: model.model_version,
+        doc_string: (!model.doc_string.is_empty()).then_some(model.doc_string),
+        graph_name: model.graph.map(|graph| graph.name).unwrap_or_default(),
+        metadata_props: model
+            .metadata_props
+            .into_iter()
+            .map(|entry| (entry.key, entry.value))
+            .collect(),
+    })
 }
 
 /// Parse a boolean-ish session-option value (§21.4). Accepts `1`/`0` and
@@ -581,6 +615,7 @@ fn optimize_graph(graph: &mut onnx_runtime_ir::Graph, level: OptimizationLevel) 
 pub struct InferenceSession {
     inputs: Vec<IoMeta>,
     outputs: Vec<IoMeta>,
+    model_metadata: ModelMetadata,
     exec: executor::Executor,
     /// EPContext dump config parsed from the `ep.context_*` session options
     /// (§21.4). Drives [`InferenceSession::export_ep_context`]; disabled by
@@ -627,6 +662,7 @@ impl InferenceSession {
             std::sync::Arc::new(onnx_runtime_loader::WeightStore::new()),
             Path::new("."),
             EpContextDumpConfig::default(),
+            ModelMetadata::default(),
         )
     }
 
@@ -635,6 +671,7 @@ impl InferenceSession {
         weights: std::sync::Arc<onnx_runtime_loader::WeightStore>,
         model_dir: &Path,
         ep_context_config: EpContextDumpConfig,
+        model_metadata: ModelMetadata,
     ) -> Result<Self> {
         onnx_runtime_loader::validate_model(&graph)?;
 
@@ -659,6 +696,7 @@ impl InferenceSession {
         Ok(Self {
             inputs,
             outputs,
+            model_metadata,
             exec,
             ep_context_config,
         })
@@ -682,6 +720,11 @@ impl InferenceSession {
     /// Output metadata.
     pub fn outputs(&self) -> &[IoMeta] {
         &self.outputs
+    }
+
+    /// Model-level metadata from the source `ModelProto`.
+    pub fn model_metadata(&self) -> &ModelMetadata {
+        &self.model_metadata
     }
 
     /// Kernel-cache statistics (§11.1); useful to observe warmup/run reuse.

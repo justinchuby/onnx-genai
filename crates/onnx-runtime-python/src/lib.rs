@@ -228,6 +228,35 @@ impl NodeArg {
     }
 }
 
+/// Model-level metadata returned by [`InferenceSession::get_modelmeta`], shaped
+/// like `onnxruntime.ModelMetadata`.
+#[pyclass(module = "nxrt", name = "ModelMetadata", frozen)]
+struct ModelMetadata {
+    #[pyo3(get)]
+    producer_name: String,
+    #[pyo3(get)]
+    graph_name: String,
+    #[pyo3(get)]
+    domain: String,
+    #[pyo3(get)]
+    description: String,
+    #[pyo3(get)]
+    version: i64,
+    custom_metadata_map: Vec<(String, String)>,
+}
+
+#[pymethods]
+impl ModelMetadata {
+    #[getter]
+    fn custom_metadata_map(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
+        let metadata = PyDict::new(py);
+        for (key, value) in &self.custom_metadata_map {
+            metadata.set_item(key, value)?;
+        }
+        Ok(metadata.unbind())
+    }
+}
+
 /// A loaded model ready for inference — the Python-facing mirror of
 /// `onnxruntime.InferenceSession`.
 ///
@@ -365,6 +394,24 @@ impl InferenceSession {
     /// Model output metadata as onnxruntime-style `NodeArg`s.
     fn get_outputs(&self, py: Python<'_>) -> PyResult<Py<PyList>> {
         node_args(py, &self.outputs)
+    }
+
+    /// Model-level metadata, matching `onnxruntime.InferenceSession.get_modelmeta`.
+    fn get_modelmeta(&self, _py: Python<'_>) -> PyResult<ModelMetadata> {
+        let metadata = self
+            .inner
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("InferenceSession state is unavailable"))?
+            .model_metadata()
+            .clone();
+        Ok(ModelMetadata {
+            producer_name: metadata.producer_name,
+            graph_name: metadata.graph_name,
+            domain: metadata.domain,
+            description: metadata.doc_string.unwrap_or_default(),
+            version: metadata.model_version,
+            custom_metadata_map: metadata.metadata_props,
+        })
     }
 
     /// The execution providers this session was created with (as requested).
@@ -1315,6 +1362,7 @@ fn nxrt(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__doc__", PyString::new(m.py(), doc))?;
     m.add_class::<InferenceSession>()?;
     m.add_class::<NodeArg>()?;
+    m.add_class::<ModelMetadata>()?;
     m.add_class::<Outputs>()?;
     m.add_class::<BoundSession>()?;
     dlpack::register(m)?;
