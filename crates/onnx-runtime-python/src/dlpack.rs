@@ -584,6 +584,11 @@ enum ImportPlan {
         /// nxrt device the borrowed buffer lives on (CPU host memory or a CUDA
         /// device ordinal), decided by [`dldevice_to_nxrt`].
         device: DeviceId,
+        /// The capsule's RAW DLPack device (`view.device`), retained un-normalized
+        /// so the commit guard can compare it against the raw advertised device.
+        /// Normalization ([`dldevice_to_nxrt`]) collapses `kDLCPU`/`kDLCUDAHost`
+        /// and drops CPU ordinals, which would hide a real device mismatch.
+        raw_device: onnx_runtime_dlpack::DLDevice,
         dtype: DataType,
         shape: Vec<usize>,
         /// First-element pointer (`data + byte_offset`).
@@ -681,7 +686,7 @@ fn plan_import(view: &onnx_runtime_dlpack::BorrowedDlpack<'_>) -> PyResult<Impor
         return Ok(ImportPlan::Fallback);
     }
 
-    Ok(ImportPlan::Commit { device, dtype, shape, data, len, align })
+    Ok(ImportPlan::Commit { device, raw_device: view.device, dtype, shape, data, len, align })
 }
 
 /// Resolve the [`ExecutionProvider`] a zero-copy imported tensor should carry as
@@ -714,7 +719,16 @@ fn import_allocator(_device: DeviceId) -> PyResult<Arc<dyn onnx_runtime_ep_api::
 
 /// Guard the zero-copy import commit: the device advertised by
 /// `__dlpack_device__` (`advertised`) must EXACTLY match the device of the
-/// capsule tensor actually returned (`actual`) — both `device_type` and ordinal.
+/// capsule tensor actually returned (`actual`) — both the RAW `device_type` and
+/// the RAW `device_id` ordinal.
+///
+/// Both devices are compared as their **raw** DLPack `(device_type, device_id)`
+/// identities, *before* any [`dldevice_to_nxrt`] normalization. Normalization
+/// collapses `kDLCPU` (1) and `kDLCUDAHost` (3) to the same nxrt `CPU:0` and
+/// discards CPU ordinals, so comparing normalized nxrt [`DeviceId`]s would let a
+/// producer advertise one raw device and hand back a *different* raw device
+/// (e.g. `kDLCPU` vs `kDLCUDAHost`, or `CPU:0` vs `CPU:1`) without detection.
+/// The exact-match requirement is only real when the raw identities are checked.
 ///
 /// A producer that advertises CPU (so the consumer skips the CUDA stream
 /// handshake at [`tensor_from_dlpack`], passing no `stream` kwarg) but then
@@ -722,12 +736,21 @@ fn import_allocator(_device: DeviceId) -> PyResult<Arc<dyn onnx_runtime_ep_api::
 /// stream ordering — a silent, unsynchronized data race. Refusing the import on
 /// mismatch keeps the consumer's stream handshake and the borrowed buffer's
 /// device consistent.
-fn ensure_committed_device_matches(advertised: DeviceId, actual: DeviceId) -> PyResult<()> {
-    if advertised != actual {
+fn ensure_committed_device_matches(
+    advertised: onnx_runtime_dlpack::DLDevice,
+    actual: onnx_runtime_dlpack::DLDevice,
+) -> PyResult<()> {
+    if advertised.device_type != actual.device_type
+        || advertised.device_id != actual.device_id
+    {
         return Err(PyValueError::new_err(format!(
-            "DLPack producer advertised device {advertised:?} via __dlpack_device__ \
-             but the capsule tensor is on {actual:?}; refusing import to avoid an \
-             unsynchronized device mismatch"
+            "DLPack producer advertised device (device_type={}, device_id={}) via \
+             __dlpack_device__ but the capsule tensor is on (device_type={}, \
+             device_id={}); refusing import to avoid an unsynchronized device mismatch",
+            advertised.device_type,
+            advertised.device_id,
+            actual.device_type,
+            actual.device_id,
         )));
     }
     Ok(())
@@ -773,6 +796,14 @@ pub(crate) fn tensor_from_dlpack(
             (Ok(t), Ok(d)) => (t, d),
             _ => return Ok(None),
         };
+    // FIX 1: retain the RAW advertised device un-normalized so the commit guard
+    // can compare it against the capsule's raw device_type/device_id. Comparing
+    // normalized nxrt `DeviceId`s (below) would collapse `kDLCPU`/`kDLCUDAHost`
+    // and drop CPU ordinals, letting a genuine raw mismatch slip past the guard.
+    let advertised_raw = onnx_runtime_dlpack::DLDevice {
+        device_type: device_type_i32,
+        device_id: device_id_i32,
+    };
     let nxrt_device = match dldevice_to_nxrt(device_type_i32, device_id_i32) {
         Some(d) => d,
         None => return Ok(None),
@@ -847,11 +878,14 @@ pub(crate) fn tensor_from_dlpack(
             let view = onnx_runtime_dlpack::borrowed_view_versioned(managed);
             match plan_import(&view)? {
                 ImportPlan::Fallback => Ok(None),
-                ImportPlan::Commit { device, dtype, shape, data, len, align } => {
-                    // FIX 1: the capsule's committed device MUST match what the
-                    // producer advertised via `__dlpack_device__`; otherwise the
-                    // consumer-side stream handshake above was skipped/wrong.
-                    ensure_committed_device_matches(nxrt_device, device)?;
+                ImportPlan::Commit { device, raw_device, dtype, shape, data, len, align } => {
+                    // FIX 1: the capsule's RAW committed device MUST match the
+                    // RAW device the producer advertised via `__dlpack_device__`;
+                    // otherwise the consumer-side stream handshake above was
+                    // skipped/wrong. Compare raw identities (device_type +
+                    // ordinal) so `kDLCPU` vs `kDLCUDAHost` and differing CPU
+                    // ordinals are not normalized away.
+                    ensure_committed_device_matches(advertised_raw, raw_device)?;
                     // Commit point: rename so the producer's destructor won't
                     // also free, then become the sole owner of the deleter.
                     if ffi::PyCapsule_SetName(cap_ptr, USED_DLTENSOR_VERSIONED.as_ptr()) != 0 {
@@ -883,10 +917,10 @@ pub(crate) fn tensor_from_dlpack(
             let view = onnx_runtime_dlpack::borrowed_view(managed);
             match plan_import(&view)? {
                 ImportPlan::Fallback => Ok(None),
-                ImportPlan::Commit { device, dtype, shape, data, len, align } => {
-                    // FIX 1: same advertised-vs-capsule device guard on the
+                ImportPlan::Commit { device, raw_device, dtype, shape, data, len, align } => {
+                    // FIX 1: same RAW advertised-vs-capsule device guard on the
                     // unversioned path.
-                    ensure_committed_device_matches(nxrt_device, device)?;
+                    ensure_committed_device_matches(advertised_raw, raw_device)?;
                     if ffi::PyCapsule_SetName(cap_ptr, USED_DLTENSOR.as_ptr()) != 0 {
                         return Err(PyErr::fetch(py));
                     }
@@ -1024,10 +1058,22 @@ mod device_mapping_tests {
         }
     }
 
-    // FIX 1: advertised-vs-capsule device guard.
+    // FIX 1: advertised-vs-capsule RAW device guard. The guard now compares the
+    // untouched DLPack `(device_type, device_id)` on both sides, so it catches
+    // mismatches that normalization would otherwise hide (`kDLCPU` vs
+    // `kDLCUDAHost`, and differing CPU ordinals).
+    fn dldev(device_type: i32, device_id: i32) -> dl::DLDevice {
+        dl::DLDevice { device_type, device_id }
+    }
+
     #[test]
     fn committed_device_matching_advertised_is_accepted() {
-        for dev in [DeviceId::cpu(), DeviceId::cuda(0), DeviceId::cuda(3)] {
+        for dev in [
+            dldev(dl::DL_CPU, 0),
+            dldev(dl::DL_CUDA, 0),
+            dldev(dl::DL_CUDA, 3),
+            dldev(dl::DL_CUDA_HOST, 0),
+        ] {
             assert!(super::ensure_committed_device_matches(dev, dev).is_ok());
         }
     }
@@ -1037,7 +1083,11 @@ mod device_mapping_tests {
         // Producer advertises CPU (so no CUDA stream handshake) but the capsule
         // is actually on CUDA → must refuse to avoid an unsynchronized race.
         assert!(
-            super::ensure_committed_device_matches(DeviceId::cpu(), DeviceId::cuda(0)).is_err(),
+            super::ensure_committed_device_matches(
+                dldev(dl::DL_CPU, 0),
+                dldev(dl::DL_CUDA, 0)
+            )
+            .is_err(),
             "advertised CPU but capsule CUDA must be refused"
         );
     }
@@ -1045,8 +1095,47 @@ mod device_mapping_tests {
     #[test]
     fn committed_device_ordinal_mismatch_is_refused() {
         assert!(
-            super::ensure_committed_device_matches(DeviceId::cuda(0), DeviceId::cuda(1)).is_err(),
-            "same device_type but different ordinal must still be refused"
+            super::ensure_committed_device_matches(
+                dldev(dl::DL_CUDA, 0),
+                dldev(dl::DL_CUDA, 1)
+            )
+            .is_err(),
+            "same device_type but different CUDA ordinal must still be refused"
+        );
+    }
+
+    #[test]
+    fn committed_cpu_ordinal_mismatch_is_refused() {
+        // Both raw devices are kDLCPU but with different ordinals. Normalizing
+        // through `dldevice_to_nxrt` would collapse both to CPU:0 and wrongly
+        // accept; the raw guard must refuse.
+        assert!(
+            super::ensure_committed_device_matches(dldev(dl::DL_CPU, 0), dldev(dl::DL_CPU, 1))
+                .is_err(),
+            "advertised CPU:0 but capsule CPU:1 must be refused (raw ordinal differs)"
+        );
+    }
+
+    #[test]
+    fn committed_kdlcpu_vs_kdlcudahost_mismatch_is_refused() {
+        // kDLCPU (1) and kDLCUDAHost (3) both normalize to nxrt CPU:0, so a
+        // normalized comparison would accept. The raw guard must refuse in both
+        // directions because the advertised and actual raw device_types differ.
+        assert!(
+            super::ensure_committed_device_matches(
+                dldev(dl::DL_CPU, 0),
+                dldev(dl::DL_CUDA_HOST, 0)
+            )
+            .is_err(),
+            "advertised kDLCPU but capsule kDLCUDAHost must be refused"
+        );
+        assert!(
+            super::ensure_committed_device_matches(
+                dldev(dl::DL_CUDA_HOST, 0),
+                dldev(dl::DL_CPU, 0)
+            )
+            .is_err(),
+            "advertised kDLCUDAHost but capsule kDLCPU must be refused"
         );
     }
 }
