@@ -712,6 +712,27 @@ fn import_allocator(_device: DeviceId) -> PyResult<Arc<dyn onnx_runtime_ep_api::
     Ok(cpu_allocator())
 }
 
+/// Guard the zero-copy import commit: the device advertised by
+/// `__dlpack_device__` (`advertised`) must EXACTLY match the device of the
+/// capsule tensor actually returned (`actual`) — both `device_type` and ordinal.
+///
+/// A producer that advertises CPU (so the consumer skips the CUDA stream
+/// handshake at [`tensor_from_dlpack`], passing no `stream` kwarg) but then
+/// hands back a CUDA capsule would otherwise be imported as CUDA with **no**
+/// stream ordering — a silent, unsynchronized data race. Refusing the import on
+/// mismatch keeps the consumer's stream handshake and the borrowed buffer's
+/// device consistent.
+fn ensure_committed_device_matches(advertised: DeviceId, actual: DeviceId) -> PyResult<()> {
+    if advertised != actual {
+        return Err(PyValueError::new_err(format!(
+            "DLPack producer advertised device {advertised:?} via __dlpack_device__ \
+             but the capsule tensor is on {actual:?}; refusing import to avoid an \
+             unsynchronized device mismatch"
+        )));
+    }
+    Ok(())
+}
+
 /// Try to import `obj` as a zero-copy nxrt [`Tensor`] via the DLPack **consumer**
 /// protocol. Returns `Ok(None)` when `obj` cannot (or should not) be borrowed —
 /// no `__dlpack__`, a producer that refuses to export, a non-CPU device, an
@@ -742,7 +763,17 @@ pub(crate) fn tensor_from_dlpack(
                 "__dlpack_device__() must return a (device_type, device_id) tuple of ints",
             )
         })?;
-    let nxrt_device = match dldevice_to_nxrt(device_type as i32, device_id as i32) {
+    // FIX 2: `device_id` is an i64 from Python; narrowing it to i32 with `as`
+    // would silently truncate a large/negative ordinal. Use checked conversion
+    // and treat any value that does not fit (device_type or device_id) as an
+    // unsupported device → fall back to the copy path, consistent with the
+    // `None` handling below.
+    let (device_type_i32, device_id_i32) =
+        match (i32::try_from(device_type), i32::try_from(device_id)) {
+            (Ok(t), Ok(d)) => (t, d),
+            _ => return Ok(None),
+        };
+    let nxrt_device = match dldevice_to_nxrt(device_type_i32, device_id_i32) {
         Some(d) => d,
         None => return Ok(None),
     };
@@ -817,6 +848,10 @@ pub(crate) fn tensor_from_dlpack(
             match plan_import(&view)? {
                 ImportPlan::Fallback => Ok(None),
                 ImportPlan::Commit { device, dtype, shape, data, len, align } => {
+                    // FIX 1: the capsule's committed device MUST match what the
+                    // producer advertised via `__dlpack_device__`; otherwise the
+                    // consumer-side stream handshake above was skipped/wrong.
+                    ensure_committed_device_matches(nxrt_device, device)?;
                     // Commit point: rename so the producer's destructor won't
                     // also free, then become the sole owner of the deleter.
                     if ffi::PyCapsule_SetName(cap_ptr, USED_DLTENSOR_VERSIONED.as_ptr()) != 0 {
@@ -849,6 +884,9 @@ pub(crate) fn tensor_from_dlpack(
             match plan_import(&view)? {
                 ImportPlan::Fallback => Ok(None),
                 ImportPlan::Commit { device, dtype, shape, data, len, align } => {
+                    // FIX 1: same advertised-vs-capsule device guard on the
+                    // unversioned path.
+                    ensure_committed_device_matches(nxrt_device, device)?;
                     if ffi::PyCapsule_SetName(cap_ptr, USED_DLTENSOR.as_ptr()) != 0 {
                         return Err(PyErr::fetch(py));
                     }
@@ -984,5 +1022,31 @@ mod device_mapping_tests {
             let d = nxrt_device_to_dldevice(DeviceId::cuda(ord)).unwrap().unwrap();
             assert_eq!(dldevice_to_nxrt(d.device_type, d.device_id), Some(DeviceId::cuda(ord)));
         }
+    }
+
+    // FIX 1: advertised-vs-capsule device guard.
+    #[test]
+    fn committed_device_matching_advertised_is_accepted() {
+        for dev in [DeviceId::cpu(), DeviceId::cuda(0), DeviceId::cuda(3)] {
+            assert!(super::ensure_committed_device_matches(dev, dev).is_ok());
+        }
+    }
+
+    #[test]
+    fn committed_device_mismatch_is_refused() {
+        // Producer advertises CPU (so no CUDA stream handshake) but the capsule
+        // is actually on CUDA → must refuse to avoid an unsynchronized race.
+        assert!(
+            super::ensure_committed_device_matches(DeviceId::cpu(), DeviceId::cuda(0)).is_err(),
+            "advertised CPU but capsule CUDA must be refused"
+        );
+    }
+
+    #[test]
+    fn committed_device_ordinal_mismatch_is_refused() {
+        assert!(
+            super::ensure_committed_device_matches(DeviceId::cuda(0), DeviceId::cuda(1)).is_err(),
+            "same device_type but different ordinal must still be refused"
+        );
     }
 }

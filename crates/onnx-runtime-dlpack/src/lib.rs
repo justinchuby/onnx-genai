@@ -1056,6 +1056,28 @@ mod tests {
     }
 
     #[test]
+    fn versioned_owner_calls_foreign_deleter_exactly_once() {
+        // The versioned owner is the default path for modern torch/numpy
+        // (DLPack major ≥ 1). Its foreign deleter must run EXACTLY once and be
+        // idempotent across an explicit `call_deleter` followed by `Drop`.
+        let _serial = IMPORT_DROPS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        IMPORT_DROPS_V.store(0, Ordering::SeqCst);
+        let managed = make_fake_managed_versioned(vec![4]);
+        // SAFETY: single owner of a live fake versioned managed tensor.
+        let mut owner = unsafe { ManagedTensorVersionedOwner::new(managed) };
+        assert_eq!(IMPORT_DROPS_V.load(Ordering::SeqCst), 0);
+        // SAFETY: no CPython C-API in the fake deleter, so no GIL required;
+        // models the Python guard's explicit call under the GIL.
+        unsafe { owner.call_deleter() };
+        assert_eq!(IMPORT_DROPS_V.load(Ordering::SeqCst), 1, "explicit call ran deleter once");
+        // SAFETY: redundant call must be a no-op.
+        unsafe { owner.call_deleter() };
+        assert_eq!(IMPORT_DROPS_V.load(Ordering::SeqCst), 1, "second call is idempotent");
+        drop(owner);
+        assert_eq!(IMPORT_DROPS_V.load(Ordering::SeqCst), 1, "no double free after Drop");
+    }
+
+    #[test]
     fn export_and_borrow_round_trip_cuda_device() {
         // The device-mapping logic must carry a kDLCUDA device + ordinal through
         // the ABI unchanged. No GPU is required: `export`/`borrowed_view` only

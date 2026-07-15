@@ -43,7 +43,7 @@ mod dlpack;
 
 use std::sync::Mutex;
 
-use onnx_runtime_ir::{DataType, Dim, Shape};
+use onnx_runtime_ir::{DataType, DeviceId, Dim, Shape};
 use onnx_runtime_session::{InferenceSession as RtSession, IoMeta, Tensor};
 use pyo3::exceptions::{
     PyAttributeError, PyFileNotFoundError, PyIndexError, PyKeyError, PyRuntimeError, PyTypeError,
@@ -458,6 +458,43 @@ impl InferenceSession {
     }
 }
 
+/// FIX 3 (honest CPU-session boundary, INPUT side): a device-resident (e.g.
+/// CUDA) input imported zero-copy would reach the CPU executor, which reads
+/// host bytes and PANICS. Full CUDA session execution — device-resident inputs
+/// actually consumed by a CUDA EP — is a **separate epic**; until it lands we
+/// refuse a non-host input with an actionable message *before* execution.
+///
+/// Returns the error message when `dev` is not host-accessible, else `None`.
+/// Pure (no Python/GPU) so it is unit-testable on the CPU dev machine.
+fn non_host_input_error(name: &str, dev: DeviceId) -> Option<String> {
+    if dev.is_host_accessible() {
+        return None;
+    }
+    Some(format!(
+        "input {name:?} is on {dev:?} but this session executes on CPU; running \
+         device-resident (CUDA) tensors requires CUDA session execution, which \
+         is not yet supported — pass a CPU tensor (e.g. tensor.cpu()) or build \
+         with CUDA session support."
+    ))
+}
+
+/// FIX 3 (honest boundary, host-READ side): host-reading a device-resident
+/// (CUDA) value into numpy calls `as_bytes()`/`host_bytes()`, whose
+/// host-accessibility assert PANICS (surfacing as a `PanicException`). Refuse
+/// with an actionable message instead.
+///
+/// Returns the error message when `dev` is not host-accessible, else `None`.
+fn non_host_read_error(name: &str, dev: DeviceId) -> Option<String> {
+    if dev.is_host_accessible() {
+        return None;
+    }
+    Some(format!(
+        "output {name:?} is on {dev:?}; host-reading a device-resident (CUDA) \
+         tensor into a numpy array is not supported — export it zero-copy via \
+         __dlpack__ (e.g. torch.from_dlpack) or move it to CPU first."
+    ))
+}
+
 impl InferenceSession {
     /// Core of the callable API shared by [`__call__`](Self::__call__) and the
     /// [`BoundSession`] proxy. `output_names` is threaded in explicitly as a
@@ -609,6 +646,12 @@ impl InferenceSession {
                 Some(t) => t,
                 None => numpy_to_tensor(py, np, &name, &value)?,
             };
+            // FIX 3: honest CPU-session boundary — refuse device-resident inputs
+            // before execution rather than panicking in the CPU executor. Full
+            // CUDA session execution is a SEPARATE epic (see `non_host_input_error`).
+            if let Some(msg) = non_host_input_error(&name, tensor.device()) {
+                return Err(PyRuntimeError::new_err(msg));
+            }
             owned.push((name, tensor));
         }
 
@@ -1049,6 +1092,14 @@ pub(crate) fn tensor_to_numpy(
 ) -> PyResult<Py<PyAny>> {
     let np_name = dtype_to_numpy_name(tensor.dtype)?;
 
+    // FIX 3: honest host-read boundary. `tensor.as_bytes()` below asserts the
+    // tensor is host-accessible and PANICS (surfacing as a PanicException) for a
+    // CUDA-resident value. Surface a clean, actionable RuntimeError instead so
+    // `.numpy()`/`run()` never panic on a device-resident output.
+    if let Some(msg) = non_host_read_error(name, tensor.device()) {
+        return Err(PyRuntimeError::new_err(msg));
+    }
+
     // Resolve the numpy dtype object; bfloat16 lives in the optional `ml_dtypes`
     // package, so import it lazily with a message that says how to get it.
     let dtype_obj = if np_name == "bfloat16" {
@@ -1274,4 +1325,46 @@ fn nxrt(m: &Bound<'_, PyModule>) -> PyResult<()> {
     #[cfg(feature = "cuda")]
     m.add_function(wrap_pyfunction!(cupti_available, m)?)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod honest_boundary_tests {
+    //! FIX 3 unit tests for the honest CPU-session boundary guards. These are
+    //! pure (no Python, no GPU): they exercise the device predicate + message
+    //! wording that `run_inner` (input side) and `tensor_to_numpy` (host-read
+    //! side) rely on, so the guard is covered on the CPU dev machine. The real
+    //! end-to-end CUDA path is validated on hardware in `test_dlpack_gpu.py`.
+    use super::{non_host_input_error, non_host_read_error};
+    use onnx_runtime_ir::{DeviceId, DeviceType};
+
+    #[test]
+    fn host_devices_pass_the_input_guard() {
+        for dev in [DeviceId::cpu(), DeviceId::new(DeviceType::Mlx, 0)] {
+            assert!(non_host_input_error("x", dev).is_none());
+        }
+    }
+
+    #[test]
+    fn cuda_input_is_refused_with_actionable_message() {
+        let msg = non_host_input_error("logits", DeviceId::cuda(0))
+            .expect("a CUDA input must be refused on a CPU session");
+        assert!(msg.contains("logits"), "names the offending input");
+        assert!(msg.contains("executes on CPU"), "explains the CPU boundary");
+        assert!(msg.contains("tensor.cpu()"), "offers an actionable fix");
+    }
+
+    #[test]
+    fn host_devices_pass_the_read_guard() {
+        for dev in [DeviceId::cpu(), DeviceId::new(DeviceType::Mlx, 0)] {
+            assert!(non_host_read_error("y", dev).is_none());
+        }
+    }
+
+    #[test]
+    fn host_reading_cuda_output_is_refused_with_actionable_message() {
+        let msg = non_host_read_error("probs", DeviceId::cuda(1))
+            .expect("host-reading a CUDA output must be refused");
+        assert!(msg.contains("probs"), "names the offending output");
+        assert!(msg.contains("__dlpack__"), "points at the zero-copy export path");
+    }
 }

@@ -52,6 +52,22 @@ def _cuda_unavailable_reason() -> str | None:
 _SKIP_REASON = _cuda_unavailable_reason()
 pytestmark = pytest.mark.skipif(_SKIP_REASON is not None, reason=_SKIP_REASON or "")
 
+# Running a device-resident (CUDA) input *through the executor* — i.e. actual
+# CUDA session execution — is a SEPARATE epic (see
+# `.squad/decisions/inbox/mariette-gpu-dlpack-fixes.md`). This feature delivers
+# zero-copy DLPack device import/export plus an HONEST boundary only: until the
+# execution epic lands the CPU executor cannot consume a CUDA input, so these
+# round-trip-through-run tests raise the clean guard error instead of a
+# PanicException. They stay as executable specs of the pending capability.
+_NEEDS_CUDA_EXECUTION = pytest.mark.xfail(
+    reason=(
+        "CUDA session execution is a separate epic; this feature delivers "
+        "DLPack device import/export + the honest CPU-session boundary only"
+    ),
+    strict=False,
+    raises=RuntimeError,
+)
+
 
 def _identity_model(dtype: int, shape) -> bytes:
     """A single ``Identity`` node so the output aliases the input value."""
@@ -90,6 +106,7 @@ def test_import_cuda_device_advertised():
     assert tuple(x.__dlpack_device__()) == (K_DL_CUDA, x.device.index)
 
 
+@_NEEDS_CUDA_EXECUTION
 def test_run_with_cuda_input_no_host_roundtrip():
     """Feeding a CUDA torch tensor runs on the GPU and returns correct values."""
     sess = _cuda_session(TensorProto.FLOAT, [2, 3])
@@ -103,6 +120,7 @@ def test_run_with_cuda_input_no_host_roundtrip():
 # (b) Export: nxrt CUDA output -> torch.from_dlpack, shared memory
 # --------------------------------------------------------------------------- #
 
+@_NEEDS_CUDA_EXECUTION
 def test_export_cuda_output_to_torch_shares_memory():
     sess = _cuda_session(TensorProto.FLOAT, [4])
     x = torch.arange(4, dtype=torch.float32, device="cuda")
@@ -122,6 +140,7 @@ def test_export_cuda_output_to_torch_shares_memory():
     assert borrowed.data_ptr() == nxrt._dlpack_import_data_ptr(value)
 
 
+@_NEEDS_CUDA_EXECUTION
 def test_export_honors_stream_sync_default():
     """Export must succeed with the default stream handshake (producer sync)."""
     sess = _cuda_session(TensorProto.FLOAT, [16])
@@ -151,3 +170,62 @@ def test_cpu_export_is_kdlcpu():
     (value,) = sess.run_with_values(None, {"X": x_cpu})
     # A CPU-resident output still exports as kDLCPU even on a CUDA session.
     assert value.__dlpack_device__()[0] in (K_DL_CPU, K_DL_CUDA)
+
+
+# --------------------------------------------------------------------------- #
+# (d) Honest CPU-session boundary (FIX 3)
+#
+# Full CUDA *session execution* (device-resident inputs actually consumed by a
+# CUDA EP) is a SEPARATE epic. This feature ships zero-copy DLPack device
+# import/export plus an HONEST boundary: a device-resident tensor that reaches
+# the CPU executor — or a host read of a device-resident value — must raise a
+# clean, actionable error instead of a PanicException or a silent wrong result.
+#
+# These exercise the real end-to-end guard and therefore need a CUDA-enabled
+# nxrt build + a CUDA torch (they skip via the module-level guard otherwise).
+# The pure guard logic (`non_host_input_error`/`non_host_read_error` and the
+# advertised-vs-capsule device check) is unit-tested without a GPU in Rust.
+# --------------------------------------------------------------------------- #
+
+def _cpu_session(dtype: int, shape) -> nxrt.InferenceSession:
+    return nxrt.InferenceSession(
+        _identity_model(dtype, shape), providers=["CPUExecutionProvider"]
+    )
+
+
+def test_cpu_session_refuses_cuda_input_cleanly():
+    """A CUDA-resident input to a CPU session raises a clear RuntimeError
+    (not a PanicException) before execution."""
+    sess = _cpu_session(TensorProto.FLOAT, [2, 3])
+    x = torch.arange(6, dtype=torch.float32, device="cuda").reshape(2, 3)
+    with pytest.raises(RuntimeError) as excinfo:
+        sess.run(None, {"X": x})
+    msg = str(excinfo.value)
+    assert "executes on CPU" in msg
+    assert "not yet supported" in msg
+    # Must be an ordinary RuntimeError, never a panic surfaced to Python.
+    assert "panic" not in msg.lower()
+
+
+@_NEEDS_CUDA_EXECUTION
+def test_host_read_of_cuda_value_raises_cleanly():
+    """`.numpy()` on a CUDA-resident output must raise a clean RuntimeError
+    instead of panicking in the host-accessibility assert.
+
+    Obtaining a CUDA-resident value requires CUDA session execution (the
+    separate epic), so today this xfails at the input boundary; the host-read
+    guard itself (`non_host_read_error`) is unit-tested without a GPU in Rust.
+    Once execution lands this becomes a live end-to-end assertion.
+    """
+    sess = _cuda_session(TensorProto.FLOAT, [4])
+    x = torch.arange(4, dtype=torch.float32, device="cuda")
+    (value,) = sess.run_with_values(None, {"X": x})
+    dev_type, _ = value.__dlpack_device__()
+    if dev_type != K_DL_CUDA:
+        pytest.skip("output landed on CPU; nothing to guard for this run")
+    with pytest.raises(RuntimeError) as excinfo:
+        value.numpy()
+    msg = str(excinfo.value)
+    assert "device-resident" in msg
+    assert "__dlpack__" in msg
+    assert "panic" not in msg.lower()
