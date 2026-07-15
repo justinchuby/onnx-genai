@@ -7,6 +7,9 @@ use onnx_genai_engine::logits::{
 use onnx_genai_engine::{ProcessorContext, TokenId};
 use tokenizers::Tokenizer;
 
+#[cfg(feature = "bench-native")]
+pub mod synthetic_decoder;
+
 pub const VOCAB_SIZE: usize = 32_000;
 
 pub fn fixture_path(name: &str) -> PathBuf {

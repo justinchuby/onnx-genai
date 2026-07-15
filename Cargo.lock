@@ -1692,6 +1692,8 @@ dependencies = [
  "onnx-genai-runtime-config",
  "onnx-runtime-ep-cpu",
  "onnx-runtime-ep-cuda",
+ "onnx-runtime-ir",
+ "onnx-runtime-loader",
  "onnx-runtime-session",
  "serde_json",
  "tokenizers",

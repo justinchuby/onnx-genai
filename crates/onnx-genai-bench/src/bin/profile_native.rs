@@ -5,8 +5,10 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, ValueEnum};
+use onnx_genai_bench::{fixture_path, synthetic_decoder};
 use onnx_genai_engine::{GenerateOptions, NativeDecodeDevice, NativeDecodeSession, ProcessorChain};
 use onnx_genai_ort::Tokenizer;
+use onnx_runtime_session::InferenceSession;
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum ExecutionProvider {
@@ -19,7 +21,13 @@ enum ExecutionProvider {
 struct Args {
     /// ONNX model file, or a directory containing model.onnx and tokenizer.json.
     #[arg(long)]
-    model: PathBuf,
+    model: Option<PathBuf>,
+    /// Build and profile the architecture-representative two-layer cached decoder.
+    #[arg(long)]
+    synthetic: bool,
+    /// Inspection ONNX path written by --synthetic; timing uses the equivalent IR graph.
+    #[arg(long, default_value = "target/native-synthetic-decoder.onnx")]
+    synthetic_model_out: PathBuf,
     #[arg(long, default_value_t = 128)]
     tokens: usize,
     #[arg(long, default_value_t = 1)]
@@ -70,19 +78,47 @@ fn main() -> Result<()> {
     if args.tokens == 0 || args.runs == 0 {
         bail!("--tokens and --runs must be greater than zero");
     }
+    if !args.synthetic && args.model.is_none() {
+        bail!("--model is required unless --synthetic is used");
+    }
     let device = match args.ep {
         ExecutionProvider::Cpu => NativeDecodeDevice::Cpu,
         ExecutionProvider::Cuda => NativeDecodeDevice::Cuda { index: None },
     };
-    let model = model_file(&args.model);
-    let tokenizer = Tokenizer::from_file(tokenizer_file(&args.model))
+    let model = if args.synthetic {
+        if let Some(parent) = args.synthetic_model_out.parent() {
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!("create synthetic model directory {}", parent.display())
+            })?;
+        }
+        synthetic_decoder::write_synthetic_decoder(&args.synthetic_model_out)
+            .context("write synthetic decoder ONNX")?;
+        args.synthetic_model_out.clone()
+    } else {
+        model_file(args.model.as_deref().expect("validated model argument"))
+    };
+    let tokenizer_path = if args.synthetic {
+        fixture_path("tiny-gemma4-assistant").join("tokenizer.json")
+    } else {
+        tokenizer_file(args.model.as_deref().expect("validated model argument"))
+    };
+    let tokenizer = Tokenizer::from_file(&tokenizer_path)
         .context("load tokenizer.json beside native decoder")?;
     let prompt_tokens = tokenizer.encode(&args.prompt).context("tokenize prompt")?;
     if prompt_tokens.is_empty() {
         bail!("prompt tokenized to an empty sequence");
     }
-    let mut session = NativeDecodeSession::load(&model, device)
-        .with_context(|| format!("load native decoder {}", model.display()))?;
+    let mut session = if args.synthetic {
+        if !matches!(device, NativeDecodeDevice::Cpu) {
+            bail!("native CUDA decode is unavailable in onnx-runtime-session");
+        }
+        let native = InferenceSession::from_graph(synthetic_decoder::build_synthetic_decoder())
+            .context("build synthetic native session")?;
+        NativeDecodeSession::from_session(native).context("wrap synthetic native decoder")?
+    } else {
+        NativeDecodeSession::load(&model, device)
+            .with_context(|| format!("load native decoder {}", model.display()))?
+    };
 
     println!(
         "profile_native: model={} ep={:?} tokens={} warmups={} runs={}",

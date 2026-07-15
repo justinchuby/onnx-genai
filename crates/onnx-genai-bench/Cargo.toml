@@ -14,6 +14,8 @@ bench-native = [
     "dep:onnx-genai-ort",
     "dep:onnx-runtime-ep-cpu",
     "dep:onnx-runtime-ep-cuda",
+    "dep:onnx-runtime-ir",
+    "dep:onnx-runtime-loader",
     "dep:onnx-runtime-session",
 ]
 
@@ -26,6 +28,8 @@ onnx-genai-ort = { workspace = true, optional = true }
 onnx-genai-runtime-config = { workspace = true }
 onnx-runtime-ep-cpu = { workspace = true, optional = true }
 onnx-runtime-ep-cuda = { workspace = true, optional = true }
+onnx-runtime-ir = { workspace = true, optional = true }
+onnx-runtime-loader = { workspace = true, optional = true }
 onnx-runtime-session = { workspace = true, optional = true }
 serde_json = { workspace = true }
 tokenizers = { workspace = true }
