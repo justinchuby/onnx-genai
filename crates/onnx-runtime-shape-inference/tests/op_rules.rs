@@ -422,6 +422,55 @@ fn attention_gqa_present_uses_kv_heads() {
 }
 
 #[test]
+fn attention_resolves_for_opsets_23_through_26() {
+    // The opset-23 rule serves model opsets 24, 25 and 26 too (the registry
+    // resolves the highest `min_opset <= version`). Y is sized at every opset.
+    let n = node("Attention", 3, 1);
+    for opset in [23, 24, 25, 26] {
+        let outs = run(
+            &n,
+            vec![
+                f32in(vec![c(1), c(2), c(3), c(8)]),
+                f32in(vec![c(1), c(2), c(5), c(8)]),
+                f32in(vec![c(1), c(2), c(5), c(16)]),
+            ],
+            opset,
+        );
+        assert_eq!(
+            out_shape(&outs),
+            vec![c(1), c(2), c(3), c(16)],
+            "Y shape wrong at opset {opset}"
+        );
+    }
+}
+
+#[test]
+fn attention_opset24_nonpad_external_cache_no_past_concat() {
+    // opset-24 external-cache path: `nonpad_kv_seqlen` (7th input) with no
+    // past_key, so total_seq == kv_seq of K (no concat). All four outputs sized.
+    // Q [1,2,3,8], K [1,2,5,8], V [1,2,5,16] -> total_seq = 5.
+    let n = node("Attention", 7, 4);
+    let outs = run(
+        &n,
+        vec![
+            f32in(vec![c(1), c(2), c(3), c(8)]),
+            f32in(vec![c(1), c(2), c(5), c(8)]),
+            f32in(vec![c(1), c(2), c(5), c(16)]),
+            NodeIo::default(),                    // attn_mask (skipped)
+            NodeIo::default(),                    // past_key (absent)
+            NodeIo::default(),                    // past_value (absent)
+            tin(DataType::Int64, vec![c(1)]),     // nonpad_kv_seqlen
+        ],
+        24,
+    );
+    let shape_i = |i: usize| outs[i].type_info.as_ref().unwrap().shape.clone();
+    assert_eq!(shape_i(0), vec![c(1), c(2), c(3), c(16)]);
+    assert_eq!(shape_i(1), vec![c(1), c(2), c(5), c(8)]);
+    assert_eq!(shape_i(2), vec![c(1), c(2), c(5), c(16)]);
+    assert_eq!(shape_i(3), vec![c(1), c(2), c(3), c(5)]);
+}
+
+#[test]
 fn add_broadcast_concrete() {
     let n = node("Add", 2, 1);
     let outs = run(

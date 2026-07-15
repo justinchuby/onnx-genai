@@ -218,7 +218,7 @@ pub fn fused_attention(ctx: &mut InferenceContext) -> Result<(), ShapeInferError
     Ok(())
 }
 
-/// Standard `ai.onnx::Attention` (opset 23/24): scaled dot-product attention
+/// Standard `ai.onnx::Attention` (opset 23–26): scaled dot-product attention
 /// with 3D/4D inputs, GQA/MQA head sharing, a KV cache, and up to four outputs.
 ///
 /// The executor sizes each value's buffer from resolved shapes, so every
@@ -403,6 +403,10 @@ pub fn register(reg: &mut InferenceRegistry) {
     reg.register("com.microsoft", "FusedGemm", 1, fused_gemm);
     // The optimizer's SDPA-core fusion: output shape == MatMul(probs, V)'s.
     reg.register("com.microsoft", "FusedAttention", 1, fused_attention);
-    // Standard ai.onnx::Attention (opset 23; shape contract unchanged in 24).
+    // Standard ai.onnx::Attention. Added at opset 23; the shape contract is
+    // unchanged through opset 26 (the opset-24 revision only adds the
+    // `nonpad_kv_seqlen` external-cache input, which never concatenates a past
+    // cache — total_seq stays kv_seq). The registry resolves the highest
+    // `min_opset <= version`, so this single rule serves opsets 23–26.
     reg.register("", "Attention", 23, attention);
 }

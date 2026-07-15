@@ -1,4 +1,4 @@
-//! Standard `ai.onnx::Attention` (opset 23/24): scaled dot-product attention
+//! Standard `ai.onnx::Attention` (opset 23–26): scaled dot-product attention
 //! (SDPA) with multi-head / grouped-query head sharing, an optional additive or
 //! boolean attention mask, causal masking, and an in-op KV cache
 //! (`past_key`/`past_value` → `present_key`/`present_value`).
@@ -15,12 +15,26 @@
 //! ## Semantics (per the spec's applied pattern)
 //!
 //! ```text
-//! scores = scale · (Q · Kᵀ)              # scale defaults to 1/sqrt(head_size)
-//! scores = softcap · tanh(scores/softcap)  # only when softcap > 0
+//! scores = (Q·√scale) · (K·√scale)ᵀ      # √scale folded into each operand so
+//!                                        # extreme magnitudes don't overflow;
+//!                                        # scale defaults to 1/sqrt(head_size)
+//! scores = softcap · tanh(scores/softcap)  # only when softcap != 0
 //! scores = scores + attn_bias            # attn_mask (add/-inf) and causal mask
 //! probs  = softmax(scores, axis=-1)      # numerically stable; fully-masked → 0
 //! Y      = probs · V
 //! ```
+//!
+//! ## Versioning (opset 23 vs 24–26)
+//!
+//! `Attention` was added at opset 23 and revised at opset 24 (no newer version
+//! exists, so a single opset-24 kernel serves model opsets 24, 25 and 26). Two
+//! semantic deltas are handled per registered `since_version`:
+//!
+//! * `qk_matmul_output_mode` values **1 and 2 were swapped** in opset 24. The
+//!   v24+ kernel uses `1` = after softcap, `2` = after mask; the v23 kernel uses
+//!   the original (reversed) meaning.
+//! * `nonpad_kv_seqlen` (7th input) — an external-cache per-batch valid-token
+//!   count — is honored for v24+ and rejected for v23 (it did not exist there).
 //!
 //! ## Supported vs. unimplemented
 //!
@@ -29,8 +43,6 @@
 //!   Q/K/V error actionably.
 //! * `qk_matmul_output_mode`: modes **0, 1, 2, 3** implemented per spec; any
 //!   other value errors.
-//! * `nonpad_kv_seqlen` (7th input) is **not** implemented and errors actionably
-//!   rather than silently producing wrong output.
 
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ir::{DataType, Node};
@@ -47,10 +59,16 @@ pub struct AttentionKernel {
     qk_matmul_output_mode: i64,
     /// Softcap value; `0.0` disables it.
     softcap: f32,
+    /// The registered opset version this kernel serves (23, or 24 for 24–26).
+    /// Controls the `qk_matmul_output_mode` 1↔2 swap and `nonpad_kv_seqlen`.
+    since_version: u32,
 }
 
 /// Factory for [`AttentionKernel`], reading the standard-`Attention` attributes.
-pub struct AttentionFactory;
+/// `since_version` selects the opset semantics (23 vs 24–26).
+pub struct AttentionFactory {
+    pub since_version: u32,
+}
 
 impl KernelFactory for AttentionFactory {
     fn create(&self, node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
@@ -89,6 +107,7 @@ impl KernelFactory for AttentionFactory {
             kv_num_heads,
             qk_matmul_output_mode,
             softcap,
+            since_version: self.since_version,
         }))
     }
 }
@@ -238,16 +257,20 @@ enum Mask {
 
 impl Mask {
     /// The additive bias for logical index `(b, h, i, j)`; masked-out positions
-    /// (bool `false`, or `j` past a short mask's last dim) yield `-inf`.
+    /// (bool `false`, or `j` past a short mask's last dim) yield `-inf`. A
+    /// rank-0 (scalar) mask broadcasts to every score position.
     fn bias(&self, b: usize, h: usize, i: usize, j: usize, total_seq: usize) -> f32 {
         match self {
             Mask::None => 0.0,
             Mask::Float { data, shape } => Self::lookup_f32(data, shape, b, h, i, j, total_seq),
             Mask::Bool { data, shape } => {
-                let last = shape[shape.len() - 1];
-                // A last dim shorter than total_seq is padded with -inf.
-                if j >= last && last < total_seq {
-                    return f32::NEG_INFINITY;
+                // A last dim shorter than total_seq is padded with -inf; a
+                // rank-0 scalar mask has no last dim and applies everywhere.
+                if !shape.is_empty() {
+                    let last = shape[shape.len() - 1];
+                    if j >= last && last < total_seq {
+                        return f32::NEG_INFINITY;
+                    }
                 }
                 if Self::lookup_bool(data, shape, b, h, i, j) {
                     0.0
@@ -267,9 +290,11 @@ impl Mask {
         j: usize,
         total_seq: usize,
     ) -> f32 {
-        let last = shape[shape.len() - 1];
-        if j >= last && last < total_seq {
-            return f32::NEG_INFINITY;
+        if !shape.is_empty() {
+            let last = shape[shape.len() - 1];
+            if j >= last && last < total_seq {
+                return f32::NEG_INFINITY;
+            }
         }
         data[Self::offset(shape, b, h, i, j)]
     }
@@ -299,23 +324,18 @@ impl Kernel for AttentionKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         check_arity("Attention", inputs, outputs, 3, 7, 1)?;
 
-        // `nonpad_kv_seqlen` (7th input) is not implemented.
-        if inputs.len() >= 7 {
-            return Err(EpError::KernelFailed(
-                "Attention: the optional `nonpad_kv_seqlen` input (external-cache padding) is \
-                 not implemented"
-                    .into(),
-            ));
-        }
-
         let q_rank = inputs[0].shape.len();
         let q = to_bhsd(&inputs[0], "Q", self.q_num_heads)?;
         let k_cur = to_bhsd(&inputs[1], "K", self.kv_num_heads)?;
         let v_cur = to_bhsd(&inputs[2], "V", self.kv_num_heads)?;
 
         // Optional past KV cache (inputs 4 and 5). They must be used together.
-        let has_past_key = inputs.len() > 4 && !inputs[4].shape.is_empty();
-        let has_past_value = inputs.len() > 5 && !inputs[5].shape.is_empty();
+        // Presence is decided by input-slot binding (a null "absent" view for an
+        // omitted optional input), NOT by an empty shape — a genuinely present
+        // rank-0 tensor also has an empty shape but must not be treated as
+        // absent.
+        let has_past_key = inputs.len() > 4 && !inputs[4].is_absent();
+        let has_past_value = inputs.len() > 5 && !inputs[5].is_absent();
         if has_past_key != has_past_value {
             return Err(EpError::KernelFailed(
                 "Attention: past_key and past_value must be provided together".into(),
@@ -332,6 +352,39 @@ impl Kernel for AttentionKernel {
             None
         };
         let past_seq = past_key.as_ref().map(|p| p.seq).unwrap_or(0);
+
+        // `nonpad_kv_seqlen` (7th input, opset 24+): per-batch count of valid
+        // (non-padding) KV tokens, used when the KV cache lives outside the op.
+        // It shifts the causal frontier by `nonpad_kv_seqlen[b] - q_seq` and is
+        // mutually exclusive with an in-op past cache.
+        let has_nonpad = inputs.len() > 6 && !inputs[6].is_absent();
+        if has_nonpad && self.since_version < 24 {
+            return Err(EpError::KernelFailed(
+                "Attention: the optional `nonpad_kv_seqlen` input was added in opset 24 and is \
+                 not valid for opset 23"
+                    .into(),
+            ));
+        }
+        if has_nonpad && (has_past_key || has_past_value) {
+            return Err(EpError::KernelFailed(
+                "Attention: `nonpad_kv_seqlen` must not be used together with past_key/past_value \
+                 (external vs. in-op KV cache)"
+                    .into(),
+            ));
+        }
+        let nonpad_kv_seqlen: Option<Vec<i64>> = if has_nonpad {
+            let seqlen = super::to_dense_i64(&inputs[6])?;
+            if seqlen.len() != q.batch {
+                return Err(EpError::KernelFailed(format!(
+                    "Attention: nonpad_kv_seqlen length {} must equal batch_size {}",
+                    seqlen.len(),
+                    q.batch
+                )));
+            }
+            Some(seqlen)
+        } else {
+            None
+        };
 
         // present_key/value = concat(past, current) along the sequence axis.
         let key = concat_cache(past_key.as_ref(), &k_cur, "key")?;
@@ -373,9 +426,16 @@ impl Kernel for AttentionKernel {
         let scale = self
             .scale
             .unwrap_or_else(|| 1.0 / (head_size as f32).sqrt());
+        // Fold `sqrt(scale)` into each Q and K operand so the dot product is
+        // `(Q·√scale)·(K·√scale)` rather than `scale·(Q·K)`. This matches the
+        // spec's `Q*sqrt(scale)`, `K*sqrt(scale)` pattern and avoids overflowing
+        // an intermediate `Q·Kᵀ` for extreme magnitudes.
+        let sqrt_scale = scale.sqrt();
 
-        // Resolve the attention mask (input 3), if present.
-        let mask = if inputs.len() > 3 && !inputs[3].shape.is_empty() {
+        // Resolve the attention mask (input 3), if present. Presence is decided
+        // by input-slot binding, so a rank-0 (scalar) mask is honored rather
+        // than mistaken for an omitted input.
+        let mask = if inputs.len() > 3 && !inputs[3].is_absent() {
             let m = &inputs[3];
             match m.dtype {
                 DataType::Bool => Mask::Bool {
@@ -405,18 +465,37 @@ impl Kernel for AttentionKernel {
             Vec::new()
         };
 
+        // `qk_matmul_output_mode` 1 and 2 were swapped in opset 24: v24+ uses
+        // 1 = after softcap, 2 = after mask; v23 uses the reverse.
+        let (softcap_mode, mask_mode) = if self.since_version >= 24 {
+            (1, 2)
+        } else {
+            (2, 1)
+        };
+
         let mut scores = vec![0.0f32; total_seq];
         for b in 0..batch {
+            // Per-batch causal offset: query in-block index `i` attends key `j`
+            // iff `j <= i + offset`. With an external cache the offset is
+            // `nonpad_kv_seqlen[b] - q_seq`; with an in-op past cache it is
+            // `past_seq`; otherwise 0. A negative offset fully masks leading
+            // query rows (→ zero output rows).
+            let offset: i64 = match &nonpad_kv_seqlen {
+                Some(seqlen) => seqlen[b] - q_seq as i64,
+                None => past_seq as i64,
+            };
             for qh in 0..q_heads {
                 let kvh = qh / group;
                 for i in 0..q_seq {
-                    // Stage 1: scaled Q·Kᵀ scores for this query row.
+                    // Stage 1: scaled Q·Kᵀ scores for this query row, with
+                    // sqrt(scale) folded into each operand (overflow-safe).
                     for (j, sc) in scores.iter_mut().enumerate() {
                         let mut acc = 0.0f32;
                         for p in 0..head_size {
-                            acc += q.at(b, qh, i, p) * key.at(b, kvh, j, p);
+                            acc += (q.at(b, qh, i, p) * sqrt_scale)
+                                * (key.at(b, kvh, j, p) * sqrt_scale);
                         }
-                        *sc = acc * scale;
+                        *sc = acc;
                     }
                     // qk mode 0: raw (scaled) QK matmul output.
                     if want_qk && self.qk_matmul_output_mode == 0 {
@@ -424,32 +503,30 @@ impl Kernel for AttentionKernel {
                         qk_out[base..base + total_seq].copy_from_slice(&scores);
                     }
 
-                    // Stage 2: softcap (before mask), if enabled.
-                    if self.softcap > 0.0 {
+                    // Stage 2: softcap (before mask), applied when nonzero.
+                    if self.softcap != 0.0 {
                         for sc in scores.iter_mut() {
                             *sc = self.softcap * (*sc / self.softcap).tanh();
                         }
                     }
-                    // qk mode 1: after softcap, before mask addition.
-                    if want_qk && self.qk_matmul_output_mode == 1 {
+                    // qk mode after-softcap (v24: 1, v23: 2), before mask.
+                    if want_qk && self.qk_matmul_output_mode == softcap_mode {
                         let base = ((b * q_heads + qh) * q_seq + i) * total_seq;
                         qk_out[base..base + total_seq].copy_from_slice(&scores);
                     }
 
                     // Stage 3: attention mask + causal frontier (additive bias).
-                    // Causal (bottom-right): query i attends key j iff
-                    // j <= i + offset, offset = past_seq.
-                    let causal_limit = i + past_seq;
+                    let causal_limit = i as i64 + offset;
                     for (j, sc) in scores.iter_mut().enumerate() {
-                        if self.is_causal && j > causal_limit {
+                        if self.is_causal && (j as i64) > causal_limit {
                             *sc = f32::NEG_INFINITY;
                             continue;
                         }
                         let bias = mask.bias(b, qh, i, j, total_seq);
                         *sc += bias;
                     }
-                    // qk mode 2: after mask + softcap, before softmax.
-                    if want_qk && self.qk_matmul_output_mode == 2 {
+                    // qk mode after-mask (v24: 2, v23: 1), before softmax.
+                    if want_qk && self.qk_matmul_output_mode == mask_mode {
                         let base = ((b * q_heads + qh) * q_seq + i) * total_seq;
                         qk_out[base..base + total_seq].copy_from_slice(&scores);
                     }
@@ -553,7 +630,7 @@ mod tests {
         v_head_size: usize,
         scale: f32,
         is_causal: bool,
-        past_seq: usize,
+        causal_offset: i64,
         bias: impl Fn(usize, usize, usize, usize) -> f32,
     ) -> Vec<f32> {
         let group = q_heads / kv_heads;
@@ -571,7 +648,7 @@ mod tests {
                             acc += q[qi] * k[kj];
                         }
                         let mut s = acc * scale + bias(b, qh, i, j);
-                        if is_causal && j > i + past_seq {
+                        if is_causal && (j as i64) > i as i64 + causal_offset {
                             s = f32::NEG_INFINITY;
                         }
                         *sc = s;
@@ -620,6 +697,19 @@ mod tests {
         qk_mode: i64,
         softcap: f32,
     ) -> AttentionKernel {
+        kernel_v(24, scale, is_causal, q_num_heads, kv_num_heads, qk_mode, softcap)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn kernel_v(
+        since_version: u32,
+        scale: Option<f32>,
+        is_causal: bool,
+        q_num_heads: Option<usize>,
+        kv_num_heads: Option<usize>,
+        qk_mode: i64,
+        softcap: f32,
+    ) -> AttentionKernel {
         AttentionKernel {
             scale,
             is_causal,
@@ -627,7 +717,13 @@ mod tests {
             kv_num_heads,
             qk_matmul_output_mode: qk_mode,
             softcap,
+            since_version,
         }
+    }
+
+    /// An omitted optional input slot (null-backed placeholder view).
+    fn absent() -> TensorView<'static> {
+        TensorView::absent(DataType::Float32)
     }
 
     #[test]
@@ -895,7 +991,7 @@ mod tests {
         full_v.extend_from_slice(&cur_v);
 
         let want = reference(
-            &q, &full_k, &full_v, b, h, h, sq, total, d, dv, scale, false, past_seq,
+            &q, &full_k, &full_v, b, h, h, sq, total, d, dv, scale, false, past_seq as i64,
             |_, _, _, _| 0.0,
         );
 
@@ -908,7 +1004,7 @@ mod tests {
                     Owned::f32(&[b, h, sq, d], &q).view(),
                     Owned::f32(&[b, h, kv_seq, d], &cur_k).view(),
                     Owned::f32(&[b, h, kv_seq, dv], &cur_v).view(),
-                    Owned::f32(&[], &[]).view(), // empty attn_mask
+                    absent(), // omitted attn_mask
                     Owned::f32(&[b, h, past_seq, d], &past_k).view(),
                     Owned::f32(&[b, h, past_seq, dv], &past_v).view(),
                 ],
@@ -939,7 +1035,7 @@ mod tests {
         let mut full_v = past_v.clone();
         full_v.extend_from_slice(&cur_v);
         let want = reference(
-            &q, &full_k, &full_v, b, h, h, sq, total, d, dv, scale, true, past_seq,
+            &q, &full_k, &full_v, b, h, h, sq, total, d, dv, scale, true, past_seq as i64,
             |_, _, _, _| 0.0,
         );
         let mut y = Owned::zeros_f32(&[b, h, sq, dv]);
@@ -949,7 +1045,7 @@ mod tests {
                     Owned::f32(&[b, h, sq, d], &q).view(),
                     Owned::f32(&[b, h, kv_seq, d], &cur_k).view(),
                     Owned::f32(&[b, h, kv_seq, dv], &cur_v).view(),
-                    Owned::f32(&[], &[]).view(),
+                    absent(),
                     Owned::f32(&[b, h, past_seq, d], &past_k).view(),
                     Owned::f32(&[b, h, past_seq, dv], &past_v).view(),
                 ],
@@ -1115,7 +1211,7 @@ mod tests {
         let mut node = Node::new(NodeId(0), "Attention", vec![], vec![]);
         node.attributes
             .insert("qk_matmul_output_mode".to_string(), Attribute::Int(5));
-        let err = AttentionFactory.create(&node, &[]);
+        let err = AttentionFactory { since_version: 24 }.create(&node, &[]);
         assert!(err.is_err(), "qk_matmul_output_mode=5 must be rejected");
     }
 
@@ -1129,30 +1225,61 @@ mod tests {
             .insert("scale".to_string(), Attribute::Float(0.25));
         node.attributes
             .insert("qk_matmul_output_mode".to_string(), Attribute::Int(3));
-        assert!(AttentionFactory.create(&node, &[]).is_ok());
+        assert!(AttentionFactory { since_version: 24 }.create(&node, &[]).is_ok());
     }
 
     #[test]
-    fn nonpad_kv_seqlen_errors() {
+    fn nonpad_kv_seqlen_rejected_for_opset23() {
+        // The 7th input was added in opset 24; the v23 kernel must reject it.
         let (b, h, s, d, dv) = (1, 1, 2, 2, 2);
         let q = vec![0.1f32; b * h * s * d];
         let k = vec![0.1f32; b * h * s * d];
         let v = vec![0.1f32; b * h * s * dv];
         let seqlen = [2i64];
         let mut out = Owned::zeros_f32(&[b, h, s, dv]);
-        let err = kernel(Some(0.5), false, None, None, 0, 0.0).execute(
+        let err = kernel_v(23, Some(0.5), false, None, None, 0, 0.0).execute(
             &[
                 Owned::f32(&[b, h, s, d], &q).view(),
                 Owned::f32(&[b, h, s, d], &k).view(),
                 Owned::f32(&[b, h, s, dv], &v).view(),
-                Owned::f32(&[], &[]).view(),
-                Owned::f32(&[], &[]).view(),
-                Owned::f32(&[], &[]).view(),
+                absent(),
+                absent(),
+                absent(),
                 Owned::i64(&[b], &seqlen).view(),
             ],
             &mut [out.view_mut()],
         );
-        assert!(err.is_err(), "nonpad_kv_seqlen must error");
+        assert!(err.is_err(), "nonpad_kv_seqlen must error for opset 23");
+    }
+
+    #[test]
+    fn nonpad_kv_seqlen_rejected_with_past_cache() {
+        // nonpad_kv_seqlen (external cache) is mutually exclusive with an in-op
+        // past_key/past_value cache.
+        let (b, h, s, d, dv) = (1, 1, 2, 2, 2);
+        let q = vec![0.1f32; b * h * s * d];
+        let k = vec![0.1f32; b * h * s * d];
+        let v = vec![0.1f32; b * h * s * dv];
+        let past_k = vec![0.1f32; b * h * s * d];
+        let past_v = vec![0.1f32; b * h * s * dv];
+        let seqlen = [2i64];
+        let mut out = Owned::zeros_f32(&[b, h, s, dv]);
+        let err = kernel_v(24, Some(0.5), false, None, None, 0, 0.0).execute(
+            &[
+                Owned::f32(&[b, h, s, d], &q).view(),
+                Owned::f32(&[b, h, s, d], &k).view(),
+                Owned::f32(&[b, h, s, dv], &v).view(),
+                absent(),
+                Owned::f32(&[b, h, s, d], &past_k).view(),
+                Owned::f32(&[b, h, s, dv], &past_v).view(),
+                Owned::i64(&[b], &seqlen).view(),
+            ],
+            &mut [out.view_mut()],
+        );
+        assert!(
+            err.is_err(),
+            "nonpad_kv_seqlen with past_key/past_value must error"
+        );
     }
 
     #[test]
@@ -1172,5 +1299,350 @@ mod tests {
             &mut [out.view_mut()],
         );
         assert!(err.is_err(), "non-divisible GQA must error");
+    }
+
+    // ---- Job A: rejection-fix regression tests ----
+
+    #[test]
+    fn sqrt_scale_avoids_overflow() {
+        // Bug 1: Q=K=1e30, scale=1e-30. The naive `Q·Kᵀ` = 1e60 overflows f32
+        // *before* scaling; folding sqrt(scale) into each operand keeps the
+        // score finite (~1e30).
+        let (b, h, sq, sk, d, dv) = (1, 1, 1, 1, 1, 1);
+        let q = [1e30f32];
+        let k = [1e30f32];
+        let v = [7.0f32];
+        let scale = 1e-30f32;
+        let mut y = Owned::zeros_f32(&[b, h, sq, dv]);
+        let mut pk = Owned::zeros_f32(&[b, h, sk, d]);
+        let mut pv = Owned::zeros_f32(&[b, h, sk, dv]);
+        let mut qk = Owned::zeros_f32(&[b, h, sq, sk]);
+        kernel(Some(scale), false, None, None, 0, 0.0)
+            .execute(
+                &[
+                    Owned::f32(&[b, h, sq, d], &q).view(),
+                    Owned::f32(&[b, h, sk, d], &k).view(),
+                    Owned::f32(&[b, h, sk, dv], &v).view(),
+                ],
+                &mut [y.view_mut(), pk.view_mut(), pv.view_mut(), qk.view_mut()],
+            )
+            .unwrap();
+        // The naive unscaled product overflows; the folded score does not.
+        assert!(!(1e30f32 * 1e30f32).is_finite());
+        let score = qk.to_f32()[0];
+        assert!(score.is_finite(), "score must be finite, got {score}");
+        assert!((score - 1e30).abs() < 1e26, "score ~1e30, got {score}");
+        approx(&y.to_f32(), &v, 1e-3);
+    }
+
+    #[test]
+    fn scalar_bool_false_mask_zeros_all_rows() {
+        // Bug 2: a rank-0 boolean `false` masks every score → all-zero output.
+        let (b, h, sq, sk, d, dv) = (1, 1, 2, 2, 2, 2);
+        let q = [1.0f32, 2.0, 3.0, 4.0];
+        let k = [1.0f32, 0.0, 0.0, 1.0];
+        let v = [5.0f32, 6.0, 7.0, 8.0];
+        let mask = [false];
+        let mut out = Owned::zeros_f32(&[b, h, sq, dv]);
+        kernel(Some(0.5), false, None, None, 0, 0.0)
+            .execute(
+                &[
+                    Owned::f32(&[b, h, sq, d], &q).view(),
+                    Owned::f32(&[b, h, sk, d], &k).view(),
+                    Owned::f32(&[b, h, sk, dv], &v).view(),
+                    Owned::bool_(&[], &mask).view(),
+                ],
+                &mut [out.view_mut()],
+            )
+            .unwrap();
+        let got = out.to_f32();
+        assert!(got.iter().all(|x| *x == 0.0), "scalar false → zero: {got:?}");
+    }
+
+    #[test]
+    fn scalar_bool_true_mask_is_noop() {
+        // Bug 2: a rank-0 boolean `true` keeps every score (equivalent to no
+        // mask), and is *not* mistaken for an omitted input.
+        let (b, h, sq, sk, d, dv) = (1, 1, 2, 3, 2, 2);
+        let scale = 0.5f32;
+        let q: Vec<f32> = (0..b * h * sq * d).map(|i| (i as f32 * 0.2).sin()).collect();
+        let k: Vec<f32> = (0..b * h * sk * d).map(|i| (i as f32 * 0.1).cos()).collect();
+        let v: Vec<f32> = (0..b * h * sk * dv).map(|i| i as f32 * 0.3).collect();
+        let want = reference(
+            &q, &k, &v, b, h, h, sq, sk, d, dv, scale, false, 0, |_, _, _, _| 0.0,
+        );
+        let mask = [true];
+        let mut out = Owned::zeros_f32(&[b, h, sq, dv]);
+        kernel(Some(scale), false, None, None, 0, 0.0)
+            .execute(
+                &[
+                    Owned::f32(&[b, h, sq, d], &q).view(),
+                    Owned::f32(&[b, h, sk, d], &k).view(),
+                    Owned::f32(&[b, h, sk, dv], &v).view(),
+                    Owned::bool_(&[], &mask).view(),
+                ],
+                &mut [out.view_mut()],
+            )
+            .unwrap();
+        approx(&out.to_f32(), &want, 1e-5);
+    }
+
+    #[test]
+    fn scalar_float_mask_adds_bias() {
+        // Bug 2: a rank-0 float mask is added to every score.
+        let (b, h, sq, sk, d, dv) = (1, 1, 1, 2, 2, 2);
+        let scale = 0.5f32;
+        let q = [1.0f32, 2.0];
+        let k = [1.0f32, 0.0, 0.0, 1.0];
+        let v = [1.0f32, 0.0, 0.0, 1.0];
+        let bias = [3.0f32];
+        let mut y = Owned::zeros_f32(&[b, h, sq, dv]);
+        let mut pk = Owned::zeros_f32(&[b, h, sk, d]);
+        let mut pv = Owned::zeros_f32(&[b, h, sk, dv]);
+        let mut qk = Owned::zeros_f32(&[b, h, sq, sk]);
+        // qk mode 2 (v24) = scores after mask addition.
+        kernel(Some(scale), false, None, None, 2, 0.0)
+            .execute(
+                &[
+                    Owned::f32(&[b, h, sq, d], &q).view(),
+                    Owned::f32(&[b, h, sk, d], &k).view(),
+                    Owned::f32(&[b, h, sk, dv], &v).view(),
+                    Owned::f32(&[], &bias).view(),
+                ],
+                &mut [y.view_mut(), pk.view_mut(), pv.view_mut(), qk.view_mut()],
+            )
+            .unwrap();
+        let mut expected = [0.0f32; 2];
+        for (j, e) in expected.iter_mut().enumerate() {
+            let mut acc = 0.0f32;
+            for p in 0..d {
+                acc += q[p] * k[j * d + p];
+            }
+            *e = acc * scale + 3.0;
+        }
+        approx(&qk.to_f32(), &expected, 1e-4);
+    }
+
+    #[test]
+    fn negative_softcap_is_applied() {
+        // Bug 3: softcap applies when nonzero (not only when > 0). A negative
+        // softcap yields the same odd-function transform as its positive twin.
+        let (b, h, sq, sk, d, dv) = (1, 1, 2, 2, 2, 2);
+        let scale = 1.0f32;
+        let q = [3.0f32, 4.0, -2.0, 1.0];
+        let k = [2.0f32, 1.0, -1.0, 3.0];
+        let v = [1.0f32, 0.0, 0.0, 1.0];
+        let softcap = -2.0f32;
+        let want = {
+            let mut out = vec![0.0f32; sq * dv];
+            for i in 0..sq {
+                let mut scores = [0.0f32; 2];
+                for (j, sc) in scores.iter_mut().enumerate() {
+                    let mut acc = 0.0f32;
+                    for p in 0..d {
+                        acc += q[i * d + p] * k[j * d + p];
+                    }
+                    let s = acc * scale;
+                    *sc = softcap * (s / softcap).tanh();
+                }
+                let max = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let mut sum = 0.0;
+                for sc in scores.iter_mut() {
+                    *sc = (*sc - max).exp();
+                    sum += *sc;
+                }
+                for sc in scores.iter_mut() {
+                    *sc /= sum;
+                }
+                for c in 0..dv {
+                    let mut acc = 0.0f32;
+                    for (j, &p) in scores.iter().enumerate() {
+                        acc += p * v[j * dv + c];
+                    }
+                    out[i * dv + c] = acc;
+                }
+            }
+            out
+        };
+        let want_nocap = reference(
+            &q, &k, &v, b, h, h, sq, sk, d, dv, scale, false, 0, |_, _, _, _| 0.0,
+        );
+        let mut out = Owned::zeros_f32(&[b, h, sq, dv]);
+        kernel(Some(scale), false, None, None, 0, softcap)
+            .execute(
+                &[
+                    Owned::f32(&[b, h, sq, d], &q).view(),
+                    Owned::f32(&[b, h, sk, d], &k).view(),
+                    Owned::f32(&[b, h, sk, dv], &v).view(),
+                ],
+                &mut [out.view_mut()],
+            )
+            .unwrap();
+        approx(&out.to_f32(), &want, 1e-5);
+        assert!(
+            out.to_f32()
+                .iter()
+                .zip(&want_nocap)
+                .any(|(a, b)| (a - b).abs() > 1e-3),
+            "negative softcap must change the output"
+        );
+    }
+
+    // ---- Job B: opset-24 semantic deltas ----
+
+    #[test]
+    fn qk_modes_per_version_swap() {
+        // Modes 0 and 3 are version-independent; modes 1 and 2 are swapped
+        // between opset 23 and 24.
+        let (b, h, sq, sk, d, dv) = (1, 1, 1, 2, 2, 2);
+        let scale = 0.5f32;
+        let softcap = 3.0f32;
+        let q = [1.0f32, 2.0];
+        let k = [1.0f32, 1.0, 2.0, 0.0];
+        let v = [1.0f32, 0.0, 0.0, 1.0];
+        let maskv = [0.5f32, -1.0];
+        let scaled: Vec<f32> = (0..sk)
+            .map(|j| {
+                let mut acc = 0.0f32;
+                for p in 0..d {
+                    acc += q[p] * k[j * d + p];
+                }
+                acc * scale
+            })
+            .collect();
+        let capped: Vec<f32> = scaled.iter().map(|s| softcap * (s / softcap).tanh()).collect();
+        let masked: Vec<f32> = capped.iter().zip(&maskv).map(|(s, m)| s + m).collect();
+        let softmaxed = {
+            let max = masked.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let mut e: Vec<f32> = masked.iter().map(|s| (s - max).exp()).collect();
+            let sum: f32 = e.iter().sum();
+            for x in e.iter_mut() {
+                *x /= sum;
+            }
+            e
+        };
+        let run = |ver: u32, mode: i64| {
+            let mut y = Owned::zeros_f32(&[b, h, sq, dv]);
+            let mut pk = Owned::zeros_f32(&[b, h, sk, d]);
+            let mut pv = Owned::zeros_f32(&[b, h, sk, dv]);
+            let mut qk = Owned::zeros_f32(&[b, h, sq, sk]);
+            kernel_v(ver, Some(scale), false, None, None, mode, softcap)
+                .execute(
+                    &[
+                        Owned::f32(&[b, h, sq, d], &q).view(),
+                        Owned::f32(&[b, h, sk, d], &k).view(),
+                        Owned::f32(&[b, h, sk, dv], &v).view(),
+                        Owned::f32(&[sq, sk], &maskv).view(),
+                    ],
+                    &mut [y.view_mut(), pk.view_mut(), pv.view_mut(), qk.view_mut()],
+                )
+                .unwrap();
+            qk.to_f32()
+        };
+        approx(&run(24, 0), &scaled, 1e-5);
+        approx(&run(23, 0), &scaled, 1e-5);
+        approx(&run(24, 3), &softmaxed, 1e-5);
+        approx(&run(23, 3), &softmaxed, 1e-5);
+        // v24: 1 = after softcap, 2 = after mask.
+        approx(&run(24, 1), &capped, 1e-5);
+        approx(&run(24, 2), &masked, 1e-5);
+        // v23: swapped — 1 = after mask, 2 = after softcap.
+        approx(&run(23, 1), &masked, 1e-5);
+        approx(&run(23, 2), &capped, 1e-5);
+    }
+
+    #[test]
+    fn nonpad_kv_seqlen_offset_positive() {
+        // offset = nonpad - q_seq > 0 shifts the causal diagonal to the right.
+        let (b, h, sq, sk, d, dv) = (1, 1, 2, 4, 2, 2);
+        let scale = 0.5f32;
+        let q: Vec<f32> = (0..b * h * sq * d).map(|i| (i as f32 * 0.3).sin()).collect();
+        let k: Vec<f32> = (0..b * h * sk * d).map(|i| (i as f32 * 0.2).cos()).collect();
+        let v: Vec<f32> = (0..b * h * sk * dv).map(|i| i as f32 * 0.1).collect();
+        let nonpad = [4i64];
+        let offset = nonpad[0] - sq as i64; // 2
+        let want = reference(
+            &q, &k, &v, b, h, h, sq, sk, d, dv, scale, true, offset, |_, _, _, _| 0.0,
+        );
+        let mut out = Owned::zeros_f32(&[b, h, sq, dv]);
+        kernel_v(24, Some(scale), true, None, None, 0, 0.0)
+            .execute(
+                &[
+                    Owned::f32(&[b, h, sq, d], &q).view(),
+                    Owned::f32(&[b, h, sk, d], &k).view(),
+                    Owned::f32(&[b, h, sk, dv], &v).view(),
+                    absent(),
+                    absent(),
+                    absent(),
+                    Owned::i64(&[b], &nonpad).view(),
+                ],
+                &mut [out.view_mut()],
+            )
+            .unwrap();
+        approx(&out.to_f32(), &want, 1e-5);
+    }
+
+    #[test]
+    fn nonpad_kv_seqlen_offset_zero_is_lower_triangular() {
+        // offset = 0 recovers standard lower-triangular causal masking.
+        let (b, h, sq, sk, d, dv) = (1, 1, 2, 2, 2, 2);
+        let scale = 0.5f32;
+        let q: Vec<f32> = (0..b * h * sq * d).map(|i| (i as f32 * 0.3).sin()).collect();
+        let k: Vec<f32> = (0..b * h * sk * d).map(|i| (i as f32 * 0.2).cos()).collect();
+        let v: Vec<f32> = (0..b * h * sk * dv).map(|i| i as f32 * 0.1).collect();
+        let nonpad = [2i64];
+        let want = reference(
+            &q, &k, &v, b, h, h, sq, sk, d, dv, scale, true, 0, |_, _, _, _| 0.0,
+        );
+        let mut out = Owned::zeros_f32(&[b, h, sq, dv]);
+        kernel_v(24, Some(scale), true, None, None, 0, 0.0)
+            .execute(
+                &[
+                    Owned::f32(&[b, h, sq, d], &q).view(),
+                    Owned::f32(&[b, h, sk, d], &k).view(),
+                    Owned::f32(&[b, h, sk, dv], &v).view(),
+                    absent(),
+                    absent(),
+                    absent(),
+                    Owned::i64(&[b], &nonpad).view(),
+                ],
+                &mut [out.view_mut()],
+            )
+            .unwrap();
+        approx(&out.to_f32(), &want, 1e-5);
+    }
+
+    #[test]
+    fn nonpad_kv_seqlen_offset_negative_zeros_leading_rows() {
+        // offset < 0 fully masks leading query rows → zero output rows (no NaN).
+        let (b, h, sq, sk, d, dv) = (1, 1, 2, 2, 2, 2);
+        let scale = 0.5f32;
+        let q: Vec<f32> = (0..b * h * sq * d).map(|i| (i as f32 * 0.3 + 0.1).sin()).collect();
+        let k: Vec<f32> = (0..b * h * sk * d).map(|i| (i as f32 * 0.2).cos()).collect();
+        let v: Vec<f32> = (0..b * h * sk * dv).map(|i| i as f32 * 0.1 + 0.2).collect();
+        let nonpad = [1i64];
+        let offset = nonpad[0] - sq as i64; // -1
+        let want = reference(
+            &q, &k, &v, b, h, h, sq, sk, d, dv, scale, true, offset, |_, _, _, _| 0.0,
+        );
+        let mut out = Owned::zeros_f32(&[b, h, sq, dv]);
+        kernel_v(24, Some(scale), true, None, None, 0, 0.0)
+            .execute(
+                &[
+                    Owned::f32(&[b, h, sq, d], &q).view(),
+                    Owned::f32(&[b, h, sk, d], &k).view(),
+                    Owned::f32(&[b, h, sk, dv], &v).view(),
+                    absent(),
+                    absent(),
+                    absent(),
+                    Owned::i64(&[b], &nonpad).view(),
+                ],
+                &mut [out.view_mut()],
+            )
+            .unwrap();
+        let got = out.to_f32();
+        assert!(got.iter().all(|x| x.is_finite()), "no NaN/inf: {got:?}");
+        approx(&got[0..dv], &[0.0, 0.0], 1e-6);
+        approx(&got, &want, 1e-5);
     }
 }
