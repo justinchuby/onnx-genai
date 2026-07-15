@@ -36,6 +36,10 @@ enum BinOp {
     Min,
     /// Variadic maximum (ONNX `Max` accepts 1..N inputs).
     Max,
+    /// Variadic sum (ONNX `Sum` accepts 1..N inputs).
+    Sum,
+    /// Variadic arithmetic mean (ONNX `Mean` accepts 1..N inputs).
+    Mean,
 }
 
 impl BinOp {
@@ -47,6 +51,8 @@ impl BinOp {
             BinOp::Pow => "Pow",
             BinOp::Min => "Min",
             BinOp::Max => "Max",
+            BinOp::Sum => "Sum",
+            BinOp::Mean => "Mean",
         }
     }
 
@@ -62,6 +68,7 @@ impl BinOp {
             BinOp::Pow => acc.c_pow(v),
             BinOp::Min => acc.c_min(v),
             BinOp::Max => acc.c_max(v),
+            BinOp::Sum | BinOp::Mean => acc.c_add(v),
         }
     }
 }
@@ -89,12 +96,14 @@ binary_factory!(DivFactory, BinOp::Div);
 binary_factory!(PowFactory, BinOp::Pow);
 binary_factory!(MinFactory, BinOp::Min);
 binary_factory!(MaxFactory, BinOp::Max);
+binary_factory!(SumFactory, BinOp::Sum);
+binary_factory!(MeanFactory, BinOp::Mean);
 
 impl Kernel for BinaryKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
-        // Min/Max are variadic (1..N); the rest are strictly binary.
+        // Min/Max/Sum/Mean are variadic (1..N); the rest are strictly binary.
         let (min_in, max_in) = match self.op {
-            BinOp::Min | BinOp::Max => (1, usize::MAX),
+            BinOp::Min | BinOp::Max | BinOp::Sum | BinOp::Mean => (1, usize::MAX),
             _ => (2, 2),
         };
         check_arity(self.op.name(), inputs, outputs, min_in, max_in, 1)?;
@@ -133,7 +142,16 @@ fn binary_typed<T: NumericElem>(
         })?;
     }
 
-    let out: Vec<T> = acc.into_iter().map(T::from_acc).collect();
+    let out: Vec<T> = acc
+        .into_iter()
+        .map(|v| {
+            T::from_acc(if matches!(op, BinOp::Mean) {
+                v.c_div_usize(inputs.len())
+            } else {
+                v
+            })
+        })
+        .collect();
     write_dense::<T>(&mut outputs[0], &out)
 }
 
@@ -344,6 +362,39 @@ mod tests {
             .unwrap();
         // max(a,3,4): max(5,3,4)=5, max(1,3,4)=4, max(8,3,4)=8, max(2,3,4)=4
         assert_eq!(out.to_f32(), vec![5., 4., 8., 4.]);
+    }
+
+    #[test]
+    fn sum_variadic_broadcasts_matrix_vector_and_scalar() {
+        let matrix = Owned::f32(&[2, 3], &[1., 2., 3., 4., 5., 6.]);
+        let vector = Owned::f32(&[3], &[10., 20., 30.]);
+        let scalar = Owned::f32(&[], &[100.]);
+        let mut out = Owned::zeros_f32(&[2, 3]);
+        BinaryKernel { op: BinOp::Sum }
+            .execute(
+                &[matrix.view(), vector.view(), scalar.view()],
+                &mut [out.view_mut()],
+            )
+            .unwrap();
+        assert_eq!(out.to_f32(), vec![111., 122., 133., 114., 125., 136.]);
+    }
+
+    #[test]
+    fn mean_variadic_broadcasts_matrix_vector_and_scalar() {
+        let matrix = Owned::f32(&[2, 3], &[1., 2., 3., 4., 5., 6.]);
+        let vector = Owned::f32(&[3], &[10., 20., 30.]);
+        let scalar = Owned::f32(&[], &[100.]);
+        let mut out = Owned::zeros_f32(&[2, 3]);
+        BinaryKernel { op: BinOp::Mean }
+            .execute(
+                &[matrix.view(), vector.view(), scalar.view()],
+                &mut [out.view_mut()],
+            )
+            .unwrap();
+        assert_eq!(
+            out.to_f32(),
+            vec![37., 40.666_668, 44.333_332, 38., 41.666_668, 45.333_332]
+        );
     }
 
     #[test]

@@ -49,6 +49,7 @@ pub trait ComputeDomain: Copy + Default {
     fn c_mul(self, o: Self) -> Self;
     fn c_div(self, o: Self) -> Self;
     fn c_pow(self, o: Self) -> Self;
+    fn c_div_usize(self, divisor: usize) -> Self;
     /// ONNX/numpy `Min`: NaN-propagating for floats, `Ord::min` for integers.
     fn c_min(self, o: Self) -> Self;
     /// ONNX/numpy `Max`: NaN-propagating for floats, `Ord::max` for integers.
@@ -63,6 +64,7 @@ macro_rules! impl_float_compute {
             #[inline] fn c_mul(self, o: Self) -> Self { self * o }
             #[inline] fn c_div(self, o: Self) -> Self { self / o }
             #[inline] fn c_pow(self, o: Self) -> Self { self.powf(o) }
+            #[inline] fn c_div_usize(self, divisor: usize) -> Self { self / divisor as $t }
             // Rust's `min`/`max` SUPPRESS NaN (return the non-NaN operand); ONNX
             // `Min`/`Max` PROPAGATE it (numpy semantics), so guard explicitly.
             #[inline] fn c_min(self, o: Self) -> Self {
@@ -91,6 +93,9 @@ macro_rules! impl_int_compute {
             // Integer Pow via f64 (exact for the magnitudes ONNX exercises);
             // negative exponents (fractional result) truncate toward zero.
             #[inline] fn c_pow(self, o: Self) -> Self { (self as f64).powf(o as f64) as $t }
+            #[inline] fn c_div_usize(self, divisor: usize) -> Self {
+                ((self as i128) / divisor as i128) as $t
+            }
             #[inline] fn c_min(self, o: Self) -> Self { core::cmp::min(self, o) }
             #[inline] fn c_max(self, o: Self) -> Self { core::cmp::max(self, o) }
         }

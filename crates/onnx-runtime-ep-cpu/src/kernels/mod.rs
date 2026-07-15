@@ -44,6 +44,7 @@ pub mod gemm;
 pub mod identity;
 pub mod indexing;
 pub mod layernorm;
+pub mod log_softmax;
 pub mod logical;
 pub mod matmul;
 pub mod movement_ops;
@@ -81,11 +82,14 @@ pub const PHASE1_OPS: &[&str] = &[
     "Pow",
     "Min",
     "Max",
+    "Sum",
+    "Mean",
     // Elementwise unary.
     "Sqrt",
     "Erf",
     "Tanh",
     "Cast",
+    "CastLike",
     // Additional elementwise unary math (unary_math.rs).
     "Abs",
     "Neg",
@@ -124,6 +128,7 @@ pub const PHASE1_OPS: &[&str] = &[
     "ReduceSumSquare",
     "ReduceL2",
     "Softmax",
+    "LogSoftmax",
     // Shape / data movement.
     "Shape",
     "Unsqueeze",
@@ -242,10 +247,7 @@ pub fn build_cpu_registry() -> OpRegistry {
     // `ai.onnx::Gelu` was added at opset 20 with the `approximate` attribute
     // ("none" = exact erf, "tanh" = tanh approximation). Distinct from the
     // com.microsoft::Gelu contrib op above.
-    reg.register(
-        OpKey::new("Gelu", "", 20),
-        Box::new(gelu::StdGeluFactory),
-    );
+    reg.register(OpKey::new("Gelu", "", 20), Box::new(gelu::StdGeluFactory));
     // `ai.onnx::RMSNormalization` added at opset 23.
     reg.register(
         OpKey::new("RMSNormalization", "", 23),
@@ -268,6 +270,11 @@ pub fn build_cpu_registry() -> OpRegistry {
     reg.register(OpKey::new("Pow", "", 1), Box::new(elementwise::PowFactory));
     reg.register(OpKey::new("Min", "", 1), Box::new(elementwise::MinFactory));
     reg.register(OpKey::new("Max", "", 1), Box::new(elementwise::MaxFactory));
+    reg.register(OpKey::new("Sum", "", 1), Box::new(elementwise::SumFactory));
+    reg.register(
+        OpKey::new("Mean", "", 1),
+        Box::new(elementwise::MeanFactory),
+    );
     // Elementwise unary ops.
     reg.register(
         OpKey::new("Sqrt", "", 1),
@@ -279,6 +286,10 @@ pub fn build_cpu_registry() -> OpRegistry {
         Box::new(elementwise::TanhFactory),
     );
     reg.register(OpKey::new("Cast", "", 1), Box::new(cast::CastFactory));
+    reg.register(
+        OpKey::new("CastLike", "", 15),
+        Box::new(cast::CastLikeFactory),
+    );
     // Identity: dtype-agnostic passthrough (raw byte copy).
     reg.register(
         OpKey::new("Identity", "", 1),
@@ -297,6 +308,16 @@ pub fn build_cpu_registry() -> OpRegistry {
     reg.register(
         OpKey::new("Softmax", "", 13),
         Box::new(softmax::SoftmaxFactory),
+    );
+    // LogSoftmax shares Softmax's opset split: legacy flattened trailing axes
+    // through opset 12, then one-axis normalization from opset 13.
+    reg.register(
+        OpKey::new("LogSoftmax", "", 1),
+        Box::new(log_softmax::LogSoftmaxLegacyFactory),
+    );
+    reg.register(
+        OpKey::new("LogSoftmax", "", 13),
+        Box::new(log_softmax::LogSoftmaxFactory),
     );
     // Shape / data movement.
     reg.register(OpKey::new("Shape", "", 1), Box::new(shape::ShapeFactory));
@@ -962,15 +983,18 @@ mod tests {
         // at both opset 23 and 24 (two default-domain entries not in
         // `PHASE1_OPS`). The standard LLM primitives `Gelu` (opset 20),
         // `RMSNormalization` (23), `RotaryEmbedding` (23) and `Swish` (24) add
-        // four more default-domain entries not in `PHASE1_OPS`, so the entry
-        // count is twelve more than the op-name count.
-        assert_eq!(reg.len(), PHASE1_OPS.len() + 12);
+        // four more default-domain entries not in `PHASE1_OPS`; `Softmax` and
+        // `LogSoftmax` each have a legacy and an opset-13 entry, so the entry
+        // count is thirteen more than the op-name count.
+        assert_eq!(reg.len(), PHASE1_OPS.len() + 13);
         for op in PHASE1_OPS {
             assert!(reg.lookup(op, "", 21).is_some(), "missing factory for {op}");
         }
         // Softmax selects legacy at opset ≤ 12 and per-axis at opset ≥ 13.
         assert!(reg.lookup("Softmax", "", 12).is_some());
         assert!(reg.lookup("Softmax", "", 13).is_some());
+        assert!(reg.lookup("LogSoftmax", "", 12).is_some());
+        assert!(reg.lookup("LogSoftmax", "", 13).is_some());
         assert!(reg.lookup("Conv", "", 21).is_none());
         // The fused contrib-domain LayerNormalization resolves to the same
         // kernel as the standard default-domain op.

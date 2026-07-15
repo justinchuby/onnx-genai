@@ -100,46 +100,75 @@ impl KernelFactory for CastFactory {
     }
 }
 
+/// `CastLike` kernel. Its target dtype is supplied by input 1 rather than an
+/// attribute, but conversion itself is exactly the `Cast` conversion table.
+pub struct CastLikeKernel;
+
+/// Factory for `CastLike`.
+pub struct CastLikeFactory;
+
+impl KernelFactory for CastLikeFactory {
+    fn create(&self, _node: &Node, _shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
+        Ok(Box::new(CastLikeKernel))
+    }
+}
+
 impl Kernel for CastKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         check_arity("Cast", inputs, outputs, 1, 1, 1)?;
         let to = self.to.ok_or_else(|| {
             EpError::KernelFailed("Cast: missing or unsupported `to` attribute".into())
         })?;
-        // Cast to/from STRING is a real ONNX feature, but the ep-cpu stores
-        // string tensors out-of-band (String has no fixed-width raw byte
-        // layout), so the byte-oriented conversion table below cannot produce or
-        // consume them. Reject explicitly (RULE #1) instead of emitting garbage.
-        if to == DataType::String || inputs[0].dtype == DataType::String {
-            return Err(EpError::KernelFailed(format!(
-                "Cast: string conversion (from {:?} to {to:?}) is unsupported on the CPU \
-                 execution provider. WHY: ep-cpu stores string tensors out-of-band and Cast \
-                 here operates on fixed-width numeric bytes, so a string source or target has \
-                 no raw layout to read or write. HOW: keep Cast between numeric/bool dtypes on \
-                 ep-cpu, or perform string (de)serialization outside the graph before running \
-                 it on this provider.",
-                inputs[0].dtype
-            )));
-        }
-        if outputs[0].dtype != to {
-            return Err(EpError::KernelFailed(format!(
-                "Cast: output dtype {:?} does not match `to` {to:?}",
-                outputs[0].dtype
-            )));
-        }
-
-        let src = read_src(&inputs[0])?;
-        let out_esize = elem_size(to)?;
-        let mut bytes = Vec::with_capacity(src.len() * out_esize);
-        for &n in &src {
-            write_num(&mut bytes, n, to)?;
-        }
-        super::write_dense_bytes(&mut outputs[0], &bytes)
+        cast_to("Cast", &inputs[0], &mut outputs[0], to)
     }
 
     fn supports_strided_input(&self, _input_idx: usize) -> bool {
         true
     }
+}
+
+impl Kernel for CastLikeKernel {
+    fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+        check_arity("CastLike", inputs, outputs, 2, 2, 1)?;
+        inputs[1].validate()?;
+        cast_to("CastLike", &inputs[0], &mut outputs[0], inputs[1].dtype)
+    }
+
+    fn supports_strided_input(&self, _input_idx: usize) -> bool {
+        true
+    }
+}
+
+fn cast_to(op: &str, input: &TensorView, output: &mut TensorMut, to: DataType) -> Result<()> {
+    // Cast to/from STRING is a real ONNX feature, but the ep-cpu stores
+    // string tensors out-of-band (String has no fixed-width raw byte
+    // layout), so the byte-oriented conversion table below cannot produce or
+    // consume them. Reject explicitly (RULE #1) instead of emitting garbage.
+    if to == DataType::String || input.dtype == DataType::String {
+        return Err(EpError::KernelFailed(format!(
+            "{op}: string conversion (from {:?} to {to:?}) is unsupported on the CPU \
+                 execution provider. WHY: ep-cpu stores string tensors out-of-band and Cast \
+                 here operates on fixed-width numeric bytes, so a string source or target has \
+                 no raw layout to read or write. HOW: keep Cast between numeric/bool dtypes on \
+                 ep-cpu, or perform string (de)serialization outside the graph before running \
+                 it on this provider.",
+            input.dtype
+        )));
+    }
+    if output.dtype != to {
+        return Err(EpError::KernelFailed(format!(
+            "{op}: output dtype {:?} does not match target dtype {to:?}",
+            output.dtype
+        )));
+    }
+
+    let src = read_src(input)?;
+    let out_esize = elem_size(to)?;
+    let mut bytes = Vec::with_capacity(src.len() * out_esize);
+    for &n in &src {
+        write_num(&mut bytes, n, to)?;
+    }
+    super::write_dense_bytes(output, &bytes)
 }
 
 /// Read a (possibly strided) view into a dense row-major `Vec<Num>`.
@@ -176,6 +205,8 @@ fn decode(dtype: DataType, buf: &[u8; 8]) -> Result<Num> {
     Ok(match dtype {
         DataType::Float32 => Num::F(f32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as f64),
         DataType::Float64 => Num::F(f64::from_le_bytes(*buf)),
+        DataType::Float16 => Num::F(half::f16::from_le_bytes([buf[0], buf[1]]).to_f64()),
+        DataType::BFloat16 => Num::F(half::bf16::from_le_bytes([buf[0], buf[1]]).to_f64()),
         DataType::Int64 => Num::I(i64::from_le_bytes(*buf)),
         DataType::Int32 => Num::I(i32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as i64),
         DataType::Int16 => Num::I(i16::from_le_bytes([buf[0], buf[1]]) as i64),
@@ -197,6 +228,12 @@ fn write_num(out: &mut Vec<u8>, n: Num, dtype: DataType) -> Result<()> {
     match dtype {
         DataType::Float32 => out.extend_from_slice(&(n.to_f64() as f32).to_le_bytes()),
         DataType::Float64 => out.extend_from_slice(&n.to_f64().to_le_bytes()),
+        DataType::Float16 => {
+            out.extend_from_slice(&half::f16::from_f32(n.to_f64() as f32).to_le_bytes())
+        }
+        DataType::BFloat16 => {
+            out.extend_from_slice(&half::bf16::from_f32(n.to_f64() as f32).to_le_bytes())
+        }
         DataType::Int64 => out.extend_from_slice(&n.to_i64().to_le_bytes()),
         DataType::Int32 => out.extend_from_slice(&n.to_i32().to_le_bytes()),
         DataType::Int16 => out.extend_from_slice(&n.to_i16().to_le_bytes()),
@@ -282,6 +319,26 @@ mod tests {
         let mut out = Owned::zeros(DataType::Float32, &[3]);
         cast(DataType::Float32, &a, &mut out);
         assert_eq!(out.to_f32(), vec![-4.0, 0.0, 11.0]);
+    }
+
+    #[test]
+    fn cast_like_uses_target_dtype_for_i32_and_f16() {
+        let input = Owned::f32(&[2], &[1.9, -2.5]);
+        let target_i32 = Owned::i32(&[], &[0]);
+        let mut i32out = Owned::zeros(DataType::Int32, &[2]);
+        CastLikeKernel
+            .execute(&[input.view(), target_i32.view()], &mut [i32out.view_mut()])
+            .unwrap();
+        assert_eq!(i32out.to_i32(), vec![1, -2]);
+
+        let target_f16 = Owned::f16(&[], &[0.]);
+        let mut f16out = Owned::zeros(DataType::Float16, &[2]);
+        CastLikeKernel
+            .execute(&[input.view(), target_f16.view()], &mut [f16out.view_mut()])
+            .unwrap();
+        assert_eq!(f16out.dtype, DataType::Float16);
+        assert!((f16out.to_f16_as_f32()[0] - 1.9).abs() < 1e-3);
+        assert_eq!(f16out.to_f16_as_f32()[1], -2.5);
     }
 
     #[test]
