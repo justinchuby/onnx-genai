@@ -51,3 +51,5 @@ Recurring audit convention is canonical: `.github/workflows/audit.yml` runs week
 
 ## 2026-07-14T20:05:00Z — Loader validation review
 Reviewed Batty's unified load-time `validate_model()` checks for unsupported control flow and dangling tensor references 🟢. Both disk/bytes and session load paths are covered; merged as `2a99eec`.
+
+- 2026-07-15 — Reviewed the complete cross-platform oneDNN wheel branch; approved `ef89a95`.

@@ -4,3 +4,5 @@
 Hired as a Metal/MPS kernel engineer for the new Apple Metal EP for ONNX Runtime (`../onnxruntime-mps`). Owns the heavy compute kernels: MatMulNBits (int4, the decode hot path — target llama.cpp Metal parity), GroupQueryAttention, softmax, RoPE, RMSNorm. Reference ExecuTorch (`backends/apple/mps`) + PyTorch (`aten/src/ATen/native/mps`). Correctness vs CPU reference first, then optimize with simdgroup matrix ops / threadgroup tiling. Tested via onnx-genai. Key prior context: onnx-genai's CPU recipe (accuracy_level=4 + quantized head) already beats LM Studio short-context; the Metal EP aims to beat everyone on Apple Silicon.
 
 - 2026-07-14T19:05:00Z — Offline per-EP ONNX conformance harness and `docs/EP_CONFORMANCE.md` merged to origin/main in `1dfab0d`; process-bridge design recorded in decisions.
+
+- 2026-07-15 — Vendored cpuinfo beneath its crate so cargo publish succeeds (merged `65cc851`).

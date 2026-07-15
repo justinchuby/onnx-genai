@@ -56,3 +56,5 @@ Advanced fixture work is canonical: builders use onnxscript/onnx-ir, `tiny-mtp-f
 - Verified fp16↔f32 conversion exactness and paged-path round-trip is a true inverse for fp16 KV.
 
 - 2026-07-14T19:05:00Z — Reviewed Ana's `nxrt` PyO3 FFI/abi3 binding; verdict GREEN. Binding merged in `878559f`.
+
+- 2026-07-15 — Performed third review of Range hardening; advisory outcome recorded for `29f0772`.

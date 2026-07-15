@@ -22,3 +22,5 @@ Renamed the full C ABI from `ort2_*` to `nxrt_*` with no compatibility aliases. 
 
 ### Recent validation
 Loader opset-import validation for file, from-parts, and nested-subgraph paths merged in `00cda89`; the executor's sentinel failure path is now an unreachable invariant. Holden's final review was green.
+
+- 2026-07-15 — Added Windows oneDNN wheel bundling in `ef89a95`; CI verification is pending.

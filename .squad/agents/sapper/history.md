@@ -35,3 +35,5 @@ Added the preprocessing-side prompt token-expansion library for multi-tile VLM i
 - 23 integration tests pass. Regenerated `~/gemma4-e2b-onnx/input_embedding.f32`.
 
 - 2026-07-14T19:05:00Z — ITT tracer collector review by Joshi recorded GREEN for commit `977a50b`; unsafe prohibition, nesting, bounded domain lifetime, graceful degradation, feature hygiene, and all gates verified.
+
+- 2026-07-15 — Added the Range Int64 addressability guard (merged `29f0772`).
