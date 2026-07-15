@@ -41,64 +41,14 @@ impl Kernel for LayerNormKernel {
             None
         };
 
-        let x_shape = inputs[0].shape;
-        let rank = x_shape.len();
-        let axis = if self.axis < 0 {
-            self.axis + rank as i64
-        } else {
-            self.axis
-        };
-        if axis < 0 || axis as usize > rank {
-            return Err(EpError::KernelFailed(format!(
-                "LayerNormalization: axis {} out of range for rank {rank}",
-                self.axis
-            )));
-        }
-        let axis = axis as usize;
-
-        let norm_size: usize = x_shape[axis..].iter().product();
-        let num_groups: usize = x_shape[..axis].iter().product();
-        if norm_size == 0 {
-            return Err(EpError::KernelFailed(
-                "LayerNormalization: empty normalization axis".into(),
-            ));
-        }
-        if scale.len() != norm_size {
-            return Err(EpError::KernelFailed(format!(
-                "LayerNormalization: scale has {} elements, expected {norm_size}",
-                scale.len()
-            )));
-        }
-        if let Some(b) = &bias
-            && b.len() != norm_size
-        {
-            return Err(EpError::KernelFailed(format!(
-                "LayerNormalization: bias has {} elements, expected {norm_size}",
-                b.len()
-            )));
-        }
-        let mut y = vec![0.0f32; x.len()];
-        let mut means = vec![0.0f32; num_groups];
-        let mut inv_stds = vec![0.0f32; num_groups];
-
-        for g in 0..num_groups {
-            let base = g * norm_size;
-            let slice = &x[base..base + norm_size];
-            let mean = slice.iter().sum::<f32>() / norm_size as f32;
-            let var =
-                slice.iter().map(|&v| (v - mean) * (v - mean)).sum::<f32>() / norm_size as f32;
-            let inv_std = 1.0 / (var + self.epsilon).sqrt();
-            means[g] = mean;
-            inv_stds[g] = inv_std;
-            for e in 0..norm_size {
-                let norm = (slice[e] - mean) * inv_std;
-                let mut out = norm * scale[e];
-                if let Some(b) = &bias {
-                    out += b[e];
-                }
-                y[base + e] = out;
-            }
-        }
+        let (y, means, inv_stds) = layer_norm_dense(
+            &x,
+            inputs[0].shape,
+            &scale,
+            bias.as_deref(),
+            self.axis,
+            self.epsilon,
+        )?;
 
         write_dense_f32(&mut outputs[0], &y)?;
         // Optional Mean / InvStdDev outputs (shape = X.shape[:axis] with the
@@ -115,6 +65,72 @@ impl Kernel for LayerNormKernel {
     fn supports_strided_input(&self, _input_idx: usize) -> bool {
         true
     }
+}
+
+/// Shared LayerNorm math for fused contrib kernels. Returns the normalized
+/// output plus one mean and inverse standard deviation per normalized group.
+pub(crate) fn layer_norm_dense(
+    x: &[f32],
+    x_shape: &[usize],
+    scale: &[f32],
+    bias: Option<&[f32]>,
+    axis: i64,
+    epsilon: f32,
+) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>)> {
+    let rank = x_shape.len();
+    let axis = if axis < 0 { axis + rank as i64 } else { axis };
+    if axis < 0 || axis as usize > rank {
+        return Err(EpError::KernelFailed(format!(
+            "LayerNormalization: axis {} out of range for rank {rank}",
+            axis
+        )));
+    }
+    let axis = axis as usize;
+
+    let norm_size: usize = x_shape[axis..].iter().product();
+    let num_groups: usize = x_shape[..axis].iter().product();
+    if norm_size == 0 {
+        return Err(EpError::KernelFailed(
+            "LayerNormalization: empty normalization axis".into(),
+        ));
+    }
+    if scale.len() != norm_size {
+        return Err(EpError::KernelFailed(format!(
+            "LayerNormalization: scale has {} elements, expected {norm_size}",
+            scale.len()
+        )));
+    }
+    if let Some(b) = bias
+        && b.len() != norm_size
+    {
+        return Err(EpError::KernelFailed(format!(
+            "LayerNormalization: bias has {} elements, expected {norm_size}",
+            b.len()
+        )));
+    }
+    let mut y = vec![0.0f32; x.len()];
+    let mut means = vec![0.0f32; num_groups];
+    let mut inv_stds = vec![0.0f32; num_groups];
+
+    for g in 0..num_groups {
+        let base = g * norm_size;
+        let slice = &x[base..base + norm_size];
+        let mean = slice.iter().sum::<f32>() / norm_size as f32;
+        let var = slice.iter().map(|&v| (v - mean) * (v - mean)).sum::<f32>() / norm_size as f32;
+        let inv_std = 1.0 / (var + epsilon).sqrt();
+        means[g] = mean;
+        inv_stds[g] = inv_std;
+        for e in 0..norm_size {
+            let norm = (slice[e] - mean) * inv_std;
+            let mut out = norm * scale[e];
+            if let Some(b) = bias {
+                out += b[e];
+            }
+            y[base + e] = out;
+        }
+    }
+
+    Ok((y, means, inv_stds))
 }
 
 #[cfg(test)]

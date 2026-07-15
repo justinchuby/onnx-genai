@@ -19,7 +19,7 @@ const FRAC_1_SQRT_2: f64 = std::f64::consts::FRAC_1_SQRT_2;
 /// Exact GELU of one element: `0.5·x·(1 + erf(x / √2))`. The inner scale and
 /// error function are computed in `f64` (as the `Erf` kernel does) and the
 /// result rounded to `f32`.
-fn gelu(x: f32) -> f32 {
+pub(crate) fn exact_gelu(x: f32) -> f32 {
     let xf = x as f64;
     (0.5 * xf * (1.0 + erf(xf * FRAC_1_SQRT_2))) as f32
 }
@@ -30,7 +30,7 @@ const SQRT_2_OVER_PI: f64 = 0.797_884_560_802_865_4;
 /// Tanh-approximation GELU of one element (the standard `ai.onnx::Gelu`
 /// `approximate="tanh"` path): `0.5·x·(1 + tanh(√(2/π)·(x + 0.044715·x³)))`.
 /// Computed in `f64` and rounded to `f32` to mirror the exact path's precision.
-fn gelu_tanh(x: f32) -> f32 {
+pub(crate) fn tanh_gelu(x: f32) -> f32 {
     let xf = x as f64;
     let inner = SQRT_2_OVER_PI * (xf + 0.044_715 * xf * xf * xf);
     (0.5 * xf * (1.0 + inner.tanh())) as f32
@@ -52,7 +52,7 @@ impl Kernel for GeluKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         check_arity("Gelu", inputs, outputs, 1, 1, 1)?;
         let x = to_dense_f32(&inputs[0])?;
-        let y: Vec<f32> = x.iter().map(|&v| gelu(v)).collect();
+        let y: Vec<f32> = x.iter().map(|&v| exact_gelu(v)).collect();
         write_dense_f32(&mut outputs[0], &y)
     }
 
@@ -89,9 +89,9 @@ impl Kernel for StdGeluKernel {
         check_arity("Gelu", inputs, outputs, 1, 1, 1)?;
         let x = to_dense_f32(&inputs[0])?;
         let y: Vec<f32> = if self.tanh {
-            x.iter().map(|&v| gelu_tanh(v)).collect()
+            x.iter().map(|&v| tanh_gelu(v)).collect()
         } else {
-            x.iter().map(|&v| gelu(v)).collect()
+            x.iter().map(|&v| exact_gelu(v)).collect()
         };
         write_dense_f32(&mut outputs[0], &y)
     }
@@ -176,20 +176,29 @@ mod tests {
             .unwrap();
         let got = out.to_f32();
         for (&x, &g) in xs.iter().zip(got.iter()) {
-            assert!((g - reference_tanh(x)).abs() <= 1e-6, "gelu_tanh({x}) = {g}");
+            assert!(
+                (g - reference_tanh(x)).abs() <= 1e-6,
+                "gelu_tanh({x}) = {g}"
+            );
         }
         // gelu(0) is exactly 0 in both paths.
         assert_eq!(got[3], 0.0);
         // Hand value: gelu_tanh(1) ≈ 0.841192.
-        assert!((got[5] - 0.841_192).abs() < 1e-4, "gelu_tanh(1) = {}", got[5]);
+        assert!(
+            (got[5] - 0.841_192).abs() < 1e-4,
+            "gelu_tanh(1) = {}",
+            got[5]
+        );
     }
 
     #[test]
     fn std_gelu_factory_reads_approximate_attr() {
         use onnx_runtime_ir::{Attribute, Node, NodeId};
         let mut node = Node::new(NodeId(0), "Gelu", vec![], vec![]);
-        node.attributes
-            .insert("approximate".to_string(), Attribute::String(b"tanh".to_vec()));
+        node.attributes.insert(
+            "approximate".to_string(),
+            Attribute::String(b"tanh".to_vec()),
+        );
         let k = StdGeluFactory.create(&node, &[]).unwrap();
         let a = Owned::f32(&[1], &[1.0]);
         let mut out = Owned::zeros_f32(&[1]);

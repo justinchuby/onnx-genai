@@ -55,100 +55,113 @@ impl Kernel for RmsNormKernel {
         check_arity("RMSNormalization", inputs, outputs, 2, 2, 1)?;
         let x = to_dense_f32(&inputs[0])?;
         let scale = to_dense_f32(&inputs[1])?;
-
-        let x_shape = inputs[0].shape;
-        let rank = x_shape.len();
-        let axis = if self.axis < 0 {
-            self.axis + rank as i64
-        } else {
-            self.axis
-        };
-        if axis < 0 || axis as usize >= rank {
-            return Err(EpError::KernelFailed(format!(
-                "RMSNormalization: axis {} out of range for rank {rank}",
-                self.axis
-            )));
-        }
-        let axis = axis as usize;
-
-        let norm_size: usize = x_shape[axis..].iter().product();
-        let num_groups: usize = x_shape[..axis].iter().product();
-        if norm_size == 0 {
-            return Err(EpError::KernelFailed(
-                "RMSNormalization: empty normalization axis".into(),
-            ));
-        }
-
-        // `scale` may be any shape unidirectionally broadcastable to `X`
-        // (NumPy-style, right-aligned). Precompute per-axis multipliers so a
-        // flat `X` index maps to the matching `scale` element in O(rank).
-        let scale_shape = inputs[1].shape;
-        if scale_shape.len() > rank {
-            return Err(EpError::KernelFailed(format!(
-                "RMSNormalization: scale rank {} exceeds X rank {rank}",
-                scale_shape.len()
-            )));
-        }
-        // Right-align scale dims against X; validate broadcastability and build
-        // a per-X-axis stride into the flat scale buffer (0 where broadcast).
-        let offset = rank - scale_shape.len();
-        let mut scale_strides = vec![0usize; rank];
-        {
-            let mut stride = 1usize;
-            for i in (0..scale_shape.len()).rev() {
-                let sdim = scale_shape[i];
-                let xdim = x_shape[offset + i];
-                if sdim != xdim && sdim != 1 {
-                    return Err(EpError::KernelFailed(format!(
-                        "RMSNormalization: scale shape {scale_shape:?} not broadcastable to X shape {x_shape:?}"
-                    )));
-                }
-                scale_strides[offset + i] = if sdim == 1 { 0 } else { stride };
-                stride *= sdim;
-            }
-        }
-        if scale.len() != scale_shape.iter().product::<usize>() {
-            return Err(EpError::KernelFailed(format!(
-                "RMSNormalization: scale has {} elements, expected {} for shape {scale_shape:?}",
-                scale.len(),
-                scale_shape.iter().product::<usize>()
-            )));
-        }
-
-        // Row-major strides for X to unravel a flat index into coordinates.
-        let mut x_strides = vec![1usize; rank];
-        for i in (0..rank.saturating_sub(1)).rev() {
-            x_strides[i] = x_strides[i + 1] * x_shape[i + 1];
-        }
-        let scale_index = |flat: usize| -> usize {
-            let mut si = 0usize;
-            let mut rem = flat;
-            for d in 0..rank {
-                let coord = rem / x_strides[d];
-                rem %= x_strides[d];
-                si += coord * scale_strides[d];
-            }
-            si
-        };
-
-        let mut y = vec![0.0f32; x.len()];
-        for g in 0..num_groups {
-            let base = g * norm_size;
-            let slice = &x[base..base + norm_size];
-            let mean_sq = slice.iter().map(|&v| v * v).sum::<f32>() / norm_size as f32;
-            let inv_rms = 1.0 / (mean_sq + self.epsilon).sqrt();
-            for e in 0..norm_size {
-                let idx = base + e;
-                y[idx] = x[idx] * inv_rms * scale[scale_index(idx)];
-            }
-        }
-
+        let y = rms_norm_dense(
+            &x,
+            inputs[0].shape,
+            &scale,
+            inputs[1].shape,
+            self.axis,
+            self.epsilon,
+        )?;
         write_dense_f32(&mut outputs[0], &y)
     }
 
     fn supports_strided_input(&self, _input_idx: usize) -> bool {
         true
     }
+}
+
+/// Shared RMSNorm math for contrib kernels.
+pub(crate) fn rms_norm_dense(
+    x: &[f32],
+    x_shape: &[usize],
+    scale: &[f32],
+    scale_shape: &[usize],
+    axis: i64,
+    epsilon: f32,
+) -> Result<Vec<f32>> {
+    let rank = x_shape.len();
+    let axis = if axis < 0 { axis + rank as i64 } else { axis };
+    if axis < 0 || axis as usize >= rank {
+        return Err(EpError::KernelFailed(format!(
+            "RMSNormalization: axis {} out of range for rank {rank}",
+            axis
+        )));
+    }
+    let axis = axis as usize;
+
+    let norm_size: usize = x_shape[axis..].iter().product();
+    let num_groups: usize = x_shape[..axis].iter().product();
+    if norm_size == 0 {
+        return Err(EpError::KernelFailed(
+            "RMSNormalization: empty normalization axis".into(),
+        ));
+    }
+
+    // `scale` may be any shape unidirectionally broadcastable to `X`
+    // (NumPy-style, right-aligned). Precompute per-axis multipliers so a
+    // flat `X` index maps to the matching `scale` element in O(rank).
+    if scale_shape.len() > rank {
+        return Err(EpError::KernelFailed(format!(
+            "RMSNormalization: scale rank {} exceeds X rank {rank}",
+            scale_shape.len()
+        )));
+    }
+    // Right-align scale dims against X; validate broadcastability and build
+    // a per-X-axis stride into the flat scale buffer (0 where broadcast).
+    let offset = rank - scale_shape.len();
+    let mut scale_strides = vec![0usize; rank];
+    {
+        let mut stride = 1usize;
+        for i in (0..scale_shape.len()).rev() {
+            let sdim = scale_shape[i];
+            let xdim = x_shape[offset + i];
+            if sdim != xdim && sdim != 1 {
+                return Err(EpError::KernelFailed(format!(
+                    "RMSNormalization: scale shape {scale_shape:?} not broadcastable to X shape {x_shape:?}"
+                )));
+            }
+            scale_strides[offset + i] = if sdim == 1 { 0 } else { stride };
+            stride *= sdim;
+        }
+    }
+    if scale.len() != scale_shape.iter().product::<usize>() {
+        return Err(EpError::KernelFailed(format!(
+            "RMSNormalization: scale has {} elements, expected {} for shape {scale_shape:?}",
+            scale.len(),
+            scale_shape.iter().product::<usize>()
+        )));
+    }
+
+    // Row-major strides for X to unravel a flat index into coordinates.
+    let mut x_strides = vec![1usize; rank];
+    for i in (0..rank.saturating_sub(1)).rev() {
+        x_strides[i] = x_strides[i + 1] * x_shape[i + 1];
+    }
+    let scale_index = |flat: usize| -> usize {
+        let mut si = 0usize;
+        let mut rem = flat;
+        for d in 0..rank {
+            let coord = rem / x_strides[d];
+            rem %= x_strides[d];
+            si += coord * scale_strides[d];
+        }
+        si
+    };
+
+    let mut y = vec![0.0f32; x.len()];
+    for g in 0..num_groups {
+        let base = g * norm_size;
+        let slice = &x[base..base + norm_size];
+        let mean_sq = slice.iter().map(|&v| v * v).sum::<f32>() / norm_size as f32;
+        let inv_rms = 1.0 / (mean_sq + epsilon).sqrt();
+        for e in 0..norm_size {
+            let idx = base + e;
+            y[idx] = x[idx] * inv_rms * scale[scale_index(idx)];
+        }
+    }
+
+    Ok(y)
 }
 
 #[cfg(test)]
@@ -160,10 +173,7 @@ mod tests {
     fn reference(row: &[f32], scale: &[f32], eps: f32) -> Vec<f32> {
         let mean_sq = row.iter().map(|v| v * v).sum::<f32>() / row.len() as f32;
         let inv = 1.0 / (mean_sq + eps).sqrt();
-        row.iter()
-            .zip(scale)
-            .map(|(v, s)| v * inv * s)
-            .collect()
+        row.iter().zip(scale).map(|(v, s)| v * inv * s).collect()
     }
 
     #[test]
@@ -208,9 +218,12 @@ mod tests {
         let scale = Owned::f32(&[2, 2], &[1., 1., 1., 1.]);
         let mut out = Owned::zeros_f32(&[2, 2, 2]);
         let eps = 1e-2;
-        RmsNormKernel { axis: 1, epsilon: eps }
-            .execute(&[x.view(), scale.view()], &mut [out.view_mut()])
-            .unwrap();
+        RmsNormKernel {
+            axis: 1,
+            epsilon: eps,
+        }
+        .execute(&[x.view(), scale.view()], &mut [out.view_mut()])
+        .unwrap();
         let mut want = reference(&[1., 2., 3., 4.], &[1., 1., 1., 1.], eps);
         want.extend(reference(&[5., 6., 7., 8.], &[1., 1., 1., 1.], eps));
         for (g, w) in out.to_f32().iter().zip(&want) {
@@ -266,7 +279,8 @@ mod tests {
         for g in 0..num_groups {
             let base = g * norm_size;
             let slice = &x[base..base + norm_size];
-            let inv = 1.0 / (slice.iter().map(|v| v * v).sum::<f32>() / norm_size as f32 + eps).sqrt();
+            let inv =
+                1.0 / (slice.iter().map(|v| v * v).sum::<f32>() / norm_size as f32 + eps).sqrt();
             for e in 0..norm_size {
                 let flat = base + e;
                 let mut rem = flat;
@@ -288,9 +302,12 @@ mod tests {
         let x = Owned::f32(&[2, 3], &x_data);
         let scale = Owned::f32(&[], &[2.0]);
         let mut out = Owned::zeros_f32(&[2, 3]);
-        RmsNormKernel { axis: -1, epsilon: 1e-5 }
-            .execute(&[x.view(), scale.view()], &mut [out.view_mut()])
-            .unwrap();
+        RmsNormKernel {
+            axis: -1,
+            epsilon: 1e-5,
+        }
+        .execute(&[x.view(), scale.view()], &mut [out.view_mut()])
+        .unwrap();
         let want = reference_bcast(&x_data, &[2, 3], &[2.0], &[], 1, 1e-5);
         for (g, w) in out.to_f32().iter().zip(&want) {
             assert!((g - w).abs() < 1e-5, "got {g}, want {w}");
@@ -305,9 +322,12 @@ mod tests {
         let scale_data = [1., 2., 3., 4.];
         let scale = Owned::f32(&[4], &scale_data);
         let mut out = Owned::zeros_f32(&[2, 3, 4]);
-        RmsNormKernel { axis: 1, epsilon: 1e-5 }
-            .execute(&[x.view(), scale.view()], &mut [out.view_mut()])
-            .unwrap();
+        RmsNormKernel {
+            axis: 1,
+            epsilon: 1e-5,
+        }
+        .execute(&[x.view(), scale.view()], &mut [out.view_mut()])
+        .unwrap();
         let want = reference_bcast(&x_data, &[2, 3, 4], &scale_data, &[4], 1, 1e-5);
         for (g, w) in out.to_f32().iter().zip(&want) {
             assert!((g - w).abs() < 1e-4, "got {g}, want {w}");
@@ -322,9 +342,12 @@ mod tests {
         let scale_data = [1., 2., 3.];
         let scale = Owned::f32(&[3, 1], &scale_data);
         let mut out = Owned::zeros_f32(&[2, 3, 4]);
-        RmsNormKernel { axis: 1, epsilon: 1e-5 }
-            .execute(&[x.view(), scale.view()], &mut [out.view_mut()])
-            .unwrap();
+        RmsNormKernel {
+            axis: 1,
+            epsilon: 1e-5,
+        }
+        .execute(&[x.view(), scale.view()], &mut [out.view_mut()])
+        .unwrap();
         let want = reference_bcast(&x_data, &[2, 3, 4], &scale_data, &[3, 1], 1, 1e-5);
         for (g, w) in out.to_f32().iter().zip(&want) {
             assert!((g - w).abs() < 1e-4, "got {g}, want {w}");
@@ -339,9 +362,12 @@ mod tests {
         let scale_data: Vec<f32> = (1..13).map(|v| v as f32 * 0.25).collect();
         let scale = Owned::f32(&[3, 4], &scale_data);
         let mut out = Owned::zeros_f32(&[2, 3, 4]);
-        RmsNormKernel { axis: 1, epsilon: 1e-5 }
-            .execute(&[x.view(), scale.view()], &mut [out.view_mut()])
-            .unwrap();
+        RmsNormKernel {
+            axis: 1,
+            epsilon: 1e-5,
+        }
+        .execute(&[x.view(), scale.view()], &mut [out.view_mut()])
+        .unwrap();
         let want = reference_bcast(&x_data, &[2, 3, 4], &scale_data, &[3, 4], 1, 1e-5);
         for (g, w) in out.to_f32().iter().zip(&want) {
             assert!((g - w).abs() < 1e-4, "got {g}, want {w}");
@@ -354,8 +380,11 @@ mod tests {
         let x = Owned::f32(&[2, 4], &[1., 2., 3., 4., 5., 6., 7., 8.]);
         let scale = Owned::f32(&[3], &[1., 1., 1.]);
         let mut out = Owned::zeros_f32(&[2, 4]);
-        let err = RmsNormKernel { axis: -1, epsilon: 1e-5 }
-            .execute(&[x.view(), scale.view()], &mut [out.view_mut()]);
+        let err = RmsNormKernel {
+            axis: -1,
+            epsilon: 1e-5,
+        }
+        .execute(&[x.view(), scale.view()], &mut [out.view_mut()]);
         assert!(err.is_err());
     }
 
@@ -365,8 +394,11 @@ mod tests {
         let x = Owned::f32(&[2, 3], &[1., 2., 3., 4., 5., 6.]);
         let scale = Owned::f32(&[3], &[1., 1., 1.]);
         let mut out = Owned::zeros_f32(&[2, 3]);
-        let err = RmsNormKernel { axis: 2, epsilon: 1e-5 }
-            .execute(&[x.view(), scale.view()], &mut [out.view_mut()]);
+        let err = RmsNormKernel {
+            axis: 2,
+            epsilon: 1e-5,
+        }
+        .execute(&[x.view(), scale.view()], &mut [out.view_mut()]);
         assert!(err.is_err(), "axis == rank must be rejected");
     }
 
@@ -376,8 +408,11 @@ mod tests {
         let x = Owned::f32(&[2, 3], &[1., 2., 3., 4., 5., 6.]);
         let scale = Owned::f32(&[3], &[1., 1., 1.]);
         let mut out = Owned::zeros_f32(&[2, 3]);
-        let err = RmsNormKernel { axis: -3, epsilon: 1e-5 }
-            .execute(&[x.view(), scale.view()], &mut [out.view_mut()]);
+        let err = RmsNormKernel {
+            axis: -3,
+            epsilon: 1e-5,
+        }
+        .execute(&[x.view(), scale.view()], &mut [out.view_mut()]);
         assert!(err.is_err(), "axis == -rank-1 must be rejected");
     }
 }

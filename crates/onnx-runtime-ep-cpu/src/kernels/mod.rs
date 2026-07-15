@@ -34,6 +34,7 @@ pub mod cast;
 pub mod concat;
 pub mod constant;
 pub mod constant_of_shape;
+pub mod contrib_fused;
 pub mod elementwise;
 pub mod expand;
 pub mod fused_attention;
@@ -245,6 +246,26 @@ pub fn build_cpu_registry() -> OpRegistry {
     reg.register(
         OpKey::new("Gelu", "com.microsoft", 1),
         Box::new(gelu::GeluFactory),
+    );
+    reg.register(
+        OpKey::new("BiasGelu", "com.microsoft", 1),
+        Box::new(contrib_fused::BiasGeluFactory),
+    );
+    reg.register(
+        OpKey::new("FastGelu", "com.microsoft", 1),
+        Box::new(contrib_fused::FastGeluFactory),
+    );
+    reg.register(
+        OpKey::new("QuickGelu", "com.microsoft", 1),
+        Box::new(contrib_fused::QuickGeluFactory),
+    );
+    reg.register(
+        OpKey::new("SkipLayerNormalization", "com.microsoft", 1),
+        Box::new(contrib_fused::SkipLayerNormFactory),
+    );
+    reg.register(
+        OpKey::new("SimplifiedLayerNormalization", "com.microsoft", 1),
+        Box::new(contrib_fused::SimplifiedLayerNormFactory),
     );
     // Standard-domain LLM/transformer primitives (ai.onnx). Registered at their
     // ONNX since_version; the registry resolves the highest since_version <=
@@ -996,9 +1017,11 @@ mod tests {
         // `PHASE1_OPS`). The standard LLM primitives `Gelu` (opset 20),
         // `RMSNormalization` (23), `RotaryEmbedding` (23) and `Swish` (24) add
         // four more default-domain entries not in `PHASE1_OPS`; `Softmax` and
-        // `LogSoftmax` each have a legacy and an opset-13 entry, so the entry
-        // count is thirteen more than the op-name count.
-        assert_eq!(reg.len(), PHASE1_OPS.len() + 13);
+        // `LogSoftmax` each have a legacy and an opset-13 entry. Five contrib
+        // (`com.microsoft`) fused transformer entries (BiasGelu, FastGelu,
+        // QuickGelu, SkipLayerNormalization, SimplifiedLayerNormalization) add
+        // five more, so the entry count is eighteen more than the op-name count.
+        assert_eq!(reg.len(), PHASE1_OPS.len() + 18);
         for op in PHASE1_OPS {
             assert!(reg.lookup(op, "", 21).is_some(), "missing factory for {op}");
         }
@@ -1024,6 +1047,18 @@ mod tests {
         // The exact-GELU fusion's contrib op has a CPU kernel (contrib-only).
         assert!(reg.supports("Gelu", "com.microsoft"));
         assert!(reg.lookup("Gelu", "com.microsoft", 1).is_some());
+        for op in [
+            "BiasGelu",
+            "FastGelu",
+            "QuickGelu",
+            "SkipLayerNormalization",
+            "SimplifiedLayerNormalization",
+        ] {
+            assert!(
+                reg.lookup(op, "com.microsoft", 1).is_some(),
+                "missing contrib factory for {op}"
+            );
+        }
         // Standard `ai.onnx::Gelu` (opset 20) is now registered in the default
         // domain; it resolves at opset ≥ 20 but not below its since-version.
         assert!(reg.lookup("Gelu", "", 21).is_some());
