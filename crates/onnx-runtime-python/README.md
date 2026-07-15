@@ -128,10 +128,48 @@ nxrt emits the versioned `DLManagedTensorVersioned` (`"dltensor_versioned"`
 capsule, writable flag) when the consumer advertises DLPack major ≥ 1, and the
 unversioned `DLManagedTensor` (`"dltensor"`) otherwise. The capsule's `deleter`
 owns a reference to the backing buffer, so an imported array stays valid even
-after the `NxrtValue` is dropped. CUDA-resident outputs raise `BufferError`
-(zero-copy CUDA export is not wired up yet); use `.numpy()` in that case. bf16
-exports as DLPack `kDLBfloat/16` (consumable by torch; numpy has no bf16 DLPack
-import).
+after the `NxrtValue` is dropped. bf16 exports as DLPack `kDLBfloat/16`
+(consumable by torch; numpy has no bf16 DLPack import).
+
+#### CUDA (`kDLCUDA`) zero-copy — import & export
+
+When nxrt is built with the `cuda` feature and runs on a
+`CUDAExecutionProvider`, the DLPack path extends to GPU memory with **no host
+round-trip**:
+
+```python
+sess = nxrt.InferenceSession(model, providers=["CUDAExecutionProvider"])
+
+# Import: a CUDA torch tensor is borrowed directly as a device-resident input.
+x = torch.rand(1024, device="cuda")
+(out,) = sess.run(None, {"x": x})          # runs on the GPU, no H2D/D2H copy
+
+# Export: a CUDA nxrt output is borrowed by torch on the same device.
+(v,) = sess.run_with_values(None, {"x": x})
+t = torch.from_dlpack(v)                    # t.is_cuda; t.data_ptr() aliases nxrt's buffer
+```
+
+* `__dlpack_device__()` returns `(kDLCUDA, ordinal)` for a CUDA output, so the
+  consumer allocates/borrows on the correct GPU.
+* **Stream contract.** DLPack requires the producer to order the exported
+  buffer's device work with respect to the consumer's stream before handoff. On
+  **export**, nxrt takes the conservative, always-correct end of the handshake:
+  it **fully synchronizes the producing EP's stream** (`Tensor::sync`) before
+  returning the capsule, so the data is valid regardless of which stream the
+  consumer reads on. A consumer `stream` of `-1` (the Array-API "no
+  synchronization" sentinel) is honored and skips the sync; any other value
+  (`None`, `1`, `2`, or a real handle) triggers it. On **import**, nxrt passes
+  the legacy-default CUDA stream (`1`) to the producer's `__dlpack__(stream=...)`
+  so the producer orders its work before nxrt reads on its default stream.
+* Contiguity, dtype and device-ordinal are validated exactly as on the CPU path;
+  any unsupported case falls back to a copy (or, for a real CUDA tensor a host
+  copy cannot service, surfaces the producer's own error) rather than silently
+  aliasing device memory as host memory.
+
+A CPU wheel (built without the `cuda` feature) has no `CUDAExecutionProvider`
+and treats a CUDA input as a copy-fallback; the GPU tests
+(`tests/test_dlpack_gpu.py`) skip unless both `torch.cuda.is_available()` and
+`CUDAExecutionProvider` are present.
 
 ### Providers
 

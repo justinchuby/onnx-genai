@@ -131,30 +131,72 @@ fn from_dldatatype(dt: onnx_runtime_dlpack::DLDataType) -> PyResult<DataType> {
 }
 
 
-/// Map an nxrt [`Tensor`]'s device to a DLPack
-/// [`DLDevice`](onnx_runtime_dlpack::DLDevice).
+/// Map an nxrt [`DeviceId`] to a DLPack [`DLDevice`](onnx_runtime_dlpack::DLDevice).
 ///
-/// Host-accessible devices (CPU, and Apple MLX unified memory) export as
-/// `kDLCPU`. CUDA is intentionally rejected in this pass (see [`NxrtValue`]);
-/// the ABI already carries `kDLCUDA`, so wiring it in is additive.
+/// Pure logic (no Python), so it is unit-tested on CPU without a GPU:
+///
+/// * Host-accessible devices (CPU, and Apple MLX unified memory) map to `kDLCPU`
+///   (ordinal 0) — they share the host address space.
+/// * CUDA device tensors map to `kDLCUDA` carrying the device ordinal, so a
+///   consumer such as `torch.from_dlpack` borrows the buffer on the correct GPU.
+///
+/// Returns `Err(device_type)` for a device with no DLPack mapping yet (ROCm,
+/// WebGPU, …) so the caller can raise an actionable error, or `Ok(None)` when the
+/// CUDA ordinal does not fit DLPack's `i32` `device_id`.
+fn nxrt_device_to_dldevice(
+    dev: DeviceId,
+) -> Result<Option<onnx_runtime_dlpack::DLDevice>, DeviceType> {
+    use onnx_runtime_dlpack as dl;
+    match dev.device_type {
+        DeviceType::Cpu | DeviceType::Mlx => {
+            Ok(Some(dl::DLDevice { device_type: dl::DL_CPU, device_id: 0 }))
+        }
+        DeviceType::Cuda => match i32::try_from(dev.index) {
+            Ok(id) => Ok(Some(dl::DLDevice { device_type: dl::DL_CUDA, device_id: id })),
+            Err(_) => Ok(None),
+        },
+        other => Err(other),
+    }
+}
+
+/// Map an nxrt [`Tensor`]'s device to a DLPack
+/// [`DLDevice`](onnx_runtime_dlpack::DLDevice) — the Python-facing wrapper over
+/// [`nxrt_device_to_dldevice`] that turns unmappable devices into an actionable
+/// `BufferError`. The actual CUDA stream ordering is handled in
+/// [`NxrtValue::__dlpack__`].
 fn to_dldevice(tensor: &Tensor) -> PyResult<onnx_runtime_dlpack::DLDevice> {
     let dev = tensor.device();
-    match dev.device_type {
-        DeviceType::Cpu | DeviceType::Mlx => Ok(onnx_runtime_dlpack::DLDevice {
-            device_type: onnx_runtime_dlpack::DL_CPU,
-            device_id: 0,
-        }),
-        DeviceType::Cuda => Err(PyBufferError::new_err(
-            "this nxrt output lives in CUDA device memory; zero-copy DLPack \
-             export for CUDA tensors is not implemented yet (the DLPack ABI \
-             carries kDLCUDA + stream semantics, but the producer-side stream \
-             ordering is not wired up in this build). Move the value to host \
-             first, or use `.numpy()`.",
-        )),
-        other => Err(PyBufferError::new_err(format!(
+    match nxrt_device_to_dldevice(dev) {
+        Ok(Some(d)) => Ok(d),
+        Ok(None) => Err(PyBufferError::new_err(format!(
+            "CUDA device ordinal {} does not fit DLPack's i32 device_id",
+            dev.index
+        ))),
+        Err(other) => Err(PyBufferError::new_err(format!(
             "nxrt output lives on device {other:?}, which has no DLPack export \
              path yet. Use `.numpy()` to obtain a host copy."
         ))),
+    }
+}
+
+/// Map a DLPack device (`device_type`, `device_id`) back to an nxrt
+/// [`DeviceId`] — the inverse of [`to_dldevice`], used on the zero-copy import
+/// path to decide where a foreign buffer lives.
+///
+/// Returns `None` for a device type nxrt cannot borrow zero-copy (anything other
+/// than `kDLCPU` and `kDLCUDA`), so the caller falls back to a copy. `kDLCUDAHost`
+/// (pinned host memory) maps to CPU: it is host-dereferenceable and can be
+/// borrowed like ordinary host memory. This mapping is pure logic and is
+/// unit-tested on CPU (no GPU required).
+fn dldevice_to_nxrt(device_type: i32, device_id: i32) -> Option<DeviceId> {
+    use onnx_runtime_dlpack as dl;
+    match device_type {
+        dl::DL_CPU | dl::DL_CUDA_HOST => Some(DeviceId::cpu()),
+        dl::DL_CUDA => {
+            let ordinal = u32::try_from(device_id).ok()?;
+            Some(DeviceId::cuda(ordinal))
+        }
+        _ => None,
     }
 }
 
@@ -264,7 +306,15 @@ impl NxrtValue {
     ///   caller demanding a fresh copy must use `.numpy()` instead.
     /// * `dl_device` may only request this value's own device (no cross-device
     ///   move on export).
-    /// * `stream` is only meaningful for CUDA, which this build does not export.
+    /// * `stream` implements the CUDA stream handshake. For a `kDLCUDA` tensor,
+    ///   nxrt takes the conservative, always-correct end of the protocol: it
+    ///   **fully synchronizes the producing EP's stream** before handing off, so
+    ///   the exported device buffer's contents are valid regardless of which
+    ///   stream the consumer reads on. A consumer `stream` of `-1` explicitly
+    ///   opts out of synchronization (per the Array-API spec) and is honored; any
+    ///   other value (including `None`, `1`, `2`, or a real stream handle) causes
+    ///   the sync. For `kDLCPU` tensors there is no device work and `stream` is a
+    ///   no-op.
     /// * `max_version` selects the wire form: when the consumer advertises
     ///   DLPack major ≥ 1 (e.g. numpy ≥ 2.1, recent torch) nxrt emits the
     ///   **versioned** `DLManagedTensorVersioned` (`"dltensor_versioned"`) with
@@ -284,8 +334,6 @@ impl NxrtValue {
         dl_device: Option<Py<PyAny>>,
         copy: Option<bool>,
     ) -> PyResult<Py<PyAny>> {
-        let _ = stream;
-
         if copy == Some(true) {
             return Err(PyBufferError::new_err(
                 "__dlpack__(copy=True) is not supported: nxrt exports a \
@@ -298,6 +346,27 @@ impl NxrtValue {
         // allocate any C-side state.
         let device = to_dldevice(&self.tensor)?;
         let dtype = to_dldatatype(self.tensor.dtype)?;
+
+        // DLPack CUDA stream handshake: the producer must ensure the exported
+        // buffer's device work is ordered before the consumer reads it on its
+        // `stream`. nxrt fully synchronizes the producing EP's stream — the
+        // simplest guarantee that is correct for *any* consumer stream value.
+        // A `stream` of -1 means "no synchronization requested"; we honor that
+        // opt-out. For host tensors there is no device work, so skip entirely.
+        if device.device_type == onnx_runtime_dlpack::DL_CUDA {
+            let opted_out = stream
+                .as_ref()
+                .and_then(|s| s.extract::<i64>(py).ok())
+                == Some(-1);
+            if !opted_out {
+                self.tensor.sync().map_err(|e| {
+                    PyBufferError::new_err(format!(
+                        "failed to synchronize the CUDA stream before DLPack \
+                         export (the exported buffer may not be valid yet): {e}"
+                    ))
+                })?;
+            }
+        }
 
         if let Some(dl_device) = dl_device {
             let requested: (i64, i64) = dl_device.extract(py).map_err(|_| {
@@ -330,13 +399,12 @@ impl NxrtValue {
 
         // Base pointer of the backing allocation. The `Arc<Tensor>` clone moved
         // into the exporter below keeps this address valid for the capsule's
-        // life, independent of this `NxrtValue`.
+        // life, independent of this `NxrtValue`. `device_ptr()` is device-aware:
+        // for a host tensor it is the dereferenceable host base; for a CUDA
+        // tensor it is the opaque device address (which is exactly what a
+        // `kDLCUDA` consumer expects). It returns null for an empty tensor.
         let keep_alive = self.tensor.clone();
-        let data = if keep_alive.numel() == 0 {
-            std::ptr::null_mut()
-        } else {
-            keep_alive.as_bytes().as_ptr() as *mut c_void
-        };
+        let data = keep_alive.device_ptr() as *mut c_void;
         let shape: Vec<i64> = keep_alive.shape.iter().map(|&d| d as i64).collect();
 
         if use_versioned {
@@ -513,6 +581,9 @@ fn is_row_major_contiguous(shape: &[i64], strides: Option<&[i64]>) -> bool {
 enum ImportPlan {
     Fallback,
     Commit {
+        /// nxrt device the borrowed buffer lives on (CPU host memory or a CUDA
+        /// device ordinal), decided by [`dldevice_to_nxrt`].
+        device: DeviceId,
         dtype: DataType,
         shape: Vec<usize>,
         /// First-element pointer (`data + byte_offset`).
@@ -524,16 +595,27 @@ enum ImportPlan {
     },
 }
 
-/// Validate a borrowed DLPack view for a zero-copy CPU import.
+/// Validate a borrowed DLPack view for a zero-copy import (CPU host memory or,
+/// when this build has the `cuda` feature, a CUDA device buffer).
 ///
-/// Returns [`ImportPlan::Fallback`] (defer to the copy path) for non-contiguous
-/// or empty tensors, an `Err` for an unsupported dtype, and
-/// [`ImportPlan::Commit`] otherwise. Performs **no** ownership transfer — the
-/// caller commits (renames the capsule, builds the guard) only for `Commit`.
+/// Returns [`ImportPlan::Fallback`] (defer to the copy path) for a device nxrt
+/// cannot borrow, non-contiguous or empty tensors, an unsupported dtype, or a
+/// CUDA buffer in a build without the `cuda` feature; [`ImportPlan::Commit`]
+/// otherwise. Performs **no** ownership transfer — the caller commits (renames
+/// the capsule, builds the guard) only for `Commit`. The device-mapping decision
+/// is pure logic ([`dldevice_to_nxrt`]) and is unit-tested on CPU.
 fn plan_import(view: &onnx_runtime_dlpack::BorrowedDlpack<'_>) -> PyResult<ImportPlan> {
     // Device is re-checked here defensively; the caller already gated on
     // `__dlpack_device__`, but the capsule's own device is authoritative.
-    if view.device.device_type != onnx_runtime_dlpack::DL_CPU {
+    let device = match dldevice_to_nxrt(view.device.device_type, view.device.device_id) {
+        Some(d) => d,
+        None => return Ok(ImportPlan::Fallback),
+    };
+    // A zero-copy CUDA borrow needs the CUDA EP compiled in — to hand back a
+    // device allocator and to actually run on the device. Builds without the
+    // `cuda` feature (e.g. this offline CPU dev machine) fall back to the copy
+    // path so the default build never depends on a CUDA toolkit.
+    if device.device_type == DeviceType::Cuda && !cfg!(feature = "cuda") {
         return Ok(ImportPlan::Fallback);
     }
     // Unsupported dtype → defer to the copy path, which raises a `TypeError`
@@ -599,7 +681,35 @@ fn plan_import(view: &onnx_runtime_dlpack::BorrowedDlpack<'_>) -> PyResult<Impor
         return Ok(ImportPlan::Fallback);
     }
 
-    Ok(ImportPlan::Commit { dtype, shape, data, len, align })
+    Ok(ImportPlan::Commit { device, dtype, shape, data, len, align })
+}
+
+/// Resolve the [`ExecutionProvider`] a zero-copy imported tensor should carry as
+/// its (deallocation-only) allocator, for its `device`.
+///
+/// Borrowed buffers are never freed by the EP (`deallocate` is a no-op for
+/// them), so the allocator's sole job here is to report the right device and let
+/// the executor route the input to the matching backend. CPU uses the shared CPU
+/// EP; CUDA uses a lazily-created device EP — feature-gated so the default build
+/// never links a CUDA toolkit. The CUDA arm is unreachable at runtime in a
+/// non-`cuda` build (`plan_import` returns `Fallback` for CUDA there), but must
+/// still compile.
+#[cfg(feature = "cuda")]
+fn import_allocator(device: DeviceId) -> PyResult<Arc<dyn onnx_runtime_ep_api::ExecutionProvider>> {
+    match device.device_type {
+        DeviceType::Cpu => Ok(cpu_allocator()),
+        DeviceType::Cuda => crate::cuda_import_allocator(device.index),
+        other => Err(PyBufferError::new_err(format!(
+            "no zero-copy DLPack import allocator for device {other:?}"
+        ))),
+    }
+}
+
+/// CPU-only build: only host memory is borrowable, so the allocator is always
+/// the shared CPU EP. (`plan_import` never yields a non-CPU `Commit` here.)
+#[cfg(not(feature = "cuda"))]
+fn import_allocator(_device: DeviceId) -> PyResult<Arc<dyn onnx_runtime_ep_api::ExecutionProvider>> {
+    Ok(cpu_allocator())
 }
 
 /// Try to import `obj` as a zero-copy nxrt [`Tensor`] via the DLPack **consumer**
@@ -621,16 +731,23 @@ pub(crate) fn tensor_from_dlpack(
         return Ok(None);
     }
 
-    // Device gate: only CPU is borrowable this pass; anything else copies.
-    let (device_type, _device_id): (i64, i64) =
+    // Device gate. CPU host memory is always borrowable; CUDA device memory is
+    // borrowable only when this build has the `cuda` feature (else we fall back
+    // to a copy — which for a real CUDA tensor will surface torch's own "can't
+    // convert cuda tensor to numpy" error, never a silent host alias of device
+    // memory). Anything else (ROCm, …) copies.
+    let (device_type, device_id): (i64, i64) =
         obj.call_method0("__dlpack_device__")?.extract().map_err(|_| {
             PyTypeError::new_err(
                 "__dlpack_device__() must return a (device_type, device_id) tuple of ints",
             )
         })?;
-    if device_type != onnx_runtime_dlpack::DL_CPU as i64 {
-        // CUDA/other-device import is out of scope; copy instead of borrowing
-        // (never silently produce a host tensor aliasing device memory).
+    let nxrt_device = match dldevice_to_nxrt(device_type as i32, device_id as i32) {
+        Some(d) => d,
+        None => return Ok(None),
+    };
+    let is_cuda = nxrt_device.device_type == DeviceType::Cuda;
+    if is_cuda && !cfg!(feature = "cuda") {
         return Ok(None);
     }
 
@@ -640,15 +757,38 @@ pub(crate) fn tensor_from_dlpack(
     // `BufferError` for a dtype it cannot encode, such as bfloat16), fall back
     // to the copy path rather than propagating — the copy path may still handle
     // the value (it moves bytes directly).
+    //
+    // CUDA stream handshake (consumer side): per the Array-API protocol we pass
+    // the stream nxrt will read the data on, so the producer orders its work
+    // before we consume. nxrt's CUDA EP submits on the (legacy) default stream,
+    // represented as `1` in the DLPack CUDA stream convention. Passing a real
+    // per-session stream handle is a future refinement (it needs the session's
+    // CUDA runtime, which this import helper does not hold).
     let capsule: Bound<'_, PyAny> = {
         let kwargs = pyo3::types::PyDict::new(py);
         kwargs.set_item("max_version", (1i64, 0i64))?;
+        if is_cuda {
+            kwargs.set_item("stream", 1i64)?;
+        }
         match obj.call_method("__dlpack__", (), Some(&kwargs)) {
             Ok(c) => c,
-            Err(_) => match obj.call_method0("__dlpack__") {
-                Ok(c) => c,
-                Err(_) => return Ok(None),
-            },
+            Err(_) => {
+                // Retry without max_version (older producers), keeping the CUDA
+                // stream so the ordering guarantee still holds.
+                let retry = pyo3::types::PyDict::new(py);
+                if is_cuda {
+                    retry.set_item("stream", 1i64)?;
+                }
+                let call = if is_cuda {
+                    obj.call_method("__dlpack__", (), Some(&retry))
+                } else {
+                    obj.call_method0("__dlpack__")
+                };
+                match call {
+                    Ok(c) => c,
+                    Err(_) => return Ok(None),
+                }
+            }
         }
     };
     let cap_ptr = capsule.as_ptr();
@@ -676,7 +816,7 @@ pub(crate) fn tensor_from_dlpack(
             let view = onnx_runtime_dlpack::borrowed_view_versioned(managed);
             match plan_import(&view)? {
                 ImportPlan::Fallback => Ok(None),
-                ImportPlan::Commit { dtype, shape, data, len, align } => {
+                ImportPlan::Commit { device, dtype, shape, data, len, align } => {
                     // Commit point: rename so the producer's destructor won't
                     // also free, then become the sole owner of the deleter.
                     if ffi::PyCapsule_SetName(cap_ptr, USED_DLTENSOR_VERSIONED.as_ptr()) != 0 {
@@ -687,9 +827,9 @@ pub(crate) fn tensor_from_dlpack(
                             owner: onnx_runtime_dlpack::ManagedTensorVersionedOwner::new(managed),
                         });
                     let buffer =
-                        DeviceBuffer::from_borrowed_parts(data, DeviceId::cpu(), len, align);
+                        DeviceBuffer::from_borrowed_parts(data, device, len, align);
                     let tensor = Tensor::from_borrowed_parts_with_guard(
-                        cpu_allocator(),
+                        import_allocator(device)?,
                         dtype,
                         shape,
                         TensorLayout::contiguous(),
@@ -708,7 +848,7 @@ pub(crate) fn tensor_from_dlpack(
             let view = onnx_runtime_dlpack::borrowed_view(managed);
             match plan_import(&view)? {
                 ImportPlan::Fallback => Ok(None),
-                ImportPlan::Commit { dtype, shape, data, len, align } => {
+                ImportPlan::Commit { device, dtype, shape, data, len, align } => {
                     if ffi::PyCapsule_SetName(cap_ptr, USED_DLTENSOR.as_ptr()) != 0 {
                         return Err(PyErr::fetch(py));
                     }
@@ -717,9 +857,9 @@ pub(crate) fn tensor_from_dlpack(
                             owner: onnx_runtime_dlpack::ManagedTensorOwner::new(managed),
                         });
                     let buffer =
-                        DeviceBuffer::from_borrowed_parts(data, DeviceId::cpu(), len, align);
+                        DeviceBuffer::from_borrowed_parts(data, device, len, align);
                     let tensor = Tensor::from_borrowed_parts_with_guard(
-                        cpu_allocator(),
+                        import_allocator(device)?,
                         dtype,
                         shape,
                         TensorLayout::contiguous(),
@@ -780,5 +920,69 @@ impl Drop for GilDlpackVersionedGuard {
             // SAFETY: as `GilDlpackGuard::drop`; the GIL is held here.
             unsafe { self.owner.call_deleter() };
         });
+    }
+}
+
+#[cfg(test)]
+mod device_mapping_tests {
+    //! Pure device-mapping round-trip tests. These exercise the CUDA
+    //! `device_type`/ordinal ↔ nxrt `DeviceId` logic **without a GPU**, so they
+    //! run on the CPU dev machine. They cover only the dependency-free mapping
+    //! helpers; the actual CUDA buffer wiring is feature-gated and validated on
+    //! real hardware (see `test_dlpack_gpu.py`).
+    use super::{dldevice_to_nxrt, nxrt_device_to_dldevice};
+    use onnx_runtime_dlpack as dl;
+    use onnx_runtime_ir::{DeviceId, DeviceType};
+
+    #[test]
+    fn nxrt_cpu_and_mlx_map_to_kdlcpu() {
+        for dev in [DeviceId::cpu(), DeviceId::new(DeviceType::Mlx, 0)] {
+            let d = nxrt_device_to_dldevice(dev).unwrap().unwrap();
+            assert_eq!(d.device_type, dl::DL_CPU);
+            assert_eq!(d.device_id, 0);
+        }
+    }
+
+    #[test]
+    fn nxrt_cuda_maps_to_kdlcuda_with_ordinal() {
+        for ord in [0u32, 1, 7] {
+            let d = nxrt_device_to_dldevice(DeviceId::cuda(ord)).unwrap().unwrap();
+            assert_eq!(d.device_type, dl::DL_CUDA);
+            assert_eq!(d.device_id, ord as i32);
+        }
+    }
+
+    #[test]
+    fn nxrt_unmappable_device_reports_its_type() {
+        let err = nxrt_device_to_dldevice(DeviceId::new(DeviceType::Rocm, 0)).unwrap_err();
+        assert_eq!(err, DeviceType::Rocm);
+    }
+
+    #[test]
+    fn dldevice_kdlcpu_and_pinned_host_map_to_cpu() {
+        assert_eq!(dldevice_to_nxrt(dl::DL_CPU, 0), Some(DeviceId::cpu()));
+        // kDLCUDAHost (pinned host memory) is host-dereferenceable → CPU borrow.
+        assert_eq!(dldevice_to_nxrt(dl::DL_CUDA_HOST, 0), Some(DeviceId::cpu()));
+    }
+
+    #[test]
+    fn dldevice_kdlcuda_maps_to_cuda_ordinal() {
+        assert_eq!(dldevice_to_nxrt(dl::DL_CUDA, 0), Some(DeviceId::cuda(0)));
+        assert_eq!(dldevice_to_nxrt(dl::DL_CUDA, 5), Some(DeviceId::cuda(5)));
+    }
+
+    #[test]
+    fn dldevice_unknown_or_negative_ordinal_is_none() {
+        assert_eq!(dldevice_to_nxrt(999, 0), None);
+        // A negative CUDA ordinal is malformed → no borrow.
+        assert_eq!(dldevice_to_nxrt(dl::DL_CUDA, -1), None);
+    }
+
+    #[test]
+    fn round_trip_cuda_ordinal_is_stable() {
+        for ord in [0u32, 2, 4] {
+            let d = nxrt_device_to_dldevice(DeviceId::cuda(ord)).unwrap().unwrap();
+            assert_eq!(dldevice_to_nxrt(d.device_type, d.device_id), Some(DeviceId::cuda(ord)));
+        }
     }
 }

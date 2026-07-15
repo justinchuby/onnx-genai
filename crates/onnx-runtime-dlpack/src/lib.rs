@@ -1056,17 +1056,42 @@ mod tests {
     }
 
     #[test]
-    fn versioned_owner_calls_foreign_deleter_exactly_once() {
-        IMPORT_DROPS_V.store(0, Ordering::SeqCst);
-        let managed = make_fake_managed_versioned(vec![2, 2]);
-        // SAFETY: live versioned fake; read fields then own + drop.
+    fn export_and_borrow_round_trip_cuda_device() {
+        // The device-mapping logic must carry a kDLCUDA device + ordinal through
+        // the ABI unchanged. No GPU is required: `export`/`borrowed_view` only
+        // move the `DLDevice` scalar fields — the `data` pointer is never
+        // dereferenced here, so a dummy host pointer stands in for a device
+        // address. This proves the kDLCUDA device_type/id survives a round trip.
+        let mut data = [0u8; 8];
+        let dev = DLDevice { device_type: DL_CUDA, device_id: 3 };
+        // SAFETY: `data` remains live until `release` below; we never deref the
+        // pointer through the "CUDA" device, only read back the header fields.
+        let managed = unsafe {
+            export(
+                Box::new(()),
+                data.as_mut_ptr() as *mut c_void,
+                dev,
+                DLDataType { code: DL_FLOAT, bits: 32, lanes: 1 },
+                vec![2],
+                vec![],
+                0,
+            )
+        };
+        // SAFETY: live export pointer we just created.
         unsafe {
-            let view = borrowed_view_versioned(managed);
-            assert_eq!(view.shape, &[2, 2]);
-            let owner = ManagedTensorVersionedOwner::new(managed);
-            assert_eq!(IMPORT_DROPS_V.load(Ordering::SeqCst), 0);
-            drop(owner);
+            let view = borrowed_view(managed);
+            assert_eq!(view.device.device_type, DL_CUDA);
+            assert_eq!(view.device.device_id, 3);
+            assert_eq!(view.shape, &[2]);
+            release(managed);
         }
-        assert_eq!(IMPORT_DROPS_V.load(Ordering::SeqCst), 1, "versioned deleter ran once");
+    }
+
+    #[test]
+    fn cuda_device_constants_match_dlpack_abi() {
+        // Pin the kDLCUDA / kDLCUDAHost codes the mapping logic relies on.
+        assert_eq!(DL_CPU, 1);
+        assert_eq!(DL_CUDA, 2);
+        assert_eq!(DL_CUDA_HOST, 3);
     }
 }

@@ -1109,18 +1109,19 @@ fn get_available_providers() -> Vec<String> {
 }
 
 /// Test-only: import `obj` via the zero-copy DLPack consumer path and return the
-/// borrowed tensor's first-element data pointer as an integer, or `None` if the
-/// value fell back to the copy path (non-CPU, non-contiguous, empty, unaligned,
-/// overflowing, unsupported dtype).
+/// borrowed tensor's base data pointer as an integer, or `None` if the value
+/// fell back to the copy path (non-borrowable device, non-contiguous, empty,
+/// unaligned, overflowing, unsupported dtype).
 ///
 /// This is the only layer that can *prove* a zero-copy borrow: a Python test
 /// compares this pointer against the source buffer's own address
-/// (`ndarray.ctypes.data` / `torch tensor.data_ptr()`); equality means no copy
-/// happened. Underscore-prefixed and undocumented in the public API.
+/// (`ndarray.ctypes.data` / `torch tensor.data_ptr()`, including CUDA device
+/// pointers); equality means no copy happened. Underscore-prefixed and
+/// undocumented in the public API.
 #[pyfunction]
 fn _dlpack_import_data_ptr(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResult<Option<usize>> {
     match dlpack::tensor_from_dlpack(py, obj)? {
-        Some(t) => Ok(Some(t.as_bytes().as_ptr() as usize)),
+        Some(t) => Ok(Some(t.device_ptr() as usize)),
         None => Ok(None),
     }
 }
@@ -1147,6 +1148,50 @@ fn _dlpack_import_drop_on_thread(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyRe
         std::thread::spawn(move || drop(tensor)).join().expect("drop thread panicked");
     });
     Ok(true)
+}
+
+/// Lazily create (and cache per device ordinal) a CUDA execution provider to
+/// back a zero-copy DLPack-imported CUDA tensor.
+///
+/// A DLPack-imported tensor carries a **borrowed** buffer, so this EP never
+/// frees the aliased device memory (`deallocate` is a no-op for borrowed
+/// buffers). Its only role is to report `CUDA:ordinal` so the executor routes
+/// the imported input to the GPU. The provider is cached process-wide per
+/// ordinal so repeated imports on the same device reuse one context.
+///
+/// Only compiled with the `cuda` feature; the default (CPU-only) build never
+/// reaches the CUDA import path (`plan_import` falls back to a copy there).
+#[cfg(feature = "cuda")]
+pub(crate) fn cuda_import_allocator(
+    index: u32,
+) -> PyResult<std::sync::Arc<dyn onnx_runtime_ep_api::ExecutionProvider>> {
+    use onnx_runtime_ep_api::ExecutionProvider;
+    use onnx_runtime_ep_cuda::CudaExecutionProvider;
+    use std::sync::{Arc, OnceLock};
+
+    type Cache = Mutex<Vec<(u32, Arc<CudaExecutionProvider>)>>;
+    static CACHE: OnceLock<Cache> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(Vec::new()));
+    let mut guard = cache
+        .lock()
+        .map_err(|_| PyRuntimeError::new_err("cuda import-allocator cache poisoned"))?;
+    if let Some((_, ep)) = guard.iter().find(|(i, _)| *i == index) {
+        return Ok(ep.clone());
+    }
+    let mut ep = CudaExecutionProvider::new(index).map_err(|e| {
+        PyRuntimeError::new_err(format!(
+            "failed to initialize CUDA device {index} for a zero-copy DLPack \
+             import: {e}"
+        ))
+    })?;
+    ep.initialize(&Default::default()).map_err(|e| {
+        PyRuntimeError::new_err(format!(
+            "failed to bind CUDA device {index} for a zero-copy DLPack import: {e}"
+        ))
+    })?;
+    let ep = Arc::new(ep);
+    guard.push((index, ep.clone()));
+    Ok(ep)
 }
 
 /// Return whether CUDA 13 CUPTI can be loaded for GPU tracing.

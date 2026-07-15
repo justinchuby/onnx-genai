@@ -255,6 +255,36 @@ impl Tensor {
         self.shape.iter().product()
     }
 
+    /// Base pointer of this tensor's backing allocation.
+    ///
+    /// For host-accessible devices (CPU, MLX) this is a dereferenceable host
+    /// pointer; for device memory (CUDA/ROCm) it is an **opaque device address**
+    /// only meaningful inside the owning EP's context — never dereference it on
+    /// the host. This is the device-agnostic base the zero-copy DLPack **export**
+    /// path hands to a consumer, so a CUDA-resident output can be borrowed as a
+    /// `kDLCUDA` tensor without a host round-trip. Returns null for an empty
+    /// (zero-element) tensor.
+    pub fn device_ptr(&self) -> *const std::ffi::c_void {
+        if self.numel() == 0 {
+            std::ptr::null()
+        } else {
+            self.buffer().as_ptr()
+        }
+    }
+
+    /// Block until all pending work on the owning EP's stream completes.
+    ///
+    /// Device-agnostic: the CPU EP's `sync` is a no-op, while the CUDA EP fully
+    /// synchronizes its compute stream. The DLPack **export** path calls this
+    /// before handing a `kDLCUDA` buffer to a foreign consumer, so the producer's
+    /// device work is guaranteed complete (and thus the data valid) regardless of
+    /// which stream the consumer reads on — the conservative, always-correct end
+    /// of the DLPack stream handshake.
+    pub fn sync(&self) -> Result<()> {
+        self.allocator.sync()?;
+        Ok(())
+    }
+
     fn buffer(&self) -> &DeviceBuffer {
         self.buffer
             .as_ref()
