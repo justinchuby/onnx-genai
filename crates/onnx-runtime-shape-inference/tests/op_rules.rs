@@ -837,6 +837,58 @@ fn layer_norm_main_and_reduced_outputs() {
     assert_eq!(mean, vec![sym(0), c(8), c(1)]);
 }
 
+#[test]
+fn rms_norm_passthrough() {
+    // Single output equal to X (opset 23).
+    let n = node("RMSNormalization", 2, 1);
+    let outs = run(
+        &n,
+        vec![f32in(vec![sym(0), c(8), c(768)]), f32in(vec![c(768)])],
+        23,
+    );
+    assert_eq!(out_shape(&outs), vec![sym(0), c(8), c(768)]);
+    assert_eq!(out_dtype(&outs), DataType::Float32);
+}
+
+#[test]
+fn rotary_embedding_passthrough_4d() {
+    // Output equals input X (opset 23), 4D [batch, heads, seq, head_size].
+    let n = node("RotaryEmbedding", 3, 1);
+    let outs = run(
+        &n,
+        vec![
+            f32in(vec![sym(0), c(12), c(16), c(64)]),
+            f32in(vec![c(16), c(32)]),
+            f32in(vec![c(16), c(32)]),
+        ],
+        23,
+    );
+    assert_eq!(out_shape(&outs), vec![sym(0), c(12), c(16), c(64)]);
+    assert_eq!(out_dtype(&outs), DataType::Float32);
+}
+
+#[test]
+fn swish_passthrough() {
+    // Elementwise, same shape/dtype (opset 24).
+    let n = with_attr(node("Swish", 1, 1), "alpha", Attribute::Float(1.0));
+    let outs = run(&n, vec![f32in(vec![sym(0), c(8), c(768)])], 24);
+    assert_eq!(out_shape(&outs), vec![sym(0), c(8), c(768)]);
+    assert_eq!(out_dtype(&outs), DataType::Float32);
+}
+
+#[test]
+fn std_gelu_passthrough() {
+    // Standard ai.onnx::Gelu (opset 20), same shape/dtype.
+    let n = with_attr(
+        node("Gelu", 1, 1),
+        "approximate",
+        Attribute::String(b"tanh".to_vec()),
+    );
+    let outs = run(&n, vec![f32in(vec![sym(0), c(8), c(768)])], 20);
+    assert_eq!(out_shape(&outs), vec![sym(0), c(8), c(768)]);
+    assert_eq!(out_dtype(&outs), DataType::Float32);
+}
+
 // --- Cast -----------------------------------------------------------------
 
 #[test]

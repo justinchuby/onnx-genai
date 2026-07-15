@@ -53,6 +53,8 @@ pub mod reduce;
 pub mod reduce_ops;
 pub mod relu;
 pub mod reshape;
+pub mod rmsnorm;
+pub mod rotary_embedding;
 pub mod selection;
 pub mod sequence;
 pub mod shape;
@@ -232,6 +234,32 @@ pub fn build_cpu_registry() -> OpRegistry {
     reg.register(
         OpKey::new("Gelu", "com.microsoft", 1),
         Box::new(gelu::GeluFactory),
+    );
+    // Standard-domain LLM/transformer primitives (ai.onnx). Registered at their
+    // ONNX since_version; the registry resolves the highest since_version <=
+    // model opset.
+    //
+    // `ai.onnx::Gelu` was added at opset 20 with the `approximate` attribute
+    // ("none" = exact erf, "tanh" = tanh approximation). Distinct from the
+    // com.microsoft::Gelu contrib op above.
+    reg.register(
+        OpKey::new("Gelu", "", 20),
+        Box::new(gelu::StdGeluFactory),
+    );
+    // `ai.onnx::RMSNormalization` added at opset 23.
+    reg.register(
+        OpKey::new("RMSNormalization", "", 23),
+        Box::new(rmsnorm::RmsNormFactory),
+    );
+    // `ai.onnx::RotaryEmbedding` added at opset 23.
+    reg.register(
+        OpKey::new("RotaryEmbedding", "", 23),
+        Box::new(rotary_embedding::RotaryEmbeddingFactory),
+    );
+    // `ai.onnx::Swish` added at opset 24: y = x·sigmoid(alpha·x).
+    reg.register(
+        OpKey::new("Swish", "", 24),
+        Box::new(activations::SwishFactory),
     );
     // Elementwise binary broadcasting ops.
     reg.register(OpKey::new("Sub", "", 1), Box::new(elementwise::SubFactory));
@@ -932,8 +960,11 @@ mod tests {
         // `FusedAttention` and the fused exact-GELU `Gelu` add contrib
         // (`com.microsoft`) entries. Standard `ai.onnx::Attention` is registered
         // at both opset 23 and 24 (two default-domain entries not in
-        // `PHASE1_OPS`), so the entry count is eight more than the op-name count.
-        assert_eq!(reg.len(), PHASE1_OPS.len() + 8);
+        // `PHASE1_OPS`). The standard LLM primitives `Gelu` (opset 20),
+        // `RMSNormalization` (23), `RotaryEmbedding` (23) and `Swish` (24) add
+        // four more default-domain entries not in `PHASE1_OPS`, so the entry
+        // count is twelve more than the op-name count.
+        assert_eq!(reg.len(), PHASE1_OPS.len() + 12);
         for op in PHASE1_OPS {
             assert!(reg.lookup(op, "", 21).is_some(), "missing factory for {op}");
         }
@@ -957,7 +988,18 @@ mod tests {
         // The exact-GELU fusion's contrib op has a CPU kernel (contrib-only).
         assert!(reg.supports("Gelu", "com.microsoft"));
         assert!(reg.lookup("Gelu", "com.microsoft", 1).is_some());
-        assert!(reg.lookup("Gelu", "", 21).is_none());
+        // Standard `ai.onnx::Gelu` (opset 20) is now registered in the default
+        // domain; it resolves at opset ≥ 20 but not below its since-version.
+        assert!(reg.lookup("Gelu", "", 21).is_some());
+        assert!(reg.lookup("Gelu", "", 20).is_some());
+        assert!(reg.lookup("Gelu", "", 19).is_none());
+        // Standard LLM primitives resolve at/after their since-versions.
+        assert!(reg.lookup("RMSNormalization", "", 23).is_some());
+        assert!(reg.lookup("RMSNormalization", "", 22).is_none());
+        assert!(reg.lookup("RotaryEmbedding", "", 23).is_some());
+        assert!(reg.lookup("RotaryEmbedding", "", 22).is_none());
+        assert!(reg.lookup("Swish", "", 24).is_some());
+        assert!(reg.lookup("Swish", "", 23).is_none());
         // Standard ai.onnx::Attention resolves at opsets 23–26 (default domain
         // and the `ai.onnx` alias), but not below its since-version. Opset 23
         // resolves to the v23 kernel; 24/25/26 resolve to the v24 kernel.

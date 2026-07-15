@@ -165,6 +165,8 @@ pub fn register(reg: &mut InferenceRegistry) {
     ] {
         reg.register("", op, 1, unary);
     }
+    // `ai.onnx::Swish` (opset 24): elementwise x·sigmoid(alpha·x), same-shape.
+    reg.register("", "Swish", 24, unary);
     for op in ["Add", "Sub", "Mul", "Div", "Pow"] {
         reg.register("", op, 1, binary);
     }

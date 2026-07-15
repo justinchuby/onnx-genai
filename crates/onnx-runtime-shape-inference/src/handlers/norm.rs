@@ -30,6 +30,23 @@ pub fn layer_norm(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
     Ok(())
 }
 
+/// `RMSNormalization`: output 0 is the input shape (single output, no optional
+/// mean/inv-std). Shape- and dtype-preserving like other norm ops.
+pub fn rms_norm(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
+    if let Some(x) = ctx.input_type(0).cloned() {
+        ctx.set_output_type(0, x);
+    }
+    Ok(())
+}
+
+/// `RotaryEmbedding`: output shape and dtype equal the input `X` (input 0).
+pub fn rotary_embedding(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
+    if let Some(x) = ctx.input_type(0).cloned() {
+        ctx.set_output_type(0, x);
+    }
+    Ok(())
+}
+
 /// `Softmax`/`LogSoftmax`: shape- and dtype-preserving.
 pub fn softmax(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
     if let Some(t) = ctx.input_type(0).cloned() {
@@ -123,6 +140,10 @@ pub fn register(reg: &mut InferenceRegistry) {
     );
     reg.register("", "Softmax", 1, softmax);
     reg.register("", "LogSoftmax", 1, softmax);
+    // Standard LLM/transformer norm primitives (ai.onnx): both are
+    // shape-preserving (output == input X).
+    reg.register("", "RMSNormalization", 23, rms_norm);
+    reg.register("", "RotaryEmbedding", 23, rotary_embedding);
 
     for op in [
         "ReduceMean",

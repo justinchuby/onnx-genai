@@ -10,6 +10,7 @@ enum Activation {
     Elu { alpha: f32 },
     LeakyRelu { alpha: f32 },
     HardSigmoid { alpha: f32, beta: f32 },
+    Swish { alpha: f32 },
 }
 
 impl Activation {
@@ -18,6 +19,7 @@ impl Activation {
             Self::Elu { .. } => "Elu",
             Self::LeakyRelu { .. } => "LeakyRelu",
             Self::HardSigmoid { .. } => "HardSigmoid",
+            Self::Swish { .. } => "Swish",
         }
     }
 
@@ -38,6 +40,18 @@ impl Activation {
                 }
             }
             Self::HardSigmoid { alpha, beta } => (alpha * x + beta).clamp(0.0, 1.0),
+            // Swish/SiLU: x·sigmoid(alpha·x), evaluated via the numerically
+            // stable logistic to avoid overflow at large-magnitude inputs.
+            Self::Swish { alpha } => {
+                let z = alpha * x;
+                let s = if z >= 0.0 {
+                    1.0 / (1.0 + (-z).exp())
+                } else {
+                    let e = z.exp();
+                    e / (1.0 + e)
+                };
+                x * s
+            }
         }
     }
 }
@@ -49,6 +63,7 @@ pub struct ActivationKernel {
 pub struct EluFactory;
 pub struct LeakyReluFactory;
 pub struct HardSigmoidFactory;
+pub struct SwishFactory;
 
 impl KernelFactory for EluFactory {
     fn create(&self, node: &Node, _shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
@@ -79,6 +94,16 @@ impl KernelFactory for HardSigmoidFactory {
             activation: Activation::HardSigmoid {
                 alpha: node.attr("alpha").and_then(|a| a.as_float()).unwrap_or(0.2),
                 beta: node.attr("beta").and_then(|a| a.as_float()).unwrap_or(0.5),
+            },
+        }))
+    }
+}
+
+impl KernelFactory for SwishFactory {
+    fn create(&self, node: &Node, _shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
+        Ok(Box::new(ActivationKernel {
+            activation: Activation::Swish {
+                alpha: node.attr("alpha").and_then(|a| a.as_float()).unwrap_or(1.0),
             },
         }))
     }
@@ -129,5 +154,32 @@ mod tests {
         .execute(&[x.view()], &mut [out.view_mut()])
         .unwrap();
         assert_eq!(out.to_f32(), vec![0.3, 0.5, 0.7]);
+    }
+
+    #[test]
+    fn swish_default_and_alpha() {
+        let x = Owned::f32(&[3], &[-1.0, 0.0, 2.0]);
+        let mut out = Owned::zeros_f32(&[3]);
+        // alpha=1 (SiLU): y = x·sigmoid(x).
+        ActivationKernel {
+            activation: Activation::Swish { alpha: 1.0 },
+        }
+        .execute(&[x.view()], &mut [out.view_mut()])
+        .unwrap();
+        let sig = |z: f32| 1.0 / (1.0 + (-z).exp());
+        let want = [-1.0 * sig(-1.0), 0.0, 2.0 * sig(2.0)];
+        for (g, w) in out.to_f32().iter().zip(&want) {
+            assert!((g - w).abs() < 1e-6, "got {g}, want {w}");
+        }
+        // alpha=2: y = x·sigmoid(2x).
+        ActivationKernel {
+            activation: Activation::Swish { alpha: 2.0 },
+        }
+        .execute(&[x.view()], &mut [out.view_mut()])
+        .unwrap();
+        let want2 = [-1.0 * sig(-2.0), 0.0, 2.0 * sig(4.0)];
+        for (g, w) in out.to_f32().iter().zip(&want2) {
+            assert!((g - w).abs() < 1e-6, "got {g}, want {w}");
+        }
     }
 }
