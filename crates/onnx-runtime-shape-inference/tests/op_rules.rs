@@ -545,6 +545,145 @@ fn relu_passthrough() {
     assert_eq!(out_dtype(&outs), DataType::Float32);
 }
 
+#[test]
+fn acos_passthrough() {
+    let n = node("Acos", 1, 1);
+    let outs = run(&n, vec![f32in(vec![sym(0), c(8), c(768)])], 7);
+    assert_eq!(out_shape(&outs), vec![sym(0), c(8), c(768)]);
+    assert_eq!(out_dtype(&outs), DataType::Float32);
+}
+
+// --- Selection ------------------------------------------------------------
+
+#[test]
+fn argmax_keepdims_variants_return_int64() {
+    let input = f32in(vec![c(2), c(3), c(4)]);
+    let keep = with_attr(node("ArgMax", 1, 1), "axis", Attribute::Int(1));
+    let outs = run(&keep, vec![input.clone()], 13);
+    assert_eq!(out_shape(&outs), vec![c(2), c(1), c(4)]);
+    assert_eq!(out_dtype(&outs), DataType::Int64);
+
+    let drop = with_attr(
+        with_attr(node("ArgMax", 1, 1), "axis", Attribute::Int(1)),
+        "keepdims",
+        Attribute::Int(0),
+    );
+    let outs = run(&drop, vec![input], 13);
+    assert_eq!(out_shape(&outs), vec![c(2), c(4)]);
+    assert_eq!(out_dtype(&outs), DataType::Int64);
+}
+
+#[test]
+fn argmin_returns_int64() {
+    let n = with_attr(node("ArgMin", 1, 1), "keepdims", Attribute::Int(0));
+    let outs = run(&n, vec![f32in(vec![c(2), c(3)])], 12);
+    assert_eq!(out_shape(&outs), vec![c(3)]);
+    assert_eq!(out_dtype(&outs), DataType::Int64);
+}
+
+#[test]
+fn topk_outputs_and_dynamic_k() {
+    let n = with_attr(node("TopK", 2, 2), "axis", Attribute::Int(-1));
+    let outs = run(
+        &n,
+        vec![f32in(vec![c(2), c(8)]), sd_vec(vec![c(3)])],
+        11,
+    );
+    assert_eq!(out_shape(&outs), vec![c(2), c(3)]);
+    assert_eq!(out_dtype(&outs), DataType::Float32);
+    assert_eq!(outs[1].type_info.as_ref().unwrap().shape, vec![c(2), c(3)]);
+    assert_eq!(outs[1].type_info.as_ref().unwrap().dtype, DataType::Int64);
+
+    let outs = run(
+        &n,
+        vec![f32in(vec![c(2), c(8)]), tin(DataType::Int64, vec![])],
+        11,
+    );
+    let shape = out_shape(&outs);
+    assert_eq!(shape.len(), 2);
+    assert_eq!(shape[0], c(2));
+    assert!(shape[1].as_symbol().is_some());
+    assert_eq!(outs[1].type_info.as_ref().unwrap().dtype, DataType::Int64);
+}
+
+#[test]
+fn topk_v1_reads_k_attribute() {
+    let n = with_attr(node("TopK", 1, 2), "k", Attribute::Int(2));
+    let outs = run(&n, vec![f32in(vec![c(3), c(8)])], 1);
+    assert_eq!(out_shape(&outs), vec![c(3), c(2)]);
+    assert_eq!(outs[1].type_info.as_ref().unwrap().dtype, DataType::Int64);
+}
+
+#[test]
+fn tile_static_repeats() {
+    let n = node("Tile", 2, 1);
+    let outs = run(
+        &n,
+        vec![f32in(vec![c(2), c(3), c(4)]), sd_vec(vec![c(1), c(2), c(3)])],
+        13,
+    );
+    assert_eq!(out_shape(&outs), vec![c(2), c(6), c(12)]);
+    assert_eq!(out_dtype(&outs), DataType::Float32);
+}
+
+#[test]
+fn tile_v1_reads_axis_and_tiles_attributes() {
+    let n = with_attr(
+        with_attr(node("Tile", 1, 1), "axis", Attribute::Int(1)),
+        "tiles",
+        Attribute::Int(3),
+    );
+    let outs = run(&n, vec![f32in(vec![c(2), c(4)])], 1);
+    assert_eq!(out_shape(&outs), vec![c(2), c(12)]);
+}
+
+#[test]
+fn range_static_and_dynamic() {
+    let n = node("Range", 3, 1);
+    let scalar = |value| NodeIo {
+        type_info: Some(TypeInfo::new(DataType::Int64, vec![])),
+        shape_data: Some(ShapeData::scalar(DataType::Int64, c(value))),
+    };
+    let outs = run(&n, vec![scalar(1), scalar(10), scalar(2)], 11);
+    assert_eq!(out_shape(&outs), vec![c(5)]);
+    assert_eq!(out_dtype(&outs), DataType::Int64);
+
+    let outs = run(
+        &n,
+        vec![
+            tin(DataType::Int64, vec![]),
+            tin(DataType::Int64, vec![]),
+            tin(DataType::Int64, vec![]),
+        ],
+        11,
+    );
+    let shape = out_shape(&outs);
+    assert_eq!(shape.len(), 1);
+    assert!(shape[0].as_symbol().is_some());
+}
+
+#[test]
+fn cumsum_passthrough() {
+    let n = node("CumSum", 2, 1);
+    let outs = run(
+        &n,
+        vec![f32in(vec![sym(0), c(8)]), tin(DataType::Int64, vec![])],
+        14,
+    );
+    assert_eq!(out_shape(&outs), vec![sym(0), c(8)]);
+    assert_eq!(out_dtype(&outs), DataType::Float32);
+}
+
+#[test]
+fn nonzero_rank_and_dynamic_nnz() {
+    let n = node("NonZero", 1, 1);
+    let outs = run(&n, vec![f32in(vec![c(2), c(3), c(4)])], 13);
+    let shape = out_shape(&outs);
+    assert_eq!(shape[0], c(3));
+    assert!(shape[1].as_symbol().is_some());
+    assert_eq!(out_dtype(&outs), DataType::Int64);
+}
+
 // --- Reshape (shape-data) -------------------------------------------------
 
 #[test]
@@ -661,6 +800,22 @@ fn gather_shape_data_selects_dim() {
     let outs = run(&n, vec![shape_out, idx], 13);
     let sd = outs[0].shape_data.as_ref().expect("gather shape-data");
     assert_eq!(sd.elems, vec![sym(0)]);
+}
+
+#[test]
+fn gather_nd_canonical_shape() {
+    // data [2, 3, 4], indices [5, 2] -> [5, 4].
+    let n = node("GatherND", 2, 1);
+    let outs = run(
+        &n,
+        vec![
+            f32in(vec![c(2), c(3), c(4)]),
+            tin(DataType::Int64, vec![c(5), c(2)]),
+        ],
+        13,
+    );
+    assert_eq!(out_shape(&outs), vec![c(5), c(4)]);
+    assert_eq!(out_dtype(&outs), DataType::Float32);
 }
 
 // --- Concat ---------------------------------------------------------------

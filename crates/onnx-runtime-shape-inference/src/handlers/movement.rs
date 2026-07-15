@@ -566,6 +566,50 @@ pub fn gather_elements(ctx: &mut InferenceContext) -> Result<(), ShapeInferError
     Ok(())
 }
 
+/// `GatherND`: `data[:batch_dims] + indices[batch_dims:-1] +
+/// data[batch_dims + indices[-1]:]`.
+pub fn gather_nd(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
+    let Some(data) = ctx.input_shape(0).map(<[DimExpr]>::to_vec) else {
+        return Ok(());
+    };
+    let Some(indices) = ctx.input_shape(1).map(<[DimExpr]>::to_vec) else {
+        return Ok(());
+    };
+    let Some(dtype) = ctx.input_dtype(0) else {
+        return Ok(());
+    };
+    let Some(index_depth) = indices.last().and_then(DimExpr::as_const) else {
+        // The index-tuple depth determines the output rank. Without it, retain
+        // the crate's unknown-rank representation (no TypeInfo).
+        return Ok(());
+    };
+    let batch_dims = ctx
+        .node
+        .attr("batch_dims")
+        .and_then(Attribute::as_int)
+        .unwrap_or(0);
+    if batch_dims < 0 {
+        return Ok(());
+    }
+    let batch_dims = batch_dims as usize;
+    let Ok(index_depth) = usize::try_from(index_depth) else {
+        return Ok(());
+    };
+    if batch_dims > data.len()
+        || batch_dims >= indices.len()
+        || index_depth > data.len().saturating_sub(batch_dims)
+    {
+        return Ok(());
+    }
+
+    let mut out = Vec::with_capacity(data.len() + indices.len() - index_depth - 1);
+    out.extend_from_slice(&data[..batch_dims]);
+    out.extend(indices[batch_dims..indices.len() - 1].iter().cloned());
+    out.extend_from_slice(&data[batch_dims + index_depth..]);
+    ctx.set_output(0, dtype, out);
+    Ok(())
+}
+
 /// Read an integer-list attribute.
 fn attr_ints(ctx: &InferenceContext, name: &str) -> Option<Vec<i64>> {
     ctx.node
@@ -591,4 +635,7 @@ pub fn register(reg: &mut InferenceRegistry) {
     reg.register("", "Split", 1, split);
     reg.register("", "Gather", 1, gather);
     reg.register("", "GatherElements", 1, gather_elements);
+    reg.register("", "GatherND", 11, gather_nd);
+    reg.register("", "GatherND", 12, gather_nd);
+    reg.register("", "GatherND", 13, gather_nd);
 }

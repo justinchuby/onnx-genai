@@ -14,6 +14,8 @@ mod linalg;
 mod movement;
 mod norm;
 mod pooling;
+mod selection;
+mod sequence;
 
 /// Normalise an ONNX axis (which may be negative) into `0..rank`.
 ///
@@ -33,4 +35,6 @@ pub fn register_all(registry: &mut InferenceRegistry) {
     movement::register(registry);
     data_ops::register(registry);
     pooling::register(registry);
+    selection::register(registry);
+    sequence::register(registry);
 }

@@ -164,6 +164,15 @@ pub fn register(reg: &mut InferenceRegistry) {
     ] {
         reg.register("", op, 1, unary);
     }
+    for op in ["Acos", "Asin", "Atan", "Tan"] {
+        reg.register("", op, 7, unary);
+    }
+    for op in ["Acosh", "Asinh", "Atanh", "Cosh", "Sinh"] {
+        reg.register("", op, 9, unary);
+    }
+    for op in ["Clip", "Elu", "HardSigmoid", "LeakyRelu"] {
+        reg.register("", op, 1, unary);
+    }
     // `ai.onnx::Gelu` (opset 20): same-shape elementwise activation. Registered
     // at its since_version so shape-inference membership agrees with the CPU
     // kernel (also opset 20); the contrib `com.microsoft::Gelu` is separate.
