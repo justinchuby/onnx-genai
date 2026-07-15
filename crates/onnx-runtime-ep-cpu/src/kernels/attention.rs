@@ -27,14 +27,15 @@
 //! ## Versioning (opset 23 vs 24–26)
 //!
 //! `Attention` was added at opset 23 and revised at opset 24 (no newer version
-//! exists, so a single opset-24 kernel serves model opsets 24, 25 and 26). Two
-//! semantic deltas are handled per registered `since_version`:
+//! exists, so a single opset-24 kernel serves model opsets 24, 25 and 26). The
+//! one semantic delta handled per registered `since_version`:
 //!
-//! * `qk_matmul_output_mode` values **1 and 2 were swapped** in opset 24. The
-//!   v24+ kernel uses `1` = after softcap, `2` = after mask; the v23 kernel uses
-//!   the original (reversed) meaning.
 //! * `nonpad_kv_seqlen` (7th input) — an external-cache per-batch valid-token
 //!   count — is honored for v24+ and rejected for v23 (it did not exist there).
+//!
+//! `qk_matmul_output_mode` has the **same** meaning in both versions (the opset
+//! 23 and 24 schema descriptions are identical): `0` = raw QK, `1` = after
+//! softcap (before mask), `2` = after mask+softcap, `3` = after softmax.
 //!
 //! ## Supported vs. unimplemented
 //!
@@ -60,7 +61,7 @@ pub struct AttentionKernel {
     /// Softcap value; `0.0` disables it.
     softcap: f32,
     /// The registered opset version this kernel serves (23, or 24 for 24–26).
-    /// Controls the `qk_matmul_output_mode` 1↔2 swap and `nonpad_kv_seqlen`.
+    /// Controls `nonpad_kv_seqlen` acceptance (opset 24+ only).
     since_version: u32,
 }
 
@@ -465,13 +466,10 @@ impl Kernel for AttentionKernel {
             Vec::new()
         };
 
-        // `qk_matmul_output_mode` 1 and 2 were swapped in opset 24: v24+ uses
-        // 1 = after softcap, 2 = after mask; v23 uses the reverse.
-        let (softcap_mode, mask_mode) = if self.since_version >= 24 {
-            (1, 2)
-        } else {
-            (2, 1)
-        };
+        // `qk_matmul_output_mode` has the same meaning across opsets 23–26 (the
+        // schema descriptions are identical): 1 = after softcap (before mask),
+        // 2 = after mask+softcap.
+        let (softcap_mode, mask_mode) = (1, 2);
 
         let mut scores = vec![0.0f32; total_seq];
         for b in 0..batch {
@@ -514,7 +512,7 @@ impl Kernel for AttentionKernel {
                             *sc = self.softcap * (*sc / self.softcap).tanh();
                         }
                     }
-                    // qk mode after-softcap (v24: 1, v23: 2), before mask.
+                    // qk mode 1: after softcap, before mask.
                     if want_qk && self.qk_matmul_output_mode == softcap_mode {
                         let base = ((b * q_heads + qh) * q_seq + i) * total_seq;
                         qk_out[base..base + total_seq].copy_from_slice(&scores);
@@ -536,7 +534,7 @@ impl Kernel for AttentionKernel {
                         let bias = mask.bias(b, qh, i, j, total_seq);
                         *sc += bias;
                     }
-                    // qk mode after-mask (v24: 2, v23: 1), before softmax.
+                    // qk mode 2: after mask+softcap, before softmax.
                     if want_qk && self.qk_matmul_output_mode == mask_mode {
                         let base = ((b * q_heads + qh) * q_seq + i) * total_seq;
                         qk_out[base..base + total_seq].copy_from_slice(&scores);
@@ -1502,9 +1500,10 @@ mod tests {
     // ---- Job B: opset-24 semantic deltas ----
 
     #[test]
-    fn qk_modes_per_version_swap() {
-        // Modes 0 and 3 are version-independent; modes 1 and 2 are swapped
-        // between opset 23 and 24.
+    fn qk_modes_are_version_independent() {
+        // All four modes have the SAME meaning across opsets 23–26 (the schema
+        // descriptions are identical): 0 = raw scaled QK, 1 = after softcap,
+        // 2 = after mask+softcap, 3 = after softmax. There is no 1↔2 swap.
         let (b, h, sq, sk, d, dv) = (1, 1, 1, 2, 2, 2);
         let scale = 0.5f32;
         let softcap = 3.0f32;
@@ -1554,12 +1553,11 @@ mod tests {
         approx(&run(23, 0), &scaled, 1e-5);
         approx(&run(24, 3), &softmaxed, 1e-5);
         approx(&run(23, 3), &softmaxed, 1e-5);
-        // v24: 1 = after softcap, 2 = after mask.
+        // Modes are version-independent: 1 = after softcap, 2 = after mask.
         approx(&run(24, 1), &capped, 1e-5);
         approx(&run(24, 2), &masked, 1e-5);
-        // v23: swapped — 1 = after mask, 2 = after softcap.
-        approx(&run(23, 1), &masked, 1e-5);
-        approx(&run(23, 2), &capped, 1e-5);
+        approx(&run(23, 1), &capped, 1e-5);
+        approx(&run(23, 2), &masked, 1e-5);
     }
 
     #[test]
