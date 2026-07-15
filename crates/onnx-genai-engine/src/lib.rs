@@ -17,6 +17,8 @@ pub mod engine;
 pub mod fim;
 pub(crate) mod kv_bridge;
 pub mod logits;
+#[cfg(feature = "native-backend")]
+pub mod native_decode;
 pub mod pipeline;
 pub(crate) mod processors;
 pub mod sampling;
@@ -39,6 +41,8 @@ pub use logits::{
     Constraint, ConstraintProcessor, JsonConstraint, LogitProcessor, ProcessorChain,
     ProcessorChainBuilder, ProcessorContext, ProcessorSignal, StopSequence, TokenId,
 };
+#[cfg(feature = "native-backend")]
+pub use native_decode::{NativeDecodeDevice, NativeDecodeSession};
 pub use onnx_genai_kv::{CachePriority, KvDType, LocalTieredConfig};
 pub use onnx_genai_scheduler::{
     GovernorReconfigureOutcome, GovernorSnapshot, ResourceLimit, ResourceLimits,

@@ -59,9 +59,12 @@ pub(crate) trait DecodeBackend {
 }
 
 #[allow(clippy::large_enum_variant)]
+#[allow(dead_code)]
 enum DecodeRunner {
     StaticCache(StaticCacheDecodeSession<'static>),
     PastPresent(DecodeSession<'static>),
+    #[cfg(feature = "native-backend")]
+    Native(crate::native_decode::NativeDecodeSession),
 }
 
 impl DecodeRunner {
@@ -69,6 +72,8 @@ impl DecodeRunner {
         match self {
             DecodeRunner::StaticCache(runner) => runner,
             DecodeRunner::PastPresent(runner) => runner,
+            #[cfg(feature = "native-backend")]
+            DecodeRunner::Native(runner) => runner,
         }
     }
 }
@@ -279,6 +284,8 @@ impl DecodeState {
         match &self.runner {
             Some(DecodeRunner::StaticCache(session)) => session.current_len(),
             Some(DecodeRunner::PastPresent(session)) => session.past_len(),
+            #[cfg(feature = "native-backend")]
+            Some(DecodeRunner::Native(session)) => session.current_len(),
             None => 0,
         }
     }
@@ -287,6 +294,8 @@ impl DecodeState {
         match &mut self.runner {
             Some(DecodeRunner::StaticCache(session)) => session.rewind(target_len)?,
             Some(DecodeRunner::PastPresent(session)) => session.rewind(target_len)?,
+            #[cfg(feature = "native-backend")]
+            Some(DecodeRunner::Native(session)) => session.rewind(target_len)?,
             None => {
                 self.past.clear();
             }

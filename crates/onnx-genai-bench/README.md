@@ -45,9 +45,9 @@ The opt-in profiling binaries measure different layers:
 
 - `bench-ort` / `profile_decode` measures token generation through the
   `onnx-genai` engine and `onnx-genai-ort` (ORT CUDA EP).
-- `bench-native` / `profile_native` measures repeated whole-model
-  `onnx-runtime-session::InferenceSession::run` calls through nxrt's pure-Rust
-  CPU runtime.
+- `bench-native` / `profile_native` measures token generation through the
+  native nxrt decoder-with-past adapter and the same engine decode loop as ORT,
+  with forward passes through `onnx-runtime-session::InferenceSession::run`.
 
 These results are **not yet comparable head-to-head**. The ORT path has a
 generation loop, I/O binding, and KV-cache decode flow. The native session

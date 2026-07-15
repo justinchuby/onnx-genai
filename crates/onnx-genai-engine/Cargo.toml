@@ -10,10 +10,15 @@ categories = ["science", "text-processing"]
 
 [features]
 default = []
+native-backend = [
+    "dep:onnx-runtime-ep-cpu",
+    "dep:onnx-runtime-ir",
+    "dep:onnx-runtime-session",
+]
 # Forwards to `onnx-genai-ort/cuda` so the CUDA execution provider is compiled
 # in. Runtime EP selection still goes through `ONNX_GENAI_EP`; without this
 # feature a `cuda` request silently falls back to CPU.
-cuda = ["onnx-genai-ort/cuda"]
+cuda = ["onnx-genai-ort/cuda", "dep:onnx-runtime-ep-cuda"]
 
 [dependencies]
 onnx-genai-metadata = { workspace = true }
@@ -22,6 +27,10 @@ onnx-genai-kv = { workspace = true }
 onnx-genai-scheduler = { workspace = true }
 onnx-genai-ort = { workspace = true }
 onnx-genai-runtime-config = { workspace = true }
+onnx-runtime-ep-cpu = { workspace = true, optional = true }
+onnx-runtime-ep-cuda = { workspace = true, optional = true }
+onnx-runtime-ir = { workspace = true, optional = true }
+onnx-runtime-session = { workspace = true, optional = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }

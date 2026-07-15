@@ -1,16 +1,12 @@
-//! Native nxrt single-inference profiler.
-//!
-//! The native session API currently exposes one named-input `run` call and is
-//! CPU-only. It does not yet expose I/O binding, KV-cache rotation, generation,
-//! or session-level CUDA graph capture/replay, so this tool measures repeated
-//! whole-model inference rather than token generation.
+//! Native nxrt token-generation profiler using the engine's shared decode loop.
 
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, ValueEnum};
-use onnx_runtime_session::{InferenceSession, Tensor};
+use onnx_genai_engine::{GenerateOptions, NativeDecodeDevice, NativeDecodeSession, ProcessorChain};
+use onnx_genai_ort::Tokenizer;
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum ExecutionProvider {
@@ -19,28 +15,21 @@ enum ExecutionProvider {
 }
 
 #[derive(Debug, Parser)]
-#[command(about = "Profile repeated whole-model inference through native nxrt")]
+#[command(about = "Profile native nxrt token generation through the engine decode loop")]
 struct Args {
-    /// ONNX model file, or a directory containing model.onnx.
+    /// ONNX model file, or a directory containing model.onnx and tokenizer.json.
     #[arg(long)]
     model: PathBuf,
-
-    /// Repeated inference calls per measured run (not generated tokens).
     #[arg(long, default_value_t = 128)]
     tokens: usize,
-
     #[arg(long, default_value_t = 1)]
     warmups: usize,
-
     #[arg(long, default_value_t = 1)]
     runs: usize,
-
     #[arg(long, value_enum, default_value_t = ExecutionProvider::Cpu)]
     ep: ExecutionProvider,
-
-    /// Request native CUDA graph capture/replay when it becomes available.
-    #[arg(long)]
-    cuda_graph: bool,
+    #[arg(long, default_value = "Hello")]
+    prompt: String,
 }
 
 fn model_file(path: &Path) -> PathBuf {
@@ -51,47 +40,29 @@ fn model_file(path: &Path) -> PathBuf {
     }
 }
 
-fn zero_inputs(session: &InferenceSession) -> Result<Vec<(String, Tensor)>> {
-    session
-        .inputs()
-        .iter()
-        .map(|meta| {
-            let shape: Vec<usize> = meta
-                .shape
-                .iter()
-                .map(|dim| dim.as_static().unwrap_or(1))
-                .collect();
-            let elements = shape
-                .iter()
-                .try_fold(1usize, |n, &dim| n.checked_mul(dim))
-                .with_context(|| format!("input {} shape overflows usize", meta.name))?;
-            let bytes = meta
-                .dtype
-                .checked_storage_bytes(elements)
-                .filter(|&size| size != 0)
-                .with_context(|| {
-                    format!(
-                        "cannot synthesize input {} with dtype {:?}",
-                        meta.name, meta.dtype
-                    )
-                })?;
-            let tensor = Tensor::from_raw(meta.dtype, shape, &vec![0; bytes])
-                .with_context(|| format!("create zero input {}", meta.name))?;
-            Ok((meta.name.clone(), tensor))
-        })
-        .collect()
+fn tokenizer_file(path: &Path) -> PathBuf {
+    if path.is_dir() {
+        path.join("tokenizer.json")
+    } else {
+        path.parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("tokenizer.json")
+    }
 }
 
-fn run_once(session: &mut InferenceSession, inputs: &[(String, Tensor)]) -> Result<()> {
-    let bindings: Vec<(&str, &Tensor)> = inputs
-        .iter()
-        .map(|(name, tensor)| (name.as_str(), tensor))
-        .collect();
-    let outputs = session.run(&bindings).context(
-        "native session.run failed (an unsupported operator is expected while native op coverage grows)",
-    )?;
-    std::hint::black_box(outputs);
-    Ok(())
+fn generate(
+    session: &mut NativeDecodeSession,
+    prompt_tokens: &[u32],
+    tokenizer: &Tokenizer,
+    tokens: usize,
+) -> Result<usize> {
+    let mut options = GenerateOptions::default();
+    options.max_new_tokens = tokens;
+    options.temperature = 0.0;
+    options.greedy = true;
+    options.stop_on_eos = false;
+    let result = session.generate(prompt_tokens, &options, &ProcessorChain::new(), tokenizer)?;
+    Ok(result.token_ids.len())
 }
 
 fn main() -> Result<()> {
@@ -99,69 +70,50 @@ fn main() -> Result<()> {
     if args.tokens == 0 || args.runs == 0 {
         bail!("--tokens and --runs must be greater than zero");
     }
-
-    if matches!(args.ep, ExecutionProvider::Cuda) {
-        if args.cuda_graph {
-            eprintln!(
-                "native CUDA graph capture not yet wired at session level \
-                 (individual kernels expose cuda_graph_compatible() gating)"
-            );
-        }
-        bail!(
-            "native onnx-runtime-session is currently CPU-only; CUDA EP selection is not yet \
-             wired into SessionBuilder"
-        );
-    }
-    if args.cuda_graph {
-        eprintln!("--cuda-graph applies only to --ep cuda; continuing on CPU without capture");
-    }
-
+    let device = match args.ep {
+        ExecutionProvider::Cpu => NativeDecodeDevice::Cpu,
+        ExecutionProvider::Cuda => NativeDecodeDevice::Cuda { index: None },
+    };
     let model = model_file(&args.model);
+    let tokenizer = Tokenizer::from_file(tokenizer_file(&args.model))
+        .context("load tokenizer.json beside native decoder")?;
+    let prompt_tokens = tokenizer.encode(&args.prompt).context("tokenize prompt")?;
+    if prompt_tokens.is_empty() {
+        bail!("prompt tokenized to an empty sequence");
+    }
+    let mut session = NativeDecodeSession::load(&model, device)
+        .with_context(|| format!("load native decoder {}", model.display()))?;
+
     println!(
-        "profile_native: model={} ep=cpu repeated_inferences={} warmups={} runs={}",
+        "profile_native: model={} ep={:?} tokens={} warmups={} runs={}",
         model.display(),
+        args.ep,
         args.tokens,
         args.warmups,
         args.runs
     );
-    println!(
-        "mode: native whole-model session.run; no I/O binding/KV decode loop is available, \
-         so tok/s is not measurable"
-    );
-
-    let mut session = InferenceSession::load(&model)
-        .with_context(|| format!("load native model {}", model.display()))?;
-    let inputs = zero_inputs(&session)?;
-    println!(
-        "inputs: {} (symbolic dimensions synthesized as 1); outputs: {}",
-        inputs.len(),
-        session.outputs().len()
-    );
-
     for _ in 0..args.warmups {
-        for _ in 0..args.tokens {
-            run_once(&mut session, &inputs)?;
-        }
+        std::hint::black_box(generate(
+            &mut session,
+            &prompt_tokens,
+            &tokenizer,
+            args.tokens,
+        )?);
     }
 
-    let calls = args
-        .tokens
-        .checked_mul(args.runs)
-        .context("measured inference count overflows usize")?;
-    let start = Instant::now();
-    for _ in 0..calls {
-        run_once(&mut session, &inputs)?;
+    let mut generated = 0usize;
+    let mut elapsed = Duration::ZERO;
+    for _ in 0..args.runs {
+        let start = Instant::now();
+        generated += generate(&mut session, &prompt_tokens, &tokenizer, args.tokens)?;
+        elapsed += start.elapsed();
     }
-    let elapsed = start.elapsed();
-    let runs_per_second = calls as f64 / elapsed.as_secs_f64();
-    let milliseconds_per_run = elapsed.as_secs_f64() * 1_000.0 / calls as f64;
+    let tok_per_s = generated as f64 / elapsed.as_secs_f64();
+    let ms_per_step = elapsed.as_secs_f64() * 1_000.0 / generated as f64;
     println!(
-        "throughput: {:.2} runs/s, {:.3} ms/run ({} session.run calls in {:.3} ms)",
-        runs_per_second,
-        milliseconds_per_run,
-        calls,
+        "throughput: {tok_per_s:.2} tok/s, {ms_per_step:.3} ms/step \
+         ({generated} generated tokens in {:.3} ms)",
         elapsed.as_secs_f64() * 1_000.0
     );
-    println!("tok/s: unavailable (native generation/decode loop is not implemented)");
     Ok(())
 }
