@@ -1,0 +1,12 @@
+domain: ""
+name: MatMul
+since_version: 13
+doc: Matrix multiplication of two tensors.
+inputs:
+  - { name: A, type_str: T }
+  - { name: B, type_str: T }
+outputs:
+  - { name: Y, type_str: T }
+type_constraints:
+  - type_param: T
+    allowed: [float16, float32, float64, int32, int64, uint32, uint64, bfloat16]

@@ -27,11 +27,12 @@
 //! |------------|---------|--------|
 //! | §3.4 / §4  | [`load_model`] / [`save_model`] round-trip | ✅ |
 //! | §5         | [`Model::to_text`] readable dump | ✅ (dump only) |
-//! | §8         | [`check::OnnxChecker`] extensible validator | ✅ (3 built-in rules) |
+//! | §7         | [`schema`] op schemas and opset-aware registry | ✅ |
+//! | §8         | [`check::OnnxChecker`] extensible validator | ✅ (schema-aware) |
 //!
 //! Deferred to later waves (see `// FOLLOW-UP` markers): text *parse-back*
-//! (§5.4), JSON / TextProto (§6), the op-schema registry (§7), the full checker
-//! rule set (§8.2), shape inference wrapping (§9), the version converter (§10),
+//! (§5.4), JSON / TextProto (§6), the remaining checker rule set (§8.2), shape
+//! inference wrapping (§9), the version converter (§10),
 //! custom-op registration (§11), and Python bindings (§12).
 //!
 //! ## Example
@@ -50,6 +51,7 @@
 pub mod check;
 mod error;
 mod model;
+pub mod schema;
 pub mod text;
 
 pub use error::{Error, Result};
@@ -62,4 +64,8 @@ pub use onnx_runtime_ir as ir;
 pub use onnx_runtime_loader::{ModelMetadata, WeightStore};
 
 pub use check::{OnnxChecker, Severity, ValidationResult, ValidationRule, Violation};
+pub use schema::{
+    AttributeDefault, AttributeSpec, AttributeType, InputSpec, OpSchema, OutputSpec, SchemaError,
+    SchemaRegistry, TypeConstraint,
+};
 pub use text::PrintOptions;

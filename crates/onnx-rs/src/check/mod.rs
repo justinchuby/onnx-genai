@@ -2,9 +2,8 @@
 //!
 //! The architecture mirrors §8.1: a [`ValidationRule`] trait, a [`Severity`] /
 //! [`Violation`] model, and an [`OnnxChecker`] registry that runs an ordered set
-//! of rules and can be extended with custom ones (§8.3). Three built-in rules
-//! ship in this first wave (see [`rules`]); the full ONNX spec rule set and the
-//! schema-driven op-level rules are deferred to later waves.
+//! of rules and can be extended with custom ones (§8.3). The built-in rules
+//! include schema-driven node conformance (see [`rules`]).
 //!
 //! Note: the runtime [`onnx_runtime_loader`] already rejects many malformed
 //! models *at load time* (dangling refs, duplicate producers, missing opset
@@ -14,9 +13,12 @@
 
 mod rules;
 
-pub use rules::{DuplicateValueNameRule, GraphAcyclicRule, MissingOpsetImportRule};
+pub use rules::{
+    DuplicateValueNameRule, GraphAcyclicRule, MissingOpsetImportRule, SchemaNodeConformsRule,
+};
 
 use crate::model::Model;
+use crate::schema::SchemaRegistry;
 
 /// Severity of a [`Violation`] (ONNX_RS §8.1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -60,14 +62,30 @@ pub struct Violation {
 
 /// Shared context handed to every rule during a check.
 ///
-/// A placeholder for now; later waves will thread the op-schema registry
-/// (ONNX_RS §7) and version info through here so op-level rules can look up
-/// operator definitions.
-#[derive(Clone, Debug, Default)]
+/// The shared schema registry used by op-level validation rules.
+#[derive(Clone, Debug)]
 pub struct ValidationContext {
-    // FOLLOW-UP (ONNX_RS §7): carry the OpSchema registry so op-level rules
-    // (input/output arity, attribute types, type constraints) can be added.
-    _private: (),
+    schemas: std::sync::Arc<SchemaRegistry>,
+}
+
+impl ValidationContext {
+    /// Create a context backed by `schemas`.
+    pub fn new(schemas: SchemaRegistry) -> Self {
+        Self {
+            schemas: std::sync::Arc::new(schemas),
+        }
+    }
+
+    /// The schema registry visible to validation rules.
+    pub fn schemas(&self) -> &SchemaRegistry {
+        &self.schemas
+    }
+}
+
+impl Default for ValidationContext {
+    fn default() -> Self {
+        Self::new(SchemaRegistry::builtins())
+    }
 }
 
 /// A rule that checks one aspect of a model (ONNX_RS §8.1).
@@ -128,8 +146,15 @@ impl OnnxChecker {
         checker.add_rule(MissingOpsetImportRule);
         checker.add_rule(DuplicateValueNameRule);
         checker.add_rule(GraphAcyclicRule);
-        // FOLLOW-UP (ONNX_RS §8.2): add the remaining structural, type, and
-        // schema-driven op-level rules from the design.
+        checker.add_rule(SchemaNodeConformsRule);
+        // FOLLOW-UP (ONNX_RS §8.2): add the remaining structural and type rules.
+        checker
+    }
+
+    /// A standard checker using a caller-provided schema registry.
+    pub fn with_schema_registry(schemas: SchemaRegistry) -> Self {
+        let mut checker = Self::new();
+        checker.context = ValidationContext::new(schemas);
         checker
     }
 
@@ -234,5 +259,14 @@ mod tests {
         assert!(ids.contains(&"ir.opset_import_present"));
         assert!(ids.contains(&"structure.duplicate_value_name"));
         assert!(ids.contains(&"structure.graph_acyclic"));
+        assert!(ids.contains(&"schema.node_conforms"));
+    }
+
+    #[test]
+    fn validation_context_exposes_custom_registry() {
+        let context = ValidationContext::new(SchemaRegistry::new());
+        assert_eq!(context.schemas().iter().count(), 0);
+        let checker = OnnxChecker::with_schema_registry(SchemaRegistry::new());
+        assert!(checker.rule_ids().contains(&"schema.node_conforms"));
     }
 }

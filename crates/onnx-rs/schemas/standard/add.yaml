@@ -1,0 +1,12 @@
+domain: ""
+name: Add
+since_version: 14
+doc: Element-wise addition.
+inputs:
+  - { name: A, type_str: T }
+  - { name: B, type_str: T }
+outputs:
+  - { name: C, type_str: T }
+type_constraints:
+  - type_param: T
+    allowed: [float16, float32, float64, bfloat16, int8, int16, int32, int64, uint8, uint16, uint32, uint64]

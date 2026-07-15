@@ -1,0 +1,14 @@
+domain: ""
+name: If
+since_version: 21
+doc: Conditional execution of one of two subgraphs.
+attributes:
+  - { name: then_branch, type: graph, required: true }
+  - { name: else_branch, type: graph }
+inputs:
+  - { name: cond, type_str: B }
+outputs:
+  - { name: outputs, type_str: V, variadic: true }
+type_constraints:
+  - { type_param: B, allowed: [bool] }
+  - { type_param: V, allowed: [float16, float32, float64, bfloat16, int8, int16, int32, int64, uint8, uint16, uint32, uint64, bool, string] }

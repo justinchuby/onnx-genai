@@ -1,0 +1,11 @@
+domain: ""
+name: Identity
+since_version: 21
+doc: Copy a tensor unchanged.
+inputs:
+  - { name: input, type_str: V }
+outputs:
+  - { name: output, type_str: V }
+type_constraints:
+  - type_param: V
+    allowed: [float16, float32, float64, bfloat16, int8, int16, int32, int64, uint8, uint16, uint32, uint64, bool, string]

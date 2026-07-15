@@ -1857,6 +1857,8 @@ version = "0.1.0-dev.2"
 dependencies = [
  "onnx-runtime-ir",
  "onnx-runtime-loader",
+ "serde",
+ "serde_yaml",
  "thiserror 2.0.18",
 ]
 

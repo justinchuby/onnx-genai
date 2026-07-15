@@ -11,4 +11,6 @@ categories = ["science", "parser-implementations"]
 [dependencies]
 onnx-runtime-ir = { workspace = true }
 onnx-runtime-loader = { workspace = true }
+serde = { workspace = true }
+serde_yaml = { workspace = true }
 thiserror = { workspace = true }
