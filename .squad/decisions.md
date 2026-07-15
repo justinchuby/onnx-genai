@@ -925,3 +925,24 @@ CHANNEL/AVG results match element-for-element.
 **Corrective review:** Holden rejected the first version because empty typed lists were lossy and empty Graphs were dropped. Ripley, as lockout revision owner, added type-preserving empty-list syntax (for example `[]:floats`) including empty Graphs and variant-preserving round-trip tests. Holden re-reviewed 🟢; `onnx-rs` has **34** tests.
 
 **Sources:** `bryant-epcpu-gaps-3.md`, `sebastian-fairshare.md`, `zhora-onnx-rs-parseback.md`; Wave-3 correction outcomes supplied by the coordinator manifest.
+
+---
+
+## 2026-07-15 — Wave 4: Clip dtypes, CUDA batched MatMul, and ONNX-RS JSON serde
+
+### CPU Clip numeric dtype coverage (`49778eb`)
+**What:** Extended CPU `Clip` numeric dtype dispatch and strengthened coverage for negative integer clamps, absent optional-bound slots, and additional numeric types.
+
+**Why:** Clip must preserve ONNX optional-input and integer-bound semantics across supported numeric dtypes. ONNX backend CPU passes rose **737 → 741** and `onnx-runtime-ep-cpu` has **341** unit tests. Brion authored; Leon strengthened tests; Roy reviewed 🟢.
+
+### CUDA batched N-D MatMul (`dae93ab`)
+**What:** CUDA MatMul now executes rank-3/4 and other rank-≥2 broadcasted batches through cuBLAS strided-batched GEMM, using zero strides where an operand batch dimension broadcasts. Rank-1 promotion remains unsupported.
+
+**Why:** Flattening cannot represent every multi-axis broadcasting layout. The stale `matmul_rejects` test now proves 4-D execution and retains the intended Int64 rejection. Pris authored; Rachael reviewed 🟢.
+
+### ONNX-RS §6 lossless JSON serde (`d6f23d7`)
+**What:** `onnx-rs` serializes and deserializes ONNX Model JSON losslessly, including FLOAT8, INT4, UINT4, and FLOAT4 tensor data. The loader's weight conversion preserves those dtypes. JSON parsing now explicitly rejects populated fields that `onnx-runtime-ir` cannot represent: Graph `sparseInitializer`, `quantizationAnnotation`, and `metadataProps`; Node `overload`; Model `trainingInfo` and `functions`; and Tensor `segment` and `metadataProps`.
+
+**Why:** Silent field or dtype loss corrupts a model during a seemingly successful round-trip. Corrective work by Rachael and Ripley followed two rejection cycles; Holden re-reviewed 🟢. The crate has **42** unit tests and **1** doctest, commits the base64/prost/serde_json lockfile changes for `--locked` CI, and is included in `publish.yml`.
+
+**Sources:** `deckard-onnx-rs-json.md`, `pris-cuda-batched-matmul.md`; Wave-4 outcomes supplied by the coordinator manifest.
