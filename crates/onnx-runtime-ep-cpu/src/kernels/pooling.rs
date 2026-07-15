@@ -313,8 +313,8 @@ impl Kernel for PoolKernel {
                         PoolKind::Max { storage_order } => {
                             if value > maximum {
                                 maximum = value;
-                                maximum_index =
-                                    spatial_index(&input_coords, spatial, storage_order);
+                                maximum_index = nc * spatial_size
+                                    + spatial_index(&input_coords, spatial, storage_order);
                             }
                         }
                     }
@@ -515,6 +515,32 @@ mod tests {
             .execute(&[x.view()], &mut [dilated_out.view_mut()])
             .unwrap();
         assert_eq!(dilated_out.to_f32(), vec![11., 12., 15., 16.]);
+    }
+
+    #[test]
+    fn max_pool_indices_include_nc_base_for_both_storage_orders() {
+        let x = Owned::f32(
+            &[1, 2, 4, 4],
+            &(1..=32).map(|v| v as f32).collect::<Vec<_>>(),
+        );
+        for (storage_order, expected_indices) in [
+            (false, vec![5, 7, 13, 15, 21, 23, 29, 31]),
+            (true, vec![5, 13, 7, 15, 21, 29, 23, 31]),
+        ] {
+            let kernel = PoolKernel {
+                params: params(&[2, 2], &[2, 2], &[0, 0, 0, 0], &[1, 1]),
+                auto_pad: AutoPad::NotSet,
+                ceil_mode: false,
+                kind: PoolKind::Max { storage_order },
+            };
+            let mut out = Owned::zeros_f32(&[1, 2, 2, 2]);
+            let mut indices = Owned::i64(&[1, 2, 2, 2], &[0; 8]);
+            kernel
+                .execute(&[x.view()], &mut [out.view_mut(), indices.view_mut()])
+                .unwrap();
+
+            assert_eq!(indices.to_i64(), expected_indices);
+        }
     }
 
     #[test]
