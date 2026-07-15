@@ -42,4 +42,8 @@ pub enum Error {
     /// An ONNX protobuf-JSON document could not be encoded or decoded.
     #[error("ONNX JSON error: {0}")]
     Json(String),
+
+    /// An ONNX protobuf TextFormat document could not be encoded or decoded.
+    #[error("ONNX TextProto error: {0}")]
+    TextProto(String),
 }

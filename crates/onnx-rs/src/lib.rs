@@ -31,9 +31,10 @@
 //! | §8         | [`check::OnnxChecker`] extensible validator | ✅ (schema-aware) |
 //! | §9         | [`shape::infer_shapes`] symbolic shape inference | ✅ |
 //! | §10        | [`version::VersionConverter`] opset conversion | ✅ |
+//! | §6.2       | [`textproto`] protobuf TextFormat I/O | ✅ |
 //!
-//! Deferred to later waves (see `// FOLLOW-UP` markers): JSON / TextProto (§6),
-//! the remaining checker rule set (§8.2), custom-op registration (§11), and
+//! Deferred to later waves (see `// FOLLOW-UP` markers): the remaining checker
+//! rule set (§8.2), custom-op registration (§11), and
 //! Python bindings (§12).
 //!
 //! ## Example
@@ -56,6 +57,7 @@ mod model;
 pub mod schema;
 pub mod shape;
 pub mod text;
+pub mod textproto;
 pub mod version;
 
 pub use error::{Error, Result};

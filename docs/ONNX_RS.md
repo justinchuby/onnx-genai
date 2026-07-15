@@ -516,15 +516,25 @@ pub enum JsonWeightEncoding {
 For compatibility with protobuf text format tooling.
 
 ```rust
-pub struct OnnxTextProto;
-
-impl OnnxTextProto {
-    /// Parse protobuf text format.
-    pub fn parse(text: &str) -> Result<Model, ParseError>;
-    /// Print to protobuf text format.
-    pub fn print(model: &Model) -> String;
-}
+let text = onnx_rs::textproto::to_textproto(&model)?;
+let model = onnx_rs::textproto::from_textproto(&text)?;
 ```
+
+**Implemented.** The functions live in `onnx_rs::textproto`, alongside the
+existing `onnx_rs::json` module, rather than behind a zero-sized
+`OnnxTextProto` type. Free functions are more idiomatic for stateless format
+conversion and make the two protobuf interchange APIs predictable.
+
+The implementation emits standard protobuf TextFormat field names and syntax:
+quoted/escaped strings and bytes, named ONNX enums, nested `{ ... }` messages,
+and one line per repeated value. `raw_data` is emitted as an escaped byte
+string. Parsing and printing share the generated `ModelProto` conversion path
+with binary protobuf and JSON. This gives Rust users a dependency-light,
+inspectable interchange format for golden fixtures, diffs, debugging, and
+interop with `google.protobuf.text_format` / `onnx.text_format`, without
+confusing it with the human-oriented ONNX DSL in §5. Populated proto fields
+that the shared IR cannot retain produce explicit errors rather than being
+silently discarded.
 
 ### 6.3 Unified I/O
 
@@ -1425,7 +1435,7 @@ onnx-rs/                          # Workspace root
 - [ ] `onnx-text`: Parser (.onnxtxt → Model)
 - [ ] `onnx-text`: Round-trip tests
 - [ ] `onnx-json`: JSON serialization
-- [ ] `onnx-json`: TextProto support
+- [x] `onnx-rs::textproto`: protobuf TextFormat support
 - [ ] `onnx-cli`: `onnx check`, `onnx print`, `onnx info` commands
 
 ### Phase 4: Version Converter + Polish

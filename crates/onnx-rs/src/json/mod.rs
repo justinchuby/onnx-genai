@@ -202,7 +202,7 @@ fn float_json(value: f64) -> Value {
     }
 }
 
-fn model_to_value(proto: &ModelProto) -> Value {
+pub(crate) fn model_to_value(proto: &ModelProto) -> Value {
     let mut map = Map::new();
     put(
         &mut map,
@@ -258,7 +258,7 @@ fn model_to_value(proto: &ModelProto) -> Value {
     Value::Object(map)
 }
 
-fn parse_model(value: &Value) -> Result<ModelProto> {
+pub(crate) fn parse_model(value: &Value) -> Result<ModelProto> {
     let map = object(value)?;
     reject_unsupported_field(map, "trainingInfo", "training_info")?;
     reject_unsupported_field(map, "functions", "functions")?;
