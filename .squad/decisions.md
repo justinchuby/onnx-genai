@@ -1012,3 +1012,52 @@ CHANNEL/AVG results match element-for-element.
 **2. Benchmark periodically.** Run benchmarks on a regular cadence to track performance (decode tok/s, latency) and output quality/correctness ("效果"), catching regressions and drift.
 
 **By:** Justin Chu (@justinchuby), via Coordinator.
+
+---
+
+## 2026-07-15 — Wave 8 consolidation
+
+### Governor API exposes engine resource policy (`9d972d1`)
+**What:** The server exposes the engine resource governor.
+**Why:** Resource policy must be observable and controllable at the API boundary rather than remaining an internal-only engine setting.
+
+### TextProto uses shared protobuf conversion (`1abcf8c`)
+**What:** ONNX-RS §11 adds TextProto serde through the common protobuf conversion path.
+**Why:** Text, binary protobuf, and JSON must preserve the same supported-field behavior and report unsupported populated fields explicitly.
+
+### H200 throughput is recorded at the target batch (`784e52d`)
+**What:** Wave-8 benchmarking documents approximately 492 tok/s on H200 at batch 128.
+**Why:** A reproducible, documented throughput baseline is required to track decode performance.
+
+### Minimal builds have a documented strategy (`f0026f7`)
+**What:** `docs/MINIMAL_BUILD.md` defines the minimal-build strategy.
+**Why:** Consumers need a supported route to reduce build footprint without guessing feature combinations.
+
+### CPU normalization operations are first-class (`b2db5c5`)
+**What:** CPU supports BatchNormalization, InstanceNormalization, GroupNormalization, and PRelu; the registry reaches 141 operations.
+**Why:** Normalization coverage is required for broader ONNX model compatibility; f64 handling follows the corrective fix.
+
+### CUDA fused epilogues are deliberately shape-gated (`a6fffc4`)
+**What:** `FusedMatMulBias` and `FusedGemm` use cuBLASLt fused epilogues only for rank-2 inputs and a bias vector shaped `[N]`.
+**Why:** Batched or broadcast variants are not silently approximated; they decline to the CPU fallback until CUDA has correct support.
+
+### Native profiling measures raw session execution (`c2f9aa0`)
+**What:** The `bench-native` feature and `profile_native` benchmark raw native `session.run`; CPU `bert_toy` measured 916 runs/s.
+**Why:** Separating raw session throughput from higher-level generation makes regressions attributable.
+
+### MoE contracts follow ORT 1.27 QMoE (`150ed54`)
+**What:** MoE design uses an expert-tier hierarchy, heat caching, batch-union scheduling, and the real ORT 1.27 QMoE signature with separate `router_probs` and `router_weights`.
+**Why:** The design must reflect executable ORT semantics and keep routing signals unambiguous.
+
+### Native decoding remains engine-owned (`cca3a61`)
+**What:** `NativeDecodeSession` implements `DecodeBackend`, with `DecodeRunner::Native`, host KV carry/rewind, an optional feature, and native tok/s profiling.
+**Why:** The engine's shared decode loop remains the sole token-generation owner; an EP supplies execution, not generation policy.
+
+## 2026-07-15 — Wave 9 (in progress)
+
+### Gather copies fixed-width element bytes (`5dddbb8`)
+**By:** Zhora
+**What:** CPU `Gather` now copies all fixed-width data types via shared byte-view helpers while retaining `Int32`/`Int64` index decoding.
+**Why:** Decoder shape subgraphs use `Int64` Gather; raw byte movement preserves each fixed-width dtype without per-dtype gather loops and unblocks native decoder execution.
+
+**Sources:** Wave-8/Wave-9 coordinator manifest; merged commits `9d972d1`, `1abcf8c`, `784e52d`, `f0026f7`, `b2db5c5`, `a6fffc4`, `c2f9aa0`, `150ed54`, `cca3a61`, and `5dddbb8`.

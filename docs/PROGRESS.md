@@ -269,3 +269,22 @@ Scoped the "export Gemma4 E2B/12B via Mobius and smoke-test through onnx-genai" 
 - **`nxrt` model metadata ✅ (`66a8e5c`, Rachael):** Added `InferenceSession::model_metadata()` and the Python `ModelMetadata` pyclass, exposing producer name, graph name, domain, description, version, and custom metadata map through `get_modelmeta()`. Holden reviewed 🟢.
 
 **Current main HEAD:** `66a8e5c`.
+
+## 2026-07-15 — Wave 8: Native execution, CPU/CUDA coverage, and documentation
+
+- **Governor server API ✅ (`9d972d1`, Vandamm; Roy 🟢):** Exposed the engine resource governor through the server API.
+- **ONNX-RS §11 TextProto serde ✅ (`1abcf8c`, Tyrell; Deckard fix; Holden 🟢):** Added TextProto serde support using the shared protobuf conversion path.
+- **H200 Wave-8 benchmark ✅ (`784e52d`, Gaff):** Documented H200 decoding at approximately **492 tok/s** at batch 128.
+- **Minimal-build strategy ✅ (`f0026f7`, Sebastian):** Added `docs/MINIMAL_BUILD.md` with the supported minimal-build approach.
+- **CPU normalization coverage ✅ (`b2db5c5`, Mariette; Deckard f64 fix; Bryant 🟢):** Added BatchNormalization, InstanceNormalization, GroupNormalization, and PRelu; the CPU registry now has **141** ops.
+- **CUDA fused GEMM epilogues ✅ (`a6fffc4`, Luv; Kira shape-gate fix; Pris 🔴→🟢):** Added cuBLASLt-backed `FusedMatMulBias` and `FusedGemm`. CUDA accepts only rank-2 inputs with bias `[N]`; batched or broadcast forms decline to CPU fallback.
+- **Native microbenchmarking ✅ (`c2f9aa0`, Sapper; Bryant 🟢):** Added the `bench-native` feature and raw native `session.run` profiling; CPU `bert_toy` measures **916 runs/s**.
+- **MoE support design ✅ (`150ed54`, Roy; Leon fix; Fact Checker 🔴→🟢):** Added `docs/MOE_SUPPORT.md` and DESIGN §43, including expert-tier hierarchy, heat caching, and batch-union scheduling. The contract uses ORT 1.27's real QMoE signature and keeps `router_probs` distinct from `router_weights`.
+- **Native decode backend ✅ (`cca3a61`, Eldon; Deckard logits fix; Holden 🔴→🟢):** Added `NativeDecodeSession`/`DecodeRunner::Native`, host KV carry/rewind, an optional `native-backend` feature, and native tok/s profiling. The engine retains the token-generation loop; the EP does not own it.
+
+### Wave 9 (in progress)
+
+- **Native fixed-width Gather ✅ (`5dddbb8`, Zhora; Bryant 🟢):** Generalized CPU `Gather` to fixed-width dtypes, including `Int64`, unblocking native decoder shape subgraphs.
+- **Next gap:** run real decoder models through the native `DecodeBackend` adapter and continue closing CPU op coverage as models surface missing operations.
+
+**Current main HEAD:** `5dddbb8`.

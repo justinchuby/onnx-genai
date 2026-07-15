@@ -536,6 +536,10 @@ confusing it with the human-oriented ONNX DSL in §5. Populated proto fields
 that the shared IR cannot retain produce explicit errors rather than being
 silently discarded.
 
+**§11 implementation note (Wave 8, `1abcf8c`).** TextProto serde is implemented
+through this shared protobuf conversion path, so TextFormat parsing and printing
+retain the same explicit unsupported-field behavior as binary and JSON I/O.
+
 ### 6.3 Unified I/O
 
 Delegates to `FormatRegistry` (§3.3) — auto-detects format from extension or magic bytes.
