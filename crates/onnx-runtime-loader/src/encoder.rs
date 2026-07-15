@@ -187,6 +187,17 @@ pub fn encode_model_proto(model: &Model) -> Result<ModelProto, LoaderError> {
             version: version as i64,
         })
         .collect();
+    if meta.ir_version >= 3
+        && !opset_import
+            .iter()
+            .any(|opset| opset.domain.is_empty() || opset.domain == "ai.onnx")
+    {
+        // IR >= 3 requires a default-domain import even for an empty graph.
+        opset_import.push(OperatorSetIdProto {
+            domain: String::new(),
+            version: 21,
+        });
+    }
     opset_import.sort_by(|a, b| a.domain.cmp(&b.domain));
 
     let metadata_props = meta

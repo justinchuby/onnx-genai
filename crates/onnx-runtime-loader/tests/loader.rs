@@ -153,6 +153,7 @@ fn find(graph: &Graph, name: &str) -> onnx_runtime_ir::ValueId {
 fn missing_opset_import_is_rejected_before_inference() {
     let mut sigmoid = node("Sigmoid", &["X"], &["Y"]);
     sigmoid.name = "missing_default_import".to_string();
+    sigmoid.domain = "com.example".to_string();
     let graph = onnx::GraphProto {
         input: vec![value_info("X", 1, &[Dimlike::Static(1)])],
         output: vec![value_info("Y", 1, &[Dimlike::Static(1)])],
@@ -161,6 +162,10 @@ fn missing_opset_import_is_rejected_before_inference() {
     };
     let bytes = onnx::ModelProto {
         ir_version: 8,
+        opset_import: vec![onnx::OperatorSetIdProto {
+            domain: String::new(),
+            version: 17,
+        }],
         graph: Some(graph),
         ..Default::default()
     }
@@ -175,11 +180,11 @@ fn missing_opset_import_is_rejected_before_inference() {
             domain,
         } if op_type == "Sigmoid"
             && node == "\"missing_default_import\""
-            && domain == "ai.onnx"
+            && domain == "com.example"
     ));
     let message = error.to_string();
     assert!(message.contains("Sigmoid"), "{message}");
-    assert!(message.contains("ai.onnx"), "{message}");
+    assert!(message.contains("com.example"), "{message}");
     assert!(
         message.contains("if you built this graph programmatically, add it before loading"),
         "{message}"

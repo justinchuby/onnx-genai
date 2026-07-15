@@ -56,15 +56,21 @@ pub mod writer;
 mod pathsafe;
 
 pub use encoder::{
-    encode_model, encode_model_proto, write_model, Model, ModelMetadata, DEFAULT_IR_VERSION,
+    DEFAULT_IR_VERSION, Model, ModelMetadata, encode_model, encode_model_proto, write_model,
 };
+/// Newest ONNX IR version accepted by the loader.
+///
+/// This is intentionally separate from [`DEFAULT_IR_VERSION`]: newly encoded
+/// models target the established IR 10 baseline, while loading remains
+/// compatible with the IR 11 models used by shipped fixtures.
+pub const MAX_SUPPORTED_IR_VERSION: i64 = 11;
 pub use epcontext::{
-    ep_context_node_ids, ep_context_nodes, is_ep_context_op, resolve_ep_context, EmbedMode,
-    EpContextBlob, EpContextNode,
+    EmbedMode, EpContextBlob, EpContextNode, ep_context_node_ids, ep_context_nodes,
+    is_ep_context_op, resolve_ep_context,
 };
 pub use error::LoaderError;
 pub use weights::WeightStore;
-pub use writer::{dump_ep_context, EpContextDumpConfig, EpContextPartition};
+pub use writer::{EpContextDumpConfig, EpContextPartition, dump_ep_context};
 
 mod error {
     use std::path::PathBuf;
@@ -137,6 +143,73 @@ mod error {
              no longer share a name; if this is a file, the model is malformed per the ONNX spec"
         )]
         InitializerHasProducer { tensor: String, node: String },
+
+        #[error(
+            "illegal ONNX model: value '{tensor}' has multiple producers ({first} and {second}). \
+             RULES #1: ONNX graphs are in SSA form, so a value name may be assigned only once. \
+             Expected: give each graph input and node output a unique name"
+        )]
+        DuplicateValueProducer {
+            tensor: String,
+            first: String,
+            second: String,
+        },
+
+        #[error(
+            "illegal ONNX model: operator {domain}::{op_type} at node {node} has attribute \
+             '{attr}' referring to function attribute '{ref_attr_name}' outside a FunctionProto. \
+             RULES #1: ref_attr_name is only bound while inlining a FunctionProto; it has no \
+             executable value in a main graph or control-flow subgraph. Expected: replace it with \
+             a concrete attribute value or move the node into a FunctionProto"
+        )]
+        RefAttributeOutsideFunction {
+            op_type: String,
+            node: String,
+            domain: String,
+            attr: String,
+            ref_attr_name: String,
+        },
+
+        #[error(
+            "illegal ONNX model: ir_version {ir_version} is invalid. RULES #1: ONNX IR versions \
+             start at 1. Expected: emit a model with ir_version in 1..={max_ir_version}"
+        )]
+        InvalidIrVersion {
+            ir_version: i64,
+            max_ir_version: i64,
+        },
+
+        #[error(
+            "unsupported ONNX model: ir_version {ir_version} is newer than this runtime supports \
+             (max {max_ir_version}). RULES #1: load a model targeting a supported ONNX IR version \
+             or upgrade the runtime"
+        )]
+        UnsupportedIrVersion {
+            ir_version: i64,
+            max_ir_version: i64,
+        },
+
+        #[error(
+            "illegal ONNX model: ir_version {ir_version} requires a default-domain opset_import \
+             (domain '' or 'ai.onnx'), but none was declared. RULES #1: default-domain operators \
+             need an opset version to bind their semantics. Expected: add an ai.onnx opset_import"
+        )]
+        MissingDefaultOpsetImport { ir_version: i64 },
+
+        #[error(
+            "illegal ONNX model: initializer '{tensor}' in an outer graph is shadowed by a \
+             subgraph input of the same name. RULES #1: this runtime does not permit ambiguous \
+             initializer/subgraph binding. Expected: rename the subgraph formal input or the \
+             outer initializer"
+        )]
+        SubgraphInputShadowsInitializer { tensor: String },
+
+        #[error(
+            "illegal ONNX model: graph output '{tensor}' has no producer in its graph. RULES #1: \
+             every output must be a graph input, initializer, or node output in the same scope. \
+             Expected: produce '{tensor}' locally or declare it as an input/initializer"
+        )]
+        GraphOutputMissingProducer { tensor: String },
 
         #[error("external data file not found: {path}")]
         ExternalDataNotFound { path: PathBuf },
@@ -275,6 +348,7 @@ fn build_from_bytes_with_weights(
     model_dir: &Path,
 ) -> Result<(Graph, Arc<WeightStore>), LoaderError> {
     let model = proto::decode_model(bytes)?;
+    validate_model_proto(&model)?;
     let BuiltGraph {
         mut graph,
         name_map,
@@ -320,6 +394,11 @@ fn build_from_bytes_with_weights(
 /// programmatic entry ([`onnx_runtime_session`]'s `from_parts`/`from_graph`) —
 /// so the checks cannot drift between the two. It runs, in order:
 ///
+/// Protobuf-only invariants (`ir_version`, raw SSA names, `ref_attr_name`,
+/// subgraph shadows, and output names) run earlier in
+/// [`validate_model_proto`], before graph construction coalesces names or drops
+/// protobuf-only fields. This IR-level phase then runs:
+///
 /// 1. [`validate_opset_imports`] — every node's domain must declare an opset.
 /// 2. [`validate_no_control_flow`] — allow the implemented subgraph-bearing ops
 ///    (`If`/`Loop`/`Scan`) and reject any other op carrying a `GraphProto`
@@ -343,6 +422,139 @@ pub fn validate_model(graph: &Graph) -> Result<(), LoaderError> {
     validate_no_control_flow(graph)?;
     validate_no_dangling_refs(graph)?;
     validate_no_initializer_producer(graph)?;
+    Ok(())
+}
+
+/// Validate ONNX model metadata and protobuf-level graph invariants that are
+/// intentionally not preserved by the runtime IR (notably `ir_version` and
+/// `AttributeProto::ref_attr_name`).
+///
+/// This runs before graph construction, ensuring invalid names cannot be
+/// coalesced into a single IR value and attribute references cannot be dropped.
+pub fn validate_model_proto(model: &proto::onnx::ModelProto) -> Result<(), LoaderError> {
+    use std::collections::HashSet;
+
+    use proto::onnx::GraphProto;
+
+    if model.ir_version < 1 {
+        return Err(LoaderError::InvalidIrVersion {
+            ir_version: model.ir_version,
+            max_ir_version: MAX_SUPPORTED_IR_VERSION,
+        });
+    }
+    if model.ir_version > MAX_SUPPORTED_IR_VERSION {
+        return Err(LoaderError::UnsupportedIrVersion {
+            ir_version: model.ir_version,
+            max_ir_version: MAX_SUPPORTED_IR_VERSION,
+        });
+    }
+    if model.ir_version >= 3
+        && !model
+            .opset_import
+            .iter()
+            .any(|opset| opset.domain.is_empty() || opset.domain == "ai.onnx")
+    {
+        return Err(LoaderError::MissingDefaultOpsetImport {
+            ir_version: model.ir_version,
+        });
+    }
+
+    fn node_description(node: &proto::onnx::NodeProto, index: usize) -> String {
+        if node.name.is_empty() {
+            format!("<unnamed node #{index}>")
+        } else {
+            format!("{:?}", node.name)
+        }
+    }
+
+    fn check_graph(graph: &GraphProto) -> Result<(), LoaderError> {
+        let mut producers = std::collections::HashMap::new();
+        for input in &graph.input {
+            if !input.name.is_empty() {
+                producers.insert(input.name.clone(), "graph input".to_string());
+            }
+        }
+        for (index, node) in graph.node.iter().enumerate() {
+            let node_description = node_description(node, index);
+            for output in &node.output {
+                if output.is_empty() {
+                    continue;
+                }
+                let producer = format!("output of {node_description}");
+                if let Some(first) = producers.insert(output.clone(), producer.clone()) {
+                    return Err(LoaderError::DuplicateValueProducer {
+                        tensor: output.clone(),
+                        first,
+                        second: producer,
+                    });
+                }
+            }
+            for attribute in &node.attribute {
+                if !attribute.ref_attr_name.is_empty() {
+                    return Err(LoaderError::RefAttributeOutsideFunction {
+                        op_type: node.op_type.clone(),
+                        node: node_description.clone(),
+                        domain: display_domain(&node.domain),
+                        attr: attribute.name.clone(),
+                        ref_attr_name: attribute.ref_attr_name.clone(),
+                    });
+                }
+            }
+        }
+
+        let sources: HashSet<&str> = graph
+            .input
+            .iter()
+            .map(|input| input.name.as_str())
+            .chain(
+                graph
+                    .initializer
+                    .iter()
+                    .map(|initializer| initializer.name.as_str()),
+            )
+            .chain(
+                graph
+                    .node
+                    .iter()
+                    .flat_map(|node| node.output.iter().map(String::as_str)),
+            )
+            .collect();
+        for output in &graph.output {
+            if !output.name.is_empty() && !sources.contains(output.name.as_str()) {
+                return Err(LoaderError::GraphOutputMissingProducer {
+                    tensor: output.name.clone(),
+                });
+            }
+        }
+
+        let outer_initializers: HashSet<&str> = graph
+            .initializer
+            .iter()
+            .map(|initializer| initializer.name.as_str())
+            .collect();
+        for node in &graph.node {
+            for attribute in &node.attribute {
+                let subgraphs = attribute.g.iter().chain(attribute.graphs.iter());
+                for subgraph in subgraphs {
+                    if let Some(input) = subgraph
+                        .input
+                        .iter()
+                        .find(|input| outer_initializers.contains(input.name.as_str()))
+                    {
+                        return Err(LoaderError::SubgraphInputShadowsInitializer {
+                            tensor: input.name.clone(),
+                        });
+                    }
+                    check_graph(subgraph)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    if let Some(graph) = &model.graph {
+        check_graph(graph)?;
+    }
     Ok(())
 }
 
