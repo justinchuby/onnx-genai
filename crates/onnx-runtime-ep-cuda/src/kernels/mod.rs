@@ -43,9 +43,9 @@ use pointwise::{
 /// * **GEMM family** — `MatMul` and `Gemm` (cuBLASLt; `Gemm` adds a fused NVRTC
 ///   `beta·C` broadcast-bias epilogue).
 /// * **Elementwise unary** — `Relu`, `Sqrt`, `Erf`, `Tanh` (+ `Sigmoid`) and the
-///   `com.microsoft` `Gelu`, via runtime-compiled (NVRTC) f32 pointwise kernels.
-/// * **Elementwise binary (equal-shape)** — `Add`, `Sub`, `Mul`, `Div`, `Pow`,
-///   `Min`, `Max`, via NVRTC f32 pointwise kernels.
+///   `com.microsoft` `Gelu`, via runtime-compiled f32/f16/bf16 NVRTC kernels.
+/// * **Elementwise binary (NumPy broadcasting)** — `Add`, `Sub`, `Mul`, `Div`,
+///   `Pow`, `Min`, `Max`, via f32/f16/bf16 NVRTC kernels.
 /// * **Attention** — the SDPA/GQA baseline (`com.microsoft` domain; cuBLAS
 ///   batched GEMM + NVRTC softmax), the §13.3 binding a cuDNN-fused SDPA /
 ///   FlashAttention-3 shim drops in behind.
@@ -59,8 +59,8 @@ use pointwise::{
 /// * **Reductions** — cuDNN `ReduceSum`/`ReduceMean` (f32/f16/bf16, f32 NVRTC
 ///   fallback) plus NVRTC `ReduceMax`/`ReduceMin`; arbitrary axes and keepdims.
 /// * **Pointwise unary math** — `Abs`, `Neg`, `Reciprocal`, `Exp`, `Log`,
-///   `Sign`, `Floor`, `Ceil`, `Round`, `Sin`, `Cos`, `Softplus` (NVRTC f32,
-///   formulas matched to the CPU EP `unary_math.rs`).
+///   `Sign`, `Floor`, `Ceil`, `Round`, `Sin`, `Cos`, `Softplus` (NVRTC
+///   f32/f16/bf16, formulas matched to the CPU EP `unary_math.rs`).
 /// * **Logical** — `Not` (bool), `And`, `Or`, `Xor` (bool, equal-shape).
 /// * **Comparison** — `Equal`, `Greater`, `Less`, `GreaterOrEqual`,
 ///   `LessOrEqual` (f32 operands → bool, equal-shape).
@@ -145,7 +145,7 @@ pub fn build_cuda_registry(runtime: Arc<CudaRuntime>) -> OpRegistry {
         }),
     );
 
-    // Elementwise unary activations (NVRTC f32 pointwise). `Gelu` is a
+    // Elementwise unary activations (NVRTC f32/f16/bf16 pointwise). `Gelu` is a
     // `com.microsoft` contrib op; the rest are standard-domain.
     for (op_type, domain, op) in [
         ("Relu", "", UnaryOp::Relu),
@@ -164,7 +164,7 @@ pub fn build_cuda_registry(runtime: Arc<CudaRuntime>) -> OpRegistry {
         );
     }
 
-    // CUDA Wave 4 — attribute-driven f32 activations.
+    // CUDA Wave 4 — attribute-driven f32/f16/bf16 activations.
     for op_type in [
         "LeakyRelu",
         "Elu",
@@ -182,7 +182,7 @@ pub fn build_cuda_registry(runtime: Arc<CudaRuntime>) -> OpRegistry {
         );
     }
 
-    // Elementwise binary (NVRTC f32 pointwise, equal-shape operands).
+    // Elementwise binary (NVRTC f32/f16/bf16, NumPy broadcasting).
     for (op_type, op) in [
         ("Add", BinaryOp::Add),
         ("Sub", BinaryOp::Sub),
@@ -298,7 +298,7 @@ pub fn build_cuda_registry(runtime: Arc<CudaRuntime>) -> OpRegistry {
 
     // ── CUDA Wave 3 — pointwise math / logical / comparison (pointwise.rs) ──
 
-    // Pointwise unary math (NVRTC f32; formulas matched to the CPU EP
+    // Pointwise unary math (NVRTC f32/f16/bf16; formulas matched to the CPU EP
     // `unary_math.rs`). Standard domain, single input/output, equal shape.
     for (op_type, op) in [
         ("Abs", UnaryMathOp::Abs),

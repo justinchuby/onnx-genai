@@ -5,16 +5,46 @@
 
 use std::collections::HashMap;
 use std::ffi::c_void;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use cudarc::driver::sys::CUdeviceptr;
 use cudarc::driver::{CudaContext, CudaFunction, CudaModule, CudaStream};
 
+use onnx_runtime_ep_api::EpError;
 use onnx_runtime_ep_api::Result;
 
 use crate::blas::CublasLt;
 use crate::cudnn::CudnnBackend;
 use crate::error::{driver_err, nvrtc_err};
+
+fn nvrtc_include_paths() -> Vec<String> {
+    let mut candidates = Vec::<PathBuf>::new();
+    for variable in ["CUDA_HOME", "CUDA_PATH"] {
+        if let Some(root) = std::env::var_os(variable) {
+            candidates.push(PathBuf::from(root).join("include"));
+        }
+    }
+    candidates.push(PathBuf::from("/usr/local/cuda/include"));
+
+    if let Some(paths) = std::env::var_os("LD_LIBRARY_PATH") {
+        for path in std::env::split_paths(&paths) {
+            if path.ends_with(Path::new("nvidia/cuda_nvrtc/lib"))
+                && let Some(nvidia) = path.parent().and_then(Path::parent)
+            {
+                candidates.push(nvidia.join("cuda_runtime/include"));
+            }
+        }
+    }
+
+    candidates.sort();
+    candidates.dedup();
+    candidates
+        .into_iter()
+        .filter(|path| path.join("cuda_fp16.h").is_file())
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect()
+}
 
 /// Device context, stream, and vendor-library backends shared across the EP.
 pub struct CudaRuntime {
@@ -103,6 +133,7 @@ impl CudaRuntime {
             } else {
                 let opts = cudarc::nvrtc::CompileOptions {
                     arch: Some("compute_90"),
+                    include_paths: nvrtc_include_paths(),
                     ..Default::default()
                 };
                 let ptx = cudarc::nvrtc::compile_ptx_with_opts(src, opts)
@@ -118,6 +149,17 @@ impl CudaRuntime {
         module
             .load_function(entry)
             .map_err(|e| driver_err(&format!("loading NVRTC function '{entry}'"), e))
+    }
+
+    pub fn require_nvrtc_half_headers(&self, op: &str) -> Result<()> {
+        if nvrtc_include_paths().is_empty() {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep {op}: f16/bf16 NVRTC kernels require cuda_fp16.h and cuda_bf16.h. \
+                 Install the CUDA runtime headers (for pip CUDA 13: `pip install \
+                 nvidia-cuda-runtime`; alternatively set CUDA_HOME/CUDA_PATH)."
+            )));
+        }
+        Ok(())
     }
 
     /// Bind this runtime's context to the calling thread. Required before any
@@ -205,4 +247,18 @@ pub fn cuptr(raw: *const c_void) -> CUdeviceptr {
 #[inline]
 pub fn raw_ptr(dptr: CUdeviceptr) -> *mut c_void {
     dptr as usize as *mut c_void
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nvrtc_include_paths_only_returns_cuda_header_dirs() {
+        assert!(
+            nvrtc_include_paths()
+                .iter()
+                .all(|path| Path::new(path).join("cuda_fp16.h").is_file())
+        );
+    }
 }

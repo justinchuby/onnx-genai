@@ -1,4 +1,4 @@
-//! Attribute-driven f32 activation kernels (CUDA Wave 4).
+//! Attribute-driven f32/f16/bf16 activation kernels (CUDA Wave 4).
 
 use std::ffi::c_void;
 use std::sync::Arc;
@@ -11,52 +11,88 @@ use crate::error::{driver_err, not_implemented};
 use crate::runtime::{CudaRuntime, cuptr};
 
 const BLOCK: u32 = 256;
-const MODULE: &str = "wave4_activations_f32";
+const MODULE: &str = "wave4_activations_float_v2";
 
 const SRC: &str = r#"
-extern "C" __global__ void leaky_relu_f32(
-    const float* x, float* y, const int n, const float alpha, const float unused) {
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
-        float v = x[i];
-        y[i] = v >= 0.0f ? v : alpha * v;
-    }
+#if __has_include(<cuda_fp16.h>) && __has_include(<cuda_bf16.h>)
+#define NXRT_HAS_CUDA_HALF_HEADERS 1
+#include <cuda_fp16.h>
+#include <cuda_bf16.h>
+#endif
+template <typename T> __device__ float load_float(T value);
+template <> __device__ float load_float<float>(float value) { return value; }
+#ifdef NXRT_HAS_CUDA_HALF_HEADERS
+template <> __device__ float load_float<__half>(__half value) { return __half2float(value); }
+template <> __device__ float load_float<__nv_bfloat16>(__nv_bfloat16 value) { return __bfloat162float(value); }
+#endif
+template <typename T> __device__ T store_float(float value);
+template <> __device__ float store_float<float>(float value) { return value; }
+#ifdef NXRT_HAS_CUDA_HALF_HEADERS
+template <> __device__ __half store_float<__half>(float value) { return __float2half_rn(value); }
+template <> __device__ __nv_bfloat16 store_float<__nv_bfloat16>(float value) { return __float2bfloat16_rn(value); }
+#endif
+
+__device__ float op_leaky_relu(float v, float alpha, float unused) { return v >= 0.0f ? v : alpha * v; }
+__device__ float op_elu(float v, float alpha, float unused) { return v >= 0.0f ? v : alpha * expm1f(v); }
+__device__ float op_hard_sigmoid(float v, float alpha, float beta) {
+    v = alpha * v + beta;
+    return isnan(v) ? v : (v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v));
 }
-extern "C" __global__ void elu_f32(
-    const float* x, float* y, const int n, const float alpha, const float unused) {
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
-        float v = x[i];
-        y[i] = v >= 0.0f ? v : alpha * expm1f(v);
-    }
+__device__ float op_clip(float v, float min_value, float max_value) {
+    return isnan(v) ? v : fminf(fmaxf(v, min_value), max_value);
 }
-extern "C" __global__ void hard_sigmoid_f32(
-    const float* x, float* y, const int n, const float alpha, const float beta) {
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
-        float v = alpha * x[i] + beta;
-        y[i] = isnan(v) ? v : (v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v));
-    }
+__device__ float op_softsign(float v, float unused0, float unused1) { return v / (1.0f + fabsf(v)); }
+__device__ float op_selu(float v, float alpha, float gamma) {
+    return gamma * (v >= 0.0f ? v : alpha * expm1f(v));
 }
-extern "C" __global__ void clip_f32(
-    const float* x, float* y, const int n, const float min_value, const float max_value) {
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
-        float v = x[i];
-        y[i] = isnan(v) ? v : fminf(fmaxf(v, min_value), max_value);
-    }
+
+#define DEFINE_ACT(NAME, TYPE, SUFFIX) \
+extern "C" __global__ void NAME##_##SUFFIX( \
+    const TYPE* x, TYPE* y, const int n, const float p0, const float p1) { \
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) \
+        y[i] = store_float<TYPE>(op_##NAME(load_float<TYPE>(x[i]), p0, p1)); \
 }
-extern "C" __global__ void softsign_f32(
-    const float* x, float* y, const int n, const float unused0, const float unused1) {
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
-        float v = x[i];
-        y[i] = v / (1.0f + fabsf(v));
-    }
-}
-extern "C" __global__ void selu_f32(
-    const float* x, float* y, const int n, const float alpha, const float gamma) {
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
-        float v = x[i];
-        y[i] = gamma * (v >= 0.0f ? v : alpha * expm1f(v));
-    }
-}
+#define DEFINE_FOR_TYPE(TYPE, SUFFIX) \
+DEFINE_ACT(leaky_relu, TYPE, SUFFIX) \
+DEFINE_ACT(elu, TYPE, SUFFIX) \
+DEFINE_ACT(hard_sigmoid, TYPE, SUFFIX) \
+DEFINE_ACT(clip, TYPE, SUFFIX) \
+DEFINE_ACT(softsign, TYPE, SUFFIX) \
+DEFINE_ACT(selu, TYPE, SUFFIX)
+DEFINE_FOR_TYPE(float, f32)
+#ifdef NXRT_HAS_CUDA_HALF_HEADERS
+DEFINE_FOR_TYPE(__half, f16)
+DEFINE_FOR_TYPE(__nv_bfloat16, bf16)
+#endif
 "#;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FloatDtype {
+    F32,
+    F16,
+    Bf16,
+}
+
+impl FloatDtype {
+    fn from_onnx(op: &str, name: &str, dtype: DataType) -> Result<Self> {
+        match dtype {
+            DataType::Float32 => Ok(Self::F32),
+            DataType::Float16 => Ok(Self::F16),
+            DataType::BFloat16 => Ok(Self::Bf16),
+            other => Err(not_implemented(format!(
+                "{op} with {name} dtype {other:?} (supported: Float32, Float16, BFloat16)"
+            ))),
+        }
+    }
+
+    fn suffix(self) -> &'static str {
+        match self {
+            Self::F32 => "f32",
+            Self::F16 => "f16",
+            Self::Bf16 => "bf16",
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ActivationOp {
@@ -69,15 +105,19 @@ pub enum ActivationOp {
 }
 
 impl ActivationOp {
-    fn entry(self) -> &'static str {
+    fn stem(self) -> &'static str {
         match self {
-            Self::LeakyRelu { .. } => "leaky_relu_f32",
-            Self::Elu { .. } => "elu_f32",
-            Self::HardSigmoid { .. } => "hard_sigmoid_f32",
-            Self::Clip { .. } => "clip_f32",
-            Self::Softsign => "softsign_f32",
-            Self::Selu { .. } => "selu_f32",
+            Self::LeakyRelu { .. } => "leaky_relu",
+            Self::Elu { .. } => "elu",
+            Self::HardSigmoid { .. } => "hard_sigmoid",
+            Self::Clip { .. } => "clip",
+            Self::Softsign => "softsign",
+            Self::Selu { .. } => "selu",
         }
+    }
+
+    fn entry(self, dtype: FloatDtype) -> String {
+        format!("{}_{}", self.stem(), dtype.suffix())
     }
 
     fn name(self) -> &'static str {
@@ -169,22 +209,33 @@ struct ActivationKernel {
 
 impl ActivationKernel {
     fn read_scalar(&self, name: &str, input: &TensorView) -> Result<f32> {
-        require_f32(self.op.name(), name, input.dtype)?;
+        FloatDtype::from_onnx(self.op.name(), name, input.dtype)?;
         require_contiguous(self.op.name(), name, input.is_contiguous())?;
         if input.numel() != 1 {
             return Err(EpError::KernelFailed(format!(
-                "cuda_ep Clip: {name} must contain one f32 value, got {}",
+                "cuda_ep Clip: {name} must contain one floating-point value, got {}",
                 input.numel()
             )));
         }
         let mut bytes = [0u8; 4];
-        // SAFETY: dtype and numel checks above prove the device allocation covers
-        // one f32 (four bytes).
+        let width = input.dtype.byte_size();
+        // SAFETY: dtype and numel checks prove the allocation covers one element.
         unsafe {
-            self.runtime
-                .dtoh(&mut bytes, cuptr(input.data_ptr::<u8>() as *const c_void))?
+            self.runtime.dtoh(
+                &mut bytes[..width],
+                cuptr(input.data_ptr::<u8>() as *const c_void),
+            )?
         };
-        Ok(f32::from_ne_bytes(bytes))
+        Ok(match input.dtype {
+            DataType::Float32 => f32::from_ne_bytes(bytes),
+            DataType::Float16 => {
+                half::f16::from_bits(u16::from_ne_bytes([bytes[0], bytes[1]])).to_f32()
+            }
+            DataType::BFloat16 => {
+                half::bf16::from_bits(u16::from_ne_bytes([bytes[0], bytes[1]])).to_f32()
+            }
+            _ => unreachable!("validated floating dtype"),
+        })
     }
 
     fn run(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
@@ -204,8 +255,16 @@ impl ActivationKernel {
         }
 
         let x = &inputs[0];
-        require_f32(op, "input", x.dtype)?;
-        require_f32(op, "output", outputs[0].dtype)?;
+        let dtype = FloatDtype::from_onnx(op, "input", x.dtype)?;
+        if dtype != FloatDtype::F32 {
+            self.runtime.require_nvrtc_half_headers(op)?;
+        }
+        if outputs[0].dtype != x.dtype {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep {op}: output dtype {:?} must equal input dtype {:?}",
+                outputs[0].dtype, x.dtype
+            )));
+        }
         require_contiguous(op, "input", x.is_contiguous())?;
         require_contiguous(op, "output", outputs[0].is_contiguous())?;
         if outputs[0].shape != x.shape {
@@ -220,9 +279,21 @@ impl ActivationKernel {
             // Optional inputs retain their positional slots, so max may be
             // present at index 2 while the min placeholder at index 1 is absent.
             if let Some(min) = inputs.get(1).filter(|input| !input.is_absent()) {
+                if min.dtype != x.dtype {
+                    return Err(EpError::KernelFailed(format!(
+                        "cuda_ep Clip: min dtype {:?} must equal input dtype {:?}",
+                        min.dtype, x.dtype
+                    )));
+                }
                 p0 = self.read_scalar("min", min)?;
             }
             if let Some(max) = inputs.get(2).filter(|input| !input.is_absent()) {
+                if max.dtype != x.dtype {
+                    return Err(EpError::KernelFailed(format!(
+                        "cuda_ep Clip: max dtype {:?} must equal input dtype {:?}",
+                        max.dtype, x.dtype
+                    )));
+                }
                 p1 = self.read_scalar("max", max)?;
             }
             if p0 > p1 {
@@ -237,7 +308,8 @@ impl ActivationKernel {
             .map_err(|_| EpError::KernelFailed(format!("cuda_ep {op}: {n} elements exceed i32")))?;
         let x_ptr = cuptr(x.data_ptr::<u8>() as *const c_void);
         let y_ptr = cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void);
-        let func = self.runtime.nvrtc_function(MODULE, SRC, self.op.entry())?;
+        let entry = self.op.entry(dtype);
+        let func = self.runtime.nvrtc_function(MODULE, SRC, &entry)?;
         let cfg = LaunchConfig {
             grid_dim: (grid_for(n), 1, 1),
             block_dim: (BLOCK, 1, 1),
@@ -247,8 +319,7 @@ impl ActivationKernel {
         builder.arg(&x_ptr).arg(&y_ptr).arg(&n_i).arg(&p0).arg(&p1);
         // SAFETY: every entry in SRC has the same (x, y, n, p0, p1) signature;
         // x/y cover n contiguous f32 elements, validated above.
-        unsafe { builder.launch(cfg) }
-            .map_err(|e| driver_err(&format!("launch {}", self.op.entry()), e))?;
+        unsafe { builder.launch(cfg) }.map_err(|e| driver_err(&format!("launch {entry}"), e))?;
         self.runtime.synchronize()
     }
 }
@@ -270,15 +341,6 @@ impl Kernel for ActivationKernel {
 fn grid_for(n: usize) -> u32 {
     const MAX_BLOCKS: usize = 65_535;
     n.div_ceil(BLOCK as usize).clamp(1, MAX_BLOCKS) as u32
-}
-
-fn require_f32(op: &str, name: &str, dtype: DataType) -> Result<()> {
-    if dtype != DataType::Float32 {
-        return Err(not_implemented(format!(
-            "{op} with {name} dtype {dtype:?} (Wave-4 activations are f32-only)"
-        )));
-    }
-    Ok(())
 }
 
 fn require_contiguous(op: &str, name: &str, contiguous: bool) -> Result<()> {
@@ -318,7 +380,11 @@ mod tests {
                 gamma: 1.0507,
             },
         ] {
-            assert!(SRC.contains(op.entry()), "missing {}", op.entry());
+            assert!(
+                SRC.contains(&format!("DEFINE_ACT({},", op.stem())),
+                "missing {}",
+                op.stem()
+            );
         }
     }
 

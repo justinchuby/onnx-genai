@@ -56,30 +56,9 @@ not yet wired) · **🔬 custom** (needs a fused NVRTC/CUTLASS kernel).
 
 | Op | Domain | Status | Backend | Notes |
 |----|--------|--------|---------|-------|
-| `Relu` | `` | ✅ | **NVRTC-custom** | f32 pointwise (`elementwise.rs`). NVRTC (not cuDNN) so it can later fuse into a GEMM epilogue. |
-| `Sqrt` | `` | ✅ | **NVRTC-custom** | f32 pointwise. |
-| `Erf` | `` | ✅ | **NVRTC-custom** | f32 pointwise (`erff` intrinsic). |
-| `Tanh` | `` | ✅ | **NVRTC-custom** | f32 pointwise. |
-| `Sigmoid` | `` | ✅ | **NVRTC-custom** | f32 pointwise (bonus; not in CPU set yet). |
-| `Gelu` | `com.microsoft` | ✅ | **NVRTC-custom** | exact (erf) GELU, f32. Prime fusion target (GELU-bias GEMM epilogue). |
-| `Abs` | `` | ✅ | **NVRTC-custom** | f32 pointwise, `fabsf` (`pointwise.rs`; CPU `x.abs()`). |
-| `Neg` | `` | ✅ | **NVRTC-custom** | f32 pointwise, `-x`. |
-| `Reciprocal` | `` | ✅ | **NVRTC-custom** | f32 pointwise, `1/x`. |
-| `Exp` | `` | ✅ | **NVRTC-custom** | f32 pointwise, `expf` (CPU `x.exp()`). |
-| `Log` | `` | ✅ | **NVRTC-custom** | f32 pointwise, `logf` (natural log; CPU `x.ln()`). |
-| `Sign` | `` | ✅ | **NVRTC-custom** | f32 pointwise; NaN→NaN, `sign(0)=0` (matches CPU `sign()`). |
-| `Floor` | `` | ✅ | **NVRTC-custom** | f32 pointwise, `floorf`. |
-| `Ceil` | `` | ✅ | **NVRTC-custom** | f32 pointwise, `ceilf`. |
-| `Round` | `` | ✅ | **NVRTC-custom** | f32 pointwise, `rintf` — round-half-to-**even** (ONNX / CPU `round_ties_even`, **not** `roundf`). |
-| `Sin` | `` | ✅ | **NVRTC-custom** | f32 pointwise, `sinf`. |
-| `Cos` | `` | ✅ | **NVRTC-custom** | f32 pointwise, `cosf`. |
-| `Softplus` | `` | ✅ | **NVRTC-custom** | f32 pointwise, stable `max(x,0)+log1pf(expf(-\|x\|))` (matches CPU). |
-| `LeakyRelu` | `` | ✅ | **NVRTC-custom** | f32; `x >= 0 ? x : alpha*x`, default `alpha=0.01`. |
-| `Elu` | `` | ✅ | **NVRTC-custom** | f32; `x >= 0 ? x : alpha*expm1(x)`, default `alpha=1`. |
-| `HardSigmoid` | `` | ✅ | **NVRTC-custom** | f32; `clamp(alpha*x+beta,0,1)`, defaults `alpha=0.2`, `beta=0.5`; preserves NaN. |
-| `Clip` | `` | ✅ | **NVRTC-custom** | f32; attribute bounds or scalar min/max inputs, unbounded defaults, NaN-preserving. |
-| `Softsign` | `` | ✅ | **NVRTC-custom** | f32; `x/(1+abs(x))`. |
-| `Selu` | `` | ✅ | **NVRTC-custom** | f32; `gamma*(x >= 0 ? x : alpha*expm1(x))`, defaults `alpha=1.67326`, `gamma=1.0507`. |
+| `Relu`, `Sqrt`, `Erf`, `Tanh`, `Sigmoid`, `Gelu` | standard / `com.microsoft` | ✅ | **NVRTC-custom** | f32/f16/bf16; half storage widens to f32 compute and narrows once on store (`elementwise.rs`). |
+| `Abs`, `Neg`, `Reciprocal`, `Exp`, `Log`, `Sign`, `Floor`, `Ceil`, `Round`, `Sin`, `Cos`, `Softplus` | `` | ✅ | **NVRTC-custom** | f32/f16/bf16 with CPU-matched formulas (`pointwise.rs`); `Round` uses ties-to-even and `Sign` preserves NaN. |
+| `LeakyRelu`, `Elu`, `HardSigmoid`, `Clip`, `Softsign`, `Selu` | `` | ✅ | **NVRTC-custom** | Attribute/input-driven f32/f16/bf16 activations (`activations.rs`), computed in f32 for half storage. |
 
 ### Elementwise — logical / comparison
 
@@ -99,13 +78,7 @@ not yet wired) · **🔬 custom** (needs a fused NVRTC/CUTLASS kernel).
 
 | Op | Domain | Status | Backend | Notes |
 |----|--------|--------|---------|-------|
-| `Add` | `` | ✅ | **NVRTC-custom** | f32, **equal-shape**. Broadcasting ⏳ (actionable error today). |
-| `Sub` | `` | ✅ | **NVRTC-custom** | f32, equal-shape. |
-| `Mul` | `` | ✅ | **NVRTC-custom** | f32, equal-shape. |
-| `Div` | `` | ✅ | **NVRTC-custom** | f32, equal-shape. |
-| `Pow` | `` | ✅ | **NVRTC-custom** | f32, equal-shape (`powf`). |
-| `Min` | `` | ✅ | **NVRTC-custom** | f32, equal-shape. |
-| `Max` | `` | ✅ | **NVRTC-custom** | f32, equal-shape. |
+| `Add`, `Sub`, `Mul`, `Div`, `Pow`, `Min`, `Max` | `` | ✅ | **NVRTC-custom** | f32/f16/bf16 with NumPy right-aligned broadcasting. Host-computed output shape plus zero-stride metadata drives one generic device index walk; half arithmetic computes in f32. |
 
 ### Normalization & softmax
 
@@ -210,6 +183,11 @@ Wave 4 raises the advertised CUDA set from **48 to 54** op names. Its six
 activations are GPU-validated against independent CPU formulas on the local
 CUDA 13.0 host; broader performance validation remains separate.
 
+The pointwise dtype/broadcast pass is GPU-validated on H200 for f16 and bf16
+`Add`/`Sub`/`Mul`/`Div`, `[4,1,3]` with `[1,5,3]` NumPy broadcasting, and
+representative unary/activation kernels. Half storage is widened to f32 for
+compute and rounded once on output, matching the CPU EP convention.
+
 ---
 
 ## Custom-kernel candidates (with WHY)
@@ -240,10 +218,8 @@ expected impact for transformer inference.
 5. **RoPE (rotary position embedding)** — no library op; a small fused kernel
    applying the sin/cos rotation in place over Q/K. Pure win, transformer-
    ubiquitous.
-6. **Broadcasting elementwise** — extend the binary kernels with NumPy
-   broadcast index math (shared with `Expand`). Removes today's "materialise the
-   smaller operand" restriction. Library alternative (cuDNN OpTensor) is
-   clunkier and less fusable.
+6. **Elementwise chain fusion** remains the next pointwise optimization;
+   dtype-generic NumPy broadcasting is now implemented for arithmetic binaries.
 
 Everything else in the matrix (`ReduceMean`→cub, `Softmax`→cuDNN, `Cast`,
 data-movement) is a **straight library/primitive mapping**, not a custom-kernel

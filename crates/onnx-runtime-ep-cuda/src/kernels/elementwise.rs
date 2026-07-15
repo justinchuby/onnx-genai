@@ -4,20 +4,15 @@
 //! ONNX elementwise chains, and keeping them as our own kernels is what later
 //! enables fusing an activation into a preceding GEMM epilogue).
 //!
-//! ## Scope of this slice (all limits are actionable errors, never panics)
+//! ## Scope (all limits are actionable errors, never panics)
 //!
-//! * **dtype:** f32 only. f16/bf16 land next (the same NVRTC source templated on
-//!   the element type); other dtypes return a "not implemented" error naming the
-//!   dtype and op.
+//! * **dtype:** f32/f16/bf16. Half inputs are widened to f32 for arithmetic and
+//!   narrowed once on store, matching the CPU EP's compute-domain convention.
 //! * **Unary** (`Relu`, `Sqrt`, `Erf`, `Tanh`, `Sigmoid`, `Gelu`): one input,
 //!   one output, identical shape; strided views are rejected with a
 //!   "materialise first" error.
-//! * **Binary** (`Add`, `Sub`, `Mul`, `Div`, `Pow`, `Min`, `Max`): two inputs of
-//!   **equal shape** (element-for-element). NumPy-style broadcasting is deferred
-//!   — a mismatch returns an actionable error telling the caller to broadcast
-//!   (materialise) the smaller operand upstream. Equal-shape is the dominant
-//!   case (residual adds, gate multiplies) and keeps the kernel correct-by-
-//!   construction while the broadcasting index math is added later.
+//! * **Binary** (`Add`, `Sub`, `Mul`, `Div`, `Pow`, `Min`, `Max`): NumPy-style
+//!   right-aligned broadcasting, using zero strides for size-one/missing axes.
 //!
 //! Each op is one thread-per-element grid-stride kernel; the arithmetic is
 //! trivially bandwidth-bound and matches a PyTorch pointwise kernel's shape.
@@ -36,78 +31,131 @@ use crate::runtime::{CudaRuntime, cuptr};
 /// Threads per block for the 1-D pointwise grids (a full warp-multiple block).
 const BLOCK: u32 = 256;
 
-/// NVRTC source: one `extern "C"` f32 pointwise kernel per unary op. NVRTC has
-/// no `<math.h>`, but the CUDA device runtime provides the intrinsics
-/// (`expf`, `tanhf`, `sqrtf`, `erff`) directly, so no header include is needed.
-const UNARY_SRC: &str = r#"
-extern "C" __global__ void relu_f32(const float* x, float* y, const int n) {
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x)
-        y[i] = fmaxf(x[i], 0.0f);
-}
-extern "C" __global__ void sqrt_f32(const float* x, float* y, const int n) {
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x)
-        y[i] = sqrtf(x[i]);
-}
-extern "C" __global__ void erf_f32(const float* x, float* y, const int n) {
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x)
-        y[i] = erff(x[i]);
-}
-extern "C" __global__ void tanh_f32(const float* x, float* y, const int n) {
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x)
-        y[i] = tanhf(x[i]);
-}
-extern "C" __global__ void sigmoid_f32(const float* x, float* y, const int n) {
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x)
-        y[i] = 1.0f / (1.0f + expf(-x[i]));
-}
-extern "C" __global__ void gelu_f32(const float* x, float* y, const int n) {
-    // Exact (erf) GELU: x * 0.5 * (1 + erf(x / sqrt(2))).
-    const float inv_sqrt2 = 0.7071067811865475f;
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
-        float v = x[i];
-        y[i] = v * 0.5f * (1.0f + erff(v * inv_sqrt2));
-    }
-}
-"#;
+const POINTWISE_SRC: &str = r#"
+#if __has_include(<cuda_fp16.h>) && __has_include(<cuda_bf16.h>)
+#define NXRT_HAS_CUDA_HALF_HEADERS 1
+#include <cuda_fp16.h>
+#include <cuda_bf16.h>
+#endif
 
-/// NVRTC source: one `extern "C"` f32 pointwise kernel per binary op (equal
-/// shape; the two operands and the output share an index).
-const BINARY_SRC: &str = r#"
-extern "C" __global__ void add_f32(const float* a, const float* b, float* y, const int n) {
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x)
-        y[i] = a[i] + b[i];
+template <typename T> __device__ float load_float(T value);
+template <> __device__ float load_float<float>(float value) { return value; }
+#ifdef NXRT_HAS_CUDA_HALF_HEADERS
+template <> __device__ float load_float<__half>(__half value) { return __half2float(value); }
+template <> __device__ float load_float<__nv_bfloat16>(__nv_bfloat16 value) { return __bfloat162float(value); }
+#endif
+
+template <typename T> __device__ T store_float(float value);
+template <> __device__ float store_float<float>(float value) { return value; }
+#ifdef NXRT_HAS_CUDA_HALF_HEADERS
+template <> __device__ __half store_float<__half>(float value) { return __float2half_rn(value); }
+template <> __device__ __nv_bfloat16 store_float<__nv_bfloat16>(float value) {
+    return __float2bfloat16_rn(value);
 }
-extern "C" __global__ void sub_f32(const float* a, const float* b, float* y, const int n) {
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x)
-        y[i] = a[i] - b[i];
+#endif
+
+__device__ float op_relu(float x) { return x != x ? x : fmaxf(x, 0.0f); }
+__device__ float op_sqrt(float x) { return sqrtf(x); }
+__device__ float op_erf(float x) { return erff(x); }
+__device__ float op_tanh(float x) { return tanhf(x); }
+__device__ float op_sigmoid(float x) {
+    if (x >= 0.0f) return 1.0f / (1.0f + expf(-x));
+    float e = expf(x);
+    return e / (1.0f + e);
 }
-extern "C" __global__ void mul_f32(const float* a, const float* b, float* y, const int n) {
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x)
-        y[i] = a[i] * b[i];
+__device__ float op_gelu(float x) {
+    return x * 0.5f * (1.0f + erff(x * 0.7071067811865475f));
 }
-extern "C" __global__ void div_f32(const float* a, const float* b, float* y, const int n) {
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x)
-        y[i] = a[i] / b[i];
+
+__device__ float op_add(float a, float b) { return a + b; }
+__device__ float op_sub(float a, float b) { return a - b; }
+__device__ float op_mul(float a, float b) { return a * b; }
+__device__ float op_div(float a, float b) { return a / b; }
+__device__ float op_pow(float a, float b) { return powf(a, b); }
+__device__ float op_min(float a, float b) { return (a != a || b != b) ? a + b : fminf(a, b); }
+__device__ float op_max(float a, float b) { return (a != a || b != b) ? a + b : fmaxf(a, b); }
+
+#define DEFINE_UNARY(NAME, TYPE, SUFFIX) \
+extern "C" __global__ void NAME##_##SUFFIX(const TYPE* x, TYPE* y, const unsigned long long n) { \
+    for (unsigned long long i = blockIdx.x * blockDim.x + threadIdx.x; i < n; \
+         i += (unsigned long long)gridDim.x * blockDim.x) \
+        y[i] = store_float<TYPE>(op_##NAME(load_float<TYPE>(x[i]))); \
 }
-extern "C" __global__ void pow_f32(const float* a, const float* b, float* y, const int n) {
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x)
-        y[i] = powf(a[i], b[i]);
+
+#define DEFINE_BINARY(NAME, TYPE, SUFFIX) \
+extern "C" __global__ void NAME##_##SUFFIX( \
+    const TYPE* a, const TYPE* b, TYPE* y, const unsigned long long* metadata, \
+    const int rank, const unsigned long long n) { \
+    const unsigned long long* shape = metadata; \
+    const unsigned long long* a_strides = metadata + rank; \
+    const unsigned long long* b_strides = metadata + rank * 2; \
+    for (unsigned long long i = blockIdx.x * blockDim.x + threadIdx.x; i < n; \
+         i += (unsigned long long)gridDim.x * blockDim.x) { \
+        unsigned long long linear = i, ai = 0, bi = 0; \
+        for (int d = rank - 1; d >= 0; --d) { \
+            unsigned long long coord = linear % shape[d]; \
+            linear /= shape[d]; \
+            ai += coord * a_strides[d]; \
+            bi += coord * b_strides[d]; \
+        } \
+        y[i] = store_float<TYPE>(op_##NAME(load_float<TYPE>(a[ai]), load_float<TYPE>(b[bi]))); \
+    } \
 }
-extern "C" __global__ void min_f32(const float* a, const float* b, float* y, const int n) {
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x)
-        y[i] = fminf(a[i], b[i]);
-}
-extern "C" __global__ void max_f32(const float* a, const float* b, float* y, const int n) {
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x)
-        y[i] = fmaxf(a[i], b[i]);
-}
+
+#define DEFINE_FOR_TYPE(TYPE, SUFFIX) \
+DEFINE_UNARY(relu, TYPE, SUFFIX) \
+DEFINE_UNARY(sqrt, TYPE, SUFFIX) \
+DEFINE_UNARY(erf, TYPE, SUFFIX) \
+DEFINE_UNARY(tanh, TYPE, SUFFIX) \
+DEFINE_UNARY(sigmoid, TYPE, SUFFIX) \
+DEFINE_UNARY(gelu, TYPE, SUFFIX) \
+DEFINE_BINARY(add, TYPE, SUFFIX) \
+DEFINE_BINARY(sub, TYPE, SUFFIX) \
+DEFINE_BINARY(mul, TYPE, SUFFIX) \
+DEFINE_BINARY(div, TYPE, SUFFIX) \
+DEFINE_BINARY(pow, TYPE, SUFFIX) \
+DEFINE_BINARY(min, TYPE, SUFFIX) \
+DEFINE_BINARY(max, TYPE, SUFFIX)
+
+DEFINE_FOR_TYPE(float, f32)
+#ifdef NXRT_HAS_CUDA_HALF_HEADERS
+DEFINE_FOR_TYPE(__half, f16)
+DEFINE_FOR_TYPE(__nv_bfloat16, bf16)
+#endif
 "#;
 
 /// NVRTC module names (one module holds all unary / all binary entries so a
 /// runtime compiles each source string at most once — see
 /// [`CudaRuntime::nvrtc_function`]).
-const UNARY_MODULE: &str = "elementwise_unary_f32";
-const BINARY_MODULE: &str = "elementwise_binary_f32";
+const POINTWISE_MODULE: &str = "elementwise_float_v2";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FloatDtype {
+    F32,
+    F16,
+    Bf16,
+}
+
+impl FloatDtype {
+    fn from_onnx(op: &str, name: &str, dtype: DataType) -> Result<Self> {
+        match dtype {
+            DataType::Float32 => Ok(Self::F32),
+            DataType::Float16 => Ok(Self::F16),
+            DataType::BFloat16 => Ok(Self::Bf16),
+            other => Err(not_implemented(format!(
+                "{op} with {name} dtype {other:?} (supported: Float32, Float16, BFloat16)"
+            ))),
+        }
+    }
+
+    fn suffix(self) -> &'static str {
+        match self {
+            Self::F32 => "f32",
+            Self::F16 => "f16",
+            Self::Bf16 => "bf16",
+        }
+    }
+}
 
 /// A supported elementwise unary op and its NVRTC entry point.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -121,15 +169,19 @@ pub enum UnaryOp {
 }
 
 impl UnaryOp {
-    fn entry(self) -> &'static str {
+    fn stem(self) -> &'static str {
         match self {
-            UnaryOp::Relu => "relu_f32",
-            UnaryOp::Sqrt => "sqrt_f32",
-            UnaryOp::Erf => "erf_f32",
-            UnaryOp::Tanh => "tanh_f32",
-            UnaryOp::Sigmoid => "sigmoid_f32",
-            UnaryOp::Gelu => "gelu_f32",
+            UnaryOp::Relu => "relu",
+            UnaryOp::Sqrt => "sqrt",
+            UnaryOp::Erf => "erf",
+            UnaryOp::Tanh => "tanh",
+            UnaryOp::Sigmoid => "sigmoid",
+            UnaryOp::Gelu => "gelu",
         }
+    }
+
+    fn entry(self, dtype: FloatDtype) -> String {
+        format!("{}_{}", self.stem(), dtype.suffix())
     }
 
     /// ONNX op type this maps to (for error messages).
@@ -158,16 +210,20 @@ pub enum BinaryOp {
 }
 
 impl BinaryOp {
-    fn entry(self) -> &'static str {
+    fn stem(self) -> &'static str {
         match self {
-            BinaryOp::Add => "add_f32",
-            BinaryOp::Sub => "sub_f32",
-            BinaryOp::Mul => "mul_f32",
-            BinaryOp::Div => "div_f32",
-            BinaryOp::Pow => "pow_f32",
-            BinaryOp::Min => "min_f32",
-            BinaryOp::Max => "max_f32",
+            BinaryOp::Add => "add",
+            BinaryOp::Sub => "sub",
+            BinaryOp::Mul => "mul",
+            BinaryOp::Div => "div",
+            BinaryOp::Pow => "pow",
+            BinaryOp::Min => "min",
+            BinaryOp::Max => "max",
         }
+    }
+
+    fn entry(self, dtype: FloatDtype) -> String {
+        format!("{}_{}", self.stem(), dtype.suffix())
     }
 
     fn op_name(self) -> &'static str {
@@ -189,16 +245,6 @@ impl BinaryOp {
 fn grid_for(n: usize) -> u32 {
     const MAX_BLOCKS: usize = 65_535;
     n.div_ceil(BLOCK as usize).clamp(1, MAX_BLOCKS) as u32
-}
-
-/// Reject any dtype other than f32 with an actionable, op-named error.
-fn require_f32(op: &str, name: &str, dt: DataType) -> Result<()> {
-    if dt != DataType::Float32 {
-        return Err(not_implemented(format!(
-            "{op} with {name} dtype {dt:?} (this slice is f32-only; f16/bf16 pending)"
-        )));
-    }
-    Ok(())
 }
 
 /// Reject a strided (non-contiguous) view with a "materialise first" error.
@@ -227,7 +273,7 @@ impl KernelFactory for UnaryFactory {
     }
 }
 
-/// NVRTC-backed f32 unary elementwise kernel.
+/// NVRTC-backed floating-point unary elementwise kernel.
 #[derive(Debug)]
 pub struct UnaryKernel {
     op: UnaryOp,
@@ -245,8 +291,16 @@ impl UnaryKernel {
             )));
         }
         let x = &inputs[0];
-        require_f32(op, "input", x.dtype)?;
-        require_f32(op, "output", outputs[0].dtype)?;
+        let dtype = FloatDtype::from_onnx(op, "input", x.dtype)?;
+        if dtype != FloatDtype::F32 {
+            self.runtime.require_nvrtc_half_headers(op)?;
+        }
+        if outputs[0].dtype != x.dtype {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep {op}: output dtype {:?} must equal input dtype {:?}",
+                outputs[0].dtype, x.dtype
+            )));
+        }
         require_contiguous(op, "input", x.is_contiguous())?;
         require_contiguous(op, "output", outputs[0].is_contiguous())?;
 
@@ -259,14 +313,15 @@ impl UnaryKernel {
         }
 
         let n = x.numel();
-        let n_i = i32::try_from(n)
-            .map_err(|_| EpError::KernelFailed(format!("cuda_ep {op}: {n} elements exceed i32")))?;
+        let n_u64 = u64::try_from(n)
+            .map_err(|_| EpError::KernelFailed(format!("cuda_ep {op}: {n} elements exceed u64")))?;
         let x_ptr = cuptr(x.data_ptr::<u8>() as *const c_void);
         let y_ptr = cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void);
+        let entry = self.op.entry(dtype);
 
         let func = self
             .runtime
-            .nvrtc_function(UNARY_MODULE, UNARY_SRC, self.op.entry())?;
+            .nvrtc_function(POINTWISE_MODULE, POINTWISE_SRC, &entry)?;
         let cfg = LaunchConfig {
             grid_dim: (grid_for(n), 1, 1),
             block_dim: (BLOCK, 1, 1),
@@ -274,12 +329,10 @@ impl UnaryKernel {
         };
         let stream = self.runtime.stream();
         let mut builder = stream.launch_builder(&func);
-        builder.arg(&x_ptr).arg(&y_ptr).arg(&n_i);
-        // SAFETY: `func` is the compiled unary entry; the (const float*, float*,
-        // int) argument list matches its signature; `x_ptr`/`y_ptr` are live
-        // device allocations of `n` f32 elements (bounds validated above).
-        unsafe { builder.launch(cfg) }
-            .map_err(|e| driver_err(&format!("launch {}", self.op.entry()), e))?;
+        builder.arg(&x_ptr).arg(&y_ptr).arg(&n_u64);
+        // SAFETY: the entry's pointer types match the validated dtype and both
+        // allocations cover `n` elements.
+        unsafe { builder.launch(cfg) }.map_err(|e| driver_err(&format!("launch {entry}"), e))?;
         self.runtime.synchronize()
     }
 }
@@ -315,7 +368,7 @@ impl KernelFactory for BinaryFactory {
     }
 }
 
-/// NVRTC-backed f32 binary elementwise kernel (equal-shape operands).
+/// NVRTC-backed floating-point binary elementwise kernel with broadcasting.
 #[derive(Debug)]
 pub struct BinaryKernel {
     op: BinaryOp,
@@ -334,38 +387,53 @@ impl BinaryKernel {
         }
         let a = &inputs[0];
         let b = &inputs[1];
-        require_f32(op, "A", a.dtype)?;
-        require_f32(op, "B", b.dtype)?;
-        require_f32(op, "output", outputs[0].dtype)?;
+        let dtype = FloatDtype::from_onnx(op, "A", a.dtype)?;
+        if dtype != FloatDtype::F32 {
+            self.runtime.require_nvrtc_half_headers(op)?;
+        }
+        if b.dtype != a.dtype || outputs[0].dtype != a.dtype {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep {op}: A/B/output dtypes must match, got {:?}/{:?}/{:?}",
+                a.dtype, b.dtype, outputs[0].dtype
+            )));
+        }
         require_contiguous(op, "A", a.is_contiguous())?;
         require_contiguous(op, "B", b.is_contiguous())?;
         require_contiguous(op, "output", outputs[0].is_contiguous())?;
 
-        if a.shape != b.shape {
-            return Err(not_implemented(format!(
-                "{op} with unequal operand shapes A {:?} vs B {:?} \
-                 (NumPy broadcasting is not yet wired on CUDA; broadcast/materialise \
-                 the operands to a common shape upstream)",
-                a.shape, b.shape
-            )));
-        }
-        if outputs[0].shape != a.shape {
+        let out_shape = onnx_runtime_ir::broadcast_shapes(a.shape, b.shape).map_err(EpError::Ir)?;
+        if outputs[0].shape != out_shape {
             return Err(EpError::KernelFailed(format!(
-                "cuda_ep {op}: output shape {:?} must equal the operand shape {:?}",
-                outputs[0].shape, a.shape
+                "cuda_ep {op}: output shape {:?} must equal broadcast shape {:?}",
+                outputs[0].shape, out_shape
             )));
         }
 
-        let n = a.numel();
-        let n_i = i32::try_from(n)
-            .map_err(|_| EpError::KernelFailed(format!("cuda_ep {op}: {n} elements exceed i32")))?;
+        let n = outputs[0].numel();
+        let n_u64 = u64::try_from(n)
+            .map_err(|_| EpError::KernelFailed(format!("cuda_ep {op}: {n} elements exceed u64")))?;
+        let rank = i32::try_from(out_shape.len()).map_err(|_| {
+            EpError::KernelFailed(format!(
+                "cuda_ep {op}: rank {} exceeds i32",
+                out_shape.len()
+            ))
+        })?;
+        let entry = self.op.entry(dtype);
+        let func = self
+            .runtime
+            .nvrtc_function(POINTWISE_MODULE, POINTWISE_SRC, &entry)?;
+        let metadata = broadcast_metadata(a.shape, b.shape, &out_shape);
+        let metadata_bytes = u64_bytes(&metadata);
+        let metadata_ptr = self.runtime.alloc_raw(metadata_bytes.len())?;
+        // SAFETY: allocation exactly covers the metadata byte slice.
+        if let Err(error) = unsafe { self.runtime.htod(metadata_bytes, metadata_ptr) } {
+            // SAFETY: metadata_ptr is still owned by this call and no launch occurred.
+            let _ = unsafe { self.runtime.free_raw(metadata_ptr) };
+            return Err(error);
+        }
         let a_ptr = cuptr(a.data_ptr::<u8>() as *const c_void);
         let b_ptr = cuptr(b.data_ptr::<u8>() as *const c_void);
         let y_ptr = cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void);
-
-        let func = self
-            .runtime
-            .nvrtc_function(BINARY_MODULE, BINARY_SRC, self.op.entry())?;
         let cfg = LaunchConfig {
             grid_dim: (grid_for(n), 1, 1),
             block_dim: (BLOCK, 1, 1),
@@ -373,13 +441,21 @@ impl BinaryKernel {
         };
         let stream = self.runtime.stream();
         let mut builder = stream.launch_builder(&func);
-        builder.arg(&a_ptr).arg(&b_ptr).arg(&y_ptr).arg(&n_i);
-        // SAFETY: `func` is the compiled binary entry; the (const float*, const
-        // float*, float*, int) argument list matches its signature; all three
-        // pointers are live device allocations of `n` f32 elements (validated).
-        unsafe { builder.launch(cfg) }
-            .map_err(|e| driver_err(&format!("launch {}", self.op.entry()), e))?;
-        self.runtime.synchronize()
+        builder
+            .arg(&a_ptr)
+            .arg(&b_ptr)
+            .arg(&y_ptr)
+            .arg(&metadata_ptr)
+            .arg(&rank)
+            .arg(&n_u64);
+        // SAFETY: pointer types match the dtype; metadata contains three
+        // rank-length u64 arrays; broadcast strides keep all reads in bounds.
+        let launch =
+            unsafe { builder.launch(cfg) }.map_err(|e| driver_err(&format!("launch {entry}"), e));
+        let sync = launch.and_then(|_| self.runtime.synchronize());
+        // SAFETY: metadata_ptr is owned by this call and the launch is synchronized.
+        let free = unsafe { self.runtime.free_raw(metadata_ptr) };
+        sync.and(free)
     }
 }
 
@@ -393,7 +469,40 @@ impl Kernel for BinaryKernel {
     }
 
     fn cuda_graph_compatible(&self) -> bool {
-        true
+        false
+    }
+}
+
+fn broadcast_metadata(a: &[usize], b: &[usize], out: &[usize]) -> Vec<u64> {
+    let mut metadata = out.iter().map(|&d| d as u64).collect::<Vec<_>>();
+    metadata.extend(broadcast_strides(a, out));
+    metadata.extend(broadcast_strides(b, out));
+    metadata
+}
+
+fn broadcast_strides(input: &[usize], out: &[usize]) -> Vec<u64> {
+    let contiguous = onnx_runtime_ir::compute_contiguous_strides(input);
+    let leading = out.len() - input.len();
+    (0..out.len())
+        .map(|axis| {
+            if axis < leading {
+                0
+            } else {
+                let input_axis = axis - leading;
+                if input[input_axis] == 1 {
+                    0
+                } else {
+                    contiguous[input_axis] as u64
+                }
+            }
+        })
+        .collect()
+}
+
+fn u64_bytes(values: &[u64]) -> &[u8] {
+    // SAFETY: u64 is plain data and the byte slice retains the input lifetime.
+    unsafe {
+        std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), std::mem::size_of_val(values))
     }
 }
 
@@ -414,9 +523,8 @@ mod tests {
         for op in ops {
             // Every advertised entry must be present verbatim in the NVRTC source.
             assert!(
-                UNARY_SRC.contains(op.entry()),
-                "missing NVRTC entry {} for {}",
-                op.entry(),
+                POINTWISE_SRC.contains(&format!("DEFINE_UNARY({},", op.stem())),
+                "missing NVRTC generator for {}",
                 op.op_name()
             );
         }
@@ -435,20 +543,27 @@ mod tests {
         ];
         for op in ops {
             assert!(
-                BINARY_SRC.contains(op.entry()),
-                "missing NVRTC entry {} for {}",
-                op.entry(),
+                POINTWISE_SRC.contains(&format!("DEFINE_BINARY({},", op.stem())),
+                "missing NVRTC generator for {}",
                 op.op_name()
             );
         }
     }
 
     #[test]
-    fn require_f32_rejects_other_dtypes_actionably() {
-        let e = require_f32("Relu", "input", DataType::Int64).unwrap_err();
+    fn dtype_dispatch_accepts_half_and_rejects_non_float() {
+        assert_eq!(
+            FloatDtype::from_onnx("Relu", "input", DataType::Float16).unwrap(),
+            FloatDtype::F16
+        );
+        assert_eq!(
+            FloatDtype::from_onnx("Relu", "input", DataType::BFloat16).unwrap(),
+            FloatDtype::Bf16
+        );
+        let e = FloatDtype::from_onnx("Relu", "input", DataType::Int64).unwrap_err();
         let msg = format!("{e}");
         assert!(msg.contains("Int64"), "{msg}");
-        assert!(msg.contains("f32-only"), "{msg}");
+        assert!(msg.contains("Float16"), "{msg}");
     }
 
     #[test]
@@ -467,5 +582,12 @@ mod tests {
         assert_eq!(grid_for(BLOCK as usize + 1), 2);
         // Huge tensors clamp to the grid limit but stay non-zero (grid-stride).
         assert_eq!(grid_for(usize::MAX / 2), 65_535);
+    }
+
+    #[test]
+    fn broadcast_strides_are_right_aligned_and_zero_for_expanded_axes() {
+        assert_eq!(broadcast_strides(&[4, 1, 3], &[4, 5, 3]), [3, 0, 1]);
+        assert_eq!(broadcast_strides(&[1, 5, 3], &[4, 5, 3]), [0, 3, 1]);
+        assert_eq!(broadcast_strides(&[3], &[4, 5, 3]), [0, 0, 1]);
     }
 }

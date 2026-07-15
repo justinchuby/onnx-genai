@@ -9,7 +9,7 @@
 //!
 //! * **Unary math** (`Abs`, `Neg`, `Reciprocal`, `Exp`, `Log`, `Sign`, `Floor`,
 //!   `Ceil`, `Round`, `Sin`, `Cos`, `Softplus`): one input, one output, identical
-//!   shape, **f32**. Each formula is matched **exactly** to the CPU EP
+//!   shape, **f32/f16/bf16** (half storage computes in f32). Each formula is matched **exactly** to the CPU EP
 //!   (`crates/onnx-runtime-ep-cpu/src/kernels/unary_math.rs`) so the untestable-
 //!   on-this-host kernels stay numerically identical to the reference path.
 //! * **Not** (`Not`): boolean element negation, matched to the CPU EP
@@ -19,10 +19,8 @@
 //! * **Logical** (`And`, `Or`, `Xor`): two **Bool** inputs of **equal shape** →
 //!   **Bool** output (non-zero byte is `true`, canonical `1`/`0` out).
 //!
-//! `dtype`: f32 (math/comparison) / bool (logical/`Not`) only — f16/bf16 are
-//! deferred exactly as in [`super::elementwise`] (the same NVRTC source templated
-//! on the element type lands with that slice); other dtypes return a "not
-//! implemented" error naming the dtype and op.
+//! `dtype`: f32/f16/bf16 for unary math, f32 for comparison, and bool for
+//! logical/`Not`; other dtypes return an actionable error naming the dtype/op.
 //!
 //! **Broadcasting:** the binary comparison/logical ops require **equal-shape**
 //! operands, matching the [`super::elementwise`] binary kernels exactly (NumPy
@@ -63,7 +61,36 @@ fn require_dtype(op: &str, name: &str, dt: DataType, want: DataType) -> Result<(
              f16/bf16 pending — see docs/CUDA_COVERAGE.md)"
         )));
     }
+
     Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FloatDtype {
+    F32,
+    F16,
+    Bf16,
+}
+
+impl FloatDtype {
+    fn from_onnx(op: &str, name: &str, dtype: DataType) -> Result<Self> {
+        match dtype {
+            DataType::Float32 => Ok(Self::F32),
+            DataType::Float16 => Ok(Self::F16),
+            DataType::BFloat16 => Ok(Self::Bf16),
+            other => Err(not_implemented(format!(
+                "{op} with {name} dtype {other:?} (supported: Float32, Float16, BFloat16)"
+            ))),
+        }
+    }
+
+    fn suffix(self) -> &'static str {
+        match self {
+            Self::F32 => "f32",
+            Self::F16 => "f16",
+            Self::Bf16 => "bf16",
+        }
+    }
 }
 
 /// Reject a strided (non-contiguous) view with a "materialise first" error.
@@ -87,79 +114,72 @@ fn count_u64(op: &str, n: usize) -> Result<u64> {
 // Unary math (f32 → f32)
 // ===========================================================================
 
-/// NVRTC source: one `extern "C"` f32 pointwise kernel per unary math op. NVRTC
+/// NVRTC source: dtype-templated pointwise kernels for each unary math op. NVRTC
 /// resolves the CUDA device intrinsics (`expf`, `logf`, `sinf`, `rintf`,
 /// `log1pf`, …) with no header include. Each formula is annotated with the exact
 /// CPU-EP expression it mirrors (`unary_math.rs`).
 const UNARY_MATH_SRC: &str = r#"
-extern "C" __global__ void abs_f32(const float* x, float* y, const unsigned long long n) {
-    // CPU: x.abs()
-    for (unsigned long long i = blockIdx.x*blockDim.x + threadIdx.x; i < n; i += (unsigned long long)gridDim.x * blockDim.x)
-        y[i] = fabsf(x[i]);
+#if __has_include(<cuda_fp16.h>) && __has_include(<cuda_bf16.h>)
+#define NXRT_HAS_CUDA_HALF_HEADERS 1
+#include <cuda_fp16.h>
+#include <cuda_bf16.h>
+#endif
+
+template <typename T> __device__ float load_float(T value);
+template <> __device__ float load_float<float>(float value) { return value; }
+#ifdef NXRT_HAS_CUDA_HALF_HEADERS
+template <> __device__ float load_float<__half>(__half value) { return __half2float(value); }
+template <> __device__ float load_float<__nv_bfloat16>(__nv_bfloat16 value) { return __bfloat162float(value); }
+#endif
+template <typename T> __device__ T store_float(float value);
+template <> __device__ float store_float<float>(float value) { return value; }
+#ifdef NXRT_HAS_CUDA_HALF_HEADERS
+template <> __device__ __half store_float<__half>(float value) { return __float2half_rn(value); }
+template <> __device__ __nv_bfloat16 store_float<__nv_bfloat16>(float value) { return __float2bfloat16_rn(value); }
+#endif
+
+__device__ float op_abs(float x) { return fabsf(x); }
+__device__ float op_neg(float x) { return -x; }
+__device__ float op_reciprocal(float x) { return 1.0f / x; }
+__device__ float op_exp(float x) { return expf(x); }
+__device__ float op_log(float x) { return logf(x); }
+__device__ float op_sign(float x) {
+    return (x != x) ? x : ((x > 0.0f) ? 1.0f : ((x < 0.0f) ? -1.0f : 0.0f));
 }
-extern "C" __global__ void neg_f32(const float* x, float* y, const unsigned long long n) {
-    // CPU: -x
-    for (unsigned long long i = blockIdx.x*blockDim.x + threadIdx.x; i < n; i += (unsigned long long)gridDim.x * blockDim.x)
-        y[i] = -x[i];
+__device__ float op_floor(float x) { return floorf(x); }
+__device__ float op_ceil(float x) { return ceilf(x); }
+__device__ float op_round(float x) { return rintf(x); }
+__device__ float op_sin(float x) { return sinf(x); }
+__device__ float op_cos(float x) { return cosf(x); }
+__device__ float op_softplus(float x) { return fmaxf(x, 0.0f) + log1pf(expf(-fabsf(x))); }
+
+#define DEFINE_UNARY(NAME, TYPE, SUFFIX) \
+extern "C" __global__ void NAME##_##SUFFIX(const TYPE* x, TYPE* y, const unsigned long long n) { \
+    for (unsigned long long i = blockIdx.x*blockDim.x + threadIdx.x; i < n; \
+         i += (unsigned long long)gridDim.x * blockDim.x) \
+        y[i] = store_float<TYPE>(op_##NAME(load_float<TYPE>(x[i]))); \
 }
-extern "C" __global__ void reciprocal_f32(const float* x, float* y, const unsigned long long n) {
-    // CPU: 1.0 / x
-    for (unsigned long long i = blockIdx.x*blockDim.x + threadIdx.x; i < n; i += (unsigned long long)gridDim.x * blockDim.x)
-        y[i] = 1.0f / x[i];
-}
-extern "C" __global__ void exp_f32(const float* x, float* y, const unsigned long long n) {
-    // CPU: x.exp()
-    for (unsigned long long i = blockIdx.x*blockDim.x + threadIdx.x; i < n; i += (unsigned long long)gridDim.x * blockDim.x)
-        y[i] = expf(x[i]);
-}
-extern "C" __global__ void log_f32(const float* x, float* y, const unsigned long long n) {
-    // CPU: x.ln()  (natural log)
-    for (unsigned long long i = blockIdx.x*blockDim.x + threadIdx.x; i < n; i += (unsigned long long)gridDim.x * blockDim.x)
-        y[i] = logf(x[i]);
-}
-extern "C" __global__ void sign_f32(const float* x, float* y, const unsigned long long n) {
-    // CPU sign(): NaN -> NaN, >0 -> 1, <0 -> -1, else 0 (so sign(0)=0, sign(-0)=0).
-    for (unsigned long long i = blockIdx.x*blockDim.x + threadIdx.x; i < n; i += (unsigned long long)gridDim.x * blockDim.x) {
-        float v = x[i];
-        y[i] = (v != v) ? v : ((v > 0.0f) ? 1.0f : ((v < 0.0f) ? -1.0f : 0.0f));
-    }
-}
-extern "C" __global__ void floor_f32(const float* x, float* y, const unsigned long long n) {
-    // CPU: x.floor()
-    for (unsigned long long i = blockIdx.x*blockDim.x + threadIdx.x; i < n; i += (unsigned long long)gridDim.x * blockDim.x)
-        y[i] = floorf(x[i]);
-}
-extern "C" __global__ void ceil_f32(const float* x, float* y, const unsigned long long n) {
-    // CPU: x.ceil()
-    for (unsigned long long i = blockIdx.x*blockDim.x + threadIdx.x; i < n; i += (unsigned long long)gridDim.x * blockDim.x)
-        y[i] = ceilf(x[i]);
-}
-extern "C" __global__ void round_f32(const float* x, float* y, const unsigned long long n) {
-    // CPU: x.round_ties_even() (banker's rounding = ONNX round-half-to-even).
-    // rintf rounds to nearest, ties-to-even under the default rounding mode.
-    for (unsigned long long i = blockIdx.x*blockDim.x + threadIdx.x; i < n; i += (unsigned long long)gridDim.x * blockDim.x)
-        y[i] = rintf(x[i]);
-}
-extern "C" __global__ void sin_f32(const float* x, float* y, const unsigned long long n) {
-    // CPU: x.sin()
-    for (unsigned long long i = blockIdx.x*blockDim.x + threadIdx.x; i < n; i += (unsigned long long)gridDim.x * blockDim.x)
-        y[i] = sinf(x[i]);
-}
-extern "C" __global__ void cos_f32(const float* x, float* y, const unsigned long long n) {
-    // CPU: x.cos()
-    for (unsigned long long i = blockIdx.x*blockDim.x + threadIdx.x; i < n; i += (unsigned long long)gridDim.x * blockDim.x)
-        y[i] = cosf(x[i]);
-}
-extern "C" __global__ void softplus_f32(const float* x, float* y, const unsigned long long n) {
-    // CPU: x.max(0.0) + (-x.abs()).exp().ln_1p()  (numerically stable softplus).
-    for (unsigned long long i = blockIdx.x*blockDim.x + threadIdx.x; i < n; i += (unsigned long long)gridDim.x * blockDim.x) {
-        float v = x[i];
-        y[i] = fmaxf(v, 0.0f) + log1pf(expf(-fabsf(v)));
-    }
-}
+#define DEFINE_FOR_TYPE(TYPE, SUFFIX) \
+DEFINE_UNARY(abs, TYPE, SUFFIX) \
+DEFINE_UNARY(neg, TYPE, SUFFIX) \
+DEFINE_UNARY(reciprocal, TYPE, SUFFIX) \
+DEFINE_UNARY(exp, TYPE, SUFFIX) \
+DEFINE_UNARY(log, TYPE, SUFFIX) \
+DEFINE_UNARY(sign, TYPE, SUFFIX) \
+DEFINE_UNARY(floor, TYPE, SUFFIX) \
+DEFINE_UNARY(ceil, TYPE, SUFFIX) \
+DEFINE_UNARY(round, TYPE, SUFFIX) \
+DEFINE_UNARY(sin, TYPE, SUFFIX) \
+DEFINE_UNARY(cos, TYPE, SUFFIX) \
+DEFINE_UNARY(softplus, TYPE, SUFFIX)
+DEFINE_FOR_TYPE(float, f32)
+#ifdef NXRT_HAS_CUDA_HALF_HEADERS
+DEFINE_FOR_TYPE(__half, f16)
+DEFINE_FOR_TYPE(__nv_bfloat16, bf16)
+#endif
 "#;
 
-const UNARY_MATH_MODULE: &str = "pointwise_unary_math_f32";
+const UNARY_MATH_MODULE: &str = "pointwise_unary_math_float_v2";
 
 /// A supported unary math op and its NVRTC entry point.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -179,21 +199,25 @@ pub enum UnaryMathOp {
 }
 
 impl UnaryMathOp {
-    fn entry(self) -> &'static str {
+    fn stem(self) -> &'static str {
         match self {
-            UnaryMathOp::Abs => "abs_f32",
-            UnaryMathOp::Neg => "neg_f32",
-            UnaryMathOp::Reciprocal => "reciprocal_f32",
-            UnaryMathOp::Exp => "exp_f32",
-            UnaryMathOp::Log => "log_f32",
-            UnaryMathOp::Sign => "sign_f32",
-            UnaryMathOp::Floor => "floor_f32",
-            UnaryMathOp::Ceil => "ceil_f32",
-            UnaryMathOp::Round => "round_f32",
-            UnaryMathOp::Sin => "sin_f32",
-            UnaryMathOp::Cos => "cos_f32",
-            UnaryMathOp::Softplus => "softplus_f32",
+            UnaryMathOp::Abs => "abs",
+            UnaryMathOp::Neg => "neg",
+            UnaryMathOp::Reciprocal => "reciprocal",
+            UnaryMathOp::Exp => "exp",
+            UnaryMathOp::Log => "log",
+            UnaryMathOp::Sign => "sign",
+            UnaryMathOp::Floor => "floor",
+            UnaryMathOp::Ceil => "ceil",
+            UnaryMathOp::Round => "round",
+            UnaryMathOp::Sin => "sin",
+            UnaryMathOp::Cos => "cos",
+            UnaryMathOp::Softplus => "softplus",
         }
+    }
+
+    fn entry(self, dtype: FloatDtype) -> String {
+        format!("{}_{}", self.stem(), dtype.suffix())
     }
 
     fn op_name(self) -> &'static str {
@@ -229,7 +253,7 @@ impl KernelFactory for UnaryMathFactory {
     }
 }
 
-/// NVRTC-backed f32 unary math kernel.
+/// NVRTC-backed f32/f16/bf16 unary math kernel.
 #[derive(Debug)]
 pub struct UnaryMathKernel {
     op: UnaryMathOp,
@@ -247,8 +271,16 @@ impl UnaryMathKernel {
             )));
         }
         let x = &inputs[0];
-        require_dtype(op, "input", x.dtype, DataType::Float32)?;
-        require_dtype(op, "output", outputs[0].dtype, DataType::Float32)?;
+        let dtype = FloatDtype::from_onnx(op, "input", x.dtype)?;
+        if dtype != FloatDtype::F32 {
+            self.runtime.require_nvrtc_half_headers(op)?;
+        }
+        if outputs[0].dtype != x.dtype {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep {op}: output dtype {:?} must equal input dtype {:?}",
+                outputs[0].dtype, x.dtype
+            )));
+        }
         require_contiguous(op, "input", x.is_contiguous())?;
         require_contiguous(op, "output", outputs[0].is_contiguous())?;
 
@@ -265,9 +297,10 @@ impl UnaryMathKernel {
         let x_ptr = cuptr(x.data_ptr::<u8>() as *const c_void);
         let y_ptr = cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void);
 
-        let func =
-            self.runtime
-                .nvrtc_function(UNARY_MATH_MODULE, UNARY_MATH_SRC, self.op.entry())?;
+        let entry = self.op.entry(dtype);
+        let func = self
+            .runtime
+            .nvrtc_function(UNARY_MATH_MODULE, UNARY_MATH_SRC, &entry)?;
         let cfg = LaunchConfig {
             grid_dim: (grid_for(n), 1, 1),
             block_dim: (BLOCK, 1, 1),
@@ -280,8 +313,7 @@ impl UnaryMathKernel {
         // float*, unsigned long long) argument list matches its signature;
         // `x_ptr`/`y_ptr` are live device allocations of `n` f32 elements, and
         // the u64 count and indexing cover their validated bounds without overflow.
-        unsafe { builder.launch(cfg) }
-            .map_err(|e| driver_err(&format!("launch {}", self.op.entry()), e))?;
+        unsafe { builder.launch(cfg) }.map_err(|e| driver_err(&format!("launch {entry}"), e))?;
         self.runtime.synchronize()
     }
 }
@@ -677,9 +709,8 @@ mod tests {
             UnaryMathOp::Softplus,
         ] {
             assert!(
-                UNARY_MATH_SRC.contains(&format!("void {}(", op.entry())),
-                "missing NVRTC entry {} for {}",
-                op.entry(),
+                UNARY_MATH_SRC.contains(&format!("DEFINE_UNARY({},", op.stem())),
+                "missing NVRTC generator for {}",
                 op.op_name()
             );
         }
@@ -721,7 +752,7 @@ mod tests {
         // ONNX Round is round-half-to-even; `roundf` (half-away-from-zero) would
         // be wrong, so the kernel must use `rintf`.
         assert!(
-            UNARY_MATH_SRC.contains("rintf(x[i])"),
+            UNARY_MATH_SRC.contains("op_round(float x) { return rintf(x); }"),
             "Round must use rintf"
         );
         assert!(
@@ -734,7 +765,7 @@ mod tests {
     fn sign_handles_nan_and_zero_like_cpu() {
         // NaN -> NaN (v != v guard) and the zero case falls through to 0.0f.
         assert!(
-            UNARY_MATH_SRC.contains("(v != v) ? v"),
+            UNARY_MATH_SRC.contains("(x != x) ? x"),
             "sign must guard NaN"
         );
     }
@@ -756,7 +787,7 @@ mod tests {
             UnaryMathOp::Cos,
             UnaryMathOp::Softplus,
         ]
-        .map(|o| o.entry());
+        .map(|o| o.entry(FloatDtype::F32));
         let cmp = [
             CmpOp::Equal,
             CmpOp::Greater,
@@ -766,8 +797,12 @@ mod tests {
         ]
         .map(|o| o.entry());
         let logical = [LogicalOp::And, LogicalOp::Or, LogicalOp::Xor].map(|o| o.entry());
-        for e in unary.into_iter().chain(cmp).chain(logical) {
-            assert!(seen.insert(e), "duplicate entry point {e}");
+        for e in unary
+            .into_iter()
+            .chain(cmp.map(str::to_owned))
+            .chain(logical.map(str::to_owned))
+        {
+            assert!(seen.insert(e.clone()), "duplicate entry point {e}");
         }
     }
 
@@ -809,8 +844,10 @@ mod tests {
         assert_eq!(count, (i32::MAX as u64) + 1);
 
         const LOOP: &str = "for (unsigned long long i = blockIdx.x*blockDim.x + threadIdx.x; i < n; i += (unsigned long long)gridDim.x * blockDim.x)";
+        assert!(UNARY_MATH_SRC.contains("const unsigned long long n)"));
+        assert!(UNARY_MATH_SRC.contains("for (unsigned long long i ="));
+        assert!(UNARY_MATH_SRC.contains("i += (unsigned long long)gridDim.x * blockDim.x"));
         for (name, source, kernel_count) in [
-            ("unary", UNARY_MATH_SRC, 12),
             ("Not", NOT_SRC, 1),
             ("comparison", CMP_SRC, 5),
             ("logical", LOGICAL_SRC, 3),
