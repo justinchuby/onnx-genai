@@ -1060,33 +1060,242 @@ shape_inference: identity  # output shape = input shape
 
 ## 12. Python Bindings
 
-### 12.1 Drop-in Compatibility Goal
+### 12.1 ABI3 Stable ABI
+
+All Python bindings use **PyO3 abi3 mode** targeting the stable limited API. This means:
+- One `.so`/`.pyd` per platform, works across Python 3.9+
+- No per-Python-version wheel builds
+- Future Python versions work without recompilation
+
+```toml
+# onnx-rs-python/Cargo.toml
+[dependencies]
+pyo3 = { version = "0.23", features = ["abi3-py39", "extension-module"] }
+```
+
+### 12.2 Extensible Traits — Python Interop
+
+All extensible traits (`ModelFormat`, `WeightBackend`, `ValidationRule`, `OpAdapter`,
+`ShapeInferenceHandler`) are implementable from Python. Users can subclass in Python
+and register with the Rust core — the Rust side calls back into Python via PyO3.
+
+#### Architecture
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                   Python user code                       │
+│   class GgufFormat(onnx_rs.ModelFormat): ...             │
+│   onnx_rs.register_format(GgufFormat())                  │
+├─────────────────────────────────────────────────────────┤
+│                   PyO3 bridge layer                       │
+│   PyModelFormat wraps Python object, implements          │
+│   Rust ModelFormat trait, calls back via GIL             │
+├─────────────────────────────────────────────────────────┤
+│                   Rust core (FormatRegistry)              │
+│   Stores Box<dyn ModelFormat> — doesn't know if it's     │
+│   Rust-native or Python-backed                           │
+└─────────────────────────────────────────────────────────┘
+```
+
+#### Bridge Pattern (ModelFormat example)
+
+```rust
+// Rust side: bridge that wraps a Python object implementing ModelFormat
+#[pyclass]
+struct PyModelFormat {
+    inner: PyObject,  // Python object with load/save/can_load methods
+}
+
+impl ModelFormat for PyModelFormat {
+    fn id(&self) -> &str {
+        // Cache id string to avoid GIL on every call
+        &self.cached_id
+    }
+
+    fn extensions(&self) -> &[&str] {
+        &self.cached_extensions
+    }
+
+    fn can_load(&self, path: &Path) -> bool {
+        Python::with_gil(|py| {
+            self.inner
+                .call_method1(py, "can_load", (path.to_str().unwrap(),))
+                .and_then(|r| r.extract::<bool>(py))
+                .unwrap_or(false)
+        })
+    }
+
+    fn load(&self, path: &Path, opts: &LoadOptions) -> Result<Model, LoadError> {
+        Python::with_gil(|py| {
+            let py_model = self.inner
+                .call_method1(py, "load", (path.to_str().unwrap(),))?;
+            // Convert Python Model repr → Rust Model
+            extract_model(py, py_model)
+        })
+    }
+
+    fn save(&self, model: &Model, path: &Path, opts: &SaveOptions) -> Result<(), SaveError> {
+        Python::with_gil(|py| {
+            let py_model = model_to_py(py, model)?;
+            self.inner.call_method1(py, "save", (py_model, path.to_str().unwrap()))?;
+            Ok(())
+        })
+    }
+}
+```
+
+#### Python User API
+
+```python
+import onnx_rs
+
+# --- Custom model format ---
+class GgufFormat(onnx_rs.ModelFormat):
+    def id(self) -> str:
+        return "gguf"
+
+    def extensions(self) -> list[str]:
+        return ["gguf"]
+
+    def can_load(self, path: str) -> bool:
+        with open(path, "rb") as f:
+            return f.read(4) == b"GGUF"
+
+    def load(self, path: str) -> onnx_rs.Model:
+        # Parse GGUF → construct onnx_rs.Model
+        ...
+
+    def save(self, model: onnx_rs.Model, path: str):
+        raise NotImplementedError("GGUF save not supported")
+
+onnx_rs.register_format(GgufFormat())
+
+# --- Custom validation rule ---
+class MaxNodeCount(onnx_rs.ValidationRule):
+    def __init__(self, max_nodes: int = 10000):
+        self.max_nodes = max_nodes
+
+    def id(self) -> str:
+        return "custom.max_node_count"
+
+    def severity(self) -> str:
+        return "warning"  # "error" | "warning" | "info"
+
+    def check(self, model: onnx_rs.Model) -> list[onnx_rs.Violation]:
+        count = model.graph.node_count()
+        if count > self.max_nodes:
+            return [onnx_rs.Violation(
+                rule_id=self.id(),
+                severity=self.severity(),
+                message=f"Graph has {count} nodes, exceeds max {self.max_nodes}",
+                location="graph",
+            )]
+        return []
+
+onnx_rs.checker.add_rule(MaxNodeCount(5000))
+
+# --- Custom weight backend ---
+class RedisWeightBackend(onnx_rs.WeightBackend):
+    def __init__(self, redis_url: str):
+        self.client = redis.Redis.from_url(redis_url)
+
+    def id(self) -> str:
+        return "redis"
+
+    def get(self, tensor_name: str) -> bytes | None:
+        return self.client.get(f"weight:{tensor_name}")
+
+    def put(self, tensor_name: str, data: bytes, dtype: str, shape: list[int]):
+        self.client.set(f"weight:{tensor_name}", data)
+
+    def tensor_names(self) -> list[str]:
+        return [k.decode().removeprefix("weight:") 
+                for k in self.client.keys("weight:*")]
+
+onnx_rs.register_weight_backend(RedisWeightBackend("redis://localhost:6379"))
+
+# --- Custom version converter adapter ---
+class MyOpV1ToV2(onnx_rs.OpAdapter):
+    def source(self) -> tuple[str, str, int]:
+        return ("com.mycompany", "MyOp", 1)
+
+    def target_version(self) -> int:
+        return 2
+
+    def adapt(self, node: onnx_rs.Node, graph: onnx_rs.Graph) -> str:
+        # Rewrite node attributes for v2 semantics
+        node.set_attr("new_attr", node.get_attr("old_attr", 0))
+        node.remove_attr("old_attr")
+        return "rewritten"  # "compatible" | "rewritten" | "incompatible"
+
+onnx_rs.version_converter.register(MyOpV1ToV2())
+
+# --- Custom shape inference ---
+class MyOpShapeInference(onnx_rs.ShapeInferenceHandler):
+    def infer(self, node: onnx_rs.Node, input_types: list) -> list:
+        # Output shape = input shape
+        return [input_types[0]] if input_types else []
+
+onnx_rs.register_shape_inference("com.mycompany", "MyOp", MyOpShapeInference())
+```
+
+#### Bridge Traits Summary
+
+Every extensible Rust trait has a corresponding Python base class and PyO3 bridge:
+
+| Rust Trait | Python Base Class | PyO3 Bridge Struct | GIL Strategy |
+|-----------|-------------------|-------------------|---------------|
+| `ModelFormat` | `onnx_rs.ModelFormat` | `PyModelFormat` | Cache id/extensions; GIL on load/save |
+| `WeightBackend` | `onnx_rs.WeightBackend` | `PyWeightBackend` | GIL on get/put |
+| `ValidationRule` | `onnx_rs.ValidationRule` | `PyValidationRule` | Cache id/severity; GIL on check |
+| `OpAdapter` | `onnx_rs.OpAdapter` | `PyOpAdapter` | Cache source/target; GIL on adapt |
+| `ShapeInferenceHandler` | `onnx_rs.ShapeInferenceHandler` | `PyShapeInferenceHandler` | GIL on infer |
+
+#### Performance Considerations
+
+- **Hot path (load/inference):** Rust-native implementations avoid GIL entirely
+- **Cold path (registration):** Python callbacks cached where possible (id, extensions, severity)
+- **GIL strategy:** Acquire only when calling into Python. Release GIL during Rust-internal work
+- **Buffer protocol:** Weight data passed as `bytes` / `memoryview` — zero-copy when possible
+- **abi3 constraint:** No `PyList::get_item_unchecked` or version-specific optimizations.
+  All PyO3 calls use stable limited API only
+
+#### Thread Safety
+
+Python-backed trait objects are `Send + Sync` by wrapping in `PyObject` (which is
+`Send`). Thread safety is guaranteed by GIL acquisition on every callback. This means:
+- Python-backed formats work correctly in multi-threaded Rust code
+- Performance degrades under contention (GIL bottleneck)
+- For high-throughput paths, users should prefer Rust-native implementations
+
+### 12.3 Drop-in Compatibility Goal
 
 ```python
 import onnx_rs as onnx  # Drop-in for common use cases
 
-# Load / save
+# Load / save (including custom-registered formats)
 model = onnx.load("model.onnx")
+model = onnx.load("model.gguf")  # works if GgufFormat registered
 onnx.save(model, "output.onnx")
 
-# Check
+# Check (including custom rules)
 onnx.checker.check_model(model)
 
 # Shape inference
 model = onnx.shape_inference.infer_shapes(model)
 
-# Text format (new!)
+# Text format
 text = onnx.printer.to_text(model)
 model = onnx.parser.from_text(text)
 
 # Version convert
 model = onnx.version_converter.convert_version(model, target_version=21)
 
-# Custom ops
+# Custom ops (YAML registration)
 onnx.registry.register_from_yaml("my_ops/")
 ```
 
-### 12.2 Not a Full Drop-in
+### 12.4 Not a Full Drop-in
 
 Things intentionally NOT replicated:
 - `onnx.helper.make_*()` — use onnxscript or direct IR construction instead
