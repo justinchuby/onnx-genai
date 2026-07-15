@@ -879,6 +879,121 @@ fn existing_default_opset_import_is_not_downgraded() {
 }
 
 #[test]
+fn ai_onnx_spelled_default_import_plus_synthesized_identity_stays_single() {
+    // BUG 4 (duck-fn3): the model imports the default domain spelled "ai.onnx",
+    // and a custom-domain pass-through function synthesizes a default `""`
+    // Identity. `""` and `"ai.onnx"` are the SAME domain, so the inlined model
+    // must carry EXACTLY ONE default-domain opset import — kept at the model's
+    // spelling ("ai.onnx") and NOT downgraded from v17.
+    let mut f = function("F", "custom.domain", &["X"], &["X"], vec![]);
+    f.opset_import = vec![onnx::OperatorSetIdProto {
+        domain: "custom.domain".to_string(),
+        version: 1,
+    }];
+    let graph = onnx::GraphProto {
+        node: vec![call("F", "custom.domain", &["a"], &["b"])],
+        ..Default::default()
+    };
+    // Model declares the default domain under the "ai.onnx" spelling.
+    let m = onnx::ModelProto {
+        ir_version: 8,
+        opset_import: vec![
+            onnx::OperatorSetIdProto {
+                domain: "ai.onnx".to_string(),
+                version: 17,
+            },
+            onnx::OperatorSetIdProto {
+                domain: "custom.domain".to_string(),
+                version: 1,
+            },
+        ],
+        graph: Some(graph),
+        functions: vec![f],
+        ..Default::default()
+    };
+    let out = inline(m);
+    let g = out.graph.as_ref().unwrap();
+    assert!(
+        g.node.iter().any(|n| n.op_type == "Identity"),
+        "pass-through must synthesize an Identity"
+    );
+    let defaults: Vec<_> = out
+        .opset_import
+        .iter()
+        .filter(|o| o.domain.is_empty() || o.domain == "ai.onnx")
+        .collect();
+    assert_eq!(
+        defaults.len(),
+        1,
+        "exactly one default-domain import despite \"\"/\"ai.onnx\" mismatch"
+    );
+    assert_eq!(
+        defaults[0].domain, "ai.onnx",
+        "model's original default spelling is preserved"
+    );
+    assert_eq!(defaults[0].version, 17, "default import not downgraded");
+    assert!(out
+        .opset_import
+        .iter()
+        .any(|o| o.domain == "custom.domain" && o.version == 1));
+}
+
+#[test]
+fn default_domain_merge_prefers_highest_version_across_spellings() {
+    // The model imports the default domain as "ai.onnx" @ 18 while a function
+    // contributes the default domain spelled "" @ 20. These collapse to ONE
+    // default-domain import at the highest version (20), keeping the model's
+    // spelling ("ai.onnx").
+    let mut f = function(
+        "F",
+        "d",
+        &["X"],
+        &["Y"],
+        vec![node("Relu", &["X"], &["Y"])],
+    );
+    f.opset_import = vec![
+        onnx::OperatorSetIdProto {
+            domain: String::new(),
+            version: 20,
+        },
+        onnx::OperatorSetIdProto {
+            domain: "d".to_string(),
+            version: 1,
+        },
+    ];
+    let graph = onnx::GraphProto {
+        node: vec![call("F", "d", &["x"], &["y"])],
+        ..Default::default()
+    };
+    let m = onnx::ModelProto {
+        ir_version: 8,
+        opset_import: vec![onnx::OperatorSetIdProto {
+            domain: "ai.onnx".to_string(),
+            version: 18,
+        }],
+        graph: Some(graph),
+        functions: vec![f],
+        ..Default::default()
+    };
+    let out = inline(m);
+    let defaults: Vec<_> = out
+        .opset_import
+        .iter()
+        .filter(|o| o.domain.is_empty() || o.domain == "ai.onnx")
+        .collect();
+    assert_eq!(
+        defaults.len(),
+        1,
+        "single default-domain import across \"\"/\"ai.onnx\" spellings"
+    );
+    assert_eq!(
+        defaults[0].domain, "ai.onnx",
+        "model's original default spelling is preserved"
+    );
+    assert_eq!(defaults[0].version, 20, "highest version across contributors");
+}
+
+#[test]
 fn subgraph_sparse_initializer_shadows_outer_capture() {
     // FIX 2 gap: a subgraph `sparse_initializer` is a local binding that shadows
     // an outer capture, exactly like a dense initializer. F(cond, X) = If(cond){

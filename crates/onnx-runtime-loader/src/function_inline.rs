@@ -133,14 +133,31 @@ pub fn inline_functions(model: &ModelProto) -> Result<Cow<'_, ModelProto>, Loade
 /// called custom-domain functions. Any version ≥ 1 satisfies loader validation.
 const DEFAULT_ONNX_OPSET_VERSION: i64 = 17;
 
+/// The ONNX default operator-set domain has two equivalent spellings: the empty
+/// string `""` and the explicit `"ai.onnx"`. They denote the SAME domain, so any
+/// opset-import comparison/dedup must treat them as one.
+fn is_default_domain(domain: &str) -> bool {
+    domain.is_empty() || domain == "ai.onnx"
+}
+
+/// Canonical map key for an opset-import domain: every spelling of the default
+/// domain collapses to a single key so duplicates cannot survive merging.
+const DEFAULT_DOMAIN_KEY: &str = "";
+
+fn domain_key(domain: &str) -> String {
+    if is_default_domain(domain) {
+        DEFAULT_DOMAIN_KEY.to_string()
+    } else {
+        domain.to_string()
+    }
+}
+
 /// Ensure `imports` contains a default-domain (`""`/`ai.onnx`) opset entry so a
 /// synthesized default-domain node (e.g. a boundary `Identity`) passes loader
 /// validation. An existing default-domain import (under either spelling) is left
-/// untouched — never downgraded.
+/// untouched — never downgraded, never duplicated.
 fn ensure_default_opset_import(imports: &mut Vec<OperatorSetIdProto>) {
-    let has_default = imports
-        .iter()
-        .any(|o| o.domain.is_empty() || o.domain == "ai.onnx");
+    let has_default = imports.iter().any(|o| is_default_domain(&o.domain));
     if !has_default {
         imports.push(OperatorSetIdProto {
             domain: String::new(),
@@ -152,35 +169,53 @@ fn ensure_default_opset_import(imports: &mut Vec<OperatorSetIdProto>) {
 /// Merge every function's `opset_import` into the model's, taking the highest
 /// version per domain. Preserves the model's original import ordering, then
 /// appends any domains introduced solely by functions (in first-seen order).
+///
+/// The default domain is canonicalized: `""` and `"ai.onnx"` collapse to a
+/// SINGLE entry at the highest contributed version, so a model importing
+/// `"ai.onnx"` plus a function (or synthesized Identity path) contributing `""`
+/// never yields two logically-duplicate default-domain imports. The emitted
+/// default entry keeps the model's original spelling if it declared one (so we
+/// don't gratuitously rewrite `"ai.onnx"`→`""`); otherwise it is spelled `""`.
 fn merged_opset_imports(model: &ModelProto) -> Vec<OperatorSetIdProto> {
     let mut order: Vec<String> = Vec::new();
     let mut best: HashMap<String, i64> = HashMap::new();
-    let mut note = |domain: &str, version: i64| {
-        let entry = best.entry(domain.to_string());
-        match entry {
+    // Preferred spelling for the emitted default-domain entry: the model's
+    // original spelling if it imported the default domain, else `""`.
+    let mut default_spelling: Option<String> = None;
+    let mut note = |domain: &str, version: i64, from_model: bool| {
+        if from_model && is_default_domain(domain) && default_spelling.is_none() {
+            default_spelling = Some(domain.to_string());
+        }
+        let key = domain_key(domain);
+        match best.entry(key.clone()) {
             std::collections::hash_map::Entry::Occupied(mut e) => {
                 if version > *e.get() {
                     *e.get_mut() = version;
                 }
             }
             std::collections::hash_map::Entry::Vacant(e) => {
-                order.push(domain.to_string());
+                order.push(key);
                 e.insert(version);
             }
         }
     };
     for o in &model.opset_import {
-        note(&o.domain, o.version);
+        note(&o.domain, o.version, true);
     }
     for f in &model.functions {
         for o in &f.opset_import {
-            note(&o.domain, o.version);
+            note(&o.domain, o.version, false);
         }
     }
     order
         .into_iter()
-        .map(|domain| {
-            let version = best[&domain];
+        .map(|key| {
+            let version = best[&key];
+            let domain = if key == DEFAULT_DOMAIN_KEY {
+                default_spelling.clone().unwrap_or_default()
+            } else {
+                key
+            };
             OperatorSetIdProto { domain, version }
         })
         .collect()
