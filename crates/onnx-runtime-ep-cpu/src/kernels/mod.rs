@@ -921,6 +921,20 @@ pub(crate) mod testutil {
             }
         }
 
+        pub fn f64(shape: &[usize], data: &[f64]) -> Self {
+            let strides = compute_contiguous_strides(shape);
+            let mut bytes = Vec::with_capacity(data.len() * 8);
+            for v in data {
+                bytes.extend_from_slice(&v.to_le_bytes());
+            }
+            Self {
+                bytes,
+                shape: shape.to_vec(),
+                strides,
+                dtype: DataType::Float64,
+            }
+        }
+
         pub fn i64(shape: &[usize], data: &[i64]) -> Self {
             let strides = compute_contiguous_strides(shape);
             let mut bytes = Vec::with_capacity(data.len() * 8);
@@ -1083,6 +1097,13 @@ pub(crate) mod testutil {
             self.bytes
                 .chunks_exact(4)
                 .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect()
+        }
+
+        pub fn to_f64(&self) -> Vec<f64> {
+            self.bytes
+                .chunks_exact(8)
+                .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
                 .collect()
         }
 

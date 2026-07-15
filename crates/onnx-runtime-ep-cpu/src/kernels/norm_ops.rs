@@ -1,9 +1,9 @@
 //! Standard channel-wise normalization kernels and `PRelu`.
 //!
-//! All kernels accept f32/f16/bf16 storage and accumulate normalization
-//! statistics in f32. GroupNormalization keeps the schema-version distinction:
-//! opset 18 affine parameters are per-group, while opset 21 parameters are
-//! per-channel.
+//! All kernels accept f32/f64/f16/bf16 storage. f64 computes and accumulates in
+//! f64, while f32/f16/bf16 compute and accumulate in f32. GroupNormalization
+//! keeps the schema-version distinction: opset 18 affine parameters are
+//! per-group, while opset 21 parameters are per-channel.
 
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ir::Node;
@@ -11,20 +11,42 @@ use onnx_runtime_ir::Node;
 use super::add::{broadcast_apply, require_same_dtype};
 use super::check_arity;
 use crate::dispatch_float;
-use crate::dtype::{FloatElem, to_dense_float, write_dense_float};
+use crate::dtype::{ComputeDomain, NumericElem, to_dense, write_dense};
 use crate::strided::numel;
 
-fn parameter<T: FloatElem>(op: &str, input: &TensorView) -> Result<Vec<f32>> {
-    require_same_dtype(op, input, T::DTYPE)?;
-    Ok(to_dense_float::<T>(input)?
-        .into_iter()
-        .map(T::to_f32)
-        .collect())
+trait NormAcc: ComputeDomain + PartialOrd {
+    fn from_f32(value: f32) -> Self;
+    fn sqrt(self) -> Self;
 }
 
-fn write_output<T: FloatElem>(out: &mut TensorMut, values: Vec<f32>) -> Result<()> {
-    let values = values.into_iter().map(T::from_f32).collect::<Vec<_>>();
-    write_dense_float::<T>(out, &values)
+impl NormAcc for f32 {
+    fn from_f32(value: f32) -> Self {
+        value
+    }
+
+    fn sqrt(self) -> Self {
+        self.sqrt()
+    }
+}
+
+impl NormAcc for f64 {
+    fn from_f32(value: f32) -> Self {
+        value as f64
+    }
+
+    fn sqrt(self) -> Self {
+        self.sqrt()
+    }
+}
+
+fn parameter<T: NumericElem>(op: &str, input: &TensorView) -> Result<Vec<T::Acc>> {
+    require_same_dtype(op, input, T::DTYPE)?;
+    Ok(to_dense::<T>(input)?.into_iter().map(T::to_acc).collect())
+}
+
+fn write_output<T: NumericElem>(out: &mut TensorMut, values: Vec<T::Acc>) -> Result<()> {
+    let values = values.into_iter().map(T::from_acc).collect::<Vec<_>>();
+    write_dense::<T>(out, &values)
 }
 
 fn require_x_output_shape(op: &str, input: &TensorView, output: &TensorMut) -> Result<()> {
@@ -92,11 +114,14 @@ impl Kernel for BatchNormKernel {
     }
 }
 
-fn batch_norm_typed<T: FloatElem>(
+fn batch_norm_typed<T: NumericElem>(
     inputs: &[TensorView],
     outputs: &mut [TensorMut],
     epsilon: f32,
-) -> Result<()> {
+) -> Result<()>
+where
+    T::Acc: NormAcc,
+{
     let shape = inputs[0].shape;
     if shape.len() < 2 {
         return Err(EpError::KernelFailed(
@@ -125,13 +150,17 @@ fn batch_norm_typed<T: FloatElem>(
         ));
     }
     let x = parameter::<T>("BatchNormalization", &inputs[0])?;
+    let epsilon = <T::Acc as NormAcc>::from_f32(epsilon);
     let y = x
         .iter()
         .enumerate()
         .map(|(i, &value)| {
             let channel = (i / spatial) % channels;
-            (value - mean[channel]) / (variance[channel] + epsilon).sqrt() * scale[channel]
-                + bias[channel]
+            value
+                .c_sub(mean[channel])
+                .c_div(variance[channel].c_add(epsilon).sqrt())
+                .c_mul(scale[channel])
+                .c_add(bias[channel])
         })
         .collect();
     write_output::<T>(&mut outputs[0], y)
@@ -167,11 +196,14 @@ impl Kernel for InstanceNormKernel {
     }
 }
 
-fn instance_norm_typed<T: FloatElem>(
+fn instance_norm_typed<T: NumericElem>(
     inputs: &[TensorView],
     outputs: &mut [TensorMut],
     epsilon: f32,
-) -> Result<()> {
+) -> Result<()>
+where
+    T::Acc: NormAcc,
+{
     let shape = inputs[0].shape;
     if shape.len() < 3 {
         return Err(EpError::KernelFailed(
@@ -191,15 +223,32 @@ fn instance_norm_typed<T: FloatElem>(
     require_channel_vector("InstanceNormalization", "scale", inputs[1].shape, channels)?;
     require_channel_vector("InstanceNormalization", "B", inputs[2].shape, channels)?;
     let x = parameter::<T>("InstanceNormalization", &inputs[0])?;
-    let mut y = vec![0.0; x.len()];
+    let epsilon = <T::Acc as NormAcc>::from_f32(epsilon);
+    let one = <T::Acc as NormAcc>::from_f32(1.0);
+    let mut y = vec![T::Acc::default(); x.len()];
     for (instance_channel, slice) in x.chunks_exact(spatial).enumerate() {
         let channel = instance_channel % channels;
-        let mean = slice.iter().sum::<f32>() / spatial as f32;
-        let variance = slice.iter().map(|&v| (v - mean) * (v - mean)).sum::<f32>() / spatial as f32;
-        let inv_std = 1.0 / (variance + epsilon).sqrt();
+        let mean = slice
+            .iter()
+            .copied()
+            .fold(T::Acc::default(), ComputeDomain::c_add)
+            .c_div_usize(spatial);
+        let variance = slice
+            .iter()
+            .map(|&value| {
+                let centered = value.c_sub(mean);
+                centered.c_mul(centered)
+            })
+            .fold(T::Acc::default(), ComputeDomain::c_add)
+            .c_div_usize(spatial);
+        let inv_std = one.c_div(variance.c_add(epsilon).sqrt());
         let base = instance_channel * spatial;
         for (offset, &value) in slice.iter().enumerate() {
-            y[base + offset] = (value - mean) * inv_std * scale[channel] + bias[channel];
+            y[base + offset] = value
+                .c_sub(mean)
+                .c_mul(inv_std)
+                .c_mul(scale[channel])
+                .c_add(bias[channel]);
         }
     }
     write_output::<T>(&mut outputs[0], y)
@@ -273,13 +322,16 @@ impl Kernel for GroupNormKernel {
     }
 }
 
-fn group_norm_typed<T: FloatElem>(
+fn group_norm_typed<T: NumericElem>(
     inputs: &[TensorView],
     outputs: &mut [TensorMut],
     num_groups: usize,
     epsilon: f32,
     affine: GroupAffine,
-) -> Result<()> {
+) -> Result<()>
+where
+    T::Acc: NormAcc,
+{
     let shape = inputs[0].shape;
     if shape.len() < 3 {
         return Err(EpError::KernelFailed(
@@ -312,13 +364,25 @@ fn group_norm_typed<T: FloatElem>(
     let channels_per_group = channels / num_groups;
     let group_size = channels_per_group * spatial;
     let groups_per_instance = num_groups;
-    let mut y = vec![0.0; x.len()];
+    let epsilon = <T::Acc as NormAcc>::from_f32(epsilon);
+    let one = <T::Acc as NormAcc>::from_f32(1.0);
+    let mut y = vec![T::Acc::default(); x.len()];
     for (flat_group, slice) in x.chunks_exact(group_size).enumerate() {
         let group = flat_group % groups_per_instance;
-        let mean = slice.iter().sum::<f32>() / group_size as f32;
-        let variance =
-            slice.iter().map(|&v| (v - mean) * (v - mean)).sum::<f32>() / group_size as f32;
-        let inv_std = 1.0 / (variance + epsilon).sqrt();
+        let mean = slice
+            .iter()
+            .copied()
+            .fold(T::Acc::default(), ComputeDomain::c_add)
+            .c_div_usize(group_size);
+        let variance = slice
+            .iter()
+            .map(|&value| {
+                let centered = value.c_sub(mean);
+                centered.c_mul(centered)
+            })
+            .fold(T::Acc::default(), ComputeDomain::c_add)
+            .c_div_usize(group_size);
+        let inv_std = one.c_div(variance.c_add(epsilon).sqrt());
         let base = flat_group * group_size;
         for (offset, &value) in slice.iter().enumerate() {
             let channel_in_group = offset / spatial;
@@ -327,7 +391,11 @@ fn group_norm_typed<T: FloatElem>(
                 GroupAffine::PerGroup => group,
                 GroupAffine::PerChannel => channel,
             };
-            y[base + offset] = (value - mean) * inv_std * scale[affine_index] + bias[affine_index];
+            y[base + offset] = value
+                .c_sub(mean)
+                .c_mul(inv_std)
+                .c_mul(scale[affine_index])
+                .c_add(bias[affine_index]);
         }
     }
     write_output::<T>(&mut outputs[0], y)
@@ -354,7 +422,10 @@ impl Kernel for PReluKernel {
     }
 }
 
-fn prelu_typed<T: FloatElem>(inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+fn prelu_typed<T: NumericElem>(inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()>
+where
+    T::Acc: NormAcc,
+{
     require_x_output_shape("PRelu", &inputs[0], &outputs[0])?;
     if inputs[1].shape.len() > inputs[0].shape.len() {
         return Err(EpError::KernelFailed(format!(
@@ -365,7 +436,8 @@ fn prelu_typed<T: FloatElem>(inputs: &[TensorView], outputs: &mut [TensorMut]) -
     }
     let x = parameter::<T>("PRelu", &inputs[0])?;
     let slope = parameter::<T>("PRelu", &inputs[1])?;
-    let mut slopes = vec![0.0; numel(inputs[0].shape)];
+    let zero = <T::Acc as NormAcc>::from_f32(0.0);
+    let mut slopes = vec![T::Acc::default(); numel(inputs[0].shape)];
     broadcast_apply(&slope, inputs[1].shape, inputs[0].shape, |i, value| {
         slopes[i] = value
     })
@@ -378,7 +450,13 @@ fn prelu_typed<T: FloatElem>(inputs: &[TensorView], outputs: &mut [TensorMut]) -
     let y = x
         .into_iter()
         .zip(slopes)
-        .map(|(value, slope)| if value >= 0.0 { value } else { value * slope })
+        .map(|(value, slope)| {
+            if value >= zero {
+                value
+            } else {
+                value.c_mul(slope)
+            }
+        })
         .collect();
     write_output::<T>(&mut outputs[0], y)
 }
@@ -468,6 +546,39 @@ mod tests {
             )
             .unwrap();
         assert_close(&y.to_f32(), &[-1.0, 3.0, -1.5, -0.5]);
+    }
+
+    #[test]
+    fn batch_normalization_preserves_f64_precision() {
+        let (graph, node) = model_node(
+            "BatchNormalization",
+            15,
+            &[&[1, 1, 1], &[1], &[1], &[1], &[1]],
+            &[1, 1, 1],
+            &[("epsilon", Attribute::Float(0.0))],
+        );
+        let model = Model::new(&graph);
+        let x = Owned::f64(&[1, 1, 1], &[16_777_217.0]);
+        let scale = Owned::f64(&[1], &[1.0]);
+        let bias = Owned::f64(&[1], &[0.0]);
+        let mean = Owned::f64(&[1], &[0.0]);
+        let variance = Owned::f64(&[1], &[1.0]);
+        let mut y = Owned::zeros(DataType::Float64, &[1, 1, 1]);
+        CpuExecutionProvider::new()
+            .get_kernel(model.graph.node(node), &[], 15)
+            .unwrap()
+            .execute(
+                &[
+                    x.view(),
+                    scale.view(),
+                    bias.view(),
+                    mean.view(),
+                    variance.view(),
+                ],
+                &mut [y.view_mut()],
+            )
+            .unwrap();
+        assert_eq!(y.to_f64(), vec![16_777_217.0]);
     }
 
     #[test]
@@ -617,5 +728,20 @@ mod tests {
             .execute(&[x.view(), slope.view()], &mut [y.view_mut()])
             .unwrap();
         assert_close(&y.to_f32(), &[-0.5, -0.25, 0.0, 3.0]);
+    }
+
+    #[test]
+    fn prelu_preserves_f64_precision() {
+        let (graph, node) = model_node("PRelu", 16, &[&[1], &[]], &[1], &[]);
+        let model = Model::new(&graph);
+        let x = Owned::f64(&[1], &[-16_777_217.0]);
+        let slope = Owned::f64(&[], &[1.0]);
+        let mut y = Owned::zeros(DataType::Float64, &[1]);
+        CpuExecutionProvider::new()
+            .get_kernel(model.graph.node(node), &[], 16)
+            .unwrap()
+            .execute(&[x.view(), slope.view()], &mut [y.view_mut()])
+            .unwrap();
+        assert_eq!(y.to_f64(), vec![-16_777_217.0]);
     }
 }
