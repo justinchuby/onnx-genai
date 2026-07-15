@@ -35,6 +35,8 @@ pub struct Graph {
 
     next_symbol: u32,
     symbol_names: HashMap<String, SymbolId>,
+    unknown_value_types: HashSet<ValueId>,
+    unknown_value_shapes: HashSet<ValueId>,
 }
 
 impl Graph {
@@ -85,6 +87,26 @@ impl Graph {
     /// Number of live values.
     pub fn num_values(&self) -> usize {
         self.values.len()
+    }
+
+    /// Whether a value's element type came from explicit source type information.
+    pub fn value_type_is_known(&self, id: ValueId) -> bool {
+        !self.unknown_value_types.contains(&id)
+    }
+
+    /// Whether a value's rank and dimensions came from explicit source shape information.
+    pub fn value_shape_is_known(&self, id: ValueId) -> bool {
+        !self.unknown_value_shapes.contains(&id)
+    }
+
+    /// Mark a value's placeholder element type as unknown.
+    pub fn mark_value_type_unknown(&mut self, id: ValueId) {
+        self.unknown_value_types.insert(id);
+    }
+
+    /// Mark a value's placeholder shape as unknown.
+    pub fn mark_value_shape_unknown(&mut self, id: ValueId) {
+        self.unknown_value_shapes.insert(id);
     }
 
     // === Symbolic dimensions ===
@@ -192,7 +214,9 @@ impl Graph {
             if boundary.contains(&v) || !seen_values.insert(v) {
                 continue;
             }
-            let Some(val) = self.values.get(v) else { continue };
+            let Some(val) = self.values.get(v) else {
+                continue;
+            };
             if let Some(prod) = val.producer {
                 if seen_nodes.insert(prod) {
                     nodes.push(prod);
@@ -412,8 +436,8 @@ impl Graph {
         for &out in &self.outputs {
             match self.values.get(out) {
                 Some(val) => {
-                    let is_source = self.inputs.contains(&out)
-                        || self.initializers.contains_key(&out);
+                    let is_source =
+                        self.inputs.contains(&out) || self.initializers.contains_key(&out);
                     if val.producer.is_none() && !is_source {
                         errors.push(GraphError::MissingProducer(out));
                     }
@@ -503,6 +527,8 @@ impl Graph {
         };
         if orphan {
             self.values.remove(value);
+            self.unknown_value_types.remove(&value);
+            self.unknown_value_shapes.remove(&value);
         }
     }
 }

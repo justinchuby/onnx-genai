@@ -93,8 +93,8 @@ impl ValidationRule for InputOutputDeclaredRule {
     }
 }
 
-/// Every present node input must be a graph input, initializer, or the output
-/// of a live node (ONNX_RS §8.2 `NoUnconnectedNodesRule`).
+/// Every present node input must have a source, and every named node output must
+/// be consumed, exported, or captured by a subgraph (ONNX_RS §8.2).
 pub struct NoUnconnectedNodesRule;
 
 impl ValidationRule for NoUnconnectedNodesRule {
@@ -160,6 +160,7 @@ fn check_graph_connections(
 ) -> Vec<Violation> {
     let mut violations = Vec::new();
     let inputs: HashSet<ValueId> = graph.inputs.iter().copied().collect();
+    let graph_outputs: HashSet<ValueId> = graph.outputs.iter().copied().collect();
     for (_node_id, node) in graph.nodes.iter() {
         for (index, value_id) in node.inputs.iter().enumerate() {
             let Some(value_id) = value_id else { continue };
@@ -205,6 +206,37 @@ fn check_graph_connections(
                 ));
             }
         }
+        for (index, &value_id) in node.outputs.iter().enumerate() {
+            let problem = match graph.try_value(value_id) {
+                None => Some(format!(
+                    "output {index} references missing value id {}",
+                    value_id.0
+                )),
+                Some(value) if value.name.as_deref().is_none_or(str::is_empty) => None,
+                Some(value)
+                    if graph_outputs.contains(&value_id)
+                        || !value.consumers.is_empty()
+                        || value
+                            .name
+                            .as_deref()
+                            .is_some_and(|name| subgraphs_capture_name(graph, name)) =>
+                {
+                    None
+                }
+                Some(value) => Some(format!(
+                    "output {index} '{}' is neither consumed, a graph output, nor captured by a subgraph",
+                    value_label(value_id, value.name.as_deref())
+                )),
+            };
+            if let Some(message) = problem {
+                violations.push(node_violation(
+                    rule_id,
+                    graph_name,
+                    node,
+                    format!("node '{}' {message}", node_label(node)),
+                ));
+            }
+        }
     }
     let mut visible_names = outer_scope.clone();
     visible_names.extend(
@@ -224,6 +256,28 @@ fn check_graph_connections(
         ));
     }
     violations
+}
+
+fn subgraphs_capture_name(graph: &Graph, name: &str) -> bool {
+    graph.subgraphs.values().any(|subgraph| {
+        let locally_defined = subgraph.values.values().any(|value| {
+            value.name.as_deref() == Some(name)
+                && (value.producer.is_some()
+                    || subgraph.inputs.contains(&value.id)
+                    || subgraph.initializers.contains_key(&value.id))
+        });
+        let directly_captured = subgraph.nodes.values().any(|node| {
+            node.input_values().any(|value_id| {
+                subgraph.try_value(value_id).is_some_and(|value| {
+                    value.name.as_deref() == Some(name)
+                        && value.producer.is_none()
+                        && !subgraph.inputs.contains(&value_id)
+                        && !subgraph.initializers.contains_key(&value_id)
+                })
+            })
+        });
+        directly_captured || (!locally_defined && subgraphs_capture_name(subgraph, name))
+    })
 }
 
 fn check_graph_opset_imports(
@@ -399,6 +453,9 @@ fn check_graph_type_constraints(
             let Some(value) = graph.try_value(value_id) else {
                 continue;
             };
+            if !graph.value_type_is_known(value_id) {
+                continue;
+            }
             let Some(constraint) = schema
                 .type_constraints
                 .iter()
@@ -536,6 +593,24 @@ fn check_graph_initializer_types(graph: &Graph, rule_id: &str) -> Vec<Violation>
                     value_name: value_label(value_id, value.name.as_deref()),
                 },
             }),
+            Some(value)
+                if graph.value_shape_is_known(value_id)
+                    && initializer_shape_mismatch(&value.shape, initializer.dims()) =>
+            {
+                violations.push(Violation {
+                    rule_id: rule_id.to_string(),
+                    severity: Severity::Error,
+                    message: format!(
+                        "initializer '{}' has shape {:?} but its declared value shape is {:?}",
+                        value_label(value_id, value.name.as_deref()),
+                        initializer.dims(),
+                        value.shape
+                    ),
+                    location: ViolationLocation::Value {
+                        value_name: value_label(value_id, value.name.as_deref()),
+                    },
+                })
+            }
             Some(_) => {}
         }
     }
@@ -543,6 +618,14 @@ fn check_graph_initializer_types(graph: &Graph, rule_id: &str) -> Vec<Violation>
         violations.extend(check_graph_initializer_types(subgraph, rule_id));
     }
     violations
+}
+
+fn initializer_shape_mismatch(declared: &[onnx_runtime_ir::Dim], actual: &[usize]) -> bool {
+    declared.len() != actual.len()
+        || declared
+            .iter()
+            .zip(actual)
+            .any(|(declared, &actual)| declared.as_static().is_some_and(|dim| dim != actual))
 }
 
 /// The ONNX IR version is required and starts at 1. There is deliberately no
@@ -822,7 +905,9 @@ fn value_label(value_id: ValueId, name: Option<&str>) -> String {
 mod tests {
     use super::*;
     use crate::schema::SchemaRegistry;
-    use onnx_runtime_ir::{Attribute, DataType, Node, NodeId, TensorData, WeightRef, static_shape};
+    use onnx_runtime_ir::{
+        Attribute, DataType, Dim, Node, NodeId, TensorData, WeightRef, static_shape,
+    };
 
     fn if_model(subgraph: Graph, output_count: usize, include_else_branch: bool) -> Model {
         let mut graph = Graph::new();
@@ -949,12 +1034,19 @@ mod tests {
         let mut graph = Graph::new();
         let input = graph.create_named_value("X", DataType::Float32, static_shape([1]));
         let output = graph.create_named_value("Y", DataType::Float32, static_shape([1]));
+        let final_output = graph.create_named_value("Z", DataType::Float32, static_shape([1]));
         graph.add_input(input);
         let node_id = graph.insert_node(Node::new(
             NodeId(0),
             "Relu",
             vec![Some(input)],
             vec![output],
+        ));
+        graph.insert_node(Node::new(
+            NodeId(0),
+            "Identity",
+            vec![Some(output)],
+            vec![final_output],
         ));
         let mut subgraph = Graph::new();
         let capture = subgraph.create_named_value("X", DataType::Float32, static_shape([1]));
@@ -966,11 +1058,87 @@ mod tests {
             vec![Some(capture)],
             vec![subgraph_output],
         ));
+        subgraph.add_output(subgraph_output);
+        graph.subgraphs.insert((node_id, "body".into()), subgraph);
+        graph.add_output(final_output);
+
+        assert!(
+            rule.check(&Model::new(graph), &ValidationContext::default())
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn omitted_optional_node_output_passes() {
+        let rule = NoUnconnectedNodesRule;
+        let mut graph = Graph::new();
+        let input = graph.create_named_value("X", DataType::Float32, static_shape([1]));
+        let omitted = graph.create_value(DataType::Float32, Vec::new());
+        graph.add_input(input);
+        graph.insert_node(Node::new(
+            NodeId(0),
+            "OptionalOutput",
+            vec![Some(input)],
+            vec![omitted],
+        ));
+
+        assert!(
+            rule.check(&Model::new(graph), &ValidationContext::default())
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn captured_node_output_passes() {
+        let rule = NoUnconnectedNodesRule;
+        let mut graph = Graph::new();
+        let input = graph.create_named_value("X", DataType::Float32, static_shape([1]));
+        let captured = graph.create_named_value("captured", DataType::Float32, static_shape([1]));
+        graph.add_input(input);
+        let node_id = graph.insert_node(Node::new(
+            NodeId(0),
+            "Relu",
+            vec![Some(input)],
+            vec![captured],
+        ));
+
+        let mut subgraph = Graph::new();
+        let capture = subgraph.create_named_value("captured", DataType::Float32, static_shape([1]));
+        let output = subgraph.create_named_value("Y", DataType::Float32, static_shape([1]));
+        subgraph.insert_node(Node::new(
+            NodeId(0),
+            "Relu",
+            vec![Some(capture)],
+            vec![output],
+        ));
+        subgraph.add_output(output);
         graph.subgraphs.insert((node_id, "body".into()), subgraph);
 
         assert!(
             rule.check(&Model::new(graph), &ValidationContext::default())
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn dangling_node_output_is_flagged() {
+        let rule = NoUnconnectedNodesRule;
+        let mut graph = Graph::new();
+        let input = graph.create_named_value("X", DataType::Float32, static_shape([1]));
+        let dangling = graph.create_named_value("dangling", DataType::Float32, static_shape([1]));
+        graph.add_input(input);
+        let mut node = Node::new(NodeId(0), "Relu", vec![Some(input)], vec![dangling]);
+        node.name = "relu".into();
+        graph.insert_node(node);
+
+        let violations = rule.check(&Model::new(graph), &ValidationContext::default());
+        assert_error(
+            rule.id(),
+            &violations,
+            ViolationLocation::Node {
+                graph_name: String::new(),
+                node_name: "relu".into(),
+            },
         );
     }
 
@@ -983,6 +1151,7 @@ mod tests {
         let mut node = Node::new(NodeId(0), "Relu", vec![Some(dangling)], vec![output]);
         node.name = "relu".into();
         graph.insert_node(node);
+        graph.add_output(output);
 
         let violations = rule.check(&Model::new(graph), &ValidationContext::default());
         assert_error(
@@ -1001,6 +1170,30 @@ mod tests {
         let model = one_node_model("Add", 2, 1);
 
         assert!(rule.check(&model, &ValidationContext::default()).is_empty());
+    }
+
+    #[test]
+    fn schema_type_constraints_skip_unknown_placeholder_types() {
+        let rule = TypeConstraintSatisfiedRule;
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 21);
+        let input = graph.create_named_value("X", DataType::Int64, static_shape([1]));
+        let output = graph.create_named_value("Y", DataType::Float32, Vec::new());
+        graph.mark_value_type_unknown(output);
+        graph.mark_value_shape_unknown(output);
+        graph.add_input(input);
+        graph.insert_node(Node::new(
+            NodeId(0),
+            "Identity",
+            vec![Some(input)],
+            vec![output],
+        ));
+        graph.add_output(output);
+
+        assert!(
+            rule.check(&Model::new(graph), &ValidationContext::default())
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1046,6 +1239,67 @@ mod tests {
             rule.check(&Model::new(graph), &ValidationContext::default())
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn initializer_symbolic_and_unknown_declared_shapes_pass() {
+        let rule = InitializerTypeMatchesDeclaredRule;
+        let mut graph = Graph::new();
+        let batch = graph.create_symbol(Some("batch".into()));
+        let symbolic = graph.create_named_value(
+            "symbolic",
+            DataType::Float32,
+            vec![Dim::Symbolic(batch), Dim::Static(3)],
+        );
+        graph.set_initializer(
+            symbolic,
+            WeightRef::Inline(TensorData::from_raw(
+                DataType::Float32,
+                vec![2, 3],
+                vec![0; 24],
+            )),
+        );
+        let unknown = graph.create_named_value("unknown", DataType::Float32, Vec::new());
+        graph.mark_value_shape_unknown(unknown);
+        graph.set_initializer(
+            unknown,
+            WeightRef::Inline(TensorData::from_raw(
+                DataType::Float32,
+                vec![4],
+                vec![0; 16],
+            )),
+        );
+
+        assert!(
+            rule.check(&Model::new(graph), &ValidationContext::default())
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn mismatched_initializer_shape_is_flagged() {
+        let rule = InitializerTypeMatchesDeclaredRule;
+        for dims in [vec![2, 4], vec![2, 3, 1]] {
+            let mut graph = Graph::new();
+            let value = graph.create_named_value("W", DataType::Float32, static_shape([2, 3]));
+            graph.set_initializer(
+                value,
+                WeightRef::Inline(TensorData::from_raw(
+                    DataType::Float32,
+                    dims.clone(),
+                    Vec::new(),
+                )),
+            );
+
+            let violations = rule.check(&Model::new(graph), &ValidationContext::default());
+            assert_error(
+                rule.id(),
+                &violations,
+                ViolationLocation::Value {
+                    value_name: "W".into(),
+                },
+            );
+        }
     }
 
     #[test]
