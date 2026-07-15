@@ -5,7 +5,7 @@
 # path, and unit-tested without a Python interpreter.
 [package]
 name = "onnx-runtime-dlpack"
-version = "0.1.0-dev.1"
+version.workspace = true
 edition = "2024"
 license = "MIT"
 authors = ["Justin Chu"]

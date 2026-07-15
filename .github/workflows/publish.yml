@@ -96,6 +96,7 @@ jobs:
           }
 
           publish_crate onnx-runtime-ir
+          publish_crate onnx-runtime-tracer
           publish_crate onnx-runtime-cpuinfo
           publish_crate onnx-runtime-shape-inference
           publish_crate onnx-runtime-loader

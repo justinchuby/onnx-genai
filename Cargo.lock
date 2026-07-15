@@ -1853,7 +1853,7 @@ dependencies = [
 
 [[package]]
 name = "onnx-runtime-capi"
-version = "0.1.0-dev.1"
+version = "0.1.0"
 dependencies = [
  "onnx-runtime-ir",
  "onnx-runtime-loader",
@@ -1863,7 +1863,7 @@ dependencies = [
 
 [[package]]
 name = "onnx-runtime-cpuinfo"
-version = "0.1.0-dev.1"
+version = "0.1.0"
 dependencies = [
  "bindgen",
  "cc",
@@ -1873,11 +1873,11 @@ dependencies = [
 
 [[package]]
 name = "onnx-runtime-dlpack"
-version = "0.1.0-dev.1"
+version = "0.1.0"
 
 [[package]]
 name = "onnx-runtime-eager"
-version = "0.1.0-dev.1"
+version = "0.1.0"
 dependencies = [
  "onnx-runtime-ep-api",
  "onnx-runtime-ep-cpu",
@@ -1888,7 +1888,7 @@ dependencies = [
 
 [[package]]
 name = "onnx-runtime-ep-api"
-version = "0.1.0-dev.1"
+version = "0.1.0"
 dependencies = [
  "onnx-runtime-ir",
  "thiserror 2.0.18",
@@ -1896,7 +1896,7 @@ dependencies = [
 
 [[package]]
 name = "onnx-runtime-ep-cpu"
-version = "0.1.0-dev.1"
+version = "0.1.0"
 dependencies = [
  "bindgen",
  "cmake",
@@ -1910,7 +1910,7 @@ dependencies = [
 
 [[package]]
 name = "onnx-runtime-ep-cuda"
-version = "0.1.0-dev.1"
+version = "0.1.0"
 dependencies = [
  "cudarc",
  "half",
@@ -1921,14 +1921,14 @@ dependencies = [
 
 [[package]]
 name = "onnx-runtime-ir"
-version = "0.1.0-dev.1"
+version = "0.1.0"
 dependencies = [
  "thiserror 2.0.18",
 ]
 
 [[package]]
 name = "onnx-runtime-loader"
-version = "0.1.0-dev.1"
+version = "0.1.0"
 dependencies = [
  "memmap2",
  "onnx-runtime-ir",
@@ -1941,7 +1941,7 @@ dependencies = [
 
 [[package]]
 name = "onnx-runtime-memory"
-version = "0.1.0-dev.1"
+version = "0.1.0"
 dependencies = [
  "onnx-runtime-ir",
  "thiserror 2.0.18",
@@ -1949,7 +1949,7 @@ dependencies = [
 
 [[package]]
 name = "onnx-runtime-optimizer"
-version = "0.1.0-dev.1"
+version = "0.1.0"
 dependencies = [
  "onnx-runtime-ir",
  "onnx-runtime-loader",
@@ -1958,7 +1958,7 @@ dependencies = [
 
 [[package]]
 name = "onnx-runtime-python"
-version = "0.1.0-dev.1"
+version = "0.1.0"
 dependencies = [
  "onnx-runtime-dlpack",
  "onnx-runtime-ep-api",
@@ -1972,7 +1972,7 @@ dependencies = [
 
 [[package]]
 name = "onnx-runtime-session"
-version = "0.1.0-dev.1"
+version = "0.1.0"
 dependencies = [
  "onnx-runtime-ep-api",
  "onnx-runtime-ep-cpu",
@@ -1986,7 +1986,7 @@ dependencies = [
 
 [[package]]
 name = "onnx-runtime-shape-inference"
-version = "0.1.0-dev.1"
+version = "0.1.0"
 dependencies = [
  "onnx-runtime-ir",
  "onnx-runtime-loader",
@@ -1995,7 +1995,7 @@ dependencies = [
 
 [[package]]
 name = "onnx-runtime-tracer"
-version = "0.1.0-dev.1"
+version = "0.1.0"
 dependencies = [
  "ittapi",
  "libloading 0.8.9",
