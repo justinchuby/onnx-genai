@@ -251,6 +251,13 @@ Concat/Squeeze/Size/Where). f16/f64/int dtype coverage is a separate wave.
 Output shapes are supplied by `onnx-runtime-shape-inference`; these kernels
 write into pre-shaped output views.
 
+### Wave 6 CPU kernels (2026-07-15)
+
+Added dedicated CPU kernels for **ScatterElements** (opsets 11/16), **OneHot** (opset 9),
+and **Trilu** (opset 14), raising the ep-cpu registry from **132 to 136** entries. Trilu
+accepts its optional scalar int64 `k` input (including negative values) and defaults to zero;
+`upper` remains an attribute. The ep-cpu unit suite has **349** passing tests.
+
 ## ONNX backend test (`onnx.backend.test`)
 
 ### CPU unary and activation coverage (2026-07-14)

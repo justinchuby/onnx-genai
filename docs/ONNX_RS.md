@@ -880,6 +880,12 @@ pub fn register_shape_inference(
 
 ## 10. Version Converter
 
+**Status: ✅ Implemented (initial framework and built-ins).** `onnx-rs::version` provides
+transactional recursive conversion, custom adapter registration, Reshape v5/v13→v14
+`allowzero` rewriting, and schema-backed compatible bumps only where an explicit schema
+upper bound proves compatibility. Unsupported downgrades and unproven targets reject without
+mutating the model.
+
 ### 10.1 Extensible Conversion Framework
 
 Converts models between opset versions. Each conversion is a standalone adapter.
@@ -922,13 +928,11 @@ impl VersionConverter {
         converter
     }
 
-    /// Convert model to target opset version.
+    /// Convert model to target opset version transactionally.
     pub fn convert(&self, model: &mut Model, target_opset: u32) -> Result<ConvertReport, ConvertError> {
-        // 1. For each node, check if current opset < target
-        // 2. Find adapter chain: current → ... → target
-        // 3. Apply adapters in sequence
-        // 4. Update model opset_imports
-        todo!()
+        // Conversion operates on a clone, recursively including nested subgraphs.
+        // The default-domain opset import changes only after every node is accepted.
+        /* implementation */
     }
 
     /// Register a custom adapter (e.g., for custom domain ops).
@@ -1419,9 +1423,9 @@ onnx-rs/                          # Workspace root
 
 ### Phase 4: Version Converter + Polish
 
-- [ ] `onnx-version-converter`: Framework + adapter registration
-- [ ] `onnx-version-converter`: Core adapters (top 30 ops across opset 11→21)
-- [ ] Custom op registration API
+- [x] `onnx-version-converter`: Framework + adapter registration
+- [x] `onnx-version-converter`: Initial core adapter (Reshape v5/v13 → v14) + schema-compatible bumps
+- [x] Custom op registration API
 - [ ] Shape inference integration (wrap `onnx-runtime-shape-inference`)
 - [ ] `onnx-rs-python`: PyO3 bindings
 - [ ] `onnx-cli`: `onnx convert`, `onnx diff` commands

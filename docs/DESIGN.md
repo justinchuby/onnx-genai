@@ -3167,6 +3167,12 @@ proportionally (the reserve fraction is preserved; its absolute size tracks the 
 
 #### 26.11.4 Config & Programmatic Surfaces
 
+**Implementation status (2026-07-15): ✅ Engine wiring landed.** The engine parses byte,
+fraction, and case-insensitive `auto` limits; reads `EngineConfig.limits` and
+`allow_runtime_override` from YAML; exposes `governor()` / `resource_snapshot()`; and
+guards runtime VRAM-limit changes. Snapshots report used/limit/headroom for VRAM, host RAM,
+and disk. Lowering-triggered live eviction remains deferred.
+
 **YAML** (extends the §26.10 `memory:` block; byte-denominated keys are the new source of
 truth, `total_gpu_pages` becomes an optional *override/cap* rather than the primary knob):
 

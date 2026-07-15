@@ -81,8 +81,9 @@ plugin EPs (via C ABI bridge) handle them.
 | Range | 11 | Position IDs generation. |
 | CumSum | 11 | Position computation. |
 | NonZero | 9 | Sparse operations. |
-| ScatterElements | 11 | |
-| Trilu | 14 | Causal mask generation. |
+| ScatterElements | 11 | CPU implemented for opsets 11/16. |
+| OneHot | 9 | CPU implemented; categorical/position encodings. |
+| Trilu | 14 | CPU implemented; causal mask generation, optional int64 `k` input. |
 | RotaryEmbedding | 22 | Added in opset 22 (ONNX standard). |
 
 > **Note:** RotaryEmbedding exists in both standard ONNX (opset 22+) and com.microsoft contrib domain. Prefer standard domain when target opset ≥ 22. Contrib variant retained for backward compatibility with older models.

@@ -967,3 +967,22 @@ CHANNEL/AVG results match element-for-element.
 **Corrective review:** Rachael rejected the fused bias+identity path because it chose a heuristic algorithm. Chew forces `CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_PRECOMP_GEMM` with matching workspace and added a numerically checked dilation GPU test. Rachael re-reviewed 🟢; **86** crate tests pass on H200.
 
 **Current main HEAD:** `894460f`.
+
+## 2026-07-15 — Wave 6: Version conversion, CPU coverage, and engine governance
+
+### ONNX-RS §10 Version Converter (`6edd589`)
+**What:** Zhora added `version.rs` with `VersionConverter`, extensible `OpAdapter`, `AdaptResult`, `ConvertReport`, and `ConvertError`. Built-ins rewrite Reshape v5/v13→v14 with `allowzero`; schema-backed bumps apply only when compatibility is proven.
+
+**Corrective review:** Holden rejected the initial converter because it bumped nested subgraphs without converting their nodes and treated open-ended schemas as indefinitely compatible. Deckard added recursive transactional conversion on a cloned model (full rollback on rejection) and requires a proven schema upper bound (for example, Conv v11→v22 rejects). Holden re-reviewed 🟢. **51** unit tests plus **1** doctest pass.
+
+### CPU ScatterElements, OneHot, and Trilu (`269892c`)
+**What:** Bryant added missing CPU kernels for ScatterElements (opsets 11/16), OneHot (9), and Trilu (14), increasing the registry **132→136**.
+
+**Corrective review:** Roy rejected Trilu because it read `k` as an attribute and required one input; ONNX Trilu-14 has optional scalar int64 `k` input. Leon fixed one/two-input handling, signed `k` decoding, default zero, and retained `upper`; Roy re-reviewed 🟢. **349** ep-cpu tests pass.
+
+### Engine Resource-Governor wiring (`1eebf5d`)
+**What:** Sebastian wired DESIGN §26.11.4 into the engine: byte/limit parsing, `EngineConfig.limits` and `allow_runtime_override` YAML support, governor/snapshot accessors, and guarded live VRAM limit updates. Live eviction remains deferred.
+
+**Corrective review:** Tyrell’s four blockers were fixed by Brion: checked integer absolute-byte parsing, YAML `1.0` preserved as a fraction, absolute limits clamp to provider capacity without fabricating it, and per-tier VRAM/host-RAM/disk snapshots. Tyrell re-reviewed 🟢. **105** tests pass; **18** pre-existing missing-asset failures remain.
+
+**Current main HEAD:** `1eebf5d`.
