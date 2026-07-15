@@ -10,8 +10,9 @@
 //! D2D copies) and covers, keyed on `(op_type, domain)` via the shared
 //! [`onnx_runtime_ep_api::OpRegistry`]:
 //!
-//! * **GEMM family** — `MatMul` and `Gemm` via `cudarc::cublaslt` (`Gemm` adds a
-//!   fused NVRTC `β·C` broadcast-bias epilogue).
+//! * **GEMM family** — `MatMul`, `Gemm`, `com.microsoft::FusedMatMulBias`, and
+//!   `com.microsoft::FusedGemm` via cuBLASLt. The fused ops use native
+//!   `BIAS`, `RELU_BIAS`, and `GELU_BIAS` epilogues.
 //! * **Elementwise** — unary activations (`Relu`, `Sqrt`, `Erf`, `Tanh`,
 //!   `Sigmoid`, and `com.microsoft` `Gelu`) and equal-shape binary ops (`Add`,
 //!   `Sub`, `Mul`, `Div`, `Pow`, `Min`, `Max`) via runtime-compiled (NVRTC) f32

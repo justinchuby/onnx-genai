@@ -49,8 +49,8 @@ not yet wired) · **🔬 custom** (needs a fused NVRTC/CUTLASS kernel).
 |----|--------|--------|---------|-----------------------|
 | `MatMul` | `` | ✅ | **cuBLASLt** | Dense rank ≥ 2 with N-D batch broadcasting, f32/f16/bf16, true-fp32 accum (`matmul.rs`); rank-1 promotion pending. |
 | `Gemm` | `` | ✅ | **cuBLASLt** + NVRTC bias | `Y=α·A'·B'+β·C`, transA/transB, α/β; fused NVRTC `β·C` broadcast-bias epilogue (`gemm.rs`). f32. |
-| `FusedMatMulBias` | `com.microsoft` | ⏳ | **cuBLASLt** epilogue | `CUBLASLT_EPILOGUE_BIAS` — bias add fused into the GEMM (no extra pass). |
-| `FusedGemm` | `com.microsoft` | ⏳ | **cuBLASLt** epilogue | `EPILOGUE_RELU_BIAS`/`GELU_BIAS` — activation+bias fused in-GEMM. |
+| `FusedMatMulBias` | `com.microsoft` | ✅ | **cuBLASLt** `CUBLASLT_EPILOGUE_BIAS` | Dense rank-2 f32/f16/bf16 with an exact per-N bias vector; bias add is fused into GEMM with no elementwise pass. |
+| `FusedGemm` | `com.microsoft` | ✅ | **cuBLASLt** `CUBLASLT_EPILOGUE_{BIAS,RELU_BIAS,GELU_BIAS}` | Dense rank-2 f32/f16/bf16; transA/transB and α. CUDA 13's `GELU_BIAS` is the tanh/0.044715 GELU approximation (H200 output differs from exact-erf at the expected ~2.2e-4 for x=1.5); cuBLASLt exposes no exact-erf selector, so this deliberately follows the vendor epilogue rather than adding a separate pass. Bias must be per-N and `beta=1` because `BIAS_POINTER` is unscaled; other β values fail explicitly. Missing `activation` defaults to Relu for the repository optimizer's existing `FusedGemm` contract; empty/Identity selects plain BIAS. |
 
 ### Convolution
 
@@ -151,9 +151,9 @@ counts:
 |---------|------:|
 | CPU registry `(domain, op_type)` pairs | **103** |
 | CPU standard-domain (`ai.onnx`) op types | **93** |
-| CUDA registry `(domain, op_type)` pairs | **58** |
-| CUDA advertised op names | **57** |
-| CPU pairs implemented by CUDA in the same domain | **47 / 103** |
+| CUDA registry `(domain, op_type)` pairs | **60** |
+| CUDA advertised op names | **59** |
+| CPU pairs implemented by CUDA in the same domain | **49 / 103** |
 | CPU standard-domain op types implemented by CUDA | **43 / 93** |
 
 The **43 shared `ai.onnx` ops** are: `Abs`, `Add`, `AveragePool`, `Cast`, `CastLike`,
@@ -173,10 +173,10 @@ The **50 CPU `ai.onnx` gaps** are: `Acos`, `Acosh`, `ArgMax`, `ArgMin`, `Asin`,
 `Shape`, `Sinh`, `Size`, `Slice`, `Split`, `Squeeze`, `Sum`, `Swish`, `Tan`,
 `Tile`, `TopK`, `Transpose`, `Unsqueeze`, and `Where`.
 
-For `com.microsoft`, CUDA matches four CPU pairs (`Gelu`,
-`LayerNormalization`, `SimplifiedLayerNormalization`, `SkipLayerNormalization`);
-CPU-only gaps are `BiasGelu`, `FastGelu`, `FusedAttention`, `FusedGemm`,
-`FusedMatMulBias`, and `QuickGelu`. CUDA additionally exposes
+For `com.microsoft`, CUDA matches six CPU pairs (`FusedGemm`,
+`FusedMatMulBias`, `Gelu`, `LayerNormalization`, `SimplifiedLayerNormalization`,
+`SkipLayerNormalization`); CPU-only gaps are `BiasGelu`, `FastGelu`,
+`FusedAttention`, and `QuickGelu`. CUDA additionally exposes
 `com.microsoft::Attention`. CUDA standard-domain extras not currently registered
 by the CPU EP are `And`, `Conv`, `Greater`, `GreaterOrEqual`, `Less`,
 `LessOrEqual`, `Or`, `Selu`, `Softsign`, and `Xor`.
@@ -185,7 +185,7 @@ by the CPU EP are `And`, `Conv`, `Greater`, `GreaterOrEqual`, `Less`,
 
 | Backend | CPU-covered gaps mapped here | Rationale |
 |---------|------------------------------|-----------|
-| **cuBLASLt** | `FusedMatMulBias`, `FusedGemm`; `BiasGelu`/`FastGelu`/`QuickGelu` where expressible as an epilogue | GEMM+bias/activation belongs in the matrix multiply epilogue. |
+| **cuBLASLt** | `BiasGelu`/`FastGelu`/`QuickGelu` where expressible as an epilogue | GEMM+bias/activation belongs in the matrix multiply epilogue. |
 | **cuDNN** | `GlobalAveragePool`, `GlobalMaxPool`, `LogSoftmax`, `ReduceL2`, `ReduceProd`, `ReduceSumSquare` | Vendor-tuned pooling, normalization/softmax, and reduction primitives. |
 | **CUTLASS / cuDNN SDPA** | standard `Attention`, `FusedAttention` | Flash/SDPA implementation avoids materialising the O(S²) score tensor. |
 | **cub/thrust via NVRTC (CCCL headers)** | `ArgMax`, `ArgMin`, `TopK`, `CumSum`, `NonZero` | Scan/select/sort/reduction primitives; cudarc has no dlopen-able cub/thrust API. |
@@ -203,6 +203,11 @@ dilated convolution on H200.
 The cuDNN pooling pass raises the advertised set to **57** op names and is
 GPU-validated on H200 for 2×2 stride-2 MaxPool in f32/f16 and padded AveragePool
 with both include-padding and exclude-padding divisor modes.
+
+The cuBLASLt fused-epilogue pass raises the advertised set to **59** op names.
+`FusedMatMulBias` uses `CUBLASLT_EPILOGUE_BIAS`; `FusedGemm` uses
+`CUBLASLT_EPILOGUE_BIAS`, `CUBLASLT_EPILOGUE_RELU_BIAS`, or
+`CUBLASLT_EPILOGUE_GELU_BIAS`. All three keep bias/activation inside GEMM.
 
 The pointwise dtype/broadcast pass is GPU-validated on H200 for f16 and bf16
 `Add`/`Sub`/`Mul`/`Div`, `[4,1,3]` with `[1,5,3]` NumPy broadcasting, and
@@ -228,10 +233,9 @@ expected impact for transformer inference.
    A library path is a reduction + several pointwise passes; the fused kernel
    removes the intermediate traffic. Add the residual add (`x+sublayer`) to make
    it **residual+norm** — a further fusion that saves a whole tensor round-trip.
-3. **`FusedGemm` / `FusedMatMulBias` (cuBLASLt epilogue)** — *not a hand-written
-   kernel*, but a library-fusion win: use `CUBLASLT_EPILOGUE_GELU_BIAS` /
-   `RELU_BIAS` / `BIAS` so the activation+bias run inside the GEMM, eliminating
-   the separate elementwise pass our current `Gemm`+`Gelu` chain does.
+3. **`FusedGemm` / `FusedMatMulBias` (cuBLASLt epilogue) — implemented.**
+   `CUBLASLT_EPILOGUE_GELU_BIAS` / `RELU_BIAS` / `BIAS` run activation+bias
+   inside GEMM, eliminating the separate elementwise pass.
 4. **Elementwise chain fusion** — the unary/binary NVRTC kernels are deliberately
    *ours* (not cuDNN OpTensor) precisely so a producer→activation→add chain can
    be fused into a single pointwise kernel (one HBM read/write instead of N).

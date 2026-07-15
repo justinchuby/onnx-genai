@@ -26,6 +26,7 @@ pub mod attention;
 pub mod cast;
 pub mod conv;
 pub mod elementwise;
+pub mod fused_gemm;
 pub mod gemm;
 pub mod matmul;
 pub mod normalization;
@@ -42,8 +43,8 @@ use pointwise::{
 
 /// The ops the CUDA EP implements today.
 ///
-/// * **GEMM family** — `MatMul` and `Gemm` (cuBLASLt; `Gemm` adds a fused NVRTC
-///   `beta·C` broadcast-bias epilogue).
+/// * **GEMM family** — `MatMul`, `Gemm`, `FusedMatMulBias`, and `FusedGemm`
+///   (cuBLASLt; the fused ops use native bias/activation epilogues).
 /// * **Elementwise unary** — `Relu`, `Sqrt`, `Erf`, `Tanh` (+ `Sigmoid`) and the
 ///   `com.microsoft` `Gelu`, via runtime-compiled f32/f16/bf16 NVRTC kernels.
 /// * **Elementwise binary (NumPy broadcasting)** — `Add`, `Sub`, `Mul`, `Div`,
@@ -73,6 +74,8 @@ use pointwise::{
 pub const CUDA_COVERED_OPS: &[&str] = &[
     "MatMul",
     "Gemm",
+    "FusedMatMulBias",
+    "FusedGemm",
     "Conv",
     "MaxPool",
     "AveragePool",
@@ -147,6 +150,18 @@ pub fn build_cuda_registry(runtime: Arc<CudaRuntime>) -> OpRegistry {
     reg.register(
         OpKey::new("Gemm", "", 1),
         Box::new(gemm::GemmFactory {
+            runtime: runtime.clone(),
+        }),
+    );
+    reg.register(
+        OpKey::new("FusedMatMulBias", "com.microsoft", 1),
+        Box::new(fused_gemm::FusedMatMulBiasFactory {
+            runtime: runtime.clone(),
+        }),
+    );
+    reg.register(
+        OpKey::new("FusedGemm", "com.microsoft", 1),
+        Box::new(fused_gemm::FusedGemmFactory {
             runtime: runtime.clone(),
         }),
     );
@@ -476,6 +491,16 @@ mod tests {
     #[test]
     fn cudnn_pooling_ops_are_listed_in_coverage() {
         for op in ["MaxPool", "AveragePool"] {
+            assert!(
+                CUDA_COVERED_OPS.contains(&op),
+                "{op} missing from CUDA_COVERED_OPS"
+            );
+        }
+    }
+
+    #[test]
+    fn fused_epilogue_ops_are_listed_in_coverage() {
+        for op in ["FusedMatMulBias", "FusedGemm"] {
             assert!(
                 CUDA_COVERED_OPS.contains(&op),
                 "{op} missing from CUDA_COVERED_OPS"

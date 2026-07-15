@@ -42,10 +42,9 @@
 //! This is the same convention cudarc's own test uses, and it is unit-tested on
 //! the GPU in `tests/matmul_gpu.rs`.
 //!
-//! ## Deferred (Phase 2b)
-//!
-//! Fused bias/activation epilogues (`CUBLASLT_EPILOGUE_BIAS_*`), FP8, GEMV auto-
-//! tuning and FP8 are **not** wired here yet.
+//! Fused bias/activation epilogues use the descriptor's native
+//! `CUBLASLT_MATMUL_DESC_EPILOGUE` and `BIAS_POINTER` attributes, so bias and
+//! activation execute inside the selected GEMM kernel.
 
 use core::ffi::c_int;
 use std::ffi::c_void;
@@ -170,6 +169,29 @@ impl MatmulDesc {
             .map_err(|e| cublas_err("cublasLtMatmulDescCreate", e))?;
         Ok(Self(h))
     }
+
+    fn set_epilogue(&self, epilogue: GemmEpilogue) -> Result<()> {
+        let kind = epilogue.kind.as_cublas();
+        let bias = epilogue.bias;
+        // SAFETY: `self.0` is live; both attribute buffers have the exact types
+        // and sizes required by cuBLASLt and remain live for each call.
+        unsafe {
+            result::set_matmul_desc_attribute(
+                self.0,
+                sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_BIAS_POINTER,
+                (&bias) as *const CUdeviceptr as *const c_void,
+                std::mem::size_of::<CUdeviceptr>(),
+            )
+            .map_err(|e| cublas_err("set MATMUL_DESC_BIAS_POINTER", e))?;
+            result::set_matmul_desc_attribute(
+                self.0,
+                sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_EPILOGUE,
+                (&kind) as *const sys::cublasLtEpilogue_t as *const c_void,
+                std::mem::size_of::<sys::cublasLtEpilogue_t>(),
+            )
+            .map_err(|e| cublas_err("set MATMUL_DESC_EPILOGUE", e))
+        }
+    }
 }
 
 impl Drop for MatmulDesc {
@@ -228,6 +250,35 @@ pub struct GemmParams {
     /// matrix across the batch.
     pub a_batch_stride: usize,
     pub b_batch_stride: usize,
+    /// Optional in-GEMM bias/activation epilogue.
+    pub epilogue: Option<GemmEpilogue>,
+}
+
+/// cuBLASLt fused epilogue kind. All variants add a per-output-channel bias;
+/// activation, when present, is evaluated by cuBLASLt before the result is
+/// written to global memory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GemmEpilogueKind {
+    Bias,
+    ReluBias,
+    GeluBias,
+}
+
+impl GemmEpilogueKind {
+    fn as_cublas(self) -> sys::cublasLtEpilogue_t {
+        match self {
+            Self::Bias => sys::cublasLtEpilogue_t::CUBLASLT_EPILOGUE_BIAS,
+            Self::ReluBias => sys::cublasLtEpilogue_t::CUBLASLT_EPILOGUE_RELU_BIAS,
+            Self::GeluBias => sys::cublasLtEpilogue_t::CUBLASLT_EPILOGUE_GELU_BIAS,
+        }
+    }
+}
+
+/// Device bias vector and the fused operation to apply to each GEMM output.
+#[derive(Clone, Copy, Debug)]
+pub struct GemmEpilogue {
+    pub kind: GemmEpilogueKind,
+    pub bias: CUdeviceptr,
 }
 
 /// Default cuBLASLt workspace. 32 MiB is NVIDIA's recommendation for Hopper
@@ -284,6 +335,9 @@ pub unsafe fn gemm(
 
     // Full-precision fp32 accumulation; scale (alpha/beta) type is f32.
     let desc = MatmulDesc::new(p.dtype.compute_type(), sys::cudaDataType_t::CUDA_R_32F)?;
+    if let Some(epilogue) = p.epilogue {
+        desc.set_epilogue(epilogue)?;
+    }
     // No transpose on either operand — the swap above already realises Cᵀ = Bᵀ·Aᵀ.
 
     let pref = MatmulPref::new(workspace_bytes)?;
@@ -368,6 +422,8 @@ pub struct GemmEx {
     pub ldb: usize,
     pub c: CUdeviceptr,
     pub ldc: usize,
+    /// Optional in-GEMM bias/activation epilogue.
+    pub epilogue: Option<GemmEpilogue>,
 }
 
 // cublasOperation_t is a plain C `enum` (4-byte int): CUBLAS_OP_N = 0, _T = 1.
@@ -449,6 +505,9 @@ pub unsafe fn gemm_ex(
         sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSB,
         p.transb,
     )?;
+    if let Some(epilogue) = p.epilogue {
+        desc.set_epilogue(epilogue)?;
+    }
 
     let pref = MatmulPref::new(workspace_bytes)?;
 

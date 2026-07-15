@@ -244,6 +244,7 @@ impl MatMulKernel {
                     batch: run.batch,
                     a_batch_stride: run.a_stride * plan.m * plan.k,
                     b_batch_stride: run.b_stride * plan.k * plan.n,
+                    epilogue: None,
                 };
                 // SAFETY: the plan's broadcast offsets address complete matrices
                 // inside A/B/Y; workspace and stream remain live for every run.

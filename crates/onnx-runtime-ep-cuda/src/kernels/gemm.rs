@@ -97,18 +97,18 @@ pub struct GemmKernel {
 /// Resolved `Gemm` problem geometry and the cuBLASLt leading dims / transpose
 /// flags that realise the row-major `Y = alpha·A'·B'` (see [`GemmKernel::run`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct GemmPlan {
-    m: usize,
-    k: usize,
-    n: usize,
+pub(super) struct GemmPlan {
+    pub(super) m: usize,
+    pub(super) k: usize,
+    pub(super) n: usize,
     /// cuBLASLt `transa` (applied to the ONNX **B** operand — see the mapping).
-    transa: bool,
+    pub(super) transa: bool,
     /// cuBLASLt `transb` (applied to the ONNX **A** operand).
-    transb: bool,
+    pub(super) transb: bool,
     /// Leading dim of the ONNX B operand as stored (`= B.shape[1]`).
-    ldb_operand: usize,
+    pub(super) ldb_operand: usize,
     /// Leading dim of the ONNX A operand as stored (`= A.shape[1]`).
-    lda_operand: usize,
+    pub(super) lda_operand: usize,
 }
 
 /// Compute the GEMM plan from the raw (row-major) operand shapes and the
@@ -116,7 +116,12 @@ struct GemmPlan {
 /// [`crate::blas`]: to get row-major `Y[M,N]` we ask cuBLASLt for the
 /// column-major `Yᵀ = alpha·(B')ᵀ·(A')ᵀ`, feeding the B operand as cuBLASLt's
 /// first matrix and A as its second.
-fn plan_gemm(a: &[usize], b: &[usize], trans_a: bool, trans_b: bool) -> Result<GemmPlan> {
+pub(super) fn plan_gemm(
+    a: &[usize],
+    b: &[usize],
+    trans_a: bool,
+    trans_b: bool,
+) -> Result<GemmPlan> {
     if a.len() != 2 || b.len() != 2 {
         return Err(not_implemented(format!(
             "Gemm with operand ranks {}D x {}D (Gemm requires 2-D A and B)",
@@ -264,6 +269,7 @@ impl GemmKernel {
             ldb: plan.lda_operand,
             c: y_ptr,
             ldc: plan.n,
+            epilogue: None,
         };
 
         // SAFETY: A/B/Y are validated dense f32 device buffers sized for the

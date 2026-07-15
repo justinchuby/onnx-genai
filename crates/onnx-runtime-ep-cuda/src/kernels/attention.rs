@@ -467,6 +467,7 @@ impl AttentionKernel {
                     ldb: d,
                     c: s_head,
                     ldc: sk,
+                    epilogue: None,
                 };
                 // SAFETY: per-head pointers lie inside the validated dense Q/K
                 // and freshly-allocated scores buffers; `workspace` is live;
@@ -533,6 +534,7 @@ impl AttentionKernel {
                     ldb: sk,
                     c: o_head,
                     ldc: d,
+                    epilogue: None,
                 };
                 // SAFETY: per-head pointers lie inside the validated dense V and
                 // the softmaxed scores buffer and the dense output; `workspace`
