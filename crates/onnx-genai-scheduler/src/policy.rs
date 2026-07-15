@@ -45,7 +45,7 @@ impl FairSharePolicy {
         }
     }
 
-    /// Change one class's weight without carrying credit from the old weight.
+    /// Change one class's weight without carrying credit from the old weights.
     ///
     /// # Panics
     ///
@@ -54,7 +54,7 @@ impl FairSharePolicy {
         assert!(weight > 0, "fair-share weights must be non-zero");
         let index = class_index(priority);
         self.weights[index] = weight;
-        self.deficits[index] = 0;
+        self.deficits = [0; CLASS_COUNT];
     }
 
     /// Select the next class from the currently backlogged classes.
@@ -76,8 +76,8 @@ impl FairSharePolicy {
         for index in 0..CLASS_COUNT {
             if active[index] {
                 let weight = i128::from(self.weights[index]);
-                self.deficits[index] += weight;
-                total_weight += weight;
+                self.deficits[index] = self.deficits[index].saturating_add(weight);
+                total_weight = total_weight.saturating_add(weight);
             } else {
                 // Idle classes neither accumulate nor retain burst credit.
                 self.deficits[index] = 0;
@@ -97,7 +97,7 @@ impl FairSharePolicy {
         }
 
         let selected = selected.expect("at least one class is active");
-        self.deficits[selected] -= total_weight;
+        self.deficits[selected] = self.deficits[selected].saturating_sub(total_weight);
         self.tie_cursor = (selected + 1) % CLASS_COUNT;
         Some(priority_from_index(selected))
     }
@@ -186,5 +186,41 @@ mod tests {
         let counts = dispatch_counts(&mut policy, &[Priority::Low, Priority::High], 40);
         assert_eq!(counts[class_index(Priority::Low)], 10);
         assert_eq!(counts[class_index(Priority::High)], 30);
+    }
+
+    #[test]
+    fn reweighting_resets_all_classes_to_a_fair_baseline() {
+        let mut policy = FairSharePolicy::with_weights(1, 1, 10);
+
+        dispatch_counts(&mut policy, &[Priority::Low, Priority::High], 104);
+        policy.set_weight(Priority::High, 1);
+
+        let mut previous = None;
+        let mut counts = [0; CLASS_COUNT];
+        for _ in 0..20 {
+            let selected = policy.select([Priority::Low, Priority::High]).unwrap();
+            assert_ne!(
+                previous,
+                Some(selected),
+                "reweighting should not leave either class with stale burst credit"
+            );
+            counts[class_index(selected)] += 1;
+            previous = Some(selected);
+        }
+
+        assert_eq!(counts[class_index(Priority::Low)], 10);
+        assert_eq!(counts[class_index(Priority::High)], 10);
+    }
+
+    #[test]
+    fn maximum_weights_do_not_overflow_deficit_updates() {
+        let mut policy = FairSharePolicy::with_weights(u32::MAX, u32::MAX, u32::MAX);
+        let counts = dispatch_counts(
+            &mut policy,
+            &[Priority::Low, Priority::Normal, Priority::High],
+            3_000,
+        );
+
+        assert_eq!(counts, [1_000, 1_000, 1_000]);
     }
 }
