@@ -9,6 +9,11 @@ publish = false
 
 [features]
 bench-ort = ["dep:onnx-genai-ort"]
+bench-native = [
+    "dep:onnx-runtime-ep-cpu",
+    "dep:onnx-runtime-ep-cuda",
+    "dep:onnx-runtime-session",
+]
 
 [dependencies]
 anyhow = { workspace = true }
@@ -17,6 +22,9 @@ onnx-genai-engine = { workspace = true }
 onnx-genai-kv = { workspace = true }
 onnx-genai-ort = { workspace = true, optional = true }
 onnx-genai-runtime-config = { workspace = true }
+onnx-runtime-ep-cpu = { workspace = true, optional = true }
+onnx-runtime-ep-cuda = { workspace = true, optional = true }
+onnx-runtime-session = { workspace = true, optional = true }
 serde_json = { workspace = true }
 tokenizers = { workspace = true }
 tokio = { workspace = true }
@@ -36,3 +44,7 @@ required-features = ["bench-ort"]
 [[bin]]
 name = "profile_decode"
 required-features = ["bench-ort"]
+
+[[bin]]
+name = "profile_native"
+required-features = ["bench-native"]

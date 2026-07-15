@@ -39,6 +39,35 @@ cargo bench -p onnx-genai-bench --bench no_model
 cargo bench -p onnx-genai-bench --features bench-ort --bench model
 ```
 
+## Engine/ORT versus native nxrt profiling
+
+The opt-in profiling binaries measure different layers:
+
+- `bench-ort` / `profile_decode` measures token generation through the
+  `onnx-genai` engine and `onnx-genai-ort` (ORT CUDA EP).
+- `bench-native` / `profile_native` measures repeated whole-model
+  `onnx-runtime-session::InferenceSession::run` calls through nxrt's pure-Rust
+  CPU runtime.
+
+These results are **not yet comparable head-to-head**. The ORT path has a
+generation loop, I/O binding, and KV-cache decode flow. The native session
+currently exposes only `run`, so it reports runs/s and ms/run rather than tok/s.
+For CLI consistency, `--tokens` is the number of repeated inference calls per
+measured run; it does not mean generated tokens.
+
+```bash
+cargo run --release -p onnx-genai-bench --features bench-native \
+  --bin profile_native -- \
+  --model crates/onnx-runtime-session/tests/fixtures/bert_toy \
+  --tokens 8 --warmups 1 --runs 3 --ep cpu
+```
+
+CUDA kernels expose per-op `cuda_graph_compatible()` predicates, but
+`onnx-runtime-session` is currently CPU-only and has no session-level CUDA graph
+capture/replay API. `--ep cuda --cuda-graph` reports that limitation rather than
+silently using CPU or faking graph replay. Unsupported operators retain the
+native session's actionable missing-kernel error.
+
 ## Cross-runtime HTTP comparison
 
 `compare` measures the deployment-facing OpenAI streaming API against other local runtimes.
