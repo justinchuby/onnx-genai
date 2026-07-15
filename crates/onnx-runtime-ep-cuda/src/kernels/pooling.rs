@@ -8,7 +8,7 @@ use onnx_runtime_ir::{DataType, Node};
 
 use crate::cudnn::{CudnnBufferPair, CudnnPoolingMode, CudnnPoolingSpec, CudnnTensorType};
 use crate::error::not_implemented;
-use crate::runtime::{CudaRuntime, cuptr};
+use crate::runtime::{cuptr, CudaRuntime};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PoolKind {
@@ -39,13 +39,13 @@ impl KernelFactory for PoolFactory {
                 "{op} ceil_mode=1 (cuDNN pooling path supports ceil_mode=0 only)"
             )));
         }
+        let dilations = ints_attr(node, op, "dilations", Some(&[1, 1]))?;
+        if dilations != [1, 1] {
+            return Err(not_implemented(format!(
+                "{op} dilations={dilations:?} (cuDNN pooling descriptor has no dilation)"
+            )));
+        }
         if self.kind == PoolKind::Max {
-            let dilations = ints_attr(node, op, "dilations", Some(&[1, 1]))?;
-            if dilations != [1, 1] {
-                return Err(not_implemented(format!(
-                    "MaxPool dilations={dilations:?} (cuDNN pooling descriptor has no dilation)"
-                )));
-            }
             let storage_order = int_attr(node, op, "storage_order", 0)?;
             if storage_order != 0 {
                 return Err(not_implemented(format!(

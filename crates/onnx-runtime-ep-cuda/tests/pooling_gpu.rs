@@ -201,3 +201,35 @@ fn cudnn_averagepool_padding_count_modes_match_cpu() {
     }
     println!("cuDNN AveragePool padded include/exclude-padding cases passed");
 }
+
+#[test]
+fn cudnn_averagepool_rejects_dilations() {
+    let Some(ep) = cuda_ep() else {
+        return;
+    };
+    let (mut graph, node) = build_pool_model(
+        "AveragePool",
+        DataType::Float32,
+        &[1, 1, 4, 4],
+        &[1, 1, 2, 2],
+        [2, 2],
+        [2, 2],
+        [0, 0, 0, 0],
+        None,
+    );
+    graph
+        .node_mut(node)
+        .attributes
+        .insert("dilations".into(), Attribute::Ints(vec![2, 2]));
+    let model = Model::new(&graph);
+
+    let error = match ep.get_kernel(model.graph.node(node), &[vec![1, 1, 4, 4]], 17) {
+        Ok(_) => panic!("AveragePool with dilations must be rejected"),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("AveragePool dilations=[2, 2] (cuDNN pooling descriptor has no dilation)")
+    );
+}
