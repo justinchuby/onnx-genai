@@ -68,6 +68,7 @@ pub mod rotary_embedding;
 pub mod selection;
 pub mod sequence;
 pub mod shape;
+pub mod skip_simplified_layernorm;
 pub mod slice;
 pub mod softmax;
 pub mod split;
@@ -295,6 +296,10 @@ pub fn build_cpu_registry() -> OpRegistry {
     reg.register(
         OpKey::new("SimplifiedLayerNormalization", "com.microsoft", 1),
         Box::new(contrib_fused::SimplifiedLayerNormFactory),
+    );
+    reg.register(
+        OpKey::new("SkipSimplifiedLayerNormalization", "com.microsoft", 1),
+        Box::new(skip_simplified_layernorm::SkipSimplifiedLayerNormFactory),
     );
     reg.register(
         OpKey::new("MoE", "com.microsoft", 1),
@@ -1207,8 +1212,9 @@ mod tests {
         // four more default-domain entries not in `PHASE1_OPS`; `Softmax` and
         // `LogSoftmax` each have a legacy and an opset-13 entry. Five contrib
         // (`com.microsoft`) fused transformer entries (BiasGelu, FastGelu,
-        // QuickGelu, SkipLayerNormalization, SimplifiedLayerNormalization) add
-        // five more; `MoE` and `GroupQueryAttention` add one contrib entry each.
+        // QuickGelu, SkipLayerNormalization, SimplifiedLayerNormalization,
+        // SkipSimplifiedLayerNormalization) add six more; `MoE` and
+        // `GroupQueryAttention` add one contrib entry each.
         // QuantizeLinear and
         // DequantizeLinear each add six versioned entries, while
         // DynamicQuantizeLinear adds one (twenty-eight over the
@@ -1221,7 +1227,7 @@ mod tests {
         // registrations over the Phase-1 op-name count in total.
         // MatMulNBits and GroupQueryAttention each add one more contrib-domain
         // registration.
-        assert_eq!(reg.len(), PHASE1_OPS.len() + 49);
+        assert_eq!(reg.len(), PHASE1_OPS.len() + 50);
         for op in PHASE1_OPS {
             assert!(reg.lookup(op, "", 21).is_some(), "missing factory for {op}");
         }
@@ -1259,6 +1265,7 @@ mod tests {
             "QuickGelu",
             "SkipLayerNormalization",
             "SimplifiedLayerNormalization",
+            "SkipSimplifiedLayerNormalization",
         ] {
             assert!(
                 reg.lookup(op, "com.microsoft", 1).is_some(),
