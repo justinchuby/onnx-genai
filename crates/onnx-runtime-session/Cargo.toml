@@ -16,3 +16,6 @@ onnx-runtime-optimizer = { workspace = true }
 onnx-runtime-ep-api = { workspace = true }
 onnx-runtime-ep-cpu = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+prost = "0.13"

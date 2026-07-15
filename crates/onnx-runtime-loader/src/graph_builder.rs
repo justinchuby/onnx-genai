@@ -29,6 +29,13 @@ pub struct BuiltGraph {
 ///
 /// Weights and shape inference are applied by later pipeline stages.
 pub fn build_graph(model: &ModelProto) -> Result<BuiltGraph, LoaderError> {
+    // Expand any model-local function calls into their primitive bodies before
+    // building the IR, so the rest of the pipeline only ever sees ops the
+    // runtime has kernels for. No-op (borrow) when the model declares no
+    // functions.
+    let inlined = crate::function_inline::inline_functions(model)?;
+    let model = inlined.as_ref();
+
     let mut graph = Graph::new();
 
     // Opset imports: domain -> version.

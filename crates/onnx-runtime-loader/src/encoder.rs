@@ -37,7 +37,11 @@
 //! emitted empty / default:
 //!
 //! * `TrainingInfoProto`, `FunctionProto`, sparse initializers, quantization
-//!   annotations (not represented in the IR);
+//!   annotations (not represented in the IR). Model-local functions ARE
+//!   supported on the load path — [`crate::function_inline`] expands every
+//!   function call into its primitive body before the IR is built — but the IR
+//!   `Graph` does not retain the original `FunctionProto` declarations, so they
+//!   are not re-emitted here;
 //! * control-flow **subgraph** formal `input`/`output` lists — the load path
 //!   does not register them as graph I/O for nested graphs. Rather than silently
 //!   emit a subgraph with a truncated signature, [`encode_attribute`] returns a

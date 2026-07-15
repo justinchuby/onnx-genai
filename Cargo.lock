@@ -1980,6 +1980,7 @@ dependencies = [
  "onnx-runtime-loader",
  "onnx-runtime-optimizer",
  "onnx-runtime-shape-inference",
+ "prost",
  "thiserror 2.0.18",
 ]
 

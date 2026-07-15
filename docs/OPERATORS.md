@@ -202,6 +202,29 @@ Phase 5 (Full coverage):
 - Microsoft contrib: https://github.com/microsoft/onnxruntime/blob/main/docs/ContribOperators.md
 - Our implementation: `native-eps/cpu/src/kernels/` and `native-eps/cuda/src/kernels/`
 
+## 4a. Model-Local Functions (`FunctionProto`)
+
+A model may declare reusable subgraphs as `FunctionProto`s in
+`ModelProto.functions`. A node whose `(domain, op_type, overload)` matches a
+declared function's `(domain, name, overload)` is a **function call**.
+
+We do **not** implement kernels for functions. Instead the loader *inlines*
+every function call into its primitive body at load time
+(`onnx-runtime-loader`'s `function_inline` module), so the executor only ever
+sees ops it has kernels for. Inlining:
+
+- remaps the function's formal inputs/outputs to the call-site actuals and
+  freshens all internal value names per instantiation (no collisions);
+- binds `ref_attr_name` attributes from the call site, falling back to the
+  function's declared defaults, and errors on a missing **required** attribute;
+- recurses to a fixpoint through nested function calls and control-flow
+  (If/Loop/Scan) subgraph bodies, rejecting true recursion;
+- merges each function's `opset_import` into the model's, taking the highest
+  version per domain.
+
+This covers model-local functions only; standard ONNX function libraries beyond
+those declared in the model are not expanded.
+
 ## 5. Minimum Opset Version Policy
 
 We support **opset 17 as minimum** (introduced LayerNormalization as standard op).

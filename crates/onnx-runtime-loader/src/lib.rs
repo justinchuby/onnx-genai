@@ -47,6 +47,7 @@ use crate::graph_builder::BuiltGraph;
 
 pub mod encoder;
 pub mod epcontext;
+pub mod function_inline;
 pub mod graph_builder;
 pub mod proto;
 pub mod weights;
@@ -154,6 +155,41 @@ mod error {
 
         #[error("graph construction failed: {0}")]
         GraphBuild(String),
+
+        #[error(
+            "illegal ONNX model: model-local function {function} is recursive (call chain: \
+             {chain}). RULES #1: ONNX function bodies may reference other model-local functions \
+             but MUST NOT be recursive — inlining cannot terminate. Expected: break the cycle so \
+             no function transitively calls itself"
+        )]
+        RecursiveFunction { function: String, chain: String },
+
+        #[error(
+            "illegal ONNX model: call to model-local function {function} at node {node} passes \
+             {actual} {kind}(s) but the function declares only {formal}. RULES #1: a function \
+             call may omit trailing optional {kind}s but must not supply more than are declared. \
+             Expected: remove the extra {kind}(s) or fix the function signature"
+        )]
+        FunctionArityMismatch {
+            function: String,
+            node: String,
+            kind: &'static str,
+            formal: usize,
+            actual: usize,
+        },
+
+        #[error(
+            "illegal ONNX model: call to model-local function {function} at node {node} is missing \
+             required attribute '{attribute}', and the function declares no default for it. \
+             RULES #1: an attribute listed in FunctionProto.attribute has no default and must be \
+             supplied at every call site. Expected: set '{attribute}' on the call node, or give \
+             the function a default via attribute_proto"
+        )]
+        MissingRequiredFunctionAttribute {
+            function: String,
+            node: String,
+            attribute: String,
+        },
 
         #[error("unsupported ONNX data_type {raw} at {context}")]
         UnsupportedDataType { raw: i32, context: String },
