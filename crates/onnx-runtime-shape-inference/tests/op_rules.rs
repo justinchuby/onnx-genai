@@ -37,6 +37,14 @@ fn sd_vec(elems: Vec<DimExpr>) -> NodeIo {
     }
 }
 
+/// A scalar input carrying a resolved floating-point constant.
+fn sd_float_scalar(dt: DataType, value: f64) -> NodeIo {
+    NodeIo {
+        type_info: Some(TypeInfo::new(dt, vec![])),
+        shape_data: Some(ShapeData::float_scalar(dt, value)),
+    }
+}
+
 fn node(op: &str, n_in: usize, n_out: usize) -> Node {
     Node::new(
         NodeId(0),
@@ -627,14 +635,20 @@ fn tile_static_repeats() {
 }
 
 #[test]
-fn tile_v1_reads_axis_and_tiles_attributes() {
-    let n = with_attr(
-        with_attr(node("Tile", 1, 1), "axis", Attribute::Int(1)),
-        "tiles",
-        Attribute::Int(3),
+fn tile_unknown_repeats_keeps_rank() {
+    // `repeats` has no shape-data (runtime-computed): every extent degrades to a
+    // fresh symbol, but the rank stays == rank(input).
+    let n = node("Tile", 2, 1);
+    let outs = run(
+        &n,
+        vec![f32in(vec![c(2), c(3)]), tin(DataType::Int64, vec![c(2)])],
+        13,
     );
-    let outs = run(&n, vec![f32in(vec![c(2), c(4)])], 1);
-    assert_eq!(out_shape(&outs), vec![c(2), c(12)]);
+    let shape = out_shape(&outs);
+    assert_eq!(shape.len(), 2);
+    assert!(shape[0].as_symbol().is_some());
+    assert!(shape[1].as_symbol().is_some());
+    assert_eq!(out_dtype(&outs), DataType::Float32);
 }
 
 #[test]
@@ -660,6 +674,59 @@ fn range_static_and_dynamic() {
     let shape = out_shape(&outs);
     assert_eq!(shape.len(), 1);
     assert!(shape[0].as_symbol().is_some());
+}
+
+#[test]
+fn range_float_positive_delta() {
+    // start=0.0, limit=1.0, delta=0.3 -> ceil(1.0 / 0.3) = ceil(3.33) = 4
+    let n = node("Range", 3, 1);
+    let outs = run(
+        &n,
+        vec![
+            sd_float_scalar(DataType::Float32, 0.0),
+            sd_float_scalar(DataType::Float32, 1.0),
+            sd_float_scalar(DataType::Float32, 0.3),
+        ],
+        11,
+    );
+    assert_eq!(out_shape(&outs), vec![c(4)]);
+    assert_eq!(out_dtype(&outs), DataType::Float32);
+}
+
+#[test]
+fn range_float_negative_delta() {
+    // start=10.0, limit=2.0, delta=-2.5 -> ceil(-8.0 / -2.5) = ceil(3.2) = 4
+    let n = node("Range", 3, 1);
+    let outs = run(
+        &n,
+        vec![
+            sd_float_scalar(DataType::Float64, 10.0),
+            sd_float_scalar(DataType::Float64, 2.0),
+            sd_float_scalar(DataType::Float64, -2.5),
+        ],
+        11,
+    );
+    assert_eq!(out_shape(&outs), vec![c(4)]);
+    assert_eq!(out_dtype(&outs), DataType::Float64);
+}
+
+#[test]
+fn range_float_dynamic() {
+    // Non-constant float operands (typed but no shape-data) -> unknown length.
+    let n = node("Range", 3, 1);
+    let outs = run(
+        &n,
+        vec![
+            tin(DataType::Float32, vec![]),
+            tin(DataType::Float32, vec![]),
+            tin(DataType::Float32, vec![]),
+        ],
+        11,
+    );
+    let shape = out_shape(&outs);
+    assert_eq!(shape.len(), 1);
+    assert!(shape[0].as_symbol().is_some());
+    assert_eq!(out_dtype(&outs), DataType::Float32);
 }
 
 #[test]

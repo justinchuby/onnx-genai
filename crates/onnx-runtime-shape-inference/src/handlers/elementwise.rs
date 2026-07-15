@@ -129,6 +129,7 @@ fn binary_shape_data(op: &str, a: Option<&ShapeData>, b: Option<&ShapeData>) -> 
         dtype: a.dtype,
         dims,
         elems,
+        float_elems: None,
     })
 }
 

@@ -166,6 +166,7 @@ pub fn cast(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
                 dtype,
                 dims: sd.dims,
                 elems: sd.elems,
+                float_elems: None,
             },
         );
     }

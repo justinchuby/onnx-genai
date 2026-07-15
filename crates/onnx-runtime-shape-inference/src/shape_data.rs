@@ -27,14 +27,26 @@ pub const MAX_SHAPE_DATA_ELEMS: usize = 1024;
 
 /// The known element values of a rank-0 or rank-1 integer tensor flowing
 /// through a shape-computation subgraph.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// Integer tensors carry their values in [`elems`](Self::elems) as
+/// [`DimExpr`]s. Floating-point *scalar* constants (needed by `Range`, whose
+/// float form the CPU kernel supports) are carried additively in
+/// [`float_elems`](Self::float_elems); for those, `elems` is empty. `Eq` is not
+/// derived because `f64` is not `Eq` — `ShapeData` is only ever used as a map
+/// *value*, so structural equality is not required.
+#[derive(Clone, Debug, PartialEq)]
 pub struct ShapeData {
-    /// The integer element type (`Int64`/`Int32`, or `Bool` for masks).
+    /// The element type (`Int64`/`Int32`, or `Bool` for masks; `Float32`/
+    /// `Float64` for the float-scalar side-channel).
     pub dtype: DataType,
     /// Static dimensions. Empty == rank-0 scalar; `[n]` == rank-1 vector.
     pub dims: Vec<usize>,
-    /// Row-major elements. Length is `1` for a scalar, `dims[0]` for a vector.
+    /// Row-major integer elements. Length is `1` for a scalar, `dims[0]` for a
+    /// vector. Empty when this is a floating-point scalar (see `float_elems`).
     pub elems: Vec<DimExpr>,
+    /// Row-major floating-point elements for floating-point constants. Present
+    /// only for float/double scalars captured for `Range`; `None` otherwise.
+    pub float_elems: Option<Vec<f64>>,
 }
 
 impl ShapeData {
@@ -44,6 +56,7 @@ impl ShapeData {
             dtype,
             dims: Vec::new(),
             elems: vec![value],
+            float_elems: None,
         }
     }
 
@@ -53,7 +66,24 @@ impl ShapeData {
             dims: vec![elems.len()],
             dtype,
             elems,
+            float_elems: None,
         }
+    }
+
+    /// A rank-0 floating-point scalar holding `value`.
+    pub fn float_scalar(dtype: DataType, value: f64) -> Self {
+        Self {
+            dtype,
+            dims: Vec::new(),
+            elems: Vec::new(),
+            float_elems: Some(vec![value]),
+        }
+    }
+
+    /// This value interpreted as a floating-point scalar, if it is one.
+    pub fn as_float_scalar(&self) -> Option<f64> {
+        let floats = self.float_elems.as_ref()?;
+        (self.is_scalar() && floats.len() == 1).then(|| floats[0])
     }
 
     /// Whether this is a rank-0 scalar.
@@ -91,13 +121,41 @@ impl ShapeData {
         if numel > MAX_SHAPE_DATA_ELEMS {
             return None;
         }
+        // Floating-point *scalars* are captured additively for `Range`; higher-
+        // rank / vector float tensors (weights) are deliberately not tracked.
+        if dtype.is_float() {
+            if !dims.is_empty() {
+                return None;
+            }
+            let value = read_float_scalar(dtype, data)?;
+            return Some(Self::float_scalar(dtype, value));
+        }
         let ints = read_ints(dtype, numel, data)?;
         let elems: Vec<DimExpr> = ints.into_iter().map(DimExpr::constant).collect();
         Some(Self {
             dtype,
             dims: dims.to_vec(),
             elems,
+            float_elems: None,
         })
+    }
+}
+
+/// Read a single little-endian floating-point scalar from `data`.
+///
+/// Supports `Float32` and `Float64` (the forms the `Range` kernel accepts);
+/// returns `None` for other dtypes or a too-short buffer.
+fn read_float_scalar(dtype: DataType, data: &[u8]) -> Option<f64> {
+    match dtype {
+        DataType::Float32 => {
+            let arr: [u8; 4] = data.get(..4)?.try_into().ok()?;
+            Some(f32::from_le_bytes(arr) as f64)
+        }
+        DataType::Float64 => {
+            let arr: [u8; 8] = data.get(..8)?.try_into().ok()?;
+            Some(f64::from_le_bytes(arr))
+        }
+        _ => None,
     }
 }
 
