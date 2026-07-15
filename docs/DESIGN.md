@@ -9145,3 +9145,88 @@ engine.add_logit_processor(DryPenaltyProcessor(penalty=1.5))
 | Ordering constraints | **Yes** | LogitProcessor order matters semantically |
 | Tree speculation support | **Yes** | Medusa/EAGLE use tree verification (higher acceptance rate) |
 | Built-in defaults | **Yes** | DefaultSampler + NgramProducer + RejectionSampling for zero-config |
+
+---
+
+## 43. First-Class Mixture-of-Experts Execution
+
+Sparse Mixture-of-Experts models are a first-class execution target, not merely a
+large generic ONNX graph. Mixtral, Qwen-MoE, DeepSeek-MoE, and related models activate
+only top-k FFN experts per token, so the runtime must preserve sparse routing through
+export, kernels, batching, and memory placement.
+
+The detailed architecture, Colibrì research, integration map, and phased plan are in
+[`MOE_SUPPORT.md`](MOE_SUPPORT.md). All MoE-specific implementation described there
+is currently **NOT YET IMPLEMENTED**.
+
+### 43.1 Graph contract
+
+Mobius should keep the model-specific router as an explicit ONNX subgraph and emit
+the existing `com.microsoft::MoE` or quantized `com.microsoft::QMoE` contrib op for
+expert dispatch and reduction. The router produces `[tokens, experts]` probabilities;
+the fused op owns top-k token permutation, grouped expert FFNs, and weighted scatter.
+
+`QMoE` is the primary int4 representation, with expert-major packed weights, block
+scales, and optional zero points compatible with the existing Mobius
+`MatMulNBits` format. Shared experts remain ordinary dense FFN nodes. Router policy is
+not fused into the expert op because softmax, sigmoid, grouped top-k, bias correction,
+and scaling are model semantics that must remain visible and exact.
+
+Mobius must also provide a dense reference export using TopK/masks, per-expert
+`MatMulNBits`/`MatMul`, and weighted reduction. The reference may compute all experts;
+it is a correctness oracle and portability fallback, not the serving fast path.
+
+### 43.2 Execution and memory
+
+CPU and CUDA EPs need fused routing gather/scatter plus grouped, expert-batched GEMM.
+The CUDA design extends the existing cuBLASLt GEMM seam; the CPU design extends the
+existing batched MatMul seam and adds compressed-domain int4 expert compute.
+
+Expert weights are immutable model data, **not KV cache**. A future expert store
+should reuse the page-table, tiering, LRU, promotion, and lease concepts from
+`onnx-genai-kv` while keeping a separate weight API. Expert-major external-data
+slices move among:
+
+- VRAM hot tier;
+- host-RAM warm tier; and
+- read-only disk backing.
+
+The Resource Governor remains authoritative:
+
+```text
+dense weights + hot experts + KV + activations/scratch + EP overhead
+<= configured VRAM ceiling
+```
+
+It must allocate coordinated KV and expert sub-budgets so independent LRUs cannot
+fight for the final VRAM pages. Residency changes latency only; it must never change
+router semantics or model precision.
+
+### 43.3 Scheduling
+
+The fused MoE op unions selected experts across the already admitted token batch:
+each unique expert is loaded once, receives all routed token rows, and scatters its
+weighted results back. Scheduler-level expert affinity is only a tie-breaker after
+priority/SLA constraints because exact routes are unknown until the router executes.
+Rare routes must not starve.
+
+Hot-expert imbalance is explicit execution state. Kernels and metrics report active
+experts, tokens per expert, imbalance, residency hits, transferred bytes, and
+prefetch waste. Multi-GPU expert parallelism is deferred until the single-device
+grouped path is correct and measured.
+
+### 43.4 Competitive requirement and delivery order
+
+llama.cpp provides practical local MoE support, while vLLM and SGLang provide strong
+serving-oriented MoE implementations. To beat llama.cpp in the experiences we
+control and approach vLLM-class throughput, onnx-genai must avoid all-expert
+residency, per-token expert launches, and opaque scheduler behavior.
+
+Delivery order:
+
+1. **Phase 1 — NOT YET IMPLEMENTED:** Mobius `MoE`/`QMoE` export plus dense fallback
+   and differential correctness tests.
+2. **Phase 2 — NOT YET IMPLEMENTED:** CPU/CUDA grouped-expert kernels and bounded
+   routing scratch.
+3. **Phase 3 — NOT YET IMPLEMENTED:** governor-controlled expert streaming,
+   heat/prefetch, and routing-aware batch policy.
