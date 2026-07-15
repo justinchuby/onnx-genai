@@ -46,7 +46,8 @@ use std::sync::Mutex;
 use onnx_runtime_ir::{DataType, Dim, Shape};
 use onnx_runtime_session::{InferenceSession as RtSession, IoMeta, Tensor};
 use pyo3::exceptions::{
-    PyFileNotFoundError, PyKeyError, PyRuntimeError, PyTypeError, PyValueError,
+    PyAttributeError, PyFileNotFoundError, PyIndexError, PyKeyError, PyRuntimeError, PyTypeError,
+    PyValueError,
 };
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList, PyString, PyTuple};
@@ -240,6 +241,12 @@ struct InferenceSession {
     inputs: Vec<IoMeta>,
     outputs: Vec<IoMeta>,
     providers: Vec<String>,
+    /// Active output subset selected by an in-scope [`bind_outputs`] block, or
+    /// `None` for "all outputs in graph order". Read only by
+    /// [`__call__`](InferenceSession::__call__); `run`/`run_with_values` ignore
+    /// it and keep taking explicit `output_names`. Interior-mutable so a `with`
+    /// block can set/restore it without `&mut self`.
+    active_outputs: Mutex<Option<Vec<String>>>,
 }
 
 #[pymethods]
@@ -302,6 +309,7 @@ impl InferenceSession {
             inputs,
             outputs,
             providers,
+            active_outputs: Mutex::new(None),
         })
     }
 
@@ -370,9 +378,187 @@ impl InferenceSession {
     fn get_providers(&self) -> Vec<String> {
         self.providers.clone()
     }
+
+    /// Model input names in graph order (convenience over `get_inputs()`).
+    #[getter]
+    fn input_names(&self) -> Vec<String> {
+        self.inputs.iter().map(|m| m.name.clone()).collect()
+    }
+
+    /// Model output names in graph order (convenience over `get_outputs()`).
+    #[getter]
+    fn output_names(&self) -> Vec<String> {
+        self.outputs.iter().map(|m| m.name.clone()).collect()
+    }
+
+    /// Call the session like a function — the ergonomic alternative to the
+    /// onnxruntime-shaped `run(None, {...})`.
+    ///
+    /// Inputs are resolved into a `{name: array}` feed, then handed to the same
+    /// zero-copy core as [`run_with_values`](Self::run_with_values):
+    ///
+    /// * a single positional `dict`/`Mapping` is used directly as the feed
+    ///   (keyword arguments may add more inputs, but must not clash with a key
+    ///   already present);
+    /// * otherwise positional arguments map to model inputs **by order** and
+    ///   keyword arguments fill or set the rest **by name**.
+    ///
+    /// Every value flows through the DLPack import (numpy/torch/cupy/jax) with a
+    /// numpy fallback, so no wrapper type is needed. Output selection honors an
+    /// in-scope [`bind_outputs`](Self::bind_outputs) block, else returns all
+    /// outputs in graph order. A single output is returned directly as an
+    /// [`NxrtValue`](dlpack::NxrtValue); multiple outputs come back in an
+    /// [`Outputs`] container.
+    #[pyo3(signature = (*args, **kwargs))]
+    fn __call__(
+        &self,
+        py: Python<'_>,
+        args: &Bound<'_, PyTuple>,
+        kwargs: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<Py<PyAny>> {
+        let np = py.import("numpy")?;
+        let feed = self.build_feed(py, args, kwargs)?;
+
+        let output_names = self
+            .active_outputs
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("nxrt session mutex poisoned"))?
+            .clone();
+
+        let (names, tensors) = self.run_inner(py, &np, output_names, &feed)?;
+
+        if tensors.len() == 1 {
+            let name = names.into_iter().next().expect("len checked");
+            let tensor = tensors.into_iter().next().expect("len checked");
+            return Ok(Py::new(py, dlpack::NxrtValue::new(tensor, name))?.into_any());
+        }
+
+        let mut values = Vec::with_capacity(tensors.len());
+        for (name, tensor) in names.iter().cloned().zip(tensors) {
+            values.push(Py::new(py, dlpack::NxrtValue::new(tensor, name))?);
+        }
+        Ok(Py::new(py, Outputs { names, values })?.into_any())
+    }
+
+    /// Restrict which outputs `__call__` returns for the duration of a `with`
+    /// block, restoring the previous selection on exit (nesting supported).
+    ///
+    /// ```python
+    /// with sess.bind_outputs("logits"):
+    ///     logits = sess(x)          # only "logits" is computed/returned
+    /// ```
+    ///
+    /// Names are validated against the model outputs immediately, with an
+    /// actionable error. `run()`/`run_with_values()` are unaffected.
+    #[pyo3(signature = (*names))]
+    fn bind_outputs(slf: Bound<'_, Self>, names: Vec<String>) -> PyResult<OutputBinding> {
+        {
+            let s = slf.borrow();
+            if names.is_empty() {
+                return Err(PyValueError::new_err(
+                    "bind_outputs: pass at least one output name to select",
+                ));
+            }
+            for n in &names {
+                if !s.outputs.iter().any(|m| &m.name == n) {
+                    let known: Vec<&str> = s.outputs.iter().map(|m| m.name.as_str()).collect();
+                    return Err(PyValueError::new_err(format!(
+                        "bind_outputs: {n:?} is not a model output. Model outputs \
+                         are: {known:?}"
+                    )));
+                }
+            }
+        }
+        Ok(OutputBinding {
+            session: slf.unbind(),
+            names,
+            saved: Mutex::new(None),
+        })
+    }
 }
 
 impl InferenceSession {
+    /// Resolve `__call__`'s positional/keyword arguments into a validated
+    /// `{name: value}` feed dict (values are left as raw Python objects so
+    /// `run_inner` can zero-copy import them).
+    fn build_feed<'py>(
+        &self,
+        py: Python<'py>,
+        args: &Bound<'py, PyTuple>,
+        kwargs: Option<&Bound<'py, PyDict>>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let feed = PyDict::new(py);
+
+        // Case 1: a single positional Mapping (dict, OrderedDict, …) is the feed
+        // itself; keyword arguments may add inputs but must not clash.
+        if args.len() == 1 {
+            let first = args.get_borrowed_item(0)?;
+            if is_mapping(&first) {
+                let items = first.call_method0("items")?;
+                for item in items.try_iter()? {
+                    let pair = item?;
+                    let key = pair.get_item(0)?;
+                    let val = pair.get_item(1)?;
+                    feed.set_item(key, val)?;
+                }
+                if let Some(kw) = kwargs {
+                    for (key, val) in kw.iter() {
+                        if feed.contains(&key)? {
+                            let name: String =
+                                key.extract().unwrap_or_else(|_| format!("{key:?}"));
+                            return Err(PyValueError::new_err(format!(
+                                "input {name:?} was supplied both in the feed \
+                                 mapping and as a keyword argument; provide it \
+                                 only once"
+                            )));
+                        }
+                        feed.set_item(key, val)?;
+                    }
+                }
+                return Ok(feed);
+            }
+        }
+
+        // Case 2: positional arguments map to model inputs by order, keyword
+        // arguments fill/override the rest by name.
+        if args.len() > self.inputs.len() {
+            let known: Vec<&str> = self.inputs.iter().map(|m| m.name.as_str()).collect();
+            return Err(PyValueError::new_err(format!(
+                "too many positional inputs: got {}, but the model has {} \
+                 input(s): {known:?}. Pass at most {} positional array(s), or use \
+                 keyword arguments by input name.",
+                args.len(),
+                self.inputs.len(),
+                self.inputs.len(),
+            )));
+        }
+        for (i, arg) in args.iter().enumerate() {
+            feed.set_item(&self.inputs[i].name, arg)?;
+        }
+        if let Some(kw) = kwargs {
+            for (key, val) in kw.iter() {
+                let name: String = key.extract().map_err(|_| {
+                    PyTypeError::new_err("keyword-argument input names must be strings")
+                })?;
+                if !self.inputs.iter().any(|m| m.name == name) {
+                    let known: Vec<&str> = self.inputs.iter().map(|m| m.name.as_str()).collect();
+                    return Err(PyValueError::new_err(format!(
+                        "unknown input {name:?} passed as a keyword argument. Model \
+                         inputs are: {known:?}"
+                    )));
+                }
+                if feed.contains(&name)? {
+                    return Err(PyValueError::new_err(format!(
+                        "input {name:?} was supplied both positionally and as a \
+                         keyword argument; provide it only once"
+                    )));
+                }
+                feed.set_item(name, val)?;
+            }
+        }
+        Ok(feed)
+    }
+
     /// Shared inference core for [`run`](Self::run) and
     /// [`run_with_values`](Self::run_with_values).
     ///
@@ -483,8 +669,247 @@ impl InferenceSession {
     }
 }
 
-fn node_args(py: Python<'_>, metas: &[IoMeta]) -> PyResult<Py<PyList>> {
-    let list = PyList::empty(py);
+/// Whether `v` should be treated as a name→array mapping feed (dict,
+/// OrderedDict, or any `collections.abc.Mapping`) rather than a single array
+/// argument. numpy/torch arrays have no `keys`/`items`, so this never
+/// misclassifies a real tensor.
+fn is_mapping(v: &Bound<'_, PyAny>) -> bool {
+    v.hasattr("keys").unwrap_or(false) && v.hasattr("items").unwrap_or(false)
+}
+
+/// Multi-output result of a callable [`InferenceSession`].
+///
+/// Ergonomic access to the selected outputs, in graph/selected order:
+/// `out[0]`, `out["logits"]`, `out.logits`, `len(out)`, unpacking
+/// (`a, b = sess(x)`), `.keys()`/`.values()`/`.items()`.
+#[pyclass(module = "nxrt", name = "Outputs")]
+struct Outputs {
+    names: Vec<String>,
+    values: Vec<Py<dlpack::NxrtValue>>,
+}
+
+#[pymethods]
+impl Outputs {
+    fn __len__(&self) -> usize {
+        self.values.len()
+    }
+
+    /// Index by position (`out[0]`, negatives allowed) or by name (`out["y"]`).
+    fn __getitem__(&self, py: Python<'_>, key: &Bound<'_, PyAny>) -> PyResult<Py<dlpack::NxrtValue>> {
+        if let Ok(idx) = key.extract::<isize>() {
+            let n = self.values.len() as isize;
+            let i = if idx < 0 { idx + n } else { idx };
+            if i < 0 || i >= n {
+                return Err(PyIndexError::new_err(format!(
+                    "output index {idx} out of range for {n} output(s)"
+                )));
+            }
+            return Ok(self.values[i as usize].clone_ref(py));
+        }
+        if let Ok(name) = key.extract::<String>() {
+            if let Some(pos) = self.names.iter().position(|n| n == &name) {
+                return Ok(self.values[pos].clone_ref(py));
+            }
+            return Err(PyKeyError::new_err(format!(
+                "no output named {name:?}; outputs are: {:?}",
+                self.names
+            )));
+        }
+        Err(PyTypeError::new_err(
+            "Outputs indices must be an int (position) or str (output name)",
+        ))
+    }
+
+    /// Attribute access by output name (`out.logits`).
+    fn __getattr__(&self, py: Python<'_>, name: &str) -> PyResult<Py<dlpack::NxrtValue>> {
+        if let Some(pos) = self.names.iter().position(|n| n == name) {
+            return Ok(self.values[pos].clone_ref(py));
+        }
+        Err(PyAttributeError::new_err(format!(
+            "'Outputs' object has no output named {name:?}; outputs are: {:?}",
+            self.names
+        )))
+    }
+
+    fn __contains__(&self, name: &str) -> bool {
+        self.names.iter().any(|n| n == name)
+    }
+
+    fn __iter__(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let list = PyList::empty(py);
+        for v in &self.values {
+            list.append(v.clone_ref(py))?;
+        }
+        Ok(list.try_iter()?.into_any().unbind())
+    }
+
+    /// Output names, in order.
+    fn keys(&self) -> Vec<String> {
+        self.names.clone()
+    }
+
+    /// Output values, in order.
+    fn values(&self, py: Python<'_>) -> Vec<Py<dlpack::NxrtValue>> {
+        self.values.iter().map(|v| v.clone_ref(py)).collect()
+    }
+
+    /// `(name, value)` pairs, in order.
+    fn items(&self, py: Python<'_>) -> PyResult<Py<PyList>> {
+        let list = PyList::empty(py);
+        for (name, value) in self.names.iter().zip(&self.values) {
+            list.append((name, value.clone_ref(py)))?;
+        }
+        Ok(list.unbind())
+    }
+
+    fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
+        let mut parts = Vec::with_capacity(self.values.len());
+        for (name, value) in self.names.iter().zip(&self.values) {
+            let v = value.borrow(py);
+            parts.push(format!(
+                "{}: {} {:?}",
+                name,
+                dtype_display_name(v.tensor().dtype),
+                v.tensor().shape,
+            ));
+        }
+        Ok(format!("Outputs({})", parts.join(", ")))
+    }
+}
+
+/// Context manager returned by [`InferenceSession::bind_outputs`]; sets the
+/// session's active output subset on `__enter__` and restores the previous
+/// selection on `__exit__` (so nested `with` blocks stack correctly).
+#[pyclass(module = "nxrt", name = "OutputBinding")]
+struct OutputBinding {
+    session: Py<InferenceSession>,
+    names: Vec<String>,
+    /// The selection that was active when this block was entered, stashed so
+    /// `__exit__` can restore it. `Some(prev)` only between enter and exit.
+    saved: Mutex<Option<Option<Vec<String>>>>,
+}
+
+#[pymethods]
+impl OutputBinding {
+    fn __enter__(&self, py: Python<'_>) -> PyResult<Py<InferenceSession>> {
+        let sess = self.session.borrow(py);
+        let mut active = sess
+            .active_outputs
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("nxrt session mutex poisoned"))?;
+        *self
+            .saved
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("nxrt binding mutex poisoned"))? =
+            Some(active.clone());
+        *active = Some(self.names.clone());
+        Ok(self.session.clone_ref(py))
+    }
+
+    #[pyo3(signature = (_exc_type=None, _exc_value=None, _traceback=None))]
+    fn __exit__(
+        &self,
+        py: Python<'_>,
+        _exc_type: Option<Py<PyAny>>,
+        _exc_value: Option<Py<PyAny>>,
+        _traceback: Option<Py<PyAny>>,
+    ) -> PyResult<bool> {
+        let sess = self.session.borrow(py);
+        let mut active = sess
+            .active_outputs
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("nxrt session mutex poisoned"))?;
+        if let Some(prev) = self
+            .saved
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("nxrt binding mutex poisoned"))?
+            .take()
+        {
+            *active = prev;
+        }
+        Ok(false)
+    }
+}
+
+/// Map a friendly `device` string to the execution-provider list the session
+/// constructor understands. `cuda`/`cuda:N` fall back to CPU; `metal` maps to
+/// the CoreML provider name (unavailable in the pure-Rust build, so it raises an
+/// actionable error listing what is buildable).
+fn device_to_providers(device: Option<&str>) -> PyResult<Vec<String>> {
+    let dev = device.unwrap_or("cpu");
+    let kind = dev.split(':').next().unwrap_or(dev).to_ascii_lowercase();
+    Ok(match kind.as_str() {
+        "cpu" => vec!["CPUExecutionProvider".to_string()],
+        "cuda" | "gpu" => vec![
+            "CUDAExecutionProvider".to_string(),
+            "CPUExecutionProvider".to_string(),
+        ],
+        "metal" | "coreml" => vec![
+            "CoreMLExecutionProvider".to_string(),
+            "CPUExecutionProvider".to_string(),
+        ],
+        _ => {
+            return Err(PyValueError::new_err(format!(
+                "unknown device {dev:?}. Supported devices: \"cpu\", \"cuda\" \
+                 (or \"cuda:N\"), \"metal\". For full control pass \
+                 providers=[...] instead."
+            )));
+        }
+    })
+}
+
+/// `nxrt.load(path, *, device=None, providers=None)` — friendly loader that
+/// returns a callable [`InferenceSession`].
+///
+/// `device` is sugar over provider selection (`"cpu"` default, `"cuda"`/
+/// `"cuda:N"`, `"metal"`). If `providers` is given it wins and `device` is
+/// ignored (the advanced escape hatch). This just calls through to the existing
+/// `InferenceSession(path, providers=...)` constructor.
+#[pyfunction]
+#[pyo3(signature = (path, *, device=None, providers=None))]
+fn load(
+    py: Python<'_>,
+    path: &Bound<'_, PyAny>,
+    device: Option<String>,
+    providers: Option<Vec<String>>,
+) -> PyResult<InferenceSession> {
+    let providers = match providers {
+        Some(p) => p,
+        None => device_to_providers(device.as_deref())?,
+    };
+    InferenceSession::new(py, path, Some(providers))
+}
+
+/// The numpy dtype *name* for a [`DataType`] (e.g. `"float32"`), falling back to
+/// the `Debug` form for types with no numpy name. Used for human-facing `repr`s.
+pub(crate) fn dtype_display_name(dtype: DataType) -> String {
+    match dtype_to_numpy_name(dtype) {
+        Ok(name) => name.to_string(),
+        Err(_) => format!("{dtype:?}"),
+    }
+}
+
+/// Resolve the numpy dtype *object* for an nxrt [`DataType`] (bfloat16 via the
+/// optional `ml_dtypes` package). Shared by `NxrtValue.dtype`.
+pub(crate) fn numpy_dtype_object(py: Python<'_>, dtype: DataType) -> PyResult<Py<PyAny>> {
+    let np = py.import("numpy")?;
+    let np_name = dtype_to_numpy_name(dtype)?;
+    let arg = if np_name == "bfloat16" {
+        let ml = py.import("ml_dtypes").map_err(|_| {
+            PyRuntimeError::new_err(
+                "dtype is bfloat16, which requires the `ml_dtypes` package to \
+                 represent as a numpy dtype. Install it with `pip install \
+                 ml_dtypes`.",
+            )
+        })?;
+        ml.getattr("bfloat16")?.into_any()
+    } else {
+        PyString::new(py, np_name).into_any()
+    };
+    Ok(np.getattr("dtype")?.call1((arg,))?.unbind())
+}
+
+fn node_args(py: Python<'_>, metas: &[IoMeta]) -> PyResult<Py<PyList>> {    let list = PyList::empty(py);
     for meta in metas {
         list.append(Py::new(py, NodeArg::from_meta(meta))?)?;
     }
@@ -722,7 +1147,10 @@ fn nxrt(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__doc__", PyString::new(m.py(), doc))?;
     m.add_class::<InferenceSession>()?;
     m.add_class::<NodeArg>()?;
+    m.add_class::<Outputs>()?;
+    m.add_class::<OutputBinding>()?;
     dlpack::register(m)?;
+    m.add_function(wrap_pyfunction!(load, m)?)?;
     m.add_function(wrap_pyfunction!(get_available_providers, m)?)?;
     m.add_function(wrap_pyfunction!(_dlpack_import_data_ptr, m)?)?;
     m.add_function(wrap_pyfunction!(_dlpack_import_drop_on_thread, m)?)?;

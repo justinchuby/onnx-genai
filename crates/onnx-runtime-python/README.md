@@ -54,6 +54,59 @@ outputs as numpy arrays: `pip install nxrt[bfloat16]`.
 | `nxrt.get_available_providers()` | Providers this wheel can service. |
 | `nxrt.__version__` | Package version. |
 
+### Ergonomic API
+
+`run()` keeps the exact onnxruntime signature (`run(output_names, input_feed)`),
+so drop-in code and conformance suites are unchanged. For everyday use nxrt adds
+a friendlier surface layered on the same zero-copy core.
+
+**`nxrt.load(path, *, device=None, providers=None)`** — a friendly loader that
+returns a **callable** `InferenceSession`. `device` is sugar for provider
+selection (`"cpu"` default, `"cuda"`/`"cuda:N"`, `"metal"`); pass `providers=[…]`
+for full control (it wins over `device`).
+
+**`session(...)`** — call the session like a function instead of
+`run(None, {...})`. Inputs resolve like a normal Python call:
+
+```python
+import numpy as np, nxrt
+
+sess = nxrt.load("model.onnx")            # device="cuda" / providers=[...] optional
+
+y = sess(x)                                # one input  -> one output, returned directly
+s = sess(a, b)                             # positional, mapped to inputs by order
+s = sess(A=a, B=b)                         # keyword, mapped to inputs by name
+s = sess({"A": a, "B": b})                 # explicit name->array feed (dict/Mapping)
+s = sess(a, B=b)                           # positional + keyword mix
+```
+
+Values may be numpy / torch / cupy / jax arrays (anything exposing `__dlpack__`
+or `__array__`) — they flow through the zero-copy DLPack import, no wrapper
+needed. Mistakes raise actionable errors (unknown input, duplicate feed, missing
+input, too many positionals).
+
+Outputs are shaped for convenience:
+
+- **one output** → the `NxrtValue` itself (not a list);
+- **multiple outputs** → an `Outputs` container supporting `out[0]`,
+  `out["logits"]`, `out.logits`, `len(out)`, unpacking (`a, b = sess(x)`), and
+  `.keys()`/`.values()`/`.items()`.
+
+`NxrtValue` behaves like a tensor: `np.asarray(v)` (via `__array__`), `v.shape`,
+`v.dtype`, `len(v)`, plus the zero-copy `torch.from_dlpack(v)` / `v.numpy()`.
+
+**`with session.bind_outputs("logits", ...):`** — restrict which outputs the
+callable returns for the duration of a `with` block (nesting supported, previous
+selection restored on exit). `run()`/`run_with_values()` are unaffected.
+
+```python
+with sess.bind_outputs("logits"):
+    logits = sess(x)                       # only "logits" computed and returned
+```
+
+`session.input_names` / `session.output_names` give the input/output names in
+graph order (alongside the existing `get_inputs()`/`get_outputs()`).
+
 ### Zero-copy output via DLPack
 
 `run()` keeps its onnxruntime-compatible contract: it returns freshly-copied

@@ -422,10 +422,52 @@ impl NxrtValue {
         crate::tensor_to_numpy(py, &np, &self.name, &self.tensor)
     }
 
+    /// numpy's array-interface hook, so `np.asarray(v)` / matplotlib / any
+    /// array-consuming API get this value's data as an ndarray (a copy, via
+    /// `.numpy()`). The optional `dtype`/`copy` keywords numpy 2 may pass are
+    /// honored loosely: `dtype` casts, `copy` is accepted and ignored (the
+    /// result is always a fresh array).
+    #[pyo3(signature = (dtype=None, copy=None))]
+    fn __array__(
+        &self,
+        py: Python<'_>,
+        dtype: Option<&Bound<'_, PyAny>>,
+        copy: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Py<PyAny>> {
+        let _ = copy;
+        let arr = self.numpy(py)?;
+        match dtype {
+            Some(dt) if !dt.is_none() => Ok(arr.bind(py).call_method1("astype", (dt,))?.unbind()),
+            _ => Ok(arr),
+        }
+    }
+
+    /// The value's shape as a tuple of ints (like `numpy.ndarray.shape`).
+    #[getter]
+    fn shape(&self, py: Python<'_>) -> PyResult<Py<PyTuple>> {
+        Ok(PyTuple::new(py, &self.tensor.shape)?.unbind())
+    }
+
+    /// The value's numpy dtype object (like `numpy.ndarray.dtype`).
+    #[getter]
+    fn dtype(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        crate::numpy_dtype_object(py, self.tensor.dtype)
+    }
+
+    /// Length of the first dimension (like `len(numpy_array)`); a 0-d value has
+    /// no length, matching numpy's `TypeError`.
+    fn __len__(&self) -> PyResult<usize> {
+        self.tensor.shape.first().copied().ok_or_else(|| {
+            PyTypeError::new_err("len() of unsized NxrtValue (0-dimensional tensor)")
+        })
+    }
+
     fn __repr__(&self) -> String {
         format!(
-            "NxrtValue(name={:?}, dtype={:?}, shape={:?})",
-            self.name, self.tensor.dtype, self.tensor.shape
+            "NxrtValue(name={:?}, shape={:?}, dtype={})",
+            self.name,
+            self.tensor.shape,
+            crate::dtype_display_name(self.tensor.dtype),
         )
     }
 }
