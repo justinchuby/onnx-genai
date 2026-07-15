@@ -275,7 +275,7 @@ impl DecodeBackend for NativeDecodeSession {
         let logits = named
             .remove(&self.logits)
             .with_context(|| format!("native decoder omitted logits output '{}'", self.logits))?;
-        let logits = extract_logits(&logits, token_ids.len())?;
+        let logits = extract_logits(&logits)?;
 
         let mut next_past = HashMap::with_capacity(self.kv_inputs.len());
         for (present, past) in &self.present_to_past {
@@ -391,16 +391,22 @@ fn matching_past_name(output: &str, inputs: &[String]) -> Option<String> {
     })
 }
 
-fn extract_logits(tensor: &Tensor, sequence_len: usize) -> anyhow::Result<Vec<Vec<f32>>> {
-    let vocab = match tensor.shape.as_slice() {
-        [1, seq, vocab] if *seq == sequence_len => *vocab,
-        [seq, vocab] if *seq == sequence_len => *vocab,
-        shape => bail!(
-            "native logits must have shape [1, sequence, vocab] or [sequence, vocab], got {shape:?}"
-        ),
-    };
+fn extract_logits(tensor: &Tensor) -> anyhow::Result<Vec<Vec<f32>>> {
     let values = tensor_to_f32(tensor)?;
-    Ok(values.chunks_exact(vocab).map(<[f32]>::to_vec).collect())
+    match tensor.shape.as_slice() {
+        [vocab] if *vocab > 0 => Ok(vec![values]),
+        [seq, vocab] if *seq > 0 && *vocab > 0 => Ok(values
+            .chunks(*vocab)
+            .take(*seq)
+            .map(<[f32]>::to_vec)
+            .collect()),
+        [batch, seq, vocab] if *batch > 0 && *seq > 0 && *vocab > 0 => Ok(values
+            .chunks(*vocab)
+            .take(*seq)
+            .map(<[f32]>::to_vec)
+            .collect()),
+        shape => bail!("unsupported logits tensor shape: {shape:?}"),
+    }
 }
 
 fn tensor_to_f32(tensor: &Tensor) -> anyhow::Result<Vec<f32>> {
@@ -482,7 +488,7 @@ fn diagnose_native_failure(session: &InferenceSession, error: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use onnx_runtime_ir::{Attribute, Graph, Node, NodeId, Shape};
+    use onnx_runtime_ir::{Attribute, Graph, Node, NodeId, Shape, TensorData};
 
     fn insert_op(
         graph: &mut Graph,
@@ -503,7 +509,7 @@ mod tests {
         graph.insert_node(node);
     }
 
-    fn tiny_decoder() -> InferenceSession {
+    fn tiny_decoder(last_token_logits: bool) -> InferenceSession {
         let mut graph = Graph::new();
         graph.opset_imports.insert(String::new(), 11);
         let batch = graph.intern_symbol("batch");
@@ -567,18 +573,42 @@ mod tests {
             &[("axes", Attribute::Ints(vec![1, 3]))],
         );
 
-        let logits = graph.create_named_value(
-            "logits",
-            DataType::Float32,
-            shape(&[batch.into(), sequence.into(), 1.into()]),
-        );
-        insert_op(
-            &mut graph,
-            "Unsqueeze",
-            vec![cast],
-            logits,
-            &[("axes", Attribute::Ints(vec![2]))],
-        );
+        let logits = if last_token_logits {
+            let logits = graph.create_named_value(
+                "logits",
+                DataType::Float32,
+                shape(&[1.into(), 1.into(), 2.into()]),
+            );
+            let data = [10.0f32, 20.0]
+                .into_iter()
+                .flat_map(f32::to_le_bytes)
+                .collect();
+            insert_op(
+                &mut graph,
+                "Constant",
+                vec![],
+                logits,
+                &[(
+                    "value",
+                    Attribute::Tensor(TensorData::from_raw(DataType::Float32, vec![1, 1, 2], data)),
+                )],
+            );
+            logits
+        } else {
+            let logits = graph.create_named_value(
+                "logits",
+                DataType::Float32,
+                shape(&[batch.into(), sequence.into(), 1.into()]),
+            );
+            insert_op(
+                &mut graph,
+                "Unsqueeze",
+                vec![cast],
+                logits,
+                &[("axes", Attribute::Ints(vec![2]))],
+            );
+            logits
+        };
         let present_key = graph.create_named_value(
             "present.0.key",
             DataType::Float32,
@@ -611,7 +641,8 @@ mod tests {
 
     #[test]
     fn native_decode_advances_kv_and_rewinds() {
-        let mut session = NativeDecodeSession::from_session(tiny_decoder()).expect("load decoder");
+        let mut session =
+            NativeDecodeSession::from_session(tiny_decoder(false)).expect("load decoder");
         let logits = session.decode(&[1, 2, 3], 0).expect("prefill");
         assert_eq!(logits.len(), 3);
         assert_eq!(logits[0].len(), 1);
@@ -626,5 +657,48 @@ mod tests {
         assert_eq!(session.current_len(), 2);
         session.decode(&[5], 2).expect("decode after rewind");
         assert_eq!(session.current_len(), 3);
+    }
+
+    #[test]
+    fn native_decode_accepts_last_token_only_logits_and_advances_kv() {
+        let mut session =
+            NativeDecodeSession::from_session(tiny_decoder(true)).expect("load decoder");
+
+        let logits = session.decode(&[1, 2, 3], 0).expect("prefill");
+        assert_eq!(logits, vec![vec![10.0, 20.0]]);
+        assert_eq!(session.current_len(), 3);
+
+        let logits = session.decode(&[4], 3).expect("decode");
+        assert_eq!(logits, vec![vec![10.0, 20.0]]);
+        assert_eq!(session.current_len(), 4);
+    }
+
+    #[test]
+    fn native_logits_shapes_match_ort_semantics() {
+        let cases = [
+            (vec![3], 1),
+            (vec![1, 3], 1),
+            (vec![2, 3], 2),
+            (vec![1, 1, 3], 1),
+            (vec![1, 2, 3], 2),
+            (vec![2, 2, 3], 2),
+        ];
+        for (shape, expected_rows) in cases {
+            let values = (0..shape.iter().product::<usize>())
+                .map(|value| value as f32)
+                .collect::<Vec<_>>();
+            let tensor = Tensor::from_f32(&shape, &values).expect("create logits");
+            let logits = extract_logits(&tensor).expect("extract logits");
+            assert_eq!(logits.len(), expected_rows, "shape {shape:?}");
+            assert_eq!(logits[0].len(), 3, "shape {shape:?}");
+        }
+
+        let tensor = Tensor::from_f32(&[1, 1, 1, 3], &[0.0; 3]).expect("create logits");
+        let error = extract_logits(&tensor).expect_err("rank-four logits must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported logits tensor shape")
+        );
     }
 }
