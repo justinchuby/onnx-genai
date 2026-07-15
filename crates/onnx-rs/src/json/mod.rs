@@ -75,6 +75,22 @@ fn field<'a>(map: &'a Map<String, Value>, camel: &str, snake: &str) -> Option<&'
     map.get(camel).or_else(|| map.get(snake))
 }
 
+fn reject_unsupported_field(map: &Map<String, Value>, camel: &str, snake: &str) -> Result<()> {
+    let populated = field(map, camel, snake).is_some_and(|value| match value {
+        Value::Null => false,
+        Value::Bool(value) => *value,
+        Value::Number(value) => value.as_f64() != Some(0.0),
+        Value::String(value) => !value.is_empty(),
+        Value::Array(value) => !value.is_empty(),
+        Value::Object(value) => !value.is_empty(),
+    });
+    if populated {
+        Err(json_error(format!("unsupported ONNX JSON field: {camel}")))
+    } else {
+        Ok(())
+    }
+}
+
 fn string(map: &Map<String, Value>, camel: &str, snake: &str) -> Result<String> {
     match field(map, camel, snake) {
         None => Ok(String::new()),
@@ -244,6 +260,8 @@ fn model_to_value(proto: &ModelProto) -> Value {
 
 fn parse_model(value: &Value) -> Result<ModelProto> {
     let map = object(value)?;
+    reject_unsupported_field(map, "trainingInfo", "training_info")?;
+    reject_unsupported_field(map, "functions", "functions")?;
     let graph = field(map, "graph", "graph").map(parse_graph).transpose()?;
     Ok(ModelProto {
         ir_version: field(map, "irVersion", "ir_version")
@@ -373,7 +391,22 @@ fn graph_to_value(graph: &GraphProto) -> Value {
 }
 
 fn parse_graph(value: &Value) -> Result<GraphProto> {
+    parse_graph_with_context(value, true)
+}
+
+fn parse_nested_graph(value: &Value) -> Result<GraphProto> {
+    parse_graph_with_context(value, false)
+}
+
+fn parse_graph_with_context(value: &Value, is_top_level: bool) -> Result<GraphProto> {
     let map = object(value)?;
+    reject_unsupported_field(map, "sparseInitializer", "sparse_initializer")?;
+    reject_unsupported_field(map, "quantizationAnnotation", "quantization_annotation")?;
+    reject_unsupported_field(map, "docString", "doc_string")?;
+    reject_unsupported_field(map, "metadataProps", "metadata_props")?;
+    if !is_top_level {
+        reject_unsupported_field(map, "name", "name")?;
+    }
     Ok(GraphProto {
         node: array(map, "node", "node")?
             .iter()
@@ -466,6 +499,8 @@ fn parse_string_array(map: &Map<String, Value>, camel: &str, snake: &str) -> Res
 
 fn parse_node(value: &Value) -> Result<NodeProto> {
     let map = object(value)?;
+    reject_unsupported_field(map, "overload", "overload")?;
+    reject_unsupported_field(map, "metadataProps", "metadata_props")?;
     Ok(NodeProto {
         input: parse_string_array(map, "input", "input")?,
         output: parse_string_array(map, "output", "output")?,
@@ -591,7 +626,7 @@ fn parse_attribute(value: &Value) -> Result<AttributeProto> {
             .transpose()?
             .unwrap_or_default(),
         t: field(map, "t", "t").map(parse_tensor).transpose()?,
-        g: field(map, "g", "g").map(parse_graph).transpose()?,
+        g: field(map, "g", "g").map(parse_nested_graph).transpose()?,
         tp: field(map, "tp", "tp").map(parse_type).transpose()?,
         floats: array(map, "floats", "floats")?
             .iter()
@@ -607,7 +642,7 @@ fn parse_attribute(value: &Value) -> Result<AttributeProto> {
             .collect::<Result<_>>()?,
         graphs: array(map, "graphs", "graphs")?
             .iter()
-            .map(parse_graph)
+            .map(parse_nested_graph)
             .collect::<Result<_>>()?,
         ..Default::default()
     })
@@ -735,6 +770,9 @@ fn parse_location(value: &Value) -> Result<i32> {
 
 fn parse_tensor(value: &Value) -> Result<TensorProto> {
     let map = object(value)?;
+    reject_unsupported_field(map, "segment", "segment")?;
+    reject_unsupported_field(map, "docString", "doc_string")?;
+    reject_unsupported_field(map, "metadataProps", "metadata_props")?;
     Ok(TensorProto {
         dims: array(map, "dims", "dims")?
             .iter()
@@ -1025,6 +1063,61 @@ mod tests {
         let mut graph = Graph::new();
         graph.opset_imports.insert(String::new(), 21);
         graph
+    }
+
+    #[test]
+    fn populated_unrepresentable_proto_fields_are_rejected() {
+        let cases = [
+            (
+                r#"{"graph":{"sparseInitializer":[{}]}}"#,
+                "sparseInitializer",
+            ),
+            (
+                r#"{"graph":{"quantizationAnnotation":[{}]}}"#,
+                "quantizationAnnotation",
+            ),
+            (r#"{"graph":{"docString":"documentation"}}"#, "docString"),
+            (
+                r#"{"graph":{"metadataProps":[{"key":"k","value":"v"}]}}"#,
+                "metadataProps",
+            ),
+            (r#"{"graph":{"node":[{"overload":"local"}]}}"#, "overload"),
+            (
+                r#"{"graph":{"node":[{"metadataProps":[{"key":"k","value":"v"}]}]}}"#,
+                "metadataProps",
+            ),
+            (r#"{"trainingInfo":[{}]}"#, "trainingInfo"),
+            (r#"{"functions":[{}]}"#, "functions"),
+            (
+                r#"{"graph":{"initializer":[{"segment":{"begin":"0","end":"1"}}]}}"#,
+                "segment",
+            ),
+            (
+                r#"{"graph":{"initializer":[{"docString":"documentation"}]}}"#,
+                "docString",
+            ),
+            (
+                r#"{"graph":{"initializer":[{"metadataProps":[{"key":"k","value":"v"}]}]}}"#,
+                "metadataProps",
+            ),
+            (
+                r#"{"graph":{"node":[{"attribute":[{"g":{"name":"nested"}}]}]}}"#,
+                "name",
+            ),
+        ];
+
+        for (source, field) in cases {
+            let error = match from_json(source) {
+                Ok(_) => panic!("expected {field} to be rejected"),
+                Err(error) => error,
+            };
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("unsupported ONNX JSON field: {field}")),
+                "unexpected error for {field}: {error}"
+            );
+        }
     }
 
     #[test]
