@@ -117,6 +117,7 @@ pub trait NumericElem: Copy {
     type Acc: ComputeDomain;
     fn to_acc(self) -> Self::Acc;
     fn from_acc(a: Self::Acc) -> Self;
+    fn from_f32_scalar(f: f32) -> Self;
 }
 
 /// The float-only subset (widens to / narrows from `f32`), used by unary
@@ -138,6 +139,10 @@ impl NumericElem for f32 {
     #[inline]
     fn from_acc(a: f32) -> Self {
         a
+    }
+    #[inline]
+    fn from_f32_scalar(f: f32) -> Self {
+        f
     }
 }
 impl FloatElem for f32 {
@@ -164,6 +169,10 @@ impl NumericElem for f64 {
     fn from_acc(a: f64) -> Self {
         a
     }
+    #[inline]
+    fn from_f32_scalar(f: f32) -> Self {
+        f as f64
+    }
 }
 impl FloatElem for f64 {
     const DTYPE: DataType = DataType::Float64;
@@ -189,6 +198,10 @@ impl NumericElem for half::f16 {
     fn from_acc(a: f32) -> Self {
         half::f16::from_f32(a)
     }
+    #[inline]
+    fn from_f32_scalar(f: f32) -> Self {
+        half::f16::from_f32(f)
+    }
 }
 impl FloatElem for half::f16 {
     const DTYPE: DataType = DataType::Float16;
@@ -212,6 +225,10 @@ impl NumericElem for half::bf16 {
     fn from_acc(a: f32) -> Self {
         half::bf16::from_f32(a)
     }
+    #[inline]
+    fn from_f32_scalar(f: f32) -> Self {
+        half::bf16::from_f32(f)
+    }
 }
 impl FloatElem for half::bf16 {
     const DTYPE: DataType = DataType::BFloat16;
@@ -233,6 +250,7 @@ macro_rules! impl_int_elem {
             type Acc = $t;
             #[inline] fn to_acc(self) -> $t { self }
             #[inline] fn from_acc(a: $t) -> Self { a }
+            #[inline] fn from_f32_scalar(f: f32) -> Self { f as $t }
         }
     )*};
 }

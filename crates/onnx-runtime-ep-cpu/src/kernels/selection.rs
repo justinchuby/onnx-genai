@@ -4,7 +4,10 @@ use core::cmp::Ordering;
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ir::{DataType, Node};
 
+use super::add::require_same_dtype;
 use super::{check_arity, to_dense_f32, to_dense_i64, write_dense_bytes, write_dense_f32};
+use crate::dispatch_arith;
+use crate::dtype::{NumericElem, to_dense, write_dense};
 use crate::strided::numel;
 
 pub struct ClipKernel {
@@ -23,34 +26,72 @@ impl KernelFactory for ClipFactory {
 impl Kernel for ClipKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         check_arity("Clip", inputs, outputs, 1, 3, 1)?;
-        if inputs[0].dtype != DataType::Float32 || outputs[0].dtype != DataType::Float32 {
-            return Err(EpError::KernelFailed(
-                "Clip: currently supports Float32".into(),
-            ));
-        }
-        let min = if inputs.len() > 1 {
-            scalar_f32("Clip min", &inputs[1])?
-        } else {
-            self.min.unwrap_or(f32::NEG_INFINITY)
-        };
-        let max = if inputs.len() > 2 {
-            scalar_f32("Clip max", &inputs[2])?
-        } else {
-            self.max.unwrap_or(f32::INFINITY)
-        };
+        dispatch_arith!(inputs[0].dtype, "Clip", T => {
+            clip_typed::<T>(self, inputs, outputs)
+        })
+    }
+
+    fn supports_strided_input(&self, _: usize) -> bool {
+        true
+    }
+}
+
+fn clip_typed<T: NumericElem + PartialOrd>(
+    kernel: &ClipKernel,
+    inputs: &[TensorView],
+    outputs: &mut [TensorMut],
+) -> Result<()> {
+    if outputs[0].dtype != T::DTYPE {
+        return Err(EpError::KernelFailed(format!(
+            "Clip: output dtype {:?} must match input dtype {:?}",
+            outputs[0].dtype,
+            T::DTYPE
+        )));
+    }
+    let min = if inputs.len() > 1 && !inputs[1].is_absent() {
+        require_same_dtype("Clip", &inputs[1], T::DTYPE)?;
+        Some(scalar_typed::<T>("Clip min", &inputs[1])?)
+    } else {
+        kernel.min.map(T::from_f32_scalar)
+    };
+    let max = if inputs.len() > 2 && !inputs[2].is_absent() {
+        require_same_dtype("Clip", &inputs[2], T::DTYPE)?;
+        Some(scalar_typed::<T>("Clip max", &inputs[2])?)
+    } else {
+        kernel.max.map(T::from_f32_scalar)
+    };
+    if let (Some(min), Some(max)) = (min, max) {
         if min > max {
             return Err(EpError::KernelFailed(
                 "Clip: min must not exceed max".into(),
             ));
         }
-        let y: Vec<f32> = to_dense_f32(&inputs[0])?
-            .into_iter()
-            .map(|x| if x.is_nan() { x } else { x.max(min).min(max) })
-            .collect();
-        write_dense_f32(&mut outputs[0], &y)
     }
-    fn supports_strided_input(&self, _: usize) -> bool {
-        true
+
+    let y = to_dense::<T>(&inputs[0])?
+        .into_iter()
+        .map(|x| {
+            let x = if let Some(min) = min {
+                if x < min { min } else { x }
+            } else {
+                x
+            };
+            if let Some(max) = max {
+                if x > max { max } else { x }
+            } else {
+                x
+            }
+        })
+        .collect::<Vec<_>>();
+    write_dense::<T>(&mut outputs[0], &y)
+}
+
+fn scalar_typed<T: NumericElem>(name: &str, view: &TensorView) -> Result<T> {
+    let x = to_dense::<T>(view)?;
+    if x.len() == 1 {
+        Ok(x[0])
+    } else {
+        Err(EpError::KernelFailed(format!("{name} must be a scalar")))
     }
 }
 
@@ -264,14 +305,6 @@ impl Kernel for NonZeroKernel {
         true
     }
 }
-fn scalar_f32(name: &str, view: &TensorView) -> Result<f32> {
-    let x = to_dense_f32(view)?;
-    if x.len() == 1 {
-        Ok(x[0])
-    } else {
-        Err(EpError::KernelFailed(format!("{name} must be a scalar")))
-    }
-}
 fn axis(name: &str, raw: i64, rank: usize) -> Result<usize> {
     let a = if raw < 0 { raw + rank as i64 } else { raw };
     if a < 0 || a as usize >= rank {
@@ -305,6 +338,39 @@ mod tests {
         .execute(&[x.view(), lo.view(), hi.view()], &mut [y.view_mut()])
         .unwrap();
         assert_eq!(y.to_f32(), vec![0., 0.5, 1.]);
+    }
+
+    #[test]
+    fn clip_supports_int8_defaults_and_f16_tensor_bounds() {
+        let x = Owned {
+            bytes: vec![(-3i8) as u8, 0, 4],
+            shape: vec![3],
+            strides: vec![1],
+            dtype: DataType::Int8,
+        };
+        let mut int_out = Owned::zeros(DataType::Int8, &[3]);
+        ClipKernel {
+            min: None,
+            max: None,
+        }
+        .execute(&[x.view()], &mut [int_out.view_mut()])
+        .unwrap();
+        assert_eq!(int_out.bytes, x.bytes);
+
+        let f16 = Owned::f16(&[3], &[-2., 0.5, 3.]);
+        let lo = Owned::f16(&[], &[0.]);
+        let hi = Owned::f16(&[], &[1.]);
+        let mut f16_out = Owned::zeros(DataType::Float16, &[3]);
+        ClipKernel {
+            min: None,
+            max: None,
+        }
+        .execute(
+            &[f16.view(), lo.view(), hi.view()],
+            &mut [f16_out.view_mut()],
+        )
+        .unwrap();
+        assert_eq!(f16_out.to_f16_as_f32(), vec![0., 0.5, 1.]);
     }
     #[test]
     fn argmax_last_tie_negative_axis() {
