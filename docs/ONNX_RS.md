@@ -418,33 +418,11 @@ version control.
 ### 5.1 Why
 
 - Binary protobuf is unreadable → can't `git diff` model changes
-- Existing `onnx.printer` in Python is output-only, no round-trip
-- MLIR has a text format; ONNX should too
+- Existing `onnx.printer` and `onnx.parser` are reference.
 
 ### 5.2 Format Design
 
-```
-// model.onnxtxt — Human-readable ONNX text format
-onnx_model {
-  ir_version: 10
-  opset_import: [ "" : 21, "com.microsoft" : 1 ]
-  producer: "pytorch 2.6"
-
-  graph main_graph (%input: f32[batch, 512]) -> (%output: f32[batch, 10]) {
-    // Weights (references, not inline data)
-    %weight1 = initializer<f32[512, 256]>("weight1", external="weights.safetensors")
-    %bias1   = initializer<f32[256]>("bias1", external="weights.safetensors")
-    %weight2 = initializer<f32[256, 10]>("weight2", external="weights.safetensors")
-
-    // Computation
-    %0 = MatMul(%input, %weight1)
-    %1 = Add(%0, %bias1)
-    %2 = Relu(%1)
-    %3 = MatMul(%2, %weight2)
-    %output = Softmax(%3) { axis: -1 }
-  }
-}
-```
+Follow the exact design in the onnx repo.
 
 ### 5.3 Design Principles
 
@@ -456,7 +434,7 @@ onnx_model {
 - **Comments:** `//` line comments
 - **Subgraphs:** Nested `graph` blocks for If/Loop/Scan body
 
-### 5.4 Implementation
+### 5.4 Implementation referece
 
 ```rust
 pub struct OnnxTextFormat;
@@ -1209,7 +1187,7 @@ class RedisWeightBackend(onnx_rs.WeightBackend):
         self.client.set(f"weight:{tensor_name}", data)
 
     def tensor_names(self) -> list[str]:
-        return [k.decode().removeprefix("weight:") 
+        return [k.decode().removeprefix("weight:")
                 for k in self.client.keys("weight:*")]
 
 onnx_rs.register_weight_backend(RedisWeightBackend("redis://localhost:6379"))
