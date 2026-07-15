@@ -49,6 +49,7 @@ pub mod layernorm;
 pub mod log_softmax;
 pub mod logical;
 pub mod matmul;
+pub mod moe;
 pub mod movement_ops;
 pub mod norm_ops;
 #[cfg(feature = "onednn")]
@@ -284,6 +285,10 @@ pub fn build_cpu_registry() -> OpRegistry {
     reg.register(
         OpKey::new("SimplifiedLayerNormalization", "com.microsoft", 1),
         Box::new(contrib_fused::SimplifiedLayerNormFactory),
+    );
+    reg.register(
+        OpKey::new("MoE", "com.microsoft", 1),
+        Box::new(moe::MoEFactory),
     );
     // Standard-domain LLM/transformer primitives (ai.onnx). Registered at their
     // ONNX since_version; the registry resolves the highest since_version <=
@@ -1193,16 +1198,17 @@ mod tests {
         // `LogSoftmax` each have a legacy and an opset-13 entry. Five contrib
         // (`com.microsoft`) fused transformer entries (BiasGelu, FastGelu,
         // QuickGelu, SkipLayerNormalization, SimplifiedLayerNormalization) add
-        // five more. QuantizeLinear and DequantizeLinear each add six versioned
-        // entries, while DynamicQuantizeLinear adds one (twenty-eight over the
+        // five more, and `MoE` adds one contrib entry. QuantizeLinear and
+        // DequantizeLinear each add six versioned entries, while
+        // DynamicQuantizeLinear adds one (twenty-eight over the
         // op-name count). Pooling adds twelve more versioned entries: five each
         // for AveragePool and MaxPool, plus the two global pool operators, for
         // forty over the op-name count. ScatterElements also has distinct
         // opset-11 and opset-16 registrations. BatchNormalization,
         // InstanceNormalization and PRelu add one registration each, while
-        // GroupNormalization adds opset-18 and opset-21 entries, for forty-six
+        // GroupNormalization adds opset-18 and opset-21 entries, for forty-seven
         // registrations over the Phase-1 op-name count in total.
-        assert_eq!(reg.len(), PHASE1_OPS.len() + 46);
+        assert_eq!(reg.len(), PHASE1_OPS.len() + 47);
         for op in PHASE1_OPS {
             assert!(reg.lookup(op, "", 21).is_some(), "missing factory for {op}");
         }
@@ -1227,6 +1233,7 @@ mod tests {
         assert!(reg.lookup("FusedGemm", "com.microsoft", 1).is_some());
         // The exact-GELU fusion's contrib op has a CPU kernel (contrib-only).
         assert!(reg.supports("Gelu", "com.microsoft"));
+        assert!(reg.supports("MoE", "com.microsoft"));
         assert!(reg.lookup("Gelu", "com.microsoft", 1).is_some());
         for op in [
             "BiasGelu",
