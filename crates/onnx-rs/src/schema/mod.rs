@@ -59,9 +59,12 @@ pub struct InputSpec {
     /// Whether this position may be omitted.
     #[serde(default)]
     pub optional: bool,
-    /// Whether this position accepts zero or more trailing values.
+    /// Whether this position accepts a variable number of trailing values.
     #[serde(default)]
     pub variadic: bool,
+    /// Minimum number of actual values consumed by a variadic position.
+    #[serde(default = "default_min_arity")]
+    pub min_arity: usize,
 }
 
 /// One positional operator output.
@@ -77,9 +80,16 @@ pub struct OutputSpec {
     /// Whether this output may be omitted.
     #[serde(default)]
     pub optional: bool,
-    /// Whether this position accepts zero or more trailing values.
+    /// Whether this position accepts a variable number of trailing values.
     #[serde(default)]
     pub variadic: bool,
+    /// Minimum number of actual values produced by a variadic position.
+    #[serde(default = "default_min_arity")]
+    pub min_arity: usize,
+}
+
+const fn default_min_arity() -> usize {
+    1
 }
 
 /// ONNX attribute kinds.
@@ -446,7 +456,7 @@ since_version: 2
 until_version: 4
 doc: example op
 inputs:
-  - { name: X, type_str: T, doc: input, optional: true, variadic: true }
+  - { name: X, type_str: T, doc: input, optional: true, variadic: true, min_arity: 2 }
 outputs:
   - { name: Y, type_str: T, doc: output, optional: true, variadic: true }
 attributes:
@@ -461,6 +471,8 @@ type_constraints:
         assert!(!schema.supports_opset(5));
         assert!(schema.inputs[0].optional && schema.inputs[0].variadic);
         assert!(schema.outputs[0].optional && schema.outputs[0].variadic);
+        assert_eq!(schema.inputs[0].min_arity, 2);
+        assert_eq!(schema.outputs[0].min_arity, 1);
         assert_eq!(schema.attributes[0].attr_type, AttributeType::Int);
         assert_eq!(schema.attributes[0].default, Some(AttributeDefault::Int(1)));
         assert_eq!(

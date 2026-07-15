@@ -262,8 +262,14 @@ fn check_node_arity(
     let min_inputs = schema
         .inputs
         .iter()
-        .filter(|spec| !spec.optional && !spec.variadic)
-        .count();
+        .map(|spec| {
+            if spec.variadic {
+                spec.min_arity
+            } else {
+                usize::from(!spec.optional)
+            }
+        })
+        .sum();
     let max_inputs =
         (!schema.inputs.iter().any(|spec| spec.variadic)).then_some(schema.inputs.len());
     if node.inputs.len() < min_inputs || max_inputs.is_some_and(|max| node.inputs.len() > max) {
@@ -291,8 +297,14 @@ fn check_node_arity(
     let min_outputs = schema
         .outputs
         .iter()
-        .filter(|spec| !spec.optional && !spec.variadic)
-        .count();
+        .map(|spec| {
+            if spec.variadic {
+                spec.min_arity
+            } else {
+                usize::from(!spec.optional)
+            }
+        })
+        .sum();
     let max_outputs =
         (!schema.outputs.iter().any(|spec| spec.variadic)).then_some(schema.outputs.len());
     if node.outputs.len() < min_outputs || max_outputs.is_some_and(|max| node.outputs.len() > max) {
@@ -428,23 +440,48 @@ mod tests {
     use crate::schema::SchemaRegistry;
     use onnx_runtime_ir::{Attribute, DataType, Node, NodeId, static_shape};
 
-    fn nested_model(subgraph: Graph) -> Model {
+    fn if_model(subgraph: Graph, output_count: usize, include_else_branch: bool) -> Model {
         let mut graph = Graph::new();
         graph.opset_imports.insert(String::new(), 21);
         let cond = graph.create_named_value("cond", DataType::Bool, static_shape([]));
-        let out = graph.create_named_value("out", DataType::Float32, static_shape([1]));
+        let outputs = (0..output_count)
+            .map(|index| {
+                graph.create_named_value(
+                    format!("out{index}"),
+                    DataType::Float32,
+                    static_shape([1]),
+                )
+            })
+            .collect::<Vec<_>>();
         graph.add_input(cond);
-        let mut node = Node::new(NodeId(0), "If", vec![Some(cond)], vec![out]);
+        let mut node = Node::new(NodeId(0), "If", vec![Some(cond)], outputs.clone());
         node.attributes.insert(
             "then_branch".into(),
             Attribute::Graph(Box::new(subgraph.clone())),
         );
+        if include_else_branch {
+            node.attributes.insert(
+                "else_branch".into(),
+                Attribute::Graph(Box::new(subgraph.clone())),
+            );
+        }
         let node_id = graph.insert_node(node);
         graph
             .subgraphs
-            .insert((node_id, "then_branch".into()), subgraph);
-        graph.add_output(out);
+            .insert((node_id, "then_branch".into()), subgraph.clone());
+        if include_else_branch {
+            graph
+                .subgraphs
+                .insert((node_id, "else_branch".into()), subgraph);
+        }
+        for output in outputs {
+            graph.add_output(output);
+        }
         Model::new(graph)
+    }
+
+    fn nested_model(subgraph: Graph) -> Model {
+        if_model(subgraph, 1, true)
     }
 
     fn one_node_model(op_type: &str, inputs: usize, outputs: usize) -> Model {
@@ -583,9 +620,56 @@ mod tests {
     }
 
     #[test]
+    fn if_requires_else_branch() {
+        let result = if_model(Graph::new(), 1, false).validate();
+        assert!(result.violations.iter().any(|violation| {
+            violation.rule_id == "schema.node_conforms"
+                && violation
+                    .message
+                    .contains("required attribute 'else_branch'")
+        }));
+    }
+
+    #[test]
+    fn if_variadic_outputs_require_at_least_one_value() {
+        let result = if_model(Graph::new(), 0, true).validate();
+        assert!(result.violations.iter().any(|violation| {
+            violation.rule_id == "schema.node_conforms"
+                && violation
+                    .message
+                    .contains("has 0 outputs but schema requires at least 1")
+        }));
+
+        let result = if_model(Graph::new(), 1, true).validate();
+        assert!(result.is_valid(), "{:?}", result.violations);
+    }
+
+    #[test]
     fn schema_rule_accepts_conforming_node() {
         let result = one_node_model("Add", 2, 1).validate();
         assert!(result.is_valid(), "{:?}", result.violations);
+    }
+
+    #[test]
+    fn common_builtin_arity_boundaries_pass() {
+        for (op_type, inputs, outputs) in [
+            ("MatMul", 2, 1),
+            ("Gemm", 2, 1),
+            ("Gemm", 3, 1),
+            ("Add", 2, 1),
+            ("Relu", 1, 1),
+            ("Conv", 2, 1),
+            ("Conv", 3, 1),
+            ("Mul", 2, 1),
+            ("Identity", 1, 1),
+        ] {
+            let result = one_node_model(op_type, inputs, outputs).validate();
+            assert!(
+                result.is_valid(),
+                "{op_type}({inputs}, {outputs}): {:?}",
+                result.violations
+            );
+        }
     }
 
     #[test]
