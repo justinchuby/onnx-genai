@@ -833,3 +833,28 @@ CHANNEL/AVG results match element-for-element.
 **What:** CPU coverage added `Split`, `Pad`, `ConstantOfShape`, `Sum`, `Mean`, `LogSoftmax`, `CastLike`, com.microsoft `BiasGelu`, `FastGelu`, `QuickGelu`, `SkipLayerNormalization`, and `SimplifiedLayerNormalization`; fused normalization honors independent absent beta/bias, requested output arity, axis, and inverse-std output. C1 shape rules now cover ArgMax/ArgMin, TopK, Tile, Range, CumSum, GatherND, NonZero, and relevant trig/activation unaries. Float `ShapeData` enables Range inference, with f32 arithmetic intentionally matching the CPU kernel. `Attention` v23/v24 coverage was hardened for overflow-safe scaling, scalar masks, softcap, v24 mode semantics, and `nonpad_kv_seqlen` causal **and** unconditional padding masks. The activation-memory planner also landed as a deterministic, executor-unwired IR planning crate.
 
 **Why:** These C1/C2 dispatch and inference gaps blocked a large conformance wave; shape contracts must match actual kernel/version behavior. The static registration-vs-schema audit alone over-reports stale operators because old kernels can implement later migrations, so kernel↔shape comm-diff is the real gap signal. Numerical and optional-slot fixes preserve spec behavior rather than broadening unsupported types. (Wallace, Zhora, Cotton, Chew, Nandez, Freysa, Deckard, Sapper, Pris, Kaiser; merged through `7c06c39`.)
+
+---
+
+## 2026-07-14 — Wave 2 conformance coverage and workspace release
+
+### CPU conformance fixes and coverage
+**What:** Wave 2 added CPU `QuantizeLinear`/`DequantizeLinear` (opsets 10/13/19/21/23/25) and `DynamicQuantizeLinear` (11), including scalar, per-axis, and blocked parameters, ties-to-even rounding, and saturation; float8 and packed int4/uint4 remain unsupported. It also added generic N-D AveragePool, MaxPool, GlobalAveragePool, and GlobalMaxPool with f16/bf16/f32/f64 widening paths, aligned pool geometry, optional MaxPool indices, and storage-order support. `Split` shape inference now permits a valid zero final chunk (for example `dim=2, num_outputs=3` yields `[1,1,0]`) and CPU `Equal` supports broadcast Bool and fixed-width numeric tensors.
+
+**Corrective reviews:** A non-author review found MaxPool `Indices` omitted the `nc * spatial_size` global batch/channel offset. Deckard fixed it with two-channel tests for both storage orders; re-review approved. A non-author review likewise found `Split` inference rejected its valid zero remainder; Chew aligned it with the CPU kernel and re-review approved. Quantization was independently approved; its only noted hardening opportunity is an extreme-value saturating add.
+
+**Attention:** Bryant corrected CPU Attention's optional `qk_matmul_output` mode semantics: modes 1 and 2 are not swapped in opset 24. The Shape kernel now implements opset-15 `start`/`end` slicing, preventing executor allocation/write byte-count mismatches. This reduced direct Attention conformance failures from 11 to 2 (the remaining f32-only-policy fp16 cases); expanded Attention still depends on primitive coverage (`Equal`, `Mod`, `And`, `Trilu`) and a Pad byte-count fix. Non-author review approved both fixes and confirmed tests and clippy gates.
+
+**Why:** Kernel and shape-inference sizing and ONNX indexing contracts must agree exactly, particularly for allocation and downstream MaxUnpool use. The remaining gaps are intentionally scoped rather than hidden by broad compatibility behavior.
+
+### ONNX_RS and scheduling sequencing
+**Decision:** Start ONNX_RS in the monorepo using existing `onnx-runtime-ir`, first with self-contained, round-trip-testable `crates/onnx-text` (ONNX text parser/printer) and `crates/onnx-json` (IR/JSON serialization). Defer proto/schema/checker/version-converter/umbrella/PyO3 phases until their dependencies are ready. Defer scheduling work until paged-memory and session-lifecycle substrates exist.
+
+**Why:** ONNX_RS is a sound independent pure-Rust concern; text and JSON offer the lowest-risk initial slices. Scheduling is coupled to not-yet-implemented hibernation, page-out, PagerSchedulerAPI, and EP negotiation.
+
+### Workspace version and tracer publication
+**What:** All `onnx-runtime-*` crates use `version.workspace = true`; internal workspace dependency pins are unified at `0.1.0`; and `onnx-runtime-tracer` was added to the publish workflow. This landed as `554cbfc` following 🟢 non-author review by duck-ver.
+
+**Why:** The workspace had diverged between runtime `0.1.0-dev.1` and GenAI `0.1.0`. Moving all crates forward to `0.1.0` is monotonic and avoids a crates.io downgrade; publishing tracer closes its missing release-workflow coverage.
+
+**Sources:** `bryant-attention-conformance.md`, `duck-attn-review.md`, `kaiser-quantize-linear.md`, `duck-quant-review.md`, `howie-pooling.md`, `duck-pool-review.md`, `deckard-maxpool-indices-fix.md`, `duck-pool2-review.md`, `mariette-split-equal.md`, `duck-spliteq-review.md`, `chew-split-zerochunk-fix.md`, `duck-spliteq2-review.md`, `coordinator-onnx-rs-scheduling-design-review-phased-implementa.md`, `tycho-version-unify.md`.
