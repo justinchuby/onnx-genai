@@ -146,3 +146,58 @@ fn model_local_function_runs_end_to_end() {
     }
     assert_eq!(outputs[0].shape, vec![2, 4]);
 }
+
+#[test]
+fn passthrough_custom_function_without_default_opset_loads_and_runs() {
+    // BUG 3 regression: a model whose ONLY node calls a custom-domain
+    // pass-through function F(X) -> X, declaring ONLY the custom domain's opset
+    // import and NO default (`""`) import — a valid ONNX model. Inlining
+    // synthesizes a default-domain `Identity`; the loader must gain a
+    // default-domain opset import so the previously-valid model still loads.
+    let func = onnx::FunctionProto {
+        name: "Passthrough".to_string(),
+        domain: "custom.domain".to_string(),
+        input: vec!["X".into()],
+        output: vec!["X".into()],
+        node: vec![], // pure pass-through: output aliases input
+        opset_import: vec![onnx::OperatorSetIdProto {
+            domain: "custom.domain".to_string(),
+            version: 1,
+        }],
+        ..Default::default()
+    };
+
+    let graph = onnx::GraphProto {
+        input: vec![value_info("input", &[2, 3])],
+        output: vec![value_info("out", &[2, 3])],
+        node: vec![call("Passthrough", "custom.domain", &["input"], &["out"])],
+        ..Default::default()
+    };
+
+    // Deliberately declare ONLY the custom domain — NO default `""` import.
+    let model = onnx::ModelProto {
+        ir_version: 8,
+        opset_import: vec![onnx::OperatorSetIdProto {
+            domain: "custom.domain".to_string(),
+            version: 1,
+        }],
+        graph: Some(graph),
+        functions: vec![func],
+        ..Default::default()
+    };
+    let bytes = model.encode_to_vec();
+
+    // Before the fix the synthesized `Identity` (default domain) had no opset
+    // import, so the loader rejected this previously-valid model.
+    let mut session =
+        InferenceSession::load_bytes(&bytes).expect("load + inline pass-through function");
+
+    let x = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+    let x_tensor = Tensor::from_f32(&[2, 3], &x).unwrap();
+    let outputs = session.run(&[("input", &x_tensor)]).expect("run");
+    assert_eq!(outputs.len(), 1);
+    assert_eq!(outputs[0].shape, vec![2, 3]);
+    // Pass-through: output equals input.
+    let got = outputs[0].to_vec_f32();
+    assert_eq!(got, x.to_vec());
+}

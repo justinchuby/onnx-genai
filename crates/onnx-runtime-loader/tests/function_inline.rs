@@ -804,6 +804,155 @@ fn function_output_passing_through_input_alongside_computed() {
     assert_eq!(idn.output, vec!["xp".to_string()]);
 }
 
+/// A `sparse_initializer` entry named `name` (indices/values contents are
+/// irrelevant to name-scoping tests; only `values.name` matters).
+fn sparse_tensor(name: &str) -> onnx::SparseTensorProto {
+    onnx::SparseTensorProto {
+        values: Some(tensor(name)),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn synthesized_identity_gets_default_opset_import() {
+    // BUG 3 regression: a pass-through F(X)->X synthesizes a default-domain
+    // `Identity`. If the model declared ONLY a custom-domain opset import (a
+    // valid model that never used a default-domain op), the inlined model must
+    // still gain a default-domain import so loader validation accepts it.
+    let mut f = function("F", "custom.domain", &["X"], &["X"], vec![]);
+    f.opset_import = vec![onnx::OperatorSetIdProto {
+        domain: "custom.domain".to_string(),
+        version: 1,
+    }];
+    let graph = onnx::GraphProto {
+        node: vec![call("F", "custom.domain", &["a"], &["b"])],
+        ..Default::default()
+    };
+    // Deliberately declare ONLY the custom domain — no default `""` import.
+    let m = onnx::ModelProto {
+        ir_version: 8,
+        opset_import: vec![onnx::OperatorSetIdProto {
+            domain: "custom.domain".to_string(),
+            version: 1,
+        }],
+        graph: Some(graph),
+        functions: vec![f],
+        ..Default::default()
+    };
+    let out = inline(m);
+    let g = out.graph.as_ref().unwrap();
+    assert!(
+        g.node.iter().any(|n| n.op_type == "Identity"),
+        "pass-through must synthesize an Identity"
+    );
+    assert!(
+        out.opset_import
+            .iter()
+            .any(|o| (o.domain.is_empty() || o.domain == "ai.onnx") && o.version >= 1),
+        "synthesized default-domain Identity must gain a default-domain opset import"
+    );
+    // The existing custom-domain import is preserved.
+    assert!(out
+        .opset_import
+        .iter()
+        .any(|o| o.domain == "custom.domain" && o.version == 1));
+}
+
+#[test]
+fn existing_default_opset_import_is_not_downgraded() {
+    // BUG 3 regression: when the model already declares a default-domain import,
+    // synthesizing an Identity must NOT add a duplicate or downgrade it.
+    let f = function("F", "custom.domain", &["X"], &["X"], vec![]);
+    let graph = onnx::GraphProto {
+        node: vec![call("F", "custom.domain", &["a"], &["b"])],
+        ..Default::default()
+    };
+    // `model()` declares default `""` @ 17.
+    let out = inline(model(graph, vec![f]));
+    let defaults: Vec<_> = out
+        .opset_import
+        .iter()
+        .filter(|o| o.domain.is_empty() || o.domain == "ai.onnx")
+        .collect();
+    assert_eq!(defaults.len(), 1, "no duplicate default-domain import");
+    assert_eq!(defaults[0].version, 17, "existing default import untouched");
+}
+
+#[test]
+fn subgraph_sparse_initializer_shadows_outer_capture() {
+    // FIX 2 gap: a subgraph `sparse_initializer` is a local binding that shadows
+    // an outer capture, exactly like a dense initializer. F(cond, X) = If(cond){
+    //   then: sparse_initializer X; Add(X, X)->tb; out tb
+    //   else: Identity(X)->eb; out eb }
+    let then_branch = onnx::GraphProto {
+        sparse_initializer: vec![sparse_tensor("X")],
+        node: vec![node("Add", &["X", "X"], &["tb"])],
+        output: vec![value_info("tb")],
+        ..Default::default()
+    };
+    let else_branch = onnx::GraphProto {
+        node: vec![node("Identity", &["X"], &["eb"])],
+        output: vec![value_info("eb")],
+        ..Default::default()
+    };
+    let if_node = node_with_attrs(
+        "If",
+        &["cond"],
+        &["Y"],
+        vec![
+            graph_attr("then_branch", then_branch),
+            graph_attr("else_branch", else_branch),
+        ],
+    );
+    let f = function("F", "d", &["cond", "X"], &["Y"], vec![if_node]);
+    let graph = onnx::GraphProto {
+        node: vec![call("F", "d", &["c", "a"], &["y"])],
+        ..Default::default()
+    };
+    let out = inline(model(graph, vec![f]));
+    let g = out.graph.as_ref().unwrap();
+    let if_n = &g.node[0];
+    let then_sub = if_n.attribute[0].g.as_ref().unwrap();
+    // `X` is a local sparse initializer here -> Add stays on local `X`.
+    assert_eq!(
+        then_sub.node[0].input,
+        vec!["X".to_string(), "X".to_string()],
+        "sparse-initializer local must not be remapped as an outer capture"
+    );
+    let else_sub = if_n.attribute[1].g.as_ref().unwrap();
+    // `X` is a genuine capture here -> remapped to the actual.
+    assert_eq!(else_sub.node[0].input[0], "a");
+}
+
+#[test]
+fn generated_names_avoid_sparse_initializer_collision() {
+    // FIX 4 gap: the outer graph declares a `sparse_initializer` named
+    // `__fn0_t`, which is exactly the name the first instantiation would naively
+    // pick for internal value `t`. The generated name must avoid it.
+    let f = function(
+        "F",
+        "d",
+        &["X"],
+        &["Y"],
+        vec![node("Relu", &["X"], &["t"]), node("Relu", &["t"], &["Y"])],
+    );
+    let graph = onnx::GraphProto {
+        sparse_initializer: vec![sparse_tensor("__fn0_t")],
+        node: vec![call("F", "d", &["a"], &["out"])],
+        ..Default::default()
+    };
+    let out = inline(model(graph, vec![f]));
+    let g = out.graph.as_ref().unwrap();
+    // The function's internal wire took a fresh, non-colliding name.
+    let relus: Vec<_> = g.node.iter().filter(|n| n.op_type == "Relu").collect();
+    let wire = &relus[0].output[0];
+    assert_ne!(
+        wire, "__fn0_t",
+        "generated name collided with a sparse-initializer name"
+    );
+    assert!(wire.starts_with("__fn0_t"));
+}
+
 #[test]
 fn generated_names_avoid_preexisting_collisions() {
     // BUG 4: the outer graph already defines `__fn0_t`, which is exactly the

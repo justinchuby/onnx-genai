@@ -104,13 +104,49 @@ pub fn inline_functions(model: &ModelProto) -> Result<Cow<'_, ModelProto>, Loade
     // new node outputs.
     let mut used: HashSet<String> = HashSet::new();
     collect_used_names(graph, &mut used);
-    let new_graph = inline_graph(graph, &funcs, &mut counter, &mut stack, &mut used)?;
+    // Set when inlining synthesizes any default-domain (`""`/`ai.onnx`) node,
+    // e.g. a boundary `Identity` alias, so we can guarantee the model declares a
+    // default-domain opset import for it (BUG 3 regression).
+    let mut synthesized_default = false;
+    let new_graph = inline_graph(
+        graph,
+        &funcs,
+        &mut counter,
+        &mut stack,
+        &mut used,
+        &mut synthesized_default,
+    )?;
 
     let mut out = model.clone();
     out.graph = Some(new_graph);
     out.opset_import = merged_opset_imports(model);
+    if synthesized_default {
+        ensure_default_opset_import(&mut out.opset_import);
+    }
     out.functions.clear();
     Ok(Cow::Owned(out))
+}
+
+/// Conservative default `ai.onnx` opset version used only when inlining
+/// synthesizes a default-domain node but the model (and its functions) declared
+/// no default-domain opset import at all — a valid ONNX model that, e.g., only
+/// called custom-domain functions. Any version ≥ 1 satisfies loader validation.
+const DEFAULT_ONNX_OPSET_VERSION: i64 = 17;
+
+/// Ensure `imports` contains a default-domain (`""`/`ai.onnx`) opset entry so a
+/// synthesized default-domain node (e.g. a boundary `Identity`) passes loader
+/// validation. An existing default-domain import (under either spelling) is left
+/// untouched — never downgraded.
+fn ensure_default_opset_import(imports: &mut Vec<OperatorSetIdProto>) {
+    let has_default = imports
+        .iter()
+        .any(|o| o.domain.is_empty() || o.domain == "ai.onnx");
+    if !has_default {
+        imports.push(OperatorSetIdProto {
+            domain: String::new(),
+            version: DEFAULT_ONNX_OPSET_VERSION,
+        });
+    }
 }
 
 /// Merge every function's `opset_import` into the model's, taking the highest
@@ -159,11 +195,12 @@ fn inline_graph(
     counter: &mut usize,
     stack: &mut Vec<FnKey>,
     used: &mut HashSet<String>,
+    synthesized_default: &mut bool,
 ) -> Result<GraphProto, LoaderError> {
     let mut out = gp.clone();
     out.node = Vec::with_capacity(gp.node.len());
     for node in &gp.node {
-        expand_node(node, funcs, counter, stack, used, &mut out.node)?;
+        expand_node(node, funcs, counter, stack, used, synthesized_default, &mut out.node)?;
     }
     Ok(out)
 }
@@ -177,12 +214,20 @@ fn expand_node(
     counter: &mut usize,
     stack: &mut Vec<FnKey>,
     used: &mut HashSet<String>,
+    synthesized_default: &mut bool,
     sink: &mut Vec<NodeProto>,
 ) -> Result<(), LoaderError> {
     if let Some(func) = funcs.get(&fn_key_of_call(node)) {
-        instantiate(node, func, funcs, counter, stack, used, sink)?;
+        instantiate(node, func, funcs, counter, stack, used, synthesized_default, sink)?;
     } else {
-        sink.push(inline_subgraph_attrs(node, funcs, counter, stack, used)?);
+        sink.push(inline_subgraph_attrs(
+            node,
+            funcs,
+            counter,
+            stack,
+            used,
+            synthesized_default,
+        )?);
     }
     Ok(())
 }
@@ -195,14 +240,15 @@ fn inline_subgraph_attrs(
     counter: &mut usize,
     stack: &mut Vec<FnKey>,
     used: &mut HashSet<String>,
+    synthesized_default: &mut bool,
 ) -> Result<NodeProto, LoaderError> {
     let mut out = node.clone();
     for attr in &mut out.attribute {
         if let Some(g) = attr.g.as_mut() {
-            *g = inline_graph(g, funcs, counter, stack, used)?;
+            *g = inline_graph(g, funcs, counter, stack, used, synthesized_default)?;
         }
         for g in &mut attr.graphs {
-            *g = inline_graph(g, funcs, counter, stack, used)?;
+            *g = inline_graph(g, funcs, counter, stack, used, synthesized_default)?;
         }
     }
     Ok(out)
@@ -211,6 +257,7 @@ fn inline_subgraph_attrs(
 /// Expand a single function call: substitute actual arguments and attributes
 /// into a fresh copy of the function body, then recursively inline any calls the
 /// body itself makes. Appends the resulting primitive nodes to `sink`.
+#[allow(clippy::too_many_arguments)]
 fn instantiate(
     call: &NodeProto,
     func: &FunctionProto,
@@ -218,6 +265,7 @@ fn instantiate(
     counter: &mut usize,
     stack: &mut Vec<FnKey>,
     used: &mut HashSet<String>,
+    synthesized_default: &mut bool,
     sink: &mut Vec<NodeProto>,
 ) -> Result<(), LoaderError> {
     let key = fn_key_of_function(func);
@@ -337,8 +385,11 @@ fn instantiate(
         }
 
         // Boundary `Identity` aliases for pass-through outputs (BUG 3). Appended
-        // last so their source values are already produced.
+        // last so their source values are already produced. `Identity` is a
+        // default-domain op, so record that we synthesized one to guarantee the
+        // model declares a default-domain opset import (BUG 3 regression).
         for (k, (src, dst)) in aliases.iter().enumerate() {
+            *synthesized_default = true;
             instantiated.push(NodeProto {
                 op_type: "Identity".to_string(),
                 input: vec![src.clone()],
@@ -351,7 +402,7 @@ fn instantiate(
         // 3. Recursively inline any function calls the body itself makes.
         let mut expanded: Vec<NodeProto> = Vec::new();
         for n in &instantiated {
-            expand_node(n, funcs, counter, stack, used, &mut expanded)?;
+            expand_node(n, funcs, counter, stack, used, synthesized_default, &mut expanded)?;
         }
         Ok::<Vec<NodeProto>, LoaderError>(expanded)
     })();
@@ -480,7 +531,15 @@ fn rename_subgraph_refs(gp: &mut GraphProto, rename: &HashMap<String, String>) {
             locals.insert(init.name.as_str());
         }
     }
-    for n in &gp.node {
+    // Sparse initializers are also initializers (schema: GraphProto.
+    // sparse_initializer), hence local bindings that shadow outer names.
+    for sparse in &gp.sparse_initializer {
+        if let Some(values) = &sparse.values
+            && !values.name.is_empty()
+        {
+            locals.insert(values.name.as_str());
+        }
+    }    for n in &gp.node {
         for o in &n.output {
             if !o.is_empty() {
                 locals.insert(o.as_str());
@@ -538,6 +597,13 @@ fn collect_used_names(gp: &GraphProto, used: &mut HashSet<String>) {
     for init in &gp.initializer {
         if !init.name.is_empty() {
             used.insert(init.name.clone());
+        }
+    }
+    for sparse in &gp.sparse_initializer {
+        if let Some(values) = &sparse.values
+            && !values.name.is_empty()
+        {
+            used.insert(values.name.clone());
         }
     }
     for vi in &gp.value_info {
