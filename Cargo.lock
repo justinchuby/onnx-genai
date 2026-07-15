@@ -1940,6 +1940,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "onnx-runtime-memory"
+version = "0.1.0-dev.1"
+dependencies = [
+ "onnx-runtime-ir",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "onnx-runtime-optimizer"
 version = "0.1.0-dev.1"
 dependencies = [
