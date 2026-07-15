@@ -956,6 +956,43 @@ fn dangling_tensor_reference_is_rejected_at_load() {
     assert!(message.contains("no producer exists"), "{message}");
 }
 
+/// A node output whose name collides with an initializer name reuses the
+/// initializer's `ValueId`, giving that value a producer. Such a graph is
+/// structurally malformed (an initializer must be a constant source) and would
+/// let a kernel write through the read-only weight storage that the
+/// weight-streaming executor borrows zero-copy. It must be rejected cleanly at
+/// load — not crash — with a message naming the tensor and the producing node.
+#[test]
+fn initializer_reused_as_node_output_is_rejected_at_load() {
+    // Identity(X) -> B where B is also an initializer, then Add(B, X) -> Y.
+    // The node output "B" collides with the initializer "B".
+    let mut producer = node("Identity", &["X"], &["B"]);
+    producer.name = "clobbers_initializer".to_string();
+    let graph = onnx::GraphProto {
+        input: vec![value_info("X", 1, &[Dimlike::Static(4)])],
+        output: vec![value_info("Y", 1, &[Dimlike::Static(4)])],
+        initializer: vec![f32_initializer("B", &[4])],
+        node: vec![producer, node("Add", &["B", "X"], &["Y"])],
+        ..Default::default()
+    };
+    let bytes = model(graph, 17);
+
+    let error = onnx_runtime_loader::load_model_bytes(&bytes).unwrap_err();
+    assert!(
+        matches!(
+            &error,
+            LoaderError::InitializerHasProducer { tensor, node }
+                if tensor == "B" && node == "\"clobbers_initializer\""
+        ),
+        "got {error:?}"
+    );
+    let message = error.to_string();
+    assert!(message.contains("'B'"), "{message}");
+    assert!(message.contains("initializer"), "{message}");
+    assert!(message.contains("RULES #1"), "{message}");
+    assert!(message.contains("no producer"), "{message}");
+}
+
 /// An initializer-backed node input is a legitimate source and must NOT be
 /// flagged as a dangling reference (regression guard against false positives:
 /// the dangling check runs only after initializers are attached).

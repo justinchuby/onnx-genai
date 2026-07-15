@@ -127,6 +127,16 @@ mod error {
             tensor: String,
         },
 
+        #[error(
+            "illegal ONNX model: tensor '{tensor}' is declared as an initializer but is also \
+             produced as an output of node {node} — an initializer must be a constant source with \
+             no producer. RULES #1: initializer names must be unique and must not collide with any \
+             node output name; a producer-backed initializer would let a kernel write through \
+             read-only weight storage. Expected: rename the node output or the initializer so they \
+             no longer share a name; if this is a file, the model is malformed per the ONNX spec"
+        )]
+        InitializerHasProducer { tensor: String, node: String },
+
         #[error("external data file not found: {path}")]
         ExternalDataNotFound { path: PathBuf },
 
@@ -280,6 +290,9 @@ fn build_from_bytes_with_weights(
 ///    attribute the executor cannot run.
 /// 3. [`validate_no_dangling_refs`] — every consumed tensor must be sourced
 ///    (graph input, initializer, or an upstream node output).
+/// 4. [`validate_no_initializer_producer`] — an initializer must be a constant
+///    source; reject any initializer value that is also a node output (shares a
+///    `ValueId` with a producer), which the IR structural check does not cover.
 ///
 /// Each rejection names the offending node/op/tensor and explains what is
 /// expected. No sentinel defaults, no silent skips.
@@ -293,6 +306,7 @@ pub fn validate_model(graph: &Graph) -> Result<(), LoaderError> {
     validate_opset_imports(graph)?;
     validate_no_control_flow(graph)?;
     validate_no_dangling_refs(graph)?;
+    validate_no_initializer_producer(graph)?;
     Ok(())
 }
 
@@ -418,7 +432,43 @@ pub fn validate_no_dangling_refs(graph: &Graph) -> Result<(), LoaderError> {
     Ok(())
 }
 
-/// Reject graphs whose nodes use an operator domain without importing its opset.
+/// Reject graphs where an initializer value is also produced by a node.
+///
+/// The graph builder maps tensor *names* → [`onnx_runtime_ir::ValueId`] for both
+/// node inputs and node outputs (see `graph_builder::get_or_create`). If a node
+/// output name collides with an initializer name, the node output reuses the
+/// initializer's `ValueId` and `connect_edges` then sets `producer = Some(node)`
+/// on that shared value. [`onnx_runtime_ir::Graph::validate`] rejects a *graph
+/// input* with a producer but has no equivalent check for an *initializer*, so
+/// such a malformed graph passes structural validation.
+///
+/// This matters for memory-safety: the session's weight-streaming path borrows
+/// an initializer's read-only mmap bytes zero-copy. A producer-backed
+/// initializer would let a kernel write through that read-only storage
+/// (SIGSEGV on external data, aliasing UB inline). The executor already refuses
+/// to borrow producer-backed initializers, but rejecting the graph here fails
+/// fast and cleanly regardless of the execution path. We name the tensor and
+/// the offending producing node.
+pub fn validate_no_initializer_producer(graph: &Graph) -> Result<(), LoaderError> {
+    for &vid in graph.initializers.keys() {
+        let Some(value) = graph.values.get(vid) else {
+            continue;
+        };
+        if let Some(producer) = value.producer {
+            let tensor = value
+                .name
+                .clone()
+                .unwrap_or_else(|| format!("<anonymous value #{}>", vid.0));
+            let node = if graph.nodes.contains(producer) {
+                node_label(graph.node(producer))
+            } else {
+                format!("<node #{}>", producer.0)
+            };
+            return Err(LoaderError::InitializerHasProducer { tensor, node });
+        }
+    }
+    Ok(())
+}
 ///
 /// ONNX treats `""` and `"ai.onnx"` as equivalent spellings of the default
 /// domain. Model-level imports also govern nodes nested in subgraphs.

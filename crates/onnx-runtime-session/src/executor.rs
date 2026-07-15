@@ -568,7 +568,19 @@ impl Executor {
             let bytes = weights.bytes(weight).ok_or_else(|| {
                 SessionError::Internal(format!("weight bytes unavailable for value#{}", vid.0))
             })?;
-            let buf = if !bytes.is_empty() && (bytes.as_ptr() as usize).is_multiple_of(init_align) {
+            // Only borrow when the value has NO producer. The borrowed
+            // `DeviceBuffer` aliases read-only mmap/inline storage, so it must
+            // never be written. A legitimate initializer always has
+            // `producer == None`; a malformed graph can reuse an initializer's
+            // `ValueId` as a node output (see loader `validate_no_initializer_producer`),
+            // giving it a producer — a kernel would then write through
+            // `as_mut_ptr()` into read-only mmap (SIGSEGV / aliasing UB). In
+            // that case fall back to the owned writable copy below.
+            let producer_less = graph.value(vid).producer.is_none();
+            let buf = if producer_less
+                && !bytes.is_empty()
+                && (bytes.as_ptr() as usize).is_multiple_of(init_align)
+            {
                 // Zero-copy: alias the aligned mmap bytes. `weights` (an owned
                 // Arc field on this executor) outlives `buffers`, so the pointer
                 // stays valid for every run; the borrowed buffer is read-only
@@ -3149,6 +3161,73 @@ mod tests {
         for (g, w) in got.iter().zip(want.iter()) {
             assert!((g - w).abs() < 1e-5, "got {g}, want {w}");
         }
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// (d) Soundness guard: even when an initializer's mmap bytes are aligned
+    /// (so the zero-copy path would otherwise fire), the executor must NOT
+    /// borrow them if the value also has a producer — i.e. a malformed graph
+    /// reused the initializer's `ValueId` as a node output. Borrowing yields a
+    /// read-only buffer; a kernel writing that output would write through the
+    /// mmap (SIGSEGV / aliasing UB). The build must fall back to an owned,
+    /// writable copy instead.
+    #[test]
+    fn producer_backed_initializer_is_not_borrowed() {
+        let align = TensorLayout::contiguous().alignment;
+        let path = weightstream_tmp_dir().join("producer_backed_init.bin");
+        let w_data = [1.0f32, 2.0, 3.0, 4.0];
+        std::fs::write(&path, f32_le(&w_data)).unwrap();
+
+        let mut store = WeightStore::new();
+        store.map_external(&path).unwrap();
+
+        let mut g = Graph::new();
+        g.opset_imports.insert(String::new(), 17);
+        let x = g.create_named_value("X", DataType::Float32, static_shape([4]));
+        g.add_input(x);
+        let w = g.create_named_value("W", DataType::Float32, static_shape([4]));
+        g.set_initializer(
+            w,
+            WeightRef::External {
+                path: path.clone(),
+                offset: 0, // aligned: without the producer guard this would borrow
+                length: 16,
+                dtype: DataType::Float32,
+                dims: vec![4],
+            },
+        );
+        // Reuse the initializer's ValueId as a node output -> gives `w` a
+        // producer, exactly the malformed shape the loader also rejects.
+        g.insert_node(Node::new(NodeId(0), "Identity", vec![Some(x)], vec![w]));
+        let y = g.create_value(DataType::Float32, static_shape([4]));
+        g.insert_node(Node::new(NodeId(1), "Add", vec![Some(x), Some(w)], vec![y]));
+        g.add_output(y);
+
+        assert!(
+            g.value(w).producer.is_some(),
+            "test setup: initializer value must have a producer",
+        );
+
+        let ep = auto_detect_cpu_ep().unwrap();
+        let exec = Executor::build(g, Arc::new(store), ep).unwrap();
+
+        let weight = &exec.graph.initializers[&w];
+        let src = exec.weights().bytes(weight).unwrap();
+        assert!(
+            (src.as_ptr() as usize).is_multiple_of(align),
+            "mmap window must be aligned so only the producer guard prevents borrowing",
+        );
+        let buf = &exec.buffers[&w];
+        assert!(
+            !buf.is_borrowed(),
+            "producer-backed initializer must fall back to an owned writable copy",
+        );
+        assert_ne!(
+            buf.as_ptr() as *const u8,
+            src.as_ptr(),
+            "producer-backed initializer must not alias read-only mmap bytes",
+        );
 
         let _ = std::fs::remove_file(&path);
     }
