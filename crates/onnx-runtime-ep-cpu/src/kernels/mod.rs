@@ -123,6 +123,7 @@ pub const PHASE1_OPS: &[&str] = &[
     "HardSigmoid",
     // Logical / selection.
     "Not",
+    "Equal",
     "Where",
     // Reduction / normalization.
     "ReduceMean",
@@ -445,6 +446,7 @@ pub fn build_cpu_registry() -> OpRegistry {
     );
     // Logical / selection.
     reg.register(OpKey::new("Not", "", 1), Box::new(logical::NotFactory));
+    reg.register(OpKey::new("Equal", "", 1), Box::new(logical::EqualFactory));
     reg.register(OpKey::new("Where", "", 1), Box::new(where_op::WhereFactory));
     // Reductions (axes attribute or opset-13/18 axes input).
     reg.register(

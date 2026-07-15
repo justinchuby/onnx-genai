@@ -458,6 +458,12 @@ pub fn split(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
         .unwrap_or(0);
     let axis = norm_axis(axis, rank);
     let n_out = ctx.num_outputs();
+    let num_outputs = ctx
+        .node
+        .attr("num_outputs")
+        .and_then(Attribute::as_int)
+        .and_then(|n| usize::try_from(n).ok())
+        .filter(|&n| n > 0);
 
     let sizes: Option<Vec<i64>> = ctx
         .node
@@ -474,9 +480,21 @@ pub fn split(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
                 .map(|&v| DimExpr::constant(v))
                 .unwrap_or_else(|| ctx.fresh_dim()),
             None => {
-                // Equal split: only exact when the axis is a known multiple.
-                match t.shape[axis].as_const() {
-                    Some(d) if n_out > 0 && d % (n_out as i64) == 0 => {
+                match (num_outputs, t.shape[axis].as_const()) {
+                    // With opset-18 `num_outputs`, ONNX gives every output but
+                    // the last ceil(dim / n) elements; the last gets the
+                    // remainder. This differs from the older equal-split path.
+                    (Some(n), Some(d)) if i < n && d >= n as i64 => {
+                        let chunk = (d + n as i64 - 1) / n as i64;
+                        let size = if i + 1 == n {
+                            d - (n as i64 - 1) * chunk
+                        } else {
+                            chunk
+                        };
+                        DimExpr::constant(size)
+                    }
+                    // The legacy no-`split` form is only exact when divisible.
+                    (None, Some(d)) if n_out > 0 && d % n_out as i64 == 0 => {
                         DimExpr::constant(d / n_out as i64)
                     }
                     _ => ctx.fresh_dim(),

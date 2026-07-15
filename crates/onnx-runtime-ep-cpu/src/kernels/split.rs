@@ -198,7 +198,7 @@ impl Kernel for SplitKernel {
 mod tests {
     use super::*;
     use crate::kernels::testutil::Owned;
-    use onnx_runtime_ir::{DataType, NodeId};
+    use onnx_runtime_ir::DataType;
 
     fn kernel(axis: i64, split: Option<Vec<i64>>, num_outputs: Option<i64>) -> SplitKernel {
         SplitKernel {
@@ -249,18 +249,19 @@ mod tests {
 
     #[test]
     fn split_num_outputs_remainder() {
-        // opset-18 num_outputs=3 on extent 5 → sizes [2,2,1] (last chunk smaller).
-        assert_eq!(even_split(5, 3).unwrap(), vec![2, 2, 1]);
-        let x = Owned::f32(&[5], &[1., 2., 3., 4., 5.]);
-        let mut o0 = Owned::zeros_f32(&[2]);
-        let mut o1 = Owned::zeros_f32(&[2]);
+        // opset-18 num_outputs=3 on extent 7 → sizes [3,3,1].
+        assert_eq!(even_split(7, 3).unwrap(), vec![3, 3, 1]);
+        assert_eq!(even_split(5, 2).unwrap(), vec![3, 2]);
+        let x = Owned::f32(&[7], &[1., 2., 3., 4., 5., 6., 7.]);
+        let mut o0 = Owned::zeros_f32(&[3]);
+        let mut o1 = Owned::zeros_f32(&[3]);
         let mut o2 = Owned::zeros_f32(&[1]);
         kernel(0, None, Some(3))
             .execute(&[x.view()], &mut [o0.view_mut(), o1.view_mut(), o2.view_mut()])
             .unwrap();
-        assert_eq!(o0.to_f32(), vec![1., 2.]);
-        assert_eq!(o1.to_f32(), vec![3., 4.]);
-        assert_eq!(o2.to_f32(), vec![5.]);
+        assert_eq!(o0.to_f32(), vec![1., 2., 3.]);
+        assert_eq!(o1.to_f32(), vec![4., 5., 6.]);
+        assert_eq!(o2.to_f32(), vec![7.]);
     }
 
     #[test]

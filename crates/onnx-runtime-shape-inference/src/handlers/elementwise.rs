@@ -34,6 +34,17 @@ pub fn binary(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
     Ok(())
 }
 
+/// Broadcasting comparison (`Equal`): output is always boolean.
+pub fn comparison(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
+    let a = ctx.input_shape(0).map(<[DimExpr]>::to_vec);
+    let b = ctx.input_shape(1).map(<[DimExpr]>::to_vec);
+    if let (Some(a), Some(b)) = (a, b) {
+        let shape = ctx.broadcast(&a, &b)?;
+        ctx.set_output(0, onnx_runtime_ir::DataType::Bool, shape);
+    }
+    Ok(())
+}
+
 /// Variadic broadcasting op (`Min`, `Max`, `Sum`, `Mean`).
 pub fn variadic(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
     let n = ctx.num_inputs();
@@ -183,6 +194,7 @@ pub fn register(reg: &mut InferenceRegistry) {
     for op in ["Add", "Sub", "Mul", "Div", "Pow"] {
         reg.register("", op, 1, binary);
     }
+    reg.register("", "Equal", 1, comparison);
     for op in ["Min", "Max", "Sum", "Mean"] {
         reg.register("", op, 1, variadic);
     }

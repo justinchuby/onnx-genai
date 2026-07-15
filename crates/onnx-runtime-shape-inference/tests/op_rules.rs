@@ -1232,6 +1232,34 @@ fn split_equal() {
     assert_eq!(outs[1].type_info.as_ref().unwrap().shape, vec![c(2), c(4)]);
 }
 
+#[test]
+fn split_num_outputs_uses_ceil_chunks_and_final_remainder() {
+    let n = with_attr(
+        with_attr(node("Split", 1, 3), "axis", Attribute::Int(1)),
+        "num_outputs",
+        Attribute::Int(3),
+    );
+    let outs = run(&n, vec![f32in(vec![c(2), c(7)])], 18);
+    assert_eq!(out_shape(&outs), vec![c(2), c(3)]);
+    assert_eq!(outs[1].type_info.as_ref().unwrap().shape, vec![c(2), c(3)]);
+    assert_eq!(outs[2].type_info.as_ref().unwrap().shape, vec![c(2), c(1)]);
+}
+
+#[test]
+fn equal_broadcasts_to_bool() {
+    let n = node("Equal", 2, 1);
+    let outs = run(
+        &n,
+        vec![
+            tin(DataType::Int64, vec![c(2), c(1)]),
+            tin(DataType::Int64, vec![c(1), c(3)]),
+        ],
+        19,
+    );
+    assert_eq!(out_shape(&outs), vec![c(2), c(3)]);
+    assert_eq!(out_dtype(&outs), DataType::Bool);
+}
+
 // --- Conv / Pool / Pad ----------------------------------------------------
 
 #[test]
