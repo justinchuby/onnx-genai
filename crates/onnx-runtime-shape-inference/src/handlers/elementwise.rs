@@ -144,7 +144,6 @@ fn const_binop(x: &DimExpr, y: &DimExpr, f: fn(i64, i64) -> i64) -> Option<DimEx
 pub fn register(reg: &mut InferenceRegistry) {
     for op in [
         "Relu",
-        "Gelu",
         "Erf",
         "Tanh",
         "Sigmoid",
@@ -165,6 +164,10 @@ pub fn register(reg: &mut InferenceRegistry) {
     ] {
         reg.register("", op, 1, unary);
     }
+    // `ai.onnx::Gelu` (opset 20): same-shape elementwise activation. Registered
+    // at its since_version so shape-inference membership agrees with the CPU
+    // kernel (also opset 20); the contrib `com.microsoft::Gelu` is separate.
+    reg.register("", "Gelu", 20, unary);
     // `ai.onnx::Swish` (opset 24): elementwise x·sigmoid(alpha·x), same-shape.
     reg.register("", "Swish", 24, unary);
     for op in ["Add", "Sub", "Mul", "Div", "Pow"] {

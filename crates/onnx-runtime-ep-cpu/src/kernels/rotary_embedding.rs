@@ -129,8 +129,28 @@ impl Kernel for RotaryEmbeddingKernel {
         }
         let half = rotary_dim / 2;
 
+        // Zero-sized input: nothing to rotate. Emit an empty output rather than
+        // underflowing on the `batch-1`/`seq-1` bounds computation below.
+        if x.is_empty() {
+            return write_dense_f32(&mut outputs[0], &[]);
+        }
+
+        // With `position_ids` present, validate its shape matches [batch, seq].
+        if let Some(pos) = &position_ids {
+            let pos_shape = inputs[3].shape;
+            let expected = batch * seq;
+            if pos.len() != expected {
+                return Err(EpError::KernelFailed(format!(
+                    "RotaryEmbedding: position_ids has {} elements, expected {expected} ([batch={batch}, seq={seq}]); shape {pos_shape:?}",
+                    pos.len()
+                )));
+            }
+        }
+
         // cos/sin lookup: with position_ids the caches are 2D [max_pos, half]
-        // gathered by position; without, they are 3D [batch, seq, half].
+        // gathered by position; without, they are 3D [batch, seq, half]. Every
+        // requested row is bounds-checked (a gathered position may exceed the
+        // cache extent even when the final position does not).
         let cache_stride = half; // last-dim size of both cache layouts
         let cache_row = |b: usize, s: usize| -> Result<usize> {
             let row = if let Some(pos) = &position_ids {
@@ -144,17 +164,15 @@ impl Kernel for RotaryEmbeddingKernel {
             } else {
                 b * seq + s
             };
-            Ok(row * cache_stride)
-        };
-        // Validate cache extent up front.
-        {
-            let max_row = cache_row(batch - 1, seq - 1)?;
-            if max_row + half > cos_cache.len() || max_row + half > sin_cache.len() {
-                return Err(EpError::KernelFailed(
-                    "RotaryEmbedding: cos/sin cache too small for the requested positions".into(),
-                ));
+            let offset = row * cache_stride;
+            if offset + half > cos_cache.len() || offset + half > sin_cache.len() {
+                return Err(EpError::KernelFailed(format!(
+                    "RotaryEmbedding: position {row} exceeds cos/sin cache extent (need {} rows of {half})",
+                    row + 1
+                )));
             }
-        }
+            Ok(offset)
+        };
 
         // Flat index of element (b, h, s, d) in X's native layout.
         let idx = |b: usize, h: usize, s: usize, d: usize| -> usize {
@@ -332,5 +350,63 @@ mod tests {
         .unwrap();
         // half=1: x1=d0=1, x2=d1=2; cos=0,sin=1 → real=-2, imag=1. Tail [3,4] unchanged.
         assert_eq!(out.to_f32(), vec![-2., 1., 3., 4.]);
+    }
+
+    #[test]
+    fn rope_zero_sized_input_returns_empty() {
+        // Empty batch: no rows to rotate. Must not panic on batch-1 underflow.
+        let x = Owned::f32(&[0, 1, 1, 4], &[]);
+        let cos = Owned::f32(&[1, 1, 2], &[1., 1.]);
+        let sin = Owned::f32(&[1, 1, 2], &[0., 0.]);
+        let mut out = Owned::zeros_f32(&[0, 1, 1, 4]);
+        RotaryEmbeddingKernel {
+            interleaved: false,
+            num_heads: 0,
+            rotary_embedding_dim: 0,
+        }
+        .execute(&[x.view(), cos.view(), sin.view()], &mut [out.view_mut()])
+        .unwrap();
+        assert!(out.to_f32().is_empty());
+    }
+
+    #[test]
+    fn rope_out_of_range_position_errors() {
+        // 3D X [1,2,4], num_heads=2, position_ids gather rows [0, 5] but the
+        // 2D cache only has 2 rows → clean error (not a panic) on the second row.
+        let x = Owned::f32(&[1, 2, 4], &[1., 2., 3., 4., 5., 6., 7., 8.]);
+        let cos = Owned::f32(&[2, 1], &[1.0, 0.0]);
+        let sin = Owned::f32(&[2, 1], &[0.0, 1.0]);
+        let pos = Owned::i64(&[1, 2], &[0, 5]);
+        let mut out = Owned::zeros_f32(&[1, 2, 4]);
+        let err = RotaryEmbeddingKernel {
+            interleaved: false,
+            num_heads: 2,
+            rotary_embedding_dim: 0,
+        }
+        .execute(
+            &[x.view(), cos.view(), sin.view(), pos.view()],
+            &mut [out.view_mut()],
+        );
+        assert!(err.is_err(), "out-of-range position must return an error");
+    }
+
+    #[test]
+    fn rope_bad_position_ids_shape_errors() {
+        // position_ids must have batch*seq = 2 elements; supplying 1 is invalid.
+        let x = Owned::f32(&[1, 2, 4], &[1., 2., 3., 4., 5., 6., 7., 8.]);
+        let cos = Owned::f32(&[2, 1], &[1.0, 0.0]);
+        let sin = Owned::f32(&[2, 1], &[0.0, 1.0]);
+        let pos = Owned::i64(&[1, 1], &[0]);
+        let mut out = Owned::zeros_f32(&[1, 2, 4]);
+        let err = RotaryEmbeddingKernel {
+            interleaved: false,
+            num_heads: 2,
+            rotary_embedding_dim: 0,
+        }
+        .execute(
+            &[x.view(), cos.view(), sin.view(), pos.view()],
+            &mut [out.view_mut()],
+        );
+        assert!(err.is_err(), "malformed position_ids must return an error");
     }
 }
