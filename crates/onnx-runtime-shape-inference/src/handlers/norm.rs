@@ -58,6 +58,13 @@ pub fn skip_layer_norm(ctx: &mut InferenceContext) -> Result<(), ShapeInferError
     Ok(())
 }
 
+/// `SkipSimplifiedLayerNormalization` (com.microsoft) has the same output
+/// shapes as `SkipLayerNormalization`: the normalized output and optional
+/// residual sum preserve `X`, while optional statistics reduce the last axis.
+pub fn skip_simplified_layer_norm(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
+    skip_layer_norm(ctx)
+}
+
 /// `RMSNormalization`: output 0 is the input shape (single output, no optional
 /// mean/inv-std). Shape- and dtype-preserving like other norm ops.
 pub fn rms_norm(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
@@ -159,7 +166,18 @@ pub fn register(reg: &mut InferenceRegistry) {
     // contrib domain; register the same rule there so the fused op's shape
     // still resolves (identical output-shape semantics as the standard op).
     reg.register("com.microsoft", "LayerNormalization", 1, layer_norm);
-    reg.register("com.microsoft", "SkipLayerNormalization", 1, skip_layer_norm);
+    reg.register(
+        "com.microsoft",
+        "SkipLayerNormalization",
+        1,
+        skip_layer_norm,
+    );
+    reg.register(
+        "com.microsoft",
+        "SkipSimplifiedLayerNormalization",
+        1,
+        skip_simplified_layer_norm,
+    );
     reg.register(
         "com.microsoft",
         "SimplifiedLayerNormalization",

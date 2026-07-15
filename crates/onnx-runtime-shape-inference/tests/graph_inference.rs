@@ -195,6 +195,65 @@ fn shape_data_chain_drives_reshape() {
     assert_eq!(out_shape[1], Dim::Static(512));
 }
 
+/// A contrib fused norm with no intermediate value_info must still resolve all
+/// requested outputs so session setup can allocate them.
+#[test]
+fn skip_simplified_layer_norm_resolves_outputs_without_value_info() {
+    let mut graph = Graph::new();
+    let input_shape = vec![Dim::Static(2), Dim::Static(8), Dim::Static(64)];
+
+    let input = graph.create_named_value("input", DataType::Float16, input_shape.clone());
+    let skip = graph.create_named_value("skip", DataType::Float16, input_shape.clone());
+    let gamma = graph.create_named_value("gamma", DataType::Float16, vec![Dim::Static(64)]);
+    graph.add_input(input);
+    graph.add_input(skip);
+    graph.add_input(gamma);
+
+    // These empty shapes model omitted intermediate value_info entries.
+    let output = graph.create_named_value("output", DataType::Float32, Shape::new());
+    let mean = graph.create_named_value("mean", DataType::Float32, Shape::new());
+    let inv_std_var = graph.create_named_value("inv_std_var", DataType::Float32, Shape::new());
+    let input_skip_bias_sum =
+        graph.create_named_value("input_skip_bias_sum", DataType::Float32, Shape::new());
+
+    let mut norm = node(
+        1,
+        "SkipSimplifiedLayerNormalization",
+        vec![Some(input), Some(skip), Some(gamma)],
+        vec![output, mean, inv_std_var, input_skip_bias_sum],
+    );
+    norm.domain = "com.microsoft".into();
+    graph.insert_node(norm);
+    graph.add_output(output);
+    graph.add_output(input_skip_bias_sum);
+    graph.opset_imports.insert(String::new(), 21);
+    graph.opset_imports.insert("com.microsoft".into(), 1);
+
+    let registry = InferenceRegistry::default_registry();
+    let opsets = graph.opset_imports.clone();
+    let report = registry
+        .infer_graph(&mut graph, &opsets, MergePolicy::Permissive)
+        .expect("infer SkipSimplifiedLayerNormalization graph");
+
+    assert!(
+        report.fully_resolved(),
+        "unresolved: {:?}",
+        report.unresolved
+    );
+    assert_eq!(graph.value(output).shape, input_shape);
+    assert_eq!(graph.value(input_skip_bias_sum).shape, input_shape);
+    assert_eq!(graph.value(output).dtype, DataType::Float16);
+    assert_eq!(graph.value(input_skip_bias_sum).dtype, DataType::Float16);
+    assert_eq!(
+        graph.value(mean).shape,
+        vec![Dim::Static(2), Dim::Static(8), Dim::Static(1)]
+    );
+    assert_eq!(
+        graph.value(inv_std_var).shape,
+        vec![Dim::Static(2), Dim::Static(8), Dim::Static(1)]
+    );
+}
+
 /// End-to-end: load the committed `bert_toy` model and assert that
 /// `infer_graph` resolves EVERY value in the graph — matching the bar the
 /// loader already meets.
