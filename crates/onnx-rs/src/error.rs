@@ -29,4 +29,13 @@ pub enum Error {
     /// The underlying loader (parse / build / encode) failed.
     #[error(transparent)]
     Loader(#[from] LoaderError),
+
+    /// A textual ONNX model could not be parsed.
+    #[error("text parse error at line {line}: {message}")]
+    TextParse {
+        /// One-based source line containing the error.
+        line: usize,
+        /// Human-readable description of the malformed construct.
+        message: String,
+    },
 }

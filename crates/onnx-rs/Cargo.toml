@@ -1,6 +1,6 @@
 [package]
 name = "onnx-rs"
-description = "Pure-Rust ONNX standard library: model I/O, textual dump, and an extensible validator, built on the shared onnx-runtime-ir IR (see docs/ONNX_RS.md)"
+description = "Pure-Rust ONNX standard library: model I/O, textual format, and an extensible validator, built on the shared onnx-runtime-ir IR (see docs/ONNX_RS.md)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

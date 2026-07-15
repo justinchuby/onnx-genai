@@ -84,6 +84,11 @@ impl Model {
         text::print_with(self, opts)
     }
 
+    /// Parse a model previously rendered in the textual format (ONNX_RS §5.4).
+    pub fn from_text(source: &str) -> Result<Self> {
+        text::parse_model(source)
+    }
+
     /// Validate this model with the default [`OnnxChecker`] (ONNX_RS §8).
     pub fn validate(&self) -> ValidationResult {
         OnnxChecker::new().check(self)

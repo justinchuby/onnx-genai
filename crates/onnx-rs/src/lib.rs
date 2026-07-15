@@ -1,6 +1,6 @@
 //! # `onnx-rs`
 //!
-//! A pure-Rust ONNX **standard library** — model I/O, textual dump, and an
+//! A pure-Rust ONNX **standard library** — model I/O, textual format, and an
 //! extensible validator — built on the shared runtime IR. This is the first
 //! wave of the design captured in `docs/ONNX_RS.md`.
 //!
@@ -26,13 +26,12 @@
 //! | ONNX_RS §  | Feature | Status |
 //! |------------|---------|--------|
 //! | §3.4 / §4  | [`load_model`] / [`save_model`] round-trip | ✅ |
-//! | §5         | [`Model::to_text`] readable dump | ✅ (dump only) |
+//! | §5         | [`Model::to_text`] / [`Model::from_text`] | ✅ |
 //! | §7         | [`schema`] op schemas and opset-aware registry | ✅ |
 //! | §8         | [`check::OnnxChecker`] extensible validator | ✅ (schema-aware) |
 //!
-//! Deferred to later waves (see `// FOLLOW-UP` markers): text *parse-back*
-//! (§5.4), JSON / TextProto (§6), the remaining checker rule set (§8.2), shape
-//! inference wrapping (§9), the version converter (§10),
+//! Deferred to later waves (see `// FOLLOW-UP` markers): JSON / TextProto (§6),
+//! the remaining checker rule set (§8.2), shape inference wrapping (§9), the version converter (§10),
 //! custom-op registration (§11), and Python bindings (§12).
 //!
 //! ## Example
@@ -68,4 +67,4 @@ pub use schema::{
     AttributeDefault, AttributeSpec, AttributeType, InputSpec, OpSchema, OutputSpec, SchemaError,
     SchemaRegistry, TypeConstraint,
 };
-pub use text::PrintOptions;
+pub use text::{PrintOptions, parse_model};

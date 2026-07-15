@@ -304,7 +304,12 @@ fn attr_value(attr: &Attribute) -> String {
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
-        Attribute::Strings(v) => format!("<{} strings>", v.len()),
+        Attribute::Strings(values) => values
+            .iter()
+            .map(|bytes| std::str::from_utf8(bytes).map(|value| format!("{value:?}")))
+            .collect::<Result<Vec<_>, _>>()
+            .map(|values| format!("[{}]", values.join(", ")))
+            .unwrap_or_else(|_| format!("<{} strings>", values.len())),
         Attribute::Tensor(t) => format!("<tensor {}[{:?}]>", dtype_name(t.dtype), t.dims),
         Attribute::SparseTensor(_) => "<sparse tensor>".to_string(),
         Attribute::TypeProto(_) => "<type>".to_string(),
