@@ -168,6 +168,7 @@ pub fn register(reg: &mut InferenceRegistry) {
         "Cos",
         "Reciprocal",
         "Softplus",
+        "Softsign",
         "Floor",
         "Ceil",
         "Round",

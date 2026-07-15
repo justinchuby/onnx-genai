@@ -110,6 +110,7 @@ pub const PHASE1_OPS: &[&str] = &[
     "Cos",
     "Sigmoid",
     "Softplus",
+    "Softsign",
     "Acos",
     "Acosh",
     "Asin",
@@ -473,6 +474,10 @@ pub fn build_cpu_registry() -> OpRegistry {
     reg.register(
         OpKey::new("Softplus", "", 1),
         Box::new(unary_math::SoftplusFactory),
+    );
+    reg.register(
+        OpKey::new("Softsign", "", 1),
+        Box::new(unary_math::SoftsignFactory),
     );
     reg.register(OpKey::new("Acos", "", 1), Box::new(unary_math::AcosFactory));
     reg.register(

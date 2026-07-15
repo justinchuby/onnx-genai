@@ -18,6 +18,7 @@
 //!   branch form so large-magnitude inputs neither overflow nor underflow.
 //! * `Softplus` — `log(1 + e^x)`, evaluated as `max(x,0) + log1p(e^-|x|)` for
 //!   the same stability reason.
+//! * `Softsign` — `x / (1 + |x|)`.
 
 use onnx_runtime_ep_api::{Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ir::Node;
@@ -40,6 +41,7 @@ enum MathOp {
     Cos,
     Sigmoid,
     Softplus,
+    Softsign,
     Acos,
     Acosh,
     Asin,
@@ -67,6 +69,7 @@ impl MathOp {
             MathOp::Cos => "Cos",
             MathOp::Sigmoid => "Sigmoid",
             MathOp::Softplus => "Softplus",
+            MathOp::Softsign => "Softsign",
             MathOp::Acos => "Acos",
             MathOp::Acosh => "Acosh",
             MathOp::Asin => "Asin",
@@ -96,6 +99,7 @@ impl MathOp {
             MathOp::Cos => x.cos(),
             MathOp::Sigmoid => sigmoid(x),
             MathOp::Softplus => softplus(x),
+            MathOp::Softsign => x / (1.0 + x.abs()),
             MathOp::Acos => x.acos(),
             MathOp::Acosh => x.acosh(),
             MathOp::Asin => x.asin(),
@@ -167,6 +171,7 @@ math_factory!(SinFactory, MathOp::Sin);
 math_factory!(CosFactory, MathOp::Cos);
 math_factory!(SigmoidFactory, MathOp::Sigmoid);
 math_factory!(SoftplusFactory, MathOp::Softplus);
+math_factory!(SoftsignFactory, MathOp::Softsign);
 math_factory!(AcosFactory, MathOp::Acos);
 math_factory!(AcoshFactory, MathOp::Acosh);
 math_factory!(AsinFactory, MathOp::Asin);
@@ -292,5 +297,18 @@ mod tests {
         assert!((r[0] - std::f32::consts::LN_2).abs() < 1e-6);
         assert!((r[1] - (1.0f32 + 1.0f32.exp()).ln()).abs() < 1e-6);
         assert!((r[2] - (1.0f32 + (-1.0f32).exp()).ln()).abs() < 1e-6);
+    }
+
+    #[test]
+    fn softsign_matches_reference_and_bounds() {
+        let x = Owned::f32(&[5], &[-100.0, -1.0, 0.0, 1.0, 100.0]);
+        let mut out = Owned::zeros_f32(&[5]);
+        run(MathOp::Softsign, &x, &mut out);
+        let actual = out.to_f32();
+        let expected = [-100.0 / 101.0, -0.5, 0.0, 0.5, 100.0 / 101.0];
+        for (got, want) in actual.into_iter().zip(expected) {
+            assert!((got - want).abs() < 1e-6);
+            assert!(got > -1.0 && got < 1.0);
+        }
     }
 }
