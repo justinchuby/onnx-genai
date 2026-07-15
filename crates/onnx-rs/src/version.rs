@@ -143,9 +143,10 @@ impl VersionConverter {
 
     /// Convert the default ONNX domain to `target_opset`.
     ///
-    /// A node without an adapter is accepted only when the schema registry
-    /// resolves both opsets to the same `since_version`. Otherwise it is
-    /// reported as incompatible and no changes are committed to `model`.
+    /// A node without an adapter is accepted only when the schema registry has
+    /// positive evidence that one schema covers the full conversion interval.
+    /// Otherwise it is reported as incompatible and no changes are committed
+    /// to `model`.
     pub fn convert(
         &self,
         model: &mut Model,
@@ -169,14 +170,7 @@ impl VersionConverter {
         }
 
         let mut graph = model.graph.clone();
-        let node_ids = graph.nodes.keys().collect::<Vec<_>>();
-        for node_id in node_ids {
-            let node = graph.node(node_id).clone();
-            if !is_default_domain(&node.domain) {
-                continue;
-            }
-            self.convert_node(&mut graph, node_id, source_opset, target_opset, &mut report)?;
-        }
+        self.convert_graph(&mut graph, source_opset, target_opset, &mut report)?;
 
         if report.ops_rejected == 0 {
             set_default_opset(&mut graph, target_opset);
@@ -188,6 +182,71 @@ impl VersionConverter {
             ));
         }
         Ok(report)
+    }
+
+    fn convert_graph(
+        &self,
+        graph: &mut Graph,
+        source_opset: u32,
+        target_opset: u32,
+        report: &mut ConvertReport,
+    ) -> Result<(), ConvertError> {
+        let node_ids = graph.nodes.keys().collect::<Vec<_>>();
+        for node_id in node_ids {
+            self.convert_subgraphs(graph, node_id, source_opset, target_opset, report)?;
+
+            let node = graph.node(node_id).clone();
+            if is_default_domain(&node.domain) {
+                self.convert_node(graph, node_id, source_opset, target_opset, report)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn convert_subgraphs(
+        &self,
+        graph: &mut Graph,
+        node_id: NodeId,
+        source_opset: u32,
+        target_opset: u32,
+        report: &mut ConvertReport,
+    ) -> Result<(), ConvertError> {
+        let attribute_names = graph
+            .node(node_id)
+            .attributes
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+
+        for attribute_name in attribute_names {
+            let converted = {
+                let Some(attribute) = graph.node_mut(node_id).attributes.get_mut(&attribute_name)
+                else {
+                    continue;
+                };
+                match attribute {
+                    Attribute::Graph(subgraph) => {
+                        self.convert_graph(subgraph, source_opset, target_opset, report)?;
+                        vec![(attribute_name.clone(), (**subgraph).clone())]
+                    }
+                    Attribute::Graphs(subgraphs) => {
+                        let mut converted = Vec::with_capacity(subgraphs.len());
+                        for (index, subgraph) in subgraphs.iter_mut().enumerate() {
+                            self.convert_graph(subgraph, source_opset, target_opset, report)?;
+                            converted
+                                .push((format!("{attribute_name}[{index}]"), subgraph.clone()));
+                        }
+                        converted
+                    }
+                    _ => continue,
+                }
+            };
+
+            for (key, subgraph) in converted {
+                graph.subgraphs.insert((node_id, key), subgraph);
+            }
+        }
+        Ok(())
     }
 
     fn convert_node(
@@ -290,7 +349,25 @@ impl VersionConverter {
         let Some(target_schema) = self.schemas.lookup(op_type, domain, u64::from(target)) else {
             return false;
         };
-        source_schema.since_version == target_schema.since_version
+        if source_schema.since_version != target_schema.since_version {
+            return false;
+        }
+
+        let target = u64::from(target);
+        source_schema
+            .until_version
+            .is_some_and(|until| target <= until)
+            || self
+                .schemas
+                .iter()
+                .filter(|schema| {
+                    schema.name == op_type
+                        && normalize_domain(&schema.domain) == normalize_domain(domain)
+                        && schema.since_version > source_schema.since_version
+                })
+                .map(|schema| schema.since_version)
+                .min()
+                .is_some_and(|next_version| target < next_version)
     }
 }
 
@@ -396,6 +473,22 @@ mod tests {
     use super::*;
     use onnx_runtime_ir::{DataType, Node, static_shape};
 
+    struct If13To14Adapter;
+
+    impl OpAdapter for If13To14Adapter {
+        fn source(&self) -> (&str, &str, u32) {
+            ("", "If", 13)
+        }
+
+        fn target_version(&self) -> u32 {
+            14
+        }
+
+        fn adapt(&self, _node: &Node, _graph: &mut Graph) -> Result<AdaptResult, ConvertError> {
+            Ok(AdaptResult::Compatible)
+        }
+    }
+
     fn unary_model(op_type: &str, opset: u32) -> Model {
         let mut graph = Graph::new();
         graph.opset_imports.insert(String::new(), u64::from(opset));
@@ -409,21 +502,160 @@ mod tests {
         Model::new(graph)
     }
 
-    #[test]
-    fn schema_compatible_bump_only_updates_opset() {
-        let mut model = unary_model("Relu", 14);
-        let before = model.graph.nodes.values().next().unwrap().clone();
+    fn unary_graph(op_type: &str) -> Graph {
+        let mut graph = Graph::new();
+        let input = graph.create_named_value("branch_X", DataType::Float32, static_shape([2, 3]));
+        let output = graph.create_named_value("branch_Y", DataType::Float32, static_shape([2, 3]));
+        graph.add_input(input);
+        graph.add_output(output);
+        let mut node = Node::new(NodeId(0), op_type, vec![Some(input)], vec![output]);
+        node.name = format!("{op_type}_branch");
+        graph.insert_node(node);
+        graph
+    }
 
-        let report = VersionConverter::new().convert(&mut model, 21).unwrap();
+    fn if_model(branch_op: &str, include_root_reshape: bool) -> Model {
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 13);
+
+        if include_root_reshape {
+            let input = graph.create_named_value("root_X", DataType::Float32, static_shape([2, 3]));
+            let output =
+                graph.create_named_value("root_Y", DataType::Float32, static_shape([2, 3]));
+            graph.add_input(input);
+            let mut reshape = Node::new(NodeId(0), "Reshape", vec![Some(input)], vec![output]);
+            reshape.name = "Reshape_root".to_string();
+            graph.insert_node(reshape);
+        }
+
+        let condition = graph.create_named_value("condition", DataType::Bool, static_shape([]));
+        let output = graph.create_named_value("if_Y", DataType::Float32, static_shape([2, 3]));
+        graph.add_input(condition);
+        graph.add_output(output);
+
+        let branch = unary_graph(branch_op);
+        let mut if_node = Node::new(NodeId(0), "If", vec![Some(condition)], vec![output]);
+        if_node.name = "If_0".to_string();
+        if_node.attributes.insert(
+            "then_branch".to_string(),
+            Attribute::Graph(Box::new(branch.clone())),
+        );
+        let if_node_id = graph.insert_node(if_node);
+        graph
+            .subgraphs
+            .insert((if_node_id, "then_branch".to_string()), branch);
+
+        Model::new(graph)
+    }
+
+    #[test]
+    fn schema_compatible_bump_requires_a_known_later_boundary() {
+        let mut model = unary_model("StableOp", 1);
+        let before = model.graph.nodes.values().next().unwrap().clone();
+        let mut converter = VersionConverter::empty();
+        converter
+            .schemas
+            .load_yaml(
+                r#"
+domain: ""
+name: StableOp
+since_version: 1
+"#,
+            )
+            .unwrap();
+        converter
+            .schemas
+            .load_yaml(
+                r#"
+domain: ""
+name: StableOp
+since_version: 5
+"#,
+            )
+            .unwrap();
+
+        let report = converter.convert(&mut model, 4).unwrap();
 
         let after = model.graph.nodes.values().next().unwrap();
-        assert_eq!(model.graph.opset_imports[""], 21);
+        assert_eq!(model.graph.opset_imports[""], 4);
         assert_eq!(after.op_type, before.op_type);
         assert_eq!(after.inputs, before.inputs);
         assert_eq!(after.outputs, before.outputs);
         assert_eq!(report.ops_unchanged, 1);
         assert_eq!(report.ops_converted, 0);
         assert_eq!(report.ops_rejected, 0);
+    }
+
+    #[test]
+    fn nested_subgraph_nodes_are_converted_and_indexes_stay_in_sync() {
+        let mut model = if_model("Reshape", false);
+        let mut converter = VersionConverter::new();
+        converter.register(If13To14Adapter);
+
+        let report = converter.convert(&mut model, 14).unwrap();
+
+        assert_eq!(model.graph.opset_imports[""], 14);
+        assert_eq!(report.ops_converted, 1);
+        assert_eq!(report.ops_unchanged, 1);
+        assert_eq!(report.ops_rejected, 0);
+
+        let if_node = model
+            .graph
+            .nodes
+            .values()
+            .find(|node| node.op_type == "If")
+            .unwrap();
+        let Attribute::Graph(branch) = &if_node.attributes["then_branch"] else {
+            panic!("then_branch must be a graph");
+        };
+        assert_eq!(
+            branch.nodes.values().next().unwrap().attributes["allowzero"].as_int(),
+            Some(0)
+        );
+        let indexed = &model.graph.subgraphs[&(if_node.id, "then_branch".to_string())];
+        assert_eq!(
+            indexed.nodes.values().next().unwrap().attributes["allowzero"].as_int(),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn nested_rejection_rolls_back_root_rewrites_and_opset_bump() {
+        let mut model = if_model("UnknownChangedOp", true);
+        let mut converter = VersionConverter::new();
+        converter.register(If13To14Adapter);
+
+        let report = converter.convert(&mut model, 14).unwrap();
+
+        assert_eq!(model.graph.opset_imports[""], 13);
+        assert_eq!(report.ops_rejected, 1);
+        assert_eq!(
+            report.ops_incompatible[0].node_name,
+            "UnknownChangedOp_branch"
+        );
+        let root_reshape = model
+            .graph
+            .nodes
+            .values()
+            .find(|node| node.name == "Reshape_root")
+            .unwrap();
+        assert!(!root_reshape.attributes.contains_key("allowzero"));
+    }
+
+    #[test]
+    fn target_beyond_known_schema_history_is_rejected() {
+        let mut model = unary_model("Conv", 11);
+
+        let report = VersionConverter::new().convert(&mut model, 22).unwrap();
+
+        assert_eq!(model.graph.opset_imports[""], 11);
+        assert_eq!(report.ops_rejected, 1);
+        assert_eq!(report.ops_incompatible[0].op_type, "Conv");
+        assert!(
+            report.ops_incompatible[0]
+                .reason
+                .contains("schemas do not prove compatibility")
+        );
     }
 
     #[test]
