@@ -53,6 +53,7 @@ pub mod movement_ops;
 #[cfg(feature = "onednn")]
 pub mod onednn;
 pub mod pad;
+pub mod pooling;
 pub mod quantization;
 pub mod reduce;
 pub mod reduce_ops;
@@ -386,6 +387,55 @@ pub fn build_cpu_registry() -> OpRegistry {
     reg.register(
         OpKey::new("DynamicQuantizeLinear", "", 11),
         Box::new(quantization::DynamicQuantizeLinearFactory),
+    );
+    // Spatial pooling. Newer registrations preserve version-specific attributes.
+    reg.register(
+        OpKey::new("AveragePool", "", 1),
+        Box::new(pooling::AveragePoolFactory),
+    );
+    reg.register(
+        OpKey::new("AveragePool", "", 7),
+        Box::new(pooling::AveragePoolFactory),
+    );
+    reg.register(
+        OpKey::new("AveragePool", "", 10),
+        Box::new(pooling::AveragePoolFactory),
+    );
+    reg.register(
+        OpKey::new("AveragePool", "", 11),
+        Box::new(pooling::AveragePoolFactory),
+    );
+    reg.register(
+        OpKey::new("AveragePool", "", 19),
+        Box::new(pooling::AveragePoolFactory),
+    );
+    reg.register(
+        OpKey::new("MaxPool", "", 1),
+        Box::new(pooling::MaxPoolFactory),
+    );
+    reg.register(
+        OpKey::new("MaxPool", "", 8),
+        Box::new(pooling::MaxPoolFactory),
+    );
+    reg.register(
+        OpKey::new("MaxPool", "", 10),
+        Box::new(pooling::MaxPoolFactory),
+    );
+    reg.register(
+        OpKey::new("MaxPool", "", 11),
+        Box::new(pooling::MaxPoolFactory),
+    );
+    reg.register(
+        OpKey::new("MaxPool", "", 12),
+        Box::new(pooling::MaxPoolFactory),
+    );
+    reg.register(
+        OpKey::new("GlobalAveragePool", "", 1),
+        Box::new(pooling::GlobalAveragePoolFactory),
+    );
+    reg.register(
+        OpKey::new("GlobalMaxPool", "", 1),
+        Box::new(pooling::GlobalMaxPoolFactory),
     );
     // --- Additional ep-cpu op coverage (op-coverage wave) ---------------------
     // Elementwise unary math (f32). Additive, default-domain-only registrations.
@@ -1043,9 +1093,11 @@ mod tests {
         // (`com.microsoft`) fused transformer entries (BiasGelu, FastGelu,
         // QuickGelu, SkipLayerNormalization, SimplifiedLayerNormalization) add
         // five more. QuantizeLinear and DequantizeLinear each add six versioned
-        // entries, while DynamicQuantizeLinear adds one, so the entry count is
-        // twenty-eight more than the op-name count.
-        assert_eq!(reg.len(), PHASE1_OPS.len() + 28);
+        // entries, while DynamicQuantizeLinear adds one (twenty-eight over the
+        // op-name count). Pooling adds twelve more versioned entries: five each
+        // for AveragePool and MaxPool, plus the two global pool operators, for
+        // forty over the op-name count.
+        assert_eq!(reg.len(), PHASE1_OPS.len() + 40);
         for op in PHASE1_OPS {
             assert!(reg.lookup(op, "", 21).is_some(), "missing factory for {op}");
         }
