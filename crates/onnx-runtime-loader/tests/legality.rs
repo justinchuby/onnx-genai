@@ -183,23 +183,20 @@ fn ir13_with_default_opset_loads() {
 }
 
 #[test]
-fn missing_default_opset_for_ir3_is_rejected_and_default_domain_alias_is_allowed() {
+fn ir3_requires_a_nonempty_opset_import_but_not_a_default_domain_import() {
     let mut invalid = model(onnx::GraphProto::default());
-    invalid.opset_import = vec![onnx::OperatorSetIdProto {
-        domain: "com.example".to_string(),
-        version: 1,
-    }];
+    invalid.opset_import.clear();
     assert!(matches!(
         onnx_runtime_loader::load_model_bytes(&invalid.encode_to_vec()),
-        Err(LoaderError::MissingDefaultOpsetImport { ir_version: 8 })
+        Err(LoaderError::MissingModelOpsetImport { ir_version: 8 })
     ));
 
     invalid.opset_import.push(onnx::OperatorSetIdProto {
-        domain: "ai.onnx".to_string(),
-        version: 17,
+        domain: "com.example".to_string(),
+        version: 1,
     });
     onnx_runtime_loader::load_model_bytes(&invalid.encode_to_vec())
-        .expect("ai.onnx alias is a default import");
+        .expect("custom-domain-only opset import is legal");
 }
 
 #[test]

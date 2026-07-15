@@ -171,11 +171,11 @@ mod error {
         InvalidIrVersion { ir_version: i64 },
 
         #[error(
-            "illegal ONNX model: ir_version {ir_version} requires a default-domain opset_import \
-             (domain '' or 'ai.onnx'), but none was declared. RULES #1: default-domain operators \
-             need an opset version to bind their semantics. Expected: add an ai.onnx opset_import"
+            "illegal ONNX model: ir_version {ir_version} requires at least one opset_import \
+             (ONNX IR>=3). Expected: add an opset_import for every operator domain used by the \
+             model"
         )]
-        MissingDefaultOpsetImport { ir_version: i64 },
+        MissingModelOpsetImport { ir_version: i64 },
 
         #[error(
             "illegal ONNX model: initializer '{tensor}' in an outer graph is shadowed by a \
@@ -441,13 +441,8 @@ pub fn validate_model_proto(model: &proto::onnx::ModelProto) -> Result<(), Loade
     // only produces false-positive rejections of otherwise-valid newer models.
     // If a genuinely unsupported construct ever ships, gate on that specific
     // FEATURE at load time — never on the IR version number.
-    if model.ir_version >= 3
-        && !model
-            .opset_import
-            .iter()
-            .any(|opset| opset.domain.is_empty() || opset.domain == "ai.onnx")
-    {
-        return Err(LoaderError::MissingDefaultOpsetImport {
+    if model.ir_version >= 3 && model.opset_import.is_empty() {
+        return Err(LoaderError::MissingModelOpsetImport {
             ir_version: model.ir_version,
         });
     }
