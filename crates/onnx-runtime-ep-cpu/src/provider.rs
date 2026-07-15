@@ -181,6 +181,12 @@ impl ExecutionProvider for CpuExecutionProvider {
             "cpu_ep: refusing to deallocate a buffer from device {:?}",
             buffer.device()
         );
+        // Borrowed buffers alias foreign memory (e.g. an mmap'd weight file)
+        // that this EP never allocated — freeing it would be undefined
+        // behavior. The real owner outlives the buffer and frees it itself.
+        if buffer.is_borrowed() {
+            return Ok(());
+        }
         let size = buffer.len();
         let align = buffer.alignment();
         let ptr = buffer.into_raw() as *mut u8;
@@ -275,6 +281,26 @@ mod tests {
         assert_eq!(buf.len(), 0);
         assert!(!buf.as_ptr().is_null());
         ep.deallocate(buf).unwrap();
+    }
+
+    /// `deallocate` must be a no-op free for a borrowed buffer: it aliases
+    /// memory the EP never allocated (here a `Vec`), so freeing it would be UB.
+    /// After deallocation the backing must remain fully valid.
+    #[test]
+    fn deallocate_borrowed_buffer_is_a_noop_free() {
+        let ep = CpuExecutionProvider::new();
+        let mut backing = vec![42u8; 128];
+        let ptr = backing.as_mut_ptr() as *mut c_void;
+        // SAFETY: `ptr`/`len` name `backing`'s live allocation; `backing`
+        // outlives the buffer, we never write through it, and `deallocate` must
+        // skip the free because the buffer is borrowed.
+        let buf = unsafe { DeviceBuffer::from_borrowed_parts(ptr, ep.device_id(), 128, 1) };
+        assert!(buf.is_borrowed());
+        ep.deallocate(buf).unwrap();
+        // No free happened: the Vec is still valid and unmodified.
+        assert!(backing.iter().all(|&b| b == 42));
+        backing[0] = 1; // proves the allocation is live (would be UAF if freed)
+        assert_eq!(backing[0], 1);
     }
 
     #[test]

@@ -179,8 +179,16 @@ impl KernelCache {
 /// public [`InferenceSession`](crate::InferenceSession).
 pub(crate) struct Executor {
     graph: Graph,
-    /// Kept alive so external-weight memory maps outlive buffer population.
-    _weights: Arc<WeightStore>,
+    /// Kept alive so external-weight memory maps outlive buffer population —
+    /// **and**, since the weight-streaming change, so borrowed initializer
+    /// buffers that alias this store's mmap bytes stay valid for the executor's
+    /// whole lifetime. `weights` MUST outlive every live use of `buffers`: a
+    /// borrowed `DeviceBuffer` in `buffers` points into `weights`' mmap/inline
+    /// storage. Teardown is safe because `Executor::drop` **drains and
+    /// deallocates `buffers` first** (a borrowed deallocate is a no-op free), so
+    /// no buffer still aliases `weights` when the `Arc<WeightStore>` field is
+    /// dropped afterwards — no use-after-free regardless of field drop order.
+    weights: Arc<WeightStore>,
     ep: Arc<CpuExecutionProvider>,
     /// One device buffer per backed value. Static values are allocated once at
     /// build; dynamic (symbol-shaped) values are allocated per run and cached
@@ -547,15 +555,41 @@ impl Executor {
         let mut buffers: HashMap<ValueId, DeviceBuffer> = HashMap::new();
         let mut buffer_shapes: HashMap<ValueId, Vec<usize>> = HashMap::new();
 
-        // 1) Initializers: always concrete. Record dims, allocate, copy weights.
+        // 1) Initializers: always concrete. Record dims and back each with a
+        //    device buffer. Where the mmap'd weight bytes are already suitably
+        //    aligned we **borrow** them zero-copy (no RAM allocation, no copy)
+        //    so a model whose weights exceed RAM still runs — the OS pages the
+        //    mmap in/out on demand. Unaligned or empty slices fall back to the
+        //    original allocate + copy path (correctness first).
+        let init_align = TensorLayout::contiguous().alignment;
         for (&vid, weight) in &graph.initializers {
             let dtype = weight.dtype();
             let dims = weight.dims().to_vec();
             let bytes = weights.bytes(weight).ok_or_else(|| {
                 SessionError::Internal(format!("weight bytes unavailable for value#{}", vid.0))
             })?;
-            let mut buf = ep.allocate(bytes.len().max(1), TensorLayout::contiguous().alignment)?;
-            write_host(&mut buf, bytes)?;
+            let buf = if !bytes.is_empty() && (bytes.as_ptr() as usize).is_multiple_of(init_align) {
+                // Zero-copy: alias the aligned mmap bytes. `weights` (an owned
+                // Arc field on this executor) outlives `buffers`, so the pointer
+                // stays valid for every run; the borrowed buffer is read-only
+                // (initializers are read-only SSA inputs, never a mutable output)
+                // and its Drop/deallocate never frees the mmap.
+                // SAFETY: `bytes` borrows `weights`' live mmap/inline storage,
+                // is `bytes.len()` long and `init_align`-aligned (checked above),
+                // is treated as read-only, and `weights` outlives every use.
+                unsafe {
+                    DeviceBuffer::from_borrowed_parts(
+                        bytes.as_ptr() as *mut std::ffi::c_void,
+                        ep.device_id(),
+                        bytes.len(),
+                        init_align,
+                    )
+                }
+            } else {
+                let mut owned = ep.allocate(bytes.len().max(1), init_align)?;
+                write_host(&mut owned, bytes)?;
+                owned
+            };
             value_dtypes.insert(vid, dtype);
             value_shapes.insert(vid, dims.iter().map(|&d| Dim::Static(d)).collect());
             buffer_shapes.insert(vid, dims);
@@ -656,7 +690,7 @@ impl Executor {
 
         let mut exec = Self {
             graph,
-            _weights: weights,
+            weights,
             ep,
             buffers,
             buffer_shapes,
@@ -841,7 +875,7 @@ impl Executor {
     /// Live weight bytes backing the graph, needed alongside [`Self::graph`] so
     /// the EPContext dump can encode initializers into the context model.
     pub(crate) fn weights(&self) -> &Arc<WeightStore> {
-        &self._weights
+        &self.weights
     }
 
     /// Warmup: re-touch the shape-keyed cache for the compiled plan so the first
@@ -2349,7 +2383,7 @@ impl Executor {
         let opset_imports = self.graph.opset_imports.clone();
         registry.infer_graph(&mut g, &opset_imports, MergePolicy::Permissive)?;
 
-        let exec = Executor::build(g, self._weights.clone(), self.ep.clone())?;
+        let exec = Executor::build(g, self.weights.clone(), self.ep.clone())?;
         Ok(CompiledSubgraph {
             exec,
             input_names: prepared
@@ -2978,5 +3012,144 @@ mod tests {
             &Graph::default(),
             &Node::new(NodeId(0), "Softmax", vec![], vec![]),
         );
+    }
+
+    // --- weight-streaming: zero-copy borrowed initializer buffers -----------
+
+    use onnx_runtime_ir::{static_shape, WeightRef};
+    use std::path::PathBuf;
+
+    /// A writable scratch dir under the workspace `target/` (never `/tmp`).
+    fn weightstream_tmp_dir() -> PathBuf {
+        let dir = PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../target/weightstream_test"
+        ));
+        std::fs::create_dir_all(&dir).expect("create weight-streaming test dir");
+        dir
+    }
+
+    fn f32_le(data: &[f32]) -> Vec<u8> {
+        data.iter().flat_map(|v| v.to_le_bytes()).collect()
+    }
+
+    /// (b) An aligned external-data initializer is backed **zero-copy** by a
+    /// borrowed buffer whose data pointer EQUALS the WeightStore's mmap slice —
+    /// no allocation, no copy. A model larger than RAM relies on this.
+    #[test]
+    fn aligned_external_initializer_is_borrowed_zero_copy() {
+        let align = TensorLayout::contiguous().alignment;
+        let path = weightstream_tmp_dir().join("aligned_init.bin");
+        let w_data = [1.0f32, 2.0, 3.0, 4.0];
+        std::fs::write(&path, f32_le(&w_data)).unwrap();
+
+        let mut store = WeightStore::new();
+        store.map_external(&path).unwrap();
+
+        let mut g = Graph::new();
+        g.opset_imports.insert(String::new(), 17);
+        let w = g.create_named_value("W", DataType::Float32, static_shape([4]));
+        g.set_initializer(
+            w,
+            WeightRef::External {
+                path: path.clone(),
+                offset: 0, // mmap base is page-aligned -> 0 is `align`-aligned
+                length: 16,
+                dtype: DataType::Float32,
+                dims: vec![4],
+            },
+        );
+        let y = g.create_value(DataType::Float32, static_shape([4]));
+        g.insert_node(Node::new(NodeId(0), "Relu", vec![Some(w)], vec![y]));
+        g.add_output(y);
+
+        let ep = auto_detect_cpu_ep().unwrap();
+        let exec = Executor::build(g, Arc::new(store), ep).unwrap();
+
+        let weight = &exec.graph.initializers[&w];
+        let src = exec.weights().bytes(weight).unwrap();
+        assert!(
+            (src.as_ptr() as usize).is_multiple_of(align),
+            "mmap window must be aligned for this test to exercise the zero-copy path"
+        );
+        let buf = &exec.buffers[&w];
+        assert!(buf.is_borrowed(), "aligned initializer must be borrowed, not copied");
+        assert_eq!(
+            buf.as_ptr() as *const u8,
+            src.as_ptr(),
+            "zero-copy: the buffer must alias the mmap bytes (no copy)"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// (c) An unaligned external-data initializer falls back to an owned copy
+    /// (buffer ptr != slice ptr) and is still numerically correct end-to-end.
+    #[test]
+    fn unaligned_external_initializer_falls_back_to_owned_copy() {
+        let align = TensorLayout::contiguous().alignment;
+        let path = weightstream_tmp_dir().join("unaligned_init.bin");
+        // Prefix the weight window with 8 bytes so it starts at offset 8, which
+        // is not a multiple of `align` (64) -> forces the copy fallback.
+        let offset = 8usize;
+        let w_data = [5.0f32, 6.0, 7.0, 8.0];
+        let mut file = vec![0u8; offset];
+        file.extend_from_slice(&f32_le(&w_data));
+        std::fs::write(&path, &file).unwrap();
+
+        let mut store = WeightStore::new();
+        store.map_external(&path).unwrap();
+
+        let mut g = Graph::new();
+        g.opset_imports.insert(String::new(), 17);
+        let w = g.create_named_value("W", DataType::Float32, static_shape([4]));
+        g.set_initializer(
+            w,
+            WeightRef::External {
+                path: path.clone(),
+                offset,
+                length: 16,
+                dtype: DataType::Float32,
+                dims: vec![4],
+            },
+        );
+        let x = g.create_named_value("X", DataType::Float32, static_shape([4]));
+        g.add_input(x);
+        let y = g.create_value(DataType::Float32, static_shape([4]));
+        g.insert_node(Node::new(NodeId(0), "Add", vec![Some(x), Some(w)], vec![y]));
+        g.add_output(y);
+
+        let ep = auto_detect_cpu_ep().unwrap();
+        let mut exec = Executor::build(g, Arc::new(store), ep).unwrap();
+
+        let weight = &exec.graph.initializers[&w];
+        let src = exec.weights().bytes(weight).unwrap();
+        assert!(
+            !(src.as_ptr() as usize).is_multiple_of(align),
+            "window must be unaligned for this test to exercise the fallback"
+        );
+        let buf = &exec.buffers[&w];
+        assert!(
+            !buf.is_borrowed(),
+            "unaligned initializer must fall back to an owned copy"
+        );
+        assert_ne!(
+            buf.as_ptr() as *const u8,
+            src.as_ptr(),
+            "fallback: the buffer must be a fresh copy, not an alias"
+        );
+
+        // The copy is numerically correct: Y = X + W.
+        let x_tensor = Tensor::from_f32(&[4], &[10.0, 20.0, 30.0, 40.0]).unwrap();
+        let out = exec.run(&[("X", &x_tensor)]).unwrap();
+        assert_eq!(out.len(), 1);
+        let got = out[0].to_vec_f32();
+        let want = [15.0f32, 26.0, 37.0, 48.0];
+        assert_eq!(got.len(), want.len());
+        for (g, w) in got.iter().zip(want.iter()) {
+            assert!((g - w).abs() < 1e-5, "got {g}, want {w}");
+        }
+
+        let _ = std::fs::remove_file(&path);
     }
 }

@@ -32,6 +32,19 @@ impl WeightStore {
         Self::default()
     }
 
+    /// Memory-map an external-data file and register it under `path`, so any
+    /// [`WeightRef::External`] whose `path` matches resolves zero-copy via
+    /// [`bytes`](Self::bytes). Idempotent: mapping the same path twice is a
+    /// no-op. This is the programmatic counterpart to the loader path (which
+    /// maps files while resolving `TensorProto` initializers), useful when
+    /// constructing a store by hand.
+    ///
+    /// The map is read-only and kept alive for the store's lifetime; callers
+    /// must not mutate or unlink the file while the store is live.
+    pub fn map_external(&mut self, path: impl AsRef<Path>) -> Result<(), LoaderError> {
+        self.mmap_file(path.as_ref())
+    }
+
     /// Resolve a weight descriptor to its raw little-endian bytes.
     ///
     /// For inline weights this borrows the stored bytes; for external weights

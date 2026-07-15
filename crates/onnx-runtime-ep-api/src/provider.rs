@@ -65,6 +65,26 @@ pub struct DeviceBuffer {
     /// this is a dereferenceable host pointer; for CUDA/ROCm it is an opaque
     /// device address only meaningful inside the owning EP's context.
     ptr: NonNull<c_void>,
+    /// Whether this handle *owns* the pointed-to allocation.
+    ///
+    /// [`BufferOwner::Owned`] (the default for [`DeviceBuffer::from_raw_parts`])
+    /// is the original contract: the owning EP must free it exactly once in
+    /// `deallocate`. [`BufferOwner::Borrowed`] (from
+    /// [`DeviceBuffer::from_borrowed_parts`]) aliases memory owned by *someone
+    /// else* (e.g. an mmap'd weight file) — `deallocate` must **not** free it
+    /// and it must never be written through.
+    owner: BufferOwner,
+}
+
+/// Whether a [`DeviceBuffer`] owns the allocation it names, or merely borrows
+/// (aliases) memory owned elsewhere.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BufferOwner {
+    /// This handle is the sole owner; the owning EP frees it in `deallocate`.
+    Owned,
+    /// This handle aliases foreign memory (e.g. an mmap). `deallocate` must be
+    /// a no-op free; the real owner must outlive the buffer and every use of it.
+    Borrowed,
 }
 
 impl DeviceBuffer {
@@ -94,7 +114,57 @@ impl DeviceBuffer {
             size,
             align,
             ptr: NonNull::new(ptr).expect("DeviceBuffer::from_raw_parts: null pointer"),
+            owner: BufferOwner::Owned,
         }
+    }
+
+    /// Wrap **foreign, borrowed** memory in a non-owning `DeviceBuffer`.
+    ///
+    /// Unlike [`DeviceBuffer::from_raw_parts`], the returned handle does **not**
+    /// own the allocation: it aliases memory owned by someone else (for example
+    /// a `memmap2::Mmap` over an on-disk weight file). This lets an EP reference
+    /// initializer bytes zero-copy instead of allocating + copying them into
+    /// fresh RAM.
+    ///
+    /// [`is_borrowed`](DeviceBuffer::is_borrowed) returns `true`, and the owning
+    /// EP's `deallocate` must treat it as a **no-op free** (the guard checks
+    /// `is_borrowed()`). [`into_raw`](DeviceBuffer::into_raw) still yields the
+    /// raw pointer, but the caller must **not** free it.
+    ///
+    /// # Safety
+    ///
+    /// The caller must guarantee all of:
+    /// * `ptr` is non-null and points to the start of a readable region of at
+    ///   least `size` bytes on `device`, aligned to at least `align` bytes.
+    /// * The memory is owned by another object (e.g. an mmap) that **outlives
+    ///   this buffer and every use of it** (read via `as_ptr`). Nothing else may
+    ///   free or unmap it while this handle or any alias derived from it lives.
+    /// * The buffer is treated as **read-only**: it is never written through
+    ///   (`as_mut_ptr` must not be used to mutate borrowed memory) and is never
+    ///   passed to an EP's `deallocate` expecting a free — `deallocate` skips
+    ///   the free for borrowed buffers.
+    ///
+    /// `align` must be a power of two (checked in debug builds).
+    pub unsafe fn from_borrowed_parts(
+        ptr: *mut c_void,
+        device: DeviceId,
+        size: usize,
+        align: usize,
+    ) -> Self {
+        debug_assert!(align.is_power_of_two(), "alignment must be a power of two");
+        Self {
+            device,
+            size,
+            align,
+            ptr: NonNull::new(ptr).expect("DeviceBuffer::from_borrowed_parts: null pointer"),
+            owner: BufferOwner::Borrowed,
+        }
+    }
+
+    /// Whether this handle merely *borrows* (aliases) foreign memory rather than
+    /// owning it. A borrowed buffer must never be freed by `deallocate`.
+    pub fn is_borrowed(&self) -> bool {
+        matches!(self.owner, BufferOwner::Borrowed)
     }
 
     /// The device this allocation lives on (and whose EP must free it).
@@ -131,8 +201,12 @@ impl DeviceBuffer {
         self.ptr.as_ptr()
     }
 
-    /// Consume the handle, returning the raw pointer *without* freeing it. The
-    /// caller assumes the single-free obligation from [`DeviceBuffer::from_raw_parts`].
+    /// Consume the handle, returning the raw pointer *without* freeing it. For
+    /// an owned buffer the caller assumes the single-free obligation from
+    /// [`DeviceBuffer::from_raw_parts`]. For a **borrowed** buffer (see
+    /// [`DeviceBuffer::from_borrowed_parts`]) the pointer must **not** be freed;
+    /// check [`is_borrowed`](DeviceBuffer::is_borrowed) first if the caller
+    /// intends to free.
     pub fn into_raw(self) -> *mut c_void {
         self.ptr.as_ptr()
     }
@@ -319,5 +393,38 @@ mod tests {
         });
         let buf = handle.join().unwrap();
         host_free(buf);
+    }
+
+    #[test]
+    fn owned_buffer_is_not_borrowed() {
+        let buf = host_alloc(32, 16);
+        assert!(
+            !buf.is_borrowed(),
+            "from_raw_parts must produce an owned buffer"
+        );
+        host_free(buf);
+    }
+
+    /// A borrowed buffer aliases memory owned by someone else (here a `Vec`):
+    /// it reports `is_borrowed()`, exposes the aliased pointer, and consuming it
+    /// via `into_raw` must NOT free the backing — the `Vec` stays valid.
+    #[test]
+    fn borrowed_buffer_aliases_without_owning() {
+        let mut backing = vec![7u8; 64];
+        let ptr = backing.as_mut_ptr() as *mut c_void;
+        // SAFETY: `ptr`/`len` name `backing`'s live allocation (aligned to 1);
+        // `backing` outlives the buffer and every use below, and we never write
+        // through the borrowed handle.
+        let buf = unsafe { DeviceBuffer::from_borrowed_parts(ptr, DeviceId::cpu(), 64, 1) };
+        assert!(buf.is_borrowed());
+        assert_eq!(buf.len(), 64);
+        assert_eq!(buf.as_ptr(), ptr as *const c_void);
+        // Consume without freeing: `into_raw` must never free a borrowed buffer.
+        let raw = buf.into_raw();
+        assert_eq!(raw, ptr);
+        // `backing` is still fully valid — a free would be a use-after-free here.
+        assert!(backing.iter().all(|&b| b == 7));
+        backing[0] = 9;
+        assert_eq!(backing[0], 9);
     }
 }

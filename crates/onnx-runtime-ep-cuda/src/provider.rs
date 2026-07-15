@@ -171,6 +171,12 @@ impl ExecutionProvider for CudaExecutionProvider {
             "cuda_ep: refusing to deallocate a buffer from device {:?}",
             buffer.device()
         );
+        // Borrowed buffers alias memory owned elsewhere and must never be
+        // cuMemFree'd. CUDA does not yet produce borrowed buffers, but keep the
+        // invariant sound so one can never be freed here.
+        if buffer.is_borrowed() {
+            return Ok(());
+        }
         let dptr = cuptr(buffer.into_raw());
         // SAFETY: `dptr` came from this EP's `alloc_raw`; `into_raw` consumed the
         // owning handle so no alias remains, and this is its single free.
