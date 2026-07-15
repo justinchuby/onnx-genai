@@ -8,7 +8,7 @@
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ir::{DataType, Node};
 
-use super::gelu::exact_gelu;
+use super::gelu::tanh_gelu;
 use super::{check_arity, to_dense_f32, write_dense_f32};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -39,14 +39,16 @@ pub struct MoEKernel {
 
 impl KernelFactory for MoEFactory {
     fn create(&self, node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
-        let k = required_int(node, "k")?;
+        let k = int_attr(node, "k", 1)?;
         if k <= 0 {
             return Err(error(format!("k must be > 0, got {k}")));
         }
-        let activation_name = node
-            .attr("activation_type")
-            .and_then(|a| a.as_str())
-            .ok_or_else(|| error("required string attribute activation_type is missing"))?;
+        let activation_name = match node.attr("activation_type") {
+            Some(attr) => attr
+                .as_str()
+                .ok_or_else(|| error("attribute activation_type must be a string"))?,
+            None => "relu",
+        };
         let activation = match activation_name {
             "relu" => Activation::Relu,
             "gelu" => Activation::Gelu,
@@ -371,7 +373,7 @@ fn routing_weights(logits: &[f32], k: usize, normalize: bool) -> Vec<(usize, f32
 fn activate(activation: Activation, value: f32) -> f32 {
     match activation {
         Activation::Relu => value.max(0.0),
-        Activation::Gelu => exact_gelu(value),
+        Activation::Gelu => tanh_gelu(value),
         Activation::Silu => value * sigmoid(value),
         Activation::Identity => value,
         Activation::Swiglu => unreachable!(),
@@ -385,12 +387,6 @@ fn sigmoid(value: f32) -> f32 {
         let exp = value.exp();
         exp / (1.0 + exp)
     }
-}
-
-fn required_int(node: &Node, name: &str) -> Result<i64> {
-    node.attr(name)
-        .and_then(|a| a.as_int())
-        .ok_or_else(|| error(format!("required integer attribute {name} is missing")))
 }
 
 fn int_attr(node: &Node, name: &str, default: i64) -> Result<i64> {
@@ -467,10 +463,10 @@ fn error(message: impl Into<String>) -> EpError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::CpuExecutionProvider;
     use crate::kernels::testutil::Owned;
+    use crate::CpuExecutionProvider;
     use onnx_runtime_ep_api::ExecutionProvider;
-    use onnx_runtime_ir::{Attribute, Graph, NodeId, static_shape};
+    use onnx_runtime_ir::{static_shape, Attribute, Graph, NodeId};
     use onnx_runtime_loader::Model;
 
     fn model_node(
@@ -566,16 +562,40 @@ mod tests {
                 &mut [y.view_mut()],
             )
             .unwrap();
-        let p = 4.0f32.exp() / (4.0f32.exp() + 1.0);
         assert_close(
             &y.to_f32(),
-            &[
-                p * (exact_gelu(1.5) + 0.25),
-                p * (exact_gelu(1.5) - 0.25),
-                p * (exact_gelu(7.0) + 0.5),
-                p * (exact_gelu(9.0) + 0.5),
-            ],
+            &[1.619_902_0, 1.128_895_2, 7.365_103_2, 9.329_131],
         );
+    }
+
+    #[test]
+    fn moe_defaults_to_top1_relu_when_attributes_are_omitted() {
+        let shapes = [
+            Some(&[1, 2][..]),
+            Some(&[1, 2]),
+            Some(&[2, 2, 2]),
+            None,
+            Some(&[2, 2, 2]),
+        ];
+        let (graph, node) = model_node(&shapes, &[1, 2], &[]);
+        let x = Owned::f32(&[1, 2], &[1.0, -2.0]);
+        let router = Owned::f32(&[1, 2], &[0.0, 0.0]);
+        let fc1 = Owned::f32(&[2, 2, 2], &[1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0]);
+        let fc2 = Owned::f32(&[2, 2, 2], &[1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0]);
+        let mut y = Owned::zeros_f32(&[1, 2]);
+        kernel(&graph, node)
+            .execute(
+                &[
+                    x.view(),
+                    router.view(),
+                    fc1.view(),
+                    TensorView::absent(DataType::Float32),
+                    fc2.view(),
+                ],
+                &mut [y.view_mut()],
+            )
+            .unwrap();
+        assert_close(&y.to_f32(), &[0.5, 0.0]);
     }
 
     #[test]
