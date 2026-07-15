@@ -889,6 +889,12 @@ fn std_gelu_passthrough() {
     assert_eq!(out_dtype(&outs), DataType::Float32);
 }
 
+#[test]
+fn std_gelu_is_unregistered_before_opset_20() {
+    let registry = InferenceRegistry::default_registry();
+    assert!(registry.get("", "Gelu", 19).is_none());
+}
+
 // --- Cast -----------------------------------------------------------------
 
 #[test]

@@ -160,15 +160,31 @@ impl Kernel for RotaryEmbeddingKernel {
                         "RotaryEmbedding: negative position id".into(),
                     ));
                 }
-                p as usize
+                usize::try_from(p).map_err(|_| {
+                    EpError::KernelFailed(
+                        "RotaryEmbedding: position id exceeds supported range".into(),
+                    )
+                })?
             } else {
                 b * seq + s
             };
-            let offset = row * cache_stride;
-            if offset + half > cos_cache.len() || offset + half > sin_cache.len() {
+            let offset = row.checked_mul(cache_stride).ok_or_else(|| {
+                EpError::KernelFailed(format!(
+                    "RotaryEmbedding: position {row} exceeds cos/sin cache extent"
+                ))
+            })?;
+            let end = offset.checked_add(half).ok_or_else(|| {
+                EpError::KernelFailed(format!(
+                    "RotaryEmbedding: position {row} exceeds cos/sin cache extent"
+                ))
+            })?;
+            if offset > cos_cache.len()
+                || end > cos_cache.len()
+                || offset > sin_cache.len()
+                || end > sin_cache.len()
+            {
                 return Err(EpError::KernelFailed(format!(
-                    "RotaryEmbedding: position {row} exceeds cos/sin cache extent (need {} rows of {half})",
-                    row + 1
+                    "RotaryEmbedding: position {row} exceeds cos/sin cache extent (row width {half})"
                 )));
             }
             Ok(offset)
@@ -388,6 +404,46 @@ mod tests {
             &mut [out.view_mut()],
         );
         assert!(err.is_err(), "out-of-range position must return an error");
+    }
+
+    #[test]
+    fn rope_i64_max_position_errors_without_overflow() {
+        // The checked cache-row arithmetic must reject this before it can wrap
+        // and be used as an in-bounds cache offset.
+        let x = Owned::f32(&[1, 1, 4], &[1., 2., 3., 4.]);
+        let cos = Owned::f32(&[1, 2], &[1.0, 1.0]);
+        let sin = Owned::f32(&[1, 2], &[0.0, 0.0]);
+        let pos = Owned::i64(&[1, 1], &[i64::MAX]);
+        let mut out = Owned::zeros_f32(&[1, 1, 4]);
+        let err = RotaryEmbeddingKernel {
+            interleaved: false,
+            num_heads: 2,
+            rotary_embedding_dim: 0,
+        }
+        .execute(
+            &[x.view(), cos.view(), sin.view(), pos.view()],
+            &mut [out.view_mut()],
+        );
+        assert!(err.is_err(), "i64::MAX position must return an error");
+    }
+
+    #[test]
+    fn rope_negative_position_errors() {
+        let x = Owned::f32(&[1, 1, 4], &[1., 2., 3., 4.]);
+        let cos = Owned::f32(&[1, 2], &[1.0, 1.0]);
+        let sin = Owned::f32(&[1, 2], &[0.0, 0.0]);
+        let pos = Owned::i64(&[1, 1], &[-1]);
+        let mut out = Owned::zeros_f32(&[1, 1, 4]);
+        let err = RotaryEmbeddingKernel {
+            interleaved: false,
+            num_heads: 2,
+            rotary_embedding_dim: 0,
+        }
+        .execute(
+            &[x.view(), cos.view(), sin.view(), pos.view()],
+            &mut [out.view_mut()],
+        );
+        assert!(err.is_err(), "negative position must return an error");
     }
 
     #[test]
