@@ -203,6 +203,11 @@ pub fn register(reg: &mut InferenceRegistry) {
     reg.register("", "Cast", 1, cast);
     reg.register("", "CastLike", 1, cast_like);
     reg.register("", "Identity", 1, identity);
+    for version in [10, 13, 19, 21, 23, 25] {
+        reg.register("", "QuantizeLinear", version, quantize_linear);
+        reg.register("", "DequantizeLinear", version, dequantize_linear);
+    }
+    reg.register("", "DynamicQuantizeLinear", 11, dynamic_quantize_linear);
 }
 
 /// `CastLike(input, target_type)`: shape from input, dtype from the second
@@ -211,6 +216,42 @@ fn cast_like(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
     let dtype = ctx.input_dtype(1);
     if let (Some(shape), Some(dtype)) = (ctx.input_shape(0).map(<[DimExpr]>::to_vec), dtype) {
         ctx.set_output(0, dtype, shape);
+    }
+    Ok(())
+}
+
+/// `QuantizeLinear`: output shape follows x; its type follows zero_point, or
+/// defaults to uint8 when zero_point is omitted.
+fn quantize_linear(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
+    let dtype = if ctx.has_input(2) {
+        ctx.input_dtype(2)
+    } else {
+        Some(DataType::Uint8)
+    };
+    if let (Some(shape), Some(dtype)) = (ctx.input_shape(0).map(<[DimExpr]>::to_vec), dtype) {
+        ctx.set_output(0, dtype, shape);
+    }
+    Ok(())
+}
+
+/// `DequantizeLinear`: output shape follows x and dtype follows scale.
+fn dequantize_linear(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
+    if let (Some(shape), Some(dtype)) = (
+        ctx.input_shape(0).map(<[DimExpr]>::to_vec),
+        ctx.input_dtype(1),
+    ) {
+        ctx.set_output(0, dtype, shape);
+    }
+    Ok(())
+}
+
+/// `DynamicQuantizeLinear`: uint8 data with scalar float32 scale and uint8
+/// zero_point.
+fn dynamic_quantize_linear(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
+    if let Some(shape) = ctx.input_shape(0).map(<[DimExpr]>::to_vec) {
+        ctx.set_output(0, DataType::Uint8, shape);
+        ctx.set_output(1, DataType::Float32, Vec::new());
+        ctx.set_output(2, DataType::Uint8, Vec::new());
     }
     Ok(())
 }

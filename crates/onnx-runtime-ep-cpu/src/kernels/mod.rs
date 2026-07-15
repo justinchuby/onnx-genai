@@ -53,6 +53,7 @@ pub mod movement_ops;
 #[cfg(feature = "onednn")]
 pub mod onednn;
 pub mod pad;
+pub mod quantization;
 pub mod reduce;
 pub mod reduce_ops;
 pub mod relu;
@@ -159,6 +160,9 @@ pub const PHASE1_OPS: &[&str] = &[
     "NonZero",
     // GEMM.
     "Gemm",
+    "QuantizeLinear",
+    "DequantizeLinear",
+    "DynamicQuantizeLinear",
 ];
 
 /// Whether `op_type` is one of the Phase-1 ops the CPU EP can run.
@@ -366,6 +370,22 @@ pub fn build_cpu_registry() -> OpRegistry {
     );
     // GEMM.
     reg.register(OpKey::new("Gemm", "", 1), Box::new(gemm::GemmFactory));
+    // Linear quantization evolved at opsets 10, 13, 19, 21, 23, and 25. The
+    // implementation accepts the newest parameter set for all these revisions.
+    for version in [10, 13, 19, 21, 23, 25] {
+        reg.register(
+            OpKey::new("QuantizeLinear", "", version),
+            Box::new(quantization::QuantizeLinearFactory),
+        );
+        reg.register(
+            OpKey::new("DequantizeLinear", "", version),
+            Box::new(quantization::DequantizeLinearFactory),
+        );
+    }
+    reg.register(
+        OpKey::new("DynamicQuantizeLinear", "", 11),
+        Box::new(quantization::DynamicQuantizeLinearFactory),
+    );
     // --- Additional ep-cpu op coverage (op-coverage wave) ---------------------
     // Elementwise unary math (f32). Additive, default-domain-only registrations.
     reg.register(OpKey::new("Abs", "", 1), Box::new(unary_math::AbsFactory));
@@ -1020,8 +1040,10 @@ mod tests {
         // `LogSoftmax` each have a legacy and an opset-13 entry. Five contrib
         // (`com.microsoft`) fused transformer entries (BiasGelu, FastGelu,
         // QuickGelu, SkipLayerNormalization, SimplifiedLayerNormalization) add
-        // five more, so the entry count is eighteen more than the op-name count.
-        assert_eq!(reg.len(), PHASE1_OPS.len() + 18);
+        // five more. QuantizeLinear and DequantizeLinear each add six versioned
+        // entries, while DynamicQuantizeLinear adds one, so the entry count is
+        // twenty-eight more than the op-name count.
+        assert_eq!(reg.len(), PHASE1_OPS.len() + 28);
         for op in PHASE1_OPS {
             assert!(reg.lookup(op, "", 21).is_some(), "missing factory for {op}");
         }
