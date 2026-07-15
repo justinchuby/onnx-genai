@@ -58,12 +58,6 @@ mod pathsafe;
 pub use encoder::{
     DEFAULT_IR_VERSION, Model, ModelMetadata, encode_model, encode_model_proto, write_model,
 };
-/// Newest ONNX IR version accepted by the loader.
-///
-/// This is intentionally separate from [`DEFAULT_IR_VERSION`]: newly encoded
-/// models target the established IR 10 baseline, while loading remains
-/// compatible with the IR 11 models used by shipped fixtures.
-pub const MAX_SUPPORTED_IR_VERSION: i64 = 11;
 pub use epcontext::{
     EmbedMode, EpContextBlob, EpContextNode, ep_context_node_ids, ep_context_nodes,
     is_ep_context_op, resolve_ep_context,
@@ -171,23 +165,10 @@ mod error {
         },
 
         #[error(
-            "illegal ONNX model: ir_version {ir_version} is invalid. RULES #1: ONNX IR versions \
-             start at 1. Expected: emit a model with ir_version in 1..={max_ir_version}"
+            "illegal ONNX model: ir_version {ir_version} is invalid. RULES #1: ir_version is \
+             required and ONNX IR versions start at 1. Expected: emit a model with ir_version >= 1"
         )]
-        InvalidIrVersion {
-            ir_version: i64,
-            max_ir_version: i64,
-        },
-
-        #[error(
-            "unsupported ONNX model: ir_version {ir_version} is newer than this runtime supports \
-             (max {max_ir_version}). RULES #1: load a model targeting a supported ONNX IR version \
-             or upgrade the runtime"
-        )]
-        UnsupportedIrVersion {
-            ir_version: i64,
-            max_ir_version: i64,
-        },
+        InvalidIrVersion { ir_version: i64 },
 
         #[error(
             "illegal ONNX model: ir_version {ir_version} requires a default-domain opset_import \
@@ -364,6 +345,17 @@ fn build_from_bytes_with_weights(
         graph.set_initializer(vid, weight.clone());
     }
 
+    // Structural IR validation runs here — *after* initializers are attached —
+    // rather than inside `graph_builder::build_graph`. A top-level initializer
+    // is only recorded in `graph.initializers` by the weight-loading path above,
+    // so validating earlier would mis-flag a legal initializer that is also a
+    // graph output (constant pass-through) or a pre-IR-4 graph input that is
+    // also an initializer as a producer-less `MissingProducer`. Validating the
+    // fully-assembled graph recognizes those values as initializer sources.
+    graph
+        .validate()
+        .map_err(|errs| LoaderError::GraphBuild(format!("{errs:?}")))?;
+
     // Full fail-fast validation once initializers are attached (so
     // initializer-backed values are recognized as sourced). Rejects
     // statically-knowable unsupported/illegal constructs before shape
@@ -436,18 +428,19 @@ pub fn validate_model_proto(model: &proto::onnx::ModelProto) -> Result<(), Loade
 
     use proto::onnx::GraphProto;
 
+    // Lower sanity bound only: `ir_version` is a required ONNX field and IR
+    // versions start at 1, so reject an absent (0) or negative version.
     if model.ir_version < 1 {
         return Err(LoaderError::InvalidIrVersion {
             ir_version: model.ir_version,
-            max_ir_version: MAX_SUPPORTED_IR_VERSION,
         });
     }
-    if model.ir_version > MAX_SUPPORTED_IR_VERSION {
-        return Err(LoaderError::UnsupportedIrVersion {
-            ir_version: model.ir_version,
-            max_ir_version: MAX_SUPPORTED_IR_VERSION,
-        });
-    }
+    // No upper bound. Per the maintainer directive, new ONNX IR versions are
+    // effectively always backward-compatible (they add fields/metadata rather
+    // than breaking existing model semantics), so gating on a version ceiling
+    // only produces false-positive rejections of otherwise-valid newer models.
+    // If a genuinely unsupported construct ever ships, gate on that specific
+    // FEATURE at load time — never on the IR version number.
     if model.ir_version >= 3
         && !model
             .opset_import

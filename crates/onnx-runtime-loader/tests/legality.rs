@@ -152,25 +152,34 @@ fn ref_attribute_outside_function_is_rejected_but_function_references_are_allowe
 }
 
 #[test]
-fn invalid_and_future_ir_versions_are_rejected_and_supported_version_loads() {
-    for (ir_version, expected_invalid) in [
-        (0, true),
-        (onnx_runtime_loader::MAX_SUPPORTED_IR_VERSION + 1, false),
-    ] {
+fn invalid_ir_version_is_rejected_and_new_ir_versions_load_without_a_ceiling() {
+    // Lower sanity bound: absent/zero (or negative) ir_version is rejected.
+    for bad in [0, -1] {
         let mut invalid = model(onnx::GraphProto::default());
-        invalid.ir_version = ir_version;
-        let result = onnx_runtime_loader::load_model_bytes(&invalid.encode_to_vec());
-        if expected_invalid {
-            assert!(matches!(result, Err(LoaderError::InvalidIrVersion { .. })));
-        } else {
-            assert!(matches!(
-                result,
-                Err(LoaderError::UnsupportedIrVersion { .. })
-            ));
-        }
+        invalid.ir_version = bad;
+        assert!(matches!(
+            onnx_runtime_loader::load_model_bytes(&invalid.encode_to_vec()),
+            Err(LoaderError::InvalidIrVersion { .. })
+        ));
     }
+
+    // No upper bound: a far-future IR version loads (new IR versions are
+    // backward-compatible; we never gate on the version number).
+    let mut future = model(onnx::GraphProto::default());
+    future.ir_version = 999;
+    onnx_runtime_loader::load_model_bytes(&future.encode_to_vec())
+        .expect("future IR versions are not rejected by a ceiling");
+
     onnx_runtime_loader::load_model_bytes(&model(onnx::GraphProto::default()).encode_to_vec())
-        .expect("supported IR version");
+        .expect("baseline IR version");
+}
+
+#[test]
+fn ir13_with_default_opset_loads() {
+    let mut legal = model(onnx::GraphProto::default());
+    legal.ir_version = 13;
+    onnx_runtime_loader::load_model_bytes(&legal.encode_to_vec())
+        .expect("IR 13 model with default opset");
 }
 
 #[test]
@@ -191,6 +200,93 @@ fn missing_default_opset_for_ir3_is_rejected_and_default_domain_alias_is_allowed
     });
     onnx_runtime_loader::load_model_bytes(&invalid.encode_to_vec())
         .expect("ai.onnx alias is a default import");
+}
+
+#[test]
+fn repeated_empty_optional_outputs_are_allowed() {
+    let legal = onnx::GraphProto {
+        input: vec![value_info("X")],
+        output: vec![value_info("Y")],
+        node: vec![
+            node("Identity", &["X"], &["mid", ""]),
+            node("Identity", &["mid"], &["Y", ""]),
+        ],
+        ..Default::default()
+    };
+    onnx_runtime_loader::load_model_bytes(&model(legal).encode_to_vec())
+        .expect("empty optional outputs are not SSA values");
+}
+
+#[test]
+fn graph_input_that_is_an_initializer_loads_for_pre_ir4_model() {
+    let mut legal = model(onnx::GraphProto {
+        input: vec![value_info("W")],
+        initializer: vec![f32_initializer("W")],
+        output: vec![value_info("W")],
+        ..Default::default()
+    });
+    legal.ir_version = 3;
+    onnx_runtime_loader::load_model_bytes(&legal.encode_to_vec())
+        .expect("graph input and initializer are both legal before IR 4");
+}
+
+#[test]
+fn identical_value_names_in_separate_subgraph_scopes_load() {
+    let branch = || onnx::GraphProto {
+        input: vec![value_info("shared")],
+        output: vec![value_info("shared")],
+        ..Default::default()
+    };
+    let legal = model(onnx::GraphProto {
+        node: vec![node_with_attrs(
+            "If",
+            vec![
+                graph_attr("then_branch", branch()),
+                graph_attr("else_branch", branch()),
+            ],
+        )],
+        ..Default::default()
+    });
+    onnx_runtime_loader::load_model_bytes(&legal.encode_to_vec())
+        .expect("subgraph scopes may shadow one another");
+}
+
+#[test]
+fn ref_attribute_in_nested_function_subgraph_loads() {
+    let ref_attr = onnx::AttributeProto {
+        name: "axis".to_string(),
+        ref_attr_name: "axis_parameter".to_string(),
+        r#type: onnx::attribute_proto::AttributeType::Int as i32,
+        ..Default::default()
+    };
+    let mut legal = model(onnx::GraphProto::default());
+    legal.functions.push(onnx::FunctionProto {
+        name: "NestedReference".to_string(),
+        node: vec![node_with_attrs(
+            "If",
+            vec![graph_attr(
+                "then_branch",
+                onnx::GraphProto {
+                    node: vec![node_with_attrs("Identity", vec![ref_attr])],
+                    ..Default::default()
+                },
+            )],
+        )],
+        ..Default::default()
+    });
+    onnx_runtime_loader::load_model_bytes(&legal.encode_to_vec())
+        .expect("function subgraphs may reference function attributes");
+}
+
+#[test]
+fn initializer_that_is_a_graph_output_loads() {
+    let legal = onnx::GraphProto {
+        initializer: vec![f32_initializer("W")],
+        output: vec![value_info("W")],
+        ..Default::default()
+    };
+    onnx_runtime_loader::load_model_bytes(&model(legal).encode_to_vec())
+        .expect("initializer graph output is a valid passthrough");
 }
 
 #[test]

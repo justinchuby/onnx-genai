@@ -28,6 +28,21 @@ pub struct BuiltGraph {
 /// Build the IR graph (nodes, values, symbols, opsets) from a `ModelProto`.
 ///
 /// Weights and shape inference are applied by later pipeline stages.
+///
+/// The graph returned here is **structurally incomplete**: top-level
+/// initializers are created as named values, but their [`WeightRef`] source
+/// data is attached later by the weight loader
+/// ([`crate::weights::load_weights`] → `Graph::set_initializer`). Structural
+/// validation ([`Graph::validate`]) is therefore deliberately deferred to the
+/// full pipeline (see `build_from_bytes_with_weights`), where it runs *after*
+/// initializers are registered — otherwise a legal initializer that is also a
+/// graph output (or a pre-IR-4 input that is also an initializer) would be
+/// mis-flagged as a producer-less value, because `Graph::validate` recognizes
+/// an initializer as a valid value source only once it appears in
+/// `graph.initializers`.
+///
+/// [`WeightRef`]: onnx_runtime_ir::WeightRef
+/// [`Graph::validate`]: onnx_runtime_ir::Graph::validate
 pub fn build_graph(model: &ModelProto) -> Result<BuiltGraph, LoaderError> {
     // Expand any model-local function calls into their primitive bodies before
     // building the IR, so the rest of the pipeline only ever sees ops the
@@ -53,10 +68,6 @@ pub fn build_graph(model: &ModelProto) -> Result<BuiltGraph, LoaderError> {
         .ok_or_else(|| LoaderError::GraphBuild("ModelProto has no graph".into()))?;
 
     let name_map = build_graph_proto(&mut graph, graph_proto, true)?;
-
-    graph
-        .validate()
-        .map_err(|errs| LoaderError::GraphBuild(format!("{errs:?}")))?;
 
     Ok(BuiltGraph { graph, name_map })
 }
