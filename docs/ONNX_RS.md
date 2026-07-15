@@ -813,11 +813,12 @@ impl ValidationResult {
 }
 ```
 
-Implementation status: the checker now includes the structural
-`InputOutputDeclaredRule` and `NoUnconnectedNodesRule`, schema-driven
+Implementation status: the checker now has **9 rules**, including the expanded
+structural `InputOutputDeclaredRule` and `NoUnconnectedNodesRule`, schema-driven
 `TypeConstraintSatisfiedRule`, `InitializerTypeMatchesDeclaredRule`, and the
-lower-bound-only `IrVersionSupportedRule`. Operator existence, arity, and
-attribute checks remain grouped in `SchemaNodeConformsRule`.
+lower-bound-only `IrVersionSupportedRule`. The IR rule deliberately has **no
+artificial upper-version ceiling**. Operator existence, arity, and attribute
+checks remain grouped in `SchemaNodeConformsRule`.
 
 ### 8.3 Extensibility
 

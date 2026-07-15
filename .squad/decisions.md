@@ -986,3 +986,29 @@ CHANNEL/AVG results match element-for-element.
 **Corrective review:** Tyrell’s four blockers were fixed by Brion: checked integer absolute-byte parsing, YAML `1.0` preserved as a fraction, absolute limits clamp to provider capacity without fabricating it, and per-tier VRAM/host-RAM/disk snapshots. Tyrell re-reviewed 🟢. **105** tests pass; **18** pre-existing missing-asset failures remain.
 
 **Current main HEAD:** `1eebf5d`.
+
+---
+
+## 2026-07-15 — Wave 7: ONNX-RS checker and CUDA cuDNN pooling
+
+### No artificial checker IR-version upper ceiling (`475cea1`)
+**What:** `onnx-rs` §8 now has nine checker rules, including lower-bound IR-version validation, but intentionally does not reject a model merely because its IR version is newer than a hard-coded checker maximum.
+
+**Why:** The checker can validate the rules it understands without claiming that a future IR version is universally invalid. This avoids artificial incompatibility while retaining required structural, schema-type, initializer-declaration, and minimum-version checks. Unknown or placeholder types are skipped where conformance cannot be determined.
+
+### cuDNN pooling support constraint set (`2775a22`)
+**What:** CUDA `MaxPool` and `AveragePool` use `cudnnPoolingForward` for 2-D NCHW f32/f16/bf16 inputs with `VALID`, symmetric `SAME`, or symmetric explicit padding. AveragePool supports both `count_include_pad` modes.
+
+**Why:** The implementation explicitly rejects asymmetric padding, `ceil_mode=1`, dilation, and `storage_order`; MaxPool also rejects the optional Indices output. These constraints prevent silently incorrect mappings to cuDNN pooling semantics.
+
+**Sources:** Wave-7 coordinator manifest; merged commits `475cea1` and `2775a22`.
+### 2026-07-15T20-05-45: Standing directives: design docs are challengeable (optimize DX/UX/maintainability/cleanliness/perf/flexibility); benchmark periodically for perf + quality
+**By:** coordinator
+**What:** Standing directives: design docs are challengeable (optimize DX/UX/maintainability/cleanliness/perf/flexibility); benchmark periodically for perf + quality
+**Why:** ### 2026-07-15: Two standing directives from the repo owner
+
+**1. Design docs are guidance, not gospel.** When implementing from docs/DESIGN.md and docs/ONNX_RS.md, agents may challenge/change unreasonable parts. Priority axes: developer experience, user experience, ease of maintenance, cleanliness, high performance, flexibility. When deviating, surface a short rationale and update the doc.
+
+**2. Benchmark periodically.** Run benchmarks on a regular cadence to track performance (decode tok/s, latency) and output quality/correctness ("效果"), catching regressions and drift.
+
+**By:** Justin Chu (@justinchuby), via Coordinator.

@@ -261,3 +261,11 @@ Scoped the "export Gemma4 E2B/12B via Mobius and smoke-test through onnx-genai" 
 - **Engine Resource-Governor wiring ✅ (`1eebf5d`, Sebastian; Brion corrective fix):** Wired §26.11.4 byte/fraction/auto parsing, `EngineConfig` limits/YAML, governor and per-tier snapshots, and guarded runtime VRAM updates. Tyrell’s 🔴 fixes added checked absolute-byte parsing, YAML float fractions, provider-capacity clamping, and VRAM/host-RAM/disk snapshots; re-review 🟢. Live eviction remains deferred; **105** pass with **18** pre-existing missing-asset failures.
 
 **Current main HEAD:** `1eebf5d`.
+
+## 2026-07-15 — Wave 7: ONNX-RS checker, CUDA pooling, and Python metadata
+
+- **ONNX-RS §8 checker rules ✅ (`475cea1`, Rutger; Brion corrective fix):** Expanded the checker to **9 rules** with input/output declaration, unconnected-node, schema type-constraint, initializer-vs-declared-type, and IR-version validation. Unknown or placeholder types are skipped safely, dangling node outputs are detected, and static initializer-dimension mismatches are rejected. The IR rule has no artificial upper-version ceiling. **67** unit tests plus **1** doctest pass; Deckard reviewed 🟢.
+- **CUDA cuDNN MaxPool + AveragePool ✅ (`2775a22`, Pris; Chew corrective fix):** Added `cudnnPoolingForward` for 2-D NCHW f32/f16/bf16 pooling with `VALID`/symmetric `SAME`/symmetric explicit padding. AveragePool maps both `count_include_pad` modes; unsupported asymmetric padding, `ceil_mode=1`, dilation, storage order, and MaxPool Indices fail explicitly. **90** tests pass.
+- **`nxrt` model metadata ✅ (`66a8e5c`, Rachael):** Added `InferenceSession::model_metadata()` and the Python `ModelMetadata` pyclass, exposing producer name, graph name, domain, description, version, and custom metadata map through `get_modelmeta()`. Holden reviewed 🟢.
+
+**Current main HEAD:** `66a8e5c`.
