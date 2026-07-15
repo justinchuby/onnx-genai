@@ -17,7 +17,7 @@
 //! either a retained size-1 dim (keepdims) or nothing (squeezed).
 
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
-use onnx_runtime_ir::{Node, compute_contiguous_strides};
+use onnx_runtime_ir::{compute_contiguous_strides, Node};
 
 use super::{check_arity, to_dense_f32, to_dense_i64, write_dense_f32};
 use crate::strided::{next_index, numel};
@@ -161,7 +161,7 @@ impl Kernel for ReduceKernel {
         // Resolve the raw axes list: input 1 (opset 13/18+) takes precedence
         // over the attribute; both absent means "reduce all axes" (unless
         // noop_with_empty_axes selects identity for an explicitly-empty set).
-        let axes_raw: Option<Vec<i64>> = if inputs.len() == 2 {
+        let axes_raw: Option<Vec<i64>> = if inputs.len() == 2 && !inputs[1].is_absent() {
             Some(to_dense_i64(&inputs[1])?)
         } else {
             self.axes_attr.clone()
@@ -234,6 +234,9 @@ impl Kernel for ReduceKernel {
                     } else if max == f32::NEG_INFINITY {
                         acc[out_off] = 1.0;
                         logsumexp_max[out_off] = value;
+                    } else if max == f32::INFINITY {
+                        // Avoid computing `inf - inf` for another infinite
+                        // value. Any group containing +inf reduces to +inf.
                     } else if value > max {
                         acc[out_off] = acc[out_off] * (max - value).exp() + 1.0;
                         logsumexp_max[out_off] = value;
@@ -270,6 +273,7 @@ impl Kernel for ReduceKernel {
 mod tests {
     use super::*;
     use crate::kernels::testutil::Owned;
+    use onnx_runtime_ir::DataType;
 
     fn run_attr(op: ReduceOp, axes: Option<Vec<i64>>, x: &Owned, out: &mut Owned) {
         ReduceKernel {
@@ -290,6 +294,20 @@ mod tests {
             noop_with_empty_axes: false,
         }
         .execute(&[x.view(), axes.view()], &mut [out.view_mut()])
+        .unwrap();
+    }
+
+    fn run_omitted_axes(op: ReduceOp, x: &Owned, out: &mut Owned) {
+        ReduceKernel {
+            op,
+            axes_attr: None,
+            keepdims: true,
+            noop_with_empty_axes: false,
+        }
+        .execute(
+            &[x.view(), TensorView::absent(DataType::Int64)],
+            &mut [out.view_mut()],
+        )
         .unwrap();
     }
 
@@ -359,6 +377,36 @@ mod tests {
         let mut out = Owned::zeros_f32(&[1]);
         run_attr(ReduceOp::LogSumExp, Some(vec![0]), &x, &mut out);
         assert!((out.to_f32()[0] - (1_001.0 + (-1_f32).exp().ln_1p())).abs() < 1e-5);
+    }
+
+    #[test]
+    fn omitted_axes_reduce_all_for_opset18_reductions() {
+        let x = Owned::f32(&[2, 2], &[-1., 2., -3., 4.]);
+        let mut l1 = Owned::zeros_f32(&[1, 1]);
+        run_omitted_axes(ReduceOp::L1, &x, &mut l1);
+        assert_eq!(l1.to_f32(), vec![10.]);
+
+        let positive = Owned::f32(&[2, 2], &[1., 2., 3., 4.]);
+        let mut log_sum = Owned::zeros_f32(&[1, 1]);
+        run_omitted_axes(ReduceOp::LogSum, &positive, &mut log_sum);
+        assert!((log_sum.to_f32()[0] - 10_f32.ln()).abs() < 1e-6);
+
+        let mut log_sum_exp = Owned::zeros_f32(&[1, 1]);
+        run_omitted_axes(ReduceOp::LogSumExp, &positive, &mut log_sum_exp);
+        assert!(
+            (log_sum_exp.to_f32()[0]
+                - (4.0 + (1.0 + (-1_f32).exp() + (-2_f32).exp() + (-3_f32).exp()).ln()))
+            .abs()
+                < 1e-6
+        );
+    }
+
+    #[test]
+    fn log_sum_exp_with_positive_infinities_is_infinite() {
+        let x = Owned::f32(&[2], &[f32::INFINITY, f32::INFINITY]);
+        let mut out = Owned::zeros_f32(&[1]);
+        run_attr(ReduceOp::LogSumExp, Some(vec![0]), &x, &mut out);
+        assert_eq!(out.to_f32(), vec![f32::INFINITY]);
     }
 
     #[test]
