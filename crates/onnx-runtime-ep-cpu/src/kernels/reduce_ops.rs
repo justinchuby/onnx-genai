@@ -1,5 +1,6 @@
 //! Additional f32 reduction kernels: `ReduceSum`, `ReduceMax`, `ReduceMin`,
-//! `ReduceProd`, `ReduceSumSquare`, `ReduceL2` (`docs/ORT2.md` §4.4).
+//! `ReduceProd`, `ReduceSumSquare`, `ReduceL1`, `ReduceL2`, `ReduceLogSum`, and
+//! `ReduceLogSumExp` (`docs/ORT2.md` §4.4).
 //!
 //! These complement [`reduce::ReduceMeanKernel`](super::reduce) and share its
 //! reduce-walk structure, but add support for the **modern input signature**:
@@ -29,7 +30,10 @@ enum ReduceOp {
     Min,
     Prod,
     SumSquare,
+    L1,
     L2,
+    LogSum,
+    LogSumExp,
 }
 
 impl ReduceOp {
@@ -40,14 +44,22 @@ impl ReduceOp {
             ReduceOp::Min => "ReduceMin",
             ReduceOp::Prod => "ReduceProd",
             ReduceOp::SumSquare => "ReduceSumSquare",
+            ReduceOp::L1 => "ReduceL1",
             ReduceOp::L2 => "ReduceL2",
+            ReduceOp::LogSum => "ReduceLogSum",
+            ReduceOp::LogSumExp => "ReduceLogSumExp",
         }
     }
 
     /// The identity/accumulator seed for an empty reduction group.
     fn init(self) -> f32 {
         match self {
-            ReduceOp::Sum | ReduceOp::SumSquare | ReduceOp::L2 => 0.0,
+            ReduceOp::Sum
+            | ReduceOp::SumSquare
+            | ReduceOp::L1
+            | ReduceOp::L2
+            | ReduceOp::LogSum
+            | ReduceOp::LogSumExp => 0.0,
             ReduceOp::Prod => 1.0,
             ReduceOp::Max => f32::NEG_INFINITY,
             ReduceOp::Min => f32::INFINITY,
@@ -57,9 +69,12 @@ impl ReduceOp {
     /// Fold accumulator `acc` with a new element `x`.
     fn fold(self, acc: f32, x: f32) -> f32 {
         match self {
-            ReduceOp::Sum => acc + x,
+            ReduceOp::Sum | ReduceOp::LogSum => acc + x,
             ReduceOp::Prod => acc * x,
             ReduceOp::SumSquare | ReduceOp::L2 => acc + x * x,
+            ReduceOp::L1 => acc + x.abs(),
+            // This is replaced by the stable two-accumulator path in `execute`.
+            ReduceOp::LogSumExp => acc + x.exp(),
             // Max/Min propagate NaN (numpy semantics) — Rust's f32::max/min
             // suppress it, so guard explicitly.
             ReduceOp::Max => {
@@ -79,10 +94,11 @@ impl ReduceOp {
         }
     }
 
-    /// Final map applied to each accumulated group (only `ReduceL2` is nonlinear).
+    /// Final map applied to each accumulated group.
     fn finish(self, acc: f32) -> f32 {
         match self {
             ReduceOp::L2 => acc.sqrt(),
+            ReduceOp::LogSum | ReduceOp::LogSumExp => acc.ln(),
             _ => acc,
         }
     }
@@ -130,7 +146,10 @@ reduce_factory!(ReduceMaxFactory, ReduceOp::Max);
 reduce_factory!(ReduceMinFactory, ReduceOp::Min);
 reduce_factory!(ReduceProdFactory, ReduceOp::Prod);
 reduce_factory!(ReduceSumSquareFactory, ReduceOp::SumSquare);
+reduce_factory!(ReduceL1Factory, ReduceOp::L1);
 reduce_factory!(ReduceL2Factory, ReduceOp::L2);
+reduce_factory!(ReduceLogSumFactory, ReduceOp::LogSum);
+reduce_factory!(ReduceLogSumExpFactory, ReduceOp::LogSumExp);
 
 impl Kernel for ReduceKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
@@ -190,6 +209,9 @@ impl Kernel for ReduceKernel {
         let kept_out_strides = compute_contiguous_strides(&kept_shape);
 
         let mut acc = vec![self.op.init(); kept_count.max(1)];
+        // `log(sum(exp(x)))` must avoid overflowing for large finite inputs.
+        // Track a running maximum and the sum in that maximum's exponent frame.
+        let mut logsumexp_max = vec![f32::NEG_INFINITY; kept_count.max(1)];
         if numel(in_shape) > 0 {
             let mut idx = vec![0usize; rank];
             loop {
@@ -203,14 +225,38 @@ impl Kernel for ReduceKernel {
                         kept_axis += 1;
                     }
                 }
-                acc[out_off] = self.op.fold(acc[out_off], x[in_off]);
+                if matches!(self.op, ReduceOp::LogSumExp) {
+                    let value = x[in_off];
+                    let max = logsumexp_max[out_off];
+                    if value.is_nan() || max.is_nan() {
+                        logsumexp_max[out_off] = f32::NAN;
+                        acc[out_off] = f32::NAN;
+                    } else if max == f32::NEG_INFINITY {
+                        acc[out_off] = 1.0;
+                        logsumexp_max[out_off] = value;
+                    } else if value > max {
+                        acc[out_off] = acc[out_off] * (max - value).exp() + 1.0;
+                        logsumexp_max[out_off] = value;
+                    } else {
+                        acc[out_off] += (value - max).exp();
+                    }
+                } else {
+                    acc[out_off] = self.op.fold(acc[out_off], x[in_off]);
+                }
                 if !next_index(in_shape, &mut idx) {
                     break;
                 }
             }
         }
 
-        let out: Vec<f32> = acc.iter().map(|&a| self.op.finish(a)).collect();
+        let out: Vec<f32> = if matches!(self.op, ReduceOp::LogSumExp) {
+            acc.iter()
+                .zip(&logsumexp_max)
+                .map(|(&sum, &max)| max + sum.ln())
+                .collect()
+        } else {
+            acc.iter().map(|&a| self.op.finish(a)).collect()
+        };
         let _ = self.keepdims;
         write_dense_f32(&mut outputs[0], &out)
     }
@@ -292,6 +338,27 @@ mod tests {
         let mut out = Owned::zeros_f32(&[1, 1]);
         run_attr(ReduceOp::L2, Some(vec![1]), &x, &mut out);
         assert_eq!(out.to_f32(), vec![5.0]);
+    }
+
+    #[test]
+    fn l1_and_log_sum() {
+        let x = Owned::f32(&[2, 2], &[-1., 2., -3., 4.]);
+        let mut l1 = Owned::zeros_f32(&[2, 1]);
+        run_attr(ReduceOp::L1, Some(vec![1]), &x, &mut l1);
+        assert_eq!(l1.to_f32(), vec![3., 7.]);
+
+        let positive = Owned::f32(&[2], &[1., 3.]);
+        let mut log_sum = Owned::zeros_f32(&[1]);
+        run_attr(ReduceOp::LogSum, Some(vec![0]), &positive, &mut log_sum);
+        assert!((log_sum.to_f32()[0] - 4_f32.ln()).abs() < 1e-6);
+    }
+
+    #[test]
+    fn log_sum_exp_is_stable_for_large_values() {
+        let x = Owned::f32(&[2], &[1_000., 1_001.]);
+        let mut out = Owned::zeros_f32(&[1]);
+        run_attr(ReduceOp::LogSumExp, Some(vec![0]), &x, &mut out);
+        assert!((out.to_f32()[0] - (1_001.0 + (-1_f32).exp().ln_1p())).abs() < 1e-5);
     }
 
     #[test]

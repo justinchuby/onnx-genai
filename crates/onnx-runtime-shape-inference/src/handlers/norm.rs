@@ -179,7 +179,10 @@ pub fn register(reg: &mut InferenceRegistry) {
         "ReduceMax",
         "ReduceMin",
         "ReduceProd",
+        "ReduceL1",
         "ReduceL2",
+        "ReduceLogSum",
+        "ReduceLogSumExp",
         "ReduceSumSquare",
     ] {
         reg.register("", op, 1, reduce);

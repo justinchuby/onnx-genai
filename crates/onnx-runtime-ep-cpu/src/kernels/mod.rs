@@ -137,7 +137,10 @@ pub const PHASE1_OPS: &[&str] = &[
     "ReduceMin",
     "ReduceProd",
     "ReduceSumSquare",
+    "ReduceL1",
     "ReduceL2",
+    "ReduceLogSum",
+    "ReduceLogSumExp",
     "Softmax",
     "LogSoftmax",
     // Shape / data movement.
@@ -537,8 +540,20 @@ pub fn build_cpu_registry() -> OpRegistry {
         Box::new(reduce_ops::ReduceSumSquareFactory),
     );
     reg.register(
+        OpKey::new("ReduceL1", "", 1),
+        Box::new(reduce_ops::ReduceL1Factory),
+    );
+    reg.register(
         OpKey::new("ReduceL2", "", 1),
         Box::new(reduce_ops::ReduceL2Factory),
+    );
+    reg.register(
+        OpKey::new("ReduceLogSum", "", 1),
+        Box::new(reduce_ops::ReduceLogSumFactory),
+    );
+    reg.register(
+        OpKey::new("ReduceLogSumExp", "", 1),
+        Box::new(reduce_ops::ReduceLogSumExpFactory),
     );
     // Shape / data movement (dtype-agnostic byte movers).
     reg.register(OpKey::new("Concat", "", 1), Box::new(concat::ConcatFactory));
