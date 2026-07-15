@@ -1,14 +1,14 @@
-//! `Gather`: index f32 `data` along `axis` with an integer `indices` tensor
+//! `Gather`: index fixed-width `data` along `axis` with an integer `indices` tensor
 //! (`docs/ORT2.md` §4.4). Output shape is
 //! `data.shape[:axis] ++ indices.shape ++ data.shape[axis+1:]`.
 
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ir::Node;
 
-use super::{check_arity, to_dense_f32, to_dense_i64, write_dense_f32};
+use super::{check_arity, elem_size, to_dense_bytes, to_dense_i64, write_dense_bytes};
 use crate::strided::numel;
 
-/// f32 Gather kernel carrying the resolved `axis`.
+/// Dtype-agnostic Gather kernel carrying the resolved `axis`.
 pub struct GatherKernel {
     /// Raw axis attribute (may be negative); normalized against data rank at run.
     axis: i64,
@@ -27,7 +27,15 @@ impl KernelFactory for GatherFactory {
 impl Kernel for GatherKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         check_arity("Gather", inputs, outputs, 2, 2, 1)?;
-        let data = to_dense_f32(&inputs[0])?;
+        let data = &inputs[0];
+        if outputs[0].dtype != data.dtype {
+            return Err(EpError::KernelFailed(format!(
+                "Gather: output dtype {:?} must match data dtype {:?}",
+                outputs[0].dtype, data.dtype
+            )));
+        }
+        let esize = elem_size(data.dtype)?;
+        let data = to_dense_bytes(data)?;
         let indices = to_dense_i64(&inputs[1])?;
         let data_shape = inputs[0].shape;
         let idx_shape = inputs[1].shape;
@@ -57,7 +65,7 @@ impl Kernel for GatherKernel {
         let inner: usize = data_shape[axis + 1..].iter().product();
         let num_idx = numel(idx_shape);
 
-        let mut out = vec![0.0f32; outer * num_idx * inner];
+        let mut out = vec![0u8; outer * num_idx * inner * esize];
         let mut w = 0usize;
         for o in 0..outer {
             for &raw in &indices {
@@ -68,11 +76,13 @@ impl Kernel for GatherKernel {
                     )));
                 }
                 let base = (o * axis_dim + idx as usize) * inner;
-                out[w..w + inner].copy_from_slice(&data[base..base + inner]);
-                w += inner;
+                let len = inner * esize;
+                let base = base * esize;
+                out[w..w + len].copy_from_slice(&data[base..base + len]);
+                w += len;
             }
         }
-        write_dense_f32(&mut outputs[0], &out)
+        write_dense_bytes(&mut outputs[0], &out)
     }
 
     fn supports_strided_input(&self, _input_idx: usize) -> bool {
@@ -84,9 +94,38 @@ impl Kernel for GatherKernel {
 mod tests {
     use super::*;
     use crate::kernels::testutil::Owned;
+    use crate::CpuExecutionProvider;
+    use onnx_runtime_ep_api::ExecutionProvider;
+    use onnx_runtime_ir::{static_shape, Attribute, DataType, Graph, Node, NodeId};
+    use onnx_runtime_loader::Model;
 
     fn run(axis: i64, data: &Owned, idx: &Owned, out: &mut Owned) {
-        GatherKernel { axis }
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 13);
+        let data_value =
+            graph.create_named_value("data", data.dtype, static_shape(data.shape.iter().copied()));
+        let indices_value = graph.create_named_value(
+            "indices",
+            idx.dtype,
+            static_shape(idx.shape.iter().copied()),
+        );
+        let output =
+            graph.create_named_value("output", out.dtype, static_shape(out.shape.iter().copied()));
+        graph.add_input(data_value);
+        graph.add_input(indices_value);
+        let mut node = Node::new(
+            NodeId(0),
+            "Gather",
+            vec![Some(data_value), Some(indices_value)],
+            vec![output],
+        );
+        node.attributes.insert("axis".into(), Attribute::Int(axis));
+        let node = graph.insert_node(node);
+        graph.add_output(output);
+        let model = Model::new(&graph);
+        CpuExecutionProvider::new()
+            .get_kernel(model.graph.node(node), &[], 13)
+            .unwrap()
             .execute(&[data.view(), idx.view()], &mut [out.view_mut()])
             .unwrap();
     }
@@ -129,5 +168,33 @@ mod tests {
         let mut out = Owned::zeros_f32(&[1, 3, 2]);
         run(0, &data, &idx, &mut out);
         assert_eq!(out.to_f32(), vec![0., 1., 4., 5., 6., 7.]);
+    }
+
+    #[test]
+    fn gather_int64_shape_dimension_with_int32_indices() {
+        let data = Owned::i64(&[4], &[8, 16, 32, 64]);
+        let idx = Owned::i32(&[1], &[2]);
+        let mut out = Owned::zeros(DataType::Int64, &[1]);
+        run(0, &data, &idx, &mut out);
+        assert_eq!(out.to_i64(), vec![32]);
+    }
+
+    #[test]
+    fn gather_int64_multidim_indices_negative_axis() {
+        // data [2,3], indices [2,2], axis -1 -> [2,2,2].
+        let data = Owned::i64(&[2, 3], &[10, 20, 30, 40, 50, 60]);
+        let idx = Owned::i64(&[2, 2], &[2, 0, 1, 2]);
+        let mut out = Owned::zeros(DataType::Int64, &[2, 2, 2]);
+        run(-1, &data, &idx, &mut out);
+        assert_eq!(out.to_i64(), vec![30, 10, 20, 30, 60, 40, 50, 60]);
+    }
+
+    #[test]
+    fn gather_int64_negative_index_wraps() {
+        let data = Owned::i64(&[3], &[11, 22, 33]);
+        let idx = Owned::i64(&[1], &[-1]);
+        let mut out = Owned::zeros(DataType::Int64, &[1]);
+        run(0, &data, &idx, &mut out);
+        assert_eq!(out.to_i64(), vec![33]);
     }
 }
