@@ -1,9 +1,12 @@
-//! Indexed byte-copy kernels: `GatherElements` and `GatherND`.
+//! Indexed data kernels: `GatherElements`, `GatherND`, `ScatterElements`, and
+//! `OneHot`.
 
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
-use onnx_runtime_ir::Node;
+use onnx_runtime_ir::{Attribute, DataType, Node};
 
 use super::{check_arity, elem_size, to_dense_bytes, to_dense_i64, write_dense_bytes};
+use crate::dispatch_arith;
+use crate::dtype::{ComputeDomain, NumericElem, to_dense, write_dense};
 use crate::strided::numel;
 
 pub struct GatherElementsKernel {
@@ -176,6 +179,226 @@ fn contiguous(shape: &[usize]) -> Vec<usize> {
     result
 }
 
+#[derive(Clone, Copy)]
+enum ScatterReduction {
+    None,
+    Add,
+    Mul,
+    Max,
+    Min,
+}
+
+pub struct ScatterElementsKernel {
+    axis: i64,
+    reduction: ScatterReduction,
+}
+pub struct ScatterElementsFactory;
+impl KernelFactory for ScatterElementsFactory {
+    fn create(&self, node: &Node, _: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
+        let reduction = match node.attr("reduction").and_then(Attribute::as_str) {
+            None | Some("none") => ScatterReduction::None,
+            Some("add") => ScatterReduction::Add,
+            Some("mul") => ScatterReduction::Mul,
+            Some("max") => ScatterReduction::Max,
+            Some("min") => ScatterReduction::Min,
+            Some(value) => {
+                return Err(EpError::KernelFailed(format!(
+                    "ScatterElements: unsupported reduction {value:?}"
+                )));
+            }
+        };
+        Ok(Box::new(ScatterElementsKernel {
+            axis: node.attr("axis").and_then(Attribute::as_int).unwrap_or(0),
+            reduction,
+        }))
+    }
+}
+impl Kernel for ScatterElementsKernel {
+    fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+        check_arity("ScatterElements", inputs, outputs, 3, 3, 1)?;
+        dispatch_arith!(inputs[0].dtype, "ScatterElements", T => {
+            scatter_elements_typed::<T>(self, inputs, outputs)
+        })
+    }
+
+    fn supports_strided_input(&self, _: usize) -> bool {
+        true
+    }
+}
+
+fn scatter_elements_typed<T: NumericElem>(
+    kernel: &ScatterElementsKernel,
+    inputs: &[TensorView],
+    outputs: &mut [TensorMut],
+) -> Result<()>
+where
+    T::Acc: PartialOrd,
+{
+    let data = &inputs[0];
+    let indices = &inputs[1];
+    let updates = &inputs[2];
+    if indices.dtype != DataType::Int64 {
+        return Err(EpError::KernelFailed(
+            "ScatterElements: indices must be Int64".into(),
+        ));
+    }
+    if updates.dtype != T::DTYPE || outputs[0].dtype != T::DTYPE {
+        return Err(EpError::KernelFailed(
+            "ScatterElements: data, updates, and output must share a dtype".into(),
+        ));
+    }
+    if indices.shape != updates.shape || indices.shape.len() != data.shape.len() {
+        return Err(EpError::KernelFailed(
+            "ScatterElements: indices and updates must have equal rank and shape".into(),
+        ));
+    }
+    if outputs[0].shape != data.shape {
+        return Err(EpError::KernelFailed(
+            "ScatterElements: output shape must match data".into(),
+        ));
+    }
+    let rank = data.shape.len();
+    let axis = normalize_axis("ScatterElements", kernel.axis, rank)?;
+    for d in 0..rank {
+        if d != axis && indices.shape[d] > data.shape[d] {
+            return Err(EpError::KernelFailed(format!(
+                "ScatterElements: indices dimension {} exceeds data dimension {} at axis {d}",
+                indices.shape[d], data.shape[d]
+            )));
+        }
+    }
+
+    let mut out = to_dense::<T>(data)?;
+    let indices = to_dense_i64(indices)?;
+    let updates = to_dense::<T>(updates)?;
+    let index_strides = contiguous(inputs[1].shape);
+    let data_strides = contiguous(data.shape);
+    for (linear, update) in updates.into_iter().enumerate() {
+        let mut rem = linear;
+        let mut data_offset = 0;
+        for d in 0..rank {
+            let coordinate = rem / index_strides[d];
+            rem %= index_strides[d];
+            let coordinate = if d == axis {
+                let raw = indices[linear];
+                let adjusted = if raw < 0 {
+                    raw + data.shape[d] as i64
+                } else {
+                    raw
+                };
+                if adjusted < 0 || adjusted as usize >= data.shape[d] {
+                    return Err(EpError::KernelFailed(format!(
+                        "ScatterElements: index {raw} out of range at axis {d}"
+                    )));
+                }
+                adjusted as usize
+            } else {
+                coordinate
+            };
+            data_offset += coordinate * data_strides[d];
+        }
+        out[data_offset] = match kernel.reduction {
+            ScatterReduction::None => update,
+            ScatterReduction::Add => T::from_acc(out[data_offset].to_acc().c_add(update.to_acc())),
+            ScatterReduction::Mul => T::from_acc(out[data_offset].to_acc().c_mul(update.to_acc())),
+            ScatterReduction::Max => T::from_acc(out[data_offset].to_acc().c_max(update.to_acc())),
+            ScatterReduction::Min => T::from_acc(out[data_offset].to_acc().c_min(update.to_acc())),
+        };
+    }
+    write_dense::<T>(&mut outputs[0], &out)
+}
+
+pub struct OneHotKernel {
+    axis: i64,
+}
+pub struct OneHotFactory;
+impl KernelFactory for OneHotFactory {
+    fn create(&self, node: &Node, _: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
+        Ok(Box::new(OneHotKernel {
+            axis: node.attr("axis").and_then(Attribute::as_int).unwrap_or(-1),
+        }))
+    }
+}
+impl Kernel for OneHotKernel {
+    fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+        check_arity("OneHot", inputs, outputs, 3, 3, 1)?;
+        let indices = &inputs[0];
+        if indices.dtype != DataType::Int64 || inputs[1].dtype != DataType::Int64 {
+            return Err(EpError::KernelFailed(
+                "OneHot: indices and depth must be Int64".into(),
+            ));
+        }
+        let depth = to_dense_i64(&inputs[1])?;
+        if depth.len() != 1 || depth[0] < 0 {
+            return Err(EpError::KernelFailed(
+                "OneHot: depth must be a non-negative scalar".into(),
+            ));
+        }
+        let depth = usize::try_from(depth[0]).map_err(|_| {
+            EpError::KernelFailed("OneHot: depth exceeds addressable memory".into())
+        })?;
+        let values = &inputs[2];
+        if values.shape != [2] || outputs[0].dtype != values.dtype {
+            return Err(EpError::KernelFailed(
+                "OneHot: values must have shape [2] and output must match its dtype".into(),
+            ));
+        }
+        let output_rank = indices.shape.len() + 1;
+        let axis = if self.axis < 0 {
+            self.axis + output_rank as i64
+        } else {
+            self.axis
+        };
+        if axis < 0 || axis as usize >= output_rank {
+            return Err(EpError::KernelFailed("OneHot: axis out of range".into()));
+        }
+        let axis = axis as usize;
+        let mut expected_shape = indices.shape.to_vec();
+        expected_shape.insert(axis, depth);
+        if outputs[0].shape != expected_shape {
+            return Err(EpError::KernelFailed(
+                "OneHot: output shape does not match indices, depth, and axis".into(),
+            ));
+        }
+        let element_size = elem_size(values.dtype)?;
+        let values = to_dense_bytes(values)?;
+        let indices = to_dense_i64(indices)?;
+        let off_value = &values[..element_size];
+        let on_value = &values[element_size..];
+        let mut out = vec![0; numel(&expected_shape) * element_size];
+        for chunk in out.chunks_exact_mut(element_size) {
+            chunk.copy_from_slice(off_value);
+        }
+        let output_strides = contiguous(&expected_shape);
+        let index_strides = contiguous(inputs[0].shape);
+        for (index_linear, index) in indices.into_iter().enumerate() {
+            if index < 0 || index as usize >= depth {
+                continue;
+            }
+            let mut rem = index_linear;
+            let mut output_linear = 0;
+            for d in 0..output_rank {
+                if d == axis {
+                    output_linear += index as usize * output_strides[d];
+                } else {
+                    let index_dimension = if d < axis { d } else { d - 1 };
+                    let stride = index_strides[index_dimension];
+                    let coordinate = rem / stride;
+                    rem %= stride;
+                    output_linear += coordinate * output_strides[d];
+                }
+            }
+            out[output_linear * element_size..(output_linear + 1) * element_size]
+                .copy_from_slice(on_value);
+        }
+        write_dense_bytes(&mut outputs[0], &out)
+    }
+
+    fn supports_strided_input(&self, _: usize) -> bool {
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -209,5 +432,71 @@ mod tests {
             .execute(&[x.view(), i.view()], &mut [out.view_mut()])
             .unwrap();
         assert_eq!(out.to_f32(), vec![2., 3., 0., 1., 4., 5., 6., 7.]);
+    }
+
+    #[test]
+    fn scatter_elements_negative_axis_and_add_reduction() {
+        let data = Owned::f32(&[2, 3], &[1., 2., 3., 4., 5., 6.]);
+        let indices = Owned::i64(&[2, 2], &[2, 0, -1, 1]);
+        let updates = Owned::f32(&[2, 2], &[10., 20., 30., 40.]);
+        let mut out = Owned::zeros_f32(&[2, 3]);
+        ScatterElementsKernel {
+            axis: -1,
+            reduction: ScatterReduction::Add,
+        }
+        .execute(
+            &[data.view(), indices.view(), updates.view()],
+            &mut [out.view_mut()],
+        )
+        .unwrap();
+        assert_eq!(out.to_f32(), vec![21., 2., 13., 4., 45., 36.]);
+    }
+
+    #[test]
+    fn scatter_elements_overwrites_duplicate_indices() {
+        let data = Owned::i32(&[3], &[1, 2, 3]);
+        let indices = Owned::i64(&[3], &[1, 1, 0]);
+        let updates = Owned::i32(&[3], &[7, 8, 9]);
+        let mut out = Owned::zeros(DataType::Int32, &[3]);
+        ScatterElementsKernel {
+            axis: 0,
+            reduction: ScatterReduction::None,
+        }
+        .execute(
+            &[data.view(), indices.view(), updates.view()],
+            &mut [out.view_mut()],
+        )
+        .unwrap();
+        assert_eq!(out.to_i32(), vec![9, 8, 3]);
+    }
+
+    #[test]
+    fn one_hot_negative_index_is_all_off_and_negative_axis() {
+        let indices = Owned::i64(&[2], &[0, -1]);
+        let depth = Owned::i64(&[], &[3]);
+        let values = Owned::i32(&[2], &[2, 5]);
+        let mut out = Owned::zeros(DataType::Int32, &[2, 3]);
+        OneHotKernel { axis: -1 }
+            .execute(
+                &[indices.view(), depth.view(), values.view()],
+                &mut [out.view_mut()],
+            )
+            .unwrap();
+        assert_eq!(out.to_i32(), vec![5, 2, 2, 2, 2, 2]);
+    }
+
+    #[test]
+    fn one_hot_inserts_axis_before_indices_dimensions() {
+        let indices = Owned::i64(&[2, 2], &[0, 1, 1, 0]);
+        let depth = Owned::i64(&[], &[2]);
+        let values = Owned::f32(&[2], &[0., 1.]);
+        let mut out = Owned::zeros_f32(&[2, 2, 2]);
+        OneHotKernel { axis: 1 }
+            .execute(
+                &[indices.view(), depth.view(), values.view()],
+                &mut [out.view_mut()],
+            )
+            .unwrap();
+        assert_eq!(out.to_f32(), vec![1., 0., 0., 1., 0., 1., 1., 0.]);
     }
 }

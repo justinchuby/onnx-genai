@@ -158,8 +158,11 @@ pub const PHASE1_OPS: &[&str] = &[
     "Pad",
     "ConstantOfShape",
     "Size",
+    "Trilu",
     "GatherElements",
     "GatherND",
+    "ScatterElements",
+    "OneHot",
     "Tile",
     "Range",
     "CumSum",
@@ -574,6 +577,10 @@ pub fn build_cpu_registry() -> OpRegistry {
         OpKey::new("Size", "", 1),
         Box::new(movement_ops::SizeFactory),
     );
+    reg.register(
+        OpKey::new("Trilu", "", 14),
+        Box::new(movement_ops::TriluFactory),
+    );
     // Indexed data movement and sequence construction.
     reg.register(
         OpKey::new("GatherElements", "", 11),
@@ -582,6 +589,19 @@ pub fn build_cpu_registry() -> OpRegistry {
     reg.register(
         OpKey::new("GatherND", "", 11),
         Box::new(indexing::GatherNDFactory),
+    );
+    // ScatterElements gained its reduction attribute at opset 16.
+    reg.register(
+        OpKey::new("ScatterElements", "", 11),
+        Box::new(indexing::ScatterElementsFactory),
+    );
+    reg.register(
+        OpKey::new("ScatterElements", "", 16),
+        Box::new(indexing::ScatterElementsFactory),
+    );
+    reg.register(
+        OpKey::new("OneHot", "", 9),
+        Box::new(indexing::OneHotFactory),
     );
     reg.register(OpKey::new("Tile", "", 6), Box::new(sequence::TileFactory));
     reg.register(
@@ -1133,8 +1153,9 @@ mod tests {
         // entries, while DynamicQuantizeLinear adds one (twenty-eight over the
         // op-name count). Pooling adds twelve more versioned entries: five each
         // for AveragePool and MaxPool, plus the two global pool operators, for
-        // forty over the op-name count.
-        assert_eq!(reg.len(), PHASE1_OPS.len() + 40);
+        // forty over the op-name count. ScatterElements also has distinct
+        // opset-11 and opset-16 registrations, for forty-one in total.
+        assert_eq!(reg.len(), PHASE1_OPS.len() + 41);
         for op in PHASE1_OPS {
             assert!(reg.lookup(op, "", 21).is_some(), "missing factory for {op}");
         }

@@ -1,4 +1,4 @@
-//! Pure metadata data-movement ops: `Flatten`, `Squeeze`, `Size`
+//! Pure metadata data-movement ops: `Flatten`, `Squeeze`, `Size`, and `Trilu`
 //! (`docs/ORT2.md` §4.4).
 //!
 //! `Flatten` and `Squeeze` only change a tensor's *shape*, never its row-major
@@ -12,7 +12,7 @@
 //! reads only shape metadata and is dtype-agnostic on its input.
 
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
-use onnx_runtime_ir::{DataType, Node};
+use onnx_runtime_ir::{Attribute, DataType, Node};
 
 use super::{check_arity, to_dense_bytes, write_dense_bytes};
 use crate::strided::numel;
@@ -99,6 +99,67 @@ impl Kernel for SizeKernel {
     }
 }
 
+/// Triangular matrix masking over the final two dimensions.
+pub struct TriluKernel {
+    upper: bool,
+    k: i64,
+}
+
+pub struct TriluFactory;
+
+impl KernelFactory for TriluFactory {
+    fn create(&self, node: &Node, _shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
+        Ok(Box::new(TriluKernel {
+            upper: node.attr("upper").and_then(Attribute::as_int).unwrap_or(1) != 0,
+            k: node.attr("k").and_then(Attribute::as_int).unwrap_or(0),
+        }))
+    }
+}
+
+impl Kernel for TriluKernel {
+    fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+        check_arity("Trilu", inputs, outputs, 1, 1, 1)?;
+        let input = &inputs[0];
+        if input.shape.len() < 2 {
+            return Err(EpError::KernelFailed(
+                "Trilu: input must have rank of at least 2".into(),
+            ));
+        }
+        if outputs[0].dtype != input.dtype || outputs[0].shape != input.shape {
+            return Err(EpError::KernelFailed(
+                "Trilu: output must have the input's dtype and shape".into(),
+            ));
+        }
+        let element_size = super::elem_size(input.dtype)?;
+        let rows = input.shape[input.shape.len() - 2];
+        let cols = input.shape[input.shape.len() - 1];
+        let matrices = numel(&input.shape[..input.shape.len() - 2]);
+        let src = to_dense_bytes(input)?;
+        let mut out = vec![0; src.len()];
+        for matrix in 0..matrices {
+            for row in 0..rows {
+                for col in 0..cols {
+                    let keep = if self.upper {
+                        (col as i64 - row as i64) >= self.k
+                    } else {
+                        (col as i64 - row as i64) <= self.k
+                    };
+                    if keep {
+                        let offset = (matrix * rows * cols + row * cols + col) * element_size;
+                        out[offset..offset + element_size]
+                            .copy_from_slice(&src[offset..offset + element_size]);
+                    }
+                }
+            }
+        }
+        write_dense_bytes(&mut outputs[0], &out)
+    }
+
+    fn supports_strided_input(&self, _input_idx: usize) -> bool {
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -154,5 +215,25 @@ mod tests {
             .execute(&[a.view()], &mut [out.view_mut()])
             .unwrap();
         assert_eq!(out.to_i64(), vec![1]);
+    }
+
+    #[test]
+    fn trilu_upper_with_positive_diagonal() {
+        let input = Owned::f32(&[2, 3], &[1., 2., 3., 4., 5., 6.]);
+        let mut out = Owned::zeros_f32(&[2, 3]);
+        TriluKernel { upper: true, k: 1 }
+            .execute(&[input.view()], &mut [out.view_mut()])
+            .unwrap();
+        assert_eq!(out.to_f32(), vec![0., 2., 3., 0., 0., 6.]);
+    }
+
+    #[test]
+    fn trilu_lower_applies_to_each_batched_matrix() {
+        let input = Owned::i64(&[2, 2, 2], &[1, 2, 3, 4, 5, 6, 7, 8]);
+        let mut out = Owned::zeros(DataType::Int64, &[2, 2, 2]);
+        TriluKernel { upper: false, k: 0 }
+            .execute(&[input.view()], &mut [out.view_mut()])
+            .unwrap();
+        assert_eq!(out.to_i64(), vec![1, 0, 3, 4, 5, 0, 7, 8]);
     }
 }
