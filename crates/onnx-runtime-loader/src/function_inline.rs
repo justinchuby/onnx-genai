@@ -19,9 +19,11 @@
 //!
 //! 1. **Value remapping.** Formal `input[i]`/`output[j]` names are mapped to the
 //!    call's actual argument names (positionally). Every *other* value name in
-//!    the body (an intermediate result) is renamed to a fresh, per-instantiation
-//!    unique name (`__fn{K}_{orig}`) so repeated instantiations never collide.
-//!    The empty name `""` (ONNX "absent optional") is never remapped.
+//!    the body (an intermediate result) is renamed to a globally-fresh unique
+//!    name (`__fn{K}_{orig}`, bumped until unused) so instantiations never
+//!    collide with each other or with pre-existing model names. The empty name
+//!    `""` (ONNX "absent optional") is never remapped. A pass-through output
+//!    whose formal name aliases an input is wired via a boundary `Identity`.
 //!
 //! 2. **Attribute binding.** A body-node attribute with a non-empty
 //!    `ref_attr_name = A` is a reference to the function's formal attribute `A`.
@@ -37,7 +39,9 @@
 //! 4. **Control-flow subgraphs.** Function calls may appear inside If/Loop/Scan
 //!    subgraph bodies, and function bodies may themselves contain control flow;
 //!    both are handled by recursing into every node's `Graph`/`Graphs`
-//!    attributes.
+//!    attributes. Attribute binding and value remapping are scope-aware: nested
+//!    `ref_attr_name` references are bound at every depth, and a subgraph's own
+//!    locals (inputs, initializers, node outputs) shadow outer captures.
 //!
 //! ## Opset policy
 //!
@@ -53,7 +57,7 @@
 //! overload set is disambiguated by the node's `overload` field.
 
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::proto::onnx::{
     AttributeProto, FunctionProto, GraphProto, ModelProto, NodeProto, OperatorSetIdProto,
@@ -95,7 +99,12 @@ pub fn inline_functions(model: &ModelProto) -> Result<Cow<'_, ModelProto>, Loade
 
     let mut counter: usize = 0;
     let mut stack: Vec<FnKey> = Vec::new();
-    let new_graph = inline_graph(graph, &funcs, &mut counter, &mut stack)?;
+    // Every value name already in use model-wide, so generated internal names
+    // can be allocated to be globally fresh (BUG 4). Updated as inlining adds
+    // new node outputs.
+    let mut used: HashSet<String> = HashSet::new();
+    collect_used_names(graph, &mut used);
+    let new_graph = inline_graph(graph, &funcs, &mut counter, &mut stack, &mut used)?;
 
     let mut out = model.clone();
     out.graph = Some(new_graph);
@@ -149,11 +158,12 @@ fn inline_graph(
     funcs: &HashMap<FnKey, &FunctionProto>,
     counter: &mut usize,
     stack: &mut Vec<FnKey>,
+    used: &mut HashSet<String>,
 ) -> Result<GraphProto, LoaderError> {
     let mut out = gp.clone();
     out.node = Vec::with_capacity(gp.node.len());
     for node in &gp.node {
-        expand_node(node, funcs, counter, stack, &mut out.node)?;
+        expand_node(node, funcs, counter, stack, used, &mut out.node)?;
     }
     Ok(out)
 }
@@ -166,12 +176,13 @@ fn expand_node(
     funcs: &HashMap<FnKey, &FunctionProto>,
     counter: &mut usize,
     stack: &mut Vec<FnKey>,
+    used: &mut HashSet<String>,
     sink: &mut Vec<NodeProto>,
 ) -> Result<(), LoaderError> {
     if let Some(func) = funcs.get(&fn_key_of_call(node)) {
-        instantiate(node, func, funcs, counter, stack, sink)?;
+        instantiate(node, func, funcs, counter, stack, used, sink)?;
     } else {
-        sink.push(inline_subgraph_attrs(node, funcs, counter, stack)?);
+        sink.push(inline_subgraph_attrs(node, funcs, counter, stack, used)?);
     }
     Ok(())
 }
@@ -183,14 +194,15 @@ fn inline_subgraph_attrs(
     funcs: &HashMap<FnKey, &FunctionProto>,
     counter: &mut usize,
     stack: &mut Vec<FnKey>,
+    used: &mut HashSet<String>,
 ) -> Result<NodeProto, LoaderError> {
     let mut out = node.clone();
     for attr in &mut out.attribute {
         if let Some(g) = attr.g.as_mut() {
-            *g = inline_graph(g, funcs, counter, stack)?;
+            *g = inline_graph(g, funcs, counter, stack, used)?;
         }
         for g in &mut attr.graphs {
-            *g = inline_graph(g, funcs, counter, stack)?;
+            *g = inline_graph(g, funcs, counter, stack, used)?;
         }
     }
     Ok(out)
@@ -205,6 +217,7 @@ fn instantiate(
     funcs: &HashMap<FnKey, &FunctionProto>,
     counter: &mut usize,
     stack: &mut Vec<FnKey>,
+    used: &mut HashSet<String>,
     sink: &mut Vec<NodeProto>,
 ) -> Result<(), LoaderError> {
     let key = fn_key_of_function(func);
@@ -242,8 +255,23 @@ fn instantiate(
     let inst_id = *counter;
     *counter += 1;
 
-    // 1. Value remapping: formals -> actuals, everything else -> fresh.
+    // The set of formal names actually produced by a body node. A formal output
+    // that is *not* produced is a pass-through of an input (or otherwise-defined
+    // value) and needs a boundary alias rather than a rename (BUG 3).
+    let produced: HashSet<&str> = func
+        .node
+        .iter()
+        .flat_map(|n| n.output.iter())
+        .filter(|o| !o.is_empty())
+        .map(String::as_str)
+        .collect();
+
+    // 1. Value remapping: formals -> actuals, everything else -> globally fresh.
     let mut rename: HashMap<String, String> = HashMap::new();
+    // Boundary `Identity` aliases (src_actual -> dst_actual) for pass-through
+    // outputs whose name aliases an input/other output (BUG 3).
+    let mut aliases: Vec<(String, String)> = Vec::new();
+
     for (i, formal) in func.input.iter().enumerate() {
         if formal.is_empty() {
             continue;
@@ -256,15 +284,29 @@ fn instantiate(
             continue;
         }
         let actual = call.output.get(j).cloned().unwrap_or_default();
-        rename.insert(formal.clone(), actual);
+        if produced.contains(formal.as_str()) {
+            // Genuinely produced by the body: consumers read the output actual.
+            rename.insert(formal.clone(), actual);
+        } else if let Some(src) = rename.get(formal) {
+            // Pass-through: the formal is already bound (e.g. it is also an
+            // input, or an earlier output). Keep body references reading the
+            // source, and emit a boundary alias to the output actual.
+            if !actual.is_empty() && src != &actual {
+                aliases.push((src.clone(), actual));
+            }
+        } else {
+            // Output not produced and not otherwise bound: map it directly.
+            rename.insert(formal.clone(), actual);
+        }
     }
-    // Fresh names for internal (non-formal) value names appearing in the body.
+    // Fresh, globally-unique names for internal (non-formal) body value names.
     for bn in &func.node {
         for name in bn.input.iter().chain(bn.output.iter()) {
             if name.is_empty() || rename.contains_key(name) {
                 continue;
             }
-            rename.insert(name.clone(), format!("__fn{inst_id}_{name}"));
+            let fresh = fresh_name(name, inst_id, used);
+            rename.insert(name.clone(), fresh);
         }
     }
 
@@ -283,32 +325,68 @@ fn instantiate(
                 format!("__fn{inst_id}_{}", bn.name)
             };
 
-            // Bind attributes (resolve ref_attr_name against the call site).
-            let mut bound: Vec<AttributeProto> = Vec::with_capacity(nn.attribute.len());
-            for attr in &nn.attribute {
-                if let Some(resolved) = bind_attribute(attr, call, func, &key)? {
-                    bound.push(resolved);
-                }
-            }
-            nn.attribute = bound;
+            // Bind attributes (resolve ref_attr_name against the call site) at
+            // every depth, including nodes inside control-flow subgraphs (BUG 1).
+            bind_node_attributes(&mut nn, call, func, &key)?;
 
             // Rename value references (inputs/outputs + captured names inside
-            // any control-flow subgraph attributes).
+            // any control-flow subgraph attributes, scope-aware).
             rename_value_refs(&mut nn, &rename);
 
             instantiated.push(nn);
         }
 
+        // Boundary `Identity` aliases for pass-through outputs (BUG 3). Appended
+        // last so their source values are already produced.
+        for (k, (src, dst)) in aliases.iter().enumerate() {
+            instantiated.push(NodeProto {
+                op_type: "Identity".to_string(),
+                input: vec![src.clone()],
+                output: vec![dst.clone()],
+                name: format!("__fn{inst_id}_alias{k}"),
+                ..Default::default()
+            });
+        }
+
         // 3. Recursively inline any function calls the body itself makes.
         let mut expanded: Vec<NodeProto> = Vec::new();
         for n in &instantiated {
-            expand_node(n, funcs, counter, stack, &mut expanded)?;
+            expand_node(n, funcs, counter, stack, used, &mut expanded)?;
         }
         Ok::<Vec<NodeProto>, LoaderError>(expanded)
     })();
     stack.pop();
 
     sink.extend(result?);
+    Ok(())
+}
+
+/// Bind a body node's attributes for a specific instantiation, recursing into
+/// any control-flow subgraph so that `ref_attr_name` references carried by
+/// nested nodes are resolved against the same call site (BUG 1).
+fn bind_node_attributes(
+    node: &mut NodeProto,
+    call: &NodeProto,
+    func: &FunctionProto,
+    key: &FnKey,
+) -> Result<(), LoaderError> {
+    let mut bound: Vec<AttributeProto> = Vec::with_capacity(node.attribute.len());
+    for attr in &node.attribute {
+        if let Some(mut resolved) = bind_attribute(attr, call, func, key)? {
+            if let Some(g) = resolved.g.as_mut() {
+                for sub in &mut g.node {
+                    bind_node_attributes(sub, call, func, key)?;
+                }
+            }
+            for g in &mut resolved.graphs {
+                for sub in &mut g.node {
+                    bind_node_attributes(sub, call, func, key)?;
+                }
+            }
+            bound.push(resolved);
+        }
+    }
+    node.attribute = bound;
     Ok(())
 }
 
@@ -361,6 +439,10 @@ fn bind_attribute(
 /// value names captured inside its control-flow subgraph attributes. A name of
 /// `""` (absent optional) is left untouched; a name absent from `rename` is left
 /// as-is (subgraph-local names live in their own scope).
+///
+/// The node's own inputs/outputs live in the function-body scope, so they are
+/// remapped directly. Subgraph attributes are remapped scope-aware
+/// ([`rename_subgraph_refs`]).
 fn rename_value_refs(node: &mut NodeProto, rename: &HashMap<String, String>) {
     for name in node.input.iter_mut().chain(node.output.iter_mut()) {
         if let Some(new) = rename.get(name.as_str()) {
@@ -377,13 +459,121 @@ fn rename_value_refs(node: &mut NodeProto, rename: &HashMap<String, String>) {
     }
 }
 
-/// Rename outer-scope value captures inside a subgraph. Only names present in
-/// `rename` are rewritten, so a subgraph referencing a function-body value is
-/// wired correctly while the subgraph's own local values are left alone.
+/// Scope-aware renaming of outer-scope value captures inside a subgraph (BUG 2).
+///
+/// ONNX subgraphs have their own lexical scope. A subgraph's graph inputs,
+/// initializers, and node outputs are *locals* that shadow any outer name, so
+/// they must not be remapped. Only genuine captures of the enclosing scope —
+/// node inputs, and `GraphProto.output` entries that directly name a captured
+/// value — are rewritten to the outer actual. Shadowing is restored on descent
+/// into deeper subgraphs by recomputing the local set at each level.
 fn rename_subgraph_refs(gp: &mut GraphProto, rename: &HashMap<String, String>) {
-    for n in &mut gp.node {
-        rename_value_refs(n, rename);
+    // Names locally bound in this subgraph shadow the outer scope.
+    let mut locals: HashSet<&str> = HashSet::new();
+    for i in &gp.input {
+        if !i.name.is_empty() {
+            locals.insert(i.name.as_str());
+        }
     }
+    for init in &gp.initializer {
+        if !init.name.is_empty() {
+            locals.insert(init.name.as_str());
+        }
+    }
+    for n in &gp.node {
+        for o in &n.output {
+            if !o.is_empty() {
+                locals.insert(o.as_str());
+            }
+        }
+    }
+
+    // Effective remap for this scope: outer captures minus anything shadowed.
+    let effective: HashMap<String, String> = rename
+        .iter()
+        .filter(|(k, _)| !locals.contains(k.as_str()))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+
+    for n in &mut gp.node {
+        for name in n.input.iter_mut().chain(n.output.iter_mut()) {
+            if let Some(new) = effective.get(name.as_str()) {
+                *name = new.clone();
+            }
+        }
+        // Recurse into deeper subgraphs with this scope's effective map so a
+        // name shadowed here stays shadowed, and is restored on the way out.
+        for attr in &mut n.attribute {
+            if let Some(g) = attr.g.as_mut() {
+                rename_subgraph_refs(g, &effective);
+            }
+            for g in &mut attr.graphs {
+                rename_subgraph_refs(g, &effective);
+            }
+        }
+    }
+
+    // A subgraph output that directly names a captured value must follow it.
+    for o in &mut gp.output {
+        if let Some(new) = effective.get(o.name.as_str()) {
+            o.name = new.clone();
+        }
+    }
+}
+
+/// Collect every value name in use within `gp` (and its nested subgraphs):
+/// graph inputs/outputs, initializers, value_info, and all node inputs/outputs.
+/// Used to allocate globally-fresh generated names (BUG 4).
+fn collect_used_names(gp: &GraphProto, used: &mut HashSet<String>) {
+    for i in &gp.input {
+        if !i.name.is_empty() {
+            used.insert(i.name.clone());
+        }
+    }
+    for o in &gp.output {
+        if !o.name.is_empty() {
+            used.insert(o.name.clone());
+        }
+    }
+    for init in &gp.initializer {
+        if !init.name.is_empty() {
+            used.insert(init.name.clone());
+        }
+    }
+    for vi in &gp.value_info {
+        if !vi.name.is_empty() {
+            used.insert(vi.name.clone());
+        }
+    }
+    for n in &gp.node {
+        for name in n.input.iter().chain(n.output.iter()) {
+            if !name.is_empty() {
+                used.insert(name.clone());
+            }
+        }
+        for attr in &n.attribute {
+            if let Some(g) = &attr.g {
+                collect_used_names(g, used);
+            }
+            for g in &attr.graphs {
+                collect_used_names(g, used);
+            }
+        }
+    }
+}
+
+/// Allocate a generated name for internal body value `base`, guaranteed unique
+/// against every name already in use `used` (BUG 4). The chosen name is added to
+/// `used` so subsequent allocations remain distinct.
+fn fresh_name(base: &str, inst_id: usize, used: &mut HashSet<String>) -> String {
+    let mut candidate = format!("__fn{inst_id}_{base}");
+    let mut suffix = 0usize;
+    while used.contains(&candidate) {
+        suffix += 1;
+        candidate = format!("__fn{inst_id}_{base}__{suffix}");
+    }
+    used.insert(candidate.clone());
+    candidate
 }
 
 fn fmt_key(key: &FnKey) -> String {

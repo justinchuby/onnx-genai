@@ -56,6 +56,32 @@ fn node_with_attrs(
     n
 }
 
+/// A `ValueInfoProto` carrying only a name (used for graph inputs/outputs).
+fn value_info(name: &str) -> onnx::ValueInfoProto {
+    onnx::ValueInfoProto {
+        name: name.to_string(),
+        ..Default::default()
+    }
+}
+
+/// A graph-valued attribute (e.g. an `If`/`Loop` branch/body).
+fn graph_attr(name: &str, g: onnx::GraphProto) -> onnx::AttributeProto {
+    onnx::AttributeProto {
+        name: name.to_string(),
+        r#type: onnx::attribute_proto::AttributeType::Graph as i32,
+        g: Some(g),
+        ..Default::default()
+    }
+}
+
+/// A named initializer tensor (contents irrelevant to name-scoping tests).
+fn tensor(name: &str) -> onnx::TensorProto {
+    onnx::TensorProto {
+        name: name.to_string(),
+        ..Default::default()
+    }
+}
+
 fn function(
     name: &str,
     domain: &str,
@@ -533,4 +559,286 @@ fn function_opset_import_is_merged_into_model() {
         .opset_import
         .iter()
         .any(|o| o.domain == "com.microsoft" && o.version == 1));
+}
+
+// --- regression tests for the four scope/correctness bugs ------------------
+
+#[test]
+fn nested_subgraph_ref_attr_is_bound() {
+    // BUG 1: a `ref_attr_name` carried by a node *inside* a control-flow
+    // subgraph must be bound to the call-site attribute, not left dangling.
+    //
+    // F(cond, X){alpha} = If(cond){ then: LeakyRelu(X, alpha=@alpha) -> t; out t
+    //                               else: LeakyRelu(X, alpha=@alpha) -> e; out e }
+    let then_branch = onnx::GraphProto {
+        node: vec![node_with_attrs(
+            "LeakyRelu",
+            &["X"],
+            &["t"],
+            vec![ref_attr("alpha", "alpha")],
+        )],
+        output: vec![value_info("t")],
+        ..Default::default()
+    };
+    let else_branch = onnx::GraphProto {
+        node: vec![node_with_attrs(
+            "LeakyRelu",
+            &["X"],
+            &["e"],
+            vec![ref_attr("alpha", "alpha")],
+        )],
+        output: vec![value_info("e")],
+        ..Default::default()
+    };
+    let if_node = node_with_attrs(
+        "If",
+        &["cond"],
+        &["Y"],
+        vec![
+            graph_attr("then_branch", then_branch),
+            graph_attr("else_branch", else_branch),
+        ],
+    );
+    let f = function("F", "d", &["cond", "X"], &["Y"], vec![if_node]);
+    let mut c = call("F", "d", &["c", "x"], &["y"]);
+    c.attribute = vec![float_attr("alpha", 0.2)];
+    let graph = onnx::GraphProto {
+        node: vec![c],
+        ..Default::default()
+    };
+    let out = inline(model(graph, vec![f]));
+    let g = out.graph.as_ref().unwrap();
+    let if_n = &g.node[0];
+    assert_eq!(if_n.op_type, "If");
+    for attr in &if_n.attribute {
+        let sub = attr.g.as_ref().unwrap();
+        let lr = &sub.node[0];
+        assert_eq!(lr.op_type, "LeakyRelu");
+        assert_eq!(lr.attribute.len(), 1);
+        assert!(
+            lr.attribute[0].ref_attr_name.is_empty(),
+            "nested ref_attr_name was not resolved"
+        );
+        assert_eq!(lr.attribute[0].f, 0.2, "nested attr not bound to call value");
+    }
+}
+
+#[test]
+fn subgraph_output_capturing_function_input_is_remapped() {
+    // BUG 2(b): a subgraph `GraphProto.output` that directly names a captured
+    // outer value must be rewritten to the call-site actual.
+    //
+    // F(cond, X) = If(cond){ then: (no nodes) out X ; else: (no nodes) out X }
+    let then_branch = onnx::GraphProto {
+        output: vec![value_info("X")],
+        ..Default::default()
+    };
+    let else_branch = onnx::GraphProto {
+        output: vec![value_info("X")],
+        ..Default::default()
+    };
+    let if_node = node_with_attrs(
+        "If",
+        &["cond"],
+        &["Y"],
+        vec![
+            graph_attr("then_branch", then_branch),
+            graph_attr("else_branch", else_branch),
+        ],
+    );
+    let f = function("F", "d", &["cond", "X"], &["Y"], vec![if_node]);
+    let c = call("F", "d", &["c", "a"], &["y"]);
+    let graph = onnx::GraphProto {
+        node: vec![c],
+        ..Default::default()
+    };
+    let out = inline(model(graph, vec![f]));
+    let g = out.graph.as_ref().unwrap();
+    for attr in &g.node[0].attribute {
+        let sub = attr.g.as_ref().unwrap();
+        assert_eq!(
+            sub.output[0].name, "a",
+            "captured subgraph output not remapped to actual"
+        );
+    }
+}
+
+#[test]
+fn subgraph_local_input_shadows_outer_capture() {
+    // BUG 2(a): a subgraph's own graph input shadows an outer formal of the
+    // same name; inner references must stay local, not follow the outer actual.
+    //
+    // F(M, cond, X) = Loop body(iter, cond_in, X): Relu(X)->r ; out cond_in, r
+    let body = onnx::GraphProto {
+        input: vec![value_info("iter"), value_info("cond_in"), value_info("X")],
+        node: vec![node("Relu", &["X"], &["r"])],
+        output: vec![value_info("cond_in"), value_info("r")],
+        ..Default::default()
+    };
+    let loop_node = node_with_attrs(
+        "Loop",
+        &["M", "cond", "X"],
+        &["Yf"],
+        vec![graph_attr("body", body)],
+    );
+    let f = function("F", "d", &["M", "cond", "X"], &["Yf"], vec![loop_node]);
+    let c = call("F", "d", &["m", "c", "a"], &["y"]);
+    let graph = onnx::GraphProto {
+        node: vec![c],
+        ..Default::default()
+    };
+    let out = inline(model(graph, vec![f]));
+    let g = out.graph.as_ref().unwrap();
+    let loop_n = &g.node[0];
+    // The outer Loop node inputs live in the body scope and are remapped.
+    assert_eq!(
+        loop_n.input,
+        vec!["m".to_string(), "c".to_string(), "a".to_string()]
+    );
+    let body_sub = loop_n.attribute[0].g.as_ref().unwrap();
+    // The inner Relu reads the loop-carried local `X`, never the outer actual.
+    assert_eq!(
+        body_sub.node[0].input[0], "X",
+        "local subgraph input was wrongly remapped to the outer actual"
+    );
+}
+
+#[test]
+fn subgraph_initializer_shadows_but_capture_is_remapped() {
+    // BUG 2(a)+(b): a subgraph initializer shadows an outer name (local), while
+    // a sibling branch that genuinely captures the same name is remapped.
+    //
+    // F(cond, X) = If(cond){ then: initializer X; Add(X, X)->tb; out tb
+    //                        else: Identity(X)->eb; out eb }
+    let then_branch = onnx::GraphProto {
+        initializer: vec![tensor("X")],
+        node: vec![node("Add", &["X", "X"], &["tb"])],
+        output: vec![value_info("tb")],
+        ..Default::default()
+    };
+    let else_branch = onnx::GraphProto {
+        node: vec![node("Identity", &["X"], &["eb"])],
+        output: vec![value_info("eb")],
+        ..Default::default()
+    };
+    let if_node = node_with_attrs(
+        "If",
+        &["cond"],
+        &["Y"],
+        vec![
+            graph_attr("then_branch", then_branch),
+            graph_attr("else_branch", else_branch),
+        ],
+    );
+    let f = function("F", "d", &["cond", "X"], &["Y"], vec![if_node]);
+    let c = call("F", "d", &["c", "a"], &["y"]);
+    let graph = onnx::GraphProto {
+        node: vec![c],
+        ..Default::default()
+    };
+    let out = inline(model(graph, vec![f]));
+    let g = out.graph.as_ref().unwrap();
+    let if_n = &g.node[0];
+    let then_sub = if_n.attribute[0].g.as_ref().unwrap();
+    // `X` is a local initializer here -> Add stays on local `X`.
+    assert_eq!(
+        then_sub.node[0].input,
+        vec!["X".to_string(), "X".to_string()]
+    );
+    let else_sub = if_n.attribute[1].g.as_ref().unwrap();
+    // `X` is a genuine capture here -> remapped to the actual.
+    assert_eq!(else_sub.node[0].input[0], "a");
+}
+
+#[test]
+fn passthrough_output_aliasing_input_is_wired_via_identity() {
+    // BUG 3: pass-through F(X) -> X (zero-node body). Call F(a) -> b must
+    // actually produce `b` (via Identity from `a`), and downstream reads `b`.
+    let f = function("F", "d", &["X"], &["X"], vec![]);
+    let graph = onnx::GraphProto {
+        node: vec![
+            call("F", "d", &["a"], &["b"]),
+            node("Relu", &["b"], &["c"]),
+        ],
+        ..Default::default()
+    };
+    let out = inline(model(graph, vec![f]));
+    let g = out.graph.as_ref().unwrap();
+    let idn = g
+        .node
+        .iter()
+        .find(|n| n.op_type == "Identity")
+        .expect("pass-through must emit an Identity alias");
+    assert_eq!(idn.input, vec!["a".to_string()]);
+    assert_eq!(idn.output, vec!["b".to_string()]);
+    let relu = g.node.iter().find(|n| n.op_type == "Relu").unwrap();
+    assert_eq!(relu.input[0], "b", "downstream consumer reads wrong value");
+}
+
+#[test]
+fn function_output_passing_through_input_alongside_computed() {
+    // BUG 3: a function that returns one of its inputs unchanged alongside a
+    // computed output. F(X, W) -> (Y, X) with Y = Mul(X, W).
+    let f = function(
+        "F",
+        "d",
+        &["X", "W"],
+        &["Y", "X"],
+        vec![node("Mul", &["X", "W"], &["Y"])],
+    );
+    let graph = onnx::GraphProto {
+        node: vec![call("F", "d", &["a", "w"], &["y", "xp"])],
+        ..Default::default()
+    };
+    let out = inline(model(graph, vec![f]));
+    let g = out.graph.as_ref().unwrap();
+    let mul = g.node.iter().find(|n| n.op_type == "Mul").unwrap();
+    assert_eq!(mul.input, vec!["a".to_string(), "w".to_string()]);
+    assert_eq!(mul.output, vec!["y".to_string()]);
+    let idn = g
+        .node
+        .iter()
+        .find(|n| n.op_type == "Identity")
+        .expect("pass-through output must emit an Identity alias");
+    assert_eq!(idn.input, vec!["a".to_string()]);
+    assert_eq!(idn.output, vec!["xp".to_string()]);
+}
+
+#[test]
+fn generated_names_avoid_preexisting_collisions() {
+    // BUG 4: the outer graph already defines `__fn0_t`, which is exactly the
+    // name the first instantiation would naively pick for internal value `t`.
+    let f = function(
+        "F",
+        "d",
+        &["X"],
+        &["Y"],
+        vec![node("Relu", &["X"], &["t"]), node("Relu", &["t"], &["Y"])],
+    );
+    let graph = onnx::GraphProto {
+        node: vec![
+            call("F", "d", &["a"], &["out"]),
+            node("Identity", &["seed"], &["__fn0_t"]),
+        ],
+        ..Default::default()
+    };
+    let out = inline(model(graph, vec![f]));
+    let g = out.graph.as_ref().unwrap();
+    // The pre-existing `__fn0_t` keeps its single (Identity) producer.
+    let producers: Vec<_> = g
+        .node
+        .iter()
+        .filter(|n| n.output.iter().any(|o| o == "__fn0_t"))
+        .collect();
+    assert_eq!(
+        producers.len(),
+        1,
+        "generated name collided with pre-existing __fn0_t"
+    );
+    assert_eq!(producers[0].op_type, "Identity");
+    // The function's internal wire took a fresh, non-colliding name.
+    let relus: Vec<_> = g.node.iter().filter(|n| n.op_type == "Relu").collect();
+    let wire = &relus[0].output[0];
+    assert_ne!(wire, "__fn0_t");
+    assert!(wire.starts_with("__fn0_t"));
 }
