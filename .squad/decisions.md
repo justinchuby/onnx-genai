@@ -858,3 +858,10 @@ CHANNEL/AVG results match element-for-element.
 **Why:** The workspace had diverged between runtime `0.1.0-dev.1` and GenAI `0.1.0`. Moving all crates forward to `0.1.0` is monotonic and avoids a crates.io downgrade; publishing tracer closes its missing release-workflow coverage.
 
 **Sources:** `bryant-attention-conformance.md`, `duck-attn-review.md`, `kaiser-quantize-linear.md`, `duck-quant-review.md`, `howie-pooling.md`, `duck-pool-review.md`, `deckard-maxpool-indices-fix.md`, `duck-pool2-review.md`, `mariette-split-equal.md`, `duck-spliteq-review.md`, `chew-split-zerochunk-fix.md`, `duck-spliteq2-review.md`, `coordinator-onnx-rs-scheduling-design-review-phased-implementa.md`, `tycho-version-unify.md`.
+
+---
+
+### 2026-07-15: Dev release v0.1.0-dev.2 published to crates.io (all 25 crates)
+**By:** Squad (Justin Chu)
+**What:** All 25 publishable workspace crates published to crates.io at 0.1.0-dev.2 (13 onnx-runtime-* + 12 onnx-genai-*). First-time crates: onnx-runtime-{tracer,eager,ep-cuda,memory,cpuinfo}, onnx-genai-{metadata,genai-config,kv,ort-sys,runtime-config,preprocess,router,scheduler,engine,ort,server} and onnx-genai. Excluded (publish=false): onnx-genai-bench, onnx-runtime-dlpack, onnx-runtime-python.
+**Why/How:** Unified workspace to version 0.1.0-dev.2 with exact =pin internal deps; completed the publish CI crate list (was missing 7 crates); fixed two release blockers surfaced by the run: (1) onnx-runtime-capi non-exhaustive match on SessionError::SequenceOp (E0004) — mapped to OrtErrorCode::Fail; (2) genai publish topological order bug (onnx-genai-engine was invoked before its dep onnx-genai-preprocess) — reordered. Made publish_crate() 429-aware: it now parses crates.io's "try again after <date>" and sleeps out the new-crate burst rate limit instead of exhausting its retry budget. Added a top-level concurrency guard to prevent duplicate publish runs. Final main commit: 01011f6; tag v0.1.0-dev.2.
