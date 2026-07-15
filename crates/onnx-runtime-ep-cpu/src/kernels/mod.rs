@@ -33,6 +33,7 @@ pub mod attention;
 pub mod cast;
 pub mod concat;
 pub mod constant;
+pub mod constant_of_shape;
 pub mod elementwise;
 pub mod expand;
 pub mod fused_attention;
@@ -50,6 +51,7 @@ pub mod matmul;
 pub mod movement_ops;
 #[cfg(feature = "onednn")]
 pub mod onednn;
+pub mod pad;
 pub mod reduce;
 pub mod reduce_ops;
 pub mod relu;
@@ -61,6 +63,7 @@ pub mod sequence;
 pub mod shape;
 pub mod slice;
 pub mod softmax;
+pub mod split;
 pub mod transpose;
 pub mod unary_math;
 pub mod unsqueeze;
@@ -139,6 +142,9 @@ pub const PHASE1_OPS: &[&str] = &[
     "Concat",
     "Flatten",
     "Squeeze",
+    "Split",
+    "Pad",
+    "ConstantOfShape",
     "Size",
     "GatherElements",
     "GatherND",
@@ -327,6 +333,12 @@ pub fn build_cpu_registry() -> OpRegistry {
     );
     reg.register(OpKey::new("Expand", "", 1), Box::new(expand::ExpandFactory));
     reg.register(OpKey::new("Slice", "", 1), Box::new(slice::SliceFactory));
+    reg.register(OpKey::new("Split", "", 1), Box::new(split::SplitFactory));
+    reg.register(OpKey::new("Pad", "", 1), Box::new(pad::PadFactory));
+    reg.register(
+        OpKey::new("ConstantOfShape", "", 1),
+        Box::new(constant_of_shape::ConstantOfShapeFactory),
+    );
     reg.register(
         OpKey::new("Constant", "", 1),
         Box::new(constant::ConstantFactory),
