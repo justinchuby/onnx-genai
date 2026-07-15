@@ -95,13 +95,14 @@ Outputs are shaped for convenience:
 `NxrtValue` behaves like a tensor: `np.asarray(v)` (via `__array__`), `v.shape`,
 `v.dtype`, `len(v)`, plus the zero-copy `torch.from_dlpack(v)` / `v.numpy()`.
 
-**`with session.bind_outputs("logits", ...):`** — restrict which outputs the
-callable returns for the duration of a `with` block (nesting supported, previous
-selection restored on exit). `run()`/`run_with_values()` are unaffected.
+**`session.bind_outputs("logits", ...)`** — returns a `BoundSession` proxy whose
+calls return only the selected outputs. It is a convenience filter; inference
+still computes all graph outputs. `run()`/`run_with_values()` on the base session
+are unaffected.
 
 ```python
-with sess.bind_outputs("logits"):
-    logits = sess(x)                       # only "logits" computed and returned
+with sess.bind_outputs("logits") as bound:
+    logits = bound(x)                      # only "logits" is returned
 ```
 
 `session.input_names` / `session.output_names` give the input/output names in

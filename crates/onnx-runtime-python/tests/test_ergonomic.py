@@ -291,6 +291,15 @@ def test_bind_outputs_unknown_name_errors():
     assert "nope" in msg and "pos" in msg and "neg" in msg
 
 
+def test_explicit_unknown_output_fails_before_inference():
+    sess = nxrt.load(_multi_output_model())
+    x = np.ones((2, 2), dtype=np.float32)  # otherwise a valid inference feed
+    with pytest.raises(ValueError) as ei:
+        sess.run(["nope"], {"X": x})
+    msg = str(ei.value)
+    assert "nope" in msg and "pos" in msg and "neg" in msg
+
+
 def test_bind_outputs_does_not_affect_run():
     sess = nxrt.load(_multi_output_model())
     x = np.ones((2, 2), dtype=np.float32)

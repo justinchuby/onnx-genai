@@ -413,12 +413,12 @@ impl InferenceSession {
         self.call_impl(py, args, kwargs, None)
     }
 
-    /// Return a lightweight [`BoundSession`] proxy that restricts which outputs
-    /// its calls compute/return, without mutating this session.
+    /// Return a lightweight [`BoundSession`] proxy that selects which outputs
+    /// its calls return, without mutating this session.
     ///
     /// ```python
     /// with sess.bind_outputs("logits") as s:
-    ///     logits = s(x)             # only "logits" is computed/returned
+    ///     logits = s(x)             # only "logits" is returned
     /// # or without a `with`:
     /// s = sess.bind_outputs("logits")
     /// logits = s(x)
@@ -426,7 +426,9 @@ impl InferenceSession {
     ///
     /// The selected names are validated against the model outputs immediately,
     /// with an actionable error, and are fixed for the life of the returned
-    /// proxy. The proxy owns its own output list, so it is thread-/async-safe:
+    /// proxy. Selection is currently a return-value convenience: inference still
+    /// computes all graph outputs. Computation pruning may be added as a future
+    /// optimization. The proxy owns its own output list, so it is thread-/async-safe:
     /// overlapping calls on distinct proxies (or the base session) never clobber
     /// each other. This session's own `run()`/`run_with_values()`/`__call__`
     /// are entirely unaffected.
@@ -581,6 +583,10 @@ impl InferenceSession {
         output_names: Option<Vec<String>>,
         input_feed: &Bound<'_, PyDict>,
     ) -> PyResult<(Vec<String>, Vec<Tensor>)> {
+        // Validate every explicit output request before converting inputs or
+        // invoking the executor, so misspellings fail without an inference run.
+        let indices = self.output_indices(output_names.as_deref())?;
+
         // Build owned tensors from the feed, validating names + dtypes with
         // actionable messages before touching the runtime.
         let mut owned: Vec<(String, Tensor)> = Vec::with_capacity(input_feed.len());
@@ -630,9 +636,29 @@ impl InferenceSession {
             guard.run(&feed).map_err(run_error)?
         };
 
-        // Resolve the requested outputs to indices into `results` (all model
-        // outputs, in graph order).
-        let indices: Vec<usize> = match &output_names {
+        // `indices` resolves requested names into `results`, which contains all
+        // model outputs in graph order.
+        let mut slots: Vec<Option<Tensor>> = results.into_iter().map(Some).collect();
+        let mut names = Vec::with_capacity(indices.len());
+        let mut tensors = Vec::with_capacity(indices.len());
+        for i in indices {
+            let tensor = slots[i].take().ok_or_else(|| {
+                PyValueError::new_err(format!(
+                    "output {:?} was requested more than once; request each output \
+                     at most once",
+                    self.outputs[i].name
+                ))
+            })?;
+            names.push(self.outputs[i].name.clone());
+            tensors.push(tensor);
+        }
+        Ok((names, tensors))
+    }
+
+    /// Resolve an optional output selection to graph-output indices, rejecting
+    /// unknown names before execution.
+    fn output_indices(&self, output_names: Option<&[String]>) -> PyResult<Vec<usize>> {
+        let indices = match output_names {
             None => (0..self.outputs.len()).collect(),
             Some(names) => {
                 let mut idxs = Vec::with_capacity(names.len());
@@ -654,25 +680,7 @@ impl InferenceSession {
                 idxs
             }
         };
-
-        // Move the selected tensors out by index. `Option::take` keeps this a
-        // move (not a copy) so the zero-copy path really owns the buffer; a
-        // duplicate request would take an already-moved slot and errors clearly.
-        let mut slots: Vec<Option<Tensor>> = results.into_iter().map(Some).collect();
-        let mut names = Vec::with_capacity(indices.len());
-        let mut tensors = Vec::with_capacity(indices.len());
-        for i in indices {
-            let tensor = slots[i].take().ok_or_else(|| {
-                PyValueError::new_err(format!(
-                    "output {:?} was requested more than once; request each output \
-                     at most once",
-                    self.outputs[i].name
-                ))
-            })?;
-            names.push(self.outputs[i].name.clone());
-            tensors.push(tensor);
-        }
-        Ok((names, tensors))
+        Ok(indices)
     }
 }
 
@@ -785,7 +793,8 @@ impl Outputs {
 }
 
 /// Lightweight proxy returned by [`InferenceSession::bind_outputs`] that applies
-/// a fixed output subset per call, without mutating the underlying session.
+/// a fixed subset of returned outputs per call, without mutating the underlying
+/// session.
 ///
 /// The proxy holds a reference to its [`InferenceSession`] plus its own
 /// immutable `names` list. Because the selection lives on the proxy (not on
@@ -795,6 +804,9 @@ impl Outputs {
 /// that default their output selection to this subset, and it doubles as a
 /// context manager (`__enter__` yields the proxy, `__exit__` is a no-op) so
 /// `with session.bind_outputs("y") as s: s(x)` keeps working.
+///
+/// This is a return-value filter only: inference still computes all graph
+/// outputs. Output-subgraph pruning is a future optimization.
 #[pyclass(module = "nxrt", name = "BoundSession")]
 struct BoundSession {
     session: Py<InferenceSession>,
