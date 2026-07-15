@@ -87,10 +87,10 @@ pub struct VramBreakdown {
 }
 
 impl VramBreakdown {
-    fn reserved_bytes(self) -> u64 {
+    fn reserved_bytes(self) -> Option<u64> {
         self.model_weights_bytes
-            .saturating_add(self.activations_bytes)
-            .saturating_add(self.ort_overhead_bytes)
+            .checked_add(self.activations_bytes)?
+            .checked_add(self.ort_overhead_bytes)
     }
 }
 
@@ -109,8 +109,8 @@ impl ModelKvConfig {
         bytes / self.page_size_bytes
     }
 
-    pub fn tokens_for_pages(&self, pages: u64) -> u64 {
-        pages.saturating_mul(self.tokens_per_page)
+    pub fn tokens_for_pages(&self, pages: u64) -> Option<u64> {
+        pages.checked_mul(self.tokens_per_page)
     }
 }
 
@@ -197,6 +197,15 @@ pub enum ResourceError {
          filesystem capacity provider or set disk_spill_limit to None"
     )]
     MissingDiskCapacityProvider,
+
+    #[error(
+        "cannot derive a valid resource budget because {operation} overflowed u64; {reason}; \
+         reduce the configured ceiling, fixed reservations, KV page size, or tokens per page"
+    )]
+    BudgetArithmeticOverflow {
+        operation: &'static str,
+        reason: String,
+    },
 }
 
 /// Resolve a limit against a tier's detected total capacity.
@@ -237,8 +246,19 @@ pub fn derive_kv_budget(
     breakdown: &VramBreakdown,
     kv_config: &ModelKvConfig,
 ) -> Result<DerivedBudget, ResourceError> {
-    let reserved_bytes = breakdown.reserved_bytes();
-    let minimum_bytes = reserved_bytes.saturating_add(kv_config.page_size_bytes);
+    let reserved_bytes =
+        breakdown
+            .reserved_bytes()
+            .ok_or_else(|| ResourceError::BudgetArithmeticOverflow {
+                operation: "summing model weights, activations, and runtime overhead",
+                reason: "the fixed VRAM reservations exceed the representable byte range".into(),
+            })?;
+    let minimum_bytes = reserved_bytes
+        .checked_add(kv_config.page_size_bytes)
+        .ok_or_else(|| ResourceError::BudgetArithmeticOverflow {
+            operation: "adding one KV page to the fixed VRAM reservations",
+            reason: "even the one-page minimum exceeds the representable byte range".into(),
+        })?;
     if kv_config.page_size_bytes == 0 || resolved_vram_bytes < minimum_bytes {
         let reason = if resolved_vram_bytes < reserved_bytes {
             format!(
@@ -247,10 +267,17 @@ pub fn derive_kv_budget(
         } else if kv_config.page_size_bytes == 0 {
             "the model reports a zero-byte KV page, so no valid page budget can be derived".into()
         } else {
+            let remaining_bytes =
+                resolved_vram_bytes
+                    .checked_sub(reserved_bytes)
+                    .ok_or_else(|| ResourceError::BudgetArithmeticOverflow {
+                        operation: "subtracting fixed VRAM reservations from the ceiling",
+                        reason: "the resolved ceiling is smaller than the fixed reservations"
+                            .into(),
+                    })?;
             format!(
                 "the remaining {} B cannot hold one {} B KV page",
-                resolved_vram_bytes.saturating_sub(reserved_bytes),
-                kv_config.page_size_bytes
+                remaining_bytes, kv_config.page_size_bytes
             )
         };
         return Err(ResourceError::CannotSatisfyLoweredLimit {
@@ -260,12 +287,36 @@ pub fn derive_kv_budget(
         });
     }
 
-    let kv_bytes = resolved_vram_bytes - reserved_bytes;
+    let kv_bytes = resolved_vram_bytes
+        .checked_sub(reserved_bytes)
+        .ok_or_else(|| ResourceError::BudgetArithmeticOverflow {
+            operation: "subtracting fixed VRAM reservations from the ceiling",
+            reason: "the resolved ceiling is smaller than the fixed reservations".into(),
+        })?;
     let total_pages = kv_config.pages_for_bytes(kv_bytes);
+    if total_pages == 0 {
+        return Err(ResourceError::CannotSatisfyLoweredLimit {
+            requested_bytes: resolved_vram_bytes,
+            minimum_bytes,
+            reason: format!(
+                "the derived KV budget of {kv_bytes} B cannot hold one {} B KV page",
+                kv_config.page_size_bytes
+            ),
+        });
+    }
+    let max_total_tokens = kv_config.tokens_for_pages(total_pages).ok_or_else(|| {
+        ResourceError::BudgetArithmeticOverflow {
+            operation: "multiplying KV pages by tokens per page",
+            reason: format!(
+                "{total_pages} pages at {} tokens per page exceed the representable token range",
+                kv_config.tokens_per_page
+            ),
+        }
+    })?;
     Ok(DerivedBudget {
         kv_bytes,
         total_pages,
-        max_total_tokens: kv_config.tokens_for_pages(total_pages),
+        max_total_tokens,
         reserved_bytes,
     })
 }
@@ -555,6 +606,36 @@ mod tests {
     }
 
     #[test]
+    fn derive_accepts_ceiling_exactly_large_enough_for_one_page() {
+        let derived = derive_kv_budget(210, &breakdown(), &kv_config()).unwrap();
+        assert_eq!(
+            derived,
+            DerivedBudget {
+                kv_bytes: 10,
+                total_pages: 1,
+                max_total_tokens: 16,
+                reserved_bytes: 200,
+            }
+        );
+    }
+
+    #[test]
+    fn derive_rejects_overflowing_fixed_reservations() {
+        let breakdown = VramBreakdown {
+            model_weights_bytes: u64::MAX,
+            activations_bytes: 1,
+            ort_overhead_bytes: 0,
+        };
+
+        let error = derive_kv_budget(u64::MAX, &breakdown, &kv_config()).unwrap_err();
+        assert!(matches!(
+            error,
+            ResourceError::BudgetArithmeticOverflow { .. }
+        ));
+        assert!(error.to_string().contains("fixed VRAM reservations"));
+    }
+
+    #[test]
     fn lower_below_usage_reports_overage_and_engine_eviction_order() {
         let governor = governor(1_000);
         governor.byte_budget().try_reserve(700).unwrap();
@@ -580,6 +661,37 @@ mod tests {
         assert!(matches!(
             error,
             ResourceError::CannotSatisfyLoweredLimit { .. }
+        ));
+        assert_eq!(governor.snapshot(), before);
+    }
+
+    #[test]
+    fn overflowing_max_ceiling_is_atomic_and_preserves_previous_budget() {
+        let capacities = CapacityProviders {
+            vram: Arc::new(FixedCapacity::new(u64::MAX, u64::MAX)),
+            host_ram: Arc::new(FixedCapacity::new(4_000, 3_000)),
+            disk_spill: None,
+        };
+        let governor = ResourceGovernor::new(
+            ResourceLimits {
+                vram_limit: ResourceLimit::Bytes(1_000),
+                host_ram_limit: ResourceLimit::Bytes(1_000),
+                disk_spill_limit: None,
+            },
+            capacities,
+            breakdown(),
+            kv_config(),
+        )
+        .unwrap();
+        governor.byte_budget().try_reserve(300).unwrap();
+        let before = governor.snapshot();
+
+        let error = governor
+            .set_vram_limit(ResourceLimit::Bytes(u64::MAX))
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ResourceError::BudgetArithmeticOverflow { .. }
         ));
         assert_eq!(governor.snapshot(), before);
     }
