@@ -5969,6 +5969,14 @@ Both matter critically on consumer GPUs (8-12 GB VRAM) where every MB counts.
 | Op coverage | Transformer-only | General purpose (CNN, RNN, transformer, etc.) |
 | Build granularity | Single target arch | Multi-arch, multi-EP support compiled in |
 
+This table describes the external ORT deployment path, but it is no longer the
+whole picture. onnx-genai now owns native CPU and CUDA execution providers. The
+CPU EP's `kernels/mod.rs` builds a runtime registry covering approximately 113
+operators (112 unique names and 114 domain/name keys), all compiled in by
+default today. For these native EPs, compile-time operator selection and
+binary-size reduction are under our control rather than requiring upstream ORT
+changes.
+
 ### 33.4 Implications for onnx-genai
 
 **What we can control (our runtime layer):**
@@ -5976,12 +5984,19 @@ Both matter critically on consumer GPUs (8-12 GB VRAM) where every MB counts.
 - Implement KV cache quantization (FP8/Q8 as designed in §16)
 - Aggressive memory reuse patterns in paged cache
 - Profile and document actual VRAM breakdown per component
+- Gate native CPU EP operator groups at compile time, then generate an exact
+  registry from one or more models; extend the same mechanism to the native CUDA
+  EP. See [Model-Driven Minimal Builds](MINIMAL_BUILD.md).
 
-**What needs ORT-level changes (upstream):**
+**What still needs ORT-level changes when using the external ORT path:**
 - Compressed-domain quantized matmul kernels (avoid dequantize round-trip)
-- Build-time op stripping (only include ops used by loaded model)
-- Reduced binary: `onnxruntime-genai-slim` with only transformer-relevant CUDA kernels
+- Reduced external ORT binaries and upstream kernel stripping
 - Better arena allocator tuning defaults for genai workloads
+
+Native-EP op stripping does **not** depend on an upstream
+`onnxruntime-genai-slim` build. The strategy is documented now and remains
+opt-in/not-yet-implemented; default builds continue to include full operator
+coverage.
 
 **Where we have an advantage over llama.cpp:**
 - **DirectML EP** — llama.cpp's DirectML/Vulkan support is weak. AMD/Intel GPU users get a poor experience with llama.cpp but good support from ORT
