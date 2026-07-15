@@ -4,10 +4,10 @@
 //! DSL in [`crate::text`]. Conversion goes through the same generated ONNX proto
 //! and shared-IR loader path as binary protobuf and JSON.
 
-use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine;
 use onnx_runtime_loader::{
-    Model as EncoderModel, encode_model_proto, load_model_bytes_with_weights,
+    encode_model_proto, load_model_bytes_with_weights, Model as EncoderModel,
 };
 use prost::Message;
 use serde_json::{Map, Number, Value};
@@ -519,17 +519,19 @@ impl<'a> Lexer<'a> {
                 b'\\' | b'\'' | b'"' => output.push(escaped),
                 b'x' | b'X' => output.push(self.radix_escape(16, 2)?),
                 b'0'..=b'7' => {
-                    let mut value = escaped - b'0';
+                    let mut value = u16::from(escaped - b'0');
                     for _ in 0..2 {
                         match self.source.get(self.offset).copied() {
                             Some(next @ b'0'..=b'7') => {
-                                value = value.wrapping_mul(8).wrapping_add(next - b'0');
+                                value = value * 8 + u16::from(next - b'0');
                                 self.offset += 1;
                             }
                             _ => break,
                         }
                     }
-                    output.push(value);
+                    output.push(u8::try_from(value).map_err(|_| {
+                        textproto_error(format!("octal escape value {value:o} exceeds 255"))
+                    })?);
                 }
                 _ => {
                     return Err(textproto_error(format!(
@@ -551,7 +553,9 @@ impl<'a> Lexer<'a> {
         let text =
             std::str::from_utf8(digits).map_err(|_| textproto_error("invalid hex escape"))?;
         self.offset = end;
-        u8::from_str_radix(text, radix).map_err(|_| textproto_error("invalid hex escape"))
+        let value =
+            u16::from_str_radix(text, radix).map_err(|_| textproto_error("invalid hex escape"))?;
+        u8::try_from(value).map_err(|_| textproto_error("hex escape value exceeds 255"))
     }
 }
 
@@ -653,7 +657,7 @@ impl Parser {
                 .map_err(|_| textproto_error(format!("{name} is not valid UTF-8"))),
             (ScalarKind::Bytes, Token::String(bytes)) => Ok(Value::String(BASE64.encode(bytes))),
             (ScalarKind::Enum, Token::Ident(value)) => Ok(Value::String(value)),
-            (ScalarKind::Enum, Token::Number(value)) => parse_integer(&value, name),
+            (ScalarKind::Enum, Token::Number(value)) => parse_enum_integer(&value, name),
             (ScalarKind::Int, Token::Number(value)) => parse_integer(&value, name),
             (ScalarKind::Uint, Token::Number(value)) => parse_unsigned(&value, name),
             (ScalarKind::Float, Token::Number(value)) => parse_float(&value, name),
@@ -741,6 +745,13 @@ fn parse_integer(text: &str, name: &str) -> Result<Value> {
     let value = parse_i64_literal(text)
         .ok_or_else(|| textproto_error(format!("{name} must be an integer")))?;
     Ok(Value::String(value.to_string()))
+}
+
+fn parse_enum_integer(text: &str, name: &str) -> Result<Value> {
+    let value = parse_i64_literal(text)
+        .and_then(|value| i32::try_from(value).ok())
+        .ok_or_else(|| textproto_error(format!("{name} must be a 32-bit integer")))?;
+    Ok(Value::Number(value.into()))
 }
 
 fn parse_unsigned(text: &str, name: &str) -> Result<Value> {
@@ -904,7 +915,7 @@ mod tests {
     use std::collections::HashMap;
 
     use onnx_runtime_ir::{
-        Attribute, DataType, Graph, Node, NodeId, TensorData, WeightRef, static_shape,
+        static_shape, Attribute, DataType, Graph, Node, NodeId, TensorData, WeightRef,
     };
     use onnx_runtime_loader::ModelMetadata;
 
@@ -1007,6 +1018,35 @@ mod tests {
     }
 
     #[test]
+    fn numeric_enum_value_parses() {
+        let source = r#"
+            ir_version: 10
+            opset_import { version: 21 }
+            graph {
+              initializer {
+                dims: 1
+                data_type: 1
+                name: "W"
+                raw_data: "\000\000\200?"
+              }
+            }
+        "#;
+        let model = from_textproto(source).expect("numeric enum");
+        let initializer = model.graph.initializers.values().next().unwrap();
+        assert_eq!(initializer.dtype(), DataType::Float32);
+    }
+
+    #[test]
+    fn byte_escape_range_is_checked() {
+        assert_eq!(
+            Lexer::new(r#""\377\xFF""#).tokenize().unwrap(),
+            vec![Token::String(vec![255, 255])]
+        );
+        let error = Lexer::new(r#""\400""#).tokenize().unwrap_err();
+        assert!(error.to_string().contains("exceeds 255"));
+    }
+
+    #[test]
     fn populated_unrepresentable_field_is_rejected() {
         let error = match from_textproto(
             r#"ir_version: 10
@@ -1016,10 +1056,8 @@ mod tests {
             Ok(_) => panic!("graph doc_string must not be silently dropped"),
             Err(error) => error,
         };
-        assert!(
-            error
-                .to_string()
-                .contains("unsupported ONNX JSON field: docString")
-        );
+        assert!(error
+            .to_string()
+            .contains("unsupported ONNX JSON field: docString"));
     }
 }
