@@ -1855,9 +1855,12 @@ dependencies = [
 name = "onnx-rs"
 version = "0.1.0-dev.2"
 dependencies = [
+ "base64 0.22.1",
  "onnx-runtime-ir",
  "onnx-runtime-loader",
+ "prost",
  "serde",
+ "serde_json",
  "serde_yaml",
  "thiserror 2.0.18",
 ]

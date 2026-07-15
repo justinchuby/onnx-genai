@@ -247,7 +247,48 @@ pub(crate) fn tensor_data_from_proto(
         DataType::Int8 | DataType::Uint8 | DataType::Bool => {
             proto.int32_data.iter().map(|v| *v as u8).collect()
         }
-        _ => Vec::new(),
+        DataType::Float8E4M3FN
+        | DataType::Float8E4M3FNUZ
+        | DataType::Float8E5M2
+        | DataType::Float8E5M2FNUZ
+        | DataType::Int4
+        | DataType::Uint4
+        | DataType::Float4E2M1 => proto.int32_data.iter().map(|v| *v as u8).collect(),
+        DataType::String => unreachable!("STRING tensors returned above"),
     };
     Ok(td)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn float8_typed_data_preserves_each_byte() {
+        let proto = TensorProto {
+            data_type: DataType::Float8E4M3FN.to_onnx(),
+            dims: vec![3],
+            int32_data: vec![0x01, 0x7f, 0xff],
+            ..Default::default()
+        };
+
+        let data =
+            tensor_data_from_proto(&proto, DataType::Float8E4M3FN, &[3]).expect("tensor data");
+        assert_eq!(data.data, [0x01, 0x7f, 0xff]);
+    }
+
+    #[test]
+    fn four_bit_typed_data_preserves_packed_nibbles() {
+        let proto = TensorProto {
+            data_type: DataType::Int4.to_onnx(),
+            dims: vec![3],
+            // ONNX stores two values per int32_data entry: first in the low
+            // nibble, second in the high nibble.
+            int32_data: vec![0x21, 0x03],
+            ..Default::default()
+        };
+
+        let data = tensor_data_from_proto(&proto, DataType::Int4, &[3]).expect("tensor data");
+        assert_eq!(data.data, [0x21, 0x03]);
+    }
 }

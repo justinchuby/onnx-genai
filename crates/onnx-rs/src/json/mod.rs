@@ -1190,4 +1190,114 @@ mod tests {
                 .contains("\"rawData\"")
         );
     }
+
+    fn assert_low_bit_typed_tensors_round_trip(
+        dtype_name: &str,
+        dtype: DataType,
+        int32_data: &[i32],
+        expected_data: &[u8],
+        dims: usize,
+    ) {
+        let source = format!(
+            r#"{{
+              "irVersion": "10",
+              "opsetImport": [{{"version": "21"}}],
+              "graph": {{
+                "initializer": [{{
+                  "dims": ["{dims}"],
+                  "dataType": "{dtype_name}",
+                  "int32Data": {int32_data:?},
+                  "name": "typed_initializer"
+                }}],
+                "node": [{{
+                  "output": ["typed_attribute_output"],
+                  "opType": "Constant",
+                  "attribute": [{{
+                    "name": "value",
+                    "type": "TENSOR",
+                    "t": {{
+                      "dims": ["{dims}"],
+                      "dataType": "{dtype_name}",
+                      "int32Data": {int32_data:?}
+                    }}
+                  }}]
+                }}],
+                "output": [
+                  {{
+                    "name": "typed_initializer",
+                    "type": {{"tensorType": {{
+                      "elemType": "{dtype_name}",
+                      "shape": {{"dim": [{{"dimValue": "{dims}"}}]}}
+                    }}}}
+                  }},
+                  {{
+                    "name": "typed_attribute_output",
+                    "type": {{"tensorType": {{
+                      "elemType": "{dtype_name}",
+                      "shape": {{"dim": [{{"dimValue": "{dims}"}}]}}
+                    }}}}
+                  }}
+                ]
+              }}
+            }}"#
+        );
+
+        let assert_data = |model: &Model| {
+            let initializer = model
+                .graph
+                .initializers
+                .iter()
+                .find(|(id, _)| {
+                    model.graph.value(**id).name.as_deref() == Some("typed_initializer")
+                })
+                .map(|(_, weight)| weight)
+                .expect("typed initializer");
+            let WeightRef::Inline(initializer) = initializer else {
+                panic!("typed initializer must be inline");
+            };
+            assert_eq!(initializer.dtype, dtype);
+            assert_eq!(initializer.data, expected_data);
+
+            let (_, node) = model.graph.nodes.iter().next().expect("Constant node");
+            let Some(Attribute::Tensor(attribute)) = node.attr("value") else {
+                panic!("Constant value must be a tensor attribute");
+            };
+            assert_eq!(attribute.dtype, dtype);
+            assert_eq!(attribute.data, expected_data);
+        };
+
+        let parsed = from_json(&source).expect("parse typed low-bit tensors");
+        assert_data(&parsed);
+
+        let canonical = to_json(&parsed).expect("serialize low-bit tensors");
+        assert!(canonical.contains("\"rawData\""));
+        let decoded = from_json(&canonical).expect("reparse serialized low-bit tensors");
+        assert_data(&decoded);
+        assert_eq!(
+            to_json(&decoded).expect("re-serialize low-bit tensors"),
+            canonical
+        );
+    }
+
+    #[test]
+    fn float8_initializer_and_attribute_tensor_round_trip() {
+        assert_low_bit_typed_tensors_round_trip(
+            "FLOAT8E4M3FN",
+            DataType::Float8E4M3FN,
+            &[0x01, 0x7f, 0xff],
+            &[0x01, 0x7f, 0xff],
+            3,
+        );
+    }
+
+    #[test]
+    fn int4_initializer_and_attribute_tensor_round_trip() {
+        assert_low_bit_typed_tensors_round_trip(
+            "INT4",
+            DataType::Int4,
+            &[0x21, 0x03],
+            &[0x21, 0x03],
+            3,
+        );
+    }
 }
