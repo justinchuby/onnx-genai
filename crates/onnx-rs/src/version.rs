@@ -1,0 +1,479 @@
+//! Opset version conversion with composable per-operator adapters (ONNX_RS §10).
+
+use std::collections::HashMap;
+
+use onnx_runtime_ir::{Attribute, Graph, Node, NodeId};
+
+use crate::{Model, SchemaRegistry};
+
+type AdapterKey = (String, String, u32);
+
+/// Converts one operator from a source schema version to a target version.
+pub trait OpAdapter: Send + Sync {
+    /// Source `(domain, op_type, version)`.
+    fn source(&self) -> (&str, &str, u32);
+
+    /// Target schema version.
+    fn target_version(&self) -> u32;
+
+    /// Adapt `node`, optionally mutating it through `graph`.
+    fn adapt(&self, node: &Node, graph: &mut Graph) -> Result<AdaptResult, ConvertError>;
+}
+
+/// Result of applying one [`OpAdapter`].
+#[derive(Clone, Debug)]
+pub enum AdaptResult {
+    /// The node is compatible as-is.
+    Compatible,
+    /// The adapter rewrote the node in place.
+    Rewritten,
+    /// The node must be replaced by the supplied nodes.
+    Decomposed { replacement_nodes: Vec<Node> },
+    /// The source node cannot be represented at the target version.
+    Incompatible { reason: String },
+}
+
+/// One node that prevented a complete conversion.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IncompatibleOp {
+    pub node_name: String,
+    pub domain: String,
+    pub op_type: String,
+    pub source_version: u32,
+    pub target_version: u32,
+    pub reason: String,
+}
+
+/// Summary of a conversion attempt.
+///
+/// Conversion is transactional: when `ops_rejected` is non-zero, the model is
+/// left unchanged and the rejected nodes explain which adapters are missing.
+#[derive(Clone, Debug, Default)]
+pub struct ConvertReport {
+    /// Nodes rewritten in place.
+    pub ops_converted: usize,
+    /// Nodes proven compatible without a rewrite.
+    pub ops_unchanged: usize,
+    /// Nodes replaced by adapter-provided subgraphs.
+    pub ops_decomposed: usize,
+    /// Nodes that could not be converted.
+    pub ops_rejected: usize,
+    /// Details for rejected nodes.
+    pub ops_incompatible: Vec<IncompatibleOp>,
+    /// Human-readable conversion diagnostics.
+    pub messages: Vec<String>,
+    pub source_opset: u32,
+    pub target_opset: u32,
+}
+
+/// Failure to execute a version conversion.
+#[derive(Debug, thiserror::Error)]
+pub enum ConvertError {
+    #[error("model has no default-domain opset import")]
+    MissingDefaultOpset,
+    #[error("opset downgrade from {source_version} to {target} is not supported")]
+    DowngradeUnsupported { source_version: u32, target: u32 },
+    #[error(
+        "invalid adapter for {domain}::{op_type}: target version {target} must exceed source version {source_version}"
+    )]
+    InvalidAdapter {
+        domain: String,
+        op_type: String,
+        source_version: u32,
+        target: u32,
+    },
+    #[error("adapter for node '{node}' failed: {message}")]
+    Adapter { node: String, message: String },
+    #[error("adapter for node '{node}' returned an empty decomposition")]
+    EmptyDecomposition { node: String },
+}
+
+/// Registry and executor for opset conversion adapters.
+pub struct VersionConverter {
+    adapters: HashMap<AdapterKey, Box<dyn OpAdapter>>,
+    schemas: SchemaRegistry,
+}
+
+impl VersionConverter {
+    /// Create a converter with the built-in adapters.
+    pub fn new() -> Self {
+        let mut converter = Self::empty();
+        converter.register(ReshapeAllowZeroAdapter::new(5));
+        converter.register(ReshapeAllowZeroAdapter::new(13));
+        converter
+    }
+
+    /// Create a converter without operator-specific adapters.
+    ///
+    /// Schema-proven compatible bumps remain available.
+    pub fn empty() -> Self {
+        Self {
+            adapters: HashMap::new(),
+            schemas: SchemaRegistry::builtins(),
+        }
+    }
+
+    /// Register or replace an adapter for its source tuple.
+    pub fn register<A: OpAdapter + 'static>(&mut self, adapter: A) {
+        let (domain, op_type, source) = adapter.source();
+        self.adapters.insert(
+            (
+                normalize_domain(domain).to_string(),
+                op_type.to_string(),
+                source,
+            ),
+            Box::new(adapter),
+        );
+    }
+
+    /// List registered `(source, target)` conversions for an operator.
+    pub fn available_conversions(&self, domain: &str, op_type: &str) -> Vec<(u32, u32)> {
+        let domain = normalize_domain(domain);
+        let mut conversions = self
+            .adapters
+            .iter()
+            .filter_map(|((candidate_domain, candidate_op, source), adapter)| {
+                (candidate_domain == domain && candidate_op == op_type)
+                    .then_some((*source, adapter.target_version()))
+            })
+            .collect::<Vec<_>>();
+        conversions.sort_unstable();
+        conversions
+    }
+
+    /// Convert the default ONNX domain to `target_opset`.
+    ///
+    /// A node without an adapter is accepted only when the schema registry
+    /// resolves both opsets to the same `since_version`. Otherwise it is
+    /// reported as incompatible and no changes are committed to `model`.
+    pub fn convert(
+        &self,
+        model: &mut Model,
+        target_opset: u32,
+    ) -> Result<ConvertReport, ConvertError> {
+        let source_opset = default_opset(&model.graph)?;
+        if target_opset < source_opset {
+            return Err(ConvertError::DowngradeUnsupported {
+                source_version: source_opset,
+                target: target_opset,
+            });
+        }
+
+        let mut report = ConvertReport {
+            source_opset,
+            target_opset,
+            ..ConvertReport::default()
+        };
+        if source_opset == target_opset {
+            return Ok(report);
+        }
+
+        let mut graph = model.graph.clone();
+        let node_ids = graph.nodes.keys().collect::<Vec<_>>();
+        for node_id in node_ids {
+            let node = graph.node(node_id).clone();
+            if !is_default_domain(&node.domain) {
+                continue;
+            }
+            self.convert_node(&mut graph, node_id, source_opset, target_opset, &mut report)?;
+        }
+
+        if report.ops_rejected == 0 {
+            set_default_opset(&mut graph, target_opset);
+            model.graph = graph;
+        } else {
+            report.messages.push(format!(
+                "conversion was not applied because {} node(s) were rejected",
+                report.ops_rejected
+            ));
+        }
+        Ok(report)
+    }
+
+    fn convert_node(
+        &self,
+        graph: &mut Graph,
+        node_id: NodeId,
+        source_opset: u32,
+        target_opset: u32,
+        report: &mut ConvertReport,
+    ) -> Result<(), ConvertError> {
+        let original = graph.node(node_id).clone();
+        let domain = normalize_domain(&original.domain);
+        let mut current = source_opset;
+        let mut rewritten = false;
+        let mut decomposed = false;
+
+        while current < target_opset {
+            let key = (domain.to_string(), original.op_type.clone(), current);
+            let Some(adapter) = self.adapters.get(&key) else {
+                if self.schema_compatible(&original.op_type, domain, current, target_opset) {
+                    break;
+                }
+                reject(
+                    report,
+                    &original,
+                    source_opset,
+                    target_opset,
+                    format!(
+                        "no adapter from opset {current} to {target_opset}, and schemas do not prove compatibility"
+                    ),
+                );
+                return Ok(());
+            };
+
+            let next = adapter.target_version();
+            if next <= current || next > target_opset {
+                return Err(ConvertError::InvalidAdapter {
+                    domain: domain.to_string(),
+                    op_type: original.op_type.clone(),
+                    source_version: current,
+                    target: next,
+                });
+            }
+
+            let node = graph.node(node_id).clone();
+            match adapter
+                .adapt(&node, graph)
+                .map_err(|error| ConvertError::Adapter {
+                    node: display_node(&original),
+                    message: error.to_string(),
+                })? {
+                AdaptResult::Compatible => {}
+                AdaptResult::Rewritten => rewritten = true,
+                AdaptResult::Decomposed { replacement_nodes } => {
+                    if replacement_nodes.is_empty() {
+                        return Err(ConvertError::EmptyDecomposition {
+                            node: display_node(&original),
+                        });
+                    }
+                    let mut replacements = replacement_nodes.into_iter();
+                    graph.replace_node(node_id, replacements.next().expect("checked non-empty"));
+                    for replacement in replacements {
+                        graph.insert_node(replacement);
+                    }
+                    decomposed = true;
+                }
+                AdaptResult::Incompatible { reason } => {
+                    reject(report, &original, source_opset, target_opset, reason);
+                    return Ok(());
+                }
+            }
+            current = next;
+
+            if decomposed && current < target_opset {
+                reject(
+                    report,
+                    &original,
+                    source_opset,
+                    target_opset,
+                    "adapter decomposed the node before the final target opset".to_string(),
+                );
+                return Ok(());
+            }
+        }
+
+        if decomposed {
+            report.ops_decomposed += 1;
+        } else if rewritten {
+            report.ops_converted += 1;
+        } else {
+            report.ops_unchanged += 1;
+        }
+        Ok(())
+    }
+
+    fn schema_compatible(&self, op_type: &str, domain: &str, source: u32, target: u32) -> bool {
+        let Some(source_schema) = self.schemas.lookup(op_type, domain, u64::from(source)) else {
+            return false;
+        };
+        let Some(target_schema) = self.schemas.lookup(op_type, domain, u64::from(target)) else {
+            return false;
+        };
+        source_schema.since_version == target_schema.since_version
+    }
+}
+
+impl Default for VersionConverter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Reshape opset 14 introduced `allowzero` with a default of zero. Materializing
+/// that default makes the old zero-copy semantics explicit.
+struct ReshapeAllowZeroAdapter {
+    source: u32,
+}
+
+impl ReshapeAllowZeroAdapter {
+    const fn new(source: u32) -> Self {
+        Self { source }
+    }
+}
+
+impl OpAdapter for ReshapeAllowZeroAdapter {
+    fn source(&self) -> (&str, &str, u32) {
+        ("", "Reshape", self.source)
+    }
+
+    fn target_version(&self) -> u32 {
+        14
+    }
+
+    fn adapt(&self, node: &Node, graph: &mut Graph) -> Result<AdaptResult, ConvertError> {
+        if node.attributes.contains_key("allowzero") {
+            return Ok(AdaptResult::Compatible);
+        }
+        graph
+            .node_mut(node.id)
+            .attributes
+            .insert("allowzero".to_string(), Attribute::Int(0));
+        Ok(AdaptResult::Rewritten)
+    }
+}
+
+fn default_opset(graph: &Graph) -> Result<u32, ConvertError> {
+    graph
+        .opset_imports
+        .get("")
+        .or_else(|| graph.opset_imports.get("ai.onnx"))
+        .copied()
+        .ok_or(ConvertError::MissingDefaultOpset)?
+        .try_into()
+        .map_err(|_| ConvertError::MissingDefaultOpset)
+}
+
+fn set_default_opset(graph: &mut Graph, target: u32) {
+    graph.opset_imports.remove("ai.onnx");
+    graph.opset_imports.insert(String::new(), u64::from(target));
+}
+
+fn is_default_domain(domain: &str) -> bool {
+    domain.is_empty() || domain == "ai.onnx"
+}
+
+fn normalize_domain(domain: &str) -> &str {
+    if is_default_domain(domain) {
+        "ai.onnx"
+    } else {
+        domain
+    }
+}
+
+fn display_node(node: &Node) -> String {
+    if node.name.is_empty() {
+        node.op_type.clone()
+    } else {
+        node.name.clone()
+    }
+}
+
+fn reject(
+    report: &mut ConvertReport,
+    node: &Node,
+    source_version: u32,
+    target_version: u32,
+    reason: String,
+) {
+    let detail = IncompatibleOp {
+        node_name: node.name.clone(),
+        domain: node.domain.clone(),
+        op_type: node.op_type.clone(),
+        source_version,
+        target_version,
+        reason,
+    };
+    report
+        .messages
+        .push(format!("{}: {}", display_node(node), detail.reason));
+    report.ops_rejected += 1;
+    report.ops_incompatible.push(detail);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use onnx_runtime_ir::{DataType, Node, static_shape};
+
+    fn unary_model(op_type: &str, opset: u32) -> Model {
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), u64::from(opset));
+        let input = graph.create_named_value("X", DataType::Float32, static_shape([2, 3]));
+        let output = graph.create_named_value("Y", DataType::Float32, static_shape([2, 3]));
+        graph.add_input(input);
+        graph.add_output(output);
+        let mut node = Node::new(NodeId(0), op_type, vec![Some(input)], vec![output]);
+        node.name = format!("{op_type}_0");
+        graph.insert_node(node);
+        Model::new(graph)
+    }
+
+    #[test]
+    fn schema_compatible_bump_only_updates_opset() {
+        let mut model = unary_model("Relu", 14);
+        let before = model.graph.nodes.values().next().unwrap().clone();
+
+        let report = VersionConverter::new().convert(&mut model, 21).unwrap();
+
+        let after = model.graph.nodes.values().next().unwrap();
+        assert_eq!(model.graph.opset_imports[""], 21);
+        assert_eq!(after.op_type, before.op_type);
+        assert_eq!(after.inputs, before.inputs);
+        assert_eq!(after.outputs, before.outputs);
+        assert_eq!(report.ops_unchanged, 1);
+        assert_eq!(report.ops_converted, 0);
+        assert_eq!(report.ops_rejected, 0);
+    }
+
+    #[test]
+    fn reshape_adapter_materializes_allowzero_default() {
+        let mut model = unary_model("Reshape", 13);
+
+        let report = VersionConverter::new().convert(&mut model, 14).unwrap();
+
+        let node = model.graph.nodes.values().next().unwrap();
+        assert_eq!(
+            node.attributes.get("allowzero").and_then(Attribute::as_int),
+            Some(0)
+        );
+        assert_eq!(model.graph.opset_imports[""], 14);
+        assert_eq!(report.ops_converted, 1);
+        assert_eq!(report.ops_unchanged, 0);
+        assert_eq!(report.ops_rejected, 0);
+    }
+
+    #[test]
+    fn missing_adapter_is_reported_and_model_is_unchanged() {
+        let mut model = unary_model("UnknownChangedOp", 10);
+
+        let report = VersionConverter::new().convert(&mut model, 11).unwrap();
+
+        assert_eq!(model.graph.opset_imports[""], 10);
+        assert_eq!(report.ops_rejected, 1);
+        assert_eq!(report.ops_incompatible.len(), 1);
+        assert!(report.ops_incompatible[0].reason.contains("no adapter"));
+        assert!(
+            report
+                .messages
+                .iter()
+                .any(|message| message.contains("not applied"))
+        );
+    }
+
+    #[test]
+    fn downgrade_returns_clear_error() {
+        let mut model = unary_model("Relu", 14);
+
+        let error = VersionConverter::new().convert(&mut model, 13).unwrap_err();
+
+        assert!(matches!(
+            error,
+            ConvertError::DowngradeUnsupported {
+                source_version: 14,
+                target: 13
+            }
+        ));
+        assert_eq!(model.graph.opset_imports[""], 14);
+    }
+}

@@ -952,6 +952,12 @@ pub struct ConvertReport {
 Adapters are standalone and composable. To go from opset 11 → 21, the converter
 chains: 11→13 → 13→15 → 15→17 → 17→19 → 19→21. Each step is a small adapter.
 
+**Implemented.** The initial built-in rewrite targets Reshape opset 5/13 → 14,
+materializing `allowzero = 0`. This is a small, semantics-preserving attribute
+rewrite that demonstrates mutable adapters without introducing a parallel IR.
+Operators whose source and target resolve to the same schema `since_version`
+use the registry's data-driven compatible-bump path.
+
 Users can register adapters for custom domains:
 
 ```rust
