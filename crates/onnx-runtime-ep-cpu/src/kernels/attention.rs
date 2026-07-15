@@ -484,6 +484,11 @@ impl Kernel for AttentionKernel {
                 Some(seqlen) => seqlen[b] - q_seq as i64,
                 None => past_seq as i64,
             };
+            // Per-batch padding frontier: with `nonpad_kv_seqlen`, keys at
+            // `j >= nonpad_kv_seqlen[b]` are padding in the external KV cache
+            // and must be masked to -inf REGARDLESS of causal mode. This
+            // composes with (intersects) the causal frontier and `attn_mask`.
+            let pad_limit: Option<i64> = nonpad_kv_seqlen.as_ref().map(|seqlen| seqlen[b]);
             for qh in 0..q_heads {
                 let kvh = qh / group;
                 for i in 0..q_seq {
@@ -518,6 +523,12 @@ impl Kernel for AttentionKernel {
                     // Stage 3: attention mask + causal frontier (additive bias).
                     let causal_limit = i as i64 + offset;
                     for (j, sc) in scores.iter_mut().enumerate() {
+                        // Padding mask: applies regardless of `is_causal`.
+                        let is_pad = pad_limit.is_some_and(|limit| (j as i64) >= limit);
+                        if is_pad {
+                            *sc = f32::NEG_INFINITY;
+                            continue;
+                        }
                         if self.is_causal && (j as i64) > causal_limit {
                             *sc = f32::NEG_INFINITY;
                             continue;
@@ -1644,5 +1655,166 @@ mod tests {
         assert!(got.iter().all(|x| x.is_finite()), "no NaN/inf: {got:?}");
         approx(&got[0..dv], &[0.0, 0.0], 1e-6);
         approx(&got, &want, 1e-5);
+    }
+
+    #[test]
+    fn nonpad_kv_seqlen_masks_padding_for_noncausal() {
+        // is_causal=false with nonpad < kv_seq: keys j >= nonpad are padding in
+        // the external KV cache and must contribute nothing, EVEN though no
+        // causal frontier is present. Compare against a reference that masks
+        // those keys to -inf, and assert it differs from the no-nonpad result.
+        let (b, h, sq, sk, d, dv) = (1, 1, 2, 4, 2, 2);
+        let scale = 0.5f32;
+        let q: Vec<f32> = (0..b * h * sq * d).map(|i| (i as f32 * 0.3).sin()).collect();
+        let k: Vec<f32> = (0..b * h * sk * d).map(|i| (i as f32 * 0.2).cos()).collect();
+        let v: Vec<f32> = (0..b * h * sk * dv).map(|i| i as f32 * 0.1).collect();
+        let nonpad = [2i64];
+        // Reference: non-causal, but padding keys (j >= nonpad) masked to -inf.
+        let pad_bias = |_b: usize, _h: usize, _i: usize, j: usize| {
+            if (j as i64) >= nonpad[0] {
+                f32::NEG_INFINITY
+            } else {
+                0.0
+            }
+        };
+        let want = reference(
+            &q, &k, &v, b, h, h, sq, sk, d, dv, scale, false, 0, pad_bias,
+        );
+        // Sanity: the padding mask must actually change the result vs. no mask.
+        let no_mask = reference(
+            &q, &k, &v, b, h, h, sq, sk, d, dv, scale, false, 0, |_, _, _, _| 0.0,
+        );
+        assert!(
+            want.iter().zip(&no_mask).any(|(a, c)| (a - c).abs() > 1e-4),
+            "padding mask must differ from the unmasked result"
+        );
+        let mut out = Owned::zeros_f32(&[b, h, sq, dv]);
+        kernel_v(24, Some(scale), false, None, None, 0, 0.0)
+            .execute(
+                &[
+                    Owned::f32(&[b, h, sq, d], &q).view(),
+                    Owned::f32(&[b, h, sk, d], &k).view(),
+                    Owned::f32(&[b, h, sk, dv], &v).view(),
+                    absent(),
+                    absent(),
+                    absent(),
+                    Owned::i64(&[b], &nonpad).view(),
+                ],
+                &mut [out.view_mut()],
+            )
+            .unwrap();
+        let got = out.to_f32();
+        assert!(got.iter().all(|x| x.is_finite()), "no NaN/inf: {got:?}");
+        approx(&got, &want, 1e-5);
+    }
+
+    #[test]
+    fn nonpad_kv_seqlen_causal_and_padding_compose() {
+        // Causal + nonpad together: padding keys beyond nonpad are masked AND
+        // the causal frontier holds. The kernel offset is nonpad - q_seq.
+        let (b, h, sq, sk, d, dv) = (1, 1, 2, 4, 2, 2);
+        let scale = 0.5f32;
+        let q: Vec<f32> = (0..b * h * sq * d).map(|i| (i as f32 * 0.3).sin()).collect();
+        let k: Vec<f32> = (0..b * h * sk * d).map(|i| (i as f32 * 0.2).cos()).collect();
+        let v: Vec<f32> = (0..b * h * sk * dv).map(|i| i as f32 * 0.1).collect();
+        let nonpad = [3i64];
+        let offset = nonpad[0] - sq as i64; // 1
+        // Reference: causal frontier (via offset) intersected with padding mask.
+        let pad_bias = |_b: usize, _h: usize, _i: usize, j: usize| {
+            if (j as i64) >= nonpad[0] {
+                f32::NEG_INFINITY
+            } else {
+                0.0
+            }
+        };
+        let want = reference(
+            &q, &k, &v, b, h, h, sq, sk, d, dv, scale, true, offset, pad_bias,
+        );
+        let mut out = Owned::zeros_f32(&[b, h, sq, dv]);
+        kernel_v(24, Some(scale), true, None, None, 0, 0.0)
+            .execute(
+                &[
+                    Owned::f32(&[b, h, sq, d], &q).view(),
+                    Owned::f32(&[b, h, sk, d], &k).view(),
+                    Owned::f32(&[b, h, sk, dv], &v).view(),
+                    absent(),
+                    absent(),
+                    absent(),
+                    Owned::i64(&[b], &nonpad).view(),
+                ],
+                &mut [out.view_mut()],
+            )
+            .unwrap();
+        let got = out.to_f32();
+        assert!(got.iter().all(|x| x.is_finite()), "no NaN/inf: {got:?}");
+        approx(&got, &want, 1e-5);
+    }
+
+    #[test]
+    fn nonpad_kv_seqlen_qk_output_reflects_padding_mask() {
+        // mode-2 (after-mask) qk output must be -inf at padding key positions,
+        // and mode-3 (post-softmax) must be 0 there, for non-causal attention.
+        let (b, h, sq, sk, d, dv) = (1, 1, 2, 3, 2, 2);
+        let scale = 0.5f32;
+        let q: Vec<f32> = (0..b * h * sq * d).map(|i| (i as f32 * 0.3).sin()).collect();
+        let k: Vec<f32> = (0..b * h * sk * d).map(|i| (i as f32 * 0.2).cos()).collect();
+        let v: Vec<f32> = (0..b * h * sk * dv).map(|i| i as f32 * 0.1).collect();
+        let nonpad = [2i64];
+
+        // mode 2: after-mask scores. Padding column j=2 must be -inf.
+        let mut y = Owned::zeros_f32(&[b, h, sq, dv]);
+        let mut pk = Owned::zeros_f32(&[b, h, sk, d]);
+        let mut pv = Owned::zeros_f32(&[b, h, sk, dv]);
+        let mut qk = Owned::zeros_f32(&[b, h, sq, sk]);
+        kernel_v(24, Some(scale), false, None, None, 2, 0.0)
+            .execute(
+                &[
+                    Owned::f32(&[b, h, sq, d], &q).view(),
+                    Owned::f32(&[b, h, sk, d], &k).view(),
+                    Owned::f32(&[b, h, sk, dv], &v).view(),
+                    absent(),
+                    absent(),
+                    absent(),
+                    Owned::i64(&[b], &nonpad).view(),
+                ],
+                &mut [y.view_mut(), pk.view_mut(), pv.view_mut(), qk.view_mut()],
+            )
+            .unwrap();
+        let masked = qk.to_f32();
+        for i in 0..sq {
+            assert_eq!(
+                masked[i * sk + 2],
+                f32::NEG_INFINITY,
+                "mode-2 padding column must be -inf"
+            );
+            assert!(masked[i * sk].is_finite() && masked[i * sk + 1].is_finite());
+        }
+
+        // mode 3: post-softmax probabilities. Padding column must be 0, and each
+        // row's valid probabilities sum to 1.
+        let mut y3 = Owned::zeros_f32(&[b, h, sq, dv]);
+        let mut pk3 = Owned::zeros_f32(&[b, h, sk, d]);
+        let mut pv3 = Owned::zeros_f32(&[b, h, sk, dv]);
+        let mut qk3 = Owned::zeros_f32(&[b, h, sq, sk]);
+        kernel_v(24, Some(scale), false, None, None, 3, 0.0)
+            .execute(
+                &[
+                    Owned::f32(&[b, h, sq, d], &q).view(),
+                    Owned::f32(&[b, h, sk, d], &k).view(),
+                    Owned::f32(&[b, h, sk, dv], &v).view(),
+                    absent(),
+                    absent(),
+                    absent(),
+                    Owned::i64(&[b], &nonpad).view(),
+                ],
+                &mut [y3.view_mut(), pk3.view_mut(), pv3.view_mut(), qk3.view_mut()],
+            )
+            .unwrap();
+        let probs = qk3.to_f32();
+        for i in 0..sq {
+            assert_eq!(probs[i * sk + 2], 0.0, "mode-3 padding prob must be 0");
+            let s = probs[i * sk] + probs[i * sk + 1];
+            assert!((s - 1.0).abs() < 1e-6, "valid probs must sum to 1: {s}");
+        }
     }
 }
