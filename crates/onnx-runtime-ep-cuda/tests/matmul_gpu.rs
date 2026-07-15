@@ -44,6 +44,51 @@ fn cpu_reference(a: &[f32], b: &[f32], batch: usize, m: usize, k: usize, n: usiz
     c
 }
 
+fn cpu_reference_nd(a: &[f32], b: &[f32], a_shape: &[usize], b_shape: &[usize]) -> Vec<f32> {
+    let (m, k, n) = (
+        a_shape[a_shape.len() - 2],
+        a_shape[a_shape.len() - 1],
+        b_shape[b_shape.len() - 1],
+    );
+    let batch_rank = (a_shape.len() - 2).max(b_shape.len() - 2);
+    let mut ad = vec![1; batch_rank];
+    let mut bd = vec![1; batch_rank];
+    ad[batch_rank - (a_shape.len() - 2)..].copy_from_slice(&a_shape[..a_shape.len() - 2]);
+    bd[batch_rank - (b_shape.len() - 2)..].copy_from_slice(&b_shape[..b_shape.len() - 2]);
+    let out_batch: Vec<usize> = ad.iter().zip(&bd).map(|(&x, &y)| x.max(y)).collect();
+    let batches: usize = out_batch.iter().product();
+    let mut out = vec![0.0; batches * m * n];
+
+    for batch in 0..batches {
+        let mut rem = batch;
+        let mut a_batch = 0;
+        let mut b_batch = 0;
+        let mut a_stride = 1;
+        let mut b_stride = 1;
+        for axis in (0..batch_rank).rev() {
+            let coord = rem % out_batch[axis];
+            rem /= out_batch[axis];
+            if ad[axis] != 1 {
+                a_batch += coord * a_stride;
+            }
+            if bd[axis] != 1 {
+                b_batch += coord * b_stride;
+            }
+            a_stride *= ad[axis];
+            b_stride *= bd[axis];
+        }
+        for i in 0..m {
+            for j in 0..n {
+                for p in 0..k {
+                    out[batch * m * n + i * n + j] +=
+                        a[a_batch * m * k + i * k + p] * b[b_batch * k * n + p * n + j];
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Run one f32 MatMul on the GPU and return the host result.
 fn run_gpu_matmul_f32(
     ep: &CudaExecutionProvider,
@@ -168,6 +213,26 @@ fn matmul_f32_on_gpu_matches_cpu_reference() {
         "batched mismatch gpu {got3:?} vs {expected3:?}"
     );
 
+    // Case 4: equal-batch 4-D.
+    let a4: Vec<f32> = (0..48).map(|i| (i as f32 - 17.0) / 11.0).collect();
+    let b4: Vec<f32> = (0..80).map(|i| (23.0 - i as f32) / 13.0).collect();
+    let got4 = run_gpu_matmul_f32(&ep, &a4, &b4, &[2, 2, 3, 4], &[2, 2, 4, 5], &[2, 2, 3, 5]);
+    let expected4 = cpu_reference_nd(&a4, &b4, &[2, 2, 3, 4], &[2, 2, 4, 5]);
+    assert!(
+        approx_eq(&got4, &expected4, 2e-4),
+        "4-D batched mismatch gpu {got4:?} vs {expected4:?}"
+    );
+
+    // Case 5: both operands broadcast a different leading batch dimension.
+    let a5: Vec<f32> = (0..24).map(|i| (i as f32 + 1.0) / 9.0).collect();
+    let b5: Vec<f32> = (0..60).map(|i| (i as f32 - 7.0) / 10.0).collect();
+    let got5 = run_gpu_matmul_f32(&ep, &a5, &b5, &[2, 1, 3, 4], &[1, 3, 4, 5], &[2, 3, 3, 5]);
+    let expected5 = cpu_reference_nd(&a5, &b5, &[2, 1, 3, 4], &[1, 3, 4, 5]);
+    assert!(
+        approx_eq(&got5, &expected5, 2e-4),
+        "broadcast batched mismatch gpu {got5:?} vs {expected5:?}"
+    );
+
     println!("all cuBLASLt MatMul cases passed on {:?}", ep.device_id());
 }
 
@@ -180,56 +245,54 @@ fn matmul_rejects_unsupported_rank_and_dtype() {
             return;
         }
     };
-    let rt = ep.runtime();
     let dev = ep.device_id();
 
-    // A 4-D operand is out of Phase-2a scope: expect an actionable error, not a
-    // panic. Use tiny real device buffers so pointer math is valid.
+    // The formerly rejected 4-D case now executes and is checked against CPU.
     let a = [1.0f32; 16];
     let b = [1.0f32; 16];
-    let a_buf = ep.allocate(64, 256).unwrap();
-    let b_buf = ep.allocate(64, 256).unwrap();
-    let mut c_buf = ep.allocate(64, 256).unwrap();
-    // SAFETY: 16 f32 = 64 bytes each.
-    unsafe {
-        rt.htod(f32_bytes(&a), cuptr(a_buf.as_ptr())).unwrap();
-        rt.htod(f32_bytes(&b), cuptr(b_buf.as_ptr())).unwrap();
-    }
     let a_shape = [2usize, 2, 2, 2];
     let b_shape = [2usize, 2, 2, 2];
     let out_shape = [2usize, 2, 2, 2];
-    let a_str = compute_contiguous_strides(&a_shape);
-    let b_str = compute_contiguous_strides(&b_shape);
-    let o_str = compute_contiguous_strides(&out_shape);
+    let got = run_gpu_matmul_f32(&ep, &a, &b, &a_shape, &b_shape, &out_shape);
+    let expected = cpu_reference_nd(&a, &b, &a_shape, &b_shape);
+    assert!(approx_eq(&got, &expected, 1e-4), "{got:?} vs {expected:?}");
+
+    // Int64 remains unsupported, with the current actionable dtype wording.
+    let a_buf = ep.allocate(8, 256).unwrap();
+    let b_buf = ep.allocate(8, 256).unwrap();
+    let mut c_buf = ep.allocate(8, 256).unwrap();
+    let shape = [1usize, 1];
+    let strides = compute_contiguous_strides(&shape);
     let av = TensorView::new(
         DevicePtr(a_buf.as_ptr()),
-        DataType::Float32,
-        &a_shape,
-        &a_str,
+        DataType::Int64,
+        &shape,
+        &strides,
         dev,
     );
     let bv = TensorView::new(
         DevicePtr(b_buf.as_ptr()),
-        DataType::Float32,
-        &b_shape,
-        &b_str,
+        DataType::Int64,
+        &shape,
+        &strides,
         dev,
     );
     let ov = TensorMut::new(
         DevicePtrMut(c_buf.as_mut_ptr()),
-        DataType::Float32,
-        &out_shape,
-        &o_str,
+        DataType::Int64,
+        &shape,
+        &strides,
         dev,
     );
     let node = Node::new(NodeId(0), "MatMul", vec![], vec![]);
     let kernel = ep.get_kernel(&node, &[], 17).unwrap();
     let err = kernel
         .execute(&[av, bv], &mut [ov])
-        .expect_err("4-D MatMul must be rejected in Phase 2a");
+        .expect_err("Int64 MatMul must be rejected");
     let msg = format!("{err}");
-    println!("rank error: {msg}");
-    assert!(msg.contains("Phase 2a"), "error must name Phase 2a: {msg}");
+    println!("dtype error: {msg}");
+    assert!(msg.contains("MatMul with dtype Int64"), "{msg}");
+    assert!(msg.contains("not yet implemented"), "{msg}");
 
     ep.deallocate(a_buf).unwrap();
     ep.deallocate(b_buf).unwrap();

@@ -47,7 +47,7 @@ not yet wired) · **🔬 custom** (needs a fused NVRTC/CUTLASS kernel).
 
 | Op | Domain | Status | Backend | Notes / justification |
 |----|--------|--------|---------|-----------------------|
-| `MatMul` | `` | ✅ | **cuBLASLt** | 2-D + equal-batch 3-D, f32/f16/bf16, true-fp32 accum (`matmul.rs`). |
+| `MatMul` | `` | ✅ | **cuBLASLt** | Dense rank ≥ 2 with N-D batch broadcasting, f32/f16/bf16, true-fp32 accum (`matmul.rs`); rank-1 promotion pending. |
 | `Gemm` | `` | ✅ | **cuBLASLt** + NVRTC bias | `Y=α·A'·B'+β·C`, transA/transB, α/β; fused NVRTC `β·C` broadcast-bias epilogue (`gemm.rs`). f32. |
 | `FusedMatMulBias` | `com.microsoft` | ⏳ | **cuBLASLt** epilogue | `CUBLASLT_EPILOGUE_BIAS` — bias add fused into the GEMM (no extra pass). |
 | `FusedGemm` | `com.microsoft` | ⏳ | **cuBLASLt** epilogue | `EPILOGUE_RELU_BIAS`/`GELU_BIAS` — activation+bias fused in-GEMM. |

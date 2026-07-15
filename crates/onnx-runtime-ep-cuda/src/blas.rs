@@ -45,7 +45,7 @@
 //! ## Deferred (Phase 2b)
 //!
 //! Fused bias/activation epilogues (`CUBLASLT_EPILOGUE_BIAS_*`), FP8, GEMV auto-
-//! tuning, and strided/broadcast batched inputs are **not** wired here yet.
+//! tuning and FP8 are **not** wired here yet.
 
 use core::ffi::c_int;
 use std::ffi::c_void;
@@ -224,6 +224,10 @@ pub struct GemmParams {
     pub n: usize,
     /// Number of independent matrices (1 for a plain 2-D GEMM).
     pub batch: usize,
+    /// Element strides between A/B matrices. A zero stride broadcasts one
+    /// matrix across the batch.
+    pub a_batch_stride: usize,
+    pub b_batch_stride: usize,
 }
 
 /// Default cuBLASLt workspace. 32 MiB is NVIDIA's recommendation for Hopper
@@ -238,8 +242,8 @@ pub const WORKSPACE_BYTES: usize = 32 * 1024 * 1024;
 /// # Safety
 ///
 /// * `handle` must be a live cuBLASLt handle.
-/// * `p.a`, `p.b`, `p.c` must be live device allocations, each large enough for
-///   `batch` contiguous row-major matrices of the stated shape and `p.dtype`.
+/// * `p.a`, `p.b`, `p.c` must be live device allocations large enough for all
+///   matrices addressed by the supplied element strides and `p.dtype`.
 /// * `workspace` must be a live device allocation of `workspace_bytes`.
 /// * `stream` must be a valid CUDA stream; the owning context must be current on
 ///   the calling thread.
@@ -273,8 +277,8 @@ pub unsafe fn gemm(
             EpError::KernelFailed(format!("cuda_ep MatMul: batch {} exceeds i32", p.batch))
         })?;
         // Strides are in ELEMENTS between consecutive matrices in the batch.
-        a_layout.set_batch(count, (p.n * p.k) as i64)?; // B matrices
-        b_layout.set_batch(count, (p.m * p.k) as i64)?; // A matrices
+        a_layout.set_batch(count, p.b_batch_stride as i64)?; // B matrices
+        b_layout.set_batch(count, p.a_batch_stride as i64)?; // A matrices
         c_layout.set_batch(count, (p.m * p.n) as i64)?; // C matrices
     }
 
