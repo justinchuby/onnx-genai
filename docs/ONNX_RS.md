@@ -836,7 +836,7 @@ checker.add_rule(MaxGraphDepthRule { max_depth: 5 });
 
 ---
 
-## 9. Shape Inference
+## 9. Shape Inference ✅ Implemented
 
 ### 9.1 Delegates to Existing Crate
 
@@ -846,9 +846,8 @@ onnx-rs wraps it with a higher-level API:
 ```rust
 /// Run shape inference on a model, populating all value type/shape info.
 pub fn infer_shapes(model: &mut Model) -> Result<ShapeInferenceResult, ShapeError> {
-    // Uses onnx-runtime-shape-inference handlers
-    // + OpSchema type constraints for validation
-    onnx_runtime_shape_inference::infer_graph_shapes(&mut model.graph, &model.opset_imports)
+    let registry = InferenceRegistry::default_registry();
+    infer_shapes_with_registry(model, &registry)
 }
 
 pub struct ShapeInferenceResult {
@@ -856,31 +855,25 @@ pub struct ShapeInferenceResult {
     pub inferred: usize,
     /// Values whose shapes could not be determined (dynamic, unknown op, etc.).
     pub unknown: usize,
-    /// Warnings (e.g., shape depends on runtime value).
+    /// Non-fatal diagnostics (currently empty; unresolved values count as unknown).
     pub warnings: Vec<String>,
 }
 ```
 
 ### 9.2 Custom Op Shape Inference
 
-Custom ops can register shape inference functions through the same trait:
+Custom ops register the underlying crate's opset-aware `InferenceFn` on an
+`InferenceRegistry`, then call `infer_shapes_with_registry`:
 
 ```rust
 /// Register a shape inference handler for a custom op.
 pub fn register_shape_inference(
+    registry: &mut InferenceRegistry,
     domain: &str,
     op_type: &str,
-    handler: impl ShapeInferenceHandler + 'static,
+    min_opset: u64,
+    handler: InferenceFn,
 );
-
-pub trait ShapeInferenceHandler: Send + Sync {
-    fn infer(
-        &self,
-        node: &Node,
-        input_types: &[Option<TypeInfo>],
-        attrs: &AttributeMap,
-    ) -> Result<Vec<TypeInfo>, ShapeError>;
-}
 ```
 
 ---

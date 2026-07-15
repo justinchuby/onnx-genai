@@ -1858,6 +1858,7 @@ dependencies = [
  "base64 0.22.1",
  "onnx-runtime-ir",
  "onnx-runtime-loader",
+ "onnx-runtime-shape-inference",
  "prost",
  "serde",
  "serde_json",

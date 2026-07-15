@@ -12,6 +12,7 @@ categories = ["science", "parser-implementations"]
 base64 = "0.22"
 onnx-runtime-ir = { workspace = true }
 onnx-runtime-loader = { workspace = true }
+onnx-runtime-shape-inference = { workspace = true }
 prost = "0.13"
 serde = { workspace = true }
 serde_json = { workspace = true }

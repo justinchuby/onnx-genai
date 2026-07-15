@@ -29,10 +29,11 @@
 //! | §5         | [`Model::to_text`] / [`Model::from_text`] | ✅ |
 //! | §7         | [`schema`] op schemas and opset-aware registry | ✅ |
 //! | §8         | [`check::OnnxChecker`] extensible validator | ✅ (schema-aware) |
+//! | §9         | [`shape::infer_shapes`] symbolic shape inference | ✅ |
 //!
 //! Deferred to later waves (see `// FOLLOW-UP` markers): JSON / TextProto (§6),
-//! the remaining checker rule set (§8.2), shape inference wrapping (§9), the version converter (§10),
-//! custom-op registration (§11), and Python bindings (§12).
+//! the remaining checker rule set (§8.2), the version converter (§10), custom-op
+//! registration (§11), and Python bindings (§12).
 //!
 //! ## Example
 //!
@@ -52,6 +53,7 @@ mod error;
 pub mod json;
 mod model;
 pub mod schema;
+pub mod shape;
 pub mod text;
 
 pub use error::{Error, Result};
@@ -68,4 +70,5 @@ pub use schema::{
     AttributeDefault, AttributeSpec, AttributeType, InputSpec, OpSchema, OutputSpec, SchemaError,
     SchemaRegistry, TypeConstraint,
 };
+pub use shape::{ShapeError, ShapeInferenceResult, infer_shapes};
 pub use text::{PrintOptions, parse_model};
