@@ -7,10 +7,16 @@
 //! - Batch formation
 
 pub mod byte_budget;
+pub mod governor;
 pub mod policy;
 
 pub use byte_budget::{
     BudgetSnapshot, ByteBudget, ByteBudgetError, ReconfigureOutcome as ByteBudgetReconfigureOutcome,
+};
+pub use governor::{
+    derive_kv_budget, resolve_limit, CapacityProvider, CapacityProviders, DerivedBudget,
+    EvictionTier, FixedCapacity, GovernorReconfigureOutcome, GovernorSnapshot, ModelKvConfig,
+    ResolvedLimits, ResourceError, ResourceGovernor, ResourceLimit, ResourceLimits, VramBreakdown,
 };
 pub use policy::FairSharePolicy;
 
