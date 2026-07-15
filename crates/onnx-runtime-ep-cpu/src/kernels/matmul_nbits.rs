@@ -24,10 +24,16 @@ impl KernelFactory for MatMulNBitsFactory {
     fn create(&self, node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
         let k = required_positive_attr(node, "K")?;
         let n = required_positive_attr(node, "N")?;
-        let bits = required_positive_attr(node, "bits")?;
+        let bits = optional_int_attr(node, "bits")?.unwrap_or(4);
         if bits != 4 {
             return Err(error(format!(
                 "only bits=4 is supported in the CPU Phase-1 kernel, got {bits}"
+            )));
+        }
+        let weight_prepacked = optional_int_attr(node, "weight_prepacked")?.unwrap_or(0);
+        if weight_prepacked != 0 {
+            return Err(error(format!(
+                "weight_prepacked={weight_prepacked} is unsupported: CPU only supports the standard (non-prepacked) layout"
             )));
         }
         let block_size = required_positive_attr(node, "block_size")?;
@@ -171,9 +177,7 @@ fn optional_input<'a>(inputs: &'a [TensorView<'a>], index: usize) -> Option<&'a 
 }
 
 fn required_positive_attr(node: &Node, name: &str) -> Result<usize> {
-    let value = node
-        .attr(name)
-        .and_then(|attribute| attribute.as_int())
+    let value = optional_int_attr(node, name)?
         .ok_or_else(|| error(format!("missing required integer attribute '{name}'")))?;
     if value <= 0 {
         return Err(error(format!(
@@ -181,6 +185,16 @@ fn required_positive_attr(node: &Node, name: &str) -> Result<usize> {
         )));
     }
     Ok(value as usize)
+}
+
+fn optional_int_attr(node: &Node, name: &str) -> Result<Option<i64>> {
+    match node.attr(name) {
+        Some(attribute) => attribute
+            .as_int()
+            .map(Some)
+            .ok_or_else(|| error(format!("attribute '{name}' must be an integer"))),
+        None => Ok(None),
+    }
 }
 
 fn require_dtype(name: &str, got: DataType, expected: DataType) -> Result<()> {
@@ -223,10 +237,10 @@ fn error(message: impl Into<String>) -> EpError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::CpuExecutionProvider;
     use crate::kernels::testutil::Owned;
+    use crate::CpuExecutionProvider;
     use onnx_runtime_ep_api::ExecutionProvider;
-    use onnx_runtime_ir::{Attribute, Graph, NodeId, static_shape};
+    use onnx_runtime_ir::{static_shape, Attribute, Graph, NodeId};
     use onnx_runtime_loader::Model;
 
     fn model_node(
@@ -508,5 +522,48 @@ mod tests {
             .err()
             .expect("bits=8 must be rejected");
         assert!(format!("{error}").contains("only bits=4"));
+    }
+
+    #[test]
+    fn matmulnbits_defaults_missing_bits_to_int4() {
+        let k = 16;
+        let (graph, node) = model_node(&[1, k], &[1, 1, 8], &[1], None, &[1, 1], k, 1, 16);
+        let mut graph = graph;
+        graph.node_mut(node).attributes.remove("bits");
+        let model = Model::new(&graph);
+        let kernel = CpuExecutionProvider::new()
+            .get_kernel(model.graph.node(node), &[], 1)
+            .expect("missing bits must default to 4");
+        let mut activation = vec![0.0; k];
+        activation[0] = 1.0;
+        activation[1] = 10.0;
+        let mut packed = vec![0x88; 8];
+        packed[0] = 0xe1;
+        let a = Owned::f32(&[1, k], &activation);
+        let b = Owned::u8(&[1, 1, 8], &packed);
+        let scales = Owned::f32(&[1], &[1.0]);
+        let mut y = Owned::zeros_f32(&[1, 1]);
+        kernel
+            .execute(&[a.view(), b.view(), scales.view()], &mut [y.view_mut()])
+            .unwrap();
+        assert_eq!(y.to_f32(), vec![53.0]);
+    }
+
+    #[test]
+    fn matmulnbits_rejects_prepacked_weight_layout() {
+        let (graph, node) = model_node(&[1, 16], &[1, 1, 8], &[1], None, &[1, 1], 16, 1, 16);
+        let mut graph = graph;
+        graph
+            .node_mut(node)
+            .attributes
+            .insert("weight_prepacked".into(), Attribute::Int(1));
+        let model = Model::new(&graph);
+        let error = CpuExecutionProvider::new()
+            .get_kernel(model.graph.node(node), &[], 1)
+            .err()
+            .expect("prepacked weights must be rejected");
+        let message = format!("{error}");
+        assert!(message.contains("weight_prepacked=1"));
+        assert!(message.contains("standard (non-prepacked) layout"));
     }
 }
