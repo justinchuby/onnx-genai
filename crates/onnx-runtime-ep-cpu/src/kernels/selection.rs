@@ -372,6 +372,94 @@ mod tests {
         .unwrap();
         assert_eq!(f16_out.to_f16_as_f32(), vec![0., 0.5, 1.]);
     }
+
+    #[test]
+    fn clip_clamps_negative_i32_values() {
+        let x = Owned::i32(&[5], &[-5, -1, 0, 3, 9]);
+        let lo = Owned::i32(&[], &[-2]);
+        let hi = Owned::i32(&[], &[4]);
+        let mut y = Owned::zeros(DataType::Int32, &[5]);
+        ClipKernel {
+            min: None,
+            max: None,
+        }
+        .execute(&[x.view(), lo.view(), hi.view()], &mut [y.view_mut()])
+        .unwrap();
+        assert_eq!(y.to_i32(), vec![-2, -1, 0, 3, 4]);
+    }
+
+    #[test]
+    fn clip_honors_absent_integer_bound_slots() {
+        let x = Owned::i32(&[5], &[-5, -1, 0, 3, 9]);
+        let lo = Owned::i32(&[], &[-2]);
+        let hi = Owned::i32(&[], &[4]);
+
+        let mut lower_only = Owned::zeros(DataType::Int32, &[5]);
+        ClipKernel {
+            min: None,
+            max: None,
+        }
+        .execute(
+            &[x.view(), lo.view(), TensorView::absent(DataType::Int32)],
+            &mut [lower_only.view_mut()],
+        )
+        .unwrap();
+        assert_eq!(lower_only.to_i32(), vec![-2, -1, 0, 3, 9]);
+
+        let mut upper_only = Owned::zeros(DataType::Int32, &[5]);
+        ClipKernel {
+            min: None,
+            max: None,
+        }
+        .execute(
+            &[x.view(), TensorView::absent(DataType::Int32), hi.view()],
+            &mut [upper_only.view_mut()],
+        )
+        .unwrap();
+        assert_eq!(upper_only.to_i32(), vec![-5, -1, 0, 3, 4]);
+    }
+
+    #[test]
+    fn clip_supports_i64_tensor_bounds() {
+        let x = Owned::i64(&[5], &[-9, -2, 0, 4, 12]);
+        let lo = Owned::i64(&[], &[-3]);
+        let hi = Owned::i64(&[], &[5]);
+        let mut y = Owned::zeros(DataType::Int64, &[5]);
+        ClipKernel {
+            min: None,
+            max: None,
+        }
+        .execute(&[x.view(), lo.view(), hi.view()], &mut [y.view_mut()])
+        .unwrap();
+        assert_eq!(y.to_i64(), vec![-3, -2, 0, 4, 5]);
+    }
+
+    #[test]
+    fn clip_supports_f64_tensor_bounds() {
+        let f64_owned = |shape: &[usize], data: &[f64]| Owned {
+            bytes: data.iter().flat_map(|v| v.to_le_bytes()).collect(),
+            shape: shape.to_vec(),
+            strides: onnx_runtime_ir::compute_contiguous_strides(shape),
+            dtype: DataType::Float64,
+        };
+        let x = f64_owned(&[5], &[-3.5, -1.0, 0.5, 2.0, 8.5]);
+        let lo = f64_owned(&[], &[-2.0]);
+        let hi = f64_owned(&[], &[4.0]);
+        let mut y = Owned::zeros(DataType::Float64, &[5]);
+        ClipKernel {
+            min: None,
+            max: None,
+        }
+        .execute(&[x.view(), lo.view(), hi.view()], &mut [y.view_mut()])
+        .unwrap();
+        let values: Vec<f64> = y
+            .bytes
+            .chunks_exact(8)
+            .map(|bytes| f64::from_le_bytes(bytes.try_into().unwrap()))
+            .collect();
+        assert_eq!(values, vec![-2.0, -1.0, 0.5, 2.0, 4.0]);
+    }
+
     #[test]
     fn argmax_last_tie_negative_axis() {
         let x = Owned::f32(&[2, 3], &[1., 4., 4., 3., 2., 1.]);
