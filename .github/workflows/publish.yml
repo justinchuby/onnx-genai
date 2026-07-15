@@ -6,6 +6,10 @@ on:
     tags:
       - "v*"
 
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
 permissions:
   contents: read
 

@@ -140,7 +140,8 @@ fn map_session_error(err: &SessionError) -> OrtErrorCode {
         | E::Internal(_)
         | E::UnresolvedShape { .. }
         | E::ShapeOverflow { .. }
-        | E::OutputShapeCountMismatch { .. } => OrtErrorCode::Fail,
+        | E::OutputShapeCountMismatch { .. }
+        | E::SequenceOp { .. } => OrtErrorCode::Fail,
     }
 }
 
