@@ -225,7 +225,11 @@ fn print_node(out: &mut String, graph: &Graph, nid: NodeId, depth: usize, opts: 
 }
 
 fn is_subgraph_attr(attr: &Attribute) -> bool {
-    matches!(attr, Attribute::Graph(_) | Attribute::Graphs(_))
+    match attr {
+        Attribute::Graph(_) => true,
+        Attribute::Graphs(graphs) => !graphs.is_empty(),
+        _ => false,
+    }
 }
 
 /// A value rendered as `dtype[shape] name` (or just `dtype name` for a scalar).
@@ -290,6 +294,7 @@ fn attr_value(attr: &Attribute) -> String {
             Ok(s) => format!("{:?}", s),
             Err(_) => format!("<{} bytes>", bytes.len()),
         },
+        Attribute::Ints(v) if v.is_empty() => "[]:ints".to_string(),
         Attribute::Ints(v) => format!(
             "[{}]",
             v.iter()
@@ -297,6 +302,7 @@ fn attr_value(attr: &Attribute) -> String {
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
+        Attribute::Floats(v) if v.is_empty() => "[]:floats".to_string(),
         Attribute::Floats(v) => format!(
             "[{}]",
             v.iter()
@@ -304,6 +310,7 @@ fn attr_value(attr: &Attribute) -> String {
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
+        Attribute::Strings(values) if values.is_empty() => "[]:strings".to_string(),
         Attribute::Strings(values) => values
             .iter()
             .map(|bytes| std::str::from_utf8(bytes).map(|value| format!("{value:?}")))
@@ -314,6 +321,7 @@ fn attr_value(attr: &Attribute) -> String {
         Attribute::SparseTensor(_) => "<sparse tensor>".to_string(),
         Attribute::TypeProto(_) => "<type>".to_string(),
         // Subgraph attributes are printed as nested blocks, not inline.
+        Attribute::Graphs(graphs) if graphs.is_empty() => "[]:graphs".to_string(),
         Attribute::Graph(_) | Attribute::Graphs(_) => "<graph>".to_string(),
     }
 }

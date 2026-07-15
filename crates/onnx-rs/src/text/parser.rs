@@ -345,6 +345,13 @@ fn parse_invocation(text: &str, line: usize) -> Result<(&str, HashMap<String, At
 }
 
 fn parse_attribute(text: &str, line: usize) -> Result<Attribute> {
+    match text {
+        "[]:ints" => return Ok(Attribute::Ints(Vec::new())),
+        "[]:floats" => return Ok(Attribute::Floats(Vec::new())),
+        "[]:strings" => return Ok(Attribute::Strings(Vec::new())),
+        "[]:graphs" => return Ok(Attribute::Graphs(Vec::new())),
+        _ => {}
+    }
     if text.starts_with('"') {
         let value: String = serde_yaml::from_str(text)
             .map_err(|error| parse_error(line, format!("invalid string: {error}")))?;
@@ -886,6 +893,39 @@ mod tests {
         let initializer = parsed.graph.initializers.values().next().unwrap();
         assert_eq!(initializer.dtype(), DataType::Float32);
         assert_eq!(initializer.dims(), &[2]);
+    }
+
+    #[test]
+    fn round_trips_empty_typed_attribute_lists() {
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 21);
+        let x = graph.create_named_value("X", DataType::Float32, static_shape([2]));
+        let y = graph.create_named_value("Y", DataType::Float32, static_shape([2]));
+        graph.add_input(x);
+        let mut node = Node::new(NodeId(0), "EmptyLists", vec![Some(x)], vec![y]);
+        node.attributes
+            .insert("ints".into(), Attribute::Ints(Vec::new()));
+        node.attributes
+            .insert("floats".into(), Attribute::Floats(Vec::new()));
+        node.attributes
+            .insert("strings".into(), Attribute::Strings(Vec::new()));
+        node.attributes
+            .insert("graphs".into(), Attribute::Graphs(Vec::new()));
+        graph.insert_node(node);
+        graph.add_output(y);
+
+        let text = print(&Model::new(graph));
+        assert!(text.contains("ints = []:ints"), "{text}");
+        assert!(text.contains("floats = []:floats"), "{text}");
+        assert!(text.contains("strings = []:strings"), "{text}");
+        assert!(text.contains("graphs = []:graphs"), "{text}");
+
+        let parsed = parse_model(&text).unwrap();
+        let node = node_by_op(&parsed.graph, "EmptyLists");
+        assert!(matches!(&node.attributes["ints"], Attribute::Ints(v) if v.is_empty()));
+        assert!(matches!(&node.attributes["floats"], Attribute::Floats(v) if v.is_empty()));
+        assert!(matches!(&node.attributes["strings"], Attribute::Strings(v) if v.is_empty()));
+        assert!(matches!(&node.attributes["graphs"], Attribute::Graphs(v) if v.is_empty()));
     }
 
     fn branch(input: &str, output: &str, op: &str) -> Graph {
