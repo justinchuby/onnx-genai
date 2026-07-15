@@ -865,3 +865,14 @@ CHANNEL/AVG results match element-for-element.
 **By:** Squad (Justin Chu)
 **What:** All 25 publishable workspace crates published to crates.io at 0.1.0-dev.2 (13 onnx-runtime-* + 12 onnx-genai-*). First-time crates: onnx-runtime-{tracer,eager,ep-cuda,memory,cpuinfo}, onnx-genai-{metadata,genai-config,kv,ort-sys,runtime-config,preprocess,router,scheduler,engine,ort,server} and onnx-genai. Excluded (publish=false): onnx-genai-bench, onnx-runtime-dlpack, onnx-runtime-python.
 **Why/How:** Unified workspace to version 0.1.0-dev.2 with exact =pin internal deps; completed the publish CI crate list (was missing 7 crates); fixed two release blockers surfaced by the run: (1) onnx-runtime-capi non-exhaustive match on SessionError::SequenceOp (E0004) — mapped to OrtErrorCode::Fail; (2) genai publish topological order bug (onnx-genai-engine was invoked before its dep onnx-genai-preprocess) — reordered. Made publish_crate() 429-aware: it now parses crates.io's "try again after <date>" and sleeps out the new-crate burst rate limit instead of exhausting its retry budget. Added a top-level concurrency guard to prevent duplicate publish runs. Final main commit: 01011f6; tag v0.1.0-dev.2.
+
+
+---
+
+### 2026-07-15: Coverage batch — onnx-rs crate + ep-cpu comparisons + CUDA wave-4
+**By:** Squad (Justin Chu)
+**What:** (a) New `onnx-rs` crate (crates/onnx-rs) — Wave 1 of docs/ONNX_RS.md: reuses onnx-runtime-ir for the IR + onnx-runtime-loader protobuf; adds owned Model + load/save round-trip, §5 text dump, §8 extensible checker. Also taught the onnx-runtime-loader ENCODER to serialize nested Graph/Graphs attributes so control-flow (If/Loop/Scan) models round-trip. (b) ep-cpu: added Greater/GreaterOrEqual/Less/LessOrEqual comparison kernels + fixed opset-13 Softmax default axis (-1); ONNX backend test suite CPU pass 687→720 (+33). (c) ep-cuda: wave-4 activations LeakyRelu/Elu/HardSigmoid/Clip/Softsign/Selu (GPU-validated on H200) + Clip omitted-optional-bounds fix (finite f32::MIN/MAX defaults) + docs/CUDA_COVERAGE.md audit.
+**Commits:** e34584b (ep-cpu), 322ba17 (cuda wave4 + Clip fix), e7d11f3 (onnx-rs + loader encoder).
+**Reviews:** Roy 🟢 (ep-cpu); Rachael 🔴→🟢 (cuda, Clip fix by Leon); Holden 🔴→🟢 (onnx-rs, nested-graph fix by Zhora). Strict-lockout honored (Leon fixed Gaff's reject; Zhora fixed Deckard's reject).
+**Follow-ups:** onnx-rs not yet in publish.yml; onnx-rs Wave 2 (JSON/textproto/op-schema/version-converter/pybindings); stale CUDA matmul_rejects test assertion (pre-existing).
+**Sources:** `gaff-cuda-wave4.md`, `ripley-epcpu-backend-gaps.md`, `Holden-approve-zhora-s-onnx-rs-control-flow-fixes.md`.
