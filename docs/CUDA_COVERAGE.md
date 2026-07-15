@@ -56,7 +56,7 @@ not yet wired) · **🔬 custom** (needs a fused NVRTC/CUTLASS kernel).
 
 | Op | Domain | Status | Backend | Notes / justification |
 |----|--------|--------|---------|-----------------------|
-| `Conv` | `` | ✅ | **cuDNN** | 2-D dense NCHW f32/f16/bf16; strides, dilation, groups, symmetric explicit padding, `VALID`, symmetric `SAME_UPPER`/`SAME_LOWER`, and optional fused channel bias. Asymmetric padding is rejected explicitly. Uses cuDNN v7 forward-algorithm heuristics and queried workspace. |
+| `Conv` | `` | ✅ | **cuDNN** | 2-D dense NCHW f32/f16/bf16; strides, dilation, groups, symmetric explicit padding, `VALID`, symmetric `SAME_UPPER`/`SAME_LOWER`, and optional fused channel bias. Asymmetric padding is rejected explicitly. Fused bias+identity forces `CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_PRECOMP_GEMM`; other paths use v7 heuristics and queried workspace. |
 
 ### Elementwise — unary / activations
 
@@ -190,7 +190,8 @@ activations are GPU-validated against independent CPU formulas on the local
 CUDA 13.0 host; broader performance validation remains separate.
 
 The cuDNN Conv pass raises the advertised set to **55** op names and is
-GPU-validated for padded f32, grouped/strided f32, and padded f16 convolution.
+GPU-validated for padded f32, grouped/strided f32, padded f16, and numerically checked
+dilated convolution on H200.
 
 The pointwise dtype/broadcast pass is GPU-validated on H200 for f16 and bf16
 `Add`/`Sub`/`Mul`/`Div`, `[4,1,3]` with `[1,5,3]` NumPy broadcasting, and

@@ -245,3 +245,11 @@ Scoped the "export Gemma4 E2B/12B via Mobius and smoke-test through onnx-genai" 
 - **ONNX-RS §6 JSON serde ✅ (`d6f23d7`, Deckard; Rachael/Ripley corrective fixes):** Added lossless Model JSON serialize/deserialize, including FLOAT8/INT4/UINT4/FLOAT4 tensor round-trips, and fixed loader weight conversion that dropped those dtypes. Unsupported populated proto fields now return explicit errors rather than silently disappearing. `onnx-rs` has **42** unit tests plus **1** doctest; `Cargo.lock` includes base64/prost/serde_json for `--locked` CI, and `onnx-rs` is in `publish.yml`. Holden reviewed 🟢 after two rejection cycles.
 
 **Current main HEAD:** `d6f23d7`.
+
+## 2026-07-15 — Wave 5: Shape inference, resource governance, and cuDNN Conv
+
+- **ONNX-RS §9 shape inference ✅ (`7dab8b0`, Deckard):** New `onnx-rs::shape` wraps `InferenceRegistry::infer_graph` with permissive merging, mutating the shared IR graph to populate inferred shapes. Public `infer_shapes` / `infer_shapes_with_registry`, custom-op handler registration, and result/error/handler re-exports make the existing inference crate available through ONNX-RS. **44** unit tests plus **1** doctest; Holden reviewed 🟢.
+- **§26.11 Resource Governor core ✅ (`4cd4bdc`, Roy; Chew corrective fix):** Scheduler resource limits support byte/fraction/auto per tier (defaults: VRAM 90%, host RAM 25%, disk disabled), vendor-neutral injected capacity, budget derivation after weights/activations/overhead, and atomic live limit updates/snapshots over `ByteBudget`. Tyrell’s 🔴 on overflow/zero-page admission was fixed with checked arithmetic, one-page prevalidation, and atomic-restore tests; re-review 🟢. Live cross-session eviction remains engine follow-up; **33** tests pass.
+- **CUDA EP cuDNN Conv ✅ (`894460f`, Pris; Chew corrective fix):** cuDNN 2-D NCHW Conv supports f32/f16/bf16, stride/dilation/groups/bias, and symmetric explicit/VALID/SAME pads; asymmetric pads and non-2-D inputs error explicitly. Rachael’s 🔴 requiring `CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_PRECOMP_GEMM` for fused bias+identity and dilation coverage was corrected by Chew; re-review 🟢. **86** crate tests pass on H200.
+
+**Current main HEAD:** `894460f`.

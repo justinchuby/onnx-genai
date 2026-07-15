@@ -3329,30 +3329,22 @@ Python surfaces.
 
 #### 26.11.7 Implementation Phasing
 
-The governor **builds on** components that are, as of this writing, DESIGN-only and not
-yet implemented — it does not require them to ship first, but its full behavior is gated
-on them:
+**Core landed (2026-07-15):** `onnx-genai-scheduler` now provides vendor-neutral injected
+capacity, `ResourceLimit::{Bytes, Fraction, Auto}` and default `ResourceLimits` (VRAM 90%,
+host RAM 25%, disk disabled), checked byte→page/token derivation after weights, activations,
+and overhead, plus atomic reconfiguration/snapshots driving `ByteBudget`. A limit that cannot
+fund one page is rejected before mutation; checked arithmetic and restoration preserve the
+previous budget on failure.
 
-- [ ] **Capacity detection** — per-tier total/free byte query (accelerator via EP device
-      query, host via OS, disk via filesystem), vendor-neutral. *(new, small)*
-- [ ] **Byte ↔ page mapping** — `ModelKvConfig::pages_for_bytes` / `tokens_for_pages`
-      honoring heterogeneous per-group page sizes (§3.2.5), and `derive_kv_budget` using
-      the §33.6 breakdown. *(new — the core reconciliation)*
-- [ ] **`ResourceGovernor` type** — `ResourceLimits` resolution, `ArcSwap` ceilings,
-      `snapshot`. Depends on **KvCacheManager / tiered store (§3.2.3)** and
-      **`MemoryBudget` (§26.4)** existing. *(new)*
-- [ ] **Live `reconfigure` eviction path** — driving the §26.4 eviction tiers to reach a
-      lowered ceiling transactionally, and swap-in on raise. Depends on eviction/offload
-      (§26.4) being implemented. *(new — the other core piece)*
-- [ ] **Error surfaces** — `ResourceError` displays + `Remedy` rendering; FFI code+message
-      mapping; PyO3 `ResourceLimitError`. *(new, per RULES.md #1)*
-- [ ] **Config + gauges** — YAML `limits:` block parsing; `..._limit_bytes` /
-      `..._headroom_bytes` gauges wired into §33.6 exposition.
+Remaining integration is deliberately separate:
 
-The two genuinely new pieces are the **byte↔page mapping** and the **live-reconfigure
-eviction path**; the rest is surfacing and wiring over machinery already specified in
-§3.2.3 and §26.4. Everything stays model-agnostic and vendor-neutral (RULES.md #2): no
-hardcoded device or model names, capacity detected generically per tier.
+- [ ] **Live cross-session eviction/swap-in** — the engine must apply reported eviction order
+      across sessions and tiered storage.
+- [ ] **Error surfaces** — complete `ResourceError`/`Remedy`, FFI, and PyO3 mapping.
+- [ ] **Config + gauges** — YAML `limits:` parsing and §33.6 metric exposition.
+
+The implementation remains model- and vendor-neutral (RULES.md #2): capacity enters through
+the injected provider, not hardcoded device or model names.
 
 ---
 

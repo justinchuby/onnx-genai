@@ -946,3 +946,24 @@ CHANNEL/AVG results match element-for-element.
 **Why:** Silent field or dtype loss corrupts a model during a seemingly successful round-trip. Corrective work by Rachael and Ripley followed two rejection cycles; Holden re-reviewed 🟢. The crate has **42** unit tests and **1** doctest, commits the base64/prost/serde_json lockfile changes for `--locked` CI, and is included in `publish.yml`.
 
 **Sources:** `deckard-onnx-rs-json.md`, `pris-cuda-batched-matmul.md`; Wave-4 outcomes supplied by the coordinator manifest.
+
+---
+
+## 2026-07-15 — Wave 5: Shape inference, resource governance, and cuDNN Conv
+
+### ONNX-RS §9 shape-inference wrapper (`7dab8b0`)
+**What:** `onnx-rs::shape` wraps `onnx_runtime_shape_inference::InferenceRegistry::infer_graph` with `MergePolicy::Permissive`. It exposes `infer_shapes`, `infer_shapes_with_registry`, custom-op handler registration, and result/error/handler re-exports; inference mutates the IR graph to populate inferred shapes.
+
+**Validation:** Deckard authored; Holden reviewed 🟢. The crate has **44** unit tests and **1** doctest.
+
+### §26.11 Resource Governor core (`4cd4bdc`)
+**What:** The scheduler now provides vendor-neutral, injected `CapacityProvider`-based resource governance: user-facing `ResourceLimit::{Bytes,Fraction,Auto}`, default `ResourceLimits` (VRAM 0.90, host RAM 0.25, disk disabled), and `derive_kv_budget` that reserves weights, activations, and overhead before deriving pages/tokens. Atomic `reconfigure`/`set_*_limit`/`snapshot` drive `ByteBudget` and report eviction overage/order; live cross-session eviction remains engine work.
+
+**Corrective review:** Tyrell rejected saturating arithmetic that could admit `u64::MAX` or a zero-page budget. Chew replaced it with checked arithmetic, rejects less than one page before mutation, and added atomic-restore coverage. Tyrell re-reviewed 🟢; **33** tests pass.
+
+### CUDA EP cuDNN Conv (`894460f`)
+**What:** Added cuDNN-backed 2-D NCHW `Conv` for f32/f16/bf16, including stride, dilation, groups, bias, symmetric padding, `VALID`, and `SAME`; asymmetric pads and non-2-D inputs fail explicitly.
+
+**Corrective review:** Rachael rejected the fused bias+identity path because it chose a heuristic algorithm. Chew forces `CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_PRECOMP_GEMM` with matching workspace and added a numerically checked dilation GPU test. Rachael re-reviewed 🟢; **86** crate tests pass on H200.
+
+**Current main HEAD:** `894460f`.
