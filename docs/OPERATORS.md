@@ -79,7 +79,7 @@ plugin EPs (via C ABI bridge) handle them.
 | ScatterElements | 11 | |
 | Trilu | 14 | Causal mask generation. |
 | RotaryEmbedding | 22 | Added in opset 22 (ONNX standard). |
-| Attention | — | Not standard yet; we use contrib version. |
+| Attention | 23 | Standard SDPA (opset 23; MHA/GQA/MQA, KV cache, causal, softcap). CPU kernel implemented. |
 
 ### Tier 3: Nice to have (broader model support)
 

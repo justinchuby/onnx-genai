@@ -29,6 +29,7 @@ use crate::strided::{elem_offset, next_index, numel};
 
 pub mod activations;
 pub mod add;
+pub mod attention;
 pub mod cast;
 pub mod concat;
 pub mod constant;
@@ -207,6 +208,17 @@ pub fn build_cpu_registry() -> OpRegistry {
     reg.register(
         OpKey::new("FusedAttention", "com.microsoft", 1),
         Box::new(fused_attention::FusedAttentionFactory),
+    );
+    // Standard `ai.onnx::Attention` (opset 23, unchanged shape contract in 24):
+    // the richer SDPA op with 3D/4D inputs, GQA/MQA head sharing, a KV cache
+    // (`past_*`/`present_*`), causal masking, softcap, and up to four outputs.
+    // Distinct from the contrib `FusedAttention` above. Registering at
+    // `since_version` 23 also serves opset-24 models (lookup picks the highest
+    // applicable version); the 7th input `nonpad_kv_seqlen` added in 24 errors
+    // actionably rather than silently mis-computing.
+    reg.register(
+        OpKey::new("Attention", "", 23),
+        Box::new(attention::AttentionFactory),
     );
     // The optimizer's exact-GELU fusion emits `com.microsoft::Gelu`; bind its
     // CPU kernel in the same contrib domain (there is no standard-domain `Gelu`
@@ -912,9 +924,10 @@ mod tests {
         // modern opset. `Softmax` is registered twice (legacy v1 + per-axis
         // v13), and `LayerNormalization`, `FusedMatMulBias`, `FusedGemm`,
         // `FusedAttention` and the fused exact-GELU `Gelu` add contrib
-        // (`com.microsoft`) entries, so the entry count is six more than the
-        // op-name count.
-        assert_eq!(reg.len(), PHASE1_OPS.len() + 6);
+        // (`com.microsoft`) entries. Standard `ai.onnx::Attention` (opset 23)
+        // adds one more default-domain entry that is not in `PHASE1_OPS`, so
+        // the entry count is seven more than the op-name count.
+        assert_eq!(reg.len(), PHASE1_OPS.len() + 7);
         for op in PHASE1_OPS {
             assert!(reg.lookup(op, "", 21).is_some(), "missing factory for {op}");
         }
@@ -939,6 +952,13 @@ mod tests {
         assert!(reg.supports("Gelu", "com.microsoft"));
         assert!(reg.lookup("Gelu", "com.microsoft", 1).is_some());
         assert!(reg.lookup("Gelu", "", 21).is_none());
+        // Standard ai.onnx::Attention resolves at opset 23 and 24 (default
+        // domain and the `ai.onnx` alias), but not below its since-version.
+        assert!(reg.lookup("Attention", "", 23).is_some());
+        assert!(reg.lookup("Attention", "", 24).is_some());
+        assert!(reg.lookup("Attention", "ai.onnx", 23).is_some());
+        assert!(reg.lookup("Attention", "", 22).is_none());
+        assert!(reg.supports("Attention", ""));
     }
 
     #[test]

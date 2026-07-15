@@ -218,6 +218,144 @@ pub fn fused_attention(ctx: &mut InferenceContext) -> Result<(), ShapeInferError
     Ok(())
 }
 
+/// Standard `ai.onnx::Attention` (opset 23/24): scaled dot-product attention
+/// with 3D/4D inputs, GQA/MQA head sharing, a KV cache, and up to four outputs.
+///
+/// The executor sizes each value's buffer from resolved shapes, so every
+/// produced output must be inferable:
+/// * `Y` — matches Q's rank: 4D `(batch, q_heads, q_seq, v_head_size)`, or 3D
+///   `(batch, q_seq, q_heads·v_head_size)`.
+/// * `present_key` — `(batch, kv_heads, total_seq, head_size)`.
+/// * `present_value` — `(batch, kv_heads, total_seq, v_head_size)`.
+/// * `qk_matmul_output` — `(batch, q_heads, q_seq, total_seq)`.
+///
+/// `total_seq = past_seq + kv_seq` (past comes from the optional `past_key`
+/// input 4). For 3D inputs the per-head sizes come from the `q_num_heads` /
+/// `kv_num_heads` attributes (`head_size = hidden / num_heads`).
+pub fn attention(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
+    let q = ctx.input_shape(0).map(<[DimExpr]>::to_vec);
+    let k = ctx.input_shape(1).map(<[DimExpr]>::to_vec);
+    let v = ctx.input_shape(2).map(<[DimExpr]>::to_vec);
+    let dtype = ctx.input_dtype(0);
+    let (Some(q), Some(k), Some(v), Some(dtype)) = (q, k, v, dtype) else {
+        return Ok(());
+    };
+    let q_rank = q.len();
+    if !(q_rank == 3 || q_rank == 4) || k.len() != q_rank || v.len() != q_rank {
+        return Err(ShapeInferError::Invalid {
+            op: "Attention".into(),
+            detail: format!(
+                "Q, K, V must all be rank 3 or 4 (got Q={q_rank}, K={}, V={})",
+                k.len(),
+                v.len()
+            ),
+        });
+    }
+
+    let attr_dim = |name: &str| -> Option<DimExpr> {
+        ctx.node
+            .attr(name)
+            .and_then(Attribute::as_int)
+            .map(DimExpr::constant)
+    };
+
+    // Resolve batch, per-head dims, and head counts for both ranks.
+    let batch = q[0].clone();
+    let (q_heads, q_seq, head_size, kv_heads, kv_seq, v_head_size) = if q_rank == 4 {
+        (
+            q[1].clone(),
+            q[2].clone(),
+            q[3].clone(),
+            k[1].clone(),
+            k[2].clone(),
+            v[3].clone(),
+        )
+    } else {
+        // 3D: (batch, seq, hidden). Split hidden by the num_heads attributes.
+        let q_heads = attr_dim("q_num_heads").ok_or_else(|| ShapeInferError::Invalid {
+            op: "Attention".into(),
+            detail: "3D inputs require the `q_num_heads` attribute".into(),
+        })?;
+        let kv_heads = attr_dim("kv_num_heads").ok_or_else(|| ShapeInferError::Invalid {
+            op: "Attention".into(),
+            detail: "3D inputs require the `kv_num_heads` attribute".into(),
+        })?;
+        let head_size = q[2]
+            .checked_div(&q_heads)
+            .unwrap_or_else(|| ctx.fresh_dim());
+        let v_head_size = v[2]
+            .checked_div(&kv_heads)
+            .unwrap_or_else(|| ctx.fresh_dim());
+        (
+            q_heads,
+            q[1].clone(),
+            head_size,
+            kv_heads,
+            k[1].clone(),
+            v_head_size,
+        )
+    };
+
+    // total_seq = past_seq + kv_seq (past_key is input 4, when present).
+    let total_seq = match ctx.input_shape(4) {
+        Some(pk) if pk.len() == 4 => pk[2].add(&kv_seq),
+        _ => kv_seq.clone(),
+    };
+
+    // Y: 4D (batch, q_heads, q_seq, v_head_size) or 3D (batch, q_seq, hidden).
+    let y_shape = if q_rank == 4 {
+        vec![
+            batch.clone(),
+            q_heads.clone(),
+            q_seq.clone(),
+            v_head_size.clone(),
+        ]
+    } else {
+        vec![
+            batch.clone(),
+            q_seq.clone(),
+            q_heads.mul(&v_head_size),
+        ]
+    };
+    ctx.set_output(0, dtype, y_shape);
+
+    // present_key / present_value (4D), when those outputs exist.
+    if ctx.num_outputs() > 1 {
+        ctx.set_output(
+            1,
+            dtype,
+            vec![
+                batch.clone(),
+                kv_heads.clone(),
+                total_seq.clone(),
+                head_size.clone(),
+            ],
+        );
+    }
+    if ctx.num_outputs() > 2 {
+        let v_dtype = ctx.input_dtype(2).unwrap_or(dtype);
+        ctx.set_output(
+            2,
+            v_dtype,
+            vec![
+                batch.clone(),
+                kv_heads.clone(),
+                total_seq.clone(),
+                v_head_size.clone(),
+            ],
+        );
+    }
+    // qk_matmul_output: (batch, q_heads, q_seq, total_seq).
+    if ctx.num_outputs() > 3 {
+        ctx.set_output(
+            3,
+            dtype,
+            vec![batch, q_heads, q_seq, total_seq],
+        );
+    }
+    Ok(())
+}
+
 /// `Gemm(A, B, C?)`: `Y = alpha * A' * B' + beta * C`, output `[M, N]`.
 pub fn gemm(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
     let a = ctx.input_shape(0).map(<[DimExpr]>::to_vec);
@@ -265,4 +403,6 @@ pub fn register(reg: &mut InferenceRegistry) {
     reg.register("com.microsoft", "FusedGemm", 1, fused_gemm);
     // The optimizer's SDPA-core fusion: output shape == MatMul(probs, V)'s.
     reg.register("com.microsoft", "FusedAttention", 1, fused_attention);
+    // Standard ai.onnx::Attention (opset 23; shape contract unchanged in 24).
+    reg.register("", "Attention", 23, attention);
 }

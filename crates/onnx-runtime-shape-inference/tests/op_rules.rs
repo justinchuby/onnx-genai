@@ -352,6 +352,76 @@ fn fused_attention_symbolic_batch_and_mask() {
 }
 
 #[test]
+fn attention_4d_all_outputs_with_cache() {
+    // Standard ai.onnx::Attention, 4D, with a past KV cache and all 4 outputs.
+    // Q [2,4,3,8], K [2,4,5,8], V [2,4,5,16], past_key [2,4,7,8].
+    // total_seq = 7 + 5 = 12.
+    //   Y            = [2,4,3,16]
+    //   present_key  = [2,4,12,8]
+    //   present_value= [2,4,12,16]
+    //   qk_matmul    = [2,4,3,12]
+    let n = node("Attention", 5, 4);
+    let outs = run(
+        &n,
+        vec![
+            f32in(vec![c(2), c(4), c(3), c(8)]),
+            f32in(vec![c(2), c(4), c(5), c(8)]),
+            f32in(vec![c(2), c(4), c(5), c(16)]),
+            NodeIo::default(), // attn_mask (skipped)
+            f32in(vec![c(2), c(4), c(7), c(8)]), // past_key
+        ],
+        23,
+    );
+    let shape_i = |i: usize| outs[i].type_info.as_ref().unwrap().shape.clone();
+    assert_eq!(shape_i(0), vec![c(2), c(4), c(3), c(16)]);
+    assert_eq!(shape_i(1), vec![c(2), c(4), c(12), c(8)]);
+    assert_eq!(shape_i(2), vec![c(2), c(4), c(12), c(16)]);
+    assert_eq!(shape_i(3), vec![c(2), c(4), c(3), c(12)]);
+    assert_eq!(out_dtype(&outs), DataType::Float32);
+}
+
+#[test]
+fn attention_3d_reshapes_hidden_by_num_heads() {
+    // 3D inputs: Q [2,S,32] with q_num_heads=4 -> head_size=8; V [2,S,32]
+    // with kv_num_heads=4 -> v_head_size=8. Y hidden = q_heads*v_head_size = 32.
+    let n = with_attr(
+        with_attr(node("Attention", 3, 1), "q_num_heads", Attribute::Int(4)),
+        "kv_num_heads",
+        Attribute::Int(4),
+    );
+    let outs = run(
+        &n,
+        vec![
+            f32in(vec![c(2), sym(2), c(32)]),
+            f32in(vec![c(2), sym(3), c(32)]),
+            f32in(vec![c(2), sym(3), c(32)]),
+        ],
+        23,
+    );
+    assert_eq!(out_shape(&outs), vec![c(2), sym(2), c(32)]);
+}
+
+#[test]
+fn attention_gqa_present_uses_kv_heads() {
+    // GQA: q_heads=4, kv_heads=2. present_key/value carry kv_heads, not q_heads.
+    // Q [1,4,S,8], K [1,2,S,8], V [1,2,S,8].
+    let n = node("Attention", 3, 3);
+    let outs = run(
+        &n,
+        vec![
+            f32in(vec![c(1), c(4), sym(2), c(8)]),
+            f32in(vec![c(1), c(2), sym(2), c(8)]),
+            f32in(vec![c(1), c(2), sym(2), c(8)]),
+        ],
+        23,
+    );
+    let shape_i = |i: usize| outs[i].type_info.as_ref().unwrap().shape.clone();
+    assert_eq!(shape_i(0), vec![c(1), c(4), sym(2), c(8)]);
+    assert_eq!(shape_i(1), vec![c(1), c(2), sym(2), c(8)]);
+    assert_eq!(shape_i(2), vec![c(1), c(2), sym(2), c(8)]);
+}
+
+#[test]
 fn add_broadcast_concrete() {
     let n = node("Add", 2, 1);
     let outs = run(
