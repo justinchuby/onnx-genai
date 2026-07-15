@@ -131,6 +131,8 @@ fn from_dldatatype(dt: onnx_runtime_dlpack::DLDataType) -> PyResult<DataType> {
 }
 
 
+/// Map an nxrt [`Tensor`]'s device to a DLPack
+/// [`DLDevice`](onnx_runtime_dlpack::DLDevice).
 ///
 /// Host-accessible devices (CPU, and Apple MLX unified memory) export as
 /// `kDLCPU`. CUDA is intentionally rejected in this pass (see [`NxrtValue`]);
@@ -501,14 +503,29 @@ fn plan_import(view: &onnx_runtime_dlpack::BorrowedDlpack<'_>) -> PyResult<Impor
         }
         shape.push(d as usize);
     }
-    let numel: usize = shape.iter().product();
+    // The DLPack shape is FOREIGN/untrusted, so the element count and its
+    // byte-length must both be computed with checked arithmetic — a crafted
+    // dim product that wraps `usize` would otherwise under-size the borrow and
+    // license an out-of-bounds alias. On overflow, fall back to the copy path
+    // (which re-materialises safely) rather than panicking.
+    let mut numel: usize = 1;
+    for &d in &shape {
+        match numel.checked_mul(d) {
+            Some(n) => numel = n,
+            None => return Ok(ImportPlan::Fallback),
+        }
+    }
     // Empty tensors have a possibly-null data pointer; `from_borrowed_parts`
     // requires non-null, so borrow only non-empty buffers and copy the rest.
     if numel == 0 || view.data.is_null() {
         return Ok(ImportPlan::Fallback);
     }
 
-    let len = dtype.storage_bytes(numel);
+    let len = match dtype.checked_storage_bytes(numel) {
+        Some(l) => l,
+        // Element count fits `usize` but count×byte_size wraps → copy fallback.
+        None => return Ok(ImportPlan::Fallback),
+    };
     // Fold the byte offset into the base pointer so nxrt sees element origin 0.
     // SAFETY: the producer guarantees `data + byte_offset` is the first element
     // of a `len`-byte allocation; we only compute the address (no deref).
@@ -517,6 +534,16 @@ fn plan_import(view: &onnx_runtime_dlpack::BorrowedDlpack<'_>) -> PyResult<Impor
     // A truthful, power-of-two alignment we can guarantee: the element size
     // (1/2/4/8 for every supported dtype). Underclaiming is always sound.
     let align = dtype.byte_size().max(1);
+
+    // `DeviceBuffer::from_borrowed_parts` documents an alignment precondition
+    // (`data` aligned to at least `align`). numpy ≥ 2.5 can hand out a
+    // contiguous but UNALIGNED buffer; borrowing it would violate that contract
+    // and any aligned load downstream. If the first-element address is not
+    // `align`-aligned, fall back to the copy path (which re-materialises into a
+    // freshly-aligned allocation).
+    if !(data as usize).is_multiple_of(align) {
+        return Ok(ImportPlan::Fallback);
+    }
 
     Ok(ImportPlan::Commit { dtype, shape, data, len, align })
 }
@@ -602,7 +629,9 @@ pub(crate) fn tensor_from_dlpack(
                         return Err(PyErr::fetch(py));
                     }
                     let guard: Box<dyn std::any::Any + Send + Sync> =
-                        Box::new(onnx_runtime_dlpack::ManagedTensorVersionedOwner::new(managed));
+                        Box::new(GilDlpackVersionedGuard {
+                            owner: onnx_runtime_dlpack::ManagedTensorVersionedOwner::new(managed),
+                        });
                     let buffer =
                         DeviceBuffer::from_borrowed_parts(data, DeviceId::cpu(), len, align);
                     let tensor = Tensor::from_borrowed_parts_with_guard(
@@ -630,7 +659,9 @@ pub(crate) fn tensor_from_dlpack(
                         return Err(PyErr::fetch(py));
                     }
                     let guard: Box<dyn std::any::Any + Send + Sync> =
-                        Box::new(onnx_runtime_dlpack::ManagedTensorOwner::new(managed));
+                        Box::new(GilDlpackGuard {
+                            owner: onnx_runtime_dlpack::ManagedTensorOwner::new(managed),
+                        });
                     let buffer =
                         DeviceBuffer::from_borrowed_parts(data, DeviceId::cpu(), len, align);
                     let tensor = Tensor::from_borrowed_parts_with_guard(
@@ -652,4 +683,48 @@ pub(crate) fn tensor_from_dlpack(
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<NxrtValue>()?;
     Ok(())
+}
+
+/// GIL-acquiring guard stored in an imported [`Tensor`]'s `import_guard`.
+///
+/// The foreign DLPack `deleter` (numpy/torch) calls into the CPython C-API
+/// (`Py_DECREF`, buffer release, …) and therefore **requires the GIL**. The
+/// underlying [`ManagedTensorOwner`](onnx_runtime_dlpack::ManagedTensorOwner) is
+/// `Send + Sync` and the `Tensor` that owns it is likewise `Send + Sync`, so
+/// nothing stops a caller from stashing an imported `Tensor` and dropping it on
+/// a background thread that does *not* hold the GIL. This guard makes that case
+/// sound **by construction**: its `Drop` calls `Python::with_gil`, which
+/// attaches the current thread to the interpreter and acquires the GIL (a no-op
+/// re-borrow when the thread already holds it), and only then drives the foreign
+/// deleter via `call_deleter`. Because `call_deleter` is idempotent and the
+/// owner's own `Drop` becomes a no-op afterwards, the deleter still runs exactly
+/// once — now guaranteed under the GIL regardless of which thread drops the
+/// tensor.
+struct GilDlpackGuard {
+    owner: onnx_runtime_dlpack::ManagedTensorOwner,
+}
+
+impl Drop for GilDlpackGuard {
+    fn drop(&mut self) {
+        Python::with_gil(|_py| {
+            // SAFETY: `with_gil` guarantees this thread holds the GIL for the
+            // duration of the closure, satisfying the foreign deleter's CPython
+            // C-API requirement. `call_deleter` runs it exactly once.
+            unsafe { self.owner.call_deleter() };
+        });
+    }
+}
+
+/// Versioned analogue of [`GilDlpackGuard`].
+struct GilDlpackVersionedGuard {
+    owner: onnx_runtime_dlpack::ManagedTensorVersionedOwner,
+}
+
+impl Drop for GilDlpackVersionedGuard {
+    fn drop(&mut self) {
+        Python::with_gil(|_py| {
+            // SAFETY: as `GilDlpackGuard::drop`; the GIL is held here.
+            unsafe { self.owner.call_deleter() };
+        });
+    }
 }

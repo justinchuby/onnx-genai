@@ -561,18 +561,23 @@ unsafe fn borrowed_view_from_tensor<'a>(t: &DLTensor) -> BorrowedDlpack<'a> {
 /// higher-level tensor — is what frees the memory the imported view borrowed.
 pub struct ManagedTensorOwner {
     managed: *mut DLManagedTensor,
+    /// Set once the deleter has been invoked, so [`Drop`] cannot re-run it.
+    deleted: bool,
 }
 
-// SAFETY: `ManagedTensorOwner` is just a raw pointer whose only use is calling
-// the producer's `deleter` once on drop. DLPack requires the deleter be callable
-// from whichever thread ends up owning the tensor; nxrt only ever moves the
-// owner into a `Tensor` and drops it single-threaded, and never dereferences the
-// aliased payload through this type. Moving the raw pointer across threads is
-// therefore sound.
+// SAFETY: `ManagedTensorOwner` is just a raw pointer plus a `bool` flag whose
+// only use is calling the producer's `deleter` once. DLPack requires the deleter
+// be callable from whichever thread ends up owning the tensor; nxrt moves the
+// owner into a `Tensor` and never dereferences the aliased payload through this
+// type. Moving the raw pointer across threads is therefore sound. Note the
+// deleter itself (numpy/torch) may require the Python GIL — that requirement is
+// satisfied by the *consumer*: the Python binding wraps this owner in a guard
+// whose `Drop` acquires the GIL before calling [`call_deleter`], so even a
+// cross-thread drop runs the deleter under the GIL.
 unsafe impl Send for ManagedTensorOwner {}
 // SAFETY: the only shared (`&self`) operation is `as_ptr`, which copies the
 // pointer value without dereferencing it — no interior mutability, no data race.
-// The single deleter call happens in `Drop`, which has exclusive `&mut self`.
+// The single deleter call happens through `&mut self` (`call_deleter`/`Drop`).
 // Sharing a reference across threads is thus sound. `Sync` is required so a
 // `Tensor` holding this guard stays `Sync` (the Python `NxrtValue` pyclass needs
 // it).
@@ -590,7 +595,7 @@ impl ManagedTensorOwner {
     /// a capsule still named `"dltensor"` that Python may also finalize, would
     /// double-free.
     pub unsafe fn new(managed: *mut DLManagedTensor) -> Self {
-        Self { managed }
+        Self { managed, deleted: false }
     }
 
     /// The managed pointer this owner will delete (for reading fields before
@@ -598,20 +603,47 @@ impl ManagedTensorOwner {
     pub fn as_ptr(&self) -> *mut DLManagedTensor {
         self.managed
     }
+
+    /// Invoke the foreign `deleter` **exactly once**, freeing the borrowed
+    /// allocation. Idempotent: subsequent calls (including the one in [`Drop`])
+    /// are no-ops.
+    ///
+    /// This exists so the Python binding can drive the deleter *under the GIL*
+    /// (via `Python::with_gil`) — numpy/torch deleters call `Py_DECREF` and must
+    /// hold the GIL. After this returns, `Drop` will not call the deleter again.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure any environment invariant the foreign deleter
+    /// requires is satisfied at the call site — in particular, for a deleter
+    /// that touches the CPython C-API, **the current thread must hold the GIL**.
+    pub unsafe fn call_deleter(&mut self) {
+        if !self.deleted {
+            self.deleted = true;
+            // SAFETY: by `new`'s contract we are the sole owner of a live,
+            // not-yet-deleted managed tensor, and the flag guarantees this runs
+            // at most once. `release` null-checks and no-ops a null deleter.
+            unsafe { release(self.managed) }
+        }
+    }
 }
 
 impl Drop for ManagedTensorOwner {
     fn drop(&mut self) {
-        // SAFETY: by `new`'s contract we are the sole owner of a live, not-yet-
-        // deleted managed tensor, so calling its deleter here runs it exactly
-        // once. `release` null-checks and no-ops a null deleter.
-        unsafe { release(self.managed) }
+        // SAFETY: `call_deleter` is idempotent (guarded by `deleted`), so this
+        // runs the deleter exactly once across `call_deleter` + `Drop`. A pure-
+        // Rust owner that was never wrapped in a GIL guard frees here directly;
+        // a Python-wrapped owner will already have `deleted == true`, making
+        // this a no-op. See the `Send`/`Sync` note re: the GIL requirement.
+        unsafe { self.call_deleter() }
     }
 }
 
 /// Versioned analogue of [`ManagedTensorOwner`].
 pub struct ManagedTensorVersionedOwner {
     managed: *mut DLManagedTensorVersioned,
+    /// Set once the deleter has been invoked, so [`Drop`] cannot re-run it.
+    deleted: bool,
 }
 
 // SAFETY: identical reasoning to `ManagedTensorOwner`'s `Send` impl.
@@ -626,19 +658,35 @@ impl ManagedTensorVersionedOwner {
     ///
     /// As [`ManagedTensorOwner::new`], for a `*mut DLManagedTensorVersioned`.
     pub unsafe fn new(managed: *mut DLManagedTensorVersioned) -> Self {
-        Self { managed }
+        Self { managed, deleted: false }
     }
 
     /// The versioned managed pointer this owner will delete.
     pub fn as_ptr(&self) -> *mut DLManagedTensorVersioned {
         self.managed
     }
+
+    /// Invoke the foreign `deleter` **exactly once** (versioned analogue of
+    /// [`ManagedTensorOwner::call_deleter`]).
+    ///
+    /// # Safety
+    ///
+    /// As [`ManagedTensorOwner::call_deleter`]: the caller must hold the GIL if
+    /// the foreign deleter touches the CPython C-API.
+    pub unsafe fn call_deleter(&mut self) {
+        if !self.deleted {
+            self.deleted = true;
+            // SAFETY: sole owner of a live, not-yet-deleted versioned tensor;
+            // the flag guarantees a single call.
+            unsafe { release_versioned(self.managed) }
+        }
+    }
 }
 
 impl Drop for ManagedTensorVersionedOwner {
     fn drop(&mut self) {
-        // SAFETY: sole owner of a live, not-yet-deleted versioned tensor.
-        unsafe { release_versioned(self.managed) }
+        // SAFETY: idempotent single call, as in `ManagedTensorOwner::drop`.
+        unsafe { self.call_deleter() }
     }
 }
 
@@ -856,6 +904,9 @@ mod tests {
     }
 
     static IMPORT_DROPS: AtomicUsize = AtomicUsize::new(0);
+    /// Serialises the tests that assert on the shared `IMPORT_DROPS` counter so
+    /// the default parallel test runner cannot interleave their reset+observe.
+    static IMPORT_DROPS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     unsafe extern "C" fn fake_deleter(managed: *mut DLManagedTensor) {
         if managed.is_null() {
@@ -919,6 +970,7 @@ mod tests {
 
     #[test]
     fn owner_calls_foreign_deleter_exactly_once() {
+        let _serial = IMPORT_DROPS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         IMPORT_DROPS.store(0, Ordering::SeqCst);
         let managed = make_fake_managed(vec![4]);
         // SAFETY: single owner of a live fake managed tensor.
@@ -926,6 +978,39 @@ mod tests {
         assert_eq!(IMPORT_DROPS.load(Ordering::SeqCst), 0);
         drop(owner);
         assert_eq!(IMPORT_DROPS.load(Ordering::SeqCst), 1, "deleter ran once");
+    }
+
+    #[test]
+    fn call_deleter_is_idempotent_across_explicit_call_and_drop() {
+        // The Python guard calls `call_deleter` under the GIL; `Drop` then runs
+        // too. The `deleted` flag must collapse both into a single deleter call.
+        let _serial = IMPORT_DROPS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        IMPORT_DROPS.store(0, Ordering::SeqCst);
+        let managed = make_fake_managed(vec![2, 3]);
+        // SAFETY: single owner of a live fake managed tensor.
+        let mut owner = unsafe { ManagedTensorOwner::new(managed) };
+        // SAFETY: no CPython C-API involved in the fake deleter, so no GIL is
+        // required here; models the guard's explicit call.
+        unsafe { owner.call_deleter() };
+        assert_eq!(IMPORT_DROPS.load(Ordering::SeqCst), 1, "explicit call ran deleter");
+        // SAFETY: redundant call must be a no-op.
+        unsafe { owner.call_deleter() };
+        drop(owner);
+        assert_eq!(IMPORT_DROPS.load(Ordering::SeqCst), 1, "no double free after Drop");
+    }
+
+    #[test]
+    fn owner_dropped_on_spawned_thread_runs_deleter_once() {
+        // The owner is `Send`; dropping it on another OS thread must still run
+        // the deleter exactly once (the raw mechanism is thread-move-safe; the
+        // GIL requirement is layered on by the Python guard, not this crate).
+        let _serial = IMPORT_DROPS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        IMPORT_DROPS.store(0, Ordering::SeqCst);
+        let managed = make_fake_managed(vec![5]);
+        // SAFETY: single owner of a live fake managed tensor.
+        let owner = unsafe { ManagedTensorOwner::new(managed) };
+        std::thread::spawn(move || drop(owner)).join().expect("drop thread panicked");
+        assert_eq!(IMPORT_DROPS.load(Ordering::SeqCst), 1, "deleter ran once off-thread");
     }
 
     static IMPORT_DROPS_V: AtomicUsize = AtomicUsize::new(0);

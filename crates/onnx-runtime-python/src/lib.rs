@@ -611,6 +611,47 @@ fn get_available_providers() -> Vec<String> {
     available_providers().iter().map(|s| s.to_string()).collect()
 }
 
+/// Test-only: import `obj` via the zero-copy DLPack consumer path and return the
+/// borrowed tensor's first-element data pointer as an integer, or `None` if the
+/// value fell back to the copy path (non-CPU, non-contiguous, empty, unaligned,
+/// overflowing, unsupported dtype).
+///
+/// This is the only layer that can *prove* a zero-copy borrow: a Python test
+/// compares this pointer against the source buffer's own address
+/// (`ndarray.ctypes.data` / `torch tensor.data_ptr()`); equality means no copy
+/// happened. Underscore-prefixed and undocumented in the public API.
+#[pyfunction]
+fn _dlpack_import_data_ptr(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResult<Option<usize>> {
+    match dlpack::tensor_from_dlpack(py, obj)? {
+        Some(t) => Ok(Some(t.as_bytes().as_ptr() as usize)),
+        None => Ok(None),
+    }
+}
+
+/// Test-only: import `obj` zero-copy, then drop the resulting borrowed tensor on
+/// a spawned OS thread that does **not** hold the GIL, exercising the
+/// GIL-acquiring import guard. Returns `True` if a zero-copy borrow occurred
+/// (guard exercised), `False` if the value fell back to the copy path.
+///
+/// If the guard did not reacquire the GIL before running the foreign deleter
+/// (numpy/torch call `Py_DECREF`), this would deadlock or corrupt the
+/// interpreter; returning cleanly with the producer's deleter flag incremented
+/// proves the GIL-at-drop invariant holds off the Python thread.
+#[pyfunction]
+fn _dlpack_import_drop_on_thread(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResult<bool> {
+    let tensor = match dlpack::tensor_from_dlpack(py, obj)? {
+        Some(t) => t,
+        None => return Ok(false),
+    };
+    // Release the GIL on this (Python) thread, then drop the imported tensor on
+    // a fresh OS thread. The import guard's `Drop` must reacquire the GIL via
+    // `Python::with_gil` to run the foreign deleter — that is what we prove.
+    py.allow_threads(move || {
+        std::thread::spawn(move || drop(tensor)).join().expect("drop thread panicked");
+    });
+    Ok(true)
+}
+
 /// Return whether CUDA 13 CUPTI can be loaded for GPU tracing.
 ///
 /// Absence or version mismatch is intentionally reported as `false`, not an
@@ -683,6 +724,8 @@ fn nxrt(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<NodeArg>()?;
     dlpack::register(m)?;
     m.add_function(wrap_pyfunction!(get_available_providers, m)?)?;
+    m.add_function(wrap_pyfunction!(_dlpack_import_data_ptr, m)?)?;
+    m.add_function(wrap_pyfunction!(_dlpack_import_drop_on_thread, m)?)?;
     #[cfg(feature = "cuda")]
     m.add_function(wrap_pyfunction!(cupti_available, m)?)?;
     Ok(())

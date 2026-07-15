@@ -368,8 +368,11 @@ def test_custom_producer_buffer_is_borrowed_and_deleter_called_once():
 
 
 def test_borrow_reflects_source_mutation_before_run():
-    # Because nxrt borrows the producer's buffer, mutating it up to the moment
-    # of `run` is visible — a copy taken at import time would not see this.
+    # Mutating the source before `run` is visible in the result. NOTE: on its
+    # own this does NOT prove zero-copy — the copy fallback also copies inside
+    # `run()`, *after* this mutation, so a pure-copy implementation would pass
+    # identically. The real no-copy proof is pointer identity, asserted in
+    # `test_numpy_import_is_pointer_identical` below.
     x = np.zeros(4, dtype=np.float32)
     flag = [0]
     prod = _NumpyDLPackProducer(x, flag)
@@ -377,6 +380,25 @@ def test_borrow_reflects_source_mutation_before_run():
     x[:] = [1.0, 2.0, 3.0, 4.0]  # mutate the borrowed source before running
     (y,) = sess.run(None, {"X": prod})
     np.testing.assert_array_equal(y, [1.0, 2.0, 3.0, 4.0])
+
+
+def test_numpy_import_is_pointer_identical():
+    # The ONLY layer that truly proves a zero-copy borrow: the imported tensor's
+    # first-element data pointer must EQUAL numpy's own buffer address. A copy
+    # would land at a different address.
+    x = np.arange(8, dtype=np.float32)
+    ptr = nxrt._dlpack_import_data_ptr(x)
+    assert ptr is not None, "contiguous CPU float32 array must be borrowed zero-copy"
+    assert ptr == x.ctypes.data, "imported tensor must alias numpy's buffer (no copy)"
+
+
+def test_noncontiguous_import_returns_no_pointer():
+    # A non-contiguous view cannot be borrowed, so the pointer accessor reports
+    # the copy fallback (None) rather than aliasing.
+    base = np.arange(12, dtype=np.float32).reshape(3, 4)
+    view = base[:, 1:3]
+    assert not view.flags["C_CONTIGUOUS"]
+    assert nxrt._dlpack_import_data_ptr(view) is None
 
 
 def test_many_import_drop_cycles_no_double_free():
@@ -428,11 +450,216 @@ def test_torch_tensor_input_is_imported_and_runs():
 
 
 def test_torch_input_zero_copy_write_through():
-    # Prove the input borrow aliases torch's storage: mutating the torch tensor
-    # before run is visible in the result.
+    # Mutating the torch tensor before run is visible in the result. As with the
+    # numpy case above, mutation-visibility alone does NOT prove no-copy (the
+    # copy fallback copies inside `run()` after this mutation); the pointer-
+    # identity check in `test_torch_import_is_pointer_identical` is the real
+    # proof.
     torch = pytest.importorskip("torch")
     x = torch.zeros(4, dtype=torch.float32)
     sess = nxrt.InferenceSession(_identity_model(TensorProto.FLOAT, [4]))
     x[:] = torch.tensor([5.0, 6.0, 7.0, 8.0])
     (y,) = sess.run(None, {"X": x})
     np.testing.assert_array_equal(y, [5.0, 6.0, 7.0, 8.0])
+
+
+def test_torch_import_is_pointer_identical():
+    # Pointer identity proves the torch input is borrowed, not copied.
+    torch = pytest.importorskip("torch")
+    x = torch.arange(6, dtype=torch.float32)
+    ptr = nxrt._dlpack_import_data_ptr(x)
+    assert ptr is not None, "contiguous CPU float32 torch tensor must be borrowed"
+    assert ptr == x.data_ptr(), "imported tensor must alias torch's storage (no copy)"
+
+
+# --------------------------------------------------------------------------- #
+# GIL-safe foreign deleter (dropped off the Python thread)
+# --------------------------------------------------------------------------- #
+
+def test_imported_tensor_drop_on_background_thread_is_gil_safe():
+    # The imported tensor's guard must reacquire the GIL before running the
+    # foreign deleter (numpy calls Py_DECREF). Dropping it on an OS thread that
+    # does NOT hold the GIL would deadlock or corrupt the interpreter if the
+    # guard did not go through `Python::with_gil`. A clean return + a single
+    # deleter call proves the invariant holds.
+    x = np.arange(4, dtype=np.float32)
+    flag = [0]
+    prod = _NumpyDLPackProducer(x, flag)
+    borrowed = nxrt._dlpack_import_drop_on_thread(prod)
+    assert borrowed, "contiguous CPU float32 producer must be borrowed zero-copy"
+    gc.collect()
+    assert flag[0] == 1, f"deleter must run exactly once off-thread, got {flag[0]}"
+
+
+# --------------------------------------------------------------------------- #
+# Coverage: shape/dtype edge cases + the unversioned capsule branch
+# --------------------------------------------------------------------------- #
+
+# DLPack type codes (DLDataTypeCode).
+_DL_INT = 0
+_DL_FLOAT = 2
+_DL_BFLOAT = 4
+
+
+class _GenericDLPackProducer:
+    """A DLPack producer over an arbitrary contiguous buffer.
+
+    Unlike ``_NumpyDLPackProducer`` (float32-only), this takes an explicit
+    DLPack ``(code, bits)`` and shape so tests can exercise 0-d, size-0, f64 and
+    bfloat16 imports. It emits a **versioned** ``dltensor_versioned`` capsule.
+    """
+
+    def __init__(self, data_ptr: int, shape, code: int, bits: int, flag: list, keep=None):
+        self.flag = flag
+        self._keep = keep  # keep the backing buffer alive
+        ndim = len(shape)
+        self._shape = (ctypes.c_int64 * ndim)(*shape) if ndim else None
+
+        def _del(_mptr):
+            flag[0] += 1
+
+        self._del_cb = _DELETER_FUNC(_del)
+        m = _DLManagedTensorVersioned()
+        m.major, m.minor = 1, 0
+        m.manager_ctx = None
+        m.deleter = ctypes.cast(self._del_cb, ctypes.c_void_p)
+        m.flags = 0
+        m.dl_tensor.data = data_ptr
+        m.dl_tensor.device = _DLDevice(K_DL_CPU, 0)
+        m.dl_tensor.ndim = ndim
+        m.dl_tensor.dtype = _DLDataType(code, bits, 1)
+        m.dl_tensor.shape = self._shape
+        m.dl_tensor.strides = None
+        m.dl_tensor.byte_offset = 0
+        self._m = m
+
+    def __dlpack_device__(self):
+        return (K_DL_CPU, 0)
+
+    def __dlpack__(self, stream=None, max_version=None, dl_device=None, copy=None):
+        return _PyCapsule_New(ctypes.addressof(self._m), b"dltensor_versioned", None)
+
+
+class _DLManagedTensor(ctypes.Structure):
+    """Unversioned DLManagedTensor: dl_tensor first, then ctx + deleter."""
+
+    _fields_ = [
+        ("dl_tensor", _DLTensor),
+        ("manager_ctx", ctypes.c_void_p),
+        ("deleter", ctypes.c_void_p),
+    ]
+
+
+_DELETER_FUNC_UNV = ctypes.CFUNCTYPE(None, ctypes.POINTER(_DLManagedTensor))
+
+
+class _UnversionedDLPackProducer:
+    """A DLPack producer that emits the legacy **unversioned** ``dltensor``
+    capsule (the branch numpy < 2.1 / older torch use)."""
+
+    def __init__(self, arr: np.ndarray, flag: list):
+        assert arr.dtype == np.float32 and arr.flags["C_CONTIGUOUS"]
+        self.arr = arr
+        self.flag = flag
+        self._shape = (ctypes.c_int64 * arr.ndim)(*arr.shape)
+
+        def _del(_mptr):
+            flag[0] += 1
+
+        self._del_cb = _DELETER_FUNC_UNV(_del)
+        m = _DLManagedTensor()
+        m.manager_ctx = None
+        m.deleter = ctypes.cast(self._del_cb, ctypes.c_void_p)
+        m.dl_tensor.data = arr.ctypes.data
+        m.dl_tensor.device = _DLDevice(K_DL_CPU, 0)
+        m.dl_tensor.ndim = arr.ndim
+        m.dl_tensor.dtype = _DLDataType(_DL_FLOAT, 32, 1)
+        m.dl_tensor.shape = self._shape
+        m.dl_tensor.strides = None
+        m.dl_tensor.byte_offset = 0
+        self._m = m
+
+    def __dlpack_device__(self):
+        return (K_DL_CPU, 0)
+
+    def __dlpack__(self, stream=None, max_version=None, dl_device=None, copy=None):
+        # Ignore max_version and always hand back the unversioned form so we
+        # exercise the "dltensor" consumer branch.
+        return _PyCapsule_New(ctypes.addressof(self._m), b"dltensor", None)
+
+
+def test_scalar_0d_import_is_borrowed():
+    # 0-d scalar: numel == 1 (empty shape product), must borrow zero-copy.
+    x = np.float32(3.5)
+    arr = np.asarray(x)  # 0-d array, C-contiguous
+    ptr = nxrt._dlpack_import_data_ptr(arr)
+    assert ptr is not None, "0-d scalar must be borrowed"
+    assert ptr == arr.ctypes.data
+
+
+def test_size_zero_import_falls_back_cleanly():
+    # A size-0 tensor has a possibly-null data pointer; must fall back to copy
+    # without borrowing or crashing.
+    x = np.zeros((0,), dtype=np.float32)
+    assert nxrt._dlpack_import_data_ptr(x) is None
+    sess = nxrt.InferenceSession(_identity_model(TensorProto.FLOAT, [0]))
+    (y,) = sess.run(None, {"X": x})
+    assert y.shape == (0,)
+
+
+def test_f64_import_is_borrowed():
+    x = np.arange(5, dtype=np.float64)
+    ptr = nxrt._dlpack_import_data_ptr(x)
+    assert ptr is not None, "contiguous f64 array must be borrowed"
+    assert ptr == x.ctypes.data
+    sess = nxrt.InferenceSession(_identity_model(TensorProto.DOUBLE, [5]))
+    (y,) = sess.run(None, {"X": x})
+    np.testing.assert_array_equal(y, x)
+
+
+def test_bf16_torch_import_is_borrowed():
+    torch = pytest.importorskip("torch")
+    if not hasattr(torch, "bfloat16"):
+        pytest.skip("torch build lacks bfloat16")
+    x = torch.arange(4, dtype=torch.bfloat16)
+    # bfloat16 → DL_BFLOAT path; must borrow (pointer identity).
+    ptr = nxrt._dlpack_import_data_ptr(x)
+    assert ptr is not None, "contiguous bf16 torch tensor must be borrowed"
+    assert ptr == x.data_ptr()
+
+
+def test_unversioned_capsule_branch_is_imported_and_borrowed():
+    # Force the legacy unversioned "dltensor" consumer path.
+    x = np.array([1.0, 2.0, 3.0], dtype=np.float32)
+    flag = [0]
+    prod = _UnversionedDLPackProducer(x, flag)
+    ptr = nxrt._dlpack_import_data_ptr(prod)
+    assert ptr == x.ctypes.data, "unversioned capsule must be borrowed zero-copy"
+    gc.collect()
+    assert flag[0] == 1, f"unversioned deleter must run once, got {flag[0]}"
+
+
+def test_unversioned_capsule_runs_end_to_end():
+    x = np.array([4.0, 5.0, 6.0], dtype=np.float32)
+    flag = [0]
+    prod = _UnversionedDLPackProducer(x, flag)
+    sess = nxrt.InferenceSession(_identity_model(TensorProto.FLOAT, [3]))
+    (y,) = sess.run(None, {"X": prod})
+    np.testing.assert_array_equal(y, x)
+    gc.collect()
+    assert flag[0] == 1
+
+
+def test_overflowing_shape_falls_back_to_copy():
+    # A crafted foreign shape whose element-product overflows usize must not
+    # panic — the import planner falls back (returns no borrow pointer).
+    huge = (1 << 62)
+    flag = [0]
+    # Zero real backing; we never dereference because the plan aborts on the
+    # overflowing dim product before any borrow. Use a 1-byte dummy address.
+    dummy = (ctypes.c_uint8 * 1)()
+    prod = _GenericDLPackProducer(
+        ctypes.addressof(dummy), [huge, huge, huge], _DL_FLOAT, 32, flag, keep=dummy
+    )
+    # Must not panic; overflow → copy fallback → no borrow pointer.
+    assert nxrt._dlpack_import_data_ptr(prod) is None
