@@ -37,6 +37,63 @@ impl KernelFactory for EqualFactory {
     }
 }
 
+#[derive(Clone, Copy)]
+enum Comparison {
+    Greater,
+    GreaterOrEqual,
+    Less,
+    LessOrEqual,
+}
+
+impl Comparison {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Greater => "Greater",
+            Self::GreaterOrEqual => "GreaterOrEqual",
+            Self::Less => "Less",
+            Self::LessOrEqual => "LessOrEqual",
+        }
+    }
+
+    fn apply<T: PartialOrd>(self, lhs: T, rhs: T) -> bool {
+        match self {
+            Self::Greater => lhs > rhs,
+            Self::GreaterOrEqual => lhs >= rhs,
+            Self::Less => lhs < rhs,
+            Self::LessOrEqual => lhs <= rhs,
+        }
+    }
+}
+
+/// Elementwise ordered comparison with NumPy broadcasting.
+pub struct ComparisonKernel {
+    comparison: Comparison,
+}
+
+pub struct GreaterFactory;
+pub struct GreaterOrEqualFactory;
+pub struct LessFactory;
+pub struct LessOrEqualFactory;
+
+fn comparison_factory(comparison: Comparison) -> Box<dyn Kernel> {
+    Box::new(ComparisonKernel { comparison })
+}
+
+macro_rules! comparison_factory {
+    ($factory:ident, $comparison:ident) => {
+        impl KernelFactory for $factory {
+            fn create(&self, _node: &Node, _shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
+                Ok(comparison_factory(Comparison::$comparison))
+            }
+        }
+    };
+}
+
+comparison_factory!(GreaterFactory, Greater);
+comparison_factory!(GreaterOrEqualFactory, GreaterOrEqual);
+comparison_factory!(LessFactory, Less);
+comparison_factory!(LessOrEqualFactory, LessOrEqual);
+
 impl Kernel for EqualKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         check_arity("Equal", inputs, outputs, 2, 2, 1)?;
@@ -52,6 +109,27 @@ impl Kernel for EqualKernel {
         } else {
             dispatch_arith!(inputs[0].dtype, "Equal", T => equal_typed::<T>(inputs, outputs))
         }
+    }
+
+    fn supports_strided_input(&self, _input_idx: usize) -> bool {
+        true
+    }
+}
+
+impl Kernel for ComparisonKernel {
+    fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+        let name = self.comparison.name();
+        check_arity(name, inputs, outputs, 2, 2, 1)?;
+        if outputs[0].dtype != DataType::Bool {
+            return Err(EpError::KernelFailed(format!(
+                "{name}: requires a Bool output, got {:?}. WHY: ONNX comparisons produce \
+                 boolean truth values. HOW: declare the output tensor as Bool.",
+                outputs[0].dtype
+            )));
+        }
+        dispatch_arith!(inputs[0].dtype, name, T => {
+            compare_typed::<T>(self.comparison, inputs, outputs)
+        })
     }
 
     fn supports_strided_input(&self, _input_idx: usize) -> bool {
@@ -88,6 +166,25 @@ fn equal_typed<T: NumericElem + PartialEq + Default>(
     broadcast_apply(&b, inputs[1].shape, &out_shape, |i, v| out[i] = lhs[i] == v)?;
     let bytes: Vec<u8> = out.into_iter().map(u8::from).collect();
     write_dense_bytes(&mut outputs[0], &bytes)
+}
+
+fn compare_typed<T: NumericElem + PartialOrd + Default>(
+    comparison: Comparison,
+    inputs: &[TensorView],
+    outputs: &mut [TensorMut],
+) -> Result<()> {
+    let name = comparison.name();
+    require_same_dtype(name, &inputs[1], T::DTYPE)?;
+    let out_shape = outputs[0].shape.to_vec();
+    let a = to_dense::<T>(&inputs[0])?;
+    let b = to_dense::<T>(&inputs[1])?;
+    let mut lhs = vec![T::default(); numel(&out_shape)];
+    let mut out = vec![0u8; numel(&out_shape)];
+    broadcast_apply(&a, inputs[0].shape, &out_shape, |i, v| lhs[i] = v)?;
+    broadcast_apply(&b, inputs[1].shape, &out_shape, |i, v| {
+        out[i] = u8::from(comparison.apply(lhs[i], v))
+    })?;
+    write_dense_bytes(&mut outputs[0], &out)
 }
 
 impl Kernel for NotKernel {
@@ -164,5 +261,49 @@ mod tests {
             .execute(&[a.view(), b.view()], &mut [out.view_mut()])
             .unwrap();
         assert_eq!(out.to_bool(), vec![true, false, false]);
+    }
+
+    #[test]
+    fn ordered_comparisons_broadcast_and_obey_equality_boundaries() {
+        let a = Owned::i64(&[2, 1], &[1, 2]);
+        let b = Owned::i64(&[1, 3], &[1, 2, 3]);
+        let cases = [
+            (
+                Comparison::Greater,
+                vec![false, false, false, true, false, false],
+            ),
+            (
+                Comparison::GreaterOrEqual,
+                vec![true, false, false, true, true, false],
+            ),
+            (
+                Comparison::Less,
+                vec![false, true, true, false, false, true],
+            ),
+            (
+                Comparison::LessOrEqual,
+                vec![true, true, true, false, true, true],
+            ),
+        ];
+        for (comparison, expected) in cases {
+            let mut out = Owned::zeros(DataType::Bool, &[2, 3]);
+            ComparisonKernel { comparison }
+                .execute(&[a.view(), b.view()], &mut [out.view_mut()])
+                .unwrap();
+            assert_eq!(out.to_bool(), expected, "{}", comparison.name());
+        }
+    }
+
+    #[test]
+    fn ordered_comparisons_follow_onnx_nan_semantics() {
+        let a = Owned::f32(&[2], &[f32::NAN, 2.]);
+        let b = Owned::f32(&[2], &[1., 2.]);
+        let mut out = Owned::zeros(DataType::Bool, &[2]);
+        ComparisonKernel {
+            comparison: Comparison::LessOrEqual,
+        }
+        .execute(&[a.view(), b.view()], &mut [out.view_mut()])
+        .unwrap();
+        assert_eq!(out.to_bool(), vec![false, true]);
     }
 }

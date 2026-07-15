@@ -35,7 +35,7 @@ pub struct SoftmaxKernel {
     coerce_2d: bool,
 }
 
-/// Factory for the opset ≥ 13 per-axis `Softmax` (`axis` default 1).
+/// Factory for the opset ≥ 13 per-axis `Softmax` (`axis` default -1).
 pub struct SoftmaxFactory;
 
 /// Factory for the legacy opset ≤ 12 coerce-to-2D `Softmax` (`axis` default 1).
@@ -43,7 +43,7 @@ pub struct SoftmaxLegacyFactory;
 
 impl KernelFactory for SoftmaxFactory {
     fn create(&self, node: &Node, _shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
-        let axis = node.attr("axis").and_then(|a| a.as_int()).unwrap_or(1);
+        let axis = node.attr("axis").and_then(|a| a.as_int()).unwrap_or(-1);
         Ok(Box::new(SoftmaxKernel {
             axis,
             coerce_2d: false,
@@ -235,6 +235,29 @@ mod tests {
         let r = out.to_f32();
         // row [1,2] and row [3,4] both softmax to [0.26894, 0.73106].
         approx(&r, &[0.268_941_43, 0.731_058_6, 0.268_941_43, 0.731_058_6]);
+    }
+
+    #[test]
+    fn softmax_opset13_default_axis_is_last_dimension() {
+        let x = Owned::f32(&[2, 2], &[1., 2., 3., 4.]);
+        let mut out = Owned::zeros_f32(&[2, 2]);
+        SoftmaxFactory
+            .create(
+                &Node::new(
+                    onnx_runtime_ir::NodeId(0),
+                    "Softmax",
+                    Vec::new(),
+                    Vec::new(),
+                ),
+                &[],
+            )
+            .unwrap()
+            .execute(&[x.view()], &mut [out.view_mut()])
+            .unwrap();
+        approx(
+            &out.to_f32(),
+            &[0.268_941_43, 0.731_058_6, 0.268_941_43, 0.731_058_6],
+        );
     }
 
     #[test]
