@@ -484,13 +484,19 @@ pub fn split(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
                     // With opset-18 `num_outputs`, ONNX gives every output but
                     // the last ceil(dim / n) elements; the last gets the
                     // remainder. This differs from the older equal-split path.
-                    (Some(n), Some(d)) if i < n && d >= n as i64 => {
+                    (Some(n), Some(d)) if i < n => {
                         let chunk = (d + n as i64 - 1) / n as i64;
-                        let size = if i + 1 == n {
-                            d - (n as i64 - 1) * chunk
-                        } else {
-                            chunk
-                        };
+                        let remainder = d - (n as i64 - 1) * chunk;
+                        if remainder < 0 {
+                            return Err(ShapeInferError::Invalid {
+                                op: "Split".into(),
+                                detail: format!(
+                                    "cannot split axis extent {d} into {n} parts: \
+                                     the even chunk size {chunk} leaves a negative final remainder"
+                                ),
+                            });
+                        }
+                        let size = if i + 1 == n { remainder } else { chunk };
                         DimExpr::constant(size)
                     }
                     // The legacy no-`split` form is only exact when divisible.

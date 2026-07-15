@@ -1246,6 +1246,19 @@ fn split_num_outputs_uses_ceil_chunks_and_final_remainder() {
 }
 
 #[test]
+fn split_num_outputs_zero_size_final_chunk() {
+    let n = with_attr(
+        with_attr(node("Split", 1, 3), "axis", Attribute::Int(1)),
+        "num_outputs",
+        Attribute::Int(3),
+    );
+    let outs = run(&n, vec![f32in(vec![c(2), c(2)])], 18);
+    assert_eq!(out_shape(&outs), vec![c(2), c(1)]);
+    assert_eq!(outs[1].type_info.as_ref().unwrap().shape, vec![c(2), c(1)]);
+    assert_eq!(outs[2].type_info.as_ref().unwrap().shape, vec![c(2), c(0)]);
+}
+
+#[test]
 fn equal_broadcasts_to_bool() {
     let n = node("Equal", 2, 1);
     let outs = run(
