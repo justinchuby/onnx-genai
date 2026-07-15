@@ -241,12 +241,6 @@ struct InferenceSession {
     inputs: Vec<IoMeta>,
     outputs: Vec<IoMeta>,
     providers: Vec<String>,
-    /// Active output subset selected by an in-scope [`bind_outputs`] block, or
-    /// `None` for "all outputs in graph order". Read only by
-    /// [`__call__`](InferenceSession::__call__); `run`/`run_with_values` ignore
-    /// it and keep taking explicit `output_names`. Interior-mutable so a `with`
-    /// block can set/restore it without `&mut self`.
-    active_outputs: Mutex<Option<Vec<String>>>,
 }
 
 #[pymethods]
@@ -309,7 +303,6 @@ impl InferenceSession {
             inputs,
             outputs,
             providers,
-            active_outputs: Mutex::new(None),
         })
     }
 
@@ -404,9 +397,10 @@ impl InferenceSession {
     ///   keyword arguments fill or set the rest **by name**.
     ///
     /// Every value flows through the DLPack import (numpy/torch/cupy/jax) with a
-    /// numpy fallback, so no wrapper type is needed. Output selection honors an
-    /// in-scope [`bind_outputs`](Self::bind_outputs) block, else returns all
-    /// outputs in graph order. A single output is returned directly as an
+    /// numpy fallback, so no wrapper type is needed. This base-session call
+    /// always returns **all** model outputs in graph order; use
+    /// [`bind_outputs`](Self::bind_outputs) to obtain a proxy that returns a
+    /// subset. A single output is returned directly as an
     /// [`NxrtValue`](dlpack::NxrtValue); multiple outputs come back in an
     /// [`Outputs`] container.
     #[pyo3(signature = (*args, **kwargs))]
@@ -416,42 +410,28 @@ impl InferenceSession {
         args: &Bound<'_, PyTuple>,
         kwargs: Option<&Bound<'_, PyDict>>,
     ) -> PyResult<Py<PyAny>> {
-        let np = py.import("numpy")?;
-        let feed = self.build_feed(py, args, kwargs)?;
-
-        let output_names = self
-            .active_outputs
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("nxrt session mutex poisoned"))?
-            .clone();
-
-        let (names, tensors) = self.run_inner(py, &np, output_names, &feed)?;
-
-        if tensors.len() == 1 {
-            let name = names.into_iter().next().expect("len checked");
-            let tensor = tensors.into_iter().next().expect("len checked");
-            return Ok(Py::new(py, dlpack::NxrtValue::new(tensor, name))?.into_any());
-        }
-
-        let mut values = Vec::with_capacity(tensors.len());
-        for (name, tensor) in names.iter().cloned().zip(tensors) {
-            values.push(Py::new(py, dlpack::NxrtValue::new(tensor, name))?);
-        }
-        Ok(Py::new(py, Outputs { names, values })?.into_any())
+        self.call_impl(py, args, kwargs, None)
     }
 
-    /// Restrict which outputs `__call__` returns for the duration of a `with`
-    /// block, restoring the previous selection on exit (nesting supported).
+    /// Return a lightweight [`BoundSession`] proxy that restricts which outputs
+    /// its calls compute/return, without mutating this session.
     ///
     /// ```python
-    /// with sess.bind_outputs("logits"):
-    ///     logits = sess(x)          # only "logits" is computed/returned
+    /// with sess.bind_outputs("logits") as s:
+    ///     logits = s(x)             # only "logits" is computed/returned
+    /// # or without a `with`:
+    /// s = sess.bind_outputs("logits")
+    /// logits = s(x)
     /// ```
     ///
-    /// Names are validated against the model outputs immediately, with an
-    /// actionable error. `run()`/`run_with_values()` are unaffected.
+    /// The selected names are validated against the model outputs immediately,
+    /// with an actionable error, and are fixed for the life of the returned
+    /// proxy. The proxy owns its own output list, so it is thread-/async-safe:
+    /// overlapping calls on distinct proxies (or the base session) never clobber
+    /// each other. This session's own `run()`/`run_with_values()`/`__call__`
+    /// are entirely unaffected.
     #[pyo3(signature = (*names))]
-    fn bind_outputs(slf: Bound<'_, Self>, names: Vec<String>) -> PyResult<OutputBinding> {
+    fn bind_outputs(slf: Bound<'_, Self>, names: Vec<String>) -> PyResult<BoundSession> {
         {
             let s = slf.borrow();
             if names.is_empty() {
@@ -469,15 +449,42 @@ impl InferenceSession {
                 }
             }
         }
-        Ok(OutputBinding {
+        Ok(BoundSession {
             session: slf.unbind(),
             names,
-            saved: Mutex::new(None),
         })
     }
 }
 
 impl InferenceSession {
+    /// Core of the callable API shared by [`__call__`](Self::__call__) and the
+    /// [`BoundSession`] proxy. `output_names` is threaded in explicitly as a
+    /// per-call parameter (never read from shared session state), so concurrent
+    /// callers with different selections cannot clobber each other.
+    fn call_impl(
+        &self,
+        py: Python<'_>,
+        args: &Bound<'_, PyTuple>,
+        kwargs: Option<&Bound<'_, PyDict>>,
+        output_names: Option<Vec<String>>,
+    ) -> PyResult<Py<PyAny>> {
+        let np = py.import("numpy")?;
+        let feed = self.build_feed(py, args, kwargs)?;
+        let (names, tensors) = self.run_inner(py, &np, output_names, &feed)?;
+
+        if tensors.len() == 1 {
+            let name = names.into_iter().next().expect("len checked");
+            let tensor = tensors.into_iter().next().expect("len checked");
+            return Ok(Py::new(py, dlpack::NxrtValue::new(tensor, name))?.into_any());
+        }
+
+        let mut values = Vec::with_capacity(tensors.len());
+        for (name, tensor) in names.iter().cloned().zip(tensors) {
+            values.push(Py::new(py, dlpack::NxrtValue::new(tensor, name))?);
+        }
+        Ok(Py::new(py, Outputs { names, values })?.into_any())
+    }
+
     /// Resolve `__call__`'s positional/keyword arguments into a validated
     /// `{name: value}` feed dict (values are left as raw Python objects so
     /// `run_inner` can zero-copy import them).
@@ -777,57 +784,97 @@ impl Outputs {
     }
 }
 
-/// Context manager returned by [`InferenceSession::bind_outputs`]; sets the
-/// session's active output subset on `__enter__` and restores the previous
-/// selection on `__exit__` (so nested `with` blocks stack correctly).
-#[pyclass(module = "nxrt", name = "OutputBinding")]
-struct OutputBinding {
+/// Lightweight proxy returned by [`InferenceSession::bind_outputs`] that applies
+/// a fixed output subset per call, without mutating the underlying session.
+///
+/// The proxy holds a reference to its [`InferenceSession`] plus its own
+/// immutable `names` list. Because the selection lives on the proxy (not on
+/// shared session state), overlapping calls across threads or asyncio tasks —
+/// on distinct proxies or on the base session — never clobber each other's
+/// output selection. It is itself callable and exposes `run`/`run_with_values`
+/// that default their output selection to this subset, and it doubles as a
+/// context manager (`__enter__` yields the proxy, `__exit__` is a no-op) so
+/// `with session.bind_outputs("y") as s: s(x)` keeps working.
+#[pyclass(module = "nxrt", name = "BoundSession")]
+struct BoundSession {
     session: Py<InferenceSession>,
     names: Vec<String>,
-    /// The selection that was active when this block was entered, stashed so
-    /// `__exit__` can restore it. `Some(prev)` only between enter and exit.
-    saved: Mutex<Option<Option<Vec<String>>>>,
 }
 
 #[pymethods]
-impl OutputBinding {
-    fn __enter__(&self, py: Python<'_>) -> PyResult<Py<InferenceSession>> {
+impl BoundSession {
+    /// Call the session with this proxy's fixed output subset.
+    #[pyo3(signature = (*args, **kwargs))]
+    fn __call__(
+        &self,
+        py: Python<'_>,
+        args: &Bound<'_, PyTuple>,
+        kwargs: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<Py<PyAny>> {
         let sess = self.session.borrow(py);
-        let mut active = sess
-            .active_outputs
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("nxrt session mutex poisoned"))?;
-        *self
-            .saved
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("nxrt binding mutex poisoned"))? =
-            Some(active.clone());
-        *active = Some(self.names.clone());
-        Ok(self.session.clone_ref(py))
+        sess.call_impl(py, args, kwargs, Some(self.names.clone()))
     }
 
+    /// Like [`InferenceSession::run`], but defaults the output selection to this
+    /// proxy's subset when `output_names` is `None`. An explicit `output_names`
+    /// still wins, matching the onnxruntime-shaped signature.
+    #[pyo3(signature = (output_names, input_feed))]
+    fn run(
+        &self,
+        py: Python<'_>,
+        output_names: Option<Vec<String>>,
+        input_feed: &Bound<'_, PyDict>,
+    ) -> PyResult<Py<PyList>> {
+        let sess = self.session.borrow(py);
+        let names = output_names.or_else(|| Some(self.names.clone()));
+        sess.run(py, names, input_feed)
+    }
+
+    /// Like [`InferenceSession::run_with_values`], but defaults the output
+    /// selection to this proxy's subset when `output_names` is `None`.
+    #[pyo3(signature = (output_names, input_feed))]
+    fn run_with_values(
+        &self,
+        py: Python<'_>,
+        output_names: Option<Vec<String>>,
+        input_feed: &Bound<'_, PyDict>,
+    ) -> PyResult<Py<PyList>> {
+        let sess = self.session.borrow(py);
+        let names = output_names.or_else(|| Some(self.names.clone()));
+        sess.run_with_values(py, names, input_feed)
+    }
+
+    /// The output names this proxy selects, in order.
+    #[getter]
+    fn output_names(&self) -> Vec<String> {
+        self.names.clone()
+    }
+
+    /// The underlying session (the escape hatch back to the full surface).
+    #[getter]
+    fn session(&self, py: Python<'_>) -> Py<InferenceSession> {
+        self.session.clone_ref(py)
+    }
+
+    /// Context-manager entry: yields the proxy itself (no session mutation).
+    fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    /// Context-manager exit: a no-op — there is no shared state to restore.
     #[pyo3(signature = (_exc_type=None, _exc_value=None, _traceback=None))]
     fn __exit__(
         &self,
-        py: Python<'_>,
         _exc_type: Option<Py<PyAny>>,
         _exc_value: Option<Py<PyAny>>,
         _traceback: Option<Py<PyAny>>,
-    ) -> PyResult<bool> {
-        let sess = self.session.borrow(py);
-        let mut active = sess
-            .active_outputs
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("nxrt session mutex poisoned"))?;
-        if let Some(prev) = self
-            .saved
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("nxrt binding mutex poisoned"))?
-            .take()
-        {
-            *active = prev;
-        }
-        Ok(false)
+    ) -> bool {
+        false
+    }
+
+    fn __repr__(&self, py: Python<'_>) -> String {
+        let _ = py;
+        format!("BoundSession(outputs={:?})", self.names)
     }
 }
 
@@ -840,10 +887,23 @@ fn device_to_providers(device: Option<&str>) -> PyResult<Vec<String>> {
     let kind = dev.split(':').next().unwrap_or(dev).to_ascii_lowercase();
     Ok(match kind.as_str() {
         "cpu" => vec!["CPUExecutionProvider".to_string()],
-        "cuda" | "gpu" => vec![
-            "CUDAExecutionProvider".to_string(),
-            "CPUExecutionProvider".to_string(),
-        ],
+        "cuda" | "gpu" => {
+            // A `cuda:N` suffix must be a non-negative integer ordinal. The
+            // ordinal has no effect yet (CUDA falls back to CPU in this build),
+            // but malformed input like `cuda:abc` is rejected up front.
+            if let Some((_, ordinal)) = dev.split_once(':')
+                && (ordinal.is_empty() || !ordinal.bytes().all(|b| b.is_ascii_digit()))
+            {
+                return Err(PyValueError::new_err(format!(
+                    "invalid CUDA device ordinal in {dev:?}: expected a \
+                     non-negative integer after ':', e.g. \"cuda:0\"."
+                )));
+            }
+            vec![
+                "CUDAExecutionProvider".to_string(),
+                "CPUExecutionProvider".to_string(),
+            ]
+        }
         "metal" | "coreml" => vec![
             "CoreMLExecutionProvider".to_string(),
             "CPUExecutionProvider".to_string(),
@@ -1148,7 +1208,7 @@ fn nxrt(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<InferenceSession>()?;
     m.add_class::<NodeArg>()?;
     m.add_class::<Outputs>()?;
-    m.add_class::<OutputBinding>()?;
+    m.add_class::<BoundSession>()?;
     dlpack::register(m)?;
     m.add_function(wrap_pyfunction!(load, m)?)?;
     m.add_function(wrap_pyfunction!(get_available_providers, m)?)?;

@@ -37,7 +37,7 @@ use std::ffi::{CStr, c_void};
 use onnx_runtime_ep_api::DeviceBuffer;
 use onnx_runtime_ir::{DataType, DeviceId, DeviceType, TensorLayout};
 use onnx_runtime_session::{Tensor, cpu_allocator};
-use pyo3::exceptions::{PyBufferError, PyTypeError};
+use pyo3::exceptions::{PyBufferError, PyTypeError, PyValueError};
 use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::types::PyTuple;
@@ -424,9 +424,12 @@ impl NxrtValue {
 
     /// numpy's array-interface hook, so `np.asarray(v)` / matplotlib / any
     /// array-consuming API get this value's data as an ndarray (a copy, via
-    /// `.numpy()`). The optional `dtype`/`copy` keywords numpy 2 may pass are
-    /// honored loosely: `dtype` casts, `copy` is accepted and ignored (the
-    /// result is always a fresh array).
+    /// `.numpy()`). Matches numpy's `__array__(self, dtype=None, copy=None)`:
+    /// `dtype` casts the result, and `copy` is honored per numpy's contract —
+    /// `copy=False` means "error if a copy is required". Since this hook can
+    /// only produce a fresh copy (there is no zero-copy ndarray view of an nxrt
+    /// buffer; use `np.from_dlpack(v)` for a borrow), `copy=False` raises, while
+    /// `copy=None`/`copy=True` return the copy.
     #[pyo3(signature = (dtype=None, copy=None))]
     fn __array__(
         &self,
@@ -434,7 +437,16 @@ impl NxrtValue {
         dtype: Option<&Bound<'_, PyAny>>,
         copy: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Py<PyAny>> {
-        let _ = copy;
+        if let Some(c) = copy
+            && !c.is_none()
+            && !c.extract::<bool>().unwrap_or(true)
+        {
+            return Err(PyValueError::new_err(
+                "__array__(copy=False) cannot be satisfied: NxrtValue has no \
+                 zero-copy numpy view. Use np.from_dlpack(v) for a true \
+                 borrow, or omit copy / pass copy=True to get a copy.",
+            ));
+        }
         let arr = self.numpy(py)?;
         match dtype {
             Some(dt) if !dt.is_none() => Ok(arr.bind(py).call_method1("astype", (dt,))?.unbind()),

@@ -9,12 +9,16 @@ only ``numpy`` + ``onnx`` (torch is optional and skipped when absent).
 
 from __future__ import annotations
 
+import importlib.util
+
 import numpy as np
 import onnx.helper as oh
 import pytest
 from onnx import TensorProto
 
 import nxrt
+
+_HAS_TORCH = importlib.util.find_spec("torch") is not None
 
 
 def _relu_model(shape=(2, 3), name_in="X", name_out="Y") -> bytes:
@@ -48,6 +52,30 @@ def _multi_output_model(shape=(2, 2)) -> bytes:
     node_p = oh.make_node("Relu", ["X"], ["pos"])
     node_n = oh.make_node("Neg", ["X"], ["neg"])
     graph = oh.make_graph([node_p, node_n], "g_multi", [x], [p, n])
+    model = oh.make_model(graph, opset_imports=[oh.make_operatorsetid("", 17)])
+    model.ir_version = 10
+    return model.SerializeToString()
+
+
+def _zero_input_model() -> bytes:
+    """No graph inputs; a ``Constant`` node produces the single output ``C``."""
+    c = oh.make_tensor_value_info("C", TensorProto.FLOAT, [2, 2])
+    const = oh.make_tensor(
+        "value", TensorProto.FLOAT, [2, 2], [1.0, 2.0, 3.0, 4.0]
+    )
+    node = oh.make_node("Constant", [], ["C"], value=const)
+    graph = oh.make_graph([node], "g_zero_in", [], [c])
+    model = oh.make_model(graph, opset_imports=[oh.make_operatorsetid("", 17)])
+    model.ir_version = 10
+    return model.SerializeToString()
+
+
+def _scalar_output_model(shape=(2, 3)) -> bytes:
+    """One input, a single 0-d (scalar) output ``s = ReduceSum(X)``."""
+    x = oh.make_tensor_value_info("X", TensorProto.FLOAT, list(shape))
+    s = oh.make_tensor_value_info("s", TensorProto.FLOAT, [])
+    node = oh.make_node("ReduceSum", ["X"], ["s"], keepdims=0)
+    graph = oh.make_graph([node], "g_scalar", [x], [s])
     model = oh.make_model(graph, opset_imports=[oh.make_operatorsetid("", 17)])
     model.ir_version = 10
     return model.SerializeToString()
@@ -204,28 +232,55 @@ def test_outputs_unknown_name_and_index_errors():
 def test_bind_outputs_selects_subset():
     sess = nxrt.load(_multi_output_model())
     x = np.array([[-1.0, 2.0], [3.0, -4.0]], dtype=np.float32)
-    with sess.bind_outputs("neg"):
-        out = sess(x)
+    with sess.bind_outputs("neg") as s:
+        out = s(x)
         # Single selected output -> returned directly.
         assert isinstance(out, nxrt.NxrtValue)
         np.testing.assert_allclose(np.asarray(out), -x)
-    # Restored: both outputs again.
+    # The base session is unaffected: it still returns both outputs.
     both = sess(x)
     assert isinstance(both, nxrt.Outputs)
     assert len(both) == 2
 
 
-def test_bind_outputs_nesting_and_restore():
+def test_bind_outputs_without_with_block():
+    # The proxy works standalone, no `with` required.
     sess = nxrt.load(_multi_output_model())
     x = np.ones((2, 2), dtype=np.float32)
-    with sess.bind_outputs("pos", "neg"):
-        assert len(sess(x)) == 2
-        with sess.bind_outputs("neg"):
-            assert isinstance(sess(x), nxrt.NxrtValue)
-        # inner block restored the two-output selection
-        assert len(sess(x)) == 2
-    # outer block restored the default (all outputs)
+    s = sess.bind_outputs("neg")
+    assert isinstance(s(x), nxrt.NxrtValue)
+    # base session still returns all outputs.
     assert isinstance(sess(x), nxrt.Outputs)
+
+
+def test_bind_outputs_base_session_unaffected_after_exception():
+    # An exception raised inside the `with` block must not corrupt selection
+    # state: the base session still returns all outputs afterwards.
+    sess = nxrt.load(_multi_output_model())
+    x = np.ones((2, 2), dtype=np.float32)
+    with pytest.raises(RuntimeError):
+        with sess.bind_outputs("neg") as s:
+            assert isinstance(s(x), nxrt.NxrtValue)
+            raise RuntimeError("boom")
+    both = sess(x)
+    assert isinstance(both, nxrt.Outputs)
+    assert len(both) == 2
+
+
+def test_bind_outputs_two_proxies_interleaved_distinct_outputs():
+    # Two proxies from the SAME session, used interleaved, must each return
+    # their own distinct output (proves there is no shared selection state to
+    # clobber).
+    sess = nxrt.load(_multi_output_model())
+    x = np.array([[-1.0, 2.0], [3.0, -4.0]], dtype=np.float32)
+    pos_proxy = sess.bind_outputs("pos")
+    neg_proxy = sess.bind_outputs("neg")
+    np.testing.assert_allclose(np.asarray(neg_proxy(x)), -x)
+    np.testing.assert_allclose(np.asarray(pos_proxy(x)), np.maximum(x, 0.0))
+    np.testing.assert_allclose(np.asarray(neg_proxy(x)), -x)
+    np.testing.assert_allclose(np.asarray(pos_proxy(x)), np.maximum(x, 0.0))
+    # base session still returns all outputs, unaffected by either proxy.
+    assert len(sess(x)) == 2
 
 
 def test_bind_outputs_unknown_name_errors():
@@ -240,9 +295,36 @@ def test_bind_outputs_does_not_affect_run():
     sess = nxrt.load(_multi_output_model())
     x = np.ones((2, 2), dtype=np.float32)
     with sess.bind_outputs("neg"):
-        # run() ignores the active selection: still returns all outputs.
+        # run() on the base session ignores the binding: still all outputs.
         outs = sess.run(None, {"X": x})
         assert len(outs) == 2
+
+
+def test_run_with_values_on_base_session_ignores_binding():
+    sess = nxrt.load(_multi_output_model())
+    x = np.ones((2, 2), dtype=np.float32)
+    proxy = sess.bind_outputs("neg")
+    # The base session's run_with_values ignores any proxy and returns all.
+    vals = sess.run_with_values(None, {"X": x})
+    assert len(vals) == 2
+    names = {v.name for v in vals} if hasattr(vals[0], "name") else None
+    _ = names  # name attribute is optional; the count is the contract here.
+    # The proxy, by contrast, applies its own subset when output_names is None.
+    proxy_vals = proxy.run_with_values(None, {"X": x})
+    assert len(proxy_vals) == 1
+
+
+def test_bind_outputs_proxy_run_defaults_to_subset():
+    sess = nxrt.load(_multi_output_model())
+    x = np.array([[-1.0, 2.0], [3.0, -4.0]], dtype=np.float32)
+    proxy = sess.bind_outputs("neg")
+    # run(None, ...) on the proxy defaults to its subset.
+    outs = proxy.run(None, {"X": x})
+    assert len(outs) == 1
+    np.testing.assert_allclose(outs[0], -x)
+    # Explicit output_names still wins over the proxy's subset.
+    both = proxy.run(["pos", "neg"], {"X": x})
+    assert len(both) == 2
 
 
 # --------------------------------------------------------------------------- #
@@ -272,6 +354,25 @@ def test_load_unknown_device_is_actionable():
     assert "tpu" in str(ei.value)
 
 
+def test_load_cuda_ordinal_accepted():
+    # `cuda:0` is a well-formed ordinal: it passes device parsing and reaches
+    # provider validation. This build has no CUDA, so it then fails with the
+    # provider-build error -- NOT an ordinal-format error, proving the ordinal
+    # was accepted.
+    with pytest.raises(ValueError) as ei:
+        nxrt.load(_relu_model((2, 2)), device="cuda:0")
+    msg = str(ei.value)
+    assert "CUDAExecutionProvider" in msg
+    assert "ordinal" not in msg
+
+
+def test_load_cuda_bad_ordinal_raises():
+    with pytest.raises(ValueError) as ei:
+        nxrt.load(_relu_model((2, 2)), device="cuda:abc")
+    msg = str(ei.value)
+    assert "cuda:abc" in msg and "ordinal" in msg
+
+
 # --------------------------------------------------------------------------- #
 # NxrtValue tensor-like surface
 # --------------------------------------------------------------------------- #
@@ -293,6 +394,42 @@ def test_value_array_shape_dtype_len_repr():
     assert "Y" in r and "float32" in r and "(2, 3)" in r.replace("[", "(").replace("]", ")")
 
 
+def test_call_zero_input_model():
+    # A model with no graph inputs is callable with no arguments.
+    sess = nxrt.load(_zero_input_model())
+    out = sess()
+    assert isinstance(out, nxrt.NxrtValue)
+    np.testing.assert_array_equal(
+        np.asarray(out), np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32)
+    )
+
+
+def test_scalar_value_len_raises():
+    # A 0-d (scalar) NxrtValue has no length, matching numpy's TypeError.
+    sess = nxrt.load(_scalar_output_model((2, 3)))
+    x = np.arange(6, dtype=np.float32).reshape(2, 3)
+    v = sess(x)
+    assert isinstance(v, nxrt.NxrtValue)
+    assert v.shape == ()
+    with pytest.raises(TypeError):
+        len(v)
+    # value itself is still correct.
+    assert float(np.asarray(v)) == pytest.approx(float(x.sum()))
+
+
+def test_array_copy_false_raises():
+    # numpy's contract: __array__(copy=False) must error when a copy is
+    # required. NxrtValue can only produce a copy, so it raises.
+    sess = nxrt.load(_relu_model((2, 3)))
+    x = np.arange(6, dtype=np.float32).reshape(2, 3)
+    v = sess(x)
+    with pytest.raises(ValueError):
+        v.__array__(copy=False)
+    # copy=True and copy=None (the default) both succeed.
+    np.testing.assert_array_equal(v.__array__(copy=True), v.numpy())
+    np.testing.assert_array_equal(v.__array__(copy=None), v.numpy())
+
+
 def test_call_equivalent_to_run():
     sess = nxrt.load(_relu_model((2, 3)))
     x = np.arange(6, dtype=np.float32).reshape(2, 3) - 3.0
@@ -301,10 +438,7 @@ def test_call_equivalent_to_run():
     np.testing.assert_array_equal(got, expected)
 
 
-@pytest.mark.skipif(
-    pytest.importorskip("torch", reason="torch not installed") is None,
-    reason="torch not installed",
-)
+@pytest.mark.skipif(not _HAS_TORCH, reason="torch not installed")
 def test_call_output_is_zero_copy_for_torch():
     import torch
 
