@@ -50,6 +50,7 @@ pub mod log_softmax;
 pub mod logical;
 pub mod matmul;
 pub mod movement_ops;
+pub mod norm_ops;
 #[cfg(feature = "onednn")]
 pub mod onednn;
 pub mod pad;
@@ -296,6 +297,28 @@ pub fn build_cpu_registry() -> OpRegistry {
     reg.register(
         OpKey::new("RMSNormalization", "", 23),
         Box::new(rmsnorm::RmsNormFactory),
+    );
+    reg.register(
+        OpKey::new("BatchNormalization", "", 15),
+        Box::new(norm_ops::BatchNormFactory),
+    );
+    reg.register(
+        OpKey::new("InstanceNormalization", "", 6),
+        Box::new(norm_ops::InstanceNormFactory),
+    );
+    // GroupNormalization v18 uses per-group scale/bias. Opset 21 changed the
+    // affine inputs to per-channel, so keep versioned factories for both schemas.
+    reg.register(
+        OpKey::new("GroupNormalization", "", 18),
+        Box::new(norm_ops::GroupNormFactory { since_version: 18 }),
+    );
+    reg.register(
+        OpKey::new("GroupNormalization", "", 21),
+        Box::new(norm_ops::GroupNormFactory { since_version: 21 }),
+    );
+    reg.register(
+        OpKey::new("PRelu", "", 16),
+        Box::new(norm_ops::PReluFactory),
     );
     // `ai.onnx::RotaryEmbedding` added at opset 23.
     reg.register(
@@ -1154,8 +1177,11 @@ mod tests {
         // op-name count). Pooling adds twelve more versioned entries: five each
         // for AveragePool and MaxPool, plus the two global pool operators, for
         // forty over the op-name count. ScatterElements also has distinct
-        // opset-11 and opset-16 registrations, for forty-one in total.
-        assert_eq!(reg.len(), PHASE1_OPS.len() + 41);
+        // opset-11 and opset-16 registrations. BatchNormalization,
+        // InstanceNormalization and PRelu add one registration each, while
+        // GroupNormalization adds opset-18 and opset-21 entries, for forty-six
+        // registrations over the Phase-1 op-name count in total.
+        assert_eq!(reg.len(), PHASE1_OPS.len() + 46);
         for op in PHASE1_OPS {
             assert!(reg.lookup(op, "", 21).is_some(), "missing factory for {op}");
         }
@@ -1201,6 +1227,14 @@ mod tests {
         // Standard LLM primitives resolve at/after their since-versions.
         assert!(reg.lookup("RMSNormalization", "", 23).is_some());
         assert!(reg.lookup("RMSNormalization", "", 22).is_none());
+        assert!(reg.lookup("BatchNormalization", "", 15).is_some());
+        assert!(reg.lookup("BatchNormalization", "", 14).is_none());
+        assert!(reg.lookup("InstanceNormalization", "", 6).is_some());
+        assert!(reg.lookup("GroupNormalization", "", 18).is_some());
+        assert!(reg.lookup("GroupNormalization", "", 21).is_some());
+        assert!(reg.lookup("GroupNormalization", "", 17).is_none());
+        assert!(reg.lookup("PRelu", "", 16).is_some());
+        assert!(reg.lookup("PRelu", "", 15).is_none());
         assert!(reg.lookup("RotaryEmbedding", "", 23).is_some());
         assert!(reg.lookup("RotaryEmbedding", "", 22).is_none());
         assert!(reg.lookup("Swish", "", 24).is_some());

@@ -1921,6 +1921,7 @@ dependencies = [
  "libm",
  "onnx-runtime-ep-api",
  "onnx-runtime-ir",
+ "onnx-runtime-loader",
  "rayon",
  "thiserror 2.0.18",
 ]

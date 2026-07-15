@@ -19,6 +19,9 @@ rayon = "1"
 # off near zero and failed the upstream conformance suite's tight tolerance.
 libm = "0.2"
 
+[dev-dependencies]
+onnx-runtime-loader = { workspace = true }
+
 [features]
 # oneDNN CPU GEMM backend (docs/ORT2.md §25.2). NON-default: it requires the
 # `third_party/onednn` git submodule and a cmake+bindgen source build, so it is
