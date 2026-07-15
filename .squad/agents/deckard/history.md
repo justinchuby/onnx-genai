@@ -88,3 +88,7 @@ Set all 8 `onnx-runtime-*` crates to `0.1.0-dev.0`; exact-pinned workspace deps 
 
 ## 2026-07-14T20:05:00Z — Identity follow-up review
 Reviewed Joshi's CPU Identity String rejection and bf16/f16/i32 bit-exact coverage 🟢. Change merged to `origin/main` as `da95a8a`; explicit String rejection prevents zero-byte silent data loss.
+
+## 2026-07-15T01:52:00Z — Session update
+
+- Reviewed Rachael’s zero-copy weight streaming 🟡; a subsequent producer-aliasing gap was corrected by Zhora before final acceptance.

@@ -6,6 +6,14 @@ Tracks implementation status of `docs/DESIGN.md` (§1–§40). Updated as work l
 
 _Last updated: 2026-07-15 — includes the Design → Implementation Gap Analysis and the latest ORT2 CPU, scheduler, CUDA, Sequence, packaging, and CI landings (see below)._
 
+
+## Current tiered-memory and interoperability milestones
+
+- **Zero-copy weight streaming ✅ DONE:** aligned mmap-backed external initializers are borrowed rather than copied; borrowed ownership and initializer-producer validation close the read-only mmap soundness boundary.
+- **DLPack zero-copy export ✅ DONE:** `onnx-runtime-dlpack` and Python `NxrtValue` export CPU tensor storage through standard DLPack ownership capsules; public FFI validation/hardening is complete.
+- **KV-insertion architecture evaluation ✅ DONE (decision-ready):** for Mobius exports, Phase 1 is functional GQA by dropping `past_present_share_buffer`; the paged-attention successor is feature-gated on correctness and M=1 latency.
+- **Follow-ups:** DLPack zero-copy **import** (unblocked by `from_borrowed_parts`); KV Phase-1 functional-GQA validation; and the liveness `MemoryPlanner` crate.
+
 ## ORT 2.0 — from-scratch Rust ONNX runtime (`docs/ORT2.md`, big design — steady progress)
 
 New parallel track (user co-designed the design with the team). Goal: a from-scratch Rust ONNX runtime living in this monorepo — own strided IR (symbolic shapes + device placement first-class), plugin-EP contract that preserves the ORT graph ABI (the EP ecosystem is the moat), cost-model-driven placement, async executor. Backend swap via a `backend-ort2` feature in `onnx-genai-engine`. Roadmap: `docs/ORT2-IMPL-PLAN.md`.

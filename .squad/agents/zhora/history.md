@@ -84,3 +84,7 @@ Next: §34 router epic (R1/R2/R3) has kicked off.
 
 ## 2026-07-14T20:05:00Z — Upstream ONNX suite review
 Reviewed Fido's `cbourjau/onnx-tests` nxrt adapter and reproduction docs 🟡. The adapter is correct; 158 pass / 1,038 fail / 2 skip across 1,198 cases accurately reflects current CPU EP gaps. Merged as `d61cc97`.
+
+## 2026-07-15T01:52:00Z — Session update
+
+- Closed the weight-streaming soundness gap (`e0c9669`): only producer-less initializers can be borrowed; loader rejects initializer/output reuse.

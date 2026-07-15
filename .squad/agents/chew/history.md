@@ -22,3 +22,7 @@ Approved the model-agnostic EP API contract and reviewed consume, option parsing
 
 ### Recent binding follow-up
 At 2026-07-14T19:05:00Z, fixed clippy findings and corrected Python pytest counts in merged commit `878559f`.
+
+## 2026-07-15T01:52:00Z — Session update
+
+- Delivered DLPack zero-copy export (`6fdccc8`): C ABI plus Python NxrtValue `__dlpack__`/`__dlpack_device__`.

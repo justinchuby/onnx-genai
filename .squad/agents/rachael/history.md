@@ -57,3 +57,7 @@ Batched-driver DoS hardening is canonical: admission is bounded by `max_pending`
 - Next: §34 router epic (R1/R2/R3) has kicked off.
 
 - 2026-07-14T19:05:00Z — Revised unsupported-op diagnostics to explicit `OpsetVersion::{Known, Undeclared}` and graceful unnamed nodes. Final loader fail-fast validation makes undeclared opsets unreachable on normal paths.
+
+## 2026-07-15T01:52:00Z — Session update
+
+- Delivered zero-copy mmap initializer borrowing (`3df84d0`). The later producer-aliasing soundness restriction was landed by Zhora.

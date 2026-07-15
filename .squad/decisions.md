@@ -757,3 +757,46 @@ CHANNEL/AVG results match element-for-element.
 ## Archived decision index
 
 - 2026-07: Historical decision archive — [`2026-07.md`](decisions-archive/2026-07.md).
+
+---
+
+### 2026-07-15: Zero-copy mmap-backed initializer borrowing
+**By:** Rachael; soundness follow-up by Zhora
+**Status:** ✅ merged (`3df84d0`, `e0c9669`)
+**What:** `DeviceBuffer` now distinguishes owned and borrowed storage and has a `from_borrowed_parts` constructor, allowing the CPU executor to borrow aligned mmap-backed external initializers instead of copying them into RAM. Borrowed buffers are never deallocated by providers. The executor only borrows producer-less initializers, and the loader rejects an initializer that is also a node output with `LoaderError::InitializerHasProducer`.
+**Why:** This preserves the mmap owner lifetime while avoiding the resident-RAM duplicate for eligible weights. Restricting the borrow path to producer-less initializers closes the write-through/read-only-mmap soundness gap that the initial review missed.
+**Validation:** Regression coverage proves aligned borrowing, unaligned fallback-to-copy, no-op deallocation, and rejection of initializer/output reuse.
+
+#### Sources: `deckard-review-weight-streaming.md`, `zhora-weight-streaming-fix.md`
+
+---
+
+### 2026-07-15: DLPack zero-copy export with explicit FFI ownership contract
+**By:** Chew; reviewed by Hassan; hardened by Ana
+**Status:** ✅ merged (`6fdccc8`, `e38eaee`)
+**What:** Added `onnx-runtime-dlpack` and Python `run_with_values()` returning `NxrtValue` with `__dlpack__` and `__dlpack_device__`. CPU tensors export by borrowing the tensor allocation while a managed owner preserves its lifetime. The public raw-pointer export constructors are `unsafe`, validate dimensions and stride lengths, reject big-endian builds, and emit null `DLTensor.data` for zero-element tensors. Writable aliasing is documented.
+**Why:** Consumers such as NumPy and PyTorch can consume runtime output without an additional host copy while retaining a clear one-owner DLPack capsule/deleter contract.
+**Validation:** Non-author review approved the capsule handshake, ABI layout, Send/GIL behavior, owner lifetime, and compatibility; Rust, build/clippy, and Python DLPack tests passed.
+
+#### Sources: `chew-dlpack-export.md`, `hassan-review-dlpack-export.md`, `ana-dlpack-hardening.md`
+
+---
+
+### 2026-07-15: KV insertion architecture — Mobius functional GQA first, paged attention later
+**By:** Tyrell; fact check by Fact Checker; revised by coordinator directive
+**Status:** ✅ decision-ready (`41c2fff`, `6e62902`)
+**What:** For third-party `com.microsoft::GroupQueryAttention` exports, retain the sanctioned `past_present_share_buffer` compatibility path. For Mobius exports we control, stop stamping `past_present_share_buffer` as Phase 1: the same GQA graph then uses functional `ZeroCopyRebind`, requiring no new kernel and removing the fixed shared-buffer constraint. Phase 2 is a flag-gated vLLM-style device insertion plus block-table paged-attention contract.
+**Why:** The exporter is a design lever for our models, while existing third-party exports require compatibility. ORT GQA shared-buffer behavior is sanctioned, standard `ai.onnx::Attention` opset 23/24 has cache semantics, and Hugging Face calls `cache.update()` inside the attention module; none of those facts make existing GQA transparently interchangeable with a paged ABI.
+**Gate:** Functional GQA and any paged path require correctness traces plus M=1 p50/p99 decode latency within noise of the shared-buffer baseline. The paged path remains non-default until that gate passes; old GQA remains a frozen compatibility shim.
+
+#### Sources: `tyrell-kv-insertion-eval.md`, `fact-checker-kv-insertion-da.md`, `tyrell-kv-mobius-exporter.md`, `coordinator-we-control-the-mobius-exporter-so-attention-op-cho.md`
+
+---
+
+### 2026-07-15: Keep the unsupported-op diagnostic probe unsupported
+**By:** Taffey
+**Status:** ✅ merged (`31e8a0e`)
+**What:** `test_unsupported_op_is_actionable` now uses ONNX `Det` rather than `Sinh`.
+**Why:** `Sinh` is implemented by the CPU coverage wave; `Det` remains unregistered, so the test continues to exercise the actionable unsupported-operation error path.
+
+#### Source: `taffey-unsupported-op-test.md`
