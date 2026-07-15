@@ -16,7 +16,11 @@ of Ollama CPU. It does not win universally: LM Studio leads long-context decode
 cases at 202.67 and 165.77 tok/s.
 
 The current **H200 CUDA / GPU** checkpoint is
+[`2026-07-15-H200-wave8.md`](2026-07-15-H200-wave8.md), with the prior
+cross-runtime comparison in
 [`2026-07-13-H200-cuda-onnxgenai-vs-ollama-foundry.md`](2026-07-13-H200-cuda-onnxgenai-vs-ollama-foundry.md).
+The Wave 8 direct-engine check reaches 492.49 tok/s at 128 tokens and
+484.44 tok/s at 1024 tokens with coherent CPU/CUDA output.
 With CUDA-graph decode capture and a vectorized greedy argmax, onnx-genai CUDA
 reaches 481 tok/s decode with 68 ms TTFT on Qwen2.5-0.5B (1024 greedy tokens):
 it beats Foundry Local on every axis and ties Ollama Q4_K_M on end-to-end total
