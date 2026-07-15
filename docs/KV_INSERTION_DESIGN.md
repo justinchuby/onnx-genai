@@ -1,10 +1,21 @@
 # Runtime-Managed KV Insertion vs. Operator-Managed KV Update
 
-**Status:** Architecture evaluation (decision-ready). No code changes.
+**Status:** Architecture evaluation (decision-ready). **Revision 2** — reframed after the
+"Mobius is our exporter" degree of freedom (see §8). No code changes.
 **Author:** Tyrell (architect)
-**Date:** 2026-07-15
+**Date:** 2026-07-15 (rev 2)
 **Related:** `.squad/decisions/inbox/fact-checker-kv-insertion-da.md` (external-claim verification),
+`.squad/decisions/inbox/tyrell-kv-mobius-exporter.md` (rev-2 decision note),
 docs/DESIGN.md §40 (SWA/sinks), tiered-memory epic (paged/spillable KV), in-flight zero-copy-view work.
+
+> **Revision 2 in one line.** The original memo treated exported GQA as a *fixed*
+> constraint ("Path A is forced because we can't rewrite the baked-in op"). That is only
+> true for **third-party pre-exported models**. **Mobius is our exporter**, so for the
+> Mobius-controlled pipeline the attention-op contract is a **design lever, not a
+> constraint** — and we should pull it toward the runtime-managed / functional path
+> (Path B) as the strategic default. §8 is the authoritative recommendation; §1–§7 are
+> the original rev-1 analysis, still valid but now *scoped to the third-party case* where
+> noted. Where §6 and §8 disagree, **§8 wins.**
 
 ---
 
@@ -271,3 +282,199 @@ native EP direction, but it is **not** a transparent change to exported GQA mode
 **not** guaranteed to win at M=1. Pursue it as an **opt-in, benchmarked, native-EP paged
 path**, keep operator-managed GQA for exports, and delete the unconditional page-mirror
 copy that currently adds cost with no functional change.
+
+---
+
+## 8. Revision 2 — Mobius is our exporter: the attention-op contract is a design lever
+
+Rev-1 §6 split the world into **Path A (operator-managed GQA `share_buffer`)** and **Path
+B (runtime-managed insertion + functional paged attention)** and recommended A as the
+*default* for all exported models because "we cannot change that op without re-export."
+That premise is now relaxed: **Mobius is our exporter, so re-export is a knob we own.**
+This section supersedes §6 for anything Mobius produces.
+
+### 8.1 Reframing Path A vs Path B
+
+- **Path A is now the *compatibility* path, scoped to third-party / pre-existing GQA
+  exports only.** For a model we did not produce, the baked-in `com.microsoft::GQA` +
+  declared `past_present_share_buffer` metadata is a fixed contract; §1–§7's analysis
+  applies unchanged, and `SharedBuffer` mode (`crates/onnx-genai-ort/src/decode.rs:45-47,
+  242-243`) stays the correct, launch-efficient way to serve it.
+- **For the Mobius-controlled pipeline, Path B (runtime-managed / functional attention)
+  becomes the strategic default.** We choose what Mobius emits, so we can emit the
+  contract that composes with paging, spilling, and our own EP kernels instead of the one
+  that fights them.
+
+The rev-1 "do NOT unify" guidance still holds — but the split is now **by model origin
+detected at load time** (§8.4), not "operator-managed for everyone."
+
+### 8.2 The central new question: what attention-op contract SHOULD Mobius emit?
+
+Three candidates, graded against what our code already supports vs. what is net-new.
+
+**Option 1 — Keep emitting `com.microsoft::GQA`, but drop the `past_present_share_buffer`
+reliance (runtime binds functional in/out; op concats logically). — *Available today,
+zero net-new kernel work.***
+This is the key rev-2 finding and it is **already implemented and live**:
+- Share-buffer is **optional, metadata-gated, not required**. `DecodeSession::new` sets
+  `share_buffer = options.past_present_share_buffer.unwrap_or(session
+  .past_present_share_buffer_supported())` (`decode.rs:239-241`). When the model does
+  **not** declare it, the session runs in **`ZeroCopyRebind`** mode
+  (`decode.rs:242-245`): **ORT allocates `present.*` fresh each step and rebinds it as
+  next step's `past.*`** — i.e. the GQA kernel runs **functionally, with no in-place
+  aliasing**, and the runtime owns the buffer lifetime (`decode.rs:546-560` rewind logic
+  operates purely on runtime-held `current_kv`).
+- The gate is a single metadata key: `past_present_share_buffer` /
+  `past.present.share_buffer` (`crates/onnx-genai-ort/src/session.rs:474-484`). **If
+  Mobius simply does not stamp that flag, the identical GQA graph runs functionally** —
+  no re-export of the op itself, no new kernel, no schema fight. The contrib schema
+  permits this cleanly (past and present are distinct optional tensors; shared storage is
+  the *opt-in* case, not the default), and ORT's GQA kernel demonstrably runs in this mode
+  — it is the path the in-flight zero-copy-view work already exercises.
+- **What Option 1 does *not* give us:** it is functional but **still contiguous**. GQA
+  consumes a contiguous past/present; it is not block-table-addressable, so it does **not**
+  yet compose with paged/spillable KV. It removes the *aliasing* coupling but not the
+  *contiguity* coupling. It is the cheap, safe first step, not the endpoint.
+
+**Option 2 — Emit standard `ai.onnx::Attention` (opset 23/24) with logical KV-cache
+update (concat-past or external `TensorScatter`). — *Net-new EP work; portable but not
+covered today.***
+- Our EPs do **not** register standard-domain `Attention`. CUDA registers only
+  `OpKey::new("Attention", "com.microsoft", 1)` (`crates/onnx-runtime-ep-cuda/src/kernels/mod.rs:138`;
+  supported-op list at `mod.rs:69-70`) — the com.microsoft SDPA/GQA baseline, not
+  `ai.onnx::Attention` v23/24. CPU registers `com.microsoft::FusedAttention`
+  (`crates/onnx-runtime-ep-cpu/src/kernels/mod.rs:208`), also contrib-domain SDPA.
+- `TensorScatter` is **not implemented anywhere** in the KV crate or EPs (no
+  `slot_mapping` / `block_table` / `scatter` primitive exists —
+  `crates/onnx-genai-kv/src/*.rs` has none). So the external-update form is entirely
+  net-new.
+- Upside: it is the only genuinely *portable* direction (standard domain). Downside: it is
+  the largest lift (new op registration on every EP + a scatter op) and standard
+  `Attention` v23/24 is still stabilizing. **Good long-horizon bet, wrong first move.**
+
+**Option 3 — Emit a decomposed form: runtime-managed KV-insertion step
+(scatter / `reshape_and_cache`-like) + a functional block-table-aware paged-attention op
+we own (the vLLM split). — *Net-new kernels, but the tiered-friendly endpoint.***
+- This is exactly rev-1 §4.3(i) + §6 Path B. We already own **half**: a page table with
+  allocate/free/COW/HOT-COLD tiering (`crates/onnx-genai-kv/src/page_table.rs`) and pure,
+  cache-free attention math on both EPs (CUDA `AttentionKernel`,
+  `crates/onnx-runtime-ep-cuda/src/kernels/attention.rs:219-234`, explicitly "not-yet-wired
+  fusion"; CPU `fused_attention.rs`). We own **neither** the device-resident scatter-write
+  nor the block-table gather kernel — those are net-new (rev-1 §4.1 limitation: storage is
+  host-`f32`, consumed via `materialize_sequence` contiguous copy,
+  `crates/onnx-genai-kv/src/paged_cache.rs:249`).
+- This is the only option that is **block-table-addressed end to end**, i.e. the only one
+  that composes with spill/tiering (§8.5).
+
+### 8.3 Recommendation for Mobius — primary + fallback
+
+**Primary direction: a two-stage migration that ends at Option 3, using Option 1 as the
+immediately-shippable bridge.**
+
+- **Stop stamping `past_present_share_buffer` in Mobius exports (Option 1) now.** This
+  flips Mobius models onto the functional `ZeroCopyRebind` path with **zero net-new kernel
+  work** — it is already live and tested. It removes the aliasing coupling and the
+  fixed-max-length contiguous buffer that `SharedBuffer` forces (`decode.rs:260-266`
+  requires `max_length` and pre-allocates it), which is the first thing that has to go for
+  tiering. Gate it on §8.6.
+- **Then build Option 3 behind our EPs (the vLLM split):** a device-resident, block-table
+  keyed scatter-write + a functional paged-attention gather that reuses the existing pure
+  `AttentionKernel` / `FusedAttention` math. Mobius emits the decomposed contract for the
+  native-EP target. This is rev-1 Path B phases B0–B3, now promoted from "opt-in someday"
+  to "the Mobius default target."
+
+**Fallback:** if the paged kernels miss the §8.6 M=1 gate or slip, **Mobius stays on
+Option 1 (functional contiguous GQA) as a stable, shippable default** — strictly better
+than `SharedBuffer` for tiering-readiness and requiring no new kernels — while Option 3
+matures behind a flag. **Do not** make Option 2 (standard `ai.onnx::Attention`) the
+near-term target; treat it as a *separate portability track* to converge on once v23/24 is
+stable and we need cross-runtime portability, not as the mechanism for the tiered-memory
+epic.
+
+> Net: **Mobius should emit functional (non-share-buffer) GQA immediately, and a
+> decomposed scatter-write + paged-attention contract as the flagged strategic target.**
+
+### 8.4 Compat / migration — detecting origin and routing at load time
+
+We do **not** need to change how third-party models are served. Route by contract detected
+at load:
+- **Third-party pre-exported GQA** declaring `past_present_share_buffer` → **Path A /
+  `SharedBuffer`**, unchanged. Detection already exists:
+  `Session::past_present_share_buffer_supported()` (`session.rs:474-484`) reads that exact
+  metadata key. Absence of the flag already selects the functional path (`decode.rs:242-245`).
+- **Mobius-emitted functional GQA** (no share-buffer flag) → **`ZeroCopyRebind`**, today.
+- **Mobius-emitted decomposed/paged contract** → our EP paged path, once it exists.
+  Detect via an explicit Mobius provenance/producer tag in model metadata (add a
+  `mobius.kv_contract = {shared_buffer|functional|paged}` custom-metadata key at export
+  and branch on it in `DecodeSession::new`, alongside the existing share-buffer probe).
+
+**Does this cost a permanent dual ABI?** Yes — and the Fact Checker flagged permanent dual
+ABI as the #2 risk. Rev-2 accepts it, with scope control:
+- The dual ABI is **not** GQA-shared-buffer vs. paged as *two live in-house code paths we
+  must co-evolve forever*. It is **compatibility-shim (Path A) vs. strategic default (Path
+  B)**. Path A becomes **frozen**: we keep the `SharedBuffer` code that already exists
+  (`decode.rs`) to *consume* third-party GQA, but we stop *producing* it and stop investing
+  in it. A frozen read-only compat path is a bounded, acceptable cost — the same shape as
+  keeping an old file-format reader.
+- The alternative (drop share-buffer support) breaks every existing third-party ORT-genai /
+  Foundry GQA model, which is unacceptable. So the dual ABI is the price of not breaking
+  the ecosystem; we minimize it by freezing, not by unifying.
+
+### 8.5 Tiered-memory alignment — the strategic argument
+
+This is the decisive reason to move the Mobius pipeline to Path B. The user's top-priority
+epic is **run any-size model even without enough VRAM**, which requires a KV cache that can
+**page and spill**:
+- The spillable machinery already exists and is **block/page addressed**: `PageTable`
+  hot(`Device::Gpu(0)`)/cold(`Device::Cpu`) tiering with transparent LRU offload/promote
+  (`crates/onnx-genai-kv/src/tiered.rs:1-12`, `local_tiered.rs`), quantized int8/fp8 page
+  storage (`tiered.rs`), paged COW/rewind/window/sink (`paged_cache.rs`).
+- **Operator-managed `share_buffer` cannot compose with this.** It requires a *single
+  contiguous max-length buffer* pre-allocated up front (`decode.rs:260-266`,
+  `allocate_shared_buffers`) with stable addresses across steps — the exact opposite of
+  block-table-addressed pages that can live partly on GPU, partly on CPU, partly on disk.
+  A contiguous fixed buffer is non-spillable by construction; you cannot evict "the middle
+  third" of a `share_buffer`.
+- **Functional GQA (Option 1)** is spill-*compatible in spirit* (runtime owns the buffer)
+  but still contiguous, so it does not yet page. **Only the decomposed block-table form
+  (Option 3)** is the shape the tiered stack already speaks — its scatter-write is the
+  device analog of `PagedKvCache::write_token_kv`, and its gather is block-table-addressed
+  like `PageTable`.
+
+**Therefore:** the tiered-memory epic *is* the business case for pushing Mobius to Option
+3. Operator-managed share_buffer is architecturally incompatible with the #1 priority;
+functional GQA unblocks the transition; block-table paged attention is the destination.
+
+### 8.6 The M=1 gate (unchanged, still binding)
+
+Whatever Mobius emits must **not regress single-token decode**. This gate governs both the
+Option 1 flip and the Option 3 promotion:
+- **Where it lives:** the existing `profile_decode` harness —
+  `crates/onnx-genai-bench/src/bin/profile_decode.rs` (built with
+  `--features bench-ort[,onnx-genai-ort/cuda] --bin profile_decode`, env-gated by
+  `ONNX_GENAI_PROFILE`; see `docs/benchmarks/2026-07-13-foundry-local-analysis.md:36-59`
+  for the interleaved-run methodology already in use).
+- **Bar:** M=1 p50 **and** p99 decode latency for the functional/paged path must be within
+  noise of the `SharedBuffer` GQA baseline on the same model, **plus** passing correctness
+  traces for append / rewind / COW / sliding-window / sink / batch-compaction /
+  cancellation. Only after both pass does the new contract become the Mobius **default**;
+  until then it ships flag-gated.
+- Rationale unchanged from rev-1 §7.2: a separate scatter-write + block-table gather adds a
+  launch and indirection that can hurt M=1 even while helping long-context throughput. The
+  CUDA-graph capture path (`decode.rs:20-37`, per-session capture ids) is share-buffer /
+  stable-address friendly; the paged path must prove it stays capture-friendly or that the
+  loss is within budget.
+
+### 8.7 Revised bottom line (supersedes §6)
+
+1. **Mobius: stop emitting `past_present_share_buffer` now** → functional GQA via the
+   already-live `ZeroCopyRebind` path, zero new kernels, gated on §8.6.
+2. **Mobius strategic target: the decomposed scatter-write + block-table paged-attention
+   contract** on our EPs, reusing the existing pure attention kernels and page table;
+   flag-gated until it clears the M=1 gate, then default.
+3. **Third-party GQA: frozen Path A / `SharedBuffer` compat**, detected via existing
+   metadata probe. Accept the bounded dual ABI as a frozen read-only shim.
+4. **Standard `ai.onnx::Attention` v23/24: a separate, later portability track**, not the
+   tiering mechanism.
+5. This is the only sequencing that unblocks the tiered-memory epic without breaking the
+   existing ecosystem or gambling on an unproven M=1 latency profile.
