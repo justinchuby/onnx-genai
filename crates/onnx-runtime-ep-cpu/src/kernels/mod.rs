@@ -43,6 +43,7 @@ pub mod fused_matmul_bias;
 pub mod gather;
 pub mod gelu;
 pub mod gemm;
+pub mod group_query_attention;
 pub mod identity;
 pub mod indexing;
 pub mod layernorm;
@@ -246,6 +247,10 @@ pub fn build_cpu_registry() -> OpRegistry {
     reg.register(
         OpKey::new("FusedAttention", "com.microsoft", 1),
         Box::new(fused_attention::FusedAttentionFactory),
+    );
+    reg.register(
+        OpKey::new("GroupQueryAttention", "com.microsoft", 1),
+        Box::new(group_query_attention::GroupQueryAttentionFactory),
     );
     // Standard `ai.onnx::Attention`: the richer SDPA op with 3D/4D inputs,
     // GQA/MQA head sharing, a KV cache (`past_*`/`present_*`), causal masking,
@@ -1203,7 +1208,8 @@ mod tests {
         // `LogSoftmax` each have a legacy and an opset-13 entry. Five contrib
         // (`com.microsoft`) fused transformer entries (BiasGelu, FastGelu,
         // QuickGelu, SkipLayerNormalization, SimplifiedLayerNormalization) add
-        // five more, and `MoE` adds one contrib entry. QuantizeLinear and
+        // five more; `MoE` and `GroupQueryAttention` add one contrib entry each.
+        // QuantizeLinear and
         // DequantizeLinear each add six versioned entries, while
         // DynamicQuantizeLinear adds one (twenty-eight over the
         // op-name count). Pooling adds twelve more versioned entries: five each
@@ -1213,8 +1219,9 @@ mod tests {
         // InstanceNormalization and PRelu add one registration each, while
         // GroupNormalization adds opset-18 and opset-21 entries, for forty-seven
         // registrations over the Phase-1 op-name count in total.
-        // MatMulNBits adds one more contrib-domain registration.
-        assert_eq!(reg.len(), PHASE1_OPS.len() + 48);
+        // MatMulNBits and GroupQueryAttention each add one more contrib-domain
+        // registration.
+        assert_eq!(reg.len(), PHASE1_OPS.len() + 49);
         for op in PHASE1_OPS {
             assert!(reg.lookup(op, "", 21).is_some(), "missing factory for {op}");
         }
@@ -1225,6 +1232,10 @@ mod tests {
         assert!(reg.lookup("LogSoftmax", "", 13).is_some());
         assert!(reg.lookup("MatMulNBits", "com.microsoft", 1).is_some());
         assert!(reg.lookup("Conv", "", 21).is_none());
+        assert!(
+            reg.lookup("GroupQueryAttention", "com.microsoft", 1)
+                .is_some()
+        );
         // The fused contrib-domain LayerNormalization resolves to the same
         // kernel as the standard default-domain op.
         assert!(
