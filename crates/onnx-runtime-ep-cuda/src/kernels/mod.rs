@@ -24,6 +24,7 @@ use crate::runtime::CudaRuntime;
 pub mod activations;
 pub mod attention;
 pub mod cast;
+pub mod conv;
 pub mod elementwise;
 pub mod gemm;
 pub mod matmul;
@@ -70,6 +71,7 @@ use pointwise::{
 pub const CUDA_COVERED_OPS: &[&str] = &[
     "MatMul",
     "Gemm",
+    "Conv",
     "Relu",
     "Sqrt",
     "Erf",
@@ -141,6 +143,12 @@ pub fn build_cuda_registry(runtime: Arc<CudaRuntime>) -> OpRegistry {
     reg.register(
         OpKey::new("Gemm", "", 1),
         Box::new(gemm::GemmFactory {
+            runtime: runtime.clone(),
+        }),
+    );
+    reg.register(
+        OpKey::new("Conv", "", 1),
+        Box::new(conv::ConvFactory {
             runtime: runtime.clone(),
         }),
     );

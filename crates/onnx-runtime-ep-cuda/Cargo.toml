@@ -27,3 +27,6 @@ half = "2"
 version = "0.19"
 default-features = false
 features = ["std", "driver", "cublaslt", "cudnn", "nvrtc", "f16", "cuda-13000", "dynamic-loading"]
+
+[dev-dependencies]
+onnx-runtime-loader = { workspace = true }

@@ -1931,6 +1931,7 @@ dependencies = [
  "half",
  "onnx-runtime-ep-api",
  "onnx-runtime-ir",
+ "onnx-runtime-loader",
  "thiserror 2.0.18",
 ]
 

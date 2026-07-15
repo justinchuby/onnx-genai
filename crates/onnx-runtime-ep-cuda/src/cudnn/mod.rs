@@ -9,8 +9,8 @@ use std::marker::PhantomData;
 use std::sync::{Arc, Mutex};
 
 use cudarc::cudnn::{
-    Cudnn, CudnnDataType, NoIndices, ReduceTensor, ReductionDescriptor, SoftmaxForward,
-    TensorDescriptor, sys,
+    ConvBiasActivationForward, ConvForward, Cudnn, CudnnDataType, NoIndices, ReduceTensor,
+    ReductionDescriptor, SoftmaxForward, TensorDescriptor, sys,
 };
 use cudarc::driver::sys::CUdeviceptr;
 use cudarc::driver::{CudaStream, DevicePtr, DevicePtrMut, DeviceSlice, SyncOnDrop};
@@ -68,6 +68,34 @@ pub struct CudnnBufferPair {
     pub input: CUdeviceptr,
     pub output: CUdeviceptr,
     pub input_numel: usize,
+    pub output_numel: usize,
+}
+
+/// Validated 2-D NCHW convolution geometry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CudnnConvSpec {
+    pub dtype: CudnnTensorType,
+    pub input_dims: [i32; 4],
+    pub input_strides: [i32; 4],
+    pub filter_dims: [i32; 4],
+    pub output_dims: [i32; 4],
+    pub output_strides: [i32; 4],
+    pub pads: [i32; 2],
+    pub strides: [i32; 2],
+    pub dilations: [i32; 2],
+    pub groups: i32,
+}
+
+/// Raw EP buffers for one cuDNN convolution.
+#[derive(Clone, Copy, Debug)]
+pub struct CudnnConvBuffers {
+    pub input: CUdeviceptr,
+    pub filter: CUdeviceptr,
+    pub bias: Option<CUdeviceptr>,
+    pub output: CUdeviceptr,
+    pub input_numel: usize,
+    pub filter_numel: usize,
+    pub bias_numel: usize,
     pub output_numel: usize,
 }
 
@@ -401,6 +429,150 @@ impl CudnnHandle<'_> {
         // workspace is at least the size returned by cuDNN and indices are off.
         unsafe { op.launch(&mut workspace, scaling, &input, &mut output) }
             .map_err(|e| cudnn_err("cudnnReduceTensor", e))
+    }
+
+    /// Select a cuDNN forward algorithm, allocate its workspace, and execute a
+    /// 2-D NCHW convolution with an optional fused channel bias.
+    pub fn conv2d(&self, spec: &CudnnConvSpec, buffers: CudnnConvBuffers) -> Result<()> {
+        match spec.dtype {
+            CudnnTensorType::F32 => self.conv2d_t::<f32>(spec, buffers, (1.0f32, 0.0f32)),
+            CudnnTensorType::F16 => {
+                self.conv2d_t::<f16>(spec, buffers, (f16::from_f32(1.0), f16::from_f32(0.0)))
+            }
+            CudnnTensorType::Bf16 => {
+                self.conv2d_t::<bf16>(spec, buffers, (bf16::from_f32(1.0), bf16::from_f32(0.0)))
+            }
+        }
+    }
+
+    fn conv2d_t<T: CudnnDataType + Copy>(
+        &self,
+        spec: &CudnnConvSpec,
+        buffers: CudnnConvBuffers,
+        scaling: (T, T),
+    ) -> Result<()> {
+        let x_desc = self
+            .handle
+            .create_4d_tensor_ex::<T>(spec.input_dims, spec.input_strides)
+            .map_err(|e| cudnn_err("creating convolution input descriptor", e))?;
+        let w_desc = self
+            .handle
+            .create_4d_filter::<T>(
+                sys::cudnnTensorFormat_t::CUDNN_TENSOR_NCHW,
+                spec.filter_dims,
+            )
+            .map_err(|e| cudnn_err("creating convolution filter descriptor", e))?;
+        let y_desc = self
+            .handle
+            .create_4d_tensor_ex::<T>(spec.output_dims, spec.output_strides)
+            .map_err(|e| cudnn_err("creating convolution output descriptor", e))?;
+        // cuDNN recommends fp32 accumulation for fp16/bf16 storage. Keep f32 in
+        // default math mode so the kernel does not silently opt into TF32.
+        let mut conv_desc = self
+            .handle
+            .create_conv2d::<f32>(
+                spec.pads,
+                spec.strides,
+                spec.dilations,
+                sys::cudnnConvolutionMode_t::CUDNN_CROSS_CORRELATION,
+            )
+            .map_err(|e| cudnn_err("creating convolution descriptor", e))?;
+        conv_desc
+            .set_group_count(spec.groups)
+            .map_err(|e| cudnn_err("cudnnSetConvolutionGroupCount", e))?;
+        conv_desc
+            .set_math_type(match spec.dtype {
+                CudnnTensorType::F32 => sys::cudnnMathType_t::CUDNN_DEFAULT_MATH,
+                CudnnTensorType::F16 | CudnnTensorType::Bf16 => {
+                    sys::cudnnMathType_t::CUDNN_TENSOR_OP_MATH
+                }
+            })
+            .map_err(|e| cudnn_err("cudnnSetConvolutionMathType", e))?;
+
+        let op = ConvForward {
+            conv: &conv_desc,
+            x: &x_desc,
+            w: &w_desc,
+            y: &y_desc,
+        };
+        let algo = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| op.pick_algorithm()))
+            .map_err(|_| {
+                EpError::KernelFailed(
+                    "cuda_ep Conv: cuDNN forward algorithm selection failed or returned no \
+                     usable algorithm"
+                        .into(),
+                )
+            })?
+            .map_err(|e| cudnn_err("cudnnGetConvolutionForwardAlgorithm_v7", e))?;
+        let workspace_bytes = op
+            .get_workspace_size(algo)
+            .map_err(|e| cudnn_err("cudnnGetConvolutionForwardWorkspaceSize", e))?;
+        let mut workspace = self
+            .stream
+            .alloc_zeros::<u8>(workspace_bytes.max(1))
+            .map_err(|e| driver_err("allocating cuDNN convolution workspace", e))?;
+        let input = RawDevice::<T>::new(buffers.input, buffers.input_numel, self.stream.clone());
+        let filter = RawDevice::<T>::new(buffers.filter, buffers.filter_numel, self.stream.clone());
+        let mut output =
+            RawDevice::<T>::new(buffers.output, buffers.output_numel, self.stream.clone());
+
+        if let Some(bias_ptr) = buffers.bias {
+            let bias_desc = self
+                .handle
+                .create_4d_tensor::<T>(
+                    sys::cudnnTensorFormat_t::CUDNN_TENSOR_NCHW,
+                    [1, spec.output_dims[1], 1, 1],
+                )
+                .map_err(|e| cudnn_err("creating convolution bias descriptor", e))?;
+            let activation = self
+                .handle
+                .create_activation::<T>(
+                    sys::cudnnActivationMode_t::CUDNN_ACTIVATION_IDENTITY,
+                    sys::cudnnNanPropagation_t::CUDNN_PROPAGATE_NAN,
+                    0.0,
+                )
+                .map_err(|e| cudnn_err("creating convolution identity activation", e))?;
+            let fused = ConvBiasActivationForward {
+                conv: &conv_desc,
+                act: &activation,
+                x: &x_desc,
+                w: &w_desc,
+                z: &y_desc,
+                bias: &bias_desc,
+                y: &y_desc,
+            };
+            let z = RawDevice::<T>::new(buffers.output, buffers.output_numel, self.stream.clone());
+            let bias = RawDevice::<T>::new(bias_ptr, buffers.bias_numel, self.stream.clone());
+            // SAFETY: all descriptors match live EP allocations. `z` aliases
+            // `y`, but alpha2 is zero, so the fused residual term is disabled.
+            unsafe {
+                fused.launch(
+                    algo,
+                    Some(&mut workspace),
+                    scaling,
+                    &input,
+                    &filter,
+                    &z,
+                    &bias,
+                    &mut output,
+                )
+            }
+            .map_err(|e| cudnn_err("cudnnConvolutionBiasActivationForward", e))
+        } else {
+            // SAFETY: descriptors and raw buffers have matching dtypes/layouts;
+            // workspace is at least the size returned by cuDNN.
+            unsafe {
+                op.launch(
+                    algo,
+                    Some(&mut workspace),
+                    scaling,
+                    &input,
+                    &filter,
+                    &mut output,
+                )
+            }
+            .map_err(|e| cudnn_err("cudnnConvolutionForward", e))
+        }
     }
 }
 

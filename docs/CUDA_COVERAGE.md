@@ -26,7 +26,7 @@ model-agnostic (RULES.md #2) — every op is shape-/dtype-/attribute-driven.
 | Tag | Backend | When it is the right choice |
 |-----|---------|-----------------------------|
 | **cuBLASLt** | `cudarc::cublaslt` (`blas.rs`) | GEMM / batched GEMM, incl. fused bias/act epilogues (`CUBLASLT_EPILOGUE_*`). |
-| **cuDNN** | `cudarc` `cudnn` feature (to add) | conv, pooling, softmax, activations, batch/instance/layer norm, LRN. Vendor-tuned, PyTorch's own backend. |
+| **cuDNN** | `cudarc` `cudnn` feature | conv, pooling, softmax, activations, batch/instance/layer norm, LRN. Vendor-tuned, PyTorch's own backend. |
 | **CUTLASS/CuTe** | NVRTC-compiled device templates | GEMM epilogue fusions cuBLASLt can't express; flash-attention-class kernels. |
 | **thrust/cub** | `cudarc` (device primitives) | reductions, cumsum/scan, sort, topk, argmax. |
 | **NVRTC-custom** | runtime-compiled `extern "C"` kernel (`nvrtc_function`) | pointwise elementwise / activation chains, fused norm+residual, RoPE — cases with **no library** or a **fusion win**. |
@@ -51,6 +51,12 @@ not yet wired) · **🔬 custom** (needs a fused NVRTC/CUTLASS kernel).
 | `Gemm` | `` | ✅ | **cuBLASLt** + NVRTC bias | `Y=α·A'·B'+β·C`, transA/transB, α/β; fused NVRTC `β·C` broadcast-bias epilogue (`gemm.rs`). f32. |
 | `FusedMatMulBias` | `com.microsoft` | ⏳ | **cuBLASLt** epilogue | `CUBLASLT_EPILOGUE_BIAS` — bias add fused into the GEMM (no extra pass). |
 | `FusedGemm` | `com.microsoft` | ⏳ | **cuBLASLt** epilogue | `EPILOGUE_RELU_BIAS`/`GELU_BIAS` — activation+bias fused in-GEMM. |
+
+### Convolution
+
+| Op | Domain | Status | Backend | Notes / justification |
+|----|--------|--------|---------|-----------------------|
+| `Conv` | `` | ✅ | **cuDNN** | 2-D dense NCHW f32/f16/bf16; strides, dilation, groups, symmetric explicit padding, `VALID`, symmetric `SAME_UPPER`/`SAME_LOWER`, and optional fused channel bias. Asymmetric padding is rejected explicitly. Uses cuDNN v7 forward-algorithm heuristics and queried workspace. |
 
 ### Elementwise — unary / activations
 
@@ -138,8 +144,8 @@ counts:
 |---------|------:|
 | CPU registry `(domain, op_type)` pairs | **103** |
 | CPU standard-domain (`ai.onnx`) op types | **93** |
-| CUDA registry `(domain, op_type)` pairs | **55** |
-| CUDA advertised op names | **54** |
+| CUDA registry `(domain, op_type)` pairs | **56** |
+| CUDA advertised op names | **55** |
 | CPU pairs implemented by CUDA in the same domain | **45 / 103** |
 | CPU standard-domain op types implemented by CUDA | **41 / 93** |
 
@@ -165,8 +171,8 @@ For `com.microsoft`, CUDA matches four CPU pairs (`Gelu`,
 CPU-only gaps are `BiasGelu`, `FastGelu`, `FusedAttention`, `FusedGemm`,
 `FusedMatMulBias`, and `QuickGelu`. CUDA additionally exposes
 `com.microsoft::Attention`. CUDA standard-domain extras not currently registered
-by the CPU EP are `And`, `Greater`, `GreaterOrEqual`, `Less`, `LessOrEqual`,
-`Or`, `Selu`, `Softsign`, and `Xor`.
+by the CPU EP are `And`, `Conv`, `Greater`, `GreaterOrEqual`, `Less`,
+`LessOrEqual`, `Or`, `Selu`, `Softsign`, and `Xor`.
 
 ### Library mapping for the remaining CPU gaps
 
@@ -182,6 +188,9 @@ by the CPU EP are `And`, `Greater`, `GreaterOrEqual`, `Less`, `LessOrEqual`,
 Wave 4 raises the advertised CUDA set from **48 to 54** op names. Its six
 activations are GPU-validated against independent CPU formulas on the local
 CUDA 13.0 host; broader performance validation remains separate.
+
+The cuDNN Conv pass raises the advertised set to **55** op names and is
+GPU-validated for padded f32, grouped/strided f32, and padded f16 convolution.
 
 The pointwise dtype/broadcast pass is GPU-validated on H200 for f16 and bf16
 `Add`/`Sub`/`Mul`/`Div`, `[4,1,3]` with `[1,5,3]` NumPy broadcasting, and
@@ -233,10 +242,8 @@ candidate.
   no CUDA toolkit because `cudarc` uses `dynamic-loading`; the driver, cuBLASLt,
   and NVRTC are `dlopen`'d at run time. Adding the `cudnn` feature for the ⏳
   norm/softmax/conv rows preserves this (cuDNN is dlopen'd too).
-- **Adding cuDNN:** enable cudarc's `cudnn` feature in
-  `crates/onnx-runtime-ep-cuda/Cargo.toml` and add a `cudnn` handle to
-  `CudaRuntime` alongside the cuBLASLt handle. Confirm the offline build still
-  completes (it will — dynamic-loading).
+- **cuDNN is enabled** through cudarc's `cudnn` feature and a lazy, stream-bound
+  backend in `CudaRuntime`; softmax, reductions, and Conv share that handle.
 - **Runtime execution requires the libraries on the loader path.** A host with
   only `libcuda` (driver) but **without** `libcublasLt` / `libcudnn` can *build*
   and can run *pure-driver* code, but cuBLASLt/cuDNN ops error/skip until those
