@@ -23,6 +23,7 @@ crate-type = ["cdylib"]
 onnx-runtime-session = { workspace = true }
 onnx-runtime-ep-cpu = { workspace = true }
 onnx-runtime-ir = { workspace = true }
+onnx-runtime-dlpack = { workspace = true }
 # Optional CUDA execution provider, gated behind the `cuda` feature so the
 # default build stays offline / pure-Rust (CPU only).
 onnx-runtime-ep-cuda = { workspace = true, optional = true }

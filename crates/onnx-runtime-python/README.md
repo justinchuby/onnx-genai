@@ -48,10 +48,36 @@ outputs as numpy arrays: `pip install nxrt[bfloat16]`.
 |---|---|
 | `nxrt.InferenceSession(path_or_bytes, providers=["CPUExecutionProvider"])` | Load a model from a path/`os.PathLike` or raw model `bytes`. |
 | `sess.run(output_names, input_feed) -> list[np.ndarray]` | `output_names` is a list of names or `None` (all outputs). `input_feed` is `{name: np.ndarray}`. |
+| `sess.run_with_values(output_names, input_feed) -> list[NxrtValue]` | Same args as `run`, but returns zero-copy `NxrtValue` wrappers (see below) instead of copied numpy arrays. |
 | `sess.get_inputs()` / `sess.get_outputs()` | Lists of `NodeArg` with `.name`, `.type` (e.g. `"tensor(float)"`), `.shape`. |
 | `sess.get_providers()` | The providers the session was created with. |
 | `nxrt.get_available_providers()` | Providers this wheel can service. |
 | `nxrt.__version__` | Package version. |
+
+### Zero-copy output via DLPack
+
+`run()` keeps its onnxruntime-compatible contract: it returns freshly-copied
+`numpy.ndarray`s. For **zero-copy** access, `run_with_values()` returns
+`NxrtValue` objects that implement the [Array-API DLPack producer
+protocol](https://data-apis.org/array-api/latest/API_specification/generated/array_api.array.__dlpack__.html)
+(`__dlpack__` / `__dlpack_device__`), so a consumer *borrows* nxrt's output
+buffer instead of copying it:
+
+```python
+(v,) = sess.run_with_values(None, {"x": x})
+a = np.from_dlpack(v)       # numpy ≥ 2.1: writable, shares nxrt's buffer
+t = torch.from_dlpack(v)    # torch: same physical memory (t.data_ptr() == a.ctypes.data)
+host = v.numpy()            # still available: an owned copy, like run()
+```
+
+nxrt emits the versioned `DLManagedTensorVersioned` (`"dltensor_versioned"`
+capsule, writable flag) when the consumer advertises DLPack major ≥ 1, and the
+unversioned `DLManagedTensor` (`"dltensor"`) otherwise. The capsule's `deleter`
+owns a reference to the backing buffer, so an imported array stays valid even
+after the `NxrtValue` is dropped. CUDA-resident outputs raise `BufferError`
+(zero-copy CUDA export is not wired up yet); use `.numpy()` in that case. bf16
+exports as DLPack `kDLBfloat/16` (consumable by torch; numpy has no bf16 DLPack
+import).
 
 ### Providers
 

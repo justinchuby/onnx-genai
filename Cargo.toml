@@ -29,6 +29,7 @@ members = [
     "crates/onnx-runtime-capi",
     "crates/onnx-runtime-tracer",
     "crates/onnx-runtime-python",
+    "crates/onnx-runtime-dlpack",
 ]
 
 [workspace.package]
@@ -64,6 +65,7 @@ onnx-runtime-eager = { path = "crates/onnx-runtime-eager", version = "=0.1.0-dev
 onnx-runtime-session = { path = "crates/onnx-runtime-session", version = "=0.1.0-dev.1" }
 onnx-runtime-capi = { path = "crates/onnx-runtime-capi", version = "=0.1.0-dev.1" }
 onnx-runtime-tracer = { path = "crates/onnx-runtime-tracer", version = "=0.1.0-dev.1" }
+onnx-runtime-dlpack = { path = "crates/onnx-runtime-dlpack", version = "=0.1.0-dev.1" }
 
 # External
 tokenizers = "0.21"

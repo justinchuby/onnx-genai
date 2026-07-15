@@ -29,11 +29,17 @@
 //!
 //! ## `unsafe`
 //!
-//! This crate contains **no `unsafe`**: all numpy ⇆ raw-bytes conversion goes
-//! through numpy's own `ascontiguousarray`/`tobytes`/`frombuffer` (the buffer
-//! protocol), so there is no hand-rolled pointer arithmetic to get wrong and
-//! nothing to leak or double-free. bf16/f16 are moved as opaque 2-byte
-//! little-endian storage — never reinterpreted through f32.
+//! Numpy ⇆ raw-bytes conversion goes through numpy's own
+//! `ascontiguousarray`/`tobytes`/`frombuffer` (the buffer protocol), so the
+//! input/output *copy* paths contain no hand-rolled pointer arithmetic. The
+//! zero-copy DLPack **export** path ([`dlpack`]) does use `unsafe`, but only a
+//! thin `pyo3::ffi` PyCapsule shim: the `DLManagedTensor` ABI and its
+//! memory-owning `deleter` live in the dependency-free `onnx-runtime-dlpack`
+//! crate, so the surface exposed here is limited to creating the `"dltensor"`
+//! capsule and its name-checking destructor. bf16/f16 are moved as opaque
+//! 2-byte little-endian storage — never reinterpreted through f32.
+
+mod dlpack;
 
 use std::sync::Mutex;
 
@@ -314,7 +320,74 @@ impl InferenceSession {
         input_feed: &Bound<'_, PyDict>,
     ) -> PyResult<Py<PyList>> {
         let np = py.import("numpy")?;
+        let (names, tensors) = self.run_inner(py, &np, output_names, input_feed)?;
+        let list = PyList::empty(py);
+        for (name, tensor) in names.iter().zip(tensors.iter()) {
+            let arr = tensor_to_numpy(py, &np, name, tensor)?;
+            list.append(arr)?;
+        }
+        Ok(list.unbind())
+    }
 
+    /// Run inference and return zero-copy-capable [`NxrtValue`] wrappers instead
+    /// of eagerly-copied numpy arrays.
+    ///
+    /// Same arguments and output selection as [`run`](Self::run), but each
+    /// result is an `nxrt.NxrtValue` implementing the DLPack producer protocol
+    /// (`__dlpack__` / `__dlpack_device__`), so `torch.from_dlpack(v)` /
+    /// `np.from_dlpack(v)` borrow nxrt's output buffer with **no copy**. Each
+    /// value also has a `.numpy()` method for the copy-based path.
+    ///
+    /// `run()` still returns plain numpy arrays; this is the opt-in zero-copy
+    /// entry point, so existing onnxruntime-compatible callers are unaffected.
+    #[pyo3(signature = (output_names, input_feed))]
+    fn run_with_values(
+        &self,
+        py: Python<'_>,
+        output_names: Option<Vec<String>>,
+        input_feed: &Bound<'_, PyDict>,
+    ) -> PyResult<Py<PyList>> {
+        let np = py.import("numpy")?;
+        let (names, tensors) = self.run_inner(py, &np, output_names, input_feed)?;
+        let list = PyList::empty(py);
+        for (name, tensor) in names.into_iter().zip(tensors) {
+            list.append(Py::new(py, dlpack::NxrtValue::new(tensor, name))?)?;
+        }
+        Ok(list.unbind())
+    }
+
+    /// Model input metadata as onnxruntime-style `NodeArg`s.
+    fn get_inputs(&self, py: Python<'_>) -> PyResult<Py<PyList>> {
+        node_args(py, &self.inputs)
+    }
+
+    /// Model output metadata as onnxruntime-style `NodeArg`s.
+    fn get_outputs(&self, py: Python<'_>) -> PyResult<Py<PyList>> {
+        node_args(py, &self.outputs)
+    }
+
+    /// The execution providers this session was created with (as requested).
+    fn get_providers(&self) -> Vec<String> {
+        self.providers.clone()
+    }
+}
+
+impl InferenceSession {
+    /// Shared inference core for [`run`](Self::run) and
+    /// [`run_with_values`](Self::run_with_values).
+    ///
+    /// Validates and builds owned input tensors from `input_feed`, runs the
+    /// session, then selects/orders the requested outputs and returns them as
+    /// **owned** tensors paired with their names. Ownership is what lets the
+    /// zero-copy path move a tensor into an `NxrtValue`/`DLManagedTensor`; the
+    /// numpy path just borrows them for the copy.
+    fn run_inner(
+        &self,
+        py: Python<'_>,
+        np: &Bound<'_, PyModule>,
+        output_names: Option<Vec<String>>,
+        input_feed: &Bound<'_, PyDict>,
+    ) -> PyResult<(Vec<String>, Vec<Tensor>)> {
         // Build owned tensors from the feed, validating names + dtypes with
         // actionable messages before touching the runtime.
         let mut owned: Vec<(String, Tensor)> = Vec::with_capacity(input_feed.len());
@@ -328,7 +401,7 @@ impl InferenceSession {
                     "unknown input {name:?} in input_feed. Model inputs are: {known:?}"
                 )));
             }
-            let tensor = numpy_to_tensor(py, &np, &name, &value)?;
+            let tensor = numpy_to_tensor(py, np, &name, &value)?;
             owned.push((name, tensor));
         }
 
@@ -356,11 +429,12 @@ impl InferenceSession {
             guard.run(&feed).map_err(run_error)?
         };
 
-        // Select and order the requested outputs by name.
-        let ordered: Vec<(&IoMeta, &Tensor)> = match &output_names {
-            None => self.outputs.iter().zip(results.iter()).collect(),
+        // Resolve the requested outputs to indices into `results` (all model
+        // outputs, in graph order).
+        let indices: Vec<usize> = match &output_names {
+            None => (0..self.outputs.len()).collect(),
             Some(names) => {
-                let mut out = Vec::with_capacity(names.len());
+                let mut idxs = Vec::with_capacity(names.len());
                 for want in names {
                     let idx = self
                         .outputs
@@ -374,33 +448,30 @@ impl InferenceSession {
                                  Model outputs are: {known:?}"
                             ))
                         })?;
-                    out.push((&self.outputs[idx], &results[idx]));
+                    idxs.push(idx);
                 }
-                out
+                idxs
             }
         };
 
-        let list = PyList::empty(py);
-        for (meta, tensor) in ordered {
-            let arr = tensor_to_numpy(py, &np, meta, tensor)?;
-            list.append(arr)?;
+        // Move the selected tensors out by index. `Option::take` keeps this a
+        // move (not a copy) so the zero-copy path really owns the buffer; a
+        // duplicate request would take an already-moved slot and errors clearly.
+        let mut slots: Vec<Option<Tensor>> = results.into_iter().map(Some).collect();
+        let mut names = Vec::with_capacity(indices.len());
+        let mut tensors = Vec::with_capacity(indices.len());
+        for i in indices {
+            let tensor = slots[i].take().ok_or_else(|| {
+                PyValueError::new_err(format!(
+                    "output {:?} was requested more than once; request each output \
+                     at most once",
+                    self.outputs[i].name
+                ))
+            })?;
+            names.push(self.outputs[i].name.clone());
+            tensors.push(tensor);
         }
-        Ok(list.unbind())
-    }
-
-    /// Model input metadata as onnxruntime-style `NodeArg`s.
-    fn get_inputs(&self, py: Python<'_>) -> PyResult<Py<PyList>> {
-        node_args(py, &self.inputs)
-    }
-
-    /// Model output metadata as onnxruntime-style `NodeArg`s.
-    fn get_outputs(&self, py: Python<'_>) -> PyResult<Py<PyList>> {
-        node_args(py, &self.outputs)
-    }
-
-    /// The execution providers this session was created with (as requested).
-    fn get_providers(&self) -> Vec<String> {
-        self.providers.clone()
+        Ok((names, tensors))
     }
 }
 
@@ -463,10 +534,12 @@ fn numpy_to_tensor(
 
 /// Convert an nxrt output [`Tensor`] back into a numpy array via
 /// `numpy.frombuffer(...).reshape(...)`.
-fn tensor_to_numpy(
+///
+/// `name` is the model-output name, used only to make dtype errors actionable.
+pub(crate) fn tensor_to_numpy(
     py: Python<'_>,
     np: &Bound<'_, PyModule>,
-    meta: &IoMeta,
+    name: &str,
     tensor: &Tensor,
 ) -> PyResult<Py<PyAny>> {
     let np_name = dtype_to_numpy_name(tensor.dtype)?;
@@ -476,10 +549,9 @@ fn tensor_to_numpy(
     let dtype_obj = if np_name == "bfloat16" {
         let ml = py.import("ml_dtypes").map_err(|_| {
             PyRuntimeError::new_err(format!(
-                "output {:?} is bfloat16, which requires the `ml_dtypes` package \
-                 to represent as a numpy array. Install it with `pip install \
-                 ml_dtypes`.",
-                meta.name
+                "output {name:?} is bfloat16, which requires the `ml_dtypes` \
+                 package to represent as a numpy array. Install it with `pip \
+                 install ml_dtypes`."
             ))
         })?;
         ml.getattr("bfloat16")?.into_any()
@@ -601,6 +673,7 @@ fn nxrt(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__doc__", PyString::new(m.py(), doc))?;
     m.add_class::<InferenceSession>()?;
     m.add_class::<NodeArg>()?;
+    dlpack::register(m)?;
     m.add_function(wrap_pyfunction!(get_available_providers, m)?)?;
     #[cfg(feature = "cuda")]
     m.add_function(wrap_pyfunction!(cupti_available, m)?)?;

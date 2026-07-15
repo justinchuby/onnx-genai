@@ -1,0 +1,16 @@
+# DLPack C-ABI bridge: the `DLManagedTensor` family of structs plus a safe(ish)
+# constructor that hands ownership of a backing allocation to the DLPack
+# consumer's deleter. Kept dependency-free and PyO3-free so it can be reused by
+# `onnx-runtime-ep-api` / `onnx-runtime-eager` for a future zero-copy *import*
+# path, and unit-tested without a Python interpreter.
+[package]
+name = "onnx-runtime-dlpack"
+version = "0.1.0-dev.1"
+edition = "2024"
+license = "MIT"
+authors = ["Justin Chu"]
+repository = "https://github.com/justinchuby/onnx-genai"
+description = "DLPack v1.0 C-ABI structs and a memory-owning DLManagedTensor exporter"
+publish = false
+
+[dependencies]
