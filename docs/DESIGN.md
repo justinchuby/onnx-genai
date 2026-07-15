@@ -316,6 +316,10 @@ pub struct ScheduleDecision {
 }
 ```
 
+**Implementation status:** `PriorityPolicy::FairShare` uses deficit-weighted round-robin
+across the existing priority classes. Class weights are configurable; only backlogged
+classes accrue credit, and idle classes reset their credit to prevent burst hoarding.
+
 #### 3.4.3 Continuous Batching
 
 Each scheduling iteration:

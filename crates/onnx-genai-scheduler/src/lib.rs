@@ -12,6 +12,7 @@ pub mod policy;
 pub use byte_budget::{
     BudgetSnapshot, ByteBudget, ByteBudgetError, ReconfigureOutcome as ByteBudgetReconfigureOutcome,
 };
+pub use policy::FairSharePolicy;
 
 use onnx_genai_kv::SequenceId;
 
@@ -132,6 +133,7 @@ pub struct Scheduler {
     swapped: Vec<RunningSequence>,
     next_request_id: u64,
     clock: u64,
+    fair_share: FairSharePolicy,
     /// Shared, cross-session hot-tier KV byte budget. When present (and
     /// `config.bytes_per_token` is set), admission and swap-in additionally
     /// reserve bytes here so no scheduler/session can exceed the global ceiling.
@@ -147,8 +149,18 @@ impl Scheduler {
             swapped: Vec::new(),
             next_request_id: 0,
             clock: 0,
+            fair_share: FairSharePolicy::new(),
             byte_budget: None,
         }
+    }
+
+    /// Configure fair-share weights for `(Low, Normal, High)` priority classes.
+    ///
+    /// This only affects [`PriorityPolicy::FairShare`]. Each weight must be
+    /// non-zero so every continuously backlogged class is guaranteed service.
+    pub fn with_fair_share_weights(mut self, low: u32, normal: u32, high: u32) -> Self {
+        self.fair_share = FairSharePolicy::with_weights(low, normal, high);
+        self
     }
 
     /// Create a scheduler that shares a global cross-session byte budget.
@@ -341,6 +353,7 @@ impl Scheduler {
 
     fn apply_preemption(&mut self, decision: &mut ScheduleDecision) {
         if matches!(self.config.preemption_policy, PreemptionPolicy::Disabled)
+            || matches!(self.config.priority_policy, PriorityPolicy::FairShare)
             || self.running.is_empty()
             || self.waiting.is_empty()
         {
@@ -432,6 +445,10 @@ impl Scheduler {
     }
 
     fn pop_next_candidate(&mut self) -> Option<Candidate> {
+        if matches!(self.config.priority_policy, PriorityPolicy::FairShare) {
+            return self.pop_next_fair_share_candidate();
+        }
+
         let waiting = self.best_waiting_index();
         let swapped = self.best_swapped_index();
         match (waiting, swapped) {
@@ -447,6 +464,46 @@ impl Scheduler {
                     Some(Candidate::Swapped(self.swapped.remove(swapped_idx)))
                 }
             }
+        }
+    }
+
+    fn pop_next_fair_share_candidate(&mut self) -> Option<Candidate> {
+        let selected_priority = self.fair_share.select(
+            self.waiting
+                .iter()
+                .map(|request| request.priority)
+                .chain(self.swapped.iter().map(|sequence| sequence.priority)),
+        )?;
+
+        let waiting = self
+            .waiting
+            .iter()
+            .enumerate()
+            .filter(|(_, request)| request.priority == selected_priority)
+            .min_by_key(|(_, request)| (request.arrived_at, request.id))
+            .map(|(index, request)| (index, request.arrived_at, request.id));
+        let swapped = self
+            .swapped
+            .iter()
+            .enumerate()
+            .filter(|(_, sequence)| sequence.priority == selected_priority)
+            .min_by_key(|(_, sequence)| (sequence.arrived_at, sequence.request_id))
+            .map(|(index, sequence)| (index, sequence.arrived_at, sequence.request_id));
+
+        match (waiting, swapped) {
+            (Some((index, _, _)), None) => Some(Candidate::Waiting(self.waiting.remove(index))),
+            (None, Some((index, _, _))) => Some(Candidate::Swapped(self.swapped.remove(index))),
+            (
+                Some((waiting_index, waiting_arrival, waiting_id)),
+                Some((swapped_index, swapped_arrival, swapped_id)),
+            ) => {
+                if (waiting_arrival, waiting_id) < (swapped_arrival, swapped_id) {
+                    Some(Candidate::Waiting(self.waiting.remove(waiting_index)))
+                } else {
+                    Some(Candidate::Swapped(self.swapped.remove(swapped_index)))
+                }
+            }
+            (None, None) => unreachable!("selected fair-share class must have a candidate"),
         }
     }
 
@@ -467,10 +524,11 @@ impl Scheduler {
     fn cmp_candidate_key(&self, a: CandidateKey, b: CandidateKey) -> std::cmp::Ordering {
         match self.config.priority_policy {
             PriorityPolicy::Fcfs => a.arrived_at.cmp(&b.arrived_at),
-            PriorityPolicy::Priority | PriorityPolicy::FairShare => b
+            PriorityPolicy::Priority => b
                 .priority
                 .cmp(&a.priority)
                 .then_with(|| a.arrived_at.cmp(&b.arrived_at)),
+            PriorityPolicy::FairShare => a.arrived_at.cmp(&b.arrived_at),
         }
         .then_with(|| a.request_id.cmp(&b.request_id))
     }
@@ -559,6 +617,34 @@ mod tests {
         assert!(resume.decode.is_empty());
     }
 
+    #[test]
+    fn fair_share_policy_is_used_for_scheduler_admission() {
+        let mut fair_config = config();
+        fair_config.priority_policy = PriorityPolicy::FairShare;
+        fair_config.preemption_policy = PreemptionPolicy::Disabled;
+        let mut scheduler = Scheduler::new(fair_config).with_fair_share_weights(1, 1, 3);
+
+        for index in 0..100 {
+            scheduler.enqueue_generate_request(1_000 + index, 1, 1, Priority::Low);
+            scheduler.enqueue_generate_request(2_000 + index, 1, 1, Priority::High);
+        }
+
+        let mut low = 0;
+        let mut high = 0;
+        for _ in 0..40 {
+            let decision = scheduler.schedule();
+            let selected = decision.prefill[0];
+            if selected < 2_000 {
+                low += 1;
+            } else {
+                high += 1;
+            }
+            scheduler.complete(selected);
+        }
+
+        assert_eq!((low, high), (10, 30));
+    }
+
     fn byte_budget_config(bytes_per_token: u64) -> SchedulerConfig {
         SchedulerConfig {
             // Large token/batch limits so the *byte* budget is the binding gate.
@@ -575,8 +661,7 @@ mod tests {
         // 10 bytes/token, footprint = (prompt 4 + max 6) * 10 = 100 B each.
         // Budget of 250 B admits only 2 of 3 otherwise-eligible sequences.
         let budget = ByteBudget::new(250);
-        let mut scheduler =
-            Scheduler::with_byte_budget(byte_budget_config(10), budget.clone());
+        let mut scheduler = Scheduler::with_byte_budget(byte_budget_config(10), budget.clone());
         scheduler.enqueue_generate_request(1, 4, 6, Priority::Normal);
         scheduler.enqueue_generate_request(2, 4, 6, Priority::Normal);
         scheduler.enqueue_generate_request(3, 4, 6, Priority::Normal);
@@ -592,8 +677,7 @@ mod tests {
     #[test]
     fn completion_releases_bytes_and_admits_waiting_sequence() {
         let budget = ByteBudget::new(250);
-        let mut scheduler =
-            Scheduler::with_byte_budget(byte_budget_config(10), budget.clone());
+        let mut scheduler = Scheduler::with_byte_budget(byte_budget_config(10), budget.clone());
         scheduler.enqueue_generate_request(1, 4, 6, Priority::Normal);
         scheduler.enqueue_generate_request(2, 4, 6, Priority::Normal);
         scheduler.enqueue_generate_request(3, 4, 6, Priority::Normal);
@@ -669,8 +753,7 @@ mod tests {
     #[test]
     fn reconfigure_lower_reports_overage_and_blocks_new_admissions() {
         let budget = ByteBudget::new(300);
-        let mut scheduler =
-            Scheduler::with_byte_budget(byte_budget_config(10), budget.clone());
+        let mut scheduler = Scheduler::with_byte_budget(byte_budget_config(10), budget.clone());
         scheduler.enqueue_generate_request(1, 4, 6, Priority::Normal);
         scheduler.enqueue_generate_request(2, 4, 6, Priority::Normal);
         scheduler.schedule();
