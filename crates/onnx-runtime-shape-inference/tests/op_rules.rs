@@ -694,6 +694,23 @@ fn range_float_positive_delta() {
 }
 
 #[test]
+fn range_float32_uses_cpu_kernel_arithmetic() {
+    // Keep in sync with `float_range_count`: f32 arithmetic makes this 25,
+    // whereas calculating from the f64 shape-data representation yields 26.
+    let n = node("Range", 3, 1);
+    let outs = run(
+        &n,
+        vec![
+            sd_float_scalar(DataType::Float32, 0.0),
+            sd_float_scalar(DataType::Float32, 1.0),
+            sd_float_scalar(DataType::Float32, 0.04),
+        ],
+        11,
+    );
+    assert_eq!(out_shape(&outs), vec![c(25)]);
+}
+
+#[test]
 fn range_float_negative_delta() {
     // start=10.0, limit=2.0, delta=-2.5 -> ceil(-8.0 / -2.5) = ceil(3.2) = 4
     let n = node("Range", 3, 1);

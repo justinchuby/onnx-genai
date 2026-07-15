@@ -63,10 +63,25 @@ fn range_len(start: i64, limit: i64, delta: i64) -> Option<i64> {
     i64::try_from(count).ok()
 }
 
-/// Compute a `Range` length for floating-point scalar inputs, mirroring the CPU
-/// kernel: `max(ceil((limit - start) / delta), 0)`. Handles negative `delta`
-/// (descending ranges) and rejects a zero/non-finite `delta` or a count that
-/// overflows an `i64`.
+/// Compute a Float32 `Range` length with the same arithmetic as the CPU
+/// kernel's `float_range_count`.
+fn range_len_f32(start: f64, limit: f64, delta: f64) -> Option<i64> {
+    let start = start as f32;
+    let limit = limit as f32;
+    let delta = delta as f32;
+    if delta == 0.0 || !start.is_finite() || !limit.is_finite() || !delta.is_finite() {
+        return None;
+    }
+    let count = ((limit - start) / delta).ceil().max(0.0);
+    if !count.is_finite() || count >= i64::MAX as f32 {
+        return None;
+    }
+    Some(count as i64)
+}
+
+/// Compute a Float64 `Range` length. Handles negative `delta` (descending
+/// ranges) and rejects a zero/non-finite `delta` or a count that overflows an
+/// `i64`.
 fn range_len_f64(start: f64, limit: f64, delta: f64) -> Option<i64> {
     if delta == 0.0 || !start.is_finite() || !limit.is_finite() || !delta.is_finite() {
         return None;
@@ -85,7 +100,7 @@ fn range(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
     let Some(dtype) = ctx.input_dtype(0) else {
         return Ok(());
     };
-    let length = range_int_len(ctx).or_else(|| range_float_len(ctx));
+    let length = range_int_len(ctx).or_else(|| range_float_len(ctx, dtype));
     let dim = length
         .map(DimExpr::constant)
         .unwrap_or_else(|| ctx.fresh_dim());
@@ -107,11 +122,15 @@ fn range_int_len(ctx: &InferenceContext) -> Option<i64> {
 
 /// The `Range` length when all three operands are floating-point scalar
 /// constants.
-fn range_float_len(ctx: &InferenceContext) -> Option<i64> {
+fn range_float_len(ctx: &InferenceContext, dtype: onnx_runtime_ir::DataType) -> Option<i64> {
     let start = const_float_scalar(ctx, 0)?;
     let limit = const_float_scalar(ctx, 1)?;
     let delta = const_float_scalar(ctx, 2)?;
-    range_len_f64(start, limit, delta)
+    match dtype {
+        onnx_runtime_ir::DataType::Float32 => range_len_f32(start, limit, delta),
+        onnx_runtime_ir::DataType::Float64 => range_len_f64(start, limit, delta),
+        _ => None,
+    }
 }
 
 /// `CumSum` does not change the input tensor's shape or dtype.
