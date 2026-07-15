@@ -3,8 +3,150 @@
 use crate::logits::{StopSequence, TokenId};
 use onnx_genai_kv::{CachePriority, DEFAULT_CHUNK_SIZE, KvDType, LocalTieredConfig, SequenceId};
 use onnx_genai_ort::{Eagle3DraftKvMode, MtpDraftKvMode};
-use onnx_genai_scheduler::{Priority, SchedulerConfig};
+use onnx_genai_scheduler::{Priority, ResourceLimit, ResourceLimits, SchedulerConfig};
+use serde::Deserialize;
 use std::path::PathBuf;
+
+/// Error returned when a user-facing resource limit cannot be parsed.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "invalid resource limit {input:?}: {reason}; use a byte count (for example 8589934592), \
+     a binary/decimal byte string (for example 8GiB or 8GB), a fraction in [0, 1] \
+     (for example 0.9), or \"auto\""
+)]
+pub struct LimitParseError {
+    input: String,
+    reason: String,
+}
+
+/// Parse a user-facing resource ceiling.
+///
+/// Integers without a suffix are bytes. Decimal values without a suffix are
+/// fractions, while suffixed values may be integral or decimal byte quantities.
+pub fn parse_resource_limit(input: &str) -> Result<ResourceLimit, LimitParseError> {
+    let input = input.trim();
+    if input.eq_ignore_ascii_case("auto") {
+        return Ok(ResourceLimit::Auto);
+    }
+    if let Ok(bytes) = input.parse::<u64>() {
+        return Ok(ResourceLimit::Bytes(bytes));
+    }
+
+    let unit_start = input
+        .find(|character: char| character.is_ascii_alphabetic())
+        .unwrap_or(input.len());
+    let (number, unit) = input.split_at(unit_start);
+    if unit.is_empty() {
+        let fraction = number.parse::<f64>().map_err(|_| {
+            limit_error(
+                input,
+                "the value is neither an integer byte count nor a numeric fraction",
+            )
+        })?;
+        if !fraction.is_finite() || !(0.0..=1.0).contains(&fraction) {
+            return Err(limit_error(
+                input,
+                "a unitless decimal is a fraction, but this value is outside [0, 1]",
+            ));
+        }
+        return Ok(ResourceLimit::Fraction(fraction as f32));
+    }
+
+    let multiplier = match unit.to_ascii_uppercase().as_str() {
+        "KIB" => 1_u64 << 10,
+        "MIB" => 1_u64 << 20,
+        "GIB" => 1_u64 << 30,
+        "KB" => 1_000,
+        "MB" => 1_000_000,
+        "GB" => 1_000_000_000,
+        _ => {
+            return Err(limit_error(
+                input,
+                format!("the unit {unit:?} is not supported"),
+            ));
+        }
+    };
+    let quantity = number.parse::<f64>().map_err(|_| {
+        limit_error(
+            input,
+            format!("the numeric part {number:?} is not a valid non-negative number"),
+        )
+    })?;
+    let bytes = quantity * multiplier as f64;
+    if !quantity.is_finite() || quantity < 0.0 || !bytes.is_finite() || bytes > u64::MAX as f64 {
+        return Err(limit_error(
+            input,
+            "the byte quantity is negative, non-finite, or exceeds u64",
+        ));
+    }
+    Ok(ResourceLimit::Bytes(bytes.round() as u64))
+}
+
+fn limit_error(input: impl Into<String>, reason: impl Into<String>) -> LimitParseError {
+    LimitParseError {
+        input: input.into(),
+        reason: reason.into(),
+    }
+}
+
+/// Error returned while decoding the resource-governor YAML surface.
+#[derive(Debug, thiserror::Error)]
+pub enum EngineConfigError {
+    #[error("failed to parse engine YAML resource limits: {0}; check serving.memory.limits syntax")]
+    Yaml(#[from] serde_yaml::Error),
+    #[error("failed to parse serving.memory.limits.{field}: {source}")]
+    Limit {
+        field: &'static str,
+        #[source]
+        source: LimitParseError,
+    },
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum LimitValue {
+    String(String),
+    Integer(u64),
+    Float(f64),
+}
+
+impl LimitValue {
+    fn parse(self, field: &'static str) -> Result<ResourceLimit, EngineConfigError> {
+        let text = match self {
+            Self::String(value) => value,
+            Self::Integer(value) => value.to_string(),
+            Self::Float(value) => value.to_string(),
+        };
+        parse_resource_limit(&text).map_err(|source| EngineConfigError::Limit { field, source })
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct LimitsYaml {
+    vram_limit: Option<LimitValue>,
+    host_ram_limit: Option<LimitValue>,
+    disk_spill_limit: Option<LimitValue>,
+    #[serde(default)]
+    allow_runtime_override: bool,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct MemoryYaml {
+    #[serde(default)]
+    limits: LimitsYaml,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ServingYaml {
+    #[serde(default)]
+    memory: MemoryYaml,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct EngineConfigYaml {
+    #[serde(default)]
+    serving: ServingYaml,
+}
 
 /// Files and target-model outputs required for multi-token prediction.
 ///
@@ -199,6 +341,10 @@ pub struct EngineConfig {
     /// Optional distributed KV connector (DESIGN §38). Defaults to
     /// [`KvConnectorBackend::Null`], which preserves in-process-only behavior.
     pub kv_connector: KvConnectorConfig,
+    /// Vendor-neutral hot, warm, and cold resource ceilings (DESIGN §26.11).
+    pub limits: ResourceLimits,
+    /// Permit programmatic resource-limit changes after engine initialization.
+    pub allow_runtime_override: bool,
 }
 
 impl Default for EngineConfig {
@@ -212,7 +358,31 @@ impl Default for EngineConfig {
             speculative_mode: SpeculativeMode::None,
             kv_cache_dtype: KvDType::F32,
             kv_connector: KvConnectorConfig::default(),
+            limits: ResourceLimits::default(),
+            allow_runtime_override: false,
         }
+    }
+}
+
+impl EngineConfig {
+    /// Decode the `serving.memory.limits` YAML surface documented in §26.11.4.
+    ///
+    /// Engine settings outside that block retain their programmatic defaults.
+    pub fn from_yaml(yaml: &str) -> Result<Self, EngineConfigError> {
+        let document: EngineConfigYaml = serde_yaml::from_str(yaml)?;
+        let yaml_limits = document.serving.memory.limits;
+        let mut config = Self::default();
+        if let Some(limit) = yaml_limits.vram_limit {
+            config.limits.vram_limit = limit.parse("vram_limit")?;
+        }
+        if let Some(limit) = yaml_limits.host_ram_limit {
+            config.limits.host_ram_limit = limit.parse("host_ram_limit")?;
+        }
+        if let Some(limit) = yaml_limits.disk_spill_limit {
+            config.limits.disk_spill_limit = Some(limit.parse("disk_spill_limit")?);
+        }
+        config.allow_runtime_override = yaml_limits.allow_runtime_override;
+        Ok(config)
     }
 }
 
@@ -234,6 +404,114 @@ impl From<String> for GeneratePrompt {
 impl From<&str> for GeneratePrompt {
     fn from(value: &str) -> Self {
         Self::Text(value.to_string())
+    }
+}
+
+#[cfg(test)]
+mod resource_limit_tests {
+    use super::*;
+
+    #[test]
+    fn parses_integer_bytes_and_all_supported_units() {
+        let cases = [
+            ("42", 42),
+            ("2KiB", 2 * 1024),
+            ("2MiB", 2 * 1024 * 1024),
+            ("2GiB", 2 * 1024 * 1024 * 1024),
+            ("2KB", 2_000),
+            ("2MB", 2_000_000),
+            ("2GB", 2_000_000_000),
+            ("1.5KiB", 1536),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                parse_resource_limit(input).unwrap(),
+                ResourceLimit::Bytes(expected),
+                "{input}"
+            );
+        }
+    }
+
+    #[test]
+    fn parses_fraction_and_case_insensitive_auto() {
+        assert_eq!(
+            parse_resource_limit("0.5").unwrap(),
+            ResourceLimit::Fraction(0.5)
+        );
+        assert_eq!(
+            parse_resource_limit("1.0").unwrap(),
+            ResourceLimit::Fraction(1.0)
+        );
+        assert_eq!(parse_resource_limit("AuTo").unwrap(), ResourceLimit::Auto);
+    }
+
+    #[test]
+    fn rejects_out_of_range_fractions_unknown_units_and_invalid_numbers() {
+        for input in ["1.01", "-0.1", "NaN", "inf"] {
+            let error = parse_resource_limit(input).unwrap_err().to_string();
+            assert!(error.contains("invalid resource limit"), "{error}");
+            assert!(error.contains("use a byte count"), "{error}");
+        }
+        for input in ["8TiB", "8G", "8Gi", "8XB"] {
+            let error = parse_resource_limit(input).unwrap_err().to_string();
+            assert!(error.contains("not supported"), "{input}: {error}");
+            assert!(error.contains("8GiB"), "{input}: {error}");
+        }
+        for input in ["GiB", "oneGiB", "-1GiB", "1e100GiB"] {
+            let error = parse_resource_limit(input).unwrap_err().to_string();
+            assert!(error.contains("invalid resource limit"), "{input}: {error}");
+        }
+    }
+
+    #[test]
+    fn engine_config_defaults_to_scheduler_resource_defaults() {
+        let config = EngineConfig::default();
+        assert_eq!(config.limits, ResourceLimits::default());
+        assert!(!config.allow_runtime_override);
+    }
+
+    #[test]
+    fn yaml_limits_parse_fraction_bytes_auto_null_and_override() {
+        let config = EngineConfig::from_yaml(
+            r#"
+    serving:
+      memory:
+        limits:
+          vram_limit: "0.5"
+          host_ram_limit: "8GiB"
+          disk_spill_limit: "auto"
+          allow_runtime_override: true
+    "#,
+        )
+        .unwrap();
+        assert_eq!(config.limits.vram_limit, ResourceLimit::Fraction(0.5));
+        assert_eq!(
+            config.limits.host_ram_limit,
+            ResourceLimit::Bytes(8_u64 << 30)
+        );
+        assert_eq!(config.limits.disk_spill_limit, Some(ResourceLimit::Auto));
+        assert!(config.allow_runtime_override);
+
+        let disabled = EngineConfig::from_yaml(
+            "serving:\n  memory:\n    limits:\n      disk_spill_limit: null\n",
+        )
+        .unwrap();
+        assert_eq!(disabled.limits.disk_spill_limit, None);
+    }
+
+    #[test]
+    fn yaml_accepts_numeric_fraction_and_reports_field_context() {
+        let config =
+            EngineConfig::from_yaml("serving:\n  memory:\n    limits:\n      vram_limit: 0.5\n")
+                .unwrap();
+        assert_eq!(config.limits.vram_limit, ResourceLimit::Fraction(0.5));
+
+        let error =
+            EngineConfig::from_yaml("serving:\n  memory:\n    limits:\n      vram_limit: 1.5\n")
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains("vram_limit"), "{error}");
+        assert!(error.contains("outside [0, 1]"), "{error}");
     }
 }
 
@@ -417,7 +695,9 @@ pub(crate) fn validate_shared_kv_proposer_config(
         anyhow::bail!("shared-KV proposer target_hidden_output must not be empty");
     }
     if config.backbone_hidden_size == 0 || config.vocab_size == 0 {
-        anyhow::bail!("shared-KV proposer backbone_hidden_size and vocab_size must be greater than zero");
+        anyhow::bail!(
+            "shared-KV proposer backbone_hidden_size and vocab_size must be greater than zero"
+        );
     }
     if config.num_speculative_tokens == 0 {
         anyhow::bail!("shared-KV proposer num_speculative_tokens must be greater than zero");

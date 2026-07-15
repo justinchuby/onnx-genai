@@ -21,26 +21,181 @@ use crate::processors::{
 use crate::sampling::SamplingRng;
 use crate::session::{ActiveGenerate, DraftModel, DraftSession, EngineSession};
 use anyhow::Context;
-use onnx_genai_kv::{Device, KvCacheOps, LocalTieredConnector, PagedKvCache, PrefixCache};
+use onnx_genai_kv::{Device, KvCacheOps, KvDType, LocalTieredConnector, PagedKvCache, PrefixCache};
 use onnx_genai_metadata::InferenceMetadata;
 use onnx_genai_ort::{
-    DataType, Eagle3DecodeSession, Environment, SharedKvProposerSession, ModelDirectory,
-    MtpDecodeSession, Session, SessionOptions, Tokenizer,
+    DataType, Eagle3DecodeSession, Environment, ModelDirectory, MtpDecodeSession, Session,
+    SessionOptions, SharedKvProposerSession, Tokenizer,
 };
-use onnx_genai_scheduler::{Priority, Scheduler};
+use onnx_genai_scheduler::{
+    CapacityProvider, CapacityProviders, FixedCapacity, GovernorReconfigureOutcome,
+    GovernorSnapshot, ModelKvConfig, Priority, ResourceError, ResourceGovernor, ResourceLimit,
+    ResourceLimits, Scheduler, VramBreakdown,
+};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
 pub use crate::config::{
-    Eagle3Config, EngineConfig, FinishReason, KvConnectorBackend, KvConnectorConfig,
-    SharedKvProposerConfig, GenerateConstraint,
+    Eagle3Config, EngineConfig, EngineConfigError, FinishReason, GenerateConstraint,
     GenerateOptions, GeneratePrompt, GenerateRequest, GenerateResult, GenerateToken,
-    GenerateTokenCallback, MtpConfig, PrioritizedGenerateRequest, PrioritizedGenerateResult,
-    ScheduledGenerateArrival, SessionId, SharedKvBinding, SpeculativeMode, TokenLogprob,
+    GenerateTokenCallback, KvConnectorBackend, KvConnectorConfig, LimitParseError, MtpConfig,
+    PrioritizedGenerateRequest, PrioritizedGenerateResult, ScheduledGenerateArrival, SessionId,
+    SharedKvBinding, SharedKvProposerConfig, SpeculativeMode, TokenLogprob, parse_resource_limit,
 };
 pub use crate::connector_bridge::{ConnectorLookupOutcome, ConnectorStats};
 use crate::speculative::{LinearEmbedder, LinearLmHead, SpeculativeStats};
+
+const FALLBACK_VRAM_CAPACITY_BYTES: u64 = 8 << 30;
+const FALLBACK_HOST_RAM_CAPACITY_BYTES: u64 = 16 << 30;
+
+/// Engine-owned Resource Governor handle.
+pub struct EngineResourceGovernor {
+    inner: ResourceGovernor,
+    allow_runtime_override: bool,
+}
+
+impl EngineResourceGovernor {
+    fn new(
+        limits: ResourceLimits,
+        allow_runtime_override: bool,
+        kv_config: ModelKvConfig,
+    ) -> Result<Self, ResourceError> {
+        let capacities = fallback_capacity_providers(&limits);
+        Self::new_with_capacities(limits, allow_runtime_override, capacities, kv_config)
+    }
+
+    fn new_with_capacities(
+        limits: ResourceLimits,
+        allow_runtime_override: bool,
+        capacities: CapacityProviders,
+        kv_config: ModelKvConfig,
+    ) -> Result<Self, ResourceError> {
+        // TODO(§26.11.4): replace fallback capacities and zero fixed reservations
+        // with vendor-neutral EP/device capacity and memory-usage queries.
+        let inner = ResourceGovernor::new(
+            limits,
+            capacities,
+            VramBreakdown {
+                model_weights_bytes: 0,
+                activations_bytes: 0,
+                ort_overhead_bytes: 0,
+            },
+            kv_config,
+        )?;
+        Ok(Self {
+            inner,
+            allow_runtime_override,
+        })
+    }
+
+    /// Point-in-time configured, resolved, derived, and live VRAM state.
+    pub fn snapshot(&self) -> GovernorSnapshot {
+        self.inner.snapshot()
+    }
+
+    /// Change the live VRAM ceiling when runtime overrides are enabled.
+    pub fn set_vram_limit(
+        &self,
+        limit: ResourceLimit,
+    ) -> Result<GovernorReconfigureOutcome, EngineGovernorError> {
+        if !self.allow_runtime_override {
+            return Err(EngineGovernorError::RuntimeOverrideDisabled);
+        }
+        // TODO(§26.11.2): execute the returned priority/offload/eviction order
+        // across live engine sessions when the outcome reports an overage.
+        Ok(self.inner.set_vram_limit(limit)?)
+    }
+
+    fn byte_budget(&self) -> onnx_genai_scheduler::ByteBudget {
+        self.inner.byte_budget()
+    }
+}
+
+/// Failure from an engine-level live governor operation.
+#[derive(Debug, thiserror::Error)]
+pub enum EngineGovernorError {
+    #[error(
+        "runtime resource-limit override is disabled; set \
+         serving.memory.limits.allow_runtime_override: true or construct EngineConfig with \
+         allow_runtime_override = true before calling set_vram_limit"
+    )]
+    RuntimeOverrideDisabled,
+    #[error(transparent)]
+    Resource(#[from] ResourceError),
+}
+
+fn fallback_capacity_providers(limits: &ResourceLimits) -> CapacityProviders {
+    let vram = capacity_for_limit(limits.vram_limit, FALLBACK_VRAM_CAPACITY_BYTES);
+    let host_ram = capacity_for_limit(limits.host_ram_limit, FALLBACK_HOST_RAM_CAPACITY_BYTES);
+    let disk_spill = limits.disk_spill_limit.map(|limit| {
+        let capacity = capacity_for_limit(limit, 0);
+        Arc::new(FixedCapacity::new(capacity, capacity)) as Arc<dyn CapacityProvider>
+    });
+    CapacityProviders {
+        vram: Arc::new(FixedCapacity::new(vram, vram)),
+        host_ram: Arc::new(FixedCapacity::new(host_ram, host_ram)),
+        disk_spill,
+    }
+}
+
+fn capacity_for_limit(limit: ResourceLimit, fallback: u64) -> u64 {
+    match limit {
+        ResourceLimit::Bytes(bytes) => fallback.max(bytes),
+        ResourceLimit::Fraction(_) | ResourceLimit::Auto => fallback,
+    }
+}
+
+fn governor_kv_config(
+    kv_model: Option<&KvModelInfo>,
+    config: &EngineConfig,
+) -> anyhow::Result<ModelKvConfig> {
+    let tokens_per_page = u64::try_from(config.page_size)
+        .context("KV page size does not fit the Resource Governor's u64 accounting")?
+        .max(1);
+    let Some(kv_model) = kv_model else {
+        return Ok(ModelKvConfig {
+            page_size_bytes: tokens_per_page,
+            tokens_per_page,
+        });
+    };
+
+    let page_size = u64::try_from(config.page_size)
+        .context("KV page size does not fit the Resource Governor's u64 accounting")?;
+    let mut page_size_bytes = 0_u64;
+    for layer in &kv_model.layer_configs {
+        let heads = u64::try_from(layer.num_kv_heads)
+            .context("KV head count does not fit Resource Governor accounting")?;
+        let head_dim = u64::try_from(layer.head_dim)
+            .context("KV head dimension does not fit Resource Governor accounting")?;
+        let values = 2_u64
+            .checked_mul(heads)
+            .and_then(|value| value.checked_mul(page_size))
+            .and_then(|value| value.checked_mul(head_dim))
+            .context("KV page value count overflowed Resource Governor accounting")?;
+        let layer_bytes = match config.kv_cache_dtype {
+            KvDType::F32 => values.checked_mul(4),
+            KvDType::Int8 | KvDType::Fp8E4M3Fn | KvDType::Fp8E5M2 => {
+                let scales = 2_u64
+                    .checked_mul(heads)
+                    .and_then(|value| value.checked_mul(page_size))
+                    .and_then(|value| value.checked_mul(4))
+                    .context(
+                        "KV quantization scale size overflowed Resource Governor accounting",
+                    )?;
+                values.checked_add(scales)
+            }
+        }
+        .context("KV page byte size overflowed Resource Governor accounting")?;
+        page_size_bytes = page_size_bytes
+            .checked_add(layer_bytes)
+            .context("total KV page byte size overflowed Resource Governor accounting")?;
+    }
+    Ok(ModelKvConfig {
+        page_size_bytes: page_size_bytes.max(1),
+        tokens_per_page,
+    })
+}
 
 /// The generation engine.
 pub struct Engine {
@@ -58,6 +213,8 @@ pub struct Engine {
     pub(crate) decode_path: ModelDecodePath,
     /// Batch scheduler.
     pub(crate) scheduler: Scheduler,
+    /// Per-device resource ceilings and shared scheduler byte budget.
+    governor: EngineResourceGovernor,
     /// Persistent multi-turn session state, keyed by session id.
     pub(crate) sessions: HashMap<SessionId, EngineSession>,
     /// ORT session for decoder execution.
@@ -134,9 +291,6 @@ impl Engine {
         let model_directory = ModelDirectory::load(model_dir)
             .map_err(|e| anyhow::anyhow!("Failed to resolve model directory: {}", e))?;
 
-        // Initialize scheduler
-        let scheduler = Scheduler::new(config.scheduler);
-
         let environment = Environment::new("onnx-genai-engine")
             .map_err(|e| anyhow::anyhow!("Failed to create ORT environment: {}", e))?;
         let session = Session::new(
@@ -203,6 +357,22 @@ impl Engine {
             .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {}", e))?;
         let fim_config = load_fim_config_from_model_dir(&model_directory.root)?;
         let kv_model = infer_kv_model_info(&session, config.page_size, config.kv_cache_dtype)?;
+        let governor_kv_config = governor_kv_config(kv_model.as_ref(), &config)?;
+        let governor = EngineResourceGovernor::new(
+            config.limits.clone(),
+            config.allow_runtime_override,
+            governor_kv_config,
+        )
+        .map_err(|error| anyhow::anyhow!("Failed to initialize Resource Governor: {error}"))?;
+        let mut scheduler_config = config.scheduler.clone();
+        if scheduler_config.bytes_per_token.is_none() {
+            scheduler_config.bytes_per_token = Some(
+                governor_kv_config
+                    .page_size_bytes
+                    .div_ceil(governor_kv_config.tokens_per_page),
+            );
+        }
+        let scheduler = Scheduler::with_byte_budget(scheduler_config, governor.byte_budget());
         let draft = if let Some(draft_model_path) = &config.draft_model {
             let draft_directory = ModelDirectory::load(draft_model_path)
                 .map_err(|e| anyhow::anyhow!("Failed to resolve draft model directory: {}", e))?;
@@ -225,7 +395,11 @@ impl Engine {
                 // If a draft model needs its own SWA + sinks, load its
                 // inference_metadata.yaml and pass the values from there.
                 detect_model_decode_path(&draft_session, metadata_max_context, None, None, 0)?;
-            let draft_kv_model = infer_kv_model_info(&draft_session, config.page_size, onnx_genai_kv::KvDType::F32)?;
+            let draft_kv_model = infer_kv_model_info(
+                &draft_session,
+                config.page_size,
+                onnx_genai_kv::KvDType::F32,
+            )?;
             let draft_kv_cache = if let Some(kv_model) = &draft_kv_model {
                 PagedKvCache::new_with_layer_tensor_configs(
                     kv_model.tensor_config.page_size,
@@ -266,10 +440,8 @@ impl Engine {
             // No explicit mode: adopt a shared-KV draft proposer advertised by
             // the model's own inference metadata, if the target exposes an f32
             // hidden output the assistant can be seeded from.
-            SpeculativeMode::None => {
-                shared_kv_mode_from_metadata(&model_directory.root, &session)
-                    .unwrap_or(SpeculativeMode::None)
-            }
+            SpeculativeMode::None => shared_kv_mode_from_metadata(&model_directory.root, &session)
+                .unwrap_or(SpeculativeMode::None),
             mode => mode,
         };
         if let SpeculativeMode::PromptLookup { ngram, max_tokens } = &speculative_mode
@@ -509,11 +681,8 @@ impl Engine {
             None
         };
 
-        let connector = build_connector_bridge(
-            &config.kv_connector,
-            &model_directory,
-            kv_model.as_ref(),
-        )?;
+        let connector =
+            build_connector_bridge(&config.kv_connector, &model_directory, kv_model.as_ref())?;
 
         Ok(Self {
             metadata,
@@ -523,6 +692,7 @@ impl Engine {
             kv_model,
             decode_path,
             scheduler,
+            governor,
             sessions: HashMap::new(),
             _environment: environment,
             session: Box::new(session),
@@ -548,6 +718,24 @@ impl Engine {
     /// Speculative verification diagnostics from the most recent generation.
     pub fn last_speculative_stats(&self) -> SpeculativeStats {
         self.last_speculative_stats
+    }
+
+    /// Access the engine-owned Resource Governor handle.
+    pub fn governor(&self) -> &EngineResourceGovernor {
+        &self.governor
+    }
+
+    /// Convenience snapshot of configured and live resource state.
+    pub fn resource_snapshot(&self) -> GovernorSnapshot {
+        self.governor.snapshot()
+    }
+
+    /// Change the live VRAM ceiling when runtime overrides are enabled.
+    pub fn set_vram_limit(
+        &self,
+        limit: ResourceLimit,
+    ) -> Result<GovernorReconfigureOutcome, EngineGovernorError> {
+        self.governor.set_vram_limit(limit)
     }
 
     /// External KV connector activity from the most recent generation.
@@ -887,9 +1075,7 @@ impl Engine {
     fn new_target_decode_state(&self) -> anyhow::Result<DecodeState> {
         if matches!(
             &self.speculative_mode,
-            SpeculativeMode::Mtp(_)
-                | SpeculativeMode::Eagle3(_)
-                | SpeculativeMode::SharedKv(_)
+            SpeculativeMode::Mtp(_) | SpeculativeMode::Eagle3(_) | SpeculativeMode::SharedKv(_)
         ) {
             DecodeState::new(&self.session)
         } else {
@@ -1121,7 +1307,9 @@ impl Engine {
             if let Some(total) = injected {
                 return Ok(in_process_hit.max(total));
             }
-            let _ = self.connector.lookup_extension(prompt_tokens, in_process_hit);
+            let _ = self
+                .connector
+                .lookup_extension(prompt_tokens, in_process_hit);
         }
         Ok(in_process_hit)
     }
@@ -1533,13 +1721,9 @@ fn read_f32_weights(path: &Path) -> anyhow::Result<Vec<f32>> {
 /// The target hidden output name is not part of the shared metadata contract,
 /// so it is auto-detected: the first Float32 output whose last dimension equals
 /// the advertised backbone hidden size (excluding `logits`).
-fn shared_kv_mode_from_metadata(
-    model_dir: &Path,
-    session: &Session,
-) -> Option<SpeculativeMode> {
+fn shared_kv_mode_from_metadata(model_dir: &Path, session: &Session) -> Option<SpeculativeMode> {
     let descriptor = onnx_genai_metadata::detect_speculator(model_dir)?;
-    let onnx_genai_metadata::SpeculatorProposerStatus::SharedKv(spec) = descriptor.proposer
-    else {
+    let onnx_genai_metadata::SpeculatorProposerStatus::SharedKv(spec) = descriptor.proposer else {
         return None;
     };
     let target_hidden_output = detect_target_hidden_output(session, spec.backbone_hidden_size)?;
@@ -1570,8 +1754,7 @@ fn detect_target_hidden_output(session: &Session, hidden_size: usize) -> Option<
         .find(|output| {
             output.dtype == DataType::Float32
                 && !output.name.to_ascii_lowercase().contains("logits")
-                && output.shape.last().copied().filter(|dim| *dim > 0)
-                    == Some(hidden_size as i64)
+                && output.shape.last().copied().filter(|dim| *dim > 0) == Some(hidden_size as i64)
         })
         .map(|output| output.name.clone())
 }
@@ -1635,6 +1818,62 @@ mod tests {
         finish_reason_after_token, select_next_token, select_next_token_with_sampler,
     };
     use crate::sampling::Sampler;
+
+    fn test_capacities() -> CapacityProviders {
+        CapacityProviders {
+            vram: Arc::new(FixedCapacity::new(1_000, 1_000)),
+            host_ram: Arc::new(FixedCapacity::new(2_000, 2_000)),
+            disk_spill: None,
+        }
+    }
+
+    #[test]
+    fn governor_handle_reflects_configured_limits_without_a_model() {
+        let limits = ResourceLimits {
+            vram_limit: ResourceLimit::Fraction(0.5),
+            host_ram_limit: ResourceLimit::Auto,
+            disk_spill_limit: None,
+        };
+        let governor = EngineResourceGovernor::new_with_capacities(
+            limits.clone(),
+            true,
+            test_capacities(),
+            ModelKvConfig {
+                page_size_bytes: 100,
+                tokens_per_page: 16,
+            },
+        )
+        .unwrap();
+        let snapshot = governor.snapshot();
+        assert_eq!(snapshot.configured_limits, limits);
+        assert_eq!(snapshot.resolved_limits.vram_bytes, 500);
+        assert_eq!(snapshot.derived_budget.total_pages, 5);
+
+        let outcome = governor.set_vram_limit(ResourceLimit::Bytes(800)).unwrap();
+        assert_eq!(outcome.new_limits.vram_bytes, 800);
+        assert_eq!(
+            governor.snapshot().configured_limits.vram_limit,
+            ResourceLimit::Bytes(800)
+        );
+    }
+
+    #[test]
+    fn governor_handle_rejects_disabled_runtime_override() {
+        let governor = EngineResourceGovernor::new_with_capacities(
+            ResourceLimits::default(),
+            false,
+            test_capacities(),
+            ModelKvConfig {
+                page_size_bytes: 100,
+                tokens_per_page: 16,
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            governor.set_vram_limit(ResourceLimit::Bytes(800)),
+            Err(EngineGovernorError::RuntimeOverrideDisabled)
+        ));
+    }
 
     #[test]
     fn token_logprobs_use_log_softmax_and_sorted_top_tokens() {
@@ -2150,7 +2389,8 @@ mod tests {
         let mut baseline = Engine::from_dir(&fixture, EngineConfig::default())?;
         assert!(!baseline.connector.is_active());
 
-        let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(vec![2, 4, 3, 5, 6, 7, 8, 9]));
+        let mut request =
+            GenerateRequest::new(GeneratePrompt::TokenIds(vec![2, 4, 3, 5, 6, 7, 8, 9]));
         request.options.max_new_tokens = 3;
         request.options.temperature = 0.0;
         request.options.stop_on_eos = false;
@@ -2170,7 +2410,8 @@ mod tests {
         let mut engine = Engine::from_dir(&fixture, local_tiered_engine_config(2))?;
         assert!(engine.connector.is_active());
 
-        let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(vec![2, 4, 3, 5, 6, 7, 8, 9]));
+        let mut request =
+            GenerateRequest::new(GeneratePrompt::TokenIds(vec![2, 4, 3, 5, 6, 7, 8, 9]));
         request.options.max_new_tokens = 3;
         request.options.temperature = 0.0;
         request.options.stop_on_eos = false;

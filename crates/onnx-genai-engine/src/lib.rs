@@ -24,21 +24,24 @@ pub(crate) mod session;
 pub mod speculative;
 
 pub use batched::{ContinuousBatchEvent, ContinuousBatchHandle, ContinuousBatchManager};
+pub use connector_bridge::{ConnectorLookupOutcome, ConnectorStats};
 pub use embedding::{EmbeddingOptions, EmbeddingPooling};
 pub use engine::{
-    Eagle3Config, Engine, EngineConfig, FinishReason, GenerateConstraint,
-    GenerateOptions, GeneratePrompt, GenerateRequest, GenerateResult, GenerateToken,
-    GenerateTokenCallback, KvConnectorBackend, KvConnectorConfig, MtpConfig,
-    PrioritizedGenerateRequest, PrioritizedGenerateResult,
-    ScheduledGenerateArrival, SessionId, SharedKvBinding, SharedKvProposerConfig, SpeculativeMode,
-    TokenLogprob,
+    Eagle3Config, Engine, EngineConfig, EngineConfigError, EngineGovernorError,
+    EngineResourceGovernor, FinishReason, GenerateConstraint, GenerateOptions, GeneratePrompt,
+    GenerateRequest, GenerateResult, GenerateToken, GenerateTokenCallback, KvConnectorBackend,
+    KvConnectorConfig, LimitParseError, MtpConfig, PrioritizedGenerateRequest,
+    PrioritizedGenerateResult, ScheduledGenerateArrival, SessionId, SharedKvBinding,
+    SharedKvProposerConfig, SpeculativeMode, TokenLogprob, parse_resource_limit,
 };
-pub use connector_bridge::{ConnectorLookupOutcome, ConnectorStats};
-pub use onnx_genai_kv::{CachePriority, KvDType, LocalTieredConfig};
 pub use fim::{FimConfig, FimFormat};
 pub use logits::{
     Constraint, ConstraintProcessor, JsonConstraint, LogitProcessor, ProcessorChain,
     ProcessorChainBuilder, ProcessorContext, ProcessorSignal, StopSequence, TokenId,
+};
+pub use onnx_genai_kv::{CachePriority, KvDType, LocalTieredConfig};
+pub use onnx_genai_scheduler::{
+    GovernorReconfigureOutcome, GovernorSnapshot, ResourceLimit, ResourceLimits,
 };
 pub use pipeline::{PipelineEngine, PipelineGenerateRequest, PipelineTensors};
 pub use sampling::{CategoricalSampler, GreedySampler, Sampler};
