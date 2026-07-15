@@ -48,7 +48,7 @@ use crate::graph_builder::BuiltGraph;
 pub mod encoder;
 pub mod epcontext;
 pub mod function_inline;
-pub mod graph_builder;
+pub(crate) mod graph_builder;
 pub mod proto;
 pub mod weights;
 pub mod writer;

@@ -366,3 +366,18 @@ fn graph_output_must_be_locally_sourced_and_input_passthrough_is_allowed() {
         Err(LoaderError::GraphOutputMissingProducer { tensor }) if tensor == "missing_nested"
     ));
 }
+
+/// `build_graph` is an internal, pre-weight-attachment step. The retained
+/// public loading API must still reject an output that has no source.
+#[test]
+fn public_load_model_bytes_rejects_producerless_graph_output() {
+    let malformed = model(onnx::GraphProto {
+        output: vec![value_info("missing")],
+        ..Default::default()
+    });
+
+    assert!(matches!(
+        onnx_runtime_loader::load_model_bytes(&malformed.encode_to_vec()),
+        Err(LoaderError::GraphOutputMissingProducer { tensor }) if tensor == "missing"
+    ));
+}

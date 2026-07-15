@@ -20,9 +20,9 @@ use crate::LoaderError;
 /// The result of building a graph: the IR graph plus the mapping from ONNX
 /// tensor names to the value ids they were assigned (needed by the weight
 /// loader).
-pub struct BuiltGraph {
-    pub graph: Graph,
-    pub name_map: HashMap<String, ValueId>,
+pub(crate) struct BuiltGraph {
+    pub(crate) graph: Graph,
+    pub(crate) name_map: HashMap<String, ValueId>,
 }
 
 /// Build the IR graph (nodes, values, symbols, opsets) from a `ModelProto`.
@@ -43,7 +43,7 @@ pub struct BuiltGraph {
 ///
 /// [`WeightRef`]: onnx_runtime_ir::WeightRef
 /// [`Graph::validate`]: onnx_runtime_ir::Graph::validate
-pub fn build_graph(model: &ModelProto) -> Result<BuiltGraph, LoaderError> {
+pub(crate) fn build_graph(model: &ModelProto) -> Result<BuiltGraph, LoaderError> {
     // Expand any model-local function calls into their primitive bodies before
     // building the IR, so the rest of the pipeline only ever sees ops the
     // runtime has kernels for. No-op (borrow) when the model declares no
