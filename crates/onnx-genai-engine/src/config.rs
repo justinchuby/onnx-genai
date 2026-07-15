@@ -66,6 +66,24 @@ pub fn parse_resource_limit(input: &str) -> Result<ResourceLimit, LimitParseErro
             ));
         }
     };
+    if number.chars().all(|character| character.is_ascii_digit()) {
+        let quantity = number.parse::<u64>().map_err(|_| {
+            limit_error(
+                input,
+                format!("the integral byte quantity {number:?} does not fit in u64"),
+            )
+        })?;
+        let bytes = quantity.checked_mul(multiplier).ok_or_else(|| {
+            limit_error(
+                input,
+                format!(
+                    "multiplying {quantity} by the {unit} unit size ({multiplier} bytes) \
+                     overflows u64; use a smaller byte quantity or a smaller unit"
+                ),
+            )
+        })?;
+        return Ok(ResourceLimit::Bytes(bytes));
+    }
     let quantity = number.parse::<f64>().map_err(|_| {
         limit_error(
             input,
@@ -73,7 +91,7 @@ pub fn parse_resource_limit(input: &str) -> Result<ResourceLimit, LimitParseErro
         )
     })?;
     let bytes = quantity * multiplier as f64;
-    if !quantity.is_finite() || quantity < 0.0 || !bytes.is_finite() || bytes > u64::MAX as f64 {
+    if !quantity.is_finite() || quantity < 0.0 || !bytes.is_finite() || bytes >= u64::MAX as f64 {
         return Err(limit_error(
             input,
             "the byte quantity is negative, non-finite, or exceeds u64",
@@ -112,12 +130,18 @@ enum LimitValue {
 
 impl LimitValue {
     fn parse(self, field: &'static str) -> Result<ResourceLimit, EngineConfigError> {
-        let text = match self {
-            Self::String(value) => value,
-            Self::Integer(value) => value.to_string(),
-            Self::Float(value) => value.to_string(),
+        let parsed = match self {
+            Self::String(value) => parse_resource_limit(&value),
+            Self::Integer(value) => Ok(ResourceLimit::Bytes(value)),
+            Self::Float(value) if value.is_finite() && (0.0..=1.0).contains(&value) => {
+                Ok(ResourceLimit::Fraction(value as f32))
+            }
+            Self::Float(value) => Err(limit_error(
+                value.to_string(),
+                "a YAML floating-point limit is a fraction, but this value is outside [0, 1]",
+            )),
         };
-        parse_resource_limit(&text).map_err(|source| EngineConfigError::Limit { field, source })
+        parsed.map_err(|source| EngineConfigError::Limit { field, source })
     }
 }
 
@@ -464,6 +488,15 @@ mod resource_limit_tests {
     }
 
     #[test]
+    fn rejects_integral_unit_overflow_at_exact_boundary() {
+        let error = parse_resource_limit("17179869184GiB")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("overflows u64"), "{error}");
+        assert!(error.contains("use a smaller byte quantity"), "{error}");
+    }
+
+    #[test]
     fn engine_config_defaults_to_scheduler_resource_defaults() {
         let config = EngineConfig::default();
         assert_eq!(config.limits, ResourceLimits::default());
@@ -501,10 +534,13 @@ mod resource_limit_tests {
 
     #[test]
     fn yaml_accepts_numeric_fraction_and_reports_field_context() {
-        let config =
-            EngineConfig::from_yaml("serving:\n  memory:\n    limits:\n      vram_limit: 0.5\n")
-                .unwrap();
-        assert_eq!(config.limits.vram_limit, ResourceLimit::Fraction(0.5));
+        for (value, expected) in [("1.0", 1.0), ("0.5", 0.5)] {
+            let config = EngineConfig::from_yaml(&format!(
+                "serving:\n  memory:\n    limits:\n      vram_limit: {value}\n"
+            ))
+            .unwrap();
+            assert_eq!(config.limits.vram_limit, ResourceLimit::Fraction(expected));
+        }
 
         let error =
             EngineConfig::from_yaml("serving:\n  memory:\n    limits:\n      vram_limit: 1.5\n")

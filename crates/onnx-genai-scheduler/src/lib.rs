@@ -14,9 +14,10 @@ pub use byte_budget::{
     BudgetSnapshot, ByteBudget, ByteBudgetError, ReconfigureOutcome as ByteBudgetReconfigureOutcome,
 };
 pub use governor::{
-    derive_kv_budget, resolve_limit, CapacityProvider, CapacityProviders, DerivedBudget,
-    EvictionTier, FixedCapacity, GovernorReconfigureOutcome, GovernorSnapshot, ModelKvConfig,
-    ResolvedLimits, ResourceError, ResourceGovernor, ResourceLimit, ResourceLimits, VramBreakdown,
+    CapacityProvider, CapacityProviders, DerivedBudget, EvictionTier, FixedCapacity,
+    GovernorReconfigureOutcome, GovernorSnapshot, ModelKvConfig, ResolvedLimits, ResourceError,
+    ResourceGovernor, ResourceLimit, ResourceLimits, TierSnapshot, VramBreakdown, derive_kv_budget,
+    resolve_limit,
 };
 pub use policy::FairSharePolicy;
 

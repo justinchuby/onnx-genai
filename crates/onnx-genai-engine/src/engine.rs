@@ -46,8 +46,12 @@ pub use crate::config::{
 pub use crate::connector_bridge::{ConnectorLookupOutcome, ConnectorStats};
 use crate::speculative::{LinearEmbedder, LinearLmHead, SpeculativeStats};
 
-const FALLBACK_VRAM_CAPACITY_BYTES: u64 = 8 << 30;
-const FALLBACK_HOST_RAM_CAPACITY_BYTES: u64 = 16 << 30;
+// Provisional vendor-neutral capacities used until the active EP, OS, and
+// filesystem supply real providers. Configured limits are resolved against
+// these conservative constants; they never manufacture additional capacity.
+const PROVISIONAL_VRAM_CAPACITY_BYTES: u64 = 8 << 30;
+const PROVISIONAL_HOST_RAM_CAPACITY_BYTES: u64 = 16 << 30;
+const PROVISIONAL_DISK_CAPACITY_BYTES: u64 = 16 << 30;
 
 /// Engine-owned Resource Governor handle.
 pub struct EngineResourceGovernor {
@@ -71,8 +75,9 @@ impl EngineResourceGovernor {
         capacities: CapacityProviders,
         kv_config: ModelKvConfig,
     ) -> Result<Self, ResourceError> {
-        // TODO(§26.11.4): replace fallback capacities and zero fixed reservations
-        // with vendor-neutral EP/device capacity and memory-usage queries.
+        // TODO(RULES.md #2, §26.11.4): replace provisional capacities and zero
+        // fixed reservations with vendor-neutral EP-backed device capacity/usage
+        // queries plus OS/filesystem providers for the warm and cold tiers.
         let inner = ResourceGovernor::new(
             limits,
             capacities,
@@ -89,7 +94,7 @@ impl EngineResourceGovernor {
         })
     }
 
-    /// Point-in-time configured, resolved, derived, and live VRAM state.
+    /// Point-in-time configured, resolved, derived, and live per-tier state.
     pub fn snapshot(&self) -> GovernorSnapshot {
         self.inner.snapshot()
     }
@@ -126,23 +131,22 @@ pub enum EngineGovernorError {
 }
 
 fn fallback_capacity_providers(limits: &ResourceLimits) -> CapacityProviders {
-    let vram = capacity_for_limit(limits.vram_limit, FALLBACK_VRAM_CAPACITY_BYTES);
-    let host_ram = capacity_for_limit(limits.host_ram_limit, FALLBACK_HOST_RAM_CAPACITY_BYTES);
-    let disk_spill = limits.disk_spill_limit.map(|limit| {
-        let capacity = capacity_for_limit(limit, 0);
-        Arc::new(FixedCapacity::new(capacity, capacity)) as Arc<dyn CapacityProvider>
+    let disk_spill = limits.disk_spill_limit.map(|_| {
+        Arc::new(FixedCapacity::new(
+            PROVISIONAL_DISK_CAPACITY_BYTES,
+            PROVISIONAL_DISK_CAPACITY_BYTES,
+        )) as Arc<dyn CapacityProvider>
     });
     CapacityProviders {
-        vram: Arc::new(FixedCapacity::new(vram, vram)),
-        host_ram: Arc::new(FixedCapacity::new(host_ram, host_ram)),
+        vram: Arc::new(FixedCapacity::new(
+            PROVISIONAL_VRAM_CAPACITY_BYTES,
+            PROVISIONAL_VRAM_CAPACITY_BYTES,
+        )),
+        host_ram: Arc::new(FixedCapacity::new(
+            PROVISIONAL_HOST_RAM_CAPACITY_BYTES,
+            PROVISIONAL_HOST_RAM_CAPACITY_BYTES,
+        )),
         disk_spill,
-    }
-}
-
-fn capacity_for_limit(limit: ResourceLimit, fallback: u64) -> u64 {
-    match limit {
-        ResourceLimit::Bytes(bytes) => fallback.max(bytes),
-        ResourceLimit::Fraction(_) | ResourceLimit::Auto => fallback,
     }
 }
 
@@ -1848,12 +1852,98 @@ mod tests {
         assert_eq!(snapshot.configured_limits, limits);
         assert_eq!(snapshot.resolved_limits.vram_bytes, 500);
         assert_eq!(snapshot.derived_budget.total_pages, 5);
+        assert_eq!(snapshot.vram.headroom, 500);
+        assert_eq!(snapshot.host_ram.used, 0);
+        assert_eq!(snapshot.host_ram.limit, 500);
+        assert_eq!(snapshot.host_ram.headroom, 500);
+        assert_eq!(snapshot.disk_spill, None);
 
         let outcome = governor.set_vram_limit(ResourceLimit::Bytes(800)).unwrap();
         assert_eq!(outcome.new_limits.vram_bytes, 800);
         assert_eq!(
             governor.snapshot().configured_limits.vram_limit,
             ResourceLimit::Bytes(800)
+        );
+    }
+
+    #[test]
+    fn provisional_capacity_clamps_absolute_limits_without_fabricating_capacity() {
+        let limits = ResourceLimits {
+            vram_limit: ResourceLimit::Bytes(PROVISIONAL_VRAM_CAPACITY_BYTES + 1),
+            host_ram_limit: ResourceLimit::Fraction(0.5),
+            disk_spill_limit: Some(ResourceLimit::Auto),
+        };
+        let governor = EngineResourceGovernor::new(
+            limits,
+            false,
+            ModelKvConfig {
+                page_size_bytes: 1,
+                tokens_per_page: 1,
+            },
+        )
+        .unwrap();
+        let snapshot = governor.snapshot();
+        assert_eq!(
+            snapshot.resolved_limits.vram_bytes,
+            PROVISIONAL_VRAM_CAPACITY_BYTES
+        );
+        assert_eq!(
+            snapshot.resolved_limits.host_ram_bytes,
+            PROVISIONAL_HOST_RAM_CAPACITY_BYTES / 2
+        );
+        assert_eq!(
+            snapshot.resolved_limits.disk_spill_bytes,
+            Some(PROVISIONAL_DISK_CAPACITY_BYTES)
+        );
+    }
+
+    #[test]
+    fn governor_snapshot_reports_usage_limit_and_headroom_for_each_enabled_tier() {
+        let capacities = CapacityProviders {
+            vram: Arc::new(FixedCapacity::new(1_000, 900)),
+            host_ram: Arc::new(FixedCapacity::new(2_000, 1_500)),
+            disk_spill: Some(Arc::new(FixedCapacity::new(4_000, 3_000))),
+        };
+        let governor = EngineResourceGovernor::new_with_capacities(
+            ResourceLimits {
+                vram_limit: ResourceLimit::Bytes(800),
+                host_ram_limit: ResourceLimit::Bytes(1_200),
+                disk_spill_limit: Some(ResourceLimit::Bytes(3_000)),
+            },
+            false,
+            capacities,
+            ModelKvConfig {
+                page_size_bytes: 100,
+                tokens_per_page: 16,
+            },
+        )
+        .unwrap();
+        governor.byte_budget().try_reserve(300).unwrap();
+
+        let snapshot = governor.snapshot();
+        assert_eq!(
+            snapshot.vram,
+            onnx_genai_scheduler::TierSnapshot {
+                used: 300,
+                limit: 800,
+                headroom: 500,
+            }
+        );
+        assert_eq!(
+            snapshot.host_ram,
+            onnx_genai_scheduler::TierSnapshot {
+                used: 500,
+                limit: 1_200,
+                headroom: 700,
+            }
+        );
+        assert_eq!(
+            snapshot.disk_spill,
+            Some(onnx_genai_scheduler::TierSnapshot {
+                used: 1_000,
+                limit: 3_000,
+                headroom: 2_000,
+            })
         );
     }
 

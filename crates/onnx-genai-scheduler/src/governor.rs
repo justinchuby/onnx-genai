@@ -6,7 +6,7 @@
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use crate::{BudgetSnapshot, ByteBudget, ByteBudgetReconfigureOutcome};
+use crate::{ByteBudget, ByteBudgetReconfigureOutcome};
 
 const DEFAULT_VRAM_FRACTION: f32 = 0.90;
 const DEFAULT_HOST_RAM_FRACTION: f32 = 0.25;
@@ -160,13 +160,33 @@ pub struct GovernorReconfigureOutcome {
     pub eviction_order: Vec<EvictionTier>,
 }
 
-/// Point-in-time governor state.
+/// Point-in-time usage and headroom for one configured resource tier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TierSnapshot {
+    pub used: u64,
+    pub limit: u64,
+    pub headroom: u64,
+}
+
+impl TierSnapshot {
+    fn new(used: u64, limit: u64) -> Self {
+        Self {
+            used,
+            limit,
+            headroom: limit.saturating_sub(used),
+        }
+    }
+}
+
+/// Point-in-time governor state, including every configured resource tier.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GovernorSnapshot {
     pub configured_limits: ResourceLimits,
     pub resolved_limits: ResolvedLimits,
     pub derived_budget: DerivedBudget,
-    pub vram: BudgetSnapshot,
+    pub vram: TierSnapshot,
+    pub host_ram: TierSnapshot,
+    pub disk_spill: Option<TierSnapshot>,
 }
 
 /// Resource-governor configuration failures.
@@ -436,11 +456,22 @@ impl ResourceGovernor {
 
     pub fn snapshot(&self) -> GovernorSnapshot {
         let state = self.lock_state();
+        let vram_budget = self.byte_budget.snapshot();
         GovernorSnapshot {
             configured_limits: state.configured_limits.clone(),
             resolved_limits: state.resolved_limits,
             derived_budget: state.derived_budget,
-            vram: self.byte_budget.snapshot(),
+            vram: TierSnapshot::new(vram_budget.used, vram_budget.limit),
+            host_ram: capacity_snapshot(
+                self.capacities.host_ram.as_ref(),
+                state.resolved_limits.host_ram_bytes,
+            ),
+            disk_spill: self.capacities.disk_spill.as_deref().and_then(|capacity| {
+                state
+                    .resolved_limits
+                    .disk_spill_bytes
+                    .map(|limit| capacity_snapshot(capacity, limit))
+            }),
         }
     }
 
@@ -449,6 +480,12 @@ impl ResourceGovernor {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
+}
+
+fn capacity_snapshot(capacity: &dyn CapacityProvider, limit: u64) -> TierSnapshot {
+    let total = capacity.total_bytes();
+    let used = total.saturating_sub(capacity.free_bytes().min(total));
+    TierSnapshot::new(used, limit)
 }
 
 fn resolve_limits(
