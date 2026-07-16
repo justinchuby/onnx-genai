@@ -124,6 +124,12 @@ impl ExecutionProvider for CudaExecutionProvider {
         {
             return KernelMatch::Unsupported;
         }
+        if op.op_type == "BlockQuantizedMatMul"
+            && op.domain == "com.github.onnxruntime.genai"
+            && !crate::kernels::block_quantized_matmul::supports_node(op, shapes)
+        {
+            return KernelMatch::Unsupported;
+        }
         let output_layouts = vec![TensorLayout::contiguous(); op.outputs.len()];
         let elems: u64 = shapes
             .iter()

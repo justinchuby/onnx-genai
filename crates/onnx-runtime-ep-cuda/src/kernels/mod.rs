@@ -23,6 +23,7 @@ use crate::runtime::CudaRuntime;
 
 pub mod activations;
 pub mod attention;
+pub mod block_quantized_matmul;
 pub mod cast;
 pub mod constant;
 pub mod conv;
@@ -80,6 +81,7 @@ use pointwise::{
 pub const CUDA_COVERED_OPS: &[&str] = &[
     "MatMul",
     "MatMulNBits",
+    "BlockQuantizedMatMul",
     "Gemm",
     "FusedMatMulBias",
     "FusedGemm",
@@ -183,6 +185,12 @@ pub fn build_cuda_registry(runtime: Arc<CudaRuntime>) -> OpRegistry {
     reg.register(
         OpKey::new("MatMulNBits", "com.microsoft", 1),
         Box::new(matmul_nbits::MatMulNBitsFactory {
+            runtime: runtime.clone(),
+        }),
+    );
+    reg.register(
+        OpKey::new("BlockQuantizedMatMul", "com.github.onnxruntime.genai", 1),
+        Box::new(block_quantized_matmul::BlockQuantizedMatMulFactory {
             runtime: runtime.clone(),
         }),
     );
@@ -489,7 +497,7 @@ mod tests {
 
     #[test]
     fn covered_ops_have_no_duplicates() {
-        assert_eq!(CUDA_COVERED_OPS.len(), 66);
+        assert_eq!(CUDA_COVERED_OPS.len(), 67);
 
         let mut seen = std::collections::HashSet::new();
         for op in CUDA_COVERED_OPS {
