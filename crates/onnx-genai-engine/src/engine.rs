@@ -847,7 +847,7 @@ impl Engine {
             &model_directory.model_path,
             native_device,
         )
-        .map_err(|error| anyhow::anyhow!("Failed to load native decoder session: {error}"))?;
+        .map_err(|error| anyhow::anyhow!("Failed to load native decoder session: {error:#}"))?;
         let environment = Environment::new("onnx-genai-engine")
             .map_err(|e| anyhow::anyhow!("Failed to create ORT environment: {}", e))?;
 

@@ -109,6 +109,13 @@ mod error {
         ExecutionProviderUnavailable(String),
 
         #[error(
+            "CUDA-only session cannot fully serve this model ({unsupported_nodes}). \
+             Heterogeneous CPU+CUDA placement is required and not yet available; \
+             use native CPU or the ORT backend"
+        )]
+        HeterogeneousPlacementRequired { unsupported_nodes: String },
+
+        #[error(
             "unsupported operator {domain}::{op_type}: no available execution provider has a \
              kernel; node {node}, opset {opset}; consulted execution providers (priority order): \
              {execution_providers}. To fix: {remediation}",

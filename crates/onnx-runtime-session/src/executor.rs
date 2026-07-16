@@ -53,8 +53,8 @@ use onnx_runtime_ep_api::{
 use onnx_runtime_ep_cpu::CpuExecutionProvider;
 use onnx_runtime_ep_cpu::strided::view_in_bounds;
 use onnx_runtime_ir::{
-    DataType, Dim, Graph, Node, NodeId, Shape, SymbolId, TensorLayout, ValueId, as_static_shape,
-    compute_contiguous_strides,
+    DataType, DeviceType, Dim, Graph, Node, NodeId, Shape, SymbolId, TensorLayout, ValueId,
+    as_static_shape, compute_contiguous_strides,
 };
 use onnx_runtime_loader::WeightStore;
 use onnx_runtime_shape_inference::{InferenceRegistry, MergePolicy};
@@ -672,6 +672,111 @@ fn fuse_silu_patterns(graph: &mut Graph) -> usize {
     fused
 }
 
+fn validate_cuda_only_coverage(graph: &Graph, ep: &dyn ExecutionProvider) -> Result<()> {
+    if ep.device_type() != DeviceType::Cuda {
+        return Ok(());
+    }
+
+    let mut issues = Vec::new();
+    collect_cuda_coverage_issues(graph, graph, ep, "graph", &mut issues);
+    if issues.is_empty() {
+        return Ok(());
+    }
+
+    const MAX_REPORTED: usize = 8;
+    let omitted = issues.len().saturating_sub(MAX_REPORTED);
+    issues.truncate(MAX_REPORTED);
+    let mut unsupported_nodes = issues.join("; ");
+    if omitted != 0 {
+        unsupported_nodes.push_str(&format!("; and {omitted} more unsupported node(s)"));
+    }
+    Err(SessionError::HeterogeneousPlacementRequired { unsupported_nodes })
+}
+
+fn collect_cuda_coverage_issues(
+    graph: &Graph,
+    opset_graph: &Graph,
+    ep: &dyn ExecutionProvider,
+    scope: &str,
+    issues: &mut Vec<String>,
+) {
+    for (node_id, node) in graph.nodes.iter() {
+        if onnx_runtime_loader::is_ep_context_op(&node.op_type, &node.domain)
+            || is_control_flow_op(&node.op_type, &node.domain)
+            || is_sequence_op(&node.op_type, &node.domain)
+        {
+            continue;
+        }
+
+        let shapes = node
+            .inputs
+            .iter()
+            .map(|input| {
+                input
+                    .map(|value| graph.value(value).shape.clone())
+                    .unwrap_or_default()
+            })
+            .collect::<Vec<_>>();
+        let layouts = node
+            .inputs
+            .iter()
+            .map(|input| {
+                input
+                    .map(|value| graph.value(value).layout.clone())
+                    .unwrap_or_else(TensorLayout::contiguous)
+            })
+            .collect::<Vec<_>>();
+
+        if !ep.supports_op(node, &shapes, &layouts).is_supported() {
+            let identity = format_node_identity(scope, node_id, node);
+            if node.op_type == "BlockQuantizedMatMul"
+                && node.domain == "com.github.onnxruntime.genai"
+            {
+                issues.push(format!(
+                    "{identity}: CUDA BlockQuantizedMatMul supports only M=1 decode, not M>1 or symbolic prefill"
+                ));
+            } else {
+                issues.push(format!("{identity}: unsupported by {}", ep.name()));
+            }
+            continue;
+        }
+
+        let Some(concrete_shapes) = shapes
+            .iter()
+            .map(|shape| as_static_shape(shape))
+            .collect::<Option<Vec<_>>>()
+        else {
+            continue;
+        };
+        let opset = effective_opset(opset_graph, node);
+        if let Err(error) = ep.get_kernel(node, &concrete_shapes, opset) {
+            issues.push(format!(
+                "{}: kernel creation failed: {error}",
+                format_node_identity(scope, node_id, node)
+            ));
+        }
+    }
+
+    for ((node_id, attribute), subgraph) in &graph.subgraphs {
+        let sub_scope = format!("{scope}/node#{}/{}", node_id.0, attribute);
+        collect_cuda_coverage_issues(subgraph, opset_graph, ep, &sub_scope, issues);
+    }
+}
+
+fn format_node_identity(scope: &str, node_id: NodeId, node: &Node) -> String {
+    let domain = if node.domain.is_empty() {
+        "ai.onnx"
+    } else {
+        node.domain.as_str()
+    };
+    let name = if node.name.is_empty() {
+        format!("#{}", node_id.0)
+    } else {
+        format!("{:?}", node.name)
+    };
+    format!("{scope} {name} ({domain}::{})", node.op_type)
+}
+
 impl Executor {
     /// Compile a graph + weights into a runnable executor on the CPU EP.
     pub(crate) fn build(
@@ -682,6 +787,7 @@ impl Executor {
         fuse_silu_patterns(&mut graph);
         // Topological order up front: also validates the graph is a DAG.
         let order = graph.topological_order()?;
+        validate_cuda_only_coverage(&graph, ep.as_ref())?;
 
         let mut value_shapes: HashMap<ValueId, Shape> = HashMap::new();
         let mut value_dtypes: HashMap<ValueId, DataType> = HashMap::new();
