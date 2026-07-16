@@ -108,3 +108,6 @@ Revised Batty's rejected Python binding path seam (`5b348b5`): `PathBuf` values 
 
 ### 2026-07-16T10:18:11Z — Native CUDA decode M1a merged
 Implemented the behavior-preserving executor seam in `f795d45`: `Executor` and kernel-cache EP references are now `Arc<dyn ExecutionProvider>` / `&dyn ExecutionProvider`; CPU execution remains token-exact (`[11576, 42740, 11, 358, 614, 264, 3405, 911]`) with all 413 CPU EP tests green. M2 device tensors and on-device coverage remains gated on design decisions and packed-QKV CUDA GQA/O(1) device-KV prerequisites.
+
+### 2026-07-16T00:00:00Z — CUDA M2 end-to-end wiring (locked out)
+Authored initial CUDA executor wiring (`1a2deca`): opt-in CUDA EP selection, device-buffer initializers and graph boundaries, device-correct views, and synchronized output downloads; Qwen CPU/CUDA tokens matched exactly. Holden rejected two off-target control-flow memory-safety hazards (SequenceAt host pointer dispatch and Scan host writes to CUDA allocation). Deckard was locked out; Leon supplied the corrective `5c0f05f`, which Holden cleared.

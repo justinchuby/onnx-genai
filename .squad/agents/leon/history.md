@@ -28,3 +28,5 @@ Loader opset-import validation for file, from-parts, and nested-subgraph paths m
 - 2026-07-16T00:00:01Z — Re-profiled native CPU decode after MatMulNBits threading and landed allocation-free, same-shape contiguous-f32 `Mul` (`347060f`). The guarded non-aliased fast path reduced Mul 3.12→0.25 ms and decode 40.5→44.2 tok/s; Holden 🟡 approved (independent +6.35%).
 
 - 2026-07-16T00:00:00Z — Streamlined M=1 GQA decode to write contiguous f32 attention and present K/V outputs directly (`1fdd1ec`), preserving the generic prefill/strided/non-f32 path. GQA fell 0.865→0.690 ms/step and decode rose 54.38→58.44 tok/s (+7.5%) with exact eight-token output; Sebastian cleared the change and 413 CPU EP tests pass.
+
+- 2026-07-16T00:00:00Z — Repaired the rejected CUDA executor control-flow paths in `5c0f05f` under Deckard's lockout. Non-host SequenceAt values now synchronously upload to correctly stamped CUDA buffers; Scan retains host staging and relies on child-executor H2D. Added CUDA SequenceAt/Scan versus CPU parity coverage; Holden cleared the repair, with exact Qwen tokens, session 112/112, and CUDA EP 117/117.

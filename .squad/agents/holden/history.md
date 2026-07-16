@@ -71,3 +71,7 @@ Cleared Deckard's `f795d45` executor EP-polymorphism refactor: it preserves CPU-
 ## 2026-07-16T00:00:00Z — CUDA M2 op-coverage review
 - 🟢 Cleared Luv's `16c1e92`: exact CPU/CUDA f32 domain/opset registration parity for SiLU and standard SimplifiedLayerNormalization, stable math, and independent references.
 - Confirmed 114/114 CUDA tests passed.
+
+## 2026-07-16T00:00:00Z — CUDA M2 executor safety review cycle
+- 🔴 Rejected Deckard's `1a2deca` CUDA executor wiring after confirming Qwen token parity but finding unsafe CUDA SequenceAt host-pointer dispatch and Scan host writes to device allocations. Deckard was locked out and Leon assigned the repair.
+- 🟢 Cleared Leon's `5c0f05f`: SequenceAt synchronously uploads into CUDA storage, Scan uses CPU staging plus child-executor H2D, and substantive CUDA control-flow parity passed. Qwen tokens remained exact; session CPU 112/112 and CUDA EP 117/117 passed.
