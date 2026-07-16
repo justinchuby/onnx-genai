@@ -153,6 +153,7 @@ fn dtype_to_numpy_name(dtype: DataType) -> PyResult<&'static str> {
 /// onnxruntime's NodeArg `.type` (e.g. `"tensor(float)"`).
 fn onnx_type_string(dtype: DataType) -> String {
     let inner = match dtype {
+        DataType::Undefined => "undefined",
         DataType::Float32 => "float",
         DataType::Float64 => "double",
         DataType::Float16 => "float16",
@@ -165,6 +166,8 @@ fn onnx_type_string(dtype: DataType) -> String {
         DataType::Uint16 => "uint16",
         DataType::Uint32 => "uint32",
         DataType::Uint64 => "uint64",
+        DataType::Complex64 => "complex64",
+        DataType::Complex128 => "complex128",
         DataType::Bool => "bool",
         DataType::String => "string",
         DataType::Float8E4M3FN => "float8e4m3fn",
