@@ -30,6 +30,7 @@ use crate::strided::{elem_offset, next_index, numel};
 pub mod activations;
 pub mod add;
 pub mod attention;
+pub mod block_quantized_matmul;
 pub mod cast;
 pub mod concat;
 pub mod constant;
@@ -201,6 +202,10 @@ pub fn build_cpu_registry() -> OpRegistry {
     reg.register(
         OpKey::new("MatMulNBits", "com.microsoft", 1),
         Box::new(matmul_nbits::MatMulNBitsFactory),
+    );
+    reg.register(
+        OpKey::new("BlockQuantizedMatMul", "com.github.onnxruntime.genai", 1),
+        Box::new(block_quantized_matmul::BlockQuantizedMatMulFactory),
     );
     reg.register(OpKey::new("Add", "", 1), Box::new(add::AddFactory));
     reg.register(OpKey::new("Relu", "", 1), Box::new(relu::ReluFactory));
@@ -1233,9 +1238,9 @@ mod tests {
         // InstanceNormalization and PRelu add one registration each, while
         // GroupNormalization adds opset-18 and opset-21 entries, for forty-seven
         // registrations over the Phase-1 op-name count in total.
-        // MatMulNBits and GroupQueryAttention each add one more contrib-domain
-        // registration.
-        assert_eq!(reg.len(), PHASE1_OPS.len() + 52);
+        // MatMulNBits, BlockQuantizedMatMul, and GroupQueryAttention each add one
+        // more private/contrib-domain registration.
+        assert_eq!(reg.len(), PHASE1_OPS.len() + 53);
         for op in PHASE1_OPS {
             assert!(reg.lookup(op, "", 21).is_some(), "missing factory for {op}");
         }
@@ -1245,6 +1250,10 @@ mod tests {
         assert!(reg.lookup("LogSoftmax", "", 12).is_some());
         assert!(reg.lookup("LogSoftmax", "", 13).is_some());
         assert!(reg.lookup("MatMulNBits", "com.microsoft", 1).is_some());
+        assert!(
+            reg.lookup("BlockQuantizedMatMul", "com.github.onnxruntime.genai", 1)
+                .is_some()
+        );
         assert!(reg.lookup("Conv", "", 21).is_none());
         assert!(
             reg.lookup("GroupQueryAttention", "com.microsoft", 1)
