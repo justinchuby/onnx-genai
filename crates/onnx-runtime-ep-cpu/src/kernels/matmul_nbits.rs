@@ -4,7 +4,7 @@
 //! ORT stores `B` as `[N, ceil(K / block_size), block_size / 2]`. Within each
 //! block, the earlier K element occupies the low nibble. For M=1 decode,
 //! constant quantized weights are prepacked once and reused by a
-//! bounded-parallel GEMV. `accuracy_level=4` keeps those weights in int8 and
+//! N-parallel GEMV. `accuracy_level=4` keeps those weights in int8 and
 //! quantizes each activation row to int8; the default path remains f32. Other
 //! shapes use the shared CPU GEMM, including its oneDNN backend.
 
@@ -170,21 +170,33 @@ impl Kernel for MatMulNBitsKernel {
                 self.block_size,
                 selected_dot_kernel(),
             );
-        } else if can_prepack && m == 1 {
-            let weight_nk = if let Some(weight) = self.weight_nk.get() {
-                weight
+        } else if m == 1 {
+            let owned_weight;
+            let weight_nk = if can_prepack {
+                if let Some(weight) = self.weight_nk.get() {
+                    weight
+                } else {
+                    let weight = self.dequantize_weight(
+                        &inputs[1],
+                        &inputs[2],
+                        zero_points,
+                        group_indices,
+                        WeightLayout::Nk,
+                    )?;
+                    let _ = self.weight_nk.set(weight);
+                    self.weight_nk
+                        .get()
+                        .expect("constant MatMulNBits prepack was just initialized")
+                }
             } else {
-                let weight = self.dequantize_weight(
+                owned_weight = self.dequantize_weight(
                     &inputs[1],
                     &inputs[2],
                     zero_points,
                     group_indices,
                     WeightLayout::Nk,
                 )?;
-                let _ = self.weight_nk.set(weight);
-                self.weight_nk
-                    .get()
-                    .expect("constant MatMulNBits prepack was just initialized")
+                &owned_weight
             };
             gemv_nk(&activations, weight_nk, &mut result, self.k, self.n);
         } else {
@@ -383,28 +395,81 @@ fn int8_matmul(
     debug_assert_eq!(weight.scales.len(), n * k_blocks);
     debug_assert_eq!(weight.block_sums.len(), n * k_blocks);
 
-    for row in 0..m {
-        let (activation, activation_scale) =
-            quantize_activation(&activations[row * k..(row + 1) * k], padded_k);
-        result[row * n..(row + 1) * n]
-            .par_iter_mut()
-            .enumerate()
-            .for_each(|(output_index, output)| {
-                let mut value = 0.0f32;
-                let weight_row =
-                    &weight.values[output_index * padded_k..(output_index + 1) * padded_k];
-                for block in 0..k_blocks {
-                    let start = block * block_size;
-                    let end = start + block_size;
-                    let unsigned_dot =
-                        dot_u8_i8(&activation[start..end], &weight_row[start..end], dot_kernel);
-                    let signed_dot =
-                        unsigned_dot - 128 * weight.block_sums[output_index * k_blocks + block];
-                    value += signed_dot as f32
-                        * (activation_scale * weight.scales[output_index * k_blocks + block]);
-                }
-                *output = value;
+    if m == 1 {
+        let (activation, activation_scale) = quantize_activation(activations, padded_k);
+        int8_row(
+            &activation,
+            activation_scale,
+            weight,
+            result,
+            k_blocks,
+            padded_k,
+            block_size,
+            dot_kernel,
+            true,
+        );
+    } else {
+        let parallel_columns =
+            m < rayon::current_num_threads() && output_chunk_len(n, padded_k) < n;
+        result
+            .par_chunks_mut(n)
+            .zip(activations.par_chunks_exact(k))
+            .for_each(|(output, activation)| {
+                let (activation, activation_scale) = quantize_activation(activation, padded_k);
+                int8_row(
+                    &activation,
+                    activation_scale,
+                    weight,
+                    output,
+                    k_blocks,
+                    padded_k,
+                    block_size,
+                    dot_kernel,
+                    parallel_columns,
+                );
             });
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn int8_row(
+    activation: &[u8],
+    activation_scale: f32,
+    weight: &Int8Weight,
+    result: &mut [f32],
+    k_blocks: usize,
+    padded_k: usize,
+    block_size: usize,
+    dot_kernel: DotKernel,
+    parallel: bool,
+) {
+    let compute = |output_start: usize, outputs: &mut [f32]| {
+        for (offset, output) in outputs.iter_mut().enumerate() {
+            let output_index = output_start + offset;
+            let mut value = 0.0f32;
+            let weight_row = &weight.values[output_index * padded_k..(output_index + 1) * padded_k];
+            for block in 0..k_blocks {
+                let start = block * block_size;
+                let end = start + block_size;
+                let unsigned_dot =
+                    dot_u8_i8(&activation[start..end], &weight_row[start..end], dot_kernel);
+                let signed_dot =
+                    unsigned_dot - 128 * weight.block_sums[output_index * k_blocks + block];
+                value += signed_dot as f32
+                    * (activation_scale * weight.scales[output_index * k_blocks + block]);
+            }
+            *output = value;
+        }
+    };
+
+    let chunk = output_chunk_len(result.len(), padded_k);
+    if parallel && chunk < result.len() {
+        result
+            .par_chunks_mut(chunk)
+            .enumerate()
+            .for_each(|(chunk_index, outputs)| compute(chunk_index * chunk, outputs));
+    } else {
+        compute(0, result);
     }
 }
 
@@ -488,18 +553,32 @@ fn gemv_nk(activation: &[f32], weight_nk: &[f32], result: &mut [f32], k: usize, 
     debug_assert_eq!(activation.len(), k);
     debug_assert_eq!(weight_nk.len(), n * k);
     debug_assert_eq!(result.len(), n);
-    let min_outputs_per_task = n.div_ceil(8);
-    result
-        .par_iter_mut()
-        .with_min_len(min_outputs_per_task)
-        .zip(
-            weight_nk
-                .par_chunks_exact(k)
-                .with_min_len(min_outputs_per_task),
-        )
-        .for_each(|(output, weight)| {
+    let compute = |output_start: usize, outputs: &mut [f32]| {
+        let weights = &weight_nk[output_start * k..(output_start + outputs.len()) * k];
+        for (output, weight) in outputs.iter_mut().zip(weights.chunks_exact(k)) {
             *output = activation.iter().zip(weight).map(|(&a, &b)| a * b).sum();
-        });
+        }
+    };
+    let chunk = output_chunk_len(n, k);
+    if chunk < n {
+        result
+            .par_chunks_mut(chunk)
+            .enumerate()
+            .for_each(|(chunk_index, outputs)| compute(chunk_index * chunk, outputs));
+    } else {
+        compute(0, result);
+    }
+}
+
+const MIN_PARALLEL_DOT_PRODUCTS: usize = 1024 * 1024;
+const MIN_OUTPUTS_PER_TASK: usize = 16;
+
+fn output_chunk_len(n: usize, k: usize) -> usize {
+    let threads = rayon::current_num_threads();
+    if threads <= 1 || n.saturating_mul(k) < MIN_PARALLEL_DOT_PRODUCTS {
+        return n.max(1);
+    }
+    n.div_ceil(threads).max(MIN_OUTPUTS_PER_TASK).min(n)
 }
 
 fn optional_input<'a>(inputs: &'a [TensorView<'a>], index: usize) -> Option<&'a TensorView<'a>> {
@@ -902,6 +981,62 @@ mod tests {
             selected,
         );
         assert_close(&selected_output, &scalar_output);
+    }
+
+    #[test]
+    fn matmulnbits_parallel_n_partition_matches_serial() {
+        let (k, n, block_size) = (1025usize, 1025usize, 32usize);
+        let padded_k = k.div_ceil(block_size) * block_size;
+        let activations: Vec<f32> = (0..k)
+            .map(|i| ((i * 23 % 53) as f32 - 26.0) / 17.0)
+            .collect();
+        let values: Vec<i8> = (0..n * padded_k)
+            .map(|i| ((i * 11 % 16) as i8) - 8)
+            .collect();
+        let block_sums = values
+            .chunks_exact(block_size)
+            .map(|block| block.iter().map(|&value| value as i32).sum())
+            .collect();
+        let weight = Int8Weight {
+            values,
+            scales: vec![0.01; n * k.div_ceil(block_size)],
+            block_sums,
+        };
+        let mut serial = vec![0.0; n];
+        let mut parallel = vec![0.0; n];
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap()
+            .install(|| {
+                int8_matmul(
+                    &activations,
+                    &weight,
+                    &mut serial,
+                    1,
+                    k,
+                    n,
+                    block_size,
+                    DotKernel::Scalar,
+                );
+            });
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap()
+            .install(|| {
+                int8_matmul(
+                    &activations,
+                    &weight,
+                    &mut parallel,
+                    1,
+                    k,
+                    n,
+                    block_size,
+                    DotKernel::Scalar,
+                );
+            });
+        assert_eq!(parallel, serial);
     }
 
     #[test]
