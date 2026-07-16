@@ -69,3 +69,23 @@ output can run without the local graph adapter. After that, profile
 MatMulNBits per node, prepack its weights, and parallelize M=1 decode across
 the output dimension. Those changes are required before comparing this native
 CPU path fairly with llama.cpp.
+
+## Perf pass 2 (int4)
+
+`MatMulNBits` now uses the session's initializer-only prepack signal to
+dequantize each constant weight once into output-major `[N, K]` f32 storage.
+M=1 decode uses a bounded-parallel GEMV over that cached matrix; activations are
+never cached. Non-decode shapes retain the shared GEMM/oneDNN path.
+
+The same release + oneDNN command and model produced:
+
+| Measurement | Before | After |
+|---|---:|---:|
+| Decode throughput | 0.19 tok/s | **0.50 tok/s** |
+| Decode latency | 5,297.249 ms/step | **1,993.045 ms/step** |
+| Speedup | — | **2.66x** |
+
+Both runs generated `[12095, 13, 1084, 374]` (` Paris. It is`), so the
+optimized result remained deterministic and coherent. The cached fp32 matrix
+trades memory for decode speed; a future packed-int8/SDOT path can reduce that
+footprint and avoid fp32 weight bandwidth.

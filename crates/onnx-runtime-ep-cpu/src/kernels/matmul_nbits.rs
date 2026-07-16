@@ -2,11 +2,16 @@
 //! block-quantized int4 weights.
 //!
 //! ORT stores `B` as `[N, ceil(K / block_size), block_size / 2]`. Within each
-//! block, the earlier K element occupies the low nibble. This Phase-1 kernel
-//! dequantizes to a dense `[K, N]` f32 matrix and uses the shared CPU GEMM.
+//! block, the earlier K element occupies the low nibble. For M=1 decode,
+//! constant quantized weights are dequantized once to output-major `[N, K]` f32
+//! and reused by a bounded-parallel GEMV. Other shapes use the shared CPU GEMM,
+//! including its oneDNN backend.
+
+use std::sync::OnceLock;
 
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ir::{DataType, Node};
+use rayon::prelude::*;
 
 use super::matmul::gemm;
 use super::{check_arity, to_dense_bytes, to_dense_f32, to_dense_i64, write_dense_f32};
@@ -16,6 +21,8 @@ pub struct MatMulNBitsKernel {
     k: usize,
     n: usize,
     block_size: usize,
+    constant_inputs: [bool; 5],
+    weight_nk: OnceLock<Vec<f32>>,
 }
 
 pub struct MatMulNBitsFactory;
@@ -51,11 +58,23 @@ impl KernelFactory for MatMulNBitsFactory {
             .and_then(|value| value.as_int())
             .unwrap_or(0);
 
-        Ok(Box::new(MatMulNBitsKernel { k, n, block_size }))
+        Ok(Box::new(MatMulNBitsKernel {
+            k,
+            n,
+            block_size,
+            constant_inputs: [false; 5],
+            weight_nk: OnceLock::new(),
+        }))
     }
 }
 
 impl Kernel for MatMulNBitsKernel {
+    fn set_constant_inputs(&mut self, constant_inputs: &[bool]) {
+        for (index, is_constant) in self.constant_inputs.iter_mut().enumerate() {
+            *is_constant = constant_inputs.get(index).copied().unwrap_or(false);
+        }
+    }
+
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         check_arity("MatMulNBits", inputs, outputs, 3, 6, 1)?;
         require_dtype("A", inputs[0].dtype, DataType::Float32)?;
@@ -83,19 +102,15 @@ impl Kernel for MatMulNBitsKernel {
         require_shape("B", inputs[1].shape, &[self.n, k_blocks, blob_size])?;
         require_flat_or_matrix_shape("scales", inputs[2].shape, self.n, k_blocks)?;
 
-        let packed = to_dense_bytes(&inputs[1])?;
-        let scales = to_dense_f32(&inputs[2])?;
         let zero_points = optional_input(inputs, 3);
-        let packed_zero_points = if let Some(zp) = zero_points {
+        if let Some(zp) = zero_points {
             require_dtype("zero_points", zp.dtype, DataType::Uint8)?;
             let zp_blob_size = k_blocks.div_ceil(2);
             require_flat_or_matrix_shape("zero_points", zp.shape, self.n, zp_blob_size)?;
-            Some(to_dense_bytes(zp)?)
-        } else {
-            None
-        };
+        }
 
-        let group_indices = if let Some(g_idx) = optional_input(inputs, 4) {
+        let group_indices = optional_input(inputs, 4);
+        if let Some(g_idx) = group_indices {
             require_dtype("g_idx", g_idx.dtype, DataType::Int32)?;
             let padded_k = k_blocks * self.block_size;
             if g_idx.shape != [self.k] && g_idx.shape != [padded_k] {
@@ -104,18 +119,7 @@ impl Kernel for MatMulNBitsKernel {
                     self.k, g_idx.shape
                 )));
             }
-            let values = to_dense_i64(g_idx)?;
-            for (index, &group) in values.iter().enumerate() {
-                if group < 0 || group as usize >= k_blocks {
-                    return Err(error(format!(
-                        "g_idx[{index}]={group} is outside 0..{k_blocks}"
-                    )));
-                }
-            }
-            Some(values)
-        } else {
-            None
-        };
+        }
 
         let bias = if let Some(bias) = optional_input(inputs, 5) {
             require_dtype("bias", bias.dtype, DataType::Float32)?;
@@ -125,8 +129,82 @@ impl Kernel for MatMulNBitsKernel {
             None
         };
 
-        let mut weight_kn = vec![0.0f32; self.k * self.n];
+        let can_prepack = self.constant_inputs[1]
+            && self.constant_inputs[2]
+            && zero_points.is_none_or(|_| self.constant_inputs[3])
+            && group_indices.is_none_or(|_| self.constant_inputs[4]);
+        let activations = to_dense_f32(&inputs[0])?;
+        let m = numel(&a_shape[..a_shape.len() - 1]);
+        let mut result = vec![0.0f32; m * self.n];
+        if can_prepack && m == 1 {
+            let weight_nk = if let Some(weight) = self.weight_nk.get() {
+                weight
+            } else {
+                let weight = self.dequantize_weight(
+                    &inputs[1],
+                    &inputs[2],
+                    zero_points,
+                    group_indices,
+                    WeightLayout::Nk,
+                )?;
+                let _ = self.weight_nk.set(weight);
+                self.weight_nk
+                    .get()
+                    .expect("constant MatMulNBits prepack was just initialized")
+            };
+            gemv_nk(&activations, weight_nk, &mut result, self.k, self.n);
+        } else {
+            let weight_kn = self.dequantize_weight(
+                &inputs[1],
+                &inputs[2],
+                zero_points,
+                group_indices,
+                WeightLayout::Kn,
+            )?;
+            gemm(&activations, &weight_kn, &mut result, m, self.k, self.n)?;
+        }
+        if let Some(bias) = bias {
+            for row in result.chunks_exact_mut(self.n) {
+                for (value, bias) in row.iter_mut().zip(&bias) {
+                    *value += bias;
+                }
+            }
+        }
+        write_dense_f32(&mut outputs[0], &result)
+    }
+
+    fn supports_strided_input(&self, _input_idx: usize) -> bool {
+        true
+    }
+}
+
+impl MatMulNBitsKernel {
+    fn dequantize_weight(
+        &self,
+        packed: &TensorView,
+        scales: &TensorView,
+        zero_points: Option<&TensorView>,
+        group_indices: Option<&TensorView>,
+        layout: WeightLayout,
+    ) -> Result<Vec<f32>> {
+        let packed = to_dense_bytes(packed)?;
+        let scales = to_dense_f32(scales)?;
+        let packed_zero_points = zero_points.map(to_dense_bytes).transpose()?;
+        let group_indices = group_indices.map(to_dense_i64).transpose()?;
+        let k_blocks = self.k.div_ceil(self.block_size);
+        if let Some(indices) = &group_indices {
+            for (index, &group) in indices.iter().enumerate() {
+                if group < 0 || group as usize >= k_blocks {
+                    return Err(error(format!(
+                        "g_idx[{index}]={group} is outside 0..{k_blocks}"
+                    )));
+                }
+            }
+        }
+
+        let blob_size = self.block_size / 2;
         let zp_row_bytes = k_blocks.div_ceil(2);
+        let mut weight_kn = vec![0.0f32; self.k * self.n];
         for output in 0..self.n {
             for depth in 0..self.k {
                 let block = depth / self.block_size;
@@ -148,28 +226,40 @@ impl Kernel for MatMulNBitsKernel {
                         byte >> 4
                     }
                 });
-                weight_kn[depth * self.n + output] =
+                let index = match layout {
+                    WeightLayout::Kn => depth * self.n + output,
+                    WeightLayout::Nk => output * self.k + depth,
+                };
+                weight_kn[index] =
                     (quantized as f32 - zero_point as f32) * scales[output * k_blocks + group];
             }
         }
-
-        let activations = to_dense_f32(&inputs[0])?;
-        let m = numel(&a_shape[..a_shape.len() - 1]);
-        let mut result = vec![0.0f32; m * self.n];
-        gemm(&activations, &weight_kn, &mut result, m, self.k, self.n)?;
-        if let Some(bias) = bias {
-            for row in result.chunks_exact_mut(self.n) {
-                for (value, bias) in row.iter_mut().zip(&bias) {
-                    *value += bias;
-                }
-            }
-        }
-        write_dense_f32(&mut outputs[0], &result)
+        Ok(weight_kn)
     }
+}
 
-    fn supports_strided_input(&self, _input_idx: usize) -> bool {
-        true
-    }
+#[derive(Clone, Copy)]
+enum WeightLayout {
+    Kn,
+    Nk,
+}
+
+fn gemv_nk(activation: &[f32], weight_nk: &[f32], result: &mut [f32], k: usize, n: usize) {
+    debug_assert_eq!(activation.len(), k);
+    debug_assert_eq!(weight_nk.len(), n * k);
+    debug_assert_eq!(result.len(), n);
+    let min_outputs_per_task = n.div_ceil(8);
+    result
+        .par_iter_mut()
+        .with_min_len(min_outputs_per_task)
+        .zip(
+            weight_nk
+                .par_chunks_exact(k)
+                .with_min_len(min_outputs_per_task),
+        )
+        .for_each(|(output, weight)| {
+            *output = activation.iter().zip(weight).map(|(&a, &b)| a * b).sum();
+        });
 }
 
 fn optional_input<'a>(inputs: &'a [TensorView<'a>], index: usize) -> Option<&'a TensorView<'a>> {
@@ -426,6 +516,62 @@ mod tests {
             )
             .unwrap();
         assert_close(&y.to_f32(), &reference(&a.to_f32(), &dequantized, m, k, n));
+    }
+
+    #[test]
+    fn matmulnbits_prepacked_block128_non_multiple_k_keeps_activation_live() {
+        let (m, k, n, block_size) = (2, 141, 7, 128);
+        let a: Vec<f32> = (0..m * k)
+            .map(|i| ((i * 11 % 41) as f32 - 20.0) / 13.0)
+            .collect();
+        let weights: Vec<f32> = (0..n * k)
+            .map(|i| ((i * 23 % 47) as f32 - 19.0) / 12.0)
+            .collect();
+        let (packed, scales, zero_points, dequantized) = quantize(&weights, n, k, block_size, true);
+        let zero_points = zero_points.unwrap();
+        let (mut graph, node) = model_node(
+            &[m, k],
+            &[n, 2, 64],
+            &[n, 2],
+            Some(&[n, 1]),
+            &[m, n],
+            k,
+            n,
+            block_size,
+        );
+        graph
+            .node_mut(node)
+            .attributes
+            .insert("accuracy_level".into(), Attribute::Int(4));
+        let model = Model::new(&graph);
+        let mut kernel = CpuExecutionProvider::new()
+            .get_kernel(model.graph.node(node), &[], 1)
+            .unwrap();
+        kernel.set_constant_inputs(&[false, true, true, true]);
+
+        let b = Owned::u8(&[n, 2, 64], &packed);
+        let scales = Owned::f32(&[n, 2], &scales);
+        let zero_points = Owned::u8(&[n, 1], &zero_points);
+        let a1 = Owned::f32(&[m, k], &a);
+        let mut y1 = Owned::zeros_f32(&[m, n]);
+        kernel
+            .execute(
+                &[a1.view(), b.view(), scales.view(), zero_points.view()],
+                &mut [y1.view_mut()],
+            )
+            .unwrap();
+        assert_close(&y1.to_f32(), &reference(&a, &dequantized, m, k, n));
+
+        let a2_values: Vec<f32> = a.iter().map(|value| value * -0.5).collect();
+        let a2 = Owned::f32(&[m, k], &a2_values);
+        let mut y2 = Owned::zeros_f32(&[m, n]);
+        kernel
+            .execute(
+                &[a2.view(), b.view(), scales.view(), zero_points.view()],
+                &mut [y2.view_mut()],
+            )
+            .unwrap();
+        assert_close(&y2.to_f32(), &reference(&a2_values, &dequantized, m, k, n));
     }
 
     #[test]
