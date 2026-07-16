@@ -51,7 +51,8 @@ use pointwise::{
 /// * **GEMM family** — `MatMul`, `Gemm`, `FusedMatMulBias`, and `FusedGemm`
 ///   (cuBLASLt; the fused ops use native bias/activation epilogues).
 /// * **Elementwise unary** — `Relu`, `Sqrt`, `Erf`, `Tanh` (+ `Sigmoid`) and the
-///   `com.microsoft` `Gelu`, via runtime-compiled f32/f16/bf16 NVRTC kernels.
+///   `com.microsoft` `Gelu`/`Silu`, via runtime-compiled NVRTC kernels (`Silu`
+///   matches the CPU EP's f32 coverage; the others support f32/f16/bf16).
 /// * **Elementwise binary (NumPy broadcasting)** — `Add`, `Sub`, `Mul`, `Div`,
 ///   `Pow`, `Min`, `Max`, via f32/f16/bf16 NVRTC kernels.
 /// * **Attention** — the SDPA/GQA baseline (`com.microsoft` domain; cuBLAS
@@ -91,6 +92,7 @@ pub const CUDA_COVERED_OPS: &[&str] = &[
     "Tanh",
     "Sigmoid",
     "Gelu",
+    "Silu",
     "Add",
     "Sub",
     "Mul",
@@ -221,8 +223,8 @@ pub fn build_cuda_registry(runtime: Arc<CudaRuntime>) -> OpRegistry {
         );
     }
 
-    // Elementwise unary activations (NVRTC f32/f16/bf16 pointwise). `Gelu` is a
-    // `com.microsoft` contrib op; the rest are standard-domain.
+    // Elementwise unary activations (NVRTC pointwise). `Gelu` and `Silu` are
+    // `com.microsoft` contrib ops; Silu matches the CPU EP's f32-only coverage.
     for (op_type, domain, op) in [
         ("Relu", "", UnaryOp::Relu),
         ("Sqrt", "", UnaryOp::Sqrt),
@@ -230,6 +232,7 @@ pub fn build_cuda_registry(runtime: Arc<CudaRuntime>) -> OpRegistry {
         ("Tanh", "", UnaryOp::Tanh),
         ("Sigmoid", "", UnaryOp::Sigmoid),
         ("Gelu", "com.microsoft", UnaryOp::Gelu),
+        ("Silu", "com.microsoft", UnaryOp::Silu),
     ] {
         reg.register(
             OpKey::new(op_type, domain, 1),
@@ -319,14 +322,17 @@ pub fn build_cuda_registry(runtime: Arc<CudaRuntime>) -> OpRegistry {
         );
     }
 
-    // RMSNormalization (fused NVRTC, no mean subtraction): the ai.onnx op and the
-    // `com.microsoft` `SimplifiedLayerNormalization` are the same computation.
-    reg.register(
-        OpKey::new("SimplifiedLayerNormalization", "com.microsoft", 1),
-        Box::new(normalization::RmsNormFactory {
-            runtime: runtime.clone(),
-        }),
-    );
+    // RMSNormalization (fused NVRTC, no mean subtraction): both CPU-registered
+    // SimplifiedLayerNormalization domains and ai.onnx RMSNormalization share
+    // the same computation.
+    for domain in ["", "com.microsoft"] {
+        reg.register(
+            OpKey::new("SimplifiedLayerNormalization", domain, 1),
+            Box::new(normalization::RmsNormFactory {
+                runtime: runtime.clone(),
+            }),
+        );
+    }
     reg.register(
         OpKey::new("RMSNormalization", "", 1),
         Box::new(normalization::RmsNormFactory {
@@ -483,7 +489,7 @@ mod tests {
 
     #[test]
     fn covered_ops_have_no_duplicates() {
-        assert_eq!(CUDA_COVERED_OPS.len(), 65);
+        assert_eq!(CUDA_COVERED_OPS.len(), 66);
 
         let mut seen = std::collections::HashSet::new();
         for op in CUDA_COVERED_OPS {

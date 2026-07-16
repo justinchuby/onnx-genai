@@ -138,6 +138,20 @@ fn wave4_activations_match_cpu_references() {
         &run(&ep, &node("Selu"), &x, None),
         &x.map(|v| 1.0507 * if v >= 0.0 { v } else { 1.67326 * v.exp_m1() }),
     );
+
+    let mut silu = node("Silu");
+    silu.domain = "com.microsoft".into();
+    assert_close(
+        &run(&ep, &silu, &x, None),
+        &x.map(|v| {
+            if v >= 0.0 {
+                v / (1.0 + (-v).exp())
+            } else {
+                let exp = v.exp();
+                v * exp / (1.0 + exp)
+            }
+        }),
+    );
 }
 
 #[test]

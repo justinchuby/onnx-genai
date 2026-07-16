@@ -63,6 +63,7 @@ __device__ float op_sigmoid(float x) {
     float e = expf(x);
     return e / (1.0f + e);
 }
+__device__ float op_silu(float x) { return x * op_sigmoid(x); }
 __device__ float op_gelu(float x) {
     return x * 0.5f * (1.0f + erff(x * 0.7071067811865475f));
 }
@@ -118,6 +119,7 @@ DEFINE_BINARY(min, TYPE, SUFFIX) \
 DEFINE_BINARY(max, TYPE, SUFFIX)
 
 DEFINE_FOR_TYPE(float, f32)
+DEFINE_UNARY(silu, float, f32)
 #ifdef NXRT_HAS_CUDA_HALF_HEADERS
 DEFINE_FOR_TYPE(__half, f16)
 DEFINE_FOR_TYPE(__nv_bfloat16, bf16)
@@ -165,6 +167,7 @@ pub enum UnaryOp {
     Erf,
     Tanh,
     Sigmoid,
+    Silu,
     Gelu,
 }
 
@@ -176,6 +179,7 @@ impl UnaryOp {
             UnaryOp::Erf => "erf",
             UnaryOp::Tanh => "tanh",
             UnaryOp::Sigmoid => "sigmoid",
+            UnaryOp::Silu => "silu",
             UnaryOp::Gelu => "gelu",
         }
     }
@@ -192,6 +196,7 @@ impl UnaryOp {
             UnaryOp::Erf => "Erf",
             UnaryOp::Tanh => "Tanh",
             UnaryOp::Sigmoid => "Sigmoid",
+            UnaryOp::Silu => "Silu",
             UnaryOp::Gelu => "Gelu",
         }
     }
@@ -292,6 +297,12 @@ impl UnaryKernel {
         }
         let x = &inputs[0];
         let dtype = FloatDtype::from_onnx(op, "input", x.dtype)?;
+        if self.op == UnaryOp::Silu && dtype != FloatDtype::F32 {
+            return Err(not_implemented(format!(
+                "{op} with input dtype {:?} (supported: Float32)",
+                x.dtype
+            )));
+        }
         if dtype != FloatDtype::F32 {
             self.runtime.require_nvrtc_half_headers(op)?;
         }
@@ -518,6 +529,7 @@ mod tests {
             UnaryOp::Erf,
             UnaryOp::Tanh,
             UnaryOp::Sigmoid,
+            UnaryOp::Silu,
             UnaryOp::Gelu,
         ];
         for op in ops {
