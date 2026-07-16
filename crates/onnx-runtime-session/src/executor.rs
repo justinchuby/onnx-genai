@@ -599,13 +599,78 @@ fn dynamic_output_shapes(
     }
 }
 
+/// Lower an exact `x * Sigmoid(x)` pair to the CPU EP's fused SiLU kernel.
+///
+/// The Sigmoid result must have exactly one consumer and must not be a graph
+/// output, so removing its materialized value cannot change observable behavior.
+fn fuse_silu_patterns(graph: &mut Graph) -> usize {
+    let sigmoid_ids: Vec<NodeId> = graph
+        .nodes
+        .iter()
+        .filter_map(|(id, node)| {
+            (node.op_type == "Sigmoid"
+                && (node.domain.is_empty() || node.domain == "ai.onnx")
+                && node.inputs.len() == 1
+                && node.outputs.len() == 1)
+                .then_some(id)
+        })
+        .collect();
+    let mut fused = 0;
+
+    for sigmoid_id in sigmoid_ids {
+        let Some(sigmoid) = graph.try_node(sigmoid_id) else {
+            continue;
+        };
+        let Some(x) = sigmoid.inputs[0] else {
+            continue;
+        };
+        let sigmoid_output = sigmoid.outputs[0];
+        if graph.outputs.contains(&sigmoid_output) {
+            continue;
+        }
+        let consumers = graph.value(sigmoid_output).consumers.clone();
+        if consumers.len() != 1 {
+            continue;
+        }
+        let mul_id = consumers[0];
+        let mul = graph.node(mul_id);
+        if mul.op_type != "Mul"
+            || !(mul.domain.is_empty() || mul.domain == "ai.onnx")
+            || mul.inputs.len() != 2
+            || mul.outputs.len() != 1
+            || !((mul.inputs[0] == Some(x) && mul.inputs[1] == Some(sigmoid_output))
+                || (mul.inputs[1] == Some(x) && mul.inputs[0] == Some(sigmoid_output)))
+        {
+            continue;
+        }
+
+        let mut silu = mul.clone();
+        silu.op_type = "Silu".to_string();
+        silu.domain = "com.microsoft".to_string();
+        silu.inputs = vec![Some(x)];
+        silu.attributes.clear();
+        graph.replace_node(mul_id, silu);
+        graph.remove_node(sigmoid_id);
+        fused += 1;
+    }
+
+    if fused != 0 {
+        graph
+            .opset_imports
+            .entry("com.microsoft".to_string())
+            .or_insert(1);
+    }
+    fused
+}
+
 impl Executor {
     /// Compile a graph + weights into a runnable executor on the CPU EP.
     pub(crate) fn build(
-        graph: Graph,
+        mut graph: Graph,
         weights: Arc<WeightStore>,
         ep: Arc<CpuExecutionProvider>,
     ) -> Result<Self> {
+        fuse_silu_patterns(&mut graph);
         // Topological order up front: also validates the graph is a DAG.
         let order = graph.topological_order()?;
 
@@ -3070,6 +3135,38 @@ pub(crate) fn auto_detect_cpu_ep() -> Result<Arc<CpuExecutionProvider>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fuses_only_single_consumer_silu_pattern() {
+        let mut graph = Graph::new();
+        let shape = vec![Dim::Static(2)];
+        let x = graph.create_named_value("x", DataType::Float32, shape.clone());
+        let sigmoid_out = graph.create_named_value("sigmoid", DataType::Float32, shape.clone());
+        let silu_out = graph.create_named_value("silu", DataType::Float32, shape);
+        graph.add_input(x);
+        graph.add_output(silu_out);
+        graph.insert_node(Node::new(
+            NodeId(0),
+            "Sigmoid",
+            vec![Some(x)],
+            vec![sigmoid_out],
+        ));
+        graph.insert_node(Node::new(
+            NodeId(0),
+            "Mul",
+            vec![Some(sigmoid_out), Some(x)],
+            vec![silu_out],
+        ));
+
+        assert_eq!(fuse_silu_patterns(&mut graph), 1);
+        assert_eq!(graph.num_nodes(), 1);
+        let fused = graph.nodes.values().next().unwrap();
+        assert_eq!(fused.op_type, "Silu");
+        assert_eq!(fused.domain, "com.microsoft");
+        assert_eq!(fused.inputs, vec![Some(x)]);
+        assert_eq!(fused.outputs, vec![silu_out]);
+        assert_eq!(graph.opset_imports["com.microsoft"], 1);
+    }
 
     /// Holden's precondition: the dispatch-boundary gate must reject a view that
     /// addresses bytes past its backing allocation, rather than letting a kernel

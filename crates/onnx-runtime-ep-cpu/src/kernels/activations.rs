@@ -1,7 +1,7 @@
 //! Attribute-driven f32 activation kernels.
 
 use onnx_runtime_ep_api::{Kernel, KernelFactory, Result, TensorMut, TensorView};
-use onnx_runtime_ir::Node;
+use onnx_runtime_ir::{DataType, Node};
 
 use super::{check_arity, to_dense_f32, write_dense_f32};
 
@@ -11,6 +11,7 @@ enum Activation {
     LeakyRelu { alpha: f32 },
     HardSigmoid { alpha: f32, beta: f32 },
     Swish { alpha: f32 },
+    Silu,
 }
 
 impl Activation {
@@ -20,6 +21,7 @@ impl Activation {
             Self::LeakyRelu { .. } => "LeakyRelu",
             Self::HardSigmoid { .. } => "HardSigmoid",
             Self::Swish { .. } => "Swish",
+            Self::Silu => "Silu",
         }
     }
 
@@ -52,7 +54,17 @@ impl Activation {
                 };
                 x * s
             }
+            Self::Silu => silu(x),
         }
+    }
+}
+
+fn silu(x: f32) -> f32 {
+    if x >= 0.0 {
+        x / (1.0 + (-x).exp())
+    } else {
+        let e = x.exp();
+        x * e / (1.0 + e)
     }
 }
 
@@ -64,6 +76,7 @@ pub struct EluFactory;
 pub struct LeakyReluFactory;
 pub struct HardSigmoidFactory;
 pub struct SwishFactory;
+pub struct SiluFactory;
 
 impl KernelFactory for EluFactory {
     fn create(&self, node: &Node, _shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
@@ -109,9 +122,22 @@ impl KernelFactory for SwishFactory {
     }
 }
 
+impl KernelFactory for SiluFactory {
+    fn create(&self, _node: &Node, _shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
+        Ok(Box::new(ActivationKernel {
+            activation: Activation::Silu,
+        }))
+    }
+}
+
 impl Kernel for ActivationKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         check_arity(self.activation.name(), inputs, outputs, 1, 1, 1)?;
+        if matches!(self.activation, Activation::Silu)
+            && silu_contiguous_f32(&inputs[0], &mut outputs[0])
+        {
+            return Ok(());
+        }
         let y = to_dense_f32(&inputs[0])?
             .into_iter()
             .map(|x| self.activation.apply(x))
@@ -122,6 +148,36 @@ impl Kernel for ActivationKernel {
     fn supports_strided_input(&self, _input_idx: usize) -> bool {
         true
     }
+}
+
+fn silu_contiguous_f32(input: &TensorView, output: &mut TensorMut) -> bool {
+    if input.dtype != DataType::Float32
+        || output.dtype != DataType::Float32
+        || input.shape != output.shape
+        || !input.is_contiguous()
+        || !output.is_contiguous()
+    {
+        return false;
+    }
+
+    let n = output.numel();
+    let bytes = n.saturating_mul(std::mem::size_of::<f32>());
+    let input_start = input.data_ptr::<f32>() as usize;
+    let input_end = input_start.saturating_add(bytes);
+    let output_start = output.data_ptr_mut::<f32>() as usize;
+    let output_end = output_start.saturating_add(bytes);
+    if output_start < input_end && input_start < output_end {
+        return false;
+    }
+
+    // SAFETY: executor bounds checks plus equal contiguous f32 shapes prove both
+    // pointers span n elements; the range check proves output does not alias input.
+    let input = unsafe { std::slice::from_raw_parts(input.data_ptr::<f32>(), n) };
+    let output = unsafe { std::slice::from_raw_parts_mut(output.data_ptr_mut::<f32>(), n) };
+    for (output, &input) in output.iter_mut().zip(input) {
+        *output = silu(input);
+    }
+    true
 }
 
 #[cfg(test)]
@@ -180,6 +236,42 @@ mod tests {
         let want2 = [-1.0 * sig(-2.0), 0.0, 2.0 * sig(4.0)];
         for (g, w) in out.to_f32().iter().zip(&want2) {
             assert!((g - w).abs() < 1e-6, "got {g}, want {w}");
+        }
+    }
+
+    #[test]
+    fn silu_contiguous_matches_reference() {
+        let x = Owned::f32(&[6], &[-100.0, -2.0, -0.0, 0.0, 2.0, 100.0]);
+        let mut out = Owned::zeros_f32(&[6]);
+        ActivationKernel {
+            activation: Activation::Silu,
+        }
+        .execute(&[x.view()], &mut [out.view_mut()])
+        .unwrap();
+        for (got, input) in out
+            .to_f32()
+            .into_iter()
+            .zip([-100.0f32, -2.0, -0.0, 0.0, 2.0, 100.0])
+        {
+            let want = input * (1.0 / (1.0 + (-input).exp()));
+            assert!((got - want).abs() < 1e-6, "got {got}, want {want}");
+        }
+    }
+
+    #[test]
+    fn silu_strided_falls_back_correctly() {
+        let mut x = Owned::f32(&[2, 2], &[-2.0, -1.0, 1.0, 2.0]);
+        x.strides = vec![1, 2];
+        let mut out = Owned::zeros_f32(&[2, 2]);
+        ActivationKernel {
+            activation: Activation::Silu,
+        }
+        .execute(&[x.view()], &mut [out.view_mut()])
+        .unwrap();
+        let logical = [-2.0f32, 1.0, -1.0, 2.0];
+        for (got, input) in out.to_f32().into_iter().zip(logical) {
+            let want = input * (1.0 / (1.0 + (-input).exp()));
+            assert!((got - want).abs() < 1e-6, "got {got}, want {want}");
         }
     }
 }

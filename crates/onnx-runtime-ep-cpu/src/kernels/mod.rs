@@ -290,6 +290,10 @@ pub fn build_cpu_registry() -> OpRegistry {
         Box::new(contrib_fused::QuickGeluFactory),
     );
     reg.register(
+        OpKey::new("Silu", "com.microsoft", 1),
+        Box::new(activations::SiluFactory),
+    );
+    reg.register(
         OpKey::new("SkipLayerNormalization", "com.microsoft", 1),
         Box::new(contrib_fused::SkipLayerNormFactory),
     );
@@ -1216,8 +1220,8 @@ mod tests {
         // four more default-domain entries not in `PHASE1_OPS`; `Softmax` and
         // `LogSoftmax` each have a legacy and an opset-13 entry. Five contrib
         // (`com.microsoft`) fused transformer entries (BiasGelu, FastGelu,
-        // QuickGelu, SkipLayerNormalization, SimplifiedLayerNormalization,
-        // SkipSimplifiedLayerNormalization) add six more; `MoE` and
+        // QuickGelu, Silu, SkipLayerNormalization, SimplifiedLayerNormalization,
+        // SkipSimplifiedLayerNormalization) add seven more; `MoE` and
         // `GroupQueryAttention` add one contrib entry each.
         // QuantizeLinear and
         // DequantizeLinear each add six versioned entries, while
@@ -1231,7 +1235,7 @@ mod tests {
         // registrations over the Phase-1 op-name count in total.
         // MatMulNBits and GroupQueryAttention each add one more contrib-domain
         // registration.
-        assert_eq!(reg.len(), PHASE1_OPS.len() + 51);
+        assert_eq!(reg.len(), PHASE1_OPS.len() + 52);
         for op in PHASE1_OPS {
             assert!(reg.lookup(op, "", 21).is_some(), "missing factory for {op}");
         }
@@ -1268,6 +1272,7 @@ mod tests {
             "BiasGelu",
             "FastGelu",
             "QuickGelu",
+            "Silu",
             "SkipLayerNormalization",
             "SimplifiedLayerNormalization",
             "SkipSimplifiedLayerNormalization",

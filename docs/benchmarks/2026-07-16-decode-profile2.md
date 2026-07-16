@@ -88,3 +88,45 @@ medians. The robust result is Mul's 92% local reduction and the corresponding
    accumulation accuracy.
 5. **GroupQueryAttention including RoPE work (3.1%)** — optimize only after the
    projection and SiLU opportunities.
+
+## Follow-up: fuse the verified SiLU decomposition
+
+Graph inspection found 24 `Sigmoid` nodes, one per transformer layer. Every
+Sigmoid consumes a gate-projection output, has exactly one consumer, and feeds a
+`Mul` whose other input is that same gate-projection value:
+
+```text
+gate ───────────────┐
+  └─ Sigmoid(gate) ─┴─ Mul → SiLU(gate)
+```
+
+The executor now lowers only that exact single-consumer pattern to
+`com.microsoft::Silu`. The CPU kernel writes the contiguous f32 result directly
+to the executor-owned output buffer after equal-shape, contiguity, dtype, and
+non-alias checks. Strided and other non-fast-path inputs retain the dense
+fallback. This removes the intermediate Sigmoid tensor and one dispatch per
+layer; unrelated Sigmoid and Mul nodes are unchanged.
+
+Fresh five-process samples used the same `RAYON_NUM_THREADS=24`, four-token,
+three-warmup, ten-run harness:
+
+| version | median tok/s | median ms/step | change |
+|---|---:|---:|---:|
+| contiguous f32 Mul baseline | 44.53 | 22.455 | — |
+| fused SiLU | **45.69** | **21.887** | **+2.6% tok/s** |
+
+Host load was visibly noisy (individual fused runs ranged from 43.29 to
+49.35 tok/s), so the per-op profile is the stronger local signal. Medians from
+60 one-token invocations were:
+
+| op/category | before median ms (%) | after median ms (%) |
+|---|---:|---:|
+| Sigmoid | 1.486 (6.55%) | **removed (0%)** |
+| fused Silu | — | **0.658 (3.40%)** |
+| Mul | 0.225 (0.99%, 48 calls) | 0.127 (0.65%, 24 calls) |
+
+The fused kernel replaces the 24 Sigmoid calls and the 24 self-multiply calls;
+the remaining 24 Mul calls are the SwiGLU product with `up_proj`. Compared with
+the former Sigmoid plus half of Mul time, the fused local path is about 59%
+faster. Greedy output remained `[11576, 42740, 11, 358]` in every throughput
+run.
