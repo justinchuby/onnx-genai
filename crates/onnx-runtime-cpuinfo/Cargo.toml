@@ -19,5 +19,5 @@ thiserror = { workspace = true }
 
 [build-dependencies]
 cmake = "0.1"
-bindgen = "0.71"
+bindgen = "0.72"
 cc = "1"

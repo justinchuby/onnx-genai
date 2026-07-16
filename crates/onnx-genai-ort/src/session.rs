@@ -187,6 +187,12 @@ impl Session {
         }
 
         let session_options = RawSessionOptions::new(env, &options)?;
+        #[cfg(windows)]
+        let path_c: Vec<u16> = {
+            use std::os::windows::ffi::OsStrExt;
+            path.as_os_str().encode_wide().chain(std::iter::once(0)).collect()
+        };
+        #[cfg(not(windows))]
         let path_c = CString::new(path.to_string_lossy().as_bytes())
             .map_err(|_| OrtError::InvalidArgument("model path contains NUL".into()))?;
         let mut ptr = std::ptr::null_mut();
