@@ -237,6 +237,19 @@ fn random_case(format: &str, k: usize, n: usize) -> (Vec<f32>, Vec<u8>, Vec<f32>
             for byte in &mut block[1..] {
                 *byte = random_u32(&mut state) as u8;
             }
+        } else if format == "iq1_m" {
+            for byte in &mut *block {
+                *byte = random_u32(&mut state) as u8;
+            }
+            let scale =
+                half::f16::from_f32(0.002 + random_u32(&mut state) as f32 / u32::MAX as f32 * 0.05);
+            for index in 0..4 {
+                let offset = 48 + index * 2;
+                let packed = u16::from_le_bytes([block[offset], block[offset + 1]]);
+                let scale_nibble = (scale.to_bits() >> (4 * index)) & 0x0f;
+                block[offset..offset + 2]
+                    .copy_from_slice(&((packed & 0x0fff) | (scale_nibble << 12)).to_le_bytes());
+            }
         } else {
             let scale =
                 half::f16::from_f32(0.002 + random_u32(&mut state) as f32 / u32::MAX as f32 * 0.05);
@@ -265,7 +278,8 @@ fn block_quantized_gemv_random_supported_formats_match_cpu() {
     let Some(ep) = gpu() else { return };
     let (k, n) = (1003usize, 37usize);
     for format in [
-        "mxfp4", "iq4_nl", "iq4_xs", "iq2_xxs", "iq3_xxs", "iq2_xs", "iq2_s", "iq3_s",
+        "mxfp4", "iq4_nl", "iq4_xs", "iq2_xxs", "iq3_xxs", "iq2_xs", "iq2_s", "iq3_s", "iq1_s",
+        "iq1_m",
     ] {
         let (qk, block_bytes) = format_info(format);
         let packed_shape = [n, k.div_ceil(qk), block_bytes];
@@ -287,7 +301,8 @@ fn block_quantized_gemv_dequant_is_bit_exact_against_cpu() {
     let Some(ep) = gpu() else { return };
     let n = 2usize;
     for format in [
-        "mxfp4", "iq4_nl", "iq4_xs", "iq2_xxs", "iq3_xxs", "iq2_xs", "iq2_s", "iq3_s",
+        "mxfp4", "iq4_nl", "iq4_xs", "iq2_xxs", "iq3_xxs", "iq2_xs", "iq2_s", "iq3_s", "iq1_s",
+        "iq1_m",
     ] {
         let (qk, block_bytes) = format_info(format);
         let k = qk;
@@ -403,27 +418,67 @@ fn block_quantized_known_blocks_match_cpu_semantics_on_gpu() {
 }
 
 #[test]
+fn block_quantized_iq1_known_blocks_match_cpu_semantics_on_gpu() {
+    let Some(ep) = gpu() else { return };
+    let cases = [
+        (
+            "iq1_s",
+            {
+                let mut block = vec![0u8; 50];
+                block[..2].copy_from_slice(&half::f16::from_f32(2.0).to_le_bytes());
+                block[4] = 0xff;
+                block[34..36].copy_from_slice(&0xa1c0u16.to_le_bytes());
+                block
+            },
+            [-11.25f32, -11.25, 8.75, -11.25],
+        ),
+        (
+            "iq1_m",
+            {
+                let mut block = vec![0u8; 56];
+                block[1] = 0xff;
+                block[2] = 0xff;
+                block[32] = 0xf0;
+                block[33] = 0x8f;
+                block[48..56].copy_from_slice(&[0x1a, 0, 0, 0, 0, 0, 0, 0x40]);
+                block
+            },
+            [-8.75f32, 8.75, 12.25, -15.75],
+        ),
+    ];
+    for (format, packed, expected) in cases {
+        let packed_shape = [1, 1, packed.len()];
+        let (qk, _) = format_info(format);
+        let (graph, node) = model_node(format, &[1, qk], &packed_shape, &[1, 1], qk, 1, false);
+        for (depth, expected) in [0usize, 8, 16, 24].into_iter().zip(expected) {
+            let mut activation = vec![0.0f32; qk];
+            activation[depth] = 1.0;
+            let inputs = [
+                HostTensor::f32(&[1, qk], &activation),
+                HostTensor::u8(&packed_shape, &packed),
+            ];
+            let cpu = run_cpu(&graph, node, &inputs, &[1, 1]);
+            let cuda = run_gpu(&ep, &graph, node, &inputs, &[1, 1]).unwrap();
+            assert_eq!(cpu, [expected], "{format} depth {depth} CPU");
+            assert_eq!(cuda, [expected], "{format} depth {depth} CUDA");
+        }
+    }
+}
+
+#[test]
 fn unsupported_formats_and_prefill_route_away_from_cuda() {
     let Some(ep) = gpu() else { return };
-    let (graph, node) = model_node("mxfp4", &[1, 32], &[1, 1, 17], &[1, 1], 32, 1, false);
-    let model = Model::new(&graph);
-    assert!(matches!(
-        ep.supports_op(
-            model.graph.node(node),
-            &[static_shape([1, 32]), static_shape([1, 1, 17])],
-            &[]
-        ),
-        KernelMatch::Supported { .. }
-    ));
-
-    for format in ["iq1_s", "iq1_m"] {
-        let (_, block_bytes) = format_info(format);
+    for format in [
+        "mxfp4", "iq4_nl", "iq4_xs", "iq2_xxs", "iq3_xxs", "iq2_xs", "iq2_s", "iq3_s", "iq1_s",
+        "iq1_m",
+    ] {
+        let (qk, block_bytes) = format_info(format);
         let (graph, node) = model_node(
             format,
-            &[1, 256],
+            &[1, qk],
             &[1, 1, block_bytes],
             &[1, 1],
-            256,
+            qk,
             1,
             false,
         );
@@ -431,21 +486,43 @@ fn unsupported_formats_and_prefill_route_away_from_cuda() {
         assert!(matches!(
             ep.supports_op(
                 model.graph.node(node),
-                &[static_shape([1, 256]), static_shape([1, 1, block_bytes])],
+                &[static_shape([1, qk]), static_shape([1, 1, block_bytes])],
+                &[]
+            ),
+            KernelMatch::Supported { .. }
+        ));
+    }
+
+    let (graph, node) = model_node("q4_0", &[1, 32], &[1, 1, 18], &[1, 1], 32, 1, false);
+    let model = Model::new(&graph);
+    assert!(matches!(
+        ep.supports_op(
+            model.graph.node(node),
+            &[static_shape([1, 32]), static_shape([1, 1, 18])],
+            &[]
+        ),
+        KernelMatch::Unsupported
+    ));
+
+    for format in ["mxfp4", "iq1_s", "iq1_m"] {
+        let (qk, block_bytes) = format_info(format);
+        let (graph, node) = model_node(
+            format,
+            &[2, qk],
+            &[1, 1, block_bytes],
+            &[2, 1],
+            qk,
+            1,
+            false,
+        );
+        let model = Model::new(&graph);
+        assert!(matches!(
+            ep.supports_op(
+                model.graph.node(node),
+                &[static_shape([2, qk]), static_shape([1, 1, block_bytes])],
                 &[]
             ),
             KernelMatch::Unsupported
         ));
     }
-
-    let (graph, node) = model_node("mxfp4", &[2, 32], &[1, 1, 17], &[2, 1], 32, 1, false);
-    let model = Model::new(&graph);
-    assert!(matches!(
-        ep.supports_op(
-            model.graph.node(node),
-            &[static_shape([2, 32]), static_shape([1, 1, 17])],
-            &[]
-        ),
-        KernelMatch::Unsupported
-    ));
 }
