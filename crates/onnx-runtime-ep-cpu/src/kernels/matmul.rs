@@ -13,8 +13,11 @@
 //!   [`crate::kernels::onednn`], statically linked.
 //!
 //! The batched / broadcast / 1-D-vector handling in [`matmul_dense`] is
-//! backend-agnostic; only the inner 2-D tile GEMM changes. Nothing above the
-//! [`Kernel`] trait — not the provider, not the session — needs to change.
+//! backend-agnostic; only the inner 2-D tile GEMM changes. The session also
+//! marks graph-initializer inputs so this kernel can safely prepack constants.
+
+use std::borrow::Cow;
+use std::sync::OnceLock;
 
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ir::{Node, broadcast_shapes, compute_contiguous_strides};
@@ -25,15 +28,57 @@ use crate::backend::CpuBackend;
 use crate::dtype::{to_dense_f32_widen, write_dense_f32_narrow};
 use crate::strided::{next_index, numel};
 
-/// Stateless f32 MatMul kernel.
-pub struct MatMulKernel;
+/// Per-kernel cache for immutable MatMul operands that require materialization.
+///
+/// Contiguous f32 constants already have the ideal representation, so they stay
+/// zero-copy and need no owned cache entry.
+#[derive(Default)]
+pub(crate) struct MatMulPrepack {
+    constant_inputs: [bool; 2],
+    dense: [OnceLock<Vec<f32>>; 2],
+}
+
+impl MatMulPrepack {
+    pub(crate) fn set_constant_inputs(&mut self, constant_inputs: &[bool]) {
+        for (index, is_constant) in self.constant_inputs.iter_mut().enumerate() {
+            *is_constant = constant_inputs.get(index).copied().unwrap_or(false);
+        }
+    }
+
+    fn dense<'a>(&'a self, index: usize, view: &'a TensorView<'_>) -> Result<Cow<'a, [f32]>> {
+        if !self.constant_inputs[index] {
+            return to_dense_f32_widen("MatMul", view);
+        }
+        if let Some(cached) = self.dense[index].get() {
+            return Ok(Cow::Borrowed(cached));
+        }
+
+        match to_dense_f32_widen("MatMul", view)? {
+            Cow::Borrowed(dense) => Ok(Cow::Borrowed(dense)),
+            Cow::Owned(dense) => {
+                let _ = self.dense[index].set(dense);
+                Ok(Cow::Borrowed(
+                    self.dense[index]
+                        .get()
+                        .expect("constant MatMul prepack was just initialized"),
+                ))
+            }
+        }
+    }
+}
+
+/// f32 MatMul kernel with initializer-only operand prepacking.
+#[derive(Default)]
+pub struct MatMulKernel {
+    prepack: MatMulPrepack,
+}
 
 /// Factory for [`MatMulKernel`] (no attributes).
 pub struct MatMulFactory;
 
 impl KernelFactory for MatMulFactory {
     fn create(&self, _node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
-        Ok(Box::new(MatMulKernel))
+        Ok(Box::new(MatMulKernel::default()))
     }
 }
 
@@ -156,9 +201,13 @@ fn micro_kernel(
 }
 
 impl Kernel for MatMulKernel {
+    fn set_constant_inputs(&mut self, constant_inputs: &[bool]) {
+        self.prepack.set_constant_inputs(constant_inputs);
+    }
+
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         check_arity("MatMul", inputs, outputs, 2, 2, 1)?;
-        let out = matmul_dense(&inputs[0], &inputs[1])?;
+        let out = matmul_dense_prepacked(&inputs[0], &inputs[1], &self.prepack)?;
         // If either operand was 1-D, the corresponding size-1 axis is squeezed
         // out of the result; the narrowing writer uses the output view's own
         // shape and dtype (f32/f16/bf16/f64), so the buffer matches element for
@@ -183,9 +232,28 @@ impl Kernel for MatMulKernel {
 /// (standard mixed-precision matmul). Shared by [`MatMulKernel`] and the fused
 /// `FusedMatMulBias` kernel so both go through exactly one GEMM implementation.
 pub(crate) fn matmul_dense(a: &TensorView, b: &TensorView) -> Result<Vec<f32>> {
-    let a_dense = to_dense_f32_widen("MatMul", a)?;
-    let b_dense = to_dense_f32_widen("MatMul", b)?;
+    matmul_dense_impl(
+        a,
+        b,
+        to_dense_f32_widen("MatMul", a)?,
+        to_dense_f32_widen("MatMul", b)?,
+    )
+}
 
+pub(crate) fn matmul_dense_prepacked(
+    a: &TensorView,
+    b: &TensorView,
+    prepack: &MatMulPrepack,
+) -> Result<Vec<f32>> {
+    matmul_dense_impl(a, b, prepack.dense(0, a)?, prepack.dense(1, b)?)
+}
+
+fn matmul_dense_impl(
+    a: &TensorView,
+    b: &TensorView,
+    a_dense: Cow<'_, [f32]>,
+    b_dense: Cow<'_, [f32]>,
+) -> Result<Vec<f32>> {
     // Promote 1-D operands per numpy matmul: a [K] -> [1,K] (drop row after),
     // b [K] -> [K,1] (drop col after).
     let a_raw = a.shape;
@@ -306,7 +374,7 @@ mod tests {
         let a = Owned::f32(&[2, 3], &[1., 2., 3., 4., 5., 6.]);
         let b = Owned::f32(&[3, 2], &[7., 8., 9., 10., 11., 12.]);
         let mut out = Owned::zeros_f32(&[2, 2]);
-        MatMulKernel
+        MatMulKernel::default()
             .execute(&[a.view(), b.view()], &mut [out.view_mut()])
             .unwrap();
         assert_eq!(out.to_f32(), vec![58., 64., 139., 154.]);
@@ -320,7 +388,7 @@ mod tests {
         let a = Owned::f32(&[2, 3], &[1., 2., 3., 4., 5., 6.]);
         let b = Owned::f32(&[2, 3], &[7., 9., 11., 8., 10., 12.]).with_view(&[3, 2], &[1, 3]);
         let mut out = Owned::zeros_f32(&[2, 2]);
-        MatMulKernel
+        MatMulKernel::default()
             .execute(&[a.view(), b.view()], &mut [out.view_mut()])
             .unwrap();
         // Same as the contiguous case above.
@@ -333,7 +401,7 @@ mod tests {
         let a = Owned::f32(&[2, 2, 2], &[1., 2., 3., 4., 5., 6., 7., 8.]);
         let b = Owned::f32(&[2, 2, 2], &[1., 0., 0., 1., 2., 0., 0., 2.]);
         let mut out = Owned::zeros_f32(&[2, 2, 2]);
-        MatMulKernel
+        MatMulKernel::default()
             .execute(&[a.view(), b.view()], &mut [out.view_mut()])
             .unwrap();
         // batch0: A@I = A; batch1: [[5,6],[7,8]]*2 = [[10,12],[14,16]]
@@ -346,7 +414,7 @@ mod tests {
         let a = Owned::f32(&[2, 2, 2], &[1., 2., 3., 4., 5., 6., 7., 8.]);
         let b = Owned::f32(&[2, 2], &[1., 0., 0., 1.]); // identity
         let mut out = Owned::zeros_f32(&[2, 2, 2]);
-        MatMulKernel
+        MatMulKernel::default()
             .execute(&[a.view(), b.view()], &mut [out.view_mut()])
             .unwrap();
         assert_eq!(out.to_f32(), vec![1., 2., 3., 4., 5., 6., 7., 8.]);
@@ -358,7 +426,7 @@ mod tests {
         let a = Owned::f32(&[3], &[1., 2., 3.]);
         let b = Owned::f32(&[3, 2], &[7., 8., 9., 10., 11., 12.]);
         let mut out = Owned::zeros_f32(&[2]);
-        MatMulKernel
+        MatMulKernel::default()
             .execute(&[a.view(), b.view()], &mut [out.view_mut()])
             .unwrap();
         // [1*7+2*9+3*11, 1*8+2*10+3*12] = [58, 64]
@@ -371,7 +439,7 @@ mod tests {
         let a = Owned::f16(&[2, 3], &[1., 2., 3., 4., 5., 6.]);
         let b = Owned::f16(&[3, 2], &[7., 8., 9., 10., 11., 12.]);
         let mut out = Owned::zeros(onnx_runtime_ir::DataType::Float16, &[2, 2]);
-        MatMulKernel
+        MatMulKernel::default()
             .execute(&[a.view(), b.view()], &mut [out.view_mut()])
             .unwrap();
         assert_eq!(out.to_f16_as_f32(), vec![58., 64., 139., 154.]);
@@ -382,7 +450,7 @@ mod tests {
         let a = Owned::bf16(&[2, 2, 2], &[1., 2., 3., 4., 5., 6., 7., 8.]);
         let b = Owned::bf16(&[2, 2, 2], &[1., 0., 0., 1., 2., 0., 0., 2.]);
         let mut out = Owned::zeros(onnx_runtime_ir::DataType::BFloat16, &[2, 2, 2]);
-        MatMulKernel
+        MatMulKernel::default()
             .execute(&[a.view(), b.view()], &mut [out.view_mut()])
             .unwrap();
         assert_eq!(
@@ -396,7 +464,7 @@ mod tests {
         let a = Owned::i32(&[2, 2], &[1, 2, 3, 4]);
         let b = Owned::i32(&[2, 2], &[1, 0, 0, 1]);
         let mut out = Owned::zeros(onnx_runtime_ir::DataType::Int32, &[2, 2]);
-        let err = MatMulKernel
+        let err = MatMulKernel::default()
             .execute(&[a.view(), b.view()], &mut [out.view_mut()])
             .unwrap_err();
         assert!(format!("{err}").contains("WHAT"));
@@ -440,7 +508,7 @@ mod tests {
             let a = Owned::f32(&[m, k], &a_data);
             let b = Owned::f32(&[k, n], &b_data);
             let mut out = Owned::zeros_f32(&[m, n]);
-            MatMulKernel
+            MatMulKernel::default()
                 .execute(&[a.view(), b.view()], &mut [out.view_mut()])
                 .unwrap();
 
@@ -458,5 +526,33 @@ mod tests {
         }
 
         println!("generic MatMul max abs error: {overall_max_abs_error}");
+    }
+
+    #[test]
+    fn constant_weight_prepack_reuses_weight_and_keeps_activation_live() {
+        let mut kernel = MatMulKernel::default();
+        kernel.set_constant_inputs(&[false, true]);
+        let weight = Owned::f16(&[2, 2], &[2., 0., 0., 3.]);
+
+        let a1 = Owned::f32(&[1, 2], &[1., 2.]);
+        let mut out1 = Owned::zeros_f32(&[1, 2]);
+        kernel
+            .execute(&[a1.view(), weight.view()], &mut [out1.view_mut()])
+            .unwrap();
+        assert_eq!(out1.to_f32(), vec![2., 6.]);
+        assert!(kernel.prepack.dense[1].get().is_some());
+        assert!(kernel.prepack.dense[0].get().is_none());
+
+        let cached_weight = kernel.prepack.dense[1].get().unwrap().as_ptr();
+        let a2 = Owned::f32(&[1, 2], &[4., 5.]);
+        let mut out2 = Owned::zeros_f32(&[1, 2]);
+        kernel
+            .execute(&[a2.view(), weight.view()], &mut [out2.view_mut()])
+            .unwrap();
+        assert_eq!(out2.to_f32(), vec![8., 15.]);
+        assert_eq!(
+            kernel.prepack.dense[1].get().unwrap().as_ptr(),
+            cached_weight
+        );
     }
 }

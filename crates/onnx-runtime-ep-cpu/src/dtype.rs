@@ -32,6 +32,8 @@
 //! element's [`NumericElem::Acc`], write with [`write_dense`], and wrap the body
 //! in the appropriate `dispatch_*` macro.
 
+use std::borrow::Cow;
+
 use onnx_runtime_ep_api::{EpError, Result, TensorMut, TensorView};
 use onnx_runtime_ir::DataType;
 
@@ -469,13 +471,27 @@ macro_rules! dispatch_float {
     }};
 }
 
-/// Widen any supported float view (`f32`/`f16`/`bf16`/`f64`) to a dense
-/// `Vec<f32>` for the MatMul/Gemm f32-accumulate path. Rejects non-float dtypes
-/// with a RULE #1 error.
-pub fn to_dense_f32_widen(op: &str, view: &TensorView) -> Result<Vec<f32>> {
+/// Borrow a contiguous f32 view zero-copy, or materialize/widen any other
+/// supported float view (`f16`/`bf16`/`f64` or strided f32) into dense f32.
+/// Rejects non-float dtypes with a RULE #1 error.
+pub fn to_dense_f32_widen<'a>(op: &str, view: &'a TensorView<'_>) -> Result<Cow<'a, [f32]>> {
+    if view.dtype == DataType::Float32 && view.is_contiguous() {
+        view.validate()?;
+        let len = view.numel();
+        if len == 0 {
+            return Ok(Cow::Borrowed(&[]));
+        }
+        // SAFETY: a validated contiguous Float32 view describes exactly `len`
+        // initialized f32 elements starting at `data_ptr`; the TensorView
+        // contract keeps that storage alive for the duration of this borrow.
+        let data = unsafe { std::slice::from_raw_parts(view.data_ptr::<f32>(), len) };
+        return Ok(Cow::Borrowed(data));
+    }
     dispatch_float!(view.dtype, op, T => {
         let raw = to_dense_float::<T>(view)?;
-        Ok(raw.into_iter().map(|v| v.to_f32()).collect())
+        Ok(Cow::Owned(
+            raw.into_iter().map(|v| v.to_f32()).collect(),
+        ))
     })
 }
 

@@ -19,27 +19,34 @@ use onnx_runtime_ep_api::{Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ir::Node;
 
 use super::add::broadcast_apply;
-use super::matmul::matmul_dense;
+use super::matmul::{MatMulPrepack, matmul_dense_prepacked};
 use super::relu::relu_in_place;
 use super::{check_arity, to_dense_f32, write_dense_f32};
 
-/// Stateless f32 `Relu(MatMul(A, B) + bias)` kernel.
-pub struct FusedGemmKernel;
+/// f32 `Relu(MatMul(A, B) + bias)` kernel with initializer-only prepacking.
+#[derive(Default)]
+pub struct FusedGemmKernel {
+    prepack: MatMulPrepack,
+}
 
 /// Factory for [`FusedGemmKernel`] (no attributes).
 pub struct FusedGemmFactory;
 
 impl KernelFactory for FusedGemmFactory {
     fn create(&self, _node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
-        Ok(Box::new(FusedGemmKernel))
+        Ok(Box::new(FusedGemmKernel::default()))
     }
 }
 
 impl Kernel for FusedGemmKernel {
+    fn set_constant_inputs(&mut self, constant_inputs: &[bool]) {
+        self.prepack.set_constant_inputs(constant_inputs);
+    }
+
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         check_arity("FusedGemm", inputs, outputs, 3, 3, 1)?;
         // MatMul(A, B) into a dense buffer laid out over the output shape.
-        let mut out = matmul_dense(&inputs[0], &inputs[1])?;
+        let mut out = matmul_dense_prepacked(&inputs[0], &inputs[1], &self.prepack)?;
         // Broadcast-add the bias in place, matching a standalone `Add`.
         let bias = to_dense_f32(&inputs[2])?;
         let bias_shape = inputs[2].shape;
@@ -68,7 +75,7 @@ mod tests {
         let b = Owned::f32(&[3, 2], &[7., 8., 9., 10., 11., 12.]);
         let bias = Owned::f32(&[2], &[-60., 20.]);
         let mut out = Owned::zeros_f32(&[2, 2]);
-        FusedGemmKernel
+        FusedGemmKernel::default()
             .execute(&[a.view(), b.view(), bias.view()], &mut [out.view_mut()])
             .unwrap();
         assert_eq!(out.to_f32(), vec![0., 84., 79., 174.]);
@@ -88,7 +95,7 @@ mod tests {
 
         // Reference: MatMul -> Add -> Relu.
         let mut mm = Owned::zeros_f32(&[2, 3]);
-        MatMulKernel
+        MatMulKernel::default()
             .execute(&[a.view(), b.view()], &mut [mm.view_mut()])
             .unwrap();
         let mut biased = mm.to_f32();
@@ -104,7 +111,7 @@ mod tests {
             .unwrap();
 
         let mut out = Owned::zeros_f32(&[2, 3]);
-        FusedGemmKernel
+        FusedGemmKernel::default()
             .execute(&[a.view(), b.view(), bias.view()], &mut [out.view_mut()])
             .unwrap();
         assert_eq!(out.to_f32(), expect.to_f32());
@@ -119,7 +126,7 @@ mod tests {
         let b = Owned::f32(&[2, 2], &[1., 0., 0., 1.]); // identity
         let bias = Owned::f32(&[2], &[-5., 3.]);
         let mut out = Owned::zeros_f32(&[2, 2, 2]);
-        FusedGemmKernel
+        FusedGemmKernel::default()
             .execute(&[a.view(), b.view(), bias.view()], &mut [out.view_mut()])
             .unwrap();
         // A + [-5, 3] across last axis, then Relu:

@@ -18,6 +18,7 @@ bench-native = [
     "dep:onnx-runtime-loader",
     "dep:onnx-runtime-session",
 ]
+onednn = ["onnx-runtime-ep-cpu/onednn"]
 
 [dependencies]
 anyhow = { workspace = true }

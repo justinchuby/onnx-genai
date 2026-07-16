@@ -142,6 +142,7 @@ impl KernelCache {
         node_id: NodeId,
         node: &Node,
         input_shapes: &[Vec<usize>],
+        constant_inputs: &[bool],
         opset: u64,
         ep: &CpuExecutionProvider,
     ) -> Result<&dyn onnx_runtime_ep_api::Kernel> {
@@ -170,7 +171,8 @@ impl KernelCache {
                     ep.name(),
                 ));
             }
-            let kernel = ep.get_kernel(node, input_shapes, opset)?;
+            let mut kernel = ep.get_kernel(node, input_shapes, opset)?;
+            kernel.set_constant_inputs(constant_inputs);
             self.entries.insert(key.clone(), kernel);
             self.misses += 1;
         }
@@ -892,10 +894,21 @@ impl Executor {
                 continue;
             }
             let input_shapes = Self::node_input_shapes(&self.plan[i], resolved);
+            let constant_inputs: Vec<bool> = self.plan[i]
+                .inputs
+                .iter()
+                .map(|input| input.is_some_and(|vid| self.graph.initializers.contains_key(&vid)))
+                .collect();
             let node = self.graph.node(node_id);
             let opset = effective_opset(&self.graph, node);
-            self.cache
-                .get_or_create(node_id, node, &input_shapes, opset, &self.ep)?;
+            self.cache.get_or_create(
+                node_id,
+                node,
+                &input_shapes,
+                &constant_inputs,
+                opset,
+                &self.ep,
+            )?;
         }
         Ok(())
     }
@@ -1274,7 +1287,12 @@ impl Executor {
 
         let node = graph.node(node_id);
         let opset = effective_opset(graph, node);
-        let kernel = cache.get_or_create(node_id, node, &input_shapes, opset, &ep)?;
+        let constant_inputs: Vec<bool> = inputs
+            .iter()
+            .map(|input| input.is_some_and(|vid| graph.initializers.contains_key(&vid)))
+            .collect();
+        let kernel =
+            cache.get_or_create(node_id, node, &input_shapes, &constant_inputs, opset, &ep)?;
 
         // --- Zero-copy view fast path ---------------------------------------
         // Ask the kernel whether its outputs are strided views over its inputs

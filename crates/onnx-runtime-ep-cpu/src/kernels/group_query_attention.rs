@@ -161,7 +161,7 @@ impl Bhsd {
             )));
         }
         Ok(Self {
-            data: to_dense_f32_widen("GroupQueryAttention", view)?,
+            data: to_dense_f32_widen("GroupQueryAttention", view)?.into_owned(),
             batch: view.shape[0],
             heads,
             seq: view.shape[2],

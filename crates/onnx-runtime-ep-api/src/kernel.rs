@@ -117,6 +117,15 @@ pub struct ViewOutput {
 
 /// A kernel ready to execute a specific op with specific shapes (§4.2).
 pub trait Kernel: Send {
+    /// Tell the kernel which positional inputs are immutable graph constants.
+    ///
+    /// The session calls this exactly once, immediately after construction.
+    /// Kernels may use it to prepack or memoize those inputs. Runtime inputs must
+    /// never be marked constant: caching them would return stale results.
+    fn set_constant_inputs(&mut self, constant_inputs: &[bool]) {
+        let _ = constant_inputs;
+    }
+
     /// Execute over device-resident inputs/outputs.
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()>;
 
