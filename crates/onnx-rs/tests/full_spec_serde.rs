@@ -279,6 +279,18 @@ fn full_spec_proto() -> ModelProto {
             g: Some(nested_graph),
             ..Default::default()
         },
+        AttributeProto {
+            name: "opaque_string".into(),
+            r#type: attribute_proto::AttributeType::String as i32,
+            s: vec![0xff, 0xfe],
+            ..Default::default()
+        },
+        AttributeProto {
+            name: "opaque_strings".into(),
+            r#type: attribute_proto::AttributeType::Strings as i32,
+            strings: vec![b"readable".to_vec(), vec![0xff]],
+            ..Default::default()
+        },
     ];
 
     ModelProto {
@@ -634,9 +646,43 @@ fn full_spec_is_lossless_across_all_three_textual_codecs() {
 #[test]
 fn readable_body_edits_are_authoritative_over_extensions() {
     let proto = full_spec_proto();
-    let model = Model::from_proto(proto).unwrap();
+    let model = Model::from_proto(proto.clone()).unwrap();
     let text = Text::serialize(&model, &Default::default()).unwrap();
-    let edited = text.replacen("full_graph (", "edited_graph (", 1);
+    assert!(text.contains("type_protos = <4 types>"), "{text}");
+    assert!(
+        text.contains("sparse_tensors = <1 sparse tensors>"),
+        "{text}"
+    );
+    assert!(text.contains("tensors = <1 tensors>"), "{text}");
+    assert!(text.contains("opaque_string = <2 bytes>"), "{text}");
+    assert!(text.contains("opaque_strings = <2 strings>"), "{text}");
+
+    let edited = text
+        .replacen("full_graph (", "edited_graph (", 1)
+        .replacen("bool[] cond", "int64[2] condition", 1)
+        .replacen("float[] sequence_input", "uint8[7] sequence_input", 1)
+        .replacen("(cond)", "(condition)", 1)
+        .replacen(
+            "external_tensor = <tensor float[[1]]>",
+            "external_tensor = <tensor int64[[2]]>",
+            1,
+        )
+        .replacen("sparse = <sparse tensor>", "sparse = <type>", 1)
+        .replacen("type_proto = <type>", "type_proto = <sparse tensor>", 1)
+        .replacen("<1 sparse tensors>", "<2 sparse tensors>", 1)
+        .replacen("<4 types>", "<2 types>", 1)
+        .replacen("<1 tensors>", "<2 tensors>", 1)
+        .replacen("opaque_string = <2 bytes>", "opaque_string = \"edited\"", 1)
+        .replacen(
+            "opaque_strings = <2 strings>",
+            "opaque_strings = [\"left\", \"right\"]",
+            1,
+        )
+        .replacen(
+            " () => () {",
+            " (int32[3] nested_value) => (int32[3] nested_value) {",
+            1,
+        );
     assert_ne!(edited, text);
 
     let parsed = Text::deserialize(&edited).unwrap();
@@ -644,8 +690,100 @@ fn readable_body_edits_are_authoritative_over_extensions() {
     let graph = parsed_proto.graph.as_ref().unwrap();
     assert_eq!(graph.name, "edited_graph");
     let node = &graph.node[0];
+    assert_eq!(graph.input[0].name, "condition");
+    let condition_type = graph.input[0].r#type.as_ref().unwrap();
+    let Some(type_proto::Value::TensorType(condition_type)) = &condition_type.value else {
+        panic!("edited graph input must be a tensor");
+    };
+    assert_eq!(
+        condition_type.elem_type,
+        tensor_proto::DataType::Int64 as i32
+    );
+    assert_eq!(
+        condition_type.shape.as_ref().unwrap().dim[0].value,
+        Some(tensor_shape_proto::dimension::Value::DimValue(2))
+    );
+    let sequence_type = graph.input[1].r#type.as_ref().unwrap();
+    let Some(type_proto::Value::TensorType(sequence_type)) = &sequence_type.value else {
+        panic!("edited container projection must become the readable tensor type");
+    };
+    assert_eq!(
+        sequence_type.elem_type,
+        tensor_proto::DataType::Uint8 as i32
+    );
+    assert_eq!(
+        sequence_type.shape.as_ref().unwrap().dim[0].value,
+        Some(tensor_shape_proto::dimension::Value::DimValue(7))
+    );
+    assert_eq!(node.input, ["condition"]);
+    assert_eq!(node_attribute(node, "type_protos").type_protos.len(), 2);
+    assert_eq!(
+        node_attribute(node, "type_protos").type_protos,
+        proto.graph.as_ref().unwrap().node[0]
+            .attribute
+            .iter()
+            .find(|attribute| attribute.name == "type_protos")
+            .unwrap()
+            .type_protos[..2]
+    );
+    assert_eq!(
+        node_attribute(node, "sparse_tensors").sparse_tensors.len(),
+        2
+    );
+    assert_eq!(
+        node_attribute(node, "sparse_tensors").sparse_tensors[0],
+        proto.graph.as_ref().unwrap().node[0]
+            .attribute
+            .iter()
+            .find(|attribute| attribute.name == "sparse_tensors")
+            .unwrap()
+            .sparse_tensors[0]
+    );
+    assert_eq!(node_attribute(node, "tensors").tensors.len(), 2);
+    assert_eq!(
+        node_attribute(node, "tensors").tensors[0],
+        proto.graph.as_ref().unwrap().node[0]
+            .attribute
+            .iter()
+            .find(|attribute| attribute.name == "tensors")
+            .unwrap()
+            .tensors[0]
+    );
+    assert_eq!(node_attribute(node, "opaque_string").s, b"edited".to_vec());
+    assert_eq!(
+        node_attribute(node, "opaque_strings").strings,
+        vec![b"left".to_vec(), b"right".to_vec()]
+    );
+    assert_eq!(
+        node_attribute(node, "sparse").r#type,
+        attribute_proto::AttributeType::TypeProto as i32
+    );
+    assert!(node_attribute(node, "sparse").tp.is_some());
+    assert!(node_attribute(node, "sparse").sparse_tensor.is_none());
+    assert_eq!(
+        node_attribute(node, "type_proto").r#type,
+        attribute_proto::AttributeType::SparseTensor as i32
+    );
+    assert!(node_attribute(node, "type_proto").sparse_tensor.is_some());
+    assert!(node_attribute(node, "type_proto").tp.is_none());
+    let tensor = node_attribute(node, "external_tensor").t.as_ref().unwrap();
+    assert_eq!(tensor.data_type, tensor_proto::DataType::Int64 as i32);
+    assert_eq!(tensor.dims, [2]);
+    let nested = node_attribute(node, "graph").g.as_ref().unwrap();
+    assert_eq!(nested.input[0].name, "nested_value");
+    assert_eq!(nested.output[0].name, "nested_value");
     assert_eq!(node.device_configurations.len(), 1);
     assert_eq!(parsed_proto.configuration[0].name, "mesh");
+
+    let unedited = Text::deserialize(&text).unwrap();
+    assert_proto_equal(&proto, &unedited);
+}
+
+fn node_attribute<'a>(node: &'a NodeProto, name: &str) -> &'a AttributeProto {
+    node.attribute
+        .iter()
+        .find(|attribute| attribute.name == name)
+        .unwrap_or_else(|| panic!("missing attribute {name}"))
 }
 
 #[test]

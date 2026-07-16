@@ -10,6 +10,8 @@ use crate::{Error, Result};
 
 pub(super) const BEGIN: &str = "__onnx_extensions_begin__";
 pub(super) const END: &str = "__onnx_extensions_end__";
+/// Invalid UTF-8 sentinel used only while merging an opaque readable placeholder.
+pub(super) const OPAQUE_PLACEHOLDER_BYTE: u8 = 0xff;
 
 /// Append only the schema fields that the compact graph DSL cannot express.
 ///
@@ -149,13 +151,24 @@ fn residual_value_info(mut value: ValueInfoProto) -> ValueInfoProto {
 }
 
 fn residual_type(mut value: TypeProto) -> TypeProto {
-    if let Some(type_proto::Value::TensorType(tensor)) = &mut value.value {
-        tensor.elem_type = 0;
-        if let Some(shape) = &mut tensor.shape {
-            for dim in &mut shape.dim {
-                dim.value = None;
+    match &mut value.value {
+        Some(type_proto::Value::TensorType(tensor)) => {
+            tensor.elem_type = 0;
+            if let Some(shape) = &mut tensor.shape {
+                for dim in &mut shape.dim {
+                    dim.value = None;
+                }
             }
         }
+        Some(type_proto::Value::SparseTensorType(tensor)) => {
+            tensor.elem_type = 0;
+            if let Some(shape) = &mut tensor.shape {
+                for dim in &mut shape.dim {
+                    dim.value = None;
+                }
+            }
+        }
+        _ => {}
     }
     value
 }
@@ -210,47 +223,47 @@ fn merge_node(mut residual: NodeProto, native: NodeProto) -> NodeProto {
     residual
 }
 
-fn merge_attribute(mut residual: AttributeProto, native: AttributeProto) -> AttributeProto {
+fn merge_attribute(residual: AttributeProto, mut native: AttributeProto) -> AttributeProto {
     use attribute_proto::AttributeType;
 
-    residual.name = native.name;
-    residual.r#type = native.r#type;
+    // Start from the readable attribute so its kind, value, and repeated
+    // cardinality always win. Add back only payload details the DSL omits.
+    native.ref_attr_name = residual.ref_attr_name;
+    native.doc_string = residual.doc_string;
     match AttributeType::try_from(native.r#type).unwrap_or(AttributeType::Undefined) {
-        AttributeType::Float => residual.f = native.f,
-        AttributeType::Int => residual.i = native.i,
-        AttributeType::String if residual.s.is_empty() => residual.s = native.s,
+        AttributeType::String if is_opaque_string_placeholder(&native.s) => {
+            let mut value = residual.s;
+            value.resize(native.s.len(), 0);
+            native.s = value;
+        }
         AttributeType::Tensor => {
-            residual.t = match (residual.t.take(), native.t) {
+            native.t = match (residual.t, native.t.take()) {
                 (Some(patch), Some(native)) => Some(merge_tensor(patch, native, false)),
                 (_, native) => native,
             }
         }
         AttributeType::Graph => {
-            residual.g = match (residual.g.take(), native.g) {
+            native.g = match (residual.g, native.g.take()) {
                 (Some(patch), Some(native)) => Some(merge_graph(patch, native, false)),
                 (_, native) => native,
             }
         }
-        AttributeType::Floats => residual.floats = native.floats,
-        AttributeType::Ints => residual.ints = native.ints,
-        AttributeType::Strings if residual.strings.is_empty() => residual.strings = native.strings,
+        AttributeType::SparseTensor => {
+            native.sparse_tensor = residual.sparse_tensor.or(native.sparse_tensor);
+        }
+        AttributeType::TypeProto => {
+            native.tp = residual.tp.or(native.tp);
+        }
+        AttributeType::Strings if is_opaque_strings_placeholder(&native.strings) => {
+            native.strings = merge_opaque_strings(residual.strings, native.strings.len());
+        }
         AttributeType::Tensors => {
-            residual.tensors = native
-                .tensors
-                .into_iter()
-                .enumerate()
-                .map(
-                    |(index, tensor)| match residual.tensors.get(index).cloned() {
-                        Some(patch) => patch,
-                        None => tensor,
-                    },
-                )
-                .collect();
+            native.tensors = merge_repeated(residual.tensors, native.tensors);
         }
         AttributeType::Graphs => {
-            residual.graphs = native
+            native.graphs = native
                 .graphs
-                .into_iter()
+                .drain(..)
                 .enumerate()
                 .map(|(index, graph)| match residual.graphs.get(index).cloned() {
                     Some(patch) => merge_graph(patch, graph, false),
@@ -258,15 +271,46 @@ fn merge_attribute(mut residual: AttributeProto, native: AttributeProto) -> Attr
                 })
                 .collect();
         }
+        AttributeType::SparseTensors => {
+            native.sparse_tensors = merge_repeated(residual.sparse_tensors, native.sparse_tensors);
+        }
+        AttributeType::TypeProtos => {
+            native.type_protos = merge_repeated(residual.type_protos, native.type_protos);
+        }
         AttributeType::Undefined
+        | AttributeType::Float
+        | AttributeType::Int
         | AttributeType::String
-        | AttributeType::SparseTensor
-        | AttributeType::TypeProto
-        | AttributeType::Strings
-        | AttributeType::SparseTensors
-        | AttributeType::TypeProtos => {}
+        | AttributeType::Floats
+        | AttributeType::Ints
+        | AttributeType::Strings => {}
     }
-    residual
+    native
+}
+
+fn is_opaque_string_placeholder(value: &[u8]) -> bool {
+    !value.is_empty() && value.iter().all(|byte| *byte == OPAQUE_PLACEHOLDER_BYTE)
+}
+
+fn is_opaque_strings_placeholder(values: &[Vec<u8>]) -> bool {
+    !values.is_empty()
+        && values
+            .iter()
+            .all(|value| value.as_slice() == [OPAQUE_PLACEHOLDER_BYTE])
+}
+
+fn merge_opaque_strings(residual: Vec<Vec<u8>>, native_len: usize) -> Vec<Vec<u8>> {
+    (0..native_len)
+        .map(|index| residual.get(index).cloned().unwrap_or_default())
+        .collect()
+}
+
+fn merge_repeated<T: Clone>(residual: Vec<T>, native: Vec<T>) -> Vec<T> {
+    native
+        .into_iter()
+        .enumerate()
+        .map(|(index, placeholder)| residual.get(index).cloned().unwrap_or(placeholder))
+        .collect()
 }
 
 fn merge_initializer(residual: TensorProto, native: TensorProto) -> TensorProto {
@@ -321,10 +365,39 @@ fn merge_type(mut residual: TypeProto, native: TypeProto) -> TypeProto {
                 (_, native) => native,
             };
         }
-        (None, native) => residual.value = native,
-        (Some(_), _) => {}
+        (
+            Some(type_proto::Value::SparseTensorType(patch)),
+            Some(type_proto::Value::SparseTensorType(native)),
+        ) => {
+            patch.elem_type = native.elem_type;
+            patch.shape = match (patch.shape.take(), native.shape) {
+                (Some(patch), Some(native)) => Some(merge_shape(patch, native)),
+                (_, native) => native,
+            };
+        }
+        (Some(value), Some(native))
+            if is_unrepresented_container(value) && is_native_placeholder(&native) => {}
+        (_, native) => residual.value = native,
     }
     residual
+}
+
+fn is_unrepresented_container(value: &type_proto::Value) -> bool {
+    matches!(
+        value,
+        type_proto::Value::SequenceType(_)
+            | type_proto::Value::MapType(_)
+            | type_proto::Value::OptionalType(_)
+    )
+}
+
+fn is_native_placeholder(value: &type_proto::Value) -> bool {
+    matches!(
+        value,
+        type_proto::Value::TensorType(tensor)
+            if tensor.elem_type == onnx_runtime_loader::proto::onnx::tensor_proto::DataType::Float as i32
+                && tensor.shape.as_ref().is_some_and(|shape| shape.dim.is_empty())
+    )
 }
 
 fn merge_shape(residual: TensorShapeProto, native: TensorShapeProto) -> TensorShapeProto {

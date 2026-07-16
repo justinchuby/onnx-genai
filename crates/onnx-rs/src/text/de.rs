@@ -21,6 +21,7 @@ struct Line<'a> {
 struct Parser<'a> {
     lines: Vec<Line<'a>>,
     pos: usize,
+    mark_opaque_placeholders: bool,
 }
 
 /// Parse a model rendered by [`crate::text::to_text`].
@@ -31,7 +32,7 @@ struct Parser<'a> {
 /// but necessarily use an empty path and zero offset.
 pub fn from_text(source: &str) -> Result<Model> {
     let (source, extension) = super::extensions::split(source)?;
-    let model = Parser::new(source).parse()?;
+    let model = Parser::new(source, extension.is_some()).parse()?;
     let Some(extension) = extension else {
         return Ok(model);
     };
@@ -40,7 +41,7 @@ pub fn from_text(source: &str) -> Result<Model> {
 }
 
 impl<'a> Parser<'a> {
-    fn new(source: &'a str) -> Self {
+    fn new(source: &'a str, mark_opaque_placeholders: bool) -> Self {
         let lines = source
             .lines()
             .enumerate()
@@ -52,7 +53,11 @@ impl<'a> Parser<'a> {
                 })
             })
             .collect();
-        Self { lines, pos: 0 }
+        Self {
+            lines,
+            pos: 0,
+            mark_opaque_placeholders,
+        }
     }
 
     fn parse(mut self) -> Result<Model> {
@@ -149,7 +154,12 @@ impl<'a> Parser<'a> {
             }
 
             self.pos += 1;
-            last_node = Some(parse_node(line, &mut graph, &mut values)?);
+            last_node = Some(parse_node(
+                line,
+                &mut graph,
+                &mut values,
+                self.mark_opaque_placeholders,
+            )?);
         }
 
         Ok((name, graph))
@@ -279,6 +289,7 @@ fn parse_node(
     line: Line<'_>,
     graph: &mut Graph,
     values: &mut HashMap<String, ValueId>,
+    mark_opaque_placeholders: bool,
 ) -> Result<NodeId> {
     let text = strip_trailing_comment(line.text);
     let open = find_top_level_char(text, '(')
@@ -296,7 +307,7 @@ fn parse_node(
         None => ("", prefix),
     };
     let outputs = split_names(lhs);
-    let (op, attrs) = parse_invocation(invocation, line.number)?;
+    let (op, attrs) = parse_invocation(invocation, line.number, mark_opaque_placeholders)?;
     let inputs = split_top_level(&text[open + 1..close], ',')
         .into_iter()
         .map(|name| {
@@ -326,7 +337,11 @@ fn parse_node(
     Ok(graph.insert_node(node))
 }
 
-fn parse_invocation(text: &str, line: usize) -> Result<(&str, HashMap<String, Attribute>)> {
+fn parse_invocation(
+    text: &str,
+    line: usize,
+    mark_opaque_placeholders: bool,
+) -> Result<(&str, HashMap<String, Attribute>)> {
     let Some(open) = find_top_level_char(text, '<') else {
         return Ok((text.trim(), HashMap::new()));
     };
@@ -345,13 +360,13 @@ fn parse_invocation(text: &str, line: usize) -> Result<(&str, HashMap<String, At
         }
         attrs.insert(
             name.to_string(),
-            parse_attribute(pair[eq + 1..].trim(), line)?,
+            parse_attribute(pair[eq + 1..].trim(), line, mark_opaque_placeholders)?,
         );
     }
     Ok((text[..open].trim(), attrs))
 }
 
-fn parse_attribute(text: &str, line: usize) -> Result<Attribute> {
+fn parse_attribute(text: &str, line: usize, mark_opaque_placeholders: bool) -> Result<Attribute> {
     match text {
         "[]:ints" => return Ok(Attribute::Ints(Vec::new())),
         "[]:floats" => return Ok(Attribute::Floats(Vec::new())),
@@ -407,7 +422,12 @@ fn parse_attribute(text: &str, line: usize) -> Result<Attribute> {
         if count > 1_000_000 {
             return Err(parse_error(line, "string-list reference is too large"));
         }
-        return Ok(Attribute::Strings(vec![Vec::new(); count]));
+        let placeholder = if mark_opaque_placeholders {
+            vec![super::extensions::OPAQUE_PLACEHOLDER_BYTE]
+        } else {
+            Vec::new()
+        };
+        return Ok(Attribute::Strings(vec![placeholder; count]));
     }
     if let Some(count) = text
         .strip_prefix('<')
@@ -453,7 +473,12 @@ fn parse_attribute(text: &str, line: usize) -> Result<Attribute> {
         if count > 64 * 1024 * 1024 {
             return Err(parse_error(line, "byte-string reference exceeds 64 MiB"));
         }
-        return Ok(Attribute::String(vec![0; count]));
+        let byte = if mark_opaque_placeholders {
+            super::extensions::OPAQUE_PLACEHOLDER_BYTE
+        } else {
+            0
+        };
+        return Ok(Attribute::String(vec![byte; count]));
     }
     if let Some(body) = text
         .strip_prefix("<tensor ")
