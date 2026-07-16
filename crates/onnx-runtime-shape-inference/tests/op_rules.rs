@@ -1496,6 +1496,27 @@ fn pad_grows_dims() {
     assert_eq!(out_shape(&outs), vec![sym(0), c(3), c(34), c(34)]);
 }
 
+#[test]
+fn pad_expanded_attention_axes_shape_and_bytes() {
+    let n = node("Pad", 4, 1);
+    // Expanded Attention pads a [2,3,4,4] bias on axis -1 by [0,2].
+    let outs = run(
+        &n,
+        vec![
+            f32in(vec![c(2), c(3), c(4), c(4)]),
+            sd_vec(vec![c(0), c(2)]),
+            sd_float_scalar(DataType::Float32, f64::NEG_INFINITY),
+            sd_vec(vec![c(-1)]),
+        ],
+        23,
+    );
+    let shape = out_shape(&outs);
+    assert_eq!(shape, vec![c(2), c(3), c(4), c(6)]);
+    let elements: i64 = shape.iter().map(|dim| dim.as_const().unwrap()).product();
+    assert_eq!(elements, 144);
+    assert_eq!(elements * DataType::Float32.byte_size() as i64, 576);
+}
+
 // --- unregistered op is permissive ---------------------------------------
 
 #[test]

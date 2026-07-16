@@ -150,7 +150,7 @@ pub fn pool(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
     conv_pool(ctx, channels, false)
 }
 
-/// `Pad`: each dim grows by its begin+end pad.
+/// `Pad`: each selected dim grows by its begin+end pad.
 pub fn pad(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
     let Some(x) = ctx.input_shape(0).map(<[DimExpr]>::to_vec) else {
         return Ok(());
@@ -175,12 +175,59 @@ pub fn pad(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
         ctx.set_output(0, dtype, out);
         return Ok(());
     };
-    let mut out = Vec::with_capacity(rank);
-    for (i, d) in x.iter().enumerate() {
-        let begin = pads.get(i).copied().unwrap_or(0);
-        let end = pads.get(i + rank).copied().unwrap_or(0);
-        out.push(d.add(&DimExpr::constant(begin + end)));
+
+    // Opset 18 added the optional `axes` input. When present, the pads are
+    // indexed by that subset rather than by every input axis.
+    let has_axes = ctx.node.inputs.get(3).is_some_and(Option::is_some);
+    let axes: Vec<usize> = if has_axes {
+        let Some(raw_axes) = ctx.input_shape_data(3).and_then(|sd| {
+            sd.elems
+                .iter()
+                .map(|axis| axis.as_const())
+                .collect::<Option<Vec<_>>>()
+        }) else {
+            let out = (0..rank).map(|_| ctx.fresh_dim()).collect();
+            ctx.set_output(0, dtype, out);
+            return Ok(());
+        };
+        raw_axes
+            .into_iter()
+            .map(|axis| {
+                let axis = if axis < 0 { axis + rank as i64 } else { axis };
+                usize::try_from(axis)
+                    .ok()
+                    .filter(|&axis| axis < rank)
+                    .ok_or_else(|| ShapeInferError::Invalid {
+                        op: ctx.op().to_string(),
+                        detail: format!("axis {axis} is out of range for rank {rank}"),
+                    })
+            })
+            .collect::<Result<_, _>>()?
+    } else {
+        (0..rank).collect()
+    };
+
+    if pads.len() != axes.len() * 2 {
+        return Err(ShapeInferError::Invalid {
+            op: ctx.op().to_string(),
+            detail: format!(
+                "pads has {} entries but {} selected axes require {}",
+                pads.len(),
+                axes.len(),
+                axes.len() * 2
+            ),
+        });
     }
+
+    let mut growth = vec![0i64; rank];
+    for (i, axis) in axes.into_iter().enumerate() {
+        growth[axis] = pads[i] + pads[pads.len() / 2 + i];
+    }
+    let out = x
+        .iter()
+        .zip(growth)
+        .map(|(dim, pad)| dim.add(&DimExpr::constant(pad)))
+        .collect();
     ctx.set_output(0, dtype, out);
     Ok(())
 }
