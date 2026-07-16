@@ -11,6 +11,7 @@ categories = ["science", "hardware-support"]
 [dependencies]
 onnx-runtime-ir = { workspace = true }
 onnx-runtime-ep-api = { workspace = true }
+onnx-runtime-quantization = { workspace = true }
 thiserror = { workspace = true }
 half = "2"
 

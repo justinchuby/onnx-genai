@@ -1940,6 +1940,7 @@ dependencies = [
  "onnx-runtime-ep-api",
  "onnx-runtime-ir",
  "onnx-runtime-loader",
+ "onnx-runtime-quantization",
  "rayon",
  "thiserror 2.0.18",
 ]
@@ -1954,6 +1955,7 @@ dependencies = [
  "onnx-runtime-ep-cpu",
  "onnx-runtime-ir",
  "onnx-runtime-loader",
+ "onnx-runtime-quantization",
  "thiserror 2.0.18",
 ]
 
@@ -2009,6 +2011,10 @@ dependencies = [
  "onnx-runtime-tracer",
  "pyo3",
 ]
+
+[[package]]
+name = "onnx-runtime-quantization"
+version = "0.1.0-dev.2"
 
 [[package]]
 name = "onnx-runtime-session"

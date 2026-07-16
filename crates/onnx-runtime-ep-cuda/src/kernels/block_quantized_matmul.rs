@@ -1,11 +1,15 @@
 //! Decode-specialized CUDA GEMV for native GGUF block formats.
 
 use std::ffi::c_void;
-use std::sync::Arc;
+use std::fmt::Write;
+use std::sync::{Arc, OnceLock};
 
 use cudarc::driver::{LaunchConfig, PushKernelArg};
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ir::{DataType, Node, Shape};
+use onnx_runtime_quantization::{
+    IQ2S_GRID, IQ2XS_GRID, IQ2XS_SIGNS, IQ2XXS_GRID, IQ3S_GRID, IQ3XXS_GRID,
+};
 
 use crate::error::driver_err;
 use crate::runtime::{CudaRuntime, cuptr};
@@ -13,14 +17,21 @@ use crate::runtime::{CudaRuntime, cuptr};
 const OP: &str = "BlockQuantizedMatMul";
 const DOMAIN: &str = "com.github.onnxruntime.genai";
 const LAYOUT_VERSION: i64 = 1;
-const QK: usize = 32;
+const SMALL_QK: usize = 32;
+const IQ_SUPER_QK: usize = 256;
 const MXFP4_BLOCK_BYTES: usize = 17;
 const IQ4_NL_BLOCK_BYTES: usize = 18;
+const IQ4_XS_BLOCK_BYTES: usize = 136;
+const IQ2_XXS_BLOCK_BYTES: usize = 66;
+const IQ3_XXS_BLOCK_BYTES: usize = 98;
+const IQ2_XS_BLOCK_BYTES: usize = 74;
+const IQ2_S_BLOCK_BYTES: usize = 82;
+const IQ3_S_BLOCK_BYTES: usize = 110;
 const BLOCK_THREADS: u32 = 256;
 const GEMV_MODULE: &str = "block_quantized_matmul_gemv";
 const GEMV_ENTRY: &str = "block_quantized_matmul_gemv_f32";
 
-const GEMV_SRC: &str = r#"
+const GEMV_PREFIX: &str = r#"
 __device__ __constant__ signed char e2m1_doubled[16] = {
     0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12
 };
@@ -29,7 +40,9 @@ __device__ __constant__ signed char iq4_nl_codebook[16] = {
     -127, -104, -83, -65, -49, -35, -22, -10,
     1, 13, 25, 38, 53, 69, 89, 113
 };
+"#;
 
+const GEMV_SUFFIX: &str = r#"
 __device__ __forceinline__ float fp16_to_fp32(unsigned short value)
 {
     const unsigned int sign = ((unsigned int)value & 0x8000u) << 16;
@@ -56,6 +69,19 @@ __device__ __forceinline__ float fp16_to_fp32(unsigned short value)
     return __uint_as_float(bits);
 }
 
+__device__ __forceinline__ unsigned short load_u16_le(const unsigned char* data)
+{
+    return (unsigned short)data[0] | ((unsigned short)data[1] << 8);
+}
+
+__device__ __forceinline__ unsigned int load_u32_le(const unsigned char* data)
+{
+    return (unsigned int)data[0]
+        | ((unsigned int)data[1] << 8)
+        | ((unsigned int)data[2] << 16)
+        | ((unsigned int)data[3] << 24);
+}
+
 __device__ __forceinline__ float e8m0_half_scale(unsigned char exponent)
 {
     if (exponent == 0xffu) {
@@ -70,6 +96,27 @@ __device__ __forceinline__ float e8m0_half_scale(unsigned char exponent)
     return __uint_as_float(((unsigned int)exponent - 1u) << 23);
 }
 
+__device__ __forceinline__ float signed_grid_value_u64(
+    unsigned long long grid,
+    int element,
+    unsigned char sign_mask,
+    float scale)
+{
+    const float magnitude = (float)((grid >> (8 * element)) & 0xffull);
+    return sign_mask & (1u << element) ? -scale * magnitude : scale * magnitude;
+}
+
+__device__ __forceinline__ float signed_grid_value_u32(
+    unsigned int grid,
+    int element,
+    int sign_element,
+    unsigned char sign_mask,
+    float scale)
+{
+    const float magnitude = (float)((grid >> (8 * element)) & 0xffu);
+    return sign_mask & (1u << sign_element) ? -scale * magnitude : scale * magnitude;
+}
+
 __device__ __forceinline__ float decode_weight(
     const unsigned char* packed,
     int format,
@@ -78,19 +125,104 @@ __device__ __forceinline__ float decode_weight(
     int column,
     int depth)
 {
-    const int block = depth >> 5;
-    const int within = depth & 31;
+    const int superblock = format >= 2;
+    const int qk = superblock ? 256 : 32;
+    const int block = depth / qk;
+    const int within = depth - block * qk;
     const unsigned char* data =
         packed + ((long long)column * blocks + block) * block_bytes;
-    const int quant_index = within & 15;
-    const unsigned char quant = data[block_bytes - 16 + quant_index];
-    const int code = within < 16 ? (quant & 15) : (quant >> 4);
+
     if (format == 0) {
+        const int quant_index = within & 15;
+        const unsigned char quant = data[1 + quant_index];
+        const int code = within < 16 ? (quant & 15) : (quant >> 4);
         return (float)e2m1_doubled[code] * e8m0_half_scale(data[0]);
     }
-    const unsigned short scale_bits =
-        (unsigned short)data[0] | ((unsigned short)data[1] << 8);
-    return fp16_to_fp32(scale_bits) * (float)iq4_nl_codebook[code];
+    const float scale = fp16_to_fp32(load_u16_le(data));
+    if (format == 1) {
+        const int quant_index = within & 15;
+        const unsigned char quant = data[2 + quant_index];
+        const int code = within < 16 ? (quant & 15) : (quant >> 4);
+        return scale * (float)iq4_nl_codebook[code];
+    }
+    if (format == 2) {
+        const int subblock = within >> 5;
+        const int subwithin = within & 31;
+        const unsigned short scales_h = load_u16_le(data + 2);
+        const unsigned char low =
+            (data[4 + subblock / 2] >> (4 * (subblock & 1))) & 0x0fu;
+        const unsigned char high = (scales_h >> (2 * subblock)) & 0x03u;
+        const int factor = (int)(low | (high << 4)) - 32;
+        const float subscale = scale * (float)factor;
+        const unsigned char quant = data[8 + subblock * 16 + (subwithin & 15)];
+        const int code = subwithin < 16 ? (quant & 15) : (quant >> 4);
+        return subscale * (float)iq4_nl_codebook[code];
+    }
+
+    const int group32 = within >> 5;
+    const int subwithin = within & 31;
+    const int vector = subwithin >> 3;
+    const int element = subwithin & 7;
+    if (format == 3) {
+        const int base = 2 + group32 * 8;
+        const unsigned int metadata = load_u32_le(data + base + 4);
+        const float subscale = scale * (0.5f + (float)(metadata >> 28)) * 0.25f;
+        const unsigned long long grid = iq2xxs_grid[data[base + vector]];
+        const unsigned char signs =
+            iq2xs_signs[(metadata >> (7 * vector)) & 127u];
+        return signed_grid_value_u64(grid, element, signs, subscale);
+    }
+    if (format == 4) {
+        const unsigned int metadata = load_u32_le(data + 66 + group32 * 4);
+        const float subscale = scale * (0.5f + (float)(metadata >> 28)) * 0.5f;
+        const int quant_base = 2 + group32 * 8 + vector * 2;
+        const unsigned int grid = iq3xxs_grid[data[quant_base + element / 4]];
+        const unsigned char signs =
+            iq2xs_signs[(metadata >> (7 * vector)) & 127u];
+        return signed_grid_value_u32(
+            grid, element & 3, element, signs, subscale);
+    }
+    if (format == 5) {
+        const int quant_base = 2 + group32 * 8 + vector * 2;
+        const unsigned short quant = load_u16_le(data + quant_base);
+        const unsigned char packed_scale = data[66 + group32];
+        const float subscale =
+            scale * (0.5f + (float)((packed_scale >> (4 * (vector / 2))) & 15u))
+            * 0.25f;
+        const unsigned long long grid = iq2xs_grid[quant & 511u];
+        const unsigned char signs = iq2xs_signs[quant >> 9];
+        return signed_grid_value_u64(grid, element, signs, subscale);
+    }
+    if (format == 6) {
+        const unsigned char packed_scale = data[74 + group32];
+        const float subscale =
+            scale * (0.5f + (float)((packed_scale >> (4 * (vector / 2))) & 15u))
+            * 0.25f;
+        const unsigned char qh = data[66 + group32];
+        const unsigned int index =
+            (unsigned int)data[2 + group32 * 4 + vector]
+            | ((unsigned int)((qh >> (2 * vector)) & 3u) << 8);
+        const unsigned long long grid = iq2s_grid[index];
+        const unsigned char signs = data[34 + group32 * 4 + vector];
+        return signed_grid_value_u64(grid, element, signs, subscale);
+    }
+
+    const int group64 = within >> 6;
+    const int half = (within >> 5) & 1;
+    const int vector4 = (within >> 3) & 3;
+    const int element4 = within & 7;
+    const unsigned char packed_scale = data[106 + group64];
+    const float subscale =
+        scale * (float)(1 + 2 * ((packed_scale >> (4 * half)) & 15u));
+    const unsigned char qh = data[66 + group64 * 2 + half];
+    const int quant_base = 2 + group64 * 16 + half * 8 + vector4 * 2;
+    const unsigned int index =
+        (unsigned int)data[quant_base + element4 / 4]
+        | ((unsigned int)((qh >> (2 * vector4 + element4 / 4)) & 1u) << 8);
+    const unsigned int grid = iq3s_grid[index];
+    const unsigned char signs = data[74 + group64 * 8 + half * 4 + vector4];
+    return signed_grid_value_u32(
+        grid, element4 & 3, element4, signs, subscale);
 }
 
 __device__ __forceinline__ float warp_sum(float value)
@@ -143,10 +275,80 @@ extern "C" __global__ void block_quantized_matmul_gemv_f32(
 }
 "#;
 
+fn gemv_src() -> &'static str {
+    static SOURCE: OnceLock<String> = OnceLock::new();
+    SOURCE.get_or_init(|| {
+        let mut source = String::from(GEMV_PREFIX);
+        append_u8_table(&mut source, "iq2xs_signs", &IQ2XS_SIGNS);
+        append_u64_table(&mut source, "iq2xxs_grid", &IQ2XXS_GRID);
+        append_u32_table(&mut source, "iq3xxs_grid", &IQ3XXS_GRID);
+        append_u64_table(&mut source, "iq2xs_grid", &IQ2XS_GRID);
+        append_u64_table(&mut source, "iq2s_grid", &IQ2S_GRID);
+        append_u32_table(&mut source, "iq3s_grid", &IQ3S_GRID);
+        source.push_str(GEMV_SUFFIX);
+        source
+    })
+}
+
+fn append_u8_table(source: &mut String, name: &str, values: &[u8]) {
+    writeln!(
+        source,
+        "__device__ __constant__ unsigned char {name}[{}] = {{",
+        values.len()
+    )
+    .expect("writing CUDA source to String cannot fail");
+    for values in values.chunks(16) {
+        for value in values {
+            write!(source, "{value},").expect("writing CUDA source to String cannot fail");
+        }
+        source.push('\n');
+    }
+    source.push_str("};\n");
+}
+
+fn append_u32_table(source: &mut String, name: &str, values: &[u32]) {
+    writeln!(
+        source,
+        "__device__ __constant__ unsigned int {name}[{}] = {{",
+        values.len()
+    )
+    .expect("writing CUDA source to String cannot fail");
+    for values in values.chunks(8) {
+        for value in values {
+            write!(source, "0x{value:08x}u,").expect("writing CUDA source to String cannot fail");
+        }
+        source.push('\n');
+    }
+    source.push_str("};\n");
+}
+
+fn append_u64_table(source: &mut String, name: &str, values: &[u64]) {
+    writeln!(
+        source,
+        "__device__ __constant__ unsigned long long {name}[{}] = {{",
+        values.len()
+    )
+    .expect("writing CUDA source to String cannot fail");
+    for values in values.chunks(4) {
+        for value in values {
+            write!(source, "0x{value:016x}ull,")
+                .expect("writing CUDA source to String cannot fail");
+        }
+        source.push('\n');
+    }
+    source.push_str("};\n");
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BlockFormat {
     Mxfp4,
     Iq4Nl,
+    Iq4Xs,
+    Iq2Xxs,
+    Iq3Xxs,
+    Iq2Xs,
+    Iq2S,
+    Iq3S,
 }
 
 impl BlockFormat {
@@ -154,9 +356,24 @@ impl BlockFormat {
         match value {
             "mxfp4" => Ok(Self::Mxfp4),
             "iq4_nl" => Ok(Self::Iq4Nl),
+            "iq4_xs" => Ok(Self::Iq4Xs),
+            "iq2_xxs" => Ok(Self::Iq2Xxs),
+            "iq3_xxs" => Ok(Self::Iq3Xxs),
+            "iq2_xs" => Ok(Self::Iq2Xs),
+            "iq2_s" => Ok(Self::Iq2S),
+            "iq3_s" => Ok(Self::Iq3S),
             other => Err(error(format!(
-                "format '{other}' is unsupported by CUDA; supported formats are mxfp4 and iq4_nl"
+                "format '{other}' is unsupported by CUDA; supported formats are mxfp4, iq4_nl, iq4_xs, iq2_xxs, iq3_xxs, iq2_xs, iq2_s, and iq3_s"
             ))),
+        }
+    }
+
+    fn qk(self) -> usize {
+        match self {
+            Self::Mxfp4 | Self::Iq4Nl => SMALL_QK,
+            Self::Iq4Xs | Self::Iq2Xxs | Self::Iq3Xxs | Self::Iq2Xs | Self::Iq2S | Self::Iq3S => {
+                IQ_SUPER_QK
+            }
         }
     }
 
@@ -164,6 +381,12 @@ impl BlockFormat {
         match self {
             Self::Mxfp4 => MXFP4_BLOCK_BYTES,
             Self::Iq4Nl => IQ4_NL_BLOCK_BYTES,
+            Self::Iq4Xs => IQ4_XS_BLOCK_BYTES,
+            Self::Iq2Xxs => IQ2_XXS_BLOCK_BYTES,
+            Self::Iq3Xxs => IQ3_XXS_BLOCK_BYTES,
+            Self::Iq2Xs => IQ2_XS_BLOCK_BYTES,
+            Self::Iq2S => IQ2_S_BLOCK_BYTES,
+            Self::Iq3S => IQ3_S_BLOCK_BYTES,
         }
     }
 
@@ -171,6 +394,12 @@ impl BlockFormat {
         match self {
             Self::Mxfp4 => 0,
             Self::Iq4Nl => 1,
+            Self::Iq4Xs => 2,
+            Self::Iq2Xxs => 3,
+            Self::Iq3Xxs => 4,
+            Self::Iq2Xs => 5,
+            Self::Iq2S => 6,
+            Self::Iq3S => 7,
         }
     }
 }
@@ -242,7 +471,7 @@ impl Kernel for BlockQuantizedMatMulKernel {
         let expected_output_shape = [&a_shape[..a_shape.len() - 1], &[self.n]].concat();
         require_shape("Y", outputs[0].shape, &expected_output_shape)?;
 
-        let blocks = self.k.div_ceil(QK);
+        let blocks = self.k.div_ceil(self.format.qk());
         require_shape(
             "packed_B",
             inputs[1].shape,
@@ -268,7 +497,7 @@ impl Kernel for BlockQuantizedMatMulKernel {
 
         let function = self
             .runtime
-            .nvrtc_function(GEMV_MODULE, GEMV_SRC, GEMV_ENTRY)?;
+            .nvrtc_function(GEMV_MODULE, gemv_src(), GEMV_ENTRY)?;
         let activation_ptr = cuptr(inputs[0].data_ptr::<u8>() as *const c_void);
         let packed_ptr = cuptr(inputs[1].data_ptr::<u8>() as *const c_void);
         let bias_ptr = bias
@@ -317,7 +546,19 @@ pub(crate) fn supports_node(node: &Node, shapes: &[Shape]) -> bool {
     let format_supported = node
         .attr("format")
         .and_then(|attribute| attribute.as_str())
-        .is_some_and(|format| matches!(format, "mxfp4" | "iq4_nl"));
+        .is_some_and(|format| {
+            matches!(
+                format,
+                "mxfp4"
+                    | "iq4_nl"
+                    | "iq4_xs"
+                    | "iq2_xxs"
+                    | "iq3_xxs"
+                    | "iq2_xs"
+                    | "iq2_s"
+                    | "iq3_s"
+            )
+        });
     let layout_supported = match node.attr("block_layout_version") {
         Some(attribute) => attribute.as_int() == Some(LAYOUT_VERSION),
         None => true,
