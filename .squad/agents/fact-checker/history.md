@@ -24,3 +24,6 @@ Verified model-package external claims; corrections were applied.
 
 ### 2026-07-16T00:00:03Z — Projection-fusion fact check
 Verified the model-specific claims in `docs/PROJECTION_FUSION.md`: QKV is already packed, while 24 gate/up pairs are separate `4864|4864→9728` candidates. Confirmed the executor seam and packing math; documented that 124.6875 MiB of fused B+scale payload does not bound actual RSS because alignment copies may add memory.
+
+### 2026-07-16T00:00:00Z — Native CUDA decode design fact check
+Audited `docs/NATIVE_CUDA_DECODE.md`: 14 central claims verified, including concrete CPU EP wiring, object-safe dynamic EP dispatch, packed-QKV GQA and O(capacity) KV blockers, and cudarc graph APIs. Required M4 corrections—a real non-null stream and serialized ownership of non-Send/Sync CUDA graphs—were incorporated in `33beb8d`; virtual-dispatch cost remains unmeasured.

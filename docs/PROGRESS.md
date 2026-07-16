@@ -329,6 +329,10 @@ Scoped the "export Gemma4 E2B/12B via Mobius and smoke-test through onnx-genai" 
 - **Cumulative CPU decode arc:** at 24 threads, approximately **40.5 → 58–59 tok/s** across Mul, SiLU, direct-int4 GEMV, RMSNorm, and GQA; `MatMulNBits` remains about **82%** and dominates, while all remaining tail ops are sub-4%.
 - **Residual `Add` fast-path rejected (`3c0788a`, Pris):** The same allocation-free contiguous-f32 pattern applied to residual `Add` shaved Add ms marginally (0.432 → 0.424 ms/step, −1.3%) but regressed paired decode (−1.5%), so it was reverted with a negative-result note (`docs/benchmarks/2026-07-16-add-contiguous-f32-negative.md`). This closes the allocation-free elementwise sweep — the sub-4% tail ops no longer yield decode wins; the remaining levers are `MatMulNBits` (gated projection fusion) and larger structural work (NUMA per-socket weight replication, native CUDA decode).
 
+### Native CUDA decode design
+
+- **Fact-checked GPU-decode frontier design ✅ (`b416b7f` + `33beb8d`, Nabil; Fact Checker):** `docs/NATIVE_CUDA_DECODE.md` proposes `Arc<dyn ExecutionProvider>` dispatch through five milestones: EP-polymorphic execution, target coverage, O(1) device KV, graph replay, and performance. The audit verified 14 core claims and corrected M4 to require a real non-null stream plus serialized graph ownership; virtual-dispatch cost remains unmeasured. **Awaiting user greenlight; not implemented.**
+
 ### Python bindings wave
 
 - **nxrt eager + genai ✅ (`41d8c31`, Rachael; Sebastian fix; Holden 🔴→🟢):** Default Python bindings now expose `nxrt.eager` dispatch/opset/cache APIs and `nxrt.genai.Engine` loading, tokenization, generation, and streaming. The rejected `RefCell`/unsendable Engine was replaced with a sendable, GIL-releasing `Mutex` wrapper that fails fast on contention; `docs/PYTHON.md` documents the wheel setup.
