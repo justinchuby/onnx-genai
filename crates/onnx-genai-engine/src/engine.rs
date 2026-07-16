@@ -252,6 +252,16 @@ pub struct Engine {
     pub(crate) _environment: Environment,
 }
 
+// SAFETY: `Engine` owns every ORT handle reachable through its sessions and
+// decode state, and ORT sessions/values/bindings/allocators have no thread
+// affinity. Moving the engine transfers exclusive ownership of those handles;
+// mutation still requires `&mut Engine`. Self-references in decode runners point
+// into boxed `Session` allocations, whose addresses remain stable when the
+// owning `Engine` moves. This would stop being sound if an execution provider
+// introduced thread-affine handles or a field gained unsynchronized shared
+// mutation.
+unsafe impl Send for Engine {}
+
 pub(crate) struct MtpModel {
     pub(crate) config: MtpConfig,
     pub(crate) session: Box<Session>,

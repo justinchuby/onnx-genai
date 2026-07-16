@@ -1997,7 +1997,9 @@ dependencies = [
 name = "onnx-runtime-python"
 version = "0.1.0-dev.2"
 dependencies = [
+ "onnx-genai-engine",
  "onnx-runtime-dlpack",
+ "onnx-runtime-eager",
  "onnx-runtime-ep-api",
  "onnx-runtime-ep-cpu",
  "onnx-runtime-ep-cuda",

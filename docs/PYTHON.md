@@ -19,10 +19,17 @@ python -m pip install nxrt
 For a local development install:
 
 ```bash
+python -m venv .venv
+source .venv/bin/activate
 python -m pip install "maturin>=1.7,<2" numpy
+# Linux only: maturin needs patchelf to repair the development wheel.
+python -m pip install patchelf
 cd crates/onnx-runtime-python
 maturin develop --release
 ```
+
+`maturin develop` requires an active virtual environment. On Linux, install
+`patchelf` as shown above; macOS and Windows do not need it.
 
 The shipped/default build enables both `eager` and `genai`. Developers can build
 a smaller package with Cargo features, for example:
@@ -144,7 +151,7 @@ token_ids = engine.tokenize("Hello")
 
 `generate_stream()` invokes a callback for each generated token. The callback
 receives `(text, token_id, finish_reason)`; `finish_reason` is `None` until a
-terminal event:
+terminal token event:
 
 ```python
 def on_token(text, token_id, finish_reason):
@@ -160,6 +167,12 @@ result = engine.generate_stream(
 print("\n", result.finish_reason)
 ```
 
-`Engine` wraps thread-affine ONNX Runtime state. Create and use each instance
-from the same Python thread, and do not start a second call while a generation
-callback is running.
+When generation stops because `max_tokens` was reached, there is no separate
+terminal token, so the token callbacks retain `finish_reason=None`; the returned
+`GenerateResult.finish_reason` is `"max_tokens"`. A future iterator-style API
+may add a dedicated completion event.
+
+`Engine` is safe to move between Python threads, but one instance is not
+re-entrant. Concurrent calls, including calls made by a generation callback,
+raise `RuntimeError` immediately. Serialize calls or use one `Engine` per
+thread.

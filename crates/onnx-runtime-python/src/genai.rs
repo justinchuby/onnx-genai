@@ -1,5 +1,5 @@
-use std::cell::RefCell;
 use std::path::Path;
+use std::sync::{Mutex, MutexGuard, TryLockError};
 
 use onnx_genai_engine::{
     Engine as RustEngine, EngineConfig, FinishReason, GenerateOptions, GenerateRequest,
@@ -121,9 +121,22 @@ fn generation_error(err: impl std::fmt::Display) -> PyErr {
     ))
 }
 
-#[pyclass(module = "nxrt.genai", name = "Engine", unsendable)]
+const ENGINE_IN_USE: &str = "engine is in use by another thread — nxrt genai Engine is not \
+re-entrant; serialize calls or use one Engine per thread";
+
+fn try_lock_engine<T>(inner: &Mutex<T>) -> PyResult<MutexGuard<'_, T>> {
+    inner.try_lock().map_err(|err| match err {
+        TryLockError::WouldBlock => PyRuntimeError::new_err(ENGINE_IN_USE),
+        TryLockError::Poisoned(_) => PyRuntimeError::new_err(
+            "nxrt genai Engine state is unavailable because a previous generation panicked; \
+             create a new Engine instance",
+        ),
+    })
+}
+
+#[pyclass(module = "nxrt.genai", name = "Engine")]
 struct Engine {
-    inner: RefCell<RustEngine>,
+    inner: Mutex<RustEngine>,
 }
 
 #[pymethods]
@@ -177,13 +190,14 @@ impl Engine {
             ))
         })?;
         Ok(Self {
-            inner: RefCell::new(engine),
+            inner: Mutex::new(engine),
         })
     }
 
     #[pyo3(signature = (prompt, *, max_tokens=128, temperature=1.0, top_p=1.0, top_k=0, seed=None, stop=None))]
     fn generate(
         &self,
+        py: Python<'_>,
         prompt: &str,
         max_tokens: usize,
         temperature: f32,
@@ -193,21 +207,19 @@ impl Engine {
         stop: Option<Vec<String>>,
     ) -> PyResult<GenerateResult> {
         let request = request(prompt, max_tokens, temperature, top_p, top_k, seed, stop)?;
-        let mut engine = self
-            .inner
-            .try_borrow_mut()
-            .map_err(|_| PyRuntimeError::new_err(
-                "genai Engine is already generating on this thread; wait for the current call to finish",
-            ))?;
-        engine
-            .generate(request)
-            .map(GenerateResult::from)
-            .map_err(generation_error)
+        py.allow_threads(|| {
+            let mut engine = try_lock_engine(&self.inner)?;
+            engine
+                .generate(request)
+                .map(GenerateResult::from)
+                .map_err(generation_error)
+        })
     }
 
     #[pyo3(signature = (prompt, callback, *, max_tokens=128, temperature=1.0, top_p=1.0, top_k=0, seed=None, stop=None))]
     fn generate_stream(
         &self,
+        py: Python<'_>,
         prompt: &str,
         callback: Py<PyAny>,
         max_tokens: usize,
@@ -217,63 +229,58 @@ impl Engine {
         seed: Option<u64>,
         stop: Option<Vec<String>>,
     ) -> PyResult<GenerateResult> {
-        Python::with_gil(|py| {
-            if !callback.bind(py).is_callable() {
-                return Err(PyTypeError::new_err(
-                    "callback must be callable and accept (text, token_id, finish_reason)",
-                ));
-            }
-            Ok(())
-        })?;
-        let request = request(prompt, max_tokens, temperature, top_p, top_k, seed, stop)?;
-        let mut callback_error: Option<PyErr> = None;
-        let mut callback_fn = |token: GenerateToken| {
-            let call = Python::with_gil(|py| {
-                callback.call1(
-                    py,
-                    (
-                        token.text,
-                        token.token_id,
-                        token.finish_reason.as_ref().map(finish_reason_name),
-                    ),
-                )
-            });
-            match call {
-                Ok(_) => Ok(()),
-                Err(err) => {
-                    callback_error = Some(err);
-                    Err(
-                        std::io::Error::other("Python streaming callback raised an exception")
-                            .into(),
-                    )
-                }
-            }
-        };
-        let mut engine = self
-            .inner
-            .try_borrow_mut()
-            .map_err(|_| PyRuntimeError::new_err(
-                "genai Engine is already generating on this thread; wait for the current call to finish",
-            ))?;
-        let callback_fn: &mut onnx_genai_engine::GenerateTokenCallback<'_> = &mut callback_fn;
-        let result = engine.generate_with_callback(request, Some(callback_fn));
-        if let Some(err) = callback_error {
-            return Err(err);
+        if !callback.bind(py).is_callable() {
+            return Err(PyTypeError::new_err(
+                "callback must be callable and accept (text, token_id, finish_reason)",
+            ));
         }
-        result.map(GenerateResult::from).map_err(generation_error)
+        let request = request(prompt, max_tokens, temperature, top_p, top_k, seed, stop)?;
+        py.allow_threads(|| {
+            let mut callback_error: Option<PyErr> = None;
+            let mut callback_fn = |token: GenerateToken| {
+                let call = Python::with_gil(|py| {
+                    callback.call1(
+                        py,
+                        (
+                            token.text,
+                            token.token_id,
+                            token.finish_reason.as_ref().map(finish_reason_name),
+                        ),
+                    )
+                });
+                match call {
+                    Ok(_) => Ok(()),
+                    Err(err) => {
+                        callback_error = Some(err);
+                        Err(
+                            std::io::Error::other("Python streaming callback raised an exception")
+                                .into(),
+                        )
+                    }
+                }
+            };
+            // The guard remains held while Rust generates, including callback
+            // invocations. Re-entry is safe because every method uses try_lock
+            // and therefore fails immediately instead of waiting on this mutex.
+            let mut engine = try_lock_engine(&self.inner)?;
+            let callback_fn: &mut onnx_genai_engine::GenerateTokenCallback<'_> = &mut callback_fn;
+            let result = engine.generate_with_callback(request, Some(callback_fn));
+            if let Some(err) = callback_error {
+                return Err(err);
+            }
+            result.map(GenerateResult::from).map_err(generation_error)
+        })
     }
 
-    fn tokenize(&self, text: &str) -> PyResult<Vec<u32>> {
-        let engine = self.inner.try_borrow().map_err(|_| {
-            PyRuntimeError::new_err(
-                "genai Engine is currently generating; tokenize after the current call finishes",
-            )
-        })?;
-        engine.tokenize(text).map_err(|err| {
-            PyValueError::new_err(format!(
-                "failed to tokenize input text: {err}. Verify the model directory contains \
-                 a valid tokenizer.json compatible with the loaded model."
-            ))
+    fn tokenize(&self, py: Python<'_>, text: &str) -> PyResult<Vec<u32>> {
+        py.allow_threads(|| {
+            let engine = try_lock_engine(&self.inner)?;
+            engine.tokenize(text).map_err(|err| {
+                PyValueError::new_err(format!(
+                    "failed to tokenize input text: {err}. Verify the model directory contains \
+                     a valid tokenizer.json compatible with the loaded model."
+                ))
+            })
         })
     }
 }
@@ -297,7 +304,9 @@ pub(crate) fn register(parent: &Bound<'_, PyModule>) -> PyResult<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::build_options;
+    use std::sync::{Arc, Mutex};
+
+    use super::{ENGINE_IN_USE, Engine, build_options, try_lock_engine};
 
     #[test]
     fn generation_options_match_python_arguments() {
@@ -309,5 +318,25 @@ mod tests {
         assert_eq!(options.seed, Some(42));
         assert!(!options.greedy);
         assert_eq!(options.stop_sequences.len(), 1);
+    }
+
+    #[test]
+    fn engine_pyclass_is_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<Engine>();
+    }
+
+    #[test]
+    fn engine_lock_contention_returns_actionable_python_error() {
+        pyo3::prepare_freethreaded_python();
+        let inner = Arc::new(Mutex::new(()));
+        let guard = inner.lock().unwrap();
+        let contender = Arc::clone(&inner);
+        let error = std::thread::spawn(move || try_lock_engine(&contender).unwrap_err())
+            .join()
+            .expect("contending thread panicked");
+        drop(guard);
+
+        assert_eq!(error.to_string(), format!("RuntimeError: {ENGINE_IN_USE}"));
     }
 }
