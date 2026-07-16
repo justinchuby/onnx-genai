@@ -40,6 +40,10 @@
 //! 2-byte little-endian storage — never reinterpreted through f32.
 
 mod dlpack;
+#[cfg(feature = "eager")]
+mod eager;
+#[cfg(feature = "genai")]
+mod genai;
 
 use std::sync::Mutex;
 
@@ -531,7 +535,7 @@ fn non_host_input_error(name: &str, dev: DeviceId) -> Option<String> {
 /// with an actionable message instead.
 ///
 /// Returns the error message when `dev` is not host-accessible, else `None`.
-fn non_host_read_error(name: &str, dev: DeviceId) -> Option<String> {
+pub(crate) fn non_host_read_error(name: &str, dev: DeviceId) -> Option<String> {
     if dev.is_host_accessible() {
         return None;
     }
@@ -1080,12 +1084,12 @@ fn node_args(py: Python<'_>, metas: &[IoMeta]) -> PyResult<Py<PyList>> {    let 
 
 /// Convert a numpy array (any feed value) into an nxrt [`Tensor`], with
 /// actionable errors for unsupported dtypes or unreadable buffers.
-fn numpy_to_tensor(
+fn numpy_array_parts(
     py: Python<'_>,
     np: &Bound<'_, PyModule>,
     input_name: &str,
     value: &Bound<'_, PyAny>,
-) -> PyResult<Tensor> {
+) -> PyResult<(DataType, Vec<usize>, Vec<u8>)> {
     // Force a C-contiguous array so `tobytes()` yields row-major little-endian
     // storage regardless of the caller's array flags (copies only if needed).
     let arr = np.call_method1("ascontiguousarray", (value,)).map_err(|_| {
@@ -1116,10 +1120,21 @@ fn numpy_to_tensor(
         .extract()?;
 
     let bytes_obj = arr.call_method0("tobytes")?;
-    let bytes: &[u8] = bytes_obj.downcast::<PyBytes>()?.as_bytes();
+    let bytes = bytes_obj.downcast::<PyBytes>()?.as_bytes().to_vec();
 
     let _ = py;
-    Tensor::from_raw(dtype, shape.clone(), bytes).map_err(|e| {
+    Ok((dtype, shape, bytes))
+}
+
+/// Convert a numpy array (any feed value) into a session tensor.
+fn numpy_to_tensor(
+    py: Python<'_>,
+    np: &Bound<'_, PyModule>,
+    input_name: &str,
+    value: &Bound<'_, PyAny>,
+) -> PyResult<Tensor> {
+    let (dtype, shape, bytes) = numpy_array_parts(py, np, input_name, value)?;
+    Tensor::from_raw(dtype, shape.clone(), &bytes).map_err(|e| {
         PyValueError::new_err(format!(
             "input {input_name:?}: failed to build a {} tensor of shape {shape:?}: {e}",
             onnx_type_string(dtype)
@@ -1137,13 +1152,36 @@ pub(crate) fn tensor_to_numpy(
     name: &str,
     tensor: &Tensor,
 ) -> PyResult<Py<PyAny>> {
-    let np_name = dtype_to_numpy_name(tensor.dtype)?;
+    if let Some(msg) = non_host_read_error(name, tensor.device()) {
+        return Err(PyRuntimeError::new_err(msg));
+    }
+    raw_tensor_to_numpy(
+        py,
+        np,
+        name,
+        tensor.dtype,
+        &tensor.shape,
+        tensor.as_bytes(),
+        tensor.device(),
+    )
+}
+
+pub(crate) fn raw_tensor_to_numpy(
+    py: Python<'_>,
+    np: &Bound<'_, PyModule>,
+    name: &str,
+    dtype: DataType,
+    shape: &[usize],
+    bytes: &[u8],
+    device: DeviceId,
+) -> PyResult<Py<PyAny>> {
+    let np_name = dtype_to_numpy_name(dtype)?;
 
     // FIX 3: honest host-read boundary. `tensor.as_bytes()` below asserts the
     // tensor is host-accessible and PANICS (surfacing as a PanicException) for a
     // CUDA-resident value. Surface a clean, actionable RuntimeError instead so
     // `.numpy()`/`run()` never panic on a device-resident output.
-    if let Some(msg) = non_host_read_error(name, tensor.device()) {
+    if let Some(msg) = non_host_read_error(name, device) {
         return Err(PyRuntimeError::new_err(msg));
     }
 
@@ -1162,10 +1200,10 @@ pub(crate) fn tensor_to_numpy(
         np.getattr("dtype")?.call1((np_name,))?.into_any()
     };
 
-    let py_bytes = PyBytes::new(py, tensor.as_bytes());
+    let py_bytes = PyBytes::new(py, bytes);
     // frombuffer over empty buffers is fine; reshape restores the logical shape.
     let flat = np.call_method1("frombuffer", (py_bytes, &dtype_obj))?;
-    let shape = PyTuple::new(py, &tensor.shape)?;
+    let shape = PyTuple::new(py, shape)?;
     let reshaped = flat.call_method1("reshape", (shape,))?;
     // Own the data (frombuffer aliases the temporary bytes buffer).
     let owned = reshaped.call_method0("copy")?;
@@ -1358,7 +1396,7 @@ fn nxrt(m: &Bound<'_, PyModule>) -> PyResult<()> {
     inject_cupti_search_paths(m);
 
     m.add("__version__", VERSION)?;
-    let doc = "nxrt — Python binding for the nxrt ONNX runtime (onnxruntime-compatible InferenceSession).";
+    let doc = "nxrt — Python bindings for ONNX inference, eager op dispatch, and generative AI.";
     m.add("__doc__", PyString::new(m.py(), doc))?;
     m.add_class::<InferenceSession>()?;
     m.add_class::<NodeArg>()?;
@@ -1366,6 +1404,10 @@ fn nxrt(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Outputs>()?;
     m.add_class::<BoundSession>()?;
     dlpack::register(m)?;
+    #[cfg(feature = "eager")]
+    eager::register(m)?;
+    #[cfg(feature = "genai")]
+    genai::register(m)?;
     m.add_function(wrap_pyfunction!(load, m)?)?;
     m.add_function(wrap_pyfunction!(get_available_providers, m)?)?;
     m.add_function(wrap_pyfunction!(_dlpack_import_data_ptr, m)?)?;

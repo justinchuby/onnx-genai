@@ -9,7 +9,7 @@ build-backend = "maturin"
 
 [project]
 name = "nxrt"
-description = "Python binding for the nxrt ONNX runtime — onnxruntime-compatible InferenceSession"
+description = "Python binding for nxrt ONNX inference, eager ops, and text generation"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [{ name = "Justin Chu" }]

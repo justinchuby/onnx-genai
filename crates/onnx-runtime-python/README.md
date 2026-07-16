@@ -1,7 +1,8 @@
 # nxrt — Python binding for the nxrt ONNX runtime
 
-`nxrt` exposes the pure-Rust **nxrt** ONNX runtime to Python with an API that
-mirrors `onnxruntime.InferenceSession`, so existing code and conformance suites
+`nxrt` exposes the **nxrt** ONNX runtime to Python with an API that
+mirrors `onnxruntime.InferenceSession`, plus eager single-op execution and the
+local genai engine. Existing code and conformance suites
 (e.g. [`cbourjau/onnx-tests`](https://github.com/cbourjau/onnx-tests)) can drive
 nxrt's execution providers with a one-line runtime swap and plain `pytest`.
 
@@ -13,6 +14,10 @@ sess = nxrt.InferenceSession("model.onnx")          # path, os.PathLike, or byte
 outs = sess.run(None, {"x": np.ones((1, 3), np.float32)})
 print(nxrt.__version__, nxrt.get_available_providers())
 ```
+
+See [`../../docs/PYTHON.md`](../../docs/PYTHON.md) for eager dispatch and text
+generation quickstarts. The Python package intentionally does not include the
+HTTP webserver.
 
 - **Minimum Python: 3.10.**
 - Built on [PyO3](https://pyo3.rs) + [maturin](https://www.maturin.rs) against

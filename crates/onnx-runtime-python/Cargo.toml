@@ -10,7 +10,7 @@ edition = "2024"
 license = "MIT"
 authors = ["Justin Chu"]
 repository = "https://github.com/justinchuby/onnx-genai"
-description = "Python (PyO3/abi3) binding for the nxrt ONNX runtime — exposes InferenceSession"
+description = "Python (PyO3/abi3) binding for nxrt inference, eager ops, and generation"
 publish = false
 
 [lib]
@@ -25,6 +25,8 @@ onnx-runtime-ep-cpu = { workspace = true }
 onnx-runtime-ep-api = { workspace = true }
 onnx-runtime-ir = { workspace = true }
 onnx-runtime-dlpack = { workspace = true }
+onnx-runtime-eager = { workspace = true, optional = true }
+onnx-genai-engine = { workspace = true, optional = true }
 # Optional CUDA execution provider, gated behind the `cuda` feature so the
 # default build stays offline / pure-Rust (CPU only).
 onnx-runtime-ep-cuda = { workspace = true, optional = true }
@@ -40,7 +42,9 @@ version = "0.23"
 features = ["extension-module", "abi3-py310"]
 
 [features]
-default = []
+default = ["eager", "genai"]
+eager = ["dep:onnx-runtime-eager"]
+genai = ["dep:onnx-genai-engine"]
 onednn = ["onnx-runtime-ep-cpu/onednn"]
 cuda = [
     "dep:onnx-runtime-ep-cuda",
