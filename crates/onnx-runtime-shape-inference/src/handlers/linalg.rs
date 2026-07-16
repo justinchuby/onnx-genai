@@ -19,6 +19,35 @@ pub fn matmul(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
     Ok(())
 }
 
+/// Quantized matmul with packed weights and output width supplied by `N`.
+pub fn quantized_matmul(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
+    let Some(mut shape) = ctx.input_shape(0).map(<[DimExpr]>::to_vec) else {
+        return Ok(());
+    };
+    let Some(dtype) = ctx.input_dtype(0) else {
+        return Ok(());
+    };
+    let n = ctx
+        .node
+        .attr("N")
+        .and_then(Attribute::as_int)
+        .ok_or_else(|| ShapeInferError::MissingAttribute {
+            op: ctx.node.op_type.clone(),
+            attr: "N".into(),
+        })?;
+    let Some(last) = shape.last_mut() else {
+        return Err(ShapeInferError::InvalidRank {
+            op: ctx.node.op_type.clone(),
+            index: 0,
+            rank: 0,
+            detail: "activation input must have rank ≥ 1".into(),
+        });
+    };
+    *last = DimExpr::constant(n);
+    ctx.set_output(0, dtype, shape);
+    Ok(())
+}
+
 /// `com.microsoft.FusedMatMul`: MatMul with optional pre-transposition of the
 /// last two dims (`transA`/`transB`) and batch-axis relocation
 /// (`transBatchA`/`transBatchB`), plus a shape-neutral `alpha` scale.
@@ -394,6 +423,13 @@ pub fn gemm(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
 pub fn register(reg: &mut InferenceRegistry) {
     reg.register("", "MatMul", 1, matmul);
     reg.register("", "Gemm", 1, gemm);
+    reg.register(
+        "com.github.onnxruntime.genai",
+        "BlockQuantizedMatMul",
+        1,
+        quantized_matmul,
+    );
+    reg.register("com.microsoft", "MatMulNBits", 1, quantized_matmul);
     // com.microsoft fused matmul honors transA/transB/transBatch attributes.
     reg.register("com.microsoft", "FusedMatMul", 1, fused_matmul);
     // The optimizer's MatMul+Add(bias) fusion: output shape == MatMul's.

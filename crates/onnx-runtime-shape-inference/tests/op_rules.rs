@@ -166,6 +166,57 @@ fn matmul_contraction_mismatch_errors() {
     assert!(res.is_err());
 }
 
+// --- Quantized matmul ------------------------------------------------------
+
+fn quantized_matmul_node(op: &str, domain: &str, n_in: usize, n: i64) -> Node {
+    with_attr(
+        with_domain(node(op, n_in, 1), domain),
+        "N",
+        Attribute::Int(n),
+    )
+}
+
+fn assert_quantized_matmul_shapes(n: &Node, n_in: usize) {
+    let packed_inputs = || (1..n_in).map(|_| NodeIo::default());
+
+    let outs = run(
+        n,
+        std::iter::once(tin(DataType::Float16, vec![c(1), sym(0), c(896)]))
+            .chain(packed_inputs())
+            .collect(),
+        1,
+    );
+    assert_eq!(out_shape(&outs), vec![c(1), sym(0), c(4864)]);
+    assert_eq!(out_dtype(&outs), DataType::Float16);
+
+    let outs = run(
+        n,
+        std::iter::once(f32in(vec![sym(1), c(896)]))
+            .chain(packed_inputs())
+            .collect(),
+        1,
+    );
+    assert_eq!(out_shape(&outs), vec![sym(1), c(4864)]);
+    assert_eq!(out_dtype(&outs), DataType::Float32);
+}
+
+#[test]
+fn block_quantized_matmul_uses_n_and_preserves_leading_dims() {
+    let n = quantized_matmul_node(
+        "BlockQuantizedMatMul",
+        "com.github.onnxruntime.genai",
+        2,
+        4864,
+    );
+    assert_quantized_matmul_shapes(&n, 2);
+}
+
+#[test]
+fn matmul_nbits_uses_n_and_preserves_leading_dims() {
+    let n = quantized_matmul_node("MatMulNBits", "com.microsoft", 3, 4864);
+    assert_quantized_matmul_shapes(&n, 3);
+}
+
 // --- Gemm -----------------------------------------------------------------
 
 #[test]
