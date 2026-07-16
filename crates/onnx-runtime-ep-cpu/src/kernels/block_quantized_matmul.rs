@@ -8,6 +8,7 @@ use std::sync::OnceLock;
 
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ir::{DataType, Node};
+use rayon::prelude::*;
 
 use super::matmul::gemm;
 use super::{check_arity, to_dense_bytes, to_dense_f32, write_dense_f32};
@@ -443,19 +444,32 @@ impl BlockFormat {
         }
     }
 
-    fn decode_block(self, block: &[u8], output: &mut [f32]) {
+    fn scalar_decoder(self) -> fn(&[u8], &mut [f32]) {
         match self {
-            Self::Mxfp4 => decode_mxfp4_block(block, output),
-            Self::Iq4Nl => decode_iq4_nl_block(block, output),
-            Self::Iq4Xs => decode_iq4_xs_block(block, output),
-            Self::Iq3S => decode_iq3_s_block(block, output),
-            Self::Iq3Xxs => decode_iq3_xxs_block(block, output),
-            Self::Iq2S => decode_iq2_s_block(block, output),
-            Self::Iq2Xs => decode_iq2_xs_block(block, output),
-            Self::Iq2Xxs => decode_iq2_xxs_block(block, output),
-            Self::Iq1S => decode_iq1_s_block(block, output),
-            Self::Iq1M => decode_iq1_m_block(block, output),
+            Self::Mxfp4 => decode_mxfp4_block,
+            Self::Iq4Nl => decode_iq4_nl_block,
+            Self::Iq4Xs => decode_iq4_xs_block,
+            Self::Iq3S => decode_iq3_s_block,
+            Self::Iq3Xxs => decode_iq3_xxs_block,
+            Self::Iq2S => decode_iq2_s_block,
+            Self::Iq2Xs => decode_iq2_xs_block,
+            Self::Iq2Xxs => decode_iq2_xxs_block,
+            Self::Iq1S => decode_iq1_s_block,
+            Self::Iq1M => decode_iq1_m_block,
         }
+    }
+
+    fn decoder(self) -> fn(&[u8], &mut [f32]) {
+        #[cfg(target_arch = "x86_64")]
+        if std::arch::is_x86_feature_detected!("avx2") {
+            return match self {
+                Self::Mxfp4 => decode_mxfp4_block_avx2_dispatch,
+                Self::Iq4Nl => decode_iq4_nl_block_avx2_dispatch,
+                Self::Iq4Xs => decode_iq4_xs_block_avx2_dispatch,
+                _ => self.scalar_decoder(),
+            };
+        }
+        self.scalar_decoder()
     }
 }
 
@@ -594,21 +608,28 @@ impl BlockQuantizedMatMulKernel {
             .checked_mul(self.n)
             .ok_or_else(|| error("dequantized weight element count overflow"))?;
         let mut weight_kn = vec![0.0f32; weight_elements];
-        let mut decoded = [0.0f32; IQ_SUPER_QK];
-        for output in 0..self.n {
-            for block_index in 0..blocks {
-                let packed_start = (output * blocks + block_index) * block_bytes;
-                self.format.decode_block(
-                    &packed[packed_start..packed_start + block_bytes],
-                    &mut decoded[..qk],
-                );
-                let k_start = block_index * qk;
-                let valid = (self.k - k_start).min(qk);
-                for (offset, value) in decoded[..valid].iter().copied().enumerate() {
-                    weight_kn[(k_start + offset) * self.n + output] = value;
+        let block_row_elements = qk
+            .min(self.k)
+            .checked_mul(self.n)
+            .ok_or_else(|| error("dequantized block-row element count overflow"))?;
+        let decoder = self.format.decoder();
+        weight_kn
+            .par_chunks_mut(block_row_elements)
+            .enumerate()
+            .for_each(|(block_index, weight_rows)| {
+                let mut decoded = [0.0f32; IQ_SUPER_QK];
+                let valid = weight_rows.len() / self.n;
+                for output in 0..self.n {
+                    let packed_start = (output * blocks + block_index) * block_bytes;
+                    decoder(
+                        &packed[packed_start..packed_start + block_bytes],
+                        &mut decoded[..qk],
+                    );
+                    for (offset, value) in decoded[..valid].iter().copied().enumerate() {
+                        weight_rows[offset * self.n + output] = value;
+                    }
                 }
-            }
-        }
+            });
         Ok(weight_kn)
     }
 }
@@ -664,6 +685,111 @@ fn decode_iq4_xs_block(block: &[u8], output: &mut [f32]) {
             output[j] = subscale * IQ4_NL_CODEBOOK[(quants[j] & 0x0f) as usize] as f32;
             output[j + 16] = subscale * IQ4_NL_CODEBOOK[(quants[j] >> 4) as usize] as f32;
         }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn decode_mxfp4_block_avx2_dispatch(block: &[u8], output: &mut [f32]) {
+    // SAFETY: BlockFormat::decoder selects this wrapper only after AVX2 detection.
+    unsafe { decode_mxfp4_block_avx2(block, output) }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn decode_iq4_nl_block_avx2_dispatch(block: &[u8], output: &mut [f32]) {
+    // SAFETY: BlockFormat::decoder selects this wrapper only after AVX2 detection.
+    unsafe { decode_iq4_nl_block_avx2(block, output) }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn decode_iq4_xs_block_avx2_dispatch(block: &[u8], output: &mut [f32]) {
+    // SAFETY: BlockFormat::decoder selects this wrapper only after AVX2 detection.
+    unsafe { decode_iq4_xs_block_avx2(block, output) }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn decode_mxfp4_block_avx2(block: &[u8], output: &mut [f32]) {
+    debug_assert_eq!(block.len(), MXFP4_BLOCK_BYTES);
+    debug_assert_eq!(output.len(), MXFP4_QK);
+    let half_scale = e8m0_half_scale(block[0]);
+    // SAFETY: the block and output lengths above cover the 16-byte load and 32 outputs.
+    unsafe {
+        decode_nibbles_scaled_avx2(&block[1..], &E2M1_DOUBLED, half_scale, output);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn decode_iq4_nl_block_avx2(block: &[u8], output: &mut [f32]) {
+    debug_assert_eq!(block.len(), IQ4_NL_BLOCK_BYTES);
+    debug_assert_eq!(output.len(), IQ4_NL_QK);
+    let scale = half::f16::from_le_bytes([block[0], block[1]]).to_f32();
+    // SAFETY: the block and output lengths above cover the 16-byte load and 32 outputs.
+    unsafe {
+        decode_nibbles_scaled_avx2(&block[2..], &IQ4_NL_CODEBOOK, scale, output);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn decode_iq4_xs_block_avx2(block: &[u8], output: &mut [f32]) {
+    debug_assert_eq!(block.len(), IQ4_XS_BLOCK_BYTES);
+    debug_assert_eq!(output.len(), IQ_SUPER_QK);
+    let scale = half::f16::from_le_bytes([block[0], block[1]]).to_f32();
+    let scales_h = u16::from_le_bytes([block[2], block[3]]);
+    let scales_l = &block[4..8];
+    let quants = &block[8..];
+    for subblock in 0..8 {
+        let low = (scales_l[subblock / 2] >> (4 * (subblock % 2))) & 0x0f;
+        let high = ((scales_h >> (2 * subblock)) & 0x03) as u8;
+        let subscale = scale * f32::from((low | (high << 4)) as i8 - 32);
+        // SAFETY: each subblock owns 16 packed bytes and 32 decoded outputs.
+        unsafe {
+            decode_nibbles_scaled_avx2(
+                &quants[subblock * 16..][..16],
+                &IQ4_NL_CODEBOOK,
+                subscale,
+                &mut output[subblock * 32..][..32],
+            );
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn decode_nibbles_scaled_avx2(
+    packed: &[u8],
+    codebook: &[i8; 16],
+    scale: f32,
+    output: &mut [f32],
+) {
+    use std::arch::x86_64::*;
+
+    debug_assert!(packed.len() >= 16);
+    debug_assert!(output.len() >= 32);
+    // SAFETY: callers provide at least 16 packed bytes and 32 output elements.
+    let (low_values, high_values) = unsafe {
+        let bytes = _mm_loadu_si128(packed.as_ptr().cast());
+        let mask = _mm_set1_epi8(0x0f);
+        let low_indices = _mm_and_si128(bytes, mask);
+        let high_indices = _mm_and_si128(_mm_srli_epi16(bytes, 4), mask);
+        let table = _mm_loadu_si128(codebook.as_ptr().cast());
+        (
+            _mm_shuffle_epi8(table, low_indices),
+            _mm_shuffle_epi8(table, high_indices),
+        )
+    };
+    let scale = _mm256_set1_ps(scale);
+    // SAFETY: each store writes eight elements inside the validated output slice.
+    unsafe {
+        let low0 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(low_values));
+        let low1 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128::<8>(low_values)));
+        let high0 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(high_values));
+        let high1 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128::<8>(high_values)));
+        _mm256_storeu_ps(output.as_mut_ptr(), _mm256_mul_ps(low0, scale));
+        _mm256_storeu_ps(output.as_mut_ptr().add(8), _mm256_mul_ps(low1, scale));
+        _mm256_storeu_ps(output.as_mut_ptr().add(16), _mm256_mul_ps(high0, scale));
+        _mm256_storeu_ps(output.as_mut_ptr().add(24), _mm256_mul_ps(high1, scale));
     }
 }
 
@@ -1426,6 +1552,48 @@ mod tests {
     }
 
     #[test]
+    fn selected_decoders_are_bit_exact_with_scalar_reference() {
+        for format in [
+            BlockFormat::Mxfp4,
+            BlockFormat::Iq4Nl,
+            BlockFormat::Iq4Xs,
+            BlockFormat::Iq3S,
+            BlockFormat::Iq3Xxs,
+            BlockFormat::Iq2S,
+            BlockFormat::Iq2Xs,
+            BlockFormat::Iq2Xxs,
+            BlockFormat::Iq1S,
+            BlockFormat::Iq1M,
+        ] {
+            let mut block = vec![0u8; format.block_bytes()];
+            for (index, byte) in block.iter_mut().enumerate() {
+                *byte = index.wrapping_mul(73).wrapping_add(19) as u8;
+            }
+            match format {
+                BlockFormat::Mxfp4 => block[0] = 128,
+                BlockFormat::Iq1M => block[48..56].fill(0),
+                _ => block[..2].copy_from_slice(&half::f16::from_f32(0.125).to_le_bytes()),
+            }
+
+            let mut scalar = [0.0f32; IQ_SUPER_QK];
+            let mut selected = [0.0f32; IQ_SUPER_QK];
+            format.scalar_decoder()(&block, &mut scalar[..format.qk()]);
+            format.decoder()(&block, &mut selected[..format.qk()]);
+            assert_eq!(
+                scalar[..format.qk()]
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                selected[..format.qk()]
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                "{format:?} selected decoder changed f32 bits"
+            );
+        }
+    }
+
+    #[test]
     fn new_iq_formats_register_with_upstream_block_sizes() {
         for (format, block_bytes) in [
             ("iq2_xs", IQ2_XS_BLOCK_BYTES),
@@ -1447,6 +1615,72 @@ mod tests {
             CpuExecutionProvider::new()
                 .get_kernel(model.graph.node(node), &[], 1)
                 .expect("implemented IQ format must create a CPU kernel");
+        }
+    }
+
+    #[test]
+    #[ignore = "representative CPU throughput benchmark; run with --release -- --ignored"]
+    fn benchmark_prefill_4096x4096_m64() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        const M: usize = 64;
+        const K: usize = 4096;
+        const N: usize = 4096;
+
+        for format in [BlockFormat::Mxfp4, BlockFormat::Iq4Nl] {
+            let block_bytes = format.block_bytes();
+            let blocks = K.div_ceil(format.qk());
+            let mut packed = vec![0u8; N * blocks * block_bytes];
+            for (index, block) in packed.chunks_exact_mut(block_bytes).enumerate() {
+                match format {
+                    BlockFormat::Mxfp4 => block[0] = 128,
+                    BlockFormat::Iq4Nl => {
+                        block[..2].copy_from_slice(&half::f16::from_f32(0.01).to_le_bytes());
+                    }
+                    _ => unreachable!(),
+                }
+                for (offset, byte) in block[block_bytes - format.qk() / 2..]
+                    .iter_mut()
+                    .enumerate()
+                {
+                    *byte = index.wrapping_mul(17).wrapping_add(offset * 29) as u8;
+                }
+            }
+            let packed = Owned::u8(&[N, blocks, block_bytes], &packed);
+            let kernel = BlockQuantizedMatMulKernel {
+                k: K,
+                n: N,
+                format,
+                packed_b_constant: false,
+                weight_kn: OnceLock::new(),
+            };
+
+            let decode_start = Instant::now();
+            let weight = black_box(kernel.dequantize_weight_kn(&packed.view()).unwrap());
+            let decode = decode_start.elapsed();
+            let activations: Vec<f32> = (0..M * K)
+                .map(|index| (index % 31) as f32 * (1.0 / 31.0))
+                .collect();
+            let mut result = vec![0.0f32; M * N];
+            let gemm_start = Instant::now();
+            gemm(
+                black_box(&activations),
+                black_box(&weight),
+                black_box(&mut result),
+                M,
+                K,
+                N,
+            )
+            .unwrap();
+            let gemm_time = gemm_start.elapsed();
+            let gflops = 2.0 * M as f64 * K as f64 * N as f64 / gemm_time.as_secs_f64() / 1.0e9;
+            eprintln!(
+                "{format:?}: decode={:.1} ms prefill={:.1} ms ({gflops:.1} GFLOP/s)",
+                decode.as_secs_f64() * 1.0e3,
+                gemm_time.as_secs_f64() * 1.0e3,
+            );
+            black_box(result);
         }
     }
 }

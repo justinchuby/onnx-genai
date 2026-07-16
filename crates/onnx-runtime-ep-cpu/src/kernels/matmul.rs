@@ -115,26 +115,39 @@ const NR: usize = 4;
 // Cache block over the K dimension so a panel of B stays resident in L1/L2
 // while a strip of C accumulates across it.
 const KC: usize = 256;
-// Row-block granularity handed to each rayon task.
-const MC: usize = 64;
+const MAX_MC: usize = 64;
 
 /// Pure-Rust blocked, register-tiled, rayon-parallelized f32 GEMM (the Generic
 /// backend). Overwrites `c` with `a @ b`.
 ///
-/// Strategy: the outer M dimension is split into `MC`-row blocks distributed
-/// across the rayon thread pool. Each task blocks over K in `KC`-wide panels and
+/// Strategy: the outer M dimension is split into pool-sized row blocks
+/// distributed across Rayon. Each task blocks over K in `KC`-wide panels and
 /// walks N in `NR`-wide strips, accumulating an `MR x NR` register tile so the
 /// hot inner loop over the N strip autovectorizes. Contains no `unsafe`.
 fn gemm_generic(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usize) {
     if m == 0 || n == 0 {
         return;
     }
+    let threads = rayon::current_num_threads();
+    let mc = if threads <= 1 {
+        MAX_MC.min(m)
+    } else {
+        let target_tasks = threads.saturating_mul(2);
+        let rows = m.div_ceil(target_tasks).clamp(1, MAX_MC);
+        if rows == 1 {
+            1
+        } else {
+            rows.div_ceil(MR).saturating_mul(MR).min(MAX_MC)
+        }
+    };
     // Parallelize over row blocks of C; each block owns a disjoint slice of `c`
-    // and reads shared, immutable `a`/`b`, so there is no aliasing.
-    c.par_chunks_mut(MC * n)
+    // and reads shared, immutable `a`/`b`, so there is no aliasing. Size the
+    // blocks from the Rayon pool: prefill commonly has fewer rows than cores,
+    // while large matrices retain MR-row reuse and bounded task counts.
+    c.par_chunks_mut(mc * n)
         .enumerate()
         .for_each(|(blk, c_block)| {
-            let i0 = blk * MC;
+            let i0 = blk * mc;
             let rows = c_block.len() / n; // last block may be short
             let a_block = &a[i0 * k..i0 * k + rows * k];
             gemm_block(a_block, b, c_block, rows, k, n);
