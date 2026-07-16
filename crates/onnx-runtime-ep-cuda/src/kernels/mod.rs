@@ -449,6 +449,8 @@ mod tests {
 
     #[test]
     fn covered_ops_have_no_duplicates() {
+        assert_eq!(CUDA_COVERED_OPS.len(), 61);
+
         let mut seen = std::collections::HashSet::new();
         for op in CUDA_COVERED_OPS {
             assert!(seen.insert(*op), "duplicate op {op} in CUDA_COVERED_OPS");

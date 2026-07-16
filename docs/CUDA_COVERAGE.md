@@ -152,9 +152,9 @@ counts:
 |---------|------:|
 | CPU registry `(domain, op_type)` pairs | **103** |
 | CPU standard-domain (`ai.onnx`) op types | **93** |
-| CUDA registry `(domain, op_type)` pairs | **60** |
-| CUDA advertised op names | **59** |
-| CPU pairs implemented by CUDA in the same domain | **49 / 103** |
+| CUDA registry `(domain, op_type)` pairs | **62** |
+| CUDA advertised op names | **61** |
+| CPU pairs implemented by CUDA in the same domain | **50 / 103** |
 | CPU standard-domain op types implemented by CUDA | **43 / 93** |
 
 The **43 shared `ai.onnx` ops** are: `Abs`, `Add`, `AveragePool`, `Cast`, `CastLike`,
@@ -174,7 +174,7 @@ The **50 CPU `ai.onnx` gaps** are: `Acos`, `Acosh`, `ArgMax`, `ArgMin`, `Asin`,
 `Shape`, `Sinh`, `Size`, `Slice`, `Split`, `Squeeze`, `Sum`, `Swish`, `Tan`,
 `Tile`, `TopK`, `Transpose`, `Unsqueeze`, and `Where`.
 
-For `com.microsoft`, CUDA matches six CPU pairs (`FusedGemm`,
+For `com.microsoft`, CUDA matches seven CPU pairs (`FusedGemm`,
 `FusedMatMulBias`, `Gelu`, `LayerNormalization`, `SimplifiedLayerNormalization`,
 `SkipLayerNormalization`, `SkipSimplifiedLayerNormalization`); CPU-only gaps are `BiasGelu`, `FastGelu`,
 `FusedAttention`, and `QuickGelu`. CUDA additionally exposes
@@ -205,7 +205,7 @@ The cuDNN pooling pass raises the advertised set to **57** op names and is
 GPU-validated on H200 for 2×2 stride-2 MaxPool in f32/f16 and padded AveragePool
 with both include-padding and exclude-padding divisor modes.
 
-The cuBLASLt fused-epilogue pass raises the advertised set to **59** op names.
+The cuBLASLt fused-epilogue pass adds two advertised op names.
 `FusedMatMulBias` uses `CUBLASLT_EPILOGUE_BIAS`; `FusedGemm` uses
 `CUBLASLT_EPILOGUE_BIAS`, `CUBLASLT_EPILOGUE_RELU_BIAS`, or
 `CUBLASLT_EPILOGUE_GELU_BIAS`. All three keep bias/activation inside GEMM.
@@ -267,4 +267,4 @@ candidate.
   libs are installed. Every such failure is an actionable `EpError` (RULES.md #1)
   naming the missing library and how to fix it.
 
-`SkipSimplifiedLayerNormalization` raises the advertised CUDA set to **60** op names; it is GPU-validated against an independent residual-add and RMS-normalization reference, including broadcast skip and residual-sum output.
+`SkipSimplifiedLayerNormalization` raises the advertised CUDA set to **61** op names; it is GPU-validated against an independent residual-add and RMS-normalization reference, including broadcast skip and residual-sum output.
