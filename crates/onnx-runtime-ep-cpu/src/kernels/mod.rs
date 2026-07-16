@@ -298,6 +298,10 @@ pub fn build_cpu_registry() -> OpRegistry {
         Box::new(contrib_fused::SimplifiedLayerNormFactory),
     );
     reg.register(
+        OpKey::new("SimplifiedLayerNormalization", "", 1),
+        Box::new(contrib_fused::SimplifiedLayerNormFactory),
+    );
+    reg.register(
         OpKey::new("SkipSimplifiedLayerNormalization", "com.microsoft", 1),
         Box::new(skip_simplified_layernorm::SkipSimplifiedLayerNormFactory),
     );
@@ -1227,7 +1231,7 @@ mod tests {
         // registrations over the Phase-1 op-name count in total.
         // MatMulNBits and GroupQueryAttention each add one more contrib-domain
         // registration.
-        assert_eq!(reg.len(), PHASE1_OPS.len() + 50);
+        assert_eq!(reg.len(), PHASE1_OPS.len() + 51);
         for op in PHASE1_OPS {
             assert!(reg.lookup(op, "", 21).is_some(), "missing factory for {op}");
         }
@@ -1242,6 +1246,7 @@ mod tests {
             reg.lookup("GroupQueryAttention", "com.microsoft", 1)
                 .is_some()
         );
+        assert!(reg.lookup("SimplifiedLayerNormalization", "", 21).is_some());
         // The fused contrib-domain LayerNormalization resolves to the same
         // kernel as the standard default-domain op.
         assert!(

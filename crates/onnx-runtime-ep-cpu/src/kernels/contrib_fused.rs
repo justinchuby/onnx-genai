@@ -279,9 +279,12 @@ impl Kernel for SimplifiedLayerNormKernel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::CpuExecutionProvider;
     use crate::kernels::elementwise::erf;
     use crate::kernels::testutil::Owned;
-    use onnx_runtime_ir::DataType;
+    use onnx_runtime_ep_api::ExecutionProvider;
+    use onnx_runtime_ir::{Attribute, DataType, Graph, Node, NodeId, static_shape};
+    use onnx_runtime_loader::{Model, encode_model_proto};
 
     fn assert_close(got: &[f32], want: &[f32]) {
         for (&g, &w) in got.iter().zip(want) {
@@ -381,7 +384,7 @@ mod tests {
             epsilon: 1e-5,
         }
         .execute(&[x.view(), scale.view()], &mut [out.view_mut()])
-            .unwrap();
+        .unwrap();
         let scale_data = [1., 2., 0.5, 1.5];
         let mut want = Vec::new();
         for row in [1., 2., 3., 4., -2., 0., 2., 4.].chunks_exact(4) {
@@ -389,6 +392,52 @@ mod tests {
             want.extend((0..4).map(|i| row[i] * inv * scale_data[i]));
         }
         assert_close(&out.to_f32(), &want);
+    }
+
+    fn simplified_layer_norm_kernel(domain: &str, opset: u64) -> Box<dyn Kernel> {
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(domain.into(), opset);
+        let x = graph.create_named_value("x", DataType::Float32, static_shape([2, 4]));
+        let scale = graph.create_named_value("scale", DataType::Float32, static_shape([4]));
+        let output = graph.create_named_value("output", DataType::Float32, static_shape([2, 4]));
+        graph.add_input(x);
+        graph.add_input(scale);
+        let mut node = Node::new(
+            NodeId(0),
+            "SimplifiedLayerNormalization",
+            vec![Some(x), Some(scale)],
+            vec![output],
+        );
+        node.domain = domain.into();
+        node.attributes
+            .insert("epsilon".into(), Attribute::Float(1e-5));
+        let node_id = graph.insert_node(node);
+        graph.add_output(output);
+        let model = Model::new(&graph);
+        let proto = encode_model_proto(&model).unwrap();
+        assert_eq!(
+            proto.graph.as_ref().unwrap().node[0].domain,
+            domain,
+            "IR-to-proto conversion must preserve the operator domain"
+        );
+        CpuExecutionProvider::new()
+            .get_kernel(model.graph.node(node_id), &[], opset)
+            .unwrap()
+    }
+
+    #[test]
+    fn standard_simplified_layer_norm_matches_contrib_variant() {
+        let x = Owned::f32(&[2, 4], &[1., 2., 3., 4., -2., 0., 2., 4.]);
+        let scale = Owned::f32(&[4], &[1., 2., 0.5, 1.5]);
+        let mut standard = Owned::zeros_f32(&[2, 4]);
+        let mut contrib = Owned::zeros_f32(&[2, 4]);
+        simplified_layer_norm_kernel("", 21)
+            .execute(&[x.view(), scale.view()], &mut [standard.view_mut()])
+            .unwrap();
+        simplified_layer_norm_kernel("com.microsoft", 1)
+            .execute(&[x.view(), scale.view()], &mut [contrib.view_mut()])
+            .unwrap();
+        assert_close(&standard.to_f32(), &contrib.to_f32());
     }
 
     /// A valid output-only SkipLayerNorm node (single output) must succeed:
@@ -547,12 +596,15 @@ mod tests {
         let mut out = Owned::zeros_f32(&[2, 2, 2]);
         let mut inv_std = Owned::zeros_f32(&[2, 1, 1]);
         let eps = 1e-5;
-        SimplifiedLayerNormKernel { axis: 1, epsilon: eps }
-            .execute(
-                &[x.view(), scale.view()],
-                &mut [out.view_mut(), inv_std.view_mut()],
-            )
-            .unwrap();
+        SimplifiedLayerNormKernel {
+            axis: 1,
+            epsilon: eps,
+        }
+        .execute(
+            &[x.view(), scale.view()],
+            &mut [out.view_mut(), inv_std.view_mut()],
+        )
+        .unwrap();
         let scale_data = [1., 2., 0.5, 1.5];
         let mut want = Vec::new();
         let mut want_inv = Vec::new();

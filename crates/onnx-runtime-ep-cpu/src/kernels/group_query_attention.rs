@@ -1,8 +1,9 @@
 //! `com.microsoft::GroupQueryAttention` f32 reference kernel.
 //!
-//! Implements the unpacked Q/K/V form, BNSH KV caches, causal and local-window
-//! masking, rotary embedding, and score softcap. Packed inputs, quantized caches,
-//! attention bias, smooth softmax/head sink, and QK capture are rejected.
+//! Implements unpacked Q/K/V and packed QKV inputs, BNSH KV caches, causal and
+//! local-window masking, rotary embedding, and score softcap. Packed KV,
+//! quantized caches, attention bias, smooth softmax/head sink, and QK capture
+//! are rejected.
 
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ir::Node;
@@ -169,6 +170,80 @@ impl Bhsd {
         })
     }
 
+    fn from_packed_qkv(
+        view: &TensorView,
+        num_heads: usize,
+        kv_num_heads: usize,
+    ) -> Result<(Self, Self, Self)> {
+        if view.shape.len() != 3 {
+            return Err(EpError::KernelFailed(format!(
+                "GroupQueryAttention: packed query must be rank 3 [B,S,(N+2*Nk)*D], got {:?}",
+                view.shape
+            )));
+        }
+        let (batch, seq, hidden) = (view.shape[0], view.shape[1], view.shape[2]);
+        let packed_heads = num_heads + 2 * kv_num_heads;
+        if !hidden.is_multiple_of(packed_heads) {
+            return Err(EpError::KernelFailed(format!(
+                "GroupQueryAttention: packed QKV hidden size {hidden} is not divisible by num_heads + 2*kv_num_heads ({packed_heads})"
+            )));
+        }
+        let dim = hidden / packed_heads;
+        if dim == 0 {
+            return Err(EpError::KernelFailed(
+                "GroupQueryAttention: packed QKV head size must be positive".into(),
+            ));
+        }
+
+        let src = to_dense_f32_widen("GroupQueryAttention", view)?;
+        let q_hidden = num_heads * dim;
+        let kv_hidden = kv_num_heads * dim;
+        let mut q = vec![0.0; batch * num_heads * seq * dim];
+        let mut k = vec![0.0; batch * kv_num_heads * seq * dim];
+        let mut v = vec![0.0; k.len()];
+        for b in 0..batch {
+            for s in 0..seq {
+                let src_base = (b * seq + s) * hidden;
+                for h in 0..num_heads {
+                    for d in 0..dim {
+                        q[((b * num_heads + h) * seq + s) * dim + d] = src[src_base + h * dim + d];
+                    }
+                }
+                for h in 0..kv_num_heads {
+                    for d in 0..dim {
+                        let dst = ((b * kv_num_heads + h) * seq + s) * dim + d;
+                        k[dst] = src[src_base + q_hidden + h * dim + d];
+                        v[dst] = src[src_base + q_hidden + kv_hidden + h * dim + d];
+                    }
+                }
+            }
+        }
+
+        Ok((
+            Self {
+                data: q,
+                batch,
+                heads: num_heads,
+                seq,
+                dim,
+            },
+            Self {
+                data: k,
+                batch,
+                heads: kv_num_heads,
+                seq,
+                dim,
+            },
+            Self {
+                data: v,
+                batch,
+                heads: kv_num_heads,
+                seq,
+                dim,
+            },
+        ))
+    }
+
     #[inline]
     fn at(&self, b: usize, h: usize, s: usize, d: usize) -> f32 {
         self.data[((b * self.heads + h) * self.seq + s) * self.dim + d]
@@ -240,9 +315,10 @@ impl Kernel for GroupQueryAttentionKernel {
                 "GroupQueryAttention: output_qk is not yet supported".into(),
             ));
         }
-        if inputs[1].is_absent() || inputs[2].is_absent() {
+        let packed_qkv = inputs[1].is_absent() && inputs[2].is_absent();
+        if inputs[1].is_absent() != inputs[2].is_absent() {
             return Err(EpError::KernelFailed(
-                "GroupQueryAttention: packed QKV/packed KV input is not yet supported; provide unpacked query, key, and value".into(),
+                "GroupQueryAttention: key and value must both be present for unpacked Q/K/V or both absent for packed QKV".into(),
             ));
         }
         if inputs.get(10).is_some_and(|v| !v.is_absent()) {
@@ -269,9 +345,15 @@ impl Kernel for GroupQueryAttentionKernel {
             ));
         }
 
-        let mut q = Bhsd::from_bsh(&inputs[0], self.num_heads, "query")?;
-        let mut k = Bhsd::from_bsh(&inputs[1], self.kv_num_heads, "key")?;
-        let v = Bhsd::from_bsh(&inputs[2], self.kv_num_heads, "value")?;
+        let (mut q, mut k, v) = if packed_qkv {
+            Bhsd::from_packed_qkv(&inputs[0], self.num_heads, self.kv_num_heads)?
+        } else {
+            (
+                Bhsd::from_bsh(&inputs[0], self.num_heads, "query")?,
+                Bhsd::from_bsh(&inputs[1], self.kv_num_heads, "key")?,
+                Bhsd::from_bsh(&inputs[2], self.kv_num_heads, "value")?,
+            )
+        };
         if q.batch != k.batch
             || q.batch != v.batch
             || k.seq != v.seq
@@ -708,6 +790,73 @@ mod tests {
         assert_eq!(pk.shape, vec![1, 2, 3, 2]);
         close(&pk.to_f32(), &k_bnsh);
         close(&pv.to_f32(), &v_bnsh);
+    }
+
+    #[test]
+    fn packed_qkv_matches_unpacked_and_independent_reference() {
+        let q = vec![
+            1., 0., 1., 0., 0., 1., 0., 1., 0., 1., 0., 1., 1., 0., 1., 0.,
+        ];
+        let k_bsh = vec![1., 0., 0., 1., 0., 1., 1., 0.];
+        let v_bsh = vec![1., 2., 10., 20., 3., 4., 30., 40.];
+        let mut packed = Vec::with_capacity(q.len() + k_bsh.len() + v_bsh.len());
+        for s in 0..2 {
+            packed.extend_from_slice(&q[s * 8..(s + 1) * 8]);
+            packed.extend_from_slice(&k_bsh[s * 4..(s + 1) * 4]);
+            packed.extend_from_slice(&v_bsh[s * 4..(s + 1) * 4]);
+        }
+        let k_bnsh = bsh_to_bnsh(&k_bsh, 2, 2);
+        let v_bnsh = bsh_to_bnsh(&v_bsh, 2, 2);
+        let want = reference(&q, &k_bnsh, &v_bnsh, 2, 2, 0);
+
+        let mut unpacked_out = Owned::zeros_f32(&[1, 2, 8]);
+        let mut packed_out = Owned::zeros_f32(&[1, 2, 8]);
+        let mut unpacked_k = Owned::zeros_f32(&[1, 2, 2, 2]);
+        let mut unpacked_v = Owned::zeros_f32(&[1, 2, 2, 2]);
+        let mut packed_k = Owned::zeros_f32(&[1, 2, 2, 2]);
+        let mut packed_v = Owned::zeros_f32(&[1, 2, 2, 2]);
+        gqa_kernel(&[])
+            .execute(
+                &[
+                    Owned::f32(&[1, 2, 8], &q).view(),
+                    Owned::f32(&[1, 2, 4], &k_bsh).view(),
+                    Owned::f32(&[1, 2, 4], &v_bsh).view(),
+                    absent(),
+                    absent(),
+                    Owned::i32(&[1], &[1]).view(),
+                    Owned::i32(&[], &[2]).view(),
+                ],
+                &mut [
+                    unpacked_out.view_mut(),
+                    unpacked_k.view_mut(),
+                    unpacked_v.view_mut(),
+                ],
+            )
+            .unwrap();
+        gqa_kernel(&[])
+            .execute(
+                &[
+                    Owned::f32(&[1, 2, 16], &packed).view(),
+                    absent(),
+                    absent(),
+                    absent(),
+                    absent(),
+                    Owned::i32(&[1], &[1]).view(),
+                    Owned::i32(&[], &[2]).view(),
+                ],
+                &mut [
+                    packed_out.view_mut(),
+                    packed_k.view_mut(),
+                    packed_v.view_mut(),
+                ],
+            )
+            .unwrap();
+
+        close(&unpacked_out.to_f32(), &want);
+        close(&packed_out.to_f32(), &want);
+        close(&packed_out.to_f32(), &unpacked_out.to_f32());
+        close(&packed_k.to_f32(), &unpacked_k.to_f32());
+        close(&packed_v.to_f32(), &unpacked_v.to_f32());
     }
 
     #[test]

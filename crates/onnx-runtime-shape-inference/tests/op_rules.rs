@@ -200,7 +200,11 @@ fn fused_matmul_transb() {
     // The exact case Chew cited: A [8,64] · B [32,64]^T -> [8,32]. The plain
     // matmul reuse produced the wrong [8,64]; the dedicated handler is correct.
     let n = fused_matmul_node(&[("transB", 1)]);
-    let outs = run(&n, vec![f32in(vec![c(8), c(64)]), f32in(vec![c(32), c(64)])], 1);
+    let outs = run(
+        &n,
+        vec![f32in(vec![c(8), c(64)]), f32in(vec![c(32), c(64)])],
+        1,
+    );
     assert_eq!(out_shape(&outs), vec![c(8), c(32)]);
 }
 
@@ -208,7 +212,11 @@ fn fused_matmul_transb() {
 fn fused_matmul_transa() {
     // A supplied as [K, M] = [64, 8], transA=1 -> M=8; B [64, 32] -> [8, 32].
     let n = fused_matmul_node(&[("transA", 1)]);
-    let outs = run(&n, vec![f32in(vec![c(64), c(8)]), f32in(vec![c(64), c(32)])], 1);
+    let outs = run(
+        &n,
+        vec![f32in(vec![c(64), c(8)]), f32in(vec![c(64), c(32)])],
+        1,
+    );
     assert_eq!(out_shape(&outs), vec![c(8), c(32)]);
 }
 
@@ -216,7 +224,11 @@ fn fused_matmul_transa() {
 fn fused_matmul_transa_and_transb() {
     // A [K,M]=[64,8] transA, B [N,K]=[32,64] transB -> [8, 32].
     let n = fused_matmul_node(&[("transA", 1), ("transB", 1)]);
-    let outs = run(&n, vec![f32in(vec![c(64), c(8)]), f32in(vec![c(32), c(64)])], 1);
+    let outs = run(
+        &n,
+        vec![f32in(vec![c(64), c(8)]), f32in(vec![c(32), c(64)])],
+        1,
+    );
     assert_eq!(out_shape(&outs), vec![c(8), c(32)]);
 }
 
@@ -239,7 +251,11 @@ fn fused_matmul_batched_transb() {
 fn fused_matmul_plain_matches_matmul() {
     // With no transpose flags, FusedMatMul must equal plain MatMul.
     let n = fused_matmul_node(&[]);
-    let outs = run(&n, vec![f32in(vec![c(2), c(3)]), f32in(vec![c(3), c(4)])], 1);
+    let outs = run(
+        &n,
+        vec![f32in(vec![c(2), c(3)]), f32in(vec![c(3), c(4)])],
+        1,
+    );
     assert_eq!(out_shape(&outs), vec![c(2), c(4)]);
 }
 
@@ -248,7 +264,11 @@ fn fused_matmul_alpha_is_shape_neutral() {
     // `alpha` scales values only; it must not affect the output shape.
     let mut n = fused_matmul_node(&[("transB", 1)]);
     n = with_attr(n, "alpha", Attribute::Float(2.0));
-    let outs = run(&n, vec![f32in(vec![c(8), c(64)]), f32in(vec![c(32), c(64)])], 1);
+    let outs = run(
+        &n,
+        vec![f32in(vec![c(8), c(64)]), f32in(vec![c(32), c(64)])],
+        1,
+    );
     assert_eq!(out_shape(&outs), vec![c(8), c(32)]);
 }
 
@@ -383,7 +403,7 @@ fn attention_4d_all_outputs_with_cache() {
             f32in(vec![c(2), c(4), c(3), c(8)]),
             f32in(vec![c(2), c(4), c(5), c(8)]),
             f32in(vec![c(2), c(4), c(5), c(16)]),
-            NodeIo::default(), // attn_mask (skipped)
+            NodeIo::default(),                   // attn_mask (skipped)
             f32in(vec![c(2), c(4), c(7), c(8)]), // past_key
         ],
         23,
@@ -472,10 +492,10 @@ fn attention_opset24_nonpad_external_cache_no_past_concat() {
             f32in(vec![c(1), c(2), c(3), c(8)]),
             f32in(vec![c(1), c(2), c(5), c(8)]),
             f32in(vec![c(1), c(2), c(5), c(16)]),
-            NodeIo::default(),                    // attn_mask (skipped)
-            NodeIo::default(),                    // past_key (absent)
-            NodeIo::default(),                    // past_value (absent)
-            tin(DataType::Int64, vec![c(1)]),     // nonpad_kv_seqlen
+            NodeIo::default(),                // attn_mask (skipped)
+            NodeIo::default(),                // past_key (absent)
+            NodeIo::default(),                // past_value (absent)
+            tin(DataType::Int64, vec![c(1)]), // nonpad_kv_seqlen
         ],
         24,
     );
@@ -528,7 +548,11 @@ fn add_two_distinct_symbols_keeps_named_representative() {
     let anon = sym(0x8000_0000);
     let n = node("Add", 2, 1);
     // Order-independent: named wins whether it is the left or the right operand.
-    let outs = run(&n, vec![f32in(vec![anon.clone()]), f32in(vec![named.clone()])], 13);
+    let outs = run(
+        &n,
+        vec![f32in(vec![anon.clone()]), f32in(vec![named.clone()])],
+        13,
+    );
     assert_eq!(out_shape(&outs), vec![named.clone()]);
     let outs = run(&n, vec![f32in(vec![named.clone()]), f32in(vec![anon])], 13);
     assert_eq!(out_shape(&outs), vec![named]);
@@ -600,11 +624,7 @@ fn argmin_returns_int64() {
 #[test]
 fn topk_outputs_and_dynamic_k() {
     let n = with_attr(node("TopK", 2, 2), "axis", Attribute::Int(-1));
-    let outs = run(
-        &n,
-        vec![f32in(vec![c(2), c(8)]), sd_vec(vec![c(3)])],
-        11,
-    );
+    let outs = run(&n, vec![f32in(vec![c(2), c(8)]), sd_vec(vec![c(3)])], 11);
     assert_eq!(out_shape(&outs), vec![c(2), c(3)]);
     assert_eq!(out_dtype(&outs), DataType::Float32);
     assert_eq!(outs[1].type_info.as_ref().unwrap().shape, vec![c(2), c(3)]);
@@ -635,7 +655,10 @@ fn tile_static_repeats() {
     let n = node("Tile", 2, 1);
     let outs = run(
         &n,
-        vec![f32in(vec![c(2), c(3), c(4)]), sd_vec(vec![c(1), c(2), c(3)])],
+        vec![
+            f32in(vec![c(2), c(3), c(4)]),
+            sd_vec(vec![c(1), c(2), c(3)]),
+        ],
         13,
     );
     assert_eq!(out_shape(&outs), vec![c(2), c(6), c(12)]);
@@ -840,10 +863,7 @@ fn size_overflowing_total_is_not_bogus() {
         vec![f32in(vec![big.clone(), big.clone(), big.clone(), big])],
         13,
     );
-    let sd = outs[0]
-        .shape_data
-        .as_ref()
-        .expect("Size emits shape-data");
+    let sd = outs[0].shape_data.as_ref().expect("Size emits shape-data");
     assert_eq!(sd.elems.len(), 1);
     assert!(sd.elems[0].is_overflow());
     assert_eq!(sd.elems[0].as_const(), None);
@@ -1171,6 +1191,39 @@ fn group_query_attention_dynamic_total_leaves_present_sequence_symbolic() {
         "dynamic max(capacity, total) must remain data-dependent"
     );
     assert_eq!(present_key[2], present_value[2]);
+}
+
+#[test]
+fn group_query_attention_packed_qkv_splits_output_and_cache_shapes() {
+    let mut inputs = gqa_inputs(8, Some(3));
+    inputs[0] = f32in(vec![c(1), c(1), c(16)]);
+    inputs[1] = NodeIo::default();
+    inputs[2] = NodeIo::default();
+    let mut packed_node = gqa_node();
+    packed_node.inputs[1] = None;
+    packed_node.inputs[2] = None;
+    let outs = run(&packed_node, inputs, 1);
+    assert_eq!(out_shape(&outs), vec![c(1), c(1), c(8)]);
+    assert_eq!(
+        outs[1].type_info.as_ref().unwrap().shape,
+        vec![c(1), c(2), c(8), c(2)]
+    );
+    assert_eq!(
+        outs[2].type_info.as_ref().unwrap().shape,
+        vec![c(1), c(2), c(8), c(2)]
+    );
+}
+
+#[test]
+fn standard_simplified_layer_norm_passthrough() {
+    let n = node("SimplifiedLayerNormalization", 2, 1);
+    let outs = run(
+        &n,
+        vec![f32in(vec![sym(0), c(8), c(768)]), f32in(vec![c(768)])],
+        21,
+    );
+    assert_eq!(out_shape(&outs), vec![sym(0), c(8), c(768)]);
+    assert_eq!(out_dtype(&outs), DataType::Float32);
 }
 
 #[test]
