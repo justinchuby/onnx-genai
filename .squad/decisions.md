@@ -434,3 +434,24 @@ NVRTC available: 113 passed, 0 failed, 0 skipped. The movement GPU binary passed
 **By:** Rachael; reviewed by Sebastian
 **What:** The native CPU executor lowers only single-consumer `x * Sigmoid(x)` patterns to `com.microsoft::Silu`; the CPU kernel uses a non-aliasing contiguous-f32 direct-write path and retains the general strided fallback. The rewrite handles either Mul operand order and rejects graph-output or multi-consumer Sigmoid values. Sebastian approved commit `682c93d`; commit `d116a96` adds the multi-consumer negative test.
 **Why:** Qwen2.5-0.5B has this exact pattern in all 24 MLP layers. Fusion removes 24 intermediate tensors and dispatches, reducing the former 6.55% Sigmoid share to zero while preserving greedy output tokens. CPU/session tests passed (409/112), and interleaved benchmarks improved from 44.45 to 47.64 tok/s.
+
+#### Source: `roy-matmulnbits-gemv.md`
+
+### 2026-07-16: Stream packed int4 weights in M=1 VNNI GEMV
+**By:** Roy
+**What:** Route symmetric block-32, no-g_idx, M=1 `MatMulNBits` at `accuracy_level=4` through a runtime-gated AVX-VNNI/AVX512-VNNI kernel that unpacks int4 weights inside the dot product. Retain the existing int8/fp32 paths for unsupported CPUs and other operator shapes.
+**Why:** Steady-state profiling put 93.7% of MatMulNBits time in the threaded GEMV while activation quantization and tensor preparation were about 3% each; prepack was one-time. The prior path streamed 617.45 MB/token of expanded weights, scales, and block sums and reduced SIMD lanes every 32 elements. The fused path follows MLAS's packed-weight approach, halves the minimum stream to 308.73 MB/token, reduces paired MatMulNBits time by 14%, and preserves known-good decode tokens.
+
+#### Source: `wallace-matmulnbits-direct-int4-review.md`
+
+### 2026-07-16: Approve direct-int4 VNNI MatMulNBits GEMV
+**By:** Wallace
+**What:** 🟢 Approve Roy's `4af8646`. Added focused scalar-fallback and direct-int4 serial/parallel partial-K coverage in `c49f878`.
+**Why:** Low/high nibble order, symmetric zero point 8, per-block scales, padded K tails, runtime SIMD gates, and disjoint N partitioning are correct. The full CPU EP suite passes 411/411 tests. Independent 24-thread medians measured 45.79→49.96 tok/s; 60-step profiling measured MatMulNBits 16.824→14.537 ms and 84.98%→83.41%. At 96 threads, throughput measured 15.45→28.00 tok/s. Tokens remained `[11576, 42740, 11, 358]`.
+
+#### Source: `luv-mmnb-tiling.md`
+
+### 2026-07-16: Keep the one-column direct-int4 GEMV
+**By:** Luv
+**What:** Four- and eight-column SIMD tiling were measured and reverted. The production MatMulNBits kernel remains the simpler one-column direct-int4 path.
+**Why:** At 24 workers, seven interleaved runs measured 54.91 tok/s for the current kernel versus 52.67 and 52.65 tok/s for tile widths four and eight. Width eight lowered median MatMulNBits time but worsened its mean through long-tail stalls; both wider tiles regressed at 96 workers. The row-major packed-weight layout makes wider tiles open more non-contiguous weight streams while the small activation vector is already cache-resident.

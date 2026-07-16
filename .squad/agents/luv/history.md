@@ -6,3 +6,7 @@ Hired as an additional Code Reviewer (alongside Gaff) as the codebase grew to 9 
 
 ## 2026-07-13T18:30:00Z — Review/fix batch
 - Reviewed Batty's issue #14 vision token-expansion wiring and rejected multi-image over-count plus missing `tokens_per_tile` guards; Batty was locked out and Leon owned the fix.
+
+## 2026-07-16T00:00:02Z — MatMulNBits GEMV tiling result
+- Evaluated four- and eight-column direct-int4 GEMV tiling; both regressed at 24 and 96 threads because of register pressure, spills, and non-contiguous packed-weight streams.
+- Reverted the experiments and documented the negative result in `79c52a6`; the one-column GEMV remains the production path.

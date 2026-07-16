@@ -313,3 +313,9 @@ Scoped the "export Gemma4 E2B/12B via Mobius and smoke-test through onnx-genai" 
 - **Allocation-free Mul fast path ✅ (`347060f`, Leon; Holden 🟡):** Same-shape contiguous f32 inputs now write directly to a non-aliased output, while aliases, broadcasting, striding, and other dtypes retain the generic path. `Mul` fell **3.12 → 0.25 ms** and native decode improved **40.5 → 44.2 tok/s**.
 - **Guarded SiLU fusion ✅ (`682c93d` + `d116a96`, Rachael; Sebastian 🟢):** The executor lowers only single-consumer `x * Sigmoid(x)` pairs (either Mul operand order) to allocation-free CPU `Silu`; graph-output and multi-consumer Sigmoids are excluded. All 24 model pairs fuse safely; Sigmoid's **6.55% → 0%** profile share and decode reaches approximately **47.6 tok/s**.
 - **Current bottleneck:** native CPU decode is approximately **40.5 → 47.6 tok/s** across this wave (+17%). `MatMulNBits` is now about **81%** of decode time and is under active investigation by Roy.
+
+### MatMulNBits direct-int4 GEMV follow-up
+
+- **Direct-int4 VNNI GEMV ✅ (`2095325` + `2d7c974`, Roy; Wallace 🟢):** M=1, block-32, symmetric/no-`g_idx`, `accuracy_level=4` projections now stream packed int4 nibbles directly into AVX-VNNI/AVX512-VNNI dot products, applying scales per block without materializing int8 weights. Decode improved from approximately **47.6 → 50 tok/s** at 24 threads; NUMA-sensitive 96-thread throughput improved from approximately **15 → 28 tok/s**. Unsupported shapes and CPUs retain the established paths.
+- **Wide GEMV tiling rejected (`79c52a6`, Luv):** Four- and eight-column tiling regressed at 24 threads (54.91 baseline vs. 52.67/52.65 tok/s) and also regressed at 96 threads due to register pressure, spills, and non-contiguous packed-weight streams. The one-column kernel remains canonical.
+- **Current bottleneck / next levers:** `MatMulNBits` remains roughly **82%** of decode time. Next work is NUMA-aware scheduling and projection fusion; design is pending.
