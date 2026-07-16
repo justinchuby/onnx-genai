@@ -9,3 +9,7 @@ Hired as a Metal/MPS kernel engineer for the new Apple Metal EP for ONNX Runtime
 
 ### 2026-07-16T00:00:00Z — Performance-and-design wave
 Applied CUDA coverage documentation correction for the merged kernel slice.
+
+## 2026-07-16T00:00:00Z — onnx-rs upstream text-format port review
+- Cleared merged commit `23e4995` 🟢: 10 added tests make 16 upstream-derived text-format cases and assert real parser/IR/codec behavior.
+- Confirmed 89 passing onnx-rs tests with no ignored or vacuous cases; documented unsupported functions, non-tensor type forms, complex/2-bit dtypes, and literal tensor/sparse payload syntax.

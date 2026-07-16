@@ -95,3 +95,8 @@ Reviewed Fido's `cbourjau/onnx-tests` nxrt adapter and reproduction docs 🟡. T
 
 ### 2026-07-16T00:00:00Z — Performance-and-design wave
 Added Rayon N-range partitioning for native CPU MatMulNBits.
+
+## 2026-07-16T00:00:00Z — onnx-rs upstream text-format test port
+- Expanded `crates/onnx-rs/tests/text_format_port.rs` from 6 to 16 upstream-derived cases in merged commit `23e4995`.
+- Coverage includes attributes, initializers, supported dtypes, node domains, multi-opset models, text round-trips, JSON/TextProto codecs, and malformed input; 89 onnx-rs tests pass.
+- Deliberately omitted unsupported model functions, sequence/optional/sparse types, complex/int2/uint2 dtypes, and typed tensor-payload literals.

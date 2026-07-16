@@ -337,3 +337,7 @@ Scoped the "export Gemma4 E2B/12B via Mobius and smoke-test through onnx-genai" 
 
 - **nxrt eager + genai ✅ (`41d8c31`, Rachael; Sebastian fix; Holden 🔴→🟢):** Default Python bindings now expose `nxrt.eager` dispatch/opset/cache APIs and `nxrt.genai.Engine` loading, tokenization, generation, and streaming. The rejected `RefCell`/unsendable Engine was replaced with a sendable, GIL-releasing `Mutex` wrapper that fails fast on contention; `docs/PYTHON.md` documents the wheel setup.
 - **onnx-rs serialization bindings ✅ (`5b348b5`, Batty; Deckard fix; Freysa 🔴→🟢):** New `onnx-rs-python` imports as `onnx_rs` with opaque model load/save and text/JSON/TextProto codecs. The reviewer-fix cycle removed lossy path conversion and `exists()` prechecks, preserving native paths and `__fspath__` exceptions.
+
+### ONNX-RS text-format upstream coverage
+
+- **Upstream serde test port ✅ (`23e4995`, Zhora; Coco 🟢):** Expanded `text_format_port.rs` from **6 → 16** upstream-derived cases; **89** onnx-rs tests pass. **Known gaps:** model-local functions; sequence/optional/sparse types; complex/int2/uint2 dtypes; and typed tensor-payload literals remain unsupported.
