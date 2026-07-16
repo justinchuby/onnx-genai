@@ -1283,6 +1283,7 @@ mod tests {
             .prepack_int8_weight(&b.view(), &scales_tensor.view(), None)
             .unwrap();
         let mut expected = vec![0.0; n];
+        let mut scalar = vec![0.0; n];
         let mut actual = vec![0.0; n];
         int8_matmul(
             &activations,
@@ -1297,6 +1298,14 @@ mod tests {
         int4_matmul_m1(
             &activations,
             &packed_weight,
+            &mut scalar,
+            k,
+            n,
+            DotKernel::Scalar,
+        );
+        int4_matmul_m1(
+            &activations,
+            &packed_weight,
             &mut actual,
             k,
             n,
@@ -1306,13 +1315,61 @@ mod tests {
             padded_k,
             activations.len().div_ceil(block_size) * block_size
         );
-        for (index, (&actual, &expected)) in actual.iter().zip(&expected).enumerate() {
+        for (index, ((&actual, &scalar), &expected)) in
+            actual.iter().zip(&scalar).zip(&expected).enumerate()
+        {
             let tolerance = 1e-4 + 1e-5 * expected.abs();
             assert!(
                 (actual - expected).abs() <= tolerance,
                 "index {index}: direct int4={actual}, int8 reference={expected}, tolerance={tolerance}"
             );
+            assert!(
+                (scalar - expected).abs() <= tolerance,
+                "index {index}: scalar int4={scalar}, int8 reference={expected}, tolerance={tolerance}"
+            );
         }
+    }
+
+    #[test]
+    fn matmulnbits_direct_int4_parallel_partial_k_matches_serial() {
+        let (k, n, block_size) = (77usize, 1025usize, 32usize);
+        let blocks = k.div_ceil(block_size);
+        let activations: Vec<f32> = (0..k)
+            .map(|i| ((i * 23 % 53) as f32 - 26.0) / 17.0)
+            .collect();
+        let packed_weight = PackedInt4Weight {
+            values: (0..n * blocks * block_size / 2)
+                .map(|i| ((i * 29 + 7) % 256) as u8)
+                .collect(),
+            scales: (0..n * blocks)
+                .map(|i| ((i * 13 % 17) + 1) as f32 / 100.0)
+                .collect(),
+        };
+        let mut serial = vec![0.0; n];
+        let mut parallel = vec![0.0; n];
+        let dot_kernel = selected_dot_kernel();
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap()
+            .install(|| {
+                int4_matmul_m1(&activations, &packed_weight, &mut serial, k, n, dot_kernel);
+            });
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap()
+            .install(|| {
+                int4_matmul_m1(
+                    &activations,
+                    &packed_weight,
+                    &mut parallel,
+                    k,
+                    n,
+                    dot_kernel,
+                );
+            });
+        assert_eq!(parallel, serial);
     }
 
     #[test]
