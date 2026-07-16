@@ -46,3 +46,7 @@ Authored CUDA Gather, Shape, and Constant kernels; coverage reached 65.
 ## 2026-07-16T14:20:00Z — CUDA M3 device-resident KV cache
 - Merged `398c536`: persistent aliased K/V allocations have stable pointers, zero KV H2D/D2H transfers, O(1) mask updates, capacity/valid-length separation, and configurable default max length 4096.
 - Sebastian cleared M3 and confirmed the CPU/CUDA mismatch beginning at token 10 is pre-existing M2 numerical drift.
+
+## 2026-07-16T17:00:38+0000 — CUDA M5 int4 GEMV decode
+- Merged `1de9584`: direct packed-int4 M=1 CUDA GEMV avoids f32 weight expansion and improved decode by approximately 68–96%.
+- Wallace 🟢 verified H200 parity and the unchanged Qwen decode contract.

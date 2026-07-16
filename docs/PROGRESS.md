@@ -348,5 +348,15 @@ Scoped the "export Gemma4 E2B/12B via Mobius and smoke-test through onnx-genai" 
 
 - **Upstream serde test port ✅ (`23e4995`, Zhora; Coco 🟢):** Expanded `text_format_port.rs` from **6 → 16** upstream-derived cases; **89** onnx-rs tests pass.
 - **onnx-rs full-spec serde ✅ DONE (`f058594`; Deckard `1b65769`; Rachael 🟢):** IR13 bindings, INT2/UINT2/FLOAT8E8M0, multi-device proto round-trips, and authoritative native text are complete. Readable DSL edits for headers, graph/nodes/attributes, dtype/shape, nested graphs, opaque strings, and list cardinalities win; residual data restores only omitted payload/metadata.
-- **Sub-4-bit CPU BlockQuantizedMatMul ✅ (`a2b2f0b`, Joi; Leon 🟢):** `MXFP4` (exact E2M1/E8M0) and `IQ4_NL` run correctly; unaudited IQ1/IQ2/IQ3/IQ4_XS formats fail explicitly rather than silently corrupting.
-- **Mobius exports — OPEN:** PR [#404](https://github.com/onnxruntime/mobius/pull/404) adds GLM-5.2 MoE with IndexShare DSA + MTP; PR [#405](https://github.com/onnxruntime/mobius/pull/405) adds DeepSeek-V4-Flash. Both are rebased on merged [#398](https://github.com/onnxruntime/mobius/pull/398) (`InferenceMetadata`).
+- **Sub-4-bit CPU BlockQuantizedMatMul ✅ (`a2b2f0b`; `f6c530f`, Bryant; Leon 🟢):** MXFP4, IQ4_NL, IQ4_XS, IQ3_S, and IQ2_XXS decode natively with audited llama.cpp grids; remaining IQ1/IQ2_XS/IQ2_S/IQ3_XXS formats fail explicitly rather than silently corrupting.
+- **CUDA int4 GEMV decode ✅ (`1de9584`, Roy; Wallace 🟢):** M=1 packed-int4 `MatMulNBits` decode reads weights directly on CUDA, improving decode by approximately 68–96% on H200 while preserving CPU/ORT contracts.
+- **Weight offload design ✅ (`docs/WEIGHT_OFFLOAD.md`, Nabil):** mmap → host → VRAM weight-tier subsystem design is complete and **awaiting user greenlight**.
+- **Mobius exports:** PR [#404](https://github.com/onnxruntime/mobius/pull/404) adds GLM-5.2 MoE with IndexShare DSA + MTP; PR [#405](https://github.com/onnxruntime/mobius/pull/405) adds DeepSeek-V4-Flash MTP + CSA; PR [#406](https://github.com/onnxruntime/mobius/pull/406) adds MXFP4 and IQ4_NL `BlockQuantizedMatMul` export wiring.
+
+### Runtime follow-ups
+
+- CUDA sub-4-bit `BlockQuantizedMatMul` kernel (GPU, in progress).
+- Native sparse-attention/index operations for DeepSeek-V4 CSA.
+- Iterative MTP orchestration.
+- Remaining IQ1/IQ2_XS/IQ2_S/IQ3_XXS formats.
+- CUDA↔CPU numeric drift.

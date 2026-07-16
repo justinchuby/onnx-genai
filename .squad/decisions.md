@@ -722,3 +722,30 @@ The scoped skip grep found no `Unsupported`, `todo!`, `unimplemented!`, `unreach
 **By:** Leon
 **What:** 🟢 CLEAR commit `0307138`. Hand-verified MXFP4's OCP E2M1 table, E8M0 scaling/NaN handling, and llama.cpp low-nibble→`j` / high-nibble→`j+16` layout; traced exponent `128` with byte `0xd7` to `12.0` and `-6.0`. Verified IQ4_NL's exact llama.cpp 16-entry codebook and nibble order; traced fp16 scale `0.5` with byte `0xf0` to `-63.5` and `56.5`. Confirmed IQ1_S, IQ2_XXS, IQ3_S, and IQ4_XS all fail kernel creation as recognized-but-unimplemented. CPU EP tests passed 420/420 and the Python ONNX IR fixture passed 1/1.
 **Why:** The implementation matches llama.cpp commit `b15ca938` for block sizes, tables, scale conversion, and packed element order, while incomplete IQ formats fail closed instead of decoding silently. `cargo clippy -p onnx-runtime-ep-cpu --lib` completed with only existing warnings and none in Joi's new code; `--all-targets` reaches an unrelated pre-existing denied approximate-constant lint in `elementwise.rs`.
+
+## 2026-07-16 — CUDA sub-4-bit and Mobius export wave
+
+### CUDA MatMulNBits M=1 packed-int4 GEMV
+**By:** Roy
+**What:** Merged `1de9584`: M=1 no-`g_idx` CUDA `MatMulNBits` decode reads output-major packed int4 weights directly, applies block scales during accumulation, and retains the constrained symmetric block-32 `accuracy_level=4` route. Unsupported shapes and M>1 continue through the established fallback.
+**Why:** Avoiding a full f32 weight materialization and parallelizing output dots improves CUDA decode by approximately 68–96% without changing packed-nibble, zero-point, scale, or fallback contracts. Wallace 🟢 verified H200 parity, adversarial layout cases, 120 CUDA tests, and unchanged Qwen tokens.
+
+### Audited IQ4_XS, IQ3_S, and IQ2_XXS CPU decoding
+**By:** Bryant
+**What:** Merged `f6c530f`: `BlockQuantizedMatMul` now decodes llama.cpp IQ4_XS, IQ3_S, and IQ2_XXS super-blocks. IQ2_XXS sign/grid and IQ3_S grid tables are imported exactly from llama.cpp `b15ca938`; IQ1_S remains explicitly rejected.
+**Why:** This expands correctness-first native sub-4-bit execution while retaining fail-closed behavior for formats without audited tables. Leon 🟢 grid-verified block decoding and table contents against upstream.
+
+### Preserve MXFP4 and IQ4_NL blocks in Mobius exports
+**By:** Pris
+**What:** Mobius PR [#406](https://github.com/onnxruntime/mobius/pull/406) exports MXFP4 and IQ4_NL as `com.github.onnxruntime.genai::BlockQuantizedMatMul` v1 nodes with complete GGUF blocks in uint8 initializers and `format`, `K`, `N`, and `block_layout_version=1` attributes.
+**Why:** Non-affine native blocks must reach the runtime unchanged rather than be misread as affine `MatMulNBits`; unsupported IQ formats remain on the existing dequantize/requantize fallback.
+
+### Weight-specific residency design awaits greenlight
+**By:** Nabil
+**What:** `docs/WEIGHT_OFFLOAD.md` specifies an immutable mmap → bounded host cache → bounded VRAM cache subsystem with expert/page leases, fused-MoE paging, and Resource Governor sub-budgets.
+**Why:** Immutable external weight ranges have alignment, representation, transfer, and in-flight lifetime requirements unlike token-indexed mutable KV. The design reuses tiering concepts without coupling to KV structures or connector APIs. **Awaiting user greenlight; not implemented.**
+
+### DeepSeek-V4-Flash MTP and CSA sidecars
+**By:** Chew
+**What:** Mobius PR [#405](https://github.com/onnxruntime/mobius/pull/405) was updated at `7e26e6e` with the official 0/4/128 CSA compression schedule, compressor and sparse-index tensors, attention sinks, a dense causal fallback, and a separate MTP sidecar plus orchestration contract.
+**Why:** Current ONNX Runtime lacks native compressed-KV construction, sparse-index/cache operations, and iterative shared-state MTP orchestration. The export preserves official tensors and usable dense/MTP artifacts without fabricating sparse runtime semantics.

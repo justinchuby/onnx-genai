@@ -11,3 +11,7 @@ Authored `docs/PROJECTION_FUSION.md` for conservative load-time gate/up MatMulNB
 
 ### 2026-07-16T00:00:00Z — Native CUDA decode design
 Authored `docs/NATIVE_CUDA_DECODE.md` (`b416b7f`) and applied Fact Checker's stream/graph-ownership corrections (`33beb8d`). The fact-checked five-milestone `Arc<dyn ExecutionProvider>` design awaits user greenlight; implementation has not started.
+
+## 2026-07-16T17:00:38+0000 — Weight offload design
+- Authored `docs/WEIGHT_OFFLOAD.md` (`f0d0890`): immutable mmap backing feeds bounded host and VRAM caches through weight-specific expert/page leases.
+- The design awaits user greenlight; no implementation has started.

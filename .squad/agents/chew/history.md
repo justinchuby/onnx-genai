@@ -30,3 +30,7 @@ At 2026-07-14T19:05:00Z, fixed clippy findings and corrected Python pytest count
 ## 2026-07-15T00:00:00Z — Cross-agent session update
 
 - Delivered contrib fused transformer kernels; follow-up review fixes for SkipLayerNormalization/SimplifiedLayerNormalization merged in the opset coverage wave.
+
+## 2026-07-16T17:00:38+0000 — DeepSeek-V4-Flash MTP and CSA export
+- Updated Mobius PR #405 (`7e26e6e`) with the 0/4/128 CSA schedule, sparse-index/compression tensors, attention sinks, dense fallback, and an MTP sidecar.
+- Native sparse KV-cache/index operations and iterative MTP orchestration remain required runtime work.

@@ -65,3 +65,7 @@ Advanced fixture work is canonical: builders use onnxscript/onnx-ir, `tiny-mtp-f
 
 ### 2026-07-16T00:00:00Z — Performance-and-design wave
 Reviewed Gather/Shape/Constant through three resolved rejection cycles.
+
+## 2026-07-16T17:00:38+0000 — Mobius sub-4-bit export wiring
+- Opened Mobius PR #406, preserving MXFP4 and IQ4_NL GGUF blocks in `BlockQuantizedMatMul` export nodes.
+- Unsupported IQ formats remain on the dequantize/requantize fallback until runtime support lands.
