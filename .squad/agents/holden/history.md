@@ -58,3 +58,6 @@ Reviewed Batty's unified load-time `validate_model()` checks for unsupported con
 Reviewed the threading change; post-fix verdict was needs-review/ship.
 
 - 2026-07-16T00:00:01Z — 🟡 Approved Leon's guarded contiguous-f32 native CPU Mul fast path (`347060f`); aliasing, striding, broadcasting, and non-f32 remain generic. Independent decode result: +6.35%.
+
+### 2026-07-16T00:00:03Z — Decode thread-cap safety review cycle
+Rejected Deckard's initial thread-cap environment parsing because unusable or huge values could abort inference or trigger unsafe worker creation; Deckard was locked out of the revision. Re-reviewed Sebastian's pure bounded resolver and cleared it: invalid values fall back safely, valid values cap at available parallelism, prefill remains untouched, and 413 tests passed.

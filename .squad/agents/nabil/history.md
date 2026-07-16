@@ -5,3 +5,6 @@ Hired to lead the ORT plugin-EP integration for a new **Apple Metal/MPS executio
 
 ### 2026-07-16T00:00:00Z — Performance-and-design wave
 Authored the ORT-schema-based model-package design document.
+
+### 2026-07-16T00:00:03Z — Projection-fusion design recorded
+Authored `docs/PROJECTION_FUSION.md` for conservative load-time gate/up MatMulNBits fusion. Fact Checker confirmed QKV is already packed, gate/up is the available `4864|4864→9728` target, and qualified the roughly 125 MiB payload as a lower-bound memory cost. The design is awaiting user approval and is not implemented.
