@@ -381,6 +381,16 @@ mod tests {
         (graph, node)
     }
 
+    fn test_kernel(k: usize, n: usize, block_size: usize) -> MatMulNBitsKernel {
+        MatMulNBitsKernel {
+            k,
+            n,
+            block_size,
+            constant_inputs: [false; 5],
+            weight_nk: OnceLock::new(),
+        }
+    }
+
     fn quantize(
         weights_nk: &[f32],
         n: usize,
@@ -433,6 +443,43 @@ mod tests {
             }
         }
         output
+    }
+
+    fn dequantize_reference(
+        packed: &[u8],
+        scales: &[f32],
+        zero_points: Option<&[u8]>,
+        n: usize,
+        k: usize,
+        block_size: usize,
+    ) -> Vec<f32> {
+        let blocks = k.div_ceil(block_size);
+        let blob_size = block_size / 2;
+        let zp_row_bytes = blocks.div_ceil(2);
+        let mut weights = vec![0.0; n * k];
+        for output in 0..n {
+            for depth in 0..k {
+                let block = depth / block_size;
+                let within_block = depth % block_size;
+                let byte = packed[(output * blocks + block) * blob_size + within_block / 2];
+                let q = if within_block.is_multiple_of(2) {
+                    byte & 0x0f
+                } else {
+                    byte >> 4
+                };
+                let zero_point = zero_points.map_or(8, |points| {
+                    let byte = points[output * zp_row_bytes + block / 2];
+                    if block.is_multiple_of(2) {
+                        byte & 0x0f
+                    } else {
+                        byte >> 4
+                    }
+                });
+                weights[output * k + depth] =
+                    (q as f32 - zero_point as f32) * scales[output * blocks + block];
+            }
+        }
+        weights
     }
 
     fn assert_close(actual: &[f32], expected: &[f32]) {
@@ -519,59 +566,108 @@ mod tests {
     }
 
     #[test]
-    fn matmulnbits_prepacked_block128_non_multiple_k_keeps_activation_live() {
-        let (m, k, n, block_size) = (2, 141, 7, 128);
-        let a: Vec<f32> = (0..m * k)
+    fn matmulnbits_prepacked_m1_block32_symmetric_reuses_weight_for_new_activations() {
+        let (k, n, block_size) = (35, 7, 32);
+        let a1_values: Vec<f32> = (0..k)
+            .map(|i| ((i * 11 % 41) as f32 - 20.0) / 13.0)
+            .collect();
+        let a2_values: Vec<f32> = a1_values
+            .iter()
+            .enumerate()
+            .map(|(i, &value)| value * -0.5 + i as f32 / 17.0)
+            .collect();
+        let weights: Vec<f32> = (0..n * k)
+            .map(|i| ((i * 11 % 41) as f32 - 20.0) / 13.0)
+            .collect();
+        let (packed, scales, _, _) = quantize(&weights, n, k, block_size, false);
+        let dequantized = dequantize_reference(&packed, &scales, None, n, k, block_size);
+        let mut kernel = test_kernel(k, n, block_size);
+        kernel.set_constant_inputs(&[false, true, true]);
+
+        let b = Owned::u8(&[n, 2, 16], &packed);
+        let scales = Owned::f32(&[n, 2], &scales);
+        let a1 = Owned::f32(&[1, k], &a1_values);
+        let mut y1 = Owned::zeros_f32(&[1, n]);
+        kernel
+            .execute(&[a1.view(), b.view(), scales.view()], &mut [y1.view_mut()])
+            .unwrap();
+        assert_close(&y1.to_f32(), &reference(&a1_values, &dequantized, 1, k, n));
+
+        let cached_weight = kernel
+            .weight_nk
+            .get()
+            .expect("M=1 constant B must populate the prepacked weight cache")
+            .as_ptr();
+        let a2 = Owned::f32(&[1, k], &a2_values);
+        let mut y2 = Owned::zeros_f32(&[1, n]);
+        kernel
+            .execute(&[a2.view(), b.view(), scales.view()], &mut [y2.view_mut()])
+            .unwrap();
+        assert_eq!(kernel.weight_nk.get().unwrap().as_ptr(), cached_weight);
+        assert_close(&y2.to_f32(), &reference(&a2_values, &dequantized, 1, k, n));
+        assert_ne!(y1.to_f32(), y2.to_f32());
+    }
+
+    #[test]
+    fn matmulnbits_prepacked_m1_block128_explicit_zp_partial_block_matches_reference() {
+        let (k, n, block_size) = (141, 7, 128);
+        let a_values: Vec<f32> = (0..k)
             .map(|i| ((i * 11 % 41) as f32 - 20.0) / 13.0)
             .collect();
         let weights: Vec<f32> = (0..n * k)
             .map(|i| ((i * 23 % 47) as f32 - 19.0) / 12.0)
             .collect();
-        let (packed, scales, zero_points, dequantized) = quantize(&weights, n, k, block_size, true);
+        let (packed, scales, zero_points, _) = quantize(&weights, n, k, block_size, true);
         let zero_points = zero_points.unwrap();
-        let (mut graph, node) = model_node(
-            &[m, k],
-            &[n, 2, 64],
-            &[n, 2],
-            Some(&[n, 1]),
-            &[m, n],
-            k,
-            n,
-            block_size,
-        );
-        graph
-            .node_mut(node)
-            .attributes
-            .insert("accuracy_level".into(), Attribute::Int(4));
-        let model = Model::new(&graph);
-        let mut kernel = CpuExecutionProvider::new()
-            .get_kernel(model.graph.node(node), &[], 1)
-            .unwrap();
+        let dequantized =
+            dequantize_reference(&packed, &scales, Some(&zero_points), n, k, block_size);
+        let mut kernel = test_kernel(k, n, block_size);
         kernel.set_constant_inputs(&[false, true, true, true]);
 
+        let a = Owned::f32(&[1, k], &a_values);
         let b = Owned::u8(&[n, 2, 64], &packed);
         let scales = Owned::f32(&[n, 2], &scales);
         let zero_points = Owned::u8(&[n, 1], &zero_points);
-        let a1 = Owned::f32(&[m, k], &a);
-        let mut y1 = Owned::zeros_f32(&[m, n]);
+        let mut y = Owned::zeros_f32(&[1, n]);
         kernel
             .execute(
-                &[a1.view(), b.view(), scales.view(), zero_points.view()],
-                &mut [y1.view_mut()],
+                &[a.view(), b.view(), scales.view(), zero_points.view()],
+                &mut [y.view_mut()],
             )
             .unwrap();
-        assert_close(&y1.to_f32(), &reference(&a, &dequantized, m, k, n));
 
-        let a2_values: Vec<f32> = a.iter().map(|value| value * -0.5).collect();
-        let a2 = Owned::f32(&[m, k], &a2_values);
-        let mut y2 = Owned::zeros_f32(&[m, n]);
+        assert_close(&y.to_f32(), &reference(&a_values, &dequantized, 1, k, n));
+        assert!(
+            kernel.weight_nk.get().is_some(),
+            "M=1 constant B/scales/zero-points must take the prepacked GEMV path"
+        );
+    }
+
+    #[test]
+    fn matmulnbits_m1_dynamic_b_falls_back_without_populating_prepack_cache() {
+        let (k, n, block_size) = (35, 5, 32);
+        let a_values: Vec<f32> = (0..k).map(|i| ((i * 5 % 29) as f32 - 14.0) / 9.0).collect();
+        let weights: Vec<f32> = (0..n * k)
+            .map(|i| ((i * 7 % 31) as f32 - 15.0) / 10.0)
+            .collect();
+        let (packed, scales, _, _) = quantize(&weights, n, k, block_size, false);
+        let dequantized = dequantize_reference(&packed, &scales, None, n, k, block_size);
+        let mut kernel = test_kernel(k, n, block_size);
+        kernel.set_constant_inputs(&[false, false, true]);
+
+        let a = Owned::f32(&[1, k], &a_values);
+        let b = Owned::u8(&[n, 2, 16], &packed);
+        let scales = Owned::f32(&[n, 2], &scales);
+        let mut y = Owned::zeros_f32(&[1, n]);
         kernel
-            .execute(
-                &[a2.view(), b.view(), scales.view(), zero_points.view()],
-                &mut [y2.view_mut()],
-            )
+            .execute(&[a.view(), b.view(), scales.view()], &mut [y.view_mut()])
             .unwrap();
-        assert_close(&y2.to_f32(), &reference(&a2_values, &dequantized, m, k, n));
+
+        assert_close(&y.to_f32(), &reference(&a_values, &dequantized, 1, k, n));
+        assert!(
+            kernel.weight_nk.get().is_none(),
+            "dynamic B must use the fallback rather than populate the prepack cache"
+        );
     }
 
     #[test]
