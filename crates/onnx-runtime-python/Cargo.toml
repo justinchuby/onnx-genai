@@ -35,7 +35,7 @@ onnx-runtime-ep-cuda = { workspace = true, optional = true }
 onnx-runtime-tracer = { workspace = true, optional = true }
 
 [dependencies.pyo3]
-version = "0.23"
+version = "0.29"
 # `extension-module` — link against the interpreter at load time, not build time.
 # `abi3-py310` — build against CPython's stable/limited API pinned to 3.10, so a
 # single wheel (`cp310-abi3`) loads on CPython 3.10 through 3.14+.
