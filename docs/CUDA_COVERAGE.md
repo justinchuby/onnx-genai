@@ -153,27 +153,26 @@ counts:
 |---------|------:|
 | CPU registry `(domain, op_type)` pairs | **103** |
 | CPU standard-domain (`ai.onnx`) op types | **93** |
-| CUDA registry `(domain, op_type)` pairs | **63** |
-| CUDA advertised op names | **62** |
-| CPU pairs implemented by CUDA in the same domain | **51 / 103** |
-| CPU standard-domain op types implemented by CUDA | **43 / 93** |
+| CUDA registry `(domain, op_type)` pairs | **66** |
+| CUDA advertised op names | **65** |
+| CPU pairs implemented by CUDA in the same domain | **54 / 103** |
+| CPU standard-domain op types implemented by CUDA | **46 / 93** |
 
-The **43 shared `ai.onnx` ops** are: `Abs`, `Add`, `AveragePool`, `Cast`, `CastLike`,
-`Ceil`, `Clip`, `Cos`, `Div`, `Elu`, `Equal`, `Erf`, `Exp`, `Floor`, `Gemm`,
-`HardSigmoid`, `LayerNormalization`, `LeakyRelu`, `Log`, `MatMul`, `Max`, `Min`,
-`MaxPool`, `Mul`, `Neg`, `Not`, `Pow`, `RMSNormalization`, `Reciprocal`, `ReduceMax`,
-`ReduceMean`, `ReduceMin`, `ReduceSum`, `Relu`, `Round`, `Sigmoid`, `Sign`,
-`Sin`, `Softmax`, `Softplus`, `Sqrt`, `Sub`, and `Tanh`.
+The **46 shared `ai.onnx` ops** are: `Abs`, `Add`, `AveragePool`, `Cast`, `CastLike`,
+`Ceil`, `Clip`, `Constant`, `Cos`, `Div`, `Elu`, `Equal`, `Erf`, `Exp`, `Floor`,
+`Gather`, `Gemm`, `HardSigmoid`, `LayerNormalization`, `LeakyRelu`, `Log`, `MatMul`,
+`Max`, `Min`, `MaxPool`, `Mul`, `Neg`, `Not`, `Pow`, `RMSNormalization`, `Reciprocal`,
+`ReduceMax`, `ReduceMean`, `ReduceMin`, `ReduceSum`, `Relu`, `Round`, `Shape`,
+`Sigmoid`, `Sign`, `Sin`, `Softmax`, `Softplus`, `Sqrt`, `Sub`, and `Tanh`.
 
-The **50 CPU `ai.onnx` gaps** are: `Acos`, `Acosh`, `ArgMax`, `ArgMin`, `Asin`,
-`Asinh`, `Atan`, `Atanh`, `Attention`, `Concat`, `Constant`,
-`ConstantOfShape`, `Cosh`, `CumSum`, `DequantizeLinear`,
-`DynamicQuantizeLinear`, `Expand`, `Flatten`, `Gather`, `GatherElements`,
+The **47 CPU `ai.onnx` gaps** are: `Acos`, `Acosh`, `ArgMax`, `ArgMin`, `Asin`,
+`Asinh`, `Atan`, `Atanh`, `Attention`, `Concat`, `ConstantOfShape`, `Cosh`, `CumSum`,
+`DequantizeLinear`, `DynamicQuantizeLinear`, `Expand`, `Flatten`, `GatherElements`,
 `GatherND`, `Gelu`, `GlobalAveragePool`, `GlobalMaxPool`, `Identity`,
 `LogSoftmax`, `Mean`, `NonZero`, `Pad`, `QuantizeLinear`, `Range`,
 `ReduceL2`, `ReduceProd`, `ReduceSumSquare`, `Reshape`, `RotaryEmbedding`,
-`Shape`, `Sinh`, `Size`, `Slice`, `Split`, `Squeeze`, `Sum`, `Swish`, `Tan`,
-`Tile`, `TopK`, `Transpose`, `Unsqueeze`, and `Where`.
+`Sinh`, `Size`, `Slice`, `Split`, `Squeeze`, `Sum`, `Swish`, `Tan`, `Tile`, `TopK`,
+`Transpose`, `Unsqueeze`, and `Where`.
 
 For `com.microsoft`, CUDA matches eight CPU pairs (`FusedGemm`,
 `FusedMatMulBias`, `Gelu`, `LayerNormalization`, `MatMulNBits`,
