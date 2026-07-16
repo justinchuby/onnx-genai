@@ -13,9 +13,10 @@
 //! `[batch, seq, hidden]` case.
 
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
-use onnx_runtime_ir::Node;
+use onnx_runtime_ir::{DataType, Node};
 
-use super::{check_arity, to_dense_f32, write_dense_f32};
+use super::{check_arity, require_dtype, write_dense_f32};
+use crate::dtype::to_dense_f32_widen;
 
 pub struct SkipSimplifiedLayerNormKernel {
     epsilon: f32,
@@ -44,12 +45,15 @@ impl Kernel for SkipSimplifiedLayerNormKernel {
                 outputs.len()
             )));
         }
+        for input in inputs.iter().filter(|input| !input.is_absent()) {
+            require_dtype(input.dtype, DataType::Float32, OP)?;
+        }
 
-        let input = to_dense_f32(&inputs[0])?;
-        let skip = to_dense_f32(&inputs[1])?;
-        let gamma = to_dense_f32(&inputs[2])?;
+        let input = to_dense_f32_widen(OP, &inputs[0])?;
+        let skip = to_dense_f32_widen(OP, &inputs[1])?;
+        let gamma = to_dense_f32_widen(OP, &inputs[2])?;
         let bias = if inputs.len() == 4 && !inputs[3].is_absent() {
-            Some(to_dense_f32(&inputs[3])?)
+            Some(to_dense_f32_widen(OP, &inputs[3])?)
         } else {
             None
         };
@@ -80,6 +84,64 @@ impl Kernel for SkipSimplifiedLayerNormKernel {
             )));
         }
 
+        let groups = input.len() / hidden;
+        let writes_mean = outputs
+            .get(1)
+            .is_some_and(|output| is_stats_shape(output.shape, shape));
+        let writes_inv_std = outputs
+            .get(2)
+            .is_some_and(|output| is_stats_shape(output.shape, shape));
+
+        if inputs[1].shape == shape
+            && inputs[0].is_contiguous()
+            && inputs[1].is_contiguous()
+            && inputs[2].is_contiguous()
+            && inputs
+                .get(3)
+                .is_none_or(|input| input.is_absent() || input.is_contiguous())
+            && outputs[0].shape == shape
+            && outputs[0].dtype == DataType::Float32
+            && outputs[0].is_contiguous()
+            && outputs.get(3).is_some_and(|output| {
+                output.shape == shape && output.dtype == DataType::Float32 && output.is_contiguous()
+            })
+            && !writes_mean
+            && !writes_inv_std
+        {
+            let (output, remaining) = outputs.split_at_mut(1);
+            let output = &mut output[0];
+            let sum_output = &mut remaining[2];
+            output.validate()?;
+            sum_output.validate()?;
+
+            // SAFETY: validated contiguous f32 output views each describe exactly
+            // `input.len()` writable elements. Kernel output views are exclusive
+            // and disjoint by the EP API contract.
+            let output = unsafe {
+                std::slice::from_raw_parts_mut(output.data_ptr_mut::<f32>(), input.len())
+            };
+            let sum_output = unsafe {
+                std::slice::from_raw_parts_mut(sum_output.data_ptr_mut::<f32>(), input.len())
+            };
+
+            for index in 0..input.len() {
+                sum_output[index] = input[index]
+                    + skip[index]
+                    + bias.as_ref().map_or(0.0, |values| values[index % hidden]);
+            }
+            for (row, normalized) in sum_output
+                .chunks_exact(hidden)
+                .zip(output.chunks_exact_mut(hidden))
+            {
+                let variance = row.iter().map(|value| value * value).sum::<f32>() / hidden as f32;
+                let inv_std_var = 1.0 / (variance + self.epsilon).sqrt();
+                for column in 0..hidden {
+                    normalized[column] = row[column] * inv_std_var * gamma[column];
+                }
+            }
+            return Ok(());
+        }
+
         let skip_strides = broadcast_strides(inputs[1].shape, shape, OP)?;
         let input_strides = row_major_strides(shape);
         let mut sum = vec![0.0f32; input.len()];
@@ -96,16 +158,7 @@ impl Kernel for SkipSimplifiedLayerNormKernel {
                 + bias.as_ref().map_or(0.0, |values| values[flat % hidden]);
         }
 
-        let groups = input.len() / hidden;
         let mut output = vec![0.0f32; input.len()];
-        let mut stats_shape = shape.to_vec();
-        *stats_shape.last_mut().unwrap() = 1;
-        let writes_mean = outputs
-            .get(1)
-            .is_some_and(|output| output.shape == stats_shape);
-        let writes_inv_std = outputs
-            .get(2)
-            .is_some_and(|output| output.shape == stats_shape);
         let mut inv_std_vars = writes_inv_std.then(|| vec![0.0f32; groups]);
         for group in 0..groups {
             let base = group * hidden;
@@ -136,6 +189,12 @@ impl Kernel for SkipSimplifiedLayerNormKernel {
     fn supports_strided_input(&self, _input_idx: usize) -> bool {
         true
     }
+}
+
+fn is_stats_shape(candidate: &[usize], input: &[usize]) -> bool {
+    candidate.len() == input.len()
+        && candidate.last() == Some(&1)
+        && candidate[..candidate.len() - 1] == input[..input.len() - 1]
 }
 
 fn row_major_strides(shape: &[usize]) -> Vec<usize> {
