@@ -1061,3 +1061,32 @@ CHANNEL/AVG results match element-for-element.
 **Why:** Decoder shape subgraphs use `Int64` Gather; raw byte movement preserves each fixed-width dtype without per-dtype gather loops and unblocks native decoder execution.
 
 **Sources:** Wave-8/Wave-9 coordinator manifest; merged commits `9d972d1`, `1abcf8c`, `784e52d`, `f0026f7`, `b2db5c5`, `a6fffc4`, `c2f9aa0`, `150ed54`, `cca3a61`, and `5dddbb8`.
+
+## 2026-07-16 — CUDA parity and native int4 performance wave
+
+### CUDA GroupQueryAttention parity approved (`3820bad`)
+**By:** Pris
+**What:** 🟢 Approved the CUDA GroupQueryAttention implementation after all eight reviewed ORT/CPU-contract behaviors, five GQA GPU tests, two existing Attention GPU tests, and the full CUDA EP suite passed with real CUDA execution and independent CPU/manual numerical references.
+**Why:** The GPU implementation now has numerically validated GQA parity; the nvrtc-12.6 workaround was used for validation.
+
+### Native GEMM prepack and threaded oneDNN approved (`f132d30`)
+**By:** Holden
+**What:** 🟢 Approved constant-MatMul prepacking and oneDNN threaded GEMM. Constants are identified only from `Graph::initializers`; the kernel cache is per-node and shape-keyed; runtime activations remain uncached; generic and oneDNN numerics pass.
+**Why:** The seam produces a measured 1.14× fp32 Gemma4-e2b improvement without changing other kernel implementations. Follow up with non-contiguous/f16 activation-cache tests and bounded accounting for widened f16/bf16 constant caches.
+
+### CUDA SkipSimplifiedLayerNormalization re-review approved (`0284999`)
+**By:** Rachael
+**What:** 🔴 Rejected `bc379d8` because the registered coverage count (61) disagreed with documentation and lacked an exact cardinality assertion. 🟢 Approved corrective commit `f792bc2`/merged `0284999`: `CUDA_COVERED_OPS` has exactly 61 unique names, enforced before the duplicate guard, and CUDA coverage documentation consistently reports 61.
+**Why:** Published coverage must match the advertised registry and be protected against drift. The CUDA EP test suite (79 unit tests and GPU integration suites, including independent residual-RMS validation) passed.
+
+### Native genai-builder compatibility approved (`04709a4`)
+**By:** Pris
+**What:** 🟢 Approved native CPU support for standard `SimplifiedLayerNormalization` and packed-QKV `GroupQueryAttention`, allowing genai-builder exports to run unmodified.
+**Why:** Compatibility is preserved at the standard exported ONNX contract rather than requiring model rewrites.
+
+### Fast prepacked MatMulNBits decode path: reject then re-approve (`3787c21`)
+**By:** Holden
+**What:** 🔴 Rejected `37b0ced` because its named test used `M=2`, which only exercised the fallback rather than the `M=1` cached GEMV fast path; it also lacked independent q-nibble dequantization and fresh-activation proofs. 🟢 Re-approved after Deckard added the `M=1` fast-path coverage in merged commit `3787c21`.
+**Why:** The cache is valid only for constant packed weights and must read activations live. The corrected coverage validates the actual decode path, delivering int4 native decode from 0.19 to 0.50 tok/s; the fp32 cache remains an 8× packed-weight expansion and must remain documented as a material memory trade-off.
+
+**Sources:** `pris-cuda-gqa-review.md`, `holden-perf-matmul-review.md`, `rachael-cuda-skiprms-review.md`, requested `pris-native-compat-review.md` recovery, and `holden-perf-nbits-review.md`; merged commits `3820bad`, `f132d30`, `eea887e`, `04709a4`, `0284999`, and `3787c21`.
