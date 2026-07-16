@@ -33,3 +33,8 @@ Authored CUDA Gather, Shape, and Constant kernels; coverage reached 65.
 ### 2026-07-16T00:00:02Z — MatMulNBits GEMV wave
 - Landed the direct-int4 VNNI M=1 GEMV (`2095325`, reviewed follow-up `2d7c974`), streaming packed nibbles with block-32 scales rather than materializing int8 weights.
 - MatMulNBits improved 16.45→14.15 ms; decode reached about 50 tok/s at 24 threads and about 28 tok/s at 96 threads. NUMA-aware scheduling and projection fusion are the pending next levers.
+
+
+### 2026-07-16T00:00:00Z — Allocation-free fused RMSNorm decode
+- Landed `de62f76`: direct-output contiguous-f32 `SkipSimplifiedLayerNormalization` fast path, retaining the scalar/broadcast/strided/statistics fallback.
+- RMSNorm fell 1.113→0.742 ms/step (-33.3%); five paired runs improved decode 44.20→46.45 tok/s (+9.1%) with matching tokens and 413 CPU EP tests.

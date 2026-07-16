@@ -483,3 +483,11 @@ NVRTC available: 113 passed, 0 failed, 0 skipped. The movement GPU binary passed
 **By:** Batty; path revision by Deckard; reviewed by Freysa
 **What:** The new abi3-py310 `onnx-rs-python` crate imports as `onnx_rs` and exposes an opaque `Model`, binary load/save, and `to_*`/`from_*` text, JSON, and TextProto codecs. The initial binding was rejected for an `exists()` preflight, lossy path conversion, and swallowing exceptions from `__fspath__`. The merged revision accepts lossless `PathBuf` values, maps actual I/O error kinds to Python exceptions, propagates `__fspath__` failures, and adds six Python path regressions.
 **Why:** `onnx_rs` avoids collision with the established `onnx` package and retains onnx-rs's stateless codec convention. Native path preservation and direct filesystem errors are required for valid non-UTF-8 Unix paths and accurate error reporting. Freysa cleared the revision after targeted Rust coverage and all six Python regression tests passed. The final merged fix is `5b348b5`.
+
+
+#### Sources: `roy-decode-perf2.md`, `wallace-rmsnorm-review.md`
+
+### 2026-07-16: Make fused residual RMSNorm allocation-free on native decode
+**By:** Roy; reviewed by Wallace
+**What:** `SkipSimplifiedLayerNormalization` now uses a contiguous f32 fast path that borrows input/skip/gamma and writes the residual sum and normalized result directly to their distinct output buffers. The scalar broadcast, strided, statistics-output, and non-f32 fallbacks remain unchanged.
+**Why:** The current steady decode profile is MatMulNBits 81.93%, RMSNorm 6.13%, GQA 5.01%, SiLU 3.47%, Add 2.25%, and Mul 0.65%; RMSNorm was the largest low-risk non-matmul lever. RMSNorm fell 1.113→0.742 ms/step (-33.3%), and five alternating 24-token pairs improved 44.20→46.45 tok/s (+9.1% paired median), with identical greedy tokens `[11576, 42740, 11, 358]`. Wallace independently reproduced a 32.7% RMSNorm reduction and +6–16% decode gains, confirmed output disjointness and fast-path guards, and cleared the change. All 413 CPU EP tests passed.
