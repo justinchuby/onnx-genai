@@ -83,7 +83,8 @@ pub fn rotary_embedding(ctx: &mut InferenceContext) -> Result<(), ShapeInferErro
 }
 
 /// `com.microsoft::GroupQueryAttention`: attention output preserves query shape;
-/// present K/V append the current key sequence to the BNSH past cache.
+/// present K/V preserve the past-cache capacity and grow only when the logical
+/// total sequence length exceeds it.
 pub fn group_query_attention(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
     let Some(query) = ctx.input_type(0).cloned() else {
         return Ok(());
@@ -95,6 +96,8 @@ pub fn group_query_attention(ctx: &mut InferenceContext) -> Result<(), ShapeInfe
     let (Some(key), Some(past)) = (ctx.input_shape(1), ctx.input_shape(3)) else {
         return Ok(());
     };
+    let key = key.to_vec();
+    let past = past.to_vec();
     if key.len() != 3 || past.len() != 4 {
         return Ok(());
     }
@@ -109,10 +112,23 @@ pub fn group_query_attention(ctx: &mut InferenceContext) -> Result<(), ShapeInfe
     let head_dim = key[2]
         .checked_div(&DimExpr::constant(kv_heads))
         .unwrap_or_else(DimExpr::overflow);
+    let total_sequence = ctx
+        .input_shape_data(6)
+        .filter(|data| data.is_scalar())
+        .and_then(|data| data.elems.first())
+        .and_then(DimExpr::as_const);
+    let present_sequence = match (past[2].as_const(), total_sequence) {
+        (Some(capacity), Some(total)) => DimExpr::constant(capacity.max(total)),
+        // `max(capacity, total)` is not representable by DimExpr. An opaque
+        // symbol keeps the output data-dependent so the executor can size it
+        // from the runtime total instead of forcing the growing-cache upper
+        // bound (`past + key`) onto a fixed-capacity cache.
+        _ => ctx.fresh_dim(),
+    };
     let present = vec![
         key[0].clone(),
         DimExpr::constant(kv_heads),
-        past[2].add(&key[1]),
+        present_sequence,
         head_dim,
     ];
     ctx.set_output(1, query.dtype, present.clone());

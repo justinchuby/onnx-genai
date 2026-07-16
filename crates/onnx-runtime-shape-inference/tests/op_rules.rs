@@ -37,6 +37,14 @@ fn sd_vec(elems: Vec<DimExpr>) -> NodeIo {
     }
 }
 
+/// An input carrying a resolved integer scalar.
+fn sd_int_scalar(dtype: DataType, value: DimExpr) -> NodeIo {
+    NodeIo {
+        type_info: Some(TypeInfo::new(dtype, vec![])),
+        shape_data: Some(ShapeData::scalar(dtype, value)),
+    }
+}
+
 /// A scalar input carrying a resolved floating-point constant.
 fn sd_float_scalar(dt: DataType, value: f64) -> NodeIo {
     NodeIo {
@@ -1097,6 +1105,72 @@ fn skip_layer_norm_emits_x_shaped_skip_bias_sum() {
     assert_eq!(inv, vec![sym(0), c(8), c(1)]);
     let skip_sum = outs[3].type_info.as_ref().unwrap().shape.clone();
     assert_eq!(skip_sum, vec![sym(0), c(8), c(768)]);
+}
+
+fn gqa_inputs(past_capacity: i64, total: Option<i64>) -> Vec<NodeIo> {
+    let mut inputs = vec![
+        f32in(vec![c(1), c(1), c(8)]),
+        f32in(vec![c(1), c(1), c(4)]),
+        f32in(vec![c(1), c(1), c(4)]),
+        f32in(vec![c(1), c(2), c(past_capacity), c(2)]),
+        f32in(vec![c(1), c(2), c(past_capacity), c(2)]),
+        tin(DataType::Int32, vec![c(1)]),
+        tin(DataType::Int32, vec![]),
+    ];
+    if let Some(total) = total {
+        inputs[6] = sd_int_scalar(DataType::Int32, c(total));
+    }
+    inputs
+}
+
+fn gqa_node() -> Node {
+    with_attr(
+        with_attr(
+            with_domain(node("GroupQueryAttention", 7, 3), "com.microsoft"),
+            "num_heads",
+            Attribute::Int(4),
+        ),
+        "kv_num_heads",
+        Attribute::Int(2),
+    )
+}
+
+#[test]
+fn group_query_attention_fixed_capacity_present_uses_max_capacity_total() {
+    let outs = run(&gqa_node(), gqa_inputs(8, Some(3)), 1);
+    assert_eq!(
+        outs[1].type_info.as_ref().unwrap().shape,
+        vec![c(1), c(2), c(8), c(2)]
+    );
+    assert_eq!(
+        outs[2].type_info.as_ref().unwrap().shape,
+        vec![c(1), c(2), c(8), c(2)]
+    );
+}
+
+#[test]
+fn group_query_attention_growing_present_uses_logical_total() {
+    let outs = run(&gqa_node(), gqa_inputs(2, Some(3)), 1);
+    assert_eq!(
+        outs[1].type_info.as_ref().unwrap().shape,
+        vec![c(1), c(2), c(3), c(2)]
+    );
+    assert_eq!(
+        outs[2].type_info.as_ref().unwrap().shape,
+        vec![c(1), c(2), c(3), c(2)]
+    );
+}
+
+#[test]
+fn group_query_attention_dynamic_total_leaves_present_sequence_symbolic() {
+    let outs = run(&gqa_node(), gqa_inputs(8, None), 1);
+    let present_key = &outs[1].type_info.as_ref().unwrap().shape;
+    let present_value = &outs[2].type_info.as_ref().unwrap().shape;
+    assert!(
+        present_key[2].as_symbol().is_some(),
+        "dynamic max(capacity, total) must remain data-dependent"
+    );
+    assert_eq!(present_key[2], present_value[2]);
 }
 
 #[test]

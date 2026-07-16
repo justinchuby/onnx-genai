@@ -551,8 +551,13 @@ fn dynamic_output_shapes(
                 return None;
             }
             let head_dim = key[2] / kv_heads;
-            let total_sequence = past_key[2].checked_add(key[1])?;
-            let present = vec![query[0], kv_heads, total_sequence, head_dim];
+            let total_sequence_values = input_values.get(6)?.as_ref()?;
+            if total_sequence_values.len() != 1 {
+                return None;
+            }
+            let total_sequence = usize::try_from(total_sequence_values[0]).ok()?;
+            let present_sequence = past_key[2].max(total_sequence);
+            let present = vec![query[0], kv_heads, present_sequence, head_dim];
             let mut shapes = vec![query.clone()];
             if node.outputs.len() >= 2 {
                 shapes.push(present.clone());

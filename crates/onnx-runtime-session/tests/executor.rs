@@ -10,6 +10,7 @@ use onnx_runtime_ir::{
     WeightRef,
 };
 use onnx_runtime_session::{InferenceSession, SessionError, Tensor, WarmupShape};
+use onnx_runtime_shape_inference::{InferenceRegistry, MergePolicy};
 
 // --- graph construction helpers --------------------------------------------
 
@@ -67,6 +68,109 @@ fn input_shaped(g: &mut Graph, name: &str, dtype: DataType, shape: Shape) -> Val
     let vid = g.create_named_value(name, dtype, shape);
     g.add_input(vid);
     vid
+}
+
+fn i32_tensor(shape: &[usize], data: &[i32]) -> Tensor {
+    let bytes: Vec<u8> = data.iter().flat_map(|value| value.to_le_bytes()).collect();
+    Tensor::from_raw(DataType::Int32, shape.to_vec(), &bytes).unwrap()
+}
+
+fn gqa_cache_graph(past_capacity: usize) -> Graph {
+    let mut g = Graph::new();
+    g.opset_imports.insert(String::new(), 17);
+    g.opset_imports.insert("com.microsoft".into(), 1);
+
+    let query = input(&mut g, "query", DataType::Float32, &[1, 1, 8]);
+    let key = input(&mut g, "key", DataType::Float32, &[1, 1, 4]);
+    let value = input(&mut g, "value", DataType::Float32, &[1, 1, 4]);
+    let past_key = input(
+        &mut g,
+        "past_key",
+        DataType::Float32,
+        &[1, 2, past_capacity, 2],
+    );
+    let past_value = input(
+        &mut g,
+        "past_value",
+        DataType::Float32,
+        &[1, 2, past_capacity, 2],
+    );
+    let seqlens = input(&mut g, "seqlens_k", DataType::Int32, &[1]);
+    let total = input(&mut g, "total_sequence_length", DataType::Int32, &[]);
+
+    let attention = g.create_value(DataType::Float32, vec![]);
+    let present_key = g.create_value(DataType::Float32, vec![]);
+    let present_value = g.create_value(DataType::Float32, vec![]);
+    let mut node = Node::new(
+        NodeId(0),
+        "GroupQueryAttention",
+        vec![
+            Some(query),
+            Some(key),
+            Some(value),
+            Some(past_key),
+            Some(past_value),
+            Some(seqlens),
+            Some(total),
+        ],
+        vec![attention, present_key, present_value],
+    );
+    node.domain = "com.microsoft".into();
+    node.attributes
+        .insert("num_heads".into(), Attribute::Int(4));
+    node.attributes
+        .insert("kv_num_heads".into(), Attribute::Int(2));
+    g.insert_node(node);
+
+    let registry = InferenceRegistry::default_registry();
+    let imports = g.opset_imports.clone();
+    registry
+        .infer_graph(&mut g, &imports, MergePolicy::Permissive)
+        .expect("infer GQA output shapes");
+    g.add_output(attention);
+    g.add_output(present_key);
+    g.add_output(present_value);
+    g
+}
+
+fn run_gqa_decode(past_capacity: usize) -> Vec<Tensor> {
+    let mut session =
+        InferenceSession::from_graph(gqa_cache_graph(past_capacity)).expect("build GQA session");
+    let query = Tensor::from_f32(&[1, 1, 8], &[1.0; 8]).unwrap();
+    let key = Tensor::from_f32(&[1, 1, 4], &[0.5; 4]).unwrap();
+    let value = Tensor::from_f32(&[1, 1, 4], &[2.0; 4]).unwrap();
+    let past_data = vec![0.25; 4 * past_capacity];
+    let past_key = Tensor::from_f32(&[1, 2, past_capacity, 2], &past_data).unwrap();
+    let past_value = Tensor::from_f32(&[1, 2, past_capacity, 2], &past_data).unwrap();
+    let seqlens = i32_tensor(&[1], &[2]);
+    let total = i32_tensor(&[], &[3]);
+    session
+        .run(&[
+            ("query", &query),
+            ("key", &key),
+            ("value", &value),
+            ("past_key", &past_key),
+            ("past_value", &past_value),
+            ("seqlens_k", &seqlens),
+            ("total_sequence_length", &total),
+        ])
+        .expect("GQA decode succeeds")
+}
+
+#[test]
+fn gqa_decode_fixed_capacity_preserves_present_cache_extent() {
+    let outputs = run_gqa_decode(8);
+    assert_eq!(outputs[0].shape, vec![1, 1, 8]);
+    assert_eq!(outputs[1].shape, vec![1, 2, 8, 2]);
+    assert_eq!(outputs[2].shape, vec![1, 2, 8, 2]);
+}
+
+#[test]
+fn gqa_decode_growing_cache_extends_present_to_logical_total() {
+    let outputs = run_gqa_decode(2);
+    assert_eq!(outputs[0].shape, vec![1, 1, 8]);
+    assert_eq!(outputs[1].shape, vec![1, 2, 3, 2]);
+    assert_eq!(outputs[2].shape, vec![1, 2, 3, 2]);
 }
 
 /// Insert an op node whose single output carries an explicit (possibly
