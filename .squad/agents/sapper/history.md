@@ -41,3 +41,8 @@ Added the preprocessing-side prompt token-expansion library for multi-tile VLM i
 ## 2026-07-15T00:00:00Z — Cross-agent session update
 
 - Closed RoPE checked-overflow and Range f32 parity fixes; canonical default-domain import merging also landed with loader validation.
+
+## 2026-07-16T18:11:48+0000 — CUDA RMS FMA parity correction
+
+- Merged `de3c556`: CUDA RMSNorm and SkipRMSNorm use separately rounded f32 multiplication and addition to match CPU serial reductions.
+- Wallace 🟢 verified H200 coverage; exact native decode parity now reaches token 11, with token-12 MatMulNBits reduction order still open.

@@ -18,3 +18,8 @@
 
 ## 2026-07-16T14:20:00Z — SM-general CUDA NVRTC
 - Merged `b56c5cb`: CUDA architecture strings now derive from the live selected device capability (SM60–SM120), retaining the unsupported-PTX native-CUBIN fallback. Holden cleared 117 CUDA tests and 6/6 GQA tests.
+
+## 2026-07-16T18:11:48+0000 — CUDA sub-4-bit and FMA-drift reviews
+
+- 🟢 Cleared Roy's MXFP4/IQ4_NL M=1 CUDA GEMV on H200, including exact decoded-weight checks and 124 CUDA tests.
+- 🟢 Cleared Sapper's RMS reduction anti-FMA fix; parity reaches token 11, while token-12 MatMulNBits reduction order remains a follow-up.

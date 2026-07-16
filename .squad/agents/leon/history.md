@@ -34,3 +34,8 @@ Loader opset-import validation for file, from-parts, and nested-subgraph paths m
 ## 2026-07-16T15:39:27Z — Scribe session update
 
 - 🟢 Reviewed BlockQuantizedMatMul: hand-verified MXFP4 0xD7→12.0/-6.0 and IQ4_NL decoding; unsupported IQ formats fail closed and 420 CPU tests pass.
+
+## 2026-07-16T18:11:48+0000 — IQ-family CPU decode reviews
+
+- 🟢 Cleared Bryant's IQ2_XS/IQ2_S/IQ3_XXS and IQ1_S/IQ1_M implementations after upstream llama.cpp grid, layout, fingerprint, and hand-trace audits.
+- CPU `BlockQuantizedMatMul` now covers the complete supported IQ family.

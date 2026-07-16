@@ -14,3 +14,8 @@ Hired as a Metal/MPS kernel engineer for the new Apple Metal EP for ONNX Runtime
 ## 2026-07-16T15:39:27Z — Scribe session update
 
 - Extended Mobius PR #404 with GLM-5.2 IndexShare DSA and improved-MTP export; it remains open and rebased on merged #398.
+
+## 2026-07-16T18:11:48+0000 — Mobius full-IQ export review
+
+- 🟢 Cleared Pris's Mobius PR #406 update: all ten native block formats match the onnx-genai `BlockQuantizedMatMul` format, dimension, and byte-preservation contract.
+- PR #406 remains awaiting user action.

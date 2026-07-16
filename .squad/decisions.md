@@ -749,3 +749,279 @@ The scoped skip grep found no `Unsupported`, `todo!`, `unimplemented!`, `unreach
 **By:** Chew
 **What:** Mobius PR [#405](https://github.com/onnxruntime/mobius/pull/405) was updated at `7e26e6e` with the official 0/4/128 CSA compression schedule, compressor and sparse-index tensors, attention sinks, a dense causal fallback, and a separate MTP sidecar plus orchestration contract.
 **Why:** Current ONNX Runtime lacks native compressed-KV construction, sparse-index/cache operations, and iterative shared-state MTP orchestration. The export preserves official tensors and usable dense/MTP artifacts without fabricating sparse runtime semantics.
+
+## 2026-07-16 — Full IQ-family CUDA decode, Mobius export, and parity wave
+
+All ten source notes below are newly merged after deduplication. Decisions archive check: `.squad/decisions.md` exceeds 20 KB, but no entries are older than 30 days relative to 2026-07-16; no archive was created.
+
+#### Source: `roy-cuda-sub4bit-gemv.md`
+
+### 2026-07-16: CUDA sub-4-bit decode GEMV
+**By:** Roy
+**What:** Added an M=1 CUDA `BlockQuantizedMatMul` kernel for `mxfp4` and `iq4_nl`, registered under `com.github.onnxruntime.genai` v1. CUDA placement accepts only static M=1 shapes, layout version 1, and those two formats; IQ4_XS, IQ3_S, IQ2_XXS, and prefill remain on CPU. GPU tests compare random blocks to the CPU op, verify every decoded weight bit-exactly through one-hot GEMV, and cover optional bias.
+**Why:** Decode is the hot path for dynamic-quant MoE models, and direct packed-block GEMV avoids materializing f32 weights while preserving the CPU op's GGUF semantics.
+
+Hand-verified blocks:
+- MXFP4 exponent byte `128`, quant byte `0xd7`: low nibble `7` at element 0 decodes to `12.0`; high nibble `13` at element 16 decodes to `-6.0`.
+- IQ4_NL fp16 scale `0.5`, quant byte `0xf0`: low nibble `0` at element 0 decodes to `-63.5`; high nibble `15` at element 16 decodes to `56.5`.
+
+Performance was not measured. Runtime gaps: IQ4_XS/IQ3_S/IQ2_XXS and M>1 are intentionally unsupported by CUDA and route to CPU; the full CUDA test suite needs the installed Python cuDNN directory on `LD_LIBRARY_PATH`.
+
+#### Source: `wallace-cuda-sub4bit-review.md`
+
+# 2026-07-16 — CUDA sub-4-bit GEMV review
+
+**By:** Wallace
+**Verdict:** 🟢 CLEAR
+**Reviewed:** `cd02810` (`cuda-sub4bit-gemv`)
+
+## What I verified
+
+- The CUDA registration uses `com.github.onnxruntime.genai::BlockQuantizedMatMul` v1 and defaults `block_layout_version` to 1, matching the CPU reference.
+- MXFP4 and IQ4_NL use the CPU reference's exact block sizes, tables, output-major block addressing, low-nibble elements 0–15 / high-nibble elements 16–31 ordering, and per-block scale application.
+- MXFP4 E8M0 handling matches the CPU implementation for ordinary exponents, the two f32-subnormal boundary encodings, and reserved `0xff` NaN.
+- IQ4_NL loads its fp16 scale little-endian and uses the exact 16-entry signed codebook.
+- Weight decode and accumulation are f32. CUDA changes reduction order versus CPU GEMM, but the one-hot tests prove every decoded weight bit-exact against CPU, while the random GEMV test covers f32 accumulation with bias, partial K, multiple blocks, and multiple columns.
+- CUDA claims only static M=1 nodes in formats `mxfp4` and `iq4_nl`. IQ4_XS, IQ3_S, IQ2_XXS, all other formats, dynamic decode shapes, and M>1 return `KernelMatch::Unsupported`; the CPU EP registers the same op/domain and remains a placement candidate.
+- The kernel is SM-general NVRTC source. No `sm_90` or other fixed architecture is introduced.
+
+## Hand-traced blocks
+
+- **MXFP4:** scale byte `128` gives `e8m0_half_scale = 2^(128-128) = 1`. Quant byte `0xD7`: low code `7` indexes doubled E2M1 value `12`, so element 0 is `12.0`; high code `13` indexes `-6`, so element 16 is `-6.0`.
+- **IQ4_NL:** fp16 scale `0.5`, quant byte `0xF0`: low code `0` indexes `-127`, giving element 0 `-63.5`; high code `15` indexes `113`, giving element 16 `56.5`.
+
+## Test results
+
+- H200 detected: compute capability 9.0, driver 580.105.08.
+- `cargo build -p onnx-runtime-ep-cuda`: passed.
+- `cargo test -p onnx-runtime-ep-cuda`: passed all 124 listed tests after adding the installed cuDNN directory to `LD_LIBRARY_PATH`; the initially requested environment alone could not locate `libcudnn.so.9`.
+- `block_quantized_matmul_gpu`: 4/4 passed, including exact per-weight CPU/GPU bit comparisons and the two hand-traced blocks.
+- `cargo test -p onnx-runtime-ep-cpu block_quantized`: 9/9 passed, 415 filtered out.
+
+#### Source: `bryant-iq2-iq3-formats.md`
+
+# 2026-07-16 — CPU IQ2_XS, IQ2_S, and IQ3_XXS decoding
+
+**By:** Bryant
+
+**What:** Added fail-closed `BlockQuantizedMatMul` CPU decoding for GGUF `IQ2_XS`,
+`IQ2_S`, and `IQ3_XXS`. The exact llama.cpp
+`b15ca938ad00aa6b3ee6c2edda7363fd02826b18` `ggml-common.h` tables are vendored:
+`iq2xs_grid` (512 `u64` entries), `iq2s_grid` (1024 `u64` entries), and
+`iq3xxs_grid` (256 `u32` entries). The shared `ksigns_iq2xs` table remains the
+sign source. FNV-1a fingerprints are pinned in tests.
+
+The upstream 256-element block layouts are used without transcoding:
+
+- `IQ2_XS`: `fp16 d; u16 qs[32]; u8 scales[8]` — 74 bytes.
+- `IQ2_S`: `fp16 d; u8 qs[64]; u8 qh[8]; u8 scales[8]` — 82 bytes.
+- `IQ3_XXS`: `fp16 d; u8 qs[96]` — 98 bytes.
+
+Known blocks were hand-traced against `ggml-quants.c`:
+
+- `IQ2_XS`: `d=2`, scales `0x21`, grids `{0,511,1,510}`, sign indices
+  `{0,1,2,3}` produce subscales `{0.75,1.25}` and the exact 32-value test vector.
+- `IQ2_S`: `d=2`, scales `0x21`, low indices `{0,0,0,255}`, `qh=0xe4`, and
+  explicit signs `{0x00,0x81,0x82,0x03}` select grids `{0,256,512,1023}` with
+  subscales `{0.75,1.25}`.
+- `IQ3_XXS`: `d=2`, scale nibble `2`, grid pairs
+  `{0,255},{1,254},{2,253},{3,252}`, and sign indices `{0,1,2,3}` produce
+  `db=2.5` and the exact 32-value test vector.
+
+`IQ1_S` and `IQ1_M` remain rejected because their shared 2048-entry grid requires
+a separate import and audit.
+
+**Why:** These formats are native grid/codebook encodings, not affine integers.
+Matching llama.cpp's serialized fields, lookup tables, sign application, and
+subscale math preserves GGUF interoperability while keeping unaudited IQ1 data
+on the explicit reject path.
+
+#### Source: `leon-iq2-iq3-review.md`
+
+# IQ2_XS / IQ2_S / IQ3_XXS CPU decode review
+
+- **Date:** 2026-07-16T17:29:45Z
+- **By:** Leon
+- **Verdict:** 🟢 CLEAR
+- **Reviewed:** Bryant commit `b56f02d` on `cpu-iq2-iq3-formats`
+
+## Evidence
+
+- Compared every numeric entry against llama.cpp commit
+  `b15ca938ad00aa6b3ee6c2edda7363fd02826b18`:
+  `iq2xs_grid` 512/512 exact, `iq2s_grid` 1024/1024 exact,
+  `iq3xxs_grid` 256/256 exact, and `ksigns_iq2xs` 128/128 exact.
+  The Rust `1 << j` sign-bit checks exactly reproduce `kmask_iq2xs =
+  [1, 2, 4, 8, 16, 32, 64, 128]`. Spot checks included first, quartile,
+  midpoint, three-quarter, and final entries of each grid.
+- Confirmed upstream layouts: IQ2_XS `2 + 64 + 8 = 74` bytes, IQ2_S
+  `2 + 64 + 8 + 8 = 82` bytes, and IQ3_XXS `2 + 96 = 98` bytes, each
+  representing 256 weights.
+- Independently hand-traced the asserted first 32 weights for all three tests
+  from the upstream grids and sign table. IQ2_XS reproduced the 9-bit indices,
+  sign indices 0–3, and `db={0.75,1.25}` values; IQ2_S reproduced
+  `qh=0xe4` indices `{0,256,512,1023}`, explicit signs, and the same subscales;
+  IQ3_XXS reproduced paired grids, packed sign indices 0–3, and
+  `db=2*(0.5+2)*0.5=2.5`. All asserted vectors matched exactly.
+- Decode field slicing, index extraction, sign application, and nibble
+  subscales match `dequantize_row_iq2_xs`, `dequantize_row_iq2_s`, and
+  `dequantize_row_iq3_xxs`.
+- IQ1_S and IQ1_M remain recognized but rejected during kernel creation, with
+  explicit test coverage.
+- Required test gate passed: **13 passed, 0 failed, 415 filtered out**.
+
+#### Source: `bryant-iq1-formats.md`
+
+### 2026-07-16: Audited IQ1_S and IQ1_M CPU decoding
+**By:** Bryant
+**What:** Implemented both IQ1_S and IQ1_M in CPU `BlockQuantizedMatMul`; neither format remains deferred. Vendored all 2048 `iq1s_grid` u64 entries byte-exact from llama.cpp commit `b15ca938` `ggml-common.h`; little-endian-byte FNV-1a is `0x6703ed863501ae2e`. Confirmed IQ1_S is 50 bytes (`fp16 d`, `qs[32]`, `qh[8]` as u16) and IQ1_M is 56 bytes (`qs[32]`, `qh[16]`, `scales[8]`, with global fp16 bits embedded in scale high nibbles).
+**Why:** The CPU runtime now matches upstream `dequantize_row_iq1_s` and `dequantize_row_iq1_m` for 11-bit grid assembly, ±0.125 deltas, odd 3-bit multipliers, and IQ1_M's two scales per 32-weight group. Hand-verified IQ1_S with `d=2`, `qh=0xa1c0`: `dl=10`, indices `[0,0,2047,0]`, negative delta, outputs `[-11.25,-11.25,8.75,-11.25]` per 8-value vector. Hand-verified IQ1_M with bitsliced fp16 `0x4000`, scale payload `0x001a`, qh `[0xf0,0x8f]`: `dl=[10,14]`, indices `[0,2047,2047,0]`, deltas `[+,-,-,-]`, outputs `[-8.75,8.75,12.25,-15.75]` per vector.
+
+#### Source: `leon-iq1-review.md`
+
+# 2026-07-16 — IQ1_S / IQ1_M CPU decode review
+
+**By:** Leon
+
+**Verdict:** 🟢 CLEAR
+
+## Grid spot-check
+
+Compared all 2048 `IQ1S_GRID` entries against `iq1s_grid` in llama.cpp commit
+`b15ca938` `ggml-common.h`: counts are 2048/2048 and every `u64` is identical.
+Both little-endian byte streams recompute to FNV-1a
+`0x6703ed863501ae2e`. Spot checks at indices
+`0, 1, 37, 255, 511, 1024, 1536, 2047` also match exactly; endpoints are
+`0xffffffffffffffff` and `0x0101010101010101`.
+
+## Layout and decode audit
+
+- `IQ1_S` matches upstream `block_iq1_s`: fp16 `d` (2 bytes), `qs[32]`,
+  then `qh[16]`, totaling 50 bytes.
+- `IQ1_M` matches upstream `block_iq1_m`: `qs[32]`, `qh[16]`, then
+  `scales[8]`, totaling 56 bytes. It has no standalone `d`; the fp16 scale is
+  reconstructed from the high nibbles of four little-endian scale words.
+- The Rust decoders exactly reproduce upstream 11-bit index assembly, signed
+  `{-1,0,+1}` grid lanes, `±0.125` delta selection, IQ1_S odd subscale, and
+  IQ1_M's two 3-bit odd subscales per 32-weight group.
+
+## Hand-traced blocks
+
+- IQ1_S: `d=2`, odd multiplier `5` gives `dl=10`; `qh=0xa1c0` produces
+  indices `[0,0,2047,0]` and delta `-0.125`. Grid lanes `[-1,-1,+1,-1]`
+  decode to `[-11.25,-11.25,8.75,-11.25]`.
+- IQ1_M: reconstructed fp16 scale is `2`; scale bits give
+  `dl=[10,14]`. `qh=[0xf0,0x8f]` produces indices
+  `[0,2047,2047,0]` and deltas `[+0.125,-0.125,-0.125,-0.125]`, decoding
+  to `[-8.75,8.75,12.25,-15.75]`.
+
+## Test results
+
+With `CARGO_TARGET_DIR=/home/justinchu/onnx-genai/target-leon`,
+`cargo test -p onnx-runtime-ep-cpu block_quantized` passed:
+**14 passed, 0 failed, 415 filtered out**. `git diff --check` also passed.
+
+#### Source: `pris-mobius-iq-family-export.md`
+
+### 2026-07-16: Export the full runtime-supported GGUF IQ family
+**By:** Pris
+**What:** Extended Mobius PR #406 so `BlockQuantizedMatMul` preserves raw blocks for MXFP4=39 (`mxfp4`, 32 elements/17 bytes), IQ4_NL=20 (`iq4_nl`, 32/18), IQ4_XS=23 (`iq4_xs`, 256/136), IQ3_S=21 (`iq3_s`, 256/110), IQ3_XXS=18 (`iq3_xxs`, 256/98), IQ2_XXS=16 (`iq2_xxs`, 256/66), IQ2_XS=17 (`iq2_xs`, 256/74), IQ2_S=22 (`iq2_s`, 256/82), IQ1_S=19 (`iq1_s`, 256/50), and IQ1_M=29 (`iq1_m`, 256/56). All nodes use domain `com.github.onnxruntime.genai`, `block_layout_version=1`, and exact `K`, `N`, and lowercase `format` attributes. Added component, repacker, and end-to-end GGUF builder tests covering every format, enum ID, block size, and byte preservation.
+**Why:** The CPU runtime now decodes this complete IQ set, so Mobius can retain the source GGUF representation instead of dequantizing and requantizing it. GGUF types outside this explicit table, such as Q5_0, remain on the existing repack/dequantize-requantize fallback because `BlockQuantizedMatMul` does not advertise them.
+
+#### Source: `mariette-pris-iq-export-review.md`
+
+### 2026-07-16: Pris full IQ-family Mobius export review
+**By:** Mariette
+
+**Verdict:** 🟢 CLEAR — Mobius commit `5705eed` matches the authoritative onnx-genai CPU `BlockQuantizedMatMul` contract exactly.
+
+#### Format-string cross-check
+
+| GGUF type | Mobius emits | Runtime accepts | Result |
+|---|---|---|---|
+| MXFP4 | `mxfp4` | `mxfp4` | exact |
+| IQ4_NL | `iq4_nl` | `iq4_nl` | exact |
+| IQ4_XS | `iq4_xs` | `iq4_xs` | exact |
+| IQ3_S | `iq3_s` | `iq3_s` | exact |
+| IQ3_XXS | `iq3_xxs` | `iq3_xxs` | exact |
+| IQ2_XXS | `iq2_xxs` | `iq2_xxs` | exact |
+| IQ2_XS | `iq2_xs` | `iq2_xs` | exact |
+| IQ2_S | `iq2_s` | `iq2_s` | exact |
+| IQ1_S | `iq1_s` | `iq1_s` | exact |
+| IQ1_M | `iq1_m` | `iq1_m` | exact |
+
+#### GGML-number and byte-size check
+
+Cross-checked Mobius against the installed authoritative `gguf.GGMLQuantizationType` and `GGML_QUANT_SIZES`, then against the runtime's `qk()` and `block_bytes()` values.
+
+| Format | ggml type | Elements/block | Bytes/block | Result |
+|---|---:|---:|---:|---|
+| `iq2_xxs` | 16 | 256 | 66 | exact |
+| `iq2_xs` | 17 | 256 | 74 | exact |
+| `iq3_xxs` | 18 | 256 | 98 | exact |
+| `iq1_s` | 19 | 256 | 50 | exact |
+| `iq4_nl` | 20 | 32 | 18 | exact |
+| `iq3_s` | 21 | 256 | 110 | exact |
+| `iq2_s` | 22 | 256 | 82 | exact |
+| `iq4_xs` | 23 | 256 | 136 | exact |
+| `iq1_m` | 29 | 256 | 56 | exact |
+| `mxfp4` | 39 | 32 | 17 | exact |
+
+`preserve_native_blocks()` validates the complete raw byte count as `N * ceil(K / elements) * bytes` and reshapes without modifying bytes. No stride or off-by-one mismatch found.
+
+#### Node contract and fallback
+
+- Exported op/domain: `com.github.onnxruntime.genai::BlockQuantizedMatMul`, matching runtime registration.
+- `K`, `N`, lowercase `format`, and `block_layout_version=1` are all emitted.
+- Native selection is an exact ten-type allowlist keyed by ggml enum number. Every other `GGMLQuantizationType` returns no native spec and follows the existing repack or dequantize/requantize path; unsupported formats cannot silently reach the custom op.
+
+#### Tests
+
+- Required gate: `40 passed, 1 skipped, 4368 deselected in 7.74s`.
+- `ruff check`: `All checks passed!`
+- `git diff 5705eed^ 5705eed --check`: passed.
+
+#### Source: `sapper-cuda-numeric-drift.md`
+
+### 2026-07-16: CUDA RMS reduction FMA caused token-10 drift
+**By:** Sapper
+
+**What:** A temporary executor trace dumped every f32 node output for CPU and CUDA on the real Qwen2.5-0.5B int4 decode. Both paths use f32 KV, f32 attention/softmax accumulation, f32 RoPE caches, and fp32 MatMul accumulation; no fp16 KV rounding was involved. Replaying the first tolerance-failing `MatMulNBits` (node 128) with identical CPU input produced bit-exact CPU/CUDA output, ruling out its reduction as the source.
+
+The first recurrent mismatch is `SkipSimplifiedLayerNormalization` at layer 0, token index 1 (node 14): its inputs are bit-exact, but CUDA differs by `9.536743e-7` in 885/896 outputs. NVRTC contracts `ss += sv * sv` into FMA, while CPU performs separately rounded f32 multiply/add. The same issue exists in `SimplifiedLayerNormalization`. Initial token-0 SiLU noise is only `1.192093e-7` and does not explain the known argmax split.
+
+Before the fix, at generated token index 10 the first `atol=1e-5, rtol=1e-4` failure is layer 6 `GroupQueryAttention` (node 84): max abs `1.270249e-4`, 214/896 elements. Layer 7 GQA then amplifies accumulated KV differences to max abs `3.993874e-2`; final logits differ by max abs `1.310799`, and the narrow CPU top-2 margin (`5.833e-3`) flips `34` CPU to `9707` CUDA.
+
+**Root cause:** Real bug, not benign fp16/KV accumulation: unintended CUDA FMA contraction in the sequential RMS-square reductions. The later GQA/logit split is amplification of this recurrent state error.
+
+**Fix:** Commit `de3c556` on branch `cuda-numeric-drift` uses `__fmul_rn` + `__fadd_rn` in CUDA RMS/SkipRMS reductions and adds exact FMA-sensitive GPU regressions. Real-model parity extends from token indices 0..9 to 0..11. The remaining first mismatch is index 12 (`11766` CPU vs `16` CUDA), so residual backend drift still needs a separate follow-up rather than an accepted exact-parity claim.
+
+**Evidence:** Full `onnx-runtime-ep-cuda` suite passed; direct CUDA crate build passed; both new exact numeric tests passed; real Qwen CPU/CUDA smoke passed with the strengthened 12-token assertion. Fixed CUDA sequence begins `[11576,42740,11,358,614,264,3405,911,279,330,34,1027]`.
+
+#### Source: `wallace-cuda-fma-drift-review.md`
+
+# 2026-07-16 — CUDA RMS reduction FMA drift review
+
+**By:** Wallace
+**Verdict:** 🟢 CLEAR
+
+## What I verified
+
+- Reviewed `de3c556`. Both CUDA RMS reductions retain f32 and the CPU reference's serial, left-to-right accumulation order.
+- `__fmul_rn` followed by `__fadd_rn` explicitly rounds the square before the addition, preventing NVRTC FMA contraction without lowering precision, enabling fast math, or hard-coding an SM architecture.
+- The regression vector genuinely distinguishes the operations: separate mul/add produces `0x422e4301`; fused `fmaf` produces `0x422e4302`.
+- `native_decode.rs` only strengthens the existing real-model parity assertion from 10 to 12 matching tokens; it is directly tied to the kernel fix.
+
+## GPU verification
+
+Verified on NVIDIA H200, compute capability 9.0, driver 580.105.08.
+
+- `cargo build -p onnx-runtime-ep-cuda`: passed.
+- `cargo test -p onnx-runtime-ep-cuda`: passed after adding the installed cuDNN library directory to `LD_LIBRARY_PATH`; the requested bare environment initially reached the GPU tests but failed only because `libcudnn.so.9` was not discoverable.
+- `simplified_layer_norm_does_not_contract_square_accumulation`: passed on GPU with exact output and inverse-RMS equality.
+- `skip_simplified_layer_norm_does_not_contract_square_accumulation`: passed on GPU with exact output, inverse-RMS, and residual-sum equality.
+- `native_decode::tests::native_cuda_qwen_decode_matches_cpu_tokens`: passed against the installed Qwen model, confirming CPU/CUDA token parity through token index 11.
+
+## Secondary-source note
+
+The accepted residual mismatch beginning at token index 12 is likely seeded by the accuracy-level-4 `MatMulNBits` decode path: CUDA reduces per-block scaled dot products across warp lanes, while the CPU AVX/VNNI path accumulates eight scaled partial-dot lanes and horizontally sums them afterward. Those distinct f32 multiplication and accumulation orders can still introduce smaller backend drift. Follow up separately; it does not invalidate this RMS reduction fix.

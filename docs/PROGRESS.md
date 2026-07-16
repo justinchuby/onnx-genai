@@ -4,7 +4,7 @@ Tracks implementation status of `docs/DESIGN.md` (§1–§40). Updated as work l
 
 **Published:** `onnx-genai` v0.1.0 + 8 sub-crates on crates.io; the `onnx-runtime-*` layer (including `onnx-runtime-tracer`) is released as v0.1.0-dev.1. CI (fmt/build/test/**blocking clippy**) + scheduled `cargo-audit`. Coverage ~77% line.
 
-_Last updated: 2026-07-16 — includes completed onnx-rs full-spec serde, sub-4-bit CPU support, and open Mobius exports._
+_Last updated: 2026-07-16 — includes the complete runtime sub-4-bit IQ family, CUDA MXFP4/IQ4_NL decode GEMV, CUDA parity correction, and Mobius IQ-family export._
 
 
 ## Current tiered-memory and interoperability milestones
@@ -337,7 +337,7 @@ Scoped the "export Gemma4 E2B/12B via Mobius and smoke-test through onnx-genai" 
 - **CUDA Native Decode Milestone 2 (device tensors + op coverage + end-to-end GPU decode) ✅ (`5c0f05f`, Deckard → Leon safety revision; Holden 🔴→🟢):** CUDA is now opt-in through `DevicePreference::Gpu` or explicit CUDA selection while CPU remains the default. The native executor uploads initializers and inputs to CUDA, uses device-correct tensor views, synchronizes D2H graph outputs for sampling, and generates Qwen2.5-0.5B-int4 tokens exactly equal to CPU: `[11576, 42740, 11, 358, 614, 264, 3405, 911]`. Holden rejected the initial wiring for unsafe CUDA `SequenceAt` host pointers and `Scan` host writes to device memory; Deckard was locked out and Leon's `copy_from_host`/host-staging repair was independently cleared, including CUDA control-flow parity. **M3 is complete; next:** decode-efficient CUDA `MatMulNBits`, then M4 CUDA graph capture on a real non-default stream with serialized graph ownership.
 - **SM-general CUDA NVRTC targeting ✅ (`b56c5cb`, Wallace; Holden 🟢):** Runtime PTX (`compute_{major}{minor}`) and native-CUBIN (`sm_{major}{minor}`) targets now derive from the selected device capability across SM60–SM120, with no hardcoded `sm_90`. The unsupported-PTX→CUBIN fallback remains active; **117** CUDA tests and **6/6** GQA tests passed.
 - **CUDA Native Decode Milestone 3 — device-resident KV cache ✅ (`398c536`, Roy; Sebastian 🟢):** Decode owns persistent aliased K/V device buffers (all **48** stable pointers), uses zero per-token KV H2D/D2H transfers, O(1) mask updates, and separate fixed physical capacity versus valid sequence length. Default capacity is **4096**, configurable through the loader/environment override. **Next:** decode-efficient CUDA `MatMulNBits`, then M4 CUDA graph capture.
-- **CUDA↔CPU long-context numerical parity follow-up:** M2 and M3 CUDA streams are byte-identical but diverge from the CPU oracle at token index **10** (`9707` CUDA vs `34` CPU); this is pre-existing numerical drift, not an M3 regression.
+- **CUDA↔CPU RMS-reduction parity fix ✅ (`de3c556`, Sapper; Wallace 🟢):** Explicit `__fmul_rn` then `__fadd_rn` in CUDA RMSNorm and SkipRMSNorm prevents NVRTC from contracting the CPU's serial f32 square reductions into FMA. Native Qwen decode now matches CPU through token index **11** (previously through index 9); the first residual mismatch is token 12 and is separately tracked.
 
 ### Python bindings wave
 
@@ -348,15 +348,15 @@ Scoped the "export Gemma4 E2B/12B via Mobius and smoke-test through onnx-genai" 
 
 - **Upstream serde test port ✅ (`23e4995`, Zhora; Coco 🟢):** Expanded `text_format_port.rs` from **6 → 16** upstream-derived cases; **89** onnx-rs tests pass.
 - **onnx-rs full-spec serde ✅ DONE (`f058594`; Deckard `1b65769`; Rachael 🟢):** IR13 bindings, INT2/UINT2/FLOAT8E8M0, multi-device proto round-trips, and authoritative native text are complete. Readable DSL edits for headers, graph/nodes/attributes, dtype/shape, nested graphs, opaque strings, and list cardinalities win; residual data restores only omitted payload/metadata.
-- **Sub-4-bit CPU BlockQuantizedMatMul ✅ (`a2b2f0b`; `f6c530f`, Bryant; Leon 🟢):** MXFP4, IQ4_NL, IQ4_XS, IQ3_S, and IQ2_XXS decode natively with audited llama.cpp grids; remaining IQ1/IQ2_XS/IQ2_S/IQ3_XXS formats fail explicitly rather than silently corrupting.
+- **Full runtime sub-4-bit IQ family ✅ (`2dfee14`; `1bf47a8`, Bryant; Leon 🟢):** `BlockQuantizedMatMul` CPU decoding now supports MXFP4, IQ4_NL, IQ4_XS, IQ3_S, IQ3_XXS, IQ2_XXS, IQ2_XS, IQ2_S, IQ1_S, and IQ1_M. The llama.cpp grids, layouts, and fingerprints were independently audited; no IQ format remains deferred.
+- **CUDA MXFP4 + IQ4_NL decode GEMV ✅ (`cef7073`, Roy; Wallace 🟢):** Static M=1 `BlockQuantizedMatMul` decode reads native MXFP4 and IQ4_NL blocks directly on GPU, with bit-exact decoded-weight coverage and H200 validation. Other IQ formats and M>1 remain CPU-placed.
 - **CUDA int4 GEMV decode ✅ (`1de9584`, Roy; Wallace 🟢):** M=1 packed-int4 `MatMulNBits` decode reads weights directly on CUDA, improving decode by approximately 68–96% on H200 while preserving CPU/ORT contracts.
 - **Weight offload design ✅ (`docs/WEIGHT_OFFLOAD.md`, Nabil):** mmap → host → VRAM weight-tier subsystem design is complete and **awaiting user greenlight**.
-- **Mobius exports:** PR [#404](https://github.com/onnxruntime/mobius/pull/404) adds GLM-5.2 MoE with IndexShare DSA + MTP; PR [#405](https://github.com/onnxruntime/mobius/pull/405) adds DeepSeek-V4-Flash MTP + CSA; PR [#406](https://github.com/onnxruntime/mobius/pull/406) adds MXFP4 and IQ4_NL `BlockQuantizedMatMul` export wiring.
+- **Mobius exports:** PR [#404](https://github.com/onnxruntime/mobius/pull/404) adds GLM-5.2 MoE with IndexShare DSA + MTP; PR [#405](https://github.com/onnxruntime/mobius/pull/405) adds DeepSeek-V4-Flash MTP + CSA; PR [#406](https://github.com/onnxruntime/mobius/pull/406) now preserves the full runtime IQ family (MXFP4, IQ4_NL, IQ4_XS, IQ3_S, IQ3_XXS, IQ2_XXS, IQ2_XS, IQ2_S, IQ1_S, IQ1_M) in `BlockQuantizedMatMul` nodes and awaits user action.
 
 ### Runtime follow-ups
 
-- CUDA sub-4-bit `BlockQuantizedMatMul` kernel (GPU, in progress).
-- Native sparse-attention/index operations for DeepSeek-V4 CSA.
-- Iterative MTP orchestration.
-- Remaining IQ1/IQ2_XS/IQ2_S/IQ3_XXS formats.
-- CUDA↔CPU numeric drift.
+- CUDA↔CPU token-12 residual drift: likely `MatMulNBits` accuracy-level-4 reduction-order differences.
+- CUDA sub-4-bit GEMV for IQ2, IQ3, IQ4_XS, and IQ1 families; GPU currently supports MXFP4 and IQ4_NL only.
+- Native sparse-attention/index operations and iterative MTP orchestration for DeepSeek CSA (Chew).
+- `WEIGHT_OFFLOAD` implementation remains **AWAITING USER GREENLIGHT**.

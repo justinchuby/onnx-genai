@@ -69,3 +69,8 @@ Reviewed Gather/Shape/Constant through three resolved rejection cycles.
 ## 2026-07-16T17:00:38+0000 — Mobius sub-4-bit export wiring
 - Opened Mobius PR #406, preserving MXFP4 and IQ4_NL GGUF blocks in `BlockQuantizedMatMul` export nodes.
 - Unsupported IQ formats remain on the dequantize/requantize fallback until runtime support lands.
+
+## 2026-07-16T18:11:48+0000 — Mobius full IQ-family export
+
+- Updated Mobius PR #406 to preserve all ten runtime-supported MXFP4/IQ formats as `BlockQuantizedMatMul` raw blocks; the PR remains open.
+- Mariette 🟢 verified enum IDs, format strings, dimensions, byte strides, and fallback behavior.

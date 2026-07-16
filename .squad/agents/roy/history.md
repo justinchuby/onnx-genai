@@ -50,3 +50,8 @@ Authored CUDA Gather, Shape, and Constant kernels; coverage reached 65.
 ## 2026-07-16T17:00:38+0000 — CUDA M5 int4 GEMV decode
 - Merged `1de9584`: direct packed-int4 M=1 CUDA GEMV avoids f32 weight expansion and improved decode by approximately 68–96%.
 - Wallace 🟢 verified H200 parity and the unchanged Qwen decode contract.
+
+## 2026-07-16T18:11:48+0000 — CUDA sub-4-bit GEMV
+
+- Merged `cef7073`: static M=1 CUDA `BlockQuantizedMatMul` now decodes MXFP4 and IQ4_NL native blocks; other IQ formats remain CPU-placed.
+- Wallace 🟢 cleared H200 packing, exact decoded-weight, and 124-test coverage.
