@@ -570,15 +570,38 @@ fn gemv_nk(activation: &[f32], weight_nk: &[f32], result: &mut [f32], k: usize, 
     }
 }
 
-const MIN_PARALLEL_DOT_PRODUCTS: usize = 1024 * 1024;
+const MIN_PARALLEL_DOT_PRODUCTS_PER_TASK: usize = 32 * 1024;
+const MIN_PARALLEL_DOT_PRODUCTS_PER_THREAD: usize = 8 * 1024;
+const MANY_THREAD_DOT_PRODUCTS_PER_THREAD: usize = 64 * 1024;
 const MIN_OUTPUTS_PER_TASK: usize = 16;
+const MANY_THREAD_CUTOFF: usize = 48;
 
 fn output_chunk_len(n: usize, k: usize) -> usize {
     let threads = rayon::current_num_threads();
-    if threads <= 1 || n.saturating_mul(k) < MIN_PARALLEL_DOT_PRODUCTS {
+    let total_work = n.saturating_mul(k);
+    // Small projections amortize Rayon well on one socket, but dispatching each
+    // one across a larger pool costs more than its GEMV on the dual-socket host.
+    let work_per_thread = if threads <= MANY_THREAD_CUTOFF {
+        MIN_PARALLEL_DOT_PRODUCTS_PER_THREAD
+    } else {
+        MANY_THREAD_DOT_PRODUCTS_PER_THREAD
+    };
+    if threads <= 1 || total_work < threads.saturating_mul(work_per_thread) {
         return n.max(1);
     }
-    n.div_ceil(threads).max(MIN_OUTPUTS_PER_TASK).min(n)
+    let max_tasks = if threads <= MANY_THREAD_CUTOFF {
+        threads.saturating_mul(2)
+    } else {
+        threads
+    };
+    let tasks = total_work
+        .div_ceil(MIN_PARALLEL_DOT_PRODUCTS_PER_TASK)
+        .min(max_tasks)
+        .min(n);
+    if tasks < 2 {
+        return n.max(1);
+    }
+    n.div_ceil(tasks).max(MIN_OUTPUTS_PER_TASK).min(n)
 }
 
 fn optional_input<'a>(inputs: &'a [TensorView<'a>], index: usize) -> Option<&'a TensorView<'a>> {
@@ -1037,6 +1060,25 @@ mod tests {
                 );
             });
         assert_eq!(parallel, serial);
+    }
+
+    #[test]
+    fn matmulnbits_partition_scales_with_pool_size_and_work() {
+        let chunk = |threads, n, k| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap()
+                .install(|| output_chunk_len(n, k))
+        };
+
+        assert_eq!(chunk(1, 4864, 896), 4864);
+        assert_eq!(chunk(24, 16, 32), 16);
+        assert_eq!(chunk(24, 896, 896), 36);
+        assert_eq!(chunk(48, 896, 896), 36);
+        assert_eq!(chunk(96, 896, 896), 896);
+        assert_eq!(chunk(96, 4864, 896), 4864);
+        assert_eq!(chunk(96, 151_936, 896), 1583);
     }
 
     #[test]
