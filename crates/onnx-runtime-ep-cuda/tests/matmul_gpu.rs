@@ -291,8 +291,10 @@ fn matmul_rejects_unsupported_rank_and_dtype() {
         .expect_err("Int64 MatMul must be rejected");
     let msg = format!("{err}");
     println!("dtype error: {msg}");
-    assert!(msg.contains("MatMul with dtype Int64"), "{msg}");
-    assert!(msg.contains("not yet implemented"), "{msg}");
+    assert!(
+        msg.contains("MatMul with dtype Int64 is not yet implemented on the CUDA EP"),
+        "{msg}"
+    );
 
     ep.deallocate(a_buf).unwrap();
     ep.deallocate(b_buf).unwrap();
