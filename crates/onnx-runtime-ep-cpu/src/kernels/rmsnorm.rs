@@ -18,9 +18,10 @@
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ir::Node;
 
-use super::{check_arity, to_dense_f32, write_dense_f32};
+use super::check_arity;
+use crate::dtype::{to_dense_f32_widen, write_dense_f32_narrow};
 
-/// f32 RMSNormalization kernel carrying `axis` and `epsilon`.
+/// Floating-point RMSNormalization kernel carrying `axis` and `epsilon`.
 pub struct RmsNormKernel {
     axis: i64,
     epsilon: f32,
@@ -53,8 +54,14 @@ impl KernelFactory for RmsNormFactory {
 impl Kernel for RmsNormKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         check_arity("RMSNormalization", inputs, outputs, 2, 2, 1)?;
-        let x = to_dense_f32(&inputs[0])?;
-        let scale = to_dense_f32(&inputs[1])?;
+        if outputs[0].dtype != inputs[0].dtype {
+            return Err(EpError::KernelFailed(format!(
+                "RMSNormalization: output dtype {:?} must match X dtype {:?}",
+                outputs[0].dtype, inputs[0].dtype
+            )));
+        }
+        let x = to_dense_f32_widen("RMSNormalization", &inputs[0])?;
+        let scale = to_dense_f32_widen("RMSNormalization", &inputs[1])?;
         let y = rms_norm_dense(
             &x,
             inputs[0].shape,
@@ -63,7 +70,7 @@ impl Kernel for RmsNormKernel {
             self.axis,
             self.epsilon,
         )?;
-        write_dense_f32(&mut outputs[0], &y)
+        write_dense_f32_narrow("RMSNormalization", &mut outputs[0], &y)
     }
 
     fn supports_strided_input(&self, _input_idx: usize) -> bool {
@@ -191,6 +198,23 @@ mod tests {
         want.extend(reference(&[2., 4., 6.], &[1., 1., 1.], 1e-5));
         for (g, w) in out.to_f32().iter().zip(&want) {
             assert!((g - w).abs() < 1e-5, "got {g}, want {w}");
+        }
+    }
+
+    #[test]
+    fn rmsnorm_float16_accumulates_in_float32() {
+        let x = Owned::f16(&[1, 4], &[1., 2., 3., 4.]);
+        let scale = Owned::f16(&[4], &[1., 1., 1., 1.]);
+        let mut out = Owned::zeros(onnx_runtime_ir::DataType::Float16, &[1, 4]);
+        RmsNormKernel {
+            axis: -1,
+            epsilon: 1e-5,
+        }
+        .execute(&[x.view(), scale.view()], &mut [out.view_mut()])
+        .unwrap();
+        let want = reference(&[1., 2., 3., 4.], &[1., 1., 1., 1.], 1e-5);
+        for (got, want) in out.to_f16_as_f32().iter().zip(want) {
+            assert!((got - want).abs() < 1e-3, "got {got}, want {want}");
         }
     }
 

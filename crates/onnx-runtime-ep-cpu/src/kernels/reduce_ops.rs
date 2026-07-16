@@ -17,9 +17,9 @@
 //! either a retained size-1 dim (keepdims) or nothing (squeezed).
 
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
-use onnx_runtime_ir::{compute_contiguous_strides, Node};
+use onnx_runtime_ir::{Node, compute_contiguous_strides};
 
-use super::{check_arity, to_dense_f32, to_dense_i64, write_dense_f32};
+use super::{check_arity, to_dense_f32, to_dense_i64, write_dense_bytes, write_dense_f32};
 use crate::strided::{next_index, numel};
 
 /// The reduction to apply over the selected axes.
@@ -154,50 +154,13 @@ reduce_factory!(ReduceLogSumExpFactory, ReduceOp::LogSumExp);
 impl Kernel for ReduceKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         check_arity(self.op.name(), inputs, outputs, 1, 2, 1)?;
+        if matches!(self.op, ReduceOp::Sum) && inputs[0].dtype == onnx_runtime_ir::DataType::Int64 {
+            return self.execute_i64_sum(inputs, &mut outputs[0]);
+        }
         let x = to_dense_f32(&inputs[0])?;
         let in_shape = inputs[0].shape;
         let rank = in_shape.len();
-
-        // Resolve the raw axes list: input 1 (opset 13/18+) takes precedence
-        // over the attribute; both absent means "reduce all axes" (unless
-        // noop_with_empty_axes selects identity for an explicitly-empty set).
-        let axes_raw: Option<Vec<i64>> = if inputs.len() == 2 && !inputs[1].is_absent() {
-            Some(to_dense_i64(&inputs[1])?)
-        } else {
-            self.axes_attr.clone()
-        };
-
-        let mut reduce = vec![false; rank];
-        match &axes_raw {
-            // Explicitly empty axes. With `noop_with_empty_axes` this reduces no
-            // axis (each element is its own group); otherwise it reduces all.
-            // Note "no reduction" is NOT a plain identity: the per-element pre-map
-            // (square for SumSquare/L2) and post-map (sqrt for L2) still apply, so
-            // we fall through to the normal loop with `reduce` all-false rather
-            // than copying the input.
-            Some(a) if a.is_empty() => {
-                if !self.noop_with_empty_axes {
-                    reduce.iter_mut().for_each(|r| *r = true);
-                }
-            }
-            Some(axes) => {
-                for &a in axes {
-                    let ax = if a < 0 { a + rank as i64 } else { a };
-                    if ax < 0 || ax as usize >= rank {
-                        return Err(EpError::KernelFailed(format!(
-                            "{}: axis {a} out of range for rank {rank}",
-                            self.op.name()
-                        )));
-                    }
-                    reduce[ax as usize] = true;
-                }
-            }
-            None => {
-                if !self.noop_with_empty_axes {
-                    reduce.iter_mut().for_each(|r| *r = true);
-                }
-            }
-        }
+        let reduce = self.resolve_axes(inputs, rank)?;
 
         let kept_shape: Vec<usize> = (0..rank)
             .filter(|&d| !reduce[d])
@@ -269,6 +232,81 @@ impl Kernel for ReduceKernel {
     }
 }
 
+impl ReduceKernel {
+    fn resolve_axes(&self, inputs: &[TensorView], rank: usize) -> Result<Vec<bool>> {
+        let axes_raw = if inputs.len() == 2 && !inputs[1].is_absent() {
+            Some(to_dense_i64(&inputs[1])?)
+        } else {
+            self.axes_attr.clone()
+        };
+        let mut reduce = vec![false; rank];
+        match &axes_raw {
+            Some(axes) if axes.is_empty() => {
+                if !self.noop_with_empty_axes {
+                    reduce.fill(true);
+                }
+            }
+            Some(axes) => {
+                for &axis in axes {
+                    let normalized = if axis < 0 { axis + rank as i64 } else { axis };
+                    if normalized < 0 || normalized as usize >= rank {
+                        return Err(EpError::KernelFailed(format!(
+                            "{}: axis {axis} out of range for rank {rank}",
+                            self.op.name()
+                        )));
+                    }
+                    reduce[normalized as usize] = true;
+                }
+            }
+            None => {
+                if !self.noop_with_empty_axes {
+                    reduce.fill(true);
+                }
+            }
+        }
+        Ok(reduce)
+    }
+
+    fn execute_i64_sum(&self, inputs: &[TensorView], output: &mut TensorMut) -> Result<()> {
+        let x = to_dense_i64(&inputs[0])?;
+        let in_shape = inputs[0].shape;
+        let rank = in_shape.len();
+        let reduce = self.resolve_axes(inputs, rank)?;
+        let kept_shape = (0..rank)
+            .filter(|&axis| !reduce[axis])
+            .map(|axis| in_shape[axis])
+            .collect::<Vec<_>>();
+        let in_strides = compute_contiguous_strides(in_shape);
+        let kept_strides = compute_contiguous_strides(&kept_shape);
+        let mut sums = vec![0_i64; numel(&kept_shape).max(1)];
+        if numel(in_shape) > 0 {
+            let mut index = vec![0; rank];
+            loop {
+                let mut input_offset = 0;
+                let mut output_offset = 0;
+                let mut kept_axis = 0;
+                for axis in 0..rank {
+                    input_offset += in_strides[axis] as usize * index[axis];
+                    if !reduce[axis] {
+                        output_offset += kept_strides[kept_axis] as usize * index[axis];
+                        kept_axis += 1;
+                    }
+                }
+                sums[output_offset] = sums[output_offset].wrapping_add(x[input_offset]);
+                if !next_index(in_shape, &mut index) {
+                    break;
+                }
+            }
+        }
+        let _ = self.keepdims;
+        let bytes = sums
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>();
+        write_dense_bytes(output, &bytes)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -317,6 +355,14 @@ mod tests {
         let mut out = Owned::zeros_f32(&[2, 1]);
         run_attr(ReduceOp::Sum, Some(vec![1]), &x, &mut out);
         assert_eq!(out.to_f32(), vec![6., 15.]);
+    }
+
+    #[test]
+    fn sum_int64_axis1() {
+        let x = Owned::i64(&[2, 3], &[1, 2, 3, 4, 5, 6]);
+        let mut out = Owned::zeros(DataType::Int64, &[2, 1]);
+        run_attr(ReduceOp::Sum, Some(vec![1]), &x, &mut out);
+        assert_eq!(out.to_i64(), vec![6, 15]);
     }
 
     #[test]

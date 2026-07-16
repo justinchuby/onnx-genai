@@ -63,14 +63,14 @@ fn generate(
     prompt_tokens: &[u32],
     tokenizer: &Tokenizer,
     tokens: usize,
-) -> Result<usize> {
+) -> Result<Vec<u32>> {
     let mut options = GenerateOptions::default();
     options.max_new_tokens = tokens;
     options.temperature = 0.0;
     options.greedy = true;
     options.stop_on_eos = false;
     let result = session.generate(prompt_tokens, &options, &ProcessorChain::new(), tokenizer)?;
-    Ok(result.token_ids.len())
+    Ok(result.token_ids)
 }
 
 fn main() -> Result<()> {
@@ -121,9 +121,11 @@ fn main() -> Result<()> {
     };
 
     println!(
-        "profile_native: model={} ep={:?} tokens={} warmups={} runs={}",
+        "profile_native: model={} ep={:?} layers={} prompt_tokens={prompt_tokens:?} \
+         tokens={} warmups={} runs={}",
         model.display(),
         args.ep,
+        session.kv_layer_count(),
         args.tokens,
         args.warmups,
         args.runs
@@ -139,10 +141,21 @@ fn main() -> Result<()> {
 
     let mut generated = 0usize;
     let mut elapsed = Duration::ZERO;
+    let mut reference_tokens = None;
     for _ in 0..args.runs {
         let start = Instant::now();
-        generated += generate(&mut session, &prompt_tokens, &tokenizer, args.tokens)?;
+        let tokens = generate(&mut session, &prompt_tokens, &tokenizer, args.tokens)?;
         elapsed += start.elapsed();
+        generated += tokens.len();
+        if let Some(reference) = &reference_tokens {
+            if reference != &tokens {
+                bail!(
+                    "native greedy decode was not deterministic: first={reference:?}, rerun={tokens:?}"
+                );
+            }
+        } else {
+            reference_tokens = Some(tokens);
+        }
     }
     let tok_per_s = generated as f64 / elapsed.as_secs_f64();
     let ms_per_step = elapsed.as_secs_f64() * 1_000.0 / generated as f64;
@@ -151,5 +164,8 @@ fn main() -> Result<()> {
          ({generated} generated tokens in {:.3} ms)",
         elapsed.as_secs_f64() * 1_000.0
     );
+    if let Some(tokens) = reference_tokens {
+        println!("generated_token_ids: {tokens:?}");
+    }
     Ok(())
 }

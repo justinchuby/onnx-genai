@@ -82,6 +82,46 @@ pub fn rotary_embedding(ctx: &mut InferenceContext) -> Result<(), ShapeInferErro
     Ok(())
 }
 
+/// `com.microsoft::GroupQueryAttention`: attention output preserves query shape;
+/// present K/V append the current key sequence to the BNSH past cache.
+pub fn group_query_attention(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
+    let Some(query) = ctx.input_type(0).cloned() else {
+        return Ok(());
+    };
+    ctx.set_output_type(0, query.clone());
+    if ctx.num_outputs() < 2 {
+        return Ok(());
+    }
+    let (Some(key), Some(past)) = (ctx.input_shape(1), ctx.input_shape(3)) else {
+        return Ok(());
+    };
+    if key.len() != 3 || past.len() != 4 {
+        return Ok(());
+    }
+    let Some(kv_heads) = ctx
+        .node
+        .attr("kv_num_heads")
+        .and_then(|attribute| attribute.as_int())
+        .filter(|&heads| heads > 0)
+    else {
+        return Ok(());
+    };
+    let head_dim = key[2]
+        .checked_div(&DimExpr::constant(kv_heads))
+        .unwrap_or_else(DimExpr::overflow);
+    let present = vec![
+        key[0].clone(),
+        DimExpr::constant(kv_heads),
+        past[2].add(&key[1]),
+        head_dim,
+    ];
+    ctx.set_output(1, query.dtype, present.clone());
+    if ctx.num_outputs() > 2 {
+        ctx.set_output(2, query.dtype, present);
+    }
+    Ok(())
+}
+
 /// `Softmax`/`LogSoftmax`: shape- and dtype-preserving.
 pub fn softmax(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
     if let Some(t) = ctx.input_type(0).cloned() {
@@ -190,6 +230,12 @@ pub fn register(reg: &mut InferenceRegistry) {
     // shape-preserving (output == input X).
     reg.register("", "RMSNormalization", 23, rms_norm);
     reg.register("", "RotaryEmbedding", 23, rotary_embedding);
+    reg.register(
+        "com.microsoft",
+        "GroupQueryAttention",
+        1,
+        group_query_attention,
+    );
 
     for op in [
         "ReduceMean",

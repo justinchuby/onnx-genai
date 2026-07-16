@@ -10,8 +10,9 @@
 use onnx_runtime_ep_api::{Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ir::Node;
 
+use super::check_arity;
 use super::elementwise::erf;
-use super::{check_arity, to_dense_f32, write_dense_f32};
+use crate::dtype::{to_dense_f32_widen, write_dense_f32_narrow};
 
 /// `1/√2`, evaluated in `f64` to match the `erf` argument precision.
 const FRAC_1_SQRT_2: f64 = std::f64::consts::FRAC_1_SQRT_2;
@@ -51,9 +52,9 @@ impl KernelFactory for GeluFactory {
 impl Kernel for GeluKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         check_arity("Gelu", inputs, outputs, 1, 1, 1)?;
-        let x = to_dense_f32(&inputs[0])?;
+        let x = to_dense_f32_widen("Gelu", &inputs[0])?;
         let y: Vec<f32> = x.iter().map(|&v| exact_gelu(v)).collect();
-        write_dense_f32(&mut outputs[0], &y)
+        write_dense_f32_narrow("Gelu", &mut outputs[0], &y)
     }
 
     fn supports_strided_input(&self, _input_idx: usize) -> bool {
@@ -87,13 +88,13 @@ impl KernelFactory for StdGeluFactory {
 impl Kernel for StdGeluKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         check_arity("Gelu", inputs, outputs, 1, 1, 1)?;
-        let x = to_dense_f32(&inputs[0])?;
+        let x = to_dense_f32_widen("Gelu", &inputs[0])?;
         let y: Vec<f32> = if self.tanh {
             x.iter().map(|&v| tanh_gelu(v)).collect()
         } else {
             x.iter().map(|&v| exact_gelu(v)).collect()
         };
-        write_dense_f32(&mut outputs[0], &y)
+        write_dense_f32_narrow("Gelu", &mut outputs[0], &y)
     }
 
     fn supports_strided_input(&self, _input_idx: usize) -> bool {

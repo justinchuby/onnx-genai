@@ -49,20 +49,18 @@ use std::sync::Arc;
 use onnx_runtime_ep_api::{
     DeviceBuffer, DevicePtr, DevicePtrMut, ExecutionProvider, KernelMatch, TensorMut, TensorView,
 };
-use onnx_runtime_ep_cpu::strided::view_in_bounds;
 use onnx_runtime_ep_cpu::CpuExecutionProvider;
+use onnx_runtime_ep_cpu::strided::view_in_bounds;
 use onnx_runtime_ir::{
-    as_static_shape, compute_contiguous_strides, DataType, Dim, Graph, Node, NodeId, Shape,
-    SymbolId, TensorLayout, ValueId,
+    DataType, Dim, Graph, Node, NodeId, Shape, SymbolId, TensorLayout, ValueId, as_static_shape,
+    compute_contiguous_strides,
 };
 use onnx_runtime_loader::WeightStore;
 use onnx_runtime_shape_inference::{InferenceRegistry, MergePolicy};
 
 use crate::error::{Result, SessionError};
-use crate::sequence::{
-    concat_axis, split_axis, stack_new_axis, SeqTensor, SequenceValue,
-};
-use crate::tensor::{host_bytes, write_host, Tensor};
+use crate::sequence::{SeqTensor, SequenceValue, concat_axis, split_axis, stack_new_axis};
+use crate::tensor::{Tensor, host_bytes, write_host};
 
 /// A per-node compiled entry: the structural facts the run loop needs without
 /// re-deriving them from the graph. Shapes are **not** baked here — they are
@@ -165,7 +163,12 @@ impl KernelCache {
                 ep.supports_op(node, &shape_dims, &layouts),
                 KernelMatch::Supported { .. }
             ) {
-                return Err(SessionError::unsupported_op(node, node_id, opset, ep.name()));
+                return Err(SessionError::unsupported_op(
+                    node,
+                    node_id,
+                    opset,
+                    ep.name(),
+                ));
             }
             let kernel = ep.get_kernel(node, input_shapes, opset)?;
             self.entries.insert(key.clone(), kernel);
@@ -400,7 +403,7 @@ fn checked_numel(dims: &[usize], value: impl FnOnce() -> String) -> Result<usize
                 return Err(SessionError::ShapeOverflow {
                     value: value(),
                     dims: dims.to_vec(),
-                })
+                });
             }
         };
     }
@@ -535,6 +538,29 @@ fn dynamic_output_shapes(
                 onnx_runtime_ep_cpu::slice_plan(data_shape, starts, ends, &axes, &steps).ok()?;
             let count: Vec<usize> = plan.iter().map(|p| p.count).collect();
             Some(vec![count])
+        }
+        "GroupQueryAttention" if node.domain == "com.microsoft" => {
+            let query = input_shapes.first()?;
+            let key = input_shapes.get(1)?;
+            let past_key = input_shapes.get(3)?;
+            if query.len() != 3 || key.len() != 3 || past_key.len() != 4 {
+                return None;
+            }
+            let kv_heads = usize::try_from(node.attr("kv_num_heads")?.as_int()?).ok()?;
+            if kv_heads == 0 || !key[2].is_multiple_of(kv_heads) {
+                return None;
+            }
+            let head_dim = key[2] / kv_heads;
+            let total_sequence = past_key[2].checked_add(key[1])?;
+            let present = vec![query[0], kv_heads, total_sequence, head_dim];
+            let mut shapes = vec![query.clone()];
+            if node.outputs.len() >= 2 {
+                shapes.push(present.clone());
+            }
+            if node.outputs.len() >= 3 {
+                shapes.push(present);
+            }
+            Some(shapes)
         }
         _ => None,
     }
@@ -905,10 +931,7 @@ impl Executor {
 
     /// Bind the graph's symbols to concrete sizes from the actual bound-input
     /// shapes, validating rank and static dims and detecting symbol conflicts.
-    fn bind_symbols(
-        &self,
-        inputs: &[(&str, &Tensor)],
-    ) -> Result<HashMap<SymbolId, usize>> {
+    fn bind_symbols(&self, inputs: &[(&str, &Tensor)]) -> Result<HashMap<SymbolId, usize>> {
         let mut bindings: HashMap<SymbolId, usize> = HashMap::new();
         for (name, tensor) in inputs {
             let vid = *self
@@ -1119,8 +1142,8 @@ impl Executor {
                 })
                 .collect();
             let node = self.graph.node(node_id);
-            let out_shapes = dynamic_output_shapes(node, &input_shapes, &input_values)
-                .ok_or_else(|| {
+            let out_shapes =
+                dynamic_output_shapes(node, &input_shapes, &input_values).ok_or_else(|| {
                     let vid = outputs
                         .iter()
                         .find(|v| !resolved.contains_key(v))
@@ -1147,8 +1170,7 @@ impl Executor {
             }
         }
 
-        let output_shapes: Vec<Vec<usize>> =
-            outputs.iter().map(|v| resolved[v].clone()).collect();
+        let output_shapes: Vec<Vec<usize>> = outputs.iter().map(|v| resolved[v].clone()).collect();
 
         // Resolve each input's real geometry (root buffer + strides/offset) and
         // bounds-check it. View inputs read through their recorded strides.
@@ -1276,10 +1298,7 @@ impl Executor {
                     None => in_vid,
                 };
                 let root_len = buffers.get(&root).map(|b| b.len()).ok_or_else(|| {
-                    SessionError::Internal(format!(
-                        "view source value#{} has no buffer",
-                        root.0
-                    ))
+                    SessionError::Internal(format!("view source value#{} has no buffer", root.0))
                 })?;
                 // Bounds-gate the composed view against the source allocation.
                 view_bounds(
@@ -1376,9 +1395,8 @@ impl Executor {
                     },
                 ));
             }
-            let src = unsafe {
-                std::slice::from_raw_parts(info.base_ptr as *const u8, info.root_len)
-            };
+            let src =
+                unsafe { std::slice::from_raw_parts(info.base_ptr as *const u8, info.root_len) };
             let gathered = gather_view(src, &info.shape, &info.strides, info.byte_offset, esize);
             let strides = compute_contiguous_strides(&info.shape);
             mat.push(Some((gathered, strides)));
@@ -1446,7 +1464,34 @@ impl Executor {
             ));
         }
 
-        kernel.execute(&views, &mut outs)?;
+        kernel.execute(&views, &mut outs).map_err(|error| {
+            let input_types = views.iter().map(|view| view.dtype).collect::<Vec<_>>();
+            let output_types = outs.iter().map(|output| output.dtype).collect::<Vec<_>>();
+            let input_shapes = views
+                .iter()
+                .map(|view| view.shape.to_vec())
+                .collect::<Vec<_>>();
+            let output_shapes = outs
+                .iter()
+                .map(|output| output.shape.to_vec())
+                .collect::<Vec<_>>();
+            let input_names = inputs
+                .iter()
+                .map(|input| {
+                    input
+                        .map(|value| self.graph.value(value).name.as_deref().unwrap_or("<unnamed>"))
+                        .unwrap_or("<absent>")
+                })
+                .collect::<Vec<_>>();
+            let output_names = outputs
+                .iter()
+                .map(|&value| self.graph.value(value).name.as_deref().unwrap_or("<unnamed>"))
+                .collect::<Vec<_>>();
+            SessionError::Internal(format!(
+                "node {} ({:?}, op '{}::{}', inputs {input_names:?} {input_types:?} {input_shapes:?}, outputs {output_names:?} {output_types:?} {output_shapes:?}) failed: {error}",
+                node.id.0, node.name, node.domain, node.op_type,
+            ))
+        })?;
 
         drop(views);
         drop(outs);
@@ -1511,19 +1556,23 @@ impl Executor {
 
         match op.as_str() {
             "SequenceEmpty" => {
-                let dtype_attr = self.graph.node(node_id).attr("dtype").and_then(|a| a.as_int());
+                let dtype_attr = self
+                    .graph
+                    .node(node_id)
+                    .attr("dtype")
+                    .and_then(|a| a.as_int());
                 let dtype = match dtype_attr {
                     None => DataType::Float32, // ONNX default element type.
-                    Some(raw) => DataType::from_onnx(raw as i32).ok_or_else(|| {
-                        SessionError::SequenceOp {
+                    Some(raw) => {
+                        DataType::from_onnx(raw as i32).ok_or_else(|| SessionError::SequenceOp {
                             op: op.clone(),
                             reason: format!(
                                 "attribute 'dtype' = {raw} is not a known ONNX \
                                  TensorProto.DataType. To fix: use a valid element \
                                  dtype id (e.g. 1=float32, 7=int64)"
                             ),
-                        }
-                    })?,
+                        })?
+                    }
                 };
                 self.sequences
                     .insert(outputs[0], SequenceValue::empty(dtype));
@@ -1541,9 +1590,11 @@ impl Executor {
             }
             "SequenceInsert" => {
                 let seq = self.get_sequence(inputs.first().copied().flatten(), &op)?;
-                let tvid = inputs.get(1).copied().flatten().ok_or_else(|| {
-                    self.seq_missing_input(&op)
-                })?;
+                let tvid = inputs
+                    .get(1)
+                    .copied()
+                    .flatten()
+                    .ok_or_else(|| self.seq_missing_input(&op))?;
                 let tensor = self.read_seq_element(tvid, resolved)?;
                 let position = match inputs.get(2).copied().flatten() {
                     Some(pvid) => Some(self.read_scalar_i64(pvid, resolved, &op)?),
@@ -1565,14 +1616,17 @@ impl Executor {
             }
             "SequenceAt" => {
                 let seq = self.get_sequence(inputs.first().copied().flatten(), &op)?;
-                let pvid = inputs.get(1).copied().flatten().ok_or_else(|| {
-                    SessionError::SequenceOp {
-                        op: op.clone(),
-                        reason: "requires a 'position' input. To fix: supply the \
+                let pvid =
+                    inputs
+                        .get(1)
+                        .copied()
+                        .flatten()
+                        .ok_or_else(|| SessionError::SequenceOp {
+                            op: op.clone(),
+                            reason: "requires a 'position' input. To fix: supply the \
                                  index tensor of the element to read"
-                            .to_string(),
-                    }
-                })?;
+                                .to_string(),
+                        })?;
                 let pos = self.read_scalar_i64(pvid, resolved, &op)?;
                 let elem = seq.at(pos).map_err(seq_err)?;
                 self.store_seq_element_output(outputs[0], elem, resolved)
@@ -1611,7 +1665,11 @@ impl Executor {
         let axis_attr = node.attr("axis").and_then(|a| a.as_int()).unwrap_or(0);
         let keepdims = node.attr("keepdims").and_then(|a| a.as_int()).unwrap_or(1) != 0;
 
-        let ivid = inputs.first().copied().flatten().ok_or_else(|| self.seq_missing_input(op))?;
+        let ivid = inputs
+            .first()
+            .copied()
+            .flatten()
+            .ok_or_else(|| self.seq_missing_input(op))?;
         let dtype = self.value_dtypes[&ivid];
         let esize = dtype.byte_size();
         if esize == 0 {
@@ -1669,9 +1727,7 @@ impl Executor {
                     if chunk <= 0 {
                         return Err(SessionError::SequenceOp {
                             op: op.to_string(),
-                            reason: format!(
-                                "'split' chunk size {chunk} must be positive"
-                            ),
+                            reason: format!("'split' chunk size {chunk} must be positive"),
                         });
                     }
                     let chunk = chunk as usize;
@@ -1732,13 +1788,14 @@ impl Executor {
         resolved: &mut HashMap<ValueId, Vec<usize>>,
     ) -> Result<()> {
         let node = self.graph.node(node_id);
-        let axis_attr = node.attr("axis").and_then(|a| a.as_int()).ok_or_else(|| {
-            SessionError::SequenceOp {
-                op: op.to_string(),
-                reason: "requires the mandatory 'axis' attribute. To fix: set 'axis'"
-                    .to_string(),
-            }
-        })?;
+        let axis_attr =
+            node.attr("axis")
+                .and_then(|a| a.as_int())
+                .ok_or_else(|| SessionError::SequenceOp {
+                    op: op.to_string(),
+                    reason: "requires the mandatory 'axis' attribute. To fix: set 'axis'"
+                        .to_string(),
+                })?;
         let new_axis = node.attr("new_axis").and_then(|a| a.as_int()).unwrap_or(0) != 0;
 
         let seq = self.get_sequence(inputs.first().copied().flatten(), op)?;
@@ -1755,9 +1812,7 @@ impl Executor {
         if esize == 0 {
             return Err(SessionError::SequenceOp {
                 op: op.to_string(),
-                reason: format!(
-                    "sub-byte dtype {dtype:?} is not supported for ConcatFromSequence"
-                ),
+                reason: format!("sub-byte dtype {dtype:?} is not supported for ConcatFromSequence"),
             });
         }
         let elem_shapes: Vec<Vec<usize>> = seq.items.iter().map(|t| t.shape.clone()).collect();
@@ -1778,8 +1833,8 @@ impl Executor {
                     });
                 }
             }
-            let axis = normalize_axis(axis_attr, rank + 1).ok_or_else(|| {
-                SessionError::SequenceOp {
+            let axis =
+                normalize_axis(axis_attr, rank + 1).ok_or_else(|| SessionError::SequenceOp {
                     op: op.to_string(),
                     reason: format!(
                         "'axis' = {axis_attr} is out of range for new_axis=1 stacking \
@@ -1787,8 +1842,7 @@ impl Executor {
                         -(rank as i64) - 1,
                         rank as i64
                     ),
-                }
-            })?;
+                })?;
             stack_new_axis(&elem_datas, &elem_shapes[0], axis, esize)
         } else {
             let axis = normalize_axis(axis_attr, rank).ok_or_else(|| SessionError::SequenceOp {
@@ -1803,7 +1857,9 @@ impl Executor {
             // Elements must agree on every dimension except the concat axis.
             for (i, s) in elem_shapes.iter().enumerate() {
                 let mismatch = s.len() != rank
-                    || s.iter().enumerate().any(|(d, &v)| d != axis && v != elem_shapes[0][d]);
+                    || s.iter()
+                        .enumerate()
+                        .any(|(d, &v)| d != axis && v != elem_shapes[0][d]);
                 if mismatch {
                     return Err(SessionError::SequenceOp {
                         op: op.to_string(),
@@ -1847,15 +1903,18 @@ impl Executor {
     /// clones), or an actionable error if the input is missing / not a sequence.
     fn get_sequence(&self, vid: Option<ValueId>, op: &str) -> Result<SequenceValue> {
         let vid = vid.ok_or_else(|| self.seq_missing_input(op))?;
-        self.sequences.get(&vid).cloned().ok_or_else(|| SessionError::SequenceOp {
-            op: op.to_string(),
-            reason: format!(
-                "input value#{} is not a live sequence. To fix: ensure it is produced \
+        self.sequences
+            .get(&vid)
+            .cloned()
+            .ok_or_else(|| SessionError::SequenceOp {
+                op: op.to_string(),
+                reason: format!(
+                    "input value#{} is not a live sequence. To fix: ensure it is produced \
                  by a Sequence-producing op (SequenceEmpty/Construct/Insert/Erase/\
                  SplitToSequence)",
-                vid.0
-            ),
-        })
+                    vid.0
+                ),
+            })
     }
 
     /// Read a scalar `i64`/`i32` position input.
@@ -1867,30 +1926,35 @@ impl Executor {
     ) -> Result<i64> {
         let shape = resolved.get(&vid).cloned().unwrap_or_default();
         let dtype = self.value_dtypes[&vid];
-        let vals = self.input_i64(vid, &shape, dtype).ok_or_else(|| SessionError::SequenceOp {
-            op: op.to_string(),
-            reason: format!(
-                "position input has dtype {dtype:?}, expected an integer (int32/int64). \
+        let vals = self
+            .input_i64(vid, &shape, dtype)
+            .ok_or_else(|| SessionError::SequenceOp {
+                op: op.to_string(),
+                reason: format!(
+                    "position input has dtype {dtype:?}, expected an integer (int32/int64). \
                  To fix: provide an int64 scalar index"
-            ),
-        })?;
-        vals.first().copied().ok_or_else(|| SessionError::SequenceOp {
-            op: op.to_string(),
-            reason: "position input is empty; expected a single scalar index".to_string(),
-        })
+                ),
+            })?;
+        vals.first()
+            .copied()
+            .ok_or_else(|| SessionError::SequenceOp {
+                op: op.to_string(),
+                reason: "position input is empty; expected a single scalar index".to_string(),
+            })
     }
 
     /// Read an `i64` vector from an integer tensor input (SplitToSequence's
     /// `split`).
     fn read_i64_vec(&self, vid: ValueId, shape: &[usize], op: &str) -> Result<Vec<i64>> {
         let dtype = self.value_dtypes[&vid];
-        self.input_i64(vid, shape, dtype).ok_or_else(|| SessionError::SequenceOp {
-            op: op.to_string(),
-            reason: format!(
-                "'split' input has dtype {dtype:?}, expected int32/int64. To fix: \
+        self.input_i64(vid, shape, dtype)
+            .ok_or_else(|| SessionError::SequenceOp {
+                op: op.to_string(),
+                reason: format!(
+                    "'split' input has dtype {dtype:?}, expected int32/int64. To fix: \
                  provide integer split sizes"
-            ),
-        })
+                ),
+            })
     }
 
     /// Back a tensor *output* value with a shared sequence element (SequenceAt):
@@ -1929,12 +1993,18 @@ impl Executor {
         self.seq_elem_values.remove(&vid);
         self.views.remove(&vid);
         let need = bytes.len().max(1);
-        let fits = self.buffers.get(&vid).map(|b| b.len() == need).unwrap_or(false);
+        let fits = self
+            .buffers
+            .get(&vid)
+            .map(|b| b.len() == need)
+            .unwrap_or(false);
         if !fits {
             if let Some(old) = self.buffers.remove(&vid) {
                 self.ep.deallocate(old)?;
             }
-            let buf = self.ep.allocate(need, TensorLayout::contiguous().alignment)?;
+            let buf = self
+                .ep
+                .allocate(need, TensorLayout::contiguous().alignment)?;
             self.buffers.insert(vid, buf);
         }
         let buf = self.buffers.get_mut(&vid).expect("just ensured");
@@ -1998,7 +2068,6 @@ fn normalize_axis(axis: i64, rank: usize) -> Option<usize> {
         Some(a as usize)
     }
 }
-
 
 /// Whether `(op_type, domain)` is one of the standard subgraph-bearing
 /// control-flow ops the executor handles recursively (default `ai.onnx`
@@ -2162,12 +2231,7 @@ impl Executor {
     /// view (strided gather over its source buffer) or truncating an owned
     /// buffer to its logical size. This is the single materialization seam used
     /// by the graph-output boundary and control-flow scope capture.
-    fn contiguous_bytes(
-        &self,
-        vid: ValueId,
-        shape: &[usize],
-        dtype: DataType,
-    ) -> Result<Vec<u8>> {
+    fn contiguous_bytes(&self, vid: ValueId, shape: &[usize], dtype: DataType) -> Result<Vec<u8>> {
         let numel: usize = shape.iter().product();
         let n = dtype.storage_bytes(numel);
         // A tensor value backed by a shared sequence element (SequenceAt output)
@@ -2201,9 +2265,10 @@ impl Executor {
                 esize,
             ))
         } else {
-            let buf = self.buffers.get(&vid).ok_or_else(|| {
-                SessionError::Internal(format!("value#{} not produced", vid.0))
-            })?;
+            let buf = self
+                .buffers
+                .get(&vid)
+                .ok_or_else(|| SessionError::Internal(format!("value#{} not produced", vid.0)))?;
             Ok(host_bytes(buf)[..n].to_vec())
         }
     }
@@ -2238,9 +2303,13 @@ impl Executor {
         resolved: &mut HashMap<ValueId, Vec<usize>>,
     ) -> Result<()> {
         let numel = checked_numel(&dims, || format!("value#{}", vid.0))?;
-        let need = checked_storage_bytes(dtype, numel, || format!("value#{}", vid.0), &dims)?
-            .max(1);
-        let fits = self.buffers.get(&vid).map(|b| b.len() == need).unwrap_or(false);
+        let need =
+            checked_storage_bytes(dtype, numel, || format!("value#{}", vid.0), &dims)?.max(1);
+        let fits = self
+            .buffers
+            .get(&vid)
+            .map(|b| b.len() == need)
+            .unwrap_or(false);
         if !fits {
             if let Some(old) = self.buffers.remove(&vid) {
                 self.ep.deallocate(old)?;
@@ -2311,14 +2380,16 @@ impl Executor {
                 if resolved.contains_key(&vid) && materialized {
                     self.value_tensor(vid, resolved)?
                 } else {
-                    outer_scope.get(&name).cloned().ok_or_else(|| {
-                        missing_capture_error(attr_key, &name)
-                    })?
+                    outer_scope
+                        .get(&name)
+                        .cloned()
+                        .ok_or_else(|| missing_capture_error(attr_key, &name))?
                 }
             } else {
-                outer_scope.get(&name).cloned().ok_or_else(|| {
-                    missing_capture_error(attr_key, &name)
-                })?
+                outer_scope
+                    .get(&name)
+                    .cloned()
+                    .ok_or_else(|| missing_capture_error(attr_key, &name))?
             };
             captures.insert(name, tensor);
         }
@@ -2344,7 +2415,7 @@ impl Executor {
         let body = self.graph.subgraphs.get(key).ok_or_else(|| {
             SessionError::Internal(format!(
                 "control-flow node #{} has no registered subgraph '{}'",
-                key.0 .0, key.1
+                key.0.0, key.1
             ))
         })?;
         let mut g = body.clone();
@@ -2429,7 +2500,12 @@ impl Executor {
             Vec::with_capacity(formal_inputs.len() + prepared.capture_names.len());
         externals.extend_from_slice(formal_inputs);
         for name in &prepared.capture_names {
-            externals.push(prepared.captures.get(name).expect("prepared capture must be present"));
+            externals.push(
+                prepared
+                    .captures
+                    .get(name)
+                    .expect("prepared capture must be present"),
+            );
         }
         let rebuild = match self.subgraph_execs.get(&prepared.key) {
             Some(cs) => {
@@ -2449,7 +2525,10 @@ impl Executor {
         }
 
         self.control_flow_stats.subgraph_runs += 1;
-        let cs = self.subgraph_execs.get_mut(&prepared.key).expect("child present");
+        let cs = self
+            .subgraph_execs
+            .get_mut(&prepared.key)
+            .expect("child present");
         let inputs: Vec<(&str, &Tensor)> = cs
             .input_names
             .iter()
@@ -2489,10 +2568,12 @@ impl Executor {
             SessionError::Internal("If node is missing its required 'cond' input".to_string())
         })?;
         let cond_t = self.value_tensor(cond_vid, resolved)?;
-        let cond = tensor_scalar_bool(&cond_t).ok_or_else(|| SessionError::Internal(format!(
-            "If: 'cond' must be a BOOL scalar, got dtype {:?} shape {:?}",
-            cond_t.dtype, cond_t.shape
-        )))?;
+        let cond = tensor_scalar_bool(&cond_t).ok_or_else(|| {
+            SessionError::Internal(format!(
+                "If: 'cond' must be a BOOL scalar, got dtype {:?} shape {:?}",
+                cond_t.dtype, cond_t.shape
+            ))
+        })?;
 
         let attr_key = if cond { "then_branch" } else { "else_branch" };
         let prepared = self.prepare_subgraph(node.id, attr_key, resolved, outer_scope)?;
@@ -2527,10 +2608,12 @@ impl Executor {
         let m: Option<i64> = match node.inputs.first().and_then(|s| *s) {
             Some(vid) => {
                 let t = self.value_tensor(vid, resolved)?;
-                let m = tensor_scalar_i64(&t).ok_or_else(|| SessionError::Internal(format!(
-                    "Loop: trip-count 'M' must be an INT64/INT32 scalar, got dtype {:?}",
-                    t.dtype
-                )))?;
+                let m = tensor_scalar_i64(&t).ok_or_else(|| {
+                    SessionError::Internal(format!(
+                        "Loop: trip-count 'M' must be an INT64/INT32 scalar, got dtype {:?}",
+                        t.dtype
+                    ))
+                })?;
                 Some(m)
             }
             None => None,
@@ -2538,10 +2621,12 @@ impl Executor {
         let mut cond: Option<bool> = match node.inputs.get(1).and_then(|s| *s) {
             Some(vid) => {
                 let t = self.value_tensor(vid, resolved)?;
-                Some(tensor_scalar_bool(&t).ok_or_else(|| SessionError::Internal(format!(
-                    "Loop: 'cond' must be a BOOL scalar, got dtype {:?}",
-                    t.dtype
-                )))?)
+                Some(tensor_scalar_bool(&t).ok_or_else(|| {
+                    SessionError::Internal(format!(
+                        "Loop: 'cond' must be a BOOL scalar, got dtype {:?}",
+                        t.dtype
+                    ))
+                })?)
             }
             None => None,
         };
@@ -2549,10 +2634,13 @@ impl Executor {
         // Initial loop-carried dependencies (inputs after M and cond).
         let mut carried: Vec<Tensor> = Vec::new();
         for slot in node.inputs.iter().skip(2) {
-            let vid = slot.ok_or_else(|| SessionError::Internal(
-                "Loop: an interior loop-carried input is omitted (empty), which ONNX does not \
-                 allow — every v_initial must be provided".to_string(),
-            ))?;
+            let vid = slot.ok_or_else(|| {
+                SessionError::Internal(
+                    "Loop: an interior loop-carried input is omitted (empty), which ONNX does not \
+                 allow — every v_initial must be provided"
+                        .to_string(),
+                )
+            })?;
             carried.push(self.value_tensor(vid, resolved)?);
         }
         let num_carried = carried.len();
@@ -2605,12 +2693,12 @@ impl Executor {
             }
             let mut it = outs.into_iter();
             let cond_out = it.next().expect("cond_out present");
-            cond = Some(tensor_scalar_bool(&cond_out).ok_or_else(|| SessionError::Internal(
-                format!(
+            cond = Some(tensor_scalar_bool(&cond_out).ok_or_else(|| {
+                SessionError::Internal(format!(
                     "Loop: body's first output 'cond_out' must be a BOOL scalar, got dtype {:?}",
                     cond_out.dtype
-                ),
-            ))?);
+                ))
+            })?);
             carried.clear();
             carried.extend((&mut it).take(num_carried));
             for acc in scan_acc.iter_mut() {
@@ -2652,9 +2740,12 @@ impl Executor {
         let num_scan_inputs = node
             .attr("num_scan_inputs")
             .and_then(|a| a.as_int())
-            .ok_or_else(|| SessionError::Internal(
-                "Scan: required attribute 'num_scan_inputs' is missing or not an INT".to_string(),
-            ))? as usize;
+            .ok_or_else(|| {
+                SessionError::Internal(
+                    "Scan: required attribute 'num_scan_inputs' is missing or not an INT"
+                        .to_string(),
+                )
+            })? as usize;
 
         // Reject the axis/direction knobs this Phase-1 implementation does not
         // yet honor, rather than silently ignoring them (RULES #1/#5).
@@ -2695,17 +2786,21 @@ impl Executor {
         // Initial state (threaded across iterations) + scan inputs (sliced).
         let mut state: Vec<Tensor> = Vec::with_capacity(num_state);
         for slot in node.inputs.iter().take(num_state) {
-            let vid = slot.ok_or_else(|| SessionError::Internal(
-                "Scan: an initial-state input is omitted (empty), which ONNX does not allow"
-                    .to_string(),
-            ))?;
+            let vid = slot.ok_or_else(|| {
+                SessionError::Internal(
+                    "Scan: an initial-state input is omitted (empty), which ONNX does not allow"
+                        .to_string(),
+                )
+            })?;
             state.push(self.value_tensor(vid, resolved)?);
         }
         let mut scan_inputs: Vec<Tensor> = Vec::with_capacity(num_scan_inputs);
         for slot in node.inputs.iter().skip(num_state) {
-            let vid = slot.ok_or_else(|| SessionError::Internal(
-                "Scan: a scan input is omitted (empty), which ONNX does not allow".to_string(),
-            ))?;
+            let vid = slot.ok_or_else(|| {
+                SessionError::Internal(
+                    "Scan: a scan input is omitted (empty), which ONNX does not allow".to_string(),
+                )
+            })?;
             scan_inputs.push(self.value_tensor(vid, resolved)?);
         }
 
@@ -2713,9 +2808,11 @@ impl Executor {
         let seq_len = scan_inputs
             .first()
             .and_then(|t| t.shape.first().copied())
-            .ok_or_else(|| SessionError::Internal(
-                "Scan: requires at least one scan input with rank >= 1".to_string(),
-            ))?;
+            .ok_or_else(|| {
+                SessionError::Internal(
+                    "Scan: requires at least one scan input with rank >= 1".to_string(),
+                )
+            })?;
         for (i, t) in scan_inputs.iter().enumerate() {
             let this = t.shape.first().copied().unwrap_or(0);
             if this != seq_len {
@@ -2742,12 +2839,7 @@ impl Executor {
         if seq_len != 0 {
             for t in &scan_inputs {
                 let (shape, bytes) = leading_slice(t, 0)?;
-                scan_slices.push(Tensor::from_raw_in(
-                    self.ep.clone(),
-                    t.dtype,
-                    shape,
-                    bytes,
-                )?);
+                scan_slices.push(Tensor::from_raw_in(self.ep.clone(), t.dtype, shape, bytes)?);
             }
         }
         for step in 0..seq_len {
@@ -2862,7 +2954,8 @@ impl TensorStackAccumulator {
             self.dtype = Some(tensor.dtype);
             self.elem_shape = tensor.shape.clone();
             if let Some(expected) = self.expected_len {
-                self.bytes.reserve(expected.saturating_mul(tensor.as_bytes().len()));
+                self.bytes
+                    .reserve(expected.saturating_mul(tensor.as_bytes().len()));
             }
         }
         self.bytes.extend_from_slice(tensor.as_bytes());
@@ -2955,10 +3048,7 @@ mod tests {
         // A product past usize::MAX overflows.
         let huge = [usize::MAX, 2];
         let err = checked_numel(&huge, || "value#9".into());
-        assert!(matches!(
-            err,
-            Err(SessionError::ShapeOverflow { .. })
-        ));
+        assert!(matches!(err, Err(SessionError::ShapeOverflow { .. })));
     }
 
     /// H-D1 (byte layer): even when the element *count* fits in `usize`, the
@@ -2988,11 +3078,11 @@ mod tests {
         let node = Node::new(NodeId(0), "Slice", vec![], vec![]);
         let input_shapes = vec![vec![4usize, 2]];
         let input_values = vec![
-            None,           // data (unused by sizer)
-            Some(vec![1]),  // starts
-            Some(vec![3]),  // ends
-            Some(vec![0]),  // axes
-            Some(vec![1]),  // steps
+            None,          // data (unused by sizer)
+            Some(vec![1]), // starts
+            Some(vec![3]), // ends
+            Some(vec![0]), // axes
+            Some(vec![1]), // steps
         ];
         let out = dynamic_output_shapes(&node, &input_shapes, &input_values).unwrap();
         assert_eq!(out.len(), 1, "Slice must resolve exactly one output shape");
@@ -3014,7 +3104,6 @@ mod tests {
 
         graph.opset_imports.insert(String::new(), 0);
         assert_eq!(effective_opset(&graph, &node), 0);
-
     }
 
     #[test]
@@ -3028,7 +3117,7 @@ mod tests {
 
     // --- weight-streaming: zero-copy borrowed initializer buffers -----------
 
-    use onnx_runtime_ir::{static_shape, WeightRef};
+    use onnx_runtime_ir::{WeightRef, static_shape};
     use std::path::PathBuf;
 
     /// A writable scratch dir under the workspace `target/` (never `/tmp`).
@@ -3085,7 +3174,10 @@ mod tests {
             "mmap window must be aligned for this test to exercise the zero-copy path"
         );
         let buf = &exec.buffers[&w];
-        assert!(buf.is_borrowed(), "aligned initializer must be borrowed, not copied");
+        assert!(
+            buf.is_borrowed(),
+            "aligned initializer must be borrowed, not copied"
+        );
         assert_eq!(
             buf.as_ptr() as *const u8,
             src.as_ptr(),

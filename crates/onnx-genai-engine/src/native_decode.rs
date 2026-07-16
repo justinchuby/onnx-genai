@@ -26,7 +26,7 @@ pub struct NativeDecodeSession {
     session: InferenceSession,
     input_ids: String,
     attention_mask: String,
-    position_ids: String,
+    position_ids: Option<String>,
     logits: String,
     kv_inputs: Vec<String>,
     present_to_past: HashMap<String, String>,
@@ -72,8 +72,7 @@ impl NativeDecodeSession {
             .context("native decoder is missing input_ids")?;
         let attention_mask = find_name(&input_names, &["attention_mask"])
             .context("native decoder is missing attention_mask")?;
-        let position_ids = find_name(&input_names, &["position_ids"])
-            .context("native decoder is missing position_ids")?;
+        let position_ids = find_name(&input_names, &["position_ids"]);
         let logits = find_name(&output_names, &["logits"])
             .context("native decoder is missing logits output")?;
         let kv_inputs = input_names
@@ -127,6 +126,10 @@ impl NativeDecodeSession {
 
     pub fn current_len(&self) -> usize {
         self.current_len
+    }
+
+    pub fn kv_layer_count(&self) -> usize {
+        self.kv_inputs.len() / 2
     }
 
     pub fn decode(
@@ -236,17 +239,19 @@ impl DecodeBackend for NativeDecodeSession {
             .iter()
             .map(|&id| i64::from(id))
             .collect::<Vec<_>>();
-        let positions = (past_len..total_len)
-            .map(|position| i64::try_from(position).context("position id exceeds i64 range"))
-            .collect::<anyhow::Result<Vec<_>>>()?;
         let input_ids = Tensor::from_i64(&[1, token_ids.len()], &ids)?;
         let attention_mask = Tensor::from_i64(&[1, total_len], &vec![1; total_len])?;
-        let position_ids = Tensor::from_i64(&[1, token_ids.len()], &positions)?;
 
         let mut owned = Vec::with_capacity(3 + self.kv_inputs.len());
         owned.push((self.input_ids.clone(), input_ids));
         owned.push((self.attention_mask.clone(), attention_mask));
-        owned.push((self.position_ids.clone(), position_ids));
+        if let Some(position_ids_name) = &self.position_ids {
+            let positions = (past_len..total_len)
+                .map(|position| i64::try_from(position).context("position id exceeds i64 range"))
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            let position_ids = Tensor::from_i64(&[1, token_ids.len()], &positions)?;
+            owned.push((position_ids_name.clone(), position_ids));
+        }
         for name in &self.kv_inputs {
             let tensor = match self.past.remove(name) {
                 Some(tensor) => tensor,
@@ -276,6 +281,9 @@ impl DecodeBackend for NativeDecodeSession {
             .remove(&self.logits)
             .with_context(|| format!("native decoder omitted logits output '{}'", self.logits))?;
         let logits = extract_logits(&logits)?;
+        if logits.iter().flatten().any(|value| !value.is_finite()) {
+            bail!("native decoder produced non-finite logits");
+        }
 
         let mut next_past = HashMap::with_capacity(self.kv_inputs.len());
         for (present, past) in &self.present_to_past {

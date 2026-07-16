@@ -7,7 +7,8 @@
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ir::Node;
 
-use super::{check_arity, to_dense_f32, to_dense_i64, write_dense_f32};
+use super::{check_arity, to_dense_i64};
+use crate::dtype::{to_dense_f32_widen, write_dense_f32_narrow};
 
 pub struct GroupQueryAttentionKernel {
     num_heads: usize,
@@ -131,7 +132,7 @@ impl Bhsd {
             )));
         }
         let dim = hidden / heads;
-        let src = to_dense_f32(view)?;
+        let src = to_dense_f32_widen("GroupQueryAttention", view)?;
         let mut data = vec![0.0; src.len()];
         for b in 0..batch {
             for s in 0..seq {
@@ -160,7 +161,7 @@ impl Bhsd {
             )));
         }
         Ok(Self {
-            data: to_dense_f32(view)?,
+            data: to_dense_f32_widen("GroupQueryAttention", view)?,
             batch: view.shape[0],
             heads,
             seq: view.shape[2],
@@ -322,6 +323,7 @@ impl Kernel for GroupQueryAttentionKernel {
             )));
         }
         let mut past_lengths = Vec::with_capacity(q.batch);
+        let mut query_starts = Vec::with_capacity(q.batch);
         for &total in &totals {
             let past = total.checked_sub(k.seq).ok_or_else(|| {
                 EpError::KernelFailed(
@@ -335,14 +337,14 @@ impl Kernel for GroupQueryAttentionKernel {
                 ));
             }
             past_lengths.push(past);
+            query_starts.push(total.checked_sub(q.seq).ok_or_else(|| {
+                EpError::KernelFailed(
+                    "GroupQueryAttention: total sequence is shorter than query sequence".into(),
+                )
+            })?);
         }
 
         if self.do_rotary {
-            if q.seq != k.seq {
-                return Err(EpError::KernelFailed(
-                    "GroupQueryAttention: do_rotary currently requires query and key to have equal sequence lengths".into(),
-                ));
-            }
             let cos_view = inputs.get(7).filter(|v| !v.is_absent()).ok_or_else(|| {
                 EpError::KernelFailed("GroupQueryAttention: do_rotary=1 requires cos_cache".into())
             })?;
@@ -361,7 +363,8 @@ impl Kernel for GroupQueryAttentionKernel {
                     q.dim / 2
                 )));
             }
-            let positions = if let Some(position_ids) = inputs.get(9).filter(|v| !v.is_absent()) {
+            let explicit_position_ids = inputs.get(9).filter(|v| !v.is_absent());
+            let query_positions = if let Some(position_ids) = explicit_position_ids {
                 let ids = to_dense_i64(position_ids)?;
                 if position_ids.shape != [q.batch, q.seq] || ids.iter().any(|&x| x < 0) {
                     return Err(EpError::KernelFailed(
@@ -371,19 +374,40 @@ impl Kernel for GroupQueryAttentionKernel {
                 ids.into_iter().map(|x| x as usize).collect()
             } else {
                 let mut ids = Vec::with_capacity(q.batch * q.seq);
-                for &past in &past_lengths {
-                    ids.extend((0..q.seq).map(|s| past + s));
+                for &total in &totals {
+                    let start = total.checked_sub(q.seq).ok_or_else(|| {
+                        EpError::KernelFailed(
+                            "GroupQueryAttention: total sequence is shorter than query sequence"
+                                .into(),
+                        )
+                    })?;
+                    ids.extend((0..q.seq).map(|s| start + s));
                 }
                 ids
             };
-            let cos = to_dense_f32(cos_view)?;
-            let sin = to_dense_f32(sin_view)?;
+            let key_positions = if explicit_position_ids.is_some() && k.seq == q.seq {
+                query_positions.clone()
+            } else {
+                let mut ids = Vec::with_capacity(k.batch * k.seq);
+                for &total in &totals {
+                    let start = total.checked_sub(k.seq).ok_or_else(|| {
+                        EpError::KernelFailed(
+                            "GroupQueryAttention: total sequence is shorter than key sequence"
+                                .into(),
+                        )
+                    })?;
+                    ids.extend((0..k.seq).map(|s| start + s));
+                }
+                ids
+            };
+            let cos = to_dense_f32_widen("GroupQueryAttention", cos_view)?;
+            let sin = to_dense_f32_widen("GroupQueryAttention", sin_view)?;
             rotate(
                 &mut q,
                 &cos,
                 &sin,
                 cos_view.shape[0],
-                &positions,
+                &query_positions,
                 self.rotary_interleaved,
             )?;
             rotate(
@@ -391,7 +415,7 @@ impl Kernel for GroupQueryAttentionKernel {
                 &cos,
                 &sin,
                 cos_view.shape[0],
-                &positions,
+                &key_positions,
                 self.rotary_interleaved,
             )?;
         }
@@ -438,7 +462,7 @@ impl Kernel for GroupQueryAttentionKernel {
             for qh in 0..self.num_heads {
                 let kvh = qh / group;
                 for qs in 0..q.seq {
-                    let causal_limit = past_lengths[b] + qs;
+                    let causal_limit = query_starts[b] + qs;
                     let local_start = if self.local_window_size > 0 {
                         (causal_limit + 1).saturating_sub(self.local_window_size as usize)
                     } else {
@@ -494,12 +518,12 @@ impl Kernel for GroupQueryAttentionKernel {
                 }
             }
         }
-        write_dense_f32(&mut outputs[0], &output)?;
+        write_dense_f32_narrow("GroupQueryAttention", &mut outputs[0], &output)?;
         if outputs.len() >= 2 {
-            write_dense_f32(&mut outputs[1], &present_k)?;
+            write_dense_f32_narrow("GroupQueryAttention", &mut outputs[1], &present_k)?;
         }
         if outputs.len() >= 3 {
-            write_dense_f32(&mut outputs[2], &present_v)?;
+            write_dense_f32_narrow("GroupQueryAttention", &mut outputs[2], &present_v)?;
         }
         Ok(())
     }
