@@ -28,6 +28,10 @@ const IQ3_XXS_BLOCK_BYTES: usize = 98;
 const IQ2_S_BLOCK_BYTES: usize = 82;
 const IQ2_XS_BLOCK_BYTES: usize = 74;
 const IQ2_XXS_BLOCK_BYTES: usize = 66;
+const IQ1_S_BLOCK_BYTES: usize = 50;
+const IQ1_M_BLOCK_BYTES: usize = 56;
+const IQ1_S_DELTA: f32 = 0.125;
+const IQ1_M_DELTA: f32 = 0.125;
 
 include!("block_quantized_matmul_iq_tables.rs");
 
@@ -386,6 +390,8 @@ enum BlockFormat {
     Iq2S,
     Iq2Xs,
     Iq2Xxs,
+    Iq1S,
+    Iq1M,
 }
 
 impl BlockFormat {
@@ -399,11 +405,10 @@ impl BlockFormat {
             "iq2_s" => Ok(Self::Iq2S),
             "iq2_xs" => Ok(Self::Iq2Xs),
             "iq2_xxs" => Ok(Self::Iq2Xxs),
-            "iq1_s" | "iq1_m" => Err(error(format!(
-                "format '{value}' is recognized but not implemented; supported formats are mxfp4, iq4_nl, iq4_xs, iq3_s, iq3_xxs, iq2_s, iq2_xs, and iq2_xxs"
-            ))),
+            "iq1_s" => Ok(Self::Iq1S),
+            "iq1_m" => Ok(Self::Iq1M),
             _ => Err(error(format!(
-                "unsupported format '{value}'; supported formats are mxfp4, iq4_nl, iq4_xs, iq3_s, iq3_xxs, iq2_s, iq2_xs, and iq2_xxs"
+                "unsupported format '{value}'; supported formats are mxfp4, iq4_nl, iq4_xs, iq3_s, iq3_xxs, iq2_s, iq2_xs, iq2_xxs, iq1_s, and iq1_m"
             ))),
         }
     }
@@ -412,9 +417,14 @@ impl BlockFormat {
         match self {
             Self::Mxfp4 => MXFP4_QK,
             Self::Iq4Nl => IQ4_NL_QK,
-            Self::Iq4Xs | Self::Iq3S | Self::Iq3Xxs | Self::Iq2S | Self::Iq2Xs | Self::Iq2Xxs => {
-                IQ_SUPER_QK
-            }
+            Self::Iq4Xs
+            | Self::Iq3S
+            | Self::Iq3Xxs
+            | Self::Iq2S
+            | Self::Iq2Xs
+            | Self::Iq2Xxs
+            | Self::Iq1S
+            | Self::Iq1M => IQ_SUPER_QK,
         }
     }
 
@@ -428,6 +438,8 @@ impl BlockFormat {
             Self::Iq2S => IQ2_S_BLOCK_BYTES,
             Self::Iq2Xs => IQ2_XS_BLOCK_BYTES,
             Self::Iq2Xxs => IQ2_XXS_BLOCK_BYTES,
+            Self::Iq1S => IQ1_S_BLOCK_BYTES,
+            Self::Iq1M => IQ1_M_BLOCK_BYTES,
         }
     }
 
@@ -441,6 +453,8 @@ impl BlockFormat {
             Self::Iq2S => decode_iq2_s_block(block, output),
             Self::Iq2Xs => decode_iq2_xs_block(block, output),
             Self::Iq2Xxs => decode_iq2_xxs_block(block, output),
+            Self::Iq1S => decode_iq1_s_block(block, output),
+            Self::Iq1M => decode_iq1_m_block(block, output),
         }
     }
 }
@@ -823,6 +837,79 @@ fn decode_iq2_xxs_block(block: &[u8], output: &mut [f32]) {
                 } else {
                     subscale * magnitude
                 };
+            }
+        }
+    }
+}
+
+fn decode_iq1_s_block(block: &[u8], output: &mut [f32]) {
+    debug_assert_eq!(block.len(), IQ1_S_BLOCK_BYTES);
+    debug_assert_eq!(output.len(), IQ_SUPER_QK);
+    let scale = half::f16::from_le_bytes([block[0], block[1]]).to_f32();
+    let quants = &block[2..34];
+    let high_bits = &block[34..50];
+
+    for group32 in 0..8 {
+        let high_base = group32 * 2;
+        let qh = u16::from_le_bytes([high_bits[high_base], high_bits[high_base + 1]]);
+        let subscale = scale * f32::from(2 * ((qh >> 12) & 7) + 1);
+        let delta = if qh & 0x8000 != 0 {
+            -IQ1_S_DELTA
+        } else {
+            IQ1_S_DELTA
+        };
+        for vector in 0..4 {
+            let index = usize::from(quants[group32 * 4 + vector])
+                | (usize::from((qh >> (3 * vector)) & 7) << 8);
+            let grid = IQ1S_GRID[index];
+            let output_base = group32 * 32 + vector * 8;
+            for j in 0..8 {
+                let value = ((grid >> (8 * j)) & 0xff) as u8 as i8;
+                output[output_base + j] = subscale * (f32::from(value) + delta);
+            }
+        }
+    }
+}
+
+fn decode_iq1_m_block(block: &[u8], output: &mut [f32]) {
+    debug_assert_eq!(block.len(), IQ1_M_BLOCK_BYTES);
+    debug_assert_eq!(output.len(), IQ_SUPER_QK);
+    let quants = &block[..32];
+    let high_bits = &block[32..48];
+    let scales = &block[48..56];
+    let packed_scales = [
+        u16::from_le_bytes([scales[0], scales[1]]),
+        u16::from_le_bytes([scales[2], scales[3]]),
+        u16::from_le_bytes([scales[4], scales[5]]),
+        u16::from_le_bytes([scales[6], scales[7]]),
+    ];
+    let scale_bits = (packed_scales[0] >> 12)
+        | ((packed_scales[1] >> 8) & 0x00f0)
+        | ((packed_scales[2] >> 4) & 0x0f00)
+        | (packed_scales[3] & 0xf000);
+    let scale = half::f16::from_bits(scale_bits).to_f32();
+
+    for group32 in 0..8 {
+        let packed_scale = packed_scales[group32 / 2];
+        let scale_shift = 6 * (group32 % 2);
+        let subscale1 = scale * f32::from(2 * ((packed_scale >> scale_shift) & 7) + 1);
+        let subscale2 = scale * f32::from(2 * ((packed_scale >> (scale_shift + 3)) & 7) + 1);
+        for vector in 0..4 {
+            let qh = high_bits[group32 * 2 + vector / 2];
+            let high_shift = 4 * (vector % 2);
+            let index = usize::from(quants[group32 * 4 + vector])
+                | (usize::from((qh >> high_shift) & 7) << 8);
+            let delta = if qh & (0x08 << high_shift) != 0 {
+                -IQ1_M_DELTA
+            } else {
+                IQ1_M_DELTA
+            };
+            let subscale = if vector < 2 { subscale1 } else { subscale2 };
+            let grid = IQ1S_GRID[index];
+            let output_base = group32 * 32 + vector * 8;
+            for j in 0..8 {
+                let value = ((grid >> (8 * j)) & 0xff) as u8 as i8;
+                output[output_base + j] = subscale * (f32::from(value) + delta);
             }
         }
     }
@@ -1252,6 +1339,58 @@ mod tests {
     }
 
     #[test]
+    fn iq1_s_decodes_eleven_bit_grids_odd_scale_and_delta() {
+        let mut packed = vec![0u8; IQ1_S_BLOCK_BYTES];
+        packed[..2].copy_from_slice(&half::f16::from_f32(2.0).to_le_bytes());
+        packed[4] = 0xff;
+        packed[34..36].copy_from_slice(&0xa1c0u16.to_le_bytes());
+        let view = Owned::u8(&[1, 1, IQ1_S_BLOCK_BYTES], &packed);
+        let decoder = BlockQuantizedMatMulKernel {
+            k: IQ_SUPER_QK,
+            n: 1,
+            format: BlockFormat::Iq1S,
+            packed_b_constant: false,
+            weight_kn: OnceLock::new(),
+        };
+        let actual = decoder.dequantize_weight_kn(&view.view()).unwrap();
+        let mut expected = vec![-1.75; IQ_SUPER_QK];
+        expected[..32].fill(-11.25);
+        expected[16..24].fill(8.75);
+        // qh=0xa1c0 gives odd scale 5, negative delta, and index 2047
+        // for vector two. With d=2, grid 0=-1 and grid 2047=+1:
+        // 10*(-1-0.125)=-11.25 and 10*(1-0.125)=8.75.
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn iq1_m_decodes_bitsliced_fp16_two_odd_scales_and_vector_deltas() {
+        let mut packed = vec![0u8; IQ1_M_BLOCK_BYTES];
+        packed[1] = 0xff;
+        packed[2] = 0xff;
+        packed[32] = 0xf0;
+        packed[33] = 0x8f;
+        packed[48..56].copy_from_slice(&[0x1a, 0, 0, 0, 0, 0, 0, 0x40]);
+        let view = Owned::u8(&[1, 1, IQ1_M_BLOCK_BYTES], &packed);
+        let decoder = BlockQuantizedMatMulKernel {
+            k: IQ_SUPER_QK,
+            n: 1,
+            format: BlockFormat::Iq1M,
+            packed_b_constant: false,
+            weight_kn: OnceLock::new(),
+        };
+        let actual = decoder.dequantize_weight_kn(&view.view()).unwrap();
+        let mut expected = vec![-1.75; IQ_SUPER_QK];
+        expected[..8].fill(-8.75);
+        expected[8..16].fill(8.75);
+        expected[16..24].fill(12.25);
+        expected[24..32].fill(-15.75);
+        // Scale high nibbles reconstruct fp16 0x4000 (2.0). sc[0]=0x001a
+        // gives odd multipliers 5 and 7. qh selects grids 0,2047,2047,0
+        // with deltas +,-,-,-, producing -8.75,8.75,12.25,-15.75.
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
     fn vendored_iq_grid_fingerprints_match_llama_cpp() {
         fn fnv1a(bytes: impl IntoIterator<Item = u8>) -> u64 {
             bytes.into_iter().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
@@ -1280,6 +1419,10 @@ mod tests {
             fnv1a(IQ3XXS_GRID.into_iter().flat_map(u32::to_le_bytes)),
             0xdfa5_dc83_d6a1_55d5
         );
+        assert_eq!(
+            fnv1a(IQ1S_GRID.into_iter().flat_map(u64::to_le_bytes)),
+            0x6703_ed86_3501_ae2e
+        );
     }
 
     #[test]
@@ -1288,6 +1431,8 @@ mod tests {
             ("iq2_xs", IQ2_XS_BLOCK_BYTES),
             ("iq2_s", IQ2_S_BLOCK_BYTES),
             ("iq3_xxs", IQ3_XXS_BLOCK_BYTES),
+            ("iq1_s", IQ1_S_BLOCK_BYTES),
+            ("iq1_m", IQ1_M_BLOCK_BYTES),
         ] {
             let (graph, node) = model_node(
                 format,
@@ -1302,27 +1447,6 @@ mod tests {
             CpuExecutionProvider::new()
                 .get_kernel(model.graph.node(node), &[], 1)
                 .expect("implemented IQ format must create a CPU kernel");
-        }
-    }
-
-    #[test]
-    fn incomplete_iq_formats_are_rejected_at_kernel_creation() {
-        for (format, block_bytes) in [("iq1_s", 50), ("iq1_m", 56)] {
-            let (graph, node) = model_node(
-                format,
-                &[1, 256],
-                &[1, 1, block_bytes],
-                &[1, 1],
-                256,
-                1,
-                false,
-            );
-            let model = Model::new(&graph);
-            let error = CpuExecutionProvider::new()
-                .get_kernel(model.graph.node(node), &[], 1)
-                .err()
-                .expect("incomplete IQ format must be rejected");
-            assert!(error.to_string().contains("recognized but not implemented"));
         }
     }
 }

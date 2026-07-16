@@ -2,8 +2,8 @@
 
 **Status:** design plus correctness-first CPU increments for affine int2
 `MatMulNBits` and native `BlockQuantizedMatMul` with MXFP4, IQ4_NL, IQ4_XS,
-IQ3_S, IQ3_XXS, IQ2_S, IQ2_XS, and IQ2_XXS. IQ1, fused sub-4-bit MoE execution,
-offload, and CUDA kernels remain follow-ups.
+IQ3_S, IQ3_XXS, IQ2_S, IQ2_XS, IQ2_XXS, IQ1_S, and IQ1_M. Fused sub-4-bit MoE
+execution, offload, and CUDA kernels remain follow-ups.
 
 ## 1. Motivation
 
@@ -92,9 +92,9 @@ matrix is not needed at inference.
   reconstructed from four high nibbles in the `scales` byte array, and each
   32-weight group has two independent 3-bit odd scale multipliers [L8].
 
-The fixed grid table sizes, E2M1 value table, and `IQ1S_DELTA=0.125` are in
-`ggml-common.h` [L9]. A runtime implementation should import or generate these
-tables from one audited source and test byte-exact vectors from llama.cpp.
+The fixed grid table sizes, E2M1 value table, and `IQ1S_DELTA=IQ1M_DELTA=0.125`
+are in `ggml-common.h` [L9]. A runtime implementation should import or generate
+these tables from one audited source and test byte-exact vectors from llama.cpp.
 
 ### 2.3 MXFP4
 
@@ -137,14 +137,14 @@ Each sub-block reconstructs a signed 6-bit scale from a low nibble in
 `scales_l` and two bits in `scales_h`, then uses
 `dl = d * (scale6 - 32)` with the IQ4_NL codebook [L13].
 
-The CPU decoder vendors the exact 256-entry `iq2xxs_grid`, 512-entry
-`iq2xs_grid`, 1024-entry `iq2s_grid`, 256-entry `iq3xxs_grid`, 512-entry
-`iq3s_grid`, and 128-entry `ksigns_iq2xs` tables from llama.cpp
-`ggml-common.h` at commit `b15ca938` [L9]. Tests pin byte-level FNV-1a
-fingerprints for all six tables and hand-trace known IQ2_XXS, IQ2_XS, IQ2_S,
-IQ3_XXS, IQ3_S, and IQ4_XS blocks against the upstream decoders [L2][L3][L4]
-[L5][L6][L13]. IQ1_S and IQ1_M remain rejected until their shared 2048-entry
-grid receives a separate import and audit.
+The CPU decoder vendors the exact 2048-entry `iq1s_grid`, 256-entry
+`iq2xxs_grid`, 512-entry `iq2xs_grid`, 1024-entry `iq2s_grid`, 256-entry
+`iq3xxs_grid`, 512-entry `iq3s_grid`, and 128-entry `ksigns_iq2xs` tables from
+llama.cpp `ggml-common.h` at commit `b15ca938` [L9]. Tests pin byte-level FNV-1a
+fingerprints for all seven tables and hand-trace known IQ1_S, IQ1_M, IQ2_XXS,
+IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, and IQ4_XS blocks against the upstream decoders
+[L2][L3][L4][L5][L6][L7][L8][L13]. The IQ1 grid fingerprint is
+`0x6703ed863501ae2e`.
 
 ## 3. Existing ONNX contracts and the CPU prototype
 
@@ -236,10 +236,10 @@ attributes:
 `packed_B` is an opaque `uint8` tensor shaped
 `[N, ceil(K/QK), block_bytes]`, where `(QK, block_bytes)` is fixed by `format`.
 For IQ1/IQ2/IQ3 and IQ4_XS, `QK=256`; implemented super-block sizes are
-IQ2_XXS 66 bytes, IQ2_XS 74 bytes, IQ2_S 82 bytes, IQ3_XXS 98 bytes, IQ3_S
-110 bytes, and IQ4_XS 136 bytes [L1]. IQ4_NL uses `(QK, block_bytes)=(32,18)`
-and GGUF MXFP4 uses `(32,17)`. Keeping the exact native block makes external-data
-slices mmap-able and avoids
+IQ1_S 50 bytes, IQ1_M 56 bytes, IQ2_XXS 66 bytes, IQ2_XS 74 bytes, IQ2_S 82
+bytes, IQ3_XXS 98 bytes, IQ3_S 110 bytes, and IQ4_XS 136 bytes [L1]. IQ4_NL
+uses `(QK, block_bytes)=(32,18)` and GGUF MXFP4 uses `(32,17)`. Keeping the
+exact native block makes external-data slices mmap-able and avoids
 separating/recombining embedded metadata. The kernel defines unused values in
 the final native block as padding, validates the exact shape and byte count,
 and owns the codebook.
@@ -251,11 +251,9 @@ standardized layouts without changing the meaning of old models.
 The CPU v1 implementation now registers this op in
 `com.github.onnxruntime.genai`, accepts f32 `A`, native uint8 `packed_B`, and an
 optional f32 bias, then dequantizes to f32 and uses the shared CPU GEMM. MXFP4
-and IQ4_NL, IQ4_XS, IQ3_S, IQ3_XXS, IQ2_S, IQ2_XS, and IQ2_XXS are implemented
-using the pinned llama.cpp layouts and dequantization math [L1][L2][L3][L4][L5]
-[L6][L9][L13]. IQ1_S/IQ1_M remain recognized but fail kernel creation with a
-clear unsupported-format error; no incomplete decoder can silently produce
-weights.
+and IQ4_NL, IQ4_XS, IQ3_S, IQ3_XXS, IQ2_S, IQ2_XS, IQ2_XXS, IQ1_S, and IQ1_M
+are implemented using the pinned llama.cpp layouts and dequantization math
+[L1][L2][L3][L4][L5][L6][L7][L8][L9][L13].
 
 For MXFP4 interoperability, also support a lowering between this GGUF-native
 layout and ORT's current `QMoE(quant_type="fp4")` representation, which uses
@@ -366,11 +364,10 @@ variant before allocating hundreds of gigabytes.
    tests.
 2. Add Mobius capability flags and a linear-int2 export/e2e fixture.
 3. **Landed:** private `BlockQuantizedMatMul` v1 CPU baseline with GGUF-native
-   MXFP4, IQ4_NL, IQ4_XS, IQ3_S, IQ3_XXS, IQ2_S, IQ2_XS, and IQ2_XXS; exact
-   block validation; optional bias; audited llama.cpp grids; and
+   MXFP4, IQ4_NL, IQ4_XS, IQ3_S, IQ3_XXS, IQ2_S, IQ2_XS, IQ2_XXS, IQ1_S, and
+   IQ1_M; exact block validation; optional bias; audited llama.cpp grids; and
    numeric/reference tests.
-4. Import and verify the shared IQ1_S/IQ1_M grid; add GGUF-to-ORT MXFP4 layout
-   parity.
+4. Add GGUF-to-ORT MXFP4 layout parity.
 5. Add fused CPU `BlockQuantizedMoE`, expert-major external-data slicing, and
    grouped decode GEMV; use oneDNN for sufficiently large dequantized GEMMs.
 6. Add direct CUDA IQ/MXFP4 kernels and a stream-ordered expert residency cache.
