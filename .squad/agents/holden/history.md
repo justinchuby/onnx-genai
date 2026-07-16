@@ -64,3 +64,6 @@ Rejected Deckard's initial thread-cap environment parsing because unusable or hu
 
 ### 2026-07-16T00:00:00Z — nxrt Python genai review cycle
 Rejected Rachael's `RefCell`/`#[pyclass(unsendable)]` Engine because cross-thread use caused `PanicException`, and because the lockfile was stale. Cleared Sebastian's `Mutex`/sendable revision (`41d8c31`): GIL-released, fail-fast `try_lock` access preserves engine safety; the locked build and 19 Rust binding tests passed.
+
+### 2026-07-16T10:18:11Z — Native CUDA decode M1a review
+Cleared Deckard's `f795d45` executor EP-polymorphism refactor: it preserves CPU-only construction and behavior, adds no CUDA/device branching, unsafe, downcasting, or steady-state virtual dispatch. Independent validation confirmed 413/413 CPU EP tests and exact eight-token output; M2 device tensors/on-device coverage is next, pending the design decisions and CUDA GQA/device-KV prerequisites.

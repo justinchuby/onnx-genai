@@ -510,3 +510,10 @@ NVRTC available: 113 passed, 0 failed, 0 skipped. The movement GPU binary passed
 **By:** Zhora; reviewed by Coco
 **What:** Merged commit `23e4995` expands `crates/onnx-rs/tests/text_format_port.rs` from 6 to 16 upstream-derived cases, covering attribute kinds, initializers, supported dtypes, node domains, multi-opset models, text round-trips, JSON/TextProto codecs, and malformed input. `cargo test -p onnx-rs` passes 89 tests (72 unit, 16 integration, 1 doctest); the reviewer found no ignored or vacuous cases.
 **Why:** The port exercises real parser and IR behavior while documenting current grammar/IR gaps: model-local functions; sequence, optional, and sparse types; complex, int2, and uint2 dtypes; and typed tensor-payload literals remain unsupported.
+
+### 2026-07-16: Complete native CUDA decode Milestone 1a
+**By:** Deckard; reviewed by Holden
+**What:** Merged `f795d45` makes the native session executor EP-polymorphic: `Executor`, `Executor::build`, and `KernelCache::get_or_create` now retain `Arc<dyn ExecutionProvider>` / `&dyn ExecutionProvider` rather than concrete CPU types. `auto_detect_cpu_ep` still constructs the same initialized `CpuExecutionProvider`; CPU-only session construction, kernel dispatch, host buffers, and device selection are otherwise unchanged.
+**Why:** This behavior-preserving seam is Milestone 1a of `docs/NATIVE_CUDA_DECODE.md`. CPU validation passed all 413 EP tests and reproduced exact tokens `[11576, 42740, 11, 358, 614, 264, 3405, 911]`; 59.99 tok/s versus the 58.44 tok/s reference is within noise. Holden cleared the one-file refactor: EP virtual calls remain cache-miss-only, outside steady-state kernel execution, with no CUDA/device branching, unsafe, downcasting, or dispatch-policy changes. M2—device tensors and on-device op coverage—is next, gated on user decisions in the design doc (GPU floor, KV capacity, hard-fail policy, and graph ownership), plus packed-QKV CUDA GQA and O(1) device-KV prerequisites.
+
+#### Sources: `deckard-cuda-m1a.md`, `holden-cuda-m1a-review.md`

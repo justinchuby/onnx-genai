@@ -331,7 +331,7 @@ Scoped the "export Gemma4 E2B/12B via Mobius and smoke-test through onnx-genai" 
 
 ### Native CUDA decode design
 
-- **Fact-checked GPU-decode frontier design ✅ (`b416b7f` + `33beb8d`, Nabil; Fact Checker):** `docs/NATIVE_CUDA_DECODE.md` proposes `Arc<dyn ExecutionProvider>` dispatch through five milestones: EP-polymorphic execution, target coverage, O(1) device KV, graph replay, and performance. The audit verified 14 core claims and corrected M4 to require a real non-null stream plus serialized graph ownership; virtual-dispatch cost remains unmeasured. **Awaiting user greenlight; not implemented.**
+- **M1a EP-polymorphic executor ✅ merged (`f795d45`, Deckard; Holden 🟢):** The native executor now stores `Arc<dyn ExecutionProvider>` while preserving the CPU-only path; all **413** CPU EP tests pass and the eight-token decode output is exact. **Next: M2** device tensors / on-device op coverage, pending the design-doc user decisions (GPU floor, KV capacity, hard-fail policy, graph ownership).
 
 ### Python bindings wave
 

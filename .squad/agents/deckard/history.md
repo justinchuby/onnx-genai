@@ -105,3 +105,6 @@ Added the opt-in `ONNX_GENAI_CPU_DECODE_THREADS` dedicated Rayon pool for M=1 CP
 
 ### 2026-07-16T00:00:00Z — onnx-rs Python path revision
 Revised Batty's rejected Python binding path seam (`5b348b5`): `PathBuf` values remain lossless, I/O error kinds map directly to Python exceptions, and `__fspath__` exceptions propagate. Added six Python regressions covering missing, denied, invalid, bytes, path-like failure, and non-UTF-8 paths; Freysa cleared the result.
+
+### 2026-07-16T10:18:11Z — Native CUDA decode M1a merged
+Implemented the behavior-preserving executor seam in `f795d45`: `Executor` and kernel-cache EP references are now `Arc<dyn ExecutionProvider>` / `&dyn ExecutionProvider`; CPU execution remains token-exact (`[11576, 42740, 11, 358, 614, 264, 3405, 911]`) with all 413 CPU EP tests green. M2 device tensors and on-device coverage remains gated on design decisions and packed-QKV CUDA GQA/O(1) device-KV prerequisites.
