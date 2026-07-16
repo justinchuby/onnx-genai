@@ -307,6 +307,28 @@ fn rotate(
     Ok(())
 }
 
+fn write_decode_output(out: &mut TensorMut, data: &[f32]) -> Result<()> {
+    if out.dtype != onnx_runtime_ir::DataType::Float32 || !out.is_contiguous() {
+        return write_dense_f32_narrow("GroupQueryAttention", out, data);
+    }
+    out.validate()?;
+    if out.numel() != data.len() {
+        return Err(EpError::KernelFailed(format!(
+            "GroupQueryAttention: output element count {} does not match produced {}",
+            out.numel(),
+            data.len()
+        )));
+    }
+    if data.is_empty() {
+        return Ok(());
+    }
+    // SAFETY: validation plus the contiguous Float32 layout prove the output
+    // spans exactly data.len() writable f32 elements.
+    let dst = unsafe { std::slice::from_raw_parts_mut(out.data_ptr_mut::<f32>(), data.len()) };
+    dst.copy_from_slice(data);
+    Ok(())
+}
+
 impl Kernel for GroupQueryAttentionKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         check_arity("GroupQueryAttention", inputs, outputs, 7, 14, 1)?;
@@ -600,12 +622,25 @@ impl Kernel for GroupQueryAttentionKernel {
                 }
             }
         }
-        write_dense_f32_narrow("GroupQueryAttention", &mut outputs[0], &output)?;
+        let decode_fast_write = q.seq == 1 && k.seq == 1;
+        if decode_fast_write {
+            write_decode_output(&mut outputs[0], &output)?;
+        } else {
+            write_dense_f32_narrow("GroupQueryAttention", &mut outputs[0], &output)?;
+        }
         if outputs.len() >= 2 {
-            write_dense_f32_narrow("GroupQueryAttention", &mut outputs[1], &present_k)?;
+            if decode_fast_write {
+                write_decode_output(&mut outputs[1], &present_k)?;
+            } else {
+                write_dense_f32_narrow("GroupQueryAttention", &mut outputs[1], &present_k)?;
+            }
         }
         if outputs.len() >= 3 {
-            write_dense_f32_narrow("GroupQueryAttention", &mut outputs[2], &present_v)?;
+            if decode_fast_write {
+                write_decode_output(&mut outputs[2], &present_v)?;
+            } else {
+                write_dense_f32_narrow("GroupQueryAttention", &mut outputs[2], &present_v)?;
+            }
         }
         Ok(())
     }
