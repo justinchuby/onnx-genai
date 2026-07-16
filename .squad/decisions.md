@@ -1199,3 +1199,115 @@ Verified on NVIDIA H200, compute capability 9.0, driver 580.105.08.
 **Why:** The real-model run revealed an incorrect 8-bit scaffold selection and malformed serialized ONNX lacking the custom-domain import. Pure-Q8 behavior remains unchanged (MatMulNBits only, no genai import).
 
 **Sources:** `nabil-deepseek-csa-mtp-design.md`, `pris-e2e-sub4bit-validation.md`, `sapper-shapeinfer-quant-matmul.md`, `leon-shapeinfer-quant-review.md`, `pris-mobius406-mixedquant-opset-fix.md`, `mariette-mobius406-fix-review.md`.
+
+
+## 2026-07-16T19:27:57+0000 — Native backend serving
+
+#### Source: `deckard-engine-native-backend.md`
+
+# 2026-07-16 — Engine native decode backend selection
+
+**By:** Deckard
+
+## What
+
+- Added `EngineDecodeBackend::{Auto, Ort, Native}` to `EngineConfig`.
+- `Auto` keeps ORT for existing models and, when `native-backend` is compiled,
+  inspects ONNX node types and selects native execution for
+  `BlockQuantizedMatMul`.
+- `Engine::from_dir` can now construct a CPU `NativeDecodeSession` and route
+  ordinary generation plus streaming callbacks through the shared decode loop.
+- Added a server `native-backend` feature forwarding to the engine, so the
+  existing server load path and serialized fallback driver can serve native
+  models.
+- Added selector coverage and a hermetic Engine-level native generation test.
+
+## Why
+
+Real IQ4_XS generation was already proven through `NativeDecodeSession`, but
+`Engine::from_dir` unconditionally created an ORT session. Backend selection
+closes that integration gap without changing the default path for existing
+models.
+
+## Deferred
+
+- Native continuous batching: requests are serialized by the server fallback
+  driver; no native multi-row/static-cache manager exists yet.
+- Persistent multi-turn sessions and prefix/KV reuse on native execution.
+- External KV connectors and paged-KV import/export for native tensors.
+- Speculative decoding, draft models, prompt lookup, MTP, EAGLE-3, and shared-KV
+  proposers on the native target backend.
+- Pipeline and embedding execution on the native backend.
+- Native device selection in `EngineConfig`; this milestone uses CPU.
+
+
+#### Source: `holden-native-backend-review.md`
+
+### 2026-07-16: Engine native-backend selector review
+**By:** Holden
+**Verdict:** 🔴 REJECT — Deckard is locked out of this revision; Batty should revise.
+
+**Reviewed:** `66ec4b8c433a8a523246e423f79467da8c1cc938`
+
+**Blocking findings:**
+
+1. `Auto` matches only `node.op_type == "BlockQuantizedMatMul"` (`engine.rs:1953-1959`). ONNX operator identity includes domain and opset; the supported native operator is specifically `com.github.onnxruntime.genai::BlockQuantizedMatMul` v1. An otherwise ORT-compatible model using that op-type string in another domain is incorrectly routed away from ORT. Require the exact domain and supported opset, and test wrong-domain/wrong-version nodes.
+2. Per-request speculative overrides are silently ignored on native. `generate_native_with_callback` validates `GenerateOptions` then directly invokes ordinary native decoding (`engine.rs:828-856`), bypassing `should_use_speculative`; therefore `GenerateOptions.speculative_mode`/`num_speculative_tokens` can request prompt lookup, MTP, EAGLE-3, draft, or shared-KV and receive non-speculative output instead of an error. Reject every unsupported request-level mode explicitly.
+3. Pipeline and device selection are silently ignored rather than refused. `PipelineEngine::from_dir_with_config` never examines `config.decode_backend` (`pipeline.rs:92-100`), so explicit `Native` and Auto-detected native-only pipeline decoders still enter ORT. The native single-model path also discards the supplied `SessionOptions` and hardcodes `NativeDecodeDevice::Cpu` (`engine.rs:307-318,783-786`), silently overriding requested EP/device settings. Add clear unsupported errors (or explicit documented warning/degradation).
+
+**Positive evidence:**
+
+- Existing non-matching models resolve to ORT; `EngineConfig::default()` is `Auto`.
+- Native state is reset before each request (`native_decode.rs:223-227`), and the server owns the engine on one driver thread, so batch-1 requests are serialized safely.
+- Embeddings, persistent sessions, continuous batching, KV connectors, and engine-configured speculation have explicit native errors/fallbacks.
+- The native integration test genuinely loads, generates, and exercises token callbacks, but uses explicit `Native` with a graph containing no `BlockQuantizedMatMul`; it does not protect Auto selection or the HTTP sub-4-bit path.
+
+**Build/test evidence:**
+
+- Engine default build: PASS.
+- Engine `native-backend` build: PASS.
+- Server default build: PASS.
+- Server `native-backend` build: PASS.
+- Native engine suite: 109 passed, 18 known missing `tiny-llm/model.onnx` fixture failures, 1 ignored.
+- Targeted `native_engine`: 1 passed.
+- Targeted Auto detector unit test: 1 passed, but lacks domain/opset cases.
+
+
+#### Source: `batty-native-backend-fix.md`
+
+### 2026-07-16: Native backend selector revision after Holden rejection
+**By:** Batty
+**What:** Addressed all three blockers from Holden's 🔴 review of Deckard's native-backend selector. Auto detection now requires the exact `com.github.onnxruntime.genai::BlockQuantizedMatMul` operator identity with domain opset version 1, with tests for the supported identity, a wrong domain, and an unsupported version. Native generation now rejects request-level draft-model, prompt-lookup, MTP, EAGLE-3, and shared-KV modes plus `num_speculative_tokens`, with generation tests covering the explicit errors. Pipeline loading now rejects explicit Native and Auto-detected native-only components, and native single-model loading rejects non-CPU `SessionOptions`; tests cover explicit/Auto pipeline refusal and non-CPU device refusal.
+**Why:** The rejected implementation could route same-named foreign or unsupported operators to native execution and silently ignore speculative, pipeline, and device selections. These changes fail closed with specific errors while preserving Auto as the default and the existing ORT path for non-matching models.
+
+
+#### Source: `holden-native-backend-rereview.md`
+
+# Native backend re-review
+
+**Date:** 2026-07-16
+**By:** Holden
+**Verdict:** 🟢 CLEAR
+
+Re-reviewed commit `2ae464b5d894276f38a5855599c0c9124ea23558` against rejected base `66ec4b8`. All three blockers are resolved; no new blocker or regression was found.
+
+## Original blockers
+
+1. **Exact native operator identity — resolved.** Auto-detection now requires node domain `com.github.onnxruntime.genai`, op type `BlockQuantizedMatMul`, and an exact v1 opset import (`crates/onnx-genai-engine/src/engine.rs:1965-1982`). Tests cover incidental strings, correct identity, wrong node domain, and unsupported opset v2 (`engine.rs:2164-2196`).
+2. **Per-request speculation rejection — resolved.** Native generation rejects every non-`None` request speculation variant (draft, prompt lookup, MTP, EAGLE-3, shared-KV) and `num_speculative_tokens` before decoding (`engine.rs:840-848,1984-2005`). Integration assertions cover prompt lookup and speculative width errors (`crates/onnx-genai-engine/tests/native_engine.rs:39-76`); the exhaustive enum match covers all current variants.
+3. **Pipeline/device selection — resolved.** Explicit Native pipelines are refused, and Auto inspects every component and refuses native-only pipeline models (`crates/onnx-genai-engine/src/pipeline.rs:96-112`), with both paths tested (`pipeline.rs:587-657`). Native single-model construction now receives `SessionOptions` and clearly rejects non-CPU execution providers before loading its CPU session (`engine.rs:306-318,731-755`), tested with WebGPU (`tests/native_engine.rs:78-97`).
+
+## Regression check
+
+- `EngineConfig::default()` remains `Auto` (`crates/onnx-genai-engine/src/config.rs:342-360,390-404`); non-matching models still fall through to ORT (`engine.rs:1925-1939`).
+- Default engine and server builds pass.
+- Native serving remains single-owner/serialized through the driver fallback (`crates/onnx-genai-server/src/driver.rs:104-121,315-321`), and each native request resets decode state (`crates/onnx-genai-engine/src/native_decode.rs:215-241`).
+- Deferred-feature failures remain: engine speculation and KV connectors (`engine.rs:731-745`), persistent sessions/scheduling (`engine.rs:883-889,1137-1141,1203-1305`), embeddings (`crates/onnx-genai-engine/src/embedding.rs:52-65`), and continuous batching's ORT/static-cache requirements (`crates/onnx-genai-engine/src/batched.rs:434-445,586-608`).
+
+## Build/test gate
+
+- `cargo build -p onnx-genai-engine`: PASS
+- `cargo build -p onnx-genai-engine --features native-backend`: PASS
+- `cargo build -p onnx-genai-server`: PASS
+- `cargo test -p onnx-genai-engine --features native-backend`: 111 passed, 18 failed, 1 ignored; all 18 failures are the allowed missing `tiny-llm/model.onnx` fixture failures.
+- Targeted backend tests: 6 passed (3 unit/pipeline plus 3 native integration), 0 failed.

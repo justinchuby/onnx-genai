@@ -115,3 +115,8 @@ Authored initial CUDA executor wiring (`1a2deca`): opt-in CUDA EP selection, dev
 ## 2026-07-16T15:39:27Z — Scribe session update
 
 - Completed authoritative onnx-rs native text (`1b65769`): readable DSL fields now override residual data while omitted payload/metadata are preserved. Rachael’s third review is 🟢 CLEAR.
+
+
+## 2026-07-16T19:27:57+0000Z — Native backend serving review cycle
+
+Authored native Engine/server backend integration in `66ec4b8`; Holden rejected it for exact operator identity, ignored speculative requests, and silent pipeline/device degradation. Deckard was locked out; Batty's `2ae464b` revision was cleared by Holden.

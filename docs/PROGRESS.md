@@ -355,14 +355,25 @@ Scoped the "export Gemma4 E2B/12B via Mobius and smoke-test through onnx-genai" 
 - **Shared `onnx-runtime-quantization` crate ✅ DONE (`8bf113e`):** CPU and CUDA now consume one audited source for the seven vendored IQ grids/sign tables; all moved values are byte-identical, including IQ1S FNV-1a `0x6703ed863501ae2e`.
 - **Weight offload design ✅ (`docs/WEIGHT_OFFLOAD.md`, Nabil):** mmap → host → VRAM weight-tier subsystem design is complete and **awaiting user greenlight**.
 - **DeepSeek CSA/MTP runtime design ✅ (`docs/DEEPSEEK_CSA_MTP_RUNTIME.md`, Nabil):** native sparse-attention/index operations and iterative sidecar-state MTP orchestration are specified and **awaiting user greenlight**.
-- **Mobius exports:** PR [#404](https://github.com/onnxruntime/mobius/pull/404) adds GLM-5.2 MoE with IndexShare DSA + MTP; PR [#405](https://github.com/onnxruntime/mobius/pull/405) adds DeepSeek-V4-Flash MTP + CSA; PR [#406](https://github.com/onnxruntime/mobius/pull/406) was updated with mixed-quant scaffold and `com.github.onnxruntime.genai` opset-import fixes and **awaits user merge**.
+- **Mobius exports awaiting merge:** PR [#404](https://github.com/onnxruntime/mobius/pull/404) adds GLM-5.2 MoE with IndexShare DSA + MTP; PR [#405](https://github.com/onnxruntime/mobius/pull/405) adds DeepSeek-V4-Flash MTP + CSA; PR [#406](https://github.com/onnxruntime/mobius/pull/406) adds the mixed-quant scaffold and `com.github.onnxruntime.genai` opset-import fixes. All await user merge.
 - **First real-model end-to-end sub-4-bit generation ✅ DONE (MAJOR MILESTONE; `2f65135`, Pris):** `bartowski/Qwen2.5-0.5B-Instruct` IQ4_XS exported through Mobius #406 generated coherent CPU-native output through **144** `BlockQuantizedMatMul` nodes (**120 IQ4_NL + 24 IQ4_XS**), with both formats confirmed executed without fallback.
 - **Quantized matmul shape inference ✅ (`67c1e3b`, Sapper; Leon 🟢):** `BlockQuantizedMatMul` and `MatMulNBits` now infer `A.shape[..-1] + [N]`; unmodified real-model E2E works.
 
 ### Runtime follow-ups
 
 - CUDA↔CPU parity: bounded `1.9e-5` drift from token 16 onward = accepted fp reduction-order tolerance (do **not** serialize GPU reduction — measured 8.4% cost).
-- Wire the native-backend path into the HTTP server, which currently loads the ORT-backed `Engine::from_dir`, so server execution (not only `NativeDecodeSession`) supports sub-4-bit models.
+- **Native decode backend serving ✅ DONE (`66ec4b8` → `2ae464b`, Deckard; Batty revision; Holden 🔴→🟢):** Engine and HTTP server now load and serve sub-4-bit `BlockQuantizedMatMul` models through `Auto`/`Ort`/`Native` selection. Auto requires the exact `com.github.onnxruntime.genai` domain and opset v1; native serving is batch-1 serialized and supports streaming while existing non-matching models remain on ORT.
+
+#### Native backend — deferred follow-ups
+
+- Native continuous batching — currently returns a clear unsupported error.
+- Persistent sessions — currently return a clear unsupported error.
+- KV connectors — currently return a clear unsupported error.
+- Pipeline models — currently return a clear unsupported error.
+- Embeddings — currently return a clear unsupported error.
+- Speculative/MTP/EAGLE-3 — currently return a clear unsupported error.
+- Non-CPU (GPU) native device selection — currently returns a clear unsupported error.
+
 - DeepSeek CSA/MTP native implementation (`docs/DEEPSEEK_CSA_MTP_RUNTIME.md`) remains **AWAITING USER GREENLIGHT**.
 - `WEIGHT_OFFLOAD` implementation remains **AWAITING USER GREENLIGHT**.
 - MatMulNBits projection-fusion (`docs/PROJECTION_FUSION.md`, Nabil) remains **AWAITING GREENLIGHT**.

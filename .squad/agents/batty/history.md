@@ -28,3 +28,8 @@ Unified text codecs around TextCodec and renamed the text APIs.
 
 ### 2026-07-16T00:00:00Z — onnx-rs Python serialization bindings
 Added the independent abi3-py310 `onnx-rs-python` crate, importing as `onnx_rs`, with opaque models, binary load/save, and text/JSON/TextProto codec functions (`1ae9a3d`). Freysa rejected the path conversion seam; Deckard's cleared path fix landed as `5b348b5`.
+
+
+## 2026-07-16T19:27:57+0000Z — Native backend selector revision
+
+Under Deckard's strict reviewer lockout, revised native serving in `2ae464b`: exact `com.github.onnxruntime.genai::BlockQuantizedMatMul` opset-v1 Auto detection, explicit errors for unsupported request speculation/pipelines/non-CPU selection, and regressions. Holden re-reviewed 🟢 CLEAR.
