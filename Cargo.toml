@@ -34,6 +34,7 @@ members = [
 
     # ── onnx-rs standard library (new — see docs/ONNX_RS.md) ──
     "crates/onnx-rs",
+    "crates/onnx-rs-python",
 ]
 
 [workspace.package]

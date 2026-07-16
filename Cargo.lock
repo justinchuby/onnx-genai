@@ -1878,6 +1878,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "onnx-rs-python"
+version = "0.1.0-dev.2"
+dependencies = [
+ "onnx-rs",
+ "onnx-runtime-loader",
+ "pyo3",
+]
+
+[[package]]
 name = "onnx-runtime-capi"
 version = "0.1.0-dev.2"
 dependencies = [
