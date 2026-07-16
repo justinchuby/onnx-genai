@@ -52,3 +52,8 @@ Loader opset-import validation for file, from-parts, and nested-subgraph paths m
 ## 2026-07-16T19-27-57+0000 — Scribe session update
 
 - 🟢 Cleared Sapper's `67c1e3b` quantized-matmul shape rules: domains, `N`, symbolic dimensions, dtype preservation, error handling, and 2D/3D coverage are correct (93 unit tests + one doc-test).
+
+## 2026-07-16T23:30:00+0000 — GAFF loader foundation review
+
+- 🟢 Cleared Sapper's `2a9e5b1`: formal subgraph I/O is ordered and typed, recursive scopes isolate inline initializers, and UNDEFINED graph attributes retain populated graph fields.
+- The Loop load regression and all 101 loader tests passed; existing validation already permits If/Loop/Scan.

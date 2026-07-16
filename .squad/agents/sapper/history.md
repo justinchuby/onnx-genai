@@ -55,3 +55,8 @@ Added the preprocessing-side prompt token-expansion library for multi-tile VLM i
 ## 2026-07-16T19-27-57+0000 — Scribe session update
 
 - Merged `67c1e3b`: shape inference for `BlockQuantizedMatMul` and `MatMulNBits` now returns `A.shape[..-1] + [N]`, unblocking unmodified real-model native E2E and the HTTP-server path.
+
+## 2026-07-16T23:30:00+0000 — GAFF control-flow loader foundation
+
+- Merged `2a9e5b1`: graph attributes retain ordered typed formal I/O and scoped inline initializers, including UNDEFINED graph attributes and nested subgraphs.
+- Leon 🟢 cleared the isolated scopes and Loop regression; child-executor and If/Loop/Scan execution remain next.

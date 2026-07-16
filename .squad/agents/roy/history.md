@@ -69,3 +69,8 @@ Authored CUDA Gather, Shape, and Constant kernels; coverage reached 65.
 ## 2026-07-16T23:06:37+0000 — Native CUDA serving safety gate
 
 - `559c46f` added native CUDA Engine/server selection but was 🔴 rejected: CUDA-only sessions could not serve the real 144-node sub-4-bit model. Roy is locked out of this revision artifact; Deckard's `fa30410` safety gate is canonical.
+
+## 2026-07-16T23:30:00+0000 — CUDA MatMul stale-test correction
+
+- Merged `3d19b72`: the unsupported MatMul regression now asserts the current Int64 CUDA EP error instead of obsolete Phase 2a wording.
+- Wallace 🟢 cleared the exact failure path and 129/129 CUDA tests.

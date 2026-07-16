@@ -6,6 +6,25 @@ Canonical, append-only record of accepted team decisions. Only the Coordinator (
 
 ---
 
+## 2026-07-16 — CUDA MatMul assertion, GAFF control-flow loader, and Pad axes fixes
+
+### Match CUDA MatMul rejection test to the implemented unsupported case
+**By:** Roy; reviewed by Wallace
+**What:** Updated `matmul_rejects_unsupported_rank_and_dtype` to assert the actionable Int64 rejection, `MatMul with dtype Int64 is not yet implemented on the CUDA EP`, replacing obsolete “Phase 2a” terminology. Four-dimensional MatMul is already supported.
+**Why:** The test must guard the current CUDA EP contract rather than an obsolete implementation phase. Wallace independently verified the error path and a full CUDA suite pass (129/129).
+
+### Preserve formal subgraph I/O and scoped inline initializers in the GAFF loader
+**By:** Sapper; reviewed by Leon
+**What:** The loader now records ordered typed formal inputs/outputs for graph attributes and stores local body initializers as scoped `WeightRef::Inline` values. Its `UNDEFINED` attribute fallback recognizes populated `g`/`graphs` fields, including recursively nested subgraphs.
+**Why:** Future child executors require complete body signatures and local constants. The baseline validation already permits default-domain If/Loop/Scan, so no loader relaxation is required. Leon verified independent nested scopes and the Loop regression; loader build and all 101 tests passed. Next: child-executor plus If/Loop/Scan execution.
+
+### Infer Pad dimensions from opset-18 `axes`
+**By:** Joi; reviewed by Bryant
+**What:** Pad shape inference now maps begin/end values to the optional opset-18 axes input, including negative axes, while preserving unlisted dimensions. The expanded-Attention regression asserts `[2,3,4,6]`, 144 f32 elements, and 576 bytes.
+**Why:** Ignoring `axes` inferred 640 bytes for `[2,3,4,4]` with pads `[0,2]` on `[-1]`, while the CPU kernel correctly produced 576 bytes. Bryant cleared the focused and crate validation. The case now advances past Pad and exposes the separate follow-up: `Less` output dtype inference must be Bool, not Float32.
+
+**Sources:** `roy-cuda-matmul-stale-test.md`, `wallace-roy-cuda-test-review.md`, `sapper-gaff-loader-io.md`, `leon-sapper-gaff-loader-review.md`, `joi-pad-bytecount-fix.md`, and `bryant-joi-pad-review.md`; merged commits `3d19b72`, `2a9e5b1`, and `0a105a4`.
+
 ## 2026-07-16 — CUDA parity and native int4 performance wave
 
 ### CUDA GroupQueryAttention parity approved (`3820bad`)

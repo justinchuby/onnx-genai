@@ -4,7 +4,7 @@ Tracks implementation status of `docs/DESIGN.md` (§1–§40). Updated as work l
 
 **Published:** `onnx-genai` v0.1.0 + 8 sub-crates on crates.io; the `onnx-runtime-*` layer (including `onnx-runtime-tracer`) is released as v0.1.0-dev.1. CI (fmt/build/test/**blocking clippy**) + scheduled `cargo-audit`. Coverage ~77% line.
 
-_Last updated: 2026-07-16T19:27:57+0000 — CUDA GPU IQ family complete at 10/10 formats._
+_Last updated: 2026-07-16T23:30:00+0000 — CUDA MatMul test, GAFF loader foundation, and Pad axes inference fixes landed._
 
 
 ## Current tiered-memory and interoperability milestones
@@ -13,6 +13,10 @@ _Last updated: 2026-07-16T19:27:57+0000 — CUDA GPU IQ family complete at 10/10
 - **DLPack zero-copy export ✅ DONE:** `onnx-runtime-dlpack` and Python `NxrtValue` export CPU tensor storage through standard DLPack ownership capsules; public FFI validation/hardening is complete.
 - **KV-insertion architecture evaluation ✅ DONE (decision-ready):** for Mobius exports, Phase 1 is functional GQA by dropping `past_present_share_buffer`; the paged-attention successor is feature-gated on correctness and M=1 latency.
 - **Follow-ups:** DLPack zero-copy **import** (unblocked by `from_borrowed_parts`); KV Phase-1 functional-GQA validation; and the liveness `MemoryPlanner` crate.
+- **CUDA MatMul stale test ✅ fixed (`3d19b72`, Roy; Wallace 🟢):** `matmul_rejects_unsupported_rank_and_dtype` now asserts the current actionable Int64 CUDA EP rejection instead of obsolete “Phase 2a” terminology; all **129/129** CUDA tests passed.
+- **GAFF control-flow foundation ▶ started (`2a9e5b1`, Sapper; Leon 🟢):** the loader records ordered typed subgraph formal I/O and scoped inline initializers, including `UNDEFINED` graph attributes and nested subgraphs. **Next:** child-executor implementation and If/Loop/Scan execution.
+- **Pad opset-18 axes shape inference ✅ fixed (`0a105a4`, Joi; Bryant 🟢):** optional `axes` now maps Pad values to the correct dimensions; expanded Attention infers `[2,3,4,6]` / **576 bytes**, not 640.
+- **Known follow-up:** `Less` op output dtype inference must produce **Bool** rather than Float32 (`less-bool-dtype-infer`); it is now exposed after the Pad fix.
 
 ## ORT 2.0 — from-scratch Rust ONNX runtime (`docs/ORT2.md`, big design — steady progress)
 

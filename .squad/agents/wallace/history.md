@@ -42,3 +42,8 @@
 ## 2026-07-16T23:06:37+0000 — Native CUDA serving safety re-review
 
 - 🔴 Rejected Roy's CUDA-only `559c46f` because the real 144-BQMM model failed mid-serving without CPU fallback; Roy is locked out. 🟢 Cleared Deckard's `fa30410`: real unsupported CUDA models now fail at startup with heterogeneous-placement guidance, while CPU sub-4 generation and CUDA-positive smoke coverage remain valid.
+
+## 2026-07-16T23:30:00+0000 — CUDA MatMul stale-test review
+
+- 🟢 Cleared Roy's `3d19b72`: the test asserts the real Int64 unsupported error and cannot pass if that dtype becomes accepted.
+- Exact target coverage and the full CUDA suite passed 129/129 with cuDNN available.
