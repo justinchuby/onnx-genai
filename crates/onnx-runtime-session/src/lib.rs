@@ -105,6 +105,9 @@ mod error {
         #[error("no model source: set a path or bytes on the builder")]
         NoModelSource,
 
+        #[error("execution provider unavailable: {0}")]
+        ExecutionProviderUnavailable(String),
+
         #[error(
             "unsupported operator {domain}::{op_type}: no available execution provider has a \
              kernel; node {node}, opset {opset}; consulted execution providers (priority order): \
@@ -467,14 +470,14 @@ impl SessionBuilder {
     /// output has no inferred shape yet, and the compile/execute stages require
     /// every value to carry a resolved shape.
     ///
-    /// Device selection is CPU-only (`auto_detect` yields the CPU EP), and
-    /// "compile" resolves a kernel per node into the shape-keyed cache.
+    /// Device selection keeps CPU as the default and selects CUDA only when
+    /// explicitly requested in a CUDA-enabled build. "Compile" resolves a
+    /// kernel per node into the shape-keyed cache.
     pub fn build(self) -> Result<InferenceSession> {
         let (level, ep_context_config) = Self::parse_options(&self.options)?;
 
-        // `memory_limit`, `enable_profiling`, and non-CPU `device` preferences
-        // are accepted but not yet acted on in Phase 1 (CPU-only executor).
-        let _ = (self.device, self.memory_limit, self.enable_profiling);
+        // Memory limits and profiling remain reserved builder intents.
+        let _ = (self.memory_limit, self.enable_profiling);
 
         let (mut graph, weights, model_dir, model_metadata) = match (self.model_path, self.model_bytes) {
             (Some(path), _) => {
@@ -506,6 +509,7 @@ impl SessionBuilder {
 
         // Optimize stage. Off by default; only runs when a level is selected.
         optimize_graph(&mut graph, level)?;
+        let ep = select_execution_provider(&self.device)?;
 
         let mut session = InferenceSession::from_parts(
             graph,
@@ -513,12 +517,55 @@ impl SessionBuilder {
             &model_dir,
             ep_context_config,
             model_metadata,
+            ep,
         )?;
         if !self.warmup_shapes.is_empty() {
             session.warmup(&self.warmup_shapes)?;
         }
         Ok(session)
     }
+}
+
+fn select_execution_provider(
+    preference: &DevicePreference,
+) -> Result<std::sync::Arc<dyn onnx_runtime_ep_api::ExecutionProvider>> {
+    match preference {
+        // Keep the zero-config/default behavior CPU-only. CUDA is an explicit
+        // opt-in until heterogeneous placement and fallback exist.
+        DevicePreference::Auto | DevicePreference::Cpu => executor::auto_detect_cpu_ep(),
+        DevicePreference::Explicit {
+            device_type: DeviceType::Cpu,
+            index: 0,
+        } => executor::auto_detect_cpu_ep(),
+        DevicePreference::Gpu { index } => cuda_execution_provider(index.unwrap_or(0)),
+        DevicePreference::Explicit {
+            device_type: DeviceType::Cuda,
+            index,
+        } => cuda_execution_provider(*index),
+        DevicePreference::Explicit { device_type, index } => {
+            Err(SessionError::ExecutionProviderUnavailable(format!(
+                "{device_type:?}:{index} is not implemented by onnx-runtime-session"
+            )))
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn cuda_execution_provider(
+    index: u32,
+) -> Result<std::sync::Arc<dyn onnx_runtime_ep_api::ExecutionProvider>> {
+    let mut ep = onnx_runtime_ep_cuda::CudaExecutionProvider::new(index)?;
+    onnx_runtime_ep_api::ExecutionProvider::initialize(&mut ep, &Default::default())?;
+    Ok(std::sync::Arc::new(ep))
+}
+
+#[cfg(not(feature = "cuda"))]
+fn cuda_execution_provider(
+    index: u32,
+) -> Result<std::sync::Arc<dyn onnx_runtime_ep_api::ExecutionProvider>> {
+    Err(SessionError::ExecutionProviderUnavailable(format!(
+        "CUDA:{index} requested, but onnx-runtime-session was built without the `cuda` feature"
+    )))
 }
 
 fn model_metadata_from_bytes(bytes: &[u8]) -> Result<ModelMetadata> {
@@ -663,6 +710,7 @@ impl InferenceSession {
             Path::new("."),
             EpContextDumpConfig::default(),
             ModelMetadata::default(),
+            executor::auto_detect_cpu_ep()?,
         )
     }
 
@@ -672,18 +720,16 @@ impl InferenceSession {
         model_dir: &Path,
         ep_context_config: EpContextDumpConfig,
         model_metadata: ModelMetadata,
+        ep: std::sync::Arc<dyn onnx_runtime_ep_api::ExecutionProvider>,
     ) -> Result<Self> {
         onnx_runtime_loader::validate_model(&graph)?;
 
         let inputs = io_meta(&graph, &graph.inputs);
         let outputs = io_meta(&graph, &graph.outputs);
-        let ep = executor::auto_detect_cpu_ep()?;
-
         // EPContext consume path (§55.3): restore any pre-compiled EP contexts
         // before building the executor. Dispatch is a pure `source`-key lookup
-        // over the session's registered EPs (Phase 1: the CPU EP only, which
-        // declares no `source` keys — so a model that carries EPContext nodes
-        // for an unloaded compiled EP fails with a clear `NoEpForContext`). The
+        // over the session's selected EP, so a model carrying EPContext nodes
+        // for an unloaded compiled EP fails with a clear `NoEpForContext`. The
         // executor then bypasses these nodes (they are pre-compiled, never run
         // as ordinary kernels).
         let eps: [(

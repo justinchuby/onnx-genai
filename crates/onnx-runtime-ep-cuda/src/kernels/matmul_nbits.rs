@@ -14,6 +14,8 @@ use crate::runtime::{CudaRuntime, cuptr};
 
 const DEQUANT_MODULE: &str = "matmul_nbits_dequant_f32";
 const DEQUANT_ENTRY: &str = "matmul_nbits_dequant_f32";
+const ACCURACY4_MODULE: &str = "matmul_nbits_accuracy4";
+const ACCURACY4_ENTRY: &str = "matmul_nbits_accuracy4";
 const BLOCK_THREADS: u32 = 256;
 
 const DEQUANT_SRC: &str = r#"
@@ -56,6 +58,77 @@ extern "C" __global__ void matmul_nbits_dequant_f32(
 }
 "#;
 
+const ACCURACY4_SRC: &str = r#"
+extern "C" __global__ void matmul_nbits_accuracy4(
+    const float* a,
+    const unsigned char* packed,
+    const float* scales,
+    const unsigned char* zero_points,
+    const float* bias,
+    float* y,
+    const int m,
+    const int k,
+    const int n,
+    const int block_size,
+    const int k_blocks,
+    const int blob_size,
+    const int zp_row_bytes)
+{
+    const long total = (long)m * n;
+    for (long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+         idx < total; idx += (long)gridDim.x * blockDim.x) {
+        const int row = (int)(idx / n);
+        const int output = (int)(idx % n);
+        const float* activation = a + (long)row * k;
+
+        float max_abs = 0.0f;
+        for (int depth = 0; depth < k; ++depth) {
+            max_abs = fmaxf(max_abs, fabsf(activation[depth]));
+        }
+        if (max_abs == 0.0f) {
+            y[idx] = bias ? bias[output] : 0.0f;
+            continue;
+        }
+
+        const float activation_scale = max_abs / 127.0f;
+        const float inverse_scale = 1.0f / activation_scale;
+        float value = 0.0f;
+        for (int block = 0; block < k_blocks; ++block) {
+            int dot = 0;
+            const int begin = block * block_size;
+            const int end = min(begin + block_size, k);
+            int zero_point = 8;
+            if (zero_points) {
+                const unsigned char zp =
+                    zero_points[(long)output * zp_row_bytes + block / 2];
+                zero_point = (block & 1) ? (zp >> 4) : (zp & 15);
+            }
+            for (int depth = begin; depth < end; ++depth) {
+                int quantized_activation =
+                    (int)roundf(fminf(127.0f, fmaxf(-127.0f,
+                        activation[depth] * inverse_scale)));
+                const int within = depth - begin;
+                const unsigned char byte =
+                    packed[((long)output * k_blocks + block) * blob_size + within / 2];
+                const int quantized_weight =
+                    (within & 1) ? (byte >> 4) : (byte & 15);
+                dot += quantized_activation * (quantized_weight - zero_point);
+            }
+            if (m == 1 && block_size == 32 && !zero_points) {
+                value += (float)dot * scales[(long)output * k_blocks + block];
+            } else {
+                value += (float)dot *
+                    (activation_scale * scales[(long)output * k_blocks + block]);
+            }
+        }
+        if (m == 1 && block_size == 32 && !zero_points) {
+            value *= activation_scale;
+        }
+        y[idx] = value + (bias ? bias[output] : 0.0f);
+    }
+}
+"#;
+
 pub struct MatMulNBitsFactory {
     pub runtime: Arc<CudaRuntime>,
 }
@@ -82,7 +155,7 @@ impl KernelFactory for MatMulNBitsFactory {
                 "block_size must be a power of two and at least 16, got {block_size}"
             )));
         }
-        let _accuracy_level = node
+        let accuracy_level = node
             .attr("accuracy_level")
             .and_then(|value| value.as_int())
             .unwrap_or(0);
@@ -92,6 +165,7 @@ impl KernelFactory for MatMulNBitsFactory {
             k,
             n,
             block_size,
+            accuracy_level,
         }))
     }
 }
@@ -102,6 +176,7 @@ pub struct MatMulNBitsKernel {
     k: usize,
     n: usize,
     block_size: usize,
+    accuracy_level: i64,
 }
 
 impl MatMulNBitsKernel {
@@ -203,6 +278,21 @@ impl MatMulNBitsKernel {
         }
 
         let m = a_shape[..a_shape.len() - 1].iter().product::<usize>();
+        if self.accuracy_level == 4 && group_indices.is_none() {
+            return self.launch_accuracy4(
+                &inputs[0],
+                &inputs[1],
+                &inputs[2],
+                zero_points,
+                bias,
+                &mut outputs[0],
+                m,
+                k_blocks,
+                blob_size,
+                zp_row_bytes,
+            );
+        }
+
         let weight = self.runtime.alloc_raw(self.k * self.n * 4)?;
         let workspace = match self.runtime.alloc_raw(WORKSPACE_BYTES) {
             Ok(workspace) => workspace,
@@ -261,6 +351,75 @@ impl MatMulNBitsKernel {
         let free_workspace = unsafe { self.runtime.free_raw(workspace) };
         let free_weight = unsafe { self.runtime.free_raw(weight) };
         result.and(free_workspace).and(free_weight)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn launch_accuracy4(
+        &self,
+        activation: &TensorView,
+        packed: &TensorView,
+        scales: &TensorView,
+        zero_points: Option<&TensorView>,
+        bias: Option<&TensorView>,
+        output: &mut TensorMut,
+        m: usize,
+        k_blocks: usize,
+        blob_size: usize,
+        zp_row_bytes: usize,
+    ) -> Result<()> {
+        let total = m.checked_mul(self.n).ok_or_else(|| {
+            error(format!(
+                "accuracy_level=4 output size {m} * {} overflows usize",
+                self.n
+            ))
+        })?;
+        let blocks = total.div_ceil(BLOCK_THREADS as usize).clamp(1, 65_535) as u32;
+        let function =
+            self.runtime
+                .nvrtc_function(ACCURACY4_MODULE, ACCURACY4_SRC, ACCURACY4_ENTRY)?;
+        let activation_ptr = cuptr(activation.data_ptr::<u8>() as *const c_void);
+        let packed_ptr = cuptr(packed.data_ptr::<u8>() as *const c_void);
+        let scales_ptr = cuptr(scales.data_ptr::<u8>() as *const c_void);
+        let zero_points_ptr = zero_points
+            .map(|tensor| cuptr(tensor.data_ptr::<u8>() as *const c_void))
+            .unwrap_or(0);
+        let bias_ptr = bias
+            .map(|tensor| cuptr(tensor.data_ptr::<u8>() as *const c_void))
+            .unwrap_or(0);
+        let output_ptr = cuptr(output.data_ptr_mut::<u8>() as *const c_void);
+        let m = as_i32("M", m)?;
+        let k = as_i32("K", self.k)?;
+        let n = as_i32("N", self.n)?;
+        let block_size = as_i32("block_size", self.block_size)?;
+        let k_blocks = as_i32("K block count", k_blocks)?;
+        let blob_size = as_i32("block blob size", blob_size)?;
+        let zp_row_bytes = as_i32("zero-point row size", zp_row_bytes)?;
+        let mut builder = self.runtime.stream().launch_builder(&function);
+        builder
+            .arg(&activation_ptr)
+            .arg(&packed_ptr)
+            .arg(&scales_ptr)
+            .arg(&zero_points_ptr)
+            .arg(&bias_ptr)
+            .arg(&output_ptr)
+            .arg(&m)
+            .arg(&k)
+            .arg(&n)
+            .arg(&block_size)
+            .arg(&k_blocks)
+            .arg(&blob_size)
+            .arg(&zp_row_bytes);
+        // SAFETY: all tensors were dtype/shape/contiguity validated above and
+        // the scalar ABI matches `matmul_nbits_accuracy4`.
+        unsafe {
+            builder.launch(LaunchConfig {
+                grid_dim: (blocks, 1, 1),
+                block_dim: (BLOCK_THREADS, 1, 1),
+                shared_mem_bytes: 0,
+            })
+        }
+        .map_err(|err| driver_err("launch MatMulNBits accuracy_level=4", err))?;
+        self.runtime.synchronize()
     }
 
     #[allow(clippy::too_many_arguments)]

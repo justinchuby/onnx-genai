@@ -110,7 +110,7 @@ fn main() -> Result<()> {
     }
     let mut session = if args.synthetic {
         if !matches!(device, NativeDecodeDevice::Cpu) {
-            bail!("native CUDA decode is unavailable in onnx-runtime-session");
+            bail!("the in-memory synthetic session constructor is CPU-only");
         }
         let native = InferenceSession::from_graph(synthetic_decoder::build_synthetic_decoder())
             .context("build synthetic native session")?;

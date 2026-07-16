@@ -12,7 +12,6 @@ use cudarc::driver::{LaunchConfig, PushKernelArg};
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ir::{DataType, Node};
 
-use super::attention::run_attention_f32;
 use crate::error::driver_err;
 use crate::runtime::{CudaRuntime, cuptr};
 
@@ -131,6 +130,94 @@ extern "C" __global__ void gqa_transpose_bnsh_to_bsh(
     const int h = x % heads; x /= heads;
     const int s = x % seq; const int b = x / seq;
     dst[idx] = src[((b * heads + h) * seq + s) * dim + d];
+}
+
+extern "C" __global__ void gqa_attention_reference_f32(
+    const float* query,
+    const float* key,
+    const float* value,
+    float* output,
+    float* scores,
+    const int* total_lengths,
+    const int batch,
+    const int query_heads,
+    const int kv_heads,
+    const int query_seq,
+    const int head_size,
+    const int cache_capacity,
+    const int group_size,
+    const float scale,
+    const int local_window,
+    const float softcap)
+{
+    const int row = blockIdx.x;
+    const int rows = batch * query_heads * query_seq;
+    if (row >= rows) return;
+    const int query_pos = row % query_seq;
+    const int query_head = (row / query_seq) % query_heads;
+    const int batch_index = row / (query_heads * query_seq);
+    const int kv_head = query_head / group_size;
+    const int total = total_lengths[batch_index];
+    const int causal_limit = total - query_seq + query_pos;
+    const int local_start =
+        local_window > 0 && causal_limit + 1 > local_window
+            ? causal_limit + 1 - local_window
+            : 0;
+    float* row_scores = scores + (long)row * cache_capacity;
+
+    if (threadIdx.x == 0) {
+        const float negative_infinity = __int_as_float(0xff800000);
+        float maximum = negative_infinity;
+        for (int key_pos = 0; key_pos < total; ++key_pos) {
+            float score = negative_infinity;
+            if (key_pos >= local_start && key_pos <= causal_limit) {
+                score = 0.0f;
+                const long q_base =
+                    ((long)(batch_index * query_heads + query_head) * query_seq + query_pos)
+                    * head_size;
+                const long k_base =
+                    ((long)(batch_index * kv_heads + kv_head) * cache_capacity + key_pos)
+                    * head_size;
+                for (int d = 0; d < head_size; ++d) {
+                    score = __fadd_rn(
+                        score,
+                        __fmul_rn(query[q_base + d], key[k_base + d]));
+                }
+                score = __fmul_rn(score, scale);
+                if (softcap != 0.0f) {
+                    score = __fmul_rn(softcap, tanhf(score / softcap));
+                }
+            }
+            row_scores[key_pos] = score;
+            maximum = fmaxf(maximum, score);
+        }
+        for (int key_pos = 0; key_pos < total; ++key_pos) {
+            float probability = isfinite(row_scores[key_pos])
+                ? (float)exp((double)(row_scores[key_pos] - maximum))
+                : 0.0f;
+            row_scores[key_pos] = probability;
+        }
+    }
+    __syncthreads();
+
+    float sum = 0.0f;
+    for (int key_pos = 0; key_pos < total; ++key_pos) {
+        sum = __fadd_rn(sum, row_scores[key_pos]);
+    }
+    for (int d = threadIdx.x; d < head_size; d += blockDim.x) {
+        float result = 0.0f;
+        for (int key_pos = 0; key_pos < total; ++key_pos) {
+            const long v_index =
+                ((long)(batch_index * kv_heads + kv_head) * cache_capacity + key_pos)
+                * head_size + d;
+            const float weighted =
+                __fmul_rn(row_scores[key_pos] / sum, value[v_index]);
+            result = __fadd_rn(result, weighted);
+        }
+        output[
+            ((long)(batch_index * query_heads + query_head) * query_seq + query_pos)
+                * head_size + d] = result;
+    }
 }
 "#;
 
@@ -819,29 +906,63 @@ impl GroupQueryAttentionKernel {
             .scale
             .filter(|&scale| scale != 0.0)
             .unwrap_or_else(|| 1.0 / (dim as f32).sqrt());
-        run_attention_f32(
-            &self.runtime,
-            self.num_heads,
-            self.kv_num_heads,
-            true,
-            batch,
-            q_seq,
-            total_sequence_length,
-            dim,
-            present_capacity,
+        let attention_rows = batch
+            .checked_mul(self.num_heads)
+            .and_then(|rows| rows.checked_mul(q_seq))
+            .ok_or_else(|| {
+                EpError::KernelFailed(
+                    "cuda_ep GroupQueryAttention: attention row count overflow".into(),
+                )
+            })?;
+        let score_count = attention_rows
+            .checked_mul(present_capacity)
+            .ok_or_else(|| {
+                EpError::KernelFailed(
+                    "cuda_ep GroupQueryAttention: score scratch size overflow".into(),
+                )
+            })?;
+        let score_scratch = Scratch::new(&self.runtime, score_count.max(1) * 4)?;
+        let attention_rows_u32 = u32::try_from(attention_rows).map_err(|_| {
+            EpError::KernelFailed(
+                "cuda_ep GroupQueryAttention: attention row count exceeds u32".into(),
+            )
+        })?;
+        let kv_heads_i = checked_i32(self.kv_num_heads, "KV head count")?;
+        let group_i = checked_i32(
             self.num_heads / self.kv_num_heads,
-            scale,
-            q_bnsh.ptr,
-            present_k_ptr,
-            present_v_ptr,
-            out_bnsh.ptr,
-            0,
-            0,
-            totals_gpu.ptr,
-            past_lengths_gpu.ptr,
-            local_window_i,
-            self.softcap,
+            "query-to-KV head group size",
         )?;
+        let func =
+            self.runtime
+                .nvrtc_function(PREP_MODULE, PREP_SRC, "gqa_attention_reference_f32")?;
+        let mut builder = self.runtime.stream().launch_builder(&func);
+        builder
+            .arg(&q_bnsh.ptr)
+            .arg(&present_k_ptr)
+            .arg(&present_v_ptr)
+            .arg(&out_bnsh.ptr)
+            .arg(&score_scratch.ptr)
+            .arg(&totals_gpu.ptr)
+            .arg(&batch_i)
+            .arg(&heads_i)
+            .arg(&kv_heads_i)
+            .arg(&q_seq_i)
+            .arg(&dim_i)
+            .arg(&present_capacity_i)
+            .arg(&group_i)
+            .arg(&scale)
+            .arg(&local_window_i)
+            .arg(&self.softcap);
+        // SAFETY: the scratch and BNSH buffers are sized above, and the scalar
+        // ABI matches `gqa_attention_reference_f32`.
+        unsafe {
+            builder.launch(LaunchConfig {
+                grid_dim: (attention_rows_u32, 1, 1),
+                block_dim: (BLOCK, 1, 1),
+                shared_mem_bytes: 0,
+            })
+        }
+        .map_err(|error| driver_err("launch GQA reference attention", error))?;
 
         let output_ptr = cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void);
         launch_1d!(

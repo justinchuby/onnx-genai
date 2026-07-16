@@ -59,8 +59,8 @@ __device__ float op_sqrt(float x) { return sqrtf(x); }
 __device__ float op_erf(float x) { return erff(x); }
 __device__ float op_tanh(float x) { return tanhf(x); }
 __device__ float op_sigmoid(float x) {
-    if (x >= 0.0f) return 1.0f / (1.0f + expf(-x));
-    float e = expf(x);
+    if (x >= 0.0f) return 1.0f / (1.0f + (float)exp((double)-x));
+    float e = (float)exp((double)x);
     return e / (1.0f + e);
 }
 __device__ float op_silu(float x) { return x * op_sigmoid(x); }
@@ -103,6 +103,26 @@ extern "C" __global__ void NAME##_##SUFFIX( \
     } \
 }
 
+#define DEFINE_BINARY_I64(NAME, EXPR) \
+extern "C" __global__ void NAME##_i64( \
+    const long long* a, const long long* b, long long* y, \
+    const unsigned long long* metadata, const int rank, const unsigned long long n) { \
+    const unsigned long long* shape = metadata; \
+    const unsigned long long* a_strides = metadata + rank; \
+    const unsigned long long* b_strides = metadata + rank * 2; \
+    for (unsigned long long i = blockIdx.x * blockDim.x + threadIdx.x; i < n; \
+         i += (unsigned long long)gridDim.x * blockDim.x) { \
+        unsigned long long linear = i, ai = 0, bi = 0; \
+        for (int d = rank - 1; d >= 0; --d) { \
+            unsigned long long coord = linear % shape[d]; \
+            linear /= shape[d]; \
+            ai += coord * a_strides[d]; \
+            bi += coord * b_strides[d]; \
+        } \
+        y[i] = (EXPR); \
+    } \
+}
+
 #define DEFINE_FOR_TYPE(TYPE, SUFFIX) \
 DEFINE_UNARY(relu, TYPE, SUFFIX) \
 DEFINE_UNARY(sqrt, TYPE, SUFFIX) \
@@ -120,6 +140,9 @@ DEFINE_BINARY(max, TYPE, SUFFIX)
 
 DEFINE_FOR_TYPE(float, f32)
 DEFINE_UNARY(silu, float, f32)
+DEFINE_BINARY_I64(add, a[ai] + b[bi])
+DEFINE_BINARY_I64(sub, a[ai] - b[bi])
+DEFINE_BINARY_I64(mul, a[ai] * b[bi])
 #ifdef NXRT_HAS_CUDA_HALF_HEADERS
 DEFINE_FOR_TYPE(__half, f16)
 DEFINE_FOR_TYPE(__nv_bfloat16, bf16)
@@ -398,8 +421,14 @@ impl BinaryKernel {
         }
         let a = &inputs[0];
         let b = &inputs[1];
-        let dtype = FloatDtype::from_onnx(op, "A", a.dtype)?;
-        if dtype != FloatDtype::F32 {
+        let float_dtype = if a.dtype == DataType::Int64
+            && matches!(self.op, BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul)
+        {
+            None
+        } else {
+            Some(FloatDtype::from_onnx(op, "A", a.dtype)?)
+        };
+        if float_dtype.is_some_and(|dtype| dtype != FloatDtype::F32) {
             self.runtime.require_nvrtc_half_headers(op)?;
         }
         if b.dtype != a.dtype || outputs[0].dtype != a.dtype {
@@ -429,7 +458,10 @@ impl BinaryKernel {
                 out_shape.len()
             ))
         })?;
-        let entry = self.op.entry(dtype);
+        let entry = match float_dtype {
+            Some(dtype) => self.op.entry(dtype),
+            None => format!("{}_i64", self.op.stem()),
+        };
         let func = self
             .runtime
             .nvrtc_function(POINTWISE_MODULE, POINTWISE_SRC, &entry)?;

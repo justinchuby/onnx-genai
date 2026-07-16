@@ -18,7 +18,7 @@ native-backend = [
 # Forwards to `onnx-genai-ort/cuda` so the CUDA execution provider is compiled
 # in. Runtime EP selection still goes through `ONNX_GENAI_EP`; without this
 # feature a `cuda` request silently falls back to CPU.
-cuda = ["onnx-genai-ort/cuda", "dep:onnx-runtime-ep-cuda"]
+cuda = ["onnx-genai-ort/cuda", "onnx-runtime-session?/cuda", "dep:onnx-runtime-ep-cuda"]
 
 [dependencies]
 onnx-genai-metadata = { workspace = true }

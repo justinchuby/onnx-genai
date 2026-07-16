@@ -134,18 +134,18 @@ extern "C" __global__ void rmsnorm_f32(
     const int tid = threadIdx.x;
     const int nt  = blockDim.x;
 
-    // Mean of squares.
-    float ss = 0.0f;
-    for (int j = tid; j < norm_size; j += nt) {
-        const float xv = x[base + j];
-        ss += xv * xv;
+    // Keep the correctness path in the CPU kernel's left-to-right f32 order.
+    // Accuracy-level-4 MatMulNBits quantizes activations, so even a one-ulp
+    // normalization difference can cross an int8 rounding boundary in decode.
+    if (tid == 0) {
+        float ss = 0.0f;
+        for (int j = 0; j < norm_size; ++j) {
+            const float xv = x[base + j];
+            ss += xv * xv;
+        }
+        red[0] = ss;
     }
-    red[tid] = ss;
     __syncthreads();
-    for (int off = nt >> 1; off > 0; off >>= 1) {
-        if (tid < off) red[tid] += red[tid + off];
-        __syncthreads();
-    }
     const float ms = red[0] / (float)norm_size;
     const float inv_std = 1.0f / sqrtf(ms + epsilon);
     if (tid == 0 && invstd_out) invstd_out[g] = inv_std;
@@ -184,7 +184,6 @@ extern "C" __global__ void skip_rmsnorm_f32(
     const int tid = threadIdx.x;
     const int nt  = blockDim.x;
 
-    float ss = 0.0f;
     for (int j = tid; j < norm_size; j += nt) {
         unsigned long long linear = (unsigned long long)base + j;
         unsigned long long skip_index = 0;
@@ -197,14 +196,17 @@ extern "C" __global__ void skip_rmsnorm_f32(
         if (has_bias) sv += bias[j];
         y[base + j] = sv;
         if (sum_out) sum_out[base + j] = sv;
-        ss += sv * sv;
     }
-    red[tid] = ss;
     __syncthreads();
-    for (int off = nt >> 1; off > 0; off >>= 1) {
-        if (tid < off) red[tid] += red[tid + off];
-        __syncthreads();
+    if (tid == 0) {
+        float ss = 0.0f;
+        for (int j = 0; j < norm_size; ++j) {
+            const float sv = y[base + j];
+            ss += sv * sv;
+        }
+        red[0] = ss;
     }
+    __syncthreads();
     const float inv_std = 1.0f / sqrtf(red[0] / (float)norm_size + epsilon);
     if (tid == 0) {
         if (mean_out) mean_out[g] = 0.0f;
@@ -212,7 +214,7 @@ extern "C" __global__ void skip_rmsnorm_f32(
     }
     __syncthreads();
     for (int j = tid; j < norm_size; j += nt)
-        y[base + j] *= inv_std * gamma[j];
+        y[base + j] = (y[base + j] * inv_std) * gamma[j];
 }
 "#;
 

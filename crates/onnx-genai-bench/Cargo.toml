@@ -19,6 +19,7 @@ bench-native = [
     "dep:onnx-runtime-session",
 ]
 onednn = ["onnx-runtime-ep-cpu/onednn"]
+cuda = ["onnx-genai-engine/cuda", "onnx-runtime-session/cuda"]
 
 [dependencies]
 anyhow = { workspace = true }

@@ -60,8 +60,8 @@ use onnx_runtime_loader::WeightStore;
 use onnx_runtime_shape_inference::{InferenceRegistry, MergePolicy};
 
 use crate::error::{Result, SessionError};
-use crate::sequence::{SeqTensor, SequenceValue, concat_axis, split_axis, stack_new_axis};
-use crate::tensor::{Tensor, host_bytes, write_host};
+use crate::sequence::{concat_axis, split_axis, stack_new_axis, SeqTensor, SequenceValue};
+use crate::tensor::Tensor;
 
 fn profile_ops_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -314,6 +314,7 @@ struct InInfo {
     strides: Vec<i64>,
     byte_offset: usize,
     base_ptr: *const std::ffi::c_void,
+    device: onnx_runtime_ir::DeviceId,
     /// Length in bytes of the backing (root) allocation, for the bounds gate.
     root_len: usize,
 }
@@ -500,13 +501,6 @@ fn substitute(shape: &Shape, bindings: &HashMap<SymbolId, usize>) -> Option<Vec<
             Dim::Symbolic(s) => bindings.get(s).copied(),
         })
         .collect()
-}
-
-/// Decode a host buffer's integer elements as `i64` for `dtype`, or `None` if
-/// the dtype is not an integer the shape math understands. Used to read the
-/// *values* of shape-defining inputs (e.g. `Slice` starts/ends) at run time.
-fn buffer_as_i64(buffer: &DeviceBuffer, dtype: DataType) -> Option<Vec<i64>> {
-    bytes_as_i64(crate::tensor::host_bytes(buffer), dtype)
 }
 
 /// Decode raw little-endian integer bytes as `i64` for `dtype`, or `None` if the
@@ -701,7 +695,8 @@ impl Executor {
             // `as_mut_ptr()` into read-only mmap (SIGSEGV / aliasing UB). In
             // that case fall back to the owned writable copy below.
             let producer_less = graph.value(vid).producer.is_none();
-            let buf = if producer_less
+            let buf = if ep.device_id().is_host_accessible()
+                && producer_less
                 && !bytes.is_empty()
                 && (bytes.as_ptr() as usize).is_multiple_of(init_align)
             {
@@ -723,7 +718,7 @@ impl Executor {
                 }
             } else {
                 let mut owned = ep.allocate(bytes.len().max(1), init_align)?;
-                write_host(&mut owned, bytes)?;
+                ep.copy_from_host(bytes, &mut owned)?;
                 owned
             };
             value_dtypes.insert(vid, dtype);
@@ -1164,7 +1159,7 @@ impl Executor {
                 .buffers
                 .get_mut(&vid)
                 .expect("input value has a buffer");
-            write_host(buf, tensor.as_bytes())?;
+            self.ep.copy_from_host(tensor.as_bytes(), buf)?;
         }
 
         // --- Execute nodes ---------------------------------------------------
@@ -1237,7 +1232,7 @@ impl Executor {
             let dtype = self.value_dtypes[&vid];
             let shape = resolved[&vid].clone();
             let bytes = self.contiguous_bytes(vid, &shape, dtype)?;
-            results.push(Tensor::from_raw_in(self.ep.clone(), dtype, shape, &bytes)?);
+            results.push(Tensor::from_raw(dtype, shape, &bytes)?);
         }
         Ok(results)
     }
@@ -1318,6 +1313,7 @@ impl Executor {
                     strides: Vec::new(),
                     byte_offset: 0,
                     base_ptr: std::ptr::null(),
+                    device: self.ep.device_id(),
                     root_len: 0,
                 });
                 continue;
@@ -1340,6 +1336,7 @@ impl Executor {
                     strides,
                     byte_offset: 0,
                     base_ptr,
+                    device: onnx_runtime_ir::DeviceId::cpu(),
                     root_len,
                 });
                 continue;
@@ -1366,6 +1363,7 @@ impl Executor {
                 strides,
                 byte_offset,
                 base_ptr,
+                device: buf.device(),
                 root_len,
             });
         }
@@ -1395,7 +1393,7 @@ impl Executor {
                     info.dtype,
                     &info.shape,
                     &info.strides,
-                    onnx_runtime_ir::DeviceId::cpu(),
+                    info.device,
                 )
                 .with_byte_offset(info.byte_offset),
             );
@@ -1529,6 +1527,12 @@ impl Executor {
                 mat.push(None);
                 continue;
             }
+            if !info.device.is_host_accessible() {
+                return Err(SessionError::Internal(format!(
+                    "op '{}' requires host-only strided materialization for CUDA input {i}",
+                    node.op_type
+                )));
+            }
             let esize = info.dtype.byte_size();
             if esize == 0 {
                 return Err(SessionError::from(
@@ -1570,7 +1574,7 @@ impl Executor {
                         info.dtype,
                         &info.shape,
                         &info.strides,
-                        onnx_runtime_ir::DeviceId::cpu(),
+                        info.device,
                     )
                     .with_byte_offset(info.byte_offset),
                 ),
@@ -1605,7 +1609,7 @@ impl Executor {
                 output_dtypes[i],
                 &output_shapes[i],
                 &out_strides[i],
-                onnx_runtime_ir::DeviceId::cpu(),
+                buf.device(),
             ));
         }
 
@@ -1651,12 +1655,8 @@ impl Executor {
     /// `Slice` whose `ends` is produced at runtime). Returns `None` if the value
     /// has no readable buffer/view or its dtype is not an integer.
     fn input_i64(&self, vid: ValueId, shape: &[usize], dtype: DataType) -> Option<Vec<i64>> {
-        if self.views.contains_key(&vid) || self.seq_elem_values.contains_key(&vid) {
-            let bytes = self.contiguous_bytes(vid, shape, dtype).ok()?;
-            bytes_as_i64(&bytes, dtype)
-        } else {
-            self.buffers.get(&vid).and_then(|b| buffer_as_i64(b, dtype))
-        }
+        let bytes = self.contiguous_bytes(vid, shape, dtype).ok()?;
+        bytes_as_i64(&bytes, dtype)
     }
 }
 
@@ -2153,7 +2153,7 @@ impl Executor {
             self.buffers.insert(vid, buf);
         }
         let buf = self.buffers.get_mut(&vid).expect("just ensured");
-        write_host(buf, bytes)?;
+        self.ep.copy_from_host(bytes, buf)?;
         self.value_dtypes.insert(vid, dtype);
         self.buffer_shapes.insert(vid, dims.clone());
         resolved.insert(vid, dims);
@@ -2359,7 +2359,7 @@ impl Executor {
         })?;
         // A view value owns no buffer; materialize its strided bytes contiguous.
         let bytes = self.contiguous_bytes(vid, &shape, dtype)?;
-        Tensor::from_raw_in(self.ep.clone(), dtype, shape, &bytes)
+        Tensor::from_raw(dtype, shape, &bytes)
     }
 
     /// The buffer-owning (root) value backing `vid`: `vid` itself if it owns a
@@ -2402,8 +2402,10 @@ impl Executor {
                     vid.0
                 )));
             }
+            let mut host = vec![0u8; buf.len()];
+            self.ep.copy_to_host(buf, &mut host)?;
             Ok(gather_view(
-                host_bytes(buf),
+                &host,
                 &view.shape,
                 &view.strides,
                 view.byte_offset,
@@ -2414,7 +2416,9 @@ impl Executor {
                 .buffers
                 .get(&vid)
                 .ok_or_else(|| SessionError::Internal(format!("value#{} not produced", vid.0)))?;
-            Ok(host_bytes(buf)[..n].to_vec())
+            let mut host = vec![0u8; n];
+            self.ep.copy_to_host(buf, &mut host)?;
+            Ok(host)
         }
     }
 
@@ -2465,7 +2469,7 @@ impl Executor {
             self.buffers.insert(vid, buf);
         }
         let buf = self.buffers.get_mut(&vid).expect("just ensured");
-        write_host(buf, bytes)?;
+        self.ep.copy_from_host(bytes, buf)?;
         self.value_dtypes.insert(vid, dtype);
         self.buffer_shapes.insert(vid, dims.clone());
         resolved.insert(vid, dims);

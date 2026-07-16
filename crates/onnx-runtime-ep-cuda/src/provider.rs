@@ -224,6 +224,48 @@ impl ExecutionProvider for CudaExecutionProvider {
         Ok(Fence::default())
     }
 
+    fn copy_from_host(&self, src: &[u8], dst: &mut DeviceBuffer) -> Result<()> {
+        assert_eq!(
+            dst.device(),
+            self.device,
+            "cuda_ep::copy_from_host: foreign dst buffer"
+        );
+        if src.len() > dst.len() {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep::copy_from_host: source {} bytes exceeds dst {}",
+                src.len(),
+                dst.len()
+            )));
+        }
+        if src.is_empty() {
+            return Ok(());
+        }
+        // SAFETY: `dst` is a live allocation on this CUDA device with enough
+        // capacity (checked above), and the synchronous copy completes here.
+        unsafe { self.runtime.htod(src, cuptr(dst.as_mut_ptr())) }
+    }
+
+    fn copy_to_host(&self, src: &DeviceBuffer, dst: &mut [u8]) -> Result<()> {
+        assert_eq!(
+            src.device(),
+            self.device,
+            "cuda_ep::copy_to_host: foreign src buffer"
+        );
+        if dst.len() > src.len() {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep::copy_to_host: destination {} bytes exceeds src {}",
+                dst.len(),
+                src.len()
+            )));
+        }
+        if dst.is_empty() {
+            return Ok(());
+        }
+        // SAFETY: `src` is a live allocation on this CUDA device with enough
+        // readable bytes (checked above); `dtoh` synchronizes before returning.
+        unsafe { self.runtime.dtoh(dst, cuptr(src.as_ptr())) }
+    }
+
     fn sync(&self) -> Result<()> {
         self.runtime.synchronize()
     }

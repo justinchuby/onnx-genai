@@ -8,6 +8,10 @@ repository.workspace = true
 keywords = ["onnx", "session", "inference", "runtime"]
 categories = ["science", "api-bindings"]
 
+[features]
+default = []
+cuda = ["dep:onnx-runtime-ep-cuda"]
+
 [dependencies]
 onnx-runtime-ir = { workspace = true }
 onnx-runtime-loader = { workspace = true }
@@ -15,6 +19,7 @@ onnx-runtime-shape-inference = { workspace = true }
 onnx-runtime-optimizer = { workspace = true }
 onnx-runtime-ep-api = { workspace = true }
 onnx-runtime-ep-cpu = { workspace = true }
+onnx-runtime-ep-cuda = { workspace = true, optional = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]

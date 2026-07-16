@@ -37,12 +37,6 @@ pub struct NativeDecodeSession {
 impl NativeDecodeSession {
     /// Load a decoder-with-past ONNX model on the requested native device.
     pub fn load(path: impl AsRef<Path>, device: NativeDecodeDevice) -> anyhow::Result<Self> {
-        if matches!(device, NativeDecodeDevice::Cuda { .. }) {
-            bail!(
-                "native CUDA decode is not available yet: onnx-runtime-session currently \
-                 accepts GPU preferences but its executor still instantiates only the CPU EP"
-            );
-        }
         let preference = match device {
             NativeDecodeDevice::Cpu => DevicePreference::Cpu,
             NativeDecodeDevice::Cuda { index } => DevicePreference::Gpu { index },
@@ -679,6 +673,46 @@ mod tests {
         let logits = session.decode(&[4], 3).expect("decode");
         assert_eq!(logits, vec![vec![10.0, 20.0]]);
         assert_eq!(session.current_len(), 4);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn native_cuda_qwen_decode_matches_cpu_tokens() -> anyhow::Result<()> {
+        if std::env::var_os("ONNX_GENAI_RUN_CUDA_SMOKE").is_none() {
+            eprintln!("skipping CUDA smoke; set ONNX_GENAI_RUN_CUDA_SMOKE=1 to run");
+            return Ok(());
+        }
+
+        let model_dir = Path::new("/home/justinchu/qwen2.5-0.5b-int4-onnx");
+        if !model_dir.join("model.onnx").is_file() {
+            eprintln!("skipping CUDA smoke; target model is not installed");
+            return Ok(());
+        }
+        let tokenizer = Tokenizer::from_file(model_dir.join("tokenizer.json"))?;
+        let prompt = tokenizer.encode("Hello")?;
+        let mut options = GenerateOptions::default();
+        options.max_new_tokens = 8;
+        options.temperature = 0.0;
+        options.greedy = true;
+        options.stop_on_eos = false;
+
+        let mut cpu =
+            NativeDecodeSession::load(model_dir.join("model.onnx"), NativeDecodeDevice::Cpu)?;
+        let cpu_tokens = cpu
+            .generate(&prompt, &options, &ProcessorChain::new(), &tokenizer)?
+            .token_ids;
+
+        let mut cuda = NativeDecodeSession::load(
+            model_dir.join("model.onnx"),
+            NativeDecodeDevice::Cuda { index: Some(0) },
+        )?;
+        let cuda_tokens = cuda
+            .generate(&prompt, &options, &ProcessorChain::new(), &tokenizer)?
+            .token_ids;
+
+        assert_eq!(cuda_tokens, cpu_tokens);
+        assert_eq!(cpu_tokens.len(), 8);
+        Ok(())
     }
 
     #[test]

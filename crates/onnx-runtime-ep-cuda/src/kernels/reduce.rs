@@ -103,10 +103,40 @@ extern "C" __global__ void reduce_f32(
         y[o] = out;
     }
 }
+
+extern "C" __global__ void reduce_i64_sum(
+    const long long* x,
+    long long*       y,
+    const long long* base_off,
+    const long long* delta_off,
+    const int        out_count,
+    const int        reduce_count)
+{
+    const int o = blockIdx.x;
+    if (o >= out_count) return;
+
+    extern __shared__ long long red_i64[];
+    const int tid = threadIdx.x;
+    const int nt  = blockDim.x;
+    const size_t base = (size_t)base_off[o];
+
+    long long acc = 0;
+    for (int r = tid; r < reduce_count; r += nt) {
+        acc += x[base + (size_t)delta_off[r]];
+    }
+    red_i64[tid] = acc;
+    __syncthreads();
+    for (int off = nt >> 1; off > 0; off >>= 1) {
+        if (tid < off) red_i64[tid] += red_i64[tid + off];
+        __syncthreads();
+    }
+    if (tid == 0) y[o] = red_i64[0];
+}
 "#;
 
 const REDUCE_MODULE: &str = "reduce_f32";
 const REDUCE_ENTRY: &str = "reduce_f32";
+const REDUCE_I64_SUM_ENTRY: &str = "reduce_i64_sum";
 
 /// Threads per block for the reduction (power of two → exact tree reduce).
 const REDUCE_BLOCK: u32 = 256;
@@ -408,7 +438,9 @@ impl ReduceKernel {
         }
         let x = &inputs[0];
         let cudnn_op = self.op.cudnn_op();
-        let supported_dtype = if cudnn_op.is_some() {
+        let supported_dtype = if self.op == ReduceOp::Sum && x.dtype == DataType::Int64 {
+            true
+        } else if cudnn_op.is_some() {
             matches!(
                 x.dtype,
                 DataType::Float32 | DataType::Float16 | DataType::BFloat16
@@ -418,7 +450,8 @@ impl ReduceKernel {
         };
         if !supported_dtype {
             return Err(not_implemented(format!(
-                "{op} with input dtype {:?} (sum/mean support f32/f16/bf16; max/min are f32)",
+                "{op} with input dtype {:?} (sum supports i64/f32/f16/bf16; mean supports \
+                 f32/f16/bf16; max/min are f32)",
                 x.dtype
             )));
         }
@@ -467,7 +500,9 @@ impl ReduceKernel {
             return Ok(());
         }
 
-        if let Some(cudnn_op) = cudnn_op {
+        if x.dtype != DataType::Int64
+            && let Some(cudnn_op) = cudnn_op
+        {
             if self.runtime.cudnn().is_available() {
                 let (input_spec, output_spec) = cudnn_reduce_specs(x.dtype, x.shape, &reduce)?;
                 let x_ptr = cuptr(x.data_ptr::<u8>() as *const c_void);
@@ -558,13 +593,23 @@ impl ReduceKernel {
         let x_ptr = cuptr(x.data_ptr::<u8>() as *const c_void);
         let y_ptr = cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void);
 
+        let entry = if x.dtype == DataType::Int64 {
+            REDUCE_I64_SUM_ENTRY
+        } else {
+            REDUCE_ENTRY
+        };
         let func = self
             .runtime
-            .nvrtc_function(REDUCE_MODULE, REDUCE_SRC, REDUCE_ENTRY)?;
+            .nvrtc_function(REDUCE_MODULE, REDUCE_SRC, entry)?;
         let cfg = LaunchConfig {
             grid_dim: (grid, 1, 1),
             block_dim: (REDUCE_BLOCK, 1, 1),
-            shared_mem_bytes: REDUCE_BLOCK * std::mem::size_of::<f32>() as u32,
+            shared_mem_bytes: REDUCE_BLOCK
+                * if x.dtype == DataType::Int64 {
+                    std::mem::size_of::<i64>() as u32
+                } else {
+                    std::mem::size_of::<f32>() as u32
+                },
         };
         let stream = self.runtime.stream();
         let mut builder = stream.launch_builder(&func);
@@ -574,13 +619,14 @@ impl ReduceKernel {
             .arg(&base_buf)
             .arg(&delta_buf)
             .arg(&out_i)
-            .arg(&red_i)
-            .arg(&op_tag)
-            .arg(&is_mean);
+            .arg(&red_i);
+        if x.dtype != DataType::Int64 {
+            builder.arg(&op_tag).arg(&is_mean);
+        }
         // SAFETY: `func` is the compiled reduce entry; the argument list/ABI
         // match its signature; `x_ptr`/`y_ptr` and the base/delta buffers are
         // live device allocations sized as validated above.
-        unsafe { builder.launch(cfg) }.map_err(|e| driver_err("launch reduce_f32", e))?;
+        unsafe { builder.launch(cfg) }.map_err(|e| driver_err(&format!("launch {entry}"), e))?;
         self.runtime.synchronize()
     }
 }

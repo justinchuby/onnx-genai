@@ -290,6 +290,62 @@ pub trait ExecutionProvider: Send + Sync {
     /// Asynchronous copy; returns a [`Fence`] to await.
     fn copy_async(&self, src: &DeviceBuffer, dst: &mut DeviceBuffer, size: usize) -> Result<Fence>;
 
+    /// Synchronously upload host bytes into a buffer owned by this EP.
+    fn copy_from_host(&self, src: &[u8], dst: &mut DeviceBuffer) -> Result<()> {
+        if !dst.device().is_host_accessible() {
+            return Err(EpError::KernelFailed(format!(
+                "{}: host upload is not implemented for device {:?}",
+                self.name(),
+                dst.device()
+            )));
+        }
+        if src.len() > dst.len() {
+            return Err(EpError::KernelFailed(format!(
+                "{}: host upload of {} bytes exceeds destination {} bytes",
+                self.name(),
+                src.len(),
+                dst.len()
+            )));
+        }
+        if src.is_empty() {
+            return Ok(());
+        }
+        // SAFETY: host accessibility is checked above, `dst` is uniquely
+        // borrowed, and its allocation is at least `src.len()` bytes.
+        unsafe {
+            std::ptr::copy_nonoverlapping(src.as_ptr(), dst.as_mut_ptr().cast(), src.len());
+        }
+        Ok(())
+    }
+
+    /// Synchronously download a buffer owned by this EP into host bytes.
+    fn copy_to_host(&self, src: &DeviceBuffer, dst: &mut [u8]) -> Result<()> {
+        if !src.device().is_host_accessible() {
+            return Err(EpError::KernelFailed(format!(
+                "{}: host download is not implemented for device {:?}",
+                self.name(),
+                src.device()
+            )));
+        }
+        if dst.len() > src.len() {
+            return Err(EpError::KernelFailed(format!(
+                "{}: host download of {} bytes exceeds source {} bytes",
+                self.name(),
+                dst.len(),
+                src.len()
+            )));
+        }
+        if dst.is_empty() {
+            return Ok(());
+        }
+        // SAFETY: host accessibility is checked above, `dst` is uniquely
+        // borrowed, and `src` contains at least `dst.len()` readable bytes.
+        unsafe {
+            std::ptr::copy_nonoverlapping(src.as_ptr().cast(), dst.as_mut_ptr(), dst.len());
+        }
+        Ok(())
+    }
+
     /// Block until all pending work on this EP completes.
     fn sync(&self) -> Result<()>;
 
