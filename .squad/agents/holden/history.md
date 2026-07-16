@@ -67,3 +67,7 @@ Rejected Rachael's `RefCell`/`#[pyclass(unsendable)]` Engine because cross-threa
 
 ### 2026-07-16T10:18:11Z — Native CUDA decode M1a review
 Cleared Deckard's `f795d45` executor EP-polymorphism refactor: it preserves CPU-only construction and behavior, adds no CUDA/device branching, unsafe, downcasting, or steady-state virtual dispatch. Independent validation confirmed 413/413 CPU EP tests and exact eight-token output; M2 device tensors/on-device coverage is next, pending the design decisions and CUDA GQA/device-KV prerequisites.
+
+## 2026-07-16T00:00:00Z — CUDA M2 op-coverage review
+- 🟢 Cleared Luv's `16c1e92`: exact CPU/CUDA f32 domain/opset registration parity for SiLU and standard SimplifiedLayerNormalization, stable math, and independent references.
+- Confirmed 114/114 CUDA tests passed.

@@ -38,3 +38,7 @@ Authored CUDA Gather, Shape, and Constant kernels; coverage reached 65.
 ### 2026-07-16T00:00:00Z — Allocation-free fused RMSNorm decode
 - Landed `de62f76`: direct-output contiguous-f32 `SkipSimplifiedLayerNormalization` fast path, retaining the scalar/broadcast/strided/statistics fallback.
 - RMSNorm fell 1.113→0.742 ms/step (-33.3%); five paired runs improved decode 44.20→46.45 tok/s (+9.1%) with matching tokens and 413 CPU EP tests.
+
+## 2026-07-16T00:00:00Z — CUDA M2 packed-GQA artifact
+- Implemented `ad73494` packed QKV splitting, device RoPE, and alias-aware O(1)-per-new-token KV append for 14/2/64 GQA.
+- Sebastian rejected the test for host-seeded cache coverage and unsupported PTX (5/6); strict lockout applied, and Wallace's subsequent repair is canonical.

@@ -59,3 +59,7 @@ Replaced Rachael's rejected `RefCell`/unsendable Python genai Engine with a send
 
 ### 2026-07-16T00:00:00Z — GQA decode direct-write review
 🟢 Cleared Leon's M=1 contiguous-f32 GQA writer (`1fdd1ec`): prefill, strided, and non-f32 outputs retain the generic writer; BSH/BNSH layouts, RoPE, KV behavior, and grouping are preserved. Independent profiling measured GQA 0.883→0.457 ms/step and throughput 51.58→59.42 tok/s with exact eight-token output; 413 CPU EP tests passed.
+
+## 2026-07-16T00:00:00Z — CUDA M2 packed-GQA review cycle
+- 🔴 Rejected Roy's initial packed-GQA artifact for bypassing real packed prefill and failing unsupported-PTX validation; strict lockout enforced.
+- 🟢 Cleared Wallace's repaired `4a34c66`: real packed-prefill→aliased-decode coverage, shared SM90 CUBIN fallback, 6/6 GQA and 114/114 CUDA tests passing.

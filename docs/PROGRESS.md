@@ -332,6 +332,8 @@ Scoped the "export Gemma4 E2B/12B via Mobius and smoke-test through onnx-genai" 
 ### Native CUDA decode design
 
 - **M1a EP-polymorphic executor ✅ merged (`f795d45`, Deckard; Holden 🟢):** The native executor now stores `Arc<dyn ExecutionProvider>` while preserving the CPU-only path; all **413** CPU EP tests pass and the eight-token decode output is exact. **Next: M2** device tensors / on-device op coverage, pending the design-doc user decisions (GPU floor, KV capacity, hard-fail policy, graph ownership).
+- **CUDA M2: op coverage (Silu + standard SimplifiedLayerNormalization) ✅ (`16c1e92`, Luv; Holden 🟢):** CUDA now matches CPU's f32 registration coverage for `com.microsoft::Silu` and standard-domain `ai.onnx::SimplifiedLayerNormalization`, closing two target-model gaps. GPU parity checks use independent stable-SiLU and RMSNorm references; the CUDA suite passed **114/114**.
+- **CUDA M2: GQA prerequisite (packed-QKV + O(1) device-KV append) ✅ (`4a34c66`, Roy → Wallace repair; Sebastian 🔴→🟢):** CUDA GQA splits target-geometry packed QKV, rotates Q/current-K on device, and appends only new K/V tokens to pointer-aliased fixed-capacity device caches. The repaired regression verifies real packed prefill followed by two aliased decode steps against an independent RoPE/repeat-KV/causal-softmax oracle. CUDA 13.3 NVRTC's PTX ISA 9.3 is unsupported by driver **580.105.08**, so the shared native-CUDA loader automatically falls back from failed PTX JIT to a native `sm_90` CUBIN; this foundational global fallback makes native kernels load reliably on this CUDA 13.3 / H200 environment. Full CUDA validation passed **114/114**.
 
 ### Python bindings wave
 

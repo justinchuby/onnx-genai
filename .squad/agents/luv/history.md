@@ -10,3 +10,7 @@ Hired as an additional Code Reviewer (alongside Gaff) as the codebase grew to 9 
 ## 2026-07-16T00:00:02Z — MatMulNBits GEMV tiling result
 - Evaluated four- and eight-column direct-int4 GEMV tiling; both regressed at 24 and 96 threads because of register pressure, spills, and non-contiguous packed-weight streams.
 - Reverted the experiments and documented the negative result in `79c52a6`; the one-column GEMV remains the production path.
+
+## 2026-07-16T00:00:00Z — CUDA M2 op-coverage delivery
+- Landed `16c1e92`: f32 `com.microsoft::Silu` and standard-domain `ai.onnx::SimplifiedLayerNormalization` CUDA registrations, matching CPU EP coverage.
+- Holden cleared independent parity checks; the CUDA suite passed 114/114.
