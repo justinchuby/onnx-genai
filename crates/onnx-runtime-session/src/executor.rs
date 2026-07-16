@@ -170,7 +170,7 @@ impl KernelCache {
         input_shapes: &[Vec<usize>],
         constant_inputs: &[bool],
         opset: u64,
-        ep: &CpuExecutionProvider,
+        ep: &dyn ExecutionProvider,
     ) -> Result<&dyn onnx_runtime_ep_api::Kernel> {
         let key = KernelKey {
             node: node_id.0,
@@ -220,7 +220,7 @@ pub(crate) struct Executor {
     /// no buffer still aliases `weights` when the `Arc<WeightStore>` field is
     /// dropped afterwards — no use-after-free regardless of field drop order.
     weights: Arc<WeightStore>,
-    ep: Arc<CpuExecutionProvider>,
+    ep: Arc<dyn ExecutionProvider>,
     /// One device buffer per backed value. Static values are allocated once at
     /// build; dynamic (symbol-shaped) values are allocated per run and cached
     /// here so a run whose resolved shape is unchanged reuses the allocation.
@@ -668,7 +668,7 @@ impl Executor {
     pub(crate) fn build(
         mut graph: Graph,
         weights: Arc<WeightStore>,
-        ep: Arc<CpuExecutionProvider>,
+        ep: Arc<dyn ExecutionProvider>,
     ) -> Result<Self> {
         fuse_silu_patterns(&mut graph);
         // Topological order up front: also validates the graph is a DAG.
@@ -998,7 +998,7 @@ impl Executor {
                 &input_shapes,
                 &constant_inputs,
                 opset,
-                &self.ep,
+                self.ep.as_ref(),
             )?;
         }
         Ok(())
@@ -1407,8 +1407,14 @@ impl Executor {
             .iter()
             .map(|input| input.is_some_and(|vid| graph.initializers.contains_key(&vid)))
             .collect();
-        let kernel =
-            cache.get_or_create(node_id, node, &input_shapes, &constant_inputs, opset, &ep)?;
+        let kernel = cache.get_or_create(
+            node_id,
+            node,
+            &input_shapes,
+            &constant_inputs,
+            opset,
+            ep.as_ref(),
+        )?;
 
         // --- Zero-copy view fast path ---------------------------------------
         // Ask the kernel whether its outputs are strided views over its inputs
@@ -3126,7 +3132,7 @@ impl Drop for Executor {
 /// Instantiate and initialize the Phase-1 CPU execution provider (§20.7,
 /// CPU-only auto-detection). A GPU/accelerator EP would be prepended here in a
 /// later phase; for Phase 1 the CPU EP is the sole, always-available backend.
-pub(crate) fn auto_detect_cpu_ep() -> Result<Arc<CpuExecutionProvider>> {
+pub(crate) fn auto_detect_cpu_ep() -> Result<Arc<dyn ExecutionProvider>> {
     let mut ep = CpuExecutionProvider::new();
     ep.initialize(&Default::default())?;
     Ok(Arc::new(ep))
