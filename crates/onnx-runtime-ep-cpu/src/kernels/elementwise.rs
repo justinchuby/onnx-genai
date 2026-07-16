@@ -15,7 +15,7 @@
 //! ONNX reference to < 1 ulp near zero.
 
 use onnx_runtime_ep_api::{Kernel, KernelFactory, Result, TensorMut, TensorView};
-use onnx_runtime_ir::Node;
+use onnx_runtime_ir::{DataType, Node};
 
 use super::add::{broadcast_apply, require_same_dtype};
 use super::check_arity;
@@ -26,7 +26,7 @@ use crate::strided::numel;
 use crate::{dispatch_arith, dispatch_float};
 
 /// The combining operation for a binary elementwise kernel.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum BinOp {
     Sub,
     Mul,
@@ -108,6 +108,9 @@ impl Kernel for BinaryKernel {
         };
         check_arity(self.op.name(), inputs, outputs, min_in, max_in, 1)?;
         let op = self.op;
+        if op == BinOp::Mul && multiply_contiguous_f32(inputs, &mut outputs[0]) {
+            return Ok(());
+        }
         match op {
             BinOp::Sum | BinOp::Mean => {
                 dispatch_float!(inputs[0].dtype, op.name(), T => binary_typed::<T>(op, inputs, outputs))
@@ -121,6 +124,43 @@ impl Kernel for BinaryKernel {
     fn supports_strided_input(&self, _input_idx: usize) -> bool {
         true
     }
+}
+
+fn multiply_contiguous_f32(inputs: &[TensorView], output: &mut TensorMut) -> bool {
+    if inputs.len() != 2
+        || inputs[0].dtype != DataType::Float32
+        || inputs[1].dtype != DataType::Float32
+        || output.dtype != DataType::Float32
+        || inputs[0].shape != output.shape
+        || inputs[1].shape != output.shape
+        || !inputs[0].is_contiguous()
+        || !inputs[1].is_contiguous()
+        || !output.is_contiguous()
+    {
+        return false;
+    }
+
+    let n = output.numel();
+    let bytes = n.saturating_mul(std::mem::size_of::<f32>());
+    let output_start = output.data_ptr_mut::<f32>() as usize;
+    let output_end = output_start.saturating_add(bytes);
+    if inputs.iter().any(|input| {
+        let input_start = input.data_ptr::<f32>() as usize;
+        let input_end = input_start.saturating_add(bytes);
+        output_start < input_end && input_start < output_end
+    }) {
+        return false;
+    }
+    // SAFETY: the executor bounds-checks every view before dispatch. The dtype,
+    // equal shapes, and contiguous layouts above prove each pointer spans n f32s;
+    // the range check proves the mutable output does not alias either input.
+    let lhs = unsafe { std::slice::from_raw_parts(inputs[0].data_ptr::<f32>(), n) };
+    let rhs = unsafe { std::slice::from_raw_parts(inputs[1].data_ptr::<f32>(), n) };
+    let output = unsafe { std::slice::from_raw_parts_mut(output.data_ptr_mut::<f32>(), n) };
+    for ((output, &lhs), &rhs) in output.iter_mut().zip(lhs).zip(rhs) {
+        *output = lhs * rhs;
+    }
+    true
 }
 
 /// Dtype-generic binary/variadic fold: seed from the first operand, then fold
@@ -287,6 +327,17 @@ mod tests {
                 30., 60., 90., 120., // 3 * row
             ]
         );
+    }
+
+    #[test]
+    fn mul_same_shape_contiguous() {
+        let a = Owned::f32(&[2, 3], &[1., -2., 3., 4., 0., f32::NAN]);
+        let b = Owned::f32(&[2, 3], &[5., 6., -7., 0.5, 8., 9.]);
+        let mut out = Owned::zeros_f32(&[2, 3]);
+        run_bin(BinOp::Mul, &a, &b, &mut out);
+        let values = out.to_f32();
+        assert_eq!(&values[..5], &[5., -12., -21., 2., 0.]);
+        assert!(values[5].is_nan());
     }
 
     #[test]
