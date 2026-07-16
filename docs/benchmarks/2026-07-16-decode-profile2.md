@@ -233,3 +233,74 @@ configuration.
    weight placement.
 4. Fuse QKV and gate/up projection dispatch at graph level after the standalone
    kernel is exhausted.
+
+## Follow-up: multi-column direct-int4 tiling did not improve decode
+
+The direct-int4 M=1 kernel was tested with four and eight output columns per
+inner K-block pass. Each candidate kept independent SIMD accumulators, loaded
+the quantized activation block once per column tile, preserved the existing
+contiguous N partition, and used the existing single-column path for N tails.
+Both widths covered a partial K block and an N tail in experimental tests.
+
+The primary 24-worker comparison interleaved seven processes per version. Each
+process generated four tokens with three warmups and ten measured runs:
+
+| column tile | median tok/s | median ms/step | vs. baseline |
+|---:|---:|---:|---:|
+| 1 (current kernel) | **54.91** | **18.211** | — |
+| 4 | 52.67 | 18.987 | -4.1% |
+| 8 | 52.65 | 18.993 | -4.1% |
+
+Five additional interleaved profiler processes per version produced 25
+steady-state one-token samples after excluding each process's prepack warmup:
+
+| column tile | MatMulNBits median ms | mean ms | median node-time share |
+|---:|---:|---:|---:|
+| 1 | 15.222 | **15.281** | 83.39% |
+| 4 | 15.087 | 16.637 | 83.34% |
+| 8 | **13.626** | 17.258 | **82.60%** |
+
+Eight columns reduced the median inner-kernel time, but introduced enough slow
+steps to make mean MatMulNBits latency 12.9% worse and end-to-end throughput
+4.1% worse. Four columns was effectively flat at the median and 8.9% worse by
+the mean. The largest sampled MatMulNBits step was 17.368 ms for the current
+kernel, 46.922 ms for four columns, and 44.249 ms for eight columns.
+
+Exploratory two-process samples at larger pools were not interleaved and were
+more host-load-sensitive, but the per-op direction consistently disfavored
+tiling:
+
+| workers | tile 1 tok/s, MatMulNBits ms (%) | tile 4 tok/s, MatMulNBits ms (%) | tile 8 tok/s, MatMulNBits ms (%) |
+|---:|---:|---:|---:|
+| 24 | 54.91, 15.222 (83.39%) | 52.67, 15.087 (83.34%) | 52.65, 13.626 (82.60%) |
+| 48 | 34.94, 19.900 (87.46%) | 40.75, 25.661 (88.07%) | 35.06, 34.088 (90.09%) |
+| 96 | 30.72, 28.841 (90.63%) | 29.33, 30.320 (91.30%) | 28.04, 32.103 (91.65%) |
+
+The 48-worker throughput anomaly conflicts with its much slower local profile
+and is attributed to the non-interleaved host noise; 24-worker interleaving is
+the acceptance result. Greedy output remained `[11576, 42740, 11, 358]` in
+every four-token run.
+
+The likely limitation is the row-major packed-weight layout: adjacent output
+columns are separated by a full packed K row, so a wider tile creates more
+independent weight streams and register pressure while saving loads from an
+activation vector that already fits in cache. The lower median for width eight
+shows that activation reuse can accelerate an undisturbed inner loop, but the
+long-tail and larger-pool regressions make it unsuitable as the production
+kernel. The tiling code was therefore reverted; the simpler one-column direct
+kernel remains.
+
+The three targeted direct-int4 tests passed for both candidates. After the
+revert, `cargo test -p onnx-runtime-ep-cpu` passed all 411 unit tests (plus one
+ignored doctest), and the release native benchmark build passed.
+
+### Ranked remaining levers
+
+1. **Cross-projection activation reuse** — quantize an input once for Q/K/V or
+   gate/up projections and share it across calls; this removes repeated work
+   without multiplying non-contiguous weight streams inside one kernel.
+2. **NUMA-aware scheduling and weight placement** — keep projection tasks and
+   their packed weights on one socket, replacing the sharp degradation above
+   48 workers.
+3. **Projection fusion** — group QKV and gate/up dispatch so shared activation
+   work, Rayon barriers, and executor overhead are amortized at graph level.
