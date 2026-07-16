@@ -46,3 +46,8 @@ Added the preprocessing-side prompt token-expansion library for multi-tile VLM i
 
 - Merged `de3c556`: CUDA RMSNorm and SkipRMSNorm use separately rounded f32 multiplication and addition to match CPU serial reductions.
 - Wallace 🟢 verified H200 coverage; exact native decode parity now reaches token 11, with token-12 MatMulNBits reduction order still open.
+
+## 2026-07-16T19:05:18+0000 — CUDA SiLU and acc4 drift closure
+
+- Merged `5c7dcc9`: matching CPU's fused-SiLU operation order and explicitly rounded acc4 scale boundaries eliminates token-12 drift; greedy CPU/CUDA parity now reaches token 15.
+- The K=4864 `1.9073486e-5` reduction-order difference first diverges at token 16 and is accepted because exact GPU reduction emulation costs 8.4%. Wallace reviewed 🟢.

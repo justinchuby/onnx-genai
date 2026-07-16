@@ -1025,3 +1025,21 @@ Verified on NVIDIA H200, compute capability 9.0, driver 580.105.08.
 ## Secondary-source note
 
 The accepted residual mismatch beginning at token index 12 is likely seeded by the accuracy-level-4 `MatMulNBits` decode path: CUDA reduces per-block scaled dot products across warp lanes, while the CPU AVX/VNNI path accumulates eight scaled partial-dot lanes and horizontally sums them afterward. Those distinct f32 multiplication and accumulation orders can still introduce smaller backend drift. Follow up separately; it does not invalidate this RMS reduction fix.
+
+## 2026-07-16T19:05:18+0000 — CPU BlockQuantizedMatMul prefill and CUDA decode-drift closure
+
+**Sources:** `joi-block-quant-perf.md`, `leon-block-quant-perf-review.md`, `sapper-matmulnbits-acc4-drift.md`, `wallace-silu-acc4-drift-review.md`
+
+### CPU BlockQuantizedMatMul prefill optimization accepted (`5010261`)
+**By:** Joi; reviewed 🟢 by Leon
+
+**What:** Dequantization is parallelized over independent K block-row panels for every MXFP4/IQ format. MXFP4, IQ4_NL, and IQ4_XS use bit-exact AVX2 unpackers; all remaining formats retain their scalar reference decoder. Adaptive Rayon row tasks improve the shared generic blocked GEMM while preserving each output element's K accumulation order. The existing GEMM seam retains optional oneDNN routing.
+
+**Why:** The former output-major scalar decode and fixed 64-row GEMM task underused CPU parallelism for M=64 prefill. At M=64/K=4096/N=4096 on a 96-core Xeon 8480C, MXFP4/IQ4_NL decode improved 5.4×/7.6× and generic matmul improved 32.3×/34.6×. All ten formats match scalar reference bits; default and oneDNN CPU EP suites each passed 430 tests.
+
+### CUDA↔CPU decode drift bounded and accepted (`5c7dcc9`)
+**By:** Sapper; reviewed 🟢 by Wallace
+
+**What:** The token-12 divergence was caused by layer-0 fused SiLU operation order, not MatMulNBits: CUDA now follows CPU's branch-stable expression with explicitly rounded f32 operations. CUDA acc4 scale/accumulation boundaries also use explicit round-to-nearest operations. CPU/CUDA greedy parity now holds through token index 15.
+
+**Why:** A remaining K=4864 accuracy-level-4 reduction-tree difference is bounded at max absolute `1.9073486e-5` and first amplifies to a token divergence at index 16. Serializing the GPU reduction to emulate CPU exactly costs 8.4% decode throughput, so the parallel warp reduction remains the accepted tolerance. H200 validation passed all 128 CUDA EP tests, exact SiLU-order regression, acc4 comparison, and 16-token parity coverage.

@@ -23,3 +23,8 @@
 
 - 🟢 Cleared Roy's MXFP4/IQ4_NL M=1 CUDA GEMV on H200, including exact decoded-weight checks and 124 CUDA tests.
 - 🟢 Cleared Sapper's RMS reduction anti-FMA fix; parity reaches token 11, while token-12 MatMulNBits reduction order remains a follow-up.
+
+## 2026-07-16T19:05:18+0000 — CUDA SiLU and acc4 drift review
+
+- 🟢 Cleared Sapper's `5c7dcc9`: CUDA now matches CPU's branch-stable SiLU operation order and explicitly rounds acc4 f32 scale/accumulation boundaries without serializing warp reduction.
+- H200 validation passed all 128 CUDA EP tests and parity through token 15. The token-16 `1.9073486e-5` reduction-order drift is accepted because exact emulation costs 8.4%.

@@ -39,3 +39,8 @@ Loader opset-import validation for file, from-parts, and nested-subgraph paths m
 
 - 🟢 Cleared Bryant's IQ2_XS/IQ2_S/IQ3_XXS and IQ1_S/IQ1_M implementations after upstream llama.cpp grid, layout, fingerprint, and hand-trace audits.
 - CPU `BlockQuantizedMatMul` now covers the complete supported IQ family.
+
+## 2026-07-16T19:05:18+0000 — BlockQuantizedMatMul prefill review
+
+- 🟢 Cleared Joi's `5010261`: all ten formats matched scalar decode bits, selected MXFP4/IQ4_NL/IQ4_XS AVX2 paths were independently checked, and generic GEMM retained K accumulation order.
+- Default and oneDNN CPU EP suites each passed 430 tests; M=64 generic matmul gains measured 32–35×.
