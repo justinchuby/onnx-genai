@@ -136,12 +136,12 @@ not yet wired) · **🔬 custom** (needs a fused NVRTC/CUTLASS kernel).
 | `Identity` | `` | ⏳ | **memcpy** (D2D) | Straight device copy; dtype-agnostic. |
 | `Reshape` | `` | ⏳ | **view rewrite** | Metadata-only when contiguous; else materialise. |
 | `Transpose` | `` | ⏳ | **NVRTC-custom** / cuBLAS | Tiled-transpose kernel (or fold into a consumer's GEMM `op`). |
-| `Gather` | `` | ⏳ | **NVRTC-custom** | Indexed copy (axis-parametric gather kernel). |
-| `Shape` | `` | ⏳ | **host** | Emits a shape tensor; no device compute. |
+| `Gather` | `` | ✅ | **NVRTC-custom** | Axis-parametric contiguous indexed copy; Int32/Int64 indices, negative index wrap, arbitrary index rank. |
+| `Shape` | `` | ✅ | **host + H2D** | Computes the metadata-only Int64 shape vector on host, including opset-15 `start`/`end`, then uploads it. |
 | `Unsqueeze` | `` | ⏳ | **view rewrite** | Metadata-only. |
 | `Expand` | `` | ⏳ | **NVRTC-custom** | Broadcast copy (shares the broadcasting index math with binary-elementwise-broadcast). |
 | `Slice` | `` | ⏳ | **NVRTC-custom** | Strided/stepped copy (opset-10 input-driven ranges). |
-| `Constant` | `` | ⏳ | **host + H2D** | Upload the constant to device once. |
+| `Constant` | `` | ✅ | **host + H2D** | Uploads `value` tensors and numeric `value_*` attribute forms to the device. |
 
 ## Source-derived coverage audit (2026-07-15)
 
@@ -269,4 +269,4 @@ candidate.
   libs are installed. Every such failure is an actionable `EpError` (RULES.md #1)
   naming the missing library and how to fix it.
 
-`SkipSimplifiedLayerNormalization` raised the advertised CUDA set to **61** op names; `MatMulNBits` raises it to **62** and is GPU-validated against independent INT4 dequantization and matmul references.
+`SkipSimplifiedLayerNormalization` raised the advertised CUDA set to **61** op names; `MatMulNBits` raised it to **62**. `Gather`, `Shape`, and `Constant` raise it to **65**; Gather uses an NVRTC device indexed-copy kernel, while Shape and Constant correctly use host metadata construction plus H2D upload.

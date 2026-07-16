@@ -24,9 +24,11 @@ use crate::runtime::CudaRuntime;
 pub mod activations;
 pub mod attention;
 pub mod cast;
+pub mod constant;
 pub mod conv;
 pub mod elementwise;
 pub mod fused_gemm;
+pub mod gather;
 pub mod gemm;
 pub mod group_query_attention;
 pub mod matmul;
@@ -35,6 +37,7 @@ pub mod normalization;
 pub mod pointwise;
 pub mod pooling;
 pub mod reduce;
+pub mod shape;
 pub mod softmax;
 
 use activations::ActivationFactory;
@@ -136,6 +139,9 @@ pub const CUDA_COVERED_OPS: &[&str] = &[
     "Clip",
     "Softsign",
     "Selu",
+    "Gather",
+    "Shape",
+    "Constant",
 ];
 
 /// Build an [`OpRegistry`] populated with the CUDA kernel factories.
@@ -149,6 +155,26 @@ pub fn build_cuda_registry(runtime: Arc<CudaRuntime>) -> OpRegistry {
     reg.register(
         OpKey::new("MatMul", "", 1),
         Box::new(matmul::MatMulFactory {
+            runtime: runtime.clone(),
+        }),
+    );
+    // Metadata / indexed data movement. Shape and Constant construct their small
+    // results on the host and upload them; Gather is an NVRTC indexed-copy kernel.
+    reg.register(
+        OpKey::new("Gather", "", 1),
+        Box::new(gather::GatherFactory {
+            runtime: runtime.clone(),
+        }),
+    );
+    reg.register(
+        OpKey::new("Shape", "", 1),
+        Box::new(shape::ShapeFactory {
+            runtime: runtime.clone(),
+        }),
+    );
+    reg.register(
+        OpKey::new("Constant", "", 1),
+        Box::new(constant::ConstantFactory {
             runtime: runtime.clone(),
         }),
     );
@@ -457,7 +483,7 @@ mod tests {
 
     #[test]
     fn covered_ops_have_no_duplicates() {
-        assert_eq!(CUDA_COVERED_OPS.len(), 62);
+        assert_eq!(CUDA_COVERED_OPS.len(), 65);
 
         let mut seen = std::collections::HashSet::new();
         for op in CUDA_COVERED_OPS {
