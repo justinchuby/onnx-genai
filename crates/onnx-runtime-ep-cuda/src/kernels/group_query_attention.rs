@@ -567,9 +567,10 @@ impl GroupQueryAttentionKernel {
                     "cuda_ep GroupQueryAttention: seqlens_k + 1 overflows int32".into(),
                 )
             })?;
-        if totals.iter().copied().max().unwrap_or(0) as usize != total_sequence_length {
+        let valid_sequence_length = totals.iter().copied().max().unwrap_or(0) as usize;
+        if valid_sequence_length > total_sequence_length {
             return Err(EpError::KernelFailed(format!(
-                "cuda_ep GroupQueryAttention: total_sequence_length {total_sequence_length} must equal max(seqlens_k + 1)"
+                "cuda_ep GroupQueryAttention: valid sequence length {valid_sequence_length} exceeds physical total_sequence_length capacity {total_sequence_length}"
             )));
         }
         let mut past_lengths = Vec::with_capacity(batch);

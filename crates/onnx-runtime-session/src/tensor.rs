@@ -112,6 +112,161 @@ pub struct Tensor {
     import_guard: Option<Box<dyn core::any::Any + Send + Sync>>,
 }
 
+/// Debug counters for host traffic explicitly requested through a persistent
+/// device binding.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DeviceBindingTransferStats {
+    pub host_upload_calls: u64,
+    pub host_upload_bytes: u64,
+    pub host_download_calls: u64,
+    pub host_download_bytes: u64,
+}
+
+/// An externally owned persistent device allocation bound to a graph input and
+/// optionally aliased by a graph output.
+pub struct DeviceIoBinding {
+    input_name: String,
+    output_name: Option<String>,
+    pub dtype: DataType,
+    physical_shape: Vec<usize>,
+    logical_shape: Vec<usize>,
+    buffer: Option<DeviceBuffer>,
+    allocator: Arc<dyn ExecutionProvider>,
+    transfer_stats: DeviceBindingTransferStats,
+}
+
+impl DeviceIoBinding {
+    pub(crate) fn allocate(
+        allocator: Arc<dyn ExecutionProvider>,
+        input_name: String,
+        output_name: Option<String>,
+        dtype: DataType,
+        physical_shape: Vec<usize>,
+        logical_shape: Vec<usize>,
+    ) -> Result<Self> {
+        validate_logical_shape(&physical_shape, &logical_shape)?;
+        let numel = physical_shape.iter().try_fold(1usize, |product, &dim| {
+            product.checked_mul(dim).ok_or_else(|| {
+                SessionError::Internal(format!(
+                    "device binding '{input_name}' physical shape overflows: {physical_shape:?}"
+                ))
+            })
+        })?;
+        let bytes = dtype.storage_bytes(numel).max(1);
+        let allocator_for_buffer = allocator.clone();
+        let buffer = allocator_for_buffer.allocate(bytes, TensorLayout::contiguous().alignment)?;
+        Ok(Self {
+            input_name,
+            output_name,
+            dtype,
+            physical_shape,
+            logical_shape,
+            buffer: Some(buffer),
+            allocator,
+            transfer_stats: DeviceBindingTransferStats::default(),
+        })
+    }
+
+    pub fn input_name(&self) -> &str {
+        &self.input_name
+    }
+
+    pub fn output_name(&self) -> Option<&str> {
+        self.output_name.as_deref()
+    }
+
+    pub fn physical_shape(&self) -> &[usize] {
+        &self.physical_shape
+    }
+
+    pub fn logical_shape(&self) -> &[usize] {
+        &self.logical_shape
+    }
+
+    pub fn set_logical_shape(&mut self, shape: Vec<usize>) -> Result<()> {
+        validate_logical_shape(&self.physical_shape, &shape)?;
+        self.logical_shape = shape;
+        Ok(())
+    }
+
+    pub fn device_ptr(&self) -> *const std::ffi::c_void {
+        self.buffer().as_ptr()
+    }
+
+    pub fn transfer_stats(&self) -> DeviceBindingTransferStats {
+        self.transfer_stats
+    }
+
+    pub fn write_bytes(&mut self, byte_offset: usize, bytes: &[u8]) -> Result<()> {
+        let buffer = self
+            .buffer
+            .as_mut()
+            .expect("DeviceIoBinding buffer taken only in Drop");
+        self.allocator
+            .copy_from_host_at(bytes, buffer, byte_offset)?;
+        self.transfer_stats.host_upload_calls += 1;
+        self.transfer_stats.host_upload_bytes += bytes.len() as u64;
+        Ok(())
+    }
+
+    pub fn read_bytes(&mut self) -> Result<Vec<u8>> {
+        let mut bytes = vec![0; self.buffer().len()];
+        self.allocator.copy_to_host(self.buffer(), &mut bytes)?;
+        self.transfer_stats.host_download_calls += 1;
+        self.transfer_stats.host_download_bytes += bytes.len() as u64;
+        Ok(bytes)
+    }
+
+    pub(crate) fn buffer(&self) -> &DeviceBuffer {
+        self.buffer
+            .as_ref()
+            .expect("DeviceIoBinding buffer taken only in Drop")
+    }
+
+    pub(crate) fn buffer_mut(&mut self) -> &mut DeviceBuffer {
+        self.buffer
+            .as_mut()
+            .expect("DeviceIoBinding buffer taken only in Drop")
+    }
+}
+
+fn validate_logical_shape(physical: &[usize], logical: &[usize]) -> Result<()> {
+    if physical.len() != logical.len()
+        || physical
+            .iter()
+            .zip(logical)
+            .any(|(&capacity, &valid)| valid > capacity)
+    {
+        return Err(SessionError::Internal(format!(
+            "device binding logical shape {logical:?} exceeds physical capacity {physical:?}"
+        )));
+    }
+    Ok(())
+}
+
+impl std::fmt::Debug for DeviceIoBinding {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeviceIoBinding")
+            .field("input_name", &self.input_name)
+            .field("output_name", &self.output_name)
+            .field("dtype", &self.dtype)
+            .field("physical_shape", &self.physical_shape)
+            .field("logical_shape", &self.logical_shape)
+            .field("device", &self.buffer().device())
+            .field("device_ptr", &self.device_ptr())
+            .field("transfer_stats", &self.transfer_stats)
+            .finish()
+    }
+}
+
+impl Drop for DeviceIoBinding {
+    fn drop(&mut self) {
+        if let Some(buffer) = self.buffer.take() {
+            let _ = self.allocator.deallocate(buffer);
+        }
+    }
+}
+
 impl Tensor {
     /// Allocate a tensor from raw little-endian element bytes using `allocator`.
     ///

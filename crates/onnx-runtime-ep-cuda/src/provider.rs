@@ -245,6 +245,41 @@ impl ExecutionProvider for CudaExecutionProvider {
         unsafe { self.runtime.htod(src, cuptr(dst.as_mut_ptr())) }
     }
 
+    fn copy_from_host_at(
+        &self,
+        src: &[u8],
+        dst: &mut DeviceBuffer,
+        byte_offset: usize,
+    ) -> Result<()> {
+        assert_eq!(
+            dst.device(),
+            self.device,
+            "cuda_ep::copy_from_host_at: foreign dst buffer"
+        );
+        let end = byte_offset.checked_add(src.len()).ok_or_else(|| {
+            EpError::KernelFailed("cuda_ep::copy_from_host_at: upload range overflows".into())
+        })?;
+        if end > dst.len() {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep::copy_from_host_at: range {byte_offset}..{end} exceeds dst {}",
+                dst.len()
+            )));
+        }
+        if src.is_empty() {
+            return Ok(());
+        }
+        let ptr = cuptr(dst.as_mut_ptr())
+            .checked_add(byte_offset as u64)
+            .ok_or_else(|| {
+                EpError::KernelFailed(
+                    "cuda_ep::copy_from_host_at: device pointer offset overflows".into(),
+                )
+            })?;
+        // SAFETY: `ptr` names the checked byte range within `dst`, and the
+        // synchronous copy completes before this method returns.
+        unsafe { self.runtime.htod(src, ptr) }
+    }
+
     fn copy_to_host(&self, src: &DeviceBuffer, dst: &mut [u8]) -> Result<()> {
         assert_eq!(
             src.device(),

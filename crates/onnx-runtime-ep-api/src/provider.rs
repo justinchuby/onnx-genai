@@ -318,6 +318,46 @@ pub trait ExecutionProvider: Send + Sync {
         Ok(())
     }
 
+    /// Synchronously upload host bytes into a byte range of a buffer owned by
+    /// this EP.
+    fn copy_from_host_at(
+        &self,
+        src: &[u8],
+        dst: &mut DeviceBuffer,
+        byte_offset: usize,
+    ) -> Result<()> {
+        let end = byte_offset.checked_add(src.len()).ok_or_else(|| {
+            EpError::KernelFailed(format!("{}: host upload range overflows", self.name()))
+        })?;
+        if end > dst.len() {
+            return Err(EpError::KernelFailed(format!(
+                "{}: host upload range {byte_offset}..{end} exceeds destination {} bytes",
+                self.name(),
+                dst.len()
+            )));
+        }
+        if src.is_empty() {
+            return Ok(());
+        }
+        if !dst.device().is_host_accessible() {
+            return Err(EpError::KernelFailed(format!(
+                "{}: ranged host upload is not implemented for device {:?}",
+                self.name(),
+                dst.device()
+            )));
+        }
+        // SAFETY: host accessibility and bounds are checked above, and `dst` is
+        // uniquely borrowed for the duration of the copy.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                src.as_ptr(),
+                dst.as_mut_ptr().cast::<u8>().add(byte_offset),
+                src.len(),
+            );
+        }
+        Ok(())
+    }
+
     /// Synchronously download a buffer owned by this EP into host bytes.
     fn copy_to_host(&self, src: &DeviceBuffer, dst: &mut [u8]) -> Result<()> {
         if !src.device().is_host_accessible() {

@@ -514,6 +514,17 @@ bytes/token = layers * 2(K,V) * kv_heads * head_dim * sizeof(f32)
 The maximum context therefore needs an explicit product decision; blindly
 allocating the model's theoretical maximum is not free.
 
+The native CUDA decoder defaults this capacity to **4096 tokens**. Override it
+per session with `NativeDecodeSession::load_with_cuda_kv_max_len`, or process-wide
+with `ONNX_GENAI_CUDA_KV_MAX_LEN`. A decode that would exceed the configured
+capacity returns an error before launching a kernel.
+
+M3 uses persistent session I/O bindings whose allocation shape is the physical
+capacity and whose separately tracked logical shape records the valid prefix.
+Each past/present pair aliases one caller-owned device allocation, and bound
+present outputs are not materialized on the host. Reset and rewind update the
+logical cursor without copying KV bytes.
+
 ### 5.5 Per-step transfer boundary
 
 The desired steady-state boundary is:
@@ -528,11 +539,22 @@ The desired steady-state boundary is:
 | none | activations | interior device buffers |
 | none | KV | resident and appended in place |
 
-The current native adapter constructs an attention-mask vector of
+Before M3, the native adapter constructed an attention-mask vector of
 `total_len` on every step ([native_decode.rs, lines
 235-253](../crates/onnx-genai-engine/src/native_decode.rs#L235-L253)). For graph
-capture, replace that with a fixed-capacity mask whose newly valid element is
-updated each token, or specialize the mask subgraph to scalar sequence lengths.
+capture, this must be a fixed-capacity mask whose newly valid element is updated
+each token, or a mask subgraph specialized to scalar sequence lengths.
+
+The M3 implementation takes the fixed-mask route: the mask is allocated once on
+the session device, zeroed during setup, and only the newly valid `i64` entries
+are uploaded during decode. Rewind/reset clear only the mask suffix; KV remains
+untouched.
+
+Validation note: the M2 baseline and the device-KV path both match the live CPU
+oracle for the first 10 greedy tokens of the `"Hello"` smoke prompt (including
+the required first eight), then diverge numerically. Stable pointers and zero KV
+host transfers are verified across a 16-token run; extending exact CPU/CUDA token
+parity past the existing M2 window remains a CUDA numerics follow-up.
 
 ## 6. CUDA graph capture for decode
 

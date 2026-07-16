@@ -268,7 +268,7 @@ fn run_packed_step(
     let total_i32 = i32::try_from(total).unwrap();
     let packed = f32_tensor(&[1, seq, PACKED_WIDTH], packed);
     let seqlens = i32_tensor(&[1], &[total_i32 - 1]);
-    let total = i32_tensor(&[], &[total_i32]);
+    let total = i32_tensor(&[], &[i32::try_from(capacity).unwrap()]);
     let cos = f32_tensor(&[capacity, HEAD_DIM / 2], cos);
     let sin = f32_tensor(&[capacity, HEAD_DIM / 2], sin);
     let position = i64_tensor(&[1, seq], positions);
@@ -854,6 +854,71 @@ fn gqa_gpu_zero_scale_softcap_and_sliding_window_match_reference() {
             Some(2),
         ),
     );
+}
+
+#[test]
+fn gqa_gpu_physical_capacity_can_exceed_valid_prefix() {
+    let Some(ep) = gpu() else { return };
+    const VALID: usize = 5;
+    const PAST: usize = VALID - 1;
+    const CAPACITY: usize = 128;
+    let q = [0.2, -0.1, 0.3, 0.4, -0.2, 0.5, 0.1, -0.3];
+    let current_k = [0.7, -0.4, 0.2, 0.6];
+    let current_v = [1.5, -0.5, 0.25, 2.0];
+    let compact_k = (0..2 * PAST * 2)
+        .map(|index| index as f32 * 0.03 - 0.2)
+        .collect::<Vec<_>>();
+    let compact_v = (0..2 * PAST * 2)
+        .map(|index| index as f32 * -0.02 + 0.4)
+        .collect::<Vec<_>>();
+    let mut capacity_k = vec![0.0; 2 * CAPACITY * 2];
+    let mut capacity_v = vec![0.0; 2 * CAPACITY * 2];
+    for head in 0..2 {
+        for position in 0..PAST {
+            for dim in 0..2 {
+                let compact = (head * PAST + position) * 2 + dim;
+                let capacity = (head * CAPACITY + position) * 2 + dim;
+                capacity_k[capacity] = compact_k[compact];
+                capacity_v[capacity] = compact_v[compact];
+            }
+        }
+    }
+
+    let exact = run_available(run(
+        &ep,
+        &attrs(&[]),
+        &base_inputs(
+            &[1, 1, 8],
+            &q,
+            &[1, 1, 4],
+            &current_k,
+            &current_v,
+            Some((&[1, 2, PAST, 2], &compact_k)),
+            Some((&[1, 2, PAST, 2], &compact_v)),
+            &[(VALID - 1) as i32],
+            VALID as i32,
+        ),
+        &[vec![1, 1, 8]],
+    ))
+    .unwrap();
+    let fixed = run_available(run(
+        &ep,
+        &attrs(&[]),
+        &base_inputs(
+            &[1, 1, 8],
+            &q,
+            &[1, 1, 4],
+            &current_k,
+            &current_v,
+            Some((&[1, 2, CAPACITY, 2], &capacity_k)),
+            Some((&[1, 2, CAPACITY, 2], &capacity_v)),
+            &[(VALID - 1) as i32],
+            CAPACITY as i32,
+        ),
+        &[vec![1, 1, 8]],
+    ))
+    .unwrap();
+    close(&fixed[0], &exact[0]);
 }
 
 #[test]

@@ -27,7 +27,7 @@ pub use onnx_runtime_loader::{
 };
 pub use error::SessionError;
 pub use executor::{CacheStats, ControlFlowStats};
-pub use tensor::{Tensor, cpu_allocator};
+pub use tensor::{DeviceBindingTransferStats, DeviceIoBinding, Tensor, cpu_allocator};
 
 mod epcontext;
 mod executor;
@@ -758,6 +758,39 @@ impl InferenceSession {
         self.exec.run(inputs)
     }
 
+    /// Run with persistent device allocations supplying graph inputs and,
+    /// optionally, aliasing graph outputs. Bound outputs are returned as `None`
+    /// because their bytes remain resident in the caller-owned allocation.
+    pub fn run_with_device_bindings(
+        &mut self,
+        inputs: &[(&str, &Tensor)],
+        bindings: &mut [DeviceIoBinding],
+    ) -> Result<Vec<Option<Tensor>>> {
+        self.exec.run_with_device_bindings(inputs, bindings)
+    }
+
+    /// Allocate a persistent buffer on this session's execution device.
+    pub fn allocate_device_binding(
+        &self,
+        input_name: impl Into<String>,
+        output_name: Option<impl Into<String>>,
+        dtype: DataType,
+        physical_shape: Vec<usize>,
+        logical_shape: Vec<usize>,
+    ) -> Result<DeviceIoBinding> {
+        self.exec.allocate_device_binding(
+            input_name.into(),
+            output_name.map(Into::into),
+            dtype,
+            physical_shape,
+            logical_shape,
+        )
+    }
+
+    pub fn device_id(&self) -> onnx_runtime_ir::DeviceId {
+        self.exec.device_id()
+    }
+
     /// Input metadata.
     pub fn inputs(&self) -> &[IoMeta] {
         &self.inputs
@@ -859,6 +892,68 @@ impl InferenceSession {
 /// This is the primary entry point — no configuration required.
 pub fn load(path: impl AsRef<Path>) -> Result<InferenceSession> {
     InferenceSession::load(path)
+}
+
+#[cfg(test)]
+mod device_binding_tests {
+    use super::*;
+    use onnx_runtime_ir::{Graph, Node, NodeId, static_shape};
+
+    #[test]
+    fn persistent_binding_aliases_input_output_and_suppresses_materialization() {
+        let mut graph = Graph::new();
+        graph.opset_imports.insert("".into(), 13);
+        let input = graph.create_named_value("input", DataType::Float32, static_shape([4]));
+        graph.add_input(input);
+        let output = graph.create_named_value("output", DataType::Float32, static_shape([4]));
+        graph.insert_node(Node::new(
+            NodeId(0),
+            "Relu",
+            vec![Some(input)],
+            vec![output],
+        ));
+        graph.add_output(output);
+        let mut session = InferenceSession::from_graph(graph).unwrap();
+        let mut binding = session
+            .allocate_device_binding(
+                "input",
+                Some("output"),
+                DataType::Float32,
+                vec![4],
+                vec![2],
+            )
+            .unwrap();
+        let ptr = binding.device_ptr();
+        let bytes = [-2.0f32, 3.0, -4.0, 5.0]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect::<Vec<_>>();
+        binding.write_bytes(0, &bytes).unwrap();
+
+        let outputs = session
+            .run_with_device_bindings(&[], std::slice::from_mut(&mut binding))
+            .unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert!(outputs[0].is_none());
+        assert_eq!(binding.device_ptr(), ptr);
+        assert_eq!(binding.logical_shape(), &[2]);
+        let values = binding
+            .read_bytes()
+            .unwrap()
+            .chunks_exact(4)
+            .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(values, vec![0.0, 3.0, 0.0, 5.0]);
+        assert_eq!(
+            binding.transfer_stats(),
+            DeviceBindingTransferStats {
+                host_upload_calls: 1,
+                host_upload_bytes: 16,
+                host_download_calls: 1,
+                host_download_bytes: 16,
+            }
+        );
+    }
 }
 
 #[cfg(test)]

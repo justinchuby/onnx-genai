@@ -6,8 +6,10 @@ use crate::decode_loop::{DecodeLoopBackend, DecodeLoopState, run_decode_loop};
 use crate::logits::{ProcessorChain, TokenId};
 use anyhow::{Context, bail};
 use onnx_genai_ort::Tokenizer;
-use onnx_runtime_ir::{DataType, Dim};
-use onnx_runtime_session::{DevicePreference, InferenceSession, Tensor};
+use onnx_runtime_ir::{DataType, DeviceType, Dim};
+use onnx_runtime_session::{
+    DeviceBindingTransferStats, DeviceIoBinding, DevicePreference, InferenceSession, Tensor,
+};
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -21,6 +23,22 @@ pub enum NativeDecodeDevice {
     },
 }
 
+const DEFAULT_CUDA_KV_MAX_LEN: usize = 4096;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CudaKvDebugStats {
+    pub logical_len: usize,
+    pub max_len: usize,
+    pub device_ptrs: Vec<usize>,
+    pub kv_transfers: DeviceBindingTransferStats,
+}
+
+struct DecodeCudaState {
+    logical_len: usize,
+    max_len: usize,
+    bindings: Vec<DeviceIoBinding>,
+}
+
 /// Stateful decoder-with-past adapter over the pure-Rust native runtime.
 pub struct NativeDecodeSession {
     session: InferenceSession,
@@ -31,12 +49,23 @@ pub struct NativeDecodeSession {
     kv_inputs: Vec<String>,
     present_to_past: HashMap<String, String>,
     past: HashMap<String, Tensor>,
+    cuda: Option<DecodeCudaState>,
     current_len: usize,
 }
 
 impl NativeDecodeSession {
     /// Load a decoder-with-past ONNX model on the requested native device.
     pub fn load(path: impl AsRef<Path>, device: NativeDecodeDevice) -> anyhow::Result<Self> {
+        Self::load_with_cuda_kv_max_len(path, device, None)
+    }
+
+    /// Load with an explicit CUDA KV capacity. `None` uses
+    /// `ONNX_GENAI_CUDA_KV_MAX_LEN`, then the 4096-token default.
+    pub fn load_with_cuda_kv_max_len(
+        path: impl AsRef<Path>,
+        device: NativeDecodeDevice,
+        cuda_kv_max_len: Option<usize>,
+    ) -> anyhow::Result<Self> {
         let preference = match device {
             NativeDecodeDevice::Cpu => DevicePreference::Cpu,
             NativeDecodeDevice::Cuda { index } => DevicePreference::Gpu { index },
@@ -46,11 +75,18 @@ impl NativeDecodeSession {
             .device(preference)
             .build()
             .context("load native decoder model")?;
-        Self::from_session(session)
+        Self::from_session_with_cuda_kv_max_len(session, cuda_kv_max_len)
     }
 
     /// Wrap an already-built native session, validating its decoder-with-past I/O.
     pub fn from_session(session: InferenceSession) -> anyhow::Result<Self> {
+        Self::from_session_with_cuda_kv_max_len(session, None)
+    }
+
+    fn from_session_with_cuda_kv_max_len(
+        mut session: InferenceSession,
+        cuda_kv_max_len: Option<usize>,
+    ) -> anyhow::Result<Self> {
         let input_names = session
             .inputs()
             .iter()
@@ -105,6 +141,22 @@ impl NativeDecodeSession {
             );
         }
 
+        let cuda = if session.device_id().device_type == DeviceType::Cuda {
+            let max_len = match cuda_kv_max_len {
+                Some(0) => bail!("CUDA KV max length must be greater than zero"),
+                Some(value) => value,
+                None => cuda_kv_max_len_from_env()?,
+            };
+            Some(DecodeCudaState::new(
+                &mut session,
+                &attention_mask,
+                &present_to_past,
+                max_len,
+            )?)
+        } else {
+            None
+        };
+
         Ok(Self {
             session,
             input_ids,
@@ -114,6 +166,7 @@ impl NativeDecodeSession {
             kv_inputs,
             present_to_past,
             past: HashMap::new(),
+            cuda,
             current_len: 0,
         })
     }
@@ -124,6 +177,10 @@ impl NativeDecodeSession {
 
     pub fn kv_layer_count(&self) -> usize {
         self.kv_inputs.len() / 2
+    }
+
+    pub fn cuda_kv_debug_stats(&self) -> Option<CudaKvDebugStats> {
+        self.cuda.as_ref().map(DecodeCudaState::debug_stats)
     }
 
     pub fn decode(
@@ -209,11 +266,237 @@ impl NativeDecodeSession {
         Tensor::from_raw(meta.dtype, shape, &vec![0; bytes])
             .with_context(|| format!("create empty native KV tensor '{name}'"))
     }
+
+    fn decode_cuda(
+        &mut self,
+        token_ids: &[TokenId],
+        past_len: usize,
+    ) -> anyhow::Result<Vec<Vec<f32>>> {
+        let total_len = past_len
+            .checked_add(token_ids.len())
+            .context("native decode context length overflow")?;
+        let state = self
+            .cuda
+            .as_mut()
+            .context("CUDA decode state is not initialized")?;
+        if total_len > state.max_len {
+            bail!(
+                "CUDA KV capacity exceeded: requested context length {total_len}, configured max_len {} (set ONNX_GENAI_CUDA_KV_MAX_LEN or use load_with_cuda_kv_max_len)",
+                state.max_len
+            );
+        }
+        state.extend_mask(past_len, total_len)?;
+
+        let ids = token_ids
+            .iter()
+            .map(|&id| i64::from(id))
+            .collect::<Vec<_>>();
+        let input_ids = Tensor::from_i64(&[1, token_ids.len()], &ids)?;
+        let mut owned = Vec::with_capacity(2);
+        owned.push((self.input_ids.clone(), input_ids));
+        if let Some(position_ids_name) = &self.position_ids {
+            let positions = (past_len..total_len)
+                .map(|position| i64::try_from(position).context("position id exceeds i64 range"))
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            owned.push((
+                position_ids_name.clone(),
+                Tensor::from_i64(&[1, token_ids.len()], &positions)?,
+            ));
+        }
+        let bindings = owned
+            .iter()
+            .map(|(name, tensor)| (name.as_str(), tensor))
+            .collect::<Vec<_>>();
+        let outputs = match self
+            .session
+            .run_with_device_bindings(&bindings, &mut state.bindings)
+        {
+            Ok(outputs) => outputs,
+            Err(error) => {
+                let diagnosis = diagnose_native_failure(&self.session, &error.to_string());
+                bail!("native CUDA decoder forward pass failed{diagnosis}: {error}");
+            }
+        };
+        let names = self
+            .session
+            .outputs()
+            .iter()
+            .map(|meta| meta.name.clone())
+            .collect::<Vec<_>>();
+        let mut named = names
+            .into_iter()
+            .zip(outputs)
+            .filter_map(|(name, tensor)| tensor.map(|tensor| (name, tensor)))
+            .collect::<HashMap<_, _>>();
+        let logits = named
+            .remove(&self.logits)
+            .with_context(|| format!("native decoder omitted logits output '{}'", self.logits))?;
+        if !named.is_empty() {
+            bail!(
+                "native CUDA decoder unexpectedly materialized bound outputs: {:?}",
+                named.keys().collect::<Vec<_>>()
+            );
+        }
+        let logits = extract_logits(&logits)?;
+        if logits.iter().flatten().any(|value| !value.is_finite()) {
+            bail!("native decoder produced non-finite logits");
+        }
+        state.set_logical_len(total_len)?;
+        self.current_len = total_len;
+        Ok(logits)
+    }
+}
+
+impl DecodeCudaState {
+    fn new(
+        session: &mut InferenceSession,
+        attention_mask: &str,
+        present_to_past: &HashMap<String, String>,
+        max_len: usize,
+    ) -> anyhow::Result<Self> {
+        let mut mask = session.allocate_device_binding(
+            attention_mask,
+            None::<String>,
+            DataType::Int64,
+            vec![1, max_len],
+            vec![1, 0],
+        )?;
+        mask.write_bytes(0, &vec![0; max_len * std::mem::size_of::<i64>()])?;
+
+        let mut pairs = present_to_past
+            .iter()
+            .map(|(present, past)| (present.clone(), past.clone()))
+            .collect::<Vec<_>>();
+        pairs.sort_unstable_by(|left, right| left.1.cmp(&right.1));
+        let mut bindings = Vec::with_capacity(1 + pairs.len());
+        bindings.push(mask);
+        for (present, past) in pairs {
+            let meta = session
+                .inputs()
+                .iter()
+                .find(|meta| meta.name == past)
+                .with_context(|| format!("missing CUDA KV input metadata for '{past}'"))?;
+            if meta.dtype != DataType::Float32 || meta.shape.len() != 4 {
+                bail!(
+                    "CUDA KV input '{past}' must be rank-4 f32, got {:?} {:?}",
+                    meta.dtype,
+                    meta.shape
+                );
+            }
+            let mut physical_shape = Vec::with_capacity(4);
+            for (axis, dim) in meta.shape.iter().copied().enumerate() {
+                let value = if axis == 0 {
+                    1
+                } else if axis == 2 {
+                    max_len
+                } else if let Dim::Static(value) = dim {
+                    value
+                } else {
+                    bail!(
+                        "cannot infer CUDA KV dimension {axis} for '{past}' shape {:?}",
+                        meta.shape
+                    );
+                };
+                physical_shape.push(value);
+            }
+            let mut logical_shape = physical_shape.clone();
+            logical_shape[2] = 0;
+            bindings.push(session.allocate_device_binding(
+                past,
+                Some(present),
+                meta.dtype,
+                physical_shape,
+                logical_shape,
+            )?);
+        }
+        Ok(Self {
+            logical_len: 0,
+            max_len,
+            bindings,
+        })
+    }
+
+    fn extend_mask(&mut self, start: usize, end: usize) -> anyhow::Result<()> {
+        if end > self.max_len || start > end {
+            bail!(
+                "invalid CUDA mask update {start}..{end} for capacity {}",
+                self.max_len
+            );
+        }
+        let ones = (start..end)
+            .flat_map(|_| 1i64.to_le_bytes())
+            .collect::<Vec<_>>();
+        self.bindings[0].write_bytes(start * std::mem::size_of::<i64>(), &ones)?;
+        self.bindings[0].set_logical_shape(vec![1, end])?;
+        Ok(())
+    }
+
+    fn set_logical_len(&mut self, len: usize) -> anyhow::Result<()> {
+        for binding in self.bindings.iter_mut().skip(1) {
+            let mut shape = binding.physical_shape().to_vec();
+            shape[2] = len;
+            binding.set_logical_shape(shape)?;
+        }
+        self.logical_len = len;
+        Ok(())
+    }
+
+    fn rewind(&mut self, target_len: usize) -> anyhow::Result<()> {
+        if target_len < self.logical_len {
+            let zeros = vec![0u8; (self.logical_len - target_len) * std::mem::size_of::<i64>()];
+            self.bindings[0].write_bytes(target_len * std::mem::size_of::<i64>(), &zeros)?;
+        }
+        self.bindings[0].set_logical_shape(vec![1, target_len])?;
+        self.set_logical_len(target_len)
+    }
+
+    fn debug_stats(&self) -> CudaKvDebugStats {
+        let mut transfers = DeviceBindingTransferStats::default();
+        let device_ptrs = self
+            .bindings
+            .iter()
+            .skip(1)
+            .map(|binding| {
+                let stats = binding.transfer_stats();
+                transfers.host_upload_calls += stats.host_upload_calls;
+                transfers.host_upload_bytes += stats.host_upload_bytes;
+                transfers.host_download_calls += stats.host_download_calls;
+                transfers.host_download_bytes += stats.host_download_bytes;
+                binding.device_ptr() as usize
+            })
+            .collect();
+        CudaKvDebugStats {
+            logical_len: self.logical_len,
+            max_len: self.max_len,
+            device_ptrs,
+            kv_transfers: transfers,
+        }
+    }
+}
+
+fn cuda_kv_max_len_from_env() -> anyhow::Result<usize> {
+    match std::env::var("ONNX_GENAI_CUDA_KV_MAX_LEN") {
+        Ok(value) => {
+            let parsed = value.trim().parse::<usize>().with_context(|| {
+                format!("invalid ONNX_GENAI_CUDA_KV_MAX_LEN={value:?}: expected a positive integer")
+            })?;
+            if parsed == 0 {
+                bail!("ONNX_GENAI_CUDA_KV_MAX_LEN must be greater than zero");
+            }
+            Ok(parsed)
+        }
+        Err(std::env::VarError::NotPresent) => Ok(DEFAULT_CUDA_KV_MAX_LEN),
+        Err(error) => Err(error).context("read ONNX_GENAI_CUDA_KV_MAX_LEN"),
+    }
 }
 
 impl DecodeBackend for NativeDecodeSession {
     fn current_len(&self) -> usize {
         self.current_len
+    }
+
+    fn max_context(&self) -> Option<usize> {
+        self.cuda.as_ref().map(|state| state.max_len)
     }
 
     fn decode(&mut self, token_ids: &[TokenId], past_len: usize) -> anyhow::Result<Vec<Vec<f32>>> {
@@ -225,6 +508,9 @@ impl DecodeBackend for NativeDecodeSession {
                 "native decode past length mismatch: caller supplied {past_len}, adapter holds {}",
                 self.current_len
             );
+        }
+        if self.cuda.is_some() {
+            return self.decode_cuda(token_ids, past_len);
         }
         let total_len = past_len
             .checked_add(token_ids.len())
@@ -309,6 +595,11 @@ impl DecodeBackend for NativeDecodeSession {
             );
         }
         if target_len == self.current_len {
+            return Ok(());
+        }
+        if let Some(state) = &mut self.cuda {
+            state.rewind(target_len)?;
+            self.current_len = target_len;
             return Ok(());
         }
         if target_len == 0 {
@@ -690,11 +981,13 @@ mod tests {
         }
         let tokenizer = Tokenizer::from_file(model_dir.join("tokenizer.json"))?;
         let prompt = tokenizer.encode("Hello")?;
-        let mut options = GenerateOptions::default();
-        options.max_new_tokens = 8;
-        options.temperature = 0.0;
-        options.greedy = true;
-        options.stop_on_eos = false;
+        let options = GenerateOptions {
+            max_new_tokens: 16,
+            temperature: 0.0,
+            greedy: true,
+            stop_on_eos: false,
+            ..GenerateOptions::default()
+        };
 
         let mut cpu =
             NativeDecodeSession::load(model_dir.join("model.onnx"), NativeDecodeDevice::Cpu)?;
@@ -702,16 +995,48 @@ mod tests {
             .generate(&prompt, &options, &ProcessorChain::new(), &tokenizer)?
             .token_ids;
 
-        let mut cuda = NativeDecodeSession::load(
+        let mut cuda = NativeDecodeSession::load_with_cuda_kv_max_len(
             model_dir.join("model.onnx"),
             NativeDecodeDevice::Cuda { index: Some(0) },
+            Some(128),
         )?;
+        let before = cuda
+            .cuda_kv_debug_stats()
+            .context("CUDA session must expose device KV stats")?;
+        assert_eq!(before.device_ptrs.len(), 48);
+        assert!(before.device_ptrs.iter().all(|&ptr| ptr != 0));
+        assert_eq!(before.kv_transfers, DeviceBindingTransferStats::default());
         let cuda_tokens = cuda
             .generate(&prompt, &options, &ProcessorChain::new(), &tokenizer)?
             .token_ids;
+        let after = cuda
+            .cuda_kv_debug_stats()
+            .context("CUDA session must retain device KV stats")?;
 
-        assert_eq!(cuda_tokens, cpu_tokens);
-        assert_eq!(cpu_tokens.len(), 8);
+        assert_eq!(cpu_tokens.len(), 16);
+        assert_eq!(cuda_tokens.len(), cpu_tokens.len());
+        // M2's CUDA numerics diverge from the CPU oracle after token 10 for this
+        // prompt; M3 must preserve (not shorten) the established parity window.
+        assert_eq!(&cuda_tokens[..10], &cpu_tokens[..10]);
+        assert_eq!(
+            &cpu_tokens[..8],
+            &[11576, 42740, 11, 358, 614, 264, 3405, 911]
+        );
+        assert_eq!(after.device_ptrs, before.device_ptrs);
+        assert_eq!(after.kv_transfers, DeviceBindingTransferStats::default());
+        assert!(after.logical_len > 8);
+
+        cuda.rewind(after.logical_len - 2)?;
+        let rewound = cuda.cuda_kv_debug_stats().unwrap();
+        assert_eq!(rewound.logical_len, after.logical_len - 2);
+        assert_eq!(rewound.device_ptrs, before.device_ptrs);
+        assert_eq!(rewound.kv_transfers, DeviceBindingTransferStats::default());
+
+        cuda.reset()?;
+        let error = cuda
+            .decode(&vec![0; 129], 0)
+            .expect_err("decode beyond configured KV capacity must fail");
+        assert!(error.to_string().contains("CUDA KV capacity exceeded"));
         Ok(())
     }
 
