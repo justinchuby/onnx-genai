@@ -3168,6 +3168,57 @@ mod tests {
         assert_eq!(graph.opset_imports["com.microsoft"], 1);
     }
 
+    #[test]
+    fn does_not_fuse_silu_when_sigmoid_has_second_consumer() {
+        let mut graph = Graph::new();
+        let shape = vec![Dim::Static(2)];
+        let x = graph.create_named_value("x", DataType::Float32, shape.clone());
+        let sigmoid_out = graph.create_named_value("sigmoid", DataType::Float32, shape.clone());
+        let mul_out = graph.create_named_value("mul", DataType::Float32, shape.clone());
+        let identity_out = graph.create_named_value("identity", DataType::Float32, shape);
+        graph.add_input(x);
+        graph.add_output(mul_out);
+        graph.add_output(identity_out);
+        graph.insert_node(Node::new(
+            NodeId(0),
+            "Sigmoid",
+            vec![Some(x)],
+            vec![sigmoid_out],
+        ));
+        graph.insert_node(Node::new(
+            NodeId(0),
+            "Mul",
+            vec![Some(x), Some(sigmoid_out)],
+            vec![mul_out],
+        ));
+        graph.insert_node(Node::new(
+            NodeId(0),
+            "Identity",
+            vec![Some(sigmoid_out)],
+            vec![identity_out],
+        ));
+
+        assert_eq!(fuse_silu_patterns(&mut graph), 0);
+        assert_eq!(graph.num_nodes(), 3);
+        assert_eq!(
+            graph
+                .nodes
+                .values()
+                .filter(|node| node.op_type == "Sigmoid")
+                .count(),
+            1
+        );
+        assert_eq!(
+            graph
+                .nodes
+                .values()
+                .filter(|node| node.op_type == "Mul")
+                .count(),
+            1
+        );
+        assert!(graph.validate().is_ok());
+    }
+
     /// Holden's precondition: the dispatch-boundary gate must reject a view that
     /// addresses bytes past its backing allocation, rather than letting a kernel
     /// dereference out of bounds (UB).
