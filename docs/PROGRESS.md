@@ -4,7 +4,7 @@ Tracks implementation status of `docs/DESIGN.md` (§1–§40). Updated as work l
 
 **Published:** `onnx-genai` v0.1.0 + 8 sub-crates on crates.io; the `onnx-runtime-*` layer (including `onnx-runtime-tracer`) is released as v0.1.0-dev.1. CI (fmt/build/test/**blocking clippy**) + scheduled `cargo-audit`. Coverage ~77% line.
 
-_Last updated: 2026-07-15 — includes the Design → Implementation Gap Analysis and the latest ORT2 CPU, scheduler, CUDA, Sequence, packaging, and CI landings (see below)._
+_Last updated: 2026-07-16 — includes the latest CUDA parity, native int4 decode, ONNX-RS serde, and model-package landings (see below)._
 
 
 ## Current tiered-memory and interoperability milestones
@@ -297,8 +297,12 @@ Scoped the "export Gemma4 E2B/12B via Mobius and smoke-test through onnx-genai" 
 - **Native genai-builder compatibility ✅ (`04709a4`, Coco; Pris 🟢):** Standard `SimplifiedLayerNormalization` and packed-QKV GQA exports run unmodified on native CPU.
 - **CUDA SkipSimplifiedLayerNormalization ✅ (`0284999`, Freysa; Sapper count fix; Rachael 🟢):** Gemma4-e2b's full required op set is now supported on both CPU and CUDA; CUDA advertises **61** unique op names with an exact-count test.
 - **Native MatMulNBits fast path ✅ (`3787c21`, Wallace; Deckard M=1 tests; Holden 🔴→🟢):** Native int4 decode improved **0.19 → 0.50 tok/s**, about **16×** cumulatively over fp32 Gemma.
+- **CUDA Gather / Shape / Constant + capture gate ✅ (`c4f91a5`, Roy; Sebastian/Deckard; Pris 🔴×3→resolved):** Added the three kernels and an honest `subgraph_graph_capturable` eligibility gate; CUDA coverage **62 → 65**. Gather is deliberately non-capturable because its deterministic bounds validation synchronizes with the host.
+- **ONNX-RS unified string serde ✅ (`fc4fa66`, Batty; Freysa 🟡):** Added `TextCodec` with `Text`/`Json`/`TextProto` markers, renamed text APIs to `to_text`/`to_text_with`/`from_text`, and ported five upstream text-format tests.
+- **Model-package design ✅ (`3219673` + `dafda35`, Nabil; Fact Checker 🟢):** `docs/MODEL_PACKAGE.md` adopts ORT schema 1.x with EPContext compiled variants, an optional `.nxpkg` envelope, `FormatRegistry` integration, and a phased rollout; §10 open questions await owner review.
+- **Native MatMulNBits threading ✅ (`96c1396`, Zhora; Sebastian fix; Holden 🟡):** Rayon partitions output columns with thread-count-aware gating. Decode benchmarks improved **+27% / +14% / +22%** at 24 / 48 / 96 threads without low-core regression; all 121 decode MatMulNBits nodes are now threaded where profitable.
 
-**Native int4 perf ladder:** fp32 Gemma **0.03 tok/s** → unoptimized int4 **0.21 tok/s** → optimized int4 **0.50 tok/s**. CPU and CUDA now both cover Gemma4-e2b's full required operator set; this is functional parity, not throughput parity.
+**Native int4 perf ladder:** fp32 Gemma **0.03 tok/s** → unoptimized int4 **0.21 tok/s** → optimized/prepacked int4 **0.50 tok/s**; the ladder continues with MatMulNBits now threaded. CPU and CUDA now both cover Gemma4-e2b's full required operator set; this is functional parity, not throughput parity.
 
 **Remaining performance work:** native decode remains behind llama.cpp/vLLM. Next levers are int8 SDOT via `accuracy_level=4`, removing per-node executor overhead, and serving work for continuous batching plus paged KV.
 

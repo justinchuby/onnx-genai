@@ -45,3 +45,6 @@ Sebastian's perf review is now in decisions. §26 should prioritize active-row c
 ## 2026-07-15T00:00:00Z — Cross-agent session update
 
 - Validated non-empty IR>=3 opset imports while preserving custom-only models; merged in the loader legality stack.
+
+### 2026-07-16T00:00:00Z — Performance-and-design wave
+Marked Gather non-capturable and fixed thread-count-aware MatMulNBits partitioning.

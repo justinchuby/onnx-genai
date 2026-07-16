@@ -92,3 +92,6 @@ Reviewed Fido's `cbourjau/onnx-tests` nxrt adapter and reproduction docs 🟡. T
 ## 2026-07-15T00:00:00Z — Cross-agent session update
 
 - Consolidated DLPack import hardening and Sum/Mean/LogSoftmax/CastLike coverage; merged in the July 15 DLPack and coverage waves.
+
+### 2026-07-16T00:00:00Z — Performance-and-design wave
+Added Rayon N-range partitioning for native CPU MatMulNBits.

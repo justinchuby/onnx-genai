@@ -6,3 +6,6 @@ Hired as a Metal/MPS kernel engineer for the new Apple Metal EP for ONNX Runtime
 - 2026-07-14T19:05:00Z — Tracer AutoDiagnosis and roofline module merged in `8607687`; Hodge review GREEN. Follow-up decision requires first-class missed-fast-path diagnosis from executor selection metadata.
 
 - 2026-07-15 — Bundled oneDNN in Linux and macOS Python wheels (merged `ef89a95`).
+
+### 2026-07-16T00:00:00Z — Performance-and-design wave
+Applied CUDA coverage documentation correction for the merged kernel slice.

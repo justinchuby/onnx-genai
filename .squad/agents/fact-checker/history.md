@@ -18,3 +18,6 @@
 ## 2026-07-15T01:52:00Z — Session update
 
 - Fact-checked KV insertion: ORT GQA shared-buffer is sanctioned, standard ONNX Attention now has cache semantics, and HF calls cache.update() inside attention.
+
+### 2026-07-16T00:00:00Z — Performance-and-design wave
+Verified model-package external claims; corrections were applied.

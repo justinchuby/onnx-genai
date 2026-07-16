@@ -26,3 +26,6 @@ Rejected the original crate-reservation runbook due to a publication cycle; Deck
 ## 2026-07-15T00:00:00Z — Cross-agent session update
 
 - Hardened CUDA DLPack commit validation to compare raw device identity; GPU review findings are incorporated in the final DLPack wave.
+
+### 2026-07-16T00:00:00Z — Performance-and-design wave
+Authored CUDA Gather, Shape, and Constant kernels; coverage reached 65.

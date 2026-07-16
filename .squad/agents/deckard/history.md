@@ -96,3 +96,6 @@ Reviewed Joshi's CPU Identity String rejection and bf16/f16/i32 bit-exact covera
 ## 2026-07-15T00:00:00Z — Cross-agent session update
 
 - Revised loader validation/inliner behavior and LLM-op shape/kernel fixes; merged across the validation and standard-ops workstreams.
+
+### 2026-07-16T00:00:00Z — Performance-and-design wave
+Wired `subgraph_graph_capturable` as the centralized capture-eligibility consumer.

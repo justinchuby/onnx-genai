@@ -22,3 +22,6 @@ Unified validation behind `validate_model()` across disk/bytes and session load 
 
 ### Reviewer lockouts and follow-ups
 Batty is locked out of revising: H-D1 storage sizing, fusion follow-ups identified on earlier optimizer reviews, EPContext writer after v1 rejection, and other artifacts explicitly reassigned by reviewers. Preserve reviewer-protocol ownership when addressing advisories.
+
+### 2026-07-16T00:00:00Z — Performance-and-design wave
+Unified text codecs around TextCodec and renamed the text APIs.

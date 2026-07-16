@@ -62,3 +62,6 @@ Advanced fixture work is canonical: builders use onnxscript/onnx-ir, `tiny-mtp-f
 ## 2026-07-15T00:00:00Z — Cross-agent session update
 
 - Hardened the Range Float32 parity regression test; included in the opset-coverage consolidation.
+
+### 2026-07-16T00:00:00Z — Performance-and-design wave
+Reviewed Gather/Shape/Constant through three resolved rejection cycles.

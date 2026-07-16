@@ -8,3 +8,6 @@ Hired as MPS Perf & Testing engineer for the new Apple Metal EP for ONNX Runtime
 ## 2026-07-15T00:00:00Z — Cross-agent session update
 
 - Added missing C1 shape handlers and initial DLPack import support; both were consolidated in the July 15 coverage/interoperability work.
+
+### 2026-07-16T00:00:00Z — Performance-and-design wave
+Reviewed the unified string-serde surface as approve-with-notes.
