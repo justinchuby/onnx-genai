@@ -51,6 +51,7 @@
 #![forbid(unsafe_code)]
 
 pub mod check;
+mod codec;
 mod error;
 pub mod json;
 mod model;
@@ -70,12 +71,13 @@ pub use onnx_runtime_ir as ir;
 pub use onnx_runtime_loader::{ModelMetadata, WeightStore};
 
 pub use check::{OnnxChecker, Severity, ValidationResult, ValidationRule, Violation};
+pub use codec::{Json, Text, TextCodec, TextProto};
 pub use schema::{
     AttributeDefault, AttributeSpec, AttributeType, InputSpec, OpSchema, OutputSpec, SchemaError,
     SchemaRegistry, TypeConstraint,
 };
 pub use shape::{ShapeError, ShapeInferenceResult, infer_shapes};
-pub use text::{PrintOptions, parse_model};
+pub use text::{PrintOptions, from_text, to_text, to_text_with};
 pub use version::{
     AdaptResult, ConvertError, ConvertReport, IncompatibleOp, OpAdapter, VersionConverter,
 };

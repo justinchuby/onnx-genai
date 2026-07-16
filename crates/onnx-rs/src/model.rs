@@ -76,17 +76,17 @@ impl Model {
 
     /// Render this model as a human-readable textual dump (ONNX_RS §5).
     pub fn to_text(&self) -> String {
-        text::print(self)
+        text::to_text(self)
     }
 
     /// Render this model as text with explicit [`PrintOptions`] (ONNX_RS §5.4).
     pub fn to_text_with(&self, opts: &PrintOptions) -> String {
-        text::print_with(self, opts)
+        text::to_text_with(self, opts)
     }
 
     /// Parse a model previously rendered in the textual format (ONNX_RS §5.4).
     pub fn from_text(source: &str) -> Result<Self> {
-        text::parse_model(source)
+        text::from_text(source)
     }
 
     /// Validate this model with the default [`OnnxChecker`] (ONNX_RS §8).

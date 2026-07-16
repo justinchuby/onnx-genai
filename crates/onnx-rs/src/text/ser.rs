@@ -7,7 +7,7 @@
 //!   ir_version: 10,
 //!   opset_import: ["" : 21]
 //! >
-//! main (float32[2, 3] X, float32[2, 3] Y) => (float32[2, 3] Z) {
+//! main (float[2, 3] X, float[2, 3] Y) => (float[2, 3] Z) {
 //!   Z = Add(X, Y)
 //! }
 //! ```
@@ -46,12 +46,12 @@ impl Default for PrintOptions {
 }
 
 /// Print `model` as text using default [`PrintOptions`].
-pub fn print(model: &Model) -> String {
-    print_with(model, &PrintOptions::default())
+pub fn to_text(model: &Model) -> String {
+    to_text_with(model, &PrintOptions::default())
 }
 
 /// Print `model` as text with explicit options.
-pub fn print_with(model: &Model, opts: &PrintOptions) -> String {
+pub fn to_text_with(model: &Model, opts: &PrintOptions) -> String {
     let mut out = String::new();
     let meta = &model.metadata;
 
@@ -256,6 +256,16 @@ fn dim_string(dim: Dim, graph: &Graph) -> String {
             .symbol_constraints
             .get(&sid)
             .and_then(|c| c.name.clone())
+            .map(|name| {
+                if name
+                    .chars()
+                    .all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+                {
+                    name
+                } else {
+                    format!("{name:?}")
+                }
+            })
             .unwrap_or_else(|| format!("s{}", sid.0)),
     }
 }
@@ -329,7 +339,7 @@ fn attr_value(attr: &Attribute) -> String {
 /// ONNX textual dtype spellings.
 fn dtype_name(dtype: DataType) -> &'static str {
     match dtype {
-        DataType::Float32 => "float32",
+        DataType::Float32 => "float",
         DataType::Uint8 => "uint8",
         DataType::Int8 => "int8",
         DataType::Uint16 => "uint16",
@@ -376,11 +386,11 @@ mod tests {
 
     #[test]
     fn dumps_header_signature_and_node() {
-        let text = print(&add_model());
+        let text = to_text(&add_model());
         assert!(text.contains("ir_version: 10"), "header:\n{text}");
         assert!(text.contains("opset_import: [\"\" : 21]"), "opset:\n{text}");
         assert!(
-            text.contains("main (float32[2, 3] X, float32[2, 3] Y) => (float32[2, 3] Z)"),
+            text.contains("main (float[2, 3] X, float[2, 3] Y) => (float[2, 3] Z)"),
             "signature:\n{text}"
         );
         assert!(text.contains("Z = Add(X, Y)"), "node:\n{text}");
@@ -398,7 +408,7 @@ mod tests {
             .insert("alpha".to_string(), Attribute::Float(0.1));
         g.insert_node(node);
         g.add_output(y);
-        let text = print(&Model::new(g));
+        let text = to_text(&Model::new(g));
         assert!(text.contains("Y = LeakyRelu <alpha = 0.1>(X)"), "{text}");
     }
 
@@ -409,10 +419,10 @@ mod tests {
         let w = g.create_named_value("W", DataType::Float32, static_shape([2]));
         let init = TensorData::from_raw(DataType::Float32, vec![2], vec![0u8; 8]);
         g.set_initializer(w, WeightRef::Inline(init));
-        let text = print(&Model::new(g));
+        let text = to_text(&Model::new(g));
         assert!(text.contains("// initializers"), "{text}");
         assert!(
-            text.contains("float32[2] W = <inline data omitted>"),
+            text.contains("float[2] W = <inline data omitted>"),
             "{text}"
         );
         // The raw bytes must never appear inline.
@@ -461,7 +471,7 @@ mod tests {
             .insert((node_id, "branches[1]".into()), second_case);
         graph.add_output(out);
 
-        let text = print(&Model::new(graph));
+        let text = to_text(&Model::new(graph));
         assert!(text.contains("then_branch = graph"), "{text}");
         assert!(text.contains("then_out = Relu(then_in)"), "{text}");
         assert!(text.contains("branches[0] = graph"), "{text}");

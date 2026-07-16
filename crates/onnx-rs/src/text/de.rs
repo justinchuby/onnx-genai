@@ -1,4 +1,4 @@
-//! Parser for the textual representation emitted by [`super::printer`].
+//! Parser for the textual representation emitted by [`super::ser`].
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -23,13 +23,13 @@ struct Parser<'a> {
     pos: usize,
 }
 
-/// Parse a model rendered by [`crate::text::print`].
+/// Parse a model rendered by [`crate::text::to_text`].
 ///
 /// Binary initializer and tensor-attribute payloads are not present in the
 /// textual format. They are reconstructed as zero-filled placeholders with the
 /// printed dtype and shape; external initializers retain their external kind
 /// but necessarily use an empty path and zero offset.
-pub fn parse_model(source: &str) -> Result<Model> {
+pub fn from_text(source: &str) -> Result<Model> {
     Parser::new(source).parse()
 }
 
@@ -87,6 +87,12 @@ impl<'a> Parser<'a> {
 
     fn parse_graph(&mut self) -> Result<(String, Graph)> {
         let signature = self.next()?;
+        if !signature.text.ends_with('{') {
+            let open = self.next()?;
+            if open.text != "{" {
+                return self.fail(open.number, "expected graph body '{'");
+            }
+        }
         let (name, inputs, outputs) = parse_signature(signature)?;
         let mut graph = Graph::new();
         let mut values = HashMap::new();
@@ -190,12 +196,6 @@ fn parse_signature(line: Line<'_>) -> Result<(String, Vec<TypedValue>, Vec<Typed
         .ok_or_else(|| parse_error(line.number, "graph signature is missing '=>'"))?;
     let left = line.text[..arrow].trim();
     let right = line.text[arrow + 2..].trim();
-    if !right.ends_with('{') {
-        return Err(parse_error(
-            line.number,
-            "graph signature must end with '{'",
-        ));
-    }
 
     let left_open = left
         .find('(')
@@ -203,7 +203,7 @@ fn parse_signature(line: Line<'_>) -> Result<(String, Vec<TypedValue>, Vec<Typed
     let left_close = left
         .rfind(')')
         .ok_or_else(|| parse_error(line.number, "graph inputs are not closed"))?;
-    let right = right[..right.len() - 1].trim();
+    let right = right.strip_suffix('{').unwrap_or(right).trim();
     let right_open = right
         .find('(')
         .ok_or_else(|| parse_error(line.number, "graph outputs are missing"))?;
@@ -257,10 +257,11 @@ fn parse_typed_value(text: &str, line: usize) -> Result<TypedValue> {
 fn create_typed_value(graph: &mut Graph, value: &TypedValue, line: usize) -> Result<ValueId> {
     let mut shape = Shape::new();
     for dim in &value.dims {
+        let dim = unquote(dim);
         match dim.parse::<usize>() {
             Ok(size) => shape.push(Dim::Static(size)),
             Err(_) if !dim.is_empty() => {
-                shape.push(Dim::Symbolic(graph.intern_symbol(dim)));
+                shape.push(Dim::Symbolic(graph.intern_symbol(&dim)));
             }
             Err(_) => return Err(parse_error(line, "empty dimension")),
         }
@@ -630,7 +631,7 @@ fn parse_static_dims(text: &str, line: usize) -> Result<Vec<usize>> {
 
 fn parse_dtype(text: &str, line: usize) -> Result<DataType> {
     let dtype = match text {
-        "float32" => DataType::Float32,
+        "float" | "float32" => DataType::Float32,
         "uint8" => DataType::Uint8,
         "int8" => DataType::Int8,
         "uint16" => DataType::Uint16,
@@ -654,6 +655,13 @@ fn parse_dtype(text: &str, line: usize) -> Result<DataType> {
         _ => return Err(parse_error(line, format!("unknown dtype '{text}'"))),
     };
     Ok(dtype)
+}
+
+fn unquote(text: &str) -> String {
+    text.strip_prefix('"')
+        .and_then(|text| text.strip_suffix('"'))
+        .unwrap_or(text)
+        .to_string()
 }
 
 fn parse_float(text: &str, line: usize) -> Result<f32> {
@@ -801,7 +809,7 @@ fn parse_error(line: usize, message: impl Into<String>) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::text::print;
+    use crate::text::to_text;
     use onnx_runtime_ir::{Node, static_shape};
 
     fn node_by_op<'a>(graph: &'a Graph, op: &str) -> &'a Node {
@@ -831,7 +839,7 @@ mod tests {
         };
         let model = Model::with_metadata(graph, metadata);
 
-        let parsed = parse_model(&print(&model)).unwrap();
+        let parsed = from_text(&to_text(&model)).unwrap();
         assert_eq!(parsed.metadata.ir_version, 9);
         assert_eq!(parsed.metadata.graph_name, "compute");
         assert_eq!(parsed.graph.opset_imports, model.graph.opset_imports);
@@ -876,7 +884,7 @@ mod tests {
         graph.insert_node(node);
         graph.add_output(y);
 
-        let parsed = parse_model(&print(&Model::new(graph))).unwrap();
+        let parsed = from_text(&to_text(&Model::new(graph))).unwrap();
         let node = node_by_op(&parsed.graph, "Decorated");
         assert!(matches!(node.attributes["axis"], Attribute::Int(-1)));
         assert!(matches!(node.attributes["alpha"], Attribute::Float(0.25)));
@@ -914,13 +922,13 @@ mod tests {
         graph.insert_node(node);
         graph.add_output(y);
 
-        let text = print(&Model::new(graph));
+        let text = to_text(&Model::new(graph));
         assert!(text.contains("ints = []:ints"), "{text}");
         assert!(text.contains("floats = []:floats"), "{text}");
         assert!(text.contains("strings = []:strings"), "{text}");
         assert!(text.contains("graphs = []:graphs"), "{text}");
 
-        let parsed = parse_model(&text).unwrap();
+        let parsed = from_text(&text).unwrap();
         let node = node_by_op(&parsed.graph, "EmptyLists");
         assert!(matches!(&node.attributes["ints"], Attribute::Ints(v) if v.is_empty()));
         assert!(matches!(&node.attributes["floats"], Attribute::Floats(v) if v.is_empty()));
@@ -977,7 +985,7 @@ mod tests {
             .insert((node_id, "cases[1]".into()), case_one);
         graph.add_output(out);
 
-        let parsed = parse_model(&print(&Model::new(graph))).unwrap();
+        let parsed = from_text(&to_text(&Model::new(graph))).unwrap();
         let if_node = node_by_op(&parsed.graph, "If");
         assert!(matches!(
             &if_node.attributes["then_branch"],
@@ -999,9 +1007,6 @@ mod tests {
     #[test]
     fn malformed_text_returns_error() {
         let malformed = "<\n  ir_version: nope,\n>\nmain () => () {\n";
-        assert!(matches!(
-            parse_model(malformed),
-            Err(Error::TextParse { .. })
-        ));
+        assert!(matches!(from_text(malformed), Err(Error::TextParse { .. })));
     }
 }

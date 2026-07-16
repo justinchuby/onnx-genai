@@ -434,27 +434,12 @@ Follow the exact design in the onnx repo.
 - **Comments:** `//` line comments
 - **Subgraphs:** Nested `graph` blocks for If/Loop/Scan body
 
-### 5.4 Implementation referece
+### 5.4 Implemented API
 
 ```rust
-pub struct OnnxTextFormat;
-
-impl OnnxTextFormat {
-    /// Parse .onnxtxt into Model.
-    pub fn parse(text: &str) -> Result<Model, ParseError>;
-
-    /// Parse from file.
-    pub fn load(path: &Path) -> Result<Model, ParseError>;
-
-    /// Print Model to text.
-    pub fn print(model: &Model) -> String;
-
-    /// Print with options (indentation, weight detail level, etc.).
-    pub fn print_with(model: &Model, opts: &PrintOptions) -> String;
-
-    /// Save to .onnxtxt file.
-    pub fn save(model: &Model, path: &Path) -> Result<(), IoError>;
-}
+pub fn to_text(model: &Model) -> String;
+pub fn to_text_with(model: &Model, opts: &PrintOptions) -> String;
+pub fn from_text(source: &str) -> Result<Model>;
 
 pub struct PrintOptions {
     /// Indentation string (default: "  ").
@@ -463,10 +448,13 @@ pub struct PrintOptions {
     pub weight_shapes_only: bool,
     /// Show doc_strings (default: false).
     pub doc_strings: bool,
-    /// Max line width for wrapping (default: 100).
-    pub max_width: usize,
 }
 ```
+
+The implementation is split internally into `text::ser` and `text::de`,
+mirroring serde terminology. The modules remain private; callers use the
+stateless free functions above. `Model::to_text`, `Model::to_text_with`, and
+`Model::from_text` are convenience methods that delegate to them.
 
 ---
 
@@ -478,38 +466,12 @@ Round-trip JSON serialization for web tooling, APIs, and interchange with non-pr
 ecosystems.
 
 ```rust
-pub struct OnnxJson;
-
-impl OnnxJson {
-    /// Serialize model to JSON. Weights are base64-encoded or referenced.
-    pub fn to_json(model: &Model, opts: &JsonOptions) -> Result<String, JsonError>;
-
-    /// Deserialize from JSON.
-    pub fn from_json(json: &str) -> Result<Model, JsonError>;
-
-    /// Load from .json file.
-    pub fn load(path: &Path) -> Result<Model, JsonError>;
-
-    /// Save to .json file.
-    pub fn save(model: &Model, path: &Path, opts: &JsonOptions) -> Result<(), JsonError>;
-}
-
-pub struct JsonOptions {
-    /// How to encode weights in JSON.
-    pub weight_encoding: JsonWeightEncoding,
-    /// Pretty-print with indentation.
-    pub pretty: bool,
-}
-
-pub enum JsonWeightEncoding {
-    /// Base64 inline (small models only).
-    Base64Inline,
-    /// Reference to external file (path string).
-    ExternalRef,
-    /// Omit weights entirely (graph structure only).
-    OmitWeights,
-}
+let json = onnx_rs::json::to_json(&model)?;
+let model = onnx_rs::json::from_json(&json)?;
 ```
+
+JSON uses the canonical protobuf JSON mapping. The current serializer is
+deterministically pretty-printed, so it does not need format-specific options.
 
 ### 6.2 TextProto
 
@@ -540,26 +502,35 @@ silently discarded.
 through this shared protobuf conversion path, so TextFormat parsing and printing
 retain the same explicit unsupported-field behavior as binary and JSON I/O.
 
-### 6.3 Unified I/O
+### 6.3 Unified string-codec API
 
-Delegates to `FormatRegistry` (§3.3) — auto-detects format from extension or magic bytes.
+The three string formats retain their idiomatic free-function pairs:
 
 ```rust
-/// Auto-detect format and load. Uses the global FormatRegistry.
-pub fn load(path: &Path) -> Result<Model, LoadError> {
-    FormatRegistry::global().load(path)
-}
+text::{to_text, to_text_with, from_text}
+json::{to_json, from_json}
+textproto::{to_textproto, from_textproto}
+```
 
-/// Auto-detect format and save.
-pub fn save(model: &Model, path: &Path, opts: &SaveOptions) -> Result<(), SaveError> {
-    FormatRegistry::global().save(model, path, opts)
-}
+For generic tooling, zero-sized `Text`, `Json`, and `TextProto` markers implement
+one shared trait:
 
-/// Register a custom format globally.
-pub fn register_format<F: ModelFormat + 'static>(format: F) {
-    FormatRegistry::global_mut().register_format(format);
+```rust
+pub trait TextCodec {
+    type Options: Default;
+    fn serialize(model: &Model, options: &Self::Options) -> Result<String>;
+    fn deserialize(source: &str) -> Result<Model>;
 }
 ```
+
+`Text::Options` is `PrintOptions`; JSON and TextProto use `()`. The marker types
+do not replace the free functions—they provide a uniform generic surface while
+the free functions remain the direct API.
+
+Binary protobuf `load_model` / `save_model` and the §3 `ModelFormat` /
+`FormatRegistry` file-format system remain separate. They operate on paths,
+external weight backends, extension detection, and file-level concerns rather
+than in-memory strings.
 
 ---
 
