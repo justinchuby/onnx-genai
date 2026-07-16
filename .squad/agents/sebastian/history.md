@@ -56,3 +56,6 @@ Revised the rejected decode-only Rayon pool with a pure `resolve_decode_threads(
 
 ### 2026-07-16T00:00:00Z — nxrt Python Engine threading revision
 Replaced Rachael's rejected `RefCell`/unsendable Python genai Engine with a sendable `Mutex<RustEngine>` wrapper (`41d8c31`). Engine work releases the GIL and `try_lock` makes concurrent or callback-reentrant access an actionable `RuntimeError`; Holden cleared the fix.
+
+### 2026-07-16T00:00:00Z — GQA decode direct-write review
+🟢 Cleared Leon's M=1 contiguous-f32 GQA writer (`1fdd1ec`): prefill, strided, and non-f32 outputs retain the generic writer; BSH/BNSH layouts, RoPE, KV behavior, and grouping are preserved. Independent profiling measured GQA 0.883→0.457 ms/step and throughput 51.58→59.42 tok/s with exact eight-token output; 413 CPU EP tests passed.

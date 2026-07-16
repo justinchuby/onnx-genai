@@ -491,3 +491,10 @@ NVRTC available: 113 passed, 0 failed, 0 skipped. The movement GPU binary passed
 **By:** Roy; reviewed by Wallace
 **What:** `SkipSimplifiedLayerNormalization` now uses a contiguous f32 fast path that borrows input/skip/gamma and writes the residual sum and normalized result directly to their distinct output buffers. The scalar broadcast, strided, statistics-output, and non-f32 fallbacks remain unchanged.
 **Why:** The current steady decode profile is MatMulNBits 81.93%, RMSNorm 6.13%, GQA 5.01%, SiLU 3.47%, Add 2.25%, and Mul 0.65%; RMSNorm was the largest low-risk non-matmul lever. RMSNorm fell 1.113→0.742 ms/step (-33.3%), and five alternating 24-token pairs improved 44.20→46.45 tok/s (+9.1% paired median), with identical greedy tokens `[11576, 42740, 11, 358]`. Wallace independently reproduced a 32.7% RMSNorm reduction and +6–16% decode gains, confirmed output disjointness and fast-path guards, and cleared the change. All 413 CPU EP tests passed.
+
+#### Sources: `leon-gqa-perf.md`, `sebastian-gqa-review.md`
+
+### 2026-07-16: Streamline contiguous f32 GQA decode writes
+**By:** Leon; reviewed by Sebastian
+**What:** The CPU `GroupQueryAttention` M=1 decode path writes contiguous f32 attention and present K/V outputs directly. The guarded path retains the generic narrowing/strided writer for prefill, non-f32, and strided outputs; BSH attention output, BNSH present K/V layout, RoPE, KV append/capacity, and head grouping remain unchanged.
+**Why:** Avoiding a redundant f32 narrowing allocation and per-element strided walk reduced GQA from 0.865 to 0.690 ms/step and raised decode from 54.38 to 58.44 tok/s (+7.5%) with exact tokens `[11576, 42740, 11, 358, 614, 264, 3405, 911]`. Sebastian independently measured 0.883→0.457 ms/step and 51.58→59.42 tok/s with the same eight tokens, cleared the change, and confirmed 413 CPU EP tests pass. Merged to `origin/main` as `1fdd1ec`.

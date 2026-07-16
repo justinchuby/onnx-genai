@@ -26,3 +26,5 @@ Loader opset-import validation for file, from-parts, and nested-subgraph paths m
 - 2026-07-15 — Added Windows oneDNN wheel bundling in `ef89a95`; CI verification is pending.
 
 - 2026-07-16T00:00:01Z — Re-profiled native CPU decode after MatMulNBits threading and landed allocation-free, same-shape contiguous-f32 `Mul` (`347060f`). The guarded non-aliased fast path reduced Mul 3.12→0.25 ms and decode 40.5→44.2 tok/s; Holden 🟡 approved (independent +6.35%).
+
+- 2026-07-16T00:00:00Z — Streamlined M=1 GQA decode to write contiguous f32 attention and present K/V outputs directly (`1fdd1ec`), preserving the generic prefill/strided/non-f32 path. GQA fell 0.865→0.690 ms/step and decode rose 54.38→58.44 tok/s (+7.5%) with exact eight-token output; Sebastian cleared the change and 413 CPU EP tests pass.
