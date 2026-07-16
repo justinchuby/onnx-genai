@@ -288,3 +288,18 @@ Scoped the "export Gemma4 E2B/12B via Mobius and smoke-test through onnx-genai" 
 - **Next gap:** run real decoder models through the native `DecodeBackend` adapter and continue closing CPU op coverage as models surface missing operations.
 
 **Current main HEAD:** `5dddbb8`.
+
+## 2026-07-16 — CUDA parity and native int4 performance wave
+
+- **CUDA GroupQueryAttention ✅ (`3820bad`, Sebastian; Pris 🟢):** Added CUDA GQA with GPU numerics validated using the nvrtc-12.6 workaround.
+- **Native prepack seam + oneDNN threaded GEMM ✅ (`f132d30`, Tyrell; Holden 🟢):** Prepacked constant MatMul weights and threaded oneDNN GEMM; fp32 Gemma4-e2b reaches a **1.14×** improvement.
+- **Native int4 benchmark milestone ✅ (`eea887e`, Joshi):** Qwen2.5-0.5B int4 reaches **0.21 tok/s**, **6.25×** the fp32 Gemma baseline.
+- **Native genai-builder compatibility ✅ (`04709a4`, Coco; Pris 🟢):** Standard `SimplifiedLayerNormalization` and packed-QKV GQA exports run unmodified on native CPU.
+- **CUDA SkipSimplifiedLayerNormalization ✅ (`0284999`, Freysa; Sapper count fix; Rachael 🟢):** Gemma4-e2b's full required op set is now supported on both CPU and CUDA; CUDA advertises **61** unique op names with an exact-count test.
+- **Native MatMulNBits fast path ✅ (`3787c21`, Wallace; Deckard M=1 tests; Holden 🔴→🟢):** Native int4 decode improved **0.19 → 0.50 tok/s**, about **16×** cumulatively over fp32 Gemma.
+
+**Native int4 perf ladder:** fp32 Gemma **0.03 tok/s** → unoptimized int4 **0.21 tok/s** → optimized int4 **0.50 tok/s**. CPU and CUDA now both cover Gemma4-e2b's full required operator set; this is functional parity, not throughput parity.
+
+**Remaining performance work:** native decode remains behind llama.cpp/vLLM. Next levers are int8 SDOT via `accuracy_level=4`, removing per-node executor overhead, and serving work for continuous batching plus paged KV.
+
+**Current main HEAD:** `3787c21`.
