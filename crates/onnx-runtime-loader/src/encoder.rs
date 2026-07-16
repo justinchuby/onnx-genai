@@ -373,6 +373,10 @@ fn encode_attribute(
             ap.t = Some(encode_tensor(t));
             ap.r#type = AttributeType::Tensor as i32;
         }
+        Attribute::Tensors(tensors) => {
+            ap.tensors = tensors.iter().map(encode_tensor).collect();
+            ap.r#type = AttributeType::Tensors as i32;
+        }
         Attribute::Graph(inline) => {
             let subgraph = graph
                 .subgraphs
@@ -397,13 +401,20 @@ fn encode_attribute(
             ap.tp = Some(encode_type_proto(graph, tp));
             ap.r#type = AttributeType::TypeProto as i32;
         }
-        // The IR carries a SparseTensor attribute variant, but the load path
-        // never builds one (it errors on sparse attribute kinds). Surface a
-        // clean error rather than emit a malformed proto.
-        Attribute::SparseTensor(_) => {
-            return Err(LoaderError::GraphBuild(format!(
-                "attribute {name:?}: SparseTensor encoding is unsupported"
-            )));
+        Attribute::TypeProtos(types) => {
+            ap.type_protos = types
+                .iter()
+                .map(|value| encode_type_proto(graph, value))
+                .collect();
+            ap.r#type = AttributeType::TypeProtos as i32;
+        }
+        Attribute::SparseTensor(tensor) => {
+            ap.sparse_tensor = Some(encode_sparse_tensor(tensor));
+            ap.r#type = AttributeType::SparseTensor as i32;
+        }
+        Attribute::SparseTensors(tensors) => {
+            ap.sparse_tensors = tensors.iter().map(encode_sparse_tensor).collect();
+            ap.r#type = AttributeType::SparseTensors as i32;
         }
     }
     Ok(ap)
@@ -423,7 +434,16 @@ fn encode_tensor(t: &TensorData) -> TensorProto {
     } else {
         tp.raw_data = t.data.clone();
     }
+
     tp
+}
+
+fn encode_sparse_tensor(tensor: &onnx_runtime_ir::SparseTensorData) -> onnx::SparseTensorProto {
+    onnx::SparseTensorProto {
+        values: Some(encode_tensor(&tensor.values)),
+        indices: Some(encode_tensor(&tensor.indices)),
+        dims: tensor.dims.iter().map(|&dim| dim as i64).collect(),
+    }
 }
 
 /// Encode an initializer [`WeightRef`] into a `TensorProto` named `name`.

@@ -26,6 +26,16 @@ pub enum Error {
         source: std::io::Error,
     },
 
+    /// Writing the model file to disk failed.
+    #[error("failed to write model file {path}: {source}")]
+    Write {
+        /// The path that could not be written.
+        path: PathBuf,
+        /// The underlying I/O error.
+        #[source]
+        source: std::io::Error,
+    },
+
     /// The underlying loader (parse / build / encode) failed.
     #[error(transparent)]
     Loader(#[from] LoaderError),

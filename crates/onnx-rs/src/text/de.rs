@@ -3,11 +3,15 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use onnx_runtime_ir::{
     Attribute, DataType, Dim, Graph, Node, NodeId, Shape, SparseTensorData, TensorData, TypeProto,
     ValueId, WeightRef,
 };
 use onnx_runtime_loader::ModelMetadata;
+use onnx_runtime_loader::proto::ModelProto;
+use prost::Message;
 
 use crate::error::{Error, Result};
 use crate::model::Model;
@@ -57,6 +61,7 @@ impl<'a> Parser<'a> {
 
         let mut metadata = ModelMetadata::default();
         let mut imports = HashMap::new();
+        let mut retained_proto = None;
         loop {
             let line = self.next()?;
             if line.text == ">" {
@@ -68,9 +73,23 @@ impl<'a> Parser<'a> {
                     .map_err(|_| self.error(line.number, "invalid ir_version"))?;
             } else if let Some(value) = line.text.strip_prefix("opset_import:") {
                 imports = parse_opset_imports(value.trim(), line.number)?;
+            } else if let Some(value) = line.text.strip_prefix("proto:") {
+                let encoded: String = serde_yaml::from_str(trim_comma(value).trim())
+                    .map_err(|error| self.error(line.number, format!("invalid proto: {error}")))?;
+                let bytes = BASE64
+                    .decode(encoded)
+                    .map_err(|error| self.error(line.number, format!("invalid proto: {error}")))?;
+                retained_proto =
+                    Some(ModelProto::decode(bytes.as_slice()).map_err(|error| {
+                        self.error(line.number, format!("invalid proto: {error}"))
+                    })?);
             } else {
                 return self.fail(line.number, "unknown model header field");
             }
+        }
+
+        if let Some(proto) = retained_proto {
+            return Model::from_proto(proto);
         }
 
         let (graph_name, mut graph) = self.parse_graph()?;
@@ -631,6 +650,7 @@ fn parse_static_dims(text: &str, line: usize) -> Result<Vec<usize>> {
 
 fn parse_dtype(text: &str, line: usize) -> Result<DataType> {
     let dtype = match text {
+        "undefined" => DataType::Undefined,
         "float" | "float32" => DataType::Float32,
         "uint8" => DataType::Uint8,
         "int8" => DataType::Int8,
@@ -644,6 +664,8 @@ fn parse_dtype(text: &str, line: usize) -> Result<DataType> {
         "float64" => DataType::Float64,
         "uint32" => DataType::Uint32,
         "uint64" => DataType::Uint64,
+        "complex64" => DataType::Complex64,
+        "complex128" => DataType::Complex128,
         "bfloat16" => DataType::BFloat16,
         "float8e4m3fn" => DataType::Float8E4M3FN,
         "float8e4m3fnuz" => DataType::Float8E4M3FNUZ,

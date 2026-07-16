@@ -16,6 +16,12 @@ pub mod onnx {
 
 pub use onnx::ModelProto;
 
+/// Encoded `FileDescriptorSet` for the exact vendored ONNX schema used to
+/// generate [`onnx`]. Textual codecs use this descriptor so every present and
+/// future field in the bound proto is handled from one source of truth.
+pub const FILE_DESCRIPTOR_SET: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/onnx_descriptor.bin"));
+
 /// Decode a [`ModelProto`] from serialized protobuf bytes.
 pub fn decode_model(bytes: &[u8]) -> Result<ModelProto, LoaderError> {
     ModelProto::decode(bytes).map_err(|e| LoaderError::ProtobufParse(e.to_string()))

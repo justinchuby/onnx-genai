@@ -849,6 +849,9 @@ fn attribute_matches(value: &Attribute, expected: AttributeType) -> bool {
             | (Attribute::Floats(_), AttributeType::Floats)
             | (Attribute::Strings(_), AttributeType::Strings)
             | (Attribute::Graphs(_), AttributeType::Graphs)
+            | (Attribute::Tensors(_), AttributeType::Tensors)
+            | (Attribute::SparseTensors(_), AttributeType::SparseTensors)
+            | (Attribute::TypeProtos(_), AttributeType::TypeProtos)
     )
 }
 
@@ -858,10 +861,13 @@ fn attribute_name(value: &Attribute) -> &'static str {
         Attribute::Float(_) => "float",
         Attribute::String(_) => "string",
         Attribute::Tensor(_) => "tensor",
+        Attribute::Tensors(_) => "tensors",
         Attribute::SparseTensor(_) => "sparse_tensor",
+        Attribute::SparseTensors(_) => "sparse_tensors",
         Attribute::Graph(_) => "graph",
         Attribute::Graphs(_) => "graphs",
         Attribute::TypeProto(_) => "type_proto",
+        Attribute::TypeProtos(_) => "type_protos",
         Attribute::Ints(_) => "ints",
         Attribute::Floats(_) => "floats",
         Attribute::Strings(_) => "strings",

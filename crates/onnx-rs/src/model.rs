@@ -16,10 +16,15 @@ use std::path::Path;
 use std::sync::Arc;
 
 use onnx_runtime_ir::Graph;
-use onnx_runtime_loader::proto::{ModelProto, decode_model};
-use onnx_runtime_loader::{
-    Model as EncoderModel, ModelMetadata, WeightStore, load_model_bytes_with_weights, write_model,
+use onnx_runtime_loader::proto::{
+    ModelProto, decode_model,
+    onnx::{ValueInfoProto, type_proto},
 };
+use onnx_runtime_loader::{
+    Model as EncoderModel, ModelMetadata, WeightStore, encode_model_proto,
+    load_model_bytes_with_weights,
+};
+use prost::Message;
 
 use crate::check::{OnnxChecker, ValidationResult};
 use crate::error::{Error, Result};
@@ -29,8 +34,8 @@ use crate::text::{self, PrintOptions};
 /// and (optionally) the live weight store backing external initializers.
 ///
 /// Unlike [`onnx_runtime_loader::Model`], which borrows a `&Graph`, this type
-/// owns its graph so it can be returned from [`load_model`], mutated, dumped to
-/// text, validated, and written back out.
+/// owns its graph so it can be returned from [`load_model`], inspected, dumped
+/// to text, validated, and written back out.
 pub struct Model {
     /// The computation graph, in the shared [`onnx_runtime_ir`] IR.
     pub graph: Graph,
@@ -40,6 +45,11 @@ pub struct Model {
     /// model can be re-saved without re-mmapping. `None` for models built in
     /// memory with only inline weights.
     weights: Option<Arc<WeightStore>>,
+    /// Exact schema-level representation for models loaded from protobuf or a
+    /// textual protobuf codec. The runtime graph is an execution projection and
+    /// intentionally does not model every ONNX field; retaining the source proto
+    /// makes standard-library serialization lossless for the full bound schema.
+    source_proto: Option<ModelProto>,
 }
 
 impl Model {
@@ -52,6 +62,7 @@ impl Model {
             graph,
             metadata: ModelMetadata::default(),
             weights: None,
+            source_proto: None,
         }
     }
 
@@ -61,6 +72,7 @@ impl Model {
             graph,
             metadata,
             weights: None,
+            source_proto: None,
         }
     }
 
@@ -72,6 +84,55 @@ impl Model {
     /// The live weight store, if this model carries one.
     pub fn weights(&self) -> Option<&Arc<WeightStore>> {
         self.weights.as_ref()
+    }
+
+    /// Construct a model from the complete generated ONNX protobuf.
+    ///
+    /// The protobuf remains the serialization source of truth, while `graph`
+    /// is populated as the runtime-compatible execution projection.
+    pub fn from_proto(proto: ModelProto) -> Result<Self> {
+        let metadata = metadata_from_proto(&proto);
+        let bytes = proto.encode_to_vec();
+        let loaded = load_model_bytes_with_weights(&bytes, ".").or_else(|_| {
+            let projection = execution_projection(&proto);
+            load_model_bytes_with_weights(&projection.encode_to_vec(), ".")
+        })?;
+        Ok(Self {
+            graph: loaded.0,
+            metadata,
+            weights: Some(loaded.1),
+            source_proto: Some(proto),
+        })
+    }
+
+    /// Return the complete generated ONNX protobuf represented by this model.
+    ///
+    /// Models parsed from protobuf JSON/TextFormat return their exact retained
+    /// schema representation. Programmatically-built models are encoded from the
+    /// shared runtime graph.
+    pub fn to_proto(&self) -> Result<ModelProto> {
+        if let Some(proto) = &self.source_proto {
+            return Ok(proto.clone());
+        }
+        let mut encoder = EncoderModel::new(&self.graph).with_metadata(self.metadata.clone());
+        if let Some(weights) = self.weights() {
+            encoder = encoder.with_weights(weights);
+        }
+        Ok(encode_model_proto(&encoder)?)
+    }
+
+    /// Discard the retained source protobuf and make the mutable runtime graph
+    /// authoritative for future serialization.
+    ///
+    /// Full-spec fields that are not represented by the execution IR (such as
+    /// training information and local function declarations) cannot survive
+    /// this transition.
+    pub fn make_graph_authoritative(&mut self) {
+        self.source_proto = None;
+    }
+
+    pub(crate) fn retained_proto_bytes(&self) -> Option<Vec<u8>> {
+        self.source_proto.as_ref().map(Message::encode_to_vec)
     }
 
     /// Render this model as a human-readable textual dump (ONNX_RS §5).
@@ -111,30 +172,78 @@ pub fn load_model(path: impl AsRef<Path>) -> Result<Model> {
     })?;
     let proto = decode_model(&bytes)?;
     let metadata = metadata_from_proto(&proto);
-
     let model_dir = path.parent().unwrap_or_else(|| Path::new("."));
-    let (graph, store) = load_model_bytes_with_weights(&bytes, model_dir)?;
-
+    let (graph, store) = load_model_bytes_with_weights(&bytes, model_dir).or_else(|_| {
+        load_model_bytes_with_weights(&execution_projection(&proto).encode_to_vec(), model_dir)
+    })?;
     Ok(Model {
         graph,
         metadata,
         weights: Some(store),
+        source_proto: Some(proto),
     })
 }
 
 /// Save a [`Model`] to a `.onnx` protobuf file (ONNX_RS §3.4).
 ///
-/// Delegates to the loader's encoder, which serialises the shared-IR graph plus
-/// the model metadata. If the model carries external initializers it must also
-/// carry the live [`WeightStore`] (as produced by [`load_model`]) so the encoder
-/// can read their bytes.
+/// Models loaded from protobuf or a textual protobuf codec preserve and write
+/// their complete source proto. Programmatically-built models serialize the
+/// shared execution graph and metadata.
 pub fn save_model(model: &Model, path: impl AsRef<Path>) -> Result<()> {
-    let mut encoder = EncoderModel::new(&model.graph).with_metadata(model.metadata.clone());
-    if let Some(weights) = &model.weights {
-        encoder = encoder.with_weights(weights);
-    }
-    write_model(&encoder, path)?;
+    let bytes = model.to_proto()?.encode_to_vec();
+    let path = path.as_ref();
+    std::fs::write(path, bytes).map_err(|source| Error::Write {
+        path: path.to_path_buf(),
+        source,
+    })?;
     Ok(())
+}
+
+/// Build a runtime-loadable projection without changing the retained proto.
+///
+/// Sparse initializers are first-class in the standard but the execution IR
+/// does not yet have sparse weight storage. Treat them as graph inputs in the
+/// projection so references remain structurally valid; serialization always
+/// uses the untouched source proto.
+fn execution_projection(proto: &ModelProto) -> ModelProto {
+    let mut projection = proto.clone();
+    if let Some(graph) = &mut projection.graph {
+        for sparse in &graph.sparse_initializer {
+            let Some(values) = &sparse.values else {
+                continue;
+            };
+            if values.name.is_empty() || graph.input.iter().any(|input| input.name == values.name) {
+                continue;
+            }
+            graph.input.push(ValueInfoProto {
+                name: values.name.clone(),
+                r#type: Some(onnx_runtime_loader::proto::onnx::TypeProto {
+                    value: Some(type_proto::Value::SparseTensorType(
+                        type_proto::SparseTensor {
+                            elem_type: values.data_type,
+                            shape: Some(onnx_runtime_loader::proto::onnx::TensorShapeProto {
+                                dim: sparse
+                                    .dims
+                                    .iter()
+                                    .map(|&dim| {
+                                        onnx_runtime_loader::proto::onnx::tensor_shape_proto::Dimension {
+                                            value: Some(
+                                                onnx_runtime_loader::proto::onnx::tensor_shape_proto::dimension::Value::DimValue(dim),
+                                            ),
+                                            denotation: String::new(),
+                                        }
+                                    })
+                                    .collect(),
+                            }),
+                        },
+                    )),
+                    denotation: String::new(),
+                }),
+                ..Default::default()
+            });
+        }
+    }
+    projection
 }
 
 /// Project the header fields of a decoded [`ModelProto`] into [`ModelMetadata`].

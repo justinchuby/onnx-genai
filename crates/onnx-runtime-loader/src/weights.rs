@@ -13,8 +13,8 @@ use std::path::{Path, PathBuf};
 use memmap2::Mmap;
 use onnx_runtime_ir::{DataType, TensorData, ValueId, WeightRef};
 
-use crate::proto::onnx::{tensor_proto, ModelProto, TensorProto};
-use crate::{pathsafe::guarded_join, LoaderError};
+use crate::proto::onnx::{ModelProto, TensorProto, tensor_proto};
+use crate::{LoaderError, pathsafe::guarded_join};
 
 /// A resolved set of initializer weights, keyed by the value they populate,
 /// plus the live memory maps backing any external data files.
@@ -115,12 +115,11 @@ fn resolve_initializer(
     init: &TensorProto,
     model_dir: &Path,
 ) -> Result<WeightRef, LoaderError> {
-    let dtype = DataType::from_onnx(init.data_type).ok_or_else(|| {
-        LoaderError::UnsupportedDataType {
+    let dtype =
+        DataType::from_onnx(init.data_type).ok_or_else(|| LoaderError::UnsupportedDataType {
             raw: init.data_type,
             context: format!("initializer {:?}", init.name),
-        }
-    })?;
+        })?;
     let dims: Vec<usize> = init.dims.iter().map(|&d| d.max(0) as usize).collect();
 
     if init.data_location == tensor_proto::DataLocation::External as i32 {
@@ -210,12 +209,28 @@ pub(crate) fn tensor_data_from_proto(
 
     // Otherwise serialise the type-specific repeated field to LE bytes.
     td.data = match dtype {
+        DataType::Undefined => {
+            return Err(LoaderError::UnsupportedDataType {
+                raw: 0,
+                context: format!("tensor {:?}", proto.name),
+            });
+        }
         DataType::Float32 => proto
             .float_data
             .iter()
             .flat_map(|v| v.to_le_bytes())
             .collect(),
         DataType::Float64 => proto
+            .double_data
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect(),
+        DataType::Complex64 => proto
+            .float_data
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect(),
+        DataType::Complex128 => proto
             .double_data
             .iter()
             .flat_map(|v| v.to_le_bytes())

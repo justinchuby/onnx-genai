@@ -33,6 +33,11 @@
 //! | §10        | [`version::VersionConverter`] opset conversion | ✅ |
 //! | §6.2       | [`textproto`] protobuf TextFormat I/O | ✅ |
 //!
+//! JSON and protobuf TextFormat are descriptor-driven from the exact vendored
+//! ONNX proto, so every bound message, field, oneof, and enum is covered. The
+//! readable text DSL retains a protobuf sidecar when fields lie outside the
+//! execution graph projection, preserving full-spec round trips.
+//!
 //! Deferred to later waves (see `// FOLLOW-UP` markers): the remaining checker
 //! rule set (§8.2), custom-op registration (§11), and
 //! Python bindings (§12).
@@ -55,6 +60,7 @@ mod codec;
 mod error;
 pub mod json;
 mod model;
+mod proto_serde;
 pub mod schema;
 pub mod shape;
 pub mod text;

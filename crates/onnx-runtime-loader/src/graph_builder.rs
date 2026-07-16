@@ -343,9 +343,7 @@ fn tensor_shape_to_shape(graph: &mut Graph, tsp: &TensorShapeProto) -> Shape {
 }
 
 /// Convert an `AttributeProto` to an IR `(name, Attribute)`. Returns `Ok(None)`
-/// for empty/absent attributes, and errors (rather than silently dropping) on
-/// tensor/sparse-tensor/type-proto **list** kinds the IR does not model, which
-/// do not appear in the Phase-1 op set.
+/// for empty/absent attributes.
 fn convert_attribute(
     graph: &mut Graph,
     ap: &AttributeProto,
@@ -370,6 +368,22 @@ fn convert_attribute(
             Some(t) => Attribute::Tensor(convert_tensor(t)?),
             None => return Ok(None),
         },
+        AT::Tensors => Attribute::Tensors(
+            ap.tensors
+                .iter()
+                .map(convert_tensor)
+                .collect::<Result<_, _>>()?,
+        ),
+        AT::SparseTensor => match ap.sparse_tensor.as_ref() {
+            Some(t) => Attribute::SparseTensor(convert_sparse_tensor(t)?),
+            None => return Ok(None),
+        },
+        AT::SparseTensors => Attribute::SparseTensors(
+            ap.sparse_tensors
+                .iter()
+                .map(convert_sparse_tensor)
+                .collect::<Result<_, _>>()?,
+        ),
         AT::Graph => match ap.g.as_ref() {
             Some(g) => {
                 let mut sub = Graph::new();
@@ -391,6 +405,12 @@ fn convert_attribute(
             Some(tp) => Attribute::TypeProto(convert_type_proto(graph, tp)?),
             None => return Ok(None),
         },
+        AT::TypeProtos => Attribute::TypeProtos(
+            ap.type_protos
+                .iter()
+                .map(|tp| convert_type_proto(graph, tp))
+                .collect::<Result<_, _>>()?,
+        ),
         // Field-presence fallback when `type` is UNDEFINED.
         AT::Undefined => {
             if let Some(t) = ap.t.as_ref() {
@@ -411,15 +431,6 @@ fn convert_attribute(
                 return Ok(None);
             }
         }
-        // Tensor / sparse-tensor / type-proto list attributes have no IR
-        // variant. Surface a clean error rather than silently dropping the
-        // attribute, which could otherwise mis-model an op (§19.1).
-        AT::Tensors | AT::SparseTensor | AT::SparseTensors | AT::TypeProtos => {
-            return Err(LoaderError::GraphBuild(format!(
-                "attribute {:?} has unmodeled type {:?}",
-                ap.name, ty
-            )));
-        }
     };
     Ok(Some((ap.name.clone(), attr)))
 }
@@ -428,6 +439,26 @@ fn convert_tensor(t: &onnx::TensorProto) -> Result<TensorData, LoaderError> {
     let dtype = decode_dtype(t.data_type, || format!("attribute tensor '{}'", t.name))?;
     let dims: Vec<usize> = t.dims.iter().map(|&d| d.max(0) as usize).collect();
     tensor_data_from_proto(t, dtype, &dims)
+}
+
+fn convert_sparse_tensor(
+    tensor: &onnx::SparseTensorProto,
+) -> Result<onnx_runtime_ir::SparseTensorData, LoaderError> {
+    let values = tensor
+        .values
+        .as_ref()
+        .ok_or_else(|| LoaderError::GraphBuild("sparse tensor is missing values".into()))
+        .and_then(convert_tensor)?;
+    let indices = tensor
+        .indices
+        .as_ref()
+        .ok_or_else(|| LoaderError::GraphBuild("sparse tensor is missing indices".into()))
+        .and_then(convert_tensor)?;
+    Ok(onnx_runtime_ir::SparseTensorData {
+        values,
+        indices,
+        dims: tensor.dims.iter().map(|&dim| dim.max(0) as usize).collect(),
+    })
 }
 
 fn convert_type_proto(graph: &mut Graph, tp: &onnx::TypeProto) -> Result<TypeProto, LoaderError> {

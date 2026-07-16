@@ -95,12 +95,15 @@ pub enum Attribute {
     /// [`Attribute::String`] for why bytes rather than `String`).
     Strings(Vec<Vec<u8>>),
     Tensor(TensorData),
+    Tensors(Vec<TensorData>),
     SparseTensor(SparseTensorData),
+    SparseTensors(Vec<SparseTensorData>),
     /// A subgraph body (control-flow ops: If/Loop/Scan). Stored inline; the
     /// owning [`Graph`] also indexes it in `subgraphs` for traversal.
     Graph(Box<Graph>),
     Graphs(Vec<Graph>),
     TypeProto(TypeProto),
+    TypeProtos(Vec<TypeProto>),
 }
 
 impl Attribute {

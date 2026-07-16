@@ -16,6 +16,7 @@ prost = "0.13"
 memmap2 = "0.9"
 
 [build-dependencies]
+prost = "0.13"
 prost-build = "0.13"
 # Pure-Rust protobuf compiler: lets `build.rs` generate the prost types without
 # requiring a system `protoc` binary to be installed.

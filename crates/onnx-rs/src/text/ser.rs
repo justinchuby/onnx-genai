@@ -19,6 +19,8 @@
 
 use std::fmt::Write as _;
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use onnx_runtime_ir::{Attribute, DataType, Dim, Graph, NodeId, Shape, ValueId, WeightRef};
 
 use crate::model::Model;
@@ -58,6 +60,9 @@ pub fn to_text_with(model: &Model, opts: &PrintOptions) -> String {
     // Model header block: ir_version + opset imports (sorted for determinism).
     out.push_str("<\n");
     let _ = writeln!(out, "{}ir_version: {},", opts.indent, meta.ir_version);
+    if let Some(proto) = model.retained_proto_bytes() {
+        let _ = writeln!(out, "{}proto: {:?},", opts.indent, BASE64.encode(proto));
+    }
     let mut imports: Vec<(&String, &u64)> = model.graph.opset_imports.iter().collect();
     imports.sort_by(|a, b| a.0.cmp(b.0));
     let imports_str = imports
@@ -328,8 +333,11 @@ fn attr_value(attr: &Attribute) -> String {
             .map(|values| format!("[{}]", values.join(", ")))
             .unwrap_or_else(|_| format!("<{} strings>", values.len())),
         Attribute::Tensor(t) => format!("<tensor {}[{:?}]>", dtype_name(t.dtype), t.dims),
+        Attribute::Tensors(tensors) => format!("<{} tensors>", tensors.len()),
         Attribute::SparseTensor(_) => "<sparse tensor>".to_string(),
+        Attribute::SparseTensors(tensors) => format!("<{} sparse tensors>", tensors.len()),
         Attribute::TypeProto(_) => "<type>".to_string(),
+        Attribute::TypeProtos(types) => format!("<{} types>", types.len()),
         // Subgraph attributes are printed as nested blocks, not inline.
         Attribute::Graphs(graphs) if graphs.is_empty() => "[]:graphs".to_string(),
         Attribute::Graph(_) | Attribute::Graphs(_) => "<graph>".to_string(),
@@ -339,6 +347,7 @@ fn attr_value(attr: &Attribute) -> String {
 /// ONNX textual dtype spellings.
 fn dtype_name(dtype: DataType) -> &'static str {
     match dtype {
+        DataType::Undefined => "undefined",
         DataType::Float32 => "float",
         DataType::Uint8 => "uint8",
         DataType::Int8 => "int8",
@@ -352,6 +361,8 @@ fn dtype_name(dtype: DataType) -> &'static str {
         DataType::Float64 => "float64",
         DataType::Uint32 => "uint32",
         DataType::Uint64 => "uint64",
+        DataType::Complex64 => "complex64",
+        DataType::Complex128 => "complex128",
         DataType::BFloat16 => "bfloat16",
         DataType::Float8E4M3FN => "float8e4m3fn",
         DataType::Float8E4M3FNUZ => "float8e4m3fnuz",

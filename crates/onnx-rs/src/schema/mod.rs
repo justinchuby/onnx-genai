@@ -118,6 +118,12 @@ pub enum AttributeType {
     Strings,
     /// Graph list.
     Graphs,
+    /// Tensor list.
+    Tensors,
+    /// Sparse tensor list.
+    SparseTensors,
+    /// Type-proto list.
+    TypeProtos,
 }
 
 /// A typed YAML-compatible attribute default.
@@ -379,6 +385,7 @@ mod data_types {
 
     fn parse(value: &str) -> Option<DataType> {
         Some(match value {
+            "undefined" => DataType::Undefined,
             "float32" => DataType::Float32,
             "uint8" => DataType::Uint8,
             "int8" => DataType::Int8,
@@ -392,6 +399,8 @@ mod data_types {
             "float64" => DataType::Float64,
             "uint32" => DataType::Uint32,
             "uint64" => DataType::Uint64,
+            "complex64" => DataType::Complex64,
+            "complex128" => DataType::Complex128,
             "bfloat16" => DataType::BFloat16,
             "float8e4m3fn" => DataType::Float8E4M3FN,
             "float8e4m3fnuz" => DataType::Float8E4M3FNUZ,
@@ -406,6 +415,7 @@ mod data_types {
 
     fn name(value: DataType) -> &'static str {
         match value {
+            DataType::Undefined => "undefined",
             DataType::Float32 => "float32",
             DataType::Uint8 => "uint8",
             DataType::Int8 => "int8",
@@ -419,6 +429,8 @@ mod data_types {
             DataType::Float64 => "float64",
             DataType::Uint32 => "uint32",
             DataType::Uint64 => "uint64",
+            DataType::Complex64 => "complex64",
+            DataType::Complex128 => "complex128",
             DataType::BFloat16 => "bfloat16",
             DataType::Float8E4M3FN => "float8e4m3fn",
             DataType::Float8E4M3FNUZ => "float8e4m3fnuz",

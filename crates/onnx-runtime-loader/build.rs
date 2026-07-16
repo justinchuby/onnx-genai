@@ -6,6 +6,7 @@
 //! file lands in `$OUT_DIR/onnx.rs` (named after the proto `package onnx;`) and
 //! is `include!`d by `src/proto.rs`.
 
+use prost::Message;
 use std::path::PathBuf;
 
 fn main() {
@@ -17,6 +18,11 @@ fn main() {
         .expect("failed to compile proto/onnx.proto3 with protox");
 
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR not set"));
+    std::fs::write(
+        out_dir.join("onnx_descriptor.bin"),
+        file_descriptors.encode_to_vec(),
+    )
+    .expect("failed to write ONNX descriptor set");
 
     prost_build::Config::new()
         .out_dir(&out_dir)

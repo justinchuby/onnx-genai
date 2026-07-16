@@ -7,6 +7,7 @@
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum DataType {
+    Undefined = 0,
     Float32 = 1,
     Uint8 = 2,
     Int8 = 3,
@@ -20,6 +21,8 @@ pub enum DataType {
     Float64 = 11,
     Uint32 = 12,
     Uint64 = 13,
+    Complex64 = 14,
+    Complex128 = 15,
     BFloat16 = 16,
     Float8E4M3FN = 17,
     Float8E4M3FNUZ = 18,
@@ -36,7 +39,8 @@ impl DataType {
     pub fn byte_size(self) -> usize {
         match self {
             Self::Float32 | Self::Int32 | Self::Uint32 => 4,
-            Self::Float64 | Self::Int64 | Self::Uint64 => 8,
+            Self::Float64 | Self::Int64 | Self::Uint64 | Self::Complex64 => 8,
+            Self::Complex128 => 16,
             Self::Float16 | Self::BFloat16 | Self::Int16 | Self::Uint16 => 2,
             Self::Int8
             | Self::Uint8
@@ -46,7 +50,7 @@ impl DataType {
             | Self::Float8E5M2
             | Self::Float8E5M2FNUZ => 1,
             Self::Int4 | Self::Uint4 | Self::Float4E2M1 => 0, // packed: 2 elements per byte
-            Self::String => 0,             // variable width
+            Self::String | Self::Undefined => 0, // variable-width / no concrete storage
         }
     }
 
@@ -91,6 +95,11 @@ impl DataType {
         )
     }
 
+    /// Whether elements contain real and imaginary floating-point components.
+    pub fn is_complex(self) -> bool {
+        matches!(self, Self::Complex64 | Self::Complex128)
+    }
+
     /// Whether elements are packed multiple-per-byte (4-bit types).
     pub fn is_sub_byte(self) -> bool {
         matches!(self, Self::Int4 | Self::Uint4 | Self::Float4E2M1)
@@ -118,7 +127,9 @@ impl DataType {
     /// wrapped product becomes a clean error instead of a 1-byte allocation
     /// followed by an out-of-bounds access.
     pub fn checked_storage_bytes(self, count: usize) -> Option<usize> {
-        if self.is_sub_byte() {
+        if self == Self::Undefined {
+            None
+        } else if self.is_sub_byte() {
             Some(count.div_ceil(2))
         } else {
             count.checked_mul(self.byte_size())
@@ -127,9 +138,8 @@ impl DataType {
 
     /// Convert from the raw ONNX `TensorProto.DataType` integer.
     ///
-    /// Returns `None` for `UNDEFINED` (0), the complex types `COMPLEX64` (14)
-    /// and `COMPLEX128` (15), and any out-of-range or future value the runtime
-    /// does not model. The discriminants below mirror the vendored
+    /// Returns `None` for `UNDEFINED` (0) and any out-of-range or future value
+    /// the runtime does not model. The discriminants below mirror the vendored
     /// `onnx.proto3` `TensorProto.DataType` enum verbatim.
     pub fn from_onnx(raw: i32) -> Option<Self> {
         Some(match raw {
@@ -146,6 +156,8 @@ impl DataType {
             11 => Self::Float64,
             12 => Self::Uint32,
             13 => Self::Uint64,
+            14 => Self::Complex64,
+            15 => Self::Complex128,
             16 => Self::BFloat16,
             17 => Self::Float8E4M3FN,
             18 => Self::Float8E4M3FNUZ,
@@ -170,6 +182,7 @@ mod tests {
 
     #[test]
     fn byte_and_bit_sizes() {
+        assert_eq!(DataType::Undefined.checked_storage_bytes(1), None);
         assert_eq!(DataType::Float32.byte_size(), 4);
         assert_eq!(DataType::Float32.bit_size(), 32);
         assert_eq!(DataType::Int64.byte_size(), 8);
@@ -199,7 +212,10 @@ mod tests {
         // The element *count* fits in usize but count * byte_size wraps: this
         // is the exploited path (a `[2^61]`-of-8-byte shape passes the numel
         // check yet `2^61 * 8` wraps to 0 → 1-byte allocation).
-        assert_eq!(DataType::Float64.checked_storage_bytes(usize::MAX / 4), None);
+        assert_eq!(
+            DataType::Float64.checked_storage_bytes(usize::MAX / 4),
+            None
+        );
         assert_eq!(DataType::Int64.checked_storage_bytes(usize::MAX), None);
         // Sub-byte packing can never overflow (div_ceil shrinks the count).
         assert_eq!(
@@ -214,6 +230,9 @@ mod tests {
         assert!(!DataType::Int32.is_float());
         assert!(DataType::Int32.is_int());
         assert!(!DataType::Bool.is_int());
+        assert!(DataType::Complex64.is_complex());
+        assert!(DataType::Complex128.is_complex());
+        assert!(!DataType::Float32.is_complex());
         assert!(DataType::Uint4.is_sub_byte());
         // float8 / float4 variants are floats but not ints.
         for dt in [
@@ -239,7 +258,10 @@ mod tests {
         assert_eq!(DataType::Float4E2M1.bit_size(), 4);
         assert_eq!(DataType::Float4E2M1.storage_bytes(4), 2);
         assert_eq!(DataType::Float4E2M1.storage_bytes(5), 3);
-        assert_eq!(DataType::Float4E2M1.checked_storage_bytes(usize::MAX), Some(usize::MAX / 2 + 1));
+        assert_eq!(
+            DataType::Float4E2M1.checked_storage_bytes(usize::MAX),
+            Some(usize::MAX / 2 + 1)
+        );
     }
 
     #[test]
@@ -261,6 +283,7 @@ mod tests {
     /// here silently corrupts weights, so the table is exhaustive.
     #[test]
     fn onnx_discriminants_match_spec() {
+        assert_eq!(DataType::Undefined.to_onnx(), 0);
         let table: &[(DataType, i32)] = &[
             (DataType::Float32, 1),
             (DataType::Uint8, 2),
@@ -275,6 +298,8 @@ mod tests {
             (DataType::Float64, 11),
             (DataType::Uint32, 12),
             (DataType::Uint64, 13),
+            (DataType::Complex64, 14),
+            (DataType::Complex128, 15),
             (DataType::BFloat16, 16),
             (DataType::Float8E4M3FN, 17),
             (DataType::Float8E4M3FNUZ, 18),
@@ -286,7 +311,11 @@ mod tests {
         ];
         for &(dt, raw) in table {
             assert_eq!(dt.to_onnx(), raw, "{dt:?} to_onnx mismatch");
-            assert_eq!(DataType::from_onnx(raw), Some(dt), "from_onnx({raw}) mismatch");
+            assert_eq!(
+                DataType::from_onnx(raw),
+                Some(dt),
+                "from_onnx({raw}) mismatch"
+            );
         }
     }
 
@@ -308,8 +337,8 @@ mod tests {
     /// never a wrong variant or a panic.
     #[test]
     fn unknown_raw_values_return_none() {
-        // UNDEFINED, complex, and out-of-range/future values.
-        for raw in [0, 14, 15, 24, 100, 9999, -1, i32::MAX, i32::MIN] {
+        // UNDEFINED and out-of-range/future values.
+        for raw in [0, 24, 100, 9999, -1, i32::MAX, i32::MIN] {
             assert_eq!(DataType::from_onnx(raw), None, "raw {raw} should be None");
         }
     }

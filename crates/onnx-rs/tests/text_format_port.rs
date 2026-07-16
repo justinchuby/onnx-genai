@@ -2,6 +2,7 @@
 
 use onnx_rs::ir::{Attribute, DataType, Dim, Graph, Node, NodeId};
 use onnx_rs::{Json, Model, ModelMetadata, Text, TextCodec, TextProto, from_text, to_text};
+use prost::Message;
 
 const BASIC_MODEL: &str = r#"
 <
@@ -223,13 +224,15 @@ fn round_trips_initializer_reference() {
 
 #[test]
 fn parses_supported_upstream_tensor_type_spellings() {
-    // Port of parser_test.py::test_parse_graph_types, limited to the tensor
-    // element types represented by onnx_runtime_ir::DataType.
+    // Port of parser_test.py::test_parse_graph_types for every concrete tensor
+    // element type in the bound ONNX proto.
     let cases = [
         ("bfloat16", DataType::BFloat16),
         ("bool", DataType::Bool),
         ("float64", DataType::Float64),
         ("float16", DataType::Float16),
+        ("complex64", DataType::Complex64),
+        ("complex128", DataType::Complex128),
         ("float", DataType::Float32),
         ("float8e4m3fn", DataType::Float8E4M3FN),
         ("float8e4m3fnuz", DataType::Float8E4M3FNUZ),
@@ -280,15 +283,15 @@ fn round_trips_several_upstream_models_stably() {
 #[test]
 fn json_and_textproto_round_trip_attribute_model() {
     let model = from_text(ATTRIBUTE_MODEL).expect("parse attribute fixture");
-    let expected = to_text(&model);
+    let expected = model.to_proto().unwrap().encode_to_vec();
 
     let json = Json::serialize(&model, &()).expect("serialize JSON");
     let from_json = Json::deserialize(&json).expect("deserialize JSON");
-    assert_eq!(to_text(&from_json), expected);
+    assert_eq!(from_json.to_proto().unwrap().encode_to_vec(), expected);
 
     let textproto = TextProto::serialize(&model, &()).expect("serialize TextProto");
     let from_textproto = TextProto::deserialize(&textproto).expect("deserialize TextProto");
-    assert_eq!(to_text(&from_textproto), expected);
+    assert_eq!(from_textproto.to_proto().unwrap().encode_to_vec(), expected);
 }
 
 #[test]
@@ -345,9 +348,11 @@ fn rejects_unclosed_attribute_block() {
 }
 
 #[test]
-fn rejects_unknown_tensor_type() {
-    let malformed = BASIC_MODEL.replace("float[N, 128] X", "complex64[N, 128] X");
-    assert!(from_text(&malformed).is_err());
+fn accepts_complex_tensor_types_from_upstream() {
+    for spelling in ["complex64", "complex128"] {
+        let source = BASIC_MODEL.replace("float[N, 128] X", &format!("{spelling}[N, 128] X"));
+        assert!(from_text(&source).is_ok(), "{spelling}");
+    }
 }
 
 #[test]
