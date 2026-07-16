@@ -28,6 +28,7 @@ pub mod conv;
 pub mod elementwise;
 pub mod fused_gemm;
 pub mod gemm;
+pub mod group_query_attention;
 pub mod matmul;
 pub mod normalization;
 pub mod pointwise;
@@ -93,6 +94,7 @@ pub const CUDA_COVERED_OPS: &[&str] = &[
     "Min",
     "Max",
     "Attention",
+    "GroupQueryAttention",
     "Softmax",
     "LayerNormalization",
     "SkipLayerNormalization",
@@ -244,6 +246,12 @@ pub fn build_cuda_registry(runtime: Arc<CudaRuntime>) -> OpRegistry {
     reg.register(
         OpKey::new("Attention", "com.microsoft", 1),
         Box::new(attention::AttentionFactory {
+            runtime: runtime.clone(),
+        }),
+    );
+    reg.register(
+        OpKey::new("GroupQueryAttention", "com.microsoft", 1),
+        Box::new(group_query_attention::GroupQueryAttentionFactory {
             runtime: runtime.clone(),
         }),
     );
@@ -437,6 +445,11 @@ mod tests {
         for op in CUDA_COVERED_OPS {
             assert!(seen.insert(*op), "duplicate op {op} in CUDA_COVERED_OPS");
         }
+    }
+
+    #[test]
+    fn group_query_attention_is_listed_in_coverage() {
+        assert!(CUDA_COVERED_OPS.contains(&"GroupQueryAttention"));
     }
 
     #[test]

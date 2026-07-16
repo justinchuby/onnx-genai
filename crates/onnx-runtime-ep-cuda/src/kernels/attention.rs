@@ -77,13 +77,17 @@ const SOFTMAX_SRC: &str = r#"
 extern "C" __global__ void attn_softmax_f32(
     float*       scores,       // [nrows, sk] row-major, in/out
     const float* mask,         // additive mask planes, or null when mask_planes==0
+    const int*   total_lengths,// optional logical key lengths [batch]
+    const int*   past_lengths, // optional logical past lengths [batch]
     const int    nrows,        // B * heads * sq
     const int    sk,           // key length (softmax axis)
     const int    sq,           // query length
     const int    heads,        // num query heads
     const int    causal,       // 0/1
     const int    mask_planes,  // 0 (none), 1, batch, or batch*heads
-    const int    batch)
+    const int    batch,
+    const int    local_window,
+    const float  softcap)
 {
     // NVRTC has no <math.h>: build +inf from its bit pattern.
     const float INF = __int_as_float(0x7f800000);
@@ -100,7 +104,11 @@ extern "C" __global__ void attn_softmax_f32(
 
     // Causal alignment: query i (absolute position sk-sq+i for cached decode)
     // attends to keys j <= sk-sq+i. Reduces to lower-triangular when sq==sk.
-    const int causal_max = sk - sq + i;
+    const int causal_max = past_lengths ? past_lengths[b] + i : sk - sq + i;
+    const int logical_sk = total_lengths ? total_lengths[b] : sk;
+    const int local_min = local_window > 0
+        ? max(0, causal_max + 1 - local_window)
+        : 0;
 
     const float* mrow = 0;
     if (mask_planes > 0) {
@@ -119,10 +127,11 @@ extern "C" __global__ void attn_softmax_f32(
     float local_max = -INF;
     for (int j = tid; j < sk; j += nt) {
         float v;
-        if (causal && j > causal_max) {
+        if (j >= logical_sk || (causal && j > causal_max) || j < local_min) {
             v = -INF;
         } else {
             v = s[j];
+            if (softcap > 0.0f) v = softcap * tanhf(v / softcap);
             if (mrow) v += mrow[j];
         }
         s[j] = v;
@@ -388,69 +397,81 @@ impl AttentionKernel {
         let v_base = cuptr(v.data_ptr::<u8>() as *const c_void);
         let o_base = cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void);
 
-        const F32: u64 = std::mem::size_of::<f32>() as u64;
-
-        // Scratch scores/probabilities buffer S = [B, heads, Sq, Sk] (f32) and a
-        // single reused cuBLASLt workspace.
-        let scores_elems = batch * self.num_heads * sq * sk;
-        let scores_buf = self.runtime.alloc_raw(scores_elems * F32 as usize)?;
-        let workspace = self.runtime.alloc_raw(WORKSPACE_BYTES)?;
-
-        let result = self.run_stages(
+        run_attention_f32(
+            &self.runtime,
+            self.num_heads,
+            self.num_kv_heads,
+            self.causal,
             batch,
             sq,
             sk,
             d,
+            sk,
             group,
             scale,
             q_base,
             k_base,
             v_base,
             o_base,
-            scores_buf,
-            workspace,
             mask_ptr,
             mask_planes,
-        );
-
-        // Always release scratch + workspace, even on failure.
-        // SAFETY: both pointers came from the `alloc_raw` calls above and are
-        // each freed exactly once here.
-        let free_scores = unsafe { self.runtime.free_raw(scores_buf) };
-        let free_ws = unsafe { self.runtime.free_raw(workspace) };
-        result.and(free_scores).and(free_ws)
+            0,
+            0,
+            0,
+            0.0,
+        )
     }
+}
 
-    /// The three stream-ordered stages (QKᵀ, softmax, PV) plus a final sync.
-    #[allow(clippy::too_many_arguments)]
-    fn run_stages(
-        &self,
-        batch: usize,
-        sq: usize,
-        sk: usize,
-        d: usize,
-        group: usize,
-        scale: f32,
-        q_base: CUdeviceptr,
-        k_base: CUdeviceptr,
-        v_base: CUdeviceptr,
-        o_base: CUdeviceptr,
-        scores_buf: CUdeviceptr,
-        workspace: CUdeviceptr,
-        mask_ptr: CUdeviceptr,
-        mask_planes: i32,
-    ) -> Result<()> {
-        const F32: u64 = std::mem::size_of::<f32>() as u64;
-        let blas = self.runtime.blas();
-        let stream = self.runtime.stream_ptr();
+/// Shared f32 attention engine used by both the explicit BNSH `Attention` op and
+/// `GroupQueryAttention` after its BSH inputs/cache have been prepared.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_attention_f32(
+    runtime: &CudaRuntime,
+    num_heads: usize,
+    num_kv_heads: usize,
+    causal: bool,
+    batch: usize,
+    sq: usize,
+    sk: usize,
+    d: usize,
+    kv_capacity: usize,
+    group: usize,
+    scale: f32,
+    q_base: CUdeviceptr,
+    k_base: CUdeviceptr,
+    v_base: CUdeviceptr,
+    o_base: CUdeviceptr,
+    mask_ptr: CUdeviceptr,
+    mask_planes: i32,
+    total_lengths: CUdeviceptr,
+    past_lengths: CUdeviceptr,
+    local_window: i32,
+    softcap: f32,
+) -> Result<()> {
+    const F32: u64 = std::mem::size_of::<f32>() as u64;
+    let scores_elems = batch * num_heads * sq * sk;
+    let scores_buf = runtime.alloc_raw(scores_elems * F32 as usize)?;
+    let workspace = match runtime.alloc_raw(WORKSPACE_BYTES) {
+        Ok(workspace) => workspace,
+        Err(error) => {
+            // SAFETY: `scores_buf` was allocated immediately above and has not
+            // escaped or been freed.
+            let _ = unsafe { runtime.free_raw(scores_buf) };
+            return Err(error);
+        }
+    };
+    let result = (|| {
+        let blas = runtime.blas();
+        let stream = runtime.stream_ptr();
 
         // Stage 1: per-head S = scale · Q·Kᵀ.  Column-major C[Sk,Sq] = Kᵀ·Q.
         for b in 0..batch {
-            for h in 0..self.num_heads {
+            for h in 0..num_heads {
                 let kv = h / group;
-                let q_head = q_base + ((b * self.num_heads + h) * sq * d) as u64 * F32;
-                let k_head = k_base + ((b * self.num_kv_heads + kv) * sk * d) as u64 * F32;
-                let s_head = scores_buf + ((b * self.num_heads + h) * sq * sk) as u64 * F32;
+                let q_head = q_base + ((b * num_heads + h) * sq * d) as u64 * F32;
+                let k_head = k_base + ((b * num_kv_heads + kv) * kv_capacity * d) as u64 * F32;
+                let s_head = scores_buf + ((b * num_heads + h) * sq * sk) as u64 * F32;
 
                 let p = GemmEx {
                     dtype: GemmDtype::F32,
@@ -477,10 +498,8 @@ impl AttentionKernel {
         }
 
         // Stage 2: fused softmax over the keys axis (scale already applied).
-        let nrows = batch * self.num_heads * sq;
-        let func = self
-            .runtime
-            .nvrtc_function(SOFTMAX_MODULE, SOFTMAX_SRC, SOFTMAX_ENTRY)?;
+        let nrows = batch * num_heads * sq;
+        let func = runtime.nvrtc_function(SOFTMAX_MODULE, SOFTMAX_SRC, SOFTMAX_ENTRY)?;
         let cfg = LaunchConfig {
             grid_dim: (nrows as u32, 1, 1),
             block_dim: (SOFTMAX_BLOCK, 1, 1),
@@ -489,23 +508,26 @@ impl AttentionKernel {
         let nrows_i = i32::try_from(nrows).map_err(|_| {
             EpError::KernelFailed(format!("cuda_ep Attention: {nrows} score rows exceed i32"))
         })?;
-        let (sk_i, sq_i, heads_i, batch_i) =
-            (sk as i32, sq as i32, self.num_heads as i32, batch as i32);
-        let causal_i: i32 = self.causal.into();
-        let stream_ref = self.runtime.stream();
+        let (sk_i, sq_i, heads_i, batch_i) = (sk as i32, sq as i32, num_heads as i32, batch as i32);
+        let causal_i: i32 = causal.into();
+        let stream_ref = runtime.stream();
         // Device pointers are passed by value (as u64) — a CUDA pointer kernel
         // parameter is ABI-identical to a 64-bit scalar argument.
         let mut builder = stream_ref.launch_builder(&func);
         builder
             .arg(&scores_buf)
             .arg(&mask_ptr)
+            .arg(&total_lengths)
+            .arg(&past_lengths)
             .arg(&nrows_i)
             .arg(&sk_i)
             .arg(&sq_i)
             .arg(&heads_i)
             .arg(&causal_i)
             .arg(&mask_planes)
-            .arg(&batch_i);
+            .arg(&batch_i)
+            .arg(&local_window)
+            .arg(&softcap);
         // SAFETY: `func` is the compiled softmax entry; the argument list and
         // its ABI match the kernel signature; `scores_buf`/`mask_ptr` are live
         // device allocations sized for [nrows, sk] / the mask planes.
@@ -513,11 +535,11 @@ impl AttentionKernel {
 
         // Stage 3: per-head O = P·V.  Column-major C[D,Sq] = Vᵀ·Pᵀ.
         for b in 0..batch {
-            for h in 0..self.num_heads {
+            for h in 0..num_heads {
                 let kv = h / group;
-                let s_head = scores_buf + ((b * self.num_heads + h) * sq * sk) as u64 * F32;
-                let v_head = v_base + ((b * self.num_kv_heads + kv) * sk * d) as u64 * F32;
-                let o_head = o_base + ((b * self.num_heads + h) * sq * d) as u64 * F32;
+                let s_head = scores_buf + ((b * num_heads + h) * sq * sk) as u64 * F32;
+                let v_head = v_base + ((b * num_kv_heads + kv) * kv_capacity * d) as u64 * F32;
+                let o_head = o_base + ((b * num_heads + h) * sq * d) as u64 * F32;
 
                 let p = GemmEx {
                     dtype: GemmDtype::F32,
@@ -543,8 +565,12 @@ impl AttentionKernel {
             }
         }
 
-        self.runtime.synchronize()
-    }
+        runtime.synchronize()
+    })();
+    // SAFETY: both pointers came from this runtime and are freed exactly once.
+    let free_scores = unsafe { runtime.free_raw(scores_buf) };
+    let free_ws = unsafe { runtime.free_raw(workspace) };
+    result.and(free_scores).and(free_ws)
 }
 
 impl Kernel for AttentionKernel {
