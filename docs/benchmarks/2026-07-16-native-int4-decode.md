@@ -89,3 +89,38 @@ Both runs generated `[12095, 13, 1084, 374]` (` Paris. It is`), so the
 optimized result remained deterministic and coherent. The cached fp32 matrix
 trades memory for decode speed; a future packed-int8/SDOT path can reduce that
 footprint and avoid fp32 weight bandwidth.
+
+## Perf pass 3: accuracy_level=4 int8/VNNI
+
+The native CPU `MatMulNBits` kernel now honors `accuracy_level=4`. It quantizes
+each fp32 activation row symmetrically with `scale = max_abs / 127`, caches
+unpacked int8 weights and block scales, accumulates int8 products in int32, and
+uses runtime-dispatched VNNI on x86-64. The model already contains
+`accuracy_level=4`, so no environment override or graph rewrite was needed.
+
+| Measurement | fp32 prepack | int8/VNNI |
+|---|---:|---:|
+| Decode throughput | 0.50 tok/s | **1.01 tok/s** |
+| Decode latency | 1,993.045 ms/step | **992.584 ms/step** |
+| Speedup | — | **2.01x** |
+
+The release benchmark used 4 generated tokens, 1 warmup, and 2 measured runs:
+
+```text
+cargo run --release -p onnx-genai-bench --features bench-native \
+  --bin profile_native -- \
+  --model /home/justinchu/qwen2.5-0.5b-int4-onnx \
+  --tokens 4 --warmups 1 --runs 2 \
+  --prompt "The capital of France is"
+```
+
+It generated `[12095, 13, 1084, 374]` (` Paris. It is`), matching the fp32
+prepack run. The benchmark host is an Intel Xeon Platinum 8480C; runtime
+detection reported both AVX-VNNI and AVX512-VNNI/AVX512VL, selecting the
+AVX512-VNNI path.
+
+Correctness tests compare against an independently dequantized fp32 matmul for
+block sizes 32 and 128, partial K, M=1, and batched M>1. They use
+`0.05 + 5% * |reference|` tolerance: activation quantization is intentionally
+lossy, and a 5% relative bound plus 0.05 absolute allowance covers values near
+zero without weakening the existing exact default-path tests.

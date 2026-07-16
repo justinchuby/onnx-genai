@@ -3,9 +3,10 @@
 //!
 //! ORT stores `B` as `[N, ceil(K / block_size), block_size / 2]`. Within each
 //! block, the earlier K element occupies the low nibble. For M=1 decode,
-//! constant quantized weights are dequantized once to output-major `[N, K]` f32
-//! and reused by a bounded-parallel GEMV. Other shapes use the shared CPU GEMM,
-//! including its oneDNN backend.
+//! constant quantized weights are prepacked once and reused by a
+//! bounded-parallel GEMV. `accuracy_level=4` keeps those weights in int8 and
+//! quantizes each activation row to int8; the default path remains f32. Other
+//! shapes use the shared CPU GEMM, including its oneDNN backend.
 
 use std::sync::OnceLock;
 
@@ -21,8 +22,16 @@ pub struct MatMulNBitsKernel {
     k: usize,
     n: usize,
     block_size: usize,
+    accuracy_level: i64,
     constant_inputs: [bool; 5],
     weight_nk: OnceLock<Vec<f32>>,
+    int8_weight: OnceLock<Int8Weight>,
+}
+
+struct Int8Weight {
+    values: Vec<i8>,
+    scales: Vec<f32>,
+    block_sums: Vec<i32>,
 }
 
 pub struct MatMulNBitsFactory;
@@ -50,10 +59,7 @@ impl KernelFactory for MatMulNBitsFactory {
             )));
         }
 
-        // accuracy_level controls optimized internal compute in ORT. This
-        // correctness path always accumulates in f32, so every value is safe to
-        // ignore without changing the mathematical result.
-        let _accuracy_level = node
+        let accuracy_level = node
             .attr("accuracy_level")
             .and_then(|value| value.as_int())
             .unwrap_or(0);
@@ -62,8 +68,10 @@ impl KernelFactory for MatMulNBitsFactory {
             k,
             n,
             block_size,
+            accuracy_level,
             constant_inputs: [false; 5],
             weight_nk: OnceLock::new(),
+            int8_weight: OnceLock::new(),
         }))
     }
 }
@@ -136,7 +144,33 @@ impl Kernel for MatMulNBitsKernel {
         let activations = to_dense_f32(&inputs[0])?;
         let m = numel(&a_shape[..a_shape.len() - 1]);
         let mut result = vec![0.0f32; m * self.n];
-        if can_prepack && m == 1 {
+        if self.accuracy_level == 4 && group_indices.is_none() {
+            let owned_weight;
+            let int8_weight = if can_prepack {
+                if let Some(weight) = self.int8_weight.get() {
+                    weight
+                } else {
+                    let weight = self.prepack_int8_weight(&inputs[1], &inputs[2], zero_points)?;
+                    let _ = self.int8_weight.set(weight);
+                    self.int8_weight
+                        .get()
+                        .expect("constant MatMulNBits int8 prepack was just initialized")
+                }
+            } else {
+                owned_weight = self.prepack_int8_weight(&inputs[1], &inputs[2], zero_points)?;
+                &owned_weight
+            };
+            int8_matmul(
+                &activations,
+                int8_weight,
+                &mut result,
+                m,
+                self.k,
+                self.n,
+                self.block_size,
+                selected_dot_kernel(),
+            );
+        } else if can_prepack && m == 1 {
             let weight_nk = if let Some(weight) = self.weight_nk.get() {
                 weight
             } else {
@@ -179,6 +213,59 @@ impl Kernel for MatMulNBitsKernel {
 }
 
 impl MatMulNBitsKernel {
+    fn prepack_int8_weight(
+        &self,
+        packed: &TensorView,
+        scales: &TensorView,
+        zero_points: Option<&TensorView>,
+    ) -> Result<Int8Weight> {
+        let packed = to_dense_bytes(packed)?;
+        let scales = to_dense_f32(scales)?;
+        let packed_zero_points = zero_points.map(to_dense_bytes).transpose()?;
+        let k_blocks = self.k.div_ceil(self.block_size);
+        let blob_size = self.block_size / 2;
+        let zp_row_bytes = k_blocks.div_ceil(2);
+        let padded_k = k_blocks * self.block_size;
+        let mut values = vec![0i8; self.n * padded_k];
+        let mut block_sums = vec![0i32; self.n * k_blocks];
+
+        for output in 0..self.n {
+            for block in 0..k_blocks {
+                let zero_point = packed_zero_points.as_ref().map_or(8, |points| {
+                    let byte = points[output * zp_row_bytes + block / 2];
+                    if block.is_multiple_of(2) {
+                        byte & 0x0f
+                    } else {
+                        byte >> 4
+                    }
+                });
+                let block_start = block * self.block_size;
+                let valid = self.k.saturating_sub(block_start).min(self.block_size);
+                let packed_start = (output * k_blocks + block) * blob_size;
+                let values_start = output * padded_k + block_start;
+                let mut sum = 0i32;
+                for offset in 0..valid {
+                    let byte = packed[packed_start + offset / 2];
+                    let quantized = if offset.is_multiple_of(2) {
+                        byte & 0x0f
+                    } else {
+                        byte >> 4
+                    };
+                    let value = quantized as i8 - zero_point as i8;
+                    values[values_start + offset] = value;
+                    sum += value as i32;
+                }
+                block_sums[output * k_blocks + block] = sum;
+            }
+        }
+
+        Ok(Int8Weight {
+            values,
+            scales,
+            block_sums,
+        })
+    }
+
     fn dequantize_weight(
         &self,
         packed: &TensorView,
@@ -236,6 +323,159 @@ impl MatMulNBitsKernel {
         }
         Ok(weight_kn)
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DotKernel {
+    Scalar,
+    #[cfg(target_arch = "x86_64")]
+    AvxVnni,
+    #[cfg(target_arch = "x86_64")]
+    Avx512Vnni,
+}
+
+fn selected_dot_kernel() -> DotKernel {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::arch::is_x86_feature_detected!("avx512vnni")
+            && std::arch::is_x86_feature_detected!("avx512vl")
+        {
+            return DotKernel::Avx512Vnni;
+        }
+        if std::arch::is_x86_feature_detected!("avxvnni") {
+            return DotKernel::AvxVnni;
+        }
+    }
+    DotKernel::Scalar
+}
+
+fn quantize_activation(activation: &[f32], padded_k: usize) -> (Vec<u8>, f32) {
+    let max_abs = activation
+        .iter()
+        .map(|value| value.abs())
+        .fold(0.0, f32::max);
+    if max_abs == 0.0 {
+        return (vec![128; padded_k], 0.0);
+    }
+    let scale = max_abs / 127.0;
+    let inverse_scale = scale.recip();
+    let mut quantized = vec![128u8; padded_k];
+    for (output, &value) in quantized.iter_mut().zip(activation) {
+        let signed = (value * inverse_scale).round().clamp(-127.0, 127.0) as i8;
+        *output = (signed as i16 + 128) as u8;
+    }
+    (quantized, scale)
+}
+
+fn int8_matmul(
+    activations: &[f32],
+    weight: &Int8Weight,
+    result: &mut [f32],
+    m: usize,
+    k: usize,
+    n: usize,
+    block_size: usize,
+    dot_kernel: DotKernel,
+) {
+    let k_blocks = k.div_ceil(block_size);
+    let padded_k = k_blocks * block_size;
+    debug_assert_eq!(weight.values.len(), n * padded_k);
+    debug_assert_eq!(weight.scales.len(), n * k_blocks);
+    debug_assert_eq!(weight.block_sums.len(), n * k_blocks);
+
+    for row in 0..m {
+        let (activation, activation_scale) =
+            quantize_activation(&activations[row * k..(row + 1) * k], padded_k);
+        result[row * n..(row + 1) * n]
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(output_index, output)| {
+                let mut value = 0.0f32;
+                let weight_row =
+                    &weight.values[output_index * padded_k..(output_index + 1) * padded_k];
+                for block in 0..k_blocks {
+                    let start = block * block_size;
+                    let end = start + block_size;
+                    let unsigned_dot =
+                        dot_u8_i8(&activation[start..end], &weight_row[start..end], dot_kernel);
+                    let signed_dot =
+                        unsigned_dot - 128 * weight.block_sums[output_index * k_blocks + block];
+                    value += signed_dot as f32
+                        * (activation_scale * weight.scales[output_index * k_blocks + block]);
+                }
+                *output = value;
+            });
+    }
+}
+
+fn dot_u8_i8(activation: &[u8], weight: &[i8], kernel: DotKernel) -> i32 {
+    debug_assert_eq!(activation.len(), weight.len());
+    #[cfg(target_arch = "x86_64")]
+    {
+        match kernel {
+            DotKernel::AvxVnni => {
+                // SAFETY: selected_dot_kernel checked AVX-VNNI at runtime.
+                return unsafe { dot_u8_i8_avxvnni(activation, weight) };
+            }
+            DotKernel::Avx512Vnni => {
+                // SAFETY: selected_dot_kernel checked AVX512-VNNI and AVX512VL.
+                return unsafe { dot_u8_i8_avx512vnni(activation, weight) };
+            }
+            DotKernel::Scalar => {}
+        }
+    }
+    dot_u8_i8_scalar(activation, weight)
+}
+
+fn dot_u8_i8_scalar(activation: &[u8], weight: &[i8]) -> i32 {
+    activation
+        .iter()
+        .zip(weight)
+        .map(|(&activation, &weight)| activation as i32 * weight as i32)
+        .sum()
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avxvnni")]
+unsafe fn dot_u8_i8_avxvnni(activation: &[u8], weight: &[i8]) -> i32 {
+    use std::arch::x86_64::*;
+
+    let vector_len = activation.len() / 32 * 32;
+    let mut accumulator = _mm256_setzero_si256();
+    for index in (0..vector_len).step_by(32) {
+        // SAFETY: index is within equal-length slices and loadu permits unaligned pointers.
+        let a = unsafe { _mm256_loadu_si256(activation.as_ptr().add(index).cast()) };
+        // SAFETY: index is within equal-length slices and loadu permits unaligned pointers.
+        let b = unsafe { _mm256_loadu_si256(weight.as_ptr().add(index).cast()) };
+        accumulator = _mm256_dpbusd_avx_epi32(accumulator, a, b);
+    }
+    horizontal_sum_256(accumulator)
+        + dot_u8_i8_scalar(&activation[vector_len..], &weight[vector_len..])
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512vnni,avx512vl")]
+unsafe fn dot_u8_i8_avx512vnni(activation: &[u8], weight: &[i8]) -> i32 {
+    use std::arch::x86_64::*;
+
+    let vector_len = activation.len() / 32 * 32;
+    let mut accumulator = _mm256_setzero_si256();
+    for index in (0..vector_len).step_by(32) {
+        // SAFETY: index is within equal-length slices and loadu permits unaligned pointers.
+        let a = unsafe { _mm256_loadu_si256(activation.as_ptr().add(index).cast()) };
+        // SAFETY: index is within equal-length slices and loadu permits unaligned pointers.
+        let b = unsafe { _mm256_loadu_si256(weight.as_ptr().add(index).cast()) };
+        accumulator = _mm256_dpbusd_epi32(accumulator, a, b);
+    }
+    horizontal_sum_256(accumulator)
+        + dot_u8_i8_scalar(&activation[vector_len..], &weight[vector_len..])
+}
+
+#[cfg(target_arch = "x86_64")]
+fn horizontal_sum_256(value: std::arch::x86_64::__m256i) -> i32 {
+    // SAFETY: __m256i and [i32; 8] are both 32-byte plain-data values.
+    let lanes: [i32; 8] = unsafe { std::mem::transmute(value) };
+    lanes.into_iter().sum()
 }
 
 #[derive(Clone, Copy)]
@@ -327,11 +567,11 @@ fn error(message: impl Into<String>) -> EpError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kernels::testutil::Owned;
     use crate::CpuExecutionProvider;
+    use crate::kernels::testutil::Owned;
     use onnx_runtime_ep_api::ExecutionProvider;
-    use onnx_runtime_ir::{static_shape, Attribute, Graph, NodeId};
-    use onnx_runtime_loader::Model;
+    use onnx_runtime_ir::{Attribute, Graph, NodeId, static_shape};
+    use onnx_runtime_loader::{Model, encode_model_proto};
 
     fn model_node(
         a_shape: &[usize],
@@ -386,8 +626,17 @@ mod tests {
             k,
             n,
             block_size,
+            accuracy_level: 0,
             constant_inputs: [false; 5],
             weight_nk: OnceLock::new(),
+            int8_weight: OnceLock::new(),
+        }
+    }
+
+    fn accuracy4_kernel(k: usize, n: usize, block_size: usize) -> MatMulNBitsKernel {
+        MatMulNBitsKernel {
+            accuracy_level: 4,
+            ..test_kernel(k, n, block_size)
         }
     }
 
@@ -490,6 +739,169 @@ mod tests {
                 "index {index}: actual={actual}, expected={expected}"
             );
         }
+    }
+
+    fn assert_int8_close(actual: &[f32], expected: &[f32]) {
+        assert_eq!(actual.len(), expected.len());
+        for (index, (&actual, &expected)) in actual.iter().zip(expected).enumerate() {
+            let tolerance = 0.05 + 0.05 * expected.abs();
+            assert!(
+                (actual - expected).abs() <= tolerance,
+                "index {index}: actual={actual}, expected={expected}, tolerance={tolerance}"
+            );
+        }
+    }
+
+    fn accuracy4_model(m: usize, k: usize, n: usize, block_size: usize) -> (Graph, NodeId) {
+        let blocks = k.div_ceil(block_size);
+        let (mut graph, node) = model_node(
+            &[m, k],
+            &[n, blocks, block_size / 2],
+            &[n, blocks],
+            None,
+            &[m, n],
+            k,
+            n,
+            block_size,
+        );
+        graph
+            .node_mut(node)
+            .attributes
+            .insert("accuracy_level".into(), Attribute::Int(4));
+        let proto = encode_model_proto(&Model::new(&graph)).expect("IR model must encode to ONNX");
+        let attribute = &proto.graph.as_ref().unwrap().node[0].attribute;
+        assert!(
+            attribute
+                .iter()
+                .any(|attr| attr.name == "accuracy_level" && attr.i == 4)
+        );
+        (graph, node)
+    }
+
+    fn run_accuracy4_case(m: usize, k: usize, n: usize, block_size: usize) {
+        let a_values: Vec<f32> = (0..m * k)
+            .map(|i| ((i * 17 % 43) as f32 - 21.0) / 13.0)
+            .collect();
+        let weights: Vec<f32> = (0..n * k)
+            .map(|i| ((i * 19 % 47) as f32 - 23.0) / 12.0)
+            .collect();
+        let (packed, scales, _, _) = quantize(&weights, n, k, block_size, false);
+        let dequantized = dequantize_reference(&packed, &scales, None, n, k, block_size);
+        let expected = reference(&a_values, &dequantized, m, k, n);
+        let (graph, node) = accuracy4_model(m, k, n, block_size);
+        let model = Model::new(&graph);
+        let kernel = CpuExecutionProvider::new()
+            .get_kernel(model.graph.node(node), &[], 1)
+            .unwrap();
+        let a = Owned::f32(&[m, k], &a_values);
+        let b = Owned::u8(&[n, k.div_ceil(block_size), block_size / 2], &packed);
+        let scales = Owned::f32(&[n, k.div_ceil(block_size)], &scales);
+        let mut y = Owned::zeros_f32(&[m, n]);
+        kernel
+            .execute(&[a.view(), b.view(), scales.view()], &mut [y.view_mut()])
+            .unwrap();
+        assert_int8_close(&y.to_f32(), &expected);
+    }
+
+    #[test]
+    fn matmulnbits_accuracy4_block32_partial_k_m1_matches_fp32_reference() {
+        run_accuracy4_case(1, 45, 9, 32);
+    }
+
+    #[test]
+    fn matmulnbits_accuracy4_block128_partial_k_batched_matches_fp32_reference() {
+        run_accuracy4_case(3, 141, 7, 128);
+    }
+
+    #[test]
+    fn matmulnbits_accuracy4_prepack_reuses_int8_weight() {
+        let (k, n, block_size) = (45, 5, 32);
+        let activations: Vec<f32> = (0..k)
+            .map(|i| ((i * 11 % 37) as f32 - 18.0) / 9.0)
+            .collect();
+        let weights: Vec<f32> = (0..n * k)
+            .map(|i| ((i * 13 % 41) as f32 - 20.0) / 11.0)
+            .collect();
+        let (packed, scales, _, _) = quantize(&weights, n, k, block_size, false);
+        let mut kernel = accuracy4_kernel(k, n, block_size);
+        kernel.set_constant_inputs(&[false, true, true]);
+        let a = Owned::f32(&[1, k], &activations);
+        let b = Owned::u8(&[n, 2, 16], &packed);
+        let scales = Owned::f32(&[n, 2], &scales);
+        let mut y = Owned::zeros_f32(&[1, n]);
+        kernel
+            .execute(&[a.view(), b.view(), scales.view()], &mut [y.view_mut()])
+            .unwrap();
+        let cached = kernel
+            .int8_weight
+            .get()
+            .expect("int8 weight must be cached")
+            .values
+            .as_ptr();
+        kernel
+            .execute(&[a.view(), b.view(), scales.view()], &mut [y.view_mut()])
+            .unwrap();
+        assert_eq!(kernel.int8_weight.get().unwrap().values.as_ptr(), cached);
+        assert!(kernel.weight_nk.get().is_none());
+    }
+
+    #[test]
+    fn matmulnbits_accuracy4_vnni_matches_scalar_when_available() {
+        let activation: Vec<u8> = (0..128).map(|i| ((i * 29 + 7) % 255) as u8).collect();
+        let weight: Vec<i8> = (0..128).map(|i| ((i * 17 % 31) as i8) - 15).collect();
+        let scalar = dot_u8_i8(&activation, &weight, DotKernel::Scalar);
+        let selected = selected_dot_kernel();
+        #[cfg(target_arch = "x86_64")]
+        if std::arch::is_x86_feature_detected!("avxvnni")
+            || (std::arch::is_x86_feature_detected!("avx512vnni")
+                && std::arch::is_x86_feature_detected!("avx512vl"))
+        {
+            assert_ne!(
+                selected,
+                DotKernel::Scalar,
+                "a VNNI CPU must select the VNNI path"
+            );
+        }
+        assert_eq!(dot_u8_i8(&activation, &weight, selected), scalar);
+
+        let activations: Vec<f32> = (0..256)
+            .map(|i| ((i * 23 % 53) as f32 - 26.0) / 17.0)
+            .collect();
+        let values: Vec<i8> = (0..384)
+            .map(|i| ((i * 11 % 16) as i8) - 8)
+            .collect();
+        let block_sums = values
+            .chunks_exact(128)
+            .map(|block| block.iter().map(|&value| value as i32).sum())
+            .collect();
+        let prepacked = Int8Weight {
+            values,
+            scales: vec![0.01, 0.02, 0.03],
+            block_sums,
+        };
+        let mut scalar_output = vec![0.0; 6];
+        let mut selected_output = vec![0.0; 6];
+        int8_matmul(
+            &activations,
+            &prepacked,
+            &mut scalar_output,
+            2,
+            128,
+            3,
+            128,
+            DotKernel::Scalar,
+        );
+        int8_matmul(
+            &activations,
+            &prepacked,
+            &mut selected_output,
+            2,
+            128,
+            3,
+            128,
+            selected,
+        );
+        assert_close(&selected_output, &scalar_output);
     }
 
     #[test]
