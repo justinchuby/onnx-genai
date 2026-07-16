@@ -1,10 +1,11 @@
 use onnx_runtime_ep_api::{
     DeviceBuffer, DevicePtr, DevicePtrMut, ExecutionProvider, TensorMut, TensorView,
 };
+use onnx_runtime_ep_cpu::CpuExecutionProvider;
 use onnx_runtime_ep_cuda::CudaExecutionProvider;
 use onnx_runtime_ep_cuda::runtime::cuptr;
 use onnx_runtime_ir::{
-    Attribute, DataType, Graph, Node, NodeId, compute_contiguous_strides, static_shape,
+    Attribute, DataType, DeviceId, Graph, Node, NodeId, compute_contiguous_strides, static_shape,
 };
 use onnx_runtime_loader::Model;
 
@@ -303,6 +304,98 @@ fn run_case(
         .collect())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn run_cpu_case(
+    a_shape: &[usize],
+    activations: &[f32],
+    packed: &[u8],
+    scales: &[f32],
+    k: usize,
+    n: usize,
+    block_size: usize,
+    accuracy_level: i64,
+) -> Vec<f32> {
+    let blocks = k.div_ceil(block_size);
+    let blob_size = block_size / 2;
+    let mut graph = Graph::new();
+    graph.opset_imports.insert("com.microsoft".into(), 1);
+    let a = graph.create_named_value(
+        "A",
+        DataType::Float32,
+        static_shape(a_shape.iter().copied()),
+    );
+    let b = graph.create_named_value("B", DataType::Uint8, static_shape([n, blocks, blob_size]));
+    let scales_value =
+        graph.create_named_value("scales", DataType::Float32, static_shape([n, blocks]));
+    for value in [a, b, scales_value] {
+        graph.add_input(value);
+    }
+    let mut output_shape = a_shape[..a_shape.len() - 1].to_vec();
+    output_shape.push(n);
+    let output = graph.create_named_value(
+        "Y",
+        DataType::Float32,
+        static_shape(output_shape.iter().copied()),
+    );
+    let mut node = Node::new(
+        NodeId(0),
+        "MatMulNBits",
+        vec![Some(a), Some(b), Some(scales_value)],
+        vec![output],
+    );
+    node.domain = "com.microsoft".into();
+    node.attributes.insert("K".into(), Attribute::Int(k as i64));
+    node.attributes.insert("N".into(), Attribute::Int(n as i64));
+    node.attributes.insert("bits".into(), Attribute::Int(4));
+    node.attributes
+        .insert("block_size".into(), Attribute::Int(block_size as i64));
+    node.attributes
+        .insert("accuracy_level".into(), Attribute::Int(accuracy_level));
+    let node = graph.insert_node(node);
+    graph.add_output(output);
+    let model = Model::new(&graph);
+    let kernel = CpuExecutionProvider::new()
+        .get_kernel(model.graph.node(node), &[], 1)
+        .unwrap();
+
+    let inputs = [
+        tensor(DataType::Float32, a_shape, activations),
+        tensor(DataType::Uint8, &[n, blocks, blob_size], packed),
+        tensor(DataType::Float32, &[n, blocks], scales),
+    ];
+    let input_strides: Vec<_> = inputs
+        .iter()
+        .map(|input| compute_contiguous_strides(&input.shape))
+        .collect();
+    let input_views: Vec<_> = inputs
+        .iter()
+        .zip(&input_strides)
+        .map(|(input, strides)| {
+            TensorView::new(
+                DevicePtr(input.bytes.as_ptr().cast()),
+                input.dtype,
+                &input.shape,
+                strides,
+                DeviceId::cpu(),
+            )
+        })
+        .collect();
+    let mut output_bytes = vec![0u8; output_shape.iter().product::<usize>() * 4];
+    let output_strides = compute_contiguous_strides(&output_shape);
+    let output_view = TensorMut::new(
+        DevicePtrMut(output_bytes.as_mut_ptr().cast()),
+        DataType::Float32,
+        &output_shape,
+        &output_strides,
+        DeviceId::cpu(),
+    );
+    kernel.execute(&input_views, &mut [output_view]).unwrap();
+    output_bytes
+        .chunks_exact(4)
+        .map(|value| f32::from_ne_bytes(value.try_into().unwrap()))
+        .collect()
+}
+
 fn assert_close(actual: &[f32], expected: &[f32]) {
     assert_eq!(actual.len(), expected.len());
     for (index, (&actual, &expected)) in actual.iter().zip(expected).enumerate() {
@@ -459,4 +552,45 @@ fn matmul_nbits_gpu_accuracy4_block32_decode_matches_quantized_reference() {
     .unwrap();
     assert_close(&actual, &expected);
     eprintln!("verified accuracy_level=4 packed-int4 CUDA GEMV semantics");
+}
+
+#[test]
+fn matmul_nbits_gpu_accuracy4_stays_within_cpu_vnni_tolerance() {
+    let Some(ep) = gpu() else { return };
+    let (m, k, n, block_size) = (1usize, 4864usize, 17usize, 32usize);
+    let blocks = k.div_ceil(block_size);
+    let blob_size = block_size / 2;
+    let mut state = 0xd18a_46ce_3b79_205fu64;
+    let activations: Vec<f32> = (0..k)
+        .map(|_| (random_u32(&mut state) as f32 / u32::MAX as f32 - 0.5) * 6.0)
+        .collect();
+    let packed: Vec<u8> = (0..n * blocks * blob_size)
+        .map(|_| random_u32(&mut state) as u8)
+        .collect();
+    let scales: Vec<f32> = (0..n * blocks)
+        .map(|_| 0.001 + (random_u32(&mut state) as f32 / u32::MAX as f32) * 0.09)
+        .collect();
+
+    let expected = run_cpu_case(&[m, k], &activations, &packed, &scales, k, n, block_size, 4);
+    let actual = run_case(
+        &ep,
+        &[m, k],
+        &activations,
+        &packed,
+        &scales,
+        None,
+        k,
+        n,
+        block_size,
+        4,
+    )
+    .unwrap();
+
+    assert_close(&actual, &expected);
+    let max_abs_diff = actual
+        .iter()
+        .zip(&expected)
+        .map(|(&actual, &expected)| (actual - expected).abs())
+        .fold(0.0f32, f32::max);
+    eprintln!("accuracy_level=4 CPU/CUDA max_abs_diff={max_abs_diff:e}");
 }

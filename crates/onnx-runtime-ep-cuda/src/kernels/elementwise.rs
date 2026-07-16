@@ -63,7 +63,16 @@ __device__ float op_sigmoid(float x) {
     float e = (float)exp((double)x);
     return e / (1.0f + e);
 }
-__device__ float op_silu(float x) { return x * op_sigmoid(x); }
+__device__ float op_silu(float x) {
+    if (x >= 0.0f) {
+        const float denominator =
+            __fadd_rn(1.0f, (float)exp((double)-x));
+        return __fdiv_rn(x, denominator);
+    }
+    const float e = (float)exp((double)x);
+    const float numerator = __fmul_rn(x, e);
+    return __fdiv_rn(numerator, __fadd_rn(1.0f, e));
+}
 __device__ float op_gelu(float x) {
     return x * 0.5f * (1.0f + erff(x * 0.7071067811865475f));
 }

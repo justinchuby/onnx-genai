@@ -1015,9 +1015,9 @@ mod tests {
 
         assert_eq!(cpu_tokens.len(), 16);
         assert_eq!(cuda_tokens.len(), cpu_tokens.len());
-        // Explicit non-contracted RMS reductions extend CUDA/CPU parity through
-        // token 11. Residual backend drift currently starts at token index 12.
-        assert_eq!(&cuda_tokens[..12], &cpu_tokens[..12]);
+        // CUDA and CPU now select the same first 16 tokens; longer traces still
+        // expose sub-ulp backend transcendental differences.
+        assert_eq!(cuda_tokens, cpu_tokens);
         assert_eq!(
             &cpu_tokens[..8],
             &[11576, 42740, 11, 358, 614, 264, 3405, 911]

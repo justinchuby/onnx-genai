@@ -155,6 +155,41 @@ fn wave4_activations_match_cpu_references() {
 }
 
 #[test]
+fn silu_matches_cpu_operation_order_exactly() {
+    let ep = match std::panic::catch_unwind(CudaExecutionProvider::new_default) {
+        Ok(Ok(ep)) => ep,
+        Ok(Err(error)) => {
+            eprintln!("skip: no CUDA GPU/runtime available ({error})");
+            return;
+        }
+        Err(_) => {
+            eprintln!("skip: CUDA runtime library loading panicked (library unavailable)");
+            return;
+        }
+    };
+    let x: [f32; 6] = [
+        -0.18738078,
+        -0.19820021,
+        0.52342105,
+        -0.29911944,
+        0.2953185,
+        1.0913864,
+    ];
+    let expected = x.map(|value| {
+        if value >= 0.0 {
+            value / (1.0 + (-value).exp())
+        } else {
+            let exp = value.exp();
+            value * exp / (1.0 + exp)
+        }
+    });
+    let mut silu = Node::new(NodeId(0), "Silu", vec![], vec![]);
+    silu.domain = "com.microsoft".into();
+
+    assert_eq!(run(&ep, &silu, &x, None), expected);
+}
+
+#[test]
 fn clip_optional_bounds_match_cpu_reference() {
     let ep = match std::panic::catch_unwind(CudaExecutionProvider::new_default) {
         Ok(Ok(ep)) => ep,

@@ -176,12 +176,14 @@ extern "C" __global__ void matmul_nbits_gemv_accuracy4_block32(
                     activation[depth] * inverse_scale)));
             dot += quantized_activation * (quantized_weight - 8);
         }
-        value += (float)dot * scales[(long)column * k_blocks + block];
+        const float scaled =
+            __fmul_rn((float)dot, scales[(long)column * k_blocks + block]);
+        value = __fadd_rn(value, scaled);
     }
 
-    value = warp_sum(value) * activation_scale;
+    value = __fmul_rn(warp_sum(value), activation_scale);
     if (threadIdx.x == 0) {
-        output[column] = value + (bias ? bias[column] : 0.0f);
+        output[column] = bias ? __fadd_rn(value, bias[column]) : value;
     }
 }
 "#;
@@ -243,16 +245,20 @@ extern "C" __global__ void matmul_nbits_accuracy4(
                 dot += quantized_activation * (quantized_weight - zero_point);
             }
             if (m == 1 && block_size == 32 && !zero_points) {
-                value += (float)dot * scales[(long)output * k_blocks + block];
+                const float scaled =
+                    __fmul_rn((float)dot, scales[(long)output * k_blocks + block]);
+                value = __fadd_rn(value, scaled);
             } else {
-                value += (float)dot *
-                    (activation_scale * scales[(long)output * k_blocks + block]);
+                const float combined_scale = __fmul_rn(
+                    activation_scale,
+                    scales[(long)output * k_blocks + block]);
+                value = __fadd_rn(value, __fmul_rn((float)dot, combined_scale));
             }
         }
         if (m == 1 && block_size == 32 && !zero_points) {
-            value *= activation_scale;
+            value = __fmul_rn(value, activation_scale);
         }
-        y[idx] = value + (bias ? bias[output] : 0.0f);
+        y[idx] = bias ? __fadd_rn(value, bias[output]) : value;
     }
 }
 "#;
