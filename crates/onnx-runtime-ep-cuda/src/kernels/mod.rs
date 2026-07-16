@@ -30,6 +30,7 @@ pub mod fused_gemm;
 pub mod gemm;
 pub mod group_query_attention;
 pub mod matmul;
+pub mod matmul_nbits;
 pub mod normalization;
 pub mod pointwise;
 pub mod pooling;
@@ -74,6 +75,7 @@ use pointwise::{
 /// prioritised list of remaining / custom-kernel ops.
 pub const CUDA_COVERED_OPS: &[&str] = &[
     "MatMul",
+    "MatMulNBits",
     "Gemm",
     "FusedMatMulBias",
     "FusedGemm",
@@ -147,6 +149,12 @@ pub fn build_cuda_registry(runtime: Arc<CudaRuntime>) -> OpRegistry {
     reg.register(
         OpKey::new("MatMul", "", 1),
         Box::new(matmul::MatMulFactory {
+            runtime: runtime.clone(),
+        }),
+    );
+    reg.register(
+        OpKey::new("MatMulNBits", "com.microsoft", 1),
+        Box::new(matmul_nbits::MatMulNBitsFactory {
             runtime: runtime.clone(),
         }),
     );
@@ -449,7 +457,7 @@ mod tests {
 
     #[test]
     fn covered_ops_have_no_duplicates() {
-        assert_eq!(CUDA_COVERED_OPS.len(), 61);
+        assert_eq!(CUDA_COVERED_OPS.len(), 62);
 
         let mut seen = std::collections::HashSet::new();
         for op in CUDA_COVERED_OPS {

@@ -51,6 +51,7 @@ not yet wired) · **🔬 custom** (needs a fused NVRTC/CUTLASS kernel).
 | `Gemm` | `` | ✅ | **cuBLASLt** + NVRTC bias | `Y=α·A'·B'+β·C`, transA/transB, α/β; fused NVRTC `β·C` broadcast-bias epilogue (`gemm.rs`). f32. |
 | `FusedMatMulBias` | `com.microsoft` | ✅ | **cuBLASLt** `CUBLASLT_EPILOGUE_BIAS` | Dense rank-2 f32/f16/bf16 with an exact per-N bias vector; bias add is fused into GEMM with no elementwise pass. |
 | `FusedGemm` | `com.microsoft` | ✅ | **cuBLASLt** `CUBLASLT_EPILOGUE_{BIAS,RELU_BIAS,GELU_BIAS}` | Dense rank-2 f32/f16/bf16; transA/transB and α. CUDA 13's `GELU_BIAS` is the tanh/0.044715 GELU approximation (H200 output differs from exact-erf at the expected ~2.2e-4 for x=1.5); cuBLASLt exposes no exact-erf selector, so this deliberately follows the vendor epilogue rather than adding a separate pass. Bias must be per-N and `beta=1` because `BIAS_POINTER` is unscaled; other β values fail explicitly. Missing `activation` defaults to Relu for the repository optimizer's existing `FusedGemm` contract; empty/Identity selects plain BIAS. |
+| `MatMulNBits` | `com.microsoft` | ✅ | **NVRTC-custom + cuBLASLt** | Standard packed INT4 `[N, ceil(K/block_size), block_size/2]` weights are block-wise dequantized to f32 on-device, then multiplied by f32 activations with full-f32 accumulation. Supports optional packed zero points, group indices, and fused per-N bias. |
 
 ### Convolution
 
@@ -152,9 +153,9 @@ counts:
 |---------|------:|
 | CPU registry `(domain, op_type)` pairs | **103** |
 | CPU standard-domain (`ai.onnx`) op types | **93** |
-| CUDA registry `(domain, op_type)` pairs | **62** |
-| CUDA advertised op names | **61** |
-| CPU pairs implemented by CUDA in the same domain | **50 / 103** |
+| CUDA registry `(domain, op_type)` pairs | **63** |
+| CUDA advertised op names | **62** |
+| CPU pairs implemented by CUDA in the same domain | **51 / 103** |
 | CPU standard-domain op types implemented by CUDA | **43 / 93** |
 
 The **43 shared `ai.onnx` ops** are: `Abs`, `Add`, `AveragePool`, `Cast`, `CastLike`,
@@ -174,9 +175,10 @@ The **50 CPU `ai.onnx` gaps** are: `Acos`, `Acosh`, `ArgMax`, `ArgMin`, `Asin`,
 `Shape`, `Sinh`, `Size`, `Slice`, `Split`, `Squeeze`, `Sum`, `Swish`, `Tan`,
 `Tile`, `TopK`, `Transpose`, `Unsqueeze`, and `Where`.
 
-For `com.microsoft`, CUDA matches seven CPU pairs (`FusedGemm`,
-`FusedMatMulBias`, `Gelu`, `LayerNormalization`, `SimplifiedLayerNormalization`,
-`SkipLayerNormalization`, `SkipSimplifiedLayerNormalization`); CPU-only gaps are `BiasGelu`, `FastGelu`,
+For `com.microsoft`, CUDA matches eight CPU pairs (`FusedGemm`,
+`FusedMatMulBias`, `Gelu`, `LayerNormalization`, `MatMulNBits`,
+`SimplifiedLayerNormalization`, `SkipLayerNormalization`,
+`SkipSimplifiedLayerNormalization`); CPU-only gaps are `BiasGelu`, `FastGelu`,
 `FusedAttention`, and `QuickGelu`. CUDA additionally exposes
 `com.microsoft::Attention`. CUDA standard-domain extras not currently registered
 by the CPU EP are `And`, `Conv`, `Greater`, `GreaterOrEqual`, `Less`,
@@ -267,4 +269,4 @@ candidate.
   libs are installed. Every such failure is an actionable `EpError` (RULES.md #1)
   naming the missing library and how to fix it.
 
-`SkipSimplifiedLayerNormalization` raises the advertised CUDA set to **61** op names; it is GPU-validated against an independent residual-add and RMS-normalization reference, including broadcast skip and residual-sum output.
+`SkipSimplifiedLayerNormalization` raised the advertised CUDA set to **61** op names; `MatMulNBits` raises it to **62** and is GPU-validated against independent INT4 dequantization and matmul references.
