@@ -1437,14 +1437,42 @@ fn split_num_outputs_zero_size_final_chunk() {
 }
 
 #[test]
-fn equal_broadcasts_to_bool() {
-    let n = node("Equal", 2, 1);
+fn comparison_ops_broadcast_to_bool() {
+    for op in ["Less", "LessOrEqual", "Greater", "GreaterOrEqual", "Equal"] {
+        let outs = run(
+            &node(op, 2, 1),
+            vec![
+                tin(DataType::Float32, vec![c(2), c(1), c(4)]),
+                tin(DataType::Float32, vec![c(1), c(3), c(1)]),
+            ],
+            19,
+        );
+        assert_eq!(out_shape(&outs), vec![c(2), c(3), c(4)], "{op}");
+        assert_eq!(out_dtype(&outs), DataType::Bool, "{op}");
+    }
+}
+
+#[test]
+fn logical_ops_broadcast_to_bool() {
+    for op in ["And", "Or", "Xor"] {
+        let outs = run(
+            &node(op, 2, 1),
+            vec![
+                tin(DataType::Bool, vec![c(2), c(1)]),
+                tin(DataType::Bool, vec![c(1), c(3)]),
+            ],
+            19,
+        );
+        assert_eq!(out_shape(&outs), vec![c(2), c(3)], "{op}");
+        assert_eq!(out_dtype(&outs), DataType::Bool, "{op}");
+    }
+}
+
+#[test]
+fn not_preserves_shape_and_outputs_bool() {
     let outs = run(
-        &n,
-        vec![
-            tin(DataType::Int64, vec![c(2), c(1)]),
-            tin(DataType::Int64, vec![c(1), c(3)]),
-        ],
+        &node("Not", 1, 1),
+        vec![tin(DataType::Bool, vec![c(2), c(3)])],
         19,
     );
     assert_eq!(out_shape(&outs), vec![c(2), c(3)]);
