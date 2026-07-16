@@ -6,8 +6,8 @@ use ::onnx_rs as onnx;
 use onnx::{Error as OnnxError, Model as OnnxModel};
 use onnx_runtime_loader::{LoaderError, ModelMetadata, load_model_bytes_with_weights};
 use pyo3::exceptions::{
-    PyFileNotFoundError, PyIsADirectoryError, PyOSError, PyPermissionError, PyTypeError,
-    PyValueError,
+    PyAttributeError, PyFileNotFoundError, PyIsADirectoryError, PyOSError, PyPermissionError,
+    PyTypeError, PyValueError,
 };
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyString};
@@ -34,7 +34,7 @@ impl Model {
 /// Load an ONNX protobuf model from a path or serialized bytes.
 #[pyfunction]
 #[pyo3(signature = (path_or_bytes))]
-fn load_model(py: Python<'_>, path_or_bytes: &Bound<'_, PyAny>) -> PyResult<Model> {
+fn load_model(path_or_bytes: &Bound<'_, PyAny>) -> PyResult<Model> {
     if let Ok(bytes) = path_or_bytes.downcast::<PyBytes>() {
         let bytes = bytes.as_bytes();
         return load_model_bytes(bytes)
@@ -51,14 +51,7 @@ fn load_model(py: Python<'_>, path_or_bytes: &Bound<'_, PyAny>) -> PyResult<Mode
             });
     }
 
-    let path = path_arg(py, path_or_bytes, "load_model(path_or_bytes)")?;
-    if !path.exists() {
-        return Err(PyFileNotFoundError::new_err(format!(
-            "failed to load ONNX model from {:?}: the file does not exist. Pass a path to an \
-             existing .onnx/.pb file, or pass the serialized ModelProto as bytes.",
-            path
-        )));
-    }
+    let path = path_arg(path_or_bytes, "load_model(path_or_bytes)", true)?;
 
     onnx::load_model(&path)
         .map(|inner| Model { inner })
@@ -67,8 +60,8 @@ fn load_model(py: Python<'_>, path_or_bytes: &Bound<'_, PyAny>) -> PyResult<Mode
                 "load ONNX model",
                 &format!("{path:?}"),
                 error,
-                "Verify that the file is a valid ONNX protobuf model and that any external-data \
-                 files remain beside it at the paths recorded in the model.",
+                "Pass a path to an existing, readable ONNX protobuf model. If it uses external \
+                 data, keep those files beside it at the paths recorded in the model.",
             )
         })
 }
@@ -76,8 +69,8 @@ fn load_model(py: Python<'_>, path_or_bytes: &Bound<'_, PyAny>) -> PyResult<Mode
 /// Save an ONNX model as binary protobuf.
 #[pyfunction]
 #[pyo3(signature = (model, path))]
-fn save_model(py: Python<'_>, model: PyRef<'_, Model>, path: &Bound<'_, PyAny>) -> PyResult<()> {
-    let path = path_arg(py, path, "save_model(model, path)")?;
+fn save_model(model: PyRef<'_, Model>, path: &Bound<'_, PyAny>) -> PyResult<()> {
+    let path = path_arg(path, "save_model(model, path)", false)?;
     onnx::save_model(&model.inner, &path).map_err(|error| {
         map_onnx_error(
             "save ONNX model",
@@ -177,23 +170,33 @@ fn from_textproto(source: &str) -> PyResult<Model> {
         })
 }
 
-fn path_arg(py: Python<'_>, value: &Bound<'_, PyAny>, call: &'static str) -> PyResult<PathBuf> {
-    let path = py
-        .import("os")?
-        .call_method1("fspath", (value,))
-        .map_err(|_| {
-            PyTypeError::new_err(format!(
-                "{call} expected a str or os.PathLike filesystem path. Pass model bytes only to \
-                 load_model; save_model always requires a path."
-            ))
-        })?;
-    let path = path.downcast::<PyString>().map_err(|_| {
-        PyTypeError::new_err(format!(
-            "{call} requires a text filesystem path; os.PathLike objects returning bytes are not \
-             supported. Return str from __fspath__ instead."
-        ))
-    })?;
-    let path = PathBuf::from(path.to_string_lossy().as_ref());
+fn path_arg(
+    value: &Bound<'_, PyAny>,
+    call: &'static str,
+    bytes_allowed: bool,
+) -> PyResult<PathBuf> {
+    if value.downcast::<PyString>().is_err() {
+        match value.getattr("__fspath__") {
+            Ok(_) => {}
+            Err(error) if error.is_instance_of::<PyAttributeError>(value.py()) => {
+                let accepted = if bytes_allowed {
+                    "a filesystem path (str or os.PathLike), or bytes containing a serialized \
+                     ONNX ModelProto"
+                } else {
+                    "a filesystem path (str or os.PathLike)"
+                };
+                return Err(PyTypeError::new_err(format!(
+                    "{call} expected {accepted}; got {}. Pass one of the accepted types.",
+                    value.get_type().name()?
+                )));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    // PyO3's PathBuf extractor calls PyOS_FSPath and losslessly converts Python's
+    // filesystem encoding to OsString, preserving non-UTF-8 Unix paths.
+    let path = value.extract::<PathBuf>()?;
     if path.as_os_str().is_empty() {
         return Err(PyValueError::new_err(format!(
             "{call} received an empty path. Pass a non-empty path to an ONNX model file."
@@ -264,11 +267,28 @@ fn map_loader_error(operation: &str, source: &str, error: LoaderError, fix: &str
 
 fn map_io_error(operation: &str, path: &str, error: std::io::Error, fix: &str) -> PyErr {
     let message = format!("failed to {operation} at {path}: {error}. {fix}");
-    match error.kind() {
-        std::io::ErrorKind::NotFound => PyFileNotFoundError::new_err(message),
-        std::io::ErrorKind::PermissionDenied => PyPermissionError::new_err(message),
-        std::io::ErrorKind::IsADirectory => PyIsADirectoryError::new_err(message),
-        _ => PyOSError::new_err(message),
+    match io_exception_kind(error.kind()) {
+        IoExceptionKind::FileNotFound => PyFileNotFoundError::new_err(message),
+        IoExceptionKind::Permission => PyPermissionError::new_err(message),
+        IoExceptionKind::IsADirectory => PyIsADirectoryError::new_err(message),
+        IoExceptionKind::Os => PyOSError::new_err(message),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IoExceptionKind {
+    FileNotFound,
+    Permission,
+    IsADirectory,
+    Os,
+}
+
+fn io_exception_kind(kind: std::io::ErrorKind) -> IoExceptionKind {
+    match kind {
+        std::io::ErrorKind::NotFound => IoExceptionKind::FileNotFound,
+        std::io::ErrorKind::PermissionDenied => IoExceptionKind::Permission,
+        std::io::ErrorKind::IsADirectory => IoExceptionKind::IsADirectory,
+        _ => IoExceptionKind::Os,
     }
 }
 
@@ -353,5 +373,25 @@ mod tests {
         assert_eq!(loaded.graph.num_nodes(), 1);
         assert_eq!(loaded.metadata.producer_name, "onnx-rs-python-test");
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn io_error_kinds_select_specific_python_exceptions() {
+        assert_eq!(
+            io_exception_kind(std::io::ErrorKind::NotFound),
+            IoExceptionKind::FileNotFound
+        );
+        assert_eq!(
+            io_exception_kind(std::io::ErrorKind::PermissionDenied),
+            IoExceptionKind::Permission
+        );
+        assert_eq!(
+            io_exception_kind(std::io::ErrorKind::IsADirectory),
+            IoExceptionKind::IsADirectory
+        );
+        assert_eq!(
+            io_exception_kind(std::io::ErrorKind::InvalidData),
+            IoExceptionKind::Os
+        );
     }
 }
