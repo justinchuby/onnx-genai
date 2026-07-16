@@ -247,7 +247,7 @@ pub(crate) struct Executor {
     /// initializers and interior SSA values). Used to resolve outer-scope
     /// captures referenced by name from a nested control-flow subgraph body.
     name_index: HashMap<String, ValueId>,
-    /// Compiled child executors for this graph's control-flow subgraph bodies,
+    /// Reusable child executors for this graph's control-flow subgraph bodies,
     /// keyed by `(control-flow node, subgraph attr key)`. Built lazily on first
     /// execution (once concrete input shapes are known) and **reused across
     /// Loop/Scan iterations** — the whole point of the efficiency directive: a
@@ -255,7 +255,7 @@ pub(crate) struct Executor {
     /// every iteration is just a re-bind + dispatch. Rebuilt only if a later
     /// invocation's external input shapes differ from the ones it was compiled
     /// for (a shape-varying loop body — rare).
-    subgraph_execs: HashMap<(NodeId, String), CompiledSubgraph>,
+    subgraph_execs: HashMap<(NodeId, String), ChildExecutor>,
     control_flow_stats: ControlFlowStats,
     /// Run-scoped zero-copy **view** metadata (§5.4). A value id present here is
     /// a strided view aliasing another value's buffer (a layout/movement-op
@@ -334,16 +334,42 @@ struct ExternalBindings {
     outputs: HashMap<ValueId, ExternalValue>,
 }
 
-/// A cached child executor for one control-flow subgraph body, plus the
-/// external-input shape signature it was compiled for (so a shape change forces
-/// a rebuild rather than a silent shape mismatch).
-struct CompiledSubgraph {
+/// Concrete child plan cached for one external-input dtype/shape signature.
+struct CompiledChildPlan {
     exec: Executor,
-    /// Ordered names of every external input: formal parameters first, then
-    /// captured outer-scope values.
+    signature: Vec<ChildInputSignature>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ChildInputSignature {
+    dtype: DataType,
+    shape: Vec<usize>,
+}
+
+/// A reusable executor for one nested graph body.
+///
+/// The body signature and lexical-capture set are resolved once at construction.
+/// The concrete [`Executor`] is then compiled lazily for the first invocation's
+/// input signature and reused while dtype/shapes stay unchanged, so Loop/Scan
+/// iterations only upload newly-bound tensor bytes and dispatch the cached plan.
+pub(crate) struct ChildExecutor {
+    name: String,
+    template: Graph,
+    inherited_opsets: HashMap<String, u64>,
+    weights: Arc<WeightStore>,
+    ep: Arc<dyn ExecutionProvider>,
+    formal_names: Vec<String>,
+    capture_names: Vec<String>,
     input_names: Vec<String>,
-    /// Concrete shapes the child was last compiled for, in `input_names` order.
-    built_shapes: Vec<Vec<usize>>,
+    compiled: Option<CompiledChildPlan>,
+    builds: u64,
+    runs: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ChildExecutorStats {
+    pub builds: u64,
+    pub runs: u64,
 }
 
 /// Invocation-invariant binding metadata for one selected subgraph. Loop/Scan
@@ -351,8 +377,6 @@ struct CompiledSubgraph {
 /// materialization, then only rebind the changing formal tensors each step.
 struct PreparedSubgraph {
     key: (NodeId, String),
-    formal_names: Vec<String>,
-    capture_names: Vec<String>,
     /// Direct captures plus transitive captures needed only by nested bodies.
     captures: HashMap<String, Tensor>,
 }
@@ -2690,13 +2714,202 @@ fn required_outer_names(graph: &Graph) -> HashSet<String> {
     required
 }
 
+impl ChildExecutor {
+    /// Create the reusable wrapper for a loaded subgraph body.
+    ///
+    /// `body.inputs` and `body.outputs` are the loader-preserved ordered formal
+    /// signature. Producer-less named values that are neither formals nor local
+    /// initializers are lexical captures and are bound from `outer_scope`.
+    pub(crate) fn new(
+        name: impl Into<String>,
+        body: Graph,
+        inherited_opsets: HashMap<String, u64>,
+        weights: Arc<WeightStore>,
+        ep: Arc<dyn ExecutionProvider>,
+    ) -> Result<Self> {
+        let name = name.into();
+        let formal_names = body
+            .inputs
+            .iter()
+            .map(|&vid| {
+                body.value(vid).name.clone().ok_or_else(|| {
+                    SessionError::Internal(format!(
+                        "subgraph '{name}' has an unnamed formal input value#{}",
+                        vid.0
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let formal_set: HashSet<ValueId> = body.inputs.iter().copied().collect();
+        let mut capture_names = body
+            .values
+            .iter()
+            .filter_map(|(vid, value)| {
+                (value.producer.is_none()
+                    && !formal_set.contains(&vid)
+                    && !body.initializers.contains_key(&vid))
+                .then(|| value.name.clone())
+                .flatten()
+            })
+            .collect::<Vec<_>>();
+        capture_names.sort();
+        let input_names = formal_names
+            .iter()
+            .chain(capture_names.iter())
+            .cloned()
+            .collect();
+
+        Ok(Self {
+            name,
+            template: body,
+            inherited_opsets,
+            weights,
+            ep,
+            formal_names,
+            capture_names,
+            input_names,
+            compiled: None,
+            builds: 0,
+            runs: 0,
+        })
+    }
+
+    pub(crate) fn stats(&self) -> ChildExecutorStats {
+        ChildExecutorStats {
+            builds: self.builds,
+            runs: self.runs,
+        }
+    }
+
+    fn compile(&self, externals: &[&Tensor]) -> Result<CompiledChildPlan> {
+        let mut graph = self.template.clone();
+        // GraphProto has no opset table: nested graphs inherit the model-level
+        // imports from their enclosing graph.
+        graph.opset_imports = self.inherited_opsets.clone();
+
+        let body_names = graph
+            .values
+            .iter()
+            .filter_map(|(vid, value)| value.name.clone().map(|name| (name, vid)))
+            .collect::<HashMap<_, _>>();
+
+        // Direct captures become required graph inputs. Local inline
+        // initializers stay in `graph.initializers`, preserving their scope.
+        for name in &self.capture_names {
+            let vid = *body_names.get(name).ok_or_else(|| {
+                SessionError::Internal(format!(
+                    "subgraph '{}' lost captured value '{name}'",
+                    self.name
+                ))
+            })?;
+            if !graph.inputs.contains(&vid) {
+                graph.add_input(vid);
+            }
+        }
+
+        for (name, tensor) in self.input_names.iter().zip(externals) {
+            let vid = *body_names.get(name).ok_or_else(|| {
+                SessionError::Internal(format!(
+                    "subgraph '{}' is missing bound input '{name}'",
+                    self.name
+                ))
+            })?;
+            let value = graph.value_mut(vid);
+            value.dtype = tensor.dtype;
+            value.shape = tensor.shape.iter().map(|&dim| Dim::Static(dim)).collect();
+        }
+
+        // Seeded formal/capture shapes let inference resolve the body once.
+        // Truly data-dependent outputs remain on Executor's JIT shape path.
+        let registry = InferenceRegistry::default_registry();
+        registry.infer_graph(&mut graph, &self.inherited_opsets, MergePolicy::Permissive)?;
+
+        Ok(CompiledChildPlan {
+            exec: Executor::build(graph, self.weights.clone(), self.ep.clone())?,
+            signature: externals
+                .iter()
+                .map(|tensor| ChildInputSignature {
+                    dtype: tensor.dtype,
+                    shape: tensor.shape.clone(),
+                })
+                .collect(),
+        })
+    }
+
+    /// Execute the body with formal inputs in declared order and lexical values
+    /// supplied by name. The cached plan is reused for matching dtype/shapes.
+    pub(crate) fn run(
+        &mut self,
+        formal_inputs: &[&Tensor],
+        outer_scope: &HashMap<String, Tensor>,
+    ) -> Result<Vec<Tensor>> {
+        if self.formal_names.len() != formal_inputs.len() {
+            return Err(SessionError::Internal(format!(
+                "subgraph '{}' expects {} formal input(s) but {} were supplied",
+                self.name,
+                self.formal_names.len(),
+                formal_inputs.len()
+            )));
+        }
+
+        let mut externals = Vec::with_capacity(formal_inputs.len() + self.capture_names.len());
+        externals.extend_from_slice(formal_inputs);
+        for name in &self.capture_names {
+            externals.push(
+                outer_scope
+                    .get(name)
+                    .ok_or_else(|| missing_capture_error(&self.name, name))?,
+            );
+        }
+
+        let signature = externals
+            .iter()
+            .map(|tensor| ChildInputSignature {
+                dtype: tensor.dtype,
+                shape: tensor.shape.clone(),
+            })
+            .collect::<Vec<_>>();
+        let rebuild = self
+            .compiled
+            .as_ref()
+            .is_none_or(|compiled| compiled.signature != signature);
+        if rebuild {
+            self.compiled = Some(self.compile(&externals)?);
+            self.builds += 1;
+        }
+
+        self.runs += 1;
+        let inputs = self
+            .input_names
+            .iter()
+            .map(String::as_str)
+            .zip(externals)
+            .collect::<Vec<_>>();
+        self.compiled
+            .as_mut()
+            .expect("child plan compiled above")
+            .exec
+            .run_scoped(&inputs, outer_scope, &ExternalBindings::default())?
+            .into_iter()
+            .map(|output| {
+                output.ok_or_else(|| {
+                    SessionError::Internal(format!(
+                        "subgraph '{}' unexpectedly suppressed an output",
+                        self.name
+                    ))
+                })
+            })
+            .collect()
+    }
+}
+
 // === Control-flow (subgraph-executing) ops: If / Loop / Scan ===
 //
 // These are handled at the executor level rather than as leaf kernels because
 // they must recursively execute a nested ONNX [`Graph`] with the enclosing
 // scope bound — something a `Kernel` (which sees only tensor views, never the
 // session/graph context) cannot do. Each body is compiled to a child
-// [`Executor`] once and **reused across iterations** (see [`CompiledSubgraph`]).
+// [`Executor`] once and **reused across iterations** (see [`ChildExecutor`]).
 impl Executor {
     /// Materialize value `vid`'s current bytes into an owned host [`Tensor`],
     /// using its resolved concrete shape and recorded dtype.
@@ -2855,31 +3068,8 @@ impl Executor {
             ))
         })?;
 
-        let formal_names: Vec<String> = body
-            .inputs
-            .iter()
-            .map(|&vid| {
-                body.value(vid)
-                    .name
-                    .clone()
-                    .unwrap_or_else(|| format!("value#{}", vid.0))
-            })
-            .collect();
-        let formal_set: HashSet<ValueId> = body.inputs.iter().copied().collect();
-        let mut capture_names = Vec::new();
-        for (vid, value) in body.values.iter() {
-            if value.producer.is_none()
-                && !formal_set.contains(&vid)
-                && !body.initializers.contains_key(&vid)
-                && let Some(name) = &value.name
-            {
-                capture_names.push(name.clone());
-            }
-        }
-        capture_names.sort();
-
-        let mut scope_names = required_outer_names(body);
-        scope_names.extend(capture_names.iter().cloned());
+        let mut scope_names = required_outer_names(body).into_iter().collect::<Vec<_>>();
+        scope_names.sort();
         let mut captures = HashMap::with_capacity(scope_names.len());
         for name in scope_names {
             let tensor = if let Some(&vid) = self.name_index.get(&name) {
@@ -2903,92 +3093,7 @@ impl Executor {
             captures.insert(name, tensor);
         }
 
-        Ok(PreparedSubgraph {
-            key,
-            formal_names,
-            capture_names,
-            captures,
-        })
-    }
-
-    /// Compile a control-flow body subgraph to a child [`Executor`], turning
-    /// captured outer-scope names into extra graph inputs (so they are supplied
-    /// and written every run), seeding the concrete external-input shapes, and
-    /// running shape inference so the body's interior buffers can be sized.
-    fn build_subgraph_exec(
-        &self,
-        prepared: &PreparedSubgraph,
-        externals: &[&Tensor],
-    ) -> Result<CompiledSubgraph> {
-        let key = &prepared.key;
-        let body = self.graph.subgraphs.get(key).ok_or_else(|| {
-            SessionError::Internal(format!(
-                "control-flow node #{} has no registered subgraph '{}'",
-                key.0.0, key.1
-            ))
-        })?;
-        let mut g = body.clone();
-        // ONNX subgraphs inherit the parent model's opset imports; GraphProto
-        // does not carry an independent import table.
-        g.opset_imports = self.graph.opset_imports.clone();
-
-        // name → value id within the body.
-        let mut body_names: HashMap<String, ValueId> = HashMap::new();
-        for (vid, value) in g.values.iter() {
-            if let Some(n) = &value.name {
-                body_names.insert(n.clone(), vid);
-            }
-        }
-
-        // Captures become graph inputs so they are required + written each run.
-        for cname in &prepared.capture_names {
-            let vid = *body_names.get(cname).ok_or_else(|| {
-                SessionError::Internal(format!(
-                    "control-flow body '{}' lost capture value '{cname}'",
-                    key.1
-                ))
-            })?;
-            if !g.inputs.contains(&vid) {
-                g.add_input(vid);
-            }
-        }
-
-        // Seed each external input's concrete static shape + runtime dtype so
-        // shape inference can flow through the body.
-        let all_names = prepared
-            .formal_names
-            .iter()
-            .chain(prepared.capture_names.iter());
-        for (name, tensor) in all_names.zip(externals.iter()) {
-            let vid = *body_names.get(name).ok_or_else(|| {
-                SessionError::Internal(format!(
-                    "control-flow body '{}' missing formal/captured input '{name}'",
-                    key.1
-                ))
-            })?;
-            let v = g.value_mut(vid);
-            v.dtype = tensor.dtype;
-            v.shape = tensor.shape.iter().map(|&d| Dim::Static(d)).collect();
-        }
-
-        // Run shape inference over the seeded body (best-effort: interior shapes
-        // that stay data-dependent are resolved just-in-time at run, exactly as
-        // for the top-level graph).
-        let registry = InferenceRegistry::default_registry();
-        let opset_imports = self.graph.opset_imports.clone();
-        registry.infer_graph(&mut g, &opset_imports, MergePolicy::Permissive)?;
-
-        let exec = Executor::build(g, self.weights.clone(), self.ep.clone())?;
-        Ok(CompiledSubgraph {
-            exec,
-            input_names: prepared
-                .formal_names
-                .iter()
-                .chain(prepared.capture_names.iter())
-                .cloned()
-                .collect(),
-            built_shapes: externals.iter().map(|t| t.shape.clone()).collect(),
-        })
+        Ok(PreparedSubgraph { key, captures })
     }
 
     /// Run a prepared control-flow body with changing formal inputs. Captures and
@@ -2999,65 +3104,38 @@ impl Executor {
         prepared: &PreparedSubgraph,
         formal_inputs: &[&Tensor],
     ) -> Result<Vec<Tensor>> {
-        if prepared.formal_names.len() != formal_inputs.len() {
-            return Err(SessionError::Internal(format!(
-                "control-flow body '{}' expects {} formal input(s) but {} were supplied",
-                prepared.key.1,
-                prepared.formal_names.len(),
-                formal_inputs.len()
-            )));
-        }
-
-        let mut externals: Vec<&Tensor> =
-            Vec::with_capacity(formal_inputs.len() + prepared.capture_names.len());
-        externals.extend_from_slice(formal_inputs);
-        for name in &prepared.capture_names {
-            externals.push(
-                prepared
-                    .captures
-                    .get(name)
-                    .expect("prepared capture must be present"),
-            );
-        }
-        let rebuild = match self.subgraph_execs.get(&prepared.key) {
-            Some(cs) => {
-                cs.built_shapes.len() != externals.len()
-                    || cs
-                        .built_shapes
-                        .iter()
-                        .zip(externals.iter())
-                        .any(|(built, tensor)| built != &tensor.shape)
-            }
-            None => true,
-        };
-        if rebuild {
-            let child = self.build_subgraph_exec(prepared, &externals)?;
+        if !self.subgraph_execs.contains_key(&prepared.key) {
+            let body = self
+                .graph
+                .subgraphs
+                .get(&prepared.key)
+                .cloned()
+                .ok_or_else(|| {
+                    SessionError::Internal(format!(
+                        "control-flow node #{} has no registered subgraph '{}'",
+                        prepared.key.0.0, prepared.key.1
+                    ))
+                })?;
+            let child = ChildExecutor::new(
+                format!("node#{}/{}", prepared.key.0.0, prepared.key.1),
+                body,
+                self.graph.opset_imports.clone(),
+                self.weights.clone(),
+                self.ep.clone(),
+            )?;
             self.subgraph_execs.insert(prepared.key.clone(), child);
-            self.control_flow_stats.subgraph_builds += 1;
         }
 
-        self.control_flow_stats.subgraph_runs += 1;
-        let cs = self
+        let child = self
             .subgraph_execs
             .get_mut(&prepared.key)
             .expect("child present");
-        let inputs: Vec<(&str, &Tensor)> = cs
-            .input_names
-            .iter()
-            .map(String::as_str)
-            .zip(externals)
-            .collect();
-        cs.exec
-            .run_scoped(&inputs, &prepared.captures, &ExternalBindings::default())?
-            .into_iter()
-            .map(|output| {
-                output.ok_or_else(|| {
-                    SessionError::Internal(
-                        "control-flow subgraph unexpectedly suppressed an output".into(),
-                    )
-                })
-            })
-            .collect()
+        let before = child.stats();
+        let result = child.run(formal_inputs, &prepared.captures);
+        let after = child.stats();
+        self.control_flow_stats.subgraph_builds += after.builds - before.builds;
+        self.control_flow_stats.subgraph_runs += after.runs - before.runs;
+        result
     }
 
     /// Dispatch a control-flow plan node to its op-specific handler.
@@ -3720,6 +3798,78 @@ mod tests {
         effective_opset(
             &Graph::default(),
             &Node::new(NodeId(0), "Softmax", vec![], vec![]),
+        );
+    }
+
+    #[test]
+    fn child_executor_binds_formals_captures_and_inline_initializers_in_output_order() {
+        use onnx_runtime_ir::{TensorData, WeightRef, static_shape};
+
+        let mut body = Graph::new();
+        let formal = body.create_named_value("formal", DataType::Float32, static_shape([2]));
+        body.add_input(formal);
+        let captured = body.create_named_value("captured", DataType::Float32, static_shape([2]));
+        let one = body.create_named_value("one", DataType::Float32, static_shape([2]));
+        body.set_initializer(
+            one,
+            WeightRef::Inline(TensorData::from_raw(
+                DataType::Float32,
+                vec![2],
+                [1.0f32, 1.0]
+                    .into_iter()
+                    .flat_map(f32::to_le_bytes)
+                    .collect(),
+            )),
+        );
+        let sum = body.create_named_value("sum", DataType::Float32, static_shape([2]));
+        body.insert_node(Node::new(
+            NodeId(0),
+            "Add",
+            vec![Some(formal), Some(captured)],
+            vec![sum],
+        ));
+        let adjusted = body.create_named_value("adjusted", DataType::Float32, static_shape([2]));
+        body.insert_node(Node::new(
+            NodeId(0),
+            "Add",
+            vec![Some(sum), Some(one)],
+            vec![adjusted],
+        ));
+        // Deliberately reverse production order to prove formal output ordering.
+        body.add_output(adjusted);
+        body.add_output(sum);
+
+        let mut opsets = HashMap::new();
+        opsets.insert(String::new(), 17);
+        let mut child = ChildExecutor::new(
+            "direct-test",
+            body,
+            opsets,
+            Arc::new(WeightStore::new()),
+            auto_detect_cpu_ep().unwrap(),
+        )
+        .unwrap();
+        let mut outer_scope = HashMap::new();
+        outer_scope.insert(
+            "captured".to_string(),
+            Tensor::from_f32(&[2], &[10.0, 20.0]).unwrap(),
+        );
+
+        let first = Tensor::from_f32(&[2], &[2.0, 3.0]).unwrap();
+        let outputs = child.run(&[&first], &outer_scope).unwrap();
+        assert_eq!(outputs.len(), 2);
+        assert_eq!(outputs[0].to_vec_f32(), vec![13.0, 24.0]);
+        assert_eq!(outputs[1].to_vec_f32(), vec![12.0, 23.0]);
+        assert_eq!(child.stats(), ChildExecutorStats { builds: 1, runs: 1 });
+
+        let second = Tensor::from_f32(&[2], &[-1.0, 4.0]).unwrap();
+        let outputs = child.run(&[&second], &outer_scope).unwrap();
+        assert_eq!(outputs[0].to_vec_f32(), vec![10.0, 25.0]);
+        assert_eq!(outputs[1].to_vec_f32(), vec![9.0, 24.0]);
+        assert_eq!(
+            child.stats(),
+            ChildExecutorStats { builds: 1, runs: 2 },
+            "matching input signatures must reuse the compiled child plan"
         );
     }
 
