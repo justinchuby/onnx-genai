@@ -83,7 +83,9 @@ overhead reduction once the uncaptured device-resident path is correct.
 
 ### 2.2 In scope
 
-- one CUDA device and one CUDA stream per native session;
+- one CUDA device and one real, non-default CUDA stream per native session;
+  before graph capture, create it with `CudaContext::new_stream()` and bind the
+  cuDNN/cuBLAS handles to it rather than using the legacy/null default stream;
 - batch size 1 first, fixed single-token decode shape;
 - prompt/prefill may initially use the uncaptured CUDA path;
 - Qwen2.5-0.5B int4, f32 activations/KV, packed QKV GQA;
@@ -288,9 +290,12 @@ struct Executor {
 - initialization must occur before placing the provider in an `Arc`, because
   `initialize` takes `&mut self`.
 
-The virtual-call cost is negligible relative to a kernel launch and absent from
-the elementwise/GEMM inner loops. On cache hits, the run loop calls the already
-cached `dyn Kernel`; it does not repeatedly ask the EP to match the node.
+**Assumption (validate in M1):** cache hits invoke the already-cached `dyn
+Kernel`; they do not repeatedly ask the EP to match the node. The structural
+claim is established, but the `Arc<dyn ExecutionProvider>` virtual-call cost has
+not yet been benchmarked. Do not assume it is negligible relative to a kernel
+launch until M1 measures it; it remains absent from the elementwise/GEMM inner
+loops.
 
 #### Option C — closed enum
 
@@ -545,11 +550,34 @@ Keep this as the mandatory eligibility gate. It is not a capture executor.
 
 M4 must add CUDA runtime ownership for:
 
+- **Prerequisite 1 — before any capture,** create a real non-default stream with
+  `CudaContext::new_stream()`; `CudaRuntime::new` currently uses
+  `context.default_stream()`, which is cudarc's legacy/null stream and cannot
+  be captured. Bind the cuDNN/cuBLAS handles to this session stream.
 - begin stream capture;
 - end capture and obtain a graph;
 - instantiate a graph executable;
 - launch replay on the session stream;
 - destroy graph/graph-exec handles before their buffers are freed.
+
+#### 6.1.1 Graph ownership and threading
+
+`ExecutionProvider` requires `Send + Sync`, but cudarc's `CudaGraph` explicitly
+implements neither because CUDA graph objects require externally serialized
+access. `CudaStream`, in contrast, implements `Send + Sync`. Therefore a
+captured graph/graph-exec cannot be a naive field on `CudaRuntime` or
+`CudaExecutionProvider`.
+
+M4 needs a deliberate serialized-ownership design and safety justification:
+
+- store the graph behind a `Mutex` in a wrapper with manual `unsafe impl
+  Send/Sync`, with the invariant that all graph use is serialized on the single
+  owning session/stream;
+- keep it in a non-shared, per-session decode driver that is never sent across
+  threads; or
+- confine interior mutability to the decode loop.
+
+Which ownership model to use is a user/implementation decision.
 
 ### 6.2 Capture shape
 
@@ -789,7 +817,7 @@ change.
 | **M1 — EP-polymorphic executor skeleton** | Change `Executor`/kernel cache/session construction to `Arc<dyn ExecutionProvider>`; add host upload/download trait methods; make buffer device ids correct; upload CUDA initializers; hard-reject host-only paths; add one CUDA single-op session smoke test. Do not wire native generation yet. | CPU suite unchanged; CUDA `Add` or `MatMul` graph runs through `InferenceSession` with H2D input and D2H output; no host dereference of a CUDA pointer. | 3-5 engineer-days | Medium |
 | **M2 — Full target decode-step coverage** | Select CUDA from `DevicePreference`; remove the native adapter's CUDA bail-out; add packed-QKV CUDA GQA; register standard-domain `SimplifiedLayerNormalization`; add CUDA SiLU or an EP-aware rewrite; verify all 299 target nodes after optimization; keep weights/activations on device; initially use ordinary dynamic present outputs if needed. | Qwen model loads and produces CPU-parity logits/tokens on CUDA with zero CPU op fallback. Exact tokens `[11576,42740,11,358]`. | 1-2 weeks | High |
 | **M3 — Device-resident O(1) KV** | Add external device input/output bindings; allocate fixed-capacity per-layer KV; alias past/present; change GQA to append one token and read only valid prefix; replace context-sized host mask work with fixed buffer/scalars; cursor-only reset/rewind. | No KV PCIe transfer after setup; stable pointers; per-token cache-update work independent of context length; exact token parity. | 1-2 weeks | High |
-| **M4 — CUDA graph capture/replay** | Extend `CudaRuntime` with graph lifecycle; retain `capture.rs` all-kernel gate; prewarm NVRTC/library state; remove per-call alloc/free/D2H/sync from capture path; persistent I/O; unique capture ids; reset/rewind invalidation. | One capture then replay; zero allocations in replay; changing token/position changes output; two generations do not collide; measurable launch-overhead reduction. | 1-2 weeks | High |
+| **M4 — CUDA graph capture/replay** | First create a real non-default session stream and bind cuDNN/cuBLAS to it; then extend `CudaRuntime` with graph lifecycle and a deliberate serialized graph-ownership design; retain `capture.rs` all-kernel gate; prewarm NVRTC/library state; remove per-call alloc/free/D2H/sync from capture path; persistent I/O; unique capture ids; reset/rewind invalidation. | One capture then replay; zero allocations in replay; changing token/position changes output; two generations do not collide; measurable launch-overhead reduction. | 1-2 weeks | High |
 | **M5 — Performance tuning** | Direct packed-int4 `M=1` kernel, persistent workspaces/metadata, fused SiLU/SwiGLU where profitable, faster GQA/SDPA, async/pinned transfers, activation arena, timeline-guided fusion. | Beat native CPU decisively; establish/close a measured gap to llama.cpp CUDA; no regression in parity or memory bounds. | 1-3 weeks, iterative | High |
 
 ### 9.1 Review boundaries
@@ -815,13 +843,15 @@ change.
    f32 KV. Decide the default and whether allocation is eager or request-scoped.
 4. **Confirm hard-fail CUDA policy.** Recommendation: no transparent CPU fallback
    in native GPU decode.
-5. **Choose cudarc graph strategy.** The crate requests cudarc `0.19` with the
+5. **Choose cudarc graph ownership strategy.** The crate requests cudarc `0.19` with the
    CUDA 13 dynamic-loading feature set ([CUDA Cargo.toml, lines
    17-29](../crates/onnx-runtime-ep-cuda/Cargo.toml#L17-L29)); the lockfile
    resolves `0.19.8` ([Cargo.lock, lines
-   563-566](../Cargo.lock#L563-L566)). Verify whether that release exposes all
-   required driver graph APIs safely. If not, choose between a narrow raw-driver
-   wrapper and a cudarc upgrade.
+   563-566](../Cargo.lock#L563-L566)). The basic lifecycle is already available:
+   `CudaStream::begin_capture`/`end_capture` and
+   `CudaGraph::launch`/`upload`. The remaining issues are selecting the required
+   non-default stream and choosing a thread-safe graph ownership model, not API
+   absence.
 
 ### 10.2 Technical risks
 
@@ -884,7 +914,8 @@ Approve the five-milestone plan with these initial choices:
   launch requirement;
 - hard-fail all-CUDA decode placement;
 - 4K default KV capacity for the first Qwen benchmark, configurable upward;
-- current cudarc pin retained for M1 while graph-API availability is verified;
+- current cudarc pin retained for M1; M4 must use a non-default stream and choose
+  a serialized graph-ownership model;
 - packed-QKV GQA, standard-domain `SimplifiedLayerNormalization`, and fused CUDA
   SiLU treated as M2 prerequisites;
 - true packed-int4 decode kernel treated as the primary M5 performance item.
