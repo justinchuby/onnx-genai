@@ -502,7 +502,20 @@ impl GroupQueryAttentionKernel {
             }
             past_lengths.push(past);
         }
-        let present_capacity = past_capacity.max(total_sequence_length);
+        let minimum_present_capacity = past_capacity.max(total_sequence_length);
+        let requested_present_capacity = outputs.get(1).map(|output| {
+            output
+                .shape
+                .get(2)
+                .copied()
+                .unwrap_or(minimum_present_capacity)
+        });
+        let present_capacity = requested_present_capacity.unwrap_or(minimum_present_capacity);
+        if present_capacity < minimum_present_capacity {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep GroupQueryAttention: present cache capacity {present_capacity} is smaller than required {minimum_present_capacity}"
+            )));
+        }
         let expected_cache_shape = [batch, self.kv_num_heads, present_capacity, dim];
         for (index, name) in [(1, "present_key"), (2, "present_value")] {
             if let Some(output) = outputs.get(index)

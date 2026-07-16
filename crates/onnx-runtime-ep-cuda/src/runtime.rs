@@ -4,8 +4,9 @@
 //! provider hands out, so the whole EP drives a single device + stream.
 
 use std::collections::HashMap;
-use std::ffi::c_void;
+use std::ffi::{CStr, CString, c_void};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use cudarc::driver::sys::CUdeviceptr;
@@ -57,6 +58,9 @@ pub struct CudaRuntime {
     /// runtime compiles a given kernel (e.g. the fused attention softmax) at
     /// most once and reuses the loaded module for every kernel invocation.
     modules: Mutex<HashMap<&'static str, Arc<CudaModule>>>,
+    /// Set after a driver rejects the toolkit's PTX ISA. Subsequent modules are
+    /// compiled directly to an SM90 CUBIN instead of repeating the failed load.
+    nvrtc_cubin_fallback: AtomicBool,
 }
 
 impl std::fmt::Debug for CudaRuntime {
@@ -84,6 +88,7 @@ impl CudaRuntime {
             cudnn,
             ordinal,
             modules: Mutex::new(HashMap::new()),
+            nvrtc_cubin_fallback: AtomicBool::new(false),
         })
     }
 
@@ -116,9 +121,11 @@ impl CudaRuntime {
     /// `module_key`, compiling `src` to PTX and loading it on first use and
     /// reusing the cached module thereafter.
     ///
-    /// The compile targets `compute_90` (Hopper / SM90, our H200) but PTX is
-    /// forward-compatible, so the module still loads on newer architectures. An
-    /// NVRTC failure surfaces the compiler log via [`nvrtc_err`] (RULES.md #1).
+    /// The compile targets `compute_90` (Hopper / SM90, our H200). If the
+    /// installed NVRTC emits a PTX ISA newer than the driver accepts, compilation
+    /// is retried for the real `sm_90` architecture and the resulting CUBIN is
+    /// loaded instead. An NVRTC failure surfaces the compiler log via
+    /// [`nvrtc_err`] (RULES.md #1).
     pub fn nvrtc_function(
         &self,
         module_key: &'static str,
@@ -131,17 +138,35 @@ impl CudaRuntime {
             if let Some(m) = cache.get(module_key) {
                 m.clone()
             } else {
-                let opts = cudarc::nvrtc::CompileOptions {
-                    arch: Some("compute_90"),
-                    include_paths: nvrtc_include_paths(),
-                    ..Default::default()
+                let include_paths = nvrtc_include_paths();
+                let m = if self.nvrtc_cubin_fallback.load(Ordering::Relaxed) {
+                    self.load_nvrtc_cubin(module_key, src, &include_paths)?
+                } else {
+                    let opts = cudarc::nvrtc::CompileOptions {
+                        arch: Some("compute_90"),
+                        include_paths: include_paths.clone(),
+                        ..Default::default()
+                    };
+                    let ptx = cudarc::nvrtc::compile_ptx_with_opts(src, opts).map_err(|e| {
+                        nvrtc_err(&format!("compiling NVRTC module '{module_key}'"), e)
+                    })?;
+                    match self.context.load_module(ptx) {
+                        Ok(module) => module,
+                        Err(error)
+                            if error.0
+                                == cudarc::driver::sys::CUresult::CUDA_ERROR_UNSUPPORTED_PTX_VERSION =>
+                        {
+                            self.nvrtc_cubin_fallback.store(true, Ordering::Relaxed);
+                            self.load_nvrtc_cubin(module_key, src, &include_paths)?
+                        }
+                        Err(error) => {
+                            return Err(driver_err(
+                                &format!("loading NVRTC module '{module_key}'"),
+                                error,
+                            ));
+                        }
+                    }
                 };
-                let ptx = cudarc::nvrtc::compile_ptx_with_opts(src, opts)
-                    .map_err(|e| nvrtc_err(&format!("compiling NVRTC module '{module_key}'"), e))?;
-                let m = self
-                    .context
-                    .load_module(ptx)
-                    .map_err(|e| driver_err(&format!("loading NVRTC module '{module_key}'"), e))?;
                 cache.insert(module_key, m.clone());
                 m
             }
@@ -149,6 +174,90 @@ impl CudaRuntime {
         module
             .load_function(entry)
             .map_err(|e| driver_err(&format!("loading NVRTC function '{entry}'"), e))
+    }
+
+    fn load_nvrtc_cubin(
+        &self,
+        module_key: &'static str,
+        src: &str,
+        include_paths: &[String],
+    ) -> Result<Arc<CudaModule>> {
+        let source = CString::new(src).map_err(|_| {
+            EpError::KernelFailed(format!(
+                "cuda_ep: compiling NVRTC module '{module_key}': source contains a NUL byte"
+            ))
+        })?;
+        let name = CString::new(module_key).expect("static module key cannot contain a NUL byte");
+        let program =
+            cudarc::nvrtc::result::create_program(source.as_c_str(), Some(name.as_c_str()))
+                .map_err(|error| {
+                    EpError::KernelFailed(format!(
+                        "cuda_ep: creating NVRTC CUBIN module '{module_key}': {error:?}"
+                    ))
+                })?;
+        let mut options = include_paths
+            .iter()
+            .map(|path| format!("--include-path={path}"))
+            .collect::<Vec<_>>();
+        options.push("--gpu-architecture=sm_90".into());
+
+        // SAFETY: `program` is live until the matching destroy call below.
+        let compile_result = unsafe { cudarc::nvrtc::result::compile_program(program, &options) };
+        if let Err(error) = compile_result {
+            // SAFETY: compilation may fail, but the live program still owns its log.
+            let log = unsafe { cudarc::nvrtc::result::get_program_log(program) }
+                .ok()
+                .map(|bytes| {
+                    // SAFETY: NVRTC returns a NUL-terminated compiler log.
+                    unsafe { CStr::from_ptr(bytes.as_ptr()) }
+                        .to_string_lossy()
+                        .into_owned()
+                })
+                .unwrap_or_else(|| "<compiler log unavailable>".into());
+            // SAFETY: this is the single destroy for the live program.
+            let _ = unsafe { cudarc::nvrtc::result::destroy_program(program) };
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep: compiling NVRTC CUBIN module '{module_key}' failed ({error:?}); compiler log:\n{log}"
+            )));
+        }
+
+        let cubin: Result<Vec<u8>> = (|| {
+            let mut size = 0usize;
+            // SAFETY: `program` compiled successfully and `size` is writable.
+            unsafe { cudarc::nvrtc::sys::nvrtcGetCUBINSize(program, &mut size) }
+                .result()
+                .map_err(|error| {
+                    EpError::KernelFailed(format!(
+                        "cuda_ep: getting NVRTC CUBIN size for '{module_key}': {error:?}"
+                    ))
+                })?;
+            let mut image = vec![0u8; size];
+            // SAFETY: `image` has the exact size reported by NVRTC.
+            unsafe { cudarc::nvrtc::sys::nvrtcGetCUBIN(program, image.as_mut_ptr().cast()) }
+                .result()
+                .map_err(|error| {
+                    EpError::KernelFailed(format!(
+                        "cuda_ep: getting NVRTC CUBIN for '{module_key}': {error:?}"
+                    ))
+                })?;
+            Ok(image)
+        })();
+        // SAFETY: this is the single destroy for the live program.
+        let destroy_result = unsafe { cudarc::nvrtc::result::destroy_program(program) };
+        let image = cubin?;
+        destroy_result.map_err(|error| {
+            EpError::KernelFailed(format!(
+                "cuda_ep: destroying NVRTC CUBIN program '{module_key}': {error:?}"
+            ))
+        })?;
+        self.context
+            .load_module(cudarc::nvrtc::Ptx::from_binary(image))
+            .map_err(|error| {
+                driver_err(
+                    &format!("loading NVRTC CUBIN fallback module '{module_key}'"),
+                    error,
+                )
+            })
     }
 
     pub fn require_nvrtc_half_headers(&self, op: &str) -> Result<()> {

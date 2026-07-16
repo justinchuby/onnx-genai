@@ -205,16 +205,10 @@ fn run(
     Ok(results)
 }
 
-fn run_available(
-    ep: &CudaExecutionProvider,
-    attrs: &[(&str, Attribute)],
-    inputs: &[Option<HostTensor>],
-    output_shapes: &[Vec<usize>],
-) -> onnx_runtime_ep_api::Result<Vec<Vec<f32>>> {
-    match run(ep, attrs, inputs, output_shapes) {
+fn run_available<T>(result: onnx_runtime_ep_api::Result<T>) -> onnx_runtime_ep_api::Result<T> {
+    match result {
         Err(error) if format!("{error}").contains("CUDA_ERROR_UNSUPPORTED_PTX_VERSION") => {
-            eprintln!("skip: NVRTC PTX is newer than the installed CUDA driver ({error})");
-            Ok(Vec::new())
+            panic!("CUDA GPU tests must execute; unsupported PTX cannot be skipped: {error}")
         }
         result => result,
     }
@@ -232,46 +226,70 @@ fn upload(
     Ok(buffer)
 }
 
-fn run_packed_decode_in_place(
+struct PackedStep {
+    output: Vec<f32>,
+    key: Vec<f32>,
+    value: Vec<f32>,
+    cache_k: DeviceBuffer,
+    cache_v: DeviceBuffer,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_packed_step(
     ep: &CudaExecutionProvider,
     packed: &[f32],
-    cache_k: &mut DeviceBuffer,
-    cache_v: &mut DeviceBuffer,
-    seqlen: i32,
-    total: i32,
+    seq: usize,
+    cache_k: Option<DeviceBuffer>,
+    cache_v: Option<DeviceBuffer>,
+    past_len: usize,
+    total: usize,
+    capacity: usize,
     cos: &[f32],
     sin: &[f32],
-    position: i64,
-) -> onnx_runtime_ep_api::Result<(Vec<f32>, Vec<f32>, Vec<f32>)> {
+    positions: &[i64],
+) -> onnx_runtime_ep_api::Result<PackedStep> {
     const NUM_HEADS: usize = 14;
     const KV_HEADS: usize = 2;
     const HEAD_DIM: usize = 64;
-    const CAPACITY: usize = 5;
     const PACKED_WIDTH: usize = (NUM_HEADS + 2 * KV_HEADS) * HEAD_DIM;
 
-    let packed = f32_tensor(&[1, 1, PACKED_WIDTH], packed);
-    let seqlens = i32_tensor(&[1], &[seqlen]);
-    let total = i32_tensor(&[], &[total]);
-    let cos = f32_tensor(&[CAPACITY, HEAD_DIM / 2], cos);
-    let sin = f32_tensor(&[CAPACITY, HEAD_DIM / 2], sin);
-    let position = i64_tensor(&[1, 1], &[position]);
+    if packed.len() != seq * PACKED_WIDTH
+        || positions.len() != seq
+        || total != past_len + seq
+        || cos.len() != capacity * HEAD_DIM / 2
+        || sin.len() != cos.len()
+        || cache_k.is_some() != cache_v.is_some()
+        || (past_len > 0 && cache_k.is_none())
+    {
+        return Err(onnx_runtime_ep_api::EpError::KernelFailed(
+            "invalid packed GQA test step".into(),
+        ));
+    }
+    let total_i32 = i32::try_from(total).unwrap();
+    let packed = f32_tensor(&[1, seq, PACKED_WIDTH], packed);
+    let seqlens = i32_tensor(&[1], &[total_i32 - 1]);
+    let total = i32_tensor(&[], &[total_i32]);
+    let cos = f32_tensor(&[capacity, HEAD_DIM / 2], cos);
+    let sin = f32_tensor(&[capacity, HEAD_DIM / 2], sin);
+    let position = i64_tensor(&[1, seq], positions);
     let transient = [&packed, &seqlens, &total, &cos, &sin, &position]
         .into_iter()
         .map(|tensor| upload(ep, tensor))
         .collect::<onnx_runtime_ep_api::Result<Vec<_>>>()?;
 
-    let cache_shape = vec![1, KV_HEADS, CAPACITY, HEAD_DIM];
+    let has_past = cache_k.is_some();
+    let cache_shape = vec![1, KV_HEADS, capacity, HEAD_DIM];
     let input_specs = [
-        Some((DataType::Float32, vec![1, 1, PACKED_WIDTH])),
+        Some((DataType::Float32, vec![1, seq, PACKED_WIDTH])),
         None,
         None,
-        Some((DataType::Float32, cache_shape.clone())),
-        Some((DataType::Float32, cache_shape.clone())),
+        has_past.then(|| (DataType::Float32, cache_shape.clone())),
+        has_past.then(|| (DataType::Float32, cache_shape.clone())),
         Some((DataType::Int32, vec![1])),
         Some((DataType::Int32, vec![])),
-        Some((DataType::Float32, vec![CAPACITY, HEAD_DIM / 2])),
-        Some((DataType::Float32, vec![CAPACITY, HEAD_DIM / 2])),
-        Some((DataType::Int64, vec![1, 1])),
+        Some((DataType::Float32, vec![capacity, HEAD_DIM / 2])),
+        Some((DataType::Float32, vec![capacity, HEAD_DIM / 2])),
+        Some((DataType::Int64, vec![1, seq])),
     ];
     let mut graph = Graph::new();
     graph.opset_imports.insert("com.microsoft".into(), 1);
@@ -291,7 +309,7 @@ fn run_packed_decode_in_place(
         })
         .collect();
     let output_shapes = [
-        vec![1, 1, NUM_HEADS * HEAD_DIM],
+        vec![1, seq, NUM_HEADS * HEAD_DIM],
         cache_shape.clone(),
         cache_shape.clone(),
     ];
@@ -329,12 +347,12 @@ fn run_packed_decode_in_place(
     let device = ep.device_id();
     let cache_strides = compute_contiguous_strides(&cache_shape);
     let transient_shapes = [
-        &[1, 1, PACKED_WIDTH][..],
+        &[1, seq, PACKED_WIDTH][..],
         &[1][..],
         &[][..],
-        &[CAPACITY, HEAD_DIM / 2][..],
-        &[CAPACITY, HEAD_DIM / 2][..],
-        &[1, 1][..],
+        &[capacity, HEAD_DIM / 2][..],
+        &[capacity, HEAD_DIM / 2][..],
+        &[1, seq][..],
     ];
     let transient_dtypes = [
         DataType::Float32,
@@ -358,24 +376,40 @@ fn run_packed_decode_in_place(
         })
         .collect();
     let mut transient_views = transient_views.into_iter();
+    let (mut cache_k, mut cache_v) = match (cache_k, cache_v) {
+        (Some(cache_k), Some(cache_v)) => (cache_k, cache_v),
+        (None, None) => (
+            ep.allocate(cache_shape.iter().product::<usize>() * 4, 256)?,
+            ep.allocate(cache_shape.iter().product::<usize>() * 4, 256)?,
+        ),
+        _ => unreachable!(),
+    };
     let inputs = vec![
         transient_views.next().unwrap(),
         TensorView::absent(DataType::Float32),
         TensorView::absent(DataType::Float32),
-        TensorView::new(
-            DevicePtr(cache_k.as_ptr()),
-            DataType::Float32,
-            &cache_shape,
-            &cache_strides,
-            device,
-        ),
-        TensorView::new(
-            DevicePtr(cache_v.as_ptr()),
-            DataType::Float32,
-            &cache_shape,
-            &cache_strides,
-            device,
-        ),
+        if has_past {
+            TensorView::new(
+                DevicePtr(cache_k.as_ptr()),
+                DataType::Float32,
+                &cache_shape,
+                &cache_strides,
+                device,
+            )
+        } else {
+            TensorView::absent(DataType::Float32)
+        },
+        if has_past {
+            TensorView::new(
+                DevicePtr(cache_v.as_ptr()),
+                DataType::Float32,
+                &cache_shape,
+                &cache_strides,
+                device,
+            )
+        } else {
+            TensorView::absent(DataType::Float32)
+        },
         transient_views.next().unwrap(),
         transient_views.next().unwrap(),
         transient_views.next().unwrap(),
@@ -428,11 +462,13 @@ fn run_packed_decode_in_place(
     for buffer in transient {
         ep.deallocate(buffer)?;
     }
-    Ok((
-        bytes_to_f32(&output_bytes),
-        bytes_to_f32(&key_bytes),
-        bytes_to_f32(&value_bytes),
-    ))
+    Ok(PackedStep {
+        output: bytes_to_f32(&output_bytes),
+        key: bytes_to_f32(&key_bytes),
+        value: bytes_to_f32(&value_bytes),
+        cache_k,
+        cache_v,
+    })
 }
 
 fn base_inputs(
@@ -522,32 +558,36 @@ fn close(got: &[f32], expected: &[f32]) {
 
 fn rotate_target(
     data: &[f32],
+    seq: usize,
     heads: usize,
-    position: usize,
+    positions: &[usize],
     cos: &[f32],
     sin: &[f32],
 ) -> Vec<f32> {
     const HEAD_DIM: usize = 64;
     let half = HEAD_DIM / 2;
     let mut output = data.to_vec();
-    for head in 0..heads {
-        let base = head * HEAD_DIM;
-        for k in 0..half {
-            let x0 = data[base + k];
-            let x1 = data[base + k + half];
-            let cache = position * half + k;
-            output[base + k] = cos[cache] * x0 - sin[cache] * x1;
-            output[base + k + half] = sin[cache] * x0 + cos[cache] * x1;
+    for (token, &position) in positions.iter().enumerate().take(seq) {
+        for head in 0..heads {
+            let base = (token * heads + head) * HEAD_DIM;
+            for k in 0..half {
+                let x0 = data[base + k];
+                let x1 = data[base + k + half];
+                let cache = position * half + k;
+                output[base + k] = cos[cache] * x0 - sin[cache] * x1;
+                output[base + k + half] = sin[cache] * x0 + cos[cache] * x1;
+            }
         }
     }
     output
 }
 
-fn target_decode_reference(
+fn target_attention_reference(
     query: &[f32],
     key_cache: &[f32],
     value_cache: &[f32],
-    valid_length: usize,
+    q_seq: usize,
+    past_len: usize,
     capacity: usize,
 ) -> Vec<f32> {
     const NUM_HEADS: usize = 14;
@@ -555,37 +595,40 @@ fn target_decode_reference(
     const HEAD_DIM: usize = 64;
     let group = NUM_HEADS / KV_HEADS;
     let scale = 1.0 / (HEAD_DIM as f32).sqrt();
-    let mut output = vec![0.0; NUM_HEADS * HEAD_DIM];
-    for head in 0..NUM_HEADS {
-        let kv_head = head / group;
-        let mut scores = Vec::with_capacity(valid_length);
-        for position in 0..valid_length {
-            let score = (0..HEAD_DIM)
-                .map(|dim| {
-                    query[head * HEAD_DIM + dim]
-                        * key_cache[(kv_head * capacity + position) * HEAD_DIM + dim]
-                })
-                .sum::<f32>()
-                * scale;
-            scores.push(score);
-        }
-        let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-        let sum: f32 = scores
-            .iter_mut()
-            .map(|score| {
-                *score = (*score - max).exp();
-                *score
-            })
-            .sum();
-        for dim in 0..HEAD_DIM {
-            output[head * HEAD_DIM + dim] = scores
-                .iter()
-                .enumerate()
-                .map(|(position, probability)| {
-                    probability / sum
-                        * value_cache[(kv_head * capacity + position) * HEAD_DIM + dim]
+    let mut output = vec![0.0; q_seq * NUM_HEADS * HEAD_DIM];
+    for token in 0..q_seq {
+        let valid_length = past_len + token + 1;
+        for head in 0..NUM_HEADS {
+            let kv_head = head / group;
+            let mut scores = Vec::with_capacity(valid_length);
+            for position in 0..valid_length {
+                let score = (0..HEAD_DIM)
+                    .map(|dim| {
+                        query[(token * NUM_HEADS + head) * HEAD_DIM + dim]
+                            * key_cache[(kv_head * capacity + position) * HEAD_DIM + dim]
+                    })
+                    .sum::<f32>()
+                    * scale;
+                scores.push(score);
+            }
+            let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let sum: f32 = scores
+                .iter_mut()
+                .map(|score| {
+                    *score = (*score - max).exp();
+                    *score
                 })
                 .sum();
+            for dim in 0..HEAD_DIM {
+                output[(token * NUM_HEADS + head) * HEAD_DIM + dim] = scores
+                    .iter()
+                    .enumerate()
+                    .map(|(position, probability)| {
+                        probability / sum
+                            * value_cache[(kv_head * capacity + position) * HEAD_DIM + dim]
+                    })
+                    .sum();
+            }
         }
     }
     output
@@ -610,7 +653,7 @@ fn gqa_gpu_head_sharing_matches_manual_repeat_kv_reference() {
     let v_bsh = [1., 2., 10., 20., 3., 4., 30., 40.];
     let k_bnsh = [1., 0., 0., 1., 0., 1., 1., 0.];
     let v_bnsh = [1., 2., 3., 4., 10., 20., 30., 40.];
-    let outputs = run_available(
+    let outputs = run_available(run(
         &ep,
         &attrs(&[]),
         &base_inputs(
@@ -625,11 +668,8 @@ fn gqa_gpu_head_sharing_matches_manual_repeat_kv_reference() {
             2,
         ),
         &[vec![1, 2, 8], vec![1, 2, 2, 2], vec![1, 2, 2, 2]],
-    )
+    ))
     .unwrap();
-    if outputs.is_empty() {
-        return;
-    }
     close(
         &outputs[0],
         &reference(
@@ -668,7 +708,7 @@ fn gqa_gpu_decode_preserves_fixed_cache_capacity_and_write_offset() {
     let expected_v = [
         1., 2., 3., 4., 5., 6., 0., 0., 0., 0., 10., 20., 30., 40., 50., 60., 0., 0., 0., 0.,
     ];
-    let outputs = run_available(
+    let outputs = run_available(run(
         &ep,
         &attrs(&[]),
         &base_inputs(
@@ -683,11 +723,8 @@ fn gqa_gpu_decode_preserves_fixed_cache_capacity_and_write_offset() {
             3,
         ),
         &[vec![1, 1, 8], vec![1, 2, 5, 2], vec![1, 2, 5, 2]],
-    )
+    ))
     .unwrap();
-    if outputs.is_empty() {
-        return;
-    }
     close(&outputs[1], &expected_k);
     close(&outputs[2], &expected_v);
     close(
@@ -722,16 +759,13 @@ fn gqa_gpu_rope_explicit_positions_rotate_query_and_key() {
     inputs.push(Some(f32_tensor(&[5, 1], &cos)));
     inputs.push(Some(f32_tensor(&[5, 1], &sin)));
     inputs.push(Some(i64_tensor(&[1, 2], &positions)));
-    let outputs = run_available(
+    let outputs = run_available(run(
         &ep,
         &attrs(&[("do_rotary", Attribute::Int(1))]),
         &inputs,
         &[vec![1, 2, 8], vec![1, 2, 2, 2]],
-    )
+    ))
     .unwrap();
-    if outputs.is_empty() {
-        return;
-    }
     let rotate = |data: &[f32], heads: usize| {
         let mut out = data.to_vec();
         for s in 0..2 {
@@ -785,7 +819,7 @@ fn gqa_gpu_zero_scale_softcap_and_sliding_window_match_reference() {
     let current_v = [9., 0., 90., 0.];
     let expected_k = [1., 0., 4., 0., 8., 0., 10., 0., 40., 0., 80., 0.];
     let expected_v = [1., 0., 3., 0., 9., 0., 10., 0., 30., 0., 90., 0.];
-    let outputs = run_available(
+    let outputs = run_available(run(
         &ep,
         &attrs(&[
             ("scale", Attribute::Float(0.0)),
@@ -804,11 +838,8 @@ fn gqa_gpu_zero_scale_softcap_and_sliding_window_match_reference() {
             3,
         ),
         &[vec![1, 1, 8]],
-    )
+    ))
     .unwrap();
-    if outputs.is_empty() {
-        return;
-    }
     close(
         &outputs[0],
         &reference(
@@ -831,6 +862,7 @@ fn gqa_gpu_packed_qkv_rope_decode_appends_in_place_across_steps() {
     const KV_HEADS: usize = 2;
     const HEAD_DIM: usize = 64;
     const CAPACITY: usize = 5;
+    const PREFILL: usize = 3;
     let Some(ep) = gpu() else { return };
 
     let mut cos = Vec::with_capacity(CAPACITY * HEAD_DIM / 2);
@@ -843,74 +875,138 @@ fn gqa_gpu_packed_qkv_rope_decode_appends_in_place_across_steps() {
         }
     }
 
-    let cache_len = KV_HEADS * CAPACITY * HEAD_DIM;
-    let mut expected_k = vec![91.0; cache_len];
-    let mut expected_v = vec![73.0; cache_len];
-    for head in 0..KV_HEADS {
-        for dim in 0..HEAD_DIM {
-            expected_k[(head * CAPACITY) * HEAD_DIM + dim] =
-                (head * HEAD_DIM + dim + 1) as f32 * 0.002;
-            expected_v[(head * CAPACITY) * HEAD_DIM + dim] =
-                (head * HEAD_DIM + dim + 1) as f32 * 0.003 - 0.2;
-        }
-    }
-    let mut cache_k = ep.allocate(cache_len * 4, 256).unwrap();
-    let mut cache_v = ep.allocate(cache_len * 4, 256).unwrap();
-    // SAFETY: cache allocations exactly cover the source slices.
-    unsafe {
-        ep.runtime()
-            .htod(&typed_bytes(&expected_k), cuptr(cache_k.as_ptr()))
-            .unwrap();
-        ep.runtime()
-            .htod(&typed_bytes(&expected_v), cuptr(cache_v.as_ptr()))
-            .unwrap();
-    }
-
-    for step in 1..=2 {
+    let make_token = |position: usize| {
         let query: Vec<f32> = (0..NUM_HEADS * HEAD_DIM)
-            .map(|index| ((index * 13 + step * 7) % 101) as f32 * 0.002 - 0.1)
+            .map(|index| ((index * 13 + position * 7) % 101) as f32 * 0.002 - 0.1)
             .collect();
         let key: Vec<f32> = (0..KV_HEADS * HEAD_DIM)
-            .map(|index| ((index * 11 + step * 5) % 67) as f32 * 0.003 - 0.08)
+            .map(|index| ((index * 11 + position * 5) % 67) as f32 * 0.003 - 0.08)
             .collect();
         let value: Vec<f32> = (0..KV_HEADS * HEAD_DIM)
-            .map(|index| ((index * 17 + step * 3) % 79) as f32 * 0.004 - 0.12)
+            .map(|index| ((index * 17 + position * 3) % 79) as f32 * 0.004 - 0.12)
             .collect();
-        let mut packed = Vec::with_capacity(query.len() + key.len() + value.len());
+        (query, key, value)
+    };
+
+    let mut prefill_query = Vec::with_capacity(PREFILL * NUM_HEADS * HEAD_DIM);
+    let mut prefill_key = Vec::with_capacity(PREFILL * KV_HEADS * HEAD_DIM);
+    let mut prefill_value = Vec::with_capacity(PREFILL * KV_HEADS * HEAD_DIM);
+    let mut packed = Vec::with_capacity(PREFILL * (NUM_HEADS + 2 * KV_HEADS) * HEAD_DIM);
+    for position in 0..PREFILL {
+        let (query, key, value) = make_token(position);
         packed.extend_from_slice(&query);
         packed.extend_from_slice(&key);
         packed.extend_from_slice(&value);
+        prefill_query.extend_from_slice(&query);
+        prefill_key.extend_from_slice(&key);
+        prefill_value.extend_from_slice(&value);
+    }
 
-        let rotated_query = rotate_target(&query, NUM_HEADS, step, &cos, &sin);
-        let rotated_key = rotate_target(&key, KV_HEADS, step, &cos, &sin);
+    let prefill_positions: Vec<_> = (0..PREFILL).collect();
+    let rotated_query = rotate_target(
+        &prefill_query,
+        PREFILL,
+        NUM_HEADS,
+        &prefill_positions,
+        &cos,
+        &sin,
+    );
+    let rotated_key = rotate_target(
+        &prefill_key,
+        PREFILL,
+        KV_HEADS,
+        &prefill_positions,
+        &cos,
+        &sin,
+    );
+    let cache_len = KV_HEADS * CAPACITY * HEAD_DIM;
+    let mut expected_k = vec![0.0; cache_len];
+    let mut expected_v = vec![0.0; cache_len];
+    for position in 0..PREFILL {
         for head in 0..KV_HEADS {
             for dim in 0..HEAD_DIM {
-                let cache_index = (head * CAPACITY + step) * HEAD_DIM + dim;
+                let cache_index = (head * CAPACITY + position) * HEAD_DIM + dim;
+                let source_index = (position * KV_HEADS + head) * HEAD_DIM + dim;
+                expected_k[cache_index] = rotated_key[source_index];
+                expected_v[cache_index] = prefill_value[source_index];
+            }
+        }
+    }
+    let expected_output = target_attention_reference(
+        &rotated_query,
+        &expected_k,
+        &expected_v,
+        PREFILL,
+        0,
+        CAPACITY,
+    );
+    let prefill_position_ids: Vec<_> = prefill_positions.iter().map(|&x| x as i64).collect();
+    let mut step = run_available(run_packed_step(
+        &ep,
+        &packed,
+        PREFILL,
+        None,
+        None,
+        0,
+        PREFILL,
+        CAPACITY,
+        &cos,
+        &sin,
+        &prefill_position_ids,
+    ))
+    .unwrap();
+    close(&step.output, &expected_output);
+    close(&step.key, &expected_k);
+    close(&step.value, &expected_v);
+
+    for position in PREFILL..CAPACITY {
+        let (query, key, value) = make_token(position);
+        let mut packed = Vec::with_capacity((NUM_HEADS + 2 * KV_HEADS) * HEAD_DIM);
+        packed.extend_from_slice(&query);
+        packed.extend_from_slice(&key);
+        packed.extend_from_slice(&value);
+        let rotated_query = rotate_target(&query, 1, NUM_HEADS, &[position], &cos, &sin);
+        let rotated_key = rotate_target(&key, 1, KV_HEADS, &[position], &cos, &sin);
+        for head in 0..KV_HEADS {
+            for dim in 0..HEAD_DIM {
+                let cache_index = (head * CAPACITY + position) * HEAD_DIM + dim;
                 expected_k[cache_index] = rotated_key[head * HEAD_DIM + dim];
                 expected_v[cache_index] = value[head * HEAD_DIM + dim];
             }
         }
-        let expected_output =
-            target_decode_reference(&rotated_query, &expected_k, &expected_v, step + 1, CAPACITY);
-        let (output, got_k, got_v) = run_packed_decode_in_place(
+        let expected_output = target_attention_reference(
+            &rotated_query,
+            &expected_k,
+            &expected_v,
+            1,
+            position,
+            CAPACITY,
+        );
+        let key_ptr = step.cache_k.as_ptr();
+        let value_ptr = step.cache_v.as_ptr();
+        step = run_available(run_packed_step(
             &ep,
             &packed,
-            &mut cache_k,
-            &mut cache_v,
-            step as i32,
-            (step + 1) as i32,
+            1,
+            Some(step.cache_k),
+            Some(step.cache_v),
+            position,
+            position + 1,
+            CAPACITY,
             &cos,
             &sin,
-            step as i64,
-        )
+            &[position as i64],
+        ))
         .unwrap();
-        close(&output, &expected_output);
-        close(&got_k, &expected_k);
-        close(&got_v, &expected_v);
+        assert_eq!(step.cache_k.as_ptr(), key_ptr);
+        assert_eq!(step.cache_v.as_ptr(), value_ptr);
+        close(&step.output, &expected_output);
+        close(&step.key, &expected_k);
+        close(&step.value, &expected_v);
     }
 
-    ep.deallocate(cache_k).unwrap();
-    ep.deallocate(cache_v).unwrap();
+    ep.deallocate(step.cache_k).unwrap();
+    ep.deallocate(step.cache_v).unwrap();
 }
 
 #[test]
