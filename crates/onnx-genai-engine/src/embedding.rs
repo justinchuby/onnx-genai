@@ -59,15 +59,18 @@ impl Engine {
             anyhow::bail!("embedding input must contain at least one token");
         }
 
+        let session = self
+            .session
+            .as_deref()
+            .context("embeddings are not supported by the native decoder backend")?;
         let hidden_output =
-            resolve_hidden_state_output(&self.session, options.hidden_state_output.as_deref())?
+            resolve_hidden_state_output(session, options.hidden_state_output.as_deref())?
                 .to_string();
-        let mut decode_state = DecodeState::new(&self.session)
-            .context("failed to initialize embedding model inputs")?;
-        let outputs = run_decode_step(&self.session, &mut decode_state, input_ids, 0)
+        let mut decode_state =
+            DecodeState::new(session).context("failed to initialize embedding model inputs")?;
+        let outputs = run_decode_step(session, &mut decode_state, input_ids, 0)
             .context("embedding model forward pass failed")?;
-        let hidden =
-            extract_hidden_sequence(&self.session, &outputs, &hidden_output, input_ids.len())?;
+        let hidden = extract_hidden_sequence(session, &outputs, &hidden_output, input_ids.len())?;
         pool_hidden_states(
             &hidden.data,
             hidden.positions,
@@ -334,11 +337,11 @@ mod tests {
         let _guard = model_test_lock();
         let mut engine = engine("tiny-mtp-full")?;
         let input_ids = [2, 4, 3];
-        let output_name = resolve_hidden_state_output(&engine.session, None)?.to_string();
-        let mut decode_state = DecodeState::new(&engine.session)?;
-        let outputs = run_decode_step(&engine.session, &mut decode_state, &input_ids, 0)?;
-        let hidden =
-            extract_hidden_sequence(&engine.session, &outputs, &output_name, input_ids.len())?;
+        let session = engine.session.as_deref().expect("ORT test engine");
+        let output_name = resolve_hidden_state_output(session, None)?.to_string();
+        let mut decode_state = DecodeState::new(session)?;
+        let outputs = run_decode_step(session, &mut decode_state, &input_ids, 0)?;
+        let hidden = extract_hidden_sequence(session, &outputs, &output_name, input_ids.len())?;
 
         let mut expected_mean = vec![0.0f32; hidden.hidden_size];
         for row in hidden.data.chunks_exact(hidden.hidden_size) {

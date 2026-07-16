@@ -97,6 +97,8 @@ formats executed.
    the source. This is the critical runtime defect blocking an unmodified
    end-to-end run.
 
-The HTTP server currently loads the ORT-backed `Engine::from_dir`; this
-validation therefore uses the engine's explicit `native-backend`
-`NativeDecodeSession` path, where the Rust CPU operator is registered.
+`Engine::from_dir` and the HTTP server can now select this path automatically
+when built with `native-backend`: models containing `BlockQuantizedMatMul` use
+the CPU `NativeDecodeSession`, while existing models remain on ORT. Native
+requests are serialized today; continuous batching and persistent native
+sessions remain follow-ups.

@@ -37,11 +37,12 @@ use std::path::Path;
 use std::sync::Arc;
 
 pub use crate::config::{
-    Eagle3Config, EngineConfig, EngineConfigError, FinishReason, GenerateConstraint,
-    GenerateOptions, GeneratePrompt, GenerateRequest, GenerateResult, GenerateToken,
-    GenerateTokenCallback, KvConnectorBackend, KvConnectorConfig, LimitParseError, MtpConfig,
-    PrioritizedGenerateRequest, PrioritizedGenerateResult, ScheduledGenerateArrival, SessionId,
-    SharedKvBinding, SharedKvProposerConfig, SpeculativeMode, TokenLogprob, parse_resource_limit,
+    Eagle3Config, EngineConfig, EngineConfigError, EngineDecodeBackend, FinishReason,
+    GenerateConstraint, GenerateOptions, GeneratePrompt, GenerateRequest, GenerateResult,
+    GenerateToken, GenerateTokenCallback, KvConnectorBackend, KvConnectorConfig, LimitParseError,
+    MtpConfig, PrioritizedGenerateRequest, PrioritizedGenerateResult, ScheduledGenerateArrival,
+    SessionId, SharedKvBinding, SharedKvProposerConfig, SpeculativeMode, TokenLogprob,
+    parse_resource_limit,
 };
 pub use crate::connector_bridge::{ConnectorLookupOutcome, ConnectorStats};
 use crate::speculative::{LinearEmbedder, LinearLmHead, SpeculativeStats};
@@ -203,6 +204,8 @@ fn governor_kv_config(
 
 /// The generation engine.
 pub struct Engine {
+    /// Resolved decoder execution backend.
+    decode_backend: EngineDecodeBackend,
     /// Model inference metadata.
     pub(crate) metadata: InferenceMetadata,
     /// KV cache manager.
@@ -222,7 +225,11 @@ pub struct Engine {
     /// Persistent multi-turn session state, keyed by session id.
     pub(crate) sessions: HashMap<SessionId, EngineSession>,
     /// ORT session for decoder execution.
-    pub(crate) session: Box<Session>,
+    pub(crate) session: Option<Box<Session>>,
+    /// Native decoder session. Native execution is single-request and serialized
+    /// by the server's fallback driver in this first milestone.
+    #[cfg(feature = "native-backend")]
+    native_session: Option<crate::native_decode::NativeDecodeSession>,
     /// Optional draft model used by the speculative decoding path.
     pub(crate) draft: Option<DraftModel>,
     /// Optional MTP head and target-side projections.
@@ -252,14 +259,14 @@ pub struct Engine {
     pub(crate) _environment: Environment,
 }
 
-// SAFETY: `Engine` owns every ORT handle reachable through its sessions and
-// decode state, and ORT sessions/values/bindings/allocators have no thread
-// affinity. Moving the engine transfers exclusive ownership of those handles;
-// mutation still requires `&mut Engine`. Self-references in decode runners point
-// into boxed `Session` allocations, whose addresses remain stable when the
-// owning `Engine` moves. This would stop being sound if an execution provider
-// introduced thread-affine handles or a field gained unsynchronized shared
-// mutation.
+// SAFETY: `Engine` owns every ORT or native-runtime handle reachable through
+// its sessions and decode state. Neither runtime's sessions, values, bindings,
+// allocators, or CPU tensors have thread affinity. Moving the engine transfers
+// exclusive ownership; mutation still requires `&mut Engine`. Self-references
+// in ORT decode runners point into boxed `Session` allocations, whose addresses
+// remain stable when the owning `Engine` moves. This would stop being sound if
+// an execution provider introduced thread-affine handles or a field gained
+// unsynchronized shared mutation.
 unsafe impl Send for Engine {}
 
 pub(crate) struct MtpModel {
@@ -304,6 +311,11 @@ impl Engine {
     ) -> anyhow::Result<Self> {
         let model_directory = ModelDirectory::load(model_dir)
             .map_err(|e| anyhow::anyhow!("Failed to resolve model directory: {}", e))?;
+        let decode_backend =
+            resolve_decode_backend(&model_directory.model_path, config.decode_backend)?;
+        if decode_backend == EngineDecodeBackend::Native {
+            return Self::from_native_model_directory(model_directory, config);
+        }
 
         let environment = Environment::new("onnx-genai-engine")
             .map_err(|e| anyhow::anyhow!("Failed to create ORT environment: {}", e))?;
@@ -331,17 +343,7 @@ impl Engine {
             compat
         } else {
             tracing::warn!("No inference metadata found, using defaults");
-            InferenceMetadata {
-                required_capabilities: vec![],
-                model: None,
-                kv_cache: None,
-                quantization: None,
-                pipeline: None,
-                strategy: None,
-                speculative: None,
-                structured_output: None,
-                hardware_requirements: None,
-            }
+            default_inference_metadata()
         };
 
         // Validate capabilities
@@ -699,6 +701,7 @@ impl Engine {
             build_connector_bridge(&config.kv_connector, &model_directory, kv_model.as_ref())?;
 
         Ok(Self {
+            decode_backend,
             metadata,
             kv_cache,
             prefix_cache: PrefixCache::new(),
@@ -709,7 +712,9 @@ impl Engine {
             governor,
             sessions: HashMap::new(),
             _environment: environment,
-            session: Box::new(session),
+            session: Some(Box::new(session)),
+            #[cfg(feature = "native-backend")]
+            native_session: None,
             draft,
             mtp,
             eagle3,
@@ -721,6 +726,154 @@ impl Engine {
             last_speculative_stats: SpeculativeStats::default(),
             connector,
         })
+    }
+
+    #[cfg(feature = "native-backend")]
+    fn from_native_model_directory(
+        model_directory: ModelDirectory,
+        config: EngineConfig,
+    ) -> anyhow::Result<Self> {
+        if config.draft_model.is_some() || !matches!(config.speculative_mode, SpeculativeMode::None)
+        {
+            anyhow::bail!(
+                "native decoder backend does not yet support speculative, MTP, EAGLE-3, or shared-KV generation"
+            );
+        }
+        if !matches!(&config.kv_connector.backend, KvConnectorBackend::Null) {
+            anyhow::bail!("native decoder backend does not yet support external KV connectors");
+        }
+
+        let metadata = if let Some(metadata_path) = &model_directory.metadata_path {
+            onnx_genai_metadata::load_metadata(metadata_path)
+                .map_err(|e| anyhow::anyhow!("Failed to load metadata: {}", e))?
+        } else if let Some(compat) =
+            onnx_genai_genai_config::inference_metadata_from_dir(&model_directory.root, None)
+                .map_err(|e| anyhow::anyhow!("Failed to convert genai_config.json: {}", e))?
+        {
+            compat
+        } else {
+            tracing::warn!("No inference metadata found, using defaults");
+            default_inference_metadata()
+        };
+        let runtime_caps = onnx_genai_metadata::RuntimeCapabilities::default();
+        if let Err(unsupported) = onnx_genai_metadata::validate(&metadata, &runtime_caps) {
+            anyhow::bail!("Unsupported capabilities: {:?}", unsupported);
+        }
+
+        let tokenizer = Tokenizer::from_file(&model_directory.tokenizer_path)
+            .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {}", e))?;
+        let fim_config = load_fim_config_from_model_dir(&model_directory.root)?;
+        let governor_kv_config = governor_kv_config(None, &config)?;
+        let governor = EngineResourceGovernor::new(
+            config.limits.clone(),
+            config.allow_runtime_override,
+            governor_kv_config,
+        )
+        .map_err(|error| anyhow::anyhow!("Failed to initialize Resource Governor: {error}"))?;
+        let mut scheduler_config = config.scheduler.clone();
+        if scheduler_config.bytes_per_token.is_none() {
+            scheduler_config.bytes_per_token = Some(
+                governor_kv_config
+                    .page_size_bytes
+                    .div_ceil(governor_kv_config.tokens_per_page),
+            );
+        }
+        let scheduler = Scheduler::with_byte_budget(scheduler_config, governor.byte_budget());
+        let connector = build_connector_bridge(&config.kv_connector, &model_directory, None)?;
+        let native_session = crate::native_decode::NativeDecodeSession::load(
+            &model_directory.model_path,
+            crate::native_decode::NativeDecodeDevice::Cpu,
+        )
+        .map_err(|error| anyhow::anyhow!("Failed to load native decoder session: {error}"))?;
+        let environment = Environment::new("onnx-genai-engine")
+            .map_err(|e| anyhow::anyhow!("Failed to create ORT environment: {}", e))?;
+
+        Ok(Self {
+            decode_backend: EngineDecodeBackend::Native,
+            metadata,
+            kv_cache: PagedKvCache::new(config.page_size, config.num_gpu_pages),
+            prefix_cache: PrefixCache::new(),
+            token_prefix_cache: Vec::new(),
+            kv_model: None,
+            decode_path: ModelDecodePath::Legacy,
+            scheduler,
+            governor,
+            sessions: HashMap::new(),
+            session: None,
+            native_session: Some(native_session),
+            draft: None,
+            mtp: None,
+            eagle3: None,
+            shared_kv_proposer: None,
+            tokenizer,
+            fim_config,
+            num_speculative_tokens: config.num_speculative_tokens.max(1),
+            speculative_mode: SpeculativeMode::None,
+            last_speculative_stats: SpeculativeStats::default(),
+            connector,
+            _environment: environment,
+        })
+    }
+
+    #[cfg(not(feature = "native-backend"))]
+    fn from_native_model_directory(
+        _model_directory: ModelDirectory,
+        _config: EngineConfig,
+    ) -> anyhow::Result<Self> {
+        anyhow::bail!(
+            "native decoder backend requires building onnx-genai-engine with the 'native-backend' feature"
+        )
+    }
+
+    #[cfg(feature = "native-backend")]
+    fn generate_native_with_callback(
+        &mut self,
+        request: GenerateRequest,
+        callback: Option<&mut GenerateTokenCallback<'_>>,
+    ) -> anyhow::Result<GenerateResult> {
+        self.last_speculative_stats = SpeculativeStats::default();
+        request.options.validate()?;
+        let mut options = request.options;
+        if options.eos_token_id.is_none() {
+            options.eos_token_id = self.tokenizer.eos_token_id();
+        }
+        let prompt_tokens = self.tokenize_prompt(&request.prompt)?;
+        if prompt_tokens.is_empty() {
+            anyhow::bail!("prompt must contain at least one token");
+        }
+        options.max_context = self.max_context_for_request(&options);
+        let chain = build_processor_chain(&options, Some(&self.tokenizer))?;
+        let native_session = self
+            .native_session
+            .as_mut()
+            .context("native decoder session is unavailable")?;
+        native_session.generate_with_callback(
+            &prompt_tokens,
+            &options,
+            &chain,
+            &self.tokenizer,
+            callback,
+        )
+    }
+
+    #[cfg(not(feature = "native-backend"))]
+    fn generate_native_with_callback(
+        &mut self,
+        _request: GenerateRequest,
+        _callback: Option<&mut GenerateTokenCallback<'_>>,
+    ) -> anyhow::Result<GenerateResult> {
+        anyhow::bail!(
+            "native decoder backend requires building onnx-genai-engine with the 'native-backend' feature"
+        )
+    }
+
+    fn require_ort_backend(&self, feature: &str) -> anyhow::Result<()> {
+        if self.decode_backend == EngineDecodeBackend::Native {
+            anyhow::bail!(
+                "the native single-session backend does not support {feature}; use independent serialized requests"
+            );
+        }
+        Ok(())
     }
 
     /// Generate text for a request.
@@ -795,6 +948,9 @@ impl Engine {
         request: GenerateRequest,
         callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
+        if self.decode_backend == EngineDecodeBackend::Native {
+            return self.generate_native_with_callback(request, callback);
+        }
         let session_id = self.create_session()?;
         let result = self.generate_in_session_with_callback(session_id, request, callback);
         let close_result = self.close_session(session_id);
@@ -910,7 +1066,10 @@ impl Engine {
             }
 
             let mut backend = SessionDecodeLoopBackend {
-                session: &self.session,
+                session: self
+                    .session
+                    .as_deref()
+                    .expect("ORT backend must own a decoder session"),
                 kv_model: self.kv_model.as_ref(),
                 kv_cache: &mut self.kv_cache,
                 scheduler: &mut self.scheduler,
@@ -965,6 +1124,7 @@ impl Engine {
         &mut self,
         mut arrivals: Vec<ScheduledGenerateArrival>,
     ) -> anyhow::Result<Vec<PrioritizedGenerateResult>> {
+        self.require_ort_backend("prioritized request scheduling")?;
         arrivals.sort_by_key(|arrival| arrival.arrival_step);
         let total_requests = arrivals.len();
         let mut next_arrival = 0;
@@ -1029,6 +1189,7 @@ impl Engine {
 
     /// Create a new generation session.
     pub fn create_session(&mut self) -> anyhow::Result<SessionId> {
+        self.require_ort_backend("persistent sessions")?;
         let decode_state = self.new_target_decode_state()?;
         let id = self.kv_cache.create_sequence();
         let draft = if let Some(draft_model) = &mut self.draft {
@@ -1056,6 +1217,7 @@ impl Engine {
 
     /// Reset a persistent session, freeing its current state while keeping the id usable.
     pub fn reset_session(&mut self, session_id: SessionId) -> anyhow::Result<()> {
+        self.require_ort_backend("persistent sessions")?;
         if !self.sessions.contains_key(&session_id) {
             anyhow::bail!("session {session_id} not found");
         }
@@ -1087,18 +1249,23 @@ impl Engine {
     }
 
     fn new_target_decode_state(&self) -> anyhow::Result<DecodeState> {
+        let session = self
+            .session
+            .as_deref()
+            .context("ORT decoder session is unavailable")?;
         if matches!(
             &self.speculative_mode,
             SpeculativeMode::Mtp(_) | SpeculativeMode::Eagle3(_) | SpeculativeMode::SharedKv(_)
         ) {
-            DecodeState::new(&self.session)
+            DecodeState::new(session)
         } else {
-            DecodeState::new_for_path(&self.session, &self.decode_path)
+            DecodeState::new_for_path(session, &self.decode_path)
         }
     }
 
     /// Close a persistent session and free its associated state.
     pub fn close_session(&mut self, session_id: SessionId) -> anyhow::Result<()> {
+        self.require_ort_backend("persistent sessions")?;
         self.scheduler.complete(session_id);
         let state = self
             .sessions
@@ -1118,6 +1285,7 @@ impl Engine {
 
     /// Number of logical tokens retained in a persistent session.
     pub fn session_token_count(&self, session_id: SessionId) -> anyhow::Result<usize> {
+        self.require_ort_backend("persistent sessions")?;
         self.sessions
             .get(&session_id)
             .map(|state| state.tokens.len())
@@ -1127,6 +1295,11 @@ impl Engine {
     /// Get the loaded metadata.
     pub fn metadata(&self) -> &InferenceMetadata {
         &self.metadata
+    }
+
+    /// Resolved decoder execution backend.
+    pub fn decode_backend(&self) -> EngineDecodeBackend {
+        self.decode_backend
     }
 
     /// Auto-detected fill-in-the-middle configuration, if the tokenizer declares one.
@@ -1283,7 +1456,9 @@ impl Engine {
                         .materialize_sequence(session_id)
                         .map_err(|e| anyhow::anyhow!("Failed to materialize prefix KV: {}", e))?;
                     load_materialized_past(
-                        &self.session,
+                        self.session
+                            .as_deref()
+                            .expect("ORT backend must own a decoder session"),
                         self.kv_model.as_ref().expect("checked above"),
                         &mut state.decode_state,
                         &materialized,
@@ -1354,7 +1529,13 @@ impl Engine {
         // Scope the immutable `kv_model` borrow so it does not overlap the
         // `&mut self.connector` fetch below.
         match self.kv_model.as_ref() {
-            Some(kv_model) if kv_model_past_is_f32(&self.session, kv_model) => {}
+            Some(kv_model)
+                if kv_model_past_is_f32(
+                    self.session
+                        .as_deref()
+                        .expect("ORT backend must own a decoder session"),
+                    kv_model,
+                ) => {}
             _ => return Ok(None),
         }
 
@@ -1391,7 +1572,14 @@ impl Engine {
             })
             .collect();
         let kv_model = self.kv_model.as_ref().expect("checked present above");
-        let kv = past_kv_from_payloads(&self.session, kv_model, &placed, total)?;
+        let kv = past_kv_from_payloads(
+            self.session
+                .as_deref()
+                .expect("ORT backend must own a decoder session"),
+            kv_model,
+            &placed,
+            total,
+        )?;
         state.decode_state.import_runner_kv(total, kv)?;
         state.kv_token_count = total;
         Ok(Some(total))
@@ -1465,7 +1653,10 @@ impl Engine {
         };
         let step_result = {
             let mut backend = SessionDecodeLoopBackend {
-                session: &self.session,
+                session: self
+                    .session
+                    .as_deref()
+                    .expect("ORT backend must own a decoder session"),
                 kv_model: self.kv_model.as_ref(),
                 kv_cache: &mut self.kv_cache,
                 scheduler: &mut self.scheduler,
@@ -1526,7 +1717,9 @@ impl Engine {
     ) -> anyhow::Result<()> {
         while state.decode_state.use_kv && state.kv_token_count < state.tokens.len() {
             let _ = next_session_token_logits(
-                &self.session,
+                self.session
+                    .as_deref()
+                    .expect("ORT backend must own a decoder session"),
                 self.kv_model.as_ref(),
                 &mut self.kv_cache,
                 session_id,
@@ -1545,7 +1738,14 @@ impl Engine {
             return;
         }
         let config = match self.kv_model.as_ref() {
-            Some(kv_model) if kv_model_past_is_f32(&self.session, kv_model) => {
+            Some(kv_model)
+                if kv_model_past_is_f32(
+                    self.session
+                        .as_deref()
+                        .expect("ORT backend must own a decoder session"),
+                    kv_model,
+                ) =>
+            {
                 kv_model.tensor_config
             }
             _ => return,
@@ -1687,6 +1887,89 @@ impl DecodeLoopBackend for SessionDecodeLoopBackend<'_> {
         self.state.tokens.push(token_id);
         self.scheduler.advance(self.session_id);
         Ok(())
+    }
+}
+
+fn resolve_decode_backend(
+    model_path: &Path,
+    requested: EngineDecodeBackend,
+) -> anyhow::Result<EngineDecodeBackend> {
+    match requested {
+        EngineDecodeBackend::Ort => Ok(EngineDecodeBackend::Ort),
+        EngineDecodeBackend::Native => {
+            #[cfg(feature = "native-backend")]
+            {
+                Ok(EngineDecodeBackend::Native)
+            }
+            #[cfg(not(feature = "native-backend"))]
+            {
+                let _ = model_path;
+                anyhow::bail!(
+                    "native decoder backend requires building onnx-genai-engine with the 'native-backend' feature"
+                )
+            }
+        }
+        EngineDecodeBackend::Auto => {
+            if model_requires_native_backend(model_path)? {
+                #[cfg(feature = "native-backend")]
+                {
+                    return Ok(EngineDecodeBackend::Native);
+                }
+                #[cfg(not(feature = "native-backend"))]
+                {
+                    anyhow::bail!(
+                        "model contains native-only BlockQuantizedMatMul operators; rebuild with the 'native-backend' feature"
+                    );
+                }
+            }
+            Ok(EngineDecodeBackend::Ort)
+        }
+    }
+}
+
+fn model_requires_native_backend(model_path: &Path) -> anyhow::Result<bool> {
+    #[cfg(feature = "native-backend")]
+    {
+        use prost::Message;
+
+        let bytes = std::fs::read(model_path).with_context(|| {
+            format!(
+                "Failed to inspect model '{}' for native operators",
+                model_path.display()
+            )
+        })?;
+        let model = onnx_runtime_loader::proto::ModelProto::decode(bytes.as_slice())
+            .context("Failed to parse ONNX model while selecting decoder backend")?;
+        return Ok(model_proto_requires_native_backend(&model));
+    }
+    #[cfg(not(feature = "native-backend"))]
+    {
+        let _ = model_path;
+        Ok(false)
+    }
+}
+
+#[cfg(feature = "native-backend")]
+fn model_proto_requires_native_backend(model: &onnx_runtime_loader::proto::ModelProto) -> bool {
+    model.graph.as_ref().is_some_and(|graph| {
+        graph
+            .node
+            .iter()
+            .any(|node| node.op_type == "BlockQuantizedMatMul")
+    })
+}
+
+fn default_inference_metadata() -> InferenceMetadata {
+    InferenceMetadata {
+        required_capabilities: vec![],
+        model: None,
+        kv_cache: None,
+        quantization: None,
+        pipeline: None,
+        strategy: None,
+        speculative: None,
+        structured_output: None,
+        hardware_requirements: None,
     }
 }
 
@@ -1832,6 +2115,28 @@ mod tests {
         finish_reason_after_token, select_next_token, select_next_token_with_sampler,
     };
     use crate::sampling::Sampler;
+
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn auto_backend_detection_reads_onnx_node_types_not_incidental_strings() {
+        use onnx_runtime_loader::proto::{
+            ModelProto,
+            onnx::{GraphProto, NodeProto},
+        };
+
+        let mut model = ModelProto {
+            producer_name: "BlockQuantizedMatMul appears only in metadata".to_string(),
+            graph: Some(GraphProto::default()),
+            ..ModelProto::default()
+        };
+        assert!(!model_proto_requires_native_backend(&model));
+
+        model.graph.as_mut().unwrap().node.push(NodeProto {
+            op_type: "BlockQuantizedMatMul".to_string(),
+            ..NodeProto::default()
+        });
+        assert!(model_proto_requires_native_backend(&model));
+    }
 
     fn test_capacities() -> CapacityProviders {
         CapacityProviders {

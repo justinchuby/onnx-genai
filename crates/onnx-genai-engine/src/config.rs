@@ -339,9 +339,25 @@ impl Default for KvConnectorConfig {
     }
 }
 
+/// Model-execution backend selected for decoder generation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum EngineDecodeBackend {
+    /// Use the native runtime for models containing native-only operators;
+    /// otherwise use ONNX Runtime.
+    #[default]
+    Auto,
+    /// Always use ONNX Runtime.
+    Ort,
+    /// Always use the native runtime.
+    Native,
+}
+
 /// Engine configuration.
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
+    /// Decoder execution backend. [`EngineDecodeBackend::Auto`] preserves ORT
+    /// for existing models and selects native execution only when required.
+    pub decode_backend: EngineDecodeBackend,
     /// Number of GPU pages for KV cache.
     pub num_gpu_pages: usize,
     /// Tokens per KV page.
@@ -374,6 +390,7 @@ pub struct EngineConfig {
 impl Default for EngineConfig {
     fn default() -> Self {
         Self {
+            decode_backend: EngineDecodeBackend::Auto,
             num_gpu_pages: 1024,
             page_size: 16,
             scheduler: SchedulerConfig::default(),
@@ -499,6 +516,7 @@ mod resource_limit_tests {
     #[test]
     fn engine_config_defaults_to_scheduler_resource_defaults() {
         let config = EngineConfig::default();
+        assert_eq!(config.decode_backend, EngineDecodeBackend::Auto);
         assert_eq!(config.limits, ResourceLimits::default());
         assert!(!config.allow_runtime_override);
     }

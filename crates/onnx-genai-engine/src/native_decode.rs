@@ -1,6 +1,6 @@
 //! Native nxrt adapter for the engine's existing decode loop.
 
-use crate::config::{GenerateOptions, GenerateResult};
+use crate::config::{GenerateOptions, GenerateResult, GenerateTokenCallback};
 use crate::decode::DecodeBackend;
 use crate::decode_loop::{DecodeLoopBackend, DecodeLoopState, run_decode_loop};
 use crate::logits::{ProcessorChain, TokenId};
@@ -208,6 +208,18 @@ impl NativeDecodeSession {
         chain: &ProcessorChain,
         tokenizer: &Tokenizer,
     ) -> anyhow::Result<GenerateResult> {
+        self.generate_with_callback(prompt_tokens, options, chain, tokenizer, None)
+    }
+
+    /// Generate through the shared loop and optionally stream generated tokens.
+    pub(crate) fn generate_with_callback(
+        &mut self,
+        prompt_tokens: &[TokenId],
+        options: &GenerateOptions,
+        chain: &ProcessorChain,
+        tokenizer: &Tokenizer,
+        callback: Option<&mut GenerateTokenCallback<'_>>,
+    ) -> anyhow::Result<GenerateResult> {
         if prompt_tokens.is_empty() {
             bail!("native generation requires at least one prompt token");
         }
@@ -225,7 +237,7 @@ impl NativeDecodeSession {
             chain,
             tokenizer,
             options.max_context,
-            None,
+            callback,
         )
     }
 

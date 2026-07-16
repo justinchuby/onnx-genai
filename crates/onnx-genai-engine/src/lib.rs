@@ -29,10 +29,10 @@ pub use batched::{ContinuousBatchEvent, ContinuousBatchHandle, ContinuousBatchMa
 pub use connector_bridge::{ConnectorLookupOutcome, ConnectorStats};
 pub use embedding::{EmbeddingOptions, EmbeddingPooling};
 pub use engine::{
-    Eagle3Config, Engine, EngineConfig, EngineConfigError, EngineGovernorError,
-    EngineResourceGovernor, FinishReason, GenerateConstraint, GenerateOptions, GeneratePrompt,
-    GenerateRequest, GenerateResult, GenerateToken, GenerateTokenCallback, KvConnectorBackend,
-    KvConnectorConfig, LimitParseError, MtpConfig, PrioritizedGenerateRequest,
+    Eagle3Config, Engine, EngineConfig, EngineConfigError, EngineDecodeBackend,
+    EngineGovernorError, EngineResourceGovernor, FinishReason, GenerateConstraint, GenerateOptions,
+    GeneratePrompt, GenerateRequest, GenerateResult, GenerateToken, GenerateTokenCallback,
+    KvConnectorBackend, KvConnectorConfig, LimitParseError, MtpConfig, PrioritizedGenerateRequest,
     PrioritizedGenerateResult, ScheduledGenerateArrival, SessionId, SharedKvBinding,
     SharedKvProposerConfig, SpeculativeMode, TokenLogprob, parse_resource_limit,
 };

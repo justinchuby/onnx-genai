@@ -846,7 +846,9 @@ impl Engine {
                         .hidden_output
                         .clone();
                     let (logits, hidden) = next_session_token_logits_and_hidden(
-                        &self.session,
+                        self.session
+                            .as_deref()
+                            .expect("ORT backend must own a decoder session"),
                         self.kv_model.as_ref(),
                         &mut self.kv_cache,
                         session_id,
@@ -862,7 +864,9 @@ impl Engine {
                         .hidden_outputs
                         .clone();
                     let (logits, layers) = next_session_token_logits_and_hiddens(
-                        &self.session,
+                        self.session
+                            .as_deref()
+                            .expect("ORT backend must own a decoder session"),
                         self.kv_model.as_ref(),
                         &mut self.kv_cache,
                         session_id,
@@ -885,7 +889,9 @@ impl Engine {
                         .target_hidden_output
                         .clone();
                     let (logits, hidden) = next_session_token_logits_and_hidden(
-                        &self.session,
+                        self.session
+                            .as_deref()
+                            .expect("ORT backend must own a decoder session"),
                         self.kv_model.as_ref(),
                         &mut self.kv_cache,
                         session_id,
@@ -896,7 +902,9 @@ impl Engine {
                 } else {
                     (
                         next_session_token_logits(
-                            &self.session,
+                            self.session
+                                .as_deref()
+                                .expect("ORT backend must own a decoder session"),
                             self.kv_model.as_ref(),
                             &mut self.kv_cache,
                             session_id,
@@ -1015,7 +1023,9 @@ impl Engine {
             } else {
                 let retained_base_len = state.decode_state.retained_kv_len(base_len);
                 let outputs = run_decode_step(
-                    &self.session,
+                    self.session
+                        .as_deref()
+                        .expect("ORT backend must own a decoder session"),
                     &mut state.decode_state,
                     &draft_tokens,
                     base_len,
@@ -1023,7 +1033,9 @@ impl Engine {
                 if state.decode_state.use_kv {
                     if let Some(kv_model) = &self.kv_model {
                         mirror_present_kv_to_pages(
-                            &self.session,
+                            self.session
+                                .as_deref()
+                                .expect("ORT backend must own a decoder session"),
                             kv_model,
                             &mut self.kv_cache,
                             session_id,
@@ -1046,7 +1058,12 @@ impl Engine {
                         state.decode_state.sink_tokens(),
                     )?;
                 }
-                extract_logits_sequence(&self.session, outputs)?
+                extract_logits_sequence(
+                    self.session
+                        .as_deref()
+                        .expect("ORT backend must own a decoder session"),
+                    outputs,
+                )?
             };
 
             let mut target_logits = Vec::with_capacity(draft_tokens.len() + 1);
@@ -1113,7 +1130,9 @@ impl Engine {
                 .map(|logprobs| logprobs[..accepted].to_vec());
             let rewind_len = base_len + accepted;
             rewind_target_state_to_len(
-                &self.session,
+                self.session
+                    .as_deref()
+                    .expect("ORT backend must own a decoder session"),
                 self.kv_model.as_ref(),
                 &mut self.kv_cache,
                 session_id,
@@ -1220,7 +1239,9 @@ impl Engine {
                 step = commit_state.step;
                 if let Some(finish_reason) = finish_reason {
                     trim_overmaterialized_target_kv(
-                        &self.session,
+                        self.session
+                            .as_deref()
+                            .expect("ORT backend must own a decoder session"),
                         self.kv_model.as_ref(),
                         &mut self.kv_cache,
                         session_id,

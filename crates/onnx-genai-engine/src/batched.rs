@@ -496,7 +496,9 @@ impl Engine {
         }
 
         let mut decode = BatchedStaticCacheDecodeSession::new(
-            &self.session,
+            self.session
+                .as_deref()
+                .context("ORT decoder session is unavailable")?,
             StaticCacheDecodeOptions {
                 batch_size: i64::try_from(rows.len()).context("batch size exceeds i64")?,
             },
@@ -597,7 +599,9 @@ impl Engine {
             .as_ref()
             .and_then(|model| model.max_sequence_length);
         ContinuousBatchManager::new(
-            &self.session,
+            self.session
+                .as_deref()
+                .context("ORT decoder session is unavailable")?,
             &self.tokenizer,
             metadata_max_context,
             max_batch,

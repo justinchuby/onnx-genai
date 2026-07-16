@@ -16,6 +16,8 @@ metrics = []
 profiling = []
 # Enables the ORT CUDA execution provider (build on a CUDA host, e.g. H200).
 cuda = ["onnx-genai-ort/cuda"]
+# Enables native decoder execution for models containing native-only operators.
+native-backend = ["onnx-genai-engine/native-backend"]
 
 [dependencies]
 onnx-genai = { workspace = true }
