@@ -48,3 +48,7 @@ Loader opset-import validation for file, from-parts, and nested-subgraph paths m
 ## 2026-07-16T19:27:57+0000 — CUDA IQ super-block GEMV wave
 
 - 🟢 Cleared Roy's shared `onnx-runtime-quantization` extraction: all seven moved grids/sign tables are byte-identical (IQ1S FNV-1a `0x6703ed863501ae2e`); CPU decode and Joi's AVX2 paths are unchanged, and the standalone crate builds/tests cleanly.
+
+## 2026-07-16T19-27-57+0000 — Scribe session update
+
+- 🟢 Cleared Sapper's `67c1e3b` quantized-matmul shape rules: domains, `N`, symbolic dimensions, dtype preservation, error handling, and 2D/3D coverage are correct (93 unit tests + one doc-test).

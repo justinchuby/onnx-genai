@@ -74,3 +74,8 @@ Reviewed Gather/Shape/Constant through three resolved rejection cycles.
 
 - Updated Mobius PR #406 to preserve all ten runtime-supported MXFP4/IQ formats as `BlockQuantizedMatMul` raw blocks; the PR remains open.
 - Mariette 🟢 verified enum IDs, format strings, dimensions, byte strides, and fallback behavior.
+
+## 2026-07-16T19-27-57+0000 — Scribe session update
+
+- **Real-model sub-4-bit milestone:** Qwen2.5-0.5B IQ4_XS produced coherent CPU-native output through 144 `BlockQuantizedMatMul` nodes (120 IQ4_NL, 24 IQ4_XS), with both formats executed without fallback (`2f65135`).
+- **Mobius #406 update:** commit `797fff9` fixes mixed-native scaffolding and emits genai-domain opset v1; 304 tests passed and the PR awaits user merge.

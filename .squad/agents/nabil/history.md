@@ -15,3 +15,7 @@ Authored `docs/NATIVE_CUDA_DECODE.md` (`b416b7f`) and applied Fact Checker's str
 ## 2026-07-16T17:00:38+0000 — Weight offload design
 - Authored `docs/WEIGHT_OFFLOAD.md` (`f0d0890`): immutable mmap backing feeds bounded host and VRAM caches through weight-specific expert/page leases.
 - The design awaits user greenlight; no implementation has started.
+
+## 2026-07-16T19-27-57+0000 — Scribe session update
+
+- Authored `docs/DEEPSEEK_CSA_MTP_RUNTIME.md` (`bca068c`), a native CSA/index-op and persistent iterative-MTP sidecar-state design. It awaits user greenlight.

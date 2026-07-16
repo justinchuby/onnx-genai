@@ -1169,3 +1169,33 @@ Verified on NVIDIA H200, compute capability 9.0, driver 580.105.08.
 **By:** Wallace
 **What:** 🟢 CLEAR on H200. The shared grid FNV-1a hash is `0x6703ed863501ae2e`; both known traces and all random/per-weight GPU-versus-CPU comparisons are correct. The CUDA suite passed 129 tests across 15 groups, and the CPU gate passed 15 tests (one ignored). No fixed SM90 target was added.
 **Why:** Validation confirms IQ1 index reconstruction, scales, deltas, signs, fallbacks, and runtime-device NVRTC targeting all preserve the established contracts.
+
+
+## 2026-07-16 — Real-model sub-4-bit validation and export/runtime fixes
+
+### 2026-07-16: Decisions archive eligibility scan
+**By:** Scribe
+**What:** Scanned `decisions.md` (120,002 bytes) before this merge. No entries predate 2026-06-16, so no entries qualify for the >30-day archive threshold.
+**Why:** The 20KB archive gate requires retaining entries that are 30 days old or newer.
+
+### 2026-07-16: DeepSeek CSA and iterative MTP runtime design
+**By:** Nabil
+**What:** Added `docs/DEEPSEEK_CSA_MTP_RUNTIME.md` (`bca068c`), specifying private-v1 `CompressedSparseAttention` and `SparseKvGather` ops; metadata-declared compressed/index/carry state with checkpointed rollback; CPU-before-CUDA delivery; and a persistent MTP proposer with explicit BSHC `mtp_state`. **AWAITING USER GREENLIGHT.**
+**Why:** Mobius PR #405 retains official 0/4/128 compressor/indexer tensors but currently executes zero-valued anchors plus dense sink-aware attention. The official CSA equations/cache layouts must be frozen before kernel work; existing MTP machinery cannot consume the DeepSeek sidecar state or persist it across iterations.
+
+### 2026-07-16: First real-model sub-4-bit native generation validated
+**By:** Pris
+**What:** Exported `bartowski/Qwen2.5-0.5B-Instruct` IQ4_XS through Mobius PR #406 and produced coherent CPU-native output: “Paris. The capital of the United States is Washington, D. C.” The graph ran 144 `BlockQuantizedMatMul` nodes (120 IQ4_NL, 24 IQ4_XS), with one-shot probes confirming both formats executed without fallback. Scripts and `docs/benchmarks/e2e-sub4bit-validation.md` landed in `2f65135`.
+**Why:** This is the first real GGUF → Mobius → onnx-genai generation proof for the sub-4-bit operator family. The run exposed mixed-scaffold selection, custom-opset import, and runtime shape-inference defects.
+
+### 2026-07-16: Quantized matmul shape inference fixed and cleared
+**By:** Sapper; reviewed by Leon
+**What:** Merged `67c1e3b`, adding shared `A.shape[..-1] + [N]` output-shape inference for `com.github.onnxruntime.genai::BlockQuantizedMatMul` and `com.microsoft::MatMulNBits`, preserving A's dtype and symbolic leading dimensions. Leon confirmed both domains and integer `N` contracts, structured invalid-input errors, 2D/3D coverage, and 93 unit tests plus one doc-test.
+**Why:** The missing rules were the critical runtime blocker. This removes the diagnostic patch requirement and unblocks unmodified real-model E2E and the HTTP-server path.
+
+### 2026-07-16: Mobius #406 mixed-quant scaffold and custom opset fixes
+**By:** Pris; reviewed by Mariette
+**What:** PR #406 was force-pushed with Mobius commit `797fff9`: native IQ/MXFP4 presence chooses a 4-bit/block-32 scaffold for non-native tensors, allowing Q5_1 requantization while preserving native IQ4_XS bytes; `BlockQuantizedMatMul` emission registers `com.github.onnxruntime.genai` opset 1. Coverage includes mixed IQ4_XS/Q5_1/Q8_0 and serialized opset imports. Mariette independently cleared the change (238 tests); Pris's full gate passed 304 tests. The PR remains **AWAITING USER MERGE**.
+**Why:** The real-model run revealed an incorrect 8-bit scaffold selection and malformed serialized ONNX lacking the custom-domain import. Pure-Q8 behavior remains unchanged (MatMulNBits only, no genai import).
+
+**Sources:** `nabil-deepseek-csa-mtp-design.md`, `pris-e2e-sub4bit-validation.md`, `sapper-shapeinfer-quant-matmul.md`, `leon-shapeinfer-quant-review.md`, `pris-mobius406-mixedquant-opset-fix.md`, `mariette-mobius406-fix-review.md`.

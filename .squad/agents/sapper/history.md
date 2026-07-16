@@ -51,3 +51,7 @@ Added the preprocessing-side prompt token-expansion library for multi-tile VLM i
 
 - Merged `5c7dcc9`: matching CPU's fused-SiLU operation order and explicitly rounded acc4 scale boundaries eliminates token-12 drift; greedy CPU/CUDA parity now reaches token 15.
 - The K=4864 `1.9073486e-5` reduction-order difference first diverges at token 16 and is accepted because exact GPU reduction emulation costs 8.4%. Wallace reviewed 🟢.
+
+## 2026-07-16T19-27-57+0000 — Scribe session update
+
+- Merged `67c1e3b`: shape inference for `BlockQuantizedMatMul` and `MatMulNBits` now returns `A.shape[..-1] + [N]`, unblocking unmodified real-model native E2E and the HTTP-server path.
