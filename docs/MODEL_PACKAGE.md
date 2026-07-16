@@ -174,13 +174,15 @@ ORT adds three policies over the standalone library:
 At the ORT core level a package is therefore a **variant-selection and path
 resolution container**. Compiled models are represented by a selected model
 file—typically an ONNX graph containing `com.microsoft::EPContext` nodes—plus
-any external context binaries and external initializers it references. The
-package does not replace the EPContext graph format.
+any external context binaries and external initializers it references. nxrt
+chooses to preserve this existing EPContext mechanism rather than introduce a
+second compiled-graph format.
 
 ### 2.3 onnxruntime-genai package documentation
 
 [`docs/model_package.md`](https://github.com/microsoft/onnxruntime-genai/blob/main/docs/model_package.md)
-defines a GenAI convention over the ORT schema [GENAI-DOC]:
+describes loading and consuming model packages using a GenAI convention over
+the ORT schema [GENAI-DOC]:
 
 - one inline component conventionally named `model`;
 - each variant directory contains a complete `genai_config.json`, ONNX graph
@@ -235,10 +237,6 @@ The important decisions are concrete:
    config directory only if the config did not already set it.
 6. GenAI resolves the experimental API functions locally instead of vendoring
    ORT's experimental C++ header.
-7. Tests cover tokenizer shared assets, shared external initializers, relative
-   path resolution, EP-context paths, and rejection of `sha256:` in flat
-   directories.
-
 PR #2255 adds no package archive, `pack` CLI, or new user-facing pack API. It
 strengthens path ownership and lifetime semantics on top of the package-loading
 surface added earlier.
@@ -254,7 +252,7 @@ surface added earlier.
 | GenAI convention | Adopt complete per-variant `genai_config.json` and shared tokenizer assets, but prefer native `inference_metadata` when both exist. |
 | Single-file distribution | **Diverge additively:** define an optional `.nxpkg` transport archive which extracts to the canonical directory form before loading. |
 | Variant policy | Start ORT-compatible, but rank across the user's full ordered EP preference list rather than only its first entry. |
-| Compiled artifacts | Preserve `EPContext` as the executable interchange; package metadata inventories and validates it but does not invent a second compiled-graph format. |
+| Compiled artifacts | **nxrt decision:** Preserve `EPContext` as the executable interchange, motivated by the existing ORT ecosystem and our existing EPContext support; package metadata inventories and validates it but does not invent a second compiled-graph format. |
 
 ## 3. Proposed package format
 
@@ -704,8 +702,9 @@ minimal-build diagnostic.
 
 ### 5.1 One executable representation
 
-The package does not create a parallel compiled-model abstraction.
-`com.microsoft::EPContext` remains the interchange:
+The package does not create a parallel compiled-model abstraction. nxrt chooses
+`com.microsoft::EPContext` as its executable interchange, leveraging the
+existing ORT ecosystem and our existing EPContext support:
 
 - variadic graph boundary inputs/outputs;
 - `source` dispatch key;
@@ -950,7 +949,7 @@ not publisher authenticity.
 | MP-2 | Canonical executable form is a directory. | ORT compatibility, stable relative paths, and weight/context `mmap`. |
 | MP-3 | `.nxpkg` is an optional deterministic transport archive extracted before load. | Meets single-file distribution without sacrificing mmap or pretending ORT accepts archives. |
 | MP-4 | Use `executor_info["nxrt"]`, with safe `"ort"` compatibility reads. | The ORT schema explicitly delegates consumer payloads by namespace. |
-| MP-5 | EPContext remains the only compiled-graph interchange. | Existing ORT ecosystem and existing repository implementation; no duplicate compiled format. |
+| MP-5 | nxrt uses EPContext as its only compiled-graph interchange. | Existing ORT ecosystem and existing repository implementation; no duplicate compiled format. |
 | MP-6 | Generic fallback is a separate variant. | Deterministic selection, inspection, minimal-build analysis, and no hidden graph switch. |
 | MP-7 | `sha256:` resolution is owned by one package resolver kept alive with the session. | Follows ORT and PR #2255; prevents inconsistent ad hoc joins/lifetime bugs. |
 | MP-8 | Native inference metadata wins over `genai_config.json`. | Preserves current engine semantics while supporting OGA packages. |
