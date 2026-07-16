@@ -385,22 +385,15 @@ fn convert_attribute(
                 .collect::<Result<_, _>>()?,
         ),
         AT::Graph => match ap.g.as_ref() {
-            Some(g) => {
-                let mut sub = Graph::new();
-                build_graph_proto(&mut sub, g, false)?;
-                Attribute::Graph(Box::new(sub))
-            }
+            Some(g) => Attribute::Graph(Box::new(build_subgraph(g)?)),
             None => return Ok(None),
         },
-        AT::Graphs => {
-            let mut subs = Vec::new();
-            for g in &ap.graphs {
-                let mut sub = Graph::new();
-                build_graph_proto(&mut sub, g, false)?;
-                subs.push(sub);
-            }
-            Attribute::Graphs(subs)
-        }
+        AT::Graphs => Attribute::Graphs(
+            ap.graphs
+                .iter()
+                .map(build_subgraph)
+                .collect::<Result<_, _>>()?,
+        ),
         AT::TypeProto => match ap.tp.as_ref() {
             Some(tp) => Attribute::TypeProto(convert_type_proto(graph, tp)?),
             None => return Ok(None),
@@ -413,7 +406,16 @@ fn convert_attribute(
         ),
         // Field-presence fallback when `type` is UNDEFINED.
         AT::Undefined => {
-            if let Some(t) = ap.t.as_ref() {
+            if let Some(g) = ap.g.as_ref() {
+                Attribute::Graph(Box::new(build_subgraph(g)?))
+            } else if !ap.graphs.is_empty() {
+                Attribute::Graphs(
+                    ap.graphs
+                        .iter()
+                        .map(build_subgraph)
+                        .collect::<Result<_, _>>()?,
+                )
+            } else if let Some(t) = ap.t.as_ref() {
                 Attribute::Tensor(convert_tensor(t)?)
             } else if !ap.floats.is_empty() {
                 Attribute::Floats(ap.floats.clone())
@@ -433,6 +435,12 @@ fn convert_attribute(
         }
     };
     Ok(Some((ap.name.clone(), attr)))
+}
+
+fn build_subgraph(gp: &GraphProto) -> Result<Graph, LoaderError> {
+    let mut graph = Graph::new();
+    build_graph_proto(&mut graph, gp, false)?;
+    Ok(graph)
 }
 
 fn convert_tensor(t: &onnx::TensorProto) -> Result<TensorData, LoaderError> {

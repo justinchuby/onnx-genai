@@ -837,6 +837,97 @@ fn bert_toy_optimized_every_value_resolves() {
     );
 }
 
+#[test]
+fn loop_body_records_formal_io_and_inline_initializer_when_attr_type_is_omitted() {
+    let bias_data: Vec<u8> = [1.5f32, -2.0]
+        .into_iter()
+        .flat_map(f32::to_le_bytes)
+        .collect();
+    let body = onnx::GraphProto {
+        name: "loop_body".to_string(),
+        input: vec![
+            value_info("iteration", 7, &[]),
+            value_info("condition_in", 9, &[]),
+            value_info("carried_in", 1, &[Dimlike::Static(2)]),
+        ],
+        output: vec![
+            value_info("condition_out", 9, &[]),
+            value_info("carried_out", 1, &[Dimlike::Static(2)]),
+        ],
+        initializer: vec![onnx::TensorProto {
+            name: "bias".to_string(),
+            data_type: 1,
+            dims: vec![2],
+            raw_data: bias_data.clone(),
+            ..Default::default()
+        }],
+        node: vec![
+            node("Identity", &["condition_in"], &["condition_out"]),
+            node("Add", &["carried_in", "bias"], &["carried_out"]),
+        ],
+        ..Default::default()
+    };
+    let mut body_attr = graph_attr("body", body);
+    body_attr.r#type = onnx::attribute_proto::AttributeType::Undefined as i32;
+    let graph = onnx::GraphProto {
+        input: vec![
+            value_info("trip_count", 7, &[]),
+            value_info("condition", 9, &[]),
+            value_info("initial", 1, &[Dimlike::Static(2)]),
+        ],
+        output: vec![value_info("final", 1, &[Dimlike::Static(2)])],
+        node: vec![node_attrs(
+            "Loop",
+            &["trip_count", "condition", "initial"],
+            &["final"],
+            vec![body_attr],
+        )],
+        ..Default::default()
+    };
+
+    let loaded = onnx_runtime_loader::load_model_bytes(&model(graph, 17))
+        .expect("load Loop with structural body metadata");
+    let (loop_id, _) = loaded
+        .nodes
+        .iter()
+        .find(|(_, node)| node.op_type == "Loop")
+        .expect("Loop node");
+    let body = loaded
+        .subgraphs
+        .get(&(loop_id, "body".to_string()))
+        .expect("Loop body");
+
+    let input_names: Vec<_> = body
+        .inputs
+        .iter()
+        .map(|&id| body.value(id).name.as_deref().expect("named input"))
+        .collect();
+    assert_eq!(input_names, ["iteration", "condition_in", "carried_in"]);
+    assert_eq!(body.value(body.inputs[0]).dtype, DataType::Int64);
+    assert_eq!(body.value(body.inputs[0]).shape, Vec::<Dim>::new());
+    assert_eq!(body.value(body.inputs[1]).dtype, DataType::Bool);
+    assert_eq!(body.value(body.inputs[2]).dtype, DataType::Float32);
+    assert_eq!(body.value(body.inputs[2]).shape, vec![Dim::Static(2)]);
+
+    let output_names: Vec<_> = body
+        .outputs
+        .iter()
+        .map(|&id| body.value(id).name.as_deref().expect("named output"))
+        .collect();
+    assert_eq!(output_names, ["condition_out", "carried_out"]);
+    assert_eq!(body.value(body.outputs[0]).dtype, DataType::Bool);
+    assert_eq!(body.value(body.outputs[1]).dtype, DataType::Float32);
+    assert_eq!(body.value(body.outputs[1]).shape, vec![Dim::Static(2)]);
+
+    let bias = find(body, "bias");
+    let WeightRef::Inline(tensor) = body.initializers.get(&bias).expect("body initializer") else {
+        panic!("body initializer must be inline");
+    };
+    assert_eq!(tensor.dtype, DataType::Float32);
+    assert_eq!(tensor.dims, vec![2]);
+    assert_eq!(tensor.data, bias_data);
+}
+
 // --- fail-fast load-time validation (RULES #1) ---
 
 /// The implemented subgraph-bearing control-flow ops (`If`/`Loop`/`Scan`) now
