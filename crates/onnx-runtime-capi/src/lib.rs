@@ -129,7 +129,7 @@ fn map_session_error(err: &SessionError) -> OrtErrorCode {
         | E::RankMismatch { .. } => OrtErrorCode::InvalidArgument,
         E::NoModelSource => OrtErrorCode::NoModel,
         E::UnsupportedOp { .. } => OrtErrorCode::NotImplemented,
-        E::Ep(_) => OrtErrorCode::EpFail,
+        E::Ep(_) | E::ExecutionProviderUnavailable(_) => OrtErrorCode::EpFail,
         E::DanglingEpContext { .. }
         | E::Ir(_)
         | E::Graph(_)
@@ -141,7 +141,9 @@ fn map_session_error(err: &SessionError) -> OrtErrorCode {
         | E::UnresolvedShape { .. }
         | E::ShapeOverflow { .. }
         | E::OutputShapeCountMismatch { .. }
-        | E::SequenceOp { .. } => OrtErrorCode::Fail,
+        | E::SequenceOp { .. }
+        | E::ControlFlow { .. }
+        | E::HeterogeneousPlacementRequired { .. } => OrtErrorCode::Fail,
     }
 }
 
