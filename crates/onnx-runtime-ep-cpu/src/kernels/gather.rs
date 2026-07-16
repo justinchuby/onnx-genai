@@ -3,7 +3,7 @@
 //! `data.shape[:axis] ++ indices.shape ++ data.shape[axis+1:]`.
 
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
-use onnx_runtime_ir::Node;
+use onnx_runtime_ir::{Node, is_contiguous};
 
 use super::{check_arity, elem_size, to_dense_bytes, to_dense_i64, write_dense_bytes};
 use crate::strided::numel;
@@ -35,7 +35,6 @@ impl Kernel for GatherKernel {
             )));
         }
         let esize = elem_size(data.dtype)?;
-        let data = to_dense_bytes(data)?;
         let indices = to_dense_i64(&inputs[1])?;
         let data_shape = inputs[0].shape;
         let idx_shape = inputs[1].shape;
@@ -65,6 +64,37 @@ impl Kernel for GatherKernel {
         let inner: usize = data_shape[axis + 1..].iter().product();
         let num_idx = numel(idx_shape);
 
+        if axis == 0
+            && is_contiguous(data.shape, data.strides)
+            && is_contiguous(outputs[0].shape, outputs[0].strides)
+        {
+            data.validate()?;
+            outputs[0].validate()?;
+            let src = data.data_ptr::<u8>();
+            let dst = outputs[0].data_ptr_mut::<u8>();
+            let row_bytes = inner * esize;
+            for (output_row, &raw) in indices.iter().enumerate() {
+                let idx = if raw < 0 { raw + axis_dim as i64 } else { raw };
+                if idx < 0 || idx as usize >= axis_dim {
+                    return Err(EpError::KernelFailed(format!(
+                        "Gather: index {raw} out of range for axis dim {axis_dim}"
+                    )));
+                }
+                // SAFETY: validated contiguous views plus the checked source index
+                // keep both row-sized regions in bounds; executor SSA makes them
+                // disjoint.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        src.add(idx as usize * row_bytes),
+                        dst.add(output_row * row_bytes),
+                        row_bytes,
+                    );
+                }
+            }
+            return Ok(());
+        }
+
+        let data = to_dense_bytes(data)?;
         let mut out = vec![0u8; outer * num_idx * inner * esize];
         let mut w = 0usize;
         for o in 0..outer {
@@ -92,11 +122,10 @@ impl Kernel for GatherKernel {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::kernels::testutil::Owned;
     use crate::CpuExecutionProvider;
+    use crate::kernels::testutil::Owned;
     use onnx_runtime_ep_api::ExecutionProvider;
-    use onnx_runtime_ir::{static_shape, Attribute, DataType, Graph, Node, NodeId};
+    use onnx_runtime_ir::{Attribute, DataType, Graph, Node, NodeId, static_shape};
     use onnx_runtime_loader::Model;
 
     fn run(axis: i64, data: &Owned, idx: &Owned, out: &mut Owned) {

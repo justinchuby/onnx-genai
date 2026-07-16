@@ -45,6 +45,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use onnx_runtime_ep_api::{
     DeviceBuffer, DevicePtr, DevicePtrMut, ExecutionProvider, KernelMatch, TensorMut, TensorView,
@@ -61,6 +62,31 @@ use onnx_runtime_shape_inference::{InferenceRegistry, MergePolicy};
 use crate::error::{Result, SessionError};
 use crate::sequence::{SeqTensor, SequenceValue, concat_axis, split_axis, stack_new_axis};
 use crate::tensor::{Tensor, host_bytes, write_host};
+
+fn profile_ops_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("ONNX_GENAI_PROFILE_OPS")
+            .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+    })
+}
+
+fn print_op_profile(total: Duration, timings: HashMap<String, (Duration, usize)>) {
+    let mut timings = timings.into_iter().collect::<Vec<_>>();
+    timings.sort_unstable_by(|left, right| right.1.0.cmp(&left.1.0));
+    let total_ms = total.as_secs_f64() * 1_000.0;
+    eprintln!("[onnx-genai-profile] node execution: {total_ms:.3} ms");
+    eprintln!("[onnx-genai-profile] op_type,total_ms,percent,calls");
+    for (op_type, (elapsed, calls)) in timings {
+        let elapsed_ms = elapsed.as_secs_f64() * 1_000.0;
+        let percent = if total_ms == 0.0 {
+            0.0
+        } else {
+            elapsed_ms / total_ms * 100.0
+        };
+        eprintln!("[onnx-genai-profile] {op_type},{elapsed_ms:.3},{percent:.2},{calls}");
+    }
+}
 
 /// A per-node compiled entry: the structural facts the run loop needs without
 /// re-deriving them from the graph. Shapes are **not** baked here — they are
@@ -1080,15 +1106,39 @@ impl Executor {
         // Iterate by index so a control-flow node can take `&mut self` (it must
         // build/reuse child executors) while an ordinary kernel node uses the
         // disjoint-field borrow split inside `exec_kernel_node`.
-        for pi in 0..self.plan.len() {
-            let node_id = self.plan[pi].node_id;
-            let node = self.graph.node(node_id);
-            if is_control_flow_op(&node.op_type, &node.domain) {
-                self.exec_control_flow(pi, &mut resolved, outer_scope)?;
-            } else if is_sequence_op(&node.op_type, &node.domain) {
-                self.exec_sequence_node(pi, &mut resolved)?;
-            } else {
-                self.exec_kernel_node(pi, &mut resolved)?;
+        if profile_ops_enabled() {
+            let run_start = Instant::now();
+            let mut timings: HashMap<String, (Duration, usize)> = HashMap::new();
+            for pi in 0..self.plan.len() {
+                let node_id = self.plan[pi].node_id;
+                let node = self.graph.node(node_id);
+                let op_type = node.op_type.clone();
+                let start = Instant::now();
+                let result = if is_control_flow_op(&node.op_type, &node.domain) {
+                    self.exec_control_flow(pi, &mut resolved, outer_scope)
+                } else if is_sequence_op(&node.op_type, &node.domain) {
+                    self.exec_sequence_node(pi, &mut resolved)
+                } else {
+                    self.exec_kernel_node(pi, &mut resolved)
+                };
+                let elapsed = start.elapsed();
+                let entry = timings.entry(op_type).or_insert((Duration::ZERO, 0));
+                entry.0 += elapsed;
+                entry.1 += 1;
+                result?;
+            }
+            print_op_profile(run_start.elapsed(), timings);
+        } else {
+            for pi in 0..self.plan.len() {
+                let node_id = self.plan[pi].node_id;
+                let node = self.graph.node(node_id);
+                if is_control_flow_op(&node.op_type, &node.domain) {
+                    self.exec_control_flow(pi, &mut resolved, outer_scope)?;
+                } else if is_sequence_op(&node.op_type, &node.domain) {
+                    self.exec_sequence_node(pi, &mut resolved)?;
+                } else {
+                    self.exec_kernel_node(pi, &mut resolved)?;
+                }
             }
         }
 
@@ -1118,6 +1168,7 @@ impl Executor {
                     ),
                 });
             }
+
             let dtype = self.value_dtypes[&vid];
             let shape = resolved[&vid].clone();
             let bytes = self.contiguous_bytes(vid, &shape, dtype)?;
