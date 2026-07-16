@@ -100,6 +100,7 @@ not yet wired) · **🔬 custom** (needs a fused NVRTC/CUTLASS kernel).
 | `Softmax` (v1 & v13) | `` | ✅ | **cuDNN** `cudnnSoftmaxForward` | `ACCURATE` algorithm, f32/f16/bf16. Legacy coerce-to-2D uses INSTANCE mode; opset ≥ 13 uses a 4-D channel view for exact single-axis semantics. Falls back to the prior NVRTC kernel for f32 when cuDNN is unavailable. |
 | `LayerNormalization` | `` / `com.microsoft` | ✅ | **NVRTC-custom** (fused) | Mean/var + normalize + affine in **one** pass over one HBM read — beats a cuDNN reduce + separate pointwise affine. Population stats, optional `Mean`/`InvStdDev` outputs, arbitrary `axis` (`normalization.rs`). f32. |
 | `SkipLayerNormalization` | `com.microsoft` | ✅ | **NVRTC-custom** (fused) | `LayerNorm(input + skip + bias)·γ + β` — the residual add is fused into the norm, saving a whole tensor round-trip. Optional `beta`/`bias` inputs, optional `mean`/`inv_std`/`input_skip_bias_sum` outputs (`normalization.rs`). f32. |
+| `SkipSimplifiedLayerNormalization` | `com.microsoft` | ✅ | **NVRTC-custom** (fused) | `RMSNorm(input + skip + bias)·γ` with no mean subtraction. Right-aligned broadcast `skip`, optional `bias`, and optional mean/inverse-RMS/residual-sum outputs (`normalization.rs`). f32. |
 | `RMSNormalization` / `SimplifiedLayerNormalization` | `` / `com.microsoft` | ✅ | **NVRTC-custom** (fused) | Root-mean-square scale, no mean subtraction (LLaMA-family norm). Optional `InvStdDev` output, arbitrary `axis` (`normalization.rs`). f32. |
 | `ReduceMean` | `` | ✅ | **cuDNN** `cudnnReduceTensor` | See reductions below. |
 
@@ -175,7 +176,7 @@ The **50 CPU `ai.onnx` gaps** are: `Acos`, `Acosh`, `ArgMax`, `ArgMin`, `Asin`,
 
 For `com.microsoft`, CUDA matches six CPU pairs (`FusedGemm`,
 `FusedMatMulBias`, `Gelu`, `LayerNormalization`, `SimplifiedLayerNormalization`,
-`SkipLayerNormalization`); CPU-only gaps are `BiasGelu`, `FastGelu`,
+`SkipLayerNormalization`, `SkipSimplifiedLayerNormalization`); CPU-only gaps are `BiasGelu`, `FastGelu`,
 `FusedAttention`, and `QuickGelu`. CUDA additionally exposes
 `com.microsoft::Attention`. CUDA standard-domain extras not currently registered
 by the CPU EP are `And`, `Conv`, `Greater`, `GreaterOrEqual`, `Less`,
@@ -265,3 +266,5 @@ candidate.
   and can run *pure-driver* code, but cuBLASLt/cuDNN ops error/skip until those
   libs are installed. Every such failure is an actionable `EpError` (RULES.md #1)
   naming the missing library and how to fix it.
+
+`SkipSimplifiedLayerNormalization` raises the advertised CUDA set to **60** op names; it is GPU-validated against an independent residual-add and RMS-normalization reference, including broadcast skip and residual-sum output.

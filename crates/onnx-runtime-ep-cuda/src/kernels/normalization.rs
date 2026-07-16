@@ -155,6 +155,67 @@ extern "C" __global__ void rmsnorm_f32(
 }
 "#;
 
+/// NVRTC source for `com.microsoft::SkipSimplifiedLayerNormalization`.
+/// The residual sum supports right-aligned NumPy broadcasting for `skip`.
+const SKIP_RMSNORM_SRC: &str = r#"
+extern "C" __global__ void skip_rmsnorm_f32(
+    const float* input,
+    const float* skip,
+    const float* gamma,
+    const float* bias,          // null when absent
+    float*       y,
+    float*       sum_out,       // null when not requested
+    float*       mean_out,      // null when not requested (always zero)
+    float*       invstd_out,    // null when not requested
+    const unsigned long long* metadata,
+    const int    rank,
+    const int    num_groups,
+    const int    norm_size,
+    const int    has_bias,
+    const float  epsilon)
+{
+    const int g = blockIdx.x;
+    if (g >= num_groups) return;
+    const size_t base = (size_t)g * norm_size;
+    const unsigned long long* shape = metadata;
+    const unsigned long long* skip_strides = metadata + rank;
+
+    extern __shared__ float red[];
+    const int tid = threadIdx.x;
+    const int nt  = blockDim.x;
+
+    float ss = 0.0f;
+    for (int j = tid; j < norm_size; j += nt) {
+        unsigned long long linear = (unsigned long long)base + j;
+        unsigned long long skip_index = 0;
+        for (int d = rank - 1; d >= 0; --d) {
+            const unsigned long long coord = linear % shape[d];
+            linear /= shape[d];
+            skip_index += coord * skip_strides[d];
+        }
+        float sv = input[base + j] + skip[skip_index];
+        if (has_bias) sv += bias[j];
+        y[base + j] = sv;
+        if (sum_out) sum_out[base + j] = sv;
+        ss += sv * sv;
+    }
+    red[tid] = ss;
+    __syncthreads();
+    for (int off = nt >> 1; off > 0; off >>= 1) {
+        if (tid < off) red[tid] += red[tid + off];
+        __syncthreads();
+    }
+    const float inv_std = 1.0f / sqrtf(red[0] / (float)norm_size + epsilon);
+    if (tid == 0) {
+        if (mean_out) mean_out[g] = 0.0f;
+        if (invstd_out) invstd_out[g] = inv_std;
+    }
+    __syncthreads();
+    for (int j = tid; j < norm_size; j += nt)
+        y[base + j] *= inv_std * gamma[j];
+}
+"#;
+
 /// NVRTC source for the fused f32 `SkipLayerNormalization` (`com.microsoft`):
 /// `y = LayerNorm(input + skip + bias) · gamma + beta`. The residual sum is
 /// computed once into `y` (scratch) and optionally published to `sum_out`, then
@@ -237,6 +298,7 @@ extern "C" __global__ void skip_layernorm_f32(
 
 const LAYERNORM_MODULE: &str = "layernorm_f32";
 const RMSNORM_MODULE: &str = "rmsnorm_f32";
+const SKIP_RMSNORM_MODULE: &str = "skip_rmsnorm_f32";
 const SKIP_LAYERNORM_MODULE: &str = "skip_layernorm_f32";
 
 /// Threads per block for the norm reductions (power of two → exact tree reduce).
@@ -547,6 +609,176 @@ impl Kernel for RmsNormKernel {
     }
 }
 
+// ───────────────────── SkipSimplifiedLayerNormalization ─────────────────────
+
+/// Factory reading `epsilon` (default 1e-5) for the fused residual RMS norm.
+pub struct SkipSimplifiedLayerNormFactory {
+    pub runtime: Arc<CudaRuntime>,
+}
+
+impl KernelFactory for SkipSimplifiedLayerNormFactory {
+    fn create(&self, node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
+        let epsilon = node
+            .attr("epsilon")
+            .and_then(|a| a.as_float())
+            .unwrap_or(1e-5);
+        Ok(Box::new(SkipSimplifiedLayerNormKernel {
+            epsilon,
+            runtime: self.runtime.clone(),
+        }))
+    }
+}
+
+/// Fused f32 `SkipSimplifiedLayerNormalization` kernel (`com.microsoft`).
+#[derive(Debug)]
+pub struct SkipSimplifiedLayerNormKernel {
+    epsilon: f32,
+    runtime: Arc<CudaRuntime>,
+}
+
+impl SkipSimplifiedLayerNormKernel {
+    fn run(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+        let op = "SkipSimplifiedLayerNormalization";
+        if !(3..=4).contains(&inputs.len()) || outputs.is_empty() || outputs.len() > 4 {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep {op}: expected 3-4 inputs (input, skip, gamma[, bias]) and 1-4 outputs, got {} and {}",
+                inputs.len(),
+                outputs.len()
+            )));
+        }
+        let input = &inputs[0];
+        let skip = &inputs[1];
+        let gamma = &inputs[2];
+        let bias = inputs.get(3).filter(|bias| !bias.is_absent());
+        require_f32(op, "input", input.dtype)?;
+        require_f32(op, "skip", skip.dtype)?;
+        require_f32(op, "gamma", gamma.dtype)?;
+        require_f32(op, "output", outputs[0].dtype)?;
+        require_contiguous(op, "input", input.is_contiguous())?;
+        require_contiguous(op, "skip", skip.is_contiguous())?;
+        require_contiguous(op, "gamma", gamma.is_contiguous())?;
+        require_contiguous(op, "output", outputs[0].is_contiguous())?;
+
+        let rank = input.shape.len();
+        if rank == 0 {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep {op}: input must have rank >= 1"
+            )));
+        }
+        let norm_size = input.shape[rank - 1];
+        let num_groups: usize = input.shape[..rank - 1].iter().product();
+        if norm_size == 0 {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep {op}: empty hidden (last) dimension"
+            )));
+        }
+        if gamma.shape != [norm_size] {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep {op}: gamma shape {:?} must equal [{norm_size}]",
+                gamma.shape
+            )));
+        }
+        let bias_ptr = optional_vec_ptr(op, "bias", bias, norm_size)?;
+        let broadcast =
+            onnx_runtime_ir::broadcast_shapes(input.shape, skip.shape).map_err(EpError::Ir)?;
+        if broadcast != input.shape {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep {op}: skip shape {:?} is not broadcastable to input shape {:?}",
+                skip.shape, input.shape
+            )));
+        }
+        if outputs[0].shape != input.shape {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep {op}: output shape {:?} must equal input shape {:?}",
+                outputs[0].shape, input.shape
+            )));
+        }
+        if num_groups == 0 {
+            return Ok(());
+        }
+
+        let (mean_ptr, invstd_ptr) = optional_stat_ptrs(op, outputs, num_groups)?;
+        let sum_ptr = match outputs.get_mut(3) {
+            None => 0u64,
+            Some(t) => {
+                require_f32(op, "input_skip_bias_sum", t.dtype)?;
+                if t.shape != input.shape {
+                    return Err(EpError::KernelFailed(format!(
+                        "cuda_ep {op}: input_skip_bias_sum shape {:?} must equal input shape {:?}",
+                        t.shape, input.shape
+                    )));
+                }
+                cuptr(t.data_ptr_mut::<u8>() as *const c_void)
+            }
+        };
+        let metadata = skip_broadcast_metadata(input.shape, skip.shape);
+        let metadata_bytes = u64_bytes(&metadata);
+        let metadata_ptr = self.runtime.alloc_raw(metadata_bytes.len())?;
+        if let Err(error) = unsafe { self.runtime.htod(metadata_bytes, metadata_ptr) } {
+            // SAFETY: metadata_ptr is still owned by this call and no launch occurred.
+            let _ = unsafe { self.runtime.free_raw(metadata_ptr) };
+            return Err(error);
+        }
+
+        let launch = (|| {
+            let (groups_u, norm_i) = (
+                u32::try_from(num_groups)
+                    .map_err(|_| dim_overflow(op, "num_groups", num_groups))?,
+                i32::try_from(norm_size).map_err(|_| dim_overflow(op, "norm_size", norm_size))?,
+            );
+            let rank_i = i32::try_from(rank).map_err(|_| dim_overflow(op, "rank", rank))?;
+            let has_bias = i32::from(bias_ptr != 0);
+            let input_ptr = cuptr(input.data_ptr::<u8>() as *const c_void);
+            let skip_ptr = cuptr(skip.data_ptr::<u8>() as *const c_void);
+            let gamma_ptr = cuptr(gamma.data_ptr::<u8>() as *const c_void);
+            let y_ptr = cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void);
+            let func = self.runtime.nvrtc_function(
+                SKIP_RMSNORM_MODULE,
+                SKIP_RMSNORM_SRC,
+                "skip_rmsnorm_f32",
+            )?;
+            let stream = self.runtime.stream();
+            let mut builder = stream.launch_builder(&func);
+            let groups_i = groups_u_i32(groups_u);
+            builder
+                .arg(&input_ptr)
+                .arg(&skip_ptr)
+                .arg(&gamma_ptr)
+                .arg(&bias_ptr)
+                .arg(&y_ptr)
+                .arg(&sum_ptr)
+                .arg(&mean_ptr)
+                .arg(&invstd_ptr)
+                .arg(&metadata_ptr)
+                .arg(&rank_i)
+                .arg(&groups_i)
+                .arg(&norm_i)
+                .arg(&has_bias)
+                .arg(&self.epsilon);
+            // SAFETY: all pointers reference validated device buffers; metadata has
+            // two rank-length u64 arrays describing the output shape and skip strides.
+            unsafe { builder.launch(launch_cfg(groups_u)) }
+                .map_err(|e| driver_err("launch skip_rmsnorm_f32", e))?;
+            self.runtime.synchronize()
+        })();
+        // SAFETY: the launch is synchronized before freeing this per-invocation metadata.
+        let free = unsafe { self.runtime.free_raw(metadata_ptr) };
+        launch.and(free)
+    }
+}
+
+impl Kernel for SkipSimplifiedLayerNormKernel {
+    fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+        self.run(inputs, outputs)
+    }
+    fn supports_strided_input(&self, _idx: usize) -> bool {
+        false
+    }
+    fn cuda_graph_compatible(&self) -> bool {
+        false
+    }
+}
+
 // ─────────────────────────── SkipLayerNormalization ─────────────────────────
 
 /// Factory reading `epsilon` (default 1e-5). SkipLayerNorm always normalizes the
@@ -734,6 +966,27 @@ fn groups_u_i32(groups: u32) -> i32 {
 
 /// Resolve the optional per-group `Mean` (output slot 1) and `InvStdDev` (slot 2)
 /// device pointers, validating f32 dtype and `num_groups` length when present.
+fn skip_broadcast_metadata(input: &[usize], skip: &[usize]) -> Vec<u64> {
+    let mut metadata = input.iter().map(|&dim| dim as u64).collect::<Vec<_>>();
+    let contiguous = onnx_runtime_ir::compute_contiguous_strides(skip);
+    let leading = input.len() - skip.len();
+    metadata.extend((0..input.len()).map(|axis| {
+        if axis < leading || skip[axis - leading] == 1 {
+            0
+        } else {
+            contiguous[axis - leading] as u64
+        }
+    }));
+    metadata
+}
+
+fn u64_bytes(values: &[u64]) -> &[u8] {
+    // SAFETY: u64 is plain data and the byte slice retains the input lifetime.
+    unsafe {
+        std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), std::mem::size_of_val(values))
+    }
+}
+
 fn optional_stat_ptrs(
     op: &str,
     outputs: &mut [TensorMut],
@@ -799,6 +1052,7 @@ mod tests {
         assert!(LAYERNORM_SRC.contains("layernorm_f32"));
         assert!(RMSNORM_SRC.contains("rmsnorm_f32"));
         assert!(SKIP_LAYERNORM_SRC.contains("skip_layernorm_f32"));
+        assert!(SKIP_RMSNORM_SRC.contains("skip_rmsnorm_f32"));
     }
 
     #[test]

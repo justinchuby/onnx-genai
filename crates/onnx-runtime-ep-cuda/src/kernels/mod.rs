@@ -57,7 +57,7 @@ use pointwise::{
 ///   coerce-to-2D at opset ≤ 12, per-axis at opset ≥ 13), with f32 NVRTC fallback.
 /// * **Normalization** — fused NVRTC `LayerNormalization` (ai.onnx +
 ///   `com.microsoft`), `RMSNormalization` / `SimplifiedLayerNormalization`, and
-///   `SkipLayerNormalization` (residual add fused into the norm).
+///   `SkipLayerNormalization` and `SkipSimplifiedLayerNormalization` (residual add fused into the norm).
 /// * **Cast / CastLike** — NVRTC element-wise dtype conversion (f32/f64/f16/bf16/
 ///   int8-64/uint8-64/bool).
 /// * **Reductions** — cuDNN `ReduceSum`/`ReduceMean` (f32/f16/bf16, f32 NVRTC
@@ -98,6 +98,7 @@ pub const CUDA_COVERED_OPS: &[&str] = &[
     "Softmax",
     "LayerNormalization",
     "SkipLayerNormalization",
+    "SkipSimplifiedLayerNormalization",
     "SimplifiedLayerNormalization",
     "RMSNormalization",
     "Cast",
@@ -306,6 +307,12 @@ pub fn build_cuda_registry(runtime: Arc<CudaRuntime>) -> OpRegistry {
             runtime: runtime.clone(),
         }),
     );
+    reg.register(
+        OpKey::new("SkipSimplifiedLayerNormalization", "com.microsoft", 1),
+        Box::new(normalization::SkipSimplifiedLayerNormFactory {
+            runtime: runtime.clone(),
+        }),
+    );
 
     // Cast / CastLike (NVRTC element-wise dtype conversion).
     for op_type in ["Cast", "CastLike"] {
@@ -423,6 +430,7 @@ mod tests {
             "Softmax",
             "LayerNormalization",
             "SkipLayerNormalization",
+            "SkipSimplifiedLayerNormalization",
             "SimplifiedLayerNormalization",
             "RMSNormalization",
             "Cast",
