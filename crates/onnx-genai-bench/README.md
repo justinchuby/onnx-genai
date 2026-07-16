@@ -62,7 +62,8 @@ cargo run --release -p onnx-genai-bench --features bench-native \
   --tokens 8 --warmups 1 --runs 3 --ep cpu
 ```
 
-CUDA kernels expose per-op `cuda_graph_compatible()` predicates, but
+CUDA kernels expose per-op `cuda_graph_compatible()` predicates, aggregated by
+the CUDA EP's `subgraph_graph_capturable()` eligibility gate. The
 `onnx-runtime-session` is currently CPU-only and has no session-level CUDA graph
 capture/replay API. `--ep cuda --cuda-graph` reports that limitation rather than
 silently using CPU or faking graph replay. Unsupported operators retain the

@@ -3,8 +3,8 @@
 use onnx_runtime_ep_api::{
     DeviceBuffer, DevicePtr, DevicePtrMut, ExecutionProvider, TensorMut, TensorView,
 };
-use onnx_runtime_ep_cuda::CudaExecutionProvider;
 use onnx_runtime_ep_cuda::runtime::cuptr;
+use onnx_runtime_ep_cuda::{CudaExecutionProvider, subgraph_graph_capturable};
 use onnx_runtime_ir::{
     Attribute, DataType, Graph, Node, NodeId, TensorData, compute_contiguous_strides, static_shape,
 };
@@ -86,8 +86,8 @@ fn run_gather(
     let model = Model::new(&graph);
     let kernel = ep.get_kernel(model.graph.node(node), &[], 13).unwrap();
     assert!(
-        !kernel.cuda_graph_compatible(),
-        "Gather performs synchronous index validation and must not be CUDA-graph capturable"
+        !subgraph_graph_capturable(&[kernel.as_ref()]),
+        "a subgraph containing Gather must be rejected by the CUDA graph eligibility gate"
     );
 
     let data_buffer = upload(ep, &bytes(data));

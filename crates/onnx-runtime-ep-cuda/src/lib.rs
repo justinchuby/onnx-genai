@@ -56,12 +56,14 @@
 //! dereferenced on the host.
 
 pub mod blas;
+pub mod capture;
 pub mod cudnn;
 pub mod error;
 pub mod kernels;
 pub mod provider;
 pub mod runtime;
 
+pub use capture::subgraph_graph_capturable;
 pub use kernels::attention::AttentionKernel;
 pub use kernels::{CUDA_COVERED_OPS, build_cuda_registry};
 pub use provider::CudaExecutionProvider;
