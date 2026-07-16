@@ -75,3 +75,6 @@ Cleared Deckard's `f795d45` executor EP-polymorphism refactor: it preserves CPU-
 ## 2026-07-16T00:00:00Z — CUDA M2 executor safety review cycle
 - 🔴 Rejected Deckard's `1a2deca` CUDA executor wiring after confirming Qwen token parity but finding unsafe CUDA SequenceAt host-pointer dispatch and Scan host writes to device allocations. Deckard was locked out and Leon assigned the repair.
 - 🟢 Cleared Leon's `5c0f05f`: SequenceAt synchronously uploads into CUDA storage, Scan uses CPU staging plus child-executor H2D, and substantive CUDA control-flow parity passed. Qwen tokens remained exact; session CPU 112/112 and CUDA EP 117/117 passed.
+
+## 2026-07-16T14:20:00Z — SM-general CUDA NVRTC review
+- 🟢 Cleared Wallace's `b56c5cb`: selected-device capability derives NVRTC PTX/CUBIN targets without a hardcoded SM90; unsupported-PTX fallback remains correct. Validated 117 CUDA tests and all 6 GQA tests.

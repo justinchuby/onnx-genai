@@ -69,3 +69,6 @@ Batched-driver DoS hardening is canonical: admission is bounded by `max_pending`
 - 2026-07-16T00:00:01Z — Confirmed all 24 Qwen2.5-0.5B Sigmoids are `Mul(x, Sigmoid(x))` and landed guarded executor lowering plus allocation-free CPU SiLU (`682c93d`). Sigmoid share fell 6.55%→0%; decode improved 44.5→45.7 tok/s. Sebastian 🟢 approved; `d116a96` adds the multi-consumer negative test.
 
 - 2026-07-16T00:00:00Z — Delivered default-on `nxrt.eager` and `nxrt.genai` Python submodules plus `docs/PYTHON.md` (`56a4a90`). The initial genai Engine wrapper was later revised by Sebastian after Holden identified a cross-thread PyO3 panic; the merged, cleared result is `41d8c31`.
+
+## 2026-07-16T14:20:00Z — onnx-rs full-spec serde review
+- 🔴 Rejected Zhora's full-spec claim: vendored ONNX v1.16.2/IR10 proto is stale against v1.22.0/IR13, and base64 retained-proto native text is non-authoritative. Zhora is locked out; Batty owns the revision.

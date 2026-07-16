@@ -15,3 +15,6 @@
 ## 2026-07-16T00:00:00Z — CUDA M2 GQA/PTX repair
 - Replaced the host-seeded GQA regression with real packed prefill plus pointer-aliased decode appends and an independent oracle.
 - Added global native `sm_90` CUBIN fallback after CUDA 13.3 PTX ISA 9.3 is rejected by driver 580.105.08; merged in `4a34c66` after Sebastian's clear review.
+
+## 2026-07-16T14:20:00Z — SM-general CUDA NVRTC
+- Merged `b56c5cb`: CUDA architecture strings now derive from the live selected device capability (SM60–SM120), retaining the unsupported-PTX native-CUBIN fallback. Holden cleared 117 CUDA tests and 6/6 GQA tests.

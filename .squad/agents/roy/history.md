@@ -42,3 +42,7 @@ Authored CUDA Gather, Shape, and Constant kernels; coverage reached 65.
 ## 2026-07-16T00:00:00Z — CUDA M2 packed-GQA artifact
 - Implemented `ad73494` packed QKV splitting, device RoPE, and alias-aware O(1)-per-new-token KV append for 14/2/64 GQA.
 - Sebastian rejected the test for host-seeded cache coverage and unsupported PTX (5/6); strict lockout applied, and Wallace's subsequent repair is canonical.
+
+## 2026-07-16T14:20:00Z — CUDA M3 device-resident KV cache
+- Merged `398c536`: persistent aliased K/V allocations have stable pointers, zero KV H2D/D2H transfers, O(1) mask updates, capacity/valid-length separation, and configurable default max length 4096.
+- Sebastian cleared M3 and confirmed the CPU/CUDA mismatch beginning at token 10 is pre-existing M2 numerical drift.

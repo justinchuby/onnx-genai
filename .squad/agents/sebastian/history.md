@@ -63,3 +63,6 @@ Replaced Rachael's rejected `RefCell`/unsendable Python genai Engine with a send
 ## 2026-07-16T00:00:00Z — CUDA M2 packed-GQA review cycle
 - 🔴 Rejected Roy's initial packed-GQA artifact for bypassing real packed prefill and failing unsupported-PTX validation; strict lockout enforced.
 - 🟢 Cleared Wallace's repaired `4a34c66`: real packed-prefill→aliased-decode coverage, shared SM90 CUBIN fallback, 6/6 GQA and 114/114 CUDA tests passing.
+
+## 2026-07-16T14:20:00Z — M3 device-resident CUDA KV review
+- 🟢 Cleared Roy's `398c536`: 48 persistent aliased K/V buffers remain stable and make no KV host transfers. M2 and M3 CUDA streams are byte-identical; the CPU mismatch starts at index 10 and is a pre-existing numerical-drift follow-up.

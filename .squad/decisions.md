@@ -538,3 +538,105 @@ NVRTC available: 113 passed, 0 failed, 0 skipped. The movement GPU binary passed
 **By:** Deckard; rejected and re-reviewed by Holden; safety revision by Leon
 **What:** Native CUDA decode is now an opt-in, end-to-end executor path, merged as `5c0f05f`. CUDA selection via `DevicePreference::Gpu` or explicit CUDA creates device-resident initializer and execution buffers, performs H2D at graph inputs and D2H at materialized outputs, and stamps views with the selected device; CPU remains the default. Qwen2.5-0.5B-int4 CPU and CUDA decode produced the identical eight-token sequence `[11576, 42740, 11, 358, 614, 264, 3405, 911]`.
 **Why:** Holden rejected Deckard's initial wiring commit `1a2deca` despite its correct Qwen parity because CUDA `SequenceAt` could pass host storage to a CUDA kernel and CUDA `Scan` could host-write a device allocation. Deckard was locked out of the revision; Leon repaired both hazards in `5c0f05f` by synchronously uploading non-host `SequenceAt` elements into correctly stamped CUDA buffers and retaining `Scan` slices as host staging tensors that the child executor uploads through `copy_from_host`. The new substantive CUDA control-flow parity test covers `SequenceAt -> Add` and CUDA `Scan` against CPU. Holden independently re-reviewed and cleared the revision: no replacement lifetime, synchronization, or teardown defect was found; the safety test passed, session CPU tests passed 112/112, CUDA EP tests passed 117/117, and engine retained only the 18 known missing-asset failures. This completes M2 after the earlier packed-QKV/GQA, O(1) append, SiLU, SimplifiedLayerNormalization, and SM90 CUBIN-fallback sub-waves. M3 device-resident persistent KV, decode-efficient CUDA `MatMulNBits`, and M4 CUDA graph capture remain.
+
+---
+
+## 2026-07-16 — CUDA SM-general, device-KV M3, and onnx-rs full-spec review wave
+
+**Wave status:** CUDA SM-general (`b56c5cb`) and device-resident KV-cache M3 (`398c536`) are merged and reviewer-cleared. The onnx-rs full-spec serde claim is **rejected**; Zhora is locked out and Batty is revising against current ONNX IR13 with authoritative native text serialization. Do not treat the bound stale-schema implementation as full-spec complete.
+
+#### Source: `holden-smgeneral-review.md`
+
+### 2026-07-16: Review — SM-general CUDA NVRTC
+**By:** Holden
+**What:** 🟢 CLEAR — runtime NVRTC PTX and native-CUBIN targets are derived from the selected CUDA device's compute capability; the unsupported-PTX fallback remains active and targets that same device architecture.
+**Why:** `CudaContext::new(ordinal)` is queried for major/minor attributes, producing `compute_{major}{minor}` and `sm_{major}{minor}` (including SM60, 75, 86, 90, 100, and 120 tests), with no production hardcoded SM90 target. On the 8× H200 host (`compute_cap=9.0`, CUDA 13.3, driver 580.105.08), a fresh-target full suite executed 117 tests with 0 skip markers and passed; all 6 GQA tests passed, demonstrating that the known unsupported-PTX path successfully recompiles/loads native `sm_90` CUBIN. The exact minimal environment initially exposed an unrelated missing cuDNN loader path; adding the installed cuDNN/cublas library directories yielded the clean full run.
+
+#### Source: `sebastian-m3-devkv-review.md`
+
+### 2026-07-16: Review — M3 device-resident CUDA KV cache
+**By:** Sebastian
+**What:** 🟢 CLEAR commit `60be8a0`. M3 supplies 48 persistent CUDA KV allocations as both graph past inputs and aliased present outputs, suppresses bound-output materialization, preserves their addresses across decode/rewind, separates physical capacity from the mask-derived valid prefix, and performs no KV host transfers during the 16-token real-model smoke.
+**Why:** `DeviceIoBinding` counters increment on explicit binding reads/writes (covered by the session alias test), while the KV bindings are only passed as external device pointers; executor inspection found no KV copy/materialization path, and the real-model test observed all KV H2D/D2H counters at zero before/after decode and rewind. GQA detects identical past/present pointers and appends at `past_lengths[b] + s`; attention loops only to `seqlens_k + 1`, while the total-sequence scalar remains physical capacity. The capacity-128/valid-5 GPU test compares against an exact-capacity reference and would reject the old equality rule or capacity-wide attention; all 7 real GQA GPU tests passed.
+
+The divergence is **pre-existing CUDA numerical drift, not an M3 regression**. An isolated 16-token empirical run of parent `dc8eaf4` (M2 host-round-trip KV) produced CPU `[11576,42740,11,358,614,264,3405,911,279,330,34,1027,11766,11635,1,323]` and CUDA `[11576,42740,11,358,614,264,3405,911,279,330,9707,4337,1,2025,304,356]`. M3 produced those exact same CPU and CUDA vectors, including the first mismatch at token index 10 (`34` vs `9707`). Therefore stale capacity, mask/cursor errors, aliasing, or M3 RoPE position drift did not introduce or move the divergence; it remains in the shared M2 CUDA numerical path.
+
+Fresh-target validation passed after adding the installed cuDNN directory to `LD_LIBRARY_PATH` (the exact two-variable invocation initially failed only because `libcudnn.so.9` was not on the loader path). Targeted results: GQA GPU `7 passed`; session external-binding alias/materialization test `1 passed`; real Qwen CPU/CUDA smoke `1 passed` in 82.16s; standard clippy completed with pre-existing warnings only.
+
+#### Source: `rachael-onnxrs-review.md`
+
+### 2026-07-16: Review — onnx-rs full-spec serde
+**By:** Rachael
+**What:** 🔴 REJECT. The change is lossless for its bound schema, but that schema is stale and the native readable codec delegates ordinary full-spec content to an authoritative opaque protobuf blob. Zhora is locked out; Batty should revise by updating the vendored proto to current ONNX and implementing genuine readable serialization for common ONNX structures.
+**Why:** `build.rs` binds `crates/onnx-runtime-loader/proto/onnx.proto3`. Its pre-bump checksum exactly matches ONNX v1.16.2 (IR10); commit `06a2423` manually added only `FLOAT4E2M1` and relabeled it IR11. Official IR11 already includes multi-device support, while current ONNX v1.22.0/main is IR13 and defines `DeviceConfigurationProto`, `NodeDeviceConfigurationProto`, `IntIntListEntryProto`, `ShardingSpecProto`, `ShardedDimProto`, `SimpleShardedDimProto`, `ModelProto.configuration`, `NodeProto.device_configurations`, `FLOAT8E8M0`, `UINT2`, and `INT2`. Thus both “no multi-device protos” and “no INT2/UINT2” are artifacts of the stale vendor, not current-spec facts. The checklist mentions a proto-update follow-up but still claims completion and does not cover that required scope. The native codec emits the entire retained `ModelProto` as base64 for every proto-backed model (`text/ser.rs:63-65`), and the parser immediately returns it while ignoring the visible graph body (`text/de.rs:91-93`); functions, sparse/type/list attributes, optional/sequence/map details, and other common fields are therefore not genuinely textually serialized. Positive checks: all 83 tests pass from a fresh target, no ignored tests or remaining `Unsupported`/`todo!`/`unimplemented!` markers were found in the reviewed codec/test paths, byte-equality assertions cover the stale bound schema, and `cargo clippy -p onnx-rs` passes. `--all-targets -D warnings` additionally finds one test-only `field_reassign_with_default` warning.
+
+#### Source: `zhora-onnxrs-full-spec.md`
+
+### 2026-07-16: onnx-rs full bound-spec serde coverage
+**By:** Zhora
+**What:** Replaced divergent JSON/TextProto allowlists with descriptor-driven protobuf codecs and retained the complete ModelProto beside the runtime graph projection. Added lossless full-spec custom-text round trips via a protobuf sidecar, completed bound dtype/attribute IR variants, and added exhaustive descriptor/payload/structural tests.
+**Why:** The previous codecs rejected or silently omitted valid ONNX fields. The vendored `crates/onnx-runtime-loader/proto/onnx.proto3` must be the single source of truth so schema additions cannot create another hand-maintained coverage gap.
+
+## Bound schema inventory and serde status
+All messages below are **DONE** in JSON, protobuf TextFormat, readable text (lossless retained-proto sidecar), and binary model I/O:
+
+- [x] `AttributeProto` — every scalar/message/list field, including `ref_attr_name`, `doc_string`, `sparse_tensor`, `tensors`, `graphs`, `sparse_tensors`, `type_protos`.
+- [x] `ValueInfoProto` — `name`, recursive `type`, `doc_string`, `metadata_props`.
+- [x] `NodeProto` — inputs/outputs/name/op/domain/overload/attributes/doc/metadata.
+- [x] `TrainingInfoProto` — initialization/algorithm graphs and both binding lists.
+- [x] `ModelProto` — header/opsets/graph/metadata/training/functions.
+- [x] `StringStringEntryProto`.
+- [x] `TensorAnnotation` quantization mappings.
+- [x] `GraphProto` — dense and sparse initializers, docs, IO/value-info, quantization annotations, metadata.
+- [x] `TensorProto` and nested `TensorProto.Segment` — every payload field, external-data/location, docs, metadata.
+- [x] `SparseTensorProto`.
+- [x] `TensorShapeProto` and nested `Dimension`, including oneof and denotation.
+- [x] `TypeProto` plus nested `Tensor`, `Sequence`, `Map`, `Optional`, `SparseTensor`; recursive combinations are round-tripped.
+- [x] `OperatorSetIdProto`.
+- [x] `FunctionProto` — signature, required/default attributes, nodes, docs, opsets, domain/overload, value-info, metadata.
+
+All bound enums are **DONE**:
+- [x] `Version`.
+- [x] `AttributeProto.AttributeType`: all 15 values, including tensor/sparse/type lists.
+- [x] `TensorProto.DataType`: `UNDEFINED`, FLOAT, UINT8, INT8, UINT16, INT16, INT32, INT64, STRING, BOOL, FLOAT16, DOUBLE, UINT32, UINT64, COMPLEX64, COMPLEX128, BFLOAT16, all four FLOAT8 variants, UINT4, INT4, FLOAT4E2M1.
+- [x] `TensorProto.DataLocation`: DEFAULT and EXTERNAL.
+- [x] `OperatorStatus`.
+
+## Dtype evidence
+- [x] Added `Undefined`, `Complex64`, and `Complex128` to runtime `DataType`; schema and readable-text maps now cover every bound enum value.
+- [x] Typed-field and raw-data fixtures cover every concrete bound dtype; STRING uses its required typed `string_data` representation.
+- [x] Packed UINT4/INT4/FLOAT4E2M1 layouts are covered with packed-byte payloads.
+- [x] BFLOAT16 and FLOAT8E4M3FN/FNUZ/E5M2/E5M2FNUZ are covered.
+- [x] The bound IR-v11 proto has **no INT2 or UINT2** (DataType ends at FLOAT4E2M1=23); tests assert their descriptor absence.
+
+## Former TextProto Unsupported fields
+- [x] All 24 `UnsupportedMessage`/`UnsupportedScalar` entries were eliminated by deleting the per-codec allowlist. JSON and TextProto now share the generated `FileDescriptorSet` through `prost-reflect`.
+- [x] Sparse initializers/attributes, function/training declarations, nested graphs, metadata, tensor segment/docs/metadata, overload/ref attributes, type denotations, and quantization annotations all round-trip byte-exactly.
+
+## Multi-device status
+- [x] **Not present in the bound proto, not silently skipped.** The descriptor contains no `DeviceConfigurationProto`, `NodeDeviceConfigurationProto`, `ShardingSpecProto`, or other device/multi-device message. Tests assert these names are absent. Supporting them requires first updating the vendored ONNX proto; descriptor-driven codecs will then pick them up automatically.
+
+## Representation note / deferred runtime execution
+- [x] Serde coverage is complete for the bound proto.
+- [ ] Runtime execution semantics for sparse initializers, training graphs, and retained local-function declarations remain outside the tensor-centric execution IR. `Model` therefore retains the exact source `ModelProto`; `make_graph_authoritative()` explicitly opts out and documents that those non-execution fields are then dropped. This is not a serde deferral.
+- [ ] The readable DSL represents fields outside its native graph syntax through a lossless base64 protobuf sidecar rather than adding bespoke surface syntax for every protobuf field. Native pretty syntax is cosmetic follow-up; round-trip coverage is complete.
+
+## Validation
+- `cargo test -p onnx-rs`: 62 unit + 4 full-spec integration + 16 ONNX-port integration + 1 doctest passed.
+- `cargo build -p onnx-rs`: passed.
+- `cargo clippy -p onnx-rs`: passed clean.
+- Wider workspace check reached unrelated `onnx-runtime-cpuinfo` and stopped because its vendored `cpuinfo/CMakeLists.txt` is absent in this checkout; all changed crates compiled before that failure.
+
+#### Source: `wallace-cuda-sm-general.md`
+
+### 2026-07-16: Make CUDA NVRTC architecture targeting device-general
+**By:** Wallace
+**What:** `CudaRuntime::new` now queries `CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR` and `_MINOR` through cudarc and caches the reported capability plus derived NVRTC targets. PTX uses `compute_{major}{minor}` and the native fallback uses plain `sm_{major}{minor}` (for example, 9.0 becomes `compute_90` / `sm_90`; no implicit `sm_90a`). Capability query failures or invalid values return actionable CUDA EP errors, with no SM default and no maximum-SM cap. The existing `CUDA_ERROR_UNSUPPORTED_PTX_VERSION` retry and process-local fallback flag are preserved.
+**Why:** Hardcoding the H200's SM90 made the CUDA EP non-portable. Pure unit tests now cover SM 60, 75, 80, 86, 89, 90, 100, and 120 derivation. All eight installed H200s report compute capability 9.0. With the dynamic path, `cargo test -p onnx-runtime-ep-cuda` passed all 117 unit/GPU tests, including activations and all six GroupQueryAttention GPU tests; `cargo build` passed and `cargo clippy` completed with only three pre-existing warnings.
+
+#### Source: `roy-cuda-device-kv.md`
+
+### 2026-07-16: Native CUDA decode uses persistent device-resident KV bindings
+**By:** Roy
+**What:** Added `DecodeCudaState` beside `NativeDecodeSession` with a logical cursor, configurable fixed capacity, one persistent CUDA allocation per key/value tensor, and a fixed-capacity device attention mask. Session `DeviceIoBinding` supplies externally owned device inputs, aliases graph outputs to the same allocation, tracks physical and logical shapes separately, and suppresses bound output materialization. CUDA GQA now treats `total_sequence_length` as physical capacity while `seqlens_k + 1` is the valid prefix; in-place append remains O(new tokens). Rewind/reset move the cursor and update only the mask suffix, never KV bytes.
+**Why:** M3 requires stable KV addresses and no context-sized KV PCIe traffic so later CUDA graph capture has fixed pointers. The default capacity is 4096 tokens; `NativeDecodeSession::load_with_cuda_kv_max_len` and `ONNX_GENAI_CUDA_KV_MAX_LEN` override it, and overflow returns a clean pre-launch error. The 16-token Qwen GPU test asserts all 48 KV pointers remain identical across generation and rewind and aggregate KV binding H2D/D2H counters remain exactly zero. Full CPU/CUDA greedy parity past token 10 is deferred: an origin/main M2 probe and M3 both match the first 10 tokens (required first eight `[11576,42740,11,358,614,264,3405,911]`) and diverge afterward, so this is a pre-existing CUDA numerics gap rather than a device-KV regression.

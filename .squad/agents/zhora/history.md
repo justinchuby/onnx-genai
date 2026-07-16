@@ -100,3 +100,6 @@ Added Rayon N-range partitioning for native CPU MatMulNBits.
 - Expanded `crates/onnx-rs/tests/text_format_port.rs` from 6 to 16 upstream-derived cases in merged commit `23e4995`.
 - Coverage includes attributes, initializers, supported dtypes, node domains, multi-opset models, text round-trips, JSON/TextProto codecs, and malformed input; 89 onnx-rs tests pass.
 - Deliberately omitted unsupported model functions, sequence/optional/sparse types, complex/int2/uint2 dtypes, and typed tensor-payload literals.
+
+## 2026-07-16T14:20:00Z — onnx-rs full-spec serde revision
+- Full-spec serde attempt was 🔴 rejected by Rachael: stale IR10 vendor proto and a base64 sidecar did not meet current ONNX IR13 or authoritative native-text requirements. Locked out; Batty is revising.
