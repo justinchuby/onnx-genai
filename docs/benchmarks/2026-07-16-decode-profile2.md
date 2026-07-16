@@ -304,3 +304,99 @@ ignored doctest), and the release native benchmark build passed.
    48 workers.
 3. **Projection fusion** — group QKV and gate/up dispatch so shared activation
    work, Rayon barriers, and executor overhead are amortized at graph level.
+
+## Follow-up: NUMA placement and a decode-only Rayon pool
+
+### Topology
+
+`lscpu` and `numactl --hardware` report:
+
+- Intel Xeon Platinum 8480C, 2 sockets, 48 physical cores per socket, no SMT;
+- 96 online CPUs: NUMA node 0 is CPUs 0-47, node 1 is CPUs 48-95;
+- 105 MiB L3 per socket (210 MiB total);
+- about 932 GiB RAM per node; and
+- NUMA distance 10 local versus 21 remote.
+
+This is a true two-node host rather than a 48-core SMT machine.
+
+### Thread and placement sweep
+
+The sweep used the release `profile_native` binary, the model above, default
+`Hello` prompt, four generated tokens, three warmups, and repeated measured
+runs. Every run reproduced `[11576, 42740, 11, 358]`.
+
+Representative medians:
+
+| placement | Rayon/decode workers | tok/s |
+|---|---:|---:|
+| unpinned | 8 | 46.37 |
+| unpinned | 16 | 45.98 |
+| unpinned | 24 | **54.26** |
+| unpinned | 32 | 47.00 |
+| unpinned | 40 | 37.53 |
+| unpinned | 48 | 36.46 |
+| unpinned | 64 | 25.90 |
+| unpinned | 96/default | 28.86-29.70 |
+| node 0 CPU+memory bound | 4 | 55.81 |
+| node 0 CPU+memory bound | 5 | 58.57 |
+| node 0 CPU+memory bound | 6 | **60.73** |
+| node 0 CPU+memory bound | 7 | 56.54 |
+| node 0 CPU+memory bound | 8 | 54.17 |
+| node 0 CPU+memory bound | 10 | 55.42 |
+| node 0 CPU+memory bound | 16 | 47.94 |
+| node 0 CPU+memory bound | 24 | 52.78 |
+| node 0 CPU+memory bound | 32 | 42.61 |
+| node 0 CPU+memory bound | 40 | 31.69 |
+| node 0 CPU+memory bound | 48/default under affinity | 25.19 |
+| node 1 CPU+memory bound | 6 | 60.73 |
+| `taskset -c 0-47` | 6 | 60.31 |
+
+The curve is not monotonic. Six pinned workers are the measured optimum for
+this small model. Pinning alone is not the win: constraining the default pool
+to one socket still leaves 48 workers and measured 25.19 tok/s, 15.2% below
+the 96-worker unpinned default. The useful combination is a small decode pool
+plus socket-local placement.
+
+### Change
+
+`ONNX_GENAI_CPU_DECODE_THREADS=<positive integer>` now opt-in creates a
+persistent Rayon pool used only by M=1 `MatMulNBits` GEMV. With the variable
+unset, execution continues on the existing global Rayon pool. M>1
+`MatMulNBits` prefill, shared GEMM, and other operators remain on their
+existing paths.
+
+The runtime deliberately does not hard-pin threads or infer a default cap.
+Larger models and larger-M work may benefit from more cores, while portable
+NUMA discovery, first-touch placement, and per-socket weight replication need
+a broader design. For this host, a decode-only process can use:
+
+```bash
+ONNX_GENAI_CPU_DECODE_THREADS=6 \
+numactl --cpunodebind=0 --membind=0 \
+  target/release/profile_native \
+  --model /home/justinchu/qwen2.5-0.5b-int4-onnx \
+  --tokens 4 --warmups 3 --runs 10
+```
+
+### Before and after
+
+Five-process medians, 40 measured tokens per process:
+
+| configuration | before/default tok/s | after tok/s | change |
+|---|---:|---:|---:|
+| unpinned | 29.99 | 46.09 (decode pool 6) | +53.7% |
+| node 0 CPU+memory bound | 25.06 | **60.53** (decode pool 6) | **+141.5%** |
+| current unpinned default vs best setting | 29.99 | **60.53** | **+101.8% (2.02x)** |
+
+Explicitly setting the global pool to 96 while keeping the decode pool at six
+still produced 60.77 tok/s under node-0 affinity, confirming that the new knob
+controls the M=1 kernel independently of the prefill/global pool.
+
+The steady-state op profile moved from 28.329 ms `MatMulNBits` at the unpinned
+default to 13.519 ms with six node-local decode workers (-52.3%). Against the
+same node-0 placement, it moved from 34.779 to 13.519 ms (-61.1%). Node-time
+share fell from about 90.1% to 83.7%.
+
+The no-variable post-change default measured 29.99 tok/s versus the 29.70
+tok/s pre-change median, within run noise. The knob is therefore an opt-in
+decode optimization, not a new machine-wide default.

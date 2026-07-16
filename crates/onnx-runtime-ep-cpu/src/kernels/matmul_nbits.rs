@@ -20,6 +20,10 @@ use super::matmul::gemm;
 use super::{check_arity, to_dense_bytes, to_dense_f32, to_dense_i64, write_dense_f32};
 use crate::strided::numel;
 
+const DECODE_THREADS_ENV: &str = "ONNX_GENAI_CPU_DECODE_THREADS";
+static DECODE_POOL: OnceLock<std::result::Result<Option<rayon::ThreadPool>, String>> =
+    OnceLock::new();
+
 pub struct MatMulNBitsKernel {
     k: usize,
     n: usize,
@@ -182,14 +186,16 @@ impl Kernel for MatMulNBitsKernel {
                 };
                 &owned_weight
             };
-            int4_matmul_m1(
-                &activations,
-                packed_weight,
-                &mut result,
-                self.k,
-                self.n,
-                dot_kernel,
-            );
+            with_decode_pool(|| {
+                int4_matmul_m1(
+                    &activations,
+                    packed_weight,
+                    &mut result,
+                    self.k,
+                    self.n,
+                    dot_kernel,
+                );
+            })?;
         } else if self.accuracy_level == 4 && group_indices.is_none() {
             let owned_weight;
             let int8_weight = if can_prepack {
@@ -206,16 +212,23 @@ impl Kernel for MatMulNBitsKernel {
                 owned_weight = self.prepack_int8_weight(&inputs[1], &inputs[2], zero_points)?;
                 &owned_weight
             };
-            int8_matmul(
-                &activations,
-                int8_weight,
-                &mut result,
-                m,
-                self.k,
-                self.n,
-                self.block_size,
-                dot_kernel,
-            );
+            let mut matmul = || {
+                int8_matmul(
+                    &activations,
+                    int8_weight,
+                    &mut result,
+                    m,
+                    self.k,
+                    self.n,
+                    self.block_size,
+                    dot_kernel,
+                );
+            };
+            if m == 1 {
+                with_decode_pool(matmul)?;
+            } else {
+                matmul();
+            }
         } else if m == 1 {
             let owned_weight;
             let weight_nk = if can_prepack {
@@ -244,7 +257,9 @@ impl Kernel for MatMulNBitsKernel {
                 )?;
                 &owned_weight
             };
-            gemv_nk(&activations, weight_nk, &mut result, self.k, self.n);
+            with_decode_pool(|| {
+                gemv_nk(&activations, weight_nk, &mut result, self.k, self.n);
+            })?;
         } else {
             let weight_kn = self.dequantize_weight(
                 &inputs[1],
@@ -380,6 +395,53 @@ impl MatMulNBitsKernel {
             }
         }
         Ok(weight_kn)
+    }
+}
+
+fn configured_decode_threads() -> std::result::Result<Option<usize>, String> {
+    match std::env::var(DECODE_THREADS_ENV) {
+        Ok(value) => parse_decode_threads(Some(&value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            Err(format!("{DECODE_THREADS_ENV} must be valid Unicode"))
+        }
+    }
+}
+
+fn parse_decode_threads(value: Option<&str>) -> std::result::Result<Option<usize>, String> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let threads = value
+        .parse::<usize>()
+        .map_err(|_| format!("{DECODE_THREADS_ENV} must be a positive integer, got '{value}'"))?;
+    if threads == 0 {
+        return Err(format!(
+            "{DECODE_THREADS_ENV} must be a positive integer, got '0'"
+        ));
+    }
+    Ok(Some(threads))
+}
+
+fn build_decode_pool(
+    threads: Option<usize>,
+) -> std::result::Result<Option<rayon::ThreadPool>, String> {
+    threads
+        .map(|threads| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .thread_name(|index| format!("onnx-genai-decode-{index}"))
+                .build()
+                .map_err(|err| format!("failed to build {DECODE_THREADS_ENV} pool: {err}"))
+        })
+        .transpose()
+}
+
+fn with_decode_pool<T: Send>(operation: impl FnOnce() -> T + Send) -> Result<T> {
+    match DECODE_POOL.get_or_init(|| configured_decode_threads().and_then(build_decode_pool)) {
+        Ok(Some(pool)) => Ok(pool.install(operation)),
+        Ok(None) => Ok(operation()),
+        Err(message) => Err(error(message.clone())),
     }
 }
 
@@ -1445,6 +1507,21 @@ mod tests {
         assert_eq!(chunk(96, 896, 896), 896);
         assert_eq!(chunk(96, 4864, 896), 4864);
         assert_eq!(chunk(96, 151_936, 896), 1583);
+    }
+
+    #[test]
+    fn decode_thread_pool_is_opt_in_and_bounded() {
+        assert!(
+            build_decode_pool(parse_decode_threads(None).unwrap())
+                .unwrap()
+                .is_none()
+        );
+        let pool = build_decode_pool(parse_decode_threads(Some("3")).unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(pool.install(rayon::current_num_threads), 3);
+        assert!(parse_decode_threads(Some("0")).is_err());
+        assert!(parse_decode_threads(Some("many")).is_err());
     }
 
     #[test]
