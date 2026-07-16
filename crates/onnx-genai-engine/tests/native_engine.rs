@@ -1,7 +1,8 @@
 #![cfg(feature = "native-backend")]
 
 use onnx_genai_engine::{
-    Engine, EngineConfig, EngineDecodeBackend, GeneratePrompt, GenerateRequest, SpeculativeMode,
+    Engine, EngineConfig, EngineDecodeBackend, GeneratePrompt, GenerateRequest, NativeDecodeDevice,
+    SpeculativeMode,
 };
 use onnx_genai_ort::{ExecutionProvider, SessionOptions};
 use std::path::Path;
@@ -76,7 +77,7 @@ fn native_backend_rejects_request_level_speculation() -> anyhow::Result<()> {
 }
 
 #[test]
-fn native_backend_rejects_non_cpu_session_options() {
+fn native_backend_rejects_unsupported_session_device() {
     let fixture =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-native-engine");
     let error = Engine::from_dir_with_session_options(
@@ -88,10 +89,77 @@ fn native_backend_rejects_non_cpu_session_options() {
         SessionOptions::with_execution_provider(ExecutionProvider::WebGpu),
     )
     .err()
-    .expect("native backend must reject non-CPU session options");
+    .expect("native backend must reject unsupported session options");
     assert!(
         error
             .to_string()
-            .contains("native decoder backend supports only CPU session execution")
+            .contains("does not support execution provider WebGpu")
     );
+}
+
+#[cfg(not(feature = "cuda"))]
+#[test]
+fn native_backend_rejects_cuda_without_cuda_feature() {
+    let fixture =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-native-engine");
+    let error = Engine::from_dir(
+        &fixture,
+        EngineConfig {
+            decode_backend: EngineDecodeBackend::Native,
+            native_device: Some(NativeDecodeDevice::Cuda { index: Some(0) }),
+            ..EngineConfig::default()
+        },
+    )
+    .err()
+    .expect("native CUDA must require the CUDA feature");
+    assert!(error.to_string().contains(
+        "requires building onnx-genai-engine with both the 'native-backend' and 'cuda' features"
+    ));
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn engine_native_cuda_matches_cpu_tokens() -> anyhow::Result<()> {
+    if let Err(error) = onnx_runtime_ep_cuda::CudaExecutionProvider::new(0) {
+        eprintln!("skipping native engine CUDA parity; CUDA is unavailable: {error}");
+        return Ok(());
+    }
+
+    let fixture =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-native-cuda-engine");
+    let config = |native_device| EngineConfig {
+        decode_backend: EngineDecodeBackend::Native,
+        native_device: Some(native_device),
+        ..EngineConfig::default()
+    };
+    let generate = |engine: &mut Engine| -> anyhow::Result<Vec<u32>> {
+        let mut request = GenerateRequest::new(GeneratePrompt::Text("Hello".to_string()));
+        request.options.max_new_tokens = 16;
+        request.options.temperature = 0.0;
+        request.options.stop_on_eos = false;
+        Ok(engine.generate(request)?.token_ids)
+    };
+
+    let mut cpu = Engine::from_dir(&fixture, config(NativeDecodeDevice::Cpu))?;
+    let mut cuda = Engine::from_dir(
+        &fixture,
+        config(NativeDecodeDevice::Cuda { index: Some(0) }),
+    )?;
+    let mut cuda_from_session_options = Engine::from_dir_with_session_options(
+        &fixture,
+        EngineConfig {
+            decode_backend: EngineDecodeBackend::Native,
+            ..EngineConfig::default()
+        },
+        SessionOptions::with_execution_provider(ExecutionProvider::Cuda { device_id: 0 }),
+    )?;
+    let cpu_tokens = generate(&mut cpu)?;
+    let cuda_tokens = generate(&mut cuda)?;
+    let session_options_tokens = generate(&mut cuda_from_session_options)?;
+
+    assert_eq!(cpu_tokens.len(), 16);
+    assert_eq!(cuda_tokens, cpu_tokens);
+    assert_eq!(session_options_tokens, cpu_tokens);
+    assert!(cuda_tokens.iter().all(|&token| token == 1));
+    Ok(())
 }

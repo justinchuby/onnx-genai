@@ -23,6 +23,8 @@ use crate::session::{ActiveGenerate, DraftModel, DraftSession, EngineSession};
 use anyhow::Context;
 use onnx_genai_kv::{Device, KvCacheOps, KvDType, LocalTieredConnector, PagedKvCache, PrefixCache};
 use onnx_genai_metadata::InferenceMetadata;
+#[cfg(feature = "native-backend")]
+use onnx_genai_ort::ExecutionProvider;
 use onnx_genai_ort::{
     DataType, Eagle3DecodeSession, Environment, ModelDirectory, MtpDecodeSession, Session,
     SessionOptions, SharedKvProposerSession, Tokenizer,
@@ -46,6 +48,65 @@ pub use crate::config::{
 };
 pub use crate::connector_bridge::{ConnectorLookupOutcome, ConnectorStats};
 use crate::speculative::{LinearEmbedder, LinearLmHead, SpeculativeStats};
+
+#[cfg(feature = "native-backend")]
+fn resolve_native_decode_device(
+    configured: Option<crate::native_decode::NativeDecodeDevice>,
+    session_options: &SessionOptions,
+) -> anyhow::Result<crate::native_decode::NativeDecodeDevice> {
+    use crate::native_decode::NativeDecodeDevice;
+
+    if let Some(device) = configured {
+        return validate_native_decode_device(device);
+    }
+
+    for provider in &session_options.execution_providers {
+        if !matches!(
+            provider,
+            ExecutionProvider::Cpu | ExecutionProvider::Cuda { .. }
+        ) {
+            anyhow::bail!(
+                "native decoder backend does not support execution provider {provider:?}; supported devices are CPU and CUDA"
+            );
+        }
+    }
+
+    match session_options.execution_providers.first() {
+        None | Some(ExecutionProvider::Cpu) => Ok(NativeDecodeDevice::Cpu),
+        Some(ExecutionProvider::Cuda { device_id }) => {
+            let index = u32::try_from(*device_id).map_err(|_| {
+                anyhow::anyhow!(
+                    "native decoder backend CUDA device id must be non-negative, got {device_id}"
+                )
+            })?;
+            validate_native_decode_device(NativeDecodeDevice::Cuda { index: Some(index) })
+        }
+        Some(provider) => {
+            unreachable!("unsupported native provider already rejected: {provider:?}")
+        }
+    }
+}
+
+#[cfg(feature = "native-backend")]
+fn validate_native_decode_device(
+    device: crate::native_decode::NativeDecodeDevice,
+) -> anyhow::Result<crate::native_decode::NativeDecodeDevice> {
+    match device {
+        crate::native_decode::NativeDecodeDevice::Cpu => Ok(device),
+        crate::native_decode::NativeDecodeDevice::Cuda { .. } => {
+            #[cfg(feature = "cuda")]
+            {
+                Ok(device)
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                anyhow::bail!(
+                    "native decoder backend CUDA device requires building onnx-genai-engine with both the 'native-backend' and 'cuda' features"
+                )
+            }
+        }
+    }
+}
 
 // Provisional vendor-neutral capacities used until the active EP, OS, and
 // filesystem supply real providers. Configured limits are resolved against
@@ -743,16 +804,7 @@ impl Engine {
         if !matches!(&config.kv_connector.backend, KvConnectorBackend::Null) {
             anyhow::bail!("native decoder backend does not yet support external KV connectors");
         }
-        if !session_options
-            .execution_providers
-            .iter()
-            .all(|provider| matches!(provider, onnx_genai_ort::ExecutionProvider::Cpu))
-        {
-            anyhow::bail!(
-                "native decoder backend supports only CPU session execution; requested execution providers: {:?}",
-                session_options.execution_providers
-            );
-        }
+        let native_device = resolve_native_decode_device(config.native_device, session_options)?;
 
         let metadata = if let Some(metadata_path) = &model_directory.metadata_path {
             onnx_genai_metadata::load_metadata(metadata_path)
@@ -793,7 +845,7 @@ impl Engine {
         let connector = build_connector_bridge(&config.kv_connector, &model_directory, None)?;
         let native_session = crate::native_decode::NativeDecodeSession::load(
             &model_directory.model_path,
-            crate::native_decode::NativeDecodeDevice::Cpu,
+            native_device,
         )
         .map_err(|error| anyhow::anyhow!("Failed to load native decoder session: {error}"))?;
         let environment = Environment::new("onnx-genai-engine")

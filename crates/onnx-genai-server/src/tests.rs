@@ -1698,6 +1698,37 @@ fn kv_cache_dtype_rejects_garbage_values() {
     }
 }
 
+#[cfg(all(feature = "native-backend", feature = "cuda"))]
+#[test]
+fn native_device_parser_accepts_cuda_index() {
+    use crate::state::parse_native_device;
+    use onnx_genai_engine::NativeDecodeDevice;
+
+    assert_eq!(parse_native_device("cpu").unwrap(), NativeDecodeDevice::Cpu);
+    assert_eq!(
+        parse_native_device("cuda").unwrap(),
+        NativeDecodeDevice::Cuda { index: None }
+    );
+    assert_eq!(
+        parse_native_device("cuda:3").unwrap(),
+        NativeDecodeDevice::Cuda { index: Some(3) }
+    );
+    assert!(parse_native_device("webgpu").is_err());
+}
+
+#[cfg(all(feature = "native-backend", not(feature = "cuda")))]
+#[test]
+fn native_device_parser_rejects_cuda_without_cuda_feature() {
+    use crate::state::parse_native_device;
+
+    assert!(parse_native_device("cpu").is_ok());
+    assert!(
+        parse_native_device("cuda:0")
+            .unwrap_err()
+            .contains("'cuda' feature")
+    );
+}
+
 #[test]
 fn server_config_engine_config_kv_cache_dtype_defaults_to_f32() {
     use onnx_genai_engine::KvDType;

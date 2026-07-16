@@ -3,6 +3,8 @@ use std::{path::Path, sync::Arc};
 use anyhow::Context;
 use onnx_genai::{Engine, EngineConfig};
 use onnx_genai_engine::KvDType;
+#[cfg(feature = "native-backend")]
+use onnx_genai_engine::NativeDecodeDevice;
 use onnx_genai_metadata::PipelineStrategy;
 use onnx_genai_ort::{
     ChatTemplate, DataType, ModelDirectory, PipelineModelDirectory, PipelineModels, Tokenizer,
@@ -38,6 +40,37 @@ pub fn parse_kv_cache_dtype(s: &str) -> Result<KvDType, String> {
     KvDType::from_metadata_name(normalised).map_err(|_| {
         format!("invalid KV cache dtype '{s}'; accepted values: f32, int8, fp8_e4m3fn, fp8_e5m2")
     })
+}
+
+/// Parse a native decoder device as `cpu`, `cuda`, or `cuda:<index>`.
+#[cfg(feature = "native-backend")]
+pub fn parse_native_device(s: &str) -> Result<NativeDecodeDevice, String> {
+    let value = s.trim().to_ascii_lowercase();
+    if value == "cpu" {
+        return Ok(NativeDecodeDevice::Cpu);
+    }
+    if value == "cuda" {
+        return parse_native_cuda_device(None);
+    }
+    if let Some(index) = value.strip_prefix("cuda:") {
+        let index = index
+            .parse::<u32>()
+            .map_err(|_| format!("invalid native device '{s}'; CUDA index must be a u32"))?;
+        return parse_native_cuda_device(Some(index));
+    }
+    Err(format!(
+        "invalid native device '{s}'; accepted values: cpu, cuda, cuda:<index>"
+    ))
+}
+
+#[cfg(all(feature = "native-backend", feature = "cuda"))]
+fn parse_native_cuda_device(index: Option<u32>) -> Result<NativeDecodeDevice, String> {
+    Ok(NativeDecodeDevice::Cuda { index })
+}
+
+#[cfg(all(feature = "native-backend", not(feature = "cuda")))]
+fn parse_native_cuda_device(_index: Option<u32>) -> Result<NativeDecodeDevice, String> {
+    Err("native CUDA requires building onnx-genai-server with the 'cuda' feature".to_string())
 }
 
 #[derive(Clone)]

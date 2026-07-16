@@ -2,6 +2,8 @@ use std::{net::SocketAddr, path::PathBuf};
 
 use clap::{ArgGroup, Parser};
 use onnx_genai_engine::KvDType;
+#[cfg(feature = "native-backend")]
+use onnx_genai_server::parse_native_device;
 use onnx_genai_server::{
     AppState, ModelSpec, ModelsConfig, ServerConfig, default_node_id, from_models_dir,
     parse_kv_cache_dtype, serve,
@@ -92,6 +94,12 @@ struct Cli {
         default_value = "f32"
     )]
     kv_cache_dtype: KvDType,
+
+    /// Device for native decoder execution: cpu, cuda, or cuda:<index>.
+    /// Falls back to ONNX_GENAI_EP when omitted.
+    #[cfg(feature = "native-backend")]
+    #[arg(long, env = "ONNX_GENAI_NATIVE_DEVICE", value_parser = parse_native_device)]
+    native_device: Option<onnx_genai_engine::NativeDecodeDevice>,
 }
 
 #[tokio::main]
@@ -113,6 +121,8 @@ async fn main() -> anyhow::Result<()> {
         eviction_policy: Default::default(),
         engine_config: onnx_genai_engine::EngineConfig {
             kv_cache_dtype: cli.kv_cache_dtype,
+            #[cfg(feature = "native-backend")]
+            native_device: cli.native_device,
             ..Default::default()
         },
     };

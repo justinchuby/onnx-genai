@@ -7,6 +7,9 @@ use onnx_genai_scheduler::{Priority, ResourceLimit, ResourceLimits, SchedulerCon
 use serde::Deserialize;
 use std::path::PathBuf;
 
+#[cfg(feature = "native-backend")]
+use crate::native_decode::NativeDecodeDevice;
+
 /// Error returned when a user-facing resource limit cannot be parsed.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error(
@@ -358,6 +361,10 @@ pub struct EngineConfig {
     /// Decoder execution backend. [`EngineDecodeBackend::Auto`] preserves ORT
     /// for existing models and selects native execution only when required.
     pub decode_backend: EngineDecodeBackend,
+    /// Native decoder device override. `None` follows the execution provider in
+    /// [`onnx_genai_ort::SessionOptions`], including `ONNX_GENAI_EP`.
+    #[cfg(feature = "native-backend")]
+    pub native_device: Option<NativeDecodeDevice>,
     /// Number of GPU pages for KV cache.
     pub num_gpu_pages: usize,
     /// Tokens per KV page.
@@ -391,6 +398,8 @@ impl Default for EngineConfig {
     fn default() -> Self {
         Self {
             decode_backend: EngineDecodeBackend::Auto,
+            #[cfg(feature = "native-backend")]
+            native_device: None,
             num_gpu_pages: 1024,
             page_size: 16,
             scheduler: SchedulerConfig::default(),
