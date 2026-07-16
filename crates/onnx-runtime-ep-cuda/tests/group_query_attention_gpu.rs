@@ -220,6 +220,221 @@ fn run_available(
     }
 }
 
+fn upload(
+    ep: &CudaExecutionProvider,
+    tensor: &HostTensor,
+) -> onnx_runtime_ep_api::Result<DeviceBuffer> {
+    let buffer = ep.allocate(tensor.bytes.len(), 256)?;
+    // SAFETY: the allocation exactly covers the source byte slice.
+    unsafe {
+        ep.runtime().htod(&tensor.bytes, cuptr(buffer.as_ptr()))?;
+    }
+    Ok(buffer)
+}
+
+fn run_packed_decode_in_place(
+    ep: &CudaExecutionProvider,
+    packed: &[f32],
+    cache_k: &mut DeviceBuffer,
+    cache_v: &mut DeviceBuffer,
+    seqlen: i32,
+    total: i32,
+    cos: &[f32],
+    sin: &[f32],
+    position: i64,
+) -> onnx_runtime_ep_api::Result<(Vec<f32>, Vec<f32>, Vec<f32>)> {
+    const NUM_HEADS: usize = 14;
+    const KV_HEADS: usize = 2;
+    const HEAD_DIM: usize = 64;
+    const CAPACITY: usize = 5;
+    const PACKED_WIDTH: usize = (NUM_HEADS + 2 * KV_HEADS) * HEAD_DIM;
+
+    let packed = f32_tensor(&[1, 1, PACKED_WIDTH], packed);
+    let seqlens = i32_tensor(&[1], &[seqlen]);
+    let total = i32_tensor(&[], &[total]);
+    let cos = f32_tensor(&[CAPACITY, HEAD_DIM / 2], cos);
+    let sin = f32_tensor(&[CAPACITY, HEAD_DIM / 2], sin);
+    let position = i64_tensor(&[1, 1], &[position]);
+    let transient = [&packed, &seqlens, &total, &cos, &sin, &position]
+        .into_iter()
+        .map(|tensor| upload(ep, tensor))
+        .collect::<onnx_runtime_ep_api::Result<Vec<_>>>()?;
+
+    let cache_shape = vec![1, KV_HEADS, CAPACITY, HEAD_DIM];
+    let input_specs = [
+        Some((DataType::Float32, vec![1, 1, PACKED_WIDTH])),
+        None,
+        None,
+        Some((DataType::Float32, cache_shape.clone())),
+        Some((DataType::Float32, cache_shape.clone())),
+        Some((DataType::Int32, vec![1])),
+        Some((DataType::Int32, vec![])),
+        Some((DataType::Float32, vec![CAPACITY, HEAD_DIM / 2])),
+        Some((DataType::Float32, vec![CAPACITY, HEAD_DIM / 2])),
+        Some((DataType::Int64, vec![1, 1])),
+    ];
+    let mut graph = Graph::new();
+    graph.opset_imports.insert("com.microsoft".into(), 1);
+    let node_inputs = input_specs
+        .iter()
+        .enumerate()
+        .map(|(index, spec)| {
+            spec.as_ref().map(|(dtype, shape)| {
+                let value = graph.create_named_value(
+                    format!("input_{index}"),
+                    *dtype,
+                    static_shape(shape.clone()),
+                );
+                graph.add_input(value);
+                value
+            })
+        })
+        .collect();
+    let output_shapes = [
+        vec![1, 1, NUM_HEADS * HEAD_DIM],
+        cache_shape.clone(),
+        cache_shape.clone(),
+    ];
+    let node_outputs: Vec<_> = output_shapes
+        .iter()
+        .enumerate()
+        .map(|(index, shape)| {
+            graph.create_named_value(
+                format!("output_{index}"),
+                DataType::Float32,
+                static_shape(shape.clone()),
+            )
+        })
+        .collect();
+    let mut node = Node::new(
+        NodeId(0),
+        "GroupQueryAttention",
+        node_inputs,
+        node_outputs.clone(),
+    );
+    node.domain = "com.microsoft".into();
+    node.attributes
+        .insert("num_heads".into(), Attribute::Int(NUM_HEADS as i64));
+    node.attributes
+        .insert("kv_num_heads".into(), Attribute::Int(KV_HEADS as i64));
+    node.attributes
+        .insert("do_rotary".into(), Attribute::Int(1));
+    let node_id = graph.insert_node(node);
+    for output in node_outputs {
+        graph.add_output(output);
+    }
+    let model = Model::new(&graph);
+    let kernel = ep.get_kernel(model.graph.node(node_id), &[], 1)?;
+
+    let device = ep.device_id();
+    let cache_strides = compute_contiguous_strides(&cache_shape);
+    let transient_shapes = [
+        &[1, 1, PACKED_WIDTH][..],
+        &[1][..],
+        &[][..],
+        &[CAPACITY, HEAD_DIM / 2][..],
+        &[CAPACITY, HEAD_DIM / 2][..],
+        &[1, 1][..],
+    ];
+    let transient_dtypes = [
+        DataType::Float32,
+        DataType::Int32,
+        DataType::Int32,
+        DataType::Float32,
+        DataType::Float32,
+        DataType::Int64,
+    ];
+    let transient_strides: Vec<_> = transient_shapes
+        .iter()
+        .map(|shape| compute_contiguous_strides(shape))
+        .collect();
+    let transient_views: Vec<_> = transient
+        .iter()
+        .zip(transient_shapes)
+        .zip(transient_dtypes)
+        .zip(&transient_strides)
+        .map(|(((buffer, shape), dtype), strides)| {
+            TensorView::new(DevicePtr(buffer.as_ptr()), dtype, shape, strides, device)
+        })
+        .collect();
+    let mut transient_views = transient_views.into_iter();
+    let inputs = vec![
+        transient_views.next().unwrap(),
+        TensorView::absent(DataType::Float32),
+        TensorView::absent(DataType::Float32),
+        TensorView::new(
+            DevicePtr(cache_k.as_ptr()),
+            DataType::Float32,
+            &cache_shape,
+            &cache_strides,
+            device,
+        ),
+        TensorView::new(
+            DevicePtr(cache_v.as_ptr()),
+            DataType::Float32,
+            &cache_shape,
+            &cache_strides,
+            device,
+        ),
+        transient_views.next().unwrap(),
+        transient_views.next().unwrap(),
+        transient_views.next().unwrap(),
+        transient_views.next().unwrap(),
+        transient_views.next().unwrap(),
+    ];
+
+    let output_shape = &output_shapes[0];
+    let output_strides = compute_contiguous_strides(output_shape);
+    let mut output = ep.allocate(output_shape.iter().product::<usize>() * 4, 256)?;
+    kernel.execute(
+        &inputs,
+        &mut [
+            TensorMut::new(
+                DevicePtrMut(output.as_mut_ptr()),
+                DataType::Float32,
+                output_shape,
+                &output_strides,
+                device,
+            ),
+            TensorMut::new(
+                DevicePtrMut(cache_k.as_mut_ptr()),
+                DataType::Float32,
+                &cache_shape,
+                &cache_strides,
+                device,
+            ),
+            TensorMut::new(
+                DevicePtrMut(cache_v.as_mut_ptr()),
+                DataType::Float32,
+                &cache_shape,
+                &cache_strides,
+                device,
+            ),
+        ],
+    )?;
+
+    let mut output_bytes = vec![0u8; output_shape.iter().product::<usize>() * 4];
+    let mut key_bytes = vec![0u8; cache_shape.iter().product::<usize>() * 4];
+    let mut value_bytes = vec![0u8; key_bytes.len()];
+    // SAFETY: destination slices exactly match their source allocations.
+    unsafe {
+        ep.runtime()
+            .dtoh(&mut output_bytes, cuptr(output.as_ptr()))?;
+        ep.runtime().dtoh(&mut key_bytes, cuptr(cache_k.as_ptr()))?;
+        ep.runtime()
+            .dtoh(&mut value_bytes, cuptr(cache_v.as_ptr()))?;
+    }
+    ep.deallocate(output)?;
+    for buffer in transient {
+        ep.deallocate(buffer)?;
+    }
+    Ok((
+        bytes_to_f32(&output_bytes),
+        bytes_to_f32(&key_bytes),
+        bytes_to_f32(&value_bytes),
+    ))
+}
+
 fn base_inputs(
     q_shape: &[usize],
     q: &[f32],
@@ -303,6 +518,77 @@ fn close(got: &[f32], expected: &[f32]) {
             "{index}: {got} != {expected}"
         );
     }
+}
+
+fn rotate_target(
+    data: &[f32],
+    heads: usize,
+    position: usize,
+    cos: &[f32],
+    sin: &[f32],
+) -> Vec<f32> {
+    const HEAD_DIM: usize = 64;
+    let half = HEAD_DIM / 2;
+    let mut output = data.to_vec();
+    for head in 0..heads {
+        let base = head * HEAD_DIM;
+        for k in 0..half {
+            let x0 = data[base + k];
+            let x1 = data[base + k + half];
+            let cache = position * half + k;
+            output[base + k] = cos[cache] * x0 - sin[cache] * x1;
+            output[base + k + half] = sin[cache] * x0 + cos[cache] * x1;
+        }
+    }
+    output
+}
+
+fn target_decode_reference(
+    query: &[f32],
+    key_cache: &[f32],
+    value_cache: &[f32],
+    valid_length: usize,
+    capacity: usize,
+) -> Vec<f32> {
+    const NUM_HEADS: usize = 14;
+    const KV_HEADS: usize = 2;
+    const HEAD_DIM: usize = 64;
+    let group = NUM_HEADS / KV_HEADS;
+    let scale = 1.0 / (HEAD_DIM as f32).sqrt();
+    let mut output = vec![0.0; NUM_HEADS * HEAD_DIM];
+    for head in 0..NUM_HEADS {
+        let kv_head = head / group;
+        let mut scores = Vec::with_capacity(valid_length);
+        for position in 0..valid_length {
+            let score = (0..HEAD_DIM)
+                .map(|dim| {
+                    query[head * HEAD_DIM + dim]
+                        * key_cache[(kv_head * capacity + position) * HEAD_DIM + dim]
+                })
+                .sum::<f32>()
+                * scale;
+            scores.push(score);
+        }
+        let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let sum: f32 = scores
+            .iter_mut()
+            .map(|score| {
+                *score = (*score - max).exp();
+                *score
+            })
+            .sum();
+        for dim in 0..HEAD_DIM {
+            output[head * HEAD_DIM + dim] = scores
+                .iter()
+                .enumerate()
+                .map(|(position, probability)| {
+                    probability / sum
+                        * value_cache[(kv_head * capacity + position) * HEAD_DIM + dim]
+                })
+                .sum();
+        }
+    }
+    output
 }
 
 fn attrs<'a>(extra: &'a [(&'a str, Attribute)]) -> Vec<(&'a str, Attribute)> {
@@ -540,6 +826,94 @@ fn gqa_gpu_zero_scale_softcap_and_sliding_window_match_reference() {
 }
 
 #[test]
+fn gqa_gpu_packed_qkv_rope_decode_appends_in_place_across_steps() {
+    const NUM_HEADS: usize = 14;
+    const KV_HEADS: usize = 2;
+    const HEAD_DIM: usize = 64;
+    const CAPACITY: usize = 5;
+    let Some(ep) = gpu() else { return };
+
+    let mut cos = Vec::with_capacity(CAPACITY * HEAD_DIM / 2);
+    let mut sin = Vec::with_capacity(cos.capacity());
+    for position in 0..CAPACITY {
+        for dim in 0..HEAD_DIM / 2 {
+            let angle = position as f32 * (dim + 1) as f32 * 0.01;
+            cos.push(angle.cos());
+            sin.push(angle.sin());
+        }
+    }
+
+    let cache_len = KV_HEADS * CAPACITY * HEAD_DIM;
+    let mut expected_k = vec![91.0; cache_len];
+    let mut expected_v = vec![73.0; cache_len];
+    for head in 0..KV_HEADS {
+        for dim in 0..HEAD_DIM {
+            expected_k[(head * CAPACITY) * HEAD_DIM + dim] =
+                (head * HEAD_DIM + dim + 1) as f32 * 0.002;
+            expected_v[(head * CAPACITY) * HEAD_DIM + dim] =
+                (head * HEAD_DIM + dim + 1) as f32 * 0.003 - 0.2;
+        }
+    }
+    let mut cache_k = ep.allocate(cache_len * 4, 256).unwrap();
+    let mut cache_v = ep.allocate(cache_len * 4, 256).unwrap();
+    // SAFETY: cache allocations exactly cover the source slices.
+    unsafe {
+        ep.runtime()
+            .htod(&typed_bytes(&expected_k), cuptr(cache_k.as_ptr()))
+            .unwrap();
+        ep.runtime()
+            .htod(&typed_bytes(&expected_v), cuptr(cache_v.as_ptr()))
+            .unwrap();
+    }
+
+    for step in 1..=2 {
+        let query: Vec<f32> = (0..NUM_HEADS * HEAD_DIM)
+            .map(|index| ((index * 13 + step * 7) % 101) as f32 * 0.002 - 0.1)
+            .collect();
+        let key: Vec<f32> = (0..KV_HEADS * HEAD_DIM)
+            .map(|index| ((index * 11 + step * 5) % 67) as f32 * 0.003 - 0.08)
+            .collect();
+        let value: Vec<f32> = (0..KV_HEADS * HEAD_DIM)
+            .map(|index| ((index * 17 + step * 3) % 79) as f32 * 0.004 - 0.12)
+            .collect();
+        let mut packed = Vec::with_capacity(query.len() + key.len() + value.len());
+        packed.extend_from_slice(&query);
+        packed.extend_from_slice(&key);
+        packed.extend_from_slice(&value);
+
+        let rotated_query = rotate_target(&query, NUM_HEADS, step, &cos, &sin);
+        let rotated_key = rotate_target(&key, KV_HEADS, step, &cos, &sin);
+        for head in 0..KV_HEADS {
+            for dim in 0..HEAD_DIM {
+                let cache_index = (head * CAPACITY + step) * HEAD_DIM + dim;
+                expected_k[cache_index] = rotated_key[head * HEAD_DIM + dim];
+                expected_v[cache_index] = value[head * HEAD_DIM + dim];
+            }
+        }
+        let expected_output =
+            target_decode_reference(&rotated_query, &expected_k, &expected_v, step + 1, CAPACITY);
+        let (output, got_k, got_v) = run_packed_decode_in_place(
+            &ep,
+            &packed,
+            &mut cache_k,
+            &mut cache_v,
+            step as i32,
+            (step + 1) as i32,
+            &cos,
+            &sin,
+            step as i64,
+        )
+        .unwrap();
+        close(&output, &expected_output);
+        close(&got_k, &expected_k);
+        close(&got_v, &expected_v);
+    }
+
+    ep.deallocate(cache_k).unwrap();
+    ep.deallocate(cache_v).unwrap();
+}
+
+#[test]
 fn gqa_gpu_rejected_features_return_clear_errors() {
     let Some(ep) = gpu() else { return };
     let mut registered = Node::new(NodeId(0), "GroupQueryAttention", vec![], vec![]);
@@ -578,9 +952,9 @@ fn gqa_gpu_rejected_features_return_clear_errors() {
         assert!(format!("{error}").contains(feature));
     }
 
-    let mut packed_inputs = base;
-    packed_inputs[1] = None;
-    let error = run(&ep, &attrs(&[]), &packed_inputs, &[vec![1, 1, 8]])
-        .expect_err("packed QKV must be rejected");
-    assert!(format!("{error}").contains("packed QKV"));
+    let mut incomplete_inputs = base;
+    incomplete_inputs[1] = None;
+    let error = run(&ep, &attrs(&[]), &incomplete_inputs, &[vec![1, 1, 8]])
+        .expect_err("partially packed QKV must be rejected");
+    assert!(format!("{error}").contains("must both be present"));
 }

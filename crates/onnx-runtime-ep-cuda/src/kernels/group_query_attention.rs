@@ -30,6 +30,27 @@ extern "C" __global__ void gqa_transpose_bsh_to_bnsh(
     dst[idx] = src[((b * seq + s) * heads + h) * dim + d];
 }
 
+extern "C" __global__ void gqa_split_packed_qkv(
+    const float* packed, float* query, float* key, float* value,
+    int batch, int seq, int q_heads, int kv_heads, int dim)
+{
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int q_hidden = q_heads * dim;
+    const int kv_hidden = kv_heads * dim;
+    const int packed_hidden = q_hidden + 2 * kv_hidden;
+    const int count = batch * seq * packed_hidden;
+    if (idx >= count) return;
+    const int feature = idx % packed_hidden;
+    const int token = idx / packed_hidden;
+    if (feature < q_hidden) {
+        query[token * q_hidden + feature] = packed[idx];
+    } else if (feature < q_hidden + kv_hidden) {
+        key[token * kv_hidden + feature - q_hidden] = packed[idx];
+    } else {
+        value[token * kv_hidden + feature - q_hidden - kv_hidden] = packed[idx];
+    }
+}
+
 extern "C" __global__ void gqa_build_cache(
     const float* current, const float* past, float* present,
     const int* past_lengths, int batch, int seq, int heads, int dim,
@@ -51,6 +72,22 @@ extern "C" __global__ void gqa_build_cache(
         value = current[((b * seq + current_s) * heads + h) * dim + d];
     }
     present[idx] = value;
+}
+
+extern "C" __global__ void gqa_append_cache(
+    const float* current, float* present, const int* past_lengths,
+    int batch, int seq, int heads, int dim, int present_capacity)
+{
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int count = batch * heads * seq * dim;
+    if (idx >= count) return;
+    int x = idx;
+    const int d = x % dim; x /= dim;
+    const int s = x % seq; x /= seq;
+    const int h = x % heads; const int b = x / heads;
+    const int target_s = past_lengths[b] + s;
+    present[((b * heads + h) * present_capacity + target_s) * dim + d] =
+        current[((b * seq + s) * heads + h) * dim + d];
 }
 
 extern "C" __global__ void gqa_rope_bnsh(
@@ -296,9 +333,10 @@ impl GroupQueryAttentionKernel {
                 outputs.len()
             )));
         }
-        if inputs[1].is_absent() || inputs[2].is_absent() {
+        let packed_qkv = inputs[1].is_absent() && inputs[2].is_absent();
+        if inputs[1].is_absent() != inputs[2].is_absent() {
             return Err(EpError::KernelFailed(
-                "cuda_ep GroupQueryAttention: packed QKV/packed KV is not supported; provide unpacked query, key, and value".into(),
+                "cuda_ep GroupQueryAttention: key and value must both be present for unpacked Q/K/V or both absent for packed QKV".into(),
             ));
         }
         for (index, feature) in [
@@ -320,38 +358,63 @@ impl GroupQueryAttentionKernel {
             ));
         }
 
-        let (q, k, v) = (&inputs[0], &inputs[1], &inputs[2]);
-        for (view, name) in [(q, "query"), (k, "key"), (v, "value")] {
-            require_dense(view, name, DataType::Float32)?;
-            if view.shape.len() != 3 {
+        let q = &inputs[0];
+        require_dense(q, "query", DataType::Float32)?;
+        if q.shape.len() != 3 {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep GroupQueryAttention: query must be rank 3 [B,S,H], got {:?}",
+                q.shape
+            )));
+        }
+        let (batch, q_seq, input_hidden) = (q.shape[0], q.shape[1], q.shape[2]);
+        let (q_hidden, k_seq, k_hidden, dim) = if packed_qkv {
+            let packed_heads = self.num_heads + 2 * self.kv_num_heads;
+            if batch == 0
+                || q_seq == 0
+                || input_hidden == 0
+                || !input_hidden.is_multiple_of(packed_heads)
+            {
                 return Err(EpError::KernelFailed(format!(
-                    "cuda_ep GroupQueryAttention: unpacked {name} must be rank 3 [B,S,H*D], got {:?}",
-                    view.shape
+                    "cuda_ep GroupQueryAttention: packed query must be [B,S,(num_heads + 2*kv_num_heads)*head_size], got {:?}",
+                    q.shape
                 )));
             }
-        }
-        let (batch, q_seq, q_hidden) = (q.shape[0], q.shape[1], q.shape[2]);
-        let (k_batch, k_seq, k_hidden) = (k.shape[0], k.shape[1], k.shape[2]);
-        if batch == 0
-            || q_seq == 0
-            || k_seq == 0
-            || q_hidden == 0
-            || k_hidden == 0
-            || !q_hidden.is_multiple_of(self.num_heads)
-            || !k_hidden.is_multiple_of(self.kv_num_heads)
-            || v.shape != [batch, k_seq, k_hidden]
-            || k_batch != batch
-        {
-            return Err(EpError::KernelFailed(
-                "cuda_ep GroupQueryAttention: incompatible query/key/value batch, sequence, or hidden dimensions".into(),
-            ));
-        }
-        let dim = q_hidden / self.num_heads;
-        if k_hidden / self.kv_num_heads != dim {
-            return Err(EpError::KernelFailed(
-                "cuda_ep GroupQueryAttention: query and key/value head sizes must match".into(),
-            ));
-        }
+            let dim = input_hidden / packed_heads;
+            (self.num_heads * dim, q_seq, self.kv_num_heads * dim, dim)
+        } else {
+            let (k, v) = (&inputs[1], &inputs[2]);
+            for (view, name) in [(k, "key"), (v, "value")] {
+                require_dense(view, name, DataType::Float32)?;
+                if view.shape.len() != 3 {
+                    return Err(EpError::KernelFailed(format!(
+                        "cuda_ep GroupQueryAttention: unpacked {name} must be rank 3 [B,S,H*D], got {:?}",
+                        view.shape
+                    )));
+                }
+            }
+            let (k_batch, k_seq, k_hidden) = (k.shape[0], k.shape[1], k.shape[2]);
+            if batch == 0
+                || q_seq == 0
+                || k_seq == 0
+                || input_hidden == 0
+                || k_hidden == 0
+                || !input_hidden.is_multiple_of(self.num_heads)
+                || !k_hidden.is_multiple_of(self.kv_num_heads)
+                || v.shape != [batch, k_seq, k_hidden]
+                || k_batch != batch
+            {
+                return Err(EpError::KernelFailed(
+                    "cuda_ep GroupQueryAttention: incompatible query/key/value batch, sequence, or hidden dimensions".into(),
+                ));
+            }
+            let dim = input_hidden / self.num_heads;
+            if k_hidden / self.kv_num_heads != dim {
+                return Err(EpError::KernelFailed(
+                    "cuda_ep GroupQueryAttention: query and key/value head sizes must match".into(),
+                ));
+            }
+            (input_hidden, k_seq, k_hidden, dim)
+        };
         if outputs[0].dtype != DataType::Float32
             || outputs[0].shape != [batch, q_seq, q_hidden]
             || !outputs[0].is_contiguous()
@@ -531,7 +594,16 @@ impl GroupQueryAttentionKernel {
             self.runtime
                 .htod(bytes_of_i32(&past_lengths), past_lengths_gpu.ptr)?;
         }
-        let q_bnsh = Scratch::new(&self.runtime, q.numel() * 4)?;
+        let packed_q = packed_qkv
+            .then(|| Scratch::new(&self.runtime, batch * q_seq * q_hidden * 4))
+            .transpose()?;
+        let packed_k = packed_qkv
+            .then(|| Scratch::new(&self.runtime, batch * k_seq * k_hidden * 4))
+            .transpose()?;
+        let packed_v = packed_qkv
+            .then(|| Scratch::new(&self.runtime, batch * k_seq * k_hidden * 4))
+            .transpose()?;
+        let q_bnsh = Scratch::new(&self.runtime, batch * q_seq * q_hidden * 4)?;
         let out_bnsh = Scratch::new(&self.runtime, outputs[0].numel() * 4)?;
         let owned_present_k = (outputs.len() < 2)
             .then(|| {
@@ -589,11 +661,54 @@ impl GroupQueryAttentionKernel {
                 "cuda_ep GroupQueryAttention: local_window_size exceeds i32".into(),
             )
         })?;
-        let q_ptr = cuptr(q.data_ptr::<u8>() as *const c_void);
+        let input_q_ptr = cuptr(q.data_ptr::<u8>() as *const c_void);
+        let (q_ptr, k_ptr, v_ptr) = if packed_qkv {
+            let q_scratch = packed_q.as_ref().ok_or_else(|| {
+                EpError::KernelFailed(
+                    "cuda_ep GroupQueryAttention: internal packed-query allocation missing".into(),
+                )
+            })?;
+            let k_scratch = packed_k.as_ref().ok_or_else(|| {
+                EpError::KernelFailed(
+                    "cuda_ep GroupQueryAttention: internal packed-key allocation missing".into(),
+                )
+            })?;
+            let v_scratch = packed_v.as_ref().ok_or_else(|| {
+                EpError::KernelFailed(
+                    "cuda_ep GroupQueryAttention: internal packed-value allocation missing".into(),
+                )
+            })?;
+            let packed_count = q.numel();
+            launch_1d!(
+                self.runtime,
+                "gqa_split_packed_qkv",
+                packed_count,
+                builder,
+                {
+                    builder
+                        .arg(&input_q_ptr)
+                        .arg(&q_scratch.ptr)
+                        .arg(&k_scratch.ptr)
+                        .arg(&v_scratch.ptr)
+                        .arg(&batch_i)
+                        .arg(&q_seq_i)
+                        .arg(&heads_i)
+                        .arg(&kv_heads_i)
+                        .arg(&dim_i);
+                }
+            );
+            (q_scratch.ptr, k_scratch.ptr, v_scratch.ptr)
+        } else {
+            (
+                input_q_ptr,
+                cuptr(inputs[1].data_ptr::<u8>() as *const c_void),
+                cuptr(inputs[2].data_ptr::<u8>() as *const c_void),
+            )
+        };
         launch_1d!(
             self.runtime,
             "gqa_transpose_bsh_to_bnsh",
-            q.numel(),
+            batch * q_seq * q_hidden,
             builder,
             {
                 builder
@@ -606,43 +721,59 @@ impl GroupQueryAttentionKernel {
             }
         );
 
-        let past_k_ptr = has_past_key
-            .then(|| cuptr(inputs[3].data_ptr::<u8>() as *const c_void))
-            .unwrap_or(0);
-        let past_v_ptr = has_past_value
-            .then(|| cuptr(inputs[4].data_ptr::<u8>() as *const c_void))
-            .unwrap_or(0);
+        let past_k_ptr = if has_past_key {
+            cuptr(inputs[3].data_ptr::<u8>() as *const c_void)
+        } else {
+            0
+        };
+        let past_v_ptr = if has_past_value {
+            cuptr(inputs[4].data_ptr::<u8>() as *const c_void)
+        } else {
+            0
+        };
         for (current, past, present) in [
-            (
-                cuptr(k.data_ptr::<u8>() as *const c_void),
-                past_k_ptr,
-                present_k_ptr,
-            ),
-            (
-                cuptr(v.data_ptr::<u8>() as *const c_void),
-                past_v_ptr,
-                present_v_ptr,
-            ),
+            (k_ptr, past_k_ptr, present_k_ptr),
+            (v_ptr, past_v_ptr, present_v_ptr),
         ] {
-            launch_1d!(
-                self.runtime,
-                "gqa_build_cache",
-                expected_cache_shape.iter().product::<usize>(),
-                builder,
-                {
-                    builder
-                        .arg(&current)
-                        .arg(&past)
-                        .arg(&present)
-                        .arg(&past_lengths_gpu.ptr)
-                        .arg(&batch_i)
-                        .arg(&k_seq_i)
-                        .arg(&kv_heads_i)
-                        .arg(&dim_i)
-                        .arg(&past_capacity_i)
-                        .arg(&present_capacity_i);
-                }
-            );
+            if past != 0 && past == present && past_capacity == present_capacity {
+                launch_1d!(
+                    self.runtime,
+                    "gqa_append_cache",
+                    batch * self.kv_num_heads * k_seq * dim,
+                    builder,
+                    {
+                        builder
+                            .arg(&current)
+                            .arg(&present)
+                            .arg(&past_lengths_gpu.ptr)
+                            .arg(&batch_i)
+                            .arg(&k_seq_i)
+                            .arg(&kv_heads_i)
+                            .arg(&dim_i)
+                            .arg(&present_capacity_i);
+                    }
+                );
+            } else {
+                launch_1d!(
+                    self.runtime,
+                    "gqa_build_cache",
+                    expected_cache_shape.iter().product::<usize>(),
+                    builder,
+                    {
+                        builder
+                            .arg(&current)
+                            .arg(&past)
+                            .arg(&present)
+                            .arg(&past_lengths_gpu.ptr)
+                            .arg(&batch_i)
+                            .arg(&k_seq_i)
+                            .arg(&kv_heads_i)
+                            .arg(&dim_i)
+                            .arg(&past_capacity_i)
+                            .arg(&present_capacity_i);
+                    }
+                );
+            }
         }
 
         if self.do_rotary {
