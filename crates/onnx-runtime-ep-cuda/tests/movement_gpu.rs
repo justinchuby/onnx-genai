@@ -85,6 +85,10 @@ fn run_gather(
     graph.add_output(output);
     let model = Model::new(&graph);
     let kernel = ep.get_kernel(model.graph.node(node), &[], 13).unwrap();
+    assert!(
+        !kernel.cuda_graph_compatible(),
+        "Gather performs synchronous index validation and must not be CUDA-graph capturable"
+    );
 
     let data_buffer = upload(ep, &bytes(data));
     let index_buffer = upload(ep, index_bytes);

@@ -223,6 +223,9 @@ impl Kernel for GatherKernel {
     }
 
     fn cuda_graph_compatible(&self) -> bool {
-        true
+        // Runtime index validation uses a synchronous D2H copy, and execution
+        // synchronizes the stream before returning. Neither is legal during
+        // CUDA graph capture.
+        false
     }
 }
