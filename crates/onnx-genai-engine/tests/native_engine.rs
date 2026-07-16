@@ -1,13 +1,15 @@
 #![cfg(feature = "native-backend")]
 
 use onnx_genai_engine::{
-    Engine, EngineConfig, EngineDecodeBackend, GeneratePrompt, GenerateRequest,
+    Engine, EngineConfig, EngineDecodeBackend, GeneratePrompt, GenerateRequest, SpeculativeMode,
 };
+use onnx_genai_ort::{ExecutionProvider, SessionOptions};
 use std::path::Path;
 
 #[test]
 fn engine_generates_through_explicit_native_backend() -> anyhow::Result<()> {
-    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-native-engine");
+    let fixture =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-native-engine");
     let mut engine = Engine::from_dir(
         &fixture,
         EngineConfig {
@@ -32,4 +34,64 @@ fn engine_generates_through_explicit_native_backend() -> anyhow::Result<()> {
     assert_eq!(streamed, result.token_ids);
     assert!(engine.create_session().is_err());
     Ok(())
+}
+
+#[test]
+fn native_backend_rejects_request_level_speculation() -> anyhow::Result<()> {
+    let fixture =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-native-engine");
+    let mut engine = Engine::from_dir(
+        &fixture,
+        EngineConfig {
+            decode_backend: EngineDecodeBackend::Native,
+            ..EngineConfig::default()
+        },
+    )?;
+    let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(vec![0]));
+    request.options.speculative_mode = Some(SpeculativeMode::PromptLookup {
+        ngram: 2,
+        max_tokens: 2,
+    });
+
+    let error = engine
+        .generate(request)
+        .expect_err("native backend must reject request-level speculation");
+    assert!(
+        error
+            .to_string()
+            .contains("does not support per-request prompt-lookup speculative decoding")
+    );
+
+    let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(vec![0]));
+    request.options.num_speculative_tokens = Some(2);
+    let error = engine
+        .generate(request)
+        .expect_err("native backend must reject request-level speculative width");
+    assert!(
+        error
+            .to_string()
+            .contains("does not support the per-request num_speculative_tokens option")
+    );
+    Ok(())
+}
+
+#[test]
+fn native_backend_rejects_non_cpu_session_options() {
+    let fixture =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-native-engine");
+    let error = Engine::from_dir_with_session_options(
+        &fixture,
+        EngineConfig {
+            decode_backend: EngineDecodeBackend::Native,
+            ..EngineConfig::default()
+        },
+        SessionOptions::with_execution_provider(ExecutionProvider::WebGpu),
+    )
+    .err()
+    .expect("native backend must reject non-CPU session options");
+    assert!(
+        error
+            .to_string()
+            .contains("native decoder backend supports only CPU session execution")
+    );
 }

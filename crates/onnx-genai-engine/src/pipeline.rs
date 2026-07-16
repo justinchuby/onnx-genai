@@ -4,17 +4,21 @@ use crate::decode::{
     DecodeState, clone_value, extract_next_token_logits, run_decode_step_with_extra,
 };
 use crate::decode_loop::{DecodeLoopBackend, DecodeLoopState, run_decode_loop};
-use crate::engine::{Engine, EngineConfig};
+use crate::engine::{Engine, EngineConfig, model_requires_native_backend};
 use crate::kv_bridge::infer_kv_model_info;
 use crate::logits::TokenId;
 use crate::processors::build_processor_chain;
-use crate::{GeneratePrompt, GenerateRequest, GenerateResult, GenerateTokenCallback};
+use crate::{
+    EngineDecodeBackend, GeneratePrompt, GenerateRequest, GenerateResult, GenerateTokenCallback,
+};
 use anyhow::Context;
 use onnx_genai_metadata::{
     DataflowEdge, PhaseRunOn, PipelineSpec, PipelineStrategy, PipelineStrategyKind,
     PipelineVisionConfig,
 };
-use onnx_genai_ort::{PipelineModels, Session, SessionOptions, Tokenizer, Value};
+use onnx_genai_ort::{
+    PipelineModelDirectory, PipelineModels, Session, SessionOptions, Tokenizer, Value,
+};
 use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 
@@ -90,6 +94,20 @@ impl PipelineEngine {
     }
 
     pub fn from_dir_with_config(pipeline_dir: &Path, config: EngineConfig) -> anyhow::Result<Self> {
+        if config.decode_backend == EngineDecodeBackend::Native {
+            anyhow::bail!("native backend not supported for pipeline models");
+        }
+        if config.decode_backend == EngineDecodeBackend::Auto {
+            let directory = PipelineModelDirectory::load(pipeline_dir)
+                .map_err(|e| anyhow::anyhow!("Failed to resolve pipeline models: {}", e))?;
+            for (component, model_path) in &directory.model_paths {
+                if model_requires_native_backend(model_path)? {
+                    anyhow::bail!(
+                        "native backend not supported for pipeline models: component '{component}' requires the native backend"
+                    );
+                }
+            }
+        }
         let models = PipelineModels::load_with_options(pipeline_dir, SessionOptions::default())
             .map_err(|e| anyhow::anyhow!("Failed to load pipeline models: {}", e))?;
         let plan = PipelinePlan::from_spec(&models.directory.spec)?;
@@ -564,6 +582,78 @@ mod tests {
             device_preference: None,
             tokenizer: None,
         }
+    }
+
+    #[test]
+    fn explicit_native_backend_is_rejected_before_loading_pipeline_models() {
+        let error = PipelineEngine::from_dir_with_config(
+            Path::new("does-not-need-to-exist"),
+            EngineConfig {
+                decode_backend: EngineDecodeBackend::Native,
+                ..EngineConfig::default()
+            },
+        )
+        .err()
+        .expect("native pipeline backend must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("native backend not supported for pipeline models")
+        );
+    }
+
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn auto_backend_rejects_pipeline_component_requiring_native() -> anyhow::Result<()> {
+        use onnx_runtime_loader::proto::{
+            ModelProto,
+            onnx::{GraphProto, NodeProto, OperatorSetIdProto},
+        };
+        use prost::Message;
+
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/test-fixtures/pipeline-native-backend-rejection");
+        std::fs::create_dir_all(&root)?;
+        let model = ModelProto {
+            opset_import: vec![OperatorSetIdProto {
+                domain: "com.github.onnxruntime.genai".to_string(),
+                version: 1,
+            }],
+            graph: Some(GraphProto {
+                node: vec![NodeProto {
+                    domain: "com.github.onnxruntime.genai".to_string(),
+                    op_type: "BlockQuantizedMatMul".to_string(),
+                    ..NodeProto::default()
+                }],
+                ..GraphProto::default()
+            }),
+            ..ModelProto::default()
+        };
+        std::fs::write(root.join("decoder.onnx"), model.encode_to_vec())?;
+        std::fs::write(
+            root.join("inference_metadata.yaml"),
+            r#"
+pipeline:
+  models:
+    decoder:
+      filename: decoder.onnx
+      type: decoder
+  dataflow: []
+  strategy:
+    kind: autoregressive
+    decoder: decoder
+"#,
+        )?;
+
+        let error = PipelineEngine::from_dir_with_config(&root, EngineConfig::default())
+            .err()
+            .expect("Auto must reject native-only pipeline components");
+        assert!(
+            error
+                .to_string()
+                .contains("native backend not supported for pipeline models")
+        );
+        Ok(())
     }
 
     #[test]

@@ -314,7 +314,7 @@ impl Engine {
         let decode_backend =
             resolve_decode_backend(&model_directory.model_path, config.decode_backend)?;
         if decode_backend == EngineDecodeBackend::Native {
-            return Self::from_native_model_directory(model_directory, config);
+            return Self::from_native_model_directory(model_directory, config, &session_options);
         }
 
         let environment = Environment::new("onnx-genai-engine")
@@ -732,6 +732,7 @@ impl Engine {
     fn from_native_model_directory(
         model_directory: ModelDirectory,
         config: EngineConfig,
+        session_options: &SessionOptions,
     ) -> anyhow::Result<Self> {
         if config.draft_model.is_some() || !matches!(config.speculative_mode, SpeculativeMode::None)
         {
@@ -741,6 +742,16 @@ impl Engine {
         }
         if !matches!(&config.kv_connector.backend, KvConnectorBackend::Null) {
             anyhow::bail!("native decoder backend does not yet support external KV connectors");
+        }
+        if !session_options
+            .execution_providers
+            .iter()
+            .all(|provider| matches!(provider, onnx_genai_ort::ExecutionProvider::Cpu))
+        {
+            anyhow::bail!(
+                "native decoder backend supports only CPU session execution; requested execution providers: {:?}",
+                session_options.execution_providers
+            );
         }
 
         let metadata = if let Some(metadata_path) = &model_directory.metadata_path {
@@ -819,6 +830,7 @@ impl Engine {
     fn from_native_model_directory(
         _model_directory: ModelDirectory,
         _config: EngineConfig,
+        _session_options: &SessionOptions,
     ) -> anyhow::Result<Self> {
         anyhow::bail!(
             "native decoder backend requires building onnx-genai-engine with the 'native-backend' feature"
@@ -832,6 +844,7 @@ impl Engine {
         callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
         self.last_speculative_stats = SpeculativeStats::default();
+        reject_native_request_speculation(&request.options)?;
         request.options.validate()?;
         let mut options = request.options;
         if options.eos_token_id.is_none() {
@@ -1927,7 +1940,7 @@ fn resolve_decode_backend(
     }
 }
 
-fn model_requires_native_backend(model_path: &Path) -> anyhow::Result<bool> {
+pub(crate) fn model_requires_native_backend(model_path: &Path) -> anyhow::Result<bool> {
     #[cfg(feature = "native-backend")]
     {
         use prost::Message;
@@ -1951,12 +1964,44 @@ fn model_requires_native_backend(model_path: &Path) -> anyhow::Result<bool> {
 
 #[cfg(feature = "native-backend")]
 fn model_proto_requires_native_backend(model: &onnx_runtime_loader::proto::ModelProto) -> bool {
-    model.graph.as_ref().is_some_and(|graph| {
-        graph
-            .node
-            .iter()
-            .any(|node| node.op_type == "BlockQuantizedMatMul")
-    })
+    const DOMAIN: &str = "com.github.onnxruntime.genai";
+    const OP_TYPE: &str = "BlockQuantizedMatMul";
+    const OPSET_VERSION: i64 = 1;
+
+    let supports_native_opset = model
+        .opset_import
+        .iter()
+        .any(|opset| opset.domain == DOMAIN && opset.version == OPSET_VERSION);
+    supports_native_opset
+        && model.graph.as_ref().is_some_and(|graph| {
+            graph
+                .node
+                .iter()
+                .any(|node| node.domain == DOMAIN && node.op_type == OP_TYPE)
+        })
+}
+
+#[cfg(feature = "native-backend")]
+fn reject_native_request_speculation(options: &GenerateOptions) -> anyhow::Result<()> {
+    let requested_mode = match options.speculative_mode.as_ref() {
+        None | Some(SpeculativeMode::None) => None,
+        Some(SpeculativeMode::DraftModel) => Some("draft-model"),
+        Some(SpeculativeMode::PromptLookup { .. }) => Some("prompt-lookup"),
+        Some(SpeculativeMode::Mtp(_)) => Some("MTP"),
+        Some(SpeculativeMode::Eagle3(_)) => Some("EAGLE-3"),
+        Some(SpeculativeMode::SharedKv(_)) => Some("shared-KV"),
+    };
+    if let Some(mode) = requested_mode {
+        anyhow::bail!(
+            "native decoder backend does not support per-request {mode} speculative decoding"
+        );
+    }
+    if options.num_speculative_tokens.is_some() {
+        anyhow::bail!(
+            "native decoder backend does not support the per-request num_speculative_tokens option"
+        );
+    }
+    Ok(())
 }
 
 fn default_inference_metadata() -> InferenceMetadata {
@@ -2121,7 +2166,7 @@ mod tests {
     fn auto_backend_detection_reads_onnx_node_types_not_incidental_strings() {
         use onnx_runtime_loader::proto::{
             ModelProto,
-            onnx::{GraphProto, NodeProto},
+            onnx::{GraphProto, NodeProto, OperatorSetIdProto},
         };
 
         let mut model = ModelProto {
@@ -2132,10 +2177,22 @@ mod tests {
         assert!(!model_proto_requires_native_backend(&model));
 
         model.graph.as_mut().unwrap().node.push(NodeProto {
+            domain: "com.github.onnxruntime.genai".to_string(),
             op_type: "BlockQuantizedMatMul".to_string(),
             ..NodeProto::default()
         });
+        model.opset_import.push(OperatorSetIdProto {
+            domain: "com.github.onnxruntime.genai".to_string(),
+            version: 1,
+        });
         assert!(model_proto_requires_native_backend(&model));
+
+        model.graph.as_mut().unwrap().node[0].domain = "example.wrong.domain".to_string();
+        assert!(!model_proto_requires_native_backend(&model));
+
+        model.graph.as_mut().unwrap().node[0].domain = "com.github.onnxruntime.genai".to_string();
+        model.opset_import[0].version = 2;
+        assert!(!model_proto_requires_native_backend(&model));
     }
 
     fn test_capacities() -> CapacityProviders {
