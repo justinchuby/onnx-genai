@@ -3,15 +3,11 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD as BASE64;
 use onnx_runtime_ir::{
     Attribute, DataType, Dim, Graph, Node, NodeId, Shape, SparseTensorData, TensorData, TypeProto,
     ValueId, WeightRef,
 };
 use onnx_runtime_loader::ModelMetadata;
-use onnx_runtime_loader::proto::ModelProto;
-use prost::Message;
 
 use crate::error::{Error, Result};
 use crate::model::Model;
@@ -34,7 +30,13 @@ struct Parser<'a> {
 /// printed dtype and shape; external initializers retain their external kind
 /// but necessarily use an empty path and zero offset.
 pub fn from_text(source: &str) -> Result<Model> {
-    Parser::new(source).parse()
+    let (source, extension) = super::extensions::split(source)?;
+    let model = Parser::new(source).parse()?;
+    let Some(extension) = extension else {
+        return Ok(model);
+    };
+    let native = model.to_proto()?;
+    Model::from_proto(super::extensions::merge(extension, native))
 }
 
 impl<'a> Parser<'a> {
@@ -61,7 +63,6 @@ impl<'a> Parser<'a> {
 
         let mut metadata = ModelMetadata::default();
         let mut imports = HashMap::new();
-        let mut retained_proto = None;
         loop {
             let line = self.next()?;
             if line.text == ">" {
@@ -73,23 +74,9 @@ impl<'a> Parser<'a> {
                     .map_err(|_| self.error(line.number, "invalid ir_version"))?;
             } else if let Some(value) = line.text.strip_prefix("opset_import:") {
                 imports = parse_opset_imports(value.trim(), line.number)?;
-            } else if let Some(value) = line.text.strip_prefix("proto:") {
-                let encoded: String = serde_yaml::from_str(trim_comma(value).trim())
-                    .map_err(|error| self.error(line.number, format!("invalid proto: {error}")))?;
-                let bytes = BASE64
-                    .decode(encoded)
-                    .map_err(|error| self.error(line.number, format!("invalid proto: {error}")))?;
-                retained_proto =
-                    Some(ModelProto::decode(bytes.as_slice()).map_err(|error| {
-                        self.error(line.number, format!("invalid proto: {error}"))
-                    })?);
             } else {
                 return self.fail(line.number, "unknown model header field");
             }
-        }
-
-        if let Some(proto) = retained_proto {
-            return Model::from_proto(proto);
         }
 
         let (graph_name, mut graph) = self.parse_graph()?;
@@ -424,6 +411,40 @@ fn parse_attribute(text: &str, line: usize) -> Result<Attribute> {
     }
     if let Some(count) = text
         .strip_prefix('<')
+        .and_then(|value| value.strip_suffix(" sparse tensors>"))
+    {
+        let count = parse_placeholder_count(count, line, "sparse-tensor-list")?;
+        return Ok(Attribute::SparseTensors(
+            (0..count).map(|_| empty_sparse_tensor()).collect(),
+        ));
+    }
+    if let Some(count) = text
+        .strip_prefix('<')
+        .and_then(|value| value.strip_suffix(" tensors>"))
+    {
+        let count = parse_placeholder_count(count, line, "tensor-list")?;
+        return Ok(Attribute::Tensors(
+            (0..count)
+                .map(|_| TensorData::from_raw(DataType::Float32, Vec::new(), Vec::new()))
+                .collect(),
+        ));
+    }
+    if let Some(count) = text
+        .strip_prefix('<')
+        .and_then(|value| value.strip_suffix(" types>"))
+    {
+        let count = parse_placeholder_count(count, line, "type-list")?;
+        return Ok(Attribute::TypeProtos(
+            (0..count)
+                .map(|_| TypeProto::Tensor {
+                    dtype: DataType::Float32,
+                    shape: Vec::new(),
+                })
+                .collect(),
+        ));
+    }
+    if let Some(count) = text
+        .strip_prefix('<')
         .and_then(|v| v.strip_suffix(" bytes>"))
     {
         let count = count
@@ -442,12 +463,7 @@ fn parse_attribute(text: &str, line: usize) -> Result<Attribute> {
         return Ok(Attribute::Tensor(typed));
     }
     if text == "<sparse tensor>" {
-        let empty = TensorData::from_raw(DataType::Float32, vec![0], Vec::new());
-        return Ok(Attribute::SparseTensor(SparseTensorData {
-            values: empty.clone(),
-            indices: TensorData::from_raw(DataType::Int64, vec![0], Vec::new()),
-            dims: Vec::new(),
-        }));
+        return Ok(Attribute::SparseTensor(empty_sparse_tensor()));
     }
     if text == "<type>" {
         return Ok(Attribute::TypeProto(TypeProto::Tensor {
@@ -461,6 +477,24 @@ fn parse_attribute(text: &str, line: usize) -> Result<Attribute> {
     text.parse::<i64>()
         .map(Attribute::Int)
         .map_err(|_| parse_error(line, "unrecognized attribute value"))
+}
+
+fn parse_placeholder_count(text: &str, line: usize, kind: &str) -> Result<usize> {
+    let count = text
+        .parse::<usize>()
+        .map_err(|_| parse_error(line, format!("invalid {kind} reference")))?;
+    if count > 1_000_000 {
+        return Err(parse_error(line, format!("{kind} reference is too large")));
+    }
+    Ok(count)
+}
+
+fn empty_sparse_tensor() -> SparseTensorData {
+    SparseTensorData {
+        values: TensorData::from_raw(DataType::Float32, vec![0], Vec::new()),
+        indices: TensorData::from_raw(DataType::Int64, vec![0], Vec::new()),
+        dims: Vec::new(),
+    }
 }
 
 fn parse_tensor_reference(text: &str, line: usize) -> Result<TensorData> {
@@ -674,6 +708,9 @@ fn parse_dtype(text: &str, line: usize) -> Result<DataType> {
         "uint4" => DataType::Uint4,
         "int4" => DataType::Int4,
         "float4e2m1" => DataType::Float4E2M1,
+        "float8e8m0" => DataType::Float8E8M0,
+        "uint2" => DataType::Uint2,
+        "int2" => DataType::Int2,
         _ => return Err(parse_error(line, format!("unknown dtype '{text}'"))),
     };
     Ok(dtype)

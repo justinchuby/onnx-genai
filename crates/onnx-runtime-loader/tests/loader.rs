@@ -6,7 +6,7 @@
 
 use prost::Message;
 
-use onnx_runtime_ir::{DataType, Dim, Graph, WeightRef};
+use onnx_runtime_ir::{Attribute, DataType, Dim, Graph, WeightRef};
 use onnx_runtime_loader::{proto::onnx, LoaderError};
 
 // --- proto construction helpers ---
@@ -367,8 +367,7 @@ fn reshape_uses_constant_shape_initializer() {
 /// must produce a clean `LoaderError`, never a panic or a silent Float32.
 #[test]
 fn unknown_initializer_dtype_is_load_error() {
-    // 14 = COMPLEX64 (unsupported); 99 = out-of-range/future value.
-    for bad in [14i32, 99] {
+    for bad in [27i32, 99] {
         let mut init = f32_initializer("W", &[2, 2]);
         init.data_type = bad;
         let g = onnx::GraphProto {
@@ -393,8 +392,7 @@ fn unknown_initializer_dtype_is_load_error() {
 /// dtype must fail closed with a clean `LoaderError`, never a silent Float32.
 #[test]
 fn unknown_value_info_dtype_is_load_error() {
-    // 14 = COMPLEX64 (unsupported); 99 = out-of-range/future value.
-    for bad in [14i32, 99] {
+    for bad in [27i32, 99] {
         let g = onnx::GraphProto {
             input: vec![value_info("X", bad, &[Dimlike::Static(2)])],
             output: vec![value_info("Y", 1, &[Dimlike::Static(2)])],
@@ -420,7 +418,7 @@ fn unknown_value_info_dtype_is_load_error() {
 /// unmodeled ONNX dtype must fail closed, never be silently mislabeled Float32.
 #[test]
 fn unknown_attribute_tensor_dtype_is_load_error() {
-    for bad in [14i32, 99] {
+    for bad in [27i32, 99] {
         let t = onnx::TensorProto {
             name: "k".to_string(),
             data_type: bad,
@@ -454,11 +452,9 @@ fn unknown_attribute_tensor_dtype_is_load_error() {
     }
 }
 
-/// A node attribute whose type is a tensor/type-proto list (which the IR does
-/// not model) must error rather than be silently dropped.
+/// Tensor-list attributes are preserved rather than silently dropped.
 #[test]
-fn unmodeled_list_attribute_is_load_error() {
-    // AttributeType::TENSORS = 9.
+fn tensor_list_attribute_is_preserved() {
     let attr = onnx::AttributeProto {
         name: "vals".to_string(),
         r#type: onnx::attribute_proto::AttributeType::Tensors as i32,
@@ -477,12 +473,15 @@ fn unmodeled_list_attribute_is_load_error() {
         ..Default::default()
     };
     let bytes = model(g, 17);
-    let err = onnx_runtime_loader::load_model_bytes(&bytes)
-        .expect_err("unmodeled list attribute must be a load error");
-    assert!(
-        err.to_string().contains("unmodeled"),
-        "error should flag the unmodeled attribute, got: {err}"
-    );
+    let graph = onnx_runtime_loader::load_model_bytes(&bytes).expect("load tensor-list attribute");
+    let node = graph.nodes.values().next().expect("node");
+    assert!(matches!(
+        node.attr("vals"),
+        Some(Attribute::Tensors(tensors))
+            if tensors.len() == 1
+                && tensors[0].dtype == DataType::Float32
+                && tensors[0].dims == [1]
+    ));
 }
 
 #[test]

@@ -131,8 +131,8 @@ impl Model {
         self.source_proto = None;
     }
 
-    pub(crate) fn retained_proto_bytes(&self) -> Option<Vec<u8>> {
-        self.source_proto.as_ref().map(Message::encode_to_vec)
+    pub(crate) fn retained_proto(&self) -> Option<&ModelProto> {
+        self.source_proto.as_ref()
     }
 
     /// Render this model as a human-readable textual dump (ONNX_RS §5).
@@ -306,10 +306,12 @@ mod tests {
 
     #[test]
     fn save_then_load_round_trips_structure_and_metadata() {
-        let mut meta = ModelMetadata::default();
-        meta.producer_name = "onnx-rs-test".to_string();
-        meta.graph_name = "g".to_string();
-        meta.metadata_props = vec![("author".to_string(), "deckard".to_string())];
+        let meta = ModelMetadata {
+            producer_name: "onnx-rs-test".to_string(),
+            graph_name: "g".to_string(),
+            metadata_props: vec![("author".to_string(), "deckard".to_string())],
+            ..Default::default()
+        };
         let model = Model::with_metadata(add_graph(), meta.clone());
 
         let dir = std::env::current_dir().unwrap().join("target");

@@ -9,7 +9,6 @@ keywords = ["onnx", "protobuf", "validation", "ir"]
 categories = ["science", "parser-implementations"]
 
 [dependencies]
-base64 = "0.22"
 onnx-runtime-ir = { workspace = true }
 onnx-runtime-loader = { workspace = true }
 onnx-runtime-shape-inference = { workspace = true }

@@ -4,9 +4,11 @@ use onnx_rs::{Json, Model, Text, TextCodec, TextProto, load_model, save_model};
 use onnx_runtime_loader::proto::{
     FILE_DESCRIPTOR_SET,
     onnx::{
-        AttributeProto, FunctionProto, GraphProto, ModelProto, NodeProto, OperatorSetIdProto,
-        SparseTensorProto, StringStringEntryProto, TensorAnnotation, TensorProto, TensorShapeProto,
-        TrainingInfoProto, TypeProto, ValueInfoProto, attribute_proto, tensor_proto,
+        AttributeProto, DeviceConfigurationProto, FunctionProto, GraphProto, IntIntListEntryProto,
+        ModelProto, NodeDeviceConfigurationProto, NodeProto, OperatorSetIdProto, ShardedDimProto,
+        ShardingSpecProto, SimpleShardedDimProto, SparseTensorProto, StringStringEntryProto,
+        TensorAnnotation, TensorProto, TensorShapeProto, TrainingInfoProto, TypeProto,
+        ValueInfoProto, attribute_proto, simple_sharded_dim_proto, tensor_proto,
         tensor_shape_proto, type_proto,
     },
 };
@@ -38,6 +40,9 @@ const ALL_DTYPES: &[tensor_proto::DataType] = &[
     tensor_proto::DataType::Uint4,
     tensor_proto::DataType::Int4,
     tensor_proto::DataType::Float4e2m1,
+    tensor_proto::DataType::Float8e8m0,
+    tensor_proto::DataType::Uint2,
+    tensor_proto::DataType::Int2,
 ];
 
 fn entry(key: &str, value: &str) -> StringStringEntryProto {
@@ -113,6 +118,10 @@ fn typed_tensor(dtype: tensor_proto::DataType, name: String) -> TensorProto {
         | tensor_proto::DataType::Float4e2m1 => {
             tensor.dims = vec![2];
             tensor.int32_data = vec![0x21];
+        }
+        tensor_proto::DataType::Uint2 | tensor_proto::DataType::Int2 => {
+            tensor.dims = vec![4];
+            tensor.int32_data = vec![0b11_10_01_00];
         }
         _ => tensor.int32_data = vec![1],
     }
@@ -273,7 +282,7 @@ fn full_spec_proto() -> ModelProto {
     ];
 
     ModelProto {
-        ir_version: 11,
+        ir_version: 13,
         opset_import: vec![
             OperatorSetIdProto {
                 domain: String::new(),
@@ -300,6 +309,34 @@ fn full_spec_proto() -> ModelProto {
                 attribute: attributes,
                 doc_string: "node documentation".into(),
                 metadata_props: vec![entry("node-key", "node-value")],
+                device_configurations: vec![NodeDeviceConfigurationProto {
+                    configuration_id: "mesh".into(),
+                    sharding_spec: vec![ShardingSpecProto {
+                        tensor_name: "Y".into(),
+                        device: vec![0, 1, 2, 3],
+                        index_to_device_group_map: vec![IntIntListEntryProto {
+                            key: 4,
+                            value: vec![0, 2],
+                        }],
+                        sharded_dim: vec![
+                            ShardedDimProto {
+                                axis: 0,
+                                simple_sharding: vec![SimpleShardedDimProto {
+                                    dim: Some(simple_sharded_dim_proto::Dim::DimValue(4)),
+                                    num_shards: 4,
+                                }],
+                            },
+                            ShardedDimProto {
+                                axis: 1,
+                                simple_sharding: vec![SimpleShardedDimProto {
+                                    dim: Some(simple_sharded_dim_proto::Dim::DimParam("N".into())),
+                                    num_shards: 2,
+                                }],
+                            },
+                        ],
+                    }],
+                    pipeline_stage: 2,
+                }],
             }],
             name: "full_graph".into(),
             initializer: {
@@ -320,12 +357,20 @@ fn full_spec_proto() -> ModelProto {
             },
             sparse_initializer: vec![sparse],
             doc_string: "graph documentation".into(),
-            input: vec![ValueInfoProto {
-                name: "cond".into(),
-                r#type: Some(tensor_type(tensor_proto::DataType::Bool, &[])),
-                doc_string: "condition".into(),
-                metadata_props: vec![entry("value-key", "value-value")],
-            }],
+            input: vec![
+                ValueInfoProto {
+                    name: "cond".into(),
+                    r#type: Some(tensor_type(tensor_proto::DataType::Bool, &[])),
+                    doc_string: "condition".into(),
+                    metadata_props: vec![entry("value-key", "value-value")],
+                },
+                ValueInfoProto {
+                    name: "sequence_input".into(),
+                    r#type: Some(nested_types[2].clone()),
+                    doc_string: "container input".into(),
+                    metadata_props: vec![entry("kind", "sequence")],
+                },
+            ],
             output: vec![ValueInfoProto {
                 name: "Y".into(),
                 r#type: Some(tensor_type(tensor_proto::DataType::Float, &[1])),
@@ -400,6 +445,16 @@ fn full_spec_proto() -> ModelProto {
             }],
             metadata_props: vec![entry("function-key", "function-value")],
         }],
+        configuration: vec![DeviceConfigurationProto {
+            name: "mesh".into(),
+            num_devices: 4,
+            device: vec![
+                "cuda:0".into(),
+                "cuda:1".into(),
+                "cuda:2".into(),
+                "cuda:3".into(),
+            ],
+        }],
     }
 }
 
@@ -419,11 +474,17 @@ fn descriptor_inventory_is_the_complete_bound_spec() {
         .collect();
     let expected_messages: BTreeSet<_> = [
         "onnx.AttributeProto",
+        "onnx.DeviceConfigurationProto",
         "onnx.FunctionProto",
         "onnx.GraphProto",
+        "onnx.IntIntListEntryProto",
         "onnx.ModelProto",
+        "onnx.NodeDeviceConfigurationProto",
         "onnx.NodeProto",
         "onnx.OperatorSetIdProto",
+        "onnx.ShardedDimProto",
+        "onnx.ShardingSpecProto",
+        "onnx.SimpleShardedDimProto",
         "onnx.SparseTensorProto",
         "onnx.StringStringEntryProto",
         "onnx.TensorAnnotation",
@@ -463,16 +524,17 @@ fn descriptor_inventory_is_the_complete_bound_spec() {
 
     assert!(
         pool.get_message_by_name("onnx.DeviceConfigurationProto")
-            .is_none()
+            .is_some()
     );
     assert!(
         pool.get_message_by_name("onnx.NodeDeviceConfigurationProto")
-            .is_none()
+            .is_some()
     );
-    assert!(pool.get_message_by_name("onnx.ShardingSpecProto").is_none());
+    assert!(pool.get_message_by_name("onnx.ShardingSpecProto").is_some());
     let dtype = pool.get_enum_by_name("onnx.TensorProto.DataType").unwrap();
-    assert!(dtype.get_value_by_name("INT2").is_none());
-    assert!(dtype.get_value_by_name("UINT2").is_none());
+    assert!(dtype.get_value_by_name("FLOAT8E8M0").is_some());
+    assert!(dtype.get_value_by_name("INT2").is_some());
+    assert!(dtype.get_value_by_name("UINT2").is_some());
 }
 
 #[test]
@@ -521,6 +583,9 @@ fn every_bound_dtype_round_trips_typed_and_raw_payloads() {
     assert_eq!(onnx_rs::ir::DataType::Complex64.to_onnx(), 14);
     assert_eq!(onnx_rs::ir::DataType::Complex128.to_onnx(), 15);
     assert_eq!(onnx_rs::ir::DataType::Undefined.to_onnx(), 0);
+    assert_eq!(onnx_rs::ir::DataType::Float8E8M0.to_onnx(), 24);
+    assert_eq!(onnx_rs::ir::DataType::Uint2.storage_bytes(5), 2);
+    assert_eq!(onnx_rs::ir::DataType::Int2.storage_bytes(5), 2);
 }
 
 #[test]
@@ -533,6 +598,8 @@ fn full_spec_is_lossless_across_all_three_textual_codecs() {
     assert!(json.contains("\"functions\""));
     assert!(json.contains("\"sparseInitializer\""));
     assert!(json.contains("\"quantizationAnnotation\""));
+    assert!(json.contains("\"configuration\""));
+    assert!(json.contains("\"deviceConfigurations\""));
     let from_json = Json::deserialize(&json).unwrap();
     assert_proto_equal(&proto, &from_json);
 
@@ -541,11 +608,19 @@ fn full_spec_is_lossless_across_all_three_textual_codecs() {
     assert!(textproto.contains("functions"));
     assert!(textproto.contains("sparse_initializer"));
     assert!(textproto.contains("type_protos"));
+    assert!(textproto.contains("device_configurations"));
+    assert!(textproto.contains("sharding_spec"));
     let from_textproto = TextProto::deserialize(&textproto).unwrap();
     assert_proto_equal(&proto, &from_textproto);
 
     let text = Text::serialize(&from_textproto, &Default::default()).unwrap();
-    assert!(text.contains("proto:"));
+    assert!(
+        !text
+            .lines()
+            .any(|line| line.trim_start().starts_with("proto:"))
+    );
+    assert!(text.contains("__onnx_extensions_begin__"));
+    assert!(text.contains("device_configurations"));
     let from_text = Text::deserialize(&text).unwrap();
     assert_proto_equal(&proto, &from_text);
 
@@ -554,6 +629,23 @@ fn full_spec_is_lossless_across_all_three_textual_codecs() {
         serde_json::from_str::<serde_json::Value>(&json_again).unwrap(),
         serde_json::from_str::<serde_json::Value>(&json).unwrap()
     );
+}
+
+#[test]
+fn readable_body_edits_are_authoritative_over_extensions() {
+    let proto = full_spec_proto();
+    let model = Model::from_proto(proto).unwrap();
+    let text = Text::serialize(&model, &Default::default()).unwrap();
+    let edited = text.replacen("full_graph (", "edited_graph (", 1);
+    assert_ne!(edited, text);
+
+    let parsed = Text::deserialize(&edited).unwrap();
+    let parsed_proto = parsed.to_proto().unwrap();
+    let graph = parsed_proto.graph.as_ref().unwrap();
+    assert_eq!(graph.name, "edited_graph");
+    let node = &graph.node[0];
+    assert_eq!(node.device_configurations.len(), 1);
+    assert_eq!(parsed_proto.configuration[0].name, "mesh");
 }
 
 #[test]

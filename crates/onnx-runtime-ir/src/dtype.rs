@@ -31,6 +31,9 @@ pub enum DataType {
     Uint4 = 21,
     Int4 = 22,
     Float4E2M1 = 23,
+    Float8E8M0 = 24,
+    Uint2 = 25,
+    Int2 = 26,
 }
 
 impl DataType {
@@ -48,8 +51,9 @@ impl DataType {
             | Self::Float8E4M3FN
             | Self::Float8E4M3FNUZ
             | Self::Float8E5M2
-            | Self::Float8E5M2FNUZ => 1,
-            Self::Int4 | Self::Uint4 | Self::Float4E2M1 => 0, // packed: 2 elements per byte
+            | Self::Float8E5M2FNUZ
+            | Self::Float8E8M0 => 1,
+            Self::Int4 | Self::Uint4 | Self::Float4E2M1 | Self::Int2 | Self::Uint2 => 0,
             Self::String | Self::Undefined => 0, // variable-width / no concrete storage
         }
     }
@@ -58,6 +62,7 @@ impl DataType {
     pub fn bit_size(self) -> usize {
         match self {
             Self::Int4 | Self::Uint4 | Self::Float4E2M1 => 4,
+            Self::Int2 | Self::Uint2 => 2,
             other => other.byte_size() * 8,
         }
     }
@@ -74,6 +79,7 @@ impl DataType {
                 | Self::Float8E4M3FNUZ
                 | Self::Float8E5M2
                 | Self::Float8E5M2FNUZ
+                | Self::Float8E8M0
                 | Self::Float4E2M1
         )
     }
@@ -92,6 +98,8 @@ impl DataType {
                 | Self::Uint64
                 | Self::Int4
                 | Self::Uint4
+                | Self::Int2
+                | Self::Uint2
         )
     }
 
@@ -100,13 +108,16 @@ impl DataType {
         matches!(self, Self::Complex64 | Self::Complex128)
     }
 
-    /// Whether elements are packed multiple-per-byte (4-bit types).
+    /// Whether elements are packed multiple-per-byte.
     pub fn is_sub_byte(self) -> bool {
-        matches!(self, Self::Int4 | Self::Uint4 | Self::Float4E2M1)
+        matches!(
+            self,
+            Self::Int4 | Self::Uint4 | Self::Float4E2M1 | Self::Int2 | Self::Uint2
+        )
     }
 
     /// Number of bytes needed to store `count` elements, accounting for
-    /// sub-byte packing (two 4-bit elements per byte, rounded up).
+    /// sub-byte packing.
     ///
     /// Panics on `usize` overflow of the `count * byte_size` product. Callers
     /// that size heap allocations from an untrusted shape MUST use
@@ -130,7 +141,8 @@ impl DataType {
         if self == Self::Undefined {
             None
         } else if self.is_sub_byte() {
-            Some(count.div_ceil(2))
+            let elements_per_byte = 8 / self.bit_size();
+            Some(count / elements_per_byte + usize::from(!count.is_multiple_of(elements_per_byte)))
         } else {
             count.checked_mul(self.byte_size())
         }
@@ -166,6 +178,9 @@ impl DataType {
             21 => Self::Uint4,
             22 => Self::Int4,
             23 => Self::Float4E2M1,
+            24 => Self::Float8E8M0,
+            25 => Self::Uint2,
+            26 => Self::Int2,
             _ => return None,
         })
     }
@@ -190,12 +205,14 @@ mod tests {
         assert_eq!(DataType::Bool.byte_size(), 1);
         assert_eq!(DataType::Int4.byte_size(), 0);
         assert_eq!(DataType::Int4.bit_size(), 4);
+        assert_eq!(DataType::Int2.bit_size(), 2);
     }
 
     #[test]
     fn sub_byte_storage_rounds_up() {
         assert_eq!(DataType::Int4.storage_bytes(4), 2);
         assert_eq!(DataType::Int4.storage_bytes(5), 3);
+        assert_eq!(DataType::Int2.storage_bytes(5), 2);
         assert_eq!(DataType::Float32.storage_bytes(4), 16);
     }
 
@@ -204,6 +221,7 @@ mod tests {
         assert_eq!(DataType::Float32.checked_storage_bytes(4), Some(16));
         assert_eq!(DataType::Float64.checked_storage_bytes(3), Some(24));
         assert_eq!(DataType::Int4.checked_storage_bytes(5), Some(3));
+        assert_eq!(DataType::Uint2.checked_storage_bytes(5), Some(2));
         assert_eq!(DataType::Bool.checked_storage_bytes(0), Some(0));
     }
 
@@ -221,6 +239,10 @@ mod tests {
         assert_eq!(
             DataType::Int4.checked_storage_bytes(usize::MAX),
             Some(usize::MAX / 2 + 1)
+        );
+        assert_eq!(
+            DataType::Int2.checked_storage_bytes(usize::MAX),
+            Some(usize::MAX / 4 + 1)
         );
     }
 
@@ -240,6 +262,7 @@ mod tests {
             DataType::Float8E4M3FNUZ,
             DataType::Float8E5M2,
             DataType::Float8E5M2FNUZ,
+            DataType::Float8E8M0,
             DataType::Float4E2M1,
         ] {
             assert!(dt.is_float(), "{dt:?} should be float");
@@ -248,6 +271,8 @@ mod tests {
         // 4-bit types (incl. Float4E2M1) are sub-byte; float8s are full bytes.
         assert!(DataType::Int4.is_sub_byte());
         assert!(DataType::Float4E2M1.is_sub_byte());
+        assert!(DataType::Int2.is_sub_byte());
+        assert!(DataType::Uint2.is_sub_byte());
         assert!(!DataType::Float8E5M2.is_sub_byte());
         assert!(!DataType::Float8E4M3FNUZ.is_sub_byte());
     }
@@ -271,6 +296,7 @@ mod tests {
             DataType::Float8E4M3FNUZ,
             DataType::Float8E5M2,
             DataType::Float8E5M2FNUZ,
+            DataType::Float8E8M0,
         ] {
             assert_eq!(dt.byte_size(), 1, "{dt:?} should be 1 byte");
             assert_eq!(dt.bit_size(), 8, "{dt:?} should be 8 bits");
@@ -308,6 +334,9 @@ mod tests {
             (DataType::Uint4, 21),
             (DataType::Int4, 22),
             (DataType::Float4E2M1, 23),
+            (DataType::Float8E8M0, 24),
+            (DataType::Uint2, 25),
+            (DataType::Int2, 26),
         ];
         for &(dt, raw) in table {
             assert_eq!(dt.to_onnx(), raw, "{dt:?} to_onnx mismatch");
@@ -328,6 +357,9 @@ mod tests {
             DataType::Uint4,
             DataType::Float4E2M1,
             DataType::Float8E5M2FNUZ,
+            DataType::Float8E8M0,
+            DataType::Uint2,
+            DataType::Int2,
         ] {
             assert_eq!(DataType::from_onnx(dt.to_onnx()), Some(dt));
         }
@@ -338,7 +370,7 @@ mod tests {
     #[test]
     fn unknown_raw_values_return_none() {
         // UNDEFINED and out-of-range/future values.
-        for raw in [0, 24, 100, 9999, -1, i32::MAX, i32::MIN] {
+        for raw in [0, 27, 100, 9999, -1, i32::MAX, i32::MIN] {
             assert_eq!(DataType::from_onnx(raw), None, "raw {raw} should be None");
         }
     }

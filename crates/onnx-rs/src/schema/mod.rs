@@ -409,6 +409,9 @@ mod data_types {
             "uint4" => DataType::Uint4,
             "int4" => DataType::Int4,
             "float4e2m1" => DataType::Float4E2M1,
+            "float8e8m0" => DataType::Float8E8M0,
+            "uint2" => DataType::Uint2,
+            "int2" => DataType::Int2,
             _ => return None,
         })
     }
@@ -439,6 +442,9 @@ mod data_types {
             DataType::Uint4 => "uint4",
             DataType::Int4 => "int4",
             DataType::Float4E2M1 => "float4e2m1",
+            DataType::Float8E8M0 => "float8e8m0",
+            DataType::Uint2 => "uint2",
+            DataType::Int2 => "int2",
         }
     }
 }

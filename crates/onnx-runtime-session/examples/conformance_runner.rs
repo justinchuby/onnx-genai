@@ -209,7 +209,10 @@ fn dtype_code(dtype: DataType) -> io::Result<u8> {
         | DataType::Float8E5M2FNUZ
         | DataType::Uint4
         | DataType::Int4
-        | DataType::Float4E2M1 => Err(io::Error::new(
+        | DataType::Float4E2M1
+        | DataType::Float8E8M0
+        | DataType::Uint2
+        | DataType::Int2 => Err(io::Error::new(
             ErrorKind::InvalidData,
             format!("interchange format does not support {dtype:?}"),
         )),

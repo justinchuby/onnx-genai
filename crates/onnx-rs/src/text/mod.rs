@@ -6,6 +6,7 @@
 //! embedding binary data.
 
 mod de;
+mod extensions;
 mod ser;
 
 pub use de::from_text;

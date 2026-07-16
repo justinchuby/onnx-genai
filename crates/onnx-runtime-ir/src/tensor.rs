@@ -15,9 +15,9 @@ pub struct TensorData {
     pub dtype: DataType,
     /// Static dimensions (constants always have a fully known shape).
     pub dims: Vec<usize>,
-    /// Raw little-endian element bytes. For sub-byte types two elements are
-    /// packed per byte; for [`DataType::String`] this is empty and `strings`
-    /// is used instead.
+    /// Raw little-endian element bytes. Sub-byte values are densely packed
+    /// (two 4-bit or four 2-bit elements per byte); for [`DataType::String`]
+    /// this is empty and `strings` is used instead.
     pub data: Vec<u8>,
     /// String payloads for [`DataType::String`] tensors.
     pub strings: Vec<String>,

@@ -35,8 +35,9 @@
 //!
 //! JSON and protobuf TextFormat are descriptor-driven from the exact vendored
 //! ONNX proto, so every bound message, field, oneof, and enum is covered. The
-//! readable text DSL retains a protobuf sidecar when fields lie outside the
-//! execution graph projection, preserving full-spec round trips.
+//! readable text DSL appends a protobuf-TextFormat extension containing only
+//! fields outside the graph syntax. The parsed DSL is authoritative for every
+//! field it represents, while the explicit extension preserves the remainder.
 //!
 //! Deferred to later waves (see `// FOLLOW-UP` markers): the remaining checker
 //! rule set (§8.2), custom-op registration (§11), and

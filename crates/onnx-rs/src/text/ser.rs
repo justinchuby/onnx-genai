@@ -19,8 +19,6 @@
 
 use std::fmt::Write as _;
 
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD as BASE64;
 use onnx_runtime_ir::{Attribute, DataType, Dim, Graph, NodeId, Shape, ValueId, WeightRef};
 
 use crate::model::Model;
@@ -60,9 +58,6 @@ pub fn to_text_with(model: &Model, opts: &PrintOptions) -> String {
     // Model header block: ir_version + opset imports (sorted for determinism).
     out.push_str("<\n");
     let _ = writeln!(out, "{}ir_version: {},", opts.indent, meta.ir_version);
-    if let Some(proto) = model.retained_proto_bytes() {
-        let _ = writeln!(out, "{}proto: {:?},", opts.indent, BASE64.encode(proto));
-    }
     let mut imports: Vec<(&String, &u64)> = model.graph.opset_imports.iter().collect();
     imports.sort_by(|a, b| a.0.cmp(b.0));
     let imports_str = imports
@@ -79,6 +74,9 @@ pub fn to_text_with(model: &Model, opts: &PrintOptions) -> String {
         &meta.graph_name
     };
     print_graph(&mut out, &model.graph, graph_name, 0, opts);
+    if let Some(proto) = model.retained_proto() {
+        super::extensions::append(proto, &mut out);
+    }
     out
 }
 
@@ -371,6 +369,9 @@ fn dtype_name(dtype: DataType) -> &'static str {
         DataType::Uint4 => "uint4",
         DataType::Int4 => "int4",
         DataType::Float4E2M1 => "float4e2m1",
+        DataType::Float8E8M0 => "float8e8m0",
+        DataType::Uint2 => "uint2",
+        DataType::Int2 => "int2",
     }
 }
 

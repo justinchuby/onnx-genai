@@ -266,9 +266,12 @@ pub(crate) fn tensor_data_from_proto(
         | DataType::Float8E4M3FNUZ
         | DataType::Float8E5M2
         | DataType::Float8E5M2FNUZ
+        | DataType::Float8E8M0
         | DataType::Int4
         | DataType::Uint4
-        | DataType::Float4E2M1 => proto.int32_data.iter().map(|v| *v as u8).collect(),
+        | DataType::Float4E2M1
+        | DataType::Int2
+        | DataType::Uint2 => proto.int32_data.iter().map(|v| *v as u8).collect(),
         DataType::String => unreachable!("STRING tensors returned above"),
     };
     Ok(td)
@@ -305,5 +308,33 @@ mod tests {
 
         let data = tensor_data_from_proto(&proto, DataType::Int4, &[3]).expect("tensor data");
         assert_eq!(data.data, [0x21, 0x03]);
+    }
+
+    #[test]
+    fn two_bit_typed_data_preserves_four_packed_elements_per_byte() {
+        let proto = TensorProto {
+            data_type: DataType::Int2.to_onnx(),
+            dims: vec![5],
+            // Elements are packed low-to-high in groups of four.
+            int32_data: vec![0b11_10_01_00, 0b0000_0001],
+            ..Default::default()
+        };
+
+        let data = tensor_data_from_proto(&proto, DataType::Int2, &[5]).expect("tensor data");
+        assert_eq!(data.data, [0b11_10_01_00, 0b0000_0001]);
+        assert_eq!(data.data.len(), DataType::Int2.storage_bytes(5));
+    }
+
+    #[test]
+    fn float8e8m0_typed_data_preserves_each_byte() {
+        let proto = TensorProto {
+            data_type: DataType::Float8E8M0.to_onnx(),
+            dims: vec![2],
+            int32_data: vec![0x7f, 0xff],
+            ..Default::default()
+        };
+
+        let data = tensor_data_from_proto(&proto, DataType::Float8E8M0, &[2]).expect("tensor data");
+        assert_eq!(data.data, [0x7f, 0xff]);
     }
 }
