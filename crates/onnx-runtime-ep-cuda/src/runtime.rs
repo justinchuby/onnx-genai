@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use cudarc::driver::sys::CUdeviceptr;
+use cudarc::driver::sys::{CUdevice_attribute, CUdeviceptr};
 use cudarc::driver::{CudaContext, CudaFunction, CudaModule, CudaStream};
 
 use onnx_runtime_ep_api::EpError;
@@ -47,6 +47,14 @@ fn nvrtc_include_paths() -> Vec<String> {
         .collect()
 }
 
+fn ptx_arch_for(major: u32, minor: u32) -> String {
+    format!("compute_{major}{minor}")
+}
+
+fn cubin_arch_for(major: u32, minor: u32) -> String {
+    format!("sm_{major}{minor}")
+}
+
 /// Device context, stream, and vendor-library backends shared across the EP.
 pub struct CudaRuntime {
     context: Arc<CudaContext>,
@@ -54,12 +62,17 @@ pub struct CudaRuntime {
     blas: CublasLt,
     cudnn: CudnnBackend,
     ordinal: u32,
+    /// Compute capability reported by the CUDA device, cached for NVRTC targets.
+    compute_capability: (u32, u32),
+    ptx_arch: String,
+    cubin_arch: String,
     /// Cache of NVRTC-compiled modules, keyed by a stable module name, so each
     /// runtime compiles a given kernel (e.g. the fused attention softmax) at
     /// most once and reuses the loaded module for every kernel invocation.
     modules: Mutex<HashMap<&'static str, Arc<CudaModule>>>,
     /// Set after a driver rejects the toolkit's PTX ISA. Subsequent modules are
-    /// compiled directly to an SM90 CUBIN instead of repeating the failed load.
+    /// compiled directly to the device's native SM CUBIN instead of repeating
+    /// the failed load.
     nvrtc_cubin_fallback: AtomicBool,
 }
 
@@ -67,6 +80,7 @@ impl std::fmt::Debug for CudaRuntime {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CudaRuntime")
             .field("ordinal", &self.ordinal)
+            .field("compute_capability", &self.compute_capability)
             .finish()
     }
 }
@@ -78,6 +92,30 @@ impl CudaRuntime {
     pub fn new(ordinal: u32) -> Result<Self> {
         let context =
             CudaContext::new(ordinal as usize).map_err(|e| driver_err("CudaContext::new", e))?;
+        let major = context
+            .attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)
+            .map_err(|e| driver_err("querying CUDA compute capability major", e))?;
+        let minor = context
+            .attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR)
+            .map_err(|e| driver_err("querying CUDA compute capability minor", e))?;
+        let major = u32::try_from(major).map_err(|_| {
+            EpError::KernelFailed(format!(
+                "cuda_ep: CUDA device {ordinal} reported invalid compute capability major {major}"
+            ))
+        })?;
+        let minor = u32::try_from(minor).map_err(|_| {
+            EpError::KernelFailed(format!(
+                "cuda_ep: CUDA device {ordinal} reported invalid compute capability minor {minor}"
+            ))
+        })?;
+        if major == 0 {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep: CUDA device {ordinal} reported invalid compute capability {major}.{minor}"
+            )));
+        }
+        let compute_capability = (major, minor);
+        let ptx_arch = ptx_arch_for(major, minor);
+        let cubin_arch = cubin_arch_for(major, minor);
         let stream = context.default_stream();
         let blas = CublasLt::new()?;
         let cudnn = CudnnBackend::new(stream.clone());
@@ -87,6 +125,9 @@ impl CudaRuntime {
             blas,
             cudnn,
             ordinal,
+            compute_capability,
+            ptx_arch,
+            cubin_arch,
             modules: Mutex::new(HashMap::new()),
             nvrtc_cubin_fallback: AtomicBool::new(false),
         })
@@ -121,11 +162,11 @@ impl CudaRuntime {
     /// `module_key`, compiling `src` to PTX and loading it on first use and
     /// reusing the cached module thereafter.
     ///
-    /// The compile targets `compute_90` (Hopper / SM90, our H200). If the
-    /// installed NVRTC emits a PTX ISA newer than the driver accepts, compilation
-    /// is retried for the real `sm_90` architecture and the resulting CUBIN is
-    /// loaded instead. An NVRTC failure surfaces the compiler log via
-    /// [`nvrtc_err`] (RULES.md #1).
+    /// The compile targets the device's detected virtual compute architecture.
+    /// If the installed NVRTC emits a PTX ISA newer than the driver accepts,
+    /// compilation is retried for the matching real SM architecture and the
+    /// resulting CUBIN is loaded instead. An NVRTC failure surfaces the compiler
+    /// log via [`nvrtc_err`] (RULES.md #1).
     pub fn nvrtc_function(
         &self,
         module_key: &'static str,
@@ -143,8 +184,8 @@ impl CudaRuntime {
                     self.load_nvrtc_cubin(module_key, src, &include_paths)?
                 } else {
                     let opts = cudarc::nvrtc::CompileOptions {
-                        arch: Some("compute_90"),
                         include_paths: include_paths.clone(),
+                        options: vec![format!("--gpu-architecture={}", self.ptx_arch)],
                         ..Default::default()
                     };
                     let ptx = cudarc::nvrtc::compile_ptx_with_opts(src, opts).map_err(|e| {
@@ -199,7 +240,7 @@ impl CudaRuntime {
             .iter()
             .map(|path| format!("--include-path={path}"))
             .collect::<Vec<_>>();
-        options.push("--gpu-architecture=sm_90".into());
+        options.push(format!("--gpu-architecture={}", self.cubin_arch));
 
         // SAFETY: `program` is live until the matching destroy call below.
         let compile_result = unsafe { cudarc::nvrtc::result::compile_program(program, &options) };
@@ -361,6 +402,38 @@ pub fn raw_ptr(dptr: CUdeviceptr) -> *mut c_void {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn derives_ptx_arch_from_compute_capability() {
+        for (major, minor, expected) in [
+            (6, 0, "compute_60"),
+            (7, 5, "compute_75"),
+            (8, 0, "compute_80"),
+            (8, 6, "compute_86"),
+            (8, 9, "compute_89"),
+            (9, 0, "compute_90"),
+            (10, 0, "compute_100"),
+            (12, 0, "compute_120"),
+        ] {
+            assert_eq!(ptx_arch_for(major, minor), expected);
+        }
+    }
+
+    #[test]
+    fn derives_cubin_arch_from_compute_capability() {
+        for (major, minor, expected) in [
+            (6, 0, "sm_60"),
+            (7, 5, "sm_75"),
+            (8, 0, "sm_80"),
+            (8, 6, "sm_86"),
+            (8, 9, "sm_89"),
+            (9, 0, "sm_90"),
+            (10, 0, "sm_100"),
+            (12, 0, "sm_120"),
+        ] {
+            assert_eq!(cubin_arch_for(major, minor), expected);
+        }
+    }
 
     #[test]
     fn nvrtc_include_paths_only_returns_cuda_header_dirs() {
