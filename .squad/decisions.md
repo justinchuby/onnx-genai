@@ -640,3 +640,85 @@ All bound enums are **DONE**:
 **By:** Roy
 **What:** Added `DecodeCudaState` beside `NativeDecodeSession` with a logical cursor, configurable fixed capacity, one persistent CUDA allocation per key/value tensor, and a fixed-capacity device attention mask. Session `DeviceIoBinding` supplies externally owned device inputs, aliases graph outputs to the same allocation, tracks physical and logical shapes separately, and suppresses bound output materialization. CUDA GQA now treats `total_sequence_length` as physical capacity while `seqlens_k + 1` is the valid prefix; in-place append remains O(new tokens). Rewind/reset move the cursor and update only the mask suffix, never KV bytes.
 **Why:** M3 requires stable KV addresses and no context-sized KV PCIe traffic so later CUDA graph capture has fixed pointers. The default capacity is 4096 tokens; `NativeDecodeSession::load_with_cuda_kv_max_len` and `ONNX_GENAI_CUDA_KV_MAX_LEN` override it, and overflow returns a clean pre-launch error. The 16-token Qwen GPU test asserts all 48 KV pointers remain identical across generation and rewind and aggregate KV binding H2D/D2H counters remain exactly zero. Full CPU/CUDA greedy parity past token 10 is deferred: an origin/main M2 probe and M3 both match the first 10 tokens (required first eight `[11576,42740,11,358,614,264,3405,911]`) and diverge afterward, so this is a pre-existing CUDA numerics gap rather than a device-KV regression.
+
+
+### 2026-07-16: Sub-4-bit IQ/MXFP4 quant — design + CPU proto
+**By:** Bryant
+**What:** Added `docs/SUB4BIT_QUANT.md` with exact llama.cpp IQ1/IQ2/IQ3 and OCP MXFP4 layouts, recommended linear `MatMulNBits` plus format-explicit block-quantized MatMul/MoE ops, Mobius capability wiring, and an ORT issue draft. Extended the CPU EP's registered `com.microsoft::MatMulNBits` kernel to execute standard linear `bits=2` weights through the f32 correctness path, with partial-block parity and bit-packing tests.
+**Why:** Enables huge-MoE sub-4-bit weights to remain compressed and makes top-k expert offload practical on smaller machines without misinterpreting IQ grid bytes as linear integers.
+**Follow-ups:** Grid-codebook IQ kernels, full MXFP4 MatMul, direct 2-bit/IQ CPU optimization, CUDA kernels, Mobius export and EP-capability wiring, expert residency/offload, and a fused block-quantized MoE op.
+
+
+### 2026-07-16: Review — sub-4-bit 2-bit CPU MatMulNBits
+**By:** Leon
+**What:** 🟢 CLEAR — commit `a5e62d2` correctly adds the CPU affine `bits=2` dequant-to-f32 baseline without changing the effective int4 or accuracy-level-4 int8 behavior. The design document is technically plausible and clearly separates affine int2 from IQ/MXFP4 native formats and deferred optimized/MoE work.
+**Why:** Packing is LSB-first and matches the existing int4 convention: `bit_offset = within_block * bits`, followed by shift and mask, yields four 2-bit values per byte in crumb order bits `[1:0]`, `[3:2]`, `[5:4]`, `[7:6]`; int4 still yields low nibble then high nibble. The absent zero point is `1 << (bits - 1)`, so int2 uses `zp=2`; explicit int2 zero points use the same LSB-first two-bit packing, four blocks per byte, matching the ORT layout. Concrete trace: packed `0b11_10_01_00` (`0xE4`) decodes to `q=[0,1,2,3]`; with scale 1 and `zp=2`, weights are `[-2,-1,0,1]`. Activations `[1,10,100,1000]` produce `-2 - 10 + 0 + 1000 = 988`, exactly asserted by the packing test; remaining `0xAA` bytes decode to `q=2` and contribute zero.
+
+Parity integrity is sound: the bits=2 test uses `M=3, K=45, N=7, block_size=32`, exercising two blocks including a partial final block, computes an independently dequantized f32 reference, and checks every output at absolute tolerance `1e-5`. Fixtures are native Rust IR (`Graph`/`Node`/`Model` plus proto encoding), not `onnx.helper`. Optimized int4 paths are explicitly gated by `self.bits == 4`; the generic int4 shifts/masks remain equivalent to the previous low/high-nibble logic. Unsupported `bits=8` is cleanly rejected while missing `bits` still defaults to 4.
+
+Fresh-target validation:
+`cargo test -p onnx-runtime-ep-cpu`: `415 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out`; doc-tests `0 passed; 0 failed; 1 ignored`.
+`cargo build -p onnx-runtime-session -p onnx-genai-engine`: `Finished dev profile` successfully in 11.53s.
+
+
+### 2026-07-16: DeepSeek-V4-Flash mobius export
+**By:** Chew
+**What:** Draft PR https://github.com/onnxruntime/mobius/pull/405 adds `deepseek_v4`/GGUF `deepseek4` registration, V4 projections, Hyper-Connections, hash/sqrt-softplus MoE, dense attention fallback, 4/8-bit MatMulNBits graph support, GGUF mappings, tests, and runtime aliases.
+**Why:** V4 differs substantially from V3 MLA; this lands the largest weight-compatible standard backbone while keeping unsupported compressed sparse attention explicit rather than guessing its runtime contract.
+**Follow-ups:** Add CSA/HCA compression/indexer/attention-sink and MTP runtime paths; add direct packed dynamic int2/int1 and MXFP4 expert support via a runtime custom op plus mobius EP capabilities and/or an ORT issue; optimize split-GGUF expert repacking.
+
+
+### 2026-07-16: GLM-5.2 mobius export
+**By:** Tyrell
+**What:** Draft PR https://github.com/onnxruntime/mobius/pull/404 adds `glm_moe_dsa` / `glm-dsa` config, registry, full-attention MLA+MoE graph export, GGUF tensor/config mapping, split-K/V fusion, streamed expert import, Q4/Q8 MatMulNBits normalization, runtime aliasing, tests, and a design note.
+**Why:** IndexShare DSA and the GLM-specific improved MTP layer require new cross-layer sparse-attention and speculative-decoding contracts. The PR therefore lands a coherent full-attention backbone first rather than a partially wired sparse path.
+**Follow-ups:** Add IndexShare and improved MTP; implement an efficient selected-expert runtime op with native IQ1_M/IQ2_XXS/IQ3_XXS/IQ4_XS support and expose it through Mobius EP capabilities; otherwise pursue the drafted ORT issue for sub-4-bit MatMulNBits/sparse-MoE support. Q4 requantization is the current fallback.
+
+
+### 2026-07-16: GLM-5.2 IndexShare DSA + MTP export
+**By:** Mariette
+**What:** PR https://github.com/onnxruntime/mobius/pull/404 now includes commit `590c7da`, implementing portable IndexShare DSA with the official shared-indexer schedule and packed index-key cache, plus the complete layer-78 improved-MTP graph, HF/GGUF mappings, ORT GenAI artifacts, dense-attention fallback, tests, and documentation.
+**Why:** Standard ONNX ops preserve DSA selection numerics without a mandatory custom op. MTP is exported as a separate artifact because ORT GenAI does not yet natively orchestrate GLM's speculative iteration state.
+**Follow-ups:** Add a selected-token sparse-attention runtime kernel for the advertised FLOP reduction; add independent indexer-cache/control state and native MTP orchestration for `index_share_for_mtp_iteration`; keep IQ1/IQ2/IQ3 quantization in its separate workstream.
+
+
+### 2026-07-16: onnx-rs proto bump to IR13 + authoritative native text
+**By:** Batty
+**What:** Landed ONNX v1.22.0 / IR13 bindings, FLOAT8E8M0/UINT2/INT2 runtime dtype and packed-storage support, and lossless multi-device serde for DeviceConfigurationProto, NodeDeviceConfigurationProto, ShardingSpecProto, ShardedDimProto, SimpleShardedDimProto, and IntIntListEntryProto across JSON, TextProto, and native text. Native text commit `67f60c0` replaces the whole-model base64 override with an explicit protobuf-TextFormat residual block; DSL-represented fields are removed from the residual and reconstructed from the readable body, so body edits are authoritative.
+**Why:** Addresses Rachael 🔴: the previous binding was stale IR10/partial IR11 and native text ignored readable edits in favor of an opaque source proto.
+**Remaining:** No known gaps in the requested serde scope. Upstream v1.22.0 attaches multi-device data at `ModelProto.configuration` and `NodeProto.device_configurations`; it defines no `GraphProto` configuration field. Training execution semantics remain out of scope, while any present training proto stays losslessly preserved by descriptor-driven codecs.
+
+
+### 2026-07-16: Re-review — onnx-rs IR13 proto + authoritative native text
+**By:** Rachael
+**What:** 🔴 REJECT. The stale-proto defect is fixed, but the native TextFormat residual can still silently override a readable DSL edit. Zhora and Batty remain locked out; Leon should revise the residual merge and add edit-authority regressions.
+**Why:** The vendored proto's SHA-256 exactly matches upstream ONNX v1.22.0, declares IR13, and is compiled by loader `build.rs` through `protox`/`prost-build` into the bindings and descriptor used by onnx-rs. `DeviceConfigurationProto`, `NodeDeviceConfigurationProto`, `ShardingSpecProto`, `ShardedDimProto`, `SimpleShardedDimProto`, and `IntIntListEntryProto` are present; upstream attaches configuration at `ModelProto.configuration` and `NodeProto.device_configurations` (there is no GraphProto configuration field). Descriptor-driven JSON/TextProto and the native residual all pass byte-exact full-spec coverage. FLOAT8E8M0/UINT2/INT2 map to 24/25/26; all legacy/new dtypes have typed/raw round-trip coverage. The existing 2-bit test preserves packed bytes, and an independent pack/unpack check round-tripped UINT2 `[0,1,2,3,1] -> [e4,01]` and INT2 `[-2,-1,0,1,-2] -> [4e,02]`.
+
+The positive `readable_body_edits_are_authoritative_over_extensions` test proves only a top-level graph-name edit. A counter-probe changed the emitted readable attribute `types = <1 types>` to `types = <2 types>`; parsing still returned one `TypeProto`. The printer exposes this count (`text/ser.rs:338`) and the parser constructs the edited count (`text/de.rs:432-444`), but `merge_attribute` explicitly leaves residual `TypeProtos` and `SparseTensors` untouched (`text/extensions.rs:261-267`). Thus the residual remains authoritative over readable fields. Leon should make readable list cardinality authoritative while retaining only non-readable payload details, audit every emitted placeholder similarly, and add failing-then-passing edit tests.
+
+The scoped skip grep found no `Unsupported`, `todo!`, `unimplemented!`, `unreachable!`, or `#[ignore]`. Fresh-target `cargo test -p onnx-rs` passed 62 unit + 5 full-spec + 16 port + 1 doctest (84 total); strict all-target clippy passed; dependent `onnx-runtime-session` and `onnx-genai-engine` builds passed.
+
+
+### 2026-07-16: onnx-rs native text made authoritative
+**By:** Deckard
+**What:** The residual merge now starts from readable attributes, uses readable repeated cardinalities for tensor/sparse/type lists, treats edited tensor/type/graph fields as authoritative, and restores only omitted payload/metadata. Opaque byte placeholders use an internal parse sentinel so replacing them with readable strings wins. The full-spec regression edits graph signatures, nested graphs, tensor/type/sparse attributes, opaque strings, and list cardinalities while retaining an exact unedited round-trip.
+**Why:** Addresses Rachael 🔴: the residual overrode readable TypeProtos/SparseTensors and could also override opaque-string edits and projected TypeProto edits.
+
+
+### 2026-07-16: onnx-rs native-text authoritative re-review (3rd)
+**By:** Rachael
+**What:** 🟢 CLEAR. Verified readable DSL edits win for model headers, graph names/signatures, nodes and attributes, tensor dtype/shape, nested graph signatures, opaque strings, and tensor/sparse/type list cardinalities. The exact adversarial `<1 types>` → `<2 types>` case passes while preserving the first omitted TypeProto payload. Unedited native-text round-trip remains byte-exact.
+**Why:** The residual now strips DSL-expressible fields and merge starts from parsed native attributes/cardinalities, restoring only omitted payload and metadata. `cargo test -p onnx-rs` passed all 84 tests, `cargo test -p onnx-runtime-loader` passed, and `cargo clippy -p onnx-rs -- -D warnings` passed.
+
+
+### 2026-07-16: BlockQuantizedMatMul — MXFP4 + IQ scaffold
+**By:** Joi
+**What:** Added the private `com.github.onnxruntime.genai::BlockQuantizedMatMul` v1 CPU op with native GGUF blocks, strict shape/layout validation, optional bias, constant-weight dequant caching, and f32 GEMM. MXFP4 is fully implemented with OCP E2M1/E8M0 semantics and llama.cpp nibble layout; IQ4_NL is the first fully implemented IQ/codebook format. IQ1/IQ2/IQ3 and IQ4_XS are recognized but explicitly rejected until audited tables land. Rust dequant/matmul tests and an ONNX IR Python fixture cover the implementation.
+**Why:** Enables correctness-first execution of unsloth/llama.cpp native block weights without misinterpreting IQ or MXFP4 bytes as affine NBits, unblocking sub-4-bit GGUF model integration.
+**Follow-ups:** Import audited llama.cpp golden vectors and grid tables for IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, and IQ4_XS; add direct CUDA kernels, Mobius capability/export wiring, GGUF-to-ORT MXFP4 layout parity, and fused `BlockQuantizedMoE` execution.
+
+
+### 2026-07-16: BlockQuantizedMatMul review
+**By:** Leon
+**What:** 🟢 CLEAR commit `0307138`. Hand-verified MXFP4's OCP E2M1 table, E8M0 scaling/NaN handling, and llama.cpp low-nibble→`j` / high-nibble→`j+16` layout; traced exponent `128` with byte `0xd7` to `12.0` and `-6.0`. Verified IQ4_NL's exact llama.cpp 16-entry codebook and nibble order; traced fp16 scale `0.5` with byte `0xf0` to `-63.5` and `56.5`. Confirmed IQ1_S, IQ2_XXS, IQ3_S, and IQ4_XS all fail kernel creation as recognized-but-unimplemented. CPU EP tests passed 420/420 and the Python ONNX IR fixture passed 1/1.
+**Why:** The implementation matches llama.cpp commit `b15ca938` for block sizes, tables, scale conversion, and packed element order, while incomplete IQ formats fail closed instead of decoding silently. `cargo clippy -p onnx-runtime-ep-cpu --lib` completed with only existing warnings and none in Joi's new code; `--all-targets` reaches an unrelated pre-existing denied approximate-constant lint in `elementwise.rs`.

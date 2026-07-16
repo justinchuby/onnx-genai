@@ -4,7 +4,7 @@ Tracks implementation status of `docs/DESIGN.md` (§1–§40). Updated as work l
 
 **Published:** `onnx-genai` v0.1.0 + 8 sub-crates on crates.io; the `onnx-runtime-*` layer (including `onnx-runtime-tracer`) is released as v0.1.0-dev.1. CI (fmt/build/test/**blocking clippy**) + scheduled `cargo-audit`. Coverage ~77% line.
 
-_Last updated: 2026-07-16 — includes CUDA SM-general targeting, device-resident KV-cache M3, and the onnx-rs full-spec revision status (see below)._
+_Last updated: 2026-07-16 — includes completed onnx-rs full-spec serde, sub-4-bit CPU support, and open Mobius exports._
 
 
 ## Current tiered-memory and interoperability milestones
@@ -346,5 +346,7 @@ Scoped the "export Gemma4 E2B/12B via Mobius and smoke-test through onnx-genai" 
 
 ### ONNX-RS text-format upstream coverage
 
-- **Upstream serde test port ✅ (`23e4995`, Zhora; Coco 🟢):** Expanded `text_format_port.rs` from **6 → 16** upstream-derived cases; **89** onnx-rs tests pass. **Known gaps:** model-local functions; sequence/optional/sparse types; complex/int2/uint2 dtypes; and typed tensor-payload literals remain unsupported.
-- **Full-spec serde status — IN REVISION (Batty):** Zhora's full-spec attempt is **not complete**; Rachael 🔴 rejected it because the vendored proto is stale (ONNX v1.16.2 / IR10 rather than current v1.22.0 / IR13, missing multi-device protos plus INT2/UINT2/FLOAT8E8M0) and its native text delegates to a non-authoritative base64 retained-proto override. Batty is revising the schema bump and authoritative native readable-text serialization.
+- **Upstream serde test port ✅ (`23e4995`, Zhora; Coco 🟢):** Expanded `text_format_port.rs` from **6 → 16** upstream-derived cases; **89** onnx-rs tests pass.
+- **onnx-rs full-spec serde ✅ DONE (`f058594`; Deckard `1b65769`; Rachael 🟢):** IR13 bindings, INT2/UINT2/FLOAT8E8M0, multi-device proto round-trips, and authoritative native text are complete. Readable DSL edits for headers, graph/nodes/attributes, dtype/shape, nested graphs, opaque strings, and list cardinalities win; residual data restores only omitted payload/metadata.
+- **Sub-4-bit CPU BlockQuantizedMatMul ✅ (`a2b2f0b`, Joi; Leon 🟢):** `MXFP4` (exact E2M1/E8M0) and `IQ4_NL` run correctly; unaudited IQ1/IQ2/IQ3/IQ4_XS formats fail explicitly rather than silently corrupting.
+- **Mobius exports — OPEN:** PR [#404](https://github.com/onnxruntime/mobius/pull/404) adds GLM-5.2 MoE with IndexShare DSA + MTP; PR [#405](https://github.com/onnxruntime/mobius/pull/405) adds DeepSeek-V4-Flash. Both are rebased on merged [#398](https://github.com/onnxruntime/mobius/pull/398) (`InferenceMetadata`).

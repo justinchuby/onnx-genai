@@ -66,3 +66,7 @@ Replaced Rachael's rejected `RefCell`/unsendable Python genai Engine with a send
 
 ## 2026-07-16T14:20:00Z — M3 device-resident CUDA KV review
 - 🟢 Cleared Roy's `398c536`: 48 persistent aliased K/V buffers remain stable and make no KV host transfers. M2 and M3 CUDA streams are byte-identical; the CPU mismatch starts at index 10 and is a pre-existing numerical-drift follow-up.
+
+## 2026-07-16T15:39:27Z — Scribe session update
+
+- Fixed `onnx-runtime-python` `onnx_type_string` exhaustiveness for Undefined/Complex64/Complex128 (`f058594`); this main commit includes the completed onnx-rs full-spec merge.

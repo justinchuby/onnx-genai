@@ -111,3 +111,7 @@ Implemented the behavior-preserving executor seam in `f795d45`: `Executor` and k
 
 ### 2026-07-16T00:00:00Z — CUDA M2 end-to-end wiring (locked out)
 Authored initial CUDA executor wiring (`1a2deca`): opt-in CUDA EP selection, device-buffer initializers and graph boundaries, device-correct views, and synchronized output downloads; Qwen CPU/CUDA tokens matched exactly. Holden rejected two off-target control-flow memory-safety hazards (SequenceAt host pointer dispatch and Scan host writes to CUDA allocation). Deckard was locked out; Leon supplied the corrective `5c0f05f`, which Holden cleared.
+
+## 2026-07-16T15:39:27Z — Scribe session update
+
+- Completed authoritative onnx-rs native text (`1b65769`): readable DSL fields now override residual data while omitted payload/metadata are preserved. Rachael’s third review is 🟢 CLEAR.

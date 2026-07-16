@@ -72,3 +72,7 @@ Batched-driver DoS hardening is canonical: admission is bounded by `max_pending`
 
 ## 2026-07-16T14:20:00Z — onnx-rs full-spec serde review
 - 🔴 Rejected Zhora's full-spec claim: vendored ONNX v1.16.2/IR10 proto is stale against v1.22.0/IR13, and base64 retained-proto native text is non-authoritative. Zhora is locked out; Batty owns the revision.
+
+## 2026-07-16T15:39:27Z — Scribe session update
+
+- 🟢 Third onnx-rs re-review cleared Deckard’s authoritative native-text residual merge, including adversarial list-cardinality and opaque-string edits.

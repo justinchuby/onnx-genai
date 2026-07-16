@@ -10,3 +10,7 @@ Hired as a Metal/MPS kernel engineer for the new Apple Metal EP for ONNX Runtime
 ## 2026-07-15T00:00:00Z — Cross-agent session update
 
 - Applied final CUDA DLPack review fixes and documented the honest CPU-executor boundary; merged in the GPU-DLPack wave.
+
+## 2026-07-16T15:39:27Z — Scribe session update
+
+- Extended Mobius PR #404 with GLM-5.2 IndexShare DSA and improved-MTP export; it remains open and rebased on merged #398.
