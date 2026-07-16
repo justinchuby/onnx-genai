@@ -62,7 +62,9 @@ pub struct RuntimeConfig {
     pub webgpu_graph_capture: bool,
     /// `ONNX_GENAI_CUDA_GRAPH` (`bool`, default: false): enables CUDA graph capture.
     pub cuda_graph: bool,
-    /// `ONNX_GENAI_DEVICE_KV` (`bool`, default: false): enables experimental device-resident KV buffers.
+    /// `ONNX_GENAI_DEVICE_KV` (`bool`, default: false): opts the experimental WebGPU
+    /// device-resident KV buffers in. CUDA device-resident KV is always on and does
+    /// not require this flag.
     pub device_kv: bool,
     /// `ONNX_GENAI_SHARED_KV_PRESENT_BINDING` (`bool`, default: false): opts unverified EPs into fixed-capacity present binding.
     pub shared_kv_present_binding: bool,
