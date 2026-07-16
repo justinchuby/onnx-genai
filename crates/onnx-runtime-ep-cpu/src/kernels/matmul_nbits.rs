@@ -1,13 +1,14 @@
 //! Correctness-first `com.microsoft::MatMulNBits` for f32 activations and
-//! block-quantized int4 weights.
+//! block-quantized 2-bit or 4-bit weights.
 //!
-//! ORT stores `B` as `[N, ceil(K / block_size), block_size / 2]`. Within each
-//! block, the earlier K element occupies the low nibble. For M=1 decode,
-//! constant quantized weights are prepacked once and reused by a
-//! N-parallel GEMV. For symmetric block-32 M=1, `accuracy_level=4` streams the
-//! packed int4 weights directly into a VNNI dot product. Other accuracy-level-4
-//! shapes keep the weights in int8 and quantize each activation row to int8;
-//! the default path remains f32. Other shapes use the shared CPU GEMM,
+//! ORT stores `B` as
+//! `[N, ceil(K / block_size), block_size * bits / 8]`, least-significant bits
+//! first within each byte. For M=1 decode, constant quantized weights are
+//! prepacked once and reused by a N-parallel GEMV. For symmetric block-32
+//! int4 M=1, `accuracy_level=4` streams the packed weights directly into a VNNI
+//! dot product. Other int4 accuracy-level-4 shapes keep the weights in int8 and
+//! quantize each activation row to int8. The 2-bit correctness path and default
+//! int4 path dequantize to f32; batched shapes then use the shared CPU GEMM,
 //! including its oneDNN backend.
 
 use std::sync::OnceLock;
@@ -27,6 +28,7 @@ static DECODE_POOL: OnceLock<std::result::Result<Option<rayon::ThreadPool>, Stri
 pub struct MatMulNBitsKernel {
     k: usize,
     n: usize,
+    bits: usize,
     block_size: usize,
     accuracy_level: i64,
     constant_inputs: [bool; 5],
@@ -53,9 +55,9 @@ impl KernelFactory for MatMulNBitsFactory {
         let k = required_positive_attr(node, "K")?;
         let n = required_positive_attr(node, "N")?;
         let bits = optional_int_attr(node, "bits")?.unwrap_or(4);
-        if bits != 4 {
+        if !matches!(bits, 2 | 4) {
             return Err(error(format!(
-                "only bits=4 is supported in the CPU Phase-1 kernel, got {bits}"
+                "only bits=2 and bits=4 are supported in the CPU kernel, got {bits}"
             )));
         }
         let weight_prepacked = optional_int_attr(node, "weight_prepacked")?.unwrap_or(0);
@@ -79,6 +81,7 @@ impl KernelFactory for MatMulNBitsFactory {
         Ok(Box::new(MatMulNBitsKernel {
             k,
             n,
+            bits: bits as usize,
             block_size,
             accuracy_level,
             constant_inputs: [false; 5],
@@ -119,14 +122,14 @@ impl Kernel for MatMulNBitsKernel {
         }
 
         let k_blocks = self.k.div_ceil(self.block_size);
-        let blob_size = self.block_size / 2;
+        let blob_size = self.block_size * self.bits / 8;
         require_shape("B", inputs[1].shape, &[self.n, k_blocks, blob_size])?;
         require_flat_or_matrix_shape("scales", inputs[2].shape, self.n, k_blocks)?;
 
         let zero_points = optional_input(inputs, 3);
         if let Some(zp) = zero_points {
             require_dtype("zero_points", zp.dtype, DataType::Uint8)?;
-            let zp_blob_size = k_blocks.div_ceil(2);
+            let zp_blob_size = (k_blocks * self.bits).div_ceil(8);
             require_flat_or_matrix_shape("zero_points", zp.shape, self.n, zp_blob_size)?;
         }
 
@@ -158,7 +161,8 @@ impl Kernel for MatMulNBitsKernel {
         let m = numel(&a_shape[..a_shape.len() - 1]);
         let mut result = vec![0.0f32; m * self.n];
         let dot_kernel = selected_dot_kernel();
-        if self.accuracy_level == 4
+        if self.bits == 4
+            && self.accuracy_level == 4
             && m == 1
             && self.block_size == 32
             && zero_points.is_none()
@@ -196,7 +200,7 @@ impl Kernel for MatMulNBitsKernel {
                     dot_kernel,
                 );
             })?;
-        } else if self.accuracy_level == 4 && group_indices.is_none() {
+        } else if self.bits == 4 && self.accuracy_level == 4 && group_indices.is_none() {
             let owned_weight;
             let int8_weight = if can_prepack {
                 if let Some(weight) = self.int8_weight.get() {
@@ -296,6 +300,7 @@ impl MatMulNBitsKernel {
         let scales = to_dense_f32(scales)?;
         let packed_zero_points = zero_points.map(to_dense_bytes).transpose()?;
         let k_blocks = self.k.div_ceil(self.block_size);
+        debug_assert_eq!(self.bits, 4);
         let blob_size = self.block_size / 2;
         let zp_row_bytes = k_blocks.div_ceil(2);
         let padded_k = k_blocks * self.block_size;
@@ -362,30 +367,28 @@ impl MatMulNBitsKernel {
             }
         }
 
-        let blob_size = self.block_size / 2;
-        let zp_row_bytes = k_blocks.div_ceil(2);
+        let blob_size = self.block_size * self.bits / 8;
+        let zp_row_bytes = (k_blocks * self.bits).div_ceil(8);
+        let quantized_mask = (1u8 << self.bits) - 1;
+        let default_zero_point = 1u8 << (self.bits - 1);
         let mut weight_kn = vec![0.0f32; self.k * self.n];
         for output in 0..self.n {
             for depth in 0..self.k {
                 let block = depth / self.block_size;
                 let within_block = depth % self.block_size;
-                let byte = packed[(output * k_blocks + block) * blob_size + within_block / 2];
-                let quantized = if within_block.is_multiple_of(2) {
-                    byte & 0x0f
-                } else {
-                    byte >> 4
-                };
+                let bit_offset = within_block * self.bits;
+                let byte = packed[(output * k_blocks + block) * blob_size + bit_offset / 8];
+                let quantized = (byte >> (bit_offset % 8)) & quantized_mask;
                 let group = group_indices
                     .as_ref()
                     .map_or(block, |indices| indices[depth] as usize);
-                let zero_point = packed_zero_points.as_ref().map_or(8, |points| {
-                    let byte = points[output * zp_row_bytes + group / 2];
-                    if group.is_multiple_of(2) {
-                        byte & 0x0f
-                    } else {
-                        byte >> 4
-                    }
-                });
+                let zero_point = packed_zero_points
+                    .as_ref()
+                    .map_or(default_zero_point, |points| {
+                        let bit_offset = group * self.bits;
+                        let byte = points[output * zp_row_bytes + bit_offset / 8];
+                        (byte >> (bit_offset % 8)) & quantized_mask
+                    });
                 let index = match layout {
                     WeightLayout::Kn => depth * self.n + output,
                     WeightLayout::Nk => output * self.k + depth,
@@ -1013,6 +1016,7 @@ mod tests {
         MatMulNBitsKernel {
             k,
             n,
+            bits: 4,
             block_size,
             accuracy_level: 0,
             constant_inputs: [false; 5],
@@ -1118,6 +1122,57 @@ mod tests {
             }
         }
         weights
+    }
+
+    fn quantize_symmetric_2bit(
+        weights_nk: &[f32],
+        n: usize,
+        k: usize,
+        block_size: usize,
+    ) -> (Vec<u8>, Vec<f32>) {
+        let blocks = k.div_ceil(block_size);
+        let blob_size = block_size / 4;
+        let mut packed = vec![0u8; n * blocks * blob_size];
+        let mut scales = vec![0.0f32; n * blocks];
+        for output in 0..n {
+            for block in 0..blocks {
+                let start = block * block_size;
+                let end = (start + block_size).min(k);
+                let values = &weights_nk[output * k + start..output * k + end];
+                let max_abs = values.iter().map(|value| value.abs()).fold(0.0, f32::max);
+                let scale = max_abs.max(1e-6);
+                scales[output * blocks + block] = scale;
+                for (offset, &value) in values.iter().enumerate() {
+                    let q = (value / scale + 2.0).round().clamp(0.0, 3.0) as u8;
+                    packed[(output * blocks + block) * blob_size + offset / 4] |=
+                        q << (2 * (offset % 4));
+                }
+            }
+        }
+        (packed, scales)
+    }
+
+    fn dequantize_2bit_reference(
+        packed: &[u8],
+        scales: &[f32],
+        n: usize,
+        k: usize,
+        block_size: usize,
+    ) -> Vec<f32> {
+        let blocks = k.div_ceil(block_size);
+        let blob_size = block_size / 4;
+        let mut dequantized = vec![0.0f32; n * k];
+        for output in 0..n {
+            for depth in 0..k {
+                let block = depth / block_size;
+                let within_block = depth % block_size;
+                let byte = packed[(output * blocks + block) * blob_size + within_block / 4];
+                let q = (byte >> (2 * (within_block % 4))) & 0x03;
+                dequantized[output * k + depth] =
+                    (q as f32 - 2.0) * scales[output * blocks + block];
+            }
+        }
+        dequantized
     }
 
     fn assert_close(actual: &[f32], expected: &[f32]) {
@@ -1551,6 +1606,74 @@ mod tests {
     }
 
     #[test]
+    fn matmulnbits_2bit_symmetric_block32_matches_dequantized_f32_reference() {
+        let (m, k, n, block_size) = (3, 45, 7, 32);
+        let a_values: Vec<f32> = (0..m * k)
+            .map(|i| ((i * 17 % 43) as f32 - 21.0) / 13.0)
+            .collect();
+        let weights: Vec<f32> = (0..n * k)
+            .map(|i| ((i * 19 % 47) as f32 - 23.0) / 12.0)
+            .collect();
+        let (packed, scales) = quantize_symmetric_2bit(&weights, n, k, block_size);
+        let dequantized = dequantize_2bit_reference(&packed, &scales, n, k, block_size);
+        let blocks = k.div_ceil(block_size);
+        let (graph, node) = model_node(
+            &[m, k],
+            &[n, blocks, block_size / 4],
+            &[n, blocks],
+            None,
+            &[m, n],
+            k,
+            n,
+            block_size,
+        );
+        let mut graph = graph;
+        graph
+            .node_mut(node)
+            .attributes
+            .insert("bits".into(), Attribute::Int(2));
+        let model = Model::new(&graph);
+        let kernel = CpuExecutionProvider::new()
+            .get_kernel(model.graph.node(node), &[], 1)
+            .expect("CPU EP must register bits=2 MatMulNBits");
+        let a = Owned::f32(&[m, k], &a_values);
+        let b = Owned::u8(&[n, blocks, block_size / 4], &packed);
+        let scales = Owned::f32(&[n, blocks], &scales);
+        let mut y = Owned::zeros_f32(&[m, n]);
+        kernel
+            .execute(&[a.view(), b.view(), scales.view()], &mut [y.view_mut()])
+            .unwrap();
+        assert_close(&y.to_f32(), &reference(&a_values, &dequantized, m, k, n));
+    }
+
+    #[test]
+    fn matmulnbits_2bit_unpacks_low_bits_first() {
+        let k = 32;
+        let (graph, node) = model_node(&[1, k], &[1, 1, 8], &[1], None, &[1, 1], k, 1, 32);
+        let mut graph = graph;
+        graph
+            .node_mut(node)
+            .attributes
+            .insert("bits".into(), Attribute::Int(2));
+        let model = Model::new(&graph);
+        let kernel = CpuExecutionProvider::new()
+            .get_kernel(model.graph.node(node), &[], 1)
+            .unwrap();
+        let mut activation = vec![0.0; k];
+        activation[..4].copy_from_slice(&[1.0, 10.0, 100.0, 1000.0]);
+        let mut packed = vec![0xaa; 8];
+        packed[0] = 0b11_10_01_00;
+        let a = Owned::f32(&[1, k], &activation);
+        let b = Owned::u8(&[1, 1, 8], &packed);
+        let scales = Owned::f32(&[1], &[1.0]);
+        let mut y = Owned::zeros_f32(&[1, 1]);
+        kernel
+            .execute(&[a.view(), b.view(), scales.view()], &mut [y.view_mut()])
+            .unwrap();
+        assert_eq!(y.to_f32(), vec![988.0]); // -2*1 + -1*10 + 0*100 + 1*1000
+    }
+
+    #[test]
     fn matmulnbits_asymmetric_block16_batched_non_square() {
         let (m, k, n, block_size) = (6, 48, 5, 16);
         let a: Vec<f32> = (0..m * k)
@@ -1775,7 +1898,7 @@ mod tests {
     }
 
     #[test]
-    fn matmulnbits_rejects_non_int4_factory_configuration() {
+    fn matmulnbits_rejects_unsupported_bit_width() {
         let (graph, node) = model_node(&[1, 16], &[1, 1, 8], &[1], None, &[1, 1], 16, 1, 16);
         let mut graph = graph;
         graph
@@ -1787,7 +1910,7 @@ mod tests {
             .get_kernel(model.graph.node(node), &[], 1)
             .err()
             .expect("bits=8 must be rejected");
-        assert!(format!("{error}").contains("only bits=4"));
+        assert!(format!("{error}").contains("only bits=2 and bits=4"));
     }
 
     #[test]
