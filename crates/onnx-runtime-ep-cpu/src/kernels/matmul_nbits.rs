@@ -398,29 +398,16 @@ impl MatMulNBitsKernel {
     }
 }
 
-fn configured_decode_threads() -> std::result::Result<Option<usize>, String> {
-    match std::env::var(DECODE_THREADS_ENV) {
-        Ok(value) => parse_decode_threads(Some(&value)),
-        Err(std::env::VarError::NotPresent) => Ok(None),
-        Err(std::env::VarError::NotUnicode(_)) => {
-            Err(format!("{DECODE_THREADS_ENV} must be valid Unicode"))
-        }
-    }
+fn configured_decode_threads() -> Option<usize> {
+    let value = std::env::var(DECODE_THREADS_ENV).ok();
+    let available = std::thread::available_parallelism().ok()?.get();
+    resolve_decode_threads(value.as_deref(), available)
 }
 
-fn parse_decode_threads(value: Option<&str>) -> std::result::Result<Option<usize>, String> {
-    let Some(value) = value else {
-        return Ok(None);
-    };
-    let threads = value
-        .parse::<usize>()
-        .map_err(|_| format!("{DECODE_THREADS_ENV} must be a positive integer, got '{value}'"))?;
-    if threads == 0 {
-        return Err(format!(
-            "{DECODE_THREADS_ENV} must be a positive integer, got '0'"
-        ));
-    }
-    Ok(Some(threads))
+fn resolve_decode_threads(raw: Option<&str>, available: usize) -> Option<usize> {
+    let available = std::num::NonZeroUsize::new(available)?.get();
+    let threads = raw?.parse::<usize>().ok()?;
+    (threads > 0).then(|| threads.min(available))
 }
 
 fn build_decode_pool(
@@ -438,7 +425,7 @@ fn build_decode_pool(
 }
 
 fn with_decode_pool<T: Send>(operation: impl FnOnce() -> T + Send) -> Result<T> {
-    match DECODE_POOL.get_or_init(|| configured_decode_threads().and_then(build_decode_pool)) {
+    match DECODE_POOL.get_or_init(|| build_decode_pool(configured_decode_threads())) {
         Ok(Some(pool)) => Ok(pool.install(operation)),
         Ok(None) => Ok(operation()),
         Err(message) => Err(error(message.clone())),
@@ -1510,18 +1497,23 @@ mod tests {
     }
 
     #[test]
-    fn decode_thread_pool_is_opt_in_and_bounded() {
-        assert!(
-            build_decode_pool(parse_decode_threads(None).unwrap())
-                .unwrap()
-                .is_none()
-        );
-        let pool = build_decode_pool(parse_decode_threads(Some("3")).unwrap())
-            .unwrap()
-            .unwrap();
+    fn decode_thread_count_defaults_invalid_values_and_clamps() {
+        assert_eq!(resolve_decode_threads(None, 8), None);
+        assert_eq!(resolve_decode_threads(Some(""), 8), None);
+        assert_eq!(resolve_decode_threads(Some("0"), 8), None);
+        assert_eq!(resolve_decode_threads(Some("-4"), 8), None);
+        assert_eq!(resolve_decode_threads(Some("abc"), 8), None);
+        assert_eq!(resolve_decode_threads(Some("3"), 8), Some(3));
+        assert_eq!(resolve_decode_threads(Some("999999"), 8), Some(8));
+        assert_eq!(resolve_decode_threads(Some("1"), 8), Some(1));
+        assert_eq!(resolve_decode_threads(Some("3"), 0), None);
+    }
+
+    #[test]
+    fn decode_thread_pool_is_opt_in() {
+        assert!(build_decode_pool(None).unwrap().is_none());
+        let pool = build_decode_pool(Some(3)).unwrap().unwrap();
         assert_eq!(pool.install(rayon::current_num_threads), 3);
-        assert!(parse_decode_threads(Some("0")).is_err());
-        assert!(parse_decode_threads(Some("many")).is_err());
     }
 
     #[test]

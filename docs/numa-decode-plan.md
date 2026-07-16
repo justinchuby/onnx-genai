@@ -6,6 +6,9 @@
 dedicated Rayon pool. It is opt-in, does not change M>1 prefill, and leaves
 placement to `numactl`, `taskset`, or the process supervisor.
 
+Invalid, empty, zero, and negative values behave as if the variable were
+unset. Positive values are capped at the logical CPUs available to the process.
+
 This avoids a hardware-specific default. On the measured 2x48-core host,
 Qwen2.5-0.5B INT4 peaks at six node-local workers, while the 96-worker default
 is about half as fast. A larger model may have a different optimum.
