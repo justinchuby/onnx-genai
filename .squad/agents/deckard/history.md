@@ -102,3 +102,6 @@ Wired `subgraph_graph_capturable` as the centralized capture-eligibility consume
 
 ### 2026-07-16T00:00:03Z — NUMA decode thread-cap landing
 Added the opt-in `ONNX_GENAI_CPU_DECODE_THREADS` dedicated Rayon pool for M=1 CPU MatMulNBits decode (`2b242e2`). The initial environment parsing was rejected; Sebastian's bounded resolver fix (`feea8e5`) was cleared by Holden. The knob leaves prefill and the global pool unchanged; six pinned workers measured about 60 tok/s on the dual-socket Xeon.
+
+### 2026-07-16T00:00:00Z — onnx-rs Python path revision
+Revised Batty's rejected Python binding path seam (`5b348b5`): `PathBuf` values remain lossless, I/O error kinds map directly to Python exceptions, and `__fspath__` exceptions propagate. Added six Python regressions covering missing, denied, invalid, bytes, path-like failure, and non-UTF-8 paths; Freysa cleared the result.

@@ -469,3 +469,17 @@ NVRTC available: 113 passed, 0 failed, 0 skipped. The movement GPU binary passed
 **By:** Deckard; safety revision by Sebastian; reviewed by Holden
 **What:** `ONNX_GENAI_CPU_DECODE_THREADS` selects a dedicated Rayon pool only for CPU `MatMulNBits` with `M=1`; prefill and the default global pool remain unchanged. Missing, empty, invalid, zero, negative, and overflowing values fall back to the existing path; valid positive requests are capped at `available_parallelism()`.
 **Why:** On the dual-socket Xeon 8480C, a small pinned worker count substantially improves decode (about 60 tok/s at six workers versus roughly 50 tok/s at the 24-thread default). The initial implementation was rejected because unsafe environment values could abort inference or provoke excessive thread creation; the pure bounded resolver closes those cases and was cleared after 413 tests.
+
+## 2026-07-16 — Python bindings wave
+
+#### Sources: `rachael-nxrt-eager-genai.md`, `holden-nxrt-engine-threading.md`, `sebastian-nxrt-mutex-fix.md`, `holden-nxrt-rereview.md`, `batty-onnxrs-pybind.md`, `freysa-onnx-rs-python-review.md`, `deckard-onnxrs-patharg-fix.md`, `freysa-onnxrs-rereview.md`
+
+### Ship thread-safe `nxrt` eager and genai Python APIs
+**By:** Rachael; threading revision by Sebastian; reviewed by Holden
+**What:** `onnx-runtime-python` now ships default-on, independently selectable `nxrt.eager` and `nxrt.genai` features (the webserver remains excluded). `nxrt.eager` exposes dispatch, opset, and cache statistics; `nxrt.genai.Engine` exposes directory loading, tokenization, generation, and callback streaming. The original `unsendable` `RefCell` Engine wrapper was rejected because cross-thread use raised PyO3 `PanicException`; the merged revision stores the Rust engine in a `Mutex`, releases the GIL for engine work, and uses `try_lock` to return actionable `RuntimeError`s on contention or callback re-entry. `Cargo.lock` was refreshed.
+**Why:** Python users need local inference, single-op execution, and generation without pulling in a server or GPU toolkit. A sendable, fail-fast Mutex wrapper supports free-threaded Python safely while preserving engine invariants. Holden cleared the revision after the locked build and all 19 Rust binding tests passed. The final merged commit is `41d8c31`.
+
+### Ship the `onnx_rs` serialization Python module with lossless path handling
+**By:** Batty; path revision by Deckard; reviewed by Freysa
+**What:** The new abi3-py310 `onnx-rs-python` crate imports as `onnx_rs` and exposes an opaque `Model`, binary load/save, and `to_*`/`from_*` text, JSON, and TextProto codecs. The initial binding was rejected for an `exists()` preflight, lossy path conversion, and swallowing exceptions from `__fspath__`. The merged revision accepts lossless `PathBuf` values, maps actual I/O error kinds to Python exceptions, propagates `__fspath__` failures, and adds six Python path regressions.
+**Why:** `onnx_rs` avoids collision with the established `onnx` package and retains onnx-rs's stateless codec convention. Native path preservation and direct filesystem errors are required for valid non-UTF-8 Unix paths and accurate error reporting. Freysa cleared the revision after targeted Rust coverage and all six Python regression tests passed. The final merged fix is `5b348b5`.

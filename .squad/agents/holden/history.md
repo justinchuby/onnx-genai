@@ -61,3 +61,6 @@ Reviewed the threading change; post-fix verdict was needs-review/ship.
 
 ### 2026-07-16T00:00:03Z — Decode thread-cap safety review cycle
 Rejected Deckard's initial thread-cap environment parsing because unusable or huge values could abort inference or trigger unsafe worker creation; Deckard was locked out of the revision. Re-reviewed Sebastian's pure bounded resolver and cleared it: invalid values fall back safely, valid values cap at available parallelism, prefill remains untouched, and 413 tests passed.
+
+### 2026-07-16T00:00:00Z — nxrt Python genai review cycle
+Rejected Rachael's `RefCell`/`#[pyclass(unsendable)]` Engine because cross-thread use caused `PanicException`, and because the lockfile was stale. Cleared Sebastian's `Mutex`/sendable revision (`41d8c31`): GIL-released, fail-fast `try_lock` access preserves engine safety; the locked build and 19 Rust binding tests passed.

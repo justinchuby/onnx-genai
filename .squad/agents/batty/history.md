@@ -25,3 +25,6 @@ Batty is locked out of revising: H-D1 storage sizing, fusion follow-ups identifi
 
 ### 2026-07-16T00:00:00Z — Performance-and-design wave
 Unified text codecs around TextCodec and renamed the text APIs.
+
+### 2026-07-16T00:00:00Z — onnx-rs Python serialization bindings
+Added the independent abi3-py310 `onnx-rs-python` crate, importing as `onnx_rs`, with opaque models, binary load/save, and text/JSON/TextProto codec functions (`1ae9a3d`). Freysa rejected the path conversion seam; Deckard's cleared path fix landed as `5b348b5`.

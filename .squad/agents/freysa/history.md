@@ -11,3 +11,6 @@ Hired as MPS Perf & Testing engineer for the new Apple Metal EP for ONNX Runtime
 
 ### 2026-07-16T00:00:00Z — Performance-and-design wave
 Reviewed the unified string-serde surface as approve-with-notes.
+
+### 2026-07-16T00:00:00Z — onnx-rs Python binding review cycle
+Rejected Batty's initial `onnx_rs` binding for lossy paths, an `exists()` preflight, and swallowed `__fspath__` exceptions. Cleared Deckard's `5b348b5` revision after targeted Rust tests and six Python regressions verified lossless paths and native filesystem errors.

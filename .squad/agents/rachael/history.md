@@ -67,3 +67,5 @@ Batched-driver DoS hardening is canonical: admission is bounded by `max_pending`
 - Made incomplete graph construction crate-private so full validation follows initializer attachment; merged in loader validation.
 
 - 2026-07-16T00:00:01Z — Confirmed all 24 Qwen2.5-0.5B Sigmoids are `Mul(x, Sigmoid(x))` and landed guarded executor lowering plus allocation-free CPU SiLU (`682c93d`). Sigmoid share fell 6.55%→0%; decode improved 44.5→45.7 tok/s. Sebastian 🟢 approved; `d116a96` adds the multi-consumer negative test.
+
+- 2026-07-16T00:00:00Z — Delivered default-on `nxrt.eager` and `nxrt.genai` Python submodules plus `docs/PYTHON.md` (`56a4a90`). The initial genai Engine wrapper was later revised by Sebastian after Holden identified a cross-thread PyO3 panic; the merged, cleared result is `41d8c31`.

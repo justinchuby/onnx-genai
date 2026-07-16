@@ -53,3 +53,6 @@ Marked Gather non-capturable and fixed thread-count-aware MatMulNBits partitioni
 
 ### 2026-07-16T00:00:03Z — Safe decode-thread configuration fix
 Revised the rejected decode-only Rayon pool with a pure `resolve_decode_threads(raw, available)` helper (`feea8e5`). Empty, invalid, zero, negative, and overflowing settings now retain default behavior; positive values cap at available parallelism. Holden cleared the change after 413 tests.
+
+### 2026-07-16T00:00:00Z — nxrt Python Engine threading revision
+Replaced Rachael's rejected `RefCell`/unsendable Python genai Engine with a sendable `Mutex<RustEngine>` wrapper (`41d8c31`). Engine work releases the GIL and `try_lock` makes concurrent or callback-reentrant access an actionable `RuntimeError`; Holden cleared the fix.
