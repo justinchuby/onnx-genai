@@ -130,3 +130,106 @@ the remaining 24 Mul calls are the SwiGLU product with `up_proj`. Compared with
 the former Sigmoid plus half of Mul time, the fused local path is about 59%
 faster. Greedy output remained `[11576, 42740, 11, 358]` in every throughput
 run.
+
+## Follow-up: MLAS-style direct-int4 VNNI GEMV
+
+### MatMulNBits phase breakdown
+
+Fine-grained, env-gated timers were added temporarily and removed after
+measurement. Across steady-state decode steps, the 121 MatMulNBits calls spent:
+
+| phase | median ms/step | MatMulNBits time |
+|---|---:|---:|
+| input densification + output allocation | 0.648 | 3.1% |
+| activation quantization | 0.658 | 3.2% |
+| threaded VNNI GEMV | 19.520 | 93.7% |
+| int8 weight prepack | 0.000 steady-state | 0% |
+
+The first process invocation spent about 2.04 seconds unpacking all constant
+weights to int8. Every later invocation hit the `OnceLock`; prepack is
+session-start amortized, not a decode-step cost.
+
+At one worker the GEMV phase took 73.076 ms versus 19.520 ms at 24 workers,
+only 3.74x scaling. The old steady-state stream was at least 493.96 MB of
+expanded int8 weights, 61.75 MB of scales, and 61.75 MB of block sums per token.
+That is about 8.45 GB/s at one worker and 31.6 GB/s at 24 workers, far below
+host DRAM capability. Its arithmetic intensity was about 1.6 integer
+multiply-add operations per byte. The evidence points to the expanded stream,
+121 repeated Rayon barriers/shape-sized tasks, and inefficient block-level SIMD
+reduction rather than DRAM saturation or activation quantization.
+
+ORT MLAS's block-32 M=1 kernel keeps B packed. It SIMD-unpacks nibbles, applies
+the symmetric zero point, feeds signed values to VNNI, accumulates scaled float
+lanes across K blocks, and folds the lanes only at the end. It also tiles
+multiple K blocks and output columns. The previous Rust path instead expanded
+the whole model to int8, streamed a separate block-sum array, and horizontally
+reduced a VNNI accumulator after every 32-element block.
+
+### Change
+
+The symmetric, no-`g_idx`, block-32, M=1 `accuracy_level=4` path now caches the
+original packed bytes and scales. Runtime AVX2 + AVX-VNNI or
+AVX512-VNNI/AVX512VL detection selects a fused kernel that:
+
+1. loads 16 packed bytes for each 32-weight block;
+2. interleaves low/high nibbles and subtracts zero point 8 in SIMD;
+3. forms a signed int8 dot product with VNNI;
+4. multiplies lane sums by the block scale and accumulates them as f32; and
+5. folds once per output instead of once per block.
+
+Unsupported CPUs and other block/zero-point/group-index shapes retain the
+existing int8 or fp32 paths. The steady-state minimum weight stream falls from
+617.45 MB to 308.73 MB per token, doubling nominal arithmetic intensity to
+about 3.2 integer operations/byte. One-time first-invocation MatMulNBits time
+also fell from a paired median 1.941 seconds to 1.234 seconds because prepack no
+longer expands B or constructs block sums.
+
+### Results
+
+The main comparison alternated seven baseline/change processes at 24 workers.
+Each process generated four tokens, used three warmups and ten measured runs,
+and reproduced `[11576, 42740, 11, 358]`.
+
+| version | median tok/s | median ms/step | change |
+|---|---:|---:|---:|
+| int8-prepacked VNNI | 46.72 | 21.404 | — |
+| direct-int4 VNNI | **49.15** | **20.346** | **+5.2% tok/s** |
+
+The median of the seven within-pair speedups was +6.5%; host load made
+individual pairs range from -3.3% to +25.3%. The paired op profiler gives the
+cleaner local result:
+
+| version | MatMulNBits ms/step | node-time share |
+|---|---:|---:|
+| int8-prepacked VNNI | 16.454 | 84.58% |
+| direct-int4 VNNI | **14.154** | **82.53%** |
+
+That is a 14.0% local MatMulNBits reduction and a 2.05-point share reduction.
+The earlier independent 60-step profiles measured 19.339 to 15.840 ms
+(-18.1%), consistent in direction despite machine noise.
+
+The same paired binaries were also sampled at larger pools:
+
+| Rayon workers | baseline tok/s | direct-int4 tok/s | change |
+|---:|---:|---:|---:|
+| 48 | 35.64 | 38.34 | +7.6% |
+| 96 | 15.31 | 29.53 | +92.9% |
+
+Twenty-four workers remain best in absolute throughput. The unusually large
+96-worker relative gain comes from the existing policy leaving medium
+projections serial on the two-socket pool: cutting their resident weight stream
+in half matters much more there, but does not make 96 workers the preferred
+configuration.
+
+### Remaining MatMulNBits levers
+
+1. Tile four output columns and two/four K blocks as MLAS does, reusing
+   activation loads and scale broadcasts while increasing instruction-level
+   parallelism.
+2. Quantize activations per block and share the quantized activation across
+   projections with the same input; this requires a numerics review and likely
+   executor/graph support.
+3. Replace the fixed 48-worker topology cliff with NUMA-aware scheduling and
+   weight placement.
+4. Fuse QKV and gate/up projection dispatch at graph level after the standalone
+   kernel is exhausted.
