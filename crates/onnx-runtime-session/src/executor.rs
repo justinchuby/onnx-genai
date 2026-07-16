@@ -1680,7 +1680,8 @@ impl Executor {
 // are unavoidable boundary crossings: a *tensor → sequence* entry (a produced
 // `DeviceBuffer`, reused across runs, cannot be aliased so its bytes are moved
 // into the element `Arc` exactly once) and the single-alloc `Split`/`Concat`
-// data movement.
+// data movement. On a non-host EP, `SequenceAt` uploads the selected element to
+// an EP-owned buffer before any device kernel consumes it.
 //
 // ## No-race design
 //
@@ -2102,15 +2103,24 @@ impl Executor {
             })
     }
 
-    /// Back a tensor *output* value with a shared sequence element (SequenceAt):
-    /// the value owns no buffer — a downstream consumer reads the element's
-    /// `Arc` bytes zero-copy. Any stale buffer/view for the value is released.
+    /// Back a tensor *output* value with a shared sequence element (SequenceAt).
+    /// Host EPs retain the zero-copy `Arc` alias. Non-host EPs upload the bytes
+    /// into an EP-owned buffer so device kernels never receive a host pointer.
     fn store_seq_element_output(
         &mut self,
         vid: ValueId,
         elem: std::sync::Arc<SeqTensor>,
         resolved: &mut HashMap<ValueId, Vec<usize>>,
     ) -> Result<()> {
+        if !self.ep.device_id().is_host_accessible() {
+            return self.store_raw_tensor_output(
+                vid,
+                elem.dtype,
+                elem.shape.clone(),
+                &elem.data,
+                resolved,
+            );
+        }
         if let Some(old) = self.buffers.remove(&vid) {
             self.ep.deallocate(old)?;
         }
@@ -2568,6 +2578,9 @@ impl Executor {
             ))
         })?;
         let mut g = body.clone();
+        // ONNX subgraphs inherit the parent model's opset imports; GraphProto
+        // does not carry an independent import table.
+        g.opset_imports = self.graph.opset_imports.clone();
 
         // name → value id within the body.
         let mut body_names: HashMap<String, ValueId> = HashMap::new();
@@ -2988,7 +3001,10 @@ impl Executor {
         if seq_len != 0 {
             for t in &scan_inputs {
                 let (shape, bytes) = leading_slice(t, 0)?;
-                scan_slices.push(Tensor::from_raw_in(self.ep.clone(), t.dtype, shape, bytes)?);
+                // Subgraph inputs are host tensors that `run_scoped` uploads
+                // through the child EP. Keep the mutable slice staging buffer on
+                // the host rather than host-writing a non-host EP allocation.
+                scan_slices.push(Tensor::from_raw(t.dtype, shape, bytes)?);
             }
         }
         for step in 0..seq_len {

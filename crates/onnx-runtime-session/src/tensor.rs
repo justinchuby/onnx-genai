@@ -18,11 +18,10 @@
 //! ## The single `unsafe` seam
 //!
 //! A [`DeviceBuffer`] hands out only raw base pointers; reading or writing the
-//! bytes is `unsafe` and sound only on host-accessible devices. Every such
-//! access in this crate funnels through [`host_bytes`] / [`write_host`] /
-//! [`copy_host`], which assert host accessibility and length, so the rest of
-//! the crate — the executor and the public API — is safe Rust over the EP
-//! contract.
+//! bytes is `unsafe` and sound only on host-accessible devices. Every direct
+//! host read in this crate funnels through [`host_bytes`], while writes use the
+//! owning execution provider's host-copy API, so the rest of the crate — the
+//! executor and the public API — is safe Rust over the EP contract.
 
 use std::sync::{Arc, OnceLock};
 
@@ -81,34 +80,6 @@ pub(crate) fn host_bytes(buffer: &DeviceBuffer) -> &[u8] {
     unsafe { std::slice::from_raw_parts(buffer.as_ptr() as *const u8, buffer.len()) }
 }
 
-/// Copy `src` into the front of a host-accessible device buffer.
-pub(crate) fn write_host(buffer: &mut DeviceBuffer, src: &[u8]) -> Result<()> {
-    assert!(
-        buffer.device().is_host_accessible(),
-        "write_host on non-host device {:?}",
-        buffer.device()
-    );
-    if src.len() > buffer.len() {
-        return Err(SessionError::Internal(format!(
-            "write_host: source {} bytes exceeds buffer {} bytes",
-            src.len(),
-            buffer.len()
-        )));
-    }
-    if src.is_empty() {
-        return Ok(());
-    }
-    let dst = buffer.as_mut_ptr() as *mut u8;
-    // SAFETY: host-accessible device (asserted); `dst` is a unique writable host
-    // pointer obtained via `&mut buffer` (no alias), with at least `src.len()`
-    // bytes of capacity (checked above). `src` is a distinct owned slice, so the
-    // ranges do not overlap.
-    unsafe {
-        std::ptr::copy_nonoverlapping(src.as_ptr(), dst, src.len());
-    }
-    Ok(())
-}
-
 /// An owned, host-resident, device-aware tensor (§5, §20.2).
 ///
 /// Owns the [`DeviceBuffer`] that holds its elements and the EP that must free
@@ -163,7 +134,7 @@ impl Tensor {
         let layout = TensorLayout::contiguous();
         let align = layout.alignment;
         let mut buffer = allocator.allocate(expected.max(1), align)?;
-        write_host(&mut buffer, bytes)?;
+        allocator.copy_from_host(bytes, &mut buffer)?;
         Ok(Self {
             dtype,
             shape,
@@ -309,7 +280,8 @@ impl Tensor {
             )));
         }
         let buffer = self.buffer.as_mut().expect("Tensor buffer taken only in Drop");
-        write_host(buffer, bytes)
+        self.allocator.copy_from_host(bytes, buffer)?;
+        Ok(())
     }
 
     /// Copy out the elements as `f32`. Panics if the dtype is not `Float32`.
