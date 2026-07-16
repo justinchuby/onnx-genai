@@ -24,3 +24,5 @@ Renamed the full C ABI from `ort2_*` to `nxrt_*` with no compatibility aliases. 
 Loader opset-import validation for file, from-parts, and nested-subgraph paths merged in `00cda89`; the executor's sentinel failure path is now an unreachable invariant. Holden's final review was green.
 
 - 2026-07-15 — Added Windows oneDNN wheel bundling in `ef89a95`; CI verification is pending.
+
+- 2026-07-16T00:00:01Z — Re-profiled native CPU decode after MatMulNBits threading and landed allocation-free, same-shape contiguous-f32 `Mul` (`347060f`). The guarded non-aliased fast path reduced Mul 3.12→0.25 ms and decode 40.5→44.2 tok/s; Holden 🟡 approved (independent +6.35%).

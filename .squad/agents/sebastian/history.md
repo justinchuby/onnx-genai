@@ -48,3 +48,5 @@ Sebastian's perf review is now in decisions. §26 should prioritize active-row c
 
 ### 2026-07-16T00:00:00Z — Performance-and-design wave
 Marked Gather non-capturable and fixed thread-count-aware MatMulNBits partitioning.
+
+- 2026-07-16T00:00:01Z — 🟢 Approved Rachael's exact single-consumer `x * Sigmoid(x)`→SiLU fusion (`682c93d`); added multi-consumer non-fusion coverage in `d116a96`. Independent interleaved benchmark: 44.45→47.64 tok/s (+7.2%) with unchanged tokens.

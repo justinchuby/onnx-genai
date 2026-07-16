@@ -56,3 +56,5 @@ Reviewed Batty's unified load-time `validate_model()` checks for unsupported con
 
 ### 2026-07-16T00:00:00Z — Performance-and-design wave
 Reviewed the threading change; post-fix verdict was needs-review/ship.
+
+- 2026-07-16T00:00:01Z — 🟡 Approved Leon's guarded contiguous-f32 native CPU Mul fast path (`347060f`); aliasing, striding, broadcasting, and non-f32 remain generic. Independent decode result: +6.35%.

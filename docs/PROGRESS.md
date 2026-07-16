@@ -307,3 +307,9 @@ Scoped the "export Gemma4 E2B/12B via Mobius and smoke-test through onnx-genai" 
 **Remaining performance work:** native decode remains behind llama.cpp/vLLM. Next levers are int8 SDOT via `accuracy_level=4`, removing per-node executor overhead, and serving work for continuous batching plus paged KV.
 
 **Current main HEAD:** `3787c21`.
+
+### Native CPU elementwise performance follow-up
+
+- **Allocation-free Mul fast path ✅ (`347060f`, Leon; Holden 🟡):** Same-shape contiguous f32 inputs now write directly to a non-aliased output, while aliases, broadcasting, striding, and other dtypes retain the generic path. `Mul` fell **3.12 → 0.25 ms** and native decode improved **40.5 → 44.2 tok/s**.
+- **Guarded SiLU fusion ✅ (`682c93d` + `d116a96`, Rachael; Sebastian 🟢):** The executor lowers only single-consumer `x * Sigmoid(x)` pairs (either Mul operand order) to allocation-free CPU `Silu`; graph-output and multi-consumer Sigmoids are excluded. All 24 model pairs fuse safely; Sigmoid's **6.55% → 0%** profile share and decode reaches approximately **47.6 tok/s**.
+- **Current bottleneck:** native CPU decode is approximately **40.5 → 47.6 tok/s** across this wave (+17%). `MatMulNBits` is now about **81%** of decode time and is under active investigation by Roy.

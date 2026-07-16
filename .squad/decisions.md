@@ -420,3 +420,17 @@ NVRTC available: 113 passed, 0 failed, 0 skipped. The movement GPU binary passed
 **By:** Zhora
 **What:** Use the existing Rayon pool to partition int8/VNNI and fp32 M=1 MatMulNBits work into contiguous N chunks, with a 1 Mi dot-product serial threshold and at least 16 outputs per task. Larger-M int8 work partitions M and nests N partitioning only when rows underfill the pool.
 **Why:** Each output column is independent, contiguous ranges preserve packed-weight locality, and measured thresholding avoids Rayon wake-up overhead on small projections while respecting the configured global pool.
+
+#### Source: `leon-decode-profile2.md`
+
+### 2026-07-16: Fast-path same-shape contiguous f32 Mul on CPU
+**By:** Leon
+**What:** The CPU elementwise `Mul` kernel now writes same-shape contiguous f32 inputs directly to a non-aliased output; broadcasting, striding, other dtypes, and aliasing retain the generic materializing path.
+**Why:** Fresh 24-thread Qwen2.5-0.5B INT4 profiling found `Mul` at 11.73% of node time after MatMulNBits threading. Removing temporary allocations and copies reduced `Mul` from 3.119 to 0.249 ms and improved median decode throughput from 40.50 to 44.22 tok/s (+9.2%).
+
+#### Source: `rachael-silu-fuse.md`, `sebastian-silu-review.md`
+
+### 2026-07-16: Lower exact Sigmoid self-multiply pairs to fused SiLU
+**By:** Rachael; reviewed by Sebastian
+**What:** The native CPU executor lowers only single-consumer `x * Sigmoid(x)` patterns to `com.microsoft::Silu`; the CPU kernel uses a non-aliasing contiguous-f32 direct-write path and retains the general strided fallback. The rewrite handles either Mul operand order and rejects graph-output or multi-consumer Sigmoid values. Sebastian approved commit `682c93d`; commit `d116a96` adds the multi-consumer negative test.
+**Why:** Qwen2.5-0.5B has this exact pattern in all 24 MLP layers. Fusion removes 24 intermediate tensors and dispatches, reducing the former 6.55% Sigmoid share to zero while preserving greedy output tokens. CPU/session tests passed (409/112), and interleaved benchmarks improved from 44.45 to 47.64 tok/s.
