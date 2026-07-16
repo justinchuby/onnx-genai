@@ -127,6 +127,54 @@ fn independent_reference(
     output
 }
 
+fn accuracy4_reference(
+    activations: &[f32],
+    packed: &[u8],
+    scales: &[f32],
+    k: usize,
+    n: usize,
+    block_size: usize,
+) -> Vec<f32> {
+    let blocks = k.div_ceil(block_size);
+    let blob_size = block_size / 2;
+    let max_abs = activations
+        .iter()
+        .map(|value| value.abs())
+        .fold(0.0, f32::max);
+    if max_abs == 0.0 {
+        return vec![0.0; n];
+    }
+    let activation_scale = max_abs / 127.0;
+    let inverse_scale = activation_scale.recip();
+    let quantized_activations: Vec<i32> = activations
+        .iter()
+        .map(|value| (value * inverse_scale).round().clamp(-127.0, 127.0) as i32)
+        .collect();
+    let mut output = vec![0.0; n];
+    for column in 0..n {
+        let mut value = 0.0;
+        for block in 0..blocks {
+            let begin = block * block_size;
+            let end = (begin + block_size).min(k);
+            let packed_start = (column * blocks + block) * blob_size;
+            let mut dot = 0i32;
+            for depth in begin..end {
+                let within = depth - begin;
+                let byte = packed[packed_start + within / 2];
+                let quantized_weight = if within % 2 == 0 {
+                    byte & 0x0f
+                } else {
+                    byte >> 4
+                };
+                dot += quantized_activations[depth] * (i32::from(quantized_weight) - 8);
+            }
+            value += dot as f32 * scales[column * blocks + block];
+        }
+        output[column] = value * activation_scale;
+    }
+    output
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_case(
     ep: &CudaExecutionProvider,
@@ -138,6 +186,7 @@ fn run_case(
     k: usize,
     n: usize,
     block_size: usize,
+    accuracy_level: i64,
 ) -> onnx_runtime_ep_api::Result<Vec<f32>> {
     let blocks = k.div_ceil(block_size);
     let blob_size = block_size / 2;
@@ -178,6 +227,10 @@ fn run_case(
     node.attributes.insert("bits".into(), Attribute::Int(4));
     node.attributes
         .insert("block_size".into(), Attribute::Int(block_size as i64));
+    if accuracy_level != 0 {
+        node.attributes
+            .insert("accuracy_level".into(), Attribute::Int(accuracy_level));
+    }
     let node = graph.insert_node(node);
     graph.add_output(output);
     let model = Model::new(&graph);
@@ -261,6 +314,47 @@ fn assert_close(actual: &[f32], expected: &[f32]) {
     }
 }
 
+fn random_u32(state: &mut u64) -> u32 {
+    *state = state
+        .wrapping_mul(6_364_136_223_846_793_005)
+        .wrapping_add(1_442_695_040_888_963_407);
+    (*state >> 32) as u32
+}
+
+#[test]
+fn matmul_nbits_gpu_gemv_streams_random_packed_int4() {
+    let Some(ep) = gpu() else { return };
+    let (m, k, n, block_size) = (1usize, 1003usize, 37usize, 32usize);
+    let blocks = k.div_ceil(block_size);
+    let blob_size = block_size / 2;
+    let mut state = 0x7d54_3a91_c2e8_6b0fu64;
+    let activations: Vec<f32> = (0..k)
+        .map(|_| (random_u32(&mut state) as f32 / u32::MAX as f32 - 0.5) * 4.0)
+        .collect();
+    let packed: Vec<u8> = (0..n * blocks * blob_size)
+        .map(|_| random_u32(&mut state) as u8)
+        .collect();
+    let scales: Vec<f32> = (0..n * blocks)
+        .map(|_| 0.002 + (random_u32(&mut state) as f32 / u32::MAX as f32) * 0.08)
+        .collect();
+    let expected = independent_reference(&activations, &packed, &scales, None, m, k, n, block_size);
+    let actual = run_case(
+        &ep,
+        &[m, k],
+        &activations,
+        &packed,
+        &scales,
+        None,
+        k,
+        n,
+        block_size,
+        0,
+    )
+    .unwrap();
+    assert_close(&actual, &expected);
+    eprintln!("verified packed-int4 CUDA GEMV against independent f32 dequant reference");
+}
+
 #[test]
 fn matmul_nbits_gpu_block32_decode_symmetric_non_multiple_k() {
     let Some(ep) = gpu() else { return };
@@ -283,6 +377,7 @@ fn matmul_nbits_gpu_block32_decode_symmetric_non_multiple_k() {
         k,
         n,
         block_size,
+        0,
     ) {
         Err(error) if format!("{error}").contains("CUDA_ERROR_UNSUPPORTED_PTX_VERSION") => {
             eprintln!("skip: NVRTC PTX is newer than the installed CUDA driver ({error})");
@@ -325,6 +420,7 @@ fn matmul_nbits_gpu_block128_batched_asymmetric_non_multiple_k() {
         k,
         n,
         block_size,
+        0,
     ) {
         Err(error) if format!("{error}").contains("CUDA_ERROR_UNSUPPORTED_PTX_VERSION") => {
             eprintln!("skip: NVRTC PTX is newer than the installed CUDA driver ({error})");
@@ -334,4 +430,33 @@ fn matmul_nbits_gpu_block128_batched_asymmetric_non_multiple_k() {
     };
     assert_close(&actual, &expected);
     eprintln!("verified real GPU block128 M>1 numerics against independent reference");
+}
+
+#[test]
+fn matmul_nbits_gpu_accuracy4_block32_decode_matches_quantized_reference() {
+    let Some(ep) = gpu() else { return };
+    let (m, k, n, block_size) = (1, 77, 19, 32);
+    let activations: Vec<f32> = (0..k)
+        .map(|index| ((index * 23 % 53) as f32 - 26.0) / 17.0)
+        .collect();
+    let weights: Vec<f32> = (0..n * k)
+        .map(|index| ((index * 19 % 47) as f32 - 23.0) / 12.0)
+        .collect();
+    let (packed, scales, zero_points) = quantize(&weights, n, k, block_size, false);
+    let expected = accuracy4_reference(&activations, &packed, &scales, k, n, block_size);
+    let actual = run_case(
+        &ep,
+        &[m, k],
+        &activations,
+        &packed,
+        &scales,
+        zero_points.as_deref(),
+        k,
+        n,
+        block_size,
+        4,
+    )
+    .unwrap();
+    assert_close(&actual, &expected);
+    eprintln!("verified accuracy_level=4 packed-int4 CUDA GEMV semantics");
 }

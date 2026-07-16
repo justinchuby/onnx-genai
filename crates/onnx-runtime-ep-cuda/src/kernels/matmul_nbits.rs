@@ -1,5 +1,5 @@
-//! `com.microsoft::MatMulNBits`: block-wise INT4 weight dequantization followed
-//! by a full-precision f32 cuBLASLt GEMM.
+//! `com.microsoft::MatMulNBits`: decode-specialized packed INT4 GEMV plus the
+//! block-wise dequantization and f32 cuBLASLt GEMM fallback used for prefill.
 
 use std::ffi::c_void;
 use std::sync::Arc;
@@ -14,9 +14,13 @@ use crate::runtime::{CudaRuntime, cuptr};
 
 const DEQUANT_MODULE: &str = "matmul_nbits_dequant_f32";
 const DEQUANT_ENTRY: &str = "matmul_nbits_dequant_f32";
+const GEMV_MODULE: &str = "matmul_nbits_gemv";
+const GEMV_F32_ENTRY: &str = "matmul_nbits_gemv_f32";
+const GEMV_ACCURACY4_ENTRY: &str = "matmul_nbits_gemv_accuracy4_block32";
 const ACCURACY4_MODULE: &str = "matmul_nbits_accuracy4";
 const ACCURACY4_ENTRY: &str = "matmul_nbits_accuracy4";
 const BLOCK_THREADS: u32 = 256;
+const GEMV_ACCURACY4_THREADS: u32 = 32;
 
 const DEQUANT_SRC: &str = r#"
 extern "C" __global__ void matmul_nbits_dequant_f32(
@@ -54,6 +58,130 @@ extern "C" __global__ void matmul_nbits_dequant_f32(
         }
         weight_kn[idx] =
             ((float)quantized - (float)zero_point) * scales[(long)output * k_blocks + group];
+    }
+}
+"#;
+
+const GEMV_SRC: &str = r#"
+__device__ __forceinline__ float warp_sum(float value)
+{
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        value += __shfl_down_sync(0xffffffffu, value, offset);
+    }
+    return value;
+}
+
+__device__ __forceinline__ float block_sum(float value)
+{
+    __shared__ float warp_sums[32];
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    value = warp_sum(value);
+    if (lane == 0) {
+        warp_sums[warp] = value;
+    }
+    __syncthreads();
+    value = threadIdx.x < ((blockDim.x + 31) >> 5) ? warp_sums[lane] : 0.0f;
+    return warp == 0 ? warp_sum(value) : 0.0f;
+}
+
+extern "C" __global__ void matmul_nbits_gemv_f32(
+    const float* activation,
+    const unsigned char* packed,
+    const float* scales,
+    const unsigned char* zero_points,
+    const float* bias,
+    float* output,
+    const int k,
+    const int n,
+    const int block_size,
+    const int k_blocks,
+    const int blob_size,
+    const int zp_row_bytes)
+{
+    const int column = (int)blockIdx.x;
+    if (column >= n) {
+        return;
+    }
+
+    float value = 0.0f;
+    for (int depth = (int)threadIdx.x; depth < k; depth += (int)blockDim.x) {
+        const int block = depth / block_size;
+        const int within = depth - block * block_size;
+        const unsigned char byte =
+            packed[((long)column * k_blocks + block) * blob_size + within / 2];
+        const int quantized = (within & 1) ? (byte >> 4) : (byte & 15);
+        int zero_point = 8;
+        if (zero_points) {
+            const unsigned char zp =
+                zero_points[(long)column * zp_row_bytes + block / 2];
+            zero_point = (block & 1) ? (zp >> 4) : (zp & 15);
+        }
+        value += activation[depth] * ((float)quantized - (float)zero_point)
+            * scales[(long)column * k_blocks + block];
+    }
+
+    value = block_sum(value);
+    if (threadIdx.x == 0) {
+        output[column] = value + (bias ? bias[column] : 0.0f);
+    }
+}
+
+extern "C" __global__ void matmul_nbits_gemv_accuracy4_block32(
+    const float* activation,
+    const unsigned char* packed,
+    const float* scales,
+    const float* bias,
+    float* output,
+    const int k,
+    const int n,
+    const int k_blocks)
+{
+    const int column = (int)blockIdx.x;
+    if (column >= n) {
+        return;
+    }
+
+    float max_abs = 0.0f;
+    for (int depth = (int)threadIdx.x; depth < k; depth += 32) {
+        max_abs = fmaxf(max_abs, fabsf(activation[depth]));
+    }
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        max_abs = fmaxf(max_abs,
+            __shfl_down_sync(0xffffffffu, max_abs, offset));
+    }
+    max_abs = __shfl_sync(0xffffffffu, max_abs, 0);
+    if (max_abs == 0.0f) {
+        if (threadIdx.x == 0) {
+            output[column] = bias ? bias[column] : 0.0f;
+        }
+        return;
+    }
+
+    const float activation_scale = max_abs / 127.0f;
+    const float inverse_scale = 1.0f / activation_scale;
+    float value = 0.0f;
+    for (int block = (int)threadIdx.x; block < k_blocks; block += 32) {
+        const int begin = block * 32;
+        const int end = begin + 32 < k ? begin + 32 : k;
+        const long packed_start = ((long)column * k_blocks + block) * 16;
+        int dot = 0;
+        for (int depth = begin; depth < end; ++depth) {
+            const int within = depth - begin;
+            const unsigned char byte = packed[packed_start + within / 2];
+            const int quantized_weight =
+                (within & 1) ? (byte >> 4) : (byte & 15);
+            const int quantized_activation =
+                (int)roundf(fminf(127.0f, fmaxf(-127.0f,
+                    activation[depth] * inverse_scale)));
+            dot += quantized_activation * (quantized_weight - 8);
+        }
+        value += (float)dot * scales[(long)column * k_blocks + block];
+    }
+
+    value = warp_sum(value) * activation_scale;
+    if (threadIdx.x == 0) {
+        output[column] = value + (bias ? bias[column] : 0.0f);
     }
 }
 "#;
@@ -278,6 +406,31 @@ impl MatMulNBitsKernel {
         }
 
         let m = a_shape[..a_shape.len() - 1].iter().product::<usize>();
+        if m == 1 && group_indices.is_none() {
+            if self.accuracy_level == 4 && self.block_size == 32 && zero_points.is_none() {
+                return self.launch_accuracy4_gemv(
+                    &inputs[0],
+                    &inputs[1],
+                    &inputs[2],
+                    bias,
+                    &mut outputs[0],
+                    k_blocks,
+                );
+            }
+            if self.accuracy_level != 4 {
+                return self.launch_f32_gemv(
+                    &inputs[0],
+                    &inputs[1],
+                    &inputs[2],
+                    zero_points,
+                    bias,
+                    &mut outputs[0],
+                    k_blocks,
+                    blob_size,
+                    zp_row_bytes,
+                );
+            }
+        }
         if self.accuracy_level == 4 && group_indices.is_none() {
             return self.launch_accuracy4(
                 &inputs[0],
@@ -351,6 +504,111 @@ impl MatMulNBitsKernel {
         let free_workspace = unsafe { self.runtime.free_raw(workspace) };
         let free_weight = unsafe { self.runtime.free_raw(weight) };
         result.and(free_workspace).and(free_weight)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn launch_f32_gemv(
+        &self,
+        activation: &TensorView,
+        packed: &TensorView,
+        scales: &TensorView,
+        zero_points: Option<&TensorView>,
+        bias: Option<&TensorView>,
+        output: &mut TensorMut,
+        k_blocks: usize,
+        blob_size: usize,
+        zp_row_bytes: usize,
+    ) -> Result<()> {
+        let function = self
+            .runtime
+            .nvrtc_function(GEMV_MODULE, GEMV_SRC, GEMV_F32_ENTRY)?;
+        let activation_ptr = cuptr(activation.data_ptr::<u8>() as *const c_void);
+        let packed_ptr = cuptr(packed.data_ptr::<u8>() as *const c_void);
+        let scales_ptr = cuptr(scales.data_ptr::<u8>() as *const c_void);
+        let zero_points_ptr = zero_points
+            .map(|tensor| cuptr(tensor.data_ptr::<u8>() as *const c_void))
+            .unwrap_or(0);
+        let bias_ptr = bias
+            .map(|tensor| cuptr(tensor.data_ptr::<u8>() as *const c_void))
+            .unwrap_or(0);
+        let output_ptr = cuptr(output.data_ptr_mut::<u8>() as *const c_void);
+        let k = as_i32("K", self.k)?;
+        let n = as_i32("N", self.n)?;
+        let block_size = as_i32("block_size", self.block_size)?;
+        let k_blocks = as_i32("K block count", k_blocks)?;
+        let blob_size = as_i32("block blob size", blob_size)?;
+        let zp_row_bytes = as_i32("zero-point row size", zp_row_bytes)?;
+        let mut builder = self.runtime.stream().launch_builder(&function);
+        builder
+            .arg(&activation_ptr)
+            .arg(&packed_ptr)
+            .arg(&scales_ptr)
+            .arg(&zero_points_ptr)
+            .arg(&bias_ptr)
+            .arg(&output_ptr)
+            .arg(&k)
+            .arg(&n)
+            .arg(&block_size)
+            .arg(&k_blocks)
+            .arg(&blob_size)
+            .arg(&zp_row_bytes);
+        // SAFETY: validated dense tensors cover the complete M=1 operation and
+        // the scalar ABI matches `matmul_nbits_gemv_f32`.
+        unsafe {
+            builder.launch(LaunchConfig {
+                grid_dim: (self.n as u32, 1, 1),
+                block_dim: (BLOCK_THREADS, 1, 1),
+                shared_mem_bytes: 0,
+            })
+        }
+        .map_err(|err| driver_err("launch MatMulNBits f32 GEMV", err))?;
+        self.runtime.synchronize()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn launch_accuracy4_gemv(
+        &self,
+        activation: &TensorView,
+        packed: &TensorView,
+        scales: &TensorView,
+        bias: Option<&TensorView>,
+        output: &mut TensorMut,
+        k_blocks: usize,
+    ) -> Result<()> {
+        let function = self
+            .runtime
+            .nvrtc_function(GEMV_MODULE, GEMV_SRC, GEMV_ACCURACY4_ENTRY)?;
+        let activation_ptr = cuptr(activation.data_ptr::<u8>() as *const c_void);
+        let packed_ptr = cuptr(packed.data_ptr::<u8>() as *const c_void);
+        let scales_ptr = cuptr(scales.data_ptr::<u8>() as *const c_void);
+        let bias_ptr = bias
+            .map(|tensor| cuptr(tensor.data_ptr::<u8>() as *const c_void))
+            .unwrap_or(0);
+        let output_ptr = cuptr(output.data_ptr_mut::<u8>() as *const c_void);
+        let k = as_i32("K", self.k)?;
+        let n = as_i32("N", self.n)?;
+        let k_blocks = as_i32("K block count", k_blocks)?;
+        let mut builder = self.runtime.stream().launch_builder(&function);
+        builder
+            .arg(&activation_ptr)
+            .arg(&packed_ptr)
+            .arg(&scales_ptr)
+            .arg(&bias_ptr)
+            .arg(&output_ptr)
+            .arg(&k)
+            .arg(&n)
+            .arg(&k_blocks);
+        // SAFETY: this path is restricted to symmetric block-32 M=1 inputs and
+        // the scalar ABI matches `matmul_nbits_gemv_accuracy4_block32`.
+        unsafe {
+            builder.launch(LaunchConfig {
+                grid_dim: (self.n as u32, 1, 1),
+                block_dim: (GEMV_ACCURACY4_THREADS, 1, 1),
+                shared_mem_bytes: 0,
+            })
+        }
+        .map_err(|err| driver_err("launch MatMulNBits accuracy_level=4 GEMV", err))?;
+        self.runtime.synchronize()
     }
 
     #[allow(clippy::too_many_arguments)]
