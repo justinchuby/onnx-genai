@@ -1311,3 +1311,16 @@ Re-reviewed commit `2ae464b5d894276f38a5855599c0c9124ea23558` against rejected b
 - `cargo build -p onnx-genai-server`: PASS
 - `cargo test -p onnx-genai-engine --features native-backend`: 111 passed, 18 failed, 1 ignored; all 18 failures are the allowed missing `tiny-llm/model.onnx` fixture failures.
 - Targeted backend tests: 6 passed (3 unit/pipeline plus 3 native integration), 0 failed.
+
+
+#### Source: `roy-native-cuda-device.md`, `wallace-native-cuda-review.md`, `deckard-native-cuda-safe.md`, `wallace-native-cuda-rereview.md`
+
+### 2026-07-16: Native CUDA serving shipped with a fail-fast heterogeneous-placement gate
+**By:** Roy, Deckard; reviewed by Wallace
+**Status:** 🟢 CLEAR (`fa30410`; supersedes the rejected `559c46f` CUDA-only serving behavior)
+
+**Decision:** Native Engine/server CUDA device plumbing is shipped, but CUDA-only native sessions must probe model coverage at load time and reject real sub-4-bit models that need CPU fallback. The load error explicitly identifies heterogeneous CPU+CUDA placement as unavailable and directs users to native CPU or ORT. It must occur before the server listens, so unsupported models cannot reach a request-time HTTP 500 or hang.
+
+**Rationale:** `559c46f` correctly exposed `NativeDecodeDevice::Cuda` through `EngineConfig`, `SessionOptions`, and server CLI/environment selection, but the real 144-`BlockQuantizedMatMul` IQ4 model failed under a CUDA-only session during prefill and later on `Transpose`. The prior Constant/Gather fixture did not exercise this failure mode. Deckard's `fa30410` adds per-node CUDA capability probing, including symbolic/M>1 `BlockQuantizedMatMul`, and a reachable multi-token sub-4-bit regression: CPU generation succeeds; explicit CUDA and SessionOptions-routed CUDA fail deterministically at load with actionable remediation. A fully CUDA-supported smoke graph remains the positive CUDA parity proof.
+
+**Deferred:** True GPU serving for real sub-4-bit models requires heterogeneous CUDA-first/CPU-fallback placement, cross-device buffers/copies, and M>1 CPU prefill versus M=1 CUDA decode. The design is documented in `docs/HETEROGENEOUS_PLACEMENT.md` and is **AWAITING USER GREENLIGHT**.

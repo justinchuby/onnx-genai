@@ -362,7 +362,7 @@ Scoped the "export Gemma4 E2B/12B via Mobius and smoke-test through onnx-genai" 
 ### Runtime follow-ups
 
 - CUDA↔CPU parity: bounded `1.9e-5` drift from token 16 onward = accepted fp reduction-order tolerance (do **not** serialize GPU reduction — measured 8.4% cost).
-- **Native decode backend serving ✅ DONE (`66ec4b8` → `2ae464b`, Deckard; Batty revision; Holden 🔴→🟢):** Engine and HTTP server now load and serve sub-4-bit `BlockQuantizedMatMul` models through `Auto`/`Ort`/`Native` selection. Auto requires the exact `com.github.onnxruntime.genai` domain and opset v1; native serving is batch-1 serialized and supports streaming while existing non-matching models remain on ORT.
+- **Native CUDA serving ✅ SHIPPED — fail-fast gated (`559c46f` → `fa30410`, Roy; Deckard revision; Wallace 🔴→🟢):** Engine and HTTP server expose native CUDA selection through `EngineConfig`, `SessionOptions`, and server CLI/environment configuration. CUDA-only sessions reject unsupported real sub-4-bit models at load time with an actionable heterogeneous-placement error directing users to native CPU or ORT; the server does not listen, so this path cannot become a request-time 500 or hang. Fully CUDA-supported graphs remain CUDA-servable. True GPU serving of real sub-4-bit models is blocked on heterogeneous placement; `docs/HETEROGENEOUS_PLACEMENT.md` is **AWAITING USER GREENLIGHT**.
 
 #### Native backend — deferred follow-ups
 

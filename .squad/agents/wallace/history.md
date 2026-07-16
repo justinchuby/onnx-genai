@@ -37,3 +37,8 @@
 
 - 🟢 Cleared Roy's merged `06c4c06` on H200: IQ1_S/IQ1_M M=1 CUDA decoding is bit-exact versus CPU, including both known traces; shared `IQ1S_GRID` hash is `0x6703ed863501ae2e`.
 - Full CUDA validation passed 129 tests across 15 groups and the CPU gate passed 15 (one ignored); M>1/unknown fallback and SM-general NVRTC behavior remain correct.
+
+
+## 2026-07-16T23:06:37+0000 — Native CUDA serving safety re-review
+
+- 🔴 Rejected Roy's CUDA-only `559c46f` because the real 144-BQMM model failed mid-serving without CPU fallback; Roy is locked out. 🟢 Cleared Deckard's `fa30410`: real unsupported CUDA models now fail at startup with heterogeneous-placement guidance, while CPU sub-4 generation and CUDA-positive smoke coverage remain valid.

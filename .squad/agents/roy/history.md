@@ -64,3 +64,8 @@ Authored CUDA Gather, Shape, and Constant kernels; coverage reached 65.
 
 - Merged `06c4c06`: static M=1 CUDA `BlockQuantizedMatMul` GEMV now supports IQ1_S and IQ1_M through the shared 2,048-entry `IQ1S_GRID`, completing all 10 GPU IQ/MXFP4 formats.
 - M>1 and unknown formats remain CPU-routed; Wallace 🟢 cleared H200 bit-exact parity, the shared-grid hash, and the full validation gates.
+
+
+## 2026-07-16T23:06:37+0000 — Native CUDA serving safety gate
+
+- `559c46f` added native CUDA Engine/server selection but was 🔴 rejected: CUDA-only sessions could not serve the real 144-node sub-4-bit model. Roy is locked out of this revision artifact; Deckard's `fa30410` safety gate is canonical.

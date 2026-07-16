@@ -120,3 +120,8 @@ Authored initial CUDA executor wiring (`1a2deca`): opt-in CUDA EP selection, dev
 ## 2026-07-16T19:27:57+0000Z — Native backend serving review cycle
 
 Authored native Engine/server backend integration in `66ec4b8`; Holden rejected it for exact operator identity, ignored speculative requests, and silent pipeline/device degradation. Deckard was locked out; Batty's `2ae464b` revision was cleared by Holden.
+
+
+## 2026-07-16T23:06:37+0000 — Native CUDA fail-fast revision
+
+- Authored `fa30410` after Roy's CUDA-only serving rejection: capability-probe CUDA models at load, fail unsupported real sub-4-bit graphs with CPU/ORT remediation, and cover a reachable BQMM/Transpose regression. Wallace 🟢 cleared it; heterogeneous placement remains AWAITING USER GREENLIGHT.
