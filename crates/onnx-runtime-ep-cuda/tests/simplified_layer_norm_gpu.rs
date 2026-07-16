@@ -187,3 +187,15 @@ fn standard_simplified_layer_norm_matches_contrib_and_reference() {
     assert_close("domain output parity", &standard.0, &contrib.0);
     assert_close("domain invstd parity", &standard.1, &contrib.1);
 }
+
+#[test]
+fn simplified_layer_norm_does_not_contract_square_accumulation() {
+    let Some(ep) = cuda_ep() else { return };
+    let input = [-0.09129826, -1.0101787, 3.0318594, 5.774467];
+    let scale = [1.0; 4];
+    let expected = reference(&input, &scale, 4, 1e-5);
+    let got = run(&ep, ("", 21), &input, &scale, &[1, 4], -1, 1e-5).unwrap();
+
+    assert_eq!(got.0, expected.0);
+    assert_eq!(got.1, expected.1);
+}

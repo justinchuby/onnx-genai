@@ -141,7 +141,9 @@ extern "C" __global__ void rmsnorm_f32(
         float ss = 0.0f;
         for (int j = 0; j < norm_size; ++j) {
             const float xv = x[base + j];
-            ss += xv * xv;
+            // Match the CPU kernel's separate multiply then add. NVRTC otherwise
+            // contracts this expression to FMA and changes recurrent decode state.
+            ss = __fadd_rn(ss, __fmul_rn(xv, xv));
         }
         red[0] = ss;
     }
@@ -202,7 +204,8 @@ extern "C" __global__ void skip_rmsnorm_f32(
         float ss = 0.0f;
         for (int j = 0; j < norm_size; ++j) {
             const float sv = y[base + j];
-            ss += sv * sv;
+            // Keep the residual RMS reduction bit-identical to the CPU kernel.
+            ss = __fadd_rn(ss, __fmul_rn(sv, sv));
         }
         red[0] = ss;
     }

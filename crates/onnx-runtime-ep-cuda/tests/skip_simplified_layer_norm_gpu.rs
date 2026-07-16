@@ -305,3 +305,24 @@ fn skip_simplified_layer_norm_matches_independent_residual_rms_reference() {
     assert_close("mean", &got[1], &vec![0.0; expected_invstd.len()]);
     assert_close("inverse RMS", &got[2], &expected_invstd);
 }
+
+#[test]
+fn skip_simplified_layer_norm_does_not_contract_square_accumulation() {
+    let Some(ep) = cuda_ep() else {
+        return;
+    };
+    let input = [-0.09129826, -1.0101787, 3.0318594, 5.774467];
+    let skip = [0.0; 4];
+    let gamma = [1.0; 4];
+    let bias = [0.0; 4];
+    let got = run_available(&ep, &[1, 4], &[1, 4], &input, &skip, &gamma, &bias, 1e-5).unwrap();
+    if got.is_empty() {
+        return;
+    }
+    let (expected_y, expected_sum, expected_invstd) =
+        reference(&[1, 4], &[1, 4], &input, &skip, &gamma, &bias, 1e-5);
+
+    assert_eq!(got[0], expected_y);
+    assert_eq!(got[2], expected_invstd);
+    assert_eq!(got[3], expected_sum);
+}

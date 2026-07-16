@@ -1015,9 +1015,9 @@ mod tests {
 
         assert_eq!(cpu_tokens.len(), 16);
         assert_eq!(cuda_tokens.len(), cpu_tokens.len());
-        // M2's CUDA numerics diverge from the CPU oracle after token 10 for this
-        // prompt; M3 must preserve (not shorten) the established parity window.
-        assert_eq!(&cuda_tokens[..10], &cpu_tokens[..10]);
+        // Explicit non-contracted RMS reductions extend CUDA/CPU parity through
+        // token 11. Residual backend drift currently starts at token index 12.
+        assert_eq!(&cuda_tokens[..12], &cpu_tokens[..12]);
         assert_eq!(
             &cpu_tokens[..8],
             &[11576, 42740, 11, 358, 614, 264, 3405, 911]
