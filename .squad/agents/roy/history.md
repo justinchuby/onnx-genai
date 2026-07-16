@@ -59,3 +59,8 @@ Authored CUDA Gather, Shape, and Constant kernels; coverage reached 65.
 ## 2026-07-16T19:27:57+0000 — CUDA IQ super-block GEMV wave
 
 - Merged `8bf113e`: CUDA static M=1 BlockQuantizedMatMul GEMV now supports IQ4_XS, IQ2_XXS, IQ3_XXS, IQ2_XS, IQ2_S, and IQ3_S; together with MXFP4/IQ4_NL this is 8/10 IQ formats. Shared audited grids/sign tables moved into `onnx-runtime-quantization`; Leon and Wallace cleared the refactor and H200 GPU validation. IQ1_S/IQ1_M remain the final GPU formats.
+
+## 2026-07-16T19:27:57+0000 — CUDA IQ1 GEMV completion
+
+- Merged `06c4c06`: static M=1 CUDA `BlockQuantizedMatMul` GEMV now supports IQ1_S and IQ1_M through the shared 2,048-entry `IQ1S_GRID`, completing all 10 GPU IQ/MXFP4 formats.
+- M>1 and unknown formats remain CPU-routed; Wallace 🟢 cleared H200 bit-exact parity, the shared-grid hash, and the full validation gates.

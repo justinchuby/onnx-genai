@@ -1153,3 +1153,19 @@ Verified on NVIDIA H200, compute capability 9.0, driver 580.105.08.
 - Explicit `--test block_quantized_matmul_gpu`: **4/4 passed**, including all-format random GPU-vs-CPU parity, per-depth bit-exact decode, known blocks, and fallback dispatch.
 - Existing MXFP4/IQ4_NL cases remain in the bit-exact/random/known-block loops and passed.
 - Existing accuracy-level-4 drift regressions passed; measured CPU/CUDA max absolute difference remains the accepted `1.9073486e-5`. RMS anti-contraction tests also passed in the full suite.
+
+---
+
+## 2026-07-16T19:27:57+0000 — CUDA IQ1 GEMV completion
+
+#### Sources: `roy-cuda-iq1-gemv.md`, `wallace-cuda-iq1-review.md`
+
+### Complete the CUDA M=1 IQ decode family with IQ1_S and IQ1_M
+**By:** Roy; reviewed by Wallace
+**What:** Merged `06c4c06`: static M=1 CUDA `BlockQuantizedMatMul` GEMV now decodes IQ1_S and IQ1_M using the canonical shared 2,048-entry `IQ1S_GRID`. This completes GPU decode for all ten formats: MXFP4, IQ4_NL, IQ4_XS, IQ2_XXS, IQ3_XXS, IQ2_XS, IQ2_S, IQ3_S, IQ1_S, and IQ1_M. M>1 and unknown formats remain unsupported by CUDA so they route to the optimized CPU prefill path.
+**Why:** The two IQ1 formats were the remaining CPU decode fallbacks. Sharing the audited grid preserves CPU semantics and eliminates table-transcription drift.
+
+### CUDA IQ1_S/IQ1_M review cleared
+**By:** Wallace
+**What:** 🟢 CLEAR on H200. The shared grid FNV-1a hash is `0x6703ed863501ae2e`; both known traces and all random/per-weight GPU-versus-CPU comparisons are correct. The CUDA suite passed 129 tests across 15 groups, and the CPU gate passed 15 tests (one ignored). No fixed SM90 target was added.
+**Why:** Validation confirms IQ1 index reconstruction, scales, deltas, signs, fallbacks, and runtime-device NVRTC targeting all preserve the established contracts.

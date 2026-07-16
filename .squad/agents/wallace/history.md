@@ -32,3 +32,8 @@
 ## 2026-07-16T19:27:57+0000 — CUDA IQ super-block GEMV wave
 
 - 🟢 Cleared Roy's CUDA IQ super-block GEMV on H200: IQ4_XS, IQ2_XXS, IQ3_XXS, IQ2_XS, IQ2_S, and IQ3_S are bit-exact against CPU; IQ1_S/IQ1_M and M>1 fall back correctly. Full CUDA validation passed 128/128 without SM90 hardcoding.
+
+## 2026-07-16T19:27:57+0000 — CUDA IQ1 GEMV review
+
+- 🟢 Cleared Roy's merged `06c4c06` on H200: IQ1_S/IQ1_M M=1 CUDA decoding is bit-exact versus CPU, including both known traces; shared `IQ1S_GRID` hash is `0x6703ed863501ae2e`.
+- Full CUDA validation passed 129 tests across 15 groups and the CPU gate passed 15 (one ignored); M>1/unknown fallback and SM-general NVRTC behavior remain correct.
