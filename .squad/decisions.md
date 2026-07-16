@@ -353,8 +353,8 @@ NVRTC available: 113 passed, 0 failed, 0 skipped. The movement GPU binary passed
 
 # Pris review — CUDA MatMulNBits int4 GEMM
 
-**Timestamp:** 2026-07-16T03:05:00Z  
-**Commit:** `4997676701b7ec3922669ae54ec84728ac6b6d84`  
+**Timestamp:** 2026-07-16T03:05:00Z
+**Commit:** `4997676701b7ec3922669ae54ec84728ac6b6d84`
 **Verdict:** 🟢 APPROVE
 
 - Inspected the NVRTC dequantization kernel, cuBLASLt GEMM path, registry, tests, and coverage documentation.
@@ -1043,3 +1043,113 @@ The accepted residual mismatch beginning at token index 12 is likely seeded by t
 **What:** The token-12 divergence was caused by layer-0 fused SiLU operation order, not MatMulNBits: CUDA now follows CPU's branch-stable expression with explicitly rounded f32 operations. CUDA acc4 scale/accumulation boundaries also use explicit round-to-nearest operations. CPU/CUDA greedy parity now holds through token index 15.
 
 **Why:** A remaining K=4864 accuracy-level-4 reduction-tree difference is bounded at max absolute `1.9073486e-5` and first amplifies to a token divergence at index 16. Serializing the GPU reduction to emulate CPU exactly costs 8.4% decode throughput, so the parallel warp reduction remains the accepted tolerance. H200 validation passed all 128 CUDA EP tests, exact SiLU-order regression, acc4 comparison, and 16-token parity coverage.
+
+
+## 2026-07-16T19:27:57+0000 — CUDA IQ super-block GEMV and shared quantization tables
+
+#### Source: `roy-cuda-iq-superblock-gemv.md`
+
+# 2026-07-16 — CUDA IQ super-block GEMV
+
+**By:** Roy
+
+**What:** Extended the static M=1 CUDA `BlockQuantizedMatMul` GEMV with bit-exact on-device decoding for `iq4_xs`, `iq2_xxs`, `iq3_xxs`, `iq2_xs`, `iq2_s`, and `iq3_s`. Existing `mxfp4`/`iq4_nl` support is unchanged. `iq1_s`, `iq1_m`, and every M>1 shape remain CPU-routed.
+
+**Why:** These six 256-element super-block formats cover the prioritized mixed-IQ MoE decode path while preserving fail-closed fallback for the delta-bearing IQ1 layouts. Shipping only formats proven bit-exact against the CPU reference avoids silent model corruption.
+
+**Shared grids:** Added `onnx-runtime-quantization`, containing the audited llama.cpp b15ca938 IQ grids/sign table moved directly from the CPU implementation. CPU decoders import those constants, and CUDA source generation serializes the same Rust constants into device `__constant__` arrays, preventing CPU/GPU table drift. Source-body comparison and existing FNV fingerprints verified all seven moved tables unchanged.
+
+**Hand-verified blocks:**
+- IQ4_XS: fp16 scale `0.5`, encoded six-bit sub-scale `34` gives factor `2`; codebook index `0` decodes element 0 to `-127.0`.
+- IQ2_XXS: fp16 scale `2.0`, grid/sign/metadata index `0` gives sub-scale `0.25`; grid magnitude `8` decodes element 0 to `2.0`.
+- Random blocks for every GPU-supported format passed CPU comparison; one-hot GEMV proved every decoded element bit-exact.
+
+**Deferred:** `iq1_s` and `iq1_m` stay on CPU because their 2048-entry signed grid, delta term, and IQ1_M bitsliced fp16 scale deserve a separate final audit. No performance benchmark was measured in this correctness pass.
+
+**Validation:** `cargo build -p onnx-runtime-ep-cuda`; full CUDA suite 128/128 passed with the installed Python cuDNN library path; CPU `block_quantized` tests 15 passed, 1 benchmark ignored.
+
+#### Source: `leon-quant-crate-refactor-review.md`
+
+# 2026-07-16T19:21:34Z — Quantization crate CPU refactor review
+
+**By:** Leon
+**Verdict:** 🟢 CLEAR
+**Reviewed:** Roy commit `4ec30be` on `cuda-iq-superblock-gemv`
+**Scope:** CPU behavior and shared-table extraction only
+
+## Table identity
+
+Compared parsed values, order, declared lengths, and little-endian byte streams from merge-base `5c7dcc9` against `crates/onnx-runtime-quantization/src/lib.rs`. All moved constants are byte-identical:
+
+- `IQ1S_GRID`: 2048 `u64`; FNV-1a `0x6703ed863501ae2e`
+- `IQ2XS_GRID`: 512 `u64`; FNV-1a `0xc9b1ee61e79909bd`
+- `IQ2S_GRID`: 1024 `u64`; FNV-1a `0x123edd38a3b62b90`
+- `IQ3XXS_GRID`: 256 `u32`; FNV-1a `0xdfa5dc83d6a155d5`
+- `IQ2XS_SIGNS`: 128 `u8`; FNV-1a `0xf19ba8f8c3292ba5`
+- `IQ2XXS_GRID`: 256 `u64`; FNV-1a `0xbb4ee025b5ac6e8e`
+- `IQ3S_GRID`: 512 `u32`; FNV-1a `0xfa37020c25b44829`
+
+The CPU-local `IQ4_NL_CODEBOOK` is unchanged byte-for-byte. The implicit `kmask` sequence remains `1 << j`, yielding `[1, 2, 4, 8, 16, 32, 64, 128]`.
+
+## CPU op unchanged
+
+`block_quantized_matmul.rs` replaces the old include/local table definitions with imports from `onnx-runtime-quantization`. After mechanically accounting for that extraction, the only residual differences are rustfmt import ordering and one blank line; decode, validation, matmul, and test logic are unchanged. Joi's runtime AVX2 selection and MXFP4/IQ4_NL/IQ4_XS SIMD decoders remain intact.
+
+## Build and tests
+
+Using `CARGO_TARGET_DIR=/home/justinchu/onnx-genai/target-leon`:
+
+- `cargo build -p onnx-runtime-ep-cpu`: passed
+- `cargo test -p onnx-runtime-ep-cpu block_quantized`: 15 passed, 0 failed, 1 ignored
+- `cargo test -p onnx-runtime-quantization`: passed, including doc tests
+- `cargo build -p onnx-runtime-quantization`: passed standalone
+- `cargo tree -p onnx-runtime-quantization --depth 1`: only the crate itself; its manifest has no dependencies
+- `git diff --check`: passed
+
+#### Source: `wallace-cuda-iq-superblock-review.md`
+
+# CUDA IQ super-block GEMV review
+
+**Date:** 2026-07-16T19:21:34+00:00
+**By:** Wallace
+**Review target:** `cuda-iq-superblock-gemv` at `4ec30be`
+**Verdict:** 🟢 CLEAR (GPU scope)
+
+## Per-format decode check
+
+All six CUDA decoders match the CPU decoder's 256-element serialized layout and arithmetic:
+
+- **IQ4_XS (136 bytes):** fp16 `d` at 0..2, 16 high scale bits at 2..4, four low-scale bytes at 4..8, and 128 nibble bytes at 8..136. CUDA reconstructs each six-bit factor as `low | high << 4`, subtracts 32, and applies the IQ4_NL codebook with the same nibble order as CPU.
+- **IQ2_XXS (66 bytes):** fp16 `d`, then eight 8-byte group records containing four grid indices followed by little-endian scale/sign metadata. CUDA uses the top metadata nibble for `d * (0.5 + scale) * 0.25`, each seven-bit sign-table index, and the matching 8-byte grid lane.
+- **IQ3_XXS (98 bytes):** fp16 `d`, 64 grid-index bytes, then eight little-endian metadata words. CUDA selects the two four-lane grids per vector, uses the full eight-bit sign mask across both grids, and computes `d * (0.5 + scale) * 0.5`.
+- **IQ2_XS (74 bytes):** fp16 `d`, 64 bytes of little-endian packed 16-bit values, then eight scale bytes. CUDA splits each packed value into a nine-bit grid index and seven-bit sign-table index and applies the correct scale nibble with `* 0.25`.
+- **IQ2_S (82 bytes):** fp16 `d`, 32 low-index bytes, 32 explicit sign bytes, eight high-index bytes, and eight scale bytes. CUDA assembles all ten grid-index bits and applies the explicit sign mask and correct scale nibble.
+- **IQ3_S (110 bytes):** fp16 `d`, 64 low-index bytes, eight high-index bytes, 32 explicit sign bytes, and four scale bytes. CUDA selects the correct grid half/high bit, sign bit, and odd sub-scale `d * (1 + 2 * nibble)`.
+
+These formats have no separate `dmin` field. All fp16 conversion, sub-scale multiplication order, grid magnitude extraction, and sign application agree with the CPU implementation. The exhaustive one-hot GPU test compared every decoded depth bit-for-bit for two random blocks of every supported format.
+
+## Hand-traced blocks
+
+- **IQ4_XS:** `d=0.5`, `scales_h[0]=2`, low nibble `2` gives factor `(2 | 2<<4)-32 = 2`, so sub-scale is `1.0`. Quant nibble zero selects codebook `-127`; CPU and CUDA both produce weight 0 = `-127.0`.
+- **IQ2_S:** for the CPU fixture with `d=2`, low indices `{0,0,0,255}`, `qh=0xe4`, signs `{0x00,0x81,0x82,0x03}`, and scale `0x21`, vector 1 assembles index `0 | 1<<8 = 256`, sub-scale `2*(0.5+1)*0.25 = 0.75`, and sign mask `0x81`. CUDA reads the same grid and produces `{-18.75,18.75,18.75,18.75,18.75,6,18.75,-6}`.
+
+## Shared-grid storage/indexing
+
+Rust emits the shared crate's exact arrays into NVRTC source as `__device__ __constant__` tables. Numeric u32/u64 literals preserve the shared table values, and least-significant-byte-first shifts match the crate's documented little-endian lane order. Total constant storage is about 17.6 KiB, safely below CUDA's 64 KiB constant-memory limit. H200 NVRTC compilation and all index paths succeeded.
+
+## Dispatch and fallback
+
+`supports_node` admits only the six new formats plus existing MXFP4/IQ4_NL when the static flattened M is exactly 1. IQ1_S, IQ1_M, dynamic M, and M>1 return `KernelMatch::Unsupported`, so placement routes them to the CPU EP. Kernel execution independently rejects M != 1. The explicit fallback test passed.
+
+No fixed `sm_90` target was added; the kernel remains architecture-neutral and uses the runtime's live-device NVRTC target selection.
+
+## GPU verification
+
+Verified on NVIDIA H200, compute capability 9.0, driver 580.105.08.
+
+- Requested direct `cargo build -p onnx-runtime-ep-cuda`: passed.
+- Requested bare `cargo test`: reached and passed all four block-quantized GPU tests; the later Conv tests initially failed only because installed `libcudnn.so.9` was not on the loader path.
+- Full suite rerun with `/usr/lib/python3.12/site-packages/nvidia/cudnn/lib` in `LD_LIBRARY_PATH`: **128/128 tests passed**.
+- Explicit `--test block_quantized_matmul_gpu`: **4/4 passed**, including all-format random GPU-vs-CPU parity, per-depth bit-exact decode, known blocks, and fallback dispatch.
+- Existing MXFP4/IQ4_NL cases remain in the bit-exact/random/known-block loops and passed.
+- Existing accuracy-level-4 drift regressions passed; measured CPU/CUDA max absolute difference remains the accepted `1.9073486e-5`. RMS anti-contraction tests also passed in the full suite.

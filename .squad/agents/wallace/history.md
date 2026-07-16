@@ -28,3 +28,7 @@
 
 - 🟢 Cleared Sapper's `5c7dcc9`: CUDA now matches CPU's branch-stable SiLU operation order and explicitly rounds acc4 f32 scale/accumulation boundaries without serializing warp reduction.
 - H200 validation passed all 128 CUDA EP tests and parity through token 15. The token-16 `1.9073486e-5` reduction-order drift is accepted because exact emulation costs 8.4%.
+
+## 2026-07-16T19:27:57+0000 — CUDA IQ super-block GEMV wave
+
+- 🟢 Cleared Roy's CUDA IQ super-block GEMV on H200: IQ4_XS, IQ2_XXS, IQ3_XXS, IQ2_XS, IQ2_S, and IQ3_S are bit-exact against CPU; IQ1_S/IQ1_M and M>1 fall back correctly. Full CUDA validation passed 128/128 without SM90 hardcoding.

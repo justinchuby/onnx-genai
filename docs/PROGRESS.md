@@ -4,7 +4,7 @@ Tracks implementation status of `docs/DESIGN.md` (§1–§40). Updated as work l
 
 **Published:** `onnx-genai` v0.1.0 + 8 sub-crates on crates.io; the `onnx-runtime-*` layer (including `onnx-runtime-tracer`) is released as v0.1.0-dev.1. CI (fmt/build/test/**blocking clippy**) + scheduled `cargo-audit`. Coverage ~77% line.
 
-_Last updated: 2026-07-16T19:05:18+0000 — includes CPU BlockQuantizedMatMul prefill optimization and bounded CUDA↔CPU decode parity._
+_Last updated: 2026-07-16T19:27:57+0000 — includes CUDA IQ super-block GEMV coverage and shared quantization tables._
 
 
 ## Current tiered-memory and interoperability milestones
@@ -350,14 +350,16 @@ Scoped the "export Gemma4 E2B/12B via Mobius and smoke-test through onnx-genai" 
 - **onnx-rs full-spec serde ✅ DONE (`f058594`; Deckard `1b65769`; Rachael 🟢):** IR13 bindings, INT2/UINT2/FLOAT8E8M0, multi-device proto round-trips, and authoritative native text are complete. Readable DSL edits for headers, graph/nodes/attributes, dtype/shape, nested graphs, opaque strings, and list cardinalities win; residual data restores only omitted payload/metadata.
 - **Full runtime sub-4-bit IQ family ✅ (`2dfee14`; `1bf47a8`, Bryant; Leon 🟢):** `BlockQuantizedMatMul` CPU decoding now supports MXFP4, IQ4_NL, IQ4_XS, IQ3_S, IQ3_XXS, IQ2_XXS, IQ2_XS, IQ2_S, IQ1_S, and IQ1_M. The llama.cpp grids, layouts, and fingerprints were independently audited; no IQ format remains deferred.
 - **CPU BlockQuantizedMatMul prefill optimization ✅ DONE (`5010261`, Joi; Leon 🟢):** K-panel-parallel dequantization across every supported format, bit-exact AVX2 decode for MXFP4/IQ4_NL/IQ4_XS, and adaptive generic GEMM task sizing produce **32–35×** M=64/K=4096/N=4096 generic matmul gains; optional oneDNN remains supported. All ten formats are bit-exact versus scalar decoding.
-- **CUDA MXFP4 + IQ4_NL decode GEMV ✅ (`cef7073`, Roy; Wallace 🟢):** Static M=1 `BlockQuantizedMatMul` decode reads native MXFP4 and IQ4_NL blocks directly on GPU, with bit-exact decoded-weight coverage and H200 validation. Other IQ formats and M>1 remain CPU-placed.
+- **CUDA sub-4-bit GEMV ✅ DONE (`8bf113e`, Roy; Leon/Wallace 🟢):** Static M=1 `BlockQuantizedMatMul` now covers **8/10** IQ formats: MXFP4, IQ4_NL, IQ4_XS, IQ2_XXS, IQ3_XXS, IQ2_XS, IQ2_S, and IQ3_S. H200 CPU/GPU checks are bit-exact; IQ1_S, IQ1_M, and M>1 remain CPU-placed.
 - **CUDA int4 GEMV decode ✅ (`1de9584`, Roy; Wallace 🟢):** M=1 packed-int4 `MatMulNBits` decode reads weights directly on CUDA, improving decode by approximately 68–96% on H200 while preserving CPU/ORT contracts.
+- **Shared `onnx-runtime-quantization` crate ✅ DONE (`8bf113e`):** CPU and CUDA now consume one audited source for the seven vendored IQ grids/sign tables; all moved values are byte-identical, including IQ1S FNV-1a `0x6703ed863501ae2e`.
 - **Weight offload design ✅ (`docs/WEIGHT_OFFLOAD.md`, Nabil):** mmap → host → VRAM weight-tier subsystem design is complete and **awaiting user greenlight**.
 - **Mobius exports:** PR [#404](https://github.com/onnxruntime/mobius/pull/404) adds GLM-5.2 MoE with IndexShare DSA + MTP; PR [#405](https://github.com/onnxruntime/mobius/pull/405) adds DeepSeek-V4-Flash MTP + CSA; PR [#406](https://github.com/onnxruntime/mobius/pull/406) now preserves the full runtime IQ family (MXFP4, IQ4_NL, IQ4_XS, IQ3_S, IQ3_XXS, IQ2_XXS, IQ2_XS, IQ2_S, IQ1_S, IQ1_M) in `BlockQuantizedMatMul` nodes and awaits user action.
 
 ### Runtime follow-ups
 
 - CUDA↔CPU parity: bounded `1.9e-5` drift from token 16 onward = accepted fp reduction-order tolerance (do **not** serialize GPU reduction — measured 8.4% cost).
-- CUDA sub-4-bit GEMV for IQ super-block families (IN PROGRESS — Roy).
-- Native sparse-attention/index operations and iterative MTP orchestration for DeepSeek CSA (Chew).
+- CUDA IQ1_S/IQ1_M GEMV (IN PROGRESS — Roy; the last 2 GPU formats).
+- DeepSeek CSA native sparse-attention/index operations + iterative MTP (Chew).
 - `WEIGHT_OFFLOAD` implementation remains **AWAITING USER GREENLIGHT**.
+- MatMulNBits projection-fusion (`docs/PROJECTION_FUSION.md`, Nabil) remains **AWAITING GREENLIGHT**.

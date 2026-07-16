@@ -44,3 +44,7 @@ Loader opset-import validation for file, from-parts, and nested-subgraph paths m
 
 - 🟢 Cleared Joi's `5010261`: all ten formats matched scalar decode bits, selected MXFP4/IQ4_NL/IQ4_XS AVX2 paths were independently checked, and generic GEMM retained K accumulation order.
 - Default and oneDNN CPU EP suites each passed 430 tests; M=64 generic matmul gains measured 32–35×.
+
+## 2026-07-16T19:27:57+0000 — CUDA IQ super-block GEMV wave
+
+- 🟢 Cleared Roy's shared `onnx-runtime-quantization` extraction: all seven moved grids/sign tables are byte-identical (IQ1S FNV-1a `0x6703ed863501ae2e`); CPU decode and Joi's AVX2 paths are unchanged, and the standalone crate builds/tests cleanly.
