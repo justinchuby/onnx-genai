@@ -122,8 +122,28 @@ pub fn constant(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
 /// the `value` attribute (default float32).
 pub fn constant_of_shape(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
     let (dtype, fill) = value_attr_scalar(ctx.node);
+    if let Some(rank) = ctx.input_rank(0)
+        && rank != 1
+    {
+        return Err(ShapeInferError::InvalidRank {
+            op: "ConstantOfShape".into(),
+            index: 0,
+            rank,
+            detail: "shape input must be a 1-D tensor".into(),
+        });
+    }
     if let Some(sd) = ctx.input_shape_data(0).cloned() {
         let shape = sd.as_shape();
+        for dim in &shape {
+            if let Some(extent) = dim.as_const()
+                && !(0..=isize::MAX as i64).contains(&extent)
+            {
+                return Err(ShapeInferError::Invalid {
+                    op: "ConstantOfShape".into(),
+                    detail: format!("shape extent {extent} is outside 0..=isize::MAX"),
+                });
+            }
+        }
         let numel_known = shape.iter().all(|d| d.as_const().is_some());
         ctx.set_output(0, dtype, shape.clone());
         // Small all-constant integer fills can themselves seed a chain.
@@ -146,14 +166,6 @@ pub fn constant_of_shape(ctx: &mut InferenceContext) -> Result<(), ShapeInferErr
             }
         }
         return Ok(());
-    }
-    // No shape-data: fall back to a fresh-symbol shape of the known rank.
-    if let Some(shape) = ctx.input_shape(0).map(<[DimExpr]>::to_vec)
-        && shape.len() == 1
-        && let Some(rank) = shape[0].as_const()
-    {
-        let out = (0..rank).map(|_| ctx.fresh_dim()).collect();
-        ctx.set_output(0, dtype, out);
     }
     Ok(())
 }

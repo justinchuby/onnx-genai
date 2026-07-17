@@ -648,10 +648,7 @@ fn relu_passthrough() {
 
 #[test]
 fn round3_math_schemas_have_shape_rules() {
-    let binary_inputs = vec![
-        f32in(vec![sym(0), c(1), c(64)]),
-        f32in(vec![c(8), c(64)]),
-    ];
+    let binary_inputs = vec![f32in(vec![sym(0), c(1), c(64)]), f32in(vec![c(8), c(64)])];
     for op in ["Sub", "Div", "Mod"] {
         let outs = run(&node(op, 2, 1), binary_inputs.clone(), 14);
         assert_eq!(out_shape(&outs), vec![sym(0), c(8), c(64)], "{op}");
@@ -763,6 +760,30 @@ fn tile_unknown_repeats_keeps_rank() {
     assert!(shape[0].as_symbol().is_some());
     assert!(shape[1].as_symbol().is_some());
     assert_eq!(out_dtype(&outs), DataType::Float32);
+}
+
+#[test]
+fn tile_rejects_non_vector_repeats_and_extent_overflow() {
+    let n = node("Tile", 2, 1);
+    assert!(
+        try_run(
+            &n,
+            vec![
+                f32in(vec![c(2), c(3)]),
+                tin(DataType::Int64, vec![c(1), c(2)]),
+            ],
+            13,
+        )
+        .is_err()
+    );
+    assert!(
+        try_run(
+            &n,
+            vec![f32in(vec![c(isize::MAX as i64)]), sd_vec(vec![c(2)]),],
+            13,
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -1338,6 +1359,37 @@ fn scatter_unknown_data_shape_leaves_output_unresolved() {
     }
 }
 
+#[test]
+fn scatter_rank_relations_are_validated() {
+    let elements = node("ScatterElements", 3, 1);
+    assert!(
+        try_run(
+            &elements,
+            vec![
+                f32in(vec![c(2), c(3)]),
+                tin(DataType::Int64, vec![c(2)]),
+                f32in(vec![c(2)]),
+            ],
+            18,
+        )
+        .is_err()
+    );
+
+    let nd = node("ScatterND", 3, 1);
+    assert!(
+        try_run(
+            &nd,
+            vec![
+                f32in(vec![c(2), c(3), c(4)]),
+                tin(DataType::Int64, vec![c(5), c(2)]),
+                f32in(vec![c(5)]),
+            ],
+            18,
+        )
+        .is_err()
+    );
+}
+
 // --- Concat ---------------------------------------------------------------
 
 #[test]
@@ -1360,6 +1412,41 @@ fn concat_shape_data_builds_vector() {
     let outs = run(&n, vec![a, b], 13);
     let sd = outs[0].shape_data.as_ref().expect("concat shape-data");
     assert_eq!(sd.elems, vec![sym(0), c(12), c(64)]);
+}
+
+#[test]
+fn concat_dynamic_axis_is_unresolved_and_other_dims_must_match() {
+    let n = with_attr(node("Concat", 2, 1), "axis", Attribute::Int(-1));
+    let outs = run(
+        &n,
+        vec![f32in(vec![c(2), sym(0)]), f32in(vec![c(2), c(5)])],
+        13,
+    );
+    let shape = out_shape(&outs);
+    assert_eq!(shape[0], c(2));
+    assert!(shape[1].as_symbol().is_some());
+
+    assert!(
+        try_run(
+            &n,
+            vec![f32in(vec![c(2), c(3)]), f32in(vec![c(4), c(5)])],
+            13,
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn concat_rejects_axis_sum_beyond_isize_max() {
+    let n = with_attr(node("Concat", 2, 1), "axis", Attribute::Int(0));
+    assert!(
+        try_run(
+            &n,
+            vec![f32in(vec![c(isize::MAX as i64)]), f32in(vec![c(1)]),],
+            13,
+        )
+        .is_err()
+    );
 }
 
 // --- Shape / Size ---------------------------------------------------------
@@ -1458,7 +1545,63 @@ fn slice_data_dependent_keeps_rank_symbolic() {
     let outs = run(&n, vec![f32in(vec![c(10), c(768)]), starts, ends], 13);
     let shape = out_shape(&outs);
     assert_eq!(shape.len(), 2);
-    // rank preserved; both dims still present
+    assert!(shape[0].as_symbol().is_some());
+    assert_eq!(shape[1], c(768));
+}
+
+#[test]
+fn slice_dynamic_bounds_only_clear_selected_axes() {
+    let n = node("Slice", 4, 1);
+    let outs = run(
+        &n,
+        vec![
+            f32in(vec![c(10), c(20)]),
+            tin(DataType::Int64, vec![c(1)]),
+            tin(DataType::Int64, vec![c(1)]),
+            sd_vec(vec![c(1)]),
+        ],
+        13,
+    );
+    let shape = out_shape(&outs);
+    assert_eq!(shape[0], c(10));
+    assert!(shape[1].as_symbol().is_some());
+}
+
+#[test]
+fn slice_dynamic_axes_clear_every_extent() {
+    let n = node("Slice", 4, 1);
+    let outs = run(
+        &n,
+        vec![
+            f32in(vec![c(10), c(20)]),
+            sd_vec(vec![c(0)]),
+            sd_vec(vec![c(5)]),
+            tin(DataType::Int64, vec![c(1)]),
+        ],
+        13,
+    );
+    assert!(
+        out_shape(&outs)
+            .iter()
+            .all(|extent| extent.as_symbol().is_some())
+    );
+}
+
+#[test]
+fn slice_negative_step_clamps_extreme_bounds() {
+    let n = node("Slice", 5, 1);
+    let outs = run(
+        &n,
+        vec![
+            f32in(vec![c(5)]),
+            sd_vec(vec![c(i64::MAX)]),
+            sd_vec(vec![c(i64::MIN)]),
+            sd_vec(vec![c(0)]),
+            sd_vec(vec![c(-1)]),
+        ],
+        13,
+    );
+    assert_eq!(out_shape(&outs), vec![c(5)]);
 }
 
 // --- ReduceMean -----------------------------------------------------------
@@ -1768,6 +1911,17 @@ fn constant_of_shape_uses_shape_data() {
 }
 
 #[test]
+fn constant_of_shape_dynamic_input_is_unresolved_but_empty_shape_is_scalar() {
+    let n = node("ConstantOfShape", 1, 1);
+    let dynamic = run(&n, vec![tin(DataType::Int64, vec![c(3)])], 25);
+    assert!(dynamic[0].type_info.is_none());
+
+    let scalar = run(&n, vec![sd_vec(vec![])], 25);
+    assert_eq!(out_shape(&scalar), Vec::<DimExpr>::new());
+    assert_eq!(out_dtype(&scalar), DataType::Float32);
+}
+
+#[test]
 fn expand_broadcasts_against_target() {
     // input [1, 8, 1], target [N, 8, 768] -> [N, 8, 768]
     let n = node("Expand", 2, 1);
@@ -1819,17 +1973,27 @@ fn expand_preserves_input_dtype() {
 }
 
 #[test]
-fn expand_unknown_shape_tensor_keeps_known_rank() {
+fn expand_unknown_shape_tensor_leaves_output_unresolved() {
     let n = node("Expand", 2, 1);
     let outs = run(
         &n,
         vec![f32in(vec![c(3), c(1)]), tin(DataType::Int64, vec![c(3)])],
         13,
     );
-    let shape = out_shape(&outs);
-    assert_eq!(shape.len(), 3);
-    assert!(shape.iter().all(|dim| dim.as_symbol().is_some()));
-    assert_eq!(out_dtype(&outs), DataType::Float32);
+    assert!(outs[0].type_info.is_none());
+}
+
+#[test]
+fn expand_rejects_incompatible_concrete_dimensions() {
+    let n = node("Expand", 2, 1);
+    assert!(
+        try_run(
+            &n,
+            vec![f32in(vec![c(2), c(3)]), sd_vec(vec![c(2), c(4)])],
+            13,
+        )
+        .is_err()
+    );
 }
 
 // --- Where ----------------------------------------------------------------
@@ -2015,6 +2179,38 @@ fn pad_expanded_attention_axes_shape_and_bytes() {
     let elements: i64 = shape.iter().map(|dim| dim.as_const().unwrap()).product();
     assert_eq!(elements, 144);
     assert_eq!(elements * DataType::Float32.byte_size() as i64, 576);
+}
+
+#[test]
+fn pad_dynamic_pads_only_clear_selected_axes() {
+    let mut n = node("Pad", 4, 1);
+    n.inputs[2] = None;
+    let outs = run(
+        &n,
+        vec![
+            f32in(vec![c(2), c(3), c(4)]),
+            tin(DataType::Int64, vec![c(2)]),
+            NodeIo::default(),
+            sd_vec(vec![c(-1)]),
+        ],
+        25,
+    );
+    let shape = out_shape(&outs);
+    assert_eq!(&shape[..2], &[c(2), c(3)]);
+    assert!(shape[2].as_symbol().is_some());
+}
+
+#[test]
+fn pad_rejects_extent_beyond_isize_max() {
+    let n = node("Pad", 2, 1);
+    assert!(
+        try_run(
+            &n,
+            vec![f32in(vec![c(1)]), sd_vec(vec![c(isize::MAX as i64), c(0)]),],
+            25,
+        )
+        .is_err()
+    );
 }
 
 // --- unregistered op is permissive ---------------------------------------

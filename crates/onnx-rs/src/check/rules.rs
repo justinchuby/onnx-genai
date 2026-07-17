@@ -5074,6 +5074,7 @@ mod tests {
                 let value = model.graph.inputs[index];
                 model.graph.value_mut(value).dtype = DataType::Int64;
             }
+
             for index in bool_inputs {
                 let value = model.graph.inputs[index];
                 model.graph.value_mut(value).dtype = DataType::Bool;
@@ -5111,6 +5112,43 @@ mod tests {
             violation.rule_id == "schema.node_conforms"
                 && violation.message.contains("required attribute 'to'")
         }));
+    }
+
+    #[test]
+    fn round_six_schemas_accept_official_minimal_forms() {
+        for (op_type, inputs, int64_inputs) in [
+            ("Tile", 2, vec![1]),
+            ("Pad", 2, vec![1]),
+            ("ScatterND", 3, vec![1]),
+            ("ScatterElements", 3, vec![1]),
+            ("ConstantOfShape", 1, vec![0]),
+        ] {
+            let mut model = one_node_model(op_type, inputs, 1);
+            model.graph.opset_imports.insert(String::new(), 25);
+            for index in int64_inputs {
+                let value = model.graph.inputs[index];
+                model.graph.value_mut(value).dtype = DataType::Int64;
+            }
+            let result = model.validate();
+            assert!(
+                result.is_valid(),
+                "{op_type}: official minimal form should pass: {:?}",
+                result.violations
+            );
+        }
+
+        let mut pad_with_axes = one_node_model("Pad", 4, 1);
+        pad_with_axes.graph.opset_imports.insert(String::new(), 25);
+        let pads = pad_with_axes.graph.inputs[1];
+        let axes = pad_with_axes.graph.inputs[3];
+        pad_with_axes.graph.value_mut(pads).dtype = DataType::Int64;
+        pad_with_axes.graph.value_mut(axes).dtype = DataType::Int32;
+        let node = pad_with_axes.graph.nodes.keys().next().unwrap();
+        pad_with_axes.graph.node_mut(node).inputs[2] = None;
+        assert!(
+            pad_with_axes.validate().is_valid(),
+            "optional constant_value may be omitted while axes is present"
+        );
     }
 
     #[test]

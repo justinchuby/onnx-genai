@@ -408,6 +408,11 @@ const BUILTIN_YAML: &[&str] = &[
     include_str!("../../schemas/standard/non_zero.yaml"),
     include_str!("../../schemas/standard/range.yaml"),
     include_str!("../../schemas/standard/split.yaml"),
+    include_str!("../../schemas/standard/tile.yaml"),
+    include_str!("../../schemas/standard/pad.yaml"),
+    include_str!("../../schemas/standard/scatter_nd.yaml"),
+    include_str!("../../schemas/standard/scatter_elements.yaml"),
+    include_str!("../../schemas/standard/constant_of_shape.yaml"),
 ];
 
 // FOLLOW-UP §7.4: complete the standard and ONNX-ML YAML catalogues.
@@ -657,6 +662,11 @@ type_constraints:
             "NonZero",
             "Range",
             "Split",
+            "Tile",
+            "Pad",
+            "ScatterND",
+            "ScatterElements",
+            "ConstantOfShape",
         ] {
             assert!(registry.lookup(name, "", 25).is_some(), "{name}");
         }
@@ -758,6 +768,69 @@ type_constraints:
                 DataType::Int64
             ]
         );
+    }
+
+    #[test]
+    fn round_six_schemas_match_official_signatures() {
+        let registry = SchemaRegistry::builtins();
+
+        for (name, since_version, inputs) in [
+            ("Slice", 13, 5),
+            ("Concat", 13, 1),
+            ("Tile", 13, 2),
+            ("Expand", 13, 2),
+            ("Pad", 25, 4),
+            ("ScatterND", 18, 3),
+            ("ScatterElements", 18, 3),
+            ("ConstantOfShape", 25, 1),
+        ] {
+            let schema = registry.lookup(name, "", 25).unwrap();
+            assert_eq!(schema.since_version, since_version, "{name}");
+            assert_eq!(schema.inputs.len(), inputs, "{name}");
+            assert_eq!(schema.outputs.len(), 1, "{name}");
+        }
+
+        let tile = registry.lookup("Tile", "", 25).unwrap();
+        assert_eq!(tile.type_constraints[1].allowed, [DataType::Int64]);
+
+        let pad = registry.lookup("Pad", "", 25).unwrap();
+        assert_eq!(
+            pad.attributes[0].default,
+            Some(AttributeDefault::String("constant".into()))
+        );
+        assert!(pad.inputs[2].optional && pad.inputs[3].optional);
+        assert_eq!(pad.type_constraints[0].allowed.len(), 26);
+        assert_eq!(
+            pad.type_constraints[1].allowed,
+            [DataType::Int32, DataType::Int64]
+        );
+
+        for name in ["ScatterND", "ScatterElements"] {
+            let scatter = registry.lookup(name, "", 25).unwrap();
+            assert_eq!(
+                scatter
+                    .attributes
+                    .iter()
+                    .find(|attribute| attribute.name == "reduction")
+                    .and_then(|attribute| attribute.default.clone()),
+                Some(AttributeDefault::String("none".into())),
+                "{name}"
+            );
+        }
+        let scatter_elements = registry.lookup("ScatterElements", "", 25).unwrap();
+        assert_eq!(
+            scatter_elements.attributes[0].default,
+            Some(AttributeDefault::Int(0))
+        );
+        assert_eq!(
+            scatter_elements.type_constraints[1].allowed,
+            [DataType::Int32, DataType::Int64]
+        );
+
+        let constant = registry.lookup("ConstantOfShape", "", 25).unwrap();
+        assert!(!constant.attributes[0].required);
+        assert_eq!(constant.type_constraints[0].allowed, [DataType::Int64]);
+        assert_eq!(constant.type_constraints[1].allowed.len(), 23);
     }
 
     #[test]

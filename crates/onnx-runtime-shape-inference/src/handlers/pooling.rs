@@ -10,6 +10,7 @@ use onnx_runtime_ir::{Attribute, DataType};
 use crate::context::InferenceContext;
 use crate::dim_expr::DimExpr;
 use crate::error::ShapeInferError;
+use crate::handlers::checked_axis;
 use crate::registry::InferenceRegistry;
 
 /// Auto-pad handling per the ONNX spec.
@@ -158,6 +159,18 @@ pub fn pad(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
     let dtype = ctx.input_dtype(0).unwrap_or(DataType::Float32);
     let rank = x.len();
 
+    if ctx.has_input(1)
+        && let Some(pads_rank) = ctx.input_rank(1)
+        && pads_rank != 1
+    {
+        return Err(ShapeInferError::InvalidRank {
+            op: "Pad".into(),
+            index: 1,
+            rank: pads_rank,
+            detail: "pads must be a 1-D tensor".into(),
+        });
+    }
+
     // pads: attribute (opset < 11) or input 1 shape-data (opset ≥ 11).
     let pads: Option<Vec<i64>> = ctx
         .node
@@ -169,17 +182,20 @@ pub fn pad(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
                 .and_then(|sd| sd.elems.iter().map(|e| e.as_const()).collect())
         });
 
-    let Some(pads) = pads else {
-        // Unknown pads: keep the rank, refresh dims.
-        let out = (0..rank).map(|_| ctx.fresh_dim()).collect();
-        ctx.set_output(0, dtype, out);
-        return Ok(());
-    };
-
     // Opset 18 added the optional `axes` input. When present, the pads are
     // indexed by that subset rather than by every input axis.
-    let has_axes = ctx.node.inputs.get(3).is_some_and(Option::is_some);
+    let has_axes = ctx.has_input(3);
     let axes: Vec<usize> = if has_axes {
+        if let Some(axes_rank) = ctx.input_rank(3)
+            && axes_rank != 1
+        {
+            return Err(ShapeInferError::InvalidRank {
+                op: "Pad".into(),
+                index: 3,
+                rank: axes_rank,
+                detail: "axes must be a 1-D tensor".into(),
+            });
+        }
         let Some(raw_axes) = ctx.input_shape_data(3).and_then(|sd| {
             sd.elems
                 .iter()
@@ -190,44 +206,73 @@ pub fn pad(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
             ctx.set_output(0, dtype, out);
             return Ok(());
         };
-        raw_axes
-            .into_iter()
-            .map(|axis| {
-                let axis = if axis < 0 { axis + rank as i64 } else { axis };
-                usize::try_from(axis)
-                    .ok()
-                    .filter(|&axis| axis < rank)
-                    .ok_or_else(|| ShapeInferError::Invalid {
-                        op: ctx.op().to_string(),
-                        detail: format!("axis {axis} is out of range for rank {rank}"),
-                    })
-            })
-            .collect::<Result<_, _>>()?
+        let mut normalized = Vec::with_capacity(raw_axes.len());
+        for axis in raw_axes {
+            let axis = checked_axis(axis, rank).ok_or_else(|| ShapeInferError::Invalid {
+                op: "Pad".into(),
+                detail: format!("axis {axis} is out of range for rank {rank}"),
+            })?;
+            if normalized.contains(&axis) {
+                return Err(ShapeInferError::Invalid {
+                    op: "Pad".into(),
+                    detail: format!("axis {axis} appears more than once"),
+                });
+            }
+            normalized.push(axis);
+        }
+        normalized
     } else {
         (0..rank).collect()
     };
 
-    if pads.len() != axes.len() * 2 {
+    let Some(pads) = pads else {
+        let mut out = x;
+        for axis in axes {
+            out[axis] = ctx.fresh_dim();
+        }
+        ctx.set_output(0, dtype, out);
+        return Ok(());
+    };
+
+    let expected_pads = axes
+        .len()
+        .checked_mul(2)
+        .ok_or_else(|| ShapeInferError::Invalid {
+            op: "Pad".into(),
+            detail: "pads length arithmetic overflowed".into(),
+        })?;
+    if pads.len() != expected_pads {
         return Err(ShapeInferError::Invalid {
-            op: ctx.op().to_string(),
+            op: "Pad".into(),
             detail: format!(
                 "pads has {} entries but {} selected axes require {}",
                 pads.len(),
                 axes.len(),
-                axes.len() * 2
+                expected_pads
             ),
         });
     }
 
-    let mut growth = vec![0i64; rank];
+    let mut out = x;
     for (i, axis) in axes.into_iter().enumerate() {
-        growth[axis] = pads[i] + pads[pads.len() / 2 + i];
+        let total_pad = i128::from(pads[i]) + i128::from(pads[pads.len() / 2 + i]);
+        out[axis] = match out[axis].as_const() {
+            Some(extent) => {
+                let output_extent = i128::from(extent) + total_pad;
+                if !(0..=isize::MAX as i128).contains(&output_extent) {
+                    return Err(ShapeInferError::Invalid {
+                        op: "Pad".into(),
+                        detail: format!(
+                            "inferred extent {output_extent} is outside 0..=isize::MAX"
+                        ),
+                    });
+                }
+                DimExpr::constant(output_extent as i64)
+            }
+            None if total_pad == 0 => out[axis].clone(),
+            None => ctx.fresh_dim(),
+        };
     }
-    let out = x
-        .iter()
-        .zip(growth)
-        .map(|(dim, pad)| dim.add(&DimExpr::constant(pad)))
-        .collect();
     ctx.set_output(0, dtype, out);
     Ok(())
 }

@@ -27,18 +27,47 @@ fn tile(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
     let Some(input) = ctx.input_type(0).cloned() else {
         return Ok(());
     };
+    if let Some(rank) = ctx.input_rank(1)
+        && rank != 1
+    {
+        return Err(ShapeInferError::InvalidRank {
+            op: "Tile".into(),
+            index: 1,
+            rank,
+            detail: "repeats must be a 1-D tensor".into(),
+        });
+    }
     let repeats = const_ints(ctx, 1);
+    if let Some(repeats) = &repeats
+        && repeats.len() != input.rank()
+    {
+        return Err(ShapeInferError::Invalid {
+            op: "Tile".into(),
+            detail: format!(
+                "repeats has {} values but input rank is {}",
+                repeats.len(),
+                input.rank()
+            ),
+        });
+    }
     let mut output = Vec::with_capacity(input.rank());
     for (i, dim) in input.shape.iter().enumerate() {
-        output.push(
-            repeats
-                .as_ref()
-                .filter(|r| r.len() == input.rank())
-                .and_then(|r| r.get(i))
-                .filter(|&&n| n >= 0)
-                .map(|&n| dim.mul(&DimExpr::constant(n)))
-                .unwrap_or_else(|| ctx.fresh_dim()),
-        );
+        let output_dim = match repeats.as_ref().and_then(|values| values.get(i)).copied() {
+            Some(repeat) if repeat >= 0 => {
+                if let Some(extent) = dim.as_const() {
+                    let product = i128::from(extent) * i128::from(repeat);
+                    if product > isize::MAX as i128 {
+                        return Err(ShapeInferError::Invalid {
+                            op: "Tile".into(),
+                            detail: format!("output extent {extent} * {repeat} exceeds isize::MAX"),
+                        });
+                    }
+                }
+                dim.mul(&DimExpr::constant(repeat))
+            }
+            Some(_) | None => ctx.fresh_dim(),
+        };
+        output.push(output_dim);
     }
     ctx.set_output(0, input.dtype, output);
     Ok(())

@@ -1,0 +1,14 @@
+domain: ""
+name: ScatterND
+since_version: 18
+doc: Scatter slices from updates into a copy of data using index tuples.
+attributes:
+  - { name: reduction, type: string, default: none }
+inputs:
+  - { name: data, type_str: T }
+  - { name: indices, type_str: "tensor(int64)" }
+  - { name: updates, type_str: T }
+outputs:
+  - { name: output, type_str: T }
+type_constraints:
+  - { type_param: T, allowed: [uint8, uint16, uint32, uint64, int8, int16, int32, int64, bfloat16, float16, float32, float64, string, bool, complex64, complex128] }

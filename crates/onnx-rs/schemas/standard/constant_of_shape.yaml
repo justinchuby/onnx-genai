@@ -1,0 +1,13 @@
+domain: ""
+name: ConstantOfShape
+since_version: 25
+doc: Generate a constant tensor whose shape is specified by the input.
+attributes:
+  - { name: value, type: tensor }
+inputs:
+  - { name: input, type_str: T1 }
+outputs:
+  - { name: output, type_str: T2 }
+type_constraints:
+  - { type_param: T1, allowed: [int64] }
+  - { type_param: T2, allowed: [float16, float32, float64, int8, int16, int32, int64, uint8, uint16, uint32, uint64, uint4, int4, bool, bfloat16, float8e4m3fn, float8e4m3fnuz, float8e5m2, float8e5m2fnuz, float4e2m1, float8e8m0, uint2, int2] }

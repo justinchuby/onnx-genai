@@ -27,6 +27,35 @@ fn const_ints(ctx: &InferenceContext, i: usize) -> Option<Vec<i64>> {
         .collect()
 }
 
+fn validate_vector_input(
+    ctx: &InferenceContext,
+    index: usize,
+    op: &str,
+) -> Result<(), ShapeInferError> {
+    if ctx.has_input(index)
+        && let Some(rank) = ctx.input_rank(index)
+        && rank != 1
+    {
+        return Err(ShapeInferError::InvalidRank {
+            op: op.into(),
+            index,
+            rank,
+            detail: "input must be a 1-D tensor".into(),
+        });
+    }
+    Ok(())
+}
+
+fn checked_extent(op: &str, value: i128) -> Result<i64, ShapeInferError> {
+    if !(0..=isize::MAX as i128).contains(&value) {
+        return Err(ShapeInferError::Invalid {
+            op: op.into(),
+            detail: format!("inferred extent {value} is outside 0..=isize::MAX"),
+        });
+    }
+    Ok(value as i64)
+}
+
 /// `Transpose`: permute dimensions by `perm` (default: reverse).
 pub fn transpose(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
     let Some(t) = ctx.input_type(0).cloned() else {
@@ -253,18 +282,57 @@ pub fn expand(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
     let Some(input) = ctx.input_type(0).cloned() else {
         return Ok(());
     };
+    validate_vector_input(ctx, 1, "Expand")?;
     if let Some(target) = ctx.input_shape_data(1).map(ShapeData::as_shape) {
-        let shape = ctx.broadcast(&input.shape, &target)?;
+        for dim in &target {
+            if let Some(value) = dim.as_const()
+                && !(0..=isize::MAX as i64).contains(&value)
+            {
+                return Err(ShapeInferError::Invalid {
+                    op: "Expand".into(),
+                    detail: format!("target extent {value} is outside 0..=isize::MAX"),
+                });
+            }
+        }
+        let shape = bidirectional_broadcast(ctx, &input.shape, &target)?;
         ctx.set_output(0, input.dtype, shape);
-    } else if let Some(rank) = target_rank(ctx) {
-        // Match Reshape's unresolved shape-tensor convention: retain a known
-        // rank and degrade each extent to a fresh symbol. Expand's output rank
-        // is the greater of the input rank and target-vector length.
-        let out_rank = rank.max(input.rank());
-        let out = (0..out_rank).map(|_| ctx.fresh_dim()).collect();
-        ctx.set_output(0, input.dtype, out);
     }
     Ok(())
+}
+
+fn bidirectional_broadcast(
+    ctx: &mut InferenceContext,
+    input: &[DimExpr],
+    target: &[DimExpr],
+) -> Result<Vec<DimExpr>, ShapeInferError> {
+    let rank = input.len().max(target.len());
+    let mut output = Vec::with_capacity(rank);
+    for axis in 0..rank {
+        let input_offset = rank - input.len();
+        let target_offset = rank - target.len();
+        let a = if axis < input_offset {
+            DimExpr::constant(1)
+        } else {
+            input[axis - input_offset].clone()
+        };
+        let b = if axis < target_offset {
+            DimExpr::constant(1)
+        } else {
+            target[axis - target_offset].clone()
+        };
+        if let (Some(a), Some(b)) = (a.as_const(), b.as_const())
+            && a != 1
+            && b != 1
+            && a != b
+        {
+            return Err(ShapeInferError::Invalid {
+                op: "Expand".into(),
+                detail: format!("incompatible broadcast dims {a} and {b} at axis {axis}"),
+            });
+        }
+        output.push(ctx.broadcast_dim(&a, &b)?);
+    }
+    Ok(output)
 }
 
 /// `Concat`: sum the concat axis across inputs; other dims from input 0.
@@ -281,24 +349,71 @@ pub fn concat(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
     let Some(&first) = present.first() else {
         return Ok(());
     };
+    if present.iter().any(|&i| ctx.input_shape(i).is_none()) {
+        return Ok(());
+    }
     let Some(base) = ctx.input_shape(first).map(<[DimExpr]>::to_vec) else {
         return Ok(());
     };
     let dtype = ctx.input_dtype(first).unwrap_or(DataType::Float32);
     let rank = base.len();
-    let axis = norm_axis(axis_attr, rank);
+    let axis = checked_axis(axis_attr, rank).ok_or_else(|| ShapeInferError::Invalid {
+        op: "Concat".into(),
+        detail: format!("axis {axis_attr} is out of range for rank {rank}"),
+    })?;
 
     let mut out = base.clone();
-    let mut sum = DimExpr::constant(0);
+    let mut sum = 0i128;
     let mut all_known = true;
     for &i in &present {
-        match ctx.input_shape(i) {
-            Some(s) if s.len() == rank => sum = sum.add(&s[axis]),
-            _ => all_known = false,
+        match ctx.input_shape(i).map(<[DimExpr]>::to_vec) {
+            Some(shape) if shape.len() == rank => {
+                if let Some(extent) = shape[axis].as_const() {
+                    sum = sum.checked_add(i128::from(extent)).ok_or_else(|| {
+                        ShapeInferError::Invalid {
+                            op: "Concat".into(),
+                            detail: "concat-axis extent sum overflowed".into(),
+                        }
+                    })?;
+                } else {
+                    all_known = false;
+                }
+                for non_concat_axis in 0..rank {
+                    if non_concat_axis == axis {
+                        continue;
+                    }
+                    let current = &out[non_concat_axis];
+                    let incoming = &shape[non_concat_axis];
+                    match (current.as_const(), incoming.as_const()) {
+                        (Some(a), Some(b)) if a != b => {
+                            return Err(ShapeInferError::Invalid {
+                                op: "Concat".into(),
+                                detail: format!(
+                                    "non-concat dimension {non_concat_axis} differs: {a} != {b}"
+                                ),
+                            });
+                        }
+                        (None, Some(_)) => out[non_concat_axis] = incoming.clone(),
+                        (None, None) if current != incoming => {
+                            out[non_concat_axis] = ctx.broadcast_dim(current, incoming)?;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Some(shape) => {
+                return Err(ShapeInferError::InvalidRank {
+                    op: "Concat".into(),
+                    index: i,
+                    rank: shape.len(),
+                    detail: format!("all inputs must have rank {rank}"),
+                });
+            }
+            None => all_known = false,
         }
     }
     if all_known {
-        out[axis] = sum;
+        out[axis] = DimExpr::constant(checked_extent("Concat", sum)?);
     } else {
         out[axis] = ctx.fresh_dim();
     }
@@ -335,63 +450,212 @@ pub fn slice(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
     let dtype = ctx.input_dtype(0).unwrap_or(DataType::Float32);
     let rank = data.len();
 
-    let starts = const_ints(ctx, 1).or_else(|| attr_ints(ctx, "starts"));
-    let ends = const_ints(ctx, 2).or_else(|| attr_ints(ctx, "ends"));
-    let axes = const_ints(ctx, 3).or_else(|| attr_ints(ctx, "axes"));
-    let steps = const_ints(ctx, 4).or_else(|| attr_ints(ctx, "steps"));
+    let input_driven = ctx.opset("") >= 10;
+    if input_driven {
+        for index in 1..ctx.num_inputs().min(5) {
+            validate_vector_input(ctx, index, "Slice")?;
+        }
+    }
+    let starts = if input_driven {
+        const_ints(ctx, 1)
+    } else {
+        attr_ints(ctx, "starts")
+    };
+    let ends = if input_driven {
+        const_ints(ctx, 2)
+    } else {
+        attr_ints(ctx, "ends")
+    };
+    let axes_present = input_driven && ctx.has_input(3);
+    let steps_present = input_driven && ctx.has_input(4);
+    let axes = if input_driven {
+        const_ints(ctx, 3)
+    } else {
+        attr_ints(ctx, "axes")
+    };
+    let steps = if input_driven {
+        const_ints(ctx, 4)
+    } else {
+        attr_ints(ctx, "steps")
+    };
 
     let mut out = data.clone();
-    match (starts, ends) {
+    let mut propagate_shape_data = false;
+    match (starts.as_ref(), ends.as_ref()) {
         (Some(starts), Some(ends)) => {
-            let axes: Vec<usize> = match axes {
-                Some(a) => a.iter().map(|&x| norm_axis(x, rank)).collect(),
-                None => (0..starts.len()).collect(),
+            if starts.len() != ends.len() {
+                return Err(ShapeInferError::Invalid {
+                    op: "Slice".into(),
+                    detail: format!(
+                        "starts and ends lengths differ: {} != {}",
+                        starts.len(),
+                        ends.len()
+                    ),
+                });
+            }
+            if axes_present && axes.is_none() {
+                for axis in 0..rank {
+                    out[axis] = ctx.fresh_dim();
+                }
+                ctx.set_output(0, dtype, out);
+                return Ok(());
+            }
+            if steps_present && steps.is_none() {
+                for axis in dynamic_slice_axes(rank, starts.len(), axes.as_deref())? {
+                    out[axis] = ctx.fresh_dim();
+                }
+                ctx.set_output(0, dtype, out);
+                return Ok(());
+            }
+            let axes: Vec<usize> = match axes.as_deref() {
+                Some(raw_axes) => {
+                    if raw_axes.len() != starts.len() {
+                        return Err(ShapeInferError::Invalid {
+                            op: "Slice".into(),
+                            detail: format!(
+                                "axes has {} entries but starts has {}",
+                                raw_axes.len(),
+                                starts.len()
+                            ),
+                        });
+                    }
+                    checked_unique_axes(raw_axes, rank, "Slice")?
+                }
+                None => checked_default_axes(starts.len(), rank, "Slice")?,
+            };
+            let steps = match steps.as_deref() {
+                Some(steps) if steps.len() != axes.len() => {
+                    return Err(ShapeInferError::Invalid {
+                        op: "Slice".into(),
+                        detail: format!(
+                            "steps has {} entries but axes has {}",
+                            steps.len(),
+                            axes.len()
+                        ),
+                    });
+                }
+                Some(steps) => steps,
+                None => &[],
             };
             for (k, &ax) in axes.iter().enumerate() {
-                let step = steps.as_ref().and_then(|s| s.get(k)).copied().unwrap_or(1);
+                let step = steps.get(k).copied().unwrap_or(1);
                 out[ax] = slice_dim(
                     &data[ax],
                     starts.get(k).copied(),
                     ends.get(k).copied(),
                     step,
-                )
+                )?
                 .unwrap_or_else(|| ctx.fresh_dim());
             }
+            propagate_shape_data = true;
         }
-        // Bounds unknown (data-dependent): the sliced extents become fresh
-        // symbols; other axes are untouched. We do not know which axes are
-        // sliced, so conservatively refresh none unless axes are known.
         _ => {
-            if let Some(axes) = axes {
-                for ax in axes {
-                    let ax = norm_axis(ax, rank);
-                    out[ax] = ctx.fresh_dim();
-                }
+            let known_len = starts
+                .as_ref()
+                .or(ends.as_ref())
+                .map(Vec::len)
+                .or_else(|| vector_length(ctx, 1))
+                .or_else(|| vector_length(ctx, 2));
+            let dynamic_axes = if axes_present && axes.is_none() {
+                (0..rank).collect()
+            } else if let Some(raw_axes) = axes.as_deref() {
+                checked_unique_axes(raw_axes, rank, "Slice")?
+            } else if let Some(length) = known_len {
+                checked_default_axes(length, rank, "Slice")?
             } else {
-                // Fully data-dependent: refresh all axes to keep a known rank.
-                for d in out.iter_mut() {
-                    *d = ctx.fresh_dim();
-                }
+                (0..rank).collect()
+            };
+            for axis in dynamic_axes {
+                out[axis] = ctx.fresh_dim();
             }
         }
     }
     ctx.set_output(0, dtype, out);
 
     // Shape-data: slicing a 1-D shape vector on axis 0 with concrete bounds.
-    if let Some(sd) = slice_shape_data(ctx, rank) {
+    if propagate_shape_data && let Some(sd) = slice_shape_data(ctx, rank) {
         ctx.set_output_shape_data(0, sd);
     }
     Ok(())
 }
 
-/// A concrete sliced extent, or `None` when any of the bounds/dim are symbolic.
-fn slice_dim(dim: &DimExpr, start: Option<i64>, end: Option<i64>, step: i64) -> Option<DimExpr> {
-    let d = dim.as_const()?;
-    let (start, end) = (start?, end?);
-    if step == 0 {
-        return None;
+fn vector_length(ctx: &InferenceContext, index: usize) -> Option<usize> {
+    let shape = ctx.input_shape(index)?;
+    (shape.len() == 1)
+        .then(|| shape[0].as_const())
+        .flatten()
+        .and_then(|length| usize::try_from(length).ok())
+}
+
+fn dynamic_slice_axes(
+    rank: usize,
+    length: usize,
+    axes: Option<&[i64]>,
+) -> Result<Vec<usize>, ShapeInferError> {
+    match axes {
+        Some(axes) => checked_unique_axes(axes, rank, "Slice"),
+        None => checked_default_axes(length, rank, "Slice"),
     }
-    let norm = |v: i64| -> i64 {
+}
+
+fn checked_default_axes(
+    length: usize,
+    rank: usize,
+    op: &str,
+) -> Result<Vec<usize>, ShapeInferError> {
+    if length > rank {
+        return Err(ShapeInferError::Invalid {
+            op: op.into(),
+            detail: format!("{length} implicit axes exceed input rank {rank}"),
+        });
+    }
+    Ok((0..length).collect())
+}
+
+fn checked_unique_axes(axes: &[i64], rank: usize, op: &str) -> Result<Vec<usize>, ShapeInferError> {
+    let mut normalized = Vec::with_capacity(axes.len());
+    for &axis in axes {
+        let axis = checked_axis(axis, rank).ok_or_else(|| ShapeInferError::Invalid {
+            op: op.into(),
+            detail: format!("axis {axis} is out of range for rank {rank}"),
+        })?;
+        if normalized.contains(&axis) {
+            return Err(ShapeInferError::Invalid {
+                op: op.into(),
+                detail: format!("axis {axis} appears more than once"),
+            });
+        }
+        normalized.push(axis);
+    }
+    Ok(normalized)
+}
+
+/// A concrete sliced extent, or `None` when any of the bounds/dim are symbolic.
+fn slice_dim(
+    dim: &DimExpr,
+    start: Option<i64>,
+    end: Option<i64>,
+    step: i64,
+) -> Result<Option<DimExpr>, ShapeInferError> {
+    if step == 0 {
+        return Err(ShapeInferError::Invalid {
+            op: "Slice".into(),
+            detail: "step cannot be 0".into(),
+        });
+    }
+    let Some(d) = dim.as_const() else {
+        return Ok(None);
+    };
+    let (Some(start), Some(end)) = (start, end) else {
+        return Ok(None);
+    };
+    let d = i128::from(d);
+    if d == 0 {
+        return Ok(Some(DimExpr::constant(0)));
+    }
+    let step = i128::from(step);
+    let norm = |v: i64| -> i128 {
+        let v = i128::from(v);
         let v = if v < 0 { v + d } else { v };
         v.clamp(0, d)
     };
@@ -400,7 +664,8 @@ fn slice_dim(dim: &DimExpr, start: Option<i64>, end: Option<i64>, step: i64) -> 
         let e = norm(end);
         ((e - s).max(0) + step - 1) / step
     } else {
-        // Negative step: clamp differently.
+        let start = i128::from(start);
+        let end = i128::from(end);
         let s = if start < 0 {
             (start + d).clamp(0, d - 1)
         } else {
@@ -413,7 +678,7 @@ fn slice_dim(dim: &DimExpr, start: Option<i64>, end: Option<i64>, step: i64) -> 
         };
         ((s - e).max(0) + (-step) - 1) / (-step)
     };
-    Some(DimExpr::constant(len.max(0)))
+    Ok(Some(DimExpr::constant(checked_extent("Slice", len)?)))
 }
 
 /// Slice a 1-D shape-data vector on axis 0 with concrete bounds.
@@ -548,11 +813,10 @@ pub fn split(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
                     }
                     // The legacy no-`split` form is only exact when divisible.
                     (None, Some(d)) if n_out > 0 => {
-                        let n_out =
-                            i64::try_from(n_out).map_err(|_| ShapeInferError::Invalid {
-                                op: "Split".into(),
-                                detail: "output count exceeds the supported integer range".into(),
-                            })?;
+                        let n_out = i64::try_from(n_out).map_err(|_| ShapeInferError::Invalid {
+                            op: "Split".into(),
+                            detail: "output count exceeds the supported integer range".into(),
+                        })?;
                         if d % n_out == 0 {
                             DimExpr::constant(d / n_out)
                         } else {
@@ -760,15 +1024,104 @@ pub fn gather_nd(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
 /// `ScatterElements` and deprecated `Scatter`: output type and shape are those
 /// of the data input. Axis and reduction attributes do not affect inference.
 pub fn scatter_elements(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
-    if let Some(data) = ctx.input_type(0).cloned() {
-        ctx.set_output_type(0, data);
+    let Some(data) = ctx.input_type(0).cloned() else {
+        return Ok(());
+    };
+    if data.rank() == 0 {
+        return Err(ShapeInferError::InvalidRank {
+            op: ctx.op().into(),
+            index: 0,
+            rank: 0,
+            detail: "data must have rank at least 1".into(),
+        });
     }
+    let axis = ctx
+        .node
+        .attr("axis")
+        .and_then(Attribute::as_int)
+        .unwrap_or(0);
+    checked_axis(axis, data.rank()).ok_or_else(|| ShapeInferError::Invalid {
+        op: ctx.op().into(),
+        detail: format!("axis {axis} is out of range for rank {}", data.rank()),
+    })?;
+    for index in [1, 2] {
+        if let Some(rank) = ctx.input_rank(index)
+            && rank != data.rank()
+        {
+            return Err(ShapeInferError::InvalidRank {
+                op: ctx.op().into(),
+                index,
+                rank,
+                detail: format!("input must have the same rank {} as data", data.rank()),
+            });
+        }
+    }
+    ctx.set_output_type(0, data);
     Ok(())
 }
 
 /// `ScatterND`: output type and shape are those of the data input.
 pub fn scatter_nd(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
-    scatter_elements(ctx)
+    let Some(data) = ctx.input_type(0).cloned() else {
+        return Ok(());
+    };
+    if data.rank() == 0 {
+        return Err(ShapeInferError::InvalidRank {
+            op: "ScatterND".into(),
+            index: 0,
+            rank: 0,
+            detail: "data must have rank at least 1".into(),
+        });
+    }
+    let Some(indices) = ctx.input_shape(1) else {
+        ctx.set_output_type(0, data);
+        return Ok(());
+    };
+    if indices.is_empty() {
+        return Err(ShapeInferError::InvalidRank {
+            op: "ScatterND".into(),
+            index: 1,
+            rank: 0,
+            detail: "indices must have rank at least 1".into(),
+        });
+    }
+    if let Some(index_depth) = indices.last().and_then(DimExpr::as_const) {
+        let index_depth = usize::try_from(index_depth).map_err(|_| ShapeInferError::Invalid {
+            op: "ScatterND".into(),
+            detail: format!("indices last dimension must be non-negative, found {index_depth}"),
+        })?;
+        if index_depth > data.rank() {
+            return Err(ShapeInferError::Invalid {
+                op: "ScatterND".into(),
+                detail: format!(
+                    "indices last dimension {index_depth} exceeds data rank {}",
+                    data.rank()
+                ),
+            });
+        }
+        if let Some(updates_rank) = ctx.input_rank(2) {
+            let expected = indices
+                .len()
+                .checked_add(data.rank())
+                .and_then(|rank| rank.checked_sub(index_depth))
+                .and_then(|rank| rank.checked_sub(1))
+                .filter(|&rank| rank <= isize::MAX as usize)
+                .ok_or_else(|| ShapeInferError::Invalid {
+                    op: "ScatterND".into(),
+                    detail: "updates rank arithmetic overflowed".into(),
+                })?;
+            if updates_rank != expected {
+                return Err(ShapeInferError::InvalidRank {
+                    op: "ScatterND".into(),
+                    index: 2,
+                    rank: updates_rank,
+                    detail: format!("updates rank must be {expected}"),
+                });
+            }
+        }
+    }
+    ctx.set_output_type(0, data);
+    Ok(())
 }
 
 /// `Trilu`: selecting a triangular region does not change the input type.
