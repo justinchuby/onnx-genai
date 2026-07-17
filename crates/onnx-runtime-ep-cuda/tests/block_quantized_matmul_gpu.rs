@@ -531,6 +531,7 @@ fn supported_formats_and_prefill_route_to_cuda() {
         assert!(matches!(
             ep.supports_op(
                 model.graph.node(node),
+                1,
                 &[static_shape([1, qk]), static_shape([1, 1, block_bytes])],
                 &[]
             ),
@@ -543,6 +544,7 @@ fn supported_formats_and_prefill_route_to_cuda() {
     assert!(matches!(
         ep.supports_op(
             model.graph.node(node),
+            1,
             &[static_shape([1, 32]), static_shape([1, 1, 18])],
             &[]
         ),
@@ -564,6 +566,7 @@ fn supported_formats_and_prefill_route_to_cuda() {
         assert!(matches!(
             ep.supports_op(
                 model.graph.node(node),
+                1,
                 &[static_shape([2, qk]), static_shape([1, 1, block_bytes])],
                 &[]
             ),
@@ -576,6 +579,7 @@ fn supported_formats_and_prefill_route_to_cuda() {
     assert!(matches!(
         ep.supports_op(
             model.graph.node(node),
+            1,
             &[
                 vec![Dim::Symbolic(SymbolId(0)), Dim::Static(32)],
                 static_shape([1, 1, 17]),

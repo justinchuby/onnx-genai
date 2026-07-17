@@ -68,16 +68,24 @@ impl OpRegistry {
             .map(|(_, f)| f.as_ref())
     }
 
-    /// Whether any factory is registered for `(op_type, domain)`, ignoring the
-    /// opset version. Used by providers to answer "is this an op/domain we
-    /// support?" without a concrete opset in hand (`supports_op`). Keeps the
-    /// support decision keyed on `(op_type, domain)` via the registry rather
-    /// than a hardcoded op/domain whitelist.
-    pub fn supports(&self, op_type: &str, domain: &str) -> bool {
+    /// Whether a factory is registered for `(op_type, domain)` at or before
+    /// `opset`.
+    pub fn supports(&self, op_type: &str, domain: &str, opset: u64) -> bool {
         let domain = norm_domain(domain);
         self.entries
             .keys()
-            .any(|k| k.op_type == op_type && k.domain == domain)
+            .any(|k| k.op_type == op_type && k.domain == domain && k.since_version <= opset)
+    }
+
+    /// Earliest registered opset for `(op_type, domain)`, if the EP knows the
+    /// operator at any version. Used only to make decline diagnostics actionable.
+    pub fn earliest_since_version(&self, op_type: &str, domain: &str) -> Option<u64> {
+        let domain = norm_domain(domain);
+        self.entries
+            .keys()
+            .filter(|k| k.op_type == op_type && k.domain == domain)
+            .map(|k| k.since_version)
+            .min()
     }
 
     /// Number of registered entries.
@@ -137,13 +145,14 @@ impl EpRegistry {
     pub fn candidates_for_op(
         &self,
         op: &Node,
+        opset: u64,
         shapes: &[Shape],
         layouts: &[TensorLayout],
     ) -> Vec<(EpId, KernelMatch)> {
         let mut out = Vec::new();
         for &id in &self.priority {
             if let Some(ep) = self.get(id) {
-                let m = ep.supports_op(op, shapes, layouts);
+                let m = ep.supports_op(op, opset, shapes, layouts);
                 if m.is_supported() {
                     out.push((id, m));
                 }

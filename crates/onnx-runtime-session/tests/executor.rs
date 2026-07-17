@@ -9,7 +9,7 @@ use onnx_runtime_ir::{
     static_shape, Attribute, DataType, Dim, Graph, Node, NodeId, Shape, TensorData, ValueId,
     WeightRef,
 };
-use onnx_runtime_session::{InferenceSession, SessionError, Tensor, WarmupShape};
+use onnx_runtime_session::{InferenceSession, OpsetVersion, SessionError, Tensor, WarmupShape};
 use onnx_runtime_shape_inference::{InferenceRegistry, MergePolicy};
 
 // --- graph construction helpers --------------------------------------------
@@ -218,8 +218,56 @@ fn unsupported_op_error_is_actionable() {
     assert!(message.contains("unsupported_activation"), "{message}");
     assert!(message.contains("opset 17"), "{message}");
     assert!(message.contains("cpu_ep"), "{message}");
-    assert!(message.contains("not in the CPU registry"), "{message}");
+    assert!(
+        message.contains("no handler for ai.onnx::Conv at opset 17"),
+        "{message}"
+    );
+    assert!(message.contains("add a claim+handler"), "{message}");
     assert!(message.contains("To fix:"), "{message}");
+}
+
+fn standard_gelu_graph(opset: u64) -> Graph {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), opset);
+    let x = input(&mut graph, "x", DataType::Float32, &[2]);
+    let y = graph.create_named_value("y", DataType::Float32, static_shape([2]));
+    graph.insert_node(Node::new(NodeId(0), "Gelu", vec![Some(x)], vec![y]));
+    graph.add_output(y);
+    graph
+}
+
+#[test]
+fn too_new_kernel_is_declined_at_claim_time_with_actionable_reason() {
+    let error = match InferenceSession::from_graph(standard_gelu_graph(19)) {
+        Err(error) => error,
+        Ok(_) => panic!("opset-19 standard Gelu must be declined"),
+    };
+
+    match error {
+        SessionError::UnsupportedOp {
+            op_type,
+            domain,
+            opset,
+            reason,
+            ..
+        } => {
+            assert_eq!(op_type, "Gelu");
+            assert_eq!(domain, "ai.onnx");
+            assert_eq!(opset, OpsetVersion::Known(19));
+            assert!(
+                reason.contains("no handler for ai.onnx::Gelu at opset 19"),
+                "{reason}"
+            );
+            assert!(reason.contains("registers Gelu since opset 20"), "{reason}");
+        }
+        other => panic!("expected actionable UnsupportedOp, got {other}"),
+    }
+}
+
+#[test]
+fn kernel_is_claimed_at_its_supported_since_opset() {
+    InferenceSession::from_graph(standard_gelu_graph(20))
+        .expect("opset-20 standard Gelu should be claimed and compiled");
 }
 
 #[test]

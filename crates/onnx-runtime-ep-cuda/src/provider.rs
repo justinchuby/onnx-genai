@@ -110,21 +110,39 @@ impl ExecutionProvider for CudaExecutionProvider {
         Ok(())
     }
 
-    fn supports_op(&self, op: &Node, shapes: &[Shape], _layouts: &[TensorLayout]) -> KernelMatch {
-        // Model-agnostic: keyed on (op_type, domain) via the registry, the same
-        // single source of truth the CPU EP uses. Phase 2a registers `MatMul`
-        // only; anything else is Unsupported so placement routes it elsewhere
-        // (typically the CPU EP) instead of hard-failing at dispatch.
-        if !self.registry.supports(&op.op_type, &op.domain) {
+    fn supports_op(
+        &self,
+        op: &Node,
+        opset: u64,
+        shapes: &[Shape],
+        _layouts: &[TensorLayout],
+    ) -> KernelMatch {
+        // Keyed on (op_type, domain, opset) via the registry, the same single
+        // source of truth the CPU EP uses.
+        if !self.registry.supports(&op.op_type, &op.domain, opset) {
             let domain = if op.domain.is_empty() {
                 "ai.onnx"
             } else {
                 &op.domain
             };
+            if let Some(since) = self
+                .registry
+                .earliest_since_version(&op.op_type, &op.domain)
+            {
+                deny!(
+                    "no handler for {}::{} at opset {} — this EP registers {} since opset {} (or: add a claim+handler)",
+                    domain,
+                    op.op_type,
+                    opset,
+                    op.op_type,
+                    since
+                );
+            }
             deny!(
-                "no CUDA kernel for {}::{} — op not in the CUDA registry (add a CUDA kernel + register it, or enable CPU/ORT fallback)",
+                "no handler for {}::{} at opset {} — add a claim+handler",
                 domain,
-                op.op_type
+                op.op_type,
+                opset
             );
         }
         if matches!(op.op_type.as_str(), "FusedMatMulBias" | "FusedGemm")
@@ -172,7 +190,13 @@ impl ExecutionProvider for CudaExecutionProvider {
             .registry
             .lookup(&op.op_type, &op.domain, opset)
             .ok_or_else(|| EpError::NoEpForOp {
+                domain: if op.domain.is_empty() {
+                    "ai.onnx".to_string()
+                } else {
+                    op.domain.clone()
+                },
                 op_type: op.op_type.clone(),
+                opset,
             })?;
         factory.create(op, shapes)
     }

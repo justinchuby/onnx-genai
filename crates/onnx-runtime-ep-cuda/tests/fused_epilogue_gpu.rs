@@ -312,7 +312,7 @@ fn placement_declines_broadcast_bias_and_batched_matmul() {
             let layouts = vec![TensorLayout::contiguous(); shapes.len()];
             assert_eq!(
                 matches!(
-                    ep.supports_op(node, &shapes, &layouts),
+                    ep.supports_op(node, 1, &shapes, &layouts),
                     KernelMatch::Supported { .. }
                 ),
                 expected,

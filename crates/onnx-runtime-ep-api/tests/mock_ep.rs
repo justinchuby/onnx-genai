@@ -74,8 +74,18 @@ impl ExecutionProvider for MockEp {
         Ok(())
     }
 
-    fn supports_op(&self, op: &Node, _shapes: &[Shape], _layouts: &[TensorLayout]) -> KernelMatch {
-        if self.registry.lookup(&op.op_type, &op.domain, 17).is_some() {
+    fn supports_op(
+        &self,
+        op: &Node,
+        opset: u64,
+        _shapes: &[Shape],
+        _layouts: &[TensorLayout],
+    ) -> KernelMatch {
+        if self
+            .registry
+            .lookup(&op.op_type, &op.domain, opset)
+            .is_some()
+        {
             KernelMatch::Supported {
                 cost: Cost::new(1.0, 0.5, 0.0).with_bytes_moved(256),
                 required_input_layouts: None,
@@ -145,6 +155,10 @@ fn op_registry_resolves_highest_matching_opset() {
     assert!(reg.lookup("Add", "", 6).is_none());
     // Unknown op.
     assert!(reg.lookup("Mul", "", 20).is_none());
+    assert!(!reg.supports("Add", "", 6));
+    assert!(reg.supports("Add", "ai.onnx", 7));
+    assert_eq!(reg.earliest_since_version("Add", ""), Some(7));
+    assert_eq!(reg.earliest_since_version("Mul", ""), None);
 }
 
 #[test]
@@ -156,7 +170,7 @@ fn mock_ep_supports_and_builds_kernel() {
     let shapes = vec![static_shape([2, 3]), static_shape([2, 3])];
     let layouts = vec![TensorLayout::contiguous(), TensorLayout::contiguous()];
 
-    let m = ep.supports_op(&node, &shapes, &layouts);
+    let m = ep.supports_op(&node, 17, &shapes, &layouts);
     assert!(m.is_supported());
 
     let kernel = ep.get_kernel(&node, &[vec![2, 3], vec![2, 3]], 17).unwrap();
@@ -174,16 +188,18 @@ fn ep_registry_lists_candidates_in_priority_order() {
     let shapes = vec![static_shape([4]), static_shape([4])];
     let layouts = vec![TensorLayout::contiguous(), TensorLayout::contiguous()];
 
-    let candidates = registry.candidates_for_op(&node, &shapes, &layouts);
+    let candidates = registry.candidates_for_op(&node, 17, &shapes, &layouts);
     assert_eq!(candidates.len(), 1);
     assert_eq!(candidates[0].0, id);
     assert!(candidates[0].1.is_supported());
 
     // An unsupported op yields no candidates.
     let unsupported = Node::new(NodeId(1), "NoSuchOp", vec![], vec![]);
-    assert!(registry
-        .candidates_for_op(&unsupported, &[], &[])
-        .is_empty());
+    assert!(
+        registry
+            .candidates_for_op(&unsupported, 17, &[], &[])
+            .is_empty()
+    );
 }
 
 #[test]

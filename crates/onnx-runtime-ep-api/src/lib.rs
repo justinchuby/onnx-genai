@@ -57,8 +57,12 @@ mod error {
     /// runtime top-level `Error`, `docs/ORT2.md` §22).
     #[derive(Debug, thiserror::Error)]
     pub enum EpError {
-        #[error("no EP supports op {op_type} on any available device")]
-        NoEpForOp { op_type: String },
+        #[error("no EP handler for {domain}::{op_type} at opset {opset} on any available device")]
+        NoEpForOp {
+            domain: String,
+            op_type: String,
+            opset: u64,
+        },
 
         #[error("kernel execution failed: {0}")]
         KernelFailed(String),

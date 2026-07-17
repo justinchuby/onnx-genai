@@ -48,9 +48,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use onnx_runtime_ep_api::{
-    DeviceBuffer, DevicePtr, DevicePtrMut, ExecutionProvider, ExternalMmapRegion, KernelInput,
-    KernelMatch, LazyWeight, LazyWeightBoundary, ResidentWeight, TensorBacking, TensorMut,
-    TensorView, WeightHandle,
+    DeviceBuffer, DevicePtr, DevicePtrMut, EpError, ExecutionProvider, ExternalMmapRegion,
+    KernelInput, KernelMatch, LazyWeight, LazyWeightBoundary, ResidentWeight, TensorBacking,
+    TensorMut, TensorView, WeightHandle,
 };
 use onnx_runtime_ep_cpu::CpuExecutionProvider;
 use onnx_runtime_ep_cpu::strided::view_in_bounds;
@@ -201,7 +201,7 @@ impl KernelCache {
                 .collect();
             let layouts = vec![TensorLayout::contiguous(); input_shapes.len()];
             if let KernelMatch::Unsupported { reason } =
-                ep.supports_op(node, &shape_dims, &layouts)
+                ep.supports_op(node, opset, &shape_dims, &layouts)
             {
                 return Err(SessionError::unsupported_op(
                     node,
@@ -211,7 +211,27 @@ impl KernelCache {
                     reason,
                 ));
             }
-            let mut kernel = ep.get_kernel(node, input_shapes, opset)?;
+            let mut kernel = match ep.get_kernel(node, input_shapes, opset) {
+                Ok(kernel) => kernel,
+                Err(EpError::NoEpForOp {
+                    domain,
+                    op_type,
+                    opset,
+                }) => {
+                    // Opset-aware claims should make this unreachable. Preserve
+                    // the actionable diagnostic if an EP's claim drifts.
+                    return Err(SessionError::unsupported_op(
+                        node,
+                        node_id,
+                        opset,
+                        ep.name(),
+                        format!(
+                            "no handler for {domain}::{op_type} at opset {opset} — add a claim+handler"
+                        ),
+                    ));
+                }
+                Err(error) => return Err(error.into()),
+            };
             kernel.set_constant_inputs(constant_inputs);
             self.entries.insert(key.clone(), kernel);
             self.misses += 1;
@@ -798,7 +818,10 @@ fn collect_cuda_coverage_issues(
             })
             .collect::<Vec<_>>();
 
-        if let KernelMatch::Unsupported { reason } = ep.supports_op(node, &shapes, &layouts) {
+        let opset = effective_opset(opset_graph, node);
+        if let KernelMatch::Unsupported { reason } =
+            ep.supports_op(node, opset, &shapes, &layouts)
+        {
             issues.push(format!(
                 "{}: {reason}",
                 format_node_identity(scope, node_id, node)
@@ -813,7 +836,6 @@ fn collect_cuda_coverage_issues(
         else {
             continue;
         };
-        let opset = effective_opset(opset_graph, node);
         if let Err(error) = ep.get_kernel(node, &concrete_shapes, opset) {
             issues.push(format!(
                 "{}: kernel creation failed: {error}",
@@ -4423,6 +4445,7 @@ mod tests {
         fn supports_op(
             &self,
             op: &Node,
+            _opset: u64,
             _shapes: &[Shape],
             _layouts: &[TensorLayout],
         ) -> KernelMatch {
@@ -4435,7 +4458,7 @@ mod tests {
                     output_layouts: vec![TensorLayout::contiguous()],
                 }
             } else {
-                KernelMatch::Unsupported
+                KernelMatch::unsupported("weight-delivery mock EP only handles BlockQuantizedMoE and Identity")
             }
         }
 
@@ -4692,6 +4715,7 @@ mod tests {
     #[test]
     fn coverage_collector_surfaces_ep_decline_reason() {
         let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 17);
         let input = graph.create_named_value("x", DataType::Float32, vec![Dim::Static(1)]);
         let output = graph.create_named_value("y", DataType::Float32, vec![Dim::Static(1)]);
         graph.insert_node(Node::new(
@@ -4708,7 +4732,7 @@ mod tests {
         assert_eq!(issues.len(), 1);
         assert!(
             issues[0].contains("NotRegistered")
-                && issues[0].contains("not in the CPU registry"),
+                && issues[0].contains("no handler for ai.onnx::NotRegistered at opset 17"),
             "{}",
             issues[0]
         );

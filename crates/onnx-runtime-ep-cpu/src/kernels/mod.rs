@@ -1353,16 +1353,16 @@ mod tests {
             reg.lookup("LayerNormalization", "com.microsoft", 1)
                 .is_some()
         );
-        assert!(reg.supports("LayerNormalization", "com.microsoft"));
-        assert!(reg.supports("MatMul", "ai.onnx"));
+        assert!(reg.supports("LayerNormalization", "com.microsoft", 1));
+        assert!(reg.supports("MatMul", "ai.onnx", 1));
         // The `MatMul + Add` fusion's contrib op now has a CPU kernel.
-        assert!(reg.supports("FusedMatMulBias", "com.microsoft"));
+        assert!(reg.supports("FusedMatMulBias", "com.microsoft", 1));
         // The `MatMul + Add + Relu` fusion's contrib op now has a CPU kernel.
-        assert!(reg.supports("FusedGemm", "com.microsoft"));
+        assert!(reg.supports("FusedGemm", "com.microsoft", 1));
         assert!(reg.lookup("FusedGemm", "com.microsoft", 1).is_some());
         // The exact-GELU fusion's contrib op has a CPU kernel (contrib-only).
-        assert!(reg.supports("Gelu", "com.microsoft"));
-        assert!(reg.supports("MoE", "com.microsoft"));
+        assert!(reg.supports("Gelu", "com.microsoft", 1));
+        assert!(reg.supports("MoE", "com.microsoft", 1));
         assert!(reg.lookup("Gelu", "com.microsoft", 1).is_some());
         for op in [
             "BiasGelu",
@@ -1408,7 +1408,7 @@ mod tests {
         assert!(reg.lookup("Attention", "ai.onnx", 23).is_some());
         assert!(reg.lookup("Attention", "ai.onnx", 26).is_some());
         assert!(reg.lookup("Attention", "", 22).is_none());
-        assert!(reg.supports("Attention", ""));
+        assert!(reg.supports("Attention", "", 23));
     }
 
     #[test]

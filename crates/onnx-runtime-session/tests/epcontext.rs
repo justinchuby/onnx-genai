@@ -90,7 +90,13 @@ impl ExecutionProvider for MockCompiledEp {
     fn shutdown(&mut self) -> EpResult<()> {
         Ok(())
     }
-    fn supports_op(&self, _op: &Node, _shapes: &[Shape], _layouts: &[TensorLayout]) -> KernelMatch {
+    fn supports_op(
+        &self,
+        _op: &Node,
+        _opset: u64,
+        _shapes: &[Shape],
+        _layouts: &[TensorLayout],
+    ) -> KernelMatch {
         KernelMatch::unsupported("test EP supports no ops")
     }
     fn get_kernel(
@@ -100,7 +106,9 @@ impl ExecutionProvider for MockCompiledEp {
         _opset: u64,
     ) -> EpResult<Box<dyn Kernel>> {
         Err(EpError::NoEpForOp {
+            domain: "ai.onnx".to_string(),
             op_type: "<mock>".to_string(),
+            opset: _opset,
         })
     }
     fn allocate(&self, _size: usize, _alignment: usize) -> EpResult<DeviceBuffer> {

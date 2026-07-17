@@ -266,13 +266,19 @@ pub trait ExecutionProvider: Send + Sync {
     /// Release device resources.
     fn shutdown(&mut self) -> Result<()>;
 
-    /// Whether this EP can run `op` with the given input shapes and layouts,
-    /// and at what cost.
+    /// Whether this EP can run `op` at the model's effective `opset` with the
+    /// given input shapes and layouts, and at what cost.
     ///
     /// Every [`KernelMatch::Unsupported`] result must carry an actionable reason:
     /// state what the EP accepts and, where possible, how to fix the model or
     /// registration rather than returning a bare decline.
-    fn supports_op(&self, op: &Node, shapes: &[Shape], layouts: &[TensorLayout]) -> KernelMatch;
+    fn supports_op(
+        &self,
+        op: &Node,
+        opset: u64,
+        shapes: &[Shape],
+        layouts: &[TensorLayout],
+    ) -> KernelMatch;
 
     /// Get or create a kernel for `op` specialized to concrete `shapes`.
     ///

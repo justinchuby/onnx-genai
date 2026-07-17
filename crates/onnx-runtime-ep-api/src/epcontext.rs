@@ -226,6 +226,7 @@ mod tests {
         fn supports_op(
             &self,
             _op: &Node,
+            _opset: u64,
             _shapes: &[Shape],
             _layouts: &[TensorLayout],
         ) -> KernelMatch {
@@ -239,7 +240,9 @@ mod tests {
             _opset: u64,
         ) -> Result<Box<dyn Kernel>> {
             Err(EpError::NoEpForOp {
+                domain: "ai.onnx".to_string(),
                 op_type: "<mock>".to_string(),
+                opset: _opset,
             })
         }
 
@@ -315,6 +318,7 @@ mod tests {
         fn supports_op(
             &self,
             _op: &Node,
+            _opset: u64,
             _shapes: &[Shape],
             _layouts: &[TensorLayout],
         ) -> KernelMatch {
@@ -327,7 +331,9 @@ mod tests {
             _opset: u64,
         ) -> Result<Box<dyn Kernel>> {
             Err(EpError::NoEpForOp {
+                domain: "ai.onnx".to_string(),
                 op_type: "<plain>".to_string(),
+                opset: _opset,
             })
         }
         fn allocate(&self, _size: usize, _alignment: usize) -> Result<DeviceBuffer> {

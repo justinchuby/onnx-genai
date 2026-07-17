@@ -27,7 +27,7 @@ use std::ffi::c_void;
 
 use onnx_runtime_ep_api::{
     Cost, DeviceBuffer, EpConfig, EpError, ExecutionProvider, Fence, Kernel, KernelMatch,
-    OpRegistry, Result, require,
+    OpRegistry, Result, deny,
 };
 use onnx_runtime_ir::{DeviceId, DeviceType, Node, Shape, TensorLayout};
 
@@ -120,9 +120,15 @@ impl ExecutionProvider for CpuExecutionProvider {
         Ok(())
     }
 
-    fn supports_op(&self, op: &Node, shapes: &[Shape], _layouts: &[TensorLayout]) -> KernelMatch {
-        // Model-agnostic: keyed on (op_type, domain) via the registry — the
-        // single source of truth for "is this an op/domain we support". This
+    fn supports_op(
+        &self,
+        op: &Node,
+        opset: u64,
+        shapes: &[Shape],
+        _layouts: &[TensorLayout],
+    ) -> KernelMatch {
+        // Keyed on (op_type, domain, opset) via the registry — the single source
+        // of truth for "is this operator version supported". This
         // accepts standard default-domain (`""`/`ai.onnx`) ops and any contrib
         // ops (e.g. fused `com.microsoft` ops) the registry knows, without a
         // hardcoded op/domain whitelist.
@@ -131,12 +137,27 @@ impl ExecutionProvider for CpuExecutionProvider {
         } else {
             &op.domain
         };
-        require!(
-            self.registry.supports(&op.op_type, &op.domain),
-            "no CPU kernel for {}::{} — op not in the CPU registry (add a kernel + register it)",
-            domain,
-            op.op_type
-        );
+        if !self.registry.supports(&op.op_type, &op.domain, opset) {
+            if let Some(since) = self
+                .registry
+                .earliest_since_version(&op.op_type, &op.domain)
+            {
+                deny!(
+                    "no handler for {}::{} at opset {} — this EP registers {} since opset {} (or: add a claim+handler)",
+                    domain,
+                    op.op_type,
+                    opset,
+                    op.op_type,
+                    since
+                );
+            }
+            deny!(
+                "no handler for {}::{} at opset {} — add a claim+handler",
+                domain,
+                op.op_type,
+                opset
+            );
+        }
         // The reference kernels produce contiguous row-major outputs and accept
         // strided inputs, so no input layout is required.
         let output_layouts = vec![TensorLayout::contiguous(); op.outputs.len()];
@@ -170,7 +191,13 @@ impl ExecutionProvider for CpuExecutionProvider {
             .registry
             .lookup(&op.op_type, &op.domain, opset)
             .ok_or_else(|| EpError::NoEpForOp {
+                domain: if op.domain.is_empty() {
+                    "ai.onnx".to_string()
+                } else {
+                    op.domain.clone()
+                },
                 op_type: op.op_type.clone(),
+                opset,
             })?;
         factory.create(op, shapes)
     }
@@ -400,13 +427,33 @@ mod tests {
     fn supports_op_reports_phase1_only() {
         let ep = CpuExecutionProvider::new();
         let mm = Node::new(onnx_runtime_ir::NodeId(0), "MatMul", vec![], vec![]);
-        assert!(ep.supports_op(&mm, &[], &[]).is_supported());
+        assert!(ep.supports_op(&mm, 17, &[], &[]).is_supported());
         let conv = Node::new(onnx_runtime_ir::NodeId(1), "Conv", vec![], vec![]);
-        let rejected = ep.supports_op(&conv, &[], &[]);
+        let rejected = ep.supports_op(&conv, 17, &[], &[]);
         assert!(!rejected.is_supported());
         let reason = rejected.reason().expect("unsupported reason");
         assert!(reason.contains("Conv"), "{reason}");
-        assert!(reason.contains("not in the CPU registry"), "{reason}");
+        assert!(
+            reason.contains("no handler for ai.onnx::Conv at opset 17"),
+            "{reason}"
+        );
+        assert!(reason.contains("add a claim+handler"), "{reason}");
+    }
+
+    #[test]
+    fn supports_op_is_opset_aware_for_standard_gelu() {
+        let ep = CpuExecutionProvider::new();
+        let gelu = Node::new(onnx_runtime_ir::NodeId(0), "Gelu", vec![], vec![]);
+
+        let rejected = ep.supports_op(&gelu, 19, &[], &[]);
+        let reason = rejected.reason().expect("opset 19 must be declined");
+        assert!(
+            reason.contains("no handler for ai.onnx::Gelu at opset 19"),
+            "{reason}"
+        );
+        assert!(reason.contains("registers Gelu since opset 20"), "{reason}");
+
+        assert!(ep.supports_op(&gelu, 20, &[], &[]).is_supported());
     }
 
     #[test]
@@ -421,7 +468,7 @@ mod tests {
             vec![],
         );
         fused.domain = "com.microsoft".to_string();
-        assert!(ep.supports_op(&fused, &[], &[]).is_supported());
+        assert!(ep.supports_op(&fused, 1, &[], &[]).is_supported());
         assert!(ep.get_kernel(&fused, &[], 1).is_ok());
 
         // The fused `FusedMatMulBias` (MatMul+Add) now has a contrib-domain
@@ -433,14 +480,14 @@ mod tests {
             vec![],
         );
         fmb.domain = "com.microsoft".to_string();
-        assert!(ep.supports_op(&fmb, &[], &[]).is_supported());
+        assert!(ep.supports_op(&fmb, 1, &[], &[]).is_supported());
         assert!(ep.get_kernel(&fmb, &[], 1).is_ok());
 
         // The fused `FusedGemm` (MatMul+Add+Relu) now has a contrib-domain
         // kernel too, so it is supported and instantiable.
         let mut fg = Node::new(onnx_runtime_ir::NodeId(2), "FusedGemm", vec![], vec![]);
         fg.domain = "com.microsoft".to_string();
-        assert!(ep.supports_op(&fg, &[], &[]).is_supported());
+        assert!(ep.supports_op(&fg, 1, &[], &[]).is_supported());
         assert!(ep.get_kernel(&fg, &[], 1).is_ok());
 
         // The fused `FusedAttention` (SDPA core) is supported in the contrib
@@ -448,7 +495,7 @@ mod tests {
         // instantiate.
         let mut fa = Node::new(onnx_runtime_ir::NodeId(4), "FusedAttention", vec![], vec![]);
         fa.domain = "com.microsoft".to_string();
-        assert!(ep.supports_op(&fa, &[], &[]).is_supported());
+        assert!(ep.supports_op(&fa, 1, &[], &[]).is_supported());
         fa.attributes
             .insert("scale".to_string(), onnx_runtime_ir::Attribute::Float(0.5));
         assert!(ep.get_kernel(&fa, &[], 1).is_ok());
@@ -462,6 +509,6 @@ mod tests {
             vec![],
         );
         unknown.domain = "com.microsoft".to_string();
-        assert!(!ep.supports_op(&unknown, &[], &[]).is_supported());
+        assert!(!ep.supports_op(&unknown, 1, &[], &[]).is_supported());
     }
 }
