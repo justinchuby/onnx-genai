@@ -39,11 +39,12 @@ pub use kernels::qmoe::WeightOffloadHostCache;
 pub use optimizer::{ProjectionFusion, cpu_optimization_passes};
 pub use provider::CpuExecutionProvider;
 pub use weight_offload::placement::{
-    ArbitrationAction, GpuLayersOverrideReport, HostFallbackReason, IqFormat, LayerPlacement,
-    LayerWeightRegions, Placement, PlacementError, PlacementPlan, QuantTileFormat, RegionPlacement,
-    SnappedTileSize, TileSizeError, VramArbitrationConfig, VramArbitrationError,
-    VramArbitrationOutcome, VramArbitrationState, VramDemand, VramSubBudgets, arbitrate_vram,
-    plan_placement, snap_transfer_tile_bytes,
+    ArbitrationAction, GpuLayersOverrideReport, HostFallbackReason, IqFormat, KvAdmissionDecision,
+    KvAdmissionLimitingFactor, LayerPlacement, LayerWeightRegions, Placement, PlacementError,
+    PlacementPlan, QuantTileFormat, RegionPlacement, SnappedTileSize, TileSizeError,
+    VramArbitrationConfig, VramArbitrationError, VramArbitrationOutcome, VramArbitrationState,
+    VramDemand, VramSubBudgets, arbitrate_vram, decide_kv_admission, plan_placement,
+    snap_transfer_tile_bytes,
 };
 pub use weight_offload::weight_handle::{
     ExecutionProviderCapabilities, LazyDeviceWeightBinder, LazyWeight, LazyWeightBoundary,

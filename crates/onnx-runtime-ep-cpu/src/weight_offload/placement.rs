@@ -315,7 +315,38 @@ pub enum ArbitrationAction {
 pub struct VramArbitrationOutcome {
     pub state: VramArbitrationState,
     pub action: ArbitrationAction,
+    pub admission: KvAdmissionDecision,
     pub explanation: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KvAdmissionLimitingFactor {
+    CurrentKvSubBudget {
+        available_kv_bytes: u64,
+    },
+    TotalVramAfterScratch {
+        maximum_kv_bytes: u64,
+        scratch_bytes: u64,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KvAdmissionDecision {
+    Admitted {
+        requested_kv_bytes: u64,
+        granted_kv_bytes: u64,
+    },
+    Rejected {
+        requested_kv_bytes: u64,
+        available_kv_bytes: u64,
+        limiting_factor: KvAdmissionLimitingFactor,
+    },
+}
+
+impl KvAdmissionDecision {
+    pub fn is_admitted(self) -> bool {
+        matches!(self, Self::Admitted { .. })
+    }
 }
 
 #[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
@@ -392,14 +423,11 @@ pub fn arbitrate_vram(
                 >= u128::from(config.kv_high_watermark_percent),
             tick,
         )?;
-        return Ok(VramArbitrationOutcome {
+        return Ok(arbitration_outcome(
             state,
-            action: ArbitrationAction::InitialAllocation,
-            explanation: arbitration_explanation(
-                ArbitrationAction::InitialAllocation,
-                state.budgets,
-            ),
-        });
+            ArbitrationAction::InitialAllocation,
+            demand.requested_kv_bytes,
+        ));
     };
 
     if tick < previous.last_rebalance_tick {
@@ -430,7 +458,10 @@ pub fn arbitrate_vram(
             .max(kv_floor_bytes)
             .min(maximum_kv)
     } else {
-        kv_floor_bytes
+        demand
+            .requested_kv_bytes
+            .max(kv_floor_bytes)
+            .min(maximum_kv)
     };
     let floor_requires_immediate_rebalance = kv_floor_bytes > previous.budgets.kv_bytes;
     let elapsed = tick.checked_sub(previous.last_rebalance_tick).ok_or(
@@ -451,11 +482,11 @@ pub fn arbitrate_vram(
             kv_pressure,
             ..previous
         };
-        return Ok(VramArbitrationOutcome {
-            state: held,
-            action: ArbitrationAction::HeldForDwell,
-            explanation: arbitration_explanation(ArbitrationAction::HeldForDwell, held.budgets),
-        });
+        return Ok(arbitration_outcome(
+            held,
+            ArbitrationAction::HeldForDwell,
+            demand.requested_kv_bytes,
+        ));
     }
 
     if target_kv == previous.budgets.kv_bytes {
@@ -467,19 +498,64 @@ pub fn arbitrate_vram(
             kv_pressure,
             ..previous
         };
-        return Ok(VramArbitrationOutcome {
-            state: held,
-            action: ArbitrationAction::HeldByHysteresis,
-            explanation: arbitration_explanation(ArbitrationAction::HeldByHysteresis, held.budgets),
-        });
+        return Ok(arbitration_outcome(
+            held,
+            ArbitrationAction::HeldByHysteresis,
+            demand.requested_kv_bytes,
+        ));
     }
 
     let state = make_arbitration_state(config, kv_floor_bytes, target_kv, kv_pressure, tick)?;
-    Ok(VramArbitrationOutcome {
+    Ok(arbitration_outcome(
         state,
-        action: ArbitrationAction::Rebalanced,
-        explanation: arbitration_explanation(ArbitrationAction::Rebalanced, state.budgets),
-    })
+        ArbitrationAction::Rebalanced,
+        demand.requested_kv_bytes,
+    ))
+}
+
+fn arbitration_outcome(
+    state: VramArbitrationState,
+    action: ArbitrationAction,
+    requested_kv_bytes: u64,
+) -> VramArbitrationOutcome {
+    VramArbitrationOutcome {
+        state,
+        action,
+        admission: decide_kv_admission(requested_kv_bytes, state.budgets),
+        explanation: arbitration_explanation(action, state.budgets),
+    }
+}
+
+/// Decide continuous-batch admission against the governor's current KV
+/// sub-budget. The decision is explicit so batch formation never infers
+/// admission from residency pressure or an arbitration action.
+pub fn decide_kv_admission(
+    requested_kv_bytes: u64,
+    budgets: VramSubBudgets,
+) -> KvAdmissionDecision {
+    if requested_kv_bytes <= budgets.kv_bytes {
+        return KvAdmissionDecision::Admitted {
+            requested_kv_bytes,
+            granted_kv_bytes: budgets.kv_bytes,
+        };
+    }
+
+    let maximum_kv_bytes = budgets.total_bytes.saturating_sub(budgets.scratch_bytes);
+    let limiting_factor = if requested_kv_bytes > maximum_kv_bytes {
+        KvAdmissionLimitingFactor::TotalVramAfterScratch {
+            maximum_kv_bytes,
+            scratch_bytes: budgets.scratch_bytes,
+        }
+    } else {
+        KvAdmissionLimitingFactor::CurrentKvSubBudget {
+            available_kv_bytes: budgets.kv_bytes,
+        }
+    };
+    KvAdmissionDecision::Rejected {
+        requested_kv_bytes,
+        available_kv_bytes: budgets.kv_bytes,
+        limiting_factor,
+    }
 }
 
 fn make_arbitration_state(
@@ -874,6 +950,124 @@ mod tests {
         assert_eq!(settled.action, ArbitrationAction::Rebalanced);
         assert_eq!(settled.state.budgets.kv_bytes, 200);
         assert_eq!(settled.state.budgets.weight_bytes, 700);
+    }
+
+    #[test]
+    fn arbitration_preserves_outstanding_requested_kv_after_dwell() {
+        let initial = arbitrate_vram(
+            arbitration_config(),
+            None,
+            VramDemand {
+                committed_sequences: 2,
+                requested_kv_bytes: 500,
+                observed_kv_bytes: 100,
+            },
+            0,
+        )
+        .unwrap();
+        let settled = arbitrate_vram(
+            arbitration_config(),
+            Some(initial.state),
+            VramDemand {
+                committed_sequences: 2,
+                requested_kv_bytes: 400,
+                observed_kv_bytes: 100,
+            },
+            10,
+        )
+        .unwrap();
+
+        assert_eq!(settled.action, ArbitrationAction::Rebalanced);
+        assert_eq!(settled.state.budgets.kv_floor_bytes, 200);
+        assert_eq!(settled.state.budgets.kv_bytes, 400);
+        assert_eq!(
+            settled.admission,
+            KvAdmissionDecision::Admitted {
+                requested_kv_bytes: 400,
+                granted_kv_bytes: 400,
+            }
+        );
+    }
+
+    #[test]
+    fn arbitration_returns_explicit_batch_admission_and_rejection() {
+        let admitted = arbitrate_vram(
+            arbitration_config(),
+            None,
+            VramDemand {
+                committed_sequences: 2,
+                requested_kv_bytes: 500,
+                observed_kv_bytes: 0,
+            },
+            0,
+        )
+        .unwrap();
+        assert_eq!(
+            admitted.admission,
+            KvAdmissionDecision::Admitted {
+                requested_kv_bytes: 500,
+                granted_kv_bytes: 500,
+            }
+        );
+
+        let held_for_dwell = arbitrate_vram(
+            arbitration_config(),
+            Some(
+                arbitrate_vram(
+                    arbitration_config(),
+                    None,
+                    VramDemand {
+                        committed_sequences: 2,
+                        requested_kv_bytes: 200,
+                        observed_kv_bytes: 180,
+                    },
+                    0,
+                )
+                .unwrap()
+                .state,
+            ),
+            VramDemand {
+                committed_sequences: 2,
+                requested_kv_bytes: 500,
+                observed_kv_bytes: 180,
+            },
+            1,
+        )
+        .unwrap();
+        assert_eq!(held_for_dwell.action, ArbitrationAction::HeldForDwell);
+        assert_eq!(
+            held_for_dwell.admission,
+            KvAdmissionDecision::Rejected {
+                requested_kv_bytes: 500,
+                available_kv_bytes: 200,
+                limiting_factor: KvAdmissionLimitingFactor::CurrentKvSubBudget {
+                    available_kv_bytes: 200,
+                },
+            }
+        );
+
+        let rejected = arbitrate_vram(
+            arbitration_config(),
+            None,
+            VramDemand {
+                committed_sequences: 2,
+                requested_kv_bytes: 950,
+                observed_kv_bytes: 0,
+            },
+            0,
+        )
+        .unwrap();
+        assert_eq!(
+            rejected.admission,
+            KvAdmissionDecision::Rejected {
+                requested_kv_bytes: 950,
+                available_kv_bytes: 900,
+                limiting_factor: KvAdmissionLimitingFactor::TotalVramAfterScratch {
+                    maximum_kv_bytes: 900,
+                    scratch_bytes: 100,
+                },
+            }
+        );
     }
 
     #[test]

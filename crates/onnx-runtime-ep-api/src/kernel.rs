@@ -4,6 +4,7 @@ use onnx_runtime_ir::TensorLayout;
 
 use crate::error::Result;
 use crate::tensor::{TensorMut, TensorView};
+use crate::weight::WeightHandle;
 
 /// A cost estimate for running a kernel, consumed by the placement cost model
 /// (`docs/ORT2.md` §6). All time fields are in **microseconds**; a fuller model
@@ -115,6 +116,30 @@ pub struct ViewOutput {
     pub byte_offset: usize,
 }
 
+/// An executor-delivered kernel input. Existing EPs receive `Tensor` variants;
+/// an EP advertising the `nxrt` capability may receive a lazy `Weight` at the
+/// `pkg.nxrt::BlockQuantizedMoE` boundary.
+pub enum KernelInput<'a> {
+    Tensor(TensorView<'a>),
+    Weight(&'a WeightHandle),
+}
+
+impl<'a> KernelInput<'a> {
+    pub fn tensor(&self) -> Option<&TensorView<'a>> {
+        match self {
+            Self::Tensor(view) => Some(view),
+            Self::Weight(_) => None,
+        }
+    }
+
+    pub fn weight(&self) -> Option<&WeightHandle> {
+        match self {
+            Self::Tensor(_) => None,
+            Self::Weight(weight) => Some(weight),
+        }
+    }
+}
+
 /// A kernel ready to execute a specific op with specific shapes (§4.2).
 pub trait Kernel: Send {
     /// Tell the kernel which positional inputs are immutable graph constants.
@@ -128,6 +153,31 @@ pub trait Kernel: Send {
 
     /// Execute over device-resident inputs/outputs.
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()>;
+
+    /// Execute through the general weight-delivery seam.
+    ///
+    /// The default adapter accepts only resident tensor inputs and forwards to
+    /// [`Kernel::execute`], so existing EPs compile and behave identically.
+    /// Paging-aware kernels override this method to consume lazy handles.
+    fn execute_with_inputs(
+        &self,
+        inputs: &[KernelInput<'_>],
+        outputs: &mut [TensorMut],
+    ) -> Result<()> {
+        let views = inputs
+            .iter()
+            .map(|input| {
+                input.tensor().copied().ok_or_else(|| {
+                    crate::EpError::KernelFailed(
+                        "kernel received a lazy WeightHandle without implementing \
+                         execute_with_inputs"
+                            .into(),
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.execute(&views, outputs)
+    }
 
     /// Estimated FLOPs, if known (for the cost model).
     fn estimated_flops(&self) -> Option<u64> {
@@ -170,7 +220,11 @@ pub trait Kernel: Send {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
     use super::*;
+    use crate::{DeviceId, DevicePtr};
 
     #[test]
     fn cost_zero_and_total() {
@@ -200,5 +254,39 @@ mod tests {
         };
         assert!(supported.is_supported());
         assert!(!KernelMatch::Unsupported.is_supported());
+    }
+
+    struct LegacyKernel {
+        called: Arc<AtomicBool>,
+    }
+
+    impl Kernel for LegacyKernel {
+        fn execute(&self, inputs: &[TensorView], _outputs: &mut [TensorMut]) -> Result<()> {
+            assert_eq!(inputs.len(), 1);
+            assert_eq!(inputs[0].shape, &[4]);
+            self.called.store(true, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn legacy_kernel_adapter_receives_the_resident_tensor_path() {
+        let called = Arc::new(AtomicBool::new(false));
+        let kernel = LegacyKernel {
+            called: Arc::clone(&called),
+        };
+        let bytes = [1u8, 2, 3, 4];
+        let shape = [4usize];
+        let strides = [1i64];
+        let inputs = [KernelInput::Tensor(TensorView::new(
+            DevicePtr(bytes.as_ptr().cast()),
+            onnx_runtime_ir::DataType::Uint8,
+            &shape,
+            &strides,
+            DeviceId::cpu(),
+        ))];
+
+        kernel.execute_with_inputs(&inputs, &mut []).unwrap();
+        assert!(called.load(Ordering::Relaxed));
     }
 }

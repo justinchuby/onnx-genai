@@ -16,6 +16,7 @@
 //! * [`registry`] — [`OpRegistry`], [`OpKey`], [`KernelFactory`], [`EpRegistry`].
 //! * [`epcontext`] — [`EpContext`] runtime form + `source`-keyed [`EpContextRegistry`] (§55).
 //! * [`tensor`] — [`TensorView`] / [`TensorMut`] zero-copy device views.
+//! * [`weight`] — capability-negotiated lazy [`WeightHandle`] delivery.
 //! * [`abi`] — ORT graph ABI bridge for legacy plugin EPs (Phase 2).
 
 pub mod abi;
@@ -24,10 +25,11 @@ pub mod kernel;
 pub mod provider;
 pub mod registry;
 pub mod tensor;
+pub mod weight;
 
 pub use epcontext::{build_ep_context_registry, EpContext, EpContextRegistry};
 pub use error::{EpError, Result};
-pub use kernel::{Cost, Kernel, KernelMatch, ViewOutput};
+pub use kernel::{Cost, Kernel, KernelInput, KernelMatch, ViewOutput};
 pub use provider::{
     DeviceBuffer, EpConfig, EpId, ExecutionProvider, Fence, OrtPluginExport,
 };
@@ -35,6 +37,11 @@ pub use onnx_runtime_optimizer::OptimizationPass as OptimizerPass;
 pub use registry::{EpRegistry, KernelFactory, OpKey, OpRegistry};
 pub use tensor::{
     DevicePtr, DevicePtrMut, ExternalMmapRegion, TensorBacking, TensorMut, TensorView,
+};
+pub use weight::{
+    ExecutionProviderCapabilities, LazyDeviceWeightBinder, LazyWeight, LazyWeightBoundary,
+    NXRT_WEIGHT_PAGING_CAPABILITY, NegotiatedWeight, Phase3aHostOnlyBinder, ResidentWeight,
+    ResidentWeightMaterializer, WeightHandle, WeightHandleError,
 };
 
 // Re-export the device vocabulary from the IR so EP authors have one import.
@@ -92,5 +99,8 @@ mod error {
 
         #[error(transparent)]
         Ir(#[from] onnx_runtime_ir::IrError),
+
+        #[error(transparent)]
+        WeightHandle(#[from] crate::weight::WeightHandleError),
     }
 }

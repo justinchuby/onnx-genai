@@ -48,8 +48,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use onnx_runtime_ep_api::{
-    DeviceBuffer, DevicePtr, DevicePtrMut, ExecutionProvider, ExternalMmapRegion, KernelMatch,
-    TensorBacking, TensorMut, TensorView,
+    DeviceBuffer, DevicePtr, DevicePtrMut, ExecutionProvider, ExternalMmapRegion, KernelInput,
+    KernelMatch, LazyWeight, LazyWeightBoundary, ResidentWeight, TensorBacking, TensorMut,
+    TensorView, WeightHandle,
 };
 use onnx_runtime_ep_cpu::CpuExecutionProvider;
 use onnx_runtime_ep_cpu::strided::view_in_bounds;
@@ -234,6 +235,9 @@ pub(crate) struct Executor {
     /// dropped afterwards — no use-after-free regardless of field drop order.
     weights: Arc<WeightStore>,
     ep: Arc<dyn ExecutionProvider>,
+    /// Lazy external initializers available only at the nxrt fused-MoE boundary.
+    /// Stock EPs ignore this map and keep receiving the resident buffers below.
+    weight_handles: HashMap<ValueId, WeightHandle>,
     /// One device buffer per backed value. Static values are allocated once at
     /// build; dynamic (symbol-shaped) values are allocated per run and cached
     /// here so a run whose resolved shape is unchanged reuses the allocation.
@@ -844,6 +848,61 @@ fn format_node_identity(scope: &str, node_id: NodeId, node: &Node) -> String {
     format!("{scope} {name} ({domain}::{})", node.op_type)
 }
 
+fn build_lazy_weight_handles(
+    graph: &Graph,
+    weights: &Arc<WeightStore>,
+    ep: &dyn ExecutionProvider,
+) -> Result<HashMap<ValueId, WeightHandle>> {
+    let capabilities = ep.capabilities();
+    if !capabilities.advertises(onnx_runtime_ep_api::NXRT_WEIGHT_PAGING_CAPABILITY) {
+        return Ok(HashMap::new());
+    }
+
+    let boundary = LazyWeightBoundary::BlockQuantizedMoe;
+    let mut handles = HashMap::new();
+    for (_, node) in graph.nodes.iter() {
+        if !boundary.matches(&node.domain, &node.op_type) {
+            continue;
+        }
+        for value in node.inputs.iter().flatten().copied() {
+            if handles.contains_key(&value) {
+                continue;
+            }
+            let Some(weight) = graph.initializers.get(&value) else {
+                continue;
+            };
+            let Some((mapping_id, offset, len)) = weights.external_mmap_provenance(weight) else {
+                continue;
+            };
+            let region = ExternalMmapRegion {
+                mapping_id,
+                offset,
+                len,
+            };
+            let dtype = weight.dtype();
+            let shape = weight.dims().to_vec();
+            let weight = weight.clone();
+            let store = Arc::clone(weights);
+            let lazy = LazyWeight::block_quantized_moe(vec![region], move || {
+                let bytes = store.bytes(&weight).ok_or_else(|| {
+                    onnx_runtime_ep_api::WeightHandleError::InvalidResident(
+                        "external weight bytes are no longer available".into(),
+                    )
+                })?;
+                ResidentWeight::new(dtype, shape.clone(), Arc::<[u8]>::from(bytes))
+            })
+            .map_err(|error| {
+                SessionError::Internal(format!(
+                    "cannot create lazy weight handle for value#{}: {error}",
+                    value.0
+                ))
+            })?;
+            handles.insert(value, WeightHandle::Lazy(lazy));
+        }
+    }
+    Ok(handles)
+}
+
 impl Executor {
     /// Compile a graph + weights into a runnable executor on the CPU EP.
     pub(crate) fn build(
@@ -856,6 +915,7 @@ impl Executor {
         // Topological order up front: also validates the graph is a DAG.
         let order = graph.topological_order()?;
         validate_cuda_only_coverage(&graph, ep.as_ref())?;
+        let weight_handles = build_lazy_weight_handles(&graph, &weights, ep.as_ref())?;
 
         let mut value_shapes: HashMap<ValueId, Shape> = HashMap::new();
         let mut value_dtypes: HashMap<ValueId, DataType> = HashMap::new();
@@ -1014,6 +1074,7 @@ impl Executor {
             graph,
             weights,
             ep,
+            weight_handles,
             buffers,
             buffer_shapes,
             value_shapes,
@@ -1768,6 +1829,7 @@ impl Executor {
         // whole while the kernel (from `cache`) and the buffers/views are held.
         let graph = &self.graph;
         let cache = &mut self.cache;
+        let weight_handles = &self.weight_handles;
         let buffers = &mut self.buffers;
         let buffer_shapes = &mut self.buffer_shapes;
         let views_meta = &mut self.views;
@@ -1808,12 +1870,23 @@ impl Executor {
             opset,
             ep.as_ref(),
         )?;
+        let capabilities = ep.capabilities();
+        let accepts_lazy_weights =
+            LazyWeightBoundary::BlockQuantizedMoe.matches(&node.domain, &node.op_type);
+        let has_lazy_inputs = accepts_lazy_weights
+            && inputs.iter().any(|input| {
+                input
+                    .and_then(|value| weight_handles.get(&value))
+                    .is_some_and(|handle| handle.is_lazy_for(&capabilities))
+            });
 
         // --- Zero-copy view fast path ---------------------------------------
         // Ask the kernel whether its outputs are strided views over its inputs
         // (a layout/movement op such as Slice). If so, record view metadata
         // aliasing the source buffer and skip compute + allocation entirely.
-        if let Some(specs) = kernel.view_outputs(&views, outputs.len()) {
+        if !has_lazy_inputs
+            && let Some(specs) = kernel.view_outputs(&views, outputs.len())
+        {
             if outputs
                 .iter()
                 .any(|output| external.outputs.contains_key(output))
@@ -2051,35 +2124,57 @@ impl Executor {
             ));
         }
 
-        kernel.execute(&views, &mut outs).map_err(|error| {
-            let input_types = views.iter().map(|view| view.dtype).collect::<Vec<_>>();
-            let output_types = outs.iter().map(|output| output.dtype).collect::<Vec<_>>();
-            let input_shapes = views
+        let kernel_inputs = has_lazy_inputs.then(|| {
+            inputs
                 .iter()
-                .map(|view| view.shape.to_vec())
-                .collect::<Vec<_>>();
-            let output_shapes = outs
-                .iter()
-                .map(|output| output.shape.to_vec())
-                .collect::<Vec<_>>();
-            let input_names = inputs
-                .iter()
-                .map(|input| {
-                    input
-                        .map(|value| self.graph.value(value).name.as_deref().unwrap_or("<unnamed>"))
-                        .unwrap_or("<absent>")
+                .zip(views.iter().copied())
+                .map(|(value, view)| {
+                    value
+                        .and_then(|value| weight_handles.get(&value))
+                        .filter(|handle| handle.is_lazy_for(&capabilities))
+                        .map(KernelInput::Weight)
+                        .unwrap_or(KernelInput::Tensor(view))
                 })
-                .collect::<Vec<_>>();
-            let output_names = outputs
-                .iter()
-                .map(|&value| self.graph.value(value).name.as_deref().unwrap_or("<unnamed>"))
-                .collect::<Vec<_>>();
-            SessionError::Internal(format!(
-                "node {} ({:?}, op '{}::{}', inputs {input_names:?} {input_types:?} {input_shapes:?}, outputs {output_names:?} {output_types:?} {output_shapes:?}) failed: {error}",
-                node.id.0, node.name, node.domain, node.op_type,
-            ))
-        })?;
+                .collect::<Vec<_>>()
+        });
+        let execution = match &kernel_inputs {
+            Some(inputs) => kernel.execute_with_inputs(inputs, &mut outs),
+            None => kernel.execute(&views, &mut outs),
+        };
+        execution.map_err(|error| {
+                let input_types = views.iter().map(|view| view.dtype).collect::<Vec<_>>();
+                let output_types = outs.iter().map(|output| output.dtype).collect::<Vec<_>>();
+                let input_shapes = views
+                    .iter()
+                    .map(|view| view.shape.to_vec())
+                    .collect::<Vec<_>>();
+                let output_shapes = outs
+                    .iter()
+                    .map(|output| output.shape.to_vec())
+                    .collect::<Vec<_>>();
+                let input_names = inputs
+                    .iter()
+                    .map(|input| {
+                        input
+                            .map(|value| {
+                                self.graph.value(value).name.as_deref().unwrap_or("<unnamed>")
+                            })
+                            .unwrap_or("<absent>")
+                    })
+                    .collect::<Vec<_>>();
+                let output_names = outputs
+                    .iter()
+                    .map(|&value| {
+                        self.graph.value(value).name.as_deref().unwrap_or("<unnamed>")
+                    })
+                    .collect::<Vec<_>>();
+                SessionError::Internal(format!(
+                    "node {} ({:?}, op '{}::{}', inputs {input_names:?} {input_types:?} {input_shapes:?}, outputs {output_names:?} {output_types:?} {output_shapes:?}) failed: {error}",
+                    node.id.0, node.name, node.domain, node.op_type,
+                ))
+            })?;
 
+        drop(kernel_inputs);
         drop(views);
         drop(outs);
         for backing in out_bufs {
@@ -4135,7 +4230,247 @@ pub(crate) fn auto_detect_cpu_ep() -> Result<Arc<dyn ExecutionProvider>> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use onnx_runtime_ep_api::{
+        Cost, EpConfig, EpError, ExecutionProviderCapabilities, Fence, Kernel, NegotiatedWeight,
+    };
+
     use super::*;
+
+    struct WeightDeliveryKernel {
+        deliveries: Arc<std::sync::Mutex<Vec<&'static str>>>,
+    }
+
+    impl WeightDeliveryKernel {
+        fn copy_bytes(bytes: &[u8], output: &mut TensorMut<'_>) -> onnx_runtime_ep_api::Result<()> {
+            if bytes.len() != output.byte_size() {
+                return Err(EpError::KernelFailed("test output byte count mismatch".into()));
+            }
+            // SAFETY: the executor bounds-checked and exclusively borrowed the
+            // output allocation, which is exactly `output.byte_size()` bytes.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    bytes.as_ptr(),
+                    output.data.0.cast::<u8>(),
+                    bytes.len(),
+                );
+            }
+            Ok(())
+        }
+    }
+
+    impl Kernel for WeightDeliveryKernel {
+        fn execute(
+            &self,
+            inputs: &[TensorView],
+            outputs: &mut [TensorMut],
+        ) -> onnx_runtime_ep_api::Result<()> {
+            self.deliveries.lock().unwrap().push("resident");
+            let bytes = unsafe {
+                std::slice::from_raw_parts(inputs[0].data_ptr::<u8>(), inputs[0].byte_size())
+            };
+            Self::copy_bytes(bytes, &mut outputs[0])
+        }
+
+        fn execute_with_inputs(
+            &self,
+            inputs: &[KernelInput<'_>],
+            outputs: &mut [TensorMut],
+        ) -> onnx_runtime_ep_api::Result<()> {
+            match &inputs[0] {
+                KernelInput::Tensor(view) => self.execute(
+                    std::slice::from_ref(view),
+                    outputs,
+                ),
+                KernelInput::Weight(handle) => {
+                    self.deliveries.lock().unwrap().push("lazy");
+                    let NegotiatedWeight::Lazy(lazy) = handle.negotiate(
+                        &ExecutionProviderCapabilities::nxrt_weight_paging(),
+                    )?
+                    else {
+                        return Err(EpError::KernelFailed(
+                            "nxrt test EP expected a lazy WeightHandle".into(),
+                        ));
+                    };
+                    let resident = lazy.materialize()?;
+                    Self::copy_bytes(resident.bytes(), &mut outputs[0])
+                }
+            }
+        }
+    }
+
+    struct WeightDeliveryEp {
+        cpu: CpuExecutionProvider,
+        lazy: bool,
+        deliveries: Arc<std::sync::Mutex<Vec<&'static str>>>,
+    }
+
+    impl WeightDeliveryEp {
+        fn new(lazy: bool, deliveries: Arc<std::sync::Mutex<Vec<&'static str>>>) -> Self {
+            let mut cpu = CpuExecutionProvider::new();
+            cpu.initialize(&EpConfig::default()).unwrap();
+            Self {
+                cpu,
+                lazy,
+                deliveries,
+            }
+        }
+    }
+
+    impl ExecutionProvider for WeightDeliveryEp {
+        fn name(&self) -> &str {
+            if self.lazy {
+                "nxrt_test_ep"
+            } else {
+                "stock_test_ep"
+            }
+        }
+
+        fn device_type(&self) -> onnx_runtime_ir::DeviceType {
+            onnx_runtime_ir::DeviceType::Cpu
+        }
+
+        fn device_id(&self) -> onnx_runtime_ir::DeviceId {
+            onnx_runtime_ir::DeviceId::cpu()
+        }
+
+        fn capabilities(&self) -> ExecutionProviderCapabilities {
+            if self.lazy {
+                ExecutionProviderCapabilities::nxrt_weight_paging()
+            } else {
+                ExecutionProviderCapabilities::stock()
+            }
+        }
+
+        fn initialize(&mut self, _config: &EpConfig) -> onnx_runtime_ep_api::Result<()> {
+            Ok(())
+        }
+
+        fn shutdown(&mut self) -> onnx_runtime_ep_api::Result<()> {
+            Ok(())
+        }
+
+        fn supports_op(
+            &self,
+            op: &Node,
+            _shapes: &[Shape],
+            _layouts: &[TensorLayout],
+        ) -> KernelMatch {
+            if LazyWeightBoundary::BlockQuantizedMoe.matches(&op.domain, &op.op_type) {
+                KernelMatch::Supported {
+                    cost: Cost::ZERO,
+                    required_input_layouts: None,
+                    output_layouts: vec![TensorLayout::contiguous()],
+                }
+            } else {
+                KernelMatch::Unsupported
+            }
+        }
+
+        fn get_kernel(
+            &self,
+            _op: &Node,
+            _shapes: &[Vec<usize>],
+            _opset: u64,
+        ) -> onnx_runtime_ep_api::Result<Box<dyn Kernel>> {
+            Ok(Box::new(WeightDeliveryKernel {
+                deliveries: Arc::clone(&self.deliveries),
+            }))
+        }
+
+        fn allocate(
+            &self,
+            size: usize,
+            alignment: usize,
+        ) -> onnx_runtime_ep_api::Result<DeviceBuffer> {
+            self.cpu.allocate(size, alignment)
+        }
+
+        fn deallocate(
+            &self,
+            buffer: DeviceBuffer,
+        ) -> onnx_runtime_ep_api::Result<()> {
+            self.cpu.deallocate(buffer)
+        }
+
+        fn copy(
+            &self,
+            src: &DeviceBuffer,
+            dst: &mut DeviceBuffer,
+            size: usize,
+        ) -> onnx_runtime_ep_api::Result<()> {
+            self.cpu.copy(src, dst, size)
+        }
+
+        fn copy_async(
+            &self,
+            src: &DeviceBuffer,
+            dst: &mut DeviceBuffer,
+            size: usize,
+        ) -> onnx_runtime_ep_api::Result<Fence> {
+            self.cpu.copy_async(src, dst, size)
+        }
+
+        fn sync(&self) -> onnx_runtime_ep_api::Result<()> {
+            self.cpu.sync()
+        }
+    }
+
+    fn weight_delivery_fixture() -> (Graph, Arc<WeightStore>, std::path::PathBuf) {
+        static NEXT_FILE: AtomicU64 = AtomicU64::new(0);
+        let root = std::env::var_os("CARGO_TARGET_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::env::current_dir().unwrap().join("target"))
+            .join("weight-handle-tests");
+        std::fs::create_dir_all(&root).unwrap();
+        let id = NEXT_FILE.fetch_add(1, Ordering::Relaxed);
+        let path = root.join(format!(
+            "block-quantized-moe-{}-{id}.bin",
+            std::process::id()
+        ));
+        std::fs::write(&path, [1u8, 2, 3, 4]).unwrap();
+
+        let mut graph = Graph::new();
+        graph.opset_imports.insert("pkg.nxrt".into(), 1);
+        let weight = graph.create_named_value("weight", DataType::Uint8, static_shape([4]));
+        graph.set_initializer(
+            weight,
+            WeightRef::External {
+                path: path.clone(),
+                offset: 0,
+                length: 4,
+                dtype: DataType::Uint8,
+                dims: vec![4],
+            },
+        );
+        let output = graph.create_named_value("output", DataType::Uint8, static_shape([4]));
+        let mut node = Node::new(NodeId(0), "BlockQuantizedMoE", vec![Some(weight)], vec![output]);
+        node.domain = "pkg.nxrt".into();
+        graph.insert_node(node);
+        graph.add_output(output);
+
+        let mut store = WeightStore::new();
+        store.map_external(&path).unwrap();
+        (graph, Arc::new(store), path)
+    }
+
+    #[test]
+    fn executor_selects_lazy_or_resident_weight_delivery_from_ep_capability() {
+        for (lazy, expected) in [(true, "lazy"), (false, "resident")] {
+            let (graph, weights, path) = weight_delivery_fixture();
+            let deliveries = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let ep: Arc<dyn ExecutionProvider> =
+                Arc::new(WeightDeliveryEp::new(lazy, Arc::clone(&deliveries)));
+            let mut executor = Executor::build(graph, weights, ep).unwrap();
+            let outputs = executor.run(&[]).unwrap();
+
+            assert_eq!(outputs[0].as_bytes(), &[1, 2, 3, 4]);
+            assert_eq!(&*deliveries.lock().unwrap(), &[expected]);
+            drop(executor);
+            std::fs::remove_file(path).unwrap();
+        }
+    }
 
     #[test]
     fn sequence_executor_preserves_element_arc_identity() {

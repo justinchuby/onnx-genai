@@ -128,6 +128,7 @@ fn validate_view(
 }
 
 /// Immutable, non-owning view of a tensor on any device.
+#[derive(Clone, Copy)]
 pub struct TensorView<'a> {
     pub data: DevicePtr,
     pub dtype: DataType,

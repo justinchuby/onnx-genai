@@ -8,6 +8,7 @@ use onnx_runtime_ir::{DeviceId, DeviceType, Graph, Node, NodeId, Shape, TensorLa
 use crate::error::{EpError, Result};
 use crate::epcontext::EpContext;
 use crate::kernel::{Kernel, KernelMatch};
+use crate::weight::ExecutionProviderCapabilities;
 
 /// Index of an EP within an [`crate::registry::EpRegistry`].
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -253,6 +254,12 @@ pub trait ExecutionProvider: Send + Sync {
 
     fn device_type(&self) -> DeviceType;
     fn device_id(&self) -> DeviceId;
+
+    /// Optional executor-to-EP capabilities. Stock EPs advertise none and
+    /// continue receiving resident [`crate::TensorView`] inputs.
+    fn capabilities(&self) -> ExecutionProviderCapabilities {
+        ExecutionProviderCapabilities::stock()
+    }
 
     /// Initialize device resources / load libraries.
     fn initialize(&mut self, config: &EpConfig) -> Result<()>;
