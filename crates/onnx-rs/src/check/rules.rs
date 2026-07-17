@@ -758,12 +758,6 @@ impl ValidationRule for IrVersionFeatureRule {
                 "ModelProto.functions requires IR version 8 or newer",
             ));
         }
-        if ir_version < 10 && !proto.metadata_props.is_empty() {
-            violations.push(model_violation(
-                self.id(),
-                "ModelProto.metadata_props requires IR version 10 or newer",
-            ));
-        }
         if let Some(graph) = &proto.graph {
             check_graph_ir_features(graph, ir_version, self.id(), &mut violations);
         }
@@ -1217,12 +1211,6 @@ fn check_function_proto(
         violations.push(model_violation(
             rule_id,
             "FunctionProto.name must be non-empty",
-        ));
-    }
-    if function.domain.is_empty() {
-        violations.push(model_violation(
-            rule_id,
-            format!("FunctionProto '{}' domain must be non-empty", function.name),
         ));
     }
     check_unique_function_names(
@@ -2830,40 +2818,7 @@ fn check_tensor_payload(tensor: &TensorProto, rule_id: &str, violations: &mut Ve
             "TensorProto.{field} contains {actual} entries/bytes but {expected} are required"
         )),
         None => report("TensorProto payload size arithmetic overflowed usize".into()),
-        _ => check_subbyte_padding(tensor, dtype, count, &mut report),
-    }
-}
-
-fn check_subbyte_padding(
-    tensor: &TensorProto,
-    dtype: tensor_proto::DataType,
-    count: usize,
-    report: &mut impl FnMut(String),
-) {
-    let bits_per_element = match dtype {
-        tensor_proto::DataType::Uint4
-        | tensor_proto::DataType::Int4
-        | tensor_proto::DataType::Float4e2m1 => 4usize,
-        tensor_proto::DataType::Uint2 | tensor_proto::DataType::Int2 => 2usize,
-        _ => return,
-    };
-    let elements_per_byte = 8 / bits_per_element;
-    let remainder = count % elements_per_byte;
-    if remainder == 0 || count == 0 {
-        return;
-    }
-    let used_bits = remainder * bits_per_element;
-    let padding_mask = !((1u32 << used_bits) - 1);
-    let last = if !tensor.raw_data.is_empty() {
-        tensor.raw_data.last().copied().map(u32::from)
-    } else {
-        tensor.int32_data.last().copied().map(|value| value as u32)
-    };
-    if last.is_some_and(|value| value & padding_mask != 0) {
-        report(format!(
-            "TensorProto packed {}-bit payload has non-zero high padding bits",
-            bits_per_element
-        ));
+        _ => {}
     }
 }
 
@@ -4117,41 +4072,25 @@ mod tests {
     }
 
     #[test]
-    fn tensor_payload_rule_checks_subbyte_padding_bits() {
-        for (dtype, dims, bad, good) in [
-            (
-                tensor_proto::DataType::Uint4,
-                vec![3],
-                vec![0x21, 0xf3],
-                vec![0x21, 0x03],
-            ),
-            (
-                tensor_proto::DataType::Uint2,
-                vec![5],
-                vec![0x1b, 0xfd],
-                vec![0x1b, 0x01],
-            ),
-        ] {
-            let mut tensor = TensorProto {
-                dims,
-                data_type: dtype as i32,
-                raw_data: bad,
-                ..Default::default()
-            };
-            let mut violations = Vec::new();
-            check_tensor_payload(&tensor, "test", &mut violations);
-            assert!(
-                violations
-                    .iter()
-                    .any(|violation| violation.message.contains("padding bits")),
-                "{dtype:?}: {violations:?}"
-            );
+    fn tensor_payload_rule_accepts_unused_packed_bits_but_checks_length() {
+        let mut tensor = TensorProto {
+            dims: vec![3],
+            data_type: tensor_proto::DataType::Uint4 as i32,
+            raw_data: vec![0x21, 0xf3],
+            ..Default::default()
+        };
+        let mut violations = Vec::new();
+        check_tensor_payload(&tensor, "test", &mut violations);
+        assert!(violations.is_empty(), "{violations:?}");
 
-            tensor.raw_data = good;
-            violations.clear();
-            check_tensor_payload(&tensor, "test", &mut violations);
-            assert!(violations.is_empty(), "{dtype:?}: {violations:?}");
-        }
+        tensor.raw_data.pop();
+        check_tensor_payload(&tensor, "test", &mut violations);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.message.contains("but 2 are required")),
+            "{violations:?}"
+        );
     }
 
     #[test]
@@ -4689,6 +4628,22 @@ mod tests {
     }
 
     #[test]
+    fn ir_feature_rule_accepts_model_metadata_before_ir10() {
+        let model = retained_model_at(
+            ModelProto {
+                metadata_props: vec![StringStringEntryProto {
+                    key: "owner".into(),
+                    value: "onnx".into(),
+                }],
+                ..Default::default()
+            },
+            7,
+        );
+        let violations = IrVersionFeatureRule.check(&model, &ValidationContext::default());
+        assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    #[test]
     fn function_rule_accepts_valid_signature_and_body() {
         let model = retained_model(ModelProto {
             functions: vec![function(
@@ -4700,6 +4655,26 @@ mod tests {
                     ..Default::default()
                 }],
             )],
+            ..Default::default()
+        });
+        let violations = FunctionProtoValidityRule.check(&model, &ValidationContext::default());
+        assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    #[test]
+    fn function_rule_accepts_empty_default_domain() {
+        let mut default_domain = function(
+            "Pass",
+            vec![NodeProto {
+                input: vec!["X".into()],
+                output: vec!["Y".into()],
+                op_type: "Identity".into(),
+                ..Default::default()
+            }],
+        );
+        default_domain.domain.clear();
+        let model = retained_model(ModelProto {
+            functions: vec![default_domain],
             ..Default::default()
         });
         let violations = FunctionProtoValidityRule.check(&model, &ValidationContext::default());
