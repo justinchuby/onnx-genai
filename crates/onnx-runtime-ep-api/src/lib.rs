@@ -33,7 +33,9 @@ pub use provider::{
 };
 pub use onnx_runtime_optimizer::OptimizationPass as OptimizerPass;
 pub use registry::{EpRegistry, KernelFactory, OpKey, OpRegistry};
-pub use tensor::{DevicePtr, DevicePtrMut, TensorBacking, TensorMut, TensorView};
+pub use tensor::{
+    DevicePtr, DevicePtrMut, ExternalMmapRegion, TensorBacking, TensorMut, TensorView,
+};
 
 // Re-export the device vocabulary from the IR so EP authors have one import.
 pub use onnx_runtime_ir::{DeviceId, DeviceType};

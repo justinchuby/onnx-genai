@@ -11,14 +11,16 @@
 //! By default this preserves the resident baseline. With
 //! `ONNX_GENAI_WEIGHT_OFFLOAD=1`, external mmap-backed expert tensors are
 //! validated as expert-major, routes are computed first, and only the batch's
-//! unique selected expert slices are dequantized. Non-pageable layouts fall
-//! back to the resident path without changing results.
+//! unique selected expert slices are dequantized one at a time and released
+//! after all routed tokens consume them. Non-pageable layouts fall back to the
+//! resident path without changing results.
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 
 use onnx_runtime_ep_api::{
-    EpError, Kernel, KernelFactory, Result, TensorBacking, TensorMut, TensorView,
+    EpError, ExternalMmapRegion, Kernel, KernelFactory, Result, TensorBacking, TensorMut,
+    TensorView,
 };
 use onnx_runtime_ir::{DataType, Node};
 use onnx_runtime_loader::{
@@ -294,6 +296,8 @@ impl Kernel for QMoEKernel {
         if route_first {
             let mut routes = Vec::with_capacity(rows);
             let mut token_counts = BTreeMap::new();
+            let mut tasks = BTreeMap::<usize, Vec<(usize, usize, f32)>>::new();
+            let mut route_slots = 0usize;
             for row in 0..rows {
                 let router_range = checked_range(row, experts, "router row")?;
                 let route = routing_weights(
@@ -302,26 +306,39 @@ impl Kernel for QMoEKernel {
                     self.attributes.k,
                     self.attributes.normalize_routing_weights,
                 );
-                for &(expert, _) in &route {
+                for &(expert, route_weight) in &route {
                     *token_counts.entry(expert).or_insert(0usize) += 1;
+                    tasks
+                        .entry(expert)
+                        .or_default()
+                        .push((row, route_slots, route_weight));
+                    route_slots = route_slots
+                        .checked_add(1)
+                        .ok_or_else(|| error("routed contribution count overflow"))?;
                 }
                 routes.push(route);
             }
 
-            let mut mapped_bytes = fc1
-                .mapped_bytes()?
-                .checked_add(fc2.mapped_bytes()?)
-                .ok_or_else(|| error("mapped expert byte count overflow"))?;
+            let mut mapped_regions = Vec::new();
+            mapped_regions.extend_from_slice(fc1.mapped_regions());
+            mapped_regions.extend_from_slice(fc2.mapped_regions());
             if let Some(weights) = &fc3 {
-                mapped_bytes = mapped_bytes
-                    .checked_add(weights.mapped_bytes()?)
-                    .ok_or_else(|| error("mapped expert byte count overflow"))?;
+                mapped_regions.extend_from_slice(weights.mapped_regions());
             }
-            metrics().record_mapped_bytes(mapped_bytes);
+            metrics()
+                .record_mapped_regions(&mapped_regions)
+                .map_err(error)?;
             metrics().record_routes(self.layer_id, &token_counts);
 
-            let mut selected = BTreeMap::new();
-            for &expert in token_counts.keys() {
+            let contribution_elements =
+                checked_product(&[route_slots, hidden], "routed contribution element count")?;
+            checked_byte_count(
+                contribution_elements,
+                std::mem::size_of::<f32>(),
+                "routed contribution byte count",
+            )?;
+            let mut contributions = vec![0.0f32; contribution_elements];
+            for (expert, expert_tasks) in tasks {
                 let weights = DequantizedExpert {
                     fc1: fc1.dequantize_expert(expert)?,
                     fc2: fc2.dequantize_expert(expert)?,
@@ -330,6 +347,7 @@ impl Kernel for QMoEKernel {
                         .map(|weights| weights.dequantize_expert(expert))
                         .transpose()?,
                 };
+                metrics().record_dequantized_window(1);
                 let mut bytes_read = fc1
                     .expert_source_bytes(expert)?
                     .checked_add(fc2.expert_source_bytes(expert)?)
@@ -339,25 +357,17 @@ impl Kernel for QMoEKernel {
                         .checked_add(source.expert_source_bytes(expert)?)
                         .ok_or_else(|| error("selected expert byte count overflow"))?;
                 }
-                metrics().record_bytes_read(bytes_read);
-                selected.insert(expert, weights);
-            }
-
-            for (row, route) in routes.into_iter().enumerate() {
-                let input_range = checked_range(row, hidden, "input row")?;
-                let input_row = &x[input_range];
-                let output_range = checked_range(row, hidden, "output row")?;
-                let output_row = &mut output[output_range];
-                for (expert, route_weight) in route {
-                    let weights = selected
-                        .get(&expert)
-                        .ok_or_else(|| error("selected expert cache is incomplete"))?;
+                metrics().record_bytes_read(bytes_read).map_err(error)?;
+                for (row, slot, route_weight) in expert_tasks {
+                    let input_range = checked_range(row, hidden, "input row")?;
+                    let contribution_range =
+                        checked_range(slot, hidden, "routed contribution row")?;
                     accumulate_expert(
-                        output_row,
-                        input_row,
+                        &mut contributions[contribution_range],
+                        &x[input_range],
                         expert,
                         route_weight,
-                        weights,
+                        &weights,
                         fc1_bias.as_deref(),
                         fc2_bias.as_deref(),
                         fc3_bias.as_deref(),
@@ -368,6 +378,26 @@ impl Kernel for QMoEKernel {
                     )?;
                 }
             }
+
+            let mut slot = 0usize;
+            for (row, route) in routes.into_iter().enumerate() {
+                let output_range = checked_range(row, hidden, "output row")?;
+                let output_row = &mut output[output_range];
+                for _ in route {
+                    let contribution_range =
+                        checked_range(slot, hidden, "routed contribution row")?;
+                    for (output_value, contribution) in output_row
+                        .iter_mut()
+                        .zip(&contributions[contribution_range])
+                    {
+                        *output_value += contribution;
+                    }
+                    slot = slot
+                        .checked_add(1)
+                        .ok_or_else(|| error("routed contribution index overflow"))?;
+                }
+            }
+            debug_assert_eq!(slot, route_slots);
         } else {
             for row in 0..rows {
                 let router_range = checked_range(row, experts, "router row")?;
@@ -465,6 +495,7 @@ struct QuantizedExperts<'a> {
     scales: Cow<'a, [f32]>,
     zero_points: Option<Cow<'a, [u8]>>,
     catalogs: Vec<WeightRegionCatalog>,
+    mapped_regions: Vec<ExternalMmapRegion>,
     pageable: bool,
     experts: usize,
     out_features: usize,
@@ -601,6 +632,10 @@ impl<'a> QuantizedExperts<'a> {
         let scale_catalog = catalog_for(scales, out_features, blocks, scale_bytes);
         let zero_point_catalog = zero_points
             .map(|points| catalog_for(points, out_features, zero_point_bytes, zero_point_elements));
+        let mapped_region = |view: &TensorView| match view.backing {
+            TensorBacking::ExternalMmap(region) => Some(region),
+            TensorBacking::Opaque => None,
+        };
         let pageable = prefer_mmap
             && packed_catalog.is_pageable()
             && scale_catalog.is_pageable()
@@ -610,9 +645,9 @@ impl<'a> QuantizedExperts<'a> {
             && packed.device.is_host_accessible()
             && scales.device.is_host_accessible()
             && zero_points.is_none_or(|points| points.device.is_host_accessible())
-            && packed.backing == TensorBacking::ExternalMmap
-            && scales.backing == TensorBacking::ExternalMmap
-            && zero_points.is_none_or(|points| points.backing == TensorBacking::ExternalMmap);
+            && mapped_region(packed).is_some()
+            && mapped_region(scales).is_some()
+            && zero_points.is_none_or(|points| mapped_region(points).is_some());
 
         let (packed_data, scale_data, zero_point_data) = if pageable {
             (
@@ -632,11 +667,20 @@ impl<'a> QuantizedExperts<'a> {
         };
         let mut catalogs = vec![packed_catalog, scale_catalog];
         catalogs.extend(zero_point_catalog);
+        let mut mapped_regions = Vec::new();
+        if pageable {
+            mapped_regions.push(mapped_region(packed).expect("pageable packed mmap"));
+            mapped_regions.push(mapped_region(scales).expect("pageable scale mmap"));
+            if let Some(points) = zero_points {
+                mapped_regions.push(mapped_region(points).expect("pageable zero-point mmap"));
+            }
+        }
         Ok(Self {
             packed: packed_data,
             scales: scale_data,
             zero_points: zero_point_data,
             catalogs,
+            mapped_regions,
             pageable,
             experts,
             out_features,
@@ -654,12 +698,8 @@ impl<'a> QuantizedExperts<'a> {
         self.pageable
     }
 
-    fn mapped_bytes(&self) -> Result<usize> {
-        self.catalogs.iter().try_fold(0usize, |total, catalog| {
-            total
-                .checked_add(catalog.mapped_bytes())
-                .ok_or_else(|| error("mapped expert tensor byte count overflow"))
-        })
+    fn mapped_regions(&self) -> &[ExternalMmapRegion] {
+        &self.mapped_regions
     }
 
     fn expert_source_bytes(&self, expert: usize) -> Result<usize> {
@@ -1042,6 +1082,9 @@ mod tests {
         dtype: DataType,
     ) -> TensorView<'a> {
         let bytes = store.bytes(weight).expect("mapped weight bytes");
+        let (mapping_id, offset, len) = store
+            .external_mmap_provenance(weight)
+            .expect("mapped weight provenance");
         TensorView::new(
             DevicePtr(bytes.as_ptr().cast()),
             dtype,
@@ -1049,10 +1092,24 @@ mod tests {
             strides,
             DeviceId::cpu(),
         )
-        .with_backing(TensorBacking::ExternalMmap)
+        .with_backing(TensorBacking::ExternalMmap(ExternalMmapRegion {
+            mapping_id,
+            offset,
+            len,
+        }))
     }
 
     fn run_mmap_qmoe(enabled: bool, interleaved: bool, input: &[f32], router: &[f32]) -> MmapRun {
+        run_mmap_qmoe_with_k(enabled, interleaved, input, router, 1)
+    }
+
+    fn run_mmap_qmoe_with_k(
+        enabled: bool,
+        interleaved: bool,
+        input: &[f32],
+        router: &[f32],
+        k: usize,
+    ) -> MmapRun {
         const EXPERTS: usize = 4;
         const ROWS: usize = 4;
         const HIDDEN: usize = 16;
@@ -1085,7 +1142,7 @@ mod tests {
             fc2.scales
         };
 
-        let mut external = Vec::new();
+        let mut external = vec![0u8; 4];
         let fc1_packed_offset = external.len();
         external.extend_from_slice(&fc1_packed);
         let fc1_scales_offset = external.len();
@@ -1229,9 +1286,11 @@ mod tests {
             ));
         }
         drop(fixture_store);
+        let mut attributes = MoeAttributes::from_node(graph.node(node)).expect("attributes");
+        attributes.k = k;
         let kernel = QMoEKernel {
             layer_id: graph.node(node).id.0,
-            attributes: MoeAttributes::from_node(graph.node(node)).expect("attributes"),
+            attributes,
             bits: BITS,
             block_size: BLOCK,
             weight_offload: WeightOffloadMode { enabled },
@@ -1418,6 +1477,17 @@ mod tests {
     }
 
     #[test]
+    fn route_first_preserves_exact_accumulation_order_for_top_k() {
+        let _guard = metrics_test_lock().lock().expect("metrics test lock");
+        let input = pseudo_random_values(4 * 16, 0xa11c_e55);
+        let router = pseudo_random_values(4 * 4, 0x5151_5151);
+        let baseline = run_mmap_qmoe_with_k(false, false, &input, &router, 3);
+        metrics().reset();
+        let route_first = run_mmap_qmoe_with_k(true, false, &input, &router, 3);
+        assert_eq!(route_first.output, baseline.output);
+    }
+
+    #[test]
     fn route_first_reads_only_unique_selected_expert_ranges() {
         let _guard = metrics_test_lock().lock().expect("metrics test lock");
         let input = pseudo_random_values(4 * 16, 0xfeed_beef);
@@ -1443,6 +1513,25 @@ mod tests {
         assert_eq!(layer.executions, 1);
         assert_eq!(layer.active_experts, 4);
         assert_eq!(layer.unique_experts, 2);
+    }
+
+    #[test]
+    fn route_first_bounds_dequantized_residency_when_all_experts_are_selected() {
+        let _guard = metrics_test_lock().lock().expect("metrics test lock");
+        let input = pseudo_random_values(4 * 16, 0x1234);
+        let router = vec![
+            9.0, 0.0, 0.0, 0.0, // expert 0
+            0.0, 9.0, 0.0, 0.0, // expert 1
+            0.0, 0.0, 9.0, 0.0, // expert 2
+            0.0, 0.0, 0.0, 9.0, // expert 3
+        ];
+        let baseline = run_mmap_qmoe(false, false, &input, &router);
+        metrics().reset();
+        let route_first = run_mmap_qmoe(true, false, &input, &router);
+        let stats = crate::weight_offload_stats();
+        assert_close(&route_first.output, &baseline.output);
+        assert_eq!(stats.unique_experts_per_batch, 4);
+        assert_eq!(stats.peak_dequantized_experts, 1);
     }
 
     #[test]

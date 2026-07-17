@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use memmap2::Mmap;
 use onnx_runtime_ir::{DataType, TensorData, ValueId, WeightRef};
@@ -24,8 +25,16 @@ pub struct WeightStore {
     /// IR weight descriptors, keyed by the graph value they initialize.
     pub weights: HashMap<ValueId, WeightRef>,
     /// Live memory maps for external-data files, keyed by absolute path.
-    mmaps: HashMap<PathBuf, Mmap>,
+    mmaps: HashMap<PathBuf, MappedFile>,
 }
+
+#[derive(Debug)]
+struct MappedFile {
+    id: usize,
+    mmap: Mmap,
+}
+
+static NEXT_MAPPING_ID: AtomicUsize = AtomicUsize::new(1);
 
 /// Quantization geometry needed to interpret one expert's packed tensor slice.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -255,6 +264,31 @@ impl WeightRegionCatalog {
                 },
             );
         }
+        let tensor_end = match tensor_offset.checked_add(tensor_len) {
+            Some(end) if end <= isize::MAX as usize => end,
+            Some(_) => {
+                return Self::non_pageable(
+                    path,
+                    tensor_offset,
+                    tensor_len,
+                    dtype,
+                    layout,
+                    NonPageableReason::Range(
+                        "expert tensor absolute endpoint exceeds isize::MAX".into(),
+                    ),
+                );
+            }
+            None => {
+                return Self::non_pageable(
+                    path,
+                    tensor_offset,
+                    tensor_len,
+                    dtype,
+                    layout,
+                    NonPageableReason::Range("expert tensor absolute endpoint overflow".into()),
+                );
+            }
+        };
 
         let mut regions = Vec::new();
         if let Err(error) = regions.try_reserve_exact(layout.experts) {
@@ -291,6 +325,31 @@ impl WeightRegionCatalog {
                         dtype,
                         layout,
                         NonPageableReason::Range("expert absolute offset overflow".into()),
+                    );
+                }
+            };
+            let _end = match offset.checked_add(bytes_per_expert) {
+                Some(end) if end <= isize::MAX as usize && end <= tensor_end => end,
+                Some(_) => {
+                    return Self::non_pageable(
+                        path,
+                        tensor_offset,
+                        tensor_len,
+                        dtype,
+                        layout,
+                        NonPageableReason::Range(
+                            "expert absolute endpoint exceeds validated tensor range".into(),
+                        ),
+                    );
+                }
+                None => {
+                    return Self::non_pageable(
+                        path,
+                        tensor_offset,
+                        tensor_len,
+                        dtype,
+                        layout,
+                        NonPageableReason::Range("expert absolute endpoint overflow".into()),
                     );
                 }
             };
@@ -506,14 +565,33 @@ impl WeightStore {
                 ..
             } => {
                 let mmap = self.mmaps.get(path)?;
-                mmap.get(*offset..offset.checked_add(*length)?)
+                mmap.mmap.get(*offset..offset.checked_add(*length)?)
             }
         }
     }
 
+    /// Return stable mmap identity and the validated absolute tensor range.
+    pub fn external_mmap_provenance(&self, weight: &WeightRef) -> Option<(usize, usize, usize)> {
+        let WeightRef::External {
+            path,
+            offset,
+            length,
+            ..
+        } = weight
+        else {
+            return None;
+        };
+        let mmap = self.mmaps.get(path)?;
+        let end = offset.checked_add(*length)?;
+        if end > mmap.mmap.len() || end > isize::MAX as usize {
+            return None;
+        }
+        Some((mmap.id, *offset, *length))
+    }
+
     fn external_bytes(&self, path: &Path, offset: usize, length: usize) -> Option<&[u8]> {
         let mmap = self.mmaps.get(path)?;
-        mmap.get(offset..offset.checked_add(length)?)
+        mmap.mmap.get(offset..offset.checked_add(length)?)
     }
 
     fn mmap_file(&mut self, path: &Path) -> Result<(), LoaderError> {
@@ -528,7 +606,11 @@ impl WeightStore {
         // weight storage. This is the only `unsafe` in the loader; the IR crate
         // stays `#![forbid(unsafe_code)]`.
         let mmap = unsafe { Mmap::map(&file) }.map_err(|e| LoaderError::Mmap(e.to_string()))?;
-        self.mmaps.insert(path.to_path_buf(), mmap);
+        let id = NEXT_MAPPING_ID
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .map_err(|_| LoaderError::Mmap("external mmap identity space exhausted".into()))?;
+        self.mmaps
+            .insert(path.to_path_buf(), MappedFile { id, mmap });
         Ok(())
     }
 }
@@ -598,13 +680,13 @@ fn resolve_initializer(
         // mis-described external data early).
         if let Some(mmap) = store.mmaps.get(&path) {
             let end = offset.checked_add(length);
-            if end.is_none_or(|e| e > mmap.len()) {
+            if end.is_none_or(|e| e > mmap.mmap.len()) {
                 return Err(LoaderError::Mmap(format!(
                     "external initializer {:?}: window [{offset}, {:?}) exceeds file {} ({} bytes)",
                     init.name,
                     end,
                     path.display(),
-                    mmap.len()
+                    mmap.mmap.len()
                 )));
             }
         }
@@ -890,5 +972,26 @@ mod tests {
                 .to_string()
                 .contains("isize::MAX")
         );
+
+        let endpoint = WeightRef::External {
+            path: PathBuf::from("weights.bin"),
+            offset: isize::MAX as usize,
+            length: 1,
+            dtype: DataType::Uint8,
+            dims: vec![1, 1, 1],
+        };
+        let layout = ExpertTensorLayout {
+            version: 1,
+            experts: 1,
+            rows_per_expert: 1,
+            storage_elements_per_row: 1,
+            order: ExpertStorageOrder::ExpertMajor,
+            quantization: None,
+        };
+        assert!(matches!(
+            WeightRegionCatalog::classify(&endpoint, layout).pageability(),
+            Pageability::NonPageable(NonPageableReason::Range(message))
+                if message.contains("endpoint")
+        ));
     }
 }

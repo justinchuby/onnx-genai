@@ -39,13 +39,24 @@ pub struct DevicePtr(pub *const std::ffi::c_void);
 #[derive(Clone, Copy, Debug)]
 pub struct DevicePtrMut(pub *mut std::ffi::c_void);
 
+/// One validated read-only range in an ONNX external-data mmap.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ExternalMmapRegion {
+    /// Identity of the live mapping that owns this range.
+    pub mapping_id: usize,
+    /// Absolute byte offset within the mapping.
+    pub offset: usize,
+    /// Length of the mapped tensor range in bytes.
+    pub len: usize,
+}
+
 /// Provenance relevant to kernels that can consume lazy external weights.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum TensorBacking {
     #[default]
     Opaque,
     /// Read-only bytes directly alias an ONNX external-data mmap.
-    ExternalMmap,
+    ExternalMmap(ExternalMmapRegion),
 }
 
 impl DevicePtr {

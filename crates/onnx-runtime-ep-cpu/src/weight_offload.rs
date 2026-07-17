@@ -1,9 +1,11 @@
 //! Huge-model weight-offload mode and lightweight process-wide observability.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
+
+use onnx_runtime_ep_api::ExternalMmapRegion;
 
 /// Environment switch for the route-first mmap MoE path.
 pub const WEIGHT_OFFLOAD_ENV: &str = "ONNX_GENAI_WEIGHT_OFFLOAD";
@@ -41,6 +43,7 @@ pub struct WeightOffloadStats {
     pub layer_executions: u64,
     pub active_experts: u64,
     pub unique_experts_per_batch: u64,
+    pub peak_dequantized_experts: u64,
     pub routed_tokens: u64,
     pub tokens_per_expert: BTreeMap<usize, u64>,
     pub per_layer: BTreeMap<u32, WeightOffloadLayerStats>,
@@ -57,24 +60,65 @@ pub struct WeightOffloadLayerStats {
 
 #[derive(Default)]
 pub(crate) struct WeightOffloadMetrics {
-    mapped_bytes: AtomicU64,
+    mapped_regions: Mutex<MappedRegionState>,
     bytes_read_from_mmap: AtomicU64,
     layer_executions: AtomicU64,
     active_experts: AtomicU64,
     unique_experts_per_batch: AtomicU64,
+    peak_dequantized_experts: AtomicU64,
     routed_tokens: AtomicU64,
     tokens_per_expert: Mutex<BTreeMap<usize, u64>>,
     per_layer: Mutex<BTreeMap<u32, WeightOffloadLayerStats>>,
 }
 
+#[derive(Default)]
+struct MappedRegionState {
+    regions: BTreeSet<ExternalMmapRegion>,
+    total_bytes: u64,
+}
+
 impl WeightOffloadMetrics {
-    pub fn record_mapped_bytes(&self, bytes: usize) {
-        self.mapped_bytes.fetch_max(bytes as u64, Ordering::Relaxed);
+    pub fn record_mapped_regions(
+        &self,
+        regions: &[ExternalMmapRegion],
+    ) -> Result<(), &'static str> {
+        let mut state = self
+            .mapped_regions
+            .lock()
+            .expect("weight-offload mapped-region lock poisoned");
+        let mut additions = BTreeSet::new();
+        let mut total = state.total_bytes;
+        for &region in regions {
+            let end = region
+                .offset
+                .checked_add(region.len)
+                .ok_or("mapped region endpoint overflow")?;
+            if end > isize::MAX as usize {
+                return Err("mapped region endpoint exceeds isize::MAX");
+            }
+            if !state.regions.contains(&region) && additions.insert(region) {
+                let len = u64::try_from(region.len).map_err(|_| "mapped region length overflow")?;
+                total = total.checked_add(len).ok_or("mapped byte total overflow")?;
+            }
+        }
+        state.regions.extend(additions);
+        state.total_bytes = total;
+        Ok(())
     }
 
-    pub fn record_bytes_read(&self, bytes: usize) {
+    pub fn record_bytes_read(&self, bytes: usize) -> Result<(), &'static str> {
+        let bytes = u64::try_from(bytes).map_err(|_| "mmap read byte count overflow")?;
         self.bytes_read_from_mmap
-            .fetch_add(bytes as u64, Ordering::Relaxed);
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |total| {
+                total.checked_add(bytes)
+            })
+            .map_err(|_| "mmap read byte total overflow")?;
+        Ok(())
+    }
+
+    pub fn record_dequantized_window(&self, experts: usize) {
+        self.peak_dequantized_experts
+            .fetch_max(experts as u64, Ordering::Relaxed);
     }
 
     pub fn record_routes(&self, layer: u32, token_counts: &BTreeMap<usize, usize>) {
@@ -114,11 +158,16 @@ impl WeightOffloadMetrics {
 
     fn snapshot(&self) -> WeightOffloadStats {
         WeightOffloadStats {
-            mapped_bytes: self.mapped_bytes.load(Ordering::Relaxed),
+            mapped_bytes: self
+                .mapped_regions
+                .lock()
+                .expect("weight-offload mapped-region lock poisoned")
+                .total_bytes,
             bytes_read_from_mmap: self.bytes_read_from_mmap.load(Ordering::Relaxed),
             layer_executions: self.layer_executions.load(Ordering::Relaxed),
             active_experts: self.active_experts.load(Ordering::Relaxed),
             unique_experts_per_batch: self.unique_experts_per_batch.load(Ordering::Relaxed),
+            peak_dequantized_experts: self.peak_dequantized_experts.load(Ordering::Relaxed),
             routed_tokens: self.routed_tokens.load(Ordering::Relaxed),
             tokens_per_expert: self
                 .tokens_per_expert
@@ -136,8 +185,12 @@ impl WeightOffloadMetrics {
 
     #[cfg(test)]
     pub fn reset(&self) {
-        self.mapped_bytes.store(0, Ordering::Relaxed);
+        *self
+            .mapped_regions
+            .lock()
+            .expect("weight-offload mapped-region lock poisoned") = MappedRegionState::default();
         self.bytes_read_from_mmap.store(0, Ordering::Relaxed);
+        self.peak_dequantized_experts.store(0, Ordering::Relaxed);
         self.layer_executions.store(0, Ordering::Relaxed);
         self.active_experts.store(0, Ordering::Relaxed);
         self.unique_experts_per_batch.store(0, Ordering::Relaxed);
@@ -200,6 +253,24 @@ mod tests {
         assert!(!WeightOffloadMode::from_value(None).enabled);
         assert!(!WeightOffloadMode::from_value(Some(OsStr::new("0"))).enabled);
         assert!(WeightOffloadMode::from_value(Some(OsStr::new("1"))).enabled);
+    }
+
+    #[test]
+    fn mapped_bytes_sum_distinct_ranges_across_layers() {
+        let metrics = WeightOffloadMetrics::default();
+        let first = ExternalMmapRegion {
+            mapping_id: 7,
+            offset: 0,
+            len: 100,
+        };
+        let second = ExternalMmapRegion {
+            mapping_id: 7,
+            offset: 100,
+            len: 200,
+        };
+        metrics.record_mapped_regions(&[first]).unwrap();
+        metrics.record_mapped_regions(&[second, first]).unwrap();
+        assert_eq!(metrics.snapshot().mapped_bytes, 300);
     }
 
     #[cfg(target_os = "linux")]

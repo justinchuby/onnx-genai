@@ -48,8 +48,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use onnx_runtime_ep_api::{
-    DeviceBuffer, DevicePtr, DevicePtrMut, ExecutionProvider, KernelMatch, TensorBacking, TensorMut,
-    TensorView,
+    DeviceBuffer, DevicePtr, DevicePtrMut, ExecutionProvider, ExternalMmapRegion, KernelMatch,
+    TensorBacking, TensorMut, TensorView,
 };
 use onnx_runtime_ep_cpu::CpuExecutionProvider;
 use onnx_runtime_ep_cpu::strided::view_in_bounds;
@@ -71,6 +71,15 @@ fn profile_ops_enabled() -> bool {
         std::env::var("ONNX_GENAI_PROFILE_OPS")
             .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
     })
+}
+
+fn host_dtype_alignment(dtype: DataType) -> usize {
+    match dtype {
+        DataType::Float16 | DataType::BFloat16 | DataType::Int16 | DataType::Uint16 => 2,
+        DataType::Float32 | DataType::Int32 | DataType::Uint32 | DataType::Complex64 => 4,
+        DataType::Float64 | DataType::Int64 | DataType::Uint64 | DataType::Complex128 => 8,
+        _ => 1,
+    }
 }
 
 fn print_op_profile(total: Duration, timings: HashMap<String, (Duration, usize)>) {
@@ -852,11 +861,9 @@ impl Executor {
         let mut buffer_shapes: HashMap<ValueId, Vec<usize>> = HashMap::new();
 
         // 1) Initializers: always concrete. Record dims and back each with a
-        //    device buffer. Where the mmap'd weight bytes are already suitably
-        //    aligned we **borrow** them zero-copy (no RAM allocation, no copy)
-        //    so a model whose weights exceed RAM still runs — the OS pages the
-        //    mmap in/out on demand. Unaligned or empty slices fall back to the
-        //    original allocate + copy path (correctness first).
+        //    device buffer. Host mmap bytes need only satisfy the initializer
+        //    dtype's alignment for scalar CPU reads; the EP's wider allocation
+        //    alignment is reserved for owned buffers and kernels that require it.
         let init_align = TensorLayout::contiguous().alignment;
         for (&vid, weight) in &graph.initializers {
             let dtype = weight.dtype();
@@ -873,25 +880,29 @@ impl Executor {
             // `as_mut_ptr()` into read-only mmap (SIGSEGV / aliasing UB). In
             // that case fall back to the owned writable copy below.
             let producer_less = graph.value(vid).producer.is_none();
+            let borrow_align = if matches!(weight, WeightRef::External { .. }) {
+                host_dtype_alignment(dtype)
+            } else {
+                init_align
+            };
             let buf = if ep.device_id().is_host_accessible()
                 && producer_less
                 && !bytes.is_empty()
-                && (bytes.as_ptr() as usize).is_multiple_of(init_align)
+                && (bytes.as_ptr() as usize).is_multiple_of(borrow_align)
             {
-                // Zero-copy: alias the aligned mmap bytes. `weights` (an owned
-                // Arc field on this executor) outlives `buffers`, so the pointer
-                // stays valid for every run; the borrowed buffer is read-only
-                // (initializers are read-only SSA inputs, never a mutable output)
-                // and its Drop/deallocate never frees the mmap.
-                // SAFETY: `bytes` borrows `weights`' live mmap/inline storage,
-                // is `bytes.len()` long and `init_align`-aligned (checked above),
-                // is treated as read-only, and `weights` outlives every use.
+                // Zero-copy: alias the suitably aligned initializer bytes. For
+                // external data this is only the dtype alignment; inline data
+                // retains the EP allocation alignment requirement.
+                // SAFETY: `bytes` borrows live mmap storage in `weights` or
+                // inline storage in `graph`; both executor fields outlive every
+                // buffer use. The range is `bytes.len()` long,
+                // `borrow_align`-aligned, and treated as read-only.
                 unsafe {
                     DeviceBuffer::from_borrowed_parts(
                         bytes.as_ptr() as *mut std::ffi::c_void,
                         ep.device_id(),
                         bytes.len(),
-                        init_align,
+                        borrow_align,
                     )
                 }
             } else {
@@ -1722,16 +1733,20 @@ impl Executor {
                 }
             };
             view_bounds(&shape, &strides, byte_offset, input_dtypes[i], root_len)?;
-            let backing = if buf.is_borrowed()
-                && matches!(
-                    self.graph.initializers.get(&root),
-                    Some(WeightRef::External { .. })
-                )
-            {
-                TensorBacking::ExternalMmap
-            } else {
-                TensorBacking::Opaque
-            };
+            let backing = self
+                .graph
+                .initializers
+                .get(&root)
+                .filter(|_| buf.is_borrowed())
+                .and_then(|weight| self.weights.external_mmap_provenance(weight))
+                .map(|(mapping_id, offset, len)| {
+                    TensorBacking::ExternalMmap(ExternalMmapRegion {
+                        mapping_id,
+                        offset,
+                        len,
+                    })
+                })
+                .unwrap_or(TensorBacking::Opaque);
             in_infos.push(InInfo {
                 present: true,
                 dtype: input_dtypes[i],
@@ -4561,14 +4576,14 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// (c) An unaligned external-data initializer falls back to an owned copy
-    /// (buffer ptr != slice ptr) and is still numerically correct end-to-end.
+    /// (c) An external-data initializer that is dtype-aligned but not 64-byte
+    /// aligned remains a zero-copy mmap borrow and is numerically correct.
     #[test]
-    fn unaligned_external_initializer_falls_back_to_owned_copy() {
+    fn device_unaligned_external_initializer_is_borrowed_at_dtype_alignment() {
         let align = TensorLayout::contiguous().alignment;
         let path = weightstream_tmp_dir().join("unaligned_init.bin");
         // Prefix the weight window with 8 bytes so it starts at offset 8, which
-        // is not a multiple of `align` (64) -> forces the copy fallback.
+        // is f32-aligned but not a multiple of the EP allocation alignment (64).
         let offset = 8usize;
         let w_data = [5.0f32, 6.0, 7.0, 8.0];
         let mut file = vec![0u8; offset];
@@ -4608,14 +4623,15 @@ mod tests {
         );
         let buf = &exec.buffers[&w];
         assert!(
-            !buf.is_borrowed(),
-            "unaligned initializer must fall back to an owned copy"
+            buf.is_borrowed(),
+            "dtype-aligned mmap initializer must remain borrowed"
         );
-        assert_ne!(
+        assert_eq!(
             buf.as_ptr() as *const u8,
             src.as_ptr(),
-            "fallback: the buffer must be a fresh copy, not an alias"
+            "zero-copy buffer must alias the mmap window"
         );
+        assert_eq!(buf.alignment(), std::mem::align_of::<f32>());
 
         // The copy is numerically correct: Y = X + W.
         let x_tensor = Tensor::from_f32(&[4], &[10.0, 20.0, 30.0, 40.0]).unwrap();
@@ -4629,6 +4645,88 @@ mod tests {
         }
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn unaligned_external_qmoe_keeps_route_first_enabled_and_matches_legacy() {
+        use std::ffi::OsString;
+        use std::sync::{Mutex, OnceLock};
+
+        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        let _env_guard = ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("weight-offload env lock");
+
+        struct RestoreEnv(Option<OsString>);
+        impl Drop for RestoreEnv {
+            fn drop(&mut self) {
+                if let Some(value) = self.0.take() {
+                    // SAFETY: this test serializes all mutations it performs.
+                    unsafe { std::env::set_var(onnx_runtime_ep_cpu::WEIGHT_OFFLOAD_ENV, value) };
+                } else {
+                    // SAFETY: this test serializes all mutations it performs.
+                    unsafe { std::env::remove_var(onnx_runtime_ep_cpu::WEIGHT_OFFLOAD_ENV) };
+                }
+            }
+        }
+
+        let _restore = RestoreEnv(std::env::var_os(onnx_runtime_ep_cpu::WEIGHT_OFFLOAD_ENV));
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../onnx-runtime-ep-cpu/tests/fixtures/qmoe_weight_offload/model.onnx");
+        let input_values: Vec<f32> = (0..64).map(|index| index as f32 * 0.03125 - 1.0).collect();
+        let router_values = vec![
+            9.0, 0.0, 0.0, 0.0, 0.0, 9.0, 0.0, 0.0, 0.0, 0.0, 9.0, 0.0, 0.0, 0.0, 0.0, 9.0,
+        ];
+        let input = Tensor::from_f32(&[4, 16], &input_values).unwrap();
+        let router = Tensor::from_f32(&[4, 4], &router_values).unwrap();
+
+        // SAFETY: guarded above; both executors compile synchronously here.
+        unsafe { std::env::set_var(onnx_runtime_ep_cpu::WEIGHT_OFFLOAD_ENV, "0") };
+        let (legacy_graph, legacy_weights) =
+            onnx_runtime_loader::load_model_with_weights(&fixture).unwrap();
+        let mut legacy =
+            Executor::build(legacy_graph, legacy_weights, auto_detect_cpu_ep().unwrap()).unwrap();
+        let legacy_output = legacy.run(&[("X", &input), ("router", &router)]).unwrap();
+
+        // SAFETY: guarded above; the offload kernel captures the flag at build.
+        unsafe { std::env::set_var(onnx_runtime_ep_cpu::WEIGHT_OFFLOAD_ENV, "1") };
+        let before = onnx_runtime_ep_cpu::weight_offload_stats();
+        let (offload_graph, offload_weights) =
+            onnx_runtime_loader::load_model_with_weights(&fixture).unwrap();
+        let mut offload = Executor::build(
+            offload_graph,
+            offload_weights,
+            auto_detect_cpu_ep().unwrap(),
+        )
+        .unwrap();
+        for (&value, weight) in &offload.graph.initializers {
+            let WeightRef::External { .. } = weight else {
+                continue;
+            };
+            let source = offload.weights.bytes(weight).unwrap();
+            assert!(
+                !(source.as_ptr() as usize).is_multiple_of(TensorLayout::contiguous().alignment)
+            );
+            let buffer = &offload.buffers[&value];
+            assert!(buffer.is_borrowed());
+            assert_eq!(buffer.as_ptr() as *const u8, source.as_ptr());
+        }
+        let offload_output = offload.run(&[("X", &input), ("router", &router)]).unwrap();
+        let after = onnx_runtime_ep_cpu::weight_offload_stats();
+
+        assert_eq!(
+            offload_output[0].to_vec_f32(),
+            legacy_output[0].to_vec_f32()
+        );
+        assert!(
+            after.layer_executions
+                >= before
+                    .layer_executions
+                    .checked_add(1)
+                    .expect("layer execution counter overflow")
+        );
+        assert!(after.bytes_read_from_mmap > before.bytes_read_from_mmap);
     }
 
     /// (d) Soundness guard: even when an initializer's mmap bytes are aligned

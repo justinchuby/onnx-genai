@@ -94,7 +94,8 @@ def main() -> None:
         "fc2_packed": fc2_packed_data.tobytes(),
         "fc2_scales": fc2_scales_data.tobytes(),
     }
-    external = bytearray()
+    # Deliberately dtype-aligned but not DeviceBuffer's 64-byte alignment.
+    external = bytearray(4)
     for initializer in proto.graph.initializer:
         payload = payloads[initializer.name]
         offset = len(external)
