@@ -2641,19 +2641,14 @@ fn produces_sequence_output(op_type: &str, domain: &str) -> bool {
         )
 }
 
-/// Read a single scalar `i64`/`i32` element from a length-1 tensor (Loop's `M`).
+/// Read a single scalar `i64` element from a length-1 tensor (Loop's `M`).
 fn tensor_scalar_i64(t: &Tensor) -> Option<i64> {
-    match t.dtype {
-        DataType::Int64 => t
-            .as_bytes()
-            .get(..8)
-            .map(|c| i64::from_le_bytes(c.try_into().unwrap())),
-        DataType::Int32 => t
-            .as_bytes()
-            .get(..4)
-            .map(|c| i32::from_le_bytes(c.try_into().unwrap()) as i64),
-        _ => None,
+    if t.dtype != DataType::Int64 || t.numel() != 1 {
+        return None;
     }
+    t.as_bytes()
+        .get(..8)
+        .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
 }
 
 /// Read a single scalar bool from a length-1 `BOOL` tensor (a `BOOL` is one
@@ -3277,6 +3272,125 @@ impl Executor {
         Ok(())
     }
 
+    /// Validate a Loop body's positional contract before the first iteration and
+    /// retain each scan output's element type/shape for the zero-iteration case.
+    fn loop_body_scan_specs(
+        &self,
+        node: &Node,
+        carried: &[Tensor],
+        num_scan: usize,
+        resolved: &HashMap<ValueId, Vec<usize>>,
+    ) -> Result<Vec<Option<(DataType, Vec<usize>)>>> {
+        let body = self
+            .graph
+            .subgraphs
+            .get(&(node.id, "body".to_string()))
+            .ok_or_else(|| SessionError::ControlFlow {
+                op: "Loop".to_string(),
+                reason: "missing required 'body' subgraph".to_string(),
+            })?;
+        let expected_inputs = 2 + carried.len();
+        if body.inputs.len() != expected_inputs {
+            return Err(SessionError::ControlFlow {
+                op: "Loop".to_string(),
+                reason: format!(
+                    "body declares {} formal input(s), expected {expected_inputs}",
+                    body.inputs.len()
+                ),
+            });
+        }
+        let expected_outputs = 1 + carried.len() + num_scan;
+        if body.outputs.len() != expected_outputs {
+            return Err(SessionError::ControlFlow {
+                op: "Loop".to_string(),
+                reason: format!(
+                    "body declares {} output(s), expected {expected_outputs}",
+                    body.outputs.len()
+                ),
+            });
+        }
+
+        for (index, expected) in [(0, DataType::Int64), (1, DataType::Bool)] {
+            let input = body.inputs[index];
+            if body.value_type_is_known(input) && body.value(input).dtype != expected {
+                return Err(SessionError::ControlFlow {
+                    op: "Loop".to_string(),
+                    reason: format!(
+                        "body formal input {index} must be {expected:?}, got {:?}",
+                        body.value(input).dtype
+                    ),
+                });
+            }
+        }
+        let cond_out = body.outputs[0];
+        if body.value_type_is_known(cond_out) && body.value(cond_out).dtype != DataType::Bool {
+            return Err(SessionError::ControlFlow {
+                op: "Loop".to_string(),
+                reason: format!(
+                    "body output 0 ('cond_out') must be Bool, got {:?}",
+                    body.value(cond_out).dtype
+                ),
+            });
+        }
+
+        for (index, initial) in carried.iter().enumerate() {
+            for (kind, value) in [
+                ("formal input", body.inputs[2 + index]),
+                ("output", body.outputs[1 + index]),
+            ] {
+                if body.value_type_is_known(value) && body.value(value).dtype != initial.dtype {
+                    return Err(SessionError::ControlFlow {
+                        op: "Loop".to_string(),
+                        reason: format!(
+                            "loop-carried {kind} {index} has dtype {:?}, but its initial value has \
+                             dtype {:?}",
+                            body.value(value).dtype,
+                            initial.dtype
+                        ),
+                    });
+                }
+            }
+        }
+
+        body.outputs
+            .iter()
+            .skip(1 + carried.len())
+            .zip(node.outputs.iter().skip(carried.len()))
+            .enumerate()
+            .map(|(index, (&body_output, &node_output))| {
+                let body_value = body.value(body_output);
+                let node_dtype = self.value_dtypes[&node_output];
+                let dtype = if body.value_type_is_known(body_output) {
+                    if self.graph.value_type_is_known(node_output)
+                        && body_value.dtype != node_dtype
+                    {
+                        return Err(SessionError::ControlFlow {
+                            op: "Loop".to_string(),
+                            reason: format!(
+                                "scan output {index} has body dtype {:?}, but the Loop node declares \
+                                 {node_dtype:?}",
+                                body_value.dtype
+                            ),
+                        });
+                    }
+                    body_value.dtype
+                } else {
+                    node_dtype
+                };
+                let elem_shape = body
+                    .value_shape_is_known(body_output)
+                    .then(|| as_static_shape(&body_value.shape))
+                    .flatten()
+                    .or_else(|| {
+                        resolved
+                            .get(&node_output)
+                            .and_then(|shape| shape.get(1..).map(<[_]>::to_vec))
+                    });
+                Ok(elem_shape.map(|shape| (dtype, shape)))
+            })
+            .collect()
+    }
+
     /// ONNX `Loop`: inputs `[M?, cond?, v_initial...]`, body signature
     /// `(iter_num, cond_in, carried...) -> (cond_out, carried..., scan_out...)`.
     /// Iterates while `cond` is true and `iter < M`, threading loop-carried
@@ -3293,11 +3407,19 @@ impl Executor {
         let m: Option<i64> = match node.inputs.first().and_then(|s| *s) {
             Some(vid) => {
                 let t = self.value_tensor(vid, resolved)?;
-                let m = tensor_scalar_i64(&t).ok_or_else(|| {
-                    SessionError::Internal(format!(
-                        "Loop: trip-count 'M' must be an INT64/INT32 scalar, got dtype {:?}",
-                        t.dtype
-                    ))
+                if t.dtype != DataType::Int64 {
+                    return Err(SessionError::DtypeMismatch {
+                        name: "Loop M".to_string(),
+                        expected: format!("{:?}", DataType::Int64),
+                        got: format!("{:?}", t.dtype),
+                    });
+                }
+                let m = tensor_scalar_i64(&t).ok_or_else(|| SessionError::ControlFlow {
+                    op: "Loop".to_string(),
+                    reason: format!(
+                        "'M' must be an INT64 scalar or single-element tensor, got shape {:?}",
+                        t.shape
+                    ),
                 })?;
                 Some(m)
             }
@@ -3306,11 +3428,19 @@ impl Executor {
         let mut cond: Option<bool> = match node.inputs.get(1).and_then(|s| *s) {
             Some(vid) => {
                 let t = self.value_tensor(vid, resolved)?;
-                Some(tensor_scalar_bool(&t).ok_or_else(|| {
-                    SessionError::Internal(format!(
-                        "Loop: 'cond' must be a BOOL scalar, got dtype {:?}",
-                        t.dtype
-                    ))
+                if t.dtype != DataType::Bool {
+                    return Err(SessionError::DtypeMismatch {
+                        name: "Loop cond".to_string(),
+                        expected: format!("{:?}", DataType::Bool),
+                        got: format!("{:?}", t.dtype),
+                    });
+                }
+                Some(tensor_scalar_bool(&t).ok_or_else(|| SessionError::ControlFlow {
+                    op: "Loop".to_string(),
+                    reason: format!(
+                        "'cond' must be a BOOL scalar or single-element tensor, got shape {:?}",
+                        t.shape
+                    ),
                 })?)
             }
             None => None,
@@ -3339,6 +3469,8 @@ impl Executor {
             )));
         }
         let num_scan = num_outputs - num_carried;
+        let empty_scan_specs =
+            self.loop_body_scan_specs(node, &carried, num_scan, resolved)?;
         let expected_iterations = m.and_then(|n| usize::try_from(n).ok());
         let mut scan_acc: Vec<TensorStackAccumulator> = (0..num_scan)
             .map(|_| TensorStackAccumulator::new(expected_iterations))
@@ -3390,15 +3522,22 @@ impl Executor {
                 acc.push(it.next().expect("scan output present"))?;
             }
 
-            iter += 1;
+            iter = iter.checked_add(1).ok_or_else(|| SessionError::ControlFlow {
+                op: "Loop".to_string(),
+                reason: "iteration counter overflowed INT64".to_string(),
+            })?;
         }
 
         // Emit outputs: carried finals, then stacked scan outputs.
         for (i, t) in carried.iter().enumerate() {
             self.store_output_tensor(node.outputs[i], t, resolved)?;
         }
-        for (s, acc) in scan_acc.into_iter().enumerate() {
-            let (dtype, shape, bytes) = acc.finish();
+        for (s, (acc, empty_spec)) in scan_acc
+            .into_iter()
+            .zip(empty_scan_specs)
+            .enumerate()
+        {
+            let (dtype, shape, bytes) = acc.finish_with_empty(empty_spec, s)?;
             self.store_output_bytes(
                 node.outputs[num_carried + s],
                 dtype,
@@ -3660,6 +3799,27 @@ impl TensorStackAccumulator {
         shape.push(self.len);
         shape.extend(self.elem_shape);
         (dtype, shape, self.bytes)
+    }
+
+    fn finish_with_empty(
+        self,
+        empty_spec: Option<(DataType, Vec<usize>)>,
+        output_index: usize,
+    ) -> Result<(DataType, Vec<usize>, Vec<u8>)> {
+        if self.len != 0 {
+            return Ok(self.finish());
+        }
+        let (dtype, elem_shape) = empty_spec.ok_or_else(|| SessionError::ControlFlow {
+            op: "Loop".to_string(),
+            reason: format!(
+                "cannot determine the element shape of scan output {output_index} for a \
+                 zero-iteration result"
+            ),
+        })?;
+        let mut shape = Vec::with_capacity(1 + elem_shape.len());
+        shape.push(0);
+        shape.extend(elem_shape);
+        Ok((dtype, shape, Vec::new()))
     }
 }
 

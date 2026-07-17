@@ -351,7 +351,11 @@ fn loop_fixed_trip_count_accumulates_and_stacks_scan_outputs() {
     assert_eq!(outs.len(), 2);
     // acc after each iter: 0, 1, 3, 6  → final 6.
     assert_eq!(outs[0].to_vec_f32(), vec![6.0]);
+    assert_eq!(outs[1].dtype, DataType::Float32);
+    assert_eq!(outs[1].shape, vec![n as usize]);
     assert_eq!(outs[1].to_vec_f32(), vec![0.0, 1.0, 3.0, 6.0]);
+    assert_eq!(session.control_flow_stats().subgraph_builds, 1);
+    assert_eq!(session.control_flow_stats().subgraph_runs, n as u64);
 }
 
 /// Loop body decrementing a counter and driving `cond_out` from it via a
@@ -402,6 +406,105 @@ fn loop_cond_driven_early_exit_with_unbounded_trip_count() {
     assert_eq!(outs.len(), 1);
     // rem after each iter: 2, 1, 0 → cond false at 0, three iterations, final 0.
     assert_eq!(outs[0].to_vec_f32(), vec![0.0]);
+}
+
+fn loop_zero_iteration_body() -> Graph {
+    let mut b = Graph::new();
+    let iter = capture(&mut b, "iter", DataType::Int64, &[]);
+    let cond_in = capture(&mut b, "cond_in", DataType::Bool, &[]);
+    let carried = capture(&mut b, "carried", DataType::Float32, &[]);
+    b.add_input(iter);
+    b.add_input(cond_in);
+    b.add_input(carried);
+
+    let cond_out = op(&mut b, "Identity", &[cond_in], Some("cond_out"), DataType::Bool, &[], &[]);
+    let carried_out =
+        op(&mut b, "Identity", &[carried], Some("carried_out"), DataType::Float32, &[], &[]);
+    let pair = init(&mut b, "pair", DataType::Int64, &[2], i64_bytes(&[7, 9]));
+    let scan = op(&mut b, "Identity", &[pair], Some("scan_out"), DataType::Int64, &[2], &[]);
+    b.add_output(cond_out);
+    b.add_output(carried_out);
+    b.add_output(scan);
+    b
+}
+
+#[test]
+fn loop_zero_iterations_preserves_carried_and_types_empty_scan_output() {
+    let mut g = new_parent();
+    let m = init(&mut g, "M", DataType::Int64, &[], i64_bytes(&[0]));
+    let carried0 = init(&mut g, "carried0", DataType::Float32, &[], f32_bytes(&[42.0]));
+    let carried_final = g.create_named_value("carried_final", DataType::Float32, scalar());
+    let scan = g.create_named_value("scan", DataType::Int64, static_shape([0, 2]));
+
+    let node = control_flow_node(
+        &mut g,
+        "Loop",
+        vec![Some(m), None, Some(carried0)],
+        vec![carried_final, scan],
+        &[],
+    );
+    register(&mut g, node, "body", loop_zero_iteration_body());
+    g.add_output(carried_final);
+    g.add_output(scan);
+
+    let mut session = InferenceSession::from_graph(g).expect("build session");
+    let outs = session.run(&[]).expect("run");
+    assert_eq!(outs[0].to_vec_f32(), vec![42.0]);
+    assert_eq!(outs[1].dtype, DataType::Int64);
+    assert_eq!(outs[1].shape, vec![0, 2]);
+    assert!(outs[1].to_vec_i64().is_empty());
+    assert_eq!(session.control_flow_stats().subgraph_builds, 0);
+    assert_eq!(session.control_flow_stats().subgraph_runs, 0);
+}
+
+fn loop_capture_body() -> Graph {
+    let mut b = Graph::new();
+    let iter = capture(&mut b, "iter", DataType::Int64, &[]);
+    let cond_in = capture(&mut b, "cond_in", DataType::Bool, &[]);
+    let acc = capture(&mut b, "acc", DataType::Float32, &[]);
+    let step = capture(&mut b, "step", DataType::Float32, &[]);
+    b.add_input(iter);
+    b.add_input(cond_in);
+    b.add_input(acc);
+
+    let acc_out = op(&mut b, "Add", &[acc, step], Some("acc_out"), DataType::Float32, &[], &[]);
+    let cond_out = op(&mut b, "Identity", &[cond_in], Some("cond_out"), DataType::Bool, &[], &[]);
+    let scan = op(&mut b, "Identity", &[acc_out], Some("scan_out"), DataType::Float32, &[], &[]);
+    b.add_output(cond_out);
+    b.add_output(acc_out);
+    b.add_output(scan);
+    b
+}
+
+#[test]
+fn loop_body_captures_outer_value_and_reuses_child_executor() {
+    let n = 3i64;
+    let mut g = new_parent();
+    let m = init(&mut g, "M", DataType::Int64, &[], i64_bytes(&[n]));
+    let acc0 = init(&mut g, "acc0", DataType::Float32, &[], f32_bytes(&[1.0]));
+    let _step = input(&mut g, "step", DataType::Float32, &[]);
+    let acc_final = g.create_named_value("acc_final", DataType::Float32, scalar());
+    let scan = g.create_named_value("scan", DataType::Float32, static_shape([n as usize]));
+
+    let node = control_flow_node(
+        &mut g,
+        "Loop",
+        vec![Some(m), None, Some(acc0)],
+        vec![acc_final, scan],
+        &[],
+    );
+    register(&mut g, node, "body", loop_capture_body());
+    g.add_output(acc_final);
+    g.add_output(scan);
+
+    let mut session = InferenceSession::from_graph(g).expect("build session");
+    let step = Tensor::from_f32(&[], &[2.0]).unwrap();
+    let outs = session.run(&[("step", &step)]).expect("run");
+    assert_eq!(outs[0].to_vec_f32(), vec![7.0]);
+    assert_eq!(outs[1].shape, vec![n as usize]);
+    assert_eq!(outs[1].to_vec_f32(), vec![3.0, 5.0, 7.0]);
+    assert_eq!(session.control_flow_stats().subgraph_builds, 1);
+    assert_eq!(session.control_flow_stats().subgraph_runs, n as u64);
 }
 
 #[test]
