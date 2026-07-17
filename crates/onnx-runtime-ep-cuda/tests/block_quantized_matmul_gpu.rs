@@ -307,11 +307,12 @@ fn block_quantized_gemv_random_supported_formats_match_cpu() {
 }
 
 #[test]
-fn block_quantized_gemm_prefill_matches_cpu_for_partial_row_tiles() {
+fn block_quantized_gemm_prefill_matches_cpu_for_partial_and_grid_stride_tiles() {
     let Some(ep) = gpu() else { return };
     for (format, a_shape, k, n, with_bias) in [
         ("mxfp4", vec![3, 99], 99usize, 13usize, true),
         ("iq4_xs", vec![1, 7, 515], 515usize, 11usize, false),
+        ("mxfp4", vec![32_769, 32], 32usize, 2usize, false),
     ] {
         let m = a_shape[..a_shape.len() - 1].iter().product();
         let (qk, block_bytes) = format_info(format);

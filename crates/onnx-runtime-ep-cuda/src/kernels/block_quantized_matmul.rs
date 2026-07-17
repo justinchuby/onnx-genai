@@ -31,6 +31,10 @@ const IQ1_S_BLOCK_BYTES: usize = 50;
 const IQ1_M_BLOCK_BYTES: usize = 56;
 const BLOCK_THREADS: u32 = 256;
 const GEMM_TILE_M: u32 = 8;
+const CUDA_MAX_GRID_DIM_Y: u32 = 65_535;
+// 4K row tiles saturate the device while keeping the grid-stride path testable.
+const GEMM_GRID_DIM_Y_CAP: u32 = 4_096;
+const _: () = assert!(GEMM_GRID_DIM_Y_CAP <= CUDA_MAX_GRID_DIM_Y);
 const GEMV_MODULE: &str = "block_quantized_matmul_gemv";
 const GEMV_ENTRY: &str = "block_quantized_matmul_gemv_f32";
 const GEMM_MODULE: &str = "block_quantized_matmul_gemm";
@@ -328,7 +332,7 @@ extern "C" __global__ void block_quantized_matmul_gemm_f32(
     const unsigned char* packed,
     const float* bias,
     float* output,
-    const int m,
+    const unsigned long long m,
     const int k,
     const int n,
     const int blocks,
@@ -336,30 +340,40 @@ extern "C" __global__ void block_quantized_matmul_gemm_f32(
     const int format)
 {
     const int column = (int)blockIdx.x;
-    const int row_base = (int)blockIdx.y * GEMM_TILE_M;
-    if (column >= n || row_base >= m) {
+    if (column >= n) {
         return;
     }
 
-    float values[GEMM_TILE_M] = {0.0f};
-    for (int depth = (int)threadIdx.x; depth < k; depth += (int)blockDim.x) {
-        const float weight =
-            decode_weight(packed, format, blocks, block_bytes, column, depth);
+    const unsigned long long row_stride =
+        (unsigned long long)gridDim.y * GEMM_TILE_M;
+    for (unsigned long long row_base =
+             (unsigned long long)blockIdx.y * GEMM_TILE_M;
+         row_base < m;
+         row_base += row_stride) {
+        float values[GEMM_TILE_M] = {0.0f};
+        for (int depth = (int)threadIdx.x; depth < k; depth += (int)blockDim.x) {
+            const float weight =
+                decode_weight(packed, format, blocks, block_bytes, column, depth);
 #pragma unroll
-        for (int row = 0; row < GEMM_TILE_M; ++row) {
-            if (row_base + row < m) {
-                values[row] += activation[(long long)(row_base + row) * k + depth] * weight;
+            for (int row = 0; row < GEMM_TILE_M; ++row) {
+                const unsigned long long row_index = row_base + (unsigned long long)row;
+                if (row_index < m) {
+                    values[row] +=
+                        activation[row_index * (unsigned long long)k + (unsigned long long)depth]
+                        * weight;
+                }
             }
         }
-    }
 
 #pragma unroll
-    for (int row = 0; row < GEMM_TILE_M; ++row) {
-        const float value = block_sum(values[row]);
-        __syncthreads();
-        if (threadIdx.x == 0 && row_base + row < m) {
-            output[(long long)(row_base + row) * n + column] =
-                value + (bias ? bias[column] : 0.0f);
+        for (int row = 0; row < GEMM_TILE_M; ++row) {
+            const float value = block_sum(values[row]);
+            __syncthreads();
+            const unsigned long long row_index = row_base + (unsigned long long)row;
+            if (threadIdx.x == 0 && row_index < m) {
+                output[row_index * (unsigned long long)n + (unsigned long long)column] =
+                    value + (bias ? bias[column] : 0.0f);
+            }
         }
     }
 }
@@ -571,30 +585,19 @@ impl Kernel for BlockQuantizedMatMulKernel {
         require_dtype("packed_B", inputs[1].dtype, DataType::Uint8)?;
         require_dtype("Y", outputs[0].dtype, DataType::Float32)?;
 
-        let a_shape = inputs[0].shape;
-        if a_shape.is_empty() || a_shape[a_shape.len() - 1] != self.k {
-            return Err(error(format!(
-                "A must have rank >= 1 and last dimension K={}, got {:?}",
-                self.k, a_shape
-            )));
-        }
-        let m = a_shape[..a_shape.len() - 1]
-            .iter()
-            .try_fold(1usize, |product, &dim| product.checked_mul(dim))
-            .ok_or_else(|| error("A leading dimension product exceeds usize limits"))?;
-        let expected_output_shape = [&a_shape[..a_shape.len() - 1], &[self.n]].concat();
-        require_shape("Y", outputs[0].shape, &expected_output_shape)?;
-
-        let blocks = self.k.div_ceil(self.format.qk());
-        require_shape(
-            "packed_B",
+        let (m, blocks) = validate_tensor_layouts(
+            inputs[0].shape,
             inputs[1].shape,
-            &[self.n, blocks, self.format.block_bytes()],
+            outputs[0].shape,
+            self.k,
+            self.n,
+            self.format,
         )?;
         let bias = inputs.get(2).filter(|input| !input.is_absent());
         if let Some(bias) = bias {
             require_dtype("bias", bias.dtype, DataType::Float32)?;
             require_shape("bias", bias.shape, &[self.n])?;
+            checked_tensor_layout("bias", bias.shape, DataType::Float32)?;
         }
         for (name, contiguous) in [
             ("A", inputs[0].is_contiguous()),
@@ -609,6 +612,11 @@ impl Kernel for BlockQuantizedMatMulKernel {
             }
         }
 
+        let k = as_i32("K", self.k)?;
+        let n = as_i32("N", self.n)?;
+        let grid_x = as_grid_x("N", n)?;
+        let blocks = as_i32("block count", blocks)?;
+        let block_bytes = as_i32("block byte count", self.format.block_bytes())?;
         if m == 0 {
             return Ok(());
         }
@@ -619,10 +627,6 @@ impl Kernel for BlockQuantizedMatMulKernel {
             .map(|tensor| cuptr(tensor.data_ptr::<u8>() as *const c_void))
             .unwrap_or(0);
         let output_ptr = cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void);
-        let k = as_i32("K", self.k)?;
-        let n = as_i32("N", self.n)?;
-        let blocks = as_i32("block count", blocks)?;
-        let block_bytes = as_i32("block byte count", self.format.block_bytes())?;
         let format = self.format.kernel_id();
 
         if m == 1 {
@@ -644,7 +648,7 @@ impl Kernel for BlockQuantizedMatMulKernel {
             // matches `block_quantized_matmul_gemv_f32`.
             unsafe {
                 builder.launch(LaunchConfig {
-                    grid_dim: (n as u32, 1, 1),
+                    grid_dim: (grid_x, 1, 1),
                     block_dim: (BLOCK_THREADS, 1, 1),
                     shared_mem_bytes: 0,
                 })
@@ -654,7 +658,8 @@ impl Kernel for BlockQuantizedMatMulKernel {
             let function = self
                 .runtime
                 .nvrtc_function(GEMM_MODULE, gemm_src(), GEMM_ENTRY)?;
-            let m = as_i32("M", m)?;
+            let m = as_u64("M", m)?;
+            let launch_config = gemm_launch_config(m, grid_x)?;
             let mut builder = self.runtime.stream().launch_builder(&function);
             builder
                 .arg(&activation_ptr)
@@ -669,14 +674,8 @@ impl Kernel for BlockQuantizedMatMulKernel {
                 .arg(&format);
             // SAFETY: all tensors are dense and shape-checked, and the scalar ABI
             // matches `block_quantized_matmul_gemm_f32`.
-            unsafe {
-                builder.launch(LaunchConfig {
-                    grid_dim: (n as u32, (m as u32).div_ceil(GEMM_TILE_M), 1),
-                    block_dim: (BLOCK_THREADS, 1, 1),
-                    shared_mem_bytes: 0,
-                })
-            }
-            .map_err(|err| driver_err("launch BlockQuantizedMatMul GEMM", err))?;
+            unsafe { builder.launch(launch_config) }
+                .map_err(|err| driver_err("launch BlockQuantizedMatMul GEMM", err))?;
         }
         self.runtime.synchronize()
     }
@@ -729,7 +728,8 @@ fn required_positive_attr(node: &Node, name: &str) -> Result<usize> {
             "attribute '{name}' must be positive, got {value}"
         )));
     }
-    Ok(value as usize)
+    usize::try_from(value)
+        .map_err(|_| error(format!("attribute '{name}'={value} exceeds usize limits")))
 }
 
 fn optional_int_attr(node: &Node, name: &str) -> Result<Option<i64>> {
@@ -760,10 +760,188 @@ fn require_shape(name: &str, got: &[usize], expected: &[usize]) -> Result<()> {
     Ok(())
 }
 
+fn validate_tensor_layouts(
+    a_shape: &[usize],
+    packed_shape: &[usize],
+    output_shape: &[usize],
+    k: usize,
+    n: usize,
+    format: BlockFormat,
+) -> Result<(usize, usize)> {
+    if a_shape.is_empty() || a_shape[a_shape.len() - 1] != k {
+        return Err(error(format!(
+            "A must have rank >= 1 and last dimension K={k}, got {a_shape:?}"
+        )));
+    }
+    let m = checked_product(&a_shape[..a_shape.len() - 1], "A leading dimension product")?;
+    let expected_output_shape = [&a_shape[..a_shape.len() - 1], &[n]].concat();
+    require_shape("Y", output_shape, &expected_output_shape)?;
+
+    let blocks = checked_div_ceil(k, format.qk(), "block count")?;
+    require_shape("packed_B", packed_shape, &[n, blocks, format.block_bytes()])?;
+
+    checked_tensor_layout("A", a_shape, DataType::Float32)?;
+    checked_tensor_layout("packed_B", packed_shape, DataType::Uint8)?;
+    checked_tensor_layout("Y", output_shape, DataType::Float32)?;
+    Ok((m, blocks))
+}
+
+fn checked_product(factors: &[usize], context: &str) -> Result<usize> {
+    let mut product = 1usize;
+    let mut has_zero = false;
+    for &factor in factors {
+        if factor == 0 {
+            has_zero = true;
+        } else {
+            product = product
+                .checked_mul(factor)
+                .ok_or_else(|| error(format!("{context} exceeds usize limits")))?;
+        }
+    }
+    Ok(if has_zero { 0 } else { product })
+}
+
+fn checked_tensor_layout(name: &str, shape: &[usize], dtype: DataType) -> Result<usize> {
+    let elements = checked_product(shape, &format!("{name} element count"))?;
+    let bytes = elements
+        .checked_mul(dtype.byte_size())
+        .ok_or_else(|| error(format!("{name} byte count exceeds usize limits")))?;
+    if bytes > isize::MAX as usize {
+        return Err(error(format!(
+            "{name} byte count {bytes} exceeds isize::MAX"
+        )));
+    }
+    Ok(elements)
+}
+
+fn checked_div_ceil(value: usize, divisor: usize, context: &str) -> Result<usize> {
+    value
+        .checked_add(divisor - 1)
+        .map(|adjusted| adjusted / divisor)
+        .ok_or_else(|| error(format!("{context} exceeds usize limits")))
+}
+
+fn gemm_launch_config(m: u64, grid_x: u32) -> Result<LaunchConfig> {
+    let row_tiles = m.div_ceil(u64::from(GEMM_TILE_M));
+    let grid_y = u32::try_from(row_tiles.min(u64::from(GEMM_GRID_DIM_Y_CAP))).map_err(|_| {
+        error(format!(
+            "GEMM row-tile count {row_tiles} exceeds u32 limits"
+        ))
+    })?;
+    Ok(LaunchConfig {
+        grid_dim: (grid_x, grid_y, 1),
+        block_dim: (BLOCK_THREADS, 1, 1),
+        shared_mem_bytes: 0,
+    })
+}
+
 fn as_i32(name: &str, value: usize) -> Result<i32> {
     i32::try_from(value).map_err(|_| error(format!("{name}={value} exceeds CUDA i32 limits")))
 }
 
+fn as_grid_x(name: &str, value: i32) -> Result<u32> {
+    u32::try_from(value).map_err(|_| error(format!("{name}={value} exceeds CUDA grid-X limits")))
+}
+
+fn as_u64(name: &str, value: usize) -> Result<u64> {
+    u64::try_from(value).map_err(|_| error(format!("{name}={value} exceeds CUDA u64 limits")))
+}
+
 fn error(message: impl Into<String>) -> EpError {
     EpError::KernelFailed(format!("cuda_ep {DOMAIN}::{OP}: {}", message.into()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gemm_launch_config_caps_grid_y_and_keeps_all_row_tiles_reachable() {
+        let row_tiles = u64::from(GEMM_GRID_DIM_Y_CAP) + 1;
+        let m = (row_tiles - 1) * u64::from(GEMM_TILE_M) + 1;
+        let config = gemm_launch_config(m, 7).unwrap();
+
+        assert_eq!(config.grid_dim, (7, GEMM_GRID_DIM_Y_CAP, 1));
+        assert!(config.grid_dim.1 <= CUDA_MAX_GRID_DIM_Y);
+        assert!(row_tiles > u64::from(config.grid_dim.1));
+        let final_tile = row_tiles - 1;
+        let starting_block = final_tile % u64::from(config.grid_dim.1);
+        let stride_iteration = final_tile / u64::from(config.grid_dim.1);
+        assert_eq!(starting_block, 0);
+        assert_eq!(stride_iteration, 1);
+    }
+
+    #[test]
+    fn zero_leading_dimension_does_not_hide_nonzero_product_overflow() {
+        let result = validate_tensor_layouts(
+            &[0, usize::MAX, 2, 32],
+            &[1, 1, MXFP4_BLOCK_BYTES],
+            &[0, usize::MAX, 2, 1],
+            32,
+            1,
+            BlockFormat::Mxfp4,
+        );
+
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("A leading dimension product exceeds usize limits"));
+    }
+
+    #[test]
+    fn legitimate_empty_tensor_layout_is_valid() {
+        let result = validate_tensor_layouts(
+            &[0, 32],
+            &[3, 1, MXFP4_BLOCK_BYTES],
+            &[0, 3],
+            32,
+            3,
+            BlockFormat::Mxfp4,
+        );
+
+        assert_eq!(result.unwrap(), (0, 1));
+    }
+
+    #[test]
+    fn tensor_layouts_reject_byte_counts_above_isize_max() {
+        let oversized_m = isize::MAX as usize / std::mem::size_of::<f32>() + 1;
+        let a_error = validate_tensor_layouts(
+            &[oversized_m, 1],
+            &[1, 1, MXFP4_BLOCK_BYTES],
+            &[oversized_m, 1],
+            1,
+            1,
+            BlockFormat::Mxfp4,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(a_error.contains("A byte count"));
+        assert!(a_error.contains("exceeds isize::MAX"));
+
+        let oversized_n = isize::MAX as usize / MXFP4_BLOCK_BYTES + 1;
+        let packed_error = validate_tensor_layouts(
+            &[0, 32],
+            &[oversized_n, 1, MXFP4_BLOCK_BYTES],
+            &[0, oversized_n],
+            32,
+            oversized_n,
+            BlockFormat::Mxfp4,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(packed_error.contains("packed_B byte count"));
+        assert!(packed_error.contains("exceeds isize::MAX"));
+
+        let output_n = isize::MAX as usize / 20 + 1;
+        let output_error = validate_tensor_layouts(
+            &[5, 1],
+            &[output_n, 1, MXFP4_BLOCK_BYTES],
+            &[5, output_n],
+            1,
+            output_n,
+            BlockFormat::Mxfp4,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(output_error.contains("Y byte count"));
+        assert!(output_error.contains("exceeds isize::MAX"));
+    }
 }
