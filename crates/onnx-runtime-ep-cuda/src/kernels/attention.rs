@@ -57,8 +57,8 @@
 use std::ffi::c_void;
 use std::sync::Arc;
 
+use cudarc::driver::PushKernelArg;
 use cudarc::driver::sys::CUdeviceptr;
-use cudarc::driver::{LaunchConfig, PushKernelArg};
 
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ir::{DataType, Node};
@@ -500,11 +500,8 @@ pub(crate) fn run_attention_f32(
         // Stage 2: fused softmax over the keys axis (scale already applied).
         let nrows = batch * num_heads * sq;
         let func = runtime.nvrtc_function(SOFTMAX_MODULE, SOFTMAX_SRC, SOFTMAX_ENTRY)?;
-        let cfg = LaunchConfig {
-            grid_dim: (nrows as u32, 1, 1),
-            block_dim: (SOFTMAX_BLOCK, 1, 1),
-            shared_mem_bytes: SOFTMAX_BLOCK * F32 as u32,
-        };
+        let cfg =
+            runtime.reduction_launch_config(&func, nrows as u32, SOFTMAX_BLOCK, F32 as u32)?;
         let nrows_i = i32::try_from(nrows).map_err(|_| {
             EpError::KernelFailed(format!("cuda_ep Attention: {nrows} score rows exceed i32"))
         })?;

@@ -9,8 +9,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use cudarc::driver::sys::{CUdevice_attribute, CUdeviceptr};
-use cudarc::driver::{CudaContext, CudaFunction, CudaModule, CudaStream};
+use cudarc::driver::sys::{CUdevice_attribute, CUdeviceptr, CUfunction_attribute_enum};
+use cudarc::driver::{CudaContext, CudaFunction, CudaModule, CudaStream, LaunchConfig};
 
 use onnx_runtime_ep_api::EpError;
 use onnx_runtime_ep_api::Result;
@@ -55,6 +55,88 @@ fn cubin_arch_for(major: u32, minor: u32) -> String {
     format!("sm_{major}{minor}")
 }
 
+const SAFE_MAX_THREADS_PER_BLOCK_FALLBACK: u32 = 256;
+const SAFE_SHARED_MEMORY_PER_BLOCK_FALLBACK: u32 = 48 * 1024;
+
+/// Hardware limits used to select portable CUDA launch configurations.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CudaDeviceCapabilities {
+    compute_capability: (u32, u32),
+    max_threads_per_block: u32,
+    max_shared_memory_per_block: u32,
+    max_shared_memory_per_block_optin: u32,
+    multiprocessor_count: u32,
+}
+
+impl CudaDeviceCapabilities {
+    fn from_reported_limits(
+        compute_capability: (u32, u32),
+        max_threads_per_block: Option<u32>,
+        max_shared_memory_per_block: Option<u32>,
+        max_shared_memory_per_block_optin: Option<u32>,
+        multiprocessor_count: Option<u32>,
+    ) -> Self {
+        let max_threads_per_block = max_threads_per_block
+            .filter(|&value| value > 0)
+            .unwrap_or(SAFE_MAX_THREADS_PER_BLOCK_FALLBACK);
+        let max_shared_memory_per_block = max_shared_memory_per_block
+            .filter(|&value| value > 0)
+            .unwrap_or(SAFE_SHARED_MEMORY_PER_BLOCK_FALLBACK);
+        let max_shared_memory_per_block_optin = max_shared_memory_per_block_optin
+            .filter(|&value| value > 0)
+            .unwrap_or(max_shared_memory_per_block)
+            .max(max_shared_memory_per_block);
+        let multiprocessor_count = multiprocessor_count.filter(|&value| value > 0).unwrap_or(1);
+        Self {
+            compute_capability,
+            max_threads_per_block,
+            max_shared_memory_per_block,
+            max_shared_memory_per_block_optin,
+            multiprocessor_count,
+        }
+    }
+
+    pub fn compute_capability(self) -> (u32, u32) {
+        self.compute_capability
+    }
+
+    pub fn max_shared_memory_per_block_optin(self) -> u32 {
+        self.max_shared_memory_per_block_optin
+    }
+
+    pub fn multiprocessor_count(self) -> u32 {
+        self.multiprocessor_count
+    }
+}
+
+fn positive_attribute(context: &CudaContext, attribute: CUdevice_attribute) -> Option<u32> {
+    context
+        .attribute(attribute)
+        .ok()
+        .and_then(|value| u32::try_from(value).ok())
+        .filter(|&value| value > 0)
+}
+
+fn reduction_launch_params(
+    preferred_threads: u32,
+    max_threads: u32,
+    bytes_per_thread: u32,
+    max_dynamic_shared_memory: u32,
+) -> Option<(u32, u32)> {
+    if preferred_threads == 0 || max_threads == 0 || bytes_per_thread == 0 {
+        return None;
+    }
+    let threads_by_shared_memory = max_dynamic_shared_memory / bytes_per_thread;
+    let thread_limit = preferred_threads
+        .min(max_threads)
+        .min(threads_by_shared_memory);
+    if thread_limit == 0 {
+        return None;
+    }
+    let threads = 1 << (31 - thread_limit.leading_zeros());
+    Some((threads, threads * bytes_per_thread))
+}
+
 /// Device context, stream, and vendor-library backends shared across the EP.
 pub struct CudaRuntime {
     context: Arc<CudaContext>,
@@ -62,8 +144,7 @@ pub struct CudaRuntime {
     blas: CublasLt,
     cudnn: CudnnBackend,
     ordinal: u32,
-    /// Compute capability reported by the CUDA device, cached for NVRTC targets.
-    compute_capability: (u32, u32),
+    capabilities: CudaDeviceCapabilities,
     ptx_arch: String,
     cubin_arch: String,
     /// Cache of NVRTC-compiled modules, keyed by a stable module name, so each
@@ -80,7 +161,7 @@ impl std::fmt::Debug for CudaRuntime {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CudaRuntime")
             .field("ordinal", &self.ordinal)
-            .field("compute_capability", &self.compute_capability)
+            .field("capabilities", &self.capabilities)
             .finish()
     }
 }
@@ -114,6 +195,25 @@ impl CudaRuntime {
             )));
         }
         let compute_capability = (major, minor);
+        let capabilities = CudaDeviceCapabilities::from_reported_limits(
+            compute_capability,
+            positive_attribute(
+                &context,
+                CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK,
+            ),
+            positive_attribute(
+                &context,
+                CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK,
+            ),
+            positive_attribute(
+                &context,
+                CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN,
+            ),
+            positive_attribute(
+                &context,
+                CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
+            ),
+        );
         let ptx_arch = ptx_arch_for(major, minor);
         let cubin_arch = cubin_arch_for(major, minor);
         let stream = context.default_stream();
@@ -125,7 +225,7 @@ impl CudaRuntime {
             blas,
             cudnn,
             ordinal,
-            compute_capability,
+            capabilities,
             ptx_arch,
             cubin_arch,
             modules: Mutex::new(HashMap::new()),
@@ -136,6 +236,11 @@ impl CudaRuntime {
     /// The CUDA device ordinal this runtime drives.
     pub fn ordinal(&self) -> u32 {
         self.ordinal
+    }
+
+    /// Hardware capabilities reported by the selected CUDA device.
+    pub fn capabilities(&self) -> CudaDeviceCapabilities {
+        self.capabilities
     }
 
     /// The cuBLASLt handle.
@@ -156,6 +261,81 @@ impl CudaRuntime {
     /// The EP's compute stream (for `launch_builder`-based kernel launches).
     pub fn stream(&self) -> &Arc<CudaStream> {
         &self.stream
+    }
+
+    /// Build a power-of-two reduction launch that fits both the function and
+    /// device thread/shared-memory limits. If the launch exceeds the legacy
+    /// shared-memory limit, opt the function into the required dynamic size.
+    pub fn reduction_launch_config(
+        &self,
+        function: &CudaFunction,
+        grid_x: u32,
+        preferred_threads: u32,
+        bytes_per_thread: u32,
+    ) -> Result<LaunchConfig> {
+        let function_max_threads = function
+            .max_threads_per_block()
+            .map_err(|error| driver_err("querying CUDA function max threads", error))?;
+        let function_max_threads = u32::try_from(function_max_threads).map_err(|_| {
+            EpError::KernelFailed(format!(
+                "cuda_ep: CUDA function reported invalid max threads {function_max_threads}"
+            ))
+        })?;
+        let static_shared_memory = function
+            .shared_size_bytes()
+            .map_err(|error| driver_err("querying CUDA function static shared memory", error))?;
+        let static_shared_memory = u32::try_from(static_shared_memory).map_err(|_| {
+            EpError::KernelFailed(format!(
+                "cuda_ep: CUDA function reported invalid static shared memory {static_shared_memory}"
+            ))
+        })?;
+        let max_dynamic_shared_memory = self
+            .capabilities
+            .max_shared_memory_per_block_optin
+            .saturating_sub(static_shared_memory);
+        let max_threads = self
+            .capabilities
+            .max_threads_per_block
+            .min(function_max_threads);
+        let (threads, shared_mem_bytes) = reduction_launch_params(
+            preferred_threads,
+            max_threads,
+            bytes_per_thread,
+            max_dynamic_shared_memory,
+        )
+        .ok_or_else(|| {
+            EpError::KernelFailed(format!(
+                "cuda_ep: reduction launch needs {bytes_per_thread} shared-memory bytes per \
+                 thread, but device SM {}.{} allows {max_dynamic_shared_memory} dynamic bytes",
+                self.capabilities.compute_capability.0, self.capabilities.compute_capability.1,
+            ))
+        })?;
+
+        let default_dynamic_shared_memory = self
+            .capabilities
+            .max_shared_memory_per_block
+            .saturating_sub(static_shared_memory);
+        if shared_mem_bytes > default_dynamic_shared_memory {
+            let shared_mem_bytes_i32 = i32::try_from(shared_mem_bytes).map_err(|_| {
+                EpError::KernelFailed(format!(
+                    "cuda_ep: dynamic shared-memory request {shared_mem_bytes} exceeds i32"
+                ))
+            })?;
+            function
+                .set_attribute(
+                    CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                    shared_mem_bytes_i32,
+                )
+                .map_err(|error| {
+                    driver_err("opting CUDA function into dynamic shared memory", error)
+                })?;
+        }
+
+        Ok(LaunchConfig {
+            grid_dim: (grid_x, 1, 1),
+            block_dim: (threads, 1, 1),
+            shared_mem_bytes,
+        })
     }
 
     /// Get a [`CudaFunction`] for entry point `entry` in the NVRTC module named
@@ -433,6 +613,50 @@ mod tests {
         ] {
             assert_eq!(cubin_arch_for(major, minor), expected);
         }
+    }
+
+    #[test]
+    fn capability_limits_use_conservative_fallbacks() {
+        let capabilities =
+            CudaDeviceCapabilities::from_reported_limits((7, 0), None, None, None, None);
+        assert_eq!(capabilities.compute_capability(), (7, 0));
+        assert_eq!(capabilities.max_threads_per_block, 256);
+        assert_eq!(
+            capabilities.max_shared_memory_per_block,
+            SAFE_SHARED_MEMORY_PER_BLOCK_FALLBACK
+        );
+        assert_eq!(
+            capabilities.max_shared_memory_per_block_optin(),
+            SAFE_SHARED_MEMORY_PER_BLOCK_FALLBACK
+        );
+        assert_eq!(capabilities.multiprocessor_count(), 1);
+    }
+
+    #[test]
+    fn capability_limits_never_reduce_optin_below_default() {
+        let capabilities = CudaDeviceCapabilities::from_reported_limits(
+            (12, 0),
+            Some(1024),
+            Some(64 * 1024),
+            Some(48 * 1024),
+            Some(200),
+        );
+        assert_eq!(capabilities.max_shared_memory_per_block_optin(), 64 * 1024);
+        assert_eq!(capabilities.multiprocessor_count(), 200);
+    }
+
+    #[test]
+    fn reduction_launch_is_clamped_to_device_limits() {
+        assert_eq!(
+            reduction_launch_params(256, 1024, 4, 227 * 1024),
+            Some((256, 1024))
+        );
+        assert_eq!(
+            reduction_launch_params(256, 128, 4, 227 * 1024),
+            Some((128, 512))
+        );
+        assert_eq!(reduction_launch_params(256, 1024, 4, 768), Some((128, 512)));
+        assert_eq!(reduction_launch_params(256, 1024, 8, 0), None);
     }
 
     #[test]

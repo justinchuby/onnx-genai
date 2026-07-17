@@ -42,8 +42,8 @@
 use std::ffi::c_void;
 use std::sync::Arc;
 
+use cudarc::driver::PushKernelArg;
 use cudarc::driver::sys::CUdeviceptr;
-use cudarc::driver::{LaunchConfig, PushKernelArg};
 
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ir::{DataType, Node};
@@ -601,16 +601,14 @@ impl ReduceKernel {
         let func = self
             .runtime
             .nvrtc_function(REDUCE_MODULE, REDUCE_SRC, entry)?;
-        let cfg = LaunchConfig {
-            grid_dim: (grid, 1, 1),
-            block_dim: (REDUCE_BLOCK, 1, 1),
-            shared_mem_bytes: REDUCE_BLOCK
-                * if x.dtype == DataType::Int64 {
-                    std::mem::size_of::<i64>() as u32
-                } else {
-                    std::mem::size_of::<f32>() as u32
-                },
+        let bytes_per_thread = if x.dtype == DataType::Int64 {
+            std::mem::size_of::<i64>() as u32
+        } else {
+            std::mem::size_of::<f32>() as u32
         };
+        let cfg =
+            self.runtime
+                .reduction_launch_config(&func, grid, REDUCE_BLOCK, bytes_per_thread)?;
         let stream = self.runtime.stream();
         let mut builder = stream.launch_builder(&func);
         builder

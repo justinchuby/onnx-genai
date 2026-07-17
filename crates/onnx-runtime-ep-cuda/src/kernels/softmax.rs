@@ -30,7 +30,7 @@
 use std::ffi::c_void;
 use std::sync::Arc;
 
-use cudarc::driver::{LaunchConfig, PushKernelArg};
+use cudarc::driver::PushKernelArg;
 
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ir::{DataType, Node};
@@ -302,11 +302,12 @@ impl SoftmaxKernel {
         let func = self
             .runtime
             .nvrtc_function(SOFTMAX_MODULE, SOFTMAX_SRC, SOFTMAX_ENTRY)?;
-        let cfg = LaunchConfig {
-            grid_dim: (groups_u, 1, 1),
-            block_dim: (SOFTMAX_BLOCK, 1, 1),
-            shared_mem_bytes: SOFTMAX_BLOCK * std::mem::size_of::<f32>() as u32,
-        };
+        let cfg = self.runtime.reduction_launch_config(
+            &func,
+            groups_u,
+            SOFTMAX_BLOCK,
+            std::mem::size_of::<f32>() as u32,
+        )?;
         let stream = self.runtime.stream();
         let mut builder = stream.launch_builder(&func);
         builder

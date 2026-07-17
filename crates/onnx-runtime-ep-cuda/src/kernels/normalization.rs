@@ -34,8 +34,8 @@
 use std::ffi::c_void;
 use std::sync::Arc;
 
+use cudarc::driver::PushKernelArg;
 use cudarc::driver::sys::CUdeviceptr;
-use cudarc::driver::{LaunchConfig, PushKernelArg};
 
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ir::{DataType, Node};
@@ -446,7 +446,12 @@ impl LayerNormKernel {
         let func = self
             .runtime
             .nvrtc_function(LAYERNORM_MODULE, LAYERNORM_SRC, "layernorm_f32")?;
-        let cfg = launch_cfg(groups_u);
+        let cfg = self.runtime.reduction_launch_config(
+            &func,
+            groups_u,
+            NORM_BLOCK,
+            std::mem::size_of::<f32>() as u32,
+        )?;
         let stream = self.runtime.stream();
         let mut builder = stream.launch_builder(&func);
         builder
@@ -583,7 +588,12 @@ impl RmsNormKernel {
         let func = self
             .runtime
             .nvrtc_function(RMSNORM_MODULE, RMSNORM_SRC, "rmsnorm_f32")?;
-        let cfg = launch_cfg(groups_u);
+        let cfg = self.runtime.reduction_launch_config(
+            &func,
+            groups_u,
+            NORM_BLOCK,
+            std::mem::size_of::<f32>() as u32,
+        )?;
         let stream = self.runtime.stream();
         let mut builder = stream.launch_builder(&func);
         let groups_i = groups_u_i32(groups_u);
@@ -762,8 +772,13 @@ impl SkipSimplifiedLayerNormKernel {
                 .arg(&self.epsilon);
             // SAFETY: all pointers reference validated device buffers; metadata has
             // two rank-length u64 arrays describing the output shape and skip strides.
-            unsafe { builder.launch(launch_cfg(groups_u)) }
-                .map_err(|e| driver_err("launch skip_rmsnorm_f32", e))?;
+            let cfg = self.runtime.reduction_launch_config(
+                &func,
+                groups_u,
+                NORM_BLOCK,
+                std::mem::size_of::<f32>() as u32,
+            )?;
+            unsafe { builder.launch(cfg) }.map_err(|e| driver_err("launch skip_rmsnorm_f32", e))?;
             self.runtime.synchronize()
         })();
         // SAFETY: the launch is synchronized before freeing this per-invocation metadata.
@@ -914,7 +929,12 @@ impl SkipLayerNormKernel {
             SKIP_LAYERNORM_SRC,
             "skip_layernorm_f32",
         )?;
-        let cfg = launch_cfg(groups_u);
+        let cfg = self.runtime.reduction_launch_config(
+            &func,
+            groups_u,
+            NORM_BLOCK,
+            std::mem::size_of::<f32>() as u32,
+        )?;
         let stream = self.runtime.stream();
         let mut builder = stream.launch_builder(&func);
         let groups_i = groups_u_i32(groups_u);
@@ -955,14 +975,6 @@ impl Kernel for SkipLayerNormKernel {
 }
 
 // ───────────────────────────────── helpers ─────────────────────────────────
-
-fn launch_cfg(groups: u32) -> LaunchConfig {
-    LaunchConfig {
-        grid_dim: (groups, 1, 1),
-        block_dim: (NORM_BLOCK, 1, 1),
-        shared_mem_bytes: NORM_BLOCK * std::mem::size_of::<f32>() as u32,
-    }
-}
 
 /// The kernels take `num_groups` as a signed `int`; convert the validated `u32`.
 fn groups_u_i32(groups: u32) -> i32 {

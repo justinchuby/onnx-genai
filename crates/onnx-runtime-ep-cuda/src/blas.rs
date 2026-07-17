@@ -281,8 +281,9 @@ pub struct GemmEpilogue {
     pub bias: CUdeviceptr,
 }
 
-/// Default cuBLASLt workspace. 32 MiB is NVIDIA's recommendation for Hopper
-/// (SM90, our H100/H200 target); smaller GPUs simply use less of it.
+/// Default cuBLASLt workspace performance budget. This is device-global scratch,
+/// not per-block shared memory or an SM-specific hardware limit; cuBLASLt's
+/// architecture-aware heuristic selects an algorithm using at most these bytes.
 ///
 /// Phase 2b: pool this per-stream instead of allocating it per call.
 pub const WORKSPACE_BYTES: usize = 32 * 1024 * 1024;
