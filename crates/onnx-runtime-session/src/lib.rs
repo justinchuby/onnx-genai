@@ -31,7 +31,7 @@ pub use tensor::{DeviceBindingTransferStats, DeviceIoBinding, Tensor, cpu_alloca
 
 mod epcontext;
 mod executor;
-mod sequence;
+pub mod sequence;
 mod tensor;
 
 /// Operator-set version associated with an operator dispatch failure.

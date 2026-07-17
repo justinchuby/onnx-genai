@@ -296,7 +296,7 @@ pub(crate) struct Executor {
     /// copied out of the sequence. A downstream kernel reads it through a
     /// [`TensorView`] over the `Arc`'s bytes; it is materialized to owned bytes
     /// only at the graph-output/control-flow boundary. Cleared each run.
-    seq_elem_values: HashMap<ValueId, Arc<SeqTensor>>,
+    seq_elem_values: HashMap<ValueId, SeqTensor>,
 }
 
 /// Run-scoped metadata for a zero-copy view value: it owns no buffer but
@@ -1702,7 +1702,7 @@ impl Executor {
             if let Some(elem) = self.seq_elem_values.get(&vid) {
                 let shape = input_shapes[i].clone();
                 let strides = compute_contiguous_strides(&shape);
-                let root_len = elem.data.len();
+                let root_len = elem.as_bytes().len();
                 let base_ptr = elem.as_ptr() as *const std::ffi::c_void;
                 view_bounds(&shape, &strides, 0, input_dtypes[i], root_len)?;
                 in_infos.push(InInfo {
@@ -2341,16 +2341,17 @@ impl Executor {
             }
         };
 
-        let parts = split_axis(&bytes, &shape, axis, &sizes, esize);
-        let items: Vec<std::sync::Arc<SeqTensor>> = parts
+        let parts = split_axis(&bytes, &shape, axis, &sizes, esize)?;
+        let items: Vec<SeqTensor> = parts
             .into_iter()
             .map(|(mut sh, data)| {
                 if squeeze {
                     sh.remove(axis);
                 }
-                SeqTensor::shared(dtype, sh, data)
+                SeqTensor::from_raw(dtype, sh, &data)
             })
-            .collect();
+            .collect::<std::result::Result<_, _>>()
+            .map_err(SessionError::from)?;
         self.sequences.insert(
             outputs[0],
             SequenceValue {
@@ -2400,7 +2401,7 @@ impl Executor {
             });
         }
         let elem_shapes: Vec<Vec<usize>> = seq.items.iter().map(|t| t.shape.clone()).collect();
-        let elem_datas: Vec<&[u8]> = seq.items.iter().map(|t| t.data.as_slice()).collect();
+        let elem_datas: Vec<&[u8]> = seq.items.iter().map(|t| t.as_bytes()).collect();
         let rank = elem_shapes[0].len();
 
         let (oshape, out) = if new_axis {
@@ -2455,13 +2456,13 @@ impl Executor {
                     });
                 }
             }
-            concat_axis(&elem_datas, &elem_shapes, axis, esize)
+            concat_axis(&elem_datas, &elem_shapes, axis, esize)?
         };
         drop(seq);
         self.store_raw_tensor_output(outputs[0], dtype, oshape, &out, resolved)
     }
 
-    /// Build (or share) an `Arc<SeqTensor>` for a tensor value entering a
+    /// Build (or share) a `SeqTensor` for a tensor value entering a
     /// sequence. If the value is already a shared sequence element (a
     /// `SequenceAt` result), its `Arc` is **shared** with no copy; otherwise its
     /// contiguous bytes are moved into a fresh element once (the tensor→sequence
@@ -2470,9 +2471,9 @@ impl Executor {
         &self,
         vid: ValueId,
         resolved: &HashMap<ValueId, Vec<usize>>,
-    ) -> Result<std::sync::Arc<SeqTensor>> {
+    ) -> Result<SeqTensor> {
         if let Some(elem) = self.seq_elem_values.get(&vid) {
-            return Ok(std::sync::Arc::clone(elem)); // zero-copy share
+            return Ok(elem.clone()); // zero-copy Arc share
         }
         let dtype = self.value_dtypes[&vid];
         let shape = resolved
@@ -2480,7 +2481,7 @@ impl Executor {
             .cloned()
             .ok_or_else(|| self.seq_unresolved("Sequence", vid))?;
         let bytes = self.contiguous_bytes(vid, &shape, dtype)?;
-        Ok(SeqTensor::shared(dtype, shape, bytes))
+        SeqTensor::from_raw(dtype, shape, &bytes).map_err(SessionError::from)
     }
 
     /// Fetch (clone) the sequence value bound to `vid` (cheap — `Arc` handle
@@ -2547,7 +2548,7 @@ impl Executor {
     fn store_seq_element_output(
         &mut self,
         vid: ValueId,
-        elem: std::sync::Arc<SeqTensor>,
+        elem: SeqTensor,
         resolved: &mut HashMap<ValueId, Vec<usize>>,
     ) -> Result<()> {
         if !self.ep.device_id().is_host_accessible() {
@@ -2555,7 +2556,7 @@ impl Executor {
                 vid,
                 elem.dtype,
                 elem.shape.clone(),
-                &elem.data,
+                elem.as_bytes(),
                 resolved,
             );
         }
@@ -2642,12 +2643,9 @@ impl Executor {
     }
 }
 
-/// Map a [`crate::sequence::SeqOpError`] into an actionable `SessionError`.
-fn seq_err(e: crate::sequence::SeqOpError) -> SessionError {
-    SessionError::SequenceOp {
-        op: e.op.to_string(),
-        reason: e.reason,
-    }
+/// Map a [`crate::sequence::SequenceError`] into an actionable `SessionError`.
+fn seq_err(e: crate::sequence::SequenceError) -> SessionError {
+    e.into()
 }
 
 /// Normalize a possibly-negative ONNX `axis` against `rank`, returning the
@@ -3038,7 +3036,8 @@ impl Executor {
         // the one materialization point where they are copied out (the boundary
         // back into owned tensors); the compute path reads them zero-copy.
         if let Some(elem) = self.seq_elem_values.get(&vid) {
-            return Ok(elem.data[..n.min(elem.data.len())].to_vec());
+            let bytes = elem.as_bytes();
+            return Ok(bytes[..n.min(bytes.len())].to_vec());
         }
         if let Some(view) = self.views.get(&vid) {
             let buf = self.buffers.get(&view.source).ok_or_else(|| {

@@ -1,608 +1,1227 @@
-//! Runtime **sequence-of-tensors** value type and the ONNX `Sequence*` op
-//! semantics, implemented **copy-free** and **race-free**.
+//! ONNX sequence values and byte-oriented Split/Concat helpers.
 //!
-//! ## Why this exists
-//!
-//! ONNX models can carry a `Sequence` value: an ordered, homogeneously-typed
-//! list of tensors (`docs/ORT2.md` §3.2, `TypeProto::Sequence`). The stock
-//! ONNX Runtime implementation of the sequence ops is *costly*: `SequenceInsert`
-//! / `SequenceErase` rebuild the vector **and** deep-copy element tensor data,
-//! and `SequenceAt` copies the selected element out. For a long sequence that is
-//! O(total bytes) of memcpy per mutation.
-//!
-//! ## The no-copy invariant
-//!
-//! A sequence op here is **value-semantic over shared, immutable elements**:
-//!
-//! * Each element is an [`Arc`]-shared [`SeqTensor`]. A [`SeqTensor`] is
-//!   **immutable once constructed** — no method ever mutates its bytes.
-//! * A mutating op ([`SequenceValue::insert`], [`SequenceValue::erase`], …)
-//!   returns a **new** [`SequenceValue`] whose `items` vector **shares the same
-//!   element `Arc`s** as the input (a persistent-data-structure style update).
-//!   Only `Arc` handles (pointers + a refcount bump) are cloned — **never the
-//!   element bytes**.
-//! * [`SequenceValue::at`] returns a *clone of the element `Arc`* — a shared
-//!   handle to the exact same allocation that was inserted. No deep copy. The
-//!   unit test `at_returns_shared_handle_no_copy` proves this with
-//!   [`Arc::ptr_eq`] and a data-pointer equality assertion.
-//!
-//! ## The no-race guarantee
-//!
-//! Because a [`SeqTensor`] is immutable after construction and is only ever
-//! *shared read-only* through [`Arc`], concurrent readers of the same element
-//! (or the same [`SequenceValue`], which is [`Clone`] by `Arc`-sharing) observe
-//! a stable, never-mutated view. There is **no interior mutability** anywhere in
-//! this module, so no data race is possible: the only cross-thread interaction
-//! is `Arc`'s atomic refcount, which is itself race-free. `SeqTensor: Send +
-//! Sync` and therefore `SequenceValue: Send + Sync` (verified by
-//! `sequence_value_is_send_sync`).
+//! Sequence elements reuse the session crate's [`Tensor`] representation. A
+//! [`SeqTensor`] is an immutable `Arc<Tensor>` handle, so constructing, inserting,
+//! erasing, and indexing a sequence only clone `Arc` handles; tensor storage is
+//! never deep-copied by those operations.
 
+use std::ops::Deref;
 use std::sync::Arc;
 
 use onnx_runtime_ir::DataType;
 
-use crate::error::{Result, SessionError};
+use crate::{SessionError, Tensor};
 
-/// One immutable, `Arc`-shared tensor element of a runtime [`SequenceValue`].
-///
-/// Elements are stored as contiguous row-major little-endian bytes plus their
-/// dtype and shape. **A `SeqTensor` is never mutated after construction** — this
-/// is the invariant that makes sharing it across sequences and threads sound
-/// (see the module docs). Always hold it behind an [`Arc`] (see
-/// [`SeqTensor::shared`]) so a sequence op shares the handle instead of copying
-/// the bytes.
-#[derive(Debug)]
-pub(crate) struct SeqTensor {
-    pub dtype: DataType,
-    pub shape: Vec<usize>,
-    /// Contiguous row-major little-endian element bytes. Immutable.
-    pub data: Vec<u8>,
+/// Result type for sequence value and byte-helper operations.
+pub type SequenceResult<T> = std::result::Result<T, SequenceError>;
+
+/// A typed failure from an ONNX sequence operation.
+#[derive(Debug, thiserror::Error)]
+pub enum SequenceError {
+    #[error(
+        "SequenceConstruct requires at least one tensor; use SequenceValue::empty(dtype) for an empty sequence"
+    )]
+    EmptyConstruct,
+
+    #[error(
+        "{op} element{index_suffix} dtype {actual:?} does not match expected {expected:?}; ONNX sequences are homogeneous. To fix: Cast the tensor to {expected:?}",
+        index_suffix = index.map(|i| format!(" {i}")).unwrap_or_default()
+    )]
+    DtypeMismatch {
+        op: &'static str,
+        index: Option<usize>,
+        expected: DataType,
+        actual: DataType,
+    },
+
+    #[error(
+        "{op} index {index} is out of bounds for a sequence of length {len} (valid range {range})",
+        range = if *insertion {
+            format!("[{}, {}]", -(*len as i128), *len)
+        } else {
+            format!("[{}, {}]", -(*len as i128), *len as i128 - 1)
+        }
+    )]
+    IndexOutOfBounds {
+        op: &'static str,
+        index: i64,
+        len: usize,
+        insertion: bool,
+    },
+
+    #[error("SequenceErase cannot erase from an empty sequence")]
+    EmptyErase,
+
+    #[error("{op} cannot represent sequence length {len} as an ONNX index")]
+    LengthOverflow { op: &'static str, len: usize },
+
+    #[error(
+        "{op} axis {axis} is invalid for rank {rank}{new_axis_suffix}",
+        new_axis_suffix = if *new_axis { " with new_axis=1" } else { "" }
+    )]
+    InvalidAxis {
+        op: &'static str,
+        axis: i64,
+        rank: usize,
+        new_axis: bool,
+    },
+
+    #[error("{op} has invalid split specification: {reason}")]
+    InvalidSplit { op: &'static str, reason: String },
+
+    #[error(
+        "{op} element {index} has shape {actual:?}, incompatible with {expected:?}: {requirement}"
+    )]
+    ShapeMismatch {
+        op: &'static str,
+        index: usize,
+        expected: Vec<usize>,
+        actual: Vec<usize>,
+        requirement: &'static str,
+    },
+
+    #[error("{op} does not support byte operations for sub-byte dtype {dtype:?}")]
+    UnsupportedDtype { op: &'static str, dtype: DataType },
+
+    #[error("{op} requires host-accessible sequence tensors, but element {index} is on {device}")]
+    NonHostTensor {
+        op: &'static str,
+        index: usize,
+        device: String,
+    },
+
+    #[error(
+        "{op} received {actual} bytes for shape {shape:?} dtype {dtype:?}, expected {expected}"
+    )]
+    ByteLengthMismatch {
+        op: &'static str,
+        dtype: DataType,
+        shape: Vec<usize>,
+        expected: usize,
+        actual: usize,
+    },
+
+    #[error("{op} shape/offset overflow while computing {context} for shape {shape:?}")]
+    ShapeOverflow {
+        op: &'static str,
+        context: &'static str,
+        shape: Vec<usize>,
+    },
+
+    #[error("{op} cannot allocate {bytes} bytes for {context}")]
+    Allocation {
+        op: &'static str,
+        context: &'static str,
+        bytes: usize,
+    },
+
+    #[error("{op} could not create a tensor: {source}")]
+    TensorCreation {
+        op: &'static str,
+        #[source]
+        source: SessionError,
+    },
 }
 
-impl SeqTensor {
-    /// Wrap an owned tensor's bytes in a shared, immutable element handle. The
-    /// bytes are moved in (no copy); every later sequence op shares this `Arc`.
-    pub(crate) fn shared(dtype: DataType, shape: Vec<usize>, data: Vec<u8>) -> Arc<Self> {
-        Arc::new(Self { dtype, shape, data })
-    }
-
-    /// Base address of the element bytes — used by the executor to hand a
-    /// zero-copy [`TensorView`](onnx_runtime_ep_api::TensorView) over this
-    /// element to a downstream kernel, and by tests to prove no deep copy
-    /// occurred (the pointer is stable across every sequence op).
-    pub(crate) fn as_ptr(&self) -> *const u8 {
-        self.data.as_ptr()
-    }
-}
-
-/// An ordered, immutable-element runtime **sequence** value.
-///
-/// Cloning is cheap: it clones the `items` vector, i.e. bumps each element's
-/// `Arc` refcount — **no element bytes are copied**. Every mutating op returns a
-/// fresh `SequenceValue` that shares surviving elements with the input.
-#[derive(Clone, Debug)]
-pub(crate) struct SequenceValue {
-    /// The tensor element type every item shares (ONNX requires homogeneity).
-    pub elem_dtype: DataType,
-    /// Ordered elements, each an `Arc`-shared immutable tensor.
-    pub items: Vec<Arc<SeqTensor>>,
-}
-
-/// A sequence-op failure carrying the actionable what/why/how (see `RULES.md`
-/// §1). The executor maps this into `SessionError::SequenceOp`.
-#[derive(Debug)]
-pub(crate) struct SeqOpError {
-    pub op: &'static str,
-    pub reason: String,
-}
-
-impl SeqOpError {
-    fn new(op: &'static str, reason: impl Into<String>) -> Self {
-        Self {
-            op,
-            reason: reason.into(),
+impl SequenceError {
+    pub(crate) fn op(&self) -> &'static str {
+        match self {
+            Self::EmptyConstruct => "SequenceConstruct",
+            Self::DtypeMismatch { op, .. }
+            | Self::IndexOutOfBounds { op, .. }
+            | Self::LengthOverflow { op, .. }
+            | Self::InvalidAxis { op, .. }
+            | Self::InvalidSplit { op, .. }
+            | Self::ShapeMismatch { op, .. }
+            | Self::UnsupportedDtype { op, .. }
+            | Self::NonHostTensor { op, .. }
+            | Self::ByteLengthMismatch { op, .. }
+            | Self::ShapeOverflow { op, .. }
+            | Self::Allocation { op, .. }
+            | Self::TensorCreation { op, .. } => op,
+            Self::EmptyErase => "SequenceErase",
         }
     }
 }
 
-type SeqResult<T> = std::result::Result<T, SeqOpError>;
-
-/// Resolve a possibly-negative ONNX access index against a sequence of length
-/// `len`, returning the non-negative position or an out-of-bounds error whose
-/// message states the valid range and the offending value.
-fn resolve_index(op: &'static str, pos: i64, len: usize) -> SeqResult<usize> {
-    let n = len as i64;
-    let idx = if pos < 0 { n + pos } else { pos };
-    if idx < 0 || idx >= n {
-        return Err(SeqOpError::new(
+impl From<SequenceError> for SessionError {
+    fn from(error: SequenceError) -> Self {
+        if let SequenceError::ShapeOverflow { context, shape, .. } = error {
+            return SessionError::ShapeOverflow {
+                value: context.to_string(),
+                dims: shape,
+            };
+        }
+        let op = error.op().to_string();
+        SessionError::SequenceOp {
             op,
-            format!(
-                "position {pos} is out of bounds for a sequence of length {len} \
-                 (valid range is [{}, {}]; negative values count from the end). \
-                 To fix: pass an index within range, or check the producer that \
-                 computed this position",
-                -n,
-                n - 1
-            ),
-        ));
+            reason: error.to_string(),
+        }
     }
-    Ok(idx as usize)
+}
+
+/// An immutable tensor handle used as one sequence element.
+///
+/// Cloning this type only bumps the `Arc` count. The contained [`Tensor`] and
+/// its device allocation are shared without copying.
+#[derive(Clone, Debug)]
+pub struct SeqTensor {
+    tensor: Arc<Tensor>,
+}
+
+impl SeqTensor {
+    /// Wrap an existing session tensor in an immutable shared handle.
+    pub fn new(tensor: Tensor) -> Self {
+        Self {
+            tensor: Arc::new(tensor),
+        }
+    }
+
+    /// Build a host tensor from raw element bytes and share it as a sequence item.
+    pub fn from_raw(dtype: DataType, shape: Vec<usize>, bytes: &[u8]) -> SequenceResult<Self> {
+        validate_tensor_bytes("SequenceTensor", bytes, dtype, &shape)?;
+        Tensor::from_raw(dtype, shape, bytes)
+            .map(Self::new)
+            .map_err(|source| SequenceError::TensorCreation {
+                op: "SequenceTensor",
+                source,
+            })
+    }
+
+    /// The shared session tensor. Use this with [`Arc::ptr_eq`] to verify sharing.
+    pub fn shared_tensor(&self) -> &Arc<Tensor> {
+        &self.tensor
+    }
+
+    /// Base address of the shared tensor allocation.
+    pub fn as_ptr(&self) -> *const std::ffi::c_void {
+        self.tensor.device_ptr()
+    }
+}
+
+impl Deref for SeqTensor {
+    type Target = Tensor;
+
+    fn deref(&self) -> &Self::Target {
+        &self.tensor
+    }
+}
+
+/// An ordered homogeneous list of immutable, shared tensors.
+#[derive(Clone, Debug)]
+pub struct SequenceValue {
+    pub(crate) elem_dtype: DataType,
+    pub(crate) items: Vec<SeqTensor>,
 }
 
 impl SequenceValue {
-    /// `SequenceEmpty`: an empty sequence with declared element dtype.
-    pub(crate) fn empty(elem_dtype: DataType) -> Self {
+    /// Construct an empty sequence with its declared tensor element dtype.
+    pub fn empty(elem_dtype: DataType) -> Self {
         Self {
             elem_dtype,
             items: Vec::new(),
         }
     }
 
-    /// `SequenceConstruct`: a sequence from N (≥1) element handles, which are
-    /// **shared** (the `Arc`s are moved in, no bytes copied). Every element must
-    /// share the sequence's dtype.
-    pub(crate) fn construct(items: Vec<Arc<SeqTensor>>) -> SeqResult<Self> {
+    /// Construct a sequence without copying any element tensor storage.
+    pub fn construct(items: Vec<SeqTensor>) -> SequenceResult<Self> {
         let elem_dtype = items
             .first()
-            .map(|t| t.dtype)
-            .ok_or_else(|| {
-                SeqOpError::new(
-                    "SequenceConstruct",
-                    "requires at least one input tensor, but none were supplied. \
-                     To fix: pass ≥1 tensor, or use SequenceEmpty for an empty sequence",
-                )
-            })?;
-        for (i, t) in items.iter().enumerate() {
-            if t.dtype != elem_dtype {
-                return Err(SeqOpError::new(
-                    "SequenceConstruct",
-                    format!(
-                        "element {i} has dtype {:?} but the sequence element type is {:?} \
-                         (a sequence is homogeneous). To fix: Cast the mismatched input",
-                        t.dtype, elem_dtype
-                    ),
-                ));
+            .map(|tensor| tensor.dtype)
+            .ok_or(SequenceError::EmptyConstruct)?;
+        for (index, tensor) in items.iter().enumerate() {
+            if tensor.dtype != elem_dtype {
+                return Err(SequenceError::DtypeMismatch {
+                    op: "SequenceConstruct",
+                    index: Some(index),
+                    expected: elem_dtype,
+                    actual: tensor.dtype,
+                });
             }
         }
         Ok(Self { elem_dtype, items })
     }
 
-    /// Number of elements (`SequenceLength`).
-    pub(crate) fn len(&self) -> usize {
+    /// Return a new sequence with `value` inserted at `at`.
+    ///
+    /// `None` appends. Negative positions count from the end, and `len` is also
+    /// accepted as an explicit append position.
+    pub fn insert(&self, value: SeqTensor, at: Option<i64>) -> SequenceResult<Self> {
+        if value.dtype != self.elem_dtype {
+            return Err(SequenceError::DtypeMismatch {
+                op: "SequenceInsert",
+                index: None,
+                expected: self.elem_dtype,
+                actual: value.dtype,
+            });
+        }
+        let index = match at {
+            None => self.items.len(),
+            Some(index) => resolve_index("SequenceInsert", index, self.items.len(), true)?,
+        };
+        let capacity = self
+            .items
+            .len()
+            .checked_add(1)
+            .ok_or(SequenceError::LengthOverflow {
+                op: "SequenceInsert",
+                len: self.items.len(),
+            })?;
+        let mut items = Vec::new();
+        items
+            .try_reserve_exact(capacity)
+            .map_err(|_| SequenceError::Allocation {
+                op: "SequenceInsert",
+                context: "sequence handles",
+                bytes: capacity.saturating_mul(std::mem::size_of::<SeqTensor>()),
+            })?;
+        items.extend_from_slice(&self.items[..index]);
+        items.push(value);
+        items.extend_from_slice(&self.items[index..]);
+        Ok(Self {
+            elem_dtype: self.elem_dtype,
+            items,
+        })
+    }
+
+    /// Return a new sequence with the selected element erased.
+    ///
+    /// `None` erases the last element. Negative indices count from the end.
+    pub fn erase(&self, at: Option<i64>) -> SequenceResult<Self> {
+        if self.items.is_empty() {
+            return Err(SequenceError::EmptyErase);
+        }
+        let index = match at {
+            None => self.items.len() - 1,
+            Some(index) => resolve_index("SequenceErase", index, self.items.len(), false)?,
+        };
+        let capacity = self.items.len() - 1;
+        let mut items = Vec::new();
+        items
+            .try_reserve_exact(capacity)
+            .map_err(|_| SequenceError::Allocation {
+                op: "SequenceErase",
+                context: "sequence handles",
+                bytes: capacity.saturating_mul(std::mem::size_of::<SeqTensor>()),
+            })?;
+        items.extend_from_slice(&self.items[..index]);
+        items.extend_from_slice(&self.items[index + 1..]);
+        Ok(Self {
+            elem_dtype: self.elem_dtype,
+            items,
+        })
+    }
+
+    /// Return the selected shared tensor handle. Negative indices count from the end.
+    pub fn at(&self, index: i64) -> SequenceResult<SeqTensor> {
+        let index = resolve_index("SequenceAt", index, self.items.len(), false)?;
+        Ok(self.items[index].clone())
+    }
+
+    /// Number of elements, matching ONNX `SequenceLength`.
+    pub fn length(&self) -> usize {
         self.items.len()
     }
 
-    /// `SequenceInsert`: a **new** sequence with `tensor` inserted at `position`
-    /// (default = append). The returned sequence **shares** every existing
-    /// element `Arc` plus the new one — no element bytes are copied.
-    pub(crate) fn insert(
-        &self,
-        tensor: Arc<SeqTensor>,
-        position: Option<i64>,
-    ) -> SeqResult<SequenceValue> {
-        if tensor.dtype != self.elem_dtype {
-            return Err(SeqOpError::new(
-                "SequenceInsert",
-                format!(
-                    "tensor dtype {:?} does not match the sequence element type {:?} \
-                     (a sequence is homogeneous). To fix: Cast the tensor to {:?}",
-                    tensor.dtype, self.elem_dtype, self.elem_dtype
-                ),
-            ));
-        }
-        let len = self.len();
-        // Insertion admits one more slot than access: the back (index == len).
-        let idx = match position {
-            None => len,
-            Some(p) => {
-                let n = len as i64;
-                let i = if p < 0 { n + p } else { p };
-                if i < 0 || i > n {
-                    return Err(SeqOpError::new(
-                        "SequenceInsert",
-                        format!(
-                            "position {p} is out of bounds for inserting into a sequence \
-                             of length {len} (valid range is [{}, {}]; negative values \
-                             count from the end). To fix: pass an in-range index or omit \
-                             it to append",
-                            -n, n
-                        ),
-                    ));
-                }
-                i as usize
-            }
-        };
-        let mut items = self.items.clone(); // Arc clones only — no bytes copied.
-        items.insert(idx, tensor);
-        Ok(SequenceValue {
-            elem_dtype: self.elem_dtype,
-            items,
-        })
+    pub(crate) fn len(&self) -> usize {
+        self.length()
     }
 
-    /// `SequenceErase`: a **new** sequence with the element at `position`
-    /// (default = last) removed. The returned sequence **shares** every
-    /// surviving element `Arc` — no bytes copied.
-    pub(crate) fn erase(&self, position: Option<i64>) -> SeqResult<SequenceValue> {
-        if self.is_empty() {
-            return Err(SeqOpError::new(
-                "SequenceErase",
-                "cannot erase from an empty sequence. To fix: guard with \
-                 SequenceLength before erasing",
-            ));
-        }
-        let idx = match position {
-            None => self.len() - 1,
-            Some(p) => resolve_index("SequenceErase", p, self.len())?,
-        };
-        let mut items = self.items.clone(); // Arc clones only — no bytes copied.
-        items.remove(idx);
-        Ok(SequenceValue {
-            elem_dtype: self.elem_dtype,
-            items,
-        })
+    /// Declared homogeneous element dtype.
+    pub fn elem_dtype(&self) -> DataType {
+        self.elem_dtype
     }
 
-    /// `SequenceAt`: a **shared handle** to the element at `position` (negative
-    /// allowed). Returns a clone of the element `Arc` — the exact same
-    /// allocation that was inserted, with **no deep copy**.
-    pub(crate) fn at(&self, position: i64) -> SeqResult<Arc<SeqTensor>> {
-        let idx = resolve_index("SequenceAt", position, self.len())?;
-        Ok(Arc::clone(&self.items[idx]))
+    /// Ordered shared tensor handles.
+    pub fn elements(&self) -> &[SeqTensor] {
+        &self.items
     }
 
-    /// Whether the sequence has no elements.
     pub(crate) fn is_empty(&self) -> bool {
         self.items.is_empty()
     }
 }
 
-/// Split a contiguous row-major tensor's bytes into `chunks` sub-tensors along
-/// `axis`, one output byte buffer per chunk. `sizes` gives each chunk's extent
-/// along `axis` (they sum to `shape[axis]`). Element bytes are **copied once**
-/// into each freshly-allocated output (a single-alloc slice — the memory the
-/// element owns as a shared sequence item). Returns `(out_shape, out_bytes)`
-/// per chunk. Callers exclude sub-byte dtypes (esize ≥ 1).
+/// ONNX `SplitToSequence` split-input interpretation.
+#[derive(Clone, Copy, Debug)]
+pub enum SplitSpec<'a> {
+    /// No split input: emit one slice per index along the selected axis.
+    Each,
+    /// Scalar split input: repeatedly take chunks of this size.
+    Chunk(i64),
+    /// Rank-1 split input: explicit extents that must sum to the axis extent.
+    Sizes(&'a [i64]),
+}
+
+/// Split raw contiguous tensor bytes into a sequence of session tensors.
+///
+/// `keepdims` only affects [`SplitSpec::Each`], as required by ONNX; an explicit
+/// split input always retains the split axis.
+pub fn split(
+    data: &[u8],
+    dtype: DataType,
+    shape: &[usize],
+    axis: i64,
+    split: SplitSpec<'_>,
+    keepdims: bool,
+) -> SequenceResult<SequenceValue> {
+    const OP: &str = "SplitToSequence";
+    let rank = shape.len();
+    if rank == 0 {
+        return Err(SequenceError::InvalidAxis {
+            op: OP,
+            axis,
+            rank,
+            new_axis: false,
+        });
+    }
+    let axis = normalize_axis(OP, axis, rank, false)?;
+    validate_tensor_bytes(OP, data, dtype, shape)?;
+    let axis_dim = shape[axis];
+
+    let (sizes, squeeze) = match split {
+        SplitSpec::Each => {
+            let mut sizes = Vec::new();
+            sizes
+                .try_reserve_exact(axis_dim)
+                .map_err(|_| SequenceError::Allocation {
+                    op: OP,
+                    context: "split sizes",
+                    bytes: axis_dim.saturating_mul(std::mem::size_of::<usize>()),
+                })?;
+            sizes.resize(axis_dim, 1);
+            (sizes, !keepdims)
+        }
+        SplitSpec::Chunk(chunk) => {
+            if chunk <= 0 {
+                return Err(SequenceError::InvalidSplit {
+                    op: OP,
+                    reason: format!("scalar chunk size {chunk} must be positive"),
+                });
+            }
+            let chunk = usize::try_from(chunk).map_err(|_| SequenceError::InvalidSplit {
+                op: OP,
+                reason: format!("scalar chunk size {chunk} cannot be represented"),
+            })?;
+            let count = axis_dim
+                .checked_add(chunk - 1)
+                .ok_or_else(|| overflow(OP, "split chunk count", shape))?
+                / chunk;
+            let mut sizes = Vec::new();
+            sizes
+                .try_reserve_exact(count)
+                .map_err(|_| SequenceError::Allocation {
+                    op: OP,
+                    context: "split sizes",
+                    bytes: count.saturating_mul(std::mem::size_of::<usize>()),
+                })?;
+            let mut remaining = axis_dim;
+            while remaining != 0 {
+                let size = remaining.min(chunk);
+                sizes.push(size);
+                remaining -= size;
+            }
+            (sizes, false)
+        }
+        SplitSpec::Sizes(values) => {
+            let mut sizes = Vec::new();
+            sizes
+                .try_reserve_exact(values.len())
+                .map_err(|_| SequenceError::Allocation {
+                    op: OP,
+                    context: "split sizes",
+                    bytes: values.len().saturating_mul(std::mem::size_of::<usize>()),
+                })?;
+            let mut sum = 0usize;
+            for &value in values {
+                let value = usize::try_from(value).map_err(|_| SequenceError::InvalidSplit {
+                    op: OP,
+                    reason: format!("size {value} must be non-negative"),
+                })?;
+                sum = sum
+                    .checked_add(value)
+                    .ok_or_else(|| overflow(OP, "split size sum", shape))?;
+                sizes.push(value);
+            }
+            if sum != axis_dim {
+                return Err(SequenceError::InvalidSplit {
+                    op: OP,
+                    reason: format!("sizes sum to {sum}, but axis {axis} has extent {axis_dim}"),
+                });
+            }
+            (sizes, false)
+        }
+    };
+
+    let parts = split_axis(data, shape, axis, &sizes, dtype.byte_size())?;
+    let mut items = Vec::new();
+    items
+        .try_reserve_exact(parts.len())
+        .map_err(|_| SequenceError::Allocation {
+            op: OP,
+            context: "sequence handles",
+            bytes: parts.len().saturating_mul(std::mem::size_of::<SeqTensor>()),
+        })?;
+    for (mut part_shape, bytes) in parts {
+        if squeeze {
+            part_shape.remove(axis);
+        }
+        let tensor = Tensor::from_raw(dtype, part_shape, &bytes)
+            .map_err(|source| SequenceError::TensorCreation { op: OP, source })?;
+        items.push(SeqTensor::new(tensor));
+    }
+    Ok(SequenceValue {
+        elem_dtype: dtype,
+        items,
+    })
+}
+
+/// Concatenate a sequence along an existing axis or stack it on a new axis.
+pub fn concat(sequence: &SequenceValue, axis: i64, new_axis: bool) -> SequenceResult<SeqTensor> {
+    const OP: &str = "ConcatFromSequence";
+    let first = sequence.items.first().ok_or(SequenceError::InvalidSplit {
+        op: OP,
+        reason: "cannot concatenate an empty sequence".to_string(),
+    })?;
+    let dtype = sequence.elem_dtype;
+    let esize = dtype.byte_size();
+    if esize == 0 {
+        return Err(SequenceError::UnsupportedDtype { op: OP, dtype });
+    }
+    let rank = first.shape.len();
+    let axis = normalize_axis(OP, axis, rank + usize::from(new_axis), new_axis)?;
+
+    let mut shapes = Vec::new();
+    let mut elements = Vec::new();
+    shapes
+        .try_reserve_exact(sequence.items.len())
+        .map_err(|_| SequenceError::Allocation {
+            op: OP,
+            context: "element shapes",
+            bytes: sequence
+                .items
+                .len()
+                .saturating_mul(std::mem::size_of::<Vec<usize>>()),
+        })?;
+    elements
+        .try_reserve_exact(sequence.items.len())
+        .map_err(|_| SequenceError::Allocation {
+            op: OP,
+            context: "element byte slices",
+            bytes: sequence
+                .items
+                .len()
+                .saturating_mul(std::mem::size_of::<&[u8]>()),
+        })?;
+    for (index, item) in sequence.items.iter().enumerate() {
+        if !item.device().is_host_accessible() {
+            return Err(SequenceError::NonHostTensor {
+                op: OP,
+                index,
+                device: format!("{:?}", item.device()),
+            });
+        }
+        validate_tensor_bytes(OP, item.as_bytes(), item.dtype, &item.shape)?;
+        shapes.push(clone_shape(OP, &item.shape)?);
+        elements.push(item.as_bytes());
+    }
+
+    let (shape, bytes) = if new_axis {
+        for (index, shape) in shapes.iter().enumerate().skip(1) {
+            if shape != &shapes[0] {
+                return Err(SequenceError::ShapeMismatch {
+                    op: OP,
+                    index,
+                    expected: clone_shape(OP, &shapes[0])?,
+                    actual: clone_shape(OP, shape)?,
+                    requirement: "new_axis=1 requires identical shapes",
+                });
+            }
+        }
+        stack_new_axis(&elements, &shapes[0], axis, esize)?
+    } else {
+        for (index, shape) in shapes.iter().enumerate().skip(1) {
+            let mismatch = shape.len() != rank
+                || shape.iter().enumerate().any(|(dimension, &extent)| {
+                    dimension != axis && extent != shapes[0][dimension]
+                });
+            if mismatch {
+                return Err(SequenceError::ShapeMismatch {
+                    op: OP,
+                    index,
+                    expected: clone_shape(OP, &shapes[0])?,
+                    actual: clone_shape(OP, shape)?,
+                    requirement: "all dimensions except the concat axis must match",
+                });
+            }
+        }
+        concat_axis(&elements, &shapes, axis, esize)?
+    };
+    let tensor = Tensor::from_raw(dtype, shape, &bytes)
+        .map_err(|source| SequenceError::TensorCreation { op: OP, source })?;
+    Ok(SeqTensor::new(tensor))
+}
+
+fn resolve_index(
+    op: &'static str,
+    index: i64,
+    len: usize,
+    insertion: bool,
+) -> SequenceResult<usize> {
+    let length = i64::try_from(len).map_err(|_| SequenceError::LengthOverflow { op, len })?;
+    let resolved = if index < 0 {
+        length.checked_add(index)
+    } else {
+        Some(index)
+    };
+    let valid = resolved.is_some_and(|value| {
+        value >= 0
+            && if insertion {
+                value <= length
+            } else {
+                value < length
+            }
+    });
+    if !valid {
+        return Err(SequenceError::IndexOutOfBounds {
+            op,
+            index,
+            len,
+            insertion,
+        });
+    }
+    usize::try_from(resolved.unwrap_or_default())
+        .map_err(|_| SequenceError::LengthOverflow { op, len })
+}
+
+fn normalize_axis(
+    op: &'static str,
+    axis: i64,
+    rank: usize,
+    new_axis: bool,
+) -> SequenceResult<usize> {
+    let rank_i64 =
+        i64::try_from(rank).map_err(|_| SequenceError::LengthOverflow { op, len: rank })?;
+    let normalized = if axis < 0 {
+        rank_i64.checked_add(axis)
+    } else {
+        Some(axis)
+    };
+    match normalized {
+        Some(axis) if axis >= 0 && axis < rank_i64 => Ok(axis as usize),
+        _ => Err(SequenceError::InvalidAxis {
+            op,
+            axis,
+            rank: rank - usize::from(new_axis),
+            new_axis,
+        }),
+    }
+}
+
+fn overflow(op: &'static str, context: &'static str, shape: &[usize]) -> SequenceError {
+    SequenceError::ShapeOverflow {
+        op,
+        context,
+        shape: shape.to_vec(),
+    }
+}
+
+/// Multiply dimensions while still detecting overflow hidden by a zero extent.
+fn checked_product(
+    op: &'static str,
+    context: &'static str,
+    shape: &[usize],
+) -> SequenceResult<usize> {
+    let mut product = 1usize;
+    let mut has_zero = false;
+    for &dimension in shape {
+        if dimension == 0 {
+            has_zero = true;
+        } else {
+            product = product
+                .checked_mul(dimension)
+                .ok_or_else(|| overflow(op, context, shape))?;
+        }
+    }
+    Ok(if has_zero { 0 } else { product })
+}
+
+fn checked_mul(
+    op: &'static str,
+    context: &'static str,
+    lhs: usize,
+    rhs: usize,
+    shape: &[usize],
+) -> SequenceResult<usize> {
+    lhs.checked_mul(rhs)
+        .ok_or_else(|| overflow(op, context, shape))
+}
+
+fn checked_add(
+    op: &'static str,
+    context: &'static str,
+    lhs: usize,
+    rhs: usize,
+    shape: &[usize],
+) -> SequenceResult<usize> {
+    lhs.checked_add(rhs)
+        .ok_or_else(|| overflow(op, context, shape))
+}
+
+fn addressable(
+    op: &'static str,
+    context: &'static str,
+    bytes: usize,
+    shape: &[usize],
+) -> SequenceResult<usize> {
+    if bytes > isize::MAX as usize {
+        return Err(overflow(op, context, shape));
+    }
+    Ok(bytes)
+}
+
+fn zeroed_bytes(
+    op: &'static str,
+    context: &'static str,
+    bytes: usize,
+    shape: &[usize],
+) -> SequenceResult<Vec<u8>> {
+    addressable(op, context, bytes, shape)?;
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(bytes)
+        .map_err(|_| SequenceError::Allocation { op, context, bytes })?;
+    output.resize(bytes, 0);
+    Ok(output)
+}
+
+fn clone_shape(op: &'static str, shape: &[usize]) -> SequenceResult<Vec<usize>> {
+    let bytes = shape
+        .len()
+        .checked_mul(std::mem::size_of::<usize>())
+        .ok_or_else(|| overflow(op, "shape allocation", shape))?;
+    let mut cloned = Vec::new();
+    cloned
+        .try_reserve_exact(shape.len())
+        .map_err(|_| SequenceError::Allocation {
+            op,
+            context: "shape",
+            bytes,
+        })?;
+    cloned.extend_from_slice(shape);
+    Ok(cloned)
+}
+
+fn validate_tensor_bytes(
+    op: &'static str,
+    data: &[u8],
+    dtype: DataType,
+    shape: &[usize],
+) -> SequenceResult<()> {
+    if dtype.byte_size() == 0 {
+        return Err(SequenceError::UnsupportedDtype { op, dtype });
+    }
+    let numel = checked_product(op, "tensor element count", shape)?;
+    let expected = dtype
+        .checked_storage_bytes(numel)
+        .ok_or_else(|| overflow(op, "tensor byte count", shape))?;
+    addressable(op, "tensor byte count", expected, shape)?;
+    if data.len() != expected {
+        return Err(SequenceError::ByteLengthMismatch {
+            op,
+            dtype,
+            shape: clone_shape(op, shape)?,
+            expected,
+            actual: data.len(),
+        });
+    }
+    Ok(())
+}
+
+/// Split already-validated contiguous bytes along one normalized axis.
 pub(crate) fn split_axis(
     data: &[u8],
     shape: &[usize],
     axis: usize,
     sizes: &[usize],
     esize: usize,
-) -> Vec<(Vec<usize>, Vec<u8>)> {
-    let outer: usize = shape[..axis].iter().product();
-    let inner: usize = shape[axis + 1..].iter().product::<usize>() * esize;
-    let axis_dim = shape[axis];
-    let mut out = Vec::with_capacity(sizes.len());
-    let mut start = 0usize;
-    for &k in sizes {
-        let mut buf = vec![0u8; outer * k * inner];
-        for o in 0..outer {
-            let src_off = (o * axis_dim + start) * inner;
-            let dst_off = o * k * inner;
-            buf[dst_off..dst_off + k * inner]
-                .copy_from_slice(&data[src_off..src_off + k * inner]);
-        }
-        let mut oshape = shape.to_vec();
-        oshape[axis] = k;
-        out.push((oshape, buf));
-        start += k;
+) -> SequenceResult<Vec<(Vec<usize>, Vec<u8>)>> {
+    const OP: &str = "SplitToSequence";
+    if axis >= shape.len() {
+        return Err(SequenceError::InvalidAxis {
+            op: OP,
+            axis: i64::try_from(axis).unwrap_or(i64::MAX),
+            rank: shape.len(),
+            new_axis: false,
+        });
     }
-    out
+    if esize == 0 {
+        return Err(SequenceError::InvalidSplit {
+            op: OP,
+            reason: "element byte size must be positive".to_string(),
+        });
+    }
+    let axis_dim = shape[axis];
+    let mut size_sum = 0usize;
+    for &size in sizes {
+        size_sum = checked_add(OP, "split size sum", size_sum, size, shape)?;
+    }
+    if size_sum != axis_dim {
+        return Err(SequenceError::InvalidSplit {
+            op: OP,
+            reason: format!("sizes sum to {size_sum}, but axis {axis} has extent {axis_dim}"),
+        });
+    }
+
+    let outer = checked_product(OP, "split outer element count", &shape[..axis])?;
+    let inner_elements = checked_product(OP, "split inner element count", &shape[axis + 1..])?;
+    let inner = checked_mul(OP, "split inner byte count", inner_elements, esize, shape)?;
+    let input_rows = checked_mul(OP, "split input row count", outer, axis_dim, shape)?;
+    let input_bytes = checked_mul(OP, "split input byte count", input_rows, inner, shape)?;
+    addressable(OP, "split input byte count", input_bytes, shape)?;
+    if data.len() != input_bytes {
+        return Err(SequenceError::ByteLengthMismatch {
+            op: OP,
+            dtype: DataType::Uint8,
+            shape: clone_shape(OP, shape)?,
+            expected: input_bytes,
+            actual: data.len(),
+        });
+    }
+
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(sizes.len())
+        .map_err(|_| SequenceError::Allocation {
+            op: OP,
+            context: "split outputs",
+            bytes: sizes
+                .len()
+                .saturating_mul(std::mem::size_of::<(Vec<usize>, Vec<u8>)>()),
+        })?;
+    let mut start = 0usize;
+    for &size in sizes {
+        let output_rows = checked_mul(OP, "split output row count", outer, size, shape)?;
+        let output_bytes = checked_mul(OP, "split output byte count", output_rows, inner, shape)?;
+        let mut bytes = zeroed_bytes(OP, "split output", output_bytes, shape)?;
+        if inner != 0 && size != 0 {
+            let copy_bytes = checked_mul(OP, "split copy width", size, inner, shape)?;
+            for outer_index in 0..outer {
+                let source_row = checked_add(
+                    OP,
+                    "split source row",
+                    checked_mul(
+                        OP,
+                        "split source outer offset",
+                        outer_index,
+                        axis_dim,
+                        shape,
+                    )?,
+                    start,
+                    shape,
+                )?;
+                let source_offset =
+                    checked_mul(OP, "split source byte offset", source_row, inner, shape)?;
+                let source_end = checked_add(
+                    OP,
+                    "split source byte range",
+                    source_offset,
+                    copy_bytes,
+                    shape,
+                )?;
+                let destination_offset = checked_mul(
+                    OP,
+                    "split destination byte offset",
+                    outer_index,
+                    copy_bytes,
+                    shape,
+                )?;
+                let destination_end = checked_add(
+                    OP,
+                    "split destination byte range",
+                    destination_offset,
+                    copy_bytes,
+                    shape,
+                )?;
+                bytes[destination_offset..destination_end]
+                    .copy_from_slice(&data[source_offset..source_end]);
+            }
+        }
+        let mut output_shape = clone_shape(OP, shape)?;
+        output_shape[axis] = size;
+        output.push((output_shape, bytes));
+        start = checked_add(OP, "split axis cursor", start, size, shape)?;
+    }
+    Ok(output)
 }
 
-/// `ConcatFromSequence` with `new_axis = 0`: concatenate `elements` (each a
-/// contiguous row-major byte buffer with the matching `shapes[i]`) along an
-/// existing `axis` into one freshly-allocated output. This necessarily
-/// allocates the output once and memcpies each element in exactly once (no
-/// redundant copies — the single-alloc Concat pattern). Returns
-/// `(out_shape, out_bytes)`.
+/// Concatenate already-validated contiguous element bytes along an existing axis.
 pub(crate) fn concat_axis(
     elements: &[&[u8]],
     shapes: &[Vec<usize>],
     axis: usize,
     esize: usize,
-) -> (Vec<usize>, Vec<u8>) {
-    let base = &shapes[0];
-    let outer: usize = base[..axis].iter().product();
-    let inner: usize = base[axis + 1..].iter().product::<usize>() * esize;
-    let total_axis: usize = shapes.iter().map(|s| s[axis]).sum();
-    let mut oshape = base.clone();
-    oshape[axis] = total_axis;
-    let mut buf = vec![0u8; outer * total_axis * inner];
-    for o in 0..outer {
-        let mut axis_cursor = 0usize;
-        for (e, src) in elements.iter().enumerate() {
-            let k = shapes[e][axis];
-            let src_off = o * k * inner;
-            let dst_off = (o * total_axis + axis_cursor) * inner;
-            buf[dst_off..dst_off + k * inner]
-                .copy_from_slice(&src[src_off..src_off + k * inner]);
-            axis_cursor += k;
+) -> SequenceResult<(Vec<usize>, Vec<u8>)> {
+    const OP: &str = "ConcatFromSequence";
+    let base = shapes.first().ok_or(SequenceError::InvalidSplit {
+        op: OP,
+        reason: "cannot concatenate an empty sequence".to_string(),
+    })?;
+    if elements.len() != shapes.len() || axis >= base.len() || esize == 0 {
+        return Err(SequenceError::InvalidSplit {
+            op: OP,
+            reason: "invalid element/shape count, axis, or element byte size".to_string(),
+        });
+    }
+    let outer = checked_product(OP, "concat outer element count", &base[..axis])?;
+    let inner_elements = checked_product(OP, "concat inner element count", &base[axis + 1..])?;
+    let inner = checked_mul(OP, "concat inner byte count", inner_elements, esize, base)?;
+    let mut total_axis = 0usize;
+    for shape in shapes {
+        total_axis = checked_add(OP, "concat axis extent", total_axis, shape[axis], base)?;
+    }
+    let output_rows = checked_mul(OP, "concat output row count", outer, total_axis, base)?;
+    let output_bytes = checked_mul(OP, "concat output byte count", output_rows, inner, base)?;
+    let mut bytes = zeroed_bytes(OP, "concat output", output_bytes, base)?;
+
+    for (index, (element, shape)) in elements.iter().zip(shapes).enumerate() {
+        let rows = checked_mul(OP, "concat source row count", outer, shape[axis], shape)?;
+        let expected = checked_mul(OP, "concat source byte count", rows, inner, shape)?;
+        addressable(OP, "concat source byte count", expected, shape)?;
+        if element.len() != expected {
+            return Err(SequenceError::ByteLengthMismatch {
+                op: OP,
+                dtype: DataType::Uint8,
+                shape: clone_shape(OP, shape)?,
+                expected,
+                actual: element.len(),
+            });
+        }
+        if shape.len() != base.len() {
+            return Err(SequenceError::ShapeMismatch {
+                op: OP,
+                index,
+                expected: clone_shape(OP, base)?,
+                actual: clone_shape(OP, shape)?,
+                requirement: "ranks must match",
+            });
         }
     }
-    (oshape, buf)
+
+    if inner != 0 && total_axis != 0 {
+        for outer_index in 0..outer {
+            let mut axis_cursor = 0usize;
+            for (element, shape) in elements.iter().zip(shapes) {
+                let size = shape[axis];
+                let copy_bytes = checked_mul(OP, "concat copy width", size, inner, base)?;
+                let source_offset = checked_mul(
+                    OP,
+                    "concat source byte offset",
+                    outer_index,
+                    copy_bytes,
+                    base,
+                )?;
+                let source_end = checked_add(
+                    OP,
+                    "concat source byte range",
+                    source_offset,
+                    copy_bytes,
+                    base,
+                )?;
+                let destination_row = checked_add(
+                    OP,
+                    "concat destination row",
+                    checked_mul(
+                        OP,
+                        "concat destination outer offset",
+                        outer_index,
+                        total_axis,
+                        base,
+                    )?,
+                    axis_cursor,
+                    base,
+                )?;
+                let destination_offset = checked_mul(
+                    OP,
+                    "concat destination byte offset",
+                    destination_row,
+                    inner,
+                    base,
+                )?;
+                let destination_end = checked_add(
+                    OP,
+                    "concat destination byte range",
+                    destination_offset,
+                    copy_bytes,
+                    base,
+                )?;
+                bytes[destination_offset..destination_end]
+                    .copy_from_slice(&element[source_offset..source_end]);
+                axis_cursor = checked_add(OP, "concat axis cursor", axis_cursor, size, base)?;
+            }
+        }
+    }
+    let mut output_shape = clone_shape(OP, base)?;
+    output_shape[axis] = total_axis;
+    Ok((output_shape, bytes))
 }
 
-/// `ConcatFromSequence` with `new_axis = 1`: **stack** `elements` (all sharing
-/// `elem_shape`) along a brand-new axis inserted at `axis`, into one freshly
-/// allocated output. Single alloc, one memcpy per element. Returns
-/// `(out_shape, out_bytes)`.
+/// Stack already-validated contiguous element bytes along a new axis.
 pub(crate) fn stack_new_axis(
     elements: &[&[u8]],
     elem_shape: &[usize],
     axis: usize,
     esize: usize,
-) -> Result<(Vec<usize>, Vec<u8>)> {
-    let overflow = |value: &str| SessionError::ShapeOverflow {
-        value: value.to_string(),
-        dims: elem_shape.to_vec(),
-    };
-    let checked_product = |dims: &[usize], value: &str| {
-        dims.iter().try_fold(1usize, |product, &dim| {
-            product.checked_mul(dim).ok_or_else(|| overflow(value))
-        })
-    };
-
-    let n = elements.len();
-    let outer = checked_product(&elem_shape[..axis], "stacked tensor outer element count")?;
-    let inner_elements =
-        checked_product(&elem_shape[axis..], "stacked tensor inner element count")?;
-    let inner = inner_elements
-        .checked_mul(esize)
-        .ok_or_else(|| overflow("stacked tensor inner byte count"))?;
-    let _source_bytes = outer
-        .checked_mul(inner)
-        .ok_or_else(|| overflow("stacked tensor source byte span"))?;
-    let output_rows = n
-        .checked_mul(outer)
-        .ok_or_else(|| overflow("stacked tensor output row count"))?;
-    let output_bytes = output_rows
-        .checked_mul(inner)
-        .ok_or_else(|| overflow("stacked tensor output byte count"))?;
-
-    let mut oshape = Vec::with_capacity(elem_shape.len() + 1);
-    oshape.extend_from_slice(&elem_shape[..axis]);
-    oshape.push(n);
-    oshape.extend_from_slice(&elem_shape[axis..]);
-    let mut buf = vec![0u8; output_bytes];
-    for (j, src) in elements.iter().enumerate() {
-        for o in 0..outer {
-            let src_off = o
-                .checked_mul(inner)
-                .ok_or_else(|| overflow("stacked tensor source offset"))?;
-            let src_end = src_off
-                .checked_add(inner)
-                .ok_or_else(|| overflow("stacked tensor source range"))?;
-            let dst_row = o
-                .checked_mul(n)
-                .and_then(|row| row.checked_add(j))
-                .ok_or_else(|| overflow("stacked tensor destination row offset"))?;
-            let dst_off = dst_row
-                .checked_mul(inner)
-                .ok_or_else(|| overflow("stacked tensor destination byte offset"))?;
-            let dst_end = dst_off
-                .checked_add(inner)
-                .ok_or_else(|| overflow("stacked tensor destination range"))?;
-            buf[dst_off..dst_end].copy_from_slice(&src[src_off..src_end]);
+) -> SequenceResult<(Vec<usize>, Vec<u8>)> {
+    const OP: &str = "ConcatFromSequence";
+    if axis > elem_shape.len() || esize == 0 {
+        return Err(SequenceError::InvalidSplit {
+            op: OP,
+            reason: "invalid new axis or element byte size".to_string(),
+        });
+    }
+    let outer = checked_product(OP, "stack outer element count", &elem_shape[..axis])?;
+    let inner_elements = checked_product(OP, "stack inner element count", &elem_shape[axis..])?;
+    let inner = checked_mul(
+        OP,
+        "stack inner byte count",
+        inner_elements,
+        esize,
+        elem_shape,
+    )?;
+    let source_bytes = checked_mul(OP, "stack source byte count", outer, inner, elem_shape)?;
+    addressable(OP, "stack source byte count", source_bytes, elem_shape)?;
+    for element in elements {
+        if element.len() != source_bytes {
+            return Err(SequenceError::ByteLengthMismatch {
+                op: OP,
+                dtype: DataType::Uint8,
+                shape: clone_shape(OP, elem_shape)?,
+                expected: source_bytes,
+                actual: element.len(),
+            });
         }
     }
-    Ok((oshape, buf))
+    let output_rows = checked_mul(
+        OP,
+        "stacked tensor output row count",
+        elements.len(),
+        outer,
+        elem_shape,
+    )?;
+    let output_bytes = checked_mul(
+        OP,
+        "stack output byte count",
+        output_rows,
+        inner,
+        elem_shape,
+    )?;
+    let mut bytes = zeroed_bytes(OP, "stack output", output_bytes, elem_shape)?;
+    if inner != 0 {
+        for (element_index, element) in elements.iter().enumerate() {
+            for outer_index in 0..outer {
+                let source_offset = checked_mul(
+                    OP,
+                    "stack source byte offset",
+                    outer_index,
+                    inner,
+                    elem_shape,
+                )?;
+                let source_end = checked_add(
+                    OP,
+                    "stack source byte range",
+                    source_offset,
+                    inner,
+                    elem_shape,
+                )?;
+                let destination_row = checked_add(
+                    OP,
+                    "stack destination row",
+                    checked_mul(
+                        OP,
+                        "stack destination outer offset",
+                        outer_index,
+                        elements.len(),
+                        elem_shape,
+                    )?,
+                    element_index,
+                    elem_shape,
+                )?;
+                let destination_offset = checked_mul(
+                    OP,
+                    "stack destination byte offset",
+                    destination_row,
+                    inner,
+                    elem_shape,
+                )?;
+                let destination_end = checked_add(
+                    OP,
+                    "stack destination byte range",
+                    destination_offset,
+                    inner,
+                    elem_shape,
+                )?;
+                bytes[destination_offset..destination_end]
+                    .copy_from_slice(&element[source_offset..source_end]);
+            }
+        }
+    }
+    let shape_capacity = elem_shape
+        .len()
+        .checked_add(1)
+        .ok_or_else(|| overflow(OP, "stack output rank", elem_shape))?;
+    let mut output_shape = Vec::new();
+    output_shape
+        .try_reserve_exact(shape_capacity)
+        .map_err(|_| SequenceError::Allocation {
+            op: OP,
+            context: "stack output shape",
+            bytes: shape_capacity.saturating_mul(std::mem::size_of::<usize>()),
+        })?;
+    output_shape.extend_from_slice(&elem_shape[..axis]);
+    output_shape.push(elements.len());
+    output_shape.extend_from_slice(&elem_shape[axis..]);
+    Ok((output_shape, bytes))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn elem(dtype: DataType, shape: &[usize], data: &[u8]) -> Arc<SeqTensor> {
-        SeqTensor::shared(dtype, shape.to_vec(), data.to_vec())
+    fn elem(dtype: DataType, shape: &[usize], bytes: &[u8]) -> SeqTensor {
+        SeqTensor::from_raw(dtype, shape.to_vec(), bytes).expect("valid test tensor")
     }
 
     #[test]
-    fn construct_len_and_dtype() {
-        let s = SequenceValue::construct(vec![
-            elem(DataType::Float32, &[2], &[0; 8]),
-            elem(DataType::Float32, &[2], &[1; 8]),
-        ])
-        .unwrap();
-        assert_eq!(s.len(), 2);
-        assert_eq!(s.elem_dtype, DataType::Float32);
+    fn value_ops_share_tensor_arcs_without_copying() {
+        let original = elem(DataType::Uint8, &[1], &[7]);
+        let sequence = SequenceValue::construct(vec![original.clone()]).expect("construct");
+        assert!(Arc::ptr_eq(
+            original.shared_tensor(),
+            sequence.elements()[0].shared_tensor()
+        ));
+
+        let inserted = elem(DataType::Uint8, &[1], &[9]);
+        let sequence = sequence.insert(inserted.clone(), Some(-1)).expect("insert");
+        assert!(Arc::ptr_eq(
+            inserted.shared_tensor(),
+            sequence.at(0).expect("at").shared_tensor()
+        ));
+        assert!(Arc::ptr_eq(
+            original.shared_tensor(),
+            sequence.at(1).expect("at").shared_tensor()
+        ));
+
+        let erased = sequence.erase(Some(0)).expect("erase");
+        assert!(Arc::ptr_eq(
+            original.shared_tensor(),
+            erased.at(-1).expect("negative at").shared_tensor()
+        ));
     }
 
     #[test]
-    fn construct_rejects_mixed_dtype_actionably() {
-        let err = SequenceValue::construct(vec![
-            elem(DataType::Float32, &[1], &[0; 4]),
-            elem(DataType::Int64, &[1], &[0; 8]),
+    fn empty_construct_insert_erase_at_and_length() {
+        let empty = SequenceValue::empty(DataType::Uint8);
+        assert_eq!(empty.length(), 0);
+        let one = empty
+            .insert(elem(DataType::Uint8, &[1], &[1]), None)
+            .unwrap();
+        let two = one
+            .insert(elem(DataType::Uint8, &[1], &[2]), Some(-1))
+            .unwrap();
+        let three = two
+            .insert(elem(DataType::Uint8, &[1], &[3]), Some(2))
+            .unwrap();
+        assert_eq!(three.length(), 3);
+        assert_eq!(three.at(0).unwrap().as_bytes(), &[2]);
+        assert_eq!(three.at(-1).unwrap().as_bytes(), &[3]);
+        let erased = three.erase(Some(-2)).unwrap();
+        assert_eq!(erased.length(), 2);
+        assert_eq!(erased.at(0).unwrap().as_bytes(), &[2]);
+        assert_eq!(erased.at(1).unwrap().as_bytes(), &[3]);
+    }
+
+    #[test]
+    fn homogeneity_violation_is_typed_error() {
+        let error = SequenceValue::construct(vec![
+            elem(DataType::Uint8, &[1], &[1]),
+            elem(DataType::Int64, &[1], &1i64.to_le_bytes()),
         ])
         .unwrap_err();
-        assert_eq!(err.op, "SequenceConstruct");
-        assert!(err.reason.contains("homogeneous"));
-        assert!(err.reason.contains("To fix"));
-    }
-
-    /// The core no-copy proof: `at` hands back the *same allocation* that was
-    /// inserted — `Arc::ptr_eq` holds and the data pointer is identical. No
-    /// intervening sequence op (construct → insert → erase) copied the bytes.
-    #[test]
-    fn at_returns_shared_handle_no_copy() {
-        let a = elem(DataType::Float32, &[3], &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
-        let a_ptr = a.as_ptr();
-        let s0 = SequenceValue::construct(vec![Arc::clone(&a)]).unwrap();
-        // Insert another element in front; `a` is now at index 1.
-        let b = elem(DataType::Float32, &[3], &[0; 12]);
-        let s1 = s0.insert(b, Some(0)).unwrap();
-        assert_eq!(s1.len(), 2);
-        let got = s1.at(1).unwrap();
-        // Same Arc allocation and same byte address → zero deep copy.
-        assert!(Arc::ptr_eq(&a, &got));
-        assert_eq!(got.as_ptr(), a_ptr);
-        // Erasing front still shares `a` (now index 0), pointer unchanged.
-        let s2 = s1.erase(Some(0)).unwrap();
-        let got2 = s2.at(-1).unwrap();
-        assert!(Arc::ptr_eq(&a, &got2));
-        assert_eq!(got2.as_ptr(), a_ptr);
-    }
-
-    /// Mutating ops share element `Arc`s with the source: the strong count rises
-    /// by exactly the number of sequences referencing an element — proof that
-    /// `insert`/`erase` clone handles, not bytes.
-    #[test]
-    fn mutations_share_arcs_not_bytes() {
-        let a = elem(DataType::Float32, &[1], &[0; 4]);
-        assert_eq!(Arc::strong_count(&a), 1);
-        let s0 = SequenceValue::construct(vec![Arc::clone(&a)]).unwrap();
-        assert_eq!(Arc::strong_count(&a), 2); // a + s0
-        let s1 = s0.insert(elem(DataType::Float32, &[1], &[9; 4]), None).unwrap();
-        assert_eq!(Arc::strong_count(&a), 3); // a + s0 + s1 (shared, not copied)
-        drop(s0);
-        assert_eq!(Arc::strong_count(&a), 2); // a + s1
-        let _ = s1;
+        assert!(matches!(
+            error,
+            SequenceError::DtypeMismatch {
+                op: "SequenceConstruct",
+                index: Some(1),
+                ..
+            }
+        ));
     }
 
     #[test]
-    fn insert_positions_and_default_append() {
-        let mk = |v: u8| elem(DataType::Uint8, &[1], &[v]);
-        let s = SequenceValue::empty(DataType::Uint8);
-        let s = s.insert(mk(1), None).unwrap(); // [1]
-        let s = s.insert(mk(2), None).unwrap(); // [1,2]
-        let s = s.insert(mk(0), Some(0)).unwrap(); // [0,1,2]
-        let s = s.insert(mk(9), Some(-1)).unwrap(); // insert before last -> [0,1,9,2]
-        let vals: Vec<u8> = (0..s.len() as i64)
-            .map(|i| s.at(i).unwrap().data[0])
-            .collect();
-        assert_eq!(vals, vec![0, 1, 9, 2]);
+    fn split_concat_roundtrip_existing_axes_and_keepdims() {
+        let data: Vec<u8> = (0..12).collect();
+        for (shape, axis, keepdims) in [
+            (vec![3, 4], 0, true),
+            (vec![3, 4], 1, true),
+            (vec![3, 4], 0, false),
+        ] {
+            let sequence = split(
+                &data,
+                DataType::Uint8,
+                &shape,
+                axis,
+                SplitSpec::Each,
+                keepdims,
+            )
+            .unwrap();
+            let concat_axis = if keepdims { axis } else { 0 };
+            let rebuilt = concat(&sequence, concat_axis, !keepdims).unwrap();
+            assert_eq!(rebuilt.shape, shape);
+            assert_eq!(rebuilt.as_bytes(), data);
+        }
     }
 
     #[test]
-    fn erase_default_last_and_indexed() {
-        let mk = |v: u8| elem(DataType::Uint8, &[1], &[v]);
-        let s = SequenceValue::construct(vec![mk(1), mk(2), mk(3)]).unwrap();
-        let s = s.erase(None).unwrap(); // remove last -> [1,2]
-        assert_eq!(s.len(), 2);
-        let s = s.erase(Some(0)).unwrap(); // remove first -> [2]
-        assert_eq!(s.at(0).unwrap().data[0], 2);
-    }
-
-    #[test]
-    fn at_out_of_bounds_is_actionable() {
-        let s = SequenceValue::construct(vec![elem(DataType::Uint8, &[1], &[7])]).unwrap();
-        let err = s.at(5).unwrap_err();
-        assert_eq!(err.op, "SequenceAt");
-        assert!(err.reason.contains("out of bounds"));
-        assert!(err.reason.contains("valid range"));
-    }
-
-    #[test]
-    fn insert_dtype_mismatch_is_actionable() {
-        let s = SequenceValue::construct(vec![elem(DataType::Float32, &[1], &[0; 4])]).unwrap();
-        let err = s
-            .insert(elem(DataType::Int64, &[1], &[0; 8]), None)
-            .unwrap_err();
-        assert_eq!(err.op, "SequenceInsert");
-        assert!(err.reason.contains("does not match"));
-    }
-
-    #[test]
-    fn empty_sequence_insert_dtype_mismatch_is_actionable() {
-        let s = SequenceValue::empty(DataType::Float32);
-        let err = s
-            .insert(elem(DataType::Int64, &[1], &[0; 8]), None)
-            .unwrap_err();
-        assert_eq!(err.op, "SequenceInsert");
-        assert!(err.reason.contains("does not match"));
-        assert!(err.reason.contains("To fix"));
-    }
-
-    #[test]
-    fn split_even_along_axis0() {
-        // shape [4,2] f32-as-u8 (esize 4): split into 4 rows of size 1.
-        let data: Vec<u8> = (0..(4 * 2 * 4) as u8).collect();
-        let parts = split_axis(&data, &[4, 2], 0, &[1, 1, 1, 1], 4);
-        assert_eq!(parts.len(), 4);
-        assert_eq!(parts[0].0, vec![1, 2]);
-        assert_eq!(parts[0].1, data[0..8]);
-        assert_eq!(parts[3].1, data[24..32]);
-    }
-
-    #[test]
-    fn split_uneven_along_axis1() {
-        // shape [2,3] esize 1: split axis 1 into sizes [1,2].
-        let data: Vec<u8> = vec![0, 1, 2, 3, 4, 5];
-        let parts = split_axis(&data, &[2, 3], 1, &[1, 2], 1);
-        assert_eq!(parts[0].0, vec![2, 1]);
-        assert_eq!(parts[0].1, vec![0, 3]); // column 0
-        assert_eq!(parts[1].0, vec![2, 2]);
-        assert_eq!(parts[1].1, vec![1, 2, 4, 5]); // columns 1,2
-    }
-
-    #[test]
-    fn concat_existing_axis_roundtrips_split() {
-        let data: Vec<u8> = vec![0, 1, 2, 3, 4, 5];
-        let parts = split_axis(&data, &[2, 3], 1, &[1, 2], 1);
-        let refs: Vec<&[u8]> = parts.iter().map(|(_, b)| b.as_slice()).collect();
-        let shapes: Vec<Vec<usize>> = parts.iter().map(|(s, _)| s.clone()).collect();
-        let (oshape, out) = concat_axis(&refs, &shapes, 1, 1);
-        assert_eq!(oshape, vec![2, 3]);
-        assert_eq!(out, data);
-    }
-
-    #[test]
-    fn stack_new_axis_front() {
-        // two [2] elements stacked at new axis 0 -> [2,2].
-        let a: Vec<u8> = vec![1, 2];
-        let b: Vec<u8> = vec![3, 4];
-        let (oshape, out) = stack_new_axis(&[&a, &b], &[2], 0, 1).unwrap();
-        assert_eq!(oshape, vec![2, 2]);
-        assert_eq!(out, vec![1, 2, 3, 4]);
-    }
-
-    #[test]
-    fn stack_new_axis_back_interleaves() {
-        // two [2] elements stacked at new axis 1 -> [2,2] interleaved.
-        let a: Vec<u8> = vec![1, 2];
-        let b: Vec<u8> = vec![3, 4];
-        let (oshape, out) = stack_new_axis(&[&a, &b], &[2], 1, 1).unwrap();
-        assert_eq!(oshape, vec![2, 2]);
-        assert_eq!(out, vec![1, 3, 2, 4]);
-    }
-
-    /// Concurrency smoke test: many threads read the same shared sequence and
-    /// its elements at once. Immutable `Arc` elements → no data race; correct
-    /// reads under contention prove the shared-read-only design.
-    #[test]
-    fn concurrent_readers_no_race() {
-        use std::thread;
-        let s = SequenceValue::construct(vec![
-            elem(DataType::Int32, &[1], &10i32.to_le_bytes()),
-            elem(DataType::Int32, &[1], &20i32.to_le_bytes()),
-            elem(DataType::Int32, &[1], &30i32.to_le_bytes()),
-        ])
+    fn split_concat_roundtrip_explicit_sizes() {
+        let data: Vec<u8> = (0..12).collect();
+        let sequence = split(
+            &data,
+            DataType::Uint8,
+            &[3, 4],
+            1,
+            SplitSpec::Sizes(&[1, 3]),
+            false,
+        )
         .unwrap();
-        let shared = Arc::new(s);
-        let mut handles = Vec::new();
-        for _ in 0..8 {
-            let seq = Arc::clone(&shared);
-            handles.push(thread::spawn(move || {
-                let mut acc = 0i32;
-                for _ in 0..1000 {
-                    for i in 0..seq.len() as i64 {
-                        let e = seq.at(i).unwrap();
-                        acc += i32::from_le_bytes(e.data[..4].try_into().unwrap());
-                    }
-                }
-                acc
-            }));
-        }
-        for h in handles {
-            assert_eq!(h.join().unwrap(), 60 * 1000);
-        }
+        let rebuilt = concat(&sequence, 1, false).unwrap();
+        assert_eq!(rebuilt.shape, vec![3, 4]);
+        assert_eq!(rebuilt.as_bytes(), data);
     }
 
     #[test]
-    fn sequence_value_is_send_sync() {
+    fn stack_new_axis_variants() {
+        let a = elem(DataType::Uint8, &[2], &[1, 2]);
+        let b = elem(DataType::Uint8, &[2], &[3, 4]);
+        let sequence = SequenceValue::construct(vec![a, b]).unwrap();
+        let front = concat(&sequence, 0, true).unwrap();
+        assert_eq!(front.shape, vec![2, 2]);
+        assert_eq!(front.as_bytes(), &[1, 2, 3, 4]);
+        let back = concat(&sequence, 1, true).unwrap();
+        assert_eq!(back.shape, vec![2, 2]);
+        assert_eq!(back.as_bytes(), &[1, 3, 2, 4]);
+    }
+
+    #[test]
+    fn byte_count_above_isize_max_is_rejected() {
+        let error = split_axis(&[], &[isize::MAX as usize + 1, 1], 1, &[1], 1).unwrap_err();
+        assert!(matches!(error, SequenceError::ShapeOverflow { .. }));
+    }
+
+    #[test]
+    fn sequence_values_are_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<SeqTensor>();
         assert_send_sync::<SequenceValue>();
-        assert_send_sync::<Arc<SeqTensor>>();
     }
 }
