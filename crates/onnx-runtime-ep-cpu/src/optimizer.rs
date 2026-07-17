@@ -211,6 +211,8 @@ struct GateUpCandidate {
     gate: Projection,
     up: Projection,
     total_n: usize,
+    fused_weight: Vec<u8>,
+    fused_scales: Vec<u8>,
 }
 
 impl GateUpCandidate {
@@ -257,16 +259,36 @@ impl GateUpCandidate {
         if gate_id == up_id {
             return None;
         }
-        let gate = Projection::parse(graph, gate_id, ctx)?;
-        let up = Projection::parse(graph, up_id, ctx)?;
+        let mut gate = Projection::parse(graph, gate_id, ctx)?;
+        let mut up = Projection::parse(graph, up_id, ctx)?;
         if gate.output != gate_output || up.output != up_output || !gate.compatible_with(&up, graph)
         {
             return None;
         }
         let total_n = gate.n.checked_add(up.n)?;
         i64::try_from(total_n).ok()?;
+        let fused_weight_len =
+            checked_combined_initializer_len(gate.weight_bytes.len(), up.weight_bytes.len())?;
+        let fused_scale_len =
+            checked_combined_initializer_len(gate.scale_bytes.len(), up.scale_bytes.len())?;
+        let fused_weight = concatenate_initializer_bytes(
+            std::mem::take(&mut gate.weight_bytes),
+            std::mem::take(&mut up.weight_bytes),
+            fused_weight_len,
+        )?;
+        let fused_scales = concatenate_initializer_bytes(
+            std::mem::take(&mut gate.scale_bytes),
+            std::mem::take(&mut up.scale_bytes),
+            fused_scale_len,
+        )?;
 
-        Some(Self { gate, up, total_n })
+        Some(Self {
+            gate,
+            up,
+            total_n,
+            fused_weight,
+            fused_scales,
+        })
     }
 
     fn apply(self, graph: &mut Graph) {
@@ -275,10 +297,8 @@ impl GateUpCandidate {
         let packed_block_bytes = self.gate.block_size * self.gate.bits / 8;
         let total_n = self.total_n;
 
-        let mut fused_weight = self.gate.weight_bytes;
-        fused_weight.extend_from_slice(&self.up.weight_bytes);
-        let mut fused_scales = self.gate.scale_bytes;
-        fused_scales.extend_from_slice(&self.up.scale_bytes);
+        let fused_weight = self.fused_weight;
+        let fused_scales = self.fused_scales;
 
         let weight_name = format!("__nxrt_fused_projection_{first_id}_weight");
         let fused_weight_value = graph.create_named_value(
@@ -378,11 +398,46 @@ fn optional_nonnegative_attr(node: &Node, name: &str, default: usize) -> Option<
     }
 }
 
+fn checked_combined_initializer_len(first: usize, second: usize) -> Option<usize> {
+    first
+        .checked_add(second)
+        .filter(|&combined| combined <= isize::MAX as usize)
+}
+
+fn concatenate_initializer_bytes(
+    mut first: Vec<u8>,
+    second: Vec<u8>,
+    combined_len: usize,
+) -> Option<Vec<u8>> {
+    first.try_reserve_exact(second.len()).ok()?;
+    first.extend_from_slice(&second);
+    debug_assert_eq!(first.len(), combined_len);
+    Some(first)
+}
+
 fn remove_orphan_initializer(graph: &mut Graph, value: ValueId) {
     if graph.value(value).consumers.is_empty()
         && !graph.inputs.contains(&value)
         && !graph.outputs.contains(&value)
     {
         graph.initializers.remove(&value);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::checked_combined_initializer_len;
+
+    #[test]
+    fn fused_initializer_capacity_rejects_overflow_and_isize_excess() {
+        assert_eq!(checked_combined_initializer_len(usize::MAX, 1), None);
+        assert_eq!(
+            checked_combined_initializer_len(isize::MAX as usize, 1),
+            None
+        );
+        assert_eq!(
+            checked_combined_initializer_len(0, isize::MAX as usize),
+            Some(isize::MAX as usize)
+        );
     }
 }

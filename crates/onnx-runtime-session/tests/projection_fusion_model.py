@@ -152,6 +152,19 @@ def build_model(scenario: str) -> ir.Model:
     outputs = [output]
     if scenario == "escape":
         outputs.append(gate_raw)
+    elif scenario == "extra_consumer":
+        escaped = value("gate_external_consumer", ir.DataType.FLOAT, [1, N])
+        nodes.append(
+            ir.Node(
+                "",
+                "Identity",
+                [gate_raw],
+                outputs=[escaped],
+                name="unrelated_gate_consumer",
+                version=21,
+            )
+        )
+        outputs.append(escaped)
 
     graph = ir.Graph(
         [x],
@@ -166,6 +179,13 @@ def build_model(scenario: str) -> ir.Model:
 
 if __name__ == "__main__":
     scenario = sys.argv[1]
-    if scenario not in {"valid", "bias", "zero_point", "escape", "decomposed"}:
+    if scenario not in {
+        "valid",
+        "bias",
+        "zero_point",
+        "escape",
+        "extra_consumer",
+        "decomposed",
+    }:
         raise ValueError(f"unknown scenario: {scenario}")
     sys.stdout.buffer.write(ir.to_proto(build_model(scenario)).SerializeToString())

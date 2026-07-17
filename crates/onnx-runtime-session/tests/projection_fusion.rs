@@ -199,6 +199,17 @@ fn projection_fusion_skips_bias_zero_point_and_escaping_outputs() {
 }
 
 #[test]
+fn projection_fusion_skips_projection_with_external_consumer() {
+    let _lock = env_lock();
+    let bytes = model_bytes("extra_consumer");
+    let (loaded, _) = onnx_runtime_loader::load_model_bytes_with_weights(&bytes, ".").unwrap();
+    let session = build(&bytes, true);
+    assert_eq!(session.graph().num_nodes(), loaded.num_nodes());
+    assert_eq!(count(session.graph(), "MatMulNBits"), 2);
+    assert_eq!(count(session.graph(), "Split"), 0);
+}
+
+#[test]
 fn projection_fusion_materializes_int64_split_initializer() {
     let _lock = env_lock();
     let bytes = model_bytes("valid");
