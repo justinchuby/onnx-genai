@@ -6,7 +6,7 @@ use onnx_runtime_ir::{Attribute, DataType};
 use crate::context::InferenceContext;
 use crate::dim_expr::DimExpr;
 use crate::error::ShapeInferError;
-use crate::handlers::norm_axis;
+use crate::handlers::checked_axis;
 use crate::registry::InferenceRegistry;
 
 /// `ArgMax`/`ArgMin`: replace or remove the selected axis and return int64.
@@ -22,7 +22,11 @@ fn arg_reduce(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
         .attr("axis")
         .and_then(Attribute::as_int)
         .unwrap_or(0);
-    let axis = norm_axis(axis, input.len());
+    let rank = input.len();
+    let axis = checked_axis(axis, rank).ok_or_else(|| ShapeInferError::Invalid {
+        op: ctx.op().into(),
+        detail: format!("axis {axis} is out of range for rank {rank}"),
+    })?;
     let keepdims = ctx
         .node
         .attr("keepdims")
@@ -74,7 +78,11 @@ fn top_k(ctx: &mut InferenceContext, k: Option<i64>) -> Result<(), ShapeInferErr
         .attr("axis")
         .and_then(Attribute::as_int)
         .unwrap_or(-1);
-    let axis = norm_axis(axis, input.len());
+    let rank = input.len();
+    let axis = checked_axis(axis, rank).ok_or_else(|| ShapeInferError::Invalid {
+        op: "TopK".into(),
+        detail: format!("axis {axis} is out of range for rank {rank}"),
+    })?;
     let mut output = input;
     output[axis] = k
         .filter(|&k| k >= 0)

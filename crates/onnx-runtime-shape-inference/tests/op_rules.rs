@@ -741,6 +741,92 @@ fn topk_v1_reads_k_attribute() {
 }
 
 #[test]
+fn topk_replaces_the_selected_middle_axis_and_rejects_invalid_axes() {
+    let middle = with_attr(node("TopK", 2, 2), "axis", Attribute::Int(1));
+    let outs = run(
+        &middle,
+        vec![f32in(vec![c(2), c(8), c(4)]), sd_vec(vec![c(3)])],
+        11,
+    );
+    assert_eq!(out_shape(&outs), vec![c(2), c(3), c(4)]);
+    assert_eq!(
+        outs[1].type_info.as_ref().unwrap().shape,
+        vec![c(2), c(3), c(4)]
+    );
+
+    let invalid = with_attr(node("TopK", 2, 2), "axis", Attribute::Int(3));
+    assert!(
+        try_run(
+            &invalid,
+            vec![f32in(vec![c(2), c(8), c(4)]), sd_vec(vec![c(3)])],
+            11,
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn axis_operators_reject_out_of_range_and_duplicate_axes() {
+    let input = f32in(vec![c(2), c(3), c(4)]);
+    assert!(
+        try_run(
+            &with_attr(node("ArgMax", 1, 1), "axis", Attribute::Int(-4)),
+            vec![input.clone()],
+            13,
+        )
+        .is_err()
+    );
+    assert!(
+        try_run(
+            &with_attr(
+                node("Transpose", 1, 1),
+                "perm",
+                Attribute::Ints(vec![0, 1, 3]),
+            ),
+            vec![input.clone()],
+            13,
+        )
+        .is_err()
+    );
+    assert!(
+        try_run(
+            &with_attr(
+                node("Transpose", 1, 1),
+                "perm",
+                Attribute::Ints(vec![0, 1, 1]),
+            ),
+            vec![input.clone()],
+            13,
+        )
+        .is_err()
+    );
+    assert!(
+        try_run(
+            &node("Unsqueeze", 2, 1),
+            vec![input.clone(), sd_vec(vec![c(4)])],
+            13,
+        )
+        .is_err()
+    );
+    assert!(
+        try_run(
+            &node("Unsqueeze", 2, 1),
+            vec![input.clone(), sd_vec(vec![c(0), c(0)])],
+            13,
+        )
+        .is_err()
+    );
+    assert!(
+        try_run(
+            &with_attr(node("Gather", 2, 1), "axis", Attribute::Int(3)),
+            vec![input, tin(DataType::Int64, vec![])],
+            13,
+        )
+        .is_err()
+    );
+}
+
+#[test]
 fn tile_static_repeats() {
     let n = node("Tile", 2, 1);
     let outs = run(
@@ -1985,6 +2071,63 @@ fn sparse_kv_gather_emits_selected_kv_shape() {
     assert_eq!(out_dtype(&outs), DataType::Float32);
 }
 
+#[test]
+fn custom_ops_validate_arity_rank_and_compression_contracts() {
+    assert!(
+        try_run(
+            &with_domain(node("MoE", 1, 2), "com.microsoft"),
+            vec![f32in(vec![c(2), c(4)])],
+            1,
+        )
+        .is_err()
+    );
+    assert!(
+        try_run(
+            &with_domain(node("SparseKvGather", 2, 1), "pkg.nxrt"),
+            vec![
+                f32in(vec![c(2), c(3), c(4)]),
+                tin(DataType::Int32, vec![c(2), c(3), c(4), c(5)]),
+            ],
+            1,
+        )
+        .is_err()
+    );
+
+    let invalid_ratio = with_attr(
+        with_domain(node("CompressedSparseAttention", 10, 3), "pkg.nxrt"),
+        "compression_ratio",
+        Attribute::Int(8),
+    );
+    assert!(
+        try_run(
+            &invalid_ratio,
+            vec![f32in(vec![c(1), c(1), c(1), c(64)])],
+            1,
+        )
+        .is_err()
+    );
+
+    let mut wrong_ratio128_arity =
+        with_domain(node("CompressedSparseAttention", 10, 2), "pkg.nxrt");
+    for (name, value) in [
+        ("num_heads", 1),
+        ("head_dim", 64),
+        ("compression_ratio", 128),
+    ] {
+        wrong_ratio128_arity
+            .attributes
+            .insert(name.into(), Attribute::Int(value));
+    }
+    assert!(
+        try_run(
+            &wrong_ratio128_arity,
+            vec![f32in(vec![c(1), c(1), c(1), c(64)])],
+            1,
+        )
+        .is_err()
+    );
+}
+
 fn csa_ratio4_node(domain: &str) -> Node {
     let mut n = with_domain(node("CompressedSparseAttention", 19, 6), domain);
     for (name, value) in [
@@ -2212,6 +2355,57 @@ fn cast_changes_dtype_keeps_shape_and_shape_data() {
     let sd = outs[0].shape_data.as_ref().unwrap();
     assert_eq!(sd.dtype, DataType::Int32);
     assert_eq!(sd.elems, vec![sym(0), c(8)]);
+}
+
+#[test]
+fn data_ops_propagate_shape_data_and_reject_invalid_metadata() {
+    let shape = with_attr(
+        with_attr(node("Shape", 1, 1), "start", Attribute::Int(-2)),
+        "end",
+        Attribute::Int(99),
+    );
+    let shape_out = run(&shape, vec![f32in(vec![sym(0), c(3), c(4)])], 15);
+    assert_eq!(out_shape(&shape_out), vec![c(2)]);
+    assert_eq!(
+        shape_out[0].shape_data.as_ref().unwrap().elems,
+        vec![c(3), c(4)]
+    );
+
+    let size_out = run(&node("Size", 1, 1), vec![f32in(vec![c(2), c(3)])], 13);
+    assert_eq!(size_out[0].shape_data.as_ref().unwrap().elems, vec![c(6)]);
+
+    let constant = with_attr(
+        node("Constant", 0, 1),
+        "value_ints",
+        Attribute::Ints(vec![2, 5]),
+    );
+    let constant_out = run(&constant, vec![], 13);
+    assert_eq!(out_shape(&constant_out), vec![c(2)]);
+    assert_eq!(
+        constant_out[0].shape_data.as_ref().unwrap().elems,
+        vec![c(2), c(5)]
+    );
+
+    let identity = run(&node("Identity", 1, 1), vec![sd_vec(vec![c(7)])], 13);
+    assert_eq!(identity[0].shape_data.as_ref().unwrap().elems, vec![c(7)]);
+
+    let cast_like = run(
+        &node("CastLike", 2, 1),
+        vec![f32in(vec![c(2), c(3)]), tin(DataType::Uint8, vec![c(1)])],
+        19,
+    );
+    assert_eq!(out_dtype(&cast_like), DataType::Uint8);
+    assert_eq!(out_shape(&cast_like), vec![c(2), c(3)]);
+
+    assert!(try_run(&node("Cast", 1, 1), vec![f32in(vec![c(1)])], 13).is_err());
+    assert!(
+        try_run(
+            &with_attr(node("Cast", 1, 1), "to", Attribute::Int(-1)),
+            vec![f32in(vec![c(1)])],
+            13,
+        )
+        .is_err()
+    );
 }
 
 // --- ConstantOfShape / Expand --------------------------------------------
@@ -2519,6 +2713,51 @@ fn pooling_auto_pad_same_and_valid() {
         out_shape(&run(&valid, vec![f32in(vec![c(1), c(3), c(8)])], 22)),
         vec![c(1), c(3), c(3)]
     );
+}
+
+#[test]
+fn pooling_validates_kernel_and_rank_and_preserves_dynamic_spatial_rank() {
+    assert!(
+        try_run(
+            &node("AveragePool", 1, 1),
+            vec![f32in(vec![c(1), c(2), c(8)])],
+            22,
+        )
+        .is_err()
+    );
+    assert!(
+        try_run(
+            &with_attr(
+                node("MaxPool", 1, 1),
+                "kernel_shape",
+                Attribute::Ints(vec![2, 2]),
+            ),
+            vec![f32in(vec![c(1), c(2), c(8)])],
+            22,
+        )
+        .is_err()
+    );
+    assert!(
+        try_run(
+            &with_attr(
+                node("MaxPool", 1, 1),
+                "kernel_shape",
+                Attribute::Ints(vec![2]),
+            ),
+            vec![f32in(vec![c(1)])],
+            22,
+        )
+        .is_err()
+    );
+
+    let n = with_attr(
+        node("AveragePool", 1, 1),
+        "kernel_shape",
+        Attribute::Ints(vec![3]),
+    );
+    let outs = run(&n, vec![f32in(vec![c(1), c(2), sym(0)])], 22);
+    assert_eq!(out_shape(&outs).len(), 3);
+    assert!(out_shape(&outs)[2].as_symbol().is_some());
 }
 
 #[test]

@@ -13,7 +13,7 @@ use onnx_runtime_ir::{Attribute, DataType};
 use crate::context::{InferenceContext, TypeInfo};
 use crate::dim_expr::DimExpr;
 use crate::error::ShapeInferError;
-use crate::handlers::{checked_axis, norm_axis};
+use crate::handlers::checked_axis;
 use crate::registry::InferenceRegistry;
 use crate::shape_data::ShapeData;
 
@@ -63,13 +63,31 @@ pub fn transpose(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
     };
     let rank = t.rank();
     let perm: Vec<usize> = match ctx.node.attr("perm").and_then(Attribute::as_ints) {
-        Some(p) => p.iter().map(|&a| norm_axis(a, rank)).collect(),
+        Some(p) => p
+            .iter()
+            .map(|&axis| {
+                checked_axis(axis, rank).ok_or_else(|| ShapeInferError::Invalid {
+                    op: "Transpose".into(),
+                    detail: format!("axis {axis} is out of range for rank {rank}"),
+                })
+            })
+            .collect::<Result<_, _>>()?,
         None => (0..rank).rev().collect(),
     };
     if perm.len() != rank {
         return Err(ShapeInferError::Invalid {
             op: "Transpose".into(),
             detail: format!("perm length {} != rank {rank}", perm.len()),
+        });
+    }
+    if perm
+        .iter()
+        .enumerate()
+        .any(|(i, axis)| perm[..i].contains(axis))
+    {
+        return Err(ShapeInferError::Invalid {
+            op: "Transpose".into(),
+            detail: "perm must contain each axis exactly once".into(),
         });
     }
     let out: Vec<DimExpr> = perm.iter().map(|&p| t.shape[p].clone()).collect();
@@ -285,13 +303,20 @@ fn unsqueeze_common(
     // range `[-output_rank, output_rank-1]`), so normalize against `out_rank`,
     // not the input rank — otherwise a high axis (e.g. 3 into a rank-2 input)
     // is wrongly clamped and the size-1 dims land in the wrong slots.
-    let norm: Vec<usize> = axes
-        .iter()
-        .map(|&a| {
-            let a = if a < 0 { a + out_rank as i64 } else { a };
-            a.clamp(0, out_rank as i64 - 1) as usize
-        })
-        .collect();
+    let mut norm = Vec::with_capacity(axes.len());
+    for &axis in &axes {
+        let axis = checked_axis(axis, out_rank).ok_or_else(|| ShapeInferError::Invalid {
+            op: ctx.op().into(),
+            detail: format!("axis {axis} is out of range for output rank {out_rank}"),
+        })?;
+        if norm.contains(&axis) {
+            return Err(ShapeInferError::Invalid {
+                op: ctx.op().into(),
+                detail: format!("axis {axis} is specified more than once"),
+            });
+        }
+        norm.push(axis);
+    }
     let mut out = Vec::with_capacity(out_rank);
     let mut src = t.shape.iter();
     for i in 0..out_rank {
@@ -1154,7 +1179,10 @@ pub fn gather(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
         .attr("axis")
         .and_then(Attribute::as_int)
         .unwrap_or(0);
-    let axis = norm_axis(axis, rank);
+    let axis = checked_axis(axis, rank).ok_or_else(|| ShapeInferError::Invalid {
+        op: "Gather".into(),
+        detail: format!("axis {axis} is out of range for rank {rank}"),
+    })?;
     let idx_shape = ctx
         .input_shape(1)
         .map(<[DimExpr]>::to_vec)
