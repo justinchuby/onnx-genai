@@ -133,6 +133,10 @@ not yet wired) · **🔬 custom** (needs a fused NVRTC/CUTLASS kernel).
 | `Reshape`, `Squeeze`, `Unsqueeze` | `` | ✅ | **memcpy** | Dtype-agnostic D2D copy into the executor's pre-shaped output; modern axes inputs and legacy attributes are accepted. |
 | `Transpose` | `` | ✅ | **NVRTC-custom** | Dtype-agnostic indexed byte copy; explicit permutation or default axis reversal. |
 | `Gather` | `` | ✅ | **NVRTC-custom** | Axis-parametric contiguous indexed copy; Int32/Int64 indices, negative index wrap, arbitrary index rank. |
+| `GatherElements` | `` | ✅ | **NVRTC-custom** | Dtype-agnostic contiguous element gather with Int64 indices, negative axes/indices, and CPU-matched rank/dimension validation. |
+| `ScatterElements` (v11 & v16) | `` | ✅ | **NVRTC-custom** | Deterministic f32/Int64 updates in row-major input order. Opset 16 supports `none`, `add`, `mul`, `min`, and `max`; duplicate indices therefore preserve CPU last-write/sequential-reduction semantics. |
+| `TopK` (v10) | `` | ✅ | **NVRTC-custom** | Deterministic f32 per-slice selection with input `K`, arbitrary/negative axis, largest/smallest modes, and CPU tie-breaking by lower source index. |
+| `CumSum` (v11) | `` | ✅ | **NVRTC-custom** | Deterministic per-lane f32/Int64 scan with scalar axis input, negative axes, and all exclusive/reverse combinations. |
 | `Shape` | `` | ✅ | **host + H2D** | Computes the metadata-only Int64 shape vector on host, including opset-15 `start`/`end`, then uploads it. |
 | `Expand` | `` | ✅ | **NVRTC-custom** | Dtype-agnostic broadcast copy sharing the binary-elementwise zero-stride indexing infrastructure. |
 | `Slice` | `` | ✅ | **NVRTC-custom** | Dtype-agnostic strided/stepped copy with opset-10 input-driven ranges, negative axes, and negative steps. |
@@ -188,7 +192,7 @@ by the CPU EP are `And`, `Conv`, `Greater`, `GreaterOrEqual`, `Less`,
 | **cuBLASLt** | `BiasGelu`/`FastGelu`/`QuickGelu` where expressible as an epilogue | GEMM+bias/activation belongs in the matrix multiply epilogue. |
 | **cuDNN** | `GlobalAveragePool`, `GlobalMaxPool`, `LogSoftmax`, `ReduceL2`, `ReduceProd`, `ReduceSumSquare` | Vendor-tuned pooling, normalization/softmax, and reduction primitives. |
 | **CUTLASS / cuDNN SDPA** | standard `Attention`, `FusedAttention` | Flash/SDPA implementation avoids materialising the O(S²) score tensor. |
-| **cub/thrust via NVRTC (CCCL headers)** | `ArgMax`, `ArgMin`, `TopK`, `CumSum`, `NonZero` | Scan/select/sort/reduction primitives; cudarc has no dlopen-able cub/thrust API. |
+| **cub/thrust via NVRTC (CCCL headers)** | `ArgMax`, `ArgMin`, `NonZero` | Select/sort/reduction primitives; cudarc has no dlopen-able cub/thrust API. |
 | **NVRTC-custom** | remaining unary math (`Acos`…`Tan`, `Swish`), quantize/dequantize, `Where`, `RotaryEmbedding`, indexed/strided movement (`Gather*`, `Slice`, `Tile`, `Expand`, `Transpose`, `Concat`, `Pad`, `Split`, `Range`) | Pointwise or index-transform work with no suitable runtime library; RoPE is a justified fusion kernel. |
 | **view / memcpy / host** | `Identity`, `Reshape`, `Flatten`, `Squeeze`, `Unsqueeze`, `Shape`, `Size`, `Constant`, `ConstantOfShape` | Metadata-only views, raw D2D copies, or small host-generated tensors. |
 

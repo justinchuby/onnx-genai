@@ -27,11 +27,13 @@ pub mod block_quantized_matmul;
 pub mod cast;
 pub mod constant;
 pub mod conv;
+pub mod cumsum;
 pub mod elementwise;
 pub mod fused_gemm;
 pub mod gather;
 pub mod gemm;
 pub mod group_query_attention;
+pub mod indexing;
 pub mod matmul;
 pub mod matmul_nbits;
 pub mod movement;
@@ -44,6 +46,7 @@ mod qmoe_grouping;
 pub mod reduce;
 pub mod shape;
 pub mod softmax;
+pub mod topk;
 pub mod where_op;
 
 use activations::ActivationFactory;
@@ -164,6 +167,10 @@ pub const CUDA_COVERED_OPS: &[&str] = &[
     "Transpose",
     "Unsqueeze",
     "Where",
+    "TopK",
+    "CumSum",
+    "GatherElements",
+    "ScatterElements",
 ];
 
 /// Build an [`OpRegistry`] populated with the CUDA kernel factories.
@@ -185,6 +192,32 @@ pub fn build_cuda_registry(runtime: Arc<CudaRuntime>) -> OpRegistry {
     reg.register(
         OpKey::new("Gather", "", 1),
         Box::new(gather::GatherFactory {
+            runtime: runtime.clone(),
+        }),
+    );
+    reg.register(
+        OpKey::new("GatherElements", "", 11),
+        Box::new(indexing::GatherElementsFactory {
+            runtime: runtime.clone(),
+        }),
+    );
+    for opset in [11, 16] {
+        reg.register(
+            OpKey::new("ScatterElements", "", opset),
+            Box::new(indexing::ScatterElementsFactory {
+                runtime: runtime.clone(),
+            }),
+        );
+    }
+    reg.register(
+        OpKey::new("CumSum", "", 11),
+        Box::new(cumsum::CumSumFactory {
+            runtime: runtime.clone(),
+        }),
+    );
+    reg.register(
+        OpKey::new("TopK", "", 10),
+        Box::new(topk::TopKFactory {
             runtime: runtime.clone(),
         }),
     );
@@ -585,11 +618,18 @@ mod tests {
 
     #[test]
     fn covered_ops_have_no_duplicates() {
-        assert_eq!(CUDA_COVERED_OPS.len(), 78);
+        assert_eq!(CUDA_COVERED_OPS.len(), 82);
 
         let mut seen = std::collections::HashSet::new();
         for op in CUDA_COVERED_OPS {
             assert!(seen.insert(*op), "duplicate op {op} in CUDA_COVERED_OPS");
+        }
+
+        #[test]
+        fn indexing_and_scan_ops_are_listed_in_coverage() {
+            for op in ["TopK", "CumSum", "GatherElements", "ScatterElements"] {
+                assert!(CUDA_COVERED_OPS.contains(&op));
+            }
         }
     }
 
