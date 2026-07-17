@@ -2080,3 +2080,640 @@ Independent validation passed: onnx-rs 149 tests and shape-inference 173 tests. 
 **By:** Roy
 **What:** CSA ratio-4 emits one compressed record per four source tokens. Its overlap factor is two projection channels with an eight-slot carry: previous-block left channels plus current-block right channels. Index-head scores are reduced before one shared top-k; the diagnostic output repeats that shared list across its frozen index-head axis. Equal-score top-k ties remain explicit `Unsupported`.
 **Why:** The pinned source and contract lines 1202-1263 define four-token emission and `[B,8,2D]`/`[B,8,2ID]` carry behavior; they do not define a stride-2 compressor. Lines 1281-1303 reduce index heads before `torch.topk`, while lines 1589-1595 state that equal-score tie ordering is not portable.
+
+## 2026-07-17 — Decision inbox merge
+
+<!-- Source: mariette-qmoe-activation-coverage.md -->
+### 2026-07-17: QMoE CPU↔CUDA equivalence coverage extended (activations/FC3/bias/router)
+**By:** Mariette
+**What:** Added equivalence tests for nonlinear activations (gelu/silu/swiglu), FC3 gated MLP, biases, and separate router_weights aggregation. The tests isolate biases and router aggregation with identity activation, exercise FC3 without biases or separate router weights, cover both CUDA GEMV and grouped-GEMM paths, and include a combined GLM-like gated-SiLU case for f32/f16/bf16.
+**Why:** Nabil advisory — prior tests only covered identity/no-bias/no-FC3/shared-weights, leaving GLM MoE numerics under-locked. All requested axes are implemented by both kernels; no unsupported-feature gap was found.
+
+<!-- Source: wallace-visible-scope-incremental.md -->
+### 2026-07-17: shape inference builds visible_scope only for subgraph-bearing nodes
+**By:** Wallace
+**What:** visible_scope is now built/extended incrementally and only when a node has child subgraphs; subgraph-free nodes skip scope materialization.
+**Why:** Audit hotspot #1 — O(N·V), 1.22s @20k nodes (600× ratio). Inferred shapes byte-identical, closure semantics preserved.
+
+<!-- Source: roy-review-epctx-batching.md -->
+### 2026-07-17: Review — EPContext partition-splice batching
+**By:** Roy (reviewer)
+**Verdict:** 🟢 APPROVE
+**What:** Reviewed the full `9362f9b` diff. Boundary inputs/outputs still iterate covered nodes in ascending `NodeId` and use `HashSet`s only for membership/first-seen dedup; no observable order derives from hash iteration. Hoisting `graph_outputs` is equivalent because splicing never mutates `graph.outputs`. Batched removals/insertions preserve partition order, covered-node removal order, recycled `NodeId`s, edge order, producer links, and orphan-value collection. Independently compared the existing multi-partition export against parent `d5f5432`: both serialized files had SHA-256 `1551b4cff1b2b8be5d06e80ad3c1aa183b585d0ce1738e4d9cbae3901f01aeb6`. Ran `cargo test --locked -p onnx-runtime-loader -p onnx-runtime-ir` with the required target directory; all 147 tests passed.
+**Why:** The ordering ABI remains ascending-`NodeId` with first-seen dedup, the final graph mutation sequence is observationally equivalent to the prior sequential splice for valid disjoint partitions, and serialized multi-partition output was proven byte-identical to the parent implementation.
+
+<!-- Source: holden-review-qmoe-coverage.md -->
+### 2026-07-17: Review — QMoE CPU↔CUDA equivalence coverage
+**By:** Holden (reviewer)
+**Verdict:** 🟢 APPROVE
+**What:** Verified that `run_cpu` obtains the real `CpuExecutionProvider` QMoE kernel and supplies the expected values, while `run_gpu` obtains the CUDA kernel and compares its copied-back output against that CPU result. CPU and CUDA GELU both use the same f64/double tanh approximation with identical constants; SiLU and SwiGLU formulas also match. The tests distinctly exercise ordinary GELU/SiLU, FC3-gated SiLU, unfused SwiGLU with separate FC3, interleaved fused SwiGLU, split fused SwiGLU, FC1/FC2 biases, FC3 bias, and separate aggregation weights that differ materially from the routing logits. The f16/bf16 oracle rounds only the activation input before CPU f32 computation, matching CUDA's widened input and fp32 accumulation, then accounts for output storage rounding. Ran `cargo test --locked -p onnx-runtime-ep-cuda --test qmoe_gpu` with the required CUDA environment: 21 passed, 0 failed; also reran the GELU case with `--nocapture` on available NVIDIA H200 GPUs.
+**Why:** The cases use non-trivial quantized weights, non-zero bias vectors, a distinct FC3 seed, and aggregation values unrelated to the logits; the forced routing gives every expert three routes, so thresholds 2 and 1024 genuinely select grouped GEMM and per-route GEMV paths. The tolerances are not laundering an implementation difference: f32 `1e-4` covers CPU-serial versus CUDA-tree reduction order, while f16 `6e-4` and bf16 `4.1e-3` closely track one output-storage unit roundoff (`2^-11` and `2^-8`) plus the same accumulation allowance. At unit scale the new bounds are only about 11%, 4%, and 3% above the prior derived bounds, respectively.
+
+<!-- Source: deckard-cuda-cpu-drift.md -->
+### 2026-07-17: CUDA↔CPU numeric drift root cause
+**By:** Deckard
+**What:** The reported token-index-10 flip was a genuine CUDA RMSNorm bug: NVRTC contracted the recurrent square accumulation to FMA, unlike the CPU oracle. The existing `__fmul_rn`/`__fadd_rn` fix restores that boundary; the next token-12 bug was fused-SiLU operation order and is also already fixed. RoPE/GQA and QMoE stay at `1.49e-8` and `1.86e-8` max absolute error. Residual accuracy-4 MatMulNBits warp/VNNI reduction-order noise is `1.9073486e-5` (6 ULP) per op and first flips the Qwen probe at token 16; no production patch was applied because exact CPU-tree emulation is architecture-specific and previously cost 8.4% decode throughput. Added long-context/per-op error-bound regressions and reporting.
+**Why:** GLM long-context accuracy (north-star). Drift first at token index ~10 was accumulating error in RMS normalization across recurrent layers/tokens; after the clear bugs are fixed, the remaining accumulating source is MatMulNBits reduction-order noise, not KV-cache RoPE/GQA or MoE aggregation.
+
+<!-- Source: chew-batch-dead-node-removal.md -->
+### 2026-07-17: batch Graph::remove_nodes eliminates O(N²) dead-node deletion
+**By:** Chew
+**What:** Added `Graph::remove_nodes` (single consumer-retain pass + precomputed I/O sets for orphan GC); DeadNodeElimination now batches. Byte-identical to sequential remove_node.
+**Why:** Audit hotspot #6 — per-node consumers.retain + linear inputs/outputs.contains was O(N²) (57ms @20k wide dead nodes).
+
+<!-- Source: bryant-review-visible-scope.md -->
+### 2026-07-17: Review — incremental visible_scope
+**By:** Bryant (reviewer)
+**Verdict:** 🟢 APPROVE
+**What:** Closure fidelity is preserved: prior outer outputs and enclosing scopes reach doubly nested subgraphs; prior inner bindings shadow outer names without leaking to sibling or parent scopes; future node outputs are excluded. Loop carried/state inputs and Scan state/scan inputs retain their declared types and shapes. A transient mixed graph covering ordinary nodes, nested If, shadowing, Loop, Scan, and outer captures produced an identical deterministic dtype/shape snapshot on `d245f9e` and `08c8006`; a separate known-`value_info` future-output probe passed only on `08c8006`, confirming corrected ordering. The requested shape-inference, loader, and session test command passed.
+**Why:** `child_scope` is created only when a node owns subgraphs. It starts from the enclosing imported scope, adds graph inputs/initializers once, then drains outputs accumulated after each previously inferred node. Current-node outputs are added only after its subgraphs run, and subgraph-local values are never inserted into the parent map. Subgraph-free graphs therefore perform no scope construction or output queueing, while graphs with later subgraphs still accumulate every preceding output. Validation: `CARGO_TARGET_DIR=/home/justinchu/target-vscope cargo test --locked -p onnx-runtime-shape-inference -p onnx-runtime-loader -p onnx-runtime-session` exited successfully.
+
+<!-- Source: roy-registry-index.md -->
+### 2026-07-17: OpRegistry indexed by (domain, op_type)
+**By:** Roy
+**What:** Added a sorted per-(domain,op_type) since_version index; lookup/supports/earliest_since_version now O(log v)/O(1) instead of O(R). Behavior byte-identical incl. ai.onnx/"" aliasing.
+**Why:** Audit hotspot #7 — ~2.9M registry key comparisons at 10k-node static compile.
+
+<!-- Source: holden-review-drift-fixes.md -->
+### 2026-07-17: Review — CUDA RMSNorm/SiLU numeric-drift fixes
+**By:** Holden (reviewer)
+**Verdict:** 🔴 REJECT
+**What:** The RMSNorm fix is correct: both RMS reductions retain serial f32 accumulation and use explicit `__fmul_rn` then `__fadd_rn`, so NVRTC cannot contract the square accumulation into FMA. The kernel still computes mean-of-squares, adds epsilon, takes reciprocal square root, and applies scale; exact FMA-sensitive GPU regressions pass. The CUDA RMSNorm implementation remains f32-only, so this change neither alters nor validates f16/bf16 behavior. The SiLU f32 fix follows the CPU's branch-stable `x / (1 + exp(-x))` or `(x * exp(x)) / (1 + exp(x))` order with explicit f32 rounding boundaries, and its exact CPU-order regression passes; CUDA SiLU remains f32-only.
+
+`cargo test --locked -p onnx-runtime-ep-cuda` passed all 166 tests on H200. Targeted metrics were GQA/RoPE max absolute error `1.4901161e-8`, QMoE `1.8626451e-8`, and accuracy-level-4 MatMulNBits `1.9073486e-5` (6 ULP). The real-model `native_cuda_qwen_decode_matches_cpu_tokens` test could not reach generation: it fails pre-decode with the reported `no inferred shape for value present.0.key produced by op GroupQueryAttention`. This blocker is pre-existing relative to `07e5545`: that commit changes only three CUDA test files and does not touch engine, session, loader, or shape inference.
+
+**Why:** The kernel fixes themselves are sound, but the token-16 residual-noise acceptance is not. The source test sets `max_new_tokens: 16` and compares only token indices 0–15, exactly stopping before the documented first divergence at index 16. Therefore it does not establish that CUDA and CPU tokens remain equal once the residual MatMulNBits drift is amplified. A reported CPU top-logit margin of `0.6502361` at the divergent step is not a near-tie and cannot be waved off as harmless output noise merely because the originating per-op difference is `1.9073486e-5`. The acceptance criterion is token correctness, and the known token flip remains. Sapper should own the revision: remove the real divergence (without Deckard), or provide a rigorously justified equivalent path, and extend the real decode parity test beyond the first known divergent token (preferably 32–64 tokens).
+
+<!-- Source: wallace-review-batch-remove-nodes.md -->
+### 2026-07-17: Review — batch Graph::remove_nodes
+**By:** Wallace (reviewer)
+**Verdict:** 🟢 APPROVE
+**What:** The batch path is semantically equivalent to sequential `remove_node` for valid graphs. Shared values retain surviving consumers in original order; producer links are cleared only when owned by a removed node; orphan collection uses the same producer/consumer/I/O/initializer predicate and preserves graph outputs and initializers. The sequential count simulation handles values shared by multiple removed consumers, slice ordering, duplicate/non-live IDs, value-arena GC order, and unknown type/shape cleanup. `remove_node` itself remains unchanged. The 10,000-trial test uses an actual sequential-removal clone, compares the complete `Graph` debug state, and probes node/value arena free-list order.
+**Why:** The implementation filters each touched consumer vector once with `retain`, preserving relative order and every surviving consumer, while precomputed membership sets replace only linear membership checks. Dedicated edge cases cover shared surviving consumers, all-removed consumers, protected outputs/initializers, and duplicate/non-live IDs. `cargo test --locked -p onnx-runtime-ir -p onnx-runtime-optimizer` passed all 99 tests (48 IR, 50 optimizer unit, 1 optimizer integration), plus doc tests.
+
+<!-- Source: sapper-gqa-present-shape.md -->
+### 2026-07-17: GQA present K/V outputs always carry a shape (graceful degrade)
+**By:** Sapper
+**What:** group_query_attention no longer early-returns when past-K/V shape is missing/non-rank4; it emits [batch, kv_heads, opaque_seq, head_dim] so present.N.key/value always have a shape.
+**Why:** Session requires op-produced values to carry a shape; missing present shape blocked native engine decode for GQA models (Qwen/GLM). Resolved-past path unchanged (byte-identical).
+
+<!-- Source: leon-fusion-resumable-scan.md -->
+### 2026-07-17: fusion uses a resumable ascending-id worklist (was O(F*N) restart)
+**By:** Leon
+**What:** OpFusion no longer rescans the arena prefix after each rewrite; an ascending-id candidate worklist re-seeds only the affected neighborhood, preserving lowest-id-first fusion order. Output byte-identical to the restart fixpoint.
+**Why:** Audit hotspot #5 — restart-from-zero find_match was O(F*N) (364ms @20k MatMul+Add).
+
+<!-- Source: bryant-review-gqa-present.md -->
+### 2026-07-17: Review — GQA present K/V graceful shape
+**By:** Bryant (reviewer)
+**Verdict:** 🟢 APPROVE
+**What:** Guard scoping is correct: only the missing/non-rank-4 past-cache guards after output 0 were replaced. Present K/V are structurally `[query batch, kv_num_heads, opaque-or-resolved sequence, output-0 head_dim]`; output-count guards remain intact. The rank-4 constant path retains `max(capacity, total)`, and the missing, rank-4, and non-rank-4 cases are covered by assertions for both present outputs.
+**Why:** All prerequisites for attention output 0 remain guarded, and batch, KV heads, and head dimension are derived before present emission. Missing or invalid-rank past shapes degrade only the sequence dimension via `fresh_dim()` rather than inventing a concrete extent. For valid rank-4 past plus scalar total, the resolved branch is unchanged and CASE B confirms the original fixed-capacity result. `cargo test --locked -p onnx-runtime-shape-inference` passed all unit, integration, and doc tests.
+
+<!-- Source: wallace-fusion-review.md -->
+### 2026-07-17: Reject fusion resumable-scan optimization
+**By:** Wallace
+**What:** 🔴 REJECT `a0023bc`. Leon is locked out from revising this artifact; Pris should own the next revision of the differential proof.
+**Why:** The hard semantic-preservation proof is insufficient. `crates/onnx-runtime-optimizer/src/fusion.rs:2584-2606` chooses exactly one canned motif per trial, while lines 2608-2626 only append terminal unary noise. It never composes multiple registered fusion candidates, shuffled/non-topological NodeIds, or chained/overlapping default-pattern candidates that can exercise lower-id revisits after mutation; the only explicit overlap is the synthetic `ReluPair` case at lines 2630-2644. Therefore the 5,000 trials do not validate the completeness of `affected_candidate_starts` at lines 251-278 for the adversarial ordering case required by the review mandate. The independent locked test command passed: 48 IR tests, 52 optimizer tests, 1 integration test, and doc tests.
+
+<!-- Source: nabil-glm-readiness-gaps.md -->
+### 2026-07-17: GLM-5.2 runtime readiness gap analysis
+**By:** Nabil
+**What:** A correctness-first f32 GLM target can take the portable CPU path once the Mobius export/domain/cache-shape fixes land, but smooth CPU/CUDA execution still needs `BlockQuantizedMoE` and selected-token DSA. Native CUDA additionally lacks the standard Attention/Rotary/TopK/movement graph core; DeepSeek native CSA and MTP state orchestration remain incomplete.
+**Why:** North-star = run GLM smoothly; this enumerates the remaining runtime gaps to dispatch against.
+
+<!-- Source: mariette-drift-revision.md -->
+### 2026-07-17: CUDA↔CPU drift revision — token-16 characterization + extended parity
+**By:** Mariette (revising Deckard's rejected artifact; Deckard locked out)
+**What:** Real bug, not a near-tie: before the revision token 16 had CPU top-2 1181=17.438587 and 330=16.788351 (gap 0.6502361), while CUDA flipped to 330=17.04121 over 1181=16.720116 (gap 0.3210945). The residual MatMulNBits K=4864,N=896 reduction-order delta is bounded at 2.670288e-5 and was not causal. MatMulNBits was left parallel; CPU SiLU/GQA softmax now round f64 exp to f32 like CUDA, and CUDA GQA RoPE prevents FMA contraction. Exact token parity now covers 64 tokens with a 2e-5 recurrent logit bound; token 16 is identical with the same 0.6502361 gap.
+**Why:** Holden 🔴 — 16-token test stopped before the known divergence; residual unproven. Kept Deckard's correct RMSNorm/SiLU fixes.
+
+<!-- Source: chew-fusion-revision.md -->
+### 2026-07-17: Strengthen resumable fusion-scan differential proof
+**By:** Chew
+**What:** Replaced the canned differential fixture with 5,000 randomized composite graphs. Every trial exercises all five registered fusion matchers, shuffled insertion and NodeId/free-list assignment, overlapping MatMul candidates sharing Add/Relu nodes, and a test-only chained replacement that must be revisited below the ascending cursor. The restart-scan oracle and resumable implementation are compared through byte-identical canonical graph serialization plus arena-allocation probes.
+**Why:** Wallace rejected the original evidence because it did not prove lowest-NodeId ordering or affected-node completeness under overlap, chaining, and varied arena layout. The strengthened test found no completeness or ordering bug, so the resumable implementation was unchanged. The required optimizer/IR gate passed (100 tests total plus integration/doc tests); a release probe on 20,000 MatMul+Add pairs measured 2.61x versus the restart oracle (2.730s → 1.045s), preserving the performance win. Wallace must re-review this revision.
+
+<!-- Source: wallace-fusion-rereview.md -->
+### 2026-07-17: Reject fusion resumable-scan revision
+**By:** Wallace
+**What:** 🔴 REJECT `1c68735`. Chew is now locked out of this revision cycle (Leon remains locked out); Pris should own the next revision of the differential proof.
+**Why:** The restart oracle is faithful, all five registered matchers and shared-node structural overlaps are exercised, serialization compares complete live graph state plus future arena allocations, and the required locked suite passes (48 IR + 51 optimizer + 1 integration; doc tests green). However, the chained adversary at `fusion.rs:2823-2834,2903-2912` only exercises the unconditional `revisits.insert(fused_id.0)` path: reverse removal followed by LIFO arena insertion reuses the old `ChainStart` slot, while its external input is a graph input, so `affected_candidate_starts` contributes no predecessor at all. Thus the test still does not prove the completeness of `affected_candidate_starts`, the exact rejected concern. It also consumes every seeded free slot before optimization (`fusion.rs:2846-2867`), so optimizer-entry free-list occupancy/state is not varied. Pris must add an asserted case where a previously scanned lower-ID predecessor is absent from the fused region, is returned by `affected_candidate_starts`, becomes newly matchable only after the higher-ID fusion, and would be missed if affected revisits were disabled; retain randomized nonempty free-list states.
+
+<!-- Source: holden-drift-rereview.md -->
+### 2026-07-17: CUDA↔CPU token-16 drift re-review
+**By:** Holden
+**What:** 🟢 APPROVE commit `87fbc09` and the full `d245f9e..87fbc09` drift change set.
+**Why:** The real Qwen native decode test now drives the same recurrent CPU/CUDA path for 64 tokens, checks every step at `2e-5` max-logit error, and explicitly verifies the former step-16 failure point. Two independent runs passed with identical step-16 top-2 logits, token IDs, `0` max error, and `0.6502361` gaps. CPU SiLU/GQA now use the CUDA kernel's existing double-precision `exp` followed by the shared f32 boundary, improving rather than reducing transcendental accuracy. CUDA RoPE uses standard explicit round-to-nearest multiply/add intrinsics, preventing FMA contraction with negligible launch-bound decode cost; its 64-token reference test is bit-exact. The `2.670288e-5` synthetic MatMulNBits difference is deterministic floating reduction-order variance between CPU VNNI lanes and the CUDA warp tree, not a dequantization or token-selection bug. The full locked ep-cuda suite passed (166 tests), and targeted CPU/GQA/session/shape regressions passed.
+
+<!-- Source: deckard-fusion-proof.md -->
+### 2026-07-17: Prove affected-start fusion revisits and match-start slot reuse
+**By:** Deckard
+**What:** Added a 5,000-seed differential test whose lower-NodeId `AdversaryStart` is initially ineligible, then becomes eligible only after a later higher-NodeId fusion replaces a three-node region. The later match consumes the lower start's output as an external input, so `affected_candidate_starts` schedules that already-passed start; instrumentation proves 5,000/5,000 affected behind-cursor revisits (100%), and disabling affected scheduling makes trial 0 fail. Every trial compares nodes, IDs, values/edges, topology, metadata, and observable node/value arena free-list state byte-for-byte with the original restart-scan oracle.
+**Why:** No implementation bug was found. The exact proposal that a later fusion consume an older reclaimed low slot is structurally impossible: `apply_fusion_returning_id` removes the current match in reverse, placing its start slot last on the LIFO free-list, then immediately inserts the replacement into that start slot. The test proves this invariant on every fusion and separately probes that the earlier fusion leaves lower interior slots reclaimable in 5,000/5,000 trials. The meaningful adversarial path is nevertheless exercised independently of `fused_id`: the newly eligible lower start differs from the first fused ID and is reached with `ScanCandidateSource::Revisit`. Required optimizer+IR gate passed (48 IR unit, 52 optimizer unit, 1 optimizer integration; doc tests green). Final release audit: 20k no-match fusion 0.782 ms; 20k match-heavy fusion 199.010 ms versus the recorded 364.826 ms baseline (~1.83× faster), with a prior-revision comparison at 206.658 ms showing no observer/proof regression beyond run noise. Wallace must re-review this third-owner revision.
+
+<!-- Source: coordinator-graph-ir-one-mutable-storage-type-borrow-enforced-.md -->
+### 2026-07-17T18-05-01: Graph IR: one mutable storage type + borrow-enforced read-only + GraphView lens; no separate immutable Graph representation
+**By:** coordinator
+**What:** Graph IR: one mutable storage type + borrow-enforced read-only + GraphView lens; no separate immutable Graph representation
+**References:** crates/onnx-runtime-ep-api/src/provider.rs:410, crates/onnx-runtime-ep-api/src/abi.rs:12, crates/onnx-runtime-session/src/executor.rs:272
+**Why:** ### 2026-07-17: Mutable vs immutable graph representation
+
+**By:** Squad (Coordinator), approved by Justin Chu (justinchuby)
+
+**Decision:** Do NOT introduce a second, immutable Graph storage type.
+
+1. Immutability at the EP boundary is already free via Rust borrows: claim_nodes(&self, graph: &Graph) (ep-api/provider.rs:410) hands EPs an immutable &Graph, compile-time enforced (ORT needs a distinct GraphViewer type only because C++ has no borrow checker + crosses a C ABI).
+
+2. Mutable/immutable is a LIFECYCLE, not two coexisting storage types: load -> optimize -> partition/fuse (mutable Graph) -> freeze -> execute (immutable plan: Vec<NodePlan>, executor.rs:272). The mutable Graph never appears on the per-token hot path.
+
+Chosen shape (three representations by lifecycle phase, ONE storage type):
+- Mutable Graph: HashMap-keyed edges (NodeId, input_index) -> O(1) single-edge add/remove; deterministic sorted accessors for reproducibility (user hard requirement).
+- GraphView (immutable lens): promote stub OrtGraphView (ep-api/abi.rs:12) into a read-only projection borrowing &Graph + cached topo-order + optional assigned-node filter (mirrors ORT GraphViewer). Ordering materialized ONCE, cached; natural home for arena-tombstone compaction.
+- plan: Vec<NodePlan>: existing frozen execution artifact; unchanged.
+
+Consequences: Chew's IR container refactor stays; GraphView lens is an additive follow-up; IR-refactor reviewers must verify NO per-run hot-path graph traversal regression.
+
+<!-- Source: chew-ir-refactor.md -->
+### 2026-07-17: Make single-node graph removal fanout-independent
+**By:** Chew
+**What:** Replaced `Value.consumers: Vec<NodeId>` with a hash-backed `(NodeId, input_index)` use set; added sorted deterministic `uses`/`consumers` boundaries, `Graph::replace_input`, per-value graph-I/O flags, and Vec-indexed topological-order scratch. Updated every workspace edge reader/mutator, added randomized equivalence/topology/serialization determinism proofs, and committed a release benchmark harness plus `docs/IR_CONTAINER_REFACTOR.md`.
+**Why:** Removing hub consumers one at a time was quadratic because every removal retained over the full consumer vector and scanned graph I/O. On the same 96-vCPU Xeon 8480C, release median sequential removal improved from 17.137 ms to 1.589 ms at 10k consumers and 58.792 ms to 2.927 ms at 20k; one hub-edge disconnect improved from 3.467 us to 0.683 us and 6.366 us to 0.815 us. Hash iteration is never observable: uses sort by `(NodeId,input_index)`, consumers/traversals sort by `NodeId`, Debug sorts, serialization/topology tests require byte-identical results after shuffled insertion. Wallace (IR owner) must review before merge.
+
+<!-- Source: coordinator-landed-cuda-cpu-token-16-drift-fix-ccf994c-kimi-k3.md -->
+### 2026-07-17T18-30-21: Landed CUDA↔CPU token-16 drift fix (ccf994c); Kimi K3 MoE expert-parallelism doc read + kept in mind
+**By:** coordinator
+**What:** Landed CUDA↔CPU token-16 drift fix (ccf994c); Kimi K3 MoE expert-parallelism doc read + kept in mind
+**References:** ccf994c, docs/MOE_EXPERT_PARALLELISM.md, wt-fusion, wt-ir-refactor
+**Why:** ## Landed
+- **ccf994c** — fix(ep-cuda): resolve/characterize token-16 MatMulNBits drift + extend decode parity to 32-64 tokens (author Mariette; reviewer Holden 🟢 APPROVE, 166 ep-cuda tests pass, drift 2.67e-5 deterministic reduction-order variance, 64-token parity @2e-5). Carried Deckard's per-op drift-bound test (d7cec74). Redundant GQA-present-shape commit auto-dropped (already upstream via c89e61f). Rebased linear, FF-pushed, worktree cleaned.
+
+## Kimi K3 architecture — read & noted (docs/MOE_EXPERT_PARALLELISM.md, commits 222c9a8+4538a96)
+Authoritative target specs now in-repo: Kimi K3 = 2.8T / 896 experts / 16 active (~50B active, ~1.4TB FP4). Novel components: KDA (Kimi Delta Attention), AttnRes (cross-layer attention residuals), Gated MLA, Stable LatentMoE + Quantile Balancing. Deployment design: session-per-GPU expert parallelism, control-plane(Rust)/data-plane(GPU) separation, MoeDispatch/MoeGather NCCL custom ops baked into each session graph, distributed PageTable (per-device shards), Mac Studio (MLX+TB5) cross-node path. REINFORCES our direction: frozen-plan hot path + GraphView lens (EPs get immutable graph views), EP-claim of custom NCCL op nodes, per-attention-type KV caching keyed by inference_metadata. No conflict with the in-flight IR refactor.
+
+## In flight
+- wallace-30: THIRD review of fusion resumable-scan (Deckard proved affected_candidate_starts completeness 5000/5000 in f997173).
+- wallace-31: IR container refactor review (Chew b0869f2: 10k removal 17ms->1.6ms, 20k 59ms->2.9ms).
+- nabil-20: Kimi op/kernel-coverage readiness note (companion to the deployment doc).
+
+<!-- Source: wallace-fusion-rereview3.md -->
+### 2026-07-17: Third review of resumable fusion scan
+**By:** Wallace
+**What:** 🟢 APPROVE commits a0023bc, 1c68735, and f997173.
+**Why:** The previously unproven behind-cursor case is now adequately resolved.
+
+- **Free-slot trace:** `apply_fusion_returning_id` removes `m.nodes` in reverse order. `Arena::remove` pushes each slot onto a LIFO free list, so the match start (`m.nodes[0]`) is pushed last. The immediately following `insert_node` therefore always gives the fused replacement the match-start NodeId. Every fusion performs this remove-then-single-insert sequence; older freed interior slots remain below the new match-start slot and cannot be consumed by a later fusion replacement. The 5,000-trial probe also confirms the replacement always takes `later_start`, while a subsequent unrelated probe takes the lower interior slot. Thus the claim that older free-slot reuse is structurally impossible for fusion replacements holds.
+- **Affected scheduling:** The dedicated adversary creates an existing lower-id start whose eligibility changes after the later fusion. It was revisited through `affected_candidate_starts` in 5,000/5,000 trials. I locally disabled insertion of affected candidates into `revisits`: the targeted test failed on trial 0. After temporarily bypassing its observer-count assertion, the byte-identical restart-reference assertion also failed, confirming a genuinely wrong fixpoint rather than merely missing instrumentation. The broader randomized differential test still passed that mutation, so the dedicated adversary is the load-bearing coverage.
+- **Determinism:** Initial candidates come from ascending arena keys, and all revisit resolution is normalized through `BTreeSet`. Although predecessor discovery uses `HashSet`, its iteration order cannot affect graph mutation order because candidates are inserted into the ordered set. The differential tests compare sorted graph state plus future arena allocation sequence. I additionally ran a temporary 100-run reconstruction test using independently created graphs/HashMaps; serialized results were byte-identical.
+- **Tests:** `cargo test --locked -p onnx-runtime-optimizer` passed: 52 unit tests, 1 integration test, 0 failures. The worktree was restored clean after mutation probes.
+
+<!-- Source: nabil-kimi-k-readiness.md -->
+### 2026-07-17: Treat Kimi MLA/KDA as first-class attention-state gaps
+**By:** Nabil
+**What:** Kimi K2/K3 readiness must not equate MLA with existing GQA or DeepSeek CSA. Add versioned semantic MLA and KDA boundaries with explicit persistent state, then prioritize `BlockQuantizedMoE` with lazy leases and model-exact MXFP4/MXFP8 negotiation. AttnRes should initially remain graph-visible activation state, not KV state. K3 MTP must remain conditional until a released artifact verifies it.
+**Why:** K2's public config proves low-rank latent KV plus a separate RoPE component, while GQA stores conventional full K/V heads and CSA implements ratio-4/128 temporal sparse compression. The current direction already provides the right seams—op/domain/opset dispatch, arbitrary IR nodes, lazy `WeightHandle`, paged checkpoint/restore, and a stateful private CSA precedent—but lacks generalized attention-state lifecycle, native MLA/KDA kernels, live `BlockQuantizedMoE` paging, and multi-device expert placement.
+
+<!-- Source: wallace-ir-refactor-review.md -->
+# IR Container Redesign Review — commit b0869f2 (branch `ir-refactor`)
+
+**Reviewer:** Wallace (IR owner) · **Date:** 2026-07-17T18:25Z · **Requested by:** Justin Chu
+**Author:** Chew · **Worktree:** /home/justinchu/wt-ir-refactor · **Merge base:** c89e61f
+
+## Verdict: 🟢 APPROVE
+
+The O(n²) single-node removal is genuinely fixed by making consumer edges a
+`HashSet<(NodeId, input_index)>` with O(1) keyed removal, and the HARD
+determinism requirement is preserved by sorting at every observable boundary.
+All four contract items verified; tests green; benchmark re-run confirms scaling.
+
+---
+
+## a. Determinism / reproducibility — PRESERVED ✅
+
+- The new `Consumers` type (value.rs) wraps a `HashSet<Usage>` and **only**
+  exposes iteration through sorted snapshots: `uses()` sorts by
+  `(NodeId, input_index)`, `nodes()` sorts by `NodeId` + dedups. `Debug` prints
+  the sorted `uses()`. Equality is set-based (order-independent).
+- Every place that feeds consumer ordering into observable output goes through
+  these sorted accessors:
+  - `graph.rs` `producers_of`/successor build sort with `sort_unstable_by_key(|n| n.0)`;
+  - `topological_order` uses a min-heap keyed on raw `NodeId` (Reverse), so adj
+    insertion order is irrelevant;
+  - `replace_all_uses` iterates the sorted `uses()` and rewrites graph outputs
+    via `set_outputs`;
+  - all optimizer/loader/memory consumers now call `graph.consumers()` /
+    `graph.uses()` (sorted), never the raw set.
+- Audit: no code iterates the raw `HashSet` for output. Only internal
+  `insert`/`remove`/`contains` and order-independent `PartialEq` clones touch it.
+- **Proof by test:** `consumer_hash_insertion_order_is_not_observable` (IR) and
+  `debug_serialization_and_topology_ignore_consumer_hash_insertion_order`
+  (loader) shuffle consumer insertion order and assert identical Debug, topo
+  order, `uses`, `consumers`, **and byte-identical `encode_model` output**.
+  No HashMap-iteration-order leak into any deterministic result.
+
+## b. Byte-identical equivalence vs old algorithm — PRESENT ✅ (with a caveat)
+
+- `single_node_removal_matches_vector_reference_on_random_dags` — 2000 random
+  DAGs, new `remove_node` vs an independent reference; asserts Debug, topo,
+  per-value `uses` and `consumers` all match.
+- `vec_indexed_topology_matches_hashmap_reference_on_random_dags` — 2000 trials,
+  new Vec-indexed topo vs HashMap reference.
+- `randomized_single_removal_matches_reference_serialization` (loader) — 250
+  trials asserting **serialized model bytes** are identical to the reference.
+- Caveat (non-blocking): the "reference" is a semantic oracle re-implemented via
+  the new `replace_input` API, not the literal pre-refactor `Vec<NodeId>` code
+  (which is deleted). It independently reproduces old semantics (per-edge scan +
+  orphan GC), so it is a legitimate differential oracle. Acceptable.
+
+## c. Benchmark proves O(n²)→O(n) for single-node removal — CONFIRMED ✅
+
+Re-ran `examples/remove_node_bench` (release) myself on a high-fanout hub graph:
+
+| nodes | sequential_remove (ms) | single_hub_disconnect (µs) |
+|------:|-----------------------:|---------------------------:|
+| 5000  | 0.790 | 0.561 |
+| 10000 | 1.420 | 0.749 |
+| 20000 | 3.272 | 0.855 |
+| 40000 | 6.670 | 1.046 |
+
+- Single-node disconnect from a value with fanout = node_count stays **flat**
+  (~0.56→1.05 µs while node count grows 8×) — the fanout-independence the fix
+  targets. Old `consumers.retain(...)` was O(fanout) per removal → O(n²) batch.
+- Sequential (remove all) scales **linearly** (~2× time per 2× nodes).
+- Directly validates the claim; not just the batch path.
+
+## d. No per-run hot-path regression — CONFIRMED ✅
+
+- `executor.rs` frozen `plan: Vec<NodePlan>` execution path is unchanged; the run
+  loop reads `self.plan[..]` / `self.graph.node(plan.node_id)`, never the mutable
+  container's consumer sets.
+- The only `consumers` reads in session/memory/optimizer/loader are **build-time**:
+  `fuse_silu_patterns`, `build_lazy_weight_handles`, memory `liveness`/`validate`,
+  loader `partition_boundary`, and fusion pattern matching. None run per token.
+- Container mutation cost is therefore build-time only, as designed.
+
+---
+
+## Residual-risk assessment
+
+1. **HashSet memory overhead** — ACCEPTABLE / non-blocking. Per-value
+   `HashSet<(NodeId,u32)>` costs more than a `Vec` for the common small-fanout
+   case, but it is a build-time structure freed once the plan is frozen. Optional
+   future optimization: inline/smallvec storage for fanout ≤ 1–2. Not required.
+2. **Non-generational NodeId slot reuse** — ACCEPTABLE / non-blocking. Pre-existing
+   arena property, not introduced here. Safe because `remove_node` →
+   `disconnect_edges` removes *all* of a node's input edges (via `replace_input(..,
+   None)`) before `nodes.remove`, and `connect_edges` re-inserts fresh on insert;
+   `validate()` checks consumer/producer link consistency and the new
+   `ConsumerLinkMismatch` path. The 2000-trial differential test exercises
+   remove-then-reuse. Keep the debug_assert invariants guarding I/O-flag drift.
+
+## Minor observation (non-blocking)
+
+`fusion::find_consumer` now selects the first matching consumer in **NodeId-sorted**
+order rather than insertion order. Still fully deterministic (arguably more robust);
+just a subtle observable-selection change vs pre-refactor. No action needed.
+
+## Test results
+
+`cargo test --locked -p onnx-runtime-ir -p onnx-runtime-optimizer -p onnx-runtime-shape-inference` — **all green**:
+- onnx-runtime-ir: 53 passed (incl. the 4 differential/determinism tests)
+- onnx-runtime-optimizer: 50 + 1 passed
+- onnx-runtime-shape-inference: 14 + 13 + 154 passed
+- (bonus) onnx-runtime-loader `ir_container_determinism`: 2 passed (byte-level)
+
+0 failed across all suites. Workspace-wide build blockage (missing cpuinfo vendor
+CMakeLists) is pre-existing and unrelated — confirmed not touched by this change.
+
+**No changes requested. Approved to merge.**
+
+<!-- Source: ripley-cuda-movement.md -->
+### 2026-07-17: CUDA movement, Where, and predicate broadcasting
+**By:** Ripley
+**What:** Added CUDA EP registrations and deterministic kernels for standard-domain `Concat`, `Expand`, `Reshape`, `Slice`, `Split`, `Squeeze`, `Tile` (opset 6), `Transpose`, `Unsqueeze`, and `Where`. `Shape`, `Gather`, and `Constant` already existed; none of the requested movement operators or `Where` were previously registered. Logical `And`/`Or`/`Xor` and f32 comparison `Equal`/`Greater`/`Less`/`GreaterOrEqual`/`LessOrEqual` now use the existing right-aligned broadcast metadata and zero-stride reads from `elementwise.rs`.
+**Why:** GLM/DeepSeek portable exports require these standard construction/movement operations and broadcast predicates to remain on the native CUDA EP. Movement and `Where` copy fixed-width element bytes, so they cover f32/f16/bf16, integer, and bool storage without dtype-specific arithmetic; logical ops remain bool and comparisons retain their existing f32 operand coverage. Added 10 construction/Where GPU model tests, two broadcast-family GPU model tests covering all eight logical/comparison ops, and a registry coverage test. `cargo test --locked -p onnx-runtime-ep-cuda` passed all 182 tests.
+
+<!-- Source: coordinator-kimi-readiness-doc-landed-8a73116-native-mla-is-th.md -->
+### 2026-07-17T19-17-36: Kimi readiness doc landed (8a73116); native MLA is the headline Kimi/DeepSeek gap — queued for design, GLM CUDA ops remain the active focus
+**By:** coordinator
+**What:** Kimi readiness doc landed (8a73116); native MLA is the headline Kimi/DeepSeek gap — queued for design, GLM CUDA ops remain the active focus
+**References:** 8a73116, docs/KIMI_K_READINESS.md, docs/MOE_EXPERT_PARALLELISM.md, docs/GLM_READINESS_GAPS.md
+**Why:** ## Landed
+- **8a73116** — docs/KIMI_K_READINESS.md (author Nabil, coordinator-committed + cross-linked to MOE_EXPERT_PARALLELISM.md). Op/kernel-coverage companion to the deployment doc.
+
+## Key finding — native MLA is the headline Kimi/DeepSeek gap
+Nabil (well-sourced: K2 config, K3 announcement, Kimi Linear proxy) confirms our GroupQueryAttention and CompressedSparseAttention do NOT implement MLA's latent-KV compression (kv_lora_rank=512, q_lora_rank=1536) or decoupled RoPE (128 non-RoPE + 64 RoPE dims). Verified K2 = 1T/384-expert/top-8 + 1 shared, MLA, FP8 (E4M3, 128x128 blocks), num_nextn_predict_layers=0 (no MTP). Announcement-level K3 = 2.8T/896/16, KDA + AttnRes + Gated MLA + Stable LatentMoE + MXFP4-weight/MXFP8-activation; weights/report due ~2026-07-27.
+
+Top Kimi gaps (in priority): (1) native MLA (latent KV state + projections around attention, no full-KV expansion) — also needed by DeepSeek lineage; (2) KDA recurrent attention (finite-state + short conv, 3:1 KDA:MLA per Kimi Linear) w/ typed persistent state; (3) MXFP4/MXFP8 BlockQuantizedMoE with live offload; (4) 1M-context prefix-cache/state integration; (5) richer EP capability negotiation (attention-state kinds, quant layouts, max state dims).
+
+## Scheduling decision
+MLA is NOT on the immediate GLM-5.2 critical path (GLM uses DSA/dense + CSA, not MLA), so it is QUEUED as a design item — do NOT auto-implement a large new attention mechanism without a design pass + user check-in. Current focus stays on GLM: P0 CUDA graph-op completeness (Ripley in flight on movement/construction + Where + broadcast-logical).
+
+<!-- Source: mariette-cuda-movement-review.md -->
+# CUDA Movement/Construction + Where + Broadcast-Logical Review
+
+**Reviewer:** Mariette (CUDA kernel reviewer)
+**Author (not reviewer):** Ripley
+**Worktree:** /home/justinchu/wt-cuda-move — branch `cuda-move` — commit `fba64de`
+**Merge base:** `40f6490` (origin/main)
+**Date:** 2026-07-17T19:20:00Z
+**Requested by:** Justin Chu
+
+## Verdict: 🟢 APPROVE
+
+The diff correctly unblocks native CUDA loading of the GLM/DeepSeek portable exports
+(P0 gap in `docs/GLM_READINESS_GAPS.md`). Every added op is semantically faithful to
+the CPU reference, deterministic, and dtype-generic where it should be. The gate is
+green on an H200.
+
+---
+
+## Test gate (re-run by me, not trusting Ripley's number)
+
+`cargo test --locked -p onnx-runtime-ep-cuda` → **all suites pass, 0 failed**.
+Relevant new coverage:
+- `construction_gpu.rs`: **10/10** pass.
+- `pointwise_gpu.rs` broadcast families pass (`logical_family_numpy_broadcast_matches_cpu_reference`,
+  `comparison_family_numpy_broadcast_matches_cpu_reference`, `f16_bf16_numpy_broadcast_matches_cpu_reference`).
+- `mod.rs` unit tests (`covered_ops_have_no_duplicates` = 78, `movement_and_where_ops_are_listed_in_coverage`) pass.
+
+## Per-op parity findings (vs `crates/onnx-runtime-ep-cpu/src/kernels/`)
+
+- **Slice** ✅ `slice_plan` is a line-for-line match of the CPU `slice_plan`: negative
+  indices, step-sign-dependent clamp bounds `(0..d-1 / -1..d-1)` for negative step vs
+  `(0..d / 0..d)` for positive, count formula, omitted-axes default `0..starts.len()`,
+  omitted-steps default `1`, negative-axis resolution. **CUDA is strictly more robust**
+  on the `dim==0 + negative step` edge (explicit guard avoids the `clamp(0, -1)` panic
+  the CPU `slice_plan` would hit) — not a divergence in any reachable-shape case (both
+  yield count 0). starts/ends/axes/steps handled as INPUTS at opset≥10. Test exercises
+  negative axis + reverse step (`axes=[1,-1]`, `steps=[-1,-2]`) with a hand-verified result.
+- **Split** ✅ Precedence identical to CPU: `split` input → `split` attr → even
+  (`num_outputs` attr else `outputs.len()`). `even_split` is byte-identical to CPU
+  (ceil chunks, smaller final remainder, over-split guard). Negative axis, sum/output
+  validation present. Tested via negative axis + `split` input.
+- **Transpose** ✅ Default reversed perm when attr absent; arbitrary perm validated as a
+  true permutation (dup/range checks); strides from `compute_contiguous_strides`. 3-axis
+  perm `[2,0,1]` tested.
+- **Concat** ✅ Negative axis; per-input shape compatibility (only axis dim may differ);
+  disjoint output writes via `axis_prefix`. Negative-axis multi-input test.
+- **Expand / Tile** ✅ Expand uses right-aligned `broadcast_strides` and validates the
+  target equals `broadcast_shapes`. Tile uses per-axis `coord % in_dims` with repeats
+  validated against input rank (non-negative). Both tested.
+- **Squeeze / Reshape / Unsqueeze** ✅ Correctly implemented as dtype-agnostic
+  device-to-device copies that trust the pre-computed output shape (numel/dtype checked);
+  axes read as INPUT at opset≥13 (Unsqueeze also validates output rank = in-rank + |axes|).
+  This is the right design — geometry is owned by shape inference, kernel only moves bytes.
+- **Where** ✅ True 3-way right-aligned broadcast (cond/x/y each get independent
+  `broadcast_strides` into the output shape), matching CPU `effective_strides`. Bool
+  condition (non-zero = true), branch/output dtype equality enforced, dtype-agnostic on
+  x/y byte width. All-three-broadcast test present.
+- **Broadcast logical/comparison** ✅ `BinaryPredKernel` now derives `out_shape` from
+  `broadcast_shapes` and passes right-aligned zero-stride metadata (layout consistent with
+  `elementwise::broadcast_metadata`: dims, then a-strides, then b-strides). Bool output
+  canonical `1/0`; scalar (rank-0) handled via the `metadata.push(0)` guard. Differential
+  broadcast tests vs CPU reference for And/Or/Xor and Equal/Greater/Less/GE/LE.
+
+## Determinism ✅
+Every kernel is a bijective one-thread-per-output-element grid-stride map (input→output
+gather). No atomics, no accumulation, stable index mapping. Concat/Split launch one
+kernel per chunk but each writes a **disjoint** output region, then a single
+`synchronize()`. Fully reproducible — meets the hard repo requirement.
+
+## dtype coverage ✅
+Movement ops (Concat/Expand/Reshape/Slice/Split/Squeeze/Tile/Transpose/Unsqueeze) and
+Where are element-size-generic via `fixed_width`/`byte_size` byte copies — verified with
+both f32 and int64 tests, so they are NOT silently f32-only.
+
+## Registration ✅
+Registered under domain `""` (normalized to ai.onnx) at `since_version=1` (Tile at 6),
+which `OpRegistry::lookup` resolves for any GLM opset (≥13). No duplicate/shadowed
+registrations — none of these ops existed in the pre-diff CUDA registry. `CUDA_COVERED_OPS`
+count updated 68→78 with a no-duplicates assertion.
+
+## Non-blocking observations (do NOT hold up the merge)
+1. **Comparison ops remain f32-only** on CUDA (CPU EP dispatches all numeric dtypes +
+   Bool-Equal via `dispatch_arith`). This is **pre-existing** — this diff only added
+   broadcasting, not dtypes. If a GLM/DeepSeek graph feeds `Equal`/`Greater` on int64
+   (e.g. position-id or mask math), that node will hit the actionable f32-only error on
+   CUDA. Recommend a follow-up issue to widen comparison dtype coverage; not required to
+   unblock loading.
+2. **Split even/`num_outputs`-remainder path** has no dedicated CUDA test (only the
+   explicit-`split`-input path is tested). The `even_split` code is byte-identical to the
+   CPU version (which is tested), so risk is low — a small follow-up test would close it.
+
+Neither observation is a correctness defect in the submitted code.
+
+## Summary
+Rigorously reviewed against the CPU EP; parity, determinism, dtype-genericity,
+registration, and differential test coverage all hold, and I independently re-ran the
+gate green. **Approved.**
+
+<!-- Source: newt-ep-coverage-diag.md -->
+### 2026-07-17: Group CUDA coverage diagnostics by distinct failure class
+**By:** Newt
+**What:** Session CUDA-only coverage diagnostics now group unsupported nodes by `(domain, op_type, reason)`, report every class with its total node count, and show at most three sorted `scope/node#id` examples per class. Before: `graph #0 (ai.onnx::TopK): ...; ...; and 392 more unsupported node(s)`. After: `ai.onnx::TopK: ... [count=47; examples: graph/node#12, graph/node#98, graph/node#103]; ai.onnx::Trilu: ... [count=6; examples: ...]`.
+**Why:** The previous eight-node cap hid distinct missing operators in large exported models. A `BTreeMap` sorts classes by domain, op type, and reason; example identities are also sorted before truncation, preventing graph/subgraph traversal or hash iteration order from leaking into the message. Tests cover repeated nodes, ten distinct failure classes (past the old cap), correct counts, three-example capping, and byte-identical output across two runs. Gate: `cargo test --locked -p onnx-runtime-session` passed.
+
+<!-- Source: bishop-epdiag-review.md -->
+### 2026-07-17: Review — grouped CUDA-only coverage diagnostics
+**By:** Bishop
+**What:** 🟢 APPROVE commit `8d6c349`. The diagnostic reports every distinct `(domain, op_type, reason)` failure class once, with an accurate total count and at most three sorted example node identities.
+**Why:** Determinism is explicit: classes are stored in a `BTreeMap<(String, String, String), _>` and each class's node identities are sorted before formatting, so no `HashMap` iteration order leaks into the byte output. No class-level truncation remains. The diff is confined to `crates/onnx-runtime-session/src/executor.rs`; placement/partition logic and `ep-cuda` are untouched. `cargo test --locked -p onnx-runtime-session` passed with zero failures.
+
+<!-- Source: hudson-graphview-design.md -->
+# GraphView lens recommendation
+
+**Date:** 2026-07-17  
+**Author:** Hudson
+
+## Decision
+
+Adopt an immutable-after-build `GraphView` as the runtime consumption surface
+over mutable `Graph`. Build it after all optimization and validation, alongside
+the frozen session plan. Cache deterministic topology, dense live node/value
+indices, flattened producer/consumer edges, and partition assignment slices.
+
+Use current Kahn topology with ascending finalized `NodeId` tie-breaking.
+Filtered EP views are borrowed topological `NodeIndex` slices with membership
+metadata, never cloned graphs or repeated full-graph filters.
+
+## Rollout
+
+First replace `Executor::build`'s one-off topology and CUDA coverage traversal,
+then add partitioned views and compatibility adapters for
+`claim_nodes(&Graph)` / `supports_op`. Promote the ABI `OrtGraphView` only after
+the Rust lens is proven.
+
+Require differential tests comparing old/new assignments and subgraph
+boundaries plus 10k-node/MoE allocation benchmarks.
+
+## Open questions for Justin
+
+1. Does byte-for-byte determinism cover only the same finalized IR artifact, or
+   semantic graphs built through different mutation histories (which need a
+   canonical key beyond NodeId)?
+2. Prefer an explicit `FrozenGraph` owner versus session-owned graph/cache
+   fields with method-scoped borrowing?
+3. Should future assignment identity be `EpId` only or a richer
+   EP-instance/device/session/expert-shard target?
+
+<!-- Source: vasquez-cuda-indexing.md -->
+### 2026-07-17: Add deterministic CUDA router indexing and scan kernels
+**By:** Vasquez
+**What:** Added native CUDA EP registrations and NVRTC kernels for `ai.onnx::TopK` opset 10, `CumSum` opset 11, `GatherElements` opset 11, and `ScatterElements` opsets 11 and 16. `TopK` supports f32 values with Int64 indices; `CumSum` and `ScatterElements` support f32/Int64; `GatherElements` copies any fixed-width dtype with Int64 indices.
+**Why:** GLM/DeepSeek router and mask graphs require these operators to remain CUDA-eligible. TopK uses deterministic per-slice selection and CPU-compatible lower-index tie-breaking (including CPU ordering when `sorted=0`). ScatterElements runs duplicate updates serially in row-major update order, preserving last-write and sequential add/mul/min/max semantics without atomics. CumSum assigns one deterministic sequential scan per outer/inner lane and supports every exclusive/reverse combination. Tests cover TopK largest/smallest/sorted/ties/input-K/non-default axis, GatherElements negative axis/index, both ScatterElements opsets and all reductions with duplicates, and all four CumSum modes with a negative axis. `cargo test --locked -p onnx-runtime-ep-cuda` passed on H200 CUDA.
+
+<!-- Source: mariette-cudaidx-review.md -->
+### 2026-07-17: CUDA indexing/scan review — REJECT
+**By:** Mariette
+**What:** 🔴 Reject commit `10e2bd1`.
+
+**Blocking defects:**
+1. `TopK` writes its output with the selected-axis and trailing dimensions transposed when `axis` is not the final dimension and `K > 1`. In `crates/onnx-runtime-ep-cuda/src/kernels/topk.rs:44`, the destination offset is `(outer * inner + i) * k + out`; contiguous output shape replaces the input axis with `K`, so it must be `(outer * k + out) * inner + i`. For `[2, 3]`, `axis=0`, `K=2`, CUDA writes `[4,4,5,2,6,6]`, whereas a contiguous `[2,3]` TopK output is `[4,5,6,4,2,6]`. The new `topk_largest_ties_k_input_and_non_default_axis` test encodes the transposed order, so it does not catch this. Coco must revise this artifact; Vasquez must not revise it.
+2. The requested scope is `crates/onnx-runtime-ep-cuda/` only, but the commit also changes `docs/CUDA_COVERAGE.md`. Remove that unrelated out-of-scope change in the revision.
+
+**Verified:** `cargo test --locked -p onnx-runtime-ep-cuda 2>&1 | tail -25` passed (CUDA environment specified by the request; 21 library tests passed and all integration/doc-test groups completed green). The green gate does not cover the layout defect.
+
+**Non-blocking follow-ups:**
+- Add CPU-vs-CUDA parity tests rather than CUDA-only fixed expected outputs; repeat ScatterElements float duplicate-index add/mul runs to demonstrate byte-for-byte determinism.
+- TopK remains Float32-only; add Int64/Int32 value paths if GLM graph partitioning needs integer TopK data. CumSum and ScatterElements provide Int64 but not Int32.
+- Registration is otherwise correct: GatherElements v11; ScatterElements v11 and v16 (the registry selects v16 for opset 18+); CumSum v11; TopK v10. Scatter uses one ordered thread, so it avoids nondeterministic floating atomics and preserves duplicate update order.
+
+<!-- Source: coco-topk-fix.md -->
+### 2026-07-17: Correct CUDA TopK non-final-axis output layout
+**By:** Coco
+**What:** Changed CUDA TopK output and duplicate-suppression indexing to contiguous `[outer, k, inner]` layout. Added GPU parity coverage for axis 0 and a rank-3 middle axis, including duplicate tie-breaking and byte-for-byte repeated-run determinism.
+**Why:** The previous `[outer, inner, k]` indexing transposed outputs whenever `inner > 1`; final-axis tests could not expose the defect.
+
+<!-- Source: ferro-graphview-v2.md -->
+# GraphView v2 revision
+
+**Date:** 2026-07-17  
+**Author:** Ferro  
+**Status:** Decision request for Justin
+
+## What changed from v1
+
+The revised design replaces EP-wide flattened assignments with atomic
+`PartitionId` / `CompiledPartitionView` objects. These preserve each
+`SubgraphClaim`'s nodes, boundaries, connectivity contract, and `meta_def`.
+
+It retracts the prior allocation-free claim for the legacy `supports_op` API:
+its contiguous shape/layout slices require cloned per-node arrays. The preferred
+path is a view-based `supports_node` migration.
+
+It moves placement and schedule metadata from mutable `Graph` fields into an
+immutable frozen plan, allowing the structural graph/cache to freeze before
+partitioning. It also corrects cache ownership to
+`FrozenGraph { graph, cache }` with borrowed `GraphView`.
+
+The revision corrects consumer cache construction to prefix-fill by scanning
+inputs in `(NodeId, input-slot)` order, identifies the topology heap cost, makes
+release-mode final validation new work, scopes determinism to one finalized IR
+artifact, and freezes nested bodies only after runtime shape preparation.
+
+## Decisions for Justin
+
+1. **Partition model:** Prefer atomic `PartitionId`/`CompiledPartitionView`,
+   not `EpId -> Vec<NodeIndex>`; this preserves ORT claim semantics at the cost
+   of more plan objects.
+2. **Capability API:** Prefer iterator/view `supports_node` migration, not
+   cached cloned shape/layout arrays; this avoids hot-path allocation but
+   requires an EP API transition.
+3. **Freeze boundary:** Prefer a structural freeze before partitioning and
+   immutable plan-owned placement/schedule state; this adds plan metadata but
+   prevents mutable-IR/view conflicts.
+4. **Reproducibility:** Guarantee same-finalized-artifact determinism; size
+   reproducible lookup bytes by maximum live ID. Cross-history semantic
+   canonicalization remains a later feature.
+5. **Target identity:** Prefer `PartitionTarget` richer than `EpId` from the
+   outset, covering EP instance, device, session, and expert shard; this adds
+   plumbing but avoids redesign for multi-device/MoE.
+
+<!-- Source: frost-graphview-v3.md -->
+### 2026-07-17: Make frozen partition storage owned and canonicalize claim sets
+**By:** Frost
+**What:** `FrozenPlan` stores owned `PartitionDescriptor` values and constructs borrowed `CompiledPartitionView<'_>` values through accessors. `SubgraphClaim.node_ids` are treated as an unordered set and canonicalized into base topological order.
+**Why:** Storing borrowed partition views in their owning plan would be self-referential and is not safely implementable as sketched. The EP ABI documents no ordering contract for claim node IDs, so supplied order must not be a rejection condition.
+
+<!-- Source: mariette-cuda-attn-review.md -->
+# CUDA standard Attention / RoPE review — 2026-07-17
+
+## 🔴 REJECT
+
+Host staging is an acceptable correctness-first slice: the f32 compute loops have a fixed sequential reduction order, use no floating-point atomics, and inherit the `Kernel` default `cuda_graph_compatible() == false`. The CUDA integration test also asserts byte-identical repeated results.
+
+Two contract defects block this claim:
+
+1. `StandardAttentionKernel` and `RotaryEmbeddingKernel` return `true` from `supports_strided_input()` while their staging readers (`dense_bytes` / `read_bytes`) explicitly reject every non-contiguous input. The executor may therefore pass a strided tensor instead of inserting a contiguous conversion, and the newly claimed CUDA op fails at runtime. Return `false` for all inputs, or implement stride-aware host materialization. Add an integration test with a strided Q/mask/cache and RoPE input.
+2. CUDA `supports_op()` claims these registrations solely from the op registry; it has no newly added deny path for f16/bf16. Those tensors are claimed and subsequently fail in `execute()` with `KernelFailed`, not `KernelMatch::Unsupported { reason }` as required. Add dtype-aware claim validation (or the appropriate input-value metadata plumbing) that cleanly declines f16/bf16 with an actionable reason, plus a coverage-diagnostic test.
+
+Suggested different fixer: **Deckard** (Systems Dev), with Pris adding the negative/strided coverage.
+
+## Verification
+
+`cargo test --locked -p onnx-runtime-ep-cuda` passed: all CUDA EP tests green, including the two new deterministic integration tests.
+
+## Non-blocking follow-ups
+
+- Route standard Attention/RoPE through a device SDPA/NVRTC path and add f16/bf16 support; host staging has substantial transfer/performance cost.
+- Broaden GPU parity tests to additive masks, past/present decode, explicit scale, softcap, qk-output modes, and both RoPE layouts without position IDs.
+- `git diff 712b1b1..ea6c61e` also contains an unrelated deletion of `docs/GRAPHVIEW_LENS_DESIGN.md`; restore or separately account for it before integration.
+
+<!-- Source: apone-custom-shape-handlers.md -->
+### 2026-07-17: Custom-op shape handlers for GLM/DeepSeek exports
+**By:** Apone
+**What:** Added shape inference for:
+- `com.microsoft::MoE` and `QMoE`: one output, identical dtype/shape to activation input 0. Matched `crates/onnx-runtime-ep-cpu/src/kernels/moe.rs` and `qmoe.rs`.
+- `com.microsoft::GatherBlockQuantized`: Gather shape `data[:gather_axis] + indices + data[gather_axis+1:]`, output dtype from scales; packed `uint8` expands the quantize-axis extent by `8 / bits`. Matched upstream ORT CPU `onnxruntime/contrib_ops/cpu/quantization/gather_block_quantized.cc` because this repository does not yet contain its CPU kernel.
+- `pkg.nxrt::SparseKvGather`: `[B,G,C,D]` cache plus `[B,G,Q,K]` indices produces `[B,G,Q,K,D]`. Matched `crates/onnx-runtime-ep-cpu/src/kernels/sparse_kv_gather.rs`.
+- `pkg.nxrt::CompressedSparseAttention` and the requested `com.microsoft` shape alias: Y preserves `[B,S,H,D]`; present cache is `[B,floor(total/compression_ratio),stored_width]`; ratio-128 carry is `[B,128,2,D]`; ratio-4 carry is `[B,8,2,2D]`, index cache is `[B,records,fp4_width(index_dim)]`, index carry is `[B,8,2,2*index_dim]`, and optional selected indices are `[B,index_heads,S,min(index_topk,records)]`. Runtime-dependent record counts become deterministic fresh symbolic dimensions. Matched `crates/onnx-runtime-ep-cpu/src/kernels/compressed_sparse_attention.rs`.
+
+**Why:** The loader/compiler needs every custom-op output typed and ranked, especially CSA's frozen present-state tensors. No requested operator was left unregistered.
+
+<!-- Source: gorman-shape-handlers-review.md -->
+# 🔴 REJECT — custom shape handlers review
+
+Reviewed `csa-shapes` commit `82456ed` against `origin/main` (`712b1b1`).
+
+## Blocking defect
+
+`GatherBlockQuantized` is registered with a guessed shape contract
+(`custom_ops.rs`, `gather_block_quantized`): it assumes packed `Uint8` input
+data expands the quantization axis by `8 / bits` and that output dtype is
+input 2's dtype.  There is no `GatherBlockQuantized` CPU kernel or prior
+implementation anywhere in this repository to establish either assumption
+(`git log -S GatherBlockQuantized` finds this change only).  Its only test
+asserts that same assumption.  This violates the no-wrong-shapes gate: an
+unverified custom operator must remain unregistered (or have its exact
+runtime/schema contract implemented and tested), rather than emit a
+potentially incorrect rank/extent/type.
+
+**Fixer: Coco** (the routed owner for GatherBlockQuantized/quantized data
+kernels; not Apone).  Remove this registration/handler pending a verified
+contract, or implement the authoritative kernel/schema and parity tests for
+all supported axes, packed widths, and dtypes.
+
+## Verified non-blocking observations
+
+- CSA ratio-4 supplies all 5 required state outputs and optional selected
+  indices with the CPU kernel's rank/extent formulas; ratio-128 supplies its
+  3 outputs.  Its fresh symbols are allocated in fixed call order, not from
+  hash iteration.
+- MoE/QMoE and SparseKvGather output ranks match their CPU kernels.
+- Change scope is limited to `onnx-runtime-shape-inference`.
+- `cargo test --locked -p onnx-runtime-shape-inference` passed: 160 unit tests
+  and 1 doctest.
+
+<!-- Source: coco-remove-gbq-handler.md -->
+### 2026-07-17: Remove guessed GatherBlockQuantized shape inference
+**By:** Coco
+**What:** Removed the `GatherBlockQuantized` shape-inference handler, registration, and self-referential unit test.
+**Why:** Its packed-width expansion and output dtype lacked an authoritative in-repo contract. Shape inference is deferred until an authoritative `com.microsoft` schema or CPU-kernel contract exists; leaving the op unregistered safely leaves its output shapes unknown.
+
+<!-- Source: gorman-shape-handlers-rereview.md -->
+### 2026-07-17: Shape-handler re-review
+**By:** Gorman
+**What:** 🟢 APPROVE `d2976b3` relative to `82456ed`.
+**Why:** `GatherBlockQuantized`, its registration, GBQ-only `axis_attr` helper/import, and its guessed-shape test are removed. The module documentation explicitly states that GBQ is deliberately unregistered pending an authoritative `com.microsoft` schema/CPU-kernel contract and that unregistered operations leave output shapes uninferred. The retained `MoE`, `QMoE`, `SparseKvGather`, and both-domain `CompressedSparseAttention` registrations and tests are unchanged; CSA coverage still resolves every present-state output. The diff is limited to `onnx-runtime-shape-inference`.
+**Validation:** `STATE_BACKEND=local CARGO_TARGET_DIR=/home/justinchu/target-gorman-recheck cargo test --locked -p onnx-runtime-shape-inference` passed: 159 unit/integration tests and 1 doctest, 0 failures. A package no-run compilation reported no warnings.
