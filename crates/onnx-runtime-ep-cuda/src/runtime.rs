@@ -104,6 +104,10 @@ impl CudaDeviceCapabilities {
         self.max_shared_memory_per_block_optin
     }
 
+    pub fn max_threads_per_block(self) -> u32 {
+        self.max_threads_per_block
+    }
+
     pub fn multiprocessor_count(self) -> u32 {
         self.multiprocessor_count
     }

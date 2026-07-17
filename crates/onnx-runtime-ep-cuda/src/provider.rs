@@ -29,7 +29,7 @@ use onnx_runtime_ep_api::{
 use onnx_runtime_ir::{DeviceId, DeviceType, Node, Shape, TensorLayout};
 
 use crate::kernels::build_cuda_registry;
-use crate::runtime::{cuptr, raw_ptr, CudaRuntime};
+use crate::runtime::{CudaRuntime, cuptr, raw_ptr};
 
 /// CUDA execution provider (Phase 2a: cudarc + cuBLASLt GEMM).
 ///
@@ -127,6 +127,12 @@ impl ExecutionProvider for CudaExecutionProvider {
         if op.op_type == "BlockQuantizedMatMul"
             && op.domain == "pkg.nxrt"
             && !crate::kernels::block_quantized_matmul::supports_node(op, shapes)
+        {
+            return KernelMatch::Unsupported;
+        }
+        if op.op_type == "QMoE"
+            && op.domain == "com.microsoft"
+            && !crate::kernels::qmoe::supports_node(op, shapes)
         {
             return KernelMatch::Unsupported;
         }

@@ -37,6 +37,7 @@ pub mod matmul_nbits;
 pub mod normalization;
 pub mod pointwise;
 pub mod pooling;
+pub mod qmoe;
 pub mod reduce;
 pub mod shape;
 pub mod softmax;
@@ -81,6 +82,7 @@ use pointwise::{
 pub const CUDA_COVERED_OPS: &[&str] = &[
     "MatMul",
     "MatMulNBits",
+    "QMoE",
     "BlockQuantizedMatMul",
     "Gemm",
     "FusedMatMulBias",
@@ -185,6 +187,12 @@ pub fn build_cuda_registry(runtime: Arc<CudaRuntime>) -> OpRegistry {
     reg.register(
         OpKey::new("MatMulNBits", "com.microsoft", 1),
         Box::new(matmul_nbits::MatMulNBitsFactory {
+            runtime: runtime.clone(),
+        }),
+    );
+    reg.register(
+        OpKey::new("QMoE", "com.microsoft", 1),
+        Box::new(qmoe::QMoEFactory {
             runtime: runtime.clone(),
         }),
     );
@@ -497,7 +505,7 @@ mod tests {
 
     #[test]
     fn covered_ops_have_no_duplicates() {
-        assert_eq!(CUDA_COVERED_OPS.len(), 67);
+        assert_eq!(CUDA_COVERED_OPS.len(), 68);
 
         let mut seen = std::collections::HashSet::new();
         for op in CUDA_COVERED_OPS {
