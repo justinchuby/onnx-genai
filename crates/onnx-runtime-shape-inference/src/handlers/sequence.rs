@@ -83,7 +83,9 @@ fn range_len_f32(start: f64, limit: f64, delta: f64) -> RangeLength {
         return RangeLength::Unknown;
     }
     let count = ((limit - start) / delta).ceil().max(0.0);
-    if !count.is_finite() || count > isize::MAX as f32 {
+    // `isize::MAX` rounds up to the next power of two in f32. Equality is
+    // therefore already outside the representable positive-isize range.
+    if !count.is_finite() || count >= isize::MAX as f32 {
         return RangeLength::TooLarge;
     }
     RangeLength::Known(count as i64)
@@ -97,7 +99,9 @@ fn range_len_f64(start: f64, limit: f64, delta: f64) -> RangeLength {
         return RangeLength::Unknown;
     }
     let count = ((limit - start) / delta).ceil().max(0.0);
-    if !count.is_finite() || count > isize::MAX as f64 {
+    // `isize::MAX` rounds up to the next power of two in f64. Equality is
+    // therefore already outside the representable positive-isize range.
+    if !count.is_finite() || count >= isize::MAX as f64 {
         return RangeLength::TooLarge;
     }
     RangeLength::Known(count as i64)

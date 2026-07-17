@@ -842,6 +842,22 @@ fn range_float_negative_delta() {
 }
 
 #[test]
+fn range_float64_rejects_two_to_the_63_length() {
+    let n = node("Range", 3, 1);
+    let error = try_run(
+        &n,
+        vec![
+            sd_float_scalar(DataType::Float64, 0.0),
+            sd_float_scalar(DataType::Float64, 2_f64.powi(63)),
+            sd_float_scalar(DataType::Float64, 1.0),
+        ],
+        11,
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("exceeds isize::MAX"));
+}
+
+#[test]
 fn range_float_dynamic() {
     // Non-constant float operands (typed but no shape-data) -> unknown length.
     let n = node("Range", 3, 1);
@@ -1849,6 +1865,21 @@ fn split_equal() {
     let outs = run(&n, vec![f32in(vec![c(2), c(8)])], 13);
     assert_eq!(out_shape(&outs), vec![c(2), c(4)]);
     assert_eq!(outs[1].type_info.as_ref().unwrap().shape, vec![c(2), c(4)]);
+}
+
+#[test]
+fn split_dynamic_sizes_leave_split_axis_unknown() {
+    let n = with_attr(node("Split", 2, 2), "axis", Attribute::Int(1));
+    let outs = run(
+        &n,
+        vec![f32in(vec![c(2), c(6)]), tin(DataType::Int64, vec![c(2)])],
+        13,
+    );
+    for output in outs {
+        let shape = output.type_info.unwrap().shape;
+        assert_eq!(shape[0], c(2));
+        assert!(shape[1].as_symbol().is_some());
+    }
 }
 
 #[test]

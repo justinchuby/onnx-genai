@@ -484,11 +484,12 @@ pub fn split(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
         .and_then(Attribute::as_ints)
         .map(<[i64]>::to_vec)
         .or_else(|| const_ints(ctx, 1));
+    let has_dynamic_split = sizes.is_none() && ctx.has_input(1);
 
     for i in 0..n_out {
         let mut shape = t.shape.clone();
-        shape[axis] = match &sizes {
-            Some(s) => match s.get(i).copied() {
+        shape[axis] = match (&sizes, has_dynamic_split) {
+            (Some(s), _) => match s.get(i).copied() {
                 Some(v) if v < 0 => {
                     return Err(ShapeInferError::Invalid {
                         op: "Split".into(),
@@ -504,7 +505,8 @@ pub fn split(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
                 Some(v) => DimExpr::constant(v),
                 None => ctx.fresh_dim(),
             },
-            None => {
+            (None, true) => ctx.fresh_dim(),
+            (None, false) => {
                 match (num_outputs, t.shape[axis].as_const()) {
                     // With opset-18 `num_outputs`, ONNX gives every output but
                     // the last ceil(dim / n) elements; the last gets the
