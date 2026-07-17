@@ -593,6 +593,8 @@ struct HostExpertCache {
     entries: BTreeMap<ExpertCacheKey, HostCacheEntry>,
     history: BTreeMap<ExpertCacheKey, AdmissionHistory>,
     owned_bytes: usize,
+    reported_owned_bytes: u64,
+    reported_budget_bytes: u64,
     clock: u64,
 }
 
@@ -626,21 +628,18 @@ impl HostExpertCache {
             if entry.frequency >= PIN_FREQUENCY {
                 entry.pin_until = now.saturating_add(PIN_WINDOW);
             }
+            let weights = Arc::clone(&entry.weights);
             metrics().record_host_cache_hit();
-            metrics()
-                .record_host_cache_residency(self.owned_bytes, budget_bytes)
-                .map_err(error)?;
+            self.record_residency(budget_bytes)?;
             return Ok(ExpertLease {
-                weights: Arc::clone(&entry.weights),
+                weights,
                 read_from_mmap: false,
             });
         }
 
         metrics().record_host_cache_miss();
         if budget_bytes == 0 || expanded_bytes == 0 || expanded_bytes > budget_bytes {
-            metrics()
-                .record_host_cache_residency(self.owned_bytes, budget_bytes)
-                .map_err(error)?;
+            self.record_residency(budget_bytes)?;
             return Ok(ExpertLease {
                 weights: Arc::new(load()?),
                 read_from_mmap: true,
@@ -656,9 +655,7 @@ impl HostExpertCache {
         history.last_used = now;
         let candidate_frequency = history.frequency;
         if candidate_frequency < ADMISSION_FREQUENCY {
-            metrics()
-                .record_host_cache_residency(self.owned_bytes, budget_bytes)
-                .map_err(error)?;
+            self.record_residency(budget_bytes)?;
             return Ok(ExpertLease {
                 weights: Arc::new(load()?),
                 read_from_mmap: true,
@@ -698,9 +695,7 @@ impl HostExpertCache {
                 }
             }
             if reclaim != 0 {
-                metrics()
-                    .record_host_cache_residency(self.owned_bytes, budget_bytes)
-                    .map_err(error)?;
+                self.record_residency(budget_bytes)?;
                 return Ok(ExpertLease {
                     weights: Arc::new(load()?),
                     read_from_mmap: true,
@@ -730,9 +725,7 @@ impl HostExpertCache {
         metrics()
             .record_host_cache_evictions(victims.len())
             .map_err(error)?;
-        metrics()
-            .record_host_cache_residency(self.owned_bytes, budget_bytes)
-            .map_err(error)?;
+        self.record_residency(budget_bytes)?;
 
         let loaded = match load() {
             Ok(loaded) => loaded,
@@ -741,9 +734,7 @@ impl HostExpertCache {
                     .owned_bytes
                     .checked_sub(expanded_bytes)
                     .ok_or_else(|| error("host-cache reservation rollback underflow"))?;
-                metrics()
-                    .record_host_cache_residency(self.owned_bytes, budget_bytes)
-                    .map_err(error)?;
+                self.record_residency(budget_bytes)?;
                 return Err(failure);
             }
         };
@@ -783,9 +774,7 @@ impl HostExpertCache {
 
     fn trim_to_budget(&mut self, budget_bytes: usize) -> Result<()> {
         if self.owned_bytes <= budget_bytes {
-            metrics()
-                .record_host_cache_residency(self.owned_bytes, budget_bytes)
-                .map_err(error)?;
+            self.record_residency(budget_bytes)?;
             return Ok(());
         }
         let mut candidates = self
@@ -828,18 +817,44 @@ impl HostExpertCache {
         metrics()
             .record_host_cache_evictions(victims.len())
             .map_err(error)?;
-        metrics()
-            .record_host_cache_residency(self.owned_bytes, budget_bytes)
-            .map_err(error)?;
+        self.record_residency(budget_bytes)?;
         Ok(())
+    }
+
+    fn record_residency(&mut self, budget_bytes: usize) -> Result<()> {
+        let (owned, budget) = metrics()
+            .record_host_cache_residency(
+                self.reported_owned_bytes,
+                self.owned_bytes,
+                self.reported_budget_bytes,
+                budget_bytes,
+            )
+            .map_err(error)?;
+        self.reported_owned_bytes = owned;
+        self.reported_budget_bytes = budget;
+        Ok(())
+    }
+
+    fn release_residency(&mut self) {
+        metrics()
+            .release_host_cache_residency(self.reported_owned_bytes, self.reported_budget_bytes);
+        self.reported_owned_bytes = 0;
+        self.reported_budget_bytes = 0;
     }
 
     #[cfg(test)]
     fn clear(&mut self) {
+        self.release_residency();
         self.entries.clear();
         self.history.clear();
         self.owned_bytes = 0;
         self.clock = 0;
+    }
+}
+
+impl Drop for HostExpertCache {
+    fn drop(&mut self) {
+        self.release_residency();
     }
 }
 
@@ -2211,6 +2226,48 @@ mod tests {
         assert!(cache_b.owned_bytes <= 8);
         assert_eq!(cache_a.entries.len(), 1);
         assert_eq!(cache_b.entries.len(), 2);
+    }
+
+    #[test]
+    fn process_metrics_aggregate_live_cache_residency_and_release_on_drop() {
+        let _guard = metrics_test_lock().lock().expect("metrics test lock");
+        metrics().reset();
+        let engine_a = WeightOffloadHostCache::new(4).unwrap();
+        let engine_b = WeightOffloadHostCache::new(8).unwrap();
+        let weights = |value| DequantizedExpert {
+            fc1: vec![value],
+            fc2: Vec::new(),
+            fc3: None,
+        };
+
+        for expert in 0..2 {
+            for _ in 0..2 {
+                drop(
+                    engine_a
+                        .lease(cache_key(expert), 4, || Ok(weights(expert as f32)))
+                        .unwrap(),
+                );
+            }
+        }
+        for expert in 0..4 {
+            for _ in 0..2 {
+                drop(
+                    engine_b
+                        .lease(cache_key(expert), 4, || Ok(weights(expert as f32)))
+                        .unwrap(),
+                );
+            }
+        }
+
+        let stats = crate::weight_offload_stats();
+        assert_eq!(stats.owned_host_cache_bytes, 12);
+        assert_eq!(stats.peak_owned_host_cache_bytes, 12);
+        assert_eq!(stats.host_cache_budget_bytes, 12);
+
+        drop(engine_a);
+        let stats = crate::weight_offload_stats();
+        assert_eq!(stats.owned_host_cache_bytes, 8);
+        assert_eq!(stats.host_cache_budget_bytes, 8);
     }
 
     #[test]

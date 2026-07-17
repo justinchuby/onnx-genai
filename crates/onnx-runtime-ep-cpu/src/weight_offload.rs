@@ -155,19 +155,51 @@ impl WeightOffloadMetrics {
 
     pub fn record_host_cache_residency(
         &self,
+        previous_owned_bytes: u64,
         owned_bytes: usize,
+        previous_budget_bytes: u64,
         budget_bytes: usize,
-    ) -> Result<(), &'static str> {
+    ) -> Result<(u64, u64), &'static str> {
         let owned =
             u64::try_from(owned_bytes).map_err(|_| "owned host-cache byte count overflow")?;
         let budget =
             u64::try_from(budget_bytes).map_err(|_| "host-cache budget byte count overflow")?;
-        self.owned_host_cache_bytes.store(owned, Ordering::Relaxed);
+
+        adjust_gauge(
+            &self.host_cache_budget_bytes,
+            previous_budget_bytes,
+            budget,
+            "host-cache budget byte total overflow",
+            "host-cache budget byte total underflow",
+        )?;
+        let aggregate_owned = match adjust_gauge(
+            &self.owned_host_cache_bytes,
+            previous_owned_bytes,
+            owned,
+            "owned host-cache byte total overflow",
+            "owned host-cache byte total underflow",
+        ) {
+            Ok(aggregate) => aggregate,
+            Err(failure) => {
+                adjust_gauge(
+                    &self.host_cache_budget_bytes,
+                    budget,
+                    previous_budget_bytes,
+                    "host-cache budget rollback overflow",
+                    "host-cache budget rollback underflow",
+                )
+                .expect("host-cache budget metric rollback must reverse the applied delta");
+                return Err(failure);
+            }
+        };
         self.peak_owned_host_cache_bytes
-            .fetch_max(owned, Ordering::Relaxed);
-        self.host_cache_budget_bytes
-            .store(budget, Ordering::Relaxed);
-        Ok(())
+            .fetch_max(aggregate_owned, Ordering::Relaxed);
+        Ok((owned, budget))
+    }
+
+    pub fn release_host_cache_residency(&self, owned_bytes: u64, budget_bytes: u64) {
+        subtract_gauge_saturating(&self.owned_host_cache_bytes, owned_bytes);
+        subtract_gauge_saturating(&self.host_cache_budget_bytes, budget_bytes);
     }
 
     pub fn record_routes(&self, layer: u32, token_counts: &BTreeMap<usize, usize>) {
@@ -187,6 +219,7 @@ impl WeightOffloadMetrics {
             let total = totals.entry(expert).or_default();
             *total = total.saturating_add(tokens as u64);
         }
+
         drop(totals);
 
         let mut layers = self
@@ -265,6 +298,40 @@ impl WeightOffloadMetrics {
             .expect("weight-offload layer metrics lock poisoned")
             .clear();
     }
+}
+
+fn adjust_gauge(
+    gauge: &AtomicU64,
+    previous: u64,
+    current: u64,
+    overflow: &'static str,
+    underflow: &'static str,
+) -> Result<u64, &'static str> {
+    if current >= previous {
+        let delta = current - previous;
+        let old = gauge
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |total| {
+                total.checked_add(delta)
+            })
+            .map_err(|_| overflow)?;
+        old.checked_add(delta).ok_or(overflow)
+    } else {
+        let delta = previous - current;
+        let old = gauge
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |total| {
+                total.checked_sub(delta)
+            })
+            .map_err(|_| underflow)?;
+        old.checked_sub(delta).ok_or(underflow)
+    }
+}
+
+fn subtract_gauge_saturating(gauge: &AtomicU64, delta: u64) {
+    gauge
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |total| {
+            Some(total.saturating_sub(delta))
+        })
+        .expect("saturating gauge subtraction always succeeds");
 }
 
 static METRICS: OnceLock<WeightOffloadMetrics> = OnceLock::new();
