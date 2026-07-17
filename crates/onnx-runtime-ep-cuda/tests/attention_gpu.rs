@@ -12,6 +12,7 @@
 //!   PATH=/conda/env/bin:$PATH LD_LIBRARY_PATH=/conda/env/lib \
 //!     cargo test -p onnx-runtime-ep-cuda --test attention_gpu
 
+use half::{bf16, f16};
 use onnx_runtime_ep_api::{
     DevicePtr, DevicePtrMut, ExecutionProvider, Kernel as _, TensorMut, TensorView,
 };
@@ -29,6 +30,43 @@ fn bytes_to_f32(b: &[u8]) -> Vec<f32> {
     b.chunks_exact(4)
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect()
+}
+
+fn encode(values: &[f32], dtype: DataType) -> Vec<u8> {
+    match dtype {
+        DataType::Float32 => f32_bytes(values).to_vec(),
+        DataType::Float16 => values
+            .iter()
+            .flat_map(|&value| f16::from_f32(value).to_bits().to_ne_bytes())
+            .collect(),
+        DataType::BFloat16 => values
+            .iter()
+            .flat_map(|&value| bf16::from_f32(value).to_bits().to_ne_bytes())
+            .collect(),
+        _ => unreachable!("test helper only supports floating attention dtypes"),
+    }
+}
+
+fn decode(bytes: &[u8], dtype: DataType) -> Vec<f32> {
+    match dtype {
+        DataType::Float32 => bytes_to_f32(bytes),
+        DataType::Float16 | DataType::BFloat16 => bytes
+            .chunks_exact(2)
+            .map(|chunk| {
+                let bits = u16::from_ne_bytes([chunk[0], chunk[1]]);
+                match dtype {
+                    DataType::Float16 => f16::from_bits(bits).to_f32(),
+                    DataType::BFloat16 => bf16::from_bits(bits).to_f32(),
+                    _ => unreachable!(),
+                }
+            })
+            .collect(),
+        _ => unreachable!("test helper only supports floating attention dtypes"),
+    }
+}
+
+fn quantize(values: &[f32], dtype: DataType) -> Vec<f32> {
+    decode(&encode(values, dtype), dtype)
 }
 
 /// Independent CPU reference: `O = softmax(scale·Q·Kᵀ [+causal] [+mask])·V`.
@@ -132,14 +170,21 @@ fn run_gpu_attention(
     num_kv_heads: usize,
     causal: bool,
     scale: Option<f32>,
+    dtype: DataType,
 ) -> Vec<f32> {
     let dev: DeviceId = ep.device_id();
+    let element_size = match dtype {
+        DataType::Float32 => 4,
+        DataType::Float16 | DataType::BFloat16 => 2,
+        _ => unreachable!("test helper only supports floating attention dtypes"),
+    };
 
     let up = |data: &[f32]| -> Buf {
-        let buf = ep.allocate(std::mem::size_of_val(data), 256).unwrap();
+        let bytes = encode(data, dtype);
+        let buf = ep.allocate(bytes.len(), 256).unwrap();
         // SAFETY: buffer sized for the byte slice we copy in.
         unsafe {
-            runtime.htod(f32_bytes(data), cuptr(buf.as_ptr())).unwrap();
+            runtime.htod(&bytes, cuptr(buf.as_ptr())).unwrap();
         }
         Buf(buf)
     };
@@ -150,41 +195,23 @@ fn run_gpu_attention(
     let mask_buf = mask.map(up);
 
     let out_len: usize = out_shape.iter().product();
-    let mut out_buf = ep.allocate(out_len * 4, 256).unwrap();
+    let mut out_buf = ep.allocate(out_len * element_size, 256).unwrap();
 
     let q_str = compute_contiguous_strides(q_shape);
     let k_str = compute_contiguous_strides(k_shape);
     let v_str = compute_contiguous_strides(v_shape);
     let o_str = compute_contiguous_strides(out_shape);
 
-    let qv = TensorView::new(
-        DevicePtr(q_buf.0.as_ptr()),
-        DataType::Float32,
-        q_shape,
-        &q_str,
-        dev,
-    );
-    let kv = TensorView::new(
-        DevicePtr(k_buf.0.as_ptr()),
-        DataType::Float32,
-        k_shape,
-        &k_str,
-        dev,
-    );
-    let vv = TensorView::new(
-        DevicePtr(v_buf.0.as_ptr()),
-        DataType::Float32,
-        v_shape,
-        &v_str,
-        dev,
-    );
+    let qv = TensorView::new(DevicePtr(q_buf.0.as_ptr()), dtype, q_shape, &q_str, dev);
+    let kv = TensorView::new(DevicePtr(k_buf.0.as_ptr()), dtype, k_shape, &k_str, dev);
+    let vv = TensorView::new(DevicePtr(v_buf.0.as_ptr()), dtype, v_shape, &v_str, dev);
 
     let mask_str = mask_shape.map(compute_contiguous_strides);
     let mut inputs = vec![qv, kv, vv];
     if let (Some(mb), Some(ms), Some(mstr)) = (&mask_buf, mask_shape, &mask_str) {
         inputs.push(TensorView::new(
             DevicePtr(mb.0.as_ptr()),
-            DataType::Float32,
+            dtype,
             ms,
             mstr,
             dev,
@@ -193,7 +220,7 @@ fn run_gpu_attention(
 
     let ov = TensorMut::new(
         DevicePtrMut(out_buf.as_mut_ptr()),
-        DataType::Float32,
+        dtype,
         out_shape,
         &o_str,
         dev,
@@ -217,8 +244,8 @@ fn run_gpu_attention(
         panic!("attention GPU execution failed: {message}");
     }
 
-    let mut out_bytes = vec![0u8; out_len * 4];
-    // SAFETY: out_buf holds out_len f32.
+    let mut out_bytes = vec![0u8; out_len * element_size];
+    // SAFETY: out_buf holds out_len elements of the selected dtype.
     unsafe {
         runtime
             .dtoh(&mut out_bytes, cuptr(out_buf.as_ptr()))
@@ -233,7 +260,7 @@ fn run_gpu_attention(
     }
     ep.deallocate(out_buf).unwrap();
 
-    bytes_to_f32(&out_bytes)
+    decode(&out_bytes, dtype)
 }
 
 fn max_abs_err(a: &[f32], b: &[f32]) -> f32 {
@@ -281,6 +308,7 @@ fn attention_f32_on_gpu_matches_cpu_reference() {
             h,
             false,
             Some(scale),
+            DataType::Float32,
         );
         if got.is_empty() {
             return;
@@ -314,6 +342,7 @@ fn attention_f32_on_gpu_matches_cpu_reference() {
             h,
             true,
             Some(scale),
+            DataType::Float32,
         );
         if got.is_empty() {
             return;
@@ -347,6 +376,7 @@ fn attention_f32_on_gpu_matches_cpu_reference() {
             hkv,
             true,
             Some(scale),
+            DataType::Float32,
         );
         if got.is_empty() {
             return;
@@ -390,6 +420,7 @@ fn attention_f32_on_gpu_matches_cpu_reference() {
             hkv,
             false,
             Some(scale),
+            DataType::Float32,
         );
         if got.is_empty() {
             return;
@@ -403,6 +434,71 @@ fn attention_f32_on_gpu_matches_cpu_reference() {
     }
 
     println!("all attention cases passed on {:?}", ep.device_id());
+}
+
+fn assert_close(got: &[f32], want: &[f32], atol: f32, rtol: f32) {
+    assert_eq!(got.len(), want.len());
+    for (index, (&got, &want)) in got.iter().zip(want).enumerate() {
+        let tolerance = atol + rtol * want.abs();
+        assert!(
+            (got - want).abs() <= tolerance,
+            "index {index}: got {got}, want {want}, abs_err={}, tolerance={tolerance}",
+            (got - want).abs()
+        );
+    }
+}
+
+fn attention_half_matches_f32_reference(dtype: DataType, atol: f32, rtol: f32) {
+    let ep = match CudaExecutionProvider::new_default() {
+        Ok(ep) => ep,
+        Err(e) => {
+            eprintln!("skip: no CUDA GPU available ({e})");
+            return;
+        }
+    };
+    let runtime = ep.runtime().clone();
+    let (b, h, s, d) = (1usize, 2usize, 16usize, 32usize);
+    let scale = 1.0 / (d as f32).sqrt();
+    let q = quantize(&fill(b * h * s * d, 101), dtype);
+    let k = quantize(&fill(b * h * s * d, 102), dtype);
+    let v = quantize(&fill(b * h * s * d, 103), dtype);
+    let got = run_gpu_attention(
+        &ep,
+        &runtime,
+        &q,
+        &k,
+        &v,
+        None,
+        &[b, h, s, d],
+        &[b, h, s, d],
+        &[b, h, s, d],
+        None,
+        &[b, h, s, d],
+        h,
+        h,
+        true,
+        Some(scale),
+        dtype,
+    );
+    if got.is_empty() {
+        return;
+    }
+    let want = cpu_reference(&q, &k, &v, b, h, h, s, s, d, scale, true, None);
+    assert_close(&got, &want, atol, rtol);
+}
+
+#[test]
+fn attention_f16_on_gpu_matches_f32_reference() {
+    // Two native-f16 GEMM stores plus the probability store can each contribute
+    // roughly one fp16 ulp, so allow a small multiple of fp16 epsilon.
+    attention_half_matches_f32_reference(DataType::Float16, 3e-3, 3e-3);
+}
+
+#[test]
+fn attention_bf16_on_gpu_matches_f32_reference() {
+    // bf16 has a 7-bit mantissa (8x fp16 epsilon), so its bound is correspondingly
+    // wider while still catching incorrect accumulation or dtype dispatch.
+    attention_half_matches_f32_reference(DataType::BFloat16, 2e-2, 2e-2);
 }
 
 #[test]

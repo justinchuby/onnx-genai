@@ -16,7 +16,7 @@
 //! ```
 //!
 //! with `Q : [B, num_heads, Sq, D]`, `K,V : [B, num_kv_heads, Sk, D]`, and
-//! `O : [B, num_heads, Sq, D]`, all row-major f32.
+//! `O : [B, num_heads, Sq, D]`, all row-major f32/f16/bf16.
 //!
 //! ## Design — two batched cuBLAS GEMMs around one NVRTC softmax
 //!
@@ -50,7 +50,7 @@
 //!
 //! ## Phase-2a limits (all actionable errors, never panics)
 //!
-//! * dtype other than f32 → deferred (fp16 SDPA lands with cuDNN in Phase 2b).
+//! * dtype other than f32/f16/bf16 → deferred.
 //! * ranks other than the explicit 4-D `[B, H, S, D]` layout → deferred.
 //! * non-contiguous (strided) Q/K/V/O or mask → actionable "materialise" error.
 
@@ -172,10 +172,161 @@ extern "C" __global__ void attn_softmax_f32(
 }
 "#;
 
+/// Half-precision softmax variants. Inputs and outputs remain in the attention
+/// dtype, while every value participating in max/exp/sum arithmetic is widened
+/// to f32. The f32 source above remains separate so its established path and
+/// generated code are unchanged.
+const SOFTMAX_HALF_SRC: &str = r#"
+#include <cuda_fp16.h>
+#include <cuda_bf16.h>
+
+template <typename T> __device__ float load_float(T value);
+template <> __device__ float load_float<__half>(__half value) { return __half2float(value); }
+template <> __device__ float load_float<__nv_bfloat16>(__nv_bfloat16 value) {
+    return __bfloat162float(value);
+}
+
+template <typename T> __device__ T store_float(float value);
+template <> __device__ __half store_float<__half>(float value) {
+    return __float2half_rn(value);
+}
+template <> __device__ __nv_bfloat16 store_float<__nv_bfloat16>(float value) {
+    return __float2bfloat16_rn(value);
+}
+
+#define DEFINE_ATTN_SOFTMAX(TYPE, SUFFIX) \
+extern "C" __global__ void attn_softmax_##SUFFIX( \
+    TYPE*        scores, \
+    const TYPE*  mask, \
+    const int*   total_lengths, \
+    const int*   past_lengths, \
+    const int    nrows, \
+    const int    sk, \
+    const int    sq, \
+    const int    heads, \
+    const int    causal, \
+    const int    mask_planes, \
+    const int    batch, \
+    const int    local_window, \
+    const float  softcap) \
+{ \
+    const float INF = __int_as_float(0x7f800000); \
+    const int row = blockIdx.x; \
+    if (row >= nrows) return; \
+    const int i  = row % sq; \
+    const int bh = row / sq; \
+    const int b  = bh / heads; \
+    TYPE* s = scores + (size_t)row * sk; \
+    const int causal_max = past_lengths ? past_lengths[b] + i : sk - sq + i; \
+    const int logical_sk = total_lengths ? total_lengths[b] : sk; \
+    const int local_min = local_window > 0 \
+        ? max(0, causal_max + 1 - local_window) \
+        : 0; \
+    const TYPE* mrow = 0; \
+    if (mask_planes > 0) { \
+        int plane = 0; \
+        if (mask_planes == batch)            plane = b; \
+        else if (mask_planes == batch*heads) plane = bh; \
+        mrow = mask + ((size_t)plane * sq + i) * sk; \
+    } \
+    extern __shared__ float red[]; \
+    const int tid = threadIdx.x; \
+    const int nt  = blockDim.x; \
+    float local_max = -INF; \
+    for (int j = tid; j < sk; j += nt) { \
+        float v; \
+        if (j >= logical_sk || (causal && j > causal_max) || j < local_min) { \
+            v = -INF; \
+        } else { \
+            v = load_float<TYPE>(s[j]); \
+            if (softcap > 0.0f) v = softcap * tanhf(v / softcap); \
+            if (mrow) v += load_float<TYPE>(mrow[j]); \
+        } \
+        const TYPE stored = store_float<TYPE>(v); \
+        s[j] = stored; \
+        local_max = fmaxf(local_max, load_float<TYPE>(stored)); \
+    } \
+    red[tid] = local_max; \
+    __syncthreads(); \
+    for (int off = nt >> 1; off > 0; off >>= 1) { \
+        if (tid < off) red[tid] = fmaxf(red[tid], red[tid + off]); \
+        __syncthreads(); \
+    } \
+    const float row_max = red[0]; \
+    __syncthreads(); \
+    float local_sum = 0.0f; \
+    for (int j = tid; j < sk; j += nt) { \
+        const float v = load_float<TYPE>(s[j]); \
+        const float e = (v == -INF) ? 0.0f : expf(v - row_max); \
+        s[j] = store_float<TYPE>(e); \
+        local_sum += e; \
+    } \
+    red[tid] = local_sum; \
+    __syncthreads(); \
+    for (int off = nt >> 1; off > 0; off >>= 1) { \
+        if (tid < off) red[tid] += red[tid + off]; \
+        __syncthreads(); \
+    } \
+    const float row_sum = red[0]; \
+    __syncthreads(); \
+    const float inv = (row_sum > 0.0f) ? (1.0f / row_sum) : 0.0f; \
+    for (int j = tid; j < sk; j += nt) { \
+        s[j] = store_float<TYPE>(load_float<TYPE>(s[j]) * inv); \
+    } \
+}
+
+DEFINE_ATTN_SOFTMAX(__half, f16)
+DEFINE_ATTN_SOFTMAX(__nv_bfloat16, bf16)
+"#;
+
 /// Stable module + entry-point names for the NVRTC softmax (see
 /// [`CudaRuntime::nvrtc_function`]).
 const SOFTMAX_MODULE: &str = "attn_softmax_f32";
 const SOFTMAX_ENTRY: &str = "attn_softmax_f32";
+const SOFTMAX_HALF_MODULE: &str = "attn_softmax_half_v1";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AttentionDtype {
+    F32,
+    F16,
+    Bf16,
+}
+
+impl AttentionDtype {
+    fn from_onnx(dtype: DataType) -> Result<Self> {
+        match dtype {
+            DataType::Float32 => Ok(Self::F32),
+            DataType::Float16 => Ok(Self::F16),
+            DataType::BFloat16 => Ok(Self::Bf16),
+            other => Err(not_implemented(format!(
+                "Attention with dtype {other:?} (supported: Float32, Float16, BFloat16)"
+            ))),
+        }
+    }
+
+    fn gemm(self) -> GemmDtype {
+        match self {
+            Self::F32 => GemmDtype::F32,
+            Self::F16 => GemmDtype::F16,
+            Self::Bf16 => GemmDtype::Bf16,
+        }
+    }
+
+    fn element_size(self) -> u64 {
+        match self {
+            Self::F32 => std::mem::size_of::<f32>() as u64,
+            Self::F16 | Self::Bf16 => std::mem::size_of::<u16>() as u64,
+        }
+    }
+
+    fn softmax(self) -> (&'static str, &'static str, &'static str) {
+        match self {
+            Self::F32 => (SOFTMAX_MODULE, SOFTMAX_SRC, SOFTMAX_ENTRY),
+            Self::F16 => (SOFTMAX_HALF_MODULE, SOFTMAX_HALF_SRC, "attn_softmax_f16"),
+            Self::Bf16 => (SOFTMAX_HALF_MODULE, SOFTMAX_HALF_SRC, "attn_softmax_bf16"),
+        }
+    }
+}
 
 /// Threads per block for the softmax reduction (a power of two, so the tree
 /// reduction is exact); rows longer than this are handled by the strided loop.
@@ -281,18 +432,23 @@ impl AttentionKernel {
         let v = &inputs[2];
         let mask = inputs.get(3);
 
-        // Phase-2a is f32-only (fp16 SDPA arrives with cuDNN in Phase 2b).
+        let dtype = AttentionDtype::from_onnx(q.dtype)?;
         for (name, dt) in [
             ("Q", q.dtype),
             ("K", k.dtype),
             ("V", v.dtype),
             ("O", outputs[0].dtype),
         ] {
-            if dt != DataType::Float32 {
-                return Err(not_implemented(format!(
-                    "Attention with {name} dtype {dt:?} (Phase-2a baseline is f32-only)"
+            if dt != q.dtype {
+                return Err(EpError::KernelFailed(format!(
+                    "cuda_ep Attention: Q/K/V/output dtypes must match; \
+                     Q is {:?}, {name} is {dt:?}",
+                    q.dtype
                 )));
             }
+        }
+        if dtype != AttentionDtype::F32 {
+            self.runtime.require_nvrtc_half_headers("Attention")?;
         }
 
         // Explicit 4-D [B, heads, seq, head_dim] layout only.
@@ -356,15 +512,16 @@ impl AttentionKernel {
         let group = self.num_heads / self.num_kv_heads;
         let scale = self.scale.unwrap_or_else(|| 1.0 / (d as f32).sqrt());
 
-        // Optional additive mask: f32, contiguous, element count a whole number
-        // of [sq,sk] planes broadcasting over {1, batch, batch*heads}.
+        // Optional additive mask: same dtype as Q/K/V, contiguous, element count
+        // a whole number of [sq,sk] planes broadcasting over
+        // {1, batch, batch*heads}.
         let (mask_ptr, mask_planes) = match mask {
             None => (0u64, 0i32),
             Some(m) => {
-                if m.dtype != DataType::Float32 {
-                    return Err(not_implemented(format!(
-                        "Attention additive mask dtype {:?} (Phase-2a is f32-only)",
-                        m.dtype
+                if m.dtype != q.dtype {
+                    return Err(EpError::KernelFailed(format!(
+                        "cuda_ep Attention: additive mask dtype {:?} must match Q dtype {:?}",
+                        m.dtype, q.dtype
                     )));
                 }
                 if !m.is_contiguous() {
@@ -397,8 +554,9 @@ impl AttentionKernel {
         let v_base = cuptr(v.data_ptr::<u8>() as *const c_void);
         let o_base = cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void);
 
-        run_attention_f32(
+        run_attention(
             &self.runtime,
+            dtype,
             self.num_heads,
             self.num_kv_heads,
             self.causal,
@@ -423,11 +581,13 @@ impl AttentionKernel {
     }
 }
 
-/// Shared f32 attention engine used by both the explicit BNSH `Attention` op and
-/// `GroupQueryAttention` after its BSH inputs/cache have been prepared.
+/// Dtype-dispatched attention engine. cuBLASLt receives the native IO dtype and
+/// always accumulates GEMMs in fp32; the softmax kernel likewise widens every
+/// reduction value to fp32 before narrowing probabilities to the IO dtype.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn run_attention_f32(
+fn run_attention(
     runtime: &CudaRuntime,
+    dtype: AttentionDtype,
     num_heads: usize,
     num_kv_heads: usize,
     causal: bool,
@@ -449,9 +609,9 @@ pub(crate) fn run_attention_f32(
     local_window: i32,
     softcap: f32,
 ) -> Result<()> {
-    const F32: u64 = std::mem::size_of::<f32>() as u64;
+    let elem_size = dtype.element_size();
     let scores_elems = batch * num_heads * sq * sk;
-    let scores_buf = runtime.alloc_raw(scores_elems * F32 as usize)?;
+    let scores_buf = runtime.alloc_raw(scores_elems * elem_size as usize)?;
     let workspace = match runtime.alloc_raw(WORKSPACE_BYTES) {
         Ok(workspace) => workspace,
         Err(error) => {
@@ -469,12 +629,13 @@ pub(crate) fn run_attention_f32(
         for b in 0..batch {
             for h in 0..num_heads {
                 let kv = h / group;
-                let q_head = q_base + ((b * num_heads + h) * sq * d) as u64 * F32;
-                let k_head = k_base + ((b * num_kv_heads + kv) * kv_capacity * d) as u64 * F32;
-                let s_head = scores_buf + ((b * num_heads + h) * sq * sk) as u64 * F32;
+                let q_head = q_base + ((b * num_heads + h) * sq * d) as u64 * elem_size;
+                let k_head =
+                    k_base + ((b * num_kv_heads + kv) * kv_capacity * d) as u64 * elem_size;
+                let s_head = scores_buf + ((b * num_heads + h) * sq * sk) as u64 * elem_size;
 
                 let p = GemmEx {
-                    dtype: GemmDtype::F32,
+                    dtype: dtype.gemm(),
                     transa: true,  // op(A=K) = Kᵀ  -> [Sk, D]
                     transb: false, // op(B=Q) = Q   -> [D, Sq] (col-major view)
                     m: sk,
@@ -499,9 +660,14 @@ pub(crate) fn run_attention_f32(
 
         // Stage 2: fused softmax over the keys axis (scale already applied).
         let nrows = batch * num_heads * sq;
-        let func = runtime.nvrtc_function(SOFTMAX_MODULE, SOFTMAX_SRC, SOFTMAX_ENTRY)?;
-        let cfg =
-            runtime.reduction_launch_config(&func, nrows as u32, SOFTMAX_BLOCK, F32 as u32)?;
+        let (softmax_module, softmax_source, softmax_entry) = dtype.softmax();
+        let func = runtime.nvrtc_function(softmax_module, softmax_source, softmax_entry)?;
+        let cfg = runtime.reduction_launch_config(
+            &func,
+            nrows as u32,
+            SOFTMAX_BLOCK,
+            std::mem::size_of::<f32>() as u32,
+        )?;
         let nrows_i = i32::try_from(nrows).map_err(|_| {
             EpError::KernelFailed(format!("cuda_ep Attention: {nrows} score rows exceed i32"))
         })?;
@@ -528,18 +694,20 @@ pub(crate) fn run_attention_f32(
         // SAFETY: `func` is the compiled softmax entry; the argument list and
         // its ABI match the kernel signature; `scores_buf`/`mask_ptr` are live
         // device allocations sized for [nrows, sk] / the mask planes.
-        unsafe { builder.launch(cfg) }.map_err(|e| driver_err("launch attn_softmax_f32", e))?;
+        unsafe { builder.launch(cfg) }
+            .map_err(|e| driver_err(&format!("launch {softmax_entry}"), e))?;
 
         // Stage 3: per-head O = P·V.  Column-major C[D,Sq] = Vᵀ·Pᵀ.
         for b in 0..batch {
             for h in 0..num_heads {
                 let kv = h / group;
-                let s_head = scores_buf + ((b * num_heads + h) * sq * sk) as u64 * F32;
-                let v_head = v_base + ((b * num_kv_heads + kv) * kv_capacity * d) as u64 * F32;
-                let o_head = o_base + ((b * num_heads + h) * sq * d) as u64 * F32;
+                let s_head = scores_buf + ((b * num_heads + h) * sq * sk) as u64 * elem_size;
+                let v_head =
+                    v_base + ((b * num_kv_heads + kv) * kv_capacity * d) as u64 * elem_size;
+                let o_head = o_base + ((b * num_heads + h) * sq * d) as u64 * elem_size;
 
                 let p = GemmEx {
-                    dtype: GemmDtype::F32,
+                    dtype: dtype.gemm(),
                     transa: false, // op(A=V) = V  -> [D, Sk] (col-major view)
                     transb: false, // op(B=P) = P  -> [Sk, Sq] (col-major view)
                     m: d,

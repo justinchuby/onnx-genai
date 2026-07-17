@@ -75,8 +75,10 @@ impl GemmDtype {
     }
 
     /// Full-precision f32 accumulation for every element type. For f16/bf16 this
-    /// is the standard "compute in fp32, store in fp16/bf16" path; for f32 it is
-    /// true IEEE fp32 (NOT TF32 — see the module docs for why that matters).
+    /// is the architecture-neutral mixed-precision mode: the cuBLASLt heuristic
+    /// selects an algorithm supported by the detected device, without requesting
+    /// an SM-specific tensor-core compute type. For f32 it is true IEEE fp32
+    /// (NOT TF32 — see the module docs for why that matters).
     fn compute_type(self) -> sys::cublasComputeType_t {
         sys::cublasComputeType_t::CUBLAS_COMPUTE_32F
     }
