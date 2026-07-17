@@ -63,7 +63,10 @@ pub use epcontext::{
     is_ep_context_op, resolve_ep_context,
 };
 pub use error::LoaderError;
-pub use weights::WeightStore;
+pub use weights::{
+    ExpertQuantization, ExpertStorageOrder, ExpertTensorLayout, ExpertWeightRegion,
+    NonPageableReason, Pageability, WeightRegionCatalog, WeightStore,
+};
 pub use writer::{EpContextDumpConfig, EpContextPartition, dump_ep_context};
 
 mod error {

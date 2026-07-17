@@ -13,6 +13,7 @@ onnx-runtime-ir = { workspace = true }
 onnx-runtime-ep-api = { workspace = true }
 onnx-runtime-optimizer = { workspace = true }
 onnx-runtime-quantization = { workspace = true }
+onnx-runtime-loader = { workspace = true }
 thiserror = { workspace = true }
 half = "2"
 rayon = "1"
@@ -20,9 +21,6 @@ rayon = "1"
 # the `Erf` op and the fused `Gelu` kernel. A polynomial approximation was ~1e-9
 # off near zero and failed the upstream conformance suite's tight tolerance.
 libm = "0.2"
-
-[dev-dependencies]
-onnx-runtime-loader = { workspace = true }
 
 [features]
 # oneDNN CPU GEMM backend (docs/ORT2.md §25.2). NON-default: it requires the

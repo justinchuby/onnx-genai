@@ -48,13 +48,14 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use onnx_runtime_ep_api::{
-    DeviceBuffer, DevicePtr, DevicePtrMut, ExecutionProvider, KernelMatch, TensorMut, TensorView,
+    DeviceBuffer, DevicePtr, DevicePtrMut, ExecutionProvider, KernelMatch, TensorBacking, TensorMut,
+    TensorView,
 };
 use onnx_runtime_ep_cpu::CpuExecutionProvider;
 use onnx_runtime_ep_cpu::strided::view_in_bounds;
 use onnx_runtime_ir::{
     DataType, DeviceType, Dim, Graph, Node, NodeId, Shape, SymbolId, TensorLayout, ValueId,
-    as_static_shape, compute_contiguous_strides,
+    WeightRef, as_static_shape, compute_contiguous_strides,
 };
 use onnx_runtime_loader::WeightStore;
 use onnx_runtime_optimizer::InitializerResolver;
@@ -316,6 +317,7 @@ struct InInfo {
     byte_offset: usize,
     base_ptr: *const std::ffi::c_void,
     device: onnx_runtime_ir::DeviceId,
+    backing: TensorBacking,
     /// Length in bytes of the backing (root) allocation, for the bounds gate.
     root_len: usize,
 }
@@ -1660,6 +1662,7 @@ impl Executor {
                     byte_offset: 0,
                     base_ptr: std::ptr::null(),
                     device: self.ep.device_id(),
+                    backing: TensorBacking::Opaque,
                     root_len: 0,
                 });
                 continue;
@@ -1675,6 +1678,7 @@ impl Executor {
                     byte_offset: 0,
                     base_ptr: value.ptr.cast_const(),
                     device: value.device,
+                    backing: TensorBacking::Opaque,
                     root_len: value.len,
                 });
                 continue;
@@ -1698,6 +1702,7 @@ impl Executor {
                     byte_offset: 0,
                     base_ptr,
                     device: onnx_runtime_ir::DeviceId::cpu(),
+                    backing: TensorBacking::Opaque,
                     root_len,
                 });
                 continue;
@@ -1717,6 +1722,16 @@ impl Executor {
                 }
             };
             view_bounds(&shape, &strides, byte_offset, input_dtypes[i], root_len)?;
+            let backing = if buf.is_borrowed()
+                && matches!(
+                    self.graph.initializers.get(&root),
+                    Some(WeightRef::External { .. })
+                )
+            {
+                TensorBacking::ExternalMmap
+            } else {
+                TensorBacking::Opaque
+            };
             in_infos.push(InInfo {
                 present: true,
                 dtype: input_dtypes[i],
@@ -1725,6 +1740,7 @@ impl Executor {
                 byte_offset,
                 base_ptr,
                 device: buf.device(),
+                backing,
                 root_len,
             });
         }
@@ -1756,7 +1772,8 @@ impl Executor {
                     &info.strides,
                     info.device,
                 )
-                .with_byte_offset(info.byte_offset),
+                .with_byte_offset(info.byte_offset)
+                .with_backing(info.backing),
             );
         }
 
@@ -1956,7 +1973,8 @@ impl Executor {
                         &info.strides,
                         info.device,
                     )
-                    .with_byte_offset(info.byte_offset),
+                    .with_byte_offset(info.byte_offset)
+                    .with_backing(info.backing),
                 ),
             }
         }

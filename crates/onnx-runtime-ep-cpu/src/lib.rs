@@ -32,9 +32,14 @@ pub mod kernels;
 pub mod optimizer;
 pub mod provider;
 pub mod strided;
+pub mod weight_offload;
 
 pub use backend::{CpuBackend, has_onednn};
 pub use optimizer::{ProjectionFusion, cpu_optimization_passes};
 pub use provider::CpuExecutionProvider;
+pub use weight_offload::{
+    LinuxProcessMemoryStats, WEIGHT_OFFLOAD_ENV, WeightOffloadLayerStats, WeightOffloadStats,
+    weight_offload_stats,
+};
 
 pub use kernels::slice::{SliceAxisPlan, slice_axes_steps, slice_plan};

@@ -39,6 +39,15 @@ pub struct DevicePtr(pub *const std::ffi::c_void);
 #[derive(Clone, Copy, Debug)]
 pub struct DevicePtrMut(pub *mut std::ffi::c_void);
 
+/// Provenance relevant to kernels that can consume lazy external weights.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TensorBacking {
+    #[default]
+    Opaque,
+    /// Read-only bytes directly alias an ONNX external-data mmap.
+    ExternalMmap,
+}
+
 impl DevicePtr {
     /// Reinterpret as a typed const pointer. Caller ensures the element type.
     pub fn as_ptr<T>(self) -> *const T {
@@ -117,6 +126,7 @@ pub struct TensorView<'a> {
     /// Offset in **bytes** of the element origin from `data` (DLPack semantics).
     pub byte_offset: usize,
     pub device: DeviceId,
+    pub backing: TensorBacking,
     _marker: PhantomData<&'a ()>,
 }
 
@@ -136,6 +146,7 @@ impl<'a> TensorView<'a> {
             strides,
             byte_offset: 0,
             device,
+            backing: TensorBacking::Opaque,
             _marker: PhantomData,
         }
     }
@@ -155,6 +166,7 @@ impl<'a> TensorView<'a> {
             strides: &[],
             byte_offset: 0,
             device: DeviceId::cpu(),
+            backing: TensorBacking::Opaque,
             _marker: PhantomData,
         }
     }
@@ -170,6 +182,11 @@ impl<'a> TensorView<'a> {
     /// Set the DLPack-style byte offset of the element origin.
     pub fn with_byte_offset(mut self, byte_offset: usize) -> Self {
         self.byte_offset = byte_offset;
+        self
+    }
+
+    pub fn with_backing(mut self, backing: TensorBacking) -> Self {
+        self.backing = backing;
         self
     }
 

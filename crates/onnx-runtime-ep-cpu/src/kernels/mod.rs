@@ -731,6 +731,59 @@ pub fn to_dense_f32(view: &TensorView) -> Result<Vec<f32>> {
     Ok(out)
 }
 
+/// Borrow a contiguous host `Uint8` tensor without materializing it.
+pub(crate) fn contiguous_u8_slice<'a>(view: &'a TensorView<'_>) -> Result<&'a [u8]> {
+    view.validate()?;
+    require_dtype(view.dtype, DataType::Uint8, "u8 kernel input")?;
+    if !view.device.is_host_accessible() || !view.is_contiguous() {
+        return Err(EpError::InvalidTensorView {
+            reason: "direct u8 slice requires a contiguous host-accessible tensor".into(),
+        });
+    }
+    let elements = view
+        .shape
+        .iter()
+        .try_fold(1usize, |count, &dim| count.checked_mul(dim));
+    let len = elements.ok_or_else(|| EpError::InvalidTensorView {
+        reason: "direct u8 slice element count overflow".into(),
+    })?;
+    if len > isize::MAX as usize {
+        return Err(EpError::InvalidTensorView {
+            reason: "direct u8 slice exceeds isize::MAX".into(),
+        });
+    }
+    // SAFETY: the validated host-accessible contiguous view describes `len`
+    // readable bytes from its element origin; the owning EP bounds-checks the
+    // view against its allocation before kernel dispatch.
+    Ok(unsafe { std::slice::from_raw_parts(view.data_ptr::<u8>(), len) })
+}
+
+/// Borrow a contiguous host `Float32` tensor without materializing it.
+pub(crate) fn contiguous_f32_slice<'a>(view: &'a TensorView<'_>) -> Result<&'a [f32]> {
+    view.validate()?;
+    require_dtype(view.dtype, DataType::Float32, "f32 kernel input")?;
+    if !view.device.is_host_accessible() || !view.is_contiguous() {
+        return Err(EpError::InvalidTensorView {
+            reason: "direct f32 slice requires a contiguous host-accessible tensor".into(),
+        });
+    }
+    let elements = view
+        .shape
+        .iter()
+        .try_fold(1usize, |count, &dim| count.checked_mul(dim));
+    let len = elements.ok_or_else(|| EpError::InvalidTensorView {
+        reason: "direct f32 slice element count overflow".into(),
+    })?;
+    len.checked_mul(std::mem::size_of::<f32>())
+        .filter(|&bytes| bytes <= isize::MAX as usize)
+        .ok_or_else(|| EpError::InvalidTensorView {
+            reason: "direct f32 slice byte count overflow or exceeds isize::MAX".into(),
+        })?;
+    // SAFETY: as above, with `Float32` alignment additionally checked by
+    // `TensorView::validate`.
+    Ok(unsafe { std::slice::from_raw_parts(view.data_ptr::<f32>(), len) })
+}
+
 /// Materialize an integer index view (`Int64` or `Int32`) into a dense
 /// `Vec<i64>`. Used for `Gather` indices.
 pub fn to_dense_i64(view: &TensorView) -> Result<Vec<i64>> {

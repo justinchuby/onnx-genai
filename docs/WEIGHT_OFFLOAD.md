@@ -542,12 +542,18 @@ serving:
 Environment aliases for command-line deployments:
 
 ```text
+ONNX_GENAI_WEIGHT_OFFLOAD=1                    # Phase-1 route-first mmap CPU MoE
 ONNX_GENAI_WEIGHT_BUDGET=auto|<bytes>          # shorthand resident-weight cap
 ONNX_GENAI_WEIGHT_DEVICE_BUDGET=auto|<bytes>
 ONNX_GENAI_WEIGHT_HOST_BUDGET=auto|<bytes>
 ONNX_GENAI_GPU_LAYERS=<N>
 ONNX_GENAI_WEIGHT_PREFETCH=off|exact|heat|predictive|auto
 ```
+
+`ONNX_GENAI_WEIGHT_OFFLOAD` is opt-in in Phase 1. When set to `1`, pageable
+expert-major external QMoE tensors use route-first execution and bypass
+full-pool materialization/dequantization caches. Unset (the default), or for any
+non-pageable tensor, execution follows the existing resident QMoE path.
 
 Precedence: explicit API > environment > YAML > auto defaults. Per-tier weight caps
 are subordinate to global ceilings and may be reduced by the governor when KV or

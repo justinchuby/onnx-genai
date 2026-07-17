@@ -8,25 +8,41 @@
 //! pack block values least-significant bits first in
 //! `[experts, out_features, ceil(blocks / pack_size)]`.
 //!
-//! This baseline intentionally dequantizes each selected expert to f32 for each
-//! routed row, then calls the float MoE's shared FFN math. Batch-union expert
-//! grouping and compressed-domain GEMM are deferred optimization work.
+//! By default this preserves the resident baseline. With
+//! `ONNX_GENAI_WEIGHT_OFFLOAD=1`, external mmap-backed expert tensors are
+//! validated as expert-major, routes are computed first, and only the batch's
+//! unique selected expert slices are dequantized. Non-pageable layouts fall
+//! back to the resident path without changing results.
 
-use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
+use std::borrow::Cow;
+use std::collections::BTreeMap;
+
+use onnx_runtime_ep_api::{
+    EpError, Kernel, KernelFactory, Result, TensorBacking, TensorMut, TensorView,
+};
 use onnx_runtime_ir::{DataType, Node};
+use onnx_runtime_loader::{
+    ExpertQuantization, ExpertStorageOrder, ExpertTensorLayout, WeightRegionCatalog,
+};
 
 use super::matmul_nbits::dequantize_nbits_row;
 use super::moe::{MoeAttributes, routing_weights, run_expert};
-use super::{check_arity, to_dense_bytes, to_dense_f32, write_dense_f32};
+use super::{
+    check_arity, contiguous_f32_slice, contiguous_u8_slice, to_dense_bytes, to_dense_f32,
+    write_dense_f32,
+};
+use crate::weight_offload::{WeightOffloadMode, metrics};
 
 /// Factory for the ORT contrib `QMoE` operator.
 pub struct QMoEFactory;
 
 /// Per-row block-dequantizing integer QMoE reference kernel.
 pub struct QMoEKernel {
+    layer_id: u32,
     attributes: MoeAttributes,
     bits: usize,
     block_size: usize,
+    weight_offload: WeightOffloadMode,
 }
 
 impl KernelFactory for QMoEFactory {
@@ -56,9 +72,11 @@ impl KernelFactory for QMoEFactory {
             )));
         }
         Ok(Box::new(QMoEKernel {
+            layer_id: node.id.0,
             attributes,
             bits: bits as usize,
             block_size: block_size as usize,
+            weight_offload: WeightOffloadMode::from_env(),
         }))
     }
 }
@@ -196,6 +214,7 @@ impl Kernel for QMoEKernel {
             hidden,
             self.bits,
             self.block_size,
+            self.weight_offload.enabled,
         )?;
         let fc2 = QuantizedExperts::new(
             "fc2",
@@ -207,6 +226,7 @@ impl Kernel for QMoEKernel {
             inter,
             self.bits,
             self.block_size,
+            self.weight_offload.enabled,
         )?;
 
         validate_bias("fc1_experts_bias", inputs, 4, experts, fc1_size)?;
@@ -233,6 +253,7 @@ impl Kernel for QMoEKernel {
                     hidden,
                     self.bits,
                     self.block_size,
+                    self.weight_offload.enabled,
                 )?),
                 optional_dense(inputs, 10)?,
             )
@@ -266,45 +287,125 @@ impl Kernel for QMoEKernel {
             )));
         }
         let mut output = vec![0.0f32; output_elements];
-        for row in 0..rows {
-            let router_range = checked_range(row, experts, "router row")?;
-            let route = routing_weights(
-                &router[router_range.clone()],
-                aggregation
-                    .as_deref()
-                    .map(|weights| &weights[router_range.clone()]),
-                self.attributes.k,
-                self.attributes.normalize_routing_weights,
-            );
-            let input_range = checked_range(row, hidden, "input row")?;
-            let input_row = &x[input_range];
-            let output_range = checked_range(row, hidden, "output row")?;
-            let output_row = &mut output[output_range];
-            for (expert, route_weight) in route {
-                let fc1_weight = fc1.dequantize_expert(expert)?;
-                let fc2_weight = fc2.dequantize_expert(expert)?;
-                let fc3_weight = fc3
-                    .as_ref()
-                    .map(|weights| weights.dequantize_expert(expert))
-                    .transpose()?;
-                let fc1_bias_range = checked_range(expert, fc1_size, "fc1 bias expert row")?;
-                let fc2_bias_range = checked_range(expert, hidden, "fc2 bias expert row")?;
-                let fc3_bias_range = checked_range(expert, inter, "fc3 bias expert row")?;
-                let expert_out = run_expert(
-                    input_row,
-                    &fc1_weight,
-                    fc1_bias.as_deref().map(|bias| &bias[fc1_bias_range]),
-                    &fc2_weight,
-                    fc2_bias.as_deref().map(|bias| &bias[fc2_bias_range]),
-                    fc3_weight.as_deref(),
-                    fc3_bias.as_deref().map(|bias| &bias[fc3_bias_range]),
-                    fc1_size,
-                    hidden,
-                    inter,
-                    &self.attributes,
+        let route_first = self.weight_offload.enabled
+            && fc1.is_pageable()
+            && fc2.is_pageable()
+            && fc3.as_ref().is_none_or(QuantizedExperts::is_pageable);
+        if route_first {
+            let mut routes = Vec::with_capacity(rows);
+            let mut token_counts = BTreeMap::new();
+            for row in 0..rows {
+                let router_range = checked_range(row, experts, "router row")?;
+                let route = routing_weights(
+                    &router[router_range.clone()],
+                    aggregation.as_deref().map(|weights| &weights[router_range]),
+                    self.attributes.k,
+                    self.attributes.normalize_routing_weights,
                 );
-                for feature in 0..hidden {
-                    output_row[feature] += route_weight * expert_out[feature];
+                for &(expert, _) in &route {
+                    *token_counts.entry(expert).or_insert(0usize) += 1;
+                }
+                routes.push(route);
+            }
+
+            let mut mapped_bytes = fc1
+                .mapped_bytes()?
+                .checked_add(fc2.mapped_bytes()?)
+                .ok_or_else(|| error("mapped expert byte count overflow"))?;
+            if let Some(weights) = &fc3 {
+                mapped_bytes = mapped_bytes
+                    .checked_add(weights.mapped_bytes()?)
+                    .ok_or_else(|| error("mapped expert byte count overflow"))?;
+            }
+            metrics().record_mapped_bytes(mapped_bytes);
+            metrics().record_routes(self.layer_id, &token_counts);
+
+            let mut selected = BTreeMap::new();
+            for &expert in token_counts.keys() {
+                let weights = DequantizedExpert {
+                    fc1: fc1.dequantize_expert(expert)?,
+                    fc2: fc2.dequantize_expert(expert)?,
+                    fc3: fc3
+                        .as_ref()
+                        .map(|weights| weights.dequantize_expert(expert))
+                        .transpose()?,
+                };
+                let mut bytes_read = fc1
+                    .expert_source_bytes(expert)?
+                    .checked_add(fc2.expert_source_bytes(expert)?)
+                    .ok_or_else(|| error("selected expert byte count overflow"))?;
+                if let Some(source) = &fc3 {
+                    bytes_read = bytes_read
+                        .checked_add(source.expert_source_bytes(expert)?)
+                        .ok_or_else(|| error("selected expert byte count overflow"))?;
+                }
+                metrics().record_bytes_read(bytes_read);
+                selected.insert(expert, weights);
+            }
+
+            for (row, route) in routes.into_iter().enumerate() {
+                let input_range = checked_range(row, hidden, "input row")?;
+                let input_row = &x[input_range];
+                let output_range = checked_range(row, hidden, "output row")?;
+                let output_row = &mut output[output_range];
+                for (expert, route_weight) in route {
+                    let weights = selected
+                        .get(&expert)
+                        .ok_or_else(|| error("selected expert cache is incomplete"))?;
+                    accumulate_expert(
+                        output_row,
+                        input_row,
+                        expert,
+                        route_weight,
+                        weights,
+                        fc1_bias.as_deref(),
+                        fc2_bias.as_deref(),
+                        fc3_bias.as_deref(),
+                        fc1_size,
+                        hidden,
+                        inter,
+                        &self.attributes,
+                    )?;
+                }
+            }
+        } else {
+            for row in 0..rows {
+                let router_range = checked_range(row, experts, "router row")?;
+                let route = routing_weights(
+                    &router[router_range.clone()],
+                    aggregation
+                        .as_deref()
+                        .map(|weights| &weights[router_range.clone()]),
+                    self.attributes.k,
+                    self.attributes.normalize_routing_weights,
+                );
+                let input_range = checked_range(row, hidden, "input row")?;
+                let input_row = &x[input_range];
+                let output_range = checked_range(row, hidden, "output row")?;
+                let output_row = &mut output[output_range];
+                for (expert, route_weight) in route {
+                    let weights = DequantizedExpert {
+                        fc1: fc1.dequantize_expert(expert)?,
+                        fc2: fc2.dequantize_expert(expert)?,
+                        fc3: fc3
+                            .as_ref()
+                            .map(|weights| weights.dequantize_expert(expert))
+                            .transpose()?,
+                    };
+                    accumulate_expert(
+                        output_row,
+                        input_row,
+                        expert,
+                        route_weight,
+                        &weights,
+                        fc1_bias.as_deref(),
+                        fc2_bias.as_deref(),
+                        fc3_bias.as_deref(),
+                        fc1_size,
+                        hidden,
+                        inter,
+                        &self.attributes,
+                    )?;
                 }
             }
         }
@@ -316,10 +417,55 @@ impl Kernel for QMoEKernel {
     }
 }
 
-struct QuantizedExperts {
-    packed: Vec<u8>,
-    scales: Vec<f32>,
-    zero_points: Option<Vec<u8>>,
+struct DequantizedExpert {
+    fc1: Vec<f32>,
+    fc2: Vec<f32>,
+    fc3: Option<Vec<f32>>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn accumulate_expert(
+    output_row: &mut [f32],
+    input_row: &[f32],
+    expert: usize,
+    route_weight: f32,
+    weights: &DequantizedExpert,
+    fc1_bias: Option<&[f32]>,
+    fc2_bias: Option<&[f32]>,
+    fc3_bias: Option<&[f32]>,
+    fc1_size: usize,
+    hidden: usize,
+    inter: usize,
+    attributes: &MoeAttributes,
+) -> Result<()> {
+    let fc1_bias_range = checked_range(expert, fc1_size, "fc1 bias expert row")?;
+    let fc2_bias_range = checked_range(expert, hidden, "fc2 bias expert row")?;
+    let fc3_bias_range = checked_range(expert, inter, "fc3 bias expert row")?;
+    let expert_out = run_expert(
+        input_row,
+        &weights.fc1,
+        fc1_bias.map(|bias| &bias[fc1_bias_range]),
+        &weights.fc2,
+        fc2_bias.map(|bias| &bias[fc2_bias_range]),
+        weights.fc3.as_deref(),
+        fc3_bias.map(|bias| &bias[fc3_bias_range]),
+        fc1_size,
+        hidden,
+        inter,
+        attributes,
+    );
+    for feature in 0..hidden {
+        output_row[feature] += route_weight * expert_out[feature];
+    }
+    Ok(())
+}
+
+struct QuantizedExperts<'a> {
+    packed: Cow<'a, [u8]>,
+    scales: Cow<'a, [f32]>,
+    zero_points: Option<Cow<'a, [u8]>>,
+    catalogs: Vec<WeightRegionCatalog>,
+    pageable: bool,
     experts: usize,
     out_features: usize,
     in_features: usize,
@@ -331,18 +477,19 @@ struct QuantizedExperts {
     block_size: usize,
 }
 
-impl QuantizedExperts {
+impl<'a> QuantizedExperts<'a> {
     #[allow(clippy::too_many_arguments)]
     fn new(
         name: &str,
-        packed: &TensorView,
-        scales: &TensorView,
-        zero_points: Option<&TensorView>,
+        packed: &'a TensorView<'a>,
+        scales: &'a TensorView<'a>,
+        zero_points: Option<&'a TensorView<'a>>,
         experts: usize,
         out_features: usize,
         in_features: usize,
         bits: usize,
         block_size: usize,
+        prefer_mmap: bool,
     ) -> Result<Self> {
         let pack_size = 8 / bits;
         if !in_features.is_multiple_of(pack_size) {
@@ -379,7 +526,7 @@ impl QuantizedExperts {
             &[expert_rows, blocks],
             &format!("{name} scale element count"),
         )?;
-        checked_byte_count(
+        let scale_bytes = checked_byte_count(
             scale_elements,
             std::mem::size_of::<f32>(),
             &format!("{name} scale byte count"),
@@ -393,11 +540,11 @@ impl QuantizedExperts {
             .checked_add(pack_size - 1)
             .ok_or_else(|| error(format!("{name} zero-point row byte count overflow")))?
             / pack_size;
+        let zero_point_elements = checked_product(
+            &[expert_rows, zero_point_bytes],
+            &format!("{name} zero-point element count"),
+        )?;
         if let Some(points) = zero_points {
-            let zero_point_elements = checked_product(
-                &[expert_rows, zero_point_bytes],
-                &format!("{name} zero-point element count"),
-            )?;
             checked_byte_count(
                 zero_point_elements,
                 std::mem::size_of::<u8>(),
@@ -426,10 +573,71 @@ impl QuantizedExperts {
             in_features,
             &format!("{name} dequantized output"),
         )?;
+        let quantization = Some(ExpertQuantization {
+            bits,
+            block_size,
+            blocks_per_row: blocks,
+        });
+        let catalog_for = |view: &TensorView, rows_per_expert, elements_per_row, tensor_len| {
+            WeightRegionCatalog::for_mapped_tensor_view(
+                view.dtype,
+                view.shape,
+                tensor_len,
+                ExpertTensorLayout {
+                    version: 1,
+                    experts,
+                    rows_per_expert,
+                    storage_elements_per_row: elements_per_row,
+                    order: if view.is_contiguous() {
+                        ExpertStorageOrder::ExpertMajor
+                    } else {
+                        ExpertStorageOrder::Interleaved
+                    },
+                    quantization,
+                },
+            )
+        };
+        let packed_catalog = catalog_for(packed, out_features, packed_in, packed_elements);
+        let scale_catalog = catalog_for(scales, out_features, blocks, scale_bytes);
+        let zero_point_catalog = zero_points
+            .map(|points| catalog_for(points, out_features, zero_point_bytes, zero_point_elements));
+        let pageable = prefer_mmap
+            && packed_catalog.is_pageable()
+            && scale_catalog.is_pageable()
+            && zero_point_catalog
+                .as_ref()
+                .is_none_or(WeightRegionCatalog::is_pageable)
+            && packed.device.is_host_accessible()
+            && scales.device.is_host_accessible()
+            && zero_points.is_none_or(|points| points.device.is_host_accessible())
+            && packed.backing == TensorBacking::ExternalMmap
+            && scales.backing == TensorBacking::ExternalMmap
+            && zero_points.is_none_or(|points| points.backing == TensorBacking::ExternalMmap);
+
+        let (packed_data, scale_data, zero_point_data) = if pageable {
+            (
+                Cow::Borrowed(contiguous_u8_slice(packed)?),
+                Cow::Borrowed(contiguous_f32_slice(scales)?),
+                zero_points
+                    .map(contiguous_u8_slice)
+                    .transpose()?
+                    .map(Cow::Borrowed),
+            )
+        } else {
+            (
+                Cow::Owned(to_dense_bytes(packed)?),
+                Cow::Owned(to_dense_f32(scales)?),
+                zero_points.map(to_dense_bytes).transpose()?.map(Cow::Owned),
+            )
+        };
+        let mut catalogs = vec![packed_catalog, scale_catalog];
+        catalogs.extend(zero_point_catalog);
         Ok(Self {
-            packed: to_dense_bytes(packed)?,
-            scales: to_dense_f32(scales)?,
-            zero_points: zero_points.map(to_dense_bytes).transpose()?,
+            packed: packed_data,
+            scales: scale_data,
+            zero_points: zero_point_data,
+            catalogs,
+            pageable,
             experts,
             out_features,
             in_features,
@@ -439,6 +647,30 @@ impl QuantizedExperts {
             dequantized_elements,
             bits,
             block_size,
+        })
+    }
+
+    fn is_pageable(&self) -> bool {
+        self.pageable
+    }
+
+    fn mapped_bytes(&self) -> Result<usize> {
+        self.catalogs.iter().try_fold(0usize, |total, catalog| {
+            total
+                .checked_add(catalog.mapped_bytes())
+                .ok_or_else(|| error("mapped expert tensor byte count overflow"))
+        })
+    }
+
+    fn expert_source_bytes(&self, expert: usize) -> Result<usize> {
+        self.catalogs.iter().try_fold(0usize, |total, catalog| {
+            let bytes = catalog
+                .region(expert)
+                .ok_or_else(|| error(format!("missing catalog range for expert {expert}")))?
+                .len;
+            total
+                .checked_add(bytes)
+                .ok_or_else(|| error("per-expert source byte count overflow"))
         })
     }
 
@@ -477,28 +709,13 @@ impl QuantizedExperts {
 }
 
 fn checked_product(factors: &[usize], context: &str) -> Result<usize> {
-    let mut product = 1usize;
-    let mut has_zero = false;
-    for &factor in factors {
-        if factor == 0 {
-            has_zero = true;
-        } else {
-            product = product
-                .checked_mul(factor)
-                .ok_or_else(|| error(format!("{context} overflow")))?;
-        }
-    }
-    Ok(if has_zero { 0 } else { product })
+    onnx_runtime_loader::weights::checked_product(factors, context)
+        .map_err(|failure| error(failure.to_string()))
 }
 
 fn checked_byte_count(elements: usize, element_size: usize, context: &str) -> Result<usize> {
-    let bytes = elements
-        .checked_mul(element_size)
-        .ok_or_else(|| error(format!("{context} overflow")))?;
-    if bytes > isize::MAX as usize {
-        return Err(error(format!("{context} exceeds isize::MAX")));
-    }
-    Ok(bytes)
+    onnx_runtime_loader::weights::checked_byte_count(elements, element_size, context)
+        .map_err(|failure| error(failure.to_string()))
 }
 
 fn checked_tensor_layout(name: &str, shape: &[usize], dtype: DataType) -> Result<usize> {
@@ -508,13 +725,8 @@ fn checked_tensor_layout(name: &str, shape: &[usize], dtype: DataType) -> Result
 }
 
 fn checked_range(index: usize, width: usize, context: &str) -> Result<std::ops::Range<usize>> {
-    let start = index
-        .checked_mul(width)
-        .ok_or_else(|| error(format!("{context} start offset overflow")))?;
-    let end = start
-        .checked_add(width)
-        .ok_or_else(|| error(format!("{context} end offset overflow")))?;
-    Ok(start..end)
+    onnx_runtime_loader::weights::checked_range(index, width, context)
+        .map_err(|failure| error(failure.to_string()))
 }
 
 fn preflight_row_ranges(rows: usize, width: usize, context: &str) -> Result<()> {
@@ -594,9 +806,13 @@ mod tests {
     use super::*;
     use crate::CpuExecutionProvider;
     use crate::kernels::testutil::Owned;
-    use onnx_runtime_ep_api::ExecutionProvider;
-    use onnx_runtime_ir::{Attribute, Graph, NodeId, static_shape};
-    use onnx_runtime_loader::Model;
+    use crate::weight_offload::{WeightOffloadMode, metrics};
+    use onnx_runtime_ep_api::{DevicePtr, ExecutionProvider};
+    use onnx_runtime_ir::{Attribute, DeviceId, Graph, NodeId, WeightRef, static_shape};
+    use onnx_runtime_loader::{Model, Pageability, WeightStore, load_model_with_weights};
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Mutex, OnceLock};
 
     struct Quantized {
         packed: Vec<u8>,
@@ -766,9 +982,304 @@ mod tests {
                     "expected error containing '{expected}', got '{message}'"
                 );
             }
+
             Err(other) => panic!("expected KernelFailed, got {other}"),
             Ok(()) => panic!("overflowing QMoE input unexpectedly succeeded"),
         }
+    }
+
+    struct MmapRun {
+        output: Vec<f32>,
+        catalogs_pageable: bool,
+        selected_source_bytes: usize,
+    }
+
+    fn interleave_u8(source: &[u8], experts: usize, rows: usize, cols: usize) -> Vec<u8> {
+        let mut output = vec![0u8; source.len()];
+        for expert in 0..experts {
+            for row in 0..rows {
+                for col in 0..cols {
+                    output[(row * experts + expert) * cols + col] =
+                        source[(expert * rows + row) * cols + col];
+                }
+            }
+        }
+        output
+    }
+
+    fn interleave_f32(source: &[f32], experts: usize, rows: usize, cols: usize) -> Vec<f32> {
+        let mut output = vec![0.0f32; source.len()];
+        for expert in 0..experts {
+            for row in 0..rows {
+                for col in 0..cols {
+                    output[(row * experts + expert) * cols + col] =
+                        source[(expert * rows + row) * cols + col];
+                }
+            }
+        }
+        output
+    }
+
+    fn append_f32_bytes(target: &mut Vec<u8>, values: &[f32]) {
+        target.extend(values.iter().flat_map(|value| value.to_le_bytes()));
+    }
+
+    fn test_external_path() -> PathBuf {
+        static NEXT_FILE: AtomicU64 = AtomicU64::new(0);
+        let id = NEXT_FILE.fetch_add(1, Ordering::Relaxed);
+        std::env::current_dir()
+            .expect("cwd")
+            .join("target-leon")
+            .join("weight-offload-tests")
+            .join(format!("qmoe-{}-{id}.bin", std::process::id()))
+    }
+
+    fn mapped_tensor_view<'a>(
+        store: &'a WeightStore,
+        weight: &'a WeightRef,
+        shape: &'a [usize],
+        strides: &'a [i64],
+        dtype: DataType,
+    ) -> TensorView<'a> {
+        let bytes = store.bytes(weight).expect("mapped weight bytes");
+        TensorView::new(
+            DevicePtr(bytes.as_ptr().cast()),
+            dtype,
+            shape,
+            strides,
+            DeviceId::cpu(),
+        )
+        .with_backing(TensorBacking::ExternalMmap)
+    }
+
+    fn run_mmap_qmoe(enabled: bool, interleaved: bool, input: &[f32], router: &[f32]) -> MmapRun {
+        const EXPERTS: usize = 4;
+        const ROWS: usize = 4;
+        const HIDDEN: usize = 16;
+        const INTER: usize = 16;
+        const BITS: usize = 4;
+        const BLOCK: usize = 16;
+        const PACKED: usize = HIDDEN / 2;
+        const BLOCKS: usize = 1;
+
+        let fc1 = quantize(EXPERTS, INTER, HIDDEN, BITS, BLOCK, false);
+        let fc2 = quantize(EXPERTS, HIDDEN, INTER, BITS, BLOCK, false);
+        let fc1_packed = if interleaved {
+            interleave_u8(&fc1.packed, EXPERTS, INTER, PACKED)
+        } else {
+            fc1.packed
+        };
+        let fc1_scales = if interleaved {
+            interleave_f32(&fc1.scales, EXPERTS, INTER, BLOCKS)
+        } else {
+            fc1.scales
+        };
+        let fc2_packed = if interleaved {
+            interleave_u8(&fc2.packed, EXPERTS, HIDDEN, PACKED)
+        } else {
+            fc2.packed
+        };
+        let fc2_scales = if interleaved {
+            interleave_f32(&fc2.scales, EXPERTS, HIDDEN, BLOCKS)
+        } else {
+            fc2.scales
+        };
+
+        let mut external = Vec::new();
+        let fc1_packed_offset = external.len();
+        external.extend_from_slice(&fc1_packed);
+        let fc1_scales_offset = external.len();
+        append_f32_bytes(&mut external, &fc1_scales);
+        let fc2_packed_offset = external.len();
+        external.extend_from_slice(&fc2_packed);
+        let fc2_scales_offset = external.len();
+        append_f32_bytes(&mut external, &fc2_scales);
+
+        let path = test_external_path();
+        std::fs::create_dir_all(path.parent().expect("external parent"))
+            .expect("create external parent");
+        std::fs::write(&path, &external).expect("write external weights");
+        let fc1_packed_ref = WeightRef::External {
+            path: path.clone(),
+            offset: fc1_packed_offset,
+            length: fc1_packed.len(),
+            dtype: DataType::Uint8,
+            dims: vec![EXPERTS, INTER, PACKED],
+        };
+        let fc1_scales_ref = WeightRef::External {
+            path: path.clone(),
+            offset: fc1_scales_offset,
+            length: fc1_scales.len() * 4,
+            dtype: DataType::Float32,
+            dims: vec![EXPERTS, INTER, BLOCKS],
+        };
+        let fc2_packed_ref = WeightRef::External {
+            path: path.clone(),
+            offset: fc2_packed_offset,
+            length: fc2_packed.len(),
+            dtype: DataType::Uint8,
+            dims: vec![EXPERTS, HIDDEN, PACKED],
+        };
+        let fc2_scales_ref = WeightRef::External {
+            path: path.clone(),
+            offset: fc2_scales_offset,
+            length: fc2_scales.len() * 4,
+            dtype: DataType::Float32,
+            dims: vec![EXPERTS, HIDDEN, BLOCKS],
+        };
+
+        let order = if interleaved {
+            ExpertStorageOrder::Interleaved
+        } else {
+            ExpertStorageOrder::ExpertMajor
+        };
+        let layout = |rows_per_expert, storage_elements_per_row| ExpertTensorLayout {
+            version: 1,
+            experts: EXPERTS,
+            rows_per_expert,
+            storage_elements_per_row,
+            order,
+            quantization: Some(ExpertQuantization {
+                bits: BITS,
+                block_size: BLOCK,
+                blocks_per_row: BLOCKS,
+            }),
+        };
+        let catalogs = [
+            WeightRegionCatalog::classify(&fc1_packed_ref, layout(INTER, PACKED)),
+            WeightRegionCatalog::classify(&fc1_scales_ref, layout(INTER, BLOCKS)),
+            WeightRegionCatalog::classify(&fc2_packed_ref, layout(HIDDEN, PACKED)),
+            WeightRegionCatalog::classify(&fc2_scales_ref, layout(HIDDEN, BLOCKS)),
+        ];
+        let selected_source_bytes = [1usize, 3usize]
+            .into_iter()
+            .flat_map(|expert| catalogs.iter().map(move |catalog| (catalog, expert)))
+            .map(|(catalog, expert)| catalog.region(expert).map_or(0, |region| region.len))
+            .sum();
+
+        let mut store = WeightStore::new();
+        store.map_external(&path).expect("map external weights");
+        let packed_strides = if interleaved {
+            [PACKED as i64, (EXPERTS * PACKED) as i64, 1]
+        } else {
+            [(INTER * PACKED) as i64, PACKED as i64, 1]
+        };
+        let fc2_packed_strides = if interleaved {
+            [PACKED as i64, (EXPERTS * PACKED) as i64, 1]
+        } else {
+            [(HIDDEN * PACKED) as i64, PACKED as i64, 1]
+        };
+        let scale_strides = if interleaved {
+            [BLOCKS as i64, (EXPERTS * BLOCKS) as i64, 1]
+        } else {
+            [(INTER * BLOCKS) as i64, BLOCKS as i64, 1]
+        };
+        let fc2_scale_strides = if interleaved {
+            [BLOCKS as i64, (EXPERTS * BLOCKS) as i64, 1]
+        } else {
+            [(HIDDEN * BLOCKS) as i64, BLOCKS as i64, 1]
+        };
+        let fc1_packed_shape = [EXPERTS, INTER, PACKED];
+        let fc1_scale_shape = [EXPERTS, INTER, BLOCKS];
+        let fc2_packed_shape = [EXPERTS, HIDDEN, PACKED];
+        let fc2_scale_shape = [EXPERTS, HIDDEN, BLOCKS];
+        let fc1_packed_view = mapped_tensor_view(
+            &store,
+            &fc1_packed_ref,
+            &fc1_packed_shape,
+            &packed_strides,
+            DataType::Uint8,
+        );
+        let fc1_scales_view = mapped_tensor_view(
+            &store,
+            &fc1_scales_ref,
+            &fc1_scale_shape,
+            &scale_strides,
+            DataType::Float32,
+        );
+        let fc2_packed_view = mapped_tensor_view(
+            &store,
+            &fc2_packed_ref,
+            &fc2_packed_shape,
+            &fc2_packed_strides,
+            DataType::Uint8,
+        );
+        let fc2_scales_view = mapped_tensor_view(
+            &store,
+            &fc2_scales_ref,
+            &fc2_scale_shape,
+            &fc2_scale_strides,
+            DataType::Float32,
+        );
+
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/qmoe_weight_offload/model.onnx");
+        let (graph, fixture_store) =
+            load_model_with_weights(&fixture).expect("load ONNX IR QMoE fixture");
+        let node = graph
+            .nodes
+            .iter()
+            .find_map(|(id, node)| (node.op_type == "QMoE").then_some(id))
+            .expect("QMoE fixture node");
+        for input in [2usize, 3, 5, 6] {
+            let value = graph.node(node).inputs[input].expect("initializer input");
+            assert!(matches!(
+                graph.initializers.get(&value),
+                Some(WeightRef::External { .. })
+            ));
+        }
+        drop(fixture_store);
+        let kernel = QMoEKernel {
+            layer_id: graph.node(node).id.0,
+            attributes: MoeAttributes::from_node(graph.node(node)).expect("attributes"),
+            bits: BITS,
+            block_size: BLOCK,
+            weight_offload: WeightOffloadMode { enabled },
+        };
+        let x = Owned::f32(&[ROWS, HIDDEN], input);
+        let router = Owned::f32(&[ROWS, EXPERTS], router);
+        let mut output = Owned::zeros_f32(&[ROWS, HIDDEN]);
+        kernel
+            .execute(
+                &[
+                    x.view(),
+                    router.view(),
+                    fc1_packed_view,
+                    fc1_scales_view,
+                    TensorView::absent(DataType::Float32),
+                    fc2_packed_view,
+                    fc2_scales_view,
+                ],
+                &mut [output.view_mut()],
+            )
+            .expect("run mmap QMoE");
+        let output = output.to_f32();
+        drop(store);
+        std::fs::remove_file(path).expect("remove external weights");
+        MmapRun {
+            output,
+            catalogs_pageable: catalogs
+                .iter()
+                .all(|catalog| catalog.pageability() == &Pageability::Pageable),
+            selected_source_bytes,
+        }
+    }
+
+    fn pseudo_random_values(len: usize, seed: u64) -> Vec<f32> {
+        let mut state = seed;
+        (0..len)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1);
+                ((state >> 40) as u32 as f32 / (1u32 << 24) as f32) * 2.0 - 1.0
+            })
+            .collect()
+    }
+
+    fn metrics_test_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
     }
 
     fn run_equivalence(
@@ -891,6 +1402,78 @@ mod tests {
     #[test]
     fn qmoe_int4_single_block_matches_float_moe() {
         run_equivalence(4, 16, 16, 16, 1, false, false);
+    }
+
+    #[test]
+    fn route_first_mmap_matches_full_dequant_on_pseudorandom_inputs() {
+        let _guard = metrics_test_lock().lock().expect("metrics test lock");
+        let input = pseudo_random_values(4 * 16, 0x1234_5678);
+        let router = pseudo_random_values(4 * 4, 0x9876_5432);
+        metrics().reset();
+        let baseline = run_mmap_qmoe(false, false, &input, &router);
+        metrics().reset();
+        let route_first = run_mmap_qmoe(true, false, &input, &router);
+        assert!(route_first.catalogs_pageable);
+        assert_close(&route_first.output, &baseline.output);
+    }
+
+    #[test]
+    fn route_first_reads_only_unique_selected_expert_ranges() {
+        let _guard = metrics_test_lock().lock().expect("metrics test lock");
+        let input = pseudo_random_values(4 * 16, 0xfeed_beef);
+        let router = vec![
+            0.0, 5.0, 1.0, 2.0, // expert 1
+            1.0, 4.0, 0.0, 3.0, // expert 1
+            0.0, 1.0, 2.0, 6.0, // expert 3
+            2.0, 1.0, 0.0, 7.0, // expert 3
+        ];
+        metrics().reset();
+        let run = run_mmap_qmoe(true, false, &input, &router);
+        let stats = crate::weight_offload_stats();
+        assert_eq!(
+            stats.bytes_read_from_mmap as usize,
+            run.selected_source_bytes
+        );
+        assert_eq!(stats.layer_executions, 1);
+        assert_eq!(stats.active_experts, 4);
+        assert_eq!(stats.unique_experts_per_batch, 2);
+        assert_eq!(stats.tokens_per_expert.get(&1), Some(&2));
+        assert_eq!(stats.tokens_per_expert.get(&3), Some(&2));
+        let layer = stats.per_layer.values().next().expect("per-layer stats");
+        assert_eq!(layer.executions, 1);
+        assert_eq!(layer.active_experts, 4);
+        assert_eq!(layer.unique_experts, 2);
+    }
+
+    #[test]
+    fn interleaved_expert_layout_falls_back_without_error() {
+        let _guard = metrics_test_lock().lock().expect("metrics test lock");
+        let input = pseudo_random_values(4 * 16, 0x55aa);
+        let router = vec![
+            0.0, 5.0, 1.0, 2.0, 1.0, 4.0, 0.0, 3.0, 0.0, 1.0, 2.0, 6.0, 2.0, 1.0, 0.0, 7.0,
+        ];
+        let baseline = run_mmap_qmoe(false, false, &input, &router);
+        metrics().reset();
+        let fallback = run_mmap_qmoe(true, true, &input, &router);
+        assert!(!fallback.catalogs_pageable);
+        assert_close(&fallback.output, &baseline.output);
+        assert_eq!(crate::weight_offload_stats().bytes_read_from_mmap, 0);
+    }
+
+    #[test]
+    fn flag_off_preserves_legacy_path_and_counters() {
+        let _guard = metrics_test_lock().lock().expect("metrics test lock");
+        let input = pseudo_random_values(4 * 16, 7);
+        let router = pseudo_random_values(4 * 4, 11);
+        metrics().reset();
+        let legacy = run_mmap_qmoe(false, false, &input, &router);
+        let stats = crate::weight_offload_stats();
+        assert_eq!(stats.bytes_read_from_mmap, 0);
+        assert_eq!(stats.layer_executions, 0);
+
+        metrics().reset();
+        let route_first = run_mmap_qmoe(true, false, &input, &router);
+        assert_close(&legacy.output, &route_first.output);
     }
 
     #[test]
