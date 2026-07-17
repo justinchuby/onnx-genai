@@ -16,7 +16,8 @@ mod rules;
 pub use rules::{
     DuplicateValueNameRule, GraphAcyclicRule, InitializerTypeMatchesDeclaredRule,
     InputOutputDeclaredRule, IrVersionSupportedRule, MissingOpsetImportRule,
-    NoUnconnectedNodesRule, SchemaNodeConformsRule, TypeConstraintSatisfiedRule,
+    MultiDeviceConfigurationRule, NoUnconnectedNodesRule, SchemaNodeConformsRule,
+    TypeConstraintSatisfiedRule,
 };
 
 use crate::model::Model;
@@ -154,6 +155,7 @@ impl OnnxChecker {
         checker.add_rule(TypeConstraintSatisfiedRule);
         checker.add_rule(InitializerTypeMatchesDeclaredRule);
         checker.add_rule(IrVersionSupportedRule);
+        checker.add_rule(MultiDeviceConfigurationRule);
         checker
     }
 
@@ -271,6 +273,7 @@ mod tests {
         assert!(ids.contains(&"schema.type_constraint_satisfied"));
         assert!(ids.contains(&"type.initializer_matches_declared"));
         assert!(ids.contains(&"ir.version_supported"));
+        assert!(ids.contains(&"multidevice.configuration_valid"));
     }
 
     #[test]

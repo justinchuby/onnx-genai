@@ -30,6 +30,16 @@ use crate::check::{OnnxChecker, ValidationResult};
 use crate::error::{Error, Result};
 use crate::text::{self, PrintOptions};
 
+/// Generated ONNX IR v13 multi-device/sharding protobuf model types.
+///
+/// These are the wire-authoritative Rust types compiled from the vendored ONNX
+/// schema. Re-exporting them here lets callers construct distributed annotations
+/// without depending directly on the runtime loader's protobuf module.
+pub use onnx_runtime_loader::proto::onnx::{
+    DeviceConfigurationProto, IntIntListEntryProto, NodeDeviceConfigurationProto, ShardedDimProto,
+    ShardingSpecProto, SimpleShardedDimProto, simple_sharded_dim_proto,
+};
+
 /// An owned ONNX model: the shared-IR [`Graph`] plus the model-level metadata
 /// and (optionally) the live weight store backing external initializers.
 ///

@@ -69,7 +69,11 @@ pub mod textproto;
 pub mod version;
 
 pub use error::{Error, Result};
-pub use model::{Model, load_model, save_model};
+pub use model::{
+    DeviceConfigurationProto, IntIntListEntryProto, Model, NodeDeviceConfigurationProto,
+    ShardedDimProto, ShardingSpecProto, SimpleShardedDimProto, load_model, save_model,
+    simple_sharded_dim_proto,
+};
 
 // Re-export the shared IR and the metadata/weight types so downstream users can
 // build and inspect models without depending on the runtime crates directly

@@ -1,14 +1,16 @@
 use std::collections::BTreeSet;
 
-use onnx_rs::{Json, Model, Text, TextCodec, TextProto, load_model, save_model};
+use onnx_rs::{
+    DeviceConfigurationProto, IntIntListEntryProto, Json, Model, NodeDeviceConfigurationProto,
+    ShardedDimProto, ShardingSpecProto, SimpleShardedDimProto, Text, TextCodec, TextProto,
+    load_model, save_model, simple_sharded_dim_proto,
+};
 use onnx_runtime_loader::proto::{
     FILE_DESCRIPTOR_SET,
     onnx::{
-        AttributeProto, DeviceConfigurationProto, FunctionProto, GraphProto, IntIntListEntryProto,
-        ModelProto, NodeDeviceConfigurationProto, NodeProto, OperatorSetIdProto, ShardedDimProto,
-        ShardingSpecProto, SimpleShardedDimProto, SparseTensorProto, StringStringEntryProto,
-        TensorAnnotation, TensorProto, TensorShapeProto, TrainingInfoProto, TypeProto,
-        ValueInfoProto, attribute_proto, simple_sharded_dim_proto, tensor_proto,
+        AttributeProto, FunctionProto, GraphProto, ModelProto, NodeProto, OperatorSetIdProto,
+        SparseTensorProto, StringStringEntryProto, TensorAnnotation, TensorProto, TensorShapeProto,
+        TrainingInfoProto, TypeProto, ValueInfoProto, attribute_proto, tensor_proto,
         tensor_shape_proto, type_proto,
     },
 };
@@ -385,7 +387,7 @@ fn full_spec_proto() -> ModelProto {
             ],
             output: vec![ValueInfoProto {
                 name: "Y".into(),
-                r#type: Some(tensor_type(tensor_proto::DataType::Float, &[1])),
+                r#type: Some(tensor_type(tensor_proto::DataType::Float, &[4, 2])),
                 ..Default::default()
             }],
             value_info: nested_types
@@ -641,6 +643,111 @@ fn full_spec_is_lossless_across_all_three_textual_codecs() {
         serde_json::from_str::<serde_json::Value>(&json_again).unwrap(),
         serde_json::from_str::<serde_json::Value>(&json).unwrap()
     );
+}
+
+#[test]
+fn multi_device_wire_and_textual_round_trips_are_lossless() {
+    let proto = full_spec_proto();
+    let original_bytes = proto.encode_to_vec();
+    let decoded = ModelProto::decode(original_bytes.as_slice()).unwrap();
+    let model = Model::from_proto(decoded).unwrap();
+
+    assert_eq!(model.to_proto().unwrap().encode_to_vec(), original_bytes);
+
+    let json = Json::serialize(&model, &()).unwrap();
+    assert!(json.contains("\"configurationId\": \"mesh\""));
+    assert!(json.contains("\"indexToDeviceGroupMap\""));
+    assert_eq!(
+        Json::deserialize(&json)
+            .unwrap()
+            .to_proto()
+            .unwrap()
+            .encode_to_vec(),
+        original_bytes
+    );
+
+    let textproto = TextProto::serialize(&model, &()).unwrap();
+    assert!(textproto.contains("configuration_id: \"mesh\""));
+    assert!(textproto.contains("index_to_device_group_map"));
+    assert_eq!(
+        TextProto::deserialize(&textproto)
+            .unwrap()
+            .to_proto()
+            .unwrap()
+            .encode_to_vec(),
+        original_bytes
+    );
+
+    let text = Text::serialize(&model, &Default::default()).unwrap();
+    assert!(text.contains("configuration_id: \"mesh\""));
+    assert!(text.contains("sharding_spec"));
+    assert_eq!(
+        Text::deserialize(&text)
+            .unwrap()
+            .to_proto()
+            .unwrap()
+            .encode_to_vec(),
+        original_bytes
+    );
+}
+
+#[test]
+fn multi_device_checker_accepts_valid_annotations_and_rejects_invalid_ones() {
+    use onnx_rs::check::{
+        MultiDeviceConfigurationRule, ValidationContext, ValidationRule, ViolationLocation,
+    };
+
+    let rule = MultiDeviceConfigurationRule;
+    let valid = Model::from_proto(full_spec_proto()).unwrap();
+    assert!(
+        rule.check(&valid, &ValidationContext::default()).is_empty(),
+        "valid multi-device fixture must pass"
+    );
+
+    let mut invalid_proto = full_spec_proto();
+    invalid_proto.ir_version = 10;
+    invalid_proto.configuration[0].device.pop();
+    let node = &mut invalid_proto.graph.as_mut().unwrap().node[0];
+    node.device_configurations[0].configuration_id = "missing".into();
+    node.device_configurations[0].sharding_spec[0].sharded_dim[0].axis = 4;
+    node.device_configurations[0].sharding_spec[0].sharded_dim[0].simple_sharding[0].dim = None;
+    node.device_configurations[0].sharding_spec[0].sharded_dim[0].simple_sharding[0].num_shards = 0;
+    let mut unknown_tensor = node.device_configurations[0].sharding_spec[0].clone();
+    unknown_tensor.tensor_name = "not-an-edge".into();
+    unknown_tensor.sharded_dim.clear();
+    node.device_configurations[0]
+        .sharding_spec
+        .push(unknown_tensor);
+
+    let invalid = Model::from_proto(invalid_proto).unwrap();
+    let violations = rule.check(&invalid, &ValidationContext::default());
+    assert!(
+        violations.iter().any(|violation| {
+            violation.location == ViolationLocation::Model
+                && violation.message.contains("names 3 devices")
+        }),
+        "{violations:?}"
+    );
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.message.contains("does not match")),
+        "{violations:?}"
+    );
+    for expected in [
+        "require IR version 11 or newer",
+        "not a named node input or output",
+        "outside [-2, 1]",
+        "has no dim_value or dim_param",
+        "positive num_shards",
+    ] {
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.message.contains(expected)),
+            "missing '{expected}' in {violations:?}"
+        );
+    }
 }
 
 #[test]
