@@ -246,15 +246,6 @@ pub struct OrtPluginExport {
     pub register_symbol: String,
 }
 
-/// An EP-specific optimization pass.
-///
-/// Placeholder trait: the full pass pipeline lives in `onnx-runtime-optimizer`
-/// (Phase 2). Defined here so [`ExecutionProvider::custom_passes`] can name it
-/// without a Phase 2 crate dependency.
-pub trait OptimizerPass: Send + Sync {
-    fn name(&self) -> &str;
-}
-
 /// The core EP interface. Every backend crate implements this (§4.1).
 pub trait ExecutionProvider: Send + Sync {
     /// EP identifier (snake_case, e.g. `"cpu_ep"`, `"cuda_ep"`).
@@ -395,7 +386,7 @@ pub trait ExecutionProvider: Send + Sync {
     }
 
     /// EP-specific optimization passes, run after the generic optimizer.
-    fn custom_passes(&self) -> Vec<Box<dyn OptimizerPass>> {
+    fn custom_passes(&self) -> Vec<Box<dyn onnx_runtime_optimizer::OptimizationPass>> {
         Vec::new()
     }
 

@@ -1928,6 +1928,7 @@ name = "onnx-runtime-ep-api"
 version = "0.1.0-dev.2"
 dependencies = [
  "onnx-runtime-ir",
+ "onnx-runtime-optimizer",
  "thiserror 2.0.18",
 ]
 
@@ -1942,6 +1943,7 @@ dependencies = [
  "onnx-runtime-ep-api",
  "onnx-runtime-ir",
  "onnx-runtime-loader",
+ "onnx-runtime-optimizer",
  "onnx-runtime-quantization",
  "rayon",
  "thiserror 2.0.18",

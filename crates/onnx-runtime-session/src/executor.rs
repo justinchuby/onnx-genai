@@ -57,6 +57,7 @@ use onnx_runtime_ir::{
     as_static_shape, compute_contiguous_strides,
 };
 use onnx_runtime_loader::WeightStore;
+use onnx_runtime_optimizer::InitializerResolver;
 use onnx_runtime_shape_inference::{InferenceRegistry, MergePolicy};
 
 use crate::error::{Result, SessionError};
@@ -696,6 +697,35 @@ fn fuse_silu_patterns(graph: &mut Graph) -> usize {
     fused
 }
 
+struct WeightStoreInitializerResolver(Arc<WeightStore>);
+
+impl InitializerResolver for WeightStoreInitializerResolver {
+    fn bytes<'a>(&'a self, weight: &'a onnx_runtime_ir::WeightRef) -> Option<&'a [u8]> {
+        self.0.bytes(weight)
+    }
+}
+
+fn run_ep_scoped_passes(
+    graph: &mut Graph,
+    weights: &Arc<WeightStore>,
+    ep: &dyn ExecutionProvider,
+) -> Result<()> {
+    let passes = ep.custom_passes();
+    if passes.is_empty() {
+        return Ok(());
+    }
+
+    let resolver = Arc::new(WeightStoreInitializerResolver(Arc::clone(weights)));
+    let context =
+        onnx_runtime_optimizer::PassContext::new().with_initializer_resolver(resolver);
+    onnx_runtime_optimizer::run_passes(graph, &passes, &context)?;
+
+    let registry = InferenceRegistry::default_registry();
+    let opset_imports = graph.opset_imports.clone();
+    registry.infer_graph(graph, &opset_imports, MergePolicy::Permissive)?;
+    Ok(())
+}
+
 fn validate_cuda_only_coverage(graph: &Graph, ep: &dyn ExecutionProvider) -> Result<()> {
     if ep.device_type() != DeviceType::Cuda {
         return Ok(());
@@ -809,6 +839,7 @@ impl Executor {
         ep: Arc<dyn ExecutionProvider>,
     ) -> Result<Self> {
         fuse_silu_patterns(&mut graph);
+        run_ep_scoped_passes(&mut graph, &weights, ep.as_ref())?;
         // Topological order up front: also validates the graph is a DAG.
         let order = graph.topological_order()?;
         validate_cuda_only_coverage(&graph, ep.as_ref())?;

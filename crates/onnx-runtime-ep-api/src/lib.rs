@@ -29,8 +29,9 @@ pub use epcontext::{build_ep_context_registry, EpContext, EpContextRegistry};
 pub use error::{EpError, Result};
 pub use kernel::{Cost, Kernel, KernelMatch, ViewOutput};
 pub use provider::{
-    DeviceBuffer, EpConfig, EpId, ExecutionProvider, Fence, OptimizerPass, OrtPluginExport,
+    DeviceBuffer, EpConfig, EpId, ExecutionProvider, Fence, OrtPluginExport,
 };
+pub use onnx_runtime_optimizer::OptimizationPass as OptimizerPass;
 pub use registry::{EpRegistry, KernelFactory, OpKey, OpRegistry};
 pub use tensor::{DevicePtr, DevicePtrMut, TensorMut, TensorView};
 

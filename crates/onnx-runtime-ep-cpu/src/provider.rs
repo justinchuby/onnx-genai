@@ -32,6 +32,7 @@ use onnx_runtime_ep_api::{
 use onnx_runtime_ir::{DeviceId, DeviceType, Node, Shape, TensorLayout};
 
 use crate::kernels::build_cpu_registry;
+use crate::optimizer::cpu_optimization_passes;
 
 /// CPU execution provider. Always available; the fallback EP for any op.
 ///
@@ -145,6 +146,10 @@ impl ExecutionProvider for CpuExecutionProvider {
                 op_type: op.op_type.clone(),
             })?;
         factory.create(op, shapes)
+    }
+
+    fn custom_passes(&self) -> Vec<Box<dyn onnx_runtime_optimizer::OptimizationPass>> {
+        cpu_optimization_passes()
     }
 
     fn allocate(&self, size: usize, alignment: usize) -> Result<DeviceBuffer> {

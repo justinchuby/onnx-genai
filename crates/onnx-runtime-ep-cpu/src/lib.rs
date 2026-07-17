@@ -29,10 +29,12 @@
 pub mod backend;
 pub mod dtype;
 pub mod kernels;
+pub mod optimizer;
 pub mod provider;
 pub mod strided;
 
 pub use backend::{CpuBackend, has_onednn};
+pub use optimizer::{ProjectionFusion, cpu_optimization_passes};
 pub use provider::CpuExecutionProvider;
 
 pub use kernels::slice::{SliceAxisPlan, slice_axes_steps, slice_plan};
