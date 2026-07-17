@@ -19,9 +19,11 @@
 //! and dispatch is purely on op type — no model-specific names. The invariant
 //! is: **never produce a wrong constant.** When in doubt, do not fold.
 
+use std::collections::{HashMap, VecDeque};
+
 use onnx_runtime_ir::{
     Attribute, DataType, Graph, NodeId, TensorData, ValueId, WeightRef, as_static_shape,
-    static_shape,
+    is_fully_static, static_shape,
 };
 
 use crate::error::Result;
@@ -41,62 +43,125 @@ impl OptimizationPass for ConstantFolding {
     }
 
     fn run(&self, graph: &mut Graph, _ctx: &PassContext) -> Result<()> {
-        // Iterate to a fixpoint: folding one node may make its consumers
-        // foldable in the next round (e.g. Constant -> Add).
-        loop {
-            let mut changed = false;
-            let node_ids: Vec<NodeId> = graph.nodes.keys().collect();
-            for nid in node_ids {
-                if !graph.nodes.contains(nid) {
-                    continue;
-                }
-                let node = graph.node(nid).clone();
-                if !matches!(node.domain.as_str(), "" | "ai.onnx") {
-                    continue;
-                }
-                if node.outputs.len() != 1 {
-                    continue;
-                }
-                let out = node.outputs[0];
+        let candidates: Vec<NodeId> = graph
+            .nodes
+            .iter()
+            .filter_map(|(nid, node)| is_candidate(node).then_some(nid))
+            .collect();
+        let mut unresolved = HashMap::with_capacity(candidates.len());
+        let mut dependents: HashMap<ValueId, Vec<NodeId>> =
+            HashMap::with_capacity(candidates.len());
+        let mut ready = VecDeque::new();
 
-                let folded: Option<TensorData> = match node.op_type.as_str() {
-                    "Constant" => eval_constant(&node),
-                    "Shape" => fold_shape(graph, &node),
-                    "Add" | "Sub" | "Mul" => fold_binary_int(graph, &node),
-                    _ => None,
-                };
-
-                let Some(tensor) = folded else { continue };
-
-                // Only fold outputs that are still needed (have a consumer or
-                // are graph outputs); dead outputs are DCE's job and folding
-                // them would leave a stale initializer referencing a GC'd id.
-                let needed = graph.outputs.contains(&out)
-                    || graph
-                        .try_value(out)
-                        .is_some_and(|v| !v.consumers.is_empty());
-                if !needed {
-                    continue;
-                }
-
-                graph.remove_node(nid);
-                // The output survives because it is needed; retype it to the
-                // folded tensor and back it with an inline initializer.
-                if graph.try_value(out).is_some() {
-                    let dims = tensor.dims.clone();
-                    let dtype = tensor.dtype;
-                    let v = graph.value_mut(out);
-                    v.dtype = dtype;
-                    v.shape = static_shape(dims);
-                    graph.set_initializer(out, WeightRef::Inline(tensor));
-                    changed = true;
+        // Arena iteration and dependent insertion are both in ascending NodeId
+        // order, so the FIFO schedule is reproducible.
+        for nid in candidates {
+            let node = graph.node(nid);
+            let Some(inputs) = unresolved_inputs(graph, node) else {
+                continue;
+            };
+            let count = inputs.len();
+            unresolved.insert(nid, count);
+            if count == 0 {
+                ready.push_back(nid);
+            } else {
+                for input in inputs {
+                    dependents.entry(input).or_default().push(nid);
                 }
             }
-            if !changed {
-                break;
+        }
+
+        while let Some(nid) = ready.pop_front() {
+            if unresolved.remove(&nid).is_none() || !graph.nodes.contains(nid) {
+                continue;
+            }
+            let (out, folded) = {
+                let node = graph.node(nid);
+                let folded = match node.op_type.as_str() {
+                    "Constant" => eval_constant(node),
+                    "Shape" => fold_shape(graph, node),
+                    "Add" | "Sub" | "Mul" => fold_binary_int(graph, node),
+                    _ => None,
+                };
+                (node.outputs[0], folded)
+            };
+            let Some(tensor) = folded else { continue };
+
+            // Only fold outputs that are still needed (have a consumer or
+            // are graph outputs); dead outputs are DCE's job and folding
+            // them would leave a stale initializer referencing a GC'd id.
+            let needed = graph.outputs.contains(&out)
+                || graph
+                    .try_value(out)
+                    .is_some_and(|v| !v.consumers.is_empty());
+            if !needed {
+                continue;
+            }
+
+            graph.remove_node(nid);
+            // The output survives because it is needed; retype it to the
+            // folded tensor and back it with an inline initializer.
+            if graph.try_value(out).is_none() {
+                continue;
+            }
+            let dims = tensor.dims.clone();
+            let dtype = tensor.dtype;
+            let v = graph.value_mut(out);
+            v.dtype = dtype;
+            v.shape = static_shape(dims);
+            graph.set_initializer(out, WeightRef::Inline(tensor));
+
+            for consumer in dependents.remove(&out).unwrap_or_default() {
+                let Some(count) = unresolved.get_mut(&consumer) else {
+                    continue;
+                };
+                *count -= 1;
+                if *count == 0 {
+                    ready.push_back(consumer);
+                }
             }
         }
         Ok(())
+    }
+}
+
+fn is_candidate(node: &onnx_runtime_ir::Node) -> bool {
+    matches!(node.domain.as_str(), "" | "ai.onnx")
+        && node.outputs.len() == 1
+        && matches!(
+            node.op_type.as_str(),
+            "Constant" | "Shape" | "Add" | "Sub" | "Mul"
+        )
+}
+
+fn unresolved_inputs(graph: &Graph, node: &onnx_runtime_ir::Node) -> Option<Vec<ValueId>> {
+    match node.op_type.as_str() {
+        "Constant" => Some(Vec::new()),
+        "Shape" => {
+            if node.attr("start").is_some() || node.attr("end").is_some() {
+                return None;
+            }
+            let input = node.inputs.first().copied().flatten()?;
+            let shape = &graph.try_value(input)?.shape;
+            if shape.len() <= MAX_FOLD_ELEMS && is_fully_static(shape) {
+                Some(Vec::new())
+            } else {
+                Some(vec![input])
+            }
+        }
+        "Add" | "Sub" | "Mul" => {
+            if node.inputs.len() != 2 {
+                return None;
+            }
+            let inputs = [node.inputs[0]?, node.inputs[1]?];
+            Some(
+                inputs
+                    .into_iter()
+                    .filter(|&input| inline_const(graph, input).is_none())
+                    .collect(),
+            )
+        }
+        _ => None,
     }
 }
 
@@ -392,6 +457,74 @@ mod tests {
         let t = inline_const(&g, out).unwrap();
         assert_eq!(read_i64(t).unwrap(), vec![4, 6]);
         assert!(g.validate().is_ok());
+    }
+
+    fn constant_chain(nodes: usize, reverse_node_ids: bool) -> (Graph, ValueId) {
+        let mut g = Graph::new();
+        g.opset_imports.insert(String::new(), 17);
+        let zero = const_init(&mut g, "zero", vec![1], &[0]);
+        let one = const_init(&mut g, "one", vec![1], &[1]);
+        let mut values = Vec::with_capacity(nodes + 1);
+        values.push(zero);
+        for _ in 0..nodes {
+            values.push(g.create_value(DataType::Int64, static_shape([1])));
+        }
+
+        if reverse_node_ids {
+            for i in (1..=nodes).rev() {
+                g.insert_node(Node::new(
+                    NodeId(0),
+                    "Add",
+                    vec![Some(values[i - 1]), Some(one)],
+                    vec![values[i]],
+                ));
+            }
+        } else {
+            for i in 1..=nodes {
+                g.insert_node(Node::new(
+                    NodeId(0),
+                    "Add",
+                    vec![Some(values[i - 1]), Some(one)],
+                    vec![values[i]],
+                ));
+            }
+        }
+
+        let out = values[nodes];
+        g.add_output(out);
+        (g, out)
+    }
+
+    #[test]
+    fn reverse_node_id_chain_matches_forward_order() {
+        let (mut forward, forward_out) = constant_chain(64, false);
+        let (mut reverse, reverse_out) = constant_chain(64, true);
+
+        let reverse_ids = reverse.topological_order().unwrap();
+        assert!(
+            reverse_ids.windows(2).all(|ids| ids[0].0 > ids[1].0),
+            "test graph must have reverse dependency NodeIds"
+        );
+
+        ConstantFolding
+            .run(&mut forward, &PassContext::new())
+            .unwrap();
+        ConstantFolding
+            .run(&mut reverse, &PassContext::new())
+            .unwrap();
+
+        assert_eq!(forward.num_nodes(), 0);
+        assert_eq!(reverse.num_nodes(), 0);
+        assert_eq!(
+            inline_const(&forward, forward_out),
+            inline_const(&reverse, reverse_out)
+        );
+        assert_eq!(
+            read_i64(inline_const(&reverse, reverse_out).unwrap()),
+            Some(vec![64])
+        );
+        assert!(forward.validate().is_ok());
+        assert!(reverse.validate().is_ok());
     }
 
     #[test]
