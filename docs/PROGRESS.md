@@ -4,7 +4,7 @@ Tracks implementation status of `docs/DESIGN.md` (§1–§40). Updated as work l
 
 **Published:** `onnx-genai` v0.1.0 + 8 sub-crates on crates.io; the `onnx-runtime-*` layer (including `onnx-runtime-tracer`) is released as v0.1.0-dev.1. CI (fmt/build/test/**blocking clippy**) + scheduled `cargo-audit`. Coverage ~77% line.
 
-_Last updated: 2026-07-17T11:15:00Z — BERT Gather parity, onnx-rs round 4/If inference, and DeepSeek CSA Phase 3 landed._
+_Last updated: 2026-07-17T12:45:00Z — CUDA QMoE Phases 1–2, onnx-rs round 5, and WEIGHT_OFFLOAD Phase 2 landed._
 
 **Current `origin/main` HEAD:** `f04b858`.
 
@@ -411,3 +411,10 @@ Scoped the "export Gemma4 E2B/12B via Mobius and smoke-test through onnx-genai" 
 - End-to-end run of a GLM-5.2/DeepSeek-scale model once the preceding work lands.
 
 - **IN FLIGHT (2026-07-17):** Projection-fusion Phase A implementation — CPU EP-scoped optimizer plus gate/up fusion.
+
+### Wave 8 — CUDA QMoE, onnx-rs, and WEIGHT_OFFLOAD
+
+- **CUDA QMoE Phase 1 ✅ landed (`0fa3557`, Mariette; Holden 🟢):** CUDA `com.microsoft::QMoE` now has top-k routing, optional aggregation weights, affine INT4/INT8 block dequantization, biases, FC3/SwiGLU, all CPU-parity activation modes, and f32/f16/bf16 storage with f32 accumulation. Launch sizing derives from device capability, thread limits, and SM count rather than SM90. Five CPU-vs-CUDA conformance tests and **148** CUDA tests pass; paging/prefetch and multi-GPU sharding remain deferred.
+- **onnx-rs round 5 ✅ landed (`8d1d41b` → `93246b9`, landed `d39eb54`; Sapper → Leon; Bryant 🔴→🟢):** added GatherElements, GatherND, Equal, Greater, Less, And, Or, Not, Cast, Shape, Size, NonZero, Range, and Split schemas/inference plus Softmax/LogSoftmax opset 12→13 conversion. Bryant rejected fabricated equal shapes for dynamic Split and a floating Range overflow gap at rounded `2^63`; Sapper was locked out and Leon made dynamic split-axis extents unresolved and rejected that Range boundary. **145** onnx-rs and **149** shape-inference tests pass.
+- **CUDA QMoE Phase 2 ✅ landed (`52918a8`, Mariette; Holden 🟢):** prefill uses GPU per-expert counts, prefix-scan buckets, contiguous f32 gather, tiled INT4/INT8 dequant-GEMM, route-slot scatter, and ordered weighted top-k combine. GEMM serves buckets with ≥2 tokens; GEMV serves smaller buckets and M==1. SM-derived 8/4 tiles fall back to 2/1 under shared-memory pressure. Oracle, empty, and all-to-one-expert coverage pass; **151** CUDA tests pass.
+- **WEIGHT_OFFLOAD Phase 2 ✅ landed (`19e90ff` → `da2d1be` → `ceda4e7`, landed `f80ca09`; Chew → Deckard → Leon; Nabil 🔴→🔴→🟢):** bounded per-engine host-RAM LFRU expert caches provide Arc leases, pinning, hysteresis, strict reservations, oversized direct-mmap, zero-byte fallback, governor integration, and metrics. Nabil's first rejection found last-engine-wins global budgeting and unbounded history; Chew was locked out and Deckard partitioned caches per engine and capped/pruned history at 4096. The second rejection found clobbered/stale global residency; Deckard was locked out and Leon added checked live-cache delta aggregation plus one-time Drop subtraction. Leased/pinned entries never evict, cached/direct-mmap output is bit-identical, and zero-byte preserves Phase 1. **487** CPU EP and **141** Engine tests pass.

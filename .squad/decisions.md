@@ -1837,3 +1837,29 @@ Status: design approved; Phase 1 = mmap disk tier + active-expert CPU MoE access
 **By:** Wallace
 **What:** Whole-graph shape inference now seeds every explicitly known value type, including intermediate ONNX `value_info`, while allowing producer rules to overwrite those seeds when they resolve a fresher type.
 **Why:** The optimizer passes did not rewire BERT's Gather. The post-optimization re-inference discarded the declared `[1, 8]` shape of Gather indices `106` because its `Expand` producer could not be re-resolved through a dynamic Slice chain. Gather then treated the missing indices shape as scalar and overwrote output `108` from `[1, 8, 32]` to `[32]`, causing the validated kernel allocation mismatch. Preserving explicit intermediate metadata keeps optimized graphs reference-equivalent without weakening Gather validation.
+
+## 2026-07-17 — Wave 8
+
+### 2026-07-17: CUDA QMoE Phase 1 parity baseline
+**By:** Mariette
+**What:** CUDA `com.microsoft::QMoE` now implements top-k routing, optional aggregation weights, affine INT4/INT8 block dequantization, biases, FC3/SwiGLU, every CPU-parity activation mode, and f32/f16/bf16 storage with f32 accumulation. Launch sizing derives from compute capability, thread limits, and SM count rather than hardcoding SM90.
+**Why:** This establishes a portable GPU QMoE baseline with five CPU-vs-CUDA conformance tests and 148 passing CUDA tests. Paging/prefetch and multi-GPU expert sharding remain deferred.
+**Landed:** `0fa3557`; reviewed 🟢 by Holden.
+
+### 2026-07-17: onnx-rs round-5 schemas and conservative dynamic Split/Range inference
+**By:** Sapper, repaired by Leon
+**What:** Added schemas and shape inference for GatherElements, GatherND, Equal, Greater, Less, And, Or, Not, Cast, Shape, Size, NonZero, Range, and Split, plus a Softmax/LogSoftmax opset 12→13 version-conversion rewrite. Dynamic Split inputs now leave split-axis extents unresolved while preserving non-axis dimensions; Range rejects the rounded `2^63` (`isize::MAX as f64`) boundary.
+**Why:** Bryant rejected the original `8d1d41b` because it fabricated equal output shapes for dynamic Split and let floating Range lengths bypass overflow rejection. Sapper was locked out; Leon repaired both failures in `93246b9`, landed as `d39eb54`. `onnx-rs` has 145 and shape-inference 149 passing tests.
+**Review:** Bryant 🔴→🟢.
+
+### 2026-07-17: CUDA QMoE Phase 2 batched prefill path
+**By:** Mariette
+**What:** Prefill now counts tokens per expert on GPU, prefix-scans and buckets them, gathers contiguous f32 inputs, runs tiled INT4/INT8 dequant-GEMM, scatters route slots, and combines weighted top-k routes in order. It selects GEMM for at least two tokens per expert, GEMV otherwise and for M==1; SM-derived 8/4 tiles fall back to 2/1 under shared-memory pressure.
+**Why:** The batched path keeps sparse expert prefill on GPU while retaining the optimal GEMV path for small buckets. GEMV-vs-GEMM-vs-CPU-oracle, empty, and all-to-one-expert coverage pass; the CUDA suite has 151 passing tests.
+**Landed:** `52918a8`; reviewed 🟢 by Holden.
+
+### 2026-07-17: WEIGHT_OFFLOAD Phase 2 per-engine bounded LFRU cache
+**By:** Chew, repaired by Deckard and Leon
+**What:** Expert offload uses bounded host-RAM LFRU caches with Arc leases, pinning, hysteresis, strict byte reservation, oversized direct-mmap, zero-byte fallback, governor integration, and metrics. Cache ownership and caps are per engine; uncacheable history is skipped and LFRU-pruned at 4096. Global residency/effective-budget metrics use checked delta aggregation across live caches, and Drop saturating-subtracts each cache contribution exactly once.
+**Why:** Nabil rejected `19e90ff` because a last engine could overwrite the global cache budget and history grew without bound. Chew was locked out; Deckard's `da2d1be` added per-engine partitioning and bounded history, but was rejected because global residency remained a clobbered/stale atomic. Deckard was locked out; Leon fixed accounting in `ceda4e7`, landed as `f80ca09`. Leased/pinned entries remain non-evictable, cached output is bit-identical to direct mmap, and zero-byte behavior remains Phase 1-compatible.
+**Review:** Nabil 🔴→🔴→🟢; CPU EP 487 and Engine 141 tests pass.
