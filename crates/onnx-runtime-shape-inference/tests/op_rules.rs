@@ -1743,6 +1743,29 @@ fn gqa_node() -> Node {
 }
 
 #[test]
+fn group_query_attention_missing_past_shape_still_emits_present_shapes() {
+    let mut inputs = gqa_inputs(8, Some(3));
+    inputs[3] = NodeIo::default();
+    let outs = run(&gqa_node(), inputs, 1);
+    let present_key = &outs[1]
+        .type_info
+        .as_ref()
+        .expect("present key shape resolved")
+        .shape;
+    let present_value = &outs[2]
+        .type_info
+        .as_ref()
+        .expect("present value shape resolved")
+        .shape;
+    assert_eq!(present_key.len(), 4);
+    assert_eq!(present_key[0], c(1));
+    assert_eq!(present_key[1], c(2));
+    assert!(present_key[2].as_symbol().is_some());
+    assert_eq!(present_key[3], c(2));
+    assert_eq!(present_key, present_value);
+}
+
+#[test]
 fn group_query_attention_fixed_capacity_present_uses_max_capacity_total() {
     let outs = run(&gqa_node(), gqa_inputs(8, Some(3)), 1);
     assert_eq!(
@@ -1753,6 +1776,29 @@ fn group_query_attention_fixed_capacity_present_uses_max_capacity_total() {
         outs[2].type_info.as_ref().unwrap().shape,
         vec![c(1), c(2), c(8), c(2)]
     );
+}
+
+#[test]
+fn group_query_attention_non_rank_four_past_still_emits_present_shapes() {
+    let mut inputs = gqa_inputs(8, Some(3));
+    inputs[3] = f32in(vec![c(1), c(8), c(4)]);
+    let outs = run(&gqa_node(), inputs, 1);
+    let present_key = &outs[1]
+        .type_info
+        .as_ref()
+        .expect("present key shape resolved")
+        .shape;
+    let present_value = &outs[2]
+        .type_info
+        .as_ref()
+        .expect("present value shape resolved")
+        .shape;
+    assert_eq!(present_key.len(), 4);
+    assert_eq!(present_key[0], c(1));
+    assert_eq!(present_key[1], c(2));
+    assert!(present_key[2].as_symbol().is_some());
+    assert_eq!(present_key[3], c(2));
+    assert_eq!(present_key, present_value);
 }
 
 #[test]

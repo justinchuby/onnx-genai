@@ -156,23 +156,23 @@ pub fn group_query_attention(ctx: &mut InferenceContext) -> Result<(), ShapeInfe
     if ctx.num_outputs() < 2 {
         return Ok(());
     }
-    let Some(past) = ctx.input_shape(3).map(<[_]>::to_vec) else {
-        return Ok(());
-    };
-    if past.len() != 4 {
-        return Ok(());
-    }
     let total_sequence = ctx
         .input_shape_data(6)
         .filter(|data| data.is_scalar())
         .and_then(|data| data.elems.first())
         .and_then(DimExpr::as_const);
-    let present_sequence = match (past[2].as_const(), total_sequence) {
+    let present_sequence = match (
+        ctx.input_shape(3)
+            .filter(|past| past.len() == 4)
+            .and_then(|past| past[2].as_const()),
+        total_sequence,
+    ) {
         (Some(capacity), Some(total)) => DimExpr::constant(capacity.max(total)),
         // `max(capacity, total)` is not representable by DimExpr. An opaque
         // symbol keeps the output data-dependent so the executor can size it
         // from the runtime total instead of forcing the growing-cache upper
-        // bound (`past + key`) onto a fixed-capacity cache.
+        // bound (`past + key`) onto a fixed-capacity cache. The same graceful
+        // degradation applies when the past-cache shape is absent or not rank 4.
         _ => ctx.fresh_dim(),
     };
     let present = vec![
