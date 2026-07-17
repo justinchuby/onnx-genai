@@ -1,7 +1,8 @@
 //! CUDA conformance tests for router/mask indexing and scan operators.
 
 use onnx_runtime_ep_api::{
-    DeviceBuffer, DevicePtr, DevicePtrMut, ExecutionProvider, KernelMatch, TensorMut, TensorView,
+    DeviceBuffer, DevicePtr, DevicePtrMut, ExecutionProvider, KernelMatch, Result, TensorMut,
+    TensorView,
 };
 use onnx_runtime_ep_cuda::CudaExecutionProvider;
 use onnx_runtime_ep_cuda::runtime::cuptr;
@@ -81,8 +82,8 @@ fn standard_attention_and_rope_claim_only_f32_and_require_contiguous_inputs() {
         );
         if op_type == "RotaryEmbedding" {
             assert!(
-                kernel.cuda_graph_compatible(),
-                "GPU-native RotaryEmbedding should be CUDA graph compatible"
+                !kernel.cuda_graph_compatible(),
+                "RotaryEmbedding validates device position_ids with a host synchronization"
             );
         }
     }
@@ -95,6 +96,16 @@ fn run(
     outputs: &[(DataType, Vec<usize>)],
     attrs: &[(&str, Attribute)],
 ) -> Vec<Vec<u8>> {
+    run_result(op, opset, inputs, outputs, attrs).unwrap()
+}
+
+fn run_result(
+    op: &str,
+    opset: u64,
+    inputs: &[Tensor],
+    outputs: &[(DataType, Vec<usize>)],
+    attrs: &[(&str, Attribute)],
+) -> Result<Vec<Vec<u8>>> {
     let ep = CudaExecutionProvider::new_default().expect("CUDA runtime must be available");
     let mut graph = Graph::new();
     graph.opset_imports.insert(String::new(), opset);
@@ -136,24 +147,18 @@ fn run(
         graph.add_output(output);
     }
     let model = Model::new(&graph);
-    let kernel = ep
-        .get_kernel(model.graph.node(node_id), &[], opset)
-        .unwrap();
+    let kernel = ep.get_kernel(model.graph.node(node_id), &[], opset)?;
 
     let input_buffers = inputs
         .iter()
-        .map(|input| {
-            let buffer = ep.allocate(input.bytes.len(), 256).unwrap();
+        .map(|input| -> Result<DeviceBuffer> {
+            let buffer = ep.allocate(input.bytes.len(), 256)?;
             if !input.bytes.is_empty() {
-                unsafe {
-                    ep.runtime()
-                        .htod(&input.bytes, cuptr(buffer.as_ptr()))
-                        .unwrap()
-                };
+                unsafe { ep.runtime().htod(&input.bytes, cuptr(buffer.as_ptr()))? };
             }
-            buffer
+            Ok(buffer)
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>>>()?;
     let input_strides = inputs
         .iter()
         .map(|input| compute_contiguous_strides(&input.shape))
@@ -174,11 +179,10 @@ fn run(
         .collect::<Vec<_>>();
     let mut output_buffers = outputs
         .iter()
-        .map(|(dtype, shape)| {
-            ep.allocate(dtype.storage_bytes(shape.iter().product()), 256)
-                .unwrap()
+        .map(|(dtype, shape)| -> Result<DeviceBuffer> {
+            Ok(ep.allocate(dtype.storage_bytes(shape.iter().product()), 256)?)
         })
-        .collect::<Vec<DeviceBuffer>>();
+        .collect::<Result<Vec<DeviceBuffer>>>()?;
     let output_strides = outputs
         .iter()
         .map(|(_, shape)| compute_contiguous_strides(shape))
@@ -197,30 +201,34 @@ fn run(
             )
         })
         .collect::<Vec<_>>();
-    kernel.execute(&input_views, &mut output_views).unwrap();
+    if let Err(error) = kernel.execute(&input_views, &mut output_views) {
+        for buffer in input_buffers {
+            ep.deallocate(buffer)?;
+        }
+        for buffer in output_buffers {
+            ep.deallocate(buffer)?;
+        }
+        return Err(error);
+    }
 
     let result = outputs
         .iter()
         .zip(&output_buffers)
-        .map(|((dtype, shape), buffer)| {
+        .map(|((dtype, shape), buffer)| -> Result<Vec<u8>> {
             let mut bytes = vec![0; dtype.storage_bytes(shape.iter().product())];
             if !bytes.is_empty() {
-                unsafe {
-                    ep.runtime()
-                        .dtoh(&mut bytes, cuptr(buffer.as_ptr()))
-                        .unwrap()
-                };
+                unsafe { ep.runtime().dtoh(&mut bytes, cuptr(buffer.as_ptr()))? };
             }
-            bytes
+            Ok(bytes)
         })
-        .collect();
+        .collect::<Result<Vec<_>>>()?;
     for buffer in input_buffers {
-        ep.deallocate(buffer).unwrap();
+        ep.deallocate(buffer)?;
     }
     for buffer in output_buffers {
-        ep.deallocate(buffer).unwrap();
+        ep.deallocate(buffer)?;
     }
-    result
+    Ok(result)
 }
 fn f32s(bytes: &[u8]) -> Vec<f32> {
     bytes
@@ -260,6 +268,35 @@ fn assert_close(got: &[f32], expected: &[f32]) {
     for (i, (&g, &e)) in got.iter().zip(expected).enumerate() {
         assert!((g - e).abs() <= 1e-4, "element {i}: {g} vs {e}");
     }
+}
+
+fn rotary_embedding_reference_4d(
+    x: &[f32],
+    batch: usize,
+    heads: usize,
+    seq: usize,
+    head_size: usize,
+    cos_cache: &[f32],
+    sin_cache: &[f32],
+    position_ids: &[i64],
+) -> Vec<f32> {
+    let half = head_size / 2;
+    let mut y = vec![0.0; x.len()];
+    for b in 0..batch {
+        for h in 0..heads {
+            for s in 0..seq {
+                let row = position_ids[b * seq + s] as usize;
+                for d in 0..half {
+                    let offset = ((b * heads + h) * seq + s) * head_size;
+                    let cos = cos_cache[row * half + d];
+                    let sin = sin_cache[row * half + d];
+                    y[offset + d] = cos * x[offset + d] - sin * x[offset + d + half];
+                    y[offset + d + half] = sin * x[offset + d] + cos * x[offset + d + half];
+                }
+            }
+        }
+    }
+    y
 }
 
 #[test]
@@ -383,5 +420,74 @@ fn rotary_embedding_3d_rotate_half_direct_cache_broadcasts_across_heads() {
         vec![
             1., -1., 3., 3., 5., -1., 7., 7., -11., 10., 9., 12., -15., 14., 13., 16.,
         ]
+    );
+}
+
+#[test]
+fn rotary_embedding_4d_multi_batch_multi_head_position_ids_matches_reference() {
+    // Each (batch, sequence) position must select one cache row, then broadcast
+    // it across heads in X's [B, H, S, D] layout.
+    let x = (1..=16).map(|value| value as f32).collect::<Vec<_>>();
+    let position_ids = [0_i64, 1, 2, 0];
+    let cos_cache = [1_f32, 0., -1.];
+    let sin_cache = [0_f32, 1., 0.];
+    let inputs = [
+        tensor(DataType::Float32, &[2, 2, 2, 2], &x),
+        tensor(DataType::Float32, &[3, 1], &cos_cache),
+        tensor(DataType::Float32, &[3, 1], &sin_cache),
+        tensor(DataType::Int64, &[2, 2], &position_ids),
+    ];
+    let output = run(
+        "RotaryEmbedding",
+        23,
+        &inputs,
+        &[(DataType::Float32, vec![2, 2, 2, 2])],
+        &[],
+    );
+    assert_close(
+        &f32s(&output[0]),
+        &rotary_embedding_reference_4d(&x, 2, 2, 2, 2, &cos_cache, &sin_cache, &position_ids),
+    );
+}
+
+#[test]
+fn rotary_embedding_negative_position_ids_return_error() {
+    let inputs = [
+        tensor(DataType::Float32, &[1, 1, 1, 2], &[1_f32, 2.]),
+        tensor(DataType::Float32, &[1, 1], &[1_f32]),
+        tensor(DataType::Float32, &[1, 1], &[0_f32]),
+        tensor(DataType::Int64, &[1, 1], &[-1_i64]),
+    ];
+    assert!(
+        run_result(
+            "RotaryEmbedding",
+            23,
+            &inputs,
+            &[(DataType::Float32, vec![1, 1, 1, 2])],
+            &[],
+        )
+        .is_err(),
+        "negative position_ids must return an error"
+    );
+}
+
+#[test]
+fn rotary_embedding_out_of_range_position_ids_return_error() {
+    let inputs = [
+        tensor(DataType::Float32, &[1, 1, 1, 2], &[1_f32, 2.]),
+        tensor(DataType::Float32, &[1, 1], &[1_f32]),
+        tensor(DataType::Float32, &[1, 1], &[0_f32]),
+        tensor(DataType::Int64, &[1, 1], &[1_i64]),
+    ];
+    assert!(
+        run_result(
+            "RotaryEmbedding",
+            23,
+            &inputs,
+            &[(DataType::Float32, vec![1, 1, 1, 2])],
+            &[],
+        )
+        .is_err(),
+        "position_ids beyond the cache rows must return an error"
     );
 }

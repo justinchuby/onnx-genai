@@ -41,8 +41,20 @@ use crate::error::driver_err;
 use crate::runtime::{CudaRuntime, cuptr};
 
 const BLOCK: u32 = 256;
-const ROTARY_EMBEDDING_MODULE: &str = "rotary_embedding_f32_v1";
+const ROTARY_EMBEDDING_MODULE: &str = "rotary_embedding_f32_v2";
 const ROTARY_EMBEDDING_SOURCE: &str = r#"
+extern "C" __global__ void validate_position_ids(
+    const long long* position_ids, unsigned long long count,
+    unsigned long long cache_rows, int* invalid) {
+  for (unsigned long long i = blockIdx.x * blockDim.x + threadIdx.x; i < count;
+       i += (unsigned long long)gridDim.x * blockDim.x) {
+    const long long position = position_ids[i];
+    if (position < 0 || (unsigned long long)position >= cache_rows) {
+      atomicOr(invalid, 1);
+    }
+  }
+}
+
 extern "C" __global__ void rotary_embedding_f32(
     const float* x, const float* cos_cache, const float* sin_cache,
     const long long* position_ids, float* y,
@@ -79,8 +91,8 @@ extern "C" __global__ void rotary_embedding_f32(
     const long long cache_row = has_position_ids
         ? position_ids[b * seq + s]
         : (long long)(b * seq + s);
-    // ONNX-valid inputs always take the rotation path. The guard prevents an
-    // invalid device position from indexing outside the cache.
+    // position_ids are validated before this kernel launches. Keep this guard
+    // as defense in depth against out-of-bounds cache access.
     if (cache_row < 0 || (unsigned long long)cache_row >= cache_rows) {
       y[i] = x[i];
       continue;
@@ -285,6 +297,55 @@ impl Kernel for RotaryEmbeddingKernel {
             )));
         }
 
+        let position_ids_ptr = inputs
+            .get(3)
+            .map(|input| cuptr(input.data_ptr::<i64>().cast()))
+            .unwrap_or(0);
+        if has_position_ids {
+            let validation_func = self.runtime.nvrtc_function(
+                ROTARY_EMBEDDING_MODULE,
+                ROTARY_EMBEDDING_SOURCE,
+                "validate_position_ids",
+            )?;
+            let invalid_flag = self.runtime.alloc_raw(std::mem::size_of::<i32>())?;
+            let validation_result = (|| -> Result<()> {
+                let zero = 0_i32.to_ne_bytes();
+                // SAFETY: invalid_flag is a live four-byte allocation.
+                unsafe { self.runtime.htod(&zero, invalid_flag) }?;
+                let count = (batch * seq) as u64;
+                let cache_rows = cache_rows as u64;
+                let mut builder = self.runtime.stream().launch_builder(&validation_func);
+                builder
+                    .arg(&position_ids_ptr)
+                    .arg(&count)
+                    .arg(&cache_rows)
+                    .arg(&invalid_flag);
+                unsafe {
+                    builder.launch(LaunchConfig {
+                        grid_dim: (count.div_ceil(BLOCK as u64).min(65_535).max(1) as u32, 1, 1),
+                        block_dim: (BLOCK, 1, 1),
+                        shared_mem_bytes: 0,
+                    })
+                }
+                .map_err(|error| driver_err("launch validate_position_ids", error))?;
+
+                let mut host_flag = [0_u8; std::mem::size_of::<i32>()];
+                // SAFETY: invalid_flag is live and holds one i32 written by the validation kernel.
+                unsafe { self.runtime.dtoh(&mut host_flag, invalid_flag) }?;
+                if i32::from_ne_bytes(host_flag) != 0 {
+                    return Err(EpError::KernelFailed(
+                        "RotaryEmbedding: position_ids contain a value outside the cos/sin cache range"
+                            .into(),
+                    ));
+                }
+                Ok(())
+            })();
+            // SAFETY: invalid_flag was allocated above and is no longer used after the
+            // synchronous D2H copy (or a launch/copy failure).
+            unsafe { self.runtime.free_raw(invalid_flag) }?;
+            validation_result?;
+        }
+
         let func = self.runtime.nvrtc_function(
             ROTARY_EMBEDDING_MODULE,
             ROTARY_EMBEDDING_SOURCE,
@@ -293,10 +354,6 @@ impl Kernel for RotaryEmbeddingKernel {
         let x_ptr = cuptr(inputs[0].data_ptr::<f32>().cast());
         let cos_ptr = cuptr(inputs[1].data_ptr::<f32>().cast());
         let sin_ptr = cuptr(inputs[2].data_ptr::<f32>().cast());
-        let position_ids_ptr = inputs
-            .get(3)
-            .map(|input| cuptr(input.data_ptr::<i64>().cast()))
-            .unwrap_or(0);
         let output_ptr = cuptr(outputs[0].data_ptr_mut::<f32>().cast());
         let batch = batch as u64;
         let seq = seq as u64;
@@ -345,6 +402,8 @@ impl Kernel for RotaryEmbeddingKernel {
     }
 
     fn cuda_graph_compatible(&self) -> bool {
-        true
+        // Input validation copies a device error flag to the host. A capturable
+        // validated-input design needs deferred device-side error propagation.
+        false
     }
 }
