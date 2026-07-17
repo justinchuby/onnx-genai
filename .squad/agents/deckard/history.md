@@ -129,3 +129,8 @@ Authored native Engine/server backend integration in `66ec4b8`; Holden rejected 
 ## 2026-07-14T00:00:00Z — QMoE arithmetic hardening
 
 - Provided the checked-arithmetic revision for the initial QMoE rejection. A later `isize::MAX` allocation-boundary issue was corrected in the independent Holden follow-up.
+
+## 2026-07-17T07:19:39Z — onnx-rs optional sharded dimension correction
+
+- Delivered `b5ccd3c`: the checker no longer incorrectly requires optional `SimpleShardedDimProto.dim`; `num_shards` remains required.
+- The correction closed Sapper's multi-device/sharding proto landing; Bryant 🟢 approved.

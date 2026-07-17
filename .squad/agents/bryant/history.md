@@ -27,3 +27,8 @@
 ## 2026-07-17T02:24:32Z — Standard shape-inference review
 
 - 🟢 Cleared `98ee7a6`: the five new rules satisfy ONNX version/shape/dtype contracts and symbolic, divisibility, and overflow cases; 140 tests passed.
+
+## 2026-07-17T07:19:39Z — onnx-rs multi-device/sharding review
+
+- 🟢 Cleared Sapper's `be68145` multi-device/sharding proto integration and Deckard's `b5ccd3c` optional-dimension checker correction.
+- The landing also includes the ONNX v1.20/IR13 spec-coverage audit; remaining gaps are tracked for Sapper.

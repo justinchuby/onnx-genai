@@ -80,3 +80,8 @@ Added the preprocessing-side prompt token-expansion library for multi-tile VLM i
 ## 2026-07-14T00:00:00Z — GAFF Scan complete
 
 - Implemented ONNX Scan through ChildExecutor; Leon’s checked stack-arithmetic repair and Holden’s approval closed the final control-flow-op gate. If + Loop + Scan are now complete.
+
+## 2026-07-17T07:19:39Z — onnx-rs multi-device/sharding proto landing
+
+- Delivered `be68145`: seven IR13 device/sharding protobuf messages with Model/Node wiring, checker and codec round trips, and `docs/ONNX_RS_SPEC_COVERAGE.md`.
+- Deckard's `b5ccd3c` correction made `SimpleShardedDimProto.dim` optional; Bryant 🟢 approved. Remaining parity gaps are in flight.

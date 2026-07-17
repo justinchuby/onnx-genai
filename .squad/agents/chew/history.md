@@ -45,3 +45,8 @@ At 2026-07-14T19:05:00Z, fixed clippy findings and corrected Python pytest count
 
 - Merged `557ca87`: CPU `And`/`Or`/`Xor`/`Not` kernels use Bool truth semantics, broadcasting, and canonical output bytes; Bryant 🟢 cleared 436 CPU tests.
 - Merged `14b5136`: opset-8+ `Expand` shape inference performs bidirectional broadcasting with dtype passthrough and known-rank fallback; Bryant 🟢 cleared 120 shape-inference tests. Expanded-Attention now advances past node 58.
+
+## 2026-07-17T07:19:39Z — WEIGHT_OFFLOAD repair
+
+- Repaired all four Phase-1 findings in `a77eed0`: bounded dequant residency, unaligned mmap provenance, endpoint-overflow rejection, and sum-of-distinct mapped-byte metrics.
+- Nabil 🟢 approved; 691 tests passed.

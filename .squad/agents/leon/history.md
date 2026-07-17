@@ -71,3 +71,8 @@ Loader opset-import validation for file, from-parts, and nested-subgraph paths m
 ## 2026-07-14T00:00:00Z — Scan hardening and normalization inference
 
 - Repaired Scan stack-shape arithmetic against zero-masked overflow (Holden 🟢) and added BatchNormalization/InstanceNormalization shape inference (Bryant 🟢).
+
+## 2026-07-17T07:19:39Z — WEIGHT_OFFLOAD Phase 1 landed
+
+- Delivered `f601cad`: `WeightRegionCatalog`, route-first mmap QMoE expert selection, and opt-in `ONNX_GENAI_WEIGHT_OFFLOAD=1`; default behavior remains unchanged.
+- Chew's corrective `a77eed0` and Nabil 🟢 approval closed the landing; large-model exact-logit/throughput validation remains deferred.
