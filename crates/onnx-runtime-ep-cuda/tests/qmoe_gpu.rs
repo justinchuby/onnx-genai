@@ -507,6 +507,105 @@ fn compare(case: Case, dtype: DataType) {
     assert_conforms(&actual, &expected, case, dtype);
 }
 
+fn compare_gemv_gemm_and_cpu(case: Case) {
+    assert_eq!(case.rows, 6);
+    assert_eq!(case.experts, 4);
+    assert_eq!(case.top_k, 2);
+    let Some(ep) = gpu() else { return };
+    let mut inputs = case_inputs(case, DataType::Float32);
+    inputs[1] = Some(HostTensor::f32(
+        &[case.rows, case.experts],
+        &[
+            9.0, 8.0, 0.0, -1.0, 8.0, 9.0, -1.0, 0.0, 9.0, 7.0, 1.0, 0.0, 0.0, -1.0, 9.0, 8.0,
+            -1.0, 0.0, 8.0, 9.0, 1.0, 0.0, 9.0, 7.0,
+        ],
+    ));
+    let expected = run_cpu(case, &inputs);
+    let gemm =
+        run_gpu_with_prefill_min_tokens(&ep, case, &inputs, DataType::Float32, Some(2)).unwrap();
+    let gemv =
+        run_gpu_with_prefill_min_tokens(&ep, case, &inputs, DataType::Float32, Some(1024)).unwrap();
+    assert_conforms(&gemm, &gemv, case, DataType::Float32);
+    assert_conforms(&gemm, &expected, case, DataType::Float32);
+    assert_conforms(&gemv, &expected, case, DataType::Float32);
+}
+
+fn activation_case(
+    activation: &'static str,
+    swiglu_fusion: usize,
+    separate_silu_gate: bool,
+) -> Case {
+    Case {
+        experts: 4,
+        rows: 6,
+        hidden: 16,
+        inter: 16,
+        bits: 4,
+        top_k: 2,
+        activation,
+        swiglu_fusion,
+        affine: true,
+        biases: true,
+        normalize: true,
+        router_weights: separate_silu_gate,
+    }
+}
+
+macro_rules! activation_path_test {
+    ($name:ident, $activation:literal, $fusion:expr, $separate_gate:expr) => {
+        #[test]
+        fn $name() {
+            compare_gemv_gemm_and_cpu(activation_case($activation, $fusion, $separate_gate));
+        }
+    };
+}
+
+activation_path_test!(qmoe_relu_gemv_gemm_matches_cpu, "relu", 0, false);
+activation_path_test!(qmoe_gelu_gemv_gemm_matches_cpu, "gelu", 0, false);
+activation_path_test!(qmoe_silu_gemv_gemm_matches_cpu, "silu", 0, false);
+activation_path_test!(qmoe_silu_gated_gemv_gemm_matches_cpu, "silu", 0, true);
+activation_path_test!(
+    qmoe_swiglu_unfused_gemv_gemm_matches_cpu,
+    "swiglu",
+    0,
+    false
+);
+activation_path_test!(
+    qmoe_swiglu_interleaved_gemv_gemm_matches_cpu,
+    "swiglu",
+    1,
+    false
+);
+activation_path_test!(qmoe_swiglu_split_gemv_gemm_matches_cpu, "swiglu", 2, false);
+activation_path_test!(qmoe_identity_gemv_gemm_matches_cpu, "identity", 0, false);
+
+macro_rules! sub_byte_path_test {
+    ($name:ident, $bits:expr, $affine:expr) => {
+        #[test]
+        fn $name() {
+            compare_gemv_gemm_and_cpu(Case {
+                experts: 4,
+                rows: 6,
+                hidden: 16,
+                inter: 16,
+                bits: $bits,
+                top_k: 2,
+                activation: "identity",
+                swiglu_fusion: 0,
+                affine: $affine,
+                biases: true,
+                normalize: true,
+                router_weights: false,
+            });
+        }
+    };
+}
+
+sub_byte_path_test!(qmoe_int1_symmetric_gemv_gemm_matches_cpu, 1, false);
+sub_byte_path_test!(qmoe_int1_affine_gemv_gemm_matches_cpu, 1, true);
+sub_byte_path_test!(qmoe_int2_symmetric_gemv_gemm_matches_cpu, 2, false);
+sub_byte_path_test!(qmoe_int2_affine_gemv_gemm_matches_cpu, 2, true);
+
 #[test]
 fn qmoe_int4_top2_symmetric_matches_cpu() {
     compare(
@@ -571,35 +670,6 @@ fn qmoe_single_expert_top1_matches_cpu() {
 }
 
 #[test]
-fn qmoe_activation_and_swiglu_layouts_match_cpu() {
-    for (activation, swiglu_fusion, router_weights) in [
-        ("silu", 0, false),
-        ("silu", 0, true),
-        ("swiglu", 0, false),
-        ("swiglu", 1, false),
-        ("swiglu", 2, false),
-    ] {
-        compare(
-            Case {
-                experts: 4,
-                rows: 2,
-                hidden: 16,
-                inter: 16,
-                bits: 4,
-                top_k: 2,
-                activation,
-                swiglu_fusion,
-                affine: true,
-                biases: true,
-                normalize: true,
-                router_weights,
-            },
-            DataType::Float32,
-        );
-    }
-}
-
-#[test]
 fn qmoe_fp16_and_bf16_storage_match_rounded_cpu_reference() {
     let case = Case {
         experts: 4,
@@ -621,7 +691,6 @@ fn qmoe_fp16_and_bf16_storage_match_rounded_cpu_reference() {
 
 #[test]
 fn qmoe_prefill_gemm_matches_gemv_and_cpu_oracle() {
-    let Some(ep) = gpu() else { return };
     let case = Case {
         experts: 4,
         rows: 6,
@@ -636,24 +705,7 @@ fn qmoe_prefill_gemm_matches_gemv_and_cpu_oracle() {
         normalize: true,
         router_weights: false,
     };
-    let mut inputs = case_inputs(case, DataType::Float32);
-    inputs[1] = Some(HostTensor::f32(
-        &[case.rows, case.experts],
-        &[
-            9.0, 8.0, 0.0, -1.0, 8.0, 9.0, -1.0, 0.0, 9.0, 7.0, 1.0, 0.0, 0.0, -1.0, 9.0, 8.0,
-            -1.0, 0.0, 8.0, 9.0, 1.0, 0.0, 9.0, 7.0,
-        ],
-    ));
-
-    let expected = run_cpu(case, &inputs);
-    let gemm =
-        run_gpu_with_prefill_min_tokens(&ep, case, &inputs, DataType::Float32, Some(2)).unwrap();
-    let gemv =
-        run_gpu_with_prefill_min_tokens(&ep, case, &inputs, DataType::Float32, Some(1024)).unwrap();
-
-    assert_conforms(&gemm, &gemv, case, DataType::Float32);
-    assert_conforms(&gemm, &expected, case, DataType::Float32);
-    assert_conforms(&gemv, &expected, case, DataType::Float32);
+    compare_gemv_gemm_and_cpu(case);
 }
 
 #[test]

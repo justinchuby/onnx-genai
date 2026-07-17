@@ -694,9 +694,9 @@ impl KernelFactory for QMoEFactory {
     fn create(&self, node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
         let attributes = MoeAttributes::from_node(node)?;
         let bits = int_attr(node, "expert_weight_bits", 4)?;
-        if !matches!(bits, 4 | 8) {
+        if !matches!(bits, 1 | 2 | 4 | 8) {
             return Err(error(format!(
-                "expert_weight_bits must be 4 or 8 in the CUDA kernel, got {bits}"
+                "expert_weight_bits must be one of {{1, 2, 4, 8}}, got {bits}"
             )));
         }
         let block_size = int_attr(node, "block_size", 0)?;
@@ -713,7 +713,10 @@ impl KernelFactory for QMoEFactory {
         };
         if quant_type != "int" {
             return Err(error(format!(
-                "quant_type='{quant_type}' is unsupported; CUDA implements integer affine QMoE only"
+                "quant_type='{quant_type}' is unsupported by CUDA QMoE; this kernel accepts only \
+                 ORT integer-affine quant_type='int'. Native IQ/MXFP4 block layouts are not \
+                 representable by QMoE's separate scales/zero-points inputs and require a \
+                 block-quantized MoE operator"
             )));
         }
         Ok(Box::new(QMoEKernel {
@@ -729,7 +732,7 @@ pub(crate) fn supports_node(node: &Node, _shapes: &[Shape]) -> bool {
     let bits = node
         .attr("expert_weight_bits")
         .map_or(Some(4), |value| value.as_int())
-        .is_some_and(|bits| matches!(bits, 4 | 8));
+        .is_some_and(|bits| matches!(bits, 1 | 2 | 4 | 8));
     let block_size = node
         .attr("block_size")
         .and_then(|value| value.as_int())
@@ -1849,18 +1852,39 @@ mod tests {
     }
 
     #[test]
-    fn placement_rejects_deferred_quantization_modes() {
-        let supported = node(&[
-            ("expert_weight_bits", Attribute::Int(4)),
-            ("block_size", Attribute::Int(16)),
-        ]);
-        assert!(supports_node(&supported, &[]));
+    fn placement_accepts_byte_dividing_integer_widths_only() {
+        for bits in [1, 2, 4, 8] {
+            let supported = node(&[
+                ("expert_weight_bits", Attribute::Int(bits)),
+                ("block_size", Attribute::Int(16)),
+            ]);
+            assert!(supports_node(&supported, &[]), "bits={bits}");
+        }
+        for bits in [0, 3, 5, 16] {
+            let unsupported = node(&[
+                ("expert_weight_bits", Attribute::Int(bits)),
+                ("block_size", Attribute::Int(16)),
+            ]);
+            assert!(!supports_node(&unsupported, &[]), "bits={bits}");
+        }
+    }
 
-        let deferred = node(&[
-            ("expert_weight_bits", Attribute::Int(2)),
-            ("block_size", Attribute::Int(16)),
-        ]);
-        assert!(!supports_node(&deferred, &[]));
+    #[test]
+    fn placement_rejects_native_iq_layouts_until_block_quantized_moe_exists() {
+        for quant_type in [
+            "mxfp4", "iq4_nl", "iq4_xs", "iq3_s", "iq3_xxs", "iq2_s", "iq2_xs", "iq2_xxs", "iq1_s",
+            "iq1_m",
+        ] {
+            let unsupported = node(&[
+                ("expert_weight_bits", Attribute::Int(2)),
+                ("block_size", Attribute::Int(16)),
+                (
+                    "quant_type",
+                    Attribute::String(quant_type.as_bytes().to_vec()),
+                ),
+            ]);
+            assert!(!supports_node(&unsupported, &[]), "{quant_type}");
+        }
     }
 
     #[test]
