@@ -14,8 +14,11 @@ use crate::processors::{
 };
 use crate::sampling::SamplingRng;
 use anyhow::Context;
+use onnx_genai_ort::decode::{
+    BatchedDecodeSession, BatchedSharedBufferDecodeSession, SharedBufferBatchOptions,
+};
 use onnx_genai_ort::{BatchedStaticCacheDecodeSession, StaticCacheDecodeOptions};
-use onnx_genai_ort::{Session, Tokenizer};
+use onnx_genai_ort::Tokenizer;
 use std::collections::VecDeque;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -95,7 +98,7 @@ impl ContinuousBatchRow {
 /// pending logits, emits token/result events, evicts finished rows, admits queued
 /// requests into freed slots, then prepares logits for the next step.
 pub struct ContinuousBatchManager<'a> {
-    decode: BatchedStaticCacheDecodeSession<'a>,
+    decode: Box<dyn BatchedDecodeSession<'a> + 'a>,
     tokenizer: &'a Tokenizer,
     metadata_max_context: Option<usize>,
     static_max_len: usize,
@@ -107,7 +110,7 @@ pub struct ContinuousBatchManager<'a> {
 
 impl<'a> ContinuousBatchManager<'a> {
     fn new(
-        session: &'a Session,
+        mut decode: Box<dyn BatchedDecodeSession<'a> + 'a>,
         tokenizer: &'a Tokenizer,
         metadata_max_context: Option<usize>,
         max_batch: usize,
@@ -115,13 +118,6 @@ impl<'a> ContinuousBatchManager<'a> {
         if max_batch == 0 {
             anyhow::bail!("continuous batch max_batch must be greater than zero");
         }
-        let mut decode = BatchedStaticCacheDecodeSession::new(
-            session,
-            StaticCacheDecodeOptions {
-                batch_size: i64::try_from(max_batch).context("batch size exceeds i64")?,
-            },
-        )
-        .map_err(|e| anyhow::anyhow!("Failed to create continuous static-cache session: {}", e))?;
         for row in 0..max_batch {
             decode
                 .deactivate_row(row)
@@ -263,7 +259,7 @@ impl<'a> ContinuousBatchManager<'a> {
                 state: loop_state,
                 pending_logits: None,
             };
-            prefill_continuous_row(&mut self.decode, &mut row)?;
+            prefill_continuous_row(&mut *self.decode, &mut row)?;
             self.rows[row_index] = Some(row);
         }
         Ok(())
@@ -588,24 +584,62 @@ impl Engine {
         &self,
         max_batch: usize,
     ) -> anyhow::Result<ContinuousBatchManager<'_>> {
-        if !matches!(self.decode_path, ModelDecodePath::StaticCache { .. }) {
-            anyhow::bail!(
-                "continuous batching requires a STATIC-CACHE model; past/present batching is deferred"
-            );
+        if max_batch == 0 {
+            anyhow::bail!("continuous batch max_batch must be greater than zero");
         }
+        let session = self
+            .session
+            .as_deref()
+            .context("ORT decoder session is unavailable")?;
+        let batch_size = i64::try_from(max_batch).context("batch size exceeds i64")?;
+        let decode: Box<dyn BatchedDecodeSession<'_> + '_> = match self.decode_path {
+            ModelDecodePath::StaticCache { .. } => {
+                Box::new(
+                    BatchedStaticCacheDecodeSession::new(
+                        session,
+                        StaticCacheDecodeOptions { batch_size },
+                    )
+                    .map_err(|e| {
+                        anyhow::anyhow!("Failed to create continuous static-cache session: {}", e)
+                    })?,
+                )
+            }
+            ModelDecodePath::PastPresent {
+                shared_buffer: true,
+                max_len,
+                ..
+            } => {
+                let max_len = max_len.context(
+                    "shared-buffer continuous batching requires a known max_len",
+                )?;
+                Box::new(
+                    BatchedSharedBufferDecodeSession::new(
+                        session,
+                        SharedBufferBatchOptions {
+                            batch_size,
+                            max_len,
+                        },
+                    )
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "Failed to create continuous shared-buffer session: {}",
+                            e
+                        )
+                    })?,
+                )
+            }
+            ModelDecodePath::PastPresent { .. } | ModelDecodePath::Legacy => {
+                anyhow::bail!(
+                    "continuous batching requires a STATIC-CACHE or shared-buffer past/present model"
+                );
+            }
+        };
         let metadata_max_context = self
             .metadata
             .model
             .as_ref()
             .and_then(|model| model.max_sequence_length);
-        ContinuousBatchManager::new(
-            self.session
-                .as_deref()
-                .context("ORT decoder session is unavailable")?,
-            &self.tokenizer,
-            metadata_max_context,
-            max_batch,
-        )
+        ContinuousBatchManager::new(decode, &self.tokenizer, metadata_max_context, max_batch)
     }
 
     /// Run requests to completion through a dynamic continuous batch.
@@ -660,7 +694,7 @@ impl Engine {
 }
 
 fn prefill_continuous_row(
-    decode: &mut BatchedStaticCacheDecodeSession<'_>,
+    decode: &mut dyn BatchedDecodeSession<'_>,
     row: &mut ContinuousBatchRow,
 ) -> anyhow::Result<()> {
     for offset in 0..row.context_tokens.len() {
