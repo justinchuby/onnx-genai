@@ -7,6 +7,9 @@ use std::sync::{Mutex, OnceLock};
 
 use onnx_runtime_ep_api::ExternalMmapRegion;
 
+pub mod placement;
+pub mod weight_handle;
+
 /// Environment switch for the route-first mmap MoE path.
 pub const WEIGHT_OFFLOAD_ENV: &str = "ONNX_GENAI_WEIGHT_OFFLOAD";
 /// Optional override for the Resource Governor's owned warm-host cache budget.

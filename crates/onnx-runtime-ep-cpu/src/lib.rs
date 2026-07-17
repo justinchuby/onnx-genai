@@ -38,6 +38,18 @@ pub use backend::{CpuBackend, has_onednn};
 pub use kernels::qmoe::WeightOffloadHostCache;
 pub use optimizer::{ProjectionFusion, cpu_optimization_passes};
 pub use provider::CpuExecutionProvider;
+pub use weight_offload::placement::{
+    ArbitrationAction, GpuLayersOverrideReport, HostFallbackReason, IqFormat, LayerPlacement,
+    LayerWeightRegions, Placement, PlacementError, PlacementPlan, QuantTileFormat, RegionPlacement,
+    SnappedTileSize, TileSizeError, VramArbitrationConfig, VramArbitrationError,
+    VramArbitrationOutcome, VramArbitrationState, VramDemand, VramSubBudgets, arbitrate_vram,
+    plan_placement, snap_transfer_tile_bytes,
+};
+pub use weight_offload::weight_handle::{
+    ExecutionProviderCapabilities, LazyDeviceWeightBinder, LazyWeight, LazyWeightBoundary,
+    NXRT_WEIGHT_PAGING_CAPABILITY, NegotiatedWeight, Phase3aHostOnlyBinder, ResidentWeight,
+    ResidentWeightMaterializer, WeightHandle, WeightHandleError,
+};
 pub use weight_offload::{
     LinuxProcessMemoryStats, WEIGHT_OFFLOAD_ENV, WEIGHT_OFFLOAD_HOST_BYTES_ENV,
     WeightOffloadLayerStats, WeightOffloadStats, set_weight_offload_host_budget,

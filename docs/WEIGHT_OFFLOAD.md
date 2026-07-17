@@ -657,13 +657,21 @@ verify no cache thrash under rare routes.
 
 ### Phase 3 — device cache and partial GPU offload
 
+**Status:** Phase 3a has landed the CPU-testable byte-budget placement planner,
+coordinated weight/KV/scratch arbitration, `WeightHandle`/`nxrt` capability seam,
+resident fallback, and quant-block-aligned tile sizing. Phase 3b remains responsible
+for live device allocation, H2D transfer, lazy `pkg.nxrt::BlockQuantizedMoE` binding,
+and device execution.
+
 **Ship independently:**
 
-- add multi-EP/layer placement and explicit transfer boundaries;
-- add lazy device initializer/weight-handle binding for fused MoE;
-- implement bounded VRAM expert pages and `gpu_layers:N`/byte-budget planning;
-- permit CPU execution for non-GPU layers or waves;
-- enforce coordinated weight/KV/scratch VRAM sub-budgets.
+- [x] add deterministic whole-layer placement planning and explicit planned transfer boundaries;
+- [x] add the lazy device initializer/weight-handle capability seam and stock-EP resident fallback;
+- [x] implement `gpu_layers:N`/byte-budget planning and quant-block-aligned tile sizing;
+- [ ] implement bounded live VRAM expert pages and device binding (Phase 3b);
+- [ ] connect CPU execution for planned non-GPU layers or waves (Phase 3b);
+- [x] enforce pure coordinated weight/KV/scratch VRAM sub-budget arbitration;
+- [ ] connect the plan and arbitration decisions to live device execution (Phase 3b).
 
 **Measure:** models larger than VRAM complete without whole-session CPU fallback or
 OOM; sweep GPU layer/device cache budgets; report H2D bytes, stalls, tok/s, and peak
