@@ -64,7 +64,7 @@
 //! `epsilon` attributes the kernel reads, extracting them from the matched
 //! subgraph (the `ReduceMean` axes and the `var + eps` constant).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use onnx_runtime_ir::{Attribute, DataType, Graph, Node, NodeId, ValueId, WeightRef};
 
@@ -226,17 +226,56 @@ impl FusionPattern {
     /// patterns (MatMul+Add, MatMul+Add+Relu) keep the linear-chain matcher.
     pub fn find_match(&self, graph: &Graph) -> Option<PatternMatch> {
         for start in graph.nodes.keys() {
-            let m = match self.kind {
-                RewriteKind::LayerNorm => self.try_match_layernorm(graph, start),
-                RewriteKind::Attention => self.try_match_attention(graph, start),
-                RewriteKind::Gelu => self.try_match_gelu(graph, start),
-                RewriteKind::Structural => self.try_match_from(graph, start),
-            };
-            if let Some(m) = m {
+            if let Some(m) = self.try_match_at(graph, start) {
                 return Some(m);
             }
         }
         None
+    }
+
+    fn try_match_at(&self, graph: &Graph, start: NodeId) -> Option<PatternMatch> {
+        match self.kind {
+            RewriteKind::LayerNorm => self.try_match_layernorm(graph, start),
+            RewriteKind::Attention => self.try_match_attention(graph, start),
+            RewriteKind::Gelu => self.try_match_gelu(graph, start),
+            RewriteKind::Structural => self.try_match_from(graph, start),
+        }
+    }
+
+    /// Candidate starts whose match result may be affected when `matched` is
+    /// replaced. The replacement is always a contrib-domain op, so it cannot
+    /// itself satisfy any standard-domain pattern step. Existing producers can
+    /// still observe changed consumer adjacency, so conservatively revisit them
+    /// and the bounded predecessor chains from which this pattern could reach
+    /// them.
+    fn affected_candidate_starts(&self, graph: &Graph, matched: &PatternMatch) -> Vec<NodeId> {
+        let max_depth = match self.kind {
+            RewriteKind::LayerNorm => 10,
+            RewriteKind::Attention => 6,
+            RewriteKind::Gelu => 5,
+            RewriteKind::Structural => self.ops.len(),
+        };
+        let mut affected = HashSet::new();
+        let mut frontier: Vec<(NodeId, usize)> = matched
+            .external_inputs
+            .iter()
+            .filter_map(|&value| graph.value(value).producer)
+            .map(|producer| (producer, 0))
+            .collect();
+
+        while let Some((node_id, depth)) = frontier.pop() {
+            if !affected.insert(node_id) || depth >= max_depth.saturating_sub(1) {
+                continue;
+            }
+            frontier.extend(
+                graph
+                    .node(node_id)
+                    .input_values()
+                    .filter_map(|value| graph.value(value).producer)
+                    .map(|producer| (producer, depth + 1)),
+            );
+        }
+        affected.into_iter().collect()
     }
 
     /// Whether `node` is a standard-domain op named `op`.
@@ -1039,6 +1078,10 @@ impl FusionPattern {
     /// Apply a match: remove the matched nodes and insert the replacement,
     /// reusing `m.output` so downstream consumers and graph outputs stay wired.
     pub fn apply_fusion(&self, graph: &mut Graph, m: &PatternMatch) -> Result<()> {
+        self.apply_fusion_returning_id(graph, m).map(|_| ())
+    }
+
+    fn apply_fusion_returning_id(&self, graph: &mut Graph, m: &PatternMatch) -> Result<NodeId> {
         let output = m.output;
 
         // For schema-aware rewrites, extract the kernel-signature inputs and
@@ -1075,8 +1118,7 @@ impl FusionPattern {
         // Emit the fused op in the private contrib domain so it never collides
         // with standard `ai.onnx` ops and dispatch stays keyed on (domain, op).
         fused.domain = CONTRIB_DOMAIN.to_string();
-        graph.insert_node(fused);
-        Ok(())
+        Ok(graph.insert_node(fused))
     }
 
     /// Extract the schema-conformant `[X, Scale, B]` inputs and the
@@ -1312,8 +1354,45 @@ impl OptimizationPass for OpFusion {
 
     fn run(&self, graph: &mut Graph, _ctx: &PassContext) -> Result<()> {
         for pattern in &self.patterns {
-            while let Some(m) = pattern.find_match(graph) {
-                pattern.apply_fusion(graph, &m)?;
+            let candidates: Vec<u32> = graph.nodes.keys().map(|id| id.0).collect();
+            let mut cursor = 0;
+            let mut revisits = BTreeSet::new();
+            loop {
+                let initial = candidates.get(cursor).copied();
+                let revisit = revisits.first().copied();
+                let raw_id = match (initial, revisit) {
+                    (None, None) => break,
+                    (Some(id), None) => {
+                        cursor += 1;
+                        id
+                    }
+                    (None, Some(_)) => revisits.pop_first().unwrap(),
+                    (Some(id), Some(revisit)) if id <= revisit => {
+                        cursor += 1;
+                        if id == revisit {
+                            revisits.pop_first();
+                        }
+                        id
+                    }
+                    (Some(_), Some(_)) => revisits.pop_first().unwrap(),
+                };
+                let start = NodeId(raw_id);
+                let Some(matched) = pattern.try_match_at(graph, start) else {
+                    continue;
+                };
+
+                let affected = pattern.affected_candidate_starts(graph, &matched);
+                let fused_id = pattern.apply_fusion_returning_id(graph, &matched)?;
+
+                // The ordered set is the source of truth for resolution order:
+                // any lower affected start is reconsidered before an untouched
+                // higher-id candidate, exactly like a restart from arena slot 0.
+                revisits.insert(fused_id.0);
+                for candidate in affected {
+                    if graph.try_node(candidate).is_some() {
+                        revisits.insert(candidate.0);
+                    }
+                }
             }
         }
         Ok(())
@@ -2376,5 +2455,218 @@ mod tests {
             g.nodes.values().all(|n| n.op_type != "Gelu"),
             "must not fuse when an interior value escapes"
         );
+    }
+
+    fn run_restart_reference(patterns: &[FusionPattern], graph: &mut Graph) {
+        for pattern in patterns {
+            while let Some(matched) = pattern.find_match(graph) {
+                pattern.apply_fusion(graph, &matched).unwrap();
+            }
+        }
+    }
+
+    fn assert_fusion_graphs_identical(
+        mut actual: Graph,
+        mut expected: Graph,
+        trial: usize,
+    ) {
+        assert_eq!(actual.inputs, expected.inputs, "inputs differ on trial {trial}");
+        assert_eq!(actual.outputs, expected.outputs, "outputs differ on trial {trial}");
+        assert_eq!(
+            actual.initializers, expected.initializers,
+            "initializers differ on trial {trial}"
+        );
+        assert_eq!(
+            actual.opset_imports, expected.opset_imports,
+            "opsets differ on trial {trial}"
+        );
+
+        let nodes = |graph: &Graph| {
+            graph
+                .nodes
+                .iter()
+                .map(|(id, node)| {
+                    let mut attributes: Vec<_> = node
+                        .attributes
+                        .iter()
+                        .map(|(name, value)| (name.clone(), format!("{value:?}")))
+                        .collect();
+                    attributes.sort();
+                    (
+                        id,
+                        node.id,
+                        node.name.clone(),
+                        node.op_type.clone(),
+                        node.domain.clone(),
+                        node.inputs.clone(),
+                        node.outputs.clone(),
+                        attributes,
+                        node.doc_string.clone(),
+                        node.device,
+                        node.exec_order,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            nodes(&actual),
+            nodes(&expected),
+            "nodes/topology differ on trial {trial}"
+        );
+        assert_eq!(
+            actual
+                .values
+                .iter()
+                .map(|(id, value)| (id, value.clone()))
+                .collect::<Vec<_>>(),
+            expected
+                .values
+                .iter()
+                .map(|(id, value)| (id, value.clone()))
+                .collect::<Vec<_>>(),
+            "values/edges differ on trial {trial}"
+        );
+
+        // Free-list order is part of byte-identical arena behavior.
+        for _ in 0..16 {
+            assert_eq!(
+                actual.insert_node(Node::new(NodeId(0), "Probe", Vec::new(), Vec::new())),
+                expected.insert_node(Node::new(NodeId(0), "Probe", Vec::new(), Vec::new())),
+                "node arena differs on trial {trial}"
+            );
+            assert_eq!(
+                actual.create_value(DataType::Float32, static_shape([1])),
+                expected.create_value(DataType::Float32, static_shape([1])),
+                "value arena differs on trial {trial}"
+            );
+        }
+    }
+
+    struct FusionTestRng(u64);
+
+    impl FusionTestRng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn usize(&mut self, upper: usize) -> usize {
+            (self.next() as usize) % upper
+        }
+
+        fn coin(&mut self) -> bool {
+            self.next() & 1 == 0
+        }
+    }
+
+    fn relu_overlap_graph(rng: &mut FusionTestRng) -> Graph {
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 17);
+        let input = val(&mut graph, "overlap_input");
+        graph.add_input(input);
+        let mut value = input;
+        for i in 0..(3 + rng.usize(5)) {
+            let output = val(&mut graph, &format!("overlap_{i}"));
+            graph.insert_node(Node::new(
+                NodeId(0),
+                "Relu",
+                vec![Some(value)],
+                vec![output],
+            ));
+            value = output;
+        }
+        graph.add_output(value);
+        graph
+    }
+
+    fn randomized_fusion_graph(trial: usize, rng: &mut FusionTestRng) -> Graph {
+        let mut graph = match trial % 5 {
+            0 => {
+                let mut graph = matmul_add_graph();
+                if rng.coin() {
+                    let biased = graph.outputs[0];
+                    graph.outputs.clear();
+                    let output = val(&mut graph, "random_relu");
+                    graph.insert_node(Node::new(
+                        NodeId(0),
+                        "Relu",
+                        vec![Some(biased)],
+                        vec![output],
+                    ));
+                    graph.add_output(output);
+                }
+                graph
+            }
+            1 => relu_overlap_graph(rng),
+            2 => layernorm_graph(),
+            3 => gelu_graph(rng.coin(), rng.coin()),
+            _ => sdpa_graph(rng.coin(), if rng.coin() { -1 } else { 3 }),
+        };
+
+        // Random side consumers turn some seeded motifs into safe declines and
+        // create additional Relu-chain overlap without invalidating the DAG.
+        for noise in 0..rng.usize(5) {
+            let values: Vec<_> = graph.values.keys().collect();
+            let input = values[rng.usize(values.len())];
+            let output = val(&mut graph, &format!("noise_{trial}_{noise}"));
+            let op = match rng.usize(3) {
+                0 => "Neg",
+                1 => "Abs",
+                _ => "Relu",
+            };
+            graph.insert_node(Node::new(
+                NodeId(0),
+                op,
+                vec![Some(input)],
+                vec![output],
+            ));
+            graph.add_output(output);
+        }
+        graph
+    }
+
+    #[test]
+    fn ascending_worklist_preserves_lowest_id_overlap_winner() {
+        let mut rng = FusionTestRng(1);
+        let mut graph = relu_overlap_graph(&mut rng);
+        let pattern = FusionPattern::new("ReluPair", &["Relu", "Relu"], "FusedReluPair");
+        let mut reference = graph.clone();
+        run_restart_reference(std::slice::from_ref(&pattern), &mut reference);
+
+        OpFusion::with_patterns(vec![pattern])
+            .run(&mut graph, &PassContext::new())
+            .unwrap();
+
+        assert_eq!(graph.node(NodeId(0)).op_type, "FusedReluPair");
+        assert!(graph.try_node(NodeId(1)).is_none());
+        assert_fusion_graphs_identical(graph, reference, 0);
+    }
+
+    #[test]
+    fn resumable_scan_matches_restart_reference_on_randomized_graphs() {
+        const TRIALS: usize = 5_000;
+        let mut rng = FusionTestRng(0x6a09_e667_f3bc_c909);
+        let mut patterns = default_fusion_patterns();
+        patterns.push(FusionPattern::new(
+            "ReluPair",
+            &["Relu", "Relu"],
+            "FusedReluPair",
+        ));
+
+        for trial in 0..TRIALS {
+            let mut graph = randomized_fusion_graph(trial, &mut rng);
+            assert!(graph.validate().is_ok(), "invalid input graph on trial {trial}");
+            let mut reference = graph.clone();
+            run_restart_reference(&patterns, &mut reference);
+
+            OpFusion::with_patterns(patterns.clone())
+                .run(&mut graph, &PassContext::new())
+                .unwrap();
+
+            assert!(graph.validate().is_ok(), "invalid result graph on trial {trial}");
+            assert_fusion_graphs_identical(graph, reference, trial);
+        }
     }
 }
