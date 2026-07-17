@@ -15,18 +15,15 @@
 //! * **Not** (`Not`): boolean element negation, matched to the CPU EP
 //!   (`logical.rs` — non-zero byte is `true`, output is canonical `1`/`0`).
 //! * **Comparison** (`Equal`, `Greater`, `Less`, `GreaterOrEqual`,
-//!   `LessOrEqual`): two **f32** inputs of **equal shape** → **Bool** output.
-//! * **Logical** (`And`, `Or`, `Xor`): two **Bool** inputs of **equal shape** →
+//!   `LessOrEqual`): two broadcast-compatible **f32** inputs → **Bool** output.
+//! * **Logical** (`And`, `Or`, `Xor`): two broadcast-compatible **Bool** inputs →
 //!   **Bool** output (non-zero byte is `true`, canonical `1`/`0` out).
 //!
 //! `dtype`: f32/f16/bf16 for unary math, f32 for comparison, and bool for
 //! logical/`Not`; other dtypes return an actionable error naming the dtype/op.
 //!
-//! **Broadcasting:** the binary comparison/logical ops require **equal-shape**
-//! operands, matching the [`super::elementwise`] binary kernels exactly (NumPy
-//! broadcasting is deferred crate-wide; a mismatch returns the same actionable
-//! "broadcast/materialise upstream" error). No new broadcasting math is invented
-//! here.
+//! **Broadcasting:** binary comparison/logical ops reuse the same right-aligned,
+//! zero-stride metadata as [`super::elementwise`].
 //!
 //! Each op is one thread-per-element grid-stride kernel (bandwidth-bound,
 //! PyTorch-pointwise shaped).
@@ -39,6 +36,7 @@ use cudarc::driver::{LaunchConfig, PushKernelArg};
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ir::{DataType, Node};
 
+use super::elementwise::{broadcast_metadata, u64_bytes};
 use crate::error::{driver_err, not_implemented};
 use crate::runtime::{CudaRuntime, cuptr};
 
@@ -430,32 +428,30 @@ impl Kernel for NotKernel {
 }
 
 // ===========================================================================
-// Comparison (f32, f32 → bool) — equal shape
+// Comparison (f32, f32 → bool) — NumPy broadcasting
 // ===========================================================================
 
 /// NVRTC source: one `extern "C"` kernel per comparison op — two f32 operands,
 /// a 1-byte bool output (canonical `1`/`0`), per ONNX comparison semantics.
 const CMP_SRC: &str = r#"
-extern "C" __global__ void equal_f32(const float* a, const float* b, unsigned char* y, const unsigned long long n) {
-    for (unsigned long long i = blockIdx.x*blockDim.x + threadIdx.x; i < n; i += (unsigned long long)gridDim.x * blockDim.x)
-        y[i] = (a[i] == b[i]) ? 1 : 0;
+__device__ __forceinline__ void broadcast_indices(unsigned long long out, const unsigned long long* m, int rank, unsigned long long* ai, unsigned long long* bi) {
+    *ai = 0; *bi = 0;
+    for (int axis = rank - 1; axis >= 0; --axis) {
+        unsigned long long coord = out % m[axis]; out /= m[axis];
+        *ai += coord * m[rank + axis]; *bi += coord * m[2 * rank + axis];
+    }
 }
-extern "C" __global__ void greater_f32(const float* a, const float* b, unsigned char* y, const unsigned long long n) {
-    for (unsigned long long i = blockIdx.x*blockDim.x + threadIdx.x; i < n; i += (unsigned long long)gridDim.x * blockDim.x)
-        y[i] = (a[i] > b[i]) ? 1 : 0;
+#define DEFINE_CMP(name, expr) \
+extern "C" __global__ void name(const float* a, const float* b, unsigned char* y, const unsigned long long* m, int rank, const unsigned long long n) { \
+    for (unsigned long long i = blockIdx.x*blockDim.x + threadIdx.x; i < n; i += (unsigned long long)gridDim.x * blockDim.x) { \
+        unsigned long long ai, bi; broadcast_indices(i, m, rank, &ai, &bi); y[i] = (expr) ? 1 : 0; \
+    } \
 }
-extern "C" __global__ void less_f32(const float* a, const float* b, unsigned char* y, const unsigned long long n) {
-    for (unsigned long long i = blockIdx.x*blockDim.x + threadIdx.x; i < n; i += (unsigned long long)gridDim.x * blockDim.x)
-        y[i] = (a[i] < b[i]) ? 1 : 0;
-}
-extern "C" __global__ void greater_equal_f32(const float* a, const float* b, unsigned char* y, const unsigned long long n) {
-    for (unsigned long long i = blockIdx.x*blockDim.x + threadIdx.x; i < n; i += (unsigned long long)gridDim.x * blockDim.x)
-        y[i] = (a[i] >= b[i]) ? 1 : 0;
-}
-extern "C" __global__ void less_equal_f32(const float* a, const float* b, unsigned char* y, const unsigned long long n) {
-    for (unsigned long long i = blockIdx.x*blockDim.x + threadIdx.x; i < n; i += (unsigned long long)gridDim.x * blockDim.x)
-        y[i] = (a[i] <= b[i]) ? 1 : 0;
-}
+DEFINE_CMP(equal_f32, a[ai] == b[bi])
+DEFINE_CMP(greater_f32, a[ai] > b[bi])
+DEFINE_CMP(less_f32, a[ai] < b[bi])
+DEFINE_CMP(greater_equal_f32, a[ai] >= b[bi])
+DEFINE_CMP(less_equal_f32, a[ai] <= b[bi])
 "#;
 
 const CMP_MODULE: &str = "pointwise_compare_f32";
@@ -493,24 +489,28 @@ impl CmpOp {
 }
 
 // ===========================================================================
-// Logical (bool, bool → bool) — equal shape
+// Logical (bool, bool → bool) — NumPy broadcasting
 // ===========================================================================
 
 /// NVRTC source: one `extern "C"` kernel per logical op — two bool operands (a
 /// non-zero byte is `true`, matching the CPU `Not`), 1-byte bool output.
 const LOGICAL_SRC: &str = r#"
-extern "C" __global__ void and_bool(const unsigned char* a, const unsigned char* b, unsigned char* y, const unsigned long long n) {
-    for (unsigned long long i = blockIdx.x*blockDim.x + threadIdx.x; i < n; i += (unsigned long long)gridDim.x * blockDim.x)
-        y[i] = ((a[i] != 0) && (b[i] != 0)) ? 1 : 0;
+__device__ __forceinline__ void broadcast_indices(unsigned long long out, const unsigned long long* m, int rank, unsigned long long* ai, unsigned long long* bi) {
+    *ai = 0; *bi = 0;
+    for (int axis = rank - 1; axis >= 0; --axis) {
+        unsigned long long coord = out % m[axis]; out /= m[axis];
+        *ai += coord * m[rank + axis]; *bi += coord * m[2 * rank + axis];
+    }
 }
-extern "C" __global__ void or_bool(const unsigned char* a, const unsigned char* b, unsigned char* y, const unsigned long long n) {
-    for (unsigned long long i = blockIdx.x*blockDim.x + threadIdx.x; i < n; i += (unsigned long long)gridDim.x * blockDim.x)
-        y[i] = ((a[i] != 0) || (b[i] != 0)) ? 1 : 0;
+#define DEFINE_LOGICAL(name, expr) \
+extern "C" __global__ void name(const unsigned char* a, const unsigned char* b, unsigned char* y, const unsigned long long* m, int rank, const unsigned long long n) { \
+    for (unsigned long long i = blockIdx.x*blockDim.x + threadIdx.x; i < n; i += (unsigned long long)gridDim.x * blockDim.x) { \
+        unsigned long long ai, bi; broadcast_indices(i, m, rank, &ai, &bi); y[i] = (expr) ? 1 : 0; \
+    } \
 }
-extern "C" __global__ void xor_bool(const unsigned char* a, const unsigned char* b, unsigned char* y, const unsigned long long n) {
-    for (unsigned long long i = blockIdx.x*blockDim.x + threadIdx.x; i < n; i += (unsigned long long)gridDim.x * blockDim.x)
-        y[i] = ((a[i] != 0) != (b[i] != 0)) ? 1 : 0;
-}
+DEFINE_LOGICAL(and_bool, (a[ai] != 0) && (b[bi] != 0))
+DEFINE_LOGICAL(or_bool, (a[ai] != 0) || (b[bi] != 0))
+DEFINE_LOGICAL(xor_bool, (a[ai] != 0) != (b[bi] != 0))
 "#;
 
 const LOGICAL_MODULE: &str = "pointwise_logical_bool";
@@ -599,8 +599,7 @@ impl KernelFactory for LogicalFactory {
 
 /// NVRTC-backed binary predicate kernel producing a **Bool** output. Covers both
 /// comparison (f32 operands) and logical (bool operands) families via
-/// [`BinaryKind`]; operands must be **equal shape** (broadcasting deferred,
-/// matching [`super::elementwise`]).
+/// [`BinaryKind`], with NumPy-style right-aligned broadcasting.
 #[derive(Debug)]
 pub struct BinaryPredKernel {
     op_name: &'static str,
@@ -632,22 +631,15 @@ impl BinaryPredKernel {
         require_contiguous(op, "B", b.is_contiguous())?;
         require_contiguous(op, "output", outputs[0].is_contiguous())?;
 
-        if a.shape != b.shape {
-            return Err(not_implemented(format!(
-                "{op} with unequal operand shapes A {:?} vs B {:?} \
-                 (NumPy broadcasting is not yet wired on CUDA; broadcast/materialise \
-                 the operands to a common shape upstream)",
-                a.shape, b.shape
-            )));
-        }
-        if outputs[0].shape != a.shape {
+        let out_shape = onnx_runtime_ir::broadcast_shapes(a.shape, b.shape).map_err(EpError::Ir)?;
+        if outputs[0].shape != out_shape {
             return Err(EpError::KernelFailed(format!(
-                "cuda_ep {op}: output shape {:?} must equal the operand shape {:?}",
-                outputs[0].shape, a.shape
+                "cuda_ep {op}: output shape {:?} must equal broadcast shape {:?}",
+                outputs[0].shape, out_shape
             )));
         }
 
-        let n = a.numel();
+        let n = outputs[0].numel();
         let n_u64 = count_u64(op, n)?;
         let a_ptr = cuptr(a.data_ptr::<u8>() as *const c_void);
         let b_ptr = cuptr(b.data_ptr::<u8>() as *const c_void);
@@ -656,6 +648,15 @@ impl BinaryPredKernel {
         let func = self
             .runtime
             .nvrtc_function(self.module, self.src, self.entry)?;
+        let metadata = broadcast_metadata(a.shape, b.shape, &out_shape);
+        let metadata_bytes = u64_bytes(&metadata);
+        let metadata_ptr = self.runtime.alloc_raw(metadata_bytes.len())?;
+        if let Err(error) = unsafe { self.runtime.htod(metadata_bytes, metadata_ptr) } {
+            let _ = unsafe { self.runtime.free_raw(metadata_ptr) };
+            return Err(error);
+        }
+        let rank = i32::try_from(out_shape.len())
+            .map_err(|_| EpError::KernelFailed(format!("cuda_ep {op}: rank exceeds i32")))?;
         let cfg = LaunchConfig {
             grid_dim: (grid_for(n), 1, 1),
             block_dim: (BLOCK, 1, 1),
@@ -663,14 +664,22 @@ impl BinaryPredKernel {
         };
         let stream = self.runtime.stream();
         let mut builder = stream.launch_builder(&func);
-        builder.arg(&a_ptr).arg(&b_ptr).arg(&y_ptr).arg(&n_u64);
+        builder
+            .arg(&a_ptr)
+            .arg(&b_ptr)
+            .arg(&y_ptr)
+            .arg(&metadata_ptr)
+            .arg(&rank)
+            .arg(&n_u64);
         // SAFETY: `func` is the compiled predicate entry; its argument list is
         // (const T*, const T*, unsigned char*, unsigned long long) where T is f32
         // or uchar per `kind` — matching the validated operand/output dtypes; all
         // pointers cover `n` elements, with a matching u64 count and indexing.
-        unsafe { builder.launch(cfg) }
-            .map_err(|e| driver_err(&format!("launch {}", self.entry), e))?;
-        self.runtime.synchronize()
+        let launch = unsafe { builder.launch(cfg) }
+            .map_err(|e| driver_err(&format!("launch {}", self.entry), e));
+        let sync = launch.and_then(|_| self.runtime.synchronize());
+        let free = unsafe { self.runtime.free_raw(metadata_ptr) };
+        sync.and(free)
     }
 }
 
@@ -684,7 +693,7 @@ impl Kernel for BinaryPredKernel {
     }
 
     fn cuda_graph_compatible(&self) -> bool {
-        true
+        false
     }
 }
 
@@ -726,7 +735,7 @@ mod tests {
             CmpOp::LessOrEqual,
         ] {
             assert!(
-                CMP_SRC.contains(&format!("void {}(", op.entry())),
+                CMP_SRC.contains(&format!("DEFINE_CMP({},", op.entry())),
                 "missing NVRTC entry {} for {}",
                 op.entry(),
                 op.op_name()
@@ -738,7 +747,7 @@ mod tests {
     fn logical_entry_points_are_present_in_source() {
         for op in [LogicalOp::And, LogicalOp::Or, LogicalOp::Xor] {
             assert!(
-                LOGICAL_SRC.contains(&format!("void {}(", op.entry())),
+                LOGICAL_SRC.contains(&format!("DEFINE_LOGICAL({},", op.entry())),
                 "missing NVRTC entry {} for {}",
                 op.entry(),
                 op.op_name()
@@ -849,8 +858,8 @@ mod tests {
         assert!(UNARY_MATH_SRC.contains("i += (unsigned long long)gridDim.x * blockDim.x"));
         for (name, source, kernel_count) in [
             ("Not", NOT_SRC, 1),
-            ("comparison", CMP_SRC, 5),
-            ("logical", LOGICAL_SRC, 3),
+            ("comparison macro", CMP_SRC, 1),
+            ("logical macro", LOGICAL_SRC, 1),
         ] {
             assert_eq!(
                 source.matches("const unsigned long long n)").count(),

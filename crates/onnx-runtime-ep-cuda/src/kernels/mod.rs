@@ -34,6 +34,7 @@ pub mod gemm;
 pub mod group_query_attention;
 pub mod matmul;
 pub mod matmul_nbits;
+pub mod movement;
 pub mod normalization;
 pub mod pointwise;
 pub mod pooling;
@@ -43,6 +44,7 @@ mod qmoe_grouping;
 pub mod reduce;
 pub mod shape;
 pub mod softmax;
+pub mod where_op;
 
 use activations::ActivationFactory;
 use elementwise::{BinaryFactory, BinaryOp, UnaryFactory, UnaryOp};
@@ -75,9 +77,11 @@ use pointwise::{
 /// * **Pointwise unary math** — `Abs`, `Neg`, `Reciprocal`, `Exp`, `Log`,
 ///   `Sign`, `Floor`, `Ceil`, `Round`, `Sin`, `Cos`, `Softplus` (NVRTC
 ///   f32/f16/bf16, formulas matched to the CPU EP `unary_math.rs`).
-/// * **Logical** — `Not` (bool), `And`, `Or`, `Xor` (bool, equal-shape).
+/// * **Logical** — `Not` (bool), `And`, `Or`, `Xor` (bool, broadcasting).
 /// * **Comparison** — `Equal`, `Greater`, `Less`, `GreaterOrEqual`,
-///   `LessOrEqual` (f32 operands → bool, equal-shape).
+///   `LessOrEqual` (f32 operands → bool, broadcasting).
+/// * **Movement/construction** — `Concat`, `Expand`, `Reshape`, `Slice`, `Split`,
+///   `Squeeze`, `Tile`, `Transpose`, `Unsqueeze`, plus broadcasting `Where`.
 ///
 /// See `docs/CUDA_COVERAGE.md` for the full op → backend mapping matrix and the
 /// prioritised list of remaining / custom-kernel ops.
@@ -150,6 +154,16 @@ pub const CUDA_COVERED_OPS: &[&str] = &[
     "Gather",
     "Shape",
     "Constant",
+    "Concat",
+    "Expand",
+    "Reshape",
+    "Slice",
+    "Split",
+    "Squeeze",
+    "Tile",
+    "Transpose",
+    "Unsqueeze",
+    "Where",
 ];
 
 /// Build an [`OpRegistry`] populated with the CUDA kernel factories.
@@ -183,6 +197,70 @@ pub fn build_cuda_registry(runtime: Arc<CudaRuntime>) -> OpRegistry {
     reg.register(
         OpKey::new("Constant", "", 1),
         Box::new(constant::ConstantFactory {
+            runtime: runtime.clone(),
+        }),
+    );
+    for (op_type, factory) in [
+        (
+            "Concat",
+            Box::new(movement::ConcatFactory {
+                runtime: runtime.clone(),
+            }) as Box<dyn onnx_runtime_ep_api::KernelFactory>,
+        ),
+        (
+            "Expand",
+            Box::new(movement::ExpandFactory {
+                runtime: runtime.clone(),
+            }),
+        ),
+        (
+            "Reshape",
+            Box::new(movement::ReshapeFactory {
+                runtime: runtime.clone(),
+            }),
+        ),
+        (
+            "Slice",
+            Box::new(movement::SliceFactory {
+                runtime: runtime.clone(),
+            }),
+        ),
+        (
+            "Split",
+            Box::new(movement::SplitFactory {
+                runtime: runtime.clone(),
+            }),
+        ),
+        (
+            "Squeeze",
+            Box::new(movement::SqueezeFactory {
+                runtime: runtime.clone(),
+            }),
+        ),
+        (
+            "Transpose",
+            Box::new(movement::TransposeFactory {
+                runtime: runtime.clone(),
+            }),
+        ),
+        (
+            "Unsqueeze",
+            Box::new(movement::UnsqueezeFactory {
+                runtime: runtime.clone(),
+            }),
+        ),
+        (
+            "Where",
+            Box::new(where_op::WhereFactory {
+                runtime: runtime.clone(),
+            }),
+        ),
+    ] {
+        reg.register(OpKey::new(op_type, "", 1), factory);
+    }
+    reg.register(
+        OpKey::new("Tile", "", 6),
+        Box::new(movement::TileFactory {
             runtime: runtime.clone(),
         }),
     );
@@ -443,7 +521,7 @@ pub fn build_cuda_registry(runtime: Arc<CudaRuntime>) -> OpRegistry {
         }),
     );
 
-    // Logical binary (bool operands → bool; equal-shape, non-zero byte = true).
+    // Logical binary (bool operands → bool; NumPy broadcasting).
     for (op_type, op) in [
         ("And", LogicalOp::And),
         ("Or", LogicalOp::Or),
@@ -458,7 +536,7 @@ pub fn build_cuda_registry(runtime: Arc<CudaRuntime>) -> OpRegistry {
         );
     }
 
-    // Comparison (f32 operands → bool; equal-shape, ONNX comparison semantics).
+    // Comparison (f32 operands → bool; NumPy broadcasting).
     for (op_type, op) in [
         ("Equal", CmpOp::Equal),
         ("Greater", CmpOp::Greater),
@@ -507,7 +585,7 @@ mod tests {
 
     #[test]
     fn covered_ops_have_no_duplicates() {
-        assert_eq!(CUDA_COVERED_OPS.len(), 68);
+        assert_eq!(CUDA_COVERED_OPS.len(), 78);
 
         let mut seen = std::collections::HashSet::new();
         for op in CUDA_COVERED_OPS {
@@ -544,6 +622,27 @@ mod tests {
             "Less",
             "GreaterOrEqual",
             "LessOrEqual",
+        ] {
+            assert!(
+                CUDA_COVERED_OPS.contains(&op),
+                "{op} missing from CUDA_COVERED_OPS"
+            );
+        }
+    }
+
+    #[test]
+    fn movement_and_where_ops_are_listed_in_coverage() {
+        for op in [
+            "Concat",
+            "Expand",
+            "Reshape",
+            "Slice",
+            "Split",
+            "Squeeze",
+            "Tile",
+            "Transpose",
+            "Unsqueeze",
+            "Where",
         ] {
             assert!(
                 CUDA_COVERED_OPS.contains(&op),

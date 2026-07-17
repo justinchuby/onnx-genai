@@ -80,14 +80,8 @@ not yet wired) · **🔬 custom** (needs a fused NVRTC/CUTLASS kernel).
 | Op | Domain | Status | Backend | Notes |
 |----|--------|--------|---------|-------|
 | `Not` | `` | ✅ | **NVRTC-custom** | bool→bool, non-zero byte = true, canonical `1`/`0` out (matches CPU `logical.rs`). |
-| `And` | `` | ✅ | **NVRTC-custom** | bool operands → bool, **equal-shape**. Broadcasting ⏳. |
-| `Or` | `` | ✅ | **NVRTC-custom** | bool operands → bool, equal-shape. |
-| `Xor` | `` | ✅ | **NVRTC-custom** | bool operands → bool, equal-shape. |
-| `Equal` | `` | ✅ | **NVRTC-custom** | f32 operands → **bool**, equal-shape. ONNX comparison semantics. |
-| `Greater` | `` | ✅ | **NVRTC-custom** | f32 operands → bool, equal-shape. |
-| `Less` | `` | ✅ | **NVRTC-custom** | f32 operands → bool, equal-shape. |
-| `GreaterOrEqual` | `` | ✅ | **NVRTC-custom** | f32 operands → bool, equal-shape. |
-| `LessOrEqual` | `` | ✅ | **NVRTC-custom** | f32 operands → bool, equal-shape. |
+| `And`, `Or`, `Xor` | `` | ✅ | **NVRTC-custom** | bool operands → bool with NumPy right-aligned broadcasting and canonical `1`/`0` output. |
+| `Equal`, `Greater`, `Less`, `GreaterOrEqual`, `LessOrEqual` | `` | ✅ | **NVRTC-custom** | f32 operands → bool with NumPy right-aligned broadcasting and ONNX comparison semantics. |
 
 ### Elementwise — binary
 
@@ -135,13 +129,16 @@ not yet wired) · **🔬 custom** (needs a fused NVRTC/CUTLASS kernel).
 | `Cast` | `` | ✅ | **NVRTC-custom** | Element-wise dtype conversion; f32/f64/f16/bf16/int8-64/uint8-64/bool, ONNX saturating float→int. Two NVRTC modules keep f16/bf16 (which need NVRTC's built-in `cuda_fp16.h`/`cuda_bf16.h`) out of the common integer/f32 path (`cast.rs`). |
 | `CastLike` | `` | ✅ | **NVRTC-custom** | Same kernel as `Cast`; target dtype taken from the output tensor. |
 | `Identity` | `` | ⏳ | **memcpy** (D2D) | Straight device copy; dtype-agnostic. |
-| `Reshape` | `` | ⏳ | **view rewrite** | Metadata-only when contiguous; else materialise. |
-| `Transpose` | `` | ⏳ | **NVRTC-custom** / cuBLAS | Tiled-transpose kernel (or fold into a consumer's GEMM `op`). |
+| `Concat` | `` | ✅ | **NVRTC-custom** | Dtype-agnostic byte copy, arbitrary/negative axis, multiple inputs. |
+| `Reshape`, `Squeeze`, `Unsqueeze` | `` | ✅ | **memcpy** | Dtype-agnostic D2D copy into the executor's pre-shaped output; modern axes inputs and legacy attributes are accepted. |
+| `Transpose` | `` | ✅ | **NVRTC-custom** | Dtype-agnostic indexed byte copy; explicit permutation or default axis reversal. |
 | `Gather` | `` | ✅ | **NVRTC-custom** | Axis-parametric contiguous indexed copy; Int32/Int64 indices, negative index wrap, arbitrary index rank. |
 | `Shape` | `` | ✅ | **host + H2D** | Computes the metadata-only Int64 shape vector on host, including opset-15 `start`/`end`, then uploads it. |
-| `Unsqueeze` | `` | ⏳ | **view rewrite** | Metadata-only. |
-| `Expand` | `` | ⏳ | **NVRTC-custom** | Broadcast copy (shares the broadcasting index math with binary-elementwise-broadcast). |
-| `Slice` | `` | ⏳ | **NVRTC-custom** | Strided/stepped copy (opset-10 input-driven ranges). |
+| `Expand` | `` | ✅ | **NVRTC-custom** | Dtype-agnostic broadcast copy sharing the binary-elementwise zero-stride indexing infrastructure. |
+| `Slice` | `` | ✅ | **NVRTC-custom** | Dtype-agnostic strided/stepped copy with opset-10 input-driven ranges, negative axes, and negative steps. |
+| `Split` | `` | ✅ | **NVRTC-custom** | Dtype-agnostic byte copy; split input, legacy attribute, even split, negative axis, and opset-18 `num_outputs`. |
+| `Tile` | `` | ✅ | **NVRTC-custom** | Dtype-agnostic repeated indexed copy across arbitrary axes. |
+| `Where` | `` | ✅ | **NVRTC-custom** | Dtype-agnostic branch selection with right-aligned broadcasting across condition, x, and y. |
 | `Constant` | `` | ✅ | **host + H2D** | Uploads `value` tensors and numeric `value_*` attribute forms to the device. |
 
 ## Source-derived coverage audit (2026-07-15)

@@ -525,14 +525,17 @@ impl Kernel for BinaryKernel {
     }
 }
 
-fn broadcast_metadata(a: &[usize], b: &[usize], out: &[usize]) -> Vec<u64> {
+pub(crate) fn broadcast_metadata(a: &[usize], b: &[usize], out: &[usize]) -> Vec<u64> {
     let mut metadata = out.iter().map(|&d| d as u64).collect::<Vec<_>>();
     metadata.extend(broadcast_strides(a, out));
     metadata.extend(broadcast_strides(b, out));
+    if metadata.is_empty() {
+        metadata.push(0);
+    }
     metadata
 }
 
-fn broadcast_strides(input: &[usize], out: &[usize]) -> Vec<u64> {
+pub(crate) fn broadcast_strides(input: &[usize], out: &[usize]) -> Vec<u64> {
     let contiguous = onnx_runtime_ir::compute_contiguous_strides(input);
     let leading = out.len() - input.len();
     (0..out.len())
@@ -551,7 +554,7 @@ fn broadcast_strides(input: &[usize], out: &[usize]) -> Vec<u64> {
         .collect()
 }
 
-fn u64_bytes(values: &[u64]) -> &[u8] {
+pub(crate) fn u64_bytes(values: &[u64]) -> &[u8] {
     // SAFETY: u64 is plain data and the byte slice retains the input lifetime.
     unsafe {
         std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), std::mem::size_of_val(values))

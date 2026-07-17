@@ -4,7 +4,8 @@ use half::{bf16, f16};
 use onnx_runtime_ep_api::{DevicePtr, DevicePtrMut, ExecutionProvider, TensorMut, TensorView};
 use onnx_runtime_ep_cuda::CudaExecutionProvider;
 use onnx_runtime_ep_cuda::runtime::cuptr;
-use onnx_runtime_ir::{DataType, Node, NodeId, compute_contiguous_strides};
+use onnx_runtime_ir::{DataType, Graph, Node, NodeId, compute_contiguous_strides, static_shape};
+use onnx_runtime_loader::Model;
 
 fn encode(values: &[f32], dtype: DataType) -> Vec<u8> {
     values
@@ -128,6 +129,76 @@ fn run_unary(ep: &CudaExecutionProvider, op: &str, dtype: DataType, x: &[f32]) -
     ep.deallocate(x_buf).unwrap();
     ep.deallocate(y_buf).unwrap();
     decode(&out, dtype)
+}
+
+fn run_predicate(
+    ep: &CudaExecutionProvider,
+    op: &str,
+    dtype: DataType,
+    a_bytes: &[u8],
+    a_shape: &[usize],
+    b_bytes: &[u8],
+    b_shape: &[usize],
+    out_shape: &[usize],
+) -> Vec<u8> {
+    let rt = ep.runtime();
+    let a_buf = ep.allocate(a_bytes.len(), 256).unwrap();
+    let b_buf = ep.allocate(b_bytes.len(), 256).unwrap();
+    let mut y_buf = ep.allocate(out_shape.iter().product(), 256).unwrap();
+    unsafe {
+        rt.htod(a_bytes, cuptr(a_buf.as_ptr())).unwrap();
+        rt.htod(b_bytes, cuptr(b_buf.as_ptr())).unwrap();
+    }
+    let a_strides = compute_contiguous_strides(a_shape);
+    let b_strides = compute_contiguous_strides(b_shape);
+    let y_strides = compute_contiguous_strides(out_shape);
+    let inputs = [
+        TensorView::new(
+            DevicePtr(a_buf.as_ptr()),
+            dtype,
+            a_shape,
+            &a_strides,
+            ep.device_id(),
+        ),
+        TensorView::new(
+            DevicePtr(b_buf.as_ptr()),
+            dtype,
+            b_shape,
+            &b_strides,
+            ep.device_id(),
+        ),
+    ];
+    let output = TensorMut::new(
+        DevicePtrMut(y_buf.as_mut_ptr()),
+        DataType::Bool,
+        out_shape,
+        &y_strides,
+        ep.device_id(),
+    );
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let a_value = graph.create_named_value("a", dtype, static_shape(a_shape.iter().copied()));
+    let b_value = graph.create_named_value("b", dtype, static_shape(b_shape.iter().copied()));
+    let y_value =
+        graph.create_named_value("y", DataType::Bool, static_shape(out_shape.iter().copied()));
+    graph.add_input(a_value);
+    graph.add_input(b_value);
+    let node_id = graph.insert_node(Node::new(
+        NodeId(0),
+        op,
+        vec![Some(a_value), Some(b_value)],
+        vec![y_value],
+    ));
+    graph.add_output(y_value);
+    let model = Model::new(&graph);
+    let kernel = ep.get_kernel(model.graph.node(node_id), &[], 17).unwrap();
+    kernel.execute(&inputs, &mut [output]).unwrap();
+    let mut out = vec![0; out_shape.iter().product()];
+    unsafe { rt.dtoh(&mut out, cuptr(y_buf.as_ptr())).unwrap() };
+    ep.deallocate(a_buf).unwrap();
+    ep.deallocate(b_buf).unwrap();
+    ep.deallocate(y_buf).unwrap();
+    out
 }
 
 fn cpu_broadcast(
@@ -285,5 +356,58 @@ fn half_unary_and_activation_families_match_cpu_reference() {
             let expected = quantize(&xq.iter().copied().map(f).collect::<Vec<_>>(), dtype);
             assert_close(&run_unary(&ep, op, dtype, &x), &expected, tolerance);
         }
+    }
+}
+
+#[test]
+fn logical_family_numpy_broadcast_matches_cpu_reference() {
+    let Some(ep) = cuda_ep() else { return };
+    let a = [0_u8, 1];
+    let b = [0_u8, 1, 1];
+    let expected = [
+        ("And", vec![0, 0, 0, 0, 1, 1]),
+        ("Or", vec![0, 1, 1, 1, 1, 1]),
+        ("Xor", vec![0, 1, 1, 1, 0, 0]),
+    ];
+    for (op, expected) in expected {
+        assert_eq!(
+            run_predicate(&ep, op, DataType::Bool, &a, &[2, 1], &b, &[1, 3], &[2, 3]),
+            expected,
+            "{op}"
+        );
+    }
+}
+
+#[test]
+fn comparison_family_numpy_broadcast_matches_cpu_reference() {
+    let Some(ep) = cuda_ep() else { return };
+    let a = [1.0_f32, 3.0];
+    let b = [2.0_f32, 3.0, 4.0];
+    let a_bytes =
+        unsafe { std::slice::from_raw_parts(a.as_ptr().cast::<u8>(), std::mem::size_of_val(&a)) };
+    let b_bytes =
+        unsafe { std::slice::from_raw_parts(b.as_ptr().cast::<u8>(), std::mem::size_of_val(&b)) };
+    let expected = [
+        ("Equal", vec![0, 0, 0, 0, 1, 0]),
+        ("Greater", vec![0, 0, 0, 1, 0, 0]),
+        ("Less", vec![1, 1, 1, 0, 0, 1]),
+        ("GreaterOrEqual", vec![0, 0, 0, 1, 1, 0]),
+        ("LessOrEqual", vec![1, 1, 1, 0, 1, 1]),
+    ];
+    for (op, expected) in expected {
+        assert_eq!(
+            run_predicate(
+                &ep,
+                op,
+                DataType::Float32,
+                a_bytes,
+                &[2, 1],
+                b_bytes,
+                &[1, 3],
+                &[2, 3],
+            ),
+            expected,
+            "{op}"
+        );
     }
 }
