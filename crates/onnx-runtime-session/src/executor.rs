@@ -62,7 +62,9 @@ use onnx_runtime_optimizer::InitializerResolver;
 use onnx_runtime_shape_inference::{InferenceRegistry, MergePolicy};
 
 use crate::error::{Result, SessionError};
-use crate::sequence::{concat_axis, split_axis, stack_new_axis, SeqTensor, SequenceValue};
+use crate::sequence::{
+    SeqTensor, SequenceError, SequenceValue, SplitSpec, concat, split, stack_new_axis,
+};
 use crate::tensor::{DeviceIoBinding, Tensor};
 
 fn profile_ops_enabled() -> bool {
@@ -2148,14 +2150,17 @@ impl Executor {
                 let dtype = match dtype_attr {
                     None => DataType::Float32, // ONNX default element type.
                     Some(raw) => {
-                        DataType::from_onnx(raw as i32).ok_or_else(|| SessionError::SequenceOp {
-                            op: op.clone(),
-                            reason: format!(
-                                "attribute 'dtype' = {raw} is not a known ONNX \
+                        i32::try_from(raw)
+                            .ok()
+                            .and_then(DataType::from_onnx)
+                            .ok_or_else(|| SessionError::SequenceOp {
+                                op: op.clone(),
+                                reason: format!(
+                                    "attribute 'dtype' = {raw} is not a known ONNX \
                                  TensorProto.DataType. To fix: use a valid element \
                                  dtype id (e.g. 1=float32, 7=int64)"
-                            ),
-                        })?
+                                ),
+                            })?
                     }
                 };
                 self.sequences
@@ -2217,7 +2222,12 @@ impl Executor {
             }
             "SequenceLength" => {
                 let seq = self.get_sequence(inputs.first().copied().flatten(), &op)?;
-                let len = seq.len() as i64;
+                let len = i64::try_from(seq.length()).map_err(|_| {
+                    seq_err(SequenceError::LengthOverflow {
+                        op: "SequenceLength",
+                        len: seq.length(),
+                    })
+                })?;
                 self.store_raw_tensor_output(
                     outputs[0],
                     DataType::Int64,
@@ -2226,7 +2236,9 @@ impl Executor {
                     resolved,
                 )
             }
-            "SplitToSequence" => self.exec_split_to_sequence(&op, &inputs, &outputs, resolved),
+            "SplitToSequence" => {
+                self.exec_split_to_sequence(node_id, &op, &inputs, &outputs, resolved)
+            }
             "ConcatFromSequence" => {
                 self.exec_concat_from_sequence(node_id, &op, &inputs, &outputs, resolved)
             }
@@ -2240,12 +2252,13 @@ impl Executor {
     /// `SplitToSequence`: split a tensor into a sequence along `axis`.
     fn exec_split_to_sequence(
         &mut self,
+        node_id: NodeId,
         op: &str,
         inputs: &[Option<ValueId>],
         outputs: &[ValueId],
         resolved: &mut HashMap<ValueId, Vec<usize>>,
     ) -> Result<()> {
-        let node = self.graph.node(self.plan_node_of(outputs[0]));
+        let node = self.graph.node(node_id);
         let axis_attr = node.attr("axis").and_then(|a| a.as_int()).unwrap_or(0);
         let keepdims = node.attr("keepdims").and_then(|a| a.as_int()).unwrap_or(1) != 0;
 
@@ -2255,110 +2268,52 @@ impl Executor {
             .flatten()
             .ok_or_else(|| self.seq_missing_input(op))?;
         let dtype = self.value_dtypes[&ivid];
-        let esize = dtype.byte_size();
-        if esize == 0 {
-            return Err(SessionError::SequenceOp {
-                op: op.to_string(),
-                reason: format!(
-                    "sub-byte dtype {dtype:?} is not supported for SplitToSequence. \
-                     To fix: Cast to a byte-addressable dtype before splitting"
-                ),
-            });
-        }
         let shape = resolved
             .get(&ivid)
             .cloned()
             .ok_or_else(|| self.seq_unresolved(op, ivid))?;
-        let rank = shape.len();
-        if rank == 0 {
-            return Err(SessionError::SequenceOp {
-                op: op.to_string(),
-                reason: "cannot split a scalar (rank-0) tensor. To fix: split a \
-                         tensor with at least one dimension"
-                    .to_string(),
-            });
-        }
-        let axis = normalize_axis(axis_attr, rank).ok_or_else(|| SessionError::SequenceOp {
-            op: op.to_string(),
-            reason: format!(
-                "attribute 'axis' = {axis_attr} is out of range for a rank-{rank} \
-                 input (valid range is [{}, {}])",
-                -(rank as i64),
-                rank as i64 - 1
-            ),
-        })?;
-        let axis_dim = shape[axis];
         let bytes = self.contiguous_bytes(ivid, &shape, dtype)?;
 
-        // Determine per-chunk sizes and whether to squeeze the split axis.
-        let mut squeeze = false;
-        let sizes: Vec<usize> = match inputs.get(1).copied().flatten() {
-            None => {
-                // No 'split': one element per index along axis; keepdims=0 drops
-                // the (size-1) axis from each element.
-                squeeze = !keepdims;
-                vec![1; axis_dim]
-            }
+        let split_input = match inputs.get(1).copied().flatten() {
+            None => None,
             Some(svid) => {
-                let sshape = resolved.get(&svid).cloned().unwrap_or_default();
-                let svals = self.read_i64_vec(svid, &sshape, op)?;
-                let is_scalar = sshape.is_empty();
-                if is_scalar {
-                    let chunk = *svals.first().ok_or_else(|| SessionError::SequenceOp {
-                        op: op.to_string(),
-                        reason: "'split' scalar is empty".to_string(),
-                    })?;
-                    if chunk <= 0 {
-                        return Err(SessionError::SequenceOp {
-                            op: op.to_string(),
-                            reason: format!("'split' chunk size {chunk} must be positive"),
-                        });
-                    }
-                    let chunk = chunk as usize;
-                    let mut v = Vec::new();
-                    let mut rem = axis_dim;
-                    while rem > 0 {
-                        let k = rem.min(chunk);
-                        v.push(k);
-                        rem -= k;
-                    }
-                    v
-                } else {
-                    let v: Vec<usize> = svals.iter().map(|&x| x.max(0) as usize).collect();
-                    let sum: usize = v.iter().sum();
-                    if sum != axis_dim {
-                        return Err(SessionError::SequenceOp {
-                            op: op.to_string(),
-                            reason: format!(
-                                "'split' sizes {v:?} sum to {sum} but axis {axis} has \
-                                 extent {axis_dim}. To fix: make the split sizes sum to \
-                                 the axis length"
-                            ),
-                        });
-                    }
-                    v
-                }
+                let split_shape = resolved
+                    .get(&svid)
+                    .cloned()
+                    .ok_or_else(|| self.seq_unresolved(op, svid))?;
+                let values = self.read_i64_vec(svid, &split_shape, op)?;
+                Some((split_shape, values))
             }
         };
-
-        let parts = split_axis(&bytes, &shape, axis, &sizes, esize)?;
-        let items: Vec<SeqTensor> = parts
-            .into_iter()
-            .map(|(mut sh, data)| {
-                if squeeze {
-                    sh.remove(axis);
-                }
-                SeqTensor::from_raw(dtype, sh, &data)
-            })
-            .collect::<std::result::Result<_, _>>()
-            .map_err(SessionError::from)?;
-        self.sequences.insert(
-            outputs[0],
-            SequenceValue {
-                elem_dtype: dtype,
-                items,
-            },
-        );
+        let split_spec = match split_input.as_ref() {
+            None => SplitSpec::Each,
+            Some((split_shape, values)) if split_shape.is_empty() => {
+                let [chunk] = values.as_slice() else {
+                    return Err(SessionError::SequenceOp {
+                        op: op.to_string(),
+                        reason: format!(
+                            "scalar 'split' input contains {} values, expected exactly one",
+                            values.len()
+                        ),
+                    });
+                };
+                SplitSpec::Chunk(*chunk)
+            }
+            Some((split_shape, values)) if split_shape.len() == 1 => SplitSpec::Sizes(values),
+            Some((split_shape, _)) => {
+                return Err(SessionError::SequenceOp {
+                    op: op.to_string(),
+                    reason: format!(
+                        "'split' input must be rank 0 (chunk size) or rank 1 (explicit sizes), \
+                         got rank {} with shape {split_shape:?}",
+                        split_shape.len()
+                    ),
+                });
+            }
+        };
+        let sequence =
+            split(&bytes, dtype, &shape, axis_attr, split_spec, keepdims).map_err(seq_err)?;
+        self.sequences.insert(outputs[0], sequence);
         Ok(())
     }
 
@@ -2384,82 +2339,15 @@ impl Executor {
         let new_axis = node.attr("new_axis").and_then(|a| a.as_int()).unwrap_or(0) != 0;
 
         let seq = self.get_sequence(inputs.first().copied().flatten(), op)?;
-        if seq.is_empty() {
-            return Err(SessionError::SequenceOp {
-                op: op.to_string(),
-                reason: "cannot concatenate an empty sequence (output shape is \
-                         undefined). To fix: guard with SequenceLength"
-                    .to_string(),
-            });
-        }
-        let dtype = seq.elem_dtype;
-        let esize = dtype.byte_size();
-        if esize == 0 {
-            return Err(SessionError::SequenceOp {
-                op: op.to_string(),
-                reason: format!("sub-byte dtype {dtype:?} is not supported for ConcatFromSequence"),
-            });
-        }
-        let elem_shapes: Vec<Vec<usize>> = seq.items.iter().map(|t| t.shape.clone()).collect();
-        let elem_datas: Vec<&[u8]> = seq.items.iter().map(|t| t.as_bytes()).collect();
-        let rank = elem_shapes[0].len();
-
-        let (oshape, out) = if new_axis {
-            // Stack: every element must share one shape; new axis in [-rank-1, rank].
-            for (i, s) in elem_shapes.iter().enumerate() {
-                if s != &elem_shapes[0] {
-                    return Err(SessionError::SequenceOp {
-                        op: op.to_string(),
-                        reason: format!(
-                            "ConcatFromSequence(new_axis=1) requires identical element \
-                             shapes, but element {i} has shape {s:?} vs {:?}",
-                            elem_shapes[0]
-                        ),
-                    });
-                }
-            }
-            let axis =
-                normalize_axis(axis_attr, rank + 1).ok_or_else(|| SessionError::SequenceOp {
-                    op: op.to_string(),
-                    reason: format!(
-                        "'axis' = {axis_attr} is out of range for new_axis=1 stacking \
-                         of rank-{rank} elements (valid range is [{}, {}])",
-                        -(rank as i64) - 1,
-                        rank as i64
-                    ),
-                })?;
-            stack_new_axis(&elem_datas, &elem_shapes[0], axis, esize)?
-        } else {
-            let axis = normalize_axis(axis_attr, rank).ok_or_else(|| SessionError::SequenceOp {
-                op: op.to_string(),
-                reason: format!(
-                    "'axis' = {axis_attr} is out of range for rank-{rank} elements \
-                     (valid range is [{}, {}])",
-                    -(rank as i64),
-                    rank as i64 - 1
-                ),
-            })?;
-            // Elements must agree on every dimension except the concat axis.
-            for (i, s) in elem_shapes.iter().enumerate() {
-                let mismatch = s.len() != rank
-                    || s.iter()
-                        .enumerate()
-                        .any(|(d, &v)| d != axis && v != elem_shapes[0][d]);
-                if mismatch {
-                    return Err(SessionError::SequenceOp {
-                        op: op.to_string(),
-                        reason: format!(
-                            "ConcatFromSequence requires elements to match on all axes \
-                             except {axis}, but element {i} has shape {s:?} vs {:?}",
-                            elem_shapes[0]
-                        ),
-                    });
-                }
-            }
-            concat_axis(&elem_datas, &elem_shapes, axis, esize)?
-        };
+        let elem = concat(&seq, axis_attr, new_axis).map_err(seq_err)?;
         drop(seq);
-        self.store_raw_tensor_output(outputs[0], dtype, oshape, &out, resolved)
+        self.store_raw_tensor_output(
+            outputs[0],
+            elem.dtype,
+            elem.shape.clone(),
+            elem.as_bytes(),
+            resolved,
+        )
     }
 
     /// Build (or share) a `SeqTensor` for a tensor value entering a
@@ -2472,6 +2360,15 @@ impl Executor {
         vid: ValueId,
         resolved: &HashMap<ValueId, Vec<usize>>,
     ) -> Result<SeqTensor> {
+        if self.sequence_values.contains(&vid) {
+            return Err(SessionError::SequenceOp {
+                op: "Sequence".to_string(),
+                reason: format!(
+                    "input value#{} is a Sequence value, expected a tensor element",
+                    vid.0
+                ),
+            });
+        }
         if let Some(elem) = self.seq_elem_values.get(&vid) {
             return Ok(elem.clone()); // zero-copy Arc share
         }
@@ -2510,6 +2407,15 @@ impl Executor {
         op: &str,
     ) -> Result<i64> {
         let shape = resolved.get(&vid).cloned().unwrap_or_default();
+        if !shape.is_empty() {
+            return Err(SessionError::SequenceOp {
+                op: op.to_string(),
+                reason: format!(
+                    "position input must be a rank-0 scalar, got rank {} with shape {shape:?}",
+                    shape.len()
+                ),
+            });
+        }
         let dtype = self.value_dtypes[&vid];
         let vals = self
             .input_i64(vid, &shape, dtype)
@@ -2520,12 +2426,16 @@ impl Executor {
                  To fix: provide an int64 scalar index"
                 ),
             })?;
-        vals.first()
-            .copied()
-            .ok_or_else(|| SessionError::SequenceOp {
+        let [value] = vals.as_slice() else {
+            return Err(SessionError::SequenceOp {
                 op: op.to_string(),
-                reason: "position input is empty; expected a single scalar index".to_string(),
-            })
+                reason: format!(
+                    "position input contains {} values; expected exactly one scalar index",
+                    vals.len()
+                ),
+            });
+        };
+        Ok(*value)
     }
 
     /// Read an `i64` vector from an integer tensor input (SplitToSequence's
@@ -2607,15 +2517,6 @@ impl Executor {
         self.buffer_shapes.insert(vid, dims.clone());
         resolved.insert(vid, dims);
         Ok(())
-    }
-
-    /// The producing node id of value `vid` (Sequence ops always have a
-    /// producer).
-    fn plan_node_of(&self, vid: ValueId) -> NodeId {
-        self.graph
-            .value(vid)
-            .producer
-            .expect("sequence op output has a producer")
     }
 
     fn seq_missing_input(&self, op: &str) -> SessionError {
@@ -3029,8 +2930,14 @@ impl Executor {
     /// buffer to its logical size. This is the single materialization seam used
     /// by the graph-output boundary and control-flow scope capture.
     fn contiguous_bytes(&self, vid: ValueId, shape: &[usize], dtype: DataType) -> Result<Vec<u8>> {
-        let numel: usize = shape.iter().product();
-        let n = dtype.storage_bytes(numel);
+        let value_name = || {
+            self.graph
+                .try_value(vid)
+                .and_then(|value| value.name.clone())
+                .unwrap_or_else(|| format!("value#{}", vid.0))
+        };
+        let numel = checked_numel(shape, value_name)?;
+        let n = checked_storage_bytes(dtype, numel, value_name, shape)?;
         // A tensor value backed by a shared sequence element (SequenceAt output)
         // owns no buffer; its bytes are the element's contiguous bytes. This is
         // the one materialization point where they are copied out (the boundary
@@ -4229,6 +4136,92 @@ pub(crate) fn auto_detect_cpu_ep() -> Result<Arc<dyn ExecutionProvider>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sequence_executor_preserves_element_arc_identity() {
+        use onnx_runtime_ir::{TensorData, WeightRef, static_shape};
+
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 17);
+
+        let input = graph.create_named_value("input", DataType::Float32, static_shape([2]));
+        graph.set_initializer(
+            input,
+            WeightRef::Inline(TensorData::from_raw(
+                DataType::Float32,
+                vec![2],
+                [7.0f32, 8.0]
+                    .into_iter()
+                    .flat_map(f32::to_le_bytes)
+                    .collect(),
+            )),
+        );
+        let zero = graph.create_named_value("zero", DataType::Int64, static_shape([]));
+        graph.set_initializer(
+            zero,
+            WeightRef::Inline(TensorData::from_raw(
+                DataType::Int64,
+                vec![],
+                0i64.to_le_bytes().to_vec(),
+            )),
+        );
+        let one = graph.create_named_value("one", DataType::Int64, static_shape([]));
+        graph.set_initializer(
+            one,
+            WeightRef::Inline(TensorData::from_raw(
+                DataType::Int64,
+                vec![],
+                1i64.to_le_bytes().to_vec(),
+            )),
+        );
+
+        let first_sequence = graph.create_value(DataType::Float32, static_shape([]));
+        graph.insert_node(Node::new(
+            NodeId(0),
+            "SequenceConstruct",
+            vec![Some(input)],
+            vec![first_sequence],
+        ));
+        let first_at = graph.create_value(DataType::Float32, static_shape([2]));
+        graph.insert_node(Node::new(
+            NodeId(0),
+            "SequenceAt",
+            vec![Some(first_sequence), Some(zero)],
+            vec![first_at],
+        ));
+        let inserted_sequence = graph.create_value(DataType::Float32, static_shape([]));
+        graph.insert_node(Node::new(
+            NodeId(0),
+            "SequenceInsert",
+            vec![Some(first_sequence), Some(first_at)],
+            vec![inserted_sequence],
+        ));
+        let second_at = graph.create_value(DataType::Float32, static_shape([2]));
+        graph.insert_node(Node::new(
+            NodeId(0),
+            "SequenceAt",
+            vec![Some(inserted_sequence), Some(one)],
+            vec![second_at],
+        ));
+        graph.add_output(second_at);
+
+        let mut executor = Executor::build(
+            graph,
+            Arc::new(WeightStore::new()),
+            auto_detect_cpu_ep().unwrap(),
+        )
+        .unwrap();
+        let output = executor.run(&[]).unwrap();
+        assert_eq!(output[0].to_vec_f32(), vec![7.0, 8.0]);
+
+        let original = executor.sequences[&first_sequence].elements()[0].shared_tensor();
+        let first_at_arc = executor.seq_elem_values[&first_at].shared_tensor();
+        let inserted = executor.sequences[&inserted_sequence].elements()[1].shared_tensor();
+        let second_at_arc = executor.seq_elem_values[&second_at].shared_tensor();
+        assert!(Arc::ptr_eq(original, first_at_arc));
+        assert!(Arc::ptr_eq(original, inserted));
+        assert!(Arc::ptr_eq(original, second_at_arc));
+    }
 
     #[test]
     fn fuses_only_single_consumer_silu_pattern() {

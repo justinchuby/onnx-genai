@@ -323,10 +323,6 @@ impl SequenceValue {
         self.items.len()
     }
 
-    pub(crate) fn len(&self) -> usize {
-        self.length()
-    }
-
     /// Declared homogeneous element dtype.
     pub fn elem_dtype(&self) -> DataType {
         self.elem_dtype
@@ -337,9 +333,6 @@ impl SequenceValue {
         &self.items
     }
 
-    pub(crate) fn is_empty(&self) -> bool {
-        self.items.is_empty()
-    }
 }
 
 /// ONNX `SplitToSequence` split-input interpretation.
@@ -489,7 +482,10 @@ pub fn concat(sequence: &SequenceValue, axis: i64, new_axis: bool) -> SequenceRe
         return Err(SequenceError::UnsupportedDtype { op: OP, dtype });
     }
     let rank = first.shape.len();
-    let axis = normalize_axis(OP, axis, rank + usize::from(new_axis), new_axis)?;
+    let output_rank = rank
+        .checked_add(usize::from(new_axis))
+        .ok_or_else(|| overflow(OP, "concat output rank", &first.shape))?;
+    let axis = normalize_axis(OP, axis, output_rank, new_axis)?;
 
     let mut shapes = Vec::new();
     let mut elements = Vec::new();

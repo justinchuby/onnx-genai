@@ -133,6 +133,38 @@ fn insert_default_append_and_length() {
     assert_eq!(out[0].to_vec_i64(), vec![3]);
 }
 
+/// Exercise the required multi-op path in one graph, including negative
+/// insertion and indexing plus scalar int64 length output.
+#[test]
+fn construct_insert_at_and_length_execute_together() {
+    let mut g = Graph::new();
+    let a = f32_init(&mut g, "a", &[1], &[1.]);
+    let b = f32_init(&mut g, "b", &[1], &[2.]);
+    let inserted = f32_init(&mut g, "inserted", &[1], &[99.]);
+    let seq = op(&mut g, "SequenceConstruct", &[a, b], DataType::Float32, &[], &[]);
+    let insert_pos = i64_init(&mut g, "insert_pos", &[], &[-1]);
+    let seq2 = op(
+        &mut g,
+        "SequenceInsert",
+        &[seq, inserted, insert_pos],
+        DataType::Float32,
+        &[],
+        &[],
+    );
+    let at_pos = i64_init(&mut g, "at_pos", &[], &[-2]);
+    let at = op(&mut g, "SequenceAt", &[seq2, at_pos], DataType::Float32, &[1], &[]);
+    let len = op(&mut g, "SequenceLength", &[seq2], DataType::Int64, &[], &[]);
+    g.add_output(at);
+    g.add_output(len);
+
+    let mut s = InferenceSession::from_graph(g).expect("build");
+    let out = s.run(&[]).expect("run");
+    assert_eq!(out[0].to_vec_f32(), vec![99.]);
+    assert_eq!(out[1].dtype, DataType::Int64);
+    assert!(out[1].shape.is_empty());
+    assert_eq!(out[1].to_vec_i64(), vec![3]);
+}
+
 /// Erase an element (default last), then length drops by one.
 #[test]
 fn erase_then_length() {
@@ -273,8 +305,8 @@ fn split_one_element_1d_sizes_must_sum_to_axis() {
     let mut s = InferenceSession::from_graph(g).expect("build");
     let err = s.run(&[]).unwrap_err();
     let msg = err.to_string();
-    assert!(msg.contains("sum to 2 but axis 0 has extent 4"), "msg: {msg}");
-    assert!(msg.contains("To fix"), "msg: {msg}");
+    assert!(msg.contains("sizes sum to 2"), "msg: {msg}");
+    assert!(msg.contains("axis 0 has extent 4"), "msg: {msg}");
 }
 
 /// A one-element rank-1 split vector is valid when its size is the full axis.
@@ -408,6 +440,52 @@ fn at_out_of_bounds_errors_actionably() {
     let msg = err.to_string();
     assert!(msg.contains("out of bounds"), "msg: {msg}");
     assert!(msg.contains("valid range"), "msg: {msg}");
+}
+
+#[test]
+fn at_empty_sequence_errors_cleanly() {
+    let mut g = Graph::new();
+    let seq = op(
+        &mut g,
+        "SequenceEmpty",
+        &[],
+        DataType::Float32,
+        &[],
+        &[("dtype", Attribute::Int(1))],
+    );
+    let idx = i64_init(&mut g, "idx", &[], &[0]);
+    let at = op(&mut g, "SequenceAt", &[seq, idx], DataType::Float32, &[1], &[]);
+    g.add_output(at);
+
+    let mut s = InferenceSession::from_graph(g).expect("build");
+    let err = s.run(&[]).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("out of bounds"), "msg: {msg}");
+    assert!(msg.contains("length 0"), "msg: {msg}");
+}
+
+#[test]
+fn construct_non_homogeneous_dtypes_errors_cleanly() {
+    let mut g = Graph::new();
+    let floats = f32_init(&mut g, "floats", &[1], &[1.]);
+    let integers = i64_init(&mut g, "integers", &[1], &[2]);
+    let seq = op(
+        &mut g,
+        "SequenceConstruct",
+        &[floats, integers],
+        DataType::Float32,
+        &[],
+        &[],
+    );
+    let len = op(&mut g, "SequenceLength", &[seq], DataType::Int64, &[], &[]);
+    g.add_output(len);
+
+    let mut s = InferenceSession::from_graph(g).expect("build");
+    let err = s.run(&[]).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("SequenceConstruct"), "msg: {msg}");
+    assert!(msg.contains("homogeneous"), "msg: {msg}");
+    assert!(msg.contains("does not match"), "msg: {msg}");
 }
 
 /// A raw Sequence graph output is rejected with an actionable message.
