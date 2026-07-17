@@ -1848,6 +1848,162 @@ fn group_query_attention_packed_qkv_splits_output_and_cache_shapes() {
 }
 
 #[test]
+fn moe_and_qmoe_preserve_activation_shape() {
+    for op in ["MoE", "QMoE"] {
+        let n = with_domain(node(op, 7, 1), "com.microsoft");
+        let inputs = vec![
+            f32in(vec![sym(0), c(4), c(512)]),
+            f32in(vec![c(4), c(8)]),
+            tin(DataType::Uint8, vec![c(8), c(1024), c(256)]),
+            f32in(vec![c(8), c(1024), c(16)]),
+            NodeIo::default(),
+            tin(DataType::Uint8, vec![c(8), c(512), c(512)]),
+            f32in(vec![c(8), c(512), c(32)]),
+        ];
+        let outs = run(&n, inputs, 1);
+        assert_eq!(out_shape(&outs), vec![sym(0), c(4), c(512)]);
+        assert_eq!(out_dtype(&outs), DataType::Float32);
+    }
+}
+
+#[test]
+fn gather_block_quantized_expands_packed_dimension() {
+    let n = with_attr(
+        with_attr(
+            with_attr(
+                with_domain(node("GatherBlockQuantized", 3, 1), "com.microsoft"),
+                "gather_axis",
+                Attribute::Int(0),
+            ),
+            "quantize_axis",
+            Attribute::Int(1),
+        ),
+        "bits",
+        Attribute::Int(4),
+    );
+    let outs = run(
+        &n,
+        vec![
+            tin(DataType::Uint8, vec![c(32000), c(256)]),
+            tin(DataType::Int64, vec![sym(0), c(7)]),
+            tin(DataType::Float16, vec![c(32000), c(16)]),
+        ],
+        1,
+    );
+    assert_eq!(out_shape(&outs), vec![sym(0), c(7), c(512)]);
+    assert_eq!(out_dtype(&outs), DataType::Float16);
+}
+
+#[test]
+fn sparse_kv_gather_emits_selected_kv_shape() {
+    let n = with_domain(node("SparseKvGather", 2, 1), "pkg.nxrt");
+    let outs = run(
+        &n,
+        vec![
+            f32in(vec![sym(0), c(2), c(64), c(128)]),
+            tin(DataType::Int32, vec![sym(0), c(2), c(3), c(16)]),
+        ],
+        1,
+    );
+    assert_eq!(out_shape(&outs), vec![sym(0), c(2), c(3), c(16), c(128)]);
+    assert_eq!(out_dtype(&outs), DataType::Float32);
+}
+
+fn csa_ratio4_node(domain: &str) -> Node {
+    let mut n = with_domain(node("CompressedSparseAttention", 19, 6), domain);
+    for (name, value) in [
+        ("num_heads", 8),
+        ("head_dim", 512),
+        ("qk_rope_head_dim", 64),
+        ("compression_ratio", 4),
+        ("index_num_heads", 2),
+        ("index_head_dim", 128),
+        ("index_topk", 512),
+    ] {
+        n.attributes.insert(name.into(), Attribute::Int(value));
+    }
+    n.attributes.insert(
+        "cache_format".into(),
+        Attribute::String("fp8_e4m3_block64".into()),
+    );
+    n
+}
+
+#[test]
+fn compressed_sparse_attention_emits_all_ratio4_state_shapes() {
+    for domain in ["pkg.nxrt", "com.microsoft"] {
+        let mut inputs = vec![NodeIo::default(); 19];
+        inputs[0] = f32in(vec![sym(0), c(5), c(8), c(512)]);
+        inputs[9] = sd_int_scalar(DataType::Int64, c(12));
+        let outs = run(&csa_ratio4_node(domain), inputs, 1);
+        let expected = [
+            (DataType::Float32, vec![sym(0), c(5), c(8), c(512)]),
+            (DataType::Uint8, vec![sym(0), c(3), c(583)]),
+            (DataType::Float32, vec![sym(0), c(8), c(2), c(1024)]),
+            (DataType::Uint8, vec![sym(0), c(3), c(68)]),
+            (DataType::Float32, vec![sym(0), c(8), c(2), c(256)]),
+            (DataType::Int32, vec![sym(0), c(2), c(5), c(3)]),
+        ];
+        for (output, (dtype, shape)) in outs.iter().zip(expected.iter()) {
+            let info = output.type_info.as_ref().expect("CSA output resolved");
+            assert_eq!(info.dtype, *dtype);
+            assert_eq!(info.shape, *shape);
+        }
+    }
+}
+
+#[test]
+fn compressed_sparse_attention_dynamic_total_resolves_every_output() {
+    let mut inputs = vec![NodeIo::default(); 19];
+    inputs[0] = f32in(vec![c(2), sym(0), c(8), c(512)]);
+    inputs[9] = tin(DataType::Int64, vec![]);
+    let outs = run(&csa_ratio4_node("pkg.nxrt"), inputs, 1);
+    assert!(outs.iter().all(|output| output.type_info.is_some()));
+    let cache_records = outs[1].type_info.as_ref().unwrap().shape[1].clone();
+    let index_records = outs[3].type_info.as_ref().unwrap().shape[1].clone();
+    assert!(cache_records.as_symbol().is_some());
+    assert_eq!(cache_records, index_records);
+    assert!(
+        outs[5].type_info.as_ref().unwrap().shape[3]
+            .as_symbol()
+            .is_some()
+    );
+}
+
+#[test]
+fn compressed_sparse_attention_ratio128_emits_three_outputs() {
+    let mut n = with_domain(node("CompressedSparseAttention", 11, 3), "pkg.nxrt");
+    for (name, value) in [
+        ("num_heads", 8),
+        ("head_dim", 512),
+        ("qk_rope_head_dim", 64),
+        ("compression_ratio", 128),
+    ] {
+        n.attributes.insert(name.into(), Attribute::Int(value));
+    }
+    n.attributes.insert(
+        "cache_format".into(),
+        Attribute::String("fp8_e4m3_block64".into()),
+    );
+    let mut inputs = vec![NodeIo::default(); 11];
+    inputs[0] = f32in(vec![c(2), c(1), c(8), c(512)]);
+    inputs[9] = sd_int_scalar(DataType::Int64, c(256));
+    let outs = run(&n, inputs, 1);
+    assert_eq!(
+        outs[0].type_info.as_ref().unwrap().shape,
+        vec![c(2), c(1), c(8), c(512)]
+    );
+    assert_eq!(
+        outs[1].type_info.as_ref().unwrap().shape,
+        vec![c(2), c(2), c(583)]
+    );
+    assert_eq!(
+        outs[2].type_info.as_ref().unwrap().shape,
+        vec![c(2), c(128), c(2), c(512)]
+    );
+}
+
+#[test]
 fn standard_simplified_layer_norm_passthrough() {
     let n = node("SimplifiedLayerNormalization", 2, 1);
     let outs = run(

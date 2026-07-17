@@ -8,6 +8,7 @@
 
 use crate::registry::InferenceRegistry;
 
+mod custom_ops;
 mod data_ops;
 mod elementwise;
 mod linalg;
@@ -43,6 +44,7 @@ pub(crate) fn checked_axis(axis: i64, rank: usize) -> Option<usize> {
 
 /// Populate `registry` with every built-in rule.
 pub fn register_all(registry: &mut InferenceRegistry) {
+    custom_ops::register(registry);
     elementwise::register(registry);
     linalg::register(registry);
     norm::register(registry);
