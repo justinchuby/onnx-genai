@@ -202,6 +202,7 @@ pub fn register(reg: &mut InferenceRegistry) {
     for op in ["Add", "Sub", "Mul", "Div", "Pow"] {
         reg.register("", op, 1, binary);
     }
+    reg.register("", "Mod", 10, binary);
     for op in ["Less", "Greater", "Equal", "And", "Or", "Xor"] {
         reg.register("", op, 1, boolean_binary);
     }

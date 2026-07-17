@@ -166,6 +166,21 @@ fn matmul_contraction_mismatch_errors() {
     assert!(res.is_err());
 }
 
+#[test]
+fn mod_broadcasts_and_preserves_dtype() {
+    let n = node("Mod", 2, 1);
+    let outs = run(
+        &n,
+        vec![
+            tin(DataType::Int64, vec![c(3), c(1)]),
+            tin(DataType::Int64, vec![c(1), c(4)]),
+        ],
+        10,
+    );
+    assert_eq!(out_shape(&outs), vec![c(3), c(4)]);
+    assert_eq!(out_dtype(&outs), DataType::Int64);
+}
+
 // --- Quantized matmul ------------------------------------------------------
 
 fn quantized_matmul_node(op: &str, domain: &str, n_in: usize, n: i64) -> Node {

@@ -3,7 +3,7 @@
 //! Two tight families share this module because they share the same dense-f32
 //! read/write plumbing:
 //!
-//! * **Binary broadcasting** — `Sub`, `Mul`, `Div`, `Pow`, and the variadic
+//! * **Binary broadcasting** — `Sub`, `Mul`, `Div`, `Mod`, `Pow`, and the variadic
 //!   `Min`. Each reuses [`broadcast_apply`](super::add::broadcast_apply) (the
 //!   numpy right-alignment / size-1 broadcast machinery Add already defines) so
 //!   broadcasting semantics stay identical across every binary op.
@@ -14,8 +14,8 @@
 //! keeping the crate FFI-free (libm is pure Rust, no `cc`) while matching the
 //! ONNX reference to < 1 ulp near zero.
 
-use onnx_runtime_ep_api::{Kernel, KernelFactory, Result, TensorMut, TensorView};
-use onnx_runtime_ir::{DataType, Node};
+use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
+use onnx_runtime_ir::{Attribute, DataType, Node};
 
 use super::add::{broadcast_apply, require_same_dtype};
 use super::check_arity;
@@ -98,6 +98,139 @@ binary_factory!(MinFactory, BinOp::Min);
 binary_factory!(MaxFactory, BinOp::Max);
 binary_factory!(SumFactory, BinOp::Sum);
 binary_factory!(MeanFactory, BinOp::Mean);
+
+/// Factory for ONNX `Mod`, carrying its `fmod` semantic selector.
+pub struct ModFactory;
+
+impl KernelFactory for ModFactory {
+    fn create(&self, node: &Node, _shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
+        let fmod = match node.attr("fmod") {
+            None | Some(Attribute::Int(0)) => false,
+            Some(Attribute::Int(1)) => true,
+            Some(Attribute::Int(value)) => {
+                return Err(EpError::KernelFailed(format!(
+                    "Mod: `fmod` must be 0 or 1, got {value}"
+                )));
+            }
+            Some(_) => {
+                return Err(EpError::KernelFailed(
+                    "Mod: `fmod` must be an integer attribute".into(),
+                ));
+            }
+        };
+        Ok(Box::new(ModKernel { fmod }))
+    }
+}
+
+/// ONNX `Mod`: integer floor-mod when `fmod=0`, C-style remainder when `fmod=1`.
+pub struct ModKernel {
+    fmod: bool,
+}
+
+impl Kernel for ModKernel {
+    fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+        check_arity("Mod", inputs, outputs, 2, 2, 1)?;
+        if self.fmod {
+            dispatch_arith!(inputs[0].dtype, "Mod", T => {
+                mod_typed::<T>(true, inputs, outputs)
+            })
+        } else {
+            match inputs[0].dtype {
+                DataType::Int8 => mod_typed::<i8>(false, inputs, outputs),
+                DataType::Int16 => mod_typed::<i16>(false, inputs, outputs),
+                DataType::Int32 => mod_typed::<i32>(false, inputs, outputs),
+                DataType::Int64 => mod_typed::<i64>(false, inputs, outputs),
+                DataType::Uint8 => mod_typed::<u8>(false, inputs, outputs),
+                DataType::Uint16 => mod_typed::<u16>(false, inputs, outputs),
+                DataType::Uint32 => mod_typed::<u32>(false, inputs, outputs),
+                DataType::Uint64 => mod_typed::<u64>(false, inputs, outputs),
+                dtype => Err(EpError::KernelFailed(format!(
+                    "Mod: fmod=0 requires an integer dtype, got {dtype:?}; \
+                     floating-point Mod requires fmod=1"
+                ))),
+            }
+        }
+    }
+
+    fn supports_strided_input(&self, _input_idx: usize) -> bool {
+        true
+    }
+}
+
+trait ModDomain: ComputeDomain {
+    fn c_mod(self, divisor: Self, fmod: bool) -> Self;
+}
+
+macro_rules! impl_float_mod {
+    ($($t:ty),*) => {$(
+        impl ModDomain for $t {
+            #[inline]
+            fn c_mod(self, divisor: Self, _fmod: bool) -> Self {
+                self % divisor
+            }
+        }
+    )*};
+}
+
+macro_rules! impl_signed_mod {
+    ($($t:ty),*) => {$(
+        impl ModDomain for $t {
+            #[inline]
+            fn c_mod(self, divisor: Self, fmod: bool) -> Self {
+                if divisor == 0 {
+                    return 0;
+                }
+                let remainder = self.wrapping_rem(divisor);
+                if !fmod
+                    && remainder != 0
+                    && (remainder < 0) != (divisor < 0)
+                {
+                    remainder.wrapping_add(divisor)
+                } else {
+                    remainder
+                }
+            }
+        }
+    )*};
+}
+
+macro_rules! impl_unsigned_mod {
+    ($($t:ty),*) => {$(
+        impl ModDomain for $t {
+            #[inline]
+            fn c_mod(self, divisor: Self, _fmod: bool) -> Self {
+                if divisor == 0 { 0 } else { self % divisor }
+            }
+        }
+    )*};
+}
+
+impl_float_mod!(f32, f64);
+impl_signed_mod!(i8, i16, i32, i64);
+impl_unsigned_mod!(u8, u16, u32, u64);
+
+fn mod_typed<T: NumericElem>(
+    fmod: bool,
+    inputs: &[TensorView],
+    outputs: &mut [TensorMut],
+) -> Result<()>
+where
+    T::Acc: ModDomain,
+{
+    require_same_dtype("Mod", &inputs[1], T::DTYPE)?;
+    let lhs = to_dense::<T>(&inputs[0])?;
+    let rhs = to_dense::<T>(&inputs[1])?;
+    let out_shape = outputs[0].shape.to_vec();
+    let mut acc = vec![T::Acc::default(); numel(&out_shape)];
+    broadcast_apply(&lhs, inputs[0].shape, &out_shape, |i, value| {
+        acc[i] = value.to_acc()
+    })?;
+    broadcast_apply(&rhs, inputs[1].shape, &out_shape, |i, divisor| {
+        acc[i] = acc[i].c_mod(divisor.to_acc(), fmod)
+    })?;
+    let out = acc.into_iter().map(T::from_acc).collect::<Vec<_>>();
+    write_dense::<T>(&mut outputs[0], &out)
+}
 
 impl Kernel for BinaryKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
@@ -358,6 +491,69 @@ mod tests {
         let r = out.to_f32();
         assert!(r[0].is_infinite() && r[0] > 0.0);
         assert!(r[1].is_nan());
+    }
+
+    #[test]
+    fn mod_integer_floor_semantics_follow_divisor_sign_i32() {
+        let a = Owned::i32(&[4], &[-5, 5, -5, 5]);
+        let b = Owned::i32(&[4], &[3, 3, -3, -3]);
+        let mut out = Owned::zeros(DataType::Int32, &[4]);
+        ModKernel { fmod: false }
+            .execute(&[a.view(), b.view()], &mut [out.view_mut()])
+            .unwrap();
+        assert_eq!(out.to_i32(), vec![1, 2, -2, -1]);
+    }
+
+    #[test]
+    fn mod_integer_floor_semantics_broadcast_i64() {
+        let a = Owned::i64(&[3, 1], &[5, -5, 8]);
+        let b = Owned::i64(&[1, 4], &[3, -3, 4, -4]);
+        let mut out = Owned::zeros(DataType::Int64, &[3, 4]);
+        ModKernel { fmod: false }
+            .execute(&[a.view(), b.view()], &mut [out.view_mut()])
+            .unwrap();
+        assert_eq!(out.to_i64(), vec![2, -1, 1, -3, 1, -2, 3, -1, 2, -1, 0, 0]);
+    }
+
+    #[test]
+    fn mod_fmod_float_follows_dividend_sign() {
+        let a = Owned::f32(&[4], &[-5.5, 5.5, -5.5, 5.5]);
+        let b = Owned::f32(&[4], &[3.0, 3.0, -3.0, -3.0]);
+        let mut out = Owned::zeros_f32(&[4]);
+        let mut node = Node::new(onnx_runtime_ir::NodeId(0), "Mod", vec![], vec![]);
+        node.attributes.insert("fmod".into(), Attribute::Int(1));
+        ModFactory
+            .create(&node, &[])
+            .unwrap()
+            .execute(&[a.view(), b.view()], &mut [out.view_mut()])
+            .unwrap();
+        assert_eq!(out.to_f32(), vec![-2.5, 2.5, -2.5, 2.5]);
+    }
+
+    #[test]
+    fn mod_integer_zero_divisor_matches_div_convention() {
+        let a = Owned::i32(&[2], &[5, -5]);
+        let b = Owned::i32(&[2], &[0, 0]);
+        let mut out = Owned::zeros(DataType::Int32, &[2]);
+        ModKernel { fmod: false }
+            .execute(&[a.view(), b.view()], &mut [out.view_mut()])
+            .unwrap();
+        assert_eq!(out.to_i32(), vec![0, 0]);
+    }
+
+    #[test]
+    fn mod_default_mode_rejects_float() {
+        let a = Owned::f32(&[1], &[5.5]);
+        let b = Owned::f32(&[1], &[3.0]);
+        let mut out = Owned::zeros_f32(&[1]);
+        let error = ModKernel { fmod: false }
+            .execute(&[a.view(), b.view()], &mut [out.view_mut()])
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("fmod=0 requires an integer dtype")
+        );
     }
 
     #[test]

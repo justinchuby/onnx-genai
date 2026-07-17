@@ -91,6 +91,7 @@ pub const PHASE1_OPS: &[&str] = &[
     "Sub",
     "Mul",
     "Div",
+    "Mod",
     "Pow",
     "Min",
     "Max",
@@ -367,6 +368,7 @@ pub fn build_cpu_registry() -> OpRegistry {
     reg.register(OpKey::new("Sub", "", 1), Box::new(elementwise::SubFactory));
     reg.register(OpKey::new("Mul", "", 1), Box::new(elementwise::MulFactory));
     reg.register(OpKey::new("Div", "", 1), Box::new(elementwise::DivFactory));
+    reg.register(OpKey::new("Mod", "", 10), Box::new(elementwise::ModFactory));
     reg.register(OpKey::new("Pow", "", 1), Box::new(elementwise::PowFactory));
     reg.register(OpKey::new("Min", "", 1), Box::new(elementwise::MinFactory));
     reg.register(OpKey::new("Max", "", 1), Box::new(elementwise::MaxFactory));
