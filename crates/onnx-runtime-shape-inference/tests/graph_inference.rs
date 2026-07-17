@@ -19,6 +19,185 @@ fn node(id: u32, op: &str, inputs: Vec<Option<ValueId>>, outputs: Vec<ValueId>) 
     Node::new(NodeId(id), op, inputs, outputs)
 }
 
+fn if_graph(then_branch: Graph, else_branch: Graph) -> (Graph, ValueId) {
+    let mut graph = Graph::new();
+    let condition = graph.create_named_value("condition", DataType::Bool, Shape::new());
+    graph.add_input(condition);
+    let output = graph.create_named_value("output", DataType::Float32, Shape::new());
+    let if_node = graph.insert_node(node(0, "If", vec![Some(condition)], vec![output]));
+    graph
+        .subgraphs
+        .insert((if_node, "then_branch".into()), then_branch);
+    graph
+        .subgraphs
+        .insert((if_node, "else_branch".into()), else_branch);
+    graph.add_output(output);
+    graph.opset_imports.insert(String::new(), 21);
+    (graph, output)
+}
+
+fn captured_identity_branch(name: &str) -> Graph {
+    let mut branch = Graph::new();
+    let capture = branch.create_named_value(name, DataType::Float32, Shape::new());
+    branch.mark_value_type_unknown(capture);
+    branch.mark_value_shape_unknown(capture);
+    let output = branch.create_named_value("branch_output", DataType::Float32, Shape::new());
+    branch.insert_node(node(0, "Identity", vec![Some(capture)], vec![output]));
+    branch.add_output(output);
+    branch
+}
+
+fn identity_branch(shape: Shape) -> Graph {
+    let mut branch = Graph::new();
+    let input = branch.create_named_value("local", DataType::Float32, shape);
+    branch.add_input(input);
+    let output = branch.create_named_value("branch_output", DataType::Float32, Shape::new());
+    branch.insert_node(node(0, "Identity", vec![Some(input)], vec![output]));
+    branch.add_output(output);
+    branch
+}
+
+fn nonzero_branch() -> Graph {
+    let mut branch = Graph::new();
+    let input = branch.create_named_value("local", DataType::Float32, vec![Dim::Static(2)]);
+    branch.set_initializer(
+        input,
+        WeightRef::Inline(TensorData::from_raw(
+            DataType::Float32,
+            vec![2],
+            vec![0; 8],
+        )),
+    );
+    let output = branch.create_named_value("branch_output", DataType::Int64, Shape::new());
+    branch.insert_node(node(0, "NonZero", vec![Some(input)], vec![output]));
+    branch.add_output(output);
+    branch
+}
+
+#[test]
+fn if_branch_inference_binds_lexically_captured_outer_value() {
+    let (mut graph, output) = if_graph(
+        captured_identity_branch("captured"),
+        captured_identity_branch("captured"),
+    );
+    let captured = graph.create_named_value(
+        "captured",
+        DataType::Float16,
+        vec![Dim::Static(2), Dim::Static(3)],
+    );
+    graph.add_input(captured);
+
+    let registry = InferenceRegistry::default_registry();
+    let opsets = graph.opset_imports.clone();
+    registry
+        .infer_graph(&mut graph, &opsets, MergePolicy::Permissive)
+        .expect("infer If with lexical capture");
+
+    assert_eq!(graph.value(output).dtype, DataType::Float16);
+    assert_eq!(
+        graph.value(output).shape,
+        vec![Dim::Static(2), Dim::Static(3)]
+    );
+}
+
+#[test]
+fn if_branch_local_symbols_merge_to_fresh_parent_symbol() {
+    let (mut graph, output) = if_graph(nonzero_branch(), nonzero_branch());
+
+    let registry = InferenceRegistry::default_registry();
+    let opsets = graph.opset_imports.clone();
+    let report = registry
+        .infer_graph(&mut graph, &opsets, MergePolicy::Permissive)
+        .expect("infer If with independent branch symbols");
+
+    let [Dim::Static(1), Dim::Symbolic(merged)] = graph.value(output).shape.as_slice() else {
+        panic!("expected [1, fresh_symbol] output shape");
+    };
+    let if_node = graph.node(NodeId(0));
+    let then_branch = &graph.subgraphs[&(if_node.id, "then_branch".into())];
+    let else_branch = &graph.subgraphs[&(if_node.id, "else_branch".into())];
+    let Dim::Symbolic(then_symbol) = then_branch.value(then_branch.outputs[0]).shape[1] else {
+        panic!("expected then-branch local symbol");
+    };
+    let Dim::Symbolic(else_symbol) = else_branch.value(else_branch.outputs[0]).shape[1] else {
+        panic!("expected else-branch local symbol");
+    };
+    assert_eq!(
+        then_symbol, else_symbol,
+        "the regression requires colliding numeric branch-local ids"
+    );
+    assert_eq!(
+        report.fresh_symbols, 1,
+        "the parent merge must mint its own symbol"
+    );
+    assert!(
+        graph.symbol_constraints.contains_key(merged),
+        "merged symbol must belong to the parent graph"
+    );
+}
+
+#[test]
+fn if_captured_symbol_maps_back_to_parent_namespace() {
+    let (mut graph, output) = if_graph(
+        captured_identity_branch("captured"),
+        captured_identity_branch("captured"),
+    );
+    let batch = graph.intern_symbol("batch");
+    let captured = graph.create_named_value(
+        "captured",
+        DataType::Float32,
+        vec![Dim::Symbolic(batch), Dim::Static(3)],
+    );
+    graph.add_input(captured);
+
+    let registry = InferenceRegistry::default_registry();
+    let opsets = graph.opset_imports.clone();
+    registry
+        .infer_graph(&mut graph, &opsets, MergePolicy::Permissive)
+        .expect("infer If with captured parent symbol");
+
+    assert_eq!(
+        graph.value(output).shape,
+        vec![Dim::Symbolic(batch), Dim::Static(3)]
+    );
+}
+
+#[test]
+fn if_equal_concrete_branch_dims_stay_concrete() {
+    let (mut graph, output) = if_graph(
+        identity_branch(vec![Dim::Static(7)]),
+        identity_branch(vec![Dim::Static(7)]),
+    );
+
+    let registry = InferenceRegistry::default_registry();
+    let opsets = graph.opset_imports.clone();
+    registry
+        .infer_graph(&mut graph, &opsets, MergePolicy::Permissive)
+        .expect("infer If with equal concrete dimensions");
+
+    assert_eq!(graph.value(output).shape, vec![Dim::Static(7)]);
+}
+
+#[test]
+fn if_branch_rank_mismatch_is_an_error() {
+    let (mut graph, _) = if_graph(
+        identity_branch(vec![Dim::Static(2)]),
+        identity_branch(vec![Dim::Static(2), Dim::Static(3)]),
+    );
+
+    let registry = InferenceRegistry::default_registry();
+    let opsets = graph.opset_imports.clone();
+    let error = registry
+        .infer_graph(&mut graph, &opsets, MergePolicy::Permissive)
+        .expect_err("branch rank mismatch must fail");
+
+    assert!(matches!(
+        error,
+        onnx_runtime_shape_inference::ShapeInferError::Invalid { op, detail }
+            if op == "If" && detail.contains("branch output ranks differ")
+    ));
+}
+
 /// Build a small graph exercising symbolic-batch propagation through
 /// MatMul → Add → Reshape, and assert the named batch dim `N` survives.
 #[test]
