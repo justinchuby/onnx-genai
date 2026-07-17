@@ -1597,3 +1597,104 @@ The shell validation script and serialized ONNX fixture were additional tracked 
 **What:** 🟢 Approved `98ee7a6`. The five handlers use correct schema-version registrations, shape/dtype contracts, symbolic degradation, known-divisibility validation, and checked `blocksize² * C` arithmetic.
 **Why:** Coverage includes OneHot axes/dynamic depth, Compress axis/no-axis, Trilu variants, spatial modes and schema versions, symbolic dimensions, divisibility failures, and blocksize-square overflow. `cargo test -p onnx-runtime-shape-inference` passed all 140 tests.
 
+
+
+## 2026-07-17 — Owner-reviewed scale-model design decisions
+
+#### Source: `coordinator-projection-fusion-md-approved-all-10-open-question.md`
+
+### 2026-07-17T05-28-52: PROJECTION_FUSION.md approved — all 10 open questions resolved
+**By:** coordinator
+**What:** PROJECTION_FUSION.md approved — all 10 open questions resolved
+**Why:** ### PROJECTION_FUSION.md — 10 open-question resolutions (approved by @justinchuby)
+
+**Q1 (memory budget):** Physical concat of sibling projection weights (accept ~125 MiB), gated by an owned-bytes release check; if gain <3% or over budget, switch to grouped separate-buffer variant.
+**Q2 (Split encoding):** Always materialize an explicit int64 split initializer (no implicit/equal-split assumption).
+**Q3 (rollout):** Guard behind ONNX_GENAI_PROJECTION_FUSION=1; default-on only after Qwen validation.
+**Q4 (prefill/TTFT):** ≤2% TTFT-regression release gate + prefer packed-GQA bypass to minimize prefill materialization. Multi-turn exposure is bounded because prefix caching (PrefixCache in onnx-genai-kv, wired in engine.rs, tracks prefix_cache_hit_len) already limits per-turn prefill to newly-added tokens.
+**Q5 (packed GQA scope):** First version does gate/up only (benchmark Qwen QKV is already packed). Separate-QKV → packed-GQA rewiring is Phase 2.
+**Q6 (bias):** Defer post-MatMul bias Add fusion; Phase A tests the no-bias gate/up path first (benchmark Qwen has no bias). Bias fusion moves to Phase D generalization.
+**Q7 (explicit zero-point):** Correct handling of explicit-zp (asymmetric) MatMulNBits is a HARD rollout gate. Until supported, fusion MUST safely skip explicit-zp nodes — never miscompute.
+**Q8 (code placement):** Build a thin shared `optimizers` module (pass trait + registry + env-flag toggle + ordering) and have EACH EP register its OWN fusion pass set (EP-scoped, per @justinchuby's point that fusion differs per EP, matching ORT's EP-scoped transformer model). Projection fusion lands first as a CPU EP optimizer; CUDA/Metal add their own later.
+**Q9 (profiler naming):** Single `fused_projection` profiling category for attribution; retain per-segment sub-labels in debug builds for interpretability.
+**Q10 (fallback threshold):** If physical-concat yields <3% decode gain OR exceeds the memory budget, fall back to the grouped separate-buffer variant.
+
+Status: doc to be marked Approved; resolutions appended to §17.
+
+#### Source: `coordinator-deepseek-csa-mtp-runtime-md-9-decisions-confirmed-.md`
+
+### 2026-07-17T05-16-20: DEEPSEEK_CSA_MTP_RUNTIME.md — §9 decisions confirmed + 14 open questions resolved
+**By:** coordinator
+**What:** DEEPSEEK_CSA_MTP_RUNTIME.md — §9 decisions confirmed + 14 open questions resolved
+**Why:** Owner @justinchuby reviewed docs/DEEPSEEK_CSA_MTP_RUNTIME.md. Confirmed the §9 proposed decisions (CSA-1..7, MTP-1..6, GPU-1) EXCEPT the CSA-7 fallback default is flipped (see Q11). Resolved all 14 §10 open questions.
+
+SOURCE OF TRUTH (Q1, and method for Q2-Q7): numerical truth = official HF deepseek-ai/DeepSeek-V4-Flash reference (inference/model.py + inference/kernel.py); run it to dump golden intermediate tensors, freeze as layout-v1 goldens in Phase 0. NeMo (Megatron-Bridge/AutoModel) + arXiv 2606.19348 for cross-check. llama.cpp is NOT faithful (Flash-Attn disabled, DSV4 graph WIP) — do not use for goldens. mobius is our exporter, not ground truth.
+
+Q2 (ratio-128 HCA semantics): pin from llama... no — pin from official reference behavior; do not presuppose "attend all" vs "extra selection"; golden-driven.
+Q3-Q7 (cache layout CW/ICW/carry; ratio-4 top-k tie order + duplicate policy + causal boundary masking; compressed RoPE rotated values + retained state; MTP official recurrent state = post-layer pre-_hc_head HC state?; sidecar KV lifetime): ALL pinned from official reference goldens; never inferred from mobius tensor names or by broadcasting mtp_hidden.
+
+Q8 (MTP weight sharing): support BOTH — metadata prefers named model-package components, falls back to target initializer names; tied/quantized embeddings referenced zero-copy (no raw f32 duplication).
+
+Q9 (verification width): contract requires 1+k tokens verified in one forward; static/native runners MAY degrade to a sequence of single-token steps but MUST produce bit-identical acceptance (greedy token identity) — enforce with an equivalence test gate.
+
+Q10 (batching): v1 requires equal-length compression/index cursors within a batch (regular cache layout, simple CUDA kernel). Ragged (per-row cursor length) is an IMMEDIATE fast-follow (owner: "以后 = 明天大概, 验证了的话"), modeled on vLLM PagedAttention per-row block-table indirection + DeepSeek-V4 per-row (offset,length) ragged gather. SparseKvGather + per-forward cursor journals + metadata state-groups already accommodate adding per-row cursor lengths — ragged is an extension, not a rewrite.
+
+Q11 (fallback policy): FLIP of CSA-7 default — package defaults to native_csa_required and REJECTS dense fallback (safest; no silent degradation of the long-context memory advantage). Portability cost accepted.
+
+Q12 (shared GLM primitive boundary): SparseKvGather is the shared correctness/reuse primitive; DeepSeek CompressedSparseAttention and GLM IndexShare DSA each get their OWN fused production op (selection semantics differ and must not be coupled).
+
+Q13 (upstream path): incubate in the private pkg.nxrt domain (like BlockQuantizedMatMul); push an ORT contrib proposal only after BOTH DeepSeek and GLM contracts stabilize and v1 layout + goldens are frozen. Optional non-urgent tracking issue.
+
+Q14 (acceptance tolerance): greedy final tokens MUST be bit-identical (integer argmax exact = hard correctness gate); intermediate compressor/index/attention tensors allow small f16/bf16 atol/rtol deviations, with concrete thresholds CALIBRATED from the official goldens (measure real error distribution, don't guess) and set per-layer for localizability.
+
+Status: design approved to begin Phase 0 (freeze contracts + goldens from the official DeepSeek reference) pending owner's explicit greenlight; no CSA/MTP kernel implementation before goldens are frozen.
+
+#### Source: `coordinator-heterogeneous-placement-md-direction-change-6-ques.md`
+
+### 2026-07-17T04-50-59: HETEROGENEOUS_PLACEMENT.md — direction change + 6 questions resolved
+**By:** coordinator
+**What:** HETEROGENEOUS_PLACEMENT.md — direction change + 6 questions resolved
+**Why:** Owner @justinchuby reviewed docs/HETEROGENEOUS_PLACEMENT.md. Major direction change on Q1 plus resolutions for all 6 open questions.
+
+DIRECTION CHANGE (Q1): The doc's core premise — route M>1 quantized prefill to CPU — is REJECTED as unusable for GLM-5.2/DeepSeek-scale models ("prefill 必须留 CUDA"). Root cause is a kernel gap: CUDA BlockQuantizedMatMul is GEMV-only (M=1). Decision: FIRST build a CUDA BlockQuantizedMatMul M>1 GEMM prefill kernel (done: commit a99f7a8, pending review), so prefill stays batched on CUDA. Heterogeneous placement is put ON HOLD and, when resumed, shrinks to a narrow safety net: CPU fallback ONLY for ops with genuinely no CUDA kernel — never the hot quantized matmul. `DevicePreference::Gpu` = CUDA-preferred; keep a strict CUDA-only mode available for benchmarking/coverage-proof.
+
+Q2 (placement cache granularity): cache by bounded shape CLASS (M=1 vs M>1), not exact shape. Only one placement axis exists today (decode vs prefill); class keying keeps the cache small and high-hit. Two-level exact-key refinement deferred as unneeded.
+
+Q3 (KV at heterogeneous boundary, Phase 1): whole-KV transfer only, and only when a real cross-device boundary exists. Since attention stays on CUDA for both prefill and decode, KV naturally stays on device; range-based KV copies deferred to Phase 2.
+
+Q4 (shared partition-boundary extraction location): extract into a shared, non-serialization utility in the LOADER, reusing the EPContext writer's boundary machinery. Single source of truth; writer stays an encoder, not an execution planner.
+
+Q5 (cost selection): strongly prefer FEWER cross-device transfers (keep runs on one device) by default; only split a run onto CUDA when measured net gain justifies it. Cross-device round-trips usually eat kernel wins on the decode hot path. Full cost-model-driven adaptive placement deferred to Phase 4.
+
+Q6 (release-blocking observability): gate releases on (1) per-node BlockQuantizedMatMul CUDA-decode (M=1) dispatch counts > 0 and == layer count, (2) fallback-reason counts grouped by op/domain/shape, (3) per-token CPU<->CUDA transfer bytes. These are assertable in CI/integration tests to prove decode did not silently fall to CPU. Per-node placement dump kept as an optional debug tool (doc §7).
+
+Status: design ON HOLD pending the CUDA GEMM prefill kernel; will be re-scoped to narrow unsupported-op fallback afterward.
+
+#### Source: `coordinator-weight-offload-md-10-open-questions-resolved-by-ow.md`
+
+### 2026-07-17T04-28-26: WEIGHT_OFFLOAD.md — 10 open questions resolved by owner
+**By:** coordinator
+**What:** WEIGHT_OFFLOAD.md — 10 open questions resolved by owner
+**Why:** Owner @justinchuby resolved all 10 open questions in docs/WEIGHT_OFFLOAD.md during design review.
+
+Q1 lazy-initializer boundary: general executor WeightHandle from the start, compatible with existing ORT plugin EPs via capability detection — paging-capable EPs advertise an nxrt capability flag and get a lazy WeightHandle; stock ORT EPs get a materialized resident tensor fallback. Paging is opt-in, never a correctness dependency.
+
+Q2 MoE op boundary: pkg.nxrt::BlockQuantizedMoE is the offload boundary (only it honors lazy expert leases), capability-negotiated with plain QMoE fallback; mobius emits BlockQuantizedMoE when nxrt capability present else QMoE; file an upstream ORT issue for lazy-external-weight QMoE.
+
+Q3 exporter metadata: hybrid — numeric bindings (FC1/FC2/FC3, scales, zero-points, shared-expert flag, per-expert sizes) explicit op inputs/attrs, NEVER name-inferred; residency metadata in package manifest; format/layout version mandatory+explicit (loader hard-rejects mismatch). Refinement: residency metadata is a compact model-/layer-group-level layout descriptor referenced by a region-group id on the op, NOT per-op/per-expert; byte ranges computed from WeightStore offsets + descriptor.
+
+Q4 host budget: hard cap on OWNED cache bytes is the cross-platform contract; RSS-tightening advisory, off hot path, only on already-evicted pages (no perf regression), behind PageAdvisor trait (madvise POSIX / Offer-DiscardVirtualMemory Windows / no-op fallback). Must be cross-platform + no perf degradation.
+
+Q5 partial-GPU API: byte-budget + explainable placement plan primary; gpu_layers:N compat override reported in bytes.
+
+Q6 mixed CPU/GPU MoE: single-device per layer first (Phase 3); intra-layer expert split deferred as measured optimization.
+
+Q7 tile size: expert-FC-panel default (whole quant blocks; never split a block), byte override snapping to block boundaries, per-format minimums; auto-tune deferred to Phase 4.
+
+Q8 governor arbitration: dynamic with hard KV floor (sized to committed in-flight sequences) + watermark hysteresis + rebalance dwell + admission control at batch formation. MUST be tested thoroughly (oscillation/thrash, KV-floor-breach, admission under continuous batching = hard test gate).
+
+Q9 prefetch: layered opt-in — exact-next-wave default + heat warm-set + router-prediction opt-in (graduates only if measured to help end-to-end without more memory violations/p99). Extension: trait-based ResidencyPolicy public extension point — policy ADVISES, Resource Governor stays AUTHORITATIVE (enforces budgets/KV floor/leases; cancels low-value transfers). Policy proposes, Governor disposes.
+
+Q10 integrity/lifetime: pin file identity cheaply at load (size + mtime/inode or fast header/region-table signature, O(1), no full re-hash), opt-in full-hash for attestation, SIGBUS handler -> clean runtime error, reject truncation/replacement of a live package.
+
+Status: design approved; Phase 1 = mmap disk tier + active-expert CPU MoE access.

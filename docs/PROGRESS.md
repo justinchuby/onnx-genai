@@ -4,7 +4,9 @@ Tracks implementation status of `docs/DESIGN.md` (§1–§40). Updated as work l
 
 **Published:** `onnx-genai` v0.1.0 + 8 sub-crates on crates.io; the `onnx-runtime-*` layer (including `onnx-runtime-tracer`) is released as v0.1.0-dev.1. CI (fmt/build/test/**blocking clippy**) + scheduled `cargo-audit`. Coverage ~77% line.
 
-_Last updated: 2026-07-17T02:24:32Z — QMoE int1/int2 and five ONNX shape-inference rules landed._
+_Last updated: 2026-07-17T05:35:45Z — CUDA M>1 BlockQuantizedMatMul prefill and scale-model design decisions landed._
+
+**Current `origin/main` HEAD:** `50bb3ea`.
 
 
 ## Current tiered-memory and interoperability milestones
@@ -364,10 +366,12 @@ Scoped the "export Gemma4 E2B/12B via Mobius and smoke-test through onnx-genai" 
 - **Full runtime sub-4-bit IQ family ✅ (`2dfee14`; `1bf47a8`, Bryant; Leon 🟢):** `BlockQuantizedMatMul` CPU decoding now supports MXFP4, IQ4_NL, IQ4_XS, IQ3_S, IQ3_XXS, IQ2_XXS, IQ2_XS, IQ2_S, IQ1_S, and IQ1_M. The llama.cpp grids, layouts, and fingerprints were independently audited; no IQ format remains deferred.
 - **CPU BlockQuantizedMatMul prefill optimization ✅ DONE (`5010261`, Joi; Leon 🟢):** K-panel-parallel dequantization across every supported format, bit-exact AVX2 decode for MXFP4/IQ4_NL/IQ4_XS, and adaptive generic GEMM task sizing produce **32–35×** M=64/K=4096/N=4096 generic matmul gains; optional oneDNN remains supported. All ten formats are bit-exact versus scalar decoding.
 - **CUDA GPU IQ family ✅ DONE 10/10 (`06c4c06`, Roy; Wallace 🟢):** Static M==1 `BlockQuantizedMatMul` decodes **all formats on GPU**: MXFP4, IQ4_NL, IQ4_XS, IQ2_XXS, IQ3_XXS, IQ2_XS, IQ2_S, IQ3_S, IQ1_S, and IQ1_M. H200 CPU/GPU checks are bit-exact; M>1 routes to optimized CPU prefill.
+- **CUDA BlockQuantizedMatMul M>1 GEMM prefill ✅ LANDED (`a99f7a8` + `776a8b9`; reviewer-approved):** Batched prefill now remains on CUDA rather than routing to CPU, closing the GLM/DeepSeek-scale batched-prefill kernel gap.
 - **CUDA int4 GEMV decode ✅ (`1de9584`, Roy; Wallace 🟢):** M=1 packed-int4 `MatMulNBits` decode reads weights directly on CUDA, improving decode by approximately 68–96% on H200 while preserving CPU/ORT contracts.
 - **Shared `onnx-runtime-quantization` crate ✅ DONE (`8bf113e`):** CPU and CUDA now consume one audited source for the seven vendored IQ grids/sign tables; all moved values are byte-identical, including IQ1S FNV-1a `0x6703ed863501ae2e`.
 - **Weight offload design ✅ (`docs/WEIGHT_OFFLOAD.md`, Nabil):** mmap → host → VRAM weight-tier subsystem design is complete and **awaiting user greenlight**.
 - **DeepSeek CSA/MTP runtime design ✅ (`docs/DEEPSEEK_CSA_MTP_RUNTIME.md`, Nabil):** native sparse-attention/index operations and iterative sidecar-state MTP orchestration are specified and **awaiting user greenlight**.
+- **Four scale-model design reviews ✅ resolved:** `WEIGHT_OFFLOAD` **Approved**; `DEEPSEEK_CSA_MTP_RUNTIME` **Approved**; `PROJECTION_FUSION` **Approved**; `HETEROGENEOUS_PLACEMENT` **ON HOLD** and re-scoped to a narrow unsupported-op CPU fallback, never hot quantized-matmul prefill.
 - **Mobius exports awaiting merge:** PR [#404](https://github.com/onnxruntime/mobius/pull/404) adds GLM-5.2 MoE with IndexShare DSA + MTP; PR [#405](https://github.com/onnxruntime/mobius/pull/405) adds DeepSeek-V4-Flash MTP + CSA; PR [#406](https://github.com/onnxruntime/mobius/pull/406) adds the mixed-quant scaffold and `pkg.nxrt` opset-import fixes. All await user merge.
 - **First real-model end-to-end sub-4-bit generation ✅ DONE (MAJOR MILESTONE; `2f65135`, Pris):** `bartowski/Qwen2.5-0.5B-Instruct` IQ4_XS exported through Mobius #406 generated coherent CPU-native output through **144** `BlockQuantizedMatMul` nodes (**120 IQ4_NL + 24 IQ4_XS**), with both formats confirmed executed without fallback.
 - **Quantized matmul shape inference ✅ (`67c1e3b`, Sapper; Leon 🟢):** `BlockQuantizedMatMul` and `MatMulNBits` now infer `A.shape[..-1] + [N]`; unmodified real-model E2E works.
@@ -391,3 +395,6 @@ Scoped the "export Gemma4 E2B/12B via Mobius and smoke-test through onnx-genai" 
 - `WEIGHT_OFFLOAD` implementation remains **AWAITING USER GREENLIGHT**.
 - MatMulNBits projection-fusion (`docs/PROJECTION_FUSION.md`, Nabil) remains **AWAITING GREENLIGHT**.
 - End-to-end run of a GLM-5.2/DeepSeek-scale model once the preceding work lands.
+
+- **IN FLIGHT (2026-07-17):** Projection-fusion Phase A implementation — CPU EP-scoped optimizer plus gate/up fusion.
+- **IN FLIGHT (2026-07-17):** DeepSeek CSA/MTP contract freeze (Phase 0 goldens from the official DeepSeek reference).
