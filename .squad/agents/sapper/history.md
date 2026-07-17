@@ -76,3 +76,7 @@ Added the preprocessing-side prompt token-expansion library for multi-tile VLM i
 
 - Initial Loop implementation `8052891` was 🔴 rejected by Holden: scan accumulation eagerly reserved from untrusted `M`, enabling an early-exit `i64::MAX` capacity-overflow DoS, and carried shapes were not validated.
 - Sapper was locked out of the revision; Leon owned the remediation. The final Loop revision was cleared and merged as `f6e8ba6`; `Scan` remains the final control-flow op.
+
+## 2026-07-14T00:00:00Z — GAFF Scan complete
+
+- Implemented ONNX Scan through ChildExecutor; Leon’s checked stack-arithmetic repair and Holden’s approval closed the final control-flow-op gate. If + Loop + Scan are now complete.

@@ -98,3 +98,7 @@ Cleared Deckard's `f795d45` executor EP-polymorphism refactor: it preserves CPU-
 
 - 🔴 Rejected Sapper's `8052891` Loop because eager scan reservation from input-controlled `M` enabled an `i64::MAX` early-exit capacity-overflow DoS, and loop-carried shapes were not invariant.
 - Sapper was locked out; 🟢 cleared Leon's final `f6e8ba6` revision after huge-trip early-exit and carried-shape regressions. Session build and 121 tests passed; only `Scan` remains.
+
+## 2026-07-14T00:00:00Z — Scan and QMoE final safety gates
+
+- Cleared Leon’s Scan overflow repair and Holden’s own QMoE follow-up: allocations are bounded at `isize::MAX`, and valid odd affine-int4 block rows remain accepted.

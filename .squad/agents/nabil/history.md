@@ -19,3 +19,7 @@ Authored `docs/NATIVE_CUDA_DECODE.md` (`b416b7f`) and applied Fact Checker's str
 ## 2026-07-16T19-27-57+0000 — Scribe session update
 
 - Authored `docs/DEEPSEEK_CSA_MTP_RUNTIME.md` (`bca068c`), a native CSA/index-op and persistent iterative-MTP sidecar-state design. It awaits user greenlight.
+
+## 2026-07-14T00:00:00Z — QMoE final approval
+
+- Rejected the initial and first hardening revisions, then approved the final QMoE kernel once overflow checks, allocation addressability, and odd affine-int4 block handling were correct.

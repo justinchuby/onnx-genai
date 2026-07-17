@@ -74,3 +74,7 @@ Authored CUDA Gather, Shape, and Constant kernels; coverage reached 65.
 
 - Merged `3d19b72`: the unsupported MatMul regression now asserts the current Int64 CUDA EP error instead of obsolete Phase 2a wording.
 - Wallace 🟢 cleared the exact failure path and 129/129 CUDA tests.
+
+## 2026-07-14T00:00:00Z — QMoE landed
+
+- The `com.microsoft::QMoE` CPU kernel landed after Nabil’s review cycle and the checked-arithmetic/addressability hardening revisions. Blockwise Q4/Q8 is enabled; IQ1/IQ2/int2 and sparse mixer remain follow-ups.

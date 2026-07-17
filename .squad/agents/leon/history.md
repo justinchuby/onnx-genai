@@ -67,3 +67,7 @@ Loader opset-import validation for file, from-parts, and nested-subgraph paths m
 
 - Under Sapper's lockout, repaired the rejected Loop design: removed the untrusted eager scan reservation and validated every loop-carried output against its initial dtype and full shape.
 - Holden 🟢 re-approved the huge-`M` early-exit and second-iteration shape-change regressions; 121 session tests passed and final commit `f6e8ba6` merged. `Scan` is now the remaining control-flow work.
+
+## 2026-07-14T00:00:00Z — Scan hardening and normalization inference
+
+- Repaired Scan stack-shape arithmetic against zero-masked overflow (Holden 🟢) and added BatchNormalization/InstanceNormalization shape inference (Bryant 🟢).

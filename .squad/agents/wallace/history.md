@@ -47,3 +47,7 @@
 
 - 🟢 Cleared Roy's `3d19b72`: the test asserts the real Int64 unsupported error and cannot pass if that dtype becomes accepted.
 - Exact target coverage and the full CUDA suite passed 129/129 with cuDNN available.
+
+## 2026-07-14T00:00:00Z — Custom-op domain rename
+
+- Landed the repository-wide serialized custom-operator domain rename to `pkg.nxrt`; all runtime producers, consumers, tests, fixtures, scripts, and docs are aligned.

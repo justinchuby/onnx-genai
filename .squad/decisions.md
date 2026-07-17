@@ -1388,3 +1388,186 @@ Re-reviewed commit `2ae464b5d894276f38a5855599c0c9124ea23558` against rejected b
 **Why:** A condition-terminated loop with `M = i64::MAX` must not capacity-overflow before its first scan slice, and ONNX loop-carried values must retain shape as well as dtype. Regression tests cover huge-trip-count early exit and a second-iteration shape change; `onnx-runtime-session` build and 121-test suite passed. Loader → ChildExecutor → If → Loop is complete; Scan is the remaining control-flow op and is in progress.
 
 **Sources:** `chew-and-logical-kernel.md`, `bryant-chew-logical-kernel-review.md`, `chew-expand-shape-infer.md`, `bryant-chew-expand-review.md`, `sapper-gaff-loop.md`, `holden-sapper-gaff-loop-review.md`, `leon-gaff-loop-fix.md`, `holden-leon-gaff-loop-rereview.md`.
+
+### 2026-07-17: Clear Scatter family shape inference
+**By:** Bryant
+**Verdict:** 🟢 CLEAR
+**What:** Independently reviewed commit `db868a56d99c8369938d5b7496c2d6db4706b3bd`. `ScatterND`, `ScatterElements`, and deprecated `Scatter` copy input 0's complete `TypeInfo`, so output shape and dtype exactly match `data`; `axis` and `reduction` are shape-neutral. All names are registered through the movement handler and exercised through the default registry. Unknown input-0 type leaves the output unresolved without error, matching the crate's convention. The four tests cover ScatterND, non-default-axis ScatterElements, the opset-9 alias, dtype passthrough, and unresolved-data fallback. No incorrect rank or shape validation was added.
+**Why:** The implementation follows the ONNX Scatter-family output contract and the registry's range-based dispatch model. Validation passed: `cargo build -p onnx-runtime-shape-inference`; `cargo test -p onnx-runtime-shape-inference` — 124 passed, 0 failed (14 unit + 4 graph + 105 op-rule + 1 doc).
+**Blockers:** None.
+**Advisories:** None.
+
+### 2026-07-17: Clear BatchNormalization and InstanceNormalization shape inference
+**By:** Bryant
+**Verdict:** 🟢 CLEAR
+**What:** Independently reviewed commit `1ae2b676375ff67c7afca951ac0c9cdfb09fe827`. Both handlers infer only output 0 (`Y`) by cloning input 0 (`X`), preserving its complete symbolic/concrete shape and dtype. Parameter inputs cannot affect the inferred output. The default-domain registrations cover BatchNormalization schema revisions 9/14/15 and InstanceNormalization revision 6 through the registry's range-based dispatch. Unknown `X` leaves outputs unresolved without error or panic, and the handlers add no graph validation.
+**Why:** This matches the inference-only runtime contract: the CPU BatchNormalization factory rejects `training_mode != 0`, and its kernel requires exactly one output. If a training-mode node declares additional outputs, shape inference resolves only `Y` and safely leaves every additional slot unresolved; `set_output_type` is bounds-checked, so this degrades gracefully rather than panicking.
+
+**Tests reviewed:** The BatchNormalization test verifies exact `X` shape and Float16 dtype passthrough at opsets 9, 14, and 15; the InstanceNormalization test verifies the same at opset 6; the unknown-`X` test covers both operators.
+
+**Validation:** `cargo build -p onnx-runtime-shape-inference` passed. `cargo test -p onnx-runtime-shape-inference` passed all 127 tests (14 unit + 4 graph integration + 108 operator-rule + 1 doc test).
+
+**Advisory:** No correctness issue. A future regression test could declare BatchNormalization's training outputs and assert that only `Y` resolves, documenting the graceful inference-only behavior already present.
+
+### 2026-07-17: Approve Leon's Scan stacking overflow repair
+**By:** Holden
+**What:** 🟢 APPROVE `gaff-scan` at `8c38afcfaeed47d8c1cbc907773688828868c2c3`. The blocker from `d3adfa3b` is fixed, including the zero-mask edge.
+**Why:** `stack_new_axis` now checks the outer and inner element products, the element-to-byte multiplication, `n * outer` before multiplying by `inner`, the final byte count, and all source/destination offset and range arithmetic. Every check returns `SessionError::ShapeOverflow` before allocation or copy loops. For the exact Float32 repro with input shape `[7_000_000_000_000_000_000, 0, 3]`, scan axis 2, Identity slices `[7_000_000_000_000_000_000, 0]`, and `scan_output_axes=[1]`, `inner=0` no longer masks the overflow in `3 * outer`; the regression receives `ShapeOverflow { value: "stacked tensor output row count", .. }` immediately. The targeted test passed in both debug and release in 0.00s, confirming no huge allocation or loop. The delta is confined to `crates/onnx-runtime-session/`; the previously verified Scan semantics and validations remain covered. `cargo build -p onnx-runtime-session` passed, and `cargo test -p onnx-runtime-session` passed all 127 tests (0 failed; 1 doc-test ignored).
+
+### 2026-07-14: Bound QMoE allocations and accept odd affine block counts
+**By:** Holden
+**What:** QMoE byte-count preflights now reject allocations above `isize::MAX`, and affine int4 validation requires only block-size alignment while retaining ceil-packed zero-point rows for odd block counts.
+**Why:** Rust allocations above `isize::MAX` can panic despite fitting in `usize`. ORT's affine int4 layout permits an odd number of blocks, with the final zero-point byte containing only the remaining nibble; rejecting those layouts was stricter than the format.
+
+### 2026-07-17: Reject Scan due to zero-element stacking overflow/hang
+**By:** Holden
+**What:** 🔴 REJECT `gaff-scan` at `d3adfa3bf2bfbc514e770168ce23b331d2084dd4`. Sapper is locked out of this revision; Leon should own the repair.
+**Why:** Scan's ordinary semantics are otherwise implemented correctly, but its newly added non-leading-output-axis path exposes unchecked shape arithmetic in `stack_new_axis` to untrusted Scan output shapes.
+
+## Blocker
+
+**High — crafted zero-element Scan can panic in debug or effectively hang in release.**
+
+- `executor.rs:4125-4142` checks the per-slice element byte count, but then calls `stack_new_axis`.
+- `sequence.rs:336-347` uses unchecked `product`, `* esize`, `n * outer * inner`, and offset arithmetic.
+- Concrete zero-byte repro shape: a Float32 scan input shaped `[7_000_000_000_000_000_000, 0, 3]`, scanned on axis 2, with an Identity body producing slices shaped `[7_000_000_000_000_000_000, 0]`, and `scan_output_axes=[1]`. This is a three-trip Scan over an empty tensor.
+- At final stacking, `n=3`, `outer=7_000_000_000_000_000_000`, and `inner=0`. Debug evaluation of `n * outer * inner` overflows at `n * outer` and panics. In release it wraps, allocates zero bytes, then executes approximately `3 * outer` zero-length copy iterations, effectively hanging.
+
+The fix must keep stacking arithmetic checked and return a `ShapeOverflow`/control-flow error before allocation or loops. Add a regression covering a huge dimension masked by a zero dimension and a non-leading scan output axis.
+
+## Checks that held
+
+- No eager reservation from `T`: `TensorStackAccumulator::new()` starts empty and accumulation grows incrementally.
+- State dtype and shape are captured from initial state and checked every iteration with the state index in the error. The shape-rejection test reaches iteration 2 and asserts the exact mismatch.
+- Input axes are defaulted, negative-normalized, sliced correctly, direction-aware, and checked for equal trip counts.
+- Output axes are defaulted, negative-normalized, and output directions are applied; the non-zero/reverse test asserts shape and values.
+- `num_scan_inputs`, state count, body input arity, and body output arity are validated consistently.
+- The six Scan tests assert substantive final states, output shapes/values, zero-trip behavior, and the rejection error.
+
+## Zero-trip punt
+
+Acceptable limitation: when neither body nor parent metadata can determine an empty scan-output element shape, `finish_scan` returns a clear `SessionError::ControlFlow` (`executor.rs:4097-4103`). It does not panic. The supplied zero-trip test covers the metadata-available success path; a graceful-error regression would be useful but is non-blocking.
+
+## Validation
+
+- `cargo build -p onnx-runtime-session`: PASS.
+- `cargo test -p onnx-runtime-session`: PASS — 126 passed, 0 failed, 1 ignored doc-test.
+
+### 2026-07-17: Add ONNX Scatter-family shape inference
+**By:** Joi
+**What:** Added shape inference registrations for ScatterND (opsets 11/13/16/18), ScatterElements (opsets 11/13/16), and deprecated Scatter (opset 9, using the ScatterElements rule). Each output clones input 0's shape and dtype; axis and reduction do not affect shape. When data TypeInfo is unavailable, the output remains unresolved, matching sibling passthrough handlers; known symbolic dimensions are preserved unchanged. Added 4 tests: scatter_nd_preserves_data_shape_and_dtype, scatter_elements_non_default_axis_preserves_data_shape, scatter_deprecated_alias_preserves_data_shape_and_dtype, and scatter_unknown_data_shape_leaves_output_unresolved. Validation passed: cargo build and cargo test for onnx-runtime-shape-inference (124 total tests: 14 unit, 4 graph, 105 op-rule, 1 doctest; 0 failures). Commit: db868a56d99c8369938d5b7496c2d6db4706b3bd.
+**Why:** The Scatter family has shape- and dtype-preserving ONNX semantics and complements the existing GatherND/GatherElements inference handlers.
+
+### 2026-07-17: Reject overflowing Scan stack shapes before allocation
+**By:** Leon
+**What:** Changed `stack_new_axis` to check the outer/inner shape products, element-to-byte multiplication, output row/byte counts, and source/destination offset arithmetic. The guard returns `SessionError::ShapeOverflow`; critically, `n * outer` is checked before multiplication by a zero `inner`, so zero-sized tensors cannot mask the overflow. Added `scan_rejects_zero_element_nonleading_output_axis_stack_overflow`.
+**Why:** Holden's crafted three-trip Scan with element shape `[7_000_000_000_000_000_000, 0]` and `scan_output_axes=[1]` previously panicked in debug or wrapped into a massive zero-length copy loop in release. `cargo build -p onnx-runtime-session` and all 127 crate tests passed. Fixed in commit `8c38afcfaeed47d8c1cbc907773688828868c2c3`.
+
+### 2026-07-17: Add BatchNormalization and InstanceNormalization shape inference
+**By:** Leon
+**What:** Registered ai.onnx `BatchNormalization` for opsets 9, 14, and 15 and `InstanceNormalization` for opset 6. Both inference handlers pass input `X`'s shape and dtype through to output `Y`; BatchNormalization intentionally does not emit training-only outputs. Added 3 tests: `batch_norm_inference_passthrough_opsets_9_14_15`, `instance_norm_passthrough_opset_6`, and `normalization_unknown_x_leaves_output_unresolved`. Commit: `1ae2b676375ff67c7afca951ac0c9cdfb09fe827`.
+**Why:** In inference mode, scale, bias, mean, and variance do not affect output shape, and unresolved `X` must leave `Y` unresolved like sibling normalization handlers. `cargo build -p onnx-runtime-shape-inference` passed; `cargo test -p onnx-runtime-shape-inference` passed 127 tests total (14 unit, 4 graph, 108 op-rule, 1 doc-test), with 0 failures.
+
+### 2026-07-14: QMoE checked-arithmetic hardening re-review — REJECT
+**By:** Nabil
+**What:** 🔴 REJECT commit `436cedc`. Reassign the revision to Holden; Roy and Deckard remain locked out for this revision cycle.
+**Why:** `qmoe.rs:498-501` only checks `elements * element_size` for `usize` overflow. It does not reject byte counts above `isize::MAX`, so attacker-controlled shapes whose byte product fits `usize` can still reach `Vec::with_capacity`/`vec!` and panic with capacity overflow before returning an `EpError` (`qmoe.rs:268,434-436,456`; compare the repository's addressability guard in `sequence.rs:234-250`). The three new tests correctly assert `EpError::KernelFailed` for their selected `usize`-overflow paths, including zero-masked multiplication, but none covers this addressability boundary. Additionally, `qmoe.rs:392-399` newly rejects valid affine int4 layouts with an odd number of blocks, contradicting the documented `ceil(blocks / pack_size)` zero-point layout; this is a semantic change and must be removed or separately justified/tested because the hardening fix is required to be purely defensive. The full `onnx-runtime-ep-cpu` suite completed with 444 passed and 1 ignored, but does not cover either gap.
+
+### 2026-07-14: QMoE round-2 fix approved
+**By:** Nabil
+**What:** 🟢 APPROVE commit `b1c9a55`; the `com.microsoft::QMoE` CPU kernel ships.
+**Why:** `checked_byte_count` now rejects counts above `isize::MAX` before input copies, output allocation, and per-expert dequantization allocation. Affine int4 validation accepts block-size-divisible odd-block rows, uses ceil-packed zero-point storage, and the final low nibble is indexed correctly; the new regressions exercise both fixes and all 446 non-ignored `onnx-runtime-ep-cpu` tests pass.
+
+### 2026-07-17: QMoE CPU kernel review — 🔴 REJECT
+**By:** Nabil
+**What:** Reject commit `3cf25359ed216a0f3c7e1c851c5083ad8ede115b` until the QMoE execution path validates all shape-derived counts and offsets with checked arithmetic and returns `EpError` on overflow. The dequantization and float-MoE equivalence work is otherwise numerically sound.
+**Why:**
+
+#### Blocker — unchecked untrusted shape arithmetic
+
+The kernel validates individual dimensions but then performs unchecked products and offset arithmetic on them:
+
+- flattened rows: `qmoe.rs:140`;
+- output allocation: `qmoe.rs:254`;
+- per-expert dequant allocation: `qmoe.rs:369`;
+- expert/row packed, scale, and zero-point offsets: `qmoe.rs:371-379`;
+- fused SwiGLU FC1 width: `moe.rs:287-290`.
+
+Overflow can panic in debug builds or wrap in release builds, producing undersized allocations followed by slicing/indexing panics or out-of-bounds behavior instead of a clear `EpError`. This fails the explicit safety gate for untrusted quantized tensor shapes. The replacement must preflight rows, tensor element counts, byte counts, dequantized sizes, and every expert-row stride/offset with `checked_mul`/`checked_add` before materialization or slicing, with adversarial overflow tests.
+
+Per reviewer protocol, Roy is locked out from revising the rejected artifact; a different agent should own the safety revision (Deckard is the recommended owner).
+
+#### Dequantization correctness — clear
+
+- QMoE reuses `matmul_nbits::dequantize_nbits_row`, so packing is consistent with the crate's MatMulNBits path.
+- Expert-major row addressing, K-axis LSB-first int4 nibble order, int8 byte order, per-K-block scale selection, packed affine zero points, and symmetric midpoint defaults (`8`/`128`) are correct.
+- The affine multi-block fixture uses two blocks with both scales and zero points changing by block, so block-to-scale mapping is genuinely exercised.
+- Registration is present beside `MoE` in `kernels/mod.rs`.
+
+#### Float-MoE equivalence — genuine but narrow
+
+`qmoe_int4_single_block_matches_float_moe` is a real differential test: it constructs dequantized float expert tensors, executes the registered trusted `MoE` kernel, executes QMoE from packed weights, and compares every output at `1e-5`. This is not a self-comparison.
+
+All four numeric equivalence cases use `activation_type="identity"` with no biases, FC3, or separate `router_weights`. Shared `routing_weights` and `run_expert` code makes activation/routing reuse structurally strong, but follow-up tests should cover at least one nonlinear activation, fused/unfused SwiGLU/FC3, biases, and separate aggregation weights.
+
+#### Advisory — schema strictness
+
+For affine block quantization, ORT requires K to be divisible by `block_size * pack_size` when zero points are supplied. The kernel checks only divisibility by `block_size` and accepts a ceiling-packed zero-point dimension. Valid inputs decode correctly, but invalid schema shapes are accepted.
+
+#### Deferred scope and GLM-5.2 impact
+
+- Batch-union grouping, caching, and compressed GEMM are performance punts only.
+- Native affine int2, IQ1/IQ2/IQ3/IQ4, MXFP4/FP8, and row-wise QMoE are load/run blockers for artifacts encoded in those formats. GLM-5.2 dynamic IQ1/IQ2 packages therefore cannot run through this kernel; a blockwise affine Q4/Q8 requantized export can.
+- Sparse mixer is a load/run blocker only for graphs that set `use_sparse_mixer=1`; the current GLM route can remain explicit and does not inherently require it.
+
+#### Validation
+
+- `cargo build -p onnx-runtime-ep-cpu`: passed.
+- `cargo test -p onnx-runtime-ep-cpu`: 441 passed, 0 failed, 1 ignored.
+- Targeted QMoE tests: 5 passed (int4 single-block, int8, affine multi-block, normalized top-k=2, unsupported block size).
+
+### 2026-07-17: Complete GAFF Scan control-flow execution
+**By:** Sapper
+**What:** Implemented ONNX Scan for opsets 9/11/16 through the existing ChildExecutor path. Scan validates its body/input/output arity, slices each scan input on its configured (including negative) axis in forward or reverse direction, threads state, and stacks each scan output on its configured axis/direction. Zero-trip execution preserves initial states and constructs typed empty scan outputs from body output specifications.
+**Why:** Scan was the remaining GAFF control-flow operator after If and Loop. State outputs are checked against the initial dtype and shape before every threading step, and scan accumulators grow incrementally without reserving from trip-count hints. Added 6 Scan tests: cumulative sum across opsets 9/11/16, multiple inputs with a negative/non-leading axis, reverse input direction, non-zero/negative output axis with reverse output direction, zero-trip typed output, and state shape-change rejection. `cargo build -p onnx-runtime-session` and all 126 session tests passed (1 doctest ignored). Commit: `d3adfa3`.
+
+### 2026-07-17: Rename the custom ONNX operator domain to `pkg.nxrt`
+**By:** Wallace
+**What:** Replaced 31 serialized/text references to `com.github.onnxruntime.genai` with `pkg.nxrt` across 20 files:
+- `crates/onnx-genai-engine/src/engine.rs`
+- `crates/onnx-genai-engine/src/pipeline.rs`
+- `crates/onnx-runtime-ep-cpu/src/kernels/block_quantized_matmul.rs`
+- `crates/onnx-runtime-ep-cpu/src/kernels/mod.rs`
+- `crates/onnx-runtime-ep-cuda/src/kernels/block_quantized_matmul.rs`
+- `crates/onnx-runtime-ep-cuda/src/kernels/mod.rs`
+- `crates/onnx-runtime-ep-cuda/src/provider.rs`
+- `crates/onnx-runtime-ep-cuda/tests/block_quantized_matmul_gpu.rs`
+- `crates/onnx-runtime-python/tests/test_block_quantized_matmul.py`
+- `crates/onnx-runtime-session/src/executor.rs`
+- `crates/onnx-runtime-shape-inference/src/handlers/linalg.rs`
+- `crates/onnx-runtime-shape-inference/tests/op_rules.rs`
+- `docs/DEEPSEEK_CSA_MTP_RUNTIME.md`
+- `docs/HETEROGENEOUS_PLACEMENT.md`
+- `docs/PROGRESS.md`
+- `docs/SUB4BIT_QUANT.md`
+- `docs/benchmarks/e2e-sub4bit-validation.md`
+- `scripts/e2e-sub4bit-validation.sh`
+- `scripts/e2e_sub4bit_export.py`
+- `tests/fixtures/tiny-native-sub4-engine/model.onnx`
+
+The shell validation script and serialized ONNX fixture were additional tracked consumers found by the repository-wide scan. The fixture changed only its node-domain and opset-import fields.
+
+**Why:** The runtime emits, detects, validates, registers, and executes the same custom operators, so every producer and consumer must use one self-consistent domain.
+
+**Deliberately unchanged:** The tracer ITT domain constant `"nxrt"`, all `set_process_name("nxrt")` calls, and Python module paths such as `module = "nxrt.genai"` / `"nxrt.eager"` remain unchanged because they are not ONNX operator domains.
+
+**Validation:**
+- Repository-wide tracked-byte scan, excluding `.squad/` and `target*/`: 0 old-domain references; 31 `pkg.nxrt` references across 20 files.
+- `cargo build -p onnx-runtime-ep-cpu -p onnx-runtime-session -p onnx-genai-engine -p onnx-runtime-shape-inference`: passed.
+- `cargo test -p onnx-runtime-ep-cpu -p onnx-runtime-session -p onnx-genai-engine -p onnx-runtime-shape-inference`: engine ran first with 106 passed, 18 failed, 1 ignored. All 18 failures were the known missing `tests/fixtures/tiny-llm/model.onnx` fixture errors; there were no domain-mismatch failures.
+- Follow-up `cargo test -p onnx-runtime-ep-cpu -p onnx-runtime-session -p onnx-runtime-shape-inference`: passed.
+- `cargo build -p onnx-runtime-ep-cuda` with CUDA environment: passed.
+- `cargo test -p onnx-genai-engine --features native-backend --test native_engine`: 5 passed.
+- `cargo test -p onnx-genai-engine --features native-backend auto_backend`: 2 passed.
+
+**Commit:** `a776ebee4a3eddffdc6ce018d9c26cfab1a0bba7`

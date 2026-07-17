@@ -125,3 +125,7 @@ Authored native Engine/server backend integration in `66ec4b8`; Holden rejected 
 ## 2026-07-16T23:06:37+0000 — Native CUDA fail-fast revision
 
 - Authored `fa30410` after Roy's CUDA-only serving rejection: capability-probe CUDA models at load, fail unsupported real sub-4-bit graphs with CPU/ORT remediation, and cover a reachable BQMM/Transpose regression. Wallace 🟢 cleared it; heterogeneous placement remains AWAITING USER GREENLIGHT.
+
+## 2026-07-14T00:00:00Z — QMoE arithmetic hardening
+
+- Provided the checked-arithmetic revision for the initial QMoE rejection. A later `isize::MAX` allocation-boundary issue was corrected in the independent Holden follow-up.

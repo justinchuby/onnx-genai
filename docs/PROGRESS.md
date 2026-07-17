@@ -4,7 +4,7 @@ Tracks implementation status of `docs/DESIGN.md` (§1–§40). Updated as work l
 
 **Published:** `onnx-genai` v0.1.0 + 8 sub-crates on crates.io; the `onnx-runtime-*` layer (including `onnx-runtime-tracer`) is released as v0.1.0-dev.1. CI (fmt/build/test/**blocking clippy**) + scheduled `cargo-audit`. Coverage ~77% line.
 
-_Last updated: 2026-07-17T00:58:13Z — logical CPU kernels, Expand inference, and GAFF Loop landed._
+_Last updated: 2026-07-14T00:00:00Z — GAFF Scan, QMoE, normalization inference, the `pkg.nxrt` domain rename, and PR #22 landed._
 
 
 ## Current tiered-memory and interoperability milestones
@@ -18,7 +18,11 @@ _Last updated: 2026-07-17T00:58:13Z — logical CPU kernels, Expand inference, a
 - **Comparison/logical Bool output inference ✅ landed (`d06d1e7`, Chew; Leon 🟢):** `Less`, `LessOrEqual`, `Greater`, `GreaterOrEqual`, `Equal`, `And`, `Or`, `Xor`, and `Not` now infer `tensor(bool)` while preserving broadcast/unary shapes; bitwise ops remain untouched.
 - **CPU logical `And`/`Or`/`Xor`/`Not` kernels ✅ landed (`557ca87`, Chew; Bryant 🟢):** Bool kernels use NumPy broadcasting, interpret nonzero storage as true, and canonicalize output bytes to `0`/`1`; expanded-Attention conformance advances to node 58.
 - **`Expand` bidirectional-broadcast shape inference ✅ landed (`14b5136`, Chew; Bryant 🟢):** opset 8+ expansion preserves dtype, correctly merges either broadcast direction, and retains a known output rank with fresh symbols when target values are unavailable; shape inference passes **120** tests and conformance advances past node 58.
-- **GAFF control-flow set ✅ COMPLETE for `If` + `Loop`:** loader metadata → `ChildExecutor` → `If` (`7a369ef`, Sapper; Holden 🟢) → `Loop` (`f6e8ba6`, Leon; Holden 🔴→🟢) is shipped. Loop avoids untrusted scan-reservation DoS and enforces loop-carried dtype/shape invariance every iteration; **121** session tests pass. **`Scan` is the last control-flow op and is now IN PROGRESS.**
+- **GAFF control-flow set ✅ COMPLETE (`If` + `Loop` + `Scan`):** loader metadata → `ChildExecutor` → `If` (`7a369ef`, Sapper; Holden 🟢) → `Loop` (`f6e8ba6`, Leon; Holden 🔴→🟢) → `Scan` (`d3adfa3` → Leon’s checked-arithmetic repair; Holden 🟢) is shipped. Scan covers axes/directions, state invariance, zero trips, and zero-masked shape-overflow rejection; **127** session tests pass.
+- **QMoE CPU kernel ✅ landed (`com.microsoft::QMoE`, `90e3d40`/`94acd87`/`2543b2b`, Roy; Nabil 🔴→🟢):** blockwise Q4/Q8 expert weights now run through the CPU EP. Checked arithmetic, an `isize::MAX` allocation ceiling, and odd affine-int4 block rows are enforced. **Follow-ups:** IQ1/IQ2/int2 formats and sparse-mixer support remain open.
+- **BatchNormalization + InstanceNormalization shape inference ✅ landed (Leon; Bryant 🟢):** inference-mode output `Y` preserves `X`’s shape and dtype, with unresolved inputs left unresolved.
+- **Custom ONNX domain ✅ renamed:** every custom-op producer/consumer now uses `pkg.nxrt` rather than `com.github.onnxruntime.genai` (`de99b73`).
+- **PR #22 ✅ merged:** Windows workspace-build fixes and CUDA serving performance improvements (device-resident KV default, automatic CUDA-graph capture, graceful graph-decode fallback) landed after the C API control-flow/heterogeneous-placement error mapping fix.
 - **CPU `Mod` ✅ landed (Joi; Bryant 🟡 advisory):** CPU EP and shape inference support `fmod` plus NumPy floor-mod integer semantics; all 13 official ONNX Mod CPU cases pass.
 - **Known follow-ups:** direct Mod BF16 coverage and ChildExecutor multi-signature caching.
 
