@@ -1069,3 +1069,549 @@ Failure rules:
 ## 11. Greenlight requested
 
 **Greenlight granted (owner @justinchuby, 2026-07-14).** Phase 0 may begin: run the official DeepSeek reference, dump and freeze layout-v1 goldens, and freeze the CSA/MTP state-transition contract before any kernel work.
+
+## Frozen Numerical Contract (from official deepseek-ai/DeepSeek-V4-Flash, 2026-07-14)
+
+### Source snapshot and notation
+
+This section is pinned to the official Hugging Face revision
+[`60d8d70770c6776ff598c94bb586a859a38244f1`](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/tree/60d8d70770c6776ff598c94bb586a859a38244f1).
+The Hugging Face API identifies that revision as the model repository head. The
+GitHub contents endpoint for `deepseek-ai/DeepSeek-V4-Flash` returned HTTP 404,
+so the files below were fetched from the pinned Hugging Face revision. No
+`configuration_deepseek.py` is present in the official file list.
+
+| Source | Governing ranges | SHA-256 |
+|---|---|---|
+| [`inference/model.py`](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/blob/60d8d70770c6776ff598c94bb586a859a38244f1/inference/model.py) | [183-251](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/blob/60d8d70770c6776ff598c94bb586a859a38244f1/inference/model.py#L183-L251), [255-377](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/blob/60d8d70770c6776ff598c94bb586a859a38244f1/inference/model.py#L255-L377), [380-543](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/blob/60d8d70770c6776ff598c94bb586a859a38244f1/inference/model.py#L380-L543), [647-809](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/blob/60d8d70770c6776ff598c94bb586a859a38244f1/inference/model.py#L647-L809) | `ce962f1face79d4f633d36436576214057a7e11443c9789935e1deb5c6cd1d71` |
+| [`inference/kernel.py`](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/blob/60d8d70770c6776ff598c94bb586a859a38244f1/inference/kernel.py) | [41-125](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/blob/60d8d70770c6776ff598c94bb586a859a38244f1/inference/kernel.py#L41-L125), [128-200](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/blob/60d8d70770c6776ff598c94bb586a859a38244f1/inference/kernel.py#L128-L200), [277-368](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/blob/60d8d70770c6776ff598c94bb586a859a38244f1/inference/kernel.py#L277-L368), [372-438](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/blob/60d8d70770c6776ff598c94bb586a859a38244f1/inference/kernel.py#L372-L438) | `59b325083d7103975cba025bd0d60ea343bb82d8fff53088afb7c04bd380c0c2` |
+| [`inference/generate.py`](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/blob/60d8d70770c6776ff598c94bb586a859a38244f1/inference/generate.py) | [19-69](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/blob/60d8d70770c6776ff598c94bb586a859a38244f1/inference/generate.py#L19-L69), [90-103](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/blob/60d8d70770c6776ff598c94bb586a859a38244f1/inference/generate.py#L90-L103) | `d4d443c0be8499b20ae5eaff0a623df02f47a8309be6feeba4eb4e0eeb5342c3` |
+| [`inference/config.json`](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/blob/60d8d70770c6776ff598c94bb586a859a38244f1/inference/config.json) | [1-34](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/blob/60d8d70770c6776ff598c94bb586a859a38244f1/inference/config.json#L1-L34) | `6cc6f816ca73a8d38750194e330398e4f6955b4b45f674f7d29c96da14ccb733` |
+| [`config.json`](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/blob/60d8d70770c6776ff598c94bb586a859a38244f1/config.json) | [1-67](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/blob/60d8d70770c6776ff598c94bb586a859a38244f1/config.json#L1-L67) | `b628e63398a645abc711d92207f8737dd8140f7a4ef1e0a5b3616019e0ddd818` |
+| [`inference/requirements.txt`](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/blob/60d8d70770c6776ff598c94bb586a859a38244f1/inference/requirements.txt) | [1-5](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/blob/60d8d70770c6776ff598c94bb586a859a38244f1/inference/requirements.txt#L1-L5) | `857e0b8b58e41cabe16e55bf4ab7ff791677c53b25f0f3e104ef85227cd11eab` |
+
+Notation:
+
+```text
+B   batch
+S   query/input sequence length for this forward
+H   hidden size = 4096
+N   query heads = 64; Nl = N / tensor_parallel_world_size
+D   attention head dimension = 512
+RD  rotary dimension = 64; ND = D - RD = 448
+W   sliding-window capacity = 128
+R   compression ratio, 4 or 128
+I   index heads = 64; Il = I / tensor_parallel_world_size
+ID  index head dimension = 128
+K   index_topk = 512
+C   hc_mult = 4
+T   model activation/cache dtype, BF16 in the reference runner
+```
+
+For every `RMSNorm`, the source performs
+
+```text
+RMSNorm_w(z) =
+  cast_T(w_fp32 * z_fp32 / sqrt(mean(z_fp32^2, last_dim) + 1e-6)).
+```
+
+This FP32 normalization and cast back to the input dtype are explicit in
+`model.py` [183-196](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/blob/60d8d70770c6776ff598c94bb586a859a38244f1/inference/model.py#L183-L196).
+
+### CSA: query, current KV, and RoPE
+
+For hidden input `x : T[B,S,H]`, absolute positions
+`p = start_pos .. start_pos+S-1`, and each attention layer:
+
+```text
+qr = RMSNorm(Wq_a x)                                  # T[B,S,1024]
+q  = reshape(Wq_b qr, [B,S,Nl,D])                    # T[B,S,Nl,D]
+q  = q * rsqrt(mean(q^2, -1, keepdim=True) + 1e-6)  # no explicit FP32 cast
+q[..., ND:D] = RoPE(q[..., ND:D], p)                 # FP32 complex multiply -> T
+
+kv = RMSNorm(Wkv x)                                   # T[B,S,D], one shared KV head
+kv[..., ND:D] = RoPE(kv[..., ND:D], p)               # FP32 complex multiply -> T
+kv[..., 0:ND] = fake_fp8_dequant(kv[..., 0:ND])       # in place, still T
+```
+
+These operations and their order are fixed by `model.py`
+[484-506](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/blob/60d8d70770c6776ff598c94bb586a859a38244f1/inference/model.py#L484-L506).
+`q` receives the learned `q_norm` and then the second unweighted RMS
+renormalization shown above.
+
+RoPE views adjacent pairs in the last `RD=64` dimensions as complex numbers,
+multiplies by `exp(i*p*freq_j)`, and copies the FP32 result back to the original
+tensor dtype. Inverse RoPE uses the complex conjugate
+(`model.py` [232-244](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/blob/60d8d70770c6776ff598c94bb586a859a38244f1/inference/model.py#L232-L244)).
+For compressed layers, `base=compress_rope_theta=160000`,
+`original_seq_len=65536`, `factor=16`, `beta_fast=32`, and `beta_slow=1`.
+For frequency pair `j`:
+
+```text
+base_freq_j = base^(-2j/RD)
+low  = max(floor(RD * log(original_seq_len/(beta_fast*2*pi))
+                 / (2*log(base))), 0)
+high = min(ceil(RD * log(original_seq_len/(beta_slow*2*pi))
+                 / (2*log(base))), RD-1)
+r_j  = clamp((j-low)/(high-low), 0, 1)
+freq_j = base_freq_j * (1-r_j) + (base_freq_j/factor) * r_j
+```
+
+For the pinned constants this evaluates to `low=15`, `high=25`. The exact
+clamping is in `model.py`
+[199-229](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/blob/60d8d70770c6776ff598c94bb586a859a38244f1/inference/model.py#L199-L229).
+Ratio-0 layers disable YaRN and use `rope_theta=10000`
+(`model.py` [475-482](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/blob/60d8d70770c6776ff598c94bb586a859a38244f1/inference/model.py#L475-L482)).
+
+The in-place FP8 simulation is per 64 non-RoPE dimensions. With the official
+inference config, its scale is power-of-two:
+
+```text
+amax  = max(max(abs(block)), 1e-4)
+scale = 2^ceil(log2(amax/448))
+y     = cast_BF16(cast_FP8_E4M3(clamp(x/scale, -448, 448)) * scale)
+```
+
+The kernel computes `amax` and scaling in FP32
+(`kernel.py` [41-100](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/blob/60d8d70770c6776ff598c94bb586a859a38244f1/inference/kernel.py#L41-L100)).
+
+### CSA: learned compression and exact cache/carry layout
+
+The compressor source is `model.py`
+[279-377](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/blob/60d8d70770c6776ff598c94bb586a859a38244f1/inference/model.py#L279-L377).
+It first casts `x` to FP32 and evaluates FP32 projections:
+
+```text
+coff = 2 if R == 4 else 1
+u_t = Wcompress_kv x_t       # FP32[coff*D]
+g_t = Wcompress_gate x_t     # FP32[coff*D]
+a_p = APE[p]                 # FP32[coff*D], p = absolute_position mod R
+```
+
+The softmax gate is **per output dimension**, not one scalar per token.
+
+For `R=128`, compressed record `z_c : FP32[D]` for complete block
+`t=cR..cR+R-1` is:
+
+```text
+alpha_{t,d} = exp(g_{t,d}+a_{t mod R,d})
+              / sum_{u=cR}^{cR+R-1} exp(g_{u,d}+a_{u mod R,d})
+z_{c,d} = sum_{t=cR}^{cR+R-1} alpha_{t,d} * u_{t,d}.
+```
+
+For `R=4`, split `u_t` and `g_t+a_p` into left/right `D`-wide channels.
+Record `c` pools `2R` candidates:
+
+```text
+J_c =
+  {(t=(c-1)R+p, left)  | p=0..R-1}, if c > 0
+  union
+  {(t=cR+p, right)     | p=0..R-1}.
+
+alpha_{j,d} = softmax over j in J_c of (g_{j,d} + a_{p(j),channel(j),d})
+z_{c,d} = sum_{j in J_c} alpha_{j,d} * u_{j,d}.
+```
+
+For `c=0`, the missing previous-block candidates are represented exactly as
+zero values with `-inf` scores. The governing transform is:
+
+```python
+new_tensor[:, :, ratio:] = tensor[:, :, :, d:]
+new_tensor[:, 1:, :ratio] = tensor[:, :-1, :, :d]
+```
+
+(`model.py` [307-314](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/blob/60d8d70770c6776ff598c94bb586a859a38244f1/inference/model.py#L307-L314)).
+
+After FP32 pooling, the record is finalized in this exact order:
+
+```text
+z = cast_BF16(z)
+z = RMSNorm(z)                                     # FP32 internal, BF16 output
+z[..., D-RD:D] = RoPE(z[..., D-RD:D], block_start)
+if attention compressor:
+    z[..., 0:D-RD] = fake_fp8_dequant(z[..., 0:D-RD])  # groups of 64
+if index compressor:
+    z = Hadamard(z, scale=1/sqrt(D))
+    z = fake_fp4_dequant(z)                            # groups of 32
+```
+
+The compressed RoPE position is the **uncompressed block start** `cR`, not
+compressed index `c`: prefill uses `freqs_cis[0:cutoff:R]`; decode uses
+`start_pos+1-R` (`model.py` [362-376](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/blob/60d8d70770c6776ff598c94bb586a859a38244f1/inference/model.py#L362-L376)).
+
+Actual reference state, replacing the placeholder `CW`/`ICW` descriptions in
+§4.3, is:
+
+| Stream | Persistent records | Incremental `kv_state` | Incremental `score_state` |
+|---|---|---|---|
+| attention, `R=4` | `T[B,max_seq_len/4,D]` | `FP32[B,8,2D]` | `FP32[B,8,2D]`, initialized `-inf` |
+| attention, `R=128` | `T[B,max_seq_len/128,D]` | `FP32[B,128,D]` | `FP32[B,128,D]`, initialized `-inf` |
+| index key, `R=4` | `T[B,max_seq_len/4,ID]` | `FP32[B,8,2ID]` | `FP32[B,8,2ID]`, initialized `-inf` |
+
+For an overlapping `R=4` decode carry, slots `0:4` contain the last completed
+block's full `2D` projections and slots `4:8` contain the current block. At a
+boundary, the source concatenates `state[:,0:4,:D]` with
+`state[:,4:8,D:]`, performs the dimension-wise FP32 softmax pool, then shifts
+the current full block into slots `0:4`
+(`model.py` [344-359](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/blob/60d8d70770c6776ff598c94bb586a859a38244f1/inference/model.py#L344-L359)).
+For `R=128`, slot `absolute_position mod 128` is updated and one record is
+emitted exactly when `(absolute_position+1) mod 128 == 0`.
+
+Prefill emits `floor(S/R)` records. An incomplete suffix emits no record and is
+copied into the carry. For `R=4`, the final complete block is also retained in
+the previous-block half so the next record can overlap it
+(`model.py` [325-342](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/blob/60d8d70770c6776ff598c94bb586a859a38244f1/inference/model.py#L325-L342)).
+
+### CSA: ratio-4 index scoring and selection
+
+The ratio-4 indexer is fixed by `model.py`
+[380-433](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/blob/60d8d70770c6776ff598c94bb586a859a38244f1/inference/model.py#L380-L433).
+It has an independent `R=4`, `ID=128` compressor with the overlap rule above.
+For `qr : T[B,S,1024]` from the main query path:
+
+```text
+qi = reshape(Windex_q qr, [B,S,Il,ID])               # T
+qi[..., ID-RD:ID] = RoPE(qi[..., ID-RD:ID], p)
+qi = Hadamard(qi, scale=1/sqrt(ID))
+qi = fake_fp4_dequant(qi)                             # T, group size 32
+
+ki = index_compressor(x)                              # T[B,Ctotal,ID]
+w  = Windex_weight x * (ID^(-1/2) * I^(-1/2))       # T[B,S,Il]
+
+dot_{b,s,i,c} = sum_d qi[b,s,i,d] * ki[b,c,d]
+score_{b,s,c} = sum_i relu(dot_{b,s,i,c}) * w[b,s,i]
+```
+
+Tensor-parallel ranks sum `score` with `all_reduce`. There is no additional
+scale on `dot`; the only explicit scale is on `w`. Neither the `einsum` nor the
+head reduction has an explicit FP32 cast in Python.
+
+For prefill (`start_pos=0`), candidate compressed record `c` is causal iff
+
+```text
+c < floor((s+1)/R).
+```
+
+All other scores become `-inf`. The source then executes exactly:
+
+```text
+topk_idxs = score.topk(min(512, floor((start_pos+S)/R)), dim=-1)[1]
+```
+
+with PyTorch defaults `largest=True, sorted=True`. Invalid prefill selections
+are rewritten to `-1`; valid compressed indices receive an offset equal to `S`
+for the prefill-local concatenated KV tensor or `W=128` for the persistent
+decode cache. The fake-FP4 operation is:
+
+```text
+amax  = max(max(abs(block32)), 6*2^-126)
+scale = 2^ceil(log2(amax/6))
+y     = cast_BF16(cast_FP4_E2M1(clamp(x/scale, -6, 6)) * scale)
+```
+
+with FP32 `amax` and scale computation
+(`kernel.py` [128-200](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/blob/60d8d70770c6776ff598c94bb586a859a38244f1/inference/kernel.py#L128-L200)).
+
+### CSA: candidate list, sparse softmax, sink, and output
+
+The candidate index list is assembled in this order
+(`model.py` [255-276](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/blob/60d8d70770c6776ff598c94bb586a859a38244f1/inference/model.py#L255-L276),
+[501-515](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/blob/60d8d70770c6776ff598c94bb586a859a38244f1/inference/model.py#L501-L515)):
+
+```text
+ratio 0:   [causal sliding-window indices]
+ratio 4:   [causal sliding-window indices, learned top-k compressed indices]
+ratio 128: [causal sliding-window indices, every completed compressed index]
+```
+
+For prefill query `s`, the window indices are ascending
+`max(0,s-W+1)..s`, padded by `-1`. For decode after the ring is full, the
+physical ring order is
+`[(start_pos mod W)+1 .. W-1, 0 .. (start_pos mod W)]`, oldest to newest.
+For ratio 128, compressed indices are ascending
+`0..floor((absolute_query_position+1)/128)-1`. Thus ratio 128 has no second
+selection rule: it attends every completed compressed record.
+
+Prefill sparse-attention KV is:
+
+```text
+ratio 0:   kv_all : T[B,S,D]
+ratio > 0: kv_all = concat(current_dense_kv, compressed_kv, dim=1)
+                     : T[B,S+floor(S/R),D].
+```
+
+Decode uses the persistent
+`T[B,W + max_seq_len/R,D]` buffer: the first `W` records are the dense ring and
+the remaining records are compressed. The selected indices are converted to
+`int32` immediately before the kernel
+(`model.py` [507-533](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/blob/60d8d70770c6776ff598c94bb586a859a38244f1/inference/model.py#L507-L533)).
+
+The sparse kernel contract is:
+
+```text
+q           BF16[B,S,Nl,D]
+kv_all      BF16[B,Nkv,D]
+attn_sink   FP32[Nl]
+indices     INT32[B,S,L], where -1 is invalid
+output      BF16[B,S,Nl,D]
+softmax_scale = D^(-1/2) = 512^(-1/2)
+```
+
+For each `(b,s,h)`, indices are processed in their supplied order in blocks of
+64. The exact online algorithm is:
+
+```text
+m = -inf_fp32
+Z = 0_fp32
+O = zeros_fp32[D]
+
+for each 64-index block:
+    ell_j = dot_BF16(q, kv[index_j]) * D^(-1/2)   # FP32 score accumulator
+    ell_j = -inf if index_j == -1
+    m_new = max(m, max_j ell_j)
+    r = exp(m - m_new)
+    p_j = exp(ell_j - m_new)                      # FP32
+    Z = Z*r + sum_j p_j                           # FP32
+    O = O*r + sum_j cast_BF16(p_j) * kv[index_j] # BF16 GEMM, FP32 O
+    m = m_new
+
+Z = Z + exp(attn_sink[h] - m)                    # FP32; sink is not in max()
+O = O / Z
+output = cast_BF16(O)
+```
+
+Invalid records load a zero value and receive `-inf` score. The learned sink
+contributes denominator mass only; it has no value vector. Note that the
+implementation adds the sink only after the online maximum has been computed,
+rather than including it in `m`. These details, including the BF16 cast of
+`p_j` before the value GEMM, are fixed by `kernel.py`
+[293-350](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/blob/60d8d70770c6776ff598c94bb586a859a38244f1/inference/kernel.py#L293-L350).
+
+Attention output assembly is:
+
+```text
+o[..., D-RD:D] = inverse_RoPE(o[..., D-RD:D], query_position)
+o = reshape(o, [B,S,o_groups=8,-1])
+u[b,s,g,r] = sum_d o[b,s,g,d] * Wo_a[g,r,d]      # BF16 einsum
+y = Wo_b(flatten(u, groups_and_rank))             # T[B,S,H]
+```
+
+(`model.py` [534-543](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/blob/60d8d70770c6776ff598c94bb586a859a38244f1/inference/model.py#L534-L543)).
+
+### MTP block structure and the contract that is actually present
+
+The official configuration has exactly one next-token-prediction layer:
+`num_nextn_predict_layers=1`. The inference model constructs one `MTPBlock`
+after the 43 target blocks and assigns it the **same module objects** as the
+target embedding and LM head:
+
+```python
+self.mtp[-1].embed = self.embed
+self.mtp[-1].head = self.head
+```
+
+(`model.py` [769-799](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/blob/60d8d70770c6776ff598c94bb586a859a38244f1/inference/model.py#L769-L799)).
+There are no per-step embedding or unembedding copies. The embedding and LM
+head are nevertheless distinct from each other (`tie_word_embeddings=false`);
+MTP shares each with its corresponding target component.
+
+One MTP invocation is defined for:
+
+```text
+x_in      T[B,S,C,H]   target/HC state supplied by the caller
+input_ids int64[B,S]
+start_pos scalar absolute position
+```
+
+and executes:
+
+```text
+e = target_embedding(input_ids)                  # T[B,S,H]
+e = RMSNorm_mtp_embedding(e)
+h = RMSNorm_mtp_hidden(x_in)                     # T[B,S,C,H], per lane
+u = W_e e[:, :, None, :] + W_h h                 # T[B,S,C,H], embedding broadcasts
+x_block = MTP_Block_43(u, start_pos, input_ids)  # T[B,S,C,H]
+logits = shared_target_head(x_block)              # FP32[B,vocab], final position only
+```
+
+The ordering is exact from `model.py`
+[738-766](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/blob/60d8d70770c6776ff598c94bb586a859a38244f1/inference/model.py#L738-L766).
+Compression schedule entry 43 is `0`, so this MTP block uses its own
+sliding-window attention cache and no compressed-attention/index cache.
+
+The inherited block updates HC state twice, once around attention and once
+around MoE. For `r : T[B,S,C,H]`, it flattens the last two dimensions to FP32,
+computes
+
+```text
+rho = rsqrt(mean(flatten(r)^2) + 1e-6)
+mixes = W_hc flatten(r) * rho                     # FP32[B,S,(2+C)C]
+pre_j  = sigmoid(mixes_j*s0 + base_j) + 1e-6
+post_j = 2*sigmoid(mixes_{C+j}*s1 + base_{C+j})
+comb   = Sinkhorn(mixes_tail*s2 + base_tail)      # FP32[C,C], 20 iterations
+reduced = sum_j pre_j * r_j                       # T[B,S,H]
+updated_j = post_j * branch_output
+            + sum_i comb_{i,j} * r_i              # T[B,S,C,H]
+```
+
+The Sinkhorn initialization is row-softmax plus epsilon, followed by column
+normalization, then 19 row/column normalization iterations
+(`kernel.py` [372-438](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/blob/60d8d70770c6776ff598c94bb586a859a38244f1/inference/kernel.py#L372-L438)).
+The block application is fixed by `model.py`
+[647-700](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/blob/60d8d70770c6776ff598c94bb586a859a38244f1/inference/model.py#L647-L700).
+
+The shared head collapses HC lanes with:
+
+```text
+flat = flatten(x_block).float()
+rho = rsqrt(mean(flat^2) + 1e-6)
+pre_j = sigmoid((W_head flat * rho)_j * scale + base_j) + 1e-6
+collapsed = cast_T(sum_j pre_j * x_block_j)
+normalized = RMSNorm_target(collapsed)
+logits = W_lm_fp32 * normalized[:, -1, :].float()
+```
+
+and therefore returns FP32 logits for only the final sequence position
+(`model.py` [703-735](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/blob/60d8d70770c6776ff598c94bb586a859a38244f1/inference/model.py#L703-L735)).
+
+### MTP generation, verification, and acceptance
+
+The pinned official reference contains **no MTP inference loop**. This is a
+source fact, not an inferred omission:
+
+- `Transformer.forward` runs only `self.layers` and the target head; it never
+  calls `self.mtp` (`model.py`
+  [801-809](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/blob/60d8d70770c6776ff598c94bb586a859a38244f1/inference/model.py#L801-L809)).
+- `generate.py` performs ordinary autoregressive generation and never accesses
+  `model.mtp` (`generate.py`
+  [27-69](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/blob/60d8d70770c6776ff598c94bb586a859a38244f1/inference/generate.py#L27-L69)).
+- `MTPBlock.forward` returns only logits, not `x_block`; consequently the
+  official API exposes no recurrent MTP hidden state to feed a second MTP step.
+
+The only official greedy selection equation available is:
+
+```text
+logits = model.forward(tokens[:, prev_pos:cur_pos], prev_pos)
+next_token = argmax(logits, dim=-1)                # when temperature <= 0
+next_token = prompt_token if cur_pos is still prompt, else next_token
+stop when every generated row emits eos
+```
+
+For temperature sampling, the reference instead computes FP32
+`softmax(logits/max(temperature,1e-5))` and uses exponential-noise
+Gumbel-max (`generate.py`
+[19-24](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/blob/60d8d70770c6776ff598c94bb586a859a38244f1/inference/generate.py#L19-L24)).
+There is no official draft width, target verification forward, longest-prefix
+acceptance equation, correction-token rule, bonus-token rule, or MTP cache
+lifetime in these files. Those items are therefore **not frozen** by this
+snapshot and must not be invented from the existing runtime loop.
+
+Per §10 Q14, the runtime correctness gates are:
+
+```text
+greedy selected token IDs: bit-identical integer equality, mandatory
+FP16/BF16 compressor/index/attention intermediates:
+    tolerance allowed only after per-layer calibration against official goldens
+    from this pinned source; no guessed global tolerance
+```
+
+### Configuration constants that pin this contract
+
+Values are from official `config.json`
+[10-66](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/blob/60d8d70770c6776ff598c94bb586a859a38244f1/config.json#L10-L66)
+and executable `inference/config.json`
+[1-34](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/blob/60d8d70770c6776ff598c94bb586a859a38244f1/inference/config.json#L1-L34):
+
+```text
+hidden_size / dim                  4096
+num_hidden_layers / n_layers      43
+num_nextn_predict_layers          1 (ModelArgs default n_mtp_layers=1)
+num_attention_heads / n_heads     64
+num_key_value_heads               1
+head_dim                          512
+qk_rope_head_dim / rope_head_dim  64
+non-RoPE head dimension           448
+q_lora_rank                       1024
+o_groups                          8
+o_lora_rank                       1024
+sliding_window / window_size      128
+index_n_heads                     64
+index_head_dim                    128
+index_topk                        512
+hc_mult                           4
+hc_sinkhorn_iters                 20
+hc_eps / rms_norm_eps             1e-6
+rope_theta                        10000
+compress_rope_theta               160000
+YaRN original length              65536
+YaRN factor                       16
+YaRN beta_fast / beta_slow        32 / 1
+torch activation dtype            bfloat16
+default projection-weight dtype   FP8 E4M3, 128x128 weight blocks
+default linear activation block   128
+compressor Wkv/Wgate dtype         FP32
+APE, RMS weights, sink, LM head   FP32
+index weights_proj dtype           BF16
+compression ratios                4 (overlap factor 2), 128 (factor 1)
+index Q/K simulation              FP4 E2M1, block size 32, power-of-two scale
+attention non-RoPE simulation     FP8 E4M3, block size 64, power-of-two scale
+sparse-attention tile             64 selected indices
+```
+
+The 44-entry compression schedule covers 43 target layers plus the one MTP
+layer:
+
+```text
+layer 0=0, layer 1=0,
+target layers 2..42 alternate 4,128 and end at layer 42=4,
+MTP layer 43=0.
+```
+
+Thus the target has 21 ratio-4 layers, 20 ratio-128 layers, and two ratio-0
+layers. The MTP layer is the third ratio-0 schedule entry. The HF config's
+maximum position is `1,048,576`; the standalone reference runner's
+`ModelArgs.max_seq_len` default is `4096` unless the caller overrides it
+(`model.py`
+[34-80](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/blob/60d8d70770c6776ff598c94bb586a859a38244f1/inference/model.py#L34-L80)).
+
+### Open deltas
+
+1. **MTP recurrence is absent.** The source computes `x_block` but returns only
+   logits. It does not establish that post-block, pre-head `x_block` is the
+   state for the next MTP step. Mobius must not label that tensor `mtp_state`
+   as an official recurrence until DeepSeek publishes or confirms the loop, or
+   an official golden demonstrates the transition.
+2. **MTP verification/acceptance is absent.** `generate.py` is target-only
+   autoregressive decoding. The proposed reuse of
+   `generate_speculative_loop`, longest-prefix acceptance, correction/bonus
+   behavior, and proposal-local versus accepted-prefix MTP KV are runtime
+   design choices, not yet official DeepSeek numerical contract.
+3. **Top-k ties are not portable.** The only rule in source is CUDA
+   `torch.topk(..., largest=True, sorted=True)`. PyTorch does not promise stable
+   indices for equal values, and the official
+   [`inference/requirements.txt`](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/blob/60d8d70770c6776ff598c94bb586a859a38244f1/inference/requirements.txt#L1-L5)
+   specifies `torch>=2.10.0` rather than an exact build. Layout-v1 goldens must
+   record tie cases, or the contract needs an explicit DeepSeek-approved tie
+   rule before a portable CPU implementation can claim bit identity.
+4. **Hadamard dependency is unpinned.** `rotate_activation` calls external
+   `fast_hadamard_transform.hadamard_transform(x, scale=D^-0.5)`
+   (`model.py`
+   [247-251](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/blob/60d8d70770c6776ff598c94bb586a859a38244f1/inference/model.py#L247-L251)),
+   while `inference/requirements.txt` gives no version. The exact transform
+   ordering/build must be captured in the golden environment.
+5. **Some backend arithmetic is implicit.** Index `einsum`, weighted head
+   reduction, BF16 output projection `einsum`, and `torch.topk` have no explicit
+   accumulator/backend contract in Python. Official GPU goldens, CUDA/PyTorch
+   versions, and per-layer error distributions must accompany the equations.
+6. **Mobius CSA layouts must be corrected to the source.** Stored compressed
+   attention records are width `D`, stored index records are width `ID`, and
+   overlap carries are raw FP32 `[B,2R,2D]` / `[B,2R,2ID]`, not a single opaque
+   `CW` record width. Mobius must emit the projected `u`, `g`, and APE streams
+   in the exact channel order above and preserve FP32 compression before the
+   BF16 norm/RoPE/quantization sequence.
+7. **Mobius MTP export needs two separately justified outputs.** A shared LM
+   head input may use the official normalized collapsed hidden value, but an
+   iterative sidecar needs an official recurrent HC state. The current exporter
+   must not reconstruct `[B,S,C,H]` by broadcasting `[B,S,H]`, and it must not
+   claim official acceptance semantics merely because the target embedding and
+   head are shared.
