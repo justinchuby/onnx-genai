@@ -10,10 +10,14 @@ categories = ["api-bindings", "science"]
 
 [features]
 default = []
-cuda = []
+# `cuda` pulls in `libloading` so the shared-KV grow path can dynamically load
+# cudart and issue device-to-device copies (see `src/cuda_rt.rs`). It is not
+# linked at build time, keeping non-CUDA builds free of a CUDA toolkit.
+cuda = ["dep:libloading"]
 
 [dependencies]
 half = { version = "2", features = ["use-intrinsics"] }
+libloading = { version = "0.8", optional = true }
 minijinja = { version = "2", features = ["json"] }
 onnx-genai-metadata = { workspace = true }
 onnx-genai-runtime-config = { workspace = true }
