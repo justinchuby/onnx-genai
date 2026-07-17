@@ -854,17 +854,6 @@ fn check_multi_device_node<'a>(
                     }
                 }
                 for simple in &sharded_dim.simple_sharding {
-                    if simple.dim.is_none() {
-                        violations.push(proto_node_violation(
-                            rule_id,
-                            graph_name,
-                            node,
-                            format!(
-                                "sharded axis {} for tensor '{}' has no dim_value or dim_param",
-                                sharded_dim.axis, sharding.tensor_name
-                            ),
-                        ));
-                    }
                     if simple.num_shards <= 0 {
                         violations.push(proto_node_violation(
                             rule_id,

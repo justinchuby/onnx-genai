@@ -704,13 +704,25 @@ fn multi_device_checker_accepts_valid_annotations_and_rejects_invalid_ones() {
         "valid multi-device fixture must pass"
     );
 
+    let mut valid_without_dim_proto = full_spec_proto();
+    valid_without_dim_proto.graph.as_mut().unwrap().node[0].device_configurations[0]
+        .sharding_spec[0]
+        .sharded_dim[0]
+        .simple_sharding[0]
+        .dim = None;
+    let valid_without_dim = Model::from_proto(valid_without_dim_proto).unwrap();
+    assert!(
+        rule.check(&valid_without_dim, &ValidationContext::default())
+            .is_empty(),
+        "SimpleShardedDimProto.dim is optional when num_shards is present"
+    );
+
     let mut invalid_proto = full_spec_proto();
     invalid_proto.ir_version = 10;
     invalid_proto.configuration[0].device.pop();
     let node = &mut invalid_proto.graph.as_mut().unwrap().node[0];
     node.device_configurations[0].configuration_id = "missing".into();
     node.device_configurations[0].sharding_spec[0].sharded_dim[0].axis = 4;
-    node.device_configurations[0].sharding_spec[0].sharded_dim[0].simple_sharding[0].dim = None;
     node.device_configurations[0].sharding_spec[0].sharded_dim[0].simple_sharding[0].num_shards = 0;
     let mut unknown_tensor = node.device_configurations[0].sharding_spec[0].clone();
     unknown_tensor.tensor_name = "not-an-edge".into();
@@ -738,7 +750,6 @@ fn multi_device_checker_accepts_valid_annotations_and_rejects_invalid_ones() {
         "require IR version 11 or newer",
         "not a named node input or output",
         "outside [-2, 1]",
-        "has no dim_value or dim_param",
         "positive num_shards",
     ] {
         assert!(

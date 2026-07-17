@@ -73,7 +73,7 @@ tensors/types/functions
 | `NodeDeviceConfigurationProto` | `configuration_id`(1), `sharding_spec`(2), `pipeline_stage`(3) | ✅ | ✅ configuration reference; ⚠️ sharding checks; `pipeline_stage` N/A | ⚠️ extension | ✅ | ✅ |
 | `ShardingSpecProto` | `tensor_name`(1), `device`(2), `index_to_device_group_map`(3), `sharded_dim`(4) | ✅ | ✅ tensor-name match; ❌ device/group-map semantics | ⚠️ extension | ✅ | ✅ |
 | `ShardedDimProto` | `axis`(1), `simple_sharding`(2) | ✅ | ✅ axis when rank is known; ⚠️ unknown-rank tensors cannot be range-checked | ⚠️ extension | ✅ | ✅ |
-| `SimpleShardedDimProto` | oneof `dim_value`(1)/`dim_param`(2), `num_shards`(3) | ✅ | ✅ oneof presence and positive shard count | ⚠️ extension | ✅ | ✅ |
+| `SimpleShardedDimProto` | oneof `dim_value`(1)/`dim_param`(2), `num_shards`(3) | ✅ | ✅ optional dimension oneof and required positive shard count | ⚠️ extension | ✅ | ✅ |
 | `TrainingInfoProto` | `initialization`(1), `algorithm`(2), `initialization_binding`(3), `update_binding`(4) | ✅ | ❌ training graph combination/binding semantics | ⚠️ extension | ✅ | ✅ |
 | `ModelProto` | `ir_version`(1), `producer_name`(2), `producer_version`(3), `domain`(4), `model_version`(5), `doc_string`(6), `graph`(7), `opset_import`(8), `metadata_props`(14), `training_info`(20), `functions`(25), `configuration`(26) | ✅ | ⚠️ IR-present/opset/graph/multi-device checks; remaining model invariants ❌ | ⚠️ IR/opset/graph native; other fields extension | ✅ | ✅ |
 | `DeviceConfigurationProto` | `name`(1), `num_devices`(2), `device`(3) | ✅ | ✅ required name, positive count, optional name-list cardinality, unique IDs | ⚠️ extension | ✅ | ✅ |
@@ -212,8 +212,8 @@ The exact field wiring is:
 
 `MultiDeviceConfigurationRule` checks the IR-version gate, model configuration
 names/counts, device name cardinality, node configuration references,
-tensor-name references, known-rank axis ranges, dimension-oneof presence, and
-positive shard counts
+tensor-name references, known-rank axis ranges, optional dimension-oneof
+handling, and required positive shard counts
 ([`check/rules.rs:667-992`](../crates/onnx-rs/src/check/rules.rs#L667-L992)).
 It recursively checks main/nested/training graphs and function nodes.
 
@@ -250,9 +250,10 @@ Deferred multi-device checker items:
   sharded dimensions is encoded, decoded, and re-encoded byte-identically.
 - Text: readable Text, protobuf TextFormat, and canonical protobuf JSON each
   round-trip the same multi-device model.
-- Checker: valid distributed annotations pass; invalid device-name cardinality,
-  missing configuration IDs, unknown tensor names, out-of-range axes, missing
-  dimension oneofs, and zero shard counts are rejected.
+- Checker: valid distributed annotations, including sharding specs that omit the
+  optional dimension oneof, pass; invalid device-name cardinality, missing
+  configuration IDs, unknown tensor names, out-of-range axes, and zero shard
+  counts are rejected.
 - The fixture is synthetic. The ONNX v1.20 repository contains the schema,
   normative IR text, and proposal material, but no checked-in binary multi-device
   model fixture was found.
