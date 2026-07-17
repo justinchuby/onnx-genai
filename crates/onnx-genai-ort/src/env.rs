@@ -1,10 +1,8 @@
 //! ORT Environment (global singleton).
 
 use std::ffi::CString;
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use std::sync::Mutex;
 
 use crate::{OrtError, Result};
@@ -14,7 +12,6 @@ use crate::{OrtError, Result};
 pub struct Environment {
     ptr: NonNull<onnx_genai_ort_sys::OrtEnv>,
     _name: String,
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     registered_ep_libraries: Mutex<std::collections::HashMap<String, PathBuf>>,
 }
 
@@ -39,7 +36,6 @@ impl Environment {
         Ok(Self {
             ptr: NonNull::new(ptr).ok_or(OrtError::NullPointer)?,
             _name: name.to_string(),
-            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             registered_ep_libraries: Mutex::new(std::collections::HashMap::new()),
         })
     }
@@ -48,7 +44,6 @@ impl Environment {
         self.ptr.as_ptr()
     }
 
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     pub(crate) fn register_execution_provider_library(
         &self,
         registration_name: &str,
@@ -70,18 +65,41 @@ impl Environment {
         let name = CString::new(registration_name).map_err(|_| {
             OrtError::InvalidArgument("execution provider registration name contains NUL".into())
         })?;
-        let path_c = CString::new(path.to_string_lossy().as_bytes()).map_err(|_| {
-            OrtError::InvalidArgument("execution provider library path contains NUL".into())
-        })?;
         let api = crate::error::api()?;
         let register = api
             .RegisterExecutionProviderLibrary
             .ok_or(OrtError::ApiUnavailable("RegisterExecutionProviderLibrary"))?;
-        // SAFETY: the environment is live, and both C strings are NUL-terminated
-        // and remain valid for the duration of the registration call.
-        crate::error::check_status(unsafe {
-            register(self.ptr.as_ptr(), name.as_ptr(), path_c.as_ptr())
-        })?;
+
+        // ORT's `RegisterExecutionProviderLibrary` takes the library path as
+        // `ORTCHAR_T*`, which is `wchar_t` (UTF-16) on Windows and `char`
+        // (UTF-8) elsewhere. Encode accordingly.
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::OsStrExt;
+            let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+            if wide.contains(&0) {
+                return Err(OrtError::InvalidArgument(
+                    "execution provider library path contains NUL".into(),
+                ));
+            }
+            wide.push(0);
+            // SAFETY: the environment is live, `name` is NUL-terminated, and
+            // `wide` is a NUL-terminated UTF-16 buffer valid for the call.
+            crate::error::check_status(unsafe {
+                register(self.ptr.as_ptr(), name.as_ptr(), wide.as_ptr())
+            })?;
+        }
+        #[cfg(not(windows))]
+        {
+            let path_c = CString::new(path.to_string_lossy().as_bytes()).map_err(|_| {
+                OrtError::InvalidArgument("execution provider library path contains NUL".into())
+            })?;
+            // SAFETY: the environment is live, and both C strings are
+            // NUL-terminated and valid for the duration of the call.
+            crate::error::check_status(unsafe {
+                register(self.ptr.as_ptr(), name.as_ptr(), path_c.as_ptr())
+            })?;
+        }
         registered.insert(registration_name.to_string(), path.to_path_buf());
         Ok(())
     }

@@ -23,6 +23,11 @@ pub enum ExecutionProvider {
     Metal,
     /// Core ML execution provider.
     CoreMl,
+    /// A generic execution-provider plugin loaded from a shared library
+    /// (`ONNX_GENAI_EP_LIBRARY`). The concrete provider (e.g. OpenVINO,
+    /// NV TensorRT RTX) is discovered from the plugin at runtime, so no
+    /// provider name is hardcoded.
+    Plugin,
     /// An unsupported normalized provider name.
     Unsupported(String),
 }
@@ -76,6 +81,27 @@ pub struct RuntimeConfig {
     pub shared_kv_present_binding: bool,
     /// `ONNX_GENAI_METAL_EP_LIB` (`PathBuf`, default: unset): points to the external Metal EP dynamic library.
     pub metal_ep_lib: Option<PathBuf>,
+    /// `ONNX_GENAI_EP_LIBRARY` (`PathBuf`, default: unset): points to a generic
+    /// ORT execution-provider plugin shared library (e.g. the
+    /// `onnxruntime-ep-openvino` plugin). Used when `ONNX_GENAI_EP=plugin`.
+    pub ep_library: Option<PathBuf>,
+    /// `ONNX_GENAI_EP_NAME` (`String`, default: unset): optional registration
+    /// name for the plugin library. Only a handle passed to ORT's
+    /// `RegisterExecutionProviderLibrary`; it does NOT need to match the
+    /// provider's internal name. Defaults to one derived from the library file
+    /// name when unset.
+    pub ep_registration_name: Option<String>,
+    /// `ONNX_GENAI_EP_OPTIONS` (`Vec<(String, String)>`, default: empty):
+    /// provider-specific options for the plugin EP, parsed from a
+    /// `key=value,key=value` list and passed straight through to ORT. The keys
+    /// are provider-defined, so nothing here is hardcoded.
+    pub ep_options: Vec<(String, String)>,
+    /// `ONNX_GENAI_EP_DEVICE` (`String`, default: unset): optional hardware
+    /// device class used to narrow a plugin EP that exposes several devices
+    /// (e.g. OpenVINO advertising both GPU and CPU) down to one. Matched against
+    /// ORT's generic `OrtHardwareDeviceType` (`CPU`, `GPU`, `NPU`) — a portable
+    /// class, not a provider-specific device name, so nothing here is hardcoded.
+    pub ep_device: Option<String>,
     /// `ONNX_GENAI_PROFILE` (`bool`, default: false): enables aggregate per-stage profiling.
     pub profile: bool,
     /// `ONNX_GENAI_TRACE` (`PathBuf`, default: unset): writes a Perfetto timeline to this non-empty path.
@@ -160,6 +186,17 @@ impl RuntimeConfig {
             ),
             metal_ep_lib: env_path(&lookup, "ONNX_GENAI_METAL_EP_LIB")
                 .filter(|path| !path.as_os_str().is_empty()),
+            ep_library: env_path(&lookup, "ONNX_GENAI_EP_LIBRARY")
+                .filter(|path| !path.as_os_str().is_empty()),
+            ep_registration_name: env_string(&lookup, "ONNX_GENAI_EP_NAME")
+                .map(|value| value.trim().to_owned())
+                .filter(|value| !value.is_empty()),
+            ep_options: env_string(&lookup, "ONNX_GENAI_EP_OPTIONS")
+                .map(|value| parse_key_value_list(&value))
+                .unwrap_or_default(),
+            ep_device: env_string(&lookup, "ONNX_GENAI_EP_DEVICE")
+                .map(|value| value.trim().to_owned())
+                .filter(|value| !value.is_empty()),
             profile: matches!(
                 env_string(&lookup, "ONNX_GENAI_PROFILE").as_deref(),
                 Some("1" | "true" | "yes")
@@ -241,8 +278,29 @@ fn parse_execution_provider(value: &str) -> ExecutionProvider {
         "cuda" => ExecutionProvider::Cuda,
         "metal" => ExecutionProvider::Metal,
         "coreml" | "core-ml" | "core_ml" => ExecutionProvider::CoreMl,
+        "plugin" | "ep-plugin" | "ep_plugin" => ExecutionProvider::Plugin,
         other => ExecutionProvider::Unsupported(other.to_owned()),
     }
+}
+
+/// Parse a `key=value,key=value` list into ordered pairs.
+///
+/// Whitespace around keys, values, and separators is trimmed. Entries without
+/// an `=`, or with an empty key, are skipped. Values may be empty. The parse is
+/// intentionally provider-agnostic: keys and values are passed through verbatim
+/// so no execution-provider option name is hardcoded.
+fn parse_key_value_list(value: &str) -> Vec<(String, String)> {
+    value
+        .split(',')
+        .filter_map(|entry| {
+            let (key, val) = entry.split_once('=')?;
+            let key = key.trim();
+            if key.is_empty() {
+                return None;
+            }
+            Some((key.to_owned(), val.trim().to_owned()))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -337,6 +395,8 @@ mod tests {
             ("cuda", ExecutionProvider::Cuda),
             ("metal", ExecutionProvider::Metal),
             ("core-ml", ExecutionProvider::CoreMl),
+            ("plugin", ExecutionProvider::Plugin),
+            ("EP-Plugin", ExecutionProvider::Plugin),
             (
                 " Unknown-EP ",
                 ExecutionProvider::Unsupported("unknown-ep".to_owned()),
@@ -348,6 +408,48 @@ mod tests {
                 Some(expected)
             );
         }
+    }
+
+    #[test]
+    fn plugin_ep_library_name_and_options_parse() {
+        let actual = config(&[
+            ("ONNX_GENAI_EP", "plugin"),
+            ("ONNX_GENAI_EP_LIBRARY", "/opt/onnxruntime_ep_openvino.so"),
+            ("ONNX_GENAI_EP_NAME", " openvino_ep "),
+            (
+                "ONNX_GENAI_EP_OPTIONS",
+                "device_type=CPU, num_streams=2 ,=skipme, valid=",
+            ),
+            ("ONNX_GENAI_EP_DEVICE", " GPU "),
+        ]);
+        assert_eq!(actual.execution_provider, Some(ExecutionProvider::Plugin));
+        assert_eq!(
+            actual.ep_library,
+            Some(PathBuf::from("/opt/onnxruntime_ep_openvino.so"))
+        );
+        assert_eq!(actual.ep_registration_name.as_deref(), Some("openvino_ep"));
+        assert_eq!(actual.ep_device.as_deref(), Some("GPU"));
+        assert_eq!(
+            actual.ep_options,
+            vec![
+                ("device_type".to_owned(), "CPU".to_owned()),
+                ("num_streams".to_owned(), "2".to_owned()),
+                ("valid".to_owned(), String::new()),
+            ]
+        );
+    }
+
+    #[test]
+    fn plugin_ep_library_and_name_reject_empty() {
+        let actual = config(&[
+            ("ONNX_GENAI_EP", "plugin"),
+            ("ONNX_GENAI_EP_LIBRARY", ""),
+            ("ONNX_GENAI_EP_NAME", "   "),
+        ]);
+        assert_eq!(actual.ep_library, None);
+        assert_eq!(actual.ep_registration_name, None);
+        assert!(actual.ep_options.is_empty());
+        assert_eq!(actual.ep_device, None);
     }
 
     #[test]
