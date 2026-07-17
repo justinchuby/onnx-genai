@@ -9,3 +9,8 @@
 
 - Merged `0a105a4`: Pad inference applies begin/end values to the optional axes subset, including negative axes, yielding `[2,3,4,6]` / 576 bytes for expanded Attention.
 - Bryant 🟢 cleared the regression and suites; execution now exposes the separate `Less` Bool-dtype inference follow-up.
+
+## 2026-07-17T00:19:41+0000 — CPU ONNX Mod
+
+- Merged `aa7127e`: CPU `Mod` supports fmod modes, broadcasting, and NumPy floor-mod integer semantics; 13/13 official Mod CPU cases passed.
+- Expanded Attention now reaches missing `And` execution at node 39; direct BF16 Mod coverage remains a follow-up.

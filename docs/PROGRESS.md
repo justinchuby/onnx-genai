@@ -4,7 +4,7 @@ Tracks implementation status of `docs/DESIGN.md` (§1–§40). Updated as work l
 
 **Published:** `onnx-genai` v0.1.0 + 8 sub-crates on crates.io; the `onnx-runtime-*` layer (including `onnx-runtime-tracer`) is released as v0.1.0-dev.1. CI (fmt/build/test/**blocking clippy**) + scheduled `cargo-audit`. Coverage ~77% line.
 
-_Last updated: 2026-07-16T23:58:29+0000 — Bool shape inference and GAFF ChildExecutor foundation landed._
+_Last updated: 2026-07-17T00:19:41+0000 — GAFF If vertical slice and CPU Mod landed._
 
 
 ## Current tiered-memory and interoperability milestones
@@ -14,11 +14,11 @@ _Last updated: 2026-07-16T23:58:29+0000 — Bool shape inference and GAFF ChildE
 - **KV-insertion architecture evaluation ✅ DONE (decision-ready):** for Mobius exports, Phase 1 is functional GQA by dropping `past_present_share_buffer`; the paged-attention successor is feature-gated on correctness and M=1 latency.
 - **Follow-ups:** DLPack zero-copy **import** (unblocked by `from_borrowed_parts`); KV Phase-1 functional-GQA validation; and the liveness `MemoryPlanner` crate.
 - **CUDA MatMul stale test ✅ fixed (`3d19b72`, Roy; Wallace 🟢):** `matmul_rejects_unsupported_rank_and_dtype` now asserts the current actionable Int64 CUDA EP rejection instead of obsolete “Phase 2a” terminology; all **129/129** CUDA tests passed.
-- **GAFF control-flow foundation ▶ started (`2a9e5b1`, Sapper; Leon 🟢):** the loader records ordered typed subgraph formal I/O and scoped inline initializers, including `UNDEFINED` graph attributes and nested subgraphs. **Next:** child-executor implementation and If/Loop/Scan execution.
 - **Pad opset-18 axes shape inference ✅ fixed (`0a105a4`, Joi; Bryant 🟢):** optional `axes` now maps Pad values to the correct dimensions; expanded Attention infers `[2,3,4,6]` / **576 bytes**, not 640.
 - **Comparison/logical Bool output inference ✅ landed (`d06d1e7`, Chew; Leon 🟢):** `Less`, `LessOrEqual`, `Greater`, `GreaterOrEqual`, `Equal`, `And`, `Or`, `Xor`, and `Not` now infer `tensor(bool)` while preserving broadcast/unary shapes; bitwise ops remain untouched.
-- **GAFF control-flow child-executor foundation ✅ landed (Sapper; Holden 🟡 advisory):** `ChildExecutor` provides lazy signature-cached compilation, lexical captures, scoped inline initializers, recursive nested scopes, and ordered outputs. **Next:** implement `If` using children keyed by `(node_id, branch)`.
-- **Known follow-ups:** unsupported `Mod` blocks expanded Attention at node 50 (`mod-op-support`); `ChildExecutor` currently retains only its most recent signature plan, so add a multi-signature cache (`gaff-exec-cache-lru`).
+- **GAFF `If` control-flow vertical slice ✅ landed (`7a369ef`, Sapper; Holden 🟢):** loader metadata → `ChildExecutor` → `If` is complete. Branches use BOOL conditions, live lexical captures, and `(node_id, branch)` caches with output count/dtype validation. **Next:** `Loop` and `Scan`.
+- **CPU `Mod` ✅ landed (Joi; Bryant 🟡 advisory):** CPU EP and shape inference support `fmod` plus NumPy floor-mod integer semantics; all 13 official ONNX Mod CPU cases pass.
+- **Known follow-ups:** logical `And`/`Or`/`Xor`/`Not` KERNELS (expanded-Attention node 39 blocker), direct Mod BF16 coverage, and ChildExecutor multi-signature caching.
 
 ## ORT 2.0 — from-scratch Rust ONNX runtime (`docs/ORT2.md`, big design — steady progress)
 

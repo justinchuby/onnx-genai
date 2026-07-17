@@ -13,3 +13,7 @@
 
 - 🟢 Cleared Joi's `0a105a4`: Pad applies opset-18 axes in order, preserves other dimensions, and normalizes negative axes.
 - The expanded-Attention regression proves `[2,3,4,6]` / 576 bytes; the later Less Float32-vs-Bool inference fault is pre-existing.
+
+## 2026-07-17T00:19:41+0000 — CPU ONNX Mod review
+
+- 🟡 Advisory-cleared Joi's `aa7127e`: arithmetic and broadcasting are correct. Zero integer divisors follow this runtime's existing zero convention; add direct BF16 coverage.

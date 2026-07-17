@@ -1354,3 +1354,17 @@ Re-reviewed commit `2ae464b5d894276f38a5855599c0c9124ea23558` against rejected b
 **By:** Sapper; reviewed by Holden (🟡 ADVISORY)
 **What:** `onnx-runtime-session` now has crate-internal `ChildExecutor::new/run/stats` for recursive control-flow bodies. It lazily compiles a seeded child plan by external dtype/shape signature, supports lexical captures including transitive nested captures, scopes `WeightRef::Inline` initializers to the child, and returns declared outputs in order. The next execution step is `If`, which selects a child keyed by `(node_id, branch)` and runs it with the live captured scope.
 **Why:** The reusable executor avoids rebuilding body setup for every invocation while preserving formal/input shadowing and nested isolation. Build and the 114-test session suite passed. Advisory follow-up `gaff-exec-cache-lru`: the current one-entry cache is correctness-safe but recompiles an `A → B → A` signature sequence; add a signature-keyed multi-plan cache and permanent shadowing/nested-cache tests.
+
+## 2026-07-17 — GAFF If execution and CPU Mod support
+
+### Execute ONNX If branches through cached ChildExecutors
+**By:** Sapper; reviewed by Holden (🟢 CLEAR)
+**What:** Commit `7a369ef` completes ONNX `If` in `onnx-runtime-session`: BOOL scalar or `[1]` conditions select the corresponding branch, captures are materialized from the live enclosing scope, and branch-specific `ChildExecutor`s are cached by `(node_id, branch)`. The runtime validates branch output count and known dtypes before execution, then binds outputs positionally.
+**Why:** Independent branch caches preserve alternating true/false execution while lexical captures stay fresh. Tests cover branch reuse, capture changes, inline initializers, condition validation, and output mismatches; the session build and all 117 tests passed. This completes the loader → ChildExecutor → If GAFF control-flow vertical slice. Loop and Scan remain.
+
+### Add CPU Mod with ONNX fmod modes and NumPy integer semantics
+**By:** Joi; reviewed by Bryant (🟡 ADVISORY)
+**What:** Added `ai.onnx::Mod` (opset 10+) to CPU execution and shape inference. `fmod=0` implements floor-mod integer semantics (divisor-sign result); `fmod=1` implements C/Rust sign-of-dividend remainder for integers and floats. Shared broadcasting supports signed/unsigned 8–64-bit integers and f16/bf16/f32/f64 where valid; integer zero divisors return zero, matching existing CPU integer `Div`.
+**Why:** Expanded Attention had stopped at unsupported `Mod`. CPU EP (435 passed, 1 ignored), shape inference (116 plus doctests), and all 13 official ONNX Mod CPU cases passed. The remaining expanded-Attention blocker is missing logical `And` execution at node 39. Direct BF16 Mod coverage and a ChildExecutor multi-signature cache remain follow-ups.
+
+**Sources:** `sapper-gaff-if.md`, `holden-sapper-gaff-if-review.md`, `joi-mod-op.md`, `bryant-joi-mod-review.md`; merged commits `7a369ef` and `aa7127e`.

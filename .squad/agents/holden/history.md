@@ -88,3 +88,7 @@ Cleared Deckard's `f795d45` executor EP-polymorphism refactor: it preserves CPU-
 
 - 🟡 Advisory-cleared Sapper's ChildExecutor foundation: lexical captures/scoped initializers and nested behavior are correct; 114 session tests passed.
 - Follow-up `gaff-exec-cache-lru`: one-entry cache safely recompiles `A → B → A`; add multi-signature caching plus permanent shadowing/nested-cache tests.
+
+## 2026-07-17T00:19:41+0000 — GAFF If review
+
+- 🟢 Cleared Sapper's `7a369ef`: branch cache separation, fresh captures, initializers, and output checks are correct; 117 session tests passed.

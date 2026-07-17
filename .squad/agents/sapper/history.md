@@ -65,3 +65,8 @@ Added the preprocessing-side prompt token-expansion library for multi-tile VLM i
 
 - Landed the recursive `ChildExecutor` foundation: lazy compile/cache by signature, lexical captures, scoped inline initializers, and nested child scopes; 114 session tests passed.
 - Next: implement `If` branches keyed by `(node_id, branch)`; expand cache storage beyond the current last-signature plan.
+
+## 2026-07-17T00:19:41+0000 — GAFF If execution
+
+- Merged `7a369ef`: ONNX `If` selects validated BOOL branches through separate `(node_id, branch)` cached ChildExecutors with fresh lexical captures and positional output binding.
+- Holden 🟢 verified alternating branches/capture freshness; 117 session tests passed. Loader → ChildExecutor → If is complete; Loop/Scan and multi-signature caching remain.
