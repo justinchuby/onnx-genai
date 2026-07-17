@@ -13,6 +13,7 @@ use onnx_runtime_quantization::{
 };
 use rayon::prelude::*;
 
+use super::block_dequant::{decode_e2m1, decode_e8m0_scale};
 use super::matmul::gemm;
 use super::{check_arity, to_dense_bytes, to_dense_f32, write_dense_f32};
 use crate::strided::numel;
@@ -37,7 +38,7 @@ const IQ1_M_BLOCK_BYTES: usize = 56;
 const IQ1_S_DELTA: f32 = 0.125;
 const IQ1_M_DELTA: f32 = 0.125;
 
-// OCP E2M1 values, doubled to pair with llama.cpp's half-scale E8M0 decode.
+// SIMD decoder uses doubled E2M1 integers with half the shared E8M0 scale.
 const E2M1_DOUBLED: [i8; 16] = [0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12];
 
 // llama.cpp commit b15ca938, ggml-common.h::kvalues_iq4nl.
@@ -303,24 +304,21 @@ impl BlockQuantizedMatMulKernel {
 fn decode_mxfp4_block(block: &[u8], output: &mut [f32]) {
     debug_assert_eq!(block.len(), MXFP4_BLOCK_BYTES);
     debug_assert_eq!(output.len(), MXFP4_QK);
-    let half_scale = e8m0_half_scale(block[0]);
+    let scale = decode_e8m0_scale(block[0]);
     for j in 0..16 {
         let packed = block[1 + j];
-        output[j] = E2M1_DOUBLED[(packed & 0x0f) as usize] as f32 * half_scale;
-        output[j + 16] = E2M1_DOUBLED[(packed >> 4) as usize] as f32 * half_scale;
+        output[j] = decode_mxfp4_value(packed, scale);
+        output[j + 16] = decode_mxfp4_value(packed >> 4, scale);
     }
 }
 
+fn decode_mxfp4_value(code: u8, scale: f32) -> f32 {
+    let value = decode_e2m1(code);
+    if value == 0.0 { 0.0 } else { value * scale }
+}
+
 fn e8m0_half_scale(exponent: u8) -> f32 {
-    match exponent {
-        // OCP E8M0 reserves 0xff for NaN. llama.cpp does not emit it.
-        0xff => f32::NAN,
-        // Exact subnormal representations of 2^-128 and 2^-127.
-        0 => f32::from_bits(0x0020_0000),
-        1 => f32::from_bits(0x0040_0000),
-        // Half of 2^(e-127) is 2^(e-128), encoded with f32 exponent e-1.
-        _ => f32::from_bits((u32::from(exponent) - 1) << 23),
-    }
+    decode_e8m0_scale(exponent) * 0.5
 }
 
 fn decode_iq4_nl_block(block: &[u8], output: &mut [f32]) {

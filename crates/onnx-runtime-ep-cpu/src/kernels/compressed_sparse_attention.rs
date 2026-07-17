@@ -1,19 +1,24 @@
-//! Phase-1 f32 reference skeleton for
-//! `pkg.nxrt::CompressedSparseAttention` v1.
+//! Correctness-first reference paths for `pkg.nxrt::CompressedSparseAttention`
+//! v1.
 //!
 //! The registered operator exposes the complete frozen stateful v1 boundary.
 //! Stateful compressor/carry updates remain an explicit Unsupported path until
-//! their equations are wired into the runtime. The Phase-1 assembled-cache
-//! gather/attention implementation remains a tested, unregistered reference.
+//! their equations are wired into the runtime. The assembled-cache reference
+//! supports f32, block-FP8, and block-FP4 caches and remains the tested
+//! gather/attention seam.
 
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ir::{DataType, Node};
 
+use super::block_dequant::{
+    FP4_E2M1_BLOCK_SIZE, FP4_E2M1_PACKED_BYTES, FP8_E4M3_BLOCK_SIZE, FP8_E4M3_PACKED_BYTES,
+    dequantize_fp4_e2m1_block, dequantize_fp8_e4m3_block,
+};
 use super::sparse_kv_gather::{
     checked_layout, checked_product, fallible_filled, read_dense_f32, read_dense_indices,
     sparse_kv_gather_masked_f32,
 };
-use super::{check_arity, write_dense_f32};
+use super::{check_arity, to_dense_bytes, write_dense_f32};
 
 const OP: &str = "CompressedSparseAttention";
 const LAYOUT_VERSION: i64 = 1;
@@ -47,6 +52,60 @@ struct CompressedSparseAttentionKernel {
     compression_ratio: usize,
     index_num_heads: usize,
     scale: f32,
+    cache_format: CacheFormat,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CacheFormat {
+    F32,
+    // Uint8 records concatenate `[E8M0 scale, 64 E4M3FN values]` blocks.
+    Fp8E4m3Block64,
+    // Uint8 records concatenate `[E8M0 scale, 16 adjacent-nibble bytes]` blocks.
+    Fp4E2m1Block32,
+}
+
+impl CacheFormat {
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "f32" => Ok(Self::F32),
+            "fp8_e4m3_block64" => Ok(Self::Fp8E4m3Block64),
+            "fp4_e2m1_block32" => Ok(Self::Fp4E2m1Block32),
+            _ => Err(unsupported(format!(
+                "cache_format='{value}' is unsupported; expected f32, fp8_e4m3_block64, or fp4_e2m1_block32"
+            ))),
+        }
+    }
+
+    fn block_layout(self) -> Option<(usize, usize)> {
+        match self {
+            Self::F32 => None,
+            Self::Fp8E4m3Block64 => Some((FP8_E4M3_BLOCK_SIZE, FP8_E4M3_PACKED_BYTES + 1)),
+            Self::Fp4E2m1Block32 => Some((FP4_E2M1_BLOCK_SIZE, FP4_E2M1_PACKED_BYTES + 1)),
+        }
+    }
+
+    fn stored_width(self, logical_width: usize) -> Result<usize> {
+        let Some((block_size, block_bytes)) = self.block_layout() else {
+            return Ok(logical_width);
+        };
+        if !logical_width.is_multiple_of(block_size) {
+            return Err(error(format!(
+                "head_dim {logical_width} must be divisible by cache block size {block_size} for {self:?}"
+            )));
+        }
+        logical_width
+            .checked_div(block_size)
+            .and_then(|blocks| blocks.checked_mul(block_bytes))
+            .filter(|&bytes| bytes <= isize::MAX as usize)
+            .ok_or_else(|| error("packed cache record width overflow or exceeds isize::MAX"))
+    }
+
+    fn dtype(self) -> DataType {
+        match self {
+            Self::F32 => DataType::Float32,
+            Self::Fp8E4m3Block64 | Self::Fp4E2m1Block32 => DataType::Uint8,
+        }
+    }
 }
 
 impl KernelFactory for CompressedSparseAttentionFactory {
@@ -61,7 +120,7 @@ impl CompressedSparseAttentionFactory {
         &self,
         node: &Node,
         input_shapes: &[Vec<usize>],
-        phase1_reference: bool,
+        assembled_cache_reference: bool,
     ) -> Result<Box<dyn Kernel>> {
         let num_heads = required_positive_int(node, "num_heads")?;
         let head_dim = required_positive_int(node, "head_dim")?;
@@ -114,11 +173,7 @@ impl CompressedSparseAttentionFactory {
             })
             .transpose()?
             .unwrap_or("f32");
-        if cache_format != "f32" {
-            return Err(unsupported(format!(
-                "cache_format='{cache_format}' requires Phase 2 FP4/FP8 compressed-KV dequantization"
-            )));
-        }
+        let cache_format = CacheFormat::parse(cache_format)?;
         let scale = node
             .attr("scale")
             .and_then(|attribute| attribute.as_float())
@@ -127,23 +182,25 @@ impl CompressedSparseAttentionFactory {
             return Err(error("scale must be finite and non-negative"));
         }
 
-        if phase1_reference && input_shapes.len() >= 4 {
-            infer_output_shape(
+        if assembled_cache_reference && input_shapes.len() >= 4 {
+            infer_output_shape_for_format(
                 &input_shapes[0],
                 &input_shapes[1],
                 &input_shapes[2],
                 &input_shapes[3],
                 num_heads,
                 head_dim,
+                cache_format,
             )?;
         }
-        if phase1_reference {
+        if assembled_cache_reference {
             Ok(Box::new(CompressedSparseAttentionKernel {
                 num_heads,
                 head_dim,
                 compression_ratio,
                 index_num_heads,
                 scale,
+                cache_format,
             }))
         } else {
             Ok(Box::new(DeferredCompressedSparseAttentionKernel {
@@ -153,7 +210,7 @@ impl CompressedSparseAttentionFactory {
     }
 
     #[cfg(test)]
-    fn create_phase1_reference(
+    fn create_assembled_cache_reference(
         &self,
         node: &Node,
         input_shapes: &[Vec<usize>],
@@ -224,13 +281,10 @@ fn validate_frozen_v1_runtime_arity(inputs: &[TensorView], outputs: &[TensorMut]
 impl Kernel for CompressedSparseAttentionKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         check_arity(OP, inputs, outputs, 4, 6, 1)?;
-        for (name, input) in [
-            ("query", &inputs[0]),
-            ("cache", &inputs[1]),
-            ("head_sink", &inputs[3]),
-        ] {
+        for (name, input) in [("query", &inputs[0]), ("head_sink", &inputs[3])] {
             require_dtype(name, input.dtype, DataType::Float32)?;
         }
+        require_dtype("cache", inputs[1].dtype, self.cache_format.dtype())?;
         if !matches!(inputs[2].dtype, DataType::Int32 | DataType::Int64) {
             return Err(error(format!(
                 "indices must have dtype Int32 or Int64, got {:?}",
@@ -239,13 +293,14 @@ impl Kernel for CompressedSparseAttentionKernel {
         }
         require_dtype("Y", outputs[0].dtype, DataType::Float32)?;
 
-        let expected_output = infer_output_shape(
+        let expected_output = infer_output_shape_for_format(
             inputs[0].shape,
             inputs[1].shape,
             inputs[2].shape,
             inputs[3].shape,
             self.num_heads,
             self.head_dim,
+            self.cache_format,
         )?;
         if outputs[0].shape != expected_output {
             return Err(error(format!(
@@ -283,12 +338,12 @@ impl Kernel for CompressedSparseAttentionKernel {
             .transpose()?;
 
         let query = read_dense_f32(&inputs[0], "query")?;
-        let cache = read_dense_f32(&inputs[1], "cache")?;
+        let cache = dequantize_cache(&inputs[1], cache_shape, dim, self.cache_format)?;
         let indices = read_dense_indices(&inputs[2], "indices")?;
         let sink = read_dense_f32(&inputs[3], "head_sink")?;
         let gathered = sparse_kv_gather_masked_f32(
             &cache,
-            cache_shape,
+            [batch, groups, cache_shape[2], dim],
             &indices,
             indices_shape,
             valid_lengths.as_deref(),
@@ -399,7 +454,7 @@ impl Kernel for CompressedSparseAttentionKernel {
     }
 }
 
-/// Infer `Y=[B,S,N,D]` while validating the Phase-1 assembled-cache boundary.
+/// Infer `Y=[B,S,N,D]` for the dense assembled-cache boundary.
 pub fn infer_output_shape(
     query: &[usize],
     cache: &[usize],
@@ -407,6 +462,26 @@ pub fn infer_output_shape(
     head_sink: &[usize],
     num_heads: usize,
     head_dim: usize,
+) -> Result<Vec<usize>> {
+    infer_output_shape_for_format(
+        query,
+        cache,
+        indices,
+        head_sink,
+        num_heads,
+        head_dim,
+        CacheFormat::F32,
+    )
+}
+
+fn infer_output_shape_for_format(
+    query: &[usize],
+    cache: &[usize],
+    indices: &[usize],
+    head_sink: &[usize],
+    num_heads: usize,
+    head_dim: usize,
+    cache_format: CacheFormat,
 ) -> Result<Vec<usize>> {
     let query = shape4("query", query)?;
     let cache = shape4("cache", cache)?;
@@ -417,10 +492,11 @@ pub fn infer_output_shape(
             &query[2..]
         )));
     }
-    if cache[0] != query[0] || cache[3] != head_dim {
+    let stored_width = cache_format.stored_width(head_dim)?;
+    if cache[0] != query[0] || cache[3] != stored_width {
         return Err(error(format!(
-            "cache must have batch {} and head_dim {head_dim}, got {cache:?}",
-            query[0]
+            "cache must have batch {} and stored record width {stored_width} for {cache_format:?}, got {cache:?}",
+            query[0],
         )));
     }
     if indices[0] != query[0] || indices[1] != cache[1] || indices[2] != query[1] {
@@ -439,6 +515,96 @@ pub fn infer_output_shape(
     }
     let output = query.to_vec();
     checked_layout(&output, std::mem::size_of::<f32>(), "Y")?;
+    Ok(output)
+}
+
+fn dequantize_cache(
+    view: &TensorView,
+    stored_shape: [usize; 4],
+    logical_width: usize,
+    format: CacheFormat,
+) -> Result<Vec<f32>> {
+    if format == CacheFormat::F32 {
+        return read_dense_f32(view, "cache");
+    }
+    require_dtype("cache", view.dtype, DataType::Uint8)?;
+    let stored_width = format.stored_width(logical_width)?;
+    if stored_shape[3] != stored_width {
+        return Err(error(format!(
+            "cache stored record width must be {stored_width} for {format:?}, got {}",
+            stored_shape[3]
+        )));
+    }
+    checked_layout(&stored_shape, std::mem::size_of::<u8>(), "packed cache")?;
+    let packed = to_dense_bytes(view)?;
+    let record_count = checked_product(&stored_shape[..3], "packed cache record count")?;
+    let output_elements = record_count
+        .checked_mul(logical_width)
+        .ok_or_else(|| error("dequantized cache element count overflow"))?;
+    checked_layout(
+        &[record_count, logical_width],
+        std::mem::size_of::<f32>(),
+        "dequantized cache",
+    )?;
+    let mut output = fallible_filled(output_elements, 0.0f32, "dequantized cache")?;
+    let (block_size, block_bytes) = format
+        .block_layout()
+        .expect("non-f32 cache format has a block layout");
+    let blocks_per_record = logical_width
+        .checked_div(block_size)
+        .ok_or_else(|| error("cache blocks-per-record division failed"))?;
+
+    for record in 0..record_count {
+        let packed_record = record
+            .checked_mul(stored_width)
+            .ok_or_else(|| error("packed cache record offset overflow"))?;
+        let output_record = record
+            .checked_mul(logical_width)
+            .ok_or_else(|| error("dequantized cache record offset overflow"))?;
+        for block in 0..blocks_per_record {
+            let packed_block = packed_record
+                .checked_add(
+                    block
+                        .checked_mul(block_bytes)
+                        .ok_or_else(|| error("packed cache block offset overflow"))?,
+                )
+                .ok_or_else(|| error("packed cache block start overflow"))?;
+            let packed_values = packed_block
+                .checked_add(1)
+                .ok_or_else(|| error("packed cache value start overflow"))?;
+            let packed_end = packed_block
+                .checked_add(block_bytes)
+                .ok_or_else(|| error("packed cache block end overflow"))?;
+            let output_block = output_record
+                .checked_add(
+                    block
+                        .checked_mul(block_size)
+                        .ok_or_else(|| error("dequantized cache block offset overflow"))?,
+                )
+                .ok_or_else(|| error("dequantized cache block start overflow"))?;
+            let output_end = output_block
+                .checked_add(block_size)
+                .ok_or_else(|| error("dequantized cache block end overflow"))?;
+            let scale = *packed
+                .get(packed_block)
+                .ok_or_else(|| error("packed cache scale offset is out of bounds"))?;
+            let values = packed
+                .get(packed_values..packed_end)
+                .ok_or_else(|| error("packed cache block is out of bounds"))?;
+            let destination = output
+                .get_mut(output_block..output_end)
+                .ok_or_else(|| error("dequantized cache block is out of bounds"))?;
+            match format {
+                CacheFormat::F32 => unreachable!("f32 returned before block decoding"),
+                CacheFormat::Fp8E4m3Block64 => {
+                    dequantize_fp8_e4m3_block(scale, values, destination)?
+                }
+                CacheFormat::Fp4E2m1Block32 => {
+                    dequantize_fp4_e2m1_block(scale, values, destination)?
+                }
+            }
+        }
+    }
     Ok(output)
 }
 
@@ -616,9 +782,14 @@ mod tests {
     ) -> Result<Box<dyn Kernel>> {
         let mut graph = Graph::new();
         graph.opset_imports.insert("pkg.nxrt".into(), 1);
+        let cache_dtype = if cache_format.unwrap_or("f32") == "f32" {
+            DataType::Float32
+        } else {
+            DataType::Uint8
+        };
         let input_specs = [
             ("query", DataType::Float32),
-            ("cache", DataType::Float32),
+            ("cache", cache_dtype),
             ("indices", DataType::Int32),
             ("head_sink", DataType::Float32),
         ];
@@ -637,8 +808,9 @@ mod tests {
         let mut node = onnx_runtime_ir::Node::new(NodeId(0), OP, inputs, vec![output]);
         node.domain = "pkg.nxrt".into();
         node.attributes
-            .insert("num_heads".into(), Attribute::Int(2));
-        node.attributes.insert("head_dim".into(), Attribute::Int(2));
+            .insert("num_heads".into(), Attribute::Int(shapes[0][2] as i64));
+        node.attributes
+            .insert("head_dim".into(), Attribute::Int(shapes[0][3] as i64));
         node.attributes
             .insert("compression_ratio".into(), Attribute::Int(ratio));
         if ratio == 4 {
@@ -653,7 +825,32 @@ mod tests {
             node.attributes
                 .insert("cache_format".into(), Attribute::String(format.into()));
         }
-        CompressedSparseAttentionFactory.create_phase1_reference(&node, shapes)
+        CompressedSparseAttentionFactory.create_assembled_cache_reference(&node, shapes)
+    }
+
+    fn run_reference(
+        ratio: i64,
+        cache_format: Option<&str>,
+        query: &Owned,
+        cache: &Owned,
+        indices: &Owned,
+        sink: &Owned,
+    ) -> Vec<f32> {
+        let shapes = vec![
+            query.shape.clone(),
+            cache.shape.clone(),
+            indices.shape.clone(),
+            sink.shape.clone(),
+        ];
+        let kernel = kernel(ratio, cache_format, &shapes).unwrap();
+        let mut output = Owned::zeros_f32(&query.shape);
+        kernel
+            .execute(
+                &[query.view(), cache.view(), indices.view(), sink.view()],
+                &mut [output.view_mut()],
+            )
+            .unwrap();
+        output.to_f32()
     }
 
     #[test]
@@ -718,18 +915,70 @@ mod tests {
     }
 
     #[test]
-    fn quantized_cache_format_is_explicitly_unsupported() {
-        let shapes = vec![
-            vec![1, 1, 2, 2],
-            vec![1, 1, 1, 2],
-            vec![1, 1, 1, 1],
-            vec![2],
-        ];
-        let result = kernel(128, Some("fp8_e4m3_block64"), &shapes);
-        assert!(result.is_err());
-        let message = result.err().unwrap().to_string();
-        assert!(message.contains("Unsupported"));
-        assert!(message.contains("FP4/FP8 compressed-KV dequantization"));
+    fn fp8_compressed_cache_matches_same_logical_f32_cache() {
+        let dim = FP8_E4M3_BLOCK_SIZE;
+        let query = Owned::f32(&[1, 1, 1, dim], &vec![0.125; dim]);
+        let indices = Owned::i32(&[1, 1, 1, 2], &[0, 1]);
+        let sink = Owned::f32(&[1], &[0.25]);
+        let record_codes = [[0x38, 0x3c, 0x40, 0xb8], [0x30, 0x34, 0xb0, 0xb4]];
+        let mut packed = Vec::new();
+        let mut dense = Vec::new();
+        for codes in record_codes {
+            packed.push(127);
+            for code in codes.into_iter().cycle().take(dim) {
+                packed.push(code);
+                dense.push(super::super::block_dequant::decode_e4m3fn(code));
+            }
+        }
+        let dense_cache = Owned::f32(&[1, 1, 2, dim], &dense);
+        let packed_cache = Owned::u8(&[1, 1, 2, FP8_E4M3_PACKED_BYTES + 1], &packed);
+
+        let expected = run_reference(128, None, &query, &dense_cache, &indices, &sink);
+        let actual = run_reference(
+            128,
+            Some("fp8_e4m3_block64"),
+            &query,
+            &packed_cache,
+            &indices,
+            &sink,
+        );
+        for (actual, expected) in actual.iter().zip(expected) {
+            assert!((actual - expected).abs() <= 1e-6, "{actual} != {expected}");
+        }
+    }
+
+    #[test]
+    fn fp4_compressed_cache_matches_same_logical_f32_cache() {
+        let dim = FP4_E2M1_BLOCK_SIZE;
+        let query = Owned::f32(&[1, 1, 1, dim], &vec![0.125; dim]);
+        let indices = Owned::i32(&[1, 1, 1, 2], &[0, 1]);
+        let sink = Owned::f32(&[1], &[-0.5]);
+        let record_bytes = [[0x21, 0x43, 0x65, 0xa9], [0x10, 0x32, 0x54, 0xba]];
+        let mut packed = Vec::new();
+        let mut dense = Vec::new();
+        for bytes in record_bytes {
+            packed.push(127);
+            for byte in bytes.into_iter().cycle().take(FP4_E2M1_PACKED_BYTES) {
+                packed.push(byte);
+                dense.push(super::super::block_dequant::decode_e2m1(byte));
+                dense.push(super::super::block_dequant::decode_e2m1(byte >> 4));
+            }
+        }
+        let dense_cache = Owned::f32(&[1, 1, 2, dim], &dense);
+        let packed_cache = Owned::u8(&[1, 1, 2, FP4_E2M1_PACKED_BYTES + 1], &packed);
+
+        let expected = run_reference(128, None, &query, &dense_cache, &indices, &sink);
+        let actual = run_reference(
+            128,
+            Some("fp4_e2m1_block32"),
+            &query,
+            &packed_cache,
+            &indices,
+            &sink,
+        );
+        for (actual, expected) in actual.iter().zip(expected) {
+            assert!((actual - expected).abs() <= 1e-6, "{actual} != {expected}");
+        }
     }
 
     #[test]
