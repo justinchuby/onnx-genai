@@ -32,6 +32,7 @@ pub mod add;
 pub mod attention;
 pub mod block_quantized_matmul;
 pub mod cast;
+pub mod compressed_sparse_attention;
 pub mod concat;
 pub mod constant;
 pub mod constant_of_shape;
@@ -73,6 +74,7 @@ pub mod shape;
 pub mod skip_simplified_layernorm;
 pub mod slice;
 pub mod softmax;
+pub mod sparse_kv_gather;
 pub mod split;
 pub mod transpose;
 pub mod unary_math;
@@ -211,6 +213,14 @@ pub fn build_cpu_registry() -> OpRegistry {
     reg.register(
         OpKey::new("BlockQuantizedMatMul", "pkg.nxrt", 1),
         Box::new(block_quantized_matmul::BlockQuantizedMatMulFactory),
+    );
+    reg.register(
+        OpKey::new("SparseKvGather", "pkg.nxrt", 1),
+        Box::new(sparse_kv_gather::SparseKvGatherFactory),
+    );
+    reg.register(
+        OpKey::new("CompressedSparseAttention", "pkg.nxrt", 1),
+        Box::new(compressed_sparse_attention::CompressedSparseAttentionFactory),
     );
     reg.register(OpKey::new("Add", "", 1), Box::new(add::AddFactory));
     reg.register(OpKey::new("Relu", "", 1), Box::new(relu::ReluFactory));
@@ -1304,9 +1314,10 @@ mod tests {
         // InstanceNormalization and PRelu add one registration each, while
         // GroupNormalization adds opset-18 and opset-21 entries, for forty-seven
         // registrations over the Phase-1 op-name count in total.
-        // MatMulNBits, BlockQuantizedMatMul, and GroupQueryAttention each add one
-        // more private/contrib-domain registration.
-        assert_eq!(reg.len(), PHASE1_OPS.len() + 54);
+        // MatMulNBits, BlockQuantizedMatMul, SparseKvGather,
+        // CompressedSparseAttention, and GroupQueryAttention add private/contrib
+        // registrations.
+        assert_eq!(reg.len(), PHASE1_OPS.len() + 56);
         for op in PHASE1_OPS {
             assert!(reg.lookup(op, "", 21).is_some(), "missing factory for {op}");
         }
@@ -1317,8 +1328,10 @@ mod tests {
         assert!(reg.lookup("LogSoftmax", "", 13).is_some());
         assert!(reg.lookup("MatMulNBits", "com.microsoft", 1).is_some());
         assert!(reg.lookup("QMoE", "com.microsoft", 1).is_some());
+        assert!(reg.lookup("BlockQuantizedMatMul", "pkg.nxrt", 1).is_some());
+        assert!(reg.lookup("SparseKvGather", "pkg.nxrt", 1).is_some());
         assert!(
-            reg.lookup("BlockQuantizedMatMul", "pkg.nxrt", 1)
+            reg.lookup("CompressedSparseAttention", "pkg.nxrt", 1)
                 .is_some()
         );
         assert!(reg.lookup("Conv", "", 21).is_none());
