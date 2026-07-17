@@ -920,6 +920,41 @@ fn cumsum_passthrough() {
 }
 
 #[test]
+fn squeeze_and_unsqueeze_static_axes_and_dynamic_axes() {
+    let squeeze = node("Squeeze", 2, 1);
+    let outs = run(
+        &squeeze,
+        vec![f32in(vec![c(2), c(1), c(4)]), sd_vec(vec![c(1)])],
+        24,
+    );
+    assert_eq!(out_shape(&outs), vec![c(2), c(4)]);
+
+    let dynamic_axes = run(
+        &squeeze,
+        vec![
+            f32in(vec![c(2), c(1), c(4)]),
+            tin(DataType::Int64, vec![sym(0)]),
+        ],
+        24,
+    );
+    assert!(dynamic_axes[0].type_info.is_none());
+
+    let unsqueeze = node("Unsqueeze", 2, 1);
+    let outs = run(
+        &unsqueeze,
+        vec![f32in(vec![c(2), c(4)]), sd_vec(vec![c(1)])],
+        24,
+    );
+    assert_eq!(out_shape(&outs), vec![c(2), c(1), c(4)]);
+    let dynamic_axes = run(
+        &unsqueeze,
+        vec![f32in(vec![c(2), c(4)]), tin(DataType::Int64, vec![sym(0)])],
+        24,
+    );
+    assert!(dynamic_axes[0].type_info.is_none());
+}
+
+#[test]
 fn nonzero_rank_and_dynamic_nnz() {
     let n = node("NonZero", 1, 1);
     let outs = run(&n, vec![f32in(vec![c(2), c(3), c(4)])], 13);

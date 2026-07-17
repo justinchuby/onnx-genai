@@ -1,0 +1,10 @@
+domain: ""
+name: Min
+since_version: 13
+doc: Element-wise minimum of one or more tensors.
+inputs:
+  - { name: data_0, type_str: T, variadic: true, min_arity: 1 }
+outputs:
+  - { name: min, type_str: T }
+type_constraints:
+  - { type_param: T, allowed: [uint8, uint16, uint32, uint64, int8, int16, int32, int64, float16, float32, float64, bfloat16] }

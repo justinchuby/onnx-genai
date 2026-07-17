@@ -1,0 +1,15 @@
+domain: ""
+name: CumSum
+since_version: 14
+doc: Cumulative sum along an axis.
+attributes:
+  - { name: exclusive, type: int, default: 0 }
+  - { name: reverse, type: int, default: 0 }
+inputs:
+  - { name: x, type_str: T }
+  - { name: axis, type_str: T2 }
+outputs:
+  - { name: y, type_str: T }
+type_constraints:
+  - { type_param: T, allowed: [uint32, uint64, int32, int64, float16, float32, float64, bfloat16] }
+  - { type_param: T2, allowed: [int32, int64] }

@@ -1,0 +1,15 @@
+domain: ""
+name: CastLike
+since_version: 24
+doc: Cast input to the element type of target_type.
+attributes:
+  - { name: round_mode, type: string, default: up }
+  - { name: saturate, type: int, default: 1 }
+inputs:
+  - { name: input, type_str: T1 }
+  - { name: target_type, type_str: T2 }
+outputs:
+  - { name: output, type_str: T2 }
+type_constraints:
+  - { type_param: T1, allowed: [uint8, uint16, uint32, uint64, int8, int16, int32, int64, bfloat16, float16, float32, float64, string, bool, float8e4m3fn, float8e4m3fnuz, float8e5m2, float8e5m2fnuz, uint4, int4, float4e2m1, float8e8m0] }
+  - { type_param: T2, allowed: [uint8, uint16, uint32, uint64, int8, int16, int32, int64, bfloat16, float16, float32, float64, string, bool, float8e4m3fn, float8e4m3fnuz, float8e5m2, float8e5m2fnuz, uint4, int4, float4e2m1, float8e8m0] }

@@ -1,0 +1,17 @@
+domain: ""
+name: TopK
+since_version: 24
+doc: Select the top K values and their indices along an axis.
+attributes:
+  - { name: axis, type: int, default: -1 }
+  - { name: largest, type: int, default: 1 }
+  - { name: sorted, type: int, default: 1 }
+inputs:
+  - { name: X, type_str: T }
+  - { name: K, type_str: "tensor(int64)" }
+outputs:
+  - { name: Values, type_str: T }
+  - { name: Indices, type_str: I }
+type_constraints:
+  - { type_param: T, allowed: [uint8, uint16, uint32, uint64, int8, int16, int32, int64, float16, float32, float64, bfloat16] }
+  - { type_param: I, allowed: [int64] }

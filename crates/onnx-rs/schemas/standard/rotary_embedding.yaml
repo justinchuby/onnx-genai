@@ -1,0 +1,18 @@
+domain: ""
+name: RotaryEmbedding
+since_version: 23
+doc: Apply rotary positional embeddings.
+attributes:
+  - { name: interleaved, type: int, default: 0 }
+  - { name: rotary_embedding_dim, type: int, default: 0 }
+  - { name: num_heads, type: int }
+inputs:
+  - { name: X, type_str: T }
+  - { name: cos_cache, type_str: T }
+  - { name: sin_cache, type_str: T }
+  - { name: position_ids, type_str: M, optional: true }
+outputs:
+  - { name: Y, type_str: T }
+type_constraints:
+  - { type_param: T, allowed: [float32, float16, bfloat16] }
+  - { type_param: M, allowed: [int64] }

@@ -421,6 +421,20 @@ const BUILTIN_YAML: &[&str] = &[
     include_str!("../../schemas/standard/quantize_linear.yaml"),
     include_str!("../../schemas/standard/dequantize_linear.yaml"),
     include_str!("../../schemas/standard/dynamic_quantize_linear.yaml"),
+    include_str!("../../schemas/standard/attention.yaml"),
+    include_str!("../../schemas/standard/cast_like.yaml"),
+    include_str!("../../schemas/standard/cum_sum.yaml"),
+    include_str!("../../schemas/standard/greater_or_equal.yaml"),
+    include_str!("../../schemas/standard/less_or_equal.yaml"),
+    include_str!("../../schemas/standard/min.yaml"),
+    include_str!("../../schemas/standard/max.yaml"),
+    include_str!("../../schemas/standard/rotary_embedding.yaml"),
+    include_str!("../../schemas/standard/softplus.yaml"),
+    include_str!("../../schemas/standard/squeeze.yaml"),
+    include_str!("../../schemas/standard/top_k.yaml"),
+    include_str!("../../schemas/standard/unsqueeze_v11.yaml"),
+    include_str!("../../schemas/standard/unsqueeze_v13.yaml"),
+    include_str!("../../schemas/standard/unsqueeze.yaml"),
 ];
 
 // FOLLOW-UP §7.4: complete the standard and ONNX-ML YAML catalogues.
@@ -919,6 +933,65 @@ type_constraints:
         let dynamic = registry.lookup("DynamicQuantizeLinear", "", 25).unwrap();
         assert_eq!(dynamic.outputs[1].type_str, "tensor(float)");
         assert_eq!(dynamic.type_constraints[1].allowed, [DataType::Uint8]);
+    }
+
+    #[test]
+    fn round_eight_schemas_match_official_signatures() {
+        let registry = SchemaRegistry::builtins();
+        for (name, since_version, inputs, outputs, attributes) in [
+            ("Attention", 24, 7, 4, 7),
+            ("CastLike", 24, 2, 1, 2),
+            ("CumSum", 14, 2, 1, 2),
+            ("GreaterOrEqual", 16, 2, 1, 0),
+            ("LessOrEqual", 16, 2, 1, 0),
+            ("Min", 13, 1, 1, 0),
+            ("Max", 13, 1, 1, 0),
+            ("RotaryEmbedding", 23, 4, 1, 3),
+            ("Softplus", 22, 1, 1, 0),
+            ("Squeeze", 24, 2, 1, 0),
+            ("TopK", 24, 2, 2, 3),
+            ("Unsqueeze", 24, 2, 1, 0),
+        ] {
+            let schema = registry.lookup(name, "", 24).unwrap();
+            assert_eq!(schema.since_version, since_version, "{name}");
+            assert_eq!(schema.inputs.len(), inputs, "{name}");
+            assert_eq!(schema.outputs.len(), outputs, "{name}");
+            assert_eq!(schema.attributes.len(), attributes, "{name}");
+        }
+
+        let attention = registry.lookup("Attention", "", 24).unwrap();
+        assert!(attention.inputs[3..].iter().all(|input| input.optional));
+        assert!(attention.outputs[1..].iter().all(|output| output.optional));
+        assert_eq!(
+            attention.type_constraints[2].allowed.last(),
+            Some(&DataType::Bool)
+        );
+        for name in ["Min", "Max"] {
+            assert!(registry.lookup(name, "", 24).unwrap().inputs[0].variadic);
+        }
+        assert!(registry.lookup("Squeeze", "", 24).unwrap().inputs[1].optional);
+        let unsqueeze_v11 = registry.lookup("Unsqueeze", "", 11).unwrap();
+        assert_eq!(unsqueeze_v11.inputs.len(), 1);
+        assert!(unsqueeze_v11.attributes[0].required);
+        assert_eq!(
+            registry.lookup("Unsqueeze", "", 13).unwrap().inputs.len(),
+            2
+        );
+        assert_eq!(
+            registry.lookup("TopK", "", 24).unwrap().outputs[1].type_str,
+            "I"
+        );
+        assert_eq!(
+            registry
+                .lookup("CastLike", "", 24)
+                .unwrap()
+                .attributes
+                .iter()
+                .find(|attribute| attribute.name == "round_mode")
+                .unwrap()
+                .default,
+            Some(AttributeDefault::String("up".into()))
+        );
     }
 
     #[test]

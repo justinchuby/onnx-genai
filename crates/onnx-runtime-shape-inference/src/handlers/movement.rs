@@ -178,6 +178,11 @@ pub fn squeeze_v1(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
 
 /// `Squeeze` with axes taken from input 1 (opset ≥ 13).
 pub fn squeeze_v13(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
+    // A runtime axes tensor can remove a variable number of dimensions, so its
+    // output rank is not statically knowable.
+    if ctx.has_input(1) && const_ints(ctx, 1).is_none() {
+        return Ok(());
+    }
     let axes = const_ints(ctx, 1);
     squeeze_common(ctx, axes)
 }

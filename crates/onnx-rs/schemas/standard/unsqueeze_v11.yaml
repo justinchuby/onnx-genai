@@ -1,0 +1,13 @@
+domain: ""
+name: Unsqueeze
+since_version: 11
+until_version: 12
+doc: Insert singleton dimensions at axes supplied by a required attribute.
+attributes:
+  - { name: axes, type: ints, required: true }
+inputs:
+  - { name: data, type_str: T }
+outputs:
+  - { name: expanded, type_str: T }
+type_constraints:
+  - { type_param: T, allowed: [uint8, uint16, uint32, uint64, int8, int16, int32, int64, float16, float32, float64, string, bool, complex64, complex128] }
