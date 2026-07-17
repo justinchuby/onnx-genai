@@ -76,3 +76,5 @@ Loader opset-import validation for file, from-parts, and nested-subgraph paths m
 
 - Delivered `f601cad`: `WeightRegionCatalog`, route-first mmap QMoE expert selection, and opt-in `ONNX_GENAI_WEIGHT_OFFLOAD=1`; default behavior remains unchanged.
 - Chew's corrective `a77eed0` and Nabil 🟢 approval closed the landing; large-model exact-logit/throughput validation remains deferred.
+
+- 2026-07-18 Scribe: Initial Reshape/Split validation and coverage work was superseded by the reviewed correction.

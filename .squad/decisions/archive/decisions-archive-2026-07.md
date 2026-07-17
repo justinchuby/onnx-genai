@@ -2601,3 +2601,169 @@ artifact, and freezes nested bodies only after runtime shape preparation.
 **Why:** Storing borrowed partition views in their owning plan would be self-referential and is not safely implementable as sketched. The EP ABI documents no ordering contract for claim node IDs, so supplied order must not be a rejection condition.
 
 <!-- Source: mariette-cuda-attn-review.md -->
+
+
+<!-- archived from decisions.md on 2026-07-18; oldest retained batch -->
+<!-- merged from holden-cuda-cmp-review.md -->
+
+### 2026-07-17: CUDA comparison dtype-generic review
+**By:** Holden
+**Verdict:** 🟢 APPROVE
+
+**Findings:**
+- No blocking correctness or contract findings.
+- `crates/onnx-runtime-ep-cuda/src/kernels/pointwise.rs:446-461` generates direct signed `int`/`long long` comparisons for i32/i64, with no integer-to-float coercion; every op uses the correct operator and writes canonical one-byte Bool values.
+- `crates/onnx-runtime-ep-cuda/src/kernels/pointwise.rs:477-503,650-690` dispatches by operand dtype, permits Bool only for `Equal`, rejects unsupported or mixed operands before launch, validates Bool output, dense inputs, and the broadcast output shape.
+- `crates/onnx-runtime-ep-cuda/src/provider.rs:180-188` applies the positional `input_dtypes` contract to exactly the registered comparison family. `crates/onnx-runtime-ep-cuda/src/kernels/pointwise.rs:518-533` claims only same-type f32/i32/i64 operands plus Bool `Equal`, with actionable denials otherwise.
+- `crates/onnx-runtime-ep-cuda/src/kernels/pointwise.rs:684-730` reuses right-aligned zero-stride broadcast metadata and introduces no atomics, reductions, shared writes, or races. Per-element output ownership is deterministic.
+- `crates/onnx-runtime-ep-cuda/src/kernels/pointwise.rs:739-745` correctly declines strided inputs and CUDA graph capture because execution allocates/copies/frees per-call metadata and synchronizes.
+- `crates/onnx-runtime-ep-cuda/tests/pointwise_gpu.rs:462-575` checks all five i32/i64 operators against a CPU broadcast oracle, GLM-like i64 position masks, repeated deterministic results, i32 masks, Bool equality, supported claims, and an actionable unsupported-dtype denial.
+
+**Gate observed:**
+- `cargo test --locked -p onnx-runtime-ep-cuda` with the requested CUDA environment and `CARGO_TARGET_DIR=/home/justinchu/target-holden-cudacmp`: green; all reported test binaries passed with zero failures.
+- Targeted GPU confirmation: `integer_comparisons_broadcast_match_cpu_oracle`, `integer_comparisons_cover_glm_like_masks_and_are_deterministic`, and `comparison_claims_integer_dtypes_and_rejects_unsupported_dtype` all executed and passed.
+
+Plain-text summary: 🟢 APPROVE — CUDA comparison dtype dispatch, claim gating, broadcasting, determinism, and value assertions are correct; the required CUDA test gate is green.
+
+<!-- merged from hudson-topk-fix-coverage.md -->
+
+# TopK axis validation and shape-inference coverage uplift
+
+- **Date:** 2026-07-17
+- **Owner:** Hudson
+
+## Correctness fixes
+
+`TopK` previously normalized axes through `norm_axis`, which clamps invalid values. A rank-3 input and `axis=3`, for example, incorrectly inferred a valid last-axis result. It now uses `checked_axis` and returns `ShapeInferError::Invalid` with the invalid axis and rank. Both values and indices continue to share the validated output shape.
+
+The focused neighboring-axis review found and fixed the same contract violation in `ArgMax`/`ArgMin`, `Transpose`, `Unsqueeze`, and `Gather`. These now reject out-of-range axes; `Transpose` and `Unsqueeze` additionally reject duplicate axes. Valid negative axes and valid normal behavior are unchanged.
+
+## Coverage tests added
+
+- TopK middle-axis and out-of-range regression; axis-validation coverage for ArgReduce, Transpose, Unsqueeze, and Gather.
+- Custom-op arity/rank/compression-ratio contract failures, alongside existing all-output CSA tests.
+- Shape-data source propagation and invalid Cast metadata paths.
+- Pooling missing/malformed kernel, rank validation, and dynamic spatial extent behavior.
+
+## Line coverage (before → after)
+
+| Handler | Before | After |
+|---|---:|---:|
+| `custom_ops.rs` | 71.21% | 79.17% |
+| `data_ops.rs` | 62.83% | 71.39% |
+| `movement.rs` | 65.60% | 66.92% |
+| `pooling.rs` | 71.57% | 77.82% |
+
+The remaining unexercised branches are primarily broader operator paths already outside this focused regression/edge-case set; no unreachable branch was claimed as covered.
+
+<!-- merged from leon-onnxrs-squeeze-fix.md -->
+
+### 2026-07-18: Squeeze static-axis validation
+
+Leon fixed the round-8 `Squeeze` shape-inference defect in
+`onnx-runtime-shape-inference`. Statically known axes now use `checked_axis`,
+reject duplicate axes, reject statically known non-singleton extents, and leave
+the output unresolved when a selected extent is dynamic. No-axes inference also
+leaves dynamic input extents unresolved.
+
+The implementation matches sibling handlers' invalid-axis convention:
+`ShapeInferError::Invalid { op, detail }`, returning `Err` rather than clamping
+or fabricating an output shape.
+
+<!-- merged from ripley-bqmoe-design.md -->
+
+# Decision: `pkg.nxrt::BlockQuantizedMoE` v1 ABI proposal (design note)
+
+- **Author:** Ripley (architect)
+- **Date:** 2026-07-18
+- **Branch:** `bqmoe-design` (worktree `/home/justinchu/wt-bqmoe`), commit `2a7e45a`
+- **Deliverable:** `docs/BLOCKQUANTIZEDMOE_DESIGN.md` (docs-only, no kernels)
+- **Status:** AWAITING JUSTIN SIGN-OFF on the op contract before any kernel work
+
+## Summary
+
+Design note for P1 #6 — the largest practical GLM blocker. `BlockQuantizedMoE`
+= QMoE's expert structure, but with native IQ/MXFP4 codebook block formats
+(reusing the existing `BlockQuantizedMatMul` decoders) and **selected-expert
+dispatch** (only routed experts evaluated), wired to the lazy weight-lease seam
+at `weight.rs:94-104`.
+
+## Proposed ABI (v1)
+
+- Domain `pkg.nxrt`, op `BlockQuantizedMoE`, version 1. Single output = input
+  shape/dtype.
+- **Key deviation from QMoE:** IQ/MXFP4 blocks are self-describing, so v1 has
+  **no `*_scales`, no `*_zero_points`, no codebook inputs** (codebooks are
+  compile-time grids). Each expert weight is one packed `uint8`
+  `[E, N, blocks, block_bytes]` tensor.
+- Inputs (dense 0–8): `input`, `router_probs` (logits), `fc1_experts_weights`,
+  `fc1_experts_bias?`, `fc2_experts_weights`, `fc2_experts_bias?`,
+  `fc3_experts_weights?`, `fc3_experts_bias?`, `router_weights?`.
+- Attributes reuse `MoeAttributes` (`k`, `activation_type`,
+  `normalize_routing_weights`, `swiglu_fusion`, `activation_alpha/beta`,
+  `swiglu_limit`, `use_sparse_mixer`) + `format`/`block_layout_version` from
+  `BlockQuantizedMatMul`. Dropped: `expert_weight_bits`, `block_size`,
+  `quant_type`. `inter`/`E` inferred from weight shapes.
+- Dispatch: route-first grouping (always-on), decode each selected expert once,
+  resident fallback for non-paging EPs. Selected-expert device leasing requires
+  a lazy-seam extension: the current binder receives only a whole
+  `LazyWeight`, not an expert/slice selector
+  (`crates/onnx-runtime-ep-api/src/weight.rs:121-161,205-227`).
+- Determinism: f32 accumulate; fixed ascending-expert reduction is a new v1
+  rule, not a QMoE precedent (QMoE reduces in top-k route-slot order); tie-break
+  = lower expert index (existing `total_cmp().then(a.cmp(b))` rule;
+  `crates/onnx-runtime-ep-cpu/src/kernels/qmoe.rs:312-335,356,404-420` and
+  `crates/onnx-runtime-ep-cpu/src/kernels/moe.rs:400-402`).
+- Staging: Phase 1 CPU parity oracle → Phase 2 CUDA bitwise parity → Phase 3b
+  live device paging (out of v1 scope).
+
+## Open decisions needing Justin's sign-off (defaults recommended)
+
+1. Weight-input ordering — dense 0–8 (default) vs. QMoE-index-preserving.
+2. Router input — logits + optional aggregation weights (default) vs. pre-norm.
+3. Block-format enum — string `format` (default) vs. int enum.
+4. sparse_mixer placement — normalize OUTSIDE the op, error if set (default).
+5. Uniform single `format` for all experts/projections (default) vs. per-proj.
+6. `inter`/`expert_dim` inferred from shapes (default) vs. declared attributes.
+7. v1 offload — resident-first, with an expert-indexed lazy-binder/
+   `LazyWeight` slice-descriptor extension required before Phase 3b paging
+   (default) vs. require paging now
+   (`crates/onnx-runtime-ep-api/src/weight.rs:121-161,205-227`).
+8. Freeze as version 1 now (default: yes).
+
+Full rationale and file:line citations in `docs/BLOCKQUANTIZEDMOE_DESIGN.md`.
+
+<!-- merged from sapper-onnxrs-r8.md -->
+
+# onnx-rs schema round 8
+
+Added standard-domain schemas for Attention, CastLike, CumSum, GreaterOrEqual,
+LessOrEqual, Min, Max, RotaryEmbedding, Softplus, Squeeze, TopK, and
+Unsqueeze. Unsqueeze includes the target fixture signatures for opsets 11, 13,
+and 24; the other target schemas resolve at opset 24.
+
+Skipped Constant because it was already registered. None of the requested
+round-8 operators was registered before this change.
+
+Shape inference already covered the requested elementwise, attention, rotary,
+CastLike, CumSum, and TopK rules. This round makes runtime axes for Squeeze
+(like Unsqueeze) deliberately unresolved because they can change output rank;
+runtime TopK K remains an unresolved axis extent.
+
+<!-- merged from vasquez-cuda-int-compare.md -->
+
+### 2026-07-17: CUDA comparison operators support GLM integer indices
+**By:** Vasquez
+**What:** CUDA EP `Equal`, `Greater`, `Less`, `GreaterOrEqual`, and `LessOrEqual` now support same-dtype f32, int32, and int64 operands with a bool output and existing NumPy broadcasting. `Equal` additionally supports bool operands. `Where`, `Not`, and logical ops were not changed.
+**Why:** GLM position/token IDs and mask construction compare int64/int32 tensors; selecting a dtype-specific NVRTC entry keeps these comparisons on-device and makes claim-time coverage accurately reject unsupported dtypes.
+
+<!-- merged from wallace-shapeinf-coverage.md -->
+
+### 2026-07-17: Shape-inference coverage finding — TopK invalid axis is clamped
+**By:** Wallace
+**What:** Added a regression test for TopK on a middle axis and an out-of-range axis. The middle-axis shape is correct (`[2, 8, 4]`, axis `1`, K `3` → `[2, 3, 4]` for both outputs), but axis `3` for rank `3` is accepted instead of rejected.
+**Why:** ONNX requires TopK's axis to be in `[-rank, rank)`. `selection::top_k` calls `norm_axis`, which clamps `3` to the final axis, fabricating a valid-looking output. The new test fails at `op_rules.rs:758`; per the test-only scope, handler logic was not changed and coverage expansion stopped for follow-up.
+
+Before coverage (line): custom_ops.rs 71.21% (188/264), data_ops.rs 62.83% (235/374), movement.rs 66.27% (937/1414), pooling.rs 71.57% (355/496), selection.rs 84.26% (166/197), elementwise.rs 66.48% (117/176).
+After coverage: not measured; the newly added correctness regression intentionally fails against the current handler.
+Tests added: 1 (one regression test with middle-axis and invalid-axis assertions).

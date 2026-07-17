@@ -32,3 +32,5 @@
 
 - 🟢 Cleared Sapper's `be68145` multi-device/sharding proto integration and Deckard's `b5ccd3c` optional-dimension checker correction.
 - The landing also includes the ONNX v1.20/IR13 spec-coverage audit; remaining gaps are tracked for Sapper.
+
+- 2026-07-18 Scribe: Reshape/Split review and approval recorded; final fixes landed in 4ff24cb.

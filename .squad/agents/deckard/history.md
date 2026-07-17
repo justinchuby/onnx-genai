@@ -134,3 +134,5 @@ Authored native Engine/server backend integration in `66ec4b8`; Holden rejected 
 
 - Delivered `b5ccd3c`: the checker no longer incorrectly requires optional `SimpleShardedDimProto.dim`; `num_shards` remains required.
 - The correction closed Sapper's multi-device/sharding proto landing; Bryant 🟢 approved.
+
+- 2026-07-18 Scribe: Reshape/Split and RoPE fixes landed; final RoPE validation commit 74a891b.
