@@ -1,0 +1,10 @@
+domain: ""
+name: Log
+since_version: 13
+doc: Element-wise natural logarithm.
+inputs:
+  - { name: input, type_str: T }
+outputs:
+  - { name: output, type_str: T }
+type_constraints:
+  - { type_param: T, allowed: [float16, float32, float64, bfloat16] }

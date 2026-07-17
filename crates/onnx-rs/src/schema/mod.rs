@@ -365,6 +365,18 @@ const BUILTIN_YAML: &[&str] = &[
     include_str!("../../schemas/standard/transpose.yaml"),
     include_str!("../../schemas/standard/concat.yaml"),
     include_str!("../../schemas/standard/slice.yaml"),
+    include_str!("../../schemas/standard/sigmoid.yaml"),
+    include_str!("../../schemas/standard/tanh.yaml"),
+    include_str!("../../schemas/standard/erf.yaml"),
+    include_str!("../../schemas/standard/sqrt.yaml"),
+    include_str!("../../schemas/standard/exp.yaml"),
+    include_str!("../../schemas/standard/log.yaml"),
+    include_str!("../../schemas/standard/pow.yaml"),
+    include_str!("../../schemas/standard/clip.yaml"),
+    include_str!("../../schemas/standard/expand.yaml"),
+    include_str!("../../schemas/standard/where.yaml"),
+    include_str!("../../schemas/standard/reduce_sum.yaml"),
+    include_str!("../../schemas/standard/reduce_mean.yaml"),
 ];
 
 // FOLLOW-UP §7.4: complete the standard and ONNX-ML YAML catalogues.
@@ -571,6 +583,18 @@ type_constraints:
             "Transpose",
             "Concat",
             "Slice",
+            "Sigmoid",
+            "Tanh",
+            "Erf",
+            "Sqrt",
+            "Exp",
+            "Log",
+            "Pow",
+            "Clip",
+            "Expand",
+            "Where",
+            "ReduceSum",
+            "ReduceMean",
         ] {
             assert!(registry.lookup(name, "", 24).is_some(), "{name}");
         }
@@ -722,5 +746,62 @@ type_constraints:
         );
         assert!(!schema.inputs[2].optional);
         assert!(schema.inputs[3].optional && schema.inputs[4].optional);
+    }
+
+    macro_rules! common_schema_test {
+        ($test:ident, $name:literal, $since:literal, $inputs:literal, $outputs:literal) => {
+            #[test]
+            fn $test() {
+                let registry = SchemaRegistry::builtins();
+                let schema = registry.lookup($name, "", 25).unwrap();
+                assert_eq!(schema.since_version, $since);
+                assert_eq!(schema.inputs.len(), $inputs);
+                assert_eq!(schema.outputs.len(), $outputs);
+            }
+        };
+    }
+
+    common_schema_test!(sigmoid_schema_matches_opset_13, "Sigmoid", 13, 1, 1);
+    common_schema_test!(tanh_schema_matches_opset_13, "Tanh", 13, 1, 1);
+    common_schema_test!(erf_schema_matches_opset_13, "Erf", 13, 1, 1);
+    common_schema_test!(sqrt_schema_matches_opset_13, "Sqrt", 13, 1, 1);
+    common_schema_test!(exp_schema_matches_opset_13, "Exp", 13, 1, 1);
+    common_schema_test!(log_schema_matches_opset_13, "Log", 13, 1, 1);
+    common_schema_test!(pow_schema_matches_opset_15, "Pow", 15, 2, 1);
+    common_schema_test!(clip_schema_matches_opset_13, "Clip", 13, 3, 1);
+    common_schema_test!(expand_schema_matches_opset_13, "Expand", 13, 2, 1);
+    common_schema_test!(where_schema_matches_opset_16, "Where", 16, 3, 1);
+    common_schema_test!(reduce_sum_schema_matches_opset_13, "ReduceSum", 13, 2, 1);
+    common_schema_test!(reduce_mean_schema_matches_opset_18, "ReduceMean", 18, 2, 1);
+
+    #[test]
+    fn added_schema_details_match_onnx_v1_20() {
+        let registry = SchemaRegistry::builtins();
+
+        let pow = registry.lookup("Pow", "", 25).unwrap();
+        assert_eq!(pow.type_constraints[0].type_param, "T");
+        assert_eq!(pow.type_constraints[1].type_param, "T1");
+        assert_eq!(pow.type_constraints[0].allowed.len(), 6);
+        assert_eq!(pow.type_constraints[1].allowed.len(), 12);
+
+        let clip = registry.lookup("Clip", "", 25).unwrap();
+        assert!(clip.inputs[1].optional && clip.inputs[2].optional);
+        assert_eq!(clip.type_constraints[0].allowed.len(), 12);
+
+        let expand = registry.lookup("Expand", "", 25).unwrap();
+        assert_eq!(expand.inputs[1].type_str, "tensor(int64)");
+        assert_eq!(expand.type_constraints[0].allowed.len(), 16);
+
+        let where_op = registry.lookup("Where", "", 25).unwrap();
+        assert_eq!(where_op.type_constraints[0].allowed, [DataType::Bool]);
+        assert_eq!(where_op.type_constraints[1].allowed.len(), 16);
+
+        for name in ["ReduceSum", "ReduceMean"] {
+            let reduce = registry.lookup(name, "", 25).unwrap();
+            assert!(reduce.inputs[1].optional);
+            assert_eq!(reduce.attributes[0].default, Some(AttributeDefault::Int(1)));
+            assert_eq!(reduce.attributes[1].default, Some(AttributeDefault::Int(0)));
+            assert_eq!(reduce.type_constraints[0].allowed.len(), 8);
+        }
     }
 }

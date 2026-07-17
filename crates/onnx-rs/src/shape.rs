@@ -69,7 +69,27 @@ pub fn register_shape_inference(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::{DataType, Dim, Graph, Node, NodeId, Shape};
+    use crate::ir::{
+        Attribute, DataType, Dim, Graph, Node, NodeId, Shape, TensorData, ValueId, WeightRef,
+    };
+
+    fn i64_initializer(graph: &mut Graph, name: &str, values: &[i64]) -> ValueId {
+        let value =
+            graph.create_named_value(name, DataType::Int64, vec![Dim::Static(values.len())]);
+        let mut bytes = Vec::with_capacity(values.len().saturating_mul(size_of::<i64>()));
+        for item in values {
+            bytes.extend_from_slice(&item.to_le_bytes());
+        }
+        graph.set_initializer(
+            value,
+            WeightRef::Inline(TensorData::from_raw(
+                DataType::Int64,
+                vec![values.len()],
+                bytes,
+            )),
+        );
+        value
+    }
 
     #[test]
     fn infers_matmul_and_add_output_shapes() {
@@ -154,5 +174,369 @@ mod tests {
         assert_eq!(model.graph.value(output).shape, vec![Dim::Static(7)]);
         assert_eq!(result.inferred, 2);
         assert_eq!(result.unknown, 0);
+    }
+
+    #[test]
+    fn infers_added_elementwise_expand_where_and_reduction_schemas() {
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 18);
+
+        let x = graph.create_named_value(
+            "x",
+            DataType::Float32,
+            vec![Dim::Static(2), Dim::Static(3), Dim::Static(4)],
+        );
+        let exponent = graph.create_named_value("exponent", DataType::Int64, vec![Dim::Static(1)]);
+        let condition = graph.create_named_value(
+            "condition",
+            DataType::Bool,
+            vec![Dim::Static(2), Dim::Static(1), Dim::Static(4)],
+        );
+        let alternative = graph.create_named_value(
+            "alternative",
+            DataType::Float32,
+            vec![Dim::Static(1), Dim::Static(3), Dim::Static(1)],
+        );
+        let expand_source = graph.create_named_value(
+            "expand_source",
+            DataType::Float32,
+            vec![Dim::Static(3), Dim::Static(1)],
+        );
+        for value in [x, exponent, condition, alternative, expand_source] {
+            graph.add_input(value);
+        }
+
+        let expand_shape = i64_initializer(&mut graph, "expand_shape", &[2, 3, 4]);
+        let reduce_axis_1 = i64_initializer(&mut graph, "reduce_axis_1", &[1]);
+        let reduce_axis_2 = i64_initializer(&mut graph, "reduce_axis_2", &[2]);
+
+        let mut current = x;
+        for (id, op) in ["Sigmoid", "Tanh", "Erf", "Sqrt", "Exp", "Log", "Clip"]
+            .into_iter()
+            .enumerate()
+        {
+            let output =
+                graph.create_named_value(format!("{op}_out"), DataType::Float32, Shape::new());
+            let inputs = if op == "Clip" {
+                vec![Some(current), None, None]
+            } else {
+                vec![Some(current)]
+            };
+            graph.insert_node(Node::new(NodeId(id as u32), op, inputs, vec![output]));
+            current = output;
+        }
+
+        let pow = graph.create_named_value("pow", DataType::Float32, Shape::new());
+        graph.insert_node(Node::new(
+            NodeId(7),
+            "Pow",
+            vec![Some(current), Some(exponent)],
+            vec![pow],
+        ));
+        let selected = graph.create_named_value("selected", DataType::Float32, Shape::new());
+        graph.insert_node(Node::new(
+            NodeId(8),
+            "Where",
+            vec![Some(condition), Some(pow), Some(alternative)],
+            vec![selected],
+        ));
+        let expanded = graph.create_named_value("expanded", DataType::Float32, Shape::new());
+        graph.insert_node(Node::new(
+            NodeId(9),
+            "Expand",
+            vec![Some(expand_source), Some(expand_shape)],
+            vec![expanded],
+        ));
+        let sum = graph.create_named_value("sum", DataType::Float32, Shape::new());
+        let mut reduce_sum = Node::new(
+            NodeId(10),
+            "ReduceSum",
+            vec![Some(selected), Some(reduce_axis_1)],
+            vec![sum],
+        );
+        reduce_sum
+            .attributes
+            .insert("keepdims".into(), Attribute::Int(0));
+        graph.insert_node(reduce_sum);
+        let mean = graph.create_named_value("mean", DataType::Float32, Shape::new());
+        graph.insert_node(Node::new(
+            NodeId(11),
+            "ReduceMean",
+            vec![Some(selected), Some(reduce_axis_2)],
+            vec![mean],
+        ));
+        graph.add_output(expanded);
+        graph.add_output(sum);
+        graph.add_output(mean);
+
+        let mut model = Model::new(graph);
+        let result = infer_shapes(&mut model).unwrap();
+        assert_eq!(
+            model.graph.value(selected).shape,
+            vec![Dim::Static(2), Dim::Static(3), Dim::Static(4)]
+        );
+        assert_eq!(
+            model.graph.value(expanded).shape,
+            vec![Dim::Static(2), Dim::Static(3), Dim::Static(4)]
+        );
+        assert_eq!(
+            model.graph.value(sum).shape,
+            vec![Dim::Static(2), Dim::Static(4)]
+        );
+        assert_eq!(
+            model.graph.value(mean).shape,
+            vec![Dim::Static(2), Dim::Static(3), Dim::Static(1)]
+        );
+        assert_eq!(result.unknown, 0);
+    }
+
+    #[test]
+    fn infers_existing_conv_norm_and_movement_schemas() {
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 21);
+
+        let image = graph.create_named_value(
+            "image",
+            DataType::Float32,
+            vec![
+                Dim::Static(1),
+                Dim::Static(3),
+                Dim::Static(32),
+                Dim::Static(32),
+            ],
+        );
+        let weights = graph.create_named_value(
+            "weights",
+            DataType::Float32,
+            vec![
+                Dim::Static(8),
+                Dim::Static(3),
+                Dim::Static(3),
+                Dim::Static(3),
+            ],
+        );
+        let scale = graph.create_named_value("scale", DataType::Float32, vec![Dim::Static(15_360)]);
+        let gather_indices = graph.create_named_value(
+            "gather_indices",
+            DataType::Int64,
+            vec![Dim::Static(5), Dim::Static(6)],
+        );
+        let concat_rhs = graph.create_named_value(
+            "concat_rhs",
+            DataType::Float32,
+            vec![
+                Dim::Static(1),
+                Dim::Static(32),
+                Dim::Static(7),
+                Dim::Static(6),
+                Dim::Static(32),
+            ],
+        );
+        for value in [image, weights, scale, gather_indices, concat_rhs] {
+            graph.add_input(value);
+        }
+
+        let starts = i64_initializer(&mut graph, "starts", &[0]);
+        let ends = i64_initializer(&mut graph, "ends", &[10]);
+        let axes = i64_initializer(&mut graph, "axes", &[2]);
+        let steps = i64_initializer(&mut graph, "steps", &[2]);
+        let reshape_target = i64_initializer(&mut graph, "reshape_target", &[2, -1]);
+
+        let convolved = graph.create_named_value("convolved", DataType::Float32, Shape::new());
+        let mut conv = Node::new(
+            NodeId(0),
+            "Conv",
+            vec![Some(image), Some(weights)],
+            vec![convolved],
+        );
+        conv.attributes
+            .insert("strides".into(), Attribute::Ints(vec![2, 2]));
+        conv.attributes
+            .insert("pads".into(), Attribute::Ints(vec![1, 1, 1, 1]));
+        graph.insert_node(conv);
+
+        let gathered = graph.create_named_value("gathered", DataType::Float32, Shape::new());
+        let mut gather = Node::new(
+            NodeId(1),
+            "Gather",
+            vec![Some(image), Some(gather_indices)],
+            vec![gathered],
+        );
+        gather.attributes.insert("axis".into(), Attribute::Int(1));
+        graph.insert_node(gather);
+
+        let transposed = graph.create_named_value("transposed", DataType::Float32, Shape::new());
+        let mut transpose = Node::new(
+            NodeId(2),
+            "Transpose",
+            vec![Some(gathered)],
+            vec![transposed],
+        );
+        transpose
+            .attributes
+            .insert("perm".into(), Attribute::Ints(vec![0, 3, 1, 2, 4]));
+        graph.insert_node(transpose);
+
+        let concatenated =
+            graph.create_named_value("concatenated", DataType::Float32, Shape::new());
+        let mut concat = Node::new(
+            NodeId(3),
+            "Concat",
+            vec![Some(transposed), Some(concat_rhs)],
+            vec![concatenated],
+        );
+        concat.attributes.insert("axis".into(), Attribute::Int(2));
+        graph.insert_node(concat);
+
+        let sliced = graph.create_named_value("sliced", DataType::Float32, Shape::new());
+        graph.insert_node(Node::new(
+            NodeId(4),
+            "Slice",
+            vec![
+                Some(concatenated),
+                Some(starts),
+                Some(ends),
+                Some(axes),
+                Some(steps),
+            ],
+            vec![sliced],
+        ));
+
+        let reshaped = graph.create_named_value("reshaped", DataType::Float32, Shape::new());
+        graph.insert_node(Node::new(
+            NodeId(5),
+            "Reshape",
+            vec![Some(sliced), Some(reshape_target)],
+            vec![reshaped],
+        ));
+        let normalized = graph.create_named_value("normalized", DataType::Float32, Shape::new());
+        let mean = graph.create_named_value("norm_mean", DataType::Float32, Shape::new());
+        let inv_std = graph.create_named_value("inv_std", DataType::Float32, Shape::new());
+        graph.insert_node(Node::new(
+            NodeId(6),
+            "LayerNormalization",
+            vec![Some(reshaped), Some(scale), None],
+            vec![normalized, mean, inv_std],
+        ));
+        let identity = graph.create_named_value("identity", DataType::Float32, Shape::new());
+        graph.insert_node(Node::new(
+            NodeId(7),
+            "Identity",
+            vec![Some(normalized)],
+            vec![identity],
+        ));
+        graph.add_output(convolved);
+        graph.add_output(identity);
+
+        let mut model = Model::new(graph);
+        infer_shapes(&mut model).unwrap();
+        assert_eq!(
+            model.graph.value(convolved).shape,
+            vec![
+                Dim::Static(1),
+                Dim::Static(8),
+                Dim::Static(16),
+                Dim::Static(16)
+            ]
+        );
+        assert_eq!(
+            model.graph.value(transposed).shape,
+            vec![
+                Dim::Static(1),
+                Dim::Static(32),
+                Dim::Static(5),
+                Dim::Static(6),
+                Dim::Static(32)
+            ]
+        );
+        assert_eq!(
+            model.graph.value(identity).shape,
+            vec![Dim::Static(2), Dim::Static(15_360)]
+        );
+        assert_eq!(
+            model.graph.value(mean).shape,
+            vec![Dim::Static(2), Dim::Static(1)]
+        );
+    }
+
+    #[test]
+    fn if_inference_unions_branch_output_shapes() {
+        fn branch(shape: Vec<Dim>) -> Graph {
+            let mut graph = Graph::new();
+            let output = graph.create_named_value("branch_output", DataType::Float32, shape);
+            graph.add_input(output);
+            graph.add_output(output);
+            graph
+        }
+
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 21);
+        let condition = graph.create_named_value("condition", DataType::Bool, Vec::<Dim>::new());
+        graph.add_input(condition);
+        let output = graph.create_named_value("output", DataType::Float32, Shape::new());
+        let node = graph.insert_node(Node::new(
+            NodeId(0),
+            "If",
+            vec![Some(condition)],
+            vec![output],
+        ));
+        graph.subgraphs.insert(
+            (node, "then_branch".into()),
+            branch(vec![Dim::Static(2), Dim::Static(4)]),
+        );
+        graph.subgraphs.insert(
+            (node, "else_branch".into()),
+            branch(vec![Dim::Static(3), Dim::Static(4)]),
+        );
+        graph.add_output(output);
+
+        let mut model = Model::new(graph);
+        let result = infer_shapes(&mut model).unwrap();
+        assert!(matches!(
+            model.graph.value(output).shape.as_slice(),
+            [Dim::Symbolic(_), Dim::Static(4)]
+        ));
+        assert_eq!(result.unknown, 0);
+    }
+
+    #[test]
+    fn if_inference_does_not_invent_unresolved_branch_shapes() {
+        fn unresolved_branch() -> Graph {
+            let mut graph = Graph::new();
+            let input = graph.create_named_value("input", DataType::Float32, vec![Dim::Static(2)]);
+            graph.add_input(input);
+            let output = graph.create_named_value("output", DataType::Float32, Shape::new());
+            graph.insert_node(Node::new(
+                NodeId(0),
+                "Unsupported",
+                vec![Some(input)],
+                vec![output],
+            ));
+            graph.add_output(output);
+            graph
+        }
+
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 21);
+        let condition = graph.create_named_value("condition", DataType::Bool, Vec::<Dim>::new());
+        graph.add_input(condition);
+        let output = graph.create_named_value("output", DataType::Float32, Shape::new());
+        let node = graph.insert_node(Node::new(
+            NodeId(0),
+            "If",
+            vec![Some(condition)],
+            vec![output],
+        ));
+        graph
+            .subgraphs
+            .insert((node, "then_branch".into()), unresolved_branch());
+        graph
+            .subgraphs
+            .insert((node, "else_branch".into()), unresolved_branch());
+        graph.add_output(output);
+
+        let mut model = Model::new(graph);
+        let result = infer_shapes(&mut model).unwrap();
+        assert_eq!(result.unknown, 1);
     }
 }

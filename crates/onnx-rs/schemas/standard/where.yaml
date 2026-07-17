@@ -1,0 +1,13 @@
+domain: ""
+name: Where
+since_version: 16
+doc: Select broadcast elements from X or Y according to a boolean condition.
+inputs:
+  - { name: condition, type_str: B }
+  - { name: X, type_str: T }
+  - { name: Y, type_str: T }
+outputs:
+  - { name: output, type_str: T }
+type_constraints:
+  - { type_param: B, allowed: [bool] }
+  - { type_param: T, allowed: [uint8, uint16, uint32, uint64, int8, int16, int32, int64, bfloat16, float16, float32, float64, string, bool, complex64, complex128] }

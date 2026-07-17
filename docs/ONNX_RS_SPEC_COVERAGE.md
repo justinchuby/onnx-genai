@@ -46,11 +46,11 @@ I/O, and dedicated multi-device paths are exercised in
 | Priority | Gap | Impact |
 |---|---|---|
 | Closed | ✅ **ONNX-ML `TypeProto.Opaque` is bound** (`Opaque.domain = 1`, `Opaque.name = 2`, `opaque_type = 7`). | Binary, JSON, TextProto, and readable-Text extension round-trips are lossless. |
-| P0 | ⚠️ **The checker is substantially expanded but is not yet the full ONNX checker.** It now validates metadata-key uniqueness, attribute discriminators/unions/references, `TypeProto` containers and shapes, dense payload storage/counts/segments/external offsets, sparse COO structure/order/bounds, and multi-device group maps. Function signature/recursion/import rules, quantization annotation targets, additional IR-version gates, and training semantics remain. | Most malformed inference-model protobuf structures are now rejected; the remaining inference gaps are listed below. Training validation is explicitly out of scope. |
-| P0 | ⚠️ **The operator schema catalog now contains 15 high-value operators / 22 versioned entries.** Added `Softmax`, `LayerNormalization`, `Gather`, `Reshape`, `Transpose`, `Concat`, and `Slice` alongside the original eight. | Common runtime graphs validate, but this is not yet the complete standard or ONNX-ML schema catalog. |
+| P0 | ⚠️ **The checker is substantially expanded but is not yet the full ONNX checker.** It validates metadata-key uniqueness, attribute discriminators/unions/references, `TypeProto` containers and shapes, dense payload storage/counts/segments/external offsets, sparse COO structure/order/bounds, and multi-device group maps. Function signature/default/topology/import compatibility and additional IR-version gates remain. | Most malformed inference-model protobuf structures are rejected; training validation is explicitly out of scope. A round-2 source audit confirmed that v1.20 `checker.cc` does not validate quantization-annotation targets or UTF-8 inside protobuf `bytes` payloads, so adding either would over-constrain the official checker. |
+| P0 | ⚠️ **The operator schema catalog now contains 27 high-value operators / 34 versioned entries.** Round 2 added `Sigmoid`, `Tanh`, `Erf`, `Sqrt`, `Exp`, `Log`, `Pow`, `Clip`, `Expand`, `Where`, `ReduceSum`, and `ReduceMean`. | Common transformer/CNN/math graphs validate, but this is not yet the complete standard or ONNX-ML schema catalog. |
 | P1 | ⚠️ **Full-schema programmatic mutation is proto-first only.** The execution IR does not own training info, local functions, sparse initializers, quantization annotations, metadata on every object, or distributed annotations. `make_graph_authoritative` drops such fields ([`model.rs:134-141`](../crates/onnx-rs/src/model.rs#L134-L141)). | Loaded models are lossless, but graph rewrites cannot preserve every construct unless callers edit/rebuild a `ModelProto`. |
 | P1 | ⚠️ **Readable Text is not a native full-spec grammar.** Many fields, including all multi-device messages, are carried in the extension block. | Round-trip is correct, but direct human editing is split between the graph DSL and TextFormat. |
-| P1 | ⚠️ **Shape inference is permissive and incomplete.** Unsupported operators remain unknown ([`shape.rs:28-50`](../crates/onnx-rs/src/shape.rs#L28-L50)). | Full ONNX shape-inference parity is not yet achieved. |
+| P1 | ⚠️ **Every operator currently present in the 27-op schema catalog now has shape inference.** Round 2 added recursive `If` branch inference and official branch-shape union semantics, with representative graph tests spanning convolution, normalization, movement, unary, broadcasting, selection, expansion, and reduction rules. Unsupported operators outside the schema catalog remain unknown ([`shape.rs:28-50`](../crates/onnx-rs/src/shape.rs#L28-L50)). | The catalog-local gap is closed; full ONNX shape-inference parity still depends on completing the operator catalog and adding sequence/optional/control-flow rules beyond `If`. |
 | Closed | ✅ **Dense and sparse payload structural validation is implemented.** | Checked arithmetic covers element/byte counts, sub-byte packing, segments, external offsets/lengths, sparse NNZ/index shape/order/uniqueness/bounds, and storage-field/dtype compatibility. |
 | P2 | ⚠️ **Version conversion is not full ONNX conversion.** Only a small adapter set is registered. | Most opset transitions cannot be performed even when the wire schema is supported. |
 
@@ -78,13 +78,13 @@ tensors/types/functions
 | `ModelProto` | `ir_version`(1), `producer_name`(2), `producer_version`(3), `domain`(4), `model_version`(5), `doc_string`(6), `graph`(7), `opset_import`(8), `metadata_props`(14), `training_info`(20), `functions`(25), `configuration`(26) | ✅ | ⚠️ IR-present/opset/graph/multi-device checks; remaining model invariants ❌ | ⚠️ IR/opset/graph native; other fields extension | ✅ | ✅ |
 | `DeviceConfigurationProto` | `name`(1), `num_devices`(2), `device`(3) | ✅ | ✅ required name, positive count, optional name-list cardinality, unique IDs | ⚠️ extension | ✅ | ✅ |
 | `StringStringEntryProto` | `key`(1), `value`(2) | ✅ | ✅ distinct metadata/external/group-map keys in checked inference scopes | ⚠️ extension | ✅ | ✅ |
-| `TensorAnnotation` | `tensor_name`(1), `quant_parameter_tensor_names`(2) | ✅ | ❌ annotation target/key semantics | ⚠️ extension | ✅ | ✅ |
+| `TensorAnnotation` | `tensor_name`(1), `quant_parameter_tensor_names`(2) | ✅ | N/A in official v1.20 `checker.cc`; duplicate map keys are checked as metadata hygiene | ⚠️ extension | ✅ | ✅ |
 | `GraphProto` | `node`(1), `name`(2), `initializer`(5), `doc_string`(10), `input`(11), `output`(12), `value_info`(13), `quantization_annotation`(14), `sparse_initializer`(15), `metadata_props`(16) | ✅ | ⚠️ acyclicity/SSA-like names/I/O/connectivity/initializer type; remaining graph rules ❌ | ⚠️ nodes/name/dense initializer refs/I/O native; other fields extension | ✅ | ✅ |
-| `TensorProto.Segment` | `begin`(1), `end`(2) | ✅ | ❌ segment bounds/legality | ⚠️ extension | ✅ | ✅ |
-| `TensorProto` | `dims`(1), `data_type`(2), `segment`(3), `float_data`(4), `int32_data`(5), `string_data`(6), `int64_data`(7), `name`(8), `raw_data`(9), `double_data`(10), `uint64_data`(11), `doc_string`(12), `external_data`(13), `data_location`(14), `metadata_props`(16) | ✅ | ✅ dtype, dimensions, checked element/byte counts, typed/raw exclusivity, sub-byte packing, segments, metadata, and external location/offset/length structure | ⚠️ dtype/shape/name references native; bytes/metadata extension | ✅ | ✅ |
+| `TensorProto.Segment` | `begin`(1), `end`(2) | ✅ | ✅ non-negative ordered bounds within the full tensor extent | ⚠️ extension | ✅ | ✅ |
+| `TensorProto` | `dims`(1), `data_type`(2), `segment`(3), `float_data`(4), `int32_data`(5), `string_data`(6), `int64_data`(7), `name`(8), `raw_data`(9), `double_data`(10), `uint64_data`(11), `doc_string`(12), `external_data`(13), `data_location`(14), `metadata_props`(16) | ✅ | ✅ dtype, dimensions, checked element/byte counts, typed/raw exclusivity, sub-byte packing, segments, metadata, and external location/offset/length structure; `string_data` is protobuf `bytes` and official v1.20 performs no UTF-8 check | ⚠️ dtype/shape/name references native; bytes/metadata extension | ✅ | ✅ |
 | `SparseTensorProto` | `values`(1), `indices`(2), `dims`(3) | ✅ | ✅ values/indices presence, NNZ, INT64 index dtype, index shape/order/uniqueness/bounds | ⚠️ extension/attribute placeholder | ✅ | ✅ |
 | `TensorShapeProto.Dimension` | oneof `dim_value`(1)/`dim_param`(2), `denotation`(3) | ✅ | ✅ negative concrete dimensions rejected; denotation has no additional structural rule | ⚠️ value native; denotation extension | ✅ | ✅ |
-| `TensorShapeProto` | `dim`(1) | ✅ | ⚠️ rank is represented; full shape rules depend on operators | ✅ tensor/sparse signatures | ✅ | ✅ |
+| `TensorShapeProto` | `dim`(1) | ✅ | ⚠️ rank is represented; all 27 registered operators have rules, while the incomplete catalog limits full shape coverage | ✅ tensor/sparse signatures | ✅ | ✅ |
 | `TypeProto.Tensor` | `elem_type`(1), `shape`(2) | ✅ | ✅ required defined dtype and legal concrete dimensions | ✅ dtype/shape, ⚠️ denotations | ✅ | ✅ |
 | `TypeProto.Sequence` | `elem_type`(1) | ✅ | ✅ required recursively-valid element type | ⚠️ extension (runtime attribute representation exists) | ✅ | ✅ |
 | `TypeProto.Map` | `key_type`(1), `value_type`(2) | ✅ | ✅ integral/string key restriction and required recursive value | ⚠️ extension | ✅ | ✅ |
@@ -125,7 +125,7 @@ Readable Text has a spelling for every value
 | `INT16` | 5 | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `INT32` | 6 | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `INT64` | 7 | ✅ | ✅ | ✅ | ✅ | ✅ |
-| `STRING` | 8 | ✅ | ⚠️ payload count checked; UTF-8 byte validation remains | ✅ | ✅ | ✅ |
+| `STRING` | 8 | ✅ | ✅ payload count checked; official v1.20 permits arbitrary bytes | ✅ | ✅ | ✅ |
 | `BOOL` | 9 | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `FLOAT16` | 10 | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `DOUBLE` | 11 | ✅ | ✅ | ✅ | ✅ | ✅ |
@@ -145,9 +145,9 @@ Readable Text has a spelling for every value
 | `UINT2` | 25 | ✅ | ⚠️ packed length checked; unused padding bits remain unchecked | ✅ | ✅ | ✅ |
 | `INT2` | 26 | ✅ | ⚠️ packed length checked; unused padding bits remain unchecked | ✅ | ✅ | ✅ |
 
-The remaining dtype-level checker gaps are UTF-8 validation for `string_data`
-and enforcing that unused high padding bits are zero in the last packed
-sub-byte element.
+The remaining dtype-level checker gap is enforcing that unused high padding
+bits are zero in the last packed sub-byte element. Official v1.20 does not
+apply UTF-8 validation to `string_data`, which is a protobuf `bytes` field.
 
 ## `AttributeProto.AttributeType` inventory
 
@@ -234,13 +234,13 @@ Deferred multi-device checker items:
 | Inference graph | ✅ | ✅ core graph syntax, ⚠️ residual metadata | ⚠️ core structural rules | ⚠️ operator-dependent |
 | Nested graph attributes | ✅ | ✅ body, ⚠️ residual metadata | ⚠️ recursive structural rules | ⚠️ operator-dependent |
 | Sparse initializers | ✅ | ⚠️ extension | ✅ structural/payload/index semantics | ❌ sparse execution storage |
-| Quantization annotations | ✅ | ⚠️ extension | ❌ | ❌ annotation-driven behavior |
+| Quantization annotations | ✅ | ⚠️ extension | N/A in official v1.20 checker; duplicate parameter-map keys checked | ❌ annotation-driven behavior |
 | Local functions | ✅ | ⚠️ extension | ❌ full function checker | ⚠️ loader may inline; declarations retained only in source proto |
 | Training info | ✅ | ⚠️ extension | ❌ training semantics | ❌ training execution |
 | Metadata properties on model/graph/node/value/tensor/function | ✅ | ⚠️ extension | ✅ distinct-key checks | N/A |
 | Multi-device/sharding | ✅ | ⚠️ extension | ✅/⚠️ only unknown-rank axes deferred | N/A hints; no distributed executor |
 | ONNX-ML `Opaque` type | ✅ | ⚠️ extension | ✅ optional payload semantics | ❌ opaque execution values |
-| Standard operator schemas through opset 24 | ✅ node serialization | ✅ node syntax | ⚠️ 15 high-value operators / 22 versioned entries | ⚠️ partial inference registry |
+| Standard operator schemas through opset 25 | ✅ node serialization | ✅ node syntax | ⚠️ 27 high-value operators / 34 versioned entries | ✅ for the registered catalog; ⚠️ catalog incomplete |
 | ONNX-ML operator schemas | ✅ generic node serialization | ✅ generic node syntax | ❌ | ⚠️ only generic/custom registration paths |
 
 ## Test evidence
@@ -258,7 +258,12 @@ Deferred multi-device checker items:
   Sharding specs that omit the optional dimension oneof pass; invalid group
   maps, configuration IDs, tensor names, axes, and shard counts are rejected.
 - Schemas: each newly added operator has a registry test pinning its ONNX
-  version, arity, attributes, optional/variadic positions, or type constraints.
+  version and arity, plus detail tests for attributes, optional inputs, concrete
+  inputs, defaults, and type constraints.
+- Shape inference: representative graphs cover every family in the registered
+  catalog. `If` recursively infers both branches, requires matching output
+  counts and element types, preserves agreeing dimensions, and replaces
+  conflicting branch dimensions with a fresh symbolic dimension.
 - The fixture is synthetic. The ONNX v1.20 repository contains the schema,
   normative IR text, and proposal material, but no checked-in binary multi-device
   model fixture was found.
@@ -270,14 +275,32 @@ Deferred multi-device checker items:
   but no training-related checker, schema, shape-inference, or runtime work is
   required for full inference-spec support.
 
+  ## Round-2 official-source verification
+
+  The round-2 schema and inference details were checked against tag `v1.20.0`:
+
+  - `onnx/defs/math/defs.cc`: `Sigmoid`/`Tanh`/`Erf`/`Sqrt`/`Exp`/`Log`
+    revision 13, `Pow` revision 15, `Clip` revision 13, and `Expand` revision 13;
+  - `onnx/defs/tensor/defs.cc`: `Where` revision 16;
+  - `onnx/defs/reduction/defs.cc` and `onnx/defs/reduction/utils.cc`:
+    `ReduceSum` revision 13, `ReduceMean` revision 18, dynamic optional axes,
+    `keepdims = 1`, `noop_with_empty_axes = 0`, and the reduction type set;
+  - `onnx/defs/schema.cc`: exact `all_float_types_ir4`,
+    `all_numeric_types_ir4`, `all_tensor_types_ir4`, and
+    `numeric_types_for_math_reduction_ir4` expansions;
+  - `onnx/defs/controlflow/utils.cc` and `onnx/defs/shape_inference.cc`:
+    recursive branch inference, output-count/type checks, and `UnionTypeInfo`
+    shape merging for `If`;
+  - `onnx/checker.cc`: no quantization-annotation validation and no UTF-8
+    validation for `TensorProto.string_data`/attribute byte payloads.
+
   ## Remaining non-training gaps
 
-  - Complete standard and ONNX-ML operator-schema catalogs (15 high-value standard
-    operators are currently registered).
+  - Complete standard and ONNX-ML operator-schema catalogs (27 high-value standard
+    operators / 34 versioned entries are currently registered).
   - Function signature/default-attribute/topology/import/recursion validation.
-  - Quantization-annotation target/key semantics and the remaining IR-version
-    introduction gates.
-  - UTF-8 validation for string tensor payloads and zero-padding-bit validation
-    for final packed 2-bit/4-bit values.
+  - Remaining IR-version introduction gates.
+  - Zero-padding-bit validation for final packed 2-bit/4-bit values.
   - Full-schema programmatic mutation, native readable-Text grammar, complete
-    shape inference, and complete opset version conversion.
+    shape inference outside the registered catalog, and complete opset version
+    conversion.

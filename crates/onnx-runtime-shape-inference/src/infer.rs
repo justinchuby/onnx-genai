@@ -1,6 +1,6 @@
 //! Whole-graph and single-node inference driving logic.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use onnx_runtime_ir::{Dim, Graph, Node, SymbolConstraints, SymbolId, ValueId, WeightRef};
 
@@ -36,6 +36,15 @@ impl InferenceRegistry {
         opset_imports: &HashMap<String, u64>,
         policy: MergePolicy,
     ) -> Result<InferenceReport, ShapeInferError> {
+        let mut subgraph_resolved = HashMap::new();
+        for (key, subgraph) in &mut graph.subgraphs {
+            let report = self.infer_graph(subgraph, opset_imports, policy)?;
+            subgraph_resolved.insert(
+                key.clone(),
+                report.resolved.into_iter().collect::<HashSet<_>>(),
+            );
+        }
+
         let order = graph
             .topological_order()
             .map_err(|_| ShapeInferError::CycleDetected)?;
@@ -57,7 +66,12 @@ impl InferenceRegistry {
         for nid in order {
             let node = graph.node(nid).clone();
             let inputs = gather_inputs(&node, &types, &shape_data);
-            let outputs = self.infer_node(&node, opset_imports, inputs, policy, &mut interner)?;
+            let outputs = if is_standard_if(&node) {
+                infer_if_outputs(graph, &node, &subgraph_resolved, &mut interner)?
+                    .unwrap_or_else(|| vec![NodeIo::default(); node.outputs.len()])
+            } else {
+                self.infer_node(&node, opset_imports, inputs, policy, &mut interner)?
+            };
             for (slot, io) in node.outputs.iter().zip(outputs) {
                 if let Some(ti) = io.type_info {
                     types.insert(*slot, ti);
@@ -113,6 +127,116 @@ impl InferenceRegistry {
             unresolved,
         })
     }
+}
+
+fn is_standard_if(node: &Node) -> bool {
+    node.op_type == "If" && (node.domain.is_empty() || node.domain == "ai.onnx")
+}
+
+fn infer_if_outputs(
+    graph: &Graph,
+    node: &Node,
+    subgraph_resolved: &HashMap<(onnx_runtime_ir::NodeId, String), HashSet<ValueId>>,
+    interner: &mut SymbolInterner,
+) -> Result<Option<Vec<NodeIo>>, ShapeInferError> {
+    let then_key = (node.id, "then_branch".to_string());
+    let else_key = (node.id, "else_branch".to_string());
+    let Some(then_branch) = graph.subgraphs.get(&then_key) else {
+        return Ok(None);
+    };
+    let Some(else_branch) = graph.subgraphs.get(&else_key) else {
+        return Ok(None);
+    };
+    let Some(then_resolved) = subgraph_resolved.get(&then_key) else {
+        return Ok(None);
+    };
+    let Some(else_resolved) = subgraph_resolved.get(&else_key) else {
+        return Ok(None);
+    };
+
+    if then_branch.outputs.len() != else_branch.outputs.len() {
+        return Err(ShapeInferError::Invalid {
+            op: "If".to_string(),
+            detail: format!(
+                "then_branch and else_branch produce different numbers of outputs: {} != {}",
+                then_branch.outputs.len(),
+                else_branch.outputs.len()
+            ),
+        });
+    }
+    if then_branch.outputs.len() != node.outputs.len() {
+        return Err(ShapeInferError::Invalid {
+            op: "If".to_string(),
+            detail: format!(
+                "node has {} outputs but its branches produce {}",
+                node.outputs.len(),
+                then_branch.outputs.len()
+            ),
+        });
+    }
+
+    let mut outputs = Vec::with_capacity(node.outputs.len());
+    for (&then_id, &else_id) in then_branch.outputs.iter().zip(&else_branch.outputs) {
+        if !branch_output_is_resolved(then_branch, then_id, then_resolved)
+            || !branch_output_is_resolved(else_branch, else_id, else_resolved)
+        {
+            outputs.push(NodeIo::default());
+            continue;
+        }
+        let then_value =
+            then_branch
+                .try_value(then_id)
+                .ok_or_else(|| ShapeInferError::Invalid {
+                    op: "If".to_string(),
+                    detail: format!("then_branch output {then_id:?} is not live"),
+                })?;
+        let else_value =
+            else_branch
+                .try_value(else_id)
+                .ok_or_else(|| ShapeInferError::Invalid {
+                    op: "If".to_string(),
+                    detail: format!("else_branch output {else_id:?} is not live"),
+                })?;
+
+        if then_value.dtype != else_value.dtype {
+            return Err(ShapeInferError::Invalid {
+                op: "If".to_string(),
+                detail: format!(
+                    "branch output element types differ: {:?} != {:?}",
+                    then_value.dtype, else_value.dtype
+                ),
+            });
+        }
+
+        if then_value.shape.len() != else_value.shape.len() {
+            outputs.push(NodeIo::default());
+            continue;
+        }
+
+        let shape = then_value
+            .shape
+            .iter()
+            .zip(&else_value.shape)
+            .map(|(&then_dim, &else_dim)| {
+                if then_dim == else_dim {
+                    DimExpr::from(then_dim)
+                } else {
+                    interner.fresh_dim()
+                }
+            })
+            .collect();
+        outputs.push(NodeIo::typed(TypeInfo::new(then_value.dtype, shape)));
+    }
+
+    Ok(Some(outputs))
+}
+
+fn branch_output_is_resolved(branch: &Graph, output: ValueId, resolved: &HashSet<ValueId>) -> bool {
+    resolved.contains(&output)
+        && branch.try_value(output).is_some_and(|value| {
+            value.producer.is_some()
+                || (branch.value_type_is_known(output) && branch.value_shape_is_known(output))
+        })
 }
 
 /// Seed the type (and shape-data) of every source value — graph inputs,

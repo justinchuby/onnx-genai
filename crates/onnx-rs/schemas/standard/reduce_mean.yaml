@@ -1,0 +1,14 @@
+domain: ""
+name: ReduceMean
+since_version: 18
+doc: Mean of tensor elements along optional axes.
+attributes:
+  - { name: keepdims, type: int, default: 1 }
+  - { name: noop_with_empty_axes, type: int, default: 0 }
+inputs:
+  - { name: data, type_str: T }
+  - { name: axes, type_str: "tensor(int64)", optional: true }
+outputs:
+  - { name: reduced, type_str: T }
+type_constraints:
+  - { type_param: T, allowed: [uint32, uint64, int32, int64, float16, float32, float64, bfloat16] }

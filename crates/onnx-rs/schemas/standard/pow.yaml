@@ -1,0 +1,12 @@
+domain: ""
+name: Pow
+since_version: 15
+doc: Element-wise exponentiation with multidirectional broadcasting.
+inputs:
+  - { name: X, type_str: T }
+  - { name: Y, type_str: T1 }
+outputs:
+  - { name: Z, type_str: T }
+type_constraints:
+  - { type_param: T, allowed: [int32, int64, float16, float32, float64, bfloat16] }
+  - { type_param: T1, allowed: [uint8, uint16, uint32, uint64, int8, int16, int32, int64, float16, float32, float64, bfloat16] }
