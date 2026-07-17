@@ -743,6 +743,115 @@ fn gqa_gpu_decode_preserves_fixed_cache_capacity_and_write_offset() {
     );
 }
 
+// Feasibility probe for shared-buffer continuous batching: two sequences with
+// DIFFERENT valid KV lengths must share one batched GQA run without cross-row
+// contamination. Each row is written into its own fixed-capacity cache slice at
+// its own per-row write offset (seqlens_k[row]), and a single shared
+// total_sequence_length scalar (= max valid length) is used for the whole batch.
+// If the CUDA GQA kernel honors per-row seqlens_k for both attention masking and
+// the present-cache write position, the batched output for each row must equal
+// that row run alone. This validates that BatchedSharedBufferDecodeSession is
+// possible.
+#[test]
+fn gqa_gpu_shared_buffer_batches_rows_of_different_lengths() {
+    let Some(ep) = gpu() else { return };
+
+    // Row 0: past_len = 2, capacity = 5.
+    let q0 = [1., 0., 1., 0., 0., 1., 0., 1.];
+    let past_k0 = [
+        1., 0., 0., 1., 91., 92., 93., 94., 95., 96., 10., 0., 0., 10., 81., 82., 83., 84., 85.,
+        86.,
+    ];
+    let past_v0 = [
+        1., 2., 3., 4., 71., 72., 73., 74., 75., 76., 10., 20., 30., 40., 61., 62., 63., 64., 65.,
+        66.,
+    ];
+    let cur_k0 = [1., 1., 10., 10.];
+    let cur_v0 = [5., 6., 50., 60.];
+
+    // Row 1: past_len = 3 (different length), capacity = 5, different data.
+    let q1 = [0., 1., 1., 1., 1., 0., 1., 1.];
+    let past_k1 = [
+        2., 0., 0., 2., 1., 1., 44., 44., 55., 55., 3., 0., 0., 3., 2., 2., 66., 66., 77., 77.,
+    ];
+    let past_v1 = [
+        1., 1., 2., 2., 3., 3., 88., 88., 99., 99., 4., 4., 5., 5., 6., 6., 11., 11., 22., 22.,
+    ];
+    let cur_k1 = [1., 0., 0., 1.];
+    let cur_v1 = [7., 7., 70., 70.];
+
+    // Standalone runs (ground truth from the real kernel), one row at a time.
+    let out_row0 = run_available(run(
+        &ep,
+        &attrs(&[]),
+        &base_inputs(
+            &[1, 1, 8],
+            &q0,
+            &[1, 1, 4],
+            &cur_k0,
+            &cur_v0,
+            Some((&[1, 2, 5, 2], &past_k0)),
+            Some((&[1, 2, 5, 2], &past_v0)),
+            &[2],
+            3,
+        ),
+        &[vec![1, 1, 8], vec![1, 2, 5, 2], vec![1, 2, 5, 2]],
+    ))
+    .unwrap();
+    let out_row1 = run(
+        &ep,
+        &attrs(&[]),
+        &base_inputs(
+            &[1, 1, 8],
+            &q1,
+            &[1, 1, 4],
+            &cur_k1,
+            &cur_v1,
+            Some((&[1, 2, 5, 2], &past_k1)),
+            Some((&[1, 2, 5, 2], &past_v1)),
+            &[3],
+            4,
+        ),
+        &[vec![1, 1, 8], vec![1, 2, 5, 2], vec![1, 2, 5, 2]],
+    )
+    .unwrap();
+
+    // Batched run: stack both rows, per-row seqlens_k = [2, 3], shared
+    // total_sequence_length = max(seqlens_k) + 1 = 4.
+    let cat = |a: &[f32], b: &[f32]| -> Vec<f32> { a.iter().chain(b).copied().collect() };
+    let q = cat(&q0, &q1);
+    let cur_k = cat(&cur_k0, &cur_k1);
+    let cur_v = cat(&cur_v0, &cur_v1);
+    let past_k = cat(&past_k0, &past_k1);
+    let past_v = cat(&past_v0, &past_v1);
+    let batched = run(
+        &ep,
+        &attrs(&[]),
+        &base_inputs(
+            &[2, 1, 8],
+            &q,
+            &[2, 1, 4],
+            &cur_k,
+            &cur_v,
+            Some((&[2, 2, 5, 2], &past_k)),
+            Some((&[2, 2, 5, 2], &past_v)),
+            &[2, 3],
+            4,
+        ),
+        &[vec![2, 1, 8], vec![2, 2, 5, 2], vec![2, 2, 5, 2]],
+    )
+    .unwrap();
+
+    // Each batched row's attention output must equal that row run alone.
+    close(&batched[0][0..8], &out_row0[0]);
+    close(&batched[0][8..16], &out_row1[0]);
+    // And each row's present KV cache (written at its own offset) must match too.
+    close(&batched[1][0..20], &out_row0[1]);
+    close(&batched[1][20..40], &out_row1[1]);
+    close(&batched[2][0..20], &out_row0[2]);
+    close(&batched[2][20..40], &out_row1[2]);
+}
+
 #[test]
 fn gqa_gpu_rope_explicit_positions_rotate_query_and_key() {
     let Some(ep) = gpu() else { return };
