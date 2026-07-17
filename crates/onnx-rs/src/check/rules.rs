@@ -1114,7 +1114,7 @@ fn check_dtype_ir_feature(
 }
 
 /// Validate model-local functions using the v1.20 checker topology/import
-/// rules plus signature, call-site, default-attribute, and unique-ID rules.
+/// rules plus signature, default-attribute, and unique-ID rules.
 pub struct FunctionProtoValidityRule;
 
 impl ValidationRule for FunctionProtoValidityRule {
@@ -1187,150 +1187,8 @@ fn check_model_functions(
     for function in &model.functions {
         check_function_proto(function, &model_opsets, ctx, rule_id, &mut violations);
     }
-    check_model_function_call_sites(model, &functions, rule_id, &mut violations);
     check_function_recursion(&functions, rule_id, &mut violations);
     violations
-}
-
-fn check_model_function_call_sites(
-    model: &ModelProto,
-    functions: &HashMap<FunctionKey, &FunctionProto>,
-    rule_id: &str,
-    violations: &mut Vec<Violation>,
-) {
-    if let Some(graph) = &model.graph {
-        check_function_calls_in_nodes(&graph.node, &graph.name, functions, rule_id, violations);
-    }
-    for function in &model.functions {
-        check_function_calls_in_nodes(
-            &function.node,
-            &function.name,
-            functions,
-            rule_id,
-            violations,
-        );
-    }
-}
-
-fn check_function_calls_in_nodes(
-    nodes: &[NodeProto],
-    graph_name: &str,
-    functions: &HashMap<FunctionKey, &FunctionProto>,
-    rule_id: &str,
-    violations: &mut Vec<Violation>,
-) {
-    for node in nodes {
-        if let Some(function) = functions.get(&node_function_key(node)) {
-            check_function_call_site(node, function, graph_name, rule_id, violations);
-        }
-        for attribute in &node.attribute {
-            if let Some(graph) = &attribute.g {
-                check_function_calls_in_nodes(
-                    &graph.node,
-                    &graph.name,
-                    functions,
-                    rule_id,
-                    violations,
-                );
-            }
-            for graph in &attribute.graphs {
-                check_function_calls_in_nodes(
-                    &graph.node,
-                    &graph.name,
-                    functions,
-                    rule_id,
-                    violations,
-                );
-            }
-        }
-    }
-}
-
-fn check_function_call_site(
-    node: &NodeProto,
-    function: &FunctionProto,
-    graph_name: &str,
-    rule_id: &str,
-    violations: &mut Vec<Violation>,
-) {
-    let location = ViolationLocation::Node {
-        graph_name: graph_name.to_string(),
-        node_name: proto_node_label(node),
-    };
-    if node.input.len() != function.input.len() {
-        violations.push(Violation {
-            rule_id: rule_id.to_string(),
-            severity: Severity::Error,
-            message: format!(
-                "call to model-local function '{}::{}' overload '{}' has {} inputs, expected {}",
-                normalize_domain(&function.domain),
-                function.name,
-                function.overload,
-                node.input.len(),
-                function.input.len()
-            ),
-            location: location.clone(),
-        });
-    }
-    if node.output.len() != function.output.len() {
-        violations.push(Violation {
-            rule_id: rule_id.to_string(),
-            severity: Severity::Error,
-            message: format!(
-                "call to model-local function '{}::{}' overload '{}' has {} outputs, expected {}",
-                normalize_domain(&function.domain),
-                function.name,
-                function.overload,
-                node.output.len(),
-                function.output.len()
-            ),
-            location: location.clone(),
-        });
-    }
-
-    let required = function
-        .attribute
-        .iter()
-        .map(String::as_str)
-        .collect::<HashSet<_>>();
-    let defaults = function
-        .attribute_proto
-        .iter()
-        .map(|attribute| attribute.name.as_str())
-        .collect::<HashSet<_>>();
-    let supplied = node
-        .attribute
-        .iter()
-        .map(|attribute| attribute.name.as_str())
-        .collect::<HashSet<_>>();
-    for attribute in required.difference(&supplied) {
-        violations.push(Violation {
-            rule_id: rule_id.to_string(),
-            severity: Severity::Error,
-            message: format!(
-                "call to model-local function '{}::{}' is missing required attribute '{}'",
-                normalize_domain(&function.domain),
-                function.name,
-                attribute
-            ),
-            location: location.clone(),
-        });
-    }
-    for attribute in supplied {
-        if !required.contains(attribute) && !defaults.contains(attribute) {
-            violations.push(Violation {
-                rule_id: rule_id.to_string(),
-                severity: Severity::Error,
-                message: format!(
-                    "call to model-local function '{}::{}' supplies undeclared attribute '{}'",
-                    normalize_domain(&function.domain),
-                    function.name,
-                    attribute
-                ),
-                location: location.clone(),
-            });
-        }
-    }
 }
 
 fn opset_map(
@@ -4981,7 +4839,7 @@ mod tests {
     }
 
     #[test]
-    fn function_rule_rejects_call_site_arity_and_attribute_mismatches() {
+    fn function_rule_accepts_call_site_arity_and_attribute_mismatches() {
         let callee = function(
             "Affine",
             vec![NodeProto {
@@ -5023,19 +4881,7 @@ mod tests {
             ..Default::default()
         });
         let violations = FunctionProtoValidityRule.check(&model, &ValidationContext::default());
-        for expected in [
-            "has 2 inputs, expected 1",
-            "has 2 outputs, expected 1",
-            "missing required attribute 'alpha'",
-            "supplies undeclared attribute 'gamma'",
-        ] {
-            assert!(
-                violations
-                    .iter()
-                    .any(|violation| violation.message.contains(expected)),
-                "{expected}: {violations:?}"
-            );
-        }
+        assert!(violations.is_empty(), "{violations:?}");
     }
 
     #[test]

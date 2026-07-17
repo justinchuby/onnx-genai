@@ -46,7 +46,7 @@ I/O, and dedicated multi-device paths are exercised in
 | Priority | Gap | Impact |
 |---|---|---|
 | Closed | ✅ **ONNX-ML `TypeProto.Opaque` is bound** (`Opaque.domain = 1`, `Opaque.name = 2`, `opaque_type = 7`). | Binary, JSON, TextProto, and readable-Text extension round-trips are lossless. |
-| P0 | ⚠️ **The checker is substantially expanded but is not yet the full ONNX checker.** Round 4 added model-local function call-site arity and declared/default-attribute consistency across the main graph, function bodies, and nested subgraphs. Round 3 added function declaration, topology/SSA, attribute-reference, import, recursion, IR-version, and packed-padding checks. | Most malformed inference-model protobuf structures are rejected; training validation is explicitly out of scope. Local-function value-type compatibility, graph-wide parity, and the full schema catalog remain. |
+| P0 | ⚠️ **The checker is substantially expanded but is not yet the full ONNX checker.** Round 3 added function declaration, topology/SSA, attribute-reference, import, recursion, IR-version, and packed-padding checks. As in official ONNX v1.20, local-function call-site consistency remains unenforced. | Most malformed inference-model protobuf structures are rejected; training validation is explicitly out of scope. Local-function call-site consistency, graph-wide parity, and the full schema catalog remain. |
 | P0 | ⚠️ **The operator schema catalog now contains 44 high-value operators / 51 versioned entries.** Round 4 added `LogSoftmax`, `RMSNormalization`, `ReduceMax`, `ReduceMin`, `ReduceProd`, `ReduceL1`, `ReduceL2`, `ReduceLogSum`, `ReduceLogSumExp`, `ReduceSumSquare`, `ArgMax`, and `ArgMin`. | Common transformer/CNN/math graphs validate, but this is not yet the complete standard or ONNX-ML schema catalog. |
 | P1 | ⚠️ **Full-schema programmatic mutation is proto-first only.** The execution IR does not own training info, local functions, sparse initializers, quantization annotations, metadata on every object, or distributed annotations. `make_graph_authoritative` drops such fields ([`model.rs:134-141`](../crates/onnx-rs/src/model.rs#L134-L141)). | Loaded models are lossless, but graph rewrites cannot preserve every construct unless callers edit/rebuild a `ModelProto`. |
 | P1 | ⚠️ **Readable Text is not a native full-spec grammar.** Many fields, including all multi-device messages, are carried in the extension block. | Round-trip is correct, but direct human editing is split between the graph DSL and TextFormat. |
@@ -333,15 +333,15 @@ Deferred multi-device checker items:
     `epsilon = 1e-5`, and `stash_type = 1`.
   - `onnx/checker.cc`: local-function nodes intentionally bypass schema
     verification and the upstream call-site consistency check remains a TODO.
-    The local checker now supplies a tested first slice covering arity and
-    declared/default attributes without requiring optional defaults.
+    The local checker likewise accepts call-site arity, required-attribute, and
+    undeclared-attribute mismatches to preserve official acceptance semantics.
 
   ## Remaining non-training gaps
 
   - Complete standard and ONNX-ML operator-schema catalogs (44 high-value standard
     operators / 51 versioned entries are currently registered).
-  - Local-function call-site value-type compatibility; arity and
-    declared/default-attribute consistency are covered.
+  - Local-function call-site consistency, matching the TODO in official
+    `onnx/checker.cc`.
   - Full-schema programmatic mutation, native readable-Text grammar, complete
     shape inference outside the registered catalog, and complete opset version
     conversion.
