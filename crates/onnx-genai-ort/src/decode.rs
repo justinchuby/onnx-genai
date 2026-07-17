@@ -553,30 +553,41 @@ impl<'a> DecodeSession<'a> {
         }
         cap.mask_valid_len = valid_len;
 
-        // Re-bind the persistent buffers every step. ORT keys its stable
-        // internal device input buffers off the binding and re-copies the bound
-        // CPU inputs host->device on each Run; a captured graph replays against
-        // those stable device buffers. Binding only once would freeze the device
-        // inputs at their first-step values (the graph does not re-copy CPU
-        // inputs on replay), so the model would repeat a single token.
+        // On the first step under this capture id (and after any reset/rewind/KV
+        // grow that calls `invalidate_captured_graph`), bind every input and
+        // output so the graph is captured against these exact buffers. On later
+        // steps that merely replay the captured graph, the output tensors (KV
+        // shared buffers and logits) are device-resident and unchanged, so their
+        // bindings persist untouched. Inputs must be cleared and re-bound so ORT
+        // re-copies the mutated CPU inputs (new token id, position, mask tail)
+        // host->device before the replay; clearing inputs also drops the KV
+        // input bindings, so those are re-bound too (cheap: device-resident, no
+        // copy). Skipping the ~30 output binds per token (each a CString alloc +
+        // FFI call) removes about half the per-token bind cost.
         let bind_span = crate::prof_span!("ort.bind_inputs");
-        self.binding.clear()?;
-        self.bind_standard_inputs(&cap.input_ids, &cap.attention_mask, &cap.position_ids)?;
-        self.bind_kv_inputs()?;
-        for output in self.session.output_names() {
-            if let Some(pair) = self.kv_pairs.iter().find(|pair| pair.present == *output) {
-                let value = self.current_kv.get(&pair.past).ok_or_else(|| {
-                    OrtError::InvalidArgument(format!(
-                        "missing shared KV buffer for '{}'",
-                        pair.past
-                    ))
-                })?;
-                self.binding.bind_output(output, value)?;
-            } else if is_logits_output(output) {
-                self.binding.bind_output(output, &cap.logits)?;
-            } else {
-                self.binding
-                    .bind_output_to_device(output, &MemoryInfo::cpu()?)?;
+        if self.capture_bound {
+            self.binding.clear_inputs()?;
+            self.bind_standard_inputs(&cap.input_ids, &cap.attention_mask, &cap.position_ids)?;
+            self.bind_kv_inputs()?;
+        } else {
+            self.binding.clear()?;
+            self.bind_standard_inputs(&cap.input_ids, &cap.attention_mask, &cap.position_ids)?;
+            self.bind_kv_inputs()?;
+            for output in self.session.output_names() {
+                if let Some(pair) = self.kv_pairs.iter().find(|pair| pair.present == *output) {
+                    let value = self.current_kv.get(&pair.past).ok_or_else(|| {
+                        OrtError::InvalidArgument(format!(
+                            "missing shared KV buffer for '{}'",
+                            pair.past
+                        ))
+                    })?;
+                    self.binding.bind_output(output, value)?;
+                } else if is_logits_output(output) {
+                    self.binding.bind_output(output, &cap.logits)?;
+                } else {
+                    self.binding
+                        .bind_output_to_device(output, &MemoryInfo::cpu()?)?;
+                }
             }
         }
         drop(bind_span);

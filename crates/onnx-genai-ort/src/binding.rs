@@ -87,6 +87,26 @@ impl IoBinding {
         Ok(())
     }
 
+    /// Clear only the bound inputs, leaving output bindings in place.
+    ///
+    /// ORT re-copies bound CPU inputs host->device on each run only for inputs
+    /// (re)bound since the previous run; re-binding an already-bound value is a
+    /// no-op that skips the copy. Captured-decode replay exploits this: it must
+    /// refresh its mutated CPU inputs every step (so it clears inputs and
+    /// re-binds them) while keeping the stable device-resident output bindings,
+    /// avoiding a full-rebind of every KV/logits output each token.
+    pub fn clear_inputs(&mut self) -> Result<()> {
+        let api = crate::error::api()?;
+        let clear_inputs = api
+            .ClearBoundInputs
+            .ok_or(OrtError::ApiUnavailable("ClearBoundInputs"))?;
+        // SAFETY: binding is valid; ORT clear function does not return status.
+        unsafe {
+            clear_inputs(self.ptr.as_ptr());
+        }
+        Ok(())
+    }
+
     pub(crate) fn as_ptr(&self) -> *const onnx_genai_ort_sys::OrtIoBinding {
         self.ptr.as_ptr()
     }
