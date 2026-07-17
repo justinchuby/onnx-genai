@@ -19,7 +19,8 @@
 //! and dispatch is purely on op type — no model-specific names. The invariant
 //! is: **never produce a wrong constant.** When in doubt, do not fold.
 
-use std::collections::{HashMap, VecDeque};
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap};
 
 use onnx_runtime_ir::{
     Attribute, DataType, Graph, NodeId, TensorData, ValueId, WeightRef, as_static_shape,
@@ -51,10 +52,11 @@ impl OptimizationPass for ConstantFolding {
         let mut unresolved = HashMap::with_capacity(candidates.len());
         let mut dependents: HashMap<ValueId, Vec<NodeId>> =
             HashMap::with_capacity(candidates.len());
-        let mut ready = VecDeque::new();
+        // Match ascending fixpoint passes: higher IDs made ready during a wave
+        // join it, while lower/equal IDs wait for the next wave.
+        let mut current_wave = BinaryHeap::new();
+        let mut next_wave = BinaryHeap::new();
 
-        // Arena iteration and dependent insertion are both in ascending NodeId
-        // order, so the FIFO schedule is reproducible.
         for nid in candidates {
             let node = graph.node(nid);
             let Some(inputs) = unresolved_inputs(graph, node) else {
@@ -63,7 +65,7 @@ impl OptimizationPass for ConstantFolding {
             let count = inputs.len();
             unresolved.insert(nid, count);
             if count == 0 {
-                ready.push_back(nid);
+                current_wave.push(Reverse(nid.0));
             } else {
                 for input in inputs {
                     dependents.entry(input).or_default().push(nid);
@@ -71,55 +73,64 @@ impl OptimizationPass for ConstantFolding {
             }
         }
 
-        while let Some(nid) = ready.pop_front() {
-            if unresolved.remove(&nid).is_none() || !graph.nodes.contains(nid) {
-                continue;
-            }
-            let (out, folded) = {
-                let node = graph.node(nid);
-                let folded = match node.op_type.as_str() {
-                    "Constant" => eval_constant(node),
-                    "Shape" => fold_shape(graph, node),
-                    "Add" | "Sub" | "Mul" => fold_binary_int(graph, node),
-                    _ => None,
-                };
-                (node.outputs[0], folded)
-            };
-            let Some(tensor) = folded else { continue };
-
-            // Only fold outputs that are still needed (have a consumer or
-            // are graph outputs); dead outputs are DCE's job and folding
-            // them would leave a stale initializer referencing a GC'd id.
-            let needed = graph.outputs.contains(&out)
-                || graph
-                    .try_value(out)
-                    .is_some_and(|v| !v.consumers.is_empty());
-            if !needed {
-                continue;
-            }
-
-            graph.remove_node(nid);
-            // The output survives because it is needed; retype it to the
-            // folded tensor and back it with an inline initializer.
-            if graph.try_value(out).is_none() {
-                continue;
-            }
-            let dims = tensor.dims.clone();
-            let dtype = tensor.dtype;
-            let v = graph.value_mut(out);
-            v.dtype = dtype;
-            v.shape = static_shape(dims);
-            graph.set_initializer(out, WeightRef::Inline(tensor));
-
-            for consumer in dependents.remove(&out).unwrap_or_default() {
-                let Some(count) = unresolved.get_mut(&consumer) else {
+        while !current_wave.is_empty() {
+            while let Some(Reverse(raw_nid)) = current_wave.pop() {
+                let nid = NodeId(raw_nid);
+                if unresolved.remove(&nid).is_none() || !graph.nodes.contains(nid) {
                     continue;
+                }
+                let (out, folded) = {
+                    let node = graph.node(nid);
+                    let folded = match node.op_type.as_str() {
+                        "Constant" => eval_constant(node),
+                        "Shape" => fold_shape(graph, node),
+                        "Add" | "Sub" | "Mul" => fold_binary_int(graph, node),
+                        _ => None,
+                    };
+                    (node.outputs[0], folded)
                 };
-                *count -= 1;
-                if *count == 0 {
-                    ready.push_back(consumer);
+                let Some(tensor) = folded else { continue };
+
+                // Only fold outputs that are still needed (have a consumer or
+                // are graph outputs); dead outputs are DCE's job and folding
+                // them would leave a stale initializer referencing a GC'd id.
+                let needed = graph.outputs.contains(&out)
+                    || graph
+                        .try_value(out)
+                        .is_some_and(|v| !v.consumers.is_empty());
+                if !needed {
+                    continue;
+                }
+
+                graph.remove_node(nid);
+                // The output survives because it is needed; retype it to the
+                // folded tensor and back it with an inline initializer.
+                if graph.try_value(out).is_none() {
+                    continue;
+                }
+                let dims = tensor.dims.clone();
+                let dtype = tensor.dtype;
+                let v = graph.value_mut(out);
+                v.dtype = dtype;
+                v.shape = static_shape(dims);
+                graph.set_initializer(out, WeightRef::Inline(tensor));
+
+                for consumer in dependents.remove(&out).unwrap_or_default() {
+                    let Some(count) = unresolved.get_mut(&consumer) else {
+                        continue;
+                    };
+                    *count -= 1;
+                    if *count == 0 {
+                        let wave = if consumer.0 > nid.0 {
+                            &mut current_wave
+                        } else {
+                            &mut next_wave
+                        };
+                        wave.push(Reverse(consumer.0));
+                    }
                 }
             }
+            std::mem::swap(&mut current_wave, &mut next_wave);
         }
         Ok(())
     }
@@ -296,6 +307,7 @@ fn read_i32(t: &TensorData) -> Option<Vec<i32>> {
 mod tests {
     use super::*;
     use onnx_runtime_ir::{Node, NodeId};
+    use onnx_runtime_loader::{Model, encode_model};
 
     fn int64_tensor(dims: Vec<usize>, vals: &[i64]) -> TensorData {
         let mut data = Vec::new();
@@ -310,6 +322,213 @@ mod tests {
         let v = graph.create_named_value(name, DataType::Int64, shape);
         graph.set_initializer(v, WeightRef::Inline(int64_tensor(dims, vals)));
         v
+    }
+
+    fn run_reference_ascending_fixpoint(graph: &mut Graph) {
+        loop {
+            let mut changed = false;
+            let node_ids: Vec<NodeId> = graph.nodes.keys().collect();
+            for nid in node_ids {
+                if !graph.nodes.contains(nid) {
+                    continue;
+                }
+                let node = graph.node(nid).clone();
+                if !matches!(node.domain.as_str(), "" | "ai.onnx") || node.outputs.len() != 1 {
+                    continue;
+                }
+                let out = node.outputs[0];
+                let folded = match node.op_type.as_str() {
+                    "Constant" => eval_constant(&node),
+                    "Shape" => fold_shape(graph, &node),
+                    "Add" | "Sub" | "Mul" => fold_binary_int(graph, &node),
+                    _ => None,
+                };
+                let Some(tensor) = folded else { continue };
+                let needed = graph.outputs.contains(&out)
+                    || graph
+                        .try_value(out)
+                        .is_some_and(|v| !v.consumers.is_empty());
+                if !needed {
+                    continue;
+                }
+
+                graph.remove_node(nid);
+                if graph.try_value(out).is_some() {
+                    let dims = tensor.dims.clone();
+                    let dtype = tensor.dtype;
+                    let v = graph.value_mut(out);
+                    v.dtype = dtype;
+                    v.shape = static_shape(dims);
+                    graph.set_initializer(out, WeightRef::Inline(tensor));
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+    }
+
+    fn serialized(graph: &Graph) -> Vec<u8> {
+        encode_model(&Model::new(graph)).expect("serialize graph")
+    }
+
+    fn schedule_sensitive_chain() -> (Graph, ValueId) {
+        let mut g = Graph::new();
+        g.opset_imports.insert(String::new(), 17);
+        let init = const_init(&mut g, "init", vec![1], &[2]);
+        let a = g.create_named_value("a", DataType::Int64, static_shape([1]));
+        let b = g.create_named_value("b", DataType::Int64, static_shape([1]));
+        let out = g.create_named_value("out", DataType::Int64, static_shape([1]));
+
+        let mut constant = Node::new(NodeId(0), "Constant", vec![], vec![a]);
+        constant.attributes.insert(
+            "value".into(),
+            Attribute::Tensor(int64_tensor(vec![1], &[3])),
+        );
+        g.insert_node(constant);
+        g.insert_node(Node::new(
+            NodeId(0),
+            "Add",
+            vec![Some(a), Some(init)],
+            vec![b],
+        ));
+        g.insert_node(Node::new(NodeId(0), "Shape", vec![Some(b)], vec![out]));
+        g.add_output(out);
+        (g, out)
+    }
+
+    #[test]
+    fn ascending_wave_folds_constant_add_before_shape_consumer() {
+        let (base, out) = schedule_sensitive_chain();
+        let mut reference = base.clone();
+        let mut worklist = base;
+        run_reference_ascending_fixpoint(&mut reference);
+        ConstantFolding
+            .run(&mut worklist, &PassContext::new())
+            .unwrap();
+
+        assert_eq!(worklist.num_nodes(), 0, "Constant, Add, and Shape fold");
+        assert!(!worklist.nodes.values().any(|node| node.op_type == "Add"));
+        assert_eq!(
+            read_i64(inline_const(&worklist, out).unwrap()),
+            Some(vec![1])
+        );
+        assert_eq!(serialized(&worklist), serialized(&reference));
+        assert!(worklist.validate().is_ok());
+    }
+
+    #[test]
+    fn ascending_wave_leaves_lower_dead_producer_unfolded() {
+        let mut base = Graph::new();
+        base.opset_imports.insert(String::new(), 17);
+        let init = const_init(&mut base, "init", vec![1], &[2]);
+        let a = base.create_named_value("a", DataType::Int64, static_shape([1]));
+        let b = base.create_named_value("b", DataType::Int64, static_shape([1]));
+        let out = base.create_named_value("out", DataType::Int64, static_shape([1]));
+
+        base.insert_node(Node::new(
+            NodeId(0),
+            "Add",
+            vec![Some(a), Some(init)],
+            vec![b],
+        ));
+        base.insert_node(Node::new(NodeId(0), "Shape", vec![Some(b)], vec![out]));
+        let mut constant = Node::new(NodeId(0), "Constant", vec![], vec![a]);
+        constant.attributes.insert(
+            "value".into(),
+            Attribute::Tensor(int64_tensor(vec![1], &[3])),
+        );
+        base.insert_node(constant);
+        base.add_output(out);
+
+        let mut reference = base.clone();
+        let mut worklist = base;
+        run_reference_ascending_fixpoint(&mut reference);
+        ConstantFolding
+            .run(&mut worklist, &PassContext::new())
+            .unwrap();
+
+        assert_eq!(worklist.num_nodes(), 1);
+        assert_eq!(worklist.nodes.values().next().unwrap().op_type, "Add");
+        assert!(inline_const(&worklist, b).is_none());
+        assert_eq!(serialized(&worklist), serialized(&reference));
+        assert!(worklist.validate().is_ok());
+    }
+
+    fn seeded_dag(mut seed: u64, nodes: usize) -> Graph {
+        fn next(seed: &mut u64) -> u64 {
+            *seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            *seed
+        }
+
+        let mut g = Graph::new();
+        g.opset_imports.insert(String::new(), 17);
+        let init = const_init(&mut g, "init", vec![1], &[1]);
+        let values: Vec<ValueId> = (0..nodes)
+            .map(|i| g.create_named_value(format!("v{i}"), DataType::Int64, static_shape([1])))
+            .collect();
+        let mut definitions = Vec::with_capacity(nodes);
+        for i in 0..nodes {
+            let mut node = if i == 0 || next(&mut seed).is_multiple_of(4) {
+                let mut constant = Node::new(NodeId(0), "Constant", vec![], vec![values[i]]);
+                constant.attributes.insert(
+                    "value".into(),
+                    Attribute::Tensor(int64_tensor(vec![1], &[(next(&mut seed) % 8) as i64])),
+                );
+                constant
+            } else if next(&mut seed).is_multiple_of(3) {
+                let input = values[(next(&mut seed) as usize) % i];
+                Node::new(NodeId(0), "Shape", vec![Some(input)], vec![values[i]])
+            } else {
+                let pick_input = |seed: &mut u64| {
+                    if next(seed).is_multiple_of(4) {
+                        init
+                    } else {
+                        values[(next(seed) as usize) % i]
+                    }
+                };
+                Node::new(
+                    NodeId(0),
+                    "Add",
+                    vec![Some(pick_input(&mut seed)), Some(pick_input(&mut seed))],
+                    vec![values[i]],
+                )
+            };
+            node.name = format!("node_{i}");
+            definitions.push(node);
+        }
+
+        let mut order: Vec<usize> = (0..nodes).collect();
+        for i in (1..nodes).rev() {
+            order.swap(i, (next(&mut seed) as usize) % (i + 1));
+        }
+        for index in order {
+            g.insert_node(definitions[index].clone());
+        }
+        for (i, &value) in values.iter().enumerate() {
+            if i + 1 == nodes || (i > nodes / 2 && next(&mut seed).is_multiple_of(11)) {
+                g.add_output(value);
+            }
+        }
+        g
+    }
+
+    #[test]
+    fn seeded_dags_are_byte_identical_to_ascending_fixpoint() {
+        for seed in 0..32 {
+            let base = seeded_dag(seed, 96);
+            assert!(base.validate().is_ok(), "seed {seed}");
+            let mut reference = base.clone();
+            let mut worklist = base;
+            run_reference_ascending_fixpoint(&mut reference);
+            ConstantFolding
+                .run(&mut worklist, &PassContext::new())
+                .unwrap();
+            assert_eq!(serialized(&worklist), serialized(&reference), "seed {seed}");
+        }
     }
 
     #[test]
