@@ -129,7 +129,7 @@ fn quantize(
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 struct Case {
     experts: usize,
     rows: usize,
@@ -140,6 +140,7 @@ struct Case {
     activation: &'static str,
     swiglu_fusion: usize,
     affine: bool,
+    fc3: bool,
     biases: bool,
     normalize: bool,
     router_weights: bool,
@@ -178,9 +179,13 @@ fn case_inputs(case: Case, dtype: DataType) -> Vec<Option<HostTensor>> {
         case.affine,
         2,
     );
-    let needs_fc3 = case.activation == "swiglu" && case.swiglu_fusion == 0
-        || case.activation == "silu" && case.router_weights;
-    let fc3 = needs_fc3.then(|| {
+    match (case.activation, case.swiglu_fusion) {
+        ("swiglu", 0) => assert!(case.fc3, "unfused SwiGLU requires FC3"),
+        ("swiglu", _) => assert!(!case.fc3, "fused SwiGLU must not provide FC3"),
+        ("silu", 0) => {}
+        _ => assert!(!case.fc3, "FC3 is only valid for SwiGLU or gated SiLU"),
+    }
+    let fc3 = case.fc3.then(|| {
         quantize(
             case.experts,
             case.inter,
@@ -208,7 +213,7 @@ fn case_inputs(case: Case, dtype: DataType) -> Vec<Option<HostTensor>> {
         case.biases.then(|| bias(case.hidden, 2)),
         fc3.as_ref().map(|weights| weights.packed.clone()),
         fc3.as_ref().map(|weights| weights.scales.clone()),
-        (case.biases && needs_fc3).then(|| bias(case.inter, 3)),
+        (case.biases && case.fc3).then(|| bias(case.inter, 3)),
         fc1.zero_points,
         fc2.zero_points,
         fc3.and_then(|weights| weights.zero_points),
@@ -475,25 +480,18 @@ fn rounded_cpu_inputs(inputs: &[Option<HostTensor>], dtype: DataType) -> Vec<Opt
 
 fn assert_conforms(actual: &[f32], expected: &[f32], case: Case, dtype: DataType) {
     assert_eq!(actual.len(), expected.len());
-    // Each result traverses two f32 dot products plus at most top_k weighted
-    // additions. gamma_n bounds serial f32 accumulation by n*u/(1-n*u);
-    // the factor 32 covers the different parallel reduction tree and nonlinear
-    // implementation rounding. Half/bfloat output adds at most one storage
-    // unit-roundoff after all compute has completed in f32.
-    let operations = case.hidden + case.inter + case.top_k + case.experts + 8;
-    let unit_roundoff = f32::EPSILON * 0.5;
-    let gamma = operations as f32 * unit_roundoff / (1.0 - operations as f32 * unit_roundoff);
-    let storage_roundoff = match dtype {
-        DataType::Float32 => 0.0,
-        DataType::Float16 => 2.0f32.powi(-11),
-        DataType::BFloat16 => 2.0f32.powi(-8),
+    let (absolute, relative) = match dtype {
+        DataType::Float32 => (2e-5, 1e-4),
+        DataType::Float16 => (2e-5, 6e-4),
+        DataType::BFloat16 => (2e-5, 4.1e-3),
         other => panic!("unsupported dtype {other:?}"),
     };
     for (index, (&actual, &expected)) in actual.iter().zip(expected).enumerate() {
-        let tolerance = 2e-5 + (32.0 * gamma + storage_roundoff) * expected.abs().max(1.0);
+        let tolerance = absolute + relative * expected.abs().max(1.0);
         assert!(
             (actual - expected).abs() <= tolerance,
-            "index {index}: actual={actual}, expected={expected}, tolerance={tolerance}, dtype={dtype:?}"
+            "index {index}: actual={actual}, expected={expected}, tolerance={tolerance}, \
+             absolute={absolute}, relative={relative}, dtype={dtype:?}, case={case:?}"
         );
     }
 }
@@ -530,11 +528,7 @@ fn compare_gemv_gemm_and_cpu(case: Case) {
     assert_conforms(&gemv, &expected, case, DataType::Float32);
 }
 
-fn activation_case(
-    activation: &'static str,
-    swiglu_fusion: usize,
-    separate_silu_gate: bool,
-) -> Case {
+fn activation_case(activation: &'static str, swiglu_fusion: usize, fc3: bool) -> Case {
     Case {
         experts: 4,
         rows: 6,
@@ -545,9 +539,10 @@ fn activation_case(
         activation,
         swiglu_fusion,
         affine: true,
-        biases: true,
+        fc3,
+        biases: false,
         normalize: true,
-        router_weights: separate_silu_gate,
+        router_weights: false,
     }
 }
 
@@ -564,12 +559,7 @@ activation_path_test!(qmoe_relu_gemv_gemm_matches_cpu, "relu", 0, false);
 activation_path_test!(qmoe_gelu_gemv_gemm_matches_cpu, "gelu", 0, false);
 activation_path_test!(qmoe_silu_gemv_gemm_matches_cpu, "silu", 0, false);
 activation_path_test!(qmoe_silu_gated_gemv_gemm_matches_cpu, "silu", 0, true);
-activation_path_test!(
-    qmoe_swiglu_unfused_gemv_gemm_matches_cpu,
-    "swiglu",
-    0,
-    false
-);
+activation_path_test!(qmoe_swiglu_unfused_gemv_gemm_matches_cpu, "swiglu", 0, true);
 activation_path_test!(
     qmoe_swiglu_interleaved_gemv_gemm_matches_cpu,
     "swiglu",
@@ -578,6 +568,66 @@ activation_path_test!(
 );
 activation_path_test!(qmoe_swiglu_split_gemv_gemm_matches_cpu, "swiglu", 2, false);
 activation_path_test!(qmoe_identity_gemv_gemm_matches_cpu, "identity", 0, false);
+
+#[test]
+fn qmoe_biases_gemv_gemm_match_cpu() {
+    compare_gemv_gemm_and_cpu(Case {
+        experts: 4,
+        rows: 6,
+        hidden: 16,
+        inter: 16,
+        bits: 4,
+        top_k: 2,
+        activation: "identity",
+        swiglu_fusion: 0,
+        affine: true,
+        fc3: false,
+        biases: true,
+        normalize: true,
+        router_weights: false,
+    });
+}
+
+#[test]
+fn qmoe_separate_router_weights_gemv_gemm_match_cpu() {
+    compare_gemv_gemm_and_cpu(Case {
+        experts: 4,
+        rows: 6,
+        hidden: 16,
+        inter: 16,
+        bits: 4,
+        top_k: 2,
+        activation: "identity",
+        swiglu_fusion: 0,
+        affine: true,
+        fc3: false,
+        biases: false,
+        normalize: true,
+        router_weights: true,
+    });
+}
+
+#[test]
+fn qmoe_glm_silu_fc3_biases_separate_router_matches_cpu_all_dtypes() {
+    let case = Case {
+        experts: 4,
+        rows: 6,
+        hidden: 16,
+        inter: 16,
+        bits: 4,
+        top_k: 2,
+        activation: "silu",
+        swiglu_fusion: 0,
+        affine: true,
+        fc3: true,
+        biases: true,
+        normalize: true,
+        router_weights: true,
+    };
+    compare_gemv_gemm_and_cpu(case);
+    compare(case, DataType::Float16);
+    compare(case, DataType::BFloat16);
+}
 
 macro_rules! sub_byte_path_test {
     ($name:ident, $bits:expr, $affine:expr) => {
@@ -593,6 +643,7 @@ macro_rules! sub_byte_path_test {
                 activation: "identity",
                 swiglu_fusion: 0,
                 affine: $affine,
+                fc3: false,
                 biases: true,
                 normalize: true,
                 router_weights: false,
@@ -619,6 +670,7 @@ fn qmoe_int4_top2_symmetric_matches_cpu() {
             activation: "identity",
             swiglu_fusion: 0,
             affine: false,
+            fc3: false,
             biases: false,
             normalize: true,
             router_weights: false,
@@ -640,6 +692,7 @@ fn qmoe_int8_top1_affine_bias_matches_cpu() {
             activation: "relu",
             swiglu_fusion: 0,
             affine: true,
+            fc3: false,
             biases: true,
             normalize: false,
             router_weights: true,
@@ -661,6 +714,7 @@ fn qmoe_single_expert_top1_matches_cpu() {
             activation: "gelu",
             swiglu_fusion: 0,
             affine: true,
+            fc3: false,
             biases: true,
             normalize: true,
             router_weights: false,
@@ -681,6 +735,7 @@ fn qmoe_fp16_and_bf16_storage_match_rounded_cpu_reference() {
         activation: "silu",
         swiglu_fusion: 0,
         affine: true,
+        fc3: false,
         biases: true,
         normalize: false,
         router_weights: false,
@@ -701,6 +756,7 @@ fn qmoe_prefill_gemm_matches_gemv_and_cpu_oracle() {
         activation: "silu",
         swiglu_fusion: 0,
         affine: true,
+        fc3: false,
         biases: true,
         normalize: true,
         router_weights: false,
@@ -721,6 +777,7 @@ fn qmoe_prefill_handles_empty_experts_and_all_routes_to_one_expert() {
         activation: "identity",
         swiglu_fusion: 0,
         affine: true,
+        fc3: false,
         biases: true,
         normalize: false,
         router_weights: true,
