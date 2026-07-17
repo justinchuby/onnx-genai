@@ -407,6 +407,28 @@ fn assert_close(actual: &[f32], expected: &[f32]) {
     }
 }
 
+fn error_metrics(actual: &[f32], expected: &[f32]) -> (f32, u32) {
+    actual.iter().zip(expected).fold(
+        (0.0f32, 0u32),
+        |(max_abs, max_ulp), (&actual, &expected)| {
+            let actual_key = if actual.is_sign_negative() {
+                !actual.to_bits()
+            } else {
+                actual.to_bits() | 0x8000_0000
+            };
+            let expected_key = if expected.is_sign_negative() {
+                !expected.to_bits()
+            } else {
+                expected.to_bits() | 0x8000_0000
+            };
+            (
+                max_abs.max((actual - expected).abs()),
+                max_ulp.max(actual_key.abs_diff(expected_key)),
+            )
+        },
+    )
+}
+
 fn random_u32(state: &mut u64) -> u32 {
     *state = state
         .wrapping_mul(6_364_136_223_846_793_005)
@@ -445,7 +467,10 @@ fn matmul_nbits_gpu_gemv_streams_random_packed_int4() {
     )
     .unwrap();
     assert_close(&actual, &expected);
-    eprintln!("verified packed-int4 CUDA GEMV against independent f32 dequant reference");
+    let (max_abs, max_ulp) = error_metrics(&actual, &expected);
+    eprintln!(
+        "MatMulNBits default GEMV CPU-reference max_abs_diff={max_abs:e} max_ulp_diff={max_ulp}"
+    );
 }
 
 #[test]
@@ -587,10 +612,8 @@ fn matmul_nbits_gpu_accuracy4_stays_within_cpu_vnni_tolerance() {
     .unwrap();
 
     assert_close(&actual, &expected);
-    let max_abs_diff = actual
-        .iter()
-        .zip(&expected)
-        .map(|(&actual, &expected)| (actual - expected).abs())
-        .fold(0.0f32, f32::max);
-    eprintln!("accuracy_level=4 CPU/CUDA max_abs_diff={max_abs_diff:e}");
+    let (max_abs_diff, max_ulp_diff) = error_metrics(&actual, &expected);
+    eprintln!(
+        "accuracy_level=4 CPU/CUDA max_abs_diff={max_abs_diff:e} max_ulp_diff={max_ulp_diff}"
+    );
 }

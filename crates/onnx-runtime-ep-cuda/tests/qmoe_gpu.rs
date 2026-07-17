@@ -496,13 +496,36 @@ fn assert_conforms(actual: &[f32], expected: &[f32], case: Case, dtype: DataType
     }
 }
 
-fn compare(case: Case, dtype: DataType) {
-    let Some(ep) = gpu() else { return };
+fn error_metrics(actual: &[f32], expected: &[f32]) -> (f32, u32) {
+    actual.iter().zip(expected).fold(
+        (0.0f32, 0u32),
+        |(max_abs, max_ulp), (&actual, &expected)| {
+            let actual_key = if actual.is_sign_negative() {
+                !actual.to_bits()
+            } else {
+                actual.to_bits() | 0x8000_0000
+            };
+            let expected_key = if expected.is_sign_negative() {
+                !expected.to_bits()
+            } else {
+                expected.to_bits() | 0x8000_0000
+            };
+            (
+                max_abs.max((actual - expected).abs()),
+                max_ulp.max(actual_key.abs_diff(expected_key)),
+            )
+        },
+    )
+}
+
+fn compare(case: Case, dtype: DataType) -> (f32, u32) {
+    let Some(ep) = gpu() else { return (0.0, 0) };
     let gpu_inputs = case_inputs(case, dtype);
     let cpu_inputs = rounded_cpu_inputs(&gpu_inputs, dtype);
     let expected = run_cpu(case, &cpu_inputs);
     let actual = run_gpu(&ep, case, &gpu_inputs, dtype).unwrap();
     assert_conforms(&actual, &expected, case, dtype);
+    error_metrics(&actual, &expected)
 }
 
 fn compare_gemv_gemm_and_cpu(case: Case) {
@@ -659,7 +682,7 @@ sub_byte_path_test!(qmoe_int2_affine_gemv_gemm_matches_cpu, 2, true);
 
 #[test]
 fn qmoe_int4_top2_symmetric_matches_cpu() {
-    compare(
+    let (max_abs, max_ulp) = compare(
         Case {
             experts: 4,
             rows: 3,
@@ -677,6 +700,7 @@ fn qmoe_int4_top2_symmetric_matches_cpu() {
         },
         DataType::Float32,
     );
+    eprintln!("QMoE int4 top-2 CPU/CUDA max_abs_diff={max_abs:e} max_ulp_diff={max_ulp}");
 }
 
 #[test]

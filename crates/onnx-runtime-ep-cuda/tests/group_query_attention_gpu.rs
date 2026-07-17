@@ -556,6 +556,27 @@ fn close(got: &[f32], expected: &[f32]) {
     }
 }
 
+fn error_metrics(got: &[f32], expected: &[f32]) -> (f32, u32) {
+    got.iter()
+        .zip(expected)
+        .fold((0.0f32, 0u32), |(max_abs, max_ulp), (&got, &expected)| {
+            let got_key = if got.is_sign_negative() {
+                !got.to_bits()
+            } else {
+                got.to_bits() | 0x8000_0000
+            };
+            let expected_key = if expected.is_sign_negative() {
+                !expected.to_bits()
+            } else {
+                expected.to_bits() | 0x8000_0000
+            };
+            (
+                max_abs.max((got - expected).abs()),
+                max_ulp.max(got_key.abs_diff(expected_key)),
+            )
+        })
+}
+
 fn rotate_target(
     data: &[f32],
     seq: usize,
@@ -1035,7 +1056,7 @@ fn gqa_gpu_packed_qkv_rope_decode_appends_in_place_across_steps() {
     const NUM_HEADS: usize = 14;
     const KV_HEADS: usize = 2;
     const HEAD_DIM: usize = 64;
-    const CAPACITY: usize = 5;
+    const CAPACITY: usize = 64;
     const PREFILL: usize = 3;
     let Some(ep) = gpu() else { return };
 
@@ -1132,6 +1153,9 @@ fn gqa_gpu_packed_qkv_rope_decode_appends_in_place_across_steps() {
     close(&step.output, &expected_output);
     close(&step.key, &expected_k);
     close(&step.value, &expected_v);
+    let (mut max_attention_abs, mut max_attention_ulp) =
+        error_metrics(&step.output, &expected_output);
+    let (mut max_rope_abs, mut max_rope_ulp) = error_metrics(&step.key, &expected_k);
 
     for position in PREFILL..CAPACITY {
         let (query, key, value) = make_token(position);
@@ -1177,8 +1201,25 @@ fn gqa_gpu_packed_qkv_rope_decode_appends_in_place_across_steps() {
         close(&step.output, &expected_output);
         close(&step.key, &expected_k);
         close(&step.value, &expected_v);
+        let (attention_abs, attention_ulp) = error_metrics(&step.output, &expected_output);
+        let (rope_abs, rope_ulp) = error_metrics(&step.key, &expected_k);
+        max_attention_abs = max_attention_abs.max(attention_abs);
+        max_attention_ulp = max_attention_ulp.max(attention_ulp);
+        max_rope_abs = max_rope_abs.max(rope_abs);
+        max_rope_ulp = max_rope_ulp.max(rope_ulp);
     }
 
+    eprintln!(
+        "64-token GQA/RoPE CPU-reference: rope max_abs_diff={max_rope_abs:e} max_ulp_diff={max_rope_ulp}; attention max_abs_diff={max_attention_abs:e} max_ulp_diff={max_attention_ulp}"
+    );
+    assert!(
+        max_rope_abs <= 1e-6,
+        "RoPE error accumulated across decode: {max_rope_abs:e}"
+    );
+    assert!(
+        max_attention_abs <= 1e-6,
+        "GQA error accumulated across decode: {max_attention_abs:e}"
+    );
     ep.deallocate(step.cache_k).unwrap();
     ep.deallocate(step.cache_v).unwrap();
 }
