@@ -119,6 +119,8 @@ const PROVISIONAL_DISK_CAPACITY_BYTES: u64 = 16 << 30;
 pub struct EngineResourceGovernor {
     inner: ResourceGovernor,
     allow_runtime_override: bool,
+    #[cfg(feature = "native-backend")]
+    weight_offload_host_cache: onnx_runtime_ep_cpu::WeightOffloadHostCache,
 }
 
 impl EngineResourceGovernor {
@@ -151,7 +153,7 @@ impl EngineResourceGovernor {
             kv_config,
         )?;
         #[cfg(feature = "native-backend")]
-        onnx_runtime_ep_cpu::set_weight_offload_host_budget(
+        let weight_offload_host_cache = onnx_runtime_ep_cpu::WeightOffloadHostCache::new(
             inner.snapshot().resolved_limits.host_ram_bytes,
         )
         .map_err(|reason| ResourceError::BudgetArithmeticOverflow {
@@ -161,6 +163,8 @@ impl EngineResourceGovernor {
         Ok(Self {
             inner,
             allow_runtime_override,
+            #[cfg(feature = "native-backend")]
+            weight_offload_host_cache,
         })
     }
 
@@ -184,6 +188,11 @@ impl EngineResourceGovernor {
 
     fn byte_budget(&self) -> onnx_genai_scheduler::ByteBudget {
         self.inner.byte_budget()
+    }
+
+    #[cfg(feature = "native-backend")]
+    fn weight_offload_host_cache(&self) -> onnx_runtime_ep_cpu::WeightOffloadHostCache {
+        self.weight_offload_host_cache.clone()
     }
 }
 
@@ -861,11 +870,13 @@ impl Engine {
         }
         let scheduler = Scheduler::with_byte_budget(scheduler_config, governor.byte_budget());
         let connector = build_connector_bridge(&config.kv_connector, &model_directory, None)?;
-        let native_session = crate::native_decode::NativeDecodeSession::load(
-            &model_directory.model_path,
-            native_device,
-        )
-        .map_err(|error| anyhow::anyhow!("Failed to load native decoder session: {error:#}"))?;
+        let native_session =
+            crate::native_decode::NativeDecodeSession::load_with_weight_offload_host_cache(
+                &model_directory.model_path,
+                native_device,
+                governor.weight_offload_host_cache(),
+            )
+            .map_err(|error| anyhow::anyhow!("Failed to load native decoder session: {error:#}"))?;
         let environment = Environment::new("onnx-genai-engine")
             .map_err(|e| anyhow::anyhow!("Failed to create ORT environment: {}", e))?;
 
@@ -2346,6 +2357,46 @@ mod tests {
         assert_eq!(
             governor.snapshot().configured_limits.vram_limit,
             ResourceLimit::Bytes(800)
+        );
+    }
+
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn two_engine_governors_keep_independent_host_cache_budgets() {
+        let first = EngineResourceGovernor::new_with_capacities(
+            ResourceLimits {
+                host_ram_limit: ResourceLimit::Bytes(400),
+                ..ResourceLimits::default()
+            },
+            false,
+            test_capacities(),
+            ModelKvConfig {
+                page_size_bytes: 100,
+                tokens_per_page: 16,
+            },
+        )
+        .unwrap();
+        let second = EngineResourceGovernor::new_with_capacities(
+            ResourceLimits {
+                host_ram_limit: ResourceLimit::Bytes(900),
+                ..ResourceLimits::default()
+            },
+            false,
+            test_capacities(),
+            ModelKvConfig {
+                page_size_bytes: 100,
+                tokens_per_page: 16,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            first.weight_offload_host_cache().configured_budget_bytes(),
+            400
+        );
+        assert_eq!(
+            second.weight_offload_host_cache().configured_budget_bytes(),
+            900
         );
     }
 

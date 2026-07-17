@@ -18,6 +18,7 @@
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::ops::Deref;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use onnx_runtime_ep_api::{
@@ -35,10 +36,20 @@ use super::{
     check_arity, contiguous_f32_slice, contiguous_u8_slice, to_dense_bytes, to_dense_f32,
     write_dense_f32,
 };
-use crate::weight_offload::{WeightOffloadMode, metrics, weight_offload_host_budget};
+use crate::weight_offload::{
+    WeightOffloadMode, checked_host_budget, metrics, weight_offload_host_budget,
+};
 
 /// Factory for the ORT contrib `QMoE` operator.
-pub struct QMoEFactory;
+pub struct QMoEFactory {
+    host_cache: WeightOffloadHostCache,
+}
+
+impl QMoEFactory {
+    pub(crate) fn new(host_cache: WeightOffloadHostCache) -> Self {
+        Self { host_cache }
+    }
+}
 
 /// Per-row block-dequantizing integer QMoE reference kernel.
 pub struct QMoEKernel {
@@ -47,6 +58,7 @@ pub struct QMoEKernel {
     bits: usize,
     block_size: usize,
     weight_offload: WeightOffloadMode,
+    host_cache: WeightOffloadHostCache,
 }
 
 impl KernelFactory for QMoEFactory {
@@ -81,6 +93,7 @@ impl KernelFactory for QMoEFactory {
             bits: bits as usize,
             block_size: block_size as usize,
             weight_offload: WeightOffloadMode::from_env(),
+            host_cache: self.host_cache.clone(),
         }))
     }
 }
@@ -340,7 +353,6 @@ impl Kernel for QMoEKernel {
                 "routed contribution byte count",
             )?;
             let mut contributions = vec![0.0f32; contribution_elements];
-            let host_cache_budget = weight_offload_host_budget().map_err(error)?;
             for (expert, expert_tasks) in tasks {
                 let expanded_bytes = DequantizedExpert::expanded_bytes(&fc1, &fc2, fc3.as_ref())?;
                 let key = ExpertCacheKey::new(
@@ -352,12 +364,9 @@ impl Kernel for QMoEKernel {
                     &fc2,
                     fc3.as_ref(),
                 );
-                let weights = host_expert_cache()
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .lease(key, expanded_bytes, host_cache_budget, || {
-                        DequantizedExpert::load(expert, &fc1, &fc2, fc3.as_ref())
-                    })?;
+                let weights = self.host_cache.lease(key, expanded_bytes, || {
+                    DequantizedExpert::load(expert, &fc1, &fc2, fc3.as_ref())
+                })?;
                 metrics().record_dequantized_window(1);
                 if weights.read_from_mmap {
                     let mut bytes_read = fc1
@@ -591,6 +600,8 @@ const ADMISSION_FREQUENCY: u64 = 2;
 const PIN_FREQUENCY: u64 = 3;
 const PIN_WINDOW: u64 = 8;
 const HISTORY_DECAY_WINDOW: u64 = 64;
+const HISTORY_EXPIRY_WINDOW: u64 = HISTORY_DECAY_WINDOW * 256;
+const MAX_ADMISSION_HISTORY_ENTRIES: usize = 4096;
 
 impl HostExpertCache {
     fn lease<F>(
@@ -626,6 +637,17 @@ impl HostExpertCache {
         }
 
         metrics().record_host_cache_miss();
+        if budget_bytes == 0 || expanded_bytes == 0 || expanded_bytes > budget_bytes {
+            metrics()
+                .record_host_cache_residency(self.owned_bytes, budget_bytes)
+                .map_err(error)?;
+            return Ok(ExpertLease {
+                weights: Arc::new(load()?),
+                read_from_mmap: true,
+            });
+        }
+
+        self.prune_history(now);
         let history = self.history.entry(key.clone()).or_default();
         if now.saturating_sub(history.last_used) > HISTORY_DECAY_WINDOW {
             history.frequency /= 2;
@@ -633,11 +655,7 @@ impl HostExpertCache {
         history.frequency = history.frequency.saturating_add(1);
         history.last_used = now;
         let candidate_frequency = history.frequency;
-        if budget_bytes == 0
-            || expanded_bytes == 0
-            || expanded_bytes > budget_bytes
-            || candidate_frequency < ADMISSION_FREQUENCY
-        {
+        if candidate_frequency < ADMISSION_FREQUENCY {
             metrics()
                 .record_host_cache_residency(self.owned_bytes, budget_bytes)
                 .map_err(error)?;
@@ -730,6 +748,7 @@ impl HostExpertCache {
             }
         };
         let weights = Arc::new(loaded);
+        self.history.remove(&key);
         self.entries.insert(
             key,
             HostCacheEntry {
@@ -744,6 +763,22 @@ impl HostExpertCache {
             weights,
             read_from_mmap: true,
         })
+    }
+
+    fn prune_history(&mut self, now: u64) {
+        self.history
+            .retain(|_, history| now.saturating_sub(history.last_used) <= HISTORY_EXPIRY_WINDOW);
+        while self.history.len() >= MAX_ADMISSION_HISTORY_ENTRIES {
+            let Some(victim) = self
+                .history
+                .iter()
+                .min_by_key(|(_, history)| (history.frequency, history.last_used))
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            self.history.remove(&victim);
+        }
     }
 
     fn trim_to_budget(&mut self, budget_bytes: usize) -> Result<()> {
@@ -808,16 +843,73 @@ impl HostExpertCache {
     }
 }
 
-fn host_expert_cache() -> &'static Mutex<HostExpertCache> {
-    static CACHE: OnceLock<Mutex<HostExpertCache>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HostExpertCache::default()))
+struct WeightOffloadHostCacheInner {
+    budget_bytes: AtomicU64,
+    cache: Mutex<HostExpertCache>,
 }
 
-pub(crate) fn reconfigure_host_expert_cache(budget_bytes: usize) -> Result<()> {
-    host_expert_cache()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .trim_to_budget(budget_bytes)
+/// A governor-owned warm-host expert-cache partition.
+#[derive(Clone)]
+pub struct WeightOffloadHostCache {
+    inner: Arc<WeightOffloadHostCacheInner>,
+}
+
+impl WeightOffloadHostCache {
+    /// Create an independent cache partition with its own byte ceiling.
+    pub fn new(budget_bytes: u64) -> std::result::Result<Self, &'static str> {
+        checked_host_budget(budget_bytes)?;
+        Ok(Self {
+            inner: Arc::new(WeightOffloadHostCacheInner {
+                budget_bytes: AtomicU64::new(budget_bytes),
+                cache: Mutex::new(HostExpertCache::default()),
+            }),
+        })
+    }
+
+    /// Return this partition's governor-configured byte ceiling.
+    pub fn configured_budget_bytes(&self) -> u64 {
+        self.inner.budget_bytes.load(Ordering::Relaxed)
+    }
+
+    fn lease<F>(&self, key: ExpertCacheKey, expanded_bytes: usize, load: F) -> Result<ExpertLease>
+    where
+        F: FnOnce() -> Result<DequantizedExpert>,
+    {
+        let budget_bytes =
+            weight_offload_host_budget(self.configured_budget_bytes()).map_err(error)?;
+        self.inner
+            .cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .lease(key, expanded_bytes, budget_bytes, load)
+    }
+
+    pub(crate) fn reconfigure(&self, budget_bytes: u64) -> Result<()> {
+        let checked = checked_host_budget(budget_bytes).map_err(error)?;
+        self.inner
+            .cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .trim_to_budget(checked)?;
+        self.inner
+            .budget_bytes
+            .store(budget_bytes, Ordering::Relaxed);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn clear(&self) {
+        self.inner
+            .cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+    }
+}
+
+pub(crate) fn default_weight_offload_host_cache() -> &'static WeightOffloadHostCache {
+    static CACHE: OnceLock<WeightOffloadHostCache> = OnceLock::new();
+    CACHE.get_or_init(|| WeightOffloadHostCache::new(0).expect("zero host-cache budget is valid"))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1656,6 +1748,7 @@ mod tests {
             bits: BITS,
             block_size: BLOCK,
             weight_offload: WeightOffloadMode { enabled },
+            host_cache: default_weight_offload_host_cache().clone(),
         };
         let x = Owned::f32(&[ROWS, HIDDEN], input);
         let mut final_output = None;
@@ -1732,12 +1825,20 @@ mod tests {
     }
 
     fn reset_offload_test_state(host_cache_budget: u64) {
-        host_expert_cache()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clear();
+        default_weight_offload_host_cache().clear();
         metrics().reset();
         crate::set_weight_offload_host_budget(host_cache_budget).expect("test host-cache budget");
+    }
+
+    fn cache_key(expert: usize) -> ExpertCacheKey {
+        ExpertCacheKey {
+            layer_id: 7,
+            expert,
+            bits: 4,
+            block_size: 16,
+            out_and_in_features: vec![(1, 1)],
+            source_regions: Vec::new(),
+        }
     }
 
     fn run_equivalence(
@@ -2084,17 +2185,77 @@ mod tests {
     }
 
     #[test]
+    fn two_engine_cache_partitions_respect_independent_budgets() {
+        let _guard = metrics_test_lock().lock().expect("metrics test lock");
+        metrics().reset();
+        let engine_a = WeightOffloadHostCache::new(4).unwrap();
+        let engine_b = WeightOffloadHostCache::new(8).unwrap();
+        let weights = |value| DequantizedExpert {
+            fc1: vec![value],
+            fc2: Vec::new(),
+            fc3: None,
+        };
+
+        for cache in [&engine_a, &engine_b] {
+            drop(cache.lease(cache_key(0), 4, || Ok(weights(1.0))).unwrap());
+            drop(cache.lease(cache_key(0), 4, || Ok(weights(1.0))).unwrap());
+            drop(cache.lease(cache_key(1), 4, || Ok(weights(2.0))).unwrap());
+            drop(cache.lease(cache_key(1), 4, || Ok(weights(2.0))).unwrap());
+        }
+
+        assert_eq!(engine_a.configured_budget_bytes(), 4);
+        assert_eq!(engine_b.configured_budget_bytes(), 8);
+        let cache_a = engine_a.inner.cache.lock().unwrap();
+        let cache_b = engine_b.inner.cache.lock().unwrap();
+        assert!(cache_a.owned_bytes <= 4);
+        assert!(cache_b.owned_bytes <= 8);
+        assert_eq!(cache_a.entries.len(), 1);
+        assert_eq!(cache_b.entries.len(), 2);
+    }
+
+    #[test]
+    fn admission_history_skips_uncacheable_keys_and_expires_churn() {
+        let _guard = metrics_test_lock().lock().expect("metrics test lock");
+        metrics().reset();
+        let mut cache = HostExpertCache::default();
+        let weights = || DequantizedExpert {
+            fc1: vec![1.0],
+            fc2: Vec::new(),
+            fc3: None,
+        };
+
+        drop(cache.lease(cache_key(0), 4, 0, || Ok(weights())).unwrap());
+        drop(cache.lease(cache_key(1), 8, 4, || Ok(weights())).unwrap());
+        assert!(cache.history.is_empty());
+
+        for expert in 0..MAX_ADMISSION_HISTORY_ENTRIES + 32 {
+            drop(
+                cache
+                    .lease(cache_key(expert), 4, 4, || Ok(weights()))
+                    .unwrap(),
+            );
+        }
+        assert_eq!(cache.history.len(), MAX_ADMISSION_HISTORY_ENTRIES);
+
+        cache.clock = cache
+            .clock
+            .checked_add(HISTORY_EXPIRY_WINDOW)
+            .and_then(|clock| clock.checked_add(1))
+            .unwrap();
+        drop(
+            cache
+                .lease(cache_key(MAX_ADMISSION_HISTORY_ENTRIES + 100), 4, 4, || {
+                    Ok(weights())
+                })
+                .unwrap(),
+        );
+        assert_eq!(cache.history.len(), 1);
+    }
+
+    #[test]
     fn active_host_cache_lease_blocks_eviction_until_drop() {
         let _guard = metrics_test_lock().lock().expect("metrics test lock");
         reset_offload_test_state(4);
-        let key = |expert| ExpertCacheKey {
-            layer_id: 7,
-            expert,
-            bits: 4,
-            block_size: 16,
-            out_and_in_features: vec![(1, 1)],
-            source_regions: Vec::new(),
-        };
         let weights = |value| DequantizedExpert {
             fc1: vec![value],
             fc2: Vec::new(),
@@ -2102,18 +2263,18 @@ mod tests {
         };
         let mut cache = HostExpertCache::default();
 
-        drop(cache.lease(key(0), 4, 4, || Ok(weights(1.0))).unwrap());
-        let held = cache.lease(key(0), 4, 4, || Ok(weights(1.0))).unwrap();
-        drop(cache.lease(key(1), 4, 4, || Ok(weights(2.0))).unwrap());
-        drop(cache.lease(key(1), 4, 4, || Ok(weights(2.0))).unwrap());
-        drop(cache.lease(key(1), 4, 4, || Ok(weights(2.0))).unwrap());
-        assert!(cache.entries.contains_key(&key(0)));
-        assert!(!cache.entries.contains_key(&key(1)));
+        drop(cache.lease(cache_key(0), 4, 4, || Ok(weights(1.0))).unwrap());
+        let held = cache.lease(cache_key(0), 4, 4, || Ok(weights(1.0))).unwrap();
+        drop(cache.lease(cache_key(1), 4, 4, || Ok(weights(2.0))).unwrap());
+        drop(cache.lease(cache_key(1), 4, 4, || Ok(weights(2.0))).unwrap());
+        drop(cache.lease(cache_key(1), 4, 4, || Ok(weights(2.0))).unwrap());
+        assert!(cache.entries.contains_key(&cache_key(0)));
+        assert!(!cache.entries.contains_key(&cache_key(1)));
 
         drop(held);
-        drop(cache.lease(key(1), 4, 4, || Ok(weights(2.0))).unwrap());
-        assert!(!cache.entries.contains_key(&key(0)));
-        assert!(cache.entries.contains_key(&key(1)));
+        drop(cache.lease(cache_key(1), 4, 4, || Ok(weights(2.0))).unwrap());
+        assert!(!cache.entries.contains_key(&cache_key(0)));
+        assert!(cache.entries.contains_key(&cache_key(1)));
         assert_eq!(crate::weight_offload_stats().host_cache_evictions, 1);
     }
 

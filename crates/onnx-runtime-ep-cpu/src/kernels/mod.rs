@@ -205,6 +205,12 @@ pub fn is_phase1_op(op_type: &str) -> bool {
 /// `lookup` picks the highest applicable version, so future opset-specialized
 /// kernels can be added alongside these.
 pub fn build_cpu_registry() -> OpRegistry {
+    build_cpu_registry_with_weight_offload_cache(qmoe::default_weight_offload_host_cache().clone())
+}
+
+pub(crate) fn build_cpu_registry_with_weight_offload_cache(
+    host_cache: qmoe::WeightOffloadHostCache,
+) -> OpRegistry {
     let mut reg = OpRegistry::new();
     reg.register(OpKey::new("MatMul", "", 1), Box::new(matmul::MatMulFactory));
     reg.register(
@@ -336,7 +342,7 @@ pub fn build_cpu_registry() -> OpRegistry {
     );
     reg.register(
         OpKey::new("QMoE", "com.microsoft", 1),
-        Box::new(qmoe::QMoEFactory),
+        Box::new(qmoe::QMoEFactory::new(host_cache)),
     );
     // Standard-domain LLM/transformer primitives (ai.onnx). Registered at their
     // ONNX since_version; the registry resolves the highest since_version <=

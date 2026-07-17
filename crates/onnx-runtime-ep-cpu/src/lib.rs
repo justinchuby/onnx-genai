@@ -35,6 +35,7 @@ pub mod strided;
 pub mod weight_offload;
 
 pub use backend::{CpuBackend, has_onednn};
+pub use kernels::qmoe::WeightOffloadHostCache;
 pub use optimizer::{ProjectionFusion, cpu_optimization_passes};
 pub use provider::CpuExecutionProvider;
 pub use weight_offload::{

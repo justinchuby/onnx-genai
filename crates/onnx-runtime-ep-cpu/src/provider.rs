@@ -31,7 +31,8 @@ use onnx_runtime_ep_api::{
 };
 use onnx_runtime_ir::{DeviceId, DeviceType, Node, Shape, TensorLayout};
 
-use crate::kernels::build_cpu_registry;
+use crate::WeightOffloadHostCache;
+use crate::kernels::{build_cpu_registry, build_cpu_registry_with_weight_offload_cache};
 use crate::optimizer::cpu_optimization_passes;
 
 /// CPU execution provider. Always available; the fallback EP for any op.
@@ -69,6 +70,24 @@ impl CpuExecutionProvider {
             initialized: false,
             registry: build_cpu_registry(),
         }
+    }
+
+    /// Construct a CPU EP whose QMoE kernels share one governor-owned host-cache partition.
+    pub fn with_weight_offload_host_cache(host_cache: WeightOffloadHostCache) -> Self {
+        Self {
+            device: DeviceId::cpu(),
+            initialized: false,
+            registry: build_cpu_registry_with_weight_offload_cache(host_cache),
+        }
+    }
+
+    /// Construct and initialize a CPU EP with a governor-owned host-cache partition.
+    pub fn initialized_with_weight_offload_host_cache(
+        host_cache: WeightOffloadHostCache,
+    ) -> Result<Self> {
+        let mut ep = Self::with_weight_offload_host_cache(host_cache);
+        ep.initialize(&Default::default())?;
+        Ok(ep)
     }
 
     /// Borrow the CPU op registry (shared with the session layer).

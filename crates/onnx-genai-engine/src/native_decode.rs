@@ -12,6 +12,7 @@ use onnx_runtime_session::{
 };
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 
 /// Device requested for a native decode session.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -57,6 +58,28 @@ impl NativeDecodeSession {
     /// Load a decoder-with-past ONNX model on the requested native device.
     pub fn load(path: impl AsRef<Path>, device: NativeDecodeDevice) -> anyhow::Result<Self> {
         Self::load_with_cuda_kv_max_len(path, device, None)
+    }
+
+    pub(crate) fn load_with_weight_offload_host_cache(
+        path: impl AsRef<Path>,
+        device: NativeDecodeDevice,
+        host_cache: onnx_runtime_ep_cpu::WeightOffloadHostCache,
+    ) -> anyhow::Result<Self> {
+        let preference = match device {
+            NativeDecodeDevice::Cpu => DevicePreference::Cpu,
+            NativeDecodeDevice::Cuda { index } => DevicePreference::Gpu { index },
+        };
+        let mut builder = InferenceSession::builder().model(path).device(preference);
+        if device == NativeDecodeDevice::Cpu {
+            let ep =
+                onnx_runtime_ep_cpu::CpuExecutionProvider::initialized_with_weight_offload_host_cache(
+                    host_cache,
+                )
+                .context("initialize native CPU execution provider")?;
+            builder = builder.execution_provider(Arc::new(ep));
+        }
+        let session = builder.build().context("load native decoder model")?;
+        Self::from_session_with_cuda_kv_max_len(session, None)
     }
 
     /// Load with an explicit CUDA KV capacity. `None` uses

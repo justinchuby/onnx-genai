@@ -344,6 +344,7 @@ pub struct SessionBuilder {
     model_path: Option<PathBuf>,
     model_bytes: Option<Vec<u8>>,
     device: DevicePreference,
+    execution_provider: Option<std::sync::Arc<dyn onnx_runtime_ep_api::ExecutionProvider>>,
     memory_limit: Option<usize>,
     enable_profiling: bool,
     warmup_shapes: Vec<WarmupShape>,
@@ -367,6 +368,15 @@ impl SessionBuilder {
 
     pub fn device(mut self, pref: DevicePreference) -> Self {
         self.device = pref;
+        self
+    }
+
+    /// Use an explicitly constructed execution provider instead of device auto-selection.
+    pub fn execution_provider(
+        mut self,
+        execution_provider: std::sync::Arc<dyn onnx_runtime_ep_api::ExecutionProvider>,
+    ) -> Self {
+        self.execution_provider = Some(execution_provider);
         self
     }
 
@@ -519,7 +529,10 @@ impl SessionBuilder {
 
         // Optimize stage. Off by default; only runs when a level is selected.
         optimize_graph(&mut graph, level)?;
-        let ep = select_execution_provider(&self.device)?;
+        let ep = match self.execution_provider {
+            Some(ep) => ep,
+            None => select_execution_provider(&self.device)?,
+        };
 
         let mut session = InferenceSession::from_parts(
             graph,
@@ -988,6 +1001,13 @@ mod option_tests {
     #[test]
     fn optimization_defaults_to_none_when_unset() {
         assert_eq!(level_of(&[]).unwrap(), OptimizationLevel::None);
+    }
+
+    #[test]
+    fn explicit_execution_provider_is_retained_by_builder() {
+        let builder =
+            SessionBuilder::new().execution_provider(executor::auto_detect_cpu_ep().unwrap());
+        assert!(builder.execution_provider.is_some());
     }
 
     #[test]

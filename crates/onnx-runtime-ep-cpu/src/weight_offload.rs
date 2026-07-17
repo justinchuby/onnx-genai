@@ -12,8 +12,6 @@ pub const WEIGHT_OFFLOAD_ENV: &str = "ONNX_GENAI_WEIGHT_OFFLOAD";
 /// Optional override for the Resource Governor's owned warm-host cache budget.
 pub const WEIGHT_OFFLOAD_HOST_BYTES_ENV: &str = "ONNX_GENAI_WEIGHT_OFFLOAD_HOST_BYTES";
 
-static GOVERNOR_HOST_CACHE_BUDGET: AtomicU64 = AtomicU64::new(0);
-
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct WeightOffloadMode {
     pub enabled: bool,
@@ -281,18 +279,16 @@ pub fn weight_offload_stats() -> WeightOffloadStats {
     metrics().snapshot()
 }
 
-/// Set the Resource Governor's process-wide owned warm-host cache sub-budget.
+/// Set the default CPU provider's owned warm-host cache sub-budget.
 ///
 /// `ONNX_GENAI_WEIGHT_OFFLOAD_HOST_BYTES`, when present, overrides this value.
 pub fn set_weight_offload_host_budget(bytes: u64) -> Result<(), &'static str> {
-    let budget = checked_host_budget(bytes)?;
-    crate::kernels::qmoe::reconfigure_host_expert_cache(budget)
-        .map_err(|_| "cannot lower host-cache budget while entries are leased")?;
-    GOVERNOR_HOST_CACHE_BUDGET.store(bytes, Ordering::Relaxed);
-    Ok(())
+    crate::kernels::qmoe::default_weight_offload_host_cache()
+        .reconfigure(bytes)
+        .map_err(|_| "cannot lower host-cache budget while entries are leased")
 }
 
-pub(crate) fn weight_offload_host_budget() -> Result<usize, &'static str> {
+pub(crate) fn weight_offload_host_budget(governor_bytes: u64) -> Result<usize, &'static str> {
     if let Some(value) = std::env::var_os(WEIGHT_OFFLOAD_HOST_BYTES_ENV) {
         let value = value
             .to_str()
@@ -302,10 +298,10 @@ pub(crate) fn weight_offload_host_budget() -> Result<usize, &'static str> {
             .map_err(|_| "host-cache byte budget must be an unsigned decimal byte count")?;
         return checked_host_budget(bytes);
     }
-    checked_host_budget(GOVERNOR_HOST_CACHE_BUDGET.load(Ordering::Relaxed))
+    checked_host_budget(governor_bytes)
 }
 
-fn checked_host_budget(bytes: u64) -> Result<usize, &'static str> {
+pub(crate) fn checked_host_budget(bytes: u64) -> Result<usize, &'static str> {
     let bytes = usize::try_from(bytes).map_err(|_| "host-cache byte budget exceeds usize::MAX")?;
     if bytes > isize::MAX as usize {
         return Err("host-cache byte budget exceeds isize::MAX");
