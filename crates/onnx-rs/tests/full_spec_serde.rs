@@ -212,6 +212,13 @@ fn full_spec_proto() -> ModelProto {
             }))),
             denotation: "MAP".into(),
         },
+        TypeProto {
+            value: Some(type_proto::Value::OpaqueType(type_proto::Opaque {
+                domain: "com.example.types".into(),
+                name: "TokenizerState".into(),
+            })),
+            denotation: "OPAQUE".into(),
+        },
     ];
 
     let sparse = sparse_tensor();
@@ -327,7 +334,7 @@ fn full_spec_proto() -> ModelProto {
                     configuration_id: "mesh".into(),
                     sharding_spec: vec![ShardingSpecProto {
                         tensor_name: "Y".into(),
-                        device: vec![0, 1, 2, 3],
+                        device: vec![0, 1, 2, 4],
                         index_to_device_group_map: vec![IntIntListEntryProto {
                             key: 4,
                             value: vec![0, 2],
@@ -509,6 +516,7 @@ fn descriptor_inventory_is_the_complete_bound_spec() {
         "onnx.TrainingInfoProto",
         "onnx.TypeProto",
         "onnx.TypeProto.Map",
+        "onnx.TypeProto.Opaque",
         "onnx.TypeProto.Optional",
         "onnx.TypeProto.Sequence",
         "onnx.TypeProto.SparseTensor",
@@ -549,6 +557,17 @@ fn descriptor_inventory_is_the_complete_bound_spec() {
     assert!(dtype.get_value_by_name("FLOAT8E8M0").is_some());
     assert!(dtype.get_value_by_name("INT2").is_some());
     assert!(dtype.get_value_by_name("UINT2").is_some());
+    let opaque = pool.get_message_by_name("onnx.TypeProto.Opaque").unwrap();
+    assert_eq!(opaque.get_field_by_name("domain").unwrap().number(), 1);
+    assert_eq!(opaque.get_field_by_name("name").unwrap().number(), 2);
+    let type_proto = pool.get_message_by_name("onnx.TypeProto").unwrap();
+    assert_eq!(
+        type_proto
+            .get_field_by_name("opaque_type")
+            .unwrap()
+            .number(),
+        7
+    );
 }
 
 #[test]
@@ -592,7 +611,7 @@ fn every_bound_dtype_round_trips_typed_and_raw_payloads() {
     ));
     assert!(matches!(
         node.attr("type_protos"),
-        Some(onnx_rs::ir::Attribute::TypeProtos(values)) if values.len() == 4
+        Some(onnx_rs::ir::Attribute::TypeProtos(values)) if values.len() == 5
     ));
     assert_eq!(onnx_rs::ir::DataType::Complex64.to_onnx(), 14);
     assert_eq!(onnx_rs::ir::DataType::Complex128.to_onnx(), 15);
@@ -614,6 +633,7 @@ fn full_spec_is_lossless_across_all_three_textual_codecs() {
     assert!(json.contains("\"quantizationAnnotation\""));
     assert!(json.contains("\"configuration\""));
     assert!(json.contains("\"deviceConfigurations\""));
+    assert!(json.contains("\"opaqueType\""));
     let from_json = Json::deserialize(&json).unwrap();
     assert_proto_equal(&proto, &from_json);
 
@@ -717,6 +737,27 @@ fn multi_device_checker_accepts_valid_annotations_and_rejects_invalid_ones() {
         "SimpleShardedDimProto.dim is optional when num_shards is present"
     );
 
+    let mut invalid_groups_proto = full_spec_proto();
+    let sharding = &mut invalid_groups_proto.graph.as_mut().unwrap().node[0].device_configurations
+        [0]
+    .sharding_spec[0];
+    sharding.device.retain(|device| *device != 4);
+    sharding.index_to_device_group_map[0].value = vec![0, 0, 9];
+    let invalid_groups = Model::from_proto(invalid_groups_proto).unwrap();
+    let group_violations = rule.check(&invalid_groups, &ValidationContext::default());
+    for expected in [
+        "is not referenced",
+        "duplicate member 0",
+        "member 9 is outside",
+    ] {
+        assert!(
+            group_violations
+                .iter()
+                .any(|violation| violation.message.contains(expected)),
+            "missing '{expected}' in {group_violations:?}"
+        );
+    }
+
     let mut invalid_proto = full_spec_proto();
     invalid_proto.ir_version = 10;
     invalid_proto.configuration[0].device.pop();
@@ -766,7 +807,7 @@ fn readable_body_edits_are_authoritative_over_extensions() {
     let proto = full_spec_proto();
     let model = Model::from_proto(proto.clone()).unwrap();
     let text = Text::serialize(&model, &Default::default()).unwrap();
-    assert!(text.contains("type_protos = <4 types>"), "{text}");
+    assert!(text.contains("type_protos = <5 types>"), "{text}");
     assert!(
         text.contains("sparse_tensors = <1 sparse tensors>"),
         "{text}"
@@ -788,7 +829,7 @@ fn readable_body_edits_are_authoritative_over_extensions() {
         .replacen("sparse = <sparse tensor>", "sparse = <type>", 1)
         .replacen("type_proto = <type>", "type_proto = <sparse tensor>", 1)
         .replacen("<1 sparse tensors>", "<2 sparse tensors>", 1)
-        .replacen("<4 types>", "<2 types>", 1)
+        .replacen("<5 types>", "<2 types>", 1)
         .replacen("<1 tensors>", "<2 tensors>", 1)
         .replacen("opaque_string = <2 bytes>", "opaque_string = \"edited\"", 1)
         .replacen(

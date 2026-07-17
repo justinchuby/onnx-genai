@@ -531,6 +531,10 @@ fn convert_type_proto(graph: &mut Graph, tp: &onnx::TypeProto) -> Result<TypePro
                 value: Box::new(value),
             }
         }
+        Some(type_proto::Value::OpaqueType(_)) => TypeProto::Tensor {
+            dtype: DataType::Float32,
+            shape: Vec::new(),
+        },
         None => TypeProto::Tensor {
             dtype: DataType::Float32,
             shape: Vec::new(),

@@ -18,7 +18,9 @@ use std::collections::{HashMap, HashSet};
 
 use onnx_runtime_ir::{Attribute, Graph, ValueId};
 use onnx_runtime_loader::proto::onnx::{
-    DeviceConfigurationProto, GraphProto, ModelProto, NodeProto, TensorShapeProto, type_proto,
+    AttributeProto, DeviceConfigurationProto, GraphProto, ModelProto, NodeProto, SparseTensorProto,
+    StringStringEntryProto, TensorProto, TensorShapeProto, TypeProto, ValueInfoProto,
+    attribute_proto, tensor_proto, type_proto,
 };
 
 use super::{Severity, ValidationContext, ValidationRule, Violation, ViolationLocation};
@@ -461,6 +463,23 @@ fn check_graph_type_constraints(
             if !graph.value_type_is_known(value_id) {
                 continue;
             }
+            if let Some(expected) = concrete_tensor_dtype(type_param) {
+                if value.dtype != expected {
+                    violations.push(node_violation(
+                        rule_id,
+                        graph_name,
+                        node,
+                        format!(
+                            "concrete type '{}' requires {:?} for value '{}', found {:?}",
+                            type_param,
+                            expected,
+                            value_label(value_id, value.name.as_deref()),
+                            value.dtype
+                        ),
+                    ));
+                }
+                continue;
+            }
             let Some(constraint) = schema
                 .type_constraints
                 .iter()
@@ -515,6 +534,39 @@ fn check_graph_type_constraints(
         ));
     }
     violations
+}
+
+fn concrete_tensor_dtype(type_str: &str) -> Option<onnx_runtime_ir::DataType> {
+    let dtype = type_str.strip_prefix("tensor(")?.strip_suffix(')')?;
+    Some(match dtype {
+        "float" => onnx_runtime_ir::DataType::Float32,
+        "double" => onnx_runtime_ir::DataType::Float64,
+        "float16" => onnx_runtime_ir::DataType::Float16,
+        "bfloat16" => onnx_runtime_ir::DataType::BFloat16,
+        "uint8" => onnx_runtime_ir::DataType::Uint8,
+        "uint16" => onnx_runtime_ir::DataType::Uint16,
+        "uint32" => onnx_runtime_ir::DataType::Uint32,
+        "uint64" => onnx_runtime_ir::DataType::Uint64,
+        "int8" => onnx_runtime_ir::DataType::Int8,
+        "int16" => onnx_runtime_ir::DataType::Int16,
+        "int32" => onnx_runtime_ir::DataType::Int32,
+        "int64" => onnx_runtime_ir::DataType::Int64,
+        "bool" => onnx_runtime_ir::DataType::Bool,
+        "string" => onnx_runtime_ir::DataType::String,
+        "complex64" => onnx_runtime_ir::DataType::Complex64,
+        "complex128" => onnx_runtime_ir::DataType::Complex128,
+        "float8e4m3fn" => onnx_runtime_ir::DataType::Float8E4M3FN,
+        "float8e4m3fnuz" => onnx_runtime_ir::DataType::Float8E4M3FNUZ,
+        "float8e5m2" => onnx_runtime_ir::DataType::Float8E5M2,
+        "float8e5m2fnuz" => onnx_runtime_ir::DataType::Float8E5M2FNUZ,
+        "uint4" => onnx_runtime_ir::DataType::Uint4,
+        "int4" => onnx_runtime_ir::DataType::Int4,
+        "float4e2m1" => onnx_runtime_ir::DataType::Float4E2M1,
+        "float8e8m0" => onnx_runtime_ir::DataType::Float8E8M0,
+        "uint2" => onnx_runtime_ir::DataType::Uint2,
+        "int2" => onnx_runtime_ir::DataType::Int2,
+        _ => return None,
+    })
 }
 
 fn schema_value_bindings<'a>(
@@ -663,6 +715,1213 @@ impl ValidationRule for IrVersionSupportedRule {
     }
 }
 
+/// Metadata maps are encoded as repeated entries and therefore require an
+/// explicit distinct-key check at every protobuf scope.
+pub struct MetadataKeysUniqueRule;
+
+impl ValidationRule for MetadataKeysUniqueRule {
+    fn id(&self) -> &str {
+        "proto.metadata_keys_unique"
+    }
+
+    fn severity(&self) -> Severity {
+        Severity::Error
+    }
+
+    fn check(&self, model: &Model, _ctx: &ValidationContext) -> Vec<Violation> {
+        let Some(proto) = model.retained_proto() else {
+            return Vec::new();
+        };
+        let mut violations = Vec::new();
+        check_unique_entries(
+            &proto.metadata_props,
+            "ModelProto.metadata_props",
+            ViolationLocation::Model,
+            self.id(),
+            &mut violations,
+        );
+        if let Some(graph) = &proto.graph {
+            check_graph_metadata(graph, self.id(), &mut violations);
+        }
+        for function in &proto.functions {
+            check_unique_entries(
+                &function.metadata_props,
+                "FunctionProto.metadata_props",
+                ViolationLocation::Model,
+                self.id(),
+                &mut violations,
+            );
+            for value in &function.value_info {
+                check_value_metadata(value, self.id(), &mut violations);
+            }
+            for node in &function.node {
+                check_node_metadata(node, &function.name, self.id(), &mut violations);
+            }
+        }
+        violations
+    }
+}
+
+/// Validate attribute names, discriminators, union payloads, and per-node
+/// attribute-name uniqueness.
+pub struct AttributeProtoValidityRule;
+
+impl ValidationRule for AttributeProtoValidityRule {
+    fn id(&self) -> &str {
+        "proto.attribute_valid"
+    }
+
+    fn severity(&self) -> Severity {
+        Severity::Error
+    }
+
+    fn check(&self, model: &Model, _ctx: &ValidationContext) -> Vec<Violation> {
+        let Some(proto) = model.retained_proto() else {
+            return Vec::new();
+        };
+        let mut violations = Vec::new();
+        if let Some(graph) = &proto.graph {
+            check_graph_attributes(graph, self.id(), &mut violations);
+        }
+        for function in &proto.functions {
+            check_attribute_list(
+                &function.attribute_proto,
+                ViolationLocation::Model,
+                self.id(),
+                &mut violations,
+            );
+            for node in &function.node {
+                check_node_attributes_proto(node, &function.name, self.id(), &mut violations);
+            }
+        }
+        violations
+    }
+}
+
+/// Validate every retained `TypeProto`, including container requirements and
+/// ONNX-ML opaque types.
+pub struct ProtoTypeValidityRule;
+
+impl ValidationRule for ProtoTypeValidityRule {
+    fn id(&self) -> &str {
+        "proto.type_valid"
+    }
+
+    fn severity(&self) -> Severity {
+        Severity::Error
+    }
+
+    fn check(&self, model: &Model, _ctx: &ValidationContext) -> Vec<Violation> {
+        let Some(proto) = model.retained_proto() else {
+            return Vec::new();
+        };
+        let mut violations = Vec::new();
+        if let Some(graph) = &proto.graph {
+            check_graph_types(graph, true, self.id(), &mut violations);
+        }
+        for function in &proto.functions {
+            for value in &function.value_info {
+                check_value_type(value, false, self.id(), &mut violations);
+            }
+            for node in &function.node {
+                check_node_types(node, &function.name, self.id(), &mut violations);
+            }
+            for attribute in &function.attribute_proto {
+                check_attribute_types(
+                    attribute,
+                    ViolationLocation::Model,
+                    self.id(),
+                    &mut violations,
+                );
+            }
+        }
+        violations
+    }
+}
+
+/// Validate dense tensor dimensions, storage-field selection, payload size,
+/// segment bounds, and external-data constraints.
+pub struct TensorPayloadValidityRule;
+
+impl ValidationRule for TensorPayloadValidityRule {
+    fn id(&self) -> &str {
+        "proto.tensor_payload_valid"
+    }
+
+    fn severity(&self) -> Severity {
+        Severity::Error
+    }
+
+    fn check(&self, model: &Model, _ctx: &ValidationContext) -> Vec<Violation> {
+        let Some(proto) = model.retained_proto() else {
+            return Vec::new();
+        };
+        let mut violations = Vec::new();
+        if let Some(graph) = &proto.graph {
+            visit_graph_tensors(graph, self.id(), &mut violations);
+        }
+        for function in &proto.functions {
+            for node in &function.node {
+                visit_node_tensors(node, &function.name, self.id(), &mut violations);
+            }
+            for attribute in &function.attribute_proto {
+                visit_attribute_tensors(
+                    attribute,
+                    ViolationLocation::Model,
+                    self.id(),
+                    &mut violations,
+                );
+            }
+        }
+        violations
+    }
+}
+
+/// Validate sparse tensor COO structure, index type/shape, bounds, ordering,
+/// and uniqueness.
+pub struct SparseTensorValidityRule;
+
+impl ValidationRule for SparseTensorValidityRule {
+    fn id(&self) -> &str {
+        "proto.sparse_tensor_valid"
+    }
+
+    fn severity(&self) -> Severity {
+        Severity::Error
+    }
+
+    fn check(&self, model: &Model, _ctx: &ValidationContext) -> Vec<Violation> {
+        let Some(proto) = model.retained_proto() else {
+            return Vec::new();
+        };
+        let mut violations = Vec::new();
+        if let Some(graph) = &proto.graph {
+            visit_graph_sparse_tensors(graph, self.id(), &mut violations);
+        }
+        for function in &proto.functions {
+            for node in &function.node {
+                visit_node_sparse_tensors(node, &function.name, self.id(), &mut violations);
+            }
+            for attribute in &function.attribute_proto {
+                visit_attribute_sparse_tensors(
+                    attribute,
+                    ViolationLocation::Model,
+                    self.id(),
+                    &mut violations,
+                );
+            }
+        }
+        violations
+    }
+}
+
+fn check_graph_attributes(graph: &GraphProto, rule_id: &str, violations: &mut Vec<Violation>) {
+    for node in &graph.node {
+        check_node_attributes_proto(node, &graph.name, rule_id, violations);
+    }
+}
+
+fn check_node_attributes_proto(
+    node: &NodeProto,
+    graph_name: &str,
+    rule_id: &str,
+    violations: &mut Vec<Violation>,
+) {
+    let location = ViolationLocation::Node {
+        graph_name: graph_name.to_string(),
+        node_name: if node.name.is_empty() {
+            format!("<{}>", node.op_type)
+        } else {
+            node.name.clone()
+        },
+    };
+    if node.op_type.is_empty() {
+        violations.push(Violation {
+            rule_id: rule_id.to_string(),
+            severity: Severity::Error,
+            message: "NodeProto.op_type must be present".into(),
+            location: location.clone(),
+        });
+    }
+    check_attribute_list(&node.attribute, location.clone(), rule_id, violations);
+    for attribute in &node.attribute {
+        if let Some(graph) = &attribute.g {
+            check_graph_attributes(graph, rule_id, violations);
+        }
+        for graph in &attribute.graphs {
+            check_graph_attributes(graph, rule_id, violations);
+        }
+    }
+}
+
+fn check_attribute_list(
+    attributes: &[AttributeProto],
+    location: ViolationLocation,
+    rule_id: &str,
+    violations: &mut Vec<Violation>,
+) {
+    let mut names = HashSet::new();
+    for attribute in attributes {
+        if attribute.name.is_empty() {
+            violations.push(Violation {
+                rule_id: rule_id.to_string(),
+                severity: Severity::Error,
+                message: "AttributeProto.name must be present".into(),
+                location: location.clone(),
+            });
+        } else if !names.insert(attribute.name.as_str()) {
+            violations.push(Violation {
+                rule_id: rule_id.to_string(),
+                severity: Severity::Error,
+                message: format!("attribute name '{}' is not unique", attribute.name),
+                location: location.clone(),
+            });
+        }
+        check_attribute_proto(attribute, location.clone(), rule_id, violations);
+    }
+}
+
+fn check_attribute_proto(
+    attribute: &AttributeProto,
+    location: ViolationLocation,
+    rule_id: &str,
+    violations: &mut Vec<Violation>,
+) {
+    let Some(expected) = attribute_proto::AttributeType::try_from(attribute.r#type)
+        .ok()
+        .filter(|value| *value != attribute_proto::AttributeType::Undefined)
+    else {
+        violations.push(Violation {
+            rule_id: rule_id.to_string(),
+            severity: Severity::Error,
+            message: format!(
+                "attribute '{}' has invalid or undefined discriminator {}",
+                attribute.name, attribute.r#type
+            ),
+            location,
+        });
+        return;
+    };
+    let populated = [
+        (attribute.f != 0.0, attribute_proto::AttributeType::Float),
+        (attribute.i != 0, attribute_proto::AttributeType::Int),
+        (
+            !attribute.s.is_empty(),
+            attribute_proto::AttributeType::String,
+        ),
+        (
+            attribute.t.is_some(),
+            attribute_proto::AttributeType::Tensor,
+        ),
+        (attribute.g.is_some(), attribute_proto::AttributeType::Graph),
+        (
+            !attribute.floats.is_empty(),
+            attribute_proto::AttributeType::Floats,
+        ),
+        (
+            !attribute.ints.is_empty(),
+            attribute_proto::AttributeType::Ints,
+        ),
+        (
+            !attribute.strings.is_empty(),
+            attribute_proto::AttributeType::Strings,
+        ),
+        (
+            !attribute.tensors.is_empty(),
+            attribute_proto::AttributeType::Tensors,
+        ),
+        (
+            !attribute.graphs.is_empty(),
+            attribute_proto::AttributeType::Graphs,
+        ),
+        (
+            attribute.tp.is_some(),
+            attribute_proto::AttributeType::TypeProto,
+        ),
+        (
+            !attribute.type_protos.is_empty(),
+            attribute_proto::AttributeType::TypeProtos,
+        ),
+        (
+            attribute.sparse_tensor.is_some(),
+            attribute_proto::AttributeType::SparseTensor,
+        ),
+        (
+            !attribute.sparse_tensors.is_empty(),
+            attribute_proto::AttributeType::SparseTensors,
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(present, kind)| present.then_some(kind))
+    .collect::<Vec<_>>();
+    if !attribute.ref_attr_name.is_empty() {
+        if !populated.is_empty() {
+            violations.push(Violation {
+                rule_id: rule_id.to_string(),
+                severity: Severity::Error,
+                message: format!(
+                    "referenced attribute '{}' must not contain a value payload",
+                    attribute.name
+                ),
+                location,
+            });
+        }
+        return;
+    }
+    if let Some(actual) = populated.iter().find(|&&actual| actual != expected) {
+        violations.push(Violation {
+            rule_id: rule_id.to_string(),
+            severity: Severity::Error,
+            message: format!(
+                "attribute '{}' discriminator {:?} conflicts with populated {:?} payload",
+                attribute.name, expected, actual
+            ),
+            location: location.clone(),
+        });
+    }
+    let required_message_missing = matches!(
+        expected,
+        attribute_proto::AttributeType::Tensor
+            | attribute_proto::AttributeType::Graph
+            | attribute_proto::AttributeType::SparseTensor
+            | attribute_proto::AttributeType::TypeProto
+    ) && !populated.contains(&expected);
+    if required_message_missing {
+        violations.push(Violation {
+            rule_id: rule_id.to_string(),
+            severity: Severity::Error,
+            message: format!(
+                "attribute '{}' discriminator {:?} requires its message payload",
+                attribute.name, expected
+            ),
+            location,
+        });
+    }
+}
+
+fn check_unique_entries(
+    entries: &[StringStringEntryProto],
+    field: &str,
+    location: ViolationLocation,
+    rule_id: &str,
+    violations: &mut Vec<Violation>,
+) {
+    let mut keys = HashSet::new();
+    for entry in entries {
+        if !keys.insert(entry.key.as_str()) {
+            violations.push(Violation {
+                rule_id: rule_id.to_string(),
+                severity: Severity::Error,
+                message: format!("{field} contains duplicate key '{}'", entry.key),
+                location: location.clone(),
+            });
+        }
+    }
+}
+
+fn check_graph_metadata(graph: &GraphProto, rule_id: &str, violations: &mut Vec<Violation>) {
+    let location = ViolationLocation::Graph {
+        graph_name: graph.name.clone(),
+    };
+    check_unique_entries(
+        &graph.metadata_props,
+        "GraphProto.metadata_props",
+        location.clone(),
+        rule_id,
+        violations,
+    );
+    for value in graph
+        .input
+        .iter()
+        .chain(&graph.output)
+        .chain(&graph.value_info)
+    {
+        check_value_metadata(value, rule_id, violations);
+    }
+    for tensor in &graph.initializer {
+        check_tensor_metadata(tensor, rule_id, violations);
+    }
+    for sparse in &graph.sparse_initializer {
+        if let Some(values) = &sparse.values {
+            check_tensor_metadata(values, rule_id, violations);
+        }
+        if let Some(indices) = &sparse.indices {
+            check_tensor_metadata(indices, rule_id, violations);
+        }
+    }
+    for annotation in &graph.quantization_annotation {
+        check_unique_entries(
+            &annotation.quant_parameter_tensor_names,
+            "TensorAnnotation.quant_parameter_tensor_names",
+            ViolationLocation::Value {
+                value_name: annotation.tensor_name.clone(),
+            },
+            rule_id,
+            violations,
+        );
+    }
+    for node in &graph.node {
+        check_node_metadata(node, &graph.name, rule_id, violations);
+    }
+}
+
+fn check_node_metadata(
+    node: &NodeProto,
+    graph_name: &str,
+    rule_id: &str,
+    violations: &mut Vec<Violation>,
+) {
+    let location = ViolationLocation::Node {
+        graph_name: graph_name.to_string(),
+        node_name: if node.name.is_empty() {
+            format!("<{}>", node.op_type)
+        } else {
+            node.name.clone()
+        },
+    };
+    check_unique_entries(
+        &node.metadata_props,
+        "NodeProto.metadata_props",
+        location,
+        rule_id,
+        violations,
+    );
+    for attribute in &node.attribute {
+        if let Some(graph) = &attribute.g {
+            check_graph_metadata(graph, rule_id, violations);
+        }
+        for graph in &attribute.graphs {
+            check_graph_metadata(graph, rule_id, violations);
+        }
+        if let Some(tensor) = &attribute.t {
+            check_tensor_metadata(tensor, rule_id, violations);
+        }
+        for tensor in &attribute.tensors {
+            check_tensor_metadata(tensor, rule_id, violations);
+        }
+        if let Some(sparse) = &attribute.sparse_tensor {
+            if let Some(values) = &sparse.values {
+                check_tensor_metadata(values, rule_id, violations);
+            }
+            if let Some(indices) = &sparse.indices {
+                check_tensor_metadata(indices, rule_id, violations);
+            }
+        }
+        for sparse in &attribute.sparse_tensors {
+            if let Some(values) = &sparse.values {
+                check_tensor_metadata(values, rule_id, violations);
+            }
+            if let Some(indices) = &sparse.indices {
+                check_tensor_metadata(indices, rule_id, violations);
+            }
+        }
+    }
+}
+
+fn check_value_metadata(value: &ValueInfoProto, rule_id: &str, violations: &mut Vec<Violation>) {
+    check_unique_entries(
+        &value.metadata_props,
+        "ValueInfoProto.metadata_props",
+        ViolationLocation::Value {
+            value_name: value.name.clone(),
+        },
+        rule_id,
+        violations,
+    );
+}
+
+fn check_tensor_metadata(tensor: &TensorProto, rule_id: &str, violations: &mut Vec<Violation>) {
+    check_unique_entries(
+        &tensor.metadata_props,
+        "TensorProto.metadata_props",
+        ViolationLocation::Value {
+            value_name: tensor.name.clone(),
+        },
+        rule_id,
+        violations,
+    );
+}
+
+fn check_graph_types(
+    graph: &GraphProto,
+    top_level: bool,
+    rule_id: &str,
+    violations: &mut Vec<Violation>,
+) {
+    for value in &graph.input {
+        check_value_type(value, top_level, rule_id, violations);
+    }
+    for value in &graph.output {
+        check_value_type(value, top_level, rule_id, violations);
+    }
+    for value in &graph.value_info {
+        check_value_type(value, false, rule_id, violations);
+    }
+    for node in &graph.node {
+        check_node_types(node, &graph.name, rule_id, violations);
+    }
+}
+
+fn check_node_types(
+    node: &NodeProto,
+    graph_name: &str,
+    rule_id: &str,
+    violations: &mut Vec<Violation>,
+) {
+    let location = ViolationLocation::Node {
+        graph_name: graph_name.to_string(),
+        node_name: if node.name.is_empty() {
+            format!("<{}>", node.op_type)
+        } else {
+            node.name.clone()
+        },
+    };
+    for attribute in &node.attribute {
+        check_attribute_types(attribute, location.clone(), rule_id, violations);
+        if let Some(graph) = &attribute.g {
+            check_graph_types(graph, false, rule_id, violations);
+        }
+        for graph in &attribute.graphs {
+            check_graph_types(graph, false, rule_id, violations);
+        }
+    }
+}
+
+fn check_attribute_types(
+    attribute: &AttributeProto,
+    location: ViolationLocation,
+    rule_id: &str,
+    violations: &mut Vec<Violation>,
+) {
+    if let Some(value) = &attribute.tp {
+        check_type_proto(value, location.clone(), rule_id, violations);
+    }
+    for value in &attribute.type_protos {
+        check_type_proto(value, location.clone(), rule_id, violations);
+    }
+}
+
+fn check_value_type(
+    value: &ValueInfoProto,
+    require_type: bool,
+    rule_id: &str,
+    violations: &mut Vec<Violation>,
+) {
+    let location = ViolationLocation::Value {
+        value_name: value.name.clone(),
+    };
+    if value.name.is_empty() {
+        violations.push(Violation {
+            rule_id: rule_id.to_string(),
+            severity: Severity::Error,
+            message: "ValueInfoProto.name must be present".into(),
+            location: location.clone(),
+        });
+    }
+    match &value.r#type {
+        Some(r#type) => check_type_proto(r#type, location, rule_id, violations),
+        None if require_type => violations.push(Violation {
+            rule_id: rule_id.to_string(),
+            severity: Severity::Error,
+            message: "top-level graph inputs and outputs must declare a TypeProto".into(),
+            location,
+        }),
+        None => {}
+    }
+}
+
+fn check_type_proto(
+    value: &TypeProto,
+    location: ViolationLocation,
+    rule_id: &str,
+    violations: &mut Vec<Violation>,
+) {
+    let invalid = |message: String, violations: &mut Vec<Violation>| {
+        violations.push(Violation {
+            rule_id: rule_id.to_string(),
+            severity: Severity::Error,
+            message,
+            location: location.clone(),
+        });
+    };
+    match value.value.as_ref() {
+        None => invalid("TypeProto must select a value variant".into(), violations),
+        Some(type_proto::Value::TensorType(tensor)) => {
+            check_tensor_type(
+                tensor.elem_type,
+                tensor.shape.as_ref(),
+                &invalid,
+                violations,
+            );
+        }
+        Some(type_proto::Value::SparseTensorType(tensor)) => {
+            check_tensor_type(
+                tensor.elem_type,
+                tensor.shape.as_ref(),
+                &invalid,
+                violations,
+            );
+        }
+        Some(type_proto::Value::SequenceType(sequence)) => match &sequence.elem_type {
+            Some(elem_type) => check_type_proto(elem_type, location.clone(), rule_id, violations),
+            None => invalid(
+                "TypeProto.Sequence.elem_type must be present".into(),
+                violations,
+            ),
+        },
+        Some(type_proto::Value::MapType(map)) => {
+            let key = tensor_proto::DataType::try_from(map.key_type).ok();
+            if !matches!(
+                key,
+                Some(
+                    tensor_proto::DataType::Uint8
+                        | tensor_proto::DataType::Int8
+                        | tensor_proto::DataType::Uint16
+                        | tensor_proto::DataType::Int16
+                        | tensor_proto::DataType::Int32
+                        | tensor_proto::DataType::Int64
+                        | tensor_proto::DataType::String
+                        | tensor_proto::DataType::Uint32
+                        | tensor_proto::DataType::Uint64
+                )
+            ) {
+                invalid(
+                    format!(
+                        "TypeProto.Map.key_type {} must be an integral or string dtype",
+                        map.key_type
+                    ),
+                    violations,
+                );
+            }
+            match &map.value_type {
+                Some(value_type) => {
+                    check_type_proto(value_type, location.clone(), rule_id, violations)
+                }
+                None => invalid(
+                    "TypeProto.Map.value_type must be present".into(),
+                    violations,
+                ),
+            }
+        }
+        Some(type_proto::Value::OptionalType(optional)) => match &optional.elem_type {
+            Some(elem_type) => {
+                if !matches!(
+                    elem_type.value,
+                    Some(
+                        type_proto::Value::TensorType(_)
+                            | type_proto::Value::SequenceType(_)
+                            | type_proto::Value::MapType(_)
+                    )
+                ) {
+                    invalid(
+                        "TypeProto.Optional.elem_type must be a tensor, sequence, or map".into(),
+                        violations,
+                    );
+                }
+                check_type_proto(elem_type, location.clone(), rule_id, violations);
+            }
+            None => invalid(
+                "TypeProto.Optional.elem_type must be present".into(),
+                violations,
+            ),
+        },
+        Some(type_proto::Value::OpaqueType(_)) => {}
+    }
+}
+
+fn check_tensor_type(
+    elem_type: i32,
+    shape: Option<&TensorShapeProto>,
+    invalid: &impl Fn(String, &mut Vec<Violation>),
+    violations: &mut Vec<Violation>,
+) {
+    if tensor_proto::DataType::try_from(elem_type)
+        .ok()
+        .is_none_or(|dtype| dtype == tensor_proto::DataType::Undefined)
+    {
+        invalid(
+            format!("tensor elem_type {elem_type} must be a defined ONNX dtype"),
+            violations,
+        );
+    }
+    if let Some(shape) = shape {
+        for (index, dim) in shape.dim.iter().enumerate() {
+            if matches!(
+                dim.value,
+                Some(onnx_runtime_loader::proto::onnx::tensor_shape_proto::dimension::Value::DimValue(value))
+                    if value < 0
+            ) {
+                invalid(
+                    format!("tensor shape dimension {index} must not be negative"),
+                    violations,
+                );
+            }
+        }
+    }
+}
+
+fn visit_graph_tensors(graph: &GraphProto, rule_id: &str, violations: &mut Vec<Violation>) {
+    for tensor in &graph.initializer {
+        check_tensor_payload(tensor, rule_id, violations);
+    }
+    for sparse in &graph.sparse_initializer {
+        if let Some(values) = &sparse.values {
+            check_tensor_payload(values, rule_id, violations);
+        }
+        if let Some(indices) = &sparse.indices {
+            check_tensor_payload(indices, rule_id, violations);
+        }
+    }
+    for node in &graph.node {
+        visit_node_tensors(node, &graph.name, rule_id, violations);
+    }
+}
+
+fn visit_node_tensors(
+    node: &NodeProto,
+    graph_name: &str,
+    rule_id: &str,
+    violations: &mut Vec<Violation>,
+) {
+    let location = ViolationLocation::Node {
+        graph_name: graph_name.to_string(),
+        node_name: if node.name.is_empty() {
+            format!("<{}>", node.op_type)
+        } else {
+            node.name.clone()
+        },
+    };
+    for attribute in &node.attribute {
+        visit_attribute_tensors(attribute, location.clone(), rule_id, violations);
+        if let Some(graph) = &attribute.g {
+            visit_graph_tensors(graph, rule_id, violations);
+        }
+        for graph in &attribute.graphs {
+            visit_graph_tensors(graph, rule_id, violations);
+        }
+    }
+}
+
+fn visit_attribute_tensors(
+    attribute: &AttributeProto,
+    _location: ViolationLocation,
+    rule_id: &str,
+    violations: &mut Vec<Violation>,
+) {
+    if let Some(tensor) = &attribute.t {
+        check_tensor_payload(tensor, rule_id, violations);
+    }
+    for tensor in &attribute.tensors {
+        check_tensor_payload(tensor, rule_id, violations);
+    }
+    if let Some(sparse) = &attribute.sparse_tensor {
+        if let Some(values) = &sparse.values {
+            check_tensor_payload(values, rule_id, violations);
+        }
+        if let Some(indices) = &sparse.indices {
+            check_tensor_payload(indices, rule_id, violations);
+        }
+    }
+    for sparse in &attribute.sparse_tensors {
+        if let Some(values) = &sparse.values {
+            check_tensor_payload(values, rule_id, violations);
+        }
+        if let Some(indices) = &sparse.indices {
+            check_tensor_payload(indices, rule_id, violations);
+        }
+    }
+}
+
+fn check_tensor_payload(tensor: &TensorProto, rule_id: &str, violations: &mut Vec<Violation>) {
+    let location = ViolationLocation::Value {
+        value_name: tensor.name.clone(),
+    };
+    let mut report = |message: String| {
+        violations.push(Violation {
+            rule_id: rule_id.to_string(),
+            severity: Severity::Error,
+            message,
+            location: location.clone(),
+        });
+    };
+    let Some(dtype) = tensor_proto::DataType::try_from(tensor.data_type)
+        .ok()
+        .filter(|dtype| *dtype != tensor_proto::DataType::Undefined)
+    else {
+        report(format!(
+            "TensorProto.data_type {} must be a defined ONNX dtype",
+            tensor.data_type
+        ));
+        return;
+    };
+    let Some(full_count) = checked_numel(&tensor.dims) else {
+        report(
+            "TensorProto dimensions must be non-negative and their product must fit usize".into(),
+        );
+        return;
+    };
+    let count = if let Some(segment) = &tensor.segment {
+        if segment.begin < 0 || segment.end < segment.begin {
+            report("TensorProto.segment must satisfy 0 <= begin <= end".into());
+            return;
+        }
+        let Ok(begin) = usize::try_from(segment.begin) else {
+            report("TensorProto.segment.begin does not fit usize".into());
+            return;
+        };
+        let Ok(end) = usize::try_from(segment.end) else {
+            report("TensorProto.segment.end does not fit usize".into());
+            return;
+        };
+        if end > full_count {
+            report(format!(
+                "TensorProto.segment end {end} exceeds element count {full_count}"
+            ));
+        }
+        end.saturating_sub(begin)
+    } else {
+        full_count
+    };
+
+    let populated = [
+        !tensor.float_data.is_empty(),
+        !tensor.int32_data.is_empty(),
+        !tensor.string_data.is_empty(),
+        !tensor.int64_data.is_empty(),
+        !tensor.raw_data.is_empty(),
+        !tensor.double_data.is_empty(),
+        !tensor.uint64_data.is_empty(),
+    ]
+    .into_iter()
+    .filter(|present| *present)
+    .count();
+    let data_location = tensor_proto::DataLocation::try_from(tensor.data_location).ok();
+    if data_location.is_none() {
+        report(format!(
+            "TensorProto.data_location {} is not valid",
+            tensor.data_location
+        ));
+        return;
+    }
+    if data_location == Some(tensor_proto::DataLocation::External) {
+        if populated != 0 {
+            report("external TensorProto must not contain embedded payload fields".into());
+        }
+        let mut external = HashMap::new();
+        for entry in &tensor.external_data {
+            if external
+                .insert(entry.key.as_str(), entry.value.as_str())
+                .is_some()
+            {
+                report(format!(
+                    "TensorProto.external_data contains duplicate key '{}'",
+                    entry.key
+                ));
+            }
+        }
+        if external
+            .get("location")
+            .is_none_or(|value| value.is_empty())
+        {
+            report("external TensorProto requires a non-empty location entry".into());
+        }
+        let offset = parse_external_usize(external.get("offset").copied(), "offset", &mut report);
+        let length = parse_external_usize(external.get("length").copied(), "length", &mut report);
+        if let (Some(offset), Some(length)) = (offset, length)
+            && offset.checked_add(length).is_none()
+        {
+            report("external TensorProto offset + length overflows usize".into());
+        }
+        return;
+    }
+    if !tensor.external_data.is_empty() {
+        report("inline TensorProto must not contain external_data entries".into());
+    }
+    if populated > 1 {
+        report("TensorProto must use exactly one embedded payload field".into());
+        return;
+    }
+    if count > 0 && populated == 0 {
+        report("non-empty TensorProto is missing its payload".into());
+        return;
+    }
+    if populated == 0 {
+        return;
+    }
+    let actual_expected = match dtype {
+        _ if !tensor.raw_data.is_empty() => storage_bytes(dtype, count)
+            .map(|expected| (tensor.raw_data.len(), expected, "raw_data")),
+        tensor_proto::DataType::Float => Some((tensor.float_data.len(), count, "float_data")),
+        tensor_proto::DataType::Complex64 => count
+            .checked_mul(2)
+            .map(|expected| (tensor.float_data.len(), expected, "float_data")),
+        tensor_proto::DataType::Double => Some((tensor.double_data.len(), count, "double_data")),
+        tensor_proto::DataType::Complex128 => count
+            .checked_mul(2)
+            .map(|expected| (tensor.double_data.len(), expected, "double_data")),
+        tensor_proto::DataType::Int64 => Some((tensor.int64_data.len(), count, "int64_data")),
+        tensor_proto::DataType::String => Some((tensor.string_data.len(), count, "string_data")),
+        tensor_proto::DataType::Uint32 | tensor_proto::DataType::Uint64 => {
+            Some((tensor.uint64_data.len(), count, "uint64_data"))
+        }
+        tensor_proto::DataType::Uint4
+        | tensor_proto::DataType::Int4
+        | tensor_proto::DataType::Float4e2m1 => count
+            .checked_add(1)
+            .map(|value| (tensor.int32_data.len(), value / 2, "int32_data")),
+        tensor_proto::DataType::Uint2 | tensor_proto::DataType::Int2 => count
+            .checked_add(3)
+            .map(|value| (tensor.int32_data.len(), value / 4, "int32_data")),
+        _ => Some((tensor.int32_data.len(), count, "int32_data")),
+    };
+    match actual_expected {
+        Some((actual, expected, field)) if actual != expected => report(format!(
+            "TensorProto.{field} contains {actual} entries/bytes but {expected} are required"
+        )),
+        None => report("TensorProto payload size arithmetic overflowed usize".into()),
+        _ => {}
+    }
+}
+
+fn parse_external_usize(
+    value: Option<&str>,
+    key: &str,
+    report: &mut impl FnMut(String),
+) -> Option<usize> {
+    let value = value?;
+    match value.parse::<usize>() {
+        Ok(value) => Some(value),
+        Err(_) => {
+            report(format!(
+                "TensorProto.external_data '{key}' must be an unsigned integer"
+            ));
+            None
+        }
+    }
+}
+
+fn checked_numel(dims: &[i64]) -> Option<usize> {
+    dims.iter().try_fold(1usize, |count, &dim| {
+        let dim = usize::try_from(dim).ok()?;
+        count.checked_mul(dim)
+    })
+}
+
+fn storage_bytes(dtype: tensor_proto::DataType, count: usize) -> Option<usize> {
+    let bits = match dtype {
+        tensor_proto::DataType::Uint2 | tensor_proto::DataType::Int2 => 2,
+        tensor_proto::DataType::Uint4
+        | tensor_proto::DataType::Int4
+        | tensor_proto::DataType::Float4e2m1 => 4,
+        tensor_proto::DataType::Uint8
+        | tensor_proto::DataType::Int8
+        | tensor_proto::DataType::Bool
+        | tensor_proto::DataType::Float8e4m3fn
+        | tensor_proto::DataType::Float8e4m3fnuz
+        | tensor_proto::DataType::Float8e5m2
+        | tensor_proto::DataType::Float8e5m2fnuz
+        | tensor_proto::DataType::Float8e8m0 => 8,
+        tensor_proto::DataType::Uint16
+        | tensor_proto::DataType::Int16
+        | tensor_proto::DataType::Float16
+        | tensor_proto::DataType::Bfloat16 => 16,
+        tensor_proto::DataType::Float
+        | tensor_proto::DataType::Int32
+        | tensor_proto::DataType::Uint32 => 32,
+        tensor_proto::DataType::Double
+        | tensor_proto::DataType::Int64
+        | tensor_proto::DataType::Uint64
+        | tensor_proto::DataType::Complex64 => 64,
+        tensor_proto::DataType::Complex128 => 128,
+        tensor_proto::DataType::String | tensor_proto::DataType::Undefined => return None,
+    };
+    count
+        .checked_mul(bits)
+        .and_then(|bits| bits.checked_add(7))
+        .map(|bits| bits / 8)
+}
+
+fn visit_graph_sparse_tensors(graph: &GraphProto, rule_id: &str, violations: &mut Vec<Violation>) {
+    for sparse in &graph.sparse_initializer {
+        check_sparse_tensor(sparse, true, rule_id, violations);
+    }
+    for node in &graph.node {
+        visit_node_sparse_tensors(node, &graph.name, rule_id, violations);
+    }
+}
+
+fn visit_node_sparse_tensors(
+    node: &NodeProto,
+    graph_name: &str,
+    rule_id: &str,
+    violations: &mut Vec<Violation>,
+) {
+    let location = ViolationLocation::Node {
+        graph_name: graph_name.to_string(),
+        node_name: if node.name.is_empty() {
+            format!("<{}>", node.op_type)
+        } else {
+            node.name.clone()
+        },
+    };
+    for attribute in &node.attribute {
+        visit_attribute_sparse_tensors(attribute, location.clone(), rule_id, violations);
+        if let Some(graph) = &attribute.g {
+            visit_graph_sparse_tensors(graph, rule_id, violations);
+        }
+        for graph in &attribute.graphs {
+            visit_graph_sparse_tensors(graph, rule_id, violations);
+        }
+    }
+}
+
+fn visit_attribute_sparse_tensors(
+    attribute: &AttributeProto,
+    _location: ViolationLocation,
+    rule_id: &str,
+    violations: &mut Vec<Violation>,
+) {
+    if let Some(sparse) = &attribute.sparse_tensor {
+        check_sparse_tensor(sparse, false, rule_id, violations);
+    }
+    for sparse in &attribute.sparse_tensors {
+        check_sparse_tensor(sparse, false, rule_id, violations);
+    }
+}
+
+fn check_sparse_tensor(
+    sparse: &SparseTensorProto,
+    require_name: bool,
+    rule_id: &str,
+    violations: &mut Vec<Violation>,
+) {
+    let name = sparse
+        .values
+        .as_ref()
+        .map(|values| values.name.clone())
+        .unwrap_or_default();
+    let location = ViolationLocation::Value { value_name: name };
+    let mut report = |message: String| {
+        violations.push(Violation {
+            rule_id: rule_id.to_string(),
+            severity: Severity::Error,
+            message,
+            location: location.clone(),
+        });
+    };
+    let Some(values) = &sparse.values else {
+        report("SparseTensorProto.values must be present".into());
+        return;
+    };
+    let Some(indices) = &sparse.indices else {
+        report("SparseTensorProto.indices must be present".into());
+        return;
+    };
+    if require_name && values.name.is_empty() {
+        report("sparse initializer values must have a non-empty name".into());
+    }
+    let Some(dense_count) = checked_numel(&sparse.dims) else {
+        report("SparseTensorProto dimensions must be non-negative and fit usize".into());
+        return;
+    };
+    if values.dims.len() != 1 {
+        report("SparseTensorProto.values must have shape [NNZ]".into());
+        return;
+    }
+    let Ok(nnz) = usize::try_from(values.dims[0]) else {
+        report("SparseTensorProto NNZ must be non-negative".into());
+        return;
+    };
+    if nnz > dense_count {
+        report(format!(
+            "SparseTensorProto NNZ {nnz} exceeds dense element count {dense_count}"
+        ));
+    }
+    if indices.data_type != tensor_proto::DataType::Int64 as i32 {
+        report("SparseTensorProto.indices must have INT64 dtype".into());
+        return;
+    }
+    let rank = sparse.dims.len();
+    let coordinate = match indices.dims.as_slice() {
+        [count] if usize::try_from(*count).ok() == Some(nnz) => false,
+        [count, width]
+            if usize::try_from(*count).ok() == Some(nnz)
+                && usize::try_from(*width).ok() == Some(rank) =>
+        {
+            true
+        }
+        _ => {
+            report(format!(
+                "SparseTensorProto.indices shape must be [{nnz}] or [{nnz}, {rank}]"
+            ));
+            return;
+        }
+    };
+    let Some(index_values) = tensor_i64_values(indices) else {
+        report("SparseTensorProto.indices must use int64_data or raw_data".into());
+        return;
+    };
+    let expected_indices = if coordinate {
+        nnz.checked_mul(rank)
+    } else {
+        Some(nnz)
+    };
+    if expected_indices != Some(index_values.len()) {
+        report("SparseTensorProto.indices payload count does not match its shape".into());
+        return;
+    }
+    if coordinate {
+        let mut previous: Option<&[i64]> = None;
+        for tuple in index_values.chunks(rank.max(1)) {
+            if tuple
+                .iter()
+                .zip(&sparse.dims)
+                .any(|(&index, &dim)| index < 0 || index >= dim)
+            {
+                report("SparseTensorProto coordinate index is out of bounds".into());
+            }
+            if previous.is_some_and(|prior| prior >= tuple) {
+                report(
+                    "SparseTensorProto coordinate indices must be lexicographically increasing"
+                        .into(),
+                );
+            }
+            previous = Some(tuple);
+        }
+    } else {
+        let Ok(dense_count) = i64::try_from(dense_count) else {
+            report("SparseTensorProto dense element count does not fit i64".into());
+            return;
+        };
+        let mut previous = None;
+        for &index in &index_values {
+            if index < 0 || index >= dense_count {
+                report("SparseTensorProto linear index is out of bounds".into());
+            }
+            if previous.is_some_and(|prior| prior >= index) {
+                report("SparseTensorProto linear indices must be strictly increasing".into());
+            }
+            previous = Some(index);
+        }
+    }
+}
+
+fn tensor_i64_values(tensor: &TensorProto) -> Option<Vec<i64>> {
+    if !tensor.int64_data.is_empty() {
+        return Some(tensor.int64_data.clone());
+    }
+    if tensor.raw_data.len() % 8 != 0 {
+        return None;
+    }
+    Some(
+        tensor
+            .raw_data
+            .chunks_exact(8)
+            .map(|bytes| i64::from_le_bytes(bytes.try_into().expect("chunk size is eight")))
+            .collect(),
+    )
+}
+
 /// Validate the IR v11+ multi-device configuration and sharding annotations.
 ///
 /// This rule operates on the retained protobuf because the execution IR
@@ -803,7 +2062,10 @@ fn check_multi_device_node<'a>(
     violations: &mut Vec<Violation>,
 ) {
     for device_configuration in &node.device_configurations {
-        if !configurations.contains_key(device_configuration.configuration_id.as_str()) {
+        let configuration = configurations
+            .get(device_configuration.configuration_id.as_str())
+            .copied();
+        if configuration.is_none() {
             violations.push(proto_node_violation(
                 rule_id,
                 graph_name,
@@ -833,6 +2095,16 @@ fn check_multi_device_node<'a>(
                     ),
                 ));
             }
+            if let Some(configuration) = configuration {
+                check_sharding_devices(
+                    sharding,
+                    configuration,
+                    graph_name,
+                    node,
+                    rule_id,
+                    violations,
+                );
+            }
 
             let rank = graph.and_then(|graph| tensor_rank(graph, &sharding.tensor_name));
             for sharded_dim in &sharding.sharded_dim {
@@ -853,6 +2125,7 @@ fn check_multi_device_node<'a>(
                         ));
                     }
                 }
+
                 for simple in &sharded_dim.simple_sharding {
                     if simple.num_shards <= 0 {
                         violations.push(proto_node_violation(
@@ -867,6 +2140,87 @@ fn check_multi_device_node<'a>(
                     }
                 }
             }
+        }
+    }
+}
+
+fn check_sharding_devices(
+    sharding: &onnx_runtime_loader::proto::onnx::ShardingSpecProto,
+    configuration: &DeviceConfigurationProto,
+    graph_name: &str,
+    node: &NodeProto,
+    rule_id: &str,
+    violations: &mut Vec<Violation>,
+) {
+    let num_devices = i64::from(configuration.num_devices);
+    let mut groups = HashMap::new();
+    for group in &sharding.index_to_device_group_map {
+        if groups.insert(group.key, group).is_some() {
+            violations.push(proto_node_violation(
+                rule_id,
+                graph_name,
+                node,
+                format!("device group key {} is not unique", group.key),
+            ));
+        }
+        if !sharding.device.contains(&group.key) {
+            violations.push(proto_node_violation(
+                rule_id,
+                graph_name,
+                node,
+                format!(
+                    "device group key {} is not referenced by ShardingSpecProto.device",
+                    group.key
+                ),
+            ));
+        }
+        if group.value.is_empty() {
+            violations.push(proto_node_violation(
+                rule_id,
+                graph_name,
+                node,
+                format!(
+                    "device group {} must contain at least one device",
+                    group.key
+                ),
+            ));
+        }
+        let mut members = HashSet::new();
+        for &member in &group.value {
+            if member < 0 || member >= num_devices {
+                violations.push(proto_node_violation(
+                    rule_id,
+                    graph_name,
+                    node,
+                    format!(
+                        "device group {} member {} is outside [0, {})",
+                        group.key, member, configuration.num_devices
+                    ),
+                ));
+            } else if !members.insert(member) {
+                violations.push(proto_node_violation(
+                    rule_id,
+                    graph_name,
+                    node,
+                    format!(
+                        "device group {} contains duplicate member {}",
+                        group.key, member
+                    ),
+                ));
+            }
+        }
+    }
+    for &device in &sharding.device {
+        if !groups.contains_key(&device) && (device < 0 || device >= num_devices) {
+            violations.push(proto_node_violation(
+                rule_id,
+                graph_name,
+                node,
+                format!(
+                    "sharding device {} is neither a group key nor within [0, {})",
+                    device, configuration.num_devices
+                ),
+            ));
         }
     }
 }
@@ -1236,6 +2590,7 @@ mod tests {
     use onnx_runtime_ir::{
         Attribute, DataType, Dim, Node, NodeId, TensorData, WeightRef, static_shape,
     };
+    use onnx_runtime_loader::proto::onnx::{OperatorSetIdProto, StringStringEntryProto};
 
     fn if_model(subgraph: Graph, output_count: usize, include_else_branch: bool) -> Model {
         let mut graph = Graph::new();
@@ -1322,6 +2677,186 @@ mod tests {
         assert_eq!(violations[0].rule_id, rule_id);
         assert_eq!(violations[0].severity, Severity::Error);
         assert_eq!(violations[0].location, location);
+    }
+
+    fn retained_model(mut proto: ModelProto) -> Model {
+        proto.ir_version = 13;
+        if proto.opset_import.is_empty() {
+            proto.opset_import.push(OperatorSetIdProto {
+                domain: String::new(),
+                version: 24,
+            });
+        }
+        if proto.graph.is_none() {
+            proto.graph = Some(GraphProto {
+                name: "graph".into(),
+                ..Default::default()
+            });
+        }
+        Model::from_proto(proto).unwrap()
+    }
+
+    #[test]
+    fn metadata_rule_rejects_duplicate_keys() {
+        let model = retained_model(ModelProto {
+            metadata_props: vec![
+                StringStringEntryProto {
+                    key: "owner".into(),
+                    value: "one".into(),
+                },
+                StringStringEntryProto {
+                    key: "owner".into(),
+                    value: "two".into(),
+                },
+            ],
+            ..Default::default()
+        });
+        let violations = MetadataKeysUniqueRule.check(&model, &ValidationContext::default());
+        assert_eq!(violations.len(), 1);
+        assert!(violations[0].message.contains("duplicate key 'owner'"));
+    }
+
+    #[test]
+    fn attribute_rule_checks_discriminator_union_and_references() {
+        let location = ViolationLocation::Model;
+        let mut violations = Vec::new();
+        check_attribute_proto(
+            &AttributeProto {
+                name: "weight".into(),
+                r#type: attribute_proto::AttributeType::Tensor as i32,
+                i: 7,
+                ..Default::default()
+            },
+            location.clone(),
+            "test",
+            &mut violations,
+        );
+        assert_eq!(violations.len(), 2, "{violations:?}");
+
+        violations.clear();
+        check_attribute_proto(
+            &AttributeProto {
+                name: "alpha".into(),
+                ref_attr_name: "alpha".into(),
+                r#type: attribute_proto::AttributeType::Float as i32,
+                ..Default::default()
+            },
+            location,
+            "test",
+            &mut violations,
+        );
+        assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    #[test]
+    fn type_rule_accepts_opaque_and_rejects_invalid_containers() {
+        let mut violations = Vec::new();
+        check_type_proto(
+            &TypeProto {
+                value: Some(type_proto::Value::OpaqueType(type_proto::Opaque {
+                    domain: "example".into(),
+                    name: "State".into(),
+                })),
+                ..Default::default()
+            },
+            ViolationLocation::Model,
+            "test",
+            &mut violations,
+        );
+        assert!(violations.is_empty());
+
+        check_type_proto(
+            &TypeProto {
+                value: Some(type_proto::Value::MapType(Box::new(type_proto::Map {
+                    key_type: tensor_proto::DataType::Float as i32,
+                    value_type: None,
+                }))),
+                ..Default::default()
+            },
+            ViolationLocation::Model,
+            "test",
+            &mut violations,
+        );
+        assert_eq!(violations.len(), 2, "{violations:?}");
+    }
+
+    #[test]
+    fn tensor_payload_rule_checks_sizes_and_external_offsets() {
+        let mut violations = Vec::new();
+        check_tensor_payload(
+            &TensorProto {
+                dims: vec![2],
+                data_type: tensor_proto::DataType::Float as i32,
+                raw_data: vec![0; 4],
+                name: "short".into(),
+                ..Default::default()
+            },
+            "test",
+            &mut violations,
+        );
+        assert_eq!(violations.len(), 1);
+        assert!(violations[0].message.contains("8 are required"));
+
+        violations.clear();
+        check_tensor_payload(
+            &TensorProto {
+                dims: vec![1],
+                data_type: tensor_proto::DataType::Float as i32,
+                data_location: tensor_proto::DataLocation::External as i32,
+                external_data: vec![
+                    StringStringEntryProto {
+                        key: "location".into(),
+                        value: "weights.bin".into(),
+                    },
+                    StringStringEntryProto {
+                        key: "offset".into(),
+                        value: usize::MAX.to_string(),
+                    },
+                    StringStringEntryProto {
+                        key: "length".into(),
+                        value: "1".into(),
+                    },
+                ],
+                ..Default::default()
+            },
+            "test",
+            &mut violations,
+        );
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.message.contains("offset + length overflows"))
+        );
+    }
+
+    #[test]
+    fn sparse_tensor_rule_checks_order_and_bounds() {
+        let sparse = SparseTensorProto {
+            values: Some(TensorProto {
+                dims: vec![2],
+                data_type: tensor_proto::DataType::Float as i32,
+                float_data: vec![1.0, 2.0],
+                name: "sparse".into(),
+                ..Default::default()
+            }),
+            indices: Some(TensorProto {
+                dims: vec![2],
+                data_type: tensor_proto::DataType::Int64 as i32,
+                int64_data: vec![1, 1],
+                ..Default::default()
+            }),
+            dims: vec![2, 2],
+        };
+        let mut violations = Vec::new();
+        check_sparse_tensor(&sparse, true, "test", &mut violations);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(violations[0].message.contains("strictly increasing"));
+
+        let mut valid = sparse;
+        valid.indices.as_mut().unwrap().int64_data = vec![0, 3];
+        violations.clear();
+        check_sparse_tensor(&valid, true, "test", &mut violations);
+        assert!(violations.is_empty(), "{violations:?}");
     }
 
     #[test]
@@ -1551,6 +3086,35 @@ mod tests {
             "{violations:?}"
         );
         assert_eq!(violations.len(), 2);
+    }
+
+    #[test]
+    fn concrete_schema_input_type_is_enforced() {
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 24);
+        let data = graph.create_named_value("data", DataType::Float32, static_shape([2]));
+        let shape = graph.create_named_value("shape", DataType::Float32, static_shape([1]));
+        let output = graph.create_named_value("output", DataType::Float32, static_shape([2]));
+        graph.add_input(data);
+        graph.add_input(shape);
+        graph.insert_node(Node::new(
+            NodeId(0),
+            "Reshape",
+            vec![Some(data), Some(shape)],
+            vec![output],
+        ));
+        graph.add_output(output);
+        let mut model = Model::new(graph);
+        let violations = TypeConstraintSatisfiedRule.check(&model, &ValidationContext::default());
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(violations[0].message.contains("tensor(int64)"));
+
+        model.graph.value_mut(shape).dtype = DataType::Int64;
+        assert!(
+            TypeConstraintSatisfiedRule
+                .check(&model, &ValidationContext::default())
+                .is_empty()
+        );
     }
 
     #[test]

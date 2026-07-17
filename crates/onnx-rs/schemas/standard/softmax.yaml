@@ -1,0 +1,13 @@
+domain: ""
+name: Softmax
+since_version: 13
+doc: Normalized exponential along an axis.
+attributes:
+  - { name: axis, type: int, default: -1 }
+inputs:
+  - { name: input, type_str: T }
+outputs:
+  - { name: output, type_str: T }
+type_constraints:
+  - type_param: T
+    allowed: [float16, float32, float64, bfloat16]

@@ -39,9 +39,9 @@
 //! fields outside the graph syntax. The parsed DSL is authoritative for every
 //! field it represents, while the explicit extension preserves the remainder.
 //!
-//! Deferred to later waves (see `// FOLLOW-UP` markers): the remaining checker
-//! rule set (§8.2), custom-op registration (§11), and
-//! Python bindings (§12).
+//! Deferred to later waves (see `// FOLLOW-UP` markers): the complete operator
+//! catalog, remaining function/IR-gate checker rules, custom-op registration
+//! (§11), and Python bindings (§12). Training semantics are out of scope.
 //!
 //! ## Example
 //!
@@ -71,7 +71,7 @@ pub mod version;
 pub use error::{Error, Result};
 pub use model::{
     DeviceConfigurationProto, IntIntListEntryProto, Model, NodeDeviceConfigurationProto,
-    ShardedDimProto, ShardingSpecProto, SimpleShardedDimProto, load_model, save_model,
+    OpaqueProto, ShardedDimProto, ShardingSpecProto, SimpleShardedDimProto, load_model, save_model,
     simple_sharded_dim_proto,
 };
 

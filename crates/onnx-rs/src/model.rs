@@ -40,6 +40,9 @@ pub use onnx_runtime_loader::proto::onnx::{
     ShardingSpecProto, SimpleShardedDimProto, simple_sharded_dim_proto,
 };
 
+/// ONNX-ML opaque type payload (`TypeProto.opaque_type`, field 7).
+pub type OpaqueProto = onnx_runtime_loader::proto::onnx::type_proto::Opaque;
+
 /// An owned ONNX model: the shared-IR [`Graph`] plus the model-level metadata
 /// and (optionally) the live weight store backing external initializers.
 ///

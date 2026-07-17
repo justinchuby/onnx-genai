@@ -1,8 +1,8 @@
 //! Declarative operator schemas and an opset-aware registry (ONNX_RS §7).
 //!
 //! Schemas are authored as YAML and loaded into owned Rust values. The built-in
-//! registry embeds a deliberately small starter set; future waves can expand the
-//! YAML catalogue without changing the registry API.
+//! registry embeds high-value standard operators and can expand the YAML
+//! catalogue without changing the registry API.
 
 use std::collections::HashMap;
 
@@ -351,9 +351,23 @@ const BUILTIN_YAML: &[&str] = &[
     include_str!("../../schemas/standard/mul.yaml"),
     include_str!("../../schemas/standard/identity.yaml"),
     include_str!("../../schemas/standard/if.yaml"),
+    include_str!("../../schemas/standard/softmax.yaml"),
+    include_str!("../../schemas/standard/layer_normalization.yaml"),
+    include_str!("../../schemas/standard/gather.yaml"),
+    include_str!("../../schemas/standard/reshape_v14.yaml"),
+    include_str!("../../schemas/standard/reshape_v19.yaml"),
+    include_str!("../../schemas/standard/reshape_v21.yaml"),
+    include_str!("../../schemas/standard/reshape_v23.yaml"),
+    include_str!("../../schemas/standard/reshape.yaml"),
+    include_str!("../../schemas/standard/transpose_v13.yaml"),
+    include_str!("../../schemas/standard/transpose_v21.yaml"),
+    include_str!("../../schemas/standard/transpose_v23.yaml"),
+    include_str!("../../schemas/standard/transpose.yaml"),
+    include_str!("../../schemas/standard/concat.yaml"),
+    include_str!("../../schemas/standard/slice.yaml"),
 ];
 
-// FOLLOW-UP §7.4: bootstrap the full YAML catalogue from onnx.defs.
+// FOLLOW-UP §7.4: complete the standard and ONNX-ML YAML catalogues.
 
 mod data_types {
     use onnx_runtime_ir::DataType;
@@ -542,9 +556,171 @@ type_constraints:
     fn builtins_contain_expected_common_ops() {
         let registry = SchemaRegistry::builtins();
         for name in [
-            "MatMul", "Gemm", "Add", "Relu", "Conv", "Mul", "Identity", "If",
+            "MatMul",
+            "Gemm",
+            "Add",
+            "Relu",
+            "Conv",
+            "Mul",
+            "Identity",
+            "If",
+            "Softmax",
+            "LayerNormalization",
+            "Gather",
+            "Reshape",
+            "Transpose",
+            "Concat",
+            "Slice",
         ] {
-            assert!(registry.lookup(name, "", 21).is_some(), "{name}");
+            assert!(registry.lookup(name, "", 24).is_some(), "{name}");
         }
+    }
+
+    #[test]
+    fn softmax_schema_matches_opset_13() {
+        let schema = SchemaRegistry::builtins()
+            .lookup("Softmax", "", 24)
+            .unwrap()
+            .clone();
+        assert_eq!(
+            (
+                schema.since_version,
+                schema.inputs.len(),
+                schema.outputs.len()
+            ),
+            (13, 1, 1)
+        );
+        assert_eq!(
+            schema.attributes[0].default,
+            Some(AttributeDefault::Int(-1))
+        );
+    }
+
+    #[test]
+    fn layer_normalization_schema_matches_opset_17() {
+        let registry = SchemaRegistry::builtins();
+        let schema = registry.lookup("LayerNormalization", "", 24).unwrap();
+        assert_eq!(
+            (
+                schema.since_version,
+                schema.inputs.len(),
+                schema.outputs.len()
+            ),
+            (17, 3, 3)
+        );
+        assert!(schema.inputs[2].optional);
+        assert!(schema.outputs[1].optional && schema.outputs[2].optional);
+        assert_eq!(schema.type_constraints.len(), 2);
+    }
+
+    #[test]
+    fn gather_schema_matches_opset_13() {
+        let registry = SchemaRegistry::builtins();
+        let schema = registry.lookup("Gather", "", 24).unwrap();
+        assert_eq!(
+            (
+                schema.since_version,
+                schema.inputs.len(),
+                schema.outputs.len()
+            ),
+            (13, 2, 1)
+        );
+        assert_eq!(schema.inputs[1].type_str, "Tind");
+        assert_eq!(
+            schema.type_constraints[1].allowed,
+            [DataType::Int32, DataType::Int64]
+        );
+    }
+
+    #[test]
+    fn reshape_schema_matches_opset_24() {
+        let registry = SchemaRegistry::builtins();
+        assert_eq!(
+            registry.lookup("Reshape", "", 18).unwrap().since_version,
+            14
+        );
+        assert_eq!(
+            registry.lookup("Reshape", "", 19).unwrap().since_version,
+            19
+        );
+        assert_eq!(
+            registry.lookup("Reshape", "", 21).unwrap().since_version,
+            21
+        );
+        assert_eq!(
+            registry.lookup("Reshape", "", 23).unwrap().since_version,
+            23
+        );
+        let schema = registry.lookup("Reshape", "", 24).unwrap();
+        assert_eq!(
+            (
+                schema.since_version,
+                schema.inputs.len(),
+                schema.outputs.len()
+            ),
+            (24, 2, 1)
+        );
+        assert_eq!(schema.inputs[1].type_str, "tensor(int64)");
+        assert_eq!(schema.attributes[0].name, "allowzero");
+    }
+
+    #[test]
+    fn transpose_schema_matches_opset_24() {
+        let registry = SchemaRegistry::builtins();
+        assert_eq!(
+            registry.lookup("Transpose", "", 20).unwrap().since_version,
+            13
+        );
+        assert_eq!(
+            registry.lookup("Transpose", "", 21).unwrap().since_version,
+            21
+        );
+        assert_eq!(
+            registry.lookup("Transpose", "", 23).unwrap().since_version,
+            23
+        );
+        let schema = registry.lookup("Transpose", "", 24).unwrap();
+        assert_eq!(
+            (
+                schema.since_version,
+                schema.inputs.len(),
+                schema.outputs.len()
+            ),
+            (24, 1, 1)
+        );
+        assert_eq!(schema.attributes[0].attr_type, AttributeType::Ints);
+    }
+
+    #[test]
+    fn concat_schema_matches_opset_13() {
+        let registry = SchemaRegistry::builtins();
+        let schema = registry.lookup("Concat", "", 24).unwrap();
+        assert_eq!(
+            (
+                schema.since_version,
+                schema.inputs.len(),
+                schema.outputs.len()
+            ),
+            (13, 1, 1)
+        );
+        assert!(schema.inputs[0].variadic);
+        assert_eq!(schema.inputs[0].min_arity, 1);
+        assert!(schema.attributes[0].required);
+    }
+
+    #[test]
+    fn slice_schema_matches_opset_13() {
+        let registry = SchemaRegistry::builtins();
+        let schema = registry.lookup("Slice", "", 24).unwrap();
+        assert_eq!(
+            (
+                schema.since_version,
+                schema.inputs.len(),
+                schema.outputs.len()
+            ),
+            (13, 5, 1)
+        );
+        assert!(!schema.inputs[2].optional);
+        assert!(schema.inputs[3].optional && schema.inputs[4].optional);
     }
 }

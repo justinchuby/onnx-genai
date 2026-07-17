@@ -14,10 +14,11 @@
 mod rules;
 
 pub use rules::{
-    DuplicateValueNameRule, GraphAcyclicRule, InitializerTypeMatchesDeclaredRule,
-    InputOutputDeclaredRule, IrVersionSupportedRule, MissingOpsetImportRule,
-    MultiDeviceConfigurationRule, NoUnconnectedNodesRule, SchemaNodeConformsRule,
-    TypeConstraintSatisfiedRule,
+    AttributeProtoValidityRule, DuplicateValueNameRule, GraphAcyclicRule,
+    InitializerTypeMatchesDeclaredRule, InputOutputDeclaredRule, IrVersionSupportedRule,
+    MetadataKeysUniqueRule, MissingOpsetImportRule, MultiDeviceConfigurationRule,
+    NoUnconnectedNodesRule, ProtoTypeValidityRule, SchemaNodeConformsRule,
+    SparseTensorValidityRule, TensorPayloadValidityRule, TypeConstraintSatisfiedRule,
 };
 
 use crate::model::Model;
@@ -155,6 +156,11 @@ impl OnnxChecker {
         checker.add_rule(TypeConstraintSatisfiedRule);
         checker.add_rule(InitializerTypeMatchesDeclaredRule);
         checker.add_rule(IrVersionSupportedRule);
+        checker.add_rule(MetadataKeysUniqueRule);
+        checker.add_rule(AttributeProtoValidityRule);
+        checker.add_rule(ProtoTypeValidityRule);
+        checker.add_rule(TensorPayloadValidityRule);
+        checker.add_rule(SparseTensorValidityRule);
         checker.add_rule(MultiDeviceConfigurationRule);
         checker
     }
@@ -273,6 +279,11 @@ mod tests {
         assert!(ids.contains(&"schema.type_constraint_satisfied"));
         assert!(ids.contains(&"type.initializer_matches_declared"));
         assert!(ids.contains(&"ir.version_supported"));
+        assert!(ids.contains(&"proto.metadata_keys_unique"));
+        assert!(ids.contains(&"proto.attribute_valid"));
+        assert!(ids.contains(&"proto.type_valid"));
+        assert!(ids.contains(&"proto.tensor_payload_valid"));
+        assert!(ids.contains(&"proto.sparse_tensor_valid"));
         assert!(ids.contains(&"multidevice.configuration_valid"));
     }
 

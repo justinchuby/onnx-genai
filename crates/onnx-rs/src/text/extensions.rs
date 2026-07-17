@@ -388,6 +388,7 @@ fn is_unrepresented_container(value: &type_proto::Value) -> bool {
         type_proto::Value::SequenceType(_)
             | type_proto::Value::MapType(_)
             | type_proto::Value::OptionalType(_)
+            | type_proto::Value::OpaqueType(_)
     )
 }
 
