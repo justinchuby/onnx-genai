@@ -781,17 +781,24 @@ impl ValidationRule for AttributeProtoValidityRule {
         };
         let mut violations = Vec::new();
         if let Some(graph) = &proto.graph {
-            check_graph_attributes(graph, self.id(), &mut violations);
+            check_graph_attributes(graph, proto.ir_version, self.id(), &mut violations);
         }
         for function in &proto.functions {
             check_attribute_list(
                 &function.attribute_proto,
                 ViolationLocation::Model,
+                proto.ir_version,
                 self.id(),
                 &mut violations,
             );
             for node in &function.node {
-                check_node_attributes_proto(node, &function.name, self.id(), &mut violations);
+                check_node_attributes_proto(
+                    node,
+                    &function.name,
+                    proto.ir_version,
+                    self.id(),
+                    &mut violations,
+                );
             }
         }
         violations
@@ -915,15 +922,21 @@ impl ValidationRule for SparseTensorValidityRule {
     }
 }
 
-fn check_graph_attributes(graph: &GraphProto, rule_id: &str, violations: &mut Vec<Violation>) {
+fn check_graph_attributes(
+    graph: &GraphProto,
+    ir_version: i64,
+    rule_id: &str,
+    violations: &mut Vec<Violation>,
+) {
     for node in &graph.node {
-        check_node_attributes_proto(node, &graph.name, rule_id, violations);
+        check_node_attributes_proto(node, &graph.name, ir_version, rule_id, violations);
     }
 }
 
 fn check_node_attributes_proto(
     node: &NodeProto,
     graph_name: &str,
+    ir_version: i64,
     rule_id: &str,
     violations: &mut Vec<Violation>,
 ) {
@@ -943,13 +956,19 @@ fn check_node_attributes_proto(
             location: location.clone(),
         });
     }
-    check_attribute_list(&node.attribute, location.clone(), rule_id, violations);
+    check_attribute_list(
+        &node.attribute,
+        location.clone(),
+        ir_version,
+        rule_id,
+        violations,
+    );
     for attribute in &node.attribute {
         if let Some(graph) = &attribute.g {
-            check_graph_attributes(graph, rule_id, violations);
+            check_graph_attributes(graph, ir_version, rule_id, violations);
         }
         for graph in &attribute.graphs {
-            check_graph_attributes(graph, rule_id, violations);
+            check_graph_attributes(graph, ir_version, rule_id, violations);
         }
     }
 }
@@ -957,6 +976,7 @@ fn check_node_attributes_proto(
 fn check_attribute_list(
     attributes: &[AttributeProto],
     location: ViolationLocation,
+    ir_version: i64,
     rule_id: &str,
     violations: &mut Vec<Violation>,
 ) {
@@ -977,20 +997,21 @@ fn check_attribute_list(
                 location: location.clone(),
             });
         }
-        check_attribute_proto(attribute, location.clone(), rule_id, violations);
+        check_attribute_proto(attribute, location.clone(), ir_version, rule_id, violations);
     }
 }
 
 fn check_attribute_proto(
     attribute: &AttributeProto,
     location: ViolationLocation,
+    ir_version: i64,
     rule_id: &str,
     violations: &mut Vec<Violation>,
 ) {
-    let Some(expected) = attribute_proto::AttributeType::try_from(attribute.r#type)
+    let expected = attribute_proto::AttributeType::try_from(attribute.r#type)
         .ok()
-        .filter(|value| *value != attribute_proto::AttributeType::Undefined)
-    else {
+        .filter(|value| *value != attribute_proto::AttributeType::Undefined);
+    if ir_version >= 2 && expected.is_none() {
         violations.push(Violation {
             rule_id: rule_id.to_string(),
             severity: Severity::Error,
@@ -1001,7 +1022,7 @@ fn check_attribute_proto(
             location,
         });
         return;
-    };
+    }
     let populated = [
         (attribute.f != 0.0, attribute_proto::AttributeType::Float),
         (attribute.i != 0, attribute_proto::AttributeType::Int),
@@ -1068,34 +1089,36 @@ fn check_attribute_proto(
         }
         return;
     }
-    if let Some(actual) = populated.iter().find(|&&actual| actual != expected) {
-        violations.push(Violation {
-            rule_id: rule_id.to_string(),
-            severity: Severity::Error,
-            message: format!(
-                "attribute '{}' discriminator {:?} conflicts with populated {:?} payload",
-                attribute.name, expected, actual
-            ),
-            location: location.clone(),
-        });
-    }
-    let required_message_missing = matches!(
-        expected,
-        attribute_proto::AttributeType::Tensor
-            | attribute_proto::AttributeType::Graph
-            | attribute_proto::AttributeType::SparseTensor
-            | attribute_proto::AttributeType::TypeProto
-    ) && !populated.contains(&expected);
-    if required_message_missing {
-        violations.push(Violation {
-            rule_id: rule_id.to_string(),
-            severity: Severity::Error,
-            message: format!(
-                "attribute '{}' discriminator {:?} requires its message payload",
-                attribute.name, expected
-            ),
-            location,
-        });
+    if let Some(expected) = expected {
+        if let Some(actual) = populated.iter().find(|&&actual| actual != expected) {
+            violations.push(Violation {
+                rule_id: rule_id.to_string(),
+                severity: Severity::Error,
+                message: format!(
+                    "attribute '{}' discriminator {:?} conflicts with populated {:?} payload",
+                    attribute.name, expected, actual
+                ),
+                location: location.clone(),
+            });
+        }
+        let required_message_missing = matches!(
+            expected,
+            attribute_proto::AttributeType::Tensor
+                | attribute_proto::AttributeType::Graph
+                | attribute_proto::AttributeType::SparseTensor
+                | attribute_proto::AttributeType::TypeProto
+        ) && !populated.contains(&expected);
+        if required_message_missing {
+            violations.push(Violation {
+                rule_id: rule_id.to_string(),
+                severity: Severity::Error,
+                message: format!(
+                    "attribute '{}' discriminator {:?} requires its message payload",
+                    attribute.name, expected
+                ),
+                location,
+            });
+        }
     }
 }
 
@@ -1294,10 +1317,10 @@ fn check_attribute_types(
     violations: &mut Vec<Violation>,
 ) {
     if let Some(value) = &attribute.tp {
-        check_type_proto(value, location.clone(), rule_id, violations);
+        check_type_proto(value, location.clone(), false, rule_id, violations);
     }
     for value in &attribute.type_protos {
-        check_type_proto(value, location.clone(), rule_id, violations);
+        check_type_proto(value, location.clone(), false, rule_id, violations);
     }
 }
 
@@ -1319,7 +1342,7 @@ fn check_value_type(
         });
     }
     match &value.r#type {
-        Some(r#type) => check_type_proto(r#type, location, rule_id, violations),
+        Some(r#type) => check_type_proto(r#type, location, require_type, rule_id, violations),
         None if require_type => violations.push(Violation {
             rule_id: rule_id.to_string(),
             severity: Severity::Error,
@@ -1333,6 +1356,7 @@ fn check_value_type(
 fn check_type_proto(
     value: &TypeProto,
     location: ViolationLocation,
+    require_shape: bool,
     rule_id: &str,
     violations: &mut Vec<Violation>,
 ) {
@@ -1350,6 +1374,7 @@ fn check_type_proto(
             check_tensor_type(
                 tensor.elem_type,
                 tensor.shape.as_ref(),
+                require_shape,
                 &invalid,
                 violations,
             );
@@ -1358,12 +1383,15 @@ fn check_type_proto(
             check_tensor_type(
                 tensor.elem_type,
                 tensor.shape.as_ref(),
+                require_shape,
                 &invalid,
                 violations,
             );
         }
         Some(type_proto::Value::SequenceType(sequence)) => match &sequence.elem_type {
-            Some(elem_type) => check_type_proto(elem_type, location.clone(), rule_id, violations),
+            Some(elem_type) => {
+                check_type_proto(elem_type, location.clone(), false, rule_id, violations)
+            }
             None => invalid(
                 "TypeProto.Sequence.elem_type must be present".into(),
                 violations,
@@ -1395,7 +1423,7 @@ fn check_type_proto(
             }
             match &map.value_type {
                 Some(value_type) => {
-                    check_type_proto(value_type, location.clone(), rule_id, violations)
+                    check_type_proto(value_type, location.clone(), false, rule_id, violations)
                 }
                 None => invalid(
                     "TypeProto.Map.value_type must be present".into(),
@@ -1418,7 +1446,7 @@ fn check_type_proto(
                         violations,
                     );
                 }
-                check_type_proto(elem_type, location.clone(), rule_id, violations);
+                check_type_proto(elem_type, location.clone(), false, rule_id, violations);
             }
             None => invalid(
                 "TypeProto.Optional.elem_type must be present".into(),
@@ -1432,6 +1460,7 @@ fn check_type_proto(
 fn check_tensor_type(
     elem_type: i32,
     shape: Option<&TensorShapeProto>,
+    require_shape: bool,
     invalid: &impl Fn(String, &mut Vec<Violation>),
     violations: &mut Vec<Violation>,
 ) {
@@ -1441,6 +1470,12 @@ fn check_tensor_type(
     {
         invalid(
             format!("tensor elem_type {elem_type} must be a defined ONNX dtype"),
+            violations,
+        );
+    }
+    if require_shape && shape.is_none() {
+        invalid(
+            "top-level tensor and sparse tensor types must declare a shape".into(),
             violations,
         );
     }
@@ -1813,15 +1848,15 @@ fn check_sparse_tensor(
         report("SparseTensorProto.values must be present".into());
         return;
     };
-    let Some(indices) = &sparse.indices else {
-        report("SparseTensorProto.indices must be present".into());
-        return;
-    };
     if require_name && values.name.is_empty() {
         report("sparse initializer values must have a non-empty name".into());
     }
+    if sparse.dims.is_empty() || sparse.dims.iter().any(|&dim| dim <= 0) {
+        report("SparseTensorProto must have positive rank and dimensions".into());
+        return;
+    }
     let Some(dense_count) = checked_numel(&sparse.dims) else {
-        report("SparseTensorProto dimensions must be non-negative and fit usize".into());
+        report("SparseTensorProto dimensions must fit usize".into());
         return;
     };
     if values.dims.len() != 1 {
@@ -1837,6 +1872,12 @@ fn check_sparse_tensor(
             "SparseTensorProto NNZ {nnz} exceeds dense element count {dense_count}"
         ));
     }
+    let Some(indices) = &sparse.indices else {
+        if nnz != 0 {
+            report("SparseTensorProto.indices must be present when NNZ is nonzero".into());
+        }
+        return;
+    };
     if indices.data_type != tensor_proto::DataType::Int64 as i32 {
         report("SparseTensorProto.indices must have INT64 dtype".into());
         return;
@@ -2728,6 +2769,7 @@ mod tests {
                 ..Default::default()
             },
             location.clone(),
+            13,
             "test",
             &mut violations,
         );
@@ -2742,10 +2784,39 @@ mod tests {
                 ..Default::default()
             },
             location,
+            13,
             "test",
             &mut violations,
         );
         assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    #[test]
+    fn attribute_type_is_required_starting_with_ir_v2() {
+        let attribute = AttributeProto {
+            name: "axis".into(),
+            i: 1,
+            ..Default::default()
+        };
+        let mut violations = Vec::new();
+        check_attribute_proto(
+            &attribute,
+            ViolationLocation::Model,
+            1,
+            "test",
+            &mut violations,
+        );
+        assert!(violations.is_empty(), "{violations:?}");
+
+        check_attribute_proto(
+            &attribute,
+            ViolationLocation::Model,
+            2,
+            "test",
+            &mut violations,
+        );
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(violations[0].message.contains("undefined discriminator"));
     }
 
     #[test]
@@ -2760,6 +2831,7 @@ mod tests {
                 ..Default::default()
             },
             ViolationLocation::Model,
+            false,
             "test",
             &mut violations,
         );
@@ -2774,10 +2846,55 @@ mod tests {
                 ..Default::default()
             },
             ViolationLocation::Model,
+            false,
             "test",
             &mut violations,
         );
         assert_eq!(violations.len(), 2, "{violations:?}");
+    }
+
+    #[test]
+    fn top_level_tensor_requires_shape_but_nested_tensor_does_not() {
+        let tensor_without_shape = TypeProto {
+            value: Some(type_proto::Value::TensorType(type_proto::Tensor {
+                elem_type: tensor_proto::DataType::Float as i32,
+                shape: None,
+            })),
+            ..Default::default()
+        };
+        let mut violations = Vec::new();
+        check_value_type(
+            &ValueInfoProto {
+                name: "input".into(),
+                r#type: Some(tensor_without_shape.clone()),
+                ..Default::default()
+            },
+            true,
+            "test",
+            &mut violations,
+        );
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(violations[0].message.contains("must declare a shape"));
+
+        violations.clear();
+        check_value_type(
+            &ValueInfoProto {
+                name: "sequence".into(),
+                r#type: Some(TypeProto {
+                    value: Some(type_proto::Value::SequenceType(Box::new(
+                        type_proto::Sequence {
+                            elem_type: Some(Box::new(tensor_without_shape)),
+                        },
+                    ))),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            true,
+            "test",
+            &mut violations,
+        );
+        assert!(violations.is_empty(), "{violations:?}");
     }
 
     #[test]
@@ -2857,6 +2974,60 @@ mod tests {
         violations.clear();
         check_sparse_tensor(&valid, true, "test", &mut violations);
         assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    #[test]
+    fn sparse_tensor_indices_are_optional_only_for_zero_nnz() {
+        let mut sparse = SparseTensorProto {
+            values: Some(TensorProto {
+                dims: vec![0],
+                data_type: tensor_proto::DataType::Float as i32,
+                name: "empty_sparse".into(),
+                ..Default::default()
+            }),
+            indices: None,
+            dims: vec![2, 3],
+        };
+        let mut violations = Vec::new();
+        check_sparse_tensor(&sparse, true, "test", &mut violations);
+        assert!(violations.is_empty(), "{violations:?}");
+
+        sparse.values.as_mut().unwrap().dims = vec![1];
+        check_sparse_tensor(&sparse, true, "test", &mut violations);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(violations[0].message.contains("when NNZ is nonzero"));
+    }
+
+    #[test]
+    fn sparse_tensor_requires_positive_rank_and_dimensions() {
+        let mut sparse = SparseTensorProto {
+            values: Some(TensorProto {
+                dims: vec![0],
+                data_type: tensor_proto::DataType::Float as i32,
+                name: "empty_sparse".into(),
+                ..Default::default()
+            }),
+            indices: None,
+            dims: Vec::new(),
+        };
+        let mut violations = Vec::new();
+        check_sparse_tensor(&sparse, true, "test", &mut violations);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0]
+                .message
+                .contains("positive rank and dimensions")
+        );
+
+        sparse.dims = vec![2, 0];
+        violations.clear();
+        check_sparse_tensor(&sparse, true, "test", &mut violations);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0]
+                .message
+                .contains("positive rank and dimensions")
+        );
     }
 
     #[test]
