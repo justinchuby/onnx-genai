@@ -74,11 +74,19 @@ impl InferenceRegistry {
             .filter_map(|&vid| graph.try_value(vid).map(|v| (vid, v.shape.clone())))
             .collect();
 
+        let mut child_scope = None;
+        let mut scope_sources_added = false;
+        let mut pending_scope_values = Vec::new();
+        let mut remaining_subgraph_nodes = graph
+            .subgraphs
+            .keys()
+            .map(|(owner, _)| *owner)
+            .collect::<HashSet<_>>()
+            .len();
+
         // Propagate in topological order.
         for nid in order {
             let node = graph.node(nid).clone();
-            let child_scope =
-                visible_scope(graph, &types, &shape_data, &imported_scope, &mut interner);
             let mut child_keys: Vec<_> = graph
                 .subgraphs
                 .keys()
@@ -87,18 +95,50 @@ impl InferenceRegistry {
                 .collect();
             child_keys.sort_by(|left, right| left.1.cmp(&right.1));
             let mut subgraph_results = HashMap::new();
-            for key in child_keys {
-                let subgraph =
-                    graph
-                        .subgraphs
-                        .get_mut(&key)
-                        .ok_or_else(|| ShapeInferError::Invalid {
-                            op: node.op_type.clone(),
-                            detail: format!("subgraph attribute `{}` disappeared", key.1),
-                        })?;
-                let result =
-                    self.infer_graph_scoped(subgraph, opset_imports, policy, &child_scope)?;
-                subgraph_results.insert(key.1, result);
+            if !child_keys.is_empty() {
+                let scope = child_scope.get_or_insert_with(|| imported_scope.clone());
+                if !scope_sources_added {
+                    let formal_inputs: HashSet<_> = graph.inputs.iter().copied().collect();
+                    let source_values: Vec<_> = graph
+                        .values
+                        .iter()
+                        .filter(|(vid, _)| {
+                            formal_inputs.contains(vid) || graph.initializers.contains_key(vid)
+                        })
+                        .map(|(vid, _)| vid)
+                        .collect();
+                    extend_visible_scope(
+                        graph,
+                        &types,
+                        &shape_data,
+                        scope,
+                        source_values,
+                        &mut interner,
+                    );
+                    scope_sources_added = true;
+                }
+                extend_visible_scope(
+                    graph,
+                    &types,
+                    &shape_data,
+                    scope,
+                    pending_scope_values.drain(..),
+                    &mut interner,
+                );
+
+                for key in child_keys {
+                    let subgraph =
+                        graph
+                            .subgraphs
+                            .get_mut(&key)
+                            .ok_or_else(|| ShapeInferError::Invalid {
+                                op: node.op_type.clone(),
+                                detail: format!("subgraph attribute `{}` disappeared", key.1),
+                            })?;
+                    let result = self.infer_graph_scoped(subgraph, opset_imports, policy, scope)?;
+                    subgraph_results.insert(key.1, result);
+                }
+                remaining_subgraph_nodes -= 1;
             }
 
             let inputs = gather_inputs(&node, &types, &shape_data);
@@ -117,6 +157,9 @@ impl InferenceRegistry {
                 {
                     shape_data.insert(*slot, sd);
                 }
+            }
+            if remaining_subgraph_nodes > 0 {
+                pending_scope_values.extend(node.outputs.iter().copied());
             }
         }
 
@@ -424,22 +467,18 @@ fn remap_dim_expr(
     DimExpr::symbol(child)
 }
 
-fn visible_scope(
+fn extend_visible_scope(
     graph: &Graph,
     types: &HashMap<ValueId, TypeInfo>,
     shape_data: &HashMap<ValueId, ShapeData>,
-    imported_scope: &ScopeBindings,
+    scope: &mut ScopeBindings,
+    values: impl IntoIterator<Item = ValueId>,
     interner: &mut SymbolInterner,
-) -> ScopeBindings {
-    let mut scope = imported_scope.clone();
-    let formal_inputs: HashSet<_> = graph.inputs.iter().copied().collect();
-    for (vid, value) in graph.values.iter() {
-        if value.producer.is_none()
-            && !formal_inputs.contains(&vid)
-            && !graph.initializers.contains_key(&vid)
-        {
+) {
+    for vid in values {
+        let Some(value) = graph.try_value(vid) else {
             continue;
-        }
+        };
         let Some(name) = value.name.as_ref() else {
             continue;
         };
@@ -464,7 +503,6 @@ fn visible_scope(
         });
         scope.insert(name.clone(), binding);
     }
-    scope
 }
 
 /// Assemble the per-input [`NodeIo`]s for a node, aligned with `node.inputs`.

@@ -79,6 +79,30 @@ fn captured_identity_branch(name: &str) -> Graph {
     branch
 }
 
+fn nested_captured_if_branch(value_name: &str, condition_name: &str) -> Graph {
+    let mut branch = Graph::new();
+    let condition = branch.create_named_value(condition_name, DataType::Bool, Shape::new());
+    branch.mark_value_type_unknown(condition);
+    branch.mark_value_shape_unknown(condition);
+    let capture = branch.create_named_value(value_name, DataType::Float32, Shape::new());
+    branch.mark_value_type_unknown(capture);
+    branch.mark_value_shape_unknown(capture);
+    let output = branch.create_named_value("nested_output", DataType::Float32, Shape::new());
+    branch.mark_value_type_unknown(output);
+    branch.mark_value_shape_unknown(output);
+    let if_node = branch.insert_node(node(0, "If", vec![Some(condition)], vec![output]));
+    branch.subgraphs.insert(
+        (if_node, "then_branch".into()),
+        captured_identity_branch(value_name),
+    );
+    branch.subgraphs.insert(
+        (if_node, "else_branch".into()),
+        captured_identity_branch(value_name),
+    );
+    branch.add_output(output);
+    branch
+}
+
 fn identity_branch(shape: Shape) -> Graph {
     let mut branch = Graph::new();
     let input = branch.create_named_value("local", DataType::Float32, shape);
@@ -151,6 +175,64 @@ fn if_branch_inference_binds_lexically_captured_outer_value() {
         graph.value(output).shape,
         vec![Dim::Static(2), Dim::Static(3)]
     );
+}
+
+#[test]
+fn nested_if_captures_prior_outer_node_output() {
+    let mut graph = Graph::new();
+    let condition = graph.create_named_value("condition", DataType::Bool, Shape::new());
+    graph.add_input(condition);
+    let source = graph.create_named_value(
+        "source",
+        DataType::Float16,
+        vec![Dim::Static(2), Dim::Static(3)],
+    );
+    graph.add_input(source);
+
+    let captured = graph.create_named_value("captured", DataType::Float32, Shape::new());
+    graph.mark_value_type_unknown(captured);
+    graph.mark_value_shape_unknown(captured);
+    graph.insert_node(node(0, "Identity", vec![Some(source)], vec![captured]));
+
+    let output = graph.create_named_value("output", DataType::Float32, Shape::new());
+    graph.mark_value_type_unknown(output);
+    graph.mark_value_shape_unknown(output);
+    let if_node = graph.insert_node(node(1, "If", vec![Some(condition)], vec![output]));
+    graph.subgraphs.insert(
+        (if_node, "then_branch".into()),
+        nested_captured_if_branch("captured", "condition"),
+    );
+    graph.subgraphs.insert(
+        (if_node, "else_branch".into()),
+        nested_captured_if_branch("captured", "condition"),
+    );
+    graph.add_output(output);
+    graph.opset_imports.insert(String::new(), 21);
+
+    let registry = InferenceRegistry::default_registry();
+    let opsets = graph.opset_imports.clone();
+    registry
+        .infer_graph(&mut graph, &opsets, MergePolicy::Permissive)
+        .expect("infer doubly nested If with lexical capture");
+
+    let expected_shape = vec![Dim::Static(2), Dim::Static(3)];
+    assert_eq!(graph.value(output).dtype, DataType::Float16);
+    assert_eq!(graph.value(output).shape, expected_shape);
+
+    for outer_attr in ["then_branch", "else_branch"] {
+        let outer_branch = &graph.subgraphs[&(if_node, outer_attr.into())];
+        let nested_if = NodeId(0);
+        let nested_output = outer_branch.outputs[0];
+        assert_eq!(outer_branch.value(nested_output).dtype, DataType::Float16);
+        assert_eq!(outer_branch.value(nested_output).shape, expected_shape);
+
+        for inner_attr in ["then_branch", "else_branch"] {
+            let inner_branch = &outer_branch.subgraphs[&(nested_if, inner_attr.into())];
+            let inner_output = inner_branch.outputs[0];
+            assert_eq!(inner_branch.value(inner_output).dtype, DataType::Float16);
+            assert_eq!(inner_branch.value(inner_output).shape, expected_shape);
+        }
+    }
 }
 
 #[test]
