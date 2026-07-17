@@ -378,6 +378,16 @@ impl Engine {
             return Self::from_native_model_directory(model_directory, config, &session_options);
         }
 
+        // Auto-enable CUDA graph capture for models that will run the shared-KV
+        // (SharedBuffer) decode path. Capturing the fixed-shape decode step
+        // removes per-kernel launch overhead and makes per-token cost flat
+        // across context length — the single largest CUDA decode speedup (on
+        // Qwen2.5-0.5B it lifts decode from ~150 to ~365 tok/s at 512 tokens).
+        // It is skipped for non-shared-KV models, where ORT cannot capture the
+        // graph, and always yields to an explicit `ONNX_GENAI_CUDA_GRAPH`.
+        let mut session_options = session_options;
+        maybe_enable_cuda_graph(&mut session_options, &model_directory);
+
         let environment = Environment::new("onnx-genai-engine")
             .map_err(|e| anyhow::anyhow!("Failed to create ORT environment: {}", e))?;
         let session = Session::new(
@@ -2091,6 +2101,47 @@ fn genai_config_compat_metadata(
         });
     onnx_genai_genai_config::inference_metadata_from_dir(model_dir, kv_native_dtype)
         .map_err(|e| anyhow::anyhow!("Failed to convert genai_config.json: {}", e))
+}
+
+/// Turn on CUDA graph capture when the model will run the shared-KV
+/// (SharedBuffer) decode path and the user has not overridden
+/// `ONNX_GENAI_CUDA_GRAPH`.
+///
+/// The decision is made from on-disk metadata *before* the session is created,
+/// because ORT's `enable_cuda_graph` provider option must be set at session
+/// construction. Enabling it for a non-shared-KV (growing rebind) model would
+/// only trip ORT's "cannot use the graph capture feature" path, so it is gated
+/// on shared-KV eligibility. An explicit `ONNX_GENAI_CUDA_GRAPH=0` is always
+/// honored; an explicit `=1` has already turned `graph_capture` on.
+fn maybe_enable_cuda_graph(options: &mut SessionOptions, model_directory: &ModelDirectory) {
+    let cfg = onnx_genai_runtime_config::runtime_config();
+    if !options.selects_cuda() || options.graph_capture || cfg.cuda_graph_explicit {
+        return;
+    }
+    if model_prefers_shared_kv_decode(model_directory) {
+        options.graph_capture = true;
+        tracing::info!(
+            "auto-enabling CUDA graph capture for the shared-KV GQA decode path (set ONNX_GENAI_CUDA_GRAPH=0 to disable)"
+        );
+    }
+}
+
+/// Whether the model at `model_directory` declares the shared-KV (SharedBuffer)
+/// decode contract, read from on-disk metadata without an ORT session.
+///
+/// Native `inference_metadata.yaml` takes precedence (it carries the KV dtype);
+/// otherwise an onnxruntime-genai `genai_config.json` is consulted for its
+/// `past_present_share_buffer` + GQA + max-length declaration.
+fn model_prefers_shared_kv_decode(model_directory: &ModelDirectory) -> bool {
+    if let Some(metadata_path) = &model_directory.metadata_path {
+        return onnx_genai_metadata::load_metadata(metadata_path)
+            .ok()
+            .and_then(|metadata| crate::decode::shared_kv_buffer_len_from_metadata(&metadata))
+            .is_some();
+    }
+    onnx_genai_genai_config::find_in_dir(&model_directory.root)
+        .and_then(|path| onnx_genai_genai_config::load(&path).ok())
+        .is_some_and(|config| config.shared_kv_buffer_supported())
 }
 
 fn read_f32_weights(path: &Path) -> anyhow::Result<Vec<f32>> {

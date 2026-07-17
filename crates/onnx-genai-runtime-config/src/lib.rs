@@ -62,6 +62,12 @@ pub struct RuntimeConfig {
     pub webgpu_graph_capture: bool,
     /// `ONNX_GENAI_CUDA_GRAPH` (`bool`, default: false): enables CUDA graph capture.
     pub cuda_graph: bool,
+    /// Whether `ONNX_GENAI_CUDA_GRAPH` was explicitly set in the environment.
+    ///
+    /// Lets callers distinguish "unset" (so they may auto-enable CUDA graph
+    /// capture for models that support it) from an explicit opt-out
+    /// (`ONNX_GENAI_CUDA_GRAPH=0`), which must always be honored.
+    pub cuda_graph_explicit: bool,
     /// `ONNX_GENAI_DEVICE_KV` (`bool`, default: false): opts the experimental WebGPU
     /// device-resident KV buffers in. CUDA device-resident KV is always on and does
     /// not require this flag.
@@ -145,6 +151,7 @@ impl RuntimeConfig {
             webgpu_validation: env_bool(&lookup, "ONNX_GENAI_WEBGPU_VALIDATION", false),
             webgpu_graph_capture: env_bool(&lookup, "ONNX_GENAI_WEBGPU_GRAPH_CAPTURE", false),
             cuda_graph: env_bool(&lookup, "ONNX_GENAI_CUDA_GRAPH", false),
+            cuda_graph_explicit: lookup("ONNX_GENAI_CUDA_GRAPH").is_some(),
             device_kv: env_bool(&lookup, "ONNX_GENAI_DEVICE_KV", false),
             shared_kv_present_binding: env_bool(
                 &lookup,
@@ -259,6 +266,7 @@ mod tests {
         assert!(!actual.webgpu_validation);
         assert!(!actual.webgpu_graph_capture);
         assert!(!actual.cuda_graph);
+        assert!(!actual.cuda_graph_explicit);
         assert!(!actual.device_kv);
         assert!(!actual.shared_kv_present_binding);
         assert_eq!(actual.metal_ep_lib, None);
@@ -305,6 +313,8 @@ mod tests {
         assert!(!actual.webgpu_validation);
         assert!(!actual.device_kv);
         assert!(!actual.cuda_graph);
+        // Explicit "no" still counts as an explicit opt-out.
+        assert!(actual.cuda_graph_explicit);
     }
 
     #[test]

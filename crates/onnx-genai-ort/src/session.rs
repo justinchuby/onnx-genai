@@ -84,7 +84,8 @@ impl SessionOptions {
             .any(|provider| matches!(provider, ExecutionProvider::WebGpu))
     }
 
-    fn selects_cuda(&self) -> bool {
+    /// Whether a CUDA execution provider is selected in these options.
+    pub fn selects_cuda(&self) -> bool {
         self.execution_providers
             .iter()
             .any(|provider| matches!(provider, ExecutionProvider::Cuda { .. }))
