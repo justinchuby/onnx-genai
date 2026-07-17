@@ -29,9 +29,9 @@ const ANON_SYMBOL_FLOOR: u32 = 0x8000_0000;
 impl InferenceRegistry {
     /// Infer shapes for every value in `graph`, in topological order.
     ///
-    /// Seeds the known types (graph inputs and initializers), runs each node's
-    /// rule to fill its outputs' types and shape-data, then writes the resolved
-    /// shapes back into the graph (lowering symbolic dimension expressions to IR
+    /// Seeds every explicitly known value type, runs each node's rule to fill or
+    /// refine its outputs' types and shape-data, then writes the resolved shapes
+    /// back into the graph (lowering symbolic dimension expressions to IR
     /// [`Dim`]s). Graph outputs are reconciled with their declared shapes under
     /// `policy`. Returns an [`InferenceReport`] of what resolved.
     ///
@@ -290,16 +290,17 @@ fn branch_output_is_resolved(branch: &Graph, output: ValueId, resolved: &HashSet
     resolved.contains(&output) && branch.try_value(output).is_some()
 }
 
-/// Seed the type (and shape-data) of every source value whose metadata is known.
+/// Seed every explicitly known value type, including intermediate `value_info`.
+///
+/// A producer rule can overwrite this seed with a freshly inferred type. If the
+/// rule cannot resolve its output, the declared metadata remains available to
+/// downstream consumers instead of being silently discarded.
 fn seed_sources(
     graph: &Graph,
     types: &mut HashMap<ValueId, TypeInfo>,
     shape_data: &mut HashMap<ValueId, ShapeData>,
 ) {
     for (vid, value) in graph.values.iter() {
-        if value.producer.is_some() {
-            continue;
-        }
         if !graph.value_type_is_known(vid) || !graph.value_shape_is_known(vid) {
             continue;
         }

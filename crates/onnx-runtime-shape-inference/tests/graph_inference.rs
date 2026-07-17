@@ -374,6 +374,53 @@ fn shape_data_chain_drives_reshape() {
     assert_eq!(out_shape[1], Dim::Static(512));
 }
 
+#[test]
+fn declared_intermediate_shape_drives_downstream_gather() {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 13);
+
+    let opaque_input = graph.create_named_value("opaque_input", DataType::Int64, Shape::new());
+    graph.add_input(opaque_input);
+    let indices = graph.create_named_value(
+        "indices",
+        DataType::Int64,
+        vec![Dim::Static(1), Dim::Static(8)],
+    );
+    graph.insert_node(node(
+        0,
+        "UnsupportedIndicesProducer",
+        vec![Some(opaque_input)],
+        vec![indices],
+    ));
+
+    let data = graph.create_named_value(
+        "data",
+        DataType::Float32,
+        vec![Dim::Static(512), Dim::Static(32)],
+    );
+    graph.add_input(data);
+    let output = graph.create_named_value("output", DataType::Float32, Shape::new());
+    graph.mark_value_shape_unknown(output);
+    graph.insert_node(node(
+        1,
+        "Gather",
+        vec![Some(data), Some(indices)],
+        vec![output],
+    ));
+    graph.add_output(output);
+
+    let registry = InferenceRegistry::default_registry();
+    let opsets = graph.opset_imports.clone();
+    registry
+        .infer_graph(&mut graph, &opsets, MergePolicy::Permissive)
+        .expect("infer Gather from declared intermediate value_info");
+
+    assert_eq!(
+        graph.value(output).shape,
+        vec![Dim::Static(1), Dim::Static(8), Dim::Static(32)]
+    );
+}
+
 /// A contrib fused norm with no intermediate value_info must still resolve all
 /// requested outputs so session setup can allocate them.
 #[test]
