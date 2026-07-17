@@ -1815,25 +1815,25 @@ Status: design approved; Phase 1 = mmap disk tier + active-expert CPU MoE access
 **What:** Shape inference seeds every value whose IR shape is marked known, including produced rank-0 tensors with an empty dimension list. Only values explicitly marked with `mark_value_shape_unknown` are treated as shape-absent; unresolved `If` tests must mark both branch and parent outputs unknown.
 **Why:** ONNX uses an empty present shape for a known rank-0 scalar, while an absent shape is unknown. Filtering produced empty shapes conflates these states and discards valid scalar metadata.
 
-## 2026-08-06 — Wave 7 source decisions
+## 2026-07-17 — Wave 7 source decisions
 
 #### Source: `roy-csa-p3.md`
 
-### 2026-08-06: Land ratio-128 CSA attention-compressor state first
+### 2026-07-17: Land ratio-128 CSA attention-compressor state first
 **By:** Roy
 **What:** Implement the frozen-v1 ratio-128 attention-compressor stream with persistent compressed records, `[B,128,2,D]` KV/score carry, block-boundary pooling, BF16→RMSNorm→block-start RoPE→hybrid FP8/BF16 finalization, and sink-aware f32 attention. Keep ratio-4 index state/top-k and MTP explicitly Unsupported.
 **Why:** Ratio-128 is the foundational non-overlapping state transition and can be validated independently across incremental decode boundaries without inventing the still-deferred ratio-4 selection or any MTP recurrence.
 
 #### Source: `sapper-onnxrs-r4.md`
 
-### 2026-08-06: Round-4 ONNX schema and function-checker slice
+### 2026-07-17: Round-4 ONNX schema and function-checker slice
 **By:** Sapper
 **What:** Added a 12-operator normalization/reduction/arg-reduction schema cluster with shape inference coverage, and advanced local-function call-site checking with exact arity plus required/default/undeclared attribute validation.
 **Why:** These operators are high-value for transformer and MoE graphs, reuse coherent official reduction semantics, and the call-site slice closes the most actionable structural gap without over-constraining optional default attributes.
 
 #### Source: `wallace-bert-gather.md`
 
-### 2026-08-06: Preserve declared intermediate value_info during shape re-inference
+### 2026-07-17: Preserve declared intermediate value_info during shape re-inference
 **By:** Wallace
 **What:** Whole-graph shape inference now seeds every explicitly known value type, including intermediate ONNX `value_info`, while allowing producer rules to overwrite those seeds when they resolve a fresher type.
 **Why:** The optimizer passes did not rewire BERT's Gather. The post-optimization re-inference discarded the declared `[1, 8]` shape of Gather indices `106` because its `Expand` producer could not be re-resolved through a dynamic Slice chain. Gather then treated the missing indices shape as scalar and overwrote output `108` from `[1, 8, 32]` to `[32]`, causing the validated kernel allocation mismatch. Preserving explicit intermediate metadata keeps optimized graphs reference-equivalent without weakening Gather validation.
