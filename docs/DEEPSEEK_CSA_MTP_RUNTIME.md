@@ -18,7 +18,7 @@
 Land the two missing features through separate, independently testable tracks:
 
 1. **CSA:** add a private, versioned
-   `com.github.onnxruntime.genai::CompressedSparseAttention` operator for the
+   `pkg.nxrt::CompressedSparseAttention` operator for the
    production path, plus a small `SparseKvGather` correctness/debug primitive.
    Keep learned projections in ordinary `MatMul`, `MatMulNBits`, or
    `BlockQuantizedMatMul` nodes; the custom op owns only temporal compression,
@@ -369,7 +369,7 @@ the existing loop, not a new speculative algorithm.
 Add:
 
 ```text
-domain: com.github.onnxruntime.genai
+domain: pkg.nxrt
 name:   SparseKvGather
 since:  1
 
@@ -405,7 +405,7 @@ helper without allocating `selected`.
 Add:
 
 ```text
-domain: com.github.onnxruntime.genai
+domain: pkg.nxrt
 name:   CompressedSparseAttention
 since:  1
 ```
@@ -999,7 +999,7 @@ Failure rules:
 
 | ID | Proposed decision | Rationale |
 |---|---|---|
-| CSA-1 | Use private domain `com.github.onnxruntime.genai`, version 1. | Matches `BlockQuantizedMatMul` incubation and permits explicit layout versioning. |
+| CSA-1 | Use private domain `pkg.nxrt`, version 1. | Matches `BlockQuantizedMatMul` incubation and permits explicit layout versioning. |
 | CSA-2 | Keep learned projections outside the CSA op. | Reuses existing quantized linear kernels and avoids coupling sparse attention to every weight format. |
 | CSA-3 | Add `SparseKvGather` as a correctness/reuse primitive, but fuse gather into production CSA. | Gives testable semantics without imposing a large intermediate on the fast path. |
 | CSA-4 | Do not emit the custom op for ratio 0. | Dense attention is the correct and simpler contract. |

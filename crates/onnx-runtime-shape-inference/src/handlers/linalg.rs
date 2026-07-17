@@ -424,7 +424,7 @@ pub fn register(reg: &mut InferenceRegistry) {
     reg.register("", "MatMul", 1, matmul);
     reg.register("", "Gemm", 1, gemm);
     reg.register(
-        "com.github.onnxruntime.genai",
+        "pkg.nxrt",
         "BlockQuantizedMatMul",
         1,
         quantized_matmul,

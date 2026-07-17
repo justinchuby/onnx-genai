@@ -754,7 +754,7 @@ fn collect_cuda_coverage_issues(
         if !ep.supports_op(node, &shapes, &layouts).is_supported() {
             let identity = format_node_identity(scope, node_id, node);
             if node.op_type == "BlockQuantizedMatMul"
-                && node.domain == "com.github.onnxruntime.genai"
+                && node.domain == "pkg.nxrt"
             {
                 issues.push(format!(
                     "{identity}: CUDA BlockQuantizedMatMul supports only M=1 decode, not M>1 or symbolic prefill"

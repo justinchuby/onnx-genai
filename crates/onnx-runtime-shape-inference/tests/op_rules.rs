@@ -219,7 +219,7 @@ fn assert_quantized_matmul_shapes(n: &Node, n_in: usize) {
 fn block_quantized_matmul_uses_n_and_preserves_leading_dims() {
     let n = quantized_matmul_node(
         "BlockQuantizedMatMul",
-        "com.github.onnxruntime.genai",
+        "pkg.nxrt",
         2,
         4864,
     );

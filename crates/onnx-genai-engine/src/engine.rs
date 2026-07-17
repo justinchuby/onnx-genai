@@ -2026,7 +2026,7 @@ pub(crate) fn model_requires_native_backend(model_path: &Path) -> anyhow::Result
 
 #[cfg(feature = "native-backend")]
 fn model_proto_requires_native_backend(model: &onnx_runtime_loader::proto::ModelProto) -> bool {
-    const DOMAIN: &str = "com.github.onnxruntime.genai";
+    const DOMAIN: &str = "pkg.nxrt";
     const OP_TYPE: &str = "BlockQuantizedMatMul";
     const OPSET_VERSION: i64 = 1;
 
@@ -2280,12 +2280,12 @@ mod tests {
         assert!(!model_proto_requires_native_backend(&model));
 
         model.graph.as_mut().unwrap().node.push(NodeProto {
-            domain: "com.github.onnxruntime.genai".to_string(),
+            domain: "pkg.nxrt".to_string(),
             op_type: "BlockQuantizedMatMul".to_string(),
             ..NodeProto::default()
         });
         model.opset_import.push(OperatorSetIdProto {
-            domain: "com.github.onnxruntime.genai".to_string(),
+            domain: "pkg.nxrt".to_string(),
             version: 1,
         });
         assert!(model_proto_requires_native_backend(&model));
@@ -2293,7 +2293,7 @@ mod tests {
         model.graph.as_mut().unwrap().node[0].domain = "example.wrong.domain".to_string();
         assert!(!model_proto_requires_native_backend(&model));
 
-        model.graph.as_mut().unwrap().node[0].domain = "com.github.onnxruntime.genai".to_string();
+        model.graph.as_mut().unwrap().node[0].domain = "pkg.nxrt".to_string();
         model.opset_import[0].version = 2;
         assert!(!model_proto_requires_native_backend(&model));
     }

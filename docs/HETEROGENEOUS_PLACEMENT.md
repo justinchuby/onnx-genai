@@ -190,7 +190,7 @@ subgraphs are partitioned recursively using the parent model's opset imports.
 
 ### 4.4 Quantized prefill versus decode
 
-For `com.github.onnxruntime.genai::BlockQuantizedMatMul`:
+For `pkg.nxrt::BlockQuantizedMatMul`:
 
 ```text
 M = product(activation.shape[..rank-1])

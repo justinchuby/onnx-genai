@@ -8,7 +8,7 @@ from onnxscript import ir
 import nxrt
 
 
-DOMAIN = "com.github.onnxruntime.genai"
+DOMAIN = "pkg.nxrt"
 
 
 def _value(name: str, dtype: ir.DataType, shape: list[int]) -> ir.Value:

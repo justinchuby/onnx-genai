@@ -18,7 +18,7 @@ use super::{check_arity, to_dense_bytes, to_dense_f32, write_dense_f32};
 use crate::strided::numel;
 
 const OP: &str = "BlockQuantizedMatMul";
-const DOMAIN: &str = "com.github.onnxruntime.genai";
+const DOMAIN: &str = "pkg.nxrt";
 const LAYOUT_VERSION: i64 = 1;
 
 const MXFP4_QK: usize = 32;

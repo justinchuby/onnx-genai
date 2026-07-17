@@ -37,12 +37,12 @@ all temporary runtime source changes.
 
 ## Exported graph
 
-- 144 `com.github.onnxruntime.genai::BlockQuantizedMatMul` nodes
+- 144 `pkg.nxrt::BlockQuantizedMatMul` nodes
 - Formats: 120 `iq4_nl`, 24 `iq4_xs`
 - Every node has `block_layout_version=1` and positive `K`/`N`
 - Remaining 24 `Q5_1` value projections are requantized to 4-bit
   `com.microsoft::MatMulNBits`
-- Custom opset import: `com.github.onnxruntime.genai` version 1
+- Custom opset import: `pkg.nxrt` version 1
 
 ## Runtime result
 

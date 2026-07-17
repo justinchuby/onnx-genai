@@ -616,12 +616,12 @@ mod tests {
         std::fs::create_dir_all(&root)?;
         let model = ModelProto {
             opset_import: vec![OperatorSetIdProto {
-                domain: "com.github.onnxruntime.genai".to_string(),
+                domain: "pkg.nxrt".to_string(),
                 version: 1,
             }],
             graph: Some(GraphProto {
                 node: vec![NodeProto {
-                    domain: "com.github.onnxruntime.genai".to_string(),
+                    domain: "pkg.nxrt".to_string(),
                     op_type: "BlockQuantizedMatMul".to_string(),
                     ..NodeProto::default()
                 }],

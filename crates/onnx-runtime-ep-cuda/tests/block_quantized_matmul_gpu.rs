@@ -9,7 +9,7 @@ use onnx_runtime_ir::{
 };
 use onnx_runtime_loader::Model;
 
-const DOMAIN: &str = "com.github.onnxruntime.genai";
+const DOMAIN: &str = "pkg.nxrt";
 
 #[derive(Clone)]
 struct HostTensor {

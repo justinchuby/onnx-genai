@@ -220,7 +220,7 @@ oneDNN f32 GEMM after dequantization; decode ultimately needs a direct packed
 Incubate a private op, then propose it upstream:
 
 ```text
-com.github.onnxruntime.genai::BlockQuantizedMatMul(
+pkg.nxrt::BlockQuantizedMatMul(
     A, packed_B, optional_bias
 ) -> Y
 
@@ -249,7 +249,7 @@ indices are semantic formats, not merely bit widths. A future schema can add
 standardized layouts without changing the meaning of old models.
 
 The CPU v1 implementation now registers this op in
-`com.github.onnxruntime.genai`, accepts f32 `A`, native uint8 `packed_B`, and an
+`pkg.nxrt`, accepts f32 `A`, native uint8 `packed_B`, and an
 optional f32 bias, then dequantizes to f32 and uses the shared CPU GEMM. MXFP4
 and IQ4_NL, IQ4_XS, IQ3_S, IQ3_XXS, IQ2_S, IQ2_XS, IQ2_XXS, IQ1_S, and IQ1_M
 are implemented using the pinned llama.cpp layouts and dequantization math

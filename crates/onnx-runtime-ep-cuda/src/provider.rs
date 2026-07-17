@@ -125,7 +125,7 @@ impl ExecutionProvider for CudaExecutionProvider {
             return KernelMatch::Unsupported;
         }
         if op.op_type == "BlockQuantizedMatMul"
-            && op.domain == "com.github.onnxruntime.genai"
+            && op.domain == "pkg.nxrt"
             && !crate::kernels::block_quantized_matmul::supports_node(op, shapes)
         {
             return KernelMatch::Unsupported;

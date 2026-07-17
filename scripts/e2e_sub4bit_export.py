@@ -14,7 +14,7 @@ from pathlib import Path
 REPO_ID = "bartowski/Qwen2.5-0.5B-Instruct-GGUF"
 GGUF_FILENAME = "Qwen2.5-0.5B-Instruct-IQ4_XS.gguf"
 TOKENIZER_ID = "Qwen/Qwen2.5-0.5B-Instruct"
-CUSTOM_DOMAIN = "com.github.onnxruntime.genai"
+CUSTOM_DOMAIN = "pkg.nxrt"
 
 
 def parse_args() -> argparse.Namespace:

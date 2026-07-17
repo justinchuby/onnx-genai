@@ -189,7 +189,7 @@ pub fn build_cuda_registry(runtime: Arc<CudaRuntime>) -> OpRegistry {
         }),
     );
     reg.register(
-        OpKey::new("BlockQuantizedMatMul", "com.github.onnxruntime.genai", 1),
+        OpKey::new("BlockQuantizedMatMul", "pkg.nxrt", 1),
         Box::new(block_quantized_matmul::BlockQuantizedMatMulFactory {
             runtime: runtime.clone(),
         }),

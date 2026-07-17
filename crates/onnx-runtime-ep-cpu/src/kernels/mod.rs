@@ -209,7 +209,7 @@ pub fn build_cpu_registry() -> OpRegistry {
         Box::new(matmul_nbits::MatMulNBitsFactory),
     );
     reg.register(
-        OpKey::new("BlockQuantizedMatMul", "com.github.onnxruntime.genai", 1),
+        OpKey::new("BlockQuantizedMatMul", "pkg.nxrt", 1),
         Box::new(block_quantized_matmul::BlockQuantizedMatMulFactory),
     );
     reg.register(OpKey::new("Add", "", 1), Box::new(add::AddFactory));
@@ -1265,7 +1265,7 @@ mod tests {
         assert!(reg.lookup("MatMulNBits", "com.microsoft", 1).is_some());
         assert!(reg.lookup("QMoE", "com.microsoft", 1).is_some());
         assert!(
-            reg.lookup("BlockQuantizedMatMul", "com.github.onnxruntime.genai", 1)
+            reg.lookup("BlockQuantizedMatMul", "pkg.nxrt", 1)
                 .is_some()
         );
         assert!(reg.lookup("Conv", "", 21).is_none());
