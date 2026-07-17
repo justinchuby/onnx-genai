@@ -13,6 +13,11 @@ pub struct Environment {
     ptr: NonNull<onnx_genai_ort_sys::OrtEnv>,
     _name: String,
     registered_ep_libraries: Mutex<std::collections::HashMap<String, PathBuf>>,
+    /// Maps an EP-plugin registration handle to the provider name discovered on
+    /// first registration, so later sessions sharing this environment can
+    /// re-select the plugin's devices without re-running the (now impossible)
+    /// before/after device diff.
+    resolved_plugin_providers: Mutex<std::collections::HashMap<String, String>>,
 }
 
 impl Environment {
@@ -37,6 +42,7 @@ impl Environment {
             ptr: NonNull::new(ptr).ok_or(OrtError::NullPointer)?,
             _name: name.to_string(),
             registered_ep_libraries: Mutex::new(std::collections::HashMap::new()),
+            resolved_plugin_providers: Mutex::new(std::collections::HashMap::new()),
         })
     }
 
@@ -44,17 +50,24 @@ impl Environment {
         self.ptr.as_ptr()
     }
 
+    /// Register an ORT execution-provider plugin shared library.
+    ///
+    /// Returns `Ok(true)` when this call performed the registration and
+    /// `Ok(false)` when the same handle+path was already registered on this
+    /// environment (ORT registration is process-global and must not be
+    /// repeated). Callers use the flag to decide whether the plugin's devices
+    /// can still be identified by a fresh before/after device diff.
     pub(crate) fn register_execution_provider_library(
         &self,
         registration_name: &str,
         path: &Path,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let mut registered = self.registered_ep_libraries.lock().map_err(|_| {
             OrtError::InvalidArgument("execution provider registration lock was poisoned".into())
         })?;
         if let Some(registered_path) = registered.get(registration_name) {
             if registered_path == path {
-                return Ok(());
+                return Ok(false);
             }
             return Err(OrtError::InvalidArgument(format!(
                 "execution provider {registration_name} is already registered from {}",
@@ -101,7 +114,24 @@ impl Environment {
             })?;
         }
         registered.insert(registration_name.to_string(), path.to_path_buf());
-        Ok(())
+        Ok(true)
+    }
+
+    /// Fetch the provider name previously discovered for a plugin registration
+    /// handle, if any.
+    pub(crate) fn cached_plugin_provider(&self, registration_name: &str) -> Option<String> {
+        self.resolved_plugin_providers
+            .lock()
+            .ok()
+            .and_then(|map| map.get(registration_name).cloned())
+    }
+
+    /// Record the provider name discovered for a plugin registration handle so
+    /// subsequent sessions sharing this environment can re-select its devices.
+    pub(crate) fn cache_plugin_provider(&self, registration_name: &str, provider_name: &str) {
+        if let Ok(mut map) = self.resolved_plugin_providers.lock() {
+            map.insert(registration_name.to_string(), provider_name.to_string());
+        }
     }
 }
 
