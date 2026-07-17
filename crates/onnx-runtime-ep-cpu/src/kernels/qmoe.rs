@@ -33,9 +33,9 @@ impl KernelFactory for QMoEFactory {
     fn create(&self, node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
         let attributes = MoeAttributes::from_node(node)?;
         let bits = int_attr(node, "expert_weight_bits", 4)?;
-        if !matches!(bits, 4 | 8) {
+        if !matches!(bits, 1 | 2 | 4 | 8) {
             return Err(error(format!(
-                "expert_weight_bits must be 4 or 8 in the correctness-first CPU kernel, got {bits}"
+                "expert_weight_bits must be one of {{1, 2, 4, 8}}, got {bits}"
             )));
         }
         let block_size = int_attr(node, "block_size", 0)?;
@@ -894,6 +894,16 @@ mod tests {
     }
 
     #[test]
+    fn qmoe_int2_single_block_matches_float_moe() {
+        run_equivalence(2, 16, 16, 16, 1, false, false);
+    }
+
+    #[test]
+    fn qmoe_int1_single_block_matches_float_moe() {
+        run_equivalence(1, 16, 16, 16, 1, false, false);
+    }
+
+    #[test]
     fn qmoe_int8_matches_float_moe() {
         run_equivalence(8, 16, 16, 16, 1, false, false);
     }
@@ -909,8 +919,39 @@ mod tests {
     }
 
     #[test]
+    fn qmoe_sub4_odd_blocks_affine_match_float_moe() {
+        run_equivalence(2, 48, 48, 16, 1, false, true);
+        run_equivalence(1, 48, 48, 16, 1, false, true);
+    }
+
+    #[test]
     fn qmoe_top2_normalized_matches_float_moe() {
         run_equivalence(4, 16, 16, 16, 2, true, false);
+    }
+
+    #[test]
+    fn qmoe_rejects_unsupported_weight_bits() {
+        let inputs = [
+            Some((DataType::Float32, &[1, 16][..])),
+            Some((DataType::Float32, &[1, 2])),
+            Some((DataType::Uint8, &[2, 16, 8])),
+            Some((DataType::Float32, &[2, 16, 1])),
+            None,
+            Some((DataType::Uint8, &[2, 16, 8])),
+            Some((DataType::Float32, &[2, 16, 1])),
+        ];
+        for bits in [3, 5] {
+            let attrs = attributes(bits, 16, 1, false);
+            let (graph, node) = model_node("QMoE", &inputs, &[1, 16], &attrs);
+            match kernel(&graph, node) {
+                Err(EpError::KernelFailed(message)) => {
+                    assert!(message.contains("expert_weight_bits must be one of {1, 2, 4, 8}"));
+                    assert!(message.contains(&format!("got {bits}")));
+                }
+                Err(other) => panic!("expected KernelFailed for {bits}-bit QMoE, got {other}"),
+                Ok(_) => panic!("unsupported {bits}-bit QMoE unexpectedly produced a kernel"),
+            }
+        }
     }
 
     #[test]
