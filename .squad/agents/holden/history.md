@@ -83,3 +83,8 @@ Cleared Deckard's `f795d45` executor EP-polymorphism refactor: it preserves CPU-
 ## 2026-07-16T19:27:57+0000Z — Native backend selector review cycle
 
 🔴 Rejected Deckard's `66ec4b8` and locked Deckard out over op-type-only detection plus silently ignored speculation, pipeline, and device selections. 🟢 Cleared Batty's `2ae464b`: exact domain/opset v1 detection and explicit unsupported errors are covered; default Auto→ORT behavior remains intact.
+
+## 2026-07-16T23:58:29+0000 — GAFF ChildExecutor review
+
+- 🟡 Advisory-cleared Sapper's ChildExecutor foundation: lexical captures/scoped initializers and nested behavior are correct; 114 session tests passed.
+- Follow-up `gaff-exec-cache-lru`: one-entry cache safely recompiles `A → B → A`; add multi-signature caching plus permanent shadowing/nested-cache tests.

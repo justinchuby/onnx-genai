@@ -57,3 +57,7 @@ Loader opset-import validation for file, from-parts, and nested-subgraph paths m
 
 - 🟢 Cleared Sapper's `2a9e5b1`: formal subgraph I/O is ordered and typed, recursive scopes isolate inline initializers, and UNDEFINED graph attributes retain populated graph fields.
 - The Loop load regression and all 101 loader tests passed; existing validation already permits If/Loop/Scan.
+
+## 2026-07-16T23:58:29+0000 — Comparison/logical inference review
+
+- 🟢 Cleared Chew's `d06d1e7`: all comparison/logical output dtypes are Bool, broadcast/unary shapes hold, and bitwise operators were untouched; 115 tests passed.

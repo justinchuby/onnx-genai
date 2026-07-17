@@ -1343,3 +1343,14 @@ Re-reviewed commit `2ae464b5d894276f38a5855599c0c9124ea23558` against rejected b
 **Rationale:** `559c46f` correctly exposed `NativeDecodeDevice::Cuda` through `EngineConfig`, `SessionOptions`, and server CLI/environment selection, but the real 144-`BlockQuantizedMatMul` IQ4 model failed under a CUDA-only session during prefill and later on `Transpose`. The prior Constant/Gather fixture did not exercise this failure mode. Deckard's `fa30410` adds per-node CUDA capability probing, including symbolic/M>1 `BlockQuantizedMatMul`, and a reachable multi-token sub-4-bit regression: CPU generation succeeds; explicit CUDA and SessionOptions-routed CUDA fail deterministically at load with actionable remediation. A fully CUDA-supported smoke graph remains the positive CUDA parity proof.
 
 **Deferred:** True GPU serving for real sub-4-bit models requires heterogeneous CUDA-first/CPU-fallback placement, cross-device buffers/copies, and M>1 CPU prefill versus M=1 CUDA decode. The design is documented in `docs/HETEROGENEOUS_PLACEMENT.md` and is **AWAITING USER GREENLIGHT**.
+
+
+### 2026-07-16: Comparison and logical ops infer Bool outputs
+**By:** Chew; reviewed by Leon (🟢 CLEAR)
+**What:** Commit `d06d1e7` registers `Less`, `LessOrEqual`, `Greater`, `GreaterOrEqual`, `Equal`, `And`, `Or`, `Xor`, and `Not` with `tensor(bool)` output inference. Binary operators retain NumPy broadcast shapes and `Not` retains its input shape. Bitwise operators are intentionally unchanged.
+**Why:** ONNX comparison/logical outputs are Bool regardless of their inputs. Coverage includes all five comparisons, three binary logical operators, and `Not`; shape-inference build and tests passed (115 tests). Expanded-Attention now advances past Pad/Less and stops at unsupported `Mod` at node 50, tracked as `mod-op-support`.
+
+### 2026-07-16: GAFF ChildExecutor control-flow foundation
+**By:** Sapper; reviewed by Holden (🟡 ADVISORY)
+**What:** `onnx-runtime-session` now has crate-internal `ChildExecutor::new/run/stats` for recursive control-flow bodies. It lazily compiles a seeded child plan by external dtype/shape signature, supports lexical captures including transitive nested captures, scopes `WeightRef::Inline` initializers to the child, and returns declared outputs in order. The next execution step is `If`, which selects a child keyed by `(node_id, branch)` and runs it with the live captured scope.
+**Why:** The reusable executor avoids rebuilding body setup for every invocation while preserving formal/input shadowing and nested isolation. Build and the 114-test session suite passed. Advisory follow-up `gaff-exec-cache-lru`: the current one-entry cache is correctness-safe but recompiles an `A → B → A` signature sequence; add a signature-keyed multi-plan cache and permanent shadowing/nested-cache tests.

@@ -60,3 +60,8 @@ Added the preprocessing-side prompt token-expansion library for multi-tile VLM i
 
 - Merged `2a9e5b1`: graph attributes retain ordered typed formal I/O and scoped inline initializers, including UNDEFINED graph attributes and nested subgraphs.
 - Leon 🟢 cleared the isolated scopes and Loop regression; child-executor and If/Loop/Scan execution remain next.
+
+## 2026-07-16T23:58:29+0000 — GAFF ChildExecutor foundation
+
+- Landed the recursive `ChildExecutor` foundation: lazy compile/cache by signature, lexical captures, scoped inline initializers, and nested child scopes; 114 session tests passed.
+- Next: implement `If` branches keyed by `(node_id, branch)`; expand cache storage beyond the current last-signature plan.

@@ -4,7 +4,7 @@ Tracks implementation status of `docs/DESIGN.md` (§1–§40). Updated as work l
 
 **Published:** `onnx-genai` v0.1.0 + 8 sub-crates on crates.io; the `onnx-runtime-*` layer (including `onnx-runtime-tracer`) is released as v0.1.0-dev.1. CI (fmt/build/test/**blocking clippy**) + scheduled `cargo-audit`. Coverage ~77% line.
 
-_Last updated: 2026-07-16T23:30:00+0000 — CUDA MatMul test, GAFF loader foundation, and Pad axes inference fixes landed._
+_Last updated: 2026-07-16T23:58:29+0000 — Bool shape inference and GAFF ChildExecutor foundation landed._
 
 
 ## Current tiered-memory and interoperability milestones
@@ -16,7 +16,9 @@ _Last updated: 2026-07-16T23:30:00+0000 — CUDA MatMul test, GAFF loader founda
 - **CUDA MatMul stale test ✅ fixed (`3d19b72`, Roy; Wallace 🟢):** `matmul_rejects_unsupported_rank_and_dtype` now asserts the current actionable Int64 CUDA EP rejection instead of obsolete “Phase 2a” terminology; all **129/129** CUDA tests passed.
 - **GAFF control-flow foundation ▶ started (`2a9e5b1`, Sapper; Leon 🟢):** the loader records ordered typed subgraph formal I/O and scoped inline initializers, including `UNDEFINED` graph attributes and nested subgraphs. **Next:** child-executor implementation and If/Loop/Scan execution.
 - **Pad opset-18 axes shape inference ✅ fixed (`0a105a4`, Joi; Bryant 🟢):** optional `axes` now maps Pad values to the correct dimensions; expanded Attention infers `[2,3,4,6]` / **576 bytes**, not 640.
-- **Known follow-up:** `Less` op output dtype inference must produce **Bool** rather than Float32 (`less-bool-dtype-infer`); it is now exposed after the Pad fix.
+- **Comparison/logical Bool output inference ✅ landed (`d06d1e7`, Chew; Leon 🟢):** `Less`, `LessOrEqual`, `Greater`, `GreaterOrEqual`, `Equal`, `And`, `Or`, `Xor`, and `Not` now infer `tensor(bool)` while preserving broadcast/unary shapes; bitwise ops remain untouched.
+- **GAFF control-flow child-executor foundation ✅ landed (Sapper; Holden 🟡 advisory):** `ChildExecutor` provides lazy signature-cached compilation, lexical captures, scoped inline initializers, recursive nested scopes, and ordered outputs. **Next:** implement `If` using children keyed by `(node_id, branch)`.
+- **Known follow-ups:** unsupported `Mod` blocks expanded Attention at node 50 (`mod-op-support`); `ChildExecutor` currently retains only its most recent signature plan, so add a multi-signature cache (`gaff-exec-cache-lru`).
 
 ## ORT 2.0 — from-scratch Rust ONNX runtime (`docs/ORT2.md`, big design — steady progress)
 

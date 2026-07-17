@@ -34,3 +34,8 @@ At 2026-07-14T19:05:00Z, fixed clippy findings and corrected Python pytest count
 ## 2026-07-16T17:00:38+0000 — DeepSeek-V4-Flash MTP and CSA export
 - Updated Mobius PR #405 (`7e26e6e`) with the 0/4/128 CSA schedule, sparse-index/compression tensors, attention sinks, dense fallback, and an MTP sidecar.
 - Native sparse KV-cache/index operations and iterative MTP orchestration remain required runtime work.
+
+## 2026-07-16T23:58:29+0000 — Comparison/logical Bool inference
+
+- Delivered `d06d1e7`: comparison/logical shape inference now produces `tensor(bool)` while preserving broadcast and unary shapes; Leon 🟢 cleared 115 tests.
+- Expanded-Attention now reaches unsupported `Mod` at node 50; `mod-op-support` is next.
