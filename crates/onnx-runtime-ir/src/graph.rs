@@ -306,6 +306,141 @@ impl Graph {
         }
     }
 
+    /// Replace disjoint node groups with one node each while updating shared
+    /// producer/consumer metadata in a batch.
+    ///
+    /// Each group is semantically equivalent to calling [`Graph::remove_node`]
+    /// for its IDs in slice order and then [`Graph::insert_node`] for the
+    /// replacement. In particular, replacement IDs and orphan-value collection
+    /// match that sequential operation. The supplied `graph_outputs` must be the
+    /// current graph-output set and is reused for orphan checks so callers that
+    /// process many groups do not repeatedly scan [`Graph::outputs`].
+    pub fn replace_node_groups(
+        &mut self,
+        groups: Vec<(Vec<NodeId>, Node)>,
+        graph_outputs: &HashSet<ValueId>,
+    ) -> Vec<NodeId> {
+        if groups.is_empty() {
+            return Vec::new();
+        }
+
+        let mut removed_nodes = HashSet::new();
+        let mut touched_consumers = HashSet::new();
+        let mut removed_outputs = Vec::new();
+        let mut consumer_counts = HashMap::new();
+
+        for (node_ids, replacement) in &groups {
+            assert!(
+                !node_ids.is_empty(),
+                "replace_node_groups: group must not be empty"
+            );
+            for &id in node_ids {
+                assert!(
+                    self.nodes.contains(id),
+                    "replace_node_groups: node id not live"
+                );
+                assert!(
+                    removed_nodes.insert(id),
+                    "replace_node_groups: groups must be disjoint"
+                );
+                let node = self.node(id);
+                touched_consumers.extend(node.input_values());
+                removed_outputs.extend(node.outputs.iter().copied());
+            }
+            touched_consumers.extend(replacement.input_values());
+        }
+
+        for &value in touched_consumers.iter().chain(removed_outputs.iter()) {
+            consumer_counts
+                .entry(value)
+                .or_insert_with(|| self.value(value).consumers.len());
+        }
+
+        let mut protected_values = graph_outputs.clone();
+        protected_values.extend(self.inputs.iter().copied());
+        protected_values.extend(self.initializers.keys().copied());
+
+        let mut inserted = Vec::with_capacity(groups.len());
+        let mut orphaned_outputs = Vec::new();
+        for (node_ids, replacement) in groups {
+            for id in node_ids {
+                let (inputs, outputs) = {
+                    let node = self.node(id);
+                    (
+                        node.input_values().collect::<Vec<_>>(),
+                        node.outputs.clone(),
+                    )
+                };
+                for value in inputs {
+                    let count = consumer_counts
+                        .get_mut(&value)
+                        .expect("covered input consumer count tracked");
+                    *count = count
+                        .checked_sub(1)
+                        .expect("covered input consumer edge present");
+                }
+                self.nodes.remove(id);
+                for value in outputs {
+                    if self.value(value).producer == Some(id)
+                        && consumer_counts[&value] == 0
+                        && !protected_values.contains(&value)
+                    {
+                        orphaned_outputs.push(value);
+                    }
+                }
+            }
+
+            let id = self.nodes.insert_with(|id| {
+                let mut replacement = replacement;
+                replacement.id = id;
+                replacement
+            });
+            for value in self.node(id).input_values() {
+                *consumer_counts
+                    .get_mut(&value)
+                    .expect("replacement input consumer count tracked") += 1;
+            }
+            inserted.push(id);
+        }
+
+        for value in touched_consumers {
+            if let Some(metadata) = self.values.get_mut(value) {
+                metadata
+                    .consumers
+                    .retain(|consumer| !removed_nodes.contains(consumer));
+            }
+        }
+        for value in removed_outputs {
+            if let Some(metadata) = self.values.get_mut(value)
+                && metadata
+                    .producer
+                    .is_some_and(|producer| removed_nodes.contains(&producer))
+            {
+                metadata.producer = None;
+            }
+        }
+        for &id in &inserted {
+            let (inputs, outputs) = {
+                let node = self.node(id);
+                (
+                    node.input_values().collect::<Vec<_>>(),
+                    node.outputs.clone(),
+                )
+            };
+            for value in inputs {
+                self.value_mut(value).consumers.push(id);
+            }
+            for value in outputs {
+                self.value_mut(value).producer = Some(id);
+            }
+        }
+        for value in orphaned_outputs {
+            self.gc_value_if_orphan(value);
+        }
+
+        inserted
+    }
+
     /// Replace node `old` in place with `new`, preserving the [`NodeId`].
     ///
     /// The old node's edges are disconnected and the new node's edges are
@@ -635,6 +770,145 @@ mod tests {
         assert!(g.value(ValueId(3)).producer.is_none());
         // b lost its consumer
         assert!(g.value(ValueId(2)).consumers.is_empty());
+    }
+
+    #[test]
+    fn replace_node_groups_matches_sequential_mutation() {
+        let mut sequential = Graph::new();
+        let input = sequential.create_value(DataType::Float32, static_shape([1]));
+        sequential.add_input(input);
+        let interior = sequential.create_value(DataType::Float32, static_shape([1]));
+        let first = sequential.insert_node(Node::new(
+            NodeId(0),
+            "Relu",
+            vec![Some(input)],
+            vec![interior],
+        ));
+        let output = sequential.create_value(DataType::Float32, static_shape([1]));
+        let second = sequential.insert_node(Node::new(
+            NodeId(0),
+            "Relu",
+            vec![Some(interior)],
+            vec![output],
+        ));
+        sequential.add_output(output);
+        let sibling_output = sequential.create_value(DataType::Float32, static_shape([1]));
+        let sibling = sequential.insert_node(Node::new(
+            NodeId(0),
+            "Neg",
+            vec![Some(input)],
+            vec![sibling_output],
+        ));
+        sequential.add_output(sibling_output);
+
+        let mut batched = sequential.clone();
+        let graph_outputs: HashSet<_> = batched.outputs.iter().copied().collect();
+        let replacement0 = Node::new(NodeId(0), "EPContext", vec![Some(input)], vec![output]);
+        let replacement1 = Node::new(
+            NodeId(0),
+            "EPContext",
+            vec![Some(input)],
+            vec![sibling_output],
+        );
+
+        sequential.remove_node(first);
+        sequential.remove_node(second);
+        let replacement0_id = sequential.insert_node(replacement0.clone());
+        sequential.remove_node(sibling);
+        let replacement1_id = sequential.insert_node(replacement1.clone());
+
+        let inserted = batched.replace_node_groups(
+            vec![
+                (vec![first, second], replacement0),
+                (vec![sibling], replacement1),
+            ],
+            &graph_outputs,
+        );
+        assert_eq!(inserted, vec![replacement0_id, replacement1_id]);
+
+        let sequential_nodes: Vec<_> = sequential
+            .nodes
+            .iter()
+            .map(|(id, node)| {
+                (
+                    id,
+                    node.op_type.clone(),
+                    node.inputs.clone(),
+                    node.outputs.clone(),
+                )
+            })
+            .collect();
+        let batched_nodes: Vec<_> = batched
+            .nodes
+            .iter()
+            .map(|(id, node)| {
+                (
+                    id,
+                    node.op_type.clone(),
+                    node.inputs.clone(),
+                    node.outputs.clone(),
+                )
+            })
+            .collect();
+        assert_eq!(batched_nodes, sequential_nodes);
+
+        let sequential_values: Vec<_> = sequential
+            .values
+            .iter()
+            .map(|(id, value)| (id, value.producer, value.consumers.clone()))
+            .collect();
+        let batched_values: Vec<_> = batched
+            .values
+            .iter()
+            .map(|(id, value)| (id, value.producer, value.consumers.clone()))
+            .collect();
+        assert_eq!(batched_values, sequential_values);
+
+        let next_sequential =
+            sequential.insert_node(Node::new(NodeId(0), "Identity", Vec::new(), Vec::new()));
+        let next_batched =
+            batched.insert_node(Node::new(NodeId(0), "Identity", Vec::new(), Vec::new()));
+        assert_eq!(next_batched, next_sequential);
+    }
+
+    #[test]
+    fn replace_node_groups_matches_sequential_orphan_collection() {
+        let mut sequential = Graph::new();
+        let input = sequential.create_value(DataType::Float32, static_shape([1]));
+        sequential.add_input(input);
+        let interior = sequential.create_value(DataType::Float32, static_shape([1]));
+        let producer = sequential.insert_node(Node::new(
+            NodeId(0),
+            "Relu",
+            vec![Some(input)],
+            vec![interior],
+        ));
+        let output = sequential.create_value(DataType::Float32, static_shape([1]));
+        let consumer = sequential.insert_node(Node::new(
+            NodeId(0),
+            "Relu",
+            vec![Some(interior)],
+            vec![output],
+        ));
+        sequential.add_output(output);
+
+        let mut batched = sequential.clone();
+        let graph_outputs: HashSet<_> = batched.outputs.iter().copied().collect();
+        let replacement = Node::new(NodeId(0), "EPContext", vec![Some(input)], vec![output]);
+
+        sequential.remove_node(consumer);
+        sequential.remove_node(producer);
+        sequential.insert_node(replacement.clone());
+        batched.replace_node_groups(
+            vec![(vec![consumer, producer], replacement)],
+            &graph_outputs,
+        );
+
+        assert!(sequential.try_value(interior).is_none());
+        assert!(batched.try_value(interior).is_none());
+        let next_sequential = sequential.create_value(DataType::Float32, static_shape([1]));
+        let next_batched = batched.create_value(DataType::Float32, static_shape([1]));
+        assert_eq!(next_batched, next_sequential);
     }
 
     #[test]

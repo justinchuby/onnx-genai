@@ -165,9 +165,29 @@ pub fn dump_ep_context(
         .entry(MS_DOMAIN.to_string())
         .or_insert(1);
 
+    // Splicing removes/inserts nodes and updates value edges, but never rewrites
+    // graph.outputs: boundary output values survive and the EPContext node
+    // re-produces them. Reuse this invariant set for every partition boundary
+    // and for the batched orphan-value checks.
+    let graph_outputs: HashSet<ValueId> = graph.outputs.iter().copied().collect();
+    #[cfg(debug_assertions)]
+    let original_graph_outputs = graph.outputs.clone();
+
+    let mut replacements = Vec::with_capacity(partitions.len());
     for (index, part) in partitions.iter().enumerate() {
-        splice_partition(&mut graph, &out_dir, &out_path, config, index, part)?;
+        replacements.push(prepare_partition(
+            &graph,
+            &graph_outputs,
+            &out_dir,
+            &out_path,
+            config,
+            index,
+            part,
+        )?);
     }
+    graph.replace_node_groups(replacements, &graph_outputs);
+    #[cfg(debug_assertions)]
+    debug_assert_eq!(graph.outputs, original_graph_outputs);
 
     let out_model = Model {
         graph: &graph,
@@ -182,23 +202,23 @@ pub fn dump_ep_context(
     Ok(out_path)
 }
 
-/// Replace one partition's nodes with a single EPContext node wired to the
-/// partition's boundary i/o.
-fn splice_partition(
-    graph: &mut Graph,
+/// Prepare the replacement EPContext node for one partition.
+fn prepare_partition(
+    graph: &Graph,
+    graph_outputs: &HashSet<ValueId>,
     out_dir: &Path,
     out_path: &Path,
     config: &EpContextDumpConfig,
     index: usize,
     part: &EpContextPartition,
-) -> Result<(), LoaderError> {
+) -> Result<(Vec<NodeId>, Node), LoaderError> {
     let covered: HashSet<NodeId> = part.covered_nodes.iter().copied().collect();
     if covered.is_empty() {
         return Err(LoaderError::EpContext(
             "EPContext dump: partition has no covered nodes".to_string(),
         ));
     }
-    let (inputs, outputs) = partition_boundary(graph, &covered);
+    let (inputs, outputs) = partition_boundary(graph, &covered, graph_outputs);
 
     // Build the ep_cache_context payload (inline bytes or a relative sidecar
     // path), writing the external `.bin` next to the output model when needed.
@@ -213,13 +233,6 @@ fn splice_partition(
     } else {
         Attribute::String(part.blob.to_vec())
     };
-
-    // Remove the compiled subgraph. Interior values (consumed only within the
-    // partition) are GC'd; boundary values survive (graph I/O or consumed
-    // outside), their producer cleared — the new node re-produces them.
-    for &nid in part.covered_nodes {
-        graph.remove_node(nid);
-    }
 
     let mut node = Node::new(NodeId(0), EP_CONTEXT_OP, inputs, outputs);
     node.domain = MS_DOMAIN.to_string();
@@ -250,8 +263,7 @@ fn splice_partition(
     }
     attrs.insert(attr::EP_CACHE_CONTEXT.to_string(), ep_cache_context);
 
-    graph.insert_node(node);
-    Ok(())
+    Ok((part.covered_nodes.to_vec(), node))
 }
 
 /// Compute a partition's boundary tensors (§55.4): the variadic inputs/outputs
@@ -279,6 +291,7 @@ fn splice_partition(
 fn partition_boundary(
     graph: &Graph,
     covered: &HashSet<NodeId>,
+    graph_outputs: &HashSet<ValueId>,
 ) -> (Vec<Option<ValueId>>, Vec<ValueId>) {
     let mut ordered: Vec<NodeId> = covered.iter().copied().collect();
     ordered.sort_by_key(|n| n.0);
@@ -287,7 +300,6 @@ fn partition_boundary(
     let mut seen_in: HashSet<ValueId> = HashSet::new();
     let mut outputs: Vec<ValueId> = Vec::new();
     let mut seen_out: HashSet<ValueId> = HashSet::new();
-    let graph_outputs: HashSet<ValueId> = graph.outputs.iter().copied().collect();
 
     for nid in &ordered {
         let node = graph.node(*nid);

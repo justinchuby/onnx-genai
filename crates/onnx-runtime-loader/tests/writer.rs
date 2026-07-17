@@ -188,6 +188,146 @@ fn multiple_partitions_each_become_one_node() {
     assert_eq!(blobs[1], b1);
 }
 
+#[test]
+fn multiple_partition_boundaries_keep_documented_order_and_attributes() {
+    let mut g = Graph::new();
+    g.opset_imports.insert(String::new(), 17);
+    let x = g.create_named_value("X", DataType::Float32, static_shape([4usize]));
+    let z = g.create_named_value("Z", DataType::Float32, static_shape([4usize]));
+    g.add_input(x);
+    g.add_input(z);
+
+    let a_mid = g.create_named_value("A_mid", DataType::Float32, static_shape([4usize]));
+    let a0 = g.insert_node(Node::new(NodeId(0), "Neg", vec![Some(z)], vec![a_mid]));
+    let a = g.create_named_value("A", DataType::Float32, static_shape([4usize]));
+    let a1 = g.insert_node(Node::new(
+        NodeId(0),
+        "Add",
+        vec![Some(x), Some(a_mid)],
+        vec![a],
+    ));
+    g.add_output(a);
+
+    let b = g.create_named_value("B", DataType::Float32, static_shape([4usize]));
+    let b0 = g.insert_node(Node::new(NodeId(0), "Relu", vec![Some(a)], vec![b]));
+    g.add_output(b);
+
+    let c_mid = g.create_named_value("C_mid", DataType::Float32, static_shape([4usize]));
+    let c0 = g.insert_node(Node::new(NodeId(0), "Sigmoid", vec![Some(x)], vec![c_mid]));
+    let c = g.create_named_value("C", DataType::Float32, static_shape([4usize]));
+    g.insert_node(Node::new(NodeId(0), "Identity", vec![Some(c_mid)], vec![c]));
+    g.add_output(c);
+
+    // Deliberately reverse partition A's removal list: boundary ordering remains
+    // ascending NodeId, independent of covered_nodes order.
+    let covered_a = [a1, a0];
+    let covered_b = [b0];
+    let covered_c = [c0];
+    let parts = [
+        EpContextPartition {
+            source: "EpA",
+            ep_sdk_version: "1.2",
+            partition_name: "alpha",
+            main_context: true,
+            blob: b"alpha-blob",
+            covered_nodes: &covered_a,
+        },
+        EpContextPartition {
+            source: "EpB",
+            ep_sdk_version: "2.3",
+            partition_name: "beta",
+            main_context: false,
+            blob: b"beta-blob",
+            covered_nodes: &covered_b,
+        },
+        EpContextPartition {
+            source: "EpC",
+            ep_sdk_version: "",
+            partition_name: "",
+            main_context: true,
+            blob: b"gamma-blob",
+            covered_nodes: &covered_c,
+        },
+    ];
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("writer_multi_boundary");
+    std::fs::create_dir_all(&dir).unwrap();
+    let config = EpContextDumpConfig {
+        enable: true,
+        file_path: None,
+        embed_mode: 1,
+    };
+
+    let model = Model::new(&g);
+    let out =
+        onnx_runtime_loader::dump_ep_context(&model, &dir.join("multi.onnx"), &parts, &config)
+            .expect("dump");
+    let dumped = load_model(&out).expect("reload");
+    let nodes: Vec<_> = ep_context_nodes(&dumped).collect();
+    assert_eq!(nodes.len(), 3);
+
+    let node = |source| {
+        nodes
+            .iter()
+            .find(|node| node.source == Some(source))
+            .expect("EPContext source")
+    };
+    let a = node("EpA");
+    assert_eq!(a.sdk_version, Some("1.2"));
+    assert_eq!(a.partition_name, Some("alpha"));
+    assert!(a.main_context);
+    assert_eq!(a.embed_mode, EmbedMode::Embedded);
+    assert_eq!(
+        a.inputs()
+            .iter()
+            .map(|slot| name_of(&dumped, slot.unwrap()))
+            .collect::<Vec<_>>(),
+        ["Z", "X"]
+    );
+    assert_eq!(
+        a.outputs()
+            .iter()
+            .map(|&value| name_of(&dumped, value))
+            .collect::<Vec<_>>(),
+        ["A"]
+    );
+    assert_eq!(resolve_ep_context(&dir, a).unwrap().bytes(), b"alpha-blob");
+
+    let b = node("EpB");
+    assert!(!b.main_context);
+    assert_eq!(
+        b.inputs()
+            .iter()
+            .map(|slot| name_of(&dumped, slot.unwrap()))
+            .collect::<Vec<_>>(),
+        ["A"]
+    );
+    assert_eq!(
+        b.outputs()
+            .iter()
+            .map(|&value| name_of(&dumped, value))
+            .collect::<Vec<_>>(),
+        ["B"]
+    );
+
+    let c = node("EpC");
+    assert_eq!(c.sdk_version, None);
+    assert_eq!(c.partition_name, None);
+    assert_eq!(
+        c.inputs()
+            .iter()
+            .map(|slot| name_of(&dumped, slot.unwrap()))
+            .collect::<Vec<_>>(),
+        ["X"]
+    );
+    assert_eq!(
+        c.outputs()
+            .iter()
+            .map(|&value| name_of(&dumped, value))
+            .collect::<Vec<_>>(),
+        ["C_mid"]
+    );
+}
+
 /// Two independent partitions producing `X → Relu → A` and `X → Neg → B` graph
 /// outputs; returns the graph plus the two single-node partitions.
 fn two_partition_graph() -> (Graph, Vec<NodeId>, Vec<NodeId>) {
