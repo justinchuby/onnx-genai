@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use onnx_runtime_ir::{Node, Shape, TensorLayout};
+use onnx_runtime_ir::{DataType, Node, Shape, TensorLayout};
 
 use crate::error::Result;
 use crate::kernel::{Kernel, KernelMatch};
@@ -243,12 +243,13 @@ impl EpRegistry {
         op: &Node,
         opset: u64,
         shapes: &[Shape],
+        input_dtypes: &[DataType],
         layouts: &[TensorLayout],
     ) -> Vec<(EpId, KernelMatch)> {
         let mut out = Vec::new();
         for &id in &self.priority {
             if let Some(ep) = self.get(id) {
-                let m = ep.supports_op(op, opset, shapes, layouts);
+                let m = ep.supports_op(op, opset, shapes, input_dtypes, layouts);
                 if m.is_supported() {
                     out.push((id, m));
                 }

@@ -1,7 +1,7 @@
 //! CUDA conformance tests for router/mask indexing and scan operators.
 
 use onnx_runtime_ep_api::{
-    DeviceBuffer, DevicePtr, DevicePtrMut, ExecutionProvider, TensorMut, TensorView,
+    DeviceBuffer, DevicePtr, DevicePtrMut, ExecutionProvider, KernelMatch, TensorMut, TensorView,
 };
 use onnx_runtime_ep_cuda::CudaExecutionProvider;
 use onnx_runtime_ep_cuda::runtime::cuptr;
@@ -27,6 +27,58 @@ fn tensor<T: Copy>(dtype: DataType, shape: &[usize], values: &[T]) -> Tensor {
         dtype,
         shape: shape.to_vec(),
         bytes: raw(values),
+    }
+}
+
+#[test]
+fn standard_attention_and_rope_claim_only_f32_and_require_contiguous_inputs() {
+    let ep = CudaExecutionProvider::new_default().expect("CUDA runtime must be available");
+
+    for (op_type, opset, dtype, expected_reason) in [
+        ("Attention", 23, DataType::Float16, "Attention: dtype f16"),
+        ("Attention", 23, DataType::BFloat16, "Attention: dtype bf16"),
+        (
+            "RotaryEmbedding",
+            23,
+            DataType::Float16,
+            "RotaryEmbedding: dtype f16",
+        ),
+        (
+            "RotaryEmbedding",
+            23,
+            DataType::BFloat16,
+            "RotaryEmbedding: dtype bf16",
+        ),
+    ] {
+        let mut graph = Graph::new();
+        let inputs = (0..3)
+            .map(|i| {
+                graph.create_named_value(format!("input_{i}"), dtype, static_shape([1, 1, 1, 2]))
+            })
+            .collect::<Vec<_>>();
+        let output = graph.create_named_value("output", dtype, static_shape([1, 1, 1, 2]));
+        let node = Node::new(
+            NodeId(0),
+            op_type,
+            inputs.into_iter().map(Some).collect(),
+            vec![output],
+        );
+        let input_dtypes = [dtype; 3];
+        assert!(matches!(
+            ep.supports_op(&node, opset, &[], &input_dtypes, &[]),
+            KernelMatch::Unsupported { ref reason } if reason.contains(expected_reason)
+        ));
+
+        let f32_dtypes = [DataType::Float32; 3];
+        assert!(
+            ep.supports_op(&node, opset, &[], &f32_dtypes, &[])
+                .is_supported()
+        );
+        let kernel = ep.get_kernel(&node, &[], opset).unwrap();
+        assert!(
+            !kernel.supports_strided_input(0),
+            "{op_type} must request contiguous inputs"
+        );
     }
 }
 

@@ -3,11 +3,11 @@
 use onnx_runtime_ep_api::{
     DevicePtr, DevicePtrMut, ExecutionProvider, KernelMatch, TensorMut, TensorView,
 };
-use onnx_runtime_ep_cuda::runtime::cuptr;
 use onnx_runtime_ep_cuda::CudaExecutionProvider;
+use onnx_runtime_ep_cuda::runtime::cuptr;
 use onnx_runtime_ir::{
-    as_static_shape, compute_contiguous_strides, static_shape, Attribute, DataType, Graph, Node,
-    NodeId, TensorLayout,
+    Attribute, DataType, Graph, Node, NodeId, TensorLayout, as_static_shape,
+    compute_contiguous_strides, static_shape,
 };
 use onnx_runtime_loader::Model;
 
@@ -312,7 +312,7 @@ fn placement_declines_broadcast_bias_and_batched_matmul() {
             let layouts = vec![TensorLayout::contiguous(); shapes.len()];
             assert_eq!(
                 matches!(
-                    ep.supports_op(node, 1, &shapes, &layouts),
+                    ep.supports_op(node, 1, &shapes, &[], &layouts),
                     KernelMatch::Supported { .. }
                 ),
                 expected,

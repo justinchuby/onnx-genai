@@ -182,7 +182,7 @@ mod tests {
     use super::*;
     use crate::kernel::{Kernel, KernelMatch};
     use crate::provider::{DeviceBuffer, EpConfig, Fence};
-    use onnx_runtime_ir::{DeviceId, DeviceType, Node, NodeId, Shape, TensorLayout};
+    use onnx_runtime_ir::{DataType, DeviceId, DeviceType, Node, NodeId, Shape, TensorLayout};
 
     /// A mock compiled EP that participates in `EPContext` dispatch. It declares
     /// two `source` keys, produces a fixed context blob, and validates the blob
@@ -228,6 +228,7 @@ mod tests {
             _op: &Node,
             _opset: u64,
             _shapes: &[Shape],
+            _input_dtypes: &[DataType],
             _layouts: &[TensorLayout],
         ) -> KernelMatch {
             KernelMatch::unsupported("test EP supports no ops")
@@ -320,6 +321,7 @@ mod tests {
             _op: &Node,
             _opset: u64,
             _shapes: &[Shape],
+            _input_dtypes: &[DataType],
             _layouts: &[TensorLayout],
         ) -> KernelMatch {
             KernelMatch::unsupported("test EP supports no ops")

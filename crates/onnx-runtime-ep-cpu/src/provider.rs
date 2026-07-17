@@ -29,7 +29,7 @@ use onnx_runtime_ep_api::{
     Cost, DeviceBuffer, EpConfig, EpError, ExecutionProvider, Fence, Kernel, KernelMatch,
     OpRegistry, Result, deny,
 };
-use onnx_runtime_ir::{DeviceId, DeviceType, Node, Shape, TensorLayout};
+use onnx_runtime_ir::{DataType, DeviceId, DeviceType, Node, Shape, TensorLayout};
 
 use crate::WeightOffloadHostCache;
 use crate::kernels::{build_cpu_registry, build_cpu_registry_with_weight_offload_cache};
@@ -125,6 +125,7 @@ impl ExecutionProvider for CpuExecutionProvider {
         op: &Node,
         opset: u64,
         shapes: &[Shape],
+        _input_dtypes: &[DataType],
         _layouts: &[TensorLayout],
     ) -> KernelMatch {
         // Keyed on (op_type, domain, opset) via the registry — the single source
@@ -427,9 +428,9 @@ mod tests {
     fn supports_op_reports_phase1_only() {
         let ep = CpuExecutionProvider::new();
         let mm = Node::new(onnx_runtime_ir::NodeId(0), "MatMul", vec![], vec![]);
-        assert!(ep.supports_op(&mm, 17, &[], &[]).is_supported());
+        assert!(ep.supports_op(&mm, 17, &[], &[], &[]).is_supported());
         let conv = Node::new(onnx_runtime_ir::NodeId(1), "Conv", vec![], vec![]);
-        let rejected = ep.supports_op(&conv, 17, &[], &[]);
+        let rejected = ep.supports_op(&conv, 17, &[], &[], &[]);
         assert!(!rejected.is_supported());
         let reason = rejected.reason().expect("unsupported reason");
         assert!(reason.contains("Conv"), "{reason}");
@@ -445,7 +446,7 @@ mod tests {
         let ep = CpuExecutionProvider::new();
         let gelu = Node::new(onnx_runtime_ir::NodeId(0), "Gelu", vec![], vec![]);
 
-        let rejected = ep.supports_op(&gelu, 19, &[], &[]);
+        let rejected = ep.supports_op(&gelu, 19, &[], &[], &[]);
         let reason = rejected.reason().expect("opset 19 must be declined");
         assert!(
             reason.contains("no handler for ai.onnx::Gelu at opset 19"),
@@ -453,7 +454,7 @@ mod tests {
         );
         assert!(reason.contains("registers Gelu since opset 20"), "{reason}");
 
-        assert!(ep.supports_op(&gelu, 20, &[], &[]).is_supported());
+        assert!(ep.supports_op(&gelu, 20, &[], &[], &[]).is_supported());
     }
 
     #[test]
@@ -468,7 +469,7 @@ mod tests {
             vec![],
         );
         fused.domain = "com.microsoft".to_string();
-        assert!(ep.supports_op(&fused, 1, &[], &[]).is_supported());
+        assert!(ep.supports_op(&fused, 1, &[], &[], &[]).is_supported());
         assert!(ep.get_kernel(&fused, &[], 1).is_ok());
 
         // The fused `FusedMatMulBias` (MatMul+Add) now has a contrib-domain
@@ -480,14 +481,14 @@ mod tests {
             vec![],
         );
         fmb.domain = "com.microsoft".to_string();
-        assert!(ep.supports_op(&fmb, 1, &[], &[]).is_supported());
+        assert!(ep.supports_op(&fmb, 1, &[], &[], &[]).is_supported());
         assert!(ep.get_kernel(&fmb, &[], 1).is_ok());
 
         // The fused `FusedGemm` (MatMul+Add+Relu) now has a contrib-domain
         // kernel too, so it is supported and instantiable.
         let mut fg = Node::new(onnx_runtime_ir::NodeId(2), "FusedGemm", vec![], vec![]);
         fg.domain = "com.microsoft".to_string();
-        assert!(ep.supports_op(&fg, 1, &[], &[]).is_supported());
+        assert!(ep.supports_op(&fg, 1, &[], &[], &[]).is_supported());
         assert!(ep.get_kernel(&fg, &[], 1).is_ok());
 
         // The fused `FusedAttention` (SDPA core) is supported in the contrib
@@ -495,7 +496,7 @@ mod tests {
         // instantiate.
         let mut fa = Node::new(onnx_runtime_ir::NodeId(4), "FusedAttention", vec![], vec![]);
         fa.domain = "com.microsoft".to_string();
-        assert!(ep.supports_op(&fa, 1, &[], &[]).is_supported());
+        assert!(ep.supports_op(&fa, 1, &[], &[], &[]).is_supported());
         fa.attributes
             .insert("scale".to_string(), onnx_runtime_ir::Attribute::Float(0.5));
         assert!(ep.get_kernel(&fa, &[], 1).is_ok());
@@ -509,6 +510,6 @@ mod tests {
             vec![],
         );
         unknown.domain = "com.microsoft".to_string();
-        assert!(!ep.supports_op(&unknown, 1, &[], &[]).is_supported());
+        assert!(!ep.supports_op(&unknown, 1, &[], &[], &[]).is_supported());
     }
 }

@@ -7,7 +7,9 @@ use onnx_runtime_ep_api::{
     Cost, DeviceBuffer, EpConfig, EpRegistry, ExecutionProvider, Fence, Kernel, KernelFactory,
     KernelMatch, OpKey, OpRegistry, Result, TensorMut, TensorView,
 };
-use onnx_runtime_ir::{DeviceId, DeviceType, Node, NodeId, Shape, TensorLayout, static_shape};
+use onnx_runtime_ir::{
+    DataType, DeviceId, DeviceType, Node, NodeId, Shape, TensorLayout, static_shape,
+};
 
 /// A trivial kernel that does nothing but report success.
 struct AddKernel;
@@ -99,6 +101,7 @@ impl ExecutionProvider for MockEp {
         op: &Node,
         opset: u64,
         _shapes: &[Shape],
+        _input_dtypes: &[onnx_runtime_ir::DataType],
         _layouts: &[TensorLayout],
     ) -> KernelMatch {
         if self
@@ -237,7 +240,7 @@ fn mock_ep_supports_and_builds_kernel() {
     let shapes = vec![static_shape([2, 3]), static_shape([2, 3])];
     let layouts = vec![TensorLayout::contiguous(), TensorLayout::contiguous()];
 
-    let m = ep.supports_op(&node, 17, &shapes, &layouts);
+    let m = ep.supports_op(&node, 17, &shapes, &[], &layouts);
     assert!(m.is_supported());
 
     let kernel = ep.get_kernel(&node, &[vec![2, 3], vec![2, 3]], 17).unwrap();
@@ -255,7 +258,8 @@ fn ep_registry_lists_candidates_in_priority_order() {
     let shapes = vec![static_shape([4]), static_shape([4])];
     let layouts = vec![TensorLayout::contiguous(), TensorLayout::contiguous()];
 
-    let candidates = registry.candidates_for_op(&node, 17, &shapes, &layouts);
+    let candidates =
+        registry.candidates_for_op(&node, 17, &shapes, &[DataType::Float32; 2], &layouts);
     assert_eq!(candidates.len(), 1);
     assert_eq!(candidates[0].0, id);
     assert!(candidates[0].1.is_supported());
@@ -264,7 +268,7 @@ fn ep_registry_lists_candidates_in_priority_order() {
     let unsupported = Node::new(NodeId(1), "NoSuchOp", vec![], vec![]);
     assert!(
         registry
-            .candidates_for_op(&unsupported, 17, &[], &[])
+            .candidates_for_op(&unsupported, 17, &[], &[], &[])
             .is_empty()
     );
 }

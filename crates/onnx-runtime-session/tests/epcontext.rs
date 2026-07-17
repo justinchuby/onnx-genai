@@ -95,6 +95,7 @@ impl ExecutionProvider for MockCompiledEp {
         _op: &Node,
         _opset: u64,
         _shapes: &[Shape],
+        _input_dtypes: &[DataType],
         _layouts: &[TensorLayout],
     ) -> KernelMatch {
         KernelMatch::unsupported("test EP supports no ops")

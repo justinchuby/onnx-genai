@@ -45,6 +45,7 @@
 //! * `qk_matmul_output_mode`: modes **0, 1, 2, 3** implemented per spec; any
 //!   other value errors.
 
+use std::borrow::Cow;
 use std::ffi::c_void;
 use std::sync::Arc;
 
@@ -52,6 +53,26 @@ use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, Ten
 use onnx_runtime_ir::{DataType, Node};
 
 use crate::runtime::{CudaRuntime, cuptr};
+
+/// Return the claim-time dtype denial for data-bearing Attention inputs.
+pub(crate) fn unsupported_reason(input_dtypes: &[DataType]) -> Option<Cow<'static, str>> {
+    for &index in &[0, 1, 2, 4, 5] {
+        let Some(&dtype) = input_dtypes.get(index) else {
+            continue;
+        };
+        if dtype != DataType::Float32 {
+            let dtype = match dtype {
+                DataType::Float16 => "f16".into(),
+                DataType::BFloat16 => "bf16".into(),
+                other => format!("{other:?}"),
+            };
+            return Some(Cow::Owned(format!(
+                "Attention: dtype {dtype} not supported on CUDA yet (f32 only; f16/bf16 follow-up)"
+            )));
+        }
+    }
+    None
+}
 
 /// f32 standard-`Attention` kernel carrying the resolved attributes.
 pub struct StandardAttentionKernel {
@@ -714,6 +735,6 @@ impl Kernel for StandardAttentionKernel {
     }
 
     fn supports_strided_input(&self, _input_idx: usize) -> bool {
-        true
+        false
     }
 }

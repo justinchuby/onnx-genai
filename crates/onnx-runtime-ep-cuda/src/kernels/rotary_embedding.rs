@@ -30,13 +30,31 @@
 //! The same `cos`/`sin` row applies to every head at a given `(batch, seq)`.
 //! Channels at or beyond `rotary_embedding_dim` pass through unrotated.
 
+use std::borrow::Cow;
 use std::ffi::c_void;
 use std::sync::Arc;
 
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
-use onnx_runtime_ir::Node;
+use onnx_runtime_ir::{DataType, Node};
 
 use crate::runtime::{CudaRuntime, cuptr};
+
+/// Return the claim-time dtype denial for RoPE's floating-point inputs.
+pub(crate) fn unsupported_reason(input_dtypes: &[DataType]) -> Option<Cow<'static, str>> {
+    for &dtype in input_dtypes.iter().take(3) {
+        if dtype != DataType::Float32 {
+            let dtype = match dtype {
+                DataType::Float16 => "f16".into(),
+                DataType::BFloat16 => "bf16".into(),
+                other => format!("{other:?}"),
+            };
+            return Some(Cow::Owned(format!(
+                "RotaryEmbedding: dtype {dtype} not supported on CUDA yet (f32 only; f16/bf16 follow-up)"
+            )));
+        }
+    }
+    None
+}
 
 fn check_arity(
     name: &str,
@@ -308,6 +326,6 @@ impl Kernel for RotaryEmbeddingKernel {
     }
 
     fn supports_strided_input(&self, _input_idx: usize) -> bool {
-        true
+        false
     }
 }

@@ -182,6 +182,7 @@ impl KernelCache {
         node_id: NodeId,
         node: &Node,
         input_shapes: &[Vec<usize>],
+        input_dtypes: &[DataType],
         constant_inputs: &[bool],
         opset: u64,
         ep: &dyn ExecutionProvider,
@@ -201,7 +202,7 @@ impl KernelCache {
                 .collect();
             let layouts = vec![TensorLayout::contiguous(); input_shapes.len()];
             if let KernelMatch::Unsupported { reason } =
-                ep.supports_op(node, opset, &shape_dims, &layouts)
+                ep.supports_op(node, opset, &shape_dims, input_dtypes, &layouts)
             {
                 return Err(SessionError::unsupported_op(
                     node,
@@ -860,10 +861,19 @@ fn collect_cuda_coverage_issues(
                     .unwrap_or_else(TensorLayout::contiguous)
             })
             .collect::<Vec<_>>();
+        let input_dtypes = node
+            .inputs
+            .iter()
+            .map(|input| {
+                input
+                    .map(|value| graph.value(value).dtype)
+                    .unwrap_or(DataType::Undefined)
+            })
+            .collect::<Vec<_>>();
 
         let opset = effective_opset(opset_graph, node);
         if let KernelMatch::Unsupported { reason } =
-            ep.supports_op(node, opset, &shapes, &layouts)
+            ep.supports_op(node, opset, &shapes, &input_dtypes, &layouts)
         {
             issues.push(CudaCoverageIssue {
                 domain: canonical_domain(node),
@@ -1312,6 +1322,7 @@ impl Executor {
                 continue;
             }
             let input_shapes = Self::node_input_shapes(&self.plan[i], resolved);
+            let input_dtypes = self.plan[i].input_dtypes.clone();
             let constant_inputs: Vec<bool> = self.plan[i]
                 .inputs
                 .iter()
@@ -1323,6 +1334,7 @@ impl Executor {
                 node_id,
                 node,
                 &input_shapes,
+                &input_dtypes,
                 &constant_inputs,
                 opset,
                 self.ep.as_ref(),
@@ -1966,6 +1978,7 @@ impl Executor {
             node_id,
             node,
             &input_shapes,
+            &input_dtypes,
             &constant_inputs,
             opset,
             ep.as_ref(),
@@ -4497,6 +4510,7 @@ mod tests {
             op: &Node,
             opset: u64,
             _shapes: &[Shape],
+            _input_dtypes: &[DataType],
             _layouts: &[TensorLayout],
         ) -> KernelMatch {
             if LazyWeightBoundary::BlockQuantizedMoe.matches(&op.domain, &op.op_type)

@@ -533,6 +533,7 @@ fn supported_formats_and_prefill_route_to_cuda() {
                 model.graph.node(node),
                 1,
                 &[static_shape([1, qk]), static_shape([1, 1, block_bytes])],
+                &[],
                 &[]
             ),
             KernelMatch::Supported { .. }
@@ -546,6 +547,7 @@ fn supported_formats_and_prefill_route_to_cuda() {
             model.graph.node(node),
             1,
             &[static_shape([1, 32]), static_shape([1, 1, 18])],
+            &[],
             &[]
         ),
         KernelMatch::Unsupported { .. }
@@ -568,6 +570,7 @@ fn supported_formats_and_prefill_route_to_cuda() {
                 model.graph.node(node),
                 1,
                 &[static_shape([2, qk]), static_shape([1, 1, block_bytes])],
+                &[],
                 &[]
             ),
             KernelMatch::Supported { .. }
@@ -584,6 +587,7 @@ fn supported_formats_and_prefill_route_to_cuda() {
                 vec![Dim::Symbolic(SymbolId(0)), Dim::Static(32)],
                 static_shape([1, 1, 17]),
             ],
+            &[],
             &[]
         ),
         KernelMatch::Supported { .. }

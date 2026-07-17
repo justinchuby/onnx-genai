@@ -1230,7 +1230,7 @@ fn gqa_gpu_rejected_features_return_clear_errors() {
     let mut registered = Node::new(NodeId(0), "GroupQueryAttention", vec![], vec![]);
     registered.domain = "com.microsoft".into();
     assert!(matches!(
-        ep.supports_op(&registered, 1, &[], &[]),
+        ep.supports_op(&registered, 1, &[], &[], &[]),
         KernelMatch::Supported { .. }
     ));
 

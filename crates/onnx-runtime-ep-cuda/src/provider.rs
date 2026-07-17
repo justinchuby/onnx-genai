@@ -26,7 +26,7 @@ use onnx_runtime_ep_api::{
     Cost, DeviceBuffer, EpConfig, EpError, ExecutionProvider, Fence, Kernel, KernelMatch,
     OpRegistry, Result, deny,
 };
-use onnx_runtime_ir::{DeviceId, DeviceType, Node, Shape, TensorLayout};
+use onnx_runtime_ir::{DataType, DeviceId, DeviceType, Node, Shape, TensorLayout};
 
 use crate::kernels::build_cuda_registry;
 use crate::runtime::{CudaRuntime, cuptr, raw_ptr};
@@ -115,6 +115,7 @@ impl ExecutionProvider for CudaExecutionProvider {
         op: &Node,
         opset: u64,
         shapes: &[Shape],
+        input_dtypes: &[DataType],
         _layouts: &[TensorLayout],
     ) -> KernelMatch {
         // Keyed on (op_type, domain, opset) via the registry, the same single
@@ -160,6 +161,19 @@ impl ExecutionProvider for CudaExecutionProvider {
         if op.op_type == "QMoE"
             && op.domain == "com.microsoft"
             && let Some(reason) = crate::kernels::qmoe::unsupported_reason(op)
+        {
+            return KernelMatch::unsupported(reason);
+        }
+        if op.op_type == "Attention"
+            && (op.domain.is_empty() || op.domain == "ai.onnx")
+            && let Some(reason) =
+                crate::kernels::standard_attention::unsupported_reason(input_dtypes)
+        {
+            return KernelMatch::unsupported(reason);
+        }
+        if op.op_type == "RotaryEmbedding"
+            && (op.domain.is_empty() || op.domain == "ai.onnx")
+            && let Some(reason) = crate::kernels::rotary_embedding::unsupported_reason(input_dtypes)
         {
             return KernelMatch::unsupported(reason);
         }

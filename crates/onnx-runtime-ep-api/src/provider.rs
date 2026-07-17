@@ -3,7 +3,7 @@
 use std::ffi::c_void;
 use std::ptr::NonNull;
 
-use onnx_runtime_ir::{DeviceId, DeviceType, Graph, Node, NodeId, Shape, TensorLayout};
+use onnx_runtime_ir::{DataType, DeviceId, DeviceType, Graph, Node, NodeId, Shape, TensorLayout};
 
 use crate::epcontext::EpContext;
 use crate::error::{EpError, Result};
@@ -267,7 +267,7 @@ pub trait ExecutionProvider: Send + Sync {
     fn shutdown(&mut self) -> Result<()>;
 
     /// Whether this EP can run `op` at the model's effective `opset` with the
-    /// given input shapes and layouts, and at what cost.
+    /// given input shapes, dtypes, and layouts, and at what cost.
     ///
     /// Every [`KernelMatch::Unsupported`] result must carry an actionable reason:
     /// state what the EP accepts and, where possible, how to fix the model or
@@ -277,6 +277,7 @@ pub trait ExecutionProvider: Send + Sync {
         op: &Node,
         opset: u64,
         shapes: &[Shape],
+        input_dtypes: &[DataType],
         layouts: &[TensorLayout],
     ) -> KernelMatch;
 
