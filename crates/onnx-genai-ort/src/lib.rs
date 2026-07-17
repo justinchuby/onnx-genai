@@ -26,7 +26,8 @@ pub use allocator::{Allocator, AllocatorType, MemoryInfo, MemoryType};
 pub use binding::IoBinding;
 pub use chat_template::{ChatMessage, ChatRole, ChatTemplate};
 pub use decode::{
-    BatchedStaticCacheDecodeSession, DecodeKvMode, DecodeSession, DecodeSessionOptions,
+    BatchedDecodeSession, BatchedSharedBufferDecodeSession, BatchedStaticCacheDecodeSession,
+    DecodeKvMode, DecodeSession, DecodeSessionOptions, SharedBufferBatchOptions,
     StaticCacheBindingMode, StaticCacheBufferInfo, StaticCacheDecodeOptions,
     StaticCacheDecodeSession, StaticCacheSignature,
 };
