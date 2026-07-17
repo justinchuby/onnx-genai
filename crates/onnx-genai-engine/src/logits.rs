@@ -114,6 +114,14 @@ impl ProcessorChain {
         self.processors.push(processor);
     }
 
+    /// Whether the chain has no processors. When empty, greedy decoding reduces
+    /// to a plain argmax of the raw logits, enabling the decode fast path that
+    /// selects the token on the device/buffer without materializing the full
+    /// vocabulary on the host.
+    pub fn is_empty(&self) -> bool {
+        self.processors.is_empty()
+    }
+
     pub fn add_constraint(
         &mut self,
         constraint: Box<dyn Constraint>,

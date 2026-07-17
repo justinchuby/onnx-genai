@@ -321,6 +321,73 @@ impl Value {
         }
     }
 
+    /// Argmax over the final `vocab`-sized row of a `[.., vocab]` logits tensor.
+    ///
+    /// Reads the tensor in place and returns the index of the maximum element
+    /// of its last row without allocating a host `Vec`. Semantics match the
+    /// engine's greedy sampler exactly: NaNs are ignored, ties resolve to the
+    /// lowest index, and an empty/all-NaN row selects index 0. Float16/BFloat16
+    /// logits are widened with half's vectorized (hardware F16C) slice
+    /// conversion before the scan, matching `to_vec_f32_lossy`.
+    ///
+    /// This is the host reduction behind the greedy decode fast path: instead
+    /// of copying the whole ~150K-entry vocabulary out of the persistent logits
+    /// buffer every token (and re-scanning it), the caller reads only the four
+    /// bytes of the selected token id. The tensor must be host-readable
+    /// (CPU-allocated), like every logits buffer the decode sessions bind as a
+    /// CPU output.
+    pub fn argmax_last_row(&self) -> Result<u32> {
+        let vocab = self
+            .shape
+            .last()
+            .copied()
+            .filter(|dim| *dim > 0)
+            .ok_or_else(|| {
+                OrtError::InvalidArgument(format!(
+                    "argmax_last_row requires a positive trailing dim, got shape {:?}",
+                    self.shape
+                ))
+            })? as usize;
+        let numel = self.numel();
+        let offset = numel.checked_sub(vocab).ok_or_else(|| {
+            OrtError::InvalidArgument(format!(
+                "argmax_last_row row size {vocab} exceeds tensor length {numel}"
+            ))
+        })?;
+        let data = tensor_data_ptr(self.ptr.as_ptr())?;
+        // SAFETY: the tensor owns `numel` contiguous elements of `dtype` at
+        // `data`, valid until the value is released; we only read the final row
+        // `[offset, offset + vocab)`, which is in bounds by construction.
+        let index = match self.dtype {
+            DataType::Float32 => {
+                let row = unsafe { std::slice::from_raw_parts(data.cast::<f32>().add(offset), vocab) };
+                argmax_row_f32(row)
+            }
+            DataType::Float16 => {
+                let bits =
+                    unsafe { std::slice::from_raw_parts(data.cast::<u16>().add(offset), vocab) };
+                // Widen with half's vectorized (hardware F16C) slice conversion
+                // rather than a scalar per-element loop, matching the fast path
+                // in `to_vec_f32_lossy`, then argmax the widened row.
+                let halves: &[half::f16] = half::slice::HalfBitsSliceExt::reinterpret_cast(bits);
+                argmax_row_f32(&half::slice::HalfFloatSliceExt::to_f32_vec(halves))
+            }
+            DataType::BFloat16 => {
+                let bits =
+                    unsafe { std::slice::from_raw_parts(data.cast::<u16>().add(offset), vocab) };
+                let halves: &[half::bf16] =
+                    half::slice::HalfBitsSliceExt::reinterpret_cast(bits);
+                argmax_row_f32(&half::slice::HalfFloatSliceExt::to_f32_vec(halves))
+            }
+            other => {
+                return Err(OrtError::InvalidArgument(format!(
+                    "argmax_last_row does not support {other:?} logits"
+                )));
+            }
+        };
+        Ok(index as u32)
+    }
+
     /// Copy Float16 tensor data out as IEEE-754 half-precision bit patterns.
     pub fn to_vec_f16_bits(&self) -> Result<Vec<u16>> {
         if self.dtype != DataType::Float16 {
@@ -770,6 +837,20 @@ fn tensor_data_to_vec<T: Copy>(
     Ok(slice.to_vec())
 }
 
+/// Index of the maximum value in `row`, ignoring NaNs.
+///
+/// Matches the engine greedy sampler exactly: a vectorizable horizontal max
+/// followed by a first-match search (so ties resolve to the lowest index), and
+/// an empty/all-NaN row yields 0. Both passes are branch-free per element, so
+/// the compiler autovectorizes them over the ~150K-entry vocabulary.
+fn argmax_row_f32(row: &[f32]) -> usize {
+    let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    if max == f32::NEG_INFINITY {
+        return 0;
+    }
+    row.iter().position(|&value| value == max).unwrap_or(0)
+}
+
 fn tensor_data_ptr(value: *mut onnx_genai_ort_sys::OrtValue) -> Result<*mut std::ffi::c_void> {
     let api = crate::error::api()?;
     let get_data = api
@@ -783,4 +864,49 @@ fn tensor_data_ptr(value: *mut onnx_genai_ort_sys::OrtValue) -> Result<*mut std:
         return Err(OrtError::NullPointer);
     }
     Ok(data)
+}
+
+#[cfg(test)]
+mod argmax_tests {
+    use super::argmax_row_f32;
+
+    /// Reference argmax mirroring the engine greedy sampler: max ignoring NaN,
+    /// lowest index on ties, index 0 for empty/all-NaN input.
+    fn reference(values: &[f32]) -> usize {
+        let max = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        if max == f32::NEG_INFINITY {
+            return 0;
+        }
+        values.iter().position(|&v| v == max).unwrap_or(0)
+    }
+
+    #[test]
+    fn matches_reference_on_various_rows() {
+        let rows: &[&[f32]] = &[
+            &[],
+            &[1.0, 3.0, 3.0],
+            &[3.0, 1.0, 3.0],
+            &[-1.0, -2.0, -0.5],
+            &[f32::NEG_INFINITY, f32::NEG_INFINITY],
+            &[0.0, f32::NAN, 2.0, f32::NAN, 2.0],
+            &[f32::NAN, f32::NAN],
+            &[f32::INFINITY, 5.0, f32::INFINITY],
+            &[-0.0, 0.0],
+        ];
+        for row in rows {
+            assert_eq!(argmax_row_f32(row), reference(row), "mismatch for {row:?}");
+        }
+    }
+
+    #[test]
+    fn ties_pick_lowest_index() {
+        assert_eq!(argmax_row_f32(&[2.0, 2.0, 2.0]), 0);
+        assert_eq!(argmax_row_f32(&[1.0, 2.0, 2.0]), 1);
+    }
+
+    #[test]
+    fn ignores_nan_and_handles_all_nan() {
+        assert_eq!(argmax_row_f32(&[f32::NAN, 1.0, f32::NAN]), 1);
+        assert_eq!(argmax_row_f32(&[f32::NAN, f32::NAN]), 0);
+    }
 }
