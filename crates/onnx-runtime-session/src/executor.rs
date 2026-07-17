@@ -3459,6 +3459,10 @@ impl Executor {
             carried.push(self.value_tensor(vid, resolved)?);
         }
         let num_carried = carried.len();
+        let carried_invariants: Vec<(DataType, Vec<usize>)> = carried
+            .iter()
+            .map(|tensor| (tensor.dtype, tensor.shape.clone()))
+            .collect();
         // Loop outputs = carried finals ++ scan outputs. Scan-output count is
         // whatever remains after the carried finals.
         let num_outputs = node.outputs.len();
@@ -3471,9 +3475,8 @@ impl Executor {
         let num_scan = num_outputs - num_carried;
         let empty_scan_specs =
             self.loop_body_scan_specs(node, &carried, num_scan, resolved)?;
-        let expected_iterations = m.and_then(|n| usize::try_from(n).ok());
         let mut scan_acc: Vec<TensorStackAccumulator> = (0..num_scan)
-            .map(|_| TensorStackAccumulator::new(expected_iterations))
+            .map(|_| TensorStackAccumulator::new(None))
             .collect();
         let prepared = self.prepare_subgraph(node.id, "body", resolved, outer_scope)?;
         let mut iter_tensor = scalar_i64_tensor(0)?;
@@ -3516,8 +3519,34 @@ impl Executor {
                     cond_out.dtype
                 ))
             })?);
-            carried.clear();
-            carried.extend((&mut it).take(num_carried));
+            let next_carried: Vec<Tensor> = (&mut it).take(num_carried).collect();
+            for (index, (tensor, (expected_dtype, expected_shape))) in next_carried
+                .iter()
+                .zip(&carried_invariants)
+                .enumerate()
+            {
+                if tensor.dtype != *expected_dtype {
+                    return Err(SessionError::ControlFlow {
+                        op: "Loop".to_string(),
+                        reason: format!(
+                            "loop-carried output {index} dtype mismatch: expected \
+                             {expected_dtype:?}, got {:?}",
+                            tensor.dtype
+                        ),
+                    });
+                }
+                if tensor.shape != *expected_shape {
+                    return Err(SessionError::ControlFlow {
+                        op: "Loop".to_string(),
+                        reason: format!(
+                            "loop-carried output {index} shape mismatch: expected \
+                             {expected_shape:?}, got {:?}",
+                            tensor.shape
+                        ),
+                    });
+                }
+            }
+            carried = next_carried;
             for acc in scan_acc.iter_mut() {
                 acc.push(it.next().expect("scan output present"))?;
             }

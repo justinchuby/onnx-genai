@@ -542,6 +542,122 @@ fn loop_many_iterations_accumulates_correctly() {
     assert_eq!(session.control_flow_stats().subgraph_runs, n as u64);
 }
 
+fn loop_single_scan_then_stop_body() -> Graph {
+    let mut b = Graph::new();
+    let iter = capture(&mut b, "iter", DataType::Int64, &[]);
+    let cond_in = capture(&mut b, "cond_in", DataType::Bool, &[]);
+    b.add_input(iter);
+    b.add_input(cond_in);
+
+    let cond_out = init(&mut b, "cond_out", DataType::Bool, &[], vec![0]);
+    let scan_out = init(
+        &mut b,
+        "scan_out",
+        DataType::Float32,
+        &[2],
+        f32_bytes(&[3.0, 5.0]),
+    );
+    b.add_output(cond_out);
+    b.add_output(scan_out);
+    b
+}
+
+#[test]
+fn loop_huge_trip_count_with_early_exit_stacks_one_scan_slice() {
+    let mut g = new_parent();
+    let m = init(&mut g, "M", DataType::Int64, &[], i64_bytes(&[i64::MAX]));
+    let cond = init(&mut g, "cond", DataType::Bool, &[], vec![1]);
+    let scan = g.create_named_value("scan", DataType::Float32, static_shape([1, 2]));
+
+    let node =
+        control_flow_node(&mut g, "Loop", vec![Some(m), Some(cond)], vec![scan], &[]);
+    register(&mut g, node, "body", loop_single_scan_then_stop_body());
+    g.add_output(scan);
+
+    let mut session = InferenceSession::from_graph(g).expect("build session");
+    let outs = session.run(&[]).expect("huge M must not reserve eagerly");
+    assert_eq!(outs[0].shape, vec![1, 2]);
+    assert_eq!(outs[0].to_vec_f32(), vec![3.0, 5.0]);
+    assert_eq!(session.control_flow_stats().subgraph_runs, 1);
+}
+
+fn loop_shape_changing_carried_body() -> Graph {
+    let mut b = Graph::new();
+    let iter = capture(&mut b, "iter", DataType::Int64, &[]);
+    let cond_in = capture(&mut b, "cond_in", DataType::Bool, &[]);
+    let carried = capture(&mut b, "carried", DataType::Float32, &[2]);
+    b.add_input(iter);
+    b.add_input(cond_in);
+    b.add_input(carried);
+
+    let axes0 = init(&mut b, "axes0", DataType::Int64, &[1], i64_bytes(&[0]));
+    let iter_vec = op(
+        &mut b,
+        "Unsqueeze",
+        &[iter, axes0],
+        Some("iter_vec"),
+        DataType::Int64,
+        &[1],
+        &[],
+    );
+    let two = init(&mut b, "two", DataType::Int64, &[1], i64_bytes(&[2]));
+    let end = op(&mut b, "Sub", &[two, iter_vec], Some("end"), DataType::Int64, &[1], &[]);
+    let start = init(&mut b, "start", DataType::Int64, &[1], i64_bytes(&[0]));
+    let axis = init(&mut b, "axis", DataType::Int64, &[1], i64_bytes(&[0]));
+    let step = init(&mut b, "step", DataType::Int64, &[1], i64_bytes(&[1]));
+    let dynamic = b.intern_symbol("dynamic_carried");
+    let carried_out =
+        b.create_named_value("carried_out", DataType::Float32, vec![Dim::Symbolic(dynamic)]);
+    b.insert_node(Node::new(
+        NodeId(0),
+        "Slice",
+        vec![Some(carried), Some(start), Some(end), Some(axis), Some(step)],
+        vec![carried_out],
+    ));
+    let cond_out = op(&mut b, "Identity", &[cond_in], Some("cond_out"), DataType::Bool, &[], &[]);
+    b.add_output(cond_out);
+    b.add_output(carried_out);
+    b
+}
+
+#[test]
+fn loop_rejects_carried_shape_change_on_second_iteration() {
+    let mut g = new_parent();
+    let m = init(&mut g, "M", DataType::Int64, &[], i64_bytes(&[2]));
+    let cond = init(&mut g, "cond", DataType::Bool, &[], vec![1]);
+    let carried0 = init(
+        &mut g,
+        "carried0",
+        DataType::Float32,
+        &[2],
+        f32_bytes(&[7.0, 11.0]),
+    );
+    let carried_final =
+        g.create_named_value("carried_final", DataType::Float32, static_shape([2]));
+
+    let node = control_flow_node(
+        &mut g,
+        "Loop",
+        vec![Some(m), Some(cond), Some(carried0)],
+        vec![carried_final],
+        &[],
+    );
+    register(&mut g, node, "body", loop_shape_changing_carried_body());
+    g.add_output(carried_final);
+
+    let mut session = InferenceSession::from_graph(g).expect("build session");
+    let err = session
+        .run(&[])
+        .expect_err("Loop must reject a carried shape change");
+    assert!(
+        err.to_string().contains(
+            "control-flow op Loop: loop-carried output 0 shape mismatch: expected [2], got [1]"
+        ),
+        "unexpected error: {err}"
+    );
+    assert_eq!(session.control_flow_stats().subgraph_runs, 2);
+}
+
 // --- Scan -------------------------------------------------------------------
 
 /// Scan body: running-sum state plus per-step emission of the updated state.
