@@ -1207,6 +1207,24 @@ fn reshape_zero_copies_input_dim() {
 }
 
 #[test]
+fn reshape_rejects_multiple_inferred_dimensions_and_product_mismatches() {
+    let n = node("Reshape", 2, 1);
+
+    // ONNX permits at most one -1 in the target shape.
+    assert!(
+        try_run(
+            &n,
+            vec![f32in(vec![c(2), c(3)]), sd_vec(vec![c(-1), c(-1)])],
+            13,
+        )
+        .is_err()
+    );
+
+    // A fully concrete target must preserve the element count.
+    assert!(try_run(&n, vec![f32in(vec![c(2), c(3)]), sd_vec(vec![c(4)])], 13,).is_err());
+}
+
+#[test]
 fn reshape_symbolic_target_dim() {
     // target carries a symbolic dim (batch read from a Shape op)
     let n = node("Reshape", 2, 1);
