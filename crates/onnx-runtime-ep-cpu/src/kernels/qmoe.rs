@@ -17,6 +17,8 @@
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
+use std::ops::Deref;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use onnx_runtime_ep_api::{
     EpError, ExternalMmapRegion, Kernel, KernelFactory, Result, TensorBacking, TensorMut,
@@ -33,7 +35,7 @@ use super::{
     check_arity, contiguous_f32_slice, contiguous_u8_slice, to_dense_bytes, to_dense_f32,
     write_dense_f32,
 };
-use crate::weight_offload::{WeightOffloadMode, metrics};
+use crate::weight_offload::{WeightOffloadMode, metrics, weight_offload_host_budget};
 
 /// Factory for the ORT contrib `QMoE` operator.
 pub struct QMoEFactory;
@@ -338,26 +340,37 @@ impl Kernel for QMoEKernel {
                 "routed contribution byte count",
             )?;
             let mut contributions = vec![0.0f32; contribution_elements];
+            let host_cache_budget = weight_offload_host_budget().map_err(error)?;
             for (expert, expert_tasks) in tasks {
-                let weights = DequantizedExpert {
-                    fc1: fc1.dequantize_expert(expert)?,
-                    fc2: fc2.dequantize_expert(expert)?,
-                    fc3: fc3
-                        .as_ref()
-                        .map(|weights| weights.dequantize_expert(expert))
-                        .transpose()?,
-                };
+                let expanded_bytes = DequantizedExpert::expanded_bytes(&fc1, &fc2, fc3.as_ref())?;
+                let key = ExpertCacheKey::new(
+                    self.layer_id,
+                    expert,
+                    self.bits,
+                    self.block_size,
+                    &fc1,
+                    &fc2,
+                    fc3.as_ref(),
+                );
+                let weights = host_expert_cache()
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .lease(key, expanded_bytes, host_cache_budget, || {
+                        DequantizedExpert::load(expert, &fc1, &fc2, fc3.as_ref())
+                    })?;
                 metrics().record_dequantized_window(1);
-                let mut bytes_read = fc1
-                    .expert_source_bytes(expert)?
-                    .checked_add(fc2.expert_source_bytes(expert)?)
-                    .ok_or_else(|| error("selected expert byte count overflow"))?;
-                if let Some(source) = &fc3 {
-                    bytes_read = bytes_read
-                        .checked_add(source.expert_source_bytes(expert)?)
+                if weights.read_from_mmap {
+                    let mut bytes_read = fc1
+                        .expert_source_bytes(expert)?
+                        .checked_add(fc2.expert_source_bytes(expert)?)
                         .ok_or_else(|| error("selected expert byte count overflow"))?;
+                    if let Some(source) = &fc3 {
+                        bytes_read = bytes_read
+                            .checked_add(source.expert_source_bytes(expert)?)
+                            .ok_or_else(|| error("selected expert byte count overflow"))?;
+                    }
+                    metrics().record_bytes_read(bytes_read).map_err(error)?;
                 }
-                metrics().record_bytes_read(bytes_read).map_err(error)?;
                 for (row, slot, route_weight) in expert_tasks {
                     let input_range = checked_range(row, hidden, "input row")?;
                     let contribution_range =
@@ -451,6 +464,360 @@ struct DequantizedExpert {
     fc1: Vec<f32>,
     fc2: Vec<f32>,
     fc3: Option<Vec<f32>>,
+}
+
+impl DequantizedExpert {
+    fn load(
+        expert: usize,
+        fc1: &QuantizedExperts<'_>,
+        fc2: &QuantizedExperts<'_>,
+        fc3: Option<&QuantizedExperts<'_>>,
+    ) -> Result<Self> {
+        Ok(Self {
+            fc1: fc1.dequantize_expert(expert)?,
+            fc2: fc2.dequantize_expert(expert)?,
+            fc3: fc3
+                .map(|weights| weights.dequantize_expert(expert))
+                .transpose()?,
+        })
+    }
+
+    fn expanded_bytes(
+        fc1: &QuantizedExperts<'_>,
+        fc2: &QuantizedExperts<'_>,
+        fc3: Option<&QuantizedExperts<'_>>,
+    ) -> Result<usize> {
+        let mut bytes = fc1.dequantized_bytes()?;
+        bytes = bytes
+            .checked_add(fc2.dequantized_bytes()?)
+            .ok_or_else(|| error("selected expert expanded byte count overflow"))?;
+        if let Some(weights) = fc3 {
+            bytes = bytes
+                .checked_add(weights.dequantized_bytes()?)
+                .ok_or_else(|| error("selected expert expanded byte count overflow"))?;
+        }
+        if bytes > isize::MAX as usize {
+            return Err(error(
+                "selected expert expanded byte count exceeds isize::MAX",
+            ));
+        }
+        Ok(bytes)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct ExpertCacheKey {
+    layer_id: u32,
+    expert: usize,
+    bits: usize,
+    block_size: usize,
+    out_and_in_features: Vec<(usize, usize)>,
+    source_regions: Vec<ExternalMmapRegion>,
+}
+
+impl ExpertCacheKey {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        layer_id: u32,
+        expert: usize,
+        bits: usize,
+        block_size: usize,
+        fc1: &QuantizedExperts<'_>,
+        fc2: &QuantizedExperts<'_>,
+        fc3: Option<&QuantizedExperts<'_>>,
+    ) -> Self {
+        let mut out_and_in_features = vec![
+            (fc1.out_features, fc1.in_features),
+            (fc2.out_features, fc2.in_features),
+        ];
+        let mut source_regions = Vec::with_capacity(
+            fc1.mapped_regions.len()
+                + fc2.mapped_regions.len()
+                + fc3.map_or(0, |weights| weights.mapped_regions.len()),
+        );
+        source_regions.extend_from_slice(&fc1.mapped_regions);
+        source_regions.extend_from_slice(&fc2.mapped_regions);
+        if let Some(weights) = fc3 {
+            out_and_in_features.push((weights.out_features, weights.in_features));
+            source_regions.extend_from_slice(&weights.mapped_regions);
+        }
+        Self {
+            layer_id,
+            expert,
+            bits,
+            block_size,
+            out_and_in_features,
+            source_regions,
+        }
+    }
+}
+
+struct ExpertLease {
+    weights: Arc<DequantizedExpert>,
+    read_from_mmap: bool,
+}
+
+impl Deref for ExpertLease {
+    type Target = DequantizedExpert;
+
+    fn deref(&self) -> &Self::Target {
+        &self.weights
+    }
+}
+
+struct HostCacheEntry {
+    weights: Arc<DequantizedExpert>,
+    expanded_bytes: usize,
+    frequency: u64,
+    last_used: u64,
+    pin_until: u64,
+}
+
+#[derive(Default)]
+struct AdmissionHistory {
+    frequency: u64,
+    last_used: u64,
+}
+
+#[derive(Default)]
+struct HostExpertCache {
+    entries: BTreeMap<ExpertCacheKey, HostCacheEntry>,
+    history: BTreeMap<ExpertCacheKey, AdmissionHistory>,
+    owned_bytes: usize,
+    clock: u64,
+}
+
+const ADMISSION_FREQUENCY: u64 = 2;
+const PIN_FREQUENCY: u64 = 3;
+const PIN_WINDOW: u64 = 8;
+const HISTORY_DECAY_WINDOW: u64 = 64;
+
+impl HostExpertCache {
+    fn lease<F>(
+        &mut self,
+        key: ExpertCacheKey,
+        expanded_bytes: usize,
+        budget_bytes: usize,
+        load: F,
+    ) -> Result<ExpertLease>
+    where
+        F: FnOnce() -> Result<DequantizedExpert>,
+    {
+        self.clock = self
+            .clock
+            .checked_add(1)
+            .ok_or_else(|| error("host-cache access clock overflow"))?;
+        let now = self.clock;
+        self.trim_to_budget(budget_bytes)?;
+        if let Some(entry) = self.entries.get_mut(&key) {
+            entry.frequency = entry.frequency.saturating_add(1);
+            entry.last_used = now;
+            if entry.frequency >= PIN_FREQUENCY {
+                entry.pin_until = now.saturating_add(PIN_WINDOW);
+            }
+            metrics().record_host_cache_hit();
+            metrics()
+                .record_host_cache_residency(self.owned_bytes, budget_bytes)
+                .map_err(error)?;
+            return Ok(ExpertLease {
+                weights: Arc::clone(&entry.weights),
+                read_from_mmap: false,
+            });
+        }
+
+        metrics().record_host_cache_miss();
+        let history = self.history.entry(key.clone()).or_default();
+        if now.saturating_sub(history.last_used) > HISTORY_DECAY_WINDOW {
+            history.frequency /= 2;
+        }
+        history.frequency = history.frequency.saturating_add(1);
+        history.last_used = now;
+        let candidate_frequency = history.frequency;
+        if budget_bytes == 0
+            || expanded_bytes == 0
+            || expanded_bytes > budget_bytes
+            || candidate_frequency < ADMISSION_FREQUENCY
+        {
+            metrics()
+                .record_host_cache_residency(self.owned_bytes, budget_bytes)
+                .map_err(error)?;
+            return Ok(ExpertLease {
+                weights: Arc::new(load()?),
+                read_from_mmap: true,
+            });
+        }
+
+        let required = self
+            .owned_bytes
+            .checked_add(expanded_bytes)
+            .ok_or_else(|| error("owned host-cache byte count overflow"))?;
+        let mut victims = Vec::new();
+        if required > budget_bytes {
+            let mut candidates = self
+                .entries
+                .iter()
+                .filter(|(_, entry)| {
+                    Arc::strong_count(&entry.weights) == 1
+                        && entry.pin_until < now
+                        && candidate_frequency > entry.frequency
+                })
+                .map(|(key, entry)| {
+                    (
+                        entry.frequency,
+                        entry.last_used,
+                        key.clone(),
+                        entry.expanded_bytes,
+                    )
+                })
+                .collect::<Vec<_>>();
+            candidates.sort_by_key(|(frequency, last_used, _, _)| (*frequency, *last_used));
+            let mut reclaim = required - budget_bytes;
+            for (_, _, victim, bytes) in candidates {
+                victims.push(victim);
+                reclaim = reclaim.saturating_sub(bytes);
+                if reclaim == 0 {
+                    break;
+                }
+            }
+            if reclaim != 0 {
+                metrics()
+                    .record_host_cache_residency(self.owned_bytes, budget_bytes)
+                    .map_err(error)?;
+                return Ok(ExpertLease {
+                    weights: Arc::new(load()?),
+                    read_from_mmap: true,
+                });
+            }
+        }
+
+        let mut evicted_bytes = 0usize;
+        for victim in &victims {
+            let entry = self
+                .entries
+                .remove(victim)
+                .expect("selected host-cache victim exists");
+            evicted_bytes = evicted_bytes
+                .checked_add(entry.expanded_bytes)
+                .ok_or_else(|| error("evicted host-cache byte count overflow"))?;
+        }
+        self.owned_bytes = self
+            .owned_bytes
+            .checked_sub(evicted_bytes)
+            .ok_or_else(|| error("owned host-cache byte accounting underflow"))?;
+        self.owned_bytes = self
+            .owned_bytes
+            .checked_add(expanded_bytes)
+            .ok_or_else(|| error("owned host-cache byte count overflow"))?;
+        debug_assert!(self.owned_bytes <= budget_bytes);
+        metrics()
+            .record_host_cache_evictions(victims.len())
+            .map_err(error)?;
+        metrics()
+            .record_host_cache_residency(self.owned_bytes, budget_bytes)
+            .map_err(error)?;
+
+        let loaded = match load() {
+            Ok(loaded) => loaded,
+            Err(failure) => {
+                self.owned_bytes = self
+                    .owned_bytes
+                    .checked_sub(expanded_bytes)
+                    .ok_or_else(|| error("host-cache reservation rollback underflow"))?;
+                metrics()
+                    .record_host_cache_residency(self.owned_bytes, budget_bytes)
+                    .map_err(error)?;
+                return Err(failure);
+            }
+        };
+        let weights = Arc::new(loaded);
+        self.entries.insert(
+            key,
+            HostCacheEntry {
+                weights: Arc::clone(&weights),
+                expanded_bytes,
+                frequency: candidate_frequency,
+                last_used: now,
+                pin_until: 0,
+            },
+        );
+        Ok(ExpertLease {
+            weights,
+            read_from_mmap: true,
+        })
+    }
+
+    fn trim_to_budget(&mut self, budget_bytes: usize) -> Result<()> {
+        if self.owned_bytes <= budget_bytes {
+            metrics()
+                .record_host_cache_residency(self.owned_bytes, budget_bytes)
+                .map_err(error)?;
+            return Ok(());
+        }
+        let mut candidates = self
+            .entries
+            .iter()
+            .filter(|(_, entry)| Arc::strong_count(&entry.weights) == 1)
+            .map(|(key, entry)| {
+                (
+                    entry.last_used,
+                    entry.frequency,
+                    key.clone(),
+                    entry.expanded_bytes,
+                )
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by_key(|(last_used, frequency, _, _)| (*last_used, *frequency));
+        let mut victims = Vec::new();
+        let mut projected = self.owned_bytes;
+        for (_, _, key, bytes) in candidates {
+            victims.push(key);
+            projected = projected
+                .checked_sub(bytes)
+                .ok_or_else(|| error("host-cache trim byte accounting underflow"))?;
+            if projected <= budget_bytes {
+                break;
+            }
+        }
+        if projected > budget_bytes {
+            return Err(error(format!(
+                "cannot lower owned host-cache budget to {budget_bytes} bytes while {} bytes are leased",
+                projected
+            )));
+        }
+        for victim in &victims {
+            self.entries
+                .remove(victim)
+                .expect("selected host-cache trim victim exists");
+        }
+        self.owned_bytes = projected;
+        metrics()
+            .record_host_cache_evictions(victims.len())
+            .map_err(error)?;
+        metrics()
+            .record_host_cache_residency(self.owned_bytes, budget_bytes)
+            .map_err(error)?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.history.clear();
+        self.owned_bytes = 0;
+        self.clock = 0;
+    }
+}
+
+fn host_expert_cache() -> &'static Mutex<HostExpertCache> {
+    static CACHE: OnceLock<Mutex<HostExpertCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HostExpertCache::default()))
+}
+
+pub(crate) fn reconfigure_host_expert_cache(budget_bytes: usize) -> Result<()> {
+    host_expert_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .trim_to_budget(budget_bytes)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -721,7 +1088,13 @@ impl<'a> QuantizedExperts<'a> {
                 self.experts
             )));
         }
-        let mut output = vec![0.0f32; self.dequantized_elements];
+        let mut output = Vec::new();
+        output
+            .try_reserve_exact(self.dequantized_elements)
+            .map_err(|failure| {
+                error(format!("failed to allocate dequantized expert: {failure}"))
+            })?;
+        output.resize(self.dequantized_elements, 0.0f32);
         for row in 0..self.out_features {
             let expert_row = expert
                 .checked_mul(self.out_features)
@@ -745,6 +1118,14 @@ impl<'a> QuantizedExperts<'a> {
             );
         }
         Ok(output)
+    }
+
+    fn dequantized_bytes(&self) -> Result<usize> {
+        checked_byte_count(
+            self.dequantized_elements,
+            std::mem::size_of::<f32>(),
+            "per-expert expanded byte count",
+        )
     }
 }
 
@@ -1110,6 +1491,16 @@ mod tests {
         router: &[f32],
         k: usize,
     ) -> MmapRun {
+        run_mmap_qmoe_sequence(enabled, interleaved, input, &[router], k)
+    }
+
+    fn run_mmap_qmoe_sequence(
+        enabled: bool,
+        interleaved: bool,
+        input: &[f32],
+        routers: &[&[f32]],
+        k: usize,
+    ) -> MmapRun {
         const EXPERTS: usize = 4;
         const ROWS: usize = 4;
         const HIDDEN: usize = 16;
@@ -1240,35 +1631,6 @@ mod tests {
         let fc1_scale_shape = [EXPERTS, INTER, BLOCKS];
         let fc2_packed_shape = [EXPERTS, HIDDEN, PACKED];
         let fc2_scale_shape = [EXPERTS, HIDDEN, BLOCKS];
-        let fc1_packed_view = mapped_tensor_view(
-            &store,
-            &fc1_packed_ref,
-            &fc1_packed_shape,
-            &packed_strides,
-            DataType::Uint8,
-        );
-        let fc1_scales_view = mapped_tensor_view(
-            &store,
-            &fc1_scales_ref,
-            &fc1_scale_shape,
-            &scale_strides,
-            DataType::Float32,
-        );
-        let fc2_packed_view = mapped_tensor_view(
-            &store,
-            &fc2_packed_ref,
-            &fc2_packed_shape,
-            &fc2_packed_strides,
-            DataType::Uint8,
-        );
-        let fc2_scales_view = mapped_tensor_view(
-            &store,
-            &fc2_scales_ref,
-            &fc2_scale_shape,
-            &fc2_scale_strides,
-            DataType::Float32,
-        );
-
         let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/qmoe_weight_offload/model.onnx");
         let (graph, fixture_store) =
@@ -1296,23 +1658,51 @@ mod tests {
             weight_offload: WeightOffloadMode { enabled },
         };
         let x = Owned::f32(&[ROWS, HIDDEN], input);
-        let router = Owned::f32(&[ROWS, EXPERTS], router);
-        let mut output = Owned::zeros_f32(&[ROWS, HIDDEN]);
-        kernel
-            .execute(
-                &[
-                    x.view(),
-                    router.view(),
-                    fc1_packed_view,
-                    fc1_scales_view,
-                    TensorView::absent(DataType::Float32),
-                    fc2_packed_view,
-                    fc2_scales_view,
-                ],
-                &mut [output.view_mut()],
-            )
-            .expect("run mmap QMoE");
-        let output = output.to_f32();
+        let mut final_output = None;
+        for router in routers {
+            let router = Owned::f32(&[ROWS, EXPERTS], router);
+            let mut output = Owned::zeros_f32(&[ROWS, HIDDEN]);
+            kernel
+                .execute(
+                    &[
+                        x.view(),
+                        router.view(),
+                        mapped_tensor_view(
+                            &store,
+                            &fc1_packed_ref,
+                            &fc1_packed_shape,
+                            &packed_strides,
+                            DataType::Uint8,
+                        ),
+                        mapped_tensor_view(
+                            &store,
+                            &fc1_scales_ref,
+                            &fc1_scale_shape,
+                            &scale_strides,
+                            DataType::Float32,
+                        ),
+                        TensorView::absent(DataType::Float32),
+                        mapped_tensor_view(
+                            &store,
+                            &fc2_packed_ref,
+                            &fc2_packed_shape,
+                            &fc2_packed_strides,
+                            DataType::Uint8,
+                        ),
+                        mapped_tensor_view(
+                            &store,
+                            &fc2_scales_ref,
+                            &fc2_scale_shape,
+                            &fc2_scale_strides,
+                            DataType::Float32,
+                        ),
+                    ],
+                    &mut [output.view_mut()],
+                )
+                .expect("run mmap QMoE");
+            final_output = Some(output.to_f32());
+        }
+        let output = final_output.expect("at least one QMoE execution");
         drop(store);
         std::fs::remove_file(path).expect("remove external weights");
         MmapRun {
@@ -1339,6 +1729,15 @@ mod tests {
     fn metrics_test_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn reset_offload_test_state(host_cache_budget: u64) {
+        host_expert_cache()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        metrics().reset();
+        crate::set_weight_offload_host_budget(host_cache_budget).expect("test host-cache budget");
     }
 
     fn run_equivalence(
@@ -1468,9 +1867,9 @@ mod tests {
         let _guard = metrics_test_lock().lock().expect("metrics test lock");
         let input = pseudo_random_values(4 * 16, 0x1234_5678);
         let router = pseudo_random_values(4 * 4, 0x9876_5432);
-        metrics().reset();
+        reset_offload_test_state(0);
         let baseline = run_mmap_qmoe(false, false, &input, &router);
-        metrics().reset();
+        reset_offload_test_state(0);
         let route_first = run_mmap_qmoe(true, false, &input, &router);
         assert!(route_first.catalogs_pageable);
         assert_close(&route_first.output, &baseline.output);
@@ -1482,7 +1881,7 @@ mod tests {
         let input = pseudo_random_values(4 * 16, 0xa11c_e55);
         let router = pseudo_random_values(4 * 4, 0x5151_5151);
         let baseline = run_mmap_qmoe_with_k(false, false, &input, &router, 3);
-        metrics().reset();
+        reset_offload_test_state(0);
         let route_first = run_mmap_qmoe_with_k(true, false, &input, &router, 3);
         assert_eq!(route_first.output, baseline.output);
     }
@@ -1497,7 +1896,7 @@ mod tests {
             0.0, 1.0, 2.0, 6.0, // expert 3
             2.0, 1.0, 0.0, 7.0, // expert 3
         ];
-        metrics().reset();
+        reset_offload_test_state(0);
         let run = run_mmap_qmoe(true, false, &input, &router);
         let stats = crate::weight_offload_stats();
         assert_eq!(
@@ -1526,7 +1925,7 @@ mod tests {
             0.0, 0.0, 0.0, 9.0, // expert 3
         ];
         let baseline = run_mmap_qmoe(false, false, &input, &router);
-        metrics().reset();
+        reset_offload_test_state(0);
         let route_first = run_mmap_qmoe(true, false, &input, &router);
         let stats = crate::weight_offload_stats();
         assert_close(&route_first.output, &baseline.output);
@@ -1542,7 +1941,7 @@ mod tests {
             0.0, 5.0, 1.0, 2.0, 1.0, 4.0, 0.0, 3.0, 0.0, 1.0, 2.0, 6.0, 2.0, 1.0, 0.0, 7.0,
         ];
         let baseline = run_mmap_qmoe(false, false, &input, &router);
-        metrics().reset();
+        reset_offload_test_state(0);
         let fallback = run_mmap_qmoe(true, true, &input, &router);
         assert!(!fallback.catalogs_pageable);
         assert_close(&fallback.output, &baseline.output);
@@ -1554,15 +1953,168 @@ mod tests {
         let _guard = metrics_test_lock().lock().expect("metrics test lock");
         let input = pseudo_random_values(4 * 16, 7);
         let router = pseudo_random_values(4 * 4, 11);
-        metrics().reset();
+        reset_offload_test_state(0);
         let legacy = run_mmap_qmoe(false, false, &input, &router);
         let stats = crate::weight_offload_stats();
         assert_eq!(stats.bytes_read_from_mmap, 0);
         assert_eq!(stats.layer_executions, 0);
 
-        metrics().reset();
+        reset_offload_test_state(0);
         let route_first = run_mmap_qmoe(true, false, &input, &router);
         assert_close(&legacy.output, &route_first.output);
+    }
+
+    #[test]
+    fn zero_byte_host_cache_matches_phase1_direct_mmap() {
+        let _guard = metrics_test_lock().lock().expect("metrics test lock");
+        let input = pseudo_random_values(4 * 16, 0x0bad_f00d);
+        let router = vec![
+            0.0, 5.0, 1.0, 2.0, 1.0, 4.0, 0.0, 3.0, 0.0, 1.0, 2.0, 6.0, 2.0, 1.0, 0.0, 7.0,
+        ];
+        reset_offload_test_state(0);
+        let direct = run_mmap_qmoe(true, false, &input, &router);
+        reset_offload_test_state(0);
+        let repeated = run_mmap_qmoe_sequence(true, false, &input, &[&router, &router, &router], 1);
+        let stats = crate::weight_offload_stats();
+        assert_eq!(repeated.output, direct.output);
+        assert_eq!(stats.host_cache_hits, 0);
+        assert_eq!(stats.host_cache_misses, 6);
+        assert_eq!(stats.owned_host_cache_bytes, 0);
+        assert_eq!(
+            stats.bytes_read_from_mmap as usize,
+            repeated.selected_source_bytes * 3
+        );
+    }
+
+    #[test]
+    fn host_cache_enforces_expanded_byte_cap_for_oversubscribed_working_set() {
+        const EXPANDED_EXPERT_BYTES: u64 = 2 * 16 * 16 * 4;
+        let _guard = metrics_test_lock().lock().expect("metrics test lock");
+        let input = pseudo_random_values(4 * 16, 0xcafe_babe);
+        let router = vec![
+            9.0, 0.0, 0.0, 0.0, // expert 0
+            0.0, 9.0, 0.0, 0.0, // expert 1
+            0.0, 0.0, 9.0, 0.0, // expert 2
+            0.0, 0.0, 0.0, 9.0, // expert 3
+        ];
+        reset_offload_test_state(0);
+        let direct = run_mmap_qmoe(true, false, &input, &router);
+        reset_offload_test_state(EXPANDED_EXPERT_BYTES);
+        let cached = run_mmap_qmoe_sequence(
+            true,
+            false,
+            &input,
+            &[&router, &router, &router, &router],
+            1,
+        );
+        let stats = crate::weight_offload_stats();
+        assert_eq!(cached.output, direct.output);
+        assert!(stats.peak_owned_host_cache_bytes <= EXPANDED_EXPERT_BYTES);
+        assert!(stats.owned_host_cache_bytes <= EXPANDED_EXPERT_BYTES);
+        assert_eq!(stats.host_cache_budget_bytes, EXPANDED_EXPERT_BYTES);
+    }
+
+    #[test]
+    fn repeated_routing_working_set_converges_to_host_cache_hits() {
+        const TWO_EXPANDED_EXPERTS: u64 = 2 * 2 * 16 * 16 * 4;
+        let _guard = metrics_test_lock().lock().expect("metrics test lock");
+        let input = pseudo_random_values(4 * 16, 0x1234_abcd);
+        let router = vec![
+            0.0, 5.0, 1.0, 2.0, 1.0, 4.0, 0.0, 3.0, 0.0, 1.0, 2.0, 6.0, 2.0, 1.0, 0.0, 7.0,
+        ];
+        reset_offload_test_state(TWO_EXPANDED_EXPERTS);
+        let run = run_mmap_qmoe_sequence(
+            true,
+            false,
+            &input,
+            &[&router, &router, &router, &router, &router],
+            1,
+        );
+        let stats = crate::weight_offload_stats();
+        assert_eq!(stats.host_cache_hits, 6);
+        assert_eq!(stats.host_cache_misses, 4);
+        assert_eq!(stats.host_cache_evictions, 0);
+        assert_eq!(stats.owned_host_cache_bytes, TWO_EXPANDED_EXPERTS);
+        assert!(
+            stats.owned_host_cache_bytes as usize > run.selected_source_bytes,
+            "cache accounting must charge expanded f32 bytes, not compressed source bytes"
+        );
+    }
+
+    #[test]
+    fn one_off_rare_route_does_not_evict_pinned_hot_expert() {
+        const EXPANDED_EXPERT_BYTES: u64 = 2 * 16 * 16 * 4;
+        let _guard = metrics_test_lock().lock().expect("metrics test lock");
+        let input = pseudo_random_values(4 * 16, 0x55aa_aa55);
+        let hot = vec![
+            0.0, 9.0, 0.0, 0.0, 0.0, 9.0, 0.0, 0.0, 0.0, 9.0, 0.0, 0.0, 0.0, 9.0, 0.0, 0.0,
+        ];
+        let rare = vec![
+            0.0, 0.0, 0.0, 9.0, 0.0, 0.0, 0.0, 9.0, 0.0, 0.0, 0.0, 9.0, 0.0, 0.0, 0.0, 9.0,
+        ];
+        reset_offload_test_state(0);
+        let direct = run_mmap_qmoe(true, false, &input, &hot);
+        reset_offload_test_state(EXPANDED_EXPERT_BYTES);
+        let cached = run_mmap_qmoe_sequence(
+            true,
+            false,
+            &input,
+            &[&hot, &hot, &hot, &hot, &rare, &hot],
+            1,
+        );
+        let stats = crate::weight_offload_stats();
+        assert_eq!(cached.output, direct.output);
+        assert_eq!(stats.host_cache_hits, 3);
+        assert_eq!(stats.host_cache_evictions, 0);
+        assert_eq!(stats.owned_host_cache_bytes, EXPANDED_EXPERT_BYTES);
+    }
+
+    #[test]
+    fn cached_and_uncached_routes_and_logits_are_bit_identical() {
+        const TWO_EXPANDED_EXPERTS: u64 = 2 * 2 * 16 * 16 * 4;
+        let _guard = metrics_test_lock().lock().expect("metrics test lock");
+        let input = pseudo_random_values(4 * 16, 0xdec0_de01);
+        let router = pseudo_random_values(4 * 4, 0xface_feed);
+        reset_offload_test_state(0);
+        let uncached = run_mmap_qmoe(true, false, &input, &router);
+        reset_offload_test_state(TWO_EXPANDED_EXPERTS);
+        let cached = run_mmap_qmoe_sequence(true, false, &input, &[&router, &router, &router], 1);
+        assert_eq!(cached.output, uncached.output);
+        assert!(crate::weight_offload_stats().host_cache_hits > 0);
+    }
+
+    #[test]
+    fn active_host_cache_lease_blocks_eviction_until_drop() {
+        let _guard = metrics_test_lock().lock().expect("metrics test lock");
+        reset_offload_test_state(4);
+        let key = |expert| ExpertCacheKey {
+            layer_id: 7,
+            expert,
+            bits: 4,
+            block_size: 16,
+            out_and_in_features: vec![(1, 1)],
+            source_regions: Vec::new(),
+        };
+        let weights = |value| DequantizedExpert {
+            fc1: vec![value],
+            fc2: Vec::new(),
+            fc3: None,
+        };
+        let mut cache = HostExpertCache::default();
+
+        drop(cache.lease(key(0), 4, 4, || Ok(weights(1.0))).unwrap());
+        let held = cache.lease(key(0), 4, 4, || Ok(weights(1.0))).unwrap();
+        drop(cache.lease(key(1), 4, 4, || Ok(weights(2.0))).unwrap());
+        drop(cache.lease(key(1), 4, 4, || Ok(weights(2.0))).unwrap());
+        drop(cache.lease(key(1), 4, 4, || Ok(weights(2.0))).unwrap());
+        assert!(cache.entries.contains_key(&key(0)));
+        assert!(!cache.entries.contains_key(&key(1)));
+
+        drop(held);
+        drop(cache.lease(key(1), 4, 4, || Ok(weights(2.0))).unwrap());
+        assert!(!cache.entries.contains_key(&key(0)));
+        assert!(cache.entries.contains_key(&key(1)));
+        assert_eq!(crate::weight_offload_stats().host_cache_evictions, 1);
     }
 
     #[test]

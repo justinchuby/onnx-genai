@@ -9,6 +9,10 @@ use onnx_runtime_ep_api::ExternalMmapRegion;
 
 /// Environment switch for the route-first mmap MoE path.
 pub const WEIGHT_OFFLOAD_ENV: &str = "ONNX_GENAI_WEIGHT_OFFLOAD";
+/// Optional override for the Resource Governor's owned warm-host cache budget.
+pub const WEIGHT_OFFLOAD_HOST_BYTES_ENV: &str = "ONNX_GENAI_WEIGHT_OFFLOAD_HOST_BYTES";
+
+static GOVERNOR_HOST_CACHE_BUDGET: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct WeightOffloadMode {
@@ -44,6 +48,12 @@ pub struct WeightOffloadStats {
     pub active_experts: u64,
     pub unique_experts_per_batch: u64,
     pub peak_dequantized_experts: u64,
+    pub host_cache_hits: u64,
+    pub host_cache_misses: u64,
+    pub host_cache_evictions: u64,
+    pub owned_host_cache_bytes: u64,
+    pub peak_owned_host_cache_bytes: u64,
+    pub host_cache_budget_bytes: u64,
     pub routed_tokens: u64,
     pub tokens_per_expert: BTreeMap<usize, u64>,
     pub per_layer: BTreeMap<u32, WeightOffloadLayerStats>,
@@ -66,6 +76,12 @@ pub(crate) struct WeightOffloadMetrics {
     active_experts: AtomicU64,
     unique_experts_per_batch: AtomicU64,
     peak_dequantized_experts: AtomicU64,
+    host_cache_hits: AtomicU64,
+    host_cache_misses: AtomicU64,
+    host_cache_evictions: AtomicU64,
+    owned_host_cache_bytes: AtomicU64,
+    peak_owned_host_cache_bytes: AtomicU64,
+    host_cache_budget_bytes: AtomicU64,
     routed_tokens: AtomicU64,
     tokens_per_expert: Mutex<BTreeMap<usize, u64>>,
     per_layer: Mutex<BTreeMap<u32, WeightOffloadLayerStats>>,
@@ -121,6 +137,41 @@ impl WeightOffloadMetrics {
             .fetch_max(experts as u64, Ordering::Relaxed);
     }
 
+    pub fn record_host_cache_hit(&self) {
+        self.host_cache_hits.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_host_cache_miss(&self) {
+        self.host_cache_misses.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_host_cache_evictions(&self, count: usize) -> Result<(), &'static str> {
+        let count = u64::try_from(count).map_err(|_| "host-cache eviction count overflow")?;
+        self.host_cache_evictions
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |total| {
+                total.checked_add(count)
+            })
+            .map_err(|_| "host-cache eviction total overflow")?;
+        Ok(())
+    }
+
+    pub fn record_host_cache_residency(
+        &self,
+        owned_bytes: usize,
+        budget_bytes: usize,
+    ) -> Result<(), &'static str> {
+        let owned =
+            u64::try_from(owned_bytes).map_err(|_| "owned host-cache byte count overflow")?;
+        let budget =
+            u64::try_from(budget_bytes).map_err(|_| "host-cache budget byte count overflow")?;
+        self.owned_host_cache_bytes.store(owned, Ordering::Relaxed);
+        self.peak_owned_host_cache_bytes
+            .fetch_max(owned, Ordering::Relaxed);
+        self.host_cache_budget_bytes
+            .store(budget, Ordering::Relaxed);
+        Ok(())
+    }
+
     pub fn record_routes(&self, layer: u32, token_counts: &BTreeMap<usize, usize>) {
         let active = token_counts.values().copied().sum::<usize>();
         self.layer_executions.fetch_add(1, Ordering::Relaxed);
@@ -168,6 +219,12 @@ impl WeightOffloadMetrics {
             active_experts: self.active_experts.load(Ordering::Relaxed),
             unique_experts_per_batch: self.unique_experts_per_batch.load(Ordering::Relaxed),
             peak_dequantized_experts: self.peak_dequantized_experts.load(Ordering::Relaxed),
+            host_cache_hits: self.host_cache_hits.load(Ordering::Relaxed),
+            host_cache_misses: self.host_cache_misses.load(Ordering::Relaxed),
+            host_cache_evictions: self.host_cache_evictions.load(Ordering::Relaxed),
+            owned_host_cache_bytes: self.owned_host_cache_bytes.load(Ordering::Relaxed),
+            peak_owned_host_cache_bytes: self.peak_owned_host_cache_bytes.load(Ordering::Relaxed),
+            host_cache_budget_bytes: self.host_cache_budget_bytes.load(Ordering::Relaxed),
             routed_tokens: self.routed_tokens.load(Ordering::Relaxed),
             tokens_per_expert: self
                 .tokens_per_expert
@@ -191,6 +248,12 @@ impl WeightOffloadMetrics {
             .expect("weight-offload mapped-region lock poisoned") = MappedRegionState::default();
         self.bytes_read_from_mmap.store(0, Ordering::Relaxed);
         self.peak_dequantized_experts.store(0, Ordering::Relaxed);
+        self.host_cache_hits.store(0, Ordering::Relaxed);
+        self.host_cache_misses.store(0, Ordering::Relaxed);
+        self.host_cache_evictions.store(0, Ordering::Relaxed);
+        self.owned_host_cache_bytes.store(0, Ordering::Relaxed);
+        self.peak_owned_host_cache_bytes.store(0, Ordering::Relaxed);
+        self.host_cache_budget_bytes.store(0, Ordering::Relaxed);
         self.layer_executions.store(0, Ordering::Relaxed);
         self.active_experts.store(0, Ordering::Relaxed);
         self.unique_experts_per_batch.store(0, Ordering::Relaxed);
@@ -216,6 +279,38 @@ pub(crate) fn metrics() -> &'static WeightOffloadMetrics {
 /// depending on kernel internals.
 pub fn weight_offload_stats() -> WeightOffloadStats {
     metrics().snapshot()
+}
+
+/// Set the Resource Governor's process-wide owned warm-host cache sub-budget.
+///
+/// `ONNX_GENAI_WEIGHT_OFFLOAD_HOST_BYTES`, when present, overrides this value.
+pub fn set_weight_offload_host_budget(bytes: u64) -> Result<(), &'static str> {
+    let budget = checked_host_budget(bytes)?;
+    crate::kernels::qmoe::reconfigure_host_expert_cache(budget)
+        .map_err(|_| "cannot lower host-cache budget while entries are leased")?;
+    GOVERNOR_HOST_CACHE_BUDGET.store(bytes, Ordering::Relaxed);
+    Ok(())
+}
+
+pub(crate) fn weight_offload_host_budget() -> Result<usize, &'static str> {
+    if let Some(value) = std::env::var_os(WEIGHT_OFFLOAD_HOST_BYTES_ENV) {
+        let value = value
+            .to_str()
+            .ok_or("host-cache byte budget is not valid UTF-8")?;
+        let bytes = value
+            .parse::<u64>()
+            .map_err(|_| "host-cache byte budget must be an unsigned decimal byte count")?;
+        return checked_host_budget(bytes);
+    }
+    checked_host_budget(GOVERNOR_HOST_CACHE_BUDGET.load(Ordering::Relaxed))
+}
+
+fn checked_host_budget(bytes: u64) -> Result<usize, &'static str> {
+    let bytes = usize::try_from(bytes).map_err(|_| "host-cache byte budget exceeds usize::MAX")?;
+    if bytes > isize::MAX as usize {
+        return Err("host-cache byte budget exceeds isize::MAX");
+    }
+    Ok(bytes)
 }
 
 #[cfg(target_os = "linux")]
@@ -253,6 +348,16 @@ mod tests {
         assert!(!WeightOffloadMode::from_value(None).enabled);
         assert!(!WeightOffloadMode::from_value(Some(OsStr::new("0"))).enabled);
         assert!(WeightOffloadMode::from_value(Some(OsStr::new("1"))).enabled);
+    }
+
+    #[test]
+    fn host_cache_budget_rejects_unaddressable_values() {
+        if usize::BITS == 64 {
+            assert_eq!(
+                checked_host_budget(isize::MAX as u64 + 1),
+                Err("host-cache byte budget exceeds isize::MAX")
+            );
+        }
     }
 
     #[test]

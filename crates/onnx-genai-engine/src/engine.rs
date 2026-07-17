@@ -150,6 +150,14 @@ impl EngineResourceGovernor {
             },
             kv_config,
         )?;
+        #[cfg(feature = "native-backend")]
+        onnx_runtime_ep_cpu::set_weight_offload_host_budget(
+            inner.snapshot().resolved_limits.host_ram_bytes,
+        )
+        .map_err(|reason| ResourceError::BudgetArithmeticOverflow {
+            operation: "configuring the native weight-offload host-cache sub-budget",
+            reason: reason.into(),
+        })?;
         Ok(Self {
             inner,
             allow_runtime_override,

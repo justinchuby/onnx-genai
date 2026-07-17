@@ -543,6 +543,7 @@ Environment aliases for command-line deployments:
 
 ```text
 ONNX_GENAI_WEIGHT_OFFLOAD=1                    # Phase-1 route-first mmap CPU MoE
+ONNX_GENAI_WEIGHT_OFFLOAD_HOST_BYTES=<bytes>   # owned Phase-2 warm-cache override
 ONNX_GENAI_WEIGHT_BUDGET=auto|<bytes>          # shorthand resident-weight cap
 ONNX_GENAI_WEIGHT_DEVICE_BUDGET=auto|<bytes>
 ONNX_GENAI_WEIGHT_HOST_BUDGET=auto|<bytes>
@@ -550,10 +551,14 @@ ONNX_GENAI_GPU_LAYERS=<N>
 ONNX_GENAI_WEIGHT_PREFETCH=off|exact|heat|predictive|auto
 ```
 
-`ONNX_GENAI_WEIGHT_OFFLOAD` is opt-in in Phase 1. When set to `1`, pageable
+`ONNX_GENAI_WEIGHT_OFFLOAD` is opt-in in Phases 1 and 2. When set to `1`, pageable
 expert-major external QMoE tensors use route-first execution and bypass
-full-pool materialization/dequantization caches. Unset (the default), or for any
-non-pageable tensor, execution follows the existing resident QMoE path.
+full-pool materialization/dequantization caches. Phase 2 inserts a bounded
+derived-f32 expert cache between mmap and compute. Its default owned-byte cap is
+the Resource Governor's resolved host-RAM sub-budget; the host-bytes environment
+variable can lower or override that cap. A zero-byte cap preserves the Phase-1
+map-and-dequantize-per-use path. Unset (the default), or for any non-pageable
+tensor, execution follows the existing resident QMoE path.
 
 Precedence: explicit API > environment > YAML > auto defaults. Per-tier weight caps
 are subordinate to global ceilings and may be reduced by the governor when KV or
@@ -620,6 +625,23 @@ routes/logits against the dense reference; report cold and warmed tokens/s and b
 read/token. No GPU or explicit host cache is required.
 
 ### Phase 2 — bounded host-RAM expert LRU
+
+**Status (2026-07-17): implemented for the fused CPU QMoE path.** The process-wide
+warm cache stores immutable `Arc`-backed derived expert entries and charges their
+expanded f32 FC1/FC2/FC3 byte size before allocation. Compute leases retain the
+`Arc`, so an entry removed from the index cannot be freed during use. Admission
+requires repeated use; frequency and recency select victims, while recently hot
+entries receive a short policy pin to prevent a rare route from displacing them.
+The cache reserves/evicts before fallible dequant allocation and never admits an
+entry that would exceed the owned-host cap. Entries larger than the current cap
+stream directly from mmap rather than making model loading fail.
+
+The native engine seeds the cache cap from the Resource Governor's resolved
+host-RAM limit. `WeightOffloadStats` reports hits, misses, evictions, current and
+peak owned bytes, and the active cache budget separately from mmap size and Linux
+RSS/page-fault counters. `ONNX_GENAI_WEIGHT_OFFLOAD_HOST_BYTES=0` explicitly
+selects the Phase-1 fallback. Device residency and asynchronous prefetch remain
+Phase 3 and Phase 4 work respectively.
 
 **Ship independently:**
 

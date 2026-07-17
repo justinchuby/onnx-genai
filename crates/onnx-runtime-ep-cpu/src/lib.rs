@@ -38,7 +38,8 @@ pub use backend::{CpuBackend, has_onednn};
 pub use optimizer::{ProjectionFusion, cpu_optimization_passes};
 pub use provider::CpuExecutionProvider;
 pub use weight_offload::{
-    LinuxProcessMemoryStats, WEIGHT_OFFLOAD_ENV, WeightOffloadLayerStats, WeightOffloadStats,
+    LinuxProcessMemoryStats, WEIGHT_OFFLOAD_ENV, WEIGHT_OFFLOAD_HOST_BYTES_ENV,
+    WeightOffloadLayerStats, WeightOffloadStats, set_weight_offload_host_budget,
     weight_offload_stats,
 };
 
