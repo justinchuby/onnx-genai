@@ -1631,6 +1631,25 @@ fn squeeze_static_axes_reject_invalid_dims_and_leave_dynamic_dims_unresolved() {
 }
 
 #[test]
+fn squeeze_static_axes_validate_structure_before_dynamic_extents() {
+    let axes_input = node("Squeeze", 2, 1);
+    let input = f32in(vec![sym(0), c(1)]);
+
+    let err = try_run(
+        &axes_input,
+        vec![input.clone(), sd_vec(vec![c(0), c(0)])],
+        13,
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("axis 0 is specified more than once"));
+
+    let err = try_run(&axes_input, vec![input, sd_vec(vec![c(0), c(2)])], 13).unwrap_err();
+    assert!(err
+        .to_string()
+        .contains("axis 2 is out of range for rank 2"));
+}
+
+#[test]
 fn squeeze_v11_rejects_duplicate_static_axes() {
     let n = with_attr(node("Squeeze", 1, 1), "axes", Attribute::Ints(vec![0, 0]));
     let err = try_run(&n, vec![f32in(vec![c(1), c(8)])], 11).unwrap_err();

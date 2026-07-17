@@ -209,8 +209,11 @@ fn squeeze_common(
                         detail: format!("axis {axis} is specified more than once"),
                     });
                 }
+                norm.push(axis);
+            }
+            for &axis in &norm {
                 match t.shape[axis].as_const() {
-                    Some(1) => norm.push(axis),
+                    Some(1) => {}
                     Some(extent) => {
                         return Err(ShapeInferError::Invalid {
                             op: ctx.op().into(),
