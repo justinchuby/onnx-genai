@@ -1390,6 +1390,56 @@ fn expand_broadcasts_against_target() {
     assert_eq!(out_shape(&outs), vec![sym(0), c(8), c(768)]);
 }
 
+#[test]
+fn expand_adds_leading_target_dimensions() {
+    let n = node("Expand", 2, 1);
+    let outs = run(
+        &n,
+        vec![f32in(vec![c(3), c(1)]), sd_vec(vec![c(2), c(1), c(6)])],
+        8,
+    );
+    assert_eq!(out_shape(&outs), vec![c(2), c(3), c(6)]);
+}
+
+#[test]
+fn expand_target_one_keeps_input_dimension() {
+    let n = node("Expand", 2, 1);
+    let outs = run(
+        &n,
+        vec![f32in(vec![c(3), c(4)]), sd_vec(vec![c(3), c(1)])],
+        13,
+    );
+    assert_eq!(out_shape(&outs), vec![c(3), c(4)]);
+}
+
+#[test]
+fn expand_preserves_input_dtype() {
+    let n = node("Expand", 2, 1);
+    let outs = run(
+        &n,
+        vec![
+            tin(DataType::Float16, vec![c(1), c(4)]),
+            sd_vec(vec![c(3), c(4)]),
+        ],
+        13,
+    );
+    assert_eq!(out_dtype(&outs), DataType::Float16);
+}
+
+#[test]
+fn expand_unknown_shape_tensor_keeps_known_rank() {
+    let n = node("Expand", 2, 1);
+    let outs = run(
+        &n,
+        vec![f32in(vec![c(3), c(1)]), tin(DataType::Int64, vec![c(3)])],
+        13,
+    );
+    let shape = out_shape(&outs);
+    assert_eq!(shape.len(), 3);
+    assert!(shape.iter().all(|dim| dim.as_symbol().is_some()));
+    assert_eq!(out_dtype(&outs), DataType::Float32);
+}
+
 // --- Where ----------------------------------------------------------------
 
 #[test]

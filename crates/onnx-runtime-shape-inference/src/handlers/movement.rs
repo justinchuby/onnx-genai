@@ -246,21 +246,22 @@ fn unsqueeze_common(
     Ok(())
 }
 
-/// `Expand`: broadcast the input against the (shape-data) target shape.
+/// `Expand` (opset 8+): bidirectionally broadcast the input shape against the
+/// values of the shape-tensor input.
 pub fn expand(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
-    let Some(input) = ctx.input_shape(0).map(<[DimExpr]>::to_vec) else {
+    let Some(input) = ctx.input_type(0).cloned() else {
         return Ok(());
     };
-    let dtype = ctx.input_dtype(0).unwrap_or(DataType::Float32);
     if let Some(target) = ctx.input_shape_data(1).map(ShapeData::as_shape) {
-        let shape = ctx.broadcast(&input, &target)?;
-        ctx.set_output(0, dtype, shape);
+        let shape = ctx.broadcast(&input.shape, &target)?;
+        ctx.set_output(0, input.dtype, shape);
     } else if let Some(rank) = target_rank(ctx) {
-        // Unknown target values: rank is max(input rank, target length), dims
-        // are fresh symbols.
-        let out_rank = rank.max(input.len());
+        // Match Reshape's unresolved shape-tensor convention: retain a known
+        // rank and degrade each extent to a fresh symbol. Expand's output rank
+        // is the greater of the input rank and target-vector length.
+        let out_rank = rank.max(input.rank());
         let out = (0..out_rank).map(|_| ctx.fresh_dim()).collect();
-        ctx.set_output(0, dtype, out);
+        ctx.set_output(0, input.dtype, out);
     }
     Ok(())
 }
@@ -653,7 +654,7 @@ pub fn register(reg: &mut InferenceRegistry) {
     reg.register("", "Squeeze", 13, squeeze_v13);
     reg.register("", "Unsqueeze", 1, unsqueeze_v1);
     reg.register("", "Unsqueeze", 13, unsqueeze_v13);
-    reg.register("", "Expand", 1, expand);
+    reg.register("", "Expand", 8, expand);
     reg.register("", "Concat", 1, concat);
     reg.register("", "Slice", 1, slice);
     reg.register("", "Split", 1, split);
