@@ -1750,6 +1750,7 @@ name = "onnx-genai-ort"
 version = "0.1.0-dev.2"
 dependencies = [
  "half",
+ "libloading 0.8.9",
  "minijinja",
  "onnx-genai-metadata",
  "onnx-genai-ort-sys",
