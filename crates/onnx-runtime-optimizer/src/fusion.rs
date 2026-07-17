@@ -1350,6 +1350,12 @@ pub struct OpFusion {
     patterns: Vec<FusionPattern>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ScanCandidateSource {
+    Initial,
+    Revisit,
+}
+
 impl Default for OpFusion {
     fn default() -> Self {
         Self::new()
@@ -1368,14 +1374,19 @@ impl OpFusion {
     pub fn with_patterns(patterns: Vec<FusionPattern>) -> Self {
         Self { patterns }
     }
-}
 
-impl OptimizationPass for OpFusion {
-    fn name(&self) -> &str {
-        "OpFusion"
-    }
-
-    fn run(&self, graph: &mut Graph, _ctx: &PassContext) -> Result<()> {
+    fn run_resumable(
+        &self,
+        graph: &mut Graph,
+        mut observe_fusion: impl FnMut(
+            &str,
+            ScanCandidateSource,
+            NodeId,
+            &[NodeId],
+            &[NodeId],
+            NodeId,
+        ),
+    ) -> Result<()> {
         for pattern in &self.patterns {
             let candidates: Vec<u32> = graph.nodes.keys().map(|id| id.0).collect();
             let mut cursor = 0;
@@ -1383,21 +1394,27 @@ impl OptimizationPass for OpFusion {
             loop {
                 let initial = candidates.get(cursor).copied();
                 let revisit = revisits.first().copied();
-                let raw_id = match (initial, revisit) {
+                let (raw_id, source) = match (initial, revisit) {
                     (None, None) => break,
                     (Some(id), None) => {
                         cursor += 1;
-                        id
+                        (id, ScanCandidateSource::Initial)
                     }
-                    (None, Some(_)) => revisits.pop_first().unwrap(),
+                    (None, Some(_)) => (
+                        revisits.pop_first().unwrap(),
+                        ScanCandidateSource::Revisit,
+                    ),
                     (Some(id), Some(revisit)) if id <= revisit => {
                         cursor += 1;
                         if id == revisit {
                             revisits.pop_first();
                         }
-                        id
+                        (id, ScanCandidateSource::Initial)
                     }
-                    (Some(_), Some(_)) => revisits.pop_first().unwrap(),
+                    (Some(_), Some(_)) => (
+                        revisits.pop_first().unwrap(),
+                        ScanCandidateSource::Revisit,
+                    ),
                 };
                 let start = NodeId(raw_id);
                 let Some(matched) = pattern.try_match_at(graph, start) else {
@@ -1406,6 +1423,14 @@ impl OptimizationPass for OpFusion {
 
                 let affected = pattern.affected_candidate_starts(graph, &matched);
                 let fused_id = pattern.apply_fusion_returning_id(graph, &matched)?;
+                observe_fusion(
+                    pattern.pattern_name(),
+                    source,
+                    start,
+                    &matched.nodes,
+                    &affected,
+                    fused_id,
+                );
 
                 // The ordered set is the source of truth for resolution order:
                 // any lower affected start is reconsidered before an untouched
@@ -1419,6 +1444,32 @@ impl OptimizationPass for OpFusion {
             }
         }
         Ok(())
+    }
+
+    #[cfg(test)]
+    fn run_with_fusion_observer(
+        &self,
+        graph: &mut Graph,
+        observe_fusion: impl FnMut(
+            &str,
+            ScanCandidateSource,
+            NodeId,
+            &[NodeId],
+            &[NodeId],
+            NodeId,
+        ),
+    ) -> Result<()> {
+        self.run_resumable(graph, observe_fusion)
+    }
+}
+
+impl OptimizationPass for OpFusion {
+    fn name(&self) -> &str {
+        "OpFusion"
+    }
+
+    fn run(&self, graph: &mut Graph, _ctx: &PassContext) -> Result<()> {
+        self.run_resumable(graph, |_, _, _, _, _, _| {})
     }
 }
 
@@ -2529,6 +2580,12 @@ mod tests {
         for (id, value) in graph.values.iter() {
             writeln!(&mut snapshot, "value={id:?}|{value:?}").unwrap();
         }
+        writeln!(
+            &mut snapshot,
+            "topological_order={:?}",
+            graph.topological_order().unwrap()
+        )
+        .unwrap();
 
         // Arena slots/free-list order are private IR details, but their complete
         // observable state is the sequence of IDs returned by future inserts.
@@ -2911,6 +2968,273 @@ mod tests {
                 .with_replacement_domain(""),
         );
         patterns
+    }
+
+    struct AffectedRevisitCase {
+        graph: Graph,
+        lower_start: NodeId,
+        later_start: NodeId,
+        first_middle: NodeId,
+        first_tail: NodeId,
+        final_tail: NodeId,
+    }
+
+    fn affected_revisit_case(seed: u64) -> AffectedRevisitCase {
+        let mut rng = FusionTestRng(seed ^ 0xbb67_ae85_84ca_a73b);
+        let noise_count = 3 + rng.usize(6);
+        let slot_count = 5 + noise_count;
+        let later_start = NodeId((slot_count - 1) as u32);
+        let mut lower_ids: Vec<u32> = (0..later_start.0).collect();
+        rng.shuffle(&mut lower_ids);
+        let lower_start = NodeId(lower_ids[0]);
+        let first_middle = NodeId(lower_ids[1]);
+        let first_tail = NodeId(lower_ids[2]);
+        let final_tail = NodeId(lower_ids[3]);
+
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 17);
+        let lower_input = graph.create_named_value(
+            format!("lower_input_{seed}"),
+            DataType::Float32,
+            static_shape([4]),
+        );
+        let later_input = graph.create_named_value(
+            format!("later_input_{seed}"),
+            DataType::Float32,
+            static_shape([4]),
+        );
+        graph.add_input(lower_input);
+        graph.add_input(later_input);
+        let lower_value = graph.create_named_value(
+            format!("lower_value_{seed}"),
+            DataType::Float32,
+            static_shape([4]),
+        );
+        let middle_value = graph.create_named_value(
+            format!("middle_value_{seed}"),
+            DataType::Float32,
+            static_shape([4]),
+        );
+        let first_output = graph.create_named_value(
+            format!("first_output_{seed}"),
+            DataType::Float32,
+            static_shape([4]),
+        );
+        let first_tail_output = graph.create_named_value(
+            format!("first_tail_output_{seed}"),
+            DataType::Float32,
+            static_shape([4]),
+        );
+        let final_output = graph.create_named_value(
+            format!("final_output_{seed}"),
+            DataType::Float32,
+            static_shape([4]),
+        );
+        graph.add_output(final_output);
+
+        let mut placements = vec![
+            (
+                lower_start,
+                Node::new(
+                    NodeId(0),
+                    "AdversaryStart",
+                    vec![Some(lower_input)],
+                    vec![lower_value],
+                ),
+            ),
+            (
+                later_start,
+                Node::new(
+                    NodeId(0),
+                    "AdversaryStart",
+                    vec![Some(later_input)],
+                    vec![middle_value],
+                ),
+            ),
+            (
+                first_middle,
+                Node::new(
+                    NodeId(0),
+                    "AdversaryMiddle",
+                    vec![Some(middle_value)],
+                    vec![first_output],
+                ),
+            ),
+            (
+                first_tail,
+                Node::new(
+                    NodeId(0),
+                    "AdversaryTail",
+                    vec![Some(first_output), Some(lower_value)],
+                    vec![first_tail_output],
+                ),
+            ),
+            (
+                final_tail,
+                Node::new(
+                    NodeId(0),
+                    "AdversaryTail",
+                    vec![Some(first_tail_output)],
+                    vec![final_output],
+                ),
+            ),
+        ];
+        let core_ids = HashSet::from([
+            lower_start,
+            later_start,
+            first_middle,
+            first_tail,
+            final_tail,
+        ]);
+        let mut noise_index = 0;
+        for raw_id in 0..slot_count as u32 {
+            let id = NodeId(raw_id);
+            if core_ids.contains(&id) {
+                continue;
+            }
+            let input = graph.create_named_value(
+                format!("noise_input_{seed}_{noise_index}"),
+                DataType::Float32,
+                static_shape([4]),
+            );
+            let output = graph.create_named_value(
+                format!("noise_output_{seed}_{noise_index}"),
+                DataType::Float32,
+                static_shape([4]),
+            );
+            graph.add_input(input);
+            graph.add_output(output);
+            placements.push((
+                id,
+                Node::new(
+                    NodeId(0),
+                    ["Abs", "Neg", "Identity", "Tanh"][rng.usize(4)],
+                    vec![Some(input)],
+                    vec![output],
+                ),
+            ));
+            noise_index += 1;
+        }
+
+        rng.shuffle(&mut placements);
+        for _ in 0..slot_count {
+            graph.insert_node(Node::new(NodeId(0), "IdSeed", Vec::new(), Vec::new()));
+        }
+        for &(target, _) in placements.iter().rev() {
+            graph.remove_node(target);
+        }
+        for (expected, node) in placements {
+            assert_eq!(graph.insert_node(node), expected);
+        }
+
+        AffectedRevisitCase {
+            graph,
+            lower_start,
+            later_start,
+            first_middle,
+            first_tail,
+            final_tail,
+        }
+    }
+
+    #[test]
+    fn affected_candidate_starts_revisits_newly_eligible_lower_ids() {
+        const TRIALS: usize = 5_000;
+        let pattern = FusionPattern::new(
+            "AffectedBehindCursor",
+            &["AdversaryStart", "AdversaryMiddle", "AdversaryTail"],
+            "AdversaryMiddle",
+        )
+        .with_replacement_domain("");
+        let patterns = vec![pattern.clone()];
+        let mut reclaimable_low_slot_trials = 0;
+        let mut affected_scheduled = 0;
+        let mut affected_revisit_hits = 0;
+
+        for trial in 0..TRIALS {
+            let case = affected_revisit_case(trial as u64);
+            assert!(case.graph.validate().is_ok(), "invalid trial {trial}");
+            assert!(case.lower_start.0 < case.later_start.0);
+            assert!(case.first_middle.0 < case.later_start.0);
+            assert!(case.first_tail.0 < case.later_start.0);
+            assert!(pattern.try_match_at(&case.graph, case.lower_start).is_none());
+            let first_match = pattern
+                .try_match_at(&case.graph, case.later_start)
+                .expect("later start must be the first eligible match");
+            assert_eq!(
+                first_match.nodes,
+                vec![case.later_start, case.first_middle, case.first_tail]
+            );
+
+            // Reverse removal followed by LIFO insertion always reuses the
+            // match-start slot. The lower interior slots remain reclaimable.
+            let mut reclaim_probe = case.graph.clone();
+            let first_fused = pattern
+                .apply_fusion_returning_id(&mut reclaim_probe, &first_match)
+                .unwrap();
+            assert_eq!(first_fused, case.later_start);
+            let probe_id = reclaim_probe.insert_node(Node::new(
+                NodeId(0),
+                "ReclaimProbe",
+                Vec::new(),
+                Vec::new(),
+            ));
+            assert_eq!(probe_id, case.first_middle);
+            reclaimable_low_slot_trials += 1;
+
+            let mut reference = case.graph.clone();
+            run_restart_reference(&patterns, &mut reference);
+            let mut actual = case.graph;
+            let mut lower_was_scheduled = false;
+            let mut trial_hits = 0;
+            OpFusion::with_patterns(patterns.clone())
+                .run_with_fusion_observer(
+                    &mut actual,
+                    |name, source, start, matched, affected, fused_id| {
+                        if name != "AffectedBehindCursor" {
+                            return;
+                        }
+                        assert_eq!(
+                            fused_id, matched[0],
+                            "replacement must reuse the just-freed match-start slot"
+                        );
+                        if start == case.later_start {
+                            assert_eq!(source, ScanCandidateSource::Initial);
+                            assert_eq!(
+                                matched,
+                                &[case.later_start, case.first_middle, case.first_tail]
+                            );
+                            assert!(affected.contains(&case.lower_start));
+                            assert_ne!(fused_id, case.lower_start);
+                            lower_was_scheduled = true;
+                            affected_scheduled += 1;
+                        } else if start == case.lower_start {
+                            assert!(lower_was_scheduled);
+                            assert_eq!(source, ScanCandidateSource::Revisit);
+                            assert_eq!(
+                                matched,
+                                &[case.lower_start, case.later_start, case.final_tail]
+                            );
+                            trial_hits += 1;
+                            affected_revisit_hits += 1;
+                        }
+                    },
+                )
+                .unwrap();
+
+            assert_eq!(trial_hits, 1, "affected revisit not hit on trial {trial}");
+            assert!(actual.validate().is_ok(), "invalid result on trial {trial}");
+            assert_fusion_graphs_byte_identical(actual, reference, trial);
+        }
+
+        assert_eq!(reclaimable_low_slot_trials, TRIALS);
+        assert_eq!(affected_scheduled, TRIALS);
+        assert_eq!(affected_revisit_hits, TRIALS);
+        eprintln!(
+            "affected behind-cursor revisit hits: {affected_revisit_hits}/{TRIALS} \
+             ({}%); reclaimable lower slots present: {reclaimable_low_slot_trials}/{TRIALS}",
+            affected_revisit_hits * 100 / TRIALS
+        );
     }
 
     fn assert_overlapping_structural_candidates(graph: &Graph, patterns: &[FusionPattern]) {
