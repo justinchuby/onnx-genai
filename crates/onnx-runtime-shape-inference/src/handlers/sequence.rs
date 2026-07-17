@@ -44,10 +44,16 @@ fn tile(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
     Ok(())
 }
 
+enum RangeLength {
+    Known(i64),
+    Unknown,
+    TooLarge,
+}
+
 /// Compute a `Range` length for integer scalar inputs, if all values are known.
-fn range_len(start: i64, limit: i64, delta: i64) -> Option<i64> {
+fn range_len(start: i64, limit: i64, delta: i64) -> RangeLength {
     if delta == 0 {
-        return None;
+        return RangeLength::Unknown;
     }
     let start = i128::from(start);
     let limit = i128::from(limit);
@@ -60,37 +66,41 @@ fn range_len(start: i64, limit: i64, delta: i64) -> Option<i64> {
     } else {
         0
     };
-    i64::try_from(count).ok()
+    if count > isize::MAX as i128 {
+        RangeLength::TooLarge
+    } else {
+        RangeLength::Known(count as i64)
+    }
 }
 
 /// Compute a Float32 `Range` length with the same arithmetic as the CPU
 /// kernel's `float_range_count`.
-fn range_len_f32(start: f64, limit: f64, delta: f64) -> Option<i64> {
+fn range_len_f32(start: f64, limit: f64, delta: f64) -> RangeLength {
     let start = start as f32;
     let limit = limit as f32;
     let delta = delta as f32;
     if delta == 0.0 || !start.is_finite() || !limit.is_finite() || !delta.is_finite() {
-        return None;
+        return RangeLength::Unknown;
     }
     let count = ((limit - start) / delta).ceil().max(0.0);
-    if !count.is_finite() || count >= i64::MAX as f32 {
-        return None;
+    if !count.is_finite() || count > isize::MAX as f32 {
+        return RangeLength::TooLarge;
     }
-    Some(count as i64)
+    RangeLength::Known(count as i64)
 }
 
 /// Compute a Float64 `Range` length. Handles negative `delta` (descending
 /// ranges) and rejects a zero/non-finite `delta` or a count that overflows an
 /// `i64`.
-fn range_len_f64(start: f64, limit: f64, delta: f64) -> Option<i64> {
+fn range_len_f64(start: f64, limit: f64, delta: f64) -> RangeLength {
     if delta == 0.0 || !start.is_finite() || !limit.is_finite() || !delta.is_finite() {
-        return None;
+        return RangeLength::Unknown;
     }
     let count = ((limit - start) / delta).ceil().max(0.0);
-    if !count.is_finite() || count >= i64::MAX as f64 {
-        return None;
+    if !count.is_finite() || count > isize::MAX as f64 {
+        return RangeLength::TooLarge;
     }
-    Some(count as i64)
+    RangeLength::Known(count as i64)
 }
 
 /// `Range`: output is a one-dimensional tensor with a static length only when
@@ -100,21 +110,30 @@ fn range(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
     let Some(dtype) = ctx.input_dtype(0) else {
         return Ok(());
     };
-    let length = range_int_len(ctx).or_else(|| range_float_len(ctx, dtype));
-    let dim = length
-        .map(DimExpr::constant)
-        .unwrap_or_else(|| ctx.fresh_dim());
+    let length = range_int_len(ctx)
+        .or_else(|| range_float_len(ctx, dtype))
+        .unwrap_or(RangeLength::Unknown);
+    let dim = match length {
+        RangeLength::Known(length) => DimExpr::constant(length),
+        RangeLength::Unknown => ctx.fresh_dim(),
+        RangeLength::TooLarge => {
+            return Err(ShapeInferError::Invalid {
+                op: "Range".into(),
+                detail: "output length exceeds isize::MAX".into(),
+            });
+        }
+    };
     ctx.set_output(0, dtype, vec![dim]);
     Ok(())
 }
 
 /// The `Range` length when all three operands are integer scalar constants.
-fn range_int_len(ctx: &InferenceContext) -> Option<i64> {
+fn range_int_len(ctx: &InferenceContext) -> Option<RangeLength> {
     match (const_ints(ctx, 0), const_ints(ctx, 1), const_ints(ctx, 2)) {
         (Some(start), Some(limit), Some(delta))
             if start.len() == 1 && limit.len() == 1 && delta.len() == 1 =>
         {
-            range_len(start[0], limit[0], delta[0])
+            Some(range_len(start[0], limit[0], delta[0]))
         }
         _ => None,
     }
@@ -122,13 +141,16 @@ fn range_int_len(ctx: &InferenceContext) -> Option<i64> {
 
 /// The `Range` length when all three operands are floating-point scalar
 /// constants.
-fn range_float_len(ctx: &InferenceContext, dtype: onnx_runtime_ir::DataType) -> Option<i64> {
+fn range_float_len(
+    ctx: &InferenceContext,
+    dtype: onnx_runtime_ir::DataType,
+) -> Option<RangeLength> {
     let start = const_float_scalar(ctx, 0)?;
     let limit = const_float_scalar(ctx, 1)?;
     let delta = const_float_scalar(ctx, 2)?;
     match dtype {
-        onnx_runtime_ir::DataType::Float32 => range_len_f32(start, limit, delta),
-        onnx_runtime_ir::DataType::Float64 => range_len_f64(start, limit, delta),
+        onnx_runtime_ir::DataType::Float32 => Some(range_len_f32(start, limit, delta)),
+        onnx_runtime_ir::DataType::Float64 => Some(range_len_f64(start, limit, delta)),
         _ => None,
     }
 }

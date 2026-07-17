@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use onnx_runtime_ir::{Attribute, Graph, Node, NodeId};
+use onnx_runtime_ir::{Attribute, DataType, Dim, Graph, Node, NodeId};
 
 use crate::{Model, SchemaRegistry};
 
@@ -100,6 +100,8 @@ impl VersionConverter {
         let mut converter = Self::empty();
         converter.register(ReshapeAllowZeroAdapter::new(5));
         converter.register(ReshapeAllowZeroAdapter::new(13));
+        converter.register(Softmax12To13Adapter::new("Softmax"));
+        converter.register(Softmax12To13Adapter::new("LogSoftmax"));
         converter
     }
 
@@ -410,6 +412,137 @@ impl OpAdapter for ReshapeAllowZeroAdapter {
     }
 }
 
+/// Opset 13 changed Softmax and LogSoftmax from flattening at `axis` to
+/// operating on exactly one axis. This is the same Shape/Flatten/op/Reshape
+/// rewrite used by the official ONNX 12→13 adapter.
+struct Softmax12To13Adapter {
+    op_type: &'static str,
+}
+
+impl Softmax12To13Adapter {
+    const fn new(op_type: &'static str) -> Self {
+        Self { op_type }
+    }
+}
+
+impl OpAdapter for Softmax12To13Adapter {
+    fn source(&self) -> (&str, &str, u32) {
+        ("", self.op_type, 12)
+    }
+
+    fn target_version(&self) -> u32 {
+        13
+    }
+
+    fn adapt(&self, node: &Node, graph: &mut Graph) -> Result<AdaptResult, ConvertError> {
+        if node.inputs.len() != 1 || node.outputs.len() != 1 {
+            return Ok(AdaptResult::Incompatible {
+                reason: format!("{} requires exactly one input and one output", self.op_type),
+            });
+        }
+        let Some(input) = node.inputs.first().copied().flatten() else {
+            return Ok(AdaptResult::Incompatible {
+                reason: format!("{} requires one present input", self.op_type),
+            });
+        };
+        let Some(&output) = node.outputs.first() else {
+            return Ok(AdaptResult::Incompatible {
+                reason: format!("{} requires one output", self.op_type),
+            });
+        };
+        if !graph.value_shape_is_known(input) {
+            return Ok(AdaptResult::Incompatible {
+                reason: format!(
+                    "{} 12→13 conversion requires a known input rank",
+                    self.op_type
+                ),
+            });
+        }
+        let rank = graph.value(input).rank();
+        let Ok(rank_i64) = i64::try_from(rank) else {
+            return Ok(AdaptResult::Incompatible {
+                reason: format!(
+                    "{} input rank exceeds the supported integer range",
+                    self.op_type
+                ),
+            });
+        };
+        if rank == 0 {
+            return Ok(AdaptResult::Incompatible {
+                reason: format!("{} input must have rank at least 1", self.op_type),
+            });
+        }
+        let old_axis = node
+            .attributes
+            .get("axis")
+            .and_then(Attribute::as_int)
+            .unwrap_or(1);
+        let normalized_axis = if old_axis < 0 {
+            old_axis.checked_add(rank_i64)
+        } else {
+            Some(old_axis)
+        };
+        let Some(normalized_axis) = normalized_axis.filter(|axis| (0..rank_i64).contains(axis))
+        else {
+            return Ok(AdaptResult::Incompatible {
+                reason: format!(
+                    "{} axis {old_axis} is outside [-{rank}, {rank})",
+                    self.op_type
+                ),
+            });
+        };
+
+        if normalized_axis == rank_i64 - 1 {
+            graph
+                .node_mut(node.id)
+                .attributes
+                .insert("axis".into(), Attribute::Int(-1));
+            return Ok(AdaptResult::Rewritten);
+        }
+
+        let input_value = graph.value(input);
+        let dtype = input_value.dtype;
+        let shape_value = graph.create_value(DataType::Int64, vec![Dim::Static(rank)]);
+        let flattened = graph.create_value(dtype, Vec::new());
+        let intermediate = graph.create_value(dtype, Vec::new());
+        graph.mark_value_shape_unknown(flattened);
+        graph.mark_value_shape_unknown(intermediate);
+
+        let helper_name =
+            |suffix: &str| (!node.name.is_empty()).then(|| format!("{}_{}", node.name, suffix));
+
+        let mut shape = Node::new(NodeId(0), "Shape", vec![Some(input)], vec![shape_value]);
+        shape.name = helper_name("shape").unwrap_or_default();
+        shape.device = node.device;
+
+        let mut flatten = Node::new(NodeId(0), "Flatten", vec![Some(input)], vec![flattened]);
+        flatten.name = helper_name("flatten").unwrap_or_default();
+        flatten
+            .attributes
+            .insert("axis".into(), Attribute::Int(normalized_axis));
+        flatten.device = node.device;
+
+        let mut softmax = node.clone();
+        softmax.id = NodeId(0);
+        softmax.inputs = vec![Some(flattened)];
+        softmax.outputs = vec![intermediate];
+        softmax.attributes.insert("axis".into(), Attribute::Int(-1));
+
+        let mut reshape = Node::new(
+            NodeId(0),
+            "Reshape",
+            vec![Some(intermediate), Some(shape_value)],
+            vec![output],
+        );
+        reshape.name = helper_name("reshape").unwrap_or_default();
+        reshape.device = node.device;
+
+        Ok(AdaptResult::Decomposed {
+            replacement_nodes: vec![shape, flatten, softmax, reshape],
+        })
+    }
+}
+
 fn default_opset(graph: &Graph) -> Result<u32, ConvertError> {
     graph
         .opset_imports
@@ -673,6 +806,112 @@ since_version: 5
         assert_eq!(report.ops_converted, 1);
         assert_eq!(report.ops_unchanged, 0);
         assert_eq!(report.ops_rejected, 0);
+    }
+
+    #[test]
+    fn softmax_and_log_softmax_12_to_13_adapters_are_registered() {
+        let converter = VersionConverter::new();
+        assert_eq!(converter.available_conversions("", "Softmax"), [(12, 13)]);
+        assert_eq!(
+            converter.available_conversions("ai.onnx", "LogSoftmax"),
+            [(12, 13)]
+        );
+    }
+
+    #[test]
+    fn softmax_last_axis_is_rewritten_without_decomposition() {
+        let mut model = unary_model("Softmax", 12);
+
+        let report = VersionConverter::new().convert(&mut model, 13).unwrap();
+
+        let node = model.graph.nodes.values().next().unwrap();
+        assert_eq!(node.attributes["axis"].as_int(), Some(-1));
+        assert_eq!(model.graph.opset_imports[""], 13);
+        assert_eq!(report.ops_converted, 1);
+        assert_eq!(report.ops_decomposed, 0);
+        assert_eq!(report.ops_rejected, 0);
+    }
+
+    #[test]
+    fn softmax_non_last_axis_uses_official_flatten_reshape_rewrite() {
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 12);
+        let input = graph.create_named_value("X", DataType::Float32, static_shape([2, 3, 4]));
+        let output = graph.create_named_value("Y", DataType::Float32, static_shape([2, 3, 4]));
+        graph.add_input(input);
+        graph.add_output(output);
+        let mut softmax = Node::new(NodeId(0), "Softmax", vec![Some(input)], vec![output]);
+        softmax.name = "softmax".into();
+        softmax.attributes.insert("axis".into(), Attribute::Int(1));
+        graph.insert_node(softmax);
+        let mut model = Model::new(graph);
+
+        let report = VersionConverter::new().convert(&mut model, 13).unwrap();
+
+        assert_eq!(model.graph.opset_imports[""], 13);
+        assert_eq!(report.ops_decomposed, 1);
+        assert_eq!(report.ops_converted, 0);
+        assert_eq!(report.ops_rejected, 0);
+        assert_eq!(model.graph.num_nodes(), 4);
+        model.graph.validate().unwrap();
+
+        let shape = model
+            .graph
+            .nodes
+            .values()
+            .find(|node| node.op_type == "Shape")
+            .unwrap();
+        let flatten = model
+            .graph
+            .nodes
+            .values()
+            .find(|node| node.op_type == "Flatten")
+            .unwrap();
+        let converted = model
+            .graph
+            .nodes
+            .values()
+            .find(|node| node.op_type == "Softmax")
+            .unwrap();
+        let reshape = model
+            .graph
+            .nodes
+            .values()
+            .find(|node| node.op_type == "Reshape")
+            .unwrap();
+
+        assert_eq!(flatten.attributes["axis"].as_int(), Some(1));
+        assert_eq!(converted.attributes["axis"].as_int(), Some(-1));
+        assert_eq!(
+            model.graph.value(flatten.inputs[0].unwrap()).id,
+            shape.inputs[0].unwrap()
+        );
+        assert_eq!(
+            model.graph.value(converted.inputs[0].unwrap()).producer,
+            Some(flatten.id)
+        );
+        assert_eq!(
+            model.graph.value(reshape.inputs[0].unwrap()).producer,
+            Some(converted.id)
+        );
+        assert_eq!(
+            model.graph.value(reshape.inputs[1].unwrap()).producer,
+            Some(shape.id)
+        );
+        assert_eq!(model.graph.value(output).producer, Some(reshape.id));
+        let flattened_output = flatten.outputs[0];
+        let converted_output = converted.outputs[0];
+
+        crate::infer_shapes(&mut model).unwrap();
+        assert_eq!(
+            model.graph.value(flattened_output).shape,
+            static_shape([2, 12])
+        );
+        assert_eq!(
+            model.graph.value(converted_output).shape,
+            static_shape([2, 12])
+        );
+        assert_eq!(model.graph.value(output).shape, static_shape([2, 3, 4]));
     }
 
     #[test]

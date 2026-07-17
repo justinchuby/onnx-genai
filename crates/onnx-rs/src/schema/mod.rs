@@ -394,6 +394,20 @@ const BUILTIN_YAML: &[&str] = &[
     include_str!("../../schemas/standard/reduce_sum_square.yaml"),
     include_str!("../../schemas/standard/arg_max.yaml"),
     include_str!("../../schemas/standard/arg_min.yaml"),
+    include_str!("../../schemas/standard/gather_elements.yaml"),
+    include_str!("../../schemas/standard/gather_nd.yaml"),
+    include_str!("../../schemas/standard/equal.yaml"),
+    include_str!("../../schemas/standard/greater.yaml"),
+    include_str!("../../schemas/standard/less.yaml"),
+    include_str!("../../schemas/standard/and.yaml"),
+    include_str!("../../schemas/standard/or.yaml"),
+    include_str!("../../schemas/standard/not.yaml"),
+    include_str!("../../schemas/standard/cast.yaml"),
+    include_str!("../../schemas/standard/shape.yaml"),
+    include_str!("../../schemas/standard/size.yaml"),
+    include_str!("../../schemas/standard/non_zero.yaml"),
+    include_str!("../../schemas/standard/range.yaml"),
+    include_str!("../../schemas/standard/split.yaml"),
 ];
 
 // FOLLOW-UP §7.4: complete the standard and ONNX-ML YAML catalogues.
@@ -629,9 +643,121 @@ type_constraints:
             "ReduceSumSquare",
             "ArgMax",
             "ArgMin",
+            "GatherElements",
+            "GatherND",
+            "Equal",
+            "Greater",
+            "Less",
+            "And",
+            "Or",
+            "Not",
+            "Cast",
+            "Shape",
+            "Size",
+            "NonZero",
+            "Range",
+            "Split",
         ] {
-            assert!(registry.lookup(name, "", 24).is_some(), "{name}");
+            assert!(registry.lookup(name, "", 25).is_some(), "{name}");
         }
+    }
+
+    #[test]
+    fn round_five_schemas_match_official_signatures() {
+        let registry = SchemaRegistry::builtins();
+
+        for (name, since_version) in [
+            ("GatherElements", 13),
+            ("GatherND", 13),
+            ("Equal", 19),
+            ("Greater", 13),
+            ("Less", 13),
+            ("And", 7),
+            ("Or", 7),
+            ("Not", 1),
+            ("Cast", 25),
+            ("Shape", 25),
+            ("Size", 25),
+            ("NonZero", 13),
+            ("Range", 11),
+            ("Split", 18),
+        ] {
+            assert_eq!(
+                registry.lookup(name, "", 25).unwrap().since_version,
+                since_version,
+                "{name}"
+            );
+        }
+
+        let gather_elements = registry.lookup("GatherElements", "", 25).unwrap();
+        assert_eq!(
+            gather_elements.attributes[0].default,
+            Some(AttributeDefault::Int(0))
+        );
+        assert_eq!(
+            gather_elements.type_constraints[1].allowed,
+            [DataType::Int32, DataType::Int64]
+        );
+
+        let gather_nd = registry.lookup("GatherND", "", 25).unwrap();
+        assert_eq!(gather_nd.inputs[1].type_str, "tensor(int64)");
+        assert_eq!(
+            gather_nd.attributes[0].default,
+            Some(AttributeDefault::Int(0))
+        );
+
+        for name in ["Equal", "Greater", "Less", "And", "Or"] {
+            let schema = registry.lookup(name, "", 25).unwrap();
+            assert_eq!(schema.outputs[0].type_str, "T1");
+            assert_eq!(
+                schema.type_constraints.last().unwrap().allowed,
+                [DataType::Bool],
+                "{name}"
+            );
+        }
+        assert_eq!(
+            registry.lookup("Not", "", 25).unwrap().type_constraints[0].allowed,
+            [DataType::Bool]
+        );
+
+        let cast = registry.lookup("Cast", "", 25).unwrap();
+        assert_eq!(
+            cast.attributes
+                .iter()
+                .find(|attribute| attribute.name == "round_mode")
+                .unwrap()
+                .default,
+            Some(AttributeDefault::String("up".into()))
+        );
+        assert!(
+            cast.attributes
+                .iter()
+                .find(|attribute| attribute.name == "to")
+                .unwrap()
+                .required
+        );
+        assert_eq!(cast.type_constraints[0].allowed.len(), 24);
+
+        for name in ["Shape", "Size"] {
+            let schema = registry.lookup(name, "", 25).unwrap();
+            assert_eq!(schema.type_constraints[0].allowed.len(), 26);
+            assert_eq!(schema.type_constraints[1].allowed, [DataType::Int64]);
+        }
+
+        let split = registry.lookup("Split", "", 25).unwrap();
+        assert!(split.inputs[1].optional);
+        assert!(split.outputs[0].variadic);
+        assert_eq!(split.outputs[0].min_arity, 1);
+        assert_eq!(
+            registry.lookup("Range", "", 25).unwrap().type_constraints[0].allowed,
+            [
+                DataType::Float32,
+                DataType::Float64,
+                DataType::Int16,
+                DataType::Int32,
+                DataType::Int64
+            ]
+        );
     }
 
     #[test]

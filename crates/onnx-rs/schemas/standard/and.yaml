@@ -1,0 +1,12 @@
+domain: ""
+name: And
+since_version: 7
+doc: Element-wise logical conjunction with multidirectional broadcasting.
+inputs:
+  - { name: A, type_str: T }
+  - { name: B, type_str: T }
+outputs:
+  - { name: C, type_str: T1 }
+type_constraints:
+  - { type_param: T, allowed: [bool] }
+  - { type_param: T1, allowed: [bool] }

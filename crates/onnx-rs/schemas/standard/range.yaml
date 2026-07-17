@@ -1,0 +1,12 @@
+domain: ""
+name: Range
+since_version: 11
+doc: Generate a one-dimensional arithmetic progression.
+inputs:
+  - { name: start, type_str: T }
+  - { name: limit, type_str: T }
+  - { name: delta, type_str: T }
+outputs:
+  - { name: output, type_str: T }
+type_constraints:
+  - { type_param: T, allowed: [float32, float64, int16, int32, int64] }

@@ -5052,6 +5052,68 @@ mod tests {
     }
 
     #[test]
+    fn round_five_schemas_accept_official_minimal_forms() {
+        for (op_type, inputs, outputs, int64_inputs, bool_inputs, int64_outputs, bool_outputs) in [
+            ("GatherElements", 2, 1, vec![1], vec![], vec![], vec![]),
+            ("GatherND", 2, 1, vec![1], vec![], vec![], vec![]),
+            ("Equal", 2, 1, vec![], vec![], vec![], vec![0]),
+            ("Greater", 2, 1, vec![], vec![], vec![], vec![0]),
+            ("Less", 2, 1, vec![], vec![], vec![], vec![0]),
+            ("And", 2, 1, vec![], vec![0, 1], vec![], vec![0]),
+            ("Or", 2, 1, vec![], vec![0, 1], vec![], vec![0]),
+            ("Not", 1, 1, vec![], vec![0], vec![], vec![0]),
+            ("Shape", 1, 1, vec![], vec![], vec![0], vec![]),
+            ("Size", 1, 1, vec![], vec![], vec![0], vec![]),
+            ("NonZero", 1, 1, vec![], vec![], vec![0], vec![]),
+            ("Range", 3, 1, vec![], vec![], vec![], vec![]),
+            ("Split", 1, 2, vec![], vec![], vec![], vec![]),
+        ] {
+            let mut model = one_node_model(op_type, inputs, outputs);
+            model.graph.opset_imports.insert(String::new(), 25);
+            for index in int64_inputs {
+                let value = model.graph.inputs[index];
+                model.graph.value_mut(value).dtype = DataType::Int64;
+            }
+            for index in bool_inputs {
+                let value = model.graph.inputs[index];
+                model.graph.value_mut(value).dtype = DataType::Bool;
+            }
+            for index in int64_outputs {
+                let value = model.graph.outputs[index];
+                model.graph.value_mut(value).dtype = DataType::Int64;
+            }
+            for index in bool_outputs {
+                let value = model.graph.outputs[index];
+                model.graph.value_mut(value).dtype = DataType::Bool;
+            }
+
+            let result = model.validate();
+            assert!(
+                result.is_valid(),
+                "{op_type}: optional fields should be omittable: {:?}",
+                result.violations
+            );
+        }
+
+        let mut cast = one_node_model("Cast", 1, 1);
+        cast.graph.opset_imports.insert(String::new(), 25);
+        let output = cast.graph.outputs[0];
+        cast.graph.value_mut(output).dtype = DataType::Int64;
+        let node = cast.graph.nodes.keys().next().unwrap();
+        cast.graph.node_mut(node).attributes.insert(
+            "to".into(),
+            Attribute::Int(i64::from(DataType::Int64.to_onnx())),
+        );
+        assert!(cast.validate().is_valid());
+
+        cast.graph.node_mut(node).attributes.remove("to");
+        assert!(cast.validate().violations.iter().any(|violation| {
+            violation.rule_id == "schema.node_conforms"
+                && violation.message.contains("required attribute 'to'")
+        }));
+    }
+
+    #[test]
     fn common_builtin_arity_boundaries_pass() {
         for (op_type, inputs, outputs) in [
             ("MatMul", 2, 1),

@@ -27,6 +27,20 @@ pub(crate) fn norm_axis(axis: i64, rank: usize) -> usize {
     a.clamp(0, r.saturating_sub(1)) as usize
 }
 
+/// Normalize an axis without clamping invalid values or overflowing.
+pub(crate) fn checked_axis(axis: i64, rank: usize) -> Option<usize> {
+    let rank = i64::try_from(rank).ok()?;
+    let normalized = if axis < 0 {
+        axis.checked_add(rank)?
+    } else {
+        axis
+    };
+    (0..rank)
+        .contains(&normalized)
+        .then(|| usize::try_from(normalized).ok())
+        .flatten()
+}
+
 /// Populate `registry` with every built-in rule.
 pub fn register_all(registry: &mut InferenceRegistry) {
     elementwise::register(registry);

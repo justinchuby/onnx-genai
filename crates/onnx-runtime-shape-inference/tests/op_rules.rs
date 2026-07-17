@@ -1072,20 +1072,18 @@ fn reshape_overflowing_total_degrades_to_symbol() {
 }
 
 #[test]
-fn size_overflowing_total_is_not_bogus() {
-    // `Size` over a 2^80-element tensor overflows i64; the shape-data scalar it
-    // emits must be an unknown (overflow) dim, never a wrapped concrete value.
+fn size_rejects_total_above_isize_max() {
+    // A concrete tensor extent that cannot be represented by Rust indexing must
+    // be rejected rather than wrapped or lowered to a bogus static dimension.
     let n = node("Size", 1, 1);
     let big = c(1 << 20);
-    let outs = run(
+    let error = try_run(
         &n,
         vec![f32in(vec![big.clone(), big.clone(), big.clone(), big])],
         13,
-    );
-    let sd = outs[0].shape_data.as_ref().expect("Size emits shape-data");
-    assert_eq!(sd.elems.len(), 1);
-    assert!(sd.elems[0].is_overflow());
-    assert_eq!(sd.elems[0].as_const(), None);
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("exceeds isize::MAX"));
 }
 
 // --- Transpose ------------------------------------------------------------

@@ -91,6 +91,19 @@ mod tests {
         value
     }
 
+    fn i64_scalar_initializer(graph: &mut Graph, name: &str, value: i64) -> ValueId {
+        let id = graph.create_named_value(name, DataType::Int64, Vec::<Dim>::new());
+        graph.set_initializer(
+            id,
+            WeightRef::Inline(TensorData::from_raw(
+                DataType::Int64,
+                Vec::new(),
+                value.to_le_bytes().to_vec(),
+            )),
+        );
+        id
+    }
+
     #[test]
     fn infers_matmul_and_add_output_shapes() {
         let mut graph = Graph::new();
@@ -580,6 +593,297 @@ mod tests {
             )
         );
         assert_eq!(result.unknown, 0);
+    }
+
+    #[test]
+    fn infers_round_five_index_predicate_and_shape_ops() {
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 25);
+
+        let data = graph.create_named_value(
+            "data",
+            DataType::Float32,
+            vec![Dim::Static(2), Dim::Static(3), Dim::Static(4)],
+        );
+        let gather_elements_indices = graph.create_named_value(
+            "gather_elements_indices",
+            DataType::Int64,
+            vec![Dim::Static(2), Dim::Static(5), Dim::Static(4)],
+        );
+        let gather_nd_indices = graph.create_named_value(
+            "gather_nd_indices",
+            DataType::Int64,
+            vec![Dim::Static(2), Dim::Static(5), Dim::Static(2)],
+        );
+        let lhs = graph.create_named_value(
+            "lhs",
+            DataType::Float32,
+            vec![Dim::Static(2), Dim::Static(1), Dim::Static(4)],
+        );
+        let rhs = graph.create_named_value(
+            "rhs",
+            DataType::Float32,
+            vec![Dim::Static(1), Dim::Static(3), Dim::Static(1)],
+        );
+        let split_input = graph.create_named_value(
+            "split_input",
+            DataType::Float32,
+            vec![Dim::Static(2), Dim::Static(6), Dim::Static(4)],
+        );
+        for input in [
+            data,
+            gather_elements_indices,
+            gather_nd_indices,
+            lhs,
+            rhs,
+            split_input,
+        ] {
+            graph.add_input(input);
+        }
+
+        let range_start = i64_scalar_initializer(&mut graph, "range_start", 0);
+        let range_limit = i64_scalar_initializer(&mut graph, "range_limit", 10);
+        let range_delta = i64_scalar_initializer(&mut graph, "range_delta", 2);
+        let split_sizes = i64_initializer(&mut graph, "split_sizes", &[2, 4]);
+
+        let gathered_elements =
+            graph.create_named_value("gathered_elements", DataType::Undefined, Shape::new());
+        let mut gather_elements = Node::new(
+            NodeId(0),
+            "GatherElements",
+            vec![Some(data), Some(gather_elements_indices)],
+            vec![gathered_elements],
+        );
+        gather_elements
+            .attributes
+            .insert("axis".into(), Attribute::Int(-2));
+        graph.insert_node(gather_elements);
+
+        let gathered_nd =
+            graph.create_named_value("gathered_nd", DataType::Undefined, Shape::new());
+        let mut gather_nd = Node::new(
+            NodeId(1),
+            "GatherND",
+            vec![Some(data), Some(gather_nd_indices)],
+            vec![gathered_nd],
+        );
+        gather_nd
+            .attributes
+            .insert("batch_dims".into(), Attribute::Int(1));
+        graph.insert_node(gather_nd);
+
+        let equal = graph.create_named_value("equal", DataType::Undefined, Shape::new());
+        graph.insert_node(Node::new(
+            NodeId(2),
+            "Equal",
+            vec![Some(lhs), Some(rhs)],
+            vec![equal],
+        ));
+        let greater = graph.create_named_value("greater", DataType::Undefined, Shape::new());
+        graph.insert_node(Node::new(
+            NodeId(3),
+            "Greater",
+            vec![Some(lhs), Some(rhs)],
+            vec![greater],
+        ));
+        let less = graph.create_named_value("less", DataType::Undefined, Shape::new());
+        graph.insert_node(Node::new(
+            NodeId(4),
+            "Less",
+            vec![Some(lhs), Some(rhs)],
+            vec![less],
+        ));
+        let and = graph.create_named_value("and", DataType::Undefined, Shape::new());
+        graph.insert_node(Node::new(
+            NodeId(5),
+            "And",
+            vec![Some(equal), Some(greater)],
+            vec![and],
+        ));
+        let or = graph.create_named_value("or", DataType::Undefined, Shape::new());
+        graph.insert_node(Node::new(
+            NodeId(6),
+            "Or",
+            vec![Some(and), Some(less)],
+            vec![or],
+        ));
+        let not = graph.create_named_value("not", DataType::Undefined, Shape::new());
+        graph.insert_node(Node::new(NodeId(7), "Not", vec![Some(or)], vec![not]));
+
+        let cast = graph.create_named_value("cast", DataType::Undefined, Shape::new());
+        let mut cast_node = Node::new(NodeId(8), "Cast", vec![Some(data)], vec![cast]);
+        cast_node.attributes.insert(
+            "to".into(),
+            Attribute::Int(i64::from(DataType::Int64.to_onnx())),
+        );
+        graph.insert_node(cast_node);
+
+        let shape = graph.create_named_value("shape", DataType::Undefined, Shape::new());
+        let mut shape_node = Node::new(NodeId(9), "Shape", vec![Some(data)], vec![shape]);
+        shape_node
+            .attributes
+            .insert("start".into(), Attribute::Int(1));
+        shape_node
+            .attributes
+            .insert("end".into(), Attribute::Int(i64::MAX));
+        graph.insert_node(shape_node);
+
+        let size = graph.create_named_value("size", DataType::Undefined, Shape::new());
+        graph.insert_node(Node::new(NodeId(10), "Size", vec![Some(data)], vec![size]));
+        let non_zero = graph.create_named_value("non_zero", DataType::Undefined, Shape::new());
+        graph.insert_node(Node::new(
+            NodeId(11),
+            "NonZero",
+            vec![Some(data)],
+            vec![non_zero],
+        ));
+        let range = graph.create_named_value("range", DataType::Undefined, Shape::new());
+        graph.insert_node(Node::new(
+            NodeId(12),
+            "Range",
+            vec![Some(range_start), Some(range_limit), Some(range_delta)],
+            vec![range],
+        ));
+
+        let split_first =
+            graph.create_named_value("split_first", DataType::Undefined, Shape::new());
+        let split_second =
+            graph.create_named_value("split_second", DataType::Undefined, Shape::new());
+        let mut split = Node::new(
+            NodeId(13),
+            "Split",
+            vec![Some(split_input), Some(split_sizes)],
+            vec![split_first, split_second],
+        );
+        split.attributes.insert("axis".into(), Attribute::Int(-2));
+        graph.insert_node(split);
+
+        for output in [
+            gathered_elements,
+            gathered_nd,
+            equal,
+            greater,
+            less,
+            and,
+            or,
+            not,
+            cast,
+            shape,
+            size,
+            non_zero,
+            range,
+            split_first,
+            split_second,
+        ] {
+            graph.add_output(output);
+        }
+
+        let mut model = Model::new(graph);
+        let result = infer_shapes(&mut model).unwrap();
+
+        assert_eq!(
+            (
+                model.graph.value(gathered_elements).dtype,
+                model.graph.value(gathered_elements).shape.clone()
+            ),
+            (
+                DataType::Float32,
+                vec![Dim::Static(2), Dim::Static(5), Dim::Static(4)]
+            )
+        );
+        assert_eq!(
+            model.graph.value(gathered_nd).shape,
+            vec![Dim::Static(2), Dim::Static(5)]
+        );
+        for output in [equal, greater, less, and, or, not] {
+            assert_eq!(
+                (
+                    model.graph.value(output).dtype,
+                    model.graph.value(output).shape.clone()
+                ),
+                (
+                    DataType::Bool,
+                    vec![Dim::Static(2), Dim::Static(3), Dim::Static(4)]
+                )
+            );
+        }
+        assert_eq!(
+            (
+                model.graph.value(cast).dtype,
+                model.graph.value(cast).shape.clone()
+            ),
+            (
+                DataType::Int64,
+                vec![Dim::Static(2), Dim::Static(3), Dim::Static(4)]
+            )
+        );
+        assert_eq!(
+            (
+                model.graph.value(shape).dtype,
+                model.graph.value(shape).shape.clone()
+            ),
+            (DataType::Int64, vec![Dim::Static(2)])
+        );
+        assert_eq!(
+            (
+                model.graph.value(size).dtype,
+                model.graph.value(size).shape.clone()
+            ),
+            (DataType::Int64, Vec::<Dim>::new())
+        );
+        assert!(matches!(
+            model.graph.value(non_zero).shape.as_slice(),
+            [Dim::Static(3), Dim::Symbolic(_)]
+        ));
+        assert_eq!(model.graph.value(range).shape, vec![Dim::Static(5)]);
+        assert_eq!(
+            model.graph.value(split_first).shape,
+            vec![Dim::Static(2), Dim::Static(2), Dim::Static(4)]
+        );
+        assert_eq!(
+            model.graph.value(split_second).shape,
+            vec![Dim::Static(2), Dim::Static(4), Dim::Static(4)]
+        );
+        assert_eq!(result.unknown, 0);
+    }
+
+    #[test]
+    fn round_five_shape_arithmetic_rejects_unrepresentable_values() {
+        let mut range_graph = Graph::new();
+        range_graph.opset_imports.insert(String::new(), 25);
+        let start = i64_scalar_initializer(&mut range_graph, "start", i64::MIN);
+        let limit = i64_scalar_initializer(&mut range_graph, "limit", i64::MAX);
+        let delta = i64_scalar_initializer(&mut range_graph, "delta", 1);
+        let output = range_graph.create_named_value("range", DataType::Undefined, Shape::new());
+        range_graph.insert_node(Node::new(
+            NodeId(0),
+            "Range",
+            vec![Some(start), Some(limit), Some(delta)],
+            vec![output],
+        ));
+        range_graph.add_output(output);
+        let error = infer_shapes(&mut Model::new(range_graph)).unwrap_err();
+        assert!(error.to_string().contains("exceeds isize::MAX"));
+
+        let mut split_graph = Graph::new();
+        split_graph.opset_imports.insert(String::new(), 25);
+        let input = split_graph.create_named_value(
+            "input",
+            DataType::Float32,
+            vec![Dim::Static(2), Dim::Static(4)],
+        );
+        let first = split_graph.create_named_value("first", DataType::Undefined, Shape::new());
+        let second = split_graph.create_named_value("second", DataType::Undefined, Shape::new());
+        split_graph.add_input(input);
+        let mut split = Node::new(NodeId(0), "Split", vec![Some(input)], vec![first, second]);
+        split
+            .attributes
+            .insert("axis".into(), Attribute::Int(i64::MIN));
+        split_graph.insert_node(split);
+        split_graph.add_output(first);
+        split_graph.add_output(second);
+        let error = infer_shapes(&mut Model::new(split_graph)).unwrap_err();
+        assert!(error.to_string().contains("axis"));
     }
 
     #[test]

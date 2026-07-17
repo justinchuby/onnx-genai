@@ -1,0 +1,13 @@
+domain: ""
+name: GatherND
+since_version: 13
+doc: Gather slices from a tensor using tuples of indices.
+attributes:
+  - { name: batch_dims, type: int, default: 0 }
+inputs:
+  - { name: data, type_str: T }
+  - { name: indices, type_str: "tensor(int64)" }
+outputs:
+  - { name: output, type_str: T }
+type_constraints:
+  - { type_param: T, allowed: [uint8, uint16, uint32, uint64, int8, int16, int32, int64, bfloat16, float16, float32, float64, string, bool, complex64, complex128] }

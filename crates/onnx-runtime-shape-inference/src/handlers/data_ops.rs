@@ -16,11 +16,18 @@ pub fn shape(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
     let Some(input) = ctx.input_shape(0).map(<[DimExpr]>::to_vec) else {
         return Ok(());
     };
-    let rank = input.len() as i64;
+    let rank = i64::try_from(input.len()).map_err(|_| ShapeInferError::Invalid {
+        op: "Shape".into(),
+        detail: "input rank exceeds the supported integer range".into(),
+    })?;
     // opset-15 start/end slicing of the dim list.
     let clamp = |v: i64| -> usize {
-        let v = if v < 0 { v + rank } else { v };
-        v.clamp(0, rank) as usize
+        let v = if v < 0 {
+            v.checked_add(rank).unwrap_or(i64::MIN)
+        } else {
+            v
+        };
+        usize::try_from(v.clamp(0, rank)).expect("clamped shape axis fits usize")
     };
     let start = clamp(
         ctx.node
@@ -51,6 +58,18 @@ pub fn size(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
     let Some(input) = ctx.input_shape(0).map(<[DimExpr]>::to_vec) else {
         return Ok(());
     };
+    if input.iter().all(DimExpr::is_const) {
+        let total = input.iter().try_fold(1usize, |total, dim| {
+            let extent = usize::try_from(dim.as_const().expect("checked constant")).ok()?;
+            total.checked_mul(extent)
+        });
+        if total.is_none_or(|total| total > isize::MAX as usize) {
+            return Err(ShapeInferError::Invalid {
+                op: "Size".into(),
+                detail: "input element count exceeds isize::MAX".into(),
+            });
+        }
+    }
     let total = DimExpr::product(&input);
     ctx.set_output(0, DataType::Int64, Vec::new());
     ctx.set_output_shape_data(0, ShapeData::scalar(DataType::Int64, total));

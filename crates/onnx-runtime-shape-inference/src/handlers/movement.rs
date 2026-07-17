@@ -13,7 +13,7 @@ use onnx_runtime_ir::{Attribute, DataType};
 use crate::context::{InferenceContext, TypeInfo};
 use crate::dim_expr::DimExpr;
 use crate::error::ShapeInferError;
-use crate::handlers::norm_axis;
+use crate::handlers::{checked_axis, norm_axis};
 use crate::registry::InferenceRegistry;
 use crate::shape_data::ShapeData;
 
@@ -453,12 +453,23 @@ pub fn split(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
         return Ok(());
     };
     let rank = t.rank();
+    if rank == 0 {
+        return Err(ShapeInferError::InvalidRank {
+            op: "Split".into(),
+            index: 0,
+            rank,
+            detail: "input must have rank at least 1".into(),
+        });
+    }
     let axis = ctx
         .node
         .attr("axis")
         .and_then(Attribute::as_int)
         .unwrap_or(0);
-    let axis = norm_axis(axis, rank);
+    let axis = checked_axis(axis, rank).ok_or_else(|| ShapeInferError::Invalid {
+        op: "Split".into(),
+        detail: format!("axis {axis} is outside [-{rank}, {rank})"),
+    })?;
     let n_out = ctx.num_outputs();
     let num_outputs = ctx
         .node
@@ -477,18 +488,46 @@ pub fn split(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
     for i in 0..n_out {
         let mut shape = t.shape.clone();
         shape[axis] = match &sizes {
-            Some(s) => s
-                .get(i)
-                .map(|&v| DimExpr::constant(v))
-                .unwrap_or_else(|| ctx.fresh_dim()),
+            Some(s) => match s.get(i).copied() {
+                Some(v) if v < 0 => {
+                    return Err(ShapeInferError::Invalid {
+                        op: "Split".into(),
+                        detail: format!("split size at index {i} is negative: {v}"),
+                    });
+                }
+                Some(v) if usize::try_from(v).is_err() || v as u128 > isize::MAX as u128 => {
+                    return Err(ShapeInferError::Invalid {
+                        op: "Split".into(),
+                        detail: format!("split size at index {i} exceeds isize::MAX: {v}"),
+                    });
+                }
+                Some(v) => DimExpr::constant(v),
+                None => ctx.fresh_dim(),
+            },
             None => {
                 match (num_outputs, t.shape[axis].as_const()) {
                     // With opset-18 `num_outputs`, ONNX gives every output but
                     // the last ceil(dim / n) elements; the last gets the
                     // remainder. This differs from the older equal-split path.
                     (Some(n), Some(d)) if i < n => {
-                        let chunk = (d + n as i64 - 1) / n as i64;
-                        let remainder = d - (n as i64 - 1) * chunk;
+                        let n = i64::try_from(n).map_err(|_| ShapeInferError::Invalid {
+                            op: "Split".into(),
+                            detail: "num_outputs exceeds the supported integer range".into(),
+                        })?;
+                        let chunk = d
+                            .checked_add(n - 1)
+                            .and_then(|numerator| numerator.checked_div(n))
+                            .ok_or_else(|| ShapeInferError::Invalid {
+                                op: "Split".into(),
+                                detail: "split chunk arithmetic overflowed".into(),
+                            })?;
+                        let remainder = (n - 1)
+                            .checked_mul(chunk)
+                            .and_then(|used| d.checked_sub(used))
+                            .ok_or_else(|| ShapeInferError::Invalid {
+                                op: "Split".into(),
+                                detail: "split remainder arithmetic overflowed".into(),
+                            })?;
                         if remainder < 0 {
                             return Err(ShapeInferError::Invalid {
                                 op: "Split".into(),
@@ -498,12 +537,25 @@ pub fn split(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
                                 ),
                             });
                         }
-                        let size = if i + 1 == n { remainder } else { chunk };
+                        let size = if i + 1 == n as usize {
+                            remainder
+                        } else {
+                            chunk
+                        };
                         DimExpr::constant(size)
                     }
                     // The legacy no-`split` form is only exact when divisible.
-                    (None, Some(d)) if n_out > 0 && d % n_out as i64 == 0 => {
-                        DimExpr::constant(d / n_out as i64)
+                    (None, Some(d)) if n_out > 0 => {
+                        let n_out =
+                            i64::try_from(n_out).map_err(|_| ShapeInferError::Invalid {
+                                op: "Split".into(),
+                                detail: "output count exceeds the supported integer range".into(),
+                            })?;
+                        if d % n_out == 0 {
+                            DimExpr::constant(d / n_out)
+                        } else {
+                            ctx.fresh_dim()
+                        }
                     }
                     _ => ctx.fresh_dim(),
                 }
@@ -584,6 +636,39 @@ fn gather_shape_data(ctx: &InferenceContext) -> Option<ShapeData> {
 /// data. (Not `GatherND` — this is the elementwise gather whose output rank
 /// equals the indices' rank.)
 pub fn gather_elements(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
+    let data_rank = ctx.input_rank(0);
+    let indices_rank = ctx.input_rank(1);
+    if let Some(rank) = data_rank {
+        if rank == 0 {
+            return Err(ShapeInferError::InvalidRank {
+                op: "GatherElements".into(),
+                index: 0,
+                rank,
+                detail: "data must have rank at least 1".into(),
+            });
+        }
+        let axis = ctx
+            .node
+            .attr("axis")
+            .and_then(Attribute::as_int)
+            .unwrap_or(0);
+        if checked_axis(axis, rank).is_none() {
+            return Err(ShapeInferError::Invalid {
+                op: "GatherElements".into(),
+                detail: format!("axis {axis} is outside [-{rank}, {rank})"),
+            });
+        }
+    }
+    if let (Some(data_rank), Some(indices_rank)) = (data_rank, indices_rank)
+        && data_rank != indices_rank
+    {
+        return Err(ShapeInferError::InvalidRank {
+            op: "GatherElements".into(),
+            index: 1,
+            rank: indices_rank,
+            detail: format!("indices rank must equal data rank {data_rank}"),
+        });
+    }
     let dtype = ctx.input_dtype(0);
     let idx_shape = ctx.input_shape(1).map(<[DimExpr]>::to_vec);
     if let (Some(dtype), Some(shape)) = (dtype, idx_shape) {
@@ -604,6 +689,22 @@ pub fn gather_nd(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
     let Some(dtype) = ctx.input_dtype(0) else {
         return Ok(());
     };
+    if data.is_empty() {
+        return Err(ShapeInferError::InvalidRank {
+            op: "GatherND".into(),
+            index: 0,
+            rank: 0,
+            detail: "data must have rank at least 1".into(),
+        });
+    }
+    if indices.is_empty() {
+        return Err(ShapeInferError::InvalidRank {
+            op: "GatherND".into(),
+            index: 1,
+            rank: 0,
+            detail: "indices must have rank at least 1".into(),
+        });
+    }
     let Some(index_depth) = indices.last().and_then(DimExpr::as_const) else {
         // The index-tuple depth determines the output rank. Without it, retain
         // the crate's unknown-rank representation (no TypeInfo).
@@ -614,21 +715,39 @@ pub fn gather_nd(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
         .attr("batch_dims")
         .and_then(Attribute::as_int)
         .unwrap_or(0);
-    if batch_dims < 0 {
-        return Ok(());
-    }
-    let batch_dims = batch_dims as usize;
-    let Ok(index_depth) = usize::try_from(index_depth) else {
-        return Ok(());
-    };
+    let batch_dims = usize::try_from(batch_dims).map_err(|_| ShapeInferError::Invalid {
+        op: "GatherND".into(),
+        detail: format!("batch_dims must be non-negative, found {batch_dims}"),
+    })?;
+    let index_depth = usize::try_from(index_depth).map_err(|_| ShapeInferError::Invalid {
+        op: "GatherND".into(),
+        detail: format!("index tuple depth must be non-negative, found {index_depth}"),
+    })?;
     if batch_dims > data.len()
         || batch_dims >= indices.len()
         || index_depth > data.len().saturating_sub(batch_dims)
     {
-        return Ok(());
+        return Err(ShapeInferError::Invalid {
+            op: "GatherND".into(),
+            detail: format!(
+                "batch_dims {batch_dims} and index depth {index_depth} are incompatible with data rank {} and indices rank {}",
+                data.len(),
+                indices.len()
+            ),
+        });
     }
 
-    let mut out = Vec::with_capacity(data.len() + indices.len() - index_depth - 1);
+    let capacity = data
+        .len()
+        .checked_add(indices.len())
+        .and_then(|rank| rank.checked_sub(index_depth))
+        .and_then(|rank| rank.checked_sub(1))
+        .filter(|&rank| rank <= isize::MAX as usize)
+        .ok_or_else(|| ShapeInferError::Invalid {
+            op: "GatherND".into(),
+            detail: "output rank arithmetic overflowed".into(),
+        })?;
+    let mut out = Vec::with_capacity(capacity);
     out.extend_from_slice(&data[..batch_dims]);
     out.extend(indices[batch_dims..indices.len() - 1].iter().cloned());
     out.extend_from_slice(&data[batch_dims + index_depth..]);

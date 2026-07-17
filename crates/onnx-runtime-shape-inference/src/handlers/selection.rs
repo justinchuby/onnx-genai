@@ -91,12 +91,12 @@ fn non_zero(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
     let Some(rank) = ctx.input_rank(0) else {
         return Ok(());
     };
+    let rank = i64::try_from(rank).map_err(|_| ShapeInferError::Invalid {
+        op: "NonZero".into(),
+        detail: "input rank exceeds the supported integer range".into(),
+    })?;
     let nnz = ctx.fresh_dim();
-    ctx.set_output(
-        0,
-        DataType::Int64,
-        vec![DimExpr::constant(rank as i64), nnz],
-    );
+    ctx.set_output(0, DataType::Int64, vec![DimExpr::constant(rank), nnz]);
     Ok(())
 }
 
