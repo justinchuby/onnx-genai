@@ -298,19 +298,15 @@ fn validate_quantization_granularity(
             detail: "non-scalar scale cannot quantize a scalar input".into(),
         });
     }
-    let axis = if data_rank == 1 {
-        0
-    } else {
-        let raw_axis = ctx
-            .node
-            .attr("axis")
-            .and_then(Attribute::as_int)
-            .unwrap_or(1);
-        checked_axis(raw_axis, data_rank).ok_or_else(|| ShapeInferError::Invalid {
-            op: ctx.op().into(),
-            detail: format!("axis {raw_axis} is out of range for rank {data_rank}"),
-        })?
-    };
+    let raw_axis = ctx
+        .node
+        .attr("axis")
+        .and_then(Attribute::as_int)
+        .unwrap_or(1);
+    let axis = checked_axis(raw_axis, data_rank).ok_or_else(|| ShapeInferError::Invalid {
+        op: ctx.op().into(),
+        detail: format!("axis {raw_axis} is out of range for rank {data_rank}"),
+    })?;
 
     if block_size != 0 {
         if scale_rank != data_rank {

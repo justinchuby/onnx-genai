@@ -2577,6 +2577,49 @@ fn quantize_uses_zero_point_dtype_and_validates_blocking() {
 }
 
 #[test]
+fn rank_one_blocked_quantization_validates_axis_range() {
+    let inputs = |op: &str| {
+        let data = if op == "QuantizeLinear" {
+            f32in(vec![c(8)])
+        } else {
+            tin(DataType::Uint4, vec![c(8)])
+        };
+        vec![data, f32in(vec![c(2)]), tin(DataType::Uint4, vec![c(2)])]
+    };
+
+    for op in ["QuantizeLinear", "DequantizeLinear"] {
+        for axis in [0, -1] {
+            let blocked = with_attr(
+                with_attr(node(op, 3, 1), "axis", Attribute::Int(axis)),
+                "block_size",
+                Attribute::Int(4),
+            );
+            let outputs = run(&blocked, inputs(op), 21);
+            assert_eq!(out_shape(&outputs), vec![c(8)]);
+        }
+    }
+
+    for (op, axis) in [
+        ("DequantizeLinear", 1),
+        ("DequantizeLinear", -2),
+        ("QuantizeLinear", 1),
+    ] {
+        let blocked = with_attr(
+            with_attr(node(op, 3, 1), "axis", Attribute::Int(axis)),
+            "block_size",
+            Attribute::Int(4),
+        );
+        let error = try_run(&blocked, inputs(op), 21).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("axis {axis} is out of range for rank 1")),
+            "{error}"
+        );
+    }
+}
+
+#[test]
 fn quantization_rejects_invalid_axis_and_block_shape() {
     let bad_axis = with_attr(node("QuantizeLinear", 3, 1), "axis", Attribute::Int(-3));
     assert!(
