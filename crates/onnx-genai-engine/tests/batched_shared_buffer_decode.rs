@@ -9,6 +9,7 @@
 //! falls back to the in-repo Qwen2.5 CUDA dir if present.
 
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use onnx_genai_engine::{Engine, EngineConfig, GeneratePrompt, GenerateRequest};
 use onnx_genai_ort::{ExecutionProvider, SessionOptions};
@@ -89,5 +90,49 @@ fn shared_buffer_continuous_batch_matches_individual() -> anyhow::Result<()> {
             got.token_ids, want.token_ids
         );
     }
+    Ok(())
+}
+
+/// Wall-clock comparison of shared-buffer continuous batching vs running the
+/// same requests sequentially. Ignored by default (needs a real CUDA model);
+/// run with `--ignored --nocapture` to print the concurrency speed-up.
+#[test]
+#[ignore = "GPU throughput measurement; run with --ignored --nocapture"]
+fn shared_buffer_continuous_batch_throughput() -> anyhow::Result<()> {
+    let Some(model_dir) = shared_buffer_model_dir() else {
+        eprintln!("skipping shared-buffer throughput; no model dir available");
+        return Ok(());
+    };
+    if cuda_engine(&model_dir).is_err() {
+        eprintln!("skipping shared-buffer throughput; CUDA unavailable");
+        return Ok(());
+    }
+
+    const CONCURRENCY: usize = 8;
+    const NEW_TOKENS: usize = 64;
+    let requests: Vec<GenerateRequest> = (0..CONCURRENCY)
+        .map(|index| token_request(vec![9707, 11, 358 + index as u32], NEW_TOKENS))
+        .collect();
+
+    let sequential_start = Instant::now();
+    let mut sequential_tokens = 0usize;
+    let mut sequential_engine = cuda_engine(&model_dir)?;
+    for request in requests.iter().cloned() {
+        sequential_tokens += sequential_engine.generate(request)?.token_ids.len();
+    }
+    let sequential_elapsed = sequential_start.elapsed();
+
+    let mut engine = cuda_engine(&model_dir)?;
+    let batched_start = Instant::now();
+    let batched = engine.run_continuous_batch(requests, CONCURRENCY)?;
+    let batched_elapsed = batched_start.elapsed();
+    let batched_tokens: usize = batched.iter().map(|result| result.token_ids.len()).sum();
+
+    let seq_tps = sequential_tokens as f64 / sequential_elapsed.as_secs_f64();
+    let batched_tps = batched_tokens as f64 / batched_elapsed.as_secs_f64();
+    eprintln!(
+        "shared-buffer throughput @concurrency={CONCURRENCY}: sequential {seq_tps:.1} tok/s ({sequential_tokens} tok in {sequential_elapsed:?}), continuous {batched_tps:.1} tok/s ({batched_tokens} tok in {batched_elapsed:?}), speed-up {:.2}x",
+        batched_tps / seq_tps
+    );
     Ok(())
 }
