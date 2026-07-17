@@ -33,6 +33,8 @@ const CUDA_MEMCPY_DEVICE_TO_DEVICE: i32 = 3;
 type CudaMemcpyFn = unsafe extern "C" fn(*mut c_void, *const c_void, usize, i32) -> i32;
 type CudaMemsetFn = unsafe extern "C" fn(*mut c_void, i32, usize) -> i32;
 type CudaDeviceSynchronizeFn = unsafe extern "C" fn() -> i32;
+type CudaSetDeviceFn = unsafe extern "C" fn(i32) -> i32;
+type CudaGetDeviceFn = unsafe extern "C" fn(*mut i32) -> i32;
 
 struct CudaRt {
     // Kept alive so the resolved function pointers remain valid; never called
@@ -41,6 +43,8 @@ struct CudaRt {
     memcpy: CudaMemcpyFn,
     memset: CudaMemsetFn,
     device_synchronize: CudaDeviceSynchronizeFn,
+    set_device: CudaSetDeviceFn,
+    get_device: CudaGetDeviceFn,
 }
 
 // SAFETY: the resolved `cudart` entry points are plain C functions that are
@@ -80,22 +84,36 @@ fn load() -> std::result::Result<CudaRt, String> {
         let memset = unsafe { lib.get::<CudaMemsetFn>(b"cudaMemset\0") };
         let device_synchronize =
             unsafe { lib.get::<CudaDeviceSynchronizeFn>(b"cudaDeviceSynchronize\0") };
-        match (memcpy, memset, device_synchronize) {
-            (Ok(memcpy), Ok(memset), Ok(device_synchronize)) => {
+        let set_device = unsafe { lib.get::<CudaSetDeviceFn>(b"cudaSetDevice\0") };
+        let get_device = unsafe { lib.get::<CudaGetDeviceFn>(b"cudaGetDevice\0") };
+        match (memcpy, memset, device_synchronize, set_device, get_device) {
+            (
+                Ok(memcpy),
+                Ok(memset),
+                Ok(device_synchronize),
+                Ok(set_device),
+                Ok(get_device),
+            ) => {
                 // Copy the function pointers out before `lib` is moved into the
                 // struct; the borrows on `lib` end here.
                 let memcpy = *memcpy;
                 let memset = *memset;
                 let device_synchronize = *device_synchronize;
+                let set_device = *set_device;
+                let get_device = *get_device;
                 return Ok(CudaRt {
                     _lib: lib,
                     memcpy,
                     memset,
                     device_synchronize,
+                    set_device,
+                    get_device,
                 });
             }
             _ => {
-                last_err = format!("{name}: missing cudaMemcpy/cudaMemset/cudaDeviceSynchronize symbol");
+                last_err = format!(
+                    "{name}: missing cudaMemcpy/cudaMemset/cudaDeviceSynchronize/cudaSetDevice/cudaGetDevice symbol"
+                );
             }
         }
     }
@@ -128,6 +146,71 @@ pub(crate) fn device_synchronize() -> Result<()> {
         )));
     }
     Ok(())
+}
+
+/// RAII guard that makes `device_id` the calling thread's current CUDA device
+/// for the duration of a grow copy, restoring the previous current device on
+/// drop.
+///
+/// All of the raw `cudart` calls below (`cudaMemcpy`, `cudaMemset`,
+/// `cudaDeviceSynchronize`) act on the thread's *current* device, but the KV
+/// buffers live on the EP's configured device (`ONNX_GENAI_CUDA_DEVICE`, which
+/// may be non-zero). Without pinning, the pre/post-copy barriers could
+/// synchronize the wrong device and fail to order the copy against the EP's
+/// stream — the exact race the barriers exist to prevent. Pinning is cheap and
+/// growth is rare (O(log length)).
+pub(crate) struct DeviceGuard {
+    prev: i32,
+    restore: bool,
+}
+
+impl DeviceGuard {
+    /// Set the current CUDA device to `device_id`, remembering the previous one.
+    pub(crate) fn set(device_id: i32) -> Result<Self> {
+        let rt = runtime()?;
+        let mut prev: i32 = 0;
+        // SAFETY: `prev` is a valid out-parameter; `cudaGetDevice` matches the
+        // `cudart` ABI.
+        let code = unsafe { (rt.get_device)(&mut prev) };
+        if code != 0 {
+            return Err(OrtError::InvalidArgument(format!(
+                "cudaGetDevice failed with CUDA error code {code}"
+            )));
+        }
+        // Only switch (and later restore) when the target differs, so the common
+        // single-GPU / device-0 path incurs no extra `cudaSetDevice` calls.
+        if prev == device_id {
+            return Ok(Self {
+                prev,
+                restore: false,
+            });
+        }
+        // SAFETY: `cudaSetDevice` matches the `cudart` ABI.
+        let code = unsafe { (rt.set_device)(device_id) };
+        if code != 0 {
+            return Err(OrtError::InvalidArgument(format!(
+                "cudaSetDevice({device_id}) failed with CUDA error code {code}"
+            )));
+        }
+        Ok(Self {
+            prev,
+            restore: true,
+        })
+    }
+}
+
+impl Drop for DeviceGuard {
+    fn drop(&mut self) {
+        if !self.restore {
+            return;
+        }
+        if let Ok(rt) = runtime() {
+            // SAFETY: `cudaSetDevice` matches the `cudart` ABI; a restore failure
+            // is best-effort (the process is likely already erroring out) so the
+            // return code is intentionally ignored.
+            let _ = unsafe { (rt.set_device)(self.prev) };
+        }
+    }
 }
 
 /// Zero `bytes` of device memory at device address `dst`.
