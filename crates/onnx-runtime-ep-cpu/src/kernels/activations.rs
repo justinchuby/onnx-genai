@@ -60,10 +60,13 @@ impl Activation {
 }
 
 fn silu(x: f32) -> f32 {
+    // CUDA's device exp is evaluated in f64. Match that precision before the
+    // f32 operation-order boundary so 1-ulp exp differences cannot be amplified
+    // by downstream accuracy-level-4 activation quantization.
     if x >= 0.0 {
-        x / (1.0 + (-x).exp())
+        x / (1.0 + ((-x) as f64).exp() as f32)
     } else {
-        let e = x.exp();
+        let e = (x as f64).exp() as f32;
         x * e / (1.0 + e)
     }
 }

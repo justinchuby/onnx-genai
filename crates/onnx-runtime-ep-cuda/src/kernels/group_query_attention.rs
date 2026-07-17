@@ -115,8 +115,10 @@ extern "C" __global__ void gqa_rope_bnsh(
     const float x1 = tensor[base + d1];
     const float c = cos_cache[pos * half + k];
     const float sn = sin_cache[pos * half + k];
-    tensor[base + d0] = c * x0 - sn * x1;
-    tensor[base + d1] = sn * x0 + c * x1;
+    tensor[base + d0] =
+        __fsub_rn(__fmul_rn(c, x0), __fmul_rn(sn, x1));
+    tensor[base + d1] =
+        __fadd_rn(__fmul_rn(sn, x0), __fmul_rn(c, x1));
 }
 
 extern "C" __global__ void gqa_transpose_bnsh_to_bsh(

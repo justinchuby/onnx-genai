@@ -640,16 +640,32 @@ fn dynamic_output_shapes(
         }
         "GroupQueryAttention" if node.domain == "com.microsoft" => {
             let query = input_shapes.first()?;
-            let key = input_shapes.get(1)?;
             let past_key = input_shapes.get(3)?;
-            if query.len() != 3 || key.len() != 3 || past_key.len() != 4 {
+            if query.len() != 3 || past_key.len() != 4 {
                 return None;
             }
+            let num_heads = usize::try_from(node.attr("num_heads")?.as_int()?).ok()?;
             let kv_heads = usize::try_from(node.attr("kv_num_heads")?.as_int()?).ok()?;
-            if kv_heads == 0 || !key[2].is_multiple_of(kv_heads) {
+            if num_heads == 0 || kv_heads == 0 {
                 return None;
             }
-            let head_dim = key[2] / kv_heads;
+            let (output, head_dim) = if node.inputs.get(1).and_then(|input| *input).is_some() {
+                let key = input_shapes.get(1)?;
+                if key.len() != 3 || !key[2].is_multiple_of(kv_heads) {
+                    return None;
+                }
+                (query.clone(), key[2] / kv_heads)
+            } else {
+                let packed_heads = num_heads.checked_add(kv_heads.checked_mul(2)?)?;
+                if !query[2].is_multiple_of(packed_heads) {
+                    return None;
+                }
+                let head_dim = query[2] / packed_heads;
+                (
+                    vec![query[0], query[1], head_dim.checked_mul(num_heads)?],
+                    head_dim,
+                )
+            };
             let total_sequence_values = input_values.get(6)?.as_ref()?;
             if total_sequence_values.len() != 1 {
                 return None;
@@ -657,7 +673,7 @@ fn dynamic_output_shapes(
             let total_sequence = usize::try_from(total_sequence_values[0]).ok()?;
             let present_sequence = past_key[2].max(total_sequence);
             let present = vec![query[0], kv_heads, present_sequence, head_dim];
-            let mut shapes = vec![query.clone()];
+            let mut shapes = vec![output];
             if node.outputs.len() >= 2 {
                 shapes.push(present.clone());
             }
@@ -5002,6 +5018,50 @@ mod tests {
         // An op the sizer cannot resolve returns None (surfaces as UnresolvedShape).
         let other = Node::new(NodeId(1), "Conv", vec![], vec![]);
         assert!(dynamic_output_shapes(&other, &input_shapes, &input_values).is_none());
+    }
+
+    #[test]
+    fn dynamic_output_shapes_gqa_supports_packed_qkv() {
+        use onnx_runtime_ir::{Attribute, ValueId};
+
+        let mut node = Node::new(
+            NodeId(0),
+            "GroupQueryAttention",
+            vec![
+                Some(ValueId(0)),
+                None,
+                None,
+                Some(ValueId(3)),
+                Some(ValueId(4)),
+                Some(ValueId(5)),
+                Some(ValueId(6)),
+            ],
+            vec![ValueId(7), ValueId(8), ValueId(9)],
+        );
+        node.domain = "com.microsoft".into();
+        node.attributes
+            .insert("num_heads".into(), Attribute::Int(14));
+        node.attributes
+            .insert("kv_num_heads".into(), Attribute::Int(2));
+        let input_shapes = vec![
+            vec![1, 1, 1152],
+            vec![],
+            vec![],
+            vec![1, 2, 16, 64],
+            vec![1, 2, 16, 64],
+            vec![1],
+            vec![],
+        ];
+        let input_values = vec![None, None, None, None, None, None, Some(vec![17])];
+
+        assert_eq!(
+            dynamic_output_shapes(&node, &input_shapes, &input_values),
+            Some(vec![
+                vec![1, 1, 896],
+                vec![1, 2, 17, 64],
+                vec![1, 2, 17, 64],
+            ])
+        );
     }
 
     /// The effective opset is read from the graph's import for the op's domain,

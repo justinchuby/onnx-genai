@@ -591,7 +591,9 @@ impl Kernel for GroupQueryAttentionKernel {
                     let mut sum = 0.0;
                     for score in &mut scores {
                         if score.is_finite() {
-                            *score = (*score - max).exp();
+                            // Match CUDA's f64 device exp followed by one f32
+                            // rounding before the serial softmax reduction.
+                            *score = ((*score - max) as f64).exp() as f32;
                             sum += *score;
                         } else {
                             *score = 0.0;
@@ -729,7 +731,7 @@ mod tests {
                 let sum: f32 = scores
                     .iter_mut()
                     .map(|x| {
-                        *x = (*x - max).exp();
+                        *x = ((*x - max) as f64).exp() as f32;
                         *x
                     })
                     .sum();

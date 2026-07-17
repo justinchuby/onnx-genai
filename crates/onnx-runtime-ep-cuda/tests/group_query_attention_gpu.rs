@@ -1212,9 +1212,9 @@ fn gqa_gpu_packed_qkv_rope_decode_appends_in_place_across_steps() {
     eprintln!(
         "64-token GQA/RoPE CPU-reference: rope max_abs_diff={max_rope_abs:e} max_ulp_diff={max_rope_ulp}; attention max_abs_diff={max_attention_abs:e} max_ulp_diff={max_attention_ulp}"
     );
-    assert!(
-        max_rope_abs <= 1e-6,
-        "RoPE error accumulated across decode: {max_rope_abs:e}"
+    assert_eq!(
+        max_rope_abs, 0.0,
+        "RoPE must match CPU operation order exactly across decode"
     );
     assert!(
         max_attention_abs <= 1e-6,

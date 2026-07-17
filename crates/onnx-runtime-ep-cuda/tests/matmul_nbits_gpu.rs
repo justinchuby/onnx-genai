@@ -580,9 +580,9 @@ fn matmul_nbits_gpu_accuracy4_block32_decode_matches_quantized_reference() {
 }
 
 #[test]
-fn matmul_nbits_gpu_accuracy4_stays_within_cpu_vnni_tolerance() {
+fn matmul_nbits_gpu_accuracy4_offending_decode_shape_stays_within_cpu_vnni_tolerance() {
     let Some(ep) = gpu() else { return };
-    let (m, k, n, block_size) = (1usize, 4864usize, 17usize, 32usize);
+    let (m, k, n, block_size) = (1usize, 4864usize, 896usize, 32usize);
     let blocks = k.div_ceil(block_size);
     let blob_size = block_size / 2;
     let mut state = 0xd18a_46ce_3b79_205fu64;
@@ -613,7 +613,11 @@ fn matmul_nbits_gpu_accuracy4_stays_within_cpu_vnni_tolerance() {
 
     assert_close(&actual, &expected);
     let (max_abs_diff, max_ulp_diff) = error_metrics(&actual, &expected);
+    assert!(
+        max_abs_diff <= 3e-5,
+        "offending K=4864,N=896 decode shape exceeded its numeric bound: {max_abs_diff:e}"
+    );
     eprintln!(
-        "accuracy_level=4 CPU/CUDA max_abs_diff={max_abs_diff:e} max_ulp_diff={max_ulp_diff}"
+        "accuracy_level=4 K=4864,N=896 CPU/CUDA max_abs_diff={max_abs_diff:e} max_ulp_diff={max_ulp_diff}"
     );
 }

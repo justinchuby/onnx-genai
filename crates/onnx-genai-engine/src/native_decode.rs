@@ -1016,20 +1016,9 @@ mod tests {
         }
         let tokenizer = Tokenizer::from_file(model_dir.join("tokenizer.json"))?;
         let prompt = tokenizer.encode("Hello")?;
-        let options = GenerateOptions {
-            max_new_tokens: 16,
-            temperature: 0.0,
-            greedy: true,
-            stop_on_eos: false,
-            ..GenerateOptions::default()
-        };
 
         let mut cpu =
             NativeDecodeSession::load(model_dir.join("model.onnx"), NativeDecodeDevice::Cpu)?;
-        let cpu_tokens = cpu
-            .generate(&prompt, &options, &ProcessorChain::new(), &tokenizer)?
-            .token_ids;
-
         let mut cuda = NativeDecodeSession::load_with_cuda_kv_max_len(
             model_dir.join("model.onnx"),
             NativeDecodeDevice::Cuda { index: Some(0) },
@@ -1041,17 +1030,76 @@ mod tests {
         assert_eq!(before.device_ptrs.len(), 48);
         assert!(before.device_ptrs.iter().all(|&ptr| ptr != 0));
         assert_eq!(before.kv_transfers, DeviceBindingTransferStats::default());
-        let cuda_tokens = cuda
-            .generate(&prompt, &options, &ProcessorChain::new(), &tokenizer)?
-            .token_ids;
+
+        let mut cpu_logits = cpu
+            .decode(&prompt, 0)?
+            .pop()
+            .context("CPU prefill must produce logits")?;
+        let mut cuda_logits = cuda
+            .decode(&prompt, 0)?
+            .pop()
+            .context("CUDA prefill must produce logits")?;
+        const HORIZON: usize = 64;
+        // The offending-shape MatMulNBits test bounds its synthetic worst case
+        // at 3e-5; this real recurrent decode has the tighter 2e-5 budget.
+        const LOGIT_ATOL: f32 = 2.0e-5;
+        let mut cpu_tokens = Vec::with_capacity(HORIZON);
+        let mut cuda_tokens = Vec::with_capacity(HORIZON);
+        for step in 0..HORIZON {
+            let mut cpu_ranked = cpu_logits.iter().copied().enumerate().collect::<Vec<_>>();
+            cpu_ranked.sort_unstable_by(|(_, a), (_, b)| b.total_cmp(a));
+            let mut cuda_ranked = cuda_logits.iter().copied().enumerate().collect::<Vec<_>>();
+            cuda_ranked.sort_unstable_by(|(_, a), (_, b)| b.total_cmp(a));
+            let max_abs = cpu_logits
+                .iter()
+                .zip(&cuda_logits)
+                .map(|(&cpu, &cuda)| (cpu - cuda).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                max_abs <= LOGIT_ATOL,
+                "step {step}: CPU/CUDA max logit difference {max_abs:e} exceeds {LOGIT_ATOL:e}"
+            );
+            let cpu_token = cpu_ranked[0].0 as TokenId;
+            let cuda_token = cuda_ranked[0].0 as TokenId;
+            assert_eq!(
+                cuda_token,
+                cpu_token,
+                "step {step}: CUDA top-2 {:?}, CPU top-2 {:?}",
+                &cuda_ranked[..2],
+                &cpu_ranked[..2]
+            );
+            if step == 16 {
+                let cpu_gap = cpu_ranked[0].1 - cpu_ranked[1].1;
+                let cuda_gap = cuda_ranked[0].1 - cuda_ranked[1].1;
+                assert_eq!([cpu_ranked[0].0, cpu_ranked[1].0], [1181, 330]);
+                assert_eq!([cuda_ranked[0].0, cuda_ranked[1].0], [1181, 330]);
+                assert!(cpu_gap > 0.6 && cuda_gap > 0.6);
+                eprintln!(
+                    "token-16 fixed: CPU top-2={:?} gap={cpu_gap:e}; CUDA top-2={:?} gap={cuda_gap:e}; max_abs={max_abs:e}",
+                    &cpu_ranked[..2],
+                    &cuda_ranked[..2],
+                );
+            }
+            cpu_tokens.push(cpu_token);
+            cuda_tokens.push(cuda_token);
+            if step + 1 == HORIZON {
+                break;
+            }
+            cpu_logits = cpu
+                .decode(&[cpu_token], cpu.current_len())?
+                .pop()
+                .context("CPU decode must produce logits")?;
+            cuda_logits = cuda
+                .decode(&[cuda_token], cuda.current_len())?
+                .pop()
+                .context("CUDA decode must produce logits")?;
+        }
         let after = cuda
             .cuda_kv_debug_stats()
             .context("CUDA session must retain device KV stats")?;
 
-        assert_eq!(cpu_tokens.len(), 16);
+        assert_eq!(cpu_tokens.len(), HORIZON);
         assert_eq!(cuda_tokens.len(), cpu_tokens.len());
-        // CUDA and CPU now select the same first 16 tokens; longer traces still
-        // expose sub-ulp backend transcendental differences.
         assert_eq!(cuda_tokens, cpu_tokens);
         assert_eq!(
             &cpu_tokens[..8],
