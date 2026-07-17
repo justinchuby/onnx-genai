@@ -7,7 +7,7 @@ use onnx_runtime_ep_api::{
     Cost, DeviceBuffer, EpConfig, EpRegistry, ExecutionProvider, Fence, Kernel, KernelFactory,
     KernelMatch, OpKey, OpRegistry, Result, TensorMut, TensorView,
 };
-use onnx_runtime_ir::{static_shape, DeviceId, DeviceType, Node, NodeId, Shape, TensorLayout};
+use onnx_runtime_ir::{DeviceId, DeviceType, Node, NodeId, Shape, TensorLayout, static_shape};
 
 /// A trivial kernel that does nothing but report success.
 struct AddKernel;
@@ -28,6 +28,26 @@ struct AddFactory;
 impl KernelFactory for AddFactory {
     fn create(&self, _node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
         Ok(Box::new(AddKernel))
+    }
+}
+
+struct TaggedKernel(u64);
+
+impl Kernel for TaggedKernel {
+    fn execute(&self, _inputs: &[TensorView], _outputs: &mut [TensorMut]) -> Result<()> {
+        Ok(())
+    }
+
+    fn estimated_flops(&self) -> Option<u64> {
+        Some(self.0)
+    }
+}
+
+struct TaggedFactory(u64);
+
+impl KernelFactory for TaggedFactory {
+    fn create(&self, _node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
+        Ok(Box::new(TaggedKernel(self.0)))
     }
 }
 
@@ -143,22 +163,69 @@ fn add_node() -> Node {
     Node::new(NodeId(0), "Add", vec![None, None], vec![])
 }
 
+fn lookup_tag(registry: &OpRegistry, op_type: &str, domain: &str, opset: u64) -> Option<u64> {
+    registry
+        .lookup(op_type, domain, opset)
+        .map(|factory| factory.create(&add_node(), &[]).unwrap())
+        .and_then(|kernel| kernel.estimated_flops())
+}
+
 #[test]
 fn op_registry_resolves_highest_matching_opset() {
     let mut reg = OpRegistry::new();
-    reg.register(OpKey::new("Add", "", 7), Box::new(AddFactory));
-    reg.register(OpKey::new("Add", "", 14), Box::new(AddFactory));
+    reg.register(OpKey::new("Add", "", 14), Box::new(TaggedFactory(14)));
+    reg.register(OpKey::new("Add", "", 7), Box::new(TaggedFactory(7)));
     assert_eq!(reg.len(), 2);
-    // opset 13 resolves to the v7 entry (highest since_version <= 13).
-    assert!(reg.lookup("Add", "", 13).is_some());
-    // opset 6 has no matching entry.
+
+    assert_eq!(lookup_tag(&reg, "Add", "", 7), Some(7));
+    assert_eq!(lookup_tag(&reg, "Add", "", 13), Some(7));
+    assert_eq!(lookup_tag(&reg, "Add", "", 14), Some(14));
+    assert_eq!(lookup_tag(&reg, "Add", "", 20), Some(14));
+}
+
+#[test]
+fn op_registry_reports_below_earliest_version() {
+    let mut reg = OpRegistry::new();
+    reg.register(OpKey::new("Add", "", 7), Box::new(AddFactory));
+
     assert!(reg.lookup("Add", "", 6).is_none());
-    // Unknown op.
-    assert!(reg.lookup("Mul", "", 20).is_none());
     assert!(!reg.supports("Add", "", 6));
-    assert!(reg.supports("Add", "ai.onnx", 7));
     assert_eq!(reg.earliest_since_version("Add", ""), Some(7));
     assert_eq!(reg.earliest_since_version("Mul", ""), None);
+}
+
+#[test]
+fn op_registry_aliases_default_onnx_domains() {
+    let mut reg = OpRegistry::new();
+    reg.register(OpKey::new("Add", "ai.onnx", 7), Box::new(TaggedFactory(7)));
+    reg.register(OpKey::new("Mul", "", 9), Box::new(TaggedFactory(9)));
+
+    let empty_domain = reg.lookup("Add", "", 7).unwrap();
+    let named_domain = reg.lookup("Add", "ai.onnx", 7).unwrap();
+    assert!(std::ptr::eq(empty_domain, named_domain));
+    let empty_domain = reg.lookup("Mul", "", 9).unwrap();
+    let named_domain = reg.lookup("Mul", "ai.onnx", 9).unwrap();
+    assert!(std::ptr::eq(empty_domain, named_domain));
+    assert!(reg.supports("Add", "", 7));
+    assert!(reg.supports("Add", "ai.onnx", 7));
+    assert_eq!(reg.earliest_since_version("Add", ""), Some(7));
+    assert_eq!(reg.earliest_since_version("Add", "ai.onnx"), Some(7));
+}
+
+#[test]
+fn op_registry_isolates_contrib_domain() {
+    let mut reg = OpRegistry::new();
+    reg.register(OpKey::new("Add", "", 1), Box::new(TaggedFactory(1)));
+    reg.register(
+        OpKey::new("Add", "com.microsoft", 5),
+        Box::new(TaggedFactory(5)),
+    );
+
+    assert_eq!(lookup_tag(&reg, "Add", "", 10), Some(1));
+    assert_eq!(lookup_tag(&reg, "Add", "ai.onnx", 10), Some(1));
+    assert_eq!(lookup_tag(&reg, "Add", "com.microsoft", 10), Some(5));
+    assert_eq!(reg.earliest_since_version("Add", ""), Some(1));
+    assert_eq!(reg.earliest_since_version("Add", "com.microsoft"), Some(5));
 }
 
 #[test]

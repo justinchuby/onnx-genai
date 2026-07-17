@@ -43,6 +43,8 @@ pub trait KernelFactory: Send + Sync {
 #[derive(Default)]
 pub struct OpRegistry {
     entries: HashMap<OpKey, Box<dyn KernelFactory>>,
+    /// Normalized domain → op type → sorted registered `since_version`s.
+    by_op: HashMap<String, HashMap<String, Vec<u64>>>,
 }
 
 impl OpRegistry {
@@ -51,7 +53,17 @@ impl OpRegistry {
     }
 
     /// Register a factory under `key`.
-    pub fn register(&mut self, key: OpKey, factory: Box<dyn KernelFactory>) {
+    pub fn register(&mut self, mut key: OpKey, factory: Box<dyn KernelFactory>) {
+        key.domain = norm_domain(&key.domain).to_owned();
+        let versions = self
+            .by_op
+            .entry(key.domain.clone())
+            .or_default()
+            .entry(key.op_type.clone())
+            .or_default();
+        if let Err(index) = versions.binary_search(&key.since_version) {
+            versions.insert(index, key.since_version);
+        }
         self.entries.insert(key, factory);
     }
 
@@ -59,33 +71,30 @@ impl OpRegistry {
     /// `<= opset` for the given `(op_type, domain)`.
     pub fn lookup(&self, op_type: &str, domain: &str, opset: u64) -> Option<&dyn KernelFactory> {
         let domain = norm_domain(domain);
+        let versions = self.by_op.get(domain)?.get(op_type)?;
+        let index = versions.partition_point(|&version| version <= opset);
+        let since_version = *versions.get(index.checked_sub(1)?)?;
         self.entries
-            .iter()
-            .filter(|(k, _)| {
-                k.op_type == op_type && k.domain == domain && k.since_version <= opset
-            })
-            .max_by_key(|(k, _)| k.since_version)
-            .map(|(_, f)| f.as_ref())
+            .get(&OpKey::new(op_type, domain, since_version))
+            .map(Box::as_ref)
     }
 
     /// Whether a factory is registered for `(op_type, domain)` at or before
     /// `opset`.
     pub fn supports(&self, op_type: &str, domain: &str, opset: u64) -> bool {
         let domain = norm_domain(domain);
-        self.entries
-            .keys()
-            .any(|k| k.op_type == op_type && k.domain == domain && k.since_version <= opset)
+        self.by_op
+            .get(domain)
+            .and_then(|ops| ops.get(op_type))
+            .and_then(|versions| versions.first())
+            .is_some_and(|&since_version| since_version <= opset)
     }
 
     /// Earliest registered opset for `(op_type, domain)`, if the EP knows the
     /// operator at any version. Used only to make decline diagnostics actionable.
     pub fn earliest_since_version(&self, op_type: &str, domain: &str) -> Option<u64> {
         let domain = norm_domain(domain);
-        self.entries
-            .keys()
-            .filter(|k| k.op_type == op_type && k.domain == domain)
-            .map(|k| k.since_version)
-            .min()
+        self.by_op.get(domain)?.get(op_type)?.first().copied()
     }
 
     /// Number of registered entries.
@@ -96,6 +105,93 @@ impl OpRegistry {
     /// Whether the registry is empty.
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct DummyFactory(u64);
+
+    impl KernelFactory for DummyFactory {
+        fn create(&self, _node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
+            let _ = self.0;
+            unreachable!("registry tests do not create kernels")
+        }
+    }
+
+    #[test]
+    fn indexed_queries_match_linear_reference() {
+        let mut registry = OpRegistry::new();
+        let mut state = 0x9e37_79b9_u64;
+        let ops = ["Add", "Mul", "Gemm", "Attention"];
+        let domains = ["", "ai.onnx", "com.microsoft", "pkg.nxrt"];
+
+        for factory_id in 0..256 {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
+            let op_type = ops[(state as usize) % ops.len()];
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
+            let domain = domains[(state as usize) % domains.len()];
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
+            let since_version = state % 25;
+            registry.register(
+                OpKey::new(op_type, domain, since_version),
+                Box::new(DummyFactory(factory_id)),
+            );
+        }
+
+        for _ in 0..512 {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
+            let op_type = ops[(state as usize) % ops.len()];
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
+            let domain = domains[(state as usize) % domains.len()];
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
+            let opset = state % 30;
+            let domain = norm_domain(domain);
+
+            let linear_lookup = registry
+                .entries
+                .iter()
+                .filter(|(key, _)| {
+                    key.op_type == op_type && key.domain == domain && key.since_version <= opset
+                })
+                .max_by_key(|(key, _)| key.since_version)
+                .map(|(_, factory)| factory.as_ref());
+            match (registry.lookup(op_type, domain, opset), linear_lookup) {
+                (Some(indexed), Some(linear)) => assert!(std::ptr::eq(indexed, linear)),
+                (None, None) => {}
+                _ => panic!("indexed lookup differed from linear reference"),
+            }
+
+            let linear_supports = registry.entries.keys().any(|key| {
+                key.op_type == op_type && key.domain == domain && key.since_version <= opset
+            });
+            assert_eq!(registry.supports(op_type, domain, opset), linear_supports);
+
+            let linear_earliest = registry
+                .entries
+                .keys()
+                .filter(|key| key.op_type == op_type && key.domain == domain)
+                .map(|key| key.since_version)
+                .min();
+            assert_eq!(
+                registry.earliest_since_version(op_type, domain),
+                linear_earliest
+            );
+        }
     }
 }
 
