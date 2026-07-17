@@ -6,7 +6,8 @@ use std::collections::HashMap;
 
 use onnx_runtime_ir::{Attribute, DataType, Node, NodeId, SymbolId, ValueId};
 use onnx_runtime_shape_inference::{
-    DimExpr, InferenceRegistry, MergePolicy, NodeIo, ShapeData, SymbolInterner, TypeInfo,
+    DimExpr, InferenceRegistry, MergePolicy, NodeIo, ShapeData, ShapeInferError, SymbolInterner,
+    TypeInfo,
 };
 
 // --- construction helpers -------------------------------------------------
@@ -73,16 +74,15 @@ fn with_domain(mut n: Node, domain: &str) -> Node {
 }
 
 fn run(n: &Node, inputs: Vec<NodeIo>, opset: u64) -> Vec<NodeIo> {
-    run_policy(n, inputs, opset, MergePolicy::Permissive)
+    try_run(n, inputs, opset).unwrap()
 }
 
-fn run_policy(n: &Node, inputs: Vec<NodeIo>, opset: u64, policy: MergePolicy) -> Vec<NodeIo> {
+fn try_run(n: &Node, inputs: Vec<NodeIo>, opset: u64) -> Result<Vec<NodeIo>, ShapeInferError> {
     let reg = InferenceRegistry::default_registry();
     let mut imports = HashMap::new();
     imports.insert(String::new(), opset);
     let mut interner = SymbolInterner::new(0x8000_0000);
-    reg.infer_node(n, &imports, inputs, policy, &mut interner)
-        .unwrap()
+    reg.infer_node(n, &imports, inputs, MergePolicy::Permissive, &mut interner)
 }
 
 /// The resolved output shape of slot 0.
@@ -217,12 +217,7 @@ fn assert_quantized_matmul_shapes(n: &Node, n_in: usize) {
 
 #[test]
 fn block_quantized_matmul_uses_n_and_preserves_leading_dims() {
-    let n = quantized_matmul_node(
-        "BlockQuantizedMatMul",
-        "pkg.nxrt",
-        2,
-        4864,
-    );
+    let n = quantized_matmul_node("BlockQuantizedMatMul", "pkg.nxrt", 2, 4864);
     assert_quantized_matmul_shapes(&n, 2);
 }
 
@@ -865,6 +860,142 @@ fn nonzero_rank_and_dynamic_nnz() {
     assert_eq!(out_dtype(&outs), DataType::Int64);
 }
 
+#[test]
+fn one_hot_inserts_known_depth_at_axis_for_opsets_9_and_11() {
+    for opset in [9, 11] {
+        for (axis, expected) in [
+            (0, vec![c(5), c(2), c(3)]),
+            (1, vec![c(2), c(5), c(3)]),
+            (-1, vec![c(2), c(3), c(5)]),
+            (-2, vec![c(2), c(5), c(3)]),
+        ] {
+            let n = with_attr(node("OneHot", 3, 1), "axis", Attribute::Int(axis));
+            let outs = run(
+                &n,
+                vec![
+                    tin(DataType::Int64, vec![c(2), c(3)]),
+                    sd_int_scalar(DataType::Int64, c(5)),
+                    tin(DataType::Float16, vec![c(2)]),
+                ],
+                opset,
+            );
+            assert_eq!(out_shape(&outs), expected, "opset {opset}, axis {axis}");
+            assert_eq!(out_dtype(&outs), DataType::Float16);
+        }
+    }
+}
+
+#[test]
+fn one_hot_preserves_symbolic_indices_and_handles_dynamic_depth() {
+    let n = node("OneHot", 3, 1);
+    let outs = run(
+        &n,
+        vec![
+            tin(DataType::Int32, vec![sym(0), c(3)]),
+            tin(DataType::Int64, vec![]),
+            tin(DataType::Int32, vec![c(2)]),
+        ],
+        11,
+    );
+    let shape = out_shape(&outs);
+    assert_eq!(shape.len(), 3);
+    assert_eq!(shape[0], sym(0));
+    assert_eq!(shape[1], c(3));
+    assert!(shape[2].as_symbol().is_some());
+    assert_eq!(out_dtype(&outs), DataType::Int32);
+
+    let outs = run(
+        &n,
+        vec![
+            tin(DataType::Int32, vec![sym(0)]),
+            sd_int_scalar(DataType::Int64, sym(7)),
+            tin(DataType::Uint8, vec![c(2)]),
+        ],
+        11,
+    );
+    assert_eq!(out_shape(&outs), vec![sym(0), sym(7)]);
+    assert_eq!(out_dtype(&outs), DataType::Uint8);
+}
+
+#[test]
+fn one_hot_rejects_invalid_axis_and_values_length() {
+    let inputs = || {
+        vec![
+            tin(DataType::Int64, vec![c(2)]),
+            sd_int_scalar(DataType::Int64, c(4)),
+            tin(DataType::Float32, vec![c(2)]),
+        ]
+    };
+    let n = with_attr(node("OneHot", 3, 1), "axis", Attribute::Int(2));
+    assert!(try_run(&n, inputs(), 11).is_err());
+
+    let n = node("OneHot", 3, 1);
+    let mut bad_values = inputs();
+    bad_values[2] = tin(DataType::Float32, vec![c(3)]);
+    assert!(try_run(&n, bad_values, 11).is_err());
+}
+
+#[test]
+fn compress_axis_and_flatten_variants_for_opsets_9_and_11() {
+    for opset in [9, 11] {
+        let n = with_attr(node("Compress", 2, 1), "axis", Attribute::Int(-2));
+        let outs = run(
+            &n,
+            vec![
+                tin(DataType::Float16, vec![sym(0), c(3), c(4)]),
+                tin(DataType::Bool, vec![c(3)]),
+            ],
+            opset,
+        );
+        let shape = out_shape(&outs);
+        assert_eq!(shape.len(), 3);
+        assert_eq!(shape[0], sym(0));
+        assert!(shape[1].as_symbol().is_some());
+        assert_eq!(shape[2], c(4));
+        assert_eq!(out_dtype(&outs), DataType::Float16);
+
+        let n = node("Compress", 2, 1);
+        let outs = run(
+            &n,
+            vec![
+                tin(DataType::Int32, vec![c(2), c(3), c(4)]),
+                tin(DataType::Bool, vec![sym(1)]),
+            ],
+            opset,
+        );
+        let shape = out_shape(&outs);
+        assert_eq!(shape.len(), 1);
+        assert!(shape[0].as_symbol().is_some());
+        assert_eq!(out_dtype(&outs), DataType::Int32);
+    }
+}
+
+#[test]
+fn compress_rejects_invalid_axis_and_condition_rank() {
+    let n = with_attr(node("Compress", 2, 1), "axis", Attribute::Int(2));
+    assert!(
+        try_run(
+            &n,
+            vec![f32in(vec![c(2), c(3)]), tin(DataType::Bool, vec![c(3)])],
+            11
+        )
+        .is_err()
+    );
+
+    let n = node("Compress", 2, 1);
+    assert!(
+        try_run(
+            &n,
+            vec![
+                f32in(vec![c(2), c(3)]),
+                tin(DataType::Bool, vec![c(1), c(3)])
+            ],
+            11
+        )
+        .is_err()
+    );
+}
+
 // --- Reshape (shape-data) -------------------------------------------------
 
 #[test]
@@ -953,6 +1084,114 @@ fn transpose_default_reverses() {
     let n = node("Transpose", 1, 1);
     let outs = run(&n, vec![f32in(vec![c(2), c(3), c(4)])], 13);
     assert_eq!(out_shape(&outs), vec![c(4), c(3), c(2)]);
+}
+
+#[test]
+fn trilu_preserves_known_and_symbolic_shape_and_dtype() {
+    for upper in [0, 1] {
+        let n = with_attr(node("Trilu", 2, 1), "upper", Attribute::Int(upper));
+        let outs = run(
+            &n,
+            vec![
+                tin(DataType::Float16, vec![sym(0), c(3), c(4)]),
+                sd_int_scalar(DataType::Int64, c(-1)),
+            ],
+            14,
+        );
+        assert_eq!(out_shape(&outs), vec![sym(0), c(3), c(4)]);
+        assert_eq!(out_dtype(&outs), DataType::Float16);
+    }
+}
+
+#[test]
+fn depth_to_space_known_dims_and_modes_across_schema_versions() {
+    let n = with_attr(node("DepthToSpace", 1, 1), "blocksize", Attribute::Int(2));
+    let outs = run(
+        &n,
+        vec![tin(DataType::Uint8, vec![c(2), c(12), c(5), c(7)])],
+        1,
+    );
+    assert_eq!(out_shape(&outs), vec![c(2), c(3), c(10), c(14)]);
+    assert_eq!(out_dtype(&outs), DataType::Uint8);
+
+    for opset in [11, 13] {
+        for mode in ["DCR", "CRD"] {
+            let n = with_attr(
+                with_attr(node("DepthToSpace", 1, 1), "blocksize", Attribute::Int(2)),
+                "mode",
+                Attribute::String(mode.as_bytes().to_vec()),
+            );
+            let outs = run(
+                &n,
+                vec![tin(DataType::Uint8, vec![c(2), c(12), c(5), c(7)])],
+                opset,
+            );
+            assert_eq!(out_shape(&outs), vec![c(2), c(3), c(10), c(14)]);
+            assert_eq!(out_dtype(&outs), DataType::Uint8);
+        }
+    }
+}
+
+#[test]
+fn depth_to_space_handles_symbolic_dims_without_panicking() {
+    let n = with_attr(node("DepthToSpace", 1, 1), "blocksize", Attribute::Int(2));
+    let outs = run(&n, vec![f32in(vec![sym(0), sym(1), sym(2), c(7)])], 13);
+    let shape = out_shape(&outs);
+    assert_eq!(shape.len(), 4);
+    assert_eq!(shape[0], sym(0));
+    assert!(shape[1].as_symbol().is_some());
+    assert_eq!(shape[2].as_const(), None);
+    assert_eq!(shape[3], c(14));
+}
+
+#[test]
+fn depth_to_space_rejects_non_divisible_channels() {
+    let n = with_attr(node("DepthToSpace", 1, 1), "blocksize", Attribute::Int(2));
+    assert!(try_run(&n, vec![f32in(vec![c(1), c(10), c(4), c(4)])], 13).is_err());
+}
+
+#[test]
+fn space_to_depth_known_dims_across_schema_versions() {
+    for opset in [1, 13] {
+        let n = with_attr(node("SpaceToDepth", 1, 1), "blocksize", Attribute::Int(2));
+        let outs = run(
+            &n,
+            vec![tin(DataType::Int32, vec![c(2), c(3), c(10), c(14)])],
+            opset,
+        );
+        assert_eq!(out_shape(&outs), vec![c(2), c(12), c(5), c(7)]);
+        assert_eq!(out_dtype(&outs), DataType::Int32);
+    }
+}
+
+#[test]
+fn space_to_depth_handles_symbolic_dims_without_panicking() {
+    let n = with_attr(node("SpaceToDepth", 1, 1), "blocksize", Attribute::Int(2));
+    let outs = run(&n, vec![f32in(vec![sym(0), sym(1), sym(2), c(14)])], 13);
+    let shape = out_shape(&outs);
+    assert_eq!(shape.len(), 4);
+    assert_eq!(shape[0], sym(0));
+    assert_eq!(shape[1].as_const(), None);
+    assert!(shape[2].as_symbol().is_some());
+    assert_eq!(shape[3], c(7));
+}
+
+#[test]
+fn space_to_depth_rejects_non_divisible_spatial_dims() {
+    let n = with_attr(node("SpaceToDepth", 1, 1), "blocksize", Attribute::Int(2));
+    assert!(try_run(&n, vec![f32in(vec![c(1), c(3), c(5), c(8)])], 13).is_err());
+    assert!(try_run(&n, vec![f32in(vec![c(1), c(3), c(8), c(5)])], 13).is_err());
+}
+
+#[test]
+fn spatial_rearrangements_reject_blocksize_square_overflow() {
+    for op in ["DepthToSpace", "SpaceToDepth"] {
+        let n = with_attr(node(op, 1, 1), "blocksize", Attribute::Int(i64::MAX));
+        assert!(
+            try_run(&n, vec![f32in(vec![c(1), c(4), c(4), c(4)])], 13).is_err(),
+            "{op}"
+        );
+    }
 }
 
 // --- Gather ---------------------------------------------------------------
