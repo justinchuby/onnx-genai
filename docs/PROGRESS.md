@@ -4,9 +4,9 @@ Tracks implementation status of `docs/DESIGN.md` (§1–§40). Updated as work l
 
 **Published:** `onnx-genai` v0.1.0 + 8 sub-crates on crates.io; the `onnx-runtime-*` layer (including `onnx-runtime-tracer`) is released as v0.1.0-dev.1. CI (fmt/build/test/**blocking clippy**) + scheduled `cargo-audit`. Coverage ~77% line.
 
-_Last updated: 2026-07-17T09:00:00Z — Sequence execution, onnx-rs round 3, and DeepSeek CSA Phase 2 landed._
+_Last updated: 2026-07-17T11:15:00Z — BERT Gather parity, onnx-rs round 4/If inference, and DeepSeek CSA Phase 3 landed._
 
-**Current `origin/main` HEAD:** `00c8184`.
+**Current `origin/main` HEAD:** `f04b858`.
 
 
 ## Current tiered-memory and interoperability milestones
@@ -399,6 +399,10 @@ Scoped the "export Gemma4 E2B/12B via Mobius and smoke-test through onnx-genai" 
 - Non-CPU (GPU) native device selection — currently returns a clear unsupported error.
 
 - **DeepSeek CSA Phase 2 ✅ landed (`00c8184`, Roy → Chew correction; Holden 🔴→🟢):** FP4 block-32 and FP8 block-64 compressed-KV dequantization, hybrid FP8/BF16 RoPE-tail handling, and sink-aware f32 attention are complete; stateful compressor/carry and production index-cache updates remain deferred.
+- **BERT Gather parity ✅ fixed (`4e99258`, Wallace; Nabil 🟢):** post-optimization shape re-inference preserves declared intermediate `value_info` as a fallback, preventing dynamic Gather indices from being mis-inferred as scalar and restoring both long-standing BERT optimizer-path failures.
+- **onnx-rs round 4 ✅ landed (`9f90dc9`, Sapper → Deckard correction; Bryant 🔴→🟢):** LogSoftmax, RMSNormalization, ReduceMax/Min/Prod/L1/L2/LogSum/LogSumExp/SumSquare, ArgMax, and ArgMin schemas plus inference tests landed; local-function call-site over-constraints were reverted to match ONNX v1.20 acceptance.
+- **onnx-rs If inference ✅ fixed (`6d6a475`, Deckard → Leon correction; Bryant 🔴→🟢):** inference now distinguishes absent shapes from present rank-0 scalar shapes, keeping unresolved If branches unknown without discarding genuine scalar metadata.
+- **DeepSeek CSA Phase 3 ✅ landed (`f04b858`, Roy → Chew correction; Holden 🔴→🟢):** ratio-128 stateful compression now maintains persistent compressed KV and `[B,128,2,512]` carry across decode boundaries; completed blocks reset carry slots and independent bit-exact carry/cache oracles cover the non-degenerate boundary golden.
 - **onnx-rs round 3 ✅ landed (`135087b`, Sapper → Deckard correction; Bryant 🔴→🟢):** Sub/Div/Neg/Abs/Mod schemas plus FunctionProto, IR-gate, and packed-padding checker coverage are complete; over-constraining checker rules were removed to match ONNX v1.20.
 - **Sequence executor wiring ✅ landed (`067dd09`, Leon; Nabil 🟢):** all eight Sequence operators execute through run-scoped sequence storage; public graph I/O bindings remain tensor-only.
 - WEIGHT_OFFLOAD Phase 1 is landed; larger-than-RAM exact-logit and throughput validation requires a real large model/package and remains deferred.
