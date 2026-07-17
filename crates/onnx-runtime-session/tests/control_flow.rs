@@ -9,7 +9,7 @@
 use onnx_runtime_ir::{
     static_shape, Attribute, DataType, Dim, Graph, Node, NodeId, Shape, TensorData, ValueId, WeightRef,
 };
-use onnx_runtime_session::{InferenceSession, Tensor};
+use onnx_runtime_session::{InferenceSession, SessionError, Tensor};
 
 // --- construction helpers ---------------------------------------------------
 
@@ -880,6 +880,58 @@ fn scan_zero_trip_preserves_state_and_builds_typed_empty_output() {
     assert!(outputs[1].to_vec_f32().is_empty());
     assert_eq!(session.control_flow_stats().subgraph_builds, 0);
     assert_eq!(session.control_flow_stats().subgraph_runs, 0);
+}
+
+#[test]
+fn scan_rejects_zero_element_nonleading_output_axis_stack_overflow() {
+    const HUGE: usize = 7_000_000_000_000_000_000;
+
+    let mut body = Graph::new();
+    let body_x = capture(&mut body, "x", DataType::Float32, &[HUGE, 0]);
+    body.add_input(body_x);
+    let body_y = op(
+        &mut body,
+        "Identity",
+        &[body_x],
+        Some("scan_out"),
+        DataType::Float32,
+        &[HUGE, 0],
+        &[],
+    );
+    body.add_output(body_y);
+
+    let mut g = new_parent_at_opset(16);
+    let x = input(&mut g, "X", DataType::Float32, &[HUGE, 0, 3]);
+    // Keep the declared output zero-sized without overflowing eager buffer
+    // planning; Scan computes the actual [HUGE, 3, 0] shape before storing it.
+    let y = g.create_named_value("Y", DataType::Float32, static_shape([HUGE, 0, 3]));
+    let node = control_flow_node(
+        &mut g,
+        "Scan",
+        vec![Some(x)],
+        vec![y],
+        &[
+            ("num_scan_inputs", Attribute::Int(1)),
+            ("scan_input_axes", Attribute::Ints(vec![2])),
+            ("scan_output_axes", Attribute::Ints(vec![1])),
+        ],
+    );
+    register(&mut g, node, "body", body);
+    g.add_output(y);
+
+    let mut session = InferenceSession::from_graph(g).expect("build session");
+    let x = Tensor::from_f32(&[HUGE, 0, 3], &[]).unwrap();
+    let err = session
+        .run(&[("X", &x)])
+        .expect_err("Scan stacking must reject overflowing zero-element shapes");
+    assert!(
+        matches!(
+            &err,
+            SessionError::ShapeOverflow { value, .. }
+                if value == "stacked tensor output row count"
+        ),
+        "unexpected error: {err}"
+    );
 }
 
 fn scan_shape_changing_body() -> Graph {

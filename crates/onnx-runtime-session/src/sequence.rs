@@ -41,6 +41,8 @@ use std::sync::Arc;
 
 use onnx_runtime_ir::DataType;
 
+use crate::error::{Result, SessionError};
+
 /// One immutable, `Arc`-shared tensor element of a runtime [`SequenceValue`].
 ///
 /// Elements are stored as contiguous row-major little-endian bytes plus their
@@ -331,23 +333,61 @@ pub(crate) fn stack_new_axis(
     elem_shape: &[usize],
     axis: usize,
     esize: usize,
-) -> (Vec<usize>, Vec<u8>) {
+) -> Result<(Vec<usize>, Vec<u8>)> {
+    let overflow = |value: &str| SessionError::ShapeOverflow {
+        value: value.to_string(),
+        dims: elem_shape.to_vec(),
+    };
+    let checked_product = |dims: &[usize], value: &str| {
+        dims.iter().try_fold(1usize, |product, &dim| {
+            product.checked_mul(dim).ok_or_else(|| overflow(value))
+        })
+    };
+
     let n = elements.len();
-    let outer: usize = elem_shape[..axis].iter().product();
-    let inner: usize = elem_shape[axis..].iter().product::<usize>() * esize;
+    let outer = checked_product(&elem_shape[..axis], "stacked tensor outer element count")?;
+    let inner_elements =
+        checked_product(&elem_shape[axis..], "stacked tensor inner element count")?;
+    let inner = inner_elements
+        .checked_mul(esize)
+        .ok_or_else(|| overflow("stacked tensor inner byte count"))?;
+    let _source_bytes = outer
+        .checked_mul(inner)
+        .ok_or_else(|| overflow("stacked tensor source byte span"))?;
+    let output_rows = n
+        .checked_mul(outer)
+        .ok_or_else(|| overflow("stacked tensor output row count"))?;
+    let output_bytes = output_rows
+        .checked_mul(inner)
+        .ok_or_else(|| overflow("stacked tensor output byte count"))?;
+
     let mut oshape = Vec::with_capacity(elem_shape.len() + 1);
     oshape.extend_from_slice(&elem_shape[..axis]);
     oshape.push(n);
     oshape.extend_from_slice(&elem_shape[axis..]);
-    let mut buf = vec![0u8; n * outer * inner];
+    let mut buf = vec![0u8; output_bytes];
     for (j, src) in elements.iter().enumerate() {
         for o in 0..outer {
-            let src_off = o * inner;
-            let dst_off = (o * n + j) * inner;
-            buf[dst_off..dst_off + inner].copy_from_slice(&src[src_off..src_off + inner]);
+            let src_off = o
+                .checked_mul(inner)
+                .ok_or_else(|| overflow("stacked tensor source offset"))?;
+            let src_end = src_off
+                .checked_add(inner)
+                .ok_or_else(|| overflow("stacked tensor source range"))?;
+            let dst_row = o
+                .checked_mul(n)
+                .and_then(|row| row.checked_add(j))
+                .ok_or_else(|| overflow("stacked tensor destination row offset"))?;
+            let dst_off = dst_row
+                .checked_mul(inner)
+                .ok_or_else(|| overflow("stacked tensor destination byte offset"))?;
+            let dst_end = dst_off
+                .checked_add(inner)
+                .ok_or_else(|| overflow("stacked tensor destination range"))?;
+            buf[dst_off..dst_end].copy_from_slice(&src[src_off..src_end]);
         }
     }
-    (oshape, buf)
+    Ok((oshape, buf))
 }
 
 #[cfg(test)]
@@ -512,7 +552,7 @@ mod tests {
         // two [2] elements stacked at new axis 0 -> [2,2].
         let a: Vec<u8> = vec![1, 2];
         let b: Vec<u8> = vec![3, 4];
-        let (oshape, out) = stack_new_axis(&[&a, &b], &[2], 0, 1);
+        let (oshape, out) = stack_new_axis(&[&a, &b], &[2], 0, 1).unwrap();
         assert_eq!(oshape, vec![2, 2]);
         assert_eq!(out, vec![1, 2, 3, 4]);
     }
@@ -522,7 +562,7 @@ mod tests {
         // two [2] elements stacked at new axis 1 -> [2,2] interleaved.
         let a: Vec<u8> = vec![1, 2];
         let b: Vec<u8> = vec![3, 4];
-        let (oshape, out) = stack_new_axis(&[&a, &b], &[2], 1, 1);
+        let (oshape, out) = stack_new_axis(&[&a, &b], &[2], 1, 1).unwrap();
         assert_eq!(oshape, vec![2, 2]);
         assert_eq!(out, vec![1, 3, 2, 4]);
     }

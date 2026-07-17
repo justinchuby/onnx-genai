@@ -2363,7 +2363,7 @@ impl Executor {
                         rank as i64
                     ),
                 })?;
-            stack_new_axis(&elem_datas, &elem_shapes[0], axis, esize)
+            stack_new_axis(&elem_datas, &elem_shapes[0], axis, esize)?
         } else {
             let axis = normalize_axis(axis_attr, rank).ok_or_else(|| SessionError::SequenceOp {
                 op: op.to_string(),
@@ -4139,7 +4139,8 @@ impl TensorStackAccumulator {
         if direction == 1 {
             elements.reverse();
         }
-        let (shape, bytes) = stack_new_axis(&elements, &elem_shape, axis, dtype.byte_size());
+        let (shape, bytes) =
+            stack_new_axis(&elements, &elem_shape, axis, dtype.byte_size())?;
         Ok((dtype, shape, bytes))
     }
 }
