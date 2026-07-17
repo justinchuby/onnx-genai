@@ -273,6 +273,7 @@ fn validate_quantization_granularity(
     ctx: &InferenceContext,
     data_input: usize,
     scale_input: usize,
+    zero_point_input: usize,
 ) -> Result<(), ShapeInferError> {
     let (Some(data), Some(scale)) = (ctx.input_type(data_input), ctx.input_type(scale_input))
     else {
@@ -280,7 +281,15 @@ fn validate_quantization_granularity(
     };
     let data_rank = data.rank();
     let scale_rank = scale.rank();
-    if scale_rank == 0 {
+    let block_size = if ctx.opset("") >= 21 {
+        ctx.node
+            .attr("block_size")
+            .and_then(Attribute::as_int)
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    if block_size == 0 && scale_rank == 0 {
         return Ok(());
     }
     if data_rank == 0 {
@@ -303,6 +312,70 @@ fn validate_quantization_granularity(
         })?
     };
 
+    if block_size != 0 {
+        if scale_rank != data_rank {
+            return Err(ShapeInferError::Invalid {
+                op: ctx.op().into(),
+                detail: format!(
+                    "blocked scale rank {scale_rank} must match input rank {data_rank}"
+                ),
+            });
+        }
+        if block_size <= 0 {
+            return Err(ShapeInferError::Invalid {
+                op: ctx.op().into(),
+                detail: "blocked quantization requires a positive block_size".into(),
+            });
+        }
+        let zero_point = ctx.input_type(zero_point_input);
+        if let Some(zero_point) = zero_point
+            && zero_point.rank() != data_rank
+        {
+            return Err(ShapeInferError::Invalid {
+                op: ctx.op().into(),
+                detail: format!(
+                    "blocked zero-point rank {} must match input rank {data_rank}",
+                    zero_point.rank()
+                ),
+            });
+        }
+        for dimension in 0..data_rank {
+            let Some(data_extent) = data.shape[dimension].as_const() else {
+                continue;
+            };
+            let expected = if dimension == axis {
+                i128::from(data_extent)
+                    .checked_add(i128::from(block_size) - 1)
+                    .ok_or_else(|| ShapeInferError::Invalid {
+                        op: ctx.op().into(),
+                        detail: "blocked quantization extent arithmetic overflowed".into(),
+                    })?
+                    / i128::from(block_size)
+            } else {
+                i128::from(data_extent)
+            };
+            for (name, extent) in [
+                ("scale", scale.shape[dimension].as_const()),
+                (
+                    "zero-point",
+                    zero_point.and_then(|value| value.shape[dimension].as_const()),
+                ),
+            ] {
+                if let Some(extent) = extent
+                    && i128::from(extent) != expected
+                {
+                    return Err(ShapeInferError::Invalid {
+                        op: ctx.op().into(),
+                        detail: format!(
+                            "blocked {name} dimension {dimension} is {extent}, expected {expected}"
+                        ),
+                    });
+                }
+            }
+        }
+        return Ok(());
+    }
+
     if scale_rank == 1 {
         if let (Some(scale_extent), Some(data_extent)) =
             (scale.shape[0].as_const(), data.shape[axis].as_const())
@@ -324,51 +397,16 @@ fn validate_quantization_granularity(
         });
     }
 
-    let block_size = ctx
-        .node
-        .attr("block_size")
-        .and_then(Attribute::as_int)
-        .unwrap_or(0);
-    if block_size <= 0 {
-        return Err(ShapeInferError::Invalid {
-            op: ctx.op().into(),
-            detail: "blocked quantization requires a positive block_size".into(),
-        });
-    }
-    for dimension in 0..data_rank {
-        let (Some(data_extent), Some(scale_extent)) = (
-            data.shape[dimension].as_const(),
-            scale.shape[dimension].as_const(),
-        ) else {
-            continue;
-        };
-        let expected = if dimension == axis {
-            i128::from(data_extent)
-                .checked_add(i128::from(block_size) - 1)
-                .ok_or_else(|| ShapeInferError::Invalid {
-                    op: ctx.op().into(),
-                    detail: "blocked quantization extent arithmetic overflowed".into(),
-                })?
-                / i128::from(block_size)
-        } else {
-            i128::from(data_extent)
-        };
-        if i128::from(scale_extent) != expected {
-            return Err(ShapeInferError::Invalid {
-                op: ctx.op().into(),
-                detail: format!(
-                    "blocked scale dimension {dimension} is {scale_extent}, expected {expected}"
-                ),
-            });
-        }
-    }
-    Ok(())
+    Err(ShapeInferError::Invalid {
+        op: ctx.op().into(),
+        detail: "blocked quantization requires a positive block_size".into(),
+    })
 }
 
 /// `QuantizeLinear`: output shape follows x; its type follows zero_point,
 /// `output_dtype` (opset 21+), or defaults to uint8.
 fn quantize_linear(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
-    validate_quantization_granularity(ctx, 0, 1)?;
+    validate_quantization_granularity(ctx, 0, 1, 2)?;
     let attribute_dtype = quantized_output_dtype(ctx)?;
     let dtype = if ctx.has_input(2) {
         let Some(zero_point_dtype) = ctx.input_dtype(2) else {
@@ -392,7 +430,7 @@ fn quantize_linear(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
 
 /// `DequantizeLinear`: output shape follows x and dtype follows scale.
 fn dequantize_linear(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
-    validate_quantization_granularity(ctx, 0, 1)?;
+    validate_quantization_granularity(ctx, 0, 1, 2)?;
     if let (Some(shape), Some(dtype)) = (
         ctx.input_shape(0).map(<[DimExpr]>::to_vec),
         ctx.input_dtype(1),

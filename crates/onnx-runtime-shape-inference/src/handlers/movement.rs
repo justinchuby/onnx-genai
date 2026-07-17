@@ -365,15 +365,42 @@ fn known_empty_vector(ctx: &InferenceContext, input: usize) -> bool {
 }
 
 fn resize_extent_from_scale(input: i64, scale: f64) -> Result<i64, ShapeInferError> {
-    let scale = scale as f32;
-    let output = (input as f32 * scale).floor();
-    if !scale.is_finite() || scale <= 0.0 || !output.is_finite() || output < 0.0 {
+    if !scale.is_finite() || scale <= 0.0 || input < 0 {
         return Err(ShapeInferError::Invalid {
             op: "Resize".into(),
             detail: format!("invalid scale {scale}"),
         });
     }
-    if output >= isize::MAX as f32 {
+    if input == 0 {
+        return Ok(0);
+    }
+
+    // Apply the exact binary value of the scale in integer space. Converting
+    // isize::MAX to either f32 or f64 rounds it up to 2^63 on 64-bit targets.
+    let bits = scale.to_bits();
+    let exponent_bits = ((bits >> 52) & 0x7ff) as i32;
+    let fraction = bits & ((1_u64 << 52) - 1);
+    let (significand, exponent) = if exponent_bits == 0 {
+        (fraction, -1074)
+    } else {
+        ((1_u64 << 52) | fraction, exponent_bits - 1023 - 52)
+    };
+    let product = (input as u128) * u128::from(significand);
+    let maximum = isize::MAX as u128;
+    let output = if exponent >= 0 {
+        let shift = exponent as u32;
+        if shift >= 128 || product > (maximum >> shift) {
+            return Err(ShapeInferError::Invalid {
+                op: "Resize".into(),
+                detail: "inferred extent exceeds isize::MAX".into(),
+            });
+        }
+        product << shift
+    } else {
+        let shift = exponent.unsigned_abs();
+        if shift >= 128 { 0 } else { product >> shift }
+    };
+    if output > maximum {
         return Err(ShapeInferError::Invalid {
             op: "Resize".into(),
             detail: format!("inferred extent {output} exceeds isize::MAX"),
@@ -382,13 +409,39 @@ fn resize_extent_from_scale(input: i64, scale: f64) -> Result<i64, ShapeInferErr
     Ok(output as i64)
 }
 
+fn resize_extent_from_ratio(
+    input: i64,
+    numerator: i64,
+    denominator: i64,
+) -> Result<i64, ShapeInferError> {
+    let product = i128::from(input) * i128::from(numerator);
+    let denominator = i128::from(denominator);
+    let quotient = product / denominator;
+    let remainder = product % denominator;
+    let rounded = quotient + i128::from(remainder * 2 >= denominator);
+    if rounded > isize::MAX as i128 {
+        return Err(ShapeInferError::Invalid {
+            op: "Resize".into(),
+            detail: format!("inferred extent {rounded} exceeds isize::MAX"),
+        });
+    }
+    Ok(rounded as i64)
+}
+
 /// `Resize` (opset 13/18/19): infer from a constant `sizes` or `scales`
 /// vector. Runtime-computed vectors preserve only the output rank.
 pub fn resize(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
     let Some(input) = ctx.input_type(0).cloned() else {
         return Ok(());
     };
-    validate_vector_input(ctx, 1, "Resize")?;
+    let coordinate_mode = ctx
+        .node
+        .attr("coordinate_transformation_mode")
+        .and_then(Attribute::as_str)
+        .unwrap_or("half_pixel");
+    if coordinate_mode == "tf_crop_and_resize" {
+        validate_vector_input(ctx, 1, "Resize")?;
+    }
     validate_vector_input(ctx, 2, "Resize")?;
     validate_vector_input(ctx, 3, "Resize")?;
 
@@ -403,14 +456,19 @@ pub fn resize(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
     let has_sizes = ctx.has_input(3)
         && !known_empty_vector(ctx, 3)
         && sizes.as_ref().is_none_or(|values| !values.is_empty());
-    if usize::from(has_scales) + usize::from(has_sizes) != 1 {
+    if has_scales && has_sizes {
         return Err(ShapeInferError::Invalid {
             op: "Resize".into(),
-            detail: "exactly one of scales or sizes must be provided".into(),
+            detail: "scales and sizes cannot both be provided".into(),
         });
     }
 
     let axes = resize_axes(ctx, input.rank())?;
+    if !has_scales && !has_sizes {
+        let output = (0..input.rank()).map(|_| ctx.fresh_dim()).collect();
+        ctx.set_output(0, input.dtype, output);
+        return Ok(());
+    }
     if has_sizes {
         let Some(mut sizes) = sizes else {
             let output = (0..input.rank()).map(|_| ctx.fresh_dim()).collect();
@@ -449,27 +507,33 @@ pub fn resize(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
                 ctx.set_output(0, input.dtype, output);
                 return Ok(());
             };
-            let scale = sizes
+            if sizes
                 .iter()
                 .zip(&input_extents)
-                .map(|(&size, &extent)| size as f32 / extent as f32)
+                .any(|(&size, &extent)| size <= 0 || extent <= 0)
+            {
+                let output = (0..input.rank()).map(|_| ctx.fresh_dim()).collect();
+                ctx.set_output(0, input.dtype, output);
+                return Ok(());
+            }
+            let (scale_numerator, scale_denominator) = sizes
+                .iter()
+                .copied()
+                .zip(input_extents.iter().copied())
                 .reduce(|left, right| {
-                    if policy == "not_larger" {
-                        left.min(right)
+                    let ordering = (i128::from(left.0) * i128::from(right.1))
+                        .cmp(&(i128::from(right.0) * i128::from(left.1)));
+                    if (policy == "not_larger" && ordering.is_le())
+                        || (policy == "not_smaller" && ordering.is_ge())
+                    {
+                        left
                     } else {
-                        left.max(right)
+                        right
                     }
                 })
-                .unwrap_or(1.0);
+                .unwrap_or((1, 1));
             for (size, extent) in sizes.iter_mut().zip(input_extents) {
-                let value = (scale * extent as f32).round();
-                if !value.is_finite() || value >= isize::MAX as f32 {
-                    return Err(ShapeInferError::Invalid {
-                        op: "Resize".into(),
-                        detail: format!("inferred extent {value} exceeds isize::MAX"),
-                    });
-                }
-                *size = value as i64;
+                *size = resize_extent_from_ratio(extent, scale_numerator, scale_denominator)?;
             }
         }
 

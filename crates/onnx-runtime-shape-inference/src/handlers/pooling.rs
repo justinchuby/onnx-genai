@@ -226,6 +226,41 @@ fn checked_pool_extent(
     Ok(output)
 }
 
+fn validate_pool_partial_extents(
+    op: &str,
+    input: Option<i64>,
+    kernel: i64,
+    dilation: i64,
+    pad_begin: i64,
+    pad_end: i64,
+) -> Result<(), ShapeInferError> {
+    let maximum = isize::MAX as i128;
+    let effective_kernel = i128::from(dilation) * (i128::from(kernel) - 1) + 1;
+    if effective_kernel > maximum {
+        return Err(ShapeInferError::Invalid {
+            op: op.into(),
+            detail: format!("effective kernel {effective_kernel} exceeds isize::MAX"),
+        });
+    }
+    let pad_sum = i128::from(pad_begin) + i128::from(pad_end);
+    if pad_sum > maximum {
+        return Err(ShapeInferError::Invalid {
+            op: op.into(),
+            detail: format!("padding extent {pad_sum} exceeds isize::MAX"),
+        });
+    }
+    if let Some(input) = input {
+        let padded_input = i128::from(input) + pad_sum;
+        if padded_input > maximum {
+            return Err(ShapeInferError::Invalid {
+                op: op.into(),
+                detail: format!("padded input extent {padded_input} exceeds isize::MAX"),
+            });
+        }
+    }
+    Ok(())
+}
+
 fn pool_spatial_dim(
     ctx: &mut InferenceContext,
     input: &DimExpr,
@@ -245,6 +280,7 @@ fn pool_spatial_dim(
     }
 
     let known = input.as_const();
+    validate_pool_partial_extents(ctx.op(), known, kernel, dilation, pad_begin, pad_end)?;
     let output = match auto_pad {
         AutoPad::SameUpper | AutoPad::SameLower => known.map(|extent| {
             let extent = i128::from(extent);

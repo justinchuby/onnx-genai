@@ -2270,6 +2270,25 @@ fn pooling_rejects_guaranteed_symbolic_overflow() {
     assert!(error.to_string().contains("exceeds isize::MAX"));
 }
 
+#[test]
+fn pooling_rejects_cancellation_masked_symbolic_overflow() {
+    let n = with_attr(
+        with_attr(
+            with_attr(
+                node("MaxPool", 1, 1),
+                "kernel_shape",
+                Attribute::Ints(vec![isize::MAX as i64]),
+            ),
+            "dilations",
+            Attribute::Ints(vec![2]),
+        ),
+        "pads",
+        Attribute::Ints(vec![isize::MAX as i64, isize::MAX as i64]),
+    );
+    let error = try_run(&n, vec![f32in(vec![c(1), c(1), sym(0)])], 22).unwrap_err();
+    assert!(error.to_string().contains("exceeds isize::MAX"));
+}
+
 // --- Resize ---------------------------------------------------------------
 
 #[test]
@@ -2346,25 +2365,57 @@ fn resize_dynamic_scales_and_sizes_leave_extents_unresolved() {
 }
 
 #[test]
-fn resize_requires_exactly_one_scales_or_sizes() {
+fn resize_accepts_ignored_roi_and_absent_extent_inputs() {
+    for (roi, has_roi) in [
+        (tin(DataType::Float32, vec![c(1), c(4)]), true),
+        (NodeIo::default(), false),
+    ] {
+        let mut resize = with_attr(
+            node("Resize", 4, 1),
+            "coordinate_transformation_mode",
+            Attribute::String("asymmetric".into()),
+        );
+        if !has_roi {
+            resize.inputs[1] = None;
+        }
+        resize.inputs[3] = None;
+        let outputs = run(
+            &resize,
+            vec![
+                f32in(vec![c(2), c(3)]),
+                roi,
+                sd_float_vec(vec![1.0, 2.0]),
+                NodeIo::default(),
+            ],
+            19,
+        );
+        assert_eq!(out_shape(&outputs), vec![c(2), c(6)]);
+    }
+
     let mut neither = node("Resize", 4, 1);
     neither.inputs[1] = None;
     neither.inputs[2] = None;
     neither.inputs[3] = None;
+    let shape = out_shape(&run(
+        &neither,
+        vec![
+            f32in(vec![c(2), c(3)]),
+            NodeIo::default(),
+            NodeIo::default(),
+            NodeIo::default(),
+        ],
+        19,
+    ));
+    assert_eq!(shape.len(), 2);
     assert!(
-        try_run(
-            &neither,
-            vec![
-                f32in(vec![c(2), c(3)]),
-                NodeIo::default(),
-                NodeIo::default(),
-                NodeIo::default(),
-            ],
-            19,
-        )
-        .is_err()
+        shape
+            .iter()
+            .all(|dimension| dimension.as_symbol().is_some())
     );
+}
 
+#[test]
+fn resize_rejects_both_scales_and_sizes() {
     let mut both = node("Resize", 4, 1);
     both.inputs[1] = None;
     assert!(
@@ -2380,6 +2431,56 @@ fn resize_requires_exactly_one_scales_or_sizes() {
         )
         .is_err()
     );
+}
+
+#[test]
+fn resize_accepts_maximum_extent_with_unit_scale() {
+    let mut resize = node("Resize", 4, 1);
+    resize.inputs[1] = None;
+    resize.inputs[3] = None;
+    let outputs = run(
+        &resize,
+        vec![
+            f32in(vec![c(isize::MAX as i64)]),
+            NodeIo::default(),
+            sd_float_vec(vec![1.0]),
+            NodeIo::default(),
+        ],
+        19,
+    );
+    assert_eq!(out_shape(&outputs), vec![c(isize::MAX as i64)]);
+
+    let mut aspect_resize = with_attr(
+        node("Resize", 4, 1),
+        "keep_aspect_ratio_policy",
+        Attribute::String("not_larger".into()),
+    );
+    aspect_resize.inputs[1] = None;
+    aspect_resize.inputs[2] = None;
+    let outputs = run(
+        &aspect_resize,
+        vec![
+            f32in(vec![c(isize::MAX as i64)]),
+            NodeIo::default(),
+            NodeIo::default(),
+            sd_vec(vec![c(isize::MAX as i64)]),
+        ],
+        19,
+    );
+    assert_eq!(out_shape(&outputs), vec![c(isize::MAX as i64)]);
+
+    let error = try_run(
+        &resize,
+        vec![
+            f32in(vec![c(isize::MAX as i64)]),
+            NodeIo::default(),
+            sd_float_vec(vec![2.0]),
+            NodeIo::default(),
+        ],
+        19,
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("exceeds isize::MAX"));
 }
 
 // --- Linear quantization --------------------------------------------------
@@ -2441,6 +2542,38 @@ fn quantize_uses_zero_point_dtype_and_validates_blocking() {
         21,
     );
     assert_eq!(out_shape(&outs), vec![c(2), c(8)]);
+
+    let rank_one_blocked = with_attr(
+        with_attr(node("DequantizeLinear", 3, 1), "axis", Attribute::Int(0)),
+        "block_size",
+        Attribute::Int(4),
+    );
+    let outs = run(
+        &rank_one_blocked,
+        vec![
+            tin(DataType::Uint4, vec![c(8)]),
+            f32in(vec![c(2)]),
+            tin(DataType::Uint4, vec![c(2)]),
+        ],
+        21,
+    );
+    assert_eq!(out_shape(&outs), vec![c(8)]);
+
+    let rank_one_quantize = with_attr(
+        with_attr(node("QuantizeLinear", 3, 1), "axis", Attribute::Int(0)),
+        "block_size",
+        Attribute::Int(4),
+    );
+    let outs = run(
+        &rank_one_quantize,
+        vec![
+            f32in(vec![c(8)]),
+            f32in(vec![c(2)]),
+            tin(DataType::Uint4, vec![c(2)]),
+        ],
+        21,
+    );
+    assert_eq!(out_shape(&outs), vec![c(8)]);
 }
 
 #[test]
