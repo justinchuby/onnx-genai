@@ -829,3 +829,91 @@ fn from_graph_rejects_dangling_tensor_reference_at_build() {
     assert!(message.contains("Add"), "{message}");
     assert!(message.contains("RULES #1"), "{message}");
 }
+
+/// The executor must obey dependencies rather than insertion order. This also
+/// locks down the deterministic NodeId tie-break used by graph planning.
+#[test]
+fn executor_topologically_orders_reverse_inserted_dependencies_deterministically() {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let x = input(&mut graph, "x", DataType::Float32, &[3]);
+    let intermediate =
+        graph.create_named_value("intermediate", DataType::Float32, static_shape([3]));
+    let y = graph.create_named_value("y", DataType::Float32, static_shape([3]));
+
+    // Insert the consumer first. The graph is valid, but node #0 cannot run
+    // until the later-inserted node #1 has produced `intermediate`.
+    let consumer = graph.insert_node(Node::new(
+        NodeId(0),
+        "Relu",
+        vec![Some(intermediate)],
+        vec![y],
+    ));
+    let producer = graph.insert_node(Node::new(
+        NodeId(0),
+        "Relu",
+        vec![Some(x)],
+        vec![intermediate],
+    ));
+    graph.add_output(y);
+
+    let expected_order = vec![producer, consumer];
+    assert_eq!(graph.topological_order().unwrap(), expected_order);
+    for _ in 0..8 {
+        assert_eq!(graph.topological_order().unwrap(), expected_order);
+    }
+
+    let mut session = InferenceSession::from_graph(graph).expect("build reverse-inserted DAG");
+    let x = Tensor::from_f32(&[3], &[-2.0, 0.5, 3.0]).unwrap();
+    let first = session.run(&[("x", &x)]).expect("first run");
+    let second = session.run(&[("x", &x)]).expect("second run");
+    assert_eq!(first[0].to_vec_f32(), vec![0.0, 0.5, 3.0]);
+    assert_eq!(second[0].to_vec_f32(), first[0].to_vec_f32());
+}
+
+/// A cyclic graph must be rejected during plan construction, never partially
+/// executed or accepted because its values happen to be present in the IR.
+#[test]
+fn from_graph_rejects_cyclic_execution_plan() {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let a = graph.create_named_value("a", DataType::Float32, static_shape([1]));
+    let b = graph.create_named_value("b", DataType::Float32, static_shape([1]));
+    graph.insert_node(Node::new(NodeId(0), "Relu", vec![Some(b)], vec![a]));
+    graph.insert_node(Node::new(NodeId(0), "Relu", vec![Some(a)], vec![b]));
+    graph.add_output(a);
+
+    let error = match InferenceSession::from_graph(graph) {
+        Err(error) => error,
+        Ok(_) => panic!("cyclic graph unexpectedly built"),
+    };
+    assert!(
+        matches!(
+            error,
+            SessionError::Graph(onnx_runtime_ir::GraphError::CycleDetected)
+        ),
+        "expected a CycleDetected graph error, got {error:?}"
+    );
+}
+
+/// Initializers are immutable graph sources. A node output cannot reuse an
+/// initializer value, since that would turn read-only weight storage writable.
+#[test]
+fn from_graph_rejects_initializer_reused_as_node_output() {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let x = input(&mut graph, "x", DataType::Float32, &[2]);
+    let weight = f32_init(&mut graph, "weight", &[2], &[1.0, 2.0]);
+    let mut overwrite = Node::new(NodeId(0), "Relu", vec![Some(x)], vec![weight]);
+    overwrite.name = "overwrites_weight".to_string();
+    graph.insert_node(overwrite);
+    graph.add_output(weight);
+
+    let message = match InferenceSession::from_graph(graph) {
+        Err(error) => error.to_string(),
+        Ok(_) => panic!("producer-backed initializer unexpectedly built"),
+    };
+    assert!(message.contains("weight"), "{message}");
+    assert!(message.contains("overwrites_weight"), "{message}");
+    assert!(message.contains("initializer"), "{message}");
+}
