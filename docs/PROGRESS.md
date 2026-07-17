@@ -4,9 +4,9 @@ Tracks implementation status of `docs/DESIGN.md` (§1–§40). Updated as work l
 
 **Published:** `onnx-genai` v0.1.0 + 8 sub-crates on crates.io; the `onnx-runtime-*` layer (including `onnx-runtime-tracer`) is released as v0.1.0-dev.1. CI (fmt/build/test/**blocking clippy**) + scheduled `cargo-audit`. Coverage ~77% line.
 
-_Last updated: 2026-07-17T09:13:06Z — CUDA capability/dtype work, CSA v1 seams, onnx-rs coverage, and sequence values landed._
+_Last updated: 2026-07-17T09:00:00Z — Sequence execution, onnx-rs round 3, and DeepSeek CSA Phase 2 landed._
 
-**Current `origin/main` HEAD:** `11a01a5`.
+**Current `origin/main` HEAD:** `00c8184`.
 
 
 ## Current tiered-memory and interoperability milestones
@@ -398,9 +398,9 @@ Scoped the "export Gemma4 E2B/12B via Mobius and smoke-test through onnx-genai" 
 - Speculative/MTP/EAGLE-3 — currently return a clear unsupported error.
 - Non-CPU (GPU) native device selection — currently returns a clear unsupported error.
 
-- **IN FLIGHT:** DeepSeek CSA Phase 2 — compressed formats, stateful compressor/carry, and production index-cache updates (Roy).
-- **IN FLIGHT:** onnx-rs round 3 — remaining standard/ONNX-ML catalog and validation gaps (Sapper).
-- **IN FLIGHT:** Sequence executor wiring — operator registration, value routing, and graph I/O bindings (Leon).
+- **DeepSeek CSA Phase 2 ✅ landed (`00c8184`, Roy → Chew correction; Holden 🔴→🟢):** FP4 block-32 and FP8 block-64 compressed-KV dequantization, hybrid FP8/BF16 RoPE-tail handling, and sink-aware f32 attention are complete; stateful compressor/carry and production index-cache updates remain deferred.
+- **onnx-rs round 3 ✅ landed (`135087b`, Sapper → Deckard correction; Bryant 🔴→🟢):** Sub/Div/Neg/Abs/Mod schemas plus FunctionProto, IR-gate, and packed-padding checker coverage are complete; over-constraining checker rules were removed to match ONNX v1.20.
+- **Sequence executor wiring ✅ landed (`067dd09`, Leon; Nabil 🟢):** all eight Sequence operators execute through run-scoped sequence storage; public graph I/O bindings remain tensor-only.
 - WEIGHT_OFFLOAD Phase 1 is landed; larger-than-RAM exact-logit and throughput validation requires a real large model/package and remains deferred.
 - MatMulNBits projection-fusion (`docs/PROJECTION_FUSION.md`, Nabil) remains **AWAITING GREENLIGHT**.
 - End-to-end run of a GLM-5.2/DeepSeek-scale model once the preceding work lands.

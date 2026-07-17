@@ -4,8 +4,6 @@ Canonical, append-only record of accepted team decisions. Only the Coordinator (
 
 ---
 
----
-
 ## 2026-07-16 — CUDA MatMul assertion, GAFF control-flow loader, and Pad axes fixes
 
 ### Match CUDA MatMul rejection test to the implemented unsupported case
@@ -503,7 +501,6 @@ NVRTC available: 113 passed, 0 failed, 0 skipped. The movement GPU binary passed
 **What:** The new abi3-py310 `onnx-rs-python` crate imports as `onnx_rs` and exposes an opaque `Model`, binary load/save, and `to_*`/`from_*` text, JSON, and TextProto codecs. The initial binding was rejected for an `exists()` preflight, lossy path conversion, and swallowing exceptions from `__fspath__`. The merged revision accepts lossless `PathBuf` values, maps actual I/O error kinds to Python exceptions, propagates `__fspath__` failures, and adds six Python path regressions.
 **Why:** `onnx_rs` avoids collision with the established `onnx` package and retains onnx-rs's stateless codec convention. Native path preservation and direct filesystem errors are required for valid non-UTF-8 Unix paths and accurate error reporting. Freysa cleared the revision after targeted Rust coverage and all six Python regression tests passed. The final merged fix is `5b348b5`.
 
-
 #### Sources: `roy-decode-perf2.md`, `wallace-rmsnorm-review.md`
 
 ### 2026-07-16: Make fused residual RMSNorm allocation-free on native decode
@@ -660,13 +657,11 @@ All bound enums are **DONE**:
 **What:** Added `DecodeCudaState` beside `NativeDecodeSession` with a logical cursor, configurable fixed capacity, one persistent CUDA allocation per key/value tensor, and a fixed-capacity device attention mask. Session `DeviceIoBinding` supplies externally owned device inputs, aliases graph outputs to the same allocation, tracks physical and logical shapes separately, and suppresses bound output materialization. CUDA GQA now treats `total_sequence_length` as physical capacity while `seqlens_k + 1` is the valid prefix; in-place append remains O(new tokens). Rewind/reset move the cursor and update only the mask suffix, never KV bytes.
 **Why:** M3 requires stable KV addresses and no context-sized KV PCIe traffic so later CUDA graph capture has fixed pointers. The default capacity is 4096 tokens; `NativeDecodeSession::load_with_cuda_kv_max_len` and `ONNX_GENAI_CUDA_KV_MAX_LEN` override it, and overflow returns a clean pre-launch error. The 16-token Qwen GPU test asserts all 48 KV pointers remain identical across generation and rewind and aggregate KV binding H2D/D2H counters remain exactly zero. Full CPU/CUDA greedy parity past token 10 is deferred: an origin/main M2 probe and M3 both match the first 10 tokens (required first eight `[11576,42740,11,358,614,264,3405,911]`) and diverge afterward, so this is a pre-existing CUDA numerics gap rather than a device-KV regression.
 
-
 ### 2026-07-16: Sub-4-bit IQ/MXFP4 quant — design + CPU proto
 **By:** Bryant
 **What:** Added `docs/SUB4BIT_QUANT.md` with exact llama.cpp IQ1/IQ2/IQ3 and OCP MXFP4 layouts, recommended linear `MatMulNBits` plus format-explicit block-quantized MatMul/MoE ops, Mobius capability wiring, and an ORT issue draft. Extended the CPU EP's registered `com.microsoft::MatMulNBits` kernel to execute standard linear `bits=2` weights through the f32 correctness path, with partial-block parity and bit-packing tests.
 **Why:** Enables huge-MoE sub-4-bit weights to remain compressed and makes top-k expert offload practical on smaller machines without misinterpreting IQ grid bytes as linear integers.
 **Follow-ups:** Grid-codebook IQ kernels, full MXFP4 MatMul, direct 2-bit/IQ CPU optimization, CUDA kernels, Mobius export and EP-capability wiring, expert residency/offload, and a fused block-quantized MoE op.
-
 
 ### 2026-07-16: Review — sub-4-bit 2-bit CPU MatMulNBits
 **By:** Leon
@@ -679,13 +674,11 @@ Fresh-target validation:
 `cargo test -p onnx-runtime-ep-cpu`: `415 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out`; doc-tests `0 passed; 0 failed; 1 ignored`.
 `cargo build -p onnx-runtime-session -p onnx-genai-engine`: `Finished dev profile` successfully in 11.53s.
 
-
 ### 2026-07-16: DeepSeek-V4-Flash mobius export
 **By:** Chew
 **What:** Draft PR https://github.com/onnxruntime/mobius/pull/405 adds `deepseek_v4`/GGUF `deepseek4` registration, V4 projections, Hyper-Connections, hash/sqrt-softplus MoE, dense attention fallback, 4/8-bit MatMulNBits graph support, GGUF mappings, tests, and runtime aliases.
 **Why:** V4 differs substantially from V3 MLA; this lands the largest weight-compatible standard backbone while keeping unsupported compressed sparse attention explicit rather than guessing its runtime contract.
 **Follow-ups:** Add CSA/HCA compression/indexer/attention-sink and MTP runtime paths; add direct packed dynamic int2/int1 and MXFP4 expert support via a runtime custom op plus mobius EP capabilities and/or an ORT issue; optimize split-GGUF expert repacking.
-
 
 ### 2026-07-16: GLM-5.2 mobius export
 **By:** Tyrell
@@ -693,20 +686,17 @@ Fresh-target validation:
 **Why:** IndexShare DSA and the GLM-specific improved MTP layer require new cross-layer sparse-attention and speculative-decoding contracts. The PR therefore lands a coherent full-attention backbone first rather than a partially wired sparse path.
 **Follow-ups:** Add IndexShare and improved MTP; implement an efficient selected-expert runtime op with native IQ1_M/IQ2_XXS/IQ3_XXS/IQ4_XS support and expose it through Mobius EP capabilities; otherwise pursue the drafted ORT issue for sub-4-bit MatMulNBits/sparse-MoE support. Q4 requantization is the current fallback.
 
-
 ### 2026-07-16: GLM-5.2 IndexShare DSA + MTP export
 **By:** Mariette
 **What:** PR https://github.com/onnxruntime/mobius/pull/404 now includes commit `590c7da`, implementing portable IndexShare DSA with the official shared-indexer schedule and packed index-key cache, plus the complete layer-78 improved-MTP graph, HF/GGUF mappings, ORT GenAI artifacts, dense-attention fallback, tests, and documentation.
 **Why:** Standard ONNX ops preserve DSA selection numerics without a mandatory custom op. MTP is exported as a separate artifact because ORT GenAI does not yet natively orchestrate GLM's speculative iteration state.
 **Follow-ups:** Add a selected-token sparse-attention runtime kernel for the advertised FLOP reduction; add independent indexer-cache/control state and native MTP orchestration for `index_share_for_mtp_iteration`; keep IQ1/IQ2/IQ3 quantization in its separate workstream.
 
-
 ### 2026-07-16: onnx-rs proto bump to IR13 + authoritative native text
 **By:** Batty
 **What:** Landed ONNX v1.22.0 / IR13 bindings, FLOAT8E8M0/UINT2/INT2 runtime dtype and packed-storage support, and lossless multi-device serde for DeviceConfigurationProto, NodeDeviceConfigurationProto, ShardingSpecProto, ShardedDimProto, SimpleShardedDimProto, and IntIntListEntryProto across JSON, TextProto, and native text. Native text commit `67f60c0` replaces the whole-model base64 override with an explicit protobuf-TextFormat residual block; DSL-represented fields are removed from the residual and reconstructed from the readable body, so body edits are authoritative.
 **Why:** Addresses Rachael 🔴: the previous binding was stale IR10/partial IR11 and native text ignored readable edits in favor of an opaque source proto.
 **Remaining:** No known gaps in the requested serde scope. Upstream v1.22.0 attaches multi-device data at `ModelProto.configuration` and `NodeProto.device_configurations`; it defines no `GraphProto` configuration field. Training execution semantics remain out of scope, while any present training proto stays losslessly preserved by descriptor-driven codecs.
-
 
 ### 2026-07-16: Re-review — onnx-rs IR13 proto + authoritative native text
 **By:** Rachael
@@ -717,25 +707,21 @@ The positive `readable_body_edits_are_authoritative_over_extensions` test proves
 
 The scoped skip grep found no `Unsupported`, `todo!`, `unimplemented!`, `unreachable!`, or `#[ignore]`. Fresh-target `cargo test -p onnx-rs` passed 62 unit + 5 full-spec + 16 port + 1 doctest (84 total); strict all-target clippy passed; dependent `onnx-runtime-session` and `onnx-genai-engine` builds passed.
 
-
 ### 2026-07-16: onnx-rs native text made authoritative
 **By:** Deckard
 **What:** The residual merge now starts from readable attributes, uses readable repeated cardinalities for tensor/sparse/type lists, treats edited tensor/type/graph fields as authoritative, and restores only omitted payload/metadata. Opaque byte placeholders use an internal parse sentinel so replacing them with readable strings wins. The full-spec regression edits graph signatures, nested graphs, tensor/type/sparse attributes, opaque strings, and list cardinalities while retaining an exact unedited round-trip.
 **Why:** Addresses Rachael 🔴: the residual overrode readable TypeProtos/SparseTensors and could also override opaque-string edits and projected TypeProto edits.
-
 
 ### 2026-07-16: onnx-rs native-text authoritative re-review (3rd)
 **By:** Rachael
 **What:** 🟢 CLEAR. Verified readable DSL edits win for model headers, graph names/signatures, nodes and attributes, tensor dtype/shape, nested graph signatures, opaque strings, and tensor/sparse/type list cardinalities. The exact adversarial `<1 types>` → `<2 types>` case passes while preserving the first omitted TypeProto payload. Unedited native-text round-trip remains byte-exact.
 **Why:** The residual now strips DSL-expressible fields and merge starts from parsed native attributes/cardinalities, restoring only omitted payload and metadata. `cargo test -p onnx-rs` passed all 84 tests, `cargo test -p onnx-runtime-loader` passed, and `cargo clippy -p onnx-rs -- -D warnings` passed.
 
-
 ### 2026-07-16: BlockQuantizedMatMul — MXFP4 + IQ scaffold
 **By:** Joi
 **What:** Added the private `com.github.onnxruntime.genai::BlockQuantizedMatMul` v1 CPU op with native GGUF blocks, strict shape/layout validation, optional bias, constant-weight dequant caching, and f32 GEMM. MXFP4 is fully implemented with OCP E2M1/E8M0 semantics and llama.cpp nibble layout; IQ4_NL is the first fully implemented IQ/codebook format. IQ1/IQ2/IQ3 and IQ4_XS are recognized but explicitly rejected until audited tables land. Rust dequant/matmul tests and an ONNX IR Python fixture cover the implementation.
 **Why:** Enables correctness-first execution of unsloth/llama.cpp native block weights without misinterpreting IQ or MXFP4 bytes as affine NBits, unblocking sub-4-bit GGUF model integration.
 **Follow-ups:** Import audited llama.cpp golden vectors and grid tables for IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, and IQ4_XS; add direct CUDA kernels, Mobius capability/export wiring, GGUF-to-ORT MXFP4 layout parity, and fused `BlockQuantizedMoE` execution.
-
 
 ### 2026-07-16: BlockQuantizedMatMul review
 **By:** Leon
@@ -1063,7 +1049,6 @@ The accepted residual mismatch beginning at token index 12 is likely seeded by t
 
 **Why:** A remaining K=4864 accuracy-level-4 reduction-tree difference is bounded at max absolute `1.9073486e-5` and first amplifies to a token divergence at index 16. Serializing the GPU reduction to emulate CPU exactly costs 8.4% decode throughput, so the parallel warp reduction remains the accepted tolerance. H200 validation passed all 128 CUDA EP tests, exact SiLU-order regression, acc4 comparison, and 16-token parity coverage.
 
-
 ## 2026-07-16T19:27:57+0000 — CUDA IQ super-block GEMV and shared quantization tables
 
 #### Source: `roy-cuda-iq-superblock-gemv.md`
@@ -1189,7 +1174,6 @@ Verified on NVIDIA H200, compute capability 9.0, driver 580.105.08.
 **What:** 🟢 CLEAR on H200. The shared grid FNV-1a hash is `0x6703ed863501ae2e`; both known traces and all random/per-weight GPU-versus-CPU comparisons are correct. The CUDA suite passed 129 tests across 15 groups, and the CPU gate passed 15 tests (one ignored). No fixed SM90 target was added.
 **Why:** Validation confirms IQ1 index reconstruction, scales, deltas, signs, fallbacks, and runtime-device NVRTC targeting all preserve the established contracts.
 
-
 ## 2026-07-16 — Real-model sub-4-bit validation and export/runtime fixes
 
 ### 2026-07-16: Decisions archive eligibility scan
@@ -1218,7 +1202,6 @@ Verified on NVIDIA H200, compute capability 9.0, driver 580.105.08.
 **Why:** The real-model run revealed an incorrect 8-bit scaffold selection and malformed serialized ONNX lacking the custom-domain import. Pure-Q8 behavior remains unchanged (MatMulNBits only, no genai import).
 
 **Sources:** `nabil-deepseek-csa-mtp-design.md`, `pris-e2e-sub4bit-validation.md`, `sapper-shapeinfer-quant-matmul.md`, `leon-shapeinfer-quant-review.md`, `pris-mobius406-mixedquant-opset-fix.md`, `mariette-mobius406-fix-review.md`.
-
 
 ## 2026-07-16T19:27:57+0000 — Native backend serving
 
@@ -1259,7 +1242,6 @@ models.
 - Pipeline and embedding execution on the native backend.
 - Native device selection in `EngineConfig`; this milestone uses CPU.
 
-
 #### Source: `holden-native-backend-review.md`
 
 ### 2026-07-16: Engine native-backend selector review
@@ -1291,14 +1273,12 @@ models.
 - Targeted `native_engine`: 1 passed.
 - Targeted Auto detector unit test: 1 passed, but lacks domain/opset cases.
 
-
 #### Source: `batty-native-backend-fix.md`
 
 ### 2026-07-16: Native backend selector revision after Holden rejection
 **By:** Batty
 **What:** Addressed all three blockers from Holden's 🔴 review of Deckard's native-backend selector. Auto detection now requires the exact `com.github.onnxruntime.genai::BlockQuantizedMatMul` operator identity with domain opset version 1, with tests for the supported identity, a wrong domain, and an unsupported version. Native generation now rejects request-level draft-model, prompt-lookup, MTP, EAGLE-3, and shared-KV modes plus `num_speculative_tokens`, with generation tests covering the explicit errors. Pipeline loading now rejects explicit Native and Auto-detected native-only components, and native single-model loading rejects non-CPU `SessionOptions`; tests cover explicit/Auto pipeline refusal and non-CPU device refusal.
 **Why:** The rejected implementation could route same-named foreign or unsupported operators to native execution and silently ignore speculative, pipeline, and device selections. These changes fail closed with specific errors while preserving Auto as the default and the existing ORT path for non-matching models.
-
 
 #### Source: `holden-native-backend-rereview.md`
 
@@ -1331,7 +1311,6 @@ Re-reviewed commit `2ae464b5d894276f38a5855599c0c9124ea23558` against rejected b
 - `cargo test -p onnx-genai-engine --features native-backend`: 111 passed, 18 failed, 1 ignored; all 18 failures are the allowed missing `tiny-llm/model.onnx` fixture failures.
 - Targeted backend tests: 6 passed (3 unit/pipeline plus 3 native integration), 0 failed.
 
-
 #### Source: `roy-native-cuda-device.md`, `wallace-native-cuda-review.md`, `deckard-native-cuda-safe.md`, `wallace-native-cuda-rereview.md`
 
 ### 2026-07-16: Native CUDA serving shipped with a fail-fast heterogeneous-placement gate
@@ -1343,7 +1322,6 @@ Re-reviewed commit `2ae464b5d894276f38a5855599c0c9124ea23558` against rejected b
 **Rationale:** `559c46f` correctly exposed `NativeDecodeDevice::Cuda` through `EngineConfig`, `SessionOptions`, and server CLI/environment selection, but the real 144-`BlockQuantizedMatMul` IQ4 model failed under a CUDA-only session during prefill and later on `Transpose`. The prior Constant/Gather fixture did not exercise this failure mode. Deckard's `fa30410` adds per-node CUDA capability probing, including symbolic/M>1 `BlockQuantizedMatMul`, and a reachable multi-token sub-4-bit regression: CPU generation succeeds; explicit CUDA and SessionOptions-routed CUDA fail deterministically at load with actionable remediation. A fully CUDA-supported smoke graph remains the positive CUDA parity proof.
 
 **Deferred:** True GPU serving for real sub-4-bit models requires heterogeneous CUDA-first/CPU-fallback placement, cross-device buffers/copies, and M>1 CPU prefill versus M=1 CUDA decode. The design is documented in `docs/HETEROGENEOUS_PLACEMENT.md` and is **AWAITING USER GREENLIGHT**.
-
 
 ### 2026-07-16: Comparison and logical ops infer Bool outputs
 **By:** Chew; reviewed by Leon (🟢 CLEAR)
@@ -1368,7 +1346,6 @@ Re-reviewed commit `2ae464b5d894276f38a5855599c0c9124ea23558` against rejected b
 **Why:** Expanded Attention had stopped at unsupported `Mod`. CPU EP (435 passed, 1 ignored), shape inference (116 plus doctests), and all 13 official ONNX Mod CPU cases passed. The remaining expanded-Attention blocker is missing logical `And` execution at node 39. Direct BF16 Mod coverage and a ChildExecutor multi-signature cache remain follow-ups.
 
 **Sources:** `sapper-gaff-if.md`, `holden-sapper-gaff-if-review.md`, `joi-mod-op.md`, `bryant-joi-mod-review.md`; merged commits `7a369ef` and `aa7127e`.
-
 
 ## 2026-07-17 — Logical kernels, Expand inference, and GAFF Loop completion
 
@@ -1584,7 +1561,6 @@ The shell validation script and serialized ONNX fixture were additional tracked 
 **What:** 🟢 Approved `cdb4ee5`, extending CPU `com.microsoft::QMoE` to 1-bit and 2-bit expert weights.
 **Why:** Factory acceptance is exactly `{1, 2, 4, 8}`; packing, offsets, masks, affine zero-point tails, and row sizing are correct for byte-dividing widths, while the established 4/8-bit path remains unchanged. New equivalence/rejection coverage and the full crate suite passed (450 passed, 1 ignored).
 
-
 ## 2026-07-17 — Standard shape-inference coverage
 
 ### 2026-07-17: Add ONNX shape inference for OneHot, Trilu, spatial rearrangements, and Compress
@@ -1596,8 +1572,6 @@ The shell validation script and serialized ONNX fixture were additional tracked 
 **By:** Bryant
 **What:** 🟢 Approved `98ee7a6`. The five handlers use correct schema-version registrations, shape/dtype contracts, symbolic degradation, known-divisibility validation, and checked `blocksize² * C` arithmetic.
 **Why:** Coverage includes OneHot axes/dynamic depth, Compress axis/no-axis, Trilu variants, spatial modes and schema versions, symbolic dimensions, divisibility failures, and blocksize-square overflow. `cargo test -p onnx-runtime-shape-inference` passed all 140 tests.
-
-
 
 ## 2026-07-17 — Owner-reviewed scale-model design decisions
 
@@ -1699,7 +1673,6 @@ Q10 integrity/lifetime: pin file identity cheaply at load (size + mtime/inode or
 
 Status: design approved; Phase 1 = mmap disk tier + active-expert CPU MoE access.
 
-
 ## 2026-07-17 — Overnight wave 4–5 landings
 
 #### Source: `deckard-csa-abi-fix.md`
@@ -1772,3 +1745,42 @@ Status: design approved; Phase 1 = mmap disk tier + active-expert CPU MoE access
 **Remaining:** Complete standard/ONNX-ML schema and shape catalogs; function signature/default/topology/import/recursion checks; remaining IR-version gates; packed 2-bit/4-bit padding validation; full mutation/text grammar/opset conversion. Training validation/execution remains explicitly out of scope.
 
 **Merged commits:** `ef40af8`, `6e82b05`, `4981dbf`, `62da14b`, `833f6da`, and `11a01a5`.
+
+## 2026-07-17 — Wave 6 landings
+
+#### Source: `deckard-onnxrs-r3-overconstraint.md`
+
+### 2026-07-17: Match ONNX v1.20 checker semantics for three over-constraints
+**By:** Deckard
+**What:** ModelProto.metadata_props is validated without an IR-version presence gate; FunctionProto.domain accepts the empty default ONNX domain instead of requiring a non-empty value; packed sub-byte tensor payloads validate byte length but do not require unused high bits to be zero.
+**Why:** ONNX v1.20 checker.cc applies duplicate-key validation to model metadata at every supported IR, uses `enforce_has_field(function, domain)` rather than a non-empty check, and imposes no value constraint on unused packed lanes. The vendored proto3 Rust representation does not retain scalar string wire presence, so it cannot distinguish an omitted FunctionProto.domain from an explicitly present empty domain after decoding; the typed checker therefore accepts the empty/default representation while preserving all other function checks.
+
+#### Source: `leon-seq-ops.md`
+
+### 2026-07-17: Execute ONNX Sequence operators in the session runtime
+**By:** Leon
+**What:** The executor keeps heterogeneous sequence values in run-scoped `HashMap<ValueId, SequenceValue>` storage, with a build-time `sequence_values` type set so sequence outputs never receive tensor buffers. `SequenceAt` tensor results retain their `SeqTensor` Arc in `seq_elem_values` for zero-copy host consumption. SequenceEmpty, SequenceConstruct, SequenceInsert, SequenceErase, SequenceAt, SequenceLength, SplitToSequence, and ConcatFromSequence are routed directly by the executor; all data operations delegate to the Phase 1 `SequenceValue`, `split`, and `concat` APIs.
+**Why:** EP kernels only accept tensor views, so executor-owned heterogeneous storage is the minimal extension that preserves existing tensor buffer/view conventions while allowing sequence values between graph nodes. Graph-level sequence input/output bindings remain a later phase because the public `InferenceSession::run` boundary is tensor-only; internal sequence graphs are fully executable when they terminate in SequenceAt, SequenceLength, or ConcatFromSequence.
+
+#### Source: `roy-deepseek-csa-p2.md`
+
+### 2026-07-17: DeepSeek CSA Phase 2 compressed-cache dequantization
+**By:** Roy
+**What:** Added checked CPU reference decoding for FP8 E4M3FN block-64 and FP4 E2M1 block-32 caches. Packed records concatenate an E8M0 power-of-two scale byte with 64 FP8 bytes or 16 adjacent-nibble FP4 bytes; CSA dequantizes to f32, reuses `SparseKvGather`, and accumulates sink-aware attention in f32. The assembled-cache path accepts `cache_format=fp8_e4m3_block64` and `cache_format=fp4_e2m1_block32`.
+**Why:** This enables correctness testing of compressed KV without full model goldens. The shared OCP E2M1/E8M0 scalar primitives were factored from `BlockQuantizedMatMul`; QMoE currently only implements integer affine dequant and had no FP4/FP8 helper to reuse. Hand-constructed blocks validate exact scale/code semantics, and FP4/FP8 CSA tests compare compressed execution with the same logical f32 cache. Stateful compressed-KV construction/carry updates, ratio-4 index-key construction/carry updates, and top-k selection remain explicit `Unsupported`; the MTP sidecar remains outside this path. Validation: `cargo test -p onnx-runtime-ep-cpu` passed 475 tests (1 ignored), plus 0 doc tests (1 ignored).
+
+#### Source: `sapper-onnxrs-round3.md`
+
+### 2026-07-17: ONNX-RS round-3 checker and schema coverage
+**By:** Sapper
+**What:** Bind the checker to ONNX v1.20/IR 13, validate inference-field introduction gates, add structural FunctionProto validation, enforce zero packed padding bits, and register Sub/Div/Neg/Abs/Mod schemas with shape tests.
+**Why:** These were the highest-priority non-training gaps in the coverage audit. Function optional fields remain optional; call-site/declaration consistency stays listed as a remaining gap because v1.20 checker.cc also marks that consistency check TODO.
+
+## 2026-07-17 — Wave 6 correction
+
+#### Source: `chew-csa-rope-tail.md`
+
+### 2026-07-17: Preserve the CSA RoPE tail outside FP8 blocks
+**By:** Chew
+**What:** The assembled CSA FP8 cache record is hybrid: E4M3 block-64 bytes encode only `head_dim - qk_rope_head_dim`, followed by little-endian BF16 values for the RoPE tail. FP4 remains full-width block-32.
+**Why:** The frozen DeepSeek contract applies attention FP8 simulation only to non-RoPE dimensions after the BF16 RoPE update, so quantizing the tail changes attention numerics.
