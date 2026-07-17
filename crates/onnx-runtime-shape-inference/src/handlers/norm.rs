@@ -74,6 +74,23 @@ pub fn rms_norm(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
     Ok(())
 }
 
+/// `BatchNormalization` in inference mode: output `Y` preserves the shape and
+/// dtype of `X`. Training-only outputs are intentionally left unresolved.
+pub fn batch_norm(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
+    if let Some(x) = ctx.input_type(0).cloned() {
+        ctx.set_output_type(0, x);
+    }
+    Ok(())
+}
+
+/// `InstanceNormalization`: output `Y` preserves the shape and dtype of `X`.
+pub fn instance_norm(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
+    if let Some(x) = ctx.input_type(0).cloned() {
+        ctx.set_output_type(0, x);
+    }
+    Ok(())
+}
+
 /// `RotaryEmbedding`: output shape and dtype equal the input `X` (input 0).
 pub fn rotary_embedding(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
     if let Some(x) = ctx.input_type(0).cloned() {
@@ -273,6 +290,10 @@ pub fn register(reg: &mut InferenceRegistry) {
     reg.register("", "SimplifiedLayerNormalization", 1, layer_norm);
     reg.register("", "Softmax", 1, softmax);
     reg.register("", "LogSoftmax", 1, softmax);
+    reg.register("", "BatchNormalization", 9, batch_norm);
+    reg.register("", "BatchNormalization", 14, batch_norm);
+    reg.register("", "BatchNormalization", 15, batch_norm);
+    reg.register("", "InstanceNormalization", 6, instance_norm);
     // Standard LLM/transformer norm primitives (ai.onnx): both are
     // shape-preserving (output == input X).
     reg.register("", "RMSNormalization", 23, rms_norm);

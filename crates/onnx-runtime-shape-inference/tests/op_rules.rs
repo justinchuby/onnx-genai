@@ -1373,6 +1373,56 @@ fn rms_norm_passthrough() {
 }
 
 #[test]
+fn batch_norm_inference_passthrough_opsets_9_14_15() {
+    let n = node("BatchNormalization", 5, 1);
+    for opset in [9, 14, 15] {
+        let outs = run(
+            &n,
+            vec![
+                tin(DataType::Float16, vec![c(2), c(3), c(4), c(5)]),
+                tin(DataType::Float16, vec![c(3)]),
+                tin(DataType::Float16, vec![c(3)]),
+                tin(DataType::Float16, vec![c(3)]),
+                tin(DataType::Float16, vec![c(3)]),
+            ],
+            opset,
+        );
+        assert_eq!(out_shape(&outs), vec![c(2), c(3), c(4), c(5)]);
+        assert_eq!(out_dtype(&outs), DataType::Float16);
+    }
+}
+
+#[test]
+fn instance_norm_passthrough_opset_6() {
+    let n = node("InstanceNormalization", 3, 1);
+    let outs = run(
+        &n,
+        vec![
+            tin(DataType::Float16, vec![c(1), c(8), c(16), c(16)]),
+            tin(DataType::Float16, vec![c(8)]),
+            tin(DataType::Float16, vec![c(8)]),
+        ],
+        6,
+    );
+    assert_eq!(out_shape(&outs), vec![c(1), c(8), c(16), c(16)]);
+    assert_eq!(out_dtype(&outs), DataType::Float16);
+}
+
+#[test]
+fn normalization_unknown_x_leaves_output_unresolved() {
+    for (op, n_in, opset) in [
+        ("BatchNormalization", 5, 15),
+        ("InstanceNormalization", 3, 6),
+    ] {
+        let n = node(op, n_in, 1);
+        let mut inputs = vec![NodeIo::default()];
+        inputs.extend((1..n_in).map(|_| f32in(vec![c(3)])));
+        let outs = run(&n, inputs, opset);
+        assert!(outs[0].type_info.is_none());
+    }
+}
+
+#[test]
 fn rotary_embedding_passthrough_4d() {
     // Output equals input X (opset 23), 4D [batch, heads, seq, head_size].
     let n = node("RotaryEmbedding", 3, 1);
