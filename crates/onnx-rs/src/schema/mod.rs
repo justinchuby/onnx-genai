@@ -382,6 +382,18 @@ const BUILTIN_YAML: &[&str] = &[
     include_str!("../../schemas/standard/neg.yaml"),
     include_str!("../../schemas/standard/abs.yaml"),
     include_str!("../../schemas/standard/mod.yaml"),
+    include_str!("../../schemas/standard/log_softmax.yaml"),
+    include_str!("../../schemas/standard/rms_normalization.yaml"),
+    include_str!("../../schemas/standard/reduce_max.yaml"),
+    include_str!("../../schemas/standard/reduce_min.yaml"),
+    include_str!("../../schemas/standard/reduce_prod.yaml"),
+    include_str!("../../schemas/standard/reduce_l1.yaml"),
+    include_str!("../../schemas/standard/reduce_l2.yaml"),
+    include_str!("../../schemas/standard/reduce_log_sum.yaml"),
+    include_str!("../../schemas/standard/reduce_log_sum_exp.yaml"),
+    include_str!("../../schemas/standard/reduce_sum_square.yaml"),
+    include_str!("../../schemas/standard/arg_max.yaml"),
+    include_str!("../../schemas/standard/arg_min.yaml"),
 ];
 
 // FOLLOW-UP §7.4: complete the standard and ONNX-ML YAML catalogues.
@@ -605,9 +617,87 @@ type_constraints:
             "Neg",
             "Abs",
             "Mod",
+            "LogSoftmax",
+            "RMSNormalization",
+            "ReduceMax",
+            "ReduceMin",
+            "ReduceProd",
+            "ReduceL1",
+            "ReduceL2",
+            "ReduceLogSum",
+            "ReduceLogSumExp",
+            "ReduceSumSquare",
+            "ArgMax",
+            "ArgMin",
         ] {
             assert!(registry.lookup(name, "", 24).is_some(), "{name}");
         }
+    }
+
+    #[test]
+    fn round_four_schemas_match_official_signatures() {
+        let registry = SchemaRegistry::builtins();
+        let reductions = [
+            ("ReduceMax", 20),
+            ("ReduceMin", 20),
+            ("ReduceProd", 18),
+            ("ReduceL1", 18),
+            ("ReduceL2", 18),
+            ("ReduceLogSum", 18),
+            ("ReduceLogSumExp", 18),
+            ("ReduceSumSquare", 18),
+        ];
+        for (name, since_version) in reductions {
+            let schema = registry.lookup(name, "", 24).unwrap();
+            assert_eq!(schema.since_version, since_version);
+            assert_eq!(schema.inputs.len(), 2);
+            assert!(schema.inputs[1].optional);
+            assert_eq!(schema.inputs[1].type_str, "tensor(int64)");
+            assert_eq!(schema.outputs.len(), 1);
+            assert_eq!(
+                schema
+                    .attributes
+                    .iter()
+                    .find(|attribute| attribute.name == "keepdims")
+                    .unwrap()
+                    .default,
+                Some(AttributeDefault::Int(1))
+            );
+            assert_eq!(
+                schema
+                    .attributes
+                    .iter()
+                    .find(|attribute| attribute.name == "noop_with_empty_axes")
+                    .unwrap()
+                    .default,
+                Some(AttributeDefault::Int(0))
+            );
+        }
+
+        let rms = registry.lookup("RMSNormalization", "", 24).unwrap();
+        assert_eq!(rms.since_version, 23);
+        assert_eq!(
+            rms.inputs
+                .iter()
+                .map(|input| input.type_str.as_str())
+                .collect::<Vec<_>>(),
+            ["T", "V"]
+        );
+        assert_eq!(rms.outputs[0].type_str, "V");
+        assert_eq!(rms.type_constraints.len(), 2);
+
+        for name in ["ArgMax", "ArgMin"] {
+            let schema = registry.lookup(name, "", 24).unwrap();
+            assert_eq!(schema.since_version, 13);
+            assert_eq!(schema.outputs[0].type_str, "tensor(int64)");
+            assert_eq!(schema.attributes.len(), 3);
+        }
+        let log_softmax = registry.lookup("LogSoftmax", "", 24).unwrap();
+        assert_eq!(log_softmax.since_version, 13);
+        assert_eq!(
+            log_softmax.attributes[0].default,
+            Some(AttributeDefault::Int(-1))
+        );
     }
 
     #[test]

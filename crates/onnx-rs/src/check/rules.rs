@@ -1114,7 +1114,7 @@ fn check_dtype_ir_feature(
 }
 
 /// Validate model-local functions using the v1.20 checker topology/import
-/// rules plus the IR signature rules for default attributes and unique IDs.
+/// rules plus signature, call-site, default-attribute, and unique-ID rules.
 pub struct FunctionProtoValidityRule;
 
 impl ValidationRule for FunctionProtoValidityRule {
@@ -1187,8 +1187,150 @@ fn check_model_functions(
     for function in &model.functions {
         check_function_proto(function, &model_opsets, ctx, rule_id, &mut violations);
     }
+    check_model_function_call_sites(model, &functions, rule_id, &mut violations);
     check_function_recursion(&functions, rule_id, &mut violations);
     violations
+}
+
+fn check_model_function_call_sites(
+    model: &ModelProto,
+    functions: &HashMap<FunctionKey, &FunctionProto>,
+    rule_id: &str,
+    violations: &mut Vec<Violation>,
+) {
+    if let Some(graph) = &model.graph {
+        check_function_calls_in_nodes(&graph.node, &graph.name, functions, rule_id, violations);
+    }
+    for function in &model.functions {
+        check_function_calls_in_nodes(
+            &function.node,
+            &function.name,
+            functions,
+            rule_id,
+            violations,
+        );
+    }
+}
+
+fn check_function_calls_in_nodes(
+    nodes: &[NodeProto],
+    graph_name: &str,
+    functions: &HashMap<FunctionKey, &FunctionProto>,
+    rule_id: &str,
+    violations: &mut Vec<Violation>,
+) {
+    for node in nodes {
+        if let Some(function) = functions.get(&node_function_key(node)) {
+            check_function_call_site(node, function, graph_name, rule_id, violations);
+        }
+        for attribute in &node.attribute {
+            if let Some(graph) = &attribute.g {
+                check_function_calls_in_nodes(
+                    &graph.node,
+                    &graph.name,
+                    functions,
+                    rule_id,
+                    violations,
+                );
+            }
+            for graph in &attribute.graphs {
+                check_function_calls_in_nodes(
+                    &graph.node,
+                    &graph.name,
+                    functions,
+                    rule_id,
+                    violations,
+                );
+            }
+        }
+    }
+}
+
+fn check_function_call_site(
+    node: &NodeProto,
+    function: &FunctionProto,
+    graph_name: &str,
+    rule_id: &str,
+    violations: &mut Vec<Violation>,
+) {
+    let location = ViolationLocation::Node {
+        graph_name: graph_name.to_string(),
+        node_name: proto_node_label(node),
+    };
+    if node.input.len() != function.input.len() {
+        violations.push(Violation {
+            rule_id: rule_id.to_string(),
+            severity: Severity::Error,
+            message: format!(
+                "call to model-local function '{}::{}' overload '{}' has {} inputs, expected {}",
+                normalize_domain(&function.domain),
+                function.name,
+                function.overload,
+                node.input.len(),
+                function.input.len()
+            ),
+            location: location.clone(),
+        });
+    }
+    if node.output.len() != function.output.len() {
+        violations.push(Violation {
+            rule_id: rule_id.to_string(),
+            severity: Severity::Error,
+            message: format!(
+                "call to model-local function '{}::{}' overload '{}' has {} outputs, expected {}",
+                normalize_domain(&function.domain),
+                function.name,
+                function.overload,
+                node.output.len(),
+                function.output.len()
+            ),
+            location: location.clone(),
+        });
+    }
+
+    let required = function
+        .attribute
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let defaults = function
+        .attribute_proto
+        .iter()
+        .map(|attribute| attribute.name.as_str())
+        .collect::<HashSet<_>>();
+    let supplied = node
+        .attribute
+        .iter()
+        .map(|attribute| attribute.name.as_str())
+        .collect::<HashSet<_>>();
+    for attribute in required.difference(&supplied) {
+        violations.push(Violation {
+            rule_id: rule_id.to_string(),
+            severity: Severity::Error,
+            message: format!(
+                "call to model-local function '{}::{}' is missing required attribute '{}'",
+                normalize_domain(&function.domain),
+                function.name,
+                attribute
+            ),
+            location: location.clone(),
+        });
+    }
+    for attribute in supplied {
+        if !required.contains(attribute) && !defaults.contains(attribute) {
+            violations.push(Violation {
+                rule_id: rule_id.to_string(),
+                severity: Severity::Error,
+                message: format!(
+                    "call to model-local function '{}::{}' supplies undeclared attribute '{}'",
+                    normalize_domain(&function.domain),
+                    function.name,
+                    attribute
+                ),
+                location: location.clone(),
+            });
+        }
+    }
 }
 
 fn opset_map(
@@ -3862,6 +4004,48 @@ mod tests {
         }
     }
 
+    fn local_function_call_model(function: FunctionProto, call: NodeProto) -> Model {
+        let graph_inputs = call
+            .input
+            .iter()
+            .filter(|name| !name.is_empty())
+            .map(|name| ValueInfoProto {
+                name: name.clone(),
+                ..Default::default()
+            })
+            .collect();
+        let graph_outputs = call
+            .output
+            .iter()
+            .filter(|name| !name.is_empty())
+            .map(|name| ValueInfoProto {
+                name: name.clone(),
+                ..Default::default()
+            })
+            .collect();
+        retained_model(ModelProto {
+            opset_import: vec![
+                OperatorSetIdProto {
+                    domain: String::new(),
+                    version: 24,
+                },
+                OperatorSetIdProto {
+                    domain: "local.test".into(),
+                    version: 1,
+                },
+            ],
+            graph: Some(GraphProto {
+                name: "graph".into(),
+                input: graph_inputs,
+                output: graph_outputs,
+                node: vec![call],
+                ..Default::default()
+            }),
+            functions: vec![function],
+            ..Default::default()
+        })
+    }
+
     #[test]
     fn metadata_rule_rejects_duplicate_keys() {
         let model = retained_model(ModelProto {
@@ -4760,6 +4944,101 @@ mod tests {
     }
 
     #[test]
+    fn function_rule_accepts_consistent_call_with_omitted_default_attribute() {
+        let mut callee = function(
+            "Affine",
+            vec![NodeProto {
+                input: vec!["X".into()],
+                output: vec!["Y".into()],
+                op_type: "Identity".into(),
+                ..Default::default()
+            }],
+        );
+        callee.attribute = vec!["alpha".into()];
+        callee.attribute_proto = vec![AttributeProto {
+            name: "beta".into(),
+            r#type: attribute_proto::AttributeType::Float as i32,
+            f: 1.0,
+            ..Default::default()
+        }];
+        let model = local_function_call_model(
+            callee,
+            NodeProto {
+                input: vec!["X".into()],
+                output: vec!["Y".into()],
+                op_type: "Affine".into(),
+                domain: "local.test".into(),
+                attribute: vec![AttributeProto {
+                    name: "alpha".into(),
+                    r#type: attribute_proto::AttributeType::Float as i32,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        let violations = FunctionProtoValidityRule.check(&model, &ValidationContext::default());
+        assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    #[test]
+    fn function_rule_rejects_call_site_arity_and_attribute_mismatches() {
+        let callee = function(
+            "Affine",
+            vec![NodeProto {
+                input: vec!["X".into()],
+                output: vec!["Y".into()],
+                op_type: "Identity".into(),
+                ..Default::default()
+            }],
+        );
+        let mut caller = function(
+            "Caller",
+            vec![NodeProto {
+                input: vec!["X".into(), "X".into()],
+                output: vec!["Y".into(), "unused".into()],
+                op_type: "Affine".into(),
+                domain: "local.test".into(),
+                attribute: vec![AttributeProto {
+                    name: "gamma".into(),
+                    r#type: attribute_proto::AttributeType::Float as i32,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        );
+        caller.opset_import.push(OperatorSetIdProto {
+            domain: "local.test".into(),
+            version: 1,
+        });
+        let mut callee = callee;
+        callee.attribute = vec!["alpha".into()];
+        callee.attribute_proto = vec![AttributeProto {
+            name: "beta".into(),
+            r#type: attribute_proto::AttributeType::Float as i32,
+            f: 1.0,
+            ..Default::default()
+        }];
+        let model = retained_model(ModelProto {
+            functions: vec![callee, caller],
+            ..Default::default()
+        });
+        let violations = FunctionProtoValidityRule.check(&model, &ValidationContext::default());
+        for expected in [
+            "has 2 inputs, expected 1",
+            "has 2 outputs, expected 1",
+            "missing required attribute 'alpha'",
+            "supplies undeclared attribute 'gamma'",
+        ] {
+            assert!(
+                violations
+                    .iter()
+                    .any(|violation| violation.message.contains(expected)),
+                "{expected}: {violations:?}"
+            );
+        }
+    }
+
+    #[test]
     fn missing_opset_import_is_flagged() {
         let mut g = Graph::new();
         // Deliberately declare no opset import.
@@ -4893,6 +5172,37 @@ mod tests {
     fn schema_rule_accepts_conforming_node() {
         let result = one_node_model("Add", 2, 1).validate();
         assert!(result.is_valid(), "{:?}", result.violations);
+    }
+
+    #[test]
+    fn round_four_optional_inputs_and_attributes_may_be_omitted() {
+        for (op_type, inputs) in [
+            ("ReduceMax", 1),
+            ("ReduceMin", 1),
+            ("ReduceProd", 1),
+            ("ReduceL1", 1),
+            ("ReduceL2", 1),
+            ("ReduceLogSum", 1),
+            ("ReduceLogSumExp", 1),
+            ("ReduceSumSquare", 1),
+            ("ArgMax", 1),
+            ("ArgMin", 1),
+            ("LogSoftmax", 1),
+            ("RMSNormalization", 2),
+        ] {
+            let mut model = one_node_model(op_type, inputs, 1);
+            model.graph.opset_imports.insert(String::new(), 24);
+            if matches!(op_type, "ArgMax" | "ArgMin") {
+                let output = model.graph.outputs[0];
+                model.graph.value_mut(output).dtype = DataType::Int64;
+            }
+            let result = model.validate();
+            assert!(
+                result.is_valid(),
+                "{op_type}: optional fields should be omittable: {:?}",
+                result.violations
+            );
+        }
     }
 
     #[test]

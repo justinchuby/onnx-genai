@@ -65,11 +65,14 @@ pub fn skip_simplified_layer_norm(ctx: &mut InferenceContext) -> Result<(), Shap
     skip_layer_norm(ctx)
 }
 
-/// `RMSNormalization`: output 0 is the input shape (single output, no optional
-/// mean/inv-std). Shape- and dtype-preserving like other norm ops.
+/// `RMSNormalization`: output 0 has the input shape and the scale element type
+/// (`V` in the standard schema).
 pub fn rms_norm(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
-    if let Some(x) = ctx.input_type(0).cloned() {
-        ctx.set_output_type(0, x);
+    if let (Some(shape), Some(dtype)) = (
+        ctx.input_shape(0).map(<[DimExpr]>::to_vec),
+        ctx.input_dtype(1),
+    ) {
+        ctx.set_output(0, dtype, shape);
     }
     Ok(())
 }

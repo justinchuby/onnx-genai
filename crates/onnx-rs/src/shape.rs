@@ -460,6 +460,129 @@ mod tests {
     }
 
     #[test]
+    fn infers_round_four_normalization_reduction_and_arg_shapes() {
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 24);
+        let x = graph.create_named_value(
+            "x",
+            DataType::Float32,
+            vec![Dim::Static(2), Dim::Static(3), Dim::Static(4)],
+        );
+        let scale = graph.create_named_value("scale", DataType::Float16, vec![Dim::Static(4)]);
+        graph.add_input(x);
+        graph.add_input(scale);
+        let axes = i64_initializer(&mut graph, "axes", &[1]);
+
+        let log_softmax = graph.create_named_value("log_softmax", DataType::Float32, Shape::new());
+        graph.insert_node(Node::new(
+            NodeId(0),
+            "LogSoftmax",
+            vec![Some(x)],
+            vec![log_softmax],
+        ));
+
+        let rms = graph.create_named_value("rms", DataType::Undefined, Shape::new());
+        graph.insert_node(Node::new(
+            NodeId(1),
+            "RMSNormalization",
+            vec![Some(x), Some(scale)],
+            vec![rms],
+        ));
+
+        let mut reduction_outputs = Vec::new();
+        for (offset, op) in [
+            "ReduceMax",
+            "ReduceMin",
+            "ReduceProd",
+            "ReduceL1",
+            "ReduceL2",
+            "ReduceLogSum",
+            "ReduceLogSumExp",
+            "ReduceSumSquare",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let output =
+                graph.create_named_value(format!("{op}_out"), DataType::Float32, Shape::new());
+            let mut node = Node::new(
+                NodeId(2 + offset as u32),
+                op,
+                vec![Some(x), Some(axes)],
+                vec![output],
+            );
+            node.attributes.insert("keepdims".into(), Attribute::Int(0));
+            graph.insert_node(node);
+            reduction_outputs.push(output);
+        }
+
+        let arg_max = graph.create_named_value("arg_max", DataType::Int64, Shape::new());
+        let mut arg_max_node = Node::new(NodeId(10), "ArgMax", vec![Some(x)], vec![arg_max]);
+        arg_max_node
+            .attributes
+            .insert("axis".into(), Attribute::Int(-1));
+        arg_max_node
+            .attributes
+            .insert("keepdims".into(), Attribute::Int(0));
+        graph.insert_node(arg_max_node);
+
+        let arg_min = graph.create_named_value("arg_min", DataType::Int64, Shape::new());
+        let mut arg_min_node = Node::new(NodeId(11), "ArgMin", vec![Some(x)], vec![arg_min]);
+        arg_min_node
+            .attributes
+            .insert("axis".into(), Attribute::Int(1));
+        graph.insert_node(arg_min_node);
+
+        for output in [log_softmax, rms, arg_max, arg_min]
+            .into_iter()
+            .chain(reduction_outputs.iter().copied())
+        {
+            graph.add_output(output);
+        }
+
+        let mut model = Model::new(graph);
+        let result = infer_shapes(&mut model).unwrap();
+        assert_eq!(
+            model.graph.value(log_softmax).shape,
+            vec![Dim::Static(2), Dim::Static(3), Dim::Static(4)]
+        );
+        assert_eq!(
+            (
+                model.graph.value(rms).dtype,
+                model.graph.value(rms).shape.clone()
+            ),
+            (
+                DataType::Float16,
+                vec![Dim::Static(2), Dim::Static(3), Dim::Static(4)]
+            )
+        );
+        for output in reduction_outputs {
+            assert_eq!(
+                model.graph.value(output).shape,
+                vec![Dim::Static(2), Dim::Static(4)]
+            );
+        }
+        assert_eq!(
+            (
+                model.graph.value(arg_max).dtype,
+                model.graph.value(arg_max).shape.clone()
+            ),
+            (DataType::Int64, vec![Dim::Static(2), Dim::Static(3)])
+        );
+        assert_eq!(
+            (
+                model.graph.value(arg_min).dtype,
+                model.graph.value(arg_min).shape.clone()
+            ),
+            (
+                DataType::Int64,
+                vec![Dim::Static(2), Dim::Static(1), Dim::Static(4)]
+            )
+        );
+        assert_eq!(result.unknown, 0);
+    }
+
+    #[test]
     fn if_inference_unions_branch_output_shapes() {
         fn branch(shape: Vec<Dim>) -> Graph {
             let mut graph = Graph::new();
