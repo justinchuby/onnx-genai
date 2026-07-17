@@ -629,6 +629,7 @@ mod tests {
             let input = graph.create_named_value("input", DataType::Float32, vec![Dim::Static(2)]);
             graph.add_input(input);
             let output = graph.create_named_value("output", DataType::Float32, Shape::new());
+            graph.mark_value_shape_unknown(output);
             graph.insert_node(Node::new(
                 NodeId(0),
                 "Unsupported",
@@ -644,6 +645,7 @@ mod tests {
         let condition = graph.create_named_value("condition", DataType::Bool, Vec::<Dim>::new());
         graph.add_input(condition);
         let output = graph.create_named_value("output", DataType::Float32, Shape::new());
+        graph.mark_value_shape_unknown(output);
         let node = graph.insert_node(Node::new(
             NodeId(0),
             "If",
@@ -661,5 +663,48 @@ mod tests {
         let mut model = Model::new(graph);
         let result = infer_shapes(&mut model).unwrap();
         assert_eq!(result.unknown, 1);
+    }
+
+    #[test]
+    fn if_inference_preserves_known_scalar_branch_outputs() {
+        fn scalar_branch() -> Graph {
+            let mut graph = Graph::new();
+            let input = graph.create_named_value("input", DataType::Float32, vec![Dim::Static(2)]);
+            graph.add_input(input);
+            let output = graph.create_named_value("output", DataType::Float32, Shape::new());
+            graph.insert_node(Node::new(
+                NodeId(0),
+                "Unsupported",
+                vec![Some(input)],
+                vec![output],
+            ));
+            graph.add_output(output);
+            graph
+        }
+
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 21);
+        let condition = graph.create_named_value("condition", DataType::Bool, Shape::new());
+        graph.add_input(condition);
+        let output = graph.create_named_value("output", DataType::Float32, Shape::new());
+        graph.mark_value_shape_unknown(output);
+        let node = graph.insert_node(Node::new(
+            NodeId(0),
+            "If",
+            vec![Some(condition)],
+            vec![output],
+        ));
+        graph
+            .subgraphs
+            .insert((node, "then_branch".into()), scalar_branch());
+        graph
+            .subgraphs
+            .insert((node, "else_branch".into()), scalar_branch());
+        graph.add_output(output);
+
+        let mut model = Model::new(graph);
+        let result = infer_shapes(&mut model).unwrap();
+        assert!(model.graph.value(output).shape.is_empty());
+        assert_eq!(result.unknown, 0);
     }
 }
