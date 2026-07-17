@@ -1,6 +1,6 @@
 # Weight Offload and Paging for Huge MoE Models
 
-> **Status:** Design for owner review; no implementation is implied by this document.
+> **Status:** Approved — Phase 1 cleared to implement (owner @justinchuby, 2026-07-14). Open questions resolved; see §11.
 >
 > **Primary targets:** GLM-5.2 and DeepSeek-V4-Flash-class sparse MoE models.
 >
@@ -661,28 +661,70 @@ latency.
    new executor `WeightHandle`, through an EP/custom-op context, or through an
    engine-owned fused MoE path? The current all-inputs-are-`TensorView` contract cannot
    honestly represent a partially resident GPU initializer.
+   **Resolution:** Use a general executor `WeightHandle` from the start, compatible with
+   existing ORT plugin EPs through capability detection. Paging-capable EPs advertise an
+   `nxrt` capability flag and receive a lazy `WeightHandle`; stock ORT EPs receive a
+   materialized resident-tensor fallback. Paging is opt-in, never a correctness dependency.
 2. **ORT integration:** can upstream `QMoE`/plugin EPs lazily access external expert
    slices, or does practical offload require the private `BlockQuantizedMoE` boundary?
+   **Resolution:** `pkg.nxrt::BlockQuantizedMoE` is the offload boundary and alone honors
+   lazy expert leases, capability-negotiated with a plain `QMoE` fallback. Mobius emits
+   `BlockQuantizedMoE` when the `nxrt` capability is present, otherwise `QMoE`; file an
+   upstream ORT issue for lazy-external-weight `QMoE`.
 3. **Exporter contract:** which metadata is required beyond expert-major shape to bind
    FC1/FC2/FC3, scales, zero points, shared experts, nonuniform expert sizes, and
    format/layout versions without name inference?
+   **Resolution:** Use a hybrid contract: numeric bindings (FC1/FC2/FC3, scales,
+   zero-points, shared-expert flag, and per-expert sizes) are explicit op inputs or
+   attributes, never name-inferred; residency metadata lives in the package manifest; and
+   format/layout version is mandatory and explicit, with the loader hard-rejecting a
+   mismatch. Residency metadata is a compact model- or layer-group-level layout descriptor
+   (stride, tiling, page size, and expert-range formula) referenced by a small region-group
+   ID on each op—O(1)–O(layers), not per-expert. Compute concrete byte ranges from
+   `WeightStore` offsets plus the descriptor.
 4. **Host budget semantics:** do we promise a cap on owned cache bytes only, or a best-
    effort process RSS cap using mmap advice? OS page-cache residency is not strictly
    controllable by the runtime.
+   **Resolution:** The cross-platform contract is a hard cap on owned cache bytes.
+   RSS-tightening is advisory, off the hot path, and acts only on already-evicted pages so
+   it cannot regress performance, behind a `PageAdvisor` trait (`madvise` on POSIX,
+   `Offer` + `DiscardVirtualMemory` on Windows, and a no-op fallback).
 5. **Partial-GPU policy:** is `gpu_layers:N` required as a stable public compatibility
    knob, or should bytes plus an explainable placement plan be the primary API?
+   **Resolution:** Make a byte budget plus an explainable placement plan the primary API.
+   Retain `gpu_layers:N` as a compatibility override and report it back in bytes.
 6. **Mixed CPU/GPU MoE:** may one fused layer execute some expert waves on CPU and
    others on GPU, or should the first device phase keep each layer on one compute
    device to simplify ordering and numerics?
+   **Resolution:** Phase 3 uses a single device per layer; defer intra-layer expert splits
+   to a later measured optimization.
 7. **Minimum tile size:** what transfer-page/panel sizes best balance NVMe readahead,
    pinned-memory pressure, direct compressed kernels, and GPU occupancy across MXFP4,
    IQ, and affine int2/int4?
+   **Resolution:** Default to expert-FC panels comprising whole quant blocks—a tile must
+   never split a quant block. Provide a byte-size override that snaps to block boundaries,
+   with per-format minimums for MXFP4, IQ, and affine int2–4. Defer auto-tuning to Phase 4.
 8. **Governor arbitration:** what minimum KV guarantee and rebalancing hysteresis
    prevent KV/expert-cache oscillation under continuous batching?
+   **Resolution:** Use dynamic arbitration: a hard KV floor sized to committed in-flight
+   sequences, watermark hysteresis, a minimum rebalance dwell, and admission control at
+   batch formation. Thoroughly test oscillation/thrash, KV-floor breaches, and admission
+   under continuous batching; these are hard test gates.
 9. **Prefetch predictor:** can GLM-5.2/DeepSeek routing be predicted early enough to
    hide storage/H2D latency without duplicating router compute or wasting bandwidth?
+   **Resolution:** Use layered opt-in escalation: (a) exact-next-wave by default, (b) a
+   heat warm-set, and (c) router prediction as opt-in, graduating to default only when
+   measured to help. Provide a trait-based public `ResidencyPolicy` extension point:
+   policy advises hints, priorities, and eviction candidates; the Resource Governor remains
+   authoritative for budgets, the KV floor, and leases, and cancels low-value work.
+   “Policy proposes, Governor disposes”: a bad policy may hurt performance but cannot
+   violate memory safety or correctness.
 10. **Integrity/lifetime:** should package validation pin file identities/hashes and
     reject replacement/truncation while mmaps and derived cache entries are live?
+    **Resolution:** Pin file identity cheaply at load using size plus mtime/inode, or a
+    fast header-plus-region-table signature—O(1), with no full re-hash. Offer opt-in
+    full hashing for attestation, translate `SIGBUS` to a clean runtime error, and reject
+    live truncation or replacement of a mapped package.
 
 ## 12. Decision
 
