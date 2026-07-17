@@ -91,8 +91,8 @@ pub struct GenAiSearch {
 }
 
 impl GenAiConfig {
-    /// Whether the decoder uses grouped/multi-query attention (fewer KV heads
-    /// than attention heads).
+    /// Whether the decoder uses grouped/multi-query attention (strictly fewer KV
+    /// heads than attention heads).
     pub fn is_group_query_attention(&self) -> bool {
         matches!(
             (
@@ -103,6 +103,25 @@ impl GenAiConfig {
         )
     }
 
+    /// Whether the decoder is served by the ONNX Runtime `GroupQueryAttention`
+    /// op. The Microsoft ONNX exporter maps attention onto the GQA op whenever
+    /// key/value heads are declared and do not exceed the query heads — this
+    /// includes full multi-head attention (`kv == attn`), which is just GQA with
+    /// group size 1. The GQA op supports `past_present_share_buffer` at any head
+    /// ratio, so this (not the strict GQA-vs-MHA ratio) is the correct gate for
+    /// the runtime-owned shared KV buffer path. Models like OLMo (32/32 heads)
+    /// use the GQA op and declare share-buffer support despite not being
+    /// strictly grouped.
+    pub fn uses_group_query_attention_op(&self) -> bool {
+        matches!(
+            (
+                self.model.decoder.num_key_value_heads,
+                self.model.decoder.num_attention_heads,
+            ),
+            (Some(kv), Some(attn)) if kv >= 1 && kv <= attn
+        )
+    }
+
     /// Maximum total sequence length usable to pre-size a shared KV buffer,
     /// preferring the explicit `context_length` then `search.max_length`.
     pub fn max_sequence_length(&self) -> Option<usize> {
@@ -110,10 +129,14 @@ impl GenAiConfig {
     }
 
     /// Whether this model advertises the runtime-owned shared KV buffer path
-    /// (share-buffer) for a GQA decoder with a known capacity.
+    /// (share-buffer). Gated on the model's own `past_present_share_buffer`
+    /// declaration (the authoritative signal onnxruntime-genai emits only for
+    /// GQA-op models), the GQA op being in use (so KV heads are known for
+    /// sizing), and a known capacity. Head ratio is intentionally not required:
+    /// full-MHA-via-GQA models (`kv == attn`, e.g. OLMo) are eligible too.
     pub fn shared_kv_buffer_supported(&self) -> bool {
         self.search.past_present_share_buffer
-            && self.is_group_query_attention()
+            && self.uses_group_query_attention_op()
             && self.max_sequence_length().is_some()
     }
 
@@ -133,7 +156,7 @@ impl GenAiConfig {
         let mut attention = Map::new();
         attention.insert(
             "type".into(),
-            json!(if self.is_group_query_attention() {
+            json!(if self.uses_group_query_attention_op() {
                 "group_query_attention"
             } else {
                 "multi_head_attention"
@@ -314,11 +337,33 @@ mod tests {
     }
 
     #[test]
-    fn non_gqa_model_is_multi_head() {
+    fn full_mha_via_gqa_op_is_share_buffer_eligible() {
+        // OLMo-style: num_key_value_heads == num_attention_heads (full MHA), but
+        // exported with the ORT GroupQueryAttention op and declaring
+        // past_present_share_buffer. It must be treated as share-buffer eligible
+        // and labelled as the GQA op, not excluded as plain multi-head attention.
         let mut cfg = qwen_config();
         cfg.model.decoder.num_key_value_heads = Some(14);
         let md = cfg.to_inference_metadata(Some("float16")).unwrap();
-        assert!(!cfg.is_group_query_attention());
+        assert!(!cfg.is_group_query_attention(), "kv == attn is not strict GQA");
+        assert!(cfg.uses_group_query_attention_op(), "kv == attn still uses the GQA op");
+        assert!(cfg.shared_kv_buffer_supported());
+        assert!(md.kv_cache.is_some(), "share-buffer KV dtype must be emitted");
+        assert_eq!(
+            md.model.and_then(|m| m.attention).map(|a| a.attention_type),
+            Some("group_query_attention".to_string())
+        );
+    }
+
+    #[test]
+    fn model_without_kv_heads_is_multi_head_and_not_share_buffer() {
+        // A model that does not declare key/value heads cannot be sized for the
+        // runtime-owned shared KV buffer and is labelled multi-head attention.
+        let mut cfg = qwen_config();
+        cfg.model.decoder.num_key_value_heads = None;
+        let md = cfg.to_inference_metadata(Some("float16")).unwrap();
+        assert!(!cfg.uses_group_query_attention_op());
+        assert!(!cfg.shared_kv_buffer_supported());
         assert!(md.kv_cache.is_none());
         assert_eq!(
             md.model.and_then(|m| m.attention).map(|a| a.attention_type),
