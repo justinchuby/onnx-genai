@@ -1,4 +1,4 @@
-//! Decode-specialized CUDA GEMV for native GGUF block formats.
+//! CUDA GEMV/GEMM kernels for native GGUF block formats.
 
 use std::ffi::c_void;
 use std::fmt::Write;
@@ -30,10 +30,13 @@ const IQ3_S_BLOCK_BYTES: usize = 110;
 const IQ1_S_BLOCK_BYTES: usize = 50;
 const IQ1_M_BLOCK_BYTES: usize = 56;
 const BLOCK_THREADS: u32 = 256;
+const GEMM_TILE_M: u32 = 8;
 const GEMV_MODULE: &str = "block_quantized_matmul_gemv";
 const GEMV_ENTRY: &str = "block_quantized_matmul_gemv_f32";
+const GEMM_MODULE: &str = "block_quantized_matmul_gemm";
+const GEMM_ENTRY: &str = "block_quantized_matmul_gemm_f32";
 
-const GEMV_PREFIX: &str = r#"
+const PREFIX: &str = r#"
 __device__ __constant__ signed char e2m1_doubled[16] = {
     0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12
 };
@@ -44,7 +47,7 @@ __device__ __constant__ signed char iq4_nl_codebook[16] = {
 };
 "#;
 
-const GEMV_SUFFIX: &str = r#"
+const SUFFIX: &str = r#"
 __device__ __forceinline__ float fp16_to_fp32(unsigned short value)
 {
     const unsigned int sign = ((unsigned int)value & 0x8000u) << 16;
@@ -288,7 +291,9 @@ __device__ __forceinline__ float block_sum(float value)
     value = threadIdx.x < ((blockDim.x + 31) >> 5) ? warp_sums[lane] : 0.0f;
     return warp == 0 ? warp_sum(value) : 0.0f;
 }
+"#;
 
+const GEMV_KERNEL: &str = r#"
 extern "C" __global__ void block_quantized_matmul_gemv_f32(
     const float* activation,
     const unsigned char* packed,
@@ -317,20 +322,75 @@ extern "C" __global__ void block_quantized_matmul_gemv_f32(
 }
 "#;
 
+const GEMM_KERNEL: &str = r#"
+extern "C" __global__ void block_quantized_matmul_gemm_f32(
+    const float* activation,
+    const unsigned char* packed,
+    const float* bias,
+    float* output,
+    const int m,
+    const int k,
+    const int n,
+    const int blocks,
+    const int block_bytes,
+    const int format)
+{
+    const int column = (int)blockIdx.x;
+    const int row_base = (int)blockIdx.y * GEMM_TILE_M;
+    if (column >= n || row_base >= m) {
+        return;
+    }
+
+    float values[GEMM_TILE_M] = {0.0f};
+    for (int depth = (int)threadIdx.x; depth < k; depth += (int)blockDim.x) {
+        const float weight =
+            decode_weight(packed, format, blocks, block_bytes, column, depth);
+#pragma unroll
+        for (int row = 0; row < GEMM_TILE_M; ++row) {
+            if (row_base + row < m) {
+                values[row] += activation[(long long)(row_base + row) * k + depth] * weight;
+            }
+        }
+    }
+
+#pragma unroll
+    for (int row = 0; row < GEMM_TILE_M; ++row) {
+        const float value = block_sum(values[row]);
+        __syncthreads();
+        if (threadIdx.x == 0 && row_base + row < m) {
+            output[(long long)(row_base + row) * n + column] =
+                value + (bias ? bias[column] : 0.0f);
+        }
+    }
+}
+"#;
+
 fn gemv_src() -> &'static str {
     static SOURCE: OnceLock<String> = OnceLock::new();
-    SOURCE.get_or_init(|| {
-        let mut source = String::from(GEMV_PREFIX);
-        append_u8_table(&mut source, "iq2xs_signs", &IQ2XS_SIGNS);
-        append_u64_table(&mut source, "iq2xxs_grid", &IQ2XXS_GRID);
-        append_u32_table(&mut source, "iq3xxs_grid", &IQ3XXS_GRID);
-        append_u64_table(&mut source, "iq2xs_grid", &IQ2XS_GRID);
-        append_u64_table(&mut source, "iq2s_grid", &IQ2S_GRID);
-        append_u32_table(&mut source, "iq3s_grid", &IQ3S_GRID);
-        append_u64_table(&mut source, "iq1s_grid", &IQ1S_GRID);
-        source.push_str(GEMV_SUFFIX);
-        source
-    })
+    SOURCE.get_or_init(|| module_src(GEMV_KERNEL, None))
+}
+
+fn gemm_src() -> &'static str {
+    static SOURCE: OnceLock<String> = OnceLock::new();
+    SOURCE.get_or_init(|| module_src(GEMM_KERNEL, Some(GEMM_TILE_M)))
+}
+
+fn module_src(kernel: &str, gemm_tile_m: Option<u32>) -> String {
+    let mut source = String::from(PREFIX);
+    append_u8_table(&mut source, "iq2xs_signs", &IQ2XS_SIGNS);
+    append_u64_table(&mut source, "iq2xxs_grid", &IQ2XXS_GRID);
+    append_u32_table(&mut source, "iq3xxs_grid", &IQ3XXS_GRID);
+    append_u64_table(&mut source, "iq2xs_grid", &IQ2XS_GRID);
+    append_u64_table(&mut source, "iq2s_grid", &IQ2S_GRID);
+    append_u32_table(&mut source, "iq3s_grid", &IQ3S_GRID);
+    append_u64_table(&mut source, "iq1s_grid", &IQ1S_GRID);
+    source.push_str(SUFFIX);
+    if let Some(tile_m) = gemm_tile_m {
+        writeln!(source, "#define GEMM_TILE_M {tile_m}")
+            .expect("writing CUDA source to String cannot fail");
+    }
+    source.push_str(kernel);
+    source
 }
 
 fn append_u8_table(source: &mut String, name: &str, values: &[u8]) {
@@ -518,12 +578,10 @@ impl Kernel for BlockQuantizedMatMulKernel {
                 self.k, a_shape
             )));
         }
-        let m = a_shape[..a_shape.len() - 1].iter().product::<usize>();
-        if m != 1 {
-            return Err(error(format!(
-                "CUDA currently supports only the decode GEMV path M=1, got M={m}"
-            )));
-        }
+        let m = a_shape[..a_shape.len() - 1]
+            .iter()
+            .try_fold(1usize, |product, &dim| product.checked_mul(dim))
+            .ok_or_else(|| error("A leading dimension product exceeds usize limits"))?;
         let expected_output_shape = [&a_shape[..a_shape.len() - 1], &[self.n]].concat();
         require_shape("Y", outputs[0].shape, &expected_output_shape)?;
 
@@ -551,9 +609,10 @@ impl Kernel for BlockQuantizedMatMulKernel {
             }
         }
 
-        let function = self
-            .runtime
-            .nvrtc_function(GEMV_MODULE, gemv_src(), GEMV_ENTRY)?;
+        if m == 0 {
+            return Ok(());
+        }
+
         let activation_ptr = cuptr(inputs[0].data_ptr::<u8>() as *const c_void);
         let packed_ptr = cuptr(inputs[1].data_ptr::<u8>() as *const c_void);
         let bias_ptr = bias
@@ -565,27 +624,60 @@ impl Kernel for BlockQuantizedMatMulKernel {
         let blocks = as_i32("block count", blocks)?;
         let block_bytes = as_i32("block byte count", self.format.block_bytes())?;
         let format = self.format.kernel_id();
-        let mut builder = self.runtime.stream().launch_builder(&function);
-        builder
-            .arg(&activation_ptr)
-            .arg(&packed_ptr)
-            .arg(&bias_ptr)
-            .arg(&output_ptr)
-            .arg(&k)
-            .arg(&n)
-            .arg(&blocks)
-            .arg(&block_bytes)
-            .arg(&format);
-        // SAFETY: all tensors are dense and shape-checked, and the scalar ABI
-        // matches `block_quantized_matmul_gemv_f32`.
-        unsafe {
-            builder.launch(LaunchConfig {
-                grid_dim: (self.n as u32, 1, 1),
-                block_dim: (BLOCK_THREADS, 1, 1),
-                shared_mem_bytes: 0,
-            })
+
+        if m == 1 {
+            let function = self
+                .runtime
+                .nvrtc_function(GEMV_MODULE, gemv_src(), GEMV_ENTRY)?;
+            let mut builder = self.runtime.stream().launch_builder(&function);
+            builder
+                .arg(&activation_ptr)
+                .arg(&packed_ptr)
+                .arg(&bias_ptr)
+                .arg(&output_ptr)
+                .arg(&k)
+                .arg(&n)
+                .arg(&blocks)
+                .arg(&block_bytes)
+                .arg(&format);
+            // SAFETY: all tensors are dense and shape-checked, and the scalar ABI
+            // matches `block_quantized_matmul_gemv_f32`.
+            unsafe {
+                builder.launch(LaunchConfig {
+                    grid_dim: (n as u32, 1, 1),
+                    block_dim: (BLOCK_THREADS, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+            }
+            .map_err(|err| driver_err("launch BlockQuantizedMatMul GEMV", err))?;
+        } else {
+            let function = self
+                .runtime
+                .nvrtc_function(GEMM_MODULE, gemm_src(), GEMM_ENTRY)?;
+            let m = as_i32("M", m)?;
+            let mut builder = self.runtime.stream().launch_builder(&function);
+            builder
+                .arg(&activation_ptr)
+                .arg(&packed_ptr)
+                .arg(&bias_ptr)
+                .arg(&output_ptr)
+                .arg(&m)
+                .arg(&k)
+                .arg(&n)
+                .arg(&blocks)
+                .arg(&block_bytes)
+                .arg(&format);
+            // SAFETY: all tensors are dense and shape-checked, and the scalar ABI
+            // matches `block_quantized_matmul_gemm_f32`.
+            unsafe {
+                builder.launch(LaunchConfig {
+                    grid_dim: (n as u32, (m as u32).div_ceil(GEMM_TILE_M), 1),
+                    block_dim: (BLOCK_THREADS, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+            }
+            .map_err(|err| driver_err("launch BlockQuantizedMatMul GEMM", err))?;
         }
-        .map_err(|err| driver_err("launch BlockQuantizedMatMul GEMV", err))?;
         self.runtime.synchronize()
     }
 
@@ -598,7 +690,7 @@ impl Kernel for BlockQuantizedMatMulKernel {
     }
 }
 
-pub(crate) fn supports_node(node: &Node, shapes: &[Shape]) -> bool {
+pub(crate) fn supports_node(node: &Node, _shapes: &[Shape]) -> bool {
     let format_supported = node
         .attr("format")
         .and_then(|attribute| attribute.as_str())
@@ -626,17 +718,7 @@ pub(crate) fn supports_node(node: &Node, shapes: &[Shape]) -> bool {
             .and_then(|attribute| attribute.as_int())
             .is_some_and(|value| value > 0)
     });
-    let Some(a_shape) = shapes.first() else {
-        return false;
-    };
-    let decode_shape = !a_shape.is_empty()
-        && a_shape[..a_shape.len() - 1]
-            .iter()
-            .try_fold(1usize, |product, dim| {
-                dim.as_static().and_then(|value| product.checked_mul(value))
-            })
-            == Some(1);
-    format_supported && layout_supported && attributes_valid && decode_shape
+    format_supported && layout_supported && attributes_valid
 }
 
 fn required_positive_attr(node: &Node, name: &str) -> Result<usize> {

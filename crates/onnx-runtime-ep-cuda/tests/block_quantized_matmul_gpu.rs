@@ -5,7 +5,8 @@ use onnx_runtime_ep_cpu::CpuExecutionProvider;
 use onnx_runtime_ep_cuda::CudaExecutionProvider;
 use onnx_runtime_ep_cuda::runtime::cuptr;
 use onnx_runtime_ir::{
-    Attribute, DataType, DeviceId, Graph, Node, NodeId, compute_contiguous_strides, static_shape,
+    Attribute, DataType, DeviceId, Dim, Graph, Node, NodeId, SymbolId, compute_contiguous_strides,
+    static_shape,
 };
 use onnx_runtime_loader::Model;
 
@@ -262,6 +263,15 @@ fn random_case(format: &str, k: usize, n: usize) -> (Vec<f32>, Vec<u8>, Vec<f32>
     (activations, packed, bias)
 }
 
+fn random_gemm_case(format: &str, m: usize, k: usize, n: usize) -> (Vec<f32>, Vec<u8>, Vec<f32>) {
+    let (_, packed, bias) = random_case(format, k, n);
+    let mut state = 0x6e2a_953d_b47c_018fu64 ^ m as u64 ^ ((k as u64) << 16);
+    let activations = (0..m * k)
+        .map(|_| (random_u32(&mut state) as f32 / u32::MAX as f32 - 0.5) * 3.0)
+        .collect();
+    (activations, packed, bias)
+}
+
 fn assert_close(actual: &[f32], expected: &[f32]) {
     assert_eq!(actual.len(), expected.len());
     for (index, (&actual, &expected)) in actual.iter().zip(expected).enumerate() {
@@ -292,6 +302,40 @@ fn block_quantized_gemv_random_supported_formats_match_cpu() {
         let (graph, node) = model_node(format, &[1, k], &packed_shape, &[1, n], k, n, true);
         let expected = run_cpu(&graph, node, &inputs, &[1, n]);
         let actual = run_gpu(&ep, &graph, node, &inputs, &[1, n]).unwrap();
+        assert_close(&actual, &expected);
+    }
+}
+
+#[test]
+fn block_quantized_gemm_prefill_matches_cpu_for_partial_row_tiles() {
+    let Some(ep) = gpu() else { return };
+    for (format, a_shape, k, n, with_bias) in [
+        ("mxfp4", vec![3, 99], 99usize, 13usize, true),
+        ("iq4_xs", vec![1, 7, 515], 515usize, 11usize, false),
+    ] {
+        let m = a_shape[..a_shape.len() - 1].iter().product();
+        let (qk, block_bytes) = format_info(format);
+        let packed_shape = [n, k.div_ceil(qk), block_bytes];
+        let output_shape = [&a_shape[..a_shape.len() - 1], &[n]].concat();
+        let (activations, packed, bias) = random_gemm_case(format, m, k, n);
+        let mut inputs = vec![
+            HostTensor::f32(&a_shape, &activations),
+            HostTensor::u8(&packed_shape, &packed),
+        ];
+        if with_bias {
+            inputs.push(HostTensor::f32(&[n], &bias));
+        }
+        let (graph, node) = model_node(
+            format,
+            &a_shape,
+            &packed_shape,
+            &output_shape,
+            k,
+            n,
+            with_bias,
+        );
+        let expected = run_cpu(&graph, node, &inputs, &output_shape);
+        let actual = run_gpu(&ep, &graph, node, &inputs, &output_shape).unwrap();
         assert_close(&actual, &expected);
     }
 }
@@ -466,7 +510,7 @@ fn block_quantized_iq1_known_blocks_match_cpu_semantics_on_gpu() {
 }
 
 #[test]
-fn unsupported_formats_and_prefill_route_away_from_cuda() {
+fn supported_formats_and_prefill_route_to_cuda() {
     let Some(ep) = gpu() else { return };
     for format in [
         "mxfp4", "iq4_nl", "iq4_xs", "iq2_xxs", "iq3_xxs", "iq2_xs", "iq2_s", "iq3_s", "iq1_s",
@@ -522,7 +566,21 @@ fn unsupported_formats_and_prefill_route_away_from_cuda() {
                 &[static_shape([2, qk]), static_shape([1, 1, block_bytes])],
                 &[]
             ),
-            KernelMatch::Unsupported
+            KernelMatch::Supported { .. }
         ));
     }
+
+    let (graph, node) = model_node("mxfp4", &[2, 32], &[1, 1, 17], &[2, 1], 32, 1, false);
+    let model = Model::new(&graph);
+    assert!(matches!(
+        ep.supports_op(
+            model.graph.node(node),
+            &[
+                vec![Dim::Symbolic(SymbolId(0)), Dim::Static(32)],
+                static_shape([1, 1, 17]),
+            ],
+            &[]
+        ),
+        KernelMatch::Supported { .. }
+    ));
 }
