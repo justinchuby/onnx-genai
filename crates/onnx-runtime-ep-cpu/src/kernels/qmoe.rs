@@ -350,6 +350,11 @@ impl QuantizedExperts {
                 "{name} input features {in_features} must be divisible by pack_size {pack_size}"
             )));
         }
+        if !in_features.is_multiple_of(block_size) {
+            return Err(error(format!(
+                "{name} input features {in_features} must be divisible by block_size {block_size}"
+            )));
+        }
         let packed_in = in_features / pack_size;
         let expert_rows = checked_product(
             &[experts, out_features],
@@ -389,15 +394,6 @@ impl QuantizedExperts {
             .ok_or_else(|| error(format!("{name} zero-point row byte count overflow")))?
             / pack_size;
         if let Some(points) = zero_points {
-            let affine_block = block_size
-                .checked_mul(pack_size)
-                .ok_or_else(|| error(format!("{name} affine block width overflow")))?;
-            if !in_features.is_multiple_of(affine_block) {
-                return Err(error(format!(
-                    "{name} input features {in_features} must be divisible by block_size * \
-                     pack_size ({affine_block}) when zero points are supplied"
-                )));
-            }
             let zero_point_elements = checked_product(
                 &[expert_rows, zero_point_bytes],
                 &format!("{name} zero-point element count"),
@@ -496,9 +492,13 @@ fn checked_product(factors: &[usize], context: &str) -> Result<usize> {
 }
 
 fn checked_byte_count(elements: usize, element_size: usize, context: &str) -> Result<usize> {
-    elements
+    let bytes = elements
         .checked_mul(element_size)
-        .ok_or_else(|| error(format!("{context} overflow")))
+        .ok_or_else(|| error(format!("{context} overflow")))?;
+    if bytes > isize::MAX as usize {
+        return Err(error(format!("{context} exceeds isize::MAX")));
+    }
+    Ok(bytes)
 }
 
 fn checked_tensor_layout(name: &str, shape: &[usize], dtype: DataType) -> Result<usize> {
@@ -904,6 +904,11 @@ mod tests {
     }
 
     #[test]
+    fn qmoe_int4_odd_blocks_affine_matches_float_moe() {
+        run_equivalence(4, 48, 48, 16, 1, false, true);
+    }
+
+    #[test]
     fn qmoe_top2_normalized_matches_float_moe() {
         run_equivalence(4, 16, 16, 16, 2, true, false);
     }
@@ -978,6 +983,33 @@ mod tests {
         );
 
         assert_kernel_failure_contains(result, "input 0 element count overflow");
+    }
+
+    #[test]
+    fn qmoe_rejects_isize_max_exceeding_byte_count_before_allocation() {
+        let hidden = isize::MAX as usize / std::mem::size_of::<f32>() + 1;
+        let x = tiny_owned(DataType::Float32, &[1, hidden]);
+        let router = tiny_owned(DataType::Float32, &[1, 1]);
+        let fc1_packed = tiny_owned(DataType::Uint8, &[1, 16, hidden / 2]);
+        let fc1_scales = tiny_owned(DataType::Float32, &[1, 16, hidden / 16]);
+        let fc2_packed = tiny_owned(DataType::Uint8, &[1, hidden, 8]);
+        let fc2_scales = tiny_owned(DataType::Float32, &[1, hidden, 1]);
+        let mut output = tiny_owned(DataType::Float32, &[1, hidden]);
+
+        let result = overflow_test_kernel().execute(
+            &[
+                x.view(),
+                router.view(),
+                fc1_packed.view(),
+                fc1_scales.view(),
+                TensorView::absent(DataType::Float32),
+                fc2_packed.view(),
+                fc2_scales.view(),
+            ],
+            &mut [output.view_mut()],
+        );
+
+        assert_kernel_failure_contains(result, "input 0 byte count exceeds isize::MAX");
     }
 
     #[test]
