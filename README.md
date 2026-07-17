@@ -169,6 +169,29 @@ ONNX_GENAI_EP=webgpu ./target/release/onnx-genai-server --model models/qwen2.5-0
 ONNX_GENAI_EP=coreml ./target/release/onnx-genai-server --model models/qwen2.5-0.5b
 ```
 
+#### Plugin execution providers (any ORT ≥ 1.22 EP)
+
+Any ONNX Runtime execution-provider plugin shared library can be loaded
+generically — the provider name is discovered from the plugin, never hardcoded.
+For example, using the [`onnxruntime-ep-openvino`](https://pypi.org/project/onnxruntime-ep-openvino/)
+pip package:
+
+```bash
+ONNX_GENAI_EP=plugin \
+ONNX_GENAI_EP_LIBRARY=/path/to/onnxruntime_providers_openvino_plugin.dll \
+ONNX_GENAI_EP_DEVICE=CPU \
+ONNX_GENAI_EP_OPTIONS=num_streams=2 \
+  ./target/release/onnx-genai-server --model models/qwen2.5-0.5b
+```
+
+- `ONNX_GENAI_EP_LIBRARY` (required): path to the plugin shared library.
+- `ONNX_GENAI_EP_DEVICE` (optional): narrows a multi-device plugin to one
+  hardware class — `CPU`, `GPU`, or `NPU` (ORT's generic device enum).
+- `ONNX_GENAI_EP_OPTIONS` (optional): provider-defined `key=value,key=value`
+  options passed straight through.
+- `ONNX_GENAI_EP_NAME` (optional): registration handle; defaults to the library
+  file name.
+
 ## Security
 
 The server defaults to `127.0.0.1:8080` and has **no built-in

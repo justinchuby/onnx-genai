@@ -21,6 +21,19 @@ pub enum ExecutionProvider {
     CoreML,
     Qnn,
     OpenVINO,
+    /// A generic execution-provider plugin loaded from a shared library at
+    /// runtime. The concrete provider (OpenVINO, NV TensorRT RTX, ...) is
+    /// discovered from the plugin's registered devices, so no provider name is
+    /// hardcoded in onnx-genai.
+    Plugin {
+        library: std::path::PathBuf,
+        registration_name: String,
+        options: Vec<(String, String)>,
+        /// Optional hardware-device class (`CPU`/`GPU`/`NPU`) used to narrow a
+        /// multi-device plugin to a single device. Matched against ORT's generic
+        /// `OrtHardwareDeviceType`, never a provider-specific device name.
+        device: Option<String>,
+    },
 }
 
 /// Session configuration options.
@@ -730,9 +743,30 @@ fn execution_providers_from_env() -> Option<Vec<ExecutionProvider>> {
         },
         ConfigExecutionProvider::Metal => ExecutionProvider::Metal,
         ConfigExecutionProvider::CoreMl => ExecutionProvider::CoreML,
+        ConfigExecutionProvider::Plugin => match runtime_config().ep_library.clone() {
+            Some(library) => {
+                let config = runtime_config();
+                let registration_name = config
+                    .ep_registration_name
+                    .clone()
+                    .unwrap_or_else(|| plugin_registration_name_from_path(&library));
+                ExecutionProvider::Plugin {
+                    library,
+                    registration_name,
+                    options: config.ep_options.clone(),
+                    device: config.ep_device.clone(),
+                }
+            }
+            None => {
+                tracing::warn!(
+                    "ONNX_GENAI_EP=plugin requires ONNX_GENAI_EP_LIBRARY to point to an ORT execution-provider plugin shared library; falling back to CPU"
+                );
+                ExecutionProvider::Cpu
+            }
+        },
         ConfigExecutionProvider::Unsupported(other) => {
             tracing::warn!(
-                "Ignoring unsupported ONNX_GENAI_EP={other}; expected cpu, webgpu, cuda, metal, or coreml"
+                "Ignoring unsupported ONNX_GENAI_EP={other}; expected cpu, webgpu, cuda, metal, coreml, or plugin"
             );
             ExecutionProvider::Cpu
         }
@@ -957,6 +991,19 @@ fn append_execution_provider(
             &[],
             available,
         ),
+        ExecutionProvider::Plugin {
+            library,
+            registration_name,
+            options,
+            device,
+        } => append_plugin_execution_provider(
+            env,
+            session_options,
+            registration_name,
+            library,
+            options,
+            device.as_deref(),
+        ),
         other => {
             tracing::warn!(
                 "Execution provider {:?} is not wired in onnx-genai-ort; falling back to CPU",
@@ -967,15 +1014,57 @@ fn append_execution_provider(
     }
 }
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn append_metal_execution_provider(
+/// Derive a stable registration handle for a plugin library from its file name.
+///
+/// This is only an opaque handle passed to ORT's
+/// `RegisterExecutionProviderLibrary`; it does not need to match (and must not
+/// be confused with) the provider's internal EP name.
+fn plugin_registration_name_from_path(path: &std::path::Path) -> String {
+    path.file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .filter(|stem| !stem.is_empty())
+        .unwrap_or_else(|| "onnx_genai_ep_plugin".to_string())
+}
+
+/// Map a portable hardware-device class string to ORT's generic
+/// `OrtHardwareDeviceType`. Accepts `CPU`, `GPU`, and `NPU` case-insensitively.
+/// This is intentionally provider-agnostic: it never matches a vendor's device
+/// name, only ORT's own hardware-class enum.
+fn parse_hardware_device_type(
+    value: &str,
+) -> Option<onnx_genai_ort_sys::OrtHardwareDeviceType> {
+    match value.trim().to_ascii_uppercase().as_str() {
+        "CPU" => Some(onnx_genai_ort_sys::OrtHardwareDeviceType_CPU),
+        "GPU" => Some(onnx_genai_ort_sys::OrtHardwareDeviceType_GPU),
+        "NPU" => Some(onnx_genai_ort_sys::OrtHardwareDeviceType_NPU),
+        _ => None,
+    }
+}
+
+/// Register an ORT execution-provider plugin shared library and append every
+/// device it contributes to `session_options`.
+///
+/// The plugin's provider is identified WITHOUT hardcoding its name: we snapshot
+/// the environment's EP devices before registration and append only the devices
+/// that appear afterwards. This mirrors the documented plugin-EP registration
+/// flow (`RegisterExecutionProviderLibrary` + `GetEpDevices` +
+/// `SessionOptionsAppendExecutionProvider_V2`) used by packages such as
+/// `onnxruntime-ep-openvino`, so it works for any ORT >= 1.22 plugin EP
+/// (OpenVINO, NV TensorRT RTX, QNN, ...).
+fn append_plugin_execution_provider(
     env: &Environment,
     session_options: *mut onnx_genai_ort_sys::OrtSessionOptions,
+    registration_name: &str,
+    plugin_path: &std::path::Path,
+    options: &[(String, String)],
+    device_class: Option<&str>,
 ) -> Result<()> {
-    const REGISTRATION_NAME: &str = "MLXExecutionProvider";
-
-    let plugin_path = metal_plugin_path()?;
-    env.register_execution_provider_library(REGISTRATION_NAME, &plugin_path)?;
+    if !plugin_path.is_file() {
+        return Err(OrtError::InvalidArgument(format!(
+            "execution provider plugin library not found at {}",
+            plugin_path.display()
+        )));
+    }
 
     let api = crate::error::api()?;
     let get_ep_devices = api
@@ -990,60 +1079,210 @@ fn append_metal_execution_provider(
             "SessionOptionsAppendExecutionProvider_V2",
         ))?;
 
-    let mut ep_devices = std::ptr::null();
-    let mut ep_device_count = 0;
-    // SAFETY: the environment is live, and both output pointers are valid.
-    crate::error::check_status(unsafe {
-        get_ep_devices(env.as_ptr(), &mut ep_devices, &mut ep_device_count)
-    })?;
-    if ep_devices.is_null() {
-        return Err(OrtError::InvalidArgument(
-            "MLXExecutionProvider registered but ONNX Runtime returned no execution provider devices".into(),
-        ));
-    }
-
-    let mut selected = Vec::new();
-    for index in 0..ep_device_count {
-        // SAFETY: ORT returned an array containing `ep_device_count` entries.
-        let device = unsafe { *ep_devices.add(index) };
-        if device.is_null() {
-            continue;
+    // Query the environment's current EP devices as a list of raw pointers.
+    let query_devices = || -> Result<Vec<*const onnx_genai_ort_sys::OrtEpDevice>> {
+        let mut devices_ptr: *const *const onnx_genai_ort_sys::OrtEpDevice = std::ptr::null();
+        let mut count = 0usize;
+        // SAFETY: the environment is live; both output pointers are valid.
+        crate::error::check_status(unsafe {
+            get_ep_devices(env.as_ptr(), &mut devices_ptr, &mut count)
+        })?;
+        let mut out = Vec::new();
+        if !devices_ptr.is_null() {
+            for index in 0..count {
+                // SAFETY: ORT returned an array of `count` entries.
+                let device = unsafe { *devices_ptr.add(index) };
+                if !device.is_null() {
+                    out.push(device);
+                }
+            }
         }
-        // SAFETY: `device` is owned by the environment and valid while it is live.
+        Ok(out)
+    };
+    // Read an EP device's provider name (discovered, never hardcoded).
+    let name_of = |device: *const onnx_genai_ort_sys::OrtEpDevice| -> Option<String> {
+        // SAFETY: `device` is owned by the live environment.
         let name_ptr = unsafe { ep_name(device) };
-        if !name_ptr.is_null()
-            // SAFETY: ORT execution provider names are NUL-terminated strings.
-            && unsafe { CStr::from_ptr(name_ptr) }.to_bytes() == REGISTRATION_NAME.as_bytes()
-        {
-            selected.push(device);
+        if name_ptr.is_null() {
+            return None;
+        }
+        // SAFETY: ORT EP names are NUL-terminated strings.
+        Some(
+            unsafe { CStr::from_ptr(name_ptr) }
+                .to_string_lossy()
+                .into_owned(),
+        )
+    };
+
+    // Snapshot the EP-name multiset before registering so we can identify the
+    // devices the plugin contributes without knowing its name in advance.
+    let mut before_counts: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    for device in query_devices()? {
+        if let Some(name) = name_of(device) {
+            *before_counts.entry(name).or_insert(0) += 1;
         }
     }
+    let before = before_counts;
+
+    env.register_execution_provider_library(registration_name, plugin_path)?;
+
+    // After registration, group the environment's EP devices by provider name.
+    // The plugin's provider is the one whose device count grew (its name is
+    // discovered here, never hardcoded). Selecting devices that all share this
+    // single provider name satisfies ORT's requirement that every device passed
+    // to `SessionOptionsAppendExecutionProvider_V2` belongs to the same EP.
+    let after: Vec<(*const onnx_genai_ort_sys::OrtEpDevice, String)> = query_devices()?
+        .into_iter()
+        .filter_map(|device| name_of(device).map(|name| (device, name)))
+        .collect();
+    let mut after_counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for (_, name) in &after {
+        *after_counts.entry(name.as_str()).or_insert(0) += 1;
+    }
+    let mut new_names: Vec<&str> = after_counts
+        .iter()
+        .filter(|(name, count)| **count > before.get(**name).copied().unwrap_or(0))
+        .map(|(name, _)| *name)
+        .collect();
+    new_names.sort_unstable();
+
+    // A plugin may expose several provider groupings (e.g. OpenVINO registers
+    // both `OpenVINOExecutionProvider` and virtual `OpenVINOExecutionProvider.AUTO`
+    // devices). ORT requires every device appended in one call to share a single
+    // EP, so choose one provider group deterministically: prefer the base
+    // provider name (no `.` suffix) over virtual variants, else the first sorted.
+    let target_name = new_names
+        .iter()
+        .find(|name| !name.contains('.'))
+        .or_else(|| new_names.first())
+        .map(|name| (*name).to_owned());
+    let target_name = match target_name {
+        Some(name) => name,
+        None => {
+            return Err(OrtError::InvalidArgument(format!(
+                "execution provider plugin '{registration_name}' registered from {} but contributed no new execution-provider devices",
+                plugin_path.display()
+            )));
+        }
+    };
+
+    let mut selected: Vec<*const onnx_genai_ort_sys::OrtEpDevice> = after
+        .iter()
+        .filter(|(_, name)| *name == target_name)
+        .map(|(device, _)| *device)
+        .collect();
+    let selected_name = Some(target_name);
+
     if selected.is_empty() {
-        return Err(OrtError::InvalidArgument(
-            "MLXExecutionProvider device not found after registering the onnxruntime-mlx plugin"
-                .into(),
-        ));
+        return Err(OrtError::InvalidArgument(format!(
+            "execution provider plugin '{registration_name}' registered from {} but contributed no execution-provider devices",
+            plugin_path.display()
+        )));
     }
 
-    // SAFETY: the selected devices belong to this live environment, the session
-    // options handle is valid, and no provider-specific options are required.
+    // If the caller asked for a specific hardware-device class (CPU/GPU/NPU),
+    // narrow the selection to a single matching device. A plugin may expose one
+    // EP name spanning several hardware devices (e.g. OpenVINO advertising both
+    // GPU and CPU); ORT's `AppendExecutionProvider_V2` chooses a device from the
+    // list it is given, so filtering here is how a portable device request is
+    // honoured. The class is matched against ORT's generic `OrtHardwareDeviceType`
+    // enum, never a provider-specific device string.
+    if let Some(requested) = device_class {
+        if let Some(wanted) = parse_hardware_device_type(requested) {
+            if let (Some(ep_device_device), Some(hw_type)) =
+                (api.EpDevice_Device, api.HardwareDevice_Type)
+            {
+                let matching: Vec<*const onnx_genai_ort_sys::OrtEpDevice> = selected
+                    .iter()
+                    .copied()
+                    .filter(|device| {
+                        // SAFETY: `device` is owned by the live environment; the
+                        // returned hardware handle is owned by ORT.
+                        let hw = unsafe { ep_device_device(*device) };
+                        !hw.is_null() && unsafe { hw_type(hw) } == wanted
+                    })
+                    .collect();
+                if matching.is_empty() {
+                    return Err(OrtError::InvalidArgument(format!(
+                        "execution provider plugin '{registration_name}' exposes no {requested} device; \
+                         unset ONNX_GENAI_EP_DEVICE or choose an available hardware class"
+                    )));
+                }
+                // Keep a single device so the plugin cannot silently fall back to
+                // a different one.
+                selected = vec![matching[0]];
+            }
+        } else {
+            tracing::warn!(
+                requested,
+                "ONNX_GENAI_EP_DEVICE is not a recognized hardware class (expected CPU, GPU, or NPU); ignoring"
+            );
+        }
+    }
+
+    // Provider options are provider-defined; pass keys/values through verbatim.
+    let option_keys = options
+        .iter()
+        .map(|(key, _)| {
+            CString::new(key.as_str())
+                .map_err(|_| OrtError::InvalidArgument("EP option key contains NUL".into()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let option_values = options
+        .iter()
+        .map(|(_, value)| {
+            CString::new(value.as_str())
+                .map_err(|_| OrtError::InvalidArgument("EP option value contains NUL".into()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let key_ptrs = option_keys.iter().map(|k| k.as_ptr()).collect::<Vec<_>>();
+    let value_ptrs = option_values.iter().map(|v| v.as_ptr()).collect::<Vec<_>>();
+    let (key_ptr, value_ptr) = if options.is_empty() {
+        (std::ptr::null(), std::ptr::null())
+    } else {
+        (key_ptrs.as_ptr(), value_ptrs.as_ptr())
+    };
+
+    // SAFETY: selected devices belong to the live environment; the session
+    // options handle is valid; the key/value arrays each hold `options.len()`
+    // NUL-terminated strings that outlive the call.
     crate::error::check_status(unsafe {
         append(
             session_options,
             env.as_ptr().cast_mut(),
             selected.as_ptr(),
             selected.len(),
-            std::ptr::null(),
-            std::ptr::null(),
-            0,
+            key_ptr,
+            value_ptr,
+            options.len(),
         )
     })?;
     tracing::info!(
         plugin = %plugin_path.display(),
+        registration = registration_name,
+        provider = selected_name.as_deref().unwrap_or("<unknown>"),
         devices = selected.len(),
-        "Enabled ONNX Runtime Metal plugin execution provider"
+        "Enabled ONNX Runtime execution provider plugin"
     );
     Ok(())
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn append_metal_execution_provider(
+    env: &Environment,
+    session_options: *mut onnx_genai_ort_sys::OrtSessionOptions,
+) -> Result<()> {
+    let plugin_path = metal_plugin_path()?;
+    let registration_name = plugin_registration_name_from_path(&plugin_path);
+    append_plugin_execution_provider(
+        env,
+        session_options,
+        &registration_name,
+        &plugin_path,
+        &[],
+        None,
+    )
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -1453,6 +1692,62 @@ mod tests {
             &[ExecutionProvider::Metal],
             true
         ));
+    }
+
+    #[test]
+    fn parse_hardware_device_type_accepts_generic_classes() {
+        assert_eq!(
+            parse_hardware_device_type("cpu"),
+            Some(onnx_genai_ort_sys::OrtHardwareDeviceType_CPU)
+        );
+        assert_eq!(
+            parse_hardware_device_type(" GPU "),
+            Some(onnx_genai_ort_sys::OrtHardwareDeviceType_GPU)
+        );
+        assert_eq!(
+            parse_hardware_device_type("Npu"),
+            Some(onnx_genai_ort_sys::OrtHardwareDeviceType_NPU)
+        );
+        assert_eq!(parse_hardware_device_type("OpenVINO"), None);
+    }
+
+    #[test]
+    fn plugin_registration_name_derives_from_file_stem() {
+        assert_eq!(
+            plugin_registration_name_from_path(std::path::Path::new(
+                "/opt/libonnxruntime_ep_openvino.so"
+            )),
+            "libonnxruntime_ep_openvino"
+        );
+        assert_eq!(
+            plugin_registration_name_from_path(std::path::Path::new(
+                "onnxruntime_ep_openvino.dll"
+            )),
+            "onnxruntime_ep_openvino"
+        );
+    }
+
+    #[test]
+    fn plugin_missing_library_reports_clear_error() {
+        let env = Environment::new("plugin-missing-test").expect("environment");
+        let error = append_execution_provider(
+            &env,
+            std::ptr::null_mut(),
+            &ExecutionProvider::Plugin {
+                library: std::path::PathBuf::from("/nonexistent/onnxruntime_ep_openvino.so"),
+                registration_name: "openvino_ep".to_string(),
+                options: Vec::new(),
+                device: None,
+            },
+            false,
+            &[],
+        )
+        .expect_err("missing plugin library must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("execution provider plugin library not found")
+        );
     }
 
     #[cfg(not(feature = "cuda"))]
