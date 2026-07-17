@@ -31,13 +31,88 @@
 //! Channels at or beyond `rotary_embedding_dim` pass through unrotated.
 
 use std::borrow::Cow;
-use std::ffi::c_void;
 use std::sync::Arc;
 
+use cudarc::driver::{LaunchConfig, PushKernelArg};
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ir::{DataType, Node};
 
+use crate::error::driver_err;
 use crate::runtime::{CudaRuntime, cuptr};
+
+const BLOCK: u32 = 256;
+const ROTARY_EMBEDDING_MODULE: &str = "rotary_embedding_f32_v1";
+const ROTARY_EMBEDDING_SOURCE: &str = r#"
+extern "C" __global__ void rotary_embedding_f32(
+    const float* x, const float* cos_cache, const float* sin_cache,
+    const long long* position_ids, float* y,
+    unsigned long long batch, unsigned long long seq,
+    unsigned long long heads, unsigned long long head_size,
+    unsigned long long rotary_dim, unsigned long long cache_rows,
+    int is_4d, int interleaved, int has_position_ids,
+    unsigned long long elements) {
+  for (unsigned long long i = blockIdx.x * blockDim.x + threadIdx.x; i < elements;
+       i += (unsigned long long)gridDim.x * blockDim.x) {
+    unsigned long long b, h, s, d;
+    if (is_4d) {
+      d = i % head_size;
+      unsigned long long rem = i / head_size;
+      s = rem % seq;
+      rem /= seq;
+      h = rem % heads;
+      b = rem / heads;
+    } else {
+      d = i % head_size;
+      unsigned long long rem = i / head_size;
+      h = rem % heads;
+      rem /= heads;
+      s = rem % seq;
+      b = rem / seq;
+    }
+
+    if (d >= rotary_dim) {
+      y[i] = x[i];
+      continue;
+    }
+
+    const unsigned long long half = rotary_dim / 2;
+    const long long cache_row = has_position_ids
+        ? position_ids[b * seq + s]
+        : (long long)(b * seq + s);
+    // ONNX-valid inputs always take the rotation path. The guard prevents an
+    // invalid device position from indexing outside the cache.
+    if (cache_row < 0 || (unsigned long long)cache_row >= cache_rows) {
+      y[i] = x[i];
+      continue;
+    }
+
+    unsigned long long k, partner;
+    if (interleaved) {
+      k = d / 2;
+      partner = d ^ 1ULL;
+    } else if (d < half) {
+      k = d;
+      partner = d + half;
+    } else {
+      k = d - half;
+      partner = d - half;
+    }
+    const float cos = cos_cache[(unsigned long long)cache_row * half + k];
+    const float sin = sin_cache[(unsigned long long)cache_row * half + k];
+    if (interleaved) {
+      if ((d & 1ULL) == 0) {
+        y[i] = __fsub_rn(__fmul_rn(cos, x[i]), __fmul_rn(sin, x[partner + i - d]));
+      } else {
+        y[i] = __fadd_rn(__fmul_rn(sin, x[partner + i - d]), __fmul_rn(cos, x[i]));
+      }
+    } else if (d < half) {
+      y[i] = __fsub_rn(__fmul_rn(cos, x[i]), __fmul_rn(sin, x[partner + i - d]));
+    } else {
+      y[i] = __fadd_rn(__fmul_rn(sin, x[partner + i - d]), __fmul_rn(cos, x[i]));
+    }
+  }
+}
+"#;
 
 /// Return the claim-time dtype denial for RoPE's floating-point inputs.
 pub(crate) fn unsupported_reason(input_dtypes: &[DataType]) -> Option<Cow<'static, str>> {
@@ -71,57 +146,6 @@ fn check_arity(
     }
     Ok(())
 }
-fn read_bytes(runtime: &CudaRuntime, view: &TensorView) -> Result<Vec<u8>> {
-    if !view.is_contiguous() {
-        return Err(EpError::KernelFailed(
-            "RotaryEmbedding: non-contiguous input".into(),
-        ));
-    }
-    let mut bytes = vec![0; view.dtype.storage_bytes(view.numel())];
-    unsafe {
-        runtime.dtoh(&mut bytes, cuptr(view.data_ptr::<u8>() as *const c_void))?;
-    }
-    Ok(bytes)
-}
-fn read_f32(runtime: &CudaRuntime, view: &TensorView) -> Result<Vec<f32>> {
-    if view.dtype != onnx_runtime_ir::DataType::Float32 {
-        return Err(EpError::KernelFailed("RotaryEmbedding: f32 only".into()));
-    }
-    Ok(read_bytes(runtime, view)?
-        .chunks_exact(4)
-        .map(|b| f32::from_ne_bytes(b.try_into().unwrap()))
-        .collect())
-}
-fn read_i64(runtime: &CudaRuntime, view: &TensorView) -> Result<Vec<i64>> {
-    if view.dtype != onnx_runtime_ir::DataType::Int64 {
-        return Err(EpError::KernelFailed(
-            "RotaryEmbedding: position_ids must be int64".into(),
-        ));
-    }
-    Ok(read_bytes(runtime, view)?
-        .chunks_exact(8)
-        .map(|b| i64::from_ne_bytes(b.try_into().unwrap()))
-        .collect())
-}
-fn write_f32(runtime: &CudaRuntime, output: &mut TensorMut, values: &[f32]) -> Result<()> {
-    if output.dtype != onnx_runtime_ir::DataType::Float32
-        || !output.is_contiguous()
-        || output.numel() != values.len()
-    {
-        return Err(EpError::KernelFailed(
-            "RotaryEmbedding: invalid f32 output".into(),
-        ));
-    }
-    let bytes = unsafe {
-        std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), std::mem::size_of_val(values))
-    };
-    let ptr = cuptr(output.data_ptr_mut::<u8>() as *const c_void);
-    unsafe {
-        runtime.htod(bytes, ptr)?;
-    }
-    Ok(())
-}
-
 /// f32 RotaryEmbedding kernel carrying the resolved attributes.
 pub struct RotaryEmbeddingKernel {
     runtime: Arc<CudaRuntime>,
@@ -164,16 +188,28 @@ impl KernelFactory for RotaryEmbeddingFactory {
 impl Kernel for RotaryEmbeddingKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         check_arity("RotaryEmbedding", inputs, outputs, 3, 4, 1)?;
-        // Inputs may have been uploaded asynchronously on the EP stream.
-        self.runtime.synchronize()?;
-        let x = read_f32(&self.runtime, &inputs[0])?;
-        let cos_cache = read_f32(&self.runtime, &inputs[1])?;
-        let sin_cache = read_f32(&self.runtime, &inputs[2])?;
-        let position_ids = if inputs.len() == 4 {
-            Some(read_i64(&self.runtime, &inputs[3])?)
-        } else {
-            None
-        };
+        if inputs[..3]
+            .iter()
+            .any(|input| input.dtype != DataType::Float32)
+        {
+            return Err(EpError::KernelFailed("RotaryEmbedding: f32 only".into()));
+        }
+        if inputs.iter().any(|input| !input.is_contiguous()) || !outputs[0].is_contiguous() {
+            return Err(EpError::KernelFailed(
+                "RotaryEmbedding: non-contiguous input/output".into(),
+            ));
+        }
+        if outputs[0].dtype != DataType::Float32 || outputs[0].numel() != inputs[0].numel() {
+            return Err(EpError::KernelFailed(
+                "RotaryEmbedding: invalid f32 output".into(),
+            ));
+        }
+        let has_position_ids = inputs.len() == 4;
+        if has_position_ids && inputs[3].dtype != DataType::Int64 {
+            return Err(EpError::KernelFailed(
+                "RotaryEmbedding: position_ids must be int64".into(),
+            ));
+        }
 
         let x_shape = inputs[0].shape;
         // Resolve batch/heads/seq/head_size in the canonical [B, S, H, D] view.
@@ -224,108 +260,91 @@ impl Kernel for RotaryEmbeddingKernel {
 
         // Zero-sized input: nothing to rotate. Emit an empty output rather than
         // underflowing on the `batch-1`/`seq-1` bounds computation below.
-        if x.is_empty() {
-            return write_f32(&self.runtime, &mut outputs[0], &[]);
+        if inputs[0].numel() == 0 {
+            return Ok(());
         }
 
         // With `position_ids` present, validate its shape matches [batch, seq].
-        if let Some(pos) = &position_ids {
+        if has_position_ids {
             let pos_shape = inputs[3].shape;
             let expected = batch * seq;
-            if pos.len() != expected {
+            if inputs[3].numel() != expected {
                 return Err(EpError::KernelFailed(format!(
                     "RotaryEmbedding: position_ids has {} elements, expected {expected} ([batch={batch}, seq={seq}]); shape {pos_shape:?}",
-                    pos.len()
+                    inputs[3].numel()
                 )));
             }
         }
 
-        // cos/sin lookup: with position_ids the caches are 2D [max_pos, half]
-        // gathered by position; without, they are 3D [batch, seq, half]. Every
-        // requested row is bounds-checked (a gathered position may exceed the
-        // cache extent even when the final position does not).
-        let cache_stride = half; // last-dim size of both cache layouts
-        let cache_row = |b: usize, s: usize| -> Result<usize> {
-            let row = if let Some(pos) = &position_ids {
-                let p = pos[b * seq + s];
-                if p < 0 {
-                    return Err(EpError::KernelFailed(
-                        "RotaryEmbedding: negative position id".into(),
-                    ));
-                }
-                usize::try_from(p).map_err(|_| {
-                    EpError::KernelFailed(
-                        "RotaryEmbedding: position id exceeds supported range".into(),
-                    )
-                })?
-            } else {
-                b * seq + s
-            };
-            let offset = row.checked_mul(cache_stride).ok_or_else(|| {
-                EpError::KernelFailed(format!(
-                    "RotaryEmbedding: position {row} exceeds cos/sin cache extent"
-                ))
-            })?;
-            let end = offset.checked_add(half).ok_or_else(|| {
-                EpError::KernelFailed(format!(
-                    "RotaryEmbedding: position {row} exceeds cos/sin cache extent"
-                ))
-            })?;
-            if offset > cos_cache.len()
-                || end > cos_cache.len()
-                || offset > sin_cache.len()
-                || end > sin_cache.len()
-            {
-                return Err(EpError::KernelFailed(format!(
-                    "RotaryEmbedding: position {row} exceeds cos/sin cache extent (row width {half})"
-                )));
-            }
-            Ok(offset)
-        };
-
-        // Flat index of element (b, h, s, d) in X's native layout.
-        let idx = |b: usize, h: usize, s: usize, d: usize| -> usize {
-            if is_4d {
-                // [B, H, S, D]
-                ((b * heads + h) * seq + s) * head_size + d
-            } else {
-                // [B, S, H*D]
-                (b * seq + s) * (heads * head_size) + h * head_size + d
-            }
-        };
-
-        let mut y = vec![0.0f32; x.len()];
-        for b in 0..batch {
-            for s in 0..seq {
-                let crow = cache_row(b, s)?;
-                for h in 0..heads {
-                    // Rotary sub-vector.
-                    for k in 0..half {
-                        let cos = cos_cache[crow + k];
-                        let sin = sin_cache[crow + k];
-                        let (d1, d2) = if self.interleaved {
-                            (2 * k, 2 * k + 1)
-                        } else {
-                            (k, k + half)
-                        };
-                        let x1 = x[idx(b, h, s, d1)];
-                        let x2 = x[idx(b, h, s, d2)];
-                        y[idx(b, h, s, d1)] = cos * x1 - sin * x2;
-                        y[idx(b, h, s, d2)] = sin * x1 + cos * x2;
-                    }
-                    // Pass-through channels beyond the rotary sub-vector.
-                    for d in rotary_dim..head_size {
-                        y[idx(b, h, s, d)] = x[idx(b, h, s, d)];
-                    }
-                }
-            }
+        let cache_rows = inputs[1].numel() / half;
+        if inputs[2].numel() / half != cache_rows
+            || (!has_position_ids && cache_rows < batch.saturating_mul(seq))
+        {
+            return Err(EpError::KernelFailed(format!(
+                "RotaryEmbedding: cos/sin cache extent invalid for row width {half}"
+            )));
         }
 
-        write_f32(&self.runtime, &mut outputs[0], &y)?;
-        self.runtime.synchronize()
+        let func = self.runtime.nvrtc_function(
+            ROTARY_EMBEDDING_MODULE,
+            ROTARY_EMBEDDING_SOURCE,
+            "rotary_embedding_f32",
+        )?;
+        let x_ptr = cuptr(inputs[0].data_ptr::<f32>().cast());
+        let cos_ptr = cuptr(inputs[1].data_ptr::<f32>().cast());
+        let sin_ptr = cuptr(inputs[2].data_ptr::<f32>().cast());
+        let position_ids_ptr = inputs
+            .get(3)
+            .map(|input| cuptr(input.data_ptr::<i64>().cast()))
+            .unwrap_or(0);
+        let output_ptr = cuptr(outputs[0].data_ptr_mut::<f32>().cast());
+        let batch = batch as u64;
+        let seq = seq as u64;
+        let heads = heads as u64;
+        let head_size = head_size as u64;
+        let rotary_dim = rotary_dim as u64;
+        let cache_rows = cache_rows as u64;
+        let is_4d = i32::from(is_4d);
+        let interleaved = i32::from(self.interleaved);
+        let has_position_ids = i32::from(has_position_ids);
+        let elements = inputs[0].numel() as u64;
+        let mut builder = self.runtime.stream().launch_builder(&func);
+        builder
+            .arg(&x_ptr)
+            .arg(&cos_ptr)
+            .arg(&sin_ptr)
+            .arg(&position_ids_ptr)
+            .arg(&output_ptr)
+            .arg(&batch)
+            .arg(&seq)
+            .arg(&heads)
+            .arg(&head_size)
+            .arg(&rotary_dim)
+            .arg(&cache_rows)
+            .arg(&is_4d)
+            .arg(&interleaved)
+            .arg(&has_position_ids)
+            .arg(&elements);
+        unsafe {
+            builder.launch(LaunchConfig {
+                grid_dim: (
+                    elements.div_ceil(BLOCK as u64).min(65_535).max(1) as u32,
+                    1,
+                    1,
+                ),
+                block_dim: (BLOCK, 1, 1),
+                shared_mem_bytes: 0,
+            })
+        }
+        .map_err(|error| driver_err("launch rotary_embedding_f32", error))
+        .map(|_| ())
     }
 
     fn supports_strided_input(&self, _input_idx: usize) -> bool {
         false
+    }
+
+    fn cuda_graph_compatible(&self) -> bool {
+        true
     }
 }

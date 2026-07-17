@@ -79,6 +79,12 @@ fn standard_attention_and_rope_claim_only_f32_and_require_contiguous_inputs() {
             !kernel.supports_strided_input(0),
             "{op_type} must request contiguous inputs"
         );
+        if op_type == "RotaryEmbedding" {
+            assert!(
+                kernel.cuda_graph_compatible(),
+                "GPU-native RotaryEmbedding should be CUDA graph compatible"
+            );
+        }
     }
 }
 
@@ -337,4 +343,45 @@ fn rotary_embedding_interleaved_partial_position_ids_is_deterministic() {
         "RotaryEmbedding must be byte-identical across runs"
     );
     assert_close(&f32s(&once[0]), &[1_f32, 2., 3., 4., -6., 5., 7., 8.]);
+}
+
+#[test]
+fn rotary_embedding_3d_rotate_half_direct_cache_broadcasts_across_heads() {
+    // [B, S, H*D] with two heads. Each cache row is shared by both heads.
+    let inputs = [
+        tensor(
+            DataType::Float32,
+            &[1, 2, 8],
+            &[
+                1_f32, 2., 3., 4., 5., 6., 7., 8., 9., 10., 11., 12., 13., 14., 15., 16.,
+            ],
+        ),
+        tensor(DataType::Float32, &[1, 2, 2], &[1_f32, 0.5, 0., 1.]),
+        tensor(DataType::Float32, &[1, 2, 2], &[0_f32, 0.5, 1., 0.]),
+    ];
+    let attrs = [("num_heads", Attribute::Int(2))];
+    let once = run(
+        "RotaryEmbedding",
+        23,
+        &inputs,
+        &[(DataType::Float32, vec![1, 2, 8])],
+        &attrs,
+    );
+    let twice = run(
+        "RotaryEmbedding",
+        23,
+        &inputs,
+        &[(DataType::Float32, vec![1, 2, 8])],
+        &attrs,
+    );
+    assert_eq!(
+        once, twice,
+        "RotaryEmbedding direct-cache path must be byte-identical across runs"
+    );
+    assert_eq!(
+        f32s(&once[0]),
+        vec![
+            1., -1., 3., 3., 5., -1., 7., 7., -11., 10., 9., 12., -15., 14., 13., 16.,
+        ]
+    );
 }
