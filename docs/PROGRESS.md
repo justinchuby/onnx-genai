@@ -4,9 +4,9 @@ Tracks implementation status of `docs/DESIGN.md` (§1–§40). Updated as work l
 
 **Published:** `onnx-genai` v0.1.0 + 8 sub-crates on crates.io; the `onnx-runtime-*` layer (including `onnx-runtime-tracer`) is released as v0.1.0-dev.1. CI (fmt/build/test/**blocking clippy**) + scheduled `cargo-audit`. Coverage ~77% line.
 
-_Last updated: 2026-07-17T07:19:39Z — onnx-rs multi-device/sharding coverage and WEIGHT_OFFLOAD Phase 1 landed._
+_Last updated: 2026-07-17T09:13:06Z — CUDA capability/dtype work, CSA v1 seams, onnx-rs coverage, and sequence values landed._
 
-**Current `origin/main` HEAD:** `a77eed0`.
+**Current `origin/main` HEAD:** `11a01a5`.
 
 
 ## Current tiered-memory and interoperability milestones
@@ -371,7 +371,13 @@ Scoped the "export Gemma4 E2B/12B via Mobius and smoke-test through onnx-genai" 
 - **CUDA int4 GEMV decode ✅ (`1de9584`, Roy; Wallace 🟢):** M=1 packed-int4 `MatMulNBits` decode reads weights directly on CUDA, improving decode by approximately 68–96% on H200 while preserving CPU/ORT contracts.
 - **Shared `onnx-runtime-quantization` crate ✅ DONE (`8bf113e`):** CPU and CUDA now consume one audited source for the seven vendored IQ grids/sign tables; all moved values are byte-identical, including IQ1S FNV-1a `0x6703ed863501ae2e`.
 - **WEIGHT_OFFLOAD Phase 1 ✅ LANDED (`f601cad` + `a77eed0`, Leon; Chew four-finding repair; Nabil 🟢):** `WeightRegionCatalog` routes QMoE first and mmaps/dequantizes only selected expert regions under `ONNX_GENAI_WEIGHT_OFFLOAD=1`; default behavior remains unchanged. The repair bounds dequant residency, preserves unaligned-mmap provenance, rejects endpoint overflow, and sums distinct mapped ranges. **691 tests pass.**
-- **DeepSeek CSA/MTP runtime design ✅ (`docs/DEEPSEEK_CSA_MTP_RUNTIME.md`, Nabil):** native sparse-attention/index operations and iterative sidecar-state MTP orchestration are specified; CSA-op skeleton implementation is in flight (Roy).
+- **DeepSeek CSA/MTP runtime design ✅ (`docs/DEEPSEEK_CSA_MTP_RUNTIME.md`, Nabil):** native sparse-attention/index operations and iterative sidecar-state MTP orchestration are specified.
+- **CUDA SM-general launch planning ✅ landed (`ef40af8`, Mariette; Nabil 🟢):** dynamic-shared-memory kernel launches now derive block and memory limits from detected compute capability instead of SM90 assumptions.
+- **CUDA Attention f16/bf16 ✅ landed (`62da14b`, Mariette; Holden 🟢):** Attention supports f32/f16/bf16 I/O, with fp32 reductions and cuBLASLt accumulation selected for the detected device.
+- **DeepSeek CSA v1 seam ✅ landed (`6e82b05`, Roy; Deckard ABI repair; Holden 🔴→🟢):** `pkg.nxrt::SparseKvGather` is reusable and checked; `CompressedSparseAttention` exposes its frozen stateful ABI while deferred compression/carry paths return explicit `Unsupported`.
+- **onnx-rs priority gaps ✅ landed (`4981dbf`, Sapper; Deckard checker repair; Bryant 🔴→🟢):** ONNX-ML `TypeProto.Opaque`, stricter v1.20 structural checking, and seven schemas close the first inference-spec batch.
+- **Copy-free sequence values ✅ landed (`833f6da`, Leon; Nabil 🟢):** Arc-backed `SeqTensor` and `SequenceValue` operations provide checked split/concat without tensor-payload copies.
+- **onnx-rs round 2 ✅ landed (`11a01a5`, Sapper; Deckard If-scoping repair; Bryant 🔴→🟢):** twelve additional schemas and shape rules cover all 27 registered ops, including recursively scoped `If`.
 - **Four scale-model design reviews ✅ resolved:** `WEIGHT_OFFLOAD` **Approved**; `DEEPSEEK_CSA_MTP_RUNTIME` **Approved**; `PROJECTION_FUSION` **Approved**; `HETEROGENEOUS_PLACEMENT` **ON HOLD** and re-scoped to a narrow unsupported-op CPU fallback, never hot quantized-matmul prefill.
 - **Mobius exports awaiting merge:** PR [#404](https://github.com/onnxruntime/mobius/pull/404) adds GLM-5.2 MoE with IndexShare DSA + MTP; PR [#405](https://github.com/onnxruntime/mobius/pull/405) adds DeepSeek-V4-Flash MTP + CSA; PR [#406](https://github.com/onnxruntime/mobius/pull/406) adds the mixed-quant scaffold and `pkg.nxrt` opset-import fixes. All await user merge.
 - **First real-model end-to-end sub-4-bit generation ✅ DONE (MAJOR MILESTONE; `2f65135`, Pris):** `bartowski/Qwen2.5-0.5B-Instruct` IQ4_XS exported through Mobius #406 generated coherent CPU-native output through **144** `BlockQuantizedMatMul` nodes (**120 IQ4_NL + 24 IQ4_XS**), with both formats confirmed executed without fallback.
@@ -392,12 +398,11 @@ Scoped the "export Gemma4 E2B/12B via Mobius and smoke-test through onnx-genai" 
 - Speculative/MTP/EAGLE-3 — currently return a clear unsupported error.
 - Non-CPU (GPU) native device selection — currently returns a clear unsupported error.
 
-- DeepSeek CSA/MTP native implementation (`docs/DEEPSEEK_CSA_MTP_RUNTIME.md`) is in flight: Roy is implementing the CSA-op skeleton.
+- **IN FLIGHT:** DeepSeek CSA Phase 2 — compressed formats, stateful compressor/carry, and production index-cache updates (Roy).
+- **IN FLIGHT:** onnx-rs round 3 — remaining standard/ONNX-ML catalog and validation gaps (Sapper).
+- **IN FLIGHT:** Sequence executor wiring — operator registration, value routing, and graph I/O bindings (Leon).
 - WEIGHT_OFFLOAD Phase 1 is landed; larger-than-RAM exact-logit and throughput validation requires a real large model/package and remains deferred.
 - MatMulNBits projection-fusion (`docs/PROJECTION_FUSION.md`, Nabil) remains **AWAITING GREENLIGHT**.
 - End-to-end run of a GLM-5.2/DeepSeek-scale model once the preceding work lands.
 
 - **IN FLIGHT (2026-07-17):** Projection-fusion Phase A implementation — CPU EP-scoped optimizer plus gate/up fusion.
-- **IN FLIGHT (2026-07-17):** GPU-EP SM-general architecture targeting (Mariette).
-- **IN FLIGHT (2026-07-17):** DeepSeek CSA op skeleton (Roy).
-- **IN FLIGHT (2026-07-17):** onnx-rs remaining parity gaps (Sapper).

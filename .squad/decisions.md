@@ -1698,3 +1698,77 @@ Q9 prefetch: layered opt-in — exact-next-wave default + heat warm-set + router
 Q10 integrity/lifetime: pin file identity cheaply at load (size + mtime/inode or fast header/region-table signature, O(1), no full re-hash), opt-in full-hash for attestation, SIGBUS handler -> clean runtime error, reject truncation/replacement of a live package.
 
 Status: design approved; Phase 1 = mmap disk tier + active-expert CPU MoE access.
+
+
+## 2026-07-17 — Overnight wave 4–5 landings
+
+#### Source: `deckard-csa-abi-fix.md`
+
+### 2026-07-17: Expose the frozen CSA v1 boundary without claiming stateful support
+**By:** Deckard
+**What:** Chose Option A. `pkg.nxrt::CompressedSparseAttention` v1 now accepts only the frozen stateful schema (11–20 positional inputs and 3–6 outputs). Execution returns an explicit `Unsupported` error for deferred compression/carry work, with ratio-4 errors also naming deferred index-cache and top-k selection. Roy's assembled-cache Phase-1 implementation remains as an unregistered tested reference.
+**Why:** The documented input/output boundary is frozen even though the compression equations and carry contents are not implemented. Registering Roy's narrower 4–6 input seam as v1 would permanently publish an incompatible ABI; retaining it only as a test reference preserves its gather/attention correctness without exposing that ABI.
+
+#### Source: `deckard-onnxrs-checker-strictness.md`
+
+### 2026-07-17: Match onnx-rs checker strictness to ONNX v1.20
+**By:** Deckard
+**What:** Corrected four retained-proto validation conditions to match `onnx/checker.cc` at tag `v1.20.0`:
+- `AttributeProto.type` is required only when `ModelProto.ir_version >= 2`; IR v1 attributes may omit the discriminator.
+- `SparseTensorProto.indices` may be absent only when `values.dims == [0]` (NNZ zero); nonzero NNZ still requires indices.
+- Sparse tensors require `dims_size() > 0` and every dense dimension strictly greater than zero, with checked dense-size arithmetic.
+- Main-graph input/output tensor and sparse-tensor types require `shape`; subgraph, intermediate, attribute, and nested container types do not inherit that shape requirement.
+**Why:** These are the field-, version-, and context-sensitive conditions enforced by ONNX v1.20 `check_attribute`, `check_sparse_tensor`, and `check_value_info`. Applying them more broadly rejects valid models; applying them less broadly accepts models rejected by the official checker.
+
+#### Source: `deckard-onnxrs-if-scoping.md`
+
+### 2026-07-17: Bind If captures lexically and merge symbols by namespace
+**By:** Deckard
+**What:** Infer control-flow subgraphs at their owning node with a lexical scope built from resolved enclosing values. Producer-less values that are neither formal inputs nor local initializers bind by name to that scope; imported symbolic dimensions receive child-local IDs with an explicit child-to-parent mapping. When merging `If` outputs, preserve only equal concrete dimensions or symbols that both branches map to the same parent symbol; otherwise mint a fresh parent symbol, and reject branch rank mismatches.
+**Why:** ONNX subgraphs capture enclosing values by name, while each `Graph` owns an independent symbol namespace. Treating captures as placeholder scalars or comparing raw branch `SymbolId` numbers silently produces incorrect and dangling parent shapes.
+
+#### Source: `leon-sequence-module.md`
+
+### 2026-07-17: ONNX sequence value module API
+**By:** Leon
+**What:** `onnx-runtime-session::sequence` publicly exposes `SeqTensor`, `SequenceValue`, `SequenceError`, `SplitSpec`, `split`, and `concat`. `SeqTensor` wraps the crate's existing `Tensor` in `Arc`; sequence construct/insert/erase/at clone only the Arc handle, and the unit test proves identity with `Arc::ptr_eq`. Sequence homogeneity enforces dtype at construction/insertion; concat additionally enforces ONNX shape compatibility. Split supports per-index slices, scalar chunk sizes, explicit sizes, negative axes, and `keepdims`; concat supports existing-axis concatenation and `new_axis` stacking. Shape, offset, and byte arithmetic is checked, byte counts above `isize::MAX` are rejected, and data allocations use `try_reserve_exact`.
+**Why:** ONNX Sequence operators need persistent value semantics without copying tensor payloads, while untrusted model shapes must not wrap arithmetic or panic allocation paths. The next op-graph phase must register and route SequenceEmpty/Construct/Insert/Erase/At/Length/SplitToSequence/ConcatFromSequence, translate tensor inputs and attributes into this API, retain returned `SeqTensor` handles through kernel consumption, and define sequence graph input/output bindings.
+
+#### Source: `mariette-attn-fp16.md`
+
+### 2026-07-17: CUDA Attention f16/bf16 dtype dispatch
+**By:** Mariette
+**What:** CUDA Attention now uses an `AttentionDtype` tag to map ONNX f32/f16/bf16 to cuBLASLt dtypes, element widths, and NVRTC softmax entry points. The half softmax kernels share a CUDA template with typed load/store helpers; max, exp, and sum reduction arithmetic is f32 before probabilities are narrowed to the IO dtype. The established f32 softmax source and entry point remain unchanged.
+**Why:** This mirrors the crate's existing dtype-tag/template dispatch convention and keeps future dtype extension centralized. Both half GEMMs use `CUBLAS_COMPUTE_32F`, so accumulation is fp32 and cuBLASLt chooses an algorithm supported by the detected device without an SM90 or tensor-core-only compute-mode hardcode. GPU reference tests use fp16 `atol=3e-3, rtol=3e-3` (a small multiple of fp16 epsilon across two GEMMs and probability storage) and bf16 `atol=2e-2, rtol=2e-2` (wider for its 7-bit mantissa).
+
+#### Source: `mariette-gpu-sm-general.md`
+
+### 2026-07-17: Make CUDA reduction launches device-capability driven
+**By:** Mariette
+**What:** The CUDA EP now caches compute capability, per-block/default and opt-in shared-memory limits, maximum threads per block, and multiprocessor count. Every NVRTC kernel that requests dynamic shared memory (attention/standalone softmax, reductions, and normalization variants) derives a power-of-two block size and shared-memory request from those limits, includes the compiled function's own limits/static shared memory, and sets `CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES` when opt-in is required. The misleading SM90-specific cuBLASLt workspace comment now states that the 32 MiB budget is device-global scratch rather than Hopper shared memory.
+**Why:** The only remaining explicit SM90 assumption was documentation around the cuBLASLt workspace; it was not a launch limit. No Hopper-only PTX (`wgmma`, TMA/`cp.async.bulk`, `setmaxnreg`, clusters/`mapa`) or FP8/TF32 compute mode exists in the crate. Capability-derived launch planning prevents current or future kernels from requesting more dynamic shared memory or threads than an older/newer device supports while preserving the existing SM90 path.
+
+#### Source: `roy-deepseek-csa-skeleton.md`
+
+### 2026-07-17: Land the DeepSeek CSA CPU reference seam on assembled f32 KV
+**By:** Roy
+**What:** Added `pkg.nxrt::SparseKvGather` v1 plus a reusable checked gather/index-planning module, and registered a Phase-1 `pkg.nxrt::CompressedSparseAttention` v1 CPU reference kernel. The fused skeleton consumes projected f32 queries, an assembled dense-window/compressed-history KV cache, selected indices, valid lengths, learned logit sinks, and optional additive bias; it calls the shared gather and computes sink-denominator attention. Exact window-128, ratio-4, and ratio-128 prefill/decode index sequences are unit-tested.
+**Why:** The frozen source makes sparse gathering and candidate ordering independently testable, while the runtime does not yet own the complete stateful compressor/carry ABI. FP4/FP8 compressed-KV formats and boolean bias return explicit `Unsupported` errors rather than panicking. Phase 2 must add FP4 block-32 and FP8 block-64 dequantization, stateful compressor/carry and ratio-4 index-cache updates at the full production ABI, then eliminate materialized gathers and optimize decode/prefill performance.
+
+#### Source: `sapper-onnxrs-gaps.md`
+
+### 2026-07-17: Close priority onnx-rs inference-spec gaps
+**By:** Sapper
+**What:** Added ONNX-ML `TypeProto.Opaque`, expanded protobuf structural checking, and grew the built-in schema registry from 8 to 15 operators (22 versioned entries). Opaque uses `domain = 1`, `name = 2`, and `TypeProto.opaque_type = 7`. Checker additions cover metadata keys, attribute unions/references, recursive container types, dense payloads, sparse COO indices, and multi-device device-group maps. Added Softmax, LayerNormalization, Gather, Reshape, Transpose, Concat, and Slice schemas.
+**Why:** These were the highest-priority non-training gaps in `docs/ONNX_RS_SPEC_COVERAGE.md`. Field numbers were verified against the official ONNX v1.20.0 ONNX-ML schema: https://raw.githubusercontent.com/onnx/onnx/v1.20.0/onnx/onnx-ml.proto. Remaining inference gaps are the complete standard/ONNX-ML schema catalogs, function validation, quantization annotation semantics, remaining IR gates, string UTF-8 and packed-padding checks, full mutation/Text grammar, shape inference, and version conversion. Training semantics remain explicitly out of scope.
+
+#### Source: `sapper-onnxrs-round2.md`
+
+### 2026-07-17: onnx-rs round-2 closes catalog-local shape inference and adds 12 schemas
+**By:** Sapper
+**What:** Added recursive ONNX `If` shape inference with branch output-count/type validation and shape union, plus representative onnx-rs graph tests covering the existing schema families. Added 12 standard schemas: Sigmoid, Tanh, Erf, Sqrt, Exp, Log, Pow, Clip, Expand, Where, ReduceSum, and ReduceMean. The catalog is now 27 operators / 34 versioned entries. Training semantics remain out of scope.
+**Why:** Every operator currently registered by onnx-rs now has a shape rule, while unsupported operators still degrade to unknown. The schema batch targets common inference graphs without claiming complete standard or ONNX-ML catalogs.
+**Sources verified:** ONNX tag `v1.20.0`: `onnx/defs/math/defs.cc`, `onnx/defs/tensor/defs.cc`, `onnx/defs/reduction/{defs.cc,utils.cc}`, `onnx/defs/schema.cc`, `onnx/defs/controlflow/utils.cc`, `onnx/defs/shape_inference.cc`, and `onnx/checker.cc`. The tag declares standard opset 25. Official `checker.cc` contains neither quantization-annotation target validation nor UTF-8 validation for protobuf byte payloads, so those audit items were reclassified rather than over-constrained.
+**Remaining:** Complete standard/ONNX-ML schema and shape catalogs; function signature/default/topology/import/recursion checks; remaining IR-version gates; packed 2-bit/4-bit padding validation; full mutation/text grammar/opset conversion. Training validation/execution remains explicitly out of scope.
+
+**Merged commits:** `ef40af8`, `6e82b05`, `4981dbf`, `62da14b`, `833f6da`, and `11a01a5`.
