@@ -996,6 +996,73 @@ fn gather_nd_canonical_shape() {
     assert_eq!(out_dtype(&outs), DataType::Float32);
 }
 
+// --- Scatter --------------------------------------------------------------
+
+#[test]
+fn scatter_nd_preserves_data_shape_and_dtype() {
+    let n = node("ScatterND", 3, 1);
+    let outs = run(
+        &n,
+        vec![
+            tin(DataType::Float16, vec![c(2), c(3), c(4)]),
+            tin(DataType::Int64, vec![c(5), c(2)]),
+            tin(DataType::Float16, vec![c(5), c(4)]),
+        ],
+        18,
+    );
+    assert_eq!(out_shape(&outs), vec![c(2), c(3), c(4)]);
+    assert_eq!(out_dtype(&outs), DataType::Float16);
+}
+
+#[test]
+fn scatter_elements_non_default_axis_preserves_data_shape() {
+    let n = with_attr(node("ScatterElements", 3, 1), "axis", Attribute::Int(-2));
+    let outs = run(
+        &n,
+        vec![
+            tin(DataType::Int32, vec![c(2), c(3), c(4)]),
+            tin(DataType::Int64, vec![c(2), c(1), c(4)]),
+            tin(DataType::Int32, vec![c(2), c(1), c(4)]),
+        ],
+        16,
+    );
+    assert_eq!(out_shape(&outs), vec![c(2), c(3), c(4)]);
+    assert_eq!(out_dtype(&outs), DataType::Int32);
+}
+
+#[test]
+fn scatter_deprecated_alias_preserves_data_shape_and_dtype() {
+    let n = with_attr(node("Scatter", 3, 1), "axis", Attribute::Int(1));
+    let outs = run(
+        &n,
+        vec![
+            tin(DataType::Float64, vec![c(2), c(3), c(4)]),
+            tin(DataType::Int64, vec![c(2), c(1), c(4)]),
+            tin(DataType::Float64, vec![c(2), c(1), c(4)]),
+        ],
+        9,
+    );
+    assert_eq!(out_shape(&outs), vec![c(2), c(3), c(4)]);
+    assert_eq!(out_dtype(&outs), DataType::Float64);
+}
+
+#[test]
+fn scatter_unknown_data_shape_leaves_output_unresolved() {
+    for (op, opset) in [("Scatter", 9), ("ScatterElements", 16), ("ScatterND", 18)] {
+        let n = node(op, 3, 1);
+        let outs = run(
+            &n,
+            vec![
+                NodeIo::default(),
+                tin(DataType::Int64, vec![c(2), c(1)]),
+                f32in(vec![c(2)]),
+            ],
+            opset,
+        );
+        assert!(outs[0].type_info.is_none(), "{op}");
+    }
+}
+
 // --- Concat ---------------------------------------------------------------
 
 #[test]

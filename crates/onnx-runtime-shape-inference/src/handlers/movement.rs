@@ -1,6 +1,6 @@
 //! Data-movement rules: `Reshape`, `Transpose`, `Flatten`, `Squeeze`,
 //! `Unsqueeze`, `Expand`, `Concat`, `Slice`, `Split`, `Gather`,
-//! `GatherElements`.
+//! `GatherElements`, `ScatterND`, `ScatterElements`, `Scatter`.
 //!
 //! Several of these are *shape-data consumers* (`Reshape`/`Expand`/`Slice` read
 //! a computed shape vector) and/or *shape-data transformers* (`Gather`/`Slice`/
@@ -635,6 +635,20 @@ pub fn gather_nd(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
     Ok(())
 }
 
+/// `ScatterElements` and deprecated `Scatter`: output type and shape are those
+/// of the data input. Axis and reduction attributes do not affect inference.
+pub fn scatter_elements(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
+    if let Some(data) = ctx.input_type(0).cloned() {
+        ctx.set_output_type(0, data);
+    }
+    Ok(())
+}
+
+/// `ScatterND`: output type and shape are those of the data input.
+pub fn scatter_nd(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
+    scatter_elements(ctx)
+}
+
 /// Read an integer-list attribute.
 fn attr_ints(ctx: &InferenceContext, name: &str) -> Option<Vec<i64>> {
     ctx.node
@@ -663,4 +677,12 @@ pub fn register(reg: &mut InferenceRegistry) {
     reg.register("", "GatherND", 11, gather_nd);
     reg.register("", "GatherND", 12, gather_nd);
     reg.register("", "GatherND", 13, gather_nd);
+    reg.register("", "Scatter", 9, scatter_elements);
+    reg.register("", "ScatterElements", 11, scatter_elements);
+    reg.register("", "ScatterElements", 13, scatter_elements);
+    reg.register("", "ScatterElements", 16, scatter_elements);
+    reg.register("", "ScatterND", 11, scatter_nd);
+    reg.register("", "ScatterND", 13, scatter_nd);
+    reg.register("", "ScatterND", 16, scatter_nd);
+    reg.register("", "ScatterND", 18, scatter_nd);
 }
