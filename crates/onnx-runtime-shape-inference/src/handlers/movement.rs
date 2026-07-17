@@ -335,6 +335,199 @@ fn bidirectional_broadcast(
     Ok(output)
 }
 
+fn resize_axes(ctx: &InferenceContext, rank: usize) -> Result<Vec<usize>, ShapeInferError> {
+    let Some(raw_axes) = ctx.node.attr("axes").and_then(Attribute::as_ints) else {
+        return Ok((0..rank).collect());
+    };
+    if raw_axes.is_empty() {
+        return Ok((0..rank).collect());
+    }
+    let mut axes = Vec::with_capacity(raw_axes.len());
+    for &axis in raw_axes {
+        let axis = checked_axis(axis, rank).ok_or_else(|| ShapeInferError::Invalid {
+            op: "Resize".into(),
+            detail: format!("axis {axis} is out of range for rank {rank}"),
+        })?;
+        if axes.contains(&axis) {
+            return Err(ShapeInferError::Invalid {
+                op: "Resize".into(),
+                detail: format!("axis {axis} appears more than once"),
+            });
+        }
+        axes.push(axis);
+    }
+    Ok(axes)
+}
+
+fn known_empty_vector(ctx: &InferenceContext, input: usize) -> bool {
+    ctx.input_shape(input)
+        .is_some_and(|shape| shape.len() == 1 && shape[0].as_const() == Some(0))
+}
+
+fn resize_extent_from_scale(input: i64, scale: f64) -> Result<i64, ShapeInferError> {
+    let scale = scale as f32;
+    let output = (input as f32 * scale).floor();
+    if !scale.is_finite() || scale <= 0.0 || !output.is_finite() || output < 0.0 {
+        return Err(ShapeInferError::Invalid {
+            op: "Resize".into(),
+            detail: format!("invalid scale {scale}"),
+        });
+    }
+    if output >= isize::MAX as f32 {
+        return Err(ShapeInferError::Invalid {
+            op: "Resize".into(),
+            detail: format!("inferred extent {output} exceeds isize::MAX"),
+        });
+    }
+    Ok(output as i64)
+}
+
+/// `Resize` (opset 13/18/19): infer from a constant `sizes` or `scales`
+/// vector. Runtime-computed vectors preserve only the output rank.
+pub fn resize(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
+    let Some(input) = ctx.input_type(0).cloned() else {
+        return Ok(());
+    };
+    validate_vector_input(ctx, 1, "Resize")?;
+    validate_vector_input(ctx, 2, "Resize")?;
+    validate_vector_input(ctx, 3, "Resize")?;
+
+    let scales = ctx
+        .input_shape_data(2)
+        .and_then(ShapeData::as_float_vector)
+        .map(<[f64]>::to_vec);
+    let sizes = const_ints(ctx, 3);
+    let has_scales = ctx.has_input(2)
+        && !known_empty_vector(ctx, 2)
+        && scales.as_ref().is_none_or(|values| !values.is_empty());
+    let has_sizes = ctx.has_input(3)
+        && !known_empty_vector(ctx, 3)
+        && sizes.as_ref().is_none_or(|values| !values.is_empty());
+    if usize::from(has_scales) + usize::from(has_sizes) != 1 {
+        return Err(ShapeInferError::Invalid {
+            op: "Resize".into(),
+            detail: "exactly one of scales or sizes must be provided".into(),
+        });
+    }
+
+    let axes = resize_axes(ctx, input.rank())?;
+    if has_sizes {
+        let Some(mut sizes) = sizes else {
+            let output = (0..input.rank()).map(|_| ctx.fresh_dim()).collect();
+            ctx.set_output(0, input.dtype, output);
+            return Ok(());
+        };
+        if sizes.len() != axes.len() {
+            return Err(ShapeInferError::Invalid {
+                op: "Resize".into(),
+                detail: format!(
+                    "sizes has {} values but {} resize axes were selected",
+                    sizes.len(),
+                    axes.len()
+                ),
+            });
+        }
+
+        let policy = ctx
+            .node
+            .attr("keep_aspect_ratio_policy")
+            .and_then(Attribute::as_str)
+            .unwrap_or("stretch");
+        if policy != "stretch" {
+            if !matches!(policy, "not_larger" | "not_smaller") {
+                return Err(ShapeInferError::Invalid {
+                    op: "Resize".into(),
+                    detail: format!("unknown keep_aspect_ratio_policy {policy}"),
+                });
+            }
+            let input_extents = axes
+                .iter()
+                .map(|&axis| input.shape[axis].as_const())
+                .collect::<Option<Vec<_>>>();
+            let Some(input_extents) = input_extents else {
+                let output = (0..input.rank()).map(|_| ctx.fresh_dim()).collect();
+                ctx.set_output(0, input.dtype, output);
+                return Ok(());
+            };
+            let scale = sizes
+                .iter()
+                .zip(&input_extents)
+                .map(|(&size, &extent)| size as f32 / extent as f32)
+                .reduce(|left, right| {
+                    if policy == "not_larger" {
+                        left.min(right)
+                    } else {
+                        left.max(right)
+                    }
+                })
+                .unwrap_or(1.0);
+            for (size, extent) in sizes.iter_mut().zip(input_extents) {
+                let value = (scale * extent as f32).round();
+                if !value.is_finite() || value >= isize::MAX as f32 {
+                    return Err(ShapeInferError::Invalid {
+                        op: "Resize".into(),
+                        detail: format!("inferred extent {value} exceeds isize::MAX"),
+                    });
+                }
+                *size = value as i64;
+            }
+        }
+
+        let mut output = input.shape;
+        for (&axis, size) in axes.iter().zip(sizes) {
+            output[axis] = if size > 0 {
+                if i128::from(size) > isize::MAX as i128 {
+                    return Err(ShapeInferError::Invalid {
+                        op: "Resize".into(),
+                        detail: format!("inferred extent {size} exceeds isize::MAX"),
+                    });
+                }
+                DimExpr::constant(size)
+            } else {
+                ctx.fresh_dim()
+            };
+        }
+        ctx.set_output(0, input.dtype, output);
+        return Ok(());
+    }
+
+    let policy = ctx
+        .node
+        .attr("keep_aspect_ratio_policy")
+        .and_then(Attribute::as_str)
+        .unwrap_or("stretch");
+    if policy != "stretch" {
+        return Err(ShapeInferError::Invalid {
+            op: "Resize".into(),
+            detail: "scales requires keep_aspect_ratio_policy=stretch".into(),
+        });
+    }
+    let Some(scales) = scales else {
+        let output = (0..input.rank()).map(|_| ctx.fresh_dim()).collect();
+        ctx.set_output(0, input.dtype, output);
+        return Ok(());
+    };
+    if scales.len() != axes.len() {
+        return Err(ShapeInferError::Invalid {
+            op: "Resize".into(),
+            detail: format!(
+                "scales has {} values but {} resize axes were selected",
+                scales.len(),
+                axes.len()
+            ),
+        });
+    }
+    let mut output = input.shape;
+    for (&axis, scale) in axes.iter().zip(scales) {
+        output[axis] = match output[axis].as_const() {
+            Some(extent) => DimExpr::constant(resize_extent_from_scale(extent, scale)?),
+            None => ctx.fresh_dim(),
+        };
+    }
+    ctx.set_output(0, input.dtype, output);
+    Ok(())
+}
+
 /// `Concat`: sum the concat axis across inputs; other dims from input 0.
 pub fn concat(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
     let Some(axis_attr) = ctx.node.attr("axis").and_then(Attribute::as_int) else {
@@ -1307,6 +1500,7 @@ pub fn register(reg: &mut InferenceRegistry) {
     reg.register("", "Unsqueeze", 1, unsqueeze_v1);
     reg.register("", "Unsqueeze", 13, unsqueeze_v13);
     reg.register("", "Expand", 8, expand);
+    reg.register("", "Resize", 13, resize);
     reg.register("", "Concat", 1, concat);
     reg.register("", "Slice", 1, slice);
     reg.register("", "Split", 1, split);

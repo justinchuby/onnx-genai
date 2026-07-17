@@ -1,0 +1,13 @@
+domain: ""
+name: DynamicQuantizeLinear
+since_version: 11
+doc: Dynamically compute a uint8 quantization scale and zero point.
+inputs:
+  - { name: x, type_str: T1 }
+outputs:
+  - { name: y, type_str: T2 }
+  - { name: y_scale, type_str: "tensor(float)" }
+  - { name: y_zero_point, type_str: T2 }
+type_constraints:
+  - { type_param: T1, allowed: [float32] }
+  - { type_param: T2, allowed: [uint8] }

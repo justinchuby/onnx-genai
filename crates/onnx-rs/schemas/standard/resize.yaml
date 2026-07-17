@@ -1,0 +1,24 @@
+domain: ""
+name: Resize
+since_version: 19
+doc: Resize an N-D tensor using scales or explicit output sizes.
+attributes:
+  - { name: mode, type: string, default: nearest }
+  - { name: cubic_coeff_a, type: float, default: -0.75 }
+  - { name: exclude_outside, type: int, default: 0 }
+  - { name: coordinate_transformation_mode, type: string, default: half_pixel }
+  - { name: nearest_mode, type: string, default: round_prefer_floor }
+  - { name: extrapolation_value, type: float, default: 0.0 }
+  - { name: antialias, type: int, default: 0 }
+  - { name: axes, type: ints }
+  - { name: keep_aspect_ratio_policy, type: string, default: stretch }
+inputs:
+  - { name: X, type_str: T1 }
+  - { name: roi, type_str: T2, optional: true }
+  - { name: scales, type_str: "tensor(float)", optional: true }
+  - { name: sizes, type_str: "tensor(int64)", optional: true }
+outputs:
+  - { name: Y, type_str: T1 }
+type_constraints:
+  - { type_param: T1, allowed: [uint8, uint16, uint32, uint64, int8, int16, int32, int64, bfloat16, float16, float32, float64, string, bool, complex64, complex128] }
+  - { type_param: T2, allowed: [float16, float32, float64] }

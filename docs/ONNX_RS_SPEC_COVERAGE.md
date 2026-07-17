@@ -376,12 +376,38 @@ Deferred multi-device checker items:
     leave the output unresolved. An empty ConstantOfShape shape vector still
     produces a known rank-0 scalar.
 
+  ## Round-7 official-source verification
+
+  Round-7 details were checked against ONNX tag `v1.20.0`:
+
+  - `onnx/defs/nn/defs.cc`: canonical schemas are `MaxPool` 22,
+    `AveragePool` 22, `GlobalAveragePool` 22, and `GlobalMaxPool` 22.
+    Pool inference covers explicit/automatic padding, strides, dilation,
+    ceil-mode window exclusion, the AveragePool `count_include_pad` attribute,
+    and MaxPool's optional `int64` Indices output.
+  - `onnx/defs/tensor/defs.cc` and `onnx/defs/tensor/utils.cc`: `Resize` 19 is
+    the catalog schema, including its four optional data inputs, interpolation
+    attributes, optional axes, and aspect-ratio policy. Exactly one non-empty
+    scales/sizes input is required by inference. Constant vectors determine
+    output extents; runtime-computed vectors preserve rank without inventing
+    dimensions.
+  - `onnx/defs/quantization/old.cc`: the selected schemas are
+    `QuantizeLinear` 21 and `DequantizeLinear` 21, with per-tensor, per-axis,
+    and blocked quantization, plus `DynamicQuantizeLinear` 11. Revision 21
+    includes uint4/int4 and all four ONNX float8 formats. Quantization output
+    shapes preserve the data input, while dtypes follow zero-point/scale rules.
+  - Pool/resize extent arithmetic is checked against `isize::MAX`, including
+    guaranteed lower-bound overflow with symbolic pool dimensions. Negative
+    axes are normalized without clamping, and dynamic resize vectors remain
+    unresolved.
+
   ## Remaining non-training gaps
 
-  - Complete standard and ONNX-ML operator-schema catalogs (63 high-value standard
-    operators / 70 versioned entries are currently registered). The largest
-    standard-library gaps remain pooling/resize, recurrent, quantization,
-    sequence/optional, and remaining control-flow/data-movement operators.
+  - Complete standard and ONNX-ML operator-schema catalogs (71 high-value
+    standard operators / 78 versioned entries are currently registered). The
+    largest standard-library gaps remain recurrent operators,
+    sequence/optional operators, and remaining control-flow/data-movement
+    operators.
   - Local-function call-site consistency, matching the TODO in official
     `onnx/checker.cc`.
   - Full-schema programmatic mutation, native readable-Text grammar, complete

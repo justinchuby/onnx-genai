@@ -7,6 +7,7 @@ use onnx_runtime_ir::{Attribute, DataType};
 use crate::context::InferenceContext;
 use crate::dim_expr::DimExpr;
 use crate::error::ShapeInferError;
+use crate::handlers::checked_axis;
 use crate::registry::InferenceRegistry;
 use crate::shape_data::ShapeData;
 
@@ -251,13 +252,137 @@ fn cast_like(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
     Ok(())
 }
 
-/// `QuantizeLinear`: output shape follows x; its type follows zero_point, or
-/// defaults to uint8 when zero_point is omitted.
-fn quantize_linear(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
-    let dtype = if ctx.has_input(2) {
-        ctx.input_dtype(2)
+fn quantized_output_dtype(ctx: &InferenceContext) -> Result<Option<DataType>, ShapeInferError> {
+    let Some(raw) = ctx
+        .node
+        .attr("output_dtype")
+        .and_then(Attribute::as_int)
+        .filter(|&raw| raw != 0)
+    else {
+        return Ok(None);
+    };
+    DataType::from_onnx(raw as i32)
+        .map(Some)
+        .ok_or_else(|| ShapeInferError::Invalid {
+            op: ctx.op().into(),
+            detail: format!("unknown output_dtype {raw}"),
+        })
+}
+
+fn validate_quantization_granularity(
+    ctx: &InferenceContext,
+    data_input: usize,
+    scale_input: usize,
+) -> Result<(), ShapeInferError> {
+    let (Some(data), Some(scale)) = (ctx.input_type(data_input), ctx.input_type(scale_input))
+    else {
+        return Ok(());
+    };
+    let data_rank = data.rank();
+    let scale_rank = scale.rank();
+    if scale_rank == 0 {
+        return Ok(());
+    }
+    if data_rank == 0 {
+        return Err(ShapeInferError::Invalid {
+            op: ctx.op().into(),
+            detail: "non-scalar scale cannot quantize a scalar input".into(),
+        });
+    }
+    let axis = if data_rank == 1 {
+        0
     } else {
-        Some(DataType::Uint8)
+        let raw_axis = ctx
+            .node
+            .attr("axis")
+            .and_then(Attribute::as_int)
+            .unwrap_or(1);
+        checked_axis(raw_axis, data_rank).ok_or_else(|| ShapeInferError::Invalid {
+            op: ctx.op().into(),
+            detail: format!("axis {raw_axis} is out of range for rank {data_rank}"),
+        })?
+    };
+
+    if scale_rank == 1 {
+        if let (Some(scale_extent), Some(data_extent)) =
+            (scale.shape[0].as_const(), data.shape[axis].as_const())
+            && scale_extent != data_extent
+        {
+            return Err(ShapeInferError::Invalid {
+                op: ctx.op().into(),
+                detail: format!(
+                    "per-axis scale length {scale_extent} does not match input axis {axis} extent {data_extent}"
+                ),
+            });
+        }
+        return Ok(());
+    }
+    if ctx.opset("") < 21 || scale_rank != data_rank {
+        return Err(ShapeInferError::Invalid {
+            op: ctx.op().into(),
+            detail: format!("scale rank {scale_rank} must be 0, 1, or the input rank {data_rank}"),
+        });
+    }
+
+    let block_size = ctx
+        .node
+        .attr("block_size")
+        .and_then(Attribute::as_int)
+        .unwrap_or(0);
+    if block_size <= 0 {
+        return Err(ShapeInferError::Invalid {
+            op: ctx.op().into(),
+            detail: "blocked quantization requires a positive block_size".into(),
+        });
+    }
+    for dimension in 0..data_rank {
+        let (Some(data_extent), Some(scale_extent)) = (
+            data.shape[dimension].as_const(),
+            scale.shape[dimension].as_const(),
+        ) else {
+            continue;
+        };
+        let expected = if dimension == axis {
+            i128::from(data_extent)
+                .checked_add(i128::from(block_size) - 1)
+                .ok_or_else(|| ShapeInferError::Invalid {
+                    op: ctx.op().into(),
+                    detail: "blocked quantization extent arithmetic overflowed".into(),
+                })?
+                / i128::from(block_size)
+        } else {
+            i128::from(data_extent)
+        };
+        if i128::from(scale_extent) != expected {
+            return Err(ShapeInferError::Invalid {
+                op: ctx.op().into(),
+                detail: format!(
+                    "blocked scale dimension {dimension} is {scale_extent}, expected {expected}"
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// `QuantizeLinear`: output shape follows x; its type follows zero_point,
+/// `output_dtype` (opset 21+), or defaults to uint8.
+fn quantize_linear(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
+    validate_quantization_granularity(ctx, 0, 1)?;
+    let attribute_dtype = quantized_output_dtype(ctx)?;
+    let dtype = if ctx.has_input(2) {
+        let Some(zero_point_dtype) = ctx.input_dtype(2) else {
+            return Ok(());
+        };
+        if attribute_dtype.is_some_and(|dtype| dtype != zero_point_dtype) {
+            return Err(ShapeInferError::Invalid {
+                op: "QuantizeLinear".into(),
+                detail: "output_dtype does not match y_zero_point dtype".into(),
+            });
+        }
+        Some(zero_point_dtype)
+    } else {
+        Some(attribute_dtype.unwrap_or(DataType::Uint8))
     };
     if let (Some(shape), Some(dtype)) = (ctx.input_shape(0).map(<[DimExpr]>::to_vec), dtype) {
         ctx.set_output(0, dtype, shape);
@@ -267,6 +392,7 @@ fn quantize_linear(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
 
 /// `DequantizeLinear`: output shape follows x and dtype follows scale.
 fn dequantize_linear(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
+    validate_quantization_granularity(ctx, 0, 1)?;
     if let (Some(shape), Some(dtype)) = (
         ctx.input_shape(0).map(<[DimExpr]>::to_vec),
         ctx.input_dtype(1),

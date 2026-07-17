@@ -1,0 +1,20 @@
+domain: ""
+name: MaxPool
+since_version: 22
+doc: Apply max pooling across the spatial dimensions.
+attributes:
+  - { name: kernel_shape, type: ints, required: true }
+  - { name: strides, type: ints }
+  - { name: auto_pad, type: string, default: NOTSET }
+  - { name: pads, type: ints }
+  - { name: ceil_mode, type: int, default: 0 }
+  - { name: storage_order, type: int, default: 0 }
+  - { name: dilations, type: ints }
+inputs:
+  - { name: X, type_str: T }
+outputs:
+  - { name: Y, type_str: T }
+  - { name: Indices, type_str: I, optional: true }
+type_constraints:
+  - { type_param: T, allowed: [bfloat16, float16, float32, float64, int8, uint8] }
+  - { type_param: I, allowed: [int64] }

@@ -54,6 +54,16 @@ fn sd_float_scalar(dt: DataType, value: f64) -> NodeIo {
     }
 }
 
+fn sd_float_vec(values: Vec<f64>) -> NodeIo {
+    NodeIo {
+        type_info: Some(TypeInfo::new(
+            DataType::Float32,
+            vec![c(values.len() as i64)],
+        )),
+        shape_data: Some(ShapeData::float_vector(DataType::Float32, values)),
+    }
+}
+
 fn node(op: &str, n_in: usize, n_out: usize) -> Node {
     Node::new(
         NodeId(0),
@@ -2175,6 +2185,315 @@ fn maxpool_spatial_formula() {
     };
     let outs = run(&n, vec![f32in(vec![sym(0), c(64), c(112), c(112)])], 13);
     assert_eq!(out_shape(&outs), vec![sym(0), c(64), c(56), c(56)]);
+}
+
+#[test]
+fn pooling_dilation_ceil_mode_and_indices_shape() {
+    let mut n = with_attr(
+        node("MaxPool", 1, 2),
+        "kernel_shape",
+        Attribute::Ints(vec![3]),
+    );
+    n = with_attr(n, "strides", Attribute::Ints(vec![2]));
+    n = with_attr(n, "pads", Attribute::Ints(vec![1, 1]));
+    n = with_attr(n, "dilations", Attribute::Ints(vec![2]));
+    n = with_attr(n, "ceil_mode", Attribute::Int(1));
+    let outs = run(&n, vec![f32in(vec![c(1), c(4), c(10)])], 22);
+    assert_eq!(out_shape(&outs), vec![c(1), c(4), c(5)]);
+    assert_eq!(outs[1].type_info.as_ref().unwrap().shape, out_shape(&outs));
+    assert_eq!(outs[1].type_info.as_ref().unwrap().dtype, DataType::Int64);
+}
+
+#[test]
+fn pooling_auto_pad_same_and_valid() {
+    let same = with_attr(
+        with_attr(
+            with_attr(
+                node("AveragePool", 1, 1),
+                "kernel_shape",
+                Attribute::Ints(vec![3, 3]),
+            ),
+            "strides",
+            Attribute::Ints(vec![2, 2]),
+        ),
+        "auto_pad",
+        Attribute::String("SAME_LOWER".into()),
+    );
+    assert_eq!(
+        out_shape(&run(&same, vec![f32in(vec![c(1), c(3), c(5), c(6)])], 22,)),
+        vec![c(1), c(3), c(3), c(3)]
+    );
+
+    let valid = with_attr(
+        with_attr(
+            with_attr(
+                node("MaxPool", 1, 1),
+                "kernel_shape",
+                Attribute::Ints(vec![3]),
+            ),
+            "strides",
+            Attribute::Ints(vec![2]),
+        ),
+        "auto_pad",
+        Attribute::String("VALID".into()),
+    );
+    assert_eq!(
+        out_shape(&run(&valid, vec![f32in(vec![c(1), c(3), c(8)])], 22)),
+        vec![c(1), c(3), c(3)]
+    );
+}
+
+#[test]
+fn global_pool_sets_every_spatial_dimension_to_one() {
+    for op in ["GlobalAveragePool", "GlobalMaxPool"] {
+        let outs = run(
+            &node(op, 1, 1),
+            vec![f32in(vec![sym(0), c(8), c(7), sym(1)])],
+            22,
+        );
+        assert_eq!(out_shape(&outs), vec![sym(0), c(8), c(1), c(1)]);
+    }
+}
+
+#[test]
+fn pooling_rejects_guaranteed_symbolic_overflow() {
+    let n = with_attr(
+        with_attr(
+            node("MaxPool", 1, 1),
+            "kernel_shape",
+            Attribute::Ints(vec![1]),
+        ),
+        "pads",
+        Attribute::Ints(vec![isize::MAX as i64, 1]),
+    );
+    let error = try_run(&n, vec![f32in(vec![c(1), c(1), sym(0)])], 22).unwrap_err();
+    assert!(error.to_string().contains("exceeds isize::MAX"));
+}
+
+// --- Resize ---------------------------------------------------------------
+
+#[test]
+fn resize_infers_constant_scales_and_sizes() {
+    let mut scales_node = node("Resize", 4, 1);
+    scales_node.inputs[1] = None;
+    scales_node.inputs[3] = None;
+    let scales = run(
+        &scales_node,
+        vec![
+            f32in(vec![c(2), c(3), c(4)]),
+            NodeIo::default(),
+            sd_float_vec(vec![1.0, 1.0, 1.5]),
+            NodeIo::default(),
+        ],
+        19,
+    );
+    assert_eq!(out_shape(&scales), vec![c(2), c(3), c(6)]);
+
+    let mut sizes_node = with_attr(node("Resize", 4, 1), "axes", Attribute::Ints(vec![-2, -1]));
+    sizes_node.inputs[1] = None;
+    sizes_node.inputs[2] = None;
+    let sizes = run(
+        &sizes_node,
+        vec![
+            f32in(vec![c(2), c(3), c(4), c(5)]),
+            NodeIo::default(),
+            NodeIo::default(),
+            sd_vec(vec![c(8), c(9)]),
+        ],
+        19,
+    );
+    assert_eq!(out_shape(&sizes), vec![c(2), c(3), c(8), c(9)]);
+}
+
+#[test]
+fn resize_dynamic_scales_and_sizes_leave_extents_unresolved() {
+    for use_scales in [true, false] {
+        let mut n = node("Resize", 4, 1);
+        n.inputs[1] = None;
+        if use_scales {
+            n.inputs[3] = None;
+        } else {
+            n.inputs[2] = None;
+        }
+        let vector = if use_scales {
+            tin(DataType::Float32, vec![c(3)])
+        } else {
+            tin(DataType::Int64, vec![c(3)])
+        };
+        let inputs = if use_scales {
+            vec![
+                f32in(vec![c(2), c(3), c(4)]),
+                NodeIo::default(),
+                vector,
+                NodeIo::default(),
+            ]
+        } else {
+            vec![
+                f32in(vec![c(2), c(3), c(4)]),
+                NodeIo::default(),
+                NodeIo::default(),
+                vector,
+            ]
+        };
+        let shape = out_shape(&run(&n, inputs, 19));
+        assert_eq!(shape.len(), 3);
+        assert!(
+            shape
+                .iter()
+                .all(|dimension| dimension.as_symbol().is_some())
+        );
+    }
+}
+
+#[test]
+fn resize_requires_exactly_one_scales_or_sizes() {
+    let mut neither = node("Resize", 4, 1);
+    neither.inputs[1] = None;
+    neither.inputs[2] = None;
+    neither.inputs[3] = None;
+    assert!(
+        try_run(
+            &neither,
+            vec![
+                f32in(vec![c(2), c(3)]),
+                NodeIo::default(),
+                NodeIo::default(),
+                NodeIo::default(),
+            ],
+            19,
+        )
+        .is_err()
+    );
+
+    let mut both = node("Resize", 4, 1);
+    both.inputs[1] = None;
+    assert!(
+        try_run(
+            &both,
+            vec![
+                f32in(vec![c(2), c(3)]),
+                NodeIo::default(),
+                sd_float_vec(vec![1.0, 2.0]),
+                sd_vec(vec![c(2), c(6)]),
+            ],
+            19,
+        )
+        .is_err()
+    );
+}
+
+// --- Linear quantization --------------------------------------------------
+
+#[test]
+fn quantize_and_dequantize_preserve_shape_and_infer_dtype() {
+    let mut quantize = with_attr(node("QuantizeLinear", 3, 1), "axis", Attribute::Int(-1));
+    quantize.inputs[2] = None;
+    let quantized = run(
+        &quantize,
+        vec![
+            f32in(vec![c(2), c(3)]),
+            f32in(vec![c(3)]),
+            NodeIo::default(),
+        ],
+        21,
+    );
+    assert_eq!(out_shape(&quantized), vec![c(2), c(3)]);
+    assert_eq!(out_dtype(&quantized), DataType::Uint8);
+
+    let dequantized = run(
+        &node("DequantizeLinear", 3, 1),
+        vec![
+            tin(DataType::Int4, vec![c(2), c(8)]),
+            tin(DataType::Float16, Vec::new()),
+            tin(DataType::Int4, Vec::new()),
+        ],
+        21,
+    );
+    assert_eq!(out_shape(&dequantized), vec![c(2), c(8)]);
+    assert_eq!(out_dtype(&dequantized), DataType::Float16);
+}
+
+#[test]
+fn quantize_uses_zero_point_dtype_and_validates_blocking() {
+    let quantized = run(
+        &node("QuantizeLinear", 3, 1),
+        vec![
+            f32in(vec![c(2), c(3)]),
+            f32in(Vec::new()),
+            tin(DataType::Int4, Vec::new()),
+        ],
+        21,
+    );
+    assert_eq!(out_dtype(&quantized), DataType::Int4);
+
+    let blocked = with_attr(
+        with_attr(node("DequantizeLinear", 3, 1), "axis", Attribute::Int(-1)),
+        "block_size",
+        Attribute::Int(4),
+    );
+    let outs = run(
+        &blocked,
+        vec![
+            tin(DataType::Uint4, vec![c(2), c(8)]),
+            f32in(vec![c(2), c(2)]),
+            tin(DataType::Uint4, vec![c(2), c(2)]),
+        ],
+        21,
+    );
+    assert_eq!(out_shape(&outs), vec![c(2), c(8)]);
+}
+
+#[test]
+fn quantization_rejects_invalid_axis_and_block_shape() {
+    let bad_axis = with_attr(node("QuantizeLinear", 3, 1), "axis", Attribute::Int(-3));
+    assert!(
+        try_run(
+            &bad_axis,
+            vec![
+                f32in(vec![c(2), c(3)]),
+                f32in(vec![c(3)]),
+                tin(DataType::Uint8, vec![c(3)]),
+            ],
+            21,
+        )
+        .is_err()
+    );
+
+    let bad_block = with_attr(
+        with_attr(node("DequantizeLinear", 3, 1), "axis", Attribute::Int(1)),
+        "block_size",
+        Attribute::Int(4),
+    );
+    assert!(
+        try_run(
+            &bad_block,
+            vec![
+                tin(DataType::Uint4, vec![c(2), c(8)]),
+                f32in(vec![c(2), c(3)]),
+                tin(DataType::Uint4, vec![c(2), c(3)]),
+            ],
+            21,
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn dynamic_quantize_linear_outputs_tensor_and_scalars() {
+    let outs = run(
+        &node("DynamicQuantizeLinear", 1, 3),
+        vec![f32in(vec![sym(0), c(7)])],
+        11,
+    );
+    assert_eq!(
+        outs[0].type_info.as_ref().unwrap().shape,
+        vec![sym(0), c(7)]
+    );
+    assert_eq!(outs[0].type_info.as_ref().unwrap().dtype, DataType::Uint8);
+    assert!(outs[1].type_info.as_ref().unwrap().shape.is_empty());
+    assert_eq!(outs[1].type_info.as_ref().unwrap().dtype, DataType::Float32);
+    assert!(outs[2].type_info.as_ref().unwrap().shape.is_empty());
+    assert_eq!(outs[2].type_info.as_ref().unwrap().dtype, DataType::Uint8);
 }
 
 #[test]

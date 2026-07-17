@@ -1,0 +1,10 @@
+domain: ""
+name: GlobalAveragePool
+since_version: 22
+doc: Apply average pooling across every spatial dimension.
+inputs:
+  - { name: X, type_str: T }
+outputs:
+  - { name: Y, type_str: T }
+type_constraints:
+  - { type_param: T, allowed: [bfloat16, float16, float32, float64] }

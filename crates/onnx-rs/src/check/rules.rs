@@ -5152,6 +5152,77 @@ mod tests {
     }
 
     #[test]
+    fn round_seven_schemas_accept_official_minimal_forms() {
+        for op_type in ["MaxPool", "AveragePool"] {
+            let mut model = one_node_model(op_type, 1, 1);
+            model.graph.opset_imports.insert(String::new(), 25);
+            let node = model.graph.nodes.keys().next().unwrap();
+            model
+                .graph
+                .node_mut(node)
+                .attributes
+                .insert("kernel_shape".into(), Attribute::Ints(vec![1]));
+            assert!(
+                model.validate().is_valid(),
+                "{op_type}: only kernel_shape is required"
+            );
+        }
+
+        for op_type in ["GlobalAveragePool", "GlobalMaxPool"] {
+            let mut model = one_node_model(op_type, 1, 1);
+            model.graph.opset_imports.insert(String::new(), 25);
+            assert!(model.validate().is_valid(), "{op_type}");
+        }
+
+        let mut max_pool_indices = one_node_model("MaxPool", 1, 2);
+        max_pool_indices
+            .graph
+            .opset_imports
+            .insert(String::new(), 25);
+        let node = max_pool_indices.graph.nodes.keys().next().unwrap();
+        max_pool_indices
+            .graph
+            .node_mut(node)
+            .attributes
+            .insert("kernel_shape".into(), Attribute::Ints(vec![1]));
+        let indices = max_pool_indices.graph.outputs[1];
+        max_pool_indices.graph.value_mut(indices).dtype = DataType::Int64;
+        assert!(max_pool_indices.validate().is_valid());
+
+        let mut resize = one_node_model("Resize", 1, 1);
+        resize.graph.opset_imports.insert(String::new(), 25);
+        assert!(
+            resize.validate().is_valid(),
+            "the official checker schema does not require either optional input"
+        );
+
+        let mut quantize = one_node_model("QuantizeLinear", 2, 1);
+        quantize.graph.opset_imports.insert(String::new(), 25);
+        let output = quantize.graph.outputs[0];
+        quantize.graph.value_mut(output).dtype = DataType::Uint8;
+        assert!(
+            quantize.validate().is_valid(),
+            "zero_point must remain optional"
+        );
+
+        let mut dequantize = one_node_model("DequantizeLinear", 2, 1);
+        dequantize.graph.opset_imports.insert(String::new(), 25);
+        let input = dequantize.graph.inputs[0];
+        dequantize.graph.value_mut(input).dtype = DataType::Uint8;
+        assert!(
+            dequantize.validate().is_valid(),
+            "zero_point must remain optional"
+        );
+
+        let mut dynamic = one_node_model("DynamicQuantizeLinear", 1, 3);
+        dynamic.graph.opset_imports.insert(String::new(), 25);
+        for output in [dynamic.graph.outputs[0], dynamic.graph.outputs[2]] {
+            dynamic.graph.value_mut(output).dtype = DataType::Uint8;
+        }
+        assert!(dynamic.validate().is_valid());
+    }
+
+    #[test]
     fn common_builtin_arity_boundaries_pass() {
         for (op_type, inputs, outputs) in [
             ("MatMul", 2, 1),

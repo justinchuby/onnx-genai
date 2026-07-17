@@ -413,6 +413,14 @@ const BUILTIN_YAML: &[&str] = &[
     include_str!("../../schemas/standard/scatter_nd.yaml"),
     include_str!("../../schemas/standard/scatter_elements.yaml"),
     include_str!("../../schemas/standard/constant_of_shape.yaml"),
+    include_str!("../../schemas/standard/max_pool.yaml"),
+    include_str!("../../schemas/standard/average_pool.yaml"),
+    include_str!("../../schemas/standard/global_average_pool.yaml"),
+    include_str!("../../schemas/standard/global_max_pool.yaml"),
+    include_str!("../../schemas/standard/resize.yaml"),
+    include_str!("../../schemas/standard/quantize_linear.yaml"),
+    include_str!("../../schemas/standard/dequantize_linear.yaml"),
+    include_str!("../../schemas/standard/dynamic_quantize_linear.yaml"),
 ];
 
 // FOLLOW-UP §7.4: complete the standard and ONNX-ML YAML catalogues.
@@ -667,6 +675,14 @@ type_constraints:
             "ScatterND",
             "ScatterElements",
             "ConstantOfShape",
+            "MaxPool",
+            "AveragePool",
+            "GlobalAveragePool",
+            "GlobalMaxPool",
+            "Resize",
+            "QuantizeLinear",
+            "DequantizeLinear",
+            "DynamicQuantizeLinear",
         ] {
             assert!(registry.lookup(name, "", 25).is_some(), "{name}");
         }
@@ -831,6 +847,78 @@ type_constraints:
         assert!(!constant.attributes[0].required);
         assert_eq!(constant.type_constraints[0].allowed, [DataType::Int64]);
         assert_eq!(constant.type_constraints[1].allowed.len(), 23);
+    }
+
+    #[test]
+    fn round_seven_schemas_match_official_signatures() {
+        let registry = SchemaRegistry::builtins();
+        for (name, since_version, inputs, outputs) in [
+            ("MaxPool", 22, 1, 2),
+            ("AveragePool", 22, 1, 1),
+            ("GlobalAveragePool", 22, 1, 1),
+            ("GlobalMaxPool", 22, 1, 1),
+            ("Resize", 19, 4, 1),
+            ("QuantizeLinear", 21, 3, 1),
+            ("DequantizeLinear", 21, 3, 1),
+            ("DynamicQuantizeLinear", 11, 1, 3),
+        ] {
+            let schema = registry.lookup(name, "", 25).unwrap();
+            assert_eq!(schema.since_version, since_version, "{name}");
+            assert_eq!(schema.inputs.len(), inputs, "{name}");
+            assert_eq!(schema.outputs.len(), outputs, "{name}");
+        }
+
+        let max_pool = registry.lookup("MaxPool", "", 25).unwrap();
+        assert!(max_pool.outputs[1].optional);
+        assert_eq!(max_pool.type_constraints[1].allowed, [DataType::Int64]);
+        assert_eq!(max_pool.type_constraints[0].allowed.len(), 6);
+        assert!(
+            max_pool
+                .attributes
+                .iter()
+                .find(|attribute| attribute.name == "kernel_shape")
+                .unwrap()
+                .required
+        );
+
+        let average_pool = registry.lookup("AveragePool", "", 25).unwrap();
+        assert_eq!(average_pool.type_constraints[0].allowed.len(), 4);
+        assert_eq!(
+            average_pool
+                .attributes
+                .iter()
+                .find(|attribute| attribute.name == "count_include_pad")
+                .unwrap()
+                .default,
+            Some(AttributeDefault::Int(0))
+        );
+
+        let resize = registry.lookup("Resize", "", 25).unwrap();
+        assert!(resize.inputs[1..].iter().all(|input| input.optional));
+        assert_eq!(resize.attributes.len(), 9);
+        assert_eq!(resize.type_constraints[0].allowed.len(), 16);
+
+        let quantize = registry.lookup("QuantizeLinear", "", 25).unwrap();
+        assert!(quantize.inputs[2].optional);
+        assert_eq!(quantize.type_constraints[1].allowed.len(), 10);
+        for dtype in [
+            DataType::Uint4,
+            DataType::Int4,
+            DataType::Float8E4M3FN,
+            DataType::Float8E4M3FNUZ,
+            DataType::Float8E5M2,
+            DataType::Float8E5M2FNUZ,
+        ] {
+            assert!(quantize.type_constraints[1].allowed.contains(&dtype));
+        }
+
+        let dequantize = registry.lookup("DequantizeLinear", "", 25).unwrap();
+        assert!(dequantize.inputs[2].optional);
+        assert_eq!(dequantize.type_constraints[0].allowed.len(), 11);
+
+        let dynamic = registry.lookup("DynamicQuantizeLinear", "", 25).unwrap();
+        assert_eq!(dynamic.outputs[1].type_str, "tensor(float)");
+        assert_eq!(dynamic.type_constraints[1].allowed, [DataType::Uint8]);
     }
 
     #[test]

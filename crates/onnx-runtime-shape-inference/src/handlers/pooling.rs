@@ -1,4 +1,4 @@
-//! Spatial rules (stretch coverage): `Conv`, `MaxPool`, `AveragePool`, `Pad`.
+//! Spatial rules: `Conv`, pooling operators, and `Pad`.
 //!
 //! These use the standard spatial output formula
 //! `floor((D + pad_begin + pad_end - dilation*(kernel-1) - 1) / stride) + 1`
@@ -142,13 +142,222 @@ pub fn conv(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
     conv_pool(ctx, channels, true)
 }
 
-/// `MaxPool`/`AveragePool`: channels are preserved from the input.
+fn pool_list(
+    ctx: &InferenceContext,
+    name: &str,
+    len: usize,
+    default: i64,
+    required: bool,
+) -> Result<Vec<i64>, ShapeInferError> {
+    match ctx.node.attr(name).and_then(Attribute::as_ints) {
+        Some(values) if values.len() == len => Ok(values.to_vec()),
+        Some(values) => Err(ShapeInferError::Invalid {
+            op: ctx.op().into(),
+            detail: format!(
+                "attribute {name} has {} values but spatial rank is {len}",
+                values.len()
+            ),
+        }),
+        None if required => Err(ShapeInferError::MissingAttribute {
+            op: ctx.op().into(),
+            attr: name.into(),
+        }),
+        None => Ok(vec![default; len]),
+    }
+}
+
+fn checked_pool_extent(
+    op: &str,
+    input: i128,
+    kernel: i64,
+    stride: i64,
+    dilation: i64,
+    pad_begin: i64,
+    pad_end: i64,
+    ceil_mode: bool,
+) -> Result<i128, ShapeInferError> {
+    let effective_kernel = i128::from(dilation)
+        .checked_mul(i128::from(kernel) - 1)
+        .and_then(|value| value.checked_add(1))
+        .ok_or_else(|| ShapeInferError::Invalid {
+            op: op.into(),
+            detail: "effective kernel arithmetic overflowed".into(),
+        })?;
+    let numerator = input
+        .checked_add(i128::from(pad_begin))
+        .and_then(|value| value.checked_add(i128::from(pad_end)))
+        .and_then(|value| value.checked_sub(effective_kernel))
+        .ok_or_else(|| ShapeInferError::Invalid {
+            op: op.into(),
+            detail: "pooling extent arithmetic overflowed".into(),
+        })?;
+    let stride = i128::from(stride);
+    let quotient = if ceil_mode {
+        numerator.div_euclid(stride) + i128::from(numerator.rem_euclid(stride) != 0)
+    } else {
+        numerator.div_euclid(stride)
+    };
+    let mut output = quotient
+        .checked_add(1)
+        .ok_or_else(|| ShapeInferError::Invalid {
+            op: op.into(),
+            detail: "pooling output arithmetic overflowed".into(),
+        })?
+        .max(0);
+    if ceil_mode && output > 0 {
+        let last_start =
+            (output - 1)
+                .checked_mul(stride)
+                .ok_or_else(|| ShapeInferError::Invalid {
+                    op: op.into(),
+                    detail: "pooling window arithmetic overflowed".into(),
+                })?;
+        let right_padding_start =
+            input
+                .checked_add(i128::from(pad_begin))
+                .ok_or_else(|| ShapeInferError::Invalid {
+                    op: op.into(),
+                    detail: "pooling padding arithmetic overflowed".into(),
+                })?;
+        if last_start >= right_padding_start {
+            output -= 1;
+        }
+    }
+    Ok(output)
+}
+
+fn pool_spatial_dim(
+    ctx: &mut InferenceContext,
+    input: &DimExpr,
+    kernel: i64,
+    stride: i64,
+    dilation: i64,
+    pad_begin: i64,
+    pad_end: i64,
+    auto_pad: AutoPad,
+    ceil_mode: bool,
+) -> Result<DimExpr, ShapeInferError> {
+    if kernel <= 0 || stride <= 0 || dilation <= 0 {
+        return Err(ShapeInferError::Invalid {
+            op: ctx.op().into(),
+            detail: "kernel_shape, strides, and dilations must be positive".into(),
+        });
+    }
+
+    let known = input.as_const();
+    let output = match auto_pad {
+        AutoPad::SameUpper | AutoPad::SameLower => known.map(|extent| {
+            let extent = i128::from(extent);
+            extent.div_euclid(i128::from(stride))
+                + i128::from(extent.rem_euclid(i128::from(stride)) != 0)
+        }),
+        AutoPad::Valid => known
+            .map(i128::from)
+            .map(|extent| {
+                checked_pool_extent(ctx.op(), extent, kernel, stride, dilation, 0, 0, ceil_mode)
+            })
+            .transpose()?,
+        AutoPad::NotSet => known
+            .map(i128::from)
+            .map(|extent| {
+                checked_pool_extent(
+                    ctx.op(),
+                    extent,
+                    kernel,
+                    stride,
+                    dilation,
+                    pad_begin,
+                    pad_end,
+                    ceil_mode,
+                )
+            })
+            .transpose()?,
+    };
+
+    if let Some(output) = output {
+        if output > isize::MAX as i128 {
+            return Err(ShapeInferError::Invalid {
+                op: ctx.op().into(),
+                detail: format!("inferred extent {output} exceeds isize::MAX"),
+            });
+        }
+        return Ok(DimExpr::constant(output as i64));
+    }
+
+    if auto_pad == AutoPad::NotSet {
+        let lower_bound = checked_pool_extent(
+            ctx.op(),
+            0,
+            kernel,
+            stride,
+            dilation,
+            pad_begin,
+            pad_end,
+            ceil_mode,
+        )?;
+        if lower_bound > isize::MAX as i128 {
+            return Err(ShapeInferError::Invalid {
+                op: ctx.op().into(),
+                detail: format!(
+                    "guaranteed pooling extent lower bound {lower_bound} exceeds isize::MAX"
+                ),
+            });
+        }
+    }
+    Ok(ctx.fresh_dim())
+}
+
+/// `MaxPool`/`AveragePool`: preserve N/C and infer each spatial extent.
 pub fn pool(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
-    let channels = ctx
-        .input_shape(0)
-        .and_then(|x| x.get(1).cloned())
-        .unwrap_or_else(|| ctx.fresh_dim());
-    conv_pool(ctx, channels, false)
+    let Some(input) = ctx.input_type(0).cloned() else {
+        return Ok(());
+    };
+    if input.rank() < 2 {
+        return Err(ShapeInferError::InvalidRank {
+            op: ctx.op().into(),
+            index: 0,
+            rank: input.rank(),
+            detail: "expected [N, C, D1, …]".into(),
+        });
+    }
+    let spatial_rank = input.rank() - 2;
+    let kernels = pool_list(ctx, "kernel_shape", spatial_rank, 0, true)?;
+    let strides = pool_list(ctx, "strides", spatial_rank, 1, false)?;
+    let dilations = pool_list(ctx, "dilations", spatial_rank, 1, false)?;
+    let explicit_pads = ctx.node.attr("pads").and_then(Attribute::as_ints).is_some();
+    let pads = pool_list(ctx, "pads", spatial_rank * 2, 0, false)?;
+    let auto_pad = if explicit_pads {
+        AutoPad::NotSet
+    } else {
+        auto_pad(ctx)
+    };
+    let ceil_mode = ctx
+        .node
+        .attr("ceil_mode")
+        .and_then(Attribute::as_int)
+        .unwrap_or(0)
+        != 0;
+
+    let mut output = Vec::with_capacity(input.rank());
+    output.extend_from_slice(&input.shape[..2]);
+    for axis in 0..spatial_rank {
+        output.push(pool_spatial_dim(
+            ctx,
+            &input.shape[axis + 2],
+            kernels[axis],
+            strides[axis],
+            dilations[axis],
+            pads[axis],
+            pads[axis + spatial_rank],
+            auto_pad,
+            ceil_mode,
+        )?);
+    }
+    ctx.set_output(0, input.dtype, output.clone());
+    if ctx.num_outputs() > 1 {
+        ctx.set_output(1, DataType::Int64, output);
+    }
+    Ok(())
 }
 
 /// `Pad`: each selected dim grows by its begin+end pad.
@@ -320,6 +529,9 @@ fn global_pool(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
     let Some(x) = ctx.input_shape(0).map(<[DimExpr]>::to_vec) else {
         return Ok(());
     };
+    if x.len() < 2 {
+        return Ok(());
+    }
     let dtype = ctx.input_dtype(0).unwrap_or(DataType::Float32);
     let mut out = x.clone();
     for d in out.iter_mut().skip(2) {
