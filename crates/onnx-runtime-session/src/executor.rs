@@ -860,45 +860,45 @@ fn build_lazy_weight_handles(
 
     let boundary = LazyWeightBoundary::BlockQuantizedMoe;
     let mut handles = HashMap::new();
-    for (_, node) in graph.nodes.iter() {
-        if !boundary.matches(&node.domain, &node.op_type) {
+    for (&value, weight) in &graph.initializers {
+        let graph_value = graph.value(value);
+        let lazy_only = graph_value.producer.is_none()
+            && !graph.outputs.contains(&value)
+            && !graph_value.consumers.is_empty()
+            && graph_value.consumers.iter().all(|&consumer| {
+                let node = graph.node(consumer);
+                boundary.matches(&node.domain, &node.op_type)
+            });
+        if !lazy_only {
             continue;
         }
-        for value in node.inputs.iter().flatten().copied() {
-            if handles.contains_key(&value) {
-                continue;
-            }
-            let Some(weight) = graph.initializers.get(&value) else {
-                continue;
-            };
-            let Some((mapping_id, offset, len)) = weights.external_mmap_provenance(weight) else {
-                continue;
-            };
-            let region = ExternalMmapRegion {
-                mapping_id,
-                offset,
-                len,
-            };
-            let dtype = weight.dtype();
-            let shape = weight.dims().to_vec();
-            let weight = weight.clone();
-            let store = Arc::clone(weights);
-            let lazy = LazyWeight::block_quantized_moe(vec![region], move || {
-                let bytes = store.bytes(&weight).ok_or_else(|| {
-                    onnx_runtime_ep_api::WeightHandleError::InvalidResident(
-                        "external weight bytes are no longer available".into(),
-                    )
-                })?;
-                ResidentWeight::new(dtype, shape.clone(), Arc::<[u8]>::from(bytes))
-            })
-            .map_err(|error| {
-                SessionError::Internal(format!(
-                    "cannot create lazy weight handle for value#{}: {error}",
-                    value.0
-                ))
+        let Some((mapping_id, offset, len)) = weights.external_mmap_provenance(weight) else {
+            continue;
+        };
+        let region = ExternalMmapRegion {
+            mapping_id,
+            offset,
+            len,
+        };
+        let dtype = weight.dtype();
+        let shape = weight.dims().to_vec();
+        let weight = weight.clone();
+        let store = Arc::clone(weights);
+        let lazy = LazyWeight::block_quantized_moe(vec![region], move || {
+            let bytes = store.bytes(&weight).ok_or_else(|| {
+                onnx_runtime_ep_api::WeightHandleError::InvalidResident(
+                    "external weight bytes are no longer available".into(),
+                )
             })?;
-            handles.insert(value, WeightHandle::Lazy(lazy));
-        }
+            ResidentWeight::new(dtype, shape.clone(), Arc::<[u8]>::from(bytes))
+        })
+        .map_err(|error| {
+            SessionError::Internal(format!(
+                "cannot create lazy weight handle for value#{}: {error}",
+                value.0
+            ))
+        })?;
+        handles.insert(value, WeightHandle::Lazy(lazy));
     }
     Ok(handles)
 }
@@ -922,14 +922,22 @@ impl Executor {
         let mut buffers: HashMap<ValueId, DeviceBuffer> = HashMap::new();
         let mut buffer_shapes: HashMap<ValueId, Vec<usize>> = HashMap::new();
 
-        // 1) Initializers: always concrete. Record dims and back each with a
-        //    device buffer. Host mmap bytes need only satisfy the initializer
-        //    dtype's alignment for scalar CPU reads; the EP's wider allocation
-        //    alignment is reserved for owned buffers and kernels that require it.
+        // 1) Initializers: record metadata and back resident consumers with a
+        //    device buffer. A non-host nxrt initializer used exclusively at the
+        //    lazy fused-MoE boundary deliberately has no eager buffer; the EP
+        //    materializes it through its WeightHandle on demand. If any resident
+        //    consumer (or graph output) coexists, no handle is built and the one
+        //    eager buffer is shared by every consumer. Host mmap bytes retain the
+        //    existing zero-copy borrow path.
         let init_align = TensorLayout::contiguous().alignment;
         for (&vid, weight) in &graph.initializers {
             let dtype = weight.dtype();
             let dims = weight.dims().to_vec();
+            value_dtypes.insert(vid, dtype);
+            value_shapes.insert(vid, dims.iter().map(|&d| Dim::Static(d)).collect());
+            if !ep.device_id().is_host_accessible() && weight_handles.contains_key(&vid) {
+                continue;
+            }
             let bytes = weights.bytes(weight).ok_or_else(|| {
                 SessionError::Internal(format!("weight bytes unavailable for value#{}", vid.0))
             })?;
@@ -972,8 +980,6 @@ impl Executor {
                 ep.copy_from_host(bytes, &mut owned)?;
                 owned
             };
-            value_dtypes.insert(vid, dtype);
-            value_shapes.insert(vid, dims.iter().map(|&d| Dim::Static(d)).collect());
             buffer_shapes.insert(vid, dims);
             buffers.insert(vid, buf);
         }
@@ -1722,6 +1728,16 @@ impl Executor {
         }
 
         let output_shapes: Vec<Vec<usize>> = outputs.iter().map(|v| resolved[v].clone()).collect();
+        let node = self.graph.node(node_id);
+        let capabilities = self.ep.capabilities();
+        let accepts_lazy_weights =
+            LazyWeightBoundary::BlockQuantizedMoe.matches(&node.domain, &node.op_type);
+        let has_lazy_inputs = accepts_lazy_weights
+            && inputs.iter().any(|input| {
+                input
+                    .and_then(|value| self.weight_handles.get(&value))
+                    .is_some_and(|handle| handle.is_lazy_for(&capabilities))
+            });
 
         // Resolve each input's real geometry (root buffer + strides/offset) and
         // bounds-check it. View inputs read through their recorded strides.
@@ -1778,6 +1794,25 @@ impl Executor {
                     device: onnx_runtime_ir::DeviceId::cpu(),
                     backing: TensorBacking::Opaque,
                     root_len,
+                });
+                continue;
+            }
+            if accepts_lazy_weights
+                && self
+                    .weight_handles
+                    .get(&vid)
+                    .is_some_and(|handle| handle.is_lazy_for(&capabilities))
+            {
+                in_infos.push(InInfo {
+                    present: false,
+                    dtype: input_dtypes[i],
+                    shape: input_shapes[i].clone(),
+                    strides: compute_contiguous_strides(&input_shapes[i]),
+                    byte_offset: 0,
+                    base_ptr: std::ptr::null(),
+                    device: self.ep.device_id(),
+                    backing: TensorBacking::Opaque,
+                    root_len: 0,
                 });
                 continue;
             }
@@ -1856,7 +1891,6 @@ impl Executor {
             );
         }
 
-        let node = graph.node(node_id);
         let opset = effective_opset(graph, node);
         let constant_inputs: Vec<bool> = inputs
             .iter()
@@ -1870,16 +1904,6 @@ impl Executor {
             opset,
             ep.as_ref(),
         )?;
-        let capabilities = ep.capabilities();
-        let accepts_lazy_weights =
-            LazyWeightBoundary::BlockQuantizedMoe.matches(&node.domain, &node.op_type);
-        let has_lazy_inputs = accepts_lazy_weights
-            && inputs.iter().any(|input| {
-                input
-                    .and_then(|value| weight_handles.get(&value))
-                    .is_some_and(|handle| handle.is_lazy_for(&capabilities))
-            });
-
         // --- Zero-copy view fast path ---------------------------------------
         // Ask the kernel whether its outputs are strided views over its inputs
         // (a layout/movement op such as Slice). If so, record view metadata
@@ -4230,7 +4254,7 @@ pub(crate) fn auto_detect_cpu_ep() -> Result<Arc<dyn ExecutionProvider>> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
     use onnx_runtime_ep_api::{
         Cost, EpConfig, EpError, ExecutionProviderCapabilities, Fence, Kernel, NegotiatedWeight,
@@ -4304,17 +4328,68 @@ mod tests {
         cpu: CpuExecutionProvider,
         lazy: bool,
         deliveries: Arc<std::sync::Mutex<Vec<&'static str>>>,
+        device: onnx_runtime_ir::DeviceId,
+        allocations: Arc<AtomicUsize>,
+        host_uploads: Arc<AtomicUsize>,
     }
 
     impl WeightDeliveryEp {
         fn new(lazy: bool, deliveries: Arc<std::sync::Mutex<Vec<&'static str>>>) -> Self {
+            Self::with_device(
+                lazy,
+                deliveries,
+                onnx_runtime_ir::DeviceId::cpu(),
+                Arc::new(AtomicUsize::new(0)),
+                Arc::new(AtomicUsize::new(0)),
+            )
+        }
+
+        fn non_host(
+            lazy: bool,
+            deliveries: Arc<std::sync::Mutex<Vec<&'static str>>>,
+            allocations: Arc<AtomicUsize>,
+            host_uploads: Arc<AtomicUsize>,
+        ) -> Self {
+            Self::with_device(
+                lazy,
+                deliveries,
+                onnx_runtime_ir::DeviceId::new(onnx_runtime_ir::DeviceType::Custom(7), 0),
+                allocations,
+                host_uploads,
+            )
+        }
+
+        fn with_device(
+            lazy: bool,
+            deliveries: Arc<std::sync::Mutex<Vec<&'static str>>>,
+            device: onnx_runtime_ir::DeviceId,
+            allocations: Arc<AtomicUsize>,
+            host_uploads: Arc<AtomicUsize>,
+        ) -> Self {
             let mut cpu = CpuExecutionProvider::new();
             cpu.initialize(&EpConfig::default()).unwrap();
             Self {
                 cpu,
                 lazy,
                 deliveries,
+                device,
+                allocations,
+                host_uploads,
             }
+        }
+
+        fn copy_bytes(
+            &self,
+            src: *const u8,
+            dst: *mut u8,
+            size: usize,
+        ) -> onnx_runtime_ep_api::Result<()> {
+            if size != 0 {
+                // The test EP tags host allocations as a non-host custom device
+                // so executor placement is realistic while bytes stay inspectable.
+                unsafe { std::ptr::copy_nonoverlapping(src, dst, size) };
+            }
+            Ok(())
         }
     }
 
@@ -4328,11 +4403,11 @@ mod tests {
         }
 
         fn device_type(&self) -> onnx_runtime_ir::DeviceType {
-            onnx_runtime_ir::DeviceType::Cpu
+            self.device.device_type
         }
 
         fn device_id(&self) -> onnx_runtime_ir::DeviceId {
-            onnx_runtime_ir::DeviceId::cpu()
+            self.device
         }
 
         fn capabilities(&self) -> ExecutionProviderCapabilities {
@@ -4357,7 +4432,9 @@ mod tests {
             _shapes: &[Shape],
             _layouts: &[TensorLayout],
         ) -> KernelMatch {
-            if LazyWeightBoundary::BlockQuantizedMoe.matches(&op.domain, &op.op_type) {
+            if LazyWeightBoundary::BlockQuantizedMoe.matches(&op.domain, &op.op_type)
+                || (op.domain.is_empty() && op.op_type == "Identity")
+            {
                 KernelMatch::Supported {
                     cost: Cost::ZERO,
                     required_input_layouts: None,
@@ -4384,14 +4461,38 @@ mod tests {
             size: usize,
             alignment: usize,
         ) -> onnx_runtime_ep_api::Result<DeviceBuffer> {
-            self.cpu.allocate(size, alignment)
+            self.allocations.fetch_add(1, Ordering::Relaxed);
+            if self.device.is_host_accessible() {
+                return self.cpu.allocate(size, alignment);
+            }
+            let layout = std::alloc::Layout::from_size_align(size.max(1), alignment)
+                .map_err(|_| EpError::AlignmentError)?;
+            let ptr = unsafe { std::alloc::alloc(layout) };
+            if ptr.is_null() {
+                return Err(EpError::OutOfMemory {
+                    requested: size,
+                    available: 0,
+                });
+            }
+            Ok(unsafe {
+                DeviceBuffer::from_raw_parts(ptr.cast(), self.device, size, alignment)
+            })
         }
 
         fn deallocate(
             &self,
             buffer: DeviceBuffer,
         ) -> onnx_runtime_ep_api::Result<()> {
-            self.cpu.deallocate(buffer)
+            if self.device.is_host_accessible() {
+                return self.cpu.deallocate(buffer);
+            }
+            let size = buffer.len();
+            let alignment = buffer.alignment();
+            let ptr = buffer.into_raw().cast::<u8>();
+            let layout = std::alloc::Layout::from_size_align(size.max(1), alignment)
+                .expect("test EP allocated this layout");
+            unsafe { std::alloc::dealloc(ptr, layout) };
+            Ok(())
         }
 
         fn copy(
@@ -4400,7 +4501,10 @@ mod tests {
             dst: &mut DeviceBuffer,
             size: usize,
         ) -> onnx_runtime_ep_api::Result<()> {
-            self.cpu.copy(src, dst, size)
+            if size > src.len() || size > dst.len() {
+                return Err(EpError::KernelFailed("test EP copy out of bounds".into()));
+            }
+            self.copy_bytes(src.as_ptr().cast(), dst.as_mut_ptr().cast(), size)
         }
 
         fn copy_async(
@@ -4409,11 +4513,39 @@ mod tests {
             dst: &mut DeviceBuffer,
             size: usize,
         ) -> onnx_runtime_ep_api::Result<Fence> {
-            self.cpu.copy_async(src, dst, size)
+            self.copy(src, dst, size)?;
+            Ok(Fence::default())
         }
 
         fn sync(&self) -> onnx_runtime_ep_api::Result<()> {
-            self.cpu.sync()
+            Ok(())
+        }
+
+        fn copy_from_host(
+            &self,
+            src: &[u8],
+            dst: &mut DeviceBuffer,
+        ) -> onnx_runtime_ep_api::Result<()> {
+            if src.len() > dst.len() {
+                return Err(EpError::KernelFailed(
+                    "test EP host upload out of bounds".into(),
+                ));
+            }
+            self.host_uploads.fetch_add(1, Ordering::Relaxed);
+            self.copy_bytes(src.as_ptr(), dst.as_mut_ptr().cast(), src.len())
+        }
+
+        fn copy_to_host(
+            &self,
+            src: &DeviceBuffer,
+            dst: &mut [u8],
+        ) -> onnx_runtime_ep_api::Result<()> {
+            if dst.len() > src.len() {
+                return Err(EpError::KernelFailed(
+                    "test EP host download out of bounds".into(),
+                ));
+            }
+            self.copy_bytes(src.as_ptr().cast(), dst.as_mut_ptr(), dst.len())
         }
     }
 
@@ -4470,6 +4602,97 @@ mod tests {
             drop(executor);
             std::fs::remove_file(path).unwrap();
         }
+    }
+
+    #[test]
+    fn non_host_lazy_only_initializer_skips_eager_device_residency() {
+        for (lazy, expected_allocations, expected_uploads, expected_delivery) in
+            [(true, 1, 0, "lazy"), (false, 2, 1, "resident")]
+        {
+            let (graph, weights, path) = weight_delivery_fixture();
+            let deliveries = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let allocations = Arc::new(AtomicUsize::new(0));
+            let host_uploads = Arc::new(AtomicUsize::new(0));
+            let ep: Arc<dyn ExecutionProvider> = Arc::new(WeightDeliveryEp::non_host(
+                lazy,
+                Arc::clone(&deliveries),
+                Arc::clone(&allocations),
+                Arc::clone(&host_uploads),
+            ));
+            let mut executor = Executor::build(graph, weights, ep).unwrap();
+
+            assert_eq!(
+                allocations.load(Ordering::Relaxed),
+                expected_allocations,
+                "lazy nxrt builds only the output; stock EPs also allocate the initializer"
+            );
+            assert_eq!(
+                host_uploads.load(Ordering::Relaxed),
+                expected_uploads,
+                "lazy nxrt must not upload the initializer during build"
+            );
+
+            let outputs = executor.run(&[]).unwrap();
+            assert_eq!(outputs[0].as_bytes(), &[1, 2, 3, 4]);
+            assert_eq!(&*deliveries.lock().unwrap(), &[expected_delivery]);
+            assert_eq!(
+                host_uploads.load(Ordering::Relaxed),
+                expected_uploads,
+                "dispatch must not introduce a second EP upload"
+            );
+            drop(executor);
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn initializer_shared_with_resident_consumer_uses_one_device_copy() {
+        let (mut graph, weights, path) = weight_delivery_fixture();
+        graph.opset_imports.insert(String::new(), 17);
+        let weight = graph
+            .values
+            .iter()
+            .find_map(|(vid, value)| (value.name.as_deref() == Some("weight")).then_some(vid))
+            .unwrap();
+        let resident_output =
+            graph.create_named_value("resident_output", DataType::Uint8, static_shape([4]));
+        graph.insert_node(Node::new(
+            NodeId(1),
+            "Identity",
+            vec![Some(weight)],
+            vec![resident_output],
+        ));
+        graph.add_output(resident_output);
+
+        let deliveries = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let allocations = Arc::new(AtomicUsize::new(0));
+        let host_uploads = Arc::new(AtomicUsize::new(0));
+        let ep: Arc<dyn ExecutionProvider> = Arc::new(WeightDeliveryEp::non_host(
+            true,
+            Arc::clone(&deliveries),
+            Arc::clone(&allocations),
+            Arc::clone(&host_uploads),
+        ));
+        let mut executor = Executor::build(graph, weights, ep).unwrap();
+
+        assert!(
+            !executor.weight_handles.contains_key(&weight),
+            "a resident consumer makes the single eager device copy authoritative"
+        );
+        assert_eq!(allocations.load(Ordering::Relaxed), 3);
+        assert_eq!(host_uploads.load(Ordering::Relaxed), 1);
+
+        let outputs = executor.run(&[]).unwrap();
+        assert_eq!(outputs[0].as_bytes(), &[1, 2, 3, 4]);
+        assert_eq!(outputs[1].as_bytes(), &[1, 2, 3, 4]);
+        assert_eq!(&*deliveries.lock().unwrap(), &["resident", "resident"]);
+        assert_eq!(
+            host_uploads.load(Ordering::Relaxed),
+            1,
+            "both consumers must share the one resident initializer"
+        );
+        drop(executor);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
