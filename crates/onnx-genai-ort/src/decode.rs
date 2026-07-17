@@ -1240,6 +1240,13 @@ fn grow_kv_value_cuda(
 
         let src_addr = old.data_ptr_addr()?;
         let dst_addr = dst.data_ptr_addr()?;
+        // Pin the thread's current CUDA device to the KV buffers' device for the
+        // whole grow sequence. The raw cudart calls below act on the *current*
+        // device, but the KV lives on the EP's configured device (which may be
+        // non-zero via ONNX_GENAI_CUDA_DEVICE); without this the barriers could
+        // target the wrong device. Restored on drop.
+        let _device_guard =
+            crate::cuda_rt::DeviceGuard::set(device_allocator.memory_info.device_id)?;
         // The prior decode step's KV writes run on the ORT CUDA EP's stream and
         // may still be in flight; block until they land before we read the old
         // buffer, so the copied prefix is complete rather than partially written.
