@@ -2659,7 +2659,7 @@ fn tensor_scalar_i64(t: &Tensor) -> Option<i64> {
 /// Read a single scalar bool from a length-1 `BOOL` tensor (a `BOOL` is one
 /// byte; any nonzero is true, per ONNX).
 fn tensor_scalar_bool(t: &Tensor) -> Option<bool> {
-    if t.dtype != DataType::Bool {
+    if t.dtype != DataType::Bool || t.numel() != 1 {
         return None;
     }
     t.as_bytes().first().map(|&b| b != 0)
@@ -3164,15 +3164,100 @@ impl Executor {
         resolved: &mut HashMap<ValueId, Vec<usize>>,
         outer_scope: &HashMap<String, Tensor>,
     ) -> Result<()> {
+        {
+            let then_branch = self
+                .graph
+                .subgraphs
+                .get(&(node.id, "then_branch".to_string()))
+                .ok_or_else(|| SessionError::ControlFlow {
+                    op: "If".to_string(),
+                    reason: "missing required 'then_branch' subgraph".to_string(),
+                })?;
+            let else_branch = self
+                .graph
+                .subgraphs
+                .get(&(node.id, "else_branch".to_string()))
+                .ok_or_else(|| SessionError::ControlFlow {
+                    op: "If".to_string(),
+                    reason: "missing required 'else_branch' subgraph".to_string(),
+                })?;
+
+            if !then_branch.inputs.is_empty() || !else_branch.inputs.is_empty() {
+                return Err(SessionError::ControlFlow {
+                    op: "If".to_string(),
+                    reason: format!(
+                        "branch subgraphs must declare zero formal inputs, but then_branch has {} \
+                         and else_branch has {}",
+                        then_branch.inputs.len(),
+                        else_branch.inputs.len()
+                    ),
+                });
+            }
+            if then_branch.outputs.len() != else_branch.outputs.len() {
+                return Err(SessionError::ControlFlow {
+                    op: "If".to_string(),
+                    reason: format!(
+                        "branches declare different output counts: then_branch has {}, \
+                         else_branch has {}",
+                        then_branch.outputs.len(),
+                        else_branch.outputs.len()
+                    ),
+                });
+            }
+            if then_branch.outputs.len() != node.outputs.len() {
+                return Err(SessionError::ControlFlow {
+                    op: "If".to_string(),
+                    reason: format!(
+                        "node declares {} output(s), but each branch declares {}",
+                        node.outputs.len(),
+                        then_branch.outputs.len()
+                    ),
+                });
+            }
+            for (index, (&then_output, &else_output)) in then_branch
+                .outputs
+                .iter()
+                .zip(&else_branch.outputs)
+                .enumerate()
+            {
+                if then_branch.value_type_is_known(then_output)
+                    && else_branch.value_type_is_known(else_output)
+                {
+                    let then_dtype = then_branch.value(then_output).dtype;
+                    let else_dtype = else_branch.value(else_output).dtype;
+                    if then_dtype != else_dtype {
+                        return Err(SessionError::ControlFlow {
+                            op: "If".to_string(),
+                            reason: format!(
+                                "branches declare different dtypes for output {index}: \
+                                 then_branch is {then_dtype:?}, else_branch is {else_dtype:?}"
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+
         let cond_vid = node.inputs.first().and_then(|s| *s).ok_or_else(|| {
-            SessionError::Internal("If node is missing its required 'cond' input".to_string())
+            SessionError::ControlFlow {
+                op: "If".to_string(),
+                reason: "missing required 'cond' input".to_string(),
+            }
         })?;
         let cond_t = self.value_tensor(cond_vid, resolved)?;
-        let cond = tensor_scalar_bool(&cond_t).ok_or_else(|| {
-            SessionError::Internal(format!(
-                "If: 'cond' must be a BOOL scalar, got dtype {:?} shape {:?}",
-                cond_t.dtype, cond_t.shape
-            ))
+        if cond_t.dtype != DataType::Bool {
+            return Err(SessionError::DtypeMismatch {
+                name: "If cond".to_string(),
+                expected: format!("{:?}", DataType::Bool),
+                got: format!("{:?}", cond_t.dtype),
+            });
+        }
+        let cond = tensor_scalar_bool(&cond_t).ok_or_else(|| SessionError::ControlFlow {
+            op: "If".to_string(),
+            reason: format!(
+                "'cond' must be a BOOL scalar or single-element tensor, got shape {:?}",
+                cond_t.shape
+            ),
         })?;
 
         let attr_key = if cond { "then_branch" } else { "else_branch" };

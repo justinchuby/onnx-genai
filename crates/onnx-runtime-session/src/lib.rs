@@ -185,6 +185,9 @@ mod error {
         )]
         SequenceOp { op: String, reason: String },
 
+        #[error("control-flow op {op}: {reason}")]
+        ControlFlow { op: String, reason: String },
+
         #[error(
             "EPContext reference node (main_context=0) has no matching primary \
              (source={source_key:?}, partition_name={partition_name:?})"

@@ -116,9 +116,9 @@ fn if_branch(bin_op: &str) -> Graph {
 }
 
 #[test]
-fn if_executes_selected_branch_and_captures_outer_value() {
+fn if_executes_selected_branch_with_capture_and_inline_initializer() {
     let mut g = new_parent();
-    let cond = input(&mut g, "cond", DataType::Bool, &[]);
+    let cond = input(&mut g, "cond", DataType::Bool, &[1]);
     let _x = input(&mut g, "X", DataType::Float32, &[2]);
     let y = g.create_named_value("Y", DataType::Float32, static_shape([2]));
 
@@ -129,19 +129,137 @@ fn if_executes_selected_branch_and_captures_outer_value() {
     g.add_output(y);
 
     let mut session = InferenceSession::from_graph(g).expect("build session");
-    for (run, (cond_val, expected)) in [(true, [3.0f32, 4.0]), (false, [1.0f32, 2.0])]
-        .into_iter()
-        .enumerate()
+    for (run, (cond_val, expected)) in [
+        (true, [3.0f32, 4.0]),
+        (false, [1.0f32, 2.0]),
+        (true, [3.0f32, 4.0]),
+        (false, [1.0f32, 2.0]),
+    ]
+    .into_iter()
+    .enumerate()
     {
-        let cond_t = Tensor::from_raw(DataType::Bool, vec![], &[cond_val as u8]).unwrap();
+        let cond_t = Tensor::from_raw(DataType::Bool, vec![1], &[cond_val as u8]).unwrap();
         let x_t = Tensor::from_f32(&[2], &[2.0, 3.0]).unwrap();
         let outs = session.run(&[("cond", &cond_t), ("X", &x_t)]).expect("run");
         assert_eq!(outs.len(), 1);
         assert_eq!(outs[0].to_vec_f32(), expected.to_vec(), "cond={cond_val}");
         let stats = session.control_flow_stats();
-        assert_eq!(stats.subgraph_builds, (run + 1) as u64);
+        assert_eq!(stats.subgraph_builds, ((run + 1).min(2)) as u64);
         assert_eq!(stats.subgraph_runs, (run + 1) as u64);
     }
+}
+
+#[test]
+fn if_rejects_mismatched_branch_output_counts_before_running_selected_branch() {
+    let mut g = new_parent();
+    let cond = input(&mut g, "cond", DataType::Bool, &[]);
+    let _x = input(&mut g, "X", DataType::Float32, &[2]);
+    let y = g.create_named_value("Y", DataType::Float32, static_shape([2]));
+    let node = control_flow_node(&mut g, "If", vec![Some(cond)], vec![y], &[]);
+
+    let then_branch = if_branch("Add");
+    let mut else_branch = if_branch("Sub");
+    let extra = capture(&mut else_branch, "X", DataType::Float32, &[2]);
+    else_branch.add_output(extra);
+    register(&mut g, node, "then_branch", then_branch);
+    register(&mut g, node, "else_branch", else_branch);
+    g.add_output(y);
+
+    let mut session = InferenceSession::from_graph(g).expect("build session");
+    let cond_t = Tensor::from_raw(DataType::Bool, vec![], &[1]).unwrap();
+    let x_t = Tensor::from_f32(&[2], &[2.0, 3.0]).unwrap();
+    let err = session
+        .run(&[("cond", &cond_t), ("X", &x_t)])
+        .expect_err("mismatched branches must fail even when then_branch is selected");
+    assert!(
+        err.to_string().contains(
+            "control-flow op If: branches declare different output counts: then_branch has 1, \
+             else_branch has 2"
+        ),
+        "unexpected error: {err}"
+    );
+    assert_eq!(session.control_flow_stats().subgraph_runs, 0);
+}
+
+#[test]
+fn if_rejects_mismatched_branch_output_dtypes() {
+    let mut g = new_parent();
+    let cond = input(&mut g, "cond", DataType::Bool, &[]);
+    let _x = input(&mut g, "X", DataType::Float32, &[2]);
+    let y = g.create_named_value("Y", DataType::Float32, static_shape([2]));
+    let node = control_flow_node(&mut g, "If", vec![Some(cond)], vec![y], &[]);
+
+    let then_branch = if_branch("Add");
+    let mut else_branch = Graph::new();
+    let x = capture(&mut else_branch, "X", DataType::Float32, &[2]);
+    let out = op(
+        &mut else_branch,
+        "Cast",
+        &[x],
+        Some("branch_out"),
+        DataType::Int64,
+        &[2],
+        &[("to", Attribute::Int(DataType::Int64 as i64))],
+    );
+    else_branch.add_output(out);
+    register(&mut g, node, "then_branch", then_branch);
+    register(&mut g, node, "else_branch", else_branch);
+    g.add_output(y);
+
+    let mut session = InferenceSession::from_graph(g).expect("build session");
+    let cond_t = Tensor::from_raw(DataType::Bool, vec![], &[1]).unwrap();
+    let x_t = Tensor::from_f32(&[2], &[2.0, 3.0]).unwrap();
+    let err = session
+        .run(&[("cond", &cond_t), ("X", &x_t)])
+        .expect_err("mismatched branch dtypes must fail");
+    assert!(
+        err.to_string().contains(
+            "control-flow op If: branches declare different dtypes for output 0: \
+             then_branch is Float32, else_branch is Int64"
+        ),
+        "unexpected error: {err}"
+    );
+    assert_eq!(session.control_flow_stats().subgraph_runs, 0);
+}
+
+#[test]
+fn if_rejects_non_bool_and_multi_element_conditions() {
+    let build = |cond_dtype: DataType, cond_dims: &[usize]| {
+        let mut g = new_parent();
+        let cond = input(&mut g, "cond", cond_dtype, cond_dims);
+        let _x = input(&mut g, "X", DataType::Float32, &[2]);
+        let y = g.create_named_value("Y", DataType::Float32, static_shape([2]));
+        let node = control_flow_node(&mut g, "If", vec![Some(cond)], vec![y], &[]);
+        register(&mut g, node, "then_branch", if_branch("Add"));
+        register(&mut g, node, "else_branch", if_branch("Sub"));
+        g.add_output(y);
+        InferenceSession::from_graph(g).expect("build session")
+    };
+
+    let x_t = Tensor::from_f32(&[2], &[2.0, 3.0]).unwrap();
+    let mut wrong_dtype = build(DataType::Float32, &[]);
+    let float_cond = Tensor::from_f32(&[], &[1.0]).unwrap();
+    let err = wrong_dtype
+        .run(&[("cond", &float_cond), ("X", &x_t)])
+        .expect_err("non-bool If cond must fail");
+    assert!(
+        err.to_string()
+            .contains("input If cond: dtype mismatch (expected Bool, got Float32)"),
+        "unexpected error: {err}"
+    );
+
+    let mut wrong_shape = build(DataType::Bool, &[2]);
+    let vector_cond = Tensor::from_raw(DataType::Bool, vec![2], &[1, 0]).unwrap();
+    let err = wrong_shape
+        .run(&[("cond", &vector_cond), ("X", &x_t)])
+        .expect_err("multi-element If cond must fail");
+    assert!(
+        err.to_string().contains(
+            "control-flow op If: 'cond' must be a BOOL scalar or single-element tensor, \
+             got shape [2]"
+        ),
+        "unexpected error: {err}"
+    );
 }
 
 #[test]
