@@ -38,6 +38,46 @@ pub(crate) fn decode_e4m3fn(code: u8) -> f32 {
     sign * magnitude
 }
 
+pub(crate) fn quantize_fp8_e4m3_block(
+    input: &[f32],
+    scale_exponent: &mut u8,
+    packed: &mut [u8],
+    output: &mut [f32],
+) -> Result<()> {
+    require_block_lengths(
+        "FP8 E4M3FN",
+        packed,
+        FP8_E4M3_PACKED_BYTES,
+        output,
+        FP8_E4M3_BLOCK_SIZE,
+    )?;
+    if input.len() != FP8_E4M3_BLOCK_SIZE {
+        return Err(error(format!(
+            "FP8 E4M3FN block must consume {FP8_E4M3_BLOCK_SIZE} values, got {}",
+            input.len()
+        )));
+    }
+    let mut amax = 1.0e-4f32;
+    for &value in input {
+        if !value.is_finite() {
+            return Err(error("FP8 E4M3FN input contains a non-finite value"));
+        }
+        amax = amax.max(value.abs());
+    }
+    let scale_power = (amax / 448.0).log2().ceil() as i32;
+    let exponent = scale_power
+        .checked_add(127)
+        .filter(|&value| (1..=254).contains(&value))
+        .ok_or_else(|| error("FP8 E4M3FN E8M0 scale exponent is out of range"))?;
+    *scale_exponent = exponent as u8;
+    let scale = 2.0f32.powi(scale_power);
+    for ((code, &value), destination) in packed.iter_mut().zip(input).zip(output.iter_mut()) {
+        *code = encode_e4m3fn((value / scale).clamp(-448.0, 448.0));
+        *destination = 0.0;
+    }
+    dequantize_fp8_e4m3_block(*scale_exponent, packed, output)
+}
+
 pub(crate) fn dequantize_fp4_e2m1_block(
     scale_exponent: u8,
     packed: &[u8],
@@ -62,6 +102,37 @@ pub(crate) fn dequantize_fp4_e2m1_block(
         output[second] = checked_scaled_value("FP4 E2M1", decode_e2m1(byte >> 4), scale)?;
     }
     Ok(())
+}
+
+fn encode_e4m3fn(value: f32) -> u8 {
+    let sign = if value.is_sign_negative() { 0x80 } else { 0 };
+    let magnitude = value.abs();
+    if magnitude == 0.0 {
+        return sign;
+    }
+    if magnitude >= 448.0 {
+        return sign | 0x7e;
+    }
+    let min_normal = 2.0f32.powi(-6);
+    if magnitude < min_normal {
+        let mantissa = (magnitude / 2.0f32.powi(-9)).round_ties_even() as u8;
+        if mantissa == 0 {
+            return sign;
+        }
+        if mantissa >= 8 {
+            return sign | 0x08;
+        }
+        return sign | mantissa;
+    }
+    let mut exponent = magnitude.log2().floor() as i32;
+    let step = 2.0f32.powi(exponent - 3);
+    let mut significand = (magnitude / step).round_ties_even() as u32;
+    if significand == 16 {
+        exponent += 1;
+        significand >>= 1;
+    }
+    let encoded = (((exponent + 7) as u32) << 3) | (significand - 8);
+    sign | encoded.min(0x7e) as u8
 }
 
 pub(crate) fn dequantize_fp8_e4m3_block(
