@@ -12,7 +12,7 @@ use super::gelu::tanh_gelu;
 use super::{check_arity, to_dense_f32, write_dense_f32};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Activation {
+pub(super) enum Activation {
     Relu,
     Gelu,
     Silu,
@@ -28,10 +28,15 @@ pub struct MoEFactory;
 /// Phase 2 can replace the row loop with batch-union expert grouping so each
 /// selected expert's weights are consumed once for all routed rows.
 pub struct MoEKernel {
-    k: usize,
-    activation: Activation,
-    normalize_routing_weights: bool,
-    swiglu_fusion: usize,
+    attributes: MoeAttributes,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct MoeAttributes {
+    pub k: usize,
+    pub activation: Activation,
+    pub normalize_routing_weights: bool,
+    pub swiglu_fusion: usize,
     activation_alpha: f32,
     activation_beta: f32,
     swiglu_limit: f32,
@@ -39,6 +44,18 @@ pub struct MoEKernel {
 
 impl KernelFactory for MoEFactory {
     fn create(&self, node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
+        let attributes = MoeAttributes::from_node(node)?;
+        if int_attr(node, "block_size", 0)? != 0 {
+            return Err(error(
+                "block_size is a QMoE quantization attribute and is unsupported by float MoE",
+            ));
+        }
+        Ok(Box::new(MoEKernel { attributes }))
+    }
+}
+
+impl MoeAttributes {
+    pub(super) fn from_node(node: &Node) -> Result<Self> {
         let k = int_attr(node, "k", 1)?;
         if k <= 0 {
             return Err(error(format!("k must be > 0, got {k}")));
@@ -78,12 +95,7 @@ impl KernelFactory for MoEFactory {
                 "swiglu_fusion is only valid when activation_type='swiglu'",
             ));
         }
-        if int_attr(node, "block_size", 0)? != 0 {
-            return Err(error(
-                "block_size is a QMoE quantization attribute and is unsupported by float MoE",
-            ));
-        }
-        Ok(Box::new(MoEKernel {
+        Ok(Self {
             k: k as usize,
             activation,
             normalize_routing_weights: normalize,
@@ -91,7 +103,13 @@ impl KernelFactory for MoEFactory {
             activation_alpha: float_attr(node, "activation_alpha", 1.0)?,
             activation_beta: float_attr(node, "activation_beta", 0.0)?,
             swiglu_limit: float_attr(node, "swiglu_limit", f32::INFINITY)?,
-        }))
+        })
+    }
+
+    fn swiglu(&self, gate: f32, linear: f32) -> f32 {
+        let g = gate.min(self.swiglu_limit);
+        let l = linear.clamp(-self.swiglu_limit, self.swiglu_limit);
+        g * sigmoid(self.activation_alpha * g) * (l + self.activation_beta)
     }
 }
 
@@ -153,10 +171,10 @@ impl Kernel for MoEKernel {
             )));
         }
         let experts = inputs[1].shape[1];
-        if self.k > experts {
+        if self.attributes.k > experts {
             return Err(error(format!(
                 "requires 0 < k <= num_experts, got k={} and num_experts={experts}",
-                self.k
+                self.attributes.k
             )));
         }
 
@@ -180,11 +198,7 @@ impl Kernel for MoEKernel {
             )));
         }
         let inter = inputs[4].shape[2];
-        let expected_fc1 = if self.activation == Activation::Swiglu && self.swiglu_fusion != 0 {
-            2 * inter
-        } else {
-            inter
-        };
+        let expected_fc1 = self.attributes.fc1_size(inter);
         if inputs[2].shape[1] != expected_fc1 {
             return Err(error(format!(
                 "fc1_experts_weights dimension 1 must be {expected_fc1}, got {}",
@@ -198,8 +212,7 @@ impl Kernel for MoEKernel {
         validate_bias("fc2_experts_bias", inputs, 5, experts, hidden)?;
 
         let has_fc3 = inputs.get(6).is_some_and(|v| !v.is_absent());
-        let uses_separate_gate = (self.activation == Activation::Swiglu && self.swiglu_fusion == 0)
-            || (self.activation == Activation::Silu && has_fc3);
+        let uses_separate_gate = self.attributes.uses_separate_gate(has_fc3);
         let (fc3, fc3_bias) = if uses_separate_gate {
             let view = inputs
                 .get(6)
@@ -231,87 +244,31 @@ impl Kernel for MoEKernel {
         for row in 0..rows {
             let route = routing_weights(
                 &router[row * experts..(row + 1) * experts],
-                self.k,
-                self.normalize_routing_weights,
+                None,
+                self.attributes.k,
+                self.attributes.normalize_routing_weights,
             );
             let input_row = &x[row * hidden..(row + 1) * hidden];
             for (expert, route_weight) in route {
-                let mut fc1_out = linear(
+                let expert_out = run_expert(
                     input_row,
                     &fc1[expert * expected_fc1 * hidden..(expert + 1) * expected_fc1 * hidden],
                     fc1_bias
                         .as_deref()
                         .map(|b| &b[expert * expected_fc1..(expert + 1) * expected_fc1]),
-                    expected_fc1,
-                    hidden,
-                );
-                let activated = match self.activation {
-                    Activation::Swiglu => {
-                        let linear_part;
-                        let gate_part;
-                        if self.swiglu_fusion == 0 {
-                            gate_part = fc1_out;
-                            let weights = fc3.as_ref().unwrap();
-                            linear_part = linear(
-                                input_row,
-                                &weights[expert * inter * hidden..(expert + 1) * inter * hidden],
-                                fc3_bias
-                                    .as_deref()
-                                    .map(|b| &b[expert * inter..(expert + 1) * inter]),
-                                inter,
-                                hidden,
-                            );
-                        } else if self.swiglu_fusion == 1 {
-                            let mut gate = Vec::with_capacity(inter);
-                            let mut linear = Vec::with_capacity(inter);
-                            for pair in fc1_out.chunks_exact(2) {
-                                gate.push(pair[0]);
-                                linear.push(pair[1]);
-                            }
-                            gate_part = gate;
-                            linear_part = linear;
-                        } else {
-                            linear_part = fc1_out.split_off(inter);
-                            gate_part = fc1_out;
-                        }
-                        gate_part
-                            .into_iter()
-                            .zip(linear_part)
-                            .map(|(g, l)| self.swiglu(g, l))
-                            .collect()
-                    }
-                    Activation::Silu if fc3.is_some() => {
-                        let weights = fc3.as_ref().unwrap();
-                        let linear_part = linear(
-                            input_row,
-                            &weights[expert * inter * hidden..(expert + 1) * inter * hidden],
-                            fc3_bias
-                                .as_deref()
-                                .map(|b| &b[expert * inter..(expert + 1) * inter]),
-                            inter,
-                            hidden,
-                        );
-                        fc1_out
-                            .into_iter()
-                            .zip(linear_part)
-                            .map(|(g, l)| self.swiglu(g, l))
-                            .collect()
-                    }
-                    activation => {
-                        for value in &mut fc1_out {
-                            *value = activate(activation, *value);
-                        }
-                        fc1_out
-                    }
-                };
-                let expert_out = linear(
-                    &activated,
                     &fc2[expert * hidden * inter..(expert + 1) * hidden * inter],
                     fc2_bias
                         .as_deref()
                         .map(|b| &b[expert * hidden..(expert + 1) * hidden]),
+                    fc3.as_ref().map(|weights| {
+                        &weights[expert * inter * hidden..(expert + 1) * inter * hidden]
+                    }),
+                    fc3_bias
+                        .as_deref()
+                        .map(|b| &b[expert * inter..(expert + 1) * inter]),
                     hidden,
                     inter,
+                    &self.attributes,
                 );
                 for h in 0..hidden {
                     output[row * hidden + h] += route_weight * expert_out[h];
@@ -326,12 +283,94 @@ impl Kernel for MoEKernel {
     }
 }
 
-impl MoEKernel {
-    fn swiglu(&self, gate: f32, linear: f32) -> f32 {
-        let g = gate.min(self.swiglu_limit);
-        let l = linear.clamp(-self.swiglu_limit, self.swiglu_limit);
-        g * sigmoid(self.activation_alpha * g) * (l + self.activation_beta)
+impl MoeAttributes {
+    pub(super) fn fc1_size(&self, inter: usize) -> usize {
+        if self.activation == Activation::Swiglu && self.swiglu_fusion != 0 {
+            2 * inter
+        } else {
+            inter
+        }
     }
+
+    pub(super) fn uses_separate_gate(&self, has_fc3: bool) -> bool {
+        (self.activation == Activation::Swiglu && self.swiglu_fusion == 0)
+            || (self.activation == Activation::Silu && has_fc3)
+    }
+}
+
+pub(super) fn run_expert(
+    input: &[f32],
+    fc1_weights: &[f32],
+    fc1_bias: Option<&[f32]>,
+    fc2_weights: &[f32],
+    fc2_bias: Option<&[f32]>,
+    fc3_weights: Option<&[f32]>,
+    fc3_bias: Option<&[f32]>,
+    hidden: usize,
+    inter: usize,
+    attributes: &MoeAttributes,
+) -> Vec<f32> {
+    let mut fc1_out = linear(
+        input,
+        fc1_weights,
+        fc1_bias,
+        attributes.fc1_size(inter),
+        hidden,
+    );
+    let activated = match attributes.activation {
+        Activation::Swiglu => {
+            let linear_part;
+            let gate_part;
+            if attributes.swiglu_fusion == 0 {
+                gate_part = fc1_out;
+                linear_part = linear(
+                    input,
+                    fc3_weights.expect("validated unfused swiglu FC3"),
+                    fc3_bias,
+                    inter,
+                    hidden,
+                );
+            } else if attributes.swiglu_fusion == 1 {
+                let mut gate = Vec::with_capacity(inter);
+                let mut linear = Vec::with_capacity(inter);
+                for pair in fc1_out.chunks_exact(2) {
+                    gate.push(pair[0]);
+                    linear.push(pair[1]);
+                }
+                gate_part = gate;
+                linear_part = linear;
+            } else {
+                linear_part = fc1_out.split_off(inter);
+                gate_part = fc1_out;
+            }
+            gate_part
+                .into_iter()
+                .zip(linear_part)
+                .map(|(g, l)| attributes.swiglu(g, l))
+                .collect()
+        }
+        Activation::Silu if fc3_weights.is_some() => {
+            let linear_part = linear(
+                input,
+                fc3_weights.expect("validated SiLU gated FC3"),
+                fc3_bias,
+                inter,
+                hidden,
+            );
+            fc1_out
+                .into_iter()
+                .zip(linear_part)
+                .map(|(g, l)| attributes.swiglu(g, l))
+                .collect()
+        }
+        activation => {
+            for value in &mut fc1_out {
+                *value = activate(activation, *value);
+            }
+            fc1_out
+        }
+    };
+    linear(&activated, fc2_weights, fc2_bias, hidden, inter)
 }
 
 fn linear(
@@ -352,13 +391,37 @@ fn linear(
     output
 }
 
-fn routing_weights(logits: &[f32], k: usize, normalize: bool) -> Vec<(usize, f32)> {
-    let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    let exponentials: Vec<f32> = logits.iter().map(|&v| (v - max).exp()).collect();
-    let all_sum: f32 = exponentials.iter().sum();
+pub(super) fn routing_weights(
+    logits: &[f32],
+    aggregation_weights: Option<&[f32]>,
+    k: usize,
+    normalize: bool,
+) -> Vec<(usize, f32)> {
     let mut indices: Vec<usize> = (0..logits.len()).collect();
     indices.sort_unstable_by(|&a, &b| logits[b].total_cmp(&logits[a]).then_with(|| a.cmp(&b)));
     indices.truncate(k);
+    if let Some(weights) = aggregation_weights {
+        let denominator = if normalize {
+            indices.iter().map(|&i| weights[i]).sum()
+        } else {
+            1.0
+        };
+        return indices
+            .into_iter()
+            .map(|i| {
+                let weight = if denominator == 0.0 {
+                    0.0
+                } else {
+                    weights[i] / denominator
+                };
+                (i, weight)
+            })
+            .collect();
+    }
+
+    let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let exponentials: Vec<f32> = logits.iter().map(|&v| (v - max).exp()).collect();
+    let all_sum: f32 = exponentials.iter().sum();
     let denominator = if normalize {
         indices.iter().map(|&i| exponentials[i]).sum()
     } else {
@@ -463,10 +526,10 @@ fn error(message: impl Into<String>) -> EpError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kernels::testutil::Owned;
     use crate::CpuExecutionProvider;
+    use crate::kernels::testutil::Owned;
     use onnx_runtime_ep_api::ExecutionProvider;
-    use onnx_runtime_ir::{static_shape, Attribute, Graph, NodeId};
+    use onnx_runtime_ir::{Attribute, Graph, NodeId, static_shape};
     use onnx_runtime_loader::Model;
 
     fn model_node(

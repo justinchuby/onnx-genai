@@ -373,6 +373,31 @@ impl MatMulNBitsKernel {
         let default_zero_point = 1u8 << (self.bits - 1);
         let mut weight_kn = vec![0.0f32; self.k * self.n];
         for output in 0..self.n {
+            if group_indices.is_none() {
+                let packed_start = output * k_blocks * blob_size;
+                let scale_start = output * k_blocks;
+                let zero_point_start = output * zp_row_bytes;
+                let packed_row = &packed[packed_start..packed_start + k_blocks * blob_size];
+                let scale_row = &scales[scale_start..scale_start + k_blocks];
+                let zero_point_row = packed_zero_points
+                    .as_ref()
+                    .map(|points| &points[zero_point_start..zero_point_start + zp_row_bytes]);
+                for depth in 0..self.k {
+                    let index = match layout {
+                        WeightLayout::Kn => depth * self.n + output,
+                        WeightLayout::Nk => output * self.k + depth,
+                    };
+                    weight_kn[index] = dequantize_nbits_value(
+                        packed_row,
+                        scale_row,
+                        zero_point_row,
+                        depth,
+                        self.bits,
+                        self.block_size,
+                    );
+                }
+                continue;
+            }
             for depth in 0..self.k {
                 let block = depth / self.block_size;
                 let within_block = depth % self.block_size;
@@ -399,6 +424,50 @@ impl MatMulNBitsKernel {
         }
         Ok(weight_kn)
     }
+}
+
+/// Dequantize one packed output row using ORT's LSB-first affine NBits layout.
+///
+/// `scales` contains one value per K block. `zero_points`, when present,
+/// contains those block zero points packed with the same bit width.
+pub(super) fn dequantize_nbits_row(
+    packed: &[u8],
+    scales: &[f32],
+    zero_points: Option<&[u8]>,
+    output: &mut [f32],
+    bits: usize,
+    block_size: usize,
+) {
+    for (depth, value) in output.iter_mut().enumerate() {
+        *value = dequantize_nbits_value(packed, scales, zero_points, depth, bits, block_size);
+    }
+}
+
+#[inline]
+fn dequantize_nbits_value(
+    packed: &[u8],
+    scales: &[f32],
+    zero_points: Option<&[u8]>,
+    depth: usize,
+    bits: usize,
+    block_size: usize,
+) -> f32 {
+    let mask = if bits == 8 {
+        u8::MAX
+    } else {
+        (1u8 << bits) - 1
+    };
+    let default_zero_point = 1u8 << (bits - 1);
+    let block = depth / block_size;
+    let within_block = depth % block_size;
+    let bit_offset = within_block * bits;
+    let quantized =
+        (packed[block * block_size * bits / 8 + bit_offset / 8] >> (bit_offset % 8)) & mask;
+    let zero_point = zero_points.map_or(default_zero_point, |points| {
+        let bit_offset = block * bits;
+        (points[bit_offset / 8] >> (bit_offset % 8)) & mask
+    });
+    (quantized as f32 - zero_point as f32) * scales[block]
 }
 
 fn configured_decode_threads() -> Option<usize> {

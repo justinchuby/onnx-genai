@@ -59,6 +59,7 @@ pub mod norm_ops;
 pub mod onednn;
 pub mod pad;
 pub mod pooling;
+pub mod qmoe;
 pub mod quantization;
 pub mod reduce;
 pub mod reduce_ops;
@@ -321,6 +322,10 @@ pub fn build_cpu_registry() -> OpRegistry {
     reg.register(
         OpKey::new("MoE", "com.microsoft", 1),
         Box::new(moe::MoEFactory),
+    );
+    reg.register(
+        OpKey::new("QMoE", "com.microsoft", 1),
+        Box::new(qmoe::QMoEFactory),
     );
     // Standard-domain LLM/transformer primitives (ai.onnx). Registered at their
     // ONNX since_version; the registry resolves the highest since_version <=
@@ -1234,7 +1239,7 @@ mod tests {
         // `LogSoftmax` each have a legacy and an opset-13 entry. Five contrib
         // (`com.microsoft`) fused transformer entries (BiasGelu, FastGelu,
         // QuickGelu, Silu, SkipLayerNormalization, SimplifiedLayerNormalization,
-        // SkipSimplifiedLayerNormalization) add seven more; `MoE` and
+        // SkipSimplifiedLayerNormalization) add seven more; `MoE`, `QMoE`, and
         // `GroupQueryAttention` add one contrib entry each.
         // QuantizeLinear and
         // DequantizeLinear each add six versioned entries, while
@@ -1248,7 +1253,7 @@ mod tests {
         // registrations over the Phase-1 op-name count in total.
         // MatMulNBits, BlockQuantizedMatMul, and GroupQueryAttention each add one
         // more private/contrib-domain registration.
-        assert_eq!(reg.len(), PHASE1_OPS.len() + 53);
+        assert_eq!(reg.len(), PHASE1_OPS.len() + 54);
         for op in PHASE1_OPS {
             assert!(reg.lookup(op, "", 21).is_some(), "missing factory for {op}");
         }
@@ -1258,6 +1263,7 @@ mod tests {
         assert!(reg.lookup("LogSoftmax", "", 12).is_some());
         assert!(reg.lookup("LogSoftmax", "", 13).is_some());
         assert!(reg.lookup("MatMulNBits", "com.microsoft", 1).is_some());
+        assert!(reg.lookup("QMoE", "com.microsoft", 1).is_some());
         assert!(
             reg.lookup("BlockQuantizedMatMul", "com.github.onnxruntime.genai", 1)
                 .is_some()
