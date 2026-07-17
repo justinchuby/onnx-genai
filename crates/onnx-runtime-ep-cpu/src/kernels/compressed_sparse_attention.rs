@@ -1,11 +1,10 @@
 //! Phase-1 f32 reference skeleton for
 //! `pkg.nxrt::CompressedSparseAttention` v1.
 //!
-//! This first executable seam consumes the frozen sparse-kernel boundary:
-//! projected queries, an already assembled dense-window/compressed-history KV
-//! cache, selected indices, and learned logit sinks. Stateful compressor/carry
-//! updates and FP4/FP8 dequantization remain explicit Unsupported paths until
-//! their complete cache ABI is wired into the runtime.
+//! The registered operator exposes the complete frozen stateful v1 boundary.
+//! Stateful compressor/carry updates remain an explicit Unsupported path until
+//! their equations are wired into the runtime. The Phase-1 assembled-cache
+//! gather/attention implementation remains a tested, unregistered reference.
 
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ir::{DataType, Node};
@@ -18,8 +17,29 @@ use super::{check_arity, write_dense_f32};
 
 const OP: &str = "CompressedSparseAttention";
 const LAYOUT_VERSION: i64 = 1;
+const FROZEN_V1_REQUIRED_INPUTS: usize = 11;
+const FROZEN_V1_MAX_INPUTS: usize = 20;
+const FROZEN_V1_REQUIRED_OUTPUTS: usize = 3;
+const FROZEN_V1_MAX_OUTPUTS: usize = 6;
+const FROZEN_V1_REQUIRED_INPUT_NAMES: [&str; FROZEN_V1_REQUIRED_INPUTS] = [
+    "query",
+    "current_kv",
+    "compressor_kv",
+    "compressor_gate",
+    "compressor_ape",
+    "compressor_norm",
+    "past_compressed_kv",
+    "past_compression_carry",
+    "seqlens_k",
+    "total_sequence_length",
+    "head_sink",
+];
 
 pub struct CompressedSparseAttentionFactory;
+
+struct DeferredCompressedSparseAttentionKernel {
+    compression_ratio: usize,
+}
 
 struct CompressedSparseAttentionKernel {
     num_heads: usize,
@@ -31,6 +51,18 @@ struct CompressedSparseAttentionKernel {
 
 impl KernelFactory for CompressedSparseAttentionFactory {
     fn create(&self, node: &Node, input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
+        validate_frozen_v1_schema(node)?;
+        self.create_impl(node, input_shapes, false)
+    }
+}
+
+impl CompressedSparseAttentionFactory {
+    fn create_impl(
+        &self,
+        node: &Node,
+        input_shapes: &[Vec<usize>],
+        phase1_reference: bool,
+    ) -> Result<Box<dyn Kernel>> {
         let num_heads = required_positive_int(node, "num_heads")?;
         let head_dim = required_positive_int(node, "head_dim")?;
         let compression_ratio = required_positive_int(node, "compression_ratio")?;
@@ -95,7 +127,7 @@ impl KernelFactory for CompressedSparseAttentionFactory {
             return Err(error("scale must be finite and non-negative"));
         }
 
-        if input_shapes.len() >= 4 {
+        if phase1_reference && input_shapes.len() >= 4 {
             infer_output_shape(
                 &input_shapes[0],
                 &input_shapes[1],
@@ -105,14 +137,88 @@ impl KernelFactory for CompressedSparseAttentionFactory {
                 head_dim,
             )?;
         }
-        Ok(Box::new(CompressedSparseAttentionKernel {
-            num_heads,
-            head_dim,
-            compression_ratio,
-            index_num_heads,
-            scale,
-        }))
+        if phase1_reference {
+            Ok(Box::new(CompressedSparseAttentionKernel {
+                num_heads,
+                head_dim,
+                compression_ratio,
+                index_num_heads,
+                scale,
+            }))
+        } else {
+            Ok(Box::new(DeferredCompressedSparseAttentionKernel {
+                compression_ratio,
+            }))
+        }
     }
+
+    #[cfg(test)]
+    fn create_phase1_reference(
+        &self,
+        node: &Node,
+        input_shapes: &[Vec<usize>],
+    ) -> Result<Box<dyn Kernel>> {
+        self.create_impl(node, input_shapes, true)
+    }
+}
+
+impl Kernel for DeferredCompressedSparseAttentionKernel {
+    fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+        validate_frozen_v1_runtime_arity(inputs, outputs)?;
+        for (index, name) in FROZEN_V1_REQUIRED_INPUT_NAMES.iter().enumerate() {
+            if inputs[index].is_absent() {
+                return Err(error(format!(
+                    "required frozen-v1 input {index} ('{name}') is absent"
+                )));
+            }
+        }
+
+        let deferred = if self.compression_ratio == 4 {
+            "stateful compressed-KV construction, compression-carry updates, index-key construction/carry updates, and top-k index selection are deferred in Phase 1"
+        } else {
+            "stateful compressed-KV construction and compression-carry updates are deferred in Phase 1"
+        };
+        Err(unsupported(deferred))
+    }
+}
+
+fn validate_frozen_v1_schema(node: &Node) -> Result<()> {
+    if !(FROZEN_V1_REQUIRED_INPUTS..=FROZEN_V1_MAX_INPUTS).contains(&node.inputs.len()) {
+        return Err(error(format!(
+            "frozen v1 requires {FROZEN_V1_REQUIRED_INPUTS}..={FROZEN_V1_MAX_INPUTS} positional inputs, got {}",
+            node.inputs.len()
+        )));
+    }
+    if !(FROZEN_V1_REQUIRED_OUTPUTS..=FROZEN_V1_MAX_OUTPUTS).contains(&node.outputs.len()) {
+        return Err(error(format!(
+            "frozen v1 requires {FROZEN_V1_REQUIRED_OUTPUTS}..={FROZEN_V1_MAX_OUTPUTS} outputs, got {}",
+            node.outputs.len()
+        )));
+    }
+    for (index, name) in FROZEN_V1_REQUIRED_INPUT_NAMES.iter().enumerate() {
+        if node.inputs[index].is_none() {
+            return Err(error(format!(
+                "required frozen-v1 input {index} ('{name}') is omitted"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_frozen_v1_runtime_arity(inputs: &[TensorView], outputs: &[TensorMut]) -> Result<()> {
+    if !(FROZEN_V1_REQUIRED_INPUTS..=FROZEN_V1_MAX_INPUTS).contains(&inputs.len()) {
+        return Err(error(format!(
+            "frozen v1 requires {FROZEN_V1_REQUIRED_INPUTS}..={FROZEN_V1_MAX_INPUTS} positional inputs, got {}",
+            inputs.len()
+        )));
+    }
+    if !(FROZEN_V1_REQUIRED_OUTPUTS..=FROZEN_V1_MAX_OUTPUTS).contains(&outputs.len()) {
+        return Err(error(format!(
+            "frozen v1 requires {FROZEN_V1_REQUIRED_OUTPUTS}..={FROZEN_V1_MAX_OUTPUTS} outputs, got {}",
+            outputs.len()
+        )));
+    }
+    Ok(())
 }
 
 impl Kernel for CompressedSparseAttentionKernel {
@@ -547,7 +653,7 @@ mod tests {
             node.attributes
                 .insert("cache_format".into(), Attribute::String(format.into()));
         }
-        CompressedSparseAttentionFactory.create(&node, shapes)
+        CompressedSparseAttentionFactory.create_phase1_reference(&node, shapes)
     }
 
     #[test]
@@ -624,5 +730,70 @@ mod tests {
         let message = result.err().unwrap().to_string();
         assert!(message.contains("Unsupported"));
         assert!(message.contains("FP4/FP8 compressed-KV dequantization"));
+    }
+
+    #[test]
+    fn frozen_v1_stateful_path_is_explicitly_unsupported() {
+        let mut graph = Graph::new();
+        graph.opset_imports.insert("pkg.nxrt".into(), 1);
+        let inputs = FROZEN_V1_REQUIRED_INPUT_NAMES
+            .iter()
+            .map(|name| Some(graph.create_named_value(*name, DataType::Float32, static_shape([1]))))
+            .collect();
+        let outputs = ["Y", "present_compressed_kv", "present_compression_carry"]
+            .into_iter()
+            .map(|name| graph.create_named_value(name, DataType::Float32, static_shape([1])))
+            .collect();
+        let mut node = Node::new(NodeId(0), OP, inputs, outputs);
+        node.domain = "pkg.nxrt".into();
+        node.attributes
+            .insert("num_heads".into(), Attribute::Int(2));
+        node.attributes.insert("head_dim".into(), Attribute::Int(2));
+        node.attributes
+            .insert("compression_ratio".into(), Attribute::Int(128));
+
+        let shapes = vec![vec![1]; FROZEN_V1_REQUIRED_INPUTS];
+        let kernel = CompressedSparseAttentionFactory
+            .create(&node, &shapes)
+            .unwrap();
+        let owned_inputs = (0..FROZEN_V1_REQUIRED_INPUTS)
+            .map(|_| Owned::f32(&[1], &[0.0]))
+            .collect::<Vec<_>>();
+        let input_views = owned_inputs.iter().map(Owned::view).collect::<Vec<_>>();
+        let mut owned_outputs = (0..FROZEN_V1_REQUIRED_OUTPUTS)
+            .map(|_| Owned::zeros_f32(&[1]))
+            .collect::<Vec<_>>();
+        let mut output_views = owned_outputs
+            .iter_mut()
+            .map(Owned::view_mut)
+            .collect::<Vec<_>>();
+
+        let message = kernel
+            .execute(&input_views, &mut output_views)
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("Unsupported"));
+        assert!(message.contains("stateful compressed-KV construction"));
+        assert!(message.contains("compression-carry updates"));
+    }
+
+    #[test]
+    fn public_v1_rejects_phase1_reference_arity() {
+        let mut graph = Graph::new();
+        let output = graph.create_named_value("Y", DataType::Float32, static_shape([1, 1, 2, 2]));
+        let mut node = Node::new(NodeId(0), OP, vec![None; 4], vec![output]);
+        node.attributes
+            .insert("num_heads".into(), Attribute::Int(2));
+        node.attributes.insert("head_dim".into(), Attribute::Int(2));
+        node.attributes
+            .insert("compression_ratio".into(), Attribute::Int(128));
+
+        let shapes = vec![vec![]; 4];
+        let message = CompressedSparseAttentionFactory
+            .create(&node, &shapes)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(message.contains("frozen v1 requires 11..=20 positional inputs"));
     }
 }
