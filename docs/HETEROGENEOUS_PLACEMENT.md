@@ -1,6 +1,6 @@
 # Heterogeneous CPU+CUDA Placement for the Native Runtime
 
-> **Status: AWAITING USER GREENLIGHT**
+> Status: ON HOLD — re-scoped (2026-07-14). Superseded premise: CUDA quantized GEMM prefill now exists (main 776a8b9); CPU fallback narrows to genuinely-unsupported ops only.
 >
 > This document is a design proposal. The current implementation remains a
 > single-EP executor and fails CUDA model load when the selected CUDA EP cannot
@@ -9,6 +9,18 @@
 > **Primary targets:** GLM-5.2/DeepSeek-scale sub-4-bit decoder models.
 >
 > **Date:** 2026-07-16
+
+## Direction Change (2026-07-14)
+
+The original premise—routing `M>1` quantized prefill to CPU—is rejected for
+GLM/DeepSeek-scale models because CPU prefill is far too slow. The fix was to
+add a CUDA quantized GEMM (`M>1`) prefill kernel, which has now landed on main
+in `776a8b9`. Consequently, `DevicePreference::Gpu` keeps quantized prefill
+and decode on CUDA.
+
+Heterogeneous placement is deferred. When it is revisited, CPU fallback will
+be limited to operations the GPU EP genuinely cannot execute; `M>1` quantized
+matmul is not a fallback case.
 
 ## 1. Executive recommendation
 
@@ -427,3 +439,19 @@ existing EP registry/capability contracts, shape-keyed placement, and explicit
 cross-device copies. Preserve CUDA `M=1 BlockQuantizedMatMul` decode while
 routing `M>1` prefill and unsupported operators to CPU. Optimize partitioning,
 copy overlap, and residency only after real-model correctness is demonstrated.
+
+## Resolved Open Questions (2026-07-14)
+
+1. `DevicePreference::Gpu` means quantized prefill and decode both run on CUDA.
+   CPU fallback is only for operations the GPU EP cannot execute, not `M>1` by
+   default.
+2. Placement is decided per operation through EP `GetCapability`, not through a
+   global `M` threshold.
+3. A fallback boundary inserts device copies only around the unsupported
+   operation island; crossings must be minimized.
+4. Quantized weights remain resident on their assigned device; they are not
+   re-uploaded for each step.
+5. The mixed-EP subgraph partition is planned once at load and cached.
+6. Heterogeneous placement is deferred until the CUDA quantized GEMM prefill
+   path is validated end-to-end on GLM/DeepSeek. It is not on the critical path
+   now.

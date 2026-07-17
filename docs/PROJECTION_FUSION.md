@@ -1,5 +1,5 @@
 # Native Decode Projection Fusion Design
-**Status:** design for review; no fusion is implemented by this document<br>
+Status: Approved (2026-07-14) — all open questions resolved<br>
 **Scope:** native CPU decode, `com.microsoft::MatMulNBits`, block-quantized int4 projections<br>
 **Primary model:** Qwen2.5-0.5B int4<br>
 **Date:** 2026-07-16
@@ -575,6 +575,7 @@ A serious version of this alternative would introduce a grouped internal kernel 
 | PF-10 | Keep direct-int4 code unchanged; fusion only changes N and constant storage. | Minimizes kernel risk and preserves established numerics. |
 | PF-11 | Make the pass idempotent and skip already-packed QKV. | The measured Qwen artifact already contains packed QKV. |
 | PF-12 | Treat owned fused-initializer bytes and prefill TTFT as release gates. | Fusion can trade decode speed for memory/load/prefill regressions. |
+**Authoritative update:** Where any PF-1–PF-12 decision conflicts with §17.1, §17.1 is authoritative.
 ## 17. Open questions for owner review
 1. **Memory budget:** Is approximately 125 MiB of owned gate/up fused bytes for Qwen2.5-0.5B acceptable, or should the first prototype use a grouped kernel over separate weight buffers?
 2. **Internal Split encoding:** May the post-load IR use the supported legacy `split` attribute under opset 21, or must EPContext export always materialize an int64 split initializer?
@@ -586,6 +587,26 @@ A serious version of this alternative would introduce a grouped internal kernel 
 8. **Optimization ownership:** Keep the pass beside `fuse_silu_patterns` for now, or create a dedicated `onnx-runtime-session::optimizers` module first?
 9. **Profiler naming:** Should fused segments be reported as one `MatMulNBits[fused_gate_up]` category or retain synthetic per-segment metadata?
 10. **Fallback experiment:** If physical concatenation wins less than 3% decode or exceeds the memory budget, should grouped separate-buffer execution become the preferred architecture?
+### §17.1 Resolutions (Approved 2026-07-14)
+Q1 (memory budget): Physical concat of sibling projection weights (accept ~125 MiB), gated by an owned-bytes release check; if decode gain <3% or over budget, switch to grouped separate-buffer variant.
+
+Q2 (Split encoding): Always materialize an explicit int64 split initializer (no implicit/equal-split assumption).
+
+Q3 (rollout): Guard behind ONNX_GENAI_PROJECTION_FUSION=1; default-on only after Qwen validation.
+
+Q4 (prefill/TTFT): ≤2% TTFT-regression release gate + prefer packed-GQA bypass to minimize prefill materialization. Multi-turn exposure is bounded because prefix caching (PrefixCache in onnx-genai-kv, wired in engine.rs, tracks prefix_cache_hit_len) already limits per-turn prefill to newly-added tokens.
+
+Q5 (packed GQA scope): First version does gate/up only (benchmark Qwen QKV is already packed). Separate-QKV → packed-GQA rewiring is Phase 2.
+
+Q6 (bias): Defer post-MatMul bias Add fusion; Phase A tests the no-bias gate/up path first. Bias fusion moves to Phase D generalization.
+
+Q7 (explicit zero-point): Correct handling of explicit-zp (asymmetric) MatMulNBits is a HARD rollout gate. Until supported, fusion MUST safely skip explicit-zp nodes — never miscompute.
+
+Q8 (code placement): Build a thin shared `optimizers` module (pass trait + registry + env-flag toggle + ordering) and have EACH EP register its OWN fusion pass set (EP-scoped, matching ORT's EP-scoped transformer model). Projection fusion lands first as a CPU EP optimizer; CUDA/Metal add their own later.
+
+Q9 (profiler naming): Single `fused_projection` profiling category for attribution; retain per-segment sub-labels in debug builds.
+
+Q10 (fallback threshold): If physical-concat yields <3% decode gain OR exceeds the memory budget, fall back to the grouped separate-buffer variant.
 ## 18. Acceptance criteria
 The design is ready to implement only when the owner accepts PF-1 through PF-12 or records replacements. Implementation is complete only when:
 - the pass fuses all 24 gate/up pairs in the inspected model;
