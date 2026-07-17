@@ -54,5 +54,9 @@ name = "profile_decode"
 required-features = ["bench-ort"]
 
 [[bin]]
+name = "render_template"
+required-features = ["bench-ort"]
+
+[[bin]]
 name = "profile_native"
 required-features = ["bench-native"]
