@@ -1863,3 +1863,220 @@ Status: design approved; Phase 1 = mmap disk tier + active-expert CPU MoE access
 **What:** Expert offload uses bounded host-RAM LFRU caches with Arc leases, pinning, hysteresis, strict byte reservation, oversized direct-mmap, zero-byte fallback, governor integration, and metrics. Cache ownership and caps are per engine; uncacheable history is skipped and LFRU-pruned at 4096. Global residency/effective-budget metrics use checked delta aggregation across live caches, and Drop saturating-subtracts each cache contribution exactly once.
 **Why:** Nabil rejected `19e90ff` because a last engine could overwrite the global cache budget and history grew without bound. Chew was locked out; Deckard's `da2d1be` added per-engine partitioning and bounded history, but was rejected because global residency remained a clobbered/stale atomic. Deckard was locked out; Leon fixed accounting in `ceda4e7`, landed as `f80ca09`. Leased/pinned entries remain non-evictable, cached output is bit-identical to direct mmap, and zero-byte behavior remains Phase 1-compatible.
 **Review:** Nabil 🔴→🔴→🟢; CPU EP 487 and Engine 141 tests pass.
+
+
+## 2026-07-17 — Overnight perf and feature decisions
+
+### Performance scalability
+
+### 2026-07-17: Graph partition/fusion performance audit (10k+ nodes)
+**By:** Wallace
+**What:** Verdict: no, the full pipeline is not generally 10k+-scalable yet. Default single-EP Executor build is near-linear (41.6 ms at 20k), but shape inference is O(NV), constant folding/fusion and many-boundary EPContext splicing have quadratic paths, there is no active heterogeneous partitioner, and static buffers have no liveness reuse.
+**Why:** Justin: must stay performant on very large models.
+
+### 2026-07-17: Constant folding uses a dependency worklist (O(N+E))
+**By:** Wallace
+**What:** Replaced global reverse-scan fixpoint with unresolved-input-count worklist.
+**Why:** Audit hotspot #2 — O(N^2), 11.6s at 20k nodes. Scheduling-only change; folded set identical.
+
+### 2026-07-17: Review — constant-folding worklist (Wallace e623ee1)
+**By:** Deckard
+**Verdict:** 🔴
+**Scheduling-only (folded set identical)?:** No. The fold/evaluation predicates are otherwise preserved: domain, single-output restriction, supported ops, inline-initializer definition, Shape guards, integer dtype/shape/size checks, and checked arithmetic match the parent implementation. However, FIFO changes the relative order of initially-ready nodes and newly-ready lower-NodeId consumers. A concrete graph with NodeId 0 `Constant -> a`, NodeId 1 `Add(a, initializer) -> b`, and NodeId 2 `Shape(b) -> graph_output` folds all three under the old ascending reverse-scan: Constant makes Add ready, Add folds while Shape still consumes `b`, then Shape folds. The new queue starts `[Constant, Shape]`; Constant appends Add behind Shape, Shape folds first and removes the sole consumer of `b`, then Add fails the unchanged `needed` guard and remains. An external read-only probe against e623ee1 produced `remaining_nodes=1`, `remaining_op=Add`, `b_initializer=false`, with a valid graph. Thus the folded set and serialized graph are not identical.
+**Counter correctness (multi-output/repeated/optional inputs):** The edge counters themselves are sound: repeated unresolved inputs are counted and registered once per edge, so they decrement the same number of times; missing optional inputs exclude the node just as evaluation previously refused it; non-constant graph inputs/external initializers never emit readiness; candidates remain single-output, so a multi-output producer cannot spuriously publish all outputs, and dependencies are keyed by the specific `ValueId`. The rejection is the queue/liveness interaction above, not an arithmetic counter underflow.
+**Determinism:** Deterministic but not semantics-preserving. Arena iteration and dependent insertion are ascending NodeId, FIFO is stable, and HashMap iteration order is not used for scheduling.
+**Termination / no-double-fold:** `unresolved.remove(&nid)` ensures at most one attempt per candidate. The reverse-NodeId chain test genuinely constructs descending dependency NodeIds and proves notification propagation; it would leave nodes behind if decrements/enqueues were broken. It does not cover ready-vs-newly-ready ordering interacting with the `needed` guard.
+**Graph-output & liveness:** Graph outputs remain live through `remove_node` and are re-backed by an inline initializer correctly. Consumer bookkeeping is exactly what exposes the semantic regression: folding an independent `Shape` first can make its producer output dead before that producer's scheduled attempt.
+**Tests:** `cargo test --locked -p onnx-runtime-optimizer` passed 48 tests total (47 unit + 1 integration; 0 failures, 0 ignored; 0 doc tests). Coverage misses the schedule-sensitive liveness case above.
+
+Wallace is locked out from revising this rejected artifact; the coordinator must assign the fix to a different agent.
+
+### 2026-07-17: Constant folding worklist reproduces original ascending-wave order
+**By:** Holden
+**What:** Replaced Wallace's FIFO with a wave-structured ascending-NodeId schedule (updates visible to higher NodeIds within a wave, lower NodeIds deferred to next wave), making the folded set byte-identical to the original fixpoint. Kept the O(N+E) edge counters.
+**Why:** Deckard 🔴 — FIFO interacted with the liveness `needed` guard, leaving `Add` unfolded in a Constant→Add→Shape graph. Fixes on top of Wallace e623ee1.
+
+### 2026-07-17: Re-review — constant-folding wave order (Holden 80b0aaf)
+**By:** Deckard
+**Verdict:** 🟢 CLEARS TO LAND
+**Counterexample folds all 3?:** Yes. `Constant(0) → Add(1) → Shape(2)` leaves `remaining_nodes == 0`, no `Add`, and serialized output exactly equal to the original ascending-fixpoint reference.
+**Wave logic faithful to original?:** Yes. The min-heap is an ascending-pass cursor: a newly-ready consumer above the processed `NodeId` joins the current wave; a lower/equal consumer waits for the next wave. Unique node IDs make equality with a distinct pending node impossible; multiple consumers spanning the cursor are independently placed on the correct side.
+**Adversarial probes:** Split fan-out (`Constant(2)` readies `Add(0)` and `Add(4)`) matched pass semantics: 4 runs now, 0 next. The lower-dead-producer graph (`Add(0) → Shape(1)`, then `Constant(2)` readies Add) matched the original and intentionally leaves Add unfolded. Two-producer diamonds with the last producer in both an earlier and later wave matched. A 500,000-case randomized DAG schedule model (2–10 nodes, static/dynamic Shape, duplicate Add inputs, arbitrary NodeId/topology order and liveness outputs) found no divergence. The proposed “higher newly-ready node kills an unrelated deferred lower producer” is not realizable with these foldable operators: Add cannot become ready before every data producer, while Shape has only its triggering input.
+**Seeded tests cross-check a faithful reference?:** Yes. `run_reference_ascending_fixpoint` is the pre-Wallace implementation: repeated full ascending `NodeId` snapshots, in-place updates visible later in the pass, and the same domain/output-count/evaluator/`needed` guards. The 32 seeded DAGs serialize the new result and this independent reference and compare bytes.
+**Tests:** optimizer 51 passed (50 unit + 1 integration; 0 failed). Deterministic raw-`NodeId` heap ordering; every candidate is dequeued/removed from `unresolved` at most once, so wave churn cannot be infinite.
+
+### 2026-07-17: EPContext splice hoists graph_outputs / avoids per-partition full scans
+**By:** Leon
+**What:** Precompute graph_outputs once; partition_boundary no longer rebuilds it per partition. Splice pass now ~linear in total covered nodes, not partitions×graph.
+**Why:** Audit hotspot #3 — O(P·G) per-partition rescan, ~4.8s at 20k nodes. Serialized model byte-identical.
+
+
+### WEIGHT_OFFLOAD Phase 3a
+
+### 2026-07-17: Keep Phase 3a device offload planning pure and capability-negotiated
+**By:** Chew
+**What:** Phase 3a translates `gpu_layers:N` to bytes under a coordinated weight ceiling, places whole layers greedily, protects a committed-sequence KV floor with hysteresis and dwell, and exposes lazy `pkg.nxrt::BlockQuantizedMoE` weights only to EPs advertising `nxrt`. Stock EPs materialize resident weights; live device binding remains explicitly unsupported until Phase 3b.
+**Why:** This lands the policy, accounting, and executor seam with CPU-only deterministic tests while preserving Phase 1/2 behavior and preventing compatibility overrides from stealing KV or scratch VRAM.
+
+### 2026-07-17: Review — WEIGHT_OFFLOAD P3a
+**By:** Nabil
+**Verdict:** 🔴 Red (blocking)
+**Findings:**
+- **[High]** `crates/onnx-runtime-ep-cpu/src/weight_offload/placement.rs:425-434` ignores `requested_kv_bytes` whenever KV pressure is low and reduces the target directly to the committed floor. After dwell, pending batch-admission demand can therefore be discarded. There is also no admission decision/result at batch formation. This violates §11 Q8 (L745-748), which makes admission control and continuous-batching admission tests hard gates. **Fix: Leon.**
+- **[High]** `crates/onnx-runtime-ep-cpu/src/weight_offload/weight_handle.rs:154-173` defines negotiation only inside the CPU EP crate, with no production call sites, while `crates/onnx-runtime-ep-api/src/kernel.rs:130` still exposes only `TensorView` inputs. Consequently, an `nxrt` EP cannot actually receive a lazy `WeightHandle`, and the stock-EP materialized path is not verified through the unchanged executor path. This violates §11 Q1 (L700-703), which requires a general executor handle with capability-detected lazy delivery and resident fallback. **Fix: Deckard.**
+- **[Pass]** `plan_placement` is deterministic and explainable, reports `gpu_layers:N` in bytes, and keeps every region of a layer on one device (§11 Q5-Q6).
+- **[Pass]** The committed KV floor rejection, watermark hysteresis, dwell behavior, whole-quant-block snapping, P1/P2 preservation, and Phase-3b device-paging deferral are correctly covered. `cargo test --locked -p onnx-runtime-ep-cpu`: 498 passed, 0 failed, 1 ignored.
+**Fix owner (if 🔴):** Leon for governor/admission; Deckard for the executor/EP `WeightHandle` seam. Chew remains locked out.
+
+### 2026-07-17: WEIGHT_OFFLOAD P3a fixes — KV admission + WeightHandle EP seam
+**By:** Deckard
+**What:** KV arbitration now preserves outstanding requested admission capacity under low residency pressure and returns an explicit admitted/rejected batch decision with the granted/current KV budget and limiting factor. The shared ep-api now exposes capability-advertised lazy `WeightHandle` kernel inputs, while the executor selects them only for `pkg.nxrt::BlockQuantizedMoE`; stock EPs retain the resident `TensorView` dispatch path and Phase 3a device binding remains unsupported.
+**Why:** §11 Q8 makes deterministic continuous-batch admission a hard gate and defines the committed KV floor as a minimum rather than a target ceiling. §11 Q1 requires a general executor weight handle with capability-detected lazy delivery and resident fallback for existing EPs.
+
+### 2026-07-17: Re-review — WEIGHT_OFFLOAD P3a fixes (Deckard 3425498)
+**By:** Nabil
+**Verdict:** 🔴
+**Finding #1 (KV admission):** Resolved. `requested_kv_bytes` now participates in both pressure branches, every successful arbitration path derives an explicit `KvAdmissionDecision`, dwell/hysteresis returns an explicit rejection rather than dropping demand, and admission uses the returned state's current KV sub-budget. Checked arithmetic bounds the target by `total - scratch` and uses checked/u128 arithmetic.
+**Finding #2 (WeightHandle seam):** Not fully resolved. `WeightHandle` correctly moved into ep-api, ep-cpu coherently re-exports it, the executor capability-gates lazy delivery specifically for `pkg.nxrt::BlockQuantizedMoE`, stock EPs retain `TensorView` dispatch, and the lazy materializer keeps `WeightStore` alive via `Arc`. However, the executor still eagerly creates a concrete buffer for every initializer before execution (`executor.rs:925-979`). For a non-host nxrt EP this allocates and copies the entire supposedly lazy weight to device (`executor.rs:970-973`), then replaces its view with `KernelInput::Weight` only at dispatch (`executor.rs:2127-2143`). This double residency can OOM during build and defeats device offload; the CPU-only seam test masks it by borrowing the mmap.
+**New issues:** High — nxrt lazy initializers must skip eager resident device allocation when they have no resident consumers, or allocation must be demand-driven/shared so the lazy and resident paths cannot materialize the same weight twice. Add a non-host test EP that fails/counts initializer allocation to prove the lazy path does not allocate/copy the full weight.
+**Tests:** ep-api 32 passed, ep-cpu 497 passed (0 failed; ep-cpu 2 ignored across unit/doc targets). Targeted session seam test: 1 passed.
+
+### 2026-07-17: nxrt lazy initializers skip eager device residency
+**By:** Leon
+**What:** Executor no longer eagerly allocates/copies device buffers for initializers consumed only by lazy nxrt BlockQuantizedMoE kernels; when a resident consumer coexists, all consumers share one eager resident buffer.
+**Why:** Nabil re-review 🔴 Finding #2 — double residency → build-time OOM, defeated device offload. Fixes on top of Deckard 3425498.
+**Design choice:** skip-when-no-resident-consumer — exclusive lazy nxrt initializers omit non-host eager residency. An initializer with any resident consumer, graph-output use, or producer does not receive a lazy handle; it is allocated once and delivered as the same resident TensorView to every consumer, preventing duplicate materialization and making read order irrelevant. Host-accessible EPs retain the existing zero-copy mmap borrow.
+
+### 2026-07-17: Re-review #2 — WEIGHT_OFFLOAD P3a nxrt alloc fix (Leon aa17f51)
+**By:** Nabil
+**Verdict:** 🟢
+**Skip-eager-alloc correct (lazy-only)?:** Yes. `build_lazy_weight_handles` now requires a producer-less, non-graph-output external initializer with at least one consumer and verifies every consumer is `pkg.nxrt::BlockQuantizedMoE`. Only those handles skip non-host allocation in `Executor::build`; any resident consumer or direct graph-output use prevents the handle and preserves eager residency.
+**Both-consumer shared materialization?:** Yes. Mixed lazy/resident consumers fail the all-consumers boundary test, so no lazy handle is created. One eager device buffer/upload backs immutable `TensorView`s for both consumers. The regression test confirms one upload, identical bytes from both outputs, and resident delivery to both kernels.
+**Proof test asserts zero eager alloc?:** Yes. The non-host test asserts the lazy case has exactly one total allocation (the output) and zero host uploads, versus two allocations and one upload for the stock EP. The pre-fix unconditional initializer allocation makes the lazy case two allocations, so the regression distinguishes 2 vs 1 rather than merely checking a reduction.
+**New issues:** None. The `WeightStore` is retained by `Arc` in the lazy materializer, the skip path adds dtype/shape metadata before continuing and contains no new unwrap/panic, host CPU mmap borrowing and the `producer_less` guard remain intact, stock EPs retain eager residency, and graph-output/mixed-consumer initializers retain backing buffers. **Tests:** ep-api 32, ep-cpu 497, session 134 passed (0 failures; ep-cpu has 1 ignored unit and 1 ignored doc test, session has 1 ignored doc test).
+
+
+### EP claim diagnostics
+
+### 2026-07-17: EP claim declines carry actionable reasons (mlx-style)
+**By:** Roy
+**What:** KernelMatch::Unsupported now carries a colocated Cow reason; EPs use deny!/require!; session surfaces per-node reasons.
+**Why:** Justin — match onnxruntime-mlx so users can debug why a node fell back off an EP.
+
+### 2026-07-17: Review — EP claim-reason diagnostics (Roy 7ad0567)
+**By:** Holden
+**Verdict:** 🔴
+**M=1 removal safe?:** Yes. The removed gate was only the stale session-owned coverage message claiming `BlockQuantizedMatMul` supported M=1 only; the parent commit already claimed symbolic/M>1 shapes and dispatched `m == 1` to GEMV and `m != 1` to the CUDA GEMM added in `a99f7a8` (`block_quantized_matmul.rs:620-679`). The GPU claim/numerics regression passed 6/6, including M>1 prefill. No architecture hardcode was introduced: device capability is queried at runtime (`runtime.rs:180-203`) and NVRTC targets are derived from it.
+**Reason quality:** The new registry, fused-GEMM shape, block-format/layout/attribute, and QMoE quantization reasons name the offending contract and accepted remediation. Blocking gap: the required default “no handler for {op} at opset {v}” path does not exist. `supports_op` has no opset argument and calls opset-blind `OpRegistry::supports` (`ep-api/src/provider.rs:262-275`, `registry.rs:71-80`), so CPU can claim registrations that begin later—for example `Attention` since opset 23 and `Gelu` since opset 20 (`ep-cpu/src/kernels/mod.rs:285-299,347-358`). `get_kernel` then fails with `NoEpForOp`, whose message carries neither domain nor opset (`ep-api/src/lib.rs:51-54`), bypassing the new actionable `KernelMatch` reason (`session/src/executor.rs:202-213`). This leaves an EP-API/session boundary broken and can falsely claim an un-runnable opset. Roy is locked out; Deckard or Leon should own the revision.
+**No-alloc-on-accept:** Confirmed. `require!` evaluates `format!` only inside the failed-condition branch, and `deny!` formats only immediately before returning the decline. The accepted path constructs no reason string.
+**Boundary coherence:** The new `KernelMatch::Unsupported { reason }` shape is otherwise coherent across ep-api, CPU, CUDA, session, and test EPs; compilation found no bare variant or unhandled match. CUDA coverage collection is a linear per-node DFS with no O(N²) aggregation; it does not currently aggregate counts by op type.
+**Tests:** ep-api 29 passed; ep-cpu 488 passed, 2 ignored; session 132 passed, 1 ignored; CUDA 166 passed on NVIDIA H200 (SM 9.0). Targeted CUDA `block_quantized_matmul_gpu`: 6/6 passed.
+
+### 2026-07-17: EP claim path is opset-aware with default fallback reason
+**By:** Wallace
+**What:** `supports_op` gains an opset argument; too-new ops are declined at claim time with an actionable reason; `NoEpForOp` now carries domain + op + opset; the default `no handler for {domain}::{op} at opset {v}` fallback was added.
+**Why:** Holden 🔴 — opset-blind claim falsely claimed later-opset ops (`Attention`@23, `Gelu`@20), then failed with opaque `NoEpForOp`, bypassing actionable reasons. Fixes on top of Roy `7ad0567`.
+
+### 2026-07-17: Re-review — EP opset-aware claim (Wallace dbf7847)
+**By:** Holden
+**Verdict:** 🟢
+**Opset gap closed (decline-at-claim, no NoEpForOp bypass)?:** Yes. `supports_op` now gates the generic registry by `(domain, op, model opset)` and returns `KernelMatch::Unsupported` with domain, model opset, and earliest registered since-opset. Gelu@19 reaches actionable `UnsupportedOp`; Gelu@20 is claimed. The same generic mechanism covers Attention: its registry entries begin at 23, so 22 has no match and 23 matches. The session also translates any drift-induced `NoEpForOp` into the actionable unsupported-op route.
+**Since-opset boundary exact (no over-constraint)?:** Yes. Registry matching remains `since_version <= opset`; tests cover Gelu 19/20 and Attention lookup 22/23, including later Attention revisions.
+**Per-domain opset source correct?:** Yes. `effective_opset` reads the node's exact domain import, aliases only `""` and `ai.onnx`, and preserves independent imports such as `com.microsoft`; both claim and kernel creation receive that same value.
+**All call sites coherent?:** Yes. CPU, CUDA, EPContext/mock EPs, `EpRegistry::candidates_for_op`, executor cache claims, and `collect_cuda_coverage_issues` pass an explicit opset. `NoEpForOp` now carries domain and opset. Decline reasons are formatted only inside the unsupported branch. Wallace did not disturb Roy's previously cleared M=1 removal.
+**Tests:** ep-api 29 passed; cpu 489 passed (1 ignored); session 134 passed. CUDA test targets compiled successfully with `cargo test --locked -p onnx-runtime-ep-cuda --no-run`; CUDA tests were not run.
+
+**Decision:** CLEARS TO LAND.
+
+
+### onnx-rs schema and inference
+
+### 2026-07-17: Use ONNX v1.20 canonical movement schemas and unresolved dynamic shapes
+**By:** Sapper
+**What:** Round 6 registers Tile-13, Pad-25, ScatterND-18, ScatterElements-18, and ConstantOfShape-25; Slice-13, Concat-13, and Expand-13 were already present. Runtime-computed Slice/Pad/Tile values preserve only justified rank/dimensions, while dynamic Expand and ConstantOfShape shape inputs leave output shape unresolved.
+**Why:** These versions and signatures match the ONNX v1.20 opset-25 registry, and unresolved dynamic values must not be mistaken for rank-0 scalars or fabricated concrete shapes.
+
+### 2026-07-17: Reject guaranteed Pad and Concat overflow with symbolic dimensions
+**By:** Deckard
+**What:** Pad now rejects a positive total padding above `isize::MAX` before inspecting whether the input extent is concrete, and Concat rejects a known concat-axis partial sum above `isize::MAX` even when another extent is symbolic. Normal symbolic cases remain unresolved.
+**Why:** ONNX extents are non-negative, so either quantity is a guaranteed lower bound on the final output extent and must be rejected before allocation-size inference can accept it.
+
+### 2026-07-17: Round-7 canonical ONNX schema revisions
+**By:** Sapper
+**What:** Register MaxPool/AveragePool/GlobalAveragePool/GlobalMaxPool at revision 22, Resize at 19, QuantizeLinear/DequantizeLinear at 21, and DynamicQuantizeLinear at 11.
+**Why:** These are the requested canonical revisions from ONNX v1.20.0; quantization revision 21 is the first requested revision covering blocked quantization, uint4/int4, and all four float8 formats.
+
+### 2026-07-17: Review — onnx-rs round-7
+**By:** Bryant
+**Verdict:** 🔴
+**Findings:**
+- `crates/onnx-runtime-shape-inference/src/handlers/movement.rs:391-393,406-410` — **High** — Resize acceptance is over-constrained. `roi` rank is checked even when `coordinate_transformation_mode` is not `tf_crop_and_resize`, and inference rejects the officially accepted form with both optional `scales` and `sizes` absent. This violates review clause 1; `tests/op_rules.rs:2349-2366` currently locks in the wrong rejection.
+- `crates/onnx-runtime-shape-inference/src/handlers/movement.rs:367-382,452-472` — **Medium** — Resize extent arithmetic lossily converts valid `i64` extents and `isize::MAX` to `f32`. An input extent of `isize::MAX` with scale `1.0` rounds to `2^63` and is rejected, violating checked-overflow clause 4.
+- `crates/onnx-runtime-shape-inference/src/handlers/pooling.rs:179-205,287-306` — **Medium** — Symbolic pooling checks only the final lower-bound result, so known partial extents exceeding `isize::MAX` can cancel without rejection. For example, `kernel=isize::MAX`, `dilation=2`, and pads `[isize::MAX,isize::MAX]` produce an effective kernel and pad sum above the limit but a lower-bound output of 2. This violates clause 4.
+- `crates/onnx-runtime-shape-inference/src/handlers/data_ops.rs:292-319` — **High** — Rank-1 blocked DequantizeLinear is misclassified as per-axis before `block_size` is considered. Valid `x=[8]`, `scale=[2]`, `zero_point=[2]`, `axis=0`, `block_size=4` is rejected although opset-21 blocked shape is `ceil(8/4)=2`. This violates clause 5.
+- `crates/onnx-runtime-shape-inference/tests/op_rules.rs:2191-2479` — **Low** — Coverage exercises ordinary ceil/auto-pad and rank-2 blocked dequantization, but misses ignored non-vector ROI, absent Resize controls, maximum-boundary Resize, cancellation-masked symbolic pool overflow, and rank-1 blocked quantization.
+
+Independent validation passed: onnx-rs 149 tests and shape-inference 173 tests. The failures are uncovered acceptance/overflow cases.
+
+**Fix owner:** Deckard. Sapper is locked out from revising this rejected artifact.
+
+### 2026-07-17: onnx-rs r7 fixes — Resize/pool/dequant acceptance + overflow
+**By:** Leon
+**What:** Resize now ignores ROI outside `tf_crop_and_resize`, accepts absent scales and sizes with unresolved output dimensions, and performs scale/aspect-ratio extent arithmetic without lossy large-integer conversion. Pooling rejects oversized effective kernels, padding sums, and padded-input partial extents before cancellation. Opset-21 blocked QuantizeLinear and DequantizeLinear are classified by nonzero `block_size` before rank-1 per-axis handling and validate scale/zero-point blocked shapes.
+**Why:** Remove over-constraint, enforce checked overflow for symbolic shapes, and classify blocked quantization correctly so inference matches official ONNX v1.20 acceptance.
+
+### 2026-07-17: Re-review — onnx-rs r7 fixes (Leon 7d75c02)
+**By:** Bryant
+**Verdict:** 🔴
+**#1 Resize acceptance:** Resolved. ROI validation is conditional on `tf_crop_and_resize`; ignored/empty ROI, scales-only, sizes-only, and absent scales+sizes are accepted, while simultaneous non-empty scales+sizes remains rejected.
+**#2 rank-1 blocked Dequant:** Not fully resolved. Valid rank-1 blocked Quantize/Dequantize shapes now pass and invalid blocked extents fail, but `data_rank == 1` unconditionally forces `axis = 0` (`data_ops.rs:301-303`). Thus a truly invalid rank-1 blocked Dequantize with `axis=1` or `axis=-2` is accepted instead of enforcing the opset-21 range `[-1, 0]`. No regression test covers this reject path.
+**#3 Resize integer extents:** Resolved. Scale extents use exact binary-significand integer arithmetic, aspect-ratio extents use checked rational arithmetic, and `isize::MAX` is never converted through float.
+**#4 symbolic overflow:** Resolved. Effective-kernel, padding-sum, and known padded-input partial extents are checked against the integer sentinel before cancellation.
+**New over-constraint?:** None introduced by the fix. New correctness gap found in rank-1 blocked axis validation, so finding #2 cannot clear.
+**Tests:** onnx-rs 149, shape-inference 176 (all passed, including doc-tests).
+
+### 2026-07-17: rank-1 blocked Quantize/Dequantize validates axis range [-1,0]
+**By:** Mariette
+**What:** Reject out-of-range axis (e.g. 1, -2) for rank-1 blocked Quantize/DequantizeLinear before normalizing; only axis in [-1,0] accepted (−1→0). Added reject + accept regression tests.
+**Why:** Bryant re-review 🔴 finding #2 — `data_rank==1` unconditionally forced axis=0, silently accepting illegal axes. Fixes on top of Leon 7d75c02.
+
+### 2026-07-17: Re-review #2 — onnx-rs r7 rank-1 axis fix (Mariette c990f6b)
+**By:** Bryant
+**Verdict:** 🟢
+**Reject path (axis 1, -2):** Resolved. Both operators call the same validator, which now passes the raw axis through `checked_axis`; for rank 1 it accepts exactly `[-1, 0]` and returns a proper `ShapeInferError::Invalid` for every other value. Tests directly cover Dequantize `1`/`-2` and Quantize `1`; Quantize `-2` follows the identical shared path.
+**Accept path (axis 0, -1) not over-constrained?:** Yes. Both Quantize and Dequantize explicitly pass with `0` and `-1`; `checked_axis(-1, 1)` normalizes to `0`, preserving the output shape byte-for-byte.
+**Raw-before-normalize?:** Yes. `raw_axis` is read first, then validated/normalized by `checked_axis`; the old rank-1 force-to-zero branch is gone.
+**New over-constraint?:** None. Higher-rank behavior is unchanged because it already used this exact validation. Rank-1 non-scalar invalid axes are now correctly rejected; scalar-scale paths still return before axis validation.
+**Tests:** onnx-rs 149, shape-inference 177, all passing under `cargo test --locked -p onnx-rs -p onnx-runtime-shape-inference`. The new regression fails on the parent implementation because its first illegal rank-1 case returns `Ok`, making `unwrap_err()` panic.
+
+**Decision:** Finding #2 is fully resolved. onnx-rs r7 CLEARS TO LAND.
+
+
+### Shape inference and CUDA coverage
+
+### 2026-07-17: If shape inference degrades gracefully on output-count mismatch
+**By:** Leon
+**What:** The If handler now reconciles branch outputs positionally up to the minimum declared/branch output count, ignores extra branch outputs, and leaves extra node outputs unresolved.
+**Why:** Shape inference must never fail a model accepted by loader legality checks; output-count mismatches are an over-constraint and must degrade gracefully.
+
+### 2026-07-17: Review — If shape-inference over-constraint hotfix
+**By:** Bryant
+**Verdict:** 🟡
+**Findings:**
+- `crates/onnx-runtime-shape-inference/src/infer.rs:198-274` — No blocking issue. Positional inference is bounded by all three output counts; paired dtype/rank/shape reconciliation is unchanged, and `resize_with` only appends unresolved node outputs because `paired_outputs <= node.outputs.len()`. Equal-count behavior is therefore unchanged.
+- `crates/onnx-runtime-shape-inference/tests/graph_inference.rs:235-271` — Low: both count-mismatch directions and paired shape inference are exercised, but the new fixtures use the same `Float32` placeholder and branch dtype, so they do not non-degenerately prove dtype propagation under mismatched counts. This is a test-strength advisory, not a landing blocker.
+- Scope is limited to the `If` handler and its graph-inference tests.
+- Verification passed: `cargo test --locked -p onnx-runtime-shape-inference -p onnx-runtime-loader`, including `identical_value_names_in_separate_subgraph_scopes_load`.
+
+### 2026-07-17: CUDA QMoE coverage follows the ORT affine contract
+**By:** Mariette
+**What:** CUDA `com.microsoft::QMoE` now accepts affine INT1/INT2 in addition to INT4/INT8 on both decode GEMV and grouped-prefill GEMM paths. All CPU activation contracts are covered by GEMV/GEMM/CPU differential tests. Native IQ/MXFP4 blocks remain explicit `Unsupported`.
+**Why:** INT1/INT2 share QMoE's byte-dividing affine packing and are directly CPU-oracle testable. IQ/MXFP4 use self-contained GGUF block layouts that QMoE's separate weights/scales/zero-points inputs cannot represent; those formats need the planned block-quantized MoE operator rather than an ambiguous or incorrect QMoE encoding.
+
+
+### CSA contract
+
+### 2026-07-17: Follow the source-defined ratio-4 overlap and shared top-k
+**By:** Roy
+**What:** CSA ratio-4 emits one compressed record per four source tokens. Its overlap factor is two projection channels with an eight-slot carry: previous-block left channels plus current-block right channels. Index-head scores are reduced before one shared top-k; the diagnostic output repeats that shared list across its frozen index-head axis. Equal-score top-k ties remain explicit `Unsupported`.
+**Why:** The pinned source and contract lines 1202-1263 define four-token emission and `[B,8,2D]`/`[B,8,2ID]` carry behavior; they do not define a stride-2 compressor. Lines 1281-1303 reduce index heads before `torch.topk`, while lines 1589-1595 state that equal-score tie ordering is not portable.
