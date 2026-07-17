@@ -92,3 +92,9 @@ Cleared Deckard's `f795d45` executor EP-polymorphism refactor: it preserves CPU-
 ## 2026-07-17T00:19:41+0000 — GAFF If review
 
 - 🟢 Cleared Sapper's `7a369ef`: branch cache separation, fresh captures, initializers, and output checks are correct; 117 session tests passed.
+
+
+## 2026-07-17T00:58:13Z — GAFF Loop reject-to-clear cycle
+
+- 🔴 Rejected Sapper's `8052891` Loop because eager scan reservation from input-controlled `M` enabled an `i64::MAX` early-exit capacity-overflow DoS, and loop-carried shapes were not invariant.
+- Sapper was locked out; 🟢 cleared Leon's final `f6e8ba6` revision after huge-trip early-exit and carried-shape regressions. Session build and 121 tests passed; only `Scan` remains.

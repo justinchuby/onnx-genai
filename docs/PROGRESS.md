@@ -4,7 +4,7 @@ Tracks implementation status of `docs/DESIGN.md` (§1–§40). Updated as work l
 
 **Published:** `onnx-genai` v0.1.0 + 8 sub-crates on crates.io; the `onnx-runtime-*` layer (including `onnx-runtime-tracer`) is released as v0.1.0-dev.1. CI (fmt/build/test/**blocking clippy**) + scheduled `cargo-audit`. Coverage ~77% line.
 
-_Last updated: 2026-07-17T00:19:41+0000 — GAFF If vertical slice and CPU Mod landed._
+_Last updated: 2026-07-17T00:58:13Z — logical CPU kernels, Expand inference, and GAFF Loop landed._
 
 
 ## Current tiered-memory and interoperability milestones
@@ -16,9 +16,11 @@ _Last updated: 2026-07-17T00:19:41+0000 — GAFF If vertical slice and CPU Mod l
 - **CUDA MatMul stale test ✅ fixed (`3d19b72`, Roy; Wallace 🟢):** `matmul_rejects_unsupported_rank_and_dtype` now asserts the current actionable Int64 CUDA EP rejection instead of obsolete “Phase 2a” terminology; all **129/129** CUDA tests passed.
 - **Pad opset-18 axes shape inference ✅ fixed (`0a105a4`, Joi; Bryant 🟢):** optional `axes` now maps Pad values to the correct dimensions; expanded Attention infers `[2,3,4,6]` / **576 bytes**, not 640.
 - **Comparison/logical Bool output inference ✅ landed (`d06d1e7`, Chew; Leon 🟢):** `Less`, `LessOrEqual`, `Greater`, `GreaterOrEqual`, `Equal`, `And`, `Or`, `Xor`, and `Not` now infer `tensor(bool)` while preserving broadcast/unary shapes; bitwise ops remain untouched.
-- **GAFF `If` control-flow vertical slice ✅ landed (`7a369ef`, Sapper; Holden 🟢):** loader metadata → `ChildExecutor` → `If` is complete. Branches use BOOL conditions, live lexical captures, and `(node_id, branch)` caches with output count/dtype validation. **Next:** `Loop` and `Scan`.
+- **CPU logical `And`/`Or`/`Xor`/`Not` kernels ✅ landed (`557ca87`, Chew; Bryant 🟢):** Bool kernels use NumPy broadcasting, interpret nonzero storage as true, and canonicalize output bytes to `0`/`1`; expanded-Attention conformance advances to node 58.
+- **`Expand` bidirectional-broadcast shape inference ✅ landed (`14b5136`, Chew; Bryant 🟢):** opset 8+ expansion preserves dtype, correctly merges either broadcast direction, and retains a known output rank with fresh symbols when target values are unavailable; shape inference passes **120** tests and conformance advances past node 58.
+- **GAFF control-flow set ✅ COMPLETE for `If` + `Loop`:** loader metadata → `ChildExecutor` → `If` (`7a369ef`, Sapper; Holden 🟢) → `Loop` (`f6e8ba6`, Leon; Holden 🔴→🟢) is shipped. Loop avoids untrusted scan-reservation DoS and enforces loop-carried dtype/shape invariance every iteration; **121** session tests pass. **`Scan` is the last control-flow op and is now IN PROGRESS.**
 - **CPU `Mod` ✅ landed (Joi; Bryant 🟡 advisory):** CPU EP and shape inference support `fmod` plus NumPy floor-mod integer semantics; all 13 official ONNX Mod CPU cases pass.
-- **Known follow-ups:** logical `And`/`Or`/`Xor`/`Not` KERNELS (expanded-Attention node 39 blocker), direct Mod BF16 coverage, and ChildExecutor multi-signature caching.
+- **Known follow-ups:** direct Mod BF16 coverage and ChildExecutor multi-signature caching.
 
 ## ORT 2.0 — from-scratch Rust ONNX runtime (`docs/ORT2.md`, big design — steady progress)
 

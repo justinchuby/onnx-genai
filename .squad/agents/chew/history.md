@@ -39,3 +39,9 @@ At 2026-07-14T19:05:00Z, fixed clippy findings and corrected Python pytest count
 
 - Delivered `d06d1e7`: comparison/logical shape inference now produces `tensor(bool)` while preserving broadcast and unary shapes; Leon 🟢 cleared 115 tests.
 - Expanded-Attention now reaches unsupported `Mod` at node 50; `mod-op-support` is next.
+
+
+## 2026-07-17T00:58:13Z — Logical execution and Expand inference
+
+- Merged `557ca87`: CPU `And`/`Or`/`Xor`/`Not` kernels use Bool truth semantics, broadcasting, and canonical output bytes; Bryant 🟢 cleared 436 CPU tests.
+- Merged `14b5136`: opset-8+ `Expand` shape inference performs bidirectional broadcasting with dtype passthrough and known-rank fallback; Bryant 🟢 cleared 120 shape-inference tests. Expanded-Attention now advances past node 58.

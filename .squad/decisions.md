@@ -1368,3 +1368,23 @@ Re-reviewed commit `2ae464b5d894276f38a5855599c0c9124ea23558` against rejected b
 **Why:** Expanded Attention had stopped at unsupported `Mod`. CPU EP (435 passed, 1 ignored), shape inference (116 plus doctests), and all 13 official ONNX Mod CPU cases passed. The remaining expanded-Attention blocker is missing logical `And` execution at node 39. Direct BF16 Mod coverage and a ChildExecutor multi-signature cache remain follow-ups.
 
 **Sources:** `sapper-gaff-if.md`, `holden-sapper-gaff-if-review.md`, `joi-mod-op.md`, `bryant-joi-mod-review.md`; merged commits `7a369ef` and `aa7127e`.
+
+
+## 2026-07-17 — Logical kernels, Expand inference, and GAFF Loop completion
+
+### Execute ONNX logical Bool kernels on CPU
+**By:** Chew; reviewed by Bryant (🟢 CLEAR)
+**What:** Merged `557ca87`: CPU `And`, `Or`, `Xor`, and `Not` accept Bool tensors, use NumPy broadcasting where applicable, treat every nonzero byte as true, and emit canonical `0`/`1` bytes.
+**Why:** Logical semantics must operate on Bool truth values rather than raw bytes (notably two distinct nonzero Xor operands are both true). The broadcast truth-table coverage passed; `onnx-runtime-ep-cpu` build and tests passed (436 passed, 1 ignored). Expanded-Attention conformance advances to node 58.
+
+### Infer ONNX Expand shapes bidirectionally
+**By:** Chew; reviewed by Bryant (🟢 CLEAR)
+**What:** Merged `14b5136`: `Expand` is registered from opset 8 and infers the bidirectional broadcast of input and known target shapes while preserving the input dtype. A known target-vector length with unavailable values retains a rank of `max(input rank, target length)` using fresh symbols.
+**Why:** This correctly handles leading target dimensions, either operand being one, strict incompatible dimensions, and unknown target values. `onnx-runtime-shape-inference` build and 120-test suite passed; expanded-Attention advances past node 58.
+
+### Complete GAFF Loop through ChildExecutor after strict review
+**By:** Sapper, revised by Leon; reviewed by Holden (🔴 REJECT → 🟢 CLEAR)
+**What:** Sapper's initial `8052891` Loop implementation was rejected and Sapper locked out because scan stacking eagerly reserved from untrusted `M` and loop-carried output shapes were not invariant. Leon's final merged revision `f6e8ba6` removes the untrusted eager reservation and validates each carried output's initial dtype and full shape on every iteration.
+**Why:** A condition-terminated loop with `M = i64::MAX` must not capacity-overflow before its first scan slice, and ONNX loop-carried values must retain shape as well as dtype. Regression tests cover huge-trip-count early exit and a second-iteration shape change; `onnx-runtime-session` build and 121-test suite passed. Loader → ChildExecutor → If → Loop is complete; Scan is the remaining control-flow op and is in progress.
+
+**Sources:** `chew-and-logical-kernel.md`, `bryant-chew-logical-kernel-review.md`, `chew-expand-shape-infer.md`, `bryant-chew-expand-review.md`, `sapper-gaff-loop.md`, `holden-sapper-gaff-loop-review.md`, `leon-gaff-loop-fix.md`, `holden-leon-gaff-loop-rereview.md`.

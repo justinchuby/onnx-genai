@@ -70,3 +70,9 @@ Added the preprocessing-side prompt token-expansion library for multi-tile VLM i
 
 - Merged `7a369ef`: ONNX `If` selects validated BOOL branches through separate `(node_id, branch)` cached ChildExecutors with fresh lexical captures and positional output binding.
 - Holden 🟢 verified alternating branches/capture freshness; 117 session tests passed. Loader → ChildExecutor → If is complete; Loop/Scan and multi-signature caching remain.
+
+
+## 2026-07-17T00:58:13Z — GAFF Loop review handoff
+
+- Initial Loop implementation `8052891` was 🔴 rejected by Holden: scan accumulation eagerly reserved from untrusted `M`, enabling an early-exit `i64::MAX` capacity-overflow DoS, and carried shapes were not validated.
+- Sapper was locked out of the revision; Leon owned the remediation. The final Loop revision was cleared and merged as `f6e8ba6`; `Scan` remains the final control-flow op.

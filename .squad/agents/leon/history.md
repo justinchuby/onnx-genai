@@ -61,3 +61,9 @@ Loader opset-import validation for file, from-parts, and nested-subgraph paths m
 ## 2026-07-16T23:58:29+0000 — Comparison/logical inference review
 
 - 🟢 Cleared Chew's `d06d1e7`: all comparison/logical output dtypes are Bool, broadcast/unary shapes hold, and bitwise operators were untouched; 115 tests passed.
+
+
+## 2026-07-17T00:58:13Z — GAFF Loop remediation
+
+- Under Sapper's lockout, repaired the rejected Loop design: removed the untrusted eager scan reservation and validated every loop-carried output against its initial dtype and full shape.
+- Holden 🟢 re-approved the huge-`M` early-exit and second-iteration shape-change regressions; 121 session tests passed and final commit `f6e8ba6` merged. `Scan` is now the remaining control-flow work.

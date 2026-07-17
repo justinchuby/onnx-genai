@@ -17,3 +17,9 @@
 ## 2026-07-17T00:19:41+0000 — CPU ONNX Mod review
 
 - 🟡 Advisory-cleared Joi's `aa7127e`: arithmetic and broadcasting are correct. Zero integer divisors follow this runtime's existing zero convention; add direct BF16 coverage.
+
+
+## 2026-07-17T00:58:13Z — Chew logical and Expand reviews
+
+- 🟢 Cleared `557ca87`: CPU Bool `And`/`Or`/`Xor`/`Not` use logical nonzero semantics, canonical outputs, and broadcast truth-table coverage; 436 CPU tests passed.
+- 🟢 Cleared `14b5136`: `Expand` covers both broadcast directions, strict incompatibility, dtype passthrough, and unknown target-value rank fallback; 120 shape-inference tests passed.
