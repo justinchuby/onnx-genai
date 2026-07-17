@@ -312,9 +312,9 @@ fn run_engine_driver(owner: EngineOwner, rx: mpsc::Receiver<DriverCommand>, max_
             return;
         }
     };
-    let static_batch_supported = engine.continuous_batch_manager(max_batch).is_ok();
-    if static_batch_supported {
-        tracing::info!(max_batch, "static-cache continuous batch driver enabled");
+    let continuous_batch_supported = engine.continuous_batch_manager(max_batch).is_ok();
+    if continuous_batch_supported {
+        tracing::info!(max_batch, "continuous batch driver enabled");
         run_static_engine_driver(&mut engine, rx, max_batch);
     } else {
         tracing::info!("continuous batch driver disabled; using per-request engine path");
