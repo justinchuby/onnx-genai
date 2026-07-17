@@ -151,6 +151,12 @@ pub struct DecodeSession<'a> {
     /// Process-unique CUDA-graph annotation id claimed lazily when this session
     /// first captures its decode graph. `None` until the first captured step.
     capture_graph_id: Option<i32>,
+    /// Set when a captured decode step fails and we fall back to the standard
+    /// decode path for the rest of this generation. Once set, the captured fast
+    /// path is skipped even though the underlying session still reports
+    /// `graph_capture() == true`, so graceful degradation persists per decode
+    /// loop without mutating the shared session.
+    graph_capture_disabled: bool,
 }
 
 /// Persistent I/O buffers for the static-shape captured decode graph.
@@ -256,6 +262,7 @@ impl<'a> DecodeSession<'a> {
             max_length: None,
             capture_bound: false,
             capture_graph_id: None,
+            graph_capture_disabled: false,
         };
         if mode == DecodeKvMode::SharedBuffer {
             let max_length = options.max_length.ok_or_else(|| {
@@ -310,10 +317,29 @@ impl<'a> DecodeSession<'a> {
         // and replayed to eliminate per-kernel launch overhead.
         if self.mode == DecodeKvMode::SharedBuffer
             && self.session.graph_capture()
+            && !self.graph_capture_disabled
             && new_input_ids.len() == 1
             && self.current_len > 0
         {
-            return self.step_captured(new_input_ids[0], attention_mask, position_ids[0]);
+            match self.step_captured(new_input_ids[0], attention_mask, position_ids[0]) {
+                Ok(logits) => return Ok(logits),
+                Err(err) => {
+                    // The captured decode path failed (e.g. the EP could not
+                    // capture/replay a graph for this session). Degrade
+                    // gracefully: skip the captured path for the rest of this
+                    // generation, drop any partial capture state, and fall
+                    // through to the standard step below. `step_captured`
+                    // advances `current_len` only on success, so no KV progress
+                    // is lost by retrying here.
+                    tracing::warn!(
+                        error = %err,
+                        "CUDA graph decode step failed; disabling graph capture and \
+                         falling back to the standard decode path for the rest of this session"
+                    );
+                    self.graph_capture_disabled = true;
+                    self.capture = None;
+                }
+            }
         }
 
         let input_ids = Value::from_slice_i64(new_input_ids, &[1, seq_len])?;
@@ -353,7 +379,7 @@ impl<'a> DecodeSession<'a> {
             // When graph capture is enabled, prompt/prefill runs use annotation
             // -1 so ORT executes them normally instead of capturing them as the
             // (differently-shaped) decode graph.
-            if self.session.graph_capture() {
+            if self.session.graph_capture() && !self.graph_capture_disabled {
                 self.session.run_with_binding_graph(&self.binding, -1)?;
             } else {
                 self.session.run_with_binding(&self.binding)?;
