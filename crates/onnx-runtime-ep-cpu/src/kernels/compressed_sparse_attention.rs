@@ -49,6 +49,7 @@ struct DeferredCompressedSparseAttentionKernel {
 struct CompressedSparseAttentionKernel {
     num_heads: usize,
     head_dim: usize,
+    qk_rope_head_dim: usize,
     compression_ratio: usize,
     index_num_heads: usize,
     scale: f32,
@@ -58,7 +59,8 @@ struct CompressedSparseAttentionKernel {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CacheFormat {
     F32,
-    // Uint8 records concatenate `[E8M0 scale, 64 E4M3FN values]` blocks.
+    // Uint8 records concatenate `[E8M0 scale, 64 E4M3FN values]` blocks for
+    // non-RoPE dimensions, followed by little-endian BF16 RoPE values.
     Fp8E4m3Block64,
     // Uint8 records concatenate `[E8M0 scale, 16 adjacent-nibble bytes]` blocks.
     Fp4E2m1Block32,
@@ -84,20 +86,47 @@ impl CacheFormat {
         }
     }
 
-    fn stored_width(self, logical_width: usize) -> Result<usize> {
-        let Some((block_size, block_bytes)) = self.block_layout() else {
-            return Ok(logical_width);
-        };
-        if !logical_width.is_multiple_of(block_size) {
-            return Err(error(format!(
-                "head_dim {logical_width} must be divisible by cache block size {block_size} for {self:?}"
-            )));
+    fn stored_width(self, logical_width: usize, qk_rope_head_dim: usize) -> Result<usize> {
+        match self {
+            Self::F32 => Ok(logical_width),
+            Self::Fp8E4m3Block64 => {
+                let non_rope = logical_width.checked_sub(qk_rope_head_dim).ok_or_else(|| {
+                    error(format!(
+                        "qk_rope_head_dim {qk_rope_head_dim} exceeds head_dim {logical_width}"
+                    ))
+                })?;
+                if !non_rope.is_multiple_of(FP8_E4M3_BLOCK_SIZE) {
+                    return Err(error(format!(
+                        "non-RoPE head dimension {non_rope} must be divisible by FP8 block size {FP8_E4M3_BLOCK_SIZE}"
+                    )));
+                }
+                let fp8_bytes = non_rope
+                    .checked_div(FP8_E4M3_BLOCK_SIZE)
+                    .and_then(|blocks| blocks.checked_mul(FP8_E4M3_PACKED_BYTES + 1))
+                    .ok_or_else(|| error("FP8 cache record width overflow"))?;
+                let rope_bytes = qk_rope_head_dim
+                    .checked_mul(std::mem::size_of::<u16>())
+                    .ok_or_else(|| error("BF16 RoPE tail width overflow"))?;
+                fp8_bytes
+                    .checked_add(rope_bytes)
+                    .filter(|&bytes| bytes <= isize::MAX as usize)
+                    .ok_or_else(|| {
+                        error("hybrid cache record width overflow or exceeds isize::MAX")
+                    })
+            }
+            Self::Fp4E2m1Block32 => {
+                if !logical_width.is_multiple_of(FP4_E2M1_BLOCK_SIZE) {
+                    return Err(error(format!(
+                        "head_dim {logical_width} must be divisible by FP4 block size {FP4_E2M1_BLOCK_SIZE}"
+                    )));
+                }
+                logical_width
+                    .checked_div(FP4_E2M1_BLOCK_SIZE)
+                    .and_then(|blocks| blocks.checked_mul(FP4_E2M1_PACKED_BYTES + 1))
+                    .filter(|&bytes| bytes <= isize::MAX as usize)
+                    .ok_or_else(|| error("FP4 cache record width overflow or exceeds isize::MAX"))
+            }
         }
-        logical_width
-            .checked_div(block_size)
-            .and_then(|blocks| blocks.checked_mul(block_bytes))
-            .filter(|&bytes| bytes <= isize::MAX as usize)
-            .ok_or_else(|| error("packed cache record width overflow or exceeds isize::MAX"))
     }
 
     fn dtype(self) -> DataType {
@@ -124,6 +153,12 @@ impl CompressedSparseAttentionFactory {
     ) -> Result<Box<dyn Kernel>> {
         let num_heads = required_positive_int(node, "num_heads")?;
         let head_dim = required_positive_int(node, "head_dim")?;
+        let qk_rope_head_dim = optional_nonnegative_int(node, "qk_rope_head_dim", 0)?;
+        if qk_rope_head_dim > head_dim {
+            return Err(error(format!(
+                "qk_rope_head_dim {qk_rope_head_dim} exceeds head_dim {head_dim}"
+            )));
+        }
         let compression_ratio = required_positive_int(node, "compression_ratio")?;
         if !matches!(compression_ratio, 4 | 128) {
             return Err(error(format!(
@@ -190,6 +225,7 @@ impl CompressedSparseAttentionFactory {
                 &input_shapes[3],
                 num_heads,
                 head_dim,
+                qk_rope_head_dim,
                 cache_format,
             )?;
         }
@@ -197,6 +233,7 @@ impl CompressedSparseAttentionFactory {
             Ok(Box::new(CompressedSparseAttentionKernel {
                 num_heads,
                 head_dim,
+                qk_rope_head_dim,
                 compression_ratio,
                 index_num_heads,
                 scale,
@@ -300,6 +337,7 @@ impl Kernel for CompressedSparseAttentionKernel {
             inputs[3].shape,
             self.num_heads,
             self.head_dim,
+            self.qk_rope_head_dim,
             self.cache_format,
         )?;
         if outputs[0].shape != expected_output {
@@ -338,7 +376,13 @@ impl Kernel for CompressedSparseAttentionKernel {
             .transpose()?;
 
         let query = read_dense_f32(&inputs[0], "query")?;
-        let cache = dequantize_cache(&inputs[1], cache_shape, dim, self.cache_format)?;
+        let cache = dequantize_cache(
+            &inputs[1],
+            cache_shape,
+            dim,
+            self.qk_rope_head_dim,
+            self.cache_format,
+        )?;
         let indices = read_dense_indices(&inputs[2], "indices")?;
         let sink = read_dense_f32(&inputs[3], "head_sink")?;
         let gathered = sparse_kv_gather_masked_f32(
@@ -470,6 +514,7 @@ pub fn infer_output_shape(
         head_sink,
         num_heads,
         head_dim,
+        0,
         CacheFormat::F32,
     )
 }
@@ -481,6 +526,7 @@ fn infer_output_shape_for_format(
     head_sink: &[usize],
     num_heads: usize,
     head_dim: usize,
+    qk_rope_head_dim: usize,
     cache_format: CacheFormat,
 ) -> Result<Vec<usize>> {
     let query = shape4("query", query)?;
@@ -492,7 +538,7 @@ fn infer_output_shape_for_format(
             &query[2..]
         )));
     }
-    let stored_width = cache_format.stored_width(head_dim)?;
+    let stored_width = cache_format.stored_width(head_dim, qk_rope_head_dim)?;
     if cache[0] != query[0] || cache[3] != stored_width {
         return Err(error(format!(
             "cache must have batch {} and stored record width {stored_width} for {cache_format:?}, got {cache:?}",
@@ -522,13 +568,14 @@ fn dequantize_cache(
     view: &TensorView,
     stored_shape: [usize; 4],
     logical_width: usize,
+    qk_rope_head_dim: usize,
     format: CacheFormat,
 ) -> Result<Vec<f32>> {
     if format == CacheFormat::F32 {
         return read_dense_f32(view, "cache");
     }
     require_dtype("cache", view.dtype, DataType::Uint8)?;
-    let stored_width = format.stored_width(logical_width)?;
+    let stored_width = format.stored_width(logical_width, qk_rope_head_dim)?;
     if stored_shape[3] != stored_width {
         return Err(error(format!(
             "cache stored record width must be {stored_width} for {format:?}, got {}",
@@ -550,7 +597,12 @@ fn dequantize_cache(
     let (block_size, block_bytes) = format
         .block_layout()
         .expect("non-f32 cache format has a block layout");
-    let blocks_per_record = logical_width
+    let quantized_width = match format {
+        CacheFormat::Fp8E4m3Block64 => logical_width - qk_rope_head_dim,
+        CacheFormat::Fp4E2m1Block32 => logical_width,
+        CacheFormat::F32 => unreachable!("f32 returned before block decoding"),
+    };
+    let blocks_per_record = quantized_width
         .checked_div(block_size)
         .ok_or_else(|| error("cache blocks-per-record division failed"))?;
 
@@ -602,6 +654,35 @@ fn dequantize_cache(
                 CacheFormat::Fp4E2m1Block32 => {
                     dequantize_fp4_e2m1_block(scale, values, destination)?
                 }
+            }
+        }
+        if format == CacheFormat::Fp8E4m3Block64 {
+            let fp8_bytes = blocks_per_record
+                .checked_mul(block_bytes)
+                .ok_or_else(|| error("packed FP8 region width overflow"))?;
+            let packed_tail = packed_record
+                .checked_add(fp8_bytes)
+                .ok_or_else(|| error("packed BF16 RoPE tail offset overflow"))?;
+            let rope_bytes = qk_rope_head_dim
+                .checked_mul(std::mem::size_of::<u16>())
+                .ok_or_else(|| error("packed BF16 RoPE tail width overflow"))?;
+            let packed_tail_end = packed_tail
+                .checked_add(rope_bytes)
+                .ok_or_else(|| error("packed BF16 RoPE tail end overflow"))?;
+            let source = packed
+                .get(packed_tail..packed_tail_end)
+                .ok_or_else(|| error("packed BF16 RoPE tail is out of bounds"))?;
+            let output_tail = output_record
+                .checked_add(quantized_width)
+                .ok_or_else(|| error("dequantized BF16 RoPE tail offset overflow"))?;
+            let output_tail_end = output_tail
+                .checked_add(qk_rope_head_dim)
+                .ok_or_else(|| error("dequantized BF16 RoPE tail end overflow"))?;
+            let destination = output
+                .get_mut(output_tail..output_tail_end)
+                .ok_or_else(|| error("dequantized BF16 RoPE tail is out of bounds"))?;
+            for (bytes, value) in source.chunks_exact(2).zip(destination) {
+                *value = half::bf16::from_bits(u16::from_le_bytes([bytes[0], bytes[1]])).to_f32();
             }
         }
     }
@@ -780,6 +861,15 @@ mod tests {
         cache_format: Option<&str>,
         shapes: &[Vec<usize>],
     ) -> Result<Box<dyn Kernel>> {
+        kernel_with_rope_dim(ratio, cache_format, 0, shapes)
+    }
+
+    fn kernel_with_rope_dim(
+        ratio: i64,
+        cache_format: Option<&str>,
+        qk_rope_head_dim: usize,
+        shapes: &[Vec<usize>],
+    ) -> Result<Box<dyn Kernel>> {
         let mut graph = Graph::new();
         graph.opset_imports.insert("pkg.nxrt".into(), 1);
         let cache_dtype = if cache_format.unwrap_or("f32") == "f32" {
@@ -811,6 +901,10 @@ mod tests {
             .insert("num_heads".into(), Attribute::Int(shapes[0][2] as i64));
         node.attributes
             .insert("head_dim".into(), Attribute::Int(shapes[0][3] as i64));
+        node.attributes.insert(
+            "qk_rope_head_dim".into(),
+            Attribute::Int(qk_rope_head_dim as i64),
+        );
         node.attributes
             .insert("compression_ratio".into(), Attribute::Int(ratio));
         if ratio == 4 {
@@ -944,6 +1038,89 @@ mod tests {
         );
         for (actual, expected) in actual.iter().zip(expected) {
             assert!((actual - expected).abs() <= 1e-6, "{actual} != {expected}");
+        }
+    }
+
+    #[test]
+    fn fp8_hybrid_d512_preserves_bf16_rope_tail() {
+        const DIM: usize = 512;
+        const ROPE_DIM: usize = 64;
+        const NON_ROPE_DIM: usize = DIM - ROPE_DIM;
+        const FP8_HALF_ULP_AT_TWO: f32 = 0.125;
+
+        let block_codes = [0x38, 0x3c, 0x40, 0xb8, 0x30, 0x34, 0x28];
+        let block_values = [1.0, 1.5, 2.0, -1.0, 0.5, 0.75, 0.25];
+        let dense_block_values = [1.03, 1.47, 1.94, -1.03, 0.48, 0.77, 0.26];
+        let rope_pattern = [8.0, -4.0, 0.5, -0.25];
+
+        let mut packed = Vec::new();
+        let mut expected = Vec::new();
+        let mut dense = Vec::new();
+        for ((code, expected_value), dense_value) in block_codes
+            .into_iter()
+            .zip(block_values)
+            .zip(dense_block_values)
+        {
+            packed.push(127);
+            packed.extend(std::iter::repeat_n(code, FP8_E4M3_BLOCK_SIZE));
+            expected.extend(std::iter::repeat_n(expected_value, FP8_E4M3_BLOCK_SIZE));
+            dense.extend(std::iter::repeat_n(dense_value, FP8_E4M3_BLOCK_SIZE));
+        }
+        for value in rope_pattern.into_iter().cycle().take(ROPE_DIM) {
+            packed.extend_from_slice(&half::bf16::from_f32(value).to_bits().to_le_bytes());
+            expected.push(value);
+            dense.push(value);
+        }
+        assert_eq!(expected.len(), DIM);
+        assert_eq!(dense.len(), DIM);
+        assert_eq!(
+            packed.len(),
+            (NON_ROPE_DIM / FP8_E4M3_BLOCK_SIZE) * (FP8_E4M3_PACKED_BYTES + 1)
+                + ROPE_DIM * std::mem::size_of::<u16>()
+        );
+
+        let query = Owned::f32(&[1, 1, 1, DIM], &vec![0.0; DIM]);
+        let packed_cache = Owned::u8(&[1, 1, 1, packed.len()], &packed);
+        let dense_cache = Owned::f32(&[1, 1, 1, DIM], &dense);
+        let indices = Owned::i32(&[1, 1, 1, 1], &[0]);
+        let sink = Owned::f32(&[1], &[f32::NEG_INFINITY]);
+        let shapes = vec![
+            query.shape.clone(),
+            packed_cache.shape.clone(),
+            indices.shape.clone(),
+            sink.shape.clone(),
+        ];
+        let kernel =
+            kernel_with_rope_dim(128, Some("fp8_e4m3_block64"), ROPE_DIM, &shapes).unwrap();
+        let mut output = Owned::zeros_f32(&query.shape);
+        kernel
+            .execute(
+                &[
+                    query.view(),
+                    packed_cache.view(),
+                    indices.view(),
+                    sink.view(),
+                ],
+                &mut [output.view_mut()],
+            )
+            .unwrap();
+        let actual = output.to_f32();
+        assert_eq!(actual, expected);
+
+        let dense_output = run_reference(128, None, &query, &dense_cache, &indices, &sink);
+        for d in 0..NON_ROPE_DIM {
+            assert!(
+                (actual[d] - dense_output[d]).abs() <= FP8_HALF_ULP_AT_TWO,
+                "non-RoPE dim {d}: compressed={} dense={}",
+                actual[d],
+                dense_output[d]
+            );
+        }
+        for d in NON_ROPE_DIM..DIM {
+            assert_eq!(
+                actual[d], dense_output[d],
+                "RoPE dim {d} must bypass FP8 quantization"
+            );
         }
     }
 
