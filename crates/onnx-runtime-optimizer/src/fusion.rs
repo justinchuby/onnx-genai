@@ -141,6 +141,8 @@ pub struct FusionPattern {
     name: String,
     ops: Vec<String>,
     replacement: String,
+    #[cfg(test)]
+    replacement_domain: String,
     kind: RewriteKind,
 }
 
@@ -154,6 +156,8 @@ impl FusionPattern {
             name: name.to_string(),
             ops: ops.iter().map(|s| s.to_string()).collect(),
             replacement: replacement.to_string(),
+            #[cfg(test)]
+            replacement_domain: CONTRIB_DOMAIN.to_string(),
             kind: RewriteKind::Structural,
         }
     }
@@ -172,6 +176,8 @@ impl FusionPattern {
             .map(|s| s.to_string())
             .collect(),
             replacement: "LayerNormalization".to_string(),
+            #[cfg(test)]
+            replacement_domain: CONTRIB_DOMAIN.to_string(),
             kind: RewriteKind::LayerNorm,
         }
     }
@@ -192,6 +198,8 @@ impl FusionPattern {
             // real recognition. Softmax is the anchor.
             ops: ["Softmax"].iter().map(|s| s.to_string()).collect(),
             replacement: "FusedAttention".to_string(),
+            #[cfg(test)]
+            replacement_domain: CONTRIB_DOMAIN.to_string(),
             kind: RewriteKind::Attention,
         }
     }
@@ -207,8 +215,16 @@ impl FusionPattern {
             // `Erf` is the anchor.
             ops: ["Erf"].iter().map(|s| s.to_string()).collect(),
             replacement: "Gelu".to_string(),
+            #[cfg(test)]
+            replacement_domain: CONTRIB_DOMAIN.to_string(),
             kind: RewriteKind::Gelu,
         }
+    }
+
+    #[cfg(test)]
+    fn with_replacement_domain(mut self, domain: &str) -> Self {
+        self.replacement_domain = domain.to_string();
+        self
     }
 
     /// This pattern's name.
@@ -1115,9 +1131,16 @@ impl FusionPattern {
 
         let mut fused = Node::new(NodeId(0), self.replacement.clone(), inputs, vec![output]);
         fused.attributes = attributes;
-        // Emit the fused op in the private contrib domain so it never collides
-        // with standard `ai.onnx` ops and dispatch stays keyed on (domain, op).
-        fused.domain = CONTRIB_DOMAIN.to_string();
+        // Production patterns emit in the private contrib domain. Unit tests
+        // can override it to exercise a replacement that can match again.
+        #[cfg(not(test))]
+        {
+            fused.domain = CONTRIB_DOMAIN.to_string();
+        }
+        #[cfg(test)]
+        {
+            fused.domain = self.replacement_domain.clone();
+        }
         Ok(graph.insert_node(fused))
     }
 
@@ -2465,81 +2488,66 @@ mod tests {
         }
     }
 
-    fn assert_fusion_graphs_identical(
-        mut actual: Graph,
-        mut expected: Graph,
-        trial: usize,
-    ) {
-        assert_eq!(actual.inputs, expected.inputs, "inputs differ on trial {trial}");
-        assert_eq!(actual.outputs, expected.outputs, "outputs differ on trial {trial}");
-        assert_eq!(
-            actual.initializers, expected.initializers,
-            "initializers differ on trial {trial}"
-        );
-        assert_eq!(
-            actual.opset_imports, expected.opset_imports,
-            "opsets differ on trial {trial}"
-        );
+    fn serialized_graph_bytes(mut graph: Graph) -> Vec<u8> {
+        use std::fmt::Write;
 
-        let nodes = |graph: &Graph| {
-            graph
-                .nodes
-                .iter()
-                .map(|(id, node)| {
-                    let mut attributes: Vec<_> = node
-                        .attributes
-                        .iter()
-                        .map(|(name, value)| (name.clone(), format!("{value:?}")))
-                        .collect();
-                    attributes.sort();
-                    (
-                        id,
-                        node.id,
-                        node.name.clone(),
-                        node.op_type.clone(),
-                        node.domain.clone(),
-                        node.inputs.clone(),
-                        node.outputs.clone(),
-                        attributes,
-                        node.doc_string.clone(),
-                        node.device,
-                        node.exec_order,
-                    )
-                })
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(
-            nodes(&actual),
-            nodes(&expected),
-            "nodes/topology differ on trial {trial}"
-        );
-        assert_eq!(
-            actual
-                .values
-                .iter()
-                .map(|(id, value)| (id, value.clone()))
-                .collect::<Vec<_>>(),
-            expected
-                .values
-                .iter()
-                .map(|(id, value)| (id, value.clone()))
-                .collect::<Vec<_>>(),
-            "values/edges differ on trial {trial}"
-        );
+        let mut snapshot = String::new();
+        writeln!(&mut snapshot, "inputs={:?}", graph.inputs).unwrap();
+        writeln!(&mut snapshot, "outputs={:?}", graph.outputs).unwrap();
 
-        // Free-list order is part of byte-identical arena behavior.
-        for _ in 0..16 {
-            assert_eq!(
-                actual.insert_node(Node::new(NodeId(0), "Probe", Vec::new(), Vec::new())),
-                expected.insert_node(Node::new(NodeId(0), "Probe", Vec::new(), Vec::new())),
-                "node arena differs on trial {trial}"
-            );
-            assert_eq!(
-                actual.create_value(DataType::Float32, static_shape([1])),
-                expected.create_value(DataType::Float32, static_shape([1])),
-                "value arena differs on trial {trial}"
-            );
+        let mut initializers: Vec<_> = graph.initializers.iter().collect();
+        initializers.sort_by_key(|(id, _)| id.0);
+        writeln!(&mut snapshot, "initializers={initializers:?}").unwrap();
+        let mut constraints: Vec<_> = graph.symbol_constraints.iter().collect();
+        constraints.sort_by_key(|(id, _)| id.0);
+        writeln!(&mut snapshot, "constraints={constraints:?}").unwrap();
+        let mut opsets: Vec<_> = graph.opset_imports.iter().collect();
+        opsets.sort_by_key(|(domain, _)| *domain);
+        writeln!(&mut snapshot, "opsets={opsets:?}").unwrap();
+        let mut subgraphs: Vec<_> = graph.subgraphs.iter().collect();
+        subgraphs.sort_by_key(|((id, name), _)| (id.0, name.as_str()));
+        writeln!(&mut snapshot, "subgraphs={subgraphs:?}").unwrap();
+
+        for (id, node) in graph.nodes.iter() {
+            let mut attributes: Vec<_> = node.attributes.iter().collect();
+            attributes.sort_by_key(|(name, _)| *name);
+            writeln!(
+                &mut snapshot,
+                "node={id:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{attributes:?}|{:?}|{:?}|{:?}",
+                node.id,
+                node.name,
+                node.op_type,
+                node.domain,
+                node.inputs,
+                node.outputs,
+                node.doc_string,
+                node.device,
+                node.exec_order,
+            )
+            .unwrap();
         }
+        for (id, value) in graph.values.iter() {
+            writeln!(&mut snapshot, "value={id:?}|{value:?}").unwrap();
+        }
+
+        // Arena slots/free-list order are private IR details, but their complete
+        // observable state is the sequence of IDs returned by future inserts.
+        // The generated graphs are far smaller than this probe count.
+        for _ in 0..128 {
+            let node =
+                graph.insert_node(Node::new(NodeId(0), "ArenaProbe", Vec::new(), Vec::new()));
+            let value = graph.create_value(DataType::Float32, static_shape([1]));
+            writeln!(&mut snapshot, "probe={node:?}|{value:?}").unwrap();
+        }
+        snapshot.into_bytes()
+    }
+
+    fn assert_fusion_graphs_byte_identical(actual: Graph, expected: Graph, trial: usize) {
+        assert_eq!(
+            serialized_graph_bytes(actual),
+            serialized_graph_bytes(expected),
+            "restart and resumable fixpoints differ byte-for-byte on trial {trial}"
+        );
     }
 
     struct FusionTestRng(u64);
@@ -2559,114 +2567,437 @@ mod tests {
         fn coin(&mut self) -> bool {
             self.next() & 1 == 0
         }
-    }
 
-    fn relu_overlap_graph(rng: &mut FusionTestRng) -> Graph {
-        let mut graph = Graph::new();
-        graph.opset_imports.insert(String::new(), 17);
-        let input = val(&mut graph, "overlap_input");
-        graph.add_input(input);
-        let mut value = input;
-        for i in 0..(3 + rng.usize(5)) {
-            let output = val(&mut graph, &format!("overlap_{i}"));
-            graph.insert_node(Node::new(
-                NodeId(0),
-                "Relu",
-                vec![Some(value)],
-                vec![output],
-            ));
-            value = output;
-        }
-        graph.add_output(value);
-        graph
-    }
-
-    fn randomized_fusion_graph(trial: usize, rng: &mut FusionTestRng) -> Graph {
-        let mut graph = match trial % 5 {
-            0 => {
-                let mut graph = matmul_add_graph();
-                if rng.coin() {
-                    let biased = graph.outputs[0];
-                    graph.outputs.clear();
-                    let output = val(&mut graph, "random_relu");
-                    graph.insert_node(Node::new(
-                        NodeId(0),
-                        "Relu",
-                        vec![Some(biased)],
-                        vec![output],
-                    ));
-                    graph.add_output(output);
-                }
-                graph
+        fn shuffle<T>(&mut self, values: &mut [T]) {
+            for i in (1..values.len()).rev() {
+                values.swap(i, self.usize(i + 1));
             }
-            1 => relu_overlap_graph(rng),
-            2 => layernorm_graph(),
-            3 => gelu_graph(rng.coin(), rng.coin()),
-            _ => sdpa_graph(rng.coin(), if rng.coin() { -1 } else { 3 }),
-        };
+        }
+    }
 
-        // Random side consumers turn some seeded motifs into safe declines and
-        // create additional Relu-chain overlap without invalidating the DAG.
-        for noise in 0..rng.usize(5) {
-            let values: Vec<_> = graph.values.keys().collect();
-            let input = values[rng.usize(values.len())];
-            let output = val(&mut graph, &format!("noise_{trial}_{noise}"));
-            let op = match rng.usize(3) {
-                0 => "Neg",
-                1 => "Abs",
-                _ => "Relu",
-            };
-            graph.insert_node(Node::new(
+    struct DifferentialGraphBuilder {
+        graph: Graph,
+        pending: Vec<Node>,
+        next_name: usize,
+    }
+
+    impl DifferentialGraphBuilder {
+        fn new() -> Self {
+            let mut graph = Graph::new();
+            graph.opset_imports.insert(String::new(), 17);
+            Self {
+                graph,
+                pending: Vec::new(),
+                next_name: 0,
+            }
+        }
+
+        fn value(&mut self, prefix: &str, dims: &[usize]) -> ValueId {
+            let name = format!("{prefix}_{}", self.next_name);
+            self.next_name += 1;
+            self.graph.create_named_value(
+                name,
+                DataType::Float32,
+                static_shape(dims.iter().copied()),
+            )
+        }
+
+        fn input(&mut self, prefix: &str, dims: &[usize]) -> ValueId {
+            let value = self.value(prefix, dims);
+            self.graph.add_input(value);
+            value
+        }
+
+        fn scalar(&mut self, prefix: &str, value: f32) -> ValueId {
+            let id = self.value(prefix, &[]);
+            self.graph.set_initializer(
+                id,
+                WeightRef::Inline(TensorData::from_raw(
+                    DataType::Float32,
+                    vec![],
+                    value.to_le_bytes().to_vec(),
+                )),
+            );
+            id
+        }
+
+        fn node(
+            &mut self,
+            name: impl Into<String>,
+            op: &str,
+            inputs: Vec<ValueId>,
+            output: ValueId,
+        ) -> &mut Node {
+            let mut node = Node::new(
                 NodeId(0),
                 op,
-                vec![Some(input)],
+                inputs.into_iter().map(Some).collect(),
                 vec![output],
-            ));
-            graph.add_output(output);
+            );
+            node.name = name.into();
+            self.pending.push(node);
+            self.pending.last_mut().unwrap()
         }
-        graph
+
+        fn output(&mut self, value: ValueId) {
+            self.graph.add_output(value);
+        }
+
+        fn add_matmul_bias(&mut self, rng: &mut FusionTestRng, relu: bool, overlap: bool) {
+            let a = self.input("mm_a", &[4]);
+            let w0 = self.input("mm_w0", &[4]);
+            let m0 = self.value("mm_m0", &[4]);
+            self.node("mm_left", "MatMul", vec![a, w0], m0);
+
+            let bias = if overlap {
+                let w1 = self.input("mm_w1", &[4]);
+                let m1 = self.value("mm_m1", &[4]);
+                self.node("mm_right", "MatMul", vec![a, w1], m1);
+                m1
+            } else {
+                self.input("mm_bias", &[4])
+            };
+
+            let add = self.value("mm_add", &[4]);
+            let add_inputs = if rng.coin() {
+                vec![m0, bias]
+            } else {
+                vec![bias, m0]
+            };
+            self.node("mm_add_node", "Add", add_inputs, add);
+            if relu {
+                let output = self.value("mm_relu", &[4]);
+                self.node("mm_relu_node", "Relu", vec![add], output);
+                self.output(output);
+            } else {
+                self.output(add);
+            }
+        }
+
+        fn add_layernorm(&mut self, split_diff: bool) {
+            let x = self.input("ln_x", &[4]);
+            let two = self.input("ln_two", &[4]);
+            let eps = self.scalar("ln_eps", 1e-12);
+            let scale = self.input("ln_scale", &[4]);
+            let bias = self.input("ln_bias", &[4]);
+
+            let mean = self.value("ln_mean", &[4]);
+            let rm1 = self.node("ln_mean_node", "ReduceMean", vec![x], mean);
+            rm1.attributes
+                .insert("axes".into(), Attribute::Ints(vec![-1]));
+            rm1.attributes.insert("keepdims".into(), Attribute::Int(1));
+
+            let diff_pow = self.value("ln_diff_pow", &[4]);
+            self.node("ln_sub_pow", "Sub", vec![x, mean], diff_pow);
+            let diff_div = if split_diff {
+                let value = self.value("ln_diff_div", &[4]);
+                self.node("ln_sub_div", "Sub", vec![x, mean], value);
+                value
+            } else {
+                diff_pow
+            };
+            let sq = self.value("ln_sq", &[4]);
+            self.node("ln_pow", "Pow", vec![diff_pow, two], sq);
+            let var = self.value("ln_var", &[4]);
+            let rm2 = self.node("ln_var_node", "ReduceMean", vec![sq], var);
+            rm2.attributes
+                .insert("axes".into(), Attribute::Ints(vec![-1]));
+            rm2.attributes.insert("keepdims".into(), Attribute::Int(1));
+            let vare = self.value("ln_vare", &[4]);
+            self.node("ln_add_eps", "Add", vec![var, eps], vare);
+            let std = self.value("ln_std", &[4]);
+            self.node("ln_sqrt", "Sqrt", vec![vare], std);
+            let norm = self.value("ln_norm", &[4]);
+            self.node("ln_div", "Div", vec![diff_div, std], norm);
+            let scaled = self.value("ln_scaled", &[4]);
+            self.node("ln_mul", "Mul", vec![norm, scale], scaled);
+            let output = self.value("ln_output", &[4]);
+            self.node("ln_add_bias", "Add", vec![scaled, bias], output);
+            self.output(output);
+        }
+
+        fn add_gelu(&mut self, rng: &mut FusionTestRng) {
+            let x = self.input("gelu_x", &[4]);
+            let half = self.value("gelu_half", &[4]);
+            if rng.coin() {
+                let c = self.scalar("gelu_half_c", 0.5);
+                let inputs = if rng.coin() { vec![x, c] } else { vec![c, x] };
+                self.node("gelu_half_node", "Mul", inputs, half);
+            } else {
+                let c = self.scalar("gelu_two_c", 2.0);
+                self.node("gelu_half_node", "Div", vec![x, c], half);
+            }
+
+            let scaled = self.value("gelu_scaled", &[4]);
+            if rng.coin() {
+                let c = self.scalar("gelu_sqrt2", std::f32::consts::SQRT_2);
+                self.node("gelu_inner", "Div", vec![x, c], scaled);
+            } else {
+                let c = self.scalar("gelu_isqrt2", std::f32::consts::FRAC_1_SQRT_2);
+                let inputs = if rng.coin() { vec![x, c] } else { vec![c, x] };
+                self.node("gelu_inner", "Mul", inputs, scaled);
+            }
+            let erf = self.value("gelu_erf", &[4]);
+            self.node("gelu_erf_node", "Erf", vec![scaled], erf);
+            let one = self.scalar("gelu_one", 1.0);
+            let plus_one = self.value("gelu_plus_one", &[4]);
+            let inputs = if rng.coin() {
+                vec![erf, one]
+            } else {
+                vec![one, erf]
+            };
+            self.node("gelu_add", "Add", inputs, plus_one);
+            let output = self.value("gelu_output", &[4]);
+            let inputs = if rng.coin() {
+                vec![half, plus_one]
+            } else {
+                vec![plus_one, half]
+            };
+            self.node("gelu_outer", "Mul", inputs, output);
+            self.output(output);
+        }
+
+        fn add_attention(&mut self, rng: &mut FusionTestRng) {
+            let q = self.input("attn_q", &[1, 2, 3, 4]);
+            let k = self.input("attn_k", &[1, 2, 3, 4]);
+            let v = self.input("attn_v", &[1, 2, 3, 4]);
+            let k_side = if rng.coin() {
+                let kt = self.value("attn_kt", &[1, 2, 4, 3]);
+                let transpose = self.node("attn_transpose", "Transpose", vec![k], kt);
+                transpose
+                    .attributes
+                    .insert("perm".into(), Attribute::Ints(vec![0, 1, 3, 2]));
+                kt
+            } else {
+                k
+            };
+            let scores = self.value("attn_scores", &[1, 2, 3, 3]);
+            self.node("attn_score_mm", "MatMul", vec![q, k_side], scores);
+            let scale_const = if rng.coin() {
+                self.scalar("attn_divisor", 2.0)
+            } else {
+                self.scalar("attn_multiplier", 0.5)
+            };
+            let scaled = self.value("attn_scaled", &[1, 2, 3, 3]);
+            if self
+                .graph
+                .value(scale_const)
+                .name
+                .as_deref()
+                .unwrap()
+                .contains("divisor")
+            {
+                self.node("attn_scale", "Div", vec![scores, scale_const], scaled);
+            } else {
+                let inputs = if rng.coin() {
+                    vec![scores, scale_const]
+                } else {
+                    vec![scale_const, scores]
+                };
+                self.node("attn_scale", "Mul", inputs, scaled);
+            }
+            let softmax_input = if rng.coin() {
+                let mask = self.input("attn_mask", &[1, 1, 3, 3]);
+                let masked = self.value("attn_masked", &[1, 2, 3, 3]);
+                let inputs = if rng.coin() {
+                    vec![scaled, mask]
+                } else {
+                    vec![mask, scaled]
+                };
+                self.node("attn_mask_add", "Add", inputs, masked);
+                masked
+            } else {
+                scaled
+            };
+            let probs = self.value("attn_probs", &[1, 2, 3, 3]);
+            let softmax = self.node("attn_softmax", "Softmax", vec![softmax_input], probs);
+            softmax.attributes.insert(
+                "axis".into(),
+                Attribute::Int(if rng.coin() { -1 } else { 3 }),
+            );
+            let output = self.value("attn_output", &[1, 2, 3, 4]);
+            self.node("attn_output_mm", "MatMul", vec![probs, v], output);
+            self.output(output);
+        }
+
+        fn add_resumable_chain(&mut self, rng: &mut FusionTestRng) {
+            let input = self.input("chain_input", &[4]);
+            let first = self.value("chain_start", &[4]);
+            self.node("chain_0", "ChainStart", vec![input], first);
+            let mut value = first;
+            for index in 1..(4 + rng.usize(6)) {
+                let output = self.value("chain_link", &[4]);
+                self.node(format!("chain_{index}"), "ChainLink", vec![value], output);
+                value = output;
+            }
+            self.output(value);
+        }
+
+        fn add_noise(&mut self, rng: &mut FusionTestRng) {
+            for index in 0..rng.usize(8) {
+                let input = self.input("noise_input", &[4]);
+                let output = self.value("noise_output", &[4]);
+                let op = ["Abs", "Neg", "Identity", "Tanh"][rng.usize(4)];
+                self.node(format!("noise_{index}"), op, vec![input], output);
+                self.output(output);
+            }
+        }
+
+        fn finish(mut self, rng: &mut FusionTestRng) -> Graph {
+            // Seed and remove one dummy per real node. Random removal order
+            // randomizes the arena free-list; independently shuffling real-node
+            // insertion then decouples logical/topological order from NodeId.
+            let mut slots = Vec::with_capacity(self.pending.len());
+            for _ in 0..self.pending.len() {
+                slots.push(self.graph.insert_node(Node::new(
+                    NodeId(0),
+                    "IdSeed",
+                    Vec::new(),
+                    Vec::new(),
+                )));
+            }
+            rng.shuffle(&mut slots);
+            for id in slots {
+                self.graph.remove_node(id);
+            }
+            rng.shuffle(&mut self.pending);
+            for node in self.pending {
+                self.graph.insert_node(node);
+            }
+            self.graph
+        }
     }
 
-    #[test]
-    fn ascending_worklist_preserves_lowest_id_overlap_winner() {
-        let mut rng = FusionTestRng(1);
-        let mut graph = relu_overlap_graph(&mut rng);
-        let pattern = FusionPattern::new("ReluPair", &["Relu", "Relu"], "FusedReluPair");
-        let mut reference = graph.clone();
-        run_restart_reference(std::slice::from_ref(&pattern), &mut reference);
+    fn randomized_fusion_graph(rng: &mut FusionTestRng) -> Graph {
+        let mut builder = DifferentialGraphBuilder::new();
+        // Every trial contains every registered matcher. The two structural
+        // motifs deliberately have two MatMul starts sharing the Add (and Relu),
+        // so lowest-NodeId overlap resolution affects the exact replacement.
+        builder.add_attention(rng);
+        builder.add_matmul_bias(rng, true, true);
+        builder.add_layernorm(rng.coin());
+        builder.add_gelu(rng);
+        builder.add_matmul_bias(rng, false, true);
 
-        OpFusion::with_patterns(vec![pattern])
-            .run(&mut graph, &PassContext::new())
-            .unwrap();
+        // Add extra independent registered motifs for structural diversity.
+        for _ in 0..rng.usize(4) {
+            match rng.usize(5) {
+                0 => builder.add_attention(rng),
+                1 => {
+                    let overlap = rng.coin();
+                    builder.add_matmul_bias(rng, true, overlap);
+                }
+                2 => builder.add_layernorm(rng.coin()),
+                3 => builder.add_gelu(rng),
+                _ => {
+                    let overlap = rng.coin();
+                    builder.add_matmul_bias(rng, false, overlap);
+                }
+            }
+        }
+        builder.add_resumable_chain(rng);
+        builder.add_noise(rng);
+        builder.finish(rng)
+    }
 
-        assert_eq!(graph.node(NodeId(0)).op_type, "FusedReluPair");
-        assert!(graph.try_node(NodeId(1)).is_none());
-        assert_fusion_graphs_identical(graph, reference, 0);
+    fn differential_patterns() -> Vec<FusionPattern> {
+        let mut patterns = default_fusion_patterns();
+        // Unlike production replacements, this test-only standard-domain op can
+        // immediately match the next ChainLink. Its NodeId has already been
+        // passed by the ascending cursor, so correctness requires a lower-id
+        // revisit after every fusion until the chain reaches its fixpoint.
+        patterns.push(
+            FusionPattern::new("ResumableChain", &["ChainStart", "ChainLink"], "ChainStart")
+                .with_replacement_domain(""),
+        );
+        patterns
+    }
+
+    fn assert_overlapping_structural_candidates(graph: &Graph, patterns: &[FusionPattern]) {
+        let mut saw_gemm_overlap = false;
+        let mut saw_bias_overlap = false;
+        for (add_id, add) in graph.nodes.iter().filter(|(_, node)| node.op_type == "Add") {
+            let starts: Vec<_> = add
+                .input_values()
+                .filter_map(|value| graph.value(value).producer)
+                .filter(|&producer| graph.node(producer).op_type == "MatMul")
+                .collect();
+            if starts.len() != 2 {
+                continue;
+            }
+            let has_relu = graph
+                .successors(add_id)
+                .iter()
+                .any(|&successor| graph.node(successor).op_type == "Relu");
+            let pattern = if has_relu { &patterns[1] } else { &patterns[4] };
+            assert!(
+                starts
+                    .iter()
+                    .all(|&start| pattern.try_match_at(graph, start).is_some()),
+                "both MatMul starts must be eligible for the shared structural tail"
+            );
+            saw_gemm_overlap |= has_relu;
+            saw_bias_overlap |= !has_relu;
+        }
+        assert!(saw_gemm_overlap, "missing shared MatMul+Add+Relu candidates");
+        assert!(saw_bias_overlap, "missing shared MatMul+Add candidates");
     }
 
     #[test]
     fn resumable_scan_matches_restart_reference_on_randomized_graphs() {
         const TRIALS: usize = 5_000;
+        const REGISTERED_PATTERNS: usize = 5;
         let mut rng = FusionTestRng(0x6a09_e667_f3bc_c909);
-        let mut patterns = default_fusion_patterns();
-        patterns.push(FusionPattern::new(
-            "ReluPair",
-            &["Relu", "Relu"],
-            "FusedReluPair",
-        ));
+        let patterns = differential_patterns();
+        assert_eq!(default_fusion_patterns().len(), REGISTERED_PATTERNS);
 
+        let mut saw_non_topological_ids = false;
         for trial in 0..TRIALS {
-            let mut graph = randomized_fusion_graph(trial, &mut rng);
-            assert!(graph.validate().is_ok(), "invalid input graph on trial {trial}");
+            let mut graph = randomized_fusion_graph(&mut rng);
+            assert!(
+                graph.validate().is_ok(),
+                "invalid input graph on trial {trial}"
+            );
+
+            for pattern in &patterns[..REGISTERED_PATTERNS] {
+                assert!(
+                    pattern.find_match(&graph).is_some(),
+                    "{} was not exercised on trial {trial}",
+                    pattern.pattern_name()
+                );
+            }
+            assert_overlapping_structural_candidates(&graph, &patterns);
+            assert!(
+                graph
+                    .nodes
+                    .values()
+                    .filter(|node| node.op_type == "ChainLink")
+                    .count()
+                    >= 3,
+                "chained replacement adversary must require multiple revisits"
+            );
+            saw_non_topological_ids |=
+                graph.topological_order().unwrap() != graph.nodes.keys().collect::<Vec<_>>();
+
             let mut reference = graph.clone();
             run_restart_reference(&patterns, &mut reference);
-
             OpFusion::with_patterns(patterns.clone())
                 .run(&mut graph, &PassContext::new())
                 .unwrap();
 
-            assert!(graph.validate().is_ok(), "invalid result graph on trial {trial}");
-            assert_fusion_graphs_identical(graph, reference, trial);
+            assert!(
+                graph.validate().is_ok(),
+                "invalid result graph on trial {trial}"
+            );
+            assert!(
+                graph.nodes.values().all(|node| node.op_type != "ChainLink"),
+                "resumable chain did not reach its fixpoint on trial {trial}"
+            );
+            assert_fusion_graphs_byte_identical(graph, reference, trial);
         }
+        assert!(
+            saw_non_topological_ids,
+            "randomized insertion must decouple NodeId from topological order"
+        );
     }
 }
