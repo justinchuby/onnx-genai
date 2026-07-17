@@ -1,7 +1,6 @@
 # DeepSeek-V4-Flash CSA and Iterative MTP Runtime Design
 
-> **Status:** AWAITING USER GREENLIGHT. Design only; no kernel or engine
-> implementation is authorized by this document.
+> **Status:** Approved (owner @justinchuby, 2026-07-14). Phase 0 (freeze contracts + goldens) cleared. §9 decisions confirmed (CSA-7 fallback default flipped — see §10 Q11). Open questions §10 resolved below.
 >
 > **Primary target:** DeepSeek-V4-Flash as exported by Mobius PR
 > [#405](https://github.com/onnxruntime/mobius/pull/405), commit
@@ -1014,46 +1013,59 @@ Failure rules:
 | MTP-6 | Use one composite checkpoint across target dense/CSA state and MTP state. | A rejected draft must atomically restore every cache stream. |
 | GPU-1 | CPU correctness and goldens precede CUDA. | Sparse state bugs are easier to isolate before device residency and graph capture. |
 
+**Owner verdict (2026-07-14):** All decisions CONFIRMED except CSA-7 — the package now DEFAULTS to native_csa_required and REJECTS dense fallback (see §10 Q11 resolution). Numerical source of truth = official HF deepseek-ai/DeepSeek-V4-Flash reference (inference/model.py + inference/kernel.py); goldens dumped from it in Phase 0. llama.cpp is NOT faithful (Flash-Attn disabled, DSV4 graph WIP) and must not be used for goldens; mobius is our exporter, not ground truth.
+
 ## 10. Open questions and risks
 
 1. **Official CSA equations:** PR #405 preserves tensor names and shapes but not
    compressor/indexer computation. Which implementation and commit is the
    numerical source of truth?
+   **Resolution:** The numerical source of truth is the official HF `deepseek-ai/DeepSeek-V4-Flash` reference (`inference/model.py` + `inference/kernel.py`). Run it to dump and freeze layout-v1 golden intermediate tensors in Phase 0. NeMo (Megatron-Bridge/AutoModel) and arXiv 2606.19348 are cross-checks only; llama.cpp is not faithful (Flash-Attn disabled, DSV4 graph WIP) and must not be used for goldens; mobius is the exporter, not ground truth.
 2. **Ratio-128 semantics:** does HCA attend every compressed record, or is there
    an additional selection rule not represented by the exported indexer
    tensors?
+   **Resolution:** Pin the behavior from the official reference goldens; do not presuppose “attend all” versus an additional selection rule.
 3. **Cache record layout:** what exactly do `CW`, `ICW`, and the partial carry
    contain? The op cannot be registered until layout v1 has golden vectors.
+   **Resolution:** Pin `CW`, `ICW`, and carry layout from official reference goldens; never infer it from mobius tensor names.
 4. **Top-k ties and causality:** what stable tie order, duplicate policy, and
    boundary masking does the official ratio-4 indexer require?
+   **Resolution:** Pin ratio-4 top-k tie order, duplicate policy, and causal boundary masking from official reference goldens; never infer them from mobius tensor names.
 5. **Compressed RoPE:** which values are rotated before compression, and what
    state must be retained to reproduce `compress_rope_theta` exactly?
+   **Resolution:** Pin compressed-RoPE rotated values and retained state from official reference goldens; never infer them from mobius tensor names.
 6. **MTP recurrent state:** is post-layer pre-`_hc_head` HC state the official
    next-iteration state? If not, Mobius must export the correct state explicitly.
+   **Resolution:** Pin the official recurrent MTP state from official reference goldens; never infer it from mobius tensor names or by broadcasting `mtp_hidden`.
 7. **MTP cache lifetime:** is the sidecar KV proposal-local, accepted-prefix
    persistent, or shared with target/CSA state?
+   **Resolution:** Pin sidecar KV lifetime from official reference goldens; never infer it from mobius tensor names or by broadcasting `mtp_hidden`.
 8. **Weight sharing format:** should metadata reference target initializer names,
    named model-package components, or both? How are quantized/tied embeddings
    represented without copying?
+   **Resolution:** Support both: metadata prefers named model-package components and falls back to target initializer names. Reference tied and quantized embeddings zero-copy; do not duplicate raw f32 weights.
 9. **Verification width:** can every target decode path verify `1+k` tokens in
    one forward, or must static/native runners use a sequence of single-token
    steps while preserving identical acceptance?
+   **Resolution:** The contract requires `1+k` tokens to be verified in one forward. Static/native runners may degrade to a sequence of single-token steps, but must produce bit-identical greedy-token acceptance; enforce this with an equivalence-test gate.
 10. **Batching:** may different batch rows have different compression/index
     cursor lengths? The v1 cache layout and CUDA kernel need a clear answer.
+    **Resolution:** v1 requires equal-length compression/index cursors within a batch for a regular cache layout and simple CUDA kernel. Ragged per-row cursor lengths are an immediate fast-follow, modeled on vLLM PagedAttention per-row block-table indirection plus DeepSeek-V4 per-row `(offset,length)` ragged gather. `SparseKvGather`, per-forward cursor journals, and metadata state groups already accommodate per-row cursor lengths, so ragged support is an extension rather than a rewrite.
 11. **Fallback policy:** is the dense fallback acceptable for user-selected
     compatibility, given that it can erase the intended long-context memory
     advantage and is not officially numerically equivalent?
+    **Resolution:** CSA-7 is flipped: the package defaults to `native_csa_required` and rejects dense fallback. The portability cost is accepted to prevent silent degradation of the long-context memory advantage.
 12. **Shared GLM primitive boundary:** is `SparseKvGather` sufficient common
     ground, or should DeepSeek CSA and GLM IndexShare expose separate fused ops?
+    **Resolution:** `SparseKvGather` is the shared correctness/reuse primitive. DeepSeek CompressedSparseAttention and GLM IndexShare DSA each get their own fused production op because their selection semantics differ and must not be coupled.
 13. **Upstream path:** should the private op be designed immediately as an ORT
     contrib proposal, or incubated until DeepSeek and GLM contracts both
     stabilize?
+    **Resolution:** Incubate in the private `pkg.nxrt` domain, as with `BlockQuantizedMatMul`. Propose ORT contrib only after both DeepSeek and GLM contracts stabilize and v1 layout and goldens are frozen; tracking this upstream is optional and non-urgent.
 14. **Acceptance tolerance:** what tensor/logit tolerance is acceptable for
     f16/bf16 CPU/CUDA while still requiring exact greedy token identity?
+    **Resolution:** Greedy final tokens must be bit-identical: exact integer argmax is a hard correctness gate. Intermediate compressor, index, and attention f16/bf16 tolerances must be calibrated from official goldens by measuring the real error distribution, not guessed, and set per layer for localizability.
 
 ## 11. Greenlight requested
 
-Implementation should begin only after the owner approves or replaces the
-decisions in Section 9 and supplies answers for the contract-blocking questions
-1-7 in Section 10. In particular, no one should infer CSA equations from tensor
-names or infer iterative HC state by broadcasting `mtp_hidden`.
+**Greenlight granted (owner @justinchuby, 2026-07-14).** Phase 0 may begin: run the official DeepSeek reference, dump and freeze layout-v1 goldens, and freeze the CSA/MTP state-transition contract before any kernel work.
