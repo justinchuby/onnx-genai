@@ -38,6 +38,8 @@ pub mod normalization;
 pub mod pointwise;
 pub mod pooling;
 pub mod qmoe;
+mod qmoe_gemm;
+mod qmoe_grouping;
 pub mod reduce;
 pub mod shape;
 pub mod softmax;

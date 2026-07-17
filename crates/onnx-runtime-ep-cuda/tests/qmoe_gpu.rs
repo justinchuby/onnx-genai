@@ -348,8 +348,24 @@ fn run_gpu(
     inputs: &[Option<HostTensor>],
     dtype: DataType,
 ) -> onnx_runtime_ep_api::Result<Vec<f32>> {
+    run_gpu_with_prefill_min_tokens(ep, case, inputs, dtype, None)
+}
+
+fn run_gpu_with_prefill_min_tokens(
+    ep: &CudaExecutionProvider,
+    case: Case,
+    inputs: &[Option<HostTensor>],
+    dtype: DataType,
+    prefill_min_tokens: Option<usize>,
+) -> onnx_runtime_ep_api::Result<Vec<f32>> {
     let output_shape = [case.rows, case.hidden];
-    let (graph, node) = model_node(inputs, dtype, &output_shape, case);
+    let (mut graph, node) = model_node(inputs, dtype, &output_shape, case);
+    if let Some(prefill_min_tokens) = prefill_min_tokens {
+        graph.node_mut(node).attributes.insert(
+            "prefill_min_tokens".into(),
+            Attribute::Int(prefill_min_tokens as i64),
+        );
+    }
     let model = Model::new(&graph);
     let concrete_shapes: Vec<_> = inputs
         .iter()
@@ -601,4 +617,72 @@ fn qmoe_fp16_and_bf16_storage_match_rounded_cpu_reference() {
     };
     compare(case, DataType::Float16);
     compare(case, DataType::BFloat16);
+}
+
+#[test]
+fn qmoe_prefill_gemm_matches_gemv_and_cpu_oracle() {
+    let Some(ep) = gpu() else { return };
+    let case = Case {
+        experts: 4,
+        rows: 6,
+        hidden: 16,
+        inter: 16,
+        bits: 4,
+        top_k: 2,
+        activation: "silu",
+        swiglu_fusion: 0,
+        affine: true,
+        biases: true,
+        normalize: true,
+        router_weights: false,
+    };
+    let mut inputs = case_inputs(case, DataType::Float32);
+    inputs[1] = Some(HostTensor::f32(
+        &[case.rows, case.experts],
+        &[
+            9.0, 8.0, 0.0, -1.0, 8.0, 9.0, -1.0, 0.0, 9.0, 7.0, 1.0, 0.0, 0.0, -1.0, 9.0, 8.0,
+            -1.0, 0.0, 8.0, 9.0, 1.0, 0.0, 9.0, 7.0,
+        ],
+    ));
+
+    let expected = run_cpu(case, &inputs);
+    let gemm =
+        run_gpu_with_prefill_min_tokens(&ep, case, &inputs, DataType::Float32, Some(2)).unwrap();
+    let gemv =
+        run_gpu_with_prefill_min_tokens(&ep, case, &inputs, DataType::Float32, Some(1024)).unwrap();
+
+    assert_conforms(&gemm, &gemv, case, DataType::Float32);
+    assert_conforms(&gemm, &expected, case, DataType::Float32);
+    assert_conforms(&gemv, &expected, case, DataType::Float32);
+}
+
+#[test]
+fn qmoe_prefill_handles_empty_experts_and_all_routes_to_one_expert() {
+    let Some(ep) = gpu() else { return };
+    let case = Case {
+        experts: 4,
+        rows: 5,
+        hidden: 16,
+        inter: 16,
+        bits: 8,
+        top_k: 1,
+        activation: "identity",
+        swiglu_fusion: 0,
+        affine: true,
+        biases: true,
+        normalize: false,
+        router_weights: true,
+    };
+    let mut inputs = case_inputs(case, DataType::Float32);
+    inputs[1] = Some(HostTensor::f32(
+        &[case.rows, case.experts],
+        &[
+            0.0, 1.0, 9.0, -1.0, 1.0, 0.0, 8.0, -1.0, -1.0, 0.0, 7.0, 1.0, 0.0, -1.0, 9.0, 1.0,
+            1.0, 0.0, 8.0, -1.0,
+        ],
+    ));
+
+    let expected = run_cpu(case, &inputs);
+    let actual = run_gpu(&ep, case, &inputs, DataType::Float32).unwrap();
+    assert_conforms(&actual, &expected, case, DataType::Float32);
 }

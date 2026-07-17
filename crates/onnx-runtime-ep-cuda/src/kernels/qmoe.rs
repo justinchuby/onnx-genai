@@ -1,9 +1,10 @@
 //! CUDA implementation of ORT 1.27 `com.microsoft::QMoE`.
 //!
-//! Phase 1 keeps all expert tensors resident on one GPU. Routing, packed affine
-//! INT4/INT8 expert GEMMs, activation/gating, and weighted reduction stay on the
-//! EP stream. Weight paging, asynchronous prefetch, and expert-parallel sharding
-//! are intentionally deferred.
+//! Expert tensors remain resident on one GPU. Decode uses the Phase-1 per-route
+//! GEMV path; prefill groups routes by expert, gathers contiguous activation
+//! tiles, and uses a tiled affine block-dequant GEMM when an expert has multiple
+//! assigned tokens. Weight paging, asynchronous prefetch, and expert-parallel
+//! sharding are intentionally deferred.
 
 use std::ffi::c_void;
 use std::sync::Arc;
@@ -14,6 +15,7 @@ use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, Ten
 use onnx_runtime_ir::{DataType, Node, Shape};
 
 use crate::error::driver_err;
+use crate::kernels::{qmoe_gemm, qmoe_grouping};
 use crate::runtime::{CudaRuntime, cuptr};
 
 const MODULE: &str = "qmoe_affine_v1";
@@ -215,12 +217,14 @@ template <typename Input>
 __device__ void qmoe_linear_impl(
     const Input* input,
     const int* selected_experts,
+    const unsigned long long* expert_counts,
     const unsigned char* packed,
     const float* scales,
     const unsigned char* zero_points,
     const float* bias,
     float* output,
     const unsigned long long routes,
+    const unsigned long long gemm_min_tokens,
     const int input_rows_are_routes,
     const int top_k,
     const int out_features,
@@ -239,6 +243,10 @@ __device__ void qmoe_linear_impl(
         const unsigned long long route = task / out_features;
         const int output_feature = (int)(task % out_features);
         const int expert = selected_experts[route];
+        if (expert_counts
+            && expert_counts[expert] >= gemm_min_tokens) {
+            continue;
+        }
         const unsigned long long input_row =
             input_rows_are_routes ? route : route / (unsigned long long)top_k;
         float value = 0.0f;
@@ -266,12 +274,14 @@ __device__ void qmoe_linear_impl(
 extern "C" __global__ void qmoe_linear_f32(
     const float* input,
     const int* selected_experts,
+    const unsigned long long* expert_counts,
     const unsigned char* packed,
     const float* scales,
     const unsigned char* zero_points,
     const float* bias,
     float* output,
     const unsigned long long routes,
+    const unsigned long long gemm_min_tokens,
     const int input_rows_are_routes,
     const int top_k,
     const int out_features,
@@ -283,8 +293,8 @@ extern "C" __global__ void qmoe_linear_f32(
     const int block_size)
 {
     qmoe_linear_impl(
-        input, selected_experts, packed, scales, zero_points, bias, output,
-        routes, input_rows_are_routes, top_k, out_features, in_features,
+        input, selected_experts, expert_counts, packed, scales, zero_points, bias,
+        output, routes, gemm_min_tokens, input_rows_are_routes, top_k, out_features, in_features,
         packed_in, blocks, zero_point_bytes, bits, block_size);
 }
 
@@ -292,12 +302,14 @@ extern "C" __global__ void qmoe_linear_f32(
 extern "C" __global__ void qmoe_linear_f16(
     const __half* input,
     const int* selected_experts,
+    const unsigned long long* expert_counts,
     const unsigned char* packed,
     const float* scales,
     const unsigned char* zero_points,
     const float* bias,
     float* output,
     const unsigned long long routes,
+    const unsigned long long gemm_min_tokens,
     const int input_rows_are_routes,
     const int top_k,
     const int out_features,
@@ -309,20 +321,22 @@ extern "C" __global__ void qmoe_linear_f16(
     const int block_size)
 {
     qmoe_linear_impl(
-        input, selected_experts, packed, scales, zero_points, bias, output,
-        routes, input_rows_are_routes, top_k, out_features, in_features,
+        input, selected_experts, expert_counts, packed, scales, zero_points, bias,
+        output, routes, gemm_min_tokens, input_rows_are_routes, top_k, out_features, in_features,
         packed_in, blocks, zero_point_bytes, bits, block_size);
 }
 
 extern "C" __global__ void qmoe_linear_bf16(
     const __nv_bfloat16* input,
     const int* selected_experts,
+    const unsigned long long* expert_counts,
     const unsigned char* packed,
     const float* scales,
     const unsigned char* zero_points,
     const float* bias,
     float* output,
     const unsigned long long routes,
+    const unsigned long long gemm_min_tokens,
     const int input_rows_are_routes,
     const int top_k,
     const int out_features,
@@ -334,8 +348,8 @@ extern "C" __global__ void qmoe_linear_bf16(
     const int block_size)
 {
     qmoe_linear_impl(
-        input, selected_experts, packed, scales, zero_points, bias, output,
-        routes, input_rows_are_routes, top_k, out_features, in_features,
+        input, selected_experts, expert_counts, packed, scales, zero_points, bias,
+        output, routes, gemm_min_tokens, input_rows_are_routes, top_k, out_features, in_features,
         packed_in, blocks, zero_point_bytes, bits, block_size);
 }
 #endif
@@ -556,6 +570,7 @@ impl Activation {
 #[derive(Clone, Copy, Debug)]
 struct MoeAttributes {
     k: usize,
+    prefill_min_tokens: usize,
     activation: Activation,
     normalize_routing_weights: bool,
     swiglu_fusion: usize,
@@ -571,10 +586,16 @@ impl MoeAttributes {
             return Err(error(format!("k must be > 0, got {k}")));
         }
         let activation = Activation::parse(node)?;
+        let prefill_min_tokens = int_attr(node, "prefill_min_tokens", 2)?;
+        if prefill_min_tokens < 2 {
+            return Err(error(format!(
+                "prefill_min_tokens must be at least 2, got {prefill_min_tokens}"
+            )));
+        }
         let normalize_routing_weights = bool_attr(node, "normalize_routing_weights", false)?;
         if bool_attr(node, "use_sparse_mixer", false)? {
             return Err(error(
-                "use_sparse_mixer=1 is unsupported by the Phase-1 CUDA kernel",
+                "use_sparse_mixer=1 is unsupported by the CUDA kernel",
             ));
         }
         let swiglu_fusion = int_attr(node, "swiglu_fusion", 0)?;
@@ -590,6 +611,8 @@ impl MoeAttributes {
         }
         Ok(Self {
             k: usize::try_from(k).map_err(|_| error("k exceeds usize limits"))?,
+            prefill_min_tokens: usize::try_from(prefill_min_tokens)
+                .map_err(|_| error("prefill_min_tokens exceeds usize limits"))?,
             activation,
             normalize_routing_weights,
             swiglu_fusion: swiglu_fusion as usize,
@@ -650,6 +673,14 @@ impl FloatDtype {
         }
     }
 
+    fn gather_entry(self) -> &'static str {
+        match self {
+            Self::F32 => qmoe_grouping::GATHER_F32_ENTRY,
+            Self::F16 => qmoe_grouping::GATHER_F16_ENTRY,
+            Self::Bf16 => qmoe_grouping::GATHER_BF16_ENTRY,
+        }
+    }
+
     fn needs_half_headers(self) -> bool {
         !matches!(self, Self::F32)
     }
@@ -665,7 +696,7 @@ impl KernelFactory for QMoEFactory {
         let bits = int_attr(node, "expert_weight_bits", 4)?;
         if !matches!(bits, 4 | 8) {
             return Err(error(format!(
-                "expert_weight_bits must be 4 or 8 in the Phase-1 CUDA kernel, got {bits}"
+                "expert_weight_bits must be 4 or 8 in the CUDA kernel, got {bits}"
             )));
         }
         let block_size = int_attr(node, "block_size", 0)?;
@@ -682,7 +713,7 @@ impl KernelFactory for QMoEFactory {
         };
         if quant_type != "int" {
             return Err(error(format!(
-                "quant_type='{quant_type}' is unsupported; CUDA Phase 1 implements integer affine QMoE only"
+                "quant_type='{quant_type}' is unsupported; CUDA implements integer affine QMoE only"
             )));
         }
         Ok(Box::new(QMoEKernel {
@@ -728,6 +759,15 @@ struct QuantizedExperts<'a> {
     packed_in: usize,
     blocks: usize,
     zero_point_bytes: usize,
+}
+
+#[derive(Clone, Copy)]
+struct ExpertGrouping {
+    counts: CUdeviceptr,
+    offsets: CUdeviceptr,
+    cursors: CUdeviceptr,
+    grouped_routes: CUdeviceptr,
+    grouped_input: CUdeviceptr,
 }
 
 impl<'a> QuantizedExperts<'a> {
@@ -1031,6 +1071,30 @@ impl Kernel for QMoEKernel {
         let route_output_elements =
             checked_product(&[routes, hidden], "route output element count")?;
         let route_output_bytes = checked_bytes(route_output_elements, 4, "route output scratch")?;
+        let grouping_sizes = (rows > 1)
+            .then(|| {
+                let expert_entries = experts
+                    .checked_add(1)
+                    .ok_or_else(|| error("expert offset entry count exceeds usize limits"))?;
+                let counts =
+                    checked_bytes(experts, std::mem::size_of::<u64>(), "expert token counts")?;
+                let offsets = checked_bytes(
+                    expert_entries,
+                    std::mem::size_of::<u64>(),
+                    "expert token offsets",
+                )?;
+                let grouped_routes =
+                    checked_bytes(routes, std::mem::size_of::<u64>(), "grouped route indices")?;
+                let grouped_features = hidden.max(inter);
+                let grouped_elements = checked_product(
+                    &[routes, grouped_features],
+                    "grouped activation element count",
+                )?;
+                let grouped_input =
+                    checked_bytes(grouped_elements, 4, "grouped activation scratch")?;
+                Ok::<_, EpError>((counts, offsets, grouped_routes, grouped_input))
+            })
+            .transpose()?;
 
         let mut scratch = Scratch::new(&self.runtime);
         let route_indices = scratch.alloc(route_index_bytes)?;
@@ -1039,6 +1103,19 @@ impl Kernel for QMoEKernel {
         let fc3_output = fc3.map(|_| scratch.alloc(activated_bytes)).transpose()?;
         let activated = scratch.alloc(activated_bytes)?;
         let route_output = scratch.alloc(route_output_bytes)?;
+        let grouping = grouping_sizes
+            .map(
+                |(counts_bytes, offsets_bytes, grouped_routes_bytes, grouped_input_bytes)| {
+                    Ok::<_, EpError>(ExpertGrouping {
+                        counts: scratch.alloc(counts_bytes)?,
+                        offsets: scratch.alloc(offsets_bytes)?,
+                        cursors: scratch.alloc(counts_bytes)?,
+                        grouped_routes: scratch.alloc(grouped_routes_bytes)?,
+                        grouped_input: scratch.alloc(grouped_input_bytes)?,
+                    })
+                },
+            )
+            .transpose()?;
 
         self.launch_route(
             &inputs[1],
@@ -1048,36 +1125,97 @@ impl Kernel for QMoEKernel {
             rows,
             experts,
         )?;
-        self.launch_linear(
-            dtype,
-            tensor_ptr(&inputs[0]),
-            route_indices,
-            fc1,
-            fc1_output,
-            routes,
-            false,
-        )?;
-        if let (Some(fc3), Some(fc3_output)) = (fc3, fc3_output) {
+        if let Some(grouping) = grouping {
+            self.launch_grouping(route_indices, grouping, routes, experts)?;
+            self.launch_gather(
+                dtype,
+                tensor_ptr(&inputs[0]),
+                grouping,
+                routes,
+                rows,
+                hidden,
+                false,
+            )?;
+            self.launch_grouped_linear(grouping, fc1, fc1_output, routes, experts)?;
             self.launch_linear(
                 dtype,
                 tensor_ptr(&inputs[0]),
                 route_indices,
-                fc3,
-                fc3_output,
+                Some(grouping.counts),
+                fc1,
+                fc1_output,
                 routes,
                 false,
             )?;
+            if let (Some(fc3), Some(fc3_output)) = (fc3, fc3_output) {
+                self.launch_grouped_linear(grouping, fc3, fc3_output, routes, experts)?;
+                self.launch_linear(
+                    dtype,
+                    tensor_ptr(&inputs[0]),
+                    route_indices,
+                    Some(grouping.counts),
+                    fc3,
+                    fc3_output,
+                    routes,
+                    false,
+                )?;
+            }
+            self.launch_activation(fc1_output, fc3_output, activated, routes, inter)?;
+            self.launch_gather(
+                FloatDtype::F32,
+                activated,
+                grouping,
+                routes,
+                routes,
+                inter,
+                true,
+            )?;
+            self.launch_grouped_linear(grouping, fc2, route_output, routes, experts)?;
+            self.launch_linear(
+                FloatDtype::F32,
+                activated,
+                route_indices,
+                Some(grouping.counts),
+                fc2,
+                route_output,
+                routes,
+                true,
+            )?;
+        } else {
+            self.launch_linear(
+                dtype,
+                tensor_ptr(&inputs[0]),
+                route_indices,
+                None,
+                fc1,
+                fc1_output,
+                routes,
+                false,
+            )?;
+            if let (Some(fc3), Some(fc3_output)) = (fc3, fc3_output) {
+                self.launch_linear(
+                    dtype,
+                    tensor_ptr(&inputs[0]),
+                    route_indices,
+                    None,
+                    fc3,
+                    fc3_output,
+                    routes,
+                    false,
+                )?;
+            }
+            self.launch_activation(fc1_output, fc3_output, activated, routes, inter)?;
+            self.launch_linear(
+                FloatDtype::F32,
+                activated,
+                route_indices,
+                None,
+                fc2,
+                route_output,
+                routes,
+                true,
+            )?;
         }
-        self.launch_activation(fc1_output, fc3_output, activated, routes, inter)?;
-        self.launch_linear(
-            FloatDtype::F32,
-            activated,
-            route_indices,
-            fc2,
-            route_output,
-            routes,
-            true,
-        )?;
         self.launch_combine(
             dtype,
             route_output,
@@ -1133,12 +1271,227 @@ impl QMoEKernel {
             .map_err(|err| driver_err("launch QMoE routing", err))
     }
 
+    fn launch_grouping(
+        &self,
+        route_indices: CUdeviceptr,
+        grouping: ExpertGrouping,
+        routes: usize,
+        experts: usize,
+    ) -> Result<()> {
+        let routes_u64 = as_u64("route count", routes)?;
+        let experts_i32 = as_i32("expert count", experts)?;
+        let expert_entries = experts
+            .checked_add(1)
+            .ok_or_else(|| error("expert offset entry count exceeds usize limits"))?;
+        let init_total = routes.max(expert_entries);
+
+        let init = self.runtime.nvrtc_function(
+            qmoe_grouping::MODULE,
+            qmoe_grouping::CUDA_SRC,
+            qmoe_grouping::INIT_ENTRY,
+        )?;
+        let mut builder = self.runtime.stream().launch_builder(&init);
+        builder
+            .arg(&grouping.counts)
+            .arg(&grouping.offsets)
+            .arg(&grouping.cursors)
+            .arg(&grouping.grouped_routes)
+            .arg(&routes_u64)
+            .arg(&experts_i32);
+        // SAFETY: all grouping buffers have their checked counts/offsets/routes
+        // sizes, and the scalar ABI matches `qmoe_group_init`.
+        unsafe {
+            builder.launch(self.pointwise_launch_config(as_u64(
+                "group initialization element count",
+                init_total,
+            )?)?)
+        }
+        .map_err(|err| driver_err("initialize QMoE expert grouping", err))?;
+
+        let count = self.runtime.nvrtc_function(
+            qmoe_grouping::MODULE,
+            qmoe_grouping::CUDA_SRC,
+            qmoe_grouping::COUNT_ENTRY,
+        )?;
+        let mut builder = self.runtime.stream().launch_builder(&count);
+        builder
+            .arg(&route_indices)
+            .arg(&grouping.counts)
+            .arg(&routes_u64)
+            .arg(&experts_i32);
+        // SAFETY: route_indices covers `routes` and counts covers `experts`.
+        unsafe { builder.launch(self.pointwise_launch_config(routes_u64)?) }
+            .map_err(|err| driver_err("count QMoE routes by expert", err))?;
+
+        let prefix = self.runtime.nvrtc_function(
+            qmoe_grouping::MODULE,
+            qmoe_grouping::CUDA_SRC,
+            qmoe_grouping::PREFIX_ENTRY,
+        )?;
+        let mut builder = self.runtime.stream().launch_builder(&prefix);
+        builder
+            .arg(&grouping.counts)
+            .arg(&grouping.offsets)
+            .arg(&routes_u64)
+            .arg(&experts_i32);
+        // SAFETY: the single-thread prefix kernel reads `experts` counts and
+        // writes `experts + 1` offsets.
+        unsafe {
+            builder.launch(LaunchConfig {
+                grid_dim: (1, 1, 1),
+                block_dim: (1, 1, 1),
+                shared_mem_bytes: 0,
+            })
+        }
+        .map_err(|err| driver_err("scan QMoE expert token offsets", err))?;
+
+        let assign = self.runtime.nvrtc_function(
+            qmoe_grouping::MODULE,
+            qmoe_grouping::CUDA_SRC,
+            qmoe_grouping::ASSIGN_ENTRY,
+        )?;
+        let mut builder = self.runtime.stream().launch_builder(&assign);
+        builder
+            .arg(&route_indices)
+            .arg(&grouping.offsets)
+            .arg(&grouping.cursors)
+            .arg(&grouping.grouped_routes)
+            .arg(&routes_u64)
+            .arg(&experts_i32);
+        // SAFETY: offsets and cursors cover all experts, grouped_routes covers
+        // all routes, and every device-side write is bounds guarded.
+        unsafe { builder.launch(self.pointwise_launch_config(routes_u64)?) }
+            .map(|_| ())
+            .map_err(|err| driver_err("assign QMoE grouped routes", err))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn launch_gather(
+        &self,
+        dtype: FloatDtype,
+        input: CUdeviceptr,
+        grouping: ExpertGrouping,
+        routes: usize,
+        input_rows: usize,
+        features: usize,
+        input_rows_are_routes: bool,
+    ) -> Result<()> {
+        let function = self.runtime.nvrtc_function(
+            qmoe_grouping::MODULE,
+            qmoe_grouping::CUDA_SRC,
+            dtype.gather_entry(),
+        )?;
+        let total = checked_product(&[routes, features], "grouped gather element count")?;
+        let routes = as_u64("route count", routes)?;
+        let input_rows = as_u64("gather input row count", input_rows)?;
+        let input_rows_are_routes = i32::from(input_rows_are_routes);
+        let top_k = as_i32("top-k", self.attributes.k)?;
+        let features = as_i32("gather feature count", features)?;
+        let mut builder = self.runtime.stream().launch_builder(&function);
+        builder
+            .arg(&input)
+            .arg(&grouping.grouped_routes)
+            .arg(&grouping.grouped_input)
+            .arg(&routes)
+            .arg(&input_rows)
+            .arg(&input_rows_are_routes)
+            .arg(&top_k)
+            .arg(&features);
+        // SAFETY: grouped_routes covers every route, grouped_input covers
+        // routes*features f32 values, and source row selection is bounds guarded.
+        unsafe {
+            builder.launch(
+                self.pointwise_launch_config(as_u64("grouped gather element count", total)?)?,
+            )
+        }
+        .map(|_| ())
+        .map_err(|err| driver_err("gather QMoE expert activation rows", err))
+    }
+
+    fn launch_grouped_linear(
+        &self,
+        grouping: ExpertGrouping,
+        weights: QuantizedExperts<'_>,
+        output: CUdeviceptr,
+        routes: usize,
+        experts: usize,
+    ) -> Result<()> {
+        let capabilities = self.runtime.capabilities();
+        let preferred_threads = self.preferred_reduction_threads();
+        let tile = qmoe_gemm::tile_for(
+            capabilities.compute_capability(),
+            preferred_threads,
+            capabilities.max_shared_memory_per_block_optin(),
+        );
+        let (module, source) = qmoe_gemm::module_source(tile);
+        let function = self
+            .runtime
+            .nvrtc_function(module, source, qmoe_gemm::ENTRY)?;
+        let tasks = checked_product(
+            &[experts, weights.out_features],
+            "grouped linear expert-feature task count",
+        )?;
+        let config = self.runtime.reduction_launch_config(
+            &function,
+            self.reduction_grid(tasks)?,
+            preferred_threads,
+            tile.checked_mul(std::mem::size_of::<f32>() as u32)
+                .ok_or_else(|| error("grouped GEMM shared-memory stride overflow"))?,
+        )?;
+        let packed = tensor_ptr(weights.packed);
+        let scales = tensor_ptr(weights.scales);
+        let zero_points = weights.zero_points.map(tensor_ptr).unwrap_or(0);
+        let bias = weights.bias.map(tensor_ptr).unwrap_or(0);
+        let routes = as_u64("route count", routes)?;
+        let tasks = as_u64("grouped linear task count", tasks)?;
+        let gemm_min_tokens = as_u64(
+            "prefill GEMM token threshold",
+            self.attributes.prefill_min_tokens,
+        )?;
+        let experts = as_i32("expert count", experts)?;
+        let out_features = as_i32("output feature count", weights.out_features)?;
+        let in_features = as_i32("input feature count", weights.in_features)?;
+        let packed_in = as_i32("packed input width", weights.packed_in)?;
+        let blocks = as_i32("block count", weights.blocks)?;
+        let zero_point_bytes = as_i32("zero-point row byte count", weights.zero_point_bytes)?;
+        let bits = as_i32("expert weight bits", self.bits)?;
+        let block_size = as_i32("block size", self.block_size)?;
+        let mut builder = self.runtime.stream().launch_builder(&function);
+        builder
+            .arg(&grouping.grouped_input)
+            .arg(&grouping.grouped_routes)
+            .arg(&grouping.counts)
+            .arg(&grouping.offsets)
+            .arg(&packed)
+            .arg(&scales)
+            .arg(&zero_points)
+            .arg(&bias)
+            .arg(&output)
+            .arg(&routes)
+            .arg(&tasks)
+            .arg(&gemm_min_tokens)
+            .arg(&experts)
+            .arg(&out_features)
+            .arg(&in_features)
+            .arg(&packed_in)
+            .arg(&blocks)
+            .arg(&zero_point_bytes)
+            .arg(&bits)
+            .arg(&block_size);
+        // SAFETY: grouped rows, expert metadata, packed weights, and outputs all
+        // have checked sizes. The kernel guards empty experts and every scatter.
+        unsafe { builder.launch(config) }
+            .map(|_| ())
+            .map_err(|err| driver_err("launch QMoE grouped block-dequant GEMM", err))
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn launch_linear(
         &self,
         dtype: FloatDtype,
         input_ptr: CUdeviceptr,
         route_indices: CUdeviceptr,
+        expert_counts: Option<CUdeviceptr>,
         weights: QuantizedExperts<'_>,
         output: CUdeviceptr,
         routes: usize,
@@ -1148,6 +1501,7 @@ impl QMoEKernel {
             .runtime
             .nvrtc_function(MODULE, CUDA_SRC, dtype.linear_entry())?;
         let packed = tensor_ptr(weights.packed);
+        let expert_counts = expert_counts.unwrap_or(0);
         let scales = tensor_ptr(weights.scales);
         let zero_points = weights.zero_points.map(tensor_ptr).unwrap_or(0);
         let bias = weights.bias.map(tensor_ptr).unwrap_or(0);
@@ -1160,6 +1514,10 @@ impl QMoEKernel {
             std::mem::size_of::<f32>() as u32,
         )?;
         let routes = as_u64("route count", routes)?;
+        let gemm_min_tokens = as_u64(
+            "prefill GEMM token threshold",
+            self.attributes.prefill_min_tokens,
+        )?;
         let input_rows_are_routes = i32::from(input_rows_are_routes);
         let top_k = as_i32("top-k", self.attributes.k)?;
         let out_features = as_i32("output feature count", weights.out_features)?;
@@ -1173,12 +1531,14 @@ impl QMoEKernel {
         builder
             .arg(&input_ptr)
             .arg(&route_indices)
+            .arg(&expert_counts)
             .arg(&packed)
             .arg(&scales)
             .arg(&zero_points)
             .arg(&bias)
             .arg(&output)
             .arg(&routes)
+            .arg(&gemm_min_tokens)
             .arg(&input_rows_are_routes)
             .arg(&top_k)
             .arg(&out_features)
@@ -1192,7 +1552,7 @@ impl QMoEKernel {
         // expert-major ranges, and the scalar ABI matches `qmoe_linear_*`.
         unsafe { builder.launch(config) }
             .map(|_| ())
-            .map_err(|err| driver_err("launch QMoE block-dequant expert GEMM", err))
+            .map_err(|err| driver_err("launch QMoE block-dequant expert GEMV", err))
     }
 
     fn launch_activation(
