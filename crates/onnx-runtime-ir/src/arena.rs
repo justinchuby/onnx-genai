@@ -52,6 +52,11 @@ impl<K: ArenaKey, T> Arena<K, T> {
         self.len == 0
     }
 
+    /// Number of allocated slots, including tombstones.
+    pub fn capacity(&self) -> usize {
+        self.slots.len()
+    }
+
     /// Insert `value`, returning its freshly allocated key.
     pub fn insert(&mut self, value: T) -> K {
         self.insert_with(|_| value)

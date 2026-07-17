@@ -319,10 +319,9 @@ fn partition_boundary(
         for &vid in &node.outputs {
             let escapes = graph_outputs.contains(&vid)
                 || graph
-                    .value(vid)
-                    .consumers
-                    .iter()
-                    .any(|c| !covered.contains(c));
+                    .consumers(vid)
+                    .into_iter()
+                    .any(|consumer| !covered.contains(&consumer));
             if escapes && seen_out.insert(vid) {
                 outputs.push(vid);
             }

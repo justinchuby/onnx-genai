@@ -97,7 +97,7 @@ impl OptimizationPass for ConstantFolding {
                 let needed = graph.outputs.contains(&out)
                     || graph
                         .try_value(out)
-                        .is_some_and(|v| !v.consumers.is_empty());
+                        .is_some_and(|_| graph.has_uses(out));
                 if !needed {
                     continue;
                 }
@@ -347,7 +347,7 @@ mod tests {
                 let needed = graph.outputs.contains(&out)
                     || graph
                         .try_value(out)
-                        .is_some_and(|v| !v.consumers.is_empty());
+                        .is_some_and(|_| graph.has_uses(out));
                 if !needed {
                     continue;
                 }

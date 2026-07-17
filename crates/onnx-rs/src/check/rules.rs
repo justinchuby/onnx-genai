@@ -222,7 +222,7 @@ fn check_graph_connections(
                 Some(value) if value.name.as_deref().is_none_or(str::is_empty) => None,
                 Some(value)
                     if graph_outputs.contains(&value_id)
-                        || !value.consumers.is_empty()
+                        || graph.has_uses(value_id)
                         || value
                             .name
                             .as_deref()
@@ -5144,7 +5144,7 @@ mod tests {
         pad_with_axes.graph.value_mut(pads).dtype = DataType::Int64;
         pad_with_axes.graph.value_mut(axes).dtype = DataType::Int32;
         let node = pad_with_axes.graph.nodes.keys().next().unwrap();
-        pad_with_axes.graph.node_mut(node).inputs[2] = None;
+        pad_with_axes.graph.replace_input(node, 2, None);
         assert!(
             pad_with_axes.validate().is_valid(),
             "optional constant_value may be omitted while axes is present"

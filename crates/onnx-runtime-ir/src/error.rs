@@ -30,7 +30,7 @@ pub enum GraphError {
     InputHasProducer(ValueId),
     /// A value's `producer` link disagrees with the node's `outputs`.
     ProducerLinkMismatch(ValueId),
-    /// A value's `consumers` list disagrees with a node's `inputs`.
+    /// A value's consumer-use set disagrees with a node's `inputs`.
     ConsumerLinkMismatch(ValueId),
     /// An opset import is malformed.
     InvalidOpsetImport { domain: String, version: u64 },

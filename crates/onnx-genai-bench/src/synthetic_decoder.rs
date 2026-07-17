@@ -286,7 +286,7 @@ pub fn build_synthetic_decoder() -> Graph {
         vec![logits],
         &[],
     );
-    graph.outputs.insert(0, logits);
+    graph.insert_output(0, logits);
     graph
 }
 

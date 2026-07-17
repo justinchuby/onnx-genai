@@ -715,7 +715,7 @@ fn fuse_silu_patterns(graph: &mut Graph) -> usize {
         if graph.outputs.contains(&sigmoid_output) {
             continue;
         }
-        let consumers = graph.value(sigmoid_output).consumers.clone();
+        let consumers = graph.consumers(sigmoid_output);
         if consumers.len() != 1 {
             continue;
         }
@@ -894,10 +894,11 @@ fn build_lazy_weight_handles(
     let mut handles = HashMap::new();
     for (&value, weight) in &graph.initializers {
         let graph_value = graph.value(value);
+        let consumers = graph.consumers(value);
         let lazy_only = graph_value.producer.is_none()
             && !graph.outputs.contains(&value)
-            && !graph_value.consumers.is_empty()
-            && graph_value.consumers.iter().all(|&consumer| {
+            && !consumers.is_empty()
+            && consumers.into_iter().all(|consumer| {
                 let node = graph.node(consumer);
                 boundary.matches(&node.domain, &node.op_type)
             });

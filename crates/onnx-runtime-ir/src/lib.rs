@@ -68,4 +68,4 @@ pub use shape::{
     as_static_shape, is_fully_static, static_shape, Dim, Shape, SymbolConstraints, SymbolId,
 };
 pub use tensor::{SparseTensorData, TensorData, TypeProto, WeightRef};
-pub use value::{Value, ValueId};
+pub use value::{Consumers, Usage, Value, ValueId};

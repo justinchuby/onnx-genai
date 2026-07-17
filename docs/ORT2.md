@@ -360,7 +360,7 @@ impl Graph {
     /// Direct successors: nodes that consume this node's outputs.
     pub fn successors(&self, node: NodeId) -> Vec<NodeId> {
         self.node(node).outputs.iter()
-            .flat_map(|vid| self.value(*vid).consumers.iter().copied())
+            .flat_map(|vid| self.consumers(*vid))
             .collect()
     }
 

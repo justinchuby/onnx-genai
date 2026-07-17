@@ -222,12 +222,12 @@ impl GateUpCandidate {
         let silu_output = silu.outputs[0];
         if graph.outputs.contains(&gate_output)
             || graph.outputs.contains(&silu_output)
-            || graph.value(gate_output).consumers.as_slice() != [silu_id]
+            || graph.consumers(gate_output) != [silu_id]
         {
             return None;
         }
 
-        let silu_consumers = &graph.value(silu_output).consumers;
+        let silu_consumers = graph.consumers(silu_output);
         if silu_consumers.len() != 1 {
             return None;
         }
@@ -249,7 +249,7 @@ impl GateUpCandidate {
         };
         if up_output == gate_output
             || graph.outputs.contains(&up_output)
-            || graph.value(up_output).consumers.as_slice() != [mul_id]
+            || graph.consumers(up_output) != [mul_id]
         {
             return None;
         }
@@ -416,7 +416,7 @@ fn concatenate_initializer_bytes(
 }
 
 fn remove_orphan_initializer(graph: &mut Graph, value: ValueId) {
-    if graph.value(value).consumers.is_empty()
+    if !graph.has_uses(value)
         && !graph.inputs.contains(&value)
         && !graph.outputs.contains(&value)
     {

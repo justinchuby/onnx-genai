@@ -276,7 +276,7 @@ fn matmul_add_layernorm_chain() {
     let h = find(&graph, "H");
     let matmul_nid = graph.value(h).producer.expect("H has producer");
     assert_eq!(graph.node(matmul_nid).op_type, "MatMul");
-    assert_eq!(graph.value(h).consumers.len(), 1);
+    assert_eq!(graph.num_uses(h), 1);
 
     // X is a graph input with no producer.
     let x = find(&graph, "X");

@@ -110,7 +110,7 @@ pub fn compute_liveness(
         let Some(interval) = intervals.get_mut(&root) else {
             continue;
         };
-        for &consumer in &graph.value(vid).consumers {
+        for consumer in graph.consumers(vid) {
             if let Some(&idx) = order_index.get(&consumer) {
                 interval.use_end = interval.use_end.max(idx);
             }

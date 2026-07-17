@@ -79,6 +79,26 @@ impl Graph {
         self.values.get(id)
     }
 
+    /// Consuming input slots sorted by `(NodeId, input_index)`.
+    pub fn uses(&self, value: ValueId) -> Vec<(NodeId, u32)> {
+        self.value(value).consumers.uses()
+    }
+
+    /// Distinct consumer nodes sorted by ascending [`NodeId`].
+    pub fn consumers(&self, value: ValueId) -> Vec<NodeId> {
+        self.value(value).consumers.nodes()
+    }
+
+    /// Number of consuming input slots.
+    pub fn num_uses(&self, value: ValueId) -> usize {
+        self.value(value).consumers.len()
+    }
+
+    /// Whether at least one node input slot consumes `value`.
+    pub fn has_uses(&self, value: ValueId) -> bool {
+        !self.value(value).consumers.is_empty()
+    }
+
     /// Number of live nodes.
     pub fn num_nodes(&self) -> usize {
         self.nodes.len()
@@ -152,14 +172,87 @@ impl Graph {
         id
     }
 
-    /// Register `value` as a graph input (also clears any producer link).
+    /// Register `value` as a graph input.
     pub fn add_input(&mut self, value: ValueId) {
+        self.value_mut(value).is_graph_input = true;
         self.inputs.push(value);
+        debug_assert!(self.value(value).is_graph_input);
     }
 
     /// Register `value` as a graph output.
     pub fn add_output(&mut self, value: ValueId) {
+        self.value_mut(value).is_graph_output = true;
         self.outputs.push(value);
+        debug_assert!(self.value(value).is_graph_output);
+    }
+
+    /// Insert `value` into the ordered graph outputs.
+    pub fn insert_output(&mut self, index: usize, value: ValueId) {
+        self.value_mut(value).is_graph_output = true;
+        self.outputs.insert(index, value);
+        debug_assert!(self.value(value).is_graph_output);
+    }
+
+    /// Remove one ordered graph input.
+    pub fn remove_input(&mut self, index: usize) -> ValueId {
+        let value = self.inputs.remove(index);
+        if !self.inputs.contains(&value) {
+            self.value_mut(value).is_graph_input = false;
+        }
+        debug_assert_eq!(
+            self.value(value).is_graph_input,
+            self.inputs.contains(&value)
+        );
+        value
+    }
+
+    /// Remove one ordered graph output.
+    pub fn remove_output(&mut self, index: usize) -> ValueId {
+        let value = self.outputs.remove(index);
+        if !self.outputs.contains(&value) {
+            self.value_mut(value).is_graph_output = false;
+        }
+        debug_assert_eq!(
+            self.value(value).is_graph_output,
+            self.outputs.contains(&value)
+        );
+        value
+    }
+
+    /// Replace the complete ordered graph-input list.
+    pub fn set_inputs(&mut self, inputs: Vec<ValueId>) {
+        for value in self.inputs.drain(..) {
+            if let Some(metadata) = self.values.get_mut(value) {
+                metadata.is_graph_input = false;
+            }
+        }
+        for &value in &inputs {
+            self.value_mut(value).is_graph_input = true;
+        }
+        self.inputs = inputs;
+        debug_assert!(
+            self.inputs
+                .iter()
+                .all(|&value| self.value(value).is_graph_input)
+        );
+    }
+
+    /// Replace the complete ordered graph-output list.
+    pub fn set_outputs(&mut self, outputs: Vec<ValueId>) {
+        for value in self.outputs.drain(..) {
+            if let Some(metadata) = self.values.get_mut(value) {
+                metadata.is_graph_output = false;
+            }
+        }
+        for &value in &outputs {
+            self.value_mut(value).is_graph_output = true;
+        }
+        self.outputs = outputs;
+        debug_assert!(
+            self.outputs
+                .iter()
+                .all(|&value| self.value(value).is_graph_output)
+        );
     }
 
     /// Attach initializer weights to `value`.
@@ -181,6 +274,7 @@ impl Graph {
                 out.push(prod);
             }
         }
+        out.sort_unstable_by_key(|node| node.0);
         out
     }
 
@@ -190,13 +284,14 @@ impl Graph {
         let mut seen = HashSet::new();
         for &v in &self.node(node).outputs {
             if let Some(val) = self.values.get(v) {
-                for &c in &val.consumers {
+                for c in val.consumers.nodes() {
                     if seen.insert(c) {
                         out.push(c);
                     }
                 }
             }
         }
+        out.sort_unstable_by_key(|node| node.0);
         out
     }
 
@@ -234,9 +329,12 @@ impl Graph {
     /// Ties are broken by ascending [`NodeId`] for deterministic output.
     /// Returns [`GraphError::CycleDetected`] if the graph has a cycle.
     pub fn topological_order(&self) -> Result<Vec<NodeId>, GraphError> {
-        let mut in_degree: HashMap<NodeId, usize> =
-            self.nodes.keys().map(|k| (k, 0usize)).collect();
-        let mut adj: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
+        const VACANT: usize = usize::MAX;
+        let mut in_degree = vec![VACANT; self.nodes.capacity()];
+        let mut adj = vec![Vec::<NodeId>::new(); self.nodes.capacity()];
+        for node in self.nodes.keys() {
+            in_degree[node.0 as usize] = 0;
+        }
 
         for (nid, node) in self.nodes.iter() {
             for v in node.input_values() {
@@ -244,8 +342,8 @@ impl Graph {
                     && let Some(prod) = val.producer
                     && self.nodes.contains(prod)
                 {
-                    adj.entry(prod).or_default().push(nid);
-                    *in_degree.entry(nid).or_insert(0) += 1;
+                    adj[prod.0 as usize].push(nid);
+                    in_degree[nid.0 as usize] += 1;
                 }
             }
         }
@@ -253,21 +351,20 @@ impl Graph {
         // Min-heap on raw id for deterministic ordering.
         let mut ready: BinaryHeap<std::cmp::Reverse<u32>> = in_degree
             .iter()
-            .filter(|(_, d)| **d == 0)
-            .map(|(k, _)| std::cmp::Reverse(k.0))
+            .enumerate()
+            .filter(|(_, degree)| **degree == 0)
+            .map(|(raw, _)| std::cmp::Reverse(raw as u32))
             .collect();
 
         let mut order = Vec::with_capacity(self.nodes.len());
         while let Some(std::cmp::Reverse(raw)) = ready.pop() {
             let nid = NodeId(raw);
             order.push(nid);
-            if let Some(succs) = adj.get(&nid) {
-                for &s in succs {
-                    let d = in_degree.get_mut(&s).expect("successor tracked");
-                    *d -= 1;
-                    if *d == 0 {
-                        ready.push(std::cmp::Reverse(s.0));
-                    }
+            for &successor in &adj[raw as usize] {
+                let degree = &mut in_degree[successor.0 as usize];
+                *degree -= 1;
+                if *degree == 0 {
+                    ready.push(std::cmp::Reverse(successor.0));
                 }
             }
         }
@@ -306,127 +403,14 @@ impl Graph {
         }
     }
 
-    /// Remove nodes in a batch while preserving the observable result of
-    /// calling [`Graph::remove_node`] for each ID in slice order.
+    /// Remove nodes in slice order.
     ///
-    /// IDs that are not live and duplicate IDs are ignored just as they are by
-    /// sequential removal. Consumer vectors for values shared by removed nodes
-    /// are filtered once, and graph-I/O and initializer membership is
-    /// precomputed for orphan checks.
+    /// Each input edge is removed directly by `(NodeId, input_index)`, so this
+    /// remains linear in the number of removed edges even for a high-fanout
+    /// shared value.
     pub fn remove_nodes(&mut self, ids: &[NodeId]) {
-        let mut removed = HashSet::with_capacity(ids.len());
-        let ordered: Vec<NodeId> = ids
-            .iter()
-            .copied()
-            .filter(|&id| self.nodes.contains(id) && removed.insert(id))
-            .collect();
-        if ordered.is_empty() {
-            return;
-        }
-
-        let mut touched_consumers = HashSet::new();
-        let mut touched_producers = HashSet::new();
-        let mut seen_inputs = HashSet::new();
-        let mut snapshots = Vec::with_capacity(ordered.len());
-        for &id in &ordered {
-            let node = self.node(id);
-            let inputs: Vec<ValueId> = node
-                .input_values()
-                .filter(|&value| seen_inputs.insert((id, value)))
-                .collect();
-            let outputs = node.outputs.clone();
-            touched_consumers.extend(inputs.iter().copied());
-            touched_producers.extend(outputs.iter().copied());
-            snapshots.push((id, inputs, outputs));
-        }
-
-        let mut consumer_counts = HashMap::new();
-        let mut removed_consumer_edges = HashMap::new();
-        for &value in &touched_consumers {
-            if let Some(metadata) = self.values.get(value) {
-                consumer_counts.insert(value, metadata.consumers.len());
-                for &consumer in &metadata.consumers {
-                    if removed.contains(&consumer) {
-                        *removed_consumer_edges
-                            .entry((consumer, value))
-                            .or_insert(0usize) += 1;
-                    }
-                }
-            }
-        }
-        for &value in &touched_producers {
-            if let Some(metadata) = self.values.get(value) {
-                consumer_counts
-                    .entry(value)
-                    .or_insert(metadata.consumers.len());
-            }
-        }
-
-        let graph_inputs: HashSet<ValueId> = self.inputs.iter().copied().collect();
-        let graph_outputs: HashSet<ValueId> = self.outputs.iter().copied().collect();
-        let initializers: HashSet<ValueId> = self.initializers.keys().copied().collect();
-
-        // Simulate sequential consumer-count changes so orphan collection
-        // happens for exactly the values remove_node would collect in this
-        // order, including the producer-after-consumers case.
-        let mut orphaned_outputs = Vec::new();
-        let mut sequentially_collected = HashSet::new();
-        for (id, inputs, outputs) in &snapshots {
-            for &value in inputs {
-                if sequentially_collected.contains(&value) {
-                    continue;
-                }
-                if let Some(count) = consumer_counts.get_mut(&value) {
-                    *count -= removed_consumer_edges
-                        .get(&(*id, value))
-                        .copied()
-                        .unwrap_or(0);
-                }
-            }
-            for &value in outputs {
-                if sequentially_collected.contains(&value) {
-                    continue;
-                }
-                let orphan = self.values.get(value).is_some_and(|metadata| {
-                    metadata.producer == Some(*id)
-                        && consumer_counts.get(&value).copied().unwrap_or(0) == 0
-                        && !graph_inputs.contains(&value)
-                        && !graph_outputs.contains(&value)
-                        && !initializers.contains(&value)
-                });
-                if orphan {
-                    orphaned_outputs.push(value);
-                    sequentially_collected.insert(value);
-                }
-            }
-        }
-
-        for value in touched_consumers {
-            if let Some(metadata) = self.values.get_mut(value) {
-                metadata
-                    .consumers
-                    .retain(|consumer| !removed.contains(consumer));
-            }
-        }
-        for value in touched_producers {
-            if let Some(metadata) = self.values.get_mut(value)
-                && metadata
-                    .producer
-                    .is_some_and(|producer| removed.contains(&producer))
-            {
-                metadata.producer = None;
-            }
-        }
-        for id in ordered {
-            self.nodes.remove(id);
-        }
-        for value in orphaned_outputs {
-            self.gc_value_if_orphan_with_membership(
-                value,
-                &graph_inputs,
-                &graph_outputs,
-                &initializers,
-            );
+        for &id in ids {
+            self.remove_node(id);
         }
     }
 
@@ -436,24 +420,20 @@ impl Graph {
     /// Each group is semantically equivalent to calling [`Graph::remove_node`]
     /// for its IDs in slice order and then [`Graph::insert_node`] for the
     /// replacement. In particular, replacement IDs and orphan-value collection
-    /// match that sequential operation. The supplied `graph_outputs` must be the
-    /// current graph-output set and is reused for orphan checks so callers that
-    /// process many groups do not repeatedly scan [`Graph::outputs`].
+    /// match that sequential operation. `graph_outputs` is retained for API
+    /// compatibility and checked against the per-value membership invariant in
+    /// debug builds.
     pub fn replace_node_groups(
         &mut self,
         groups: Vec<(Vec<NodeId>, Node)>,
         graph_outputs: &HashSet<ValueId>,
     ) -> Vec<NodeId> {
-        if groups.is_empty() {
-            return Vec::new();
-        }
-
+        debug_assert_eq!(
+            graph_outputs,
+            &self.outputs.iter().copied().collect::<HashSet<_>>()
+        );
         let mut removed_nodes = HashSet::new();
-        let mut touched_consumers = HashSet::new();
-        let mut removed_outputs = Vec::new();
-        let mut consumer_counts = HashMap::new();
-
-        for (node_ids, replacement) in &groups {
+        for (node_ids, _) in &groups {
             assert!(
                 !node_ids.is_empty(),
                 "replace_node_groups: group must not be empty"
@@ -467,99 +447,15 @@ impl Graph {
                     removed_nodes.insert(id),
                     "replace_node_groups: groups must be disjoint"
                 );
-                let node = self.node(id);
-                touched_consumers.extend(node.input_values());
-                removed_outputs.extend(node.outputs.iter().copied());
             }
-            touched_consumers.extend(replacement.input_values());
         }
-
-        for &value in touched_consumers.iter().chain(removed_outputs.iter()) {
-            consumer_counts
-                .entry(value)
-                .or_insert_with(|| self.value(value).consumers.len());
-        }
-
-        let mut protected_values = graph_outputs.clone();
-        protected_values.extend(self.inputs.iter().copied());
-        protected_values.extend(self.initializers.keys().copied());
 
         let mut inserted = Vec::with_capacity(groups.len());
-        let mut orphaned_outputs = Vec::new();
         for (node_ids, replacement) in groups {
             for id in node_ids {
-                let (inputs, outputs) = {
-                    let node = self.node(id);
-                    (
-                        node.input_values().collect::<Vec<_>>(),
-                        node.outputs.clone(),
-                    )
-                };
-                for value in inputs {
-                    let count = consumer_counts
-                        .get_mut(&value)
-                        .expect("covered input consumer count tracked");
-                    *count = count
-                        .checked_sub(1)
-                        .expect("covered input consumer edge present");
-                }
-                self.nodes.remove(id);
-                for value in outputs {
-                    if self.value(value).producer == Some(id)
-                        && consumer_counts[&value] == 0
-                        && !protected_values.contains(&value)
-                    {
-                        orphaned_outputs.push(value);
-                    }
-                }
+                self.remove_node(id);
             }
-
-            let id = self.nodes.insert_with(|id| {
-                let mut replacement = replacement;
-                replacement.id = id;
-                replacement
-            });
-            for value in self.node(id).input_values() {
-                *consumer_counts
-                    .get_mut(&value)
-                    .expect("replacement input consumer count tracked") += 1;
-            }
-            inserted.push(id);
-        }
-
-        for value in touched_consumers {
-            if let Some(metadata) = self.values.get_mut(value) {
-                metadata
-                    .consumers
-                    .retain(|consumer| !removed_nodes.contains(consumer));
-            }
-        }
-        for value in removed_outputs {
-            if let Some(metadata) = self.values.get_mut(value)
-                && metadata
-                    .producer
-                    .is_some_and(|producer| removed_nodes.contains(&producer))
-            {
-                metadata.producer = None;
-            }
-        }
-        for &id in &inserted {
-            let (inputs, outputs) = {
-                let node = self.node(id);
-                (
-                    node.input_values().collect::<Vec<_>>(),
-                    node.outputs.clone(),
-                )
-            };
-            for value in inputs {
-                self.value_mut(value).consumers.push(id);
-            }
-            for value in outputs {
-                self.value_mut(value).producer = Some(id);
-            }
-        }
-        for value in orphaned_outputs {
-            self.gc_value_if_orphan(value);
+            inserted.push(self.insert_node(replacement));
         }
 
         inserted
@@ -604,35 +500,71 @@ impl Graph {
         self.insert_node(new_node)
     }
 
+    /// Replace one node input and update both values' consumer sets.
+    ///
+    /// This is constant-time on average for edge metadata. `None` disconnects
+    /// the slot and is used by node removal.
+    pub fn replace_input(
+        &mut self,
+        node: NodeId,
+        input_index: usize,
+        new_value: Option<ValueId>,
+    ) -> Option<ValueId> {
+        assert!(self.nodes.contains(node), "replace_input: node id not live");
+        assert!(
+            input_index < self.node(node).inputs.len(),
+            "replace_input: input index out of bounds"
+        );
+        if let Some(value) = new_value {
+            assert!(
+                self.values.contains(value),
+                "replace_input: value id not live"
+            );
+        }
+
+        let old_value = self.node(node).inputs[input_index];
+        if old_value == new_value {
+            return old_value;
+        }
+        if let Some(value) = old_value {
+            let removed = self
+                .value_mut(value)
+                .consumers
+                .remove(node, input_index as u32);
+            debug_assert!(removed, "old input edge must be present");
+        }
+        self.node_mut(node).inputs[input_index] = new_value;
+        if let Some(value) = new_value {
+            self.value_mut(value)
+                .consumers
+                .insert(node, input_index as u32);
+        }
+        old_value
+    }
+
     /// Replace every use of `old_value` with `new_value` in consumer nodes and
     /// in the graph output list, moving consumer edges accordingly.
     pub fn replace_all_uses(&mut self, old_value: ValueId, new_value: ValueId) {
         if old_value == new_value {
             return;
         }
-        let consumers = match self.values.get(old_value) {
-            Some(v) => v.consumers.clone(),
+        let uses = match self.values.get(old_value) {
+            Some(value) => value.consumers.uses(),
             None => return,
         };
-        for nid in &consumers {
-            if let Some(node) = self.nodes.get_mut(*nid) {
-                for slot in node.inputs.iter_mut() {
-                    if *slot == Some(old_value) {
-                        *slot = Some(new_value);
-                    }
+        for (node, input_index) in uses {
+            if self.nodes.contains(node) {
+                self.replace_input(node, input_index as usize, Some(new_value));
+            }
+        }
+        if self.value(old_value).is_graph_output {
+            let mut outputs = self.outputs.clone();
+            for output in &mut outputs {
+                if *output == old_value {
+                    *output = new_value;
                 }
             }
-        }
-        // Move consumer entries from old to new.
-        let mut moved = std::mem::take(&mut self.value_mut(old_value).consumers);
-        if let Some(nv) = self.values.get_mut(new_value) {
-            nv.consumers.append(&mut moved);
-        }
-        // Rewrite graph outputs.
-        for out in self.outputs.iter_mut() {
-            if *out == old_value {
-                *out = new_value;
-            }
+            self.set_outputs(outputs);
         }
     }
 
@@ -641,13 +573,35 @@ impl Graph {
     /// Verify structural invariants (§3.3). Returns every defect found.
     pub fn validate(&self) -> Result<(), Vec<GraphError>> {
         let mut errors = Vec::new();
+        let graph_inputs: HashSet<_> = self.inputs.iter().copied().collect();
+        let graph_outputs: HashSet<_> = self.outputs.iter().copied().collect();
+        for (value, metadata) in self.values.iter() {
+            debug_assert_eq!(
+                metadata.is_graph_input,
+                graph_inputs.contains(&value),
+                "graph-input membership flag drifted for {value:?}"
+            );
+            debug_assert_eq!(
+                metadata.is_graph_output,
+                graph_outputs.contains(&value),
+                "graph-output membership flag drifted for {value:?}"
+            );
+        }
 
         // 1. Node edges reference live values; collect produced values.
         let mut produced: HashMap<ValueId, NodeId> = HashMap::new();
         for (nid, node) in self.nodes.iter() {
-            for v in node.input_values() {
-                if !self.values.contains(v) {
-                    errors.push(GraphError::DanglingValue(v));
+            for (input_index, input) in node.inputs.iter().enumerate() {
+                if let Some(value) = input {
+                    if !self.values.contains(*value) {
+                        errors.push(GraphError::DanglingValue(*value));
+                    } else if !self
+                        .value(*value)
+                        .consumers
+                        .contains(nid, input_index as u32)
+                    {
+                        errors.push(GraphError::ConsumerLinkMismatch(*value));
+                    }
                 }
             }
             for &v in &node.outputs {
@@ -670,10 +624,10 @@ impl Graph {
                     errors.push(GraphError::ProducerLinkMismatch(vid));
                 }
             }
-            for &c in &val.consumers {
-                if !self.nodes.contains(c) {
-                    errors.push(GraphError::DanglingNode(c));
-                } else if !self.node(c).input_values().any(|iv| iv == vid) {
+            for (consumer, input_index) in val.consumers.uses() {
+                if !self.nodes.contains(consumer) {
+                    errors.push(GraphError::DanglingNode(consumer));
+                } else if self.node(consumer).inputs.get(input_index as usize) != Some(&Some(vid)) {
                     errors.push(GraphError::ConsumerLinkMismatch(vid));
                 }
             }
@@ -685,6 +639,7 @@ impl Graph {
                 if val.producer.is_some() {
                     errors.push(GraphError::InputHasProducer(inp));
                 }
+                debug_assert!(val.is_graph_input);
             } else {
                 errors.push(GraphError::DanglingValue(inp));
             }
@@ -695,8 +650,8 @@ impl Graph {
         for &out in &self.outputs {
             match self.values.get(out) {
                 Some(val) => {
-                    let is_source =
-                        self.inputs.contains(&out) || self.initializers.contains_key(&out);
+                    debug_assert!(val.is_graph_output);
+                    let is_source = val.is_graph_input || self.initializers.contains_key(&out);
                     if val.producer.is_none() && !is_source {
                         errors.push(GraphError::MissingProducer(out));
                     }
@@ -738,11 +693,13 @@ impl Graph {
 
     /// Wire a live node's edges into its input/output values.
     fn connect_edges(&mut self, id: NodeId) {
-        let inputs: Vec<ValueId> = self.node(id).input_values().collect();
+        let inputs = self.node(id).inputs.clone();
         let outputs = self.node(id).outputs.clone();
-        for v in inputs {
-            if let Some(val) = self.values.get_mut(v) {
-                val.consumers.push(id);
+        for (input_index, input) in inputs.into_iter().enumerate() {
+            if let Some(value) = input
+                && let Some(metadata) = self.values.get_mut(value)
+            {
+                metadata.consumers.insert(id, input_index as u32);
             }
         }
         for v in outputs {
@@ -755,12 +712,10 @@ impl Graph {
     /// Remove a live node's edges from its input/output values, without
     /// deleting the values or the node itself.
     fn disconnect_edges(&mut self, id: NodeId) {
-        let inputs: Vec<ValueId> = self.node(id).input_values().collect();
+        let input_count = self.node(id).inputs.len();
         let outputs = self.node(id).outputs.clone();
-        for v in inputs {
-            if let Some(val) = self.values.get_mut(v) {
-                val.consumers.retain(|&c| c != id);
-            }
+        for input_index in 0..input_count {
+            self.replace_input(id, input_index, None);
         }
         for v in outputs {
             if let Some(val) = self.values.get_mut(v)
@@ -778,33 +733,12 @@ impl Graph {
             Some(v) => {
                 v.producer.is_none()
                     && v.consumers.is_empty()
-                    && !self.inputs.contains(&value)
-                    && !self.outputs.contains(&value)
+                    && !v.is_graph_input
+                    && !v.is_graph_output
                     && !self.initializers.contains_key(&value)
             }
             None => false,
         };
-        if orphan {
-            self.values.remove(value);
-            self.unknown_value_types.remove(&value);
-            self.unknown_value_shapes.remove(&value);
-        }
-    }
-
-    fn gc_value_if_orphan_with_membership(
-        &mut self,
-        value: ValueId,
-        graph_inputs: &HashSet<ValueId>,
-        graph_outputs: &HashSet<ValueId>,
-        initializers: &HashSet<ValueId>,
-    ) {
-        let orphan = self.values.get(value).is_some_and(|metadata| {
-            metadata.producer.is_none()
-                && metadata.consumers.is_empty()
-                && !graph_inputs.contains(&value)
-                && !graph_outputs.contains(&value)
-                && !initializers.contains(&value)
-        });
         if orphan {
             self.values.remove(value);
             self.unknown_value_types.remove(&value);
@@ -869,6 +803,91 @@ mod tests {
         }
     }
 
+    fn reference_remove_node(graph: &mut Graph, id: NodeId) {
+        if !graph.nodes.contains(id) {
+            return;
+        }
+        let (inputs, outputs) = {
+            let node = graph.node(id);
+            (
+                node.input_values().collect::<Vec<_>>(),
+                node.outputs.clone(),
+            )
+        };
+        let unique_inputs: HashSet<_> = inputs.into_iter().collect();
+        for value in unique_inputs {
+            if let Some(metadata) = graph.values.get_mut(value) {
+                for (consumer, input_index) in metadata.consumers.uses() {
+                    if consumer == id {
+                        metadata.consumers.remove(consumer, input_index);
+                    }
+                }
+            }
+        }
+        for &value in &outputs {
+            if let Some(metadata) = graph.values.get_mut(value)
+                && metadata.producer == Some(id)
+            {
+                metadata.producer = None;
+            }
+        }
+        graph.nodes.remove(id);
+        for value in outputs {
+            let orphan = graph.values.get(value).is_some_and(|metadata| {
+                metadata.producer.is_none()
+                    && metadata.consumers.is_empty()
+                    && !graph.inputs.contains(&value)
+                    && !graph.outputs.contains(&value)
+                    && !graph.initializers.contains_key(&value)
+            });
+            if orphan {
+                graph.values.remove(value);
+                graph.unknown_value_types.remove(&value);
+                graph.unknown_value_shapes.remove(&value);
+            }
+        }
+    }
+
+    fn reference_topological_order(graph: &Graph) -> Result<Vec<NodeId>, GraphError> {
+        let mut in_degree: HashMap<NodeId, usize> =
+            graph.nodes.keys().map(|node| (node, 0)).collect();
+        let mut adjacency: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
+        for (node_id, node) in graph.nodes.iter() {
+            for value in node.input_values() {
+                if let Some(producer) = graph.value(value).producer
+                    && graph.nodes.contains(producer)
+                {
+                    adjacency.entry(producer).or_default().push(node_id);
+                    *in_degree.get_mut(&node_id).unwrap() += 1;
+                }
+            }
+        }
+        let mut ready: BinaryHeap<std::cmp::Reverse<u32>> = in_degree
+            .iter()
+            .filter(|(_, degree)| **degree == 0)
+            .map(|(node, _)| std::cmp::Reverse(node.0))
+            .collect();
+        let mut order = Vec::with_capacity(graph.num_nodes());
+        while let Some(std::cmp::Reverse(raw)) = ready.pop() {
+            let node = NodeId(raw);
+            order.push(node);
+            if let Some(successors) = adjacency.get(&node) {
+                for successor in successors {
+                    let degree = in_degree.get_mut(successor).unwrap();
+                    *degree -= 1;
+                    if *degree == 0 {
+                        ready.push(std::cmp::Reverse(successor.0));
+                    }
+                }
+            }
+        }
+        if order.len() == graph.num_nodes() {
+            Ok(order)
+        } else {
+            Err(GraphError::CycleDetected)
+        }
+    }
+
     /// Build `a -> Relu -> b -> Add(b, c) -> d`, returning ids.
     fn sample_graph() -> Graph {
         let mut g = Graph::new();
@@ -909,6 +928,94 @@ mod tests {
     }
 
     #[test]
+    fn uses_preserve_input_multiplicity_and_replace_one_slot() {
+        let mut graph = Graph::new();
+        let old = graph.create_value(DataType::Float32, static_shape([1]));
+        let new = graph.create_value(DataType::Float32, static_shape([1]));
+        graph.add_input(old);
+        graph.add_input(new);
+        let output = graph.create_value(DataType::Float32, static_shape([1]));
+        let node = graph.insert_node(Node::new(
+            NodeId(0),
+            "Add",
+            vec![Some(old), Some(old)],
+            vec![output],
+        ));
+
+        assert_eq!(graph.uses(old), vec![(node, 0), (node, 1)]);
+        assert_eq!(graph.consumers(old), vec![node]);
+        assert_eq!(graph.replace_input(node, 1, Some(new)), Some(old));
+        assert_eq!(graph.uses(old), vec![(node, 0)]);
+        assert_eq!(graph.uses(new), vec![(node, 1)]);
+        assert!(graph.validate().is_ok());
+
+        graph.remove_node(node);
+        assert!(graph.uses(old).is_empty());
+        assert!(graph.uses(new).is_empty());
+    }
+
+    #[test]
+    fn io_membership_flags_follow_ordered_lists() {
+        let mut graph = Graph::new();
+        let a = graph.create_value(DataType::Float32, static_shape([1]));
+        let b = graph.create_value(DataType::Float32, static_shape([1]));
+        graph.add_input(a);
+        graph.add_output(a);
+        graph.insert_output(0, b);
+        assert!(graph.value(a).is_graph_input);
+        assert!(graph.value(a).is_graph_output);
+        assert!(graph.value(b).is_graph_output);
+
+        assert_eq!(graph.remove_output(1), a);
+        assert!(!graph.value(a).is_graph_output);
+        graph.set_inputs(vec![b]);
+        assert!(!graph.value(a).is_graph_input);
+        assert!(graph.value(b).is_graph_input);
+        graph.set_outputs(vec![a]);
+        assert!(graph.value(a).is_graph_output);
+        assert!(!graph.value(b).is_graph_output);
+    }
+
+    #[test]
+    fn consumer_hash_insertion_order_is_not_observable() {
+        let mut first = Graph::new();
+        let hub = first.create_value(DataType::Float32, static_shape([1]));
+        first.add_input(hub);
+        let mut nodes = Vec::new();
+        for _ in 0..32 {
+            let output = first.create_value(DataType::Float32, static_shape([1]));
+            nodes.push(first.insert_node(Node::new(
+                NodeId(0),
+                "Add",
+                vec![Some(hub), Some(hub)],
+                vec![output],
+            )));
+        }
+        let mut shuffled = first.clone();
+        let mut uses = shuffled.uses(hub);
+        for &(node, input_index) in &uses {
+            shuffled.replace_input(node, input_index as usize, None);
+        }
+        let mut rng = TestRng(0x6a09_e667_f3bc_c909);
+        for index in (1..uses.len()).rev() {
+            uses.swap(index, rng.usize(index + 1));
+        }
+        for (node, input_index) in uses {
+            shuffled.replace_input(node, input_index as usize, Some(hub));
+        }
+
+        assert_eq!(first.uses(hub), shuffled.uses(hub));
+        assert_eq!(first.consumers(hub), shuffled.consumers(hub));
+        assert_eq!(first.topological_order(), shuffled.topological_order());
+        assert_eq!(format!("{first:#?}"), format!("{shuffled:#?}"));
+        assert_eq!(
+            format!("{:#?}", sample_graph()),
+            format!("{:#?}", sample_graph())
+        );
+        assert_eq!(nodes, first.consumers(hub));
+    }
+
+    #[test]
     fn validate_accepts_wellformed_graph() {
         let g = sample_graph();
         assert!(g.validate().is_ok());
@@ -940,7 +1047,7 @@ mod tests {
         let add = g.node(NodeId(1));
         assert!(add.input_values().any(|v| v == e));
         assert!(!add.input_values().any(|v| v == ValueId(2)));
-        assert_eq!(g.value(e).consumers, vec![NodeId(1)]);
+        assert_eq!(g.consumers(e), vec![NodeId(1)]);
         assert!(g.value(ValueId(2)).consumers.is_empty());
     }
 
@@ -1015,7 +1122,7 @@ mod tests {
 
         graph.remove_nodes(&nodes[..2]);
 
-        assert_eq!(graph.value(input).consumers, vec![nodes[2]]);
+        assert_eq!(graph.consumers(input), vec![nodes[2]]);
         assert!(graph.try_node(nodes[2]).is_some());
         assert!(graph.validate().is_ok());
     }
@@ -1157,6 +1264,103 @@ mod tests {
                 node_count + 1,
                 input_count + node_count + 1,
                 trial,
+            );
+        }
+    }
+
+    #[test]
+    fn single_node_removal_matches_vector_reference_on_random_dags() {
+        let mut rng = TestRng(0xbb67_ae85_84ca_a73b);
+        for trial in 0..2_000 {
+            let mut graph = Graph::new();
+            let input_count = 1 + rng.usize(3);
+            let node_count = 1 + rng.usize(24);
+            let mut values = Vec::new();
+            for _ in 0..input_count {
+                let value = graph.create_value(DataType::Float32, static_shape([1]));
+                graph.add_input(value);
+                values.push(value);
+            }
+            let mut nodes = Vec::new();
+            for _ in 0..node_count {
+                let input_count = 1 + rng.usize(4);
+                let inputs = (0..input_count)
+                    .map(|_| Some(values[rng.usize(values.len())]))
+                    .collect();
+                let output = graph.create_value(DataType::Float32, static_shape([1]));
+                nodes.push(graph.insert_node(Node::new(NodeId(0), "Random", inputs, vec![output])));
+                values.push(output);
+            }
+            for _ in 0..rng.usize(4) {
+                graph.add_output(values[rng.usize(values.len())]);
+            }
+
+            let mut removals = nodes.clone();
+            for index in (1..removals.len()).rev() {
+                removals.swap(index, rng.usize(index + 1));
+            }
+            removals.truncate(rng.usize(removals.len() + 1));
+            if let Some(&duplicate) = removals.first() {
+                removals.push(duplicate);
+            }
+            removals.push(NodeId(u32::MAX));
+
+            let mut actual = graph.clone();
+            let mut reference = graph;
+            for &node in &removals {
+                actual.remove_node(node);
+                reference_remove_node(&mut reference, node);
+            }
+
+            assert_eq!(
+                format!("{actual:#?}"),
+                format!("{reference:#?}"),
+                "debug mismatch on trial {trial}"
+            );
+            assert_eq!(
+                actual.topological_order(),
+                reference.topological_order(),
+                "topology mismatch on trial {trial}"
+            );
+            for value in actual.values.keys() {
+                assert_eq!(
+                    actual.uses(value),
+                    reference.uses(value),
+                    "uses mismatch for {value:?} on trial {trial}"
+                );
+                assert_eq!(
+                    actual.consumers(value),
+                    reference.consumers(value),
+                    "consumers mismatch for {value:?} on trial {trial}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn vec_indexed_topology_matches_hashmap_reference_on_random_dags() {
+        let mut rng = TestRng(0x3c6e_f372_fe94_f82b);
+        for trial in 0..2_000 {
+            let mut graph = Graph::new();
+            let input = graph.create_value(DataType::Float32, static_shape([1]));
+            graph.add_input(input);
+            let mut values = vec![input];
+            let mut nodes = Vec::new();
+            for _ in 0..(1 + rng.usize(48)) {
+                let inputs = (0..(1 + rng.usize(4)))
+                    .map(|_| Some(values[rng.usize(values.len())]))
+                    .collect();
+                let output = graph.create_value(DataType::Float32, static_shape([1]));
+                nodes.push(graph.insert_node(Node::new(NodeId(0), "Random", inputs, vec![output])));
+                values.push(output);
+            }
+            for &node in nodes.iter().filter(|_| rng.usize(5) == 0) {
+                graph.remove_node(node);
+            }
+            assert_eq!(
+                graph.topological_order(),
+                reference_topological_order(&graph),
+                "topology mismatch on trial {trial}"
             );
         }
     }

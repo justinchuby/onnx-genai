@@ -87,10 +87,9 @@ where
             continue; // source not part of the arena (e.g. excluded input)
         };
         let view_use = graph
-            .value(vid)
-            .consumers
-            .iter()
-            .filter_map(|c| live.order_index.get(c).copied())
+            .consumers(vid)
+            .into_iter()
+            .filter_map(|consumer| live.order_index.get(&consumer).copied())
             .max();
         let view_use = match view_use {
             Some(u) => u.max(view_output_end(graph, &live, vid)),

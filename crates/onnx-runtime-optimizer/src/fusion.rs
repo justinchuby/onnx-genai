@@ -302,10 +302,8 @@ impl FusionPattern {
     /// The first consumer of `value` whose op is `op` (standard domain).
     fn find_consumer(graph: &Graph, value: ValueId, op: &str) -> Option<NodeId> {
         graph
-            .value(value)
-            .consumers
-            .iter()
-            .copied()
+            .consumers(value)
+            .into_iter()
             .find(|&c| Self::op_matches(graph.node(c), op))
     }
 
@@ -337,10 +335,8 @@ impl FusionPattern {
         // Every `Sub` that consumes `mean` (i.e. computes `x - mean`). One in the
         // canonical diamond, two in the split-diff variant.
         let subs: Vec<NodeId> = graph
-            .value(mean)
-            .consumers
-            .iter()
-            .copied()
+            .consumers(mean)
+            .into_iter()
             .filter(|&c| {
                 let n = graph.node(c);
                 Self::op_matches(n, "Sub") && n.input_values().any(|v| v == mean)
@@ -413,10 +409,9 @@ impl FusionPattern {
                     && graph.node(nid).outputs.iter().any(|&out| {
                         graph.outputs.contains(&out)
                             || graph
-                                .value(out)
-                                .consumers
-                                .iter()
-                                .any(|c| !matched_set.contains(c))
+                                .consumers(out)
+                                .into_iter()
+                                .any(|consumer| !matched_set.contains(&consumer))
                     })
             });
             if escapes {
@@ -430,9 +425,11 @@ impl FusionPattern {
                 continue;
             }
             let output = fa.outputs[0];
-            let out_val = graph.value(output);
             let survives = graph.outputs.contains(&output)
-                || out_val.consumers.iter().any(|c| !matched_set.contains(c));
+                || graph
+                    .consumers(output)
+                    .into_iter()
+                    .any(|consumer| !matched_set.contains(&consumer));
             if !survives {
                 continue;
             }
@@ -542,10 +539,8 @@ impl FusionPattern {
         // following MatMul (matmul is not commutative; a right-operand softmax
         // would be `V · probs`, a different op → decline).
         let out_mm = graph
-            .value(sm_out)
-            .consumers
-            .iter()
-            .copied()
+            .consumers(sm_out)
+            .into_iter()
             .find(|&c| {
                 let n = graph.node(c);
                 Self::op_matches(n, "MatMul") && n.inputs.first() == Some(&Some(sm_out))
@@ -636,10 +631,9 @@ impl FusionPattern {
                 && graph.node(nid).outputs.iter().any(|&o| {
                     graph.outputs.contains(&o)
                         || graph
-                            .value(o)
-                            .consumers
-                            .iter()
-                            .any(|c| !matched_set.contains(c))
+                            .consumers(o)
+                            .into_iter()
+                            .any(|consumer| !matched_set.contains(&consumer))
                 })
         });
         if escapes {
@@ -647,9 +641,11 @@ impl FusionPattern {
         }
 
         // The fused output (out_mm's single output) must survive removal.
-        let out_val = graph.value(output);
         let survives = graph.outputs.contains(&output)
-            || out_val.consumers.iter().any(|c| !matched_set.contains(c));
+            || graph
+                .consumers(output)
+                .into_iter()
+                .any(|consumer| !matched_set.contains(&consumer));
         if !survives {
             return None;
         }
@@ -733,7 +729,7 @@ impl FusionPattern {
                 && t.inputs.len() == 1
                 && t.outputs.len() == 1
                 && t.outputs[0] == k_side
-                && graph.value(k_side).consumers.as_slice() == [score_mm_id]
+                && graph.consumers(k_side) == [score_mm_id]
                 && let Some(perm) = t.attr("perm").and_then(Attribute::as_ints)
                 && is_last2_swap_perm(perm)
                 && let Some(kin) = t.inputs[0]
@@ -857,10 +853,9 @@ impl FusionPattern {
                 && graph.node(nid).outputs.iter().any(|&o| {
                     graph.outputs.contains(&o)
                         || graph
-                            .value(o)
-                            .consumers
-                            .iter()
-                            .any(|c| !matched_set.contains(c))
+                            .consumers(o)
+                            .into_iter()
+                            .any(|consumer| !matched_set.contains(&consumer))
                 })
         });
         if escapes {
@@ -868,9 +863,11 @@ impl FusionPattern {
         }
 
         // The fused output (outer's single output) must survive removal.
-        let out_val = graph.value(output);
         let survives = graph.outputs.contains(&output)
-            || out_val.consumers.iter().any(|c| !matched_set.contains(c));
+            || graph
+                .consumers(output)
+                .into_iter()
+                .any(|consumer| !matched_set.contains(&consumer));
         if !survives {
             return None;
         }
@@ -956,10 +953,9 @@ impl FusionPattern {
                     return None;
                 }
                 if graph
-                    .value(out)
-                    .consumers
-                    .iter()
-                    .any(|c| !chain_set.contains(c))
+                    .consumers(out)
+                    .into_iter()
+                    .any(|consumer| !chain_set.contains(&consumer))
                 {
                     return None;
                 }
@@ -976,9 +972,11 @@ impl FusionPattern {
 
         // The output must survive removal of the matched nodes: it is either a
         // graph output or has a consumer outside the matched set.
-        let out_val = graph.value(output);
         let survives = graph.outputs.contains(&output)
-            || out_val.consumers.iter().any(|c| !chain_set.contains(c));
+            || graph
+                .consumers(output)
+                .into_iter()
+                .any(|consumer| !chain_set.contains(&consumer));
         if !survives {
             return None;
         }
@@ -1954,8 +1952,9 @@ mod tests {
                 (-1i64).to_le_bytes().to_vec(),
             )),
         );
-        g.node_mut(rm1).inputs.push(Some(axes_in));
-        g.value_mut(axes_in).consumers.push(rm1);
+        let input_index = g.node(rm1).inputs.len();
+        g.node_mut(rm1).inputs.push(None);
+        g.replace_input(rm1, input_index, Some(axes_in));
         assert!(g.validate().is_ok());
 
         assert_eq!(g.num_nodes(), 9);
