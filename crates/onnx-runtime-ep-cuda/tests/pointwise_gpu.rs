@@ -1,7 +1,9 @@
 //! GPU-vs-CPU checks for floating pointwise dtype and broadcasting coverage.
 
 use half::{bf16, f16};
-use onnx_runtime_ep_api::{DevicePtr, DevicePtrMut, ExecutionProvider, TensorMut, TensorView};
+use onnx_runtime_ep_api::{
+    DevicePtr, DevicePtrMut, ExecutionProvider, KernelMatch, TensorMut, TensorView,
+};
 use onnx_runtime_ep_cuda::CudaExecutionProvider;
 use onnx_runtime_ep_cuda::runtime::cuptr;
 use onnx_runtime_ir::{DataType, Graph, Node, NodeId, compute_contiguous_strides, static_shape};
@@ -199,6 +201,51 @@ fn run_predicate(
     ep.deallocate(b_buf).unwrap();
     ep.deallocate(y_buf).unwrap();
     out
+}
+
+fn bytes<T>(values: &[T]) -> &[u8] {
+    // SAFETY: `u8` has alignment 1 and the returned slice covers exactly the
+    // original initialized values for the duration of `values`.
+    unsafe {
+        std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), std::mem::size_of_val(values))
+    }
+}
+
+fn cpu_predicate<T: Copy>(
+    a: &[T],
+    a_shape: &[usize],
+    b: &[T],
+    b_shape: &[usize],
+    out_shape: &[usize],
+    op: impl Fn(T, T) -> bool,
+) -> Vec<u8> {
+    let strides = |shape: &[usize]| {
+        let contiguous = compute_contiguous_strides(shape);
+        let leading = out_shape.len() - shape.len();
+        (0..out_shape.len())
+            .map(|axis| {
+                if axis < leading || shape[axis - leading] == 1 {
+                    0
+                } else {
+                    contiguous[axis - leading] as usize
+                }
+            })
+            .collect::<Vec<_>>()
+    };
+    let a_strides = strides(a_shape);
+    let b_strides = strides(b_shape);
+    (0..out_shape.iter().product())
+        .map(|mut linear| {
+            let (mut ai, mut bi) = (0, 0);
+            for axis in (0..out_shape.len()).rev() {
+                let coord = linear % out_shape[axis];
+                linear /= out_shape[axis];
+                ai += coord * a_strides[axis];
+                bi += coord * b_strides[axis];
+            }
+            u8::from(op(a[ai], b[bi]))
+        })
+        .collect()
 }
 
 fn cpu_broadcast(
@@ -410,4 +457,119 @@ fn comparison_family_numpy_broadcast_matches_cpu_reference() {
             "{op}"
         );
     }
+}
+
+fn assert_integer_comparisons<T>(ep: &CudaExecutionProvider, dtype: DataType, a: &[T], b: &[T])
+where
+    T: Copy + PartialEq + PartialOrd,
+{
+    let a_shape = [2, 1];
+    let b_shape = [1, 3];
+    let out_shape = [2, 3];
+    for (op, predicate) in [
+        ("Equal", (|x: T, y: T| x == y) as fn(T, T) -> bool),
+        ("Greater", (|x: T, y: T| x > y) as fn(T, T) -> bool),
+        ("Less", (|x: T, y: T| x < y) as fn(T, T) -> bool),
+        ("GreaterOrEqual", (|x: T, y: T| x >= y) as fn(T, T) -> bool),
+        ("LessOrEqual", (|x: T, y: T| x <= y) as fn(T, T) -> bool),
+    ] {
+        assert_eq!(
+            run_predicate(
+                ep,
+                op,
+                dtype,
+                bytes(a),
+                &a_shape,
+                bytes(b),
+                &b_shape,
+                &out_shape
+            ),
+            cpu_predicate(a, &a_shape, b, &b_shape, &out_shape, predicate),
+            "{dtype:?} {op}"
+        );
+    }
+}
+
+#[test]
+fn integer_comparisons_broadcast_match_cpu_oracle() {
+    let Some(ep) = cuda_ep() else { return };
+    assert_integer_comparisons(&ep, DataType::Int64, &[1_i64, 3], &[2_i64, 3, 4]);
+    assert_integer_comparisons(&ep, DataType::Int32, &[1_i32, 3], &[2_i32, 3, 4]);
+}
+
+#[test]
+fn integer_comparisons_cover_glm_like_masks_and_are_deterministic() {
+    let Some(ep) = cuda_ep() else { return };
+    let position_ids = [-2_i64, -1, 0, 1, 2, 3];
+    let zero = [0_i64];
+    let expected = cpu_predicate(&position_ids, &[2, 3], &zero, &[], &[2, 3], |a, b| a >= b);
+    for _ in 0..5 {
+        assert_eq!(
+            run_predicate(
+                &ep,
+                "GreaterOrEqual",
+                DataType::Int64,
+                bytes(&position_ids),
+                &[2, 3],
+                bytes(&zero),
+                &[],
+                &[2, 3],
+            ),
+            expected
+        );
+    }
+
+    let token_ids = [1_i32, 0, 42, 0];
+    let pad_id = [0_i32];
+    assert_eq!(
+        run_predicate(
+            &ep,
+            "Equal",
+            DataType::Int32,
+            bytes(&token_ids),
+            &[2, 2],
+            bytes(&pad_id),
+            &[],
+            &[2, 2],
+        ),
+        vec![0, 1, 0, 1]
+    );
+
+    assert_eq!(
+        run_predicate(
+            &ep,
+            "Equal",
+            DataType::Bool,
+            &[0, 1],
+            &[2, 1],
+            &[0, 1, 1],
+            &[1, 3],
+            &[2, 3],
+        ),
+        vec![1, 0, 0, 0, 1, 1]
+    );
+}
+
+#[test]
+fn comparison_claims_integer_dtypes_and_rejects_unsupported_dtype() {
+    let Some(ep) = cuda_ep() else { return };
+    let node = Node::new(NodeId(0), "Equal", vec![], vec![]);
+    let shapes = [static_shape([2]), static_shape([2])];
+    for dtype in [DataType::Int64, DataType::Int32] {
+        assert!(matches!(
+            ep.supports_op(&node, 17, &shapes, &[dtype, dtype], &[]),
+            KernelMatch::Supported { .. }
+        ));
+    }
+    assert!(matches!(
+        ep.supports_op(
+            &node,
+            17,
+            &shapes,
+            &[DataType::Float64, DataType::Float64],
+            &[]
+        ),
+        KernelMatch::Unsupported { ref reason }
+            if reason.contains("Equal: operand dtype Float64 not supported on CUDA EP")
+    ));
 }

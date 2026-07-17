@@ -15,11 +15,13 @@
 //! * **Not** (`Not`): boolean element negation, matched to the CPU EP
 //!   (`logical.rs` — non-zero byte is `true`, output is canonical `1`/`0`).
 //! * **Comparison** (`Equal`, `Greater`, `Less`, `GreaterOrEqual`,
-//!   `LessOrEqual`): two broadcast-compatible **f32** inputs → **Bool** output.
+//!   `LessOrEqual`): two broadcast-compatible **f32/i32/i64** inputs → **Bool**
+//!   output; `Equal` also accepts **Bool** inputs.
 //! * **Logical** (`And`, `Or`, `Xor`): two broadcast-compatible **Bool** inputs →
 //!   **Bool** output (non-zero byte is `true`, canonical `1`/`0` out).
 //!
-//! `dtype`: f32/f16/bf16 for unary math, f32 for comparison, and bool for
+//! `dtype`: f32/f16/bf16 for unary math, f32/i32/i64 for comparison (plus bool
+//! for `Equal`), and bool for
 //! logical/`Not`; other dtypes return an actionable error naming the dtype/op.
 //!
 //! **Broadcasting:** binary comparison/logical ops reuse the same right-aligned,
@@ -428,11 +430,11 @@ impl Kernel for NotKernel {
 }
 
 // ===========================================================================
-// Comparison (f32, f32 → bool) — NumPy broadcasting
+// Comparison (f32/i32/i64, same dtype → bool) — NumPy broadcasting
 // ===========================================================================
 
-/// NVRTC source: one `extern "C"` kernel per comparison op — two f32 operands,
-/// a 1-byte bool output (canonical `1`/`0`), per ONNX comparison semantics.
+/// NVRTC source: one `extern "C"` kernel per comparison op/dtype. Outputs are
+/// canonical 1-byte bool values, per ONNX comparison semantics.
 const CMP_SRC: &str = r#"
 __device__ __forceinline__ void broadcast_indices(unsigned long long out, const unsigned long long* m, int rank, unsigned long long* ai, unsigned long long* bi) {
     *ai = 0; *bi = 0;
@@ -441,22 +443,27 @@ __device__ __forceinline__ void broadcast_indices(unsigned long long out, const 
         *ai += coord * m[rank + axis]; *bi += coord * m[2 * rank + axis];
     }
 }
-#define DEFINE_CMP(name, expr) \
-extern "C" __global__ void name(const float* a, const float* b, unsigned char* y, const unsigned long long* m, int rank, const unsigned long long n) { \
+#define DEFINE_CMP(name, type, suffix, expr) \
+extern "C" __global__ void name##_##suffix(const type* a, const type* b, unsigned char* y, const unsigned long long* m, int rank, const unsigned long long n) { \
     for (unsigned long long i = blockIdx.x*blockDim.x + threadIdx.x; i < n; i += (unsigned long long)gridDim.x * blockDim.x) { \
         unsigned long long ai, bi; broadcast_indices(i, m, rank, &ai, &bi); y[i] = (expr) ? 1 : 0; \
     } \
 }
-DEFINE_CMP(equal_f32, a[ai] == b[bi])
-DEFINE_CMP(greater_f32, a[ai] > b[bi])
-DEFINE_CMP(less_f32, a[ai] < b[bi])
-DEFINE_CMP(greater_equal_f32, a[ai] >= b[bi])
-DEFINE_CMP(less_equal_f32, a[ai] <= b[bi])
+#define DEFINE_CMP_FOR_TYPE(type, suffix) \
+DEFINE_CMP(equal, type, suffix, a[ai] == b[bi]) \
+DEFINE_CMP(greater, type, suffix, a[ai] > b[bi]) \
+DEFINE_CMP(less, type, suffix, a[ai] < b[bi]) \
+DEFINE_CMP(greater_equal, type, suffix, a[ai] >= b[bi]) \
+DEFINE_CMP(less_equal, type, suffix, a[ai] <= b[bi])
+DEFINE_CMP_FOR_TYPE(float, f32)
+DEFINE_CMP_FOR_TYPE(int, i32)
+DEFINE_CMP_FOR_TYPE(long long, i64)
+DEFINE_CMP(equal, unsigned char, bool, a[ai] == b[bi])
 "#;
 
-const CMP_MODULE: &str = "pointwise_compare_f32";
+const CMP_MODULE: &str = "pointwise_compare";
 
-/// A supported comparison op (f32 operands, bool output).
+/// A supported comparison op (same-type operands, bool output).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CmpOp {
     Equal,
@@ -467,14 +474,33 @@ pub enum CmpOp {
 }
 
 impl CmpOp {
-    fn entry(self) -> &'static str {
-        match self {
-            CmpOp::Equal => "equal_f32",
-            CmpOp::Greater => "greater_f32",
-            CmpOp::Less => "less_f32",
-            CmpOp::GreaterOrEqual => "greater_equal_f32",
-            CmpOp::LessOrEqual => "less_equal_f32",
-        }
+    fn entry(self, dtype: DataType) -> Option<&'static str> {
+        let suffix = match dtype {
+            DataType::Float32 => "f32",
+            DataType::Int32 => "i32",
+            DataType::Int64 => "i64",
+            DataType::Bool if self == Self::Equal => "bool",
+            _ => return None,
+        };
+        Some(match (self, suffix) {
+            (CmpOp::Equal, "f32") => "equal_f32",
+            (CmpOp::Equal, "i32") => "equal_i32",
+            (CmpOp::Equal, "i64") => "equal_i64",
+            (CmpOp::Equal, "bool") => "equal_bool",
+            (CmpOp::Greater, "f32") => "greater_f32",
+            (CmpOp::Greater, "i32") => "greater_i32",
+            (CmpOp::Greater, "i64") => "greater_i64",
+            (CmpOp::Less, "f32") => "less_f32",
+            (CmpOp::Less, "i32") => "less_i32",
+            (CmpOp::Less, "i64") => "less_i64",
+            (CmpOp::GreaterOrEqual, "f32") => "greater_equal_f32",
+            (CmpOp::GreaterOrEqual, "i32") => "greater_equal_i32",
+            (CmpOp::GreaterOrEqual, "i64") => "greater_equal_i64",
+            (CmpOp::LessOrEqual, "f32") => "less_equal_f32",
+            (CmpOp::LessOrEqual, "i32") => "less_equal_i32",
+            (CmpOp::LessOrEqual, "i64") => "less_equal_i64",
+            _ => unreachable!("unsupported comparison dtype was filtered above"),
+        })
     }
 
     fn op_name(self) -> &'static str {
@@ -486,6 +512,24 @@ impl CmpOp {
             CmpOp::LessOrEqual => "LessOrEqual",
         }
     }
+}
+
+/// Returns a claim-time rejection reason for a comparison dtype contract.
+pub(crate) fn comparison_unsupported_reason(op: &str, input_dtypes: &[DataType]) -> Option<String> {
+    let Some(&a) = input_dtypes.first() else {
+        return Some(format!("{op}: missing operand dtype for CUDA EP"));
+    };
+    let Some(&b) = input_dtypes.get(1) else {
+        return Some(format!("{op}: missing second operand dtype for CUDA EP"));
+    };
+    if a != b {
+        return Some(format!(
+            "{op}: operands must have the same dtype on CUDA EP (got {a:?} and {b:?})"
+        ));
+    }
+    let supported = matches!(a, DataType::Float32 | DataType::Int32 | DataType::Int64)
+        || (op == "Equal" && a == DataType::Bool);
+    (!supported).then(|| format!("{op}: operand dtype {a:?} not supported on CUDA EP"))
 }
 
 // ===========================================================================
@@ -544,19 +588,10 @@ impl LogicalOp {
 /// The dtype contract for a binary op: operand dtype and output dtype.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BinaryKind {
-    /// f32 operands, bool output (comparison).
-    CompareF32,
+    /// Same-dtype operands, bool output (comparison).
+    Compare(CmpOp),
     /// bool operands, bool output (logical).
     LogicalBool,
-}
-
-impl BinaryKind {
-    fn operand_dtype(self) -> DataType {
-        match self {
-            BinaryKind::CompareF32 => DataType::Float32,
-            BinaryKind::LogicalBool => DataType::Bool,
-        }
-    }
 }
 
 /// Factory for a binary comparison kernel.
@@ -569,10 +604,10 @@ impl KernelFactory for CmpFactory {
     fn create(&self, _node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
         Ok(Box::new(BinaryPredKernel {
             op_name: self.op.op_name(),
-            entry: self.op.entry(),
+            entry: "",
             module: CMP_MODULE,
             src: CMP_SRC,
-            kind: BinaryKind::CompareF32,
+            kind: BinaryKind::Compare(self.op),
             runtime: self.runtime.clone(),
         }))
     }
@@ -598,7 +633,8 @@ impl KernelFactory for LogicalFactory {
 }
 
 /// NVRTC-backed binary predicate kernel producing a **Bool** output. Covers both
-/// comparison (f32 operands) and logical (bool operands) families via
+/// comparison (f32/i32/i64 operands, plus bool `Equal`) and logical (bool
+/// operands) families via
 /// [`BinaryKind`], with NumPy-style right-aligned broadcasting.
 #[derive(Debug)]
 pub struct BinaryPredKernel {
@@ -622,9 +658,23 @@ impl BinaryPredKernel {
         }
         let a = &inputs[0];
         let b = &inputs[1];
-        let operand = self.kind.operand_dtype();
-        require_dtype(op, "A", a.dtype, operand)?;
-        require_dtype(op, "B", b.dtype, operand)?;
+        let entry = match self.kind {
+            BinaryKind::Compare(cmp) => {
+                let Some(entry) = cmp.entry(a.dtype) else {
+                    return Err(not_implemented(format!(
+                        "{op}: operand dtype {:?} not supported on CUDA EP",
+                        a.dtype
+                    )));
+                };
+                require_dtype(op, "B", b.dtype, a.dtype)?;
+                entry
+            }
+            BinaryKind::LogicalBool => {
+                require_dtype(op, "A", a.dtype, DataType::Bool)?;
+                require_dtype(op, "B", b.dtype, DataType::Bool)?;
+                self.entry
+            }
+        };
         // Comparison and logical ops always emit Bool.
         require_dtype(op, "output", outputs[0].dtype, DataType::Bool)?;
         require_contiguous(op, "A", a.is_contiguous())?;
@@ -645,9 +695,7 @@ impl BinaryPredKernel {
         let b_ptr = cuptr(b.data_ptr::<u8>() as *const c_void);
         let y_ptr = cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void);
 
-        let func = self
-            .runtime
-            .nvrtc_function(self.module, self.src, self.entry)?;
+        let func = self.runtime.nvrtc_function(self.module, self.src, entry)?;
         let metadata = broadcast_metadata(a.shape, b.shape, &out_shape);
         let metadata_bytes = u64_bytes(&metadata);
         let metadata_ptr = self.runtime.alloc_raw(metadata_bytes.len())?;
@@ -672,11 +720,11 @@ impl BinaryPredKernel {
             .arg(&rank)
             .arg(&n_u64);
         // SAFETY: `func` is the compiled predicate entry; its argument list is
-        // (const T*, const T*, unsigned char*, unsigned long long) where T is f32
-        // or uchar per `kind` — matching the validated operand/output dtypes; all
-        // pointers cover `n` elements, with a matching u64 count and indexing.
-        let launch = unsafe { builder.launch(cfg) }
-            .map_err(|e| driver_err(&format!("launch {}", self.entry), e));
+        // (const T*, const T*, unsigned char*, metadata, rank, count), where T
+        // matches the validated same-type operands. All pointers cover their
+        // respective allocations, with matching rank/count and indexing.
+        let launch =
+            unsafe { builder.launch(cfg) }.map_err(|e| driver_err(&format!("launch {entry}"), e));
         let sync = launch.and_then(|_| self.runtime.synchronize());
         let free = unsafe { self.runtime.free_raw(metadata_ptr) };
         sync.and(free)
@@ -734,13 +782,22 @@ mod tests {
             CmpOp::GreaterOrEqual,
             CmpOp::LessOrEqual,
         ] {
+            let stem = op
+                .entry(DataType::Float32)
+                .unwrap()
+                .strip_suffix("_f32")
+                .unwrap();
             assert!(
-                CMP_SRC.contains(&format!("DEFINE_CMP({},", op.entry())),
-                "missing NVRTC entry {} for {}",
-                op.entry(),
+                CMP_SRC.contains(&format!("DEFINE_CMP({stem}, type, suffix,")),
+                "missing NVRTC generator for {}",
                 op.op_name()
             );
         }
+        for suffix in ["float, f32", "int, i32", "long long, i64"] {
+            assert!(CMP_SRC.contains(suffix), "missing comparison type {suffix}");
+        }
+        assert_eq!(CmpOp::Equal.entry(DataType::Bool), Some("equal_bool"));
+        assert_eq!(CmpOp::Greater.entry(DataType::Bool), None);
     }
 
     #[test]
@@ -804,7 +861,7 @@ mod tests {
             CmpOp::GreaterOrEqual,
             CmpOp::LessOrEqual,
         ]
-        .map(|o| o.entry());
+        .map(|o| o.entry(DataType::Float32).unwrap());
         let logical = [LogicalOp::And, LogicalOp::Or, LogicalOp::Xor].map(|o| o.entry());
         for e in unary
             .into_iter()
@@ -832,9 +889,17 @@ mod tests {
     }
 
     #[test]
-    fn operand_dtype_maps_kind_correctly() {
-        assert_eq!(BinaryKind::CompareF32.operand_dtype(), DataType::Float32);
-        assert_eq!(BinaryKind::LogicalBool.operand_dtype(), DataType::Bool);
+    fn comparison_dtype_contract_is_actionable() {
+        assert_eq!(
+            comparison_unsupported_reason("Equal", &[DataType::Int64, DataType::Int64]),
+            None
+        );
+        let reason =
+            comparison_unsupported_reason("Greater", &[DataType::Bool, DataType::Bool]).unwrap();
+        assert!(reason.contains("Bool"), "{reason}");
+        let reason =
+            comparison_unsupported_reason("Equal", &[DataType::Int32, DataType::Int64]).unwrap();
+        assert!(reason.contains("same dtype"), "{reason}");
     }
 
     #[test]

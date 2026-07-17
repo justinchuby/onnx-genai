@@ -81,7 +81,7 @@ not yet wired) · **🔬 custom** (needs a fused NVRTC/CUTLASS kernel).
 |----|--------|--------|---------|-------|
 | `Not` | `` | ✅ | **NVRTC-custom** | bool→bool, non-zero byte = true, canonical `1`/`0` out (matches CPU `logical.rs`). |
 | `And`, `Or`, `Xor` | `` | ✅ | **NVRTC-custom** | bool operands → bool with NumPy right-aligned broadcasting and canonical `1`/`0` output. |
-| `Equal`, `Greater`, `Less`, `GreaterOrEqual`, `LessOrEqual` | `` | ✅ | **NVRTC-custom** | f32 operands → bool with NumPy right-aligned broadcasting and ONNX comparison semantics. |
+| `Equal`, `Greater`, `Less`, `GreaterOrEqual`, `LessOrEqual` | `` | ✅ | **NVRTC-custom** | f32/i32/i64 operands → bool with NumPy right-aligned broadcasting and ONNX comparison semantics; `Equal` also supports bool operands. |
 
 ### Elementwise — binary
 

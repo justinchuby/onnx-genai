@@ -84,7 +84,8 @@ use pointwise::{
 ///   f32/f16/bf16, formulas matched to the CPU EP `unary_math.rs`).
 /// * **Logical** — `Not` (bool), `And`, `Or`, `Xor` (bool, broadcasting).
 /// * **Comparison** — `Equal`, `Greater`, `Less`, `GreaterOrEqual`,
-///   `LessOrEqual` (f32 operands → bool, broadcasting).
+///   `LessOrEqual` (f32/i32/i64 operands → bool, broadcasting; `Equal` also
+///   accepts bool operands).
 /// * **Movement/construction** — `Concat`, `Expand`, `Reshape`, `Slice`, `Split`,
 ///   `Squeeze`, `Tile`, `Transpose`, `Unsqueeze`, plus broadcasting `Where`.
 ///
