@@ -106,6 +106,30 @@ fn run_result(
     outputs: &[(DataType, Vec<usize>)],
     attrs: &[(&str, Attribute)],
 ) -> Result<Vec<Vec<u8>>> {
+    let optional = inputs.iter().map(Some).collect::<Vec<_>>();
+    run_result_core(op, opset, &optional, outputs, attrs)
+}
+
+/// Like [`run`], but individual input slots may be `None` to model an omitted
+/// optional ONNX input (an empty-string input name → an absent [`TensorView`]).
+fn run_opt(
+    op: &str,
+    opset: u64,
+    inputs: &[Option<Tensor>],
+    outputs: &[(DataType, Vec<usize>)],
+    attrs: &[(&str, Attribute)],
+) -> Vec<Vec<u8>> {
+    let optional = inputs.iter().map(|o| o.as_ref()).collect::<Vec<_>>();
+    run_result_core(op, opset, &optional, outputs, attrs).unwrap()
+}
+
+fn run_result_core(
+    op: &str,
+    opset: u64,
+    inputs: &[Option<&Tensor>],
+    outputs: &[(DataType, Vec<usize>)],
+    attrs: &[(&str, Attribute)],
+) -> Result<Vec<Vec<u8>>> {
     let ep = CudaExecutionProvider::new_default().expect("CUDA runtime must be available");
     let mut graph = Graph::new();
     graph.opset_imports.insert(String::new(), opset);
@@ -113,13 +137,15 @@ fn run_result(
         .iter()
         .enumerate()
         .map(|(i, input)| {
-            let value = graph.create_named_value(
-                &format!("input_{i}"),
-                input.dtype,
-                static_shape(input.shape.iter().copied()),
-            );
-            graph.add_input(value);
-            value
+            input.map(|input| {
+                let value = graph.create_named_value(
+                    &format!("input_{i}"),
+                    input.dtype,
+                    static_shape(input.shape.iter().copied()),
+                );
+                graph.add_input(value);
+                value
+            })
         })
         .collect::<Vec<_>>();
     let output_values = outputs
@@ -136,7 +162,7 @@ fn run_result(
     let mut node = Node::new(
         NodeId(0),
         op,
-        input_values.into_iter().map(Some).collect(),
+        input_values.into_iter().collect(),
         output_values.clone(),
     );
     for (name, value) in attrs {
@@ -151,30 +177,38 @@ fn run_result(
 
     let input_buffers = inputs
         .iter()
-        .map(|input| -> Result<DeviceBuffer> {
+        .map(|input| -> Result<Option<DeviceBuffer>> {
+            let Some(input) = input else {
+                return Ok(None);
+            };
             let buffer = ep.allocate(input.bytes.len(), 256)?;
             if !input.bytes.is_empty() {
                 unsafe { ep.runtime().htod(&input.bytes, cuptr(buffer.as_ptr()))? };
             }
-            Ok(buffer)
+            Ok(Some(buffer))
         })
         .collect::<Result<Vec<_>>>()?;
     let input_strides = inputs
         .iter()
-        .map(|input| compute_contiguous_strides(&input.shape))
+        .map(|input| {
+            input
+                .map(|input| compute_contiguous_strides(&input.shape))
+                .unwrap_or_default()
+        })
         .collect::<Vec<_>>();
     let input_views = inputs
         .iter()
         .zip(&input_buffers)
         .zip(&input_strides)
-        .map(|((input, buffer), strides)| {
-            TensorView::new(
+        .map(|((input, buffer), strides)| match (input, buffer) {
+            (Some(input), Some(buffer)) => TensorView::new(
                 DevicePtr(buffer.as_ptr()),
                 input.dtype,
                 &input.shape,
                 strides,
                 ep.device_id(),
-            )
+            ),
+            _ => TensorView::absent(DataType::Float32),
         })
         .collect::<Vec<_>>();
     let mut output_buffers = outputs
@@ -202,7 +236,7 @@ fn run_result(
         })
         .collect::<Vec<_>>();
     if let Err(error) = kernel.execute(&input_views, &mut output_views) {
-        for buffer in input_buffers {
+        for buffer in input_buffers.into_iter().flatten() {
             ep.deallocate(buffer)?;
         }
         for buffer in output_buffers {
@@ -222,7 +256,7 @@ fn run_result(
             Ok(bytes)
         })
         .collect::<Result<Vec<_>>>()?;
-    for buffer in input_buffers {
+    for buffer in input_buffers.into_iter().flatten() {
         ep.deallocate(buffer)?;
     }
     for buffer in output_buffers {
@@ -490,4 +524,677 @@ fn rotary_embedding_out_of_range_position_ids_return_error() {
         .is_err(),
         "position_ids beyond the cache rows must return an error"
     );
+}
+
+// ---------------------------------------------------------------------------
+// GPU-vs-reference parity coverage for the GPU-native standard Attention kernel.
+// ---------------------------------------------------------------------------
+
+/// A resolved reference mask mirroring the kernel's broadcast + short-last-dim
+/// semantics exactly.
+enum RefMask {
+    None,
+    Float(Vec<f32>, Vec<usize>),
+    Bool(Vec<u8>, Vec<usize>),
+}
+
+impl RefMask {
+    fn offset(shape: &[usize], b: usize, h: usize, i: usize, j: usize) -> usize {
+        let full = [b, h, i, j];
+        let rank = shape.len();
+        let mut off = 0usize;
+        for (k, &dim) in shape.iter().enumerate() {
+            let logical = full[4 - rank + k];
+            let idx = if dim == 1 { 0 } else { logical };
+            off = off * dim + idx;
+        }
+        off
+    }
+
+    fn bias(&self, b: usize, h: usize, i: usize, j: usize, total: usize) -> f32 {
+        match self {
+            RefMask::None => 0.0,
+            RefMask::Float(data, shape) => {
+                if !shape.is_empty() {
+                    let last = shape[shape.len() - 1];
+                    if j >= last && last < total {
+                        return f32::NEG_INFINITY;
+                    }
+                }
+                data[Self::offset(shape, b, h, i, j)]
+            }
+            RefMask::Bool(data, shape) => {
+                if !shape.is_empty() {
+                    let last = shape[shape.len() - 1];
+                    if j >= last && last < total {
+                        return f32::NEG_INFINITY;
+                    }
+                }
+                if data[Self::offset(shape, b, h, i, j)] != 0 {
+                    0.0
+                } else {
+                    f32::NEG_INFINITY
+                }
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+struct RefCase<'a> {
+    q: &'a [f32],
+    key: &'a [f32],
+    value: &'a [f32],
+    batch: usize,
+    q_heads: usize,
+    q_seq: usize,
+    kv_heads: usize,
+    total_seq: usize,
+    head_size: usize,
+    v_head_size: usize,
+    mask: RefMask,
+    is_causal: bool,
+    offset: i64,
+    scale: Option<f32>,
+    softcap: f32,
+}
+
+/// Full-precision reference SDPA over already-concatenated present K/V, matching
+/// the kernel's stage ordering. `qk_mode` selects the captured qk stage (0 raw,
+/// 1 after softcap, 2 after mask, 3 after softmax), returned alongside Y.
+fn sdpa_ref(case: &RefCase, qk_mode: i64) -> (Vec<f32>, Vec<f32>) {
+    let RefCase {
+        q,
+        key,
+        value,
+        batch,
+        q_heads,
+        q_seq,
+        kv_heads,
+        total_seq,
+        head_size,
+        v_head_size,
+        mask,
+        is_causal,
+        offset,
+        scale,
+        softcap,
+    } = case;
+    let (batch, q_heads, q_seq, kv_heads, total_seq, head_size, v_head_size) = (
+        *batch,
+        *q_heads,
+        *q_seq,
+        *kv_heads,
+        *total_seq,
+        *head_size,
+        *v_head_size,
+    );
+    let scale = scale.unwrap_or(1.0 / (head_size as f32).sqrt());
+    let ss = scale.sqrt();
+    let group = q_heads / kv_heads;
+    let mut y = vec![0.0f32; batch * q_heads * q_seq * v_head_size];
+    let mut qk = vec![0.0f32; batch * q_heads * q_seq * total_seq];
+    for b in 0..batch {
+        for qh in 0..q_heads {
+            let kvh = qh / group;
+            for i in 0..q_seq {
+                let mut scores = vec![0.0f32; total_seq];
+                for (j, sc) in scores.iter_mut().enumerate() {
+                    let mut acc = 0.0f32;
+                    for p in 0..head_size {
+                        let qv = q[((b * q_heads + qh) * q_seq + i) * head_size + p] * ss;
+                        let kv = key[((b * kv_heads + kvh) * total_seq + j) * head_size + p] * ss;
+                        acc += qv * kv;
+                    }
+                    *sc = acc;
+                }
+                let base = ((b * q_heads + qh) * q_seq + i) * total_seq;
+                if qk_mode == 0 {
+                    qk[base..base + total_seq].copy_from_slice(&scores);
+                }
+                if *softcap != 0.0 {
+                    for sc in scores.iter_mut() {
+                        *sc = *softcap * (*sc / *softcap).tanh();
+                    }
+                }
+                if qk_mode == 1 {
+                    qk[base..base + total_seq].copy_from_slice(&scores);
+                }
+                let causal_limit = i as i64 + *offset;
+                for (j, sc) in scores.iter_mut().enumerate() {
+                    if *is_causal && (j as i64) > causal_limit {
+                        *sc = f32::NEG_INFINITY;
+                        continue;
+                    }
+                    *sc += mask.bias(b, qh, i, j, total_seq);
+                }
+                if qk_mode == 2 {
+                    qk[base..base + total_seq].copy_from_slice(&scores);
+                }
+                let max = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                if max == f32::NEG_INFINITY {
+                    for sc in scores.iter_mut() {
+                        *sc = 0.0;
+                    }
+                } else {
+                    let mut sum = 0.0f32;
+                    for sc in scores.iter_mut() {
+                        let e = (*sc - max).exp();
+                        *sc = e;
+                        sum += e;
+                    }
+                    let inv = 1.0 / sum;
+                    for sc in scores.iter_mut() {
+                        *sc *= inv;
+                    }
+                }
+                if qk_mode == 3 {
+                    qk[base..base + total_seq].copy_from_slice(&scores);
+                }
+                let y_base = ((b * q_heads + qh) * q_seq + i) * v_head_size;
+                for c in 0..v_head_size {
+                    let mut acc = 0.0f32;
+                    for (j, &p) in scores.iter().enumerate() {
+                        acc += p * value[((b * kv_heads + kvh) * total_seq + j) * v_head_size + c];
+                    }
+                    y[y_base + c] = acc;
+                }
+            }
+        }
+    }
+    (y, qk)
+}
+
+fn seq_f32(n: usize) -> Vec<f32> {
+    (0..n).map(|v| ((v % 13) as f32) * 0.25 - 1.0).collect()
+}
+
+#[test]
+fn standard_attention_basic_mha_matches_reference() {
+    let (b, h, sq, d) = (1usize, 2usize, 3usize, 4usize);
+    let q = seq_f32(b * h * sq * d);
+    let k = seq_f32(b * h * sq * d);
+    let v = seq_f32(b * h * sq * d);
+    let (y_ref, _) = sdpa_ref(
+        &RefCase {
+            q: &q,
+            key: &k,
+            value: &v,
+            batch: b,
+            q_heads: h,
+            q_seq: sq,
+            kv_heads: h,
+            total_seq: sq,
+            head_size: d,
+            v_head_size: d,
+            mask: RefMask::None,
+            is_causal: false,
+            offset: 0,
+            scale: None,
+            softcap: 0.0,
+        },
+        -1,
+    );
+    let inputs = [
+        tensor(DataType::Float32, &[b, h, sq, d], &q),
+        tensor(DataType::Float32, &[b, h, sq, d], &k),
+        tensor(DataType::Float32, &[b, h, sq, d], &v),
+    ];
+    let out = run(
+        "Attention",
+        23,
+        &inputs,
+        &[(DataType::Float32, vec![b, h, sq, d])],
+        &[],
+    );
+    assert_close(&f32s(&out[0]), &y_ref);
+}
+
+#[test]
+fn standard_attention_gqa_multi_batch_multi_head_matches_reference() {
+    let (b, hq, hkv, sq, d) = (2usize, 4usize, 2usize, 3usize, 4usize);
+    let q = seq_f32(b * hq * sq * d);
+    let k = seq_f32(b * hkv * sq * d);
+    let v = seq_f32(b * hkv * sq * d);
+    let (y_ref, _) = sdpa_ref(
+        &RefCase {
+            q: &q,
+            key: &k,
+            value: &v,
+            batch: b,
+            q_heads: hq,
+            q_seq: sq,
+            kv_heads: hkv,
+            total_seq: sq,
+            head_size: d,
+            v_head_size: d,
+            mask: RefMask::None,
+            is_causal: true,
+            offset: 0,
+            scale: None,
+            softcap: 0.0,
+        },
+        -1,
+    );
+    let inputs = [
+        tensor(DataType::Float32, &[b, hq, sq, d], &q),
+        tensor(DataType::Float32, &[b, hkv, sq, d], &k),
+        tensor(DataType::Float32, &[b, hkv, sq, d], &v),
+    ];
+    let attrs = [("is_causal", Attribute::Int(1))];
+    let out = run(
+        "Attention",
+        23,
+        &inputs,
+        &[(DataType::Float32, vec![b, hq, sq, d])],
+        &attrs,
+    );
+    assert_close(&f32s(&out[0]), &y_ref);
+}
+
+#[test]
+fn standard_attention_3d_input_reshape_matches_reference() {
+    // 3D (batch, seq, heads*dim) input; reference consumes the equivalent 4D
+    // (batch, heads, seq, dim) transpose.
+    let (b, h, sq, d) = (1usize, 2usize, 2usize, 2usize);
+    let q3 = seq_f32(b * sq * h * d);
+    let k3 = seq_f32(b * sq * h * d);
+    let v3 = seq_f32(b * sq * h * d);
+    // Transpose (b, s, h, d) -> (b, h, s, d) for the reference.
+    let to_bhsd = |src: &[f32]| -> Vec<f32> {
+        let mut dst = vec![0.0f32; src.len()];
+        for bi in 0..b {
+            for s in 0..sq {
+                for hi in 0..h {
+                    for di in 0..d {
+                        let si = ((bi * sq + s) * h + hi) * d + di;
+                        let dj = ((bi * h + hi) * sq + s) * d + di;
+                        dst[dj] = src[si];
+                    }
+                }
+            }
+        }
+        dst
+    };
+    let q4 = to_bhsd(&q3);
+    let k4 = to_bhsd(&k3);
+    let v4 = to_bhsd(&v3);
+    let (y_ref_bhsd, _) = sdpa_ref(
+        &RefCase {
+            q: &q4,
+            key: &k4,
+            value: &v4,
+            batch: b,
+            q_heads: h,
+            q_seq: sq,
+            kv_heads: h,
+            total_seq: sq,
+            head_size: d,
+            v_head_size: d,
+            mask: RefMask::None,
+            is_causal: false,
+            offset: 0,
+            scale: None,
+            softcap: 0.0,
+        },
+        -1,
+    );
+    // 3D output is (batch, seq, heads*dim); transpose the reference back.
+    let mut y_ref3 = vec![0.0f32; y_ref_bhsd.len()];
+    for bi in 0..b {
+        for hi in 0..h {
+            for s in 0..sq {
+                for di in 0..d {
+                    let src = ((bi * h + hi) * sq + s) * d + di;
+                    let dst = (bi * sq + s) * (h * d) + hi * d + di;
+                    y_ref3[dst] = y_ref_bhsd[src];
+                }
+            }
+        }
+    }
+    let inputs = [
+        tensor(DataType::Float32, &[b, sq, h * d], &q3),
+        tensor(DataType::Float32, &[b, sq, h * d], &k3),
+        tensor(DataType::Float32, &[b, sq, h * d], &v3),
+    ];
+    let attrs = [
+        ("q_num_heads", Attribute::Int(h as i64)),
+        ("kv_num_heads", Attribute::Int(h as i64)),
+    ];
+    let out = run(
+        "Attention",
+        23,
+        &inputs,
+        &[(DataType::Float32, vec![b, sq, h * d])],
+        &attrs,
+    );
+    assert_close(&f32s(&out[0]), &y_ref3);
+}
+
+#[test]
+fn standard_attention_in_op_past_cache_matches_reference_and_present() {
+    // Causal decode step: past cache of length 2, current step of length 1.
+    let (b, h, d) = (1usize, 2usize, 2usize);
+    let (past_seq, cur_seq) = (2usize, 1usize);
+    let total = past_seq + cur_seq;
+    let q = seq_f32(b * h * cur_seq * d);
+    let past_k = seq_f32(b * h * past_seq * d);
+    let past_v = seq_f32(b * h * past_seq * d);
+    let cur_k = seq_f32(b * h * cur_seq * d);
+    let cur_v = seq_f32(b * h * cur_seq * d);
+    // Build present = concat(past, current) along seq for the reference.
+    let concat = |past: &[f32], cur: &[f32], dim: usize| -> Vec<f32> {
+        let mut out = vec![0.0f32; b * h * total * dim];
+        for bi in 0..b {
+            for hi in 0..h {
+                for di in 0..dim {
+                    for t in 0..past_seq {
+                        out[((bi * h + hi) * total + t) * dim + di] =
+                            past[((bi * h + hi) * past_seq + t) * dim + di];
+                    }
+                    for t in 0..cur_seq {
+                        out[((bi * h + hi) * total + past_seq + t) * dim + di] =
+                            cur[((bi * h + hi) * cur_seq + t) * dim + di];
+                    }
+                }
+            }
+        }
+        out
+    };
+    let present_k = concat(&past_k, &cur_k, d);
+    let present_v = concat(&past_v, &cur_v, d);
+    let (y_ref, _) = sdpa_ref(
+        &RefCase {
+            q: &q,
+            key: &present_k,
+            value: &present_v,
+            batch: b,
+            q_heads: h,
+            q_seq: cur_seq,
+            kv_heads: h,
+            total_seq: total,
+            head_size: d,
+            v_head_size: d,
+            mask: RefMask::None,
+            is_causal: true,
+            offset: past_seq as i64,
+            scale: None,
+            softcap: 0.0,
+        },
+        -1,
+    );
+    // Inputs: Q, K, V, (mask omitted), past_key, past_value.
+    let inputs = [
+        Some(tensor(DataType::Float32, &[b, h, cur_seq, d], &q)),
+        Some(tensor(DataType::Float32, &[b, h, cur_seq, d], &cur_k)),
+        Some(tensor(DataType::Float32, &[b, h, cur_seq, d], &cur_v)),
+        None,
+        Some(tensor(DataType::Float32, &[b, h, past_seq, d], &past_k)),
+        Some(tensor(DataType::Float32, &[b, h, past_seq, d], &past_v)),
+    ];
+    let attrs = [("is_causal", Attribute::Int(1))];
+    let out = run_opt(
+        "Attention",
+        23,
+        &inputs,
+        &[
+            (DataType::Float32, vec![b, h, cur_seq, d]),
+            (DataType::Float32, vec![b, h, total, d]),
+            (DataType::Float32, vec![b, h, total, d]),
+        ],
+        &attrs,
+    );
+    assert_close(&f32s(&out[0]), &y_ref);
+    assert_close(&f32s(&out[1]), &present_k);
+    assert_close(&f32s(&out[2]), &present_v);
+}
+
+#[test]
+fn standard_attention_float_mask_add_matches_reference() {
+    let (b, h, sq, d) = (1usize, 2usize, 2usize, 2usize);
+    let q = seq_f32(b * h * sq * d);
+    let k = seq_f32(b * h * sq * d);
+    let v = seq_f32(b * h * sq * d);
+    let mask_data = vec![0.0f32, -2.0, 1.5, 0.0];
+    let (y_ref, _) = sdpa_ref(
+        &RefCase {
+            q: &q,
+            key: &k,
+            value: &v,
+            batch: b,
+            q_heads: h,
+            q_seq: sq,
+            kv_heads: h,
+            total_seq: sq,
+            head_size: d,
+            v_head_size: d,
+            mask: RefMask::Float(mask_data.clone(), vec![1, 1, sq, sq]),
+            is_causal: false,
+            offset: 0,
+            scale: None,
+            softcap: 0.0,
+        },
+        -1,
+    );
+    let inputs = [
+        tensor(DataType::Float32, &[b, h, sq, d], &q),
+        tensor(DataType::Float32, &[b, h, sq, d], &k),
+        tensor(DataType::Float32, &[b, h, sq, d], &v),
+        tensor(DataType::Float32, &[1, 1, sq, sq], &mask_data),
+    ];
+    let out = run(
+        "Attention",
+        23,
+        &inputs,
+        &[(DataType::Float32, vec![b, h, sq, d])],
+        &[],
+    );
+    assert_close(&f32s(&out[0]), &y_ref);
+}
+
+#[test]
+fn standard_attention_bool_mask_matches_reference() {
+    let (b, h, sq, d) = (1usize, 2usize, 2usize, 2usize);
+    let q = seq_f32(b * h * sq * d);
+    let k = seq_f32(b * h * sq * d);
+    let v = seq_f32(b * h * sq * d);
+    let mask_bytes = vec![1u8, 0, 1, 1];
+    let (y_ref, _) = sdpa_ref(
+        &RefCase {
+            q: &q,
+            key: &k,
+            value: &v,
+            batch: b,
+            q_heads: h,
+            q_seq: sq,
+            kv_heads: h,
+            total_seq: sq,
+            head_size: d,
+            v_head_size: d,
+            mask: RefMask::Bool(mask_bytes.clone(), vec![1, 1, sq, sq]),
+            is_causal: false,
+            offset: 0,
+            scale: None,
+            softcap: 0.0,
+        },
+        -1,
+    );
+    let inputs = [
+        tensor(DataType::Float32, &[b, h, sq, d], &q),
+        tensor(DataType::Float32, &[b, h, sq, d], &k),
+        tensor(DataType::Float32, &[b, h, sq, d], &v),
+        tensor(DataType::Bool, &[1, 1, sq, sq], &mask_bytes),
+    ];
+    let out = run(
+        "Attention",
+        23,
+        &inputs,
+        &[(DataType::Float32, vec![b, h, sq, d])],
+        &[],
+    );
+    assert_close(&f32s(&out[0]), &y_ref);
+}
+
+#[test]
+fn standard_attention_softcap_matches_reference() {
+    let (b, h, sq, d) = (1usize, 2usize, 3usize, 4usize);
+    let q = seq_f32(b * h * sq * d);
+    let k = seq_f32(b * h * sq * d);
+    let v = seq_f32(b * h * sq * d);
+    let softcap = 2.5f32;
+    let (y_ref, _) = sdpa_ref(
+        &RefCase {
+            q: &q,
+            key: &k,
+            value: &v,
+            batch: b,
+            q_heads: h,
+            q_seq: sq,
+            kv_heads: h,
+            total_seq: sq,
+            head_size: d,
+            v_head_size: d,
+            mask: RefMask::None,
+            is_causal: true,
+            offset: 0,
+            scale: None,
+            softcap,
+        },
+        -1,
+    );
+    let inputs = [
+        tensor(DataType::Float32, &[b, h, sq, d], &q),
+        tensor(DataType::Float32, &[b, h, sq, d], &k),
+        tensor(DataType::Float32, &[b, h, sq, d], &v),
+    ];
+    let attrs = [
+        ("is_causal", Attribute::Int(1)),
+        ("softcap", Attribute::Float(softcap)),
+    ];
+    let out = run(
+        "Attention",
+        23,
+        &inputs,
+        &[(DataType::Float32, vec![b, h, sq, d])],
+        &attrs,
+    );
+    assert_close(&f32s(&out[0]), &y_ref);
+}
+
+#[test]
+fn standard_attention_fully_masked_row_is_zero() {
+    // A bool mask row that is entirely `false` must yield an all-zero output row
+    // (numerically-stable softmax guard), not NaN.
+    let (b, h, sq, d) = (1usize, 1usize, 2usize, 2usize);
+    let q = seq_f32(b * h * sq * d);
+    let k = seq_f32(b * h * sq * d);
+    let v = seq_f32(b * h * sq * d);
+    // Row 0 fully masked; row 1 keeps key 0.
+    let mask_bytes = vec![0u8, 0, 1, 0];
+    let inputs = [
+        tensor(DataType::Float32, &[b, h, sq, d], &q),
+        tensor(DataType::Float32, &[b, h, sq, d], &k),
+        tensor(DataType::Float32, &[b, h, sq, d], &v),
+        tensor(DataType::Bool, &[1, 1, sq, sq], &mask_bytes),
+    ];
+    let out = run(
+        "Attention",
+        23,
+        &inputs,
+        &[(DataType::Float32, vec![b, h, sq, d])],
+        &[],
+    );
+    let y = f32s(&out[0]);
+    assert_eq!(&y[0..d], &[0.0, 0.0], "fully-masked row 0 must be zero");
+    assert!(
+        y[d..].iter().any(|&x| x != 0.0),
+        "row 1 must be non-zero (attends key 0)"
+    );
+    let (y_ref, _) = sdpa_ref(
+        &RefCase {
+            q: &q,
+            key: &k,
+            value: &v,
+            batch: b,
+            q_heads: h,
+            q_seq: sq,
+            kv_heads: h,
+            total_seq: sq,
+            head_size: d,
+            v_head_size: d,
+            mask: RefMask::Bool(mask_bytes, vec![1, 1, sq, sq]),
+            is_causal: false,
+            offset: 0,
+            scale: None,
+            softcap: 0.0,
+        },
+        -1,
+    );
+    assert_close(&y, &y_ref);
+}
+
+#[test]
+fn standard_attention_qk_matmul_output_modes_match_reference() {
+    let (b, h, sq, d) = (1usize, 2usize, 2usize, 2usize);
+    let q = seq_f32(b * h * sq * d);
+    let k = seq_f32(b * h * sq * d);
+    let v = seq_f32(b * h * sq * d);
+    let mask_data = vec![0.0f32, -1.0, 0.5, 0.0];
+    let softcap = 3.0f32;
+    for mode in 0..=3i64 {
+        let (y_ref, qk_ref) = sdpa_ref(
+            &RefCase {
+                q: &q,
+                key: &k,
+                value: &v,
+                batch: b,
+                q_heads: h,
+                q_seq: sq,
+                kv_heads: h,
+                total_seq: sq,
+                head_size: d,
+                v_head_size: d,
+                mask: RefMask::Float(mask_data.clone(), vec![1, 1, sq, sq]),
+                is_causal: false,
+                offset: 0,
+                scale: None,
+                softcap,
+            },
+            mode,
+        );
+        let inputs = [
+            tensor(DataType::Float32, &[b, h, sq, d], &q),
+            tensor(DataType::Float32, &[b, h, sq, d], &k),
+            tensor(DataType::Float32, &[b, h, sq, d], &v),
+            tensor(DataType::Float32, &[1, 1, sq, sq], &mask_data),
+        ];
+        let attrs = [
+            ("softcap", Attribute::Float(softcap)),
+            ("qk_matmul_output_mode", Attribute::Int(mode)),
+        ];
+        let out = run(
+            "Attention",
+            23,
+            &inputs,
+            &[
+                (DataType::Float32, vec![b, h, sq, d]),
+                (DataType::Float32, vec![b, h, sq, d]),
+                (DataType::Float32, vec![b, h, sq, d]),
+                (DataType::Float32, vec![b, h, sq, sq]),
+            ],
+            &attrs,
+        );
+        assert_close(&f32s(&out[0]), &y_ref);
+        // qk_matmul_output may legitimately contain -inf (masked positions in
+        // mode 2). Compare finite entries and require matching infinities.
+        let got_qk = f32s(&out[3]);
+        assert_eq!(got_qk.len(), qk_ref.len());
+        for (idx, (&g, &e)) in got_qk.iter().zip(&qk_ref).enumerate() {
+            if e.is_finite() {
+                assert!((g - e).abs() <= 1e-4, "mode {mode} qk[{idx}]: {g} vs {e}");
+            } else {
+                assert_eq!(g, e, "mode {mode} qk[{idx}] infinity mismatch: {g} vs {e}");
+            }
+        }
+    }
 }

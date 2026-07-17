@@ -24,6 +24,35 @@
 //! Y      = probs · V
 //! ```
 //!
+//! ## GPU-native execution
+//!
+//! Unlike a host-staged reference that copies Q/K/V to the CPU, this kernel is
+//! GPU-native: Q, K, V, the attention mask, and every bulk output stay resident
+//! on the device. Two NVRTC kernels do all the heavy lifting:
+//!
+//! * `build_kv` gathers each K/V input — handling the 3D→4D head reshape and the
+//!   `past ⧺ current` cache concatenation — into a contiguous
+//!   `[batch, kv_heads, total_seq, dim]` present buffer (also the `present_key`/
+//!   `present_value` outputs when requested).
+//! * `attention_row` runs one CUDA block per `(batch, q_head, query)` row: it
+//!   computes the scaled QK scores, softcap, the composed causal/pad/attn masks,
+//!   a numerically-stable softmax, and the probs·V accumulation, writing `Y`
+//!   (and the optional `qk_matmul_output`) directly to device output buffers.
+//!
+//! Only tiny host-side control state leaves/enters the device: the per-batch
+//! causal `offset` and padding-frontier arrays are built on the host and
+//! uploaded as small device arrays, and `nonpad_kv_seqlen` (a per-batch scalar
+//! count) is read back to compute them. Q/K/V and the score/probability tensors
+//! never round-trip through host memory.
+//!
+//! ## Determinism
+//!
+//! Each score row is reduced in a fixed order: the per-row `QK` dot products and
+//! the `probs·V` accumulation each sum in ascending index order within a single
+//! thread (bit-identical to the CPU reference), and the softmax max/exp/sum are
+//! performed sequentially by the block's lead thread. No atomics contribute to a
+//! shared accumulator, so results are byte-identical run to run.
+//!
 //! ## Versioning (opset 23 vs 24–26)
 //!
 //! `Attention` was added at opset 23 and revised at opset 24 (no newer version
@@ -49,10 +78,235 @@ use std::borrow::Cow;
 use std::ffi::c_void;
 use std::sync::Arc;
 
+use cudarc::driver::sys::CUdeviceptr;
+use cudarc::driver::{LaunchConfig, PushKernelArg};
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ir::{DataType, Node};
 
+use crate::error::driver_err;
 use crate::runtime::{CudaRuntime, cuptr};
+
+const BLOCK: u32 = 256;
+/// Threads per block for `attention_row` (one block services one score row).
+const ROW_THREADS: u32 = 128;
+const ATTENTION_MODULE: &str = "standard_attention_f32_v1";
+const ATTENTION_SOURCE: &str = r#"
+#define NEG_INF __int_as_float(0xff800000)
+
+// Gather a K/V input into a contiguous [batch, heads, total_seq, dim] present
+// buffer, applying the 3D->4D head reshape and the past ++ current concat.
+extern "C" __global__ void build_kv(
+    const float* past, const float* cur, float* out,
+    int has_past, int cur_is_3d, int past_is_3d,
+    unsigned long long batch, unsigned long long heads,
+    unsigned long long past_seq, unsigned long long cur_seq,
+    unsigned long long total_seq, unsigned long long dim,
+    unsigned long long elements) {
+  for (unsigned long long idx = blockIdx.x * blockDim.x + threadIdx.x; idx < elements;
+       idx += (unsigned long long)gridDim.x * blockDim.x) {
+    unsigned long long d = idx % dim;
+    unsigned long long rem = idx / dim;
+    unsigned long long t = rem % total_seq;
+    rem /= total_seq;
+    unsigned long long h = rem % heads;
+    unsigned long long b = rem / heads;
+    float val;
+    if (has_past && t < past_seq) {
+      unsigned long long off = past_is_3d
+          ? (b * past_seq + t) * (heads * dim) + h * dim + d
+          : ((b * heads + h) * past_seq + t) * dim + d;
+      val = past[off];
+    } else {
+      unsigned long long c = has_past ? (t - past_seq) : t;
+      unsigned long long off = cur_is_3d
+          ? (b * cur_seq + c) * (heads * dim) + h * dim + d
+          : ((b * heads + h) * cur_seq + c) * dim + d;
+      val = cur[off];
+    }
+    out[idx] = val;
+  }
+}
+
+// Additive mask bias for logical index (b, h, i, j), broadcasting a rank<=4
+// mask right-aligned against [b, h, i, j]. Mirrors the CPU reference exactly:
+// a last dim shorter than total_seq pads with -inf; bool false -> -inf.
+__device__ __forceinline__ float mask_bias(
+    const void* mask, int mask_kind, int mask_rank,
+    unsigned long long md0, unsigned long long md1,
+    unsigned long long md2, unsigned long long md3,
+    unsigned long long b, unsigned long long h,
+    unsigned long long i, unsigned long long j,
+    unsigned long long total_seq) {
+  if (mask_kind == 0) {
+    return 0.0f;
+  }
+  unsigned long long full[4] = {b, h, i, j};
+  unsigned long long md[4] = {md0, md1, md2, md3};
+  unsigned long long off = 0;
+  for (int a = 0; a < 4; ++a) {
+    unsigned long long idx = (md[a] == 1ULL) ? 0ULL : full[a];
+    off = off * md[a] + idx;
+  }
+  if (mask_rank > 0) {
+    unsigned long long last = md3;
+    if (j >= last && last < total_seq) {
+      return NEG_INF;
+    }
+  }
+  if (mask_kind == 1) {
+    return ((const float*)mask)[off];
+  }
+  // Bool mask: nonzero keeps (bias 0), zero masks (-inf).
+  return ((const unsigned char*)mask)[off] != 0 ? 0.0f : NEG_INF;
+}
+
+// One block per (batch, q_head, query) row. Computes scaled QK scores, softcap,
+// the composed causal/pad/attn masks, a stable softmax, and probs*V.
+extern "C" __global__ void attention_row(
+    const float* q, const float* key, const float* value,
+    const void* mask, float* scores, float* y, float* qk_out,
+    const long long* offsets, const long long* pad_limits,
+    unsigned long long batch, unsigned long long q_heads, unsigned long long q_seq,
+    unsigned long long kv_heads, unsigned long long total_seq,
+    unsigned long long head_size, unsigned long long v_head_size,
+    unsigned long long group,
+    int q_is_3d, int out_is_3d, int is_causal,
+    float sqrt_scale, float softcap,
+    int mask_kind, int mask_rank,
+    unsigned long long md0, unsigned long long md1,
+    unsigned long long md2, unsigned long long md3,
+    int qk_mode, int want_qk) {
+  const unsigned long long row = blockIdx.x;
+  const unsigned long long total_rows = batch * q_heads * q_seq;
+  if (row >= total_rows) {
+    return;
+  }
+  const unsigned long long i = row % q_seq;
+  unsigned long long rem = row / q_seq;
+  const unsigned long long qh = rem % q_heads;
+  const unsigned long long b = rem / q_heads;
+  const unsigned long long kvh = qh / group;
+  const unsigned long long srow = row * total_seq;
+  const int tid = threadIdx.x;
+  const int nthreads = blockDim.x;
+
+  // Base offset of this query row's head vector.
+  const unsigned long long qoff = q_is_3d
+      ? (b * q_seq + i) * (q_heads * head_size) + qh * head_size
+      : ((b * q_heads + qh) * q_seq + i) * head_size;
+
+  // Stage 1: scaled Q·Kᵀ scores (sqrt(scale) folded into each operand).
+  for (unsigned long long j = tid; j < total_seq; j += nthreads) {
+    const unsigned long long koff = ((b * kv_heads + kvh) * total_seq + j) * head_size;
+    float acc = 0.0f;
+    for (unsigned long long p = 0; p < head_size; ++p) {
+      acc += (q[qoff + p] * sqrt_scale) * (key[koff + p] * sqrt_scale);
+    }
+    scores[srow + j] = acc;
+    if (want_qk && qk_mode == 0) {
+      qk_out[srow + j] = acc;
+    }
+  }
+  __syncthreads();
+
+  // Stage 2: softcap (before mask), applied when nonzero.
+  if (softcap != 0.0f) {
+    for (unsigned long long j = tid; j < total_seq; j += nthreads) {
+      const float s = scores[srow + j];
+      scores[srow + j] = softcap * tanhf(s / softcap);
+    }
+    __syncthreads();
+  }
+  if (want_qk && qk_mode == 1) {
+    for (unsigned long long j = tid; j < total_seq; j += nthreads) {
+      qk_out[srow + j] = scores[srow + j];
+    }
+    __syncthreads();
+  }
+
+  // Stage 3: attention mask + causal frontier + padding frontier.
+  const long long offset = offsets[b];
+  const long long pad_limit = pad_limits[b];
+  const long long causal_limit = (long long)i + offset;
+  for (unsigned long long j = tid; j < total_seq; j += nthreads) {
+    const long long jj = (long long)j;
+    if (pad_limit >= 0 && jj >= pad_limit) {
+      scores[srow + j] = NEG_INF;
+      continue;
+    }
+    if (is_causal && jj > causal_limit) {
+      scores[srow + j] = NEG_INF;
+      continue;
+    }
+    scores[srow + j] += mask_bias(mask, mask_kind, mask_rank, md0, md1, md2, md3,
+                                  b, qh, i, j, total_seq);
+  }
+  __syncthreads();
+  if (want_qk && qk_mode == 2) {
+    for (unsigned long long j = tid; j < total_seq; j += nthreads) {
+      qk_out[srow + j] = scores[srow + j];
+    }
+    __syncthreads();
+  }
+
+  // Stage 4: numerically-stable softmax. The lead thread performs the max,
+  // exp, and sum in a fixed ascending order to match the CPU reference and be
+  // reproducible; the final normalize is embarrassingly parallel.
+  __shared__ float inv_sum_sh;
+  __shared__ int all_masked_sh;
+  if (tid == 0) {
+    float m = NEG_INF;
+    for (unsigned long long j = 0; j < total_seq; ++j) {
+      m = fmaxf(m, scores[srow + j]);
+    }
+    if (m == NEG_INF) {
+      all_masked_sh = 1;
+      inv_sum_sh = 0.0f;
+    } else {
+      all_masked_sh = 0;
+      float sum = 0.0f;
+      for (unsigned long long j = 0; j < total_seq; ++j) {
+        const float e = expf(scores[srow + j] - m);
+        scores[srow + j] = e;
+        sum += e;
+      }
+      inv_sum_sh = 1.0f / sum;
+    }
+  }
+  __syncthreads();
+  if (all_masked_sh) {
+    for (unsigned long long j = tid; j < total_seq; j += nthreads) {
+      scores[srow + j] = 0.0f;
+    }
+  } else {
+    const float inv = inv_sum_sh;
+    for (unsigned long long j = tid; j < total_seq; j += nthreads) {
+      scores[srow + j] *= inv;
+    }
+  }
+  __syncthreads();
+  if (want_qk && qk_mode == 3) {
+    for (unsigned long long j = tid; j < total_seq; j += nthreads) {
+      qk_out[srow + j] = scores[srow + j];
+    }
+    __syncthreads();
+  }
+
+  // Stage 5: Y = probs · V. Each thread owns whole output channels and sums
+  // over keys in ascending order (bit-identical to the CPU reference).
+  const unsigned long long ybase = out_is_3d
+      ? (b * q_seq + i) * (q_heads * v_head_size) + qh * v_head_size
+      : ((b * q_heads + qh) * q_seq + i) * v_head_size;
+  for (unsigned long long c = tid; c < v_head_size; c += nthreads) {
+    float acc = 0.0f;
+    for (unsigned long long j = 0; j < total_seq; ++j) {
+      const unsigned long long voff = ((b * kv_heads + kvh) * total_seq + j) * v_head_size;
+      acc += scores[srow + j] * value[voff + c];
+    }
+    y[ybase + c] = acc;
+  }
+}
+"#;
 
 /// Return the claim-time dtype denial for data-bearing Attention inputs.
 pub(crate) fn unsupported_reason(input_dtypes: &[DataType]) -> Option<Cow<'static, str>> {
@@ -90,8 +344,8 @@ pub struct StandardAttentionKernel {
     since_version: u32,
 }
 
-/// Factory for [`AttentionKernel`], reading the standard-`Attention` attributes.
-/// `since_version` selects the opset semantics (23 vs 24–26).
+/// Factory for [`StandardAttentionKernel`], reading the standard-`Attention`
+/// attributes. `since_version` selects the opset semantics (23 vs 24–26).
 pub struct StandardAttentionFactory {
     pub runtime: Arc<CudaRuntime>,
     pub since_version: u32,
@@ -152,104 +406,45 @@ fn check_arity(
     Ok(())
 }
 
-fn dense_bytes(runtime: &CudaRuntime, view: &TensorView) -> Result<Vec<u8>> {
+/// Resolved `[batch, heads, seq, dim]` view of a Q/K/V input, keeping the input
+/// on the device (no host copy). A 3D `(batch, seq, heads·dim)` input records
+/// `is_3d` so the on-device gather can reshape it into heads.
+struct BhsdDims {
+    batch: usize,
+    heads: usize,
+    seq: usize,
+    dim: usize,
+    is_3d: bool,
+}
+
+/// Resolve a Q/K/V input's `[batch, heads, seq, dim]` dims without copying data.
+///
+/// A 4D input `(batch, heads, seq, dim)` is read as-is. A 3D input
+/// `(batch, seq, heads·dim)` reshapes to heads via `num_heads` (from the
+/// `q_num_heads`/`kv_num_heads` attributes), which is required and must divide
+/// the hidden size. Non-contiguous inputs are rejected (the kernel requests
+/// contiguous inputs).
+fn resolve_bhsd(view: &TensorView, name: &str, num_heads: Option<usize>) -> Result<BhsdDims> {
     if !view.is_contiguous() {
         return Err(EpError::KernelFailed(
             "Attention: non-contiguous inputs are not supported".into(),
         ));
     }
-    let mut bytes = vec![0u8; view.dtype.storage_bytes(view.numel())];
-    unsafe {
-        runtime.dtoh(&mut bytes, cuptr(view.data_ptr::<u8>() as *const c_void))?;
-    }
-    Ok(bytes)
-}
-
-fn dense_f32(runtime: &CudaRuntime, view: &TensorView) -> Result<Vec<f32>> {
     if view.dtype != DataType::Float32 {
         return Err(EpError::KernelFailed(format!(
             "Attention: expected f32 input, got {:?}",
             view.dtype
         )));
     }
-    Ok(dense_bytes(runtime, view)?
-        .chunks_exact(4)
-        .map(|b| f32::from_ne_bytes(b.try_into().unwrap()))
-        .collect())
-}
-
-fn dense_i64(runtime: &CudaRuntime, view: &TensorView) -> Result<Vec<i64>> {
-    if view.dtype != DataType::Int64 {
-        return Err(EpError::KernelFailed(
-            "Attention: nonpad_kv_seqlen must be int64".into(),
-        ));
-    }
-    Ok(dense_bytes(runtime, view)?
-        .chunks_exact(8)
-        .map(|b| i64::from_ne_bytes(b.try_into().unwrap()))
-        .collect())
-}
-
-fn write_f32(runtime: &CudaRuntime, output: &mut TensorMut, values: &[f32]) -> Result<()> {
-    if output.dtype != DataType::Float32
-        || !output.is_contiguous()
-        || output.numel() != values.len()
-    {
-        return Err(EpError::KernelFailed(
-            "Attention: output must be contiguous f32 with the expected shape".into(),
-        ));
-    }
-    let bytes = unsafe {
-        std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), std::mem::size_of_val(values))
-    };
-    unsafe {
-        runtime.htod(bytes, cuptr(output.data_ptr_mut::<u8>() as *const c_void))?;
-    }
-    Ok(())
-}
-
-/// `[batch, heads, seq, dim]` dense f32 buffer with its resolved dims.
-struct Bhsd {
-    data: Vec<f32>,
-    batch: usize,
-    heads: usize,
-    seq: usize,
-    dim: usize,
-}
-
-impl Bhsd {
-    #[inline]
-    fn at(&self, b: usize, h: usize, s: usize, d: usize) -> f32 {
-        self.data[((b * self.heads + h) * self.seq + s) * self.dim + d]
-    }
-}
-
-/// Materialize a Q/K/V input into a dense `[batch, heads, seq, dim]` f32 buffer.
-///
-/// A 4D input `(batch, heads, seq, dim)` is read as-is. A 3D input
-/// `(batch, seq, heads·dim)` is reshaped to `(batch, seq, heads, dim)` and
-/// transposed to `(batch, heads, seq, dim)`; `num_heads` (from the
-/// `q_num_heads`/`kv_num_heads` attributes) is required and must divide the
-/// hidden size.
-fn to_bhsd(
-    runtime: &CudaRuntime,
-    view: &TensorView,
-    name: &str,
-    num_heads: Option<usize>,
-) -> Result<Bhsd> {
     let shape = view.shape;
     match shape.len() {
-        4 => {
-            let (batch, heads, seq, dim) = (shape[0], shape[1], shape[2], shape[3]);
-            let data = dense_f32(runtime, view)?;
-            Ok(Bhsd {
-                data,
-                batch,
-                heads,
-                seq,
-                dim,
-            })
-        }
+        4 => Ok(BhsdDims {
+            batch: shape[0],
+            heads: shape[1],
+            seq: shape[2],
+            dim: shape[3],
+            is_3d: false,
+        }),
         3 => {
             let heads = num_heads.ok_or_else(|| {
                 EpError::KernelFailed(format!(
@@ -269,28 +464,12 @@ fn to_bhsd(
                      {heads}"
                 )));
             }
-            let dim = hidden / heads;
-            // Source is contiguous over (batch, seq, heads, dim); transpose the
-            // seq/heads axes to produce (batch, heads, seq, dim).
-            let src = dense_f32(runtime, view)?;
-            let mut data = vec![0.0f32; batch * heads * seq * dim];
-            for b in 0..batch {
-                for s in 0..seq {
-                    for h in 0..heads {
-                        for d in 0..dim {
-                            let src_i = ((b * seq + s) * heads + h) * dim + d;
-                            let dst_i = ((b * heads + h) * seq + s) * dim + d;
-                            data[dst_i] = src[src_i];
-                        }
-                    }
-                }
-            }
-            Ok(Bhsd {
-                data,
+            Ok(BhsdDims {
                 batch,
                 heads,
                 seq,
-                dim,
+                dim: hidden / heads,
+                is_3d: true,
             })
         }
         other => Err(EpError::KernelFailed(format!(
@@ -299,131 +478,110 @@ fn to_bhsd(
     }
 }
 
-/// Concatenate an optional past cache `[batch, heads, past_seq, dim]` in front
-/// of `cur` `[batch, heads, cur_seq, dim]` along the sequence axis, returning
-/// the present cache `[batch, heads, past_seq+cur_seq, dim]`.
-fn concat_cache(past: Option<&Bhsd>, cur: &Bhsd, name: &str) -> Result<Bhsd> {
-    let Some(past) = past else {
-        return Ok(Bhsd {
-            data: cur.data.clone(),
-            batch: cur.batch,
-            heads: cur.heads,
-            seq: cur.seq,
-            dim: cur.dim,
-        });
-    };
-    if past.batch != cur.batch || past.heads != cur.heads || past.dim != cur.dim {
-        return Err(EpError::KernelFailed(format!(
-            "Attention: past_{name} dims (b={},h={},d={}) incompatible with current \
-             (b={},h={},d={})",
-            past.batch, past.heads, past.dim, cur.batch, cur.heads, cur.dim
-        )));
+fn dense_i64(runtime: &CudaRuntime, view: &TensorView) -> Result<Vec<i64>> {
+    if view.dtype != DataType::Int64 {
+        return Err(EpError::KernelFailed(
+            "Attention: nonpad_kv_seqlen must be int64".into(),
+        ));
     }
-    let (batch, heads, dim) = (cur.batch, cur.heads, cur.dim);
-    let total = past.seq + cur.seq;
-    let mut data = vec![0.0f32; batch * heads * total * dim];
-    for b in 0..batch {
-        for h in 0..heads {
-            for d in 0..dim {
-                for j in 0..past.seq {
-                    let dst = ((b * heads + h) * total + j) * dim + d;
-                    data[dst] = past.at(b, h, j, d);
-                }
-                for j in 0..cur.seq {
-                    let dst = ((b * heads + h) * total + past.seq + j) * dim + d;
-                    data[dst] = cur.at(b, h, j, d);
-                }
-            }
-        }
+    if !view.is_contiguous() {
+        return Err(EpError::KernelFailed(
+            "Attention: non-contiguous inputs are not supported".into(),
+        ));
     }
-    Ok(Bhsd {
-        data,
-        batch,
-        heads,
-        seq: total,
-        dim,
-    })
+    let mut bytes = vec![0u8; view.dtype.storage_bytes(view.numel())];
+    unsafe {
+        runtime.dtoh(&mut bytes, cuptr(view.data_ptr::<u8>() as *const c_void))?;
+    }
+    Ok(bytes
+        .chunks_exact(8)
+        .map(|b| i64::from_ne_bytes(b.try_into().unwrap()))
+        .collect())
 }
 
-/// A resolved attention mask, materialized to a broadcastable
-/// `[batch, q_heads, q_seq, total_seq]` bias generator.
-enum Mask {
-    None,
-    /// Float mask (added to scores). Stored dense over its own shape with the
-    /// leading dims to broadcast.
-    Float {
-        data: Vec<f32>,
-        shape: Vec<usize>,
-    },
-    /// Boolean mask (`true` = keep). `false` positions contribute `-inf`.
-    Bool {
-        data: Vec<bool>,
-        shape: Vec<usize>,
-    },
+/// Validate an output slot (contiguous f32 with the expected element count) and
+/// return its device pointer.
+fn output_ptr(output: &mut TensorMut, expected: usize) -> Result<CUdeviceptr> {
+    if output.dtype != DataType::Float32 || !output.is_contiguous() || output.numel() != expected {
+        return Err(EpError::KernelFailed(
+            "Attention: output must be contiguous f32 with the expected shape".into(),
+        ));
+    }
+    Ok(cuptr(output.data_ptr_mut::<u8>() as *const c_void))
 }
 
-impl Mask {
-    /// The additive bias for logical index `(b, h, i, j)`; masked-out positions
-    /// (bool `false`, or `j` past a short mask's last dim) yield `-inf`. A
-    /// rank-0 (scalar) mask broadcasts to every score position.
-    fn bias(&self, b: usize, h: usize, i: usize, j: usize, total_seq: usize) -> f32 {
-        match self {
-            Mask::None => 0.0,
-            Mask::Float { data, shape } => Self::lookup_f32(data, shape, b, h, i, j, total_seq),
-            Mask::Bool { data, shape } => {
-                // A last dim shorter than total_seq is padded with -inf; a
-                // rank-0 scalar mask has no last dim and applies everywhere.
-                if !shape.is_empty() {
-                    let last = shape[shape.len() - 1];
-                    if j >= last && last < total_seq {
-                        return f32::NEG_INFINITY;
-                    }
-                }
-                if Self::lookup_bool(data, shape, b, h, i, j) {
-                    0.0
-                } else {
-                    f32::NEG_INFINITY
-                }
-            }
-        }
-    }
+/// Mask kind + right-aligned broadcast dims passed to the device kernel.
+struct MaskMeta {
+    ptr: CUdeviceptr,
+    kind: i32,
+    rank: i32,
+    dims: [u64; 4],
+}
 
-    fn lookup_f32(
-        data: &[f32],
-        shape: &[usize],
-        b: usize,
-        h: usize,
-        i: usize,
-        j: usize,
+impl StandardAttentionKernel {
+    /// Launch `build_kv` to gather a K/V input (plus an optional past cache)
+    /// into a contiguous `[batch, heads, total_seq, dim]` present buffer at
+    /// `out_ptr`.
+    #[allow(clippy::too_many_arguments)]
+    fn launch_build_kv(
+        &self,
+        past_ptr: CUdeviceptr,
+        cur_ptr: CUdeviceptr,
+        out_ptr: CUdeviceptr,
+        has_past: bool,
+        cur_is_3d: bool,
+        past_is_3d: bool,
+        batch: usize,
+        heads: usize,
+        past_seq: usize,
+        cur_seq: usize,
         total_seq: usize,
-    ) -> f32 {
-        if !shape.is_empty() {
-            let last = shape[shape.len() - 1];
-            if j >= last && last < total_seq {
-                return f32::NEG_INFINITY;
-            }
+        dim: usize,
+    ) -> Result<()> {
+        let elements = (batch * heads * total_seq * dim) as u64;
+        if elements == 0 {
+            return Ok(());
         }
-        data[Self::offset(shape, b, h, i, j)]
-    }
-
-    fn lookup_bool(data: &[bool], shape: &[usize], b: usize, h: usize, i: usize, j: usize) -> bool {
-        data[Self::offset(shape, b, h, i, j)]
-    }
-
-    /// Row-major offset into a mask broadcastable to `[b, h, i, j]`. The mask
-    /// may have rank 1..=4; missing leading dims broadcast, and any size-1 dim
-    /// broadcasts.
-    fn offset(shape: &[usize], b: usize, h: usize, i: usize, j: usize) -> usize {
-        let full = [b, h, i, j];
-        let rank = shape.len();
-        let mut off = 0usize;
-        for (k, &dim) in shape.iter().enumerate() {
-            // Align the mask's trailing axes with [b, h, i, j].
-            let logical = full[4 - rank + k];
-            let idx = if dim == 1 { 0 } else { logical };
-            off = off * dim + idx;
+        let func = self
+            .runtime
+            .nvrtc_function(ATTENTION_MODULE, ATTENTION_SOURCE, "build_kv")?;
+        let has_past_i = i32::from(has_past);
+        let cur_is_3d_i = i32::from(cur_is_3d);
+        let past_is_3d_i = i32::from(past_is_3d);
+        let batch = batch as u64;
+        let heads = heads as u64;
+        let past_seq = past_seq as u64;
+        let cur_seq = cur_seq as u64;
+        let total_seq = total_seq as u64;
+        let dim = dim as u64;
+        let mut builder = self.runtime.stream().launch_builder(&func);
+        builder
+            .arg(&past_ptr)
+            .arg(&cur_ptr)
+            .arg(&out_ptr)
+            .arg(&has_past_i)
+            .arg(&cur_is_3d_i)
+            .arg(&past_is_3d_i)
+            .arg(&batch)
+            .arg(&heads)
+            .arg(&past_seq)
+            .arg(&cur_seq)
+            .arg(&total_seq)
+            .arg(&dim)
+            .arg(&elements);
+        unsafe {
+            builder.launch(LaunchConfig {
+                grid_dim: (
+                    elements.div_ceil(BLOCK as u64).min(65_535).max(1) as u32,
+                    1,
+                    1,
+                ),
+                block_dim: (BLOCK, 1, 1),
+                shared_mem_bytes: 0,
+            })
         }
-        off
+        .map_err(|error| driver_err("launch build_kv", error))
+        .map(|_| ())
     }
 }
 
@@ -434,9 +592,9 @@ impl Kernel for StandardAttentionKernel {
         self.runtime.synchronize()?;
 
         let q_rank = inputs[0].shape.len();
-        let q = to_bhsd(&self.runtime, &inputs[0], "Q", self.q_num_heads)?;
-        let k_cur = to_bhsd(&self.runtime, &inputs[1], "K", self.kv_num_heads)?;
-        let v_cur = to_bhsd(&self.runtime, &inputs[2], "V", self.kv_num_heads)?;
+        let q = resolve_bhsd(&inputs[0], "Q", self.q_num_heads)?;
+        let k_cur = resolve_bhsd(&inputs[1], "K", self.kv_num_heads)?;
+        let v_cur = resolve_bhsd(&inputs[2], "V", self.kv_num_heads)?;
 
         // Optional past KV cache (inputs 4 and 5). They must be used together.
         // Presence is decided by input-slot binding (a null "absent" view for an
@@ -451,26 +609,36 @@ impl Kernel for StandardAttentionKernel {
             ));
         }
         let past_key = if has_past_key {
-            Some(to_bhsd(
-                &self.runtime,
-                &inputs[4],
-                "past_key",
-                self.kv_num_heads,
-            )?)
+            Some(resolve_bhsd(&inputs[4], "past_key", self.kv_num_heads)?)
         } else {
             None
         };
         let past_value = if has_past_value {
-            Some(to_bhsd(
-                &self.runtime,
-                &inputs[5],
-                "past_value",
-                self.kv_num_heads,
-            )?)
+            Some(resolve_bhsd(&inputs[5], "past_value", self.kv_num_heads)?)
         } else {
             None
         };
         let past_seq = past_key.as_ref().map(|p| p.seq).unwrap_or(0);
+
+        // Preserve the concat compatibility checks (past vs current dims).
+        if let Some(past) = &past_key {
+            if past.batch != k_cur.batch || past.heads != k_cur.heads || past.dim != k_cur.dim {
+                return Err(EpError::KernelFailed(format!(
+                    "Attention: past_key dims (b={},h={},d={}) incompatible with current \
+                     (b={},h={},d={})",
+                    past.batch, past.heads, past.dim, k_cur.batch, k_cur.heads, k_cur.dim
+                )));
+            }
+        }
+        if let Some(past) = &past_value {
+            if past.batch != v_cur.batch || past.heads != v_cur.heads || past.dim != v_cur.dim {
+                return Err(EpError::KernelFailed(format!(
+                    "Attention: past_value dims (b={},h={},d={}) incompatible with current \
+                     (b={},h={},d={})",
+                    past.batch, past.heads, past.dim, v_cur.batch, v_cur.heads, v_cur.dim
+                )));
+            }
+        }
 
         // `nonpad_kv_seqlen` (7th input, opset 24+): per-batch count of valid
         // (non-padding) KV tokens, used when the KV cache lives outside the op.
@@ -505,31 +673,27 @@ impl Kernel for StandardAttentionKernel {
             None
         };
 
-        // present_key/value = concat(past, current) along the sequence axis.
-        let key = concat_cache(past_key.as_ref(), &k_cur, "key")?;
-        let value = concat_cache(past_value.as_ref(), &v_cur, "value")?;
-
         let batch = q.batch;
         let q_heads = q.heads;
         let q_seq = q.seq;
         let head_size = q.dim;
-        let kv_heads = key.heads;
-        let total_seq = key.seq;
-        let v_head_size = value.dim;
+        let kv_heads = k_cur.heads;
+        let total_seq = past_seq + k_cur.seq;
+        let v_total_seq = past_value.as_ref().map(|p| p.seq).unwrap_or(0) + v_cur.seq;
+        let v_head_size = v_cur.dim;
 
-        if key.dim != head_size {
+        if k_cur.dim != head_size {
             return Err(EpError::KernelFailed(format!(
                 "Attention: Q head_size {head_size} != K head_size {}",
-                key.dim
+                k_cur.dim
             )));
         }
-        if value.seq != total_seq {
+        if v_total_seq != total_seq {
             return Err(EpError::KernelFailed(format!(
-                "Attention: present_key seq {total_seq} != present_value seq {}",
-                value.seq
+                "Attention: present_key seq {total_seq} != present_value seq {v_total_seq}"
             )));
         }
-        if key.batch != batch || value.batch != batch {
+        if k_cur.batch != batch || v_cur.batch != batch {
             return Err(EpError::KernelFailed(
                 "Attention: Q, K, V must share the batch dimension".into(),
             ));
@@ -551,190 +715,274 @@ impl Kernel for StandardAttentionKernel {
         // an intermediate `Q·Kᵀ` for extreme magnitudes.
         let sqrt_scale = scale.sqrt();
 
-        // Resolve the attention mask (input 3), if present. Presence is decided
-        // by input-slot binding, so a rank-0 (scalar) mask is honored rather
-        // than mistaken for an omitted input.
+        // Resolve the attention mask (input 3), if present. Its bytes stay on
+        // the device; only the broadcast metadata is read on the host. Presence
+        // is decided by input-slot binding, so a rank-0 (scalar) mask is honored
+        // rather than mistaken for an omitted input.
         let mask = if inputs.len() > 3 && !inputs[3].is_absent() {
             let m = &inputs[3];
-            match m.dtype {
-                DataType::Bool => Mask::Bool {
-                    data: dense_bytes(&self.runtime, m)?
-                        .iter()
-                        .map(|&b| b != 0)
-                        .collect(),
-                    shape: m.shape.to_vec(),
-                },
-                DataType::Float32 => Mask::Float {
-                    data: dense_f32(&self.runtime, m)?,
-                    shape: m.shape.to_vec(),
-                },
+            if !m.is_contiguous() {
+                return Err(EpError::KernelFailed(
+                    "Attention: non-contiguous inputs are not supported".into(),
+                ));
+            }
+            let rank = m.shape.len();
+            if rank > 4 {
+                return Err(EpError::KernelFailed(format!(
+                    "Attention: attn_mask rank {rank} is not supported (max 4)"
+                )));
+            }
+            // Right-align the mask dims against [b, h, i, j]; missing leading
+            // axes broadcast (size 1).
+            let mut dims = [1u64; 4];
+            for (k, &d) in m.shape.iter().enumerate() {
+                dims[4 - rank + k] = d as u64;
+            }
+            let kind = match m.dtype {
+                DataType::Bool => 2,
+                DataType::Float32 => 1,
                 other => {
                     return Err(EpError::KernelFailed(format!(
                         "Attention: attn_mask dtype {other:?} not supported (expected bool or f32)"
                     )));
                 }
+            };
+            MaskMeta {
+                ptr: cuptr(m.data_ptr::<u8>() as *const c_void),
+                kind,
+                rank: rank as i32,
+                dims,
             }
         } else {
-            Mask::None
+            MaskMeta {
+                ptr: 0,
+                kind: 0,
+                rank: 0,
+                dims: [1u64; 4],
+            }
         };
 
-        let mut y = vec![0.0f32; batch * q_heads * q_seq * v_head_size];
-        // qk_matmul_output buffer, produced only when a 4th output is present.
-        let want_qk = outputs.len() >= 4;
-        let mut qk_out = if want_qk {
-            vec![0.0f32; batch * q_heads * q_seq * total_seq]
+        // Validate output slots up front (before any device work) so shape
+        // errors surface cleanly.
+        let y_expected = if q_rank == 3 {
+            batch * q_seq * q_heads * v_head_size
         } else {
-            Vec::new()
+            batch * q_heads * q_seq * v_head_size
+        };
+        let y_ptr = output_ptr(&mut outputs[0], y_expected)?;
+        let want_present_key = outputs.len() >= 2;
+        let want_present_value = outputs.len() >= 3;
+        let want_qk = outputs.len() >= 4;
+        let present_key_expected = batch * kv_heads * total_seq * head_size;
+        let present_value_expected = batch * kv_heads * total_seq * v_head_size;
+        let qk_expected = batch * q_heads * q_seq * total_seq;
+
+        // Validate present/qk outputs and capture their device pointers. Split
+        // the mutable borrows so each slot is checked independently.
+        let (rest0, rest1) = outputs.split_at_mut(1);
+        let _ = rest0;
+        let (present_key_out, rest_after1) = if want_present_key {
+            let (a, b) = rest1.split_at_mut(1);
+            (Some(output_ptr(&mut a[0], present_key_expected)?), b)
+        } else {
+            (None, rest1)
+        };
+        let (present_value_out, rest_after2) = if want_present_value {
+            let (a, b) = rest_after1.split_at_mut(1);
+            (Some(output_ptr(&mut a[0], present_value_expected)?), b)
+        } else {
+            (None, rest_after1)
+        };
+        let qk_ptr = if want_qk {
+            output_ptr(&mut rest_after2[0], qk_expected)?
+        } else {
+            0
         };
 
-        // `qk_matmul_output_mode` has the same meaning across opsets 23–26 (the
-        // schema descriptions are identical): 1 = after softcap (before mask),
-        // 2 = after mask+softcap.
-        let (softcap_mode, mask_mode) = (1, 2);
+        // Q/K/V device pointers (bulk data stays on the device).
+        let q_ptr = cuptr(inputs[0].data_ptr::<u8>() as *const c_void);
+        let k_cur_ptr = cuptr(inputs[1].data_ptr::<u8>() as *const c_void);
+        let v_cur_ptr = cuptr(inputs[2].data_ptr::<u8>() as *const c_void);
+        let past_key_ptr = past_key
+            .as_ref()
+            .map(|_| cuptr(inputs[4].data_ptr::<u8>() as *const c_void))
+            .unwrap_or(0);
+        let past_value_ptr = past_value
+            .as_ref()
+            .map(|_| cuptr(inputs[5].data_ptr::<u8>() as *const c_void))
+            .unwrap_or(0);
 
-        let mut scores = vec![0.0f32; total_seq];
+        // Per-batch causal offset and padding frontier (built on the host, then
+        // uploaded as small device arrays). Query in-block index `i` attends
+        // key `j` iff `j <= i + offset`. With an external cache the offset is
+        // `nonpad_kv_seqlen[b] - q_seq`; with an in-op past cache it is
+        // `past_seq`; otherwise 0. A negative offset fully masks leading query
+        // rows (→ zero output rows). The padding frontier masks keys at
+        // `j >= nonpad_kv_seqlen[b]` regardless of causal mode; `-1` disables it.
+        let mut offsets = vec![0i64; batch.max(1)];
+        let mut pad_limits = vec![-1i64; batch.max(1)];
         for b in 0..batch {
-            // Per-batch causal offset: query in-block index `i` attends key `j`
-            // iff `j <= i + offset`. With an external cache the offset is
-            // `nonpad_kv_seqlen[b] - q_seq`; with an in-op past cache it is
-            // `past_seq`; otherwise 0. A negative offset fully masks leading
-            // query rows (→ zero output rows).
-            let offset: i64 = match &nonpad_kv_seqlen {
+            offsets[b] = match &nonpad_kv_seqlen {
                 Some(seqlen) => seqlen[b] - q_seq as i64,
                 None => past_seq as i64,
             };
-            // Per-batch padding frontier: with `nonpad_kv_seqlen`, keys at
-            // `j >= nonpad_kv_seqlen[b]` are padding in the external KV cache
-            // and must be masked to -inf REGARDLESS of causal mode. This
-            // composes with (intersects) the causal frontier and `attn_mask`.
-            let pad_limit: Option<i64> = nonpad_kv_seqlen.as_ref().map(|seqlen| seqlen[b]);
-            for qh in 0..q_heads {
-                let kvh = qh / group;
-                for i in 0..q_seq {
-                    // Stage 1: scaled Q·Kᵀ scores for this query row, with
-                    // sqrt(scale) folded into each operand (overflow-safe).
-                    for (j, sc) in scores.iter_mut().enumerate() {
-                        let mut acc = 0.0f32;
-                        for p in 0..head_size {
-                            acc += (q.at(b, qh, i, p) * sqrt_scale)
-                                * (key.at(b, kvh, j, p) * sqrt_scale);
-                        }
-                        *sc = acc;
-                    }
-                    // qk mode 0: raw (scaled) QK matmul output.
-                    if want_qk && self.qk_matmul_output_mode == 0 {
-                        let base = ((b * q_heads + qh) * q_seq + i) * total_seq;
-                        qk_out[base..base + total_seq].copy_from_slice(&scores);
-                    }
+            pad_limits[b] = match &nonpad_kv_seqlen {
+                Some(seqlen) => seqlen[b],
+                None => -1,
+            };
+        }
 
-                    // Stage 2: softcap (before mask), applied when nonzero.
-                    if self.softcap != 0.0 {
-                        for sc in scores.iter_mut() {
-                            *sc = self.softcap * (*sc / self.softcap).tanh();
-                        }
-                    }
-                    // qk mode 1: after softcap, before mask.
-                    if want_qk && self.qk_matmul_output_mode == softcap_mode {
-                        let base = ((b * q_heads + qh) * q_seq + i) * total_seq;
-                        qk_out[base..base + total_seq].copy_from_slice(&scores);
-                    }
+        // Allocate device scratch; track owned allocations for cleanup.
+        let mut owned: Vec<CUdeviceptr> = Vec::new();
+        let result = (|| -> Result<()> {
+            let alloc = |runtime: &CudaRuntime,
+                         owned: &mut Vec<CUdeviceptr>,
+                         bytes: usize|
+             -> Result<CUdeviceptr> {
+                let ptr = runtime.alloc_raw(bytes.max(1))?;
+                owned.push(ptr);
+                Ok(ptr)
+            };
 
-                    // Stage 3: attention mask + causal frontier (additive bias).
-                    let causal_limit = i as i64 + offset;
-                    for (j, sc) in scores.iter_mut().enumerate() {
-                        // Padding mask: applies regardless of `is_causal`.
-                        let is_pad = pad_limit.is_some_and(|limit| (j as i64) >= limit);
-                        if is_pad {
-                            *sc = f32::NEG_INFINITY;
-                            continue;
-                        }
-                        if self.is_causal && (j as i64) > causal_limit {
-                            *sc = f32::NEG_INFINITY;
-                            continue;
-                        }
-                        let bias = mask.bias(b, qh, i, j, total_seq);
-                        *sc += bias;
-                    }
-                    // qk mode 2: after mask+softcap, before softmax.
-                    if want_qk && self.qk_matmul_output_mode == mask_mode {
-                        let base = ((b * q_heads + qh) * q_seq + i) * total_seq;
-                        qk_out[base..base + total_seq].copy_from_slice(&scores);
-                    }
+            // Present K/V: write directly into output slots when present, else
+            // into scratch (still needed as the attention kernel's K/V source).
+            let present_key_ptr = match present_key_out {
+                Some(ptr) => ptr,
+                None => alloc(&self.runtime, &mut owned, present_key_expected * 4)?,
+            };
+            let present_value_ptr = match present_value_out {
+                Some(ptr) => ptr,
+                None => alloc(&self.runtime, &mut owned, present_value_expected * 4)?,
+            };
+            let scores_ptr = alloc(&self.runtime, &mut owned, qk_expected * 4)?;
 
-                    // Stage 4: numerically-stable softmax with a fully-masked
-                    // row guard (all -inf → zero row, not NaN).
-                    let max = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                    if max == f32::NEG_INFINITY {
-                        for sc in scores.iter_mut() {
-                            *sc = 0.0;
-                        }
-                    } else {
-                        let mut sum = 0.0f32;
-                        for sc in scores.iter_mut() {
-                            let e = (*sc - max).exp();
-                            *sc = e;
-                            sum += e;
-                        }
-                        let inv = 1.0 / sum;
-                        for sc in scores.iter_mut() {
-                            *sc *= inv;
-                        }
-                    }
-                    // qk mode 3: post-softmax probabilities.
-                    if want_qk && self.qk_matmul_output_mode == 3 {
-                        let base = ((b * q_heads + qh) * q_seq + i) * total_seq;
-                        qk_out[base..base + total_seq].copy_from_slice(&scores);
-                    }
+            // Upload the per-batch control arrays.
+            let offsets_ptr = alloc(&self.runtime, &mut owned, offsets.len() * 8)?;
+            let pad_limits_ptr = alloc(&self.runtime, &mut owned, pad_limits.len() * 8)?;
+            let offsets_bytes = unsafe {
+                std::slice::from_raw_parts(offsets.as_ptr().cast::<u8>(), offsets.len() * 8)
+            };
+            let pad_bytes = unsafe {
+                std::slice::from_raw_parts(pad_limits.as_ptr().cast::<u8>(), pad_limits.len() * 8)
+            };
+            unsafe { self.runtime.htod(offsets_bytes, offsets_ptr)? };
+            unsafe { self.runtime.htod(pad_bytes, pad_limits_ptr)? };
 
-                    // Stage 5: Y = probs · V.
-                    let y_base = ((b * q_heads + qh) * q_seq + i) * v_head_size;
-                    for c in 0..v_head_size {
-                        let mut acc = 0.0f32;
-                        for (j, &p) in scores.iter().enumerate() {
-                            acc += p * value.at(b, kvh, j, c);
-                        }
-                        y[y_base + c] = acc;
-                    }
+            // Build present_key / present_value on the device.
+            self.launch_build_kv(
+                past_key_ptr,
+                k_cur_ptr,
+                present_key_ptr,
+                has_past_key,
+                k_cur.is_3d,
+                past_key.as_ref().map(|p| p.is_3d).unwrap_or(false),
+                batch,
+                kv_heads,
+                past_seq,
+                k_cur.seq,
+                total_seq,
+                head_size,
+            )?;
+            self.launch_build_kv(
+                past_value_ptr,
+                v_cur_ptr,
+                present_value_ptr,
+                has_past_value,
+                v_cur.is_3d,
+                past_value.as_ref().map(|p| p.is_3d).unwrap_or(false),
+                batch,
+                kv_heads,
+                past_seq,
+                v_cur.seq,
+                total_seq,
+                v_head_size,
+            )?;
+
+            // Launch the main attention kernel: one block per query row.
+            let func =
+                self.runtime
+                    .nvrtc_function(ATTENTION_MODULE, ATTENTION_SOURCE, "attention_row")?;
+            let total_rows = (batch * q_heads * q_seq) as u64;
+            if total_rows > 0 {
+                let batch_u = batch as u64;
+                let q_heads_u = q_heads as u64;
+                let q_seq_u = q_seq as u64;
+                let kv_heads_u = kv_heads as u64;
+                let total_seq_u = total_seq as u64;
+                let head_size_u = head_size as u64;
+                let v_head_size_u = v_head_size as u64;
+                let group_u = group as u64;
+                let q_is_3d = i32::from(q.is_3d);
+                let out_is_3d = i32::from(q_rank == 3);
+                let is_causal = i32::from(self.is_causal);
+                let mask_kind = mask.kind;
+                let mask_rank = mask.rank;
+                let (md0, md1, md2, md3) = (mask.dims[0], mask.dims[1], mask.dims[2], mask.dims[3]);
+                let qk_mode = self.qk_matmul_output_mode as i32;
+                let want_qk_i = i32::from(want_qk);
+                let softcap = self.softcap;
+                let mut builder = self.runtime.stream().launch_builder(&func);
+                builder
+                    .arg(&q_ptr)
+                    .arg(&present_key_ptr)
+                    .arg(&present_value_ptr)
+                    .arg(&mask.ptr)
+                    .arg(&scores_ptr)
+                    .arg(&y_ptr)
+                    .arg(&qk_ptr)
+                    .arg(&offsets_ptr)
+                    .arg(&pad_limits_ptr)
+                    .arg(&batch_u)
+                    .arg(&q_heads_u)
+                    .arg(&q_seq_u)
+                    .arg(&kv_heads_u)
+                    .arg(&total_seq_u)
+                    .arg(&head_size_u)
+                    .arg(&v_head_size_u)
+                    .arg(&group_u)
+                    .arg(&q_is_3d)
+                    .arg(&out_is_3d)
+                    .arg(&is_causal)
+                    .arg(&sqrt_scale)
+                    .arg(&softcap)
+                    .arg(&mask_kind)
+                    .arg(&mask_rank)
+                    .arg(&md0)
+                    .arg(&md1)
+                    .arg(&md2)
+                    .arg(&md3)
+                    .arg(&qk_mode)
+                    .arg(&want_qk_i);
+                unsafe {
+                    builder.launch(LaunchConfig {
+                        grid_dim: (total_rows.min(u32::MAX as u64).max(1) as u32, 1, 1),
+                        block_dim: (ROW_THREADS, 1, 1),
+                        shared_mem_bytes: 0,
+                    })
                 }
+                .map_err(|error| driver_err("launch attention_row", error))?;
+            }
+            self.runtime.synchronize()
+        })();
+
+        let mut free_result = Ok(());
+        for ptr in owned {
+            let freed = unsafe { self.runtime.free_raw(ptr) };
+            if free_result.is_ok() {
+                free_result = freed;
             }
         }
-
-        // Write Y, reshaping back to the rank of Q.
-        if q_rank == 3 {
-            // (batch, q_heads, q_seq, v_head_size) → (batch, q_seq, q_heads·v)
-            let hidden = q_heads * v_head_size;
-            let mut y3 = vec![0.0f32; batch * q_seq * hidden];
-            for b in 0..batch {
-                for h in 0..q_heads {
-                    for s in 0..q_seq {
-                        for c in 0..v_head_size {
-                            let src = ((b * q_heads + h) * q_seq + s) * v_head_size + c;
-                            let dst = (b * q_seq + s) * hidden + h * v_head_size + c;
-                            y3[dst] = y[src];
-                        }
-                    }
-                }
-            }
-            write_f32(&self.runtime, &mut outputs[0], &y3)?;
-        } else {
-            write_f32(&self.runtime, &mut outputs[0], &y)?;
-        }
-
-        // present_key / present_value (outputs 1 and 2), always 4D.
-        if outputs.len() >= 2 {
-            write_f32(&self.runtime, &mut outputs[1], &key.data)?;
-        }
-        if outputs.len() >= 3 {
-            write_f32(&self.runtime, &mut outputs[2], &value.data)?;
-        }
-        if want_qk {
-            write_f32(&self.runtime, &mut outputs[3], &qk_out)?;
-        }
-        self.runtime.synchronize()?;
-        Ok(())
+        result.and(free_result)
     }
 
     fn supports_strided_input(&self, _input_idx: usize) -> bool {
+        false
+    }
+
+    fn cuda_graph_compatible(&self) -> bool {
+        // Setup uploads small per-batch control arrays (and reads back
+        // `nonpad_kv_seqlen`) via synchronous copies, so this kernel is not
+        // capturable as-is. The bulk Q/K/V/score tensors stay on the device.
         false
     }
 }
