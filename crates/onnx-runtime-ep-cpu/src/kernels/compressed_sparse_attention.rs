@@ -651,9 +651,7 @@ impl StatefulCompressedSparseAttentionKernel {
                     emitted_counts[b] = emitted_index
                         .checked_add(1)
                         .ok_or_else(|| error("emitted record count overflow"))?;
-                    if start == 0 {
-                        reset_ratio128_row(&mut carry, b, self.compression_ratio, dim)?;
-                    }
+                    reset_ratio128_row(&mut carry, b, self.compression_ratio, dim)?;
                 }
             }
         }
@@ -2281,22 +2279,64 @@ mod tests {
     }
 
     #[test]
-    fn fp4_compressed_cache_matches_same_logical_f32_cache() {
+    fn fp4_compressed_cache_quantizes_nontrivial_values_with_e2m1_bound() {
         let dim = FP4_E2M1_BLOCK_SIZE;
-        let query = Owned::f32(&[1, 1, 1, dim], &vec![0.125; dim]);
+        let query = Owned::f32(
+            &[1, 1, 1, dim],
+            &(0..dim)
+                .map(|d| 0.05 + (d % 11) as f32 * 0.0125)
+                .collect::<Vec<_>>(),
+        );
         let indices = Owned::i32(&[1, 1, 1, 2], &[0, 1]);
         let sink = Owned::f32(&[1], &[-0.5]);
-        let record_bytes = [[0x21, 0x43, 0x65, 0xa9], [0x10, 0x32, 0x54, 0xba]];
         let mut packed = Vec::new();
         let mut dense = Vec::new();
-        for bytes in record_bytes {
-            packed.push(127);
-            for byte in bytes.into_iter().cycle().take(FP4_E2M1_PACKED_BYTES) {
+        let mut observed_quantization_error = false;
+        for record in 0..2 {
+            let source = (0..dim)
+                .map(|d| {
+                    let magnitude = 0.3 + ((d * 7 + record * 5) % 24) as f32 * 0.23;
+                    if (d + record).is_multiple_of(3) {
+                        -magnitude
+                    } else {
+                        magnitude
+                    }
+                })
+                .collect::<Vec<_>>();
+            let amax = source
+                .iter()
+                .map(|value| value.abs())
+                .fold(6.0 * 2.0f32.powi(-126), f32::max);
+            let scale_power = (amax / 6.0).log2().ceil() as i32;
+            let scale = 2.0f32.powi(scale_power);
+            packed.push((scale_power + 127) as u8);
+            for pair in source.chunks_exact(2) {
+                let mut byte = 0u8;
+                for (nibble, &value) in pair.iter().enumerate() {
+                    let normalized = (value / scale).clamp(-6.0, 6.0);
+                    let (code, quantized) = (0u8..16)
+                        .map(|code| (code, super::super::block_dequant::decode_e2m1(code)))
+                        .min_by(|(_, left), (_, right)| {
+                            (normalized - *left)
+                                .abs()
+                                .total_cmp(&(normalized - *right).abs())
+                        })
+                        .unwrap();
+                    byte |= code << (nibble * 4);
+                    let dequantized = quantized * scale;
+                    let error = (dequantized - value).abs();
+                    observed_quantization_error |= error > 0.0;
+                    assert!(
+                        error <= scale,
+                        "FP4 error {error} exceeds half of the maximum E2M1 gap {}",
+                        scale
+                    );
+                    dense.push(dequantized);
+                }
                 packed.push(byte);
-                dense.push(super::super::block_dequant::decode_e2m1(byte));
-                dense.push(super::super::block_dequant::decode_e2m1(byte >> 4));
             }
         }
+        assert!(observed_quantization_error);
         let dense_cache = Owned::f32(&[1, 1, 2, dim], &dense);
         let packed_cache = Owned::u8(&[1, 1, 2, FP4_E2M1_PACKED_BYTES + 1], &packed);
 
@@ -2309,56 +2349,211 @@ mod tests {
             &indices,
             &sink,
         );
-        for (actual, expected) in actual.iter().zip(expected) {
-            assert!((actual - expected).abs() <= 1e-6, "{actual} != {expected}");
-        }
+        assert_eq!(actual, expected);
     }
 
     #[test]
     fn ratio128_stateful_carry_matches_full_recompute_across_decode_boundary() {
         const DIM: usize = 512;
         const ROPE_DIM: usize = 64;
+        const RATIO: usize = 128;
+        const BLOCK_START: usize = 128;
         const STORED_WIDTH: usize =
             ((DIM - ROPE_DIM) / FP8_E4M3_BLOCK_SIZE) * (FP8_E4M3_PACKED_BYTES + 1) + ROPE_DIM * 2;
 
-        fn token_rows(start: usize, count: usize, dim: usize, compressor: bool) -> Vec<f32> {
-            let mut values = Vec::with_capacity(count * dim);
+        fn compressor_value(position: usize, d: usize) -> f32 {
+            0.4 + (position % RATIO) as f32 * 0.00625
+                + (position / RATIO) as f32 * 0.03125
+                + (d % 23) as f32 * 0.009
+                + ((position * 11 + d * 3) % 7) as f32 * 0.001
+        }
+
+        fn compressor_score(position: usize, d: usize) -> f32 {
+            ((position * 3 + d * 5) % 19) as f32 * 0.0625 - 0.5625
+                + ((position + d) % 3) as f32 * 0.015625
+        }
+
+        fn ape_value(slot: usize, d: usize) -> f32 {
+            0.03125 + ((slot * 5 + d * 7) % 17) as f32 * 0.0078125 - 0.0625
+        }
+
+        fn query_value(position: usize, d: usize) -> f32 {
+            0.01 + ((position * 17 + d * 13) % 37) as f32 * 0.00025
+        }
+
+        fn kv_value(position: usize, d: usize) -> f32 {
+            0.2 + ((position * 7 + d * 11) % 41) as f32 * 0.0125 + (position % 5) as f32 * 0.003
+        }
+
+        fn rows(start: usize, count: usize, value: impl Fn(usize, usize) -> f32) -> Vec<f32> {
+            let mut values = Vec::with_capacity(count * DIM);
             for position in start..start + count {
-                let value = if compressor {
-                    (position + 1) as f32
-                } else {
-                    (position % 7 + 1) as f32
-                };
-                values.extend(std::iter::repeat_n(value, dim));
+                for d in 0..DIM {
+                    values.push(value(position, d));
+                }
             }
             values
         }
 
         fn initial_carry() -> Owned {
-            let mut values = vec![0.0f32; 128 * 2 * DIM];
-            for slot in 0..128 {
+            let mut values = vec![0.0f32; RATIO * 2 * DIM];
+            for slot in 0..RATIO {
                 for d in 0..DIM {
                     values[(slot * 2 + 1) * DIM + d] = f32::NEG_INFINITY;
                 }
             }
-            Owned::f32(&[1, 128, 2, DIM], &values)
+            Owned::f32(&[1, RATIO, 2, DIM], &values)
         }
 
-        fn expected_dense_sum(start: usize, end_inclusive: usize) -> f32 {
-            (start..=end_inclusive)
-                .map(|position| (position % 7 + 1) as f32)
-                .sum()
+        fn expected_carry(position: usize) -> Vec<f32> {
+            let mut values = initial_carry().to_f32();
+            if (position + 1).is_multiple_of(RATIO) {
+                return values;
+            }
+            let block_start = position - position % RATIO;
+            for absolute in block_start..=position {
+                let slot = absolute % RATIO;
+                for d in 0..DIM {
+                    values[(slot * 2) * DIM + d] = compressor_value(absolute, d);
+                    values[(slot * 2 + 1) * DIM + d] = compressor_score(absolute, d);
+                }
+            }
+            values
         }
 
-        let ape = Owned::f32(&[128, DIM], &vec![0.0; 128 * DIM]);
-        let norm = Owned::f32(&[DIM], &vec![1.0; DIM]);
-        let sink = Owned::f32(&[1], &[0.0]);
-        let empty_cache = Owned::u8(&[1, 0, STORED_WIDTH], &[]);
+        fn oracle_decode_e4m3(code: u8) -> f32 {
+            let sign = if code & 0x80 == 0 { 1.0 } else { -1.0 };
+            let exponent = (code >> 3) & 0x0f;
+            let mantissa = code & 0x07;
+            let magnitude = if exponent == 0 {
+                f32::from(mantissa) * 2.0f32.powi(-9)
+            } else {
+                (1.0 + f32::from(mantissa) / 8.0) * 2.0f32.powi(i32::from(exponent) - 7)
+            };
+            sign * magnitude
+        }
 
-        let prefill_query = Owned::f32(&[1, 126, 1, DIM], &vec![0.0; 126 * DIM]);
-        let prefill_kv = Owned::f32(&[1, 126, DIM], &token_rows(0, 126, DIM, false));
-        let prefill_compressor = Owned::f32(&[1, 126, DIM], &token_rows(0, 126, DIM, true));
-        let prefill_gate = Owned::f32(&[1, 126, DIM], &vec![0.0; 126 * DIM]);
+        fn oracle_encode_e4m3(value: f32) -> u8 {
+            let mut best_code = 0u8;
+            let mut best_distance = f32::INFINITY;
+            for code in 0u8..=0xfe {
+                if code == 0x7f {
+                    continue;
+                }
+                let distance = (value - oracle_decode_e4m3(code)).abs();
+                if distance < best_distance
+                    || (distance == best_distance && code & 1 == 0 && best_code & 1 != 0)
+                {
+                    best_code = code;
+                    best_distance = distance;
+                }
+            }
+            best_code
+        }
+
+        fn oracle_record(
+            block_start: usize,
+            norm: &[f32],
+        ) -> (Vec<u8>, Vec<f32>, Vec<f32>, Vec<f32>) {
+            let mut pooled = vec![0.0f32; DIM];
+            for (d, destination) in pooled.iter_mut().enumerate() {
+                let maximum = (block_start..block_start + RATIO)
+                    .map(|position| compressor_score(position, d))
+                    .fold(f32::NEG_INFINITY, f32::max);
+                let mut numerator = 0.0f32;
+                let mut denominator = 0.0f32;
+                for position in block_start..block_start + RATIO {
+                    let weight = (compressor_score(position, d) - maximum).exp();
+                    numerator += weight * compressor_value(position, d);
+                    denominator += weight;
+                }
+                *destination = numerator / denominator;
+            }
+
+            let mut finalized = pooled
+                .iter()
+                .map(|&value| half::bf16::from_f32(value).to_f32())
+                .collect::<Vec<_>>();
+            let square_sum = finalized.iter().map(|value| value * value).sum::<f32>();
+            let inverse_rms = (square_sum / DIM as f32 + 1.0e-6).sqrt().recip();
+            for (value, &weight) in finalized.iter_mut().zip(norm) {
+                *value = half::bf16::from_f32(*value * inverse_rms * weight).to_f32();
+            }
+            let pre_rope = finalized.clone();
+
+            const BASE: f32 = 160_000.0;
+            const FACTOR: f32 = 16.0;
+            const LOW: f32 = 15.0;
+            const HIGH: f32 = 25.0;
+            let tail = &mut finalized[DIM - ROPE_DIM..];
+            for pair in 0..ROPE_DIM / 2 {
+                let ramp = ((pair as f32 - LOW) / (HIGH - LOW)).clamp(0.0, 1.0);
+                let base_frequency = BASE.powf(-((2 * pair) as f32) / ROPE_DIM as f32);
+                let frequency = base_frequency * (1.0 - ramp) + base_frequency / FACTOR * ramp;
+                let (sin, cos) = (block_start as f32 * frequency).sin_cos();
+                let real = tail[pair * 2];
+                let imaginary = tail[pair * 2 + 1];
+                tail[pair * 2] = half::bf16::from_f32(real * cos - imaginary * sin).to_f32();
+                tail[pair * 2 + 1] = half::bf16::from_f32(real * sin + imaginary * cos).to_f32();
+            }
+
+            let pre_fp8 = finalized.clone();
+            let mut packed = Vec::with_capacity(STORED_WIDTH);
+            for block in finalized[..DIM - ROPE_DIM].chunks_exact_mut(FP8_E4M3_BLOCK_SIZE) {
+                let amax = block
+                    .iter()
+                    .map(|value| value.abs())
+                    .fold(1.0e-4f32, f32::max);
+                let scale_power = (amax / 448.0).log2().ceil() as i32;
+                let scale = 2.0f32.powi(scale_power);
+                packed.push((scale_power + 127) as u8);
+                for value in block {
+                    let code = oracle_encode_e4m3((*value / scale).clamp(-448.0, 448.0));
+                    packed.push(code);
+                    *value = oracle_decode_e4m3(code) * scale;
+                }
+            }
+            for value in &finalized[DIM - ROPE_DIM..] {
+                packed.extend_from_slice(&half::bf16::from_f32(*value).to_bits().to_le_bytes());
+            }
+            (packed, finalized, pre_fp8, pre_rope)
+        }
+
+        let ape_values = rows(0, RATIO, |slot, d| ape_value(slot, d));
+        let norm_values = (0..DIM)
+            .map(|d| 0.75 + (d % 17) as f32 * 0.03125)
+            .collect::<Vec<_>>();
+        let ape = Owned::f32(&[RATIO, DIM], &ape_values);
+        let norm = Owned::f32(&[DIM], &norm_values);
+        let sink = Owned::f32(&[1], &[-0.375]);
+        let (past_bytes, _, _, _) = oracle_record(0, &norm_values);
+        let past_cache = Owned::u8(&[1, 1, STORED_WIDTH], &past_bytes);
+        let (expected_record, expected_logical, pre_fp8, pre_rope) =
+            oracle_record(BLOCK_START, &norm_values);
+        assert_eq!(
+            &expected_record[..8],
+            &[119, 115, 115, 116, 116, 117, 118, 118],
+            "first block must use E8M0 scale 2^-8 and the contract-derived E4M3 codes"
+        );
+        assert_eq!(
+            &expected_record[STORED_WIDTH - ROPE_DIM * 2..][..8],
+            &[173, 191, 51, 186, 117, 63, 143, 63],
+            "block-start 128 must produce the contract-derived BF16 RoPE bytes"
+        );
+
+        let prefill_query = Owned::f32(&[1, 126, 1, DIM], &rows(BLOCK_START, 126, query_value));
+        let prefill_kv = Owned::f32(
+            &[1, BLOCK_START + 126, DIM],
+            &rows(0, BLOCK_START + 126, kv_value),
+        );
+        let prefill_compressor =
+            Owned::f32(&[1, 126, DIM], &rows(BLOCK_START, 126, compressor_value));
+        let prefill_gate = Owned::f32(
+            &[1, 126, DIM],
+            &rows(BLOCK_START, 126, |position, d| {
+                compressor_score(position, d) - ape_value(position % RATIO, d)
+            }),
+        );
         let prefill = run_ratio128_stateful(
             &prefill_query,
             &prefill_kv,
@@ -2366,30 +2561,32 @@ mod tests {
             &prefill_gate,
             &ape,
             &norm,
-            &empty_cache,
+            &past_cache,
             &initial_carry(),
-            &Owned::i32(&[1], &[125]),
-            &Owned::i64(&[], &[126]),
+            &Owned::i32(&[1], &[253]),
+            &Owned::i64(&[], &[254]),
             &sink,
         );
-        assert!(prefill.cache.to_u8().is_empty());
-        let prefill_carry = prefill.carry.to_f32();
-        assert_eq!(prefill_carry[(125 * 2) * DIM], 126.0);
-        assert_eq!(prefill_carry[(125 * 2 + 1) * DIM], 0.0);
-        assert_eq!(prefill_carry[(126 * 2 + 1) * DIM], f32::NEG_INFINITY);
+        assert_eq!(prefill.cache.to_u8(), past_bytes);
+        assert_eq!(prefill.carry.to_f32(), expected_carry(253));
 
         let mut incremental = prefill;
         let mut decode_outputs = Vec::new();
-        for position in 126usize..=128 {
+        for position in 254usize..=256 {
             let window_start = position.saturating_sub(127);
             let window_len = position - window_start + 1;
-            let query = Owned::f32(&[1, 1, 1, DIM], &vec![0.0; DIM]);
+            let query = Owned::f32(&[1, 1, 1, DIM], &rows(position, 1, query_value));
             let current_kv = Owned::f32(
                 &[1, window_len, DIM],
-                &token_rows(window_start, window_len, DIM, false),
+                &rows(window_start, window_len, kv_value),
             );
-            let compressor = Owned::f32(&[1, 1, DIM], &token_rows(position, 1, DIM, true));
-            let gate = Owned::f32(&[1, 1, DIM], &vec![0.0; DIM]);
+            let compressor = Owned::f32(&[1, 1, DIM], &rows(position, 1, compressor_value));
+            let gate = Owned::f32(
+                &[1, 1, DIM],
+                &rows(position, 1, |absolute, d| {
+                    compressor_score(absolute, d) - ape_value(absolute % RATIO, d)
+                }),
+            );
             incremental = run_ratio128_stateful(
                 &query,
                 &current_kv,
@@ -2404,12 +2601,25 @@ mod tests {
                 &sink,
             );
             decode_outputs.push(incremental.y.to_f32());
+            assert_eq!(
+                incremental.carry.to_f32(),
+                expected_carry(position),
+                "complete carry mismatch after absolute position {position}"
+            );
         }
 
-        let full_query = Owned::f32(&[1, 129, 1, DIM], &vec![0.0; 129 * DIM]);
-        let full_kv = Owned::f32(&[1, 129, DIM], &token_rows(0, 129, DIM, false));
-        let full_compressor = Owned::f32(&[1, 129, DIM], &token_rows(0, 129, DIM, true));
-        let full_gate = Owned::f32(&[1, 129, DIM], &vec![0.0; 129 * DIM]);
+        let full_query = Owned::f32(&[1, 129, 1, DIM], &rows(BLOCK_START, 129, query_value));
+        let full_kv = Owned::f32(
+            &[1, BLOCK_START + 129, DIM],
+            &rows(0, BLOCK_START + 129, kv_value),
+        );
+        let full_compressor = Owned::f32(&[1, 129, DIM], &rows(BLOCK_START, 129, compressor_value));
+        let full_gate = Owned::f32(
+            &[1, 129, DIM],
+            &rows(BLOCK_START, 129, |position, d| {
+                compressor_score(position, d) - ape_value(position % RATIO, d)
+            }),
+        );
         let full = run_ratio128_stateful(
             &full_query,
             &full_kv,
@@ -2417,48 +2627,64 @@ mod tests {
             &full_gate,
             &ape,
             &norm,
-            &empty_cache,
+            &past_cache,
             &initial_carry(),
-            &Owned::i32(&[1], &[128]),
-            &Owned::i64(&[], &[129]),
+            &Owned::i32(&[1], &[256]),
+            &Owned::i64(&[], &[257]),
             &sink,
         );
 
-        let expected = [
-            expected_dense_sum(0, 126) / 128.0,
-            (expected_dense_sum(0, 127) + 1.0) / 130.0,
-            (expected_dense_sum(1, 128) + 1.0) / 130.0,
-        ];
         let full_y = full.y.to_f32();
-        for (step, (actual, expected_scalar)) in decode_outputs.iter().zip(expected).enumerate() {
+        for (step, actual) in decode_outputs.iter().enumerate() {
             let full_offset = (126 + step) * DIM;
-            for d in 0..DIM {
-                assert!(
-                    (actual[d] - expected_scalar).abs() <= 1e-5,
-                    "decode step {step}, dim {d}: {} != {expected_scalar}",
-                    actual[d]
-                );
-                assert!(
-                    (actual[d] - full_y[full_offset + d]).abs() <= 1e-5,
-                    "decode/full mismatch at step {step}, dim {d}: {} != {}",
-                    actual[d],
-                    full_y[full_offset + d]
-                );
-            }
+            assert_eq!(
+                actual.as_slice(),
+                &full_y[full_offset..full_offset + DIM],
+                "incremental/full attention mismatch at decode step {step}"
+            );
         }
+        assert_eq!(incremental.carry.to_f32(), full.carry.to_f32());
         assert_eq!(incremental.cache.to_u8(), full.cache.to_u8());
+        let cache_bytes = incremental.cache.to_u8();
+        assert_eq!(&cache_bytes[..STORED_WIDTH], past_bytes.as_slice());
+        assert_eq!(&cache_bytes[STORED_WIDTH..], expected_record.as_slice());
+
         let decoded = dequantize_cache(
             &incremental.cache.view(),
-            [1, 1, 1, STORED_WIDTH],
+            [1, 1, 2, STORED_WIDTH],
             DIM,
             ROPE_DIM,
             CacheFormat::Fp8E4m3Block64,
         )
         .unwrap();
-        assert!(decoded.iter().all(|&value| value == 1.0));
-        let final_carry = incremental.carry.to_f32();
-        assert_eq!(final_carry[0], 129.0);
-        assert_eq!(final_carry[DIM], 0.0);
+        assert_eq!(&decoded[DIM..], expected_logical.as_slice());
+
+        let mut observed_quantization_error = false;
+        for block_start in (0..DIM - ROPE_DIM).step_by(FP8_E4M3_BLOCK_SIZE) {
+            let scale = super::super::block_dequant::decode_e8m0_scale(
+                expected_record[block_start / FP8_E4M3_BLOCK_SIZE * (FP8_E4M3_PACKED_BYTES + 1)],
+            );
+            let absolute_bound = 16.0 * scale;
+            for d in block_start..block_start + FP8_E4M3_BLOCK_SIZE {
+                let error = (expected_logical[d] - pre_fp8[d]).abs();
+                observed_quantization_error |= error > 0.0;
+                assert!(
+                    error <= absolute_bound,
+                    "FP8 dim {d} error {error} exceeds half of the maximum E4M3 ULP {absolute_bound}"
+                );
+            }
+        }
+        assert!(observed_quantization_error);
+        assert_eq!(
+            &expected_logical[DIM - ROPE_DIM..],
+            &pre_fp8[DIM - ROPE_DIM..],
+            "BF16 RoPE tail must bypass FP8"
+        );
+        assert_ne!(
+            expected_logical[DIM - ROPE_DIM],
+            pre_rope[DIM - ROPE_DIM],
+            "nonzero block-start RoPE must rotate the first tail pair"
+        );
     }
 
     #[test]
