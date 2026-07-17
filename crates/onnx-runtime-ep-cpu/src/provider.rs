@@ -27,7 +27,7 @@ use std::ffi::c_void;
 
 use onnx_runtime_ep_api::{
     Cost, DeviceBuffer, EpConfig, EpError, ExecutionProvider, Fence, Kernel, KernelMatch,
-    OpRegistry, Result,
+    OpRegistry, Result, require,
 };
 use onnx_runtime_ir::{DeviceId, DeviceType, Node, Shape, TensorLayout};
 
@@ -126,9 +126,17 @@ impl ExecutionProvider for CpuExecutionProvider {
         // accepts standard default-domain (`""`/`ai.onnx`) ops and any contrib
         // ops (e.g. fused `com.microsoft` ops) the registry knows, without a
         // hardcoded op/domain whitelist.
-        if !self.registry.supports(&op.op_type, &op.domain) {
-            return KernelMatch::Unsupported;
-        }
+        let domain = if op.domain.is_empty() {
+            "ai.onnx"
+        } else {
+            &op.domain
+        };
+        require!(
+            self.registry.supports(&op.op_type, &op.domain),
+            "no CPU kernel for {}::{} — op not in the CPU registry (add a kernel + register it)",
+            domain,
+            op.op_type
+        );
         // The reference kernels produce contiguous row-major outputs and accept
         // strided inputs, so no input layout is required.
         let output_layouts = vec![TensorLayout::contiguous(); op.outputs.len()];
@@ -394,7 +402,11 @@ mod tests {
         let mm = Node::new(onnx_runtime_ir::NodeId(0), "MatMul", vec![], vec![]);
         assert!(ep.supports_op(&mm, &[], &[]).is_supported());
         let conv = Node::new(onnx_runtime_ir::NodeId(1), "Conv", vec![], vec![]);
-        assert!(!ep.supports_op(&conv, &[], &[]).is_supported());
+        let rejected = ep.supports_op(&conv, &[], &[]);
+        assert!(!rejected.is_supported());
+        let reason = rejected.reason().expect("unsupported reason");
+        assert!(reason.contains("Conv"), "{reason}");
+        assert!(reason.contains("not in the CPU registry"), "{reason}");
     }
 
     #[test]

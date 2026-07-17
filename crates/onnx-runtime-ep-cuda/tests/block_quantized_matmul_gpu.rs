@@ -546,7 +546,7 @@ fn supported_formats_and_prefill_route_to_cuda() {
             &[static_shape([1, 32]), static_shape([1, 1, 18])],
             &[]
         ),
-        KernelMatch::Unsupported
+        KernelMatch::Unsupported { .. }
     ));
 
     for format in ["mxfp4", "iq1_s", "iq1_m"] {

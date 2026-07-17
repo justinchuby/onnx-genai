@@ -117,8 +117,8 @@ mod error {
 
         #[error(
             "unsupported operator {domain}::{op_type}: no available execution provider has a \
-             kernel; node {node}, opset {opset}; consulted execution providers (priority order): \
-             {execution_providers}. To fix: {remediation}",
+             kernel; node {node}, opset {opset}; decline reason: {reason}; consulted execution \
+             providers (priority order): {execution_providers}. To fix: {remediation}",
             remediation = unsupported_op_remediation(*.opset, .domain)
         )]
         UnsupportedOp {
@@ -126,6 +126,7 @@ mod error {
             domain: String,
             node: String,
             opset: OpsetVersion,
+            reason: String,
             execution_providers: String,
         },
 
@@ -222,6 +223,7 @@ mod error {
             node_id: onnx_runtime_ir::NodeId,
             opset: u64,
             execution_providers: impl Into<String>,
+            reason: impl Into<String>,
         ) -> Self {
             let domain = if node.domain.is_empty() {
                 "ai.onnx".to_string()
@@ -243,6 +245,7 @@ mod error {
                 domain,
                 node: node_display,
                 opset,
+                reason: reason.into(),
                 execution_providers: execution_providers.into(),
             }
         }

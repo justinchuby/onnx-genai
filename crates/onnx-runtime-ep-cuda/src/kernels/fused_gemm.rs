@@ -5,15 +5,16 @@
 //! output as column-major `Yᵀ[N,M]`, so its bias-vector length is exactly `N`,
 //! matching the ONNX output-channel axis without a transpose or materialization.
 
+use std::borrow::Cow;
 use std::ffi::c_void;
 use std::sync::Arc;
 
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ir::{DataType, Node, Shape};
 
-use crate::blas::{gemm_ex, GemmDtype, GemmEpilogue, GemmEpilogueKind, GemmEx, WORKSPACE_BYTES};
+use crate::blas::{GemmDtype, GemmEpilogue, GemmEpilogueKind, GemmEx, WORKSPACE_BYTES, gemm_ex};
 use crate::error::not_implemented;
-use crate::runtime::{cuptr, CudaRuntime};
+use crate::runtime::{CudaRuntime, cuptr};
 
 use super::gemm::plan_gemm;
 
@@ -98,12 +99,22 @@ fn parse_activation(activation: &str) -> Result<GemmEpilogueKind> {
     }
 }
 
-pub(crate) fn supports_shapes(node: &Node, shapes: &[Shape]) -> bool {
+pub(crate) fn unsupported_reason(node: &Node, shapes: &[Shape]) -> Option<Cow<'static, str>> {
     let [a, b, bias] = shapes else {
-        return false;
+        return Some(Cow::Owned(format!(
+            "{}: CUDA requires exactly 3 input shapes (A, B, bias), got {} — export the fused op with a dense per-output-channel bias",
+            node.op_type,
+            shapes.len()
+        )));
     };
     if a.len() != 2 || b.len() != 2 || bias.len() != 1 {
-        return false;
+        return Some(Cow::Owned(format!(
+            "{}: CUDA requires rank-2 A/B and rank-1 bias, got ranks {}/{}/{} — reshape inputs or decompose the fused op",
+            node.op_type,
+            a.len(),
+            b.len(),
+            bias.len()
+        )));
     }
 
     let (trans_a, trans_b) = if node.op_type == "FusedGemm" {
@@ -123,7 +134,13 @@ pub(crate) fn supports_shapes(node: &Node, shapes: &[Shape]) -> bool {
     let a_k = if trans_a { a[0] } else { a[1] };
     let (b_k, n) = if trans_b { (b[1], b[0]) } else { (b[0], b[1]) };
 
-    a_k == b_k && bias[0] == n
+    if a_k != b_k || bias[0] != n {
+        return Some(Cow::Owned(format!(
+            "{}: CUDA requires matching K dimensions and bias length N, got A.K={a_k:?}, B.K={b_k:?}, bias={:?}, N={n:?} — export compatible dimensions or decompose the fused op",
+            node.op_type, bias[0]
+        )));
+    }
+    None
 }
 
 struct FusedEpilogueKernel {
@@ -261,6 +278,7 @@ impl Kernel for FusedEpilogueKernel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use onnx_runtime_ir::{Dim, NodeId};
 
     #[test]
     fn activation_mapping_and_rejection() {
@@ -275,5 +293,22 @@ mod tests {
         );
         let error = parse_activation("LeakyRelu").unwrap_err();
         assert!(format!("{error}").contains("supported activations"));
+    }
+
+    #[test]
+    fn placement_decline_explains_rank_contract() {
+        let mut node = Node::new(NodeId(0), "FusedGemm", vec![], vec![]);
+        node.domain = "com.microsoft".into();
+        let reason = unsupported_reason(
+            &node,
+            &[
+                vec![Dim::Static(2), Dim::Static(3), Dim::Static(4)],
+                vec![Dim::Static(4), Dim::Static(5)],
+                vec![Dim::Static(5)],
+            ],
+        )
+        .expect("rank-3 A must be declined");
+        assert!(reason.contains("rank-2 A/B and rank-1 bias"), "{reason}");
+        assert!(reason.contains("reshape inputs"), "{reason}");
     }
 }

@@ -5,8 +5,8 @@ use std::ptr::NonNull;
 
 use onnx_runtime_ir::{DeviceId, DeviceType, Graph, Node, NodeId, Shape, TensorLayout};
 
-use crate::error::{EpError, Result};
 use crate::epcontext::EpContext;
+use crate::error::{EpError, Result};
 use crate::kernel::{Kernel, KernelMatch};
 use crate::weight::ExecutionProviderCapabilities;
 
@@ -268,6 +268,10 @@ pub trait ExecutionProvider: Send + Sync {
 
     /// Whether this EP can run `op` with the given input shapes and layouts,
     /// and at what cost.
+    ///
+    /// Every [`KernelMatch::Unsupported`] result must carry an actionable reason:
+    /// state what the EP accepts and, where possible, how to fix the model or
+    /// registration rather than returning a bare decline.
     fn supports_op(&self, op: &Node, shapes: &[Shape], layouts: &[TensorLayout]) -> KernelMatch;
 
     /// Get or create a kernel for `op` specialized to concrete `shapes`.
@@ -275,8 +279,7 @@ pub trait ExecutionProvider: Send + Sync {
     /// `opset` is the effective operator-set version for `op`'s domain in the
     /// owning graph. EPs use it to select opset-specialized kernels (e.g. the
     /// opset-13 per-axis vs. the legacy opset-<13 2D-coercion `Softmax`).
-    fn get_kernel(&self, op: &Node, shapes: &[Vec<usize>], opset: u64)
-        -> Result<Box<dyn Kernel>>;
+    fn get_kernel(&self, op: &Node, shapes: &[Vec<usize>], opset: u64) -> Result<Box<dyn Kernel>>;
 
     /// Allocate device memory.
     fn allocate(&self, size: usize, alignment: usize) -> Result<DeviceBuffer>;

@@ -1,5 +1,7 @@
 //! The [`Kernel`] trait and kernel-match / cost types (§4.2).
 
+use std::borrow::Cow;
+
 use onnx_runtime_ir::TensorLayout;
 
 use crate::error::Result;
@@ -75,6 +77,10 @@ impl Cost {
 }
 
 /// Result of [`crate::ExecutionProvider::supports_op`].
+///
+/// A decline reason travels with the decision that produced it. EPs must not
+/// maintain a separate reason table: colocating the reason with `Unsupported`
+/// keeps diagnostics from drifting away from the actual claim predicate.
 pub enum KernelMatch {
     Supported {
         cost: Cost,
@@ -83,14 +89,55 @@ pub enum KernelMatch {
         /// Layouts the kernel produces for each output.
         output_layouts: Vec<TensorLayout>,
     },
-    Unsupported,
+    Unsupported {
+        /// Actionable explanation of what the EP accepts or how to fix fallback.
+        reason: Cow<'static, str>,
+    },
 }
 
 impl KernelMatch {
+    /// Construct an unsupported match with its actionable decline reason.
+    pub fn unsupported(reason: impl Into<Cow<'static, str>>) -> Self {
+        Self::Unsupported {
+            reason: reason.into(),
+        }
+    }
+
     /// Whether the op is supported.
     pub fn is_supported(&self) -> bool {
         matches!(self, KernelMatch::Supported { .. })
     }
+
+    /// The EP's decline reason, or `None` when the op is supported.
+    pub fn reason(&self) -> Option<&str> {
+        match self {
+            Self::Supported { .. } => None,
+            Self::Unsupported { reason } => Some(reason),
+        }
+    }
+}
+
+/// Decline the current `supports_op` call with an actionable reason.
+///
+/// Formatting is evaluated only on the decline path.
+#[macro_export]
+macro_rules! deny {
+    ($($arg:tt)+) => {
+        return $crate::KernelMatch::unsupported(format!($($arg)+))
+    };
+}
+
+/// Require a claim condition, declining with an actionable reason when false.
+///
+/// Formatting is evaluated only when the condition fails, keeping the hot
+/// supported path allocation-free.
+#[macro_export]
+macro_rules! require {
+    ($condition:expr, $($arg:tt)+) => {
+        if !$condition {
+            $crate::deny!($($arg)+);
+        }
+    };
 }
 
 /// A zero-copy **view output**: a kernel's declaration that one of its outputs
@@ -253,7 +300,27 @@ mod tests {
             output_layouts: vec![],
         };
         assert!(supported.is_supported());
-        assert!(!KernelMatch::Unsupported.is_supported());
+        assert_eq!(supported.reason(), None);
+
+        let unsupported = KernelMatch::unsupported("test EP supports no ops");
+        assert!(!unsupported.is_supported());
+        assert_eq!(unsupported.reason(), Some("test EP supports no ops"));
+    }
+
+    fn require_positive(value: i32) -> KernelMatch {
+        require!(value > 0, "value must be positive, got {value}");
+        KernelMatch::Supported {
+            cost: Cost::ZERO,
+            required_input_layouts: None,
+            output_layouts: vec![],
+        }
+    }
+
+    #[test]
+    fn require_macro_carries_formatted_decline_reason() {
+        let rejected = require_positive(-2);
+        assert_eq!(rejected.reason(), Some("value must be positive, got -2"));
+        assert!(require_positive(2).is_supported());
     }
 
     struct LegacyKernel {

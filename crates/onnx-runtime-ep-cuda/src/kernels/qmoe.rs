@@ -6,13 +6,14 @@
 //! assigned tokens. Weight paging, asynchronous prefetch, and expert-parallel
 //! sharding are intentionally deferred.
 
+use std::borrow::Cow;
 use std::ffi::c_void;
 use std::sync::Arc;
 
 use cudarc::driver::sys::CUdeviceptr;
 use cudarc::driver::{LaunchConfig, PushKernelArg};
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
-use onnx_runtime_ir::{DataType, Node, Shape};
+use onnx_runtime_ir::{DataType, Node};
 
 use crate::error::driver_err;
 use crate::kernels::{qmoe_gemm, qmoe_grouping};
@@ -728,20 +729,60 @@ impl KernelFactory for QMoEFactory {
     }
 }
 
-pub(crate) fn supports_node(node: &Node, _shapes: &[Shape]) -> bool {
+pub(crate) fn unsupported_reason(node: &Node) -> Option<Cow<'static, str>> {
     let bits = node
         .attr("expert_weight_bits")
-        .map_or(Some(4), |value| value.as_int())
-        .is_some_and(|bits| matches!(bits, 1 | 2 | 4 | 8));
-    let block_size = node
-        .attr("block_size")
-        .and_then(|value| value.as_int())
-        .is_some_and(|value| value >= 16 && (value as usize).is_power_of_two());
-    let quant_type = node
+        .map_or(Some(4), |value| value.as_int());
+    match bits {
+        Some(1 | 2 | 4 | 8) => {}
+        Some(bits) => {
+            return Some(Cow::Owned(format!(
+                "QMoE: CUDA supports expert_weight_bits 1, 2, 4, or 8, got {bits} — requantize the expert weights to a supported width"
+            )));
+        }
+        None => {
+            return Some(Cow::Borrowed(
+                "QMoE: expert_weight_bits must be an integer (supported: 1, 2, 4, 8)",
+            ));
+        }
+    }
+    match node.attr("block_size") {
+        Some(attribute) => match attribute.as_int() {
+            Some(value) if value >= 16 && (value as usize).is_power_of_two() => {}
+            Some(value) => {
+                return Some(Cow::Owned(format!(
+                    "QMoE: CUDA requires block_size to be a power of two at least 16, got {value} — requantize the expert weights with a supported block size"
+                )));
+            }
+            None => {
+                return Some(Cow::Borrowed(
+                    "QMoE: block_size must be an integer power of two at least 16",
+                ));
+            }
+        },
+        None => {
+            return Some(Cow::Borrowed(
+                "QMoE: missing integer block_size — export a power-of-two block size of at least 16",
+            ));
+        }
+    }
+    match node
         .attr("quant_type")
         .map_or(Some("int"), |value| value.as_str())
-        == Some("int");
-    bits && block_size && quant_type
+    {
+        Some("int") => {}
+        Some(quant_type) => {
+            return Some(Cow::Owned(format!(
+                "QMoE: CUDA supports only quant_type='int', got '{quant_type}' — use ORT integer-affine expert weights or a block-quantized MoE operator"
+            )));
+        }
+        None => {
+            return Some(Cow::Borrowed(
+                "QMoE: quant_type must be the string 'int' for CUDA integer-affine expert weights",
+            ));
+        }
+    }
+    None
 }
 
 pub struct QMoEKernel {
@@ -1858,14 +1899,17 @@ mod tests {
                 ("expert_weight_bits", Attribute::Int(bits)),
                 ("block_size", Attribute::Int(16)),
             ]);
-            assert!(supports_node(&supported, &[]), "bits={bits}");
+            assert!(unsupported_reason(&supported).is_none(), "bits={bits}");
         }
         for bits in [0, 3, 5, 16] {
             let unsupported = node(&[
                 ("expert_weight_bits", Attribute::Int(bits)),
                 ("block_size", Attribute::Int(16)),
             ]);
-            assert!(!supports_node(&unsupported, &[]), "bits={bits}");
+            assert!(unsupported_reason(&unsupported).is_some(), "bits={bits}");
+            let reason = unsupported_reason(&unsupported).expect("unsupported bits reason");
+            assert!(reason.contains("1, 2, 4, or 8"), "{reason}");
+            assert!(reason.contains("requantize"), "{reason}");
         }
     }
 
@@ -1883,7 +1927,7 @@ mod tests {
                     Attribute::String(quant_type.as_bytes().to_vec()),
                 ),
             ]);
-            assert!(!supports_node(&unsupported, &[]), "{quant_type}");
+            assert!(unsupported_reason(&unsupported).is_some(), "{quant_type}");
         }
     }
 

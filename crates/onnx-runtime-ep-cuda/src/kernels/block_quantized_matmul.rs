@@ -1,12 +1,13 @@
 //! CUDA GEMV/GEMM kernels for native GGUF block formats.
 
+use std::borrow::Cow;
 use std::ffi::c_void;
 use std::fmt::Write;
 use std::sync::{Arc, OnceLock};
 
 use cudarc::driver::{LaunchConfig, PushKernelArg};
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
-use onnx_runtime_ir::{DataType, Node, Shape};
+use onnx_runtime_ir::{DataType, Node};
 use onnx_runtime_quantization::{
     IQ1S_GRID, IQ2S_GRID, IQ2XS_GRID, IQ2XS_SIGNS, IQ2XXS_GRID, IQ3S_GRID, IQ3XXS_GRID,
 };
@@ -689,35 +690,77 @@ impl Kernel for BlockQuantizedMatMulKernel {
     }
 }
 
-pub(crate) fn supports_node(node: &Node, _shapes: &[Shape]) -> bool {
-    let format_supported = node
-        .attr("format")
-        .and_then(|attribute| attribute.as_str())
-        .is_some_and(|format| {
-            matches!(
-                format,
-                "mxfp4"
-                    | "iq4_nl"
-                    | "iq4_xs"
-                    | "iq2_xxs"
-                    | "iq3_xxs"
-                    | "iq2_xs"
-                    | "iq2_s"
-                    | "iq3_s"
-                    | "iq1_s"
-                    | "iq1_m"
-            )
-        });
-    let layout_supported = match node.attr("block_layout_version") {
-        Some(attribute) => attribute.as_int() == Some(LAYOUT_VERSION),
-        None => true,
+pub(crate) fn unsupported_reason(node: &Node) -> Option<Cow<'static, str>> {
+    let format = match node.attr("format") {
+        Some(attribute) => match attribute.as_str() {
+            Some(format) => format,
+            None => {
+                return Some(Cow::Borrowed(
+                    "BlockQuantizedMatMul: attribute 'format' must be a string naming a CUDA-supported block format",
+                ));
+            }
+        },
+        None => {
+            return Some(Cow::Borrowed(
+                "BlockQuantizedMatMul: missing required string attribute 'format' — export one of mxfp4, iq4_nl, iq4_xs, iq2_xxs, iq3_xxs, iq2_xs, iq2_s, iq3_s, iq1_s, or iq1_m",
+            ));
+        }
     };
-    let attributes_valid = ["K", "N"].into_iter().all(|name| {
-        node.attr(name)
-            .and_then(|attribute| attribute.as_int())
-            .is_some_and(|value| value > 0)
-    });
-    format_supported && layout_supported && attributes_valid
+    if !matches!(
+        format,
+        "mxfp4"
+            | "iq4_nl"
+            | "iq4_xs"
+            | "iq2_xxs"
+            | "iq3_xxs"
+            | "iq2_xs"
+            | "iq2_s"
+            | "iq3_s"
+            | "iq1_s"
+            | "iq1_m"
+    ) {
+        return Some(Cow::Owned(format!(
+            "BlockQuantizedMatMul: CUDA does not support format '{format}' — re-export weights as mxfp4, iq4_nl, iq4_xs, iq2_xxs, iq3_xxs, iq2_xs, iq2_s, iq3_s, iq1_s, or iq1_m"
+        )));
+    }
+    if let Some(attribute) = node.attr("block_layout_version") {
+        match attribute.as_int() {
+            Some(version) if version == LAYOUT_VERSION => {}
+            Some(version) => {
+                return Some(Cow::Owned(format!(
+                    "BlockQuantizedMatMul: CUDA requires block_layout_version={LAYOUT_VERSION}, got {version} — re-export the packed weights with the current layout"
+                )));
+            }
+            None => {
+                return Some(Cow::Owned(format!(
+                    "BlockQuantizedMatMul: block_layout_version must be integer {LAYOUT_VERSION} — re-export the packed weights with the current layout"
+                )));
+            }
+        }
+    }
+    for name in ["K", "N"] {
+        match node.attr(name) {
+            Some(attribute) => match attribute.as_int() {
+                Some(value) if value > 0 => {}
+                Some(value) => {
+                    return Some(Cow::Owned(format!(
+                        "BlockQuantizedMatMul: attribute '{name}' must be positive, got {value} — export the static matrix dimension"
+                    )));
+                }
+                None => {
+                    return Some(Cow::Owned(format!(
+                        "BlockQuantizedMatMul: attribute '{name}' must be an integer — export the static matrix dimension"
+                    )));
+                }
+            },
+            None => {
+                return Some(Cow::Owned(format!(
+                    "BlockQuantizedMatMul: missing required positive integer attribute '{name}' — export the static matrix dimension"
+                )));
+            }
+        }
+    }
+    None
 }
 
 fn required_positive_attr(node: &Node, name: &str) -> Result<usize> {
@@ -854,6 +897,21 @@ fn error(message: impl Into<String>) -> EpError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use onnx_runtime_ir::{Attribute, NodeId};
+
+    #[test]
+    fn placement_decline_names_unsupported_format_and_fix() {
+        let mut node = Node::new(NodeId(0), "BlockQuantizedMatMul", vec![], vec![]);
+        node.domain = "pkg.nxrt".into();
+        node.attributes
+            .insert("format".into(), Attribute::String(b"q4_0".to_vec()));
+        node.attributes.insert("K".into(), Attribute::Int(32));
+        node.attributes.insert("N".into(), Attribute::Int(1));
+
+        let reason = unsupported_reason(&node).expect("q4_0 must be declined");
+        assert!(reason.contains("q4_0"), "{reason}");
+        assert!(reason.contains("re-export weights"), "{reason}");
+    }
 
     #[test]
     fn gemm_launch_config_caps_grid_y_and_keeps_all_row_tiles_reachable() {

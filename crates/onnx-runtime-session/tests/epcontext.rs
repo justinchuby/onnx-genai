@@ -91,7 +91,7 @@ impl ExecutionProvider for MockCompiledEp {
         Ok(())
     }
     fn supports_op(&self, _op: &Node, _shapes: &[Shape], _layouts: &[TensorLayout]) -> KernelMatch {
-        KernelMatch::Unsupported
+        KernelMatch::unsupported("test EP supports no ops")
     }
     fn get_kernel(
         &self,

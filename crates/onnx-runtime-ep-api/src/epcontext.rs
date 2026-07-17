@@ -229,7 +229,7 @@ mod tests {
             _shapes: &[Shape],
             _layouts: &[TensorLayout],
         ) -> KernelMatch {
-            KernelMatch::Unsupported
+            KernelMatch::unsupported("test EP supports no ops")
         }
 
         fn get_kernel(
@@ -318,7 +318,7 @@ mod tests {
             _shapes: &[Shape],
             _layouts: &[TensorLayout],
         ) -> KernelMatch {
-            KernelMatch::Unsupported
+            KernelMatch::unsupported("test EP supports no ops")
         }
         fn get_kernel(
             &self,

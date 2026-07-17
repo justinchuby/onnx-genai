@@ -24,7 +24,7 @@ use std::sync::Arc;
 
 use onnx_runtime_ep_api::{
     Cost, DeviceBuffer, EpConfig, EpError, ExecutionProvider, Fence, Kernel, KernelMatch,
-    OpRegistry, Result,
+    OpRegistry, Result, deny,
 };
 use onnx_runtime_ir::{DeviceId, DeviceType, Node, Shape, TensorLayout};
 
@@ -116,25 +116,34 @@ impl ExecutionProvider for CudaExecutionProvider {
         // only; anything else is Unsupported so placement routes it elsewhere
         // (typically the CPU EP) instead of hard-failing at dispatch.
         if !self.registry.supports(&op.op_type, &op.domain) {
-            return KernelMatch::Unsupported;
+            let domain = if op.domain.is_empty() {
+                "ai.onnx"
+            } else {
+                &op.domain
+            };
+            deny!(
+                "no CUDA kernel for {}::{} — op not in the CUDA registry (add a CUDA kernel + register it, or enable CPU/ORT fallback)",
+                domain,
+                op.op_type
+            );
         }
         if matches!(op.op_type.as_str(), "FusedMatMulBias" | "FusedGemm")
             && op.domain == "com.microsoft"
-            && !crate::kernels::fused_gemm::supports_shapes(op, shapes)
+            && let Some(reason) = crate::kernels::fused_gemm::unsupported_reason(op, shapes)
         {
-            return KernelMatch::Unsupported;
+            return KernelMatch::unsupported(reason);
         }
         if op.op_type == "BlockQuantizedMatMul"
             && op.domain == "pkg.nxrt"
-            && !crate::kernels::block_quantized_matmul::supports_node(op, shapes)
+            && let Some(reason) = crate::kernels::block_quantized_matmul::unsupported_reason(op)
         {
-            return KernelMatch::Unsupported;
+            return KernelMatch::unsupported(reason);
         }
         if op.op_type == "QMoE"
             && op.domain == "com.microsoft"
-            && !crate::kernels::qmoe::supports_node(op, shapes)
+            && let Some(reason) = crate::kernels::qmoe::unsupported_reason(op)
         {
-            return KernelMatch::Unsupported;
+            return KernelMatch::unsupported(reason);
         }
         let output_layouts = vec![TensorLayout::contiguous(); op.outputs.len()];
         let elems: u64 = shapes

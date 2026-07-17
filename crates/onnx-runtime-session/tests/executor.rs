@@ -218,6 +218,7 @@ fn unsupported_op_error_is_actionable() {
     assert!(message.contains("unsupported_activation"), "{message}");
     assert!(message.contains("opset 17"), "{message}");
     assert!(message.contains("cpu_ep"), "{message}");
+    assert!(message.contains("not in the CPU registry"), "{message}");
     assert!(message.contains("To fix:"), "{message}");
 }
 

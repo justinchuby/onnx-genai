@@ -200,15 +200,15 @@ impl KernelCache {
                 .map(|s| s.iter().map(|&d| Dim::Static(d)).collect())
                 .collect();
             let layouts = vec![TensorLayout::contiguous(); input_shapes.len()];
-            if !matches!(
-                ep.supports_op(node, &shape_dims, &layouts),
-                KernelMatch::Supported { .. }
-            ) {
+            if let KernelMatch::Unsupported { reason } =
+                ep.supports_op(node, &shape_dims, &layouts)
+            {
                 return Err(SessionError::unsupported_op(
                     node,
                     node_id,
                     opset,
                     ep.name(),
+                    reason,
                 ));
             }
             let mut kernel = ep.get_kernel(node, input_shapes, opset)?;
@@ -798,17 +798,11 @@ fn collect_cuda_coverage_issues(
             })
             .collect::<Vec<_>>();
 
-        if !ep.supports_op(node, &shapes, &layouts).is_supported() {
-            let identity = format_node_identity(scope, node_id, node);
-            if node.op_type == "BlockQuantizedMatMul"
-                && node.domain == "pkg.nxrt"
-            {
-                issues.push(format!(
-                    "{identity}: CUDA BlockQuantizedMatMul supports only M=1 decode, not M>1 or symbolic prefill"
-                ));
-            } else {
-                issues.push(format!("{identity}: unsupported by {}", ep.name()));
-            }
+        if let KernelMatch::Unsupported { reason } = ep.supports_op(node, &shapes, &layouts) {
+            issues.push(format!(
+                "{}: {reason}",
+                format_node_identity(scope, node_id, node)
+            ));
             continue;
         }
 
@@ -4693,6 +4687,32 @@ mod tests {
         );
         drop(executor);
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn coverage_collector_surfaces_ep_decline_reason() {
+        let mut graph = Graph::new();
+        let input = graph.create_named_value("x", DataType::Float32, vec![Dim::Static(1)]);
+        let output = graph.create_named_value("y", DataType::Float32, vec![Dim::Static(1)]);
+        graph.insert_node(Node::new(
+            NodeId(0),
+            "NotRegistered",
+            vec![Some(input)],
+            vec![output],
+        ));
+
+        let ep = CpuExecutionProvider::new();
+        let mut issues = Vec::new();
+        collect_cuda_coverage_issues(&graph, &graph, &ep, "graph", &mut issues);
+
+        assert_eq!(issues.len(), 1);
+        assert!(
+            issues[0].contains("NotRegistered")
+                && issues[0].contains("not in the CPU registry"),
+            "{}",
+            issues[0]
+        );
+        assert!(!issues[0].contains("unsupported by"), "{}", issues[0]);
     }
 
     #[test]

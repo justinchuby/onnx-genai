@@ -82,7 +82,7 @@ impl ExecutionProvider for MockEp {
                 output_layouts: vec![TensorLayout::contiguous()],
             }
         } else {
-            KernelMatch::Unsupported
+            KernelMatch::unsupported("mock EP has no registered kernel for this op")
         }
     }
 
