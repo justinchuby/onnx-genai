@@ -306,6 +306,130 @@ impl Graph {
         }
     }
 
+    /// Remove nodes in a batch while preserving the observable result of
+    /// calling [`Graph::remove_node`] for each ID in slice order.
+    ///
+    /// IDs that are not live and duplicate IDs are ignored just as they are by
+    /// sequential removal. Consumer vectors for values shared by removed nodes
+    /// are filtered once, and graph-I/O and initializer membership is
+    /// precomputed for orphan checks.
+    pub fn remove_nodes(&mut self, ids: &[NodeId]) {
+        let mut removed = HashSet::with_capacity(ids.len());
+        let ordered: Vec<NodeId> = ids
+            .iter()
+            .copied()
+            .filter(|&id| self.nodes.contains(id) && removed.insert(id))
+            .collect();
+        if ordered.is_empty() {
+            return;
+        }
+
+        let mut touched_consumers = HashSet::new();
+        let mut touched_producers = HashSet::new();
+        let mut seen_inputs = HashSet::new();
+        let mut snapshots = Vec::with_capacity(ordered.len());
+        for &id in &ordered {
+            let node = self.node(id);
+            let inputs: Vec<ValueId> = node
+                .input_values()
+                .filter(|&value| seen_inputs.insert((id, value)))
+                .collect();
+            let outputs = node.outputs.clone();
+            touched_consumers.extend(inputs.iter().copied());
+            touched_producers.extend(outputs.iter().copied());
+            snapshots.push((id, inputs, outputs));
+        }
+
+        let mut consumer_counts = HashMap::new();
+        let mut removed_consumer_edges = HashMap::new();
+        for &value in &touched_consumers {
+            if let Some(metadata) = self.values.get(value) {
+                consumer_counts.insert(value, metadata.consumers.len());
+                for &consumer in &metadata.consumers {
+                    if removed.contains(&consumer) {
+                        *removed_consumer_edges
+                            .entry((consumer, value))
+                            .or_insert(0usize) += 1;
+                    }
+                }
+            }
+        }
+        for &value in &touched_producers {
+            if let Some(metadata) = self.values.get(value) {
+                consumer_counts
+                    .entry(value)
+                    .or_insert(metadata.consumers.len());
+            }
+        }
+
+        let graph_inputs: HashSet<ValueId> = self.inputs.iter().copied().collect();
+        let graph_outputs: HashSet<ValueId> = self.outputs.iter().copied().collect();
+        let initializers: HashSet<ValueId> = self.initializers.keys().copied().collect();
+
+        // Simulate sequential consumer-count changes so orphan collection
+        // happens for exactly the values remove_node would collect in this
+        // order, including the producer-after-consumers case.
+        let mut orphaned_outputs = Vec::new();
+        let mut sequentially_collected = HashSet::new();
+        for (id, inputs, outputs) in &snapshots {
+            for &value in inputs {
+                if sequentially_collected.contains(&value) {
+                    continue;
+                }
+                if let Some(count) = consumer_counts.get_mut(&value) {
+                    *count -= removed_consumer_edges
+                        .get(&(*id, value))
+                        .copied()
+                        .unwrap_or(0);
+                }
+            }
+            for &value in outputs {
+                if sequentially_collected.contains(&value) {
+                    continue;
+                }
+                let orphan = self.values.get(value).is_some_and(|metadata| {
+                    metadata.producer == Some(*id)
+                        && consumer_counts.get(&value).copied().unwrap_or(0) == 0
+                        && !graph_inputs.contains(&value)
+                        && !graph_outputs.contains(&value)
+                        && !initializers.contains(&value)
+                });
+                if orphan {
+                    orphaned_outputs.push(value);
+                    sequentially_collected.insert(value);
+                }
+            }
+        }
+
+        for value in touched_consumers {
+            if let Some(metadata) = self.values.get_mut(value) {
+                metadata
+                    .consumers
+                    .retain(|consumer| !removed.contains(consumer));
+            }
+        }
+        for value in touched_producers {
+            if let Some(metadata) = self.values.get_mut(value)
+                && metadata
+                    .producer
+                    .is_some_and(|producer| removed.contains(&producer))
+            {
+                metadata.producer = None;
+            }
+        }
+        for id in ordered {
+            self.nodes.remove(id);
+        }
+        for value in orphaned_outputs {
+            self.gc_value_if_orphan_with_membership(
+                value,
+                &graph_inputs,
+                &graph_outputs,
+                &initializers,
+            );
+        }
+    }
+
     /// Replace disjoint node groups with one node each while updating shared
     /// producer/consumer metadata in a batch.
     ///
@@ -666,12 +790,84 @@ impl Graph {
             self.unknown_value_shapes.remove(&value);
         }
     }
+
+    fn gc_value_if_orphan_with_membership(
+        &mut self,
+        value: ValueId,
+        graph_inputs: &HashSet<ValueId>,
+        graph_outputs: &HashSet<ValueId>,
+        initializers: &HashSet<ValueId>,
+    ) {
+        let orphan = self.values.get(value).is_some_and(|metadata| {
+            metadata.producer.is_none()
+                && metadata.consumers.is_empty()
+                && !graph_inputs.contains(&value)
+                && !graph_outputs.contains(&value)
+                && !initializers.contains(&value)
+        });
+        if orphan {
+            self.values.remove(value);
+            self.unknown_value_types.remove(&value);
+            self.unknown_value_shapes.remove(&value);
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::shape::static_shape;
+    use crate::tensor::TensorData;
+
+    fn assert_graphs_identical(
+        mut batched: Graph,
+        mut sequential: Graph,
+        node_probes: usize,
+        value_probes: usize,
+        trial: usize,
+    ) {
+        assert_eq!(
+            format!("{batched:#?}"),
+            format!("{sequential:#?}"),
+            "graph mismatch on randomized trial {trial}"
+        );
+
+        // Arena free-list order is observable through subsequently allocated
+        // IDs, so exhaust the recycled slots as part of the equivalence check.
+        for _ in 0..node_probes {
+            let batched_id =
+                batched.insert_node(Node::new(NodeId(0), "Probe", Vec::new(), Vec::new()));
+            let sequential_id =
+                sequential.insert_node(Node::new(NodeId(0), "Probe", Vec::new(), Vec::new()));
+            assert_eq!(
+                batched_id, sequential_id,
+                "node arena mismatch on randomized trial {trial}"
+            );
+        }
+        for _ in 0..value_probes {
+            let batched_id = batched.create_value(DataType::Float32, static_shape([1]));
+            let sequential_id = sequential.create_value(DataType::Float32, static_shape([1]));
+            assert_eq!(
+                batched_id, sequential_id,
+                "value arena mismatch on randomized trial {trial}"
+            );
+        }
+    }
+
+    struct TestRng(u64);
+
+    impl TestRng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn usize(&mut self, upper: usize) -> usize {
+            (self.next() as usize) % upper
+        }
+    }
 
     /// Build `a -> Relu -> b -> Add(b, c) -> d`, returning ids.
     fn sample_graph() -> Graph {
@@ -770,6 +966,199 @@ mod tests {
         assert!(g.value(ValueId(3)).producer.is_none());
         // b lost its consumer
         assert!(g.value(ValueId(2)).consumers.is_empty());
+    }
+
+    #[test]
+    fn remove_nodes_filters_wide_shared_input_once() {
+        let mut graph = Graph::new();
+        let input = graph.create_value(DataType::Float32, static_shape([1]));
+        graph.add_input(input);
+        let mut dead = Vec::new();
+        let mut outputs = Vec::new();
+        for _ in 0..1_000 {
+            let output = graph.create_value(DataType::Float32, static_shape([1]));
+            dead.push(graph.insert_node(Node::new(
+                NodeId(0),
+                "Relu",
+                vec![Some(input)],
+                vec![output],
+            )));
+            outputs.push(output);
+        }
+
+        graph.remove_nodes(&dead);
+
+        assert_eq!(graph.num_nodes(), 0);
+        assert!(graph.value(input).consumers.is_empty());
+        assert!(
+            outputs
+                .into_iter()
+                .all(|output| graph.try_value(output).is_none())
+        );
+    }
+
+    #[test]
+    fn remove_nodes_keeps_surviving_shared_consumer() {
+        let mut graph = Graph::new();
+        let input = graph.create_value(DataType::Float32, static_shape([1]));
+        graph.add_input(input);
+        let mut nodes = Vec::new();
+        for op_type in ["Relu", "Neg", "Abs"] {
+            let output = graph.create_value(DataType::Float32, static_shape([1]));
+            nodes.push(graph.insert_node(Node::new(
+                NodeId(0),
+                op_type,
+                vec![Some(input)],
+                vec![output],
+            )));
+        }
+
+        graph.remove_nodes(&nodes[..2]);
+
+        assert_eq!(graph.value(input).consumers, vec![nodes[2]]);
+        assert!(graph.try_node(nodes[2]).is_some());
+        assert!(graph.validate().is_ok());
+    }
+
+    #[test]
+    fn remove_nodes_collects_value_after_all_consumers_are_removed() {
+        let mut graph = Graph::new();
+        let input = graph.create_value(DataType::Float32, static_shape([1]));
+        graph.add_input(input);
+        let shared = graph.create_value(DataType::Float32, static_shape([1]));
+        let producer = graph.insert_node(Node::new(
+            NodeId(0),
+            "Relu",
+            vec![Some(input)],
+            vec![shared],
+        ));
+        let mut consumers = Vec::new();
+        for op_type in ["Neg", "Abs"] {
+            let output = graph.create_value(DataType::Float32, static_shape([1]));
+            consumers.push(graph.insert_node(Node::new(
+                NodeId(0),
+                op_type,
+                vec![Some(shared)],
+                vec![output],
+            )));
+        }
+
+        graph.remove_nodes(&[consumers[0], consumers[1], producer]);
+
+        assert!(graph.try_value(shared).is_none());
+    }
+
+    #[test]
+    fn remove_nodes_keeps_graph_outputs_and_initializers() {
+        let mut graph = Graph::new();
+        let input = graph.create_value(DataType::Float32, static_shape([1]));
+        graph.add_input(input);
+
+        let graph_output = graph.create_value(DataType::Float32, static_shape([1]));
+        let output_node = graph.insert_node(Node::new(
+            NodeId(0),
+            "Relu",
+            vec![Some(input)],
+            vec![graph_output],
+        ));
+        graph.add_output(graph_output);
+
+        let initializer = graph.create_value(DataType::Float32, static_shape([1]));
+        let initializer_node = graph.insert_node(Node::new(
+            NodeId(0),
+            "Neg",
+            vec![Some(input)],
+            vec![initializer],
+        ));
+        graph.set_initializer(
+            initializer,
+            WeightRef::Inline(TensorData::from_raw(
+                DataType::Float32,
+                vec![1],
+                0.0f32.to_le_bytes().to_vec(),
+            )),
+        );
+
+        graph.remove_nodes(&[output_node, initializer_node]);
+
+        assert!(graph.try_value(graph_output).is_some());
+        assert!(graph.value(graph_output).producer.is_none());
+        assert!(graph.try_value(initializer).is_some());
+        assert!(graph.value(initializer).producer.is_none());
+    }
+
+    #[test]
+    fn remove_nodes_ignores_duplicate_and_nonlive_ids() {
+        let graph = sample_graph();
+        let ids = [NodeId(u32::MAX), NodeId(1), NodeId(1)];
+        let mut sequential = graph.clone();
+        for id in ids {
+            sequential.remove_node(id);
+        }
+        let mut batched = graph;
+        batched.remove_nodes(&ids);
+
+        assert_graphs_identical(batched, sequential, 3, 5, 0);
+    }
+
+    #[test]
+    fn remove_nodes_matches_sequential_removal_on_random_dags() {
+        let mut rng = TestRng(0x4d59_5df4_d0f3_3173);
+
+        for trial in 0..10_000 {
+            let input_count = 1 + rng.usize(3);
+            let node_count = 1 + rng.usize(12);
+            let mut graph = Graph::new();
+            let mut values = Vec::new();
+            for _ in 0..input_count {
+                let input = graph.create_value(DataType::Float32, static_shape([1]));
+                graph.add_input(input);
+                values.push(input);
+            }
+
+            let mut nodes = Vec::with_capacity(node_count);
+            for _ in 0..node_count {
+                let input_arity = 1 + rng.usize(3);
+                let inputs = (0..input_arity)
+                    .map(|_| Some(values[rng.usize(values.len())]))
+                    .collect();
+                let output = graph.create_value(DataType::Float32, static_shape([1]));
+                nodes.push(graph.insert_node(Node::new(NodeId(0), "Random", inputs, vec![output])));
+                if rng.usize(5) == 0 {
+                    graph.mark_value_type_unknown(output);
+                }
+                if rng.usize(5) == 0 {
+                    graph.mark_value_shape_unknown(output);
+                }
+                values.push(output);
+            }
+
+            for _ in 0..rng.usize(4) {
+                let output = values[rng.usize(values.len())];
+                graph.add_output(output);
+            }
+
+            for i in (1..nodes.len()).rev() {
+                let j = rng.usize(i + 1);
+                nodes.swap(i, j);
+            }
+            nodes.truncate(rng.usize(nodes.len() + 1));
+
+            let mut sequential = graph.clone();
+            for &id in &nodes {
+                sequential.remove_node(id);
+            }
+            let mut batched = graph;
+            batched.remove_nodes(&nodes);
+
+            assert_graphs_identical(
+                batched,
+                sequential,
+                node_count + 1,
+                input_count + node_count + 1,
+                trial,
+            );
+        }
     }
 
     #[test]

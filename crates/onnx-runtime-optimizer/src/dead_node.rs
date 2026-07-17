@@ -13,7 +13,7 @@ use crate::pass::{OptimizationPass, PassContext};
 /// A node is *live* if any of its outputs is (transitively) required to compute
 /// a value in [`Graph::outputs`]. Liveness is found by walking backwards from
 /// the graph outputs through producer edges; every node not reached is removed
-/// via [`Graph::remove_node`], which keeps producer/consumer edges consistent
+/// via [`Graph::remove_nodes`], which keeps producer/consumer edges consistent
 /// and garbage-collects orphaned values. Graph inputs and initializers are left
 /// untouched.
 #[derive(Clone, Copy, Debug, Default)]
@@ -57,9 +57,7 @@ impl OptimizationPass for DeadNodeElimination {
             .keys()
             .filter(|nid| !live.contains(nid))
             .collect();
-        for nid in dead {
-            graph.remove_node(nid);
-        }
+        graph.remove_nodes(&dead);
         Ok(())
     }
 }
