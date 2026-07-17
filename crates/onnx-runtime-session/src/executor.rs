@@ -2598,6 +2598,28 @@ fn normalize_axis(axis: i64, rank: usize) -> Option<usize> {
     }
 }
 
+fn scan_list_attr(node: &Node, name: &str, count: usize, default: i64) -> Result<Vec<i64>> {
+    match node.attr(name) {
+        None => Ok(vec![default; count]),
+        Some(attr) => {
+            let values = attr.as_ints().ok_or_else(|| SessionError::ControlFlow {
+                op: "Scan".to_string(),
+                reason: format!("attribute '{name}' must be an INTS list"),
+            })?;
+            if values.len() != count {
+                return Err(SessionError::ControlFlow {
+                    op: "Scan".to_string(),
+                    reason: format!(
+                        "attribute '{name}' has {} value(s), expected {count}",
+                        values.len()
+                    ),
+                });
+            }
+            Ok(values.to_vec())
+        }
+    }
+}
+
 /// Whether `(op_type, domain)` is one of the standard subgraph-bearing
 /// control-flow ops the executor handles recursively (default `ai.onnx`
 /// domain). Kept in lock-step with the loader's `validate_no_control_flow`
@@ -3476,7 +3498,7 @@ impl Executor {
         let empty_scan_specs =
             self.loop_body_scan_specs(node, &carried, num_scan, resolved)?;
         let mut scan_acc: Vec<TensorStackAccumulator> = (0..num_scan)
-            .map(|_| TensorStackAccumulator::new(None))
+            .map(|_| TensorStackAccumulator::new())
             .collect();
         let prepared = self.prepare_subgraph(node.id, "body", resolved, outer_scope)?;
         let mut iter_tensor = scalar_i64_tensor(0)?;
@@ -3578,131 +3600,301 @@ impl Executor {
         Ok(())
     }
 
-    /// ONNX `Scan`: inputs `[initial_state..., scan_input...]`, body signature
-    /// `(state..., scan_slice...) -> (state..., scan_out_slice...)`. Iterates
-    /// over the scan axis, threading state and stacking scan outputs along their
-    /// axis. Phase-1 scope: scan axis 0 for every scan input/output, forward
-    /// direction (the common exporter output); anything else is rejected
-    /// clearly rather than silently mis-scanned.
+    fn scan_body_specs(
+        &self,
+        node: &Node,
+        state: &[Tensor],
+        scan_inputs: &[Tensor],
+        input_axes: &[usize],
+        num_scan_outputs: usize,
+        output_axes: &[i64],
+        resolved: &HashMap<ValueId, Vec<usize>>,
+    ) -> Result<Vec<Option<(DataType, Vec<usize>)>>> {
+        let body = self
+            .graph
+            .subgraphs
+            .get(&(node.id, "body".to_string()))
+            .ok_or_else(|| SessionError::ControlFlow {
+                op: "Scan".to_string(),
+                reason: "missing required 'body' subgraph".to_string(),
+            })?;
+        let expected_inputs = state.len() + scan_inputs.len();
+        if body.inputs.len() != expected_inputs {
+            return Err(SessionError::ControlFlow {
+                op: "Scan".to_string(),
+                reason: format!(
+                    "body declares {} formal input(s), expected {expected_inputs}",
+                    body.inputs.len()
+                ),
+            });
+        }
+        let expected_outputs = state.len() + num_scan_outputs;
+        if body.outputs.len() != expected_outputs {
+            return Err(SessionError::ControlFlow {
+                op: "Scan".to_string(),
+                reason: format!(
+                    "body declares {} output(s), expected {expected_outputs}",
+                    body.outputs.len()
+                ),
+            });
+        }
+
+        for (index, initial) in state.iter().enumerate() {
+            for (kind, value) in [
+                ("formal input", body.inputs[index]),
+                ("output", body.outputs[index]),
+            ] {
+                if body.value_type_is_known(value) && body.value(value).dtype != initial.dtype {
+                    return Err(SessionError::ControlFlow {
+                        op: "Scan".to_string(),
+                        reason: format!(
+                            "state {kind} {index} has dtype {:?}, but its initial value has dtype {:?}",
+                            body.value(value).dtype, initial.dtype
+                        ),
+                    });
+                }
+            }
+        }
+        for (index, ((input, &axis), &formal)) in scan_inputs
+            .iter()
+            .zip(input_axes)
+            .zip(body.inputs.iter().skip(state.len()))
+            .enumerate()
+        {
+            if body.value_type_is_known(formal) && body.value(formal).dtype != input.dtype {
+                return Err(SessionError::ControlFlow {
+                    op: "Scan".to_string(),
+                    reason: format!(
+                        "scan formal input {index} has dtype {:?}, but scan input {index} has dtype {:?}",
+                        body.value(formal).dtype, input.dtype
+                    ),
+                });
+            }
+            let mut slice_shape = input.shape.clone();
+            slice_shape.remove(axis);
+            if body.value_shape_is_known(formal)
+                && let Some(shape) = as_static_shape(&body.value(formal).shape)
+                && shape != slice_shape
+            {
+                return Err(SessionError::ControlFlow {
+                    op: "Scan".to_string(),
+                    reason: format!(
+                        "scan formal input {index} has shape {shape:?}, but slicing input shape {:?} \
+                         along axis {axis} produces {slice_shape:?}",
+                        input.shape
+                    ),
+                });
+            }
+        }
+
+        body.outputs
+            .iter()
+            .skip(state.len())
+            .zip(node.outputs.iter().skip(state.len()))
+            .zip(output_axes)
+            .enumerate()
+            .map(|(index, ((&body_output, &node_output), &axis))| {
+                let body_value = body.value(body_output);
+                let node_dtype = self.value_dtypes[&node_output];
+                let dtype = if body.value_type_is_known(body_output) {
+                    if self.graph.value_type_is_known(node_output)
+                        && body_value.dtype != node_dtype
+                    {
+                        return Err(SessionError::ControlFlow {
+                            op: "Scan".to_string(),
+                            reason: format!(
+                                "scan output {index} has body dtype {:?}, but the Scan node declares \
+                                 {node_dtype:?}",
+                                body_value.dtype
+                            ),
+                        });
+                    }
+                    body_value.dtype
+                } else {
+                    node_dtype
+                };
+                let elem_shape = body
+                    .value_shape_is_known(body_output)
+                    .then(|| as_static_shape(&body_value.shape))
+                    .flatten()
+                    .or_else(|| {
+                        resolved.get(&node_output).and_then(|shape| {
+                            normalize_axis(axis, shape.len()).map(|axis| {
+                                let mut elem_shape = shape.clone();
+                                elem_shape.remove(axis);
+                                elem_shape
+                            })
+                        })
+                    });
+                if let Some(shape) = &elem_shape
+                    && normalize_axis(axis, shape.len() + 1).is_none()
+                {
+                    return Err(SessionError::ControlFlow {
+                        op: "Scan".to_string(),
+                        reason: format!(
+                            "scan_output_axes[{index}]={axis} is out of range for output rank {}",
+                            shape.len() + 1
+                        ),
+                    });
+                }
+                Ok(elem_shape.map(|shape| (dtype, shape)))
+            })
+            .collect()
+    }
+
+    /// ONNX `Scan`: slice configured input axes/directions, thread invariant
+    /// state through the body, and stack scan outputs on configured axes.
     fn exec_scan(
         &mut self,
         node: &Node,
         resolved: &mut HashMap<ValueId, Vec<usize>>,
         outer_scope: &HashMap<String, Tensor>,
     ) -> Result<()> {
-        let num_scan_inputs = node
+        let raw_num_scan_inputs = node
             .attr("num_scan_inputs")
             .and_then(|a| a.as_int())
-            .ok_or_else(|| {
-                SessionError::Internal(
-                    "Scan: required attribute 'num_scan_inputs' is missing or not an INT"
-                        .to_string(),
-                )
-            })? as usize;
-
-        // Reject the axis/direction knobs this Phase-1 implementation does not
-        // yet honor, rather than silently ignoring them (RULES #1/#5).
-        for attr in ["scan_input_axes", "scan_output_axes"] {
-            if let Some(a) = node.attr(attr)
-                && let Some(axes) = a.as_ints()
-                && axes.iter().any(|&ax| ax != 0)
-            {
-                return Err(SessionError::Internal(format!(
-                    "Scan: attribute '{attr}' = {axes:?} requests a non-zero scan axis, \
-                     which this runtime does not yet support. Expected axis 0 for every \
-                     scan input/output; re-export with axis 0 or wait for full Scan-axis \
-                     support"
-                )));
-            }
-        }
-        for attr in ["scan_input_directions", "scan_output_directions"] {
-            if let Some(a) = node.attr(attr)
-                && let Some(dirs) = a.as_ints()
-                && dirs.iter().any(|&d| d != 0)
-            {
-                return Err(SessionError::Internal(format!(
-                    "Scan: attribute '{attr}' = {dirs:?} requests reverse iteration, which \
-                     this runtime does not yet support (forward only). Re-export forward or \
-                     wait for reverse-Scan support"
-                )));
-            }
-        }
+            .ok_or_else(|| SessionError::ControlFlow {
+                op: "Scan".to_string(),
+                reason: "required attribute 'num_scan_inputs' is missing or not an INT".to_string(),
+            })?;
+        let num_scan_inputs = usize::try_from(raw_num_scan_inputs)
+            .ok()
+            .filter(|&count| count != 0)
+            .ok_or_else(|| SessionError::ControlFlow {
+                op: "Scan".to_string(),
+                reason: format!(
+                    "'num_scan_inputs' must be a positive INT, got {raw_num_scan_inputs}"
+                ),
+            })?;
 
         let total_inputs = node.inputs.len();
         if total_inputs < num_scan_inputs {
-            return Err(SessionError::Internal(format!(
-                "Scan: node has {total_inputs} input(s) but num_scan_inputs={num_scan_inputs}"
-            )));
+            return Err(SessionError::ControlFlow {
+                op: "Scan".to_string(),
+                reason: format!(
+                    "node has {total_inputs} input(s) but num_scan_inputs={num_scan_inputs}"
+                ),
+            });
         }
         let num_state = total_inputs - num_scan_inputs;
+        if node.outputs.len() < num_state {
+            return Err(SessionError::ControlFlow {
+                op: "Scan".to_string(),
+                reason: format!(
+                    "declares {} output(s) but has {num_state} state variable(s)",
+                    node.outputs.len()
+                ),
+            });
+        }
+        let num_scan_outputs = node.outputs.len() - num_state;
+        let input_axes_raw = scan_list_attr(node, "scan_input_axes", num_scan_inputs, 0)?;
+        let input_directions =
+            scan_list_attr(node, "scan_input_directions", num_scan_inputs, 0)?;
+        let output_axes = scan_list_attr(node, "scan_output_axes", num_scan_outputs, 0)?;
+        let output_directions =
+            scan_list_attr(node, "scan_output_directions", num_scan_outputs, 0)?;
+        for (name, values) in [
+            ("scan_input_directions", &input_directions),
+            ("scan_output_directions", &output_directions),
+        ] {
+            for (index, &value) in values.iter().enumerate() {
+                if !matches!(value, 0 | 1) {
+                    return Err(SessionError::ControlFlow {
+                        op: "Scan".to_string(),
+                        reason: format!(
+                            "{name}[{index}] must be 0 (forward) or 1 (reverse), got {value}"
+                        ),
+                    });
+                }
+            }
+        }
 
-        // Initial state (threaded across iterations) + scan inputs (sliced).
         let mut state: Vec<Tensor> = Vec::with_capacity(num_state);
         for slot in node.inputs.iter().take(num_state) {
-            let vid = slot.ok_or_else(|| {
-                SessionError::Internal(
-                    "Scan: an initial-state input is omitted (empty), which ONNX does not allow"
-                        .to_string(),
-                )
+            let vid = slot.ok_or_else(|| SessionError::ControlFlow {
+                op: "Scan".to_string(),
+                reason: "an initial-state input is omitted (empty), which ONNX does not allow"
+                    .to_string(),
             })?;
             state.push(self.value_tensor(vid, resolved)?);
         }
         let mut scan_inputs: Vec<Tensor> = Vec::with_capacity(num_scan_inputs);
         for slot in node.inputs.iter().skip(num_state) {
-            let vid = slot.ok_or_else(|| {
-                SessionError::Internal(
-                    "Scan: a scan input is omitted (empty), which ONNX does not allow".to_string(),
-                )
+            let vid = slot.ok_or_else(|| SessionError::ControlFlow {
+                op: "Scan".to_string(),
+                reason: "a scan input is omitted (empty), which ONNX does not allow".to_string(),
             })?;
             scan_inputs.push(self.value_tensor(vid, resolved)?);
         }
 
-        // Sequence length = extent of scan axis 0; all scan inputs must agree.
-        let seq_len = scan_inputs
-            .first()
-            .and_then(|t| t.shape.first().copied())
-            .ok_or_else(|| {
-                SessionError::Internal(
-                    "Scan: requires at least one scan input with rank >= 1".to_string(),
-                )
+        let mut input_axes = Vec::with_capacity(num_scan_inputs);
+        for (index, (input, &raw_axis)) in scan_inputs.iter().zip(&input_axes_raw).enumerate() {
+            let axis = normalize_axis(raw_axis, input.shape.len()).ok_or_else(|| {
+                SessionError::ControlFlow {
+                    op: "Scan".to_string(),
+                    reason: format!(
+                        "scan_input_axes[{index}]={raw_axis} is out of range for input rank {}",
+                        input.shape.len()
+                    ),
+                }
             })?;
-        for (i, t) in scan_inputs.iter().enumerate() {
-            let this = t.shape.first().copied().unwrap_or(0);
-            if this != seq_len {
-                return Err(SessionError::Internal(format!(
-                    "Scan: scan input #{i} has scan-axis length {this} but the first scan input has \
-                     {seq_len}; all scan inputs must share the same scan-axis length"
-                )));
+            input_axes.push(axis);
+        }
+        let trip_count = scan_inputs[0].shape[input_axes[0]];
+        for (index, (input, &axis)) in scan_inputs.iter().zip(&input_axes).enumerate() {
+            let length = input.shape[axis];
+            if length != trip_count {
+                return Err(SessionError::ControlFlow {
+                    op: "Scan".to_string(),
+                    reason: format!(
+                        "scan input {index} has scan-axis length {length}, but the first scan input \
+                         has {trip_count}; all scan inputs must agree"
+                    ),
+                });
             }
         }
 
-        let num_outputs = node.outputs.len();
-        if num_outputs < num_state {
-            return Err(SessionError::Internal(format!(
-                "Scan: declares {num_outputs} output(s) but has {num_state} state variable(s); \
-                 outputs must be final-state followed by scan-outputs"
-            )));
-        }
-        let num_scan_out = num_outputs - num_state;
-        let mut scan_acc: Vec<TensorStackAccumulator> = (0..num_scan_out)
-            .map(|_| TensorStackAccumulator::new(Some(seq_len)))
+        let state_specs: Vec<(DataType, Vec<usize>)> =
+            state.iter().map(|tensor| (tensor.dtype, tensor.shape.clone())).collect();
+        let empty_specs = self.scan_body_specs(
+            node,
+            &state,
+            &scan_inputs,
+            &input_axes,
+            num_scan_outputs,
+            &output_axes,
+            resolved,
+        )?;
+        let mut scan_acc: Vec<TensorStackAccumulator> = (0..num_scan_outputs)
+            .map(|_| TensorStackAccumulator::new())
             .collect();
         let prepared = self.prepare_subgraph(node.id, "body", resolved, outer_scope)?;
         let mut scan_slices = Vec::with_capacity(num_scan_inputs);
-        if seq_len != 0 {
-            for t in &scan_inputs {
-                let (shape, bytes) = leading_slice(t, 0)?;
-                // Subgraph inputs are host tensors that `run_scoped` uploads
-                // through the child EP. Keep the mutable slice staging buffer on
-                // the host rather than host-writing a non-host EP allocation.
-                scan_slices.push(Tensor::from_raw(t.dtype, shape, bytes)?);
+        if trip_count != 0 {
+            for (index, ((input, &axis), &direction)) in scan_inputs
+                .iter()
+                .zip(&input_axes)
+                .zip(&input_directions)
+                .enumerate()
+            {
+                let source_index = if direction == 0 { 0 } else { trip_count - 1 };
+                let (shape, bytes) = scan_slice(input, axis, source_index, index)?;
+                scan_slices.push(Tensor::from_raw(input.dtype, shape, &bytes)?);
             }
         }
-        for step in 0..seq_len {
+        for step in 0..trip_count {
             if step != 0 {
-                for (source, slice) in scan_inputs.iter().zip(scan_slices.iter_mut()) {
-                    let (_, bytes) = leading_slice(source, step)?;
-                    slice.overwrite_bytes(bytes)?;
+                for (index, (((input, &axis), &direction), slice)) in scan_inputs
+                    .iter()
+                    .zip(&input_axes)
+                    .zip(&input_directions)
+                    .zip(scan_slices.iter_mut())
+                    .enumerate()
+                {
+                    let source_index =
+                        if direction == 0 { step } else { trip_count - 1 - step };
+                    let (_, bytes) = scan_slice(input, axis, source_index, index)?;
+                    slice.overwrite_bytes(&bytes)?;
                 }
             }
             let mut formal: Vec<&Tensor> = Vec::with_capacity(num_state + num_scan_inputs);
@@ -3711,7 +3903,7 @@ impl Executor {
 
             let outs = self.run_subgraph(&prepared, &formal)?;
             drop(formal);
-            let expected = num_state + num_scan_out;
+            let expected = num_state + num_scan_outputs;
             if outs.len() != expected {
                 return Err(SessionError::OutputShapeCountMismatch {
                     op: "Scan/body".to_string(),
@@ -3720,8 +3912,30 @@ impl Executor {
                 });
             }
             let mut it = outs.into_iter();
-            state.clear();
-            state.extend((&mut it).take(num_state));
+            let next_state: Vec<Tensor> = (&mut it).take(num_state).collect();
+            for (index, (tensor, (expected_dtype, expected_shape))) in
+                next_state.iter().zip(&state_specs).enumerate()
+            {
+                if tensor.dtype != *expected_dtype {
+                    return Err(SessionError::ControlFlow {
+                        op: "Scan".to_string(),
+                        reason: format!(
+                            "state output {index} dtype mismatch: expected {expected_dtype:?}, got {:?}",
+                            tensor.dtype
+                        ),
+                    });
+                }
+                if tensor.shape != *expected_shape {
+                    return Err(SessionError::ControlFlow {
+                        op: "Scan".to_string(),
+                        reason: format!(
+                            "state output {index} shape mismatch: expected {expected_shape:?}, got {:?}",
+                            tensor.shape
+                        ),
+                    });
+                }
+            }
+            state = next_state;
             for acc in scan_acc.iter_mut() {
                 acc.push(it.next().expect("scan output present"))?;
             }
@@ -3730,50 +3944,75 @@ impl Executor {
         for (i, t) in state.iter().enumerate() {
             self.store_output_tensor(node.outputs[i], t, resolved)?;
         }
-        for (s, acc) in scan_acc.into_iter().enumerate() {
-            let (dtype, shape, bytes) = acc.finish();
+        for (s, ((acc, empty_spec), (&axis, &direction))) in scan_acc
+            .into_iter()
+            .zip(empty_specs)
+            .zip(output_axes.iter().zip(&output_directions))
+            .enumerate()
+        {
+            let (dtype, shape, bytes) =
+                acc.finish_scan(axis, direction, empty_spec, s)?;
             self.store_output_bytes(node.outputs[num_state + s], dtype, shape, &bytes, resolved)?;
         }
         Ok(())
     }
 }
 
-/// Borrow the `index`-th contiguous slice along a tensor's leading axis while
-/// dropping that axis from the returned shape.
-fn leading_slice(t: &Tensor, index: usize) -> Result<(Vec<usize>, &[u8])> {
-    if t.shape.is_empty() {
-        return Err(SessionError::Internal(
-            "Scan: cannot slice a scalar scan input along axis 0".to_string(),
-        ));
+fn scan_slice(
+    t: &Tensor,
+    axis: usize,
+    index: usize,
+    input_index: usize,
+) -> Result<(Vec<usize>, Vec<u8>)> {
+    let axis_len = t.shape[axis];
+    if index >= axis_len {
+        return Err(SessionError::ControlFlow {
+            op: "Scan".to_string(),
+            reason: format!(
+                "slice index {index} is out of range for scan input {input_index} axis {axis}"
+            ),
+        });
     }
-    let outer = t.shape[0];
-    if index >= outer {
-        return Err(SessionError::Internal(format!(
-            "Scan: slice index {index} out of range for scan-axis length {outer}"
-        )));
-    }
-    let inner_shape = t.shape[1..].to_vec();
-    let inner_numel: usize = inner_shape.iter().product();
     let esize = t.dtype.byte_size();
-    // Sub-byte dtypes have no clean per-element byte stride for slicing; reject.
     if esize == 0 {
-        return Err(SessionError::Internal(format!(
-            "Scan: sub-byte dtype {:?} scan inputs are not supported",
-            t.dtype
-        )));
+        return Err(SessionError::ControlFlow {
+            op: "Scan".to_string(),
+            reason: format!(
+                "sub-byte dtype {:?} for scan input {input_index} is not supported",
+                t.dtype
+            ),
+        });
     }
-    let slice_bytes = inner_numel * esize;
-    let start = index * slice_bytes;
-    let bytes = &t.as_bytes()[start..start + slice_bytes];
-    Ok((inner_shape, bytes))
+    let mut shape = t.shape.clone();
+    shape.remove(axis);
+    let outer = checked_numel(&t.shape[..axis], || format!("Scan input {input_index}"))?;
+    let inner = checked_numel(&t.shape[axis + 1..], || format!("Scan input {input_index}"))?;
+    let inner_bytes = checked_storage_bytes(
+        t.dtype,
+        inner,
+        || format!("Scan input {input_index}"),
+        &t.shape,
+    )?;
+    let total_bytes = outer.checked_mul(inner_bytes).ok_or_else(|| {
+        SessionError::ShapeOverflow {
+            value: format!("Scan input {input_index} slice"),
+            dims: shape.clone(),
+        }
+    })?;
+    let source = t.as_bytes();
+    let mut bytes = vec![0u8; total_bytes];
+    for outer_index in 0..outer {
+        let src = (outer_index * axis_len + index) * inner_bytes;
+        let dst = outer_index * inner_bytes;
+        bytes[dst..dst + inner_bytes].copy_from_slice(&source[src..src + inner_bytes]);
+    }
+    Ok((shape, bytes))
 }
 
-/// Single-allocation accumulator for Loop/Scan scan outputs. Each iteration's
-/// temporary output is copied directly into its final stacked byte position and
-/// then dropped, avoiding a retained tensor allocation per step and a second
-/// full stacking pass.
+/// Incremental accumulator for Loop/Scan outputs. Iteration tensors are copied
+/// into one byte buffer and dropped; non-leading Scan axes are rearranged once
+/// when the final tensor is materialized.
 struct TensorStackAccumulator {
-    expected_len: Option<usize>,
     dtype: Option<DataType>,
     elem_shape: Vec<usize>,
     len: usize,
@@ -3781,9 +4020,8 @@ struct TensorStackAccumulator {
 }
 
 impl TensorStackAccumulator {
-    fn new(expected_len: Option<usize>) -> Self {
+    fn new() -> Self {
         Self {
-            expected_len,
             dtype: None,
             elem_shape: Vec::new(),
             len: 0,
@@ -3809,10 +4047,6 @@ impl TensorStackAccumulator {
             }
             self.dtype = Some(tensor.dtype);
             self.elem_shape = tensor.shape.clone();
-            if let Some(expected) = self.expected_len {
-                self.bytes
-                    .reserve(expected.saturating_mul(tensor.as_bytes().len()));
-            }
         }
         self.bytes.extend_from_slice(tensor.as_bytes());
         self.len += 1;
@@ -3849,6 +4083,64 @@ impl TensorStackAccumulator {
         shape.push(0);
         shape.extend(elem_shape);
         Ok((dtype, shape, Vec::new()))
+    }
+
+    fn finish_scan(
+        self,
+        axis: i64,
+        direction: i64,
+        empty_spec: Option<(DataType, Vec<usize>)>,
+        output_index: usize,
+    ) -> Result<(DataType, Vec<usize>, Vec<u8>)> {
+        let (dtype, elem_shape) = match self.dtype {
+            Some(dtype) => (dtype, self.elem_shape.clone()),
+            None => empty_spec.ok_or_else(|| SessionError::ControlFlow {
+                op: "Scan".to_string(),
+                reason: format!(
+                    "cannot determine the element shape of scan output {output_index} for a \
+                     zero-iteration result"
+                ),
+            })?,
+        };
+        let output_rank = elem_shape.len() + 1;
+        let axis = normalize_axis(axis, output_rank).ok_or_else(|| SessionError::ControlFlow {
+            op: "Scan".to_string(),
+            reason: format!(
+                "scan_output_axes[{output_index}]={axis} is out of range for output rank \
+                 {output_rank}"
+            ),
+        })?;
+        if self.len == 0 {
+            let mut shape = elem_shape;
+            shape.insert(axis, 0);
+            return Ok((dtype, shape, Vec::new()));
+        }
+        if axis == 0 && direction == 0 {
+            let mut shape = Vec::with_capacity(output_rank);
+            shape.push(self.len);
+            shape.extend(elem_shape);
+            return Ok((dtype, shape, self.bytes));
+        }
+
+        let elem_numel = checked_numel(&elem_shape, || {
+            format!("Scan output {output_index} element")
+        })?;
+        let elem_bytes = checked_storage_bytes(
+            dtype,
+            elem_numel,
+            || format!("Scan output {output_index} element"),
+            &elem_shape,
+        )?;
+        let mut elements: Vec<&[u8]> = if elem_bytes == 0 {
+            (0..self.len).map(|_| &self.bytes[..]).collect()
+        } else {
+            self.bytes.chunks_exact(elem_bytes).collect()
+        };
+        if direction == 1 {
+            elements.reverse();
+        }
+        let (shape, bytes) = stack_new_axis(&elements, &elem_shape, axis, dtype.byte_size());
+        Ok((dtype, shape, bytes))
     }
 }
 

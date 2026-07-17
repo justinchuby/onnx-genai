@@ -97,8 +97,12 @@ fn register(parent: &mut Graph, node_id: NodeId, attr_key: &str, mut body: Graph
 }
 
 fn new_parent() -> Graph {
+    new_parent_at_opset(17)
+}
+
+fn new_parent_at_opset(opset: u64) -> Graph {
     let mut g = Graph::new();
-    g.opset_imports.insert(String::new(), 17);
+    g.opset_imports.insert(String::new(), opset);
     g
 }
 
@@ -660,52 +664,286 @@ fn loop_rejects_carried_shape_change_on_second_iteration() {
 
 // --- Scan -------------------------------------------------------------------
 
-/// Scan body: running-sum state plus per-step emission of the updated state.
-///
-/// `(state f32[D], x f32[D]) -> (state_out f32[D], scan_out f32[D])`
-fn scan_cumsum_body(d: usize) -> Graph {
+fn scan_sum_body(shape: &[usize]) -> Graph {
     let mut b = Graph::new();
-    let state = capture(&mut b, "state", DataType::Float32, &[d]);
-    let x = capture(&mut b, "x", DataType::Float32, &[d]);
+    let state = capture(&mut b, "state", DataType::Float32, shape);
+    let x = capture(&mut b, "x", DataType::Float32, shape);
     b.add_input(state);
     b.add_input(x);
-
-    let state_out =
-        op(&mut b, "Add", &[state, x], Some("state_out"), DataType::Float32, &[d], &[]);
-    let scan_out =
-        op(&mut b, "Identity", &[state_out], Some("scan_out"), DataType::Float32, &[d], &[]);
+    let state_out = op(
+        &mut b,
+        "Add",
+        &[state, x],
+        Some("state_out"),
+        DataType::Float32,
+        shape,
+        &[],
+    );
+    let scan_out = op(
+        &mut b,
+        "Identity",
+        &[state_out],
+        Some("scan_out"),
+        DataType::Float32,
+        shape,
+        &[],
+    );
     b.add_output(state_out);
     b.add_output(scan_out);
     b
 }
 
 #[test]
-fn scan_forward_axis0_threads_state_and_stacks_outputs() {
-    let (t, d) = (3usize, 2usize);
-    let mut g = new_parent();
-    let s0 = init(&mut g, "s0", DataType::Float32, &[d], f32_bytes(&[0.0, 0.0]));
-    let x = input(&mut g, "X", DataType::Float32, &[t, d]);
-    let s_final = g.create_named_value("s_final", DataType::Float32, static_shape([d]));
-    let y = g.create_named_value("Y", DataType::Float32, static_shape([t, d]));
+fn scan_cumulative_sum_supports_opsets_9_11_16() {
+    for opset in [9, 11, 16] {
+        let mut g = new_parent_at_opset(opset);
+        let s0 = init(&mut g, "s0", DataType::Float32, &[], f32_bytes(&[0.0]));
+        let x = input(&mut g, "X", DataType::Float32, &[4]);
+        let s_final = g.create_named_value("s_final", DataType::Float32, scalar());
+        let y = g.create_named_value("Y", DataType::Float32, static_shape([4]));
+        let node = control_flow_node(
+            &mut g,
+            "Scan",
+            vec![Some(s0), Some(x)],
+            vec![s_final, y],
+            &[("num_scan_inputs", Attribute::Int(1))],
+        );
+        register(&mut g, node, "body", scan_sum_body(&[]));
+        g.add_output(s_final);
+        g.add_output(y);
 
+        let mut session = InferenceSession::from_graph(g).expect("build session");
+        let x = Tensor::from_f32(&[4], &[1.0, 2.0, 3.0, 4.0]).unwrap();
+        let outputs = session.run(&[("X", &x)]).expect("run");
+        assert_eq!(outputs[0].to_vec_f32(), vec![10.0], "opset {opset}");
+        assert_eq!(outputs[1].to_vec_f32(), vec![1.0, 3.0, 6.0, 10.0]);
+        assert_eq!(session.control_flow_stats().subgraph_builds, 1);
+        assert_eq!(session.control_flow_stats().subgraph_runs, 4);
+    }
+}
+
+fn scan_two_input_body() -> Graph {
+    let mut b = Graph::new();
+    let state = capture(&mut b, "state", DataType::Float32, &[2]);
+    let x = capture(&mut b, "x", DataType::Float32, &[2]);
+    let y = capture(&mut b, "y", DataType::Float32, &[2]);
+    b.add_input(state);
+    b.add_input(x);
+    b.add_input(y);
+    let state_x =
+        op(&mut b, "Add", &[state, x], Some("state_x"), DataType::Float32, &[2], &[]);
+    let state_out =
+        op(&mut b, "Add", &[state_x, y], Some("state_out"), DataType::Float32, &[2], &[]);
+    let scan_out =
+        op(&mut b, "Identity", &[state_out], Some("scan_out"), DataType::Float32, &[2], &[]);
+    b.add_output(state_out);
+    b.add_output(scan_out);
+    b
+}
+
+#[test]
+fn scan_multiple_inputs_and_negative_axes() {
+    let mut g = new_parent_at_opset(16);
+    let s0 = init(
+        &mut g,
+        "s0",
+        DataType::Float32,
+        &[2],
+        f32_bytes(&[0.0, 0.0]),
+    );
+    let x = input(&mut g, "X", DataType::Float32, &[3, 2]);
+    let y = input(&mut g, "Y", DataType::Float32, &[2, 3]);
+    let s_final = g.create_named_value("s_final", DataType::Float32, static_shape([2]));
+    let z = g.create_named_value("Z", DataType::Float32, static_shape([3, 2]));
+    let node = control_flow_node(
+        &mut g,
+        "Scan",
+        vec![Some(s0), Some(x), Some(y)],
+        vec![s_final, z],
+        &[
+            ("num_scan_inputs", Attribute::Int(2)),
+            ("scan_input_axes", Attribute::Ints(vec![0, -1])),
+        ],
+    );
+    register(&mut g, node, "body", scan_two_input_body());
+    g.add_output(s_final);
+    g.add_output(z);
+
+    let mut session = InferenceSession::from_graph(g).expect("build session");
+    let x = Tensor::from_f32(&[3, 2], &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
+    let y = Tensor::from_f32(&[2, 3], &[10.0, 30.0, 50.0, 20.0, 40.0, 60.0]).unwrap();
+    let outputs = session.run(&[("X", &x), ("Y", &y)]).expect("run");
+    assert_eq!(outputs[0].to_vec_f32(), vec![99.0, 132.0]);
+    assert_eq!(
+        outputs[1].to_vec_f32(),
+        vec![11.0, 22.0, 44.0, 66.0, 99.0, 132.0]
+    );
+}
+
+#[test]
+fn scan_reverse_input_direction() {
+    let mut g = new_parent_at_opset(16);
+    let s0 = init(&mut g, "s0", DataType::Float32, &[], f32_bytes(&[0.0]));
+    let x = input(&mut g, "X", DataType::Float32, &[3]);
+    let s_final = g.create_named_value("s_final", DataType::Float32, scalar());
+    let y = g.create_named_value("Y", DataType::Float32, static_shape([3]));
     let node = control_flow_node(
         &mut g,
         "Scan",
         vec![Some(s0), Some(x)],
         vec![s_final, y],
-        &[("num_scan_inputs", Attribute::Int(1))],
+        &[
+            ("num_scan_inputs", Attribute::Int(1)),
+            ("scan_input_directions", Attribute::Ints(vec![1])),
+        ],
     );
-    register(&mut g, node, "body", scan_cumsum_body(d));
+    register(&mut g, node, "body", scan_sum_body(&[]));
     g.add_output(s_final);
     g.add_output(y);
 
     let mut session = InferenceSession::from_graph(g).expect("build session");
-    let x_t = Tensor::from_f32(&[t, d], &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
-    let outs = session.run(&[("X", &x_t)]).expect("run");
-    assert_eq!(outs.len(), 2);
-    // Running sums: [1,2] -> [4,6] -> [9,12].
-    assert_eq!(outs[0].to_vec_f32(), vec![9.0, 12.0]);
-    assert_eq!(outs[1].to_vec_f32(), vec![1.0, 2.0, 4.0, 6.0, 9.0, 12.0]);
-    assert_eq!(session.control_flow_stats().subgraph_builds, 1);
-    assert_eq!(session.control_flow_stats().subgraph_runs, t as u64);
+    let x = Tensor::from_f32(&[3], &[1.0, 2.0, 3.0]).unwrap();
+    let outputs = session.run(&[("X", &x)]).expect("run");
+    assert_eq!(outputs[0].to_vec_f32(), vec![6.0]);
+    assert_eq!(outputs[1].to_vec_f32(), vec![3.0, 5.0, 6.0]);
+}
+
+#[test]
+fn scan_stacks_output_on_nonzero_axis_in_reverse_direction() {
+    let mut g = new_parent_at_opset(16);
+    let s0 = init(
+        &mut g,
+        "s0",
+        DataType::Float32,
+        &[2],
+        f32_bytes(&[0.0, 0.0]),
+    );
+    let x = input(&mut g, "X", DataType::Float32, &[3, 2]);
+    let s_final = g.create_named_value("s_final", DataType::Float32, static_shape([2]));
+    let y = g.create_named_value("Y", DataType::Float32, static_shape([2, 3]));
+    let node = control_flow_node(
+        &mut g,
+        "Scan",
+        vec![Some(s0), Some(x)],
+        vec![s_final, y],
+        &[
+            ("num_scan_inputs", Attribute::Int(1)),
+            ("scan_output_axes", Attribute::Ints(vec![-1])),
+            ("scan_output_directions", Attribute::Ints(vec![1])),
+        ],
+    );
+    register(&mut g, node, "body", scan_sum_body(&[2]));
+    g.add_output(s_final);
+    g.add_output(y);
+
+    let mut session = InferenceSession::from_graph(g).expect("build session");
+    let x = Tensor::from_f32(&[3, 2], &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
+    let outputs = session.run(&[("X", &x)]).expect("run");
+    assert_eq!(outputs[0].to_vec_f32(), vec![9.0, 12.0]);
+    assert_eq!(outputs[1].shape, vec![2, 3]);
+    assert_eq!(outputs[1].to_vec_f32(), vec![9.0, 4.0, 1.0, 12.0, 6.0, 2.0]);
+}
+
+#[test]
+fn scan_zero_trip_preserves_state_and_builds_typed_empty_output() {
+    let mut g = new_parent_at_opset(16);
+    let s0 = init(
+        &mut g,
+        "s0",
+        DataType::Float32,
+        &[2],
+        f32_bytes(&[42.0, 7.0]),
+    );
+    let x = input(&mut g, "X", DataType::Float32, &[0, 2]);
+    let s_final = g.create_named_value("s_final", DataType::Float32, static_shape([2]));
+    let y = g.create_named_value("Y", DataType::Float32, static_shape([2, 0]));
+    let node = control_flow_node(
+        &mut g,
+        "Scan",
+        vec![Some(s0), Some(x)],
+        vec![s_final, y],
+        &[
+            ("num_scan_inputs", Attribute::Int(1)),
+            ("scan_output_axes", Attribute::Ints(vec![1])),
+        ],
+    );
+    register(&mut g, node, "body", scan_sum_body(&[2]));
+    g.add_output(s_final);
+    g.add_output(y);
+
+    let mut session = InferenceSession::from_graph(g).expect("build session");
+    let x = Tensor::from_f32(&[0, 2], &[]).unwrap();
+    let outputs = session.run(&[("X", &x)]).expect("run");
+    assert_eq!(outputs[0].to_vec_f32(), vec![42.0, 7.0]);
+    assert_eq!(outputs[1].dtype, DataType::Float32);
+    assert_eq!(outputs[1].shape, vec![2, 0]);
+    assert!(outputs[1].to_vec_f32().is_empty());
+    assert_eq!(session.control_flow_stats().subgraph_builds, 0);
+    assert_eq!(session.control_flow_stats().subgraph_runs, 0);
+}
+
+fn scan_shape_changing_body() -> Graph {
+    let mut b = Graph::new();
+    let state = capture(&mut b, "state", DataType::Float32, &[2]);
+    let end = capture(&mut b, "end", DataType::Int64, &[]);
+    b.add_input(state);
+    b.add_input(end);
+    let axes = init(&mut b, "axes", DataType::Int64, &[1], i64_bytes(&[0]));
+    let end_vec =
+        op(&mut b, "Unsqueeze", &[end, axes], Some("end_vec"), DataType::Int64, &[1], &[]);
+    let starts = init(&mut b, "starts", DataType::Int64, &[1], i64_bytes(&[0]));
+    let steps = init(&mut b, "steps", DataType::Int64, &[1], i64_bytes(&[1]));
+    let dynamic = b.intern_symbol("dynamic_state");
+    let state_out =
+        b.create_named_value("state_out", DataType::Float32, vec![Dim::Symbolic(dynamic)]);
+    b.insert_node(Node::new(
+        NodeId(0),
+        "Slice",
+        vec![
+            Some(state),
+            Some(starts),
+            Some(end_vec),
+            Some(axes),
+            Some(steps),
+        ],
+        vec![state_out],
+    ));
+    b.add_output(state_out);
+    b
+}
+
+#[test]
+fn scan_rejects_state_shape_change() {
+    let mut g = new_parent_at_opset(16);
+    let s0 = init(
+        &mut g,
+        "s0",
+        DataType::Float32,
+        &[2],
+        f32_bytes(&[7.0, 11.0]),
+    );
+    let ends = input(&mut g, "ends", DataType::Int64, &[2]);
+    let s_final = g.create_named_value("s_final", DataType::Float32, static_shape([2]));
+    let node = control_flow_node(
+        &mut g,
+        "Scan",
+        vec![Some(s0), Some(ends)],
+        vec![s_final],
+        &[("num_scan_inputs", Attribute::Int(1))],
+    );
+    register(&mut g, node, "body", scan_shape_changing_body());
+    g.add_output(s_final);
+
+    let mut session = InferenceSession::from_graph(g).expect("build session");
+    let ends = Tensor::from_i64(&[2], &[2, 1]).unwrap();
+    let err = session
+        .run(&[("ends", &ends)])
+        .expect_err("Scan must reject a state shape change");
+    assert!(
+        err.to_string().contains(
+            "control-flow op Scan: state output 0 shape mismatch: expected [2], got [1]"
+        ),
+        "unexpected error: {err}"
+    );
+    assert_eq!(session.control_flow_stats().subgraph_runs, 2);
 }
