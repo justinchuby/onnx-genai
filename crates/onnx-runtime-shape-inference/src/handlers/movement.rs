@@ -375,6 +375,14 @@ pub fn concat(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
                             detail: "concat-axis extent sum overflowed".into(),
                         }
                     })?;
+                    if sum > isize::MAX as i128 {
+                        return Err(ShapeInferError::Invalid {
+                            op: "Concat".into(),
+                            detail: format!(
+                                "known concat-axis extent sum {sum} exceeds isize::MAX"
+                            ),
+                        });
+                    }
                 } else {
                     all_known = false;
                 }

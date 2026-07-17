@@ -255,10 +255,26 @@ pub fn pad(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
 
     let mut out = x;
     for (i, axis) in axes.into_iter().enumerate() {
-        let total_pad = i128::from(pads[i]) + i128::from(pads[pads.len() / 2 + i]);
+        let total_pad = i128::from(pads[i])
+            .checked_add(i128::from(pads[pads.len() / 2 + i]))
+            .ok_or_else(|| ShapeInferError::Invalid {
+                op: "Pad".into(),
+                detail: "total padding arithmetic overflowed".into(),
+            })?;
+        if total_pad > isize::MAX as i128 {
+            return Err(ShapeInferError::Invalid {
+                op: "Pad".into(),
+                detail: format!("total padding {total_pad} exceeds isize::MAX"),
+            });
+        }
         out[axis] = match out[axis].as_const() {
             Some(extent) => {
-                let output_extent = i128::from(extent) + total_pad;
+                let output_extent = i128::from(extent).checked_add(total_pad).ok_or_else(|| {
+                    ShapeInferError::Invalid {
+                        op: "Pad".into(),
+                        detail: "output extent arithmetic overflowed".into(),
+                    }
+                })?;
                 if !(0..=isize::MAX as i128).contains(&output_extent) {
                     return Err(ShapeInferError::Invalid {
                         op: "Pad".into(),

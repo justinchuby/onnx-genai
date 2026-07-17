@@ -1449,6 +1449,32 @@ fn concat_rejects_axis_sum_beyond_isize_max() {
     );
 }
 
+#[test]
+fn concat_symbolic_axis_rejects_overflowing_known_partial_and_stays_unresolved_normally() {
+    let n = with_attr(node("Concat", 3, 1), "axis", Attribute::Int(0));
+    let error = try_run(
+        &n,
+        vec![
+            f32in(vec![c(isize::MAX as i64)]),
+            f32in(vec![sym(0)]),
+            f32in(vec![c(1)]),
+        ],
+        13,
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("exceeds isize::MAX"));
+
+    let outs = run(
+        &n,
+        vec![f32in(vec![c(2)]), f32in(vec![sym(0)]), f32in(vec![c(3)])],
+        13,
+    );
+    let shape = out_shape(&outs);
+    let axis = &shape[0];
+    assert!(axis.as_const().is_none());
+    assert!(axis.as_symbol().is_some());
+}
+
 // --- Shape / Size ---------------------------------------------------------
 
 #[test]
@@ -2211,6 +2237,27 @@ fn pad_rejects_extent_beyond_isize_max() {
         )
         .is_err()
     );
+}
+
+#[test]
+fn pad_symbolic_extent_rejects_guaranteed_overflow_and_stays_symbolic_normally() {
+    let n = node("Pad", 2, 1);
+    let error = try_run(
+        &n,
+        vec![
+            f32in(vec![sym(0)]),
+            sd_vec(vec![c(isize::MAX as i64), c(1)]),
+        ],
+        25,
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("exceeds isize::MAX"));
+
+    let outs = run(&n, vec![f32in(vec![sym(0)]), sd_vec(vec![c(1), c(1)])], 25);
+    let shape = out_shape(&outs);
+    let extent = &shape[0];
+    assert!(extent.as_const().is_none());
+    assert!(extent.as_symbol().is_some());
 }
 
 // --- unregistered op is permissive ---------------------------------------
