@@ -165,6 +165,13 @@ pub fn reshape(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
         });
     }
     if let Some(idx) = neg1 {
+        if product.as_const() == Some(0) {
+            return Err(ShapeInferError::Invalid {
+                op: "Reshape".into(),
+                detail: "cannot infer -1 dimension when the remaining target product is zero"
+                    .into(),
+            });
+        }
         out[idx] = match total.checked_div(&product) {
             Some(inferred) => inferred,
             None if total.is_const() && product.is_const() => {
@@ -1092,12 +1099,16 @@ pub fn split(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
         detail: format!("axis {axis} is outside [-{rank}, {rank})"),
     })?;
     let n_out = ctx.num_outputs();
-    let num_outputs = ctx
-        .node
-        .attr("num_outputs")
-        .and_then(Attribute::as_int)
-        .and_then(|n| usize::try_from(n).ok())
-        .filter(|&n| n > 0);
+    let raw_num_outputs = ctx.node.attr("num_outputs").and_then(Attribute::as_int);
+    if let Some(n) = raw_num_outputs
+        && n <= 0
+    {
+        return Err(ShapeInferError::Invalid {
+            op: "Split".into(),
+            detail: format!("num_outputs must be positive, got {n}"),
+        });
+    }
+    let num_outputs = raw_num_outputs.and_then(|n| usize::try_from(n).ok());
 
     let sizes: Option<Vec<i64>> = ctx
         .node

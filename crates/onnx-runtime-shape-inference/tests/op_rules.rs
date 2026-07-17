@@ -16,6 +16,18 @@ fn c(n: i64) -> DimExpr {
     DimExpr::constant(n)
 }
 
+fn assert_invalid(error: ShapeInferError, op: &str, expected_detail: &str) {
+    assert!(
+        matches!(
+            &error,
+            ShapeInferError::Invalid { op: actual_op, detail }
+                if actual_op == op && detail.contains(expected_detail)
+        ),
+        "expected Invalid {op:?} error containing {expected_detail:?}, got {error:?}"
+    );
+    assert!(error.to_string().contains(expected_detail));
+}
+
 #[test]
 fn constant_variants_and_constant_of_shape_static_validation() {
     let int = run(
@@ -1350,41 +1362,59 @@ fn reshape_rejects_multiple_inferred_dimensions_and_product_mismatches() {
     let n = node("Reshape", 2, 1);
 
     // ONNX permits at most one -1 in the target shape.
-    assert!(
+    assert_invalid(
         try_run(
             &n,
             vec![f32in(vec![c(2), c(3)]), sd_vec(vec![c(-1), c(-1)])],
             13,
         )
-        .is_err()
+        .unwrap_err(),
+        "Reshape",
+        "at most one dimension may be -1",
     );
 
     // A fully concrete target must preserve the element count.
-    assert!(try_run(&n, vec![f32in(vec![c(2), c(3)]), sd_vec(vec![c(4)])], 13,).is_err());
+    assert_invalid(
+        try_run(&n, vec![f32in(vec![c(2), c(3)]), sd_vec(vec![c(4)])], 13).unwrap_err(),
+        "Reshape",
+        "input element count 6 does not match target element count 4",
+    );
 }
 
 #[test]
 fn reshape_validates_static_target_values_without_guessing_dynamic_targets() {
     let n = node("Reshape", 2, 1);
-    assert!(try_run(&n, vec![f32in(vec![c(2), c(3)]), sd_vec(vec![c(-2)])], 13).is_err());
-    assert!(
+    assert_invalid(
+        try_run(&n, vec![f32in(vec![c(2), c(3)]), sd_vec(vec![c(-2)])], 13).unwrap_err(),
+        "Reshape",
+        "target dimension -2 is invalid",
+    );
+    assert_invalid(
         try_run(
             &n,
             vec![f32in(vec![c(2), c(3)]), sd_vec(vec![c(-1), c(4)])],
-            13
+            13,
         )
-        .is_err()
+        .unwrap_err(),
+        "Reshape",
+        "input element count is not divisible",
     );
-    assert!(try_run(&n, vec![f32in(vec![c(2)]), sd_vec(vec![c(0), c(0)])], 13).is_err());
+    assert_invalid(
+        try_run(&n, vec![f32in(vec![c(2)]), sd_vec(vec![c(0), c(0)])], 13).unwrap_err(),
+        "Reshape",
+        "0 at target index 1 has no corresponding input dimension",
+    );
 
     let allowzero = with_attr(node("Reshape", 2, 1), "allowzero", Attribute::Int(1));
-    assert!(
+    assert_invalid(
         try_run(
             &allowzero,
             vec![f32in(vec![c(0)]), sd_vec(vec![c(0), c(-1)])],
             14,
         )
-        .is_err()
+        .unwrap_err(),
+        "Reshape",
+        "allowzero=1 does not permit 0 and -1",
     );
     let zero = run(&allowzero, vec![f32in(vec![c(0)]), sd_vec(vec![c(0)])], 14);
     assert_eq!(out_shape(&zero), vec![c(0)]);
@@ -1395,6 +1425,21 @@ fn reshape_validates_static_target_values_without_guessing_dynamic_targets() {
         13,
     );
     assert!(dynamic[0].type_info.is_none());
+}
+
+#[test]
+fn reshape_rejects_indeterminate_minus_one_with_zero_product() {
+    let error = try_run(
+        &node("Reshape", 2, 1),
+        vec![f32in(vec![c(0), c(3)]), sd_vec(vec![c(0), c(-1)])],
+        13,
+    )
+    .unwrap_err();
+    assert_invalid(
+        error,
+        "Reshape",
+        "cannot infer -1 dimension when the remaining target product is zero",
+    );
 }
 
 #[test]
@@ -2793,24 +2838,45 @@ fn split_input_sizes_are_uneven_and_must_match_outputs_and_axis_extent() {
     assert_eq!(out_shape(&outs), vec![c(3), c(2)]);
     assert_eq!(outs[1].type_info.as_ref().unwrap().shape, vec![c(3), c(5)]);
 
-    assert!(
+    assert_invalid(
         try_run(
             &n,
             vec![f32in(vec![c(3), c(7)]), sd_vec(vec![c(2), c(4)])],
             18,
         )
-        .is_err()
+        .unwrap_err(),
+        "Split",
+        "split sizes sum to 6, but axis extent is 7",
     );
 
     let both = with_attr(n.clone(), "num_outputs", Attribute::Int(2));
-    assert!(
+    assert_invalid(
         try_run(
             &both,
             vec![f32in(vec![c(3), c(7)]), sd_vec(vec![c(2), c(5)])],
             18,
         )
-        .is_err()
+        .unwrap_err(),
+        "Split",
+        "split input and num_outputs cannot both be specified",
     );
+}
+
+#[test]
+fn split_rejects_non_positive_num_outputs() {
+    for num_outputs in [0, -1] {
+        let n = with_attr(
+            node("Split", 1, 2),
+            "num_outputs",
+            Attribute::Int(num_outputs),
+        );
+        let error = try_run(&n, vec![f32in(vec![c(2), c(8)])], 18).unwrap_err();
+        assert_invalid(
+            error,
+            "Split",
+            &format!("num_outputs must be positive, got {num_outputs}"),
+        );
+    }
 }
 
 #[test]
