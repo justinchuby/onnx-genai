@@ -36,6 +36,38 @@ fn if_graph(then_branch: Graph, else_branch: Graph) -> (Graph, ValueId) {
     (graph, output)
 }
 
+fn if_graph_with_output_count(
+    then_branch: Graph,
+    else_branch: Graph,
+    output_count: usize,
+) -> (Graph, Vec<ValueId>) {
+    let mut graph = Graph::new();
+    let condition = graph.create_named_value("condition", DataType::Bool, Shape::new());
+    graph.add_input(condition);
+    let outputs: Vec<_> = (0..output_count)
+        .map(|index| {
+            let output = graph.create_named_value(
+                format!("output_{index}"),
+                DataType::Float32,
+                Shape::new(),
+            );
+            graph.mark_value_type_unknown(output);
+            graph.mark_value_shape_unknown(output);
+            graph.add_output(output);
+            output
+        })
+        .collect();
+    let if_node = graph.insert_node(node(0, "If", vec![Some(condition)], outputs.clone()));
+    graph
+        .subgraphs
+        .insert((if_node, "then_branch".into()), then_branch);
+    graph
+        .subgraphs
+        .insert((if_node, "else_branch".into()), else_branch);
+    graph.opset_imports.insert(String::new(), 21);
+    (graph, outputs)
+}
+
 fn captured_identity_branch(name: &str) -> Graph {
     let mut branch = Graph::new();
     let capture = branch.create_named_value(name, DataType::Float32, Shape::new());
@@ -54,6 +86,27 @@ fn identity_branch(shape: Shape) -> Graph {
     let output = branch.create_named_value("branch_output", DataType::Float32, Shape::new());
     branch.insert_node(node(0, "Identity", vec![Some(input)], vec![output]));
     branch.add_output(output);
+    branch
+}
+
+fn identity_branch_outputs(shapes: Vec<Shape>) -> Graph {
+    let mut branch = Graph::new();
+    for (index, shape) in shapes.into_iter().enumerate() {
+        let input = branch.create_named_value(format!("local_{index}"), DataType::Float32, shape);
+        branch.add_input(input);
+        let output = branch.create_named_value(
+            format!("branch_output_{index}"),
+            DataType::Float32,
+            Shape::new(),
+        );
+        branch.insert_node(node(
+            index as u32,
+            "Identity",
+            vec![Some(input)],
+            vec![output],
+        ));
+        branch.add_output(output);
+    }
     branch
 }
 
@@ -176,6 +229,46 @@ fn if_equal_concrete_branch_dims_stay_concrete() {
         .expect("infer If with equal concrete dimensions");
 
     assert_eq!(graph.value(output).shape, vec![Dim::Static(7)]);
+}
+
+#[test]
+fn if_fewer_declared_outputs_infers_paired_outputs_and_ignores_branch_extras() {
+    let (mut graph, outputs) = if_graph_with_output_count(
+        identity_branch_outputs(vec![vec![Dim::Static(7)], vec![Dim::Static(2)]]),
+        identity_branch_outputs(vec![
+            vec![Dim::Static(7)],
+            vec![Dim::Static(2), Dim::Static(3)],
+        ]),
+        1,
+    );
+
+    let registry = InferenceRegistry::default_registry();
+    let opsets = graph.opset_imports.clone();
+    registry
+        .infer_graph(&mut graph, &opsets, MergePolicy::Permissive)
+        .expect("extra branch outputs must be ignored");
+
+    assert_eq!(graph.value(outputs[0]).shape, vec![Dim::Static(7)]);
+}
+
+#[test]
+fn if_more_declared_outputs_leaves_unpaired_outputs_unresolved() {
+    let (mut graph, outputs) = if_graph_with_output_count(
+        identity_branch_outputs(vec![vec![Dim::Static(7)]]),
+        identity_branch_outputs(vec![vec![Dim::Static(7)], vec![Dim::Static(9)]]),
+        3,
+    );
+
+    let registry = InferenceRegistry::default_registry();
+    let opsets = graph.opset_imports.clone();
+    let report = registry
+        .infer_graph(&mut graph, &opsets, MergePolicy::Permissive)
+        .expect("missing branch outputs must leave node outputs unresolved");
+
+    assert_eq!(graph.value(outputs[0]).shape, vec![Dim::Static(7)]);
+    assert!(report.resolved.contains(&outputs[0]));
+    assert!(report.unresolved.contains(&outputs[1]));
+    assert!(report.unresolved.contains(&outputs[2]));
 }
 
 #[test]

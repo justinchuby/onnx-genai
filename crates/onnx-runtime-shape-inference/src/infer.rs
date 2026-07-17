@@ -195,29 +195,18 @@ fn infer_if_outputs(
     let then_resolved: HashSet<_> = then_result.report.resolved.iter().copied().collect();
     let else_resolved: HashSet<_> = else_result.report.resolved.iter().copied().collect();
 
-    if then_branch.outputs.len() != else_branch.outputs.len() {
-        return Err(ShapeInferError::Invalid {
-            op: "If".to_string(),
-            detail: format!(
-                "then_branch and else_branch produce different numbers of outputs: {} != {}",
-                then_branch.outputs.len(),
-                else_branch.outputs.len()
-            ),
-        });
-    }
-    if then_branch.outputs.len() != node.outputs.len() {
-        return Err(ShapeInferError::Invalid {
-            op: "If".to_string(),
-            detail: format!(
-                "node has {} outputs but its branches produce {}",
-                node.outputs.len(),
-                then_branch.outputs.len()
-            ),
-        });
-    }
-
+    let paired_outputs = node
+        .outputs
+        .len()
+        .min(then_branch.outputs.len())
+        .min(else_branch.outputs.len());
     let mut outputs = Vec::with_capacity(node.outputs.len());
-    for (&then_id, &else_id) in then_branch.outputs.iter().zip(&else_branch.outputs) {
+    for (&then_id, &else_id) in then_branch
+        .outputs
+        .iter()
+        .zip(&else_branch.outputs)
+        .take(paired_outputs)
+    {
         if !branch_output_is_resolved(then_branch, then_id, &then_resolved)
             || !branch_output_is_resolved(else_branch, else_id, &else_resolved)
         {
@@ -282,6 +271,7 @@ fn infer_if_outputs(
             .collect();
         outputs.push(NodeIo::typed(TypeInfo::new(then_value.dtype, shape)));
     }
+    outputs.resize_with(node.outputs.len(), NodeIo::default);
 
     Ok(Some(outputs))
 }
