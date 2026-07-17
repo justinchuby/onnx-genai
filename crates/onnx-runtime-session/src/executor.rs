@@ -43,7 +43,7 @@
 //! refuses to dispatch on failure. That check is the sole thing that makes
 //! ep-cpu's unchecked pointer derefs sound.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -790,14 +790,41 @@ fn validate_cuda_only_coverage(graph: &Graph, ep: &dyn ExecutionProvider) -> Res
         return Ok(());
     }
 
-    const MAX_REPORTED: usize = 8;
-    let omitted = issues.len().saturating_sub(MAX_REPORTED);
-    issues.truncate(MAX_REPORTED);
-    let mut unsupported_nodes = issues.join("; ");
-    if omitted != 0 {
-        unsupported_nodes.push_str(&format!("; and {omitted} more unsupported node(s)"));
-    }
+    let unsupported_nodes = format_cuda_coverage_issues(issues);
     Err(SessionError::HeterogeneousPlacementRequired { unsupported_nodes })
+}
+
+struct CudaCoverageIssue {
+    domain: String,
+    op_type: String,
+    reason: String,
+    node_identity: String,
+}
+
+fn format_cuda_coverage_issues(issues: Vec<CudaCoverageIssue>) -> String {
+    const MAX_EXAMPLES_PER_CLASS: usize = 3;
+
+    let mut groups: BTreeMap<(String, String, String), Vec<String>> = BTreeMap::new();
+    for issue in issues {
+        groups
+            .entry((issue.domain, issue.op_type, issue.reason))
+            .or_default()
+            .push(issue.node_identity);
+    }
+
+    groups
+        .into_iter()
+        .map(|((domain, op_type, reason), mut nodes)| {
+            nodes.sort();
+            let count = nodes.len();
+            nodes.truncate(MAX_EXAMPLES_PER_CLASS);
+            format!(
+                "{domain}::{op_type}: {reason} [count={count}; examples: {}]",
+                nodes.join(", ")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 fn collect_cuda_coverage_issues(
@@ -805,7 +832,7 @@ fn collect_cuda_coverage_issues(
     opset_graph: &Graph,
     ep: &dyn ExecutionProvider,
     scope: &str,
-    issues: &mut Vec<String>,
+    issues: &mut Vec<CudaCoverageIssue>,
 ) {
     for (node_id, node) in graph.nodes.iter() {
         if onnx_runtime_loader::is_ep_context_op(&node.op_type, &node.domain)
@@ -838,10 +865,12 @@ fn collect_cuda_coverage_issues(
         if let KernelMatch::Unsupported { reason } =
             ep.supports_op(node, opset, &shapes, &layouts)
         {
-            issues.push(format!(
-                "{}: {reason}",
-                format_node_identity(scope, node_id, node)
-            ));
+            issues.push(CudaCoverageIssue {
+                domain: canonical_domain(node),
+                op_type: node.op_type.clone(),
+                reason: reason.into_owned(),
+                node_identity: format_node_identity(scope, node_id, node),
+            });
             continue;
         }
 
@@ -853,10 +882,12 @@ fn collect_cuda_coverage_issues(
             continue;
         };
         if let Err(error) = ep.get_kernel(node, &concrete_shapes, opset) {
-            issues.push(format!(
-                "{}: kernel creation failed: {error}",
-                format_node_identity(scope, node_id, node)
-            ));
+            issues.push(CudaCoverageIssue {
+                domain: canonical_domain(node),
+                op_type: node.op_type.clone(),
+                reason: format!("kernel creation failed: {error}"),
+                node_identity: format_node_identity(scope, node_id, node),
+            });
         }
     }
 
@@ -866,18 +897,20 @@ fn collect_cuda_coverage_issues(
     }
 }
 
+fn canonical_domain(node: &Node) -> String {
+    if node.domain.is_empty() {
+        "ai.onnx".to_string()
+    } else {
+        node.domain.clone()
+    }
+}
+
 fn format_node_identity(scope: &str, node_id: NodeId, node: &Node) -> String {
-    let domain = if node.domain.is_empty() {
-        "ai.onnx"
+    if node.name.is_empty() {
+        format!("{scope}/node#{}", node_id.0)
     } else {
-        node.domain.as_str()
-    };
-    let name = if node.name.is_empty() {
-        format!("#{}", node_id.0)
-    } else {
-        format!("{:?}", node.name)
-    };
-    format!("{scope} {name} ({domain}::{})", node.op_type)
+        format!("{scope}/node#{} {:?}", node_id.0, node.name)
+    }
 }
 
 fn build_lazy_weight_handles(
@@ -4462,7 +4495,7 @@ mod tests {
         fn supports_op(
             &self,
             op: &Node,
-            _opset: u64,
+            opset: u64,
             _shapes: &[Shape],
             _layouts: &[TensorLayout],
         ) -> KernelMatch {
@@ -4475,7 +4508,11 @@ mod tests {
                     output_layouts: vec![TensorLayout::contiguous()],
                 }
             } else {
-                KernelMatch::unsupported("weight-delivery mock EP only handles BlockQuantizedMoE and Identity")
+                KernelMatch::unsupported(format!(
+                    "no handler for {}::{} at opset {opset} — test EP intentionally declines this op",
+                    canonical_domain(op),
+                    op.op_type
+                ))
             }
         }
 
@@ -4747,13 +4784,96 @@ mod tests {
         collect_cuda_coverage_issues(&graph, &graph, &ep, "graph", &mut issues);
 
         assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].op_type, "NotRegistered");
+        assert_eq!(issues[0].domain, "ai.onnx");
         assert!(
-            issues[0].contains("NotRegistered")
-                && issues[0].contains("no handler for ai.onnx::NotRegistered at opset 17"),
-            "{}",
             issues[0]
+                .reason
+                .contains("no handler for ai.onnx::NotRegistered at opset 17"),
+            "{}",
+            issues[0].reason
         );
-        assert!(!issues[0].contains("unsupported by"), "{}", issues[0]);
+        assert!(
+            !issues[0].reason.contains("unsupported by"),
+            "{}",
+            issues[0].reason
+        );
+    }
+
+    #[test]
+    fn cuda_coverage_report_groups_all_distinct_failure_classes_deterministically() {
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 17);
+        let input = graph.create_named_value("x", DataType::Float32, vec![Dim::Static(1)]);
+
+        let op_types = [
+            "RepeatedMissing",
+            "Missing08",
+            "RepeatedMissing",
+            "Missing07",
+            "Missing06",
+            "RepeatedMissing",
+            "Missing05",
+            "Missing04",
+            "Missing03",
+            "Missing02",
+            "Missing01",
+            "Missing00",
+            "RepeatedMissing",
+        ];
+        for (index, op_type) in op_types.into_iter().enumerate() {
+            let output = graph.create_named_value(
+                format!("output_{index}"),
+                DataType::Float32,
+                vec![Dim::Static(1)],
+            );
+            graph.insert_node(Node::new(
+                NodeId(index as u32),
+                op_type,
+                vec![Some(input)],
+                vec![output],
+            ));
+        }
+
+        let ep = WeightDeliveryEp::with_device(
+            false,
+            Arc::new(std::sync::Mutex::new(Vec::new())),
+            onnx_runtime_ir::DeviceId::cuda(0),
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+        );
+        let report = || validate_cuda_only_coverage(&graph, &ep).unwrap_err().to_string();
+        let first = report();
+        let second = report();
+
+        assert_eq!(first, second);
+        assert_eq!(first.matches("ai.onnx::RepeatedMissing:").count(), 1);
+        assert!(first.contains("ai.onnx::RepeatedMissing: no handler"));
+        assert!(first.contains("[count=4; examples: graph/node#0, graph/node#12, graph/node#2]"));
+        assert!(!first.contains("graph/node#5"));
+
+        for op_type in [
+            "Missing00",
+            "Missing01",
+            "Missing02",
+            "Missing03",
+            "Missing04",
+            "Missing05",
+            "Missing06",
+            "Missing07",
+            "Missing08",
+        ] {
+            assert_eq!(
+                first.matches(&format!("ai.onnx::{op_type}:")).count(),
+                1,
+                "{first}"
+            );
+            assert!(
+                first.contains(&format!("ai.onnx::{op_type}: no handler")),
+                "{first}"
+            );
+        }
+        assert!(!first.contains("more unsupported node"));
     }
 
     #[test]
