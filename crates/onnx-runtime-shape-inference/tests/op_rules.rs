@@ -1587,6 +1587,56 @@ fn squeeze_v13_axes_input() {
     assert_eq!(out_shape(&outs), vec![c(8)]);
 }
 
+#[test]
+fn squeeze_static_axes_reject_invalid_dims_and_leave_dynamic_dims_unresolved() {
+    let axes_input = node("Squeeze", 2, 1);
+    let err = try_run(
+        &axes_input,
+        vec![f32in(vec![c(1), c(8)]), sd_vec(vec![c(2)])],
+        13,
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("axis 2 is out of range for rank 2"));
+
+    let err = try_run(
+        &axes_input,
+        vec![f32in(vec![c(1), c(8)]), sd_vec(vec![c(1)])],
+        13,
+    )
+    .unwrap_err();
+    assert!(err
+        .to_string()
+        .contains("cannot squeeze axis 1 with non-singleton extent 8"));
+
+    let outs = run(
+        &axes_input,
+        vec![f32in(vec![c(1), c(8)]), sd_vec(vec![c(0)])],
+        13,
+    );
+    assert_eq!(out_shape(&outs), vec![c(8)]);
+
+    let dynamic_extent = run(
+        &axes_input,
+        vec![f32in(vec![sym(0), c(8)]), sd_vec(vec![c(0)])],
+        13,
+    );
+    assert!(dynamic_extent[0].type_info.is_none());
+
+    let dynamic_axes = run(
+        &axes_input,
+        vec![f32in(vec![c(1), c(8)]), tin(DataType::Int64, vec![sym(0)])],
+        13,
+    );
+    assert!(dynamic_axes[0].type_info.is_none());
+}
+
+#[test]
+fn squeeze_v11_rejects_duplicate_static_axes() {
+    let n = with_attr(node("Squeeze", 1, 1), "axes", Attribute::Ints(vec![0, 0]));
+    let err = try_run(&n, vec![f32in(vec![c(1), c(8)])], 11).unwrap_err();
+    assert!(err.to_string().contains("axis 0 is specified more than once"));
+}
+
 // --- Slice ----------------------------------------------------------------
 
 #[test]

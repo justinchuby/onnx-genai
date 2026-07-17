@@ -197,7 +197,31 @@ fn squeeze_common(
     let rank = t.rank();
     let out: Vec<DimExpr> = match axes {
         Some(axes) => {
-            let norm: Vec<usize> = axes.iter().map(|&a| norm_axis(a, rank)).collect();
+            let mut norm = Vec::with_capacity(axes.len());
+            for axis in axes {
+                let axis = checked_axis(axis, rank).ok_or_else(|| ShapeInferError::Invalid {
+                    op: ctx.op().into(),
+                    detail: format!("axis {axis} is out of range for rank {rank}"),
+                })?;
+                if norm.contains(&axis) {
+                    return Err(ShapeInferError::Invalid {
+                        op: ctx.op().into(),
+                        detail: format!("axis {axis} is specified more than once"),
+                    });
+                }
+                match t.shape[axis].as_const() {
+                    Some(1) => norm.push(axis),
+                    Some(extent) => {
+                        return Err(ShapeInferError::Invalid {
+                            op: ctx.op().into(),
+                            detail: format!(
+                                "cannot squeeze axis {axis} with non-singleton extent {extent}"
+                            ),
+                        });
+                    }
+                    None => return Ok(()),
+                }
+            }
             t.shape
                 .iter()
                 .enumerate()
@@ -205,13 +229,18 @@ fn squeeze_common(
                 .map(|(_, d)| d.clone())
                 .collect()
         }
-        // No axes: drop every statically-size-1 dim.
-        None => t
-            .shape
-            .iter()
-            .filter(|d| d.as_const() != Some(1))
-            .cloned()
-            .collect(),
+        // Without axes, a dynamic extent might be 1 at runtime, so no output
+        // shape can be inferred.
+        None => {
+            if t.shape.iter().any(|d| d.as_const().is_none()) {
+                return Ok(());
+            }
+            t.shape
+                .iter()
+                .filter(|d| d.as_const() != Some(1))
+                .cloned()
+                .collect()
+        }
     };
     // Squeeze on a shape-data vector (drops nothing structurally for a 1-D
     // shape vector, but keep the data flowing for downstream ops).
