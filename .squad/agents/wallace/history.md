@@ -51,3 +51,7 @@
 ## 2026-07-14T00:00:00Z — Custom-op domain rename
 
 - Landed the repository-wide serialized custom-operator domain rename to `pkg.nxrt`; all runtime producers, consumers, tests, fixtures, scripts, and docs are aligned.
+
+## 2026-07-17 — TopK coverage finding
+
+- Added coverage exposing that TopK rank-3 `axis=3` was clamped into a valid-looking result; the follow-up handler fix and review landed in `cb30ced`.
