@@ -1,0 +1,18 @@
+coverage:
+  status:
+    project:
+      default:
+        informational: true
+    patch:
+      default:
+        informational: true
+
+comment:
+  layout: "reach, diff, flags, tree"
+
+ignore:
+  - "**/tests/**"
+  - "**/build.rs"
+  - "target/**"
+  - "crates/onnx-genai-ort/ort-sys/**"
+  - "**/*_generated.rs"

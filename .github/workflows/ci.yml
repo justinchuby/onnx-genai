@@ -80,6 +80,49 @@ jobs:
           -p onnx-runtime-session
           -p onnx-runtime-tracer
 
+  coverage:
+    name: Rust coverage
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TERM_COLOR: always
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Collect Rust coverage
+        run: >-
+          cargo llvm-cov --locked --codecov --output-path codecov.json
+          -p onnx-runtime-ir
+          -p onnx-runtime-ep-api
+          -p onnx-runtime-ep-cpu
+          -p onnx-runtime-loader
+          -p onnx-runtime-session
+          -p onnx-runtime-tracer
+          -p onnx-rs
+          -p onnx-runtime-shape-inference
+          -p onnx-runtime-optimizer
+          -p onnx-runtime-quantization
+          -p onnx-runtime-memory
+          -p onnx-runtime-cpuinfo
+          -p onnx-genai-genai-config
+          -p onnx-genai-metadata
+          -p onnx-genai-runtime-config
+
+      - name: Upload coverage to Codecov
+        if: always()
+        uses: codecov/codecov-action@v4
+        with:
+          files: codecov.json
+          fail_ci_if_error: false
+          token: ${{ secrets.CODECOV_TOKEN }}
+
   cuda-compile:
     name: CUDA compile (${{ matrix.name }})
     strategy:
