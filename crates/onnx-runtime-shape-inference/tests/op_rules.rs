@@ -647,6 +647,28 @@ fn relu_passthrough() {
 }
 
 #[test]
+fn round3_math_schemas_have_shape_rules() {
+    let binary_inputs = vec![
+        f32in(vec![sym(0), c(1), c(64)]),
+        f32in(vec![c(8), c(64)]),
+    ];
+    for op in ["Sub", "Div", "Mod"] {
+        let outs = run(&node(op, 2, 1), binary_inputs.clone(), 14);
+        assert_eq!(out_shape(&outs), vec![sym(0), c(8), c(64)], "{op}");
+        assert_eq!(out_dtype(&outs), DataType::Float32, "{op}");
+    }
+    for op in ["Neg", "Abs"] {
+        let outs = run(
+            &node(op, 1, 1),
+            vec![tin(DataType::Int32, vec![sym(0), c(64)])],
+            13,
+        );
+        assert_eq!(out_shape(&outs), vec![sym(0), c(64)], "{op}");
+        assert_eq!(out_dtype(&outs), DataType::Int32, "{op}");
+    }
+}
+
+#[test]
 fn acos_passthrough() {
     let n = node("Acos", 1, 1);
     let outs = run(&n, vec![f32in(vec![sym(0), c(8), c(768)])], 7);

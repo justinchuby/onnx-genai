@@ -346,6 +346,8 @@ const BUILTIN_YAML: &[&str] = &[
     include_str!("../../schemas/standard/matmul.yaml"),
     include_str!("../../schemas/standard/gemm.yaml"),
     include_str!("../../schemas/standard/add.yaml"),
+    include_str!("../../schemas/standard/sub.yaml"),
+    include_str!("../../schemas/standard/div.yaml"),
     include_str!("../../schemas/standard/relu.yaml"),
     include_str!("../../schemas/standard/conv.yaml"),
     include_str!("../../schemas/standard/mul.yaml"),
@@ -377,6 +379,9 @@ const BUILTIN_YAML: &[&str] = &[
     include_str!("../../schemas/standard/where.yaml"),
     include_str!("../../schemas/standard/reduce_sum.yaml"),
     include_str!("../../schemas/standard/reduce_mean.yaml"),
+    include_str!("../../schemas/standard/neg.yaml"),
+    include_str!("../../schemas/standard/abs.yaml"),
+    include_str!("../../schemas/standard/mod.yaml"),
 ];
 
 // FOLLOW-UP §7.4: complete the standard and ONNX-ML YAML catalogues.
@@ -571,6 +576,8 @@ type_constraints:
             "MatMul",
             "Gemm",
             "Add",
+            "Sub",
+            "Div",
             "Relu",
             "Conv",
             "Mul",
@@ -595,6 +602,9 @@ type_constraints:
             "Where",
             "ReduceSum",
             "ReduceMean",
+            "Neg",
+            "Abs",
+            "Mod",
         ] {
             assert!(registry.lookup(name, "", 24).is_some(), "{name}");
         }
@@ -773,6 +783,11 @@ type_constraints:
     common_schema_test!(where_schema_matches_opset_16, "Where", 16, 3, 1);
     common_schema_test!(reduce_sum_schema_matches_opset_13, "ReduceSum", 13, 2, 1);
     common_schema_test!(reduce_mean_schema_matches_opset_18, "ReduceMean", 18, 2, 1);
+    common_schema_test!(sub_schema_matches_opset_14, "Sub", 14, 2, 1);
+    common_schema_test!(div_schema_matches_opset_14, "Div", 14, 2, 1);
+    common_schema_test!(neg_schema_matches_opset_13, "Neg", 13, 1, 1);
+    common_schema_test!(abs_schema_matches_opset_13, "Abs", 13, 1, 1);
+    common_schema_test!(mod_schema_matches_opset_13, "Mod", 13, 2, 1);
 
     #[test]
     fn added_schema_details_match_onnx_v1_20() {
@@ -803,5 +818,25 @@ type_constraints:
             assert_eq!(reduce.attributes[1].default, Some(AttributeDefault::Int(0)));
             assert_eq!(reduce.type_constraints[0].allowed.len(), 8);
         }
+
+        for name in ["Sub", "Div", "Abs", "Mod"] {
+            assert_eq!(
+                registry.lookup(name, "", 25).unwrap().type_constraints[0]
+                    .allowed
+                    .len(),
+                12,
+                "{name}"
+            );
+        }
+        assert_eq!(
+            registry.lookup("Neg", "", 25).unwrap().type_constraints[0]
+                .allowed
+                .len(),
+            8
+        );
+        assert_eq!(
+            registry.lookup("Mod", "", 25).unwrap().attributes[0].default,
+            Some(AttributeDefault::Int(0))
+        );
     }
 }

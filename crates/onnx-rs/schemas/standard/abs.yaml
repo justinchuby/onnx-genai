@@ -1,0 +1,10 @@
+domain: ""
+name: Abs
+since_version: 13
+doc: Element-wise absolute value.
+inputs:
+  - { name: X, type_str: T }
+outputs:
+  - { name: Y, type_str: T }
+type_constraints:
+  - { type_param: T, allowed: [float16, float32, float64, bfloat16, int8, int16, int32, int64, uint8, uint16, uint32, uint64] }
