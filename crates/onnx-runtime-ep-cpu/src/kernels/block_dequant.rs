@@ -104,6 +104,62 @@ pub(crate) fn dequantize_fp4_e2m1_block(
     Ok(())
 }
 
+pub(crate) fn quantize_fp4_e2m1_block(
+    input: &[f32],
+    scale_exponent: &mut u8,
+    packed: &mut [u8],
+    output: &mut [f32],
+) -> Result<()> {
+    require_block_lengths(
+        "FP4 E2M1",
+        packed,
+        FP4_E2M1_PACKED_BYTES,
+        output,
+        FP4_E2M1_BLOCK_SIZE,
+    )?;
+    if input.len() != FP4_E2M1_BLOCK_SIZE {
+        return Err(error(format!(
+            "FP4 E2M1 block must consume {FP4_E2M1_BLOCK_SIZE} values, got {}",
+            input.len()
+        )));
+    }
+    let mut amax = 6.0 * 2.0f32.powi(-126);
+    for &value in input {
+        if !value.is_finite() {
+            return Err(error("FP4 E2M1 input contains a non-finite value"));
+        }
+        amax = amax.max(value.abs());
+    }
+    let scale_power = (amax / 6.0).log2().ceil() as i32;
+    let exponent = scale_power
+        .checked_add(127)
+        .filter(|&value| (1..=254).contains(&value))
+        .ok_or_else(|| error("FP4 E2M1 E8M0 scale exponent is out of range"))?;
+    *scale_exponent = exponent as u8;
+    let scale = 2.0f32.powi(scale_power);
+    for (pair, destination) in input.chunks_exact(2).zip(packed.iter_mut()) {
+        let low = encode_e2m1((pair[0] / scale).clamp(-6.0, 6.0));
+        let high = encode_e2m1((pair[1] / scale).clamp(-6.0, 6.0));
+        *destination = low | (high << 4);
+    }
+    dequantize_fp4_e2m1_block(*scale_exponent, packed, output)
+}
+
+fn encode_e2m1(value: f32) -> u8 {
+    let mut best_code = 0u8;
+    let mut best_distance = f32::INFINITY;
+    for code in 0u8..16 {
+        let distance = (value - decode_e2m1(code)).abs();
+        if distance < best_distance
+            || (distance == best_distance && code & 1 == 0 && best_code & 1 != 0)
+        {
+            best_code = code;
+            best_distance = distance;
+        }
+    }
+    best_code
+}
+
 fn encode_e4m3fn(value: f32) -> u8 {
     let sign = if value.is_sign_negative() { 0x80 } else { 0 };
     let magnitude = value.abs();
