@@ -1,0 +1,288 @@
+//! CUDA conformance tests for router/mask indexing and scan operators.
+
+use onnx_runtime_ep_api::{
+    DeviceBuffer, DevicePtr, DevicePtrMut, ExecutionProvider, TensorMut, TensorView,
+};
+use onnx_runtime_ep_cuda::CudaExecutionProvider;
+use onnx_runtime_ep_cuda::runtime::cuptr;
+use onnx_runtime_ir::{
+    Attribute, DataType, Graph, Node, NodeId, compute_contiguous_strides, static_shape,
+};
+use onnx_runtime_loader::Model;
+
+struct Tensor {
+    dtype: DataType,
+    shape: Vec<usize>,
+    bytes: Vec<u8>,
+}
+
+fn raw<T: Copy>(values: &[T]) -> Vec<u8> {
+    unsafe {
+        std::slice::from_raw_parts(values.as_ptr().cast(), std::mem::size_of_val(values)).to_vec()
+    }
+}
+
+fn tensor<T: Copy>(dtype: DataType, shape: &[usize], values: &[T]) -> Tensor {
+    Tensor {
+        dtype,
+        shape: shape.to_vec(),
+        bytes: raw(values),
+    }
+}
+
+fn run(
+    op: &str,
+    opset: u64,
+    inputs: &[Tensor],
+    outputs: &[(DataType, Vec<usize>)],
+    attrs: &[(&str, Attribute)],
+) -> Vec<Vec<u8>> {
+    let ep = CudaExecutionProvider::new_default().expect("CUDA runtime must be available");
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), opset);
+    let input_values = inputs
+        .iter()
+        .enumerate()
+        .map(|(i, input)| {
+            let value = graph.create_named_value(
+                &format!("input_{i}"),
+                input.dtype,
+                static_shape(input.shape.iter().copied()),
+            );
+            graph.add_input(value);
+            value
+        })
+        .collect::<Vec<_>>();
+    let output_values = outputs
+        .iter()
+        .enumerate()
+        .map(|(i, (dtype, shape))| {
+            graph.create_named_value(
+                &format!("output_{i}"),
+                *dtype,
+                static_shape(shape.iter().copied()),
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut node = Node::new(
+        NodeId(0),
+        op,
+        input_values.into_iter().map(Some).collect(),
+        output_values.clone(),
+    );
+    for (name, value) in attrs {
+        node.attributes.insert((*name).into(), value.clone());
+    }
+    let node_id = graph.insert_node(node);
+    for output in output_values {
+        graph.add_output(output);
+    }
+    let model = Model::new(&graph);
+    let kernel = ep
+        .get_kernel(model.graph.node(node_id), &[], opset)
+        .unwrap();
+
+    let input_buffers = inputs
+        .iter()
+        .map(|input| {
+            let buffer = ep.allocate(input.bytes.len(), 256).unwrap();
+            if !input.bytes.is_empty() {
+                unsafe {
+                    ep.runtime()
+                        .htod(&input.bytes, cuptr(buffer.as_ptr()))
+                        .unwrap()
+                };
+            }
+            buffer
+        })
+        .collect::<Vec<_>>();
+    let input_strides = inputs
+        .iter()
+        .map(|input| compute_contiguous_strides(&input.shape))
+        .collect::<Vec<_>>();
+    let input_views = inputs
+        .iter()
+        .zip(&input_buffers)
+        .zip(&input_strides)
+        .map(|((input, buffer), strides)| {
+            TensorView::new(
+                DevicePtr(buffer.as_ptr()),
+                input.dtype,
+                &input.shape,
+                strides,
+                ep.device_id(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut output_buffers = outputs
+        .iter()
+        .map(|(dtype, shape)| {
+            ep.allocate(dtype.storage_bytes(shape.iter().product()), 256)
+                .unwrap()
+        })
+        .collect::<Vec<DeviceBuffer>>();
+    let output_strides = outputs
+        .iter()
+        .map(|(_, shape)| compute_contiguous_strides(shape))
+        .collect::<Vec<_>>();
+    let mut output_views = outputs
+        .iter()
+        .zip(output_buffers.iter_mut())
+        .zip(&output_strides)
+        .map(|(((dtype, shape), buffer), strides)| {
+            TensorMut::new(
+                DevicePtrMut(buffer.as_mut_ptr()),
+                *dtype,
+                shape,
+                strides,
+                ep.device_id(),
+            )
+        })
+        .collect::<Vec<_>>();
+    kernel.execute(&input_views, &mut output_views).unwrap();
+
+    let result = outputs
+        .iter()
+        .zip(&output_buffers)
+        .map(|((dtype, shape), buffer)| {
+            let mut bytes = vec![0; dtype.storage_bytes(shape.iter().product())];
+            if !bytes.is_empty() {
+                unsafe {
+                    ep.runtime()
+                        .dtoh(&mut bytes, cuptr(buffer.as_ptr()))
+                        .unwrap()
+                };
+            }
+            bytes
+        })
+        .collect();
+    for buffer in input_buffers {
+        ep.deallocate(buffer).unwrap();
+    }
+    for buffer in output_buffers {
+        ep.deallocate(buffer).unwrap();
+    }
+    result
+}
+fn f32s(bytes: &[u8]) -> Vec<f32> {
+    bytes
+        .chunks_exact(4)
+        .map(|v| f32::from_ne_bytes(v.try_into().unwrap()))
+        .collect()
+}
+
+fn attention_reference(q: &[f32], k: &[f32], v: &[f32], mask: &[u8]) -> Vec<f32> {
+    // [B=1,Hq=2,S=2,D=2], [B=1,Hkv=1,S=2,D=2], causal; mask is [1,1,S,S].
+    let mut result = vec![0.0; 8];
+    let scale = 1.0 / 2.0_f32.sqrt();
+    for h in 0..2 {
+        for i in 0..2 {
+            let mut scores = [f32::NEG_INFINITY; 2];
+            for j in 0..2 {
+                if j <= i && mask[i * 2 + j] != 0 {
+                    scores[j] = (0..2)
+                        .map(|d| q[(h * 2 + i) * 2 + d] * k[j * 2 + d])
+                        .sum::<f32>()
+                        * scale;
+                }
+            }
+            let max = scores.into_iter().fold(f32::NEG_INFINITY, f32::max);
+            let exp = scores.map(|x| if x.is_finite() { (x - max).exp() } else { 0.0 });
+            let sum: f32 = exp.iter().sum();
+            for d in 0..2 {
+                result[(h * 2 + i) * 2 + d] = (0..2).map(|j| exp[j] / sum * v[j * 2 + d]).sum();
+            }
+        }
+    }
+    result
+}
+
+fn assert_close(got: &[f32], expected: &[f32]) {
+    assert_eq!(got.len(), expected.len());
+    for (i, (&g, &e)) in got.iter().zip(expected).enumerate() {
+        assert!((g - e).abs() <= 1e-4, "element {i}: {g} vs {e}");
+    }
+}
+
+#[test]
+fn standard_attention_prefill_gqa_bool_mask_is_deterministic() {
+    let inputs = [
+        tensor(
+            DataType::Float32,
+            &[1, 2, 2, 2],
+            &[1_f32, 0., 0., 1., 1., 1., 2., -1.],
+        ),
+        tensor(DataType::Float32, &[1, 1, 2, 2], &[1_f32, 2., 3., 4.]),
+        tensor(DataType::Float32, &[1, 1, 2, 2], &[10_f32, 20., 30., 40.]),
+        tensor(DataType::Bool, &[1, 1, 2, 2], &[1_u8, 1, 1, 0]),
+    ];
+    let attrs = [
+        ("is_causal", Attribute::Int(1)),
+        ("q_num_heads", Attribute::Int(2)),
+        ("kv_num_heads", Attribute::Int(1)),
+    ];
+    let once = run(
+        "Attention",
+        23,
+        &inputs,
+        &[(DataType::Float32, vec![1, 2, 2, 2])],
+        &attrs,
+    );
+    let twice = run(
+        "Attention",
+        23,
+        &inputs,
+        &[(DataType::Float32, vec![1, 2, 2, 2])],
+        &attrs,
+    );
+    assert_eq!(
+        once, twice,
+        "standard Attention must be byte-identical across runs"
+    );
+    assert_close(
+        &f32s(&once[0]),
+        &attention_reference(
+            &[1_f32, 0., 0., 1., 1., 1., 2., -1.],
+            &[1_f32, 2., 3., 4.],
+            &[10_f32, 20., 30., 40.],
+            &[1, 1, 1, 0],
+        ),
+    );
+}
+
+#[test]
+fn rotary_embedding_interleaved_partial_position_ids_is_deterministic() {
+    let inputs = [
+        tensor(
+            DataType::Float32,
+            &[1, 1, 2, 4],
+            &[1_f32, 2., 3., 4., 5., 6., 7., 8.],
+        ),
+        tensor(DataType::Float32, &[2, 1], &[1_f32, 0.]),
+        tensor(DataType::Float32, &[2, 1], &[0_f32, 1.]),
+        tensor(DataType::Int64, &[1, 2], &[0_i64, 1]),
+    ];
+    let attrs = [
+        ("interleaved", Attribute::Int(1)),
+        ("rotary_embedding_dim", Attribute::Int(2)),
+    ];
+    let once = run(
+        "RotaryEmbedding",
+        23,
+        &inputs,
+        &[(DataType::Float32, vec![1, 1, 2, 4])],
+        &attrs,
+    );
+    let twice = run(
+        "RotaryEmbedding",
+        23,
+        &inputs,
+        &[(DataType::Float32, vec![1, 1, 2, 4])],
+        &attrs,
+    );
+    assert_eq!(
+        once, twice,
+        "RotaryEmbedding must be byte-identical across runs"
+    );
+    assert_close(&f32s(&once[0]), &[1_f32, 2., 3., 4., -6., 5., 7., 8.]);
+}

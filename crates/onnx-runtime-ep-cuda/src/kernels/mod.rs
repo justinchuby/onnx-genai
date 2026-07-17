@@ -44,8 +44,10 @@ pub mod qmoe;
 mod qmoe_gemm;
 mod qmoe_grouping;
 pub mod reduce;
+pub mod rotary_embedding;
 pub mod shape;
 pub mod softmax;
+pub mod standard_attention;
 pub mod topk;
 pub mod where_op;
 
@@ -115,6 +117,7 @@ pub const CUDA_COVERED_OPS: &[&str] = &[
     "Max",
     "Attention",
     "GroupQueryAttention",
+    "RotaryEmbedding",
     "Softmax",
     "LayerNormalization",
     "SkipLayerNormalization",
@@ -416,6 +419,21 @@ pub fn build_cuda_registry(runtime: Arc<CudaRuntime>) -> OpRegistry {
             runtime: runtime.clone(),
         }),
     );
+    for opset in [23, 24] {
+        reg.register(
+            OpKey::new("Attention", "", opset),
+            Box::new(standard_attention::StandardAttentionFactory {
+                runtime: runtime.clone(),
+                since_version: opset as u32,
+            }),
+        );
+    }
+    reg.register(
+        OpKey::new("RotaryEmbedding", "", 23),
+        Box::new(rotary_embedding::RotaryEmbeddingFactory {
+            runtime: runtime.clone(),
+        }),
+    );
     reg.register(
         OpKey::new("GroupQueryAttention", "com.microsoft", 1),
         Box::new(group_query_attention::GroupQueryAttentionFactory {
@@ -618,7 +636,7 @@ mod tests {
 
     #[test]
     fn covered_ops_have_no_duplicates() {
-        assert_eq!(CUDA_COVERED_OPS.len(), 82);
+        assert_eq!(CUDA_COVERED_OPS.len(), 83);
 
         let mut seen = std::collections::HashSet::new();
         for op in CUDA_COVERED_OPS {
@@ -721,6 +739,16 @@ mod tests {
     #[test]
     fn fused_epilogue_ops_are_listed_in_coverage() {
         for op in ["FusedMatMulBias", "FusedGemm"] {
+            assert!(
+                CUDA_COVERED_OPS.contains(&op),
+                "{op} missing from CUDA_COVERED_OPS"
+            );
+        }
+    }
+
+    #[test]
+    fn standard_attention_and_rope_are_listed_in_coverage() {
+        for op in ["Attention", "RotaryEmbedding"] {
             assert!(
                 CUDA_COVERED_OPS.contains(&op),
                 "{op} missing from CUDA_COVERED_OPS"

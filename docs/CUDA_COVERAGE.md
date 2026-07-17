@@ -120,6 +120,8 @@ not yet wired) · **🔬 custom** (needs a fused NVRTC/CUTLASS kernel).
 | Op | Domain | Status | Backend | Notes |
 |----|--------|--------|---------|-------|
 | `Attention` | `com.microsoft` | ✅ | **cuBLAS GEMM + NVRTC softmax** | SDPA/GQA baseline (`attention.rs`); §13.3 binding. |
+| `Attention` (opset 23/24) | `` | ✅ | **deterministic CUDA EP fallback** | Standard ONNX SDPA with 3D/4D layouts, GQA, bool/additive masks, and in-op KV cache. f32. |
+| `RotaryEmbedding` (opset 23) | `` | ✅ | **deterministic CUDA EP fallback** | f32 interleaved/non-interleaved RoPE, partial rotary dimensions, and optional position-id gathering. |
 | `FusedAttention` | `com.microsoft` | 🔬 | **cuDNN SDPA / FlashAttention-3** | Fused flash-attention behind the same binding — the top perf item. |
 
 ### Shape / data-movement / misc
