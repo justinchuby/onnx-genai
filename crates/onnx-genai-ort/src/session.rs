@@ -1125,45 +1125,67 @@ fn append_plugin_execution_provider(
     }
     let before = before_counts;
 
-    env.register_execution_provider_library(registration_name, plugin_path)?;
+    let newly_registered =
+        env.register_execution_provider_library(registration_name, plugin_path)?;
 
     // After registration, group the environment's EP devices by provider name.
-    // The plugin's provider is the one whose device count grew (its name is
-    // discovered here, never hardcoded). Selecting devices that all share this
-    // single provider name satisfies ORT's requirement that every device passed
-    // to `SessionOptionsAppendExecutionProvider_V2` belongs to the same EP.
     let after: Vec<(*const onnx_genai_ort_sys::OrtEpDevice, String)> = query_devices()?
         .into_iter()
         .filter_map(|device| name_of(device).map(|name| (device, name)))
         .collect();
-    let mut after_counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
-    for (_, name) in &after {
-        *after_counts.entry(name.as_str()).or_insert(0) += 1;
-    }
-    let mut new_names: Vec<&str> = after_counts
-        .iter()
-        .filter(|(name, count)| **count > before.get(**name).copied().unwrap_or(0))
-        .map(|(name, _)| *name)
-        .collect();
-    new_names.sort_unstable();
 
-    // A plugin may expose several provider groupings (e.g. OpenVINO registers
-    // both `OpenVINOExecutionProvider` and virtual `OpenVINOExecutionProvider.AUTO`
-    // devices). ORT requires every device appended in one call to share a single
-    // EP, so choose one provider group deterministically: prefer the base
-    // provider name (no `.` suffix) over virtual variants, else the first sorted.
-    let target_name = new_names
-        .iter()
-        .find(|name| !name.contains('.'))
-        .or_else(|| new_names.first())
-        .map(|name| (*name).to_owned());
-    let target_name = match target_name {
-        Some(name) => name,
-        None => {
-            return Err(OrtError::InvalidArgument(format!(
-                "execution provider plugin '{registration_name}' registered from {} but contributed no new execution-provider devices",
-                plugin_path.display()
-            )));
+    // Determine the plugin's provider name.
+    //
+    // On the first registration for this handle, the provider is discovered by
+    // the before/after device diff: the name whose device count grew (never
+    // hardcoded). When the library was already registered on this shared
+    // environment (e.g. a second session such as a speculative-decode draft),
+    // the diff is empty because the devices were already present, so we reuse
+    // the provider name discovered on the first registration instead.
+    let target_name = if newly_registered {
+        let mut after_counts: std::collections::HashMap<&str, usize> =
+            std::collections::HashMap::new();
+        for (_, name) in &after {
+            *after_counts.entry(name.as_str()).or_insert(0) += 1;
+        }
+        let mut new_names: Vec<&str> = after_counts
+            .iter()
+            .filter(|(name, count)| **count > before.get(**name).copied().unwrap_or(0))
+            .map(|(name, _)| *name)
+            .collect();
+        new_names.sort_unstable();
+
+        // A plugin may expose several provider groupings (e.g. OpenVINO registers
+        // both `OpenVINOExecutionProvider` and virtual `OpenVINOExecutionProvider.AUTO`
+        // devices). ORT requires every device appended in one call to share a single
+        // EP, so choose one provider group deterministically: prefer the base
+        // provider name (no `.` suffix) over virtual variants, else the first sorted.
+        let discovered = new_names
+            .iter()
+            .find(|name| !name.contains('.'))
+            .or_else(|| new_names.first())
+            .map(|name| (*name).to_owned());
+        match discovered {
+            Some(name) => {
+                env.cache_plugin_provider(registration_name, &name);
+                name
+            }
+            None => {
+                return Err(OrtError::InvalidArgument(format!(
+                    "execution provider plugin '{registration_name}' registered from {} but contributed no new execution-provider devices",
+                    plugin_path.display()
+                )));
+            }
+        }
+    } else {
+        match env.cached_plugin_provider(registration_name) {
+            Some(name) => name,
+            None => {
+                return Err(OrtError::InvalidArgument(format!(
+                    "execution provider plugin '{registration_name}' (from {}) was already registered but its provider name is unknown",
+                    plugin_path.display()
+                )));
+            }
         }
     };
 
@@ -1190,28 +1212,35 @@ fn append_plugin_execution_provider(
     // enum, never a provider-specific device string.
     if let Some(requested) = device_class {
         if let Some(wanted) = parse_hardware_device_type(requested) {
-            if let (Some(ep_device_device), Some(hw_type)) =
-                (api.EpDevice_Device, api.HardwareDevice_Type)
-            {
-                let matching: Vec<*const onnx_genai_ort_sys::OrtEpDevice> = selected
-                    .iter()
-                    .copied()
-                    .filter(|device| {
-                        // SAFETY: `device` is owned by the live environment; the
-                        // returned hardware handle is owned by ORT.
-                        let hw = unsafe { ep_device_device(*device) };
-                        !hw.is_null() && unsafe { hw_type(hw) } == wanted
-                    })
-                    .collect();
-                if matching.is_empty() {
-                    return Err(OrtError::InvalidArgument(format!(
-                        "execution provider plugin '{registration_name}' exposes no {requested} device; \
-                         unset ONNX_GENAI_EP_DEVICE or choose an available hardware class"
-                    )));
+            match (api.EpDevice_Device, api.HardwareDevice_Type) {
+                (Some(ep_device_device), Some(hw_type)) => {
+                    let matching: Vec<*const onnx_genai_ort_sys::OrtEpDevice> = selected
+                        .iter()
+                        .copied()
+                        .filter(|device| {
+                            // SAFETY: `device` is owned by the live environment; the
+                            // returned hardware handle is owned by ORT.
+                            let hw = unsafe { ep_device_device(*device) };
+                            !hw.is_null() && unsafe { hw_type(hw) } == wanted
+                        })
+                        .collect();
+                    if matching.is_empty() {
+                        return Err(OrtError::InvalidArgument(format!(
+                            "execution provider plugin '{registration_name}' exposes no {requested} device; \
+                             unset ONNX_GENAI_EP_DEVICE or choose an available hardware class"
+                        )));
+                    }
+                    // Keep a single device so the plugin cannot silently fall back to
+                    // a different one.
+                    selected = vec![matching[0]];
                 }
-                // Keep a single device so the plugin cannot silently fall back to
-                // a different one.
-                selected = vec![matching[0]];
+                _ => {
+                    // The request cannot be honoured without device introspection;
+                    // fail loudly rather than silently running on an arbitrary device.
+                    return Err(OrtError::ApiUnavailable(
+                        "EpDevice_Device/HardwareDevice_Type (required for ONNX_GENAI_EP_DEVICE selection)",
+                    ));
+                }
             }
         } else {
             tracing::warn!(
