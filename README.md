@@ -28,8 +28,10 @@ A Rust inference runtime for generative AI models, built on ONNX Runtime.
 - **Pipelines and models:** metadata-declared multi-model pipelines, a tested
   tiny vision-language pipeline fixture, and real Qwen2.5-0.5B-Instruct and
   TinyStories generation built through Mobius.
-- **Execution providers:** select CPU, WebGPU, or CoreML with
-  `ONNX_GENAI_EP`; unavailable providers warn and fall back to CPU.
+- **Execution providers:** select CPU, WebGPU, CUDA, CoreML, or any ORT plugin
+  EP with `ONNX_GENAI_EP` — a comma-separated priority list is supported so
+  several providers (including multiple plugins) can be composed; unavailable
+  providers warn and fall back to CPU.
 - **Extensibility:** public `Sampler`, `SpeculativeProposer`, logit processor
   registry, and KV/pipeline APIs, plus an internal `DecodeBackend` seam shared
   by dynamic and static-cache decoding.
@@ -191,6 +193,27 @@ ONNX_GENAI_EP_OPTIONS=num_streams=2 \
   options passed straight through.
 - `ONNX_GENAI_EP_NAME` (optional): registration handle; defaults to the library
   file name.
+
+#### Multiple execution providers (priority list)
+
+`ONNX_GENAI_EP` accepts a comma-separated **priority list** — ORT tries each
+entry in order and falls back to later entries for nodes it cannot claim. Each
+entry is a built-in (`cpu`, `webgpu`, `cuda`, `metal`, `coreml`), the bare
+`plugin` token (configured through the scalar `ONNX_GENAI_EP_*` variables
+above), or an **inline plugin** that carries its own library and options so
+several distinct plugins can be composed at once:
+
+```bash
+# CUDA first, then two different plugins, then CPU as a final fallback.
+ONNX_GENAI_EP='cuda,plugin:/path/openvino_plugin.dll|device=GPU|opt.num_streams=2,plugin:/path/other_ep.so,cpu' \
+  ./target/release/onnx-genai-server --model models/qwen2.5-0.5b
+```
+
+Inline plugin syntax: `plugin:<library>[|name=<handle>][|device=<CPU|GPU|NPU>][|opt.<key>=<value>]...`.
+No provider name is ever hardcoded — each plugin's concrete provider is still
+discovered from the library at load time. Distinct plugins that share the same
+library file name should each set an explicit `name=` to avoid a registration
+handle collision.
 
 ## Security
 

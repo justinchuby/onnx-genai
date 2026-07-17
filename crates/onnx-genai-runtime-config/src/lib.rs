@@ -32,6 +32,44 @@ pub enum ExecutionProvider {
     Unsupported(String),
 }
 
+/// A single execution-provider plugin fully described inline in the
+/// `ONNX_GENAI_EP` priority list (e.g. `plugin:/path/ep.so|device=GPU`).
+///
+/// Unlike the bare `plugin` token (which is configured through the scalar
+/// `ONNX_GENAI_EP_LIBRARY`/`_NAME`/`_OPTIONS`/`_DEVICE` variables and can only
+/// appear once), an inline plugin carries its own library, registration name,
+/// options, and device class, so several distinct plugins can be composed in
+/// one `ONNX_GENAI_EP` list. Nothing here is provider-specific: the concrete
+/// provider name is still discovered from the plugin at load time.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PluginSpec {
+    /// Path to the ORT execution-provider plugin shared library.
+    pub library: PathBuf,
+    /// Optional registration handle passed to ORT's
+    /// `RegisterExecutionProviderLibrary`. Only an opaque handle; it does NOT
+    /// need to match the provider's internal name. Defaults to one derived from
+    /// the library file name when unset.
+    pub registration_name: Option<String>,
+    /// Provider-specific options passed straight through to ORT.
+    pub options: Vec<(String, String)>,
+    /// Optional hardware device class (`CPU`, `GPU`, `NPU`) used to narrow a
+    /// plugin that exposes several devices down to one.
+    pub device: Option<String>,
+}
+
+/// One entry in the `ONNX_GENAI_EP` execution-provider priority list.
+///
+/// The list is ordered by descending priority: ORT tries the first entry's
+/// provider first, then falls back to later entries for nodes it cannot claim.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ExecutionProviderEntry {
+    /// A built-in provider or the bare `plugin` token (configured through the
+    /// scalar `ONNX_GENAI_EP_*` variables).
+    Builtin(ExecutionProvider),
+    /// A plugin fully described inline in the list.
+    Plugin(PluginSpec),
+}
+
 /// Parsed `ONNX_GENAI_CUDA_DEVICE` value.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CudaDevice {
@@ -55,8 +93,13 @@ pub enum IntraOpThreads {
 /// Complete registry of ONNX GenAI library-internal runtime knobs.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RuntimeConfig {
-    /// `ONNX_GENAI_EP` (`ExecutionProvider`, default: unset): overrides the ORT execution provider.
-    pub execution_provider: Option<ExecutionProvider>,
+    /// `ONNX_GENAI_EP` (`Vec<ExecutionProviderEntry>`, default: empty): the
+    /// ordered execution-provider priority list. Parsed from a comma-separated
+    /// list of tokens (built-ins such as `cuda`/`webgpu`, the bare `plugin`
+    /// token, and/or inline `plugin:<path>|attr=..` plugins). Multiple plugins
+    /// and built-ins can be composed; ORT tries them in order. Empty means no
+    /// override (auto-detect).
+    pub execution_providers: Vec<ExecutionProviderEntry>,
     /// `ONNX_GENAI_CUDA_DEVICE` (`CudaDevice`, default: device 0): selects the CUDA device.
     pub cuda_device: CudaDevice,
     /// `ONNX_GENAI_INTRA_OP_THREADS` (`IntraOpThreads`, default: unset): overrides ORT intra-op threads when positive.
@@ -150,8 +193,9 @@ impl RuntimeConfig {
     where
         F: Fn(&str) -> Option<OsString>,
     {
-        let execution_provider =
-            env_string(&lookup, "ONNX_GENAI_EP").map(|value| parse_execution_provider(&value));
+        let execution_providers = env_string(&lookup, "ONNX_GENAI_EP")
+            .map(|value| parse_execution_provider_list(&value))
+            .unwrap_or_default();
         let cuda_device = match env_string(&lookup, "ONNX_GENAI_CUDA_DEVICE") {
             Some(value) => value
                 .trim()
@@ -171,7 +215,7 @@ impl RuntimeConfig {
         };
 
         Self {
-            execution_provider,
+            execution_providers,
             cuda_device,
             intra_op_threads,
             webgpu_validation: env_bool(&lookup, "ONNX_GENAI_WEBGPU_VALIDATION", false),
@@ -283,6 +327,94 @@ fn parse_execution_provider(value: &str) -> ExecutionProvider {
     }
 }
 
+/// Parse the `ONNX_GENAI_EP` value into an ordered execution-provider priority
+/// list.
+///
+/// Tokens are comma-separated and tried in order. Each token is one of:
+/// * a built-in provider name (`cpu`, `webgpu`, `cuda`, `metal`, `coreml`),
+/// * the bare `plugin` token (configured through the scalar `ONNX_GENAI_EP_*`
+///   variables — kept for backward compatibility, may appear once), or
+/// * an inline plugin `plugin:<library>[|name=<n>][|device=<class>][|opt.<k>=<v>]...`.
+///
+/// Empty tokens are skipped; if the whole value has no usable token (e.g. an
+/// explicit empty string) the list falls back to a single CPU entry, matching
+/// the historical single-value behavior. Nothing here hardcodes a plugin's
+/// provider name — inline plugins only carry a library path and passthrough
+/// options; the concrete provider is discovered at load time.
+fn parse_execution_provider_list(value: &str) -> Vec<ExecutionProviderEntry> {
+    let mut entries: Vec<ExecutionProviderEntry> = value
+        .split(',')
+        .map(|token| token.trim())
+        .filter(|token| !token.is_empty())
+        .map(parse_execution_provider_entry)
+        .collect();
+    if entries.is_empty() {
+        entries.push(ExecutionProviderEntry::Builtin(ExecutionProvider::Cpu));
+    }
+    entries
+}
+
+fn parse_execution_provider_entry(token: &str) -> ExecutionProviderEntry {
+    // Detect an inline plugin (`plugin:<...>`) case-insensitively on the scheme
+    // only, so the library path itself keeps its original case (important on
+    // case-sensitive filesystems and for Windows drive letters).
+    if let Some((scheme, rest)) = token.split_once(':') {
+        if scheme.trim().eq_ignore_ascii_case("plugin") {
+            return ExecutionProviderEntry::Plugin(parse_inline_plugin_spec(rest));
+        }
+    }
+    ExecutionProviderEntry::Builtin(parse_execution_provider(token))
+}
+
+/// Parse the portion of an inline plugin token after `plugin:`.
+///
+/// Layout: `<library>[|name=<n>][|device=<class>][|opt.<k>=<v>]...`. The first
+/// `|`-separated segment is the library path; later segments are `key=value`
+/// attributes: `name`, `device`, or `opt.<option-key>` (the option key keeps
+/// its original case and is passed straight through to ORT). Unknown attribute
+/// keys are ignored.
+fn parse_inline_plugin_spec(rest: &str) -> PluginSpec {
+    let mut segments = rest.split('|');
+    let library = segments.next().unwrap_or("").trim();
+    let mut registration_name = None;
+    let mut device = None;
+    let mut options = Vec::new();
+    for attr in segments {
+        let attr = attr.trim();
+        if attr.is_empty() {
+            continue;
+        }
+        let Some((key, val)) = attr.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        let val = val.trim();
+        let key_lc = key.to_ascii_lowercase();
+        if key_lc == "name" {
+            if !val.is_empty() {
+                registration_name = Some(val.to_owned());
+            }
+        } else if key_lc == "device" {
+            if !val.is_empty() {
+                device = Some(val.to_owned());
+            }
+        } else if let Some(option_key) = key_lc
+            .starts_with("opt.")
+            .then(|| key[4..].trim())
+        {
+            if !option_key.is_empty() {
+                options.push((option_key.to_owned(), val.to_owned()));
+            }
+        }
+    }
+    PluginSpec {
+        library: PathBuf::from(library),
+        registration_name,
+        options,
+        device,
+    }
+}
+
 /// Parse a `key=value,key=value` list into ordered pairs.
 ///
 /// Whitespace around keys, values, and separators is trimmed. Entries without
@@ -308,7 +440,10 @@ mod tests {
     use std::collections::HashMap;
     use std::path::PathBuf;
 
-    use super::{CudaDevice, ExecutionProvider, IntraOpThreads, RuntimeConfig};
+    use super::{
+        CudaDevice, ExecutionProvider, ExecutionProviderEntry, IntraOpThreads, PluginSpec,
+        RuntimeConfig,
+    };
 
     fn config(entries: &[(&str, &str)]) -> RuntimeConfig {
         let values: HashMap<&str, &str> = entries.iter().copied().collect();
@@ -318,7 +453,7 @@ mod tests {
     #[test]
     fn every_flag_has_its_existing_default() {
         let actual = config(&[]);
-        assert_eq!(actual.execution_provider, None);
+        assert_eq!(actual.execution_providers, Vec::new());
         assert_eq!(actual.cuda_device, CudaDevice::Id(0));
         assert_eq!(actual.intra_op_threads, IntraOpThreads::Unset);
         assert!(!actual.webgpu_validation);
@@ -404,10 +539,67 @@ mod tests {
         ];
         for (value, expected) in cases {
             assert_eq!(
-                config(&[("ONNX_GENAI_EP", value)]).execution_provider,
-                Some(expected)
+                config(&[("ONNX_GENAI_EP", value)]).execution_providers,
+                vec![ExecutionProviderEntry::Builtin(expected)]
             );
         }
+    }
+
+    #[test]
+    fn execution_provider_list_parses_ordered_priority_entries() {
+        let actual = config(&[("ONNX_GENAI_EP", " cuda , webgpu ,cpu")]);
+        assert_eq!(
+            actual.execution_providers,
+            vec![
+                ExecutionProviderEntry::Builtin(ExecutionProvider::Cuda),
+                ExecutionProviderEntry::Builtin(ExecutionProvider::WebGpu),
+                ExecutionProviderEntry::Builtin(ExecutionProvider::Cpu),
+            ]
+        );
+    }
+
+    #[test]
+    fn execution_provider_list_skips_empty_tokens_but_keeps_bare_empty_as_cpu() {
+        // A trailing comma yields an empty token that is skipped.
+        assert_eq!(
+            config(&[("ONNX_GENAI_EP", "cuda,")]).execution_providers,
+            vec![ExecutionProviderEntry::Builtin(ExecutionProvider::Cuda)]
+        );
+        // An explicit empty value still resolves to a single CPU entry.
+        assert_eq!(
+            config(&[("ONNX_GENAI_EP", "")]).execution_providers,
+            vec![ExecutionProviderEntry::Builtin(ExecutionProvider::Cpu)]
+        );
+    }
+
+    #[test]
+    fn execution_provider_list_parses_inline_plugins_with_attributes() {
+        let actual = config(&[(
+            "ONNX_GENAI_EP",
+            "cuda,plugin:C:\\ep\\openvino.dll|device=GPU|name=ov|opt.device_type=GPU|opt.num_streams=2,\
+             plugin:/opt/other_ep.so",
+        )]);
+        assert_eq!(
+            actual.execution_providers,
+            vec![
+                ExecutionProviderEntry::Builtin(ExecutionProvider::Cuda),
+                ExecutionProviderEntry::Plugin(PluginSpec {
+                    library: PathBuf::from("C:\\ep\\openvino.dll"),
+                    registration_name: Some("ov".to_owned()),
+                    options: vec![
+                        ("device_type".to_owned(), "GPU".to_owned()),
+                        ("num_streams".to_owned(), "2".to_owned()),
+                    ],
+                    device: Some("GPU".to_owned()),
+                }),
+                ExecutionProviderEntry::Plugin(PluginSpec {
+                    library: PathBuf::from("/opt/other_ep.so"),
+                    registration_name: None,
+                    options: Vec::new(),
+                    device: None,
+                }),
+            ]
+        );
     }
 
     #[test]
@@ -422,7 +614,10 @@ mod tests {
             ),
             ("ONNX_GENAI_EP_DEVICE", " GPU "),
         ]);
-        assert_eq!(actual.execution_provider, Some(ExecutionProvider::Plugin));
+        assert_eq!(
+            actual.execution_providers,
+            vec![ExecutionProviderEntry::Builtin(ExecutionProvider::Plugin)]
+        );
         assert_eq!(
             actual.ep_library,
             Some(PathBuf::from("/opt/onnxruntime_ep_openvino.so"))

@@ -5,7 +5,8 @@ use std::path::Path;
 use std::ptr::NonNull;
 
 use onnx_genai_runtime_config::{
-    CudaDevice, ExecutionProvider as ConfigExecutionProvider, IntraOpThreads, runtime_config,
+    CudaDevice, ExecutionProvider as ConfigExecutionProvider,
+    ExecutionProviderEntry as ConfigExecutionProviderEntry, IntraOpThreads, PluginSpec, runtime_config,
 };
 
 use crate::{Allocator, DataType, Environment, IoBinding, MemoryInfo, OrtError, Result, Value};
@@ -735,7 +736,42 @@ impl RawSessionOptions {
 }
 
 fn execution_providers_from_env() -> Option<Vec<ExecutionProvider>> {
-    let provider = match runtime_config().execution_provider.as_ref()? {
+    let entries = &runtime_config().execution_providers;
+    if entries.is_empty() {
+        return None;
+    }
+    let mut providers = Vec::with_capacity(entries.len());
+    for entry in entries {
+        match entry {
+            ConfigExecutionProviderEntry::Builtin(provider) => {
+                if let Some(resolved) = resolve_builtin_execution_provider(provider) {
+                    providers.push(resolved);
+                }
+            }
+            ConfigExecutionProviderEntry::Plugin(spec) => {
+                if let Some(resolved) = resolve_inline_plugin_execution_provider(spec) {
+                    providers.push(resolved);
+                }
+            }
+        }
+    }
+    if providers.is_empty() {
+        // Every configured entry was unusable (e.g. all unsupported names or a
+        // misconfigured bare plugin); leave the default CPU provider in place.
+        return None;
+    }
+    Some(providers)
+}
+
+/// Resolve one built-in `ONNX_GENAI_EP` token (or the bare `plugin` token,
+/// configured through the scalar `ONNX_GENAI_EP_*` variables) into an ORT
+/// execution provider. Returns `None` when the entry contributes no provider
+/// (e.g. an unsupported name or a misconfigured bare plugin), so it is simply
+/// skipped in the priority list.
+fn resolve_builtin_execution_provider(
+    provider: &ConfigExecutionProvider,
+) -> Option<ExecutionProvider> {
+    let resolved = match provider {
         ConfigExecutionProvider::Cpu => ExecutionProvider::Cpu,
         ConfigExecutionProvider::WebGpu => ExecutionProvider::WebGpu,
         ConfigExecutionProvider::Cuda => ExecutionProvider::Cuda {
@@ -759,19 +795,42 @@ fn execution_providers_from_env() -> Option<Vec<ExecutionProvider>> {
             }
             None => {
                 tracing::warn!(
-                    "ONNX_GENAI_EP=plugin requires ONNX_GENAI_EP_LIBRARY to point to an ORT execution-provider plugin shared library; falling back to CPU"
+                    "ONNX_GENAI_EP=plugin requires ONNX_GENAI_EP_LIBRARY to point to an ORT execution-provider plugin shared library; skipping this entry"
                 );
-                ExecutionProvider::Cpu
+                return None;
             }
         },
         ConfigExecutionProvider::Unsupported(other) => {
             tracing::warn!(
-                "Ignoring unsupported ONNX_GENAI_EP={other}; expected cpu, webgpu, cuda, metal, coreml, or plugin"
+                "Ignoring unsupported ONNX_GENAI_EP entry '{other}'; expected cpu, webgpu, cuda, metal, coreml, plugin, or plugin:<library>"
             );
-            ExecutionProvider::Cpu
+            return None;
         }
     };
-    Some(vec![provider])
+    Some(resolved)
+}
+
+/// Resolve an inline `plugin:<library>|attr=..` list entry into an ORT plugin
+/// execution provider. The concrete provider name is still discovered from the
+/// plugin at load time; only the library path and passthrough options are taken
+/// from the spec.
+fn resolve_inline_plugin_execution_provider(spec: &PluginSpec) -> Option<ExecutionProvider> {
+    if spec.library.as_os_str().is_empty() {
+        tracing::warn!(
+            "Ignoring inline plugin entry with an empty library path; expected plugin:<library>"
+        );
+        return None;
+    }
+    let registration_name = spec
+        .registration_name
+        .clone()
+        .unwrap_or_else(|| plugin_registration_name_from_path(&spec.library));
+    Some(ExecutionProvider::Plugin {
+        library: spec.library.clone(),
+        registration_name,
+        options: spec.options.clone(),
+        device: spec.device.clone(),
+    })
 }
 
 fn requested_non_cpu_provider(options: &SessionOptions) -> bool {
@@ -1754,6 +1813,63 @@ mod tests {
             )),
             "onnxruntime_ep_openvino"
         );
+    }
+
+    #[test]
+    fn inline_plugin_spec_resolves_to_plugin_provider_with_derived_name() {
+        let spec = PluginSpec {
+            library: std::path::PathBuf::from("/opt/onnxruntime_ep_openvino.so"),
+            registration_name: None,
+            options: vec![("device_type".to_owned(), "GPU".to_owned())],
+            device: Some("GPU".to_owned()),
+        };
+        let resolved =
+            resolve_inline_plugin_execution_provider(&spec).expect("inline plugin resolves");
+        match resolved {
+            ExecutionProvider::Plugin {
+                library,
+                registration_name,
+                options,
+                device,
+            } => {
+                assert_eq!(
+                    library,
+                    std::path::PathBuf::from("/opt/onnxruntime_ep_openvino.so")
+                );
+                // Registration name is derived from the file stem when unset.
+                assert_eq!(registration_name, "onnxruntime_ep_openvino");
+                assert_eq!(options, vec![("device_type".to_owned(), "GPU".to_owned())]);
+                assert_eq!(device.as_deref(), Some("GPU"));
+            }
+            other => panic!("expected a plugin provider, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn inline_plugin_spec_with_explicit_name_is_preserved() {
+        let spec = PluginSpec {
+            library: std::path::PathBuf::from("/opt/ep.so"),
+            registration_name: Some("my_handle".to_owned()),
+            options: Vec::new(),
+            device: None,
+        };
+        match resolve_inline_plugin_execution_provider(&spec).expect("resolves") {
+            ExecutionProvider::Plugin {
+                registration_name, ..
+            } => assert_eq!(registration_name, "my_handle"),
+            other => panic!("expected a plugin provider, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn inline_plugin_spec_with_empty_library_is_skipped() {
+        let spec = PluginSpec {
+            library: std::path::PathBuf::new(),
+            registration_name: None,
+            options: Vec::new(),
+            device: None,
+        };
+        assert!(resolve_inline_plugin_execution_provider(&spec).is_none());
     }
 
     #[test]
