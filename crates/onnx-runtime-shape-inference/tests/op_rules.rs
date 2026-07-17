@@ -1867,34 +1867,6 @@ fn moe_and_qmoe_preserve_activation_shape() {
 }
 
 #[test]
-fn gather_block_quantized_expands_packed_dimension() {
-    let n = with_attr(
-        with_attr(
-            with_attr(
-                with_domain(node("GatherBlockQuantized", 3, 1), "com.microsoft"),
-                "gather_axis",
-                Attribute::Int(0),
-            ),
-            "quantize_axis",
-            Attribute::Int(1),
-        ),
-        "bits",
-        Attribute::Int(4),
-    );
-    let outs = run(
-        &n,
-        vec![
-            tin(DataType::Uint8, vec![c(32000), c(256)]),
-            tin(DataType::Int64, vec![sym(0), c(7)]),
-            tin(DataType::Float16, vec![c(32000), c(16)]),
-        ],
-        1,
-    );
-    assert_eq!(out_shape(&outs), vec![sym(0), c(7), c(512)]);
-    assert_eq!(out_dtype(&outs), DataType::Float16);
-}
-
-#[test]
 fn sparse_kv_gather_emits_selected_kv_shape() {
     let n = with_domain(node("SparseKvGather", 2, 1), "pkg.nxrt");
     let outs = run(

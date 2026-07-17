@@ -1,11 +1,15 @@
 //! Shape rules for runtime custom operators.
+//!
+//! `GatherBlockQuantized` shape inference is intentionally NOT registered —
+//! it awaits an authoritative `com.microsoft` schema/CPU-kernel contract. An
+//! unregistered op leaves its output shapes uninferred (safe) rather than
+//! emitting a guessed shape.
 
 use onnx_runtime_ir::{Attribute, DataType};
 
 use crate::context::InferenceContext;
 use crate::dim_expr::DimExpr;
 use crate::error::ShapeInferError;
-use crate::handlers::checked_axis;
 use crate::registry::InferenceRegistry;
 
 /// `MoE`/`QMoE`: the single output preserves the activation tensor.
@@ -14,65 +18,6 @@ pub fn moe(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
     if let Some(input) = ctx.input_type(0).cloned() {
         ctx.set_output_type(0, input);
     }
-    Ok(())
-}
-
-/// `GatherBlockQuantized`: standard Gather shape, with packed uint8 values
-/// expanded along the quantization axis. The output dtype follows the scales.
-pub fn gather_block_quantized(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
-    require_outputs(ctx, 1)?;
-    let Some(data) = ctx.input_shape(0).map(<[_]>::to_vec) else {
-        return Ok(());
-    };
-    let Some(indices) = ctx.input_shape(1).map(<[_]>::to_vec) else {
-        return Ok(());
-    };
-    let Some(dtype) = ctx.input_dtype(2) else {
-        return Ok(());
-    };
-    if data.is_empty() {
-        return Err(ShapeInferError::InvalidRank {
-            op: ctx.op().into(),
-            index: 0,
-            rank: 0,
-            detail: "data must have rank >= 1".into(),
-        });
-    }
-
-    let gather_axis = axis_attr(ctx, "gather_axis", 0, data.len())?;
-    let quantize_axis = axis_attr(ctx, "quantize_axis", 1, data.len())?;
-    if gather_axis == quantize_axis {
-        return Err(ShapeInferError::Invalid {
-            op: ctx.op().into(),
-            detail: "gather_axis and quantize_axis must differ".into(),
-        });
-    }
-
-    let mut output = Vec::with_capacity(data.len() - 1 + indices.len());
-    output.extend_from_slice(&data[..gather_axis]);
-    output.extend(indices.iter().cloned());
-    output.extend_from_slice(&data[gather_axis + 1..]);
-
-    if ctx.input_dtype(0) == Some(DataType::Uint8) {
-        let bits = int_attr(ctx, "bits", 4)?;
-        if !matches!(bits, 2 | 4 | 8) {
-            return Err(ShapeInferError::Invalid {
-                op: ctx.op().into(),
-                detail: format!("uint8 packed data requires bits 2, 4, or 8, got {bits}"),
-            });
-        }
-        let components = 8 / bits;
-        if components > 1 {
-            let output_axis = if quantize_axis < gather_axis {
-                quantize_axis
-            } else {
-                quantize_axis - 1 + indices.len()
-            };
-            output[output_axis] = output[output_axis].mul(&DimExpr::constant(components));
-        }
-    }
-
-    ctx.set_output(0, dtype, output);
     Ok(())
 }
 
@@ -243,23 +188,6 @@ fn require_outputs(ctx: &InferenceContext, expected: usize) -> Result<(), ShapeI
     Ok(())
 }
 
-fn axis_attr(
-    ctx: &InferenceContext,
-    name: &str,
-    default: i64,
-    rank: usize,
-) -> Result<usize, ShapeInferError> {
-    let axis = ctx
-        .node
-        .attr(name)
-        .and_then(Attribute::as_int)
-        .unwrap_or(default);
-    checked_axis(axis, rank).ok_or_else(|| ShapeInferError::Invalid {
-        op: ctx.op().into(),
-        detail: format!("{name} {axis} is out of range for rank {rank}"),
-    })
-}
-
 fn int_attr(ctx: &InferenceContext, name: &str, default: i64) -> Result<i64, ShapeInferError> {
     match ctx.node.attr(name) {
         Some(attr) => attr.as_int().ok_or_else(|| ShapeInferError::Invalid {
@@ -369,12 +297,6 @@ fn c(value: i64) -> DimExpr {
 pub fn register(reg: &mut InferenceRegistry) {
     reg.register("com.microsoft", "MoE", 1, moe);
     reg.register("com.microsoft", "QMoE", 1, moe);
-    reg.register(
-        "com.microsoft",
-        "GatherBlockQuantized",
-        1,
-        gather_block_quantized,
-    );
     reg.register("pkg.nxrt", "SparseKvGather", 1, sparse_kv_gather);
     reg.register(
         "pkg.nxrt",
