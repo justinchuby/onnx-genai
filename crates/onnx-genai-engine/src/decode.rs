@@ -52,6 +52,24 @@ pub(crate) trait DecodeBackend {
         None
     }
     fn decode(&mut self, token_ids: &[TokenId], past_len: usize) -> anyhow::Result<Vec<Vec<f32>>>;
+    /// Greedy fast path: run the decode step and return only the argmax token
+    /// id of the final position, or `None` when this backend cannot select the
+    /// token internally (the caller then falls back to [`Self::decode`] plus
+    /// host-side sampling). Only valid when no logit processors run and greedy
+    /// sampling is requested — the caller must enforce those preconditions.
+    fn decode_argmax(
+        &mut self,
+        _token_ids: &[TokenId],
+        _past_len: usize,
+    ) -> anyhow::Result<Option<u32>> {
+        Ok(None)
+    }
+    /// Whether [`Self::decode_argmax`] can select the token internally. Backends
+    /// return `false` unless they support the fast path so callers can decide
+    /// without triggering the step's side effects.
+    fn supports_argmax(&self) -> bool {
+        false
+    }
     fn rewind(&mut self, target_len: usize) -> anyhow::Result<()>;
     fn reset(&mut self) -> anyhow::Result<()> {
         self.rewind(0)
@@ -76,6 +94,15 @@ impl DecodeRunner {
             DecodeRunner::Native(runner) => runner,
         }
     }
+
+    fn supports_argmax(&self) -> bool {
+        match self {
+            DecodeRunner::StaticCache(runner) => runner.supports_argmax(),
+            DecodeRunner::PastPresent(runner) => runner.supports_argmax(),
+            #[cfg(feature = "native-backend")]
+            DecodeRunner::Native(runner) => runner.supports_argmax(),
+        }
+    }
 }
 
 impl DecodeBackend for DecodeSession<'static> {
@@ -96,6 +123,28 @@ impl DecodeBackend for DecodeSession<'static> {
         let logits = self.step(&input_ids, &attention_mask, &position_ids)?;
         let _extract = onnx_genai_ort::prof_span!("engine.logits_to_vec");
         extract_logits_value_sequence(&logits)
+    }
+
+    fn decode_argmax(
+        &mut self,
+        token_ids: &[TokenId],
+        past_len: usize,
+    ) -> anyhow::Result<Option<u32>> {
+        let total_len = past_len + token_ids.len();
+        let input_ids = token_ids
+            .iter()
+            .map(|&id| i64::from(id))
+            .collect::<Vec<_>>();
+        let attention_mask = vec![1_i64; total_len];
+        let position_ids = (past_len..total_len)
+            .map(|pos| i64::try_from(pos).context("position id exceeds i64 range"))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let token = self.step_argmax(&input_ids, &attention_mask, &position_ids)?;
+        Ok(Some(token))
+    }
+
+    fn supports_argmax(&self) -> bool {
+        true
     }
 
     fn rewind(&mut self, target_len: usize) -> anyhow::Result<()> {
@@ -290,6 +339,16 @@ impl DecodeState {
         }
     }
 
+    /// Whether the active runner can select the greedy token internally via
+    /// [`DecodeBackend::decode_argmax`] without materializing host logits. Only
+    /// the shared-buffer past/present runner supports this today; the check is
+    /// side-effect-free so callers can decide before consuming any input.
+    pub(crate) fn runner_supports_argmax(&self) -> bool {
+        self.runner
+            .as_ref()
+            .is_some_and(DecodeRunner::supports_argmax)
+    }
+
     pub(crate) fn rewind_runner(&mut self, target_len: usize) -> anyhow::Result<()> {
         match &mut self.runner {
             Some(DecodeRunner::StaticCache(session)) => session.rewind(target_len)?,
@@ -447,6 +506,47 @@ impl DecodeState {
         self.retained_kv_len = new_retained;
         Ok(())
     }
+}
+
+/// Greedy fast-path sibling of [`next_session_token_logits`] for the optimized
+/// decode runner.
+///
+/// Returns `Some(token)` when the shared-buffer runner selected the argmax token
+/// internally (no host logits materialized), or `None` when the fast path does
+/// not apply (no runner, or a runner that cannot select internally) so the
+/// caller falls back to [`next_session_token_logits`] plus host sampling.
+///
+/// The capability check happens before any windowed-prefix consumption or KV
+/// advancement, so returning `None` leaves session state untouched and safe for
+/// the fallback to re-drive.
+pub(crate) fn next_session_token_argmax(
+    session: &Session,
+    kv_model: Option<&KvModelInfo>,
+    kv_cache: &mut PagedKvCache,
+    seq: SessionId,
+    state: &mut EngineSession,
+) -> anyhow::Result<Option<u32>> {
+    if !state.decode_state.has_runner() || !state.decode_state.runner_supports_argmax() {
+        return Ok(None);
+    }
+    let (mut input_tokens, mut past_len) = session_decode_input_tokens(state)?;
+    consume_windowed_prefix(
+        session,
+        kv_model,
+        kv_cache,
+        seq,
+        state,
+        &mut input_tokens,
+        &mut past_len,
+    )?;
+    let input_len = input_tokens.len();
+    let token = run_decode_session_argmax(&mut state.decode_state, &input_tokens, past_len)?
+        .context("argmax-capable decode runner returned no token")?;
+    kv_cache
+        .append(seq, input_len)
+        .map_err(|e| anyhow::anyhow!("Failed to advance KV sequence {seq}: {}", e))?;
+    state.kv_token_count += input_len;
+    Ok(Some(token))
 }
 
 pub(crate) fn next_session_token_logits(
@@ -1031,6 +1131,44 @@ pub(crate) fn run_decode_session_logits(
     token_ids: &[TokenId],
     past_len: usize,
 ) -> anyhow::Result<Vec<Vec<f32>>> {
+    align_runner_cursor(decode_state, token_ids, past_len)?;
+    decode_state
+        .runner
+        .as_mut()
+        .context("decode session runner not initialized")?
+        .as_backend()
+        .decode(token_ids, past_len)
+        .map_err(map_decode_context_error)
+}
+
+/// Greedy fast-path sibling of [`run_decode_session_logits`]: advance the
+/// runner one step and return only the argmax token id, or `None` if the runner
+/// cannot select internally. Callers gate this on
+/// [`DecodeState::runner_supports_argmax`], so `None` should not occur in
+/// practice once the fast path is chosen.
+pub(crate) fn run_decode_session_argmax(
+    decode_state: &mut DecodeState,
+    token_ids: &[TokenId],
+    past_len: usize,
+) -> anyhow::Result<Option<u32>> {
+    align_runner_cursor(decode_state, token_ids, past_len)?;
+    decode_state
+        .runner
+        .as_mut()
+        .context("decode session runner not initialized")?
+        .as_backend()
+        .decode_argmax(token_ids, past_len)
+        .map_err(map_decode_context_error)
+}
+
+/// Align the runner's KV cursor to `past_len`, rewinding if it is ahead and
+/// erroring if it is behind (replay is required). Shared by the logits and
+/// argmax decode-session entry points.
+fn align_runner_cursor(
+    decode_state: &mut DecodeState,
+    token_ids: &[TokenId],
+    past_len: usize,
+) -> anyhow::Result<()> {
     if token_ids.is_empty() {
         anyhow::bail!("decode session step requires at least one input token");
     }
@@ -1044,24 +1182,19 @@ pub(crate) fn run_decode_session_logits(
             past_len
         );
     }
+    Ok(())
+}
 
-    decode_state
-        .runner
-        .as_mut()
-        .context("decode session runner not initialized")?
-        .as_backend()
-        .decode(token_ids, past_len)
-    .map_err(|error| {
-        let message = error.to_string();
-        if is_gather_out_of_bounds(&message) {
-            anyhow::anyhow!(
-                "model context length exceeded during ORT decode; configure inference metadata `model.max_sequence_length` or GenerateOptions::max_context to stop cleanly before the context window is exceeded: {}",
-                error
-            )
-        } else {
+fn map_decode_context_error(error: anyhow::Error) -> anyhow::Error {
+    let message = error.to_string();
+    if is_gather_out_of_bounds(&message) {
+        anyhow::anyhow!(
+            "model context length exceeded during ORT decode; configure inference metadata `model.max_sequence_length` or GenerateOptions::max_context to stop cleanly before the context window is exceeded: {}",
             error
-        }
-    })
+        )
+    } else {
+        error
+    }
 }
 
 pub(crate) fn run_decode_step(

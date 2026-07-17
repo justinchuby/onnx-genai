@@ -159,6 +159,15 @@ pub struct DecodeSession<'a> {
     graph_capture_disabled: bool,
 }
 
+/// Outcome of a single decode step: either the logits Value (default path) or,
+/// on the greedy fast path, only the argmax token id read directly from the
+/// persistent logits buffer without materializing the full vocabulary on the
+/// host.
+enum StepLogits {
+    Value(Value),
+    Token(u32),
+}
+
 /// Persistent I/O buffers for the static-shape captured decode graph.
 struct CaptureState {
     input_ids: Value,
@@ -296,15 +305,48 @@ impl<'a> DecodeSession<'a> {
         attention_mask: &[i64],
         position_ids: &[i64],
     ) -> Result<Value> {
+        match self.step_dispatch(new_input_ids, attention_mask, position_ids, false)? {
+            StepLogits::Value(logits) => Ok(logits),
+            // `argmax_only` is false, so the captured path returns a Value.
+            StepLogits::Token(_) => {
+                Err(OrtError::InvalidArgument("step produced a token id".into()))
+            }
+        }
+    }
+
+    /// Run one incremental decode step and return only the greedy (argmax)
+    /// token id of the final logits row.
+    ///
+    /// This is the greedy decode fast path: on the captured single-token path
+    /// the argmax is computed directly on the persistent logits buffer, so the
+    /// full ~150K-entry vocabulary never leaves the tensor (no owned clone, no
+    /// host `Vec`, no separate CPU argmax scan). Callers that apply logit
+    /// processors or non-greedy sampling must use [`Self::step`] instead.
+    pub fn step_argmax(
+        &mut self,
+        new_input_ids: &[i64],
+        attention_mask: &[i64],
+        position_ids: &[i64],
+    ) -> Result<u32> {
+        match self.step_dispatch(new_input_ids, attention_mask, position_ids, true)? {
+            StepLogits::Token(token) => Ok(token),
+            // The standard (non-captured) path returns a Value; reduce it here.
+            StepLogits::Value(logits) => logits.argmax_last_row(),
+        }
+    }
+
+    fn step_dispatch(
+        &mut self,
+        new_input_ids: &[i64],
+        attention_mask: &[i64],
+        position_ids: &[i64],
+        argmax_only: bool,
+    ) -> Result<StepLogits> {
         if new_input_ids.is_empty() {
             return Err(OrtError::InvalidArgument(
                 "decode step requires at least one input id".into(),
             ));
         }
-        let seq_len = i64::try_from(new_input_ids.len())
-            .map_err(|_| OrtError::InvalidArgument("input length exceeds i64".into()))?;
-        let total_len = i64::try_from(attention_mask.len())
-            .map_err(|_| OrtError::InvalidArgument("attention mask length exceeds i64".into()))?;
         if position_ids.len() != new_input_ids.len() {
             return Err(OrtError::InvalidArgument(
                 "position_ids length must match input_ids length".into(),
@@ -321,7 +363,8 @@ impl<'a> DecodeSession<'a> {
             && new_input_ids.len() == 1
             && self.current_len > 0
         {
-            match self.step_captured(new_input_ids[0], attention_mask, position_ids[0]) {
+            match self.step_captured(new_input_ids[0], attention_mask, position_ids[0], argmax_only)
+            {
                 Ok(logits) => return Ok(logits),
                 Err(err) => {
                     // The captured decode path failed (e.g. the EP could not
@@ -341,6 +384,21 @@ impl<'a> DecodeSession<'a> {
                 }
             }
         }
+
+        self.step_standard(new_input_ids, attention_mask, position_ids)
+            .map(StepLogits::Value)
+    }
+
+    fn step_standard(
+        &mut self,
+        new_input_ids: &[i64],
+        attention_mask: &[i64],
+        position_ids: &[i64],
+    ) -> Result<Value> {
+        let seq_len = i64::try_from(new_input_ids.len())
+            .map_err(|_| OrtError::InvalidArgument("input length exceeds i64".into()))?;
+        let total_len = i64::try_from(attention_mask.len())
+            .map_err(|_| OrtError::InvalidArgument("attention mask length exceeds i64".into()))?;
 
         let input_ids = Value::from_slice_i64(new_input_ids, &[1, seq_len])?;
         let attention_mask = Value::from_slice_i64(attention_mask, &[1, total_len])?;
@@ -421,7 +479,8 @@ impl<'a> DecodeSession<'a> {
         token: i64,
         attention_mask: &[i64],
         position: i64,
-    ) -> Result<Value> {
+        argmax_only: bool,
+    ) -> Result<StepLogits> {
         self.ensure_capture_state()?;
         // Move the capture buffers out of `self` for the duration of the step so
         // the `&mut self` bind helpers don't alias the borrow; restore on the
@@ -498,12 +557,19 @@ impl<'a> DecodeSession<'a> {
             .checked_add(1)
             .ok_or_else(|| OrtError::InvalidArgument("decode length overflow".into()))?;
 
-        // Copy the persistent logits buffer into an owned Value so the caller
-        // can consume it while the captured buffer is reused next step.
+        // Reduce or copy the persistent logits buffer while it is still live.
+        // The greedy fast path (`argmax_only`) reads only the winning token id
+        // straight from the buffer — the full vocabulary never leaves the
+        // tensor. Otherwise snapshot it into an owned Value so the caller can
+        // consume it while the captured buffer is reused next step.
         let _extract_span = crate::prof_span!("ort.extract_outputs");
-        let logits = cap.logits.clone_owned();
+        let result = if argmax_only {
+            cap.logits.argmax_last_row().map(StepLogits::Token)
+        } else {
+            cap.logits.clone_owned().map(StepLogits::Value)
+        };
         self.capture = Some(cap);
-        logits
+        result
     }
 
     /// Lazily allocate the persistent captured-decode I/O buffers.

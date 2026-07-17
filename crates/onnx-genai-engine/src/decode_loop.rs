@@ -50,6 +50,18 @@ pub(crate) trait DecodeLoopBackend {
     fn processor_prompt_tokens(&self) -> Vec<TokenId>;
     fn next_logits(&mut self) -> anyhow::Result<Vec<f32>>;
     fn commit_token(&mut self, token_id: TokenId) -> anyhow::Result<()>;
+    /// Whether the backend can select the greedy (argmax) token internally,
+    /// skipping host logits materialization. Only consulted for greedy
+    /// decoding with no logit processors and no logprobs.
+    fn greedy_fastpath_supported(&self) -> bool {
+        false
+    }
+    /// Run one decode step and return only the argmax token id, selecting it on
+    /// the device/buffer without copying the full vocabulary to the host. Only
+    /// called when [`Self::greedy_fastpath_supported`] is true.
+    fn next_token_greedy(&mut self) -> anyhow::Result<TokenId> {
+        anyhow::bail!("greedy fast path is not supported by this decode backend")
+    }
 }
 
 pub(crate) fn run_decode_loop<B: DecodeLoopBackend>(
@@ -106,23 +118,38 @@ pub(crate) fn step_decode_loop<B: DecodeLoopBackend>(
         .map(Some);
     }
 
-    let context = ProcessorContext {
-        prompt_tokens: backend.processor_prompt_tokens(),
-        generated_tokens: state.generated_tokens.clone(),
-        generated_text: state.generated_text.clone(),
-        step: state.step,
-    };
-    let mut logits = {
+    let greedy_fastpath = chain.is_empty()
+        && options.top_logprobs.is_none()
+        && (options.greedy || options.temperature == 0.0)
+        && backend.greedy_fastpath_supported();
+
+    let token_id = if greedy_fastpath {
+        // Greedy with no logit processors: select the argmax token on the
+        // device/buffer without materializing the full vocabulary on the host.
         let _span = onnx_genai_ort::prof_span!("loop.next_logits");
-        backend.next_logits()?
+        backend.next_token_greedy()?
+    } else {
+        let context = ProcessorContext {
+            prompt_tokens: backend.processor_prompt_tokens(),
+            generated_tokens: state.generated_tokens.clone(),
+            generated_text: state.generated_text.clone(),
+            step: state.step,
+        };
+        let mut logits = {
+            let _span = onnx_genai_ort::prof_span!("loop.next_logits");
+            backend.next_logits()?
+        };
+        let token_id = {
+            let _span = onnx_genai_ort::prof_span!("loop.sampling");
+            select_next_token_with_rng(&mut logits, &context, options, chain, &mut state.rng)
+        };
+        if let (Some(top_logprobs), Some(logprobs)) =
+            (options.top_logprobs, state.logprobs.as_mut())
+        {
+            logprobs.push(logprob_for_token(&logits, token_id, top_logprobs));
+        }
+        token_id
     };
-    let token_id = {
-        let _span = onnx_genai_ort::prof_span!("loop.sampling");
-        select_next_token_with_rng(&mut logits, &context, options, chain, &mut state.rng)
-    };
-    if let (Some(top_logprobs), Some(logprobs)) = (options.top_logprobs, state.logprobs.as_mut()) {
-        logprobs.push(logprob_for_token(&logits, token_id, top_logprobs));
-    }
     {
         let _span = onnx_genai_ort::prof_span!("loop.commit_token");
         backend.commit_token(token_id)?;
