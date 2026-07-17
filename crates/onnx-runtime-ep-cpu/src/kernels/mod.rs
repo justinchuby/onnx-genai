@@ -131,6 +131,9 @@ pub const PHASE1_OPS: &[&str] = &[
     "LeakyRelu",
     "HardSigmoid",
     // Logical / selection.
+    "And",
+    "Or",
+    "Xor",
     "Not",
     "Equal",
     "Greater",
@@ -568,6 +571,9 @@ pub fn build_cpu_registry() -> OpRegistry {
         Box::new(activations::HardSigmoidFactory),
     );
     // Logical / selection.
+    reg.register(OpKey::new("And", "", 7), Box::new(logical::AndFactory));
+    reg.register(OpKey::new("Or", "", 7), Box::new(logical::OrFactory));
+    reg.register(OpKey::new("Xor", "", 7), Box::new(logical::XorFactory));
     reg.register(OpKey::new("Not", "", 1), Box::new(logical::NotFactory));
     reg.register(OpKey::new("Equal", "", 1), Box::new(logical::EqualFactory));
     reg.register(
