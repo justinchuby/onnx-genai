@@ -294,7 +294,9 @@ fn branch_output_is_resolved(branch: &Graph, output: ValueId, resolved: &HashSet
 ///
 /// A producer rule can overwrite this seed with a freshly inferred type. If the
 /// rule cannot resolve its output, the declared metadata remains available to
-/// downstream consumers instead of being silently discarded.
+/// downstream consumers instead of being silently discarded. Empty shapes on
+/// produced values are the IR's placeholder for omitted shape metadata, not a
+/// declared scalar shape, so they must be resolved by the producer.
 fn seed_sources(
     graph: &Graph,
     types: &mut HashMap<ValueId, TypeInfo>,
@@ -302,6 +304,9 @@ fn seed_sources(
 ) {
     for (vid, value) in graph.values.iter() {
         if !graph.value_type_is_known(vid) || !graph.value_shape_is_known(vid) {
+            continue;
+        }
+        if value.producer.is_some() && value.shape.is_empty() {
             continue;
         }
         let shape: TypedShape = value.shape.iter().map(|&d| DimExpr::from(d)).collect();
