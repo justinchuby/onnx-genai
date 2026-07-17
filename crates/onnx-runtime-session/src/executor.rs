@@ -379,6 +379,10 @@ struct CompiledChildPlan {
     signature: Vec<ChildInputSignature>,
 }
 
+/// Control-flow bodies commonly alternate among a handful of stable shapes.
+/// Four entries cover those cases without retaining an unbounded set of plans.
+const CHILD_EXECUTOR_CACHE_CAPACITY: usize = 4;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ChildInputSignature {
     dtype: DataType,
@@ -388,9 +392,9 @@ struct ChildInputSignature {
 /// A reusable executor for one nested graph body.
 ///
 /// The body signature and lexical-capture set are resolved once at construction.
-/// The concrete [`Executor`] is then compiled lazily for the first invocation's
-/// input signature and reused while dtype/shapes stay unchanged, so Loop/Scan
-/// iterations only upload newly-bound tensor bytes and dispatch the cached plan.
+/// Concrete [`Executor`]s are compiled lazily and retained in a small,
+/// deterministic LRU keyed by external-input dtype/shapes, so alternating
+/// Loop/Scan/If signatures reuse prior plans instead of recompiling each switch.
 pub(crate) struct ChildExecutor {
     name: String,
     template: Graph,
@@ -400,7 +404,7 @@ pub(crate) struct ChildExecutor {
     formal_names: Vec<String>,
     capture_names: Vec<String>,
     input_names: Vec<String>,
-    compiled: Option<CompiledChildPlan>,
+    compiled: Vec<CompiledChildPlan>,
     builds: u64,
     runs: u64,
 }
@@ -2946,7 +2950,7 @@ impl ChildExecutor {
             formal_names,
             capture_names,
             input_names,
-            compiled: None,
+            compiled: Vec::new(),
             builds: 0,
             runs: 0,
         })
@@ -3015,7 +3019,7 @@ impl ChildExecutor {
     }
 
     /// Execute the body with formal inputs in declared order and lexical values
-    /// supplied by name. The cached plan is reused for matching dtype/shapes.
+    /// supplied by name. A cached plan is reused for matching dtype/shapes.
     pub(crate) fn run(
         &mut self,
         formal_inputs: &[&Tensor],
@@ -3047,14 +3051,23 @@ impl ChildExecutor {
                 shape: tensor.shape.clone(),
             })
             .collect::<Vec<_>>();
-        let rebuild = self
+        let cache_index = if let Some(index) = self
             .compiled
-            .as_ref()
-            .is_none_or(|compiled| compiled.signature != signature);
-        if rebuild {
-            self.compiled = Some(self.compile(&externals)?);
+            .iter()
+            .position(|compiled| compiled.signature == signature)
+        {
+            let compiled = self.compiled.remove(index);
+            self.compiled.push(compiled);
+            self.compiled.len() - 1
+        } else {
+            let compiled = self.compile(&externals)?;
+            if self.compiled.len() == CHILD_EXECUTOR_CACHE_CAPACITY {
+                self.compiled.remove(0);
+            }
+            self.compiled.push(compiled);
             self.builds += 1;
-        }
+            self.compiled.len() - 1
+        };
 
         self.runs += 1;
         let inputs = self
@@ -3063,9 +3076,7 @@ impl ChildExecutor {
             .map(String::as_str)
             .zip(externals)
             .collect::<Vec<_>>();
-        self.compiled
-            .as_mut()
-            .expect("child plan compiled above")
+        self.compiled[cache_index]
             .exec
             .run_scoped(&inputs, outer_scope, &ExternalBindings::default())?
             .into_iter()
@@ -5291,6 +5302,148 @@ mod tests {
             ChildExecutorStats { builds: 1, runs: 2 },
             "matching input signatures must reuse the compiled child plan"
         );
+    }
+
+    fn unary_child(name: &str) -> ChildExecutor {
+        let mut body = Graph::new();
+        let input = body.create_named_value("input", DataType::Float32, Vec::new());
+        body.add_input(input);
+        let output = body.create_named_value("output", DataType::Float32, Vec::new());
+        body.insert_node(Node::new(
+            NodeId(0),
+            "Relu",
+            vec![Some(input)],
+            vec![output],
+        ));
+        body.add_output(output);
+
+        let mut opsets = HashMap::new();
+        opsets.insert(String::new(), 17);
+        ChildExecutor::new(
+            name,
+            body,
+            opsets,
+            Arc::new(WeightStore::new()),
+            auto_detect_cpu_ep().unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn child_executor_reuses_a_signature_after_an_intervening_signature() {
+        let mut child = unary_child("a-b-a");
+        let outer_scope = HashMap::new();
+        let a = Tensor::from_f32(&[1], &[-1.0]).unwrap();
+        let b = Tensor::from_f32(&[2], &[-2.0, 3.0]).unwrap();
+
+        assert_eq!(
+            child.run(&[&a], &outer_scope).unwrap()[0].to_vec_f32(),
+            vec![0.0]
+        );
+        assert_eq!(
+            child.run(&[&b], &outer_scope).unwrap()[0].to_vec_f32(),
+            vec![0.0, 3.0]
+        );
+        assert_eq!(
+            child.run(&[&a], &outer_scope).unwrap()[0].to_vec_f32(),
+            vec![0.0]
+        );
+        assert_eq!(child.stats(), ChildExecutorStats { builds: 2, runs: 3 });
+    }
+
+    #[test]
+    fn child_executor_lru_evicts_oldest_signature_only() {
+        let mut child = unary_child("lru-eviction");
+        let outer_scope = HashMap::new();
+        let inputs = (1..=CHILD_EXECUTOR_CACHE_CAPACITY + 1)
+            .map(|len| Tensor::from_f32(&[len], &vec![len as f32; len]).unwrap())
+            .collect::<Vec<_>>();
+
+        for input in &inputs {
+            child.run(&[input], &outer_scope).unwrap();
+        }
+        assert_eq!(
+            child.stats(),
+            ChildExecutorStats {
+                builds: (CHILD_EXECUTOR_CACHE_CAPACITY + 1) as u64,
+                runs: (CHILD_EXECUTOR_CACHE_CAPACITY + 1) as u64,
+            }
+        );
+
+        child.run(&[&inputs[0]], &outer_scope).unwrap();
+        child.run(&[inputs.last().unwrap()], &outer_scope).unwrap();
+        assert_eq!(
+            child.stats(),
+            ChildExecutorStats {
+                builds: (CHILD_EXECUTOR_CACHE_CAPACITY + 2) as u64,
+                runs: (CHILD_EXECUTOR_CACHE_CAPACITY + 3) as u64,
+            },
+            "the evicted oldest signature must rebuild while a recent entry remains cached"
+        );
+    }
+
+    fn captured_add_child(name: &str) -> ChildExecutor {
+        let mut body = Graph::new();
+        let input = body.create_named_value("input", DataType::Float32, Vec::new());
+        body.add_input(input);
+        let captured = body.create_named_value("captured", DataType::Float32, Vec::new());
+        let output = body.create_named_value("output", DataType::Float32, Vec::new());
+        body.insert_node(Node::new(
+            NodeId(0),
+            "Add",
+            vec![Some(input), Some(captured)],
+            vec![output],
+        ));
+        body.add_output(output);
+
+        let mut opsets = HashMap::new();
+        opsets.insert(String::new(), 17);
+        ChildExecutor::new(
+            name,
+            body,
+            opsets,
+            Arc::new(WeightStore::new()),
+            auto_detect_cpu_ep().unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn child_executor_cached_plan_rebinds_captures_without_stale_state() {
+        let mut child = captured_add_child("capture-shadowing");
+        let a_input = Tensor::from_f32(&[1], &[1.0]).unwrap();
+        let b_input = Tensor::from_f32(&[2], &[2.0, 3.0]).unwrap();
+
+        let mut scope = HashMap::new();
+        scope.insert(
+            "captured".to_string(),
+            Tensor::from_f32(&[1], &[10.0]).unwrap(),
+        );
+        assert_eq!(
+            child.run(&[&a_input], &scope).unwrap()[0].to_vec_f32(),
+            vec![11.0]
+        );
+
+        scope.insert(
+            "captured".to_string(),
+            Tensor::from_f32(&[2], &[20.0, 30.0]).unwrap(),
+        );
+        assert_eq!(
+            child.run(&[&b_input], &scope).unwrap()[0].to_vec_f32(),
+            vec![22.0, 33.0]
+        );
+
+        scope.insert(
+            "captured".to_string(),
+            Tensor::from_f32(&[1], &[40.0]).unwrap(),
+        );
+        let cached = child.run(&[&a_input], &scope).unwrap()[0].to_vec_f32();
+        let mut fresh = captured_add_child("capture-shadowing-fresh");
+        let freshly_compiled = fresh.run(&[&a_input], &scope).unwrap()[0].to_vec_f32();
+
+        assert_eq!(cached, vec![41.0]);
+        assert_eq!(cached, freshly_compiled);
+        assert_eq!(child.stats(), ChildExecutorStats { builds: 2, runs: 3 });
     }
 
     // --- weight-streaming: zero-copy borrowed initializer buffers -----------
