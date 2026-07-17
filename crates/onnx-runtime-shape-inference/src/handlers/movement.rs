@@ -110,11 +110,8 @@ pub fn reshape(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
         != 0;
 
     let Some(target) = ctx.input_shape_data(1).map(ShapeData::as_shape) else {
-        // No resolved target: produce a fresh-symbol shape of the known rank.
-        if let Some(rank) = target_rank(ctx) {
-            let out = (0..rank).map(|_| ctx.fresh_dim()).collect();
-            ctx.set_output(0, dtype, out);
-        }
+        // A runtime target has unknown values, so even a known target-vector
+        // length cannot establish the output dimensions.
         return Ok(());
     };
 
@@ -122,9 +119,11 @@ pub fn reshape(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
     let mut out: Vec<DimExpr> = Vec::with_capacity(target.len());
     let mut product = DimExpr::constant(1);
     let mut neg1: Option<usize> = None;
+    let mut neg1_count = 0;
     for (i, t) in target.iter().enumerate() {
         match t.as_const() {
             Some(-1) => {
+                neg1_count += 1;
                 neg1 = Some(i);
                 out.push(DimExpr::constant(1)); // placeholder, fixed below
             }
@@ -132,9 +131,20 @@ pub fn reshape(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
                 let d = input
                     .get(i)
                     .cloned()
-                    .unwrap_or_else(|| DimExpr::constant(1));
+                    .ok_or_else(|| ShapeInferError::Invalid {
+                        op: "Reshape".into(),
+                        detail: format!(
+                            "0 at target index {i} has no corresponding input dimension"
+                        ),
+                    })?;
                 product = product.mul(&d);
                 out.push(d);
+            }
+            Some(value) if value < 0 => {
+                return Err(ShapeInferError::Invalid {
+                    op: "Reshape".into(),
+                    detail: format!("target dimension {value} is invalid"),
+                });
             }
             _ => {
                 product = product.mul(t);
@@ -142,24 +152,43 @@ pub fn reshape(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
             }
         }
     }
+    if neg1_count > 1 {
+        return Err(ShapeInferError::Invalid {
+            op: "Reshape".into(),
+            detail: format!("at most one dimension may be -1, found {neg1_count}"),
+        });
+    }
+    if allowzero && neg1.is_some() && target.iter().any(|t| t.as_const() == Some(0)) {
+        return Err(ShapeInferError::Invalid {
+            op: "Reshape".into(),
+            detail: "allowzero=1 does not permit 0 and -1 in the same target shape".into(),
+        });
+    }
     if let Some(idx) = neg1 {
-        out[idx] = total
-            .checked_div(&product)
-            .unwrap_or_else(|| ctx.fresh_dim());
+        out[idx] = match total.checked_div(&product) {
+            Some(inferred) => inferred,
+            None if total.is_const() && product.is_const() => {
+                return Err(ShapeInferError::Invalid {
+                    op: "Reshape".into(),
+                    detail: "input element count is not divisible by the known target dimensions"
+                        .into(),
+                });
+            }
+            None => ctx.fresh_dim(),
+        };
+    } else if let (Some(input_elements), Some(output_elements)) =
+        (total.as_const(), product.as_const())
+        && input_elements != output_elements
+    {
+        return Err(ShapeInferError::Invalid {
+            op: "Reshape".into(),
+            detail: format!(
+                "input element count {input_elements} does not match target element count {output_elements}"
+            ),
+        });
     }
     ctx.set_output(0, dtype, out);
     Ok(())
-}
-
-/// The rank of a `Reshape`/`Expand` target when its values are unknown but its
-/// length is a concrete 1-D shape.
-fn target_rank(ctx: &InferenceContext) -> Option<usize> {
-    let s = ctx.input_shape(1)?;
-    if s.len() == 1 {
-        s[0].as_const().map(|n| n.max(0) as usize)
-    } else {
-        None
-    }
 }
 
 /// `Flatten`: collapse to `[prod(dims[..axis]), prod(dims[axis..])]`.
@@ -1077,6 +1106,61 @@ pub fn split(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
         .map(<[i64]>::to_vec)
         .or_else(|| const_ints(ctx, 1));
     let has_dynamic_split = sizes.is_none() && ctx.has_input(1);
+    if let (Some(sizes), Some(num_outputs)) = (&sizes, num_outputs) {
+        if sizes.len() != n_out {
+            return Err(ShapeInferError::Invalid {
+                op: "Split".into(),
+                detail: format!(
+                    "split provides {} sizes but the node has {n_out} outputs",
+                    sizes.len()
+                ),
+            });
+        }
+        if num_outputs != n_out {
+            return Err(ShapeInferError::Invalid {
+                op: "Split".into(),
+                detail: format!("num_outputs is {num_outputs} but the node has {n_out} outputs"),
+            });
+        }
+        return Err(ShapeInferError::Invalid {
+            op: "Split".into(),
+            detail: "split input and num_outputs cannot both be specified".into(),
+        });
+    }
+    if let Some(sizes) = &sizes {
+        if sizes.len() != n_out {
+            return Err(ShapeInferError::Invalid {
+                op: "Split".into(),
+                detail: format!(
+                    "split provides {} sizes but the node has {n_out} outputs",
+                    sizes.len()
+                ),
+            });
+        }
+        let total = sizes.iter().try_fold(0_i128, |total, &size| {
+            if size < 0 {
+                None
+            } else {
+                total.checked_add(i128::from(size))
+            }
+        });
+        if let (Some(total), Some(extent)) = (total, t.shape[axis].as_const())
+            && total != i128::from(extent)
+        {
+            return Err(ShapeInferError::Invalid {
+                op: "Split".into(),
+                detail: format!("split sizes sum to {total}, but axis extent is {extent}"),
+            });
+        }
+    }
+    if let Some(num_outputs) = num_outputs
+        && num_outputs != n_out
+    {
+        return Err(ShapeInferError::Invalid {
+            op: "Split".into(),
+            detail: format!("num_outputs is {num_outputs} but the node has {n_out} outputs"),
+        });
+    }
 
     for i in 0..n_out {
         let mut shape = t.shape.clone();

@@ -16,8 +16,147 @@ fn c(n: i64) -> DimExpr {
     DimExpr::constant(n)
 }
 
+#[test]
+fn constant_variants_and_constant_of_shape_static_validation() {
+    let int = run(
+        &with_attr(node("Constant", 0, 1), "value_int", Attribute::Int(9)),
+        vec![],
+        13,
+    );
+    assert_eq!(out_shape(&int), Vec::<DimExpr>::new());
+    assert_eq!(int[0].shape_data.as_ref().unwrap().elems, vec![c(9)]);
+
+    let floats = run(
+        &with_attr(
+            node("Constant", 0, 1),
+            "value_floats",
+            Attribute::Floats(vec![1.0, 2.0]),
+        ),
+        vec![],
+        13,
+    );
+    assert_eq!(out_dtype(&floats), DataType::Float32);
+    assert_eq!(out_shape(&floats), vec![c(2)]);
+
+    let constant_of_shape = node("ConstantOfShape", 1, 1);
+    assert!(
+        try_run(
+            &constant_of_shape,
+            vec![tin(DataType::Int64, vec![c(1), c(1)])],
+            13,
+        )
+        .is_err()
+    );
+    assert!(try_run(&constant_of_shape, vec![sd_vec(vec![c(-1)])], 13,).is_err());
+}
+
+#[test]
+fn quantization_static_metadata_rejects_invalid_scalar_block_and_dtype_cases() {
+    assert!(
+        try_run(
+            &node("QuantizeLinear", 2, 1),
+            vec![f32in(vec![]), f32in(vec![c(1)])],
+            13,
+        )
+        .is_err()
+    );
+
+    let invalid_dtype = with_attr(
+        node("QuantizeLinear", 2, 1),
+        "output_dtype",
+        Attribute::Int(-1),
+    );
+    assert!(try_run(&invalid_dtype, vec![f32in(vec![c(2)]), f32in(vec![])], 21,).is_err());
+
+    let blocked = with_attr(
+        node("QuantizeLinear", 3, 1),
+        "block_size",
+        Attribute::Int(2),
+    );
+    assert!(
+        try_run(
+            &blocked,
+            vec![
+                f32in(vec![c(2), c(4)]),
+                f32in(vec![c(2)]),
+                tin(DataType::Uint8, vec![c(2), c(2)]),
+            ],
+            21,
+        )
+        .is_err()
+    );
+    assert!(
+        try_run(
+            &blocked,
+            vec![
+                f32in(vec![c(2), c(4)]),
+                f32in(vec![c(2), c(2)]),
+                tin(DataType::Uint8, vec![c(2)]),
+            ],
+            21,
+        )
+        .is_err()
+    );
+    assert!(
+        try_run(
+            &blocked,
+            vec![
+                f32in(vec![c(2), c(4)]),
+                f32in(vec![c(2), c(3)]),
+                tin(DataType::Uint8, vec![c(2), c(3)]),
+            ],
+            21,
+        )
+        .is_err()
+    );
+}
+
 fn sym(n: u32) -> DimExpr {
     DimExpr::symbol(SymbolId(n))
+}
+
+#[test]
+fn gather_elementwise_and_nd_validate_rank_and_batch_depth() {
+    let elements = with_attr(node("GatherElements", 2, 1), "axis", Attribute::Int(-1));
+    let out = run(
+        &elements,
+        vec![
+            f32in(vec![c(2), c(3)]),
+            tin(DataType::Int64, vec![c(2), c(4)]),
+        ],
+        13,
+    );
+    assert_eq!(out_shape(&out), vec![c(2), c(4)]);
+    assert!(
+        try_run(
+            &elements,
+            vec![f32in(vec![c(2), c(3)]), tin(DataType::Int64, vec![c(2)])],
+            13,
+        )
+        .is_err()
+    );
+
+    let gather_nd = with_attr(node("GatherND", 2, 1), "batch_dims", Attribute::Int(1));
+    let out = run(
+        &gather_nd,
+        vec![
+            f32in(vec![c(2), c(3), c(4)]),
+            tin(DataType::Int64, vec![c(2), c(5), c(1)]),
+        ],
+        13,
+    );
+    assert_eq!(out_shape(&out), vec![c(2), c(5), c(4)]);
+    assert!(
+        try_run(
+            &gather_nd,
+            vec![
+                f32in(vec![c(2), c(3)]),
+                tin(DataType::Int64, vec![c(2), c(5), c(2)]),
+            ],
+            13,
+        )
+        .is_err()
+    );
 }
 
 /// A typed input with the given dtype and dims.
@@ -1225,6 +1364,40 @@ fn reshape_rejects_multiple_inferred_dimensions_and_product_mismatches() {
 }
 
 #[test]
+fn reshape_validates_static_target_values_without_guessing_dynamic_targets() {
+    let n = node("Reshape", 2, 1);
+    assert!(try_run(&n, vec![f32in(vec![c(2), c(3)]), sd_vec(vec![c(-2)])], 13).is_err());
+    assert!(
+        try_run(
+            &n,
+            vec![f32in(vec![c(2), c(3)]), sd_vec(vec![c(-1), c(4)])],
+            13
+        )
+        .is_err()
+    );
+    assert!(try_run(&n, vec![f32in(vec![c(2)]), sd_vec(vec![c(0), c(0)])], 13).is_err());
+
+    let allowzero = with_attr(node("Reshape", 2, 1), "allowzero", Attribute::Int(1));
+    assert!(
+        try_run(
+            &allowzero,
+            vec![f32in(vec![c(0)]), sd_vec(vec![c(0), c(-1)])],
+            14,
+        )
+        .is_err()
+    );
+    let zero = run(&allowzero, vec![f32in(vec![c(0)]), sd_vec(vec![c(0)])], 14);
+    assert_eq!(out_shape(&zero), vec![c(0)]);
+
+    let dynamic = run(
+        &n,
+        vec![f32in(vec![c(2), c(3)]), tin(DataType::Int64, vec![c(2)])],
+        13,
+    );
+    assert!(dynamic[0].type_info.is_none());
+}
+
+#[test]
 fn reshape_symbolic_target_dim() {
     // target carries a symbolic dim (batch read from a Shape op)
     let n = node("Reshape", 2, 1);
@@ -1700,7 +1873,10 @@ fn squeeze_static_axes_reject_invalid_dims_and_leave_dynamic_dims_unresolved() {
         13,
     )
     .unwrap_err();
-    assert!(err.to_string().contains("axis 2 is out of range for rank 2"));
+    assert!(
+        err.to_string()
+            .contains("axis 2 is out of range for rank 2")
+    );
 
     let err = try_run(
         &axes_input,
@@ -1708,9 +1884,10 @@ fn squeeze_static_axes_reject_invalid_dims_and_leave_dynamic_dims_unresolved() {
         13,
     )
     .unwrap_err();
-    assert!(err
-        .to_string()
-        .contains("cannot squeeze axis 1 with non-singleton extent 8"));
+    assert!(
+        err.to_string()
+            .contains("cannot squeeze axis 1 with non-singleton extent 8")
+    );
 
     let outs = run(
         &axes_input,
@@ -1745,19 +1922,26 @@ fn squeeze_static_axes_validate_structure_before_dynamic_extents() {
         13,
     )
     .unwrap_err();
-    assert!(err.to_string().contains("axis 0 is specified more than once"));
+    assert!(
+        err.to_string()
+            .contains("axis 0 is specified more than once")
+    );
 
     let err = try_run(&axes_input, vec![input, sd_vec(vec![c(0), c(2)])], 13).unwrap_err();
-    assert!(err
-        .to_string()
-        .contains("axis 2 is out of range for rank 2"));
+    assert!(
+        err.to_string()
+            .contains("axis 2 is out of range for rank 2")
+    );
 }
 
 #[test]
 fn squeeze_v11_rejects_duplicate_static_axes() {
     let n = with_attr(node("Squeeze", 1, 1), "axes", Attribute::Ints(vec![0, 0]));
     let err = try_run(&n, vec![f32in(vec![c(1), c(8)])], 11).unwrap_err();
-    assert!(err.to_string().contains("axis 0 is specified more than once"));
+    assert!(
+        err.to_string()
+            .contains("axis 0 is specified more than once")
+    );
 }
 
 // --- Slice ----------------------------------------------------------------
@@ -2599,6 +2783,37 @@ fn split_num_outputs_zero_size_final_chunk() {
 }
 
 #[test]
+fn split_input_sizes_are_uneven_and_must_match_outputs_and_axis_extent() {
+    let n = with_attr(node("Split", 2, 2), "axis", Attribute::Int(1));
+    let outs = run(
+        &n,
+        vec![f32in(vec![c(3), c(7)]), sd_vec(vec![c(2), c(5)])],
+        18,
+    );
+    assert_eq!(out_shape(&outs), vec![c(3), c(2)]);
+    assert_eq!(outs[1].type_info.as_ref().unwrap().shape, vec![c(3), c(5)]);
+
+    assert!(
+        try_run(
+            &n,
+            vec![f32in(vec![c(3), c(7)]), sd_vec(vec![c(2), c(4)])],
+            18,
+        )
+        .is_err()
+    );
+
+    let both = with_attr(n.clone(), "num_outputs", Attribute::Int(2));
+    assert!(
+        try_run(
+            &both,
+            vec![f32in(vec![c(3), c(7)]), sd_vec(vec![c(2), c(5)])],
+            18,
+        )
+        .is_err()
+    );
+}
+
+#[test]
 fn comparison_ops_broadcast_to_bool() {
     for op in ["Less", "LessOrEqual", "Greater", "GreaterOrEqual", "Equal"] {
         let outs = run(
@@ -2628,6 +2843,39 @@ fn logical_ops_broadcast_to_bool() {
         assert_eq!(out_shape(&outs), vec![c(2), c(3)], "{op}");
         assert_eq!(out_dtype(&outs), DataType::Bool, "{op}");
     }
+}
+
+#[test]
+fn elementwise_shape_data_handles_vector_scalar_and_exact_division() {
+    let add = run(
+        &node("Add", 2, 1),
+        vec![
+            sd_vec(vec![c(2), c(5)]),
+            sd_int_scalar(DataType::Int64, c(3)),
+        ],
+        13,
+    );
+    assert_eq!(add[0].shape_data.as_ref().unwrap().elems, vec![c(5), c(8)]);
+
+    let div = run(
+        &node("Div", 2, 1),
+        vec![
+            sd_int_scalar(DataType::Int64, c(12)),
+            sd_vec(vec![c(2), c(3)]),
+        ],
+        13,
+    );
+    assert_eq!(div[0].shape_data.as_ref().unwrap().elems, vec![c(6), c(4)]);
+
+    let maximum = run(
+        &node("Max", 2, 1),
+        vec![sd_vec(vec![c(2), c(9)]), sd_vec(vec![c(7), c(3)])],
+        13,
+    );
+    assert_eq!(
+        maximum[0].shape_data.as_ref().unwrap().elems,
+        vec![c(7), c(9)]
+    );
 }
 
 #[test]
