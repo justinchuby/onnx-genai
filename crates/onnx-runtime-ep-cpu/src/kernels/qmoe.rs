@@ -137,7 +137,15 @@ impl Kernel for QMoEKernel {
             )));
         }
         let hidden = *x_shape.last().unwrap();
-        let rows = x_shape[..x_shape.len() - 1].iter().product::<usize>();
+        let rows = checked_product(&x_shape[..x_shape.len() - 1], "flattened input row count")?;
+        for (index, input) in inputs
+            .iter()
+            .enumerate()
+            .filter(|(_, input)| !input.is_absent())
+        {
+            checked_tensor_layout(&format!("input {index}"), input.shape, input.dtype)?;
+        }
+        let output_elements = checked_tensor_layout("output", outputs[0].shape, outputs[0].dtype)?;
         require_rank("router_probs", inputs[1].shape, 2)?;
         if inputs[1].shape[0] != rows {
             return Err(error(format!(
@@ -176,7 +184,7 @@ impl Kernel for QMoEKernel {
                 self.block_size
             )));
         }
-        let fc1_size = self.attributes.fc1_size(inter);
+        let fc1_size = self.attributes.checked_fc1_size(inter, "QMoE")?;
 
         let fc1 = QuantizedExperts::new(
             "fc1",
@@ -251,43 +259,52 @@ impl Kernel for QMoEKernel {
         let x = to_dense_f32(&inputs[0])?;
         let router = to_dense_f32(&inputs[1])?;
         let aggregation = optional_dense(inputs, 14)?;
-        let mut output = vec![0.0f32; rows * hidden];
+        let expected_output_elements = checked_product(&[rows, hidden], "output element count")?;
+        if output_elements != expected_output_elements {
+            return Err(error(format!(
+                "output has {output_elements} elements, expected {expected_output_elements}"
+            )));
+        }
+        let mut output = vec![0.0f32; output_elements];
         for row in 0..rows {
+            let router_range = checked_range(row, experts, "router row")?;
             let route = routing_weights(
-                &router[row * experts..(row + 1) * experts],
+                &router[router_range.clone()],
                 aggregation
                     .as_deref()
-                    .map(|weights| &weights[row * experts..(row + 1) * experts]),
+                    .map(|weights| &weights[router_range.clone()]),
                 self.attributes.k,
                 self.attributes.normalize_routing_weights,
             );
-            let input_row = &x[row * hidden..(row + 1) * hidden];
+            let input_range = checked_range(row, hidden, "input row")?;
+            let input_row = &x[input_range];
+            let output_range = checked_range(row, hidden, "output row")?;
+            let output_row = &mut output[output_range];
             for (expert, route_weight) in route {
-                let fc1_weight = fc1.dequantize_expert(expert);
-                let fc2_weight = fc2.dequantize_expert(expert);
+                let fc1_weight = fc1.dequantize_expert(expert)?;
+                let fc2_weight = fc2.dequantize_expert(expert)?;
                 let fc3_weight = fc3
                     .as_ref()
-                    .map(|weights| weights.dequantize_expert(expert));
+                    .map(|weights| weights.dequantize_expert(expert))
+                    .transpose()?;
+                let fc1_bias_range = checked_range(expert, fc1_size, "fc1 bias expert row")?;
+                let fc2_bias_range = checked_range(expert, hidden, "fc2 bias expert row")?;
+                let fc3_bias_range = checked_range(expert, inter, "fc3 bias expert row")?;
                 let expert_out = run_expert(
                     input_row,
                     &fc1_weight,
-                    fc1_bias
-                        .as_deref()
-                        .map(|bias| &bias[expert * fc1_size..(expert + 1) * fc1_size]),
+                    fc1_bias.as_deref().map(|bias| &bias[fc1_bias_range]),
                     &fc2_weight,
-                    fc2_bias
-                        .as_deref()
-                        .map(|bias| &bias[expert * hidden..(expert + 1) * hidden]),
+                    fc2_bias.as_deref().map(|bias| &bias[fc2_bias_range]),
                     fc3_weight.as_deref(),
-                    fc3_bias
-                        .as_deref()
-                        .map(|bias| &bias[expert * inter..(expert + 1) * inter]),
+                    fc3_bias.as_deref().map(|bias| &bias[fc3_bias_range]),
+                    fc1_size,
                     hidden,
                     inter,
                     &self.attributes,
                 );
                 for feature in 0..hidden {
-                    output[row * hidden + feature] += route_weight * expert_out[feature];
+                    output_row[feature] += route_weight * expert_out[feature];
                 }
             }
         }
@@ -303,11 +320,13 @@ struct QuantizedExperts {
     packed: Vec<u8>,
     scales: Vec<f32>,
     zero_points: Option<Vec<u8>>,
+    experts: usize,
     out_features: usize,
     in_features: usize,
     packed_in: usize,
     blocks: usize,
     zero_point_bytes: usize,
+    dequantized_elements: usize,
     bits: usize,
     block_size: usize,
 }
@@ -332,58 +351,177 @@ impl QuantizedExperts {
             )));
         }
         let packed_in = in_features / pack_size;
+        let expert_rows = checked_product(
+            &[experts, out_features],
+            &format!("{name} expert-row count"),
+        )?;
+        let packed_elements = checked_product(
+            &[expert_rows, packed_in],
+            &format!("{name} packed-weight element count"),
+        )?;
+        checked_byte_count(
+            packed_elements,
+            std::mem::size_of::<u8>(),
+            &format!("{name} packed-weight byte count"),
+        )?;
         require_exact_shape(
             &format!("{name}_experts_weights"),
             packed.shape,
             &[experts, out_features, packed_in],
         )?;
         let blocks = in_features / block_size;
+        let scale_elements = checked_product(
+            &[expert_rows, blocks],
+            &format!("{name} scale element count"),
+        )?;
+        checked_byte_count(
+            scale_elements,
+            std::mem::size_of::<f32>(),
+            &format!("{name} scale byte count"),
+        )?;
         require_exact_shape(
             &format!("{name}_scales"),
             scales.shape,
             &[experts, out_features, blocks],
         )?;
-        let zero_point_bytes = blocks.div_ceil(pack_size);
+        let zero_point_bytes = blocks
+            .checked_add(pack_size - 1)
+            .ok_or_else(|| error(format!("{name} zero-point row byte count overflow")))?
+            / pack_size;
         if let Some(points) = zero_points {
+            let affine_block = block_size
+                .checked_mul(pack_size)
+                .ok_or_else(|| error(format!("{name} affine block width overflow")))?;
+            if !in_features.is_multiple_of(affine_block) {
+                return Err(error(format!(
+                    "{name} input features {in_features} must be divisible by block_size * \
+                     pack_size ({affine_block}) when zero points are supplied"
+                )));
+            }
+            let zero_point_elements = checked_product(
+                &[expert_rows, zero_point_bytes],
+                &format!("{name} zero-point element count"),
+            )?;
+            checked_byte_count(
+                zero_point_elements,
+                std::mem::size_of::<u8>(),
+                &format!("{name} zero-point byte count"),
+            )?;
             require_exact_shape(
                 &format!("{name}_zero_points"),
                 points.shape,
                 &[experts, out_features, zero_point_bytes],
             )?;
         }
+        preflight_row_ranges(expert_rows, packed_in, &format!("{name} packed-weight"))?;
+        preflight_row_ranges(expert_rows, blocks, &format!("{name} scale"))?;
+        preflight_row_ranges(expert_rows, zero_point_bytes, &format!("{name} zero-point"))?;
+        let dequantized_elements = checked_product(
+            &[out_features, in_features],
+            &format!("{name} per-expert dequantized element count"),
+        )?;
+        checked_byte_count(
+            dequantized_elements,
+            std::mem::size_of::<f32>(),
+            &format!("{name} per-expert dequantized byte count"),
+        )?;
+        preflight_row_ranges(
+            out_features,
+            in_features,
+            &format!("{name} dequantized output"),
+        )?;
         Ok(Self {
             packed: to_dense_bytes(packed)?,
             scales: to_dense_f32(scales)?,
             zero_points: zero_points.map(to_dense_bytes).transpose()?,
+            experts,
             out_features,
             in_features,
             packed_in,
             blocks,
             zero_point_bytes,
+            dequantized_elements,
             bits,
             block_size,
         })
     }
 
-    fn dequantize_expert(&self, expert: usize) -> Vec<f32> {
-        let mut output = vec![0.0f32; self.out_features * self.in_features];
+    fn dequantize_expert(&self, expert: usize) -> Result<Vec<f32>> {
+        if expert >= self.experts {
+            return Err(error(format!(
+                "routed expert {expert} is out of range for {} experts",
+                self.experts
+            )));
+        }
+        let mut output = vec![0.0f32; self.dequantized_elements];
         for row in 0..self.out_features {
-            let packed_start = (expert * self.out_features + row) * self.packed_in;
-            let scale_start = (expert * self.out_features + row) * self.blocks;
-            let zero_point_start = (expert * self.out_features + row) * self.zero_point_bytes;
+            let expert_row = expert
+                .checked_mul(self.out_features)
+                .and_then(|offset| offset.checked_add(row))
+                .ok_or_else(|| error("expert-row offset overflow"))?;
+            let packed_range =
+                checked_range(expert_row, self.packed_in, "packed-weight expert row")?;
+            let scale_range = checked_range(expert_row, self.blocks, "scale expert row")?;
+            let zero_point_range =
+                checked_range(expert_row, self.zero_point_bytes, "zero-point expert row")?;
+            let output_range = checked_range(row, self.in_features, "dequantized output row")?;
             dequantize_nbits_row(
-                &self.packed[packed_start..packed_start + self.packed_in],
-                &self.scales[scale_start..scale_start + self.blocks],
-                self.zero_points.as_ref().map(|points| {
-                    &points[zero_point_start..zero_point_start + self.zero_point_bytes]
-                }),
-                &mut output[row * self.in_features..(row + 1) * self.in_features],
+                &self.packed[packed_range],
+                &self.scales[scale_range],
+                self.zero_points
+                    .as_ref()
+                    .map(|points| &points[zero_point_range]),
+                &mut output[output_range],
                 self.bits,
                 self.block_size,
             );
         }
-        output
+        Ok(output)
     }
+}
+
+fn checked_product(factors: &[usize], context: &str) -> Result<usize> {
+    let mut product = 1usize;
+    let mut has_zero = false;
+    for &factor in factors {
+        if factor == 0 {
+            has_zero = true;
+        } else {
+            product = product
+                .checked_mul(factor)
+                .ok_or_else(|| error(format!("{context} overflow")))?;
+        }
+    }
+    Ok(if has_zero { 0 } else { product })
+}
+
+fn checked_byte_count(elements: usize, element_size: usize, context: &str) -> Result<usize> {
+    elements
+        .checked_mul(element_size)
+        .ok_or_else(|| error(format!("{context} overflow")))
+}
+
+fn checked_tensor_layout(name: &str, shape: &[usize], dtype: DataType) -> Result<usize> {
+    let elements = checked_product(shape, &format!("{name} element count"))?;
+    checked_byte_count(elements, dtype.byte_size(), &format!("{name} byte count"))?;
+    Ok(elements)
+}
+
+fn checked_range(index: usize, width: usize, context: &str) -> Result<std::ops::Range<usize>> {
+    let start = index
+        .checked_mul(width)
+        .ok_or_else(|| error(format!("{context} start offset overflow")))?;
+    let end = start
+        .checked_add(width)
+        .ok_or_else(|| error(format!("{context} end offset overflow")))?;
+    Ok(start..end)
+}
+
+fn preflight_row_ranges(rows: usize, width: usize, context: &str) -> Result<()> {
+    if rows != 0 {
+        checked_range(rows - 1, width, context)?;
+    }
+    Ok(())
 }
 
 fn optional_input<'a, 'b>(
@@ -596,6 +734,43 @@ mod tests {
         }
     }
 
+    fn tiny_owned(dtype: DataType, shape: &[usize]) -> Owned {
+        Owned {
+            bytes: vec![0; dtype.byte_size().max(1)],
+            shape: shape.to_vec(),
+            strides: vec![0; shape.len()],
+            dtype,
+        }
+    }
+
+    fn overflow_test_kernel() -> Box<dyn Kernel> {
+        let inputs = [
+            Some((DataType::Float32, &[1, 16][..])),
+            Some((DataType::Float32, &[1, 1])),
+            Some((DataType::Uint8, &[1, 16, 8])),
+            Some((DataType::Float32, &[1, 16, 1])),
+            None,
+            Some((DataType::Uint8, &[1, 16, 8])),
+            Some((DataType::Float32, &[1, 16, 1])),
+        ];
+        let attrs = attributes(4, 16, 1, false);
+        let (graph, node) = model_node("QMoE", &inputs, &[1, 16], &attrs);
+        kernel(&graph, node).unwrap()
+    }
+
+    fn assert_kernel_failure_contains(result: Result<()>, expected: &str) {
+        match result {
+            Err(EpError::KernelFailed(message)) => {
+                assert!(
+                    message.contains(expected),
+                    "expected error containing '{expected}', got '{message}'"
+                );
+            }
+            Err(other) => panic!("expected KernelFailed, got {other}"),
+            Ok(()) => panic!("overflowing QMoE input unexpectedly succeeded"),
+        }
+    }
+
     fn run_equivalence(
         bits: usize,
         hidden: usize,
@@ -751,5 +926,84 @@ mod tests {
             Err(error) => error.to_string(),
         };
         assert!(failure.contains("block_size must be a power of two and at least 16"));
+    }
+
+    #[test]
+    fn qmoe_rejects_flattened_rows_overflow_before_allocation() {
+        let x = tiny_owned(DataType::Float32, &[usize::MAX, 2, 0]);
+        let router = tiny_owned(DataType::Float32, &[0, 1]);
+        let fc1_packed = tiny_owned(DataType::Uint8, &[1, 16, 0]);
+        let fc1_scales = tiny_owned(DataType::Float32, &[1, 16, 0]);
+        let fc2_packed = tiny_owned(DataType::Uint8, &[1, 0, 8]);
+        let fc2_scales = tiny_owned(DataType::Float32, &[1, 0, 1]);
+        let mut output = tiny_owned(DataType::Float32, &[usize::MAX, 2, 0]);
+
+        let result = overflow_test_kernel().execute(
+            &[
+                x.view(),
+                router.view(),
+                fc1_packed.view(),
+                fc1_scales.view(),
+                TensorView::absent(DataType::Float32),
+                fc2_packed.view(),
+                fc2_scales.view(),
+            ],
+            &mut [output.view_mut()],
+        );
+
+        assert_kernel_failure_contains(result, "flattened input row count overflow");
+    }
+
+    #[test]
+    fn qmoe_rejects_zero_masked_tensor_overflow_before_allocation() {
+        let x = tiny_owned(DataType::Float32, &[0, usize::MAX, 2]);
+        let router = tiny_owned(DataType::Float32, &[0, 1]);
+        let fc1_packed = tiny_owned(DataType::Uint8, &[1, 16, 1]);
+        let fc1_scales = tiny_owned(DataType::Float32, &[1, 16, 0]);
+        let fc2_packed = tiny_owned(DataType::Uint8, &[1, 2, 8]);
+        let fc2_scales = tiny_owned(DataType::Float32, &[1, 2, 1]);
+        let mut output = tiny_owned(DataType::Float32, &[0, usize::MAX, 2]);
+
+        let result = overflow_test_kernel().execute(
+            &[
+                x.view(),
+                router.view(),
+                fc1_packed.view(),
+                fc1_scales.view(),
+                TensorView::absent(DataType::Float32),
+                fc2_packed.view(),
+                fc2_scales.view(),
+            ],
+            &mut [output.view_mut()],
+        );
+
+        assert_kernel_failure_contains(result, "input 0 element count overflow");
+    }
+
+    #[test]
+    fn qmoe_rejects_quantized_expert_layout_overflow_before_allocation() {
+        let experts = usize::MAX / 16 + 1;
+        let x = tiny_owned(DataType::Float32, &[1, 16]);
+        let router = tiny_owned(DataType::Float32, &[1, experts]);
+        let fc1_packed = tiny_owned(DataType::Uint8, &[experts, 16, 8]);
+        let fc1_scales = tiny_owned(DataType::Float32, &[experts, 16, 1]);
+        let fc2_packed = tiny_owned(DataType::Uint8, &[experts, 16, 8]);
+        let fc2_scales = tiny_owned(DataType::Float32, &[experts, 16, 1]);
+        let mut output = tiny_owned(DataType::Float32, &[1, 16]);
+
+        let result = overflow_test_kernel().execute(
+            &[
+                x.view(),
+                router.view(),
+                fc1_packed.view(),
+                fc1_scales.view(),
+                TensorView::absent(DataType::Float32),
+                fc2_packed.view(),
+                fc2_scales.view(),
+            ],
+            &mut [output.view_mut()],
+        );
+
+        assert_kernel_failure_contains(result, "input 2 element count overflow");
     }
 }

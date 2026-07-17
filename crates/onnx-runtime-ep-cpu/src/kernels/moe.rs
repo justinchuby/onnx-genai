@@ -198,7 +198,7 @@ impl Kernel for MoEKernel {
             )));
         }
         let inter = inputs[4].shape[2];
-        let expected_fc1 = self.attributes.fc1_size(inter);
+        let expected_fc1 = self.attributes.checked_fc1_size(inter, "MoE")?;
         if inputs[2].shape[1] != expected_fc1 {
             return Err(error(format!(
                 "fc1_experts_weights dimension 1 must be {expected_fc1}, got {}",
@@ -266,6 +266,7 @@ impl Kernel for MoEKernel {
                     fc3_bias
                         .as_deref()
                         .map(|b| &b[expert * inter..(expert + 1) * inter]),
+                    expected_fc1,
                     hidden,
                     inter,
                     &self.attributes,
@@ -284,11 +285,15 @@ impl Kernel for MoEKernel {
 }
 
 impl MoeAttributes {
-    pub(super) fn fc1_size(&self, inter: usize) -> usize {
+    pub(super) fn checked_fc1_size(&self, inter: usize, op: &str) -> Result<usize> {
         if self.activation == Activation::Swiglu && self.swiglu_fusion != 0 {
-            2 * inter
+            inter.checked_mul(2).ok_or_else(|| {
+                EpError::KernelFailed(format!(
+                    "{op}: fused SwiGLU FC1 width overflow for inter_size {inter}"
+                ))
+            })
         } else {
-            inter
+            Ok(inter)
         }
     }
 
@@ -306,17 +311,12 @@ pub(super) fn run_expert(
     fc2_bias: Option<&[f32]>,
     fc3_weights: Option<&[f32]>,
     fc3_bias: Option<&[f32]>,
+    fc1_size: usize,
     hidden: usize,
     inter: usize,
     attributes: &MoeAttributes,
 ) -> Vec<f32> {
-    let mut fc1_out = linear(
-        input,
-        fc1_weights,
-        fc1_bias,
-        attributes.fc1_size(inter),
-        hidden,
-    );
+    let mut fc1_out = linear(input, fc1_weights, fc1_bias, fc1_size, hidden);
     let activated = match attributes.activation {
         Activation::Swiglu => {
             let linear_part;
