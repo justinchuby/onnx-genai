@@ -180,22 +180,70 @@ fn i64s(bytes: &[u8]) -> Vec<i64> {
 }
 
 #[test]
-fn topk_largest_ties_k_input_and_non_default_axis() {
+fn topk_non_final_axes_match_cpu_layout_and_are_deterministic() {
+    let axis_zero = || {
+        run(
+            "TopK",
+            10,
+            &[
+                tensor(
+                    DataType::Float32,
+                    &[3, 4],
+                    &[5_f32, 1., 7., 2., 5., 4., 6., 9., 3., 4., 8., 9.],
+                ),
+                tensor(DataType::Int64, &[], &[2_i64]),
+            ],
+            &[
+                (DataType::Float32, vec![2, 4]),
+                (DataType::Int64, vec![2, 4]),
+            ],
+            &[("axis", Attribute::Int(0))],
+        )
+    };
+    let out = axis_zero();
+    assert_eq!(f32s(&out[0]), vec![5., 4., 8., 9., 5., 4., 7., 9.]);
+    assert_eq!(i64s(&out[1]), vec![0, 1, 2, 1, 1, 2, 0, 2]);
+    assert_eq!(out, axis_zero());
+
+    let middle_axis = || {
+        run(
+            "TopK",
+            10,
+            &[
+                tensor(
+                    DataType::Float32,
+                    &[2, 3, 2],
+                    &[1_f32, 9., 5., 9., 5., 2., 7., 4., 6., 8., 7., 8.],
+                ),
+                tensor(DataType::Int64, &[], &[2_i64]),
+            ],
+            &[
+                (DataType::Float32, vec![2, 2, 2]),
+                (DataType::Int64, vec![2, 2, 2]),
+            ],
+            &[("axis", Attribute::Int(1))],
+        )
+    };
+    let out = middle_axis();
+    assert_eq!(f32s(&out[0]), vec![5., 9., 5., 9., 7., 8., 7., 8.]);
+    assert_eq!(i64s(&out[1]), vec![1, 0, 2, 1, 0, 1, 2, 2]);
+    assert_eq!(out, middle_axis());
+}
+
+#[test]
+fn topk_largest_ties_k_input() {
     let out = run(
         "TopK",
         10,
         &[
-            tensor(DataType::Float32, &[2, 3], &[4_f32, 5., 6., 4., 2., 6.]),
+            tensor(DataType::Float32, &[4], &[4_f32, 5., 5., 2.]),
             tensor(DataType::Int64, &[], &[2_i64]),
         ],
-        &[
-            (DataType::Float32, vec![2, 3]),
-            (DataType::Int64, vec![2, 3]),
-        ],
-        &[("axis", Attribute::Int(0))],
+        &[(DataType::Float32, vec![2]), (DataType::Int64, vec![2])],
+        &[],
     );
-    assert_eq!(f32s(&out[0]), vec![4., 4., 5., 2., 6., 6.]);
-    assert_eq!(i64s(&out[1]), vec![0, 1, 0, 1, 0, 1]);
+    assert_eq!(f32s(&out[0]), vec![5., 5.]);
+    assert_eq!(i64s(&out[1]), vec![1, 2]);
 }
 
 #[test]

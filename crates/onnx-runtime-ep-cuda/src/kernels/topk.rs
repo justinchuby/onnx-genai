@@ -33,7 +33,7 @@ extern "C" __global__ void topk_f32(
       for (unsigned long long candidate = 0; candidate < width; ++candidate) {
         bool used = false;
         for (unsigned long long prior = 0; prior < out; ++prior)
-          if (indices[(outer * inner + i) * k + prior] == (long long)candidate) used = true;
+          if (indices[(outer * k + prior) * inner + i] == (long long)candidate) used = true;
         if (used) continue;
         float value = input[(outer * width + candidate) * inner + i];
         if (best_index < 0 || before(value, best, (long long)candidate, best_index, largest)) {
@@ -41,7 +41,7 @@ extern "C" __global__ void topk_f32(
           best_index = (long long)candidate;
         }
       }
-      unsigned long long offset = (outer * inner + i) * k + out;
+      unsigned long long offset = (outer * k + out) * inner + i;
       values[offset] = best;
       indices[offset] = best_index;
     }
