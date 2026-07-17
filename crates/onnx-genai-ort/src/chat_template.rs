@@ -16,6 +16,8 @@ const DEFAULT_CHAT_TEMPLATE: &str = r#"{% for message in messages %}{{ message.r
 #[derive(Debug, Clone)]
 pub struct ChatTemplate {
     template: String,
+    bos_token: Option<String>,
+    eos_token: Option<String>,
 }
 
 /// Chat roles understood by common Hugging Face chat templates.
@@ -128,6 +130,8 @@ impl ChatTemplate {
     pub fn builtin_default() -> Self {
         Self {
             template: DEFAULT_CHAT_TEMPLATE.to_string(),
+            bos_token: None,
+            eos_token: None,
         }
     }
 
@@ -135,31 +139,46 @@ impl ChatTemplate {
     ///
     /// A standalone `chat_template.jinja` takes precedence to match ORT-GenAI.
     pub fn from_model_dir(model_dir: &Path) -> Result<Self> {
-        let standalone = model_dir.join("chat_template.jinja");
-        if standalone.is_file() {
-            return Ok(Self {
-                template: std::fs::read_to_string(standalone)?,
-            });
-        }
-
         let tokenizer_config = model_dir.join("tokenizer_config.json");
-        if tokenizer_config.is_file() {
+        let tokenizer_config_value = if tokenizer_config.is_file() {
             let text = std::fs::read_to_string(&tokenizer_config)?;
-            let value: Value = serde_json::from_str(&text).map_err(|err| {
+            Some(serde_json::from_str::<Value>(&text).map_err(|err| {
                 OrtError::InvalidArgument(format!(
                     "invalid JSON in {}: {err}",
                     tokenizer_config.display()
                 ))
-            })?;
+            })?)
+        } else {
+            None
+        };
+        let (bos_token, eos_token) = tokenizer_config_value
+            .as_ref()
+            .map(special_tokens)
+            .unwrap_or_default();
+
+        let standalone = model_dir.join("chat_template.jinja");
+        if standalone.is_file() {
+            return Ok(Self {
+                template: std::fs::read_to_string(standalone)?,
+                bos_token,
+                eos_token,
+            });
+        }
+
+        if let Some(value) = tokenizer_config_value {
             if let Some(template) = value.get("chat_template").and_then(Value::as_str) {
                 return Ok(Self {
                     template: template.to_string(),
+                    bos_token,
+                    eos_token,
                 });
             }
         }
 
         Ok(Self {
             template: DEFAULT_CHAT_TEMPLATE.to_string(),
+            bos_token,
+            eos_token,
         })
     }
 
@@ -182,7 +201,10 @@ impl ChatTemplate {
         };
 
         let mut env = Environment::new();
+        env.set_trim_blocks(true);
+        env.set_lstrip_blocks(true);
         env.add_filter("tojson", minijinja::filters::tojson);
+        env.add_function("raise_exception", raise_exception);
         env.add_template("chat", &self.template)
             .map_err(|err| OrtError::InvalidArgument(format!("invalid chat template: {err}")))?;
         let template = env
@@ -193,20 +215,43 @@ impl ChatTemplate {
                 messages => messages,
                 tools => tools,
                 add_generation_prompt => add_generation_prompt,
+                bos_token => self.bos_token.as_deref().unwrap_or_default(),
+                eos_token => self.eos_token.as_deref().unwrap_or_default(),
             })
             .map_err(|err| OrtError::InvalidArgument(format!("chat template render failed: {err}")))
     }
 }
 
+fn special_tokens(config: &Value) -> (Option<String>, Option<String>) {
+    (
+        special_token(config, "bos_token"),
+        special_token(config, "eos_token"),
+    )
+}
+
+fn special_token(config: &Value, key: &str) -> Option<String> {
+    let value = config.get(key)?;
+    value
+        .as_str()
+        .or_else(|| value.get("content").and_then(Value::as_str))
+        .map(ToString::to_string)
+}
+
+fn raise_exception(message: String) -> std::result::Result<(), minijinja::Error> {
+    Err(minijinja::Error::new(
+        minijinja::ErrorKind::InvalidOperation,
+        message,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::path::PathBuf;
 
     fn sample_messages() -> Vec<ChatMessage> {
-        vec![
-            ChatMessage::system("be brief"),
-            ChatMessage::user("hello"),
-        ]
+        vec![ChatMessage::system("be brief"), ChatMessage::user("hello")]
     }
 
     #[test]
@@ -221,8 +266,12 @@ mod tests {
         let messages = sample_messages();
         for add_generation_prompt in [false, true] {
             assert_eq!(
-                builtin.render(&messages, None, add_generation_prompt).unwrap(),
-                from_dir.render(&messages, None, add_generation_prompt).unwrap(),
+                builtin
+                    .render(&messages, None, add_generation_prompt)
+                    .unwrap(),
+                from_dir
+                    .render(&messages, None, add_generation_prompt)
+                    .unwrap(),
             );
         }
     }
@@ -239,5 +288,62 @@ mod tests {
             .render(&messages, None, true)
             .unwrap();
         assert_eq!(with, "system: be brief\nuser: hello\nassistant: ");
+    }
+
+    #[test]
+    fn standalone_template_loads_string_and_object_special_tokens() {
+        let dir = test_dir("special-tokens");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("chat_template.jinja"),
+            "{{ bos_token }}|{{ eos_token }}",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("tokenizer_config.json"),
+            r#"{"bos_token":{"content":"<bos>","lstrip":false},"eos_token":"<eos>"}"#,
+        )
+        .unwrap();
+
+        let rendered = ChatTemplate::from_model_dir(&dir)
+            .unwrap()
+            .render(&[], None, false)
+            .unwrap();
+        assert_eq!(rendered, "<bos>|<eos>");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn raise_exception_returns_render_error() {
+        let template = ChatTemplate {
+            template: "{{ raise_exception('invalid messages') }}".to_string(),
+            bos_token: None,
+            eos_token: None,
+        };
+
+        let error = template.render(&[], None, false).unwrap_err();
+        assert!(error.to_string().contains("invalid messages"));
+    }
+
+    #[test]
+    fn render_uses_hugging_face_block_whitespace_controls() {
+        let template = ChatTemplate {
+            template: "before\n    {% if true %}\n    value\n    {% endif %}\nafter".to_string(),
+            bos_token: None,
+            eos_token: None,
+        };
+
+        assert_eq!(
+            template.render(&[], None, false).unwrap(),
+            "before\n    value\nafter"
+        );
+    }
+
+    fn test_dir(name: &str) -> PathBuf {
+        std::env::current_dir().unwrap().join(format!(
+            "chat-template-test-{}-{}",
+            std::process::id(),
+            name
+        ))
     }
 }
