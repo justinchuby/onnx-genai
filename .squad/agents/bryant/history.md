@@ -23,3 +23,7 @@
 
 - 🟢 Cleared `557ca87`: CPU Bool `And`/`Or`/`Xor`/`Not` use logical nonzero semantics, canonical outputs, and broadcast truth-table coverage; 436 CPU tests passed.
 - 🟢 Cleared `14b5136`: `Expand` covers both broadcast directions, strict incompatibility, dtype passthrough, and unknown target-value rank fallback; 120 shape-inference tests passed.
+
+## 2026-07-17T02:24:32Z — Standard shape-inference review
+
+- 🟢 Cleared `98ee7a6`: the five new rules satisfy ONNX version/shape/dtype contracts and symbolic, divisibility, and overflow cases; 140 tests passed.

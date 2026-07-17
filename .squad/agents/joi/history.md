@@ -14,3 +14,7 @@
 
 - Merged `aa7127e`: CPU `Mod` supports fmod modes, broadcasting, and NumPy floor-mod integer semantics; 13/13 official Mod CPU cases passed.
 - Expanded Attention now reaches missing `And` execution at node 39; direct BF16 Mod coverage remains a follow-up.
+
+## 2026-07-17T02:24:32Z — Standard shape-inference expansion
+
+- Landed `98ee7a6`: added OneHot, Trilu, DepthToSpace, SpaceToDepth, and Compress inference with safe symbolic and checked-arithmetic behavior; 140 tests passed.

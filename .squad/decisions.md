@@ -1571,3 +1571,29 @@ The shell validation script and serialized ONNX fixture were additional tracked 
 - `cargo test -p onnx-genai-engine --features native-backend auto_backend`: 2 passed.
 
 **Commit:** `a776ebee4a3eddffdc6ce018d9c26cfab1a0bba7`
+
+## 2026-07-17 — QMoE sub-byte support
+
+### 2026-07-17: Restrict QMoE sub-byte experts to byte-dividing widths
+**By:** Roy
+**What:** CPU `com.microsoft::QMoE` now accepts `expert_weight_bits` in `{1, 2, 4, 8}`; unsupported widths, including 3-bit, remain rejected. Checked allocation, layout, range, and `isize::MAX` guards are unchanged.
+**Why:** Byte-dividing widths keep packed weights and zero points from crossing byte boundaries. With power-of-two blocks of at least 16, the generalized packing and partial zero-point tails remain byte-aligned.
+
+### 2026-07-17: Approve QMoE 1-bit and 2-bit expert support
+**By:** Nabil
+**What:** 🟢 Approved `cdb4ee5`, extending CPU `com.microsoft::QMoE` to 1-bit and 2-bit expert weights.
+**Why:** Factory acceptance is exactly `{1, 2, 4, 8}`; packing, offsets, masks, affine zero-point tails, and row sizing are correct for byte-dividing widths, while the established 4/8-bit path remains unchanged. New equivalence/rejection coverage and the full crate suite passed (450 passed, 1 ignored).
+
+
+## 2026-07-17 — Standard shape-inference coverage
+
+### 2026-07-17: Add ONNX shape inference for OneHot, Trilu, spatial rearrangements, and Compress
+**By:** Joi
+**What:** Added opset-aware inference for OneHot (9/11), Trilu (14), DepthToSpace (1/11/13), SpaceToDepth (1/13), and Compress (9/11). Dynamic extents become fresh symbols; specified input symbols and dtypes are preserved; spatial arithmetic/divisibility checks are checked.
+**Why:** These standard operators no longer block graph-shape resolution. The handlers follow ONNX axis, rank, blocksize, mode, dtype, and known-divisibility contracts without panicking on symbolic dimensions; 140 crate tests passed.
+
+### 2026-07-17: Approve OneHot/Trilu/spatial-rearrangement/Compress inference
+**By:** Bryant
+**What:** 🟢 Approved `98ee7a6`. The five handlers use correct schema-version registrations, shape/dtype contracts, symbolic degradation, known-divisibility validation, and checked `blocksize² * C` arithmetic.
+**Why:** Coverage includes OneHot axes/dynamic depth, Compress axis/no-axis, Trilu variants, spatial modes and schema versions, symbolic dimensions, divisibility failures, and blocksize-square overflow. `cargo test -p onnx-runtime-shape-inference` passed all 140 tests.
+

@@ -78,3 +78,7 @@ Authored CUDA Gather, Shape, and Constant kernels; coverage reached 65.
 ## 2026-07-14T00:00:00Z — QMoE landed
 
 - The `com.microsoft::QMoE` CPU kernel landed after Nabil’s review cycle and the checked-arithmetic/addressability hardening revisions. Blockwise Q4/Q8 is enabled; IQ1/IQ2/int2 and sparse mixer remain follow-ups.
+
+## 2026-07-17T02:24:32Z — QMoE int1/int2 support
+
+- Landed `cdb4ee5`: CPU `com.microsoft::QMoE` now accepts 1/2/4/8-bit expert weights; 3-bit remains rejected because packed values would cross byte boundaries.

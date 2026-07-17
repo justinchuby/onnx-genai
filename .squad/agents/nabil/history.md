@@ -23,3 +23,7 @@ Authored `docs/NATIVE_CUDA_DECODE.md` (`b416b7f`) and applied Fact Checker's str
 ## 2026-07-14T00:00:00Z — QMoE final approval
 
 - Rejected the initial and first hardening revisions, then approved the final QMoE kernel once overflow checks, allocation addressability, and odd affine-int4 block handling were correct.
+
+## 2026-07-17T02:24:32Z — QMoE int1/int2 review
+
+- 🟢 Cleared `cdb4ee5`: factory gating, packing, zero-point tails, sizing, and existing hardening are correct; full crate suite passed (450 passed, 1 ignored).
