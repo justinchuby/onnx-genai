@@ -86,35 +86,103 @@ the token dispatch externally.**
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-### Design Principles
+### Design Principles: Control Plane / Data Plane Separation
 
-1. **ORT sessions are opaque executors.** Each session holds a subset of experts as an
-   ONNX subgraph. It receives token hidden states, runs its local experts, returns results.
-   It knows nothing about other GPUs.
+The core insight: **separate the "what" (strategy/policy) from the "how" (execution).**
 
-2. **genai-server owns all routing logic.** The router network runs on a designated GPU
-   (or CPU). Router output determines which tokens go to which sessions.
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  CONTROL PLANE (Rust, async) — slow path, flexible, maintainable │
+│                                                                  │
+│  Responsibilities:                                               │
+│  • Expert placement decisions (which expert → which GPU)         │
+│  • Compile dispatch plan (lookup table: expert_id → gpu + offset)│
+│  • Monitor activation frequencies                                │
+│  • Dynamic rebalancing (replicate hot experts, hibernate cold)   │
+│  • KV cache eviction policy                                      │
+│  • SLA enforcement, session lifecycle                            │
+│                                                                  │
+│  When it intervenes:                                             │
+│  • Startup / model load                                          │
+│  • Rebalance events (every N seconds, not every token)           │
+│  • Error recovery                                                │
+│                                                                  │
+│  NOT on the per-token hot path.                                  │
+├─────────────────────────────────────────────────────────────────┤
+│  DATA PLANE (GPU-native) — hot path, maximum performance         │
+│                                                                  │
+│  Responsibilities:                                               │
+│  • Router forward (on-GPU, produces expert_ids + gate_weights)   │
+│  • Token dispatch via NCCL All-to-All (GPU↔GPU, no host)         │
+│  • Local expert compute (each GPU runs its shard)                │
+│  • Result gather via NCCL All-to-All                             │
+│  • Weighted combine (on-GPU)                                     │
+│  • Attention forward with TP AllReduce (on-GPU)                  │
+│                                                                  │
+│  The entire decode loop runs without returning to Rust.           │
+│  genai-server "fires" the loop and collects output tokens.       │
+└─────────────────────────────────────────────────────────────────┘
+```
 
-3. **Dispatch is async and batched.** For a batch of B tokens with top-K=16 experts,
-   the dispatcher groups tokens by target GPU and sends them in bulk, not one at a time.
+**Analogy:** Linux networking. Control plane (routing table, iptables) is set in
+userspace. Data plane (packet forwarding) runs in kernel fast path — packets never
+go back to userspace. Same idea: Rust sets the dispatch plan, GPUs execute it
+at wire speed.
 
-4. **Combine happens on the orchestrator side.** After all expert sessions return, genai-server
-   performs the weighted sum (gating weights × expert outputs) and feeds the result into
-   the next layer.
+### Why This Architecture
 
-### Why This Works
+1. **Performance = GPU-native.** The decode loop is pure GPU execution with NCCL
+   collectives. Zero Rust overhead per token. Equivalent to hand-written multi-GPU
+   pipeline (vLLM, Megatron, etc.).
 
-- **Leverages existing strengths.** ORT is already optimized for single-GPU execution.
-  genai-server's async Rust scheduler already manages multiple sessions. This extends
-  the model naturally.
+2. **Flexibility = Rust control plane.** Placement strategy, rebalancing policy,
+   monitoring, and lifecycle are all in maintainable Rust code. Changing routing
+   strategy doesn't require touching CUDA kernels.
 
-- **Clean separation of concerns.** Communication logic (which is model-architecture-specific)
-  lives in genai-server Rust code, not inside ORT kernels. This means supporting new
-  MoE variants (K3's LatentMoE, DeepSeek's shared experts, etc.) requires changing
-  orchestration code, not custom CUDA kernels.
+3. **Clarity = clean separation.** Data plane is deterministic execution of a compiled
+   plan. Control plane is policy/strategy. They interact through a narrow interface
+   (the dispatch plan table).
 
-- **Testable.** Each expert session can be tested in isolation. The dispatcher can be tested
-  with mock sessions. No need for multi-GPU hardware to test routing logic.
+4. **Testable.** Control plane tested with mock GPU metrics. Data plane tested with
+   real multi-GPU but deterministic inputs. The plan table is the contract between them.
+
+### How GPU Sessions Execute Without Host Round-Trips
+
+The key mechanism: **the dispatch plan is baked into each ORT session as a constant
+tensor.** Each GPU's session graph contains:
+
+```
+Router → LookupDispatchPlan → NCCL_AllToAll → LocalExperts → NCCL_AllToAll → Combine
+```
+
+This is achieved via a custom ONNX op (`MoeDispatch`) that encapsulates the NCCL call:
+
+```rust
+/// Custom ORT op that performs NCCL All-to-All for MoE token dispatch.
+/// Registered as a custom op domain in ORT; appears as a single node in the ONNX graph.
+///
+/// Inputs:
+///   - hidden_states: [local_batch, hidden_dim]
+///   - expert_ids: [local_batch, top_k] (from router)
+///   - dispatch_plan: [num_experts] → int (expert_id → target_rank, constant)
+///
+/// Outputs:
+///   - dispatched_states: [received_tokens, hidden_dim] (tokens routed TO this GPU)
+///   - token_metadata: routing info for the gather step
+pub struct MoeDispatchOp {
+    nccl_comm: NcclCommunicator,
+    rank: usize,
+    world_size: usize,
+}
+```
+
+When genai-server wants to change placement (rebalance), it:
+1. Pauses the decode loop (after current token completes)
+2. Updates the dispatch_plan constant tensor in each session
+3. Resumes the loop
+
+This is the only point where Rust touches the hot path — and it's rare (every N seconds
+or on-demand, not per-token).
 
 ---
 
@@ -242,43 +310,79 @@ For each MoE layer:
    Runs on: orchestrator GPU (or whichever GPU feeds into next attention layer)
 ```
 
-### 5.2 Dispatch Granularity: Per-Layer vs Per-Block
+### 5.2 Dispatch Granularity: Full-Graph GPU Execution (Recommended)
 
-**Option A: Per-layer dispatch** (described above)
-- Each MoE layer is a dispatch boundary
-- Pro: maximum flexibility, works with any interleaving of attention + MoE
-- Con: many dispatch round-trips (one per MoE layer × num_layers)
+With the control plane / data plane separation, the question is not "per-layer vs
+per-block" but rather: **the entire model graph runs on GPUs without returning to host.**
 
-**Option B: Per-block dispatch (fused attention + MoE)**
-- Each GPU runs a full transformer block (attention shard + local experts)
-- Dispatch happens at block boundaries, not individual MoE layers
-- Pro: fewer round-trips, attention and MoE execute back-to-back on same GPU
-- Con: requires attention TP + expert EP to coexist within one ORT session
+Each GPU's ORT session contains the full transformer stack for its shard:
+- All attention layers (TP sharded)
+- All MoE layers (EP sharded, with NCCL dispatch ops)
+- Router networks (replicated on all GPUs)
 
-**Recommendation: Start with Option A, optimize to Option B.**
+```
+GPU 0 session graph (simplified, one block):
+  LayerNorm → Attention(heads 0..H/N) → TP_AllReduce → LayerNorm
+  → Router → MoeDispatch(NCCL) → LocalExperts(0..55) → MoeGather(NCCL) → Combine
+  → Residual → [next block...]
+```
 
-Option A is simpler and maps cleanly to "each ORT session = a bag of experts."
-Option B is an optimization that reduces dispatch count but requires more complex
-per-GPU ONNX subgraphs (containing both TP attention shards and EP expert shards).
+The MoeDispatch and MoeGather custom ops handle cross-GPU token movement internally
+via NCCL. From ORT's perspective, they're just ops with tensor inputs/outputs.
 
-### 5.3 Rust Orchestration Sketch
+**Fallback mode for debugging/testing:** A pure-Rust per-layer dispatch mode
+(genai-server orchestrates each layer individually) is useful for:
+- Development without multi-GPU
+- Unit testing routing logic
+- Profiling to identify bottlenecks
+
+This fallback uses the `ExpertSession` trait from §10 with `HostStagedTransport`.
+
+### 5.3 Execution Modes
+
+#### Mode 1: GPU-Native (Production — Maximum Performance)
+
+The full model graph runs on GPUs. genai-server only handles:
+- Session setup (load model, set dispatch plan)
+- Feeding input tokens → collecting output logits
+- Control plane decisions (rebalance, KV eviction)
 
 ```rust
-/// One step of MoE execution across multiple GPU sessions.
-pub async fn moe_dispatch(
-    hidden_states: &Tensor,           // [batch, hidden_dim]
-    router_session: &OrtSession,       // runs router MLP
-    expert_sessions: &[GpuExpertSession], // one per GPU
+/// Production execution: fire the multi-GPU graph and collect output.
+pub async fn generate_token(
+    sessions: &[GpuSession],  // One per GPU, holding the full model shard
+    input_ids: &Tensor,
+    kv_caches: &mut [KvCacheHandle],
+) -> Result<Tensor> {
+    // Each GPU session runs the FULL forward pass for its shard.
+    // NCCL ops inside the graph handle cross-GPU communication.
+    // We only need to feed input to rank 0 and read logits from rank 0.
+    let logits = sessions[0].run_forward(input_ids, &kv_caches[0]).await?;
+    Ok(logits)
+}
+```
+
+#### Mode 2: Orchestrated Dispatch (Development/Debug — Maximum Flexibility)
+
+genai-server orchestrates each layer individually. Slower but inspectable:
+
+```rust
+/// Debug/development mode: Rust orchestrates each MoE layer.
+/// Allows inspection of routing decisions, activation stats, etc.
+pub async fn moe_dispatch_debug(
+    hidden_states: &Tensor,
+    router_session: &OrtSession,
+    expert_sessions: &[GpuExpertSession],
     placement: &ExpertPlacement,
     top_k: usize,
+    stats: &mut DispatchStats,  // For monitoring/profiling
 ) -> Result<Tensor> {
     // 1. Route
     let (expert_ids, gate_weights) = router_session.run_router(hidden_states)?;
-    // expert_ids: [batch, top_k], gate_weights: [batch, top_k]
+    stats.record_routing(&expert_ids);
 
     // 2. Group tokens by GPU
-    let gpu_groups = group_tokens_by_gpu(&expert_ids, &placement);
-    // HashMap<GpuId, GroupedTokens { indices, local_expert_ids, hidden_states }>
+    let gpu_groups = group_tokens_by_gpu(&expert_ids, placement);
 
     // 3. Async dispatch to all GPUs
     let expert_outputs: Vec<(GpuId, Tensor)> = futures::future::join_all(
@@ -294,18 +398,25 @@ pub async fn moe_dispatch(
         })
     ).await.into_iter().collect::<Result<Vec<_>>>()?;
 
-    // 4. Scatter-gather and weighted combine
+    // 4. Combine
     let output = combine_expert_outputs(
-        &expert_outputs,
-        &expert_ids,
-        &gate_weights,
-        &placement,
+        &expert_outputs, &expert_ids, &gate_weights, placement,
         hidden_states.shape(),
     )?;
 
     Ok(output)
 }
 ```
+
+#### Switching Between Modes
+
+The mode is a deployment-time choice, not a code path fork:
+- **GPU-Native:** Use ONNX graphs that include MoeDispatch/MoeGather custom ops + NCCL
+- **Orchestrated:** Use ONNX graphs with only local experts (no NCCL ops); genai-server
+  handles dispatch externally
+
+Same model weights, different graph compilation. Mobius (or equivalent exporter) can
+emit either variant based on a deployment target flag.
 
 ---
 
