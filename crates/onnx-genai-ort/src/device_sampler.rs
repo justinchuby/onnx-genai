@@ -355,14 +355,21 @@ __device__ void finish_row(float* w, int vocab, float m,
         float target = rng * Ssurv;
         float acc = 0.0f;
         int chosen = -1;
+        int last_survivor = -1;
         for (int i = 0; i < vocab; i++) {
             float p = w[i];
             if (p >= T) {
+                last_survivor = i;
                 acc += p;
                 if (acc > target) { chosen = i; break; }
             }
         }
-        out[row] = (chosen < 0) ? 0 : chosen;
+        // Float non-associativity: the sequential `acc` can fall just short of
+        // the parallel `Ssurv`, so an extreme-tail `target` may leave `chosen`
+        // unset. Fall back to the LAST survivor (mirrors the host oracle), never
+        // token 0 which may have been filtered out. `last_survivor` is always
+        // >= 0 because the argmax survives any valid threshold.
+        out[row] = (chosen >= 0) ? chosen : (last_survivor >= 0 ? last_survivor : 0);
     }
 }
 
