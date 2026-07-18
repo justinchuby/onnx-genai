@@ -4,7 +4,7 @@ use onnx_genai_engine::{
     Engine, EngineConfig, EngineDecodeBackend, GeneratePrompt, GenerateRequest, NativeDecodeDevice,
     SpeculativeMode,
 };
-use onnx_genai_ort::{ExecutionProvider, SessionOptions};
+use onnx_genai_ort::{SessionOptions, ep_selection};
 use std::path::Path;
 
 #[test]
@@ -86,7 +86,7 @@ fn native_backend_rejects_unsupported_session_device() {
             decode_backend: EngineDecodeBackend::Native,
             ..EngineConfig::default()
         },
-        SessionOptions::with_execution_provider(ExecutionProvider::WebGpu),
+        SessionOptions::with_execution_provider(ep_selection("webgpu")),
     )
     .err()
     .expect("native backend must reject unsupported session options");
@@ -165,7 +165,7 @@ fn native_sub4_cuda_fails_fast_at_load() -> anyhow::Result<()> {
             decode_backend: EngineDecodeBackend::Native,
             ..EngineConfig::default()
         },
-        SessionOptions::with_execution_provider(ExecutionProvider::Cuda { device_id: 0 }),
+        SessionOptions::with_execution_provider(ep_selection("cuda")),
     )
     .err()
     .expect("ONNX_GENAI_EP-style CUDA routing must fail before generation");
@@ -222,7 +222,7 @@ fn engine_native_cuda_matches_cpu_tokens() -> anyhow::Result<()> {
             decode_backend: EngineDecodeBackend::Native,
             ..EngineConfig::default()
         },
-        SessionOptions::with_execution_provider(ExecutionProvider::Cuda { device_id: 0 }),
+        SessionOptions::with_execution_provider(ep_selection("cuda")),
     )?;
     let cpu_tokens = generate(&mut cpu)?;
     let cuda_tokens = generate(&mut cuda)?;

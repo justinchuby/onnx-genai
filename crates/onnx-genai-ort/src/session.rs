@@ -5,43 +5,319 @@ use std::path::Path;
 use std::ptr::NonNull;
 
 use onnx_genai_runtime_config::{
-    CudaDevice, ExecutionProvider as ConfigExecutionProvider,
-    ExecutionProviderEntry as ConfigExecutionProviderEntry, IntraOpThreads, PluginSpec, runtime_config,
+    CudaDevice, EpSelection, ExecutionProviderEntry, IntraOpThreads, PluginSpec, runtime_config,
 };
 
 use crate::{Allocator, DataType, Environment, IoBinding, MemoryInfo, OrtError, Result, Value};
 
-/// Execution provider selection.
-#[derive(Debug, Clone)]
-pub enum ExecutionProvider {
-    Cpu,
-    WebGpu,
-    Cuda { device_id: i32 },
-    Metal,
-    DirectML { device_id: i32 },
-    CoreML,
-    Qnn,
-    OpenVINO,
-    /// A generic execution-provider plugin loaded from a shared library at
-    /// runtime. The concrete provider (OpenVINO, NV TensorRT RTX, ...) is
-    /// discovered from the plugin's registered devices, so no provider name is
-    /// hardcoded in onnx-genai.
-    Plugin {
-        library: std::path::PathBuf,
-        registration_name: String,
-        options: Vec<(String, String)>,
-        /// Optional hardware-device class (`CPU`/`GPU`/`NPU`) used to narrow a
-        /// multi-device plugin to a single device. Matched against ORT's generic
-        /// `OrtHardwareDeviceType`, never a provider-specific device name.
-        device: Option<String>,
-    },
+pub use ep_compat::{
+    EpCapabilities, HardwareKind, ResolvedEp, capability, resolve_execution_provider,
+};
+
+/// Convenience constructor for an [`EpSelection`] from a bare provider name.
+///
+/// The runtime core stays EP-agnostic: name resolution happens in
+/// [`ep_compat`]. This helper only saves callers from importing [`BTreeMap`].
+#[must_use]
+pub fn ep_selection(name: impl Into<String>) -> EpSelection {
+    EpSelection::new(name.into())
+}
+
+/// The ONLY place in the runtime that knows execution-provider *names*.
+///
+/// `cpu` and `cuda` are the permanent built-in providers. `webgpu`, `coreml`,
+/// and `metal` are TRANSITIONAL built-ins: each is expected to become a
+/// self-registering plugin EP, at which point its arm here is deleted and it is
+/// resolved purely from EP-reported metadata. Everything outside this module
+/// makes decode/allocation decisions from [`EpCapabilities`], never from names.
+pub mod ep_compat {
+    use std::collections::BTreeSet;
+    use std::path::PathBuf;
+
+    use onnx_genai_runtime_config::{EpSelection, runtime_config};
+
+    /// Broad class of hardware an execution provider targets.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum HardwareKind {
+        Cpu,
+        Gpu,
+        Npu,
+        Other,
+    }
+
+    /// Capability-flag vocabulary. These `&str` constants are the *only* stable
+    /// identifiers the runtime core uses to reason about EP behavior, so
+    /// decode/allocation code never branches on an EP name.
+    pub mod capability {
+        /// EP honors ORT's pre-bound fixed-capacity `present.*` output contract
+        /// that the SharedBuffer O(1)/token decode path needs.
+        pub const FIXED_CAPACITY_PRESENT_BINDING: &str = "fixed_capacity_present_binding";
+        /// EP supports ORT graph capture/replay.
+        pub const GRAPH_CAPTURE: &str = "graph_capture";
+        /// EP owns device memory usable for device-resident KV.
+        pub const DEVICE_KV: &str = "device_kv";
+        /// EP exposes device-resident logits + a device allocator for on-device
+        /// argmax/sampling.
+        pub const DEVICE_SAMPLING: &str = "device_sampling";
+    }
+
+    /// Capabilities the runtime core reasons about, resolved once per EP.
+    #[derive(Debug, Clone)]
+    pub struct EpCapabilities {
+        pub name: String,
+        pub hardware: HardwareKind,
+        pub device_id: Option<i32>,
+        pub vendor: Option<String>,
+        flags: BTreeSet<String>,
+    }
+
+    impl EpCapabilities {
+        pub(crate) fn new(
+            name: impl Into<String>,
+            hardware: HardwareKind,
+            device_id: Option<i32>,
+            vendor: Option<String>,
+            flags: &[&str],
+        ) -> Self {
+            Self {
+                name: name.into(),
+                hardware,
+                device_id,
+                vendor,
+                flags: flags.iter().map(|flag| (*flag).to_string()).collect(),
+            }
+        }
+
+        /// Whether this EP advertises the given capability flag.
+        #[must_use]
+        pub fn has(&self, flag: &str) -> bool {
+            self.flags.contains(flag)
+        }
+
+        /// Whether this EP targets a GPU.
+        #[must_use]
+        pub fn is_gpu(&self) -> bool {
+            self.hardware == HardwareKind::Gpu
+        }
+
+        /// Whether this EP is the host (CPU) provider.
+        #[must_use]
+        pub fn is_host(&self) -> bool {
+            self.hardware == HardwareKind::Cpu
+        }
+
+        /// Device id this EP is bound to, if any.
+        #[must_use]
+        pub fn device_id(&self) -> Option<i32> {
+            self.device_id
+        }
+
+        /// Whether this EP reports an NVIDIA vendor (case-insensitive).
+        #[must_use]
+        pub fn is_nvidia(&self) -> bool {
+            self.vendor
+                .as_deref()
+                .is_some_and(|vendor| vendor.to_ascii_lowercase().contains("nvidia"))
+        }
+
+        /// The default host (CPU) capabilities.
+        #[must_use]
+        pub fn host() -> Self {
+            Self::new(
+                "cpu",
+                HardwareKind::Cpu,
+                None,
+                None,
+                &[capability::FIXED_CAPACITY_PRESENT_BINDING],
+            )
+        }
+    }
+
+    /// How an EP is appended to ORT session options. Variants carry only opaque
+    /// data; the append FFI lives in `session.rs`.
+    #[derive(Debug, Clone)]
+    pub(crate) enum AppendStrategy {
+        /// CPU / no-op (the host provider is implicit in ORT).
+        HostDefault,
+        /// Permanent built-in CUDA EP appended via the typed CUDA V2 API.
+        #[cfg(feature = "cuda")]
+        CudaTyped { device_id: i32 },
+        /// CUDA requested without the compile-time `cuda` feature. Preserves the
+        /// historical hard error raised at append time.
+        #[cfg(not(feature = "cuda"))]
+        CudaUnavailable,
+        /// Self-registering plugin EP: register the library, match an
+        /// EP-reported device name, and append via V2 (Metal today).
+        PluginLibrary {
+            lib: PathBuf,
+            registration_name: String,
+            options: Vec<(String, String)>,
+            device: Option<String>,
+        },
+        /// ORT built-in appended by name (WebGPU/CoreML transitional, plus any
+        /// unrecognized name attempted by-name with conservative capabilities).
+        NamedGeneric {
+            ort_name: String,
+            provider_name: String,
+        },
+    }
+
+    /// An [`EpSelection`] resolved into capabilities plus an append strategy.
+    #[derive(Debug, Clone)]
+    pub struct ResolvedEp {
+        pub selection: EpSelection,
+        pub caps: EpCapabilities,
+        pub(crate) strategy: AppendStrategy,
+        /// Whether this EP's provider-specific graph-capture env flag is enabled.
+        pub(crate) graph_capture_env: bool,
+        /// TRANSITIONAL: whether WebGPU session-config entries apply to this EP.
+        pub(crate) transitional_webgpu: bool,
+    }
+
+    impl ResolvedEp {
+        /// A strict provider must NOT silently fall back to CPU on load failure.
+        /// Today only self-registering plugin EPs (Metal) are strict.
+        pub(crate) fn is_strict(&self) -> bool {
+            matches!(self.strategy, AppendStrategy::PluginLibrary { .. })
+        }
+    }
+
+    /// Resolve an [`EpSelection`] into capabilities and an append strategy.
+    ///
+    /// This is the single compatibility table mapping EP *names* to behavior.
+    #[must_use]
+    pub fn resolve_execution_provider(selection: &EpSelection) -> ResolvedEp {
+        use capability::{
+            DEVICE_KV, DEVICE_SAMPLING, FIXED_CAPACITY_PRESENT_BINDING, GRAPH_CAPTURE,
+        };
+
+        if selection.is_host_default() {
+            return ResolvedEp {
+                selection: selection.clone(),
+                caps: EpCapabilities::host(),
+                strategy: AppendStrategy::HostDefault,
+                graph_capture_env: false,
+                transitional_webgpu: false,
+            };
+        }
+
+        match selection.name.as_str() {
+            // Permanent built-in.
+            "cuda" => {
+                let device_id = super::cuda_device_id_from_env();
+                let caps = EpCapabilities::new(
+                    "cuda",
+                    HardwareKind::Gpu,
+                    Some(device_id),
+                    Some("NVIDIA".to_string()),
+                    &[
+                        FIXED_CAPACITY_PRESENT_BINDING,
+                        GRAPH_CAPTURE,
+                        DEVICE_KV,
+                        DEVICE_SAMPLING,
+                    ],
+                );
+                #[cfg(feature = "cuda")]
+                let strategy = AppendStrategy::CudaTyped { device_id };
+                #[cfg(not(feature = "cuda"))]
+                let strategy = AppendStrategy::CudaUnavailable;
+                ResolvedEp {
+                    selection: selection.clone(),
+                    caps,
+                    strategy,
+                    graph_capture_env: runtime_config().cuda_graph,
+                    transitional_webgpu: false,
+                }
+            }
+            // TRANSITIONAL: WebGPU is an ORT built-in appended by name today; it
+            // will become a self-registering plugin EP.
+            "webgpu" => ResolvedEp {
+                selection: selection.clone(),
+                caps: EpCapabilities::new(
+                    "webgpu",
+                    HardwareKind::Gpu,
+                    None,
+                    None,
+                    &[FIXED_CAPACITY_PRESENT_BINDING, GRAPH_CAPTURE, DEVICE_KV],
+                ),
+                strategy: AppendStrategy::NamedGeneric {
+                    ort_name: "WebGPU".to_string(),
+                    provider_name: "WebGpuExecutionProvider".to_string(),
+                },
+                graph_capture_env: runtime_config().webgpu_graph_capture,
+                transitional_webgpu: true,
+            },
+            // TRANSITIONAL: CoreML is an ORT built-in appended by name today.
+            "coreml" => ResolvedEp {
+                selection: selection.clone(),
+                caps: EpCapabilities::new("coreml", HardwareKind::Npu, None, None, &[]),
+                strategy: AppendStrategy::NamedGeneric {
+                    ort_name: "CoreML".to_string(),
+                    provider_name: "CoreMLExecutionProvider".to_string(),
+                },
+                graph_capture_env: false,
+                transitional_webgpu: false,
+            },
+            // TRANSITIONAL: Metal is loaded from the external onnxruntime-mlx
+            // plugin library and appended via the V2 plugin path; it is the only
+            // strict provider today. The MLX plugin implements the fixed-capacity
+            // in-place-write GQA contract, so Metal carries
+            // FIXED_CAPACITY_PRESENT_BINDING (preserving today's SharedBuffer
+            // decode path) but no other device capabilities by default.
+            "metal" => ResolvedEp {
+                selection: selection.clone(),
+                caps: EpCapabilities::new(
+                    "metal",
+                    HardwareKind::Gpu,
+                    None,
+                    None,
+                    &[FIXED_CAPACITY_PRESENT_BINDING],
+                ),
+                strategy: AppendStrategy::PluginLibrary {
+                    lib: runtime_config().metal_ep_lib.clone().unwrap_or_default(),
+                    registration_name: "onnxruntime_mlx_ep".to_string(),
+                    options: selection
+                        .options
+                        .iter()
+                        .map(|(key, value)| (key.clone(), value.clone()))
+                        .collect(),
+                    device: None,
+                },
+                graph_capture_env: false,
+                transitional_webgpu: false,
+            },
+            // Any other name: no plugin library env is configured, so attempt an
+            // ORT built-in append by name with conservative capabilities.
+            other => {
+                tracing::warn!(
+                    "Unrecognized ONNX_GENAI_EP={other}; attempting to append it to ONNX Runtime by name with conservative capabilities (no device-resident KV/sampling, no graph capture, no fixed-capacity present binding)"
+                );
+                ResolvedEp {
+                    selection: selection.clone(),
+                    caps: EpCapabilities::new(
+                        selection.name.clone(),
+                        HardwareKind::Other,
+                        None,
+                        None,
+                        &[],
+                    ),
+                    strategy: AppendStrategy::NamedGeneric {
+                        ort_name: selection.name.clone(),
+                        provider_name: format!("{other}ExecutionProvider"),
+                    },
+                    graph_capture_env: false,
+                    transitional_webgpu: false,
+                }
+            }
+        }
+    }
 }
 
 /// Session configuration options.
 #[derive(Debug, Clone)]
 pub struct SessionOptions {
-    /// Execution providers in priority order.
-    pub execution_providers: Vec<ExecutionProvider>,
+    /// Execution providers in priority order, resolved to capabilities.
+    pub execution_providers: Vec<ResolvedEp>,
     /// Graph optimization level (0=none, 1=basic, 2=extended, 99=all).
     pub optimization_level: i32,
     /// Number of intra-op threads.
@@ -73,7 +349,7 @@ impl Default for SessionOptions {
 impl SessionOptions {
     fn cpu() -> Self {
         Self {
-            execution_providers: vec![ExecutionProvider::Cpu],
+            execution_providers: vec![resolve_execution_provider(&ep_selection("cpu"))],
             optimization_level: 99,
             intra_op_num_threads: 0, // ORT decides
             inter_op_num_threads: 0,
@@ -83,37 +359,58 @@ impl SessionOptions {
     }
 
     /// Create default session options with a single explicit execution provider.
-    pub fn with_execution_provider(provider: ExecutionProvider) -> Self {
+    pub fn with_execution_provider(selection: EpSelection) -> Self {
         let mut options = Self {
-            execution_providers: vec![provider],
+            execution_providers: vec![resolve_execution_provider(&selection)],
             ..Self::cpu()
         };
         options.apply_provider_defaults();
         options
     }
 
+    /// Capabilities of the first non-host EP, else the host provider.
+    fn primary_caps(&self) -> EpCapabilities {
+        self.execution_providers
+            .iter()
+            .find(|ep| !ep.caps.is_host())
+            .map(|ep| ep.caps.clone())
+            .unwrap_or_else(EpCapabilities::host)
+    }
+
+    /// Whether the primary EP's provider-specific graph-capture env flag is set.
+    fn primary_graph_capture_env(&self) -> bool {
+        self.execution_providers
+            .iter()
+            .find(|ep| !ep.caps.is_host())
+            .is_some_and(|ep| ep.graph_capture_env)
+    }
+
+    /// TRANSITIONAL: whether a WebGPU EP is selected (drives WebGPU-specific
+    /// session-config entries). Kept here as documented transitional glue until
+    /// WebGPU ships as a self-registering plugin EP.
     fn selects_webgpu(&self) -> bool {
         self.execution_providers
             .iter()
-            .any(|provider| matches!(provider, ExecutionProvider::WebGpu))
+            .any(|ep| ep.transitional_webgpu)
     }
 
     /// Whether a CUDA execution provider is selected in these options.
     pub fn selects_cuda(&self) -> bool {
         self.execution_providers
             .iter()
-            .any(|provider| matches!(provider, ExecutionProvider::Cuda { .. }))
+            .any(|ep| ep.caps.is_nvidia() && ep.caps.is_gpu())
     }
 
     /// Apply provider performance defaults. WebGPU validation is disabled (pure
-    /// overhead reduction), while graph capture follows the selected EP's
-    /// provider-specific environment flag and remains off by default.
+    /// overhead reduction), while graph capture follows the primary EP's
+    /// capability plus its provider-specific environment flag and remains off by
+    /// default.
     fn apply_provider_defaults(&mut self) {
         if self.selects_webgpu() {
             self.webgpu_disable_validation = webgpu_disable_validation_from_env();
         }
-        self.graph_capture = (self.selects_webgpu() && runtime_config().webgpu_graph_capture)
-            || (self.selects_cuda() && runtime_config().cuda_graph);
+        self.graph_capture =
+            self.primary_caps().has(capability::GRAPH_CAPTURE) && self.primary_graph_capture_env();
     }
 
     /// Set the number of ORT intra-op threads.
@@ -175,26 +472,16 @@ pub struct TensorInfo {
 }
 
 /// A run failure tagged with whether the model was actually invoked.
-///
-/// Returned by [`Session::run_with_binding_graph_phased`] so a retry/fallback
-/// caller can tell a pre-invocation setup failure (safe to replay — the model
-/// has not advanced) apart from a failure at or after the ORT `Run` call (which
-/// may have advanced model state and must not be replayed).
 #[derive(Debug)]
 pub enum RunPhaseError {
-    /// Failure before the model was invoked (API lookup, run-option creation,
-    /// config-entry setup). The model has not run, so the step is retryable.
     Setup(OrtError),
-    /// Failure at or after the ORT `Run` call. The model may have advanced
-    /// state (e.g. the KV cache), so the run must not be replayed.
     Invoked(OrtError),
 }
 
 impl RunPhaseError {
-    /// The underlying error, discarding the phase tag.
     pub fn into_inner(self) -> OrtError {
         match self {
-            RunPhaseError::Setup(err) | RunPhaseError::Invoked(err) => err,
+            Self::Setup(err) | Self::Invoked(err) => err,
         }
     }
 }
@@ -209,7 +496,7 @@ pub struct Session {
     outputs: Vec<TensorInfo>,
     /// Execution providers requested for this session (priority order). Used to
     /// decide whether device-resident KV buffers can be allocated.
-    execution_providers: Vec<ExecutionProvider>,
+    execution_providers: Vec<ResolvedEp>,
     /// Whether the session was created with EP graph capture enabled
     /// (CUDA `enable_cuda_graph=1`). Decode runners use this to drive the
     /// static-shape captured-graph replay path.
@@ -230,10 +517,7 @@ impl Session {
         #[cfg(windows)]
         let path_c: Vec<u16> = {
             use std::os::windows::ffi::OsStrExt;
-            path.as_os_str()
-                .encode_wide()
-                .chain(std::iter::once(0))
-                .collect()
+            path.as_os_str().encode_wide().chain(std::iter::once(0)).collect()
         };
         #[cfg(not(windows))]
         let path_c = CString::new(path.to_string_lossy().as_bytes())
@@ -372,9 +656,9 @@ impl Session {
 
     /// The CUDA device id this session runs on, if a CUDA EP was requested.
     pub fn cuda_device_id(&self) -> Option<i32> {
-        self.execution_providers.iter().find_map(|provider| {
-            if let ExecutionProvider::Cuda { device_id } = provider {
-                Some(*device_id)
+        self.execution_providers.iter().find_map(|ep| {
+            if ep.caps.is_nvidia() && ep.caps.is_gpu() {
+                ep.caps.device_id()
             } else {
                 None
             }
@@ -398,17 +682,7 @@ impl Session {
             .map_err(RunPhaseError::into_inner)
     }
 
-    /// Same as [`Self::run_with_binding_graph`], but the error distinguishes
-    /// whether the model was actually invoked.
-    ///
-    /// Everything before the ORT `Run` call — resolving the C API entry points,
-    /// creating the run options, and adding the `gpu_graph_id` config entry — is
-    /// pure setup that cannot have executed the model, so those failures are
-    /// reported as [`RunPhaseError::Setup`]. Only a failure of the `Run` call
-    /// itself is reported as [`RunPhaseError::Invoked`], because at that point
-    /// the model may have advanced state (e.g. the KV cache) and the run must
-    /// not be replayed. Callers driving a retry/fallback path rely on this split
-    /// to decide whether replaying the step is safe.
+    /// Run with graph annotation while distinguishing setup from invocation failures.
     pub fn run_with_binding_graph_phased(
         &self,
         binding: &IoBinding,
@@ -445,14 +719,11 @@ impl Session {
             let value =
                 CString::new(graph_annotation_id.to_string()).expect("integer string has no NUL");
             // SAFETY: run options handle and NUL-terminated strings are valid.
-            // Building the config entry is still setup: the model has not run.
             crate::error::check_status(unsafe {
                 add_entry(run_options.as_ptr(), key.as_ptr(), value.as_ptr())
             })
             .map_err(RunPhaseError::Setup)?;
             // SAFETY: session, run options, and binding are valid ORT handles.
-            // This is the model invocation: a failure here may leave state
-            // advanced, so it is classified as `Invoked`, not `Setup`.
             crate::error::check_status(unsafe {
                 run(self.ptr.as_ptr(), run_options.as_ptr(), binding.as_ptr())
             })
@@ -568,26 +839,11 @@ impl Session {
         self.ptr.as_ptr()
     }
 
-    /// Whether a WebGPU execution provider is (effectively) active for this
-    /// session.
-    pub fn is_webgpu(&self) -> bool {
-        self.execution_providers
-            .iter()
-            .any(|provider| matches!(provider, ExecutionProvider::WebGpu))
-    }
-
     /// Whether a CUDA execution provider is (effectively) active for this session.
     pub fn is_cuda(&self) -> bool {
         self.execution_providers
             .iter()
-            .any(|provider| matches!(provider, ExecutionProvider::Cuda { .. }))
-    }
-
-    /// Whether the plugin Metal execution provider is active for this session.
-    pub fn is_metal(&self) -> bool {
-        self.execution_providers
-            .iter()
-            .any(|provider| matches!(provider, ExecutionProvider::Metal))
+            .any(|ep| ep.caps.is_nvidia() && ep.caps.is_gpu())
     }
 
     /// Whether this session's execution provider can accept the runtime-owned,
@@ -634,7 +890,11 @@ impl Session {
     /// allocator (e.g. the EP silently fell back to CPU), the error is logged
     /// and `Ok(None)` is returned so decode still works via CPU buffers.
     pub(crate) fn device_kv_allocator(&self) -> Result<Option<Allocator>> {
-        if !self.is_webgpu() && !self.is_cuda() {
+        if !self
+            .execution_providers
+            .iter()
+            .any(|ep| ep.caps.has(capability::DEVICE_KV))
+        {
             return Ok(None);
         }
 
@@ -648,9 +908,9 @@ impl Session {
         // only opts the still-experimental WebGPU device allocator in (see
         // below).
         #[cfg(feature = "cuda")]
-        if let Some(device_id) = self.execution_providers.iter().find_map(|provider| {
-            if let ExecutionProvider::Cuda { device_id } = provider {
-                Some(*device_id)
+        if let Some(device_id) = self.execution_providers.iter().find_map(|ep| {
+            if ep.caps.is_nvidia() && ep.caps.is_gpu() {
+                ep.caps.device_id()
             } else {
                 None
             }
@@ -795,116 +1055,89 @@ impl RawSessionOptions {
     }
 }
 
-fn execution_providers_from_env() -> Option<Vec<ExecutionProvider>> {
+fn execution_providers_from_env() -> Option<Vec<ResolvedEp>> {
     let entries = &runtime_config().execution_providers;
     if entries.is_empty() {
         return None;
     }
-    let mut providers = Vec::with_capacity(entries.len());
-    for entry in entries {
-        match entry {
-            ConfigExecutionProviderEntry::Builtin(provider) => {
-                if let Some(resolved) = resolve_builtin_execution_provider(provider) {
-                    providers.push(resolved);
-                }
-            }
-            ConfigExecutionProviderEntry::Plugin(spec) => {
-                if let Some(resolved) = resolve_inline_plugin_execution_provider(spec) {
-                    providers.push(resolved);
-                }
-            }
-        }
-    }
-    if providers.is_empty() {
-        // Every configured entry was unusable (e.g. all unsupported names or a
-        // misconfigured bare plugin); leave the default CPU provider in place.
-        return None;
-    }
-    Some(providers)
-}
-
-/// Resolve one built-in `ONNX_GENAI_EP` token (or the bare `plugin` token,
-/// configured through the scalar `ONNX_GENAI_EP_*` variables) into an ORT
-/// execution provider. Returns `None` when the entry contributes no provider
-/// (e.g. an unsupported name or a misconfigured bare plugin), so it is simply
-/// skipped in the priority list.
-fn resolve_builtin_execution_provider(
-    provider: &ConfigExecutionProvider,
-) -> Option<ExecutionProvider> {
-    let resolved = match provider {
-        ConfigExecutionProvider::Cpu => ExecutionProvider::Cpu,
-        ConfigExecutionProvider::WebGpu => ExecutionProvider::WebGpu,
-        ConfigExecutionProvider::Cuda => ExecutionProvider::Cuda {
-            device_id: cuda_device_id_from_env(),
-        },
-        ConfigExecutionProvider::Metal => ExecutionProvider::Metal,
-        ConfigExecutionProvider::CoreMl => ExecutionProvider::CoreML,
-        ConfigExecutionProvider::Plugin => match runtime_config().ep_library.clone() {
-            Some(library) => {
+    let providers = entries
+        .iter()
+        .filter_map(|entry| match entry {
+            ExecutionProviderEntry::Builtin(selection) if selection.name == "plugin" => {
                 let config = runtime_config();
-                let registration_name = config
-                    .ep_registration_name
-                    .clone()
-                    .unwrap_or_else(|| plugin_registration_name_from_path(&library));
-                ExecutionProvider::Plugin {
-                    library,
-                    registration_name,
-                    options: config.ep_options.clone(),
-                    device: config.ep_device.clone(),
-                }
+                let library = config.ep_library.clone()?;
+                Some(resolve_plugin_selection(
+                    selection.clone(),
+                    library.clone(),
+                    config
+                        .ep_registration_name
+                        .clone()
+                        .unwrap_or_else(|| plugin_registration_name_from_path(&library)),
+                    config.ep_options.clone(),
+                    config.ep_device.clone(),
+                ))
             }
-            None => {
-                tracing::warn!(
-                    "ONNX_GENAI_EP=plugin requires ONNX_GENAI_EP_LIBRARY to point to an ORT execution-provider plugin shared library; skipping this entry"
-                );
-                return None;
+            ExecutionProviderEntry::Builtin(selection) => {
+                Some(resolve_execution_provider(selection))
             }
-        },
-        ConfigExecutionProvider::Unsupported(other) => {
-            tracing::warn!(
-                "Ignoring unsupported ONNX_GENAI_EP entry '{other}'; expected cpu, webgpu, cuda, metal, coreml, plugin, or plugin:<library>"
-            );
-            return None;
-        }
-    };
-    Some(resolved)
+            ExecutionProviderEntry::Plugin(spec) => resolve_inline_plugin(spec),
+        })
+        .collect::<Vec<_>>();
+    (!providers.is_empty()).then_some(providers)
 }
 
-/// Resolve an inline `plugin:<library>|attr=..` list entry into an ORT plugin
-/// execution provider. The concrete provider name is still discovered from the
-/// plugin at load time; only the library path and passthrough options are taken
-/// from the spec.
-fn resolve_inline_plugin_execution_provider(spec: &PluginSpec) -> Option<ExecutionProvider> {
+fn resolve_inline_plugin(spec: &PluginSpec) -> Option<ResolvedEp> {
     if spec.library.as_os_str().is_empty() {
-        tracing::warn!(
-            "Ignoring inline plugin entry with an empty library path; expected plugin:<library>"
-        );
+        tracing::warn!("Ignoring inline plugin entry with an empty library path");
         return None;
     }
-    let registration_name = spec
-        .registration_name
-        .clone()
-        .unwrap_or_else(|| plugin_registration_name_from_path(&spec.library));
-    Some(ExecutionProvider::Plugin {
-        library: spec.library.clone(),
-        registration_name,
-        options: spec.options.clone(),
-        device: spec.device.clone(),
-    })
+    Some(resolve_plugin_selection(
+        EpSelection::new("plugin"),
+        spec.library.clone(),
+        spec.registration_name
+            .clone()
+            .unwrap_or_else(|| plugin_registration_name_from_path(&spec.library)),
+        spec.options.clone(),
+        spec.device.clone(),
+    ))
+}
+
+fn resolve_plugin_selection(
+    selection: EpSelection,
+    library: std::path::PathBuf,
+    registration_name: String,
+    options: Vec<(String, String)>,
+    device: Option<String>,
+) -> ResolvedEp {
+    let hardware = match device.as_deref().map(str::to_ascii_uppercase).as_deref() {
+        Some("CPU") => HardwareKind::Cpu,
+        Some("GPU") => HardwareKind::Gpu,
+        Some("NPU") => HardwareKind::Npu,
+        _ => HardwareKind::Other,
+    };
+    ResolvedEp {
+        caps: EpCapabilities::new(selection.name.clone(), hardware, None, None, &[]),
+        selection,
+        strategy: ep_compat::AppendStrategy::PluginLibrary {
+            lib: library,
+            registration_name,
+            options,
+            device,
+        },
+        graph_capture_env: false,
+        transitional_webgpu: false,
+    }
 }
 
 fn requested_non_cpu_provider(options: &SessionOptions) -> bool {
     options
         .execution_providers
         .iter()
-        .any(|provider| !matches!(provider, ExecutionProvider::Cpu))
+        .any(|ep| !ep.caps.is_host())
 }
 
 fn requested_strict_provider(options: &SessionOptions) -> bool {
-    options
-        .execution_providers
-        .iter()
-        .any(|provider| matches!(provider, ExecutionProvider::Metal))
+    options.execution_providers.iter().any(ResolvedEp::is_strict)
 }
 
 fn cuda_device_id_from_env() -> i32 {
@@ -978,24 +1211,14 @@ fn shared_kv_present_binding_opt_in_from_env() -> bool {
     runtime_config().shared_kv_present_binding
 }
 
-/// Resolve fixed-capacity present binding from the verified EP capability
-/// allowlist, with an explicit operator override for unverified EPs.
-fn fixed_capacity_present_binding_supported(providers: &[ExecutionProvider], opt_in: bool) -> bool {
+/// Resolve fixed-capacity present binding from EP capabilities, with an explicit
+/// operator override for unverified EPs.
+fn fixed_capacity_present_binding_supported(providers: &[ResolvedEp], opt_in: bool) -> bool {
     opt_in
         || !providers.is_empty()
-            && providers.iter().all(|provider| {
-                matches!(
-                    provider,
-                    ExecutionProvider::Cpu
-                        | ExecutionProvider::Cuda { .. }
-                        | ExecutionProvider::WebGpu
-                        // The MLX plugin EP implements the fixed-capacity in-place-write GQA
-                        // contract (writes new K/V at the valid-past offset, emits `present` at
-                        // the buffer's full capacity), so Metal accepts the runtime-owned shared
-                        // present buffer like CPU/CUDA/WebGPU — no `is_metal()` in decode logic.
-                        | ExecutionProvider::Metal
-                )
-            })
+            && providers
+                .iter()
+                .all(|ep| ep.caps.has(capability::FIXED_CAPACITY_PRESENT_BINDING))
 }
 
 /// Apply WebGPU EP provider options via session config entries.
@@ -1071,47 +1294,26 @@ fn append_execution_providers(
 fn append_execution_provider(
     env: &Environment,
     session_options: *mut onnx_genai_ort_sys::OrtSessionOptions,
-    provider: &ExecutionProvider,
+    provider: &ResolvedEp,
     graph_capture: bool,
     available: &[String],
 ) -> Result<()> {
-    match provider {
-        ExecutionProvider::Cpu => Ok(()),
-        ExecutionProvider::WebGpu => append_named_execution_provider(
-            session_options,
-            "WebGPU",
-            "WebGpuExecutionProvider",
-            &[],
-            available,
-        ),
-        ExecutionProvider::Cuda { device_id } => {
-            #[cfg(feature = "cuda")]
-            {
-                append_cuda_execution_provider(
-                    session_options,
-                    *device_id,
-                    graph_capture,
-                    available,
-                )
-            }
-            #[cfg(not(feature = "cuda"))]
-            {
-                let _ = (session_options, device_id, graph_capture, available);
-                Err(OrtError::InvalidArgument(
-                    "CUDA support not compiled in; rebuild with --features cuda".into(),
-                ))
-            }
+    use ep_compat::AppendStrategy;
+    match &provider.strategy {
+        AppendStrategy::HostDefault => Ok(()),
+        #[cfg(feature = "cuda")]
+        AppendStrategy::CudaTyped { device_id } => {
+            append_cuda_execution_provider(session_options, *device_id, graph_capture, available)
         }
-        ExecutionProvider::Metal => append_metal_execution_provider(env, session_options),
-        ExecutionProvider::CoreML => append_named_execution_provider(
-            session_options,
-            "CoreML",
-            "CoreMLExecutionProvider",
-            &[],
-            available,
-        ),
-        ExecutionProvider::Plugin {
-            library,
+        #[cfg(not(feature = "cuda"))]
+        AppendStrategy::CudaUnavailable => {
+            let _ = (session_options, graph_capture, available);
+            Err(OrtError::InvalidArgument(
+                "CUDA support not compiled in; rebuild with --features cuda".into(),
+            ))
+        }
+        AppendStrategy::PluginLibrary {
+            lib,
             registration_name,
             options,
             device,
@@ -1119,16 +1321,27 @@ fn append_execution_provider(
             env,
             session_options,
             registration_name,
-            library,
+            lib,
             options,
             device.as_deref(),
         ),
-        other => {
-            tracing::warn!(
-                "Execution provider {:?} is not wired in onnx-genai-ort; falling back to CPU",
-                other
-            );
-            Ok(())
+        AppendStrategy::NamedGeneric {
+            ort_name,
+            provider_name,
+        } => {
+            let provider_options = provider
+                .selection
+                .options
+                .iter()
+                .map(|(key, value)| (key.as_str(), value.as_str()))
+                .collect::<Vec<_>>();
+            append_named_execution_provider(
+                session_options,
+                ort_name,
+                provider_name,
+                &provider_options,
+                available,
+            )
         }
     }
 }
@@ -1821,153 +2034,122 @@ mod tests {
     }
 
     #[test]
-    fn fixed_capacity_present_binding_uses_allowlist_or_opt_in() {
+    fn fixed_capacity_present_binding_uses_capabilities_or_opt_in() {
+        let resolve = |name: &str| resolve_execution_provider(&ep_selection(name));
         assert!(fixed_capacity_present_binding_supported(
-            &[ExecutionProvider::Cpu],
+            &[resolve("cpu")],
             false
         ));
         assert!(fixed_capacity_present_binding_supported(
-            &[ExecutionProvider::Cuda { device_id: 0 }],
+            &[resolve("cuda")],
             false
         ));
         assert!(fixed_capacity_present_binding_supported(
-            &[ExecutionProvider::WebGpu],
+            &[resolve("webgpu")],
             false
         ));
         assert!(fixed_capacity_present_binding_supported(
-            &[ExecutionProvider::Metal],
+            &[resolve("metal")],
             false
         ));
         assert!(!fixed_capacity_present_binding_supported(
-            &[ExecutionProvider::CoreML],
+            &[resolve("coreml")],
             false
         ));
+        assert!(!fixed_capacity_present_binding_supported(
+            &[resolve("some-unknown-ep")],
+            false
+        ));
+        // The operator opt-in overrides the conservative default.
         assert!(fixed_capacity_present_binding_supported(
-            &[ExecutionProvider::Metal],
+            &[resolve("some-unknown-ep")],
             true
         ));
     }
 
     #[test]
-    fn parse_hardware_device_type_accepts_generic_classes() {
-        assert_eq!(
-            parse_hardware_device_type("cpu"),
-            Some(onnx_genai_ort_sys::OrtHardwareDeviceType_CPU)
-        );
-        assert_eq!(
-            parse_hardware_device_type(" GPU "),
-            Some(onnx_genai_ort_sys::OrtHardwareDeviceType_GPU)
-        );
-        assert_eq!(
-            parse_hardware_device_type("Npu"),
-            Some(onnx_genai_ort_sys::OrtHardwareDeviceType_NPU)
-        );
-        assert_eq!(parse_hardware_device_type("OpenVINO"), None);
+    fn resolves_cpu_to_host_defaults() {
+        let resolved = resolve_execution_provider(&ep_selection("cpu"));
+        assert!(resolved.caps.is_host());
+        assert!(resolved.caps.has(capability::FIXED_CAPACITY_PRESENT_BINDING));
+        assert!(!resolved.is_strict());
+        assert!(matches!(
+            resolved.strategy,
+            ep_compat::AppendStrategy::HostDefault
+        ));
     }
 
     #[test]
-    fn plugin_registration_name_derives_from_file_stem() {
-        assert_eq!(
-            plugin_registration_name_from_path(std::path::Path::new(
-                "/opt/libonnxruntime_ep_openvino.so"
-            )),
-            "libonnxruntime_ep_openvino"
-        );
-        assert_eq!(
-            plugin_registration_name_from_path(std::path::Path::new(
-                "onnxruntime_ep_openvino.dll"
-            )),
-            "onnxruntime_ep_openvino"
-        );
+    fn resolves_cuda_to_nvidia_gpu_capabilities() {
+        let resolved = resolve_execution_provider(&ep_selection("cuda"));
+        assert!(resolved.caps.is_gpu());
+        assert!(resolved.caps.is_nvidia());
+        assert!(resolved.caps.device_id().is_some());
+        for flag in [
+            capability::FIXED_CAPACITY_PRESENT_BINDING,
+            capability::GRAPH_CAPTURE,
+            capability::DEVICE_KV,
+            capability::DEVICE_SAMPLING,
+        ] {
+            assert!(resolved.caps.has(flag), "cuda should advertise {flag}");
+        }
+        #[cfg(feature = "cuda")]
+        assert!(matches!(
+            resolved.strategy,
+            ep_compat::AppendStrategy::CudaTyped { .. }
+        ));
+        #[cfg(not(feature = "cuda"))]
+        assert!(matches!(
+            resolved.strategy,
+            ep_compat::AppendStrategy::CudaUnavailable
+        ));
     }
 
     #[test]
-    fn inline_plugin_spec_resolves_to_plugin_provider_with_derived_name() {
-        let spec = PluginSpec {
-            library: std::path::PathBuf::from("/opt/onnxruntime_ep_openvino.so"),
-            registration_name: None,
-            options: vec![("device_type".to_owned(), "GPU".to_owned())],
-            device: Some("GPU".to_owned()),
-        };
-        let resolved =
-            resolve_inline_plugin_execution_provider(&spec).expect("inline plugin resolves");
-        match resolved {
-            ExecutionProvider::Plugin {
-                library,
-                registration_name,
-                options,
-                device,
+    fn resolves_unknown_ep_to_named_generic_other_hardware() {
+        let resolved = resolve_execution_provider(&ep_selection("openvino"));
+        assert_eq!(resolved.caps.hardware, HardwareKind::Other);
+        assert!(!resolved.caps.is_gpu());
+        assert!(!resolved.caps.is_host());
+        assert!(!resolved.caps.has(capability::FIXED_CAPACITY_PRESENT_BINDING));
+        assert!(!resolved.is_strict());
+        match &resolved.strategy {
+            ep_compat::AppendStrategy::NamedGeneric {
+                ort_name,
+                provider_name,
             } => {
-                assert_eq!(
-                    library,
-                    std::path::PathBuf::from("/opt/onnxruntime_ep_openvino.so")
-                );
-                // Registration name is derived from the file stem when unset.
-                assert_eq!(registration_name, "onnxruntime_ep_openvino");
-                assert_eq!(options, vec![("device_type".to_owned(), "GPU".to_owned())]);
-                assert_eq!(device.as_deref(), Some("GPU"));
+                assert_eq!(ort_name, "openvino");
+                assert_eq!(provider_name, "openvinoExecutionProvider");
             }
-            other => panic!("expected a plugin provider, got {other:?}"),
+            other => panic!("expected NamedGeneric, got {other:?}"),
         }
     }
 
     #[test]
-    fn inline_plugin_spec_with_explicit_name_is_preserved() {
-        let spec = PluginSpec {
-            library: std::path::PathBuf::from("/opt/ep.so"),
-            registration_name: Some("my_handle".to_owned()),
-            options: Vec::new(),
-            device: None,
-        };
-        match resolve_inline_plugin_execution_provider(&spec).expect("resolves") {
-            ExecutionProvider::Plugin {
-                registration_name, ..
-            } => assert_eq!(registration_name, "my_handle"),
-            other => panic!("expected a plugin provider, got {other:?}"),
-        }
-    }
+    fn strict_provider_is_plugin_only() {
+        // Metal (a plugin library) is strict: load failure must not silently
+        // fall back to CPU. Named-generic providers (WebGPU) are non-strict.
+        let metal = SessionOptions::with_execution_provider(ep_selection("metal"));
+        assert!(requested_non_cpu_provider(&metal));
+        assert!(requested_strict_provider(&metal));
 
-    #[test]
-    fn inline_plugin_spec_with_empty_library_is_skipped() {
-        let spec = PluginSpec {
-            library: std::path::PathBuf::new(),
-            registration_name: None,
-            options: Vec::new(),
-            device: None,
-        };
-        assert!(resolve_inline_plugin_execution_provider(&spec).is_none());
-    }
+        let webgpu = SessionOptions::with_execution_provider(ep_selection("webgpu"));
+        assert!(requested_non_cpu_provider(&webgpu));
+        assert!(!requested_strict_provider(&webgpu));
 
-    #[test]
-    fn plugin_missing_library_reports_clear_error() {
-        let env = Environment::new("plugin-missing-test").expect("environment");
-        let error = append_execution_provider(
-            &env,
-            std::ptr::null_mut(),
-            &ExecutionProvider::Plugin {
-                library: std::path::PathBuf::from("/nonexistent/onnxruntime_ep_openvino.so"),
-                registration_name: "openvino_ep".to_string(),
-                options: Vec::new(),
-                device: None,
-            },
-            false,
-            &[],
-        )
-        .expect_err("missing plugin library must be rejected");
-        assert!(
-            error
-                .to_string()
-                .contains("execution provider plugin library not found")
-        );
+        let cpu = SessionOptions::cpu();
+        assert!(!requested_non_cpu_provider(&cpu));
+        assert!(!requested_strict_provider(&cpu));
     }
 
     #[cfg(not(feature = "cuda"))]
     #[test]
     fn cuda_request_requires_compile_time_feature() {
+        let resolved = resolve_execution_provider(&ep_selection("cuda"));
         let error = append_execution_provider(
             &Environment::new("cuda-feature-test").expect("environment"),
             std::ptr::null_mut(),
-            &ExecutionProvider::Cuda { device_id: 0 },
+            &resolved,
             false,
             &[],
         )

@@ -28,8 +28,8 @@ use std::{
 };
 
 use onnx_genai_ort::{
-    ChatMessage, ChatTemplate, DecodeSession, DecodeSessionOptions, Environment, ExecutionProvider,
-    ModelDirectory, OrtError, Result, Session, SessionOptions, Tokenizer, Value,
+    ChatMessage, ChatTemplate, DecodeSession, DecodeSessionOptions, Environment,
+    ModelDirectory, OrtError, Result, Session, SessionOptions, Tokenizer, Value, ep_selection,
 };
 
 #[derive(Debug)]
@@ -117,7 +117,7 @@ fn main() -> Result<()> {
     let cpu_session = Session::new(
         &env,
         &dir.model_path,
-        SessionOptions::with_execution_provider(ExecutionProvider::Cpu),
+        SessionOptions::with_execution_provider(ep_selection("cpu")),
     )?;
 
     // Metal session is optional: if the plugin is not configured we skip the
@@ -125,7 +125,7 @@ fn main() -> Result<()> {
     let metal_session = match Session::new(
         &env,
         &dir.model_path,
-        SessionOptions::with_execution_provider(ExecutionProvider::Metal),
+        SessionOptions::with_execution_provider(ep_selection("metal")),
     ) {
         Ok(session) => Some(session),
         Err(err) => {

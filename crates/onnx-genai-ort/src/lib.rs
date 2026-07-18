@@ -55,8 +55,9 @@ pub use onnx_genai_metadata::{
     SpeculatorProposerKind, SpeculatorProposerStatus, SpeculatorVerifier, detect_speculator,
 };
 pub use session::{
-    ExecutionProvider, RunPhaseError, Session, SessionOptions, TensorInfo,
-    available_execution_providers,
+    EpCapabilities, HardwareKind, ResolvedEp, RunPhaseError, Session, SessionOptions, TensorInfo,
+    available_execution_providers, capability, ep_selection, resolve_execution_provider,
 };
+pub use onnx_genai_runtime_config::EpSelection;
 pub use tokenizer::Tokenizer;
 pub use value::{DataType, Value};
