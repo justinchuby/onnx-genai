@@ -2266,17 +2266,89 @@ fn genai_config_compat_metadata(
 /// only trip ORT's "cannot use the graph capture feature" path, so it is gated
 /// on shared-KV eligibility. An explicit `ONNX_GENAI_CUDA_GRAPH=0` is always
 /// honored; an explicit `=1` has already turned `graph_capture` on.
+///
+/// Even a shared-KV model is left uncaptured when its graph contains control-flow
+/// nodes (`If`/`Loop`/`Scan`, e.g. Phi-4-mini's long-context RoPE branch): ORT
+/// cannot capture such graphs, and forcing `enable_cuda_graph` on them triggers a
+/// pathological ~6× slower per-Run path.
 fn maybe_enable_cuda_graph(options: &mut SessionOptions, model_directory: &ModelDirectory) {
     let cfg = onnx_genai_runtime_config::runtime_config();
     if !options.selects_cuda() || options.graph_capture || cfg.cuda_graph_explicit {
         return;
     }
     if model_prefers_shared_kv_decode(model_directory) {
+        if model_has_control_flow_nodes(&model_directory.model_path) {
+            tracing::info!(
+                "skipping CUDA graph capture: model '{}' contains control-flow nodes (If/Loop/Scan), which ORT cannot capture — enabling capture would force a much slower per-Run path",
+                model_directory.model_path.display()
+            );
+            return;
+        }
         options.graph_capture = true;
         tracing::info!(
             "auto-enabling CUDA graph capture for the shared-KV GQA decode path (set ONNX_GENAI_CUDA_GRAPH=0 to disable)"
         );
     }
+}
+
+/// Minimal protobuf views used to scan an ONNX graph's node `op_type`s without
+/// pulling in the full model proto (which lives behind the `native-backend`
+/// feature). prost silently ignores unknown fields, so only the traversed tags
+/// need declaring: `ModelProto.graph = 7`, `GraphProto.node = 1`,
+/// `NodeProto.op_type = 4`.
+#[derive(Clone, PartialEq, prost::Message)]
+struct ScanModel {
+    #[prost(message, optional, tag = "7")]
+    graph: Option<ScanGraph>,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct ScanGraph {
+    #[prost(message, repeated, tag = "1")]
+    node: Vec<ScanNode>,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct ScanNode {
+    #[prost(string, tag = "4")]
+    op_type: String,
+}
+
+/// Whether the ONNX model at `model_path` contains top-level control-flow nodes
+/// (`If`/`Loop`/`Scan`). ORT cannot capture a CUDA graph for such models, and
+/// requesting capture anyway (via the `enable_cuda_graph` provider option)
+/// forces a pathological ~6× slower per-Run path, so the caller must leave graph
+/// capture disabled when this returns `true`.
+///
+/// Returns `false` (preserving the capture-enabled default) whenever the model
+/// cannot be inspected — unreadable, unparseable, or larger than
+/// [`MAX_CONTROL_FLOW_SCAN_BYTES`] (a model that embeds its weights inline rather
+/// than as external data, where parsing would be needlessly expensive).
+fn model_has_control_flow_nodes(model_path: &Path) -> bool {
+    /// onnxruntime-genai / Foundry models keep weights in an external
+    /// `model.onnx.data`, so the graph proto itself is small (a few MB). Skip the
+    /// scan for anything larger to avoid decoding an inline-weight model.
+    const MAX_CONTROL_FLOW_SCAN_BYTES: u64 = 512 * 1024 * 1024;
+    const CONTROL_FLOW_OPS: [&str; 3] = ["If", "Loop", "Scan"];
+
+    match std::fs::metadata(model_path) {
+        Ok(meta) if meta.len() > MAX_CONTROL_FLOW_SCAN_BYTES => return false,
+        Ok(_) => {}
+        Err(_) => return false,
+    }
+    let Ok(bytes) = std::fs::read(model_path) else {
+        return false;
+    };
+    use prost::Message;
+    let Ok(model) = ScanModel::decode(bytes.as_slice()) else {
+        return false;
+    };
+    model.graph.is_some_and(|graph| {
+        graph
+            .node
+            .iter()
+            .any(|node| CONTROL_FLOW_OPS.contains(&node.op_type.as_str()))
+    })
 }
 
 /// Whether the model at `model_directory` declares the shared-KV (SharedBuffer)
@@ -2467,6 +2539,56 @@ mod tests {
     #[test]
     fn cap_kv_len_ignores_cap_larger_than_model_max() {
         assert_eq!(cap_kv_len(512, Some(40_960)), 512);
+    fn write_scan_model(op_types: &[&str]) -> std::path::PathBuf {
+        use prost::Message;
+        let model = ScanModel {
+            graph: Some(ScanGraph {
+                node: op_types
+                    .iter()
+                    .map(|op| ScanNode {
+                        op_type: (*op).to_string(),
+                    })
+                    .collect(),
+            }),
+        };
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "onnx_genai_control_flow_scan_{}_{:?}.onnx",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::write(&path, model.encode_to_vec()).unwrap();
+        path
+    }
+
+    #[test]
+    fn control_flow_scan_detects_if_loop_scan_but_not_regular_ops() {
+        let plain = write_scan_model(&["MatMul", "Add", "GroupQueryAttention"]);
+        assert!(!model_has_control_flow_nodes(&plain));
+        std::fs::remove_file(&plain).ok();
+
+        for op in ["If", "Loop", "Scan"] {
+            let path = write_scan_model(&["MatMul", op, "Add"]);
+            assert!(
+                model_has_control_flow_nodes(&path),
+                "expected control-flow op '{op}' to be detected"
+            );
+            std::fs::remove_file(&path).ok();
+        }
+    }
+
+    #[test]
+    fn control_flow_scan_returns_false_for_missing_or_unparseable_model() {
+        let missing = std::path::Path::new("does-not-exist-onnx-genai.onnx");
+        assert!(!model_has_control_flow_nodes(missing));
+
+        let mut garbage = std::env::temp_dir();
+        garbage.push(format!("onnx_genai_garbage_{}.onnx", std::process::id()));
+        std::fs::write(&garbage, b"not a protobuf").ok();
+        // Arbitrary bytes may or may not decode as an (empty) proto, but must
+        // never report control flow.
+        assert!(!model_has_control_flow_nodes(&garbage));
+        std::fs::remove_file(&garbage).ok();
     }
 
     #[cfg(feature = "native-backend")]
