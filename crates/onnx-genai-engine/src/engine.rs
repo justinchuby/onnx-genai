@@ -1326,7 +1326,6 @@ impl Engine {
                 scheduler: &mut self.scheduler,
                 session_id,
                 state: &mut state,
-                sampled_fastpath_failed: false,
             };
             run_decode_loop(
                 &mut backend,
@@ -1462,6 +1461,7 @@ impl Engine {
             kv_token_count: 0,
             decode_state,
             draft,
+            sampled_fastpath_failed: false,
         };
         self.sessions.insert(id, state);
         Ok(id)
@@ -1915,7 +1915,6 @@ impl Engine {
                 scheduler: &mut self.scheduler,
                 session_id: active.session_id,
                 state: &mut active.state,
-                sampled_fastpath_failed: false,
             };
             step_decode_loop(
                 &mut backend,
@@ -2116,7 +2115,6 @@ struct SessionDecodeLoopBackend<'a> {
     scheduler: &'a mut Scheduler,
     session_id: SessionId,
     state: &'a mut EngineSession,
-    sampled_fastpath_failed: bool,
 }
 
 impl DecodeLoopBackend for SessionDecodeLoopBackend<'_> {
@@ -2160,7 +2158,7 @@ impl DecodeLoopBackend for SessionDecodeLoopBackend<'_> {
     }
 
     fn sampled_fastpath_supported(&self) -> bool {
-        !self.sampled_fastpath_failed
+        !self.state.sampled_fastpath_failed
             && self.state.decode_state.has_runner()
             && self.state.decode_state.runner_supports_sampled()
     }
@@ -2181,7 +2179,7 @@ impl DecodeLoopBackend for SessionDecodeLoopBackend<'_> {
     }
 
     fn sampled_fastpath_failed(&mut self) {
-        self.sampled_fastpath_failed = true;
+        self.state.sampled_fastpath_failed = true;
     }
 }
 

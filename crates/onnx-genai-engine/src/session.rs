@@ -17,6 +17,10 @@ pub(crate) struct EngineSession {
     pub(crate) decode_state: DecodeState,
     /// Optional draft-model state aligned to this target sequence.
     pub(crate) draft: Option<DraftSession>,
+    /// Latched once the device sampled fast path reports it is unavailable, so
+    /// the incremental generate path (which rebuilds its transient decode-loop
+    /// backend every step) stops retrying it and stays on the host sampler.
+    pub(crate) sampled_fastpath_failed: bool,
 }
 
 pub(crate) struct ActiveGenerate {

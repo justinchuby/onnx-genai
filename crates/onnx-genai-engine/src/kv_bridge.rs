@@ -1259,6 +1259,7 @@ mod tests {
             kv_token_count: 4,
             decode_state: DecodeState::new(&session)?,
             draft: None,
+            sampled_fastpath_failed: false,
         };
 
         trim_overmaterialized_target_kv(&session, None, &mut cache, seq, &mut state)?;
