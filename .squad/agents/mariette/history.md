@@ -25,3 +25,5 @@ Hired as a Metal/MPS kernel engineer for the new Apple Metal EP for ONNX Runtime
 - 🟢 Cleared Pris's Mobius `797fff9` PR #406 fixes: mixed-native export uses a 4-bit/block-32 scaffold, native IQ bytes remain exact, serialized genai opset v1 is present, and pure-Q8 behavior remains unchanged (238 tests).
 
 - 2026-07-18: Attention review cycle completed: initial rejection corrected and final revision approved.
+
+- 2026-07-18: Completed CUDA CSA review chain (two rejections followed by final approval) and MTP review chain (rejection then approval).

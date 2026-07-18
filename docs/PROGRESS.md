@@ -470,3 +470,7 @@ GPU-native standard Attention landed, including the present-value cache-geometry
 ## 2026-07-18 — PR closure and CUDA sparse KV landing
 
 - All 6 open PRs merged (#20,#23,#25,#26,#27,#28); CUDA SparseKvGather landed (DeepSeek/GLM sparse KV primitive now GPU-native); in flight: CUDA CompressedSparseAttention (host-staged, Ash) + MTP Phase 1 sidecar metadata (Hudson).
+
+## 2026-07-18 — CUDA CSA Phase A and MTP Phase 1 landed
+
+CUDA CompressedSparseAttention Phase A landed (correctness-first host-staged, delegates to CPU oracle for parity; claim gate mirrors CPU per-ratio contract incl. attention_bias; device-resident fused kernel = future Phase B per doc §4.8) — biggest DeepSeek/GLM CUDA gap now has a correct GPU path. MTP Phase 1 landed (Mobius sidecar metadata parse + Hyper-Connection [B,S,hc_mult,H] threading; MtpConfig public contract preserved via internal ResolvedMtpConfig). Both went through reviewer-rejection→reassign cycles (Ash/Leon/Deckard on CSA; Hudson/Batty on MTP).

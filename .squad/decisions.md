@@ -573,3 +573,201 @@ No real bug was surfaced: all three regression tests pass against the current im
 **By:** Vasquez
 **What:** 🟢 APPROVE commit `dbff29c`.
 **Why:** The rewritten test uses real `Environment::new` values and their real `Drop`, proving cache sharing while environments are live, retention after the first drop, clearing on final drop, and a fresh registration attempt after recreation. The isolated child process and PID-specific key prevent global-state leakage; Linux, Windows, and macOS checks are green.
+
+## 2026-07-18 — CUDA CSA Phase A and MTP Phase 1 landing decisions
+
+The following reviewer chains record the two landed features in chronological order.
+
+<!-- merged from ash-cuda-csa-phaseA.md -->
+# Decision: CUDA host-staged CompressedSparseAttention (CSA) — Phase A
+
+- Author: Ash (ep-cuda)
+- Date: 2026-07-18T01:20:34Z
+- Branch: `feat/cuda-csa-hoststaged` (worktree `/home/justinchu/wt-csa`, based on origin/main b09a8e8)
+- Scope: correctness-first, host-staged CUDA execution of `pkg.nxrt::CompressedSparseAttention` v1.
+
+## Reuse strategy — delegate to the CPU oracle (no math re-derivation)
+
+The CUDA kernel does **not** re-derive any CSA math. It delegates to the fully-implemented CPU
+kernel, which is the authoritative numerical oracle:
+
+- `CompressedSparseAttentionFactory` (CUDA) builds the CPU kernel by calling the CPU
+  `CompressedSparseAttentionFactory` (`onnx_runtime_ep_cpu::kernels::compressed_sparse_attention`)
+  from the *same* `Node`, so the CPU kernel carries the identical, fully-validated frozen-v1 attribute
+  configuration. The CUDA kernel wraps that `Box<dyn Kernel>`.
+- At execute time the CUDA kernel: (1) D2H-copies every present device input into host buffers,
+  (2) builds host-resident `TensorView`/`TensorMut` (DeviceId::cpu) over those buffers reusing each
+  tensor's contiguous shape/strides, (3) runs the CPU oracle kernel verbatim, (4) H2D-uploads every
+  host output back to its device buffer. This guarantees bit-parity by construction.
+
+### ep-cpu visibility change: NONE
+
+No ep-cpu change was required. `pub mod compressed_sparse_attention` and
+`pub struct CompressedSparseAttentionFactory` were already public, and `KernelFactory`/`Kernel` are
+public `onnx_runtime_ep_api` traits. The only build change was promoting `onnx-runtime-ep-cpu` from a
+`[dev-dependencies]` to a `[dependencies]` entry in `crates/onnx-runtime-ep-cuda/Cargo.toml` so the
+library (not just tests) can link the oracle. `git diff --stat -- crates/onnx-runtime-ep-cpu/` is empty.
+
+## State threading (prefill → decode → decode)
+
+CSA statefulness is expressed through the graph as ordinary `past_* → present_*` I/O tensors (the ONNX
+KV-cache pattern), **not** as internal kernel state — the CPU kernel struct holds only config. The
+host-staged CUDA kernel therefore reproduces the entire lifecycle for free: each step's `present_*`
+device outputs are fed back as the next step's `past_*` device inputs by the session/caller. Because we
+delegate to the CPU kernel, the compressed-cache, compression-carry (and, for ratio-4, index-key /
+index-carry) evolution — including block-boundary emission of a fresh FP8-quantized record and carry
+reset — is identical to the CPU oracle. Host-resident state (via the round trip) is accepted for this
+correctness-first phase; device-resident state is Phase B.
+
+## `supports_op` contract — accepted vs rejected (doc §4.8)
+
+`crate::kernels::compressed_sparse_attention::unsupported_reason(node, input_dtypes)` gates claims,
+wired into `provider.rs` alongside the other pkg.nxrt/attention gates:
+
+- **Rejected at claim time** (never reaches `execute`):
+  - Any attribute combination the CPU factory rejects, obtained by dry-running the CPU factory
+    (`CpuCsaFactory.create(node, &[])`): `compression_ratio` other than 4 or 128; unknown
+    `cache_format` (only `f32`, `fp8_e4m3_block64`, `fp4_e2m1_block32`); `sink_mode` other than
+    `logit_only`; ratio-4 requiring positive `index_num_heads`/`index_head_dim`/`index_topk` while
+    ratio-128 requires them zero; missing `num_heads`/`head_dim`; `qk_rope_head_dim > head_dim`;
+    non-conforming `causal`/`cache_layout_version`/`index_layout_version`; input arity outside 11..=20
+    or output arity outside 3..=6; any omitted required frozen-v1 input by name.
+  - dtype mismatches on the dtype-fixed inputs: query(0)=f32, seqlens_k(8)=i32,
+    total_sequence_length(9)=i64, head_sink(10)=f32, and past_compressed_kv(6) = uint8 for the
+    block-quantized formats / f32 for `cache_format=f32`.
+- **Accepted (claimed) then executed host-staged**: ratio-128 and ratio-4 frozen-v1 configs the CPU
+  oracle supports (D=512, RD=64; ratio-4 additionally ID=128), with `cache_format` `f32` /
+  `fp8_e4m3_block64` (and `fp4_e2m1_block32` for the ratio-4 index stream). Remaining shape checks that
+  depend on runtime shapes are enforced identically by the delegated CPU kernel at execute time.
+
+`cuda_graph_compatible()` returns **false** (host round trip + per-copy stream syncs), and
+`supports_strided_input()` returns false (the host blit is dense; strided inputs are rejected in
+execute with an actionable error).
+
+## Phase-B TODO markers (device-resident kernel)
+
+`crates/onnx-runtime-ep-cuda/src/kernels/compressed_sparse_attention.rs` carries a top-of-file
+`// TODO(csa-cuda phase B): ...` referencing `docs/DEEPSEEK_CSA_MTP_RUNTIME.md §4.8`, calling out the
+device-resident replacement: device-resident compressed cache/carry, fused
+selection/score/sink-softmax/value-reduction, CUDA-graph capture, and elimination of the host round
+trip. `cuda_graph_compatible()` also documents the Phase-B goal inline.
+
+## Tests added (`tests/compressed_sparse_attention_gpu.rs`)
+
+Uses the Rust `onnx_runtime_ir` graph builders (no Python `ir.to_proto`), mirroring the CPU kernel's
+own ratio-128 test value generators so the oracle comparison is apples-to-apples:
+
+- `ratio128_prefill_then_two_decodes_matches_cpu`: prefill (S=126, dense-window + sink / dense-fallback
+  path, 0 compressed records) → decode@126 → decode@127 (crosses the 128-block boundary, emitting the
+  first FP8-quantized compressed record and resetting the carry). Runs the SAME inputs through the CPU
+  and CUDA kernels at every step and asserts bit-parity on `Y`, `present_compressed_kv` (exact bytes),
+  and `present_compression_carry`, threading CPU `present_*` outputs into the next step's `past_*`.
+- `supports_op_rejects_unsupported_configs`: a valid ratio-128 config is claimed; unsupported
+  `compression_ratio=8`, unknown `cache_format`, and non-f32 query dtype are each rejected at claim time.
+
+## Results
+
+- `cargo test -p onnx-runtime-ep-cuda --test compressed_sparse_attention_gpu`: **2 passed, 0 failed**.
+- `cargo test -p onnx-runtime-ep-cuda --lib`: **101 passed, 0 failed** (updated the
+  `covered_ops_have_no_duplicates` count 84 → 85 for the new registered op).
+- `cargo test -p onnx-runtime-ep-cuda --test sparse_kv_gather_gpu`: 12 passed (no registration
+  regression).
+- ep-cpu unchanged (no CPU behavior/signature change).
+
+<!-- merged from mariette-cuda-csa-phaseA-review.md -->
+### 2026-07-18T01:20:34Z: Reject CUDA CSA Phase A claim gating
+**By:** Mariette
+**What:** 🔴 REJECT commit `f1bd482`. Reassign the revision to **Leon**; Ash is locked out.
+**Why:** The host-staging implementation itself faithfully copies every present input to host, invokes the CPU kernel built from the same `Node`, uploads every output, threads state through graph I/O, and explicitly disables CUDA graph capture. The ratio-128 test crosses the 128-record boundary and compares all three outputs at every step. However, `supports_op` is not a true gate. `unsupported_reason` checks only inputs 0, 6, 8, 9, and 10, while the CPU runtime requires many additional f32/u8 inputs. For example, a Float16 `current_kv` at input 1 is claimed and then fails in `execute`. The CPU factory dry-run also accepts configurations rejected only at runtime: ratio-4 with `index_head_dim != 128`, missing index inputs 11..18, fewer than five outputs, or a non-FP8 cache format; ratio-128 similarly over-claims FP4 cache format and ratio-4-only inputs/outputs. ORT can therefore place unsupported CSA nodes on CUDA and fail during execution.
+**How:** Make claim validation mirror the CPU runtime's ratio-specific structural and dtype contract, using `shapes` where needed. Add a valid ratio-4 claim test plus negative claim tests for a non-query dtype (for example `current_kv`), invalid ratio-4 index dimensions, missing ratio-4 index state, and ratio-specific cache-format/output-count mismatches. The existing negative test only proves ratio, unknown-format, and query-dtype rejection, so it does not catch these over-claims.
+
+**Verification:** CPU source diff is empty; registration is unique; `CUDA_COVERED_OPS` contains 85 unique entries; ep-cpu has no ep-cuda dependency. Focused CUDA CSA tests passed 2/2, and CUDA EP library tests passed 101/101.
+
+<!-- merged from leon-cuda-csa-supports-op-fix.md -->
+### 2026-07-18T01:20:34Z: CUDA CSA claim gate mirrors CPU ratio contracts
+**By:** Leon
+**What:** `CompressedSparseAttention` CUDA claim-time validation now passes static shapes into the CPU factory dry-run, requires complete positional shape/dtype metadata, and applies the CPU runtime's ratio-specific contract before claiming:
+- Ratio 4: 19 or 20 inputs with all index inputs 11..18 present; 5 or 6 outputs; `head_dim=512`, `qk_rope_head_dim=64`, `index_head_dim=128`; FP8/BF16 attention cache only; f32 inputs 0..5, 7, 10..16, 18; u8 inputs 6 and 17; i32 input 8; i64 input 9; optional input 19 is additive f32 bias. Static input ranks/extents mirror the CPU ratio-4 path, including 8-slot 2D/index carries and packed widths 583/68.
+- Ratio 128: index inputs 11..18 must be absent; exactly 3 outputs; `head_dim=512`, `qk_rope_head_dim=64`; f32 inputs 0..5, 7, 10; i32 input 8; i64 input 9; input 6 matches the cache format. FP4 is rejected. CPU-supported f32 and FP8/BF16 caches remain claimable, with packed widths 512/583 respectively. Static input ranks/extents mirror the CPU ratio-128 path.
+**Why:** The prior gate checked only inputs 0, 6, 8, 9, and 10, so CUDA placement could claim nodes that the delegated CPU oracle rejected during `execute`. The CPU kernel remains the runtime source of truth; the host-staged compute and `cuda_graph_compatible() == false` are unchanged.
+
+The documentation describes the production format as FP8/BF16 and uses logical/cache placeholders in §4.3, while the CPU runtime explicitly also accepts an f32 ratio-128 cache and stores packed caches as `[B, records, stored_width]`. The gate follows CPU behavior and therefore rejects ratio-128 FP4 without over-rejecting CPU-supported f32.
+
+Tests added: valid ratio-4 claim plus CPU/CUDA parity across all six outputs; claim rejection for Float16 `current_kv`, ratio-4 `index_head_dim != 128`, missing inputs 11..18, fewer than five ratio-4 outputs, ratio-128 FP4, and a ratio-4-only input under ratio-128. Results: CSA integration 9 passed/0 failed; CUDA library 101 passed/0 failed.
+
+<!-- merged from mariette-cuda-csa-phaseA-rereview.md -->
+### 2026-07-18T01:20:34Z: 🔴 REJECT CUDA CSA Phase-A re-review
+**By:** Mariette
+
+**What:** Reject commit `e4442bf`. The six requested negative claim tests are load-bearing, valid ratio-4 and ratio-128 configurations remain claimed, ratio-4 CPU/CUDA parity passes, and the previously named failures are fixed. However, ratio-128 still over-claims when optional input 19 (`attention_bias`) is present.
+
+**Why:** `validate_ratio128_claim` validates only inputs 0–10 and never checks input 19. The CPU runtime calls `AttentionBias::new`, which rejects non-`Float32` bias and rank greater than four. Therefore a ratio-128 node with a present Float16 (or rank-5) `attention_bias` is reported `Supported` and then fails inside `execute`, violating the required CPU-contract claim gate. Ratio-4 already performs these dtype/rank checks, demonstrating the missing ratio-128 branch.
+
+**How:** Deckard should add shared optional-`attention_bias` claim validation for both ratios, including Float32 dtype, rank ≤ 4, and statically checkable broadcast dimensions, plus a negative ratio-128 claim test that appends absent slots 11–18 and a bad input 19. Ash and Leon are locked out.
+
+**Verification:** CPU EP diff is empty; registration is unique; `CUDA_COVERED_OPS` remains 85 with one CSA entry; `cuda_graph_compatible()` remains false; the host-staging kernel body is byte-identical to the prior revision; determinism/state threading are untouched. CUDA CSA tests passed 9/9 and CUDA library tests passed 101/101.
+
+<!-- merged from deckard-cuda-csa-bias-claim-fix.md -->
+### 2026-07-18T01:20:34Z: Share CSA optional attention-bias claim validation
+**By:** Deckard
+**What:** Added `validate_attention_bias_claim`, invoked after either ratio-4 or ratio-128 structural validation. When optional input 19 is absent it accepts the node. When present it requires Float32, rank <= 4, a statically safe dense f32 layout, and right-aligned broadcasting to the attention-score shape `[batch, num_heads, sequence, candidates]`: static non-1 bias dimensions must equal the corresponding statically known target dimension; symbolic dimensions and the runtime-dependent candidate dimension remain claimable. Ratio-128 keeps inputs 11-18 absent and checks the bias at its actual positional slot 19.
+**Why:** CPU `AttentionBias::new` applies the same dtype, rank, layout, and broadcast contract at execution. Sharing the claim helper prevents ratio-128 from being over-claimed while retaining ratio-4 behavior and avoiding rejection where broadcast compatibility cannot be disproved statically. Added one ratio-128 claim test covering Float16, rank-5, statically incompatible broadcast, and valid broadcastable f32 bias at input 19. CUDA CSA integration tests passed 10/10; CUDA EP library tests passed 101/101 (two pre-existing warnings).
+
+<!-- merged from mariette-cuda-csa-phaseA-rereview2.md -->
+### 2026-07-18T01:20:34Z: CUDA CSA phase-A third review approved
+**By:** Mariette
+**What:** 🟢 APPROVE commit `d23cac5` for the CUDA host-staged `CompressedSparseAttention` kernel.
+**Why:** The shared input-19 validator now mirrors CPU `AttentionBias::new` for both ratio-4 and ratio-128: optional absence is accepted; present bias requires Float32, rank <= 4, safe static byte layout, and every statically knowable broadcast axis matches `[B, N, S, Candidate]`. Ratio-128 correctly preserves absent slots 11–18 before placing bias at index 19. The valid f32 broadcast case remains claimed, while dtype/rank/broadcast negatives are load-bearing because ratio-128 would otherwise claim them. No other optional input is ignored: 11–18 are fully validated for ratio-4 and forbidden for ratio-128, and 19 is now validated. Host-staging execution is byte-identical to `e4442bf`; ep-cpu and registration/count surfaces are unchanged. Verified 10/10 CSA integration tests and 101/101 CUDA library tests pass, including the 85-op count assertion.
+
+<!-- merged from hudson-mtp-phase1.md -->
+### 2026-07-18T01:20:34Z: DeepSeek/GLM MTP Phase 1 metadata and HC adapter
+**By:** Hudson
+**What:** Implemented native `proposal_type: mtp` resolution into `MtpConfig`, package-referenced target embedding/LM-head adapters, rank-4 Hyper-Connection state extraction/binding/threading, and one persistent MTP proposer per generation. Manual raw-f32 `MtpConfig` remains supported through file weight sources and the legacy `BSH`, `hc_mult=1`, no-`mtp_state` path.
+
+The §6.7 metadata fields are:
+- `proposal_type` string enum (`mtp`);
+- required `model` string/path;
+- `num_speculative_tokens` positive integer, default `4`;
+- `target_hidden_output` string, default `hidden_states`;
+- `target_hidden_layout` enum `BSH`/`BSHC`, default `BSHC`;
+- required positive integers `target_hidden_size` and `hc_mult`;
+- `mtp_hidden_output` string, default `mtp_hidden`;
+- `mtp_state_output` string, default `mtp_state`;
+- `kv_mode` enum `proposal_local`/`accepted_prefix`, default `proposal_local`;
+- required `embedding` and `lm_head` objects, each with `source: target_initializer` and a non-empty exact initializer `name`.
+
+Metadata carries exact initializer identity rather than a guessed filename or tensor name. The runtime inspects ONNX dtypes and currently borrows Float32, Float16, or BFloat16 initializer bytes from `WeightStore`; sidecar activations support Float32, Float16, and BFloat16. This follows §6.7 and the frozen configuration constants (§“Configuration constants that pin this contract”).
+
+HC handling follows §2.4 and §6.3: target extraction preserves the final `[B,S,hc_mult,H]` row as `hc_mult*H`; `MtpDecodeSession` binds `hidden_states` as BSHC, returns separate `[B,S,H] mtp_hidden` and `[B,S,hc_mult,H] mtp_state`, and the proposer feeds only `mtp_hidden` to the LM head while threading `mtp_state` to the next draft. Absolute MTP positions use target length plus draft index. The proposer/session is constructed once per generation and reused across verification iterations (§6.1-§6.2).
+
+**Blocked:** The released §2.4 sidecar described in the design exports only `mtp_hidden`; `hc_mult>1` iterative execution therefore still requires Mobius to export the explicit `mtp_state` required by §6.3. `accepted_prefix` parses but runtime reuse is rejected because the frozen numerical contract explicitly does not define correction-token/cache lifetime alignment. FP8/block-quantized target initializers remain blocked on wiring the runtime embedding/quantized matmul components; no quantization semantics were invented.
+
+**Tests:** Added metadata-to-`MtpConfig`, malformed descriptor, validation, package-initializer parity, rank-4 `hc_mult=2` recurrent threading, and legacy `hc_mult=1` coverage. `cargo test -p onnx-genai-engine`: 147 passed, 0 failed, 10 ignored. `cargo check -p onnx-genai-engine`: passed. Metadata tests: 23 passed. Targeted ORT MTP test: passed.
+
+**Why:** Phase 1 must make the approved package contract executable without hand-built raw-weight configuration while preserving the existing speculative verify/correction state machine and refusing to guess recurrent-state or cache semantics absent from the frozen contract.
+
+<!-- merged from ripley-mtp-phase1-review.md -->
+### 2026-07-18T01:20:34Z: Reject MTP Phase 1 backward-compatibility break
+**By:** Ripley
+**What:** 🔴 REJECT commit `2243968`. Reassign the revision to **Batty**; Hudson is locked out.
+**Why:** The metadata-to-runtime mapping, rank-4 `[B,S,hc_mult,H]` threading, `hc_mult=2` recurrence test, proposer lifetime, and proposal-local reset behavior are sound. The blocked `mtp_state`, `accepted_prefix`, and quantized-adapter work is legitimately unfrozen by the pinned contract. However, the public manual `MtpConfig` API is source-breaking: five required fields were added, and `embedding_weights`/`lm_head_weights` changed from `PathBuf` to `MtpWeightSource`. Every existing external `SpeculativeMode::Mtp(MtpConfig { ... })` consumer now fails to compile. The repository test was updated with new fields and `.into()`, so it does not prove backward compatibility.
+**How:** Restore the original public `MtpConfig` struct-literal contract unchanged. Resolve metadata-only layout, HC, output-name, cache-scope, and initializer-reference data into a separate internal configuration path (or an additive API that does not alter `SpeculativeMode::Mtp(MtpConfig)`). Add a compile-time compatibility fixture using the pre-`2243968` struct literal verbatim, while retaining the metadata and `hc_mult > 1` tests.
+
+**Verification:** Targeted metadata, engine MTP, and ORT MTP tests passed; the ignored MTP greedy-equivalence test also passed when run explicitly. The rejection is specifically for the public source-compatibility regression.
+
+<!-- merged from batty-mtp-config-compat-fix.md -->
+### 2026-07-18T01:20:34Z: Preserve the public MTP configuration contract
+**By:** Batty
+**What:** Restored `MtpConfig` to its pre-`2243968` eight-field public struct, including `PathBuf` embedding and LM-head fields. Metadata-only layout, Hyper-Connection, sidecar output/cache, and initializer-source settings now live in crate-private `ResolvedMtpConfig`; manual configs resolve to legacy BSH, `hc_mult = 1`, `mtp_hidden`, no recurrent state, proposal-local cache, and file-backed weights. Added and exercised `pre_phase1_mtp_config_literal_remains_source_compatible` using the original struct literal.
+**Why:** Existing external `SpeculativeMode::Mtp(MtpConfig { ... })` consumers must remain source-compatible while metadata-driven DeepSeek/GLM MTP retains Phase-1 behavior. Validation passed: engine tests 148 passed, 0 failed, 10 ignored; compatibility fixture 1 passed; `cargo check` passed for `onnx-genai-engine` and `onnx-genai-ort`.
+
+<!-- merged from ripley-mtp-phase1-rereview.md -->
+# Ripley MTP Phase 1 Re-review
+
+- **CURRENT_DATETIME:** 2026-07-18T01:20:34Z
+- **Commit:** `ea92bf5`
+- **Verdict:** 🟢 APPROVE
+
+The public eight-field `MtpConfig` contract exactly matches its pre-`2243968` definition, including `PathBuf` weight fields. The compatibility test uses the original struct literal without `Default` masking and passes. `ResolvedMtpConfig` preserves legacy manual defaults while retaining metadata resolution, rank-4 HC threading, hc_mult=2 recurrence coverage, persistent per-generation proposer lifetime, proposal-local reset, and malformed-descriptor rejection.
+
+Validation: `cargo test -p onnx-genai-engine` passed all 148 non-ignored tests; `cargo check -p onnx-genai-ort` passed.

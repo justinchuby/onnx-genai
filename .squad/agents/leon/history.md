@@ -81,3 +81,5 @@ Loader opset-import validation for file, from-parts, and nested-subgraph paths m
 
 ## 2026-07-18T01:20:34Z — CUDA SparseKvGather D==0 fix landed
 - Fixed validation ordering in `c2180c9`; three D==0 parity tests passed 12/12, Gorman re-approved, and CUDA SparseKvGather landed.
+
+- 2026-07-18: CUDA CSA claim gate was corrected to mirror CPU ratio-specific contracts and parity tests, then superseded by Deckard's shared attention_bias validation; final CSA approval landed.

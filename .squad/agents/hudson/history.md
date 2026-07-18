@@ -4,3 +4,5 @@
 
 ## 2026-07-18T01:20:34Z — MTP Phase 1 remains in flight
 - Sidecar metadata and Hyper-Connection adapter work continues in `wt-mtp`; not yet landed.
+
+- 2026-07-18: MTP Phase 1 metadata/HC implementation landed after Batty restored the public MtpConfig compatibility contract; Hudson's initial revision was locked out.

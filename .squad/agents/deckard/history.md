@@ -138,3 +138,5 @@ Authored native Engine/server backend integration in `66ec4b8`; Holden rejected 
 - 2026-07-18 Scribe: Reshape/Split and RoPE fixes landed; final RoPE validation commit 74a891b.
 
 - 2026-07-18: Fixed Attention present-value geometry; continuing the PR #25 lifecycle fix.
+
+- 2026-07-18: Added shared CUDA CSA attention_bias claim validation for ratio-4/128; Mariette approved the final Phase A revision.

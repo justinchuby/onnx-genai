@@ -33,3 +33,5 @@ Added the independent abi3-py310 `onnx-rs-python` crate, importing as `onnx_rs`,
 ## 2026-07-16T19:27:57+0000Z — Native backend selector revision
 
 Under Deckard's strict reviewer lockout, revised native serving in `2ae464b`: exact `com.github.onnxruntime.genai::BlockQuantizedMatMul` opset-v1 Auto detection, explicit errors for unsupported request speculation/pipelines/non-CPU selection, and regressions. Holden re-reviewed 🟢 CLEAR.
+
+- 2026-07-18: Restored the pre-Phase-1 public MtpConfig struct contract via internal ResolvedMtpConfig; MTP Phase 1 re-review approved.
