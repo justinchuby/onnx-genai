@@ -1,36 +1,45 @@
-# C++ vs Rust for onnx-genai and the ORT rewrite — an honest assessment
+# C++ vs Rust for ONNX Runtime — an honest assessment
 
-**Audience:** the C++ engineers on this team who will (rightly) be skeptical of "rewrite it in Rust."
-**Purpose:** make the *honest* case — where Rust has already paid for itself in this codebase, where
-C++ is still the right tool, and how a migration can be incremental and low-risk instead of a
-religious big-bang rewrite.
+**Audience:** the ONNX Runtime maintainers and engineers at Microsoft who own the C++ codebase and
+will (rightly) be skeptical of "rewrite it in Rust."
+**Purpose:** make the *honest* case — where Rust would demonstrably help ORT, where C++ is still the
+right tool, and how adoption can be incremental and low-risk instead of a religious big-bang rewrite.
 
 This is deliberately not a hype piece. If you are an expert, hype is what makes you distrust the
-argument. Everything below is grounded in code we have already shipped in this repo (and the sibling
-`onnxruntime-mlx` plugin EP), with real numbers you can reproduce.
+argument. Everything below is grounded in a **working existence proof**: `onnx-genai`, an independent
+Rust reimplementation of the ONNX Runtime GenAI stack (and a partial `onnx-runtime-*` runtime layer),
+plus `onnxruntime-ep-mlx`, a **pure-Rust ONNX Runtime plugin execution provider that loads into stock,
+unmodified ORT**. Those two codebases are used here only as *evidence that the approach is executable* —
+not as products anyone is asking ORT to adopt. Every number below is reproducible (see appendix).
 
 ---
 
 ## 0. TL;DR
 
-- We are **not** proposing to rewrite ONNX Runtime's MLAS/CUDA kernels in Rust. That would be a
-  decade of work thrown away. We keep and *reuse* the fast C/C++/CUDA kernels through FFI.
-- We **are** proposing that the *orchestration* layers — IR, graph optimizer, partitioner, memory
-  planner, session/EP glue, KV cache, scheduler, sampling, serving — are better written in Rust, and
-  that new components should start in Rust.
-- The evidence is that we already did a lot of this and it works: **~119k lines of Rust across 27
-  crates, 1468 tests**, a pure-Rust CPU EP with real kernels, a pure-Rust paged-KV cache, and a
-  **pure-Rust ONNX Runtime plugin EP** (`onnxruntime-ep-mlx`) that loads into *stock* ORT and is
-  published to crates.io + PyPI.
-- The honest cost: **452 `unsafe` blocks**, almost all of them at C-ABI / CUDA boundaries, plus Rust's
+- This is **not** a proposal to rewrite ORT's MLAS/CUDA kernels in Rust. That would throw away a
+  decade of hand-tuned work. Keep and *reuse* the fast C/C++/CUDA kernels through FFI.
+- It **is** an argument that the *orchestration* layers — IR, graph optimizer, partitioner, memory
+  planner, session/EP glue, and the GenAI stack (KV cache, batching, sampling, serving) — are a
+  natural fit for Rust, and that new components and new EPs are a low-risk place to start.
+- The evidence that this is executable: a proof-of-concept of **~119k lines of Rust across 27 crates,
+  1468 tests**, including a pure-Rust CPU EP with real kernels, a pure-Rust paged-KV cache, and a
+  pure-Rust ORT plugin EP published to crates.io + PyPI that runs under an unmodified ONNX Runtime.
+- The honest cost: **452 `unsafe` blocks**, almost all at C-ABI / CUDA boundaries, plus Rust's
   compile times and a less mature ML-kernel ecosystem.
+- **Agentic development** is a first-class consideration here (§6): Rust's compiler-as-oracle feedback
+  loop makes AI agents converge fast and blocks whole classes of latent bug — but today's agents are
+  more fluent in C++ and in the existing ORT idioms. Both effects are real.
 
-If you read nothing else, read §3 (where C++ still wins) and §6 (the migration that doesn't bet the
-company).
+If you read nothing else, read §3 (where C++ still wins), §6 (agentic development), and §7 (the
+adoption path that doesn't bet the runtime).
 
 ---
 
-## 1. What we have actually built in Rust (the receipts)
+## 1. The existence proof (the receipts)
+
+These numbers come from `onnx-genai` + `onnxruntime-ep-mlx` — an independent, working reimplementation
+built to test exactly this question. They are offered as *proof the approach compiles, runs, tests,
+and ships*, not as code for ORT to consume.
 
 | Layer | Crate(s) | Rust LOC | `unsafe` | Tests | Nature |
 |---|---|---:|---:|---:|---|
@@ -49,7 +58,7 @@ safe Rust** (KV cache: 0 `unsafe` in 5.7k lines; optimizer: 1 in 3.3k; CPU kerne
 is safe; it *contains* the danger to auditable, minority regions instead of letting it diffuse
 through the whole codebase the way `reinterpret_cast` and raw pointers do in C++.
 
-### Concrete capabilities we shipped in Rust
+### Concrete capabilities the experiment covers
 
 - A **pure-Rust ORT plugin EP** for Apple MLX: it implements the ORT plugin-EP C ABI, is loaded by an
   *unmodified* ONNX Runtime, claims ~130 op types, and covers `MatMulNBits`, `GroupQueryAttention`,
@@ -61,11 +70,12 @@ through the whole codebase the way `reinterpret_cast` and raw pointers do in C++
 - A **CPU execution provider with real kernels** written in safe Rust.
 - A graph **optimizer**, **shape-inference**, and **partitioner** as ordinary, testable Rust modules.
 
-None of this is theoretical. It is compiled, tested, and (for the EP) released to public registries.
+None of this is theoretical. It is compiled, tested, and (for the EP) released to public registries by
+one person as a side experiment — which is itself a data point about the approach's tractability.
 
 ---
 
-## 2. Where Rust demonstrably helped *in this codebase*
+## 2. Where Rust demonstrably helped (from building the experiment)
 
 These are not textbook claims; they are things that happened while building the above.
 
@@ -125,10 +135,12 @@ If we pretend these away, the experts are right to ignore us.
 5. **Rewrite risk and opportunity cost.** ORT is millions of lines of *correct, fast, shipping* C++.
    "Rewrite it" is, at face value, the single most classic engineering mistake there is. A Rust ORT
    that is 95% as fast and 100% rewritten is a **strategic loss**, not a win. The only defensible
-   version is incremental and reuse-heavy (see §6).
+   version is incremental and reuse-heavy (see §7).
 
-6. **Team expertise.** Our deep experts are C++ experts. Ramping the whole team on Rust's borrow
-   checker, async, and macro ecosystem is a real cost, paid in calendar time.
+6. **The ORT team's expertise is in C++.** ORT's deepest experts are C++ experts with years of context
+   in *this specific codebase*. Ramping a team on Rust's borrow checker, async, and macro ecosystem is
+   a real cost paid in calendar time — and an agent (see §6) working inside the existing C++ ORT has
+   far more precedent to draw on than in a greenfield Rust runtime.
 
 ---
 
@@ -145,8 +157,8 @@ If we pretend these away, the experts are right to ignore us.
 | CUDA / Metal device kernels | Written in CUDA/Metal regardless of host language | **Neutral** (host glue can be Rust) |
 
 The pattern: **Rust wins the orchestration and correctness-critical logic; C++/vendor kernels win the
-raw FLOPs.** A good architecture puts the Rust/kernel boundary exactly at the FFI line — which is what
-we already do.
+raw FLOPs.** A good architecture puts the Rust/kernel boundary exactly at the FFI line — which is
+precisely where the experiment draws it.
 
 ---
 
@@ -160,55 +172,122 @@ The reflexive objection is: "you still write `unsafe`, so what did safety buy yo
    *100%* of the code is in the danger zone; there is no `unsafe` keyword to grep for because there is
    no safe subset. Reviewers can spend their attention where it matters.
 
-2. **The unsafe you keep is honest about its contract.** When we mis-used an FFI contract (int32 vs
-   int64 read), the bug was in an `unsafe fn` whose job is exactly that boundary. The fix was local
-   and the blast radius was one function. That is the whole value proposition: not zero danger, but
-   *localized, labeled* danger.
+2. **The unsafe you keep is honest about its contract.** When the experiment mis-used an FFI contract
+   (int32 vs int64 read), the bug was in an `unsafe fn` whose job is exactly that boundary. The fix was
+   local and the blast radius was one function. That is the whole value proposition: not zero danger,
+   but *localized, labeled* danger.
 
 ---
 
-## 6. A migration that doesn't bet the company
+## 6. Agentic development: which codebase is easier for AI agents?
 
-This is the part to actually argue about. The plan is **strangler-fig, not big-bang**:
+This is no longer a footnote. A growing share of ORT changes will be written or drafted by coding
+agents, and the language's ergonomics *for an agent* now matter as much as for a human. This section
+is grounded in direct evidence: the entire experiment above — `PagedAttention`, `QMoE`, `GatherND`,
+the 129-predicate `ClaimResult` refactor, a crate-wide clippy sweep, an env-var namespace rename —
+was implemented by an AI agent in a tight edit→check loop.
 
-1. **New components start in Rust.** KV cache, scheduler, engine, server, router, sampling — done, in
-   Rust, today. This is free: you were going to write them anyway.
-2. **Wrap, don't rewrite, ORT first.** `onnx-genai-ort` binds the existing ORT via its C ABI. You get
-   ORT's kernels and EPs immediately, with a safe Rust surface on top. (This is exactly how the MLX EP
-   ships: stock ORT + a Rust plugin.)
-3. **Reimplement the runtime layer behind the ORT C API** (`nxrt` / the `onnx-runtime-*` crates), one
-   piece at a time: IR → optimizer → partitioner → memory planner → session. Each piece is validated
-   against ORT's own conformance tests. Because it presents the same C API, consumers don't notice.
-4. **Reuse kernels via FFI; replace selectively.** Call MLAS/CUDA from Rust. Rewrite a kernel only
-   when you have a measured win (e.g. the MLX path, where there was no ORT kernel at all on Apple
-   Silicon — so Rust wasn't competing with a mature kernel, it was the *only* option).
-5. **Plugin EPs are the wedge.** A Rust EP loads into *unmodified* ONNX Runtime. That means you can
-   ship Rust into a C++ ORT deployment with zero rewrite, prove it in production, and expand from
-   there. We already did this end-to-end.
+**Where Rust is markedly better for agents:**
+
+1. **The compiler is a precise, machine-readable oracle.** `cargo check` / `clippy --message-format=json`
+   emit structured diagnostics with exact spans *and suggested fixes*. An agent's wrong guess usually
+   **fails to compile with a pointer to the exact fix**, and it self-corrects in the next loop
+   iteration. In C++ the same class of mistake frequently *compiles* and fails at runtime as UB or a
+   segfault — which gives an agent **no actionable signal** (a stack-less abort is nearly useless
+   feedback). Concretely, in this experiment the compiler caught agent mistakes — an unstable
+   expression-attribute (`E0658`), a bad `if let` collapse, borrow/lifetime errors, non-exhaustive
+   `match` — each as a localized error the agent fixed immediately. The only *hard* crashes were in the
+   C++ MLX library and one FFI-contract slip; the safe-Rust logic gave the agent no UB to chase.
+
+2. **"If it compiles, the change is complete."** When an agent renames or re-types an API, the compiler
+   enumerates *every* call site. The agent gets a complete, verifiable worklist and knows when it is
+   done. In C++, silent breakage, link-time errors, and ODR give an agent an incomplete and often
+   misleading picture — the failure surfaces far from the edit.
+
+3. **One uniform, scriptable toolchain.** `cargo build/test/clippy` is the same everywhere, with
+   parseable output. An agent doesn't have to reverse-engineer CMake/Bazel targets, generated headers,
+   or include paths to know how to build and test. Fewer files per change, too — no `.h`/`.cpp` to keep
+   in sync, no forward declarations.
+
+4. **`unsafe` is a labeled blast radius.** An agent (and the human reviewing the agent's PR) can `grep`
+   for exactly the regions that need scrutiny. C++ has no safe subset to exclude, so review attention
+   can't be focused — a real problem when triaging machine-written diffs at volume.
+
+5. **Clippy is a built-in senior reviewer.** It flags non-idiomatic and footgun patterns in agent
+   output automatically, before a human looks.
+
+6. **Bugs are caught, not shipped.** An agent lacks full global context by construction. In C++ that
+   makes it prone to introducing latent use-after-free / aliasing bugs that pass review and tests; in
+   Rust those simply do not compile. In this experiment, a speculative optimization that would have
+   been a silent latent bug in C++ instead surfaced as a *reproducible* `mlx_compile` abort, was caught
+   by the conformance suite, and was cleanly reverted — exactly the failure mode you want with
+   machine-authored change.
+
+**Where C++ is better for agents (honest):**
+
+1. **Training-data asymmetry.** Agents have seen vastly more C++ than Rust, and specifically far more
+   *ORT* C++. An agent modifying the existing ORT codebase has enormous in-distribution precedent;
+   the same agent in a greenfield Rust runtime has less to pattern-match against. For incremental
+   changes *inside today's ORT*, C++ is the agent's native habitat.
+2. **The borrow checker can force non-local restructuring.** Lifetime and aliasing errors sometimes
+   require refactoring beyond the edit site — agents can thrash on these the same way juniors do.
+   Macro-heavy code and elaborate trait bounds also degrade agent accuracy.
+3. **Compile/link latency slows the loop.** A cold Rust workspace build is minutes; that lengthens the
+   agent's edit→check cycle (though `cargo check` and per-crate builds mitigate it).
+
+**Net for agents:** for orchestration and correctness-critical logic, Rust's tight, precise,
+machine-readable feedback loop plus memory safety make it an *excellent* target for agentic
+development — agents converge fast and cannot ship whole categories of latent bug. The countervailing
+force is that today's agents are simply more fluent in C++ and in the existing ORT idioms, which
+matters most for incremental work inside the current codebase. That asymmetry shrinks over time; the
+compiler-as-oracle advantage does not.
+
+---
+
+## 7. An adoption path that doesn't bet the runtime
+
+This is the part to actually argue about. The path is **strangler-fig, not big-bang**:
+
+1. **New components start in Rust.** KV cache, scheduler, engine, server, router, sampling — the
+   experiment shows these are comfortable in Rust today, and they're greenfield anyway.
+2. **Wrap, don't rewrite, ORT first.** Bind the existing ORT via its C ABI (the experiment's
+   `onnx-genai-ort` does this). You get ORT's kernels and EPs immediately, with a safe Rust surface on
+   top — exactly how the MLX EP ships: stock ORT + a Rust plugin.
+3. **Reimplement the runtime layer behind the ORT C API**, one piece at a time: IR → optimizer →
+   partitioner → memory planner → session. Each piece is validated against ORT's own conformance
+   tests. Because it presents the same C API, consumers don't notice.
+4. **Reuse kernels via FFI; replace selectively.** Call MLAS/CUDA from Rust. Rewrite a kernel only on a
+   measured win (e.g. the MLX path, where there was no ORT kernel at all on Apple Silicon — so Rust
+   wasn't competing with a mature kernel, it was the *only* option).
+5. **Plugin EPs are the wedge.** A Rust EP loads into *unmodified* ONNX Runtime. You can ship Rust into
+   a C++ ORT deployment with zero rewrite, prove it, and expand from there. The experiment does this
+   end-to-end.
 
 At every step the system is shippable, ORT-compatible, and reuses the expensive kernels. Nobody has to
-approve a two-year rewrite; they approve one crate at a time, each with a conformance gate.
+approve a multi-year rewrite; they approve one crate at a time, each behind a conformance gate.
 
 ---
 
-## 7. Recommendation, and what would change it
+## 8. Recommendation, and what would change it
 
-**Recommendation:** default new onnx-genai components to Rust; continue the incremental `nxrt`
-runtime behind the ORT C API; keep and reuse C++/CUDA kernels through FFI indefinitely, replacing them
-only on measured evidence. Treat "rewrite a hot kernel in Rust" as guilty-until-proven, and "write the
-orchestration in Rust" as the default.
+**Recommendation (for discussion, not a mandate):** treat Rust as the default for *new* orchestration
+and GenAI components and for *new* plugin EPs; where the runtime is reimplemented, do it incrementally
+behind the ORT C API; keep and reuse C++/CUDA kernels through FFI indefinitely, replacing them only on
+measured evidence. Treat "rewrite a hot kernel in Rust" as guilty-until-proven, and "write the
+orchestration/EP glue in Rust" as the low-risk default.
 
 **What would change this recommendation (intellectual honesty):**
-- If a Rust runtime piece cannot match ORT's latency within a small margin on our conformance suite,
-  it stays a C++/FFI wrapper. We measure, we don't assume.
+- If a Rust runtime piece cannot match ORT's latency within a small margin on the ORT conformance
+  suite, it stays a C++/FFI wrapper. Measure, don't assume.
 - If FFI overhead at the Rust↔kernel boundary shows up in decode-step profiles, that boundary gets
   redrawn or the hot path stays native.
-- If team velocity drops because of Rust ramp-up rather than rising after it, we slow the migration.
+- If agent/human velocity drops because of Rust ramp-up rather than rising after it, slow down.
 
-The bet is not "Rust is faster than C++." It is: **for the 80% of this system that is orchestration
-and correctness-critical state, Rust removes an entire category of bug at the cost of some `unsafe` at
-the edges and some compile time — and for the 20% that is raw kernels, we keep using the best C/C++/CUDA
-we can get.** The receipts in §1 say we can execute that split, because we already have.
+The bet is not "Rust is faster than C++." It is: **for the majority of this system that is
+orchestration and correctness-critical state, Rust removes an entire category of bug — and is a
+strong substrate for agentic development — at the cost of some `unsafe` at the edges and some compile
+time; and for the raw kernels, keep using the best C/C++/CUDA available.** The receipts in §1 say one
+person (plus an agent) can execute that split, because the experiment already did.
 
 ---
 
