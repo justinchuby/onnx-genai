@@ -41,8 +41,8 @@ The story the trace tells: **`ort.session_run` dominates each token**, and the
 per-token host `engine.logits_to_vec` copy is **absent** — with device argmax the
 full-vocabulary logits are never pulled to the host, so only `ort.extract_outputs`
 (which now launches the argmax kernel and copies back the 4-byte token id)
-remains. Compare with `../onnx-genai-cuda-decode.perfetto.json`, captured on the
-host-argmax path, where `engine.logits_to_vec` is a per-token span.
+remains. Compare with `onnx-genai-cuda-decode.perfetto.json` (below), captured on
+the host-argmax path, where `engine.logits_to_vec` is a per-token span.
 
 ### Regenerate
 
@@ -69,6 +69,20 @@ ONNX_GENAI_PROFILE=1 ONNX_GENAI_CUDA_GRAPH=1 ONNX_GENAI_DEVICE_ARGMAX=1 \
 The event *timings* reflect the machine and thermal state at capture time (this
 one was taken on a throttled RTX 4060 Laptop); it is the span *structure* — which
 stages exist per token — that the trace is meant to show.
+
+## `onnx-genai-cuda-decode.perfetto.json`
+
+An earlier capture on the **host-argmax** path: Qwen2.5-0.5B-Instruct, CUDA EP,
+CUDA graph + device KV, on an NVIDIA H200. Same viewing steps as above.
+
+Here `engine.logits_to_vec` (the device→host logits copy) *is* a per-token span
+and is the second-largest slice after `ort.session_run` — the copy the
+device-argmax path above eliminates. Its extra spans:
+
+| Category | Span | Meaning |
+| --- | --- | --- |
+| `engine` | `engine.logits_to_vec` | Copy logits to host for sampling |
+| `loop` | `loop.sampling` | Greedy argmax over the vocabulary (host) |
 
 [ctf]: https://docs.google.com/document/d/1CvAClvFfyA5R-PhYUmn5OOQtYMH4h6I0nSsKchNAySU/preview
 [perfetto]: https://ui.perfetto.dev
