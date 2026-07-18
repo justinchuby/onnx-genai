@@ -1,255 +1,206 @@
-# Kimi K-series native-runtime architecture readiness
+# Kimi K3 native-runtime readiness
 
-**Audit point:** `main` at `5dcd075`, 2026-07-17
-**Scope:** native `onnx-runtime-session` with the in-tree CPU or CUDA execution
-provider. This is an architecture-readiness analysis, not a reproduction of an
-unpublished Moonshot specification.
+**Audit point:** `main` at `c86cebc`, 2026-07-18
 
-> **Companion:** [MOE_EXPERT_PARALLELISM.md](./MOE_EXPERT_PARALLELISM.md) covers the
-> multi-GPU/multi-node *deployment* side of K3-class MoE (session-per-GPU expert
-> parallelism, control/data-plane split, `MoeDispatch`/`MoeGather` NCCL ops,
-> distributed KV cache). This note covers the complementary *op/kernel-coverage*
-> side: which operators, attention mechanisms, quant formats, and state seams the
-> native runtime must implement to load and run Kimi K-series at all.
-
-## Sourcing boundary: verified versus extrapolated
-
-The released Kimi K2 architecture is public. Moonshot's official repository and
-model card describe a 1T-parameter, 32B-activated MoE with 384 routed experts,
-eight selected experts, one shared expert, MLA, and a 128K context window
-([official repository](https://github.com/MoonshotAI/Kimi-K2),
-[official model card](https://huggingface.co/moonshotai/Kimi-K2-Base)).
-The published K2 config additionally identifies the implementation as
-`DeepseekV3ForCausalLM` and records `kv_lora_rank=512`,
-`q_lora_rank=1536`, a 128-dimensional non-RoPE query/key component, a
-64-dimensional RoPE component, YaRN scaling, and no next-token-prediction
-layers
-([official K2 config](https://huggingface.co/moonshotai/Kimi-K2-Base/raw/main/config.json)).
-The K2 technical report is also public
-([Kimi K2 report](https://arxiv.org/abs/2507.20534)).
-
-As of this audit, Kimi K3 has been **announced**, but its weights and full
-technical report have not yet been released. Moonshot verifies 2.8T parameters,
-a 1M-token context, native vision, Kimi Delta Attention (KDA), Attention
-Residuals (AttnRes), Stable LatentMoE with 16 of 896 experts active, Gated MLA,
-and MXFP4-weight/MXFP8-activation quantization-aware training. The announcement
-says the weights and more detailed report are due by July 27, 2026
+**Release boundary:** Kimi K3 is available through Moonshot's API, but weights and
+the detailed technical report are promised by 2026-07-27. Exact tensor layouts,
+checkpoint packing, layer schedule, and cache ABI are therefore not yet public
 ([official K3 announcement](https://www.kimi.com/blog/kimi-k3),
-[official K3 API documentation](https://platform.kimi.ai/docs/guide/kimi-k3-quickstart)).
-Those are verified **announcement-level** facts; exact tensor layouts, operator
-contracts, shared-expert count, cache ABI, routing equations, and checkpoint
-format remain unverified until the artifacts arrive.
+[official K3 API guide](https://platform.kimi.ai/docs/guide/kimi-k3-quickstart)).
 
-For the likely KDA execution shape, this analysis uses Moonshot's separately
-released Kimi Linear reference: a 3:1 KDA-to-global-MLA hybrid with finite-state
-recurrent KDA, short convolution, and a 1M context
-([official Kimi Linear repository](https://github.com/MoonshotAI/Kimi-Linear),
-[official Kimi Linear config](https://huggingface.co/moonshotai/Kimi-Linear-48B-A3B-Base/raw/main/config.json),
-[Kimi Linear paper](https://arxiv.org/abs/2510.26692)).
-That is a reasoned readiness proxy, **not confirmation that K3 uses the same
-ratio, dimensions, state layout, or kernel ABI**. The public KDA kernel exposes
-an initial/final recurrent state shaped by value heads and key/value dimensions
-([public KDA recurrent kernel](https://github.com/fla-org/flash-linear-attention/blob/main/fla/ops/kda/fused_recurrent.py)).
+This document distinguishes:
 
-## Verified Kimi K2 architecture
+- **verified K3 facts** from Moonshot;
+- **lineage evidence** from Kimi K2, Kimi Linear, FlashKDA, and AttnRes; and
+- **runtime facts** verified directly against the current CPU/CUDA registries.
 
-| Property | Verified K2 value | Runtime consequence |
+## What changed since the previous audit
+
+The prior Kimi audit was mostly right about the architectural gaps, but its
+runtime snapshot is stale in two important ways:
+
+1. CUDA now has **GPU-native** standard `ai.onnx::Attention` and
+   `ai.onnx::RotaryEmbedding`, registered at opset 23/24 and opset 23
+   respectively
+   ([CUDA registry](../crates/onnx-runtime-ep-cuda/src/kernels/mod.rs#L416-L443)).
+   Bulk Q/K/V, masks, outputs, and RoPE tensors remain device-resident
+   ([standard attention](../crates/onnx-runtime-ep-cuda/src/kernels/standard_attention.rs#L27-L46),
+   [RoPE kernel](../crates/onnx-runtime-ep-cuda/src/kernels/rotary_embedding.rs#L43-L65)).
+   These landed in commits `7cefae9` and `4c9374b`, with correctness fixes in
+   `53ef68c` and `74a891b`. Any older statement that these kernels are
+   host-staged is superseded.
+2. CPU now registers the complete frozen
+   `pkg.nxrt::CompressedSparseAttention` v1 reference plus
+   `pkg.nxrt::SparseKvGather`; CUDA registers neither on this `main`
+   ([CPU registry](../crates/onnx-runtime-ep-cpu/src/kernels/mod.rs#L220-L231),
+   [CUDA covered ops](../crates/onnx-runtime-ep-cuda/src/kernels/mod.rs#L94-L178)).
+   A CUDA `SparseKvGather` port is in progress outside this audited tree; it must
+   not be counted as landed. CUDA CSA has not started.
+
+The CPU CSA implementation is substantial—ratio-4 and ratio-128 state, carries,
+compressed records, FP8/FP4 cache formats, learned top-k, and shape inference
+exist
+([CSA header](../crates/onnx-runtime-ep-cpu/src/kernels/compressed_sparse_attention.rs#L1-L8),
+[CSA factory](../crates/onnx-runtime-ep-cpu/src/kernels/compressed_sparse_attention.rs#L149-L263),
+[shape registration](../crates/onnx-runtime-shape-inference/src/handlers/custom_ops.rs#L296-L313)).
+It remains **DeepSeek CSA**, not Kimi KDA or MLA.
+
+## Kimi K3 architecture summary
+
+| Component | Current public evidence | Confidence / runtime implication |
 |---|---|---|
-| Scale | 1T total parameters; 32B activated per token ([Moonshot](https://github.com/MoonshotAI/Kimi-K2)) | Whole-model residency is unrealistic on ordinary machines; sparse expert paging matters. |
-| MoE | 384 routed experts, top-8, plus one shared expert; SwiGLU ([Moonshot](https://huggingface.co/moonshotai/Kimi-K2-Base)) | Preserve router semantics, selected-expert dispatch, shared dense path, and expert-major weights. |
-| Attention | MLA with low-rank Q/KV projections and split non-RoPE/RoPE dimensions ([K2 config](https://huggingface.co/moonshotai/Kimi-K2-Base/raw/main/config.json)); MLA's compressed latent cache and decoupled RoPE design are documented by the DeepSeek-V3 lineage ([DeepSeek-V3 report](https://arxiv.org/abs/2412.19437)) | GQA alone is not sufficient: the runtime must retain a latent KV state and apply model projections around attention without expanding a full conventional KV cache. |
-| Context | 128K ([Moonshot](https://huggingface.co/moonshotai/Kimi-K2-Base)) | Cache representation and offload dominate memory; dense reconstructed K/V is only a correctness fallback. |
-| Released precision | The published checkpoint config declares FP8 quantization with E4M3 format, 128×128 weight blocks, and dynamic activation quantization ([K2 config](https://huggingface.co/moonshotai/Kimi-K2-Base/raw/main/config.json)) | Exact FP8 execution is not covered by current native linear/MoE kernels; local sub-4-bit packages require an explicitly converted format. |
-| MTP | The published config has `num_nextn_predict_layers=0` ([K2 config](https://huggingface.co/moonshotai/Kimi-K2-Base/raw/main/config.json)) | K2 does not currently require an MTP sidecar. |
+| Scale and modality | 2.8T parameters, native vision, 1M-token context ([Moonshot](https://www.kimi.com/blog/kimi-k3)) | **High.** Model residency, expert distribution, and non-token visual inputs are first-order runtime concerns. |
+| Attention | Kimi Delta Attention (KDA), Attention Residuals (AttnRes), and Gated MLA are named by Moonshot. The launch diagram appears to show a repeated 3× KDA / 1× Gated-MLA pattern, but no machine-readable layer schedule is published ([Moonshot](https://www.kimi.com/blog/kimi-k3)). | **High** for the named mechanisms; **medium** for the 3:1 schedule. Do not freeze layer counts from the diagram. |
+| KDA state | FlashKDA exposes `q,k,v,g,beta`, gate parameters, and an initial/final recurrent matrix state `[B,H,V,K]`; its current kernel requires `K=V=128` ([FlashKDA](https://github.com/MoonshotAI/FlashKDA)). Kimi Linear additionally uses short convolution and a 3:1 KDA/global-MLA hybrid ([Kimi Linear](https://github.com/MoonshotAI/Kimi-Linear), [config](https://huggingface.co/moonshotai/Kimi-Linear-48B-A3B-Base/raw/main/config.json)). | **Medium as a K3 proxy, not a K3 ABI.** A closed vLLM FlashKDA integration documents an old/new gate-equation incompatibility, proving that “KDA” alone is not enough to select a kernel ([vLLM #43833](https://github.com/vllm-project/vllm/pull/43833)). |
+| AttnRes | AttnRes attends over earlier layer/block representations; Block AttnRes reduces retained depth states to block representatives ([official AttnRes repository](https://github.com/MoonshotAI/Attention-Residuals)). | **High** for the general mechanism; K3 block count, projection layout, and exact placement remain unknown. This is activation state across depth, not token KV state. |
+| MoE | Stable LatentMoE with 896 experts and 16 active experts per token. Quantile Balancing is named as the load-balancing method ([Moonshot](https://www.kimi.com/blog/kimi-k3)). | **High** for 896/top-16; **low** for the inference router ABI. The announcement does not establish whether quantile balancing changes inference-time selection or only training. Shared-expert count is not published. |
+| Quantization | Quantization-aware training from SFT onward with MXFP4 weights and MXFP8 activations ([Moonshot](https://www.kimi.com/blog/kimi-k3)). | **High** for numeric families; **unknown** packing, scale granularity, block axes, accumulation dtype, and checkpoint encoding until release. |
+| RoPE | No K3 RoPE configuration is public. K2 uses split non-RoPE/RoPE MLA dimensions plus YaRN ([K2 config](https://huggingface.co/moonshotai/Kimi-K2-Base/raw/main/config.json)); Kimi Linear's global MLA uses a 64-dimensional RoPE component and `rope_theta=10000` without scaling ([Kimi Linear config](https://huggingface.co/moonshotai/Kimi-Linear-48B-A3B-Base/raw/main/config.json)). | **Unknown for K3.** Standard partial-dimension RoPE is likely reusable for Gated MLA if the exporter supplies exact cos/sin tables, but the K3 frequency law must not be guessed. |
+| MTP | Moonshot's K3 announcement and API guide do not identify an MTP/speculative head. K2 and Kimi Linear both publish `num_nextn_predict_layers=0` ([K2 config](https://huggingface.co/moonshotai/Kimi-K2-Base/raw/main/config.json), [Kimi Linear config](https://huggingface.co/moonshotai/Kimi-Linear-48B-A3B-Base/raw/main/config.json)). | **No verified K3 requirement.** Keep MTP conditional; “always-on reasoning” is an API behavior, not evidence of an MTP graph. |
+| Deployment | Moonshot recommends supernodes with 64 or more accelerators and says KDA prefix-cache support is being contributed to vLLM ([Moonshot](https://www.kimi.com/blog/kimi-k3)). | **High.** Single-device correctness is useful, but practical K3 serving requires expert parallelism, collectives, and KDA-aware prefix state. |
 
-### Why MLA is not GQA
+## Capability coverage: what is reusable and what is genuinely missing
 
-`GroupQueryAttention` reduces the number of **full K/V heads** and stores
-ordinary K/V cache tensors. The in-tree CPU and CUDA kernels explicitly use
-`num_heads` and `kv_num_heads`, build/preserve `[B, kv_heads, S, D]` caches, and
-apply ordinary RoPE
-([CPU GQA](../crates/onnx-runtime-ep-cpu/src/kernels/group_query_attention.rs),
-[CUDA GQA](../crates/onnx-runtime-ep-cuda/src/kernels/group_query_attention.rs)).
+`✅` means the semantics are present. `◐` means useful pieces or a correctness
+fallback exist. `❌` means a new semantic/runtime boundary is required.
 
-MLA instead stores a low-rank KV latent, reconstructs or algebraically absorbs
-per-head K/V projections, and carries a separate RoPE key component. K2's
-published `kv_lora_rank`, `qk_nope_head_dim`, and `qk_rope_head_dim` make that
-distinction concrete
-([K2 config](https://huggingface.co/moonshotai/Kimi-K2-Base/raw/main/config.json)).
-Therefore:
+| K3 need | Existing building block | Coverage | Exact assessment |
+|---|---|---:|---|
+| Ordinary dense/GQA attention | CPU and CUDA standard `Attention`; CPU/CUDA contrib `GroupQueryAttention` | ✅ | Recent CUDA standard Attention is GPU-native, but f32-only and uses conventional full K/V caches ([kernel constraints](../crates/onnx-runtime-ep-cuda/src/kernels/standard_attention.rs#L69-L75)). It is a correctness fallback for reconstructed K/V, not KDA or efficient MLA. |
+| RoPE for a global-attention fallback | CPU and CUDA `RotaryEmbedding` | ◐ | Both support partial rotary dimensions and precomputed cos/sin tables. CUDA is GPU-native but f32-only. Reuse is likely once K3's exact RoPE tables/interleaving are known; the frequency law is not known today. |
+| Efficient MLA latent cache | `attention.type: multi_latent` metadata vocabulary; MatMul/RoPE/Attention decomposition | ❌ | **There is no native MLA operator or MLA cache adapter.** The metadata value is descriptive only ([schema](../crates/onnx-genai-metadata/src/schema.rs#L225-L263)). Expanded K/V through standard Attention is possible but forfeits MLA's cache benefit. |
+| Gated MLA | Standard linear, normalization, RoPE, Attention pieces | ❌ | Gate math may decompose into graph ops, but learned low-rank latent state, decoupled RoPE cache, and gate-bearing fused execution are absent. Exact K3 semantics are unpublished. |
+| KDA recurrent attention | CPU CSA state machinery; generic graph I/O | ❌ | CSA is temporal compression plus sparse selection at fixed ratios 4/128. KDA is a gated delta-rule recurrent matrix update with different equations and state. Reuse CSA's versioned-op, shape, state/checkpoint, and golden-test patterns—not its operator or kernel. |
+| KDA prefix cache / rollback | Paged KV checkpoints; CSA compressed-state/carry precedent | ❌ | Current engine state is token K/V-centric. KDA needs typed recurrent and convolution state, prefix import/composition rules, capacity accounting, and speculative rollback. Moonshot explicitly says conventional prefix caching needs a KDA-specific implementation. |
+| AttnRes | MatMul/RMSNorm/Softmax and generic SSA values | ◐ | A portable decomposition is plausible. New work is activation-lifetime planning and retaining block representations across depth; a fused op is optional until profiling. Do not map AttnRes to KV pages. |
+| 896-expert, top-16 sparse routing | CPU `MoE`/`QMoE`; CUDA `QMoE` grouping/GEMM | ◐ | Dynamic expert count/top-k and selected-route grouping are reusable. Stable LatentMoE's router and any inference-visible quantile rule must be verified. Current QMoE accepts only affine integer `quant_type="int"` ([CPU](../crates/onnx-runtime-ep-cpu/src/kernels/qmoe.rs#L79-L89), [CUDA](../crates/onnx-runtime-ep-cuda/src/kernels/qmoe.rs#L709-L723)). |
+| MXFP4 dense weights | CPU/CUDA `pkg.nxrt::BlockQuantizedMatMul` | ◐ | Both backends decode the repository's OCP/llama-style MXFP4 blocks. This is reusable only after byte-level proof that Moonshot's checkpoint packing matches, or after an explicit conversion. CUDA currently consumes f32 activations/outputs, not MXFP8. |
+| MXFP4/MXFP8 routed experts | Proposed `pkg.nxrt::BlockQuantizedMoE`; QMoE route grouping; block decoders | ❌ | `BlockQuantizedMoE` is design-only and unregistered. The lazy-weight seam recognizes its name but can bind/materialize only whole weights, not selected expert slices ([design](BLOCKQUANTIZEDMOE_DESIGN.md), [weight seam](../crates/onnx-runtime-ep-api/src/weight.rs#L94-L105), [binder](../crates/onnx-runtime-ep-api/src/weight.rs#L205-L243)). K3 also needs an exact MXFP8 activation contract. |
+| Expert weight paging | External mmap, `WeightHandle`, lazy-boundary negotiation | ◐ | Host materialization fallback exists; live device paging and per-expert leases do not. A 2.8T model cannot treat whole-weight materialization as the production path. |
+| Multi-device expert parallelism | `MOE_EXPERT_PARALLELISM.md` design | ❌ | No `MoeDispatch`/`MoeGather`, NCCL all-to-all, per-node placement, or distributed KDA/MLA state is implemented. This is required for practical deployment, independently of single-device kernel correctness. |
+| MTP/speculation, if K3 publishes it | Generic speculative loop and `MtpProposer` | ◐ / conditional | The reusable draft/verify/accept loop exists, but metadata still marks MTP unsupported and the proposer is rebuilt each iteration ([parser](../crates/onnx-genai-metadata/src/parser.rs#L70-L90), [loop](../crates/onnx-genai-engine/src/speculative.rs#L965-L980)). Do not make K3 readiness depend on this without an artifact. |
+| Native vision front end | Existing generic ONNX graph/runtime arithmetic | ❌ / unknown | K3 verifies native image/video understanding, but no encoder, projector, tiling, positional, or package contract is public. Audit the released graph instead of guessing from Kimi-VL. |
 
-- GQA can serve only an **expanded-K/V fallback** after MLA projection.
-- CPU `RotaryEmbedding` can rotate only the designated tail when the exporter
-  supplies precomputed K2/YaRN cos/sin tables
-  ([rotary_embedding.rs:18-31](../crates/onnx-runtime-ep-cpu/src/kernels/rotary_embedding.rs#L18-L31)).
-- `pkg.nxrt::CompressedSparseAttention` is reusable evidence that the EP can own
-  compressed persistent state, but it is a frozen temporal ratio-4/128 sparse
-  attention contract, not MLA's learned low-rank KV factorization
-  ([compressed_sparse_attention.rs:1-8](../crates/onnx-runtime-ep-cpu/src/kernels/compressed_sparse_attention.rs#L1-L8),
-  [163-185](../crates/onnx-runtime-ep-cpu/src/kernels/compressed_sparse_attention.rs#L163-L185)).
+### Building-block verdict
 
-**Conclusion:** efficient native MLA is a real gap. The CPU graph can express
-the surrounding projection/RoPE/attention arithmetic as a slow expanded-cache
-reference, but neither GQA nor CSA implements K2 MLA semantics.
+- **CSA / `CompressedSparseAttention`: reuse the engineering pattern, not the
+  semantics.** It proves the CPU EP can own versioned compressed state, carries,
+  sparse selection, quantized cache records, and shape inference. It does not
+  implement KDA or MLA.
+- **MLA: not currently implemented as a runtime building block.** We have a
+  metadata label and decomposable projections/Attention/RoPE, but no latent-cache
+  operator or lifecycle.
+- **MoE/QMoE: routing/grouping is reusable; K3 quantization is not covered.**
+  `BlockQuantizedMatMul` supplies useful MXFP4 decode math, while
+  `BlockQuantizedMoE` and MXFP8 activation execution remain missing.
+- **MTP: engine scaffolding exists but is incomplete and not a verified K3
+  requirement.**
+- **RoPE and standard Attention: recently landed GPU-native and are valid
+  fallback/oracle primitives.** Their f32 conventional-KV contract is not a
+  production KDA/Gated-MLA implementation.
 
-## K3: verified announcement facts and unconfirmed implementation assumptions
+## Prioritized gaps
 
-### Verified announcement-level characteristics
+### P0 — freeze the released K3 contract immediately
 
-- K3 is a 2.8T-parameter model with a 1M-token context and native vision
-  ([official announcement](https://www.kimi.com/blog/kimi-k3)).
-- It uses KDA, AttnRes, Gated MLA, and Stable LatentMoE, activating 16 of 896
-  experts
-  ([official announcement](https://www.kimi.com/blog/kimi-k3)).
-- It applies quantization-aware training with MXFP4 weights and MXFP8
-  activations
-  ([official announcement](https://www.kimi.com/blog/kimi-k3)).
+On weight/report release, capture and golden-test:
 
-### Anticipated runtime characteristics — unconfirmed for K3
+1. exact KDA gate equation, convolution state, recurrent-state shape/dtype/layout,
+   prefill/decode transition, and prefix-cache transform;
+2. Gated MLA projection/gate equations, latent cache, RoPE split/scaling, and
+   layer schedule;
+3. Stable LatentMoE router scoring, top-16 normalization/tie behavior, shared
+   experts, and whether Quantile Balancing is inference-visible;
+4. MXFP4/MXFP8 byte layout, scale granularity, accumulator dtype, and expert
+   tensor axes; and
+5. vision graph/package inputs plus any MTP sidecar.
 
-1. **Hybrid recurrent/global attention state.** Kimi Linear suggests KDA layers
-   carry a fixed-size recurrent matrix state while periodic global layers use
-   MLA
-   ([official Kimi Linear repository](https://github.com/MoonshotAI/Kimi-Linear)).
-   K3's exact layer ratio and state shape are not yet public.
-2. **A KDA-specific prefix-cache transform.** Moonshot says KDA requires new
-   prefix-caching work, but has not yet published K3's cache ABI
-   ([official K3 announcement](https://www.kimi.com/blog/kimi-k3)).
-3. **Inference-visible Stable LatentMoE routing may require a new router
-   contract.** Quantile Balancing is announced, but the report needed to
-   distinguish training-only balancing from inference-time selection is not
-   available
-   ([official K3 announcement](https://www.kimi.com/blog/kimi-k3)).
-4. **No verified K3 MTP requirement.** The K3 announcement discusses always-on
-   reasoning, not an MTP sidecar
-   ([official K3 API documentation](https://platform.kimi.ai/docs/guide/kimi-k3-quickstart)).
-   Do not infer MTP merely from DeepSeek lineage.
+Do not freeze a private ABI solely from Kimi Linear: vLLM #43833 already shows
+that two KDA generations can use incompatible gate equations.
 
-## Feature-to-runtime coverage matrix
+### P0 — add typed KDA state and CPU/CUDA KDA kernels — genuinely new
 
-`✅` means the required semantics are implemented in the audited native path.
-`◐` means pieces or a correctness fallback exist, but not the efficient/model-
-exact feature. `❌` means no matching native operator/state contract exists.
+Add a versioned semantic operator (for example
+`pkg.nxrt::KimiDeltaAttention`) with explicit Q/K/V/gate/beta inputs,
+initial/final recurrent state, convolution state, variable-length batching, and
+prefill/decode modes. Extend the runtime state manager beyond `[K,V]` pages to
+typed attention state with checkpoint/restore/fork/prefix-import. Implement a
+scalar/CPU oracle first, then CUDA; FlashKDA is a backend candidate only when
+the released gate/layout contract matches.
 
-| Kimi feature | CPU EP | CUDA EP | Shape/IR/runtime | Assessment |
-|---|---:|---:|---:|---|
-| **K2 MLA: low-rank latent KV + decoupled RoPE** | ◐ | ❌ | ◐ | CPU has `MatMul`, partial-dimension `RotaryEmbedding`, standard `Attention`, and GQA registrations ([CPU registry:215-230, 280-299, 382-385](../crates/onnx-runtime-ep-cpu/src/kernels/mod.rs#L215-L230)); a decomposed expanded-K/V fallback is plausible. CUDA has contrib GQA/Attention but no standard `RotaryEmbedding` and no MLA kernel ([CUDA registry:301-313](../crates/onnx-runtime-ep-cuda/src/kernels/mod.rs#L301-L313)). Metadata recognizes `multi_latent`, but there is no native MLA cache adapter ([schema.rs:225-247](../crates/onnx-genai-metadata/src/schema.rs#L225-L247)). |
-| **GQA/MQA fallback** | ✅ | ✅ | ✅ | Both EPs register `com.microsoft::GroupQueryAttention`; shape inference models its ordinary fixed-capacity K/V cache ([CPU:279-282](../crates/onnx-runtime-ep-cpu/src/kernels/mod.rs#L279-L282), [CUDA:301-313](../crates/onnx-runtime-ep-cuda/src/kernels/mod.rs#L301-L313), [shape:105-188](../crates/onnx-runtime-shape-inference/src/handlers/norm.rs#L105-L188)). This does **not** upgrade the MLA row above. |
-| **K3 KDA recurrent attention** | ❌ | ❌ | ❌ | No KDA/DeltaNet operator or kernel is registered. The current KV abstraction stores K/V pages and token-position checkpoints, not arbitrary per-layer recurrent matrices ([kv/lib.rs:1-22, 72-102](../crates/onnx-genai-kv/src/lib.rs#L1-L22)). |
-| **K3 periodic Gated MLA** | ❌ | ❌ | ❌ | Plain MLA is already missing; no gate-bearing MLA contract exists. Exact K3 semantics remain unpublished. |
-| **AttnRes / Block AttnRes** | ◐ | ◐ | ◐ | AttnRes is ordinary depth-wise norm/projection/softmax/weighted-sum math and can be represented as graph values; the IR supports arbitrary nodes, attributes, and SSA values ([node.rs:25-46](../crates/onnx-runtime-ir/src/node.rs#L25-L46), [graph.rs:14-34](../crates/onnx-runtime-ir/src/graph.rs#L14-L34)). There is no fused op, shape handler, or activation-liveness policy specialized for retaining block representations. AttnRes is an activation-lifetime issue, **not conventional token KV-cache sharing** ([official AttnRes repository](https://github.com/MoonshotAI/Attention-Residuals)). |
-| **384/896-expert sparse MoE, top-8/top-16** | ◐ | ◐ | ◐ | CPU has float `MoE` and affine-int `QMoE`; CUDA has affine-int `QMoE` ([CPU:340-345](../crates/onnx-runtime-ep-cpu/src/kernels/mod.rs#L340-L345), [CUDA:190-200](../crates/onnx-runtime-ep-cuda/src/kernels/mod.rs#L190-L200)). Kernels validate dynamic expert counts/top-k, but `QMoE` accepts only affine integer formats and rejects native MXFP4/IQ ([GLM readiness:184-189](GLM_READINESS_GAPS.md#L184-L189)). `BlockQuantizedMoE` has no CPU/CUDA/shape registration ([GLM readiness:154-168](GLM_READINESS_GAPS.md#L154-L168)). |
-| **Shared expert** | ✅ | ✅ | ◐ | A shared expert can remain an ordinary dense SwiGLU path using `MatMulNBits` or `BlockQuantizedMatMul`, beside routed `QMoE`. A single fused shared+routed K3 ABI is not frozen. |
-| **K2 128K context** | ◐ | ◐ | ◐ | Paged/tiered KV, prefix sharing, and checkpoint/restore exist ([kv/lib.rs:1-18, 72-102](../crates/onnx-genai-kv/src/lib.rs#L1-L18)). CPU attention can be correct, but efficient MLA state is absent. CUDA's own catalogue still defers paged KV ([CUDA mod.rs:8-14](../crates/onnx-runtime-ep-cuda/src/kernels/mod.rs#L8-L14)). |
-| **K3 1M hybrid context/prefix cache** | ❌ | ❌ | ❌ | Ordinary token KV pages do not encode KDA recurrent state or its prefix-composition rules. A typed attention-state interface is required before the K3 cache contract can be implemented. |
-| **Sub-4-bit dense projections** | ✅ | ✅ | ✅ | `pkg.nxrt::BlockQuantizedMatMul` supports MXFP4 and IQ1/2/3/4 families on CPU and CUDA; CUDA is currently f32-activation/output only ([SUB4BIT_QUANT.md:218-262](SUB4BIT_QUANT.md#L218-L262), [GLM readiness:190-194](GLM_READINESS_GAPS.md#L190-L194)). |
-| **K3 MXFP4-weight/MXFP8-activation MoE** | ❌ | ❌ | ❌ | Current `QMoE` rejects non-`int` quant types; `BlockQuantizedMoE` is only a designed boundary. K3's exact QAT packing is unknown until weights/report release. |
-| **Huge-model weight offload** | ◐ | ◐ | ◐ | External mmap, lazy `WeightHandle`, capability negotiation, and placement/budget planning exist; live device paging/binding remains Phase 3b ([WEIGHT_OFFLOAD.md:116-161](WEIGHT_OFFLOAD.md#L116-L161), [650-678](WEIGHT_OFFLOAD.md#L650-L678), [weight.rs:94-105, 164-226](../crates/onnx-runtime-ep-api/src/weight.rs#L94-L105)). The lazy boundary is already named `BlockQuantizedMoE`, but no kernel consumes it. |
-| **MTP/speculative decoding** | ◐ | ◐ | ◐ | The engine has generic speculative and MTP proposer code, but native package metadata still marks MTP unsupported and reconstructs the proposer per iteration ([parser.rs:70-90](../crates/onnx-genai-metadata/src/parser.rs#L70-L90), [speculative.rs:965-980](../crates/onnx-genai-engine/src/speculative.rs#L965-L980)). K2 and announced K3 do not currently verify an MTP requirement. |
-| **Native vision front end (K3)** | ❌ | ❌ | ❌ | K3 verifies native visual understanding, but no released weights/export contract exists yet. This audit covers the decoder runtime; vision encoder/projector coverage must be audited from the released graph rather than guessed. |
+### P0 — add native Gated MLA latent-cache execution — genuinely new
 
-## Ranked architectural gaps
+Create a model-agnostic MLA boundary with explicit low-rank latent state,
+non-RoPE/RoPE dimensions, gate inputs, and past/present latent outputs. Reuse
+current MatMul/BlockQuantizedMatMul, RoPE, and standard Attention for a
+decomposed oracle, but do not ship expanded K/V as the production 1M-context
+path.
 
-### P0 — hybrid KDA/MLA attention and typed persistent state — **XL**
+### P0 — implement model-exact block-quantized MoE and expert leases
 
-This is the headline K-series gap. Add private, versioned, model-agnostic
-contracts such as `pkg.nxrt::MultiLatentAttention` and
-`pkg.nxrt::KimiDeltaAttention`, with:
+Reuse QMoE routing/grouping and BlockQuantizedMatMul's decode infrastructure,
+but implement and register `pkg.nxrt::BlockQuantizedMoE` on CPU/CUDA, add exact
+Moonshot MXFP4 packing or an explicit converter, support the required MXFP8
+activation path, and extend lazy binding to selected expert slices. This is
+partly reuse, but the op, activation format, and lease granularity are new.
 
-- explicit projected Q, latent KV, RoPE tail, gate/decay, and optional bias
-  inputs rather than model-name checks;
-- explicit past/present latent or recurrent state outputs;
-- prefill, decode, continuous-batch slot, checkpoint, restore, and prefix-import
-  semantics;
-- CPU reference kernels, then fused CUDA kernels;
-- matching shape inference and package metadata; and
-- a correctness fallback that is clearly labeled expanded/dense rather than
-  silently claimed as MLA/KDA.
+### P0 for deployment — implement expert parallelism
 
-CSA supplies a useful implementation pattern for versioned compressed state,
-but must not be generalized by pretending ratio-4/128 temporal compression is
-low-rank MLA or KDA.
+The single-EP executor cannot practically host 2.8T parameters. Implement
+per-node/per-region placement, expert ownership, GPU-native dispatch/combine
+collectives, shared-expert policy, and distributed attention state. The existing
+session-per-GPU document is a design baseline, not implementation evidence
+([MOE_EXPERT_PARALLELISM.md](MOE_EXPERT_PARALLELISM.md)).
 
-### P0 — native MXFP4/MXFP8 `BlockQuantizedMoE` plus live leases — **L–XL**
+### P1 — AttnRes activation residency and optional fusion
 
-Implement the already-designed `pkg.nxrt::BlockQuantizedMoE` boundary with
-selected-expert dispatch, shared-expert composition, exact format/layout
-negotiation, and lazy expert leases. K3 adds an exact-layout gate: do not call
-GGUF MXFP4 compatible with Moonshot's QAT format until byte-level conversion and
-numeric parity are proven after weight release. This is the dominant
-weight-capacity path for 1T–2.8T models
-([SUB4BIT_QUANT.md:264-322](SUB4BIT_QUANT.md#L264-L322),
-[WEIGHT_OFFLOAD.md:694-720](WEIGHT_OFFLOAD.md#L694-L720)).
+First export a portable Block-AttnRes decomposition and teach liveness planning
+to retain only required block representatives. Add a fused op only if profiling
+shows material launch/memory cost.
 
-### P1 — 1M-context attention-state/prefix-cache integration — **L–XL**
+### P1 — production dtypes and fallback quality
 
-Generalize the KV layer into an attention-state manager whose state kind is
-declared by metadata: dense KV, MLA latent, KDA recurrent matrix, or future
-private state. Each state kind needs capacity accounting, tiering,
-prefix-compatibility rules, checkpoints, and atomic speculative rollback.
-Existing token-position KV checkpoints are the right lifecycle model, but not
-the complete payload contract.
+Add f16/bf16—and, where the released contract requires it, MXFP8—support to
+CUDA Attention/RoPE/normalization paths. The current GPU-native f32 kernels are
+excellent correctness oracles but are not sufficient evidence for efficient
+K3 precision.
 
-### P1 — multi-device expert parallelism and heterogeneous placement — **XL**
+### Conditional — MTP and vision
 
-At 2.8T parameters, fast deployment needs expert sharding/all-to-all rather
-than only single-device paging. The current executor owns one EP for a whole
-plan, and non-host initializers are otherwise uploaded eagerly
-([WEIGHT_OFFLOAD.md:142-152](WEIGHT_OFFLOAD.md#L142-L152)).
-Retain the existing model-agnostic EP registry, but add per-node/per-region
-placement, topology-aware expert ownership, dispatch/combine collectives, and
-shared-expert replication policy.
+- Do not prioritize MTP until the released package contains a draft head or
+  sidecar. If it does, reuse the speculative state machine but fix package
+  discovery and persistent proposer/state rollback.
+- Audit the released vision encoder/projector graph as a separate P0/P1 intake.
+  Native vision is verified, but its runtime contract is not public.
 
-### P2 — AttnRes fusion and activation residency — **M**
+## Decisions for Justin
 
-First support a portable decomposition and let the existing SSA graph represent
-block states. Then add an optional fused `AttentionResidual` op if profiling
-shows launch or memory pressure. The activation liveness planner must keep only
-the required block representatives; this should not be implemented as KV pages.
+1. **Pre-build before 2026-07-27?** Recommended: build typed-state scaffolding,
+   CPU oracle harnesses, and KDA/MLA capability negotiation now, but keep operator
+   ABI/layout versions provisional until official artifacts arrive.
+2. **Quantization policy?** Choose whether native K3 packages must preserve
+   Moonshot MXFP4/MXFP8 exactly, or whether an explicit conversion profile is an
+   acceptable first milestone. Recommended: support a clearly labeled converted
+   correctness profile, while treating native packing/activation support as the
+   production target.
+3. **First deployment target?** Choose single-GPU/small-shard correctness versus
+   immediate 64+-accelerator production work. Recommended: CPU + one-GPU oracle
+   first, but start expert-parallel transport/placement in parallel because it is
+   not optional for full K3.
+4. **MLA/KDA boundary strategy?** Recommended: separate semantic ops and state
+   kinds (`KDA`, `MLA`, `CSA`); share lifecycle infrastructure, never overload
+   CSA with model branches.
+5. **MTP scope?** Recommended: no K3-specific MTP work until weights/config
+   verify it.
 
-### Conditional — MTP sidecar orchestration — **M–L**
+## Bottom line
 
-Do not make Kimi support depend on MTP without a released Kimi artifact that
-uses it. If one appears, reuse the approved persistent proposer, explicit state,
-and composite rollback design in
-[DEEPSEEK_CSA_MTP_RUNTIME.md:700-813](DEEPSEEK_CSA_MTP_RUNTIME.md#L700-L813).
+The runtime is better positioned than the previous audit implied: CPU CSA is a
+real stateful reference implementation, and standard CUDA Attention plus RoPE
+are now GPU-native. Those are valuable oracle and infrastructure pieces.
 
-## What the IR/EP architecture needs so Kimi K “can be supported”
-
-The current direction is viable if these boundaries remain first-class:
-
-1. **Versioned semantic operators, not model switches.** The existing
-   `(domain, op_type, opset)` registry is the correct dispatch foundation
-   ([registry.rs:12-90](../crates/onnx-runtime-ep-api/src/registry.rs#L12-L90)).
-   Add KDA/MLA/AttnRes contracts by semantics and layout version.
-2. **Typed state as graph-visible I/O plus runtime-owned lifecycle.** The IR
-   already supports arbitrary multi-output nodes. The engine needs a generalized
-   state group with `append/checkpoint/restore/fork/prefix-import`, rather than
-   assuming every attention state is `[K,V]`.
-3. **Shape inference for every private stateful op.** Loader/executor allocation
-   cannot rely on names or guessed dimensions. MLA and KDA handlers must infer
-   all present-state outputs, including fixed-size recurrent states.
-4. **Capability negotiation richer than op names.** Advertise attention state
-   kinds, quant formats/layouts, dtypes, maximum state dimensions, prefix-cache
-   support, and lazy-weight support. Reject incompatible K3 packages before
-   allocating model-scale weights.
-5. **Lazy immutable weights and mutable attention state must stay separate.**
-   Continue using `WeightHandle`/leases for expert weights and KV/state
-   checkpoint APIs for per-generation state. They have different ownership,
-   mutability, and eviction rules.
-6. **Per-node/per-region placement and collectives.** A K3-class model needs
-   attention tensor parallelism, expert parallelism, shared-expert policy, and
-   bounded offload under one Resource Governor.
-7. **Portable oracle profiles.** Keep decomposed f32 attention/MoE exports for
-   differential testing, but make package metadata explicit when the profile
-   expands MLA, omits KDA prefix caching, requantizes MXFP4, or disables MTP.
-
-## Verdict
-
-For K2, the runtime has most ordinary graph arithmetic and strong MoE/quant/offload
-seams, but **does not yet have efficient native MLA**. For announced K3, the gap
-widens to KDA recurrent attention, Gated MLA, model-exact MXFP4/MXFP8 MoE, and
-1M-context typed state. The architecture direction is on track—private
-versioned ops, EP capability dispatch, lazy weights, paged state, and rollback
-are the right primitives—but Kimi K support is not achieved until those seams
-are generalized and backed by CPU/CUDA kernels.
+They do **not** close the K3-critical gaps. The missing production semantics are
+KDA recurrent state/prefix caching, native Gated MLA latent caching,
+model-exact MXFP4/MXFP8 MoE with selected-expert leases, AttnRes activation
+residency, and multi-device expert parallelism. MTP is unverified and should not
+drive the schedule before the 2026-07-27 artifact release.
