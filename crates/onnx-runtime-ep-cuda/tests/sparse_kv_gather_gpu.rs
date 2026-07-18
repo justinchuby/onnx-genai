@@ -149,6 +149,16 @@ fn run_cpu(
     output_shape: &[usize],
     out_dtype: DataType,
 ) -> Vec<u8> {
+    run_cpu_result(graph, node, inputs, output_shape, out_dtype).unwrap()
+}
+
+fn run_cpu_result(
+    graph: &Graph,
+    node: NodeId,
+    inputs: &[HostTensor],
+    output_shape: &[usize],
+    out_dtype: DataType,
+) -> onnx_runtime_ep_api::Result<Vec<u8>> {
     let model = Model::new(graph);
     let kernel = CpuExecutionProvider::new()
         .get_kernel(model.graph.node(node), &[], 1)
@@ -169,8 +179,9 @@ fn run_cpu(
         &output_strides,
         DeviceId::cpu(),
     );
-    kernel.execute(&input_views, &mut [output_view]).unwrap();
-    output
+    kernel
+        .execute(&input_views, &mut [output_view])
+        .map(|()| output)
 }
 
 fn run_gpu(
@@ -366,6 +377,66 @@ fn empty_selection_yields_empty_output() {
     let (graph, node) = model_node(&inputs, &out_shape, DataType::Float32);
     let gpu_out = run_gpu(&ep, &graph, node, &inputs, &out_shape, DataType::Float32).unwrap();
     assert!(gpu_out.is_empty());
+}
+
+#[test]
+fn zero_dim_valid_indices_match_cpu() {
+    let Some(ep) = gpu() else { return };
+    let cache = HostTensor::f32(&[1, 1, 3, 0], &[]);
+    let indices = HostTensor::i64(&[1, 1, 2, 2], &[0, 2, 1, 0]);
+    let valid = HostTensor::i64(&[1], &[3]);
+    let out_shape = [1, 1, 2, 2, 0];
+    let inputs = [cache, indices, valid];
+    let (graph, node) = model_node(&inputs, &out_shape, DataType::Float32);
+    let gpu_out = run_gpu(&ep, &graph, node, &inputs, &out_shape, DataType::Float32).unwrap();
+    let cpu_out = run_cpu(&graph, node, &inputs, &out_shape, DataType::Float32);
+    assert!(gpu_out.is_empty());
+    assert_eq!(gpu_out, cpu_out);
+}
+
+#[test]
+fn zero_dim_negative_index_errors_like_cpu() {
+    let Some(ep) = gpu() else { return };
+    let cache = HostTensor::f32(&[1, 1, 3, 0], &[]);
+    let indices = HostTensor::i64(&[1, 1, 1, 2], &[0, -1]);
+    let out_shape = [1, 1, 1, 2, 0];
+    let inputs = [cache, indices];
+    let (graph, node) = model_node(&inputs, &out_shape, DataType::Float32);
+    let cpu_error =
+        run_cpu_result(&graph, node, &inputs, &out_shape, DataType::Float32).unwrap_err();
+    let gpu_error = run_gpu(&ep, &graph, node, &inputs, &out_shape, DataType::Float32).unwrap_err();
+    assert!(
+        cpu_error.to_string().contains("negative index"),
+        "unexpected CPU error: {cpu_error}"
+    );
+    assert!(
+        gpu_error.to_string().contains("negative index"),
+        "unexpected CUDA error: {gpu_error}"
+    );
+}
+
+#[test]
+fn zero_dim_indices_at_or_above_cache_length_error_like_cpu() {
+    let Some(ep) = gpu() else { return };
+    let out_shape = [1, 1, 1, 1, 0];
+    for index in [3, 4] {
+        let cache = HostTensor::f32(&[1, 1, 3, 0], &[]);
+        let indices = HostTensor::i64(&[1, 1, 1, 1], &[index]);
+        let inputs = [cache, indices];
+        let (graph, node) = model_node(&inputs, &out_shape, DataType::Float32);
+        let cpu_error =
+            run_cpu_result(&graph, node, &inputs, &out_shape, DataType::Float32).unwrap_err();
+        let gpu_error =
+            run_gpu(&ep, &graph, node, &inputs, &out_shape, DataType::Float32).unwrap_err();
+        assert!(
+            cpu_error.to_string().contains("out of range"),
+            "unexpected CPU error for index {index}: {cpu_error}"
+        );
+        assert!(
+            gpu_error.to_string().contains("out of range"),
+            "unexpected CUDA error for index {index}: {gpu_error}"
+        );
+    }
 }
 
 #[test]

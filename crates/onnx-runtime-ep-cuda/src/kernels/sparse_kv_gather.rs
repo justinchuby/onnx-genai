@@ -168,25 +168,27 @@ impl Kernel for SparseKvGatherKernel {
             .checked_mul(row_bytes)
             .ok_or_else(|| error("selected byte count overflow"))?;
 
-        // An empty selection (K=0 or D=0) is a valid, empty, contiguous output.
-        if output_bytes == 0 {
-            return Ok(());
-        }
-
         // A device-side out-of-range index would be an out-of-bounds load, so the
         // small index tensor is validated on the host before launch to keep the
         // ONNX-required error deterministic. The cache values never leave the
         // device.
-        let host_indices = self.read_indices(indices, records)?;
-        for (record, raw) in host_indices.iter().enumerate() {
-            validate_index(
-                *raw,
-                record,
-                records_per_bg,
-                groups,
-                cache_len,
-                &valid_lengths,
-            )?;
+        if records > 0 {
+            let host_indices = self.read_indices(indices, records)?;
+            for (record, raw) in host_indices.iter().enumerate() {
+                validate_index(
+                    *raw,
+                    record,
+                    records_per_bg,
+                    groups,
+                    cache_len,
+                    &valid_lengths,
+                )?;
+            }
+        }
+
+        // No launch is needed for zero records or zero-width (D=0) records.
+        if output_bytes == 0 {
+            return Ok(());
         }
 
         for (value, name) in [
