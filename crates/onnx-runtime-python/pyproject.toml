@@ -48,7 +48,7 @@ repository = "https://github.com/justinchuby/onnx-genai"
 manifest-path = "Cargo.toml"
 # Build the stable-ABI wheel. `abi3-py310` pins Py_LIMITED_API to 3.10 so the
 # wheel is tagged cp310-abi3 and loads on CPython 3.10+ from a single build.
-features = ["pyo3/abi3-py310"]
+features = ["pyo3/abi3-py310", "pyo3/extension-module"]
 strip = true
 
 [tool.cibuildwheel]

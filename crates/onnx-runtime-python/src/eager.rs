@@ -26,7 +26,7 @@ fn eager_error(op_type: &str, domain: &str, err: EagerError) -> PyErr {
 }
 
 fn sequence_attribute(name: &str, value: &Bound<'_, PyAny>) -> PyResult<Attribute> {
-    let seq = value.downcast::<PySequence>().map_err(|_| {
+    let seq = value.cast::<PySequence>().map_err(|_| {
         PyTypeError::new_err(format!(
             "eager attribute {name:?} must be bool, int, float, str, bytes, or a \
              homogeneous non-empty sequence of int, float, str, or bytes"
@@ -56,19 +56,19 @@ fn sequence_attribute(name: &str, value: &Bound<'_, PyAny>) -> PyResult<Attribut
                 .collect::<PyResult<_>>()?,
         ));
     }
-    if items.iter().all(|item| item.downcast::<PyString>().is_ok()) {
+    if items.iter().all(|item| item.cast::<PyString>().is_ok()) {
         return Ok(Attribute::Strings(
             items
                 .iter()
-                .map(|item| Ok(item.downcast::<PyString>()?.to_str()?.as_bytes().to_vec()))
+                .map(|item| Ok(item.cast::<PyString>()?.to_str()?.as_bytes().to_vec()))
                 .collect::<PyResult<_>>()?,
         ));
     }
-    if items.iter().all(|item| item.downcast::<PyBytes>().is_ok()) {
+    if items.iter().all(|item| item.cast::<PyBytes>().is_ok()) {
         return Ok(Attribute::Strings(
             items
                 .iter()
-                .map(|item| Ok(item.downcast::<PyBytes>()?.as_bytes().to_vec()))
+                .map(|item| Ok(item.cast::<PyBytes>()?.as_bytes().to_vec()))
                 .collect::<PyResult<_>>()?,
         ));
     }
@@ -88,10 +88,10 @@ fn attribute_from_python(name: &str, value: &Bound<'_, PyAny>) -> PyResult<Attri
     if let Ok(v) = value.extract::<f32>() {
         return Ok(Attribute::Float(v));
     }
-    if let Ok(v) = value.downcast::<PyString>() {
+    if let Ok(v) = value.cast::<PyString>() {
         return Ok(Attribute::String(v.to_str()?.as_bytes().to_vec()));
     }
-    if let Ok(v) = value.downcast::<PyBytes>() {
+    if let Ok(v) = value.cast::<PyBytes>() {
         return Ok(Attribute::String(v.as_bytes().to_vec()));
     }
     sequence_attribute(name, value)
@@ -129,7 +129,7 @@ fn dispatch(
             "op_type must not be empty; pass an ONNX operator name such as 'Add'",
         ));
     }
-    let input_seq = inputs.downcast::<PySequence>().map_err(|_| {
+    let input_seq = inputs.cast::<PySequence>().map_err(|_| {
         PyTypeError::new_err(
             "eager.dispatch inputs must be a list or tuple of numpy-compatible arrays",
         )
@@ -207,7 +207,7 @@ pub(crate) fn register(parent: &Bound<'_, PyModule>) -> PyResult<()> {
     parent.add_submodule(&module)?;
     py.import("sys")?
         .getattr("modules")?
-        .downcast_into::<PyDict>()?
+        .cast_into::<PyDict>()?
         .set_item("nxrt.eager", &module)?;
     Ok(())
 }
