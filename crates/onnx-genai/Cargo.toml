@@ -11,6 +11,11 @@ categories = ["science", "text-processing"]
 [features]
 default = []
 cuda = ["onnx-genai-ort/cuda"]
+# CUDA API version passthroughs, forwarded to `onnx-genai-ort`.
+cuda-12060 = ["onnx-genai-ort/cuda-12060"]
+cuda-12080 = ["onnx-genai-ort/cuda-12080"]
+cuda-12090 = ["onnx-genai-ort/cuda-12090"]
+cuda-13000 = ["onnx-genai-ort/cuda-13000"]
 
 [dependencies]
 onnx-genai-metadata = { workspace = true }
