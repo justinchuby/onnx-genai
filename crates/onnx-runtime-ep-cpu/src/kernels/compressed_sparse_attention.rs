@@ -174,6 +174,9 @@ impl CompressedSparseAttentionFactory {
                 "compression_ratio must be exactly 4 or 128, got {compression_ratio}"
             )));
         }
+        if !assembled_cache_reference {
+            validate_ratio_specific_v1_schema(node, compression_ratio)?;
+        }
         let index_num_heads = optional_nonnegative_int(node, "index_num_heads", 0)?;
         let index_head_dim = optional_nonnegative_int(node, "index_head_dim", 0)?;
         let index_topk = optional_nonnegative_int(node, "index_topk", 0)?;
@@ -2455,6 +2458,39 @@ fn validate_frozen_v1_schema(node: &Node) -> Result<()> {
     Ok(())
 }
 
+fn validate_ratio_specific_v1_schema(node: &Node, compression_ratio: usize) -> Result<()> {
+    match compression_ratio {
+        4 => {
+            if node.inputs.len() < 19 || node.inputs[11..19].iter().any(Option::is_none) {
+                return Err(error(
+                    "ratio-4 requires all eight positional index inputs (11..=18)",
+                ));
+            }
+            if !(5..=6).contains(&node.outputs.len()) {
+                return Err(error(format!(
+                    "ratio-4 requires 5 or 6 outputs, got {}",
+                    node.outputs.len()
+                )));
+            }
+        }
+        128 => {
+            if node.inputs.iter().skip(11).take(8).any(Option::is_some) {
+                return Err(unsupported(
+                    "ratio-4-only inputs (11..=18) are not supported by the ratio-128 stateful path",
+                ));
+            }
+            if node.outputs.len() != FROZEN_V1_REQUIRED_OUTPUTS {
+                return Err(unsupported(format!(
+                    "ratio-128 supports exactly {FROZEN_V1_REQUIRED_OUTPUTS} outputs, got {}",
+                    node.outputs.len()
+                )));
+            }
+        }
+        _ => unreachable!("compression ratio was validated before schema validation"),
+    }
+    Ok(())
+}
+
 fn validate_frozen_v1_runtime_arity(inputs: &[TensorView], outputs: &[TensorMut]) -> Result<()> {
     if !(FROZEN_V1_REQUIRED_INPUTS..=FROZEN_V1_MAX_INPUTS).contains(&inputs.len()) {
         return Err(error(format!(
@@ -3082,6 +3118,51 @@ mod tests {
         CompressedSparseAttentionFactory.create_assembled_cache_reference(&node, shapes)
     }
 
+    fn stateful_node(
+        graph: &mut Graph,
+        ratio: i64,
+        input_count: usize,
+        output_count: usize,
+    ) -> Node {
+        let inputs = (0..input_count)
+            .map(|index| {
+                Some(graph.create_named_value(
+                    format!("input_{index}"),
+                    DataType::Float32,
+                    static_shape([]),
+                ))
+            })
+            .collect();
+        let outputs = (0..output_count)
+            .map(|index| {
+                graph.create_named_value(
+                    format!("output_{index}"),
+                    DataType::Float32,
+                    static_shape([]),
+                )
+            })
+            .collect();
+        let mut node = Node::new(NodeId(0), OP, inputs, outputs);
+        node.domain = "pkg.nxrt".into();
+        node.attributes
+            .insert("num_heads".into(), Attribute::Int(1));
+        node.attributes
+            .insert("head_dim".into(), Attribute::Int(512));
+        node.attributes
+            .insert("qk_rope_head_dim".into(), Attribute::Int(64));
+        node.attributes
+            .insert("compression_ratio".into(), Attribute::Int(ratio));
+        if ratio == 4 {
+            node.attributes
+                .insert("index_num_heads".into(), Attribute::Int(1));
+            node.attributes
+                .insert("index_head_dim".into(), Attribute::Int(128));
+            node.attributes
+                .insert("index_topk".into(), Attribute::Int(1));
+        }
+        node
+    }
+
     fn run_reference(
         ratio: i64,
         cache_format: Option<&str>,
@@ -3491,6 +3572,75 @@ mod tests {
         assert!(message.contains("Metadata `sink_tokens`"));
         assert!(message.contains("retained prefix tokens"));
         assert!(message.contains("unrelated"));
+    }
+
+    #[test]
+    fn stateful_claim_gate_rejects_ratio_specific_arity() {
+        let mut graph = Graph::new();
+        let ratio4 = stateful_node(&mut graph, 4, 11, 5);
+        let message = match CompressedSparseAttentionFactory.create(&ratio4, &vec![vec![]; 11]) {
+            Ok(_) => panic!("ratio-4 must require its index inputs at claim time"),
+            Err(error) => error.to_string(),
+        };
+        assert!(message.contains("ratio-4 requires all eight positional index inputs (11..=18)"));
+
+        let mut graph = Graph::new();
+        let ratio128_outputs = stateful_node(&mut graph, 128, 11, 4);
+        let message =
+            match CompressedSparseAttentionFactory.create(&ratio128_outputs, &vec![vec![]; 11]) {
+                Ok(_) => panic!("ratio-128 must reject ratio-4 output arity at claim time"),
+                Err(error) => error.to_string(),
+            };
+        assert!(message.contains("ratio-128 supports exactly 3 outputs, got 4"));
+
+        let mut graph = Graph::new();
+        let ratio128_index_input = stateful_node(&mut graph, 128, 12, 3);
+        let message = match CompressedSparseAttentionFactory
+            .create(&ratio128_index_input, &vec![vec![]; 12])
+        {
+            Ok(_) => panic!("ratio-128 must reject ratio-4 inputs at claim time"),
+            Err(error) => error.to_string(),
+        };
+        assert!(message.contains("ratio-4-only inputs (11..=18)"));
+    }
+
+    #[test]
+    fn attention_bias_rejects_unsupported_dtype_rank_and_broadcast() {
+        let boolean = Owned::bool_(&[1], &[true]);
+        let message = match AttentionBias::new(&boolean.view(), [1, 1, 1, 1]) {
+            Ok(_) => panic!("boolean attention bias must remain unsupported"),
+            Err(error) => error.to_string(),
+        };
+        assert!(message.contains("boolean attention_bias semantics are deferred"));
+
+        let rank_five = Owned::zeros_f32(&[1, 1, 1, 1, 1]);
+        let message = match AttentionBias::new(&rank_five.view(), [1, 1, 1, 1]) {
+            Ok(_) => panic!("rank-five attention bias must be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(message.contains("attention_bias rank must be <= 4"));
+
+        let non_broadcastable = Owned::zeros_f32(&[2, 2]);
+        let message = match AttentionBias::new(&non_broadcastable.view(), [1, 1, 1, 2]) {
+            Ok(_) => panic!("non-broadcastable attention bias must be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(message.contains("is not broadcastable"));
+    }
+
+    #[test]
+    fn packed_cache_formats_reject_invalid_block_widths() {
+        let fp8 = CacheFormat::Fp8E4m3Block64
+            .stored_width(FP8_E4M3_BLOCK_SIZE + 1, 0)
+            .unwrap_err()
+            .to_string();
+        assert!(fp8.contains("must be divisible by FP8 block size"));
+
+        let fp4 = CacheFormat::Fp4E2m1Block32
+            .stored_width(FP4_E2M1_BLOCK_SIZE + 1, 0)
+            .unwrap_err()
+            .to_string();
+        assert!(fp4.contains("must be divisible by FP4 block size"));
     }
 
     #[test]

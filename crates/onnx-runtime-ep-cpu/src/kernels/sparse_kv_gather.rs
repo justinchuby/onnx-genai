@@ -277,6 +277,11 @@ pub fn prefill_csa_indices(
         let (indices, width) = ratio4_topk.ok_or_else(|| {
             error("ratio-4 prefill index construction requires learned top-k indices")
         })?;
+        if width == 0 {
+            return Err(error(
+                "ratio-4 prefill index construction requires a positive learned top-k width",
+            ));
+        }
         let expected = sequence_length
             .checked_mul(width)
             .ok_or_else(|| error("ratio-4 top-k element count overflow"))?;
@@ -365,9 +370,14 @@ pub fn decode_csa_indices(
         .checked_add(1)
         .ok_or_else(|| error("absolute position overflow"))?;
     let compressed_width = if compression_ratio == CSA_RATIO_4 {
-        ratio4_topk
-            .ok_or_else(|| error("ratio-4 decode index construction requires learned top-k"))?
-            .len()
+        let topk = ratio4_topk
+            .ok_or_else(|| error("ratio-4 decode index construction requires learned top-k"))?;
+        if topk.is_empty() {
+            return Err(error(
+                "ratio-4 decode index construction requires at least one learned top-k index",
+            ));
+        }
+        topk.len()
     } else {
         if ratio4_topk.is_some() {
             return Err(error(
@@ -684,6 +694,42 @@ mod tests {
         let selected =
             sparse_kv_gather_f32(&[1.0, 2.0], [1, 1, 1, 2], &[], [1, 1, 3, 0], None).unwrap();
         assert!(selected.is_empty());
+    }
+
+    #[test]
+    fn masked_gather_rejects_non_sentinel_negative_and_out_of_range_indices() {
+        let negative =
+            match sparse_kv_gather_masked_f32(&[1.0, 2.0], [1, 1, 1, 2], &[-2], [1, 1, 1, 1], None)
+            {
+                Ok(_) => panic!("only -1 is a valid masked-gather sentinel"),
+                Err(error) => error.to_string(),
+            };
+        assert!(negative.contains("negative index -2"));
+
+        let out_of_range = match sparse_kv_gather_masked_f32(
+            &[1.0, 2.0],
+            [1, 1, 1, 2],
+            &[1],
+            [1, 1, 1, 1],
+            None,
+        ) {
+            Ok(_) => panic!("masked gather must reject positive out-of-range indices"),
+            Err(error) => error.to_string(),
+        };
+        assert!(out_of_range.contains("out of range for valid length 1"));
+    }
+
+    #[test]
+    fn ratio4_planners_reject_empty_learned_topk() {
+        let prefill = prefill_csa_indices(4, CSA_RATIO_4, Some((&[], 0)))
+            .unwrap_err()
+            .to_string();
+        assert!(prefill.contains("positive learned top-k width"));
+
+        let decode = decode_csa_indices(4, CSA_RATIO_4, Some(&[]))
+            .unwrap_err()
+            .to_string();
+        assert!(decode.contains("at least one learned top-k index"));
     }
 
     #[test]
