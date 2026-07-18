@@ -294,57 +294,62 @@ unsafe impl Sync for Environment {}
 mod tests {
     use super::*;
 
-    struct SimulatedEnvironment<'a> {
-        lifecycle: &'a Mutex<EnvironmentLifecycle>,
-        registrations: &'a Mutex<std::collections::HashMap<String, PluginRegistration>>,
-    }
-
-    impl<'a> SimulatedEnvironment<'a> {
-        fn new(
-            lifecycle: &'a Mutex<EnvironmentLifecycle>,
-            registrations: &'a Mutex<std::collections::HashMap<String, PluginRegistration>>,
-        ) -> Self {
-            lifecycle
-                .lock()
-                .expect("lifecycle lock")
-                .environment_created();
-            Self {
-                lifecycle,
-                registrations,
-            }
-        }
-
-        fn simulate_registration(&self, registration_name: &str, path: &Path) -> bool {
-            let mut registrations = self.registrations.lock().expect("registration lock");
-            if registrations.contains_key(registration_name) {
-                return false;
-            }
-            registrations.insert(
-                registration_name.to_string(),
-                PluginRegistration {
-                    path: path.to_path_buf(),
-                    provider_name: Some("TestExecutionProvider".to_string()),
-                },
-            );
-            true
-        }
-    }
-
-    impl Drop for SimulatedEnvironment<'_> {
-        fn drop(&mut self) {
-            let mut lifecycle = self.lifecycle.lock().expect("lifecycle lock");
-            release_environment(&mut lifecycle, self.registrations);
-        }
-    }
+    const REAL_LIFECYCLE_CHILD: &str = "ONNX_GENAI_REAL_ENV_LIFECYCLE_TEST";
 
     #[test]
-    fn plugin_registration_and_provider_cache_are_shared_by_live_environments() {
-        let first = Environment::new("plugin-global-first").expect("first environment");
-        let second = Environment::new("plugin-global-second").expect("second environment");
+    fn plugin_registration_cache_is_cleared_after_last_environment_drop() {
+        if std::env::var_os(REAL_LIFECYCLE_CHILD).is_none() {
+            // Run this assertion in an isolated test process so no parallel unit
+            // test can keep another real Environment alive and mask the 1 -> 0
+            // transition under test.
+            let output = std::process::Command::new(
+                std::env::current_exe().expect("current unit-test executable"),
+            )
+            .arg("--exact")
+            .arg("env::tests::plugin_registration_cache_is_cleared_after_last_environment_drop")
+            .arg("--nocapture")
+            .env(REAL_LIFECYCLE_CHILD, "1")
+            .output()
+            .expect("run isolated real Environment lifecycle test");
+            assert!(
+                output.status.success(),
+                "isolated real Environment lifecycle test failed\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        assert_eq!(
+            environment_lifecycle()
+                .lock()
+                .expect("lifecycle lock")
+                .active_environments,
+            0
+        );
+        assert!(
+            registered_ep_libraries()
+                .lock()
+                .expect("registration lock")
+                .is_empty()
+        );
+
+        let first = Environment::new("plugin-lifecycle-first").expect("first environment");
+        let second = Environment::new("plugin-lifecycle-second").expect("second environment");
         let registration_name = format!("onnx_genai_test_plugin_{}", std::process::id());
         let path = PathBuf::from("/onnx-genai/test/plugin.so");
-        let _discovery_guard = first.lock_plugin_discovery().expect("discovery lock");
 
+        assert_eq!(
+            environment_lifecycle()
+                .lock()
+                .expect("lifecycle lock")
+                .active_environments,
+            2
+        );
+
+        // There is no plugin shared library fixture in the unit-test suite.
+        // Seed the real production cache, then exercise its production
+        // registration/provider accessors and the real Environment lifecycle.
         registered_ep_libraries()
             .lock()
             .expect("registration lock")
@@ -355,11 +360,10 @@ mod tests {
                     provider_name: None,
                 },
             );
-
         assert!(
             !second
                 .register_execution_provider_library(&registration_name, &path)
-                .expect("second environment should reuse registration")
+                .expect("live environment should reuse registration")
         );
         first
             .cache_plugin_provider(&registration_name, "TestExecutionProvider")
@@ -372,64 +376,68 @@ mod tests {
             Some("TestExecutionProvider")
         );
 
-        registered_ep_libraries()
-            .lock()
-            .expect("registration lock")
-            .remove(&registration_name);
-    }
-
-    #[test]
-    fn plugin_registration_cache_is_cleared_after_last_environment_drop() {
-        // The unit-test suite has no real ORT plugin shared library, so use the
-        // production lifecycle counter/clear path with simulated registrations.
-        let lifecycle = Mutex::new(EnvironmentLifecycle::default());
-        let registrations = Mutex::new(std::collections::HashMap::new());
-        let path = PathBuf::from("/onnx-genai/test/plugin.so");
-
-        let first = SimulatedEnvironment::new(&lifecycle, &registrations);
-        let second = SimulatedEnvironment::new(&lifecycle, &registrations);
-        assert_eq!(
-            lifecycle
-                .lock()
-                .expect("lifecycle lock")
-                .active_environments,
-            2
-        );
-        assert!(first.simulate_registration("test-plugin", &path));
-
         drop(first);
         assert_eq!(
-            lifecycle
+            environment_lifecycle()
                 .lock()
                 .expect("lifecycle lock")
                 .active_environments,
             1
         );
         assert!(
-            registrations
+            registered_ep_libraries()
                 .lock()
                 .expect("registration lock")
-                .contains_key("test-plugin")
+                .contains_key(&registration_name)
+        );
+        assert!(
+            !second
+                .register_execution_provider_library(&registration_name, &path)
+                .expect("registration remains shared while an environment is live")
         );
 
         drop(second);
         assert_eq!(
-            lifecycle
+            environment_lifecycle()
                 .lock()
                 .expect("lifecycle lock")
                 .active_environments,
             0
         );
-        assert!(registrations.lock().expect("registration lock").is_empty());
+        assert!(
+            registered_ep_libraries()
+                .lock()
+                .expect("registration lock")
+                .is_empty()
+        );
 
-        let fresh = SimulatedEnvironment::new(&lifecycle, &registrations);
+        let fresh = Environment::new("plugin-lifecycle-fresh").expect("fresh environment");
         assert_eq!(
-            lifecycle
+            environment_lifecycle()
                 .lock()
                 .expect("lifecycle lock")
                 .active_environments,
             1
         );
-        assert!(fresh.simulate_registration("test-plugin", &path));
+        assert_eq!(
+            fresh
+                .cached_plugin_provider(&registration_name)
+                .expect("read provider after recreation"),
+            None
+        );
+        assert!(
+            fresh
+                .register_execution_provider_library(&registration_name, &path)
+                .is_err(),
+            "a fresh environment must attempt the missing plugin registration, not return Ok(false) from stale cache"
+        );
+        drop(fresh);
+        assert_eq!(
+            environment_lifecycle()
+                .lock()
+                .expect("lifecycle lock")
+                .active_environments,
+            0
+        );
     }
 }
