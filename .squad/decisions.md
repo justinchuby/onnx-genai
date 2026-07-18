@@ -972,3 +972,44 @@ For a fixed, valid selected set, the additive-mask standard-Attention result is 
 **Verdict:** 🟢 APPROVE
 **What:** The CPU provider now calls CSA `unsupported_reason` from `supports_op`. It dry-runs the same `CompressedSparseAttentionFactory.create` used by `get_kernel`, so frozen-v1 attributes and ratio-specific positional-input/output arity are denied before placement. The provider-level test invokes `ep.supports_op` directly and denies ratio-4 missing-index and wrong-output nodes plus ratio-128 index-present and wrong-output nodes. The remaining dtype, static-shape, and optional-bias checks mirror the runtime CSA paths; valid/dynamic metadata is not rejected merely for being dynamic.
 **Why:** The prior CPU claim-then-fail gap is closed without loosening Bishop's factory checks or changing the assembled-cache-reference bypass. The dry-run only parses/validates metadata and boxes a scalar kernel descriptor; it allocates no device or tensor buffers and performs no copies, cache decoding, or compute, so it is cheap for repeated placement. Deterministic execution and `assembled_cache_reference` semantics remain intact. Validation passed: CPU 509 passed, 0 failed, 1 ignored (plus 0/0/1 doctest); CUDA 234 passed, 0 failed, 0 ignored.
+
+## 2026-07-18 — Scribe inbox merge (CUDA GLM claim-gate hardening)
+
+### 2026-07-18: Harden CUDA GLM standard-op claim contracts
+**By:** Holden
+**What:** Audited CUDA claim gates against their runtime contracts for the GLM standard-op path. Findings:
+
+| Op | Finding |
+|---|---|
+| `RMSNormalization` | Bug: it claimed non-f32 X/scale although the CUDA kernel is f32-only; it also silently accepted unsupported `stash_type`. |
+| `RotaryEmbedding` | Bug: required f32 inputs were checked, but a present optional `position_ids` with a non-int64 dtype was claimed. Explicit omitted slot 3 (`Undefined`) is correctly treated absent. Negative dimensions/non-boolean `interleaved` were silently coerced by the factory. |
+| `TopK` | Bug: it claimed non-f32 values/non-int64 K, then failed at execution; non-boolean `largest`/`sorted` were silently coerced. |
+| `CumSum` | Bug: it claimed unsupported data or non-int64 axis, then failed at execution; non-boolean flags were silently coerced. |
+| `Gather` | Bug: it claimed non-integer indices and packed/variable-width data, then failed at execution. |
+| `GatherElements` | Bug: it claimed non-int64 indices and packed/variable-width data, then failed at execution. |
+| `ScatterElements` | Bug: it claimed non-int64 indices, unsupported data/updates, then failed at execution; malformed reduction attributes were deferred. |
+| `Where` | Bug: it claimed a non-bool condition or packed/variable-width branches, then failed at execution. |
+| `Expand` | Bug: it claimed a non-int64 ONNX shape input, despite the schema contract. |
+| `CompressedSparseAttention` | OK: ratio-specific factory dry-run plus dtype/shape validation correctly rejects invalid present `attention_bias`; an explicit omitted input 19 with `Undefined` is absent and claims. |
+
+Also rechecked standard `Attention`: the landed omitted-optional gate remains correct.
+
+**Why:** Added a shared standard-op CUDA claim validator that rejects each runtime-unsupported required input before placement, while preserving the `Undefined` omitted-optional contract for RoPE. Factories now reject attributes that previously silently coerced values. Added `claim_gates_gpu` coverage for all repaired standard-op dtype gates, RoPE omitted-vs-present optional behavior, and invalid attribute gates; added CSA input-19 omission coverage. Full CUDA EP suite passed 238 tests, 0 failed.
+
+### 2026-07-18: Approve CUDA standard claim-gate hardening
+**By:** Mariette
+**What:** 🟢 APPROVE Holden's `030faa1` (`fix(cuda): harden GLM standard claim gates`).
+
+| Op | New claim requirement | GLM / CPU / CUDA parity conclusion |
+|---|---|---|
+| RMSNormalization | f32 X/scale; `stash_type=1` | GLM's portable profile is f32; CUDA is f32-only and CPU accepts this subset. |
+| RotaryEmbedding | f32 X/cos/sin; present positions int64; valid boolean/non-negative attrs | Matches GLM's f32 and int64-position contract; an omitted `Undefined` slot remains claimed. |
+| TopK | f32 X, int64 K, valid boolean attrs | Matches documented GLM f32 values and int64 scalar K; CUDA execution has the same limits. |
+| CumSum | f32 or int64 X, int64 axis, valid boolean attrs | Matches the GLM contract and CPU/CUDA supported subset. |
+| Gather | fixed-width data; int32/int64 indices | Matches the CUDA byte-copy kernel and GLM integer indexing. |
+| GatherElements | fixed-width data; int64 indices | Matches CUDA's int64-only index kernel and GLM usage. |
+| ScatterElements | f32/int64 matched data/updates; int64 indices; valid reduction | Matches the constrained CUDA kernel and GLM contract. |
+| Where | bool condition; matched fixed-width branches | Matches CUDA execution and GLM use. |
+| Expand | fixed-width input; int64 shape | Matches the ONNX shape-input contract and CUDA movement kernel. |
+
+**Why:** The shared helper is correctly limited to standard domains, is called only after registry lookup, checks metadata arity before indexing, and preserves RoPE's omitted optional input contract. New factory validation gives actionable errors instead of coercing the audited attributes; CUDA-graph compatibility methods were unchanged. No GLM over-rejection or remaining audited dtype/attribute claim-then-fail path was found. The CUDA EP suite passed 238 tests and failed 0 (missing-cuDNN failures were not present).

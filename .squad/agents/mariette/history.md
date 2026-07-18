@@ -31,3 +31,8 @@ Hired as a Metal/MPS kernel engineer for the new Apple Metal EP for ONNX Runtime
 ## 2026-07-18T04-55-00Z — Scribe session update
 
 - Reviewed the omitted-optional dtype contract batch: 🔴 rejected Wallace's first pass due to CUDA standard-Attention optional past-KV claim regression, then 🟢 approved Nabil's `8eb23f1` fix after CUDA/session/CPU gates passed.
+
+## 2026-07-18T06:30:00Z — CUDA claim-gate hardening review
+
+- 🟢 Approved Holden's `030faa1` after verifying no GLM over-rejection, correct omitted-optional handling, standard-domain scoping, and CPU/GLM/CUDA parity for audited ops.
+- Reported CUDA EP suite success: 238 passed, 0 failed.

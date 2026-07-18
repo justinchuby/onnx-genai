@@ -106,3 +106,8 @@ Cleared Deckard's `f795d45` executor EP-polymorphism refactor: it preserves CPU-
 - 2026-07-18 Scribe: RoPE review rejected silent invalid positions, then approved validated commit 74a891b.
 
 - 2026-07-18: PR triage recorded five merged PRs, Attention landing, and PR #25 lifecycle follow-up.
+
+## 2026-07-18T06:30:00Z — CUDA GLM standard claim gates
+
+- Hardened CUDA GLM standard-op claim gates in `030faa1`, fixing claim-then-fail dtype/attribute gaps across RMSNorm, RoPE, TopK, CumSum, Gather, GatherElements, ScatterElements, Where, and Expand.
+- Added shared `standard_claims.rs` validation and reported CUDA EP suite success: 238 passed, 0 failed.
