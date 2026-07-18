@@ -46,6 +46,8 @@ pub struct MtpHeadSignature {
     pub layers: usize,
     /// KV tensor element type.
     pub dtype: DataType,
+    /// Element type shared by `inputs_embeds`, `hidden_states`, and MTP state.
+    pub activation_dtype: DataType,
 }
 
 /// Strategy for the MTP head's own key/value cache while chaining `k` drafts.
@@ -71,6 +73,14 @@ pub struct MtpDecodeOptions {
     pub kv_mode: MtpDraftKvMode,
     /// Batch size for the head forward. Speculation uses 1.
     pub batch_size: i64,
+    /// Number of Hyper-Connection lanes in `hidden_states`.
+    pub hc_mult: usize,
+    /// Bind `hidden_states` as rank 4 `[B,S,C,H]` instead of legacy rank 3.
+    pub hidden_state_rank4: bool,
+    /// Exact sidecar output consumed by the target LM head.
+    pub hidden_output: String,
+    /// Exact recurrent HC-state output. Legacy `hc_mult == 1` heads may omit it.
+    pub state_output: Option<String>,
 }
 
 impl Default for MtpDecodeOptions {
@@ -78,8 +88,21 @@ impl Default for MtpDecodeOptions {
         Self {
             kv_mode: MtpDraftKvMode::HiddenThreaded,
             batch_size: 1,
+            hc_mult: 1,
+            hidden_state_rank4: false,
+            hidden_output: "mtp_hidden".into(),
+            state_output: None,
         }
     }
+}
+
+/// Outputs from one MTP sidecar step.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MtpStepOutput {
+    /// Collapsed `[B,S,H]` state consumed by the shared target LM head.
+    pub hidden: Vec<f32>,
+    /// Recurrent `[B,S,C,H]` HC state, flattened in row-major order.
+    pub state: Vec<f32>,
 }
 
 #[derive(Debug, Clone)]
@@ -94,8 +117,22 @@ struct MtpKvPair {
 ///
 /// Holds the head's own single-layer KV state (when growing) and runs one
 /// forward step at a time. It does not select tokens or drive a proposal loop.
+enum MtpSessionHandle<'a> {
+    Borrowed(&'a Session),
+    Owned(Arc<Session>),
+}
+
+impl MtpSessionHandle<'_> {
+    fn session(&self) -> &Session {
+        match self {
+            Self::Borrowed(session) => session,
+            Self::Owned(session) => session,
+        }
+    }
+}
+
 pub struct MtpDecodeSession<'a> {
-    session: &'a Session,
+    session: MtpSessionHandle<'a>,
     binding: IoBinding,
     signature: MtpHeadSignature,
     mode: MtpDraftKvMode,
@@ -108,26 +145,68 @@ pub struct MtpDecodeSession<'a> {
     mask_input: Option<String>,
     position_input: Option<String>,
     hidden_output: String,
+    state_output: Option<String>,
+    hc_mult: usize,
+    hidden_state_rank4: bool,
 }
 
 impl<'a> MtpDecodeSession<'a> {
     /// Detect an MTP-head signature from graph I/O, if present.
     pub fn detect(session: &Session) -> Result<Option<MtpHeadSignature>> {
-        Ok(detect_mtp_head(session)?.map(|(signature, _, _)| signature))
+        Ok(detect_mtp_head(session, "mtp_hidden", None)?.map(|(signature, _, _)| signature))
     }
 
     /// Create an MTP decode session from a head graph.
     pub fn new(session: &'a Session, options: MtpDecodeOptions) -> Result<Self> {
-        let (signature, kv_pairs, io) = detect_mtp_head(session)?.ok_or_else(|| {
+        Self::new_with_handle(MtpSessionHandle::Borrowed(session), options)
+    }
+
+    /// Create an MTP decode session that owns a shared session handle.
+    pub fn new_owned(
+        session: Arc<Session>,
+        options: MtpDecodeOptions,
+    ) -> Result<MtpDecodeSession<'static>> {
+        MtpDecodeSession::new_with_handle(MtpSessionHandle::Owned(session), options)
+    }
+
+    fn new_with_handle(
+        session_handle: MtpSessionHandle<'a>,
+        options: MtpDecodeOptions,
+    ) -> Result<Self> {
+        if options.hc_mult == 0 {
+            return Err(OrtError::InvalidArgument(
+                "MTP hc_mult must be greater than zero".into(),
+            ));
+        }
+        let session = session_handle.session();
+        let (signature, kv_pairs, io) = detect_mtp_head(
+            session,
+            &options.hidden_output,
+            options.state_output.as_deref(),
+        )?
+        .ok_or_else(|| {
             OrtError::InvalidArgument(
                 "model is not an MTP head (needs inputs_embeds + hidden_states inputs and an \
-                 mtp_hidden output)"
+                 MTP hidden output)"
                     .into(),
             )
         })?;
+        if options.hidden_state_rank4 && io.hidden_rank != 4 {
+            return Err(OrtError::InvalidArgument(format!(
+                "MTP hidden_states input must be rank 4 for BSHC, got rank {}",
+                io.hidden_rank
+            )));
+        }
+        if !options.hidden_state_rank4 && io.hidden_rank != 3 {
+            return Err(OrtError::InvalidArgument(format!(
+                "legacy MTP hidden_states input must be rank 3, got rank {}",
+                io.hidden_rank
+            )));
+        }
+        let binding = IoBinding::new(session)?;
         Ok(Self {
-            session,
-            binding: IoBinding::new(session)?,
+            session: session_handle,
+            binding,
             signature,
             mode: options.kv_mode,
             batch_size: options.batch_size,
@@ -139,6 +218,9 @@ impl<'a> MtpDecodeSession<'a> {
             mask_input: io.mask_input,
             position_input: io.position_input,
             hidden_output: io.hidden_output,
+            state_output: io.state_output,
+            hc_mult: options.hc_mult,
+            hidden_state_rank4: options.hidden_state_rank4,
         })
     }
 
@@ -150,6 +232,11 @@ impl<'a> MtpDecodeSession<'a> {
     /// Selected draft-cache strategy.
     pub fn mode(&self) -> MtpDraftKvMode {
         self.mode
+    }
+
+    /// Number of Hyper-Connection lanes bound in `hidden_states`.
+    pub fn hc_mult(&self) -> usize {
+        self.hc_mult
     }
 
     /// Current head KV length (always 0 in [`MtpDraftKvMode::HiddenThreaded`]).
@@ -208,16 +295,31 @@ impl<'a> MtpDecodeSession<'a> {
         Ok(())
     }
 
-    /// Run one MTP-head forward and return `mtp_hidden` (`seq_len * H` floats).
+    /// Run one legacy MTP-head forward and return `mtp_hidden`.
     ///
-    /// `inputs_embeds` and `hidden_states` are row-major `[1, seq_len, H]`.
-    /// `position_start` is the position id of the first token in the step.
+    /// Use [`Self::step_with_state`] when the sidecar exposes recurrent
+    /// Hyper-Connection state.
     pub fn step(
         &mut self,
         inputs_embeds: &[f32],
         hidden_states: &[f32],
         position_start: i64,
     ) -> Result<Vec<f32>> {
+        Ok(self
+            .step_with_state(inputs_embeds, hidden_states, position_start)?
+            .hidden)
+    }
+
+    /// Run one MTP-head forward and return collapsed hidden plus recurrent state.
+    ///
+    /// `inputs_embeds` and `hidden_states` are row-major `[1, seq_len, H]`.
+    /// `position_start` is the position id of the first token in the step.
+    pub fn step_with_state(
+        &mut self,
+        inputs_embeds: &[f32],
+        hidden_states: &[f32],
+        position_start: i64,
+    ) -> Result<MtpStepOutput> {
         let hidden = self.signature.hidden_size;
         if inputs_embeds.is_empty() || !inputs_embeds.len().is_multiple_of(hidden) {
             return Err(OrtError::InvalidArgument(format!(
@@ -225,19 +327,37 @@ impl<'a> MtpDecodeSession<'a> {
                 inputs_embeds.len()
             )));
         }
-        if hidden_states.len() != inputs_embeds.len() {
-            return Err(OrtError::InvalidArgument(
-                "hidden_states length must match inputs_embeds length".into(),
-            ));
+        let expected_state_len = inputs_embeds
+            .len()
+            .checked_mul(self.hc_mult)
+            .ok_or_else(|| OrtError::InvalidArgument("MTP hidden state length overflow".into()))?;
+        if hidden_states.len() != expected_state_len {
+            return Err(OrtError::InvalidArgument(format!(
+                "hidden_states length {} must equal inputs_embeds length {} * hc_mult {}",
+                hidden_states.len(),
+                inputs_embeds.len(),
+                self.hc_mult
+            )));
         }
         let seq_len = inputs_embeds.len() / hidden;
         let seq_i64 = i64::try_from(seq_len)
             .map_err(|_| OrtError::InvalidArgument("seq_len exceeds i64".into()))?;
 
-        let embeds =
-            Value::from_slice_f32(inputs_embeds, &[self.batch_size, seq_i64, hidden as i64])?;
-        let hidden_value =
-            Value::from_slice_f32(hidden_states, &[self.batch_size, seq_i64, hidden as i64])?;
+        let embeds = Value::from_f32_slice_as(
+            inputs_embeds,
+            &[self.batch_size, seq_i64, hidden as i64],
+            self.signature.activation_dtype,
+        )?;
+        let hidden_shape = if self.hidden_state_rank4 {
+            vec![self.batch_size, seq_i64, self.hc_mult as i64, hidden as i64]
+        } else {
+            vec![self.batch_size, seq_i64, hidden as i64]
+        };
+        let hidden_value = Value::from_f32_slice_as(
+            hidden_states,
+            &hidden_shape,
+            self.signature.activation_dtype,
+        )?;
 
         let past = if self.mode == MtpDraftKvMode::GrowCache {
             self.kv_len
@@ -277,23 +397,26 @@ impl<'a> MtpDecodeSession<'a> {
         }
         self.bind_kv_inputs()?;
 
-        for output in self.session.output_names() {
+        for output in self.session.session().output_names() {
             self.binding
                 .bind_output_to_device(output, &MemoryInfo::cpu()?)?;
         }
-        self.session.run_with_binding(&self.binding)?;
+        self.session.session().run_with_binding(&self.binding)?;
 
         let outputs = self.binding.output_values()?;
         let mut mtp_hidden = None;
+        let mut mtp_state = None;
         let present_to_past = self
             .kv_pairs
             .iter()
             .map(|pair| (pair.present.as_str(), pair.past.as_str()))
             .collect::<HashMap<_, _>>();
         let mut next_kv = HashMap::with_capacity(self.kv_pairs.len());
-        for (name, value) in self.session.output_names().iter().zip(outputs) {
+        for (name, value) in self.session.session().output_names().iter().zip(outputs) {
             if *name == self.hidden_output {
-                mtp_hidden = Some(value.to_vec_f32()?);
+                mtp_hidden = Some(value.to_vec_f32_lossy()?);
+            } else if self.state_output.as_deref() == Some(name.as_str()) {
+                mtp_state = Some(value.to_vec_f32_lossy()?);
             } else if let Some(past_name) = present_to_past.get(name.as_str()) {
                 next_kv.insert((*past_name).to_string(), Arc::new(value));
             }
@@ -303,8 +426,35 @@ impl<'a> MtpDecodeSession<'a> {
             self.current_kv = next_kv;
             self.kv_len = total;
         }
-        mtp_hidden
-            .ok_or_else(|| OrtError::InvalidArgument("MTP head did not produce mtp_hidden".into()))
+        let hidden = mtp_hidden.ok_or_else(|| {
+            OrtError::InvalidArgument(format!("MTP head did not produce '{}'", self.hidden_output))
+        })?;
+        let state = match mtp_state {
+            Some(state) => state,
+            None if self.hc_mult == 1 => hidden.clone(),
+            None => {
+                return Err(OrtError::InvalidArgument(format!(
+                    "MTP head did not produce recurrent state '{}' for hc_mult {}",
+                    self.state_output.as_deref().unwrap_or("mtp_state"),
+                    self.hc_mult
+                )));
+            }
+        };
+        if hidden.len() != inputs_embeds.len() {
+            return Err(OrtError::InvalidArgument(format!(
+                "MTP hidden output length {} != expected {}",
+                hidden.len(),
+                inputs_embeds.len()
+            )));
+        }
+        if state.len() != expected_state_len {
+            return Err(OrtError::InvalidArgument(format!(
+                "MTP state output length {} != expected {}",
+                state.len(),
+                expected_state_len
+            )));
+        }
+        Ok(MtpStepOutput { hidden, state })
     }
 
     fn bind_kv_inputs(&mut self) -> Result<()> {
@@ -328,9 +478,15 @@ struct MtpIo {
     mask_input: Option<String>,
     position_input: Option<String>,
     hidden_output: String,
+    state_output: Option<String>,
+    hidden_rank: usize,
 }
 
-fn detect_mtp_head(session: &Session) -> Result<Option<(MtpHeadSignature, Vec<MtpKvPair>, MtpIo)>> {
+fn detect_mtp_head(
+    session: &Session,
+    hidden_output_name: &str,
+    state_output_name: Option<&str>,
+) -> Result<Option<(MtpHeadSignature, Vec<MtpKvPair>, MtpIo)>> {
     let embeds_input = session
         .inputs()
         .iter()
@@ -342,7 +498,7 @@ fn detect_mtp_head(session: &Session) -> Result<Option<(MtpHeadSignature, Vec<Mt
     let hidden_output = session
         .outputs()
         .iter()
-        .find(|output| matches_name(&output.name, "mtp_hidden"));
+        .find(|output| output.name == hidden_output_name);
     let (Some(embeds_input), Some(hidden_input), Some(hidden_output)) =
         (embeds_input, hidden_input, hidden_output)
     else {
@@ -352,6 +508,38 @@ fn detect_mtp_head(session: &Session) -> Result<Option<(MtpHeadSignature, Vec<Mt
     let hidden_size = last_positive_dim(&embeds_input.shape).ok_or_else(|| {
         OrtError::InvalidArgument("inputs_embeds must have a static hidden dimension".into())
     })?;
+    if !matches!(
+        embeds_input.dtype,
+        DataType::Float32 | DataType::Float16 | DataType::BFloat16
+    ) || hidden_input.dtype != embeds_input.dtype
+        || hidden_output.dtype != embeds_input.dtype
+    {
+        return Err(OrtError::InvalidArgument(format!(
+            "MTP activation inputs/output must share Float32, Float16, or BFloat16 dtype; got embeds={:?}, hidden={:?}, output={:?}",
+            embeds_input.dtype, hidden_input.dtype, hidden_output.dtype
+        )));
+    }
+    let state_output = state_output_name
+        .map(|name| {
+            session
+                .outputs()
+                .iter()
+                .find(|output| output.name == name)
+                .ok_or_else(|| {
+                    OrtError::InvalidArgument(format!(
+                        "MTP recurrent state output '{name}' was not found"
+                    ))
+                })
+        })
+        .transpose()?;
+    if let Some(state_output) = state_output
+        && state_output.dtype != embeds_input.dtype
+    {
+        return Err(OrtError::InvalidArgument(format!(
+            "MTP recurrent state output '{}' dtype {:?} does not match activation dtype {:?}",
+            state_output.name, state_output.dtype, embeds_input.dtype
+        )));
+    }
 
     let kv_pairs = infer_mtp_kv_pairs(session)?;
     let (kv_heads, head_dim, dtype) = if let Some(pair) = kv_pairs.first() {
@@ -387,6 +575,7 @@ fn detect_mtp_head(session: &Session) -> Result<Option<(MtpHeadSignature, Vec<Mt
             })
             .count(),
         dtype,
+        activation_dtype: embeds_input.dtype,
     };
     let io = MtpIo {
         embeds_input: embeds_input.name.clone(),
@@ -394,6 +583,8 @@ fn detect_mtp_head(session: &Session) -> Result<Option<(MtpHeadSignature, Vec<Mt
         mask_input,
         position_input,
         hidden_output: hidden_output.name.clone(),
+        state_output: state_output.map(|output| output.name.clone()),
+        hidden_rank: hidden_input.shape.len(),
     };
     Ok(Some((signature, kv_pairs, io)))
 }

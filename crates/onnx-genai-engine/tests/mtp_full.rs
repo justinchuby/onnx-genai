@@ -1,5 +1,6 @@
 use onnx_genai_engine::{
-    Engine, EngineConfig, GeneratePrompt, GenerateRequest, MtpConfig, SpeculativeMode,
+    Engine, EngineConfig, GeneratePrompt, GenerateRequest, MtpCacheScope, MtpConfig,
+    MtpHiddenLayout, SpeculativeMode,
 };
 use onnx_genai_ort::{MtpDraftKvMode, SessionOptions};
 use std::path::{Path, PathBuf};
@@ -40,11 +41,16 @@ fn mtp_speculative_generation_matches_plain_greedy() -> anyhow::Result<()> {
         SpeculativeMode::Mtp(MtpConfig {
             head_model: fixture.join("mtp/model.onnx"),
             target_hidden_output: "hidden_states.0".into(),
-            embedding_weights: fixture.join("embedding.f32"),
-            lm_head_weights: fixture.join("lm_head.f32"),
+            target_hidden_layout: MtpHiddenLayout::Bsh,
+            embedding_weights: fixture.join("embedding.f32").into(),
+            lm_head_weights: fixture.join("lm_head.f32").into(),
             vocab_size: 32,
             hidden_size: 16,
+            hc_mult: 1,
+            mtp_hidden_output: "mtp_hidden".into(),
+            mtp_state_output: None,
             kv_mode: MtpDraftKvMode::HiddenThreaded,
+            cache_scope: MtpCacheScope::ProposalLocal,
             num_speculative_tokens: 4,
         }),
     )?;

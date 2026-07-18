@@ -2,6 +2,9 @@
 
 use crate::logits::{StopSequence, TokenId};
 use onnx_genai_kv::{CachePriority, DEFAULT_CHUNK_SIZE, KvDType, LocalTieredConfig, SequenceId};
+use onnx_genai_metadata::{
+    MtpHiddenLayout as MetadataMtpHiddenLayout, MtpKvMode as MetadataMtpKvMode, MtpProposerSpec,
+};
 use onnx_genai_ort::{Eagle3DraftKvMode, MtpDraftKvMode};
 use onnx_genai_scheduler::{Priority, ResourceLimit, ResourceLimits, SchedulerConfig};
 use serde::Deserialize;
@@ -175,7 +178,52 @@ struct EngineConfigYaml {
     serving: ServingYaml,
 }
 
-/// Files and target-model outputs required for multi-token prediction.
+/// Source of a target weight shared with an MTP sidecar.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MtpWeightSource {
+    /// Standalone raw little-endian f32 matrix used by legacy/manual configs.
+    File(PathBuf),
+    /// Exact initializer name in the target model package.
+    TargetInitializer(String),
+}
+
+impl From<PathBuf> for MtpWeightSource {
+    fn from(path: PathBuf) -> Self {
+        Self::File(path)
+    }
+}
+
+impl From<&str> for MtpWeightSource {
+    fn from(path: &str) -> Self {
+        Self::File(path.into())
+    }
+}
+
+impl From<String> for MtpWeightSource {
+    fn from(path: String) -> Self {
+        Self::File(path.into())
+    }
+}
+
+/// Target hidden-state layout consumed by an MTP sidecar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MtpHiddenLayout {
+    /// Legacy `[batch, sequence, hidden]` state.
+    Bsh,
+    /// Mobius `[batch, sequence, hc_mult, hidden]` Hyper-Connection state.
+    Bshc,
+}
+
+/// Lifetime of an MTP sidecar's private KV state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MtpCacheScope {
+    /// Reset sidecar KV at each target verification iteration.
+    ProposalLocal,
+    /// Retain KV corresponding to the accepted draft prefix.
+    AcceptedPrefix,
+}
+
+/// Files, package references, and target-model outputs required for MTP.
 ///
 /// The target decoder must emit both logits and the configured last-layer
 /// hidden-state output on every forward. The embedding and LM-head files must
@@ -186,20 +234,61 @@ struct EngineConfigYaml {
 pub struct MtpConfig {
     /// ONNX model containing the MTP head.
     pub head_model: PathBuf,
-    /// Target decoder output containing `[batch, sequence, hidden]` states.
+    /// Target decoder output containing the configured hidden-state layout.
     pub target_hidden_output: String,
-    /// Raw little-endian f32 target embedding weights in `[vocab, hidden]` order.
-    pub embedding_weights: PathBuf,
-    /// Raw little-endian f32 target LM-head weights in `[hidden, vocab]` order.
-    pub lm_head_weights: PathBuf,
+    /// Layout of the target hidden-state output.
+    pub target_hidden_layout: MtpHiddenLayout,
+    /// Target embedding weights or exact target initializer reference.
+    pub embedding_weights: MtpWeightSource,
+    /// Target LM-head weights or exact target initializer reference.
+    pub lm_head_weights: MtpWeightSource,
     /// Target vocabulary size.
     pub vocab_size: usize,
     /// Target hidden size.
     pub hidden_size: usize,
+    /// Number of target Hyper-Connection lanes.
+    pub hc_mult: usize,
+    /// Sidecar output projected through the shared target LM head.
+    pub mtp_hidden_output: String,
+    /// Sidecar recurrent HC state. Optional only for legacy `hc_mult == 1`.
+    pub mtp_state_output: Option<String>,
     /// MTP-head cache strategy.
     pub kv_mode: MtpDraftKvMode,
+    /// Lifetime of sidecar KV across target verification iterations.
+    pub cache_scope: MtpCacheScope,
     /// Number of speculative tokens produced after the guaranteed target token.
     pub num_speculative_tokens: usize,
+}
+
+impl MtpConfig {
+    /// Build an engine MTP configuration from a resolved native sidecar
+    /// descriptor. `vocab_size` is derived from the referenced target
+    /// initializers by the engine loader.
+    pub(crate) fn from_sidecar_descriptor(spec: &MtpProposerSpec, vocab_size: usize) -> Self {
+        Self {
+            head_model: spec.model.clone(),
+            target_hidden_output: spec.target_hidden_output.clone(),
+            target_hidden_layout: match spec.target_hidden_layout {
+                MetadataMtpHiddenLayout::Bsh => MtpHiddenLayout::Bsh,
+                MetadataMtpHiddenLayout::Bshc => MtpHiddenLayout::Bshc,
+            },
+            embedding_weights: MtpWeightSource::TargetInitializer(
+                spec.embedding_initializer.clone(),
+            ),
+            lm_head_weights: MtpWeightSource::TargetInitializer(spec.lm_head_initializer.clone()),
+            vocab_size,
+            hidden_size: spec.target_hidden_size,
+            hc_mult: spec.hc_mult,
+            mtp_hidden_output: spec.mtp_hidden_output.clone(),
+            mtp_state_output: Some(spec.mtp_state_output.clone()),
+            kv_mode: MtpDraftKvMode::GrowCache,
+            cache_scope: match spec.kv_mode {
+                MetadataMtpKvMode::ProposalLocal => MtpCacheScope::ProposalLocal,
+                MetadataMtpKvMode::AcceptedPrefix => MtpCacheScope::AcceptedPrefix,
+            },
+            num_speculative_tokens: spec.num_speculative_tokens,
+        }
+    }
 }
 
 /// Files and target-model outputs required for EAGLE-3 speculation.
@@ -719,8 +808,42 @@ impl GenerateOptions {
 }
 
 pub(crate) fn validate_mtp_config(config: &MtpConfig) -> anyhow::Result<()> {
+    if config.head_model.as_os_str().is_empty() {
+        anyhow::bail!("MTP head_model must not be empty");
+    }
     if config.target_hidden_output.is_empty() {
         anyhow::bail!("MTP target_hidden_output must not be empty");
+    }
+    if config.mtp_hidden_output.is_empty() {
+        anyhow::bail!("MTP mtp_hidden_output must not be empty");
+    }
+    if config
+        .mtp_state_output
+        .as_ref()
+        .is_some_and(|name| name.is_empty())
+    {
+        anyhow::bail!("MTP mtp_state_output must not be empty when provided");
+    }
+    if config.hc_mult == 0 {
+        anyhow::bail!("MTP hc_mult must be greater than zero");
+    }
+    if config.target_hidden_layout == MtpHiddenLayout::Bsh && config.hc_mult != 1 {
+        anyhow::bail!("MTP BSH target_hidden_layout requires hc_mult == 1");
+    }
+    if config.hc_mult > 1 && config.mtp_state_output.is_none() {
+        anyhow::bail!("MTP hc_mult > 1 requires mtp_state_output");
+    }
+    for (field, source) in [
+        ("embedding_weights", &config.embedding_weights),
+        ("lm_head_weights", &config.lm_head_weights),
+    ] {
+        let empty = match source {
+            MtpWeightSource::File(path) => path.as_os_str().is_empty(),
+            MtpWeightSource::TargetInitializer(name) => name.is_empty(),
+        };
+        if empty {
+            anyhow::bail!("MTP {field} must not be empty");
+        }
     }
     if config.vocab_size == 0 || config.hidden_size == 0 {
         anyhow::bail!("MTP vocab_size and hidden_size must be greater than zero");
@@ -780,6 +903,141 @@ pub(crate) fn validate_shared_kv_proposer_config(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod mtp_config_tests {
+    use super::*;
+    use onnx_genai_metadata::{
+        InferenceMetadata, SpeculatorProposerStatus, resolve_speculator_config,
+    };
+    use std::path::Path;
+
+    #[test]
+    fn mobius_sidecar_metadata_builds_complete_mtp_config() {
+        let metadata: InferenceMetadata = serde_yaml::from_str(
+            r#"
+speculative:
+  proposal_type: mtp
+  model: mtp/model.onnx
+  num_speculative_tokens: 4
+  target_hidden_output: hidden_states
+  target_hidden_layout: BSHC
+  target_hidden_size: 4096
+  hc_mult: 4
+  mtp_hidden_output: mtp_hidden
+  mtp_state_output: mtp_state
+  kv_mode: proposal_local
+  embedding:
+    source: target_initializer
+    name: model.embed_tokens.weight
+  lm_head:
+    source: target_initializer
+    name: lm_head.weight
+"#,
+        )
+        .expect("metadata parses");
+        let descriptor = resolve_speculator_config(
+            Path::new("/models/deepseek-v4"),
+            metadata.speculative.expect("speculative descriptor"),
+        );
+        let SpeculatorProposerStatus::Mtp(spec) = descriptor.proposer else {
+            panic!("MTP descriptor did not resolve");
+        };
+        let config = MtpConfig::from_sidecar_descriptor(&spec, 129_280);
+
+        assert_eq!(
+            config.head_model,
+            Path::new("/models/deepseek-v4/mtp/model.onnx")
+        );
+        assert_eq!(config.target_hidden_output, "hidden_states");
+        assert_eq!(config.target_hidden_layout, MtpHiddenLayout::Bshc);
+        assert_eq!(
+            config.embedding_weights,
+            MtpWeightSource::TargetInitializer("model.embed_tokens.weight".into())
+        );
+        assert_eq!(
+            config.lm_head_weights,
+            MtpWeightSource::TargetInitializer("lm_head.weight".into())
+        );
+        assert_eq!(config.vocab_size, 129_280);
+        assert_eq!(config.hidden_size, 4096);
+        assert_eq!(config.hc_mult, 4);
+        assert_eq!(config.mtp_hidden_output, "mtp_hidden");
+        assert_eq!(config.mtp_state_output.as_deref(), Some("mtp_state"));
+        assert_eq!(config.kv_mode, MtpDraftKvMode::GrowCache);
+        assert_eq!(config.cache_scope, MtpCacheScope::ProposalLocal);
+        assert_eq!(config.num_speculative_tokens, 4);
+        validate_mtp_config(&config).expect("resolved config validates");
+    }
+
+    #[test]
+    fn malformed_mtp_metadata_is_rejected_before_config_construction() {
+        let metadata: InferenceMetadata = serde_yaml::from_str(
+            r#"
+speculative:
+  proposal_type: mtp
+  model: mtp/model.onnx
+  target_hidden_size: 4096
+  hc_mult: 4
+  embedding:
+    source: target_initializer
+    name: model.embed_tokens.weight
+"#,
+        )
+        .expect("metadata syntax parses");
+        let descriptor = resolve_speculator_config(
+            Path::new("/models/deepseek-v4"),
+            metadata.speculative.expect("speculative descriptor"),
+        );
+        assert_eq!(
+            descriptor.proposer,
+            SpeculatorProposerStatus::Unknown("mtp metadata is missing `lm_head`".into())
+        );
+    }
+
+    #[test]
+    fn mtp_validation_enforces_hc_layout_and_state_contract() {
+        let mut config = MtpConfig {
+            head_model: "mtp/model.onnx".into(),
+            target_hidden_output: "hidden_states".into(),
+            target_hidden_layout: MtpHiddenLayout::Bshc,
+            embedding_weights: "embedding.f32".into(),
+            lm_head_weights: "lm_head.f32".into(),
+            vocab_size: 32,
+            hidden_size: 16,
+            hc_mult: 0,
+            mtp_hidden_output: "mtp_hidden".into(),
+            mtp_state_output: Some("mtp_state".into()),
+            kv_mode: MtpDraftKvMode::HiddenThreaded,
+            cache_scope: MtpCacheScope::ProposalLocal,
+            num_speculative_tokens: 4,
+        };
+        assert!(
+            validate_mtp_config(&config)
+                .unwrap_err()
+                .to_string()
+                .contains("hc_mult")
+        );
+
+        config.hc_mult = 2;
+        config.mtp_state_output = None;
+        assert!(
+            validate_mtp_config(&config)
+                .unwrap_err()
+                .to_string()
+                .contains("mtp_state_output")
+        );
+
+        config.target_hidden_layout = MtpHiddenLayout::Bsh;
+        config.mtp_state_output = Some("mtp_state".into());
+        assert!(
+            validate_mtp_config(&config)
+                .unwrap_err()
+                .to_string()
+                .contains("requires hc_mult == 1")
+        );
+    }
 }
 
 /// A single generation request.

@@ -7,8 +7,9 @@ pub mod schema;
 pub mod validation;
 
 pub use parser::{
-    SharedKvProposerSpec, SpeculatorConfigSource, SpeculatorDescriptor, SpeculatorProposerKind,
-    SpeculatorProposerStatus, detect_speculator, load_metadata, load_pipeline_spec,
+    MtpProposerSpec, SharedKvProposerSpec, SpeculatorConfigSource, SpeculatorDescriptor,
+    SpeculatorProposerKind, SpeculatorProposerStatus, detect_speculator, load_metadata,
+    load_pipeline_spec, resolve_speculator_config,
 };
 pub use schema::*;
 pub use validation::{

@@ -44,7 +44,9 @@ pub use shared_kv_proposer::{
     SharedKvSpec,
 };
 pub use loader::{ModelDirectory, PipelineModelDirectory, PipelineModels, PipelineTokenizerPaths};
-pub use mtp::{MtpDecodeOptions, MtpDecodeSession, MtpDraftKvMode, MtpHeadSignature};
+pub use mtp::{
+    MtpDecodeOptions, MtpDecodeSession, MtpDraftKvMode, MtpHeadSignature, MtpStepOutput,
+};
 pub use onnx_genai_metadata::{
     ProposalType, SpeculatorConfig, SpeculatorConfigSource, SpeculatorDescriptor,
     SpeculatorProposerKind, SpeculatorProposerStatus, SpeculatorVerifier, detect_speculator,

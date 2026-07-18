@@ -12,8 +12,6 @@ categories = ["science", "text-processing"]
 default = []
 native-backend = [
     "dep:onnx-runtime-ep-cpu",
-    "dep:onnx-runtime-ir",
-    "dep:onnx-runtime-loader",
     "dep:onnx-runtime-session",
     "dep:prost",
 ]
@@ -31,8 +29,8 @@ onnx-genai-ort = { workspace = true }
 onnx-genai-runtime-config = { workspace = true }
 onnx-runtime-ep-cpu = { workspace = true, optional = true }
 onnx-runtime-ep-cuda = { workspace = true, optional = true }
-onnx-runtime-ir = { workspace = true, optional = true }
-onnx-runtime-loader = { workspace = true, optional = true }
+onnx-runtime-ir = { workspace = true }
+onnx-runtime-loader = { workspace = true }
 onnx-runtime-session = { workspace = true, optional = true }
 prost = { version = "0.13", optional = true }
 tokio = { workspace = true }
@@ -44,6 +42,7 @@ serde = { workspace = true }
 serde_yaml = { workspace = true }
 tokenizers = { workspace = true }
 rand = "0.9.5"
+half = { version = "2", features = ["use-intrinsics"] }
 llguidance = "1.7.6"
 toktrie_hf_tokenizers = "1.7.6"
 

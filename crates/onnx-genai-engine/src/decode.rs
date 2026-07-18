@@ -1376,6 +1376,15 @@ fn extract_last_hidden(
             let start = (*seq as usize - 1) * hidden;
             Ok(data[start..start + hidden].to_vec())
         }
+        [batch, seq, hc_mult, hidden] if *batch == 1 && *seq > 0 && *hc_mult > 0 && *hidden > 0 => {
+            let state_width = (*hc_mult as usize)
+                .checked_mul(*hidden as usize)
+                .context("target HC state width overflow")?;
+            let start = (*seq as usize - 1)
+                .checked_mul(state_width)
+                .context("target HC state offset overflow")?;
+            Ok(data[start..start + state_width].to_vec())
+        }
         other => anyhow::bail!(
             "unsupported target hidden-state tensor shape for '{output_name}': {:?}",
             other

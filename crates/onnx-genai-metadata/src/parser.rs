@@ -1,7 +1,8 @@
 //! Load inference metadata from YAML or JSON files.
 
 use crate::schema::{
-    InferenceMetadata, PipelineSpec, ProposalType, SharedKvGroup, SpeculatorConfig,
+    InferenceMetadata, MtpHiddenLayout, MtpKvMode, PipelineSpec, ProposalType, SharedKvGroup,
+    SpeculatorConfig,
 };
 use std::path::{Path, PathBuf};
 
@@ -47,11 +48,40 @@ pub struct SharedKvProposerSpec {
     pub shared_kv: Vec<SharedKvGroup>,
 }
 
+/// Resolved Mobius MTP sidecar descriptor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MtpProposerSpec {
+    /// Absolute path to the MTP sidecar ONNX model.
+    pub model: PathBuf,
+    /// Number of speculative tokens after the guaranteed target token.
+    pub num_speculative_tokens: usize,
+    /// Target decoder output carrying the recurrent MTP state.
+    pub target_hidden_output: String,
+    /// Target hidden-state layout.
+    pub target_hidden_layout: MtpHiddenLayout,
+    /// Target hidden width `H`.
+    pub target_hidden_size: usize,
+    /// Hyper-Connection multiplier `C`.
+    pub hc_mult: usize,
+    /// Sidecar output consumed by the shared target LM head.
+    pub mtp_hidden_output: String,
+    /// Sidecar recurrent HC-state output.
+    pub mtp_state_output: String,
+    /// Sidecar KV lifetime.
+    pub kv_mode: MtpKvMode,
+    /// Exact target embedding initializer name.
+    pub embedding_initializer: String,
+    /// Exact target LM-head initializer name.
+    pub lm_head_initializer: String,
+}
+
 /// Current construction status for the engine-facing proposer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SpeculatorProposerStatus {
     /// A fully resolved shared-KV proposer.
     SharedKv(SharedKvProposerSpec),
+    /// A fully resolved Mobius MTP sidecar.
+    Mtp(MtpProposerSpec),
     NotYetSupported(SpeculatorProposerKind),
     Unknown(String),
 }
@@ -80,9 +110,7 @@ impl SpeculatorDescriptor {
             ProposalType::PEagle => {
                 SpeculatorProposerStatus::NotYetSupported(SpeculatorProposerKind::PEagle)
             }
-            ProposalType::Mtp => {
-                SpeculatorProposerStatus::NotYetSupported(SpeculatorProposerKind::Mtp)
-            }
+            ProposalType::Mtp => Self::resolve_mtp(model_dir, &config),
             ProposalType::DFlash => {
                 SpeculatorProposerStatus::NotYetSupported(SpeculatorProposerKind::DFlash)
             }
@@ -99,6 +127,73 @@ impl SpeculatorDescriptor {
             proposer,
         }
     }
+
+    fn resolve_mtp(model_dir: &Path, config: &SpeculatorConfig) -> SpeculatorProposerStatus {
+        let missing = |field: &str| {
+            SpeculatorProposerStatus::Unknown(format!("mtp metadata is missing `{field}`"))
+        };
+        let Some(model) = config.model.as_ref().filter(|value| !value.is_empty()) else {
+            return missing("model");
+        };
+        let Some(target_hidden_size) = config.target_hidden_size.filter(|&value| value > 0) else {
+            return missing("target_hidden_size");
+        };
+        let Some(hc_mult) = config.hc_mult.filter(|&value| value > 0) else {
+            return missing("hc_mult");
+        };
+        let Some(embedding) = config.embedding.as_ref() else {
+            return missing("embedding");
+        };
+        if embedding.name.is_empty() {
+            return SpeculatorProposerStatus::Unknown(
+                "mtp metadata `embedding.name` must not be empty".into(),
+            );
+        }
+        let Some(lm_head) = config.lm_head.as_ref() else {
+            return missing("lm_head");
+        };
+        if lm_head.name.is_empty() {
+            return SpeculatorProposerStatus::Unknown(
+                "mtp metadata `lm_head.name` must not be empty".into(),
+            );
+        }
+        if config.num_speculative_tokens == 0 {
+            return SpeculatorProposerStatus::Unknown(
+                "mtp metadata `num_speculative_tokens` must be greater than zero".into(),
+            );
+        }
+
+        SpeculatorProposerStatus::Mtp(MtpProposerSpec {
+            model: model_dir.join(model),
+            num_speculative_tokens: config.num_speculative_tokens,
+            target_hidden_output: config
+                .target_hidden_output
+                .clone()
+                .unwrap_or_else(|| "hidden_states".into()),
+            target_hidden_layout: config.target_hidden_layout.unwrap_or(MtpHiddenLayout::Bshc),
+            target_hidden_size,
+            hc_mult,
+            mtp_hidden_output: config
+                .mtp_hidden_output
+                .clone()
+                .unwrap_or_else(|| "mtp_hidden".into()),
+            mtp_state_output: config
+                .mtp_state_output
+                .clone()
+                .unwrap_or_else(|| "mtp_state".into()),
+            kv_mode: config.kv_mode.unwrap_or(MtpKvMode::ProposalLocal),
+            embedding_initializer: embedding.name.clone(),
+            lm_head_initializer: lm_head.name.clone(),
+        })
+    }
+}
+
+/// Resolve a parsed speculative declaration without re-reading metadata.
+pub fn resolve_speculator_config(
+    model_dir: &Path,
+    config: SpeculatorConfig,
+) -> SpeculatorDescriptor {
+    SpeculatorDescriptor::from_config(model_dir, config, SpeculatorConfigSource::InferenceMetadata)
 }
 
 /// Resolve a `shared_kv` speculator into a supported proposer status.

@@ -5,6 +5,7 @@
 //! longest-prefix acceptance, correction-token, and KV rewind path.
 
 use crate::TokenId;
+use crate::config::{MtpCacheScope, MtpHiddenLayout};
 use crate::decode::{
     apply_paged_sliding_window, extract_logits_sequence, next_session_token_logits,
     next_session_token_logits_and_hidden, next_session_token_logits_and_hiddens,
@@ -29,9 +30,13 @@ use crate::{
 use anyhow::Context;
 use onnx_genai_kv::KvCacheOps;
 use onnx_genai_ort::{
-    Eagle3DecodeOptions, Eagle3DecodeSession, SharedKvProposerSession, SharedKvInput,
-    MtpDecodeOptions, MtpDecodeSession, Session,
+    Eagle3DecodeOptions, Eagle3DecodeSession, MtpDecodeOptions, MtpDecodeSession, Session,
+    SharedKvInput, SharedKvProposerSession,
 };
+use onnx_runtime_ir::{DataType as IrDataType, WeightRef};
+use onnx_runtime_loader::WeightStore;
+use std::path::Path;
+use std::sync::Arc;
 
 /// Produces a target-model token embedding for an MTP proposal step.
 pub trait TokenEmbedder {
@@ -98,6 +103,289 @@ pub struct LinearLmHead {
     weight: Vec<f32>,
     hidden: usize,
     vocab: usize,
+}
+
+#[derive(Debug, Clone)]
+struct TargetInitializerMatrix {
+    store: Arc<WeightStore>,
+    weight: WeightRef,
+    rows: usize,
+    cols: usize,
+}
+
+impl TargetInitializerMatrix {
+    fn new(
+        store: Arc<WeightStore>,
+        weight: WeightRef,
+        rows: usize,
+        cols: usize,
+    ) -> anyhow::Result<Self> {
+        let dtype = weight.dtype();
+        if !matches!(
+            dtype,
+            IrDataType::Float32 | IrDataType::Float16 | IrDataType::BFloat16
+        ) {
+            anyhow::bail!(
+                "MTP target initializer dtype {dtype:?} is not supported; Phase 1 supports Float32, Float16, and BFloat16 shared weights"
+            );
+        }
+        let bytes = store
+            .bytes(&weight)
+            .context("target initializer bytes are not available")?;
+        let expected = dtype.storage_bytes(
+            rows.checked_mul(cols)
+                .context("target initializer element count overflow")?,
+        );
+        if bytes.len() != expected {
+            anyhow::bail!(
+                "target initializer byte length {} != expected {expected} for [{rows}, {cols}] {dtype:?}",
+                bytes.len()
+            );
+        }
+        Ok(Self {
+            store,
+            weight,
+            rows,
+            cols,
+        })
+    }
+
+    fn value(&self, row: usize, col: usize) -> anyhow::Result<f32> {
+        let index = row
+            .checked_mul(self.cols)
+            .and_then(|start| start.checked_add(col))
+            .context("target initializer index overflow")?;
+        let bytes = self
+            .store
+            .bytes(&self.weight)
+            .context("target initializer bytes are not available")?;
+        Ok(match self.weight.dtype() {
+            IrDataType::Float32 => {
+                let start = index * 4;
+                f32::from_le_bytes(bytes[start..start + 4].try_into().expect("four bytes"))
+            }
+            IrDataType::Float16 => {
+                let start = index * 2;
+                half::f16::from_bits(u16::from_le_bytes(
+                    bytes[start..start + 2].try_into().expect("two bytes"),
+                ))
+                .to_f32()
+            }
+            IrDataType::BFloat16 => {
+                let start = index * 2;
+                half::bf16::from_bits(u16::from_le_bytes(
+                    bytes[start..start + 2].try_into().expect("two bytes"),
+                ))
+                .to_f32()
+            }
+            dtype => anyhow::bail!("unsupported target initializer dtype {dtype:?}"),
+        })
+    }
+}
+
+/// Target embedding adapter backed directly by an ONNX initializer.
+#[derive(Debug, Clone)]
+pub(crate) struct TargetInitializerEmbedder {
+    matrix: TargetInitializerMatrix,
+}
+
+impl TokenEmbedder for TargetInitializerEmbedder {
+    fn hidden_size(&self) -> usize {
+        self.matrix.cols
+    }
+
+    fn embed(&self, token: TokenId, out: &mut [f32]) -> anyhow::Result<()> {
+        let token = token as usize;
+        if token >= self.matrix.rows {
+            anyhow::bail!(
+                "token {token} out of range for target initializer vocabulary {}",
+                self.matrix.rows
+            );
+        }
+        if out.len() != self.matrix.cols {
+            anyhow::bail!(
+                "embed output length {} != hidden {}",
+                out.len(),
+                self.matrix.cols
+            );
+        }
+        for (column, value) in out.iter_mut().enumerate() {
+            *value = self.matrix.value(token, column)?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum LmHeadInitializerLayout {
+    HiddenVocab,
+    VocabHidden,
+}
+
+/// Target LM-head adapter backed directly by an ONNX initializer.
+#[derive(Debug, Clone)]
+pub(crate) struct TargetInitializerLmHead {
+    matrix: TargetInitializerMatrix,
+    layout: LmHeadInitializerLayout,
+    hidden: usize,
+    vocab: usize,
+}
+
+impl LmHead for TargetInitializerLmHead {
+    fn vocab_size(&self) -> usize {
+        self.vocab
+    }
+
+    fn logits(&self, hidden: &[f32], out: &mut [f32]) -> anyhow::Result<()> {
+        if hidden.len() != self.hidden {
+            anyhow::bail!(
+                "lm-head input length {} != hidden {}",
+                hidden.len(),
+                self.hidden
+            );
+        }
+        if out.len() != self.vocab {
+            anyhow::bail!(
+                "lm-head output length {} != vocab {}",
+                out.len(),
+                self.vocab
+            );
+        }
+        for (vocab_index, slot) in out.iter_mut().enumerate() {
+            let mut acc = 0.0f32;
+            for (hidden_index, &value) in hidden.iter().enumerate() {
+                let weight = match self.layout {
+                    LmHeadInitializerLayout::HiddenVocab => {
+                        self.matrix.value(hidden_index, vocab_index)?
+                    }
+                    LmHeadInitializerLayout::VocabHidden => {
+                        self.matrix.value(vocab_index, hidden_index)?
+                    }
+                };
+                acc += value * weight;
+            }
+            *slot = acc;
+        }
+        Ok(())
+    }
+}
+
+/// Embedding implementation selected by legacy file or package metadata.
+#[derive(Debug, Clone)]
+pub(crate) enum MtpEmbedder {
+    Linear(LinearEmbedder),
+    TargetInitializer(TargetInitializerEmbedder),
+}
+
+impl TokenEmbedder for MtpEmbedder {
+    fn hidden_size(&self) -> usize {
+        match self {
+            Self::Linear(embedder) => embedder.hidden_size(),
+            Self::TargetInitializer(embedder) => embedder.hidden_size(),
+        }
+    }
+
+    fn embed(&self, token: TokenId, out: &mut [f32]) -> anyhow::Result<()> {
+        match self {
+            Self::Linear(embedder) => embedder.embed(token, out),
+            Self::TargetInitializer(embedder) => embedder.embed(token, out),
+        }
+    }
+}
+
+/// LM-head implementation selected by legacy file or package metadata.
+#[derive(Debug, Clone)]
+pub(crate) enum MtpLmHead {
+    Linear(LinearLmHead),
+    TargetInitializer(TargetInitializerLmHead),
+}
+
+impl LmHead for MtpLmHead {
+    fn vocab_size(&self) -> usize {
+        match self {
+            Self::Linear(lm_head) => lm_head.vocab_size(),
+            Self::TargetInitializer(lm_head) => lm_head.vocab_size(),
+        }
+    }
+
+    fn logits(&self, hidden: &[f32], out: &mut [f32]) -> anyhow::Result<()> {
+        match self {
+            Self::Linear(lm_head) => lm_head.logits(hidden, out),
+            Self::TargetInitializer(lm_head) => lm_head.logits(hidden, out),
+        }
+    }
+}
+
+pub(crate) fn load_target_initializer_adapters(
+    model_path: &Path,
+    embedding_name: &str,
+    lm_head_name: &str,
+    hidden_size: usize,
+) -> anyhow::Result<(MtpEmbedder, MtpLmHead, usize)> {
+    let (graph, store) =
+        onnx_runtime_loader::load_model_with_weights(model_path).with_context(|| {
+            format!(
+                "Failed to load target initializers from '{}'",
+                model_path.display()
+            )
+        })?;
+    let find_weight = |name: &str| -> anyhow::Result<WeightRef> {
+        graph
+            .initializers
+            .iter()
+            .find_map(|(&value_id, weight)| {
+                (graph.value(value_id).name.as_deref() == Some(name)).then(|| weight.clone())
+            })
+            .with_context(|| format!("target model initializer '{name}' was not found"))
+    };
+    let embedding_weight = find_weight(embedding_name)?;
+    let lm_head_weight = find_weight(lm_head_name)?;
+    let embedding_dims = embedding_weight.dims();
+    if embedding_dims.len() != 2 || embedding_dims[1] != hidden_size {
+        anyhow::bail!(
+            "target embedding initializer '{embedding_name}' shape {:?} must be [vocab, {hidden_size}]",
+            embedding_dims
+        );
+    }
+    let vocab_size = embedding_dims[0];
+    let lm_head_dims = lm_head_weight.dims();
+    let (layout, rows, cols) = if lm_head_dims == [hidden_size, vocab_size] {
+        (
+            LmHeadInitializerLayout::HiddenVocab,
+            hidden_size,
+            vocab_size,
+        )
+    } else if lm_head_dims == [vocab_size, hidden_size] {
+        (
+            LmHeadInitializerLayout::VocabHidden,
+            vocab_size,
+            hidden_size,
+        )
+    } else {
+        anyhow::bail!(
+            "target LM-head initializer '{lm_head_name}' shape {:?} must be [{hidden_size}, {vocab_size}] or [{vocab_size}, {hidden_size}]",
+            lm_head_dims
+        );
+    };
+    let embedder = TargetInitializerEmbedder {
+        matrix: TargetInitializerMatrix::new(
+            Arc::clone(&store),
+            embedding_weight,
+            vocab_size,
+            hidden_size,
+        )?,
+    };
+    let lm_head = TargetInitializerLmHead {
+        matrix: TargetInitializerMatrix::new(store, lm_head_weight, rows, cols)?,
+        layout,
+        hidden: hidden_size,
+        vocab: vocab_size,
+    };
+    Ok((
+        MtpEmbedder::TargetInitializer(embedder),
+        MtpLmHead::TargetInitializer(lm_head),
+        vocab_size,
+    ))
 }
 
 impl LinearLmHead {
@@ -306,6 +594,7 @@ pub struct MtpProposer<'a, E = LinearEmbedder, L = LinearLmHead> {
     session: MtpDecodeSession<'a>,
     embedder: E,
     lm_head: L,
+    cache_scope: MtpCacheScope,
 }
 
 impl<'a, E, L> MtpProposer<'a, E, L>
@@ -318,6 +607,22 @@ where
         options: MtpDecodeOptions,
         embedder: E,
         lm_head: L,
+    ) -> anyhow::Result<Self> {
+        Self::new_with_cache_scope(
+            head,
+            options,
+            embedder,
+            lm_head,
+            MtpCacheScope::ProposalLocal,
+        )
+    }
+
+    pub fn new_with_cache_scope(
+        head: &'a Session,
+        options: MtpDecodeOptions,
+        embedder: E,
+        lm_head: L,
+        cache_scope: MtpCacheScope,
     ) -> anyhow::Result<Self> {
         let session = MtpDecodeSession::new(head, options)
             .map_err(|error| anyhow::anyhow!("Failed to create MTP decode session: {error}"))?;
@@ -332,6 +637,37 @@ where
             session,
             embedder,
             lm_head,
+            cache_scope,
+        })
+    }
+}
+
+impl<E, L> MtpProposer<'static, E, L>
+where
+    E: TokenEmbedder,
+    L: LmHead,
+{
+    pub fn new_owned(
+        head: Arc<Session>,
+        options: MtpDecodeOptions,
+        embedder: E,
+        lm_head: L,
+        cache_scope: MtpCacheScope,
+    ) -> anyhow::Result<Self> {
+        let session = MtpDecodeSession::new_owned(head, options)
+            .map_err(|error| anyhow::anyhow!("Failed to create MTP decode session: {error}"))?;
+        if session.signature().hidden_size != embedder.hidden_size() {
+            anyhow::bail!(
+                "MTP head hidden size {} does not match target embedding hidden size {}",
+                session.signature().hidden_size,
+                embedder.hidden_size()
+            );
+        }
+        Ok(Self {
+            session,
+            embedder,
+            lm_head,
+            cache_scope,
         })
     }
 }
@@ -352,32 +688,51 @@ where
             .guaranteed_token
             .context("MTP proposer requires the target model's greedy next token")?;
         let draft_count = context.width.saturating_sub(1);
-        if hidden.len() != self.session.signature().hidden_size {
+        let expected_state_len = self
+            .session
+            .signature()
+            .hidden_size
+            .checked_mul(self.session.hc_mult())
+            .context("MTP HC state width overflow")?;
+        if hidden.len() != expected_state_len {
             anyhow::bail!(
-                "target_hidden length {} != hidden {}",
+                "target_hidden length {} != hc_mult {} * hidden {}",
                 hidden.len(),
+                self.session.hc_mult(),
                 self.session.signature().hidden_size
             );
         }
-        self.session.reset();
+        if self.cache_scope == MtpCacheScope::ProposalLocal {
+            self.session.reset();
+        } else if context.first_step > 0 {
+            anyhow::bail!(
+                "MTP accepted_prefix KV reuse is not enabled: the frozen Mobius contract does not define correction-token/cache alignment"
+            );
+        }
         let mut tokens = Vec::with_capacity(draft_count + 1);
         tokens.push(guaranteed_token);
-        let mut running_hidden = hidden.to_vec();
+        let mut running_state = hidden.to_vec();
         let mut previous_token = guaranteed_token;
         let mut embedding = vec![0.0f32; self.session.signature().hidden_size];
         let mut logits = vec![0.0f32; self.lm_head.vocab_size()];
-        for _ in 0..draft_count {
+        for draft_index in 0..draft_count {
             self.embedder.embed(previous_token, &mut embedding)?;
-            let position =
-                i64::try_from(self.session.past_len()).context("MTP position exceeds i64")?;
-            let mtp_hidden = self
+            let position = i64::try_from(
+                context
+                    .context_tokens
+                    .len()
+                    .checked_add(draft_index)
+                    .context("MTP absolute position overflow")?,
+            )
+            .context("MTP position exceeds i64")?;
+            let output = self
                 .session
-                .step(&embedding, &running_hidden, position)
+                .step_with_state(&embedding, &running_state, position)
                 .map_err(|error| anyhow::anyhow!("MTP proposal step failed: {error}"))?;
-            self.lm_head.logits(&mtp_hidden, &mut logits)?;
+            self.lm_head.logits(&output.hidden, &mut logits)?;
             let token = argmax(&logits).context("lm-head produced empty logits")? as TokenId;
             tokens.push(token);
-            running_hidden = mtp_hidden;
+            running_state = output.state;
             previous_token = token;
         }
         Ok(SpeculativeProposal {
@@ -388,7 +743,9 @@ where
     }
 
     fn accept(&mut self, context: &SpeculativeAcceptContext<'_>) -> anyhow::Result<()> {
-        if self.session.mode() == onnx_genai_ort::MtpDraftKvMode::HiddenThreaded {
+        if self.cache_scope == MtpCacheScope::ProposalLocal
+            || self.session.mode() == onnx_genai_ort::MtpDraftKvMode::HiddenThreaded
+        {
             self.session.reset();
             return Ok(());
         }
@@ -804,6 +1161,28 @@ impl Engine {
                 .unwrap_or(self.num_speculative_tokens),
         }
         .max(1);
+        let mut mtp_proposer = if matches!(&speculative_mode, SpeculativeMode::Mtp(_)) {
+            let mtp = self
+                .mtp
+                .as_ref()
+                .context("MTP speculation requested without a loaded MTP head")?;
+            Some(MtpProposer::new_owned(
+                Arc::clone(&mtp.session),
+                MtpDecodeOptions {
+                    kv_mode: mtp.kv_mode,
+                    batch_size: 1,
+                    hc_mult: mtp.config.hc_mult,
+                    hidden_state_rank4: mtp.config.target_hidden_layout == MtpHiddenLayout::Bshc,
+                    hidden_output: mtp.config.mtp_hidden_output.clone(),
+                    state_output: mtp.config.mtp_state_output.clone(),
+                },
+                mtp.embedder.clone(),
+                mtp.lm_head.clone(),
+                mtp.config.cache_scope,
+            )?)
+        } else {
+            None
+        };
         let mut step = 0;
 
         loop {
@@ -963,21 +1342,11 @@ impl Engine {
                         .tokens
                 }
                 SpeculativeMode::Mtp(_) => {
-                    let mtp = self
-                        .mtp
-                        .as_ref()
-                        .context("MTP speculation requested without a loaded MTP head")?;
-                    MtpProposer::new(
-                        &mtp.session,
-                        MtpDecodeOptions {
-                            kv_mode: mtp.kv_mode,
-                            batch_size: 1,
-                        },
-                        mtp.embedder.clone(),
-                        mtp.lm_head.clone(),
-                    )?
-                    .propose(&proposer_context)?
-                    .tokens
+                    mtp_proposer
+                        .as_mut()
+                        .context("MTP proposer state was not initialized")?
+                        .propose(&proposer_context)?
+                        .tokens
                 }
                 SpeculativeMode::Eagle3(_) => {
                     let eagle3 = self
@@ -1197,6 +1566,12 @@ impl Engine {
 
             if matches!(&speculative_mode, SpeculativeMode::DraftModel) {
                 self.notify_draft_acceptance(state, accepted, &commit_tokens)?;
+            } else if let Some(proposer) = mtp_proposer.as_mut() {
+                proposer.accept(&SpeculativeAcceptContext {
+                    accepted_prefix_len: accepted,
+                    committed_tokens: &commit_tokens,
+                    target_tokens: &state.tokens,
+                })?;
             }
 
             for (commit_idx, token_id) in commit_tokens.into_iter().enumerate() {
@@ -1675,6 +2050,135 @@ mod tests {
         Ok(())
     }
 
+    #[derive(Clone)]
+    struct ConstantEmbedder;
+
+    impl TokenEmbedder for ConstantEmbedder {
+        fn hidden_size(&self) -> usize {
+            2
+        }
+
+        fn embed(&self, _token: TokenId, out: &mut [f32]) -> anyhow::Result<()> {
+            out.copy_from_slice(&[1.0, 0.0]);
+            Ok(())
+        }
+    }
+
+    #[derive(Clone)]
+    struct RecordingLmHead {
+        inputs: Arc<Mutex<Vec<Vec<f32>>>>,
+    }
+
+    impl LmHead for RecordingLmHead {
+        fn vocab_size(&self) -> usize {
+            1
+        }
+
+        fn logits(&self, hidden: &[f32], out: &mut [f32]) -> anyhow::Result<()> {
+            self.inputs
+                .lock()
+                .map_err(|_| anyhow::anyhow!("recording LM-head lock poisoned"))?
+                .push(hidden.to_vec());
+            out[0] = 1.0;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn mtp_proposer_threads_rank4_hc_state_across_drafts() -> anyhow::Result<()> {
+        static ENVIRONMENT: OnceLock<Environment> = OnceLock::new();
+        let environment = ENVIRONMENT
+            .get_or_init(|| Environment::new("engine-mtp-hc-test").expect("environment"));
+        let head_path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tiny-hc-mtp/model.onnx");
+        let head = Session::new(
+            environment,
+            &head_path,
+            SessionOptions::default().with_intra_op_threads(1),
+        )?;
+        let recorded = Arc::new(Mutex::new(Vec::new()));
+        let mut proposer = MtpProposer::new(
+            &head,
+            MtpDecodeOptions {
+                kv_mode: onnx_genai_ort::MtpDraftKvMode::HiddenThreaded,
+                batch_size: 1,
+                hc_mult: 2,
+                hidden_state_rank4: true,
+                hidden_output: "mtp_hidden".into(),
+                state_output: Some("mtp_state".into()),
+            },
+            ConstantEmbedder,
+            RecordingLmHead {
+                inputs: Arc::clone(&recorded),
+            },
+        )?;
+        let options = GenerateOptions::default();
+        let chain = ProcessorChain::new();
+        let target_hc = vec![0.0; 4];
+
+        let proposal = proposer.propose(&SpeculativeProposerContext {
+            width: 3,
+            context_tokens: &[4, 5],
+            generated_tokens: &[],
+            generated_text: "",
+            first_step: 0,
+            options: &options,
+            chain: &chain,
+            target_hidden: Some(&target_hc),
+            target_hidden_layers: None,
+            guaranteed_token: Some(0),
+            shared_kv_slices: None,
+        })?;
+
+        assert_eq!(proposal.tokens, vec![0, 0, 0]);
+        assert_eq!(
+            *recorded
+                .lock()
+                .map_err(|_| anyhow::anyhow!("recording LM-head lock poisoned"))?,
+            vec![vec![2.0, 0.0], vec![4.0, 0.0]]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn mtp_package_references_borrow_target_initializers() -> anyhow::Result<()> {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/tiny-mtp-full");
+        let (embedder, lm_head, vocab_size) = load_target_initializer_adapters(
+            &fixture.join("model.onnx"),
+            "transformer.wte.weight",
+            "lm_head.weight_t",
+            16,
+        )?;
+        assert_eq!(vocab_size, 32);
+
+        let mut embedded = vec![0.0; 16];
+        embedder.embed(7, &mut embedded)?;
+        let raw_embedding = std::fs::read(fixture.join("embedding.f32"))?;
+        let expected_embedding = raw_embedding
+            .chunks_exact(4)
+            .map(|bytes| f32::from_le_bytes(bytes.try_into().expect("four bytes")))
+            .collect::<Vec<_>>();
+        assert_eq!(embedded, expected_embedding[7 * 16..8 * 16]);
+
+        let hidden = lcg_weights(0xDEAD_BEEF, 16);
+        let mut package_logits = vec![0.0; 32];
+        lm_head.logits(&hidden, &mut package_logits)?;
+        let raw_lm_head = std::fs::read(fixture.join("lm_head.f32"))?;
+        let linear_lm_head = LinearLmHead::new(
+            raw_lm_head
+                .chunks_exact(4)
+                .map(|bytes| f32::from_le_bytes(bytes.try_into().expect("four bytes")))
+                .collect(),
+            16,
+            32,
+        )?;
+        let mut expected_logits = vec![0.0; 32];
+        linear_lm_head.logits(&hidden, &mut expected_logits)?;
+        assert_eq!(package_logits, expected_logits);
+        Ok(())
+    }
+
     #[test]
     fn eagle3_proposer_loads_fixture_and_returns_shape_correct_proposal() -> anyhow::Result<()> {
         const HIDDEN: usize = 16;
@@ -1765,11 +2269,16 @@ mod tests {
         let mode = SpeculativeMode::Mtp(crate::config::MtpConfig {
             head_model: "mtp.onnx".into(),
             target_hidden_output: "hidden_states".into(),
+            target_hidden_layout: crate::config::MtpHiddenLayout::Bsh,
             embedding_weights: "embed.f32".into(),
             lm_head_weights: "lm_head.f32".into(),
             vocab_size: 32,
             hidden_size: 16,
+            hc_mult: 1,
+            mtp_hidden_output: "mtp_hidden".into(),
+            mtp_state_output: None,
             kv_mode: onnx_genai_ort::MtpDraftKvMode::HiddenThreaded,
+            cache_scope: crate::config::MtpCacheScope::ProposalLocal,
             num_speculative_tokens: 4,
         });
         let selected = match mode {

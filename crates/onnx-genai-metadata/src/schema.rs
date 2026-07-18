@@ -134,6 +134,94 @@ pub struct SpeculatorConfig {
     /// cache feeds that slice. Empty for proposers that own their KV cache.
     #[serde(default)]
     pub shared_kv: Vec<SharedKvGroup>,
+
+    /// Target decoder output carrying the recurrent MTP seed.
+    ///
+    /// Defaults to `hidden_states` for `mtp`.
+    #[serde(default)]
+    pub target_hidden_output: Option<String>,
+
+    /// Layout of `target_hidden_output`.
+    ///
+    /// Mobius MTP sidecars use `BSHC`: batch, sequence, Hyper-Connection lane,
+    /// hidden.
+    #[serde(default)]
+    pub target_hidden_layout: Option<MtpHiddenLayout>,
+
+    /// Target hidden width `H`.
+    #[serde(default)]
+    #[schemars(range(min = 1))]
+    pub target_hidden_size: Option<usize>,
+
+    /// Number of Hyper-Connection lanes `C`.
+    #[serde(default)]
+    #[schemars(range(min = 1))]
+    pub hc_mult: Option<usize>,
+
+    /// Sidecar output projected through the shared target LM head.
+    ///
+    /// Defaults to `mtp_hidden`.
+    #[serde(default)]
+    pub mtp_hidden_output: Option<String>,
+
+    /// Sidecar recurrent Hyper-Connection state output.
+    ///
+    /// Defaults to `mtp_state`.
+    #[serde(default)]
+    pub mtp_state_output: Option<String>,
+
+    /// Lifetime of the sidecar's KV state.
+    ///
+    /// Defaults to `proposal_local`.
+    #[serde(default)]
+    pub kv_mode: Option<MtpKvMode>,
+
+    /// Target embedding initializer shared with the MTP sidecar.
+    #[serde(default)]
+    pub embedding: Option<MtpTargetInitializer>,
+
+    /// Target LM-head initializer shared with the MTP sidecar.
+    #[serde(default)]
+    pub lm_head: Option<MtpTargetInitializer>,
+}
+
+/// Layout of the target state consumed by an MTP sidecar.
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, JsonSchema)]
+pub enum MtpHiddenLayout {
+    /// `[batch, sequence, hidden]` legacy layout.
+    #[serde(rename = "BSH")]
+    Bsh,
+    /// `[batch, sequence, hc_mult, hidden]` Mobius Hyper-Connection layout.
+    #[serde(rename = "BSHC")]
+    Bshc,
+}
+
+/// Lifetime declared for an MTP sidecar's private KV state.
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MtpKvMode {
+    /// Reset sidecar KV at every target verification iteration.
+    ProposalLocal,
+    /// Retain only KV corresponding to the accepted draft prefix.
+    AcceptedPrefix,
+}
+
+/// Exact target-model initializer reference used by an MTP sidecar.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, JsonSchema)]
+pub struct MtpTargetInitializer {
+    /// Initializer ownership source. The Phase-1 contract requires
+    /// `target_initializer`.
+    pub source: MtpWeightSource,
+    /// Exact initializer name in the target ONNX graph.
+    pub name: String,
+}
+
+/// Ownership source for an MTP shared weight.
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MtpWeightSource {
+    /// Borrow the named initializer from the target model package.
+    TargetInitializer,
 }
 
 /// One shared-KV binding group for a shared-KV proposer.

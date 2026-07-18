@@ -784,6 +784,64 @@
         }
       }
     },
+    "MtpHiddenLayout": {
+      "description": "Layout of the target state consumed by an MTP sidecar.",
+      "oneOf": [
+        {
+          "description": "`[batch, sequence, hidden]` legacy layout.",
+          "type": "string",
+          "const": "BSH"
+        },
+        {
+          "description": "`[batch, sequence, hc_mult, hidden]` Mobius Hyper-Connection layout.",
+          "type": "string",
+          "const": "BSHC"
+        }
+      ]
+    },
+    "MtpKvMode": {
+      "description": "Lifetime declared for an MTP sidecar's private KV state.",
+      "oneOf": [
+        {
+          "description": "Reset sidecar KV at every target verification iteration.",
+          "type": "string",
+          "const": "proposal_local"
+        },
+        {
+          "description": "Retain only KV corresponding to the accepted draft prefix.",
+          "type": "string",
+          "const": "accepted_prefix"
+        }
+      ]
+    },
+    "MtpTargetInitializer": {
+      "description": "Exact target-model initializer reference used by an MTP sidecar.",
+      "type": "object",
+      "properties": {
+        "name": {
+          "description": "Exact initializer name in the target ONNX graph.",
+          "type": "string"
+        },
+        "source": {
+          "description": "Initializer ownership source. The Phase-1 contract requires\n`target_initializer`.",
+          "$ref": "#/$defs/MtpWeightSource"
+        }
+      },
+      "required": [
+        "source",
+        "name"
+      ]
+    },
+    "MtpWeightSource": {
+      "description": "Ownership source for an MTP shared weight.",
+      "oneOf": [
+        {
+          "description": "Borrow the named initializer from the target model package.",
+          "type": "string",
+          "const": "target_initializer"
+        }
+      ]
+    },
     "PerformanceHints": {
       "description": "Publisher-provided speculative decoding performance guidance.",
       "type": "object",
@@ -1467,6 +1525,27 @@
           "default": null,
           "minimum": 1
         },
+        "embedding": {
+          "description": "Target embedding initializer shared with the MTP sidecar.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MtpTargetInitializer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "hc_mult": {
+          "description": "Number of Hyper-Connection lanes `C`.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "default": null,
+          "minimum": 1
+        },
         "input_embedding": {
           "description": "Relative path (from the model directory) to the target model's raw\ninput-token embedding table, as a little-endian f32 matrix in\n`[vocab_size, backbone_hidden_size]` order.\n\nThe `shared_kv` proposer builds each step's `inputs_embeds` as\n`concat(target_input_embedding(last_token), hidden)`, so it must be able\nto look up the target's input embedding of the last drafted/accepted\ntoken. Required for the `shared_kv` proposer.",
           "type": [
@@ -1474,6 +1553,28 @@
             "null"
           ],
           "default": null
+        },
+        "kv_mode": {
+          "description": "Lifetime of the sidecar's KV state.\n\nDefaults to `proposal_local`.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MtpKvMode"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "lm_head": {
+          "description": "Target LM-head initializer shared with the MTP sidecar.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MtpTargetInitializer"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "logits_output": {
           "description": "Name of the proposer's draft-distribution output.\n\nDefaults to `logits` for `shared_kv`.",
@@ -1495,6 +1596,22 @@
         },
         "model": {
           "description": "Relative path (from the model directory) to the proposer ONNX model.\n\nUsed by the `shared_kv` proposer to locate the\nproposer graph. Optional for forward compatibility with proposer\nfamilies that do not ship a standalone model file.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "mtp_hidden_output": {
+          "description": "Sidecar output projected through the shared target LM head.\n\nDefaults to `mtp_hidden`.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "mtp_state_output": {
+          "description": "Sidecar recurrent Hyper-Connection state output.\n\nDefaults to `mtp_state`.",
           "type": [
             "string",
             "null"
@@ -1526,6 +1643,35 @@
           "items": {
             "$ref": "#/$defs/SharedKvGroup"
           }
+        },
+        "target_hidden_layout": {
+          "description": "Layout of `target_hidden_output`.\n\nMobius MTP sidecars use `BSHC`: batch, sequence, Hyper-Connection lane,\nhidden.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MtpHiddenLayout"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "target_hidden_output": {
+          "description": "Target decoder output carrying the recurrent MTP seed.\n\nDefaults to `hidden_states` for `mtp`.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "target_hidden_size": {
+          "description": "Target hidden width `H`.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "default": null,
+          "minimum": 1
         },
         "tokens_per_step": {
           "description": "Deprecated alias for `num_speculative_tokens`.",

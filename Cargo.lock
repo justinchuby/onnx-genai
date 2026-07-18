@@ -1688,6 +1688,7 @@ version = "0.1.0-dev.2"
 dependencies = [
  "anyhow",
  "async-trait",
+ "half",
  "llguidance",
  "onnx-genai-genai-config",
  "onnx-genai-kv",
