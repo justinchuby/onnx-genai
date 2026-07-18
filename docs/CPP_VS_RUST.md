@@ -34,7 +34,8 @@ not as products anyone is asking ORT to adopt. Every number below is reproducibl
 
 If you read nothing else, read §3 (where C++ still wins), §6–§8 (agentic development, contract-first
 workflow, and reviewing agent-authored Rust), §9 (composability / à-la-carte reuse for collaborators),
-and §10 (the adoption path that doesn't bet the runtime).
+§10 (how the biggest C++ projects already adopt Rust without breaking users), and §11 (the adoption
+path that doesn't bet the runtime).
 
 ---
 
@@ -138,7 +139,7 @@ If we pretend these away, the experts are right to ignore us.
 5. **Rewrite risk and opportunity cost.** ORT is millions of lines of *correct, fast, shipping* C++.
    "Rewrite it" is, at face value, the single most classic engineering mistake there is. A Rust ORT
    that is 95% as fast and 100% rewritten is a **strategic loss**, not a win. The only defensible
-   version is incremental and reuse-heavy (see §10).
+   version is incremental and reuse-heavy (see §10–§11).
 
 6. **The ORT team's expertise is in C++.** ORT's deepest experts are C++ experts with years of context
    in *this specific codebase*. Ramping a team on Rust's borrow checker, async, and macro ecosystem is
@@ -385,7 +386,81 @@ C-ABI path that already works.
 
 ---
 
-## 10. An adoption path that doesn't bet the runtime
+## 10. Precedent: how the biggest C++ projects adopt Rust *without breaking users*
+
+This is the concern that actually matters for us: **not breaking existing users, and staying compatible
+with their build process.** It is worth being precise, because the largest C++ codebases on earth have
+already solved exactly this, and their playbook is the one we're proposing — not a leap of faith.
+
+**Chromium / Microsoft Edge.** Chromium began landing production Rust in 2023. The mechanics are the
+point:
+- Rust enters the **existing GN/Ninja build** as ordinary library targets (`rust_static_library`)
+  that C++ `static_library` targets depend on. There is no separate build the downstream must adopt;
+  Ninja links the Rust output like any other object file.
+- Interop goes through **CXX** (safe, generated, bidirectional bindings) at a reviewed FFI boundary.
+- The policy is explicitly **interop-only / new-code-first**: Rust is *not* used to force-rewrite
+  established C++. No top-level feature is Rust-only, and integration "must not significantly slow
+  existing build workflows."
+- **Edge is built on Chromium and inherits all of this.** It already ships upstream Rust (e.g. font and
+  image-decoding paths) into a browser used by hundreds of millions — and no user, and no downstream
+  build, had to change anything. That is the existence proof for "you can put Rust into a giant, shipping
+  C++ product invisibly."
+
+**Windows.** Microsoft landed the **first Rust in the Windows kernel** (the Win32k graphics subsystem —
+`win32kbase_rs.sys`) and in **DWriteCore**, dropped into the existing Windows build and binary-compatible
+with everything around them; users never saw a seam. The motivation is MSRC's finding that **~70% of
+Microsoft CVEs are memory-safety bugs** — the same category safe Rust removes by construction. Again:
+incremental interop, no rewrite, no user-visible break.
+
+**Android.** Google's data is the most useful, because it quantifies *why new-code-first works*: the
+share of Android's memory-safety vulnerabilities fell from **~76% (2019) to ~24% (2024)** — achieved
+**not by rewriting old C/C++**, but by writing new and refactored code in Rust alongside it.
+Vulnerabilities concentrate in *new* code and decay as code ages, so shifting only new code to a safe
+language captures most of the safety benefit without touching the mature codebase.
+
+**The shared playbook (identical across all three):**
+1. Rust enters through the **existing build system** as normal library targets — no new toolchain the
+   consumer must adopt (Cargo can emit a `staticlib`/`cdylib` that CMake/MSBuild/GN links like any
+   other `.a`/`.lib`/`.so`; `cxx`/`cbindgen` generate the headers).
+2. A **stable ABI / interop boundary** (CXX, or a plain C ABI) keeps callers unchanged.
+3. **New-code-first, no forced rewrite;** mature code stays until there's a reason.
+4. **Never a user-visible break** — the language underneath is invisible across the boundary.
+
+### Why our transition is *easier* than these precedents
+
+The hard constraint that dominates Chromium/Windows Rust adoption is *"don't disturb the one enormous,
+monolithic C++ build that ships to everyone."* We have that constraint on **one** side and not the other:
+
+- **Runtime (ORT) side — as hard as theirs, and solved the same way.** We bind ORT through its **C ABI**,
+  exactly as those projects use CXX/C-ABI, and plugin EPs load into *unmodified* ORT (the MLX EP is a
+  stock-ORT `.dylib` — no fork, no relink). Consumers keep the same C API and the same build. So even our
+  harder half mirrors the proven precedent.
+- **GenAI (OGA) side — materially easier, because the giant C++ consumers aren't here.** Edge, Windows,
+  and Android — the very codebases whose build compatibility makes Rust adoption delicate — **do not
+  depend on onnxruntime-genai at all.** OGA's consumers are a smaller, newer, higher-level set (apps
+  calling the GenAI API in C/C++/C#/Python), not OS/browser build pipelines. So the "don't break the
+  monolithic C++ build" constraint that shapes the precedents **largely doesn't apply to the GenAI
+  layer.** OGA-next can present a compatible API surface, reach parity, and only then deprecate anything —
+  without ever threatening a browser or OS build. That makes the **GenAI layer the easiest place to go
+  Rust-first**, arguably easier than the precedents, which had to thread Rust into a single giant binary.
+
+### The one real cost the precedents all paid (so should we)
+
+The honest tax is **the Rust toolchain in CI** — bootstrapping `rustc`/`cargo` into hermetic/enterprise
+build systems — plus some build-time increase. Chromium gates adoption on "must not significantly slow
+existing workflows," and Windows/Android absorbed the toolchain-integration work up front. We should
+adopt the same bar: Rust artifacts must link into a consumer's existing build with no new *runtime*
+dependency and a bounded *build-time* cost, or the boundary stays where it is.
+
+**Bottom line:** "we don't want to break existing users / we need build-process compatibility" is not a
+reason to avoid Rust — it is precisely the requirement Chromium/Edge, Windows, and Android already met
+with the strangler-fig + stable-ABI playbook. We inherit that playbook for ORT via the C ABI, and the
+GenAI layer is *less* constrained than any of them because its consumers aren't the monolithic C++
+builds that made the precedents hard.
+
+---
+
+## 11. An adoption path that doesn't bet the runtime
 
 This is the part to actually argue about. The path is **strangler-fig, not big-bang**:
 
@@ -409,7 +484,7 @@ approve a multi-year rewrite; they approve one crate at a time, each behind a co
 
 ---
 
-## 11. Recommendation, and what would change it
+## 12. Recommendation, and what would change it
 
 **Recommendation (for discussion, not a mandate):** treat Rust as the default for *new* orchestration
 and GenAI components and for *new* plugin EPs; where the runtime is reimplemented, do it incrementally
