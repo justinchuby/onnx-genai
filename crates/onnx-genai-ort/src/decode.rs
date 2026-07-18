@@ -390,9 +390,9 @@ impl<'a> DecodeSession<'a> {
         attention_mask: &[i64],
         position_ids: &[i64],
     ) -> Result<Value> {
-        match self.step_dispatch(new_input_ids, attention_mask, position_ids, false)? {
+        match self.step_dispatch(new_input_ids, attention_mask, position_ids, None)? {
             StepLogits::Value(logits) => Ok(logits),
-            // `argmax_only` is false, so the captured path returns a Value.
+            // `params` is None, so the captured path returns a Value.
             StepLogits::Token(_) => {
                 Err(OrtError::InvalidArgument("step produced a token id".into()))
             }
@@ -413,7 +413,12 @@ impl<'a> DecodeSession<'a> {
         attention_mask: &[i64],
         position_ids: &[i64],
     ) -> Result<u32> {
-        match self.step_dispatch(new_input_ids, attention_mask, position_ids, true)? {
+        match self.step_dispatch(
+            new_input_ids,
+            attention_mask,
+            position_ids,
+            Some(&DeviceSampleParams::greedy()),
+        )? {
             StepLogits::Token(token) => Ok(token),
             // The standard (non-captured) path returns a Value; reduce it here.
             StepLogits::Value(logits) => logits.argmax_last_row(),
@@ -425,9 +430,11 @@ impl<'a> DecodeSession<'a> {
     ///
     /// This is the sampling analogue of [`Self::step_argmax`]: when `params` is
     /// greedy it is exactly the argmax fast path. Non-greedy device sampling
-    /// (temperature/top-k/top-p/min-p + categorical draw on-device) is landing
-    /// incrementally; until the device kernels are wired in, non-greedy requests
-    /// return an error so the engine can fall back to the host sampler.
+    /// (temperature/top-k/top-p/min-p + categorical draw) runs entirely on the
+    /// device logits pointer via the [`DeviceSampler`]. If the logits are not on
+    /// the device (CPU path), the non-greedy request returns an error so the
+    /// engine can fall back to its host sampler — this method never copies the
+    /// full vocabulary to the host to sample.
     pub fn step_sampled(
         &mut self,
         new_input_ids: &[i64],
@@ -438,9 +445,17 @@ impl<'a> DecodeSession<'a> {
         if params.greedy {
             return self.step_argmax(new_input_ids, attention_mask, position_ids);
         }
-        Err(OrtError::InvalidArgument(
-            "device sampled (non-greedy) decode not yet implemented".into(),
-        ))
+        match self.step_dispatch(new_input_ids, attention_mask, position_ids, Some(params))? {
+            StepLogits::Token(token) => Ok(token),
+            // The captured device path yields a token; a Value means the logits
+            // stayed on the host (non-captured / CPU path), where this method
+            // does not sample. Signal the engine to fall back to its host sampler.
+            StepLogits::Value(_) => Err(OrtError::InvalidArgument(
+                "device sampled (non-greedy) decode requires on-device logits; \
+                 logits are on the host"
+                    .into(),
+            )),
+        }
     }
 
     fn step_dispatch(
@@ -448,7 +463,7 @@ impl<'a> DecodeSession<'a> {
         new_input_ids: &[i64],
         attention_mask: &[i64],
         position_ids: &[i64],
-        argmax_only: bool,
+        params: Option<&DeviceSampleParams>,
     ) -> Result<StepLogits> {
         if new_input_ids.is_empty() {
             return Err(OrtError::InvalidArgument(
@@ -486,7 +501,7 @@ impl<'a> DecodeSession<'a> {
             && new_input_ids.len() == 1
             && self.current_len > 0
         {
-            match self.step_captured(new_input_ids[0], attention_mask, position_ids[0], argmax_only)
+            match self.step_captured(new_input_ids[0], attention_mask, position_ids[0], params)
             {
                 Ok(logits) => return Ok(logits),
                 Err(err) => {
@@ -602,7 +617,7 @@ impl<'a> DecodeSession<'a> {
         token: i64,
         attention_mask: &[i64],
         position: i64,
-        argmax_only: bool,
+        params: Option<&DeviceSampleParams>,
     ) -> Result<StepLogits> {
         self.ensure_capture_state()?;
         // Move the capture buffers out of `self` for the duration of the step so
@@ -692,10 +707,11 @@ impl<'a> DecodeSession<'a> {
             .ok_or_else(|| OrtError::InvalidArgument("decode length overflow".into()))?;
 
         // Reduce or copy the persistent logits buffer while it is still live.
-        // The greedy fast path (`argmax_only`) reads only the winning token id
-        // straight from the buffer — the full vocabulary never leaves the
-        // tensor. Otherwise snapshot it into an owned Value so the caller can
-        // consume it while the captured buffer is reused next step.
+        // With `params` set (greedy or non-greedy) the device sampler reads only
+        // the winning token id straight from the buffer — the full vocabulary
+        // never leaves the tensor. Without `params` (plain `step`) snapshot it
+        // into an owned Value so the caller can consume it while the captured
+        // buffer is reused next step.
         let _extract_span = crate::prof_span!("ort.extract_outputs");
         #[cfg(feature = "cuda")]
         if cap.logits_on_device {
@@ -705,9 +721,9 @@ impl<'a> DecodeSession<'a> {
                 .device_sampler
                 .as_ref()
                 .expect("device sampler initialized for device logits");
-            let result = if argmax_only {
+            let result = if let Some(params) = params {
                 device_sampler
-                    .sample(dtype, ptr, 1, cap.vocab, &DeviceSampleParams::greedy())
+                    .sample(dtype, ptr, 1, cap.vocab, params)
                     .map(|ids| StepLogits::Token(ids[0]))
             } else {
                 device_logits_to_host_value(device_sampler.as_ref(), dtype, ptr, cap.vocab)
@@ -716,10 +732,13 @@ impl<'a> DecodeSession<'a> {
             self.capture = Some(cap);
             return result;
         }
-        let result = if argmax_only {
-            cap.logits.argmax_last_row().map(StepLogits::Token)
-        } else {
-            cap.logits.clone_owned().map(StepLogits::Value)
+        // Host logits (no CUDA feature / CPU-allocated output). Greedy reduces to
+        // the argmax token; non-greedy cannot sample here, so surface the logits
+        // Value and let `step_sampled` signal a host fallback.
+        let result = match params {
+            None => cap.logits.clone_owned().map(StepLogits::Value),
+            Some(p) if p.greedy => cap.logits.argmax_last_row().map(StepLogits::Token),
+            Some(_) => cap.logits.clone_owned().map(StepLogits::Value),
         };
         self.capture = Some(cap);
         result
