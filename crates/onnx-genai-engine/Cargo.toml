@@ -13,7 +13,6 @@ default = []
 native-backend = [
     "dep:onnx-runtime-ep-cpu",
     "dep:onnx-runtime-session",
-    "dep:prost",
 ]
 # Forwards to `onnx-genai-ort/cuda` so the CUDA execution provider is compiled
 # in. Runtime EP selection still goes through `ONNX_GENAI_EP`; without this
@@ -32,7 +31,7 @@ onnx-runtime-ep-cuda = { workspace = true, optional = true }
 onnx-runtime-ir = { workspace = true }
 onnx-runtime-loader = { workspace = true }
 onnx-runtime-session = { workspace = true, optional = true }
-prost = { version = "0.13", optional = true }
+prost = { version = "0.13" }
 tokio = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
