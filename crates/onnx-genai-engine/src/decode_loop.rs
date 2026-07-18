@@ -82,6 +82,8 @@ pub(crate) trait DecodeLoopBackend {
     ) -> anyhow::Result<TokenId> {
         anyhow::bail!("device sampled fast path is not supported by this decode backend")
     }
+    /// Record that a device sampling attempt was unavailable for this backend.
+    fn sampled_fastpath_failed(&mut self) {}
 }
 
 pub(crate) fn run_decode_loop<B: DecodeLoopBackend>(
@@ -170,6 +172,10 @@ pub(crate) fn step_decode_loop<B: DecodeLoopBackend>(
         let _span = onnx_genai_ort::prof_span!("loop.next_logits");
         backend.next_token_sampled(params)
     });
+
+    if sampled_result.as_ref().is_some_and(Result::is_err) {
+        backend.sampled_fastpath_failed();
+    }
 
     let mut host_token = |rng_value: Option<f32>| -> anyhow::Result<TokenId> {
         let context = ProcessorContext {
@@ -360,6 +366,7 @@ mod tests {
         next_logits: usize,
         sampled_attempts: usize,
         sampled_supported: bool,
+        sampled_failed: bool,
         committed: Vec<TokenId>,
     }
 
@@ -374,6 +381,7 @@ mod tests {
                 next_logits: 0,
                 sampled_attempts: 0,
                 sampled_supported,
+                sampled_failed: false,
                 committed: Vec::new(),
             }
         }
@@ -400,7 +408,7 @@ mod tests {
         }
 
         fn sampled_fastpath_supported(&self) -> bool {
-            self.sampled_supported
+            self.sampled_supported && !self.sampled_failed
         }
 
         fn next_token_sampled(
@@ -409,6 +417,10 @@ mod tests {
         ) -> anyhow::Result<TokenId> {
             self.sampled_attempts += 1;
             anyhow::bail!("device sampler unavailable")
+        }
+
+        fn sampled_fastpath_failed(&mut self) {
+            self.sampled_failed = true;
         }
     }
 
@@ -460,7 +472,7 @@ mod tests {
 
         assert_eq!(fallback.token_ids, host.token_ids);
         assert_eq!(fallback_backend.committed, host_backend.committed);
-        assert_eq!(fallback_backend.sampled_attempts, options.max_new_tokens);
+        assert_eq!(fallback_backend.sampled_attempts, 1);
         Ok(())
     }
 }

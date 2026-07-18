@@ -1326,6 +1326,7 @@ impl Engine {
                 scheduler: &mut self.scheduler,
                 session_id,
                 state: &mut state,
+                sampled_fastpath_failed: false,
             };
             run_decode_loop(
                 &mut backend,
@@ -1914,6 +1915,7 @@ impl Engine {
                 scheduler: &mut self.scheduler,
                 session_id: active.session_id,
                 state: &mut active.state,
+                sampled_fastpath_failed: false,
             };
             step_decode_loop(
                 &mut backend,
@@ -2114,6 +2116,7 @@ struct SessionDecodeLoopBackend<'a> {
     scheduler: &'a mut Scheduler,
     session_id: SessionId,
     state: &'a mut EngineSession,
+    sampled_fastpath_failed: bool,
 }
 
 impl DecodeLoopBackend for SessionDecodeLoopBackend<'_> {
@@ -2157,7 +2160,9 @@ impl DecodeLoopBackend for SessionDecodeLoopBackend<'_> {
     }
 
     fn sampled_fastpath_supported(&self) -> bool {
-        self.state.decode_state.has_runner() && self.state.decode_state.runner_supports_sampled()
+        !self.sampled_fastpath_failed
+            && self.state.decode_state.has_runner()
+            && self.state.decode_state.runner_supports_sampled()
     }
 
     fn next_token_sampled(
@@ -2173,6 +2178,10 @@ impl DecodeLoopBackend for SessionDecodeLoopBackend<'_> {
             params,
         )?
         .context("device sampled fast path unexpectedly returned no token")
+    }
+
+    fn sampled_fastpath_failed(&mut self) {
+        self.sampled_fastpath_failed = true;
     }
 }
 
