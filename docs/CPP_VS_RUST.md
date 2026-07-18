@@ -418,7 +418,40 @@ share of Android's memory-safety vulnerabilities fell from **~76% (2019) to ~24%
 Vulnerabilities concentrate in *new* code and decay as code ages, so shifting only new code to a safe
 language captures most of the safety benefit without touching the mature codebase.
 
-**The shared playbook (identical across all three):**
+### The most honest data point: Firefox reuses ONNX Runtime rather than rewriting it
+
+Firefox is the strongest possible test of "shouldn't a Rust shop just write it in Rust?" — Mozilla
+*created* Rust, and Gecko already contains large Rust subsystems (Stylo, WebRender). Yet for its
+on-device ML features Firefox **vendors ONNX Runtime (C++, compiled to WebAssembly) via Transformers.js
+in a dedicated inference process** — it did **not** write a Rust-native inference runtime. That fact
+cuts both ways, and both directions matter for this proposal:
+
+- **It validates the "keep and reuse the kernels/runtime" half — strongly.** The people with the deepest
+  Rust expertise on earth chose to reuse a mature C++ inference runtime rather than reimplement one.
+  Reimplementing a kernel-heavy runtime *for its own sake* is exactly the guilty-until-proven case §3 and
+  §12 warn against. If ORT already runs your model well, the highest-value move is to *wrap* it, not
+  re-derive MLAS.
+- **It is the honest counterweight to Phase 2 (incrementally porting the runtime to Rust).** If Mozilla
+  didn't rewrite ORT, we cannot justify porting the runtime on "Rust is nicer." Any runtime seam must
+  earn its way on measured value and long-term (agent-)maintainability, one conformance-gated piece at a
+  time — and for many consumers the right answer is *"never; keep wrapping ORT."* That is already the
+  plan; Firefox is the reason to hold that line.
+- **It also confirms where Rust *did* win even for a Rust maximalist: the layers *around* inference.**
+  Firefox's inference-process isolation and integration are Rust; the compute is reused ORT. That is
+  precisely the split proposed here — reuse ORT for compute, put Rust in the orchestration/serving layer
+  where correctness-critical state lives.
+- **The workload that pulls all of this is on-device, interactive inference.** Firefox's ML push is
+  entirely local (privacy, no server round-trip). That is the same class of workload — long-context,
+  concurrent, latency-sensitive, on-device — where the orchestration layer (KV/memory management,
+  scheduling, sampling) is the bottleneck and where a safe, concurrent Rust substrate pays off, without
+  touching the reused kernels.
+
+Net: Firefox does not weaken the case; it sharpens it. It is a real-world confirmation of the exact
+boundary this document draws — **reuse the C++ runtime/kernels through a stable ABI; write the new
+orchestration and on-device serving layer in Rust; port the runtime itself only incrementally and only
+on evidence.**
+
+### The shared playbook (identical across all of them):
 1. Rust enters through the **existing build system** as normal library targets — no new toolchain the
    consumer must adopt (Cargo can emit a `staticlib`/`cdylib` that CMake/MSBuild/GN links like any
    other `.a`/`.lib`/`.so`; `cxx`/`cbindgen` generate the headers).
