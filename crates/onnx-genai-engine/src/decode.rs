@@ -9,7 +9,7 @@
 //! engine.
 
 use crate::config::{GenerateOptions, SessionId};
-use crate::kv_bridge::{KvModelInfo, mirror_present_kv_to_pages};
+use crate::kv_bridge::{mirror_present_kv_to_pages, KvModelInfo};
 use crate::logits::{ProcessorChain, ProcessorContext, TokenId};
 use crate::processors::select_next_token_with_rng;
 use crate::sampling::SamplingRng;
@@ -18,8 +18,8 @@ use anyhow::Context;
 use onnx_genai_kv::{KvCacheOps, PagedKvCache};
 use onnx_genai_metadata::InferenceMetadata;
 use onnx_genai_ort::{
-    DataType, DecodeKvMode, DecodeSession, DecodeSessionOptions, Session, StaticCacheDecodeOptions,
-    StaticCacheDecodeSession, TensorInfo, Value,
+    DataType, DecodeKvMode, DecodeSession, DecodeSessionOptions, DeviceSampleParams, Session,
+    StaticCacheDecodeOptions, StaticCacheDecodeSession, TensorInfo, Value,
 };
 use std::collections::HashMap;
 
@@ -70,6 +70,17 @@ pub(crate) trait DecodeBackend {
     fn supports_argmax(&self) -> bool {
         false
     }
+    fn decode_sampled(
+        &mut self,
+        _token_ids: &[TokenId],
+        _past_len: usize,
+        _params: &DeviceSampleParams,
+    ) -> anyhow::Result<Option<u32>> {
+        Ok(None)
+    }
+    fn supports_sampled(&self) -> bool {
+        false
+    }
     fn rewind(&mut self, target_len: usize) -> anyhow::Result<()>;
     fn reset(&mut self) -> anyhow::Result<()> {
         self.rewind(0)
@@ -102,6 +113,10 @@ impl DecodeRunner {
             #[cfg(feature = "native-backend")]
             DecodeRunner::Native(runner) => runner.supports_argmax(),
         }
+    }
+
+    fn supports_sampled(&self) -> bool {
+        matches!(self, DecodeRunner::PastPresent(_))
     }
 }
 
@@ -144,6 +159,33 @@ impl DecodeBackend for DecodeSession<'static> {
     }
 
     fn supports_argmax(&self) -> bool {
+        true
+    }
+
+    fn decode_sampled(
+        &mut self,
+        token_ids: &[TokenId],
+        past_len: usize,
+        params: &DeviceSampleParams,
+    ) -> anyhow::Result<Option<u32>> {
+        let total_len = past_len + token_ids.len();
+        let input_ids = token_ids
+            .iter()
+            .map(|&id| i64::from(id))
+            .collect::<Vec<_>>();
+        let attention_mask = vec![1_i64; total_len];
+        let position_ids = (past_len..total_len)
+            .map(|pos| i64::try_from(pos).context("position id exceeds i64 range"))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        Ok(Some(self.step_sampled(
+            &input_ids,
+            &attention_mask,
+            &position_ids,
+            params,
+        )?))
+    }
+
+    fn supports_sampled(&self) -> bool {
         true
     }
 
@@ -349,6 +391,12 @@ impl DecodeState {
             .is_some_and(DecodeRunner::supports_argmax)
     }
 
+    pub(crate) fn runner_supports_sampled(&self) -> bool {
+        self.runner
+            .as_ref()
+            .is_some_and(DecodeRunner::supports_sampled)
+    }
+
     pub(crate) fn rewind_runner(&mut self, target_len: usize) -> anyhow::Result<()> {
         match &mut self.runner {
             Some(DecodeRunner::StaticCache(session)) => session.rewind(target_len)?,
@@ -542,6 +590,41 @@ pub(crate) fn next_session_token_argmax(
     let input_len = input_tokens.len();
     let token = run_decode_session_argmax(&mut state.decode_state, &input_tokens, past_len)?
         .context("argmax-capable decode runner returned no token")?;
+    kv_cache
+        .append(seq, input_len)
+        .map_err(|e| anyhow::anyhow!("Failed to advance KV sequence {seq}: {}", e))?;
+    state.kv_token_count += input_len;
+    Ok(Some(token))
+}
+
+/// Device-sampled fast-path sibling of [`next_session_token_logits`].
+///
+/// The caller falls back to host logits and sampling when this returns an error.
+pub(crate) fn next_session_token_sampled(
+    session: &Session,
+    kv_model: Option<&KvModelInfo>,
+    kv_cache: &mut PagedKvCache,
+    seq: SessionId,
+    state: &mut EngineSession,
+    params: &DeviceSampleParams,
+) -> anyhow::Result<Option<u32>> {
+    if !state.decode_state.has_runner() || !state.decode_state.runner_supports_sampled() {
+        return Ok(None);
+    }
+    let (mut input_tokens, mut past_len) = session_decode_input_tokens(state)?;
+    consume_windowed_prefix(
+        session,
+        kv_model,
+        kv_cache,
+        seq,
+        state,
+        &mut input_tokens,
+        &mut past_len,
+    )?;
+    let input_len = input_tokens.len();
+    let token =
+        run_decode_session_sampled(&mut state.decode_state, &input_tokens, past_len, params)?
+            .context("sample-capable decode runner returned no token")?;
     kv_cache
         .append(seq, input_len)
         .map_err(|e| anyhow::anyhow!("Failed to advance KV sequence {seq}: {}", e))?;
@@ -1158,6 +1241,22 @@ pub(crate) fn run_decode_session_argmax(
         .context("decode session runner not initialized")?
         .as_backend()
         .decode_argmax(token_ids, past_len)
+        .map_err(map_decode_context_error)
+}
+
+pub(crate) fn run_decode_session_sampled(
+    decode_state: &mut DecodeState,
+    token_ids: &[TokenId],
+    past_len: usize,
+    params: &DeviceSampleParams,
+) -> anyhow::Result<Option<u32>> {
+    align_runner_cursor(decode_state, token_ids, past_len)?;
+    decode_state
+        .runner
+        .as_mut()
+        .context("decode session runner not initialized")?
+        .as_backend()
+        .decode_sampled(token_ids, past_len, params)
         .map_err(map_decode_context_error)
 }
 

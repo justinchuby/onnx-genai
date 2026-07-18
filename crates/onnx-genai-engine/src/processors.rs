@@ -1,6 +1,5 @@
 //! Request logit processor construction and token selection helpers.
 
-use crate::FimConfig;
 use crate::config::{FinishReason, GenerateConstraint, GenerateOptions};
 use crate::logits::{
     ConstraintProcessor, FrequencyPenaltyProcessor, GrammarConstraintKind, JsonConstraint,
@@ -8,7 +7,8 @@ use crate::logits::{
     ProcessorContext, ProcessorSignal, RepetitionPenaltyProcessor, StopSequence,
     StopSequenceProcessor, TemperatureProcessor, TokenId, TopKProcessor, TopPProcessor,
 };
-use crate::sampling::{Sampler, default_sampler_for_options};
+use crate::sampling::{default_sampler_for_options, Sampler};
+use crate::FimConfig;
 use anyhow::Context;
 use onnx_genai_ort::Tokenizer;
 use std::path::Path;
@@ -121,6 +121,14 @@ pub(crate) fn build_processor_chain(
     }
 
     Ok(chain)
+}
+
+/// Whether every processor in `chain` is implemented by the device sampler.
+pub(crate) fn is_device_portable_chain(chain: &ProcessorChain) -> bool {
+    chain
+        .names()
+        .into_iter()
+        .all(|name| matches!(name, "temperature" | "top_k" | "top_p" | "min_p"))
 }
 
 pub(crate) fn load_fim_config_from_model_dir(

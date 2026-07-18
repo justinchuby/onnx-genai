@@ -6,8 +6,8 @@ use crate::config::{
 };
 use crate::logits::{ProcessorChain, ProcessorContext, TokenId};
 use crate::processors::{
-    ensure_constrained_finish, finish_reason_after_token, select_next_token_with_rng,
-    select_next_token_with_sampler,
+    ensure_constrained_finish, finish_reason_after_token, is_device_portable_chain,
+    select_next_token, select_next_token_with_rng, select_next_token_with_sampler,
 };
 use crate::sampling::{Sampler, SamplingRng};
 use onnx_genai_ort::Tokenizer;
@@ -70,6 +70,18 @@ pub(crate) trait DecodeLoopBackend {
     fn next_token_greedy(&mut self) -> anyhow::Result<TokenId> {
         anyhow::bail!("greedy fast path is not supported by this decode backend")
     }
+    /// Whether the backend can apply device-portable sampling without materializing
+    /// host logits.
+    fn sampled_fastpath_supported(&self) -> bool {
+        false
+    }
+    /// Run one decode step and sample on the device. An error requests host fallback.
+    fn next_token_sampled(
+        &mut self,
+        _params: &onnx_genai_ort::DeviceSampleParams,
+    ) -> anyhow::Result<TokenId> {
+        anyhow::bail!("device sampled fast path is not supported by this decode backend")
+    }
 }
 
 pub(crate) fn run_decode_loop<B: DecodeLoopBackend>(
@@ -127,20 +139,39 @@ pub(crate) fn step_decode_loop<B: DecodeLoopBackend>(
     }
 
     // A custom sampler replaces the default greedy/categorical selection, so the
-    // device greedy fast path (which hard-codes argmax) must be bypassed to give
-    // the sampler the processed logits.
+    // device fast paths must be bypassed to give the sampler processed logits.
     let greedy_fastpath = chain.is_empty()
         && options.top_logprobs.is_none()
         && (options.greedy || options.temperature == 0.0)
         && state.custom_sampler.is_none()
         && backend.greedy_fastpath_supported();
+    // Keep greedy behavior on its existing argmax path. The sampled path is only
+    // for categorical decoding whose processor chain the device sampler supports.
+    let sampled_fastpath = !greedy_fastpath
+        && !options.greedy
+        && options.temperature != 0.0
+        && options.top_logprobs.is_none()
+        && state.custom_sampler.is_none()
+        && is_device_portable_chain(chain)
+        && backend.sampled_fastpath_supported();
 
-    let token_id = if greedy_fastpath {
-        // Greedy with no logit processors: select the argmax token on the
-        // device/buffer without materializing the full vocabulary on the host.
+    let sampled_params = sampled_fastpath.then(|| onnx_genai_ort::DeviceSampleParams {
+        temperature: options.temperature,
+        top_k: options.top_k,
+        top_p: options.top_p,
+        min_p: options.min_p,
+        greedy: false,
+        // Draw from the same request RNG as host categorical sampling. If the
+        // device call fails, this value is reused by the host fallback.
+        rng_value: state.rng.value_for(options),
+    });
+
+    let sampled_result = sampled_params.as_ref().map(|params| {
         let _span = onnx_genai_ort::prof_span!("loop.next_logits");
-        backend.next_token_greedy()?
-    } else {
+        backend.next_token_sampled(params)
+    });
+
+    let mut host_token = |rng_value: Option<f32>| -> anyhow::Result<TokenId> {
         let context = ProcessorContext {
             prompt_tokens: backend.processor_prompt_tokens(),
             generated_tokens: state.generated_tokens.clone(),
@@ -155,14 +186,10 @@ pub(crate) fn step_decode_loop<B: DecodeLoopBackend>(
             let _span = onnx_genai_ort::prof_span!("loop.sampling");
             if let Some(sampler) = state.custom_sampler.as_deref_mut() {
                 select_next_token_with_sampler(&mut logits, &context, chain, sampler)
+            } else if let Some(rng_value) = rng_value {
+                select_next_token(&mut logits, &context, options, chain, rng_value)
             } else {
-                select_next_token_with_rng(
-                    &mut logits,
-                    &context,
-                    options,
-                    chain,
-                    &mut state.rng,
-                )
+                select_next_token_with_rng(&mut logits, &context, options, chain, &mut state.rng)
             }
         };
         if let (Some(top_logprobs), Some(logprobs)) =
@@ -170,7 +197,18 @@ pub(crate) fn step_decode_loop<B: DecodeLoopBackend>(
         {
             logprobs.push(logprob_for_token(&logits, token_id, top_logprobs));
         }
+        Ok(token_id)
+    };
+
+    let token_id = if greedy_fastpath {
+        let _span = onnx_genai_ort::prof_span!("loop.next_logits");
+        backend.next_token_greedy()?
+    } else if let Some(Ok(token_id)) = sampled_result {
         token_id
+    } else {
+        // `step_sampled` is allowed to report that the device sampler is not
+        // available. Reuse its draw to preserve seeded host sampling behavior.
+        host_token(sampled_params.as_ref().map(|params| params.rng_value))?
     };
     {
         let _span = onnx_genai_ort::prof_span!("loop.commit_token");
@@ -309,4 +347,120 @@ pub(crate) fn exceeded_context_limit(
     max_context: Option<usize>,
 ) -> bool {
     max_context.is_some_and(|limit| current_context_len > limit)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::processors::build_processor_chain;
+    use std::path::Path;
+
+    struct MockBackend {
+        logits: Vec<Vec<f32>>,
+        next_logits: usize,
+        sampled_attempts: usize,
+        sampled_supported: bool,
+        committed: Vec<TokenId>,
+    }
+
+    impl MockBackend {
+        fn new(sampled_supported: bool) -> Self {
+            Self {
+                logits: vec![
+                    vec![0.0, 0.4, 1.0],
+                    vec![0.5, 1.0, 0.0],
+                    vec![1.0, 0.0, 0.5],
+                ],
+                next_logits: 0,
+                sampled_attempts: 0,
+                sampled_supported,
+                committed: Vec::new(),
+            }
+        }
+    }
+
+    impl DecodeLoopBackend for MockBackend {
+        fn context_len(&self) -> usize {
+            self.committed.len() + 1
+        }
+
+        fn processor_prompt_tokens(&self) -> Vec<TokenId> {
+            vec![0]
+        }
+
+        fn next_logits(&mut self) -> anyhow::Result<Vec<f32>> {
+            let logits = self.logits[self.next_logits].clone();
+            self.next_logits += 1;
+            Ok(logits)
+        }
+
+        fn commit_token(&mut self, token_id: TokenId) -> anyhow::Result<()> {
+            self.committed.push(token_id);
+            Ok(())
+        }
+
+        fn sampled_fastpath_supported(&self) -> bool {
+            self.sampled_supported
+        }
+
+        fn next_token_sampled(
+            &mut self,
+            _params: &onnx_genai_ort::DeviceSampleParams,
+        ) -> anyhow::Result<TokenId> {
+            self.sampled_attempts += 1;
+            anyhow::bail!("device sampler unavailable")
+        }
+    }
+
+    fn tokenizer() -> anyhow::Result<Tokenizer> {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/tiny-llm/tokenizer.json")
+            .canonicalize()?;
+        Tokenizer::from_file(&fixture).map_err(Into::into)
+    }
+
+    #[test]
+    fn sampled_fastpath_error_falls_back_to_seeded_host_sampling() -> anyhow::Result<()> {
+        let options = GenerateOptions {
+            max_new_tokens: 3,
+            greedy: false,
+            temperature: 0.8,
+            top_k: 2,
+            top_p: 0.95,
+            min_p: 0.1,
+            seed: Some(17),
+            ..Default::default()
+        };
+        let chain = build_processor_chain(&options, None)?;
+        let tokenizer = tokenizer()?;
+
+        let mut fallback_backend = MockBackend::new(true);
+        let mut fallback_state = DecodeLoopState::new(0, options.seed, None);
+        let fallback = run_decode_loop(
+            &mut fallback_backend,
+            &mut fallback_state,
+            &options,
+            &chain,
+            &tokenizer,
+            None,
+            None,
+        )?;
+
+        let mut host_backend = MockBackend::new(false);
+        let mut host_state = DecodeLoopState::new(0, options.seed, None);
+        let host = run_decode_loop(
+            &mut host_backend,
+            &mut host_state,
+            &options,
+            &chain,
+            &tokenizer,
+            None,
+            None,
+        )?;
+
+        assert_eq!(fallback.token_ids, host.token_ids);
+        assert_eq!(fallback_backend.committed, host_backend.committed);
+        assert_eq!(fallback_backend.sampled_attempts, options.max_new_tokens);
+        Ok(())
+    }
 }

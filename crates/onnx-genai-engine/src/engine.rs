@@ -5,7 +5,7 @@ use crate::config::{ResolvedMtpConfig, validate_resolved_mtp_config};
 use crate::connector_bridge::ConnectorBridge;
 use crate::decode::{
     DecodeState, ModelDecodePath, detect_model_decode_path, next_session_token_argmax,
-    next_session_token_logits,
+    next_session_token_logits, next_session_token_sampled,
 };
 use crate::decode_loop::{
     DecodeLoopBackend, DecodeLoopState, exceeded_context_limit, run_decode_loop, step_decode_loop,
@@ -2154,6 +2154,25 @@ impl DecodeLoopBackend for SessionDecodeLoopBackend<'_> {
             self.state,
         )?
         .context("greedy fast path unexpectedly returned no token")
+    }
+
+    fn sampled_fastpath_supported(&self) -> bool {
+        self.state.decode_state.has_runner() && self.state.decode_state.runner_supports_sampled()
+    }
+
+    fn next_token_sampled(
+        &mut self,
+        params: &onnx_genai_ort::DeviceSampleParams,
+    ) -> anyhow::Result<TokenId> {
+        next_session_token_sampled(
+            self.session,
+            self.kv_model,
+            self.kv_cache,
+            self.session_id,
+            self.state,
+            params,
+        )?
+        .context("device sampled fast path unexpectedly returned no token")
     }
 }
 
