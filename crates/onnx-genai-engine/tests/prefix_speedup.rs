@@ -3,8 +3,11 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 fn tiny_fixture() -> anyhow::Result<PathBuf> {
+    // Use the `tiny-llm-scatter` fixture: it ships a full `model.onnx` (the
+    // plain `tiny-llm` fixture only has `model.onnx.data`) and exercises the
+    // real ScatterND KV-update path that prefix reuse depends on.
     Ok(Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../tests/fixtures/tiny-llm")
+        .join("../../tests/fixtures/tiny-llm-scatter")
         .canonicalize()?)
 }
 
