@@ -104,3 +104,5 @@ Cleared Deckard's `f795d45` executor EP-polymorphism refactor: it preserves CPU-
 - Cleared Leon’s Scan overflow repair and Holden’s own QMoE follow-up: allocations are bounded at `isize::MAX`, and valid odd affine-int4 block rows remain accepted.
 
 - 2026-07-18 Scribe: RoPE review rejected silent invalid positions, then approved validated commit 74a891b.
+
+- 2026-07-18: PR triage recorded five merged PRs, Attention landing, and PR #25 lifecycle follow-up.

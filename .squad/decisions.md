@@ -181,3 +181,346 @@ Plain-text summary: 🟢 APPROVE — the clamp-to-valid-shape defects are correc
 - **Reshape/Split:** Ferro's regressions exposed multiple `-1` inference acceptance; Leon added static target, count, and Split validation. Bryant rejected the first revision for zero-product Reshape and non-positive `num_outputs`; Deckard fixed both, added exact `Invalid` assertions, and Bryant approved. Shape-inference tests and coverage gates passed.
 - **GPU-native RoPE:** Drake removed f32 host staging with a cached CUDA kernel covering 3D/4D layouts, rotation modes, cache addressing, broadcast, and tails. Holden found invalid `position_ids` were silently accepted and rejected; Deckard added device validation, error propagation, boundary tests, and `B=2,H=2` parity coverage. Final review approved commit `74a891b`; graph capture remains disabled due to host flag synchronization.
 - **GLM CUDA audit:** Newt refreshed the standard-op readiness audit, distinguishing registration/loading from smooth execution and documenting the all-f32 constraints of denied operators. Parker corrected overclaims: casts can satisfy constrained inputs in mixed graphs; host-staged Attention/RoPE and custom BlockQuantizedMoE, IndexShare, and MTP boundaries remain throughput/execution blockers.
+
+## 2026-07-18 — Scribe inbox merge (PR triage, Attention, CI, and test coverage)
+
+<!-- merged from ash-cuda-attention-native.md -->
+
+# Decision: GPU-native standard `ai.onnx::Attention` kernel
+
+**Author:** Ash (CUDA kernel engineer)
+**Branch:** `cuda-attention-native` (worktree `/home/justinchu/wt-attn`, off origin/main 74a891b)
+**File:** `crates/onnx-runtime-ep-cuda/src/kernels/standard_attention.rs`
+
+## Summary
+
+Converted the host-staged standard `Attention` kernel to a GPU-native
+implementation. The previous impl did `dtoh` on Q/K/V/mask into `Vec<f32>`, ran
+the entire SDPA on the CPU, then `htod` the result — a D2H→CPU→H2D round trip
+that was the GLM-decode perf blocker. Bulk tensors now stay resident on the
+device end to end.
+
+## What moved to device
+
+Two NVRTC kernels (module `standard_attention_f32_v1`), following the crate's
+RoPE/where_op NVRTC pattern (runtime module cache, `LaunchConfig` +
+`PushKernelArg`, `cuptr` device pointers, `self.runtime.stream()`):
+
+- **`build_kv`** — gathers each K/V input into a contiguous
+  `[batch, kv_heads, total_seq, dim]` present buffer, doing the 3D→4D head
+  reshape **and** the `past ⧺ current` cache concat on device (stride-aware
+  indexing, handles 3D or 4D current/past). Writes directly into the
+  `present_key`/`present_value` output slots when those outputs are requested,
+  else into scratch (still the attention kernel's K/V source).
+- **`attention_row`** — one CUDA block per `(batch, q_head, query)` row. Computes
+  scaled QK scores (√scale folded into each operand), softcap, the composed
+  causal + padding + attn-mask frontiers, numerically-stable softmax, and the
+  probs·V accumulation. Writes `Y` (in 4D or 3D output layout, so no host
+  reshape) and the optional `qk_matmul_output` directly to device buffers. Q is
+  read in place with stride-aware indexing (no Q materialization); the mask input
+  is read in place on device (bool bytes / f32), broadcast in-kernel exactly like
+  the CPU reference (right-aligned dims, short-last-dim → −inf).
+
+No Q/K/V/mask/score tensor ever leaves the device in bulk.
+
+## What stayed on host (and why)
+
+- **Attribute/shape/validation resolution** and **all error messages** (arity,
+  dtype deny, non-contiguous, past-together, past-vs-nonpad exclusivity, dim
+  mismatches, qk mode range) — pure control logic, no bulk data.
+- **Per-batch causal `offset` and padding-frontier arrays** — built on host from
+  scalars and uploaded as tiny `int64[batch]` device arrays (as the task
+  suggested).
+- **`nonpad_kv_seqlen`** (7th input, opset 24+) — a per-batch scalar count read
+  back via a small `dtoh` to compute the offsets/pad limits. It is tiny control
+  state (length = batch), not bulk data.
+
+No `qk_matmul_output` host recompute was needed: all four modes (0 raw, 1 after
+softcap, 2 after mask, 3 after softmax) are produced in-kernel at the correct
+stage.
+
+## Determinism
+
+Fixed per-row reduction order, byte-identical run to run:
+- QK dot products and probs·V sums each run in ascending index order **within a
+  single thread** → bit-identical to the CPU reference for those stages.
+- Softmax max/exp/sum are performed sequentially by the block's lead thread
+  (thread 0), then a parallel normalize. No atomics feed a shared accumulator.
+- The only float-rounding divergence from the CPU reference is transcendental
+  ulp (`expf`/`tanhf` vs Rust `f32::exp`/`tanh`); covered by the 1e-4 test
+  tolerance.
+
+## cuda_graph_compatible
+
+`false` (explicit override, matching the prior default). Setup performs
+synchronous small `htod` uploads of the per-batch control arrays and a `dtoh` of
+`nonpad_kv_seqlen`, which are not capture-safe. A capturable design would need
+device-side offset construction; deferred as a follow-up. The bulk-data win is
+independent of graph capture.
+
+## Semantic parity preserved
+
+√scale-folded scores; softcap `s·tanh(s/softcap)` only when nonzero; composed
+(intersected) causal/pad/attn masks; GQA/MQA head sharing `kvh = qh/group`;
+3D↔4D reshape; in-op KV cache concat + `present_key`/`present_value` outputs;
+`qk_matmul_output` modes 0–3 (softcap_mode=1, mask_mode=2); numerically-stable
+softmax with fully-masked-row → zero-output guard; f32-only claim-time deny.
+
+## Test coverage added (`tests/standard_attention_gpu.rs`)
+
+Kept all existing tests green; added a general inline CPU reference (`sdpa_ref`)
+and GPU-vs-reference parity tests: basic MHA; GQA with `kv_heads<q_heads` and
+`batch>1, heads>1`; 3D-input reshape path; in-op past cache (`past_seq>0`, plus
+`present_key`/`present_value` correctness); float mask add; bool mask; softcap≠0;
+fully-masked row → zero output; and `qk_matmul_output` modes 0–3. Extended the
+test harness with `run_opt` to model omitted optional inputs (absent
+`TensorView` for the empty-string mask slot when past KV is supplied).
+
+## Reviewer scrutiny
+
+- **Softmax denominator rounding**: block lead-thread sequential sum matches CPU
+  order; other stages are bit-identical. Confirm the 1e-4 tolerance is
+  acceptable for the intended models (it is for GLM f32).
+- **Scores scratch memory**: a `[batch, q_heads, q_seq, total_seq]` f32 scratch
+  is allocated (same magnitude as `qk_matmul_output`). Fine for decode; large
+  prefills allocate the full attention matrix. Correctness-first; a
+  shared-memory/online-softmax variant is a perf follow-up.
+- **value/key head-count assumption**: present buffers are built with
+  `kv_heads = key.heads`; `value.heads` is assumed equal (standard GQA), matching
+  the prior impl's implicit assumption.
+
+
+<!-- merged from bryant-child-lru-review.md -->
+
+# Bryant review: ChildExecutor multi-signature LRU
+
+**Verdict: 🟢 APPROVE — land as-is.**
+
+Reviewed commit `caf2dba` on `child-lru`.
+
+- Scope is clean: only `crates/onnx-runtime-session/src/executor.rs` changed; no `.squad/` or unrelated crate changes.
+- The capacity-4 `Vec` LRU is bounded and deterministic. Hits remove and append the matching plan without incrementing `builds`; misses compile, evict index 0 only when full, append the new MRU plan, and increment `builds`.
+- The selected last index is borrowed mutably only after cache mutation completes. `runs` increments per successful locate/compile before dispatch; public API and stats propagation remain unchanged.
+- A→B→A correctly asserts 2 builds/3 runs; the prior single-slot implementation would build three times.
+- Eviction coverage exceeds capacity, confirms the oldest signature rebuilds, and confirms a retained recent signature remains a hit.
+- Capture reuse changes tensor values, checks the expected result, and compares against a fresh-compile reference, ruling out stale captured state.
+
+Gate: `cargo test -p onnx-runtime-session` passed. Targeted ChildExecutor tests also passed (4/4).
+
+
+<!-- merged from deckard-attention-fix.md -->
+
+### 2026-07-18: Attention K/V cache concatenation uses per-operand geometry
+**By:** Deckard
+**What:** The GPU-native standard Attention kernel now launches `build_kv` for key with `past_key.seq + K.seq` and for value with `past_value.seq + V.seq`, while retaining the CPU reference's validation that the two resulting present sequence lengths agree. Added GPU regressions for differing key/value cache splits, opset-24 `nonpad_kv_seqlen`, and explicit non-default scale.
+**Why:** The value launch incorrectly reused the key cache's past and total sequence lengths, shifting current value tokens and corrupting both `present_value` and Y when key/value concat geometry differed. The new present-value test fails on the original code and directly checks both present output buffers; the other tests cover padding/causal offset semantics, opset-23 rejection, and sqrt-scale folding.
+
+
+<!-- merged from dietrich-pr23.md -->
+
+### 2026-07-18: Rebase PR #23 benchmarks and use the complete scatter fixture
+**By:** Dietrich
+**What:** Rebased `bench/serving-scenarios` onto current `origin/main`, retained main's continuous-batch admission/eviction and prefix-cache cold/warm scenarios, and changed the end-to-end tokens/second benchmark plus README to use `tiny-llm-scatter`.
+**Why:** Main independently contained evolved versions of both new serving scenarios, so retaining them preserved the intended benchmark coverage without duplicate functions. `tiny-llm-scatter` is semantically suitable, has the same tokenizer, and includes both `model.onnx` and `model.onnx.data`, unlike the incomplete `tiny-llm` fixture.
+
+
+<!-- merged from ferro-ci-python-deps.md -->
+
+### 2026-07-18: Install projection-fusion Python dependencies in Rust CI lanes
+**By:** Ferro
+**What:** The `rust-portable` and `coverage` jobs set up Python 3.12 and install current `numpy` and `onnxscript` before running crates that include `onnx-runtime-session`.
+**Why:** The projection-fusion integration test generates ONNX fixtures through Python, and both CI lanes otherwise fail with `ModuleNotFoundError`, leaving main red.
+
+
+<!-- merged from gorman-session-cov-review.md -->
+
+### 2026-07-18: Session edge-case regression review
+**By:** Gorman
+**What:** 🟢 APPROVE commit `71b859d` for landing as-is. The commit changes only `crates/onnx-runtime-session/tests/executor.rs` (88 test lines), with no production or `.squad/` changes. The reverse-insertion test repeatedly computes topology and runs the session twice with identical outputs; the cycle test builds a real two-node cycle and matches `SessionError::Graph(GraphError::CycleDetected)`; the initializer test creates a producer-backed initializer and checks the actionable tensor, node, and initializer error details. Construction uses the existing IR fixture style (`Graph`, `Node`, `ValueId`, and helpers) used throughout the file.
+**Why:** Although line coverage remains 77.55%, these tests add meaningful behavioral regression guards for dependency ordering/determinism and two malformed-graph rejection contracts. Reworking solely to increase line coverage would trade away useful semantic protection; land them and pursue uncovered branches separately. Gate passed: `STATE_BACKEND=local cargo test -p onnx-runtime-session` completed with zero failures.
+
+
+<!-- merged from gorman-test-quality-review.md -->
+
+### 2026-07-18: Test-quality regression review
+**By:** Gorman
+**What:** 🟢 APPROVE commit `cffbcb6`.
+**Why:** Scope is test-only and limited to the three requested pure crates. BatchNorm uses `training_mode=1` with three outputs and verifies Y preserves X while training statistics remain unresolved. BF16 Mod independently derives f32 remainder results from BF16-rounded inputs, rounds back to BF16, and covers a negative dividend. Loader builds a genuine `a ↔ b` dependency cycle that protobuf validation accepts and the public load path rejects as `LoaderError::GraphBuild` containing `CycleDetected`, from `Graph::validate()`.
+
+**Gates:** `cargo test -p onnx-runtime-shape-inference`, `cargo test -p onnx-runtime-ep-cpu`, and `cargo test -p onnx-runtime-loader` all passed. Each named regression also passed directly.
+
+
+<!-- merged from hicks-child-lru.md -->
+
+### 2026-07-18: Bounded deterministic LRU for child executors
+**By:** Hicks
+**What:** Replaced `ChildExecutor`'s single compiled-plan slot with a four-entry, signature-keyed LRU. Cache hits move the plan to the most-recently-used end; misses compile once, increment `builds`, and evict the oldest entry at capacity.
+**Why:** Control-flow bodies can alternate among stable dtype/shape signatures (for example A→B→A). Four entries cover a small working set without unbounded executor retention. A `Vec` provides explicit deterministic ordering with no hash iteration dependence. Regression tests cover A→B→A reuse, oldest-entry eviction with a recent-entry hit, and capture rebinding parity against a freshly compiled plan.
+
+
+<!-- merged from hicks-pr27.md -->
+
+### 2026-07-18: Harden CUDA decode shared-KV bucket growth
+**By:** Hicks
+**What:** Rebased PR #27 (`fix/cuda-decode-kv-capacity`) cleanly onto `origin/main` at `53ef68c`. Shared-KV growth now rejects required capacity above the model-declared `max_length`, and the bucket helper never returns an over-limit allocation. KV replacement buffers and the fallible captured attention-mask replacement are fully prepared before the old captured graph is released and the session state is committed.
+**Why:** This preserves power-of-two grow-on-boundary behavior while preventing allocations beyond the model ceiling and preventing mask-allocation failures from leaving KV/capture state partially updated. Validation passed after the final rebase: `cargo check -p onnx-genai-ort`, 22/22 crate library tests, and the four KV bucket tests. Commit `deea1ab` was force-with-lease pushed only to `fix/cuda-decode-kv-capacity`.
+
+
+<!-- merged from mariette-attention-rereview.md -->
+
+### 2026-07-18: Approve CUDA Attention concat-geometry revision
+**By:** Mariette
+**What:** 🟢 APPROVE commit `f57e35` for landing as-is.
+**Why:** `present_key` uses key past/current/total geometry, while `present_value` independently uses value past/current/total geometry and `v_head_size`. Equal final sequence lengths remain required, matching the CPU `concat_cache` behavior while allowing different key/value past-current splits. Output buffers remain correctly sized, and the masking, GQA/layout, and deterministic softmax logic is unchanged. The regression directly checks `present_value` contents and failed against the pre-fix kernel (`[100, 200, 0, 300, 400]` vs `[100, 200, 300, 400, 500]`). Opset-24 nonpad masking/causal-offset/v23 rejection and non-default scale parity are meaningfully covered. Required gate: **211 passed, 0 failed, 0 ignored**.
+
+
+<!-- merged from mariette-attention-review.md -->
+
+### 2026-07-18: Reject GPU-native standard Attention
+**By:** Mariette
+**What:** 🔴 REJECT commit `ffd231d`. Ash is locked out; **Deckard** should revise.
+**Why:** `standard_attention.rs:621` derives `past_seq` only from `past_key`, then `:895` passes that key length into the `present_value` `build_kv` launch even though `:682` separately permits a different past/current V split with the same total length. The prior CPU code concatenated K and V using their own past lengths. A focused GPU probe with K split 2+1 and V split 1+2 produced present V `[100, 0, 200]` instead of `[100, 200, 300]`.
+
+The new tests also leave real semantic paths uncovered: there is no opset-24 `nonpad_kv_seqlen` test (per-batch negative causal offsets, unconditional pad frontier, v23 rejection, or past-cache mutual exclusion), and no explicit `scale` test. These omissions fail the requested semantic gate.
+
+Mask composition, GQA mapping, ordinary 3D/4D layout, equal-split past/present, qk modes, fully-masked rows, and deterministic fixed-order reductions otherwise match the prior reference in the reviewed paths.
+
+**Gate:** `STATE_BACKEND=local CARGO_TARGET_DIR=/home/justinchu/target-mariette-attn cargo test -p onnx-runtime-ep-cuda` passed, including all 16 `standard_attention_gpu` tests. The focused cache-split parity probe failed as described above; its temporary test file was removed.
+
+
+<!-- merged from newt-pr25.md -->
+
+### 2026-07-18: ORT plugin registration state is process-global
+**By:** Newt
+**What:** Track plugin registration paths and discovered provider names in a process-global registry, and serialize registration with EP-device diff discovery across `Environment` instances.
+**Why:** ORT plugin-library registration is process-global. Per-environment state could re-register the same handle or lose the provider name when another environment performed the first registration.
+
+
+<!-- merged from ripley-session-coverage.md -->
+
+# Executor edge-case coverage
+
+- **Commit:** `71b859d0174fad6b1e7c10cf1d2cc8038fdea0ad`
+- **Coverage:** executor source lines were **77.55% (3310/4268)** before and **77.55% (3310/4268)** after; the new public API regressions exercise already-covered execution seams, so the source-line percentage did not move. Total source coverage remains **79.06%**.
+- **Tests added:**
+  - reverse-inserted dependency DAG executes in deterministic topological order across repeated planning/runs;
+  - cyclic graph fails with `GraphError::CycleDetected` rather than constructing a partial plan;
+  - initializer reused as a node output is rejected, protecting immutable weight storage.
+- **Validation:** `cargo test -p onnx-runtime-session` passed; targeted `--test executor` passed (23 tests).
+- **Bug found:** none.
+
+
+<!-- merged from spunkmeyer-pr20.md -->
+
+### 2026-07-18: PyO3 0.29 migration for onnx-runtime-python
+**By:** Spunkmeyer
+**What:** Migrated GIL acquisition/release to `Python::attach`/`Python::detach`, replaced deprecated downcasts with `Bound::cast`/`cast_into`, updated interpreter initialization and owned-pointer construction, and enabled `pyo3/extension-module` only in maturin wheel builds.
+**Why:** PyO3 0.29 removed the old APIs. Keeping `extension-module` out of ordinary Cargo builds preserves wheel behavior while allowing the Rust unit-test harness to link libpython successfully.
+
+
+<!-- merged from vasquez-pr25-review.md -->
+
+# Vasquez review — PR #25 global ORT plugin registration
+
+## Verdict
+
+🔴 **REJECT**
+
+### Blocking: the static cache outlives ORT's registration state
+
+`registered_ep_libraries()` is process-static (`env.rs:16-20`), but ORT 1.27's
+global `OrtEnv` is reference-counted and destroyed when the last `Environment`
+calls `ReleaseEnv`. Destruction also destroys the ORT environment-owned plugin
+factories/devices. The Rust map is never cleared.
+
+Consequently:
+
+1. Environment A registers a plugin and caches its provider.
+2. A is dropped as the last live environment; ORT unloads that registration.
+3. Environment B is created later with a fresh ORT environment.
+4. `register_execution_provider_library` returns `Ok(false)` from stale Rust
+   state, so the plugin is not registered in B's ORT environment.
+5. B reads the stale provider name, but `GetEpDevices` has no corresponding
+   devices, and session setup fails.
+
+This is a normal sequential-engine lifecycle, not merely a shutdown edge case.
+It also conflicts with the repository's established invariant that the ORT
+environment owns the plugin factory (`crates/onnx-genai-engine/src/engine.rs:
+333-338`).
+
+**Required fix:** Deckard must tie the registration/cache lifetime to the live
+ORT environment generation. For example, serialize Rust `Environment`
+creation/drop with an active-environment count and clear registration state
+when the final wrapper releases ORT, or retain a canonical process-lifetime ORT
+environment reference. Add a drop-last-environment → create-new-environment →
+register-same-plugin regression test.
+
+### Other review results
+
+- The discovery mutex prevents the checked append path's registration TOCTOU;
+  provider names are visible across concurrently live `Environment` wrappers.
+- No concrete lock-order inversion was found. Both mutex poison cases return an
+  error rather than deadlocking, although plugin DLL loading occurs while the
+  Rust registration mutex is held.
+- Windows `ORTCHAR_T` UTF-16 handling is preserved.
+- The added test manually inserts into the Rust map. It does not perform real
+  ORT registration/device-diff discovery, exercise concurrent callers, or test
+  environment destruction/recreation. The test itself passes.
+
+Revision owner: **Deckard** (Newt is locked out for this revision).
+
+
+<!-- merged from vasquez-test-quality.md -->
+
+### 2026-07-18: Test-quality regressions for BatchNorm, Mod, and loader cycles
+**By:** Vasquez
+**What:** Added tests that (1) run opset-15 BatchNormalization with `training_mode=1` and three declared outputs, asserting Y retains X's shape/dtype while unresolved training statistics are not fabricated; (2) run bf16 `Mod` with `fmod=1`, comparing f32-computed and bf16-rounded remainders and checking a negative dividend preserves its sign; and (3) load a protobuf graph with a two-node data-dependency cycle through the public bytes-loading API, asserting its `GraphBuild` error reports `CycleDetected`.
+**Why:** These paths previously lacked direct regression coverage for multi-output graceful degradation, bf16 promotion semantics, and structural validation that occurs only after IR graph construction.
+
+No real bug was surfaced: all three regression tests pass against the current implementation.
+
+
+<!-- merged from wierzbowski-pr20-review.md -->
+
+### 2026-07-18: PyO3 0.23 → 0.29 API migration review
+**By:** Wierzbowski
+**What:** 🟢 APPROVE PR #20 (`5ee76ea`, author Spunkmeyer).
+**Why:** The migration preserves the required GIL, checked-cast, and FFI ownership semantics.
+
+## Safety review
+
+- All 3 `Python::with_gil` replacements are correct. PyO3 0.29 explicitly renamed this API to `Python::attach`; it attaches the thread and acquires/re-borrows the GIL. The two DLPack guard drops and the streaming callback therefore still execute Python-sensitive work while attached.
+- All 4 `py.allow_threads` replacements are correct. `Python::detach` explicitly releases the GIL for the closure and reacquires it afterward. The streaming path correctly reattaches only around the Python callback.
+- All 13 `downcast` / `downcast_into` replacements remain checked and fallible. `Bound::cast` and `cast_into` call `PyTypeCheck::type_check` and return `Result`; only the separately named `cast_unchecked` APIs are unchecked.
+- `Python::initialize()` is the direct replacement for `prepare_freethreaded_python()`. Both implementations call `Py_InitializeEx(0)` when needed and then `PyEval_SaveThread()`.
+- Both pointer conversions are ownership-correct. Each pointer comes directly from successful `PyCapsule_New`, which returns a new/owned reference. `Bound::from_owned_ptr` consumes that owned reference without incrementing it, and `.unbind()` transfers the same ownership into `Py<PyAny>` without an extra incref/decref. The null paths release only the separately allocated DLPack managed tensor and fetch the Python exception. No borrowed pointer is passed to `from_owned_ptr`, and refcount balance is unchanged from the former `Py::<PyAny>::from_owned_ptr`.
+
+## Verification
+
+- `cargo test --locked -p onnx-runtime-python --lib`: 19 passed.
+- Built the abi3 wheel with maturin successfully, confirming the `extension-module` feature placement.
+- Installed the wheel into an isolated review venv and ran `test_dlpack.py`: 41 passed, including off-thread DLPack deleter/GIL coverage.
+- Focused API/eager/genai tests: 26 passed, 2 deselected.
+
+## Non-blocking observations
+
+- PyO3 0.29 `Python::attach` deliberately panics during interpreter shutdown; this is safer than attempting an invalid late attachment, but background-owned tensors must still not outlive the interpreter.
+- A broader API test run exposed one pre-existing stale expectation: Float16 `Cast` now succeeds although the test expects an unsupported-kernel error. It is unrelated to this PyO3-only migration.
+
+
+
+<!-- merged from deckard-pr25-fix.md (late arrival) -->
+
+### 2026-07-18: Clear plugin registration state with the last ORT environment
+**By:** Deckard
+**What:** Track live `onnx_genai_ort::Environment` wrappers under a process-global lifecycle mutex. The last `ReleaseEnv` clears the plugin registration/provider-name cache before another `CreateEnv` can proceed.
+**Why:** ORT 1.27 destroys environment-owned plugin factories and devices when its final environment reference is released. Generation-scoped cache state prevents a later fresh ORT environment from incorrectly reusing stale registration metadata, while preserving sharing between concurrently live environments.
+
+
+<!-- merged from lambert-kimi-k3-readiness.md (late arrival) -->
+
+### 2026-07-18: Treat KDA, MLA, and CSA as separate runtime state kinds
+**By:** Lambert
+**What:** Reuse CSA's versioned state/operator lifecycle, standard Attention/RoPE as fallback oracles, and QMoE/block-dequant internals, but implement KDA and Gated MLA as distinct semantic operators. Keep K3 MTP conditional until the released package verifies it.
+**Why:** Current CPU CSA is DeepSeek-specific ratio-4/128 temporal compression, while public KDA uses gated recurrent matrix state and MLA uses learned low-rank latent KV. Conflating them would freeze an incorrect cache ABI before K3 weights and the technical report arrive on or before 2026-07-27.
+

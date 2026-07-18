@@ -136,3 +136,5 @@ Authored native Engine/server backend integration in `66ec4b8`; Holden rejected 
 - The correction closed Sapper's multi-device/sharding proto landing; Bryant 🟢 approved.
 
 - 2026-07-18 Scribe: Reshape/Split and RoPE fixes landed; final RoPE validation commit 74a891b.
+
+- 2026-07-18: Fixed Attention present-value geometry; continuing the PR #25 lifecycle fix.

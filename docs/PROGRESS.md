@@ -462,3 +462,7 @@ Coverage-uplift directive ("test coverage 要提上来 这种错误最好测试�
 **Coverage bug-hunt scoreboard (5 bugs):** TopK out-of-range-axis clamp; ArgReduce/Transpose/Unsqueeze/Gather clamp+duplicate-axis family; Reshape multiple-`-1`; Reshape zero-product-`-1` fabrication; Split non-positive `num_outputs`. Root cause captured as a repository memory (handlers must use `checked_axis`+`Invalid`, never clamp via `norm_axis`).
 
 - **IN FLIGHT (2026-07-18):** GPU-native standard `Attention` kernel (Ash, opus-4.8) — the bigger host-staged perf blocker; converting the full SDPA (GQA, KV-cache concat, causal/pad/float/bool masks, softcap, 4 outputs, qk-output modes) to on-device NVRTC with reference-parity tests.
+
+## 2026-07-18 — PR triage (6 PRs) + GPU-native Attention + CI fix
+
+GPU-native standard Attention landed, including the present-value cache-geometry correction. Fixed red CI by installing numpy/onnxscript for projection-fusion tests. Merged PRs #20, #23, #26, #27, and #28; #25 remains in review-fix. DeepSeek CUDA SparseKvGather and KIMI readiness work kicked off.
