@@ -11,7 +11,7 @@ devices. The no-model suite needs no ONNX Runtime model or GPU:
 
 Model scenarios are gated by `bench-ort` and use the committed tiny fixtures:
 
-- end-to-end generation tokens/second (`tiny-llm`)
+- end-to-end generation tokens/second (`tiny-llm-scatter`)
 - prefill latency by context length (`tiny-llm-scatter`)
 - static batch throughput by batch size (`tiny-llm-scatter`)
 - continuous (dynamic) batch throughput by admission cap `max_batch` (`tiny-llm-scatter`)
