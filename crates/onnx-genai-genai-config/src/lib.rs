@@ -343,12 +343,24 @@ mod tests {
         // past_present_share_buffer. It must be treated as share-buffer eligible
         // and labelled as the GQA op, not excluded as plain multi-head attention.
         let mut cfg = qwen_config();
+        // Pin both head counts explicitly so the kv == attn (full MHA) condition
+        // holds regardless of the qwen_config() fixture's defaults.
+        cfg.model.decoder.num_attention_heads = Some(14);
         cfg.model.decoder.num_key_value_heads = Some(14);
         let md = cfg.to_inference_metadata(Some("float16")).unwrap();
-        assert!(!cfg.is_group_query_attention(), "kv == attn is not strict GQA");
-        assert!(cfg.uses_group_query_attention_op(), "kv == attn still uses the GQA op");
+        assert!(
+            !cfg.is_group_query_attention(),
+            "kv == attn is not strict GQA"
+        );
+        assert!(
+            cfg.uses_group_query_attention_op(),
+            "kv == attn still uses the GQA op"
+        );
         assert!(cfg.shared_kv_buffer_supported());
-        assert!(md.kv_cache.is_some(), "share-buffer KV dtype must be emitted");
+        assert!(
+            md.kv_cache.is_some(),
+            "share-buffer KV dtype must be emitted"
+        );
         assert_eq!(
             md.model.and_then(|m| m.attention).map(|a| a.attention_type),
             Some("group_query_attention".to_string())
