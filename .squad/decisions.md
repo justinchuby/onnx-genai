@@ -1013,3 +1013,10 @@ Also rechecked standard `Attention`: the landed omitted-optional gate remains co
 | Expand | fixed-width input; int64 shape | Matches the ONNX shape-input contract and CUDA movement kernel. |
 
 **Why:** The shared helper is correctly limited to standard domains, is called only after registry lookup, checks metadata arity before indexing, and preserves RoPE's omitted optional input contract. New factory validation gives actionable errors instead of coercing the audited attributes; CUDA-graph compatibility methods were unchanged. No GLM over-rejection or remaining audited dtype/attribute claim-then-fail path was found. The CUDA EP suite passed 238 tests and failed 0 (missing-cuDNN failures were not present).
+
+---
+
+### 2026-07-18: Reserve the nxrt PyPI name with an sdist-only publish
+**By:** Deckard
+**What:** Added an independent `publish-pypi-sdist` job to `publish.yml` that publishes only the `nxrt` source distribution through the `pypi` environment using PyPI Trusted Publishing. The initial burned version is `0.1.0.dev2`. Workflow dispatch now has opt-in `publish_crates` and `publish_pypi` inputs.
+**Why:** A reliable sdist-only release reserves the PyPI name without coupling it to crates.io publication or prematurely publishing platform wheels; wheels will ship later through `wheels.yml`.
