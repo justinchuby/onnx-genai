@@ -174,6 +174,12 @@ pub struct DecodeSession<'a> {
     /// `graph_capture() == true`, so graceful degradation persists per decode
     /// loop without mutating the shared session.
     graph_capture_disabled: bool,
+    /// On-device argmax for the captured greedy path. `Some` only when the
+    /// captured `logits` buffer is CUDA device-resident (see
+    /// [`CaptureState::logits_on_device`]); it keeps the full vocabulary on the
+    /// GPU and reduces it there, so no per-token full-vocab host copy occurs.
+    #[cfg(feature = "cuda")]
+    cuda_argmax: Option<crate::cuda_argmax::CudaArgmax>,
 }
 
 /// Outcome of a single decode step: either the logits Value (default path) or,
@@ -198,6 +204,14 @@ struct CaptureState {
     /// keeping the captured-decode step O(1) rather than O(context). Reset to 0
     /// by [`DecodeSession::reset_captured_mask`] on rewind/reset.
     mask_valid_len: usize,
+    /// Vocabulary width of the `logits [1, 1, vocab]` output.
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    vocab: usize,
+    /// Whether `logits` is CUDA device-resident (allocated on the session's CUDA
+    /// allocator). When set, the greedy fast path reduces it with an on-device
+    /// argmax kernel instead of copying the full vocabulary to the host.
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    logits_on_device: bool,
 }
 
 impl Drop for DecodeSession<'_> {
@@ -290,6 +304,8 @@ impl<'a> DecodeSession<'a> {
             capture_bound: false,
             capture_graph_id: None,
             graph_capture_disabled: false,
+            #[cfg(feature = "cuda")]
+            cuda_argmax: None,
         };
         if mode == DecodeKvMode::SharedBuffer {
             let max_length = options.max_length.ok_or_else(|| {
@@ -614,6 +630,22 @@ impl<'a> DecodeSession<'a> {
         // tensor. Otherwise snapshot it into an owned Value so the caller can
         // consume it while the captured buffer is reused next step.
         let _extract_span = crate::prof_span!("ort.extract_outputs");
+        #[cfg(feature = "cuda")]
+        if cap.logits_on_device {
+            let dtype = cap.logits.dtype();
+            let ptr = cap.logits.data_ptr_addr()?;
+            let argmax = self
+                .cuda_argmax
+                .as_ref()
+                .expect("cuda argmax initialized for device logits");
+            let result = if argmax_only {
+                argmax.argmax(dtype, ptr, cap.vocab).map(StepLogits::Token)
+            } else {
+                device_logits_to_host_value(argmax, dtype, ptr, cap.vocab).map(StepLogits::Value)
+            };
+            self.capture = Some(cap);
+            return result;
+        }
         let result = if argmax_only {
             cap.logits.argmax_last_row().map(StepLogits::Token)
         } else {
@@ -656,7 +688,49 @@ impl<'a> DecodeSession<'a> {
         let input_ids = Value::from_vec_i64(vec![0i64], &[1, 1])?;
         let position_ids = Value::from_vec_i64(vec![0i64], &[1, 1])?;
         let attention_mask = Value::from_vec_i64(vec![0i64; mask_len], &[1, mask_len as i64])?;
-        let logits = Value::empty(&[1, 1, vocab], logits_info.dtype)?;
+        let logits_dtype = logits_info.dtype;
+        let vocab_usize = usize::try_from(vocab).map_err(|_| {
+            OrtError::InvalidArgument("logits vocab dim is negative".into())
+        })?;
+        // Ends the immutable borrow of `self.session` (`logits_info`) before the
+        // device-argmax setup below borrows `self` mutably.
+        let _ = logits_info;
+
+        // Keep logits on the CUDA device when the session runs on CUDA, so the
+        // captured greedy path can argmax the full vocabulary on-device (one
+        // 4-byte token id returns) instead of ORT copying it host-side every
+        // token. `kv_allocator` is the retained CUDA device allocator (Some only
+        // for device EPs in shared-buffer mode); reuse it so it outlives the
+        // logits `Value` (mirroring the shared KV buffers).
+        #[cfg_attr(not(feature = "cuda"), allow(unused_mut))]
+        let mut logits_on_device = false;
+        let logits;
+        #[cfg(feature = "cuda")]
+        {
+            // Default on; `ONNX_GENAI_DEVICE_ARGMAX=0` forces the host argmax
+            // path (CPU logits + full-vocab device->host copy) for A/B testing.
+            let device_argmax_enabled = std::env::var("ONNX_GENAI_DEVICE_ARGMAX")
+                .map(|v| v != "0")
+                .unwrap_or(true);
+            if device_argmax_enabled && self.session.cuda_device_id().is_some() {
+                if let Some(allocator) = self.kv_allocator.as_ref() {
+                    logits = Value::empty_in(&[1, 1, vocab], logits_dtype, allocator)?;
+                    logits_on_device = true;
+                } else {
+                    logits = Value::empty(&[1, 1, vocab], logits_dtype)?;
+                }
+            } else {
+                logits = Value::empty(&[1, 1, vocab], logits_dtype)?;
+            }
+            if logits_on_device && self.cuda_argmax.is_none() {
+                let device = self.session.cuda_device_id().unwrap_or(0).max(0) as usize;
+                self.cuda_argmax = Some(crate::cuda_argmax::CudaArgmax::new(device)?);
+            }
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            logits = Value::empty(&[1, 1, vocab], logits_dtype)?;
+        }
 
         // Claim a process-unique annotation id so this session captures its own
         // graph rather than re-capturing under an id ORT may still hold from a
@@ -670,6 +744,8 @@ impl<'a> DecodeSession<'a> {
             logits,
             mask_len,
             mask_valid_len: 0,
+            vocab: vocab_usize,
+            logits_on_device,
         });
         Ok(())
     }
@@ -3158,6 +3234,29 @@ fn empty_past_value(info: &TensorInfo) -> Result<Value> {
 
 fn is_logits_output(name: &str) -> bool {
     name.to_ascii_lowercase().contains("logits")
+}
+
+/// Copy a device-resident `logits [1, 1, vocab]` row back into a host CPU
+/// [`Value`] of the same dtype, for the non-greedy path that still consumes the
+/// full vocabulary. This mirrors ORT's implicit device->host logits copy that
+/// the on-device path otherwise skips.
+#[cfg(feature = "cuda")]
+fn device_logits_to_host_value(
+    argmax: &crate::cuda_argmax::CudaArgmax,
+    dtype: DataType,
+    dev_ptr: usize,
+    vocab: usize,
+) -> Result<Value> {
+    let host = Value::empty(&[1, 1, vocab as i64], dtype)?;
+    let nbytes = vocab
+        .checked_mul(dtype.size_of())
+        .ok_or_else(|| OrtError::InvalidArgument("logits byte size overflow".into()))?;
+    let base = host.data_ptr_addr()? as *mut u8;
+    // SAFETY: `host` is a freshly-allocated CPU tensor holding exactly `nbytes`
+    // bytes; the slice aliases only that storage for the duration of the copy.
+    let dst = unsafe { std::slice::from_raw_parts_mut(base, nbytes) };
+    argmax.copy_row_to_host(dtype, dev_ptr, vocab, dst)?;
+    Ok(host)
 }
 
 /// Copy an OrtValue's tensor data onto host-owned Rust buffers, producing a

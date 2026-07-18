@@ -13,11 +13,20 @@ default = []
 # `cuda` pulls in `libloading` so the shared-KV grow path can dynamically load
 # cudart and issue device-to-device copies (see `src/cuda_rt.rs`). It is not
 # linked at build time, keeping non-CUDA builds free of a CUDA toolkit.
-cuda = ["dep:libloading"]
+#
+# `cuda` also pulls in cudarc (driver + NVRTC, dynamically loaded — no build-time
+# CUDA toolkit) so the captured greedy decode can keep logits on-device and run
+# an on-device argmax kernel instead of copying the full vocabulary host-side.
+cuda = ["dep:libloading", "dep:cudarc"]
 
 [dependencies]
 half = { version = "2", features = ["use-intrinsics"] }
 libloading = { version = "0.8", optional = true }
+# Only compiled under the `cuda` feature. `dynamic-loading` dlopen's the driver
+# (nvcuda) and NVRTC at runtime, so `cargo build` needs no CUDA toolkit. We use
+# the driver + NVRTC surface only (no cuBLAS/cuDNN). Pinned to the CUDA 12 API
+# set to match the ORT CUDA 12 runtime this crate loads.
+cudarc = { version = "0.19", default-features = false, features = ["std", "driver", "nvrtc", "dynamic-loading", "cuda-12060"], optional = true }
 minijinja = { version = "2", features = ["json"] }
 onnx-genai-metadata = { workspace = true }
 onnx-genai-runtime-config = { workspace = true }

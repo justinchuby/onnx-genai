@@ -12,6 +12,8 @@ pub mod binding;
 pub mod chat_template;
 #[cfg(feature = "cuda")]
 pub(crate) mod cuda_rt;
+#[cfg(feature = "cuda")]
+pub(crate) mod cuda_argmax;
 pub mod decode;
 pub mod eagle3;
 pub mod env;
