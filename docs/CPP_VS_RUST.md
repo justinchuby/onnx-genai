@@ -26,12 +26,14 @@ not as products anyone is asking ORT to adopt. Every number below is reproducibl
   pure-Rust ORT plugin EP published to crates.io + PyPI that runs under an unmodified ONNX Runtime.
 - The honest cost: **452 `unsafe` blocks**, almost all at C-ABI / CUDA boundaries, plus Rust's
   compile times and a less mature ML-kernel ecosystem.
-- **Agentic development** is a first-class consideration here (§6): Rust's compiler-as-oracle feedback
-  loop makes AI agents converge fast and blocks whole classes of latent bug — but today's agents are
-  more fluent in C++ and in the existing ORT idioms. Both effects are real.
+- **Agentic development** is a first-class consideration here (§6–§8): Rust's compiler-as-oracle
+  feedback loop makes AI agents converge fast and blocks whole classes of latent bug, it makes
+  human-defined contracts *machine-enforceable* for agent implementations, and it shrinks what a
+  reviewer must actually check — but today's agents are more fluent in C++ and in the existing ORT
+  idioms. All of these are real.
 
-If you read nothing else, read §3 (where C++ still wins), §6 (agentic development), and §7 (the
-adoption path that doesn't bet the runtime).
+If you read nothing else, read §3 (where C++ still wins), §6–§8 (agentic development, contract-first
+workflow, and reviewing agent-authored Rust), and §9 (the adoption path that doesn't bet the runtime).
 
 ---
 
@@ -135,7 +137,7 @@ If we pretend these away, the experts are right to ignore us.
 5. **Rewrite risk and opportunity cost.** ORT is millions of lines of *correct, fast, shipping* C++.
    "Rewrite it" is, at face value, the single most classic engineering mistake there is. A Rust ORT
    that is 95% as fast and 100% rewritten is a **strategic loss**, not a win. The only defensible
-   version is incremental and reuse-heavy (see §7).
+   version is incremental and reuse-heavy (see §9).
 
 6. **The ORT team's expertise is in C++.** ORT's deepest experts are C++ experts with years of context
    in *this specific codebase*. Ramping a team on Rust's borrow checker, async, and macro ecosystem is
@@ -244,7 +246,86 @@ compiler-as-oracle advantage does not.
 
 ---
 
-## 7. An adoption path that doesn't bet the runtime
+## 7. The workflow you actually want: contract-first, agent-implemented, machine-verified
+
+The target operating model is: **a team member specifies the *contract* and the *expected behavior*;
+an agent writes the implementation; the toolchain verifies the implementation against the contract.**
+Rust is an unusually strong substrate for exactly this division of labor, because in Rust the contract
+is *machine-checked*, not aspirational.
+
+- **The contract lives in the type system, not a comment.** A trait signature, a `Result<T, ErrKind>`,
+  a newtype that enforces an invariant, an exhaustive `enum`, `#[must_use]` — these are promises the
+  agent's body is *forced* to honor. A C++ header declares a signature but cannot stop the body from
+  violating the invariant with a `reinterpret_cast` or a raw pointer; a Rust signature constrains what
+  the implementation can even express. When the human owns the types, the agent cannot silently break
+  the interface.
+- **Expected behavior lives in oracles the agent must pass.** In the experiment, `PagedAttention` was
+  specified by a numpy port of ORT's *own* reference kernel; the agent iterated the MLX implementation
+  until it matched the oracle to ~1e-4 — the reviewer never had to read the MLX plumbing line by line,
+  because they defined the acceptance test. `QMoE` used ORT's CPU kernel as ground truth. Op-claim
+  validity is a typed `ClaimResult`, so "is this input admissible" is a value the compiler tracks.
+- **Verification is automatic and total.** The agent's PR is not "trust me"; it is "the contract you
+  wrote compiles, and the behavior you specified passes" — build + `clippy` + the conformance suite.
+  That is precisely the human-defines / agent-implements / machine-verifies loop you want, and Rust
+  makes the "contract" half enforceable at compile time rather than a convention policed in review.
+- **The agent optimizes *within* the contract.** Choosing the fused-vs-eager path, the chunked
+  algorithm, the shapeless-vs-shape-keyed capture — the agent explores the implementation space (this
+  is where "optimize per the latest research" happens) while the human owns the interface and the
+  acceptance oracle. The contract is the guardrail that makes autonomous exploration safe.
+
+This maps cleanly onto contract/spec-first development with property-based testing — a workflow that is
+*more* effective in a language where the compiler can reject any implementation that doesn't fit the
+declared shape.
+
+---
+
+## 8. "Can we review Rust we don't know?" — the reviewability concern, honestly
+
+A colleague's worry — *"I'm not fluent in Rust, so I can't effectively review it"* — is the right
+question to ask about machine-authored code at volume. Here is the honest answer, both sides.
+
+**Why the concern is smaller than it feels:**
+
+1. **The review model changes.** In *safe* Rust the compiler already guarantees the absence of
+   use-after-free, double-free, data races, buffer overflows, and uninitialized reads. That entire
+   category — which consumes a large fraction of C++ review attention — is simply *off the table*.
+   The reviewer's budget shifts to the one thing that matters: **does this implementation satisfy the
+   contract and the expected behavior you specified?** That is a higher-level review, anchored on the
+   contract the reviewer themselves wrote — and it is largely language-agnostic.
+2. **The part that truly needs Rust+FFI expertise is small and labeled.** It's the `unsafe` blocks —
+   ~0.4% of the code, greppable, at named boundaries. Point your scarce deep-Rust review there and let
+   the compiler own the rest.
+3. **Gate before review, not during.** Require agent PRs to be green build + `clippy`-clean +
+   conformance-passing in CI. The human then reviews a *pre-validated* diff; the machine has already
+   rejected the mechanical mistakes.
+4. **Reading Rust is much easier than writing it.** A reviewer never fights the borrow checker — the
+   compiler already resolved the lifetimes. Explicit types, `Result`, and exhaustive `match` make
+   intent unusually legible; idiomatic Rust is arguably *more* reviewable than template/overload-heavy
+   modern C++, where the behavior of a line can depend on invisible ADL and SFINAE.
+5. **Agent-assisted review closes the fluency gap now.** The same compiler/clippy signal that guides
+   the authoring agent, plus an agent that summarizes a diff, explains a lifetime, or answers "does
+   this satisfy the contract," lets a C++-fluent engineer review Rust effectively *today* while ramping
+   their own fluency.
+
+**The honest costs:**
+
+- Reviewing `unsafe` FFI genuinely requires Rust+FFI skill. It's a small, concentrated capability, but
+  it must exist on the team.
+- A reviewer new to Rust idioms *is* slower at first. This is a real ramp cost — mitigated by the
+  shrunken surface (points 1–2) and the automated gates (point 3), but not zero.
+- Macro-heavy or trait-bound-heavy code can be opaque to a newcomer. That's a reason to hold
+  agent-authored code to an idiomatic, macro-light standard (enforced by `clippy` and review norms),
+  which is good practice regardless.
+
+**Net:** the thing you *can't* review well in unfamiliar Rust — memory safety — is exactly the thing
+the compiler already reviewed for you. The thing you *must* review — does the implementation meet the
+contract and behave correctly — is language-agnostic and anchored on the contract you wrote. The
+unfamiliarity cost is real, but it is concentrated in the small `unsafe` surface and the initial ramp,
+not spread across every line the way C++'s memory-safety review burden is.
+
+---
+
+## 9. An adoption path that doesn't bet the runtime
 
 This is the part to actually argue about. The path is **strangler-fig, not big-bang**:
 
@@ -268,7 +349,7 @@ approve a multi-year rewrite; they approve one crate at a time, each behind a co
 
 ---
 
-## 8. Recommendation, and what would change it
+## 10. Recommendation, and what would change it
 
 **Recommendation (for discussion, not a mandate):** treat Rust as the default for *new* orchestration
 and GenAI components and for *new* plugin EPs; where the runtime is reimplemented, do it incrementally
