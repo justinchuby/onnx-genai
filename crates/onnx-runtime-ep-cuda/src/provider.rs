@@ -187,6 +187,12 @@ impl ExecutionProvider for CudaExecutionProvider {
         {
             return KernelMatch::unsupported(reason);
         }
+        if (op.domain.is_empty() || op.domain == "ai.onnx")
+            && let Some(reason) =
+                crate::kernels::standard_claims::unsupported_reason(op, input_dtypes)
+        {
+            return KernelMatch::unsupported(reason);
+        }
         if matches!(
             op.op_type.as_str(),
             "Equal" | "Greater" | "Less" | "GreaterOrEqual" | "LessOrEqual"

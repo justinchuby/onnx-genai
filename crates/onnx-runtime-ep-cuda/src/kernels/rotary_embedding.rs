@@ -173,21 +173,30 @@ pub struct RotaryEmbeddingFactory {
 
 impl KernelFactory for RotaryEmbeddingFactory {
     fn create(&self, node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
-        let interleaved = node
-            .attr("interleaved")
-            .and_then(|a| a.as_int())
-            .unwrap_or(0)
-            != 0;
-        let num_heads = node
-            .attr("num_heads")
-            .and_then(|a| a.as_int())
-            .unwrap_or(0)
-            .max(0) as usize;
-        let rotary_embedding_dim = node
-            .attr("rotary_embedding_dim")
-            .and_then(|a| a.as_int())
-            .unwrap_or(0)
-            .max(0) as usize;
+        let interleaved = match node.attr("interleaved") {
+            None | Some(onnx_runtime_ir::Attribute::Int(0)) => false,
+            Some(onnx_runtime_ir::Attribute::Int(1)) => true,
+            Some(_) => {
+                return Err(EpError::KernelFailed(
+                    "RotaryEmbedding: interleaved must be 0 or 1".into(),
+                ));
+            }
+        };
+        let non_negative = |name: &str| -> Result<usize> {
+            match node.attr(name) {
+                None => Ok(0),
+                Some(attribute) => attribute
+                    .as_int()
+                    .and_then(|value| usize::try_from(value).ok())
+                    .ok_or_else(|| {
+                        EpError::KernelFailed(format!(
+                            "RotaryEmbedding: {name} must be a non-negative integer"
+                        ))
+                    }),
+            }
+        };
+        let num_heads = non_negative("num_heads")?;
+        let rotary_embedding_dim = non_negative("rotary_embedding_dim")?;
         Ok(Box::new(RotaryEmbeddingKernel {
             runtime: self.runtime.clone(),
             interleaved,

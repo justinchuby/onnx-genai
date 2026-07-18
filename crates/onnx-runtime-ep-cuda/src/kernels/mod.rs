@@ -50,6 +50,7 @@ pub mod shape;
 pub mod softmax;
 pub mod sparse_kv_gather;
 pub mod standard_attention;
+pub(crate) mod standard_claims;
 pub mod topk;
 pub mod where_op;
 

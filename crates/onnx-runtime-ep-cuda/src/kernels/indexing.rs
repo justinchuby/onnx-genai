@@ -306,17 +306,25 @@ pub struct ScatterElementsFactory {
 
 impl KernelFactory for ScatterElementsFactory {
     fn create(&self, node: &Node, _: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
-        let reduction = match node.attr("reduction").and_then(Attribute::as_str) {
-            None | Some("none") => Reduction::None,
-            Some("add") => Reduction::Add,
-            Some("mul") => Reduction::Mul,
-            Some("max") => Reduction::Max,
-            Some("min") => Reduction::Min,
-            Some(value) => {
-                return Err(EpError::KernelFailed(format!(
-                    "cuda_ep ScatterElements: unsupported reduction {value:?}"
-                )));
-            }
+        let reduction = match node.attr("reduction") {
+            None => Reduction::None,
+            Some(attribute) => match attribute.as_str() {
+                Some("none") => Reduction::None,
+                Some("add") => Reduction::Add,
+                Some("mul") => Reduction::Mul,
+                Some("max") => Reduction::Max,
+                Some("min") => Reduction::Min,
+                Some(value) => {
+                    return Err(EpError::KernelFailed(format!(
+                        "cuda_ep ScatterElements: unsupported reduction {value:?}"
+                    )));
+                }
+                None => {
+                    return Err(EpError::KernelFailed(
+                        "cuda_ep ScatterElements: reduction must be a string".into(),
+                    ));
+                }
+            },
         };
         Ok(Box::new(ScatterElementsKernel {
             runtime: self.runtime.clone(),

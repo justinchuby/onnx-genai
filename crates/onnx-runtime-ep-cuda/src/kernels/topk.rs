@@ -55,11 +55,23 @@ pub struct TopKFactory {
 
 impl KernelFactory for TopKFactory {
     fn create(&self, node: &Node, _: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
+        let bool_attr = |name: &str, default: bool| -> Result<bool> {
+            match node.attr(name) {
+                None => Ok(default),
+                Some(attribute) => match attribute.as_int() {
+                    Some(0) => Ok(false),
+                    Some(1) => Ok(true),
+                    _ => Err(EpError::KernelFailed(format!(
+                        "cuda_ep TopK: {name} must be 0 or 1"
+                    ))),
+                },
+            }
+        };
         Ok(Box::new(TopKKernel {
             runtime: self.runtime.clone(),
             axis: node.attr("axis").and_then(|a| a.as_int()).unwrap_or(-1),
-            largest: node.attr("largest").and_then(|a| a.as_int()).unwrap_or(1) != 0,
-            _sorted: node.attr("sorted").and_then(|a| a.as_int()).unwrap_or(1) != 0,
+            largest: bool_attr("largest", true)?,
+            _sorted: bool_attr("sorted", true)?,
         }))
     }
 }

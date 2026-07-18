@@ -495,6 +495,14 @@ pub struct RmsNormFactory {
 
 impl KernelFactory for RmsNormFactory {
     fn create(&self, node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
+        if node
+            .attr("stash_type")
+            .is_some_and(|attribute| attribute.as_int() != Some(1))
+        {
+            return Err(EpError::KernelFailed(
+                "RMSNormalization: stash_type must be 1 (float)".into(),
+            ));
+        }
         let axis = node.attr("axis").and_then(|a| a.as_int()).unwrap_or(-1);
         let epsilon = node
             .attr("epsilon")

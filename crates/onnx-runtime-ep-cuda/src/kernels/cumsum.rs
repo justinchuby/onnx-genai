@@ -52,10 +52,19 @@ pub struct CumSumFactory {
 
 impl KernelFactory for CumSumFactory {
     fn create(&self, node: &Node, _: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
+        let bool_attr = |name: &str| -> Result<bool> {
+            match node.attr(name) {
+                None | Some(onnx_runtime_ir::Attribute::Int(0)) => Ok(false),
+                Some(onnx_runtime_ir::Attribute::Int(1)) => Ok(true),
+                Some(_) => Err(EpError::KernelFailed(format!(
+                    "cuda_ep CumSum: {name} must be 0 or 1"
+                ))),
+            }
+        };
         Ok(Box::new(CumSumKernel {
             runtime: self.runtime.clone(),
-            exclusive: node.attr("exclusive").and_then(|a| a.as_int()).unwrap_or(0) != 0,
-            reverse: node.attr("reverse").and_then(|a| a.as_int()).unwrap_or(0) != 0,
+            exclusive: bool_attr("exclusive")?,
+            reverse: bool_attr("reverse")?,
         }))
     }
 }

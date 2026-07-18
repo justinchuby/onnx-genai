@@ -1062,3 +1062,29 @@ fn supports_op_validates_ratio128_attention_bias_at_input_19() {
         "ratio-128 broadcastable f32 attention_bias at input 19 must remain claimed"
     );
 }
+
+#[test]
+fn supports_op_claims_omitted_ratio128_attention_bias() {
+    let Some(ep) = gpu() else { return };
+    let ape = HostTensor::f32(&[RATIO, DIM], &rows(0, RATIO, ape_value));
+    let norm = HostTensor::f32(&[DIM], &vec![0.8f32; DIM]);
+    let sink = HostTensor::f32(&[1], &[-0.375]);
+    let state = CsaState {
+        cache: HostTensor::zeros(DataType::Uint8, &[1, 0, STORED_WIDTH]),
+        carry: HostTensor::zeros(DataType::Float32, &[1, RATIO, 2, DIM]),
+    };
+    let inputs = ratio128_inputs(1, 0, 0, 1, 1, &ape, &norm, &sink, &state);
+    let (mut graph, node) = ratio128_node(&inputs, 0);
+    graph.node_mut(node).inputs.resize(20, None);
+    let (mut shapes, mut dtypes) = claim_metadata(&inputs);
+    shapes.resize(20, Vec::new());
+    dtypes.resize(20, DataType::Undefined);
+
+    assert!(
+        matches!(
+            ep.supports_op(graph.node(node), 1, &shapes, &dtypes, &[]),
+            KernelMatch::Supported { .. }
+        ),
+        "an omitted positional attention_bias must be treated as absent"
+    );
+}
