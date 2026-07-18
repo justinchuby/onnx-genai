@@ -14,8 +14,50 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 #[cfg(feature = "cuda")]
-use crate::device_sampler::{CudaSampler, DeviceSampleParams, DeviceSampler};
+#[cfg(feature = "cuda")]
+use crate::device_sampler::{CudaSampler, DeviceSampler};
 use crate::{DataType, IoBinding, MemoryInfo, OrtError, Result, Session, TensorInfo, Value};
+
+/// Parameters for one device sampling step.
+///
+/// Mirrors the device-portable subset of the engine's generation options.
+/// History-dependent processing (penalties, constraints, stop sequences) is
+/// applied host-side before/around this and is intentionally absent here.
+///
+/// `greedy` short-circuits to argmax and ignores every filter, since top-k /
+/// top-p / min-p / temperature are all monotonic and never change the argmax.
+///
+/// Defined unconditionally (not behind `cuda`) so the engine can construct it
+/// regardless of which compute backends are compiled in.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DeviceSampleParams {
+    /// Softmax temperature. `<= 0.0` or `1.0` means "no scaling".
+    pub temperature: f32,
+    /// Keep only the `top_k` highest-probability tokens. `0` disables.
+    pub top_k: usize,
+    /// Nucleus threshold in `(0, 1]`. `>= 1.0` disables.
+    pub top_p: f32,
+    /// Minimum probability relative to the max (`min_p * p_max`). `<= 0.0` disables.
+    pub min_p: f32,
+    /// Select the argmax token (ignore every filter and the RNG).
+    pub greedy: bool,
+    /// Uniform draw in `[0, 1)` used for the categorical pick when `!greedy`.
+    pub rng_value: f32,
+}
+
+impl DeviceSampleParams {
+    /// Pure greedy selection: argmax, no filters, no RNG.
+    pub fn greedy() -> Self {
+        Self {
+            temperature: 1.0,
+            top_k: 0,
+            top_p: 1.0,
+            min_p: 0.0,
+            greedy: true,
+            rng_value: 0.0,
+        }
+    }
+}
 
 /// Prompt and prefill runs use CUDA-graph annotation id `-1` (no capture) so
 /// only the fixed-shape decode step is captured and replayed. Each
@@ -376,6 +418,29 @@ impl<'a> DecodeSession<'a> {
             // The standard (non-captured) path returns a Value; reduce it here.
             StepLogits::Value(logits) => logits.argmax_last_row(),
         }
+    }
+
+    /// Run one incremental decode step and return the token id selected by the
+    /// device-portable sampling pipeline described by `params`.
+    ///
+    /// This is the sampling analogue of [`Self::step_argmax`]: when `params` is
+    /// greedy it is exactly the argmax fast path. Non-greedy device sampling
+    /// (temperature/top-k/top-p/min-p + categorical draw on-device) is landing
+    /// incrementally; until the device kernels are wired in, non-greedy requests
+    /// return an error so the engine can fall back to the host sampler.
+    pub fn step_sampled(
+        &mut self,
+        new_input_ids: &[i64],
+        attention_mask: &[i64],
+        position_ids: &[i64],
+        params: &DeviceSampleParams,
+    ) -> Result<u32> {
+        if params.greedy {
+            return self.step_argmax(new_input_ids, attention_mask, position_ids);
+        }
+        Err(OrtError::InvalidArgument(
+            "device sampled (non-greedy) decode not yet implemented".into(),
+        ))
     }
 
     fn step_dispatch(

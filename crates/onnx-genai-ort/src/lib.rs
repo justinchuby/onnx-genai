@@ -31,7 +31,8 @@ pub use binding::IoBinding;
 pub use chat_template::{ChatMessage, ChatRole, ChatTemplate};
 pub use decode::{
     BatchedDecodeSession, BatchedSharedBufferDecodeSession, BatchedStaticCacheDecodeSession,
-    DecodeKvMode, DecodeSession, DecodeSessionOptions, SharedBufferBatchOptions,
+    DecodeKvMode, DecodeSession, DecodeSessionOptions, DeviceSampleParams,
+    SharedBufferBatchOptions,
     StaticCacheBindingMode, StaticCacheBufferInfo, StaticCacheDecodeOptions,
     StaticCacheDecodeSession, StaticCacheSignature,
 };

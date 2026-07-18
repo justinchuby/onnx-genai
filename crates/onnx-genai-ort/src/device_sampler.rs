@@ -41,43 +41,7 @@ use cudarc::driver::{CudaContext, CudaFunction, CudaStream, LaunchConfig, PushKe
 use crate::error::{OrtError, Result};
 use crate::value::DataType;
 
-/// Parameters for one device sampling step.
-///
-/// Mirrors the device-portable subset of `GenerateOptions`. History-dependent
-/// processing (penalties, constraints, stop sequences) is applied host-side
-/// before/around this and is intentionally absent here.
-///
-/// `greedy` short-circuits to argmax and ignores every filter, since top-k /
-/// top-p / min-p / temperature are all monotonic and never change the argmax.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct DeviceSampleParams {
-    /// Softmax temperature. `<= 0.0` or `1.0` means "no scaling".
-    pub temperature: f32,
-    /// Keep only the `top_k` highest-probability tokens. `0` disables.
-    pub top_k: usize,
-    /// Nucleus threshold in `(0, 1]`. `>= 1.0` disables.
-    pub top_p: f32,
-    /// Minimum probability relative to the max (`min_p * p_max`). `<= 0.0` disables.
-    pub min_p: f32,
-    /// Select the argmax token (ignore every filter and the RNG).
-    pub greedy: bool,
-    /// Uniform draw in `[0, 1)` used for the categorical pick when `!greedy`.
-    pub rng_value: f32,
-}
-
-impl DeviceSampleParams {
-    /// Pure greedy selection: argmax, no filters, no RNG.
-    pub fn greedy() -> Self {
-        Self {
-            temperature: 1.0,
-            top_k: 0,
-            top_p: 1.0,
-            min_p: 0.0,
-            greedy: true,
-            rng_value: 0.0,
-        }
-    }
-}
+use crate::decode::DeviceSampleParams;
 
 /// Device-side token selection over logits that remain in device memory.
 ///
