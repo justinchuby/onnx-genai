@@ -21,10 +21,10 @@ not as products anyone is asking ORT to adopt. Every number below is reproducibl
 - It **is** an argument that the *orchestration* layers — IR, graph optimizer, partitioner, memory
   planner, session/EP glue, and the GenAI stack (KV cache, batching, sampling, serving) — are a
   natural fit for Rust, and that new components and new EPs are a low-risk place to start.
-- The evidence that this is executable: a proof-of-concept of **~119k lines of Rust across 27 crates,
-  1468 tests**, including a pure-Rust CPU EP with real kernels, a pure-Rust paged-KV cache, and a
-  pure-Rust ORT plugin EP published to crates.io + PyPI that runs under an unmodified ONNX Runtime.
-- The honest cost: **452 `unsafe` blocks**, almost all at C-ABI / CUDA boundaries, plus Rust's
+- The evidence that this is executable: a proof-of-concept of **~204k lines of Rust across 31 crates,
+  2,200+ tests**, including a pure-Rust CPU EP with real kernels, a pure-Rust paged-KV cache, and a
+  Rust-authored ORT plugin EP published to crates.io + PyPI that runs under an unmodified ONNX Runtime.
+- The honest cost: **~650 `unsafe` occurrences**, almost all at C-ABI / CUDA boundaries, plus Rust's
   compile times and a less mature ML-kernel ecosystem.
 - **Agentic development** is a first-class consideration here (§6–§8): Rust's compiler-as-oracle
   feedback loop makes AI agents converge fast and blocks whole classes of latent bug, it makes
@@ -64,10 +64,12 @@ through the whole codebase the way `reinterpret_cast` and raw pointers do in C++
 
 ### Concrete capabilities the experiment covers
 
-- A **pure-Rust ORT plugin EP** for Apple MLX: it implements the ORT plugin-EP C ABI, is loaded by an
-  *unmodified* ONNX Runtime, claims ~130 op types, and covers `MatMulNBits`, `GroupQueryAttention`,
-  `PagedAttention` (block-paged KV, packed var-length batches — CUDA-only in ORT itself, so Rust is
-  the *only* way it runs on Apple Silicon), quantized Mixture-of-Experts (`QMoE`), `GatherND`, and a
+- A **Rust-authored ORT plugin EP** for Apple MLX (its compute calls the native MLX C API): it
+  implements the ORT plugin-EP C ABI, is loaded by an *unmodified* ONNX Runtime, claims ~130 op types,
+  and covers `MatMulNBits`, `GroupQueryAttention`, `PagedAttention` (block-paged KV, packed var-length
+  batches — CUDA-only in ORT itself, so this EP is currently the only way to run it under ORT on Apple
+  Silicon; MLX/Metal does the compute, and a C++ plugin could do the same — the point is the path didn't
+  exist, not that only Rust could build it), quantized Mixture-of-Experts (`QMoE`), `GatherND`, and a
   compiled-subgraph fusion path. Published to crates.io and PyPI via OIDC trusted publishing.
 - A **paged-KV cache** with per-page quantization, single-token-append invariants, and 56 tests —
   0 `unsafe`.
@@ -93,7 +95,7 @@ These are not textbook claims; they are things that happened while building the 
    either (a) inside the C++ MLX library (`mlx_compile` aborting on a bad closure), or (b) an
    FFI-contract mistake we made in *one* `unsafe` function (reading an `int32` tensor's bytes as
    `i64`). Both were localized in seconds because the safe/unsafe boundary told us exactly where to
-   look. We spent zero time chasing use-after-free, double-free, or data races in the ~119k lines of
+   look. We spent zero time chasing use-after-free, double-free, or data races in the ~204k lines of
    safe Rust. In an equivalent C++ codebase those are the bugs that eat weeks.
 
 3. **Fearless concurrency for serving.** The MLX EP is thread-affine; the rule "one session per
@@ -102,7 +104,7 @@ These are not textbook claims; they are things that happened while building the 
    this: async batching without a class of heisenbugs.
 
 4. **`cargo` as the whole build system.** No CMake, no protobuf compiler, no vendored toolchain matrix.
-   `cargo build` cross-compiles; `cargo test` runs 1468 tests; the EP publishes to two package
+   `cargo build` cross-compiles; `cargo test` runs 2,200+ tests; the EP publishes to two package
    registries from one CI workflow with OIDC and no long-lived tokens. Onboarding a new component is
    `cargo new`, not a CMakeLists archaeology dig.
 
@@ -170,11 +172,16 @@ precisely where the experiment draws it.
 
 The reflexive objection is: "you still write `unsafe`, so what did safety buy you?" Two answers:
 
-1. **Containment is the point.** 452 `unsafe` blocks in 119k lines means **>99.6% of the code is
-   compiler-verified memory-safe**, and the dangerous 0.4% is greppable, reviewable, and lives at
-   named boundaries (`onnx-runtime-capi`, `onnx-genai-ort`, `onnx-runtime-ep-cuda`). In C++,
-   *100%* of the code is in the danger zone; there is no `unsafe` keyword to grep for because there is
-   no safe subset. Reviewers can spend their attention where it matters.
+1. **Containment is the point.** The ~650 `unsafe` occurrences are *concentrated at FFI boundaries*, not
+   spread through the logic. Five C-ABI / kernel crates (`onnx-runtime-ep-cuda`, `onnx-genai-ort`,
+   `onnx-runtime-capi`, `onnx-runtime-ep-cpu`, `onnx-runtime-dlpack`) hold roughly 80% of them, while the
+   pure-logic crates are near-zero: `onnx-genai-engine` has 2 `unsafe` in ~18k lines, `onnx-runtime-ir` /
+   `-optimizer` / `-shape-inference` have 1 each, `onnx-genai-kv` has 0. `unsafe` is greppable and lives
+   at named boundaries, so reviewers spend their memory-safety attention where it actually applies. This
+   is *not* a claim that the rest is bug-free — safe Rust still has logic, panic, arithmetic, and
+   concurrency bugs that need ordinary review — but it does remove the *use-after-free / data-race*
+   review burden from the large majority of crates that carry little or no `unsafe`. In C++ there is no
+   safe subset to grep for: every line is in scope for that class of review.
 
 2. **The unsafe you keep is honest about its contract.** When the experiment mis-used an FFI contract
    (int32 vs int64 read), the bug was in an `unsafe fn` whose job is exactly that boundary. The fix was
@@ -220,7 +227,7 @@ was implemented by an AI agent in a tight edit→check loop.
 5. **Clippy is a built-in senior reviewer.** It flags non-idiomatic and footgun patterns in agent
    output automatically, before a human looks.
 
-6. **Bugs are caught, not shipped.** An agent lacks full global context by construction. In C++ that
+6. **Whole categories of bug are caught, not shipped.** An agent lacks full global context by construction. In C++ that
    makes it prone to introducing latent use-after-free / aliasing bugs that pass review and tests; in
    Rust those simply do not compile. In this experiment, a speculative optimization that would have
    been a silent latent bug in C++ instead surfaced as a *reproducible* `mlx_compile` abort, was caught
@@ -266,10 +273,11 @@ is *machine-checked*, not aspirational.
   until it matched the oracle to ~1e-4 — the reviewer never had to read the MLX plumbing line by line,
   because they defined the acceptance test. `QMoE` used ORT's CPU kernel as ground truth. Op-claim
   validity is a typed `ClaimResult`, so "is this input admissible" is a value the compiler tracks.
-- **Verification is automatic and total.** The agent's PR is not "trust me"; it is "the contract you
-  wrote compiles, and the behavior you specified passes" — build + `clippy` + the conformance suite.
-  That is precisely the human-defines / agent-implements / machine-verifies loop you want, and Rust
-  makes the "contract" half enforceable at compile time rather than a convention policed in review.
+- **Verification is mechanical, not a matter of trust.** The agent's PR is not "trust me"; it is "the
+  typed contract you wrote compiles, and the behavior you specified passes its oracle" — build +
+  `clippy` + the conformance suite. This does *not* prove universal correctness (tests are finite, and
+  the types encode only the invariants you chose to express), but it does mean the declared interface
+  holds and the acceptance oracles pass without a human reading every line of the implementation.
 - **The agent optimizes *within* the contract.** Choosing the fused-vs-eager path, the chunked
   algorithm, the shapeless-vs-shape-keyed capture — the agent explores the implementation space (this
   is where "optimize per the latest research" happens) while the human owns the interface and the
@@ -340,10 +348,11 @@ substantially easier for Rust consumers, and no worse for everyone else.
 - **Cargo + crates.io is frictionless library reuse.** Every component is an independently versioned
   crate. A collaborator who only wants graph fusion writes `onnx-runtime-ir = "…"` (+ `-optimizer`) in
   `Cargo.toml` and has it — no vendoring, no CMake, no ABI matching, no system deps, no "which ORT
-  build did you link against." The experiment already proved the publish path end-to-end: the MLX EP
-  is on crates.io, installable with `cargo add`. The C++ story is heavier — consume ORT and you link
-  (or vendor) the monolith and match its ABI and compiler.
-- **Fine-grained crates = take only what you need.** The workspace is 27 crates with real boundaries
+  build did you link against" (this holds for the pure-Rust crates like `-ir`/`-optimizer`; crates that
+  bind ORT/CUDA/MLX still carry those native toolchain requirements). The experiment already proved the
+  publish path end-to-end: the MLX EP is on crates.io, installable with `cargo add`. The C++ story is
+  heavier — consume ORT and you link (or vendor) the monolith and match its ABI and compiler.
+- **Fine-grained crates = take only what you need.** The workspace is 31 crates with real boundaries
   (`onnx-runtime-ir`, `-memory`, `-optimizer`, `-ep-cpu`, `-ep-cuda`, `onnx-genai-kv`, `-scheduler`,
   `-engine`, `-preprocess`, `-router`…). Depend on the three you use; the rest never enters your build.
   Feature flags (`default-features = false` + opt-in) trim further — a CUDA-free build, a tracer-free
@@ -352,9 +361,12 @@ substantially easier for Rust consumers, and no worse for everyone else.
 - **Traits are clean, zero-cost plugin points — and they already exist here.** "Bring your own
   component" is a trait the user implements. The experiment already exposes `Sampler`, `LogitProcessor`,
   `Constraint`, `TokenEmbedder`, `LmHead`, and `SpeculativeProposer` as public traits: a user writes
-  `impl Sampler for MySampler` and drops it in. It's compile-time-checked, monomorphized (the
-  abstraction costs nothing at runtime — unlike a virtual-dispatch or FFI-callback plugin), and needs
-  no registration boilerplate or ABI contract. Users provide custom-optimized components by
+  `impl Sampler for MySampler` and drops it in. It's compile-time-checked against the trait; depending
+  on how the extension point is wired it is either monomorphized (static dispatch, no runtime cost) or a
+  cheap `Box<dyn _>` trait object (one vtable indirection, comparable to a C++ virtual call — the
+  experiment uses trait objects for `LogitProcessor`/`Constraint`/`Sampler`), and it needs no
+  registration boilerplate. Note these are *source-level* extension points (you rebuild with your impl),
+  not dynamically-loaded ABI plugins. Users provide custom-optimized components by
   implementing the trait, and the compiler guarantees they fit the contract.
 - **A source-level, semver'd, documented API.** `cargo doc` + crates.io semver give consumers a stable,
   discoverable surface instead of a C++ header they must match to a compiler and an STL ABI — no
@@ -422,29 +434,33 @@ language captures most of the safety benefit without touching the mature codebas
 
 Firefox is the strongest possible test of "shouldn't a Rust shop just write it in Rust?" — Mozilla
 *created* Rust, and Gecko already contains large Rust subsystems (Stylo, WebRender). Yet for its
-on-device ML features Firefox **vendors ONNX Runtime (C++, compiled to WebAssembly) via Transformers.js
-in a dedicated inference process** — it did **not** write a Rust-native inference runtime. That fact
-cuts both ways, and both directions matter for this proposal:
+on-device ML features Firefox **reuses ONNX Runtime rather than writing a Rust inference engine.** It
+started with ORT compiled to WebAssembly (via Transformers.js) and in 2024–2025 moved to a **native C++
+ONNX Runtime backend**, vendored as precompiled libraries and exposed to the JS front-end through a thin
+WebIDL shim — a 2–10× speedup, transparent to the calling code. The ML backend is explicitly C++; the
+orchestration around it is JS/Transformers.js. That fact cuts both ways, and both directions matter:
 
 - **It validates the "keep and reuse the kernels/runtime" half — strongly.** The people with the deepest
-  Rust expertise on earth chose to reuse a mature C++ inference runtime rather than reimplement one.
-  Reimplementing a kernel-heavy runtime *for its own sake* is exactly the guilty-until-proven case §3 and
-  §12 warn against. If ORT already runs your model well, the highest-value move is to *wrap* it, not
-  re-derive MLAS.
+  Rust expertise on earth chose to reuse a mature C++ inference runtime rather than reimplement one — and
+  when they optimized, they moved *toward* native C++ ORT, not away from it. Reimplementing a kernel-heavy
+  runtime *for its own sake* is exactly the guilty-until-proven case §3 and §12 warn against. If ORT
+  already runs your model well, the highest-value move is to *wrap* it, not re-derive MLAS.
 - **It is the honest counterweight to Phase 2 (incrementally porting the runtime to Rust).** If Mozilla
   didn't rewrite ORT, we cannot justify porting the runtime on "Rust is nicer." Any runtime seam must
   earn its way on measured value and long-term (agent-)maintainability, one conformance-gated piece at a
   time — and for many consumers the right answer is *"never; keep wrapping ORT."* That is already the
   plan; Firefox is the reason to hold that line.
-- **It also confirms where Rust *did* win even for a Rust maximalist: the layers *around* inference.**
-  Firefox's inference-process isolation and integration are Rust; the compute is reused ORT. That is
-  precisely the split proposed here — reuse ORT for compute, put Rust in the orchestration/serving layer
-  where correctness-critical state lives.
+- **It also shows the integration pattern we're proposing, in production.** Firefox vendors the C++
+  runtime behind a thin, stable shim (WebIDL there; the C ABI / plugin-EP boundary here) so the compute
+  stays reused and unmodified while the surrounding code evolves independently. That is exactly the split
+  proposed here — reuse ORT for compute behind a stable boundary, and keep the new correctness-critical
+  orchestration code in a memory-safe language.
 - **The workload that pulls all of this is on-device, interactive inference.** Firefox's ML push is
-  entirely local (privacy, no server round-trip). That is the same class of workload — long-context,
-  concurrent, latency-sensitive, on-device — where the orchestration layer (KV/memory management,
-  scheduling, sampling) is the bottleneck and where a safe, concurrent Rust substrate pays off, without
-  touching the reused kernels.
+  entirely local (privacy, no server round-trip) — the same class of workload (concurrent,
+  latency-sensitive, on-device) where the orchestration layer (KV/memory management, scheduling,
+  sampling) is a natural place for a safe, concurrent Rust substrate, without touching the reused kernels.
+  (Firefox doesn't itself prove *where* the bottleneck sits; that's a claim we'd back with our own
+  decode-step profiles, not borrow from Mozilla.)
 
 Net: Firefox does not weaken the case; it sharpens it. It is a real-world confirmation of the exact
 boundary this document draws — **reuse the C++ runtime/kernels through a stable ABI; write the new
@@ -542,10 +558,14 @@ person (plus an agent) can execute that split, because the experiment already di
 
 ### Appendix: reproduce the numbers
 
+Numbers below are from the `onnx-genai` workspace (excluding the sibling `onnxruntime-mlx` repo, whose
+22,180 LOC / 521 `unsafe` are counted separately); "unsafe" counts *lines containing the keyword*
+(occurrences, not syntactic blocks). Re-run against `HEAD` — they grow as the experiment does.
+
 ```bash
 # Rust LOC across the workspace
 find crates -name '*.rs' -not -path '*/target/*' | xargs wc -l | tail -1
-# unsafe blocks
+# unsafe occurrences (lines containing the keyword, excluding tests)
 grep -rn 'unsafe' crates --include='*.rs' | grep -v test | wc -l
 # tests
 grep -rn '#\[test\]\|#\[tokio::test\]' crates --include='*.rs' | wc -l
