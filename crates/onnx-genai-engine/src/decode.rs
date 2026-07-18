@@ -116,7 +116,10 @@ impl DecodeRunner {
     }
 
     fn supports_sampled(&self) -> bool {
-        matches!(self, DecodeRunner::PastPresent(_))
+        match self {
+            DecodeRunner::PastPresent(runner) => runner.supports_sampled(),
+            _ => false,
+        }
     }
 }
 
@@ -186,7 +189,7 @@ impl DecodeBackend for DecodeSession<'static> {
     }
 
     fn supports_sampled(&self) -> bool {
-        true
+        self.will_sample_on_device()
     }
 
     fn rewind(&mut self, target_len: usize) -> anyhow::Result<()> {
