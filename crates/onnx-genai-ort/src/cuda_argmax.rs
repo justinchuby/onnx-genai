@@ -1,4 +1,4 @@
-//! On-device greedy argmax for captured CUDA decode.
+//! Device-side greedy token selection for captured decode.
 //!
 //! In the captured greedy decode loop the model's `logits [1, 1, vocab]` output
 //! is the only tensor we need to reduce to a single winning token id. When the
@@ -6,7 +6,8 @@
 //! 151,936 f16 = ~300 KiB) host-side every token inside `RunWithBinding`, and we
 //! then argmax on the host. onnxruntime-genai avoids this by keeping logits on
 //! the GPU and reducing them with a custom CUDA kernel; this module does the
-//! same.
+//! same. [`DeviceGreedySampler`] is the extension point for compute backends;
+//! [`CudaArgmax`] provides the CUDA implementation.
 //!
 //! The logits buffer is allocated on the session's CUDA device allocator (see
 //! [`crate::decode`]). After each captured replay we launch a single-block
@@ -38,6 +39,32 @@ use cudarc::driver::{CudaContext, CudaFunction, CudaStream, LaunchConfig, PushKe
 
 use crate::error::{OrtError, Result};
 use crate::value::DataType;
+
+/// Device-side greedy token selection over logits that remain in device memory.
+///
+/// Compute backends implement this interface to reduce `[rows, vocab]` logits
+/// to one token id per row without copying the full vocabulary to the host.
+pub(crate) trait DeviceGreedySampler: Send {
+    fn argmax(&self, dtype: DataType, ptr_addr: usize, vocab: usize) -> Result<u32>;
+
+    fn argmax_rows(
+        &self,
+        dtype: DataType,
+        ptr_addr: usize,
+        rows: usize,
+        vocab: usize,
+    ) -> Result<Vec<u32>>;
+
+    fn copy_row_to_host(
+        &self,
+        dtype: DataType,
+        ptr_addr: usize,
+        len: usize,
+        dst: &mut [u8],
+    ) -> Result<()>;
+
+    fn name(&self) -> &str;
+}
 
 /// Threads per block. One block reduces the whole row via a grid-stride loop
 /// then a shared-memory tree reduction, so this is also the shared-array width.
@@ -229,11 +256,13 @@ impl CudaArgmax {
             out: Mutex::new(OutScratch { ptr, cap: 1 }),
         })
     }
+}
 
+impl DeviceGreedySampler for CudaArgmax {
     /// Argmax over the final (single) `vocab`-element device row at `ptr_addr`.
-    /// Convenience wrapper over [`CudaArgmax::argmax_rows`] for the common
+    /// Convenience wrapper over [`DeviceGreedySampler::argmax_rows`] for the common
     /// single-token greedy decode path.
-    pub(crate) fn argmax(&self, dtype: DataType, ptr_addr: usize, vocab: usize) -> Result<u32> {
+    fn argmax(&self, dtype: DataType, ptr_addr: usize, vocab: usize) -> Result<u32> {
         Ok(self.argmax_rows(dtype, ptr_addr, 1, vocab)?[0])
     }
 
@@ -242,7 +271,7 @@ impl CudaArgmax {
     /// [`crate::value::Value::data_ptr_addr`]), returning one token id per row.
     /// Synchronizes the context first so all of ORT's just-issued decode work
     /// (which wrote these logits) is visible to the kernel.
-    pub(crate) fn argmax_rows(
+    fn argmax_rows(
         &self,
         dtype: DataType,
         ptr_addr: usize,
@@ -315,7 +344,7 @@ impl CudaArgmax {
     /// Copy a `len`-element device row of `dtype` at `ptr_addr` into `dst`
     /// (host), for the non-greedy path that still needs the full vocabulary.
     /// Synchronizes the context first so ORT's writes are visible.
-    pub(crate) fn copy_row_to_host(
+    fn copy_row_to_host(
         &self,
         dtype: DataType,
         ptr_addr: usize,
@@ -345,6 +374,10 @@ impl CudaArgmax {
         self.stream
             .synchronize()
             .map_err(|e| OrtError::Cuda(format!("stream synchronize: {e:?}")))
+    }
+
+    fn name(&self) -> &str {
+        "cuda_argmax"
     }
 }
 
@@ -402,4 +435,3 @@ fn dtype_size(dtype: DataType) -> Result<usize> {
         }
     })
 }
-
