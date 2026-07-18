@@ -430,7 +430,7 @@ share of Android's memory-safety vulnerabilities fell from **~76% (2019) to ~24%
 Vulnerabilities concentrate in *new* code and decay as code ages, so shifting only new code to a safe
 language captures most of the safety benefit without touching the mature codebase.
 
-### The most honest data point: Firefox reuses ONNX Runtime rather than rewriting it
+### The most instructive data point: Firefox migrated its *own* engine to Rust — yet reuses ONNX Runtime in C++
 
 Firefox is the strongest possible test of "shouldn't a Rust shop just write it in Rust?" — Mozilla
 *created* Rust, and Gecko already contains large Rust subsystems (Stylo, WebRender). Yet for its
@@ -461,6 +461,42 @@ orchestration around it is JS/Transformers.js. That fact cuts both ways, and bot
   sampling) is a natural place for a safe, concurrent Rust substrate, without touching the reused kernels.
   (Firefox doesn't itself prove *where* the bottleneck sits; that's a claim we'd back with our own
   decode-step profiles, not borrow from Mozilla.)
+
+#### How Firefox *itself* migrated to Rust (the "Oxidation" playbook)
+
+The same organization is also the best-documented example of incrementally moving a giant, shipping C++
+codebase (Gecko, ~tens of millions of lines) to Rust — and the method is exactly the strangler-fig
+approach this document argues for. The sequence:
+
+- **Incubate risky work out-of-tree first.** Rust and the **Servo** research engine (a from-scratch,
+  all-Rust browser engine) were the proving ground. Components were hardened in Servo, then transplanted
+  into Gecko — Firefox never bet the shipping product on unproven code. *(Our analog: `onnx-genai` /
+  `onnxruntime-mlx` are the out-of-tree experiment; proven pieces graduate into the mainline.)*
+- **Start with a small, self-contained, security-sensitive component.** The first Rust to ship in
+  Firefox was the **MP4 metadata parser, in Firefox 48 (Aug 2016)** — a leaf that parses *untrusted*
+  media, a classic memory-safety hotspot, with a narrow interface. Low blast radius, high safety payoff,
+  easy to A/B. *(Our analog: a plugin EP, or a leaf orchestration crate — the MLX EP is precisely this
+  wedge.)*
+- **Roll in more parsers/libraries incrementally, coexisting via FFI.** e.g. **`encoding_rs`** (character
+  encoding) replaced its C++ counterpart piece by piece, living behind an FFI boundary next to unchanged
+  C++. No big-bang cutover.
+- **Then take on a major subsystem where Rust's strengths uniquely pay off.** **Stylo / Quantum CSS
+  (Firefox 57, Nov 2017)** replaced the CSS style system with a Rust engine that runs styling **in
+  parallel across cores**. Mozilla has noted that parallel styling had been attempted in C++ before and
+  abandoned because the data races were unmanageable; Rust's compile-time data-race freedom is what
+  finally made a *parallel* engine shippable. **WebRender (Firefox 67, May 2019)**, a GPU renderer, came
+  from the same Servo lineage. *(Our analog: the concurrent, lifetime-heavy **scheduler / KV-memory /
+  continuous-batching** layer is our "Stylo" — the subsystem being redesigned anyway, where fearless
+  concurrency is the point.)*
+- **Coexistence is permanent, not a deadline.** A decade in, Gecko is still majority C++ with growing
+  Rust; the goal was never a full rewrite, only to move the seams where Rust earns its place. That is the
+  same posture §12 recommends here.
+
+The honest, load-bearing detail is Stylo: it is a concrete case where Rust's safety didn't just prevent
+bugs, it **enabled a capability C++ couldn't ship** (safe parallelism at that scale). That is the
+strongest form of the argument — not "Rust is nicer," but "Rust let us build the thing we otherwise
+couldn't." Our bet is that an LLM scheduler + paged-KV memory manager is the same kind of
+concurrency-heavy subsystem.
 
 Net: Firefox does not weaken the case; it sharpens it. It is a real-world confirmation of the exact
 boundary this document draws — **reuse the C++ runtime/kernels through a stable ABI; write the new
