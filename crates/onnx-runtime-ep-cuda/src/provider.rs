@@ -160,8 +160,11 @@ impl ExecutionProvider for CudaExecutionProvider {
         }
         if op.op_type == "CompressedSparseAttention"
             && op.domain == "pkg.nxrt"
-            && let Some(reason) =
-                crate::kernels::compressed_sparse_attention::unsupported_reason(op, input_dtypes)
+            && let Some(reason) = crate::kernels::compressed_sparse_attention::unsupported_reason(
+                op,
+                shapes,
+                input_dtypes,
+            )
         {
             return KernelMatch::unsupported(reason);
         }

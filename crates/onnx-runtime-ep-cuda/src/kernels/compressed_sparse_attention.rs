@@ -57,23 +57,12 @@ use std::sync::Arc;
 
 use onnx_runtime_ep_api::{Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ep_cpu::kernels::compressed_sparse_attention::CompressedSparseAttentionFactory as CpuCsaFactory;
-use onnx_runtime_ir::{DataType, DeviceId, Node};
+use onnx_runtime_ir::{DataType, DeviceId, Dim, Node, Shape, as_static_shape};
 
 use crate::error::not_implemented;
 use crate::runtime::{CudaRuntime, cuptr};
 
 const OP: &str = "CompressedSparseAttention";
-
-/// Positions whose dtype is fixed regardless of ratio / cache format. These are
-/// gated at claim time so an unsupported dtype is rejected rather than failing
-/// inside the CPU kernel. Index 6 (`past_compressed_kv`) is gated separately
-/// because its dtype depends on `cache_format`.
-const FIXED_DTYPES: &[(usize, DataType, &str)] = &[
-    (0, DataType::Float32, "query"),
-    (8, DataType::Int32, "seqlens_k"),
-    (9, DataType::Int64, "total_sequence_length"),
-    (10, DataType::Float32, "head_sink"),
-];
 
 /// Factory for the host-staged CUDA CSA kernel. It builds the CPU CSA kernel
 /// from the same node (reusing the CPU oracle's attribute validation and compute
@@ -230,39 +219,339 @@ impl Kernel for CompressedSparseAttentionKernel {
 /// (docs/DEEPSEEK_CSA_MTP_RUNTIME.md §4.8).
 pub(crate) fn unsupported_reason(
     node: &Node,
+    shapes: &[Shape],
     input_dtypes: &[DataType],
 ) -> Option<Cow<'static, str>> {
     // Attribute/arity gating: the CPU factory validates the full frozen-v1
     // attribute set and required-input names; any rejection there is a config we
     // cannot correctly execute host-staged either.
-    if let Err(error) = CpuCsaFactory.create(node, &[]) {
+    let concrete_shapes = shapes
+        .iter()
+        .map(|shape| as_static_shape(shape))
+        .collect::<Option<Vec<_>>>()
+        .unwrap_or_default();
+    if let Err(error) = CpuCsaFactory.create(node, &concrete_shapes) {
         return Some(Cow::Owned(format!("{OP}: {error}")));
     }
 
-    // dtype gating for the positions whose dtype is fixed by the frozen contract.
-    for &(index, expected, name) in FIXED_DTYPES {
-        if let Some(&dtype) = input_dtypes.get(index)
-            && dtype != expected
-        {
-            return Some(Cow::Owned(format!(
-                "{OP}: input {index} ('{name}') dtype {dtype:?} unsupported; expected {expected:?}"
-            )));
-        }
-    }
-
-    // `past_compressed_kv` (input 6) dtype is Uint8 for the block-quantized cache
-    // formats and Float32 for the plain f32 format.
-    let cache_dtype = match node.attr("cache_format").and_then(|a| a.as_str()) {
-        Some("f32") | None => DataType::Float32,
-        Some(_) => DataType::Uint8,
-    };
-    if let Some(&dtype) = input_dtypes.get(6)
-        && dtype != cache_dtype
-    {
+    if shapes.len() != node.inputs.len() || input_dtypes.len() != node.inputs.len() {
         return Some(Cow::Owned(format!(
-            "{OP}: input 6 ('past_compressed_kv') dtype {dtype:?} unsupported for cache_format; expected {cache_dtype:?}"
+            "{OP}: claim metadata must cover all {} positional inputs (got {} shapes and {} dtypes)",
+            node.inputs.len(),
+            shapes.len(),
+            input_dtypes.len()
         )));
     }
 
-    None
+    let ratio = usize::try_from(
+        node.attr("compression_ratio")
+            .and_then(|attribute| attribute.as_int())
+            .expect("CPU factory accepted compression_ratio"),
+    )
+    .expect("CPU factory accepted positive compression_ratio");
+    let cache_format = node
+        .attr("cache_format")
+        .and_then(|attribute| attribute.as_str())
+        .unwrap_or("f32");
+
+    let result = match ratio {
+        4 => validate_ratio4_claim(node, shapes, input_dtypes, cache_format),
+        128 => validate_ratio128_claim(node, shapes, input_dtypes, cache_format),
+        _ => unreachable!("CPU factory rejected unsupported compression ratio"),
+    };
+
+    result
+        .err()
+        .map(|reason| Cow::Owned(format!("{OP}: {reason}")))
+}
+
+fn validate_ratio4_claim(
+    node: &Node,
+    shapes: &[Shape],
+    input_dtypes: &[DataType],
+    cache_format: &str,
+) -> std::result::Result<(), String> {
+    if node.inputs.len() < 19 || node.inputs[11..19].iter().any(Option::is_none) {
+        return Err("ratio-4 requires all eight index inputs (11..=18)".into());
+    }
+    if !(5..=6).contains(&node.outputs.len()) {
+        return Err(format!(
+            "ratio-4 requires 5 or 6 outputs, got {}",
+            node.outputs.len()
+        ));
+    }
+    if node
+        .attr("index_head_dim")
+        .and_then(|attribute| attribute.as_int())
+        != Some(128)
+    {
+        return Err("ratio-4 requires index_head_dim=128".into());
+    }
+    if cache_format != "fp8_e4m3_block64" {
+        return Err(format!(
+            "ratio-4 requires cache_format='fp8_e4m3_block64', got '{cache_format}'"
+        ));
+    }
+    require_fixed_contract(node, 4)?;
+
+    for &(index, expected, name) in &[
+        (0, DataType::Float32, "query"),
+        (1, DataType::Float32, "current_kv"),
+        (2, DataType::Float32, "compressor_kv"),
+        (3, DataType::Float32, "compressor_gate"),
+        (4, DataType::Float32, "compressor_ape"),
+        (5, DataType::Float32, "compressor_norm"),
+        (6, DataType::Uint8, "past_compressed_kv"),
+        (7, DataType::Float32, "past_compression_carry"),
+        (8, DataType::Int32, "seqlens_k"),
+        (9, DataType::Int64, "total_sequence_length"),
+        (10, DataType::Float32, "head_sink"),
+        (11, DataType::Float32, "index_query"),
+        (12, DataType::Float32, "index_weight"),
+        (13, DataType::Float32, "index_compressor_kv"),
+        (14, DataType::Float32, "index_compressor_gate"),
+        (15, DataType::Float32, "index_compressor_ape"),
+        (16, DataType::Float32, "index_compressor_norm"),
+        (17, DataType::Uint8, "past_index_key"),
+        (18, DataType::Float32, "past_index_carry"),
+    ] {
+        require_dtype(input_dtypes, index, expected, name)?;
+    }
+    if node.inputs.get(19).is_some_and(Option::is_some) {
+        require_dtype(input_dtypes, 19, DataType::Float32, "attention_bias")?;
+        if shapes[19].len() > 4 {
+            return Err(format!(
+                "input 19 ('attention_bias') rank {} unsupported; expected rank <= 4",
+                shapes[19].len()
+            ));
+        }
+    }
+
+    let heads = required_attr(node, "num_heads")?;
+    let index_heads = required_attr(node, "index_num_heads")?;
+    for (index, name, contract) in [
+        (0, "query", vec![Any, NonZero, Fixed(heads), Fixed(512)]),
+        (1, "current_kv", vec![Same(0, 0), Any, Fixed(512)]),
+        (
+            2,
+            "compressor_kv",
+            vec![Same(0, 0), Same(0, 1), Fixed(1024)],
+        ),
+        (
+            3,
+            "compressor_gate",
+            vec![Same(0, 0), Same(0, 1), Fixed(1024)],
+        ),
+        (4, "compressor_ape", vec![Fixed(4), Fixed(1024)]),
+        (5, "compressor_norm", vec![Fixed(512)]),
+        (6, "past_compressed_kv", vec![Same(0, 0), Any, Fixed(583)]),
+        (
+            7,
+            "past_compression_carry",
+            vec![Same(0, 0), Fixed(8), Fixed(2), Fixed(1024)],
+        ),
+        (8, "seqlens_k", vec![Same(0, 0)]),
+        (9, "total_sequence_length", vec![]),
+        (10, "head_sink", vec![Fixed(heads)]),
+        (
+            11,
+            "index_query",
+            vec![Same(0, 0), Same(0, 1), Fixed(index_heads), Fixed(128)],
+        ),
+        (
+            12,
+            "index_weight",
+            vec![Same(0, 0), Same(0, 1), Fixed(index_heads)],
+        ),
+        (
+            13,
+            "index_compressor_kv",
+            vec![Same(0, 0), Same(0, 1), Fixed(256)],
+        ),
+        (
+            14,
+            "index_compressor_gate",
+            vec![Same(0, 0), Same(0, 1), Fixed(256)],
+        ),
+        (15, "index_compressor_ape", vec![Fixed(4), Fixed(256)]),
+        (16, "index_compressor_norm", vec![Fixed(128)]),
+        (17, "past_index_key", vec![Same(0, 0), Any, Fixed(68)]),
+        (
+            18,
+            "past_index_carry",
+            vec![Same(0, 0), Fixed(8), Fixed(2), Fixed(256)],
+        ),
+    ] {
+        require_shape(shapes, index, name, &contract)?;
+    }
+    Ok(())
+}
+
+fn validate_ratio128_claim(
+    node: &Node,
+    shapes: &[Shape],
+    input_dtypes: &[DataType],
+    cache_format: &str,
+) -> std::result::Result<(), String> {
+    for index in 11..19.min(node.inputs.len()) {
+        if node.inputs[index].is_some() {
+            return Err(format!(
+                "ratio-4-only input {index} is unsupported for ratio-128"
+            ));
+        }
+    }
+    if node.outputs.len() != 3 {
+        return Err(format!(
+            "ratio-128 requires exactly 3 outputs, got {}",
+            node.outputs.len()
+        ));
+    }
+    if cache_format == "fp4_e2m1_block32" {
+        return Err(
+            "ratio-128 attention-compressor state uses f32 or hybrid FP8/BF16 records, not FP4"
+                .into(),
+        );
+    }
+    require_fixed_contract(node, 128)?;
+
+    let cache_dtype = if cache_format == "f32" {
+        DataType::Float32
+    } else {
+        DataType::Uint8
+    };
+    for &(index, expected, name) in &[
+        (0, DataType::Float32, "query"),
+        (1, DataType::Float32, "current_kv"),
+        (2, DataType::Float32, "compressor_kv"),
+        (3, DataType::Float32, "compressor_gate"),
+        (4, DataType::Float32, "compressor_ape"),
+        (5, DataType::Float32, "compressor_norm"),
+        (6, cache_dtype, "past_compressed_kv"),
+        (7, DataType::Float32, "past_compression_carry"),
+        (8, DataType::Int32, "seqlens_k"),
+        (9, DataType::Int64, "total_sequence_length"),
+        (10, DataType::Float32, "head_sink"),
+    ] {
+        require_dtype(input_dtypes, index, expected, name)?;
+    }
+
+    let heads = required_attr(node, "num_heads")?;
+    let stored_width = if cache_format == "f32" { 512 } else { 583 };
+    for (index, name, contract) in [
+        (0, "query", vec![Any, NonZero, Fixed(heads), Fixed(512)]),
+        (1, "current_kv", vec![Same(0, 0), Any, Fixed(512)]),
+        (2, "compressor_kv", vec![Same(0, 0), Same(0, 1), Fixed(512)]),
+        (
+            3,
+            "compressor_gate",
+            vec![Same(0, 0), Same(0, 1), Fixed(512)],
+        ),
+        (4, "compressor_ape", vec![Fixed(128), Fixed(512)]),
+        (5, "compressor_norm", vec![Fixed(512)]),
+        (
+            6,
+            "past_compressed_kv",
+            vec![Same(0, 0), Any, Fixed(stored_width)],
+        ),
+        (
+            7,
+            "past_compression_carry",
+            vec![Same(0, 0), Fixed(128), Fixed(2), Fixed(512)],
+        ),
+        (8, "seqlens_k", vec![Same(0, 0)]),
+        (9, "total_sequence_length", vec![]),
+        (10, "head_sink", vec![Fixed(heads)]),
+    ] {
+        require_shape(shapes, index, name, &contract)?;
+    }
+    Ok(())
+}
+
+fn require_fixed_contract(node: &Node, ratio: usize) -> std::result::Result<(), String> {
+    if required_attr(node, "head_dim")? != 512 {
+        return Err(format!("ratio-{ratio} requires head_dim=512"));
+    }
+    let rope_dim = match node.attr("qk_rope_head_dim") {
+        Some(attribute) => attribute
+            .as_int()
+            .ok_or_else(|| "qk_rope_head_dim must be an integer".to_string())?,
+        None => 0,
+    };
+    if rope_dim != 64 {
+        return Err(format!("ratio-{ratio} requires qk_rope_head_dim=64"));
+    }
+    Ok(())
+}
+
+fn required_attr(node: &Node, name: &str) -> std::result::Result<usize, String> {
+    node.attr(name)
+        .and_then(|attribute| attribute.as_int())
+        .and_then(|value| usize::try_from(value).ok())
+        .ok_or_else(|| format!("missing or invalid integer attribute '{name}'"))
+}
+
+fn require_dtype(
+    input_dtypes: &[DataType],
+    index: usize,
+    expected: DataType,
+    name: &str,
+) -> std::result::Result<(), String> {
+    let got = input_dtypes[index];
+    if got != expected {
+        return Err(format!(
+            "input {index} ('{name}') dtype {got:?} unsupported; expected {expected:?}"
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum ShapeAxis {
+    Any,
+    NonZero,
+    Fixed(usize),
+    Same(usize, usize),
+}
+use ShapeAxis::{Any, Fixed, NonZero, Same};
+
+fn require_shape(
+    shapes: &[Shape],
+    index: usize,
+    name: &str,
+    contract: &[ShapeAxis],
+) -> std::result::Result<(), String> {
+    let shape = &shapes[index];
+    if shape.len() != contract.len() {
+        return Err(format!(
+            "input {index} ('{name}') rank {} unsupported; expected {}",
+            shape.len(),
+            contract.len()
+        ));
+    }
+    for (axis, requirement) in contract.iter().enumerate() {
+        let mismatch = match requirement {
+            Any => None,
+            NonZero if shape[axis] == Dim::Static(0) => Some("must be nonzero".into()),
+            NonZero => None,
+            Fixed(expected) => shape[axis]
+                .as_static()
+                .filter(|got| got != expected)
+                .map(|got| format!("is {got}; expected {expected}")),
+            Same(other_input, other_axis) => {
+                match (
+                    shape[axis].as_static(),
+                    shapes[*other_input][*other_axis].as_static(),
+                ) {
+                    (Some(got), Some(expected)) if got != expected => {
+                        Some(format!("is {got}; expected {expected}"))
+                    }
+                    _ => None,
+                }
+            }
+        };
+        if let Some(mismatch) = mismatch {
+            return Err(format!("input {index} ('{name}') axis {axis} {mismatch}"));
+        }
+    }
+    Ok(())
 }

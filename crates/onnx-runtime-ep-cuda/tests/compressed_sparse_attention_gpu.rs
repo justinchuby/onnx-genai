@@ -34,6 +34,13 @@ const RATIO: usize = 128;
 // Hybrid FP8/BF16 record: (D-RD)/64 FP8 blocks of (64 codes + 1 E8M0 scale) byte
 // each, followed by RD little-endian BF16 RoPE values (2 bytes each).
 const STORED_WIDTH: usize = ((DIM - ROPE_DIM) / 64) * (64 + 1) + ROPE_DIM * 2;
+const RATIO4: usize = 4;
+const RATIO4_SEQUENCE: usize = 4;
+const RATIO4_INDEX_HEADS: usize = 2;
+const RATIO4_INDEX_DIM: usize = 128;
+const RATIO4_MAIN_WIDTH: usize = DIM * 2;
+const RATIO4_INDEX_COMPRESSOR_WIDTH: usize = RATIO4_INDEX_DIM * 2;
+const RATIO4_INDEX_STORED_WIDTH: usize = (RATIO4_INDEX_DIM / 32) * (16 + 1);
 
 #[derive(Clone)]
 struct HostTensor {
@@ -263,6 +270,200 @@ fn ratio128_node(inputs: &[HostTensor], next_records: usize) -> (Graph, NodeId) 
         graph.add_output(output);
     }
     (graph, node)
+}
+
+fn ratio4_values(len: usize, offset: usize, scale: f32) -> Vec<f32> {
+    (0..len)
+        .map(|index| 0.05 + ((index * 17 + offset) % 97) as f32 * scale)
+        .collect()
+}
+
+fn ratio4_inputs() -> Vec<HostTensor> {
+    vec![
+        HostTensor::f32(
+            &[1, RATIO4_SEQUENCE, 1, DIM],
+            &ratio4_values(RATIO4_SEQUENCE * DIM, 3, 0.0005),
+        ),
+        HostTensor::f32(
+            &[1, RATIO4_SEQUENCE, DIM],
+            &ratio4_values(RATIO4_SEQUENCE * DIM, 5, 0.003),
+        ),
+        HostTensor::f32(
+            &[1, RATIO4_SEQUENCE, RATIO4_MAIN_WIDTH],
+            &ratio4_values(RATIO4_SEQUENCE * RATIO4_MAIN_WIDTH, 7, 0.002),
+        ),
+        HostTensor::f32(
+            &[1, RATIO4_SEQUENCE, RATIO4_MAIN_WIDTH],
+            &ratio4_values(RATIO4_SEQUENCE * RATIO4_MAIN_WIDTH, 11, 0.001),
+        ),
+        HostTensor::f32(
+            &[RATIO4, RATIO4_MAIN_WIDTH],
+            &ratio4_values(RATIO4 * RATIO4_MAIN_WIDTH, 13, 0.0002),
+        ),
+        HostTensor::f32(
+            &[DIM],
+            &(0..DIM)
+                .map(|index| 0.75 + (index % 19) as f32 * 0.01)
+                .collect::<Vec<_>>(),
+        ),
+        HostTensor::zeros(DataType::Uint8, &[1, 0, STORED_WIDTH]),
+        HostTensor::zeros(DataType::Float32, &[1, 8, 2, RATIO4_MAIN_WIDTH]),
+        HostTensor::i32(&[1], &[(RATIO4_SEQUENCE - 1) as i32]),
+        HostTensor::i64(&[], &[RATIO4_SEQUENCE as i64]),
+        HostTensor::f32(&[1], &[-0.41]),
+        HostTensor::f32(
+            &[1, RATIO4_SEQUENCE, RATIO4_INDEX_HEADS, RATIO4_INDEX_DIM],
+            &ratio4_values(
+                RATIO4_SEQUENCE * RATIO4_INDEX_HEADS * RATIO4_INDEX_DIM,
+                17,
+                0.0015,
+            ),
+        ),
+        HostTensor::f32(
+            &[1, RATIO4_SEQUENCE, RATIO4_INDEX_HEADS],
+            &ratio4_values(RATIO4_SEQUENCE * RATIO4_INDEX_HEADS, 19, 0.01),
+        ),
+        HostTensor::f32(
+            &[1, RATIO4_SEQUENCE, RATIO4_INDEX_COMPRESSOR_WIDTH],
+            &ratio4_values(RATIO4_SEQUENCE * RATIO4_INDEX_COMPRESSOR_WIDTH, 23, 0.002),
+        ),
+        HostTensor::f32(
+            &[1, RATIO4_SEQUENCE, RATIO4_INDEX_COMPRESSOR_WIDTH],
+            &ratio4_values(RATIO4_SEQUENCE * RATIO4_INDEX_COMPRESSOR_WIDTH, 29, 0.001),
+        ),
+        HostTensor::f32(
+            &[RATIO4, RATIO4_INDEX_COMPRESSOR_WIDTH],
+            &ratio4_values(RATIO4 * RATIO4_INDEX_COMPRESSOR_WIDTH, 31, 0.0002),
+        ),
+        HostTensor::f32(
+            &[RATIO4_INDEX_DIM],
+            &(0..RATIO4_INDEX_DIM)
+                .map(|index| 0.8 + (index % 13) as f32 * 0.0125)
+                .collect::<Vec<_>>(),
+        ),
+        HostTensor::zeros(DataType::Uint8, &[1, 0, RATIO4_INDEX_STORED_WIDTH]),
+        HostTensor::zeros(DataType::Float32, &[1, 8, 2, RATIO4_INDEX_COMPRESSOR_WIDTH]),
+    ]
+}
+
+fn ratio4_node(inputs: &[HostTensor]) -> (Graph, NodeId) {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(DOMAIN.into(), 1);
+    let names = [
+        "query",
+        "current_kv",
+        "compressor_kv",
+        "compressor_gate",
+        "compressor_ape",
+        "compressor_norm",
+        "past_compressed_kv",
+        "past_compression_carry",
+        "seqlens_k",
+        "total_sequence_length",
+        "head_sink",
+        "index_query",
+        "index_weight",
+        "index_compressor_kv",
+        "index_compressor_gate",
+        "index_compressor_ape",
+        "index_compressor_norm",
+        "past_index_key",
+        "past_index_carry",
+    ];
+    let node_inputs = inputs
+        .iter()
+        .zip(names)
+        .map(|(input, name)| {
+            let value = graph.create_named_value(
+                name,
+                input.dtype,
+                static_shape(input.shape.iter().copied()),
+            );
+            graph.add_input(value);
+            Some(value)
+        })
+        .collect();
+    let outputs = vec![
+        graph.create_named_value(
+            "Y",
+            DataType::Float32,
+            static_shape([1, RATIO4_SEQUENCE, 1, DIM]),
+        ),
+        graph.create_named_value(
+            "present_compressed_kv",
+            DataType::Uint8,
+            static_shape([1, 1, STORED_WIDTH]),
+        ),
+        graph.create_named_value(
+            "present_compression_carry",
+            DataType::Float32,
+            static_shape([1, 8, 2, RATIO4_MAIN_WIDTH]),
+        ),
+        graph.create_named_value(
+            "present_index_key",
+            DataType::Uint8,
+            static_shape([1, 1, RATIO4_INDEX_STORED_WIDTH]),
+        ),
+        graph.create_named_value(
+            "present_index_carry",
+            DataType::Float32,
+            static_shape([1, 8, 2, RATIO4_INDEX_COMPRESSOR_WIDTH]),
+        ),
+        graph.create_named_value(
+            "selected_indices",
+            DataType::Int32,
+            static_shape([1, RATIO4_INDEX_HEADS, RATIO4_SEQUENCE, 1]),
+        ),
+    ];
+    let mut node = Node::new(
+        NodeId(0),
+        "CompressedSparseAttention",
+        node_inputs,
+        outputs.clone(),
+    );
+    node.domain = DOMAIN.into();
+    node.attributes
+        .insert("num_heads".into(), Attribute::Int(1));
+    node.attributes
+        .insert("head_dim".into(), Attribute::Int(DIM as i64));
+    node.attributes
+        .insert("qk_rope_head_dim".into(), Attribute::Int(ROPE_DIM as i64));
+    node.attributes
+        .insert("compression_ratio".into(), Attribute::Int(RATIO4 as i64));
+    node.attributes.insert(
+        "index_num_heads".into(),
+        Attribute::Int(RATIO4_INDEX_HEADS as i64),
+    );
+    node.attributes.insert(
+        "index_head_dim".into(),
+        Attribute::Int(RATIO4_INDEX_DIM as i64),
+    );
+    node.attributes
+        .insert("index_topk".into(), Attribute::Int(1));
+    node.attributes.insert("causal".into(), Attribute::Int(1));
+    node.attributes
+        .insert("cache_layout_version".into(), Attribute::Int(1));
+    node.attributes
+        .insert("index_layout_version".into(), Attribute::Int(1));
+    node.attributes.insert(
+        "cache_format".into(),
+        Attribute::String("fp8_e4m3_block64".as_bytes().to_vec()),
+    );
+    let node = graph.insert_node(node);
+    for output in outputs {
+        graph.add_output(output);
+    }
+    (graph, node)
+}
+
+fn claim_metadata(inputs: &[HostTensor]) -> (Vec<onnx_runtime_ir::Shape>, Vec<DataType>) {
+    (
+        inputs
+            .iter()
+            .map(|input| static_shape(input.shape.iter().copied()))
+            .collect(),
+        inputs.iter().map(|input| input.dtype).collect(),
+    )
 }
 
 struct OutputSpec {
@@ -514,6 +715,56 @@ fn ratio128_prefill_then_two_decodes_matches_cpu() {
     assert_eq!(after_decode2.cache.shape, vec![1, 1, STORED_WIDTH]);
 }
 
+#[test]
+fn ratio4_prefill_claim_and_execute_matches_cpu() {
+    let Some(ep) = gpu() else { return };
+    let inputs = ratio4_inputs();
+    let (graph, node) = ratio4_node(&inputs);
+    let (shapes, dtypes) = claim_metadata(&inputs);
+    assert!(
+        matches!(
+            ep.supports_op(graph.node(node), 1, &shapes, &dtypes, &[]),
+            KernelMatch::Supported { .. }
+        ),
+        "valid ratio-4 CSA must be claimed"
+    );
+
+    let output_specs = vec![
+        OutputSpec {
+            dtype: DataType::Float32,
+            shape: vec![1, RATIO4_SEQUENCE, 1, DIM],
+        },
+        OutputSpec {
+            dtype: DataType::Uint8,
+            shape: vec![1, 1, STORED_WIDTH],
+        },
+        OutputSpec {
+            dtype: DataType::Float32,
+            shape: vec![1, 8, 2, RATIO4_MAIN_WIDTH],
+        },
+        OutputSpec {
+            dtype: DataType::Uint8,
+            shape: vec![1, 1, RATIO4_INDEX_STORED_WIDTH],
+        },
+        OutputSpec {
+            dtype: DataType::Float32,
+            shape: vec![1, 8, 2, RATIO4_INDEX_COMPRESSOR_WIDTH],
+        },
+        OutputSpec {
+            dtype: DataType::Int32,
+            shape: vec![1, RATIO4_INDEX_HEADS, RATIO4_SEQUENCE, 1],
+        },
+    ];
+    let cpu = run_cpu(&graph, node, &inputs, &output_specs).expect("CPU ratio-4 CSA kernel");
+    let gpu = run_gpu(&ep, &graph, node, &inputs, &output_specs).expect("CUDA ratio-4 CSA kernel");
+    assert_f32_close(&gpu[0], &cpu[0], 1e-4, "ratio-4 Y");
+    assert_eq!(gpu[1], cpu[1], "ratio-4 compressed cache");
+    assert_f32_close(&gpu[2], &cpu[2], 1e-4, "ratio-4 compression carry");
+    assert_eq!(gpu[3], cpu[3], "ratio-4 index cache");
+    assert_f32_close(&gpu[4], &cpu[4], 1e-4, "ratio-4 index carry");
+    assert_eq!(gpu[5], cpu[5], "ratio-4 selected indices");
+}
+
 /// `supports_op` must reject, at claim time, ratio/dtype/attribute combinations
 /// the kernel does not correctly handle — rather than claiming the node and
 /// failing inside `execute` (doc §4.8).
@@ -597,5 +848,131 @@ fn supports_op_rejects_unsupported_configs() {
             KernelMatch::Unsupported { .. }
         ),
         "non-f32 query dtype must be rejected at claim time"
+    );
+}
+
+#[test]
+fn supports_op_rejects_non_query_fixed_input_dtype() {
+    let Some(ep) = gpu() else { return };
+    let inputs = ratio4_inputs();
+    let (graph, node) = ratio4_node(&inputs);
+    let (shapes, mut dtypes) = claim_metadata(&inputs);
+    dtypes[1] = DataType::Float16;
+    assert!(
+        matches!(
+            ep.supports_op(graph.node(node), 1, &shapes, &dtypes, &[]),
+            KernelMatch::Unsupported { .. }
+        ),
+        "Float16 current_kv must be rejected at claim time"
+    );
+}
+
+#[test]
+fn supports_op_rejects_ratio4_non_128_index_head_dim() {
+    let Some(ep) = gpu() else { return };
+    let inputs = ratio4_inputs();
+    let (mut graph, node) = ratio4_node(&inputs);
+    graph
+        .node_mut(node)
+        .attributes
+        .insert("index_head_dim".into(), Attribute::Int(64));
+    let (shapes, dtypes) = claim_metadata(&inputs);
+    assert!(
+        matches!(
+            ep.supports_op(graph.node(node), 1, &shapes, &dtypes, &[]),
+            KernelMatch::Unsupported { .. }
+        ),
+        "ratio-4 index_head_dim != 128 must be rejected at claim time"
+    );
+}
+
+#[test]
+fn supports_op_rejects_ratio4_missing_index_inputs() {
+    let Some(ep) = gpu() else { return };
+    let inputs = ratio4_inputs();
+    let (mut graph, node) = ratio4_node(&inputs);
+    graph.node_mut(node).inputs.truncate(11);
+    let (mut shapes, mut dtypes) = claim_metadata(&inputs);
+    shapes.truncate(11);
+    dtypes.truncate(11);
+    assert!(
+        matches!(
+            ep.supports_op(graph.node(node), 1, &shapes, &dtypes, &[]),
+            KernelMatch::Unsupported { .. }
+        ),
+        "ratio-4 without inputs 11..18 must be rejected at claim time"
+    );
+}
+
+#[test]
+fn supports_op_rejects_ratio4_wrong_output_count() {
+    let Some(ep) = gpu() else { return };
+    let inputs = ratio4_inputs();
+    let (mut graph, node) = ratio4_node(&inputs);
+    graph.node_mut(node).outputs.truncate(4);
+    let (shapes, dtypes) = claim_metadata(&inputs);
+    assert!(
+        matches!(
+            ep.supports_op(graph.node(node), 1, &shapes, &dtypes, &[]),
+            KernelMatch::Unsupported { .. }
+        ),
+        "ratio-4 with fewer than five outputs must be rejected at claim time"
+    );
+}
+
+#[test]
+fn supports_op_rejects_ratio128_fp4_cache_format() {
+    let Some(ep) = gpu() else { return };
+    let ape = HostTensor::f32(&[RATIO, DIM], &rows(0, RATIO, ape_value));
+    let norm = HostTensor::f32(&[DIM], &vec![0.8f32; DIM]);
+    let sink = HostTensor::f32(&[1], &[-0.375]);
+    let state = CsaState {
+        cache: HostTensor::zeros(DataType::Uint8, &[1, 0, STORED_WIDTH]),
+        carry: HostTensor::zeros(DataType::Float32, &[1, RATIO, 2, DIM]),
+    };
+    let inputs = ratio128_inputs(1, 0, 0, 1, 1, &ape, &norm, &sink, &state);
+    let (mut graph, node) = ratio128_node(&inputs, 0);
+    graph.node_mut(node).attributes.insert(
+        "cache_format".into(),
+        Attribute::String("fp4_e2m1_block32".as_bytes().to_vec()),
+    );
+    let (shapes, dtypes) = claim_metadata(&inputs);
+    assert!(
+        matches!(
+            ep.supports_op(graph.node(node), 1, &shapes, &dtypes, &[]),
+            KernelMatch::Unsupported { .. }
+        ),
+        "ratio-128 FP4 cache format must be rejected at claim time"
+    );
+}
+
+#[test]
+fn supports_op_rejects_ratio128_ratio4_only_input() {
+    let Some(ep) = gpu() else { return };
+    let ape = HostTensor::f32(&[RATIO, DIM], &rows(0, RATIO, ape_value));
+    let norm = HostTensor::f32(&[DIM], &vec![0.8f32; DIM]);
+    let sink = HostTensor::f32(&[1], &[-0.375]);
+    let state = CsaState {
+        cache: HostTensor::zeros(DataType::Uint8, &[1, 0, STORED_WIDTH]),
+        carry: HostTensor::zeros(DataType::Float32, &[1, RATIO, 2, DIM]),
+    };
+    let inputs = ratio128_inputs(1, 0, 0, 1, 1, &ape, &norm, &sink, &state);
+    let (mut graph, node) = ratio128_node(&inputs, 0);
+    let index_query = graph.create_named_value(
+        "index_query",
+        DataType::Float32,
+        static_shape([1, 1, 1, RATIO4_INDEX_DIM]),
+    );
+    graph.add_input(index_query);
+    graph.node_mut(node).inputs.push(Some(index_query));
+    let (mut shapes, mut dtypes) = claim_metadata(&inputs);
+    shapes.push(static_shape([1, 1, 1, RATIO4_INDEX_DIM]));
+    dtypes.push(DataType::Float32);
+    assert!(
+        matches!(
+            ep.supports_op(graph.node(node), 1, &shapes, &dtypes, &[]),
+            KernelMatch::Unsupported { .. }
+        ),
+        "ratio-4-only inputs must be rejected for ratio-128 at claim time"
     );
 }
