@@ -9,3 +9,6 @@
 
 
 - 2026-07-18: Merged 17 decision notes; wrote orchestration/session logs and progress update. No history exceeded summarization threshold.
+
+## 2026-07-18T01:20:34Z — PR #25 and CUDA SparseKvGather archive
+- Merged seven decision notes, wrote orchestration/session logs, and updated progress. Ash and Hudson remain in flight.

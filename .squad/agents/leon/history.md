@@ -78,3 +78,6 @@ Loader opset-import validation for file, from-parts, and nested-subgraph paths m
 - Chew's corrective `a77eed0` and Nabil 🟢 approval closed the landing; large-model exact-logit/throughput validation remains deferred.
 
 - 2026-07-18 Scribe: Initial Reshape/Split validation and coverage work was superseded by the reviewed correction.
+
+## 2026-07-18T01:20:34Z — CUDA SparseKvGather D==0 fix landed
+- Fixed validation ordering in `c2180c9`; three D==0 parity tests passed 12/12, Gorman re-approved, and CUDA SparseKvGather landed.

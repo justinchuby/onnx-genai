@@ -466,3 +466,7 @@ Coverage-uplift directive ("test coverage 要提上来 这种错误最好测试�
 ## 2026-07-18 — PR triage (6 PRs) + GPU-native Attention + CI fix
 
 GPU-native standard Attention landed, including the present-value cache-geometry correction. Fixed red CI by installing numpy/onnxscript for projection-fusion tests. Merged PRs #20, #23, #26, #27, and #28; #25 remains in review-fix. DeepSeek CUDA SparseKvGather and KIMI readiness work kicked off.
+
+## 2026-07-18 — PR closure and CUDA sparse KV landing
+
+- All 6 open PRs merged (#20,#23,#25,#26,#27,#28); CUDA SparseKvGather landed (DeepSeek/GLM sparse KV primitive now GPU-native); in flight: CUDA CompressedSparseAttention (host-staged, Ash) + MTP Phase 1 sidecar metadata (Hudson).

@@ -79,3 +79,6 @@ Reviewed Gather/Shape/Constant through three resolved rejection cycles.
 
 - **Real-model sub-4-bit milestone:** Qwen2.5-0.5B IQ4_XS produced coherent CPU-native output through 144 `BlockQuantizedMatMul` nodes (120 IQ4_NL, 24 IQ4_XS), with both formats executed without fallback (`2f65135`).
 - **Mobius #406 update:** commit `797fff9` fixes mixed-native scaffolding and emits genai-domain opset v1; 304 tests passed and the PR awaits user merge.
+
+## 2026-07-18T01:20:34Z — PR #25 lifecycle regression landed
+- Replaced simulated lifecycle coverage with an isolated child-process test using real `Environment` create/drop and plugin registration; Vasquez approved `dbff29c`, and PR #25 merged.

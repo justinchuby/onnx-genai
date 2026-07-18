@@ -524,3 +524,52 @@ No real bug was surfaced: all three regression tests pass against the current im
 **What:** Reuse CSA's versioned state/operator lifecycle, standard Attention/RoPE as fallback oracles, and QMoE/block-dequant internals, but implement KDA and Gated MLA as distinct semantic operators. Keep K3 MTP conditional until the released package verifies it.
 **Why:** Current CPU CSA is DeepSeek-specific ratio-4/128 temporal compression, while public KDA uses gated recurrent matrix state and MLA uses learned low-rank latent KV. Conflating them would freeze an incorrect cache ABI before K3 weights and the technical report arrive on or before 2026-07-27.
 
+
+<!-- merged from bishop-cuda-sparse-kv-gather.md -->
+
+### 2026-07-18: Device-native `pkg.nxrt::SparseKvGather` on the CUDA EP
+**By:** Bishop
+**What:** Added and registered a device-native CUDA `SparseKvGather` kernel for `pkg.nxrt::SparseKvGather` v1, with raw-byte support for f32/f16/bf16 cache values, host-side deterministic index validation, and 9 parity/edge tests. The kernel preserves order and duplicates and keeps cache/index data device-resident during the copy.
+**Why:** DeepSeek/GLM compressed sparse-attention was CPU-only; this closes the GPU execution gap while preserving the authoritative CPU contract. Host validation means `cuda_graph_compatible()` remains false.
+
+<!-- merged from gorman-cuda-sparse-kv-gather-review.md -->
+
+### 2026-07-18: CUDA SparseKvGather correctness review
+**By:** Gorman
+**What:** 🔴 REJECT commit `751a387`; reassign to Leon and lock Bishop out for this revision cycle.
+**Why:** The `output_bytes == 0` early return skipped index validation for non-empty records with `D == 0`, allowing CUDA to accept negative or out-of-range indices that the CPU implementation rejects. Validation must run before the zero-output return whenever records are nonzero; add valid, negative, and upper-bound `D == 0` parity tests. Other registration, indexing, dtype, and graph-compatibility mechanics were correct.
+
+<!-- merged from pris-pr25-test.md -->
+
+### 2026-07-18: Exercise the real ORT Environment lifecycle in the plugin-cache regression
+**By:** Pris
+**What:** Replaced the simulated parallel regression with an isolated child-process test using real `Environment` values, the production lifecycle counter, and registration cache. It verifies live sharing, last-drop clearing, and that a fresh environment attempts registration instead of returning a stale-cache hit.
+**Why:** A child process guarantees the real process-local 1 → 0 transition despite concurrent test harness activity. A missing plugin path provides evidence of a fresh registration attempt without requiring a shared-library fixture.
+
+<!-- merged from vasquez-pr25-rereview.md -->
+
+### 2026-07-18: PR #25 lifecycle fix re-review
+**By:** Vasquez
+**What:** 🔴 REJECT commit `8c96fba`; the production lifecycle fix is sound, but the regression test only exercises `SimulatedEnvironment` and a local registration map.
+**Why:** It never calls production `Environment::new`, `Drop`, or `register_execution_provider_library`, so it would pass if either production lifecycle hook were removed. Pris must drive the actual create/drop/recreate/registration path; Newt and Deckard are locked out for this artifact revision.
+
+<!-- merged from gorman-cuda-sparse-kv-gather-rereview.md -->
+
+### 2026-07-18T01:20:34Z: CUDA SparseKvGather D==0 re-review
+**By:** Gorman
+**What:** 🟢 APPROVE commit `c2180c9`.
+**Why:** For nonzero records, CUDA now copies and validates every index before the zero-byte-output return, so `D == 0` enforces negative-index and upper-bound errors through the same path as non-empty output. Zero-record cases safely skip validation; valid-length mapping and normal execution remain correct. The focused integration gate passed 12/12 tests.
+
+<!-- merged from leon-cuda-sparse-kv-gather-fix.md -->
+
+### 2026-07-18T01:20:34Z: Validate CUDA SparseKvGather indices for zero-width records
+**By:** Leon
+**What:** Moved host-side D2H index validation before the zero-output return and gated it on `records > 0`, preserving `valid_lengths` handling while allowing `D == 0` to return only after all indices are validated. Added valid, negative, equal-to-`C`, and greater-than-`C` CUDA/CPU parity tests.
+**Why:** CUDA previously skipped validation whenever output bytes were zero, diverging from the CPU `out_of_range="error"` contract. The targeted suite passed 12/12 tests.
+
+<!-- merged from vasquez-pr25-rereview-2.md -->
+
+### 2026-07-18T01:20:34Z: PR #25 plugin lifecycle regression re-review
+**By:** Vasquez
+**What:** 🟢 APPROVE commit `dbff29c`.
+**Why:** The rewritten test uses real `Environment::new` values and their real `Drop`, proving cache sharing while environments are live, retention after the first drop, clearing on final drop, and a fresh registration attempt after recreation. The isolated child process and PID-specific key prevent global-state leakage; Linux, Windows, and macOS checks are green.
