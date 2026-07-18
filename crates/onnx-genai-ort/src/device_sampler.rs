@@ -1,35 +1,36 @@
-//! Device-side greedy token selection for captured decode.
+//! Device-side token sampling for captured decode.
 //!
-//! In the captured greedy decode loop the model's `logits [1, 1, vocab]` output
-//! is the only tensor we need to reduce to a single winning token id. When the
-//! logits buffer is CPU-allocated, ORT copies the entire vocabulary (e.g.
-//! 151,936 f16 = ~300 KiB) host-side every token inside `RunWithBinding`, and we
-//! then argmax on the host. onnxruntime-genai avoids this by keeping logits on
-//! the GPU and reducing them with a custom CUDA kernel; this module does the
-//! same. [`DeviceGreedySampler`] is the extension point for compute backends;
-//! [`CudaArgmax`] provides the CUDA implementation.
+//! In the captured decode loop the model's `logits [1, 1, vocab]` output is the
+//! only tensor we need to reduce to a single winning token id. When the logits
+//! buffer is CPU-allocated, ORT copies the entire vocabulary (e.g. 151,936 f16 =
+//! ~300 KiB) host-side every token inside `RunWithBinding`, and we then sample on
+//! the host. onnxruntime-genai avoids this by keeping logits on the GPU and
+//! reducing them with custom CUDA kernels; this module does the same.
+//! [`DeviceSampler`] is the extension point for compute backends;
+//! [`CudaSampler`] provides the CUDA implementation.
 //!
-//! The logits buffer is allocated on the session's CUDA device allocator (see
-//! [`crate::decode`]). After each captured replay we launch a single-block
-//! argmax kernel over the final vocabulary row directly on that device pointer
-//! and copy back only the 4-byte token id. Both the host-side full-vocab copy
-//! and the host-side argmax disappear.
+//! The sampler applies the device-portable pipeline — temperature, top-k, top-p,
+//! min-p, then greedy (argmax) or categorical selection — entirely on the device
+//! pointer, copying back only the 4-byte token id(s). History-dependent
+//! processors (repetition/frequency/presence penalties, grammar constraints,
+//! stop sequences) and logprobs remain host-side; [`DeviceSampler::copy_row_to_host`]
+//! serves those by copying the full row on demand.
 //!
 //! ## Context sharing
 //!
 //! [`cudarc::driver::CudaContext::new`] *retains the primary context* of the
 //! device (`cuDevicePrimaryCtxRetain`), which is the very context ORT's built-in
 //! CUDA EP drives. Device pointers are therefore valid across both, so the
-//! kernel can read ORT's logits allocation directly with no cross-context copy
+//! kernels can read ORT's logits allocation directly with no cross-context copy
 //! (unlike `OrtApi::CopyTensors`, which has no data-transfer path for the
 //! built-in CUDA EP).
 //!
 //! ## Correctness
 //!
-//! The kernel matches the host reference argmax used elsewhere in the crate:
-//! maximum value, **NaNs ignored**, **lowest index wins ties**, and index `0`
-//! for an all-NaN (or empty) row. f16/bf16 are decoded to f32 with pure integer
-//! bit math so the NVRTC source needs no `<cuda_fp16.h>` (keeping it
+//! The greedy (argmax) kernel matches the host reference argmax used elsewhere in
+//! the crate: maximum value, **NaNs ignored**, **lowest index wins ties**, and
+//! index `0` for an all-NaN (or empty) row. f16/bf16 are decoded to f32 with pure
+//! integer bit math so the NVRTC source needs no `<cuda_fp16.h>` (keeping it
 //! self-contained and header-free).
 
 use std::sync::Mutex;
@@ -40,19 +41,59 @@ use cudarc::driver::{CudaContext, CudaFunction, CudaStream, LaunchConfig, PushKe
 use crate::error::{OrtError, Result};
 use crate::value::DataType;
 
-/// Device-side greedy token selection over logits that remain in device memory.
+/// Parameters for one device sampling step.
 ///
-/// Compute backends implement this interface to reduce `[rows, vocab]` logits
-/// to one token id per row without copying the full vocabulary to the host.
-pub(crate) trait DeviceGreedySampler: Send {
-    fn argmax(&self, dtype: DataType, ptr_addr: usize, vocab: usize) -> Result<u32>;
+/// Mirrors the device-portable subset of `GenerateOptions`. History-dependent
+/// processing (penalties, constraints, stop sequences) is applied host-side
+/// before/around this and is intentionally absent here.
+///
+/// `greedy` short-circuits to argmax and ignores every filter, since top-k /
+/// top-p / min-p / temperature are all monotonic and never change the argmax.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DeviceSampleParams {
+    /// Softmax temperature. `<= 0.0` or `1.0` means "no scaling".
+    pub temperature: f32,
+    /// Keep only the `top_k` highest-probability tokens. `0` disables.
+    pub top_k: usize,
+    /// Nucleus threshold in `(0, 1]`. `>= 1.0` disables.
+    pub top_p: f32,
+    /// Minimum probability relative to the max (`min_p * p_max`). `<= 0.0` disables.
+    pub min_p: f32,
+    /// Select the argmax token (ignore every filter and the RNG).
+    pub greedy: bool,
+    /// Uniform draw in `[0, 1)` used for the categorical pick when `!greedy`.
+    pub rng_value: f32,
+}
 
-    fn argmax_rows(
+impl DeviceSampleParams {
+    /// Pure greedy selection: argmax, no filters, no RNG.
+    pub fn greedy() -> Self {
+        Self {
+            temperature: 1.0,
+            top_k: 0,
+            top_p: 1.0,
+            min_p: 0.0,
+            greedy: true,
+            rng_value: 0.0,
+        }
+    }
+}
+
+/// Device-side token selection over logits that remain in device memory.
+///
+/// Compute backends implement this interface to reduce `[rows, vocab]` logits to
+/// one token id per row — applying temperature/top-k/top-p/min-p and the final
+/// greedy or categorical pick — without copying the full vocabulary to the host.
+pub(crate) trait DeviceSampler: Send {
+    /// Select one token id per row from the device logits buffer at `ptr_addr`,
+    /// applying `params` on-device.
+    fn sample(
         &self,
         dtype: DataType,
         ptr_addr: usize,
         rows: usize,
         vocab: usize,
+        params: &DeviceSampleParams,
     ) -> Result<Vec<u32>>;
 
     fn copy_row_to_host(
@@ -187,9 +228,9 @@ extern "C" __global__ void argmax_f32(const float* x, int rows, int vocab, int* 
 }
 "#;
 
-/// A compiled, ready-to-launch on-device argmax bound to device 0's primary
+/// A compiled, ready-to-launch on-device sampler bound to device 0's primary
 /// context. Cheap to hold; NVRTC compilation happens once at construction.
-pub(crate) struct CudaArgmax {
+pub(crate) struct CudaSampler {
     ctx: std::sync::Arc<CudaContext>,
     stream: std::sync::Arc<CudaStream>,
     f_f16: CudaFunction,
@@ -210,11 +251,11 @@ struct OutScratch {
 // SAFETY: every device operation binds the primary context first and the shared
 // `out` scratch is guarded by its `Mutex`, so the handle is safe to move/share
 // across threads.
-unsafe impl Send for CudaArgmax {}
-unsafe impl Sync for CudaArgmax {}
+unsafe impl Send for CudaSampler {}
+unsafe impl Sync for CudaSampler {}
 
-impl CudaArgmax {
-    /// Initialise the primary context on device `ordinal`, compile the argmax
+impl CudaSampler {
+    /// Initialise the primary context on device `ordinal`, compile the sampler
     /// module, and allocate the initial result scratch.
     pub(crate) fn new(ordinal: usize) -> Result<Self> {
         let ctx = CudaContext::new(ordinal)
@@ -258,20 +299,13 @@ impl CudaArgmax {
     }
 }
 
-impl DeviceGreedySampler for CudaArgmax {
-    /// Argmax over the final (single) `vocab`-element device row at `ptr_addr`.
-    /// Convenience wrapper over [`DeviceGreedySampler::argmax_rows`] for the common
-    /// single-token greedy decode path.
-    fn argmax(&self, dtype: DataType, ptr_addr: usize, vocab: usize) -> Result<u32> {
-        Ok(self.argmax_rows(dtype, ptr_addr, 1, vocab)?[0])
-    }
-
+impl CudaSampler {
     /// Argmax each of `rows` contiguous `vocab`-element rows in the device buffer
     /// at `ptr_addr` (a device pointer, e.g. from
     /// [`crate::value::Value::data_ptr_addr`]), returning one token id per row.
     /// Synchronizes the context first so all of ORT's just-issued decode work
     /// (which wrote these logits) is visible to the kernel.
-    fn argmax_rows(
+    pub(crate) fn argmax_rows(
         &self,
         dtype: DataType,
         ptr_addr: usize,
@@ -340,6 +374,28 @@ impl DeviceGreedySampler for CudaArgmax {
             .map_err(|e| OrtError::Cuda(format!("stream synchronize: {e:?}")))?;
         Ok(idx.into_iter().map(|v| v as u32).collect())
     }
+}
+
+impl DeviceSampler for CudaSampler {
+    fn sample(
+        &self,
+        dtype: DataType,
+        ptr_addr: usize,
+        rows: usize,
+        vocab: usize,
+        params: &DeviceSampleParams,
+    ) -> Result<Vec<u32>> {
+        // Greedy is exact via argmax and ignores every monotonic filter
+        // (temperature/top-k/top-p/min-p never move the maximum).
+        if params.greedy {
+            return self.argmax_rows(dtype, ptr_addr, rows, vocab);
+        }
+        // Filtered categorical sampling kernels land in a follow-up; the engine
+        // falls back to the host sampler until then.
+        Err(OrtError::Cuda(
+            "device sampled (non-greedy) path not yet implemented".into(),
+        ))
+    }
 
     /// Copy a `len`-element device row of `dtype` at `ptr_addr` into `dst`
     /// (host), for the non-greedy path that still needs the full vocabulary.
@@ -377,7 +433,7 @@ impl DeviceGreedySampler for CudaArgmax {
     }
 
     fn name(&self) -> &str {
-        "cuda_argmax"
+        "cuda_sampler"
     }
 }
 
@@ -400,7 +456,7 @@ impl OutScratch {
     }
 }
 
-impl Drop for CudaArgmax {
+impl Drop for CudaSampler {
     fn drop(&mut self) {
         // Best-effort free of the scratch; ignore errors during teardown.
         if self.ctx.bind_to_thread().is_ok() {
