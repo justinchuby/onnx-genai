@@ -603,6 +603,14 @@ struct RefCase<'a> {
 /// the kernel's stage ordering. `qk_mode` selects the captured qk stage (0 raw,
 /// 1 after softcap, 2 after mask, 3 after softmax), returned alongside Y.
 fn sdpa_ref(case: &RefCase, qk_mode: i64) -> (Vec<f32>, Vec<f32>) {
+    sdpa_ref_with_pad_limit(case, qk_mode, None)
+}
+
+fn sdpa_ref_with_pad_limit(
+    case: &RefCase,
+    qk_mode: i64,
+    pad_limit: Option<i64>,
+) -> (Vec<f32>, Vec<f32>) {
     let RefCase {
         q,
         key,
@@ -662,6 +670,10 @@ fn sdpa_ref(case: &RefCase, qk_mode: i64) -> (Vec<f32>, Vec<f32>) {
                 }
                 let causal_limit = i as i64 + *offset;
                 for (j, sc) in scores.iter_mut().enumerate() {
+                    if pad_limit.is_some_and(|limit| j as i64 >= limit) {
+                        *sc = f32::NEG_INFINITY;
+                        continue;
+                    }
                     if *is_causal && (j as i64) > causal_limit {
                         *sc = f32::NEG_INFINITY;
                         continue;
@@ -950,6 +962,177 @@ fn standard_attention_in_op_past_cache_matches_reference_and_present() {
 }
 
 #[test]
+fn standard_attention_present_value_uses_its_own_concat_geometry() {
+    // Key and value use different past/current splits but the same present
+    // length. The CPU reference concatenates each cache using its own sequence
+    // geometry before checking that the resulting present lengths agree.
+    let (b, h, q_seq, d) = (1usize, 1usize, 2usize, 1usize);
+    let (key_past_seq, key_cur_seq) = (3usize, 2usize);
+    let (value_past_seq, value_cur_seq) = (2usize, 3usize);
+    let total = key_past_seq + key_cur_seq;
+    assert_eq!(total, value_past_seq + value_cur_seq);
+
+    let q = [1.0f32, 1.0];
+    let past_k = [1.0f32, 2.0, 3.0];
+    let cur_k = [4.0f32, 5.0];
+    let past_v = [100.0f32, 200.0];
+    let cur_v = [300.0f32, 400.0, 500.0];
+    let present_k = [1.0f32, 2.0, 3.0, 4.0, 5.0];
+    let present_v = [100.0f32, 200.0, 300.0, 400.0, 500.0];
+    let (y_ref, _) = sdpa_ref(
+        &RefCase {
+            q: &q,
+            key: &present_k,
+            value: &present_v,
+            batch: b,
+            q_heads: h,
+            q_seq,
+            kv_heads: h,
+            total_seq: total,
+            head_size: d,
+            v_head_size: d,
+            mask: RefMask::None,
+            is_causal: true,
+            offset: key_past_seq as i64,
+            scale: None,
+            softcap: 0.0,
+        },
+        -1,
+    );
+    let inputs = [
+        Some(tensor(DataType::Float32, &[b, h, q_seq, d], &q)),
+        Some(tensor(DataType::Float32, &[b, h, key_cur_seq, d], &cur_k)),
+        Some(tensor(DataType::Float32, &[b, h, value_cur_seq, d], &cur_v)),
+        None,
+        Some(tensor(DataType::Float32, &[b, h, key_past_seq, d], &past_k)),
+        Some(tensor(
+            DataType::Float32,
+            &[b, h, value_past_seq, d],
+            &past_v,
+        )),
+    ];
+    let out = run_opt(
+        "Attention",
+        23,
+        &inputs,
+        &[
+            (DataType::Float32, vec![b, h, q_seq, d]),
+            (DataType::Float32, vec![b, h, total, d]),
+            (DataType::Float32, vec![b, h, total, d]),
+        ],
+        &[("is_causal", Attribute::Int(1))],
+    );
+    assert_eq!(f32s(&out[1]), present_k);
+    assert_eq!(
+        f32s(&out[2]),
+        present_v,
+        "present_value must concatenate at value_past_seq, not key_past_seq"
+    );
+    assert_close(&f32s(&out[0]), &y_ref);
+}
+
+#[test]
+fn standard_attention_opset24_nonpad_kv_seqlen_masks_padding_and_offsets_causal() {
+    let (b, h, q_seq, kv_seq, d) = (1usize, 1usize, 2usize, 4usize, 2usize);
+    let nonpad = 3i64;
+    let offset = nonpad - q_seq as i64;
+    let q = seq_f32(b * h * q_seq * d);
+    let k = seq_f32(b * h * kv_seq * d);
+    let v = [10.0f32, 11.0, 20.0, 21.0, 30.0, 31.0, 900.0, 901.0];
+    let inputs = [
+        Some(tensor(DataType::Float32, &[b, h, q_seq, d], &q)),
+        Some(tensor(DataType::Float32, &[b, h, kv_seq, d], &k)),
+        Some(tensor(DataType::Float32, &[b, h, kv_seq, d], &v)),
+        None,
+        None,
+        None,
+        Some(tensor(DataType::Int64, &[b], &[nonpad])),
+    ];
+
+    for is_causal in [false, true] {
+        let (y_ref, qk_ref) = sdpa_ref_with_pad_limit(
+            &RefCase {
+                q: &q,
+                key: &k,
+                value: &v,
+                batch: b,
+                q_heads: h,
+                q_seq,
+                kv_heads: h,
+                total_seq: kv_seq,
+                head_size: d,
+                v_head_size: d,
+                mask: RefMask::None,
+                is_causal,
+                offset,
+                scale: None,
+                softcap: 0.0,
+            },
+            2,
+            Some(nonpad),
+        );
+        let attrs = [
+            ("is_causal", Attribute::Int(i64::from(is_causal))),
+            ("qk_matmul_output_mode", Attribute::Int(2)),
+        ];
+        let out = run_opt(
+            "Attention",
+            24,
+            &inputs,
+            &[
+                (DataType::Float32, vec![b, h, q_seq, d]),
+                (DataType::Float32, vec![b, h, kv_seq, d]),
+                (DataType::Float32, vec![b, h, kv_seq, d]),
+                (DataType::Float32, vec![b, h, q_seq, kv_seq]),
+            ],
+            &attrs,
+        );
+        assert_close(&f32s(&out[0]), &y_ref);
+        let got_qk = f32s(&out[3]);
+        for (idx, (&got, &expected)) in got_qk.iter().zip(&qk_ref).enumerate() {
+            if expected.is_finite() {
+                assert!(
+                    (got - expected).abs() <= 1e-4,
+                    "qk[{idx}]: {got} vs {expected}"
+                );
+            } else {
+                assert_eq!(got, expected, "qk[{idx}] infinity mismatch");
+            }
+        }
+        for row in got_qk.chunks_exact(kv_seq) {
+            assert_eq!(
+                row[3],
+                f32::NEG_INFINITY,
+                "padding key must always be masked"
+            );
+        }
+        if is_causal {
+            assert!(got_qk[0].is_finite() && got_qk[1].is_finite());
+            assert_eq!(got_qk[2], f32::NEG_INFINITY);
+            assert!(got_qk[kv_seq + 2].is_finite());
+        } else {
+            assert!(got_qk[..3].iter().all(|score| score.is_finite()));
+        }
+    }
+
+    let error = run_result_core(
+        "Attention",
+        23,
+        &inputs
+            .iter()
+            .map(|input| input.as_ref())
+            .collect::<Vec<_>>(),
+        &[(DataType::Float32, vec![b, h, q_seq, d])],
+        &[],
+    )
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("added in opset 24"),
+        "unexpected v23 error: {error}"
+    );
+}
+
+#[test]
 fn standard_attention_float_mask_add_matches_reference() {
     let (b, h, sq, d) = (1usize, 2usize, 2usize, 2usize);
     let q = seq_f32(b * h * sq * d);
@@ -1079,6 +1262,69 @@ fn standard_attention_softcap_matches_reference() {
         &attrs,
     );
     assert_close(&f32s(&out[0]), &y_ref);
+}
+
+#[test]
+fn standard_attention_explicit_scale_matches_reference() {
+    let (b, h, sq, d) = (1usize, 1usize, 3usize, 4usize);
+    let q = seq_f32(b * h * sq * d);
+    let k = seq_f32(b * h * sq * d)
+        .into_iter()
+        .map(|value| value + 0.75)
+        .collect::<Vec<_>>();
+    let v = seq_f32(b * h * sq * d)
+        .into_iter()
+        .map(|value| value * 3.0 + 2.0)
+        .collect::<Vec<_>>();
+    let scale = 0.125f32;
+    let (y_ref, _) = sdpa_ref(
+        &RefCase {
+            q: &q,
+            key: &k,
+            value: &v,
+            batch: b,
+            q_heads: h,
+            q_seq: sq,
+            kv_heads: h,
+            total_seq: sq,
+            head_size: d,
+            v_head_size: d,
+            mask: RefMask::None,
+            is_causal: false,
+            offset: 0,
+            scale: Some(scale),
+            softcap: 0.0,
+        },
+        -1,
+    );
+    let inputs = [
+        tensor(DataType::Float32, &[b, h, sq, d], &q),
+        tensor(DataType::Float32, &[b, h, sq, d], &k),
+        tensor(DataType::Float32, &[b, h, sq, d], &v),
+    ];
+    let explicit = run(
+        "Attention",
+        23,
+        &inputs,
+        &[(DataType::Float32, vec![b, h, sq, d])],
+        &[("scale", Attribute::Float(scale))],
+    );
+    let default = run(
+        "Attention",
+        23,
+        &inputs,
+        &[(DataType::Float32, vec![b, h, sq, d])],
+        &[],
+    );
+    let explicit = f32s(&explicit[0]);
+    assert_close(&explicit, &y_ref);
+    assert!(
+        explicit
+            .iter()
+            .zip(f32s(&default[0]))
+            .any(|(explicit, default)| (explicit - default).abs() > 1e-4),
+        "explicit non-default scale must affect the result"
+    );
 }
 
 #[test]

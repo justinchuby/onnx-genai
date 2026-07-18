@@ -618,7 +618,8 @@ impl Kernel for StandardAttentionKernel {
         } else {
             None
         };
-        let past_seq = past_key.as_ref().map(|p| p.seq).unwrap_or(0);
+        let key_past_seq = past_key.as_ref().map(|p| p.seq).unwrap_or(0);
+        let value_past_seq = past_value.as_ref().map(|p| p.seq).unwrap_or(0);
 
         // Preserve the concat compatibility checks (past vs current dims).
         if let Some(past) = &past_key {
@@ -678,8 +679,8 @@ impl Kernel for StandardAttentionKernel {
         let q_seq = q.seq;
         let head_size = q.dim;
         let kv_heads = k_cur.heads;
-        let total_seq = past_seq + k_cur.seq;
-        let v_total_seq = past_value.as_ref().map(|p| p.seq).unwrap_or(0) + v_cur.seq;
+        let total_seq = key_past_seq + k_cur.seq;
+        let value_total_seq = value_past_seq + v_cur.seq;
         let v_head_size = v_cur.dim;
 
         if k_cur.dim != head_size {
@@ -688,9 +689,9 @@ impl Kernel for StandardAttentionKernel {
                 k_cur.dim
             )));
         }
-        if v_total_seq != total_seq {
+        if value_total_seq != total_seq {
             return Err(EpError::KernelFailed(format!(
-                "Attention: present_key seq {total_seq} != present_value seq {v_total_seq}"
+                "Attention: present_key seq {total_seq} != present_value seq {value_total_seq}"
             )));
         }
         if k_cur.batch != batch || v_cur.batch != batch {
@@ -824,7 +825,7 @@ impl Kernel for StandardAttentionKernel {
         for b in 0..batch {
             offsets[b] = match &nonpad_kv_seqlen {
                 Some(seqlen) => seqlen[b] - q_seq as i64,
-                None => past_seq as i64,
+                None => key_past_seq as i64,
             };
             pad_limits[b] = match &nonpad_kv_seqlen {
                 Some(seqlen) => seqlen[b],
@@ -878,7 +879,7 @@ impl Kernel for StandardAttentionKernel {
                 past_key.as_ref().map(|p| p.is_3d).unwrap_or(false),
                 batch,
                 kv_heads,
-                past_seq,
+                key_past_seq,
                 k_cur.seq,
                 total_seq,
                 head_size,
@@ -892,9 +893,9 @@ impl Kernel for StandardAttentionKernel {
                 past_value.as_ref().map(|p| p.is_3d).unwrap_or(false),
                 batch,
                 kv_heads,
-                past_seq,
+                value_past_seq,
                 v_cur.seq,
-                total_seq,
+                value_total_seq,
                 v_head_size,
             )?;
 
