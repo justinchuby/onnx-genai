@@ -323,7 +323,9 @@ __device__ void finish_row(float* w, int vocab, float m,
     float topp_thresh = 0.0f;
     if (top_p > 0.0f && top_p < 1.0f) {
         float lo = 0.0f, hi = p_max;
-        for (int it = 0; it < 64; ++it) {
+        // 32 bisections exhaust f32 precision on [0, p_max]; more only burns
+        // full-vocab reductions without moving the threshold.
+        for (int it = 0; it < 32; ++it) {
             float mid = 0.5f * (lo + hi);
             float loc = 0.0f;
             for (int i = tid; i < vocab; i += BLOCK) {
@@ -994,7 +996,7 @@ mod tests {
         let mut topp_thresh = 0.0f32;
         if params.top_p > 0.0 && params.top_p < 1.0 {
             let (mut lo, mut hi) = (0.0f32, p_max);
-            for _ in 0..64 {
+            for _ in 0..32 {
                 let mid = 0.5 * (lo + hi);
                 let sm: f32 = w.iter().filter(|&&p| p >= mid).sum();
                 if sm >= params.top_p {

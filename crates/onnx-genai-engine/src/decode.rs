@@ -612,6 +612,17 @@ pub(crate) fn next_session_token_sampled(
         return Ok(None);
     }
     let (mut input_tokens, mut past_len) = session_decode_input_tokens(state)?;
+    // The device sampler only applies to captured single-token decode steps. The
+    // prompt-prefill (multi-token) step has no captured graph and returns host
+    // logits, so signal "not applicable this step" (`Ok(None)`) *without*
+    // running the model or advancing KV state — the caller re-drives via the
+    // host logits path. Crucially this is not a device-sampler failure, so the
+    // fast path stays armed for the single-token decode steps that follow.
+    // `session_decode_input_tokens` is a pure read, so returning here leaves all
+    // session state untouched for the host fallback to re-drive.
+    if input_tokens.len() != 1 {
+        return Ok(None);
+    }
     consume_windowed_prefix(
         session,
         kv_model,

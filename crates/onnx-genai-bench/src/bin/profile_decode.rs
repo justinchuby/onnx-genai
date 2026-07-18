@@ -10,7 +10,8 @@
 //!   ONNX_GENAI_PROFILE=1 cargo run --release -p onnx-genai-bench \
 //!     --features bench-ort --bin profile_decode -- \
 //!     --model models/qwen2.5-0.5b-q4-onnx-fixed --tokens 128 [--threads N] \
-//!     [--prompt "..."] [--warmups 1] [--runs 1] [--raw]
+//!     [--prompt "..."] [--warmups 1] [--runs 1] [--raw] [--temperature F]
+//!     [--top-p F] [--top-k N] [--min-p F] [--seed N]
 //!
 //! By default the `--prompt` is wrapped as a single user turn and rendered
 //! through the model's chat template (same path the server uses), so the
@@ -31,6 +32,11 @@ struct Args {
     warmups: usize,
     runs: usize,
     raw: bool,
+    temperature: f32,
+    top_p: f32,
+    top_k: usize,
+    min_p: f32,
+    seed: Option<u64>,
 }
 
 fn parse_args() -> Args {
@@ -41,6 +47,11 @@ fn parse_args() -> Args {
     let mut warmups = 1usize;
     let mut runs = 1usize;
     let mut raw = false;
+    let mut temperature = 0.0f32;
+    let mut top_p = 1.0f32;
+    let mut top_k = 0usize;
+    let mut min_p = 0.0f32;
+    let mut seed: Option<u64> = None;
 
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -54,6 +65,13 @@ fn parse_args() -> Args {
             "--warmups" => warmups = it.next().and_then(|v| v.parse().ok()).expect("--warmups N"),
             "--runs" => runs = it.next().and_then(|v| v.parse().ok()).expect("--runs N"),
             "--raw" => raw = true,
+            "--temperature" => {
+                temperature = it.next().and_then(|v| v.parse().ok()).expect("--temperature F");
+            }
+            "--top-p" => top_p = it.next().and_then(|v| v.parse().ok()).expect("--top-p F"),
+            "--top-k" => top_k = it.next().and_then(|v| v.parse().ok()).expect("--top-k N"),
+            "--min-p" => min_p = it.next().and_then(|v| v.parse().ok()).expect("--min-p F"),
+            "--seed" => seed = it.next().and_then(|v| v.parse().ok()),
             other => panic!("unknown arg: {other}"),
         }
     }
@@ -66,6 +84,11 @@ fn parse_args() -> Args {
         warmups,
         runs,
         raw,
+        temperature,
+        top_p,
+        top_k,
+        min_p,
+        seed,
     }
 }
 
@@ -132,10 +155,15 @@ fn build_engine(args: &Args) -> Engine {
     .expect("model must load")
 }
 
-fn request(prompt: &str, tokens: usize) -> GenerateRequest {
+fn request(args: &Args, prompt: &str) -> GenerateRequest {
     let mut request = GenerateRequest::new(prompt.to_string());
-    request.options.max_new_tokens = tokens;
-    request.options.temperature = 0.0;
+    request.options.max_new_tokens = args.tokens;
+    request.options.temperature = args.temperature;
+    request.options.top_p = args.top_p;
+    request.options.top_k = args.top_k;
+    request.options.min_p = args.min_p;
+    request.options.greedy = args.temperature == 0.0;
+    request.options.seed = args.seed;
     request.options.stop_on_eos = false;
     request
 }
@@ -143,12 +171,17 @@ fn request(prompt: &str, tokens: usize) -> GenerateRequest {
 fn main() {
     let args = parse_args();
     println!(
-        "profile_decode: model={} tokens={} threads={:?} warmups={} runs={} profile_enabled={}",
+        "profile_decode: model={} tokens={} threads={:?} warmups={} runs={} temp={} top_p={} top_k={} min_p={} seed={:?} profile_enabled={}",
         args.model.display(),
         args.tokens,
         args.threads,
         args.warmups,
         args.runs,
+        args.temperature,
+        args.top_p,
+        args.top_k,
+        args.min_p,
+        args.seed,
         profile::enabled()
     );
 
@@ -157,7 +190,7 @@ fn main() {
 
     for _ in 0..args.warmups {
         let result = engine
-            .generate(request(&prompt, args.tokens))
+            .generate(request(&args, &prompt))
             .expect("warmup generate");
         std::hint::black_box(&result);
     }
@@ -170,7 +203,7 @@ fn main() {
     let start = Instant::now();
     for _ in 0..args.runs {
         let result = engine
-            .generate(request(&prompt, args.tokens))
+            .generate(request(&args, &prompt))
             .expect("measured generate");
         total_tokens += result.token_ids.len() as u64;
         last_text = result.text.clone();
