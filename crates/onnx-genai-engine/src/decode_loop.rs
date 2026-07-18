@@ -75,11 +75,18 @@ pub(crate) trait DecodeLoopBackend {
     fn sampled_fastpath_supported(&self) -> bool {
         false
     }
-    /// Run one decode step and sample on the device. An error requests host fallback.
+    /// Run one decode step and sample on the device.
+    ///
+    /// Returns `Ok(Some(token))` when the device sampler selected a token,
+    /// `Ok(None)` when the fast path does not apply to this step (e.g. the
+    /// multi-token prompt-prefill step, which has no captured graph) so the
+    /// caller should fall back to host sampling *without* disabling the fast
+    /// path for subsequent single-token decode steps, and `Err` on a genuine
+    /// failure that should latch the fast path off.
     fn next_token_sampled(
         &mut self,
         _params: &onnx_genai_ort::DeviceSampleParams,
-    ) -> anyhow::Result<TokenId> {
+    ) -> anyhow::Result<Option<TokenId>> {
         anyhow::bail!("device sampled fast path is not supported by this decode backend")
     }
     /// Record that a device sampling attempt was unavailable for this backend.
@@ -173,6 +180,10 @@ pub(crate) fn step_decode_loop<B: DecodeLoopBackend>(
         backend.next_token_sampled(params)
     });
 
+    // Only a hard error latches the device fast path off. `Ok(None)` means the
+    // fast path did not apply to this step (the multi-token prefill has no
+    // captured graph and returns host logits); it must keep the fast path armed
+    // for the subsequent single-token decode steps that *can* device-sample.
     if sampled_result.as_ref().is_some_and(Result::is_err) {
         backend.sampled_fastpath_failed();
     }
@@ -209,7 +220,7 @@ pub(crate) fn step_decode_loop<B: DecodeLoopBackend>(
     let token_id = if greedy_fastpath {
         let _span = onnx_genai_ort::prof_span!("loop.next_logits");
         backend.next_token_greedy()?
-    } else if let Some(Ok(token_id)) = sampled_result {
+    } else if let Some(Ok(Some(token_id))) = sampled_result {
         token_id
     } else {
         // `step_sampled` is allowed to report that the device sampler is not
@@ -361,17 +372,30 @@ mod tests {
     use crate::processors::build_processor_chain;
     use std::path::Path;
 
+    #[derive(Clone, Copy)]
+    enum SampledOutcome {
+        HardError,
+        NotApplicable,
+        #[allow(dead_code)]
+        Token(TokenId),
+    }
+
     struct MockBackend {
         logits: Vec<Vec<f32>>,
         next_logits: usize,
         sampled_attempts: usize,
         sampled_supported: bool,
         sampled_failed: bool,
+        sampled_outcome: SampledOutcome,
         committed: Vec<TokenId>,
     }
 
     impl MockBackend {
         fn new(sampled_supported: bool) -> Self {
+            Self::with_outcome(sampled_supported, SampledOutcome::HardError)
+        }
+
+        fn with_outcome(sampled_supported: bool, sampled_outcome: SampledOutcome) -> Self {
             Self {
                 logits: vec![
                     vec![0.0, 0.4, 1.0],
@@ -382,6 +406,7 @@ mod tests {
                 sampled_attempts: 0,
                 sampled_supported,
                 sampled_failed: false,
+                sampled_outcome,
                 committed: Vec::new(),
             }
         }
@@ -414,9 +439,13 @@ mod tests {
         fn next_token_sampled(
             &mut self,
             _params: &onnx_genai_ort::DeviceSampleParams,
-        ) -> anyhow::Result<TokenId> {
+        ) -> anyhow::Result<Option<TokenId>> {
             self.sampled_attempts += 1;
-            anyhow::bail!("device sampler unavailable")
+            match self.sampled_outcome {
+                SampledOutcome::HardError => anyhow::bail!("device sampler unavailable"),
+                SampledOutcome::NotApplicable => Ok(None),
+                SampledOutcome::Token(token) => Ok(Some(token)),
+            }
         }
 
         fn sampled_fastpath_failed(&mut self) {
@@ -473,6 +502,57 @@ mod tests {
         assert_eq!(fallback.token_ids, host.token_ids);
         assert_eq!(fallback_backend.committed, host_backend.committed);
         assert_eq!(fallback_backend.sampled_attempts, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn sampled_fastpath_not_applicable_does_not_latch_off() -> anyhow::Result<()> {
+        // `Ok(None)` (e.g. the multi-token prefill step) must fall back to host
+        // sampling for that step WITHOUT disabling the device fast path, so the
+        // backend keeps being asked on every subsequent step.
+        let options = GenerateOptions {
+            max_new_tokens: 3,
+            greedy: false,
+            temperature: 0.8,
+            top_k: 2,
+            top_p: 0.95,
+            min_p: 0.1,
+            seed: Some(17),
+            ..Default::default()
+        };
+        let chain = build_processor_chain(&options, None)?;
+        let tokenizer = tokenizer()?;
+
+        let mut na_backend = MockBackend::with_outcome(true, SampledOutcome::NotApplicable);
+        let mut na_state = DecodeLoopState::new(0, options.seed, None);
+        let na = run_decode_loop(
+            &mut na_backend,
+            &mut na_state,
+            &options,
+            &chain,
+            &tokenizer,
+            None,
+            None,
+        )?;
+
+        let mut host_backend = MockBackend::new(false);
+        let mut host_state = DecodeLoopState::new(0, options.seed, None);
+        let host = run_decode_loop(
+            &mut host_backend,
+            &mut host_state,
+            &options,
+            &chain,
+            &tokenizer,
+            None,
+            None,
+        )?;
+
+        // Same tokens as the pure host path (device never selected a token) ...
+        assert_eq!(na.token_ids, host.token_ids);
+        assert_eq!(na_backend.committed, host_backend.committed);
+        // ... but the fast path stayed armed and was retried every step.
+        assert_eq!(na_backend.sampled_attempts, host_backend.committed.len());
+        assert!(!na_backend.sampled_failed);
         Ok(())
     }
 }

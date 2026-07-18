@@ -20,6 +20,11 @@ bench-native = [
 ]
 onednn = ["onnx-runtime-ep-cpu/onednn"]
 cuda = ["onnx-genai-engine/cuda", "onnx-runtime-session/cuda"]
+# Device-sampler-only CUDA: enables the ORT built-in CUDA EP path plus the
+# on-device argmax/sampler in `onnx-genai-ort` WITHOUT the pure-Rust
+# `onnx-runtime-ep-cuda` (which pins a different cudarc CUDA version and would
+# collide). Use this to benchmark the captured decode / device sampling path.
+cuda-ort = ["bench-ort", "onnx-genai-ort/cuda"]
 
 [dependencies]
 anyhow = { workspace = true }

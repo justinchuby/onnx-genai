@@ -2166,7 +2166,7 @@ impl DecodeLoopBackend for SessionDecodeLoopBackend<'_> {
     fn next_token_sampled(
         &mut self,
         params: &onnx_genai_ort::DeviceSampleParams,
-    ) -> anyhow::Result<TokenId> {
+    ) -> anyhow::Result<Option<TokenId>> {
         next_session_token_sampled(
             self.session,
             self.kv_model,
@@ -2174,8 +2174,7 @@ impl DecodeLoopBackend for SessionDecodeLoopBackend<'_> {
             self.session_id,
             self.state,
             params,
-        )?
-        .context("device sampled fast path unexpectedly returned no token")
+        )
     }
 
     fn sampled_fastpath_failed(&mut self) {
