@@ -569,7 +569,8 @@ state_groups:
       index_carry: [past_csa.2.index_carry, present_csa.2.index_carry]
 ```
 
-`DecodeState` should maintain, per forward:
+Each decode backend should maintain the authoritative cursor tuple, per
+forward:
 
 ```text
 token_len
@@ -579,16 +580,21 @@ index_len
 index_carry_len
 ```
 
-Before a speculative verification, capture a cursor checkpoint. After target
-verification, restore the cursor corresponding to `base_len + accepted`.
+Before a speculative verification, capture an opaque cursor checkpoint bound to
+the sequence/generation and current row mapping. After target verification,
+restore the accepted-token offset relative to that checkpoint.
 For CPU growing tensors, restoration may use prefix views. For fixed-capacity
 native CPU/CUDA state, restoration changes logical lengths and clears only
 invalid carry/index tails. It must not recompress the entire accepted prefix.
 
 The existing token-only `rewind(target_len)` API can remain the public engine
-call if each decode backend owns the token-to-auxiliary-cursor journal.
-Internally, adding `checkpoint()`/`restore(checkpoint)` to the decode runner is
-safer than trying to derive compressed lengths from token length after the fact.
+call if each decode backend owns the token-to-auxiliary-cursor mapping.
+Internally, use `checkpoint()` plus
+`restore_prefix(checkpoint, accepted_tokens)` on the decode runner rather than
+deriving compressed lengths from token length after the fact. The engine owns
+composite transaction orchestration, not the backend-specific cursor values.
+If speculative writes can overwrite committed carry required by a restorable
+prefix, the checkpoint must preserve that bounded overwritten region.
 
 ### 4.7 CPU implementation shape
 
@@ -798,7 +804,7 @@ logical token length
 After accepting `a` proposed tokens:
 
 ```text
-restore target state to base_len + a
+restore target state to checkpoint + accepted offset a
 restore MTP state to the recurrent state after a MTP-produced tokens
 discard all rejected dense/CSA/index/carry records
 commit correction/bonus token through the normal target path
@@ -1003,7 +1009,7 @@ Failure rules:
 | CSA-3 | Add `SparseKvGather` as a correctness/reuse primitive, but fuse gather into production CSA. | Gives testable semantics without imposing a large intermediate on the fast path. |
 | CSA-4 | Do not emit the custom op for ratio 0. | Dense attention is the correct and simpler contract. |
 | CSA-5 | Treat learned `attn_sink` as logit-only denominator mass. | Exactly matches the current Mobius fallback. |
-| CSA-6 | Use metadata-declared state groups and per-forward cursor journals. | CSA carries multiple state streams whose lengths cannot be inferred from dense token count alone. |
+| CSA-6 | Use metadata-declared state groups, backend-owned authoritative cursors, and opaque per-forward checkpoints. | CSA carries multiple state streams whose lengths cannot be inferred from dense token count alone; the engine should orchestrate a composite checkpoint without owning backend cursor semantics. |
 | CSA-7 | Preserve an explicit dense fallback package, with an opt-in native-required export mode. | Enables portability without disguising fallback cost or semantics. |
 | MTP-1 | Reuse `generate_speculative_loop`. | Draft, verify, accept, correction, and target rewind already exist. |
 | MTP-2 | Make the MTP proposer persistent per generation/session. | Required for sidecar cache/state ownership and correct acceptance rollback. |
@@ -1039,7 +1045,9 @@ Failure rules:
    **Resolution:** Pin the official recurrent MTP state from official reference goldens; never infer it from mobius tensor names or by broadcasting `mtp_hidden`.
 7. **MTP cache lifetime:** is the sidecar KV proposal-local, accepted-prefix
    persistent, or shared with target/CSA state?
-   **Resolution:** Pin sidecar KV lifetime from official reference goldens; never infer it from mobius tensor names or by broadcasting `mtp_hidden`.
+   **Resolution:** Until official reference goldens pin a reusable lifetime,
+   default to proposal-local KV and reject accepted-prefix reuse. Never infer
+   lifetime from Mobius tensor names or by broadcasting `mtp_hidden`.
 8. **Weight sharing format:** should metadata reference target initializer names,
    named model-package components, or both? How are quantized/tied embeddings
    represented without copying?

@@ -8,6 +8,11 @@ checkpoint packing, layer schedule, and cache ABI are therefore not yet public
 ([official K3 announcement](https://www.kimi.com/blog/kimi-k3),
 [official K3 API guide](https://platform.kimi.ai/docs/guide/kimi-k3-quickstart)).
 
+> **Owner direction (2026-07-18):** defer K3-specific implementation and ABI
+> decisions until official artifacts are released. The sections below remain a
+> post-artifact readiness plan; model-agnostic infrastructure may proceed only
+> when independently justified.
+
 This document distinguishes:
 
 - **verified K3 facts** from Moonshot;
@@ -173,25 +178,27 @@ K3 precision.
 - Audit the released vision encoder/projector graph as a separate P0/P1 intake.
   Native vision is verified, but its runtime contract is not public.
 
-## Decisions for Justin
+## Deferred decisions for Justin
 
-1. **Pre-build before 2026-07-27?** Recommended: build typed-state scaffolding,
-   CPU oracle harnesses, and KDA/MLA capability negotiation now, but keep operator
-   ABI/layout versions provisional until official artifacts arrive.
+1. **Pre-build before 2026-07-27?** Recommended: defer K3-specific
+   implementation until official artifacts arrive. Continue only
+   model-agnostic infrastructure that is independently justified; do not add a
+   provisional K3 operator ABI.
 2. **Quantization policy?** Choose whether native K3 packages must preserve
    Moonshot MXFP4/MXFP8 exactly, or whether an explicit conversion profile is an
-   acceptable first milestone. Recommended: support a clearly labeled converted
-   correctness profile, while treating native packing/activation support as the
-   production target.
+   acceptable first milestone. Recommended: defer this choice until official
+   packing and activation semantics are available. Do not label an existing
+   generic `mxfp4` decoder as K3/Moonshot compatible.
 3. **First deployment target?** Choose single-GPU/small-shard correctness versus
-   immediate 64+-accelerator production work. Recommended: CPU + one-GPU oracle
-   first, but start expert-parallel transport/placement in parallel because it is
-   not optional for full K3.
-4. **MLA/KDA boundary strategy?** Recommended: separate semantic ops and state
-   kinds (`KDA`, `MLA`, `CSA`); share lifecycle infrastructure, never overload
-   CSA with model branches.
-5. **MTP scope?** Recommended: no K3-specific MTP work until weights/config
-   verify it.
+   immediate 64+-accelerator production work. Recommended: defer the K3-specific
+   deployment target until official artifacts establish the runnable layout and
+   resource profile. Model-agnostic expert-parallel transport/placement may
+   proceed independently.
+4. **MLA/KDA boundary strategy?** Recommended: preserve the guardrail that
+   `KDA`, `MLA`, and `CSA` are separate semantic state kinds, but defer
+   K3-specific KDA/MLA ABI and implementation until official artifacts arrive.
+5. **MTP scope?** Recommended: defer all K3-specific MTP work until
+   weights/config verify a draft head or sidecar.
 
 ## Bottom line
 
