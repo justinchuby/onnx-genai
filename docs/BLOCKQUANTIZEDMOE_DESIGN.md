@@ -87,7 +87,7 @@ scales. `packed_*` tensors are `uint8`; all float tensors are `float32`
 | Idx | Name | Type | Req? | Shape | Mirrors QMoE |
 |---:|---|---|---|---|---|
 | 0 | `input` (hidden states) | f32 | **required** | `[rows, H]` or `[B,S,H]` | idx 0 ([qmoe.rs:107](../crates/onnx-runtime-ep-cpu/src/kernels/qmoe.rs#L107)) |
-| 1 | `router_probs` (router **logits**) | f32 | **required** | `[rows, E]` | idx 1 ([qmoe.rs:108,298](../crates/onnx-runtime-ep-cpu/src/kernels/qmoe.rs#L108)) |
+| 1 | `router_logits` | f32 | **required** | `[rows, E]` | idx 1 ([qmoe.rs:108,298](../crates/onnx-runtime-ep-cpu/src/kernels/qmoe.rs#L108)) |
 | 2 | `fc1_experts_weights` (gate/up, packed) | u8 | **required** | `[E, fc1_out, blocks1, block_bytes]` | idx 2 |
 | 3 | `fc1_experts_bias` | f32 | optional | `[E, fc1_out]` | idx 4 (bias) |
 | 4 | `fc2_experts_weights` (down, packed) | u8 | **required** | `[E, H, blocks2, block_bytes]` | idx 5 |
@@ -132,15 +132,16 @@ except `format` / `block_layout_version`, which reuse `BlockQuantizedMatMul`
 | `k` (top_k) | int | 1 | `MoeAttributes.k`, must be `>0` and `<= E` ([moe.rs:59-62](../crates/onnx-runtime-ep-cpu/src/kernels/moe.rs#L59-L62), [qmoe.rs:192-197](../crates/onnx-runtime-ep-cpu/src/kernels/qmoe.rs#L192-L197)) |
 | `activation_type` | string | `relu` | `relu, gelu, silu, swiglu, identity` ([moe.rs:63-80](../crates/onnx-runtime-ep-cpu/src/kernels/moe.rs#L63-L80)) |
 | `normalize_routing_weights` | int(bool) | 0 | ([moe.rs:81](../crates/onnx-runtime-ep-cpu/src/kernels/moe.rs#L81)) |
-| `use_sparse_mixer` | int(bool) | 0 | rejected in Phase 1 (see §7) ([moe.rs:82-86](../crates/onnx-runtime-ep-cpu/src/kernels/moe.rs#L82-L86)) |
 | `swiglu_fusion` | int | 0 | `0..=2`; nonzero only with swiglu ([moe.rs:87-97](../crates/onnx-runtime-ep-cpu/src/kernels/moe.rs#L87-L97)) |
 | `activation_alpha` | float | 1.0 | ([moe.rs:103](../crates/onnx-runtime-ep-cpu/src/kernels/moe.rs#L103)) |
 | `activation_beta` | float | 0.0 | ([moe.rs:104](../crates/onnx-runtime-ep-cpu/src/kernels/moe.rs#L104)) |
 | `swiglu_limit` | float | +inf | ([moe.rs:105](../crates/onnx-runtime-ep-cpu/src/kernels/moe.rs#L105)) |
 
 **Intentionally NOT present** (justified): `expert_weight_bits`, `block_size`,
-`quant_type` — all affine-int-only knobs that IQ/MXFP4 self-description makes
-meaningless ([qmoe.rs:67-89](../crates/onnx-runtime-ep-cpu/src/kernels/qmoe.rs#L67-L89)).
+`quant_type`, and `use_sparse_mixer`. The first three are affine-int-only knobs
+that IQ/MXFP4 self-description makes meaningless
+([qmoe.rs:67-89](../crates/onnx-runtime-ep-cpu/src/kernels/qmoe.rs#L67-L89));
+sparse-mixer normalization is lowered outside the op (§7).
 `expert_dim`/`inter_dim` are **not** attributes: like QMoE they are inferred
 from weight shapes (inter from fc2's packed width, hidden from input), not
 declared ([qmoe.rs:174-222](../crates/onnx-runtime-ep-cpu/src/kernels/qmoe.rs#L174-L222)).
@@ -161,7 +162,7 @@ Single output `output : f32`, shape **equal to `input`**
 
 Routing reuses `routing_weights` unchanged
 ([moe.rs:394-434](../crates/onnx-runtime-ep-cpu/src/kernels/moe.rs#L394-L434)):
-top-`k` selection over `router_probs`; when `router_weights` (idx 8) is present
+top-`k` selection over `router_logits`; when `router_weights` (idx 8) is present
 it supplies aggregation weights, otherwise a softmax over logits is used;
 `normalize_routing_weights` renormalizes over the selected `k`.
 
@@ -366,15 +367,14 @@ The QMoE/MoE Phase-1 CPU reference **rejects** `use_sparse_mixer=1`
 sparse_mixer is a *routing-normalization* transform, orthogonal to expert
 arithmetic.
 
-**Recommendation:** keep routing normalization **outside** this op — expressed
+**Recommendation:** keep routing normalization **outside** this op, expressed
 as an explicit portable gate (softmax / sparse-mixer jitter+renorm) feeding
-`router_probs`/`router_weights`. `BlockQuantizedMoE` v1 accepts `use_sparse_mixer`
-as an attribute for schema-compatibility but **errors if set to 1**, exactly as
-the current reference does. Rationale: (a) it keeps the determinism surface
-small and CUDA-parity-simple; (b) it matches the existing precedent so a QMoE
-graph transcodes cleanly; (c) native fused sparse_mixer can be added in a later
-version once P1 #9 freezes its semantics, without changing v1 weight ABI. This
-is offered for sign-off as Decision 4.
+`router_logits`/`router_weights`. `BlockQuantizedMoE` v1 omits the
+`use_sparse_mixer` attribute; a QMoE transcode must lower it explicitly.
+Rationale: (a) it keeps the determinism surface small and CUDA-parity-simple;
+(b) the schema does not freeze an attribute that every v1 implementation
+rejects; and (c) native fused sparse_mixer can be added in a later version once
+P1 #9 freezes its semantics. This is offered for sign-off as Decision 4.
 
 ---
 
@@ -388,8 +388,9 @@ Each item lists a recommended default. Sign-off requested before kernel work.
    mechanical transcode. **Default: dense 0–8.**
 
 2. **Router input: logits vs. pre-normalized weights.**
-   *Recommend:* `router_probs` are **logits** (softmax inside), with optional
-   `router_weights` overriding aggregation — identical to QMoE
+   *Recommend:* name the required input `router_logits` and apply softmax
+   internally, with optional `router_weights` overriding aggregation — identical
+   in semantics to QMoE without the misleading `router_probs` name
    ([qmoe.rs:293-322](../crates/onnx-runtime-ep-cpu/src/kernels/qmoe.rs#L293-L322)).
    **Default: logits in, optional aggregation weights.**
 
@@ -400,13 +401,16 @@ Each item lists a recommended default. Sign-off requested before kernel work.
    **Default: string `format`.**
 
 4. **sparse_mixer placement (P1 #9).**
-   *Recommend:* normalization **outside** the op (explicit portable gate); v1
-   errors on `use_sparse_mixer=1` (§7). **Default: outside / error-if-set.**
+   *Recommend:* normalization **outside** the op (explicit portable gate); omit
+   `use_sparse_mixer` from v1 (§7). **Default: outside / absent from schema.**
 
 5. **Single uniform `format` vs. per-projection / per-expert formats.**
-   *Recommend:* **one uniform `format`** for all experts and projections in v1
-   (GLM's routed tensors are homogeneous IQ). Per-projection formats deferred to
-   a later version. **Default: uniform.**
+   *Recommend:* **one uniform, currently verified `format`** for all experts and
+   projections in v1 (GLM's routed tensors are homogeneous IQ). Existing
+   `mxfp4` means the current BlockQuantizedMatMul layout, not an unpublished
+   K3/Moonshot format with a similar name. Per-projection or new native formats
+   are deferred to a later namespaced format/version. **Default: uniform,
+   verified formats only.**
 
 6. **`inter`/`expert_dim` inferred vs. declared attributes.**
    *Recommend:* **inferred from weight shapes** (QMoE precedent,
@@ -423,8 +427,12 @@ Each item lists a recommended default. Sign-off requested before kernel work.
    `LazyWeight` as §2.3 specifies; the current whole-`LazyWeight` binder
    signature cannot select an expert slice
    ([weight.rs:121-161,205-227](../crates/onnx-runtime-ep-api/src/weight.rs#L121-L161)).
-   **Default: resident-first; require that seam extension before paging.**
+   **Default: resident-first correctness for the GLM/IQ profile; require that
+   seam extension before paging or production-scale K3 claims.**
 
 8. **Op version: ship as `pkg.nxrt::BlockQuantizedMoE` v1 now?**
-   *Recommend:* yes — freeze this ABI as v1 so the CPU parity oracle and the
-   `weight.rs` seam are backed by a stable contract. **Default: v1.**
+   *Recommend:* yes — freeze this ABI as v1 for the currently verified GLM/IQ
+   and BlockQuantizedMatMul layouts so the CPU parity oracle and the `weight.rs`
+   seam are backed by a stable contract. Native K3/Moonshot formats remain out
+   of scope until official layouts and activation semantics are available; use
+   a namespaced format or new op version if they differ. **Default: scoped v1.**

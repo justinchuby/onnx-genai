@@ -12,10 +12,13 @@ into ordered sub-phases **B0…B7**, each of which:
   device path fully replaces it (switchover in B7);
 - has an explicit **done / pass bar** and a **rollback story**.
 
-The authoritative numerical oracle throughout is the CPU kernel
-`crates/onnx-runtime-ep-cpu/src/kernels/compressed_sparse_attention.rs`. Every
-sub-phase is gated against it, exactly as Phase A was
-(`crates/onnx-runtime-ep-cuda/tests/compressed_sparse_attention_gpu.rs`).
+The CPU kernel
+`crates/onnx-runtime-ep-cpu/src/kernels/compressed_sparse_attention.rs` is the
+temporary Phase B implementation oracle, exactly as it was for Phase A
+(`crates/onnx-runtime-ep-cuda/tests/compressed_sparse_attention_gpu.rs`). The
+official BF16 reference remains the production numerical contract; B7
+switchover requires official-golden parity or prior reconciliation of the CPU
+oracle.
 
 ---
 
@@ -34,10 +37,11 @@ needs an explicit yes/no.
   **Question:** does the CUDA kernel target (a) the CPU oracle (f32 attention
   accumulation, our Phase A contract and current test gate), or (b) official
   BF16 kernel.py numerics? These differ measurably in the softmax denominator.
-  **Recommendation:** target the **CPU oracle** (option a) so the existing
-  bit-parity gate holds; open a separate item to reconcile the oracle itself
-  with official BF16 goldens under §10-Q14 tolerances. This choice makes the
-  device attention accumulate in f32 in fixed index order (see B1).
+  **Recommendation:** use the **CPU oracle** as a temporary implementation gate
+  so existing bit-parity tests keep catching device regressions, but do not
+  freeze its f32 reduction as the production numerical contract. Reconcile the
+  CPU oracle with official BF16 goldens, or add a separate official-golden gate,
+  before B7 switchover. B1 may initially accumulate in f32 in fixed index order.
 
 - **D2 — FP8/FP4 device compute strategy.**
   CSA needs **both** device *dequant* (reading `past_*` records) and device
@@ -63,13 +67,18 @@ needs an explicit yes/no.
   what `max_seq_len` and sliding-window `W` do we budget for, and is a
   fixed-capacity cap acceptable (fail-closed when exceeded)?
   **Recommendation:** fixed-capacity, sized from package metadata
-  `max_seq_len`; reject at claim time if the device cannot hold the budget.
+  `max_seq_len`. Claim time validates static metadata and supported bounds;
+  session/runner initialization reserves the buffers and fails before execution
+  if the reservation cannot be satisfied. Do not make EP capability depend on
+  transient free device memory.
 
 - **D4 — Per-row cursor lengths (ragged batch).** §10-Q10 pins v1 to
   **equal-length compression/index cursors within a batch**; ragged per-row
   lengths are a fast-follow. **Question:** confirm Phase B stays equal-length
   (simple regular layout, one cursor set per forward) and defers ragged to a
-  later phase. **Recommendation:** yes — equal-length only in B0…B7.
+  later phase. **Recommendation:** yes — equal-length only in B0…B7, enforced
+  by validation. Fail fast or use a non-captured fallback for ragged rows, and
+  retain per-row cursors as the immediate fast-follow.
 
 - **D5 — Device top-k determinism & graph-capturability.** Ratio-4 selection is
   `score.topk(min(512, floor(total/R)), largest=True, sorted=True)` with a
@@ -85,15 +94,22 @@ needs an explicit yes/no.
   checkpoint/restore for speculative decode (§4.6): does `DecodeState` own the
   cursor journal and call kernel-exposed `checkpoint()`/`restore(cursor)`, or
   does the kernel own device-resident cursors that the engine rewinds?
-  **Recommendation:** kernel owns device-resident logical-length cursors;
-  engine drives `checkpoint()`/`restore(base_len+accepted)`; restore only
-  adjusts lengths and clears invalid carry/index tails (no recompress).
+  **Recommendation:** the backend/kernel owns authoritative device-resident
+  logical-length cursors and token-to-auxiliary-state mapping; the engine owns
+  composite checkpoint orchestration. Restore uses an opaque checkpoint plus an
+  accepted-token offset, validates sequence/generation identity, and restores
+  logical lengths plus active carry/index state without recompression. Physical
+  inactive tails may remain stale when every reader is length-masked. If
+  speculative writes can overwrite committed carry, checkpoint the bounded
+  overwritten region.
 
 - **D7 — Retiring the host-staged fallback.** CSA-7 was flipped to
   `native_csa_required` (§9 owner verdict). **Question:** in B7, remove the
   host-staged path entirely, or keep it behind a `--csa-oracle` debug flag as an
-  in-process differential oracle? **Recommendation:** keep it behind a debug
-  flag (invaluable for regression triage), but never on the default path.
+  in-process differential oracle? **Recommendation:** keep it behind an explicit
+  test/diagnostic flag (invaluable for regression triage), but never use it as
+  an automatic fallback or include it in production performance/CUDA Graph
+  eligibility claims.
 
 ---
 
@@ -293,10 +309,12 @@ Symbols (v1): `D=512`, `RD=64`, `N=num_heads`, `I=index_num_heads`, `ID=128`,
 
 ### B7 — Stream-ordered checkpoint/restore + switchover
 
-- **Scope.** Implement device `checkpoint()` / `restore(cursor)` of the five
-  logical cursors with tail-clearing only (no recompress), stream-ordered for
-  speculative decode (D6, §4.6). Switch the **default** path from host-staged to
-  device; retain host-staged behind a debug oracle flag (D7). Wire the
+- **Scope.** Implement device `checkpoint()` /
+  `restore_prefix(checkpoint, accepted)` of the five logical cursors and any
+  bounded overwritten active carry state, with no recompress, stream-ordered
+  for speculative decode (D6, §4.6). Switch the **default** path from
+  host-staged to device; retain host-staged behind a diagnostic oracle flag
+  (D7). Wire the
   observability metrics from §8 (attention mode per layer, bytes avoided,
   cursor lengths, stage timings, sink mass, rollback counts, host/device bytes).
 - **Fused stages.** All + rollback semantics.
