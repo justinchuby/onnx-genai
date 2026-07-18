@@ -258,7 +258,8 @@ pub(crate) fn unsupported_reason(
         4 => validate_ratio4_claim(node, shapes, input_dtypes, cache_format),
         128 => validate_ratio128_claim(node, shapes, input_dtypes, cache_format),
         _ => unreachable!("CPU factory rejected unsupported compression ratio"),
-    };
+    }
+    .and_then(|()| validate_attention_bias_claim(node, shapes, input_dtypes));
 
     result
         .err()
@@ -317,16 +318,6 @@ fn validate_ratio4_claim(
     ] {
         require_dtype(input_dtypes, index, expected, name)?;
     }
-    if node.inputs.get(19).is_some_and(Option::is_some) {
-        require_dtype(input_dtypes, 19, DataType::Float32, "attention_bias")?;
-        if shapes[19].len() > 4 {
-            return Err(format!(
-                "input 19 ('attention_bias') rank {} unsupported; expected rank <= 4",
-                shapes[19].len()
-            ));
-        }
-    }
-
     let heads = required_attr(node, "num_heads")?;
     let index_heads = required_attr(node, "index_num_heads")?;
     for (index, name, contract) in [
@@ -463,6 +454,61 @@ fn validate_ratio128_claim(
         (10, "head_sink", vec![Fixed(heads)]),
     ] {
         require_shape(shapes, index, name, &contract)?;
+    }
+    Ok(())
+}
+
+fn validate_attention_bias_claim(
+    node: &Node,
+    shapes: &[Shape],
+    input_dtypes: &[DataType],
+) -> std::result::Result<(), String> {
+    if !node.inputs.get(19).is_some_and(Option::is_some) {
+        return Ok(());
+    }
+
+    require_dtype(input_dtypes, 19, DataType::Float32, "attention_bias")?;
+    let bias_shape = &shapes[19];
+    if bias_shape.len() > 4 {
+        return Err(format!(
+            "input 19 ('attention_bias') rank {} unsupported; expected rank <= 4",
+            bias_shape.len()
+        ));
+    }
+
+    if let Some(static_shape) = as_static_shape(bias_shape) {
+        let elements = static_shape
+            .iter()
+            .try_fold(1usize, |count, &dimension| count.checked_mul(dimension));
+        if elements
+            .and_then(|count| count.checked_mul(std::mem::size_of::<f32>()))
+            .is_none_or(|bytes| bytes > isize::MAX as usize)
+        {
+            return Err(format!(
+                "input 19 ('attention_bias') byte count overflow or exceeds isize::MAX for shape {static_shape:?}"
+            ));
+        }
+    }
+
+    let heads = required_attr(node, "num_heads")?;
+    let target = [
+        shapes[0][0].as_static(),
+        Some(heads),
+        shapes[0][1].as_static(),
+        None,
+    ];
+    let offset = 4 - bias_shape.len();
+    for (axis, dimension) in bias_shape.iter().enumerate() {
+        let Some(got) = dimension.as_static() else {
+            continue;
+        };
+        let target_axis = offset + axis;
+        if got != 1 && target[target_axis].is_some_and(|expected| got != expected) {
+            return Err(format!(
+                "input 19 ('attention_bias') shape {bias_shape:?} is not broadcastable to attention scores [{:?}, {heads}, {:?}, ?]",
+                shapes[0][0], shapes[0][1]
+            ));
+        }
     }
     Ok(())
 }

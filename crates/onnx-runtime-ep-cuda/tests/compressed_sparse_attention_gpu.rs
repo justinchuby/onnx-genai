@@ -272,6 +272,35 @@ fn ratio128_node(inputs: &[HostTensor], next_records: usize) -> (Graph, NodeId) 
     (graph, node)
 }
 
+fn ratio128_node_with_bias(
+    inputs: &[HostTensor],
+    next_records: usize,
+    bias: &HostTensor,
+) -> (Graph, NodeId) {
+    let (mut graph, node) = ratio128_node(inputs, next_records);
+    let attention_bias = graph.create_named_value(
+        "attention_bias",
+        bias.dtype,
+        static_shape(bias.shape.iter().copied()),
+    );
+    graph.add_input(attention_bias);
+    graph.node_mut(node).inputs.resize(19, None);
+    graph.node_mut(node).inputs.push(Some(attention_bias));
+    (graph, node)
+}
+
+fn ratio128_bias_claim_metadata(
+    inputs: &[HostTensor],
+    bias: &HostTensor,
+) -> (Vec<onnx_runtime_ir::Shape>, Vec<DataType>) {
+    let (mut shapes, mut dtypes) = claim_metadata(inputs);
+    shapes.resize(19, Vec::new());
+    dtypes.resize(19, DataType::Undefined);
+    shapes.push(static_shape(bias.shape.iter().copied()));
+    dtypes.push(bias.dtype);
+    (shapes, dtypes)
+}
+
 fn ratio4_values(len: usize, offset: usize, scale: f32) -> Vec<f32> {
     (0..len)
         .map(|index| 0.05 + ((index * 17 + offset) % 97) as f32 * scale)
@@ -974,5 +1003,62 @@ fn supports_op_rejects_ratio128_ratio4_only_input() {
             KernelMatch::Unsupported { .. }
         ),
         "ratio-4-only inputs must be rejected for ratio-128 at claim time"
+    );
+}
+
+#[test]
+fn supports_op_validates_ratio128_attention_bias_at_input_19() {
+    let Some(ep) = gpu() else { return };
+    let ape = HostTensor::f32(&[RATIO, DIM], &rows(0, RATIO, ape_value));
+    let norm = HostTensor::f32(&[DIM], &vec![0.8f32; DIM]);
+    let sink = HostTensor::f32(&[1], &[-0.375]);
+    let state = CsaState {
+        cache: HostTensor::zeros(DataType::Uint8, &[1, 0, STORED_WIDTH]),
+        carry: HostTensor::zeros(DataType::Float32, &[1, RATIO, 2, DIM]),
+    };
+    let inputs = ratio128_inputs(1, 0, 0, 1, 1, &ape, &norm, &sink, &state);
+
+    let bad_dtype = HostTensor::zeros(DataType::Float16, &[1, 1, 1, 1]);
+    let (graph, node) = ratio128_node_with_bias(&inputs, 0, &bad_dtype);
+    let (shapes, dtypes) = ratio128_bias_claim_metadata(&inputs, &bad_dtype);
+    assert!(
+        matches!(
+            ep.supports_op(graph.node(node), 1, &shapes, &dtypes, &[]),
+            KernelMatch::Unsupported { .. }
+        ),
+        "ratio-128 Float16 attention_bias at input 19 must be rejected"
+    );
+
+    let bad_rank = HostTensor::zeros(DataType::Float32, &[1, 1, 1, 1, 1]);
+    let (graph, node) = ratio128_node_with_bias(&inputs, 0, &bad_rank);
+    let (shapes, dtypes) = ratio128_bias_claim_metadata(&inputs, &bad_rank);
+    assert!(
+        matches!(
+            ep.supports_op(graph.node(node), 1, &shapes, &dtypes, &[]),
+            KernelMatch::Unsupported { .. }
+        ),
+        "ratio-128 rank-5 attention_bias at input 19 must be rejected"
+    );
+
+    let bad_broadcast = HostTensor::zeros(DataType::Float32, &[2, 1, 1, 1]);
+    let (graph, node) = ratio128_node_with_bias(&inputs, 0, &bad_broadcast);
+    let (shapes, dtypes) = ratio128_bias_claim_metadata(&inputs, &bad_broadcast);
+    assert!(
+        matches!(
+            ep.supports_op(graph.node(node), 1, &shapes, &dtypes, &[]),
+            KernelMatch::Unsupported { .. }
+        ),
+        "ratio-128 statically incompatible attention_bias must be rejected"
+    );
+
+    let valid_bias = HostTensor::zeros(DataType::Float32, &[1, 1, 1]);
+    let (graph, node) = ratio128_node_with_bias(&inputs, 0, &valid_bias);
+    let (shapes, dtypes) = ratio128_bias_claim_metadata(&inputs, &valid_bias);
+    assert!(
+        matches!(
+            ep.supports_op(graph.node(node), 1, &shapes, &dtypes, &[]),
+            KernelMatch::Supported { .. }
+        ),
+        "ratio-128 broadcastable f32 attention_bias at input 19 must remain claimed"
     );
 }
