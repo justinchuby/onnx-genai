@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 #[cfg(feature = "cuda")]
-use crate::cuda_argmax::{CudaArgmax, DeviceGreedySampler};
+use crate::device_sampler::{CudaSampler, DeviceSampleParams, DeviceSampler};
 use crate::{DataType, IoBinding, MemoryInfo, OrtError, Result, Session, TensorInfo, Value};
 
 /// Prompt and prefill runs use CUDA-graph annotation id `-1` (no capture) so
@@ -176,12 +176,12 @@ pub struct DecodeSession<'a> {
     /// `graph_capture() == true`, so graceful degradation persists per decode
     /// loop without mutating the shared session.
     graph_capture_disabled: bool,
-    /// Backend-provided device-side greedy selection for the captured path.
+    /// Backend-provided device-side token selection for the captured path.
     /// `Some` only when the captured `logits` buffer is device-resident (see
     /// [`CaptureState::logits_on_device`]); it keeps the full vocabulary on the
     /// device and reduces it there, so no per-token full-vocab host copy occurs.
     #[cfg(feature = "cuda")]
-    device_greedy: Option<Box<dyn DeviceGreedySampler>>,
+    device_sampler: Option<Box<dyn DeviceSampler>>,
 }
 
 /// Outcome of a single decode step: either the logits Value (default path) or,
@@ -307,7 +307,7 @@ impl<'a> DecodeSession<'a> {
             capture_graph_id: None,
             graph_capture_disabled: false,
             #[cfg(feature = "cuda")]
-            device_greedy: None,
+            device_sampler: None,
         };
         if mode == DecodeKvMode::SharedBuffer {
             let max_length = options.max_length.ok_or_else(|| {
@@ -636,14 +636,16 @@ impl<'a> DecodeSession<'a> {
         if cap.logits_on_device {
             let dtype = cap.logits.dtype();
             let ptr = cap.logits.data_ptr_addr()?;
-            let device_greedy = self
-                .device_greedy
+            let device_sampler = self
+                .device_sampler
                 .as_ref()
-                .expect("device greedy sampler initialized for device logits");
+                .expect("device sampler initialized for device logits");
             let result = if argmax_only {
-                device_greedy.argmax(dtype, ptr, cap.vocab).map(StepLogits::Token)
+                device_sampler
+                    .sample(dtype, ptr, 1, cap.vocab, &DeviceSampleParams::greedy())
+                    .map(|ids| StepLogits::Token(ids[0]))
             } else {
-                device_logits_to_host_value(device_greedy.as_ref(), dtype, ptr, cap.vocab)
+                device_logits_to_host_value(device_sampler.as_ref(), dtype, ptr, cap.vocab)
                     .map(StepLogits::Value)
             };
             self.capture = Some(cap);
@@ -725,16 +727,16 @@ impl<'a> DecodeSession<'a> {
             } else {
                 logits = Value::empty(&[1, 1, vocab], logits_dtype)?;
             }
-            if logits_on_device && self.device_greedy.is_none() {
+            if logits_on_device && self.device_sampler.is_none() {
                 let device = self.session.cuda_device_id().unwrap_or(0).max(0) as usize;
                 let sampler =
-                    Box::new(CudaArgmax::new(device)?) as Box<dyn DeviceGreedySampler>;
+                    Box::new(CudaSampler::new(device)?) as Box<dyn DeviceSampler>;
                 tracing::debug!(
                     sampler = sampler.name(),
                     device,
-                    "initialized device greedy sampler"
+                    "initialized device sampler"
                 );
-                self.device_greedy = Some(sampler);
+                self.device_sampler = Some(sampler);
             }
         }
         #[cfg(not(feature = "cuda"))]
@@ -3252,7 +3254,7 @@ fn is_logits_output(name: &str) -> bool {
 /// the on-device path otherwise skips.
 #[cfg(feature = "cuda")]
 fn device_logits_to_host_value(
-    device_greedy: &dyn DeviceGreedySampler,
+    device_sampler: &dyn DeviceSampler,
     dtype: DataType,
     dev_ptr: usize,
     vocab: usize,
@@ -3265,7 +3267,7 @@ fn device_logits_to_host_value(
     // SAFETY: `host` is a freshly-allocated CPU tensor holding exactly `nbytes`
     // bytes; the slice aliases only that storage for the duration of the copy.
     let dst = unsafe { std::slice::from_raw_parts_mut(base, nbytes) };
-    device_greedy.copy_row_to_host(dtype, dev_ptr, vocab, dst)?;
+    device_sampler.copy_row_to_host(dtype, dev_ptr, vocab, dst)?;
     Ok(host)
 }
 
