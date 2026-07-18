@@ -458,6 +458,38 @@ impl<'a> DecodeSession<'a> {
         }
     }
 
+    /// Whether a subsequent single-token [`Self::step_sampled`] call will select
+    /// the token entirely on the device (returning a token id) rather than
+    /// producing host logits.
+    ///
+    /// The non-greedy device sample path requires *both* the captured decode
+    /// fast path (`SharedBuffer` KV, graph capture enabled) *and* on-device
+    /// logits (CUDA, device argmax enabled, a device KV allocator). When either
+    /// is missing, `step_sampled` runs the standard step — which advances KV
+    /// state — and then reports that logits are on the host. Callers must not
+    /// invoke the sampled path in that case: the standard step's side effects
+    /// would be replayed by the host fallback, double-advancing the KV cache.
+    /// This predicate lets the caller route straight to host sampling instead.
+    pub fn will_sample_on_device(&self) -> bool {
+        #[cfg(feature = "cuda")]
+        {
+            let captured = self.mode == DecodeKvMode::SharedBuffer
+                && self.session.graph_capture()
+                && !self.graph_capture_disabled;
+            let device_argmax_enabled = std::env::var("ONNX_GENAI_DEVICE_ARGMAX")
+                .map(|v| v != "0")
+                .unwrap_or(true);
+            let device_logits = device_argmax_enabled
+                && self.session.cuda_device_id().is_some()
+                && self.kv_allocator.is_some();
+            captured && device_logits
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            false
+        }
+    }
+
     fn step_dispatch(
         &mut self,
         new_input_ids: &[i64],

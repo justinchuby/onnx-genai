@@ -555,4 +555,44 @@ mod tests {
         assert!(!na_backend.sampled_failed);
         Ok(())
     }
+
+    #[test]
+    fn unsupported_sampled_runner_never_runs_device_step() -> anyhow::Result<()> {
+        // A backend that cannot sample on the device (`sampled_fastpath_supported`
+        // is false) must never have `next_token_sampled` invoked. That method runs
+        // a model step which advances KV state; if it were called and then failed,
+        // the host fallback would re-run the step and double-advance the KV cache,
+        // corrupting the first decode token. Guard that the device step is skipped
+        // entirely and the pure host path is taken.
+        let options = GenerateOptions {
+            max_new_tokens: 3,
+            greedy: false,
+            temperature: 0.8,
+            top_k: 2,
+            top_p: 0.95,
+            min_p: 0.1,
+            seed: Some(17),
+            ..Default::default()
+        };
+        let chain = build_processor_chain(&options, None)?;
+        let tokenizer = tokenizer()?;
+
+        // `HardError` outcome would panic-latch if ever reached; assert it isn't.
+        let mut backend = MockBackend::with_outcome(false, SampledOutcome::HardError);
+        let mut state = DecodeLoopState::new(0, options.seed, None);
+        let result = run_decode_loop(
+            &mut backend,
+            &mut state,
+            &options,
+            &chain,
+            &tokenizer,
+            None,
+            None,
+        )?;
+
+        assert!(!result.token_ids.is_empty());
+        assert_eq!(backend.sampled_attempts, 0);
+        assert!(!backend.sampled_failed);
+        Ok(())
+    }
 }
