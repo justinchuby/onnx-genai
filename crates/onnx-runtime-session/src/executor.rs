@@ -116,8 +116,9 @@ pub(crate) struct NodePlan {
     pub inputs: Vec<Option<ValueId>>,
     /// Output value ids, in positional order.
     pub outputs: Vec<ValueId>,
-    /// Element types of the inputs, positional (matches `inputs`). A `None`
-    /// input slot carries a placeholder dtype that kernels never read.
+    /// Element types of the inputs, positional (matches `inputs`). An omitted
+    /// optional (`None`) slot carries [`DataType::Undefined`] so EP claim-time
+    /// validation can distinguish it from a supplied tensor.
     pub input_dtypes: Vec<DataType>,
     /// Element types of the outputs.
     pub output_dtypes: Vec<DataType>,
@@ -1122,7 +1123,10 @@ impl Executor {
             let outputs: Vec<ValueId> = node.outputs.clone();
             let input_dtypes: Vec<DataType> = inputs
                 .iter()
-                .map(|v| v.map(|vid| value_dtypes[&vid]).unwrap_or(DataType::Float32))
+                .map(|v| {
+                    v.map(|vid| value_dtypes[&vid])
+                        .unwrap_or(DataType::Undefined)
+                })
                 .collect();
             let output_dtypes: Vec<DataType> = outputs.iter().map(|v| value_dtypes[v]).collect();
             plan.push(NodePlan {
@@ -4417,6 +4421,7 @@ mod tests {
     struct WeightDeliveryEp {
         cpu: CpuExecutionProvider,
         lazy: bool,
+        optional_input_contract: bool,
         deliveries: Arc<std::sync::Mutex<Vec<&'static str>>>,
         device: onnx_runtime_ir::DeviceId,
         allocations: Arc<AtomicUsize>,
@@ -4461,6 +4466,7 @@ mod tests {
             Self {
                 cpu,
                 lazy,
+                optional_input_contract: false,
                 deliveries,
                 device,
                 allocations,
@@ -4521,9 +4527,21 @@ mod tests {
             op: &Node,
             opset: u64,
             _shapes: &[Shape],
-            _input_dtypes: &[DataType],
+            input_dtypes: &[DataType],
             _layouts: &[TensorLayout],
         ) -> KernelMatch {
+            if self.optional_input_contract && op.op_type == "OptionalContract" {
+                if input_dtypes == [DataType::Float32, DataType::Undefined, DataType::Bool] {
+                    return KernelMatch::Supported {
+                        cost: Cost::ZERO,
+                        required_input_layouts: None,
+                        output_layouts: vec![TensorLayout::contiguous()],
+                    };
+                }
+                return KernelMatch::unsupported(format!(
+                    "OptionalContract requires [Float32, Undefined, Bool] input dtypes, got {input_dtypes:?}"
+                ));
+            }
             if LazyWeightBoundary::BlockQuantizedMoe.matches(&op.domain, &op.op_type)
                 || (op.domain.is_empty() && op.op_type == "Identity")
             {
@@ -4681,6 +4699,34 @@ mod tests {
         let mut store = WeightStore::new();
         store.map_external(&path).unwrap();
         (graph, Arc::new(store), path)
+    }
+
+    #[test]
+    fn claim_time_optional_input_dtype_is_undefined_not_silently_float32() {
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 1);
+        let data = graph.create_named_value("data", DataType::Float32, static_shape([1]));
+        let training_mode =
+            graph.create_named_value("training_mode", DataType::Bool, static_shape([]));
+        let output = graph.create_named_value("output", DataType::Float32, static_shape([1]));
+        graph.add_input(data);
+        graph.add_input(training_mode);
+        graph.add_output(output);
+        graph.insert_node(Node::new(
+            NodeId(0),
+            "OptionalContract",
+            vec![Some(data), None, Some(training_mode)],
+            vec![output],
+        ));
+
+        let deliveries = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut ep = WeightDeliveryEp::new(false, deliveries);
+        ep.optional_input_contract = true;
+        let executor = Executor::build(graph, Arc::new(WeightStore::new()), Arc::new(ep));
+        assert!(
+            executor.is_ok(),
+            "an omitted optional input must reach supports_op as DataType::Undefined"
+        );
     }
 
     #[test]
