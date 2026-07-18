@@ -25,6 +25,7 @@ pub mod activations;
 pub mod attention;
 pub mod block_quantized_matmul;
 pub mod cast;
+pub mod compressed_sparse_attention;
 pub mod constant;
 pub mod conv;
 pub mod cumsum;
@@ -98,6 +99,7 @@ pub const CUDA_COVERED_OPS: &[&str] = &[
     "QMoE",
     "BlockQuantizedMatMul",
     "SparseKvGather",
+    "CompressedSparseAttention",
     "Gemm",
     "FusedMatMulBias",
     "FusedGemm",
@@ -326,6 +328,14 @@ pub fn build_cuda_registry(runtime: Arc<CudaRuntime>) -> OpRegistry {
         Box::new(sparse_kv_gather::SparseKvGatherFactory {
             runtime: runtime.clone(),
         }),
+    );
+    reg.register(
+        OpKey::new("CompressedSparseAttention", "pkg.nxrt", 1),
+        Box::new(
+            compressed_sparse_attention::CompressedSparseAttentionFactory {
+                runtime: runtime.clone(),
+            },
+        ),
     );
     reg.register(
         OpKey::new("Gemm", "", 1),
@@ -645,7 +655,7 @@ mod tests {
 
     #[test]
     fn covered_ops_have_no_duplicates() {
-        assert_eq!(CUDA_COVERED_OPS.len(), 84);
+        assert_eq!(CUDA_COVERED_OPS.len(), 85);
 
         let mut seen = std::collections::HashSet::new();
         for op in CUDA_COVERED_OPS {
