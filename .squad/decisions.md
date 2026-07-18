@@ -866,3 +866,68 @@ Phase B (the device-resident fused CUDA `CompressedSparseAttention` kernel repla
 Implementable-now: **none**. No source changes, no commit. Tests: engine 148 passed / 10 ignored; ORT MTP 2 passed; MTP greedy-equivalence 1 passed.
 **Why:** Confirms MTP Phase 1 is functionally complete; the only outstanding item (`mtp_state`) remains user/Mobius-contract-blocked. No further Phase 1 engine work until the contract is frozen.
 
+
+## 2026-07-18 — Scribe inbox merge (EP omitted-optional contract and IndexShare audit)
+
+<!-- merged from wallace-session-coverage.md -->
+
+### 2026-07-18: Preserve omitted optional-input dtype during EP claims
+**By:** Wallace
+**What:** Fixed `onnx-runtime-session` planning to pass `DataType::Undefined` (not a silent `Float32` fallback) for each interior omitted optional input in `supports_op` calls. Added a regression EP that refuses the former fake Float32 signature and accepts `[Float32, Undefined, Bool]`.
+**Why:** Claim-time dtype validation must distinguish an ONNX omitted optional input from a supplied Float32 tensor. The old fallback could make an EP accept or reject a node on false dtype metadata, masking a provider contract violation until compilation or execution. Coverage rose from 84.64% to 84.72% regions and 79.41% to 79.49% lines; `cargo test -p onnx-runtime-session` passed 148 tests.
+
+<!-- merged from mariette-wallace-optional-dtype-review.md -->
+
+### 2026-07-18: REJECT Wallace's omitted-optional dtype claim fix
+**By:** Mariette
+**What:** The session change correctly makes `NodePlan::input_dtypes` positional and maps an omitted `None` input to `DataType::Undefined`; its revised documentation is accurate. The regression test proves that contract. CSA is safe: both CPU execution paths determine `attention_bias` presence from the bound optional slot (`get(19)` plus `!is_absent()`), and CUDA claim validation first checks `node.inputs[19].is_some()` before reading dtype 19. CPU `Attention` does not inspect claim dtypes. CUDA `RotaryEmbedding` checks only required inputs 0–2; optional `position_ids` is slot 3 and is not read by its claim-time dtype gate.
+
+CUDA standard `Attention` is not safe. Its `unsupported_reason` iterates dtype indices `[0, 1, 2, 4, 5]` without checking `node.inputs`. Inputs 4 and 5 (`past_key`, `past_value`) are optional and execution itself correctly detects them with `!inputs[index].is_absent()`. After this change, an omitted past-KV pair reaches the gate as `Undefined`, which is rejected as non-f32. Before this commit, the accidental Float32 placeholder let the same valid no-past Attention node be claimed. This is a claim regression.
+
+**Required revision owner:** Nabil (not Wallace or Mariette).
+
+**Required change:** Change CUDA standard-Attention claim validation to use node-slot presence for optional positions. Pass `&Node` to `standard_attention::unsupported_reason` from `CudaExecutionProvider::supports_op`, always validate required Q/K/V slots 0–2 as f32, and validate slots 4 and 5 as f32 only when `node.inputs.get(index).is_some_and(Option::is_some)`. Add a regression claim test for an Attention node with f32 Q/K/V and omitted mask/past slots whose positional dtypes are `Undefined`; it must be supported. Preserve rejection for a present non-f32 past input.
+
+**Validation:** `cargo test -p onnx-runtime-session -p onnx-runtime-ep-cpu` passed 649 / failed 0. `cargo test -p onnx-runtime-ep-cuda` passed 233 / failed 0. The CUDA suite includes deterministic standard-Attention and RotaryEmbedding tests, so existing execution determinism remains covered; no cuDNN-related failures occurred.
+
+<!-- merged from nabil-cuda-attention-optional-fix.md -->
+
+### 2026-07-18: CUDA Attention claims omitted optional inputs correctly
+**By:** Nabil
+**What:** Updated standard `ai.onnx::Attention` CUDA claim validation for all optional schema positions: `attn_mask` (input 3), `past_key` (4), `past_value` (5), and opset-24 `nonpad_kv_seqlen` (6). `DataType::Undefined` now means the slot is absent; supplied masks must be bool/f32, supplied past caches must be f32 and paired, and supplied nonpad lengths must be int64, opset-24+, and mutually exclusive with in-op past caches. Added a graph-builder regression proving omitted past KV is claimed while a present non-f32 `past_key` is rejected.
+**Why:** Session planning now preserves omitted optional slots as `DataType::Undefined` instead of the old f32 placeholder. CUDA Attention's f32-only loop treated that absence marker as a real wrong-typed cache, blocking valid GLM/Mobius prefill. The revised gate mirrors CPU presence semantics without weakening supplied-tensor validation. No other CUDA claim gate compares an optional input slot against f32; RotaryEmbedding's claim check covers only its three required floating inputs.
+
+<!-- merged from mariette-nabil-rereview.md -->
+
+### 2026-07-18: APPROVE Nabil's CUDA Attention omitted-optional claim fix (`8eb23f1`)
+**By:** Mariette
+**Verdict:** 🟢 APPROVE
+
+**What:** `standard_attention::unsupported_reason(opset, input_dtypes)` now treats `DataType::Undefined` as an absent optional input for every optional standard-Attention position: `attn_mask` (3), `past_key` (4), `past_value` (5), and `nonpad_kv_seqlen` (6). Required Q/K/V (0–2) remain f32-only. A supplied mask remains bool/f32-only, supplied past KV remains f32-only and paired, and supplied nonpad length remains int64-only, opset-24+, and mutually exclusive with in-op past KV.
+
+**Why:** This precisely resolves the prior claim regression: an Attention node with omitted mask/past slots and positional `Undefined` dtypes is now claimed. The added regression constructs that exact node and calls `supports_op`, which is the previously failing claim path under `848ad87`; before this change its omitted slot 4 was rejected by the f32-only loop. It also constructs a node with an actual `Int64` `past_key` plus f32 `past_value` and verifies rejection, preserving claim-then-fail protection.
+
+**Contract review:** The CUDA claim semantics mirror CPU execution's input-slot contract: CPU treats optional mask, past KV, and nonpad inputs as provided only when their binding is non-absent, and enforces the same mask/past/nonpad type and compatibility rules at execution. Under the session's positional dtype contract, `Undefined` represents that absent binding. No required or supplied dtype validation was weakened. `cuda_graph_compatible()` is unchanged and remains `false`.
+
+**Validation:** `cargo test -p onnx-runtime-ep-cuda` passed 234 / failed 0 (including the new omitted-vs-wrong-typed past-cache claim regression). `cargo test -p onnx-runtime-session -p onnx-runtime-ep-cpu` passed 649 / failed 0. No cuDNN failures occurred.
+
+<!-- merged from ferro-indexshare-selected-token.md -->
+
+### 2026-07-18: IndexShare selected-token attention is contract-blocked
+**By:** Ferro
+**What:** Audited the GLM IndexShare fallback and the DeepSeek CSA sparse path. No runtime source was changed because the GLM production-op contract is not frozen.
+
+The current GLM fallback is emitted by Mobius PR #404. `GlmMoeDsaIndexer.select` computes IndexShare scores and `TopK` indices; `_sparse_bias` expands a dense FLOAT-min tensor over the complete key length, scatters zero at selected indices, adds the ordinary causal/padding attention bias, and feeds that dense mask plus full K/V (and past K/V) to standard `ai.onnx::Attention`. The CPU Attention kernel materializes the full present K/V cache and computes/scans scores and value accumulation across `total_seq`, so it is correct but dense over the cache even though unselected logits underflow to zero probability.
+
+DeepSeek CSA ratio-4 already implements selected-record attention. Inputs 11–18 are mandatory index-query/weight/compressor/state inputs; they build the FP4 index-key stream, select top-k compressed records, and `ratio4_attention` scores only the dense 128-token window plus those selected compressed records. The stateful hot path indexes selected records directly. `SparseKvGather` is the reusable checked gather and is used by CSA's assembled-cache/decomposed reference path; it is not evidence that GLM IndexShare has a production handler. The approved shared-boundary decision explicitly says DeepSeek CSA and GLM IndexShare require separate fused ops because selection semantics differ.
+
+For a fixed, valid selected set, the additive-mask standard-Attention result is a clean correctness oracle: a sparse implementation can gather the same K/V rows and match the dense fallback, including empty/all-selected cases. However, an in-tree implementation cannot currently be wired without inventing the GLM private-op ABI and numerical ordering contract.
+
+**Decisions for Justin:**
+1. Freeze the `pkg.nxrt` GLM op name/version and boundary: does it consume exporter-computed top-k indices, or own full/shared IndexShare selection plus index-key cache/state?
+2. Freeze index semantics: ordered list versus set, duplicate policy, `-1` sentinel behavior, out-of-range behavior, and empty selection.
+3. Freeze deterministic/numerical parity: preserve incoming `TopK(sorted=0)` order, or canonicalize selected cache indices into dense-cache order to reproduce the additive-mask accumulation order; specify exact f32 equality versus tolerance.
+4. Freeze mask/cache ABI: composition with causal/padding bias, past/present K/V outputs, supported layouts/head sharing, and whether shared-layer indices are explicit inputs/outputs.
+
+**Why:** Adding a helper alone would not make exported GLM graphs use selected-token attention, while extending standard ONNX Attention with private index inputs would violate its schema. The additive-mask path supplies a strong parity oracle after the GLM boundary is frozen, but choosing that boundary and its ordering/cache semantics is a user-visible FROZEN-contract decision.
+

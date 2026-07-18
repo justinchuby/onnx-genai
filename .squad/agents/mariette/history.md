@@ -27,3 +27,7 @@ Hired as a Metal/MPS kernel engineer for the new Apple Metal EP for ONNX Runtime
 - 2026-07-18: Attention review cycle completed: initial rejection corrected and final revision approved.
 
 - 2026-07-18: Completed CUDA CSA review chain (two rejections followed by final approval) and MTP review chain (rejection then approval).
+
+## 2026-07-18T04-55-00Z — Scribe session update
+
+- Reviewed the omitted-optional dtype contract batch: 🔴 rejected Wallace's first pass due to CUDA standard-Attention optional past-KV claim regression, then 🟢 approved Nabil's `8eb23f1` fix after CUDA/session/CPU gates passed.

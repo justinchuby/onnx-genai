@@ -55,3 +55,7 @@
 ## 2026-07-17 — TopK coverage finding
 
 - Added coverage exposing that TopK rank-3 `axis=3` was clamped into a valid-looking result; the follow-up handler fix and review landed in `cb30ced`.
+
+## 2026-07-18T04-55-00Z — Scribe session update
+
+- Fixed session EP claim planning to preserve omitted optional inputs as `DataType::Undefined` (`848ad87`) and added regression coverage; Mariette found a downstream CUDA Attention claim regression for reassignment.

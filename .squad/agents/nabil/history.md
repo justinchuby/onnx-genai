@@ -27,3 +27,7 @@ Authored `docs/NATIVE_CUDA_DECODE.md` (`b416b7f`) and applied Fact Checker's str
 ## 2026-07-17T02:24:32Z — QMoE int1/int2 review
 
 - 🟢 Cleared `cdb4ee5`: factory gating, packing, zero-point tails, sizing, and existing hardening are correct; full crate suite passed (450 passed, 1 ignored).
+
+## 2026-07-18T04-55-00Z — Scribe session update
+
+- On lockout reassignment, fixed CUDA standard Attention claim validation (`8eb23f1`) so `Undefined` optional mask/past/nonpad slots mean absent while supplied tensors retain strict type and compatibility checks.
