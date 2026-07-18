@@ -1683,6 +1683,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "onnx-genai-capi"
+version = "0.1.0-dev.2"
+dependencies = [
+ "anyhow",
+ "onnx-genai-engine",
+]
+
+[[package]]
 name = "onnx-genai-engine"
 version = "0.1.0-dev.2"
 dependencies = [
