@@ -3,21 +3,33 @@
 use std::ffi::CString;
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use crate::{OrtError, Result};
+
+#[derive(Default)]
+struct PluginRegistration {
+    path: PathBuf,
+    provider_name: Option<String>,
+}
+
+fn registered_ep_libraries() -> &'static Mutex<std::collections::HashMap<String, PluginRegistration>>
+{
+    static REGISTERED: OnceLock<Mutex<std::collections::HashMap<String, PluginRegistration>>> =
+        OnceLock::new();
+    REGISTERED.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+fn plugin_discovery_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
 
 /// ORT Environment — must be created before any sessions.
 /// Typically one per process.
 pub struct Environment {
     ptr: NonNull<onnx_genai_ort_sys::OrtEnv>,
     _name: String,
-    registered_ep_libraries: Mutex<std::collections::HashMap<String, PathBuf>>,
-    /// Maps an EP-plugin registration handle to the provider name discovered on
-    /// first registration, so later sessions sharing this environment can
-    /// re-select the plugin's devices without re-running the (now impossible)
-    /// before/after device diff.
-    resolved_plugin_providers: Mutex<std::collections::HashMap<String, String>>,
 }
 
 impl Environment {
@@ -41,8 +53,6 @@ impl Environment {
         Ok(Self {
             ptr: NonNull::new(ptr).ok_or(OrtError::NullPointer)?,
             _name: name.to_string(),
-            registered_ep_libraries: Mutex::new(std::collections::HashMap::new()),
-            resolved_plugin_providers: Mutex::new(std::collections::HashMap::new()),
         })
     }
 
@@ -53,25 +63,24 @@ impl Environment {
     /// Register an ORT execution-provider plugin shared library.
     ///
     /// Returns `Ok(true)` when this call performed the registration and
-    /// `Ok(false)` when the same handle+path was already registered on this
-    /// environment (ORT registration is process-global and must not be
-    /// repeated). Callers use the flag to decide whether the plugin's devices
-    /// can still be identified by a fresh before/after device diff.
+    /// `Ok(false)` when the same handle+path was already registered in this
+    /// process. ORT registration is process-global and must not be repeated,
+    /// even through a different `Environment`.
     pub(crate) fn register_execution_provider_library(
         &self,
         registration_name: &str,
         path: &Path,
     ) -> Result<bool> {
-        let mut registered = self.registered_ep_libraries.lock().map_err(|_| {
+        let mut registered = registered_ep_libraries().lock().map_err(|_| {
             OrtError::InvalidArgument("execution provider registration lock was poisoned".into())
         })?;
-        if let Some(registered_path) = registered.get(registration_name) {
-            if registered_path == path {
+        if let Some(registration) = registered.get(registration_name) {
+            if registration.path == path {
                 return Ok(false);
             }
             return Err(OrtError::InvalidArgument(format!(
                 "execution provider {registration_name} is already registered from {}",
-                registered_path.display()
+                registration.path.display()
             )));
         }
 
@@ -113,25 +122,66 @@ impl Environment {
                 register(self.ptr.as_ptr(), name.as_ptr(), path_c.as_ptr())
             })?;
         }
-        registered.insert(registration_name.to_string(), path.to_path_buf());
+        registered.insert(
+            registration_name.to_string(),
+            PluginRegistration {
+                path: path.to_path_buf(),
+                provider_name: None,
+            },
+        );
         Ok(true)
     }
 
-    /// Fetch the provider name previously discovered for a plugin registration
-    /// handle, if any.
-    pub(crate) fn cached_plugin_provider(&self, registration_name: &str) -> Option<String> {
-        self.resolved_plugin_providers
-            .lock()
-            .ok()
-            .and_then(|map| map.get(registration_name).cloned())
+    /// Serialize process-global plugin registration with provider-name
+    /// discovery. This keeps another environment from observing a completed ORT
+    /// registration before its provider name has been cached.
+    pub(crate) fn lock_plugin_discovery(&self) -> Result<MutexGuard<'static, ()>> {
+        plugin_discovery_lock().lock().map_err(|_| {
+            OrtError::InvalidArgument("execution provider discovery lock was poisoned".into())
+        })
     }
 
-    /// Record the provider name discovered for a plugin registration handle so
-    /// subsequent sessions sharing this environment can re-select its devices.
-    pub(crate) fn cache_plugin_provider(&self, registration_name: &str, provider_name: &str) {
-        if let Ok(mut map) = self.resolved_plugin_providers.lock() {
-            map.insert(registration_name.to_string(), provider_name.to_string());
+    /// Fetch the process-global provider name previously discovered for a
+    /// plugin registration handle, if any.
+    pub(crate) fn cached_plugin_provider(&self, registration_name: &str) -> Result<Option<String>> {
+        registered_ep_libraries()
+            .lock()
+            .map_err(|_| {
+                OrtError::InvalidArgument(
+                    "execution provider registration lock was poisoned".into(),
+                )
+            })
+            .map(|map| {
+                map.get(registration_name)
+                    .and_then(|registration| registration.provider_name.clone())
+            })
+    }
+
+    /// Record the process-global provider name discovered for a plugin
+    /// registration handle so sessions using any environment can re-select its
+    /// devices.
+    pub(crate) fn cache_plugin_provider(
+        &self,
+        registration_name: &str,
+        provider_name: &str,
+    ) -> Result<()> {
+        let mut registered = registered_ep_libraries().lock().map_err(|_| {
+            OrtError::InvalidArgument("execution provider registration lock was poisoned".into())
+        })?;
+        let registration = registered.get_mut(registration_name).ok_or_else(|| {
+            OrtError::InvalidArgument(format!(
+                "execution provider {registration_name} was not registered"
+            ))
+        })?;
+        if let Some(existing) = &registration.provider_name
+            && existing != provider_name
+        {
+            return Err(OrtError::InvalidArgument(format!(
+                "execution provider {registration_name} was already resolved as {existing}, not {provider_name}"
+            )));
         }
+        registration.provider_name = Some(provider_name.to_string());
+        Ok(())
     }
 }
 
@@ -156,3 +206,49 @@ unsafe impl Send for Environment {}
 // SAFETY: Same invariant as `Send`: shared references expose only the stable ORT
 // environment handle, whose operations are thread-safe under ORT's contract.
 unsafe impl Sync for Environment {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plugin_registration_and_provider_cache_are_process_global() {
+        let first = Environment::new("plugin-global-first").expect("first environment");
+        let second = Environment::new("plugin-global-second").expect("second environment");
+        let registration_name = format!("onnx_genai_test_plugin_{}", std::process::id());
+        let path = PathBuf::from("/onnx-genai/test/plugin.so");
+        let _discovery_guard = first.lock_plugin_discovery().expect("discovery lock");
+
+        registered_ep_libraries()
+            .lock()
+            .expect("registration lock")
+            .insert(
+                registration_name.clone(),
+                PluginRegistration {
+                    path: path.clone(),
+                    provider_name: None,
+                },
+            );
+
+        assert!(
+            !second
+                .register_execution_provider_library(&registration_name, &path)
+                .expect("second environment should reuse registration")
+        );
+        first
+            .cache_plugin_provider(&registration_name, "TestExecutionProvider")
+            .expect("cache provider");
+        assert_eq!(
+            second
+                .cached_plugin_provider(&registration_name)
+                .expect("read provider")
+                .as_deref(),
+            Some("TestExecutionProvider")
+        );
+
+        registered_ep_libraries()
+            .lock()
+            .expect("registration lock")
+            .remove(&registration_name);
+    }
+}

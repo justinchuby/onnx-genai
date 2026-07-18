@@ -1138,6 +1138,11 @@ fn append_plugin_execution_provider(
             "SessionOptionsAppendExecutionProvider_V2",
         ))?;
 
+    // ORT plugin registration is process-global. Keep the device snapshot,
+    // registration, and provider-name cache update atomic with respect to other
+    // environments registering plugins concurrently.
+    let discovery_guard = env.lock_plugin_discovery()?;
+
     // Query the environment's current EP devices as a list of raw pointers.
     let query_devices = || -> Result<Vec<*const onnx_genai_ort_sys::OrtEpDevice>> {
         let mut devices_ptr: *const *const onnx_genai_ort_sys::OrtEpDevice = std::ptr::null();
@@ -1226,7 +1231,7 @@ fn append_plugin_execution_provider(
             .map(|name| (*name).to_owned());
         match discovered {
             Some(name) => {
-                env.cache_plugin_provider(registration_name, &name);
+                env.cache_plugin_provider(registration_name, &name)?;
                 name
             }
             None => {
@@ -1237,7 +1242,7 @@ fn append_plugin_execution_provider(
             }
         }
     } else {
-        match env.cached_plugin_provider(registration_name) {
+        match env.cached_plugin_provider(registration_name)? {
             Some(name) => name,
             None => {
                 return Err(OrtError::InvalidArgument(format!(
@@ -1247,6 +1252,7 @@ fn append_plugin_execution_provider(
             }
         }
     };
+    drop(discovery_guard);
 
     let mut selected: Vec<*const onnx_genai_ort_sys::OrtEpDevice> = after
         .iter()
