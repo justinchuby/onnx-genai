@@ -840,28 +840,71 @@ fn tensor_data_to_vec<T: Copy>(
 fn argmax_row_f32(row: &[f32]) -> usize {
     let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     if max == f32::NEG_INFINITY {
-        return 0;
+        return row.iter().position(|value| !value.is_nan()).unwrap_or(0);
     }
     row.iter().position(|&value| value == max).unwrap_or(0)
 }
 
-/// Argmax over raw binary16 bits, ignoring NaNs, matching [`argmax_row_f32`].
+/// Number of half-precision elements widened per chunk in [`argmax_half_bits`].
 ///
-/// Widens the whole row to f32 with half's hardware-accelerated (F16C) slice
-/// conversion, then runs the vectorized f32 reduction. A microbenchmark over a
-/// 151,936-entry vocabulary showed this beats a scalar branch-on-NaN integer
-/// keying loop ~2x (94us vs 200us): the widen + f32 fold both autovectorize,
-/// whereas the loop-carried max/index update in a bit-keying loop does not. The
-/// one f32 scratch allocation is cheap relative to that.
+/// Sized so the scratch buffer (`CHUNK * 4` bytes = 16 KiB) stays on the stack
+/// and comfortably within L1, while remaining large enough that half's
+/// F16C-accelerated slice conversion and the two f32 reductions per chunk still
+/// autovectorize with negligible per-chunk overhead.
+const ARGMAX_WIDEN_CHUNK: usize = 4096;
+
+/// Argmax over half-precision bits (f16 or bf16), ignoring NaNs, matching
+/// [`argmax_row_f32`] exactly (max wins, lowest index on ties, index 0 for
+/// empty/all-NaN/all-`-inf` input).
+///
+/// Widening to f32 first is worth ~2x over a scalar branch-on-NaN bit-keying
+/// loop (94us vs 200us over a 151,936-entry vocabulary on this box): both the
+/// F16C widen and the f32 `max` fold autovectorize, whereas a loop-carried
+/// max/index update does not. Rather than widen the whole row into one heap
+/// `Vec<f32>` (a ~600 KiB allocation for a large vocab), this streams the row
+/// through a fixed 16 KiB stack buffer `ARGMAX_WIDEN_CHUNK` elements at a time.
+/// Each chunk still runs two vectorized passes (a `max` fold, then a `position`
+/// scan only when that chunk beats the running best), so the SIMD win is kept
+/// with zero heap allocation. Strict `>` comparison across chunks preserves the
+/// lowest-index-wins tie-break.
+fn argmax_half_bits<H>(halves: &[H]) -> usize
+where
+    [H]: half::slice::HalfFloatSliceExt,
+{
+    use half::slice::HalfFloatSliceExt;
+    let mut scratch = [0f32; ARGMAX_WIDEN_CHUNK];
+    let mut best_value = f32::NEG_INFINITY;
+    let mut best_index = 0usize;
+    let mut found = false;
+    for (chunk_index, chunk) in halves.chunks(ARGMAX_WIDEN_CHUNK).enumerate() {
+        let widened = &mut scratch[..chunk.len()];
+        chunk.convert_to_f32_slice(widened);
+        let chunk_max = widened.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        if let Some(offset) = widened.iter().position(|&value| value == chunk_max)
+            && (!found || chunk_max > best_value)
+        {
+            best_value = chunk_max;
+            best_index = chunk_index * ARGMAX_WIDEN_CHUNK + offset;
+            found = true;
+        }
+    }
+    if found {
+        best_index
+    } else {
+        0
+    }
+}
+
+/// Argmax over raw binary16 bits, ignoring NaNs, matching [`argmax_row_f32`].
 fn argmax_f16_bits(bits: &[u16]) -> usize {
     let halves: &[half::f16] = half::slice::HalfBitsSliceExt::reinterpret_cast(bits);
-    argmax_row_f32(&half::slice::HalfFloatSliceExt::to_f32_vec(halves))
+    argmax_half_bits(halves)
 }
 
 /// Argmax over raw bfloat16 bits, ignoring NaNs, matching [`argmax_row_f32`].
 fn argmax_bf16_bits(bits: &[u16]) -> usize {
     let halves: &[half::bf16] = half::slice::HalfBitsSliceExt::reinterpret_cast(bits);
-    argmax_row_f32(&half::slice::HalfFloatSliceExt::to_f32_vec(halves))
+    argmax_half_bits(halves)
 }
 
 fn tensor_data_ptr(value: *mut onnx_genai_ort_sys::OrtValue) -> Result<*mut std::ffi::c_void> {
@@ -888,7 +931,7 @@ mod argmax_tests {
     fn reference(values: &[f32]) -> usize {
         let max = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
         if max == f32::NEG_INFINITY {
-            return 0;
+            return values.iter().position(|value| !value.is_nan()).unwrap_or(0);
         }
         values.iter().position(|&v| v == max).unwrap_or(0)
     }
@@ -901,6 +944,7 @@ mod argmax_tests {
             &[3.0, 1.0, 3.0],
             &[-1.0, -2.0, -0.5],
             &[f32::NEG_INFINITY, f32::NEG_INFINITY],
+            &[f32::NAN, f32::NEG_INFINITY],
             &[0.0, f32::NAN, 2.0, f32::NAN, 2.0],
             &[f32::NAN, f32::NAN],
             &[f32::INFINITY, 5.0, f32::INFINITY],
@@ -921,6 +965,70 @@ mod argmax_tests {
     fn ignores_nan_and_handles_all_nan() {
         assert_eq!(argmax_row_f32(&[f32::NAN, 1.0, f32::NAN]), 1);
         assert_eq!(argmax_row_f32(&[f32::NAN, f32::NAN]), 0);
+        assert_eq!(argmax_row_f32(&[f32::NAN, f32::NEG_INFINITY]), 1);
+        assert_eq!(argmax_row_f32(&[f32::NEG_INFINITY; 3]), 0);
+        for values in [
+            vec![f32::NAN, f32::NEG_INFINITY],
+            vec![f32::NEG_INFINITY; 3],
+        ] {
+            let f16 = values
+                .iter()
+                .map(|&value| half::f16::from_f32(value).to_bits())
+                .collect::<Vec<_>>();
+            let bf16 = values
+                .iter()
+                .map(|&value| half::bf16::from_f32(value).to_bits())
+                .collect::<Vec<_>>();
+            assert_eq!(argmax_f16_bits(&f16), reference(&values));
+            assert_eq!(argmax_bf16_bits(&bf16), reference(&values));
+        }
+    }
+
+    /// Exercise the chunked, no-alloc half-precision argmax across chunk
+    /// boundaries (row length > `ARGMAX_WIDEN_CHUNK`) with the winner in a
+    /// later chunk, cross-chunk ties, NaNs, and the all-NaN fallback.
+    #[test]
+    fn half_argmax_matches_reference_across_chunks() {
+        let len = super::ARGMAX_WIDEN_CHUNK * 2 + 123;
+        let cases: &[(usize, f32)] = &[
+            (0, 3.0),
+            (super::ARGMAX_WIDEN_CHUNK - 1, 3.0),
+            (super::ARGMAX_WIDEN_CHUNK, 3.0),
+            (super::ARGMAX_WIDEN_CHUNK + 7, 3.0),
+            (len - 1, 3.0),
+        ];
+        for &(peak, value) in cases {
+            let mut f32_row = vec![1.0f32; len];
+            f32_row[peak] = value;
+            // A cross-chunk tie a few chunks later must NOT displace the
+            // lowest-index winner.
+            if peak + super::ARGMAX_WIDEN_CHUNK < len {
+                f32_row[peak + super::ARGMAX_WIDEN_CHUNK] = value;
+            }
+            let f16_bits: Vec<u16> = f32_row
+                .iter()
+                .map(|&v| half::f16::from_f32(v).to_bits())
+                .collect();
+            let bf16_bits: Vec<u16> = f32_row
+                .iter()
+                .map(|&v| half::bf16::from_f32(v).to_bits())
+                .collect();
+            assert_eq!(argmax_f16_bits(&f16_bits), reference(&f32_row), "f16 peak {peak}");
+            assert_eq!(argmax_bf16_bits(&bf16_bits), reference(&f32_row), "bf16 peak {peak}");
+        }
+
+        // NaNs are ignored; a single finite value in a later chunk wins.
+        let mut nan_row = vec![f32::NAN; len];
+        nan_row[super::ARGMAX_WIDEN_CHUNK + 5] = 1.0;
+        let nan_bits: Vec<u16> = nan_row
+            .iter()
+            .map(|&v| half::f16::from_f32(v).to_bits())
+            .collect();
+        assert_eq!(argmax_f16_bits(&nan_bits), super::ARGMAX_WIDEN_CHUNK + 5);
+
+        // All-NaN falls back to index 0.
+        let all_nan: Vec<u16> = vec![half::f16::from_f32(f32::NAN).to_bits(); len];
+        assert_eq!(argmax_f16_bits(&all_nan), 0);
     }
 
     // A cheap xorshift so the parity fuzz has no external dependency.

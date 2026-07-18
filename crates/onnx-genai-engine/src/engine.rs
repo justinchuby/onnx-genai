@@ -25,8 +25,6 @@ use crate::session::{ActiveGenerate, DraftModel, DraftSession, EngineSession};
 use anyhow::Context;
 use onnx_genai_kv::{Device, KvCacheOps, KvDType, LocalTieredConnector, PagedKvCache, PrefixCache};
 use onnx_genai_metadata::{InferenceMetadata, ProposalType, SpeculatorProposerStatus};
-#[cfg(feature = "native-backend")]
-use onnx_genai_ort::ExecutionProvider;
 use onnx_genai_ort::{
     DataType, Eagle3DecodeSession, Environment, ModelDirectory, MtpDecodeSession, Session,
     SessionOptions, SharedKvProposerSession, Tokenizer,
@@ -66,20 +64,24 @@ fn resolve_native_decode_device(
     }
 
     for provider in &session_options.execution_providers {
-        if !matches!(
-            provider,
-            ExecutionProvider::Cpu | ExecutionProvider::Cuda { .. }
-        ) {
+        if !provider.caps.is_host()
+            && !(provider.caps.is_gpu() && provider.caps.is_nvidia())
+        {
             anyhow::bail!(
                 "native decoder backend does not support execution provider {provider:?}; supported devices are CPU and CUDA"
             );
         }
     }
 
-    match session_options.execution_providers.first() {
-        None | Some(ExecutionProvider::Cpu) => Ok(NativeDecodeDevice::Cpu),
-        Some(ExecutionProvider::Cuda { device_id }) => {
-            let index = u32::try_from(*device_id).map_err(|_| {
+    match session_options
+        .execution_providers
+        .iter()
+        .find(|provider| !provider.caps.is_host())
+    {
+        None => Ok(NativeDecodeDevice::Cpu),
+        Some(provider) if provider.caps.is_gpu() && provider.caps.is_nvidia() => {
+            let device_id = provider.caps.device_id().unwrap_or(0);
+            let index = u32::try_from(device_id).map_err(|_| {
                 anyhow::anyhow!(
                     "native decoder backend CUDA device id must be non-negative, got {device_id}"
                 )

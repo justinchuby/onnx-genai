@@ -3,6 +3,7 @@
 //! Add new library-internal runtime flags to [`RuntimeConfig`] instead of
 //! reading environment variables at their call sites.
 
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -10,26 +11,33 @@ use std::sync::OnceLock;
 const DEFAULT_SPEC_PROMPT: &str = "Once upon a time, there was a small robot who";
 const DEFAULT_MB_PROMPT: &str = "<bos>The capital of France is";
 
-/// Execution provider requested through `ONNX_GENAI_EP`.
+/// An execution provider requested through `ONNX_GENAI_EP`.
+///
+/// Provider names are normalized but otherwise opaque. Provider-specific
+/// options are forwarded unchanged by the ORT layer.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ExecutionProvider {
-    /// CPU execution provider.
-    Cpu,
-    /// WebGPU execution provider.
-    WebGpu,
-    /// CUDA execution provider.
-    Cuda,
-    /// External Metal execution provider.
-    Metal,
-    /// Core ML execution provider.
-    CoreMl,
-    /// A generic execution-provider plugin loaded from a shared library
-    /// (`ONNX_GENAI_EP_LIBRARY`). The concrete provider (e.g. OpenVINO,
-    /// NV TensorRT RTX) is discovered from the plugin at runtime, so no
-    /// provider name is hardcoded.
-    Plugin,
-    /// An unsupported normalized provider name.
-    Unsupported(String),
+pub struct EpSelection {
+    /// Normalized (trimmed, lowercased) provider name.
+    pub name: String,
+    /// Opaque provider options.
+    pub options: BTreeMap<String, String>,
+}
+
+impl EpSelection {
+    /// Construct a selection using the same normalization as the env parser.
+    #[must_use]
+    pub fn new(name: impl AsRef<str>) -> Self {
+        Self {
+            name: normalize_ep_name(name.as_ref()),
+            options: BTreeMap::new(),
+        }
+    }
+
+    /// Whether this selection names the implicit host provider.
+    #[must_use]
+    pub fn is_host_default(&self) -> bool {
+        self.name.is_empty() || self.name == "cpu"
+    }
 }
 
 /// A single execution-provider plugin fully described inline in the
@@ -65,7 +73,7 @@ pub struct PluginSpec {
 pub enum ExecutionProviderEntry {
     /// A built-in provider or the bare `plugin` token (configured through the
     /// scalar `ONNX_GENAI_EP_*` variables).
-    Builtin(ExecutionProvider),
+    Builtin(EpSelection),
     /// A plugin fully described inline in the list.
     Plugin(PluginSpec),
 }
@@ -193,9 +201,17 @@ impl RuntimeConfig {
     where
         F: Fn(&str) -> Option<OsString>,
     {
-        let execution_providers = env_string(&lookup, "ONNX_GENAI_EP")
+        let mut execution_providers = env_string(&lookup, "ONNX_GENAI_EP")
             .map(|value| parse_execution_provider_list(&value))
             .unwrap_or_default();
+        let ep_options = env_string(&lookup, "ONNX_GENAI_EP_OPTIONS")
+            .map(|value| parse_key_value_list(&value))
+            .unwrap_or_default();
+        for entry in &mut execution_providers {
+            if let ExecutionProviderEntry::Builtin(selection) = entry {
+                selection.options.extend(ep_options.iter().cloned());
+            }
+        }
         let cuda_device = match env_string(&lookup, "ONNX_GENAI_CUDA_DEVICE") {
             Some(value) => value
                 .trim()
@@ -235,9 +251,7 @@ impl RuntimeConfig {
             ep_registration_name: env_string(&lookup, "ONNX_GENAI_EP_NAME")
                 .map(|value| value.trim().to_owned())
                 .filter(|value| !value.is_empty()),
-            ep_options: env_string(&lookup, "ONNX_GENAI_EP_OPTIONS")
-                .map(|value| parse_key_value_list(&value))
-                .unwrap_or_default(),
+            ep_options,
             ep_device: env_string(&lookup, "ONNX_GENAI_EP_DEVICE")
                 .map(|value| value.trim().to_owned())
                 .filter(|value| !value.is_empty()),
@@ -315,16 +329,14 @@ where
     lookup(name).and_then(|value| value.into_string().ok())
 }
 
-fn parse_execution_provider(value: &str) -> ExecutionProvider {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "" | "cpu" => ExecutionProvider::Cpu,
-        "webgpu" | "web-gpu" | "web_gpu" => ExecutionProvider::WebGpu,
-        "cuda" => ExecutionProvider::Cuda,
-        "metal" => ExecutionProvider::Metal,
-        "coreml" | "core-ml" | "core_ml" => ExecutionProvider::CoreMl,
-        "plugin" | "ep-plugin" | "ep_plugin" => ExecutionProvider::Plugin,
-        other => ExecutionProvider::Unsupported(other.to_owned()),
-    }
+/// Normalize an execution-provider name consistently for env and API callers.
+#[must_use]
+pub fn normalize_ep_name(value: &str) -> String {
+    value.trim().to_ascii_lowercase()
+}
+
+fn parse_execution_provider(value: &str) -> EpSelection {
+    EpSelection::new(value)
 }
 
 /// Parse the `ONNX_GENAI_EP` value into an ordered execution-provider priority
@@ -349,7 +361,7 @@ fn parse_execution_provider_list(value: &str) -> Vec<ExecutionProviderEntry> {
         .map(parse_execution_provider_entry)
         .collect();
     if entries.is_empty() {
-        entries.push(ExecutionProviderEntry::Builtin(ExecutionProvider::Cpu));
+        entries.push(ExecutionProviderEntry::Builtin(EpSelection::new("cpu")));
     }
     entries
 }
@@ -441,13 +453,16 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        CudaDevice, ExecutionProvider, ExecutionProviderEntry, IntraOpThreads, PluginSpec,
-        RuntimeConfig,
+        CudaDevice, EpSelection, ExecutionProviderEntry, IntraOpThreads, PluginSpec, RuntimeConfig,
     };
 
     fn config(entries: &[(&str, &str)]) -> RuntimeConfig {
         let values: HashMap<&str, &str> = entries.iter().copied().collect();
         RuntimeConfig::from_fn(|name| values.get(name).map(|value| (*value).to_owned()))
+    }
+
+    fn ep(name: &str) -> ExecutionProviderEntry {
+        ExecutionProviderEntry::Builtin(EpSelection::new(name))
     }
 
     #[test]
@@ -521,26 +536,23 @@ mod tests {
     }
 
     #[test]
-    fn execution_provider_parses_aliases_and_retains_unsupported_name() {
+    fn execution_provider_normalizes_and_retains_generic_names() {
         let cases = [
-            ("", ExecutionProvider::Cpu),
-            (" CPU ", ExecutionProvider::Cpu),
-            ("web-gpu", ExecutionProvider::WebGpu),
-            ("WEB_GPU", ExecutionProvider::WebGpu),
-            ("cuda", ExecutionProvider::Cuda),
-            ("metal", ExecutionProvider::Metal),
-            ("core-ml", ExecutionProvider::CoreMl),
-            ("plugin", ExecutionProvider::Plugin),
-            ("EP-Plugin", ExecutionProvider::Plugin),
-            (
-                " Unknown-EP ",
-                ExecutionProvider::Unsupported("unknown-ep".to_owned()),
-            ),
+            ("", ""),
+            (" CPU ", "cpu"),
+            ("web-gpu", "web-gpu"),
+            ("WEB_GPU", "web_gpu"),
+            ("cuda", "cuda"),
+            ("metal", "metal"),
+            ("core-ml", "core-ml"),
+            ("plugin", "plugin"),
+            ("EP-Plugin", "ep-plugin"),
+            (" Unknown-EP ", "unknown-ep"),
         ];
-        for (value, expected) in cases {
+        for (value, expected_name) in cases {
             assert_eq!(
                 config(&[("ONNX_GENAI_EP", value)]).execution_providers,
-                vec![ExecutionProviderEntry::Builtin(expected)]
+                vec![ep(expected_name)]
             );
         }
     }
@@ -550,11 +562,7 @@ mod tests {
         let actual = config(&[("ONNX_GENAI_EP", " cuda , webgpu ,cpu")]);
         assert_eq!(
             actual.execution_providers,
-            vec![
-                ExecutionProviderEntry::Builtin(ExecutionProvider::Cuda),
-                ExecutionProviderEntry::Builtin(ExecutionProvider::WebGpu),
-                ExecutionProviderEntry::Builtin(ExecutionProvider::Cpu),
-            ]
+            vec![ep("cuda"), ep("webgpu"), ep("cpu")]
         );
     }
 
@@ -563,12 +571,12 @@ mod tests {
         // A trailing comma yields an empty token that is skipped.
         assert_eq!(
             config(&[("ONNX_GENAI_EP", "cuda,")]).execution_providers,
-            vec![ExecutionProviderEntry::Builtin(ExecutionProvider::Cuda)]
+            vec![ep("cuda")]
         );
         // An explicit empty value still resolves to a single CPU entry.
         assert_eq!(
             config(&[("ONNX_GENAI_EP", "")]).execution_providers,
-            vec![ExecutionProviderEntry::Builtin(ExecutionProvider::Cpu)]
+            vec![ep("cpu")]
         );
     }
 
@@ -582,7 +590,7 @@ mod tests {
         assert_eq!(
             actual.execution_providers,
             vec![
-                ExecutionProviderEntry::Builtin(ExecutionProvider::Cuda),
+                ep("cuda"),
                 ExecutionProviderEntry::Plugin(PluginSpec {
                     library: PathBuf::from("C:\\ep\\openvino.dll"),
                     registration_name: Some("ov".to_owned()),
@@ -614,10 +622,12 @@ mod tests {
             ),
             ("ONNX_GENAI_EP_DEVICE", " GPU "),
         ]);
-        assert_eq!(
-            actual.execution_providers,
-            vec![ExecutionProviderEntry::Builtin(ExecutionProvider::Plugin)]
-        );
+        assert_eq!(actual.execution_providers.len(), 1);
+        let ExecutionProviderEntry::Builtin(selection) = &actual.execution_providers[0] else {
+            panic!("expected built-in plugin selection");
+        };
+        assert_eq!(selection.name, "plugin");
+        assert_eq!(selection.options.get("device_type").map(String::as_str), Some("CPU"));
         assert_eq!(
             actual.ep_library,
             Some(PathBuf::from("/opt/onnxruntime_ep_openvino.so"))

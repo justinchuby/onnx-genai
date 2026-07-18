@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use onnx_genai_engine::{Engine, EngineConfig, GeneratePrompt, GenerateRequest};
-use onnx_genai_ort::{ExecutionProvider, SessionOptions};
+use onnx_genai_ort::{SessionOptions, ep_selection};
 
 fn shared_buffer_model_dir() -> Option<PathBuf> {
     if let Ok(dir) = std::env::var("ONNX_GENAI_SHARED_BUFFER_MODEL") {
@@ -28,7 +28,7 @@ fn cuda_engine(model_dir: &Path) -> anyhow::Result<Engine> {
     Engine::from_dir_with_session_options(
         model_dir,
         EngineConfig::default(),
-        SessionOptions::with_execution_provider(ExecutionProvider::Cuda { device_id: 0 }),
+        SessionOptions::with_execution_provider(ep_selection("cuda")),
     )
 }
 
