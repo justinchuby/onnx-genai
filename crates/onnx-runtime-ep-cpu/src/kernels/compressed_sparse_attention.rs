@@ -205,7 +205,9 @@ impl CompressedSparseAttentionFactory {
             .unwrap_or("logit_only");
         if sink_mode != "logit_only" {
             return Err(unsupported(format!(
-                "sink_mode='{sink_mode}' is unsupported; v1 requires 'logit_only'"
+                "sink_mode='{sink_mode}' is unsupported for the learned per-head logit input \
+                 `head_sink`; v1 requires 'logit_only'. Metadata `sink_tokens` configures retained \
+                 prefix tokens and is unrelated"
             )));
         }
         let cache_format = node
@@ -3467,6 +3469,28 @@ mod tests {
         for (actual, expected) in output.to_f32().iter().zip(expected) {
             assert!((actual - expected).abs() < 1e-6, "{actual} != {expected}");
         }
+    }
+
+    #[test]
+    fn sink_mode_error_distinguishes_learned_logit_sink_from_sink_tokens() {
+        let mut node = Node::new(NodeId(0), OP, vec![], vec![]);
+        node.attributes
+            .insert("num_heads".into(), Attribute::Int(1));
+        node.attributes.insert("head_dim".into(), Attribute::Int(2));
+        node.attributes
+            .insert("compression_ratio".into(), Attribute::Int(128));
+        node.attributes
+            .insert("sink_mode".into(), Attribute::String("sink_tokens".into()));
+
+        let message =
+            match CompressedSparseAttentionFactory.create_assembled_cache_reference(&node, &[]) {
+                Ok(_) => panic!("sink_tokens must not be accepted as a learned-logit sink mode"),
+                Err(error) => error.to_string(),
+            };
+        assert!(message.contains("learned per-head logit input `head_sink`"));
+        assert!(message.contains("Metadata `sink_tokens`"));
+        assert!(message.contains("retained prefix tokens"));
+        assert!(message.contains("unrelated"));
     }
 
     #[test]

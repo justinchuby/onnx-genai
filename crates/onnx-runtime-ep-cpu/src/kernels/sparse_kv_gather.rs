@@ -650,6 +650,22 @@ mod tests {
     }
 
     #[test]
+    fn strict_gather_rejects_negative_and_cache_end_indices() {
+        let negative = sparse_kv_gather_f32(&[0.0; 8], [1, 1, 4, 2], &[0, -1], [1, 1, 1, 2], None)
+            .unwrap_err()
+            .to_string();
+        assert!(negative.contains("negative index -1"));
+        assert!(negative.contains("[batch=0, group=0, query=0, index=1]"));
+
+        let cache_end = sparse_kv_gather_f32(&[0.0; 8], [1, 1, 4, 2], &[4], [1, 1, 1, 1], None)
+            .unwrap_err()
+            .to_string();
+        assert!(cache_end.contains("index 4"));
+        assert!(cache_end.contains("[batch=0, group=0, query=0, index=0]"));
+        assert!(cache_end.contains("valid length 4"));
+    }
+
+    #[test]
     fn masked_gather_zeroes_minus_one_without_reordering() {
         let gathered = sparse_kv_gather_masked_f32(
             &[1.0, 2.0, 3.0, 4.0],
@@ -668,6 +684,54 @@ mod tests {
         let selected =
             sparse_kv_gather_f32(&[1.0, 2.0], [1, 1, 1, 2], &[], [1, 1, 3, 0], None).unwrap();
         assert!(selected.is_empty());
+    }
+
+    #[test]
+    fn gather_uses_deterministic_b_g_q_k_d_layout() {
+        let mut cache = Vec::new();
+        for b in 0..2 {
+            for g in 0..2 {
+                for c in 0..3 {
+                    let record = (100 * b + 10 * g + c) as f32;
+                    cache.extend([record, record + 0.5]);
+                }
+            }
+        }
+        let indices = [
+            2, 0, 1, 2, // b0 g0
+            1, 0, 2, 1, // b0 g1
+            0, 2, 2, 0, // b1 g0
+            2, 1, 0, 1, // b1 g1
+        ];
+        let selected =
+            sparse_kv_gather_f32(&cache, [2, 2, 3, 2], &indices, [2, 2, 2, 2], None).unwrap();
+        assert_eq!(
+            selected,
+            [
+                2.0, 2.5, 0.0, 0.5, 1.0, 1.5, 2.0, 2.5, // b0 g0
+                11.0, 11.5, 10.0, 10.5, 12.0, 12.5, 11.0, 11.5, // b0 g1
+                100.0, 100.5, 102.0, 102.5, 102.0, 102.5, 100.0, 100.5, // b1 g0
+                112.0, 112.5, 111.0, 111.5, 110.0, 110.5, 111.0, 111.5, // b1 g1
+            ]
+        );
+    }
+
+    #[test]
+    fn ratio4_prefill_empty_compressed_prefix_is_minus_one_masked() {
+        let topk = [0, 0, 0, 0, 0, 0, 0, 0];
+        let plan = prefill_csa_indices(4, CSA_RATIO_4, Some((&topk, 2))).unwrap();
+        for query in 0..3 {
+            let row = query * plan.selections;
+            assert_eq!(
+                &plan.indices[row + CSA_WINDOW_SIZE..row + plan.selections],
+                &[-1, -1]
+            );
+        }
+        let final_row = 3 * plan.selections;
+        assert_eq!(
+            &plan.indices[final_row + CSA_WINDOW_SIZE..final_row + plan.selections],
+            &[4, 4]
+        );
     }
 
     #[test]
