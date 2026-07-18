@@ -76,8 +76,50 @@ through the whole codebase the way `reinterpret_cast` and raw pointers do in C++
 - A **CPU execution provider with real kernels** written in safe Rust.
 - A graph **optimizer**, **shape-inference**, and **partitioner** as ordinary, testable Rust modules.
 
+### Extensibility: the rewrite adds what OGA doesn't have
+
+The strongest test of "too model-specific / not extensible" is whether the successor onboards
+*new capabilities* fast. `onnx-genai` — the standard-driven Rust reimplementation of OGA — is being
+built by an **agent team** and is already reaching past OGA's surface into modalities OGA does not
+support: **diffusion, multimodal (vision + audio), and audio-to-audio** pipelines, added as
+declared-metadata + trait-plugin extensions rather than new bespoke model dispatch. This is the
+extensibility argument in practice: because behavior is derived from declared inference metadata and
+à-la-carte traits (see §9), a new architecture or modality is mostly *declaration + fixture + a plugin*,
+and it is tractable for agents to add. (Scope is honest: these are in-progress capabilities in a
+personal experiment, not a shipped, conformance-gated product — but the point is the *shape* of
+extension, which is what OGA's per-model-family style makes hard.)
+
 None of this is theoretical. It is compiled, tested, and (for the EP) released to public registries by
 one person as a side experiment — which is itself a data point about the approach's tractability.
+
+### Measured performance vs onnxruntime-genai (OGA)
+
+Early signs are that the Rust reimplementation is **not** paying a decode tax versus OGA — and on CUDA
+is ahead — but the *clean* runtime-to-runtime numbers are still being collected. The comparisons below
+use **Foundry Local** as the OGA proxy (its decode path *is* `OgaGenerator::GenerateNextToken` /
+onnxruntime-genai), and **Foundry Local runs as a daemon/server, so its HTTP figures carry server
+overhead that this document should not launder into a pure engine-vs-engine result.** Treat these as
+*indicative*, not definitive:
+
+- **CPU (Apple M1 Max, Qwen2.5-0.5B int4).** Warm decode roughly parity on short, ahead on long
+  (~175 vs ~160 tok/s) after the fp32-GQA shared-KV fix; feeding OGA's *own* `model.onnx` through our
+  runtime reproduces parity, so the delta is the runtime, not the model.
+  (`docs/benchmarks/2026-07-13-foundry-local-analysis.md`.)
+- **CUDA (H200, Qwen2.5-0.5B int4).** Ahead of Foundry Local / onnxruntime-genai CUDA on decode, TTFT,
+  and total in the measured run. (`docs/benchmarks/2026-07-13-H200-cuda-onnxgenai-vs-ollama-foundry.md`.)
+
+> **[PLACEHOLDER — clean OGA head-to-head, to be filled in]**
+> Definitive numbers will compare **onnx-genai against onnxruntime-genai's C API directly** (no Foundry
+> Local server in the loop), on the **same ORT build, model, EP, tokenizer, sampling, and hardware**,
+> reporting TTFT and inter-token latency (median + p95/p99), tokens/sec under concurrent load, and peak
+> memory — on **CPU and CUDA**. Author's summary of current results: *CPU decode already exceeds OGA;
+> CUDA is on par (fuller CUDA numbers to be added).* These land here once the server-overhead-free
+> harness is run; see the bake-off methodology in §12.
+
+**Honest scope:** one model family, two machines, batch-1 greedy decode, an ORT-version delta (FL 1.26 /
+ours 1.27), and a server-mediated OGA proxy. The narrow, defensible claim today is: *where it has been
+measured, the Rust orchestration layer meets-or-beats OGA on decode and is ahead on CUDA* — not "faster
+everywhere." The clean bake-off in §12 is what turns that from indicative into settled.
 
 ---
 
@@ -158,7 +200,11 @@ If we pretend these away, the experts are right to ignore us.
    execute (runtime, probabilistic, and off in production builds), and the guidelines are opt-in and
    unenforced; Rust's guarantees are compile-time, total over all paths, and on by default. That is a
    real, but *narrower and more nuanced*, advantage than a naïve pitch implies — and for a team already
-   running ASan/TSan/fuzzing well, the marginal safety gain is smaller than for one that isn't.
+   running ASan/TSan/fuzzing well, the marginal safety gain is smaller than for one that isn't. (The
+   honest counter-asymmetry: standing up and *continuously running* that tooling — separate sanitizer
+   build variants, fuzzing infra, keeping them green in CI — is itself an ongoing build-pipeline cost,
+   whereas Rust's guarantees are on by default with no extra pipeline. So the gap is smaller for a
+   well-tooled team, but that tooling is not free either.)
 
 8. **Async runtime and thread-pool coexistence is unsolved integration work.** Adopting `async` Rust
    means adopting a runtime (e.g. Tokio) that owns threads — which must then coexist with ORT's and each
@@ -174,10 +220,12 @@ If we pretend these away, the experts are right to ignore us.
 **Read the "Verdict" column as a qualitative assessment of *fit and maintainability*, drawn from
 building the experiment — not a benchmarked claim of performance parity.** "Rust win" here means the
 code was safer to write and refactor and had zero memory-safety defects, not that it out-runs a tuned
-C++ equivalent. Substantiating a *performance* claim would need head-to-head numbers this document does
-not yet have: decode/prefill latency, throughput, peak memory, binary size, cold/warm build time, and
-model/platform coverage against OGA/ORT. Where those are missing, treat the verdict as "promising fit,
-pending measurement."
+C++ equivalent. On raw performance there are now *preliminary* head-to-head numbers vs OGA (see §1:
+CPU meets-or-beats, CUDA ahead in the measured runs) — but via a server-mediated proxy (Foundry Local)
+and on a narrow model/hardware set, so a *settled* performance claim still needs the clean bake-off in
+§12: decode/prefill latency (median + p95/p99), throughput under concurrent load, peak memory, binary
+size, cold/warm build time, and model/platform coverage against OGA/ORT. Until that lands, treat each
+verdict as "promising fit, with early-but-favorable perf signal, pending the full bake-off."
 
 | Component type | Rust advantage | Verdict (qualitative) |
 |---|---|---|
@@ -405,8 +453,11 @@ substantially easier for Rust consumers, and no worse for everyone else.
   (`onnx-runtime-ir`, `-memory`, `-optimizer`, `-ep-cpu`, `-ep-cuda`, `onnx-genai-kv`, `-scheduler`,
   `-engine`, `-preprocess`, `-router`…). Depend on the three you use; the rest never enters your build.
   Feature flags (`default-features = false` + opt-in) trim further — a CUDA-free build, a tracer-free
-  build. C++ *can* be modular, but in practice ORT ships as one large artifact and cherry-picking a
-  subsystem is surgery.
+  build. This cuts the *other* way too, and it's a lived contrast from building the experiment:
+  **modular crates make a subsystem extractable and reusable by construction**, whereas pulling a
+  coherent module *out* of the ORT C++ monolith — shared headers, template entanglement, a coupled
+  build graph — is real surgery. "Reuse just the optimizer" is a one-line dependency here; in the C++
+  codebase it's a detangling project.
 - **Traits are clean, zero-cost plugin points — and they already exist here.** "Bring your own
   component" is a trait the user implements. The experiment already exposes `Sampler`, `LogitProcessor`,
   `Constraint`, `TokenEmbedder`, `LmHead`, and `SpeculativeProposer` as public traits: a user writes
@@ -496,7 +547,7 @@ orchestration around it is JS/Transformers.js. That fact cuts both ways, and bot
 - **It validates the "keep and reuse the kernels/runtime" half — strongly.** The people with the deepest
   Rust expertise on earth chose to reuse a mature C++ inference runtime rather than reimplement one — and
   when they optimized, they moved *toward* native C++ ORT, not away from it. Reimplementing a kernel-heavy
-  runtime *for its own sake* is exactly the guilty-until-proven case §3 and §12 warn against. If ORT
+  runtime *for its own sake* is exactly the guilty-until-proven case §3 and §13 warn against. If ORT
   already runs your model well, the highest-value move is to *wrap* it, not re-derive MLAS.
 - **It is the honest counterweight to Phase 2 (incrementally porting the runtime to Rust).** If Mozilla
   didn't rewrite ORT, we cannot justify porting the runtime on "Rust is nicer." Any runtime seam must
@@ -543,7 +594,7 @@ approach this document argues for. The sequence:
   concurrency is the point.)*
 - **Coexistence is permanent, not a deadline.** A decade in, Gecko is still majority C++ with growing
   Rust; the goal was never a full rewrite, only to move the seams where Rust earns its place. That is the
-  same posture §12 recommends here.
+  same posture §13 recommends here.
 
 The honest, load-bearing detail is Stylo: it is a concrete case where Rust's safety didn't just prevent
 bugs, it **enabled a capability C++ couldn't ship** (safe parallelism at that scale). That is the
@@ -631,7 +682,67 @@ approve a multi-year rewrite; they approve one crate at a time, each behind a co
 
 ---
 
-## 12. Recommendation, and what would change it
+## 12. Proposed experiment: the matched bake-off and its decision gates
+
+The doc should be *falsifiable*, not just persuasive. Here is the concrete experiment that would turn
+"credible case to try" into "greenlight" or "stand down." It is designed to answer the exact objections
+a skeptical senior ORT engineer raises: no clean head-to-head numbers, async/thread integration
+unproven, agentic claim anecdotal, OGA parity undefined.
+
+**Step 0 — Define the ABI first (prerequisite, no experiment without it).** Any cross-language reuse or
+plugin story rides on a **deliberately-stable C ABI**. Before porting or cross-language claims, freeze
+the interface: the runtime C API surface and the plugin-EP ABI, versioned, with a compatibility policy.
+This is cheap, uncontroversial, and unblocks everything else.
+
+**A. The clean performance bake-off (replaces the server-mediated Foundry Local numbers in §1).**
+- **Contestants:** `onnx-genai` (Rust) vs **onnxruntime-genai's C API directly** — *no* Foundry Local
+  server in the loop, so no daemon/HTTP overhead on either side.
+- **Held identical:** ORT build, model weights, EP, tokenizer, sampling, batching policy, hardware.
+- **Report:** TTFT and inter-token latency (median **+ p95/p99**); tokens/sec at batch-1 **and under
+  concurrent load**; peak + steady-state **host and device memory**; CPU utilization + thread count;
+  allocation and Rust↔C transition profiles; cancellation/overload behavior; plus **binary size** and
+  **cold/warm build time**.
+- **Coverage:** **CPU and CUDA** at minimum, plus one constrained on-device target — and **more than one
+  model family** (not just Qwen2.5-0.5B), including at least one larger model.
+- *Author's current read (to be confirmed by this harness): CPU decode already exceeds OGA; CUDA is on
+  par-to-ahead, with fuller CUDA numbers to be added.*
+
+**B. The async / thread-pool integration proof.** A design + trace for the Rust serving slice showing:
+bounded thread count under load, **no blocking FFI on executor workers**, explicit ownership of CPU
+scheduling vs ORT's intra/inter-op pools, GPU-completion integration without polling storms, and clean
+cancellation/backpressure — compared directly against a C++ slice using ORT's existing facilities.
+
+**C. The agentic-development study (matched, blind).** The *same* set of representative tasks
+implemented by agents in both a Rust crate and ORT C++, reviewed by ORT engineers **unfamiliar with each
+implementation**. Measure iterations-to-green, wall-clock time, **escaped defects found by fuzzing**,
+human review minutes, and a six-month follow-up modification cost. Rule: don't count compiler errors
+fixed during generation as "defects avoided" unless the C++ arm gets equivalent compiler + sanitizer +
+static-analysis feedback.
+
+**D. The extensibility study.** Time-to-add a capability OGA lacks — e.g. an **audio-to-audio** or
+**diffusion** pipeline — in each stack, from spec to passing fixture. This tests the "standard-driven,
+declaration-not-dispatch" thesis directly (the `onnx-genai` agent-team work is the Rust data point).
+
+**E. The OGA parity matrix (prerequisite deliverable for proposition (b)).** A requirements matrix with
+explicit pass/fail gates: OGA public APIs, model families, multimodal preprocessing, structured
+generation, adapters, device combinations, packaging, language bindings, telemetry, support
+obligations. "The experiment implements X" is not evidence of product equivalence until this is filled.
+
+### Decision gates (what each outcome greenlights)
+
+| Result | Conclusion |
+|---|---|
+| Rust slice hits **feature parity, within ~2% latency/throughput, no thread/memory regression**, and **materially less implement+review time and fewer fuzz-found defects** | Greenlight proposition (b): refactor OGA to the Rust layer, on a schedule, parity-gated |
+| Perf parity but agentic/maintenance benefits unproven | Continue (a) (new EPs + isolated components); keep (b) a pilot |
+| Perf regression outside ~2%, or async/thread integration unsolved | Hold (b); the Rust layer stays experimental; keep wrapping ORT |
+| Any runtime-internal seam can't match ORT on numerics **and** latency **and** coverage | That seam stays C++/FFI — proposition (c) is refused for it |
+
+The bar is deliberately strict and symmetric: this experiment can **fail** and tell us to keep C++.
+That is the point — it replaces advocacy with a measurement everyone has pre-agreed to believe.
+
+---
+
+## 13. Recommendation, and what would change it
 
 **Recommendation (for discussion, not a mandate):** treat Rust as the default for *new* orchestration
 and GenAI components and for *new* plugin EPs; where the runtime is reimplemented, do it incrementally
@@ -639,7 +750,8 @@ behind the ORT C API; keep and reuse C++/CUDA kernels through FFI indefinitely, 
 measured evidence. Treat "rewrite a hot kernel in Rust" as guilty-until-proven, and "write the
 orchestration/EP glue in Rust" as the low-risk default.
 
-**What would change this recommendation (intellectual honesty):**
+**What would change this recommendation (intellectual honesty):** the **bake-off and decision gates in
+§12** are the concrete, pre-agreed test — this recommendation is contingent on their outcome. In short:
 - If a Rust runtime piece cannot match ORT's latency within a small margin on the ORT conformance
   suite, it stays a C++/FFI wrapper. Measure, don't assume.
 - If FFI overhead at the Rust↔kernel boundary shows up in decode-step profiles, that boundary gets
