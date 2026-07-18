@@ -1006,17 +1006,23 @@ impl<'a> DecodeSession<'a> {
     /// ~O(actual length) while growth (and its one-time KV copy + graph
     /// re-capture) happens only O(log length) times per generation.
     fn ensure_kv_capacity(&mut self, required: usize) -> Result<()> {
-        if self.mode != DecodeKvMode::SharedBuffer || required <= self.kv_capacity {
+        if self.mode != DecodeKvMode::SharedBuffer {
             return Ok(());
         }
         let hard_max = self.max_length.ok_or_else(|| {
             OrtError::InvalidArgument("shared-buffer growth requires max_length".into())
         })?;
+        if required > hard_max {
+            return Err(OrtError::InvalidArgument(format!(
+                "requested KV capacity {required} exceeds model max_length {hard_max}"
+            )));
+        }
+        if required <= self.kv_capacity {
+            return Ok(());
+        }
         let new_capacity = kv_capacity_bucket(required, hard_max);
         if new_capacity <= self.kv_capacity {
-            // Already at the hard cap (or `required` is spuriously small); leave
-            // the buffers as-is so a genuine overrun surfaces downstream rather
-            // than silently reallocating to the same size.
+            // Already at the hard cap; no growth is needed.
             return Ok(());
         }
         self.grow_kv_buffers(new_capacity)
@@ -1065,27 +1071,32 @@ impl<'a> DecodeSession<'a> {
             )?;
             grown.insert(pair.past.clone(), Arc::new(new_value));
         }
-        self.current_kv = grown;
-        self.kv_capacity = new_capacity;
 
         // The captured attention mask capacity must equal the KV buffer
-        // capacity. Rebuild it at the new size, preserving the already-valid
-        // leading ones (the valid region only grows within a generation).
-        if let Some(cap) = self.capture.as_mut() {
+        // capacity. Build its replacement before mutating the session so a
+        // fallible allocation cannot leave the KV and capture state out of sync.
+        let grown_mask = if let Some(cap) = self.capture.as_ref() {
             let valid_ones = cap.mask_valid_len;
             let mut mask = vec![0i64; new_capacity];
             for slot in mask.iter_mut().take(valid_ones) {
                 *slot = 1;
             }
-            cap.attention_mask =
-                Value::from_vec_i64(mask, &[1, new_capacity as i64])?;
+            let mask_len = i64::try_from(new_capacity)
+                .map_err(|_| OrtError::InvalidArgument("KV capacity exceeds i64".into()))?;
+            Some(Value::from_vec_i64(mask, &[1, mask_len])?)
+        } else {
+            None
+        };
+
+        // All fallible work is complete. Release the captured graph while its old
+        // buffers are still alive, then atomically commit the replacement state.
+        self.invalidate_captured_graph();
+        self.current_kv = grown;
+        self.kv_capacity = new_capacity;
+        if let (Some(cap), Some(attention_mask)) = (self.capture.as_mut(), grown_mask) {
+            cap.attention_mask = attention_mask;
             cap.mask_len = new_capacity;
         }
-
-        // A captured graph is bound to the old buffer shapes/addresses; release
-        // it and claim a fresh id so the next captured step re-captures against
-        // the larger buffers.
-        self.invalidate_captured_graph();
         Ok(())
     }
 
@@ -1127,8 +1138,9 @@ enum GrowDevice {
 /// Round a required sequence length up to the shared-KV bucket capacity.
 ///
 /// Buckets are powers of two (at least the minimum bucket floor), clamped to the
-/// model's hard `max_length`, and never below `len` itself. Sizing the shared KV
-/// buffers to the bucket rather than the full `max_length` keeps captured-decode
+/// model's hard `max_length`. The caller must reject lengths above that ceiling
+/// before bucketing. Sizing the shared KV buffers to the bucket rather than the
+/// full `max_length` keeps captured-decode
 /// per-step attention cost ~O(actual length) — matching onnxruntime-genai —
 /// while the sequence only crosses O(log length) bucket boundaries, so the
 /// buffers (and the captured CUDA graph) are grown/re-captured that few times.
@@ -1146,7 +1158,7 @@ fn kv_capacity_bucket(len: usize, hard_max: usize) -> usize {
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|v| *v > 0)
         .unwrap_or(MIN_BUCKET_DEFAULT);
-    len.next_power_of_two().max(min_bucket).min(hard_max).max(len)
+    len.next_power_of_two().max(min_bucket).min(hard_max)
 }
 
 /// Allocate a `new_shape` shared-KV buffer and copy the valid sequence prefix
@@ -1175,6 +1187,7 @@ fn grow_kv_value(
             grow_kv_value_cuda(old, new_shape, seq_axis, valid_len, allocator)
         }
     }
+
 }
 
 /// Grow a host-resident KV buffer: read the old contents, rearrange the prefix
@@ -3399,11 +3412,10 @@ mod tests {
     }
 
     #[test]
-    fn kv_capacity_bucket_degenerate_guard_never_truncates_below_len() {
-        // Degenerate case (caller normally enforces len <= hard_max): the
-        // `.max(len)` guard keeps capacity large enough to hold `len` rather
-        // than silently truncating it below the required length.
-        assert_eq!(kv_capacity_bucket(40000, 32768), 40000);
+    fn kv_capacity_bucket_never_exceeds_hard_max() {
+        // The caller rejects this case with an actionable error, but the bucket
+        // helper itself must never produce an over-limit allocation.
+        assert_eq!(kv_capacity_bucket(40000, 32768), 32768);
     }
 
     #[test]
@@ -3545,4 +3557,3 @@ mod tests {
         assert_eq!(plan.total_bytes, 2 * 8 * 3 * 2);
     }
 }
-
