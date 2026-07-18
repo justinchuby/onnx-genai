@@ -1020,3 +1020,10 @@ Also rechecked standard `Attention`: the landed omitted-optional gate remains co
 **By:** Deckard
 **What:** Added an independent `publish-pypi-sdist` job to `publish.yml` that publishes only the `nxrt` source distribution through the `pypi` environment using PyPI Trusted Publishing. The initial burned version is `0.1.0.dev2`. Workflow dispatch now has opt-in `publish_crates` and `publish_pypi` inputs.
 **Why:** A reliable sdist-only release reserves the PyPI name without coupling it to crates.io publication or prematurely publishing platform wheels; wheels will ship later through `wheels.yml`.
+
+<!-- merged from deckard-onnx-genai-pypi.md -->
+
+### 2026-07-18: Reserve the `onnx-genai` PyPI name
+**By:** Deckard
+**What:** Reserved the `onnx-genai` PyPI name with a pure-Python placeholder at `python/onnx-genai/`, fixed at version `0.0.0`. Added the dispatch-only `publish-onnx-genai-sdist` job in `publish.yml`, publishing through PyPI Trusted Publishing with the `pypi` environment.
+**Why:** The placeholder and opt-in sdist publication reserve the package name without coupling it to the future native implementation or platform wheel release path.

@@ -142,3 +142,5 @@ Authored native Engine/server backend integration in `66ec4b8`; Holden rejected 
 - 2026-07-18: Added shared CUDA CSA attention_bias claim validation for ratio-4/128; Mariette approved the final Phase A revision.
 - 2026-07-18T05:55:00Z — Rejected Bishop CSA CPU coverage pass for CPU claim-then-fail gap, then approved Leon's unified factory dry-run `supports_op` fix as cheap metadata-only validation.
 - 2026-07-18: Added and published the sdist-only Trusted Publishing job reserving the `nxrt` PyPI name with version 0.1.0.dev2; wheels remain deferred to `wheels.yml`.
+
+- **2026-07-18 — onnx-genai PyPI name reservation:** Added the pure-Python `onnx-genai` 0.0.0 placeholder under `python/onnx-genai/` and a dispatch-only Trusted Publishing sdist job in `publish.yml`; published successfully as run `29662713813`.

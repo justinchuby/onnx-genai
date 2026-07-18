@@ -503,3 +503,7 @@ Coverage bug-hunt on the session EP placement/claim path surfaced a genuine clai
 ## 2026-07-18 — nxrt PyPI name reserved
 
 Published `nxrt` 0.1.0.dev2 as an sdist-only release through Trusted Publishing in `publish.yml`; platform wheels remain deferred to `wheels.yml`.
+
+## 2026-07-18 — onnx-genai PyPI name reserved
+
+Reserved `onnx-genai` 0.0.0 on PyPI with a pure-Python placeholder at `python/onnx-genai/` and a dispatch-only Trusted Publishing job in `publish.yml`.
