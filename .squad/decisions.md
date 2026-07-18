@@ -771,3 +771,98 @@ HC handling follows §2.4 and §6.3: target extraction preserves the final `[B,S
 The public eight-field `MtpConfig` contract exactly matches its pre-`2243968` definition, including `PathBuf` weight fields. The compatibility test uses the original struct literal without `Default` masking and passes. `ResolvedMtpConfig` preserves legacy manual defaults while retaining metadata resolution, rank-4 HC threading, hc_mult=2 recurrence coverage, persistent per-generation proposer lifetime, proposal-local reset, and malformed-descriptor rejection.
 
 Validation: `cargo test -p onnx-genai-engine` passed all 148 non-ignored tests; `cargo check -p onnx-genai-ort` passed.
+
+## 2026-07-18 — Scribe inbox merge (03:50Z)
+
+<!-- merged from frost-csa-phase2-audit.md -->
+
+### 2026-07-18T01:20:34Z: Phase 2 CPU learned-sink and sparse-gather audit
+**By:** Frost
+**What:** Audited every Phase 2 bullet and added only missing edge coverage plus explicit sink taxonomy errors. Code commit: `83ec096cf13695f6b6bf71f8a9154e857af4704d`.
+**Why:** Most Phase 2 implementation had already landed in `c5bdafd`; the remaining gaps were explicit negative/cache-end bounds coverage, an explicitly named empty-compressed-prefix case, multi-axis deterministic-layout coverage, and an actionable error distinguishing learned logit sinks from retained sink tokens.
+
+## Per-bullet verdict
+
+1. **`head_sink` in the CPU dense attention reference — already satisfied; no `attention.rs` change.**
+   - `attention.rs` is specifically the standard `ai.onnx::Attention` operator (`crates/onnx-runtime-ep-cpu/src/kernels/attention.rs:1-13`) and enforces that standard schema's 3..=7 inputs (`attention.rs:324-326`). It has no schema slot for a private DeepSeek `head_sink`; extending it would change standard ONNX operator semantics.
+   - The Phase 2 dense reference meant by the CSA document is the assembled-cache/decomposed reference path: `CompressedSparseAttentionKernel` (`compressed_sparse_attention.rs:58-66`, factory seam at `:269-275`, execution at `:2474-2650`). It gathers selected records, computes explicit scores, and adds the learned per-head sink only to the denominator at `:2613-2643`.
+   - The independent scalar-oracle test already existed at `compressed_sparse_attention.rs:3414-3471`.
+
+2. **CPU `SparseKvGather` v1 — already implemented and registered.**
+   - Factory and v1 attribute validation: `sparse_kv_gather.rs:39-69`.
+   - Kernel execution: `sparse_kv_gather.rs:72-105`.
+   - `pkg.nxrt::SparseKvGather` v1 registration: `crates/onnx-runtime-ep-cpu/src/kernels/mod.rs:224-227`.
+   - Existing tests already covered duplicates/order (`sparse_kv_gather.rs:607-623`), valid-length bounds with exact coordinates (`:638-650`), `-1` masks (`:669-680`), contiguous empty selection (`:683-687`), and frozen candidate ordering (`:738-805`).
+   - Missing explicit cases added: negative and `index == C` bounds (`:653-666`), deterministic `[B,G,Q,K,D]` layout (`:690-717`), and empty compressed prefix masking (`:720-735`).
+
+3. **Learned logit sink vs. `sink_tokens` taxonomy — metadata was distinct; error text was incomplete and is now fixed.**
+   - Inference metadata defines `sink_tokens` only as StreamingLLM retained leading tokens (`crates/onnx-genai-metadata/src/schema.rs:341-346`); engine parsing repeats that retained-token meaning (`crates/onnx-genai-engine/src/decode.rs:1010-1018`).
+   - CSA node metadata parses `sink_mode` independently. Its rejection now explicitly says `head_sink` is a learned per-head logit input while metadata `sink_tokens` configures unrelated retained prefix tokens (`compressed_sparse_attention.rs:197-212`).
+   - Added a metadata/error regression test at `compressed_sparse_attention.rs:3475-3494`.
+
+## Frozen sink formula
+
+Used the exact contract from `docs/DEEPSEEK_CSA_MTP_RUNTIME.md` §4.5 (`:533-543`) and the frozen online formula (`:1360-1388`):
+
+```text
+m = max(real_scores)
+Z = sum_j exp(real_score_j - m) + exp(head_sink[h] - m)
+O = sum_j exp(real_score_j - m) * V_j / Z
+```
+
+The sink is not included in `m`, contributes only the extra denominator term, has no value vector, and therefore contributes nothing to the numerator/output.
+
+## Validation
+
+- Focused sparse-gather tests: 11 passed, 0 failed.
+- Learned-sink taxonomy test: 1 passed, 0 failed.
+- Existing independent scalar sink oracle: 1 passed, 0 failed.
+- Full `cargo test -p onnx-runtime-ep-cpu`: 503 passed, 0 failed, 1 ignored; doctests 0 passed, 0 failed, 1 ignored.
+- No engine or metadata source changed, so the conditional engine check was not required.
+- Blocked sub-pieces: none.
+
+<!-- merged from gorman-frost-phase2-review.md -->
+
+### 2026-07-18: Frost CSA Phase 2 CPU review — APPROVED
+**By:** Gorman
+**What:** 🟢 APPROVE of Frost's commit `83ec096` (CSA Phase 2 CPU). Only runtime change is the clarified `sink_mode != "logit_only"` error string distinguishing the learned per-head logit input `head_sink` from metadata `sink_tokens` — no semantics changed. Hand-checked the new `gather_uses_deterministic_b_g_q_k_d_layout` expected array against the B/G/Q/K/D layout + index table, and the ratio-4 `-1`/cache-end (`4`) empty-prefix expectations against the frozen formula. Deterministic ordering preserved (no HashMap iteration in gather path). Gate: 503 passed, 0 failed, 1 ignored (`-p onnx-runtime-ep-cpu`).
+**Why:** Reviewer verdict for the strict-lockout protocol; landed to main as `83ec096`.
+
+<!-- merged from keaton-cuda-csa-phaseb-plan.md -->
+
+# Decision: CUDA CSA Phase B — phased implementation plan
+
+- **Date:** 2026-07-18T01:20:34Z
+- **Author:** Keaton (CUDA architect)
+- **Artifact:** `docs/CUDA_CSA_PHASE_B_PLAN.md` (branch `docs/cuda-csa-phaseb-plan`, based on origin/main 73629cd)
+
+## Summary
+
+Phase B (the device-resident fused CUDA `CompressedSparseAttention` kernel replacing the Phase A host-staged path) is decomposed into eight independently-landable, CPU-parity-gated sub-phases: **B0** device-execution scaffolding + per-stage Host/Device dispatch + FP8/FP4 quant round-trip primitives (no numeric change); **B1** device sparse sink-softmax attention core for ratio-128 (state still host-staged); **B2** device ratio-128 compression + device-resident FP8/f32 cache & carry (ratio-128 fully device-resident); **B3** device ratio-4 FP4 index-key compression; **B4** device ratio-4 index scoring + deterministic top-k selection; **B5** device ratio-4 fused selection→attention (ratio-4 fully device-resident); **B6** CUDA-graph capture compatibility (stable addresses, device cursors, graph-safe top-k, flip `cuda_graph_compatible()`→true); **B7** stream-ordered checkpoint/restore for speculative decode + switch the default off the host-staged fallback (retained behind a debug flag). Each slice keeps the Phase A host-staged path as a correctness fallback via a stage dispatch flag, lands with existing GPU parity tests green, and has an explicit pass bar + rollback (flip the stage back to Host). Hardest slices: B4 (top-k tie determinism) and B1 (attention numerics). 
+
+## Decisions for Justin
+
+- **D1** Parity target: CPU-f32 oracle (current gate) vs. official BF16 kernel.py numerics — they differ (CPU oracle accumulates attention in f32; kernel.py casts `p_j` to BF16). Recommend targeting the CPU oracle.
+- **D2** FP8/FP4 device compute: extract/reuse `block_quantized_matmul` decode helpers + add device *quantize*, vs. self-contained CSA quant module. Recommend a shared, graph-safe quant/dequant NVRTC snippet.
+- **D3** Device cache: fixed-capacity (required for stable addresses / graph capture) sized from `max_seq_len`; confirm `max_seq_len`/window `W` budget and fail-closed cap.
+- **D4** Confirm equal-length per-batch cursors for v1 (ragged deferred, per §10-Q10).
+- **D5** Device top-k determinism & graph-capturability: accept an index-only host readback until B6, then fully device-resident/capturable.
+- **D6** Checkpoint/restore ownership: kernel owns device cursors, engine drives `checkpoint()`/`restore(base_len+accepted)`, restore clears tails without recompress.
+- **D7** Retire host-staged path in B7 or keep behind a `--csa-oracle` debug flag (recommend keep for triage; never default).
+
+<!-- merged from hudson-mtp-phase1-remaining.md -->
+
+### 2026-07-18: MTP Phase 1 remaining-bullet audit — Phase 1 complete
+**By:** Hudson
+**What:** Audited the remaining MTP Phase 1 bullets in `docs/DEEPSEEK_CSA_MTP_RUNTIME.md` against the engine implementation. Classification:
+- Metadata resolution — already implemented
+- Package embedding / LM-head references — already implemented
+- Rank-4 Hyper-Connection extraction — already implemented
+- BSHC sidecar hidden_states binding — already implemented
+- Persistent per-generation proposer — already implemented
+- Greedy draft/verify/correction reuse — already implemented
+- Explicit `mtp_state` — legitimately blocked (unfrozen for released Mobius packages)
+
+Implementable-now: **none**. No source changes, no commit. Tests: engine 148 passed / 10 ignored; ORT MTP 2 passed; MTP greedy-equivalence 1 passed.
+**Why:** Confirms MTP Phase 1 is functionally complete; the only outstanding item (`mtp_state`) remains user/Mobius-contract-blocked. No further Phase 1 engine work until the contract is frozen.
+
