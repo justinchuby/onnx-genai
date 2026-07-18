@@ -13,6 +13,11 @@ on:
         required: false
         type: boolean
         default: false
+      publish_onnx_genai:
+        description: Publish the onnx-genai placeholder to PyPI
+        required: false
+        type: boolean
+        default: false
   push:
     tags:
       - "v*"
@@ -196,6 +201,29 @@ jobs:
       - name: Build nxrt source distribution
         run: maturin sdist --manifest-path crates/onnx-runtime-python/Cargo.toml --out dist
       - name: Publish nxrt source distribution to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
+
+  publish-onnx-genai-sdist:
+    name: Publish onnx-genai placeholder to PyPI
+    if: github.event_name == 'workflow_dispatch' && inputs.publish_onnx_genai
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - name: Install build
+        run: pip install build
+      - name: Build onnx-genai source distribution
+        run: python -m build --sdist python/onnx-genai --outdir dist
+      - name: Publish onnx-genai source distribution to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist
