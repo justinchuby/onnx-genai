@@ -7,8 +7,9 @@ use crate::config::{
 use crate::logits::{ProcessorChain, ProcessorContext, TokenId};
 use crate::processors::{
     ensure_constrained_finish, finish_reason_after_token, select_next_token_with_rng,
+    select_next_token_with_sampler,
 };
-use crate::sampling::SamplingRng;
+use crate::sampling::{Sampler, SamplingRng};
 use onnx_genai_ort::Tokenizer;
 
 pub(crate) struct DecodeLoopState {
@@ -18,6 +19,12 @@ pub(crate) struct DecodeLoopState {
     pub(crate) prefix_cache_hit_len: usize,
     pub(crate) logprobs: Option<Vec<TokenLogprob>>,
     pub(crate) rng: SamplingRng,
+    /// Optional caller-supplied final token selector. When set it replaces the
+    /// default greedy/categorical [`Sampler`] (the logit-processor chain still
+    /// runs first) and disables the device greedy fast path. This is how the
+    /// engine's public `generate_*_with_sampler` methods — and, through them,
+    /// the C ABI — inject a foreign sampler into the shared decode loop.
+    pub(crate) custom_sampler: Option<Box<dyn Sampler>>,
 }
 
 impl DecodeLoopState {
@@ -41,6 +48,7 @@ impl DecodeLoopState {
             prefix_cache_hit_len,
             logprobs: top_logprobs.map(|_| Vec::new()),
             rng,
+            custom_sampler: None,
         }
     }
 }
@@ -118,9 +126,13 @@ pub(crate) fn step_decode_loop<B: DecodeLoopBackend>(
         .map(Some);
     }
 
+    // A custom sampler replaces the default greedy/categorical selection, so the
+    // device greedy fast path (which hard-codes argmax) must be bypassed to give
+    // the sampler the processed logits.
     let greedy_fastpath = chain.is_empty()
         && options.top_logprobs.is_none()
         && (options.greedy || options.temperature == 0.0)
+        && state.custom_sampler.is_none()
         && backend.greedy_fastpath_supported();
 
     let token_id = if greedy_fastpath {
@@ -141,7 +153,17 @@ pub(crate) fn step_decode_loop<B: DecodeLoopBackend>(
         };
         let token_id = {
             let _span = onnx_genai_ort::prof_span!("loop.sampling");
-            select_next_token_with_rng(&mut logits, &context, options, chain, &mut state.rng)
+            if let Some(sampler) = state.custom_sampler.as_deref_mut() {
+                select_next_token_with_sampler(&mut logits, &context, chain, sampler)
+            } else {
+                select_next_token_with_rng(
+                    &mut logits,
+                    &context,
+                    options,
+                    chain,
+                    &mut state.rng,
+                )
+            }
         };
         if let (Some(top_logprobs), Some(logprobs)) =
             (options.top_logprobs, state.logprobs.as_mut())

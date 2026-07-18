@@ -20,7 +20,7 @@ use crate::processors::{
     build_processor_chain, ensure_constrained_finish, load_fim_config_from_model_dir,
     push_unique_stop_sequence,
 };
-use crate::sampling::SamplingRng;
+use crate::sampling::{Sampler, SamplingRng};
 use crate::session::{ActiveGenerate, DraftModel, DraftSession, EngineSession};
 use anyhow::Context;
 use onnx_genai_kv::{Device, KvCacheOps, KvDType, LocalTieredConnector, PagedKvCache, PrefixCache};
@@ -1078,6 +1078,34 @@ impl Engine {
         self.generate_with_callback(request, None)
     }
 
+    /// Generate text using a caller-supplied [`Sampler`] for final token
+    /// selection.
+    ///
+    /// The logit-processor chain (temperature, top-k, top-p, min-p, penalties,
+    /// constraints, …) still runs; only the terminal greedy/categorical pick is
+    /// replaced by `sampler`. This is the public extension seam that the C ABI
+    /// ([`crate::capi`]) exposes to foreign samplers. Not supported on the
+    /// native single-session backend.
+    pub fn generate_with_sampler(
+        &mut self,
+        request: GenerateRequest,
+        sampler: Box<dyn Sampler>,
+    ) -> anyhow::Result<GenerateResult> {
+        if self.decode_backend == EngineDecodeBackend::Native {
+            anyhow::bail!(
+                "custom samplers are not supported on the native single-session backend"
+            );
+        }
+        let session_id = self.create_session()?;
+        let result = self.generate_in_session_with_sampler(session_id, request, sampler);
+        let close_result = self.close_session(session_id);
+        match (result, close_result) {
+            (Ok(result), Ok(())) => Ok(result),
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+        }
+    }
+
     /// Speculative verification diagnostics from the most recent generation.
     pub fn last_speculative_stats(&self) -> SpeculativeStats {
         self.last_speculative_stats
@@ -1173,7 +1201,7 @@ impl Engine {
         request: GenerateRequest,
         priority: Priority,
     ) -> anyhow::Result<GenerateResult> {
-        self.generate_in_session_with_priority_and_callback(session_id, request, priority, None)
+        self.generate_in_session_with_priority_and_callback(session_id, request, priority, None, None)
     }
 
     /// Generate text in a persistent session and optionally stream generated tokens.
@@ -1187,7 +1215,31 @@ impl Engine {
             session_id,
             request,
             Priority::Normal,
+            None,
             callback,
+        )
+    }
+
+    /// Generate text in a persistent session using a caller-supplied [`Sampler`].
+    ///
+    /// The custom sampler replaces the built-in greedy/categorical token
+    /// selection while the full logit-processor chain (temperature, top-k,
+    /// top-p, penalties, constraints, …) still runs first. This is the Rust
+    /// extension seam that the C ABI ([`crate::capi`]) plugs foreign samplers
+    /// into. The device greedy fast path is bypassed so the sampler always sees
+    /// the processed logits.
+    pub fn generate_in_session_with_sampler(
+        &mut self,
+        session_id: SessionId,
+        request: GenerateRequest,
+        sampler: Box<dyn Sampler>,
+    ) -> anyhow::Result<GenerateResult> {
+        self.generate_in_session_with_priority_and_callback(
+            session_id,
+            request,
+            Priority::Normal,
+            Some(sampler),
+            None,
         )
     }
 
@@ -1196,6 +1248,7 @@ impl Engine {
         session_id: SessionId,
         request: GenerateRequest,
         priority: Priority,
+        custom_sampler: Option<Box<dyn Sampler>>,
         mut callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
         self.last_speculative_stats = SpeculativeStats::default();
@@ -1243,9 +1296,11 @@ impl Engine {
             self.prepare_session_prefix(session_id, &mut state, &prompt_tokens)?;
         let mut loop_state =
             DecodeLoopState::new(prefix_cache_hit_len, options.seed, options.top_logprobs);
+        let has_custom_sampler = custom_sampler.is_some();
+        loop_state.custom_sampler = custom_sampler;
 
         let result = (|| -> anyhow::Result<GenerateResult> {
-            if self.should_use_speculative(&options) {
+            if self.should_use_speculative(&options) && !has_custom_sampler {
                 return self.generate_speculative_loop(
                     session_id,
                     &mut state,
@@ -1846,6 +1901,7 @@ impl Engine {
             step: active.step,
             prefix_cache_hit_len: active.prefix_cache_hit_len,
             rng: std::mem::replace(&mut active.rng, SamplingRng::new(Some(0))),
+            custom_sampler: None,
         };
         let step_result = {
             let mut backend = SessionDecodeLoopBackend {

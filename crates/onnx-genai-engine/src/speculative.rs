@@ -1594,6 +1594,7 @@ impl Engine {
                     prefix_cache_hit_len,
                     logprobs: generated_logprobs.take(),
                     rng: SamplingRng::new(options.seed),
+                    custom_sampler: None,
                 };
                 if let (Some(all_logprobs), Some(step_logprobs)) =
                     (commit_state.logprobs.as_mut(), commit_logprobs.as_ref())
