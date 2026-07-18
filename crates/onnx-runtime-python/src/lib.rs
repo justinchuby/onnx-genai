@@ -311,7 +311,7 @@ impl InferenceSession {
 
         // Accept raw model bytes directly; otherwise treat the argument as a
         // path (covering str and os.PathLike via Python's str()).
-        let session = if let Ok(pybytes) = path_or_bytes.downcast::<PyBytes>() {
+        let session = if let Ok(pybytes) = path_or_bytes.cast::<PyBytes>() {
             let bytes = pybytes.as_bytes();
             RtSession::load_bytes(bytes).map_err(|e| load_error(&format!("<{} bytes>", bytes.len()), e))?
         } else {
@@ -1121,12 +1121,12 @@ fn numpy_array_parts(
 
     let shape: Vec<usize> = arr
         .getattr("shape")?
-        .downcast::<PyTuple>()
+        .cast::<PyTuple>()
         .map_err(|_| PyValueError::new_err(format!("input {input_name:?}: unreadable shape")))?
         .extract()?;
 
     let bytes_obj = arr.call_method0("tobytes")?;
-    let bytes = bytes_obj.downcast::<PyBytes>()?.as_bytes().to_vec();
+    let bytes = bytes_obj.cast::<PyBytes>()?.as_bytes().to_vec();
 
     let _ = py;
     Ok((dtype, shape, bytes))
@@ -1285,8 +1285,8 @@ fn _dlpack_import_drop_on_thread(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyRe
     };
     // Release the GIL on this (Python) thread, then drop the imported tensor on
     // a fresh OS thread. The import guard's `Drop` must reacquire the GIL via
-    // `Python::with_gil` to run the foreign deleter — that is what we prove.
-    py.allow_threads(move || {
+    // `Python::attach` to run the foreign deleter — that is what we prove.
+    py.detach(move || {
         std::thread::spawn(move || drop(tensor)).join().expect("drop thread panicked");
     });
     Ok(true)

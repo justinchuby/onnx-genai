@@ -207,7 +207,7 @@ impl Engine {
         stop: Option<Vec<String>>,
     ) -> PyResult<GenerateResult> {
         let request = request(prompt, max_tokens, temperature, top_p, top_k, seed, stop)?;
-        py.allow_threads(|| {
+        py.detach(|| {
             let mut engine = try_lock_engine(&self.inner)?;
             engine
                 .generate(request)
@@ -235,10 +235,10 @@ impl Engine {
             ));
         }
         let request = request(prompt, max_tokens, temperature, top_p, top_k, seed, stop)?;
-        py.allow_threads(|| {
+        py.detach(|| {
             let mut callback_error: Option<PyErr> = None;
             let mut callback_fn = |token: GenerateToken| {
-                let call = Python::with_gil(|py| {
+                let call = Python::attach(|py| {
                     callback.call1(
                         py,
                         (
@@ -273,7 +273,7 @@ impl Engine {
     }
 
     fn tokenize(&self, py: Python<'_>, text: &str) -> PyResult<Vec<u32>> {
-        py.allow_threads(|| {
+        py.detach(|| {
             let engine = try_lock_engine(&self.inner)?;
             engine.tokenize(text).map_err(|err| {
                 PyValueError::new_err(format!(
@@ -297,7 +297,7 @@ pub(crate) fn register(parent: &Bound<'_, PyModule>) -> PyResult<()> {
     parent.add_submodule(&module)?;
     py.import("sys")?
         .getattr("modules")?
-        .downcast_into::<PyDict>()?
+        .cast_into::<PyDict>()?
         .set_item("nxrt.genai", &module)?;
     Ok(())
 }
@@ -328,7 +328,7 @@ mod tests {
 
     #[test]
     fn engine_lock_contention_returns_actionable_python_error() {
-        pyo3::prepare_freethreaded_python();
+        pyo3::Python::initialize();
         let inner = Arc::new(Mutex::new(()));
         let guard = inner.lock().unwrap();
         let contender = Arc::clone(&inner);

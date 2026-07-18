@@ -439,7 +439,7 @@ impl NxrtValue {
                     onnx_runtime_dlpack::release_versioned(managed);
                     return Err(PyErr::fetch(py));
                 }
-                Py::<PyAny>::from_owned_ptr(py, raw)
+                Bound::<PyAny>::from_owned_ptr(py, raw).unbind()
             };
             return Ok(capsule);
         }
@@ -476,7 +476,7 @@ impl NxrtValue {
                 onnx_runtime_dlpack::release(managed);
                 return Err(PyErr::fetch(py));
             }
-            Py::<PyAny>::from_owned_ptr(py, raw)
+            Bound::<PyAny>::from_owned_ptr(py, raw).unbind()
         };
         Ok(capsule)
     }
@@ -959,7 +959,7 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
 /// `Send + Sync` and the `Tensor` that owns it is likewise `Send + Sync`, so
 /// nothing stops a caller from stashing an imported `Tensor` and dropping it on
 /// a background thread that does *not* hold the GIL. This guard makes that case
-/// sound **by construction**: its `Drop` calls `Python::with_gil`, which
+/// sound **by construction**: its `Drop` calls `Python::attach`, which
 /// attaches the current thread to the interpreter and acquires the GIL (a no-op
 /// re-borrow when the thread already holds it), and only then drives the foreign
 /// deleter via `call_deleter`. Because `call_deleter` is idempotent and the
@@ -972,8 +972,8 @@ struct GilDlpackGuard {
 
 impl Drop for GilDlpackGuard {
     fn drop(&mut self) {
-        Python::with_gil(|_py| {
-            // SAFETY: `with_gil` guarantees this thread holds the GIL for the
+        Python::attach(|_py| {
+            // SAFETY: `attach` guarantees this thread holds the GIL for the
             // duration of the closure, satisfying the foreign deleter's CPython
             // C-API requirement. `call_deleter` runs it exactly once.
             unsafe { self.owner.call_deleter() };
@@ -988,7 +988,7 @@ struct GilDlpackVersionedGuard {
 
 impl Drop for GilDlpackVersionedGuard {
     fn drop(&mut self) {
-        Python::with_gil(|_py| {
+        Python::attach(|_py| {
             // SAFETY: as `GilDlpackGuard::drop`; the GIL is held here.
             unsafe { self.owner.call_deleter() };
         });
