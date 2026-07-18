@@ -2,6 +2,17 @@ name: Publish crates
 
 on:
   workflow_dispatch:
+    inputs:
+      publish_crates:
+        description: Publish workspace crates to crates.io
+        required: false
+        type: boolean
+        default: false
+      publish_pypi:
+        description: Publish the nxrt source distribution to PyPI
+        required: false
+        type: boolean
+        default: false
   push:
     tags:
       - "v*"
@@ -15,6 +26,7 @@ permissions:
 
 jobs:
   publish:
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.publish_crates)
     runs-on: ubuntu-latest
     environment: crates
     env:
@@ -160,3 +172,30 @@ jobs:
           publish_crate onnx-genai-engine
           publish_crate onnx-genai
           publish_crate onnx-genai-server
+
+
+  publish-pypi-sdist:
+    name: Publish nxrt sdist to PyPI
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.publish_pypi)
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install maturin
+        run: pip install maturin
+      - name: Build nxrt source distribution
+        run: maturin sdist --manifest-path crates/onnx-runtime-python/Cargo.toml --out dist
+      - name: Publish nxrt source distribution to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
