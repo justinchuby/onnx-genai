@@ -125,7 +125,7 @@ impl ExecutionProvider for CpuExecutionProvider {
         op: &Node,
         opset: u64,
         shapes: &[Shape],
-        _input_dtypes: &[DataType],
+        input_dtypes: &[DataType],
         _layouts: &[TensorLayout],
     ) -> KernelMatch {
         // Keyed on (op_type, domain, opset) via the registry — the single source
@@ -158,6 +158,16 @@ impl ExecutionProvider for CpuExecutionProvider {
                 op.op_type,
                 opset
             );
+        }
+        if op.op_type == "CompressedSparseAttention"
+            && op.domain == "pkg.nxrt"
+            && let Some(reason) = crate::kernels::compressed_sparse_attention::unsupported_reason(
+                op,
+                shapes,
+                input_dtypes,
+            )
+        {
+            return KernelMatch::unsupported(reason);
         }
         // The reference kernels produce contiguous row-major outputs and accept
         // strided inputs, so no input layout is required.
@@ -308,6 +318,48 @@ impl ExecutionProvider for CpuExecutionProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use onnx_runtime_ir::{Attribute, Graph, NodeId, static_shape};
+
+    fn stateful_csa_node(ratio: i64, input_count: usize, output_count: usize) -> Node {
+        let mut graph = Graph::new();
+        let inputs = (0..input_count)
+            .map(|index| {
+                Some(graph.create_named_value(
+                    format!("input_{index}"),
+                    DataType::Float32,
+                    static_shape([]),
+                ))
+            })
+            .collect();
+        let outputs = (0..output_count)
+            .map(|index| {
+                graph.create_named_value(
+                    format!("output_{index}"),
+                    DataType::Float32,
+                    static_shape([]),
+                )
+            })
+            .collect();
+        let mut node = Node::new(NodeId(0), "CompressedSparseAttention", inputs, outputs);
+        node.domain = "pkg.nxrt".into();
+        node.attributes
+            .insert("num_heads".into(), Attribute::Int(1));
+        node.attributes
+            .insert("head_dim".into(), Attribute::Int(512));
+        node.attributes
+            .insert("qk_rope_head_dim".into(), Attribute::Int(64));
+        node.attributes
+            .insert("compression_ratio".into(), Attribute::Int(ratio));
+        if ratio == 4 {
+            node.attributes
+                .insert("index_num_heads".into(), Attribute::Int(1));
+            node.attributes
+                .insert("index_head_dim".into(), Attribute::Int(128));
+            node.attributes
+                .insert("index_topk".into(), Attribute::Int(1));
+        }
+        node
+    }
 
     #[test]
     fn identity_and_lifecycle() {
@@ -455,6 +507,36 @@ mod tests {
         assert!(reason.contains("registers Gelu since opset 20"), "{reason}");
 
         assert!(ep.supports_op(&gelu, 20, &[], &[], &[]).is_supported());
+    }
+
+    #[test]
+    fn supports_op_rejects_malformed_csa_ratio_specific_arity() {
+        let ep = CpuExecutionProvider::new();
+        let mut ratio4_missing_index = stateful_csa_node(4, 19, 5);
+        ratio4_missing_index.inputs[17] = None;
+        for (node, expected) in [
+            (
+                ratio4_missing_index,
+                "ratio-4 requires all eight positional index inputs (11..=18)",
+            ),
+            (
+                stateful_csa_node(4, 19, 4),
+                "ratio-4 requires 5 or 6 outputs, got 4",
+            ),
+            (
+                stateful_csa_node(128, 12, 3),
+                "ratio-4-only inputs (11..=18)",
+            ),
+            (
+                stateful_csa_node(128, 11, 4),
+                "ratio-128 supports exactly 3 outputs, got 4",
+            ),
+        ] {
+            let rejected = ep.supports_op(&node, 1, &[], &[], &[]);
+            assert!(!rejected.is_supported());
+            let reason = rejected.reason().expect("CSA claim must be denied");
+            assert!(reason.contains(expected), "{reason}");
+        }
     }
 
     #[test]
