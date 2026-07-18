@@ -43,6 +43,18 @@ use crate::value::DataType;
 /// then a shared-memory tree reduction, so this is also the shared-array width.
 const BLOCK: u32 = 1024;
 
+/// Whether to issue a device-wide `cuCtxSynchronize` before reading the logits.
+/// ORT's built-in CUDA EP synchronizes its compute stream at the end of each
+/// `Run`, so by the time we regain control the logits are already visible and
+/// this wait returns immediately (measured: no per-token cost). It is kept on by
+/// default as a correctness guard against any ORT configuration that leaves the
+/// stream running asynchronously; set `ONNX_GENAI_ARGMAX_CTX_SYNC=0` to drop it.
+fn ctx_sync_enabled() -> bool {
+    std::env::var("ONNX_GENAI_ARGMAX_CTX_SYNC")
+        .map(|v| v != "0" && !v.is_empty())
+        .unwrap_or(true)
+}
+
 /// NVRTC source: three argmax entry points (f16 / bf16 / f32). Each launches
 /// **one block per row** (`blockIdx.x` selects the row) and reduces that row's
 /// `vocab` contiguous elements to the index of its maximum, ignoring NaN and
@@ -244,9 +256,15 @@ impl CudaArgmax {
         self.ctx
             .bind_to_thread()
             .map_err(|e| OrtError::Cuda(format!("bind context: {e:?}")))?;
-        // Wait for ORT's decode kernels to finish writing the logits.
-        cudarc::driver::result::ctx::synchronize()
-            .map_err(|e| OrtError::Cuda(format!("ctx synchronize: {e:?}")))?;
+        // ORT's CUDA EP synchronizes its compute stream at the end of each
+        // `Run`, so by the time control returns here the logits are fully
+        // written and visible. This device-wide wait is therefore normally a
+        // no-op guard (see `ctx_sync_enabled`); it can be disabled via
+        // `ONNX_GENAI_ARGMAX_CTX_SYNC=0`.
+        if ctx_sync_enabled() {
+            cudarc::driver::result::ctx::synchronize()
+                .map_err(|e| OrtError::Cuda(format!("ctx synchronize: {e:?}")))?;
+        }
         out.ensure(rows)?;
 
         let func = match dtype {
@@ -308,8 +326,10 @@ impl CudaArgmax {
         self.ctx
             .bind_to_thread()
             .map_err(|e| OrtError::Cuda(format!("bind context: {e:?}")))?;
-        cudarc::driver::result::ctx::synchronize()
-            .map_err(|e| OrtError::Cuda(format!("ctx synchronize: {e:?}")))?;
+        if ctx_sync_enabled() {
+            cudarc::driver::result::ctx::synchronize()
+                .map_err(|e| OrtError::Cuda(format!("ctx synchronize: {e:?}")))?;
+        }
         let want = len
             .checked_mul(dtype_size(dtype)?)
             .ok_or_else(|| OrtError::Cuda("logits byte size overflow".into()))?;
