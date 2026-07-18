@@ -101,7 +101,9 @@ These are not textbook claims; they are things that happened while building the 
 3. **Fearless concurrency for serving.** The MLX EP is thread-affine; the rule "one session per
    thread" is *enforced* by the borrow checker and `Send`/`Sync` bounds, and shared caches are
    `Mutex`-guarded with the compiler refusing to let you forget. The server/scheduler crates lean on
-   this: async batching without a class of heisenbugs.
+   this: async batching without *data races* — a whole class of heisenbug the compiler rules out.
+   (Honestly: this is data-race freedom, not deadlock/starvation/cancellation freedom — those still
+   need design and review; see §3.)
 
 4. **`cargo` as the whole build system.** No CMake, no protobuf compiler, no vendored toolchain matrix.
    `cargo build` cross-compiles; `cargo test` runs 2,200+ tests; the EP publishes to two package
@@ -148,21 +150,46 @@ If we pretend these away, the experts are right to ignore us.
    a real cost paid in calendar time — and an agent (see §6) working inside the existing C++ ORT has
    far more precedent to draw on than in a greenfield Rust runtime.
 
+7. **Modern C++ has closed part of the safety gap.** A fair comparison is against *today's* C++, not
+   1990s C++: RAII, `unique_ptr`/`shared_ptr`, `std::span`, `std::variant`/`std::expected`, `gsl`, plus
+   AddressSanitizer / ThreadSanitizer / UBSan, `clang-tidy`, and continuous fuzzing catch a large share
+   of memory and concurrency bugs. The honest difference is not "C++ is unsafe, Rust is safe" — it is
+   *default and coverage*: sanitizers/fuzzers find bugs only on code paths and inputs they actually
+   execute (runtime, probabilistic, and off in production builds), and the guidelines are opt-in and
+   unenforced; Rust's guarantees are compile-time, total over all paths, and on by default. That is a
+   real, but *narrower and more nuanced*, advantage than a naïve pitch implies — and for a team already
+   running ASan/TSan/fuzzing well, the marginal safety gain is smaller than for one that isn't.
+
+8. **Async runtime and thread-pool coexistence is unsolved integration work.** Adopting `async` Rust
+   means adopting a runtime (e.g. Tokio) that owns threads — which must then coexist with ORT's and each
+   EP's own thread pools and, for GPU EPs, their stream/queue model. Getting this wrong causes
+   oversubscription, priority inversion, or executor threads blocked on FFI calls. It is tractable, but
+   it is a concrete adoption cost and design question the experiment has only partially exercised, not a
+   free lunch.
+
 ---
 
 ## 4. Feature-by-feature: does Rust actually help *this* kind of code?
 
-| Component type | Rust advantage | Verdict |
+**Read the "Verdict" column as a qualitative assessment of *fit and maintainability*, drawn from
+building the experiment — not a benchmarked claim of performance parity.** "Rust win" here means the
+code was safer to write and refactor and had zero memory-safety defects, not that it out-runs a tuned
+C++ equivalent. Substantiating a *performance* claim would need head-to-head numbers this document does
+not yet have: decode/prefill latency, throughput, peak memory, binary size, cold/warm build time, and
+model/platform coverage against OGA/ORT. Where those are missing, treat the verdict as "promising fit,
+pending measurement."
+
+| Component type | Rust advantage | Verdict (qualitative) |
 |---|---|---|
-| Graph IR / optimizer / partitioner | Sum types + exhaustive `match` model op-graphs perfectly; refactors are compiler-checked | **Strong Rust win** (see `onnx-runtime-ir`, `-optimizer`) |
-| KV cache / scheduler / batching | Ownership models buffer lifetimes and aliasing; 0 `unsafe`, no data races | **Strong Rust win** (`onnx-genai-kv`: 0 unsafe) |
-| Session / EP glue / C-ABI | Must speak C ABI → `unsafe`, but contained; safe wrappers above it | **Rust win, with a caveat** |
-| Sampling / detokenize / serving | Async + `Result` error handling + no GC pauses | **Rust win** |
-| Elementwise / shape / movement kernels | Safe Rust is competitive and far more maintainable | **Rust win** (`onnx-runtime-ep-cpu`) |
+| Graph IR / optimizer / partitioner | Sum types + exhaustive `match` model op-graphs perfectly; refactors are compiler-checked | **Strong Rust fit** (see `onnx-runtime-ir`, `-optimizer`) |
+| KV cache / scheduler / batching | Ownership models buffer lifetimes and aliasing; 0 `unsafe`, no data races | **Strong Rust fit** (`onnx-genai-kv`: 0 unsafe) |
+| Session / EP glue / C-ABI | Must speak C ABI → `unsafe`, but contained; safe wrappers above it | **Rust fit, with a caveat** |
+| Sampling / detokenize / serving | Async + `Result` error handling + no GC pauses | **Rust fit** |
+| Elementwise / shape / movement kernels | Safe Rust is maintainable; perf parity for these simple kernels is plausible but unbenchmarked here | **Likely Rust fit** (`onnx-runtime-ep-cpu`) |
 | GEMM / conv / attention hot kernels | No mature Rust ecosystem; vendor libs win | **C++ / reuse via FFI** |
 | CUDA / Metal device kernels | Written in CUDA/Metal regardless of host language | **Neutral** (host glue can be Rust) |
 
-The pattern: **Rust wins the orchestration and correctness-critical logic; C++/vendor kernels win the
+The pattern: **Rust fits the orchestration and correctness-critical logic; C++/vendor kernels own the
 raw FLOPs.** A good architecture puts the Rust/kernel boundary exactly at the FFI line — which is
 precisely where the experiment draws it.
 
@@ -266,6 +293,14 @@ development — agents converge fast and cannot ship whole categories of latent 
 force is that today's agents are simply more fluent in C++ and in the existing ORT idioms, which
 matters most for incremental work inside the current codebase. That asymmetry shrinks over time; the
 compiler-as-oracle advantage does not.
+
+**Evidence status (important):** the above is grounded in *one* agent-built project, not a controlled
+comparison. It shows the loop is *feasible and pleasant* in Rust; it does **not** measure that Rust
+beats modern ORT C++ (with clang diagnostics, sanitizers, static analysis, and huge in-repo precedent)
+as an agent substrate. Read it as a hypothesis. What would actually settle it: a matched study — the
+same set of representative tasks implemented by agents in both a Rust crate and ORT C++, measuring
+iterations-to-green, wall-clock time, escaped-defect rate, and human review time. That experiment is
+worth running before treating "better for agents" as established rather than plausible.
 
 ---
 
@@ -423,7 +458,11 @@ point:
 - Rust enters the **existing GN/Ninja build** as ordinary library targets (`rust_static_library`)
   that C++ `static_library` targets depend on. There is no separate build the downstream must adopt;
   Ninja links the Rust output like any other object file.
-- Interop goes through **CXX** (safe, generated, bidirectional bindings) at a reviewed FFI boundary.
+- Interop goes through **CXX** (a binding generator that produces checked, bidirectional glue and
+  eliminates a class of hand-written FFI mismatch) at a reviewed boundary. CXX reduces the boilerplate
+  and the type-mismatch surface; it does not by itself validate a falsely-declared foreign contract or
+  make arbitrary C++ internals safe, and it is not a versioned cross-version dynamic ABI (that role
+  belongs to a deliberately-stable C ABI).
 - The policy is explicitly **interop-only / new-code-first**: Rust is *not* used to force-rewrite
   established C++. No top-level feature is Rust-only, and integration "must not significantly slow
   existing build workflows."
@@ -521,7 +560,8 @@ on evidence.**
 1. Rust enters through the **existing build system** as normal library targets — no new toolchain the
    consumer must adopt (Cargo can emit a `staticlib`/`cdylib` that CMake/MSBuild/GN links like any
    other `.a`/`.lib`/`.so`; `cxx`/`cbindgen` generate the headers).
-2. A **stable ABI / interop boundary** (CXX, or a plain C ABI) keeps callers unchanged.
+2. A **reviewed interop boundary** — CXX (generated bindings that cut FFI-mismatch bugs) or, for a
+   *versioned, stable* cross-version contract, a plain **C ABI** — keeps callers unchanged.
 3. **New-code-first, no forced rewrite;** mature code stays until there's a reason.
 4. **Never a user-visible break** — the language underneath is invisible across the boundary.
 
@@ -568,12 +608,20 @@ This is the part to actually argue about. The path is **strangler-fig, not big-b
 2. **Wrap, don't rewrite, ORT first.** Bind the existing ORT via its C ABI (the experiment's
    `onnx-genai-ort` does this). You get ORT's kernels and EPs immediately, with a safe Rust surface on
    top — exactly how the MLX EP ships: stock ORT + a Rust plugin.
-3. **Reimplement the runtime layer behind the ORT C API**, one piece at a time: IR → optimizer →
-   partitioner → memory planner → session. Each piece is validated against ORT's own conformance
-   tests. Because it presents the same C API, consumers don't notice.
+3. **(Hardest tier, explicitly experimental) reimplement *internal* runtime seams behind the ORT C
+   API** — IR → optimizer → partitioner → memory planner → session — one at a time. Two honest caveats
+   separate this from step 2's proven "wrap ORT": **(a)** presenting the same C API preserves the
+   *external* surface, but ORT's internals are not cleanly pluggable seams today, so "swap one piece" is
+   real architectural work, not a drop-in; and **(b)** ORT's conformance corpus gates *numerical/op*
+   behavior but does not by itself establish parity of threading, allocation, memory planning,
+   performance, or platform/model coverage. Treat each seam as a hypothesis with its *own* parity gate
+   (numerics **and** latency **and** coverage); several will rightly stay C++/FFI wrappers. Steps 1–2
+   and 5 are validated by the experiment; **step 3 is the research bet, not a settled plan** — keep the
+   two clearly separate when discussing risk.
 4. **Reuse kernels via FFI; replace selectively.** Call MLAS/CUDA from Rust. Rewrite a kernel only on a
-   measured win (e.g. the MLX path, where there was no ORT kernel at all on Apple Silicon — so Rust
-   wasn't competing with a mature kernel, it was the *only* option).
+   measured win (e.g. the MLX path, where there was no ORT kernel at all on Apple Silicon — so this EP
+   is the only current way to run those ops under ORT there; MLX does the compute, and a C++ plugin
+   could have too).
 5. **Plugin EPs are the wedge.** A Rust EP loads into *unmodified* ONNX Runtime. You can ship Rust into
    a C++ ORT deployment with zero rewrite, prove it, and expand from there. The experiment does this
    end-to-end.
