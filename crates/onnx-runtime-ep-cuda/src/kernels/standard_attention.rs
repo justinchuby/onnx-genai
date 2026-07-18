@@ -308,23 +308,82 @@ extern "C" __global__ void attention_row(
 }
 "#;
 
-/// Return the claim-time dtype denial for data-bearing Attention inputs.
-pub(crate) fn unsupported_reason(input_dtypes: &[DataType]) -> Option<Cow<'static, str>> {
-    for &index in &[0, 1, 2, 4, 5] {
-        let Some(&dtype) = input_dtypes.get(index) else {
-            continue;
+/// Return the claim-time denial for Attention's positional input contract.
+///
+/// An omitted optional input is represented by [`DataType::Undefined`]. Keep
+/// that distinct from a supplied tensor so absent mask/cache/length slots are
+/// accepted without weakening dtype checks for tensors that are present.
+pub(crate) fn unsupported_reason(
+    opset: u64,
+    input_dtypes: &[DataType],
+) -> Option<Cow<'static, str>> {
+    let dtype_at = |index: usize| {
+        input_dtypes
+            .get(index)
+            .copied()
+            .unwrap_or(DataType::Undefined)
+    };
+    let f32_denial = |dtype| {
+        let dtype = match dtype {
+            DataType::Float16 => "f16".into(),
+            DataType::BFloat16 => "bf16".into(),
+            other => format!("{other:?}"),
         };
+        Cow::Owned(format!(
+            "Attention: dtype {dtype} not supported on CUDA yet (f32 only; f16/bf16 follow-up)"
+        ))
+    };
+
+    for index in 0..3 {
+        let dtype = dtype_at(index);
         if dtype != DataType::Float32 {
-            let dtype = match dtype {
-                DataType::Float16 => "f16".into(),
-                DataType::BFloat16 => "bf16".into(),
-                other => format!("{other:?}"),
-            };
-            return Some(Cow::Owned(format!(
-                "Attention: dtype {dtype} not supported on CUDA yet (f32 only; f16/bf16 follow-up)"
-            )));
+            return Some(f32_denial(dtype));
         }
     }
+
+    let mask_dtype = dtype_at(3);
+    if !matches!(
+        mask_dtype,
+        DataType::Undefined | DataType::Bool | DataType::Float32
+    ) {
+        return Some(Cow::Owned(format!(
+            "Attention: attn_mask dtype {mask_dtype:?} not supported (expected bool or f32 when provided)"
+        )));
+    }
+
+    let past_key_dtype = dtype_at(4);
+    let past_value_dtype = dtype_at(5);
+    for dtype in [past_key_dtype, past_value_dtype] {
+        if dtype != DataType::Undefined && dtype != DataType::Float32 {
+            return Some(f32_denial(dtype));
+        }
+    }
+    let has_past_key = past_key_dtype != DataType::Undefined;
+    let has_past_value = past_value_dtype != DataType::Undefined;
+    if has_past_key != has_past_value {
+        return Some(Cow::Borrowed(
+            "Attention: past_key and past_value must be provided together",
+        ));
+    }
+
+    let nonpad_dtype = dtype_at(6);
+    if !matches!(nonpad_dtype, DataType::Undefined | DataType::Int64) {
+        return Some(Cow::Owned(format!(
+            "Attention: nonpad_kv_seqlen dtype {nonpad_dtype:?} not supported (expected int64 when provided)"
+        )));
+    }
+    let has_nonpad = nonpad_dtype != DataType::Undefined;
+    if has_nonpad && opset < 24 {
+        return Some(Cow::Borrowed(
+            "Attention: nonpad_kv_seqlen was added in opset 24 and is not valid for opset 23",
+        ));
+    }
+    if has_nonpad && has_past_key {
+        return Some(Cow::Borrowed(
+            "Attention: nonpad_kv_seqlen must not be used together with past_key/past_value",
+        ));
+    }
+
     None
 }
 

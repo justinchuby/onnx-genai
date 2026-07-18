@@ -89,6 +89,76 @@ fn standard_attention_and_rope_claim_only_f32_and_require_contiguous_inputs() {
     }
 }
 
+#[test]
+fn standard_attention_claim_distinguishes_omitted_and_wrong_typed_past_cache() {
+    let ep = CudaExecutionProvider::new_default().expect("CUDA runtime must be available");
+    let mut graph = Graph::new();
+    let q = graph.create_named_value("q", DataType::Float32, static_shape([1, 1, 1, 2]));
+    let k = graph.create_named_value("k", DataType::Float32, static_shape([1, 1, 1, 2]));
+    let v = graph.create_named_value("v", DataType::Float32, static_shape([1, 1, 1, 2]));
+    let y = graph.create_named_value("y", DataType::Float32, static_shape([1, 1, 1, 2]));
+    let node_id = graph.insert_node(Node::new(
+        NodeId(0),
+        "Attention",
+        vec![Some(q), Some(k), Some(v), None, None, None],
+        vec![y],
+    ));
+    let node = graph.node(node_id);
+
+    let omitted_past_dtypes = [
+        DataType::Float32,
+        DataType::Float32,
+        DataType::Float32,
+        DataType::Undefined,
+        DataType::Undefined,
+        DataType::Undefined,
+    ];
+    assert!(
+        ep.supports_op(node, 23, &[], &omitted_past_dtypes, &[])
+            .is_supported(),
+        "omitted optional Attention inputs must not prevent the CUDA EP claim"
+    );
+
+    let wrong_past_key_dtypes = [
+        DataType::Float32,
+        DataType::Float32,
+        DataType::Float32,
+        DataType::Undefined,
+        DataType::Int64,
+        DataType::Float32,
+    ];
+    let past_key =
+        graph.create_named_value("past_key", DataType::Int64, static_shape([1, 1, 1, 2]));
+    let past_value =
+        graph.create_named_value("past_value", DataType::Float32, static_shape([1, 1, 1, 2]));
+    let wrong_y =
+        graph.create_named_value("wrong_y", DataType::Float32, static_shape([1, 1, 1, 2]));
+    let wrong_node_id = graph.insert_node(Node::new(
+        NodeId(1),
+        "Attention",
+        vec![
+            Some(q),
+            Some(k),
+            Some(v),
+            None,
+            Some(past_key),
+            Some(past_value),
+        ],
+        vec![wrong_y],
+    ));
+    assert!(matches!(
+        ep.supports_op(
+            graph.node(wrong_node_id),
+            23,
+            &[],
+            &wrong_past_key_dtypes,
+            &[]
+        ),
+        KernelMatch::Unsupported { ref reason }
+            if reason.contains("Attention: dtype Int64")
+    ));
+}
+
 fn run(
     op: &str,
     opset: u64,
