@@ -230,8 +230,10 @@ pub mod ep_compat {
                 }
             }
             // TRANSITIONAL: WebGPU is an ORT built-in appended by name today; it
-            // will become a self-registering plugin EP.
-            "webgpu" => ResolvedEp {
+            // will become a self-registering plugin EP. Separator aliases are
+            // accepted here (the single EP-name table) rather than in the generic
+            // config parser.
+            "webgpu" | "web-gpu" | "web_gpu" => ResolvedEp {
                 selection: selection.clone(),
                 caps: EpCapabilities::new(
                     "webgpu",
@@ -248,7 +250,7 @@ pub mod ep_compat {
                 transitional_webgpu: true,
             },
             // TRANSITIONAL: CoreML is an ORT built-in appended by name today.
-            "coreml" => ResolvedEp {
+            "coreml" | "core-ml" | "core_ml" => ResolvedEp {
                 selection: selection.clone(),
                 caps: EpCapabilities::new("coreml", HardwareKind::Npu, None, None, &[]),
                 strategy: AppendStrategy::NamedGeneric {
@@ -2122,6 +2124,26 @@ mod tests {
                 assert_eq!(provider_name, "openvinoExecutionProvider");
             }
             other => panic!("expected NamedGeneric, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolves_webgpu_and_coreml_separator_aliases() {
+        for name in ["webgpu", "web-gpu", "web_gpu"] {
+            let resolved = resolve_execution_provider(&ep_selection(name));
+            assert!(resolved.caps.is_gpu(), "{name} should resolve to WebGPU GPU caps");
+            assert!(resolved.transitional_webgpu, "{name} should be the WebGPU transitional EP");
+            assert!(resolved.caps.has(capability::DEVICE_KV), "{name} should keep WebGPU device-KV");
+            assert_eq!(resolved.caps.name, "webgpu");
+        }
+        for name in ["coreml", "core-ml", "core_ml"] {
+            let resolved = resolve_execution_provider(&ep_selection(name));
+            assert_eq!(resolved.caps.hardware, HardwareKind::Npu, "{name} should resolve to CoreML");
+            assert_eq!(resolved.caps.name, "coreml");
+            assert!(matches!(
+                resolved.strategy,
+                ep_compat::AppendStrategy::NamedGeneric { .. }
+            ));
         }
     }
 
