@@ -16,6 +16,9 @@ pub enum OrtError {
     SessionCreation(String),
     #[error("Tokenizer error: {0}")]
     Tokenizer(String),
+    #[cfg(feature = "cuda")]
+    #[error("CUDA error: {0}")]
+    Cuda(String),
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 }
