@@ -140,3 +140,4 @@ Authored native Engine/server backend integration in `66ec4b8`; Holden rejected 
 - 2026-07-18: Fixed Attention present-value geometry; continuing the PR #25 lifecycle fix.
 
 - 2026-07-18: Added shared CUDA CSA attention_bias claim validation for ratio-4/128; Mariette approved the final Phase A revision.
+- 2026-07-18T05:55:00Z — Rejected Bishop CSA CPU coverage pass for CPU claim-then-fail gap, then approved Leon's unified factory dry-run `supports_op` fix as cheap metadata-only validation.

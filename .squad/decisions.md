@@ -931,3 +931,44 @@ For a fixed, valid selected set, the additive-mask standard-Attention result is 
 
 **Why:** Adding a helper alone would not make exported GLM graphs use selected-token attention, while extending standard ONNX Attention with private index inputs would violate its schema. The additive-mask path supplies a strong parity oracle after the GLM boundary is frozen, but choosing that boundary and its ordering/cache semantics is a user-visible FROZEN-contract decision.
 
+
+
+## 2026-07-18 — Scribe inbox merge (GLM readiness and CSA CPU claim validation)
+
+<!-- merged from newt-glm-readiness-refresh.md -->
+
+### 2026-07-18: Refresh GLM readiness and consolidate owner decisions
+**By:** Newt
+**What:** Refreshed `docs/GLM_READINESS_GAPS.md` at `main` `8d9c958` to record GPU-native CUDA Attention, RotaryEmbedding, and SparseKvGather; CUDA CSA Phase A; the optional-input `DataType::Undefined` claim fix; and functionally complete MTP Phase 1. Added `docs/DECISIONS_FOR_JUSTIN.md` with 32 open decision points: CSA 7, BlockQuantizedMoE 8, Kimi K3 5, IndexShare 4, GraphView 5, MLA 1, and Mobius exports 2. Committed as `22841f1`.
+**Why:** The previous readiness audit still described landed CUDA paths as missing or host-staged, and owner-blocking roadmap decisions were scattered across team state and design documents. The refresh gives Justin one evidence-linked morning checklist without changing runtime source.
+
+<!-- merged from bishop-csa-cpu-coverage.md -->
+
+### 2026-07-18: Harden CSA CPU claim gate and sparse planner validation
+**By:** Bishop
+**What:** Fixed the CSA factory to reject ratio-4 graphs missing positional index inputs 11..=18 or index-state outputs, and ratio-128 graphs carrying ratio-4 inputs or extra outputs, at claim time. Sparse ratio-4 prefill/decode planners now reject an empty learned top-k rather than constructing a zero-width selection. Added regression coverage for these claims, attention-bias dtype/rank/broadcast rejection, FP8/FP4 block widths, masked-gather sentinel/bounds checks, and empty top-k planners.
+**Why:** The previous factory could claim invalid ratio-specific graphs and fail only when executed; empty learned top-k also silently produced a degenerate ratio-4 plan. Full CPU tests pass (508 passed, 1 ignored). llvm-cov line coverage improved from 85.27% to 85.95% for compressed_sparse_attention.rs and from 78.63% to 79.39% for sparse_kv_gather.rs.
+
+<!-- merged from deckard-bishop-csa-review.md -->
+
+### 2026-07-18: Review of `af0725c` CSA ratio-specific validation
+**By:** Deckard
+**Verdict:** 🔴 REJECT
+**Finding:** CUDA is consistent: its `unsupported_reason` first dry-runs `CpuCsaFactory.create` and also independently enforces ratio-4 inputs 11..=18 plus 5–6 outputs, and ratio-128 absent inputs 11..=18 plus exactly 3 outputs. The CPU EP's actual `supports_op`, however, only checks registry membership and unconditionally claims every registered CSA node. It therefore accepts each invalid ratio-specific schema that the new CPU factory rejects, retaining a CPU claim-then-fail path and violating the requested cross-EP claim contract.
+**Required change (Leon):** Add CSA-specific validation to `CpuExecutionProvider::supports_op` (or an equivalent per-op claim hook) that invokes the same frozen/ratio-specific schema validation as the factory, and add provider-level tests proving the three newly rejected malformed schemas are declined before `get_kernel`.
+**Other review results:** The new `unreachable!` is safe because `create_impl` validates `compression_ratio ∈ {4,128}` immediately before calling the helper; the assembled-cache path bypasses the helper. Empty learned top-k produces clean errors before zero-width plan construction and preserves deterministic ordering. CPU tests: 508 passed, 0 failed, 1 ignored (doctests: 0 passed, 0 failed, 1 ignored). CUDA tests: 234 passed, 0 failed; including `compressed_sparse_attention_gpu`: 10 passed, 0 failed.
+
+<!-- merged from leon-csa-cpu-claim-validation.md -->
+
+### 2026-07-18: CPU CSA claim-time contract validation
+**By:** Leon
+**What:** Added a `pkg.nxrt::CompressedSparseAttention` claim hook to `CpuExecutionProvider::supports_op`. The hook rejects malformed ratio-4/ratio-128 positional arity through a dry-run of `CompressedSparseAttentionFactory`, then applies the CUDA-equivalent fixed ratio, input dtype, input shape, and optional `attention_bias` checks. Added provider-level denials for ratio-4 missing-index and wrong-output cases plus ratio-128 index-present and wrong-output cases.
+**Why:** CPU previously claimed every registry-known CSA node and deferred malformed ratio-specific schemas until factory creation. Dry-running the same factory from the claim hook makes the factory's frozen-v1 and ratio-specific validation the single source of truth, preventing claim-then-fail drift while preserving the existing assembled-cache reference path.
+
+<!-- merged from deckard-leon-rereview.md -->
+
+### 2026-07-18: Re-review of Leon's CPU CSA claim validation (`6c9cfd1`)
+**By:** Deckard
+**Verdict:** 🟢 APPROVE
+**What:** The CPU provider now calls CSA `unsupported_reason` from `supports_op`. It dry-runs the same `CompressedSparseAttentionFactory.create` used by `get_kernel`, so frozen-v1 attributes and ratio-specific positional-input/output arity are denied before placement. The provider-level test invokes `ep.supports_op` directly and denies ratio-4 missing-index and wrong-output nodes plus ratio-128 index-present and wrong-output nodes. The remaining dtype, static-shape, and optional-bias checks mirror the runtime CSA paths; valid/dynamic metadata is not rejected merely for being dynamic.
+**Why:** The prior CPU claim-then-fail gap is closed without loosening Bishop's factory checks or changing the assembled-cache-reference bypass. The dry-run only parses/validates metadata and boxes a scalar kernel descriptor; it allocates no device or tensor buffers and performs no copies, cache decoding, or compute, so it is cheap for repeated placement. Deterministic execution and `assembled_cache_reference` semantics remain intact. Validation passed: CPU 509 passed, 0 failed, 1 ignored (plus 0/0/1 doctest); CUDA 234 passed, 0 failed, 0 ignored.
