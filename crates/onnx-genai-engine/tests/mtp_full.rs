@@ -1,6 +1,5 @@
 use onnx_genai_engine::{
-    Engine, EngineConfig, GeneratePrompt, GenerateRequest, MtpCacheScope, MtpConfig,
-    MtpHiddenLayout, SpeculativeMode,
+    Engine, EngineConfig, GeneratePrompt, GenerateRequest, MtpConfig, SpeculativeMode,
 };
 use onnx_genai_ort::{MtpDraftKvMode, SessionOptions};
 use std::path::{Path, PathBuf};
@@ -31,29 +30,31 @@ fn request() -> GenerateRequest {
     request
 }
 
+fn pre_phase1_mtp_mode(fixture: &Path) -> SpeculativeMode {
+    SpeculativeMode::Mtp(MtpConfig {
+        head_model: fixture.join("mtp/model.onnx"),
+        target_hidden_output: "hidden_states.0".into(),
+        embedding_weights: fixture.join("embedding.f32"),
+        lm_head_weights: fixture.join("lm_head.f32"),
+        vocab_size: 32,
+        hidden_size: 16,
+        kv_mode: MtpDraftKvMode::HiddenThreaded,
+        num_speculative_tokens: 4,
+    })
+}
+
+#[test]
+fn pre_phase1_mtp_config_literal_remains_source_compatible() {
+    let mode = pre_phase1_mtp_mode(Path::new("tiny-mtp-full"));
+    assert!(matches!(mode, SpeculativeMode::Mtp(_)));
+}
+
 #[test]
 #[ignore = "random Mobius fixture; run explicitly to exercise target -> MTP head -> verify"]
 fn mtp_speculative_generation_matches_plain_greedy() -> anyhow::Result<()> {
     let fixture = fixture()?;
     let mut baseline = engine(&fixture, SpeculativeMode::None)?;
-    let mut mtp = engine(
-        &fixture,
-        SpeculativeMode::Mtp(MtpConfig {
-            head_model: fixture.join("mtp/model.onnx"),
-            target_hidden_output: "hidden_states.0".into(),
-            target_hidden_layout: MtpHiddenLayout::Bsh,
-            embedding_weights: fixture.join("embedding.f32").into(),
-            lm_head_weights: fixture.join("lm_head.f32").into(),
-            vocab_size: 32,
-            hidden_size: 16,
-            hc_mult: 1,
-            mtp_hidden_output: "mtp_hidden".into(),
-            mtp_state_output: None,
-            kv_mode: MtpDraftKvMode::HiddenThreaded,
-            cache_scope: MtpCacheScope::ProposalLocal,
-            num_speculative_tokens: 4,
-        }),
-    )?;
+    let mut mtp = engine(&fixture, pre_phase1_mtp_mode(&fixture))?;
 
     let expected = baseline.generate(request())?;
     let actual = mtp.generate(request())?;

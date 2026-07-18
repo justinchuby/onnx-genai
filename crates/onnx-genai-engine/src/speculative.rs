@@ -1171,14 +1171,15 @@ impl Engine {
                 MtpDecodeOptions {
                     kv_mode: mtp.kv_mode,
                     batch_size: 1,
-                    hc_mult: mtp.config.hc_mult,
-                    hidden_state_rank4: mtp.config.target_hidden_layout == MtpHiddenLayout::Bshc,
-                    hidden_output: mtp.config.mtp_hidden_output.clone(),
-                    state_output: mtp.config.mtp_state_output.clone(),
+                    hc_mult: mtp.runtime_config.hc_mult,
+                    hidden_state_rank4: mtp.runtime_config.target_hidden_layout
+                        == MtpHiddenLayout::Bshc,
+                    hidden_output: mtp.runtime_config.mtp_hidden_output.clone(),
+                    state_output: mtp.runtime_config.mtp_state_output.clone(),
                 },
                 mtp.embedder.clone(),
                 mtp.lm_head.clone(),
-                mtp.config.cache_scope,
+                mtp.runtime_config.cache_scope,
             )?)
         } else {
             None
@@ -2269,16 +2270,11 @@ mod tests {
         let mode = SpeculativeMode::Mtp(crate::config::MtpConfig {
             head_model: "mtp.onnx".into(),
             target_hidden_output: "hidden_states".into(),
-            target_hidden_layout: crate::config::MtpHiddenLayout::Bsh,
             embedding_weights: "embed.f32".into(),
             lm_head_weights: "lm_head.f32".into(),
             vocab_size: 32,
             hidden_size: 16,
-            hc_mult: 1,
-            mtp_hidden_output: "mtp_hidden".into(),
-            mtp_state_output: None,
             kv_mode: onnx_genai_ort::MtpDraftKvMode::HiddenThreaded,
-            cache_scope: crate::config::MtpCacheScope::ProposalLocal,
             num_speculative_tokens: 4,
         });
         let selected = match mode {

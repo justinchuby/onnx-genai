@@ -1,6 +1,7 @@
 //! Main generation engine.
 
 use crate::FimConfig;
+use crate::config::{ResolvedMtpConfig, validate_resolved_mtp_config};
 use crate::connector_bridge::ConnectorBridge;
 use crate::decode::{
     DecodeState, ModelDecodePath, detect_model_decode_path, next_session_token_argmax,
@@ -353,6 +354,7 @@ unsafe impl Send for Engine {}
 
 pub(crate) struct MtpModel {
     pub(crate) config: MtpConfig,
+    pub(crate) runtime_config: ResolvedMtpConfig,
     pub(crate) session: Arc<Session>,
     pub(crate) embedder: MtpEmbedder,
     pub(crate) lm_head: MtpLmHead,
@@ -543,25 +545,40 @@ impl Engine {
             PagedKvCache::new(config.page_size, config.num_gpu_pages)
         };
 
-        let speculative_mode = match config.speculative_mode {
-            SpeculativeMode::None if draft.is_some() => SpeculativeMode::DraftModel,
+        let (speculative_mode, resolved_mtp_config) = match config.speculative_mode {
+            SpeculativeMode::None if draft.is_some() => (SpeculativeMode::DraftModel, None),
             // No explicit mode: adopt a shared-KV draft proposer advertised by
             // the model's own inference metadata, if the target exposes an f32
             // hidden output the assistant can be seeded from.
             SpeculativeMode::None => {
-                mtp_mode_from_metadata(&metadata, &model_directory.root, &session)?
-                    .or_else(|| shared_kv_mode_from_metadata(&model_directory.root, &session))
-                    .unwrap_or(SpeculativeMode::None)
+                if let Some(config) =
+                    mtp_config_from_metadata(&metadata, &model_directory.root, &session)?
+                {
+                    (
+                        SpeculativeMode::Mtp(config.public_config.clone()),
+                        Some(config),
+                    )
+                } else {
+                    (
+                        shared_kv_mode_from_metadata(&model_directory.root, &session)
+                            .unwrap_or(SpeculativeMode::None),
+                        None,
+                    )
+                }
             }
-            mode => mode,
+            SpeculativeMode::Mtp(config) => (
+                SpeculativeMode::Mtp(config.clone()),
+                Some(ResolvedMtpConfig::from_manual(config)),
+            ),
+            mode => (mode, None),
         };
         if let SpeculativeMode::PromptLookup { ngram, max_tokens } = &speculative_mode
             && (*ngram == 0 || *max_tokens == 0)
         {
             anyhow::bail!("prompt-lookup ngram and max_tokens must be greater than zero");
         }
-        let mtp = if let SpeculativeMode::Mtp(mtp_config) = &speculative_mode {
-            crate::config::validate_mtp_config(mtp_config)?;
+        let mtp = if let Some(mtp_config) = resolved_mtp_config {
+            validate_resolved_mtp_config(&mtp_config)?;
             if mtp_config.cache_scope == MtpCacheScope::AcceptedPrefix {
                 anyhow::bail!(
                     "MTP kv_mode accepted_prefix is declared but not executable: the frozen Mobius contract does not define correction-token/cache alignment"
@@ -570,11 +587,11 @@ impl Engine {
             let hidden_output = session
                 .outputs()
                 .iter()
-                .find(|output| output.name == mtp_config.target_hidden_output)
+                .find(|output| output.name == mtp_config.public_config.target_hidden_output)
                 .with_context(|| {
                     format!(
                         "MTP target model must expose hidden-state output '{}'",
-                        mtp_config.target_hidden_output
+                        mtp_config.public_config.target_hidden_output
                     )
                 })?;
             if !matches!(
@@ -591,28 +608,29 @@ impl Engine {
                 MtpHiddenLayout::Bsh
                     if hidden_output.shape.len() == 3
                         && hidden_output.shape.last().copied().filter(|dim| *dim > 0)
-                            == Some(mtp_config.hidden_size as i64) => {}
+                            == Some(mtp_config.public_config.hidden_size as i64) => {}
                 MtpHiddenLayout::Bshc
                     if hidden_output.shape.len() == 4
                         && hidden_output.shape[2] == mtp_config.hc_mult as i64
-                        && hidden_output.shape[3] == mtp_config.hidden_size as i64 => {}
+                        && hidden_output.shape[3]
+                            == mtp_config.public_config.hidden_size as i64 => {}
                 _ => anyhow::bail!(
                     "MTP target hidden-state output '{}' shape {:?} does not match configured {:?} with hc_mult {} and hidden size {}",
                     hidden_output.name,
                     hidden_output.shape,
                     mtp_config.target_hidden_layout,
                     mtp_config.hc_mult,
-                    mtp_config.hidden_size
+                    mtp_config.public_config.hidden_size
                 ),
             }
             let head_session = Session::new(
                 &environment,
-                &mtp_config.head_model,
+                &mtp_config.public_config.head_model,
                 session_options.clone(),
             )
             .map_err(|error| anyhow::anyhow!("Failed to load MTP head: {error}"))?;
             let decode_options = onnx_genai_ort::MtpDecodeOptions {
-                kv_mode: mtp_config.kv_mode,
+                kv_mode: mtp_config.public_config.kv_mode,
                 batch_size: 1,
                 hc_mult: mtp_config.hc_mult,
                 hidden_state_rank4: mtp_config.target_hidden_layout == MtpHiddenLayout::Bshc,
@@ -623,11 +641,11 @@ impl Engine {
                 .map_err(|error| anyhow::anyhow!("Failed to inspect MTP head: {error}"))?
                 .signature()
                 .clone();
-            if head_signature.hidden_size != mtp_config.hidden_size {
+            if head_signature.hidden_size != mtp_config.public_config.hidden_size {
                 anyhow::bail!(
                     "MTP head hidden size {} does not match configured target hidden size {}",
                     head_signature.hidden_size,
-                    mtp_config.hidden_size
+                    mtp_config.public_config.hidden_size
                 );
             }
             let (embedder, lm_head) = match (
@@ -638,8 +656,8 @@ impl Engine {
                     MtpEmbedder::Linear(
                         LinearEmbedder::new(
                             read_f32_weights(embedding)?,
-                            mtp_config.vocab_size,
-                            mtp_config.hidden_size,
+                            mtp_config.public_config.vocab_size,
+                            mtp_config.public_config.hidden_size,
                         )
                         .map_err(|error| {
                             anyhow::anyhow!("Invalid MTP embedding weights: {error}")
@@ -648,8 +666,8 @@ impl Engine {
                     MtpLmHead::Linear(
                         LinearLmHead::new(
                             read_f32_weights(lm_head)?,
-                            mtp_config.hidden_size,
-                            mtp_config.vocab_size,
+                            mtp_config.public_config.hidden_size,
+                            mtp_config.public_config.vocab_size,
                         )
                         .map_err(|error| anyhow::anyhow!("Invalid MTP LM-head weights: {error}"))?,
                     ),
@@ -662,12 +680,12 @@ impl Engine {
                         &model_directory.model_path,
                         embedding,
                         lm_head,
-                        mtp_config.hidden_size,
+                        mtp_config.public_config.hidden_size,
                     )?;
-                    if vocab_size != mtp_config.vocab_size {
+                    if vocab_size != mtp_config.public_config.vocab_size {
                         anyhow::bail!(
                             "MTP target initializer vocabulary {vocab_size} does not match configured vocabulary {}",
-                            mtp_config.vocab_size
+                            mtp_config.public_config.vocab_size
                         );
                     }
                     (embedder, lm_head)
@@ -677,13 +695,14 @@ impl Engine {
                 ),
             };
             Some(MtpModel {
-                config: mtp_config.clone(),
+                config: mtp_config.public_config.clone(),
+                runtime_config: mtp_config.clone(),
                 session: Arc::new(head_session),
                 embedder,
                 lm_head,
-                hidden_output: mtp_config.target_hidden_output.clone(),
-                kv_mode: mtp_config.kv_mode,
-                num_speculative_tokens: mtp_config.num_speculative_tokens,
+                hidden_output: mtp_config.public_config.target_hidden_output.clone(),
+                kv_mode: mtp_config.public_config.kv_mode,
+                num_speculative_tokens: mtp_config.public_config.num_speculative_tokens,
             })
         } else {
             None
@@ -2264,16 +2283,16 @@ fn read_f32_weights(path: &Path) -> anyhow::Result<Vec<f32>> {
         .collect())
 }
 
-/// Build a native [`SpeculativeMode::Mtp`] from the already-loaded metadata.
+/// Resolve a native MTP runtime configuration from the already-loaded metadata.
 ///
 /// The target vocabulary is read from the target `logits` signature; exact
 /// embedding and LM-head initializer names remain package references until the
 /// MTP model is initialized.
-fn mtp_mode_from_metadata(
+fn mtp_config_from_metadata(
     metadata: &InferenceMetadata,
     model_dir: &Path,
     session: &Session,
-) -> anyhow::Result<Option<SpeculativeMode>> {
+) -> anyhow::Result<Option<ResolvedMtpConfig>> {
     let Some(config) = metadata.speculative.as_ref() else {
         return Ok(None);
     };
@@ -2296,9 +2315,9 @@ fn mtp_mode_from_metadata(
         .and_then(|value| usize::try_from(value).ok())
         .filter(|&value| value > 0)
         .context("MTP metadata requires a target logits output with static vocabulary size")?;
-    let config = MtpConfig::from_sidecar_descriptor(&spec, vocab_size);
-    crate::config::validate_mtp_config(&config)?;
-    Ok(Some(SpeculativeMode::Mtp(config)))
+    let config = ResolvedMtpConfig::from_sidecar_descriptor(&spec, vocab_size);
+    validate_resolved_mtp_config(&config)?;
+    Ok(Some(config))
 }
 
 /// Build a [`SpeculativeMode::SharedKv`] from a model directory's native

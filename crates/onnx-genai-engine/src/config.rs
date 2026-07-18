@@ -223,7 +223,7 @@ pub enum MtpCacheScope {
     AcceptedPrefix,
 }
 
-/// Files, package references, and target-model outputs required for MTP.
+/// Files and target-model outputs required for MTP.
 ///
 /// The target decoder must emit both logits and the configured last-layer
 /// hidden-state output on every forward. The embedding and LM-head files must
@@ -234,40 +234,63 @@ pub enum MtpCacheScope {
 pub struct MtpConfig {
     /// ONNX model containing the MTP head.
     pub head_model: PathBuf,
-    /// Target decoder output containing the configured hidden-state layout.
+    /// Target decoder output containing `[batch, sequence, hidden]` states.
     pub target_hidden_output: String,
-    /// Layout of the target hidden-state output.
-    pub target_hidden_layout: MtpHiddenLayout,
-    /// Target embedding weights or exact target initializer reference.
-    pub embedding_weights: MtpWeightSource,
-    /// Target LM-head weights or exact target initializer reference.
-    pub lm_head_weights: MtpWeightSource,
+    /// Raw little-endian f32 target embedding weights in `[vocab, hidden]` order.
+    pub embedding_weights: PathBuf,
+    /// Raw little-endian f32 target LM-head weights in `[hidden, vocab]` order.
+    pub lm_head_weights: PathBuf,
     /// Target vocabulary size.
     pub vocab_size: usize,
     /// Target hidden size.
     pub hidden_size: usize,
-    /// Number of target Hyper-Connection lanes.
-    pub hc_mult: usize,
-    /// Sidecar output projected through the shared target LM head.
-    pub mtp_hidden_output: String,
-    /// Sidecar recurrent HC state. Optional only for legacy `hc_mult == 1`.
-    pub mtp_state_output: Option<String>,
     /// MTP-head cache strategy.
     pub kv_mode: MtpDraftKvMode,
-    /// Lifetime of sidecar KV across target verification iterations.
-    pub cache_scope: MtpCacheScope,
     /// Number of speculative tokens produced after the guaranteed target token.
     pub num_speculative_tokens: usize,
 }
 
-impl MtpConfig {
-    /// Build an engine MTP configuration from a resolved native sidecar
-    /// descriptor. `vocab_size` is derived from the referenced target
-    /// initializers by the engine loader.
-    pub(crate) fn from_sidecar_descriptor(spec: &MtpProposerSpec, vocab_size: usize) -> Self {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ResolvedMtpConfig {
+    pub(crate) public_config: MtpConfig,
+    pub(crate) target_hidden_layout: MtpHiddenLayout,
+    pub(crate) embedding_weights: MtpWeightSource,
+    pub(crate) lm_head_weights: MtpWeightSource,
+    pub(crate) hc_mult: usize,
+    pub(crate) mtp_hidden_output: String,
+    pub(crate) mtp_state_output: Option<String>,
+    pub(crate) cache_scope: MtpCacheScope,
+}
+
+impl ResolvedMtpConfig {
+    pub(crate) fn from_manual(config: MtpConfig) -> Self {
         Self {
+            embedding_weights: MtpWeightSource::File(config.embedding_weights.clone()),
+            lm_head_weights: MtpWeightSource::File(config.lm_head_weights.clone()),
+            public_config: config,
+            target_hidden_layout: MtpHiddenLayout::Bsh,
+            hc_mult: 1,
+            mtp_hidden_output: "mtp_hidden".into(),
+            mtp_state_output: None,
+            cache_scope: MtpCacheScope::ProposalLocal,
+        }
+    }
+
+    /// Resolve metadata-only MTP settings without expanding the stable public
+    /// hand-authored [`MtpConfig`] surface.
+    pub(crate) fn from_sidecar_descriptor(spec: &MtpProposerSpec, vocab_size: usize) -> Self {
+        let public_config = MtpConfig {
             head_model: spec.model.clone(),
             target_hidden_output: spec.target_hidden_output.clone(),
+            embedding_weights: PathBuf::from(&spec.embedding_initializer),
+            lm_head_weights: PathBuf::from(&spec.lm_head_initializer),
+            vocab_size,
+            hidden_size: spec.target_hidden_size,
+            kv_mode: MtpDraftKvMode::GrowCache,
+            num_speculative_tokens: spec.num_speculative_tokens,
+        };
+        Self {
+            public_config,
             target_hidden_layout: match spec.target_hidden_layout {
                 MetadataMtpHiddenLayout::Bsh => MtpHiddenLayout::Bsh,
                 MetadataMtpHiddenLayout::Bshc => MtpHiddenLayout::Bshc,
@@ -276,17 +299,13 @@ impl MtpConfig {
                 spec.embedding_initializer.clone(),
             ),
             lm_head_weights: MtpWeightSource::TargetInitializer(spec.lm_head_initializer.clone()),
-            vocab_size,
-            hidden_size: spec.target_hidden_size,
             hc_mult: spec.hc_mult,
             mtp_hidden_output: spec.mtp_hidden_output.clone(),
             mtp_state_output: Some(spec.mtp_state_output.clone()),
-            kv_mode: MtpDraftKvMode::GrowCache,
             cache_scope: match spec.kv_mode {
                 MetadataMtpKvMode::ProposalLocal => MtpCacheScope::ProposalLocal,
                 MetadataMtpKvMode::AcceptedPrefix => MtpCacheScope::AcceptedPrefix,
             },
-            num_speculative_tokens: spec.num_speculative_tokens,
         }
     }
 }
@@ -814,6 +833,22 @@ pub(crate) fn validate_mtp_config(config: &MtpConfig) -> anyhow::Result<()> {
     if config.target_hidden_output.is_empty() {
         anyhow::bail!("MTP target_hidden_output must not be empty");
     }
+    if config.embedding_weights.as_os_str().is_empty()
+        || config.lm_head_weights.as_os_str().is_empty()
+    {
+        anyhow::bail!("MTP embedding_weights and lm_head_weights must not be empty");
+    }
+    if config.vocab_size == 0 || config.hidden_size == 0 {
+        anyhow::bail!("MTP vocab_size and hidden_size must be greater than zero");
+    }
+    if config.num_speculative_tokens == 0 {
+        anyhow::bail!("MTP num_speculative_tokens must be greater than zero");
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_resolved_mtp_config(config: &ResolvedMtpConfig) -> anyhow::Result<()> {
+    validate_mtp_config(&config.public_config)?;
     if config.mtp_hidden_output.is_empty() {
         anyhow::bail!("MTP mtp_hidden_output must not be empty");
     }
@@ -844,12 +879,6 @@ pub(crate) fn validate_mtp_config(config: &MtpConfig) -> anyhow::Result<()> {
         if empty {
             anyhow::bail!("MTP {field} must not be empty");
         }
-    }
-    if config.vocab_size == 0 || config.hidden_size == 0 {
-        anyhow::bail!("MTP vocab_size and hidden_size must be greater than zero");
-    }
-    if config.num_speculative_tokens == 0 {
-        anyhow::bail!("MTP num_speculative_tokens must be greater than zero");
     }
     Ok(())
 }
@@ -944,13 +973,13 @@ speculative:
         let SpeculatorProposerStatus::Mtp(spec) = descriptor.proposer else {
             panic!("MTP descriptor did not resolve");
         };
-        let config = MtpConfig::from_sidecar_descriptor(&spec, 129_280);
+        let config = ResolvedMtpConfig::from_sidecar_descriptor(&spec, 129_280);
 
         assert_eq!(
-            config.head_model,
+            config.public_config.head_model,
             Path::new("/models/deepseek-v4/mtp/model.onnx")
         );
-        assert_eq!(config.target_hidden_output, "hidden_states");
+        assert_eq!(config.public_config.target_hidden_output, "hidden_states");
         assert_eq!(config.target_hidden_layout, MtpHiddenLayout::Bshc);
         assert_eq!(
             config.embedding_weights,
@@ -960,15 +989,15 @@ speculative:
             config.lm_head_weights,
             MtpWeightSource::TargetInitializer("lm_head.weight".into())
         );
-        assert_eq!(config.vocab_size, 129_280);
-        assert_eq!(config.hidden_size, 4096);
+        assert_eq!(config.public_config.vocab_size, 129_280);
+        assert_eq!(config.public_config.hidden_size, 4096);
         assert_eq!(config.hc_mult, 4);
         assert_eq!(config.mtp_hidden_output, "mtp_hidden");
         assert_eq!(config.mtp_state_output.as_deref(), Some("mtp_state"));
-        assert_eq!(config.kv_mode, MtpDraftKvMode::GrowCache);
+        assert_eq!(config.public_config.kv_mode, MtpDraftKvMode::GrowCache);
         assert_eq!(config.cache_scope, MtpCacheScope::ProposalLocal);
-        assert_eq!(config.num_speculative_tokens, 4);
-        validate_mtp_config(&config).expect("resolved config validates");
+        assert_eq!(config.public_config.num_speculative_tokens, 4);
+        validate_resolved_mtp_config(&config).expect("resolved config validates");
     }
 
     #[test]
@@ -998,23 +1027,27 @@ speculative:
 
     #[test]
     fn mtp_validation_enforces_hc_layout_and_state_contract() {
-        let mut config = MtpConfig {
-            head_model: "mtp/model.onnx".into(),
-            target_hidden_output: "hidden_states".into(),
+        let mut config = ResolvedMtpConfig {
+            public_config: MtpConfig {
+                head_model: "mtp/model.onnx".into(),
+                target_hidden_output: "hidden_states".into(),
+                embedding_weights: "embedding.f32".into(),
+                lm_head_weights: "lm_head.f32".into(),
+                vocab_size: 32,
+                hidden_size: 16,
+                kv_mode: MtpDraftKvMode::HiddenThreaded,
+                num_speculative_tokens: 4,
+            },
             target_hidden_layout: MtpHiddenLayout::Bshc,
-            embedding_weights: "embedding.f32".into(),
-            lm_head_weights: "lm_head.f32".into(),
-            vocab_size: 32,
-            hidden_size: 16,
+            embedding_weights: MtpWeightSource::File("embedding.f32".into()),
+            lm_head_weights: MtpWeightSource::File("lm_head.f32".into()),
             hc_mult: 0,
             mtp_hidden_output: "mtp_hidden".into(),
             mtp_state_output: Some("mtp_state".into()),
-            kv_mode: MtpDraftKvMode::HiddenThreaded,
             cache_scope: MtpCacheScope::ProposalLocal,
-            num_speculative_tokens: 4,
         };
         assert!(
-            validate_mtp_config(&config)
+            validate_resolved_mtp_config(&config)
                 .unwrap_err()
                 .to_string()
                 .contains("hc_mult")
@@ -1023,7 +1056,7 @@ speculative:
         config.hc_mult = 2;
         config.mtp_state_output = None;
         assert!(
-            validate_mtp_config(&config)
+            validate_resolved_mtp_config(&config)
                 .unwrap_err()
                 .to_string()
                 .contains("mtp_state_output")
@@ -1032,7 +1065,7 @@ speculative:
         config.target_hidden_layout = MtpHiddenLayout::Bsh;
         config.mtp_state_output = Some("mtp_state".into());
         assert!(
-            validate_mtp_config(&config)
+            validate_resolved_mtp_config(&config)
                 .unwrap_err()
                 .to_string()
                 .contains("requires hc_mult == 1")
