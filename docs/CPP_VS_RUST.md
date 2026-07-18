@@ -234,6 +234,20 @@ was implemented by an AI agent in a tight edit→check loop.
    by the conformance suite, and was cleanly reverted — exactly the failure mode you want with
    machine-authored change.
 
+7. **Runtime failures are *diagnosable*, not undefined.** When Rust logic does fail, a `panic` is a
+   *defined* event: a message plus the exact `file:line` (with `#[track_caller]`, `unwrap`/`expect`/index
+   panics point at the caller), and a symbolicated backtrace under `RUST_BACKTRACE=1`. It is
+   deterministic and reproducible for a given input, and with `panic = "unwind"` it can be caught at an
+   FFI/request boundary (`catch_unwind`) — turning a would-be crash into a logged, handled error while
+   the process stays up. The C++ counterpart to the same mistake (out-of-bounds, use-after-free) is
+   *undefined*: it may corrupt silently, crash far from the cause, or segfault with no message — the
+   "no actionable signal" problem from point 1, now at runtime. **Honest caveats:** a panic escaping a
+   plain `extern "C"` boundary is itself UB (so FFI entry points must wrap in `catch_unwind`, as this
+   EP does); `panic = "abort"` builds forgo unwind/catch; and interactive stepping, debugger
+   pretty-printers, and especially *async* backtraces are still weaker than C++'s mature tooling (§3).
+   Net: for the UB/segfault/corruption class, Rust failures are markedly easier to *diagnose*; for
+   interactive debugging depth, C++ tooling still leads.
+
 **Where C++ is better for agents (honest):**
 
 1. **Training-data asymmetry.** Agents have seen vastly more C++ than Rust, and specifically far more
