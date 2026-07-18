@@ -33,7 +33,8 @@ not as products anyone is asking ORT to adopt. Every number below is reproducibl
   idioms. All of these are real.
 
 If you read nothing else, read §3 (where C++ still wins), §6–§8 (agentic development, contract-first
-workflow, and reviewing agent-authored Rust), and §9 (the adoption path that doesn't bet the runtime).
+workflow, and reviewing agent-authored Rust), §9 (composability / à-la-carte reuse for collaborators),
+and §10 (the adoption path that doesn't bet the runtime).
 
 ---
 
@@ -137,7 +138,7 @@ If we pretend these away, the experts are right to ignore us.
 5. **Rewrite risk and opportunity cost.** ORT is millions of lines of *correct, fast, shipping* C++.
    "Rewrite it" is, at face value, the single most classic engineering mistake there is. A Rust ORT
    that is 95% as fast and 100% rewritten is a **strategic loss**, not a win. The only defensible
-   version is incremental and reuse-heavy (see §9).
+   version is incremental and reuse-heavy (see §10).
 
 6. **The ORT team's expertise is in C++.** ORT's deepest experts are C++ experts with years of context
    in *this specific codebase*. Ramping a team on Rust's borrow checker, async, and macro ecosystem is
@@ -325,7 +326,66 @@ not spread across every line the way C++'s memory-safety review burden is.
 
 ---
 
-## 9. An adoption path that doesn't bet the runtime
+## 9. Composability: à la carte components and user plugins
+
+A core goal is that collaborators and users can **reuse the pieces they want and replace the pieces
+they want** — take the IR crate just to do graph fusion on ONNX models, take the ORT or GenAI crate as
+a runtime, use the built-in sampler or drop in their own, plug in a custom tokenizer or logit
+processor — and contribute their own optimized components where they have an edge. Rust makes this
+substantially easier for Rust consumers, and no worse for everyone else.
+
+**Why Rust helps:**
+
+- **Cargo + crates.io is frictionless library reuse.** Every component is an independently versioned
+  crate. A collaborator who only wants graph fusion writes `onnx-runtime-ir = "…"` (+ `-optimizer`) in
+  `Cargo.toml` and has it — no vendoring, no CMake, no ABI matching, no system deps, no "which ORT
+  build did you link against." The experiment already proved the publish path end-to-end: the MLX EP
+  is on crates.io, installable with `cargo add`. The C++ story is heavier — consume ORT and you link
+  (or vendor) the monolith and match its ABI and compiler.
+- **Fine-grained crates = take only what you need.** The workspace is 27 crates with real boundaries
+  (`onnx-runtime-ir`, `-memory`, `-optimizer`, `-ep-cpu`, `-ep-cuda`, `onnx-genai-kv`, `-scheduler`,
+  `-engine`, `-preprocess`, `-router`…). Depend on the three you use; the rest never enters your build.
+  Feature flags (`default-features = false` + opt-in) trim further — a CUDA-free build, a tracer-free
+  build. C++ *can* be modular, but in practice ORT ships as one large artifact and cherry-picking a
+  subsystem is surgery.
+- **Traits are clean, zero-cost plugin points — and they already exist here.** "Bring your own
+  component" is a trait the user implements. The experiment already exposes `Sampler`, `LogitProcessor`,
+  `Constraint`, `TokenEmbedder`, `LmHead`, and `SpeculativeProposer` as public traits: a user writes
+  `impl Sampler for MySampler` and drops it in. It's compile-time-checked, monomorphized (the
+  abstraction costs nothing at runtime — unlike a virtual-dispatch or FFI-callback plugin), and needs
+  no registration boilerplate or ABI contract. Users provide custom-optimized components by
+  implementing the trait, and the compiler guarantees they fit the contract.
+- **A source-level, semver'd, documented API.** `cargo doc` + crates.io semver give consumers a stable,
+  discoverable surface instead of a C++ header they must match to a compiler and an STL ABI — no
+  symbol-mangling or ABI-skew failures at link time.
+- **Strong external precedent.** The two most widely reused pieces of the modern LLM stack —
+  HuggingFace `tokenizers` and `safetensors` — are *Rust libraries* consumed everywhere (Python, JS,
+  Rust). Rust components getting adopted à la carte across an ecosystem is not hypothetical; it is how
+  today's tokenizer and model-format layers already work.
+
+**Honest caveats:**
+
+- **Rust source-level reuse is for Rust consumers.** A collaborator writing in C++/Python cannot `impl`
+  a Rust trait; they consume the same **C ABI** the runtime already exposes (`onnx-runtime-capi`, the
+  plugin-EP ABI). So Rust makes reuse *much* easier for Rust users and *no harder* for cross-language
+  users — but the cross-language plugin story is the C ABI, exactly as today (and it works: the MLX EP
+  is a C-ABI plugin loaded by unmodified C++ ORT). Python bindings (PyO3) can re-export the ergonomic
+  pieces, which is how `tokenizers`/`safetensors` reach Python.
+- **Pre-1.0 semver churns.** While the crates are `0.x`, breaking API changes are frequent and
+  consumers must pin versions. A *stable* third-party plugin ecosystem needs a committed-stable
+  interface — a stabilized trait or the C ABI — the same discipline ORT already applies to its C API.
+- **Cargo builds from source.** Consumers compile the crate and its deps (fast for pure-Rust libs like
+  the IR/optimizer; the usual FFI build cost for crates with C kernels). Prebuilt-binary distribution
+  is possible but less turnkey than dropping in a prebuilt `.so`.
+
+**Net:** for the "pick the components that fit you, replace the ones where you have a better idea" goal,
+Rust's crate granularity + traits + cargo make **Rust-native reuse dramatically more ergonomic** — with
+real traits already in place and strong ecosystem precedent — while cross-language consumers keep the
+C-ABI path that already works.
+
+---
+
+## 10. An adoption path that doesn't bet the runtime
 
 This is the part to actually argue about. The path is **strangler-fig, not big-bang**:
 
@@ -349,7 +409,7 @@ approve a multi-year rewrite; they approve one crate at a time, each behind a co
 
 ---
 
-## 10. Recommendation, and what would change it
+## 11. Recommendation, and what would change it
 
 **Recommendation (for discussion, not a mandate):** treat Rust as the default for *new* orchestration
 and GenAI components and for *new* plugin EPs; where the runtime is reimplemented, do it incrementally
