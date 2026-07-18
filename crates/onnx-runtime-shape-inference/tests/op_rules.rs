@@ -2515,6 +2515,31 @@ fn batch_norm_inference_passthrough_opsets_9_14_15() {
 }
 
 #[test]
+fn batch_norm_training_with_optional_outputs_preserves_y_without_fabricating_statistics() {
+    let n = with_attr(
+        node("BatchNormalization", 5, 3),
+        "training_mode",
+        Attribute::Int(1),
+    );
+    let outs = run(
+        &n,
+        vec![
+            tin(DataType::Float16, vec![c(2), c(3), c(4), c(5)]),
+            tin(DataType::Float16, vec![c(3)]),
+            tin(DataType::Float16, vec![c(3)]),
+            tin(DataType::Float16, vec![c(3)]),
+            tin(DataType::Float16, vec![c(3)]),
+        ],
+        15,
+    );
+
+    assert_eq!(out_shape(&outs), vec![c(2), c(3), c(4), c(5)]);
+    assert_eq!(out_dtype(&outs), DataType::Float16);
+    assert!(outs[1].type_info.is_none());
+    assert!(outs[2].type_info.is_none());
+}
+
+#[test]
 fn instance_norm_passthrough_opset_6() {
     let n = node("InstanceNormalization", 3, 1);
     let outs = run(

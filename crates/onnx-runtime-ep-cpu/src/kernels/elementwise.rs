@@ -531,6 +531,31 @@ mod tests {
     }
 
     #[test]
+    fn mod_fmod_bf16_computes_in_f32_and_preserves_dividend_sign() {
+        let dividends = [-5.5, 7.3];
+        let divisors = [3.0, 2.2];
+        let a = Owned::bf16(&[2], &dividends);
+        let b = Owned::bf16(&[2], &divisors);
+        let mut out = Owned::zeros(DataType::BFloat16, &[2]);
+
+        ModKernel { fmod: true }
+            .execute(&[a.view(), b.view()], &mut [out.view_mut()])
+            .unwrap();
+
+        let expected = dividends
+            .into_iter()
+            .zip(divisors)
+            .map(|(dividend, divisor)| {
+                let dividend = half::bf16::from_f32(dividend).to_f32();
+                let divisor = half::bf16::from_f32(divisor).to_f32();
+                half::bf16::from_f32(dividend % divisor).to_f32()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(out.to_bf16_as_f32(), expected);
+        assert!(out.to_bf16_as_f32()[0].is_sign_negative());
+    }
+
+    #[test]
     fn mod_integer_zero_divisor_matches_div_convention() {
         let a = Owned::i32(&[2], &[5, -5]);
         let b = Owned::i32(&[2], &[0, 0]);

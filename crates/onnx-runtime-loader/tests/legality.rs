@@ -378,3 +378,20 @@ fn public_load_model_bytes_rejects_producerless_graph_output() {
         Err(LoaderError::GraphOutputMissingProducer { tensor }) if tensor == "missing"
     ));
 }
+
+#[test]
+fn public_load_model_bytes_rejects_dependency_cycle() {
+    let cyclic = model(onnx::GraphProto {
+        output: vec![value_info("a")],
+        node: vec![
+            node("Identity", &["b"], &["a"]),
+            node("Identity", &["a"], &["b"]),
+        ],
+        ..Default::default()
+    });
+
+    assert!(matches!(
+        onnx_runtime_loader::load_model_bytes(&cyclic.encode_to_vec()),
+        Err(LoaderError::GraphBuild(error)) if error.contains("CycleDetected")
+    ));
+}
