@@ -13,11 +13,62 @@ struct PluginRegistration {
     provider_name: Option<String>,
 }
 
+#[derive(Default)]
+struct EnvironmentLifecycle {
+    active_environments: usize,
+}
+
+impl EnvironmentLifecycle {
+    fn ensure_creation_capacity(&self) -> Result<()> {
+        if self.active_environments == usize::MAX {
+            return Err(OrtError::InvalidArgument(
+                "ORT environment reference count overflowed".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn environment_created(&mut self) {
+        self.active_environments += 1;
+    }
+
+    fn environment_released(&mut self) -> bool {
+        if self.active_environments == 0 {
+            debug_assert!(false, "released an untracked ORT environment");
+            return false;
+        }
+        self.active_environments -= 1;
+        self.active_environments == 0
+    }
+}
+
+fn environment_lifecycle() -> &'static Mutex<EnvironmentLifecycle> {
+    static LIFECYCLE: OnceLock<Mutex<EnvironmentLifecycle>> = OnceLock::new();
+    LIFECYCLE.get_or_init(|| Mutex::new(EnvironmentLifecycle::default()))
+}
+
 fn registered_ep_libraries() -> &'static Mutex<std::collections::HashMap<String, PluginRegistration>>
 {
     static REGISTERED: OnceLock<Mutex<std::collections::HashMap<String, PluginRegistration>>> =
         OnceLock::new();
     REGISTERED.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+fn release_environment(
+    lifecycle: &mut EnvironmentLifecycle,
+    registrations: &Mutex<std::collections::HashMap<String, PluginRegistration>>,
+) {
+    if lifecycle.environment_released() {
+        registrations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+    }
+}
+
+fn plugin_registration_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
 }
 
 fn plugin_discovery_lock() -> &'static Mutex<()> {
@@ -35,6 +86,13 @@ pub struct Environment {
 impl Environment {
     /// Create a new ORT environment.
     pub fn new(name: &str) -> Result<Self> {
+        // Serialize the ORT refcount transition with last-environment cache
+        // clearing. A new OrtEnv cannot become visible between ReleaseEnv and
+        // clearing registrations owned by the previous OrtEnv generation.
+        let mut lifecycle = environment_lifecycle().lock().map_err(|_| {
+            OrtError::InvalidArgument("ORT environment lifecycle lock was poisoned".into())
+        })?;
+        lifecycle.ensure_creation_capacity()?;
         let log_id = CString::new(name)
             .map_err(|_| OrtError::InvalidArgument("environment name contains NUL".into()))?;
         let mut ptr = std::ptr::null_mut();
@@ -49,9 +107,11 @@ impl Environment {
                 &mut ptr,
             )
         })?;
+        let ptr = NonNull::new(ptr).ok_or(OrtError::NullPointer)?;
+        lifecycle.environment_created();
         tracing::info!("Creating ORT environment: {}", name);
         Ok(Self {
-            ptr: NonNull::new(ptr).ok_or(OrtError::NullPointer)?,
+            ptr,
             _name: name.to_string(),
         })
     }
@@ -63,25 +123,38 @@ impl Environment {
     /// Register an ORT execution-provider plugin shared library.
     ///
     /// Returns `Ok(true)` when this call performed the registration and
-    /// `Ok(false)` when the same handle+path was already registered in this
-    /// process. ORT registration is process-global and must not be repeated,
-    /// even through a different `Environment`.
+    /// `Ok(false)` when the same handle+path was already registered in the
+    /// current ORT environment generation. The registration is shared by
+    /// concurrently live `Environment` wrappers.
     pub(crate) fn register_execution_provider_library(
         &self,
         registration_name: &str,
         path: &Path,
     ) -> Result<bool> {
-        let mut registered = registered_ep_libraries().lock().map_err(|_| {
-            OrtError::InvalidArgument("execution provider registration lock was poisoned".into())
+        // Serialize registrations without retaining the cache mutex across the
+        // ORT call. Environment create/drop may re-enter while ORT loads a
+        // plugin, and last-environment teardown needs the cache mutex to clear
+        // registrations without deadlocking.
+        let _registration_guard = plugin_registration_lock().lock().map_err(|_| {
+            OrtError::InvalidArgument(
+                "execution provider registration call lock was poisoned".into(),
+            )
         })?;
-        if let Some(registration) = registered.get(registration_name) {
-            if registration.path == path {
-                return Ok(false);
+        {
+            let registered = registered_ep_libraries().lock().map_err(|_| {
+                OrtError::InvalidArgument(
+                    "execution provider registration lock was poisoned".into(),
+                )
+            })?;
+            if let Some(registration) = registered.get(registration_name) {
+                if registration.path == path {
+                    return Ok(false);
+                }
+                return Err(OrtError::InvalidArgument(format!(
+                    "execution provider {registration_name} is already registered from {}",
+                    registration.path.display()
+                )));
             }
-            return Err(OrtError::InvalidArgument(format!(
-                "execution provider {registration_name} is already registered from {}",
-                registration.path.display()
-            )));
         }
 
         let name = CString::new(registration_name).map_err(|_| {
@@ -122,6 +195,9 @@ impl Environment {
                 register(self.ptr.as_ptr(), name.as_ptr(), path_c.as_ptr())
             })?;
         }
+        let mut registered = registered_ep_libraries().lock().map_err(|_| {
+            OrtError::InvalidArgument("execution provider registration lock was poisoned".into())
+        })?;
         registered.insert(
             registration_name.to_string(),
             PluginRegistration {
@@ -141,8 +217,8 @@ impl Environment {
         })
     }
 
-    /// Fetch the process-global provider name previously discovered for a
-    /// plugin registration handle, if any.
+    /// Fetch the provider name discovered for a plugin registration handle in
+    /// the current ORT environment generation, if any.
     pub(crate) fn cached_plugin_provider(&self, registration_name: &str) -> Result<Option<String>> {
         registered_ep_libraries()
             .lock()
@@ -157,8 +233,8 @@ impl Environment {
             })
     }
 
-    /// Record the process-global provider name discovered for a plugin
-    /// registration handle so sessions using any environment can re-select its
+    /// Record the provider name discovered for a plugin registration handle so
+    /// sessions using any concurrently live environment can re-select its
     /// devices.
     pub(crate) fn cache_plugin_provider(
         &self,
@@ -187,11 +263,18 @@ impl Environment {
 
 impl Drop for Environment {
     fn drop(&mut self) {
+        // Keep this guard through ReleaseEnv and cache clearing. Environment::new
+        // takes the same lock before CreateEnv, so a fresh OrtEnv generation
+        // cannot observe registrations owned by the generation being destroyed.
+        let mut lifecycle = environment_lifecycle()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Ok(api) = crate::error::api()
             && let Some(release) = api.ReleaseEnv
         {
             // SAFETY: `ptr` is owned by this wrapper and released exactly once here.
             unsafe { release(self.ptr.as_ptr()) };
+            release_environment(&mut lifecycle, registered_ep_libraries());
         }
     }
 }
@@ -211,8 +294,51 @@ unsafe impl Sync for Environment {}
 mod tests {
     use super::*;
 
+    struct SimulatedEnvironment<'a> {
+        lifecycle: &'a Mutex<EnvironmentLifecycle>,
+        registrations: &'a Mutex<std::collections::HashMap<String, PluginRegistration>>,
+    }
+
+    impl<'a> SimulatedEnvironment<'a> {
+        fn new(
+            lifecycle: &'a Mutex<EnvironmentLifecycle>,
+            registrations: &'a Mutex<std::collections::HashMap<String, PluginRegistration>>,
+        ) -> Self {
+            lifecycle
+                .lock()
+                .expect("lifecycle lock")
+                .environment_created();
+            Self {
+                lifecycle,
+                registrations,
+            }
+        }
+
+        fn simulate_registration(&self, registration_name: &str, path: &Path) -> bool {
+            let mut registrations = self.registrations.lock().expect("registration lock");
+            if registrations.contains_key(registration_name) {
+                return false;
+            }
+            registrations.insert(
+                registration_name.to_string(),
+                PluginRegistration {
+                    path: path.to_path_buf(),
+                    provider_name: Some("TestExecutionProvider".to_string()),
+                },
+            );
+            true
+        }
+    }
+
+    impl Drop for SimulatedEnvironment<'_> {
+        fn drop(&mut self) {
+            let mut lifecycle = self.lifecycle.lock().expect("lifecycle lock");
+            release_environment(&mut lifecycle, self.registrations);
+        }
+    }
+
     #[test]
-    fn plugin_registration_and_provider_cache_are_process_global() {
+    fn plugin_registration_and_provider_cache_are_shared_by_live_environments() {
         let first = Environment::new("plugin-global-first").expect("first environment");
         let second = Environment::new("plugin-global-second").expect("second environment");
         let registration_name = format!("onnx_genai_test_plugin_{}", std::process::id());
@@ -250,5 +376,60 @@ mod tests {
             .lock()
             .expect("registration lock")
             .remove(&registration_name);
+    }
+
+    #[test]
+    fn plugin_registration_cache_is_cleared_after_last_environment_drop() {
+        // The unit-test suite has no real ORT plugin shared library, so use the
+        // production lifecycle counter/clear path with simulated registrations.
+        let lifecycle = Mutex::new(EnvironmentLifecycle::default());
+        let registrations = Mutex::new(std::collections::HashMap::new());
+        let path = PathBuf::from("/onnx-genai/test/plugin.so");
+
+        let first = SimulatedEnvironment::new(&lifecycle, &registrations);
+        let second = SimulatedEnvironment::new(&lifecycle, &registrations);
+        assert_eq!(
+            lifecycle
+                .lock()
+                .expect("lifecycle lock")
+                .active_environments,
+            2
+        );
+        assert!(first.simulate_registration("test-plugin", &path));
+
+        drop(first);
+        assert_eq!(
+            lifecycle
+                .lock()
+                .expect("lifecycle lock")
+                .active_environments,
+            1
+        );
+        assert!(
+            registrations
+                .lock()
+                .expect("registration lock")
+                .contains_key("test-plugin")
+        );
+
+        drop(second);
+        assert_eq!(
+            lifecycle
+                .lock()
+                .expect("lifecycle lock")
+                .active_environments,
+            0
+        );
+        assert!(registrations.lock().expect("registration lock").is_empty());
+
+        let fresh = SimulatedEnvironment::new(&lifecycle, &registrations);
+        assert_eq!(
+            lifecycle
+                .lock()
+                .expect("lifecycle lock")
+                .active_environments,
+            1
+        );
+        assert!(fresh.simulate_registration("test-plugin", &path));
     }
 }
