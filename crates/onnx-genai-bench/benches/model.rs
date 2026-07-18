@@ -28,9 +28,9 @@ fn e2e_tokens_per_second(c: &mut Criterion) {
     let mut group = c.benchmark_group("model_e2e");
     group.sample_size(10);
     group.throughput(Throughput::Elements(NEW_TOKENS as u64));
-    group.bench_function("tiny_llm_tokens_per_second", |b| {
+    group.bench_function("tiny_llm_scatter_tokens_per_second", |b| {
         b.iter_batched(
-            || engine("tiny-llm"),
+            || engine("tiny-llm-scatter"),
             |mut engine| {
                 engine
                     .generate(black_box(request("hello world", NEW_TOKENS)))
