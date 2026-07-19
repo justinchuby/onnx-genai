@@ -1653,12 +1653,18 @@ version = "0.1.0-dev.2"
 dependencies = [
  "anyhow",
  "clap",
+ "image",
+ "onnx-genai-comfyui-config",
  "onnx-genai-engine",
  "onnx-genai-kv",
  "onnx-genai-metadata",
  "onnx-genai-ort",
  "onnx-genai-preprocess",
  "onnx-genai-scheduler",
+ "rand 0.9.5",
+ "rand_distr",
+ "serde_json",
+ "tokenizers",
 ]
 
 [[package]]

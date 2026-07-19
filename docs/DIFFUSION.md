@@ -127,13 +127,23 @@ vae.onnx          : latent               -> image   (1/scaling_factor baked in)
 ### 3.2 One-command conversion & rendering
 
 ```bash
-# Convert a workflow + checkpoint into a runnable onnx-genai pipeline directory:
+# Convert a workflow + checkpoint into a runnable onnx-genai pipeline directory
+# (this also emits a self-contained fast-format `tokenizer.json` into `out/`):
 mobius convert-comfyui workflow.json --checkpoint <.safetensors | dir | HF-id> -o out/
 
-# Render an image end-to-end (honors the negative prompt):
-python scripts/run_comfyui.py --workflow workflow.json \
-    --checkpoint OFA-Sys/small-stable-diffusion-v0 -o image.png [--compare]
+# Render an image end-to-end with the native runner (honors the negative prompt).
+# The runner consumes an already-exported ONNX package — no re-export or Python:
+cargo build --release -p onnx-genai --bin run_comfyui
+run_comfyui --workflow workflow.json --pipeline-dir out/ --output image.png
 ```
+
+The native `run_comfyui` binary parses the workflow with `onnx-genai-comfyui-config`, tokenizes the
+positive and negative prompts natively with the Hugging Face `tokenizers` crate (loading the
+package's `tokenizer.json`), draws the seed latent — pre-scaled by the scheduler's
+`init_noise_sigma`, queried from the engine via `PipelineEngine::diffusion_init_noise_sigma()` — plus
+the per-step noise for ancestral samplers, runs the pipeline, and saves the PNG(s). For `batch_size >
+1` it writes numbered files (`image_0.png`, `image_1.png`, …). It requires the model to already be
+ONNX (`denoiser.onnx` / `text_encoder.onnx` / `vae.onnx` in the package).
 
 `convert_comfyui_workflow` reconciles the ComfyUI sampler (kind/steps/cfg) with the checkpoint's
 own noise schedule (betas / `num_train_timesteps`, which the ComfyUI JSON never carries), computes
@@ -165,9 +175,9 @@ seeded generator and feeds it; the reference uses a generator of the same seed. 
 ## 6. Negative prompts
 
 Real ComfyUI workflows carry a negative prompt (not empty). The CFG unconditional pass uses the
-embedding supplied on `{denoiser}.encoder_hidden_states.uncond`; `run_comfyui.py` computes it from
-the **negative** prompt via the exported text encoder (onnxruntime), so the negative prompt is
-honored end-to-end.
+embedding supplied on `{denoiser}.encoder_hidden_states.uncond`; the native `run_comfyui` binary
+computes it from the **negative** prompt via the exported text encoder (onnxruntime), so the negative
+prompt is honored end-to-end.
 
 ---
 
@@ -206,8 +216,9 @@ End-to-end image (full pipeline through onnx-genai vs diffusers): `diffusion_ima
   constants + multi-input CFG) handles it. Matches diffusers to max|Δ|~4e-2 on tiny-random SDXL
   weights (the exact multi-input CFG path is unit-tested to 1e-5). The Mobius **export side is
   done** — `checkpoint_export` auto-detects SDXL and emits the dual-encoder + 5-input-UNet pipeline,
-  `mobius convert-comfyui` routes both conditioning edges automatically, and **`run_comfyui.py`
-  renders SDXL end-to-end** (dual tokenizers, `time_ids`, dual-conditioning negative-prompt uncond).
+  and `mobius convert-comfyui` routes both conditioning edges automatically. The native `run_comfyui`
+  binary currently drives the plain **SD txt2img** path (+ batched generation); rendering the SDXL /
+  ControlNet / inpaint variants through the one-command runner is not yet ported to native Rust.
 - **ControlNet** ✅ handled by a **combined ControlNet+UNet export** (like SDXL, no runtime change):
   the denoiser is a fused ControlNet+UNet taking an extra constant `controlnet_cond` image input
   (the ControlNet produces down/mid residuals injected into the UNet). The translator collects
@@ -215,7 +226,6 @@ End-to-end image (full pipeline through onnx-genai vs diffusers): `diffusion_ima
   `mobius convert-comfyui --controlnet NAME=PATH` resolves it; `controlnet_cond` is an external
   denoiser input (like SDXL `time_ids`) shared across the CFG cond/uncond passes. Validated
   (`scripts/controlnet_e2e.py`): a fused export matches diffusers to 5.8e-6 and differs from base by
-  0.45 (ControlNet takes effect). **`run_comfyui.py` renders ControlNet + LoRA workflows** (`--control-image`,
-  `--lora`/`--controlnet NAME=PATH`) — verified a ControlNet workflow renders end-to-end. *Remaining:*
-  SDXL ControlNet; inpainting.
+  0.45 (ControlNet takes effect). *Remaining:* native `run_comfyui` rendering of ControlNet / LoRA /
+  SDXL ControlNet / inpaint workflows (conversion via `mobius convert-comfyui` already supports them).
 - **img2img** is supported; inpainting (mask) is not.

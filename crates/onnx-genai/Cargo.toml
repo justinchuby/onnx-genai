@@ -24,9 +24,19 @@ onnx-genai-scheduler = { workspace = true }
 onnx-genai-engine = { workspace = true }
 onnx-genai-ort = { workspace = true }
 onnx-genai-preprocess = { workspace = true }
+onnx-genai-comfyui-config = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
+tokenizers = { workspace = true }
+serde_json = { workspace = true }
+image = { version = "0.25", default-features = false, features = ["png"] }
+rand = "0.9"
+rand_distr = "0.5"
 
 [[bin]]
 name = "onnx-genai"
 path = "src/bin/onnx-genai.rs"
+
+[[bin]]
+name = "run_comfyui"
+path = "src/bin/run_comfyui.rs"
