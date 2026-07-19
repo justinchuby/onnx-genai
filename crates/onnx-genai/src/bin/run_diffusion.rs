@@ -30,6 +30,17 @@ fn read_f32(path: &str) -> Result<Vec<f32>> {
         .collect())
 }
 
+fn read_i64(path: &str) -> Result<Vec<i64>> {
+    let bytes = fs::read(path).with_context(|| format!("reading {path}"))?;
+    if bytes.len() % 8 != 0 {
+        bail!("{path}: length {} is not a multiple of 8", bytes.len());
+    }
+    Ok(bytes
+        .chunks_exact(8)
+        .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
+        .collect())
+}
+
 fn write_f32(path: &str, data: &[f32]) -> Result<()> {
     let mut bytes = Vec::with_capacity(data.len() * 4);
     for v in data {
@@ -54,26 +65,45 @@ fn main() -> Result<()> {
     let mut request =
         PipelineGenerateRequest::new(GenerateRequest::new(GeneratePrompt::TokenIds(vec![])));
     for spec in &args[4..] {
-        let parts: Vec<&str> = spec.splitn(3, ':').collect();
-        if parts.len() != 3 {
-            bail!("bad input spec '{spec}' (expected endpoint:d,d,..:path)");
-        }
-        let endpoint = parts[0];
-        let shape: Vec<i64> = parts[1]
+        // endpoint:[dtype:]d,d,..:path   (dtype in {f32,i64}, default f32)
+        let parts: Vec<&str> = spec.split(':').collect();
+        let (endpoint, dtype, shape_str, path) = match parts.as_slice() {
+            [ep, shape, path] => (*ep, "f32", *shape, *path),
+            [ep, dt, shape, path] => (*ep, *dt, *shape, *path),
+            _ => bail!("bad input spec '{spec}' (expected endpoint:[dtype:]d,d,..:path)"),
+        };
+        let shape: Vec<i64> = shape_str
             .split(',')
             .map(|d| d.trim().parse::<i64>())
             .collect::<Result<_, _>>()
             .with_context(|| format!("bad shape in '{spec}'"))?;
-        let data = read_f32(parts[2])?;
         let expected: i64 = shape.iter().product();
-        if expected as usize != data.len() {
-            bail!(
-                "input '{endpoint}': shape {:?} implies {expected} elements but file has {}",
-                shape,
-                data.len()
-            );
-        }
-        request = request.with_input(endpoint, Value::from_slice_f32(&data, &shape)?);
+        let value = match dtype {
+            "f32" => {
+                let data = read_f32(path)?;
+                if expected as usize != data.len() {
+                    bail!(
+                        "input '{endpoint}': shape {:?} implies {expected} f32 but file has {}",
+                        shape,
+                        data.len()
+                    );
+                }
+                Value::from_slice_f32(&data, &shape)?
+            }
+            "i64" => {
+                let data = read_i64(path)?;
+                if expected as usize != data.len() {
+                    bail!(
+                        "input '{endpoint}': shape {:?} implies {expected} i64 but file has {}",
+                        shape,
+                        data.len()
+                    );
+                }
+                Value::from_slice_i64(&data, &shape)?
+            }
+            other => bail!("unsupported dtype '{other}' (expected f32 or i64)"),
+        };
+        request = request.with_input(endpoint, value);
     }
 
     let mut engine = Engine::from_pipeline_dir(std::path::Path::new(pipeline_dir), EngineConfig::default())?;
