@@ -48,6 +48,7 @@ pub mod contrib_fused;
 pub mod dropout;
 pub mod elementwise;
 pub mod expand;
+pub mod eye_like;
 pub mod fused_attention;
 pub mod fused_gemm;
 pub mod fused_matmul_bias;
@@ -59,6 +60,7 @@ pub mod hardmax;
 pub mod identity;
 pub mod index_share;
 pub mod indexing;
+pub mod is_inf;
 pub mod layernorm;
 pub mod log_softmax;
 pub mod logical;
@@ -424,6 +426,11 @@ pub(crate) fn build_cpu_registry_with_weight_offload_cache(
     reg.register(OpKey::new("Div", "", 1), Box::new(elementwise::DivFactory));
     reg.register(OpKey::new("Mod", "", 10), Box::new(elementwise::ModFactory));
     reg.register(OpKey::new("Pow", "", 1), Box::new(elementwise::PowFactory));
+    reg.register(OpKey::new("IsInf", "", 10), Box::new(is_inf::IsInfFactory));
+    reg.register(
+        OpKey::new("EyeLike", "", 9),
+        Box::new(eye_like::EyeLikeFactory),
+    );
     reg.register(OpKey::new("Min", "", 1), Box::new(elementwise::MinFactory));
     reg.register(OpKey::new("Max", "", 1), Box::new(elementwise::MaxFactory));
     reg.register(OpKey::new("Sum", "", 1), Box::new(elementwise::SumFactory));
