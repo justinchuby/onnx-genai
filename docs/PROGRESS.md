@@ -4,9 +4,9 @@ Tracks implementation status of `docs/DESIGN.md` (§1–§40). Updated as work l
 
 **Published:** `onnx-genai` v0.1.0 + 8 sub-crates on crates.io; the `onnx-runtime-*` layer (including `onnx-runtime-tracer`) is released as v0.1.0-dev.1. CI (fmt/build/test/**blocking clippy**) + scheduled `cargo-audit`. Coverage ~77% line.
 
-_Last updated: 2026-07-19T07:42:20Z — CSA Phase B B6 landed; B7 is in progress._
+_Last updated: 2026-07-19T07:42:20Z — CSA Phase B complete (B0–B7); Mobius-head E2E harness landed._
 
-**Current `origin/main` HEAD:** `9c56d9c`.
+**Current `origin/main` HEAD:** `d81b96a`.
 
 
 ## Current tiered-memory and interoperability milestones
@@ -525,10 +525,12 @@ Reserved `onnx-genai` 0.0.0 on PyPI with a pure-Python placeholder at `python/on
 - **CSA Phase B B4 ✅ LANDED (`77a44a4`, 2026-07-19; Roy; Chew 🟢):** device ratio-4 index scoring and deterministic top-k selection landed; **17/17 GPU parity tests are bit-exact on H200.**
 - **CSA Phase B B5 ✅ LANDED (`1ddf01b`, 2026-07-19; Roy; Chew 🔴→🟢):** device ratio-4 fused selection→attention with full device residency landed, including the five-output ratio-4 host-oracle fallback regression fix; **19/19 GPU parity tests are bit-exact on H200.**
 - **CSA Phase B B6 ✅ LANDED (`2a7703a`, 2026-07-19; Roy; Chew 🟡):** CUDA-graph capture compatibility landed for the ratio-4 fp8 6-output configuration only; `cuda_graph_compatible()` is now true there. B4 index host readback was removed, cursors are device-resident, and pooled workspaces use stable addresses; **20/20 CSA parity/capture tests and the full ep-cuda suite pass on H200.**
+- **CSA Phase B B7 ✅ LANDED (`d81b96a`, 2026-07-19; Roy; Chew 🟡):** stream-ordered speculative checkpoint/restore, generation and accepted-prefix validation, device-to-device carry snapshots, instance-scoped observability metrics, and the device default switchover landed. **CSA Phase B is COMPLETE (B0–B7 all ✅).** The ratio-4 fp8 capturable configuration is now device-default with CUDA-graph capture and speculative checkpoint/restore; host-staged fallback remains behind `ONNX_GENAI_CSA_FORCE_HOST`. Sapper is closing the non-blocking B7 review nits (completed-block rollback coverage and five-output host metrics mode label).
+- **Pinned Mobius-head E2E harness ✅ LANDED (`3d47ea9`, 2026-07-19; Leon; Gaff 🟢):** declarative GLM-5.2 and DeepSeek-V4-Flash manifest pins plus an ignored, `ONNX_GENAI_E2E_MODEL_DIR`-gated real-engine smoke test that skips cleanly without artifacts.
 
 ### Tiered implementation worklist
 
 - **Tier 0 ✅ DONE:** BQMoE v1 ✅ and CSA Phase B B0 ✅.
-- **Tier 1 🔄 ACTIVE:** IndexShare v1 ✅; CSA ladder B0✅ B1✅ B2✅ B3✅ B4✅ B5✅ B6✅; only B7 remains (speculative checkpoint/restore + default device switchover + observability metrics — in progress). E2E Mobius-head harness (Tier 1) scaffolding is in progress in parallel.
+- **Tier 1 ✅ COMPLETE:** IndexShare v1 ✅; CSA Phase B B0✅ B1✅ B2✅ B3✅ B4✅ B5✅ B6✅ B7✅; Mobius-head E2E harness scaffolding ✅. Remaining gated work awaiting official Mobius artifacts: native-K3/Kimi, accepted-prefix reuse, BQMoE device-paging, and the MTP integration smoke.
 - **Tier 2 ⏳ PENDING:** device-resident paging/sparse-cache integration after Tier-1 correctness gates.
 - **Tier 3 ⏳ PENDING:** broader performance optimization and production hardening after paging integration.
