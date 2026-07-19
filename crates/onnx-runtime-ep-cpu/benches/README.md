@@ -24,9 +24,11 @@ cargo bench -p onnx-runtime-ep-cpu -- matmul/medium
 Criterion reports the estimated time interval and change versus the prior local
 baseline. HTML reports are written under
 `target/criterion/report/index.html`. Compare the central time estimate, not a
-single sample, and keep CPU governor, thread count, build flags, and machine
-fixed. Benchmark IDs encode the operation, size class, dtype, and element or
-matrix dimensions.
+single sample, and keep CPU governor, build flags, and machine fixed. MatMul is
+run in dedicated Rayon pools pinned to 1 and 8 workers; its benchmark IDs report
+`threads=1` or `threads=8`. Add, ReduceMean, and Gather do not use Rayon
+internally and their IDs explicitly report `threads=1-internal`. Benchmark IDs
+also encode the operation, size class, dtype, and element or matrix dimensions.
 
 Coverage:
 
@@ -56,13 +58,32 @@ shapes after warmup, excluding session construction:
 
 ```bash
 python crates/onnx-runtime-ep-cpu/benches/ort_baseline.py \
-  --filter matmul/medium --warmup 20 --iterations 200
+  --filter matmul/medium --threads 1 8 --warmup 20 --iterations 200
 ```
 
 Run it on the same otherwise-idle machine as Criterion. Compare matching f32
-rows in microseconds. ORT support and optimization behavior for f16/bf16 on CPU
-varies by release, so f32 is the required common baseline; the Rust-only
-f16/bf16 rows guard the broader dtype surface.
+rows and matching thread counts in microseconds. The script pins and prints
+`intra_op_num_threads` for every result and fixes `inter_op_num_threads=1`
+because each generated graph contains one node. ORT support and optimization
+behavior for f16/bf16 on CPU varies by release, so f32 is the required common
+baseline; the Rust-only f16/bf16 rows guard the broader dtype surface.
+
+## Thread-matched MatMul comparison
+
+For the medium f32 shape (`32×512×512`), Gaff's warm-cache measurements with
+allocation outside the timed loop and ORT 1.27.0 were:
+
+| Workers | Rust MatMul | ORT CPU EP | Rust / ORT |
+|---:|---:|---:|---:|
+| 1 | 2.801 ms | 131 µs | 21.4× |
+| 8 | 502 µs | 30.6 µs | 16.4× |
+
+These are matched comparisons, not default-pool results: Rust uses a dedicated
+Rayon pool with the stated worker count, while ORT uses the same intra-op count
+and one inter-op thread. The current gap is therefore approximately 16–21×,
+depending on the matched thread count. The standing bar remains no slower than
+ORT at matching shape, dtype, and thread count while preserving the Rust EP's
+broader dtype coverage. Porting MLAS GEMM/MatMul is the recommended next step.
 
 ## Numeric regressions
 

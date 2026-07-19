@@ -3,8 +3,17 @@ mod common;
 use common::{FloatDType, Tensor, float_values, make_kernel};
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 use onnx_runtime_ir::Attribute;
+use rayon::{ThreadPool, ThreadPoolBuilder};
 
 const FLOAT_DTYPES: [FloatDType; 3] = [FloatDType::F32, FloatDType::F16, FloatDType::Bf16];
+const MATCHED_THREAD_COUNTS: [usize; 2] = [1, 8];
+
+fn thread_pool(threads: usize) -> ThreadPool {
+    ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .build()
+        .expect("benchmark Rayon pool must build")
+}
 
 fn bench_add(c: &mut Criterion) {
     let mut group = c.benchmark_group("add");
@@ -22,7 +31,7 @@ fn bench_add(c: &mut Criterion) {
             let mut output = Tensor::zeros(dtype, &shape);
             let kernel = make_kernel("Add", [], &[shape.clone(), vec![width]], 13);
             group.bench_with_input(
-                BenchmarkId::new(format!("{size}/{}", dtype.name()), len),
+                BenchmarkId::new(format!("{size}/{}/threads=1-internal", dtype.name()), len),
                 &(),
                 |bencher, _| {
                     bencher.iter(|| {
@@ -60,16 +69,19 @@ fn bench_reduce_mean(c: &mut Criterion) {
             &[shape.clone()],
             13,
         );
-        group.bench_function(BenchmarkId::new(format!("{size}/f32"), len), |bencher| {
-            bencher.iter(|| {
-                kernel
-                    .execute(
-                        black_box(&[input.view()]),
-                        black_box(&mut [output.view_mut()]),
-                    )
-                    .unwrap()
-            });
-        });
+        group.bench_function(
+            BenchmarkId::new(format!("{size}/f32/threads=1-internal"), len),
+            |bencher| {
+                bencher.iter(|| {
+                    kernel
+                        .execute(
+                            black_box(&[input.view()]),
+                            black_box(&mut [output.view_mut()]),
+                        )
+                        .unwrap()
+                });
+            },
+        );
     }
     group.finish();
 }
@@ -97,7 +109,10 @@ fn bench_gather(c: &mut Criterion) {
                 13,
             );
             group.bench_function(
-                BenchmarkId::new(format!("{size}/{}", dtype.name()), index_count * columns),
+                BenchmarkId::new(
+                    format!("{size}/{}/threads=1-internal", dtype.name()),
+                    index_count * columns,
+                ),
                 |bencher| {
                     bencher.iter(|| {
                         kernel
@@ -123,23 +138,35 @@ fn bench_matmul(c: &mut Criterion) {
     ] {
         group.throughput(Throughput::Elements((m * n) as u64));
         for dtype in FLOAT_DTYPES {
-            let a = Tensor::floats(dtype, &[m, k], &float_values(m * k));
-            let b = Tensor::floats(dtype, &[k, n], &float_values(k * n));
-            let mut output = Tensor::zeros(dtype, &[m, n]);
-            let kernel = make_kernel("MatMul", [], &[vec![m, k], vec![k, n]], 13);
-            group.bench_function(
-                BenchmarkId::new(format!("{size}/{}", dtype.name()), format!("{m}x{k}x{n}")),
-                |bencher| {
-                    bencher.iter(|| {
-                        kernel
-                            .execute(
-                                black_box(&[a.view(), b.view()]),
-                                black_box(&mut [output.view_mut()]),
-                            )
-                            .unwrap()
-                    });
-                },
-            );
+            for threads in MATCHED_THREAD_COUNTS {
+                let pool = thread_pool(threads);
+                let a = Tensor::floats(dtype, &[m, k], &float_values(m * k));
+                let b = Tensor::floats(dtype, &[k, n], &float_values(k * n));
+                let mut output = Tensor::zeros(dtype, &[m, n]);
+                let mut kernel = make_kernel("MatMul", [], &[vec![m, k], vec![k, n]], 13);
+                group.bench_function(
+                    BenchmarkId::new(
+                        format!("{size}/{}/threads={threads}", dtype.name()),
+                        format!("{m}x{k}x{n}"),
+                    ),
+                    |bencher| {
+                        bencher.iter(|| {
+                            let a = &a;
+                            let b = &b;
+                            let output = &mut output;
+                            let kernel = &mut kernel;
+                            pool.install(move || {
+                                kernel
+                                    .execute(
+                                        black_box(&[a.view(), b.view()]),
+                                        black_box(&mut [output.view_mut()]),
+                                    )
+                                    .unwrap()
+                            })
+                        });
+                    },
+                );
+            }
         }
     }
     group.finish();
