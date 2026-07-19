@@ -17,4 +17,10 @@ onnx-runtime-loader = { workspace = true }
 
 [dependencies.pyo3]
 version = "0.29"
-features = ["extension-module", "abi3-py310"]
+features = ["abi3-py310"]
+
+[features]
+default = []
+# Wheel builds should enable this feature. Keeping it out of normal workspace
+# builds lets Rust test binaries link libpython.
+extension-module = ["pyo3/extension-module"]

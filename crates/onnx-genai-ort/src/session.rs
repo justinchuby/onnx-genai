@@ -519,7 +519,10 @@ impl Session {
         #[cfg(windows)]
         let path_c: Vec<u16> = {
             use std::os::windows::ffi::OsStrExt;
-            path.as_os_str().encode_wide().chain(std::iter::once(0)).collect()
+            path.as_os_str()
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect()
         };
         #[cfg(not(windows))]
         let path_c = CString::new(path.to_string_lossy().as_bytes())
@@ -1139,7 +1142,10 @@ fn requested_non_cpu_provider(options: &SessionOptions) -> bool {
 }
 
 fn requested_strict_provider(options: &SessionOptions) -> bool {
-    options.execution_providers.iter().any(ResolvedEp::is_strict)
+    options
+        .execution_providers
+        .iter()
+        .any(ResolvedEp::is_strict)
 }
 
 fn cuda_device_id_from_env() -> i32 {
@@ -1331,12 +1337,7 @@ fn append_execution_provider(
             ort_name,
             provider_name,
         } => {
-            let provider_options = provider
-                .selection
-                .options
-                .iter()
-                .map(|(key, value)| (key.as_str(), value.as_str()))
-                .collect::<Vec<_>>();
+            let provider_options = named_provider_options(provider);
             append_named_execution_provider(
                 session_options,
                 ort_name,
@@ -1346,6 +1347,15 @@ fn append_execution_provider(
             )
         }
     }
+}
+
+fn named_provider_options(provider: &ResolvedEp) -> Vec<(&str, &str)> {
+    provider
+        .selection
+        .options
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect()
 }
 
 /// Derive a stable registration handle for a plugin library from its file name.
@@ -1364,9 +1374,7 @@ fn plugin_registration_name_from_path(path: &std::path::Path) -> String {
 /// `OrtHardwareDeviceType`. Accepts `CPU`, `GPU`, and `NPU` case-insensitively.
 /// This is intentionally provider-agnostic: it never matches a vendor's device
 /// name, only ORT's own hardware-class enum.
-fn parse_hardware_device_type(
-    value: &str,
-) -> Option<onnx_genai_ort_sys::OrtHardwareDeviceType> {
+fn parse_hardware_device_type(value: &str) -> Option<onnx_genai_ort_sys::OrtHardwareDeviceType> {
     match value.trim().to_ascii_uppercase().as_str() {
         "CPU" => Some(onnx_genai_ort_sys::OrtHardwareDeviceType_CPU),
         "GPU" => Some(onnx_genai_ort_sys::OrtHardwareDeviceType_GPU),
@@ -1635,59 +1643,6 @@ fn append_plugin_execution_provider(
         "Enabled ONNX Runtime execution provider plugin"
     );
     Ok(())
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn append_metal_execution_provider(
-    env: &Environment,
-    session_options: *mut onnx_genai_ort_sys::OrtSessionOptions,
-) -> Result<()> {
-    let plugin_path = metal_plugin_path()?;
-    let registration_name = plugin_registration_name_from_path(&plugin_path);
-    append_plugin_execution_provider(
-        env,
-        session_options,
-        &registration_name,
-        &plugin_path,
-        &[],
-        None,
-    )
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn metal_plugin_path() -> Result<std::path::PathBuf> {
-    const HELP: &str = "set ONNX_GENAI_METAL_EP_LIB to the built onnxruntime-mlx plugin (libonnxruntime_mlx_ep.dylib)";
-    let path = runtime_config()
-        .metal_ep_lib
-        .clone()
-        .ok_or_else(|| OrtError::InvalidArgument(HELP.into()))?;
-    if !path.is_absolute() {
-        return Err(OrtError::InvalidArgument(format!(
-            "ONNX_GENAI_METAL_EP_LIB must be an absolute path; {HELP}"
-        )));
-    }
-    if !path.is_file() {
-        return Err(OrtError::InvalidArgument(format!(
-            "Metal execution provider library not found at {}; {HELP}",
-            path.display()
-        )));
-    }
-    path.canonicalize().map_err(|err| {
-        OrtError::InvalidArgument(format!(
-            "could not resolve ONNX_GENAI_METAL_EP_LIB={}: {err}; {HELP}",
-            path.display()
-        ))
-    })
-}
-
-#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-fn append_metal_execution_provider(
-    _env: &Environment,
-    _session_options: *mut onnx_genai_ort_sys::OrtSessionOptions,
-) -> Result<()> {
-    Err(OrtError::InvalidArgument(
-        "Metal execution provider is supported only on macOS arm64".into(),
-    ))
 }
 
 #[cfg(feature = "cuda")]
@@ -2073,7 +2028,11 @@ mod tests {
     fn resolves_cpu_to_host_defaults() {
         let resolved = resolve_execution_provider(&ep_selection("cpu"));
         assert!(resolved.caps.is_host());
-        assert!(resolved.caps.has(capability::FIXED_CAPACITY_PRESENT_BINDING));
+        assert!(
+            resolved
+                .caps
+                .has(capability::FIXED_CAPACITY_PRESENT_BINDING)
+        );
         assert!(!resolved.is_strict());
         assert!(matches!(
             resolved.strategy,
@@ -2108,12 +2067,27 @@ mod tests {
     }
 
     #[test]
+    fn convenience_selection_uses_env_name_normalization() {
+        let cuda = ep_selection("CUDA");
+        assert_eq!(cuda, EpSelection::new("CUDA"));
+        assert!(resolve_execution_provider(&cuda).caps.is_nvidia());
+
+        let cpu = ep_selection(" cpu ");
+        assert_eq!(cpu, EpSelection::new(" cpu "));
+        assert!(resolve_execution_provider(&cpu).caps.is_host());
+    }
+
+    #[test]
     fn resolves_unknown_ep_to_named_generic_other_hardware() {
         let resolved = resolve_execution_provider(&ep_selection("openvino"));
         assert_eq!(resolved.caps.hardware, HardwareKind::Other);
         assert!(!resolved.caps.is_gpu());
         assert!(!resolved.caps.is_host());
-        assert!(!resolved.caps.has(capability::FIXED_CAPACITY_PRESENT_BINDING));
+        assert!(
+            !resolved
+                .caps
+                .has(capability::FIXED_CAPACITY_PRESENT_BINDING)
+        );
         assert!(!resolved.is_strict());
         match &resolved.strategy {
             ep_compat::AppendStrategy::NamedGeneric {
@@ -2128,17 +2102,47 @@ mod tests {
     }
 
     #[test]
+    fn named_generic_forwards_opaque_provider_options() {
+        let config = onnx_genai_runtime_config::RuntimeConfig::from_fn(|name| match name {
+            "ONNX_GENAI_EP" => Some("openvino".to_owned()),
+            "ONNX_GENAI_EP_OPTIONS" => Some("device_type=GPU,precision=FP16".to_owned()),
+            _ => None,
+        });
+        let ExecutionProviderEntry::Builtin(selection) = &config.execution_providers[0] else {
+            panic!("expected named provider selection");
+        };
+        let resolved = resolve_execution_provider(selection);
+        assert_eq!(
+            named_provider_options(&resolved),
+            vec![("device_type", "GPU"), ("precision", "FP16")]
+        );
+    }
+
+    #[test]
     fn resolves_webgpu_and_coreml_separator_aliases() {
         for name in ["webgpu", "web-gpu", "web_gpu"] {
             let resolved = resolve_execution_provider(&ep_selection(name));
-            assert!(resolved.caps.is_gpu(), "{name} should resolve to WebGPU GPU caps");
-            assert!(resolved.transitional_webgpu, "{name} should be the WebGPU transitional EP");
-            assert!(resolved.caps.has(capability::DEVICE_KV), "{name} should keep WebGPU device-KV");
+            assert!(
+                resolved.caps.is_gpu(),
+                "{name} should resolve to WebGPU GPU caps"
+            );
+            assert!(
+                resolved.transitional_webgpu,
+                "{name} should be the WebGPU transitional EP"
+            );
+            assert!(
+                resolved.caps.has(capability::DEVICE_KV),
+                "{name} should keep WebGPU device-KV"
+            );
             assert_eq!(resolved.caps.name, "webgpu");
         }
         for name in ["coreml", "core-ml", "core_ml"] {
             let resolved = resolve_execution_provider(&ep_selection(name));
-            assert_eq!(resolved.caps.hardware, HardwareKind::Npu, "{name} should resolve to CoreML");
+            assert_eq!(
+                resolved.caps.hardware,
+                HardwareKind::Npu,
+                "{name} should resolve to CoreML"
+            );
             assert_eq!(resolved.caps.name, "coreml");
             assert!(matches!(
                 resolved.strategy,

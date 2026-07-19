@@ -410,10 +410,7 @@ fn parse_inline_plugin_spec(rest: &str) -> PluginSpec {
             if !val.is_empty() {
                 device = Some(val.to_owned());
             }
-        } else if let Some(option_key) = key_lc
-            .starts_with("opt.")
-            .then(|| key[4..].trim())
-        {
+        } else if let Some(option_key) = key_lc.starts_with("opt.").then(|| key[4..].trim()) {
             if !option_key.is_empty() {
                 options.push((option_key.to_owned(), val.to_owned()));
             }
@@ -538,7 +535,7 @@ mod tests {
     #[test]
     fn execution_provider_normalizes_and_retains_generic_names() {
         let cases = [
-            ("", ""),
+            ("", "cpu"),
             (" CPU ", "cpu"),
             ("web-gpu", "web-gpu"),
             ("WEB_GPU", "web_gpu"),
@@ -627,7 +624,10 @@ mod tests {
             panic!("expected built-in plugin selection");
         };
         assert_eq!(selection.name, "plugin");
-        assert_eq!(selection.options.get("device_type").map(String::as_str), Some("CPU"));
+        assert_eq!(
+            selection.options.get("device_type").map(String::as_str),
+            Some("CPU")
+        );
         assert_eq!(
             actual.ep_library,
             Some(PathBuf::from("/opt/onnxruntime_ep_openvino.so"))

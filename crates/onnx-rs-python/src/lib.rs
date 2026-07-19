@@ -35,7 +35,7 @@ impl Model {
 #[pyfunction]
 #[pyo3(signature = (path_or_bytes))]
 fn load_model(path_or_bytes: &Bound<'_, PyAny>) -> PyResult<Model> {
-    if let Ok(bytes) = path_or_bytes.downcast::<PyBytes>() {
+    if let Ok(bytes) = path_or_bytes.cast::<PyBytes>() {
         let bytes = bytes.as_bytes();
         return load_model_bytes(bytes)
             .map(|inner| Model { inner })
@@ -175,7 +175,7 @@ fn path_arg(
     call: &'static str,
     bytes_allowed: bool,
 ) -> PyResult<PathBuf> {
-    if value.downcast::<PyString>().is_err() {
+    if value.cast::<PyString>().is_err() {
         match value.getattr("__fspath__") {
             Ok(_) => {}
             Err(error) if error.is_instance_of::<PyAttributeError>(value.py()) => {
