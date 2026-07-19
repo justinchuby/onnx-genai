@@ -111,53 +111,68 @@ def get_num_transfer_tokens(mask_count: int, steps: int) -> np.ndarray:
     return counts
 
 
-def reference_generate(prompt: list[int], gen_length: int, steps: int) -> np.ndarray:
-    """Faithful LLaDA `generate` core: single block, temperature=0, cfg=0."""
+def reference_generate(prompt: list[int], gen_length: int, steps: int, block_length: int) -> np.ndarray:
+    """Faithful LLaDA `generate` core: temperature=0, cfg=0, low_confidence.
+
+    Supports semi-autoregressive block decoding (`block_length < gen_length`).
+    """
     prompt_length = len(prompt)
     x = np.full((1, prompt_length + gen_length), MASK_TOKEN, dtype=np.int64)
     x[0, :prompt_length] = prompt
 
-    block_mask = x[0, prompt_length:] == MASK_TOKEN
-    num_transfer_tokens = get_num_transfer_tokens(int(block_mask.sum()), steps)
+    assert gen_length % block_length == 0
+    num_blocks = gen_length // block_length
+    assert steps % num_blocks == 0
+    steps_per_block = steps // num_blocks
 
-    for i in range(steps):
-        mask_index = x == MASK_TOKEN
-        logits = model_logits(x)  # temperature 0 => argmax over clean logits
-        predicted = logits.argmax(axis=-1)  # [1, S]
-        shifted = logits - logits.max(axis=-1, keepdims=True)
-        probabilities = np.exp(shifted) / np.exp(shifted).sum(axis=-1, keepdims=True)
-        chosen_probability = np.take_along_axis(
-            probabilities, predicted[..., None], axis=-1
-        )[..., 0]
+    for block in range(num_blocks):
+        block_start = prompt_length + block * block_length
+        block_end = prompt_length + (block + 1) * block_length
+        block_mask = x[0, block_start:block_end] == MASK_TOKEN
+        num_transfer_tokens = get_num_transfer_tokens(int(block_mask.sum()), steps_per_block)
+        for i in range(steps_per_block):
+            mask_index = x == MASK_TOKEN
+            logits = model_logits(x)  # temperature 0 => argmax over clean logits
+            predicted = logits.argmax(axis=-1)  # [1, S]
+            shifted = logits - logits.max(axis=-1, keepdims=True)
+            probabilities = np.exp(shifted) / np.exp(shifted).sum(axis=-1, keepdims=True)
+            chosen_probability = np.take_along_axis(
+                probabilities, predicted[..., None], axis=-1
+            )[..., 0]
 
-        predicted = np.where(mask_index, predicted, x)
-        confidence = np.where(mask_index, chosen_probability, -np.inf)
+            # Only positions inside the current block are eligible this step.
+            chosen_probability[:, block_end:] = -np.inf
+            predicted = np.where(mask_index, predicted, x)
+            confidence = np.where(mask_index, chosen_probability, -np.inf)
 
-        k = int(num_transfer_tokens[i])
-        if k > 0:
-            select = np.argsort(-confidence[0], kind="stable")[:k]
-            x[0, select] = predicted[0, select]
+            k = int(num_transfer_tokens[i])
+            if k > 0:
+                select = np.argsort(-confidence[0], kind="stable")[:k]
+                x[0, select] = predicted[0, select]
     return x[0]
 
 
-def write_metadata(directory: Path) -> None:
-    (directory / "inference_metadata.yaml").write_text(
-        "pipeline:\n"
-        "  models:\n"
-        "    denoiser:\n"
-        "      filename: lm.onnx\n"
-        "      type: denoiser\n"
-        "  dataflow:\n"
-        "    - from: denoiser.logits\n"
-        "      to: denoiser.input_ids\n"
-        "  strategy:\n"
-        "    kind: iterative\n"
-        "    denoiser: denoiser\n"
-        f"    num_steps: {STEPS}\n"
-        "    scheduler_config:\n"
-        "      kind: masked_diffusion\n"
-        f"      mask_token_id: {MASK_TOKEN}\n"
-    )
+def write_metadata(directory: Path, block_length: int | None) -> None:
+    lines = [
+        "pipeline:",
+        "  models:",
+        "    denoiser:",
+        "      filename: lm.onnx",
+        "      type: denoiser",
+        "  dataflow:",
+        "    - from: denoiser.logits",
+        "      to: denoiser.input_ids",
+        "  strategy:",
+        "    kind: iterative",
+        "    denoiser: denoiser",
+        f"    num_steps: {STEPS}",
+        "    scheduler_config:",
+        "      kind: masked_diffusion",
+        f"      mask_token_id: {MASK_TOKEN}",
+    ]
+    if block_length is not None:
+        lines.append(f"      block_length: {block_length}")
+    (directory / "inference_metadata.yaml").write_text("\n".join(lines) + "\n")
 
 
 def run_onnx_genai(directory: Path, seed_tokens: np.ndarray) -> np.ndarray:
@@ -206,23 +221,30 @@ def main() -> int:
     print("num_transfer schedule: div_ceil == LLaDA get_num_transfer_tokens ✓")
 
     gen_length = SEQUENCE_LENGTH - len(PROMPT)
-    expected = reference_generate(PROMPT, gen_length, STEPS)
-
     seed = np.full(SEQUENCE_LENGTH, MASK_TOKEN, dtype=np.int64)
     seed[: len(PROMPT)] = PROMPT
 
-    with tempfile.TemporaryDirectory() as tmp:
-        directory = Path(tmp)
-        build_onnx_model(directory / "lm.onnx")
-        write_metadata(directory)
-        actual = run_onnx_genai(directory, seed)
-
-    print(f"reference (LLaDA):  {expected.tolist()}")
-    print(f"onnx-genai:         {actual.tolist()}")
-    assert np.array_equal(actual, expected), "masked_diffusion output diverged from LLaDA reference"
-    # All masked positions filled (no mask token remains in the generation region).
-    assert MASK_TOKEN not in actual[len(PROMPT):], "generation region still contains mask tokens"
-    print("PARITY OK: masked_diffusion == LLaDA generate (single block, temp=0, cfg=0)")
+    # (block_length metadata value, effective block length for the reference).
+    # None => single block spanning the whole generation region.
+    cases = [
+        ("single block", None, gen_length),
+        ("semi-autoregressive (block_length=3)", 3, 3),
+    ]
+    for label, block_metadata, block_length in cases:
+        if gen_length % block_length != 0 or STEPS % (gen_length // block_length) != 0:
+            raise SystemExit(f"bad test config for {label}")
+        expected = reference_generate(PROMPT, gen_length, STEPS, block_length)
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            build_onnx_model(directory / "lm.onnx")
+            write_metadata(directory, block_metadata)
+            actual = run_onnx_genai(directory, seed)
+        print(f"[{label}]")
+        print(f"  reference (LLaDA): {expected.tolist()}")
+        print(f"  onnx-genai:        {actual.tolist()}")
+        assert np.array_equal(actual, expected), f"masked_diffusion diverged from LLaDA ({label})"
+        assert MASK_TOKEN not in actual[len(PROMPT):], f"mask tokens remain ({label})"
+    print("PARITY OK: masked_diffusion == LLaDA generate (temp=0, cfg=0; single + semi-AR)")
     return 0
 
 

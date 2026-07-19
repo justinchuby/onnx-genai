@@ -1161,15 +1161,16 @@ impl SchedulerRegistry {
                 if temperature < 0.0 {
                     anyhow::bail!("masked_diffusion temperature must be >= 0");
                 }
-                if cfg.block_length.is_some() {
-                    anyhow::bail!(
-                        "masked_diffusion semi-autoregressive 'block_length' is not yet \
-                         supported; omit it to use a single block over the masked region"
-                    );
+                if let Some(block_length) = cfg.block_length
+                    && block_length == 0
+                {
+                    anyhow::bail!("masked_diffusion block_length must be >= 1");
                 }
                 Ok(Arc::new(MaskedDiffusion {
                     mask_token_id,
                     temperature,
+                    block_length: cfg.block_length,
+                    generation_start: Mutex::new(None),
                 }) as Arc<dyn Scheduler>)
             }),
         );
@@ -1199,7 +1200,8 @@ impl Default for SchedulerRegistry {
     }
 }
 
-/// Masked (discrete) language diffusion — LLaDA-style low-confidence remasking.
+/// Masked (discrete) language diffusion — LLaDA-style low-confidence remasking,
+/// with optional semi-autoregressive block decoding.
 ///
 /// The loop-carried tensor is an int64 token sequence `[B, S]` (prompt tokens
 /// plus a masked generation region), the denoiser emits `[B, S, V]` logits, and
@@ -1207,18 +1209,29 @@ impl Default for SchedulerRegistry {
 /// positions per sequence, unmasking progressively so all masked positions are
 /// filled by the final step.
 ///
-/// Faithful to `ML-GSAI/LLaDA`'s `generate` (single-block, `cfg_scale = 0`):
+/// Faithful to `ML-GSAI/LLaDA`'s `generate` (`cfg_scale = 0`):
 ///   * the chosen token per position is the argmax of the (optionally
 ///     Gumbel-noised) logits (`add_gumbel_noise`; identity at `temperature = 0`);
 ///   * the confidence that ranks positions for remasking is the clean-softmax
 ///     probability of that chosen token (`remasking = "low_confidence"`);
-///   * the number of tokens committed at step `i` follows the even split of the
-///     masked count across the remaining steps (`get_num_transfer_tokens`),
-///     which `commit = ceil(remaining / remaining_steps)` reproduces exactly.
-#[derive(Debug, Clone)]
+///   * with `block_length` set, the generation region is split into contiguous
+///     left-to-right blocks; the total `num_steps` is divided evenly across the
+///     `num_blocks`, and each step only commits tokens inside the current block
+///     (semi-autoregressive remasking). A single block (the default) spans the
+///     whole masked region;
+///   * the number of tokens committed at a block's step follows the even split
+///     of that block's masked count across its steps, which
+///     `ceil(remaining / remaining_steps_in_block)` reproduces exactly.
+#[derive(Debug)]
 struct MaskedDiffusion {
     mask_token_id: i64,
     temperature: f32,
+    block_length: Option<usize>,
+    /// Per-sequence generation-region start (prompt length), captured on the
+    /// first step of a loop and cleared by [`Scheduler::reset`]. This lets the
+    /// semi-autoregressive block boundaries be derived without threading the
+    /// prompt length through the [`Scheduler`] trait.
+    generation_start: Mutex<Option<Vec<usize>>>,
 }
 
 impl MaskedDiffusion {
@@ -1254,6 +1267,10 @@ impl MaskedDiffusion {
 }
 
 impl Scheduler for MaskedDiffusion {
+    fn reset(&self) {
+        *self.generation_start.lock().unwrap() = None;
+    }
+
     fn step(
         &self,
         step: usize,
@@ -1277,26 +1294,69 @@ impl Scheduler for MaskedDiffusion {
         // and the transfer schedule are computed independently per sequence
         // (matching LLaDA's per-batch-row `topk`). Rank-1 inputs are one row.
         let sequence_length = *token_shape.last().unwrap_or(&(sequence_count as i64)) as usize;
-        let batch = sequence_count
-            .checked_div(sequence_length)
-            .unwrap_or(0);
+        let batch = sequence_count.checked_div(sequence_length).unwrap_or(0).max(1);
+
+        // Capture each sequence's generation-region start (prompt length) on the
+        // first step of this loop; it is the index of the first mask token.
+        {
+            let mut guard = self.generation_start.lock().unwrap();
+            if guard.is_none() {
+                let mut starts = Vec::with_capacity(batch);
+                for row_index in 0..batch {
+                    let start = row_index * sequence_length;
+                    let first_mask = tokens[start..start + sequence_length]
+                        .iter()
+                        .position(|&token| token == self.mask_token_id)
+                        .unwrap_or(sequence_length);
+                    starts.push(first_mask);
+                }
+                *guard = Some(starts);
+            }
+        }
+        let generation_start = self.generation_start.lock().unwrap().clone().unwrap();
 
         let all_logits = logits.to_vec_f32()?;
-        let remaining_steps = num_steps.saturating_sub(step).max(1);
         let mut output = tokens.clone();
 
-        for row_index in 0..batch.max(1) {
-            let start = row_index * sequence_length;
-            let end = start + sequence_length;
-            let row_tokens = &tokens[start..end];
+        for (row_index, &prompt_length) in generation_start.iter().enumerate() {
+            let row_start = row_index * sequence_length;
+            let generation_length = sequence_length.saturating_sub(prompt_length);
+            if generation_length == 0 {
+                continue;
+            }
+            let block_length = self
+                .block_length
+                .unwrap_or(generation_length)
+                .min(generation_length)
+                .max(1);
+            if !generation_length.is_multiple_of(block_length) {
+                anyhow::bail!(
+                    "masked_diffusion: generation length {generation_length} is not divisible \
+                     by block_length {block_length}"
+                );
+            }
+            let num_blocks = generation_length / block_length;
+            if !num_steps.is_multiple_of(num_blocks) {
+                anyhow::bail!(
+                    "masked_diffusion: num_steps {num_steps} is not divisible by num_blocks \
+                     {num_blocks} (generation_length {generation_length} / block_length \
+                     {block_length})"
+                );
+            }
+            let steps_per_block = num_steps / num_blocks;
+            let block_index = (step / steps_per_block).min(num_blocks - 1);
+            let step_in_block = step % steps_per_block;
+            let block_start = prompt_length + block_index * block_length;
+            let block_end = (block_start + block_length).min(sequence_length);
 
-            // Predicted token + confidence for every still-masked position.
+            // Predicted token + confidence for every still-masked position inside
+            // the current block (only these are candidates for this step).
             let mut candidates: Vec<(usize, i64, f32)> = Vec::new();
-            for (offset, &token) in row_tokens.iter().enumerate() {
-                if token != self.mask_token_id {
+            for offset in block_start..block_end {
+                let position = row_start + offset;
+                if tokens[position] != self.mask_token_id {
                     continue;
                 }
-                let position = start + offset;
                 let logit_row = &all_logits[position * vocab..(position + 1) * vocab];
                 let gumbel = if self.temperature > 0.0 {
                     gumbel_uniforms(step, position, vocab)
@@ -1309,11 +1369,12 @@ impl Scheduler for MaskedDiffusion {
             if candidates.is_empty() {
                 continue;
             }
-            // Commit the highest-confidence subset for this step. The even split
-            // of the masked count over the remaining steps equals
-            // ceil(remaining / remaining_steps).
+            // Commit the highest-confidence subset for this block-step. The even
+            // split of the block's masked count across its remaining steps equals
+            // ceil(remaining / remaining_steps_in_block).
             candidates.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
-            let commit = candidates.len().div_ceil(remaining_steps);
+            let remaining_steps_in_block = steps_per_block - step_in_block;
+            let commit = candidates.len().div_ceil(remaining_steps_in_block);
             for &(position, predicted, _) in candidates.iter().take(commit) {
                 output[position] = predicted;
             }

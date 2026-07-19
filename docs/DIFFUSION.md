@@ -201,9 +201,13 @@ Faithful to `ML-GSAI/LLaDA`'s `generate` (single block, `cfg_scale = 0`):
 - top-k selection is **per sequence** (matching LLaDA's per-batch-row `topk`).
 
 Configured via `scheduler_config`: `mask_token_id` (required), `temperature` (default 0), and
-`block_length` (semi-autoregressive; not yet wired — single block only). Validated exactly against
-the reference LLaDA algorithm by `scripts/masked_diffusion_parity.py` (a deterministic coupled ONNX
-LM driven by both the reference `generate` and onnx-genai — identical token sequences).
+`block_length` (semi-autoregressive block decoding; default is a single block over the whole masked
+region). With `block_length` set, the generation region is split into contiguous left-to-right
+blocks, `num_steps` is divided evenly across the blocks, and each step only commits tokens inside the
+current block. Validated exactly against the reference LLaDA algorithm by
+`scripts/masked_diffusion_parity.py` — a deterministic coupled ONNX LM drives both the reference
+`generate` and onnx-genai, for **single-block and semi-autoregressive** cases, with identical token
+sequences.
 
 ---
 
