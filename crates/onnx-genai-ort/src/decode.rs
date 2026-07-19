@@ -675,16 +675,23 @@ impl<'a> DecodeSession<'a> {
     ///
     /// Both the captured decode graph and the uncaptured persistent path
     /// ([`Self::step_persistent`] with `use_graph == false`, for control-flow
-    /// models) reduce the logits on the device, so either can device-sample. The
-    /// prompt-prefill (multi-token) step needs no special handling here: the
-    /// engine only invokes the device sampler for single-token steps
-    /// (`next_session_token_sampled` returns `Ok(None)` for a multi-token input
-    /// without advancing KV), so this stays a pure capability check.
+    /// models) reduce the logits on the device, so either can device-sample.
+    ///
+    /// This is gated on `current_len > 0`: only genuine single-token decode
+    /// steps reach a device branch in [`Self::step_dispatch`]. The prompt-prefill
+    /// step (`current_len == 0`) always runs [`Self::step_standard`] and returns
+    /// host logits, which the non-greedy sampler cannot consume — so the engine
+    /// must drive prefill through its host path. Reporting `true` at prefill
+    /// would make the engine attempt a device sample that returns host logits,
+    /// erroring back to a host replay that double-advances the KV cache.
     pub fn will_sample_on_device(&self) -> bool {
         #[cfg(feature = "cuda")]
         {
             let shared_kv =
                 self.mode == DecodeKvMode::SharedBuffer && !self.graph_capture_disabled;
+            // Only single-token decode steps (not the multi-token prefill) take a
+            // device branch that returns a device-selected token.
+            let decode_step = self.current_len > 0;
             // The captured graph always reduces on device; the uncaptured path
             // does so only when persistent decode is enabled.
             let device_reduce = self.session.graph_capture() || persistent_uncaptured_enabled();
@@ -696,7 +703,7 @@ impl<'a> DecodeSession<'a> {
             let device_logits = device_argmax_enabled()
                 && self.session.cuda_device_id().is_some()
                 && self.kv_allocator.is_some();
-            shared_kv && device_reduce && device_logits
+            shared_kv && decode_step && device_reduce && device_logits
         }
         #[cfg(not(feature = "cuda"))]
         {
@@ -763,6 +770,16 @@ impl<'a> DecodeSession<'a> {
                     self.graph_capture_disabled = true;
                     self.capture = None;
                 }
+                // A non-greedy device-sample request cannot consume host logits.
+                // Running `step_standard` here would advance the KV cache and
+                // then `step_sampled` would reject the resulting `Value`, making
+                // the engine's host fallback run this step a SECOND time and
+                // double-advance the cache. Propagate the pre-run error instead
+                // (capture is now latched off, so the host fallback re-drives
+                // this step once through the standard path).
+                if params.is_some_and(|params| !params.greedy) {
+                    return Err(err);
+                }
                 self.step_standard(new_input_ids, attention_mask, position_ids)
                     .map(StepLogits::Value)
             });
@@ -807,6 +824,15 @@ impl<'a> DecodeSession<'a> {
                 );
                 self.graph_capture_disabled = true;
                 self.capture = None;
+                // As in the captured branch: a non-greedy device-sample request
+                // cannot consume host logits, so running `step_standard` here
+                // would advance KV and then `step_sampled` would reject the
+                // `Value`, double-advancing via the engine's host replay.
+                // Propagate the pre-run error instead so the host fallback runs
+                // this step exactly once through the standard path.
+                if params.is_some_and(|params| !params.greedy) {
+                    return Err(err);
+                }
                 self.step_standard(new_input_ids, attention_mask, position_ids)
                     .map(StepLogits::Value)
             });
