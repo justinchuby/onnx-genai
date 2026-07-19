@@ -15,12 +15,28 @@
 
 use onnx_genai_engine::{Engine, EngineConfig, GeneratePrompt, GenerateRequest, PipelineGenerateRequest};
 use onnx_genai_ort::Value;
+use std::fs;
 use std::path::{Path, PathBuf};
 
 fn diffusion_fixture() -> anyhow::Result<PathBuf> {
     Ok(Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures/tiny-diffusion")
         .canonicalize()?)
+}
+
+/// Build a scratch pipeline dir that reuses the committed tiny-diffusion ONNX
+/// files but substitutes custom `inference_metadata.yaml`.
+fn fixture_with_metadata(name: &str, files: &[&str], metadata: &str) -> anyhow::Result<PathBuf> {
+    let source = diffusion_fixture()?;
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/test-fixtures")
+        .join(name);
+    fs::create_dir_all(&root)?;
+    for file in files {
+        fs::copy(source.join(file), root.join(file))?;
+    }
+    fs::write(root.join("inference_metadata.yaml"), metadata)?;
+    Ok(root)
 }
 
 fn empty_request() -> PipelineGenerateRequest {
@@ -93,5 +109,137 @@ fn number_of_steps_controls_denoise_iterations() -> anyhow::Result<()> {
     let one_step: Vec<f32> = cond.iter().map(|c| c * 0.5).collect();
     assert_eq!(denoised, three_step);
     assert_ne!(denoised, one_step);
+    Ok(())
+}
+
+#[test]
+fn single_pass_pipeline_runs_one_forward() -> anyhow::Result<()> {
+    // vae alone as a single_pass model: image = latent * 2 + 1.
+    let metadata = "\
+pipeline:
+  models:
+    vae:
+      filename: vae.onnx
+      type: vae
+  strategy:
+    kind: single_pass
+    model: vae
+";
+    let dir = fixture_with_metadata("diffusion-single-pass", &["vae.onnx"], metadata)?;
+    let mut engine = Engine::from_pipeline_dir(&dir, EngineConfig::default())?;
+
+    let latent = [1.5f32, -2.0, 3.0, 0.25];
+    let request = empty_request().with_input("vae.latent", Value::from_slice_f32(&latent, &[1, 4])?);
+    let out = engine.run_pipeline(request)?;
+    let image = out.get("vae.image").expect("vae output").to_vec_f32()?;
+    for (got, l) in image.iter().zip(&latent) {
+        assert!((got - (l * 2.0 + 1.0)).abs() < 1e-5, "{got} != {}", l * 2.0 + 1.0);
+    }
+    Ok(())
+}
+
+fn diffusion_metadata_with_guidance(scale: &str) -> String {
+    format!(
+        "\
+pipeline:
+  models:
+    denoiser:
+      filename: denoiser.onnx
+      type: denoiser
+  dataflow:
+    - from: denoiser.denoised
+      to: denoiser.sample
+  strategy:
+    kind: iterative
+    denoiser: denoiser
+    num_steps: 2
+    guidance_scale: {scale}
+"
+    )
+}
+
+#[test]
+fn guidance_scale_one_is_treated_as_no_guidance_and_runs() -> anyhow::Result<()> {
+    let dir = fixture_with_metadata(
+        "diffusion-guidance-one",
+        &["denoiser.onnx"],
+        &diffusion_metadata_with_guidance("1.0"),
+    )?;
+    let mut engine = Engine::from_pipeline_dir(&dir, EngineConfig::default())?;
+    let cond = [2.0f32, 4.0, 6.0, 8.0];
+    let request = empty_request()
+        .with_input("denoiser.sample", Value::from_slice_f32(&[0.0; 4], &[1, 4])?)
+        .with_input("denoiser.cond", Value::from_slice_f32(&cond, &[1, 4])?);
+    // guidance_scale == 1.0 must run (no CFG); 2 steps -> s_2 = cond * 3/4.
+    let out = engine.run_pipeline(request)?;
+    let denoised = out.get("denoiser.denoised").unwrap().to_vec_f32()?;
+    for (got, c) in denoised.iter().zip(&cond) {
+        assert!((got - c * 0.75).abs() < 1e-5, "{got} != {}", c * 0.75);
+    }
+    Ok(())
+}
+
+#[test]
+fn nonunit_guidance_scale_is_rejected_pending_scheduler() -> anyhow::Result<()> {
+    let dir = fixture_with_metadata(
+        "diffusion-guidance-cfg",
+        &["denoiser.onnx"],
+        &diffusion_metadata_with_guidance("7.5"),
+    )?;
+    let mut engine = Engine::from_pipeline_dir(&dir, EngineConfig::default())?;
+    let request = empty_request()
+        .with_input("denoiser.sample", Value::from_slice_f32(&[0.0; 4], &[1, 4])?)
+        .with_input("denoiser.cond", Value::from_slice_f32(&[1.0; 4], &[1, 4])?);
+    let err = match engine.run_pipeline(request) {
+        Ok(_) => panic!("non-unit guidance_scale must be rejected"),
+        Err(e) => e,
+    };
+    assert!(
+        err.to_string().contains("guidance"),
+        "unexpected error: {err}"
+    );
+    Ok(())
+}
+
+#[test]
+fn iterative_threads_multiple_independent_loop_carried_tensors() -> anyhow::Result<()> {
+    // denoiser_multi has two loop-carried states x, y and constant cond:
+    //   x_next = (x + cond) * 0.5   (loop-carried x)
+    //   y_next = (y + x)    * 0.5   (loop-carried y)
+    // With x0 = y0 = 0, cond = c, after 2 steps: x = 3c/4, y = c/4.
+    let metadata = "\
+pipeline:
+  models:
+    denoiser:
+      filename: denoiser_multi.onnx
+      type: denoiser
+  dataflow:
+    - from: denoiser.x_next
+      to: denoiser.x
+    - from: denoiser.y_next
+      to: denoiser.y
+  strategy:
+    kind: iterative
+    denoiser: denoiser
+    num_steps: 2
+";
+    let dir = fixture_with_metadata("diffusion-multi", &["denoiser_multi.onnx"], metadata)?;
+    let mut engine = Engine::from_pipeline_dir(&dir, EngineConfig::default())?;
+
+    let cond = [4.0f32, 8.0, 12.0, 16.0];
+    let request = empty_request()
+        .with_input("denoiser.x", Value::from_slice_f32(&[0.0; 4], &[1, 4])?)
+        .with_input("denoiser.y", Value::from_slice_f32(&[0.0; 4], &[1, 4])?)
+        .with_input("denoiser.cond", Value::from_slice_f32(&cond, &[1, 4])?);
+    let out = engine.run_pipeline(request)?;
+
+    let x = out.get("denoiser.x_next").expect("x_next").to_vec_f32()?;
+    let y = out.get("denoiser.y_next").expect("y_next").to_vec_f32()?;
+    for (got, c) in x.iter().zip(&cond) {
+        assert!((got - c * 0.75).abs() < 1e-5, "x {got} != {}", c * 0.75);
+    }
+    for (got, c) in y.iter().zip(&cond) {
+        assert!((got - c * 0.25).abs() < 1e-5, "y {got} != {}", c * 0.25);
+    }
     Ok(())
 }

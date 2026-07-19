@@ -64,8 +64,37 @@ def build_denoiser(path: Path) -> None:
     save_model(ir.Model(graph, ir_version=8, producer_name="onnx-genai tiny-diffusion"), path)
 
 
+def build_denoiser_multi(path: Path) -> None:
+    # Two independent loop-carried states + one constant conditioning input:
+    #   x_next = (x + cond) * 0.5     (loop-carried x)
+    #   y_next = (y + x)    * 0.5     (loop-carried y, coupled to this step's x)
+    x = tensor_value("x", ir.DataType.FLOAT, [1, 4])
+    y = tensor_value("y", ir.DataType.FLOAT, [1, 4])
+    cond = tensor_value("cond", ir.DataType.FLOAT, [1, 4])
+    half = initializer("half_m", np.array([0.5], dtype=np.float32))
+
+    x_sum = node("Add", [x, cond], "x_sum")
+    x_next = node("Mul", [x_sum.outputs[0], half], "x_next")
+    x_next.outputs[0].type = ir.TensorType(ir.DataType.FLOAT)
+    x_next.outputs[0].shape = ir.Shape([1, 4])
+
+    y_sum = node("Add", [y, x], "y_sum")
+    y_next = node("Mul", [y_sum.outputs[0], half], "y_next")
+    y_next.outputs[0].type = ir.TensorType(ir.DataType.FLOAT)
+    y_next.outputs[0].shape = ir.Shape([1, 4])
+
+    graph = ir.Graph(
+        [x, y, cond],
+        [x_next.outputs[0], y_next.outputs[0]],
+        nodes=[x_sum, x_next, y_sum, y_next],
+        initializers=[half],
+        opset_imports={"": 13},
+        name="tiny_diffusion_denoiser_multi",
+    )
+    save_model(ir.Model(graph, ir_version=8, producer_name="onnx-genai tiny-diffusion"), path)
+
+
 def build_vae(path: Path) -> None:
-    # image = latent * 2 + 1
     latent = tensor_value("latent", ir.DataType.FLOAT, [1, 4])
     two = initializer("two", np.array([2.0], dtype=np.float32))
     one = initializer("one", np.array([1.0], dtype=np.float32))
@@ -151,6 +180,7 @@ def main() -> None:
     output_dir = args.output
     output_dir.mkdir(parents=True, exist_ok=True)
     build_denoiser(output_dir / "denoiser.onnx")
+    build_denoiser_multi(output_dir / "denoiser_multi.onnx")
     build_vae(output_dir / "vae.onnx")
     write_metadata(output_dir / "inference_metadata.yaml")
     if not args.no_validate:

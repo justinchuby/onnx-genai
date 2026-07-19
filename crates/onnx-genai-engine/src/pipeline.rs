@@ -291,14 +291,19 @@ impl PipelineEngine {
                  iterative pipeline seam; it is pending the scheduler-registry follow-up"
             );
         }
-        let mut tensors = request.inputs;
-        self.run_prompt_phase_components(&plan.prompt_components, &mut tensors)?;
+        // `constants` holds external inputs + prompt-phase outputs and is NOT
+        // mutated by the loop, so a denoiser whose output port shares a name
+        // with a conditioning input cannot clobber that conditioning. Denoiser
+        // outputs live in a separate `loop_state`, keyed by output port.
+        let mut constants = request.inputs;
+        self.run_prompt_phase_components(&plan.prompt_components, &mut constants)?;
 
         let denoiser = self
             .models
             .session(&plan.denoiser)
             .with_context(|| format!("pipeline denoiser '{}' was not loaded", plan.denoiser))?;
 
+        let mut loop_state: HashMap<String, Value> = HashMap::new();
         for step in 0..plan.num_steps {
             let mut inputs: Vec<(String, Value)> = Vec::new();
             for info in denoiser.inputs() {
@@ -309,22 +314,28 @@ impl PipelineEngine {
                 {
                     // Loop-carried: step 0 seeds from the external initial
                     // tensor; later steps read the previous step's output.
-                    let source = if step == 0 {
-                        endpoint.clone()
+                    if step == 0 {
+                        constants.get(&endpoint).with_context(|| {
+                            format!("missing iterative pipeline seed '{endpoint}' at step 0")
+                        })?
                     } else {
-                        format!("{}.{}", plan.denoiser, out_port)
-                    };
-                    tensors.get(&source).with_context(|| {
-                        format!("missing iterative pipeline input '{source}' at step {step}")
-                    })?
+                        loop_state.get(out_port).with_context(|| {
+                            format!(
+                                "loop-carried output '{}.{out_port}' was not produced at step {}",
+                                plan.denoiser,
+                                step - 1
+                            )
+                        })?
+                    }
                 } else {
-                    // Constant conditioning: external tensor or routed edge.
+                    // Constant conditioning: external tensor or routed edge,
+                    // always read from the immutable `constants` pool.
                     let routed = plan
                         .dataflow
                         .iter()
                         .find(|edge| edge.to == endpoint)
-                        .and_then(|edge| tensors.get(&edge.from));
-                    tensors
+                        .and_then(|edge| constants.get(&edge.from));
+                    constants
                         .get(&endpoint)
                         .or(routed)
                         .with_context(|| format!("missing pipeline input '{endpoint}'"))?
@@ -339,10 +350,16 @@ impl PipelineEngine {
                 anyhow::anyhow!("ORT denoiser '{}' failed at step {step}: {e}", plan.denoiser)
             })?;
             for (name, value) in denoiser.output_names().iter().zip(outputs) {
-                tensors.insert(format!("{}.{}", plan.denoiser, name), value);
+                loop_state.insert(name.clone(), value);
             }
         }
 
+        // Publish the final denoiser outputs, then run final-phase components
+        // (e.g. a VAE) once over the combined tensor pool.
+        let mut tensors = constants;
+        for (name, value) in loop_state {
+            tensors.insert(format!("{}.{}", plan.denoiser, name), value);
+        }
         self.run_prompt_phase_components(&plan.final_components, &mut tensors)?;
         Ok(tensors)
     }
@@ -721,7 +738,25 @@ impl PipelinePlan {
         if !spec.models.contains_key(&model) {
             anyhow::bail!("pipeline model '{model}' is not declared in models");
         }
-        let prompt_components = prompt_phase_components(spec, &model)?;
+        // Single-pass has no loop and no final stage, so `every_step` and
+        // `final_only` components would be silently dropped — reject them.
+        let mut prompt_components = Vec::new();
+        for component in topological_components(spec)? {
+            if component == model {
+                continue;
+            }
+            match component_phase(spec, &component, &model) {
+                PhaseRunOn::PromptOnly => prompt_components.push(component),
+                PhaseRunOn::OnDemand => {}
+                PhaseRunOn::EveryStep | PhaseRunOn::FinalOnly => anyhow::bail!(
+                    "component '{component}' declares a run_on phase unsupported by a single_pass \
+                     pipeline (only prompt_only / on_demand components are allowed)"
+                ),
+                PhaseRunOn::Other(value) => anyhow::bail!(
+                    "unsupported phase '{value}' for pipeline component '{component}'"
+                ),
+            }
+        }
         Ok(Self::SinglePass(SinglePassPlan {
             model,
             prompt_components,
@@ -767,7 +802,11 @@ impl PipelinePlan {
             match component_phase(spec, &component, &denoiser) {
                 PhaseRunOn::PromptOnly => prompt_components.push(component),
                 PhaseRunOn::FinalOnly => final_components.push(component),
-                PhaseRunOn::EveryStep | PhaseRunOn::OnDemand => {}
+                PhaseRunOn::OnDemand => {}
+                PhaseRunOn::EveryStep => anyhow::bail!(
+                    "component '{component}' declares run_on: every_step, but running a \
+                     non-denoiser component inside the iterative loop is not yet supported"
+                ),
                 PhaseRunOn::Other(value) => anyhow::bail!(
                     "unsupported phase '{value}' for pipeline component '{component}'"
                 ),

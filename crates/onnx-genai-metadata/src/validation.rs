@@ -77,6 +77,16 @@ pub fn validate_pipeline_spec(spec: &PipelineSpec) -> Result<(), PipelineValidat
         adjacency.entry(name.as_str()).or_default();
     }
 
+    // A same-component self-edge (`A.x -> A.y`) is a legal loop-carried temporal
+    // dependency ONLY for the denoiser of an iterative strategy; anywhere else it
+    // is treated as a cycle. Collect the components allowed to have self-edges.
+    let mut iterative_denoisers: BTreeSet<&str> = BTreeSet::new();
+    collect_iterative_denoisers(&spec.strategy, &mut iterative_denoisers);
+
+    // Each destination port may be fed by at most one edge; multiple producers
+    // into one input are ambiguous (order-dependent) and rejected.
+    let mut seen_destinations: BTreeSet<&str> = BTreeSet::new();
+
     for edge in &spec.dataflow {
         match parse_endpoint(&edge.from) {
             Some((component, port)) => {
@@ -120,14 +130,21 @@ pub fn validate_pipeline_spec(spec: &PipelineSpec) -> Result<(), PipelineValidat
             )),
         }
 
+        if !seen_destinations.insert(edge.to.as_str()) {
+            errors.push(format!(
+                "dataflow has multiple edges into the same destination port: {}",
+                edge.to
+            ));
+        }
+
         if let (Some((from, _)), Some((to, _))) =
             (parse_endpoint(&edge.from), parse_endpoint(&edge.to))
             && spec.models.contains_key(from)
             && spec.models.contains_key(to)
-            // A self-edge (`A.x -> A.y`) is a loop-carried temporal dependency
-            // (e.g. a diffusion denoiser fed its previous step's output), not a
-            // same-step DAG cycle; it is excluded from the acyclic check.
-            && from != to
+            // A self-edge is excluded from the acyclic check only when it is an
+            // iterative denoiser's loop-carried feedback; a self-edge on any
+            // other component is a genuine (unsupported) cycle.
+            && !(from == to && iterative_denoisers.contains(from))
         {
             adjacency.entry(from).or_default().insert(to);
         }
@@ -157,6 +174,24 @@ fn parse_endpoint(endpoint: &str) -> Option<(&str, &str)> {
         return None;
     }
     Some((component, port))
+}
+
+/// Collect the components that are the `denoiser` of some (possibly nested)
+/// iterative strategy — the only components permitted a loop-carried self-edge.
+fn collect_iterative_denoisers<'a>(strategy: &'a PipelineStrategy, out: &mut BTreeSet<&'a str>) {
+    match strategy.kind {
+        PipelineStrategyKind::Iterative => {
+            if let Some(denoiser) = strategy.denoiser.as_deref() {
+                out.insert(denoiser);
+            }
+        }
+        PipelineStrategyKind::Composite => {
+            for stage in &strategy.stages {
+                collect_iterative_denoisers(&stage.strategy, out);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn validate_strategy(

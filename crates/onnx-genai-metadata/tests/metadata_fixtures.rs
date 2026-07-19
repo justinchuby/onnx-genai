@@ -206,6 +206,74 @@ fn pipeline_validation_accepts_iterative_denoiser_self_edge() {
 }
 
 #[test]
+fn pipeline_validation_rejects_self_edge_outside_iterative_denoiser() {
+    // A self-edge on a component that is NOT an iterative denoiser has no loop
+    // semantics and must be rejected as a cycle.
+    let yaml = "
+pipeline:
+  models:
+    encoder:
+      filename: encoder.onnx
+      type: encoder
+    decoder:
+      filename: decoder.onnx
+      type: decoder
+  dataflow:
+    - from: encoder.state
+      to: encoder.state
+  strategy:
+    kind: autoregressive
+    decoder: decoder
+";
+    let metadata: onnx_genai_metadata::InferenceMetadata =
+        serde_yaml::from_str(yaml).expect("parses");
+    let spec = metadata.pipeline.expect("pipeline section");
+    let err = validate_pipeline_spec(&spec).expect_err("non-denoiser self-edge is rejected");
+    assert!(
+        err.errors.iter().any(|e| e.contains("contains a cycle")),
+        "unexpected errors: {:?}",
+        err.errors
+    );
+}
+
+#[test]
+fn pipeline_validation_rejects_duplicate_destination_edges() {
+    // Two producers feeding one destination port is ambiguous and rejected.
+    let yaml = "
+pipeline:
+  models:
+    encoder_a:
+      filename: a.onnx
+      type: encoder
+    encoder_b:
+      filename: b.onnx
+      type: encoder
+    decoder:
+      filename: decoder.onnx
+      type: decoder
+  dataflow:
+    - from: encoder_a.hidden
+      to: decoder.encoder_hidden_states
+    - from: encoder_b.hidden
+      to: decoder.encoder_hidden_states
+  strategy:
+    kind: autoregressive
+    decoder: decoder
+";
+    let metadata: onnx_genai_metadata::InferenceMetadata =
+        serde_yaml::from_str(yaml).expect("parses");
+    let spec = metadata.pipeline.expect("pipeline section");
+    let err = validate_pipeline_spec(&spec).expect_err("duplicate destination is rejected");
+    assert!(
+        err.errors
+            .iter()
+            .any(|e| e.contains("multiple edges into the same destination")),
+        "unexpected errors: {:?}",
+        err.errors
+    );
+}
+
+#[test]
 fn pipeline_vision_config_round_trips_via_json() {
     use onnx_genai_metadata::PipelineVisionConfig;
 
