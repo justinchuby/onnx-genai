@@ -17,6 +17,9 @@ Environment:
 import sys, time, os, json
 import onnxruntime_genai as og
 
+if len(sys.argv) < 2:
+    sys.exit("usage: python oga_bench.py <model_dir> [prompt] [max_new_tokens]")
+
 model_path = sys.argv[1]
 prompt = sys.argv[2] if len(sys.argv) > 2 else "Explain the theory of relativity in simple terms."
 max_new = int(sys.argv[3]) if len(sys.argv) > 3 else 128
@@ -65,8 +68,11 @@ for _ in range(runs):
     total_dt += dt
     last_seq = seq
 
-tps = total_tok / total_dt
-print(f"wall: {total_dt*1000:.3f} ms over {total_tok} tokens ({runs} run(s)) -> {tps:.2f} tok/s, {total_dt/total_tok*1e6:.2f} us/token")
+if total_tok == 0 or total_dt == 0.0:
+    print(f"wall: {total_dt*1000:.3f} ms over {total_tok} tokens ({runs} run(s)) -> no tokens decoded, nothing to measure")
+else:
+    tps = total_tok / total_dt
+    print(f"wall: {total_dt*1000:.3f} ms over {total_tok} tokens ({runs} run(s)) -> {tps:.2f} tok/s, {total_dt/total_tok*1e6:.2f} us/token")
 try:
     text = tokenizer.decode(last_seq[prompt_len:])
     print("--- generated text (coherence check) ---")

@@ -40,8 +40,9 @@ $env:OGA_WARMUPS = "$Warmups"
 $env:OGA_RUNS = "$Runs"
 
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$repoRoot = Split-Path -Parent (Split-Path -Parent $scriptDir)
 $ogaBench = Join-Path $scriptDir "oga_bench.py"
-$profileDecode = ".\target\release\profile_decode.exe"
+$profileDecode = Join-Path $repoRoot "target\release\profile_decode.exe"
 
 function Cool { if ($CooldownSeconds -gt 0) { Start-Sleep -Seconds $CooldownSeconds } }
 
