@@ -4,13 +4,14 @@ Tracks implementation status of `docs/DESIGN.md` (§1–§40). Updated as work l
 
 **Published:** `onnx-genai` v0.1.0 + 8 sub-crates on crates.io; the `onnx-runtime-*` layer (including `onnx-runtime-tracer`) is released as v0.1.0-dev.1. CI (fmt/build/test/**blocking clippy**) + scheduled `cargo-audit`. Coverage ~77% line.
 
-_Last updated: 2026-07-19T07:42:20Z — CSA Phase B complete (B0–B7); Mobius-head E2E harness landed._
+_Last updated: 2026-07-19T12:40Z — ONNX backend conformance refreshed; CUDA drift root-caused._
 
-**Current `origin/main` HEAD:** `d81b96a`.
+**Current `origin/main` HEAD:** `ec5118c`.
 
 
 ## Current tiered-memory and interoperability milestones
 
+- **2026-07-19 conformance + CUDA drift ✅ recorded:** ONNX backend-test conformance was refreshed to **875/1,765** pure-Rust CPU node cases passing at `ec5118c` (890 failing; CUDA variants skipped). The CUDA token-index-10 CPU/GPU numeric drift was confirmed as SkipSimplifiedLayerNorm RMS FMA-contraction, already fixed by `de3c556` and verified through 64 tokens at `ccf994c`. **Backlog:** `onnx-genai-engine --features cuda,native-backend` now exposes a cudarc feature-unification build conflict (`cuda-12060` from `onnx-genai-ort` vs `cuda-13000` from `onnx-runtime-ep-cuda`).
 - **Zero-copy weight streaming ✅ DONE:** aligned mmap-backed external initializers are borrowed rather than copied; borrowed ownership and initializer-producer validation close the read-only mmap soundness boundary.
 - **DLPack zero-copy export ✅ DONE:** `onnx-runtime-dlpack` and Python `NxrtValue` export CPU tensor storage through standard DLPack ownership capsules; public FFI validation/hardening is complete.
 - **KV-insertion architecture evaluation ✅ DONE (decision-ready):** for Mobius exports, Phase 1 is functional GQA by dropping `past_present_share_buffer`; the paged-attention successor is feature-gated on correctness and M=1 latency.
