@@ -216,6 +216,7 @@ End-to-end image (full pipeline through onnx-genai vs diffusers): `diffusion_ima
   `mobius convert-comfyui --controlnet NAME=PATH` resolves it; `controlnet_cond` is an external
   denoiser input (like SDXL `time_ids`) shared across the CFG cond/uncond passes. Validated
   (`scripts/controlnet_e2e.py`): a fused export matches diffusers to 5.8e-6 and differs from base by
-  0.45 (ControlNet takes effect). *Remaining:* a control-image-aware `run_comfyui.py` driver; SDXL
-  ControlNet; inpainting.
+  0.45 (ControlNet takes effect). **`run_comfyui.py` renders ControlNet + LoRA workflows** (`--control-image`,
+  `--lora`/`--controlnet NAME=PATH`) — verified a ControlNet workflow renders end-to-end. *Remaining:*
+  SDXL ControlNet; inpainting.
 - **img2img** is supported; inpainting (mask) is not.
