@@ -499,52 +499,93 @@ function render() {
   const vizMount = el("div");
   app.appendChild(vizMount);
   const runPanel = el("div", "panel");
-  runPanel.style.display = "none";
-  runPanel.appendChild(el("h2", undefined, "3 · Run"));
+  runPanel.appendChild(el("h2", undefined, "3 · Prompt & properties"));
+  runPanel.appendChild(
+    el(
+      "div",
+      "sub",
+      currentTab === "language"
+        ? "Type a prompt to seed the sequence; the model un-masks the rest. Empty prompt = fully unconditional."
+        : "Edit any property (ComfyUI-style), then render. Steps, CFG, seed, prompt and size all take effect live."
+    )
+  );
 
-  // Image tab: prompt + generation controls that drive the real SD pipeline.
-  let promptInput: HTMLTextAreaElement | null = null;
-  let negativeInput: HTMLInputElement | null = null;
-  let stepsInput: HTMLInputElement | null = null;
-  let guidanceInput: HTMLInputElement | null = null;
-  let seedInput: HTMLInputElement | null = null;
+  // The editable property form (references kept so the run handler can read it).
+  const form = el("div", "prop-grid");
+  const inputs: Record<string, HTMLInputElement | HTMLTextAreaElement> = {};
+  const addField = (
+    key: string,
+    labelText: string,
+    kind: "text" | "number" | "textarea",
+    o: { value?: unknown; placeholder?: string; min?: number; step?: number; full?: boolean } = {}
+  ) => {
+    const field = el("label", "prop-field" + (o.full || kind === "textarea" ? " full" : ""));
+    field.appendChild(el("span", "prop-label", labelText));
+    const input =
+      kind === "textarea"
+        ? (document.createElement("textarea") as HTMLTextAreaElement)
+        : (document.createElement("input") as HTMLInputElement);
+    if (kind !== "textarea") (input as HTMLInputElement).type = kind;
+    if (o.value !== undefined && o.value !== null) input.value = String(o.value);
+    if (o.placeholder) input.placeholder = o.placeholder;
+    if (kind === "number") {
+      if (o.min != null) (input as HTMLInputElement).min = String(o.min);
+      if (o.step != null) (input as HTMLInputElement).step = String(o.step);
+    }
+    field.appendChild(input);
+    form.appendChild(field);
+    inputs[key] = input;
+    return input;
+  };
+
+  if (currentTab === "language") {
+    addField("prompt", "Prompt (seed prefix)", "textarea", {
+      placeholder: "e.g. The meaning of life is",
+    });
+    addField("seqLen", "Sequence length", "number", {
+      value: 64,
+      min: 1,
+      step: 1,
+    });
+  } else {
+    addField("prompt", "Prompt", "textarea", {
+      placeholder: "e.g. a photograph of an astronaut riding a horse",
+    });
+    addField("negative", "Negative prompt", "textarea", {
+      placeholder: "e.g. blurry, low quality",
+    });
+    addField("steps", "Steps", "number", { min: 1, step: 1 });
+    addField("guidance", "Guidance (CFG)", "number", { min: 0, step: 0.5 });
+    addField("seed", "Seed", "number", { step: 1 });
+    addField("size", "Size (px, square)", "number", { min: 64, step: 64 });
+  }
+  runPanel.appendChild(form);
+  const bakedNote = el("div", "note");
+  runPanel.appendChild(bakedNote);
+
+  // Prefill image properties from the exported package's workflow.json.
   if (currentTab === "image") {
-    const promptField = el("div", "field");
-    promptField.appendChild(el("label", "field-label", "Prompt"));
-    promptInput = el("textarea") as HTMLTextAreaElement;
-    promptInput.className = "prompt-input";
-    promptInput.placeholder = "a photograph of an astronaut riding a horse";
-    promptInput.value = "a photograph of an astronaut riding a horse";
-    promptField.appendChild(promptInput);
-    runPanel.appendChild(promptField);
-
-    const negField = el("div", "field");
-    negField.appendChild(el("label", "field-label", "Negative prompt"));
-    negativeInput = el("input") as HTMLInputElement;
-    negativeInput.type = "text";
-    negativeInput.className = "prompt-input";
-    negativeInput.placeholder = "(optional) blurry, low quality";
-    negField.appendChild(negativeInput);
-    runPanel.appendChild(negField);
-
-    const numRow = el("div", "row controls-row");
-    const mkNumber = (label: string, value: string, min: string, max: string, step: string) => {
-      const field = el("div", "field field-inline");
-      field.appendChild(el("label", "field-label", label));
-      const input = el("input") as HTMLInputElement;
-      input.type = "number";
-      input.min = min;
-      input.max = max;
-      input.step = step;
-      input.value = value;
-      field.appendChild(input);
-      numRow.appendChild(field);
-      return input;
-    };
-    stepsInput = mkNumber("Steps", "25", "1", "100", "1");
-    guidanceInput = mkNumber("Guidance", "7.5", "0", "30", "0.5");
-    seedInput = mkNumber("Seed", "0", "0", "999999", "1");
-    runPanel.appendChild(numRow);
+    fetch("/api/image/settings")
+      .then((r) => r.json())
+      .then((s) => {
+        const st = s.settings;
+        if (!st) return;
+        const set = (k: string, v: unknown) => {
+          if (v !== undefined && v !== null && inputs[k]) inputs[k].value = String(v);
+        };
+        set("prompt", st.prompt);
+        set("negative", st.negative);
+        set("steps", st.steps);
+        set("guidance", st.guidance);
+        set("seed", st.seed);
+        set("size", st.size);
+        bakedNote.textContent = `package: ${s.package ?? "?"} · from-scratch Mobius SD 1.x`;
+      })
+      .catch(() => {
+        bakedNote.textContent = "set ONNX_GENAI_SD_PACKAGE to a package with a workflow.json (see README)";
+      });
+  } else {
+    bakedNote.textContent = "mask-token un-masking · scheduler baked at export";
   }
 
   const runRow = el("div", "row");
@@ -558,18 +599,39 @@ function render() {
   runPanel.appendChild(runErr);
   app.appendChild(runPanel);
 
-  // The image tab renders straight from the configured SD package, so expose
-  // the run controls immediately without requiring a pasted config first.
-  if (currentTab === "image") runPanel.style.display = "";
+  // Collect the current form values as a request body for the run endpoints.
+  const num = (k: string): number | undefined => {
+    const raw = inputs[k]?.value?.trim();
+    if (!raw) return undefined;
+    const n = Number(raw);
+    return Number.isFinite(n) ? n : undefined;
+  };
+  const runOpts = (): Record<string, unknown> => {
+    if (currentTab === "language") {
+      return { prompt: inputs.prompt.value, seqLen: num("seqLen") ?? 64 };
+    }
+    const size = num("size");
+    const o: Record<string, unknown> = {
+      prompt: inputs.prompt.value,
+      negative: inputs.negative.value,
+      steps: num("steps"),
+      guidance: num("guidance"),
+      seed: num("seed"),
+    };
+    if (size !== undefined) {
+      o.width = size;
+      o.height = size;
+    }
+    return o;
+  };
 
   const showViz = (meta: Metadata) => {
     loadedMeta = meta;
     vizMount.innerHTML = "";
     const p = el("div", "panel");
-    p.appendChild(el("h2", undefined, "2 · Current pipeline config"));
+    p.appendChild(el("h2", undefined, "Pipeline config"));
     vizMount.appendChild(p);
     vizMount.appendChild(renderPipeline(meta));
-    runPanel.style.display = "";
   };
 
   const setErr = (node: HTMLElement, msg: string) => {
@@ -608,12 +670,8 @@ function render() {
       runBtn.disabled = true;
       runBtn.textContent = "Running…";
       try {
-        const res = await postText("/api/run/language", "{}");
+        const res = await postText("/api/run/language", JSON.stringify(runOpts()));
         if (res.metadata) showViz(res.metadata as Metadata);
-        else {
-          loadedMeta = null;
-          runPanel.style.display = "";
-        }
         renderLanguageRun(runOut, res.frames as Frame[], res.maskId, res.perf as Perf);
       } catch (e) {
         setErr(runErr, String((e as Error).message));
@@ -631,18 +689,11 @@ function render() {
     runBtn.textContent = "Running…";
     try {
       if (currentTab === "language") {
-        const res = await postText("/api/run/language", "{}");
+        const res = await postText("/api/run/language", JSON.stringify(runOpts()));
         if (res.metadata && !loadedMeta) showViz(res.metadata as Metadata);
         renderLanguageRun(runOut, res.frames as Frame[], res.maskId, res.perf as Perf);
       } else {
-        const payload = {
-          prompt: promptInput?.value ?? "",
-          negative: negativeInput?.value ?? "",
-          steps: stepsInput ? Number(stepsInput.value) : undefined,
-          guidance: guidanceInput ? Number(guidanceInput.value) : undefined,
-          seed: seedInput ? Number(seedInput.value) : undefined,
-        };
-        const res = await postText("/api/run/image", JSON.stringify(payload));
+        const res = await postText("/api/run/image", JSON.stringify(runOpts()));
         runOut.innerHTML = "";
         if (res.metadata) showViz(res.metadata as Metadata);
         renderImageRun(runOut, (res.frames as ImageFrame[]) ?? [], (res.image as string) ?? null, {

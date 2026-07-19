@@ -10,8 +10,13 @@ categories = ["science", "text-processing"]
 
 [features]
 default = []
-cuda = ["onnx-genai-ort/cuda"]
-# CUDA API version passthroughs, forwarded to `onnx-genai-ort`.
+# The CLI's CUDA EP is pinned to CUDA 13.0, matching `onnx-genai-engine` (whose
+# native CUDA EP requires 13.0). We disable `onnx-genai-ort`'s default version
+# feature (`cuda-12060`) below so only one cudarc binding version is ever active;
+# mixing versions makes cudarc's generated bindings fail to compile.
+cuda = ["onnx-genai-ort/cuda", "onnx-genai-ort/cuda-13000"]
+# CUDA API version passthroughs, forwarded to `onnx-genai-ort`. Do not combine a
+# 12.x passthrough with `cuda`, which already selects 13.0.
 cuda-12060 = ["onnx-genai-ort/cuda-12060"]
 cuda-12080 = ["onnx-genai-ort/cuda-12080"]
 cuda-12090 = ["onnx-genai-ort/cuda-12090"]
@@ -22,7 +27,7 @@ onnx-genai-metadata = { workspace = true }
 onnx-genai-kv = { workspace = true }
 onnx-genai-scheduler = { workspace = true }
 onnx-genai-engine = { workspace = true }
-onnx-genai-ort = { workspace = true }
+onnx-genai-ort = { path = "../onnx-genai-ort", version = "=0.1.0-dev.2", default-features = false }
 onnx-genai-preprocess = { workspace = true }
 onnx-genai-comfyui-config = { workspace = true }
 anyhow = { workspace = true }

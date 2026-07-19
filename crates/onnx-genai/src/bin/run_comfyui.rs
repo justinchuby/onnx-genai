@@ -20,7 +20,8 @@
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use onnx_genai::engine::{
-    Engine, EngineConfig, GeneratePrompt, GenerateRequest, PipelineGenerateRequest,
+    Engine, EngineConfig, GeneratePrompt, GenerateRequest, IterativeOverrides,
+    PipelineGenerateRequest,
 };
 use onnx_genai::ort::{Environment, Session, SessionOptions, Value};
 use onnx_genai_comfyui_config::parse_workflow_file;
@@ -332,7 +333,13 @@ fn main() -> Result<()> {
         );
     }
 
-    let outputs = engine.run_pipeline(request)?;
+    let outputs = engine.run_pipeline(
+        request.with_iterative_overrides(IterativeOverrides {
+            num_steps: Some(num_steps),
+            guidance_scale: Some(workflow.cfg as f32),
+            start_step: None,
+        }),
+    )?;
     let image_value = outputs
         .get("vae.image")
         .context("pipeline did not produce 'vae.image'")?;

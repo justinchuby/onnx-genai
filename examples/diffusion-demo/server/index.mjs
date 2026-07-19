@@ -124,7 +124,7 @@ function runPipelineWithDump(packageDir, outputEndpoint, inputs) {
 // ---- GPT-2 byte-level tokenizer decode (dependency-free) ----
 // Reverses the standard GPT-2 bytes<->unicode table so we can turn token ids
 // back into human-readable text for the language-diffusion animation.
-function gpt2ByteDecoder() {
+function gpt2ByteTables() {
   const bs = [];
   for (let i = 33; i <= 126; i++) bs.push(i);
   for (let i = 161; i <= 172; i++) bs.push(i);
@@ -139,11 +139,15 @@ function gpt2ByteDecoder() {
     }
   }
   const decoder = new Map(); // unicode codepoint -> original byte
-  for (let i = 0; i < bs.length; i++) decoder.set(cs[i], bs[i]);
-  return decoder;
+  const encoder = new Array(256); // byte -> unicode char
+  for (let i = 0; i < bs.length; i++) {
+    decoder.set(cs[i], bs[i]);
+    encoder[bs[i]] = String.fromCharCode(cs[i]);
+  }
+  return { decoder, encoder };
 }
 
-const tokenizerCache = new Map(); // packageDir -> { idToToken, byteDecoder } | null
+const tokenizerCache = new Map(); // packageDir -> tokenizer | null
 function loadTokenizer(packageDir) {
   if (tokenizerCache.has(packageDir)) return tokenizerCache.get(packageDir);
   let entry = null;
@@ -154,7 +158,14 @@ function loadTokenizer(packageDir) {
       const vocab = tk?.model?.vocab ?? {};
       const idToToken = [];
       for (const [tokenStr, id] of Object.entries(vocab)) idToToken[id] = tokenStr;
-      entry = { idToToken, byteDecoder: gpt2ByteDecoder() };
+      const { decoder, encoder } = gpt2ByteTables();
+      const bpeRanks = new Map();
+      const merges = tk?.model?.merges ?? [];
+      merges.forEach((m, i) => {
+        const pair = Array.isArray(m) ? m.join(" ") : m;
+        bpeRanks.set(pair, i);
+      });
+      entry = { vocab, idToToken, byteDecoder: decoder, byteEncoder: encoder, bpeRanks };
     } catch {
       entry = null;
     }
@@ -177,6 +188,59 @@ function decodeToken(tokenizer, id) {
     bytes.push(b);
   }
   return Buffer.from(bytes).toString("utf8");
+}
+
+// Apply GPT-2 BPE merges to a byte-level-encoded token string, returning the
+// list of subword pieces (in vocab).
+function bpeMerge(token, ranks, cache) {
+  const cached = cache.get(token);
+  if (cached) return cached;
+  let word = Array.from(token);
+  while (word.length > 1) {
+    let minRank = Infinity;
+    let minIndex = -1;
+    for (let i = 0; i < word.length - 1; i++) {
+      const rank = ranks.get(`${word[i]} ${word[i + 1]}`);
+      if (rank !== undefined && rank < minRank) {
+        minRank = rank;
+        minIndex = i;
+      }
+    }
+    if (minIndex < 0) break;
+    const merged = [];
+    for (let i = 0; i < word.length; ) {
+      if (i === minIndex) {
+        merged.push(word[i] + word[i + 1]);
+        i += 2;
+      } else {
+        merged.push(word[i]);
+        i += 1;
+      }
+    }
+    word = merged;
+  }
+  cache.set(token, word);
+  return word;
+}
+
+// Encode text to GPT-2 token ids (byte-level pre-tokenization + BPE). Returns
+// null when the tokenizer is unavailable.
+function encodeGpt2(tokenizer, text) {
+  if (!tokenizer || !tokenizer.bpeRanks) return null;
+  const pattern =
+    /'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+/gu;
+  const ids = [];
+  const cache = new Map();
+  for (const match of text.matchAll(pattern)) {
+    const bytes = Buffer.from(match[0], "utf8");
+    let piece = "";
+    for (const b of bytes) piece += tokenizer.byteEncoder[b];
+    for (const sub of bpeMerge(piece, tokenizer.bpeRanks, cache)) {
+      const id = tokenizer.vocab[sub];
+      if (id !== undefined) ids.push(id);
+    }
+  }
+  return ids;
 }
 
 // Map an SD-1.5 latent ([1,4,H,W] f32) to a small RGB preview using the
@@ -212,24 +276,40 @@ function latentToRgbPreview(data, shape) {
 }
 
 
-// Language diffusion: seed an all-mask sequence and run masked_diffusion.
-function runLanguage() {
+// Language diffusion: seed a sequence (optional prompt prefix + masks) and run
+// masked_diffusion. Non-mask prefix tokens are held fixed by the scheduler
+// (LLaDA-style infilling), so a prompt conditions the generated continuation.
+function runLanguage(opts = {}) {
   const metaPath = join(LM_PACKAGE, "inference_metadata.yaml");
   const metaText = existsSync(metaPath) ? readFileSync(metaPath, "utf8") : "";
   const maskId = Number(/mask_token_id:\s*(-?\d+)/.exec(metaText)?.[1] ?? 1);
   const numSteps = Number(/num_steps:\s*(\d+)/.exec(metaText)?.[1] ?? 4);
-  // Sequence length: the fixture is 4; a real LM would size this from the prompt.
-  const seqLen = Number(process.env.ONNX_GENAI_LM_SEQ_LEN || 4);
+  // Sequence length: overridable per-request; falls back to the launch env.
+  const envSeqLen = Number(process.env.ONNX_GENAI_LM_SEQ_LEN || 4);
+  const seqLen = Math.max(1, Math.floor(Number(opts.seqLen) || envSeqLen));
+  const tokenizer = loadTokenizer(LM_PACKAGE);
+
+  // Encode the optional prompt into a fixed prefix; the rest stays masked.
+  let promptIds = [];
+  const promptText = typeof opts.prompt === "string" ? opts.prompt.trim() : "";
+  if (promptText) {
+    promptIds = encodeGpt2(tokenizer, promptText) ?? [];
+    // Always leave at least one position to generate.
+    if (promptIds.length > seqLen - 1) promptIds = promptIds.slice(0, seqLen - 1);
+  }
+
   const seedPath = join(mkdtempSync(join(tmpdir(), "ogseed-")), "seed.i64");
   const buf = Buffer.alloc(seqLen * 8);
-  for (let i = 0; i < seqLen; i++) buf.writeBigInt64LE(BigInt(maskId), i * 8);
+  for (let i = 0; i < seqLen; i++) {
+    const tokenId = i < promptIds.length ? promptIds[i] : maskId;
+    buf.writeBigInt64LE(BigInt(tokenId), i * 8);
+  }
   writeFileSync(seedPath, buf);
   const { frames, timing, stages } = runPipelineWithDump(LM_PACKAGE, "denoiser.input_ids", [
     `denoiser.input_ids:i64:1,${seqLen}:${seedPath}`,
   ]);
   // Decode token ids -> readable text so the UI can animate real words filling
   // in (masked positions stay null). Falls back to numeric ids if no tokenizer.
-  const tokenizer = loadTokenizer(LM_PACKAGE);
   const framesWithText = frames.map((f) => {
     const data = f.data.slice(-seqLen);
     const text = data.map((v) => (v === maskId ? null : decodeToken(tokenizer, v)));
@@ -260,7 +340,7 @@ function runLanguage() {
         stepMs: frames.map((f) => f.step_ms ?? null),
       }
     : { stages, stepMs: frames.map((f) => f.step_ms ?? null) };
-  return { kind: "language", maskId, numSteps, seqLen, metadata, frames: framesWithText, decoded, tokenizer: !!tokenizer, perf };
+  return { kind: "language", maskId, numSteps, seqLen, promptLength: promptIds.length, prompt: promptText, metadata, frames: framesWithText, decoded, tokenizer: !!tokenizer, perf };
 }
 
 // Render a full image (text-encode + denoise + VAE decode -> PNG) with
@@ -277,6 +357,14 @@ function runImage(options) {
   const steps = clampInt(options.steps, 1, 100, 25);
   const guidance = clampFloat(options.guidance, 0, 30, 7.5);
   const seed = clampInt(options.seed, 0, Number.MAX_SAFE_INTEGER, 0);
+  // Snap the requested size to a multiple of 8 (VAE downscale); render_sd
+  // defaults to 512 (the SD 1.x native size) when omitted.
+  const snap8 = (v, fallback) => {
+    const n = clampInt(v, 64, 1024, fallback);
+    return Math.round(n / 8) * 8;
+  };
+  const width = snap8(options.width, 512);
+  const height = snap8(options.height, 512);
 
   const bin = findBinary("render_sd");
   const outPng = join(mkdtempSync(join(tmpdir(), "ogimg-")), "out.png");
@@ -290,6 +378,8 @@ function runImage(options) {
       "--negative", negative,
       "--steps", String(steps),
       "--guidance", String(guidance),
+      "--width", String(width),
+      "--height", String(height),
       "--seed", String(seed),
       "--output", outPng,
     ],
@@ -366,6 +456,8 @@ function runImage(options) {
     steps,
     guidance,
     seed,
+    width,
+    height,
     metadata: existsSync(metaPath) ? YAML.parse(readFileSync(metaPath, "utf8")) : null,
     image,
     frames,
@@ -402,7 +494,30 @@ const server = createServer(async (req, res) => {
       return json(res, 200, { metadata: YAML.parse(await readBody(req)) });
     }
     if (req.url === "/api/run/language" && req.method === "POST") {
-      return json(res, 200, runLanguage());
+      const body = await readBody(req);
+      let opts = {};
+      try {
+        opts = body ? JSON.parse(body) : {};
+      } catch {
+        opts = {};
+      }
+      return json(res, 200, runLanguage(opts));
+    }
+    if (req.url === "/api/image/settings" && req.method === "GET") {
+      if (!SD_PACKAGE) return json(res, 400, { error: "no Stable Diffusion package configured; set ONNX_GENAI_SD_PACKAGE (see README)" });
+      // render_sd takes its parameters directly (no workflow.json), so expose
+      // sensible defaults for the UI to prefill.
+      return json(res, 200, {
+        package: SD_PACKAGE,
+        settings: {
+          prompt: "a photograph of an astronaut riding a horse, highly detailed",
+          negative: "",
+          steps: 25,
+          guidance: 7.5,
+          seed: 0,
+          size: 512,
+        },
+      });
     }
     if (req.url === "/api/run/image" && req.method === "POST") {
       if (!SD_PACKAGE) {
