@@ -342,6 +342,55 @@ pipeline:
 }
 
 #[test]
+fn iterative_euler_scheduler_scales_input_and_steps() -> anyhow::Result<()> {
+    // denoiser_step outputs `denoised = sample + t`. Euler scales the loop input
+    // by 1/sqrt(sigma^2+1) BEFORE the denoiser, so with t=0 the model output
+    // (eps) = sample/sqrt(2). num_train=2, beta=0.5 (linear), num_steps=1 gives
+    // sigmas=[1, 0]; step advances the RAW sample: x + eps*(0-1).
+    //   scaled  = 1/sqrt(2)
+    //   eps     = 1/sqrt(2)              (published under the output port)
+    //   sample' = 1 + (1/sqrt(2))*(-1) = 1 - 1/sqrt(2)   (published under input port)
+    let metadata = "\
+pipeline:
+  models:
+    denoiser:
+      filename: denoiser_step.onnx
+      type: denoiser
+  dataflow:
+    - from: denoiser.denoised
+      to: denoiser.sample
+  strategy:
+    kind: iterative
+    denoiser: denoiser
+    num_steps: 1
+    timestep_input: t
+    scheduler_config:
+      kind: euler
+      num_train_timesteps: 2
+      beta_start: 0.5
+      beta_end: 0.5
+      beta_schedule: linear
+";
+    let dir = fixture_with_metadata("diffusion-euler", &["denoiser_step.onnx"], metadata)?;
+    let mut engine = Engine::from_pipeline_dir(&dir, EngineConfig::default())?;
+    let request =
+        empty_request().with_input("denoiser.sample", Value::from_slice_f32(&[1.0; 4], &[1, 4])?);
+    let out = engine.run_pipeline(request)?;
+
+    let inv_sqrt2 = 1.0 / std::f32::consts::SQRT_2;
+    let sample = out.get("denoiser.sample").expect("scheduled sample").to_vec_f32()?;
+    let expected_sample = 1.0 - inv_sqrt2;
+    for got in &sample {
+        assert!((got - expected_sample).abs() < 1e-5, "sample {got} != {expected_sample}");
+    }
+    let eps = out.get("denoiser.denoised").expect("model output").to_vec_f32()?;
+    for got in &eps {
+        assert!((got - inv_sqrt2).abs() < 1e-5, "eps {got} != {inv_sqrt2}");
+    }
+    Ok(())
+}
+
+#[test]
 fn iterative_ddim_scheduler_transforms_loop_carried_sample() -> anyhow::Result<()> {
     // denoiser_step outputs `denoised = sample + t`. With timestep_input=t and
     // no explicit schedule, step 0 injects t=0, so the model output (treated as
@@ -403,7 +452,7 @@ pipeline:
     denoiser: denoiser
     num_steps: 2
     scheduler_config:
-      kind: euler
+      kind: no_such_scheduler
 ";
     let dir = fixture_with_metadata("diffusion-bad-scheduler", &["denoiser.onnx"], metadata)?;
     let err = Engine::from_pipeline_dir(&dir, EngineConfig::default())

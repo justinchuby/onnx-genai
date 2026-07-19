@@ -361,19 +361,71 @@ impl PipelineEngine {
                 .map(|ts| ts[step])
                 .unwrap_or(step as f32);
 
-            // Conditional pass (all inputs as declared).
-            let (cond_out, sample_in) =
-                self.run_denoiser_pass(denoiser, plan, &constants, &carried, step, timestep, None)?;
+            // Raw (unscaled) loop-carried sample feeding each loop input this
+            // step: the seed at step 0, otherwise the value carried from the
+            // previous step. The scheduler's `step` consumes these raw samples.
+            let mut raw_samples: HashMap<String, Value> = HashMap::new();
+            for (_, in_port) in &plan.loop_edges {
+                let raw = if step == 0 {
+                    let endpoint = format!("{}.{}", plan.denoiser, in_port);
+                    constants.get(&endpoint).with_context(|| {
+                        format!("missing iterative pipeline seed '{endpoint}' at step 0")
+                    })?
+                } else {
+                    carried.get(in_port).with_context(|| {
+                        format!("loop-carried input '{}.{in_port}' was not produced", plan.denoiser)
+                    })?
+                };
+                raw_samples.insert(in_port.clone(), clone_value(raw)?);
+            }
+
+            // Some schedulers (e.g. Euler) scale the loop-carried sample before
+            // it reaches the denoiser. Compute those scaled values once and feed
+            // them as per-port overrides; schedulers that don't scale (DDIM,
+            // masked diffusion) leave the raw sample untouched.
+            let mut scaled_inputs: HashMap<String, Value> = HashMap::new();
+            if let Some(scheduler) = &plan.scheduler {
+                for (_, in_port) in &plan.loop_edges {
+                    let raw = &raw_samples[in_port];
+                    if let Some(scaled) = scheduler.scale_input(step, plan.num_steps, raw)? {
+                        scaled_inputs.insert(in_port.clone(), scaled);
+                    }
+                }
+            }
+            let scale_overrides: Vec<(&str, &Value)> = scaled_inputs
+                .iter()
+                .map(|(port, value)| (port.as_str(), value))
+                .collect();
+
+            // Conditional pass (all inputs as declared, plus any input scaling).
+            let cond_out = self.run_denoiser_pass(
+                denoiser,
+                plan,
+                &constants,
+                &carried,
+                step,
+                timestep,
+                &scale_overrides,
+            )?;
 
             // Classifier-free guidance: run an unconditional pass with the
             // conditioning replaced by the unconditional embedding, then combine
             // per output port:  pred = uncond + scale * (cond - uncond).
             let out_map = if let Some(scale) = guidance {
-                let cfg = cfg_uncond
-                    .as_ref()
-                    .map(|(port, value)| (port.as_str(), value));
-                let (uncond_out, _) =
-                    self.run_denoiser_pass(denoiser, plan, &constants, &carried, step, timestep, cfg)?;
+                let mut cfg_overrides = scale_overrides.clone();
+                if let Some((port, value)) = &cfg_uncond {
+                    cfg_overrides.retain(|(p, _)| *p != port.as_str());
+                    cfg_overrides.push((port.as_str(), value));
+                }
+                let uncond_out = self.run_denoiser_pass(
+                    denoiser,
+                    plan,
+                    &constants,
+                    &carried,
+                    step,
+                    timestep,
+                    &cfg_overrides,
+                )?;
                 let mut combined: HashMap<String, Value> = HashMap::new();
                 for (port, cond_value) in &cond_out {
                     let uncond_value = uncond_out.get(port).with_context(|| {
@@ -396,13 +448,13 @@ impl PipelineEngine {
             // Compute the next value for each loop-carried input. Without a
             // scheduler this is identity feedback (output -> input). With a
             // scheduler the output is a noise prediction and the next sample is
-            // `scheduler.step(sample_in, prediction)`.
+            // `scheduler.step(raw_sample, prediction)` (raw = unscaled).
             for (out_port, in_port) in &plan.loop_edges {
                 let model_output = out_map.get(out_port).with_context(|| {
                     format!("denoiser did not produce loop output '{}.{out_port}'", plan.denoiser)
                 })?;
                 let next = if let Some(scheduler) = &plan.scheduler {
-                    let sample = sample_in.get(in_port).with_context(|| {
+                    let sample = raw_samples.get(in_port).with_context(|| {
                         format!("missing loop-carried sample for '{}.{in_port}'", plan.denoiser)
                     })?;
                     scheduler.step(step, plan.num_steps, sample, model_output)?
@@ -441,17 +493,16 @@ impl PipelineEngine {
         carried: &HashMap<String, Value>,
         step: usize,
         timestep: f32,
-        override_input: Option<(&str, &Value)>,
-    ) -> anyhow::Result<(HashMap<String, Value>, HashMap<String, Value>)> {
-        let mut sample_in: HashMap<String, Value> = HashMap::new();
+        overrides: &[(&str, &Value)],
+    ) -> anyhow::Result<HashMap<String, Value>> {
         let mut inputs: Vec<(String, Value)> = Vec::new();
         for info in denoiser.inputs() {
             let port = info.name.as_str();
             let endpoint = format!("{}.{}", plan.denoiser, port);
-            // An override (CFG unconditional conditioning) wins for its port.
-            if let Some((over_port, over_value)) = override_input
-                && over_port == port
-            {
+            // An override wins for its port. Two producers use overrides: the
+            // scheduler's per-step input scaling (Euler) and CFG's unconditional
+            // conditioning embedding.
+            if let Some((_, over_value)) = overrides.iter().find(|(p, _)| *p == port) {
                 inputs.push((port.to_string(), clone_value(over_value)?));
                 continue;
             }
@@ -488,9 +539,6 @@ impl PipelineEngine {
                     .or(routed)
                     .with_context(|| format!("missing pipeline input '{endpoint}'"))?
             };
-            if is_loop {
-                sample_in.insert(port.to_string(), clone_value(value)?);
-            }
             inputs.push((port.to_string(), clone_value(value)?));
         }
         let refs = inputs
@@ -504,7 +552,7 @@ impl PipelineEngine {
         for (name, value) in denoiser.output_names().iter().zip(outputs) {
             out_map.insert(name.clone(), value);
         }
-        Ok((out_map, sample_in))
+        Ok(out_map)
     }
 
     /// Run a single-pass pipeline: prompt-phase components once, then one
@@ -862,6 +910,18 @@ pub trait Scheduler: Send + Sync + std::fmt::Debug {
         sample: &Value,
         model_output: &Value,
     ) -> anyhow::Result<Value>;
+
+    /// Per-step transform applied to the loop-carried input BEFORE the denoiser
+    /// (e.g. Euler's `sample / sqrt(sigma^2 + 1)`). `Ok(None)` = identity (the
+    /// denoiser sees the raw loop-carried value, as DDIM requires).
+    fn scale_input(
+        &self,
+        _step: usize,
+        _num_steps: usize,
+        _sample: &Value,
+    ) -> anyhow::Result<Option<Value>> {
+        Ok(None)
+    }
 }
 
 /// Builds a [`Scheduler`] from a declared [`SchedulerSpec`] and the loop length.
@@ -885,7 +945,7 @@ impl std::fmt::Debug for SchedulerRegistry {
 }
 
 impl SchedulerRegistry {
-    /// Registry with the built-in `ddim` and `masked_diffusion` schedulers.
+    /// Registry with the built-in `ddim`, `euler` and `masked_diffusion` schedulers.
     pub fn builtin() -> Self {
         let mut factories: HashMap<String, SchedulerFactory> = HashMap::new();
         factories.insert(
@@ -903,6 +963,26 @@ impl SchedulerRegistry {
                     cfg.beta_start.unwrap_or(0.00085),
                     cfg.beta_end.unwrap_or(0.012),
                     cfg.beta_schedule.as_deref().unwrap_or("linear"),
+                    num_steps,
+                )?;
+                Ok(Arc::new(sched) as Arc<dyn Scheduler>)
+            }),
+        );
+        factories.insert(
+            "euler".to_string(),
+            Arc::new(|cfg: &SchedulerSpec, num_steps: usize| {
+                if let Some(prediction) = cfg.prediction_type.as_deref()
+                    && prediction != "epsilon"
+                {
+                    anyhow::bail!(
+                        "unsupported euler prediction_type '{prediction}' (only 'epsilon')"
+                    );
+                }
+                let sched = EulerSchedule::with_schedule(
+                    cfg.num_train_timesteps.unwrap_or(1000),
+                    cfg.beta_start.unwrap_or(0.00085),
+                    cfg.beta_end.unwrap_or(0.012),
+                    cfg.beta_schedule.as_deref().unwrap_or("scaled_linear"),
                     num_steps,
                 )?;
                 Ok(Arc::new(sched) as Arc<dyn Scheduler>)
@@ -1106,6 +1186,124 @@ impl Scheduler for DdimSchedule {
         let stepped =
             DdimSchedule::step(self, step, &sample.to_vec_f32()?, &model_output.to_vec_f32()?)?;
         Value::from_slice_f32(&stepped, &shape).map_err(Into::into)
+    }
+}
+
+/// Euler (`EulerDiscreteScheduler`, epsilon prediction) — a sigma-space
+/// scheduler. Unlike DDIM it rescales the loop-carried sample before the
+/// denoiser (`x / sqrt(sigma^2 + 1)`), then advances the *raw* sample along the
+/// noise derivative: `x_next = x + eps * (sigma_next - sigma)`. Matches diffusers
+/// `EulerDiscreteScheduler(timestep_spacing="linspace", interpolation_type="linear")`.
+/// The initial seed must be pre-scaled by `init_noise_sigma` (= `sigmas[0]`).
+#[derive(Debug, Clone)]
+struct EulerSchedule {
+    /// Inference sigmas, descending, with a trailing `0.0`. Length `num_steps + 1`.
+    sigmas: Vec<f32>,
+}
+
+impl EulerSchedule {
+    fn with_schedule(
+        num_train_timesteps: usize,
+        beta_start: f32,
+        beta_end: f32,
+        beta_schedule: &str,
+        num_steps: usize,
+    ) -> anyhow::Result<Self> {
+        if num_train_timesteps < 2 {
+            anyhow::bail!("scheduler num_train_timesteps must be >= 2");
+        }
+        if num_steps == 0 || num_steps > num_train_timesteps {
+            anyhow::bail!(
+                "scheduler num_steps ({num_steps}) must be in 1..={num_train_timesteps}"
+            );
+        }
+        let denom = (num_train_timesteps - 1) as f32;
+        let (lo, hi, square) = match beta_schedule {
+            "linear" => (beta_start, beta_end, false),
+            "scaled_linear" => (beta_start.sqrt(), beta_end.sqrt(), true),
+            other => anyhow::bail!(
+                "unsupported scheduler beta_schedule '{other}' (expected 'linear' or 'scaled_linear')"
+            ),
+        };
+        // Training sigmas: sigma_i = sqrt((1 - alpha_cumprod_i) / alpha_cumprod_i).
+        let mut train_sigmas = Vec::with_capacity(num_train_timesteps);
+        let mut prod = 1.0f32;
+        for i in 0..num_train_timesteps {
+            let mut beta = lo + (hi - lo) * (i as f32) / denom;
+            if square {
+                beta *= beta;
+            }
+            prod *= 1.0 - beta;
+            train_sigmas.push(((1.0 - prod) / prod).sqrt());
+        }
+        // "linspace" timesteps: evenly spaced over [0, N-1], taken descending,
+        // with sigmas linearly interpolated at each (fractional) timestep.
+        let ts_denom = if num_steps > 1 { (num_steps - 1) as f32 } else { 1.0 };
+        let interp = |t: f32| -> f32 {
+            let low = t.floor().max(0.0) as usize;
+            let high = (low + 1).min(num_train_timesteps - 1);
+            let frac = t - low as f32;
+            train_sigmas[low] * (1.0 - frac) + train_sigmas[high] * frac
+        };
+        let mut sigmas = Vec::with_capacity(num_steps + 1);
+        for k in 0..num_steps {
+            let idx = num_steps - 1 - k;
+            let t = idx as f32 * denom / ts_denom;
+            sigmas.push(interp(t));
+        }
+        sigmas.push(0.0);
+        Ok(Self { sigmas })
+    }
+
+    /// `init_noise_sigma` — the factor the caller must apply to the initial
+    /// random latent so it lives in the scheduler's sigma space.
+    #[allow(dead_code)]
+    fn init_noise_sigma(&self) -> f32 {
+        self.sigmas[0]
+    }
+
+    /// `x / sqrt(sigma^2 + 1)` — scale the raw sample for the denoiser input.
+    fn scale(&self, step: usize, sample: &[f32]) -> Vec<f32> {
+        let factor = (self.sigmas[step] * self.sigmas[step] + 1.0).sqrt();
+        sample.iter().map(|&x| x / factor).collect()
+    }
+
+    /// `x_next = x + eps * (sigma_next - sigma)` on the raw sample.
+    fn step_vec(&self, step: usize, sample: &[f32], eps: &[f32]) -> anyhow::Result<Vec<f32>> {
+        if sample.len() != eps.len() {
+            anyhow::bail!(
+                "scheduler sample/eps length mismatch: {} vs {}",
+                sample.len(),
+                eps.len()
+            );
+        }
+        let dt = self.sigmas[step + 1] - self.sigmas[step];
+        Ok(sample.iter().zip(eps).map(|(&x, &e)| x + e * dt).collect())
+    }
+}
+
+impl Scheduler for EulerSchedule {
+    fn step(
+        &self,
+        step: usize,
+        _num_steps: usize,
+        sample: &Value,
+        model_output: &Value,
+    ) -> anyhow::Result<Value> {
+        let shape = sample.shape().to_vec();
+        let stepped = self.step_vec(step, &sample.to_vec_f32()?, &model_output.to_vec_f32()?)?;
+        Value::from_slice_f32(&stepped, &shape).map_err(Into::into)
+    }
+
+    fn scale_input(
+        &self,
+        step: usize,
+        _num_steps: usize,
+        sample: &Value,
+    ) -> anyhow::Result<Option<Value>> {
+        let shape = sample.shape().to_vec();
+        let scaled = self.scale(step, &sample.to_vec_f32()?);
+        Ok(Some(Value::from_slice_f32(&scaled, &shape)?))
     }
 }
 
