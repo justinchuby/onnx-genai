@@ -278,20 +278,41 @@ accelerator's **exclusive** memory (GPU VRAM, NPU on-chip SRAM, etc.).
 **CRITICAL: there is exactly one DeviceGovernor per DEVICE, not per session.**
 It is shared across all sessions on that device.
 
-> [!IMPORTANT]
-> **Review comment P1 — make governor ownership implementable.**
-> This invariant conflicts with the session-owned governors in §6.2/§6.3 and
-> with the current `EngineResourceGovernor`, which is constructed once per
-> `Engine`. Define the concrete owner, registry, and lifetime: for example, a
-> process-level `MachineRuntime` owns one `HostGovernor` and one
-> `DeviceGovernor` per physical device, while engines/sessions hold only
-> `SessionBudgetLease`s. Also state whether "per machine" assumes exactly one
-> server process or requires cross-process coordination.
->
-> **Acceptance criteria:** no diagram or API gives a session its own
-> authoritative governor; every allocation can be charged to both a physical
-> pool and a session lease; standalone and server deployments have explicit
-> ownership rules.
+### 4.0 Ownership Model
+
+```rust
+/// Process-level singleton that owns all governors.
+/// Constructed once at process startup, lives for the process lifetime.
+pub struct MachineRuntime {
+    host: Arc<HostGovernor>,
+    devices: Vec<Arc<dyn DeviceGovernor>>,
+    topology: MemoryTopology,
+}
+
+/// Sessions do not own governors. They hold budget leases.
+pub struct SessionBudgetLease {
+    device_id: usize,
+    vram_reserved: usize,
+    host_reserved: usize,
+    /// Dropped on session end → budget returns to pool.
+    _guard: LeaseGuard,
+}
+```
+
+**Ownership rules:**
+
+- `MachineRuntime` is a process-level singleton (one per server process). It owns
+  all `DeviceGovernor` and `HostGovernor` instances directly.
+- Sessions request a `SessionBudgetLease` from the governor, not direct access to
+  the governor's allocation primitives. The lease represents a reserved portion of
+  the device's budget.
+- **Single-process deployment:** `MachineRuntime` owns everything directly. The
+  existing `EngineResourceGovernor` becomes a facade that delegates to the
+  `MachineRuntime`'s `DeviceGovernor` for the relevant device.
+- **Multi-process (future):** Would require shared-memory coordination or a
+  dedicated governor process — deferred to Phase 4.
+- The governor enforces limits; sessions cannot exceed their lease. Every allocation
+  is charged to both the physical pool (governor-level) and the session lease.
 
 > **Mapping to DESIGN.md §26.11:** The `ResourceGovernor` described in §26.11
 > corresponds to what is now called `DeviceGovernor`. The §26.11 interfaces,
@@ -373,22 +394,29 @@ existing eviction tiers in order:
 3. Preempt **running standard** sessions (recompute from last checkpoint on resume).
 4. **Interactive** sessions and `interactive_reserve` are touched last.
 
-The call blocks until under ceiling or tiers are exhausted. If the target cannot
-be met, the governor **rejects atomically**, restores the previous ceiling, and
-returns `ResourceError::CannotSatisfyLoweredLimit`.
+The eviction sequence follows a two-phase protocol:
 
-> [!IMPORTANT]
-> **Review comment P1 — narrow the atomicity guarantee.**
-> Restoring the old ceiling is possible, but KV already dropped, data already
-> offloaded, or sessions already preempted cannot be atomically restored. Specify
-> a two-phase flow: build a reclaim plan and reserve destination-tier capacity,
-> execute the plan, then publish the new ceiling only after the target is met.
-> If execution fails, the old ceiling remains, but irreversible reclaim actions
-> must be reported rather than described as rolled back.
->
-> **Acceptance criteria:** the API distinguishes atomic limit publication from
-> non-atomic eviction side effects and returns an outcome that lists completed
-> reclaim actions.
+**Phase 1 (reversible):** Mark candidate pages/experts for eviction, reduce soft
+ceiling. Reserve destination-tier capacity (host RAM or disk) via HostGovernor. If
+any reservation fails, unmark all candidates and restore the soft ceiling. No data
+has moved yet.
+
+**Phase 2 (commit):** Actually evict/copy marked data to the reserved destinations.
+Once commit begins, partial progress is acceptable — some pages may be evicted while
+others are still in flight. The invariant is that `sum(usage) ≤ ceiling` holds at
+the END of the sequence, not at every intermediate point. After all evictions
+complete, the new ceiling is published to sessions.
+
+**Failure semantics:** Eviction is NOT transactional in the database sense. The
+guarantee is: if Phase 1 (planning/reservation) fails, the ceiling reverts and no
+side effects occur. If Phase 2 (execution) fails partway through, the old ceiling
+remains advertised, but completed reclaim actions (KV already dropped, data already
+offloaded) are irreversible and reported in the outcome. The API returns
+`ReconfigureOutcome` which lists all completed reclaim actions regardless of
+overall success or failure.
+
+If the target cannot be met after exhausting all tiers, the governor returns
+`ResourceError::CannotSatisfyLoweredLimit` with the list of actions already taken.
 
 **Offload flow (DeviceGovernor → HostGovernor interaction):**
 
@@ -583,17 +611,44 @@ When a DeviceGovernor needs to offload data from device memory to host RAM:
 5. **Release:** DeviceGovernor calls `release_host_pages()` when data is
    promoted back to VRAM or no longer needed.
 
-> [!IMPORTANT]
-> **Review comment P1 — define pressure ordering and deadlock prevention.**
-> A DeviceGovernor can synchronously wait for HostGovernor quota while the
-> HostGovernor asks other DeviceGovernors to reclaim pages. Define a global lock
-> order and make cross-governor pressure a non-blocking, two-phase protocol; no
-> governor callback may run while another governor's reconfiguration/admission
-> lock is held.
->
-> **Acceptance criteria:** the document includes the lock/order invariant,
-> request cancellation and timeout behavior, and a test scenario with two
-> devices simultaneously offloading under host pressure.
+### 5.3.1 Lock Ordering and Deadlock Prevention
+
+```
+Lock acquisition order (MUST be followed to prevent deadlock):
+1. HostGovernor lock (coarsest)
+2. DeviceGovernor[0] lock
+3. DeviceGovernor[1] lock
+4. ... (by device ordinal)
+
+Rule: A thread holding a DeviceGovernor lock MUST NOT acquire the
+HostGovernor lock. If a DeviceGovernor needs host pages, it must
+release its own lock first, acquire HostGovernor, then re-acquire
+its device lock and re-validate.
+```
+
+**Pressure flow:**
+
+- **HostGovernor under pressure** → notifies all DeviceGovernors to stop offloading
+  (via a non-blocking pressure signal, not a lock acquisition).
+- **DeviceGovernor under pressure** → requests host pages from HostGovernor
+  (following lock order: release device lock, acquire host lock, re-acquire device
+  lock, re-validate state).
+- **Circular pressure (both under pressure simultaneously)** → DeviceGovernor
+  evicts to disk (cold tier) instead of host, breaking the cycle.
+
+**Request cancellation and timeout:** Host page requests carry a deadline. If the
+HostGovernor cannot satisfy the request within the deadline (e.g., waiting for
+cross-device reclaim), it returns `HostQuotaDenied` rather than blocking
+indefinitely. The requesting DeviceGovernor can then fall back to disk spill or
+reject its own caller.
+
+**Test scenario — two devices simultaneously offloading under host pressure:**
+1. GPU 0 releases its device lock, requests 10GB from HostGovernor.
+2. GPU 1 simultaneously releases its device lock, requests 8GB from HostGovernor.
+3. HostGovernor lock serializes both requests. First wins (FIFO); second either
+   fits in remaining headroom or triggers cross-device pressure/disk spill.
+4. Both GPUs re-acquire their device locks and re-validate (state may have changed
+   while locks were released).
 
 ### 5.4 Config Surface
 
@@ -843,8 +898,8 @@ mechanism from the per-session residency manager.
 For multi-node (e.g., Mac Studio cluster), the coordinator splits into:
 
 - **LocalCoordinator** per machine — handles CUDA IPC / mmap sharing.
-- **GlobalCoordinator** in genai-server — handles cross-node expert migration
-  (via Communicator), cross-node prefix cache lookup, and global budget
+- **ClusterCoordinator** in genai-server (global role) — handles cross-node expert
+  migration (via Communicator), cross-node prefix cache lookup, and global budget
   arbitration.
 
 ```text
@@ -1147,17 +1202,19 @@ coherence. Separate DeviceGovernor and HostGovernor would create a false dichoto
 - No copy between "host" and "device" — just pointer sharing.
 - Apple's `recommendedMaxWorkingSetSize` provides the device partition hint.
 
-> [!IMPORTANT]
-> **Review comment P2 — prevent unified-memory double accounting.**
-> Because the same `UnifiedGovernor` is exposed through both traits, a device
-> reservation followed by `request_host_pages()` can charge the same physical
-> bytes twice. Define one physical allocation ledger keyed by allocation ID.
-> "Offload" on unified memory should change residency/priority classification,
-> not create a second allocation.
->
-> **Acceptance criteria:** snapshots reconcile to one physical total, shared
-> pages are counted once, and every device/host API operation maps to a ledger
-> reservation or classification transition.
+**Double-accounting prevention:** When `UnifiedGovernor` is stored as both
+`devices[0]` and `host`, the same physical memory pool is behind both trait
+interfaces. The governor internally tracks a single `total_used` counter.
+Allocations via `request_device_memory()` and `request_host_pages()` draw from
+the same pool — there is no risk of double-counting because the `UnifiedGovernor`
+is one object with one internal state. The `DeviceGovernor` trait represents the
+'wired/GPU-pinned' partition; the `HostGovernor` trait represents the 'available
+for offload/overflow' partition. Their sum equals the single memory pool ceiling.
+
+On unified memory, an "offload" operation (device → host) does not copy data or
+create a second allocation. It reclassifies the allocation from the device
+partition to the host partition — changing residency priority without moving bytes.
+Snapshots always reconcile to one physical total.
 
 ```text
 MemoryTopology::Unified
@@ -1319,7 +1376,12 @@ IR: Node.device_hints (optional, informational)
     ▼
 ParallelStrategy: reads hints as ILP seed placement
     │  Hint says "TP on dim=0, 8 devices"
-    │  → generate TensorParallel strategy, skip analysis
+    │  → validate annotation feasibility (device count matches,
+    │    EP supports the required ops, memory budget accommodates
+    │    the sharding, communication is achievable), then generate
+    │    strategy from hint — skipping the optimization *search*
+    │    but not the *validation*. If validation fails, emit a
+    │    diagnostic warning and fall back to automatic placement.
     │  No hint → fall back to automatic graph analysis
     │
     ▼
@@ -1358,17 +1420,11 @@ struct ShardingSpec {
   loader should preserve them into `NodeDeviceHints` when present.
 - Without annotations, the runtime falls back to automatic placement — no regression.
 
-> [!IMPORTANT]
-> **Review comment P2 — validate hints before skipping placement search.**
-> ONNX permits backends to treat multi-device annotations as hints, but "use the
-> hints directly" must not bypass shape, device-count, EP-capability, memory, or
-> communication-feasibility validation. Change the promise to "skip optimization
-> search after validation" and define fallback behavior for stale or unsupported
-> annotations.
->
-> **Acceptance criteria:** annotated and automatically placed plans pass the same
-> correctness/capability validation; invalid hints produce diagnostics and fall
-> back or fail according to an explicit policy.
+**Stale annotation detection:** Annotations from a previous model version (e.g.,
+model modified post-export) are detected when device counts or tensor shapes don't
+match the current runtime topology. The runtime MUST NOT silently produce incorrect
+results from stale hints — validation catches mismatches and falls back to automatic
+placement with a diagnostic warning.
 
 **Current status:** `onnx-rs` validates; IR/loader do not yet propagate. Low priority
 until real models with sharding annotations exist.
@@ -1404,11 +1460,24 @@ authentication. Default bind to `127.0.0.1`; multi-machine requires explicit
 network configuration (`listen_addr` + `allowed_cidrs`).
 
 **Security model:**
-- Opt-in: user must explicitly enable distributed mode
-- Token auth: ranks must present a valid pre-shared token to register
-- Network binding: default localhost; multi-machine needs explicit CIDR allowlist
-- Threat: unauthorized rank registration → tensor injection → model poisoning
-- Defense in depth: opt-in + token + binding + CIDR
+
+**Control plane (rendezvous, rank registration, topology exchange):**
+- Requires TLS or mTLS for multi-machine deployments
+- PSK token is transmitted only over encrypted channel
+- Rank identity bound to session ID + topology epoch (prevents replay/replacement)
+- Localhost binding for single-machine skips TLS (trusted loopback)
+
+**Data plane (tensor transport):**
+- NCCL/CUDA IPC: inherently local, no encryption needed
+- Thunderbolt 5 DMA: physical link, no encryption needed
+- TCP/RDMA over network: explicitly restricted to trusted isolated network segment
+- If running on untrusted network, data plane requires transport-level encryption
+  (performance tradeoff documented)
+
+**Threat model explicitly covers:** interception, replay, rank replacement,
+topology mismatch, and tensor-data exposure.
+
+**Defense in depth:** opt-in + TLS/mTLS + token + binding + CIDR + epoch binding
 
 ```yaml
 distributed:
@@ -1425,19 +1494,6 @@ distributed:
 **Rationale:** Exposing a rendezvous endpoint without auth would allow unauthorized
 rank registration and potential tensor injection. An attacker joining as a fake rank
 could corrupt all-reduce results or exfiltrate model weights.
-
-> [!IMPORTANT]
-> **Review comment P1 — define control-plane and data-plane security separately.**
-> Token authentication plus a CIDR allowlist does not protect a token sent over
-> an unencrypted multi-machine connection and does not bind a rank to the
-> expected session/topology epoch. Require mTLS, or TLS plus a PSK
-> challenge-response with replay protection, for the control plane. For tensor
-> transports that do not provide confidentiality/integrity, explicitly restrict
-> support to a trusted isolated network.
->
-> **Acceptance criteria:** the threat model covers interception, replay, rank
-> replacement, topology mismatch, and tensor-data exposure; credentials are never
-> transmitted in clear text; rank identity is bound to session ID and epoch.
 
 ### D10: Model metadata hint namespace (`pkg.nxrt.hint.*`)
 
@@ -1555,22 +1611,17 @@ Unified across all design documents:
 
 - Thunderbolt 5 `Communicator` for Mac Studio cluster.
 - RDMA `Communicator` for data center.
-- `GlobalCoordinator` above per-node `HostGovernor`s.
+- `ClusterCoordinator` above per-node `HostGovernor`s (global cross-node role).
 - Cross-node expert migration via Communicator.
 - Cross-node prefix cache lookup.
 
-> [!IMPORTANT]
-> **Review comment P1 — keep one canonical coordinator name and decision source.**
-> This document otherwise calls the type `ClusterCoordinator`, while
-> `DISTRIBUTED_RUNTIME.md` refers to `MemoryCoordinator` and repeats questions
-> resolved below. Use `ClusterCoordinator` consistently. Declare this document
-> canonical only for memory ownership/coordination and
-> `DISTRIBUTED_RUNTIME.md` canonical for communicator/execution-plan contracts;
-> replace duplicated decisions with links.
->
-> **Acceptance criteria:** `GlobalCoordinator` and `MemoryCoordinator` no longer
-> name the same concept, and resolved items are not simultaneously listed as open
-> in another canonical document.
+> **Canonical naming:** This document uses `ClusterCoordinator` consistently for
+> the cross-session/cross-node coordination layer. `DISTRIBUTED_RUNTIME.md` may
+> reference `MemoryCoordinator` — that name is deprecated in favor of
+> `ClusterCoordinator`. This document (`MEMORY_ARCHITECTURE.md`) is canonical for
+> memory ownership, governor hierarchy, and coordination policy.
+> `DISTRIBUTED_RUNTIME.md` is canonical for communicator contracts, execution plan
+> structure, and collective semantics.
 
 ---
 
@@ -1613,20 +1664,26 @@ All questions consolidated from source documents, with decisions.
 
 7. **Quantized communication.** Send FP8/INT8 and up-cast at receiver to halve
    bandwidth?
-   **Decision:** Phase 1 full precision. Phase 3+ add optional FP8 as
-   `Communicator` config flag (no trait signature change). Highest value for
-   cross-node (TB5 40Gb/s bottleneck).
+   **Decision:** Phase 1 full precision. Phase 3+ add optional quantized wire
+   formats. Wire format is negotiated at plan compilation time via `WireTensorSpec`:
 
-> [!IMPORTANT]
-> **Review comment P2 — make wire-format negotiation explicit.**
-> A config flag alone cannot describe logical dtype versus wire dtype, scale and
-> zero-point exchange, block layout/version, error bounds, or mixed-backend
-> support. Define a negotiated `WireTensorSpec`/codec contract and let full
-> precision remain its default implementation.
->
-> **Acceptance criteria:** both peers agree on the wire format before transfer;
-> unsupported codecs fail during plan compilation; quantized and full-precision
-> operations have explicit numerical parity tolerances.
+   ```rust
+   /// Wire format negotiated during plan compilation.
+   pub struct WireTensorSpec {
+       pub logical_dtype: DType,
+       pub wire_dtype: DType,       // e.g., FP8_E4M3 for bandwidth savings
+       pub scale: Option<f64>,      // for quantized wire format
+       pub block_size: Option<usize>,
+       pub error_bound: f64,        // max |logical - dequant(wire)| tolerance
+   }
+   ```
+
+   Wire format is negotiated at plan compilation time. Both peers must agree on the
+   spec before transfer. If a backend does not support the requested wire codec,
+   compilation fails with a diagnostic. Full precision (`wire_dtype == logical_dtype`,
+   no quantization) is the default implementation with zero error bound.
+
+   Highest value for cross-node (TB5 40Gb/s bottleneck).
 
 8. **CUDA IPC ownership semantics.** When session 0 allocates shared weights and
    sessions 1–7 map via IPC, who owns the lifecycle?
