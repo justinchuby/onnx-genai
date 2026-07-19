@@ -124,14 +124,13 @@ extern "C" __global__ void csa_ratio128_compress(
     for (int i = 0; i < past_records * cache_width; ++i)
         cache[b * cache_records * cache_width + i] = past_cache[b * past_records * cache_width + i];
     if (start == 0) {
-        for (int slot = 0; slot < 128; ++slot)
-            // A completed ratio-128 block consumes every slot.  Clear the complete
-            // block after finalizing it (the next token writes only its own slot).
-            for (int reset_slot = 0; reset_slot < 128; ++reset_slot)
-                for (int d = 0; d < dim; ++d) {
-                    carry[b * carry_stride + (2 * reset_slot) * dim + d] = 0.0f;
-                    carry[b * carry_stride + (2 * reset_slot + 1) * dim + d] = __int_as_float(0xff800000);
-                }
+        // A completed ratio-128 block consumes every slot.  Clear the complete
+        // block after finalizing it (the next token writes only its own slot).
+        for (int reset_slot = 0; reset_slot < 128; ++reset_slot)
+            for (int d = 0; d < dim; ++d) {
+                carry[b * carry_stride + (2 * reset_slot) * dim + d] = 0.0f;
+                carry[b * carry_stride + (2 * reset_slot + 1) * dim + d] = __int_as_float(0xff800000);
+            }
     }
     int emitted = 0;
     for (int s = 0; s < sequence; ++s) {
@@ -161,7 +160,7 @@ extern "C" __global__ void csa_ratio128_compress(
         float square_sum = 0.0f;
         for (int d = 0; d < dim; ++d)
             square_sum = __fadd_rn(square_sum, __fmul_rn(record[d], record[d]));
-        float inverse_rms = __frsqrt_rn(__fadd_rn(__fdiv_rn(square_sum, (float)dim), 1.0e-6f));
+        float inverse_rms = __frcp_rn(__fsqrt_rn(__fadd_rn(__fdiv_rn(square_sum, (float)dim), 1.0e-6f)));
         for (int d = 0; d < dim; ++d)
             record[d] = csa_bf16(__fmul_rn(__fmul_rn(record[d], inverse_rms), norm[d]));
         // The compressed RoPE tail is BF16-rounded after each component, just
