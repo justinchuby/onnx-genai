@@ -2374,3 +2374,115 @@ Summary: Implemented BitShift, OneHot, and Compress at opset 11; registry count 
 **By:** Sapper
 **What:** Updated CPU EP OneHot to emit all-off vectors for indices outside `[-depth, depth - 1]`, and made BitShift reject nodes without the required `direction` attribute.
 **Why:** These changes restore ONNX operator conformance identified by review, preventing invalid OneHot category selection and silent BitShift semantic defaults.
+
+
+---
+
+## 2026-07-19 — Scribe inbox merge (CPU-EP op coverage Batch 4)
+
+<!-- merged from pris-isinf-eyelike-pow.md -->
+
+### 2026-07-19: Add CPU IsInf and EyeLike support and mixed-type Pow
+**By:** Pris
+**What:** Registered IsInf at opset 10 and EyeLike at opset 9, and made Pow accept numeric exponents independent of the base tensor dtype.
+**Why:** ONNX backend cases require sign-selective infinity detection, offset/dtype-controlled identity generation, and Pow results typed as the base input.
+
+<!-- merged from bryant-dropout-split.md -->
+
+### 2026-07-19: Add deterministic Dropout paths and complete Split edge handling
+**By:** Bryant
+**What:** Added CPU Dropout registrations at opsets 13 and 22 with bit-exact evaluation/zero-ratio identity behavior and all-true optional masks. Added an explicit Split opset-18 registration, validated `num_outputs` and output metadata, and covered explicit zero-size parts, uneven splits, and a zero-size final part.
+**Why:** ONNX backend conformance requires deterministic Dropout evaluation semantics and Split's opset-18 ceil-chunk behavior. Non-zero training Dropout is rejected explicitly because ONNX does not define a portable seeded RNG stream, rather than emitting silently incompatible random results.
+
+<!-- merged from deckard-gridsample.md -->
+
+### 2026-07-19: CPU GridSample kernel
+**By:** Deckard
+**What:** Added a float32 CPU GridSample kernel with 2-D linear/nearest/cubic and volumetric linear/nearest sampling, all three padding modes, align-corners handling, and opset-16/opset-20 registrations.
+**Why:** The CPU EP must claim GridSample backend nodes while preserving ONNX normalized-coordinate, reflection-boundary, cubic A=-0.75, and nearest ties-to-even behavior.
+
+<!-- merged from chew-review-dropout-split.md -->
+
+### 2026-07-19: Approve Bryant's CPU Dropout and Split implementation
+**By:** Chew
+**What:** 🟢 APPROVE — reviewed commit `4565e68`. Dropout copies data bit-exactly and emits an all-true Bool mask in inference (including nonzero ratio), handles omitted optional inputs and f16/bf16/f32/f64 ratio decoding, and deliberately rejects nonzero training RNG with a clear documented limitation. Its ignored `seed` is correct for the supported deterministic paths. Split correctly normalizes negative axes; honors split-input over legacy attribute; validates sizes, shapes, and dtypes; and implements opset-18 ceil-sized leading chunks with the final remainder, including zero-size final outputs.
+**Why:** This matches ONNX Dropout 13/22 and Split 1/18 behavior for supported valid models. `cargo test -p onnx-runtime-ep-cpu --lib` passed (590 tests), and `cargo test -p onnx-runtime-ep-cpu --lib registry` passed; the registry assertion is internally consistent at `PHASE1_OPS.len() + 80` for the two additional Split/Dropout version entries.
+
+<!-- merged from luv-review-isinf-eyelike-pow.md -->
+
+### 2026-07-19: Reject IsInf/EyeLike/Pow review
+
+**By:** Luv
+
+**What:** 🔴 REJECT. Assign Deckard to fix `EyeLike` before merge. `eye_typed` and `eye_bool` compute `row as i64 + k` directly (lines 74 and 86). `k` is a valid unrestricted ONNX `int64`; for a 2-row tensor and `k = i64::MAX`, the row-1 addition overflows and panics in debug builds rather than producing the required all-zero matrix. Use checked/wider arithmetic or bounds checks that avoid addition overflow, and add extreme positive/negative-offset coverage. Also validate `dtype` through a checked `i64 -> i32` conversion: line 29 currently truncates an out-of-range ONNX enum value into a valid dtype.
+
+**Why:** The IsInf sign flags/defaults, Bool output, NaN handling, and f16/f32/f64 paths are correct; EyeLike's normal offset/dtype logic is correct; and Pow now accepts mixed numeric exponents, broadcasts them, and retains the base output dtype. `cargo test -p onnx-runtime-ep-cpu --lib` passed (593 passed, 1 ignored), and `cargo test -p onnx-runtime-ep-cpu --lib registry` passed. The valid extreme `EyeLike.k` input nevertheless violates required diagonal-offset behavior by panicking, so this cannot be approved.
+
+<!-- merged from gaff-review-gridsample.md -->
+
+### 2026-07-19: Reject GridSample opset split
+**By:** Gaff
+**What:** 🔴 REJECT — reassign the correction to Sapper. The implementation correctly applies the two unnormalization formulas, uses `(x, y[, z])` against `(W, H[, D])`, and its reflection limits agree with the `align_corners` convention. Both requested crate test commands pass (588 library tests; registry selector test).
+**Why:** ONNX GridSample opset 16 is 2-D only; 3-D input is introduced at opset 20. `mod.rs` registers the identical version-unaware `GridSampleFactory` for keys 16 and 20 (lines 488–493), while `grid_sample.rs` accepts rank 5 unconditionally (lines 186–204). Therefore an opset-16 model with `[N,C,D,H,W]` executes trilinear/nearest sampling instead of being rejected, violating the opset-16 schema. Use distinct version-configured factories/kernels (or equivalent) so only the opset-20 registration permits rank 5, and add a regression test.
+
+<!-- merged from sapper-fix-gridsample-opset.md -->
+
+### 2026-07-19: Gate GridSample volumetric inputs by ONNX opset
+**By:** Sapper
+**What:** Threaded GridSample's registered since-version into the kernel; opset 16 now rejects rank-5 inputs while opset 20 accepts rank-4 and rank-5 inputs.
+**Why:** ONNX added 3D GridSample support in opset 20, so accepting it at opset 16 violates the operator schema.
+
+<!-- merged from deckard-fix-eyelike-overflow.md -->
+
+### 2026-07-19: EyeLike checked diagonal arithmetic and dtype validation
+**By:** Deckard
+**What:** Replaced EyeLike's overflowing diagonal calculation with checked signed arithmetic and strict dtype-attribute conversion; added extreme-offset and dtype-override regressions.
+**Why:** ONNX permits any `k`, so extreme offsets must yield zeros rather than panic, and dtype attributes must not truncate into unintended output types.
+
+<!-- merged from luv-rereview-eyelike.md -->
+
+# Luv re-review — EyeLike / IsInf / Pow
+
+**Verdict: 🟢 APPROVE**
+
+Reviewed Deckard's fix commit `114180e` on `pris/isinf-eyelike-pow`.
+
+- `EyeLike` computes diagonal indices with `checked_add` and checked conversion/bounds filtering. Multi-row inputs with `k = i64::MAX` or `i64::MIN` therefore yield all zeros without overflow/panic; regression coverage is present.
+- The `dtype` attribute now uses `i32::try_from` before ONNX type lookup, rejecting out-of-range values instead of silently truncating. Execution verifies that the declared dtype overrides the input dtype, and the added regression covers every supported EyeLike output dtype plus invalid values.
+- `IsInf` and `Pow` are unchanged by `114180e` and remain correct from the prior review.
+
+Validation passed:
+- `cargo test -p onnx-runtime-ep-cpu --lib` — 597 passed, 1 ignored
+- `cargo test -p onnx-runtime-ep-cpu --lib registry` — 1 passed
+
+<!-- merged from gaff-rereview-gridsample.md -->
+
+# Gaff re-review: GridSample opset gate
+
+**Verdict: 🟢 APPROVE**
+
+Reviewed fix commit `61d5e638ea98c75803eb130d35158397087896b6`.
+
+- The registry registers version-carrying `GridSampleFactory` instances for opsets 16 and 20, matching the existing `since_version` factory/kernel pattern used by `Attention`.
+- Rank-5 volumetric input now fails under the opset-16 factory with the clear error `GridSample: 3D input requires opset 20 or later`; rank 4 remains valid for both versions and rank 5 is valid at opset 20.
+- The interpolation implementation is unchanged; the patch only threads the registered version, gates rank-5 execution, and adjusts/adds tests.
+- Regression coverage exercises rank-4 at opsets 16 and 20, rank-5 failure at 16, and rank-5 success at 20.
+
+Validation passed:
+
+- `cargo test -p onnx-runtime-ep-cpu --lib` — 588 passed, 0 failed, 1 ignored.
+- `cargo test -p onnx-runtime-ep-cpu --lib registry` — 2 passed, 0 failed.
+
+<!-- merged from bryant-conformance-1012.md -->
+
+### 2026-07-19: Refresh ONNX backend node conformance to Batch 4
+**By:** Bryant
+**What:** Regenerated the authoritative ONNX backend node-test result set at 3,530 total cases: 1,012 passed, 753 failed, and 1,765 skipped. Updated EP conformance history and documented Batch-4 coverage for Dropout, Split, IsInf, EyeLike, mixed-type Pow, and GridSample.
+**Why:** Batch 4 raised CPU node coverage by 37 cases on main commit `9c250c6`; the checked-in documentation and per-test data must match the measured backend run.
+
+<!-- merged from gaff-review-conformance-1012.md -->
+
+### 2026-07-19: Review — Batch-4 conformance documentation refresh (`8c2a264`)
+**By:** Gaff
+**What:** 🟢 APPROVE
+**Why:** Commit scope is exactly the two intended files: `docs/EP_CONFORMANCE.md` and `crates/onnx-runtime-python/conformance/onnx_backend_node_results.txt`; no `.squad/`, kernel, or formatting-only files are part of the commit. The results header reports total/passed/failed/skipped as 3530/1012/753/1765, and tab-separated row counts independently match (1012 passed, 753 failed, 1765 skipped; 3530 total). Arithmetic is consistent. The documentation retains the 360@2026-07-14 and 875/921/936/975 history, adds the dated 2026-07-19 1012/753/1765 entry, and accurately names the Batch-4 Dropout, Split, IsInf, EyeLike, mixed-type Pow, and GridSample coverage.

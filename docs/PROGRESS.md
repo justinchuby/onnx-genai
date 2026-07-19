@@ -4,10 +4,14 @@ Tracks implementation status of `docs/DESIGN.md` (§1–§40). Updated as work l
 
 **Published:** `onnx-genai` v0.1.0 + 8 sub-crates on crates.io; the `onnx-runtime-*` layer (including `onnx-runtime-tracer`) is released as v0.1.0-dev.1. CI (fmt/build/test/**blocking clippy**) + scheduled `cargo-audit`. Coverage ~77% line.
 
-_Last updated: 2026-07-19T18:20Z — CPU-EP op-coverage wave advanced backend node conformance to 975 passing._
+_Last updated: 2026-07-19T20:10Z — CPU-EP op-coverage Batch 4 advanced backend node conformance to 1,012 passing._
 
-**Current `origin/main` implementation HEAD:** `eef2c81`.
+**Current `origin/main` implementation HEAD:** `8c2a264`.
 
+
+## 2026-07-19 — CPU-EP op coverage 975→1,012
+
+- **CPU-EP coverage ✅ landed (`8c2a264`):** added Dropout, Split, IsInf, EyeLike, mixed-type Pow, and GridSample. Backend node conformance advanced **975→1,012 passing (+37 backend tests)**, with 753 failing and 1,765 skipped. Two 🔴 reject→lockout-fix→🟢 approve cycles completed: Deckard fixed EyeLike overflow/dtype validation after Pris's lockout, and Sapper fixed GridSample's opset-16 rank gate after Deckard's lockout.
 
 ## 2026-07-19 — CPU-EP op coverage 936→975
 
