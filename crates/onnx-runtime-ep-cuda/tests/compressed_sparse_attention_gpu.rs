@@ -21,7 +21,9 @@ use onnx_runtime_ep_api::{
 };
 use onnx_runtime_ep_cpu::CpuExecutionProvider;
 use onnx_runtime_ep_cuda::runtime::cuptr;
-use onnx_runtime_ep_cuda::{CsaAttentionMode, CsaCheckpointJournal, CudaExecutionProvider};
+use onnx_runtime_ep_cuda::{
+    CsaAttentionMode, CsaCheckpointJournal, CsaCursors, CudaExecutionProvider,
+};
 use onnx_runtime_ir::{
     Attribute, DataType, DeviceId, Graph, Node, NodeId, compute_contiguous_strides, static_shape,
 };
@@ -1545,6 +1547,15 @@ fn ratio4_five_output_fused_attention_falls_back_to_host_oracle_bit_exact() {
         assert_eq!(specs.len(), 5, "5-output ratio-4 node has 5 output specs");
         let cpu = run_cpu(&graph, node, &inputs, &specs).expect("CPU ratio-4 CSA oracle");
         let gpu = run_gpu(&ep, &graph, node, &inputs, &specs).expect("CUDA ratio-4 CSA");
+        let layer = ep
+            .csa_metrics()
+            .layer(graph.node(node).id.0 as u64)
+            .expect("5-output decode must record §8 metrics");
+        assert_eq!(
+            layer.mode,
+            CsaAttentionMode::Host,
+            "5-output ratio-4 Y runs through the host oracle and must report Host mode"
+        );
         assert_eq!(
             max_ulp(&gpu[0], &cpu[0]),
             0,
@@ -2376,6 +2387,218 @@ fn ratio4_speculative_rollback_restores_accepted_prefix_bit_exact() {
         );
         assert_eq!(
             spec[index], cpu[index],
+            "post-rollback {label} must be byte-exact vs the CPU oracle"
+        );
+    }
+
+    ep.deallocate(main_carry).unwrap();
+    ep.deallocate(index_carry).unwrap();
+    ep.deallocate(seq_scalar).unwrap();
+}
+
+/// B7 — reject a speculative draft after it completes a ratio-4 record. The
+/// completed record is logically discarded by restoring the checkpoint cursors,
+/// while the pre-record carry is restored byte-exact. The follow-up decode must
+/// match an accepted-only run and the independent CPU oracle bit-for-bit.
+#[test]
+fn ratio4_speculative_rollback_discards_completed_block_bit_exact() {
+    let Some(ep) = gpu() else { return };
+    const PREFILL: usize = 12;
+    const ACCEPTED: u64 = 13;
+    let full = ratio4_inputs_prefill(
+        PREFILL + 4,
+        ratio4_values(
+            (PREFILL + 4) * RATIO4_INDEX_HEADS * RATIO4_INDEX_DIM,
+            37,
+            0.0013,
+        ),
+        ratio4_values((PREFILL + 4) * RATIO4_INDEX_HEADS, 41, 0.009),
+    );
+
+    let mut prefill = full.clone();
+    for index in [0usize, 1, 2, 3, 11, 12, 13, 14] {
+        prefill[index] = ratio4_sequence_slice(&full[index], 0, PREFILL);
+    }
+    prefill[8] = HostTensor::i32(&[1], &[(PREFILL - 1) as i32]);
+    prefill[9] = HostTensor::i64(&[], &[PREFILL as i64]);
+    let (pg, pn) = ratio4_node(&prefill);
+    let first = run_gpu(
+        &ep,
+        &pg,
+        pn,
+        &prefill,
+        &ratio4_topk_output_specs(PREFILL, PREFILL / RATIO4, 1),
+    )
+    .expect("prefill");
+
+    let committed_inputs = ratio4_decode_step(&full, PREFILL, &first);
+    let (cg, cn) = ratio4_node(&committed_inputs);
+    let committed = run_gpu(
+        &ep,
+        &cg,
+        cn,
+        &committed_inputs,
+        &ratio4_topk_output_specs(1, ACCEPTED as usize / RATIO4, 1),
+    )
+    .expect("accepted-prefix decode");
+
+    let main_carry = upload_device(&ep, &committed[2]);
+    let index_carry = upload_device(&ep, &committed[4]);
+    let seq_scalar = upload_device(&ep, &(ACCEPTED as i64).to_ne_bytes());
+    let metrics = ep.csa_metrics().clone();
+    let journal = CsaCheckpointJournal::new(
+        ep.runtime().clone(),
+        RATIO4 as u64,
+        committed[2].len(),
+        committed[4].len(),
+        metrics,
+    )
+    .expect("journal");
+    const GENERATION: u64 = 0xB7_4;
+    // SAFETY: carry buffers are live and cover the committed carry state.
+    let checkpoint = unsafe {
+        journal.checkpoint(
+            cuptr(main_carry.as_ptr()),
+            cuptr(index_carry.as_ptr()),
+            committed[2].len(),
+            committed[4].len(),
+            ACCEPTED,
+            GENERATION,
+        )
+    }
+    .expect("checkpoint");
+    assert_eq!(
+        checkpoint.cursors(),
+        CsaCursors::from_sequence(ACCEPTED, RATIO4 as u64),
+        "checkpoint must preserve the pre-block carry"
+    );
+
+    // Draft positions 13, 14, and 15. The last step completes record four and
+    // resets both carries, exercising the completed-block reject boundary.
+    let mut draft_state = committed.clone();
+    for position in PREFILL + 1..PREFILL + 4 {
+        let draft_inputs = ratio4_decode_step(&full, position, &draft_state);
+        let (dg, dn) = ratio4_node(&draft_inputs);
+        draft_state = run_gpu(
+            &ep,
+            &dg,
+            dn,
+            &draft_inputs,
+            &ratio4_topk_output_specs(1, (position + 1) / RATIO4, 1),
+        )
+        .expect("speculative draft decode");
+    }
+    assert!(
+        draft_state[1].len() > committed[1].len(),
+        "draft must write a newly completed compressed record"
+    );
+    assert!(
+        draft_state[3].len() > committed[3].len(),
+        "draft must write a newly completed index record"
+    );
+    let drafted_cursors = CsaCursors::from_sequence((PREFILL + 4) as u64, RATIO4 as u64);
+    assert_eq!(drafted_cursors.compressed_len, 4);
+    assert_eq!(drafted_cursors.index_len, 4);
+    assert_eq!(drafted_cursors.compression_carry_len, 0);
+    assert_eq!(drafted_cursors.index_carry_len, 0);
+    // SAFETY: live carry buffers are overwritten with the speculative final state.
+    unsafe {
+        ep.runtime()
+            .htod(&draft_state[2], cuptr(main_carry.as_ptr()))
+            .expect("dirty main carry");
+        ep.runtime()
+            .htod(&draft_state[4], cuptr(index_carry.as_ptr()))
+            .expect("dirty index carry");
+    }
+    assert_ne!(
+        download_device(&ep, &main_carry, committed[2].len()),
+        committed[2],
+        "completed-block draft must replace the pre-block main carry"
+    );
+
+    // SAFETY: the checkpoint owns snapshots for these same live carry buffers.
+    let restored = unsafe {
+        journal.restore_prefix(
+            &checkpoint,
+            ACCEPTED,
+            GENERATION,
+            cuptr(main_carry.as_ptr()),
+            cuptr(index_carry.as_ptr()),
+            Some(cuptr(seq_scalar.as_ptr())),
+        )
+    }
+    .expect("restore completed-block rejection");
+    assert_eq!(
+        restored,
+        CsaCursors::from_sequence(ACCEPTED, RATIO4 as u64),
+        "restore must discard the completed records and reinstate the pre-block carry"
+    );
+    assert_eq!(restored.compressed_len, checkpoint.cursors().compressed_len);
+    assert_eq!(restored.index_len, checkpoint.cursors().index_len);
+    assert_eq!(
+        restored.compression_carry_len,
+        checkpoint.cursors().compression_carry_len
+    );
+    assert_eq!(
+        restored.index_carry_len,
+        checkpoint.cursors().index_carry_len
+    );
+    assert_eq!(
+        download_device(&ep, &main_carry, committed[2].len()),
+        committed[2],
+        "restore must reinstate the main carry byte-exact"
+    );
+    assert_eq!(
+        download_device(&ep, &index_carry, committed[4].len()),
+        committed[4],
+        "restore must reinstate the index carry byte-exact"
+    );
+    assert_eq!(
+        i64::from_ne_bytes(download_device(&ep, &seq_scalar, 8).try_into().unwrap()),
+        ACCEPTED as i64,
+        "restore must reset the device sequence cursor before the completed record"
+    );
+
+    let mut restored_state = committed.clone();
+    restored_state[2] = download_device(&ep, &main_carry, committed[2].len());
+    restored_state[4] = download_device(&ep, &index_carry, committed[4].len());
+    let continuation_inputs = ratio4_decode_step(&full, PREFILL + 1, &restored_state);
+    let (sg, sn) = ratio4_node(&continuation_inputs);
+    let specs = ratio4_topk_output_specs(1, (PREFILL + 2) / RATIO4, 1);
+    let restored_continuation =
+        run_gpu(&ep, &sg, sn, &continuation_inputs, &specs).expect("restored continuation");
+
+    let fresh_inputs = ratio4_decode_step(&full, PREFILL + 1, &committed);
+    let (fg, fn_) = ratio4_node(&fresh_inputs);
+    let fresh = run_gpu(&ep, &fg, fn_, &fresh_inputs, &specs).expect("fresh continuation");
+    let cpu = run_cpu(&fg, fn_, &fresh_inputs, &specs).expect("CPU continuation oracle");
+    assert_eq!(
+        max_ulp(&restored_continuation[0], &fresh[0]),
+        0,
+        "post-rollback Y must be bit-identical to the fresh accepted-only run"
+    );
+    assert_eq!(
+        max_ulp(&restored_continuation[0], &cpu[0]),
+        0,
+        "post-rollback Y must be bit-exact vs the independent CPU oracle"
+    );
+    for (index, label) in [
+        "present_compressed_kv",
+        "present_compression_carry",
+        "present_index_key",
+        "present_index_carry",
+        "selected_indices",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let output = index + 1;
+        assert_eq!(
+            restored_continuation[output], fresh[output],
+            "post-rollback {label} must equal the fresh accepted-only run"
+        );
+        assert_eq!(
+            restored_continuation[output], cpu[output],
             "post-rollback {label} must be byte-exact vs the CPU oracle"
         );
     }

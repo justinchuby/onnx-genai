@@ -2140,7 +2140,7 @@ impl Kernel for CompressedSparseAttentionKernel {
             + out_bufs.iter().map(|buf| buf.len() as u64).sum::<u64>();
         let mode = if self.force_host && self.capturable {
             CsaAttentionMode::Host
-        } else if self.device_ratio4_attention || self.device_attention {
+        } else if (self.device_ratio4_attention && outputs.len() == 6) || self.device_attention {
             CsaAttentionMode::Device
         } else {
             CsaAttentionMode::Host
