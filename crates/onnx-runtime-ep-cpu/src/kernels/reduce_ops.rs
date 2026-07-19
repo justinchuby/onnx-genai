@@ -10,7 +10,7 @@
 //! to "reduce all axes".
 //!
 //! `noop_with_empty_axes` (opset 18, default 0) selects identity vs reduce-all
-//! when the axes set is explicitly empty.
+//! only when the optional axes *input* is explicitly present and empty.
 //!
 //! The output view's own shape (keepdims-aware) governs the write; the produced
 //! dense buffer matches it element-for-element because reduced axes contribute
@@ -243,7 +243,8 @@ impl Kernel for ReduceKernel {
 
 impl ReduceKernel {
     fn resolve_axes(&self, inputs: &[TensorView], rank: usize) -> Result<Vec<bool>> {
-        let axes_raw = if inputs.len() == 2 && !inputs[1].is_absent() {
+        let axes_input_present = inputs.len() == 2 && !inputs[1].is_absent();
+        let axes_raw = if axes_input_present {
             Some(to_dense_i64(&inputs[1])?)
         } else {
             self.axes_attr.clone()
@@ -251,7 +252,7 @@ impl ReduceKernel {
         let mut reduce = vec![false; rank];
         match &axes_raw {
             Some(axes) if axes.is_empty() => {
-                if !self.noop_with_empty_axes {
+                if !axes_input_present || !self.noop_with_empty_axes {
                     reduce.fill(true);
                 }
             }
@@ -268,9 +269,10 @@ impl ReduceKernel {
                 }
             }
             None => {
-                if !self.noop_with_empty_axes {
-                    reduce.fill(true);
-                }
+                // An omitted axes input (and no legacy attribute) always means
+                // reduce all axes. `noop_with_empty_axes` only applies to a
+                // present, empty axes input.
+                reduce.fill(true);
             }
         }
         Ok(reduce)
@@ -592,6 +594,42 @@ mod tests {
     }
 
     #[test]
+    fn empty_axes_input_without_noop_reduces_all() {
+        let x = Owned::f32(&[2, 2], &[1., 2., 3., 4.]);
+        let mut out = Owned::zeros_f32(&[1, 1]);
+        ReduceKernel {
+            op: ReduceOp::Sum,
+            axes_attr: None,
+            keepdims: true,
+            noop_with_empty_axes: false,
+        }
+        .execute(
+            &[x.view(), Owned::i64(&[0], &[]).view()],
+            &mut [out.view_mut()],
+        )
+        .unwrap();
+        assert_eq!(out.to_f32(), vec![10.]);
+    }
+
+    #[test]
+    fn omitted_axes_reduce_all_despite_noop_with_empty_axes() {
+        let x = Owned::f32(&[2, 2], &[1., 2., 3., 4.]);
+        let mut out = Owned::zeros_f32(&[1, 1]);
+        ReduceKernel {
+            op: ReduceOp::Sum,
+            axes_attr: None,
+            keepdims: true,
+            noop_with_empty_axes: true,
+        }
+        .execute(
+            &[x.view(), TensorView::absent(DataType::Int64)],
+            &mut [out.view_mut()],
+        )
+        .unwrap();
+        assert_eq!(out.to_f32(), vec![10.]);
+    }
+
+    #[test]
     fn max_min_bool_inputs() {
         let x = Owned::bool_(&[2, 3], &[false, true, false, true, true, false]);
         let mut max = Owned::zeros(DataType::Bool, &[2, 1]);
@@ -610,5 +648,13 @@ mod tests {
         let mut out = Owned::zeros_f32(&[0]);
         run_attr(ReduceOp::Sum, Some(vec![0]), &x, &mut out);
         assert!(out.to_f32().is_empty());
+    }
+
+    #[test]
+    fn sum_empty_reduced_axis_uses_additive_identity() {
+        let x = Owned::f32(&[2, 0], &[]);
+        let mut out = Owned::zeros_f32(&[2, 1]);
+        run_attr(ReduceOp::Sum, Some(vec![1]), &x, &mut out);
+        assert_eq!(out.to_f32(), vec![0., 0.]);
     }
 }
