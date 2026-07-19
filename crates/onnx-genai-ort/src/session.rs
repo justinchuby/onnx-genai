@@ -174,6 +174,31 @@ pub struct TensorInfo {
     pub shape: Vec<i64>,
 }
 
+/// A run failure tagged with whether the model was actually invoked.
+///
+/// Returned by [`Session::run_with_binding_graph_phased`] so a retry/fallback
+/// caller can tell a pre-invocation setup failure (safe to replay — the model
+/// has not advanced) apart from a failure at or after the ORT `Run` call (which
+/// may have advanced model state and must not be replayed).
+#[derive(Debug)]
+pub enum RunPhaseError {
+    /// Failure before the model was invoked (API lookup, run-option creation,
+    /// config-entry setup). The model has not run, so the step is retryable.
+    Setup(OrtError),
+    /// Failure at or after the ORT `Run` call. The model may have advanced
+    /// state (e.g. the KV cache), so the run must not be replayed.
+    Invoked(OrtError),
+}
+
+impl RunPhaseError {
+    /// The underlying error, discarding the phase tag.
+    pub fn into_inner(self) -> OrtError {
+        match self {
+            RunPhaseError::Setup(err) | RunPhaseError::Invoked(err) => err,
+        }
+    }
+}
+
 /// An ORT inference session (a loaded model).
 pub struct Session {
     ptr: NonNull<onnx_genai_ort_sys::OrtSession>,
@@ -205,7 +230,10 @@ impl Session {
         #[cfg(windows)]
         let path_c: Vec<u16> = {
             use std::os::windows::ffi::OsStrExt;
-            path.as_os_str().encode_wide().chain(std::iter::once(0)).collect()
+            path.as_os_str()
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect()
         };
         #[cfg(not(windows))]
         let path_c = CString::new(path.to_string_lossy().as_bytes())
@@ -366,37 +394,69 @@ impl Session {
         binding: &IoBinding,
         graph_annotation_id: i32,
     ) -> Result<()> {
-        let api = crate::error::api()?;
+        self.run_with_binding_graph_phased(binding, graph_annotation_id)
+            .map_err(RunPhaseError::into_inner)
+    }
+
+    /// Same as [`Self::run_with_binding_graph`], but the error distinguishes
+    /// whether the model was actually invoked.
+    ///
+    /// Everything before the ORT `Run` call — resolving the C API entry points,
+    /// creating the run options, and adding the `gpu_graph_id` config entry — is
+    /// pure setup that cannot have executed the model, so those failures are
+    /// reported as [`RunPhaseError::Setup`]. Only a failure of the `Run` call
+    /// itself is reported as [`RunPhaseError::Invoked`], because at that point
+    /// the model may have advanced state (e.g. the KV cache) and the run must
+    /// not be replayed. Callers driving a retry/fallback path rely on this split
+    /// to decide whether replaying the step is safe.
+    pub fn run_with_binding_graph_phased(
+        &self,
+        binding: &IoBinding,
+        graph_annotation_id: i32,
+    ) -> std::result::Result<(), RunPhaseError> {
+        let api = crate::error::api().map_err(RunPhaseError::Setup)?;
         let run = api
             .RunWithBinding
-            .ok_or(OrtError::ApiUnavailable("RunWithBinding"))?;
+            .ok_or(OrtError::ApiUnavailable("RunWithBinding"))
+            .map_err(RunPhaseError::Setup)?;
         let create_opts = api
             .CreateRunOptions
-            .ok_or(OrtError::ApiUnavailable("CreateRunOptions"))?;
+            .ok_or(OrtError::ApiUnavailable("CreateRunOptions"))
+            .map_err(RunPhaseError::Setup)?;
         let add_entry = api
             .AddRunConfigEntry
-            .ok_or(OrtError::ApiUnavailable("AddRunConfigEntry"))?;
+            .ok_or(OrtError::ApiUnavailable("AddRunConfigEntry"))
+            .map_err(RunPhaseError::Setup)?;
         let release_opts = api
             .ReleaseRunOptions
-            .ok_or(OrtError::ApiUnavailable("ReleaseRunOptions"))?;
+            .ok_or(OrtError::ApiUnavailable("ReleaseRunOptions"))
+            .map_err(RunPhaseError::Setup)?;
 
         let mut run_options = std::ptr::null_mut();
         // SAFETY: `run_options` is a valid out-parameter, released below.
-        crate::error::check_status(unsafe { create_opts(&mut run_options) })?;
-        let run_options = NonNull::new(run_options).ok_or(OrtError::NullPointer)?;
+        crate::error::check_status(unsafe { create_opts(&mut run_options) })
+            .map_err(RunPhaseError::Setup)?;
+        let run_options = NonNull::new(run_options)
+            .ok_or(OrtError::NullPointer)
+            .map_err(RunPhaseError::Setup)?;
 
         let result = (|| {
             let key = CString::new("gpu_graph_id").expect("literal has no NUL");
             let value =
                 CString::new(graph_annotation_id.to_string()).expect("integer string has no NUL");
             // SAFETY: run options handle and NUL-terminated strings are valid.
+            // Building the config entry is still setup: the model has not run.
             crate::error::check_status(unsafe {
                 add_entry(run_options.as_ptr(), key.as_ptr(), value.as_ptr())
-            })?;
+            })
+            .map_err(RunPhaseError::Setup)?;
             // SAFETY: session, run options, and binding are valid ORT handles.
+            // This is the model invocation: a failure here may leave state
+            // advanced, so it is classified as `Invoked`, not `Setup`.
             crate::error::check_status(unsafe {
                 run(self.ptr.as_ptr(), run_options.as_ptr(), binding.as_ptr())
             })
+            .map_err(RunPhaseError::Invoked)
         })();
 
         // SAFETY: `run_options` was created above and is released exactly once.

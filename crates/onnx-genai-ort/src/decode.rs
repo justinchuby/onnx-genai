@@ -16,7 +16,9 @@ use std::sync::Arc;
 #[cfg(feature = "cuda")]
 #[cfg(feature = "cuda")]
 use crate::device_sampler::{CudaSampler, DeviceSampler};
-use crate::{DataType, IoBinding, MemoryInfo, OrtError, Result, Session, TensorInfo, Value};
+use crate::{
+    DataType, IoBinding, MemoryInfo, OrtError, Result, RunPhaseError, Session, TensorInfo, Value,
+};
 
 /// Parameters for one device sampling step.
 ///
@@ -95,6 +97,20 @@ enum CapturedStepError {
     RunInvoked(OrtError),
 }
 
+/// Map a phased run failure onto the captured-step retry classification.
+///
+/// A [`RunPhaseError::Setup`] failure happens before the ORT `Run` call, so the
+/// model has not advanced and the step is safe to replay through the standard
+/// path — classified [`CapturedStepError::PreRun`]. A [`RunPhaseError::Invoked`]
+/// failure happens at or after the model invocation, which may have advanced KV
+/// state, so it must propagate without a replay — [`CapturedStepError::RunInvoked`].
+fn classify_run_phase(err: RunPhaseError) -> CapturedStepError {
+    match err {
+        RunPhaseError::Setup(err) => CapturedStepError::PreRun(err),
+        RunPhaseError::Invoked(err) => CapturedStepError::RunInvoked(err),
+    }
+}
+
 fn retry_pre_run_captured_failure<T>(
     result: std::result::Result<T, CapturedStepError>,
     retry: impl FnOnce(OrtError) -> Result<T>,
@@ -109,21 +125,146 @@ fn retry_pre_run_captured_failure<T>(
 #[cfg(test)]
 mod captured_step_retry_tests {
     use super::*;
+    use std::cell::Cell;
+
+    /// A fake model+sampler that counts how many times the model is invoked.
+    ///
+    /// Its [`Self::captured_step`] mirrors the phase ordering of the real
+    /// [`DecodeSession::step_captured`]: a pre-run setup phase (input binding /
+    /// run-option setup) that has *not* touched the model, then the single model
+    /// invocation, then the post-run device-argmax readback / sampler. Failures
+    /// are injected at a chosen phase so a test can prove exactly how many times
+    /// the model runs across the fast path and any standard-step fallback.
+    struct FakeRunner {
+        model_invocations: Cell<usize>,
+    }
+
+    impl FakeRunner {
+        fn new() -> Self {
+            Self {
+                model_invocations: Cell::new(0),
+            }
+        }
+
+        fn invoke_model(&self) {
+            self.model_invocations.set(self.model_invocations.get() + 1);
+        }
+
+        /// One captured decode step, failing at `fail_phase` if set.
+        fn captured_step(
+            &self,
+            fail_phase: Option<StepPhase>,
+        ) -> std::result::Result<i64, CapturedStepError> {
+            // PRE-run: input/mask/KV binding and run-option setup. The model has
+            // not executed, so a failure here is retryable.
+            if fail_phase == Some(StepPhase::Setup) {
+                return Err(classify_run_phase(RunPhaseError::Setup(
+                    OrtError::InvalidArgument("injected binding failure".into()),
+                )));
+            }
+            // The model invocation itself (advances KV state exactly once).
+            self.invoke_model();
+            if fail_phase == Some(StepPhase::Run) {
+                return Err(classify_run_phase(RunPhaseError::Invoked(
+                    OrtError::InvalidArgument("injected run failure".into()),
+                )));
+            }
+            // POST-run: device-argmax readback / device sampler. The model has
+            // already advanced, so a failure here must propagate, never retry.
+            if fail_phase == Some(StepPhase::Sample) {
+                return Err(CapturedStepError::RunInvoked(OrtError::InvalidArgument(
+                    "injected sampler failure".into(),
+                )));
+            }
+            Ok(7)
+        }
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum StepPhase {
+        Setup,
+        Run,
+        Sample,
+    }
 
     #[test]
-    fn post_run_sampling_failure_does_not_rerun_model() {
-        let mut model_runs = 1;
-        let sampling_failure = CapturedStepError::RunInvoked(OrtError::InvalidArgument(
-            "injected sampler failure".into(),
-        ));
+    fn post_run_sampling_failure_runs_model_once_and_does_not_fall_back() {
+        let runner = FakeRunner::new();
+        let result =
+            retry_pre_run_captured_failure(runner.captured_step(Some(StepPhase::Sample)), |_| {
+                // step_standard fallback would re-invoke the model — forbidden
+                // once the sampler failed post-invocation.
+                runner.invoke_model();
+                Ok(0)
+            });
 
-        let result: Result<()> = retry_pre_run_captured_failure(Err(sampling_failure), |_| {
-            model_runs += 1;
-            Ok(())
-        });
+        assert!(result.is_err(), "post-run sampler failure must propagate");
+        assert_eq!(
+            runner.model_invocations.get(),
+            1,
+            "post-run failure must not replay the model via the standard step"
+        );
+    }
 
-        assert!(result.is_err());
-        assert_eq!(model_runs, 1, "standard fallback must not replay the step");
+    #[test]
+    fn post_run_invocation_failure_runs_model_once_and_does_not_fall_back() {
+        let runner = FakeRunner::new();
+        let result =
+            retry_pre_run_captured_failure(runner.captured_step(Some(StepPhase::Run)), |_| {
+                runner.invoke_model();
+                Ok(0)
+            });
+
+        assert!(result.is_err(), "run-call failure must propagate");
+        assert_eq!(
+            runner.model_invocations.get(),
+            1,
+            "a failure at the model invocation must not be replayed"
+        );
+    }
+
+    #[test]
+    fn pre_run_setup_failure_falls_back_and_runs_model_once() {
+        let runner = FakeRunner::new();
+        let result =
+            retry_pre_run_captured_failure(runner.captured_step(Some(StepPhase::Setup)), |_| {
+                // Setup failed before the model ran, so the standard step safely
+                // performs the one and only model invocation.
+                runner.invoke_model();
+                Ok(99)
+            });
+
+        assert_eq!(result.expect("pre-run failure should retry"), 99);
+        assert_eq!(
+            runner.model_invocations.get(),
+            1,
+            "pre-run failure must retry through the standard step exactly once"
+        );
+    }
+
+    #[test]
+    fn classify_run_phase_maps_setup_to_retryable_and_invoked_to_propagate() {
+        // Setup failures are retryable (PreRun); invocation failures propagate.
+        let runner = FakeRunner::new();
+        let retried = retry_pre_run_captured_failure(
+            Err(classify_run_phase(RunPhaseError::Setup(
+                OrtError::InvalidArgument("setup".into()),
+            ))),
+            |_| {
+                runner.invoke_model();
+                Ok(1)
+            },
+        );
+        assert_eq!(retried.expect("setup must retry"), 1);
+        assert_eq!(runner.model_invocations.get(), 1);
+
+        let propagated: Result<i64> = retry_pre_run_captured_failure(
+            Err(classify_run_phase(RunPhaseError::Invoked(
+                OrtError::InvalidArgument("invoked".into()),
+            ))),
+            |_| panic!("invoked failure must not retry"),
+        );
+        assert!(propagated.is_err());
     }
 }
 
@@ -789,20 +930,17 @@ impl<'a> DecodeSession<'a> {
                 .capture_graph_id
                 .expect("capture graph id assigned in ensure_capture_state");
             self.session
-                .run_with_binding_graph(&self.binding, graph_id)
-                .map_err(CapturedStepError::RunInvoked)?;
+                .run_with_binding_graph_phased(&self.binding, graph_id)
+                .map_err(classify_run_phase)?;
         }
         // A graph is now captured under `capture_graph_id`; mark it so reset /
         // rewind / drop release it before this session's buffers are freed.
         self.capture_bound = true;
-        self.current_len = self
-            .current_len
-            .checked_add(1)
-            .ok_or_else(|| {
-                CapturedStepError::RunInvoked(OrtError::InvalidArgument(
-                    "decode length overflow".into(),
-                ))
-            })?;
+        self.current_len = self.current_len.checked_add(1).ok_or_else(|| {
+            CapturedStepError::RunInvoked(OrtError::InvalidArgument(
+                "decode length overflow".into(),
+            ))
+        })?;
 
         // Reduce or copy the persistent logits buffer while it is still live.
         // With `params` set (greedy or non-greedy) the device sampler reads only
@@ -879,9 +1017,8 @@ impl<'a> DecodeSession<'a> {
         let position_ids = Value::from_vec_i64(vec![0i64], &[1, 1])?;
         let attention_mask = Value::from_vec_i64(vec![0i64; mask_len], &[1, mask_len as i64])?;
         let logits_dtype = logits_info.dtype;
-        let vocab_usize = usize::try_from(vocab).map_err(|_| {
-            OrtError::InvalidArgument("logits vocab dim is negative".into())
-        })?;
+        let vocab_usize = usize::try_from(vocab)
+            .map_err(|_| OrtError::InvalidArgument("logits vocab dim is negative".into()))?;
         // Ends the immutable borrow of `self.session` (`logits_info`) before the
         // device-argmax setup below borrows `self` mutably.
         let _ = logits_info;
@@ -911,8 +1048,7 @@ impl<'a> DecodeSession<'a> {
             }
             if logits_on_device && self.device_sampler.is_none() {
                 let device = self.session.cuda_device_id().unwrap_or(0).max(0) as usize;
-                let sampler =
-                    Box::new(CudaSampler::new(device)?) as Box<dyn DeviceSampler>;
+                let sampler = Box::new(CudaSampler::new(device)?) as Box<dyn DeviceSampler>;
                 tracing::debug!(
                     sampler = sampler.name(),
                     device,
@@ -2856,7 +2992,12 @@ impl<'a> BatchedDecodeSession<'a> for BatchedStaticCacheDecodeSession<'a> {
         position_ids: &[i64],
         advance_rows: &[bool],
     ) -> Result<Value> {
-        BatchedStaticCacheDecodeSession::step_select(self, next_token_ids, position_ids, advance_rows)
+        BatchedStaticCacheDecodeSession::step_select(
+            self,
+            next_token_ids,
+            position_ids,
+            advance_rows,
+        )
     }
     fn step_active(&mut self, next_token_ids: &[i64], position_ids: &[i64]) -> Result<Value> {
         BatchedStaticCacheDecodeSession::step_active(self, next_token_ids, position_ids)
@@ -2935,7 +3076,8 @@ impl<'a> BatchedSharedBufferDecodeSession<'a> {
             let lower = input.name.to_ascii_lowercase();
             lower == "attention_mask" || lower.ends_with(".attention_mask")
         });
-        if !has_attention_mask {            return Err(OrtError::InvalidArgument(
+        if !has_attention_mask {
+            return Err(OrtError::InvalidArgument(
                 "shared-buffer batching requires an attention_mask input to signal per-row \
                  sequence lengths"
                     .into(),
@@ -2981,7 +3123,9 @@ impl<'a> BatchedSharedBufferDecodeSession<'a> {
 
     /// Active logical rows in ascending physical order.
     pub fn active_rows(&self) -> Vec<usize> {
-        (0..self.batch_size).filter(|&row| self.active[row]).collect()
+        (0..self.batch_size)
+            .filter(|&row| self.active[row])
+            .collect()
     }
 
     /// Mark a row inactive; its slot may be recycled by [`Self::assign_row`].
@@ -3179,26 +3323,42 @@ impl<'a> BatchedSharedBufferDecodeSession<'a> {
             if lower == "input_ids" || lower.ends_with(".input_ids") {
                 self.binding
                     .bind_input(&input.name, &input_ids_value)
-                    .map_err(|e| OrtError::InvalidArgument(format!("bind input_ids '{}': {e}", input.name)))?;
+                    .map_err(|e| {
+                        OrtError::InvalidArgument(format!("bind input_ids '{}': {e}", input.name))
+                    })?;
             } else if lower == "attention_mask" || lower.ends_with(".attention_mask") {
                 self.binding
                     .bind_input(&input.name, &attention_mask_value)
-                    .map_err(|e| OrtError::InvalidArgument(format!("bind attention_mask '{}': {e}", input.name)))?;
+                    .map_err(|e| {
+                        OrtError::InvalidArgument(format!(
+                            "bind attention_mask '{}': {e}",
+                            input.name
+                        ))
+                    })?;
             } else if let Some(position_ids_value) = position_ids_value.as_ref()
                 && (lower == "position_ids" || lower.ends_with(".position_ids"))
             {
                 self.binding
                     .bind_input(&input.name, position_ids_value)
-                    .map_err(|e| OrtError::InvalidArgument(format!("bind position_ids '{}': {e}", input.name)))?;
+                    .map_err(|e| {
+                        OrtError::InvalidArgument(format!(
+                            "bind position_ids '{}': {e}",
+                            input.name
+                        ))
+                    })?;
             }
         }
         for pair in &self.kv_pairs {
             let value = self.kv_buffers.get(&pair.past).ok_or_else(|| {
                 OrtError::InvalidArgument(format!("missing shared KV buffer for '{}'", pair.past))
             })?;
-            self.binding
-                .bind_input(&pair.past, value)
-                .map_err(|e| OrtError::InvalidArgument(format!("bind past '{}' shape {:?}: {e}", pair.past, value.shape())))?;
+            self.binding.bind_input(&pair.past, value).map_err(|e| {
+                OrtError::InvalidArgument(format!(
+                    "bind past '{}' shape {:?}: {e}",
+                    pair.past,
+                    value.shape()
+                ))
+            })?;
         }
         let mut borrowed_outputs = Vec::new();
         for output in self.session.output_names() {
@@ -3210,13 +3370,15 @@ impl<'a> BatchedSharedBufferDecodeSession<'a> {
                     ))
                 })?;
                 borrowed_outputs.push(value.raw_ptr_addr());
-                self.binding
-                    .bind_output(output, value)
-                    .map_err(|e| OrtError::InvalidArgument(format!("bind present '{output}': {e}")))?;
+                self.binding.bind_output(output, value).map_err(|e| {
+                    OrtError::InvalidArgument(format!("bind present '{output}': {e}"))
+                })?;
             } else {
                 self.binding
                     .bind_output_to_device(output, &MemoryInfo::cpu()?)
-                    .map_err(|e| OrtError::InvalidArgument(format!("bind output '{output}' to cpu: {e}")))?;
+                    .map_err(|e| {
+                        OrtError::InvalidArgument(format!("bind output '{output}' to cpu: {e}"))
+                    })?;
             }
         }
         drop(bind_span);
@@ -3257,8 +3419,9 @@ impl<'a> BatchedSharedBufferDecodeSession<'a> {
         }
         let logits = logits
             .ok_or_else(|| OrtError::InvalidArgument("model did not produce logits".into()))?;
-        let logits = to_f32_logits(&logits)
-            .map_err(|e| OrtError::InvalidArgument(format!("convert batched logits to f32: {e}")))?;
+        let logits = to_f32_logits(&logits).map_err(|e| {
+            OrtError::InvalidArgument(format!("convert batched logits to f32: {e}"))
+        })?;
 
         for row in 0..batch {
             if advances[row] {
@@ -3351,10 +3514,7 @@ fn gather_logits_rows(logits: &Value, rows: &[usize]) -> Result<Value> {
         let start = row * row_stride;
         gathered.extend_from_slice(&data[start..start + row_stride]);
     }
-    Value::from_vec_f32(
-        gathered,
-        &[rows.len() as i64, seq_len as i64, vocab as i64],
-    )
+    Value::from_vec_f32(gathered, &[rows.len() as i64, seq_len as i64, vocab as i64])
 }
 
 fn infer_kv_pairs(session: &Session) -> Result<Vec<KvPair>> {
