@@ -1698,6 +1698,7 @@ dependencies = [
  "async-trait",
  "half",
  "llguidance",
+ "memmap2",
  "onnx-genai-genai-config",
  "onnx-genai-kv",
  "onnx-genai-metadata",
