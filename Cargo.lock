@@ -1697,6 +1697,7 @@ dependencies = [
  "onnx-genai-preprocess",
  "onnx-genai-runtime-config",
  "onnx-genai-scheduler",
+ "onnx-rs",
  "onnx-runtime-ep-cpu",
  "onnx-runtime-ep-cuda",
  "onnx-runtime-ir",

@@ -47,4 +47,5 @@ toktrie_hf_tokenizers = "1.7.6"
 
 [dev-dependencies]
 onnx-genai-preprocess = { workspace = true }
+onnx-rs = { workspace = true }
 async-trait = { workspace = true }

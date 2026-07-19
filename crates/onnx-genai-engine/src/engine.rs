@@ -2291,11 +2291,15 @@ fn maybe_enable_cuda_graph(options: &mut SessionOptions, model_directory: &Model
     }
 }
 
+/// Models larger than this likely embed initializer data inline. Decoding them
+/// solely to inspect their graph would be needlessly expensive.
+const MAX_CONTROL_FLOW_SCAN_BYTES: u64 = 512 * 1024 * 1024;
+
 /// Minimal protobuf views used to scan an ONNX graph's node `op_type`s without
 /// pulling in the full model proto (which lives behind the `native-backend`
 /// feature). prost silently ignores unknown fields, so only the traversed tags
 /// need declaring: `ModelProto.graph = 7`, `GraphProto.node = 1`,
-/// `NodeProto.op_type = 4`.
+/// `NodeProto.op_type = 4`, and `NodeProto.domain = 7`.
 #[derive(Clone, PartialEq, prost::Message)]
 struct ScanModel {
     #[prost(message, optional, tag = "7")]
@@ -2312,6 +2316,8 @@ struct ScanGraph {
 struct ScanNode {
     #[prost(string, tag = "4")]
     op_type: String,
+    #[prost(string, tag = "7")]
+    domain: String,
 }
 
 /// Whether the ONNX model at `model_path` contains top-level control-flow nodes
@@ -2320,34 +2326,33 @@ struct ScanNode {
 /// forces a pathological ~6× slower per-Run path, so the caller must leave graph
 /// capture disabled when this returns `true`.
 ///
-/// Returns `false` (preserving the capture-enabled default) whenever the model
-/// cannot be inspected — unreadable, unparseable, or larger than
-/// [`MAX_CONTROL_FLOW_SCAN_BYTES`] (a model that embeds its weights inline rather
-/// than as external data, where parsing would be needlessly expensive).
+/// Returns `true` whenever the model cannot be inspected. CUDA graph capture is
+/// an optional optimization, so uncertain models conservatively skip it rather
+/// than risking ORT's pathological uncaptured per-Run path.
 fn model_has_control_flow_nodes(model_path: &Path) -> bool {
-    /// onnxruntime-genai / Foundry models keep weights in an external
-    /// `model.onnx.data`, so the graph proto itself is small (a few MB). Skip the
-    /// scan for anything larger to avoid decoding an inline-weight model.
-    const MAX_CONTROL_FLOW_SCAN_BYTES: u64 = 512 * 1024 * 1024;
     const CONTROL_FLOW_OPS: [&str; 3] = ["If", "Loop", "Scan"];
 
     match std::fs::metadata(model_path) {
-        Ok(meta) if meta.len() > MAX_CONTROL_FLOW_SCAN_BYTES => return false,
+        // onnxruntime-genai / Foundry models keep weights in an external
+        // `model.onnx.data`, so the graph proto itself is small (a few MB).
+        // Avoid decoding an inline-weight model, but conservatively leave graph
+        // capture off because it may still contain control flow.
+        Ok(meta) if meta.len() > MAX_CONTROL_FLOW_SCAN_BYTES => return true,
         Ok(_) => {}
-        Err(_) => return false,
+        Err(_) => return true,
     }
     let Ok(bytes) = std::fs::read(model_path) else {
-        return false;
+        return true;
     };
     use prost::Message;
     let Ok(model) = ScanModel::decode(bytes.as_slice()) else {
-        return false;
+        return true;
     };
     model.graph.is_some_and(|graph| {
-        graph
-            .node
-            .iter()
-            .any(|node| CONTROL_FLOW_OPS.contains(&node.op_type.as_str()))
+        graph.node.iter().any(|node| {
+            matches!(node.domain.as_str(), "" | "ai.onnx")
+                && CONTROL_FLOW_OPS.contains(&node.op_type.as_str())
+        })
     })
 }
 
@@ -2539,56 +2544,105 @@ mod tests {
     #[test]
     fn cap_kv_len_ignores_cap_larger_than_model_max() {
         assert_eq!(cap_kv_len(512, Some(40_960)), 512);
-    fn write_scan_model(op_types: &[&str]) -> std::path::PathBuf {
+    }
+
+    fn test_model_path(label: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static NEXT_PATH_ID: AtomicUsize = AtomicUsize::new(0);
+        std::env::current_dir()
+            .expect("current directory")
+            .join(format!(
+                ".onnx-genai-{label}-{}-{}.onnx",
+                std::process::id(),
+                NEXT_PATH_ID.fetch_add(1, Ordering::Relaxed)
+            ))
+    }
+
+    fn write_scan_model(nodes: &[(&str, &str)]) -> std::path::PathBuf {
+        use onnx::ir::{DataType, Graph, Node, NodeId, static_shape};
+        use onnx_rs as onnx;
         use prost::Message;
-        let model = ScanModel {
-            graph: Some(ScanGraph {
-                node: op_types
-                    .iter()
-                    .map(|op| ScanNode {
-                        op_type: (*op).to_string(),
-                    })
-                    .collect(),
-            }),
-        };
-        let mut path = std::env::temp_dir();
-        path.push(format!(
-            "onnx_genai_control_flow_scan_{}_{:?}.onnx",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        std::fs::write(&path, model.encode_to_vec()).unwrap();
+
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 17);
+        for (index, &(domain, op_type)) in nodes.iter().enumerate() {
+            let output = graph.create_named_value(
+                format!("output_{index}"),
+                DataType::Float32,
+                static_shape([]),
+            );
+            let mut node = Node::new(NodeId(index as u32), op_type, vec![], vec![output]);
+            node.domain = domain.to_string();
+            graph.insert_node(node);
+            graph.add_output(output);
+        }
+
+        let path = test_model_path("control-flow");
+        std::fs::write(
+            &path,
+            onnx::Model::new(graph)
+                .to_proto()
+                .expect("serialize test model")
+                .encode_to_vec(),
+        )
+        .expect("write test model");
         path
     }
 
     #[test]
-    fn control_flow_scan_detects_if_loop_scan_but_not_regular_ops() {
-        let plain = write_scan_model(&["MatMul", "Add", "GroupQueryAttention"]);
+    fn control_flow_scan_ignores_regular_ops() {
+        let plain = write_scan_model(&[("", "MatMul"), ("", "Add"), ("", "GroupQueryAttention")]);
         assert!(!model_has_control_flow_nodes(&plain));
         std::fs::remove_file(&plain).ok();
+    }
 
-        for op in ["If", "Loop", "Scan"] {
-            let path = write_scan_model(&["MatMul", op, "Add"]);
+    #[test]
+    fn control_flow_scan_detects_standard_onnx_control_flow_ops() {
+        for domain in ["", "ai.onnx"] {
+            for op_type in ["If", "Loop", "Scan"] {
+                let path = write_scan_model(&[(domain, op_type)]);
+                assert!(
+                    model_has_control_flow_nodes(&path),
+                    "expected standard-domain control-flow op '{domain}:{op_type}' to be detected"
+                );
+                std::fs::remove_file(&path).ok();
+            }
+        }
+    }
+
+    #[test]
+    fn control_flow_scan_ignores_custom_domain_control_flow_names() {
+        for op_type in ["If", "Loop", "Scan"] {
+            let path = write_scan_model(&[("com.example", op_type)]);
             assert!(
-                model_has_control_flow_nodes(&path),
-                "expected control-flow op '{op}' to be detected"
+                !model_has_control_flow_nodes(&path),
+                "custom-domain op 'com.example:{op_type}' must not disable capture"
             );
             std::fs::remove_file(&path).ok();
         }
     }
 
     #[test]
-    fn control_flow_scan_returns_false_for_missing_or_unparseable_model() {
+    fn control_flow_scan_conservatively_skips_uninspectable_models() {
         let missing = std::path::Path::new("does-not-exist-onnx-genai.onnx");
-        assert!(!model_has_control_flow_nodes(missing));
+        assert!(model_has_control_flow_nodes(missing));
 
-        let mut garbage = std::env::temp_dir();
-        garbage.push(format!("onnx_genai_garbage_{}.onnx", std::process::id()));
-        std::fs::write(&garbage, b"not a protobuf").ok();
-        // Arbitrary bytes may or may not decode as an (empty) proto, but must
-        // never report control flow.
-        assert!(!model_has_control_flow_nodes(&garbage));
+        let garbage = test_model_path("garbage");
+        std::fs::write(&garbage, b"not a protobuf").expect("write garbage model");
+        assert!(model_has_control_flow_nodes(&garbage));
         std::fs::remove_file(&garbage).ok();
+    }
+
+    #[test]
+    fn control_flow_scan_conservatively_skips_large_models() {
+        let path = test_model_path("large-control-flow");
+        std::fs::File::create(&path)
+            .expect("create large test model")
+            .set_len(MAX_CONTROL_FLOW_SCAN_BYTES + 1)
+            .expect("make sparse large test model");
+        assert!(model_has_control_flow_nodes(&path));
+        std::fs::remove_file(&path).ok();
     }
 
     #[cfg(feature = "native-backend")]
