@@ -398,8 +398,10 @@ impl Engine {
         let decode_backend =
             resolve_decode_backend(&model_directory.model_path, config.decode_backend)?;
         if decode_backend == EngineDecodeBackend::Native {
-            return Self::from_native_model_directory(model_directory, config, &session_options)
-                .with_context(native_to_ort_hint);
+            return augment_backend_error(
+                Self::from_native_model_directory(model_directory, config, &session_options),
+                EngineDecodeBackend::Native,
+            );
         }
 
         // Auto-enable CUDA graph capture for models that will run the shared-KV
@@ -414,13 +416,15 @@ impl Engine {
 
         let environment = Environment::new("onnx-genai-engine")
             .map_err(|e| anyhow::anyhow!("Failed to create ORT environment: {}", e))?;
-        let session = Session::new(
-            &environment,
-            &model_directory.model_path,
-            session_options.clone(),
-        )
-        .map_err(|e| anyhow::anyhow!("Failed to load ORT session: {}", e))
-        .with_context(ort_to_native_hint)?;
+        let session = augment_backend_error(
+            Session::new(
+                &environment,
+                &model_directory.model_path,
+                session_options.clone(),
+            )
+            .map_err(|e| anyhow::anyhow!("Failed to load ORT session: {}", e)),
+            EngineDecodeBackend::Ort,
+        )?;
 
         // Resolve inference metadata. Our own `inference_metadata.yaml` is the
         // canonical source of truth. When a model ships without it (e.g. the
@@ -1045,9 +1049,16 @@ impl Engine {
             .native_session
             .as_mut()
             .context("native decoder session is unavailable")?;
-        native_session
-            .generate_with_callback(&prompt_tokens, &options, &chain, &self.tokenizer, callback)
-            .with_context(native_to_ort_hint)
+        augment_backend_error(
+            native_session.generate_with_callback(
+                &prompt_tokens,
+                &options,
+                &chain,
+                &self.tokenizer,
+                callback,
+            ),
+            EngineDecodeBackend::Native,
+        )
     }
 
     #[cfg(not(feature = "native-backend"))]
@@ -2269,6 +2280,18 @@ fn native_to_ort_hint() -> &'static str {
      to run this model on ONNX Runtime"
 }
 
+fn augment_backend_error<T>(
+    result: anyhow::Result<T>,
+    backend: EngineDecodeBackend,
+) -> anyhow::Result<T> {
+    let hint = match backend {
+        EngineDecodeBackend::Ort => ort_to_native_hint(),
+        EngineDecodeBackend::Native => native_to_ort_hint(),
+        EngineDecodeBackend::Auto => unreachable!("the selected backend cannot be Auto"),
+    };
+    result.with_context(|| hint)
+}
+
 pub(crate) fn model_requires_native_backend(model_path: &Path) -> anyhow::Result<bool> {
     #[cfg(feature = "native-backend")]
     {
@@ -2953,23 +2976,28 @@ mod tests {
     }
 
     #[test]
-    fn backend_failure_hints_explain_how_to_switch() {
-        let ort_hint = ort_to_native_hint();
-        assert!(
-            ort_hint.contains("EngineDecodeBackend::Native"),
-            "{ort_hint}"
-        );
-        assert!(ort_hint.contains("ONNX_GENAI_BACKEND=native"), "{ort_hint}");
+    fn forced_ort_load_failure_includes_native_switch_hint() {
+        let error = augment_backend_error::<()>(
+            Err(anyhow::anyhow!("simulated native-only model load failure")),
+            EngineDecodeBackend::Ort,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("EngineDecodeBackend::Native"), "{error}");
+        assert!(error.contains("ONNX_GENAI_BACKEND=native"), "{error}");
+    }
 
-        let native_hint = native_to_ort_hint();
-        assert!(
-            native_hint.contains("EngineDecodeBackend::Ort"),
-            "{native_hint}"
-        );
-        assert!(
-            native_hint.contains("ONNX_GENAI_BACKEND=ort"),
-            "{native_hint}"
-        );
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn forced_native_load_or_run_failure_includes_ort_switch_hint() {
+        let error = augment_backend_error::<()>(
+            Err(anyhow::anyhow!("simulated native decoder load/run failure")),
+            EngineDecodeBackend::Native,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("EngineDecodeBackend::Ort"), "{error}");
+        assert!(error.contains("ONNX_GENAI_BACKEND=ort"), "{error}");
     }
 
     #[cfg(not(feature = "native-backend"))]
