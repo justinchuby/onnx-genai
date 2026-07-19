@@ -57,7 +57,10 @@ fn even_split(dim: usize, n: usize) -> Result<Vec<usize>> {
         return Ok(vec![dim / n; n]);
     }
     let chunk = dim / n + 1;
-    if chunk * (n - 1) > dim {
+    let leading_total = chunk
+        .checked_mul(n - 1)
+        .ok_or_else(|| EpError::KernelFailed("Split: split-size arithmetic overflowed".into()))?;
+    if leading_total > dim {
         return Err(EpError::KernelFailed(format!(
             "Split: WHAT: cannot split axis extent {dim} into {n} parts. \
              WHY: the even chunk size {chunk} leaves a negative final remainder. \
@@ -65,7 +68,7 @@ fn even_split(dim: usize, n: usize) -> Result<Vec<usize>> {
         )));
     }
     let mut sizes = vec![chunk; n - 1];
-    sizes.push(dim - chunk * (n - 1));
+    sizes.push(dim - leading_total);
     Ok(sizes)
 }
 
@@ -113,6 +116,16 @@ impl Kernel for SplitKernel {
         let axis = resolved as usize;
         let axis_dim = in_shape[axis];
         let n_out = outputs.len();
+        if let Some(raw) = self.num_outputs {
+            let configured = usize::try_from(raw).map_err(|_| {
+                EpError::KernelFailed(format!("Split: `num_outputs` must be positive, got {raw}"))
+            })?;
+            if configured == 0 || configured != n_out {
+                return Err(EpError::KernelFailed(format!(
+                    "Split: `num_outputs` must equal the positive output count {n_out}, got {raw}"
+                )));
+            }
+        }
 
         // Resolve split sizes in ONNX precedence: `split` input, then legacy
         // `split` attribute, then an even division (opset-18 `num_outputs`).
@@ -173,6 +186,15 @@ impl Kernel for SplitKernel {
 
         let mut prefix = 0usize;
         for (k, &sz) in sizes.iter().enumerate() {
+            let mut expected_shape = in_shape.clone();
+            expected_shape[axis] = sz;
+            if outputs[k].dtype != inputs[0].dtype || outputs[k].shape != expected_shape {
+                return Err(EpError::KernelFailed(format!(
+                    "Split: output {k} must have dtype {:?} and shape {expected_shape:?}, got \
+                     {:?}{:?}",
+                    inputs[0].dtype, outputs[k].dtype, outputs[k].shape
+                )));
+            }
             let chunk_bytes = sz * inner_bytes;
             let mut buf = vec![0u8; outer * chunk_bytes];
             if chunk_bytes != 0 {
@@ -249,19 +271,63 @@ mod tests {
 
     #[test]
     fn split_num_outputs_remainder() {
-        // opset-18 num_outputs=3 on extent 7 → sizes [3,3,1].
+        // opset-18 num_outputs=4 on extent 7 → sizes [2,2,2,1].
         assert_eq!(even_split(7, 3).unwrap(), vec![3, 3, 1]);
         assert_eq!(even_split(5, 2).unwrap(), vec![3, 2]);
         let x = Owned::f32(&[7], &[1., 2., 3., 4., 5., 6., 7.]);
-        let mut o0 = Owned::zeros_f32(&[3]);
-        let mut o1 = Owned::zeros_f32(&[3]);
-        let mut o2 = Owned::zeros_f32(&[1]);
-        kernel(0, None, Some(3))
-            .execute(&[x.view()], &mut [o0.view_mut(), o1.view_mut(), o2.view_mut()])
+        let mut o0 = Owned::zeros_f32(&[2]);
+        let mut o1 = Owned::zeros_f32(&[2]);
+        let mut o2 = Owned::zeros_f32(&[2]);
+        let mut o3 = Owned::zeros_f32(&[1]);
+        kernel(0, None, Some(4))
+            .execute(
+                &[x.view()],
+                &mut [o0.view_mut(), o1.view_mut(), o2.view_mut(), o3.view_mut()],
+            )
             .unwrap();
-        assert_eq!(o0.to_f32(), vec![1., 2., 3.]);
-        assert_eq!(o1.to_f32(), vec![4., 5., 6.]);
-        assert_eq!(o2.to_f32(), vec![7.]);
+        assert_eq!(o0.to_f32(), vec![1., 2.]);
+        assert_eq!(o1.to_f32(), vec![3., 4.]);
+        assert_eq!(o2.to_f32(), vec![5., 6.]);
+        assert_eq!(o3.to_f32(), vec![7.]);
+    }
+
+    #[test]
+    fn split_explicit_zero_size_parts() {
+        let x = Owned::f32(&[0], &[]);
+        let split = Owned::i64(&[3], &[0, 0, 0]);
+        let mut o0 = Owned::zeros_f32(&[0]);
+        let mut o1 = Owned::zeros_f32(&[0]);
+        let mut o2 = Owned::zeros_f32(&[0]);
+
+        kernel(0, None, None)
+            .execute(
+                &[x.view(), split.view()],
+                &mut [o0.view_mut(), o1.view_mut(), o2.view_mut()],
+            )
+            .unwrap();
+
+        assert!(o0.bytes.is_empty());
+        assert!(o1.bytes.is_empty());
+        assert!(o2.bytes.is_empty());
+    }
+
+    #[test]
+    fn split_num_outputs_allows_zero_final_part() {
+        let x = Owned::f32(&[2], &[10., 20.]);
+        let mut o0 = Owned::zeros_f32(&[1]);
+        let mut o1 = Owned::zeros_f32(&[1]);
+        let mut o2 = Owned::zeros_f32(&[0]);
+
+        kernel(0, None, Some(3))
+            .execute(
+                &[x.view()],
+                &mut [o0.view_mut(), o1.view_mut(), o2.view_mut()],
+            )
+            .unwrap();
+
+        assert_eq!(o0.to_f32(), vec![10.]);
+        assert_eq!(o1.to_f32(), vec![20.]);
+        assert!(o2.bytes.is_empty());
     }
 
     #[test]
@@ -272,7 +338,10 @@ mod tests {
         let mut o0 = Owned::zeros(DataType::Int64, &[3]);
         let mut o1 = Owned::zeros(DataType::Int64, &[2]);
         kernel(0, None, None)
-            .execute(&[x.view(), split.view()], &mut [o0.view_mut(), o1.view_mut()])
+            .execute(
+                &[x.view(), split.view()],
+                &mut [o0.view_mut(), o1.view_mut()],
+            )
             .unwrap();
         assert_eq!(o0.to_i64(), vec![10, 20, 30]);
         assert_eq!(o1.to_i64(), vec![40, 50]);

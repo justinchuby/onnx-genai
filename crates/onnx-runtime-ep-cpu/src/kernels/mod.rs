@@ -45,6 +45,7 @@ pub mod concat;
 pub mod constant;
 pub mod constant_of_shape;
 pub mod contrib_fused;
+pub mod dropout;
 pub mod elementwise;
 pub mod expand;
 pub mod fused_attention;
@@ -205,6 +206,7 @@ pub const PHASE1_OPS: &[&str] = &[
     "QuantizeLinear",
     "DequantizeLinear",
     "DynamicQuantizeLinear",
+    "Dropout",
 ];
 
 /// Whether `op_type` is one of the Phase-1 ops the CPU EP can run.
@@ -482,6 +484,15 @@ pub(crate) fn build_cpu_registry_with_weight_offload_cache(
     reg.register(OpKey::new("Expand", "", 1), Box::new(expand::ExpandFactory));
     reg.register(OpKey::new("Slice", "", 1), Box::new(slice::SliceFactory));
     reg.register(OpKey::new("Split", "", 1), Box::new(split::SplitFactory));
+    reg.register(OpKey::new("Split", "", 18), Box::new(split::SplitFactory));
+    reg.register(
+        OpKey::new("Dropout", "", 13),
+        Box::new(dropout::DropoutFactory),
+    );
+    reg.register(
+        OpKey::new("Dropout", "", 22),
+        Box::new(dropout::DropoutFactory),
+    );
     reg.register(OpKey::new("Pad", "", 1), Box::new(pad::PadFactory));
     reg.register(
         OpKey::new("AffineGrid", "", 20),
@@ -1440,7 +1451,7 @@ mod tests {
         // private/contrib registrations.
         // CumProd and the three standard window generators add four more
         // default-domain entries beyond the original Phase-1 set.
-        assert_eq!(reg.len(), PHASE1_OPS.len() + 78);
+        assert_eq!(reg.len(), PHASE1_OPS.len() + 80);
         for op in PHASE1_OPS {
             assert!(reg.lookup(op, "", 21).is_some(), "missing factory for {op}");
         }
@@ -1459,6 +1470,9 @@ mod tests {
         assert!(reg.lookup("LpPool", "", 18).is_some());
         assert!(reg.lookup("GlobalLpPool", "", 2).is_some());
         assert!(reg.lookup("SpaceToDepth", "", 13).is_some());
+        assert!(reg.lookup("Split", "", 18).is_some());
+        assert!(reg.lookup("Dropout", "", 13).is_some());
+        assert!(reg.lookup("Dropout", "", 22).is_some());
         assert!(reg.lookup("MatMulNBits", "com.microsoft", 1).is_some());
         assert!(reg.lookup("QMoE", "com.microsoft", 1).is_some());
         assert!(reg.lookup("BlockQuantizedMatMul", "pkg.nxrt", 1).is_some());
