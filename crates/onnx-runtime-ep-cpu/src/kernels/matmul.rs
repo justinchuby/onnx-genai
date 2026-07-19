@@ -49,6 +49,8 @@ mod simd_gemm;
 pub(crate) struct MatMulPrepack {
     constant_inputs: [bool; 2],
     dense: [OnceLock<Vec<f32>>; 2],
+    #[cfg(feature = "mlas")]
+    packed_b: OnceLock<mlas_sys::PackedB>,
 }
 
 impl MatMulPrepack {
@@ -77,6 +79,14 @@ impl MatMulPrepack {
                 ))
             }
         }
+    }
+
+    #[cfg(feature = "mlas")]
+    fn packed_b(&self, b: &[f32], k: usize, n: usize) -> Option<&mlas_sys::PackedB> {
+        self.constant_inputs[1].then(|| {
+            self.packed_b
+                .get_or_init(|| mlas_sys::PackedB::new(n, k, b))
+        })
     }
 }
 
@@ -110,6 +120,20 @@ pub(crate) fn gemm(
     n: usize,
 ) -> Result<()> {
     gemm_with_backend(CpuBackend::auto_detect(), a, b, c, m, k, n)
+}
+
+#[cfg(feature = "mlas")]
+fn gemm_packed(
+    a: &[f32],
+    packed: &mlas_sys::PackedB,
+    c: &mut [f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<()> {
+    assert_eq!(packed.dimensions(), (k, n));
+    mlas_sys::sgemm_nn_packed(m, a, packed, c);
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -253,13 +277,7 @@ impl Kernel for MatMulKernel {
     }
 
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
-        check_arity("MatMul", inputs, outputs, 2, 2, 1)?;
-        let out = matmul_dense_prepacked(&inputs[0], &inputs[1], &self.prepack)?;
-        // If either operand was 1-D, the corresponding size-1 axis is squeezed
-        // out of the result; the narrowing writer uses the output view's own
-        // shape and dtype (f32/f16/bf16/f64), so the buffer matches element for
-        // element and rounds to the requested precision.
-        write_dense_f32_narrow("MatMul", &mut outputs[0], &out)
+        self.execute_with_backend(inputs, outputs, CpuBackend::auto_detect())
     }
 
     fn supports_strided_input(&self, _input_idx: usize) -> bool {
@@ -271,6 +289,24 @@ impl Kernel for MatMulKernel {
     }
 }
 
+impl MatMulKernel {
+    fn execute_with_backend(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        backend: CpuBackend,
+    ) -> Result<()> {
+        check_arity("MatMul", inputs, outputs, 2, 2, 1)?;
+        let out =
+            matmul_dense_prepacked_with_backend(&inputs[0], &inputs[1], &self.prepack, backend)?;
+        // If either operand was 1-D, the corresponding size-1 axis is squeezed
+        // out of the result; the narrowing writer uses the output view's own
+        // shape and dtype (f32/f16/bf16/f64), so the buffer matches element for
+        // element and rounds to the requested precision.
+        write_dense_f32_narrow("MatMul", &mut outputs[0], &out)
+    }
+}
+
 /// Compute `A @ B` (numpy semantics: batched, broadcast leading dims, 1-D
 /// operand promotion) into a dense row-major `Vec<f32>`.
 ///
@@ -279,28 +315,49 @@ impl Kernel for MatMulKernel {
 /// (standard mixed-precision matmul). Shared by [`MatMulKernel`] and the fused
 /// `FusedMatMulBias` kernel so both go through exactly one GEMM implementation.
 pub(crate) fn matmul_dense(a: &TensorView, b: &TensorView) -> Result<Vec<f32>> {
-    matmul_dense_impl(
+    matmul_dense_impl_with_backend(
         a,
         b,
         to_dense_f32_widen("MatMul", a)?,
         to_dense_f32_widen("MatMul", b)?,
+        CpuBackend::auto_detect(),
+        #[cfg(feature = "mlas")]
+        None,
     )
 }
 
-// TODO(mlas prepack): cache `mlas_sys::PackedB` for immutable f32 B weights.
 pub(crate) fn matmul_dense_prepacked(
     a: &TensorView,
     b: &TensorView,
     prepack: &MatMulPrepack,
 ) -> Result<Vec<f32>> {
-    matmul_dense_impl(a, b, prepack.dense(0, a)?, prepack.dense(1, b)?)
+    matmul_dense_prepacked_with_backend(a, b, prepack, CpuBackend::auto_detect())
 }
 
-fn matmul_dense_impl(
+fn matmul_dense_prepacked_with_backend(
+    a: &TensorView,
+    b: &TensorView,
+    prepack: &MatMulPrepack,
+    backend: CpuBackend,
+) -> Result<Vec<f32>> {
+    matmul_dense_impl_with_backend(
+        a,
+        b,
+        prepack.dense(0, a)?,
+        prepack.dense(1, b)?,
+        backend,
+        #[cfg(feature = "mlas")]
+        Some(prepack),
+    )
+}
+
+fn matmul_dense_impl_with_backend(
     a: &TensorView,
     b: &TensorView,
     a_dense: Cow<'_, [f32]>,
     b_dense: Cow<'_, [f32]>,
+    backend: CpuBackend,
+    #[cfg(feature = "mlas")] prepack: Option<&MatMulPrepack>,
 ) -> Result<Vec<f32>> {
     // Promote 1-D operands per numpy matmul: a [K] -> [1,K] (drop row after),
     // b [K] -> [K,1] (drop col after).
@@ -357,19 +414,51 @@ fn matmul_dense_impl(
         return Ok(out);
     }
 
+    #[cfg(feature = "mlas")]
+    let packed_b = if backend == CpuBackend::Mlas && b_shape.len() == 2 {
+        prepack.and_then(|prepack| prepack.packed_b(&b_dense, k, n))
+    } else {
+        None
+    };
+
     if batch_shape.is_empty() {
         // No batch dims: a single matmul.
-        gemm(&a_dense, &b_dense, &mut out, m, k, n)?;
+        #[cfg(feature = "mlas")]
+        if let Some(packed_b) = packed_b {
+            gemm_packed(&a_dense, packed_b, &mut out, m, k, n)?;
+        } else {
+            gemm_with_backend(backend, &a_dense, &b_dense, &mut out, m, k, n)?;
+        }
+        #[cfg(not(feature = "mlas"))]
+        gemm_with_backend(backend, &a_dense, &b_dense, &mut out, m, k, n)?;
     } else {
         let mut bidx = vec![0usize; batch_shape.len()];
         let mut b_out = 0usize;
         loop {
             let a_off = broadcast_offset(&bidx, a_batch, &a_batch_strides) * a_mat;
             let b_off = broadcast_offset(&bidx, b_batch, &b_batch_strides) * b_mat;
-            gemm(
-                &a_dense[a_off..a_off + a_mat],
+            let a_tile = &a_dense[a_off..a_off + a_mat];
+            let c_tile = &mut out[b_out * c_mat..b_out * c_mat + c_mat];
+            #[cfg(feature = "mlas")]
+            if let Some(packed_b) = packed_b {
+                gemm_packed(a_tile, packed_b, c_tile, m, k, n)?;
+            } else {
+                gemm_with_backend(
+                    backend,
+                    a_tile,
+                    &b_dense[b_off..b_off + b_mat],
+                    c_tile,
+                    m,
+                    k,
+                    n,
+                )?;
+            }
+            #[cfg(not(feature = "mlas"))]
+            gemm_with_backend(
+                backend,
+                a_tile,
                 &b_dense[b_off..b_off + b_mat],
-                &mut out[b_out * c_mat..b_out * c_mat + c_mat],
+                c_tile,
                 m,
                 k,
                 n,
@@ -610,6 +699,158 @@ mod tests {
                 max_error <= 1e-3,
                 "{m}x{k} @ {k}x{n}: MLAS max error {max_error} exceeds tolerance"
             );
+        }
+    }
+
+    #[cfg(feature = "mlas")]
+    #[test]
+    fn mlas_constant_b_packed_kernel_matches_unpacked_and_generic() {
+        for (m, k, n) in [(5usize, 17usize, 9usize), (33, 64, 48)] {
+            let a_data: Vec<f32> = (0..m * k)
+                .map(|i| ((i as f32 * 0.037).sin()) * 0.25)
+                .collect();
+            let b_data: Vec<f32> = (0..k * n)
+                .map(|i| ((i as f32 * 0.021 + 0.3).cos()) * 0.25)
+                .collect();
+            let a = Owned::f32(&[m, k], &a_data);
+            let b = Owned::f32(&[k, n], &b_data);
+            let mut out = Owned::zeros_f32(&[m, n]);
+            let mut kernel = MatMulKernel::default();
+            kernel.set_constant_inputs(&[false, true]);
+            kernel
+                .execute_with_backend(
+                    &[a.view(), b.view()],
+                    &mut [out.view_mut()],
+                    CpuBackend::Mlas,
+                )
+                .unwrap();
+
+            let mut unpacked = vec![0.0; m * n];
+            let mut generic = vec![0.0; m * n];
+            gemm_with_backend(CpuBackend::Mlas, &a_data, &b_data, &mut unpacked, m, k, n).unwrap();
+            gemm_with_backend(CpuBackend::Generic, &a_data, &b_data, &mut generic, m, k, n)
+                .unwrap();
+
+            let packed = out.to_f32();
+            for (index, ((packed, unpacked), generic)) in
+                packed.iter().zip(&unpacked).zip(&generic).enumerate()
+            {
+                assert!(
+                    (packed - unpacked).abs() <= 1e-4,
+                    "{m}x{k}x{n} packed/unpacked mismatch at {index}: {packed} vs {unpacked}"
+                );
+                assert!(
+                    (packed - generic).abs() <= 1e-3,
+                    "{m}x{k}x{n} packed/generic mismatch at {index}: {packed} vs {generic}"
+                );
+            }
+            assert!(kernel.prepack.packed_b.get().is_some());
+        }
+    }
+
+    #[cfg(feature = "mlas")]
+    #[test]
+    fn mlas_constant_b_packed_buffer_is_reused() {
+        let mut kernel = MatMulKernel::default();
+        kernel.set_constant_inputs(&[false, true]);
+        let weight_data: Vec<f32> = (0..17 * 9)
+            .map(|i| ((i as f32 * 0.031).sin()) * 0.5)
+            .collect();
+        let weight = Owned::f16(&[17, 9], &weight_data);
+
+        let a1_data: Vec<f32> = (0..5 * 17).map(|i| i as f32 * 0.01).collect();
+        let a1 = Owned::f32(&[5, 17], &a1_data);
+        let mut out1 = Owned::zeros_f32(&[5, 9]);
+        kernel
+            .execute_with_backend(
+                &[a1.view(), weight.view()],
+                &mut [out1.view_mut()],
+                CpuBackend::Mlas,
+            )
+            .unwrap();
+        let packed_ptr = kernel.prepack.packed_b.get().unwrap() as *const mlas_sys::PackedB;
+        let dense_ptr = kernel.prepack.dense[1].get().unwrap().as_ptr();
+
+        let a2_data: Vec<f32> = (0..5 * 17)
+            .map(|i| ((i as f32 * 0.07).cos()) * 0.2)
+            .collect();
+        let a2 = Owned::f32(&[5, 17], &a2_data);
+        let mut out2 = Owned::zeros_f32(&[5, 9]);
+        kernel
+            .execute_with_backend(
+                &[a2.view(), weight.view()],
+                &mut [out2.view_mut()],
+                CpuBackend::Mlas,
+            )
+            .unwrap();
+
+        assert_eq!(
+            kernel.prepack.packed_b.get().unwrap() as *const mlas_sys::PackedB,
+            packed_ptr
+        );
+        assert_eq!(kernel.prepack.dense[1].get().unwrap().as_ptr(), dense_ptr);
+        assert!(kernel.prepack.dense[0].get().is_none());
+        assert_ne!(out1.to_f32(), out2.to_f32());
+    }
+
+    #[cfg(feature = "mlas")]
+    #[test]
+    fn mlas_packed_cache_requires_mlas_constant_unbatched_b() {
+        let (m, k, n) = (5usize, 17usize, 9usize);
+        let a_data: Vec<f32> = (0..m * k).map(|i| i as f32 * 0.01).collect();
+        let b_data: Vec<f32> = (0..k * n)
+            .map(|i| ((i as f32 * 0.02).sin()) * 0.1)
+            .collect();
+        let a = Owned::f32(&[m, k], &a_data);
+        let b = Owned::f32(&[k, n], &b_data);
+        let mut out = Owned::zeros_f32(&[m, n]);
+        let mut kernel = MatMulKernel::default();
+        kernel.set_constant_inputs(&[false, false]);
+        kernel
+            .execute_with_backend(
+                &[a.view(), b.view()],
+                &mut [out.view_mut()],
+                CpuBackend::Mlas,
+            )
+            .unwrap();
+
+        let mut expected = vec![0.0; m * n];
+        gemm_generic(&a_data, &b_data, &mut expected, m, k, n);
+        assert!(kernel.prepack.packed_b.get().is_none());
+        for (actual, expected) in out.to_f32().iter().zip(&expected) {
+            assert!((actual - expected).abs() <= 1e-3);
+        }
+
+        let mut generic_kernel = MatMulKernel::default();
+        generic_kernel.set_constant_inputs(&[false, true]);
+        let mut generic_out = Owned::zeros_f32(&[m, n]);
+        generic_kernel
+            .execute_with_backend(
+                &[a.view(), b.view()],
+                &mut [generic_out.view_mut()],
+                CpuBackend::Generic,
+            )
+            .unwrap();
+        assert!(generic_kernel.prepack.packed_b.get().is_none());
+        assert_eq!(generic_out.to_f32(), expected);
+
+        let batched_b_data = [b_data.clone(), b_data].concat();
+        let batched_a_data = [a_data.clone(), a_data].concat();
+        let batched_a = Owned::f32(&[2, m, k], &batched_a_data);
+        let batched_b = Owned::f32(&[2, k, n], &batched_b_data);
+        let mut batched_out = Owned::zeros_f32(&[2, m, n]);
+        let mut batched_kernel = MatMulKernel::default();
+        batched_kernel.set_constant_inputs(&[false, true]);
+        batched_kernel
+            .execute_with_backend(
+                &[batched_a.view(), batched_b.view()],
+                &mut [batched_out.view_mut()],
+                CpuBackend::Mlas,
+            )
+            .unwrap();
+        assert!(batched_kernel.prepack.packed_b.get().is_none());
+        for (actual, expected) in batched_out.to_f32().iter().zip(expected.iter().cycle()) {
+            assert!((actual - expected).abs() <= 1e-3);
         }
     }
 

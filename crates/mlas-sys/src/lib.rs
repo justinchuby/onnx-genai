@@ -143,6 +143,11 @@ pub struct PackedB {
     k: usize,
 }
 
+// SAFETY: construction fully initializes the allocation, which is immutable
+// afterward. Packed GEMM calls only read it, so shared concurrent use is safe.
+unsafe impl Send for PackedB {}
+unsafe impl Sync for PackedB {}
+
 impl PackedB {
     /// Pack a row-major `k x n` B matrix (no transpose, `ldb = n`).
     pub fn new(n: usize, k: usize, b: &[f32]) -> Self {
@@ -153,6 +158,11 @@ impl PackedB {
         assert!(!ptr.is_null(), "packed-B allocation failed");
         unsafe { mlas_sgemm_pack_b(0, 0, n, k, b.as_ptr(), n, ptr) };
         Self { ptr, layout, n, k }
+    }
+
+    /// Return the logical `(k, n)` dimensions of the packed B matrix.
+    pub fn dimensions(&self) -> (usize, usize) {
+        (self.k, self.n)
     }
 }
 
@@ -255,6 +265,13 @@ pub fn sgemm(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_send_sync<T: Send + Sync>() {}
+
+    #[test]
+    fn packed_b_is_send_sync() {
+        assert_send_sync::<PackedB>();
+    }
 
     /// Naive row-major triple-loop reference: C = alpha*op(A)*op(B) + beta*C.
     #[allow(clippy::too_many_arguments)]
