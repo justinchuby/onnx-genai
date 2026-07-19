@@ -1,9 +1,10 @@
-//! Attribute-driven f32 activation kernels.
+//! Attribute-driven float activation kernels.
 
 use onnx_runtime_ep_api::{Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ir::{DataType, Node};
 
-use super::{check_arity, to_dense_f32, write_dense_f32};
+use super::check_arity;
+use crate::dtype::{to_dense_f32_widen, write_dense_f32_narrow};
 
 const SELU_ALPHA_DEFAULT: f32 = 1.673_263_2;
 const SELU_GAMMA_DEFAULT: f32 = 1.050_701;
@@ -185,11 +186,11 @@ impl Kernel for ActivationKernel {
         {
             return Ok(());
         }
-        let y = to_dense_f32(&inputs[0])?
+        let y = to_dense_f32_widen(self.activation.name(), &inputs[0])?
             .into_iter()
-            .map(|x| self.activation.apply(x))
+            .map(|x| self.activation.apply(*x))
             .collect::<Vec<_>>();
-        write_dense_f32(&mut outputs[0], &y)
+        write_dense_f32_narrow(self.activation.name(), &mut outputs[0], &y)
     }
 
     fn supports_strided_input(&self, _input_idx: usize) -> bool {
@@ -316,6 +317,85 @@ mod tests {
             .execute(&[x.view()], &mut [out.view_mut()])
             .unwrap();
         assert_eq!(out.to_f32(), vec![0.0, 0.0, 1.0, 1.5, 2.0]);
+    }
+
+    #[test]
+    fn selu_supports_f16_f64_and_bf16() {
+        let values = [-1.0f32, 0.0, 2.0];
+        let expected: Vec<f32> = values
+            .iter()
+            .map(|&x| {
+                Activation::Selu {
+                    alpha: SELU_ALPHA_DEFAULT,
+                    gamma: SELU_GAMMA_DEFAULT,
+                }
+                .apply(x)
+            })
+            .collect();
+        let kernel = ActivationKernel {
+            activation: Activation::Selu {
+                alpha: SELU_ALPHA_DEFAULT,
+                gamma: SELU_GAMMA_DEFAULT,
+            },
+        };
+
+        let x16 = Owned::f16(&[3], &values);
+        let mut out16 = Owned::zeros(DataType::Float16, &[3]);
+        kernel
+            .execute(&[x16.view()], &mut [out16.view_mut()])
+            .unwrap();
+        for (got, want) in out16.to_f16_as_f32().into_iter().zip(&expected) {
+            assert!((got - want).abs() < 1e-3, "got {got}, want {want}");
+        }
+
+        let x64 = Owned::f64(&[3], &values.map(f64::from));
+        let mut out64 = Owned::zeros(DataType::Float64, &[3]);
+        kernel
+            .execute(&[x64.view()], &mut [out64.view_mut()])
+            .unwrap();
+        assert_eq!(
+            out64.to_f64(),
+            expected.iter().map(|&x| x as f64).collect::<Vec<_>>()
+        );
+
+        let xbf16 = Owned::bf16(&[3], &values);
+        let mut outbf16 = Owned::zeros(DataType::BFloat16, &[3]);
+        kernel
+            .execute(&[xbf16.view()], &mut [outbf16.view_mut()])
+            .unwrap();
+        for (got, want) in outbf16.to_bf16_as_f32().into_iter().zip(&expected) {
+            assert!((got - want).abs() < 1e-2, "got {got}, want {want}");
+        }
+    }
+
+    #[test]
+    fn thresholded_relu_supports_f16_f64_and_bf16() {
+        let values = [-1.0f32, 1.0, 1.5];
+        let expected = [0.0f32, 0.0, 1.5];
+        let kernel = ActivationKernel {
+            activation: Activation::ThresholdedRelu { alpha: 1.0 },
+        };
+
+        let x16 = Owned::f16(&[3], &values);
+        let mut out16 = Owned::zeros(DataType::Float16, &[3]);
+        kernel
+            .execute(&[x16.view()], &mut [out16.view_mut()])
+            .unwrap();
+        assert_eq!(out16.to_f16_as_f32(), expected);
+
+        let x64 = Owned::f64(&[3], &values.map(f64::from));
+        let mut out64 = Owned::zeros(DataType::Float64, &[3]);
+        kernel
+            .execute(&[x64.view()], &mut [out64.view_mut()])
+            .unwrap();
+        assert_eq!(out64.to_f64(), expected.map(f64::from));
+
+        let xbf16 = Owned::bf16(&[3], &values);
+        let mut outbf16 = Owned::zeros(DataType::BFloat16, &[3]);
+        kernel
+            .execute(&[xbf16.view()], &mut [outbf16.view_mut()])
+            .unwrap();
+        assert_eq!(outbf16.to_bf16_as_f32(), expected);
     }
 
     #[test]
