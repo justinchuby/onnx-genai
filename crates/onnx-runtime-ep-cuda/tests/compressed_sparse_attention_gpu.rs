@@ -1072,6 +1072,195 @@ fn ratio4_prefill_claim_and_execute_matches_cpu() {
     assert_eq!(gpu[5], cpu[5], "ratio-4 selected indices");
 }
 
+/// Build a full ratio-4 prefill input set for an arbitrary sequence length,
+/// letting the caller override the `index_query` / `index_weight` streams so a
+/// test can engineer clustered (near-tie) candidate scores. `start == 0`, so
+/// `total == seq` and `next_records == seq / 4`.
+fn ratio4_inputs_prefill(
+    seq: usize,
+    index_query: Vec<f32>,
+    index_weight: Vec<f32>,
+) -> Vec<HostTensor> {
+    vec![
+        HostTensor::f32(&[1, seq, 1, DIM], &ratio4_values(seq * DIM, 3, 0.0005)),
+        HostTensor::f32(&[1, seq, DIM], &ratio4_values(seq * DIM, 5, 0.003)),
+        HostTensor::f32(
+            &[1, seq, RATIO4_MAIN_WIDTH],
+            &ratio4_values(seq * RATIO4_MAIN_WIDTH, 7, 0.002),
+        ),
+        HostTensor::f32(
+            &[1, seq, RATIO4_MAIN_WIDTH],
+            &ratio4_values(seq * RATIO4_MAIN_WIDTH, 11, 0.001),
+        ),
+        HostTensor::f32(
+            &[RATIO4, RATIO4_MAIN_WIDTH],
+            &ratio4_values(RATIO4 * RATIO4_MAIN_WIDTH, 13, 0.0002),
+        ),
+        HostTensor::f32(
+            &[DIM],
+            &(0..DIM)
+                .map(|index| 0.75 + (index % 19) as f32 * 0.01)
+                .collect::<Vec<_>>(),
+        ),
+        HostTensor::zeros(DataType::Uint8, &[1, 0, STORED_WIDTH]),
+        HostTensor::zeros(DataType::Float32, &[1, 8, 2, RATIO4_MAIN_WIDTH]),
+        HostTensor::i32(&[1], &[(seq - 1) as i32]),
+        HostTensor::i64(&[], &[seq as i64]),
+        HostTensor::f32(&[1], &[-0.41]),
+        HostTensor::f32(
+            &[1, seq, RATIO4_INDEX_HEADS, RATIO4_INDEX_DIM],
+            &index_query,
+        ),
+        HostTensor::f32(&[1, seq, RATIO4_INDEX_HEADS], &index_weight),
+        HostTensor::f32(
+            &[1, seq, RATIO4_INDEX_COMPRESSOR_WIDTH],
+            &ratio4_values(seq * RATIO4_INDEX_COMPRESSOR_WIDTH, 23, 0.002),
+        ),
+        HostTensor::f32(
+            &[1, seq, RATIO4_INDEX_COMPRESSOR_WIDTH],
+            &ratio4_values(seq * RATIO4_INDEX_COMPRESSOR_WIDTH, 29, 0.001),
+        ),
+        HostTensor::f32(
+            &[RATIO4, RATIO4_INDEX_COMPRESSOR_WIDTH],
+            &ratio4_values(RATIO4 * RATIO4_INDEX_COMPRESSOR_WIDTH, 31, 0.0002),
+        ),
+        HostTensor::f32(
+            &[RATIO4_INDEX_DIM],
+            &(0..RATIO4_INDEX_DIM)
+                .map(|index| 0.8 + (index % 13) as f32 * 0.0125)
+                .collect::<Vec<_>>(),
+        ),
+        HostTensor::zeros(DataType::Uint8, &[1, 0, RATIO4_INDEX_STORED_WIDTH]),
+        HostTensor::zeros(DataType::Float32, &[1, 8, 2, RATIO4_INDEX_COMPRESSOR_WIDTH]),
+    ]
+}
+
+/// Same node as [`ratio4_node`] but with a caller-chosen `index_topk`, sizing
+/// `selected_indices` to `index_topk.min(next_records)` so top-k selection over
+/// multiple candidate records is exercised.
+fn ratio4_node_topk(inputs: &[HostTensor], index_topk: usize) -> (Graph, NodeId) {
+    let (mut graph, node) = ratio4_node(inputs);
+    let sequence = inputs[0].shape[1];
+    let total = i64::from_ne_bytes(inputs[9].bytes.as_slice().try_into().unwrap()) as usize;
+    let start = total - sequence;
+    let next_records = total / RATIO4;
+    let records = inputs[17].shape[1] + next_records - start / RATIO4;
+    let topk = index_topk.min(next_records);
+    graph
+        .node_mut(node)
+        .attributes
+        .insert("index_topk".into(), Attribute::Int(index_topk as i64));
+    // Re-point `selected_indices` (output 5) at a value with the correct top-k
+    // width. The other outputs already match `records` from `ratio4_node`.
+    let selected = graph.create_named_value(
+        "selected_indices_topk",
+        DataType::Int32,
+        static_shape([1, RATIO4_INDEX_HEADS, sequence, topk]),
+    );
+    graph.node_mut(node).outputs[5] = selected;
+    let _ = records;
+    (graph, node)
+}
+
+fn ratio4_topk_output_specs(sequence: usize, records: usize, topk: usize) -> Vec<OutputSpec> {
+    vec![
+        OutputSpec {
+            dtype: DataType::Float32,
+            shape: vec![1, sequence, 1, DIM],
+        },
+        OutputSpec {
+            dtype: DataType::Uint8,
+            shape: vec![1, records, STORED_WIDTH],
+        },
+        OutputSpec {
+            dtype: DataType::Float32,
+            shape: vec![1, 8, 2, RATIO4_MAIN_WIDTH],
+        },
+        OutputSpec {
+            dtype: DataType::Uint8,
+            shape: vec![1, records, RATIO4_INDEX_STORED_WIDTH],
+        },
+        OutputSpec {
+            dtype: DataType::Float32,
+            shape: vec![1, 8, 2, RATIO4_INDEX_COMPRESSOR_WIDTH],
+        },
+        OutputSpec {
+            dtype: DataType::Int32,
+            shape: vec![1, RATIO4_INDEX_HEADS, sequence, topk],
+        },
+    ]
+}
+
+/// B4 — device stages 3–5 must reproduce the CPU oracle's `selected_indices`
+/// **bit-for-bit** across many causal candidate records and a wide top-k, so the
+/// full `sorted=True, largest=True` ordering and the `-1` causal padding are all
+/// exercised (not just the single-record prefill case). Compared against the
+/// INDEPENDENT CPU oracle, never the device against itself.
+#[test]
+fn ratio4_device_topk_selection_multi_record_matches_cpu() {
+    let Some(ep) = gpu() else { return };
+    const SEQ: usize = 16;
+    let index_query = ratio4_values(SEQ * RATIO4_INDEX_HEADS * RATIO4_INDEX_DIM, 17, 0.0015);
+    let index_weight = ratio4_values(SEQ * RATIO4_INDEX_HEADS, 19, 0.01);
+    let inputs = ratio4_inputs_prefill(SEQ, index_query, index_weight);
+    // next_records = 16/4 = 4; a top-k of 4 fully orders every causal record.
+    let index_topk = 4;
+    let records = SEQ / RATIO4;
+    let (graph, node) = ratio4_node_topk(&inputs, index_topk);
+    let specs = ratio4_topk_output_specs(SEQ, records, index_topk.min(records));
+
+    let cpu = run_cpu(&graph, node, &inputs, &specs).expect("CPU ratio-4 top-k oracle");
+    let gpu = run_gpu(&ep, &graph, node, &inputs, &specs).expect("CUDA ratio-4 top-k");
+
+    // The selection must actually be non-trivial: the deepest queries fill every
+    // top-k slot with a real (non `-1`) record, and shallow queries pad with -1.
+    let selected: Vec<i32> = gpu[5]
+        .chunks_exact(4)
+        .map(|c| i32::from_ne_bytes(c.try_into().unwrap()))
+        .collect();
+    assert!(
+        selected.iter().any(|&v| v >= 0) && selected.contains(&-1),
+        "multi-record top-k must exercise both real selections and -1 padding: {selected:?}"
+    );
+    assert_eq!(
+        gpu[5], cpu[5],
+        "device deterministic top-k selection must match the CPU oracle bit-for-bit"
+    );
+    assert_eq!(gpu[3], cpu[3], "ratio-4 index cache");
+}
+
+/// B4 adversarial tie fixture — engineer clustered candidate scores (tiny,
+/// near-equal per-record contributions) so the deterministic tie order is
+/// genuinely exercised. If the device reduction order or the total-order
+/// comparator diverged from the oracle by a single ULP, the winning record would
+/// flip; asserting bit-identical `selected_indices` vs the independent oracle
+/// catches it.
+#[test]
+fn ratio4_device_topk_tie_break_matches_cpu() {
+    let Some(ep) = gpu() else { return };
+    const SEQ: usize = 12;
+    // Near-constant, tiny index queries make every `dot` tiny and the per-record
+    // scores cluster in the last mantissa bits — the worst case for tie order.
+    let index_query: Vec<f32> = (0..SEQ * RATIO4_INDEX_HEADS * RATIO4_INDEX_DIM)
+        .map(|index| 0.5 + ((index % 7) as f32) * 1.0e-4)
+        .collect();
+    let index_weight: Vec<f32> = (0..SEQ * RATIO4_INDEX_HEADS)
+        .map(|index| 0.25 + ((index % 3) as f32) * 1.0e-3)
+        .collect();
+    let inputs = ratio4_inputs_prefill(SEQ, index_query, index_weight);
+    let index_topk = 3;
+    let records = SEQ / RATIO4;
+    let (graph, node) = ratio4_node_topk(&inputs, index_topk);
+    let specs = ratio4_topk_output_specs(SEQ, records, index_topk.min(records));
+
+    let cpu = run_cpu(&graph, node, &inputs, &specs).expect("CPU ratio-4 tie oracle");
+    let gpu = run_gpu(&ep, &graph, node, &inputs, &specs).expect("CUDA ratio-4 tie selection");
+    assert_eq!(
+        gpu[5], cpu[5],
+        "device tie-break order must be bit-identical to the CPU oracle"
+    );
+}
+
 fn ratio4_sequence_slice(tensor: &HostTensor, first: usize, count: usize) -> HostTensor {
     let mut shape = tensor.shape.clone();
     let row_bytes = tensor.bytes.len() / shape[1];
@@ -1124,6 +1313,10 @@ fn ratio4_device_index_stream_matches_cpu_oracle_across_decode_boundary() {
     let prefill_gpu = run_gpu(&ep, &prefill_graph, prefill_node, &prefill, &prefill_specs).unwrap();
     assert_eq!(prefill_gpu[3], prefill_cpu[3], "prefix index key");
     assert_eq!(prefill_gpu[4], prefill_cpu[4], "prefix index carry");
+    assert_eq!(
+        prefill_gpu[5], prefill_cpu[5],
+        "prefix selected_indices (empty top-k)"
+    );
 
     let mut decode = full.clone();
     for index in [0usize, 2, 3, 11, 12, 13, 14] {
@@ -1174,6 +1367,10 @@ fn ratio4_device_index_stream_matches_cpu_oracle_across_decode_boundary() {
     assert_eq!(
         decode_gpu[4], decode_cpu[4],
         "device index carry including overlap shift and c=0"
+    );
+    assert_eq!(
+        decode_gpu[5], decode_cpu[5],
+        "device deterministic top-k selection at the decode boundary"
     );
 }
 

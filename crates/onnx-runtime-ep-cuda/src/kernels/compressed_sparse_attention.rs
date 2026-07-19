@@ -101,6 +101,9 @@ const COMPRESSION_MODULE: &str = "csa_ratio128_compression";
 const COMPRESSION_ENTRY: &str = "csa_ratio128_compress";
 const INDEX_COMPRESSION_MODULE: &str = "csa_ratio4_index_compression";
 const INDEX_COMPRESSION_ENTRY: &str = "csa_ratio4_index_compress";
+/// B4 stage-3/4/5 ratio-4 index scoring + deterministic top-k selection.
+const INDEX_SELECT_MODULE: &str = "csa_ratio4_index_select";
+const INDEX_SELECT_ENTRY: &str = "csa_ratio4_index_select";
 const COMPRESSION_SOURCE: &str = r#"
 __device__ __forceinline__ unsigned short csa_bf16_bits(float x) {
     unsigned int bits = __float_as_uint(x);
@@ -305,6 +308,167 @@ extern "C" __global__ void csa_ratio4_index_compress(
     }
 }
 "#;
+/// B4 stages 3–5 for ratio-4: index-query finalize (RoPE → Hadamard `1/√ID` →
+/// FP4 E2M1 round-trip), `dot → relu → weighted-head-sum` scoring with causal +
+/// valid-length masking, and a deterministic top-k selection reproducing the CPU
+/// oracle's `select_ratio4_topk` **bit-for-bit**:
+///
+/// * one CUDA block owns one `(batch, query)` row; a single thread runs the
+///   order-dependent reductions so the f32 accumulation order equals the CPU
+///   oracle (`dot` sums ascending in the dimension index; the head sum accrues
+///   ascending in the head index). `__fadd_rn`/`__fmul_rn` keep every
+///   multiply-add un-fused.
+/// * the index-query finalize reuses the frozen index-record math (the same
+///   `csa_index_bf16`, compressed-RoPE, Hadamard `1/√ID`, and FP4 E2M1
+///   round-trip primitives proven bit-identical in B3), just keyed on the query
+///   position and without the RMSNorm/pooling stages.
+/// * the candidate keys are dequantized on the fly from the freshly written
+///   `present_index_key` FP4 buffer — identical values, in the identical
+///   ascending-dimension order, to the oracle's `all_index_logical`.
+/// * selection reproduces PyTorch `topk(..., largest=True, sorted=True)` exactly
+///   as the oracle freezes it: a strict total order of `(-score, +record)` using
+///   Rust's `f32::total_cmp` on the bit-identical scores, with `-1` padding for
+///   the unfilled tail when fewer than `topk_width` causal records exist. The
+///   oracle rejects exact `==` score ties, so the ascending-record tiebreak is a
+///   determinism guard that never triggers for an accepted input.
+const INDEX_SELECT_SOURCE: &str = r#"
+__device__ __forceinline__ unsigned short csa_sel_bf16_bits(float x) {
+    unsigned int bits = __float_as_uint(x);
+    return (unsigned short)((bits + 0x7fffu + ((bits >> 16) & 1u)) >> 16);
+}
+__device__ __forceinline__ float csa_sel_bf16(float x) {
+    return __uint_as_float((unsigned int)csa_sel_bf16_bits(x) << 16);
+}
+// Rust `f32::total_cmp`: a strict total order over the raw bit patterns.
+__device__ __forceinline__ int csa_total_cmp(float a, float b) {
+    int ia = __float_as_int(a);
+    int ib = __float_as_int(b);
+    ia ^= (int)(((unsigned int)(ia >> 31)) >> 1);
+    ib ^= (int)(((unsigned int)(ib >> 31)) >> 1);
+    return ia < ib ? -1 : (ia > ib ? 1 : 0);
+}
+// Record `a` ranks strictly before record `b` under `sorted=True, largest=True`:
+// higher score first (descending `total_cmp`), then lower original record index.
+__device__ __forceinline__ bool csa_rank_before(float sa, int ia, float sb, int ib) {
+    const int c = csa_total_cmp(sa, sb);
+    if (c > 0) return true;
+    if (c < 0) return false;
+    return ia < ib;
+}
+extern "C" __global__ void csa_ratio4_index_select(
+    const float* index_query,        // [batch, sequence, index_heads, index_dim]
+    const float* index_weight,       // [batch, sequence, index_heads]
+    const unsigned char* index_key,  // [batch, records, 68] packed FP4 E2M1
+    float* transformed,              // [batch * sequence * index_heads * index_dim] scratch
+    float* scores,                   // [batch, sequence, records] scratch
+    int* selected,                   // [batch, sequence, topk_width] scratch
+    int batch, int sequence, int index_heads, int index_dim, int rope_dim,
+    int records, long long start, int topk_width)
+{
+    const int bs = blockIdx.x;
+    if (bs >= batch * sequence || threadIdx.x != 0) return;
+    const int s = bs % sequence;
+    const int b = bs / sequence;
+
+    const long long position = start + (long long)s;
+    long long valid_ll = (position + 1) / 4;
+    int limit = records;
+    if (valid_ll < (long long)limit) limit = (int)valid_ll;
+    if (limit < 0) limit = 0;
+
+    // weight_scale = (1 / sqrt(index_dim)) / sqrt(index_heads), matching the
+    // oracle's two-step division exactly.
+    float weight_scale = __fdiv_rn(1.0f, __fsqrt_rn((float)index_dim));
+    weight_scale = __fdiv_rn(weight_scale, __fsqrt_rn((float)index_heads));
+
+    // Stage 3: finalize every index-query head for this (batch, query) row.
+    const int query_stride = index_heads * index_dim;
+    for (int head = 0; head < index_heads; ++head) {
+        float* q = transformed + ((long long)bs * query_stride) + (long long)head * index_dim;
+        const float* src =
+            index_query + ((((long long)(b * sequence + s) * index_heads + head) * index_dim));
+        for (int d = 0; d < index_dim; ++d) q[d] = csa_sel_bf16(src[d]);
+        // Compressed RoPE on the last `rope_dim` components, keyed on `position`.
+        for (int pair = 0; pair < rope_dim / 2; ++pair) {
+            const float ramp = fminf(1.0f, fmaxf(0.0f, ((float)pair - 15.0f) / 10.0f));
+            const float base = powf(160000.0f, -((float)(2 * pair)) / (float)rope_dim);
+            const float frequency =
+                __fadd_rn(__fmul_rn(base, 1.0f - ramp), __fmul_rn(base / 16.0f, ramp));
+            float sn, cs; sincosf((float)position * frequency, &sn, &cs);
+            const int d = index_dim - rope_dim + 2 * pair;
+            const float re = q[d], im = q[d + 1];
+            q[d]     = csa_sel_bf16(__fsub_rn(__fmul_rn(re, cs), __fmul_rn(im, sn)));
+            q[d + 1] = csa_sel_bf16(__fadd_rn(__fmul_rn(re, sn), __fmul_rn(im, cs)));
+        }
+        // Hadamard transform (plain f32 add/sub), then bf16 `1/√ID` scaling.
+        for (int span = 1; span < index_dim; span *= 2)
+            for (int base2 = 0; base2 < index_dim; base2 += 2 * span)
+                for (int offset = 0; offset < span; ++offset) {
+                    const float left = q[base2 + offset];
+                    const float right = q[base2 + offset + span];
+                    q[base2 + offset] = __fadd_rn(left, right);
+                    q[base2 + offset + span] = __fsub_rn(left, right);
+                }
+        const float hadamard_scale = __frcp_rn(__fsqrt_rn((float)index_dim));
+        for (int d = 0; d < index_dim; ++d) q[d] = csa_sel_bf16(__fmul_rn(q[d], hadamard_scale));
+        // FP4 E2M1 round-trip: quantize each block, then dequantize back in place.
+        for (int block = 0; block < index_dim / 32; ++block) {
+            unsigned char scale_byte; unsigned char packed[16];
+            quantize_fp4_e2m1_block(q + 32 * block, &scale_byte, packed);
+            const float block_scale = e8m0_scale(scale_byte);
+            for (int pair = 0; pair < 16; ++pair) {
+                const unsigned char byte = packed[pair];
+                q[32 * block + 2 * pair]     = decode_e2m1(byte) * block_scale;
+                q[32 * block + 2 * pair + 1] = decode_e2m1(byte >> 4) * block_scale;
+            }
+        }
+    }
+
+    // Stage 4: score each causal candidate record.
+    const int weight_row = (b * sequence + s) * index_heads;
+    float* row_scores = scores + ((long long)(b * sequence + s) * records);
+    for (int record = 0; record < limit; ++record) {
+        const unsigned char* key = index_key + ((long long)b * records + record) * 68;
+        float score = 0.0f;
+        for (int head = 0; head < index_heads; ++head) {
+            const float* q = transformed + ((long long)bs * query_stride) + (long long)head * index_dim;
+            float acc = 0.0f;
+            for (int block = 0; block < index_dim / 32; ++block) {
+                const float block_scale = e8m0_scale(key[17 * block]);
+                for (int pair = 0; pair < 16; ++pair) {
+                    const unsigned char byte = key[17 * block + 1 + pair];
+                    const int d = 32 * block + 2 * pair;
+                    acc = __fadd_rn(acc, __fmul_rn(q[d], decode_e2m1(byte) * block_scale));
+                    acc = __fadd_rn(acc, __fmul_rn(q[d + 1], decode_e2m1(byte >> 4) * block_scale));
+                }
+            }
+            const float relu = fmaxf(acc, 0.0f);
+            const float weight = index_weight[weight_row + head];
+            score = __fadd_rn(score, __fmul_rn(__fmul_rn(relu, weight), weight_scale));
+        }
+        row_scores[record] = score;
+    }
+
+    // Stage 5: deterministic top-k selection over the frozen total order.
+    int* row_selected = selected + ((long long)(b * sequence + s) * topk_width);
+    for (int slot = 0; slot < topk_width; ++slot) row_selected[slot] = -1;
+    int prev = -1; float prev_score = 0.0f;
+    for (int slot = 0; slot < topk_width; ++slot) {
+        int best = -1; float best_score = 0.0f;
+        for (int record = 0; record < limit; ++record) {
+            const float sr = row_scores[record];
+            // Skip any record that ranks at or before the previously chosen one.
+            if (prev != -1 && !csa_rank_before(prev_score, prev, sr, record)) continue;
+            if (best == -1 || csa_rank_before(sr, record, best_score, best)) {
+                best = record; best_score = sr;
+            }
+        }
+        if (best == -1) break;  // fewer causal records than topk_width: leave -1.
+        row_selected[slot] = best;
+        prev = best; prev_score = best_score;
+    }
+}
+"#;
 const ATTENTION_SOURCE: &str = r#"
 extern "C" __global__ void csa_ratio128_sink_attention(
     const float* query,        // [batch, sequence, heads, dim]
@@ -461,6 +625,7 @@ impl KernelFactory for CompressedSparseAttentionFactory {
         let has_attention_bias = node.inputs.get(19).is_some_and(Option::is_some);
         let device_compression = ratio == 128 && !has_attention_bias;
         let device_index_compression = ratio == 4;
+        let device_index_scoring = ratio == 4;
         let device_attention = ratio == 128 && cache_format == "f32" && !has_attention_bias;
         let configured_scale = node
             .attr("scale")
@@ -472,6 +637,11 @@ impl KernelFactory for CompressedSparseAttentionFactory {
         }
         if device_index_compression {
             dispatch.set(CsaPipelineStage::IndexKeyUpdate, CsaStageMode::Device);
+        }
+        if device_index_scoring {
+            dispatch.set(CsaPipelineStage::IndexQueryFinalize, CsaStageMode::Device);
+            dispatch.set(CsaPipelineStage::IndexScoring, CsaStageMode::Device);
+            dispatch.set(CsaPipelineStage::Selection, CsaStageMode::Device);
         }
         if device_attention {
             dispatch.set(CsaPipelineStage::CandidateAssembly, CsaStageMode::Device);
@@ -488,6 +658,7 @@ impl KernelFactory for CompressedSparseAttentionFactory {
             dispatch,
             device_compression,
             device_index_compression,
+            device_index_scoring,
             device_attention,
             qk_rope_head_dim: usize::try_from(
                 node.attr("qk_rope_head_dim")
@@ -495,6 +666,18 @@ impl KernelFactory for CompressedSparseAttentionFactory {
                     .expect("CPU factory accepted qk_rope_head_dim"),
             )
             .expect("CPU factory accepted positive qk_rope_head_dim"),
+            index_num_heads: usize::try_from(
+                node.attr("index_num_heads")
+                    .and_then(|attribute| attribute.as_int())
+                    .unwrap_or(0),
+            )
+            .unwrap_or(0),
+            index_head_dim: usize::try_from(
+                node.attr("index_head_dim")
+                    .and_then(|attribute| attribute.as_int())
+                    .unwrap_or(0),
+            )
+            .unwrap_or(0),
             configured_scale,
             golden_capture: CsaGoldenCapture::from_environment(),
         }))
@@ -515,9 +698,17 @@ struct CompressedSparseAttentionKernel {
     /// B3: ratio-4 stage-2 index-key compression is independently finalized on
     /// the device; scoring and attention deliberately remain host-staged.
     device_index_compression: bool,
+    /// B4: ratio-4 stages 3–5 (index-query finalize, scoring, deterministic
+    /// top-k selection) run on device, overwriting `selected_indices` with the
+    /// device-resident result. Attention (stages 6–7) stays host-staged (B5).
+    device_index_scoring: bool,
     /// B1: ratio-128 f32-cache path runs stage-7 attention on device.
     device_attention: bool,
     qk_rope_head_dim: usize,
+    /// Ratio-4 index-stream geometry (`index_num_heads`, `index_head_dim`);
+    /// zero for ratio-128 where the index stream is absent.
+    index_num_heads: usize,
+    index_head_dim: usize,
     /// Raw `scale` attribute (0.0 → `1/sqrt(dim)`), resolved at launch.
     configured_scale: f32,
     golden_capture: CsaGoldenCapture,
@@ -923,6 +1114,171 @@ impl CompressedSparseAttentionKernel {
         .map_err(|error| driver_err("launch csa_ratio4_index_compress", error))?;
         self.runtime.synchronize()
     }
+
+    /// B4 stages 3–5 for ratio-4: index-query finalize + `dot→relu→
+    /// weighted-head-sum` scoring + deterministic top-k selection.  Reads the
+    /// freshly written device `present_index_key` (output 3), computes the
+    /// selection device-resident, then reads back the shared per-`(batch,query)`
+    /// index set (permitted by decision D5 — indices only) and writes the
+    /// per-index-head replicated `selected_indices` (output 5).
+    fn run_device_index_scoring(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+    ) -> Result<()> {
+        let (batch, sequence) = (inputs[0].shape[0], inputs[0].shape[1]);
+        let index_heads = self.index_num_heads;
+        let index_dim = self.index_head_dim;
+        let records = outputs[3].shape[1];
+        // selected_indices is [batch, index_heads, sequence, topk_width].
+        let topk_width = outputs[5].shape[3];
+        if batch == 0 || sequence == 0 || index_heads == 0 || topk_width == 0 {
+            return Ok(());
+        }
+        let start = {
+            let total_bytes = inputs[9];
+            // `total_sequence_length` is a scalar Int64 device tensor.
+            let mut bytes = [0u8; 8];
+            // SAFETY: input 9 is a live device scalar of 8 bytes (Int64).
+            unsafe {
+                self.runtime.dtoh(
+                    &mut bytes,
+                    cuptr(total_bytes.data_ptr::<u8>() as *const c_void),
+                )?;
+            }
+            let total = i64::from_ne_bytes(bytes);
+            usize::try_from(total)
+                .ok()
+                .and_then(|total| total.checked_sub(sequence))
+                .ok_or_else(|| {
+                    not_implemented(format!("{OP}: total < sequence in device index scoring"))
+                })?
+        };
+
+        let rows = batch * sequence;
+        let transformed_len = rows
+            .checked_mul(index_heads)
+            .and_then(|value| value.checked_mul(index_dim))
+            .ok_or_else(|| not_implemented(format!("{OP}: index scoring workspace overflow")))?;
+        let scores_len = rows
+            .checked_mul(records.max(1))
+            .ok_or_else(|| not_implemented(format!("{OP}: index score buffer overflow")))?;
+        let selected_len = rows
+            .checked_mul(topk_width)
+            .ok_or_else(|| not_implemented(format!("{OP}: index selection buffer overflow")))?;
+
+        let transformed = self
+            .runtime
+            .alloc_raw(transformed_len.checked_mul(4).unwrap_or(usize::MAX).max(1))?;
+        let scores = self
+            .runtime
+            .alloc_raw(scores_len.checked_mul(4).unwrap_or(usize::MAX).max(1))?;
+        let selected = self
+            .runtime
+            .alloc_raw(selected_len.checked_mul(4).unwrap_or(usize::MAX).max(1))?;
+
+        let index_key_ptr = cuptr(outputs[3].data_ptr_mut::<u8>() as *const c_void);
+        let run = || -> Result<Vec<i32>> {
+            let source = format!("{}\n{}", block_quant::source(), INDEX_SELECT_SOURCE);
+            let func =
+                self.runtime
+                    .nvrtc_function(INDEX_SELECT_MODULE, &source, INDEX_SELECT_ENTRY)?;
+            let index_query = cuptr(inputs[11].data_ptr::<u8>() as *const c_void);
+            let index_weight = cuptr(inputs[12].data_ptr::<u8>() as *const c_void);
+            let index_key = index_key_ptr;
+            let batch_i =
+                i32::try_from(batch).map_err(|_| not_implemented("CSA batch exceeds i32"))?;
+            let sequence_i =
+                i32::try_from(sequence).map_err(|_| not_implemented("CSA sequence exceeds i32"))?;
+            let heads_i = i32::try_from(index_heads)
+                .map_err(|_| not_implemented("CSA index heads exceed i32"))?;
+            let dim_i = i32::try_from(index_dim)
+                .map_err(|_| not_implemented("CSA index dimension exceeds i32"))?;
+            let rope_i = i32::try_from(self.qk_rope_head_dim)
+                .map_err(|_| not_implemented("CSA RoPE dimension exceeds i32"))?;
+            let records_i =
+                i32::try_from(records).map_err(|_| not_implemented("CSA records exceed i32"))?;
+            let start_i = start as i64;
+            let topk_i =
+                i32::try_from(topk_width).map_err(|_| not_implemented("CSA topk exceeds i32"))?;
+            let grid = u32::try_from(rows)
+                .map_err(|_| not_implemented(format!("{OP}: index scoring rows exceed u32")))?;
+
+            let mut builder = self.runtime.stream().launch_builder(&func);
+            builder
+                .arg(&index_query)
+                .arg(&index_weight)
+                .arg(&index_key)
+                .arg(&transformed)
+                .arg(&scores)
+                .arg(&selected)
+                .arg(&batch_i)
+                .arg(&sequence_i)
+                .arg(&heads_i)
+                .arg(&dim_i)
+                .arg(&rope_i)
+                .arg(&records_i)
+                .arg(&start_i)
+                .arg(&topk_i);
+            // SAFETY: argument order/types match `csa_ratio4_index_select`; every
+            // pointer is a live contiguous allocation sized by the shapes above,
+            // and one block per `(batch, query)` row owns its scratch slices.
+            unsafe {
+                builder.launch(LaunchConfig {
+                    grid_dim: (grid, 1, 1),
+                    block_dim: (1, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+            }
+            .map_err(|error| driver_err("launch csa_ratio4_index_select", error))?;
+            self.runtime.synchronize()?;
+
+            let mut host = vec![0u8; selected_len * 4];
+            // SAFETY: `selected` covers exactly `selected_len` i32 values.
+            unsafe {
+                self.runtime.dtoh(&mut host, selected)?;
+            }
+            Ok(host
+                .chunks_exact(4)
+                .map(|chunk| i32::from_ne_bytes(chunk.try_into().expect("4 bytes")))
+                .collect())
+        };
+
+        let selection = run();
+        // SAFETY: each scratch came from this runtime's `alloc_raw`, freed once.
+        let free = unsafe { self.runtime.free_raw(transformed) };
+        let free = free.and(unsafe { self.runtime.free_raw(scores) });
+        let free = free.and(unsafe { self.runtime.free_raw(selected) });
+        let shared = selection.and_then(|shared| free.map(|()| shared))?;
+
+        // Replicate the shared `[batch, sequence, topk_width]` selection across
+        // every index head into `[batch, index_heads, sequence, topk_width]`,
+        // exactly like the oracle's `write_shared_selected_i32`.
+        let row_width = sequence * topk_width;
+        let mut replicated = vec![-1i32; batch * index_heads * row_width];
+        for b in 0..batch {
+            let source = &shared[b * row_width..(b + 1) * row_width];
+            for head in 0..index_heads {
+                let destination = (b * index_heads + head) * row_width;
+                replicated[destination..destination + row_width].copy_from_slice(source);
+            }
+        }
+        let bytes: Vec<u8> = replicated
+            .iter()
+            .flat_map(|value| value.to_ne_bytes())
+            .collect();
+        if !bytes.is_empty() {
+            // SAFETY: output 5 is a live device allocation whose dense size equals
+            // `batch * index_heads * sequence * topk_width` i32 values.
+            unsafe {
+                self.runtime.htod(
+                    &bytes,
+                    cuptr(outputs[5].data_ptr_mut::<u8>() as *const c_void),
+                )?;
+            }
+        }
+        self.runtime.synchronize()
+    }
 }
 
 impl Kernel for CompressedSparseAttentionKernel {
@@ -1042,6 +1398,17 @@ impl Kernel for CompressedSparseAttentionKernel {
             && self.dispatch.mode(CsaPipelineStage::IndexKeyUpdate) == CsaStageMode::Device
         {
             self.run_device_index_compression(inputs, outputs, &staged)?;
+        }
+
+        // B4 device stages 3–5: recompute `selected_indices` (output 5) on device
+        // from the freshly written device `present_index_key` (output 3),
+        // overwriting the host oracle's selection. Attention (stages 6–7) stays
+        // host-staged, so `Y` remains the host oracle result this slice.
+        if self.device_index_scoring
+            && outputs.len() == 6
+            && self.dispatch.mode(CsaPipelineStage::Selection) == CsaStageMode::Device
+        {
+            self.run_device_index_scoring(inputs, outputs)?;
         }
 
         // B1 device stage-7: recompute `Y` on device for ratio-128 f32-cache,
