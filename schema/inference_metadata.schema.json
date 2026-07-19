@@ -1044,6 +1044,14 @@
         "batching": {
           "description": "Runtime-specific batching parameters."
         },
+        "cfg_conditioning_input": {
+          "description": "Denoiser conditioning input port zeroed for the unconditional pass of\nclassifier-free guidance. Required when `guidance_scale` != 1.0.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
         "decoder": {
           "description": "Autoregressive decoder component name.",
           "type": [

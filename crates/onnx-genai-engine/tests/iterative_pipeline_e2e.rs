@@ -180,24 +180,58 @@ fn guidance_scale_one_is_treated_as_no_guidance_and_runs() -> anyhow::Result<()>
 }
 
 #[test]
-fn nonunit_guidance_scale_is_rejected_pending_scheduler() -> anyhow::Result<()> {
+fn nonunit_guidance_without_cfg_input_is_rejected_at_load() -> anyhow::Result<()> {
+    // guidance_scale != 1.0 requires a declared cfg_conditioning_input; the
+    // metadata here omits it, so loading must fail with an actionable error.
     let dir = fixture_with_metadata(
-        "diffusion-guidance-cfg",
+        "diffusion-guidance-nocfg",
         &["denoiser.onnx"],
         &diffusion_metadata_with_guidance("7.5"),
     )?;
-    let mut engine = Engine::from_pipeline_dir(&dir, EngineConfig::default())?;
-    let request = empty_request()
-        .with_input("denoiser.sample", Value::from_slice_f32(&[0.0; 4], &[1, 4])?)
-        .with_input("denoiser.cond", Value::from_slice_f32(&[1.0; 4], &[1, 4])?);
-    let err = match engine.run_pipeline(request) {
-        Ok(_) => panic!("non-unit guidance_scale must be rejected"),
-        Err(e) => e,
-    };
+    let err = Engine::from_pipeline_dir(&dir, EngineConfig::default())
+        .err()
+        .expect("non-unit guidance without cfg_conditioning_input must be rejected");
     assert!(
-        err.to_string().contains("guidance"),
+        err.to_string().contains("cfg_conditioning_input"),
         "unexpected error: {err}"
     );
+    Ok(())
+}
+
+#[test]
+fn classifier_free_guidance_combines_conditional_and_unconditional() -> anyhow::Result<()> {
+    // denoiser: denoised = (sample + cond) * 0.5.
+    //   conditional (cond=c):  (sample + c) * 0.5
+    //   unconditional (cond=0): sample * 0.5
+    //   guided = uncond + scale*(cond - uncond) = 0.5*sample + 0.5*scale*c
+    // With seed sample=0, scale=2: guided = c. Identity feedback publishes it.
+    let metadata = "\
+pipeline:
+  models:
+    denoiser:
+      filename: denoiser.onnx
+      type: denoiser
+  dataflow:
+    - from: denoiser.denoised
+      to: denoiser.sample
+  strategy:
+    kind: iterative
+    denoiser: denoiser
+    num_steps: 1
+    guidance_scale: 2.0
+    cfg_conditioning_input: cond
+";
+    let dir = fixture_with_metadata("diffusion-cfg", &["denoiser.onnx"], metadata)?;
+    let mut engine = Engine::from_pipeline_dir(&dir, EngineConfig::default())?;
+    let cond = [1.0f32, 2.0, 3.0, 4.0];
+    let request = empty_request()
+        .with_input("denoiser.sample", Value::from_slice_f32(&[0.0; 4], &[1, 4])?)
+        .with_input("denoiser.cond", Value::from_slice_f32(&cond, &[1, 4])?);
+    let out = engine.run_pipeline(request)?;
+    let denoised = out.get("denoiser.denoised").expect("guided output").to_vec_f32()?;
+    for (got, c) in denoised.iter().zip(&cond) {
+        assert!((got - c).abs() < 1e-5, "guided {got} != {c}");
+    }
     Ok(())
 }
 

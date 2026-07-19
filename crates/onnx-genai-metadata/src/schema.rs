@@ -675,6 +675,11 @@ pub struct PipelineStrategy {
     #[serde(default)]
     pub scheduler_config: Option<SchedulerSpec>,
 
+    /// Denoiser conditioning input port zeroed for the unconditional pass of
+    /// classifier-free guidance. Required when `guidance_scale` != 1.0.
+    #[serde(default)]
+    pub cfg_conditioning_input: Option<String>,
+
     /// Classifier-free guidance scale or equivalent strategy-specific multiplier.
     #[schemars(range(min = 0.0))]
     pub guidance_scale: Option<f32>,

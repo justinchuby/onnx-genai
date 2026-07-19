@@ -279,18 +279,8 @@ impl PipelineEngine {
         let PipelinePlan::Iterative(plan) = &self.plan else {
             anyhow::bail!("internal error: run_iterative on a non-iterative plan");
         };
-        // Fail loudly rather than silently produce an unguided result: CFG
-        // requires model-specific conditional/unconditional batching that the
-        // scheduler-registry follow-up supplies. `1.0` (or unset) means "no
-        // guidance" and is safe to run here.
-        if let Some(scale) = plan.guidance_scale
-            && scale != 1.0
-        {
-            anyhow::bail!(
-                "classifier-free guidance (guidance_scale = {scale}) is not yet applied by the \
-                 iterative pipeline seam; it is pending the scheduler-registry follow-up"
-            );
-        }
+        // Classifier-free guidance scale (active only when set and != 1.0).
+        let guidance = plan.guidance_scale.filter(|s| *s != 1.0);
         // `constants` holds external inputs + prompt-phase outputs and is NOT
         // mutated by the loop, so a denoiser whose output port shares a name
         // with a conditioning input cannot clobber that conditioning. Denoiser
@@ -318,61 +308,37 @@ impl PipelineEngine {
                 .as_ref()
                 .map(|ts| ts[step])
                 .unwrap_or(step as f32);
-            // Value fed to each loop-carried input this step (needed by the
-            // scheduler, which transforms `(sample, model_output)`).
-            let mut sample_in: HashMap<String, Value> = HashMap::new();
-            let mut inputs: Vec<(String, Value)> = Vec::new();
-            for info in denoiser.inputs() {
-                let port = info.name.as_str();
-                let endpoint = format!("{}.{}", plan.denoiser, port);
-                // Per-step timestep injection takes precedence for its port.
-                if plan.timestep_input.as_deref() == Some(port) {
-                    inputs.push((port.to_string(), Value::from_slice_f32(&[timestep], &[1])?));
-                    continue;
-                }
-                let is_loop = plan.loop_edges.iter().any(|(_, in_port)| in_port == port);
-                let value = if is_loop {
-                    // Loop-carried: step 0 seeds from the external initial
-                    // tensor; later steps read the carried value for this port.
-                    if step == 0 {
-                        constants.get(&endpoint).with_context(|| {
-                            format!("missing iterative pipeline seed '{endpoint}' at step 0")
-                        })?
-                    } else {
-                        carried.get(port).with_context(|| {
-                            format!("loop-carried input '{endpoint}' was not produced")
-                        })?
-                    }
-                } else {
-                    // Constant conditioning: external tensor or routed edge,
-                    // always read from the immutable `constants` pool.
-                    let routed = plan
-                        .dataflow
+
+            // Conditional pass (all inputs as declared).
+            let (cond_out, sample_in) =
+                self.run_denoiser_pass(denoiser, plan, &constants, &carried, step, timestep, None)?;
+
+            // Classifier-free guidance: run an unconditional pass with the
+            // conditioning input zeroed, then combine per output port:
+            //   pred = uncond + scale * (cond - uncond).
+            let out_map = if let Some(scale) = guidance {
+                let zero_port = plan.cfg_conditioning_input.as_deref();
+                let (uncond_out, _) = self.run_denoiser_pass(
+                    denoiser, plan, &constants, &carried, step, timestep, zero_port,
+                )?;
+                let mut combined: HashMap<String, Value> = HashMap::new();
+                for (port, cond_value) in &cond_out {
+                    let uncond_value = uncond_out.get(port).with_context(|| {
+                        format!("unconditional pass did not produce '{}.{port}'", plan.denoiser)
+                    })?;
+                    let cond_v = cond_value.to_vec_f32()?;
+                    let uncond_v = uncond_value.to_vec_f32()?;
+                    let guided: Vec<f32> = uncond_v
                         .iter()
-                        .find(|edge| edge.to == endpoint)
-                        .and_then(|edge| constants.get(&edge.from));
-                    constants
-                        .get(&endpoint)
-                        .or(routed)
-                        .with_context(|| format!("missing pipeline input '{endpoint}'"))?
-                };
-                let cloned = clone_value(value)?;
-                if is_loop {
-                    sample_in.insert(port.to_string(), clone_value(value)?);
+                        .zip(&cond_v)
+                        .map(|(u, c)| u + scale * (c - u))
+                        .collect();
+                    combined.insert(port.clone(), Value::from_slice_f32(&guided, cond_value.shape())?);
                 }
-                inputs.push((port.to_string(), cloned));
-            }
-            let refs = inputs
-                .iter()
-                .map(|(name, value)| (name.as_str(), value))
-                .collect::<Vec<_>>();
-            let outputs = denoiser.run(&refs).map_err(|e| {
-                anyhow::anyhow!("ORT denoiser '{}' failed at step {step}: {e}", plan.denoiser)
-            })?;
-            let mut out_map: HashMap<String, Value> = HashMap::new();
-            for (name, value) in denoiser.output_names().iter().zip(outputs) {
-                out_map.insert(name.clone(), value);
-            }
+                combined
+            } else {
+                cond_out
+            };
 
             // Compute the next value for each loop-carried input. Without a
             // scheduler this is identity feedback (output -> input). With a
@@ -410,6 +376,78 @@ impl PipelineEngine {
         }
         self.run_prompt_phase_components(&plan.final_components, &mut tensors)?;
         Ok(tensors)
+    }
+
+    /// Run one denoiser invocation for `step`. Returns `(outputs, sample_in)`
+    /// keyed by port. `zero_port`, when set, zeros that conditioning input (the
+    /// unconditional pass of classifier-free guidance).
+    #[allow(clippy::too_many_arguments)]
+    fn run_denoiser_pass(
+        &self,
+        denoiser: &Session,
+        plan: &IterativePlan,
+        constants: &PipelineTensors,
+        carried: &HashMap<String, Value>,
+        step: usize,
+        timestep: f32,
+        zero_port: Option<&str>,
+    ) -> anyhow::Result<(HashMap<String, Value>, HashMap<String, Value>)> {
+        let mut sample_in: HashMap<String, Value> = HashMap::new();
+        let mut inputs: Vec<(String, Value)> = Vec::new();
+        for info in denoiser.inputs() {
+            let port = info.name.as_str();
+            let endpoint = format!("{}.{}", plan.denoiser, port);
+            // Per-step timestep injection takes precedence for its port.
+            if plan.timestep_input.as_deref() == Some(port) {
+                inputs.push((port.to_string(), Value::from_slice_f32(&[timestep], &[1])?));
+                continue;
+            }
+            let is_loop = plan.loop_edges.iter().any(|(_, in_port)| in_port == port);
+            let value = if is_loop {
+                if step == 0 {
+                    constants.get(&endpoint).with_context(|| {
+                        format!("missing iterative pipeline seed '{endpoint}' at step 0")
+                    })?
+                } else {
+                    carried
+                        .get(port)
+                        .with_context(|| format!("loop-carried input '{endpoint}' was not produced"))?
+                }
+            } else {
+                let routed = plan
+                    .dataflow
+                    .iter()
+                    .find(|edge| edge.to == endpoint)
+                    .and_then(|edge| constants.get(&edge.from));
+                constants
+                    .get(&endpoint)
+                    .or(routed)
+                    .with_context(|| format!("missing pipeline input '{endpoint}'"))?
+            };
+            if is_loop {
+                sample_in.insert(port.to_string(), clone_value(value)?);
+            }
+            // Unconditional pass zeros the declared conditioning input.
+            let cloned = if zero_port == Some(port) {
+                let zeros = vec![0.0f32; value.numel()];
+                Value::from_slice_f32(&zeros, value.shape())?
+            } else {
+                clone_value(value)?
+            };
+            inputs.push((port.to_string(), cloned));
+        }
+        let refs = inputs
+            .iter()
+            .map(|(name, value)| (name.as_str(), value))
+            .collect::<Vec<_>>();
+        let outputs = denoiser.run(&refs).map_err(|e| {
+            anyhow::anyhow!("ORT denoiser '{}' failed at step {step}: {e}", plan.denoiser)
+        })?;
+        let mut out_map: HashMap<String, Value> = HashMap::new();
+        for (name, value) in denoiser.output_names().iter().zip(outputs) {
+            out_map.insert(name.clone(), value);
+        }
+        Ok((out_map, sample_in))
     }
 
     /// Run a single-pass pipeline: prompt-phase components once, then one
@@ -746,6 +784,9 @@ struct IterativePlan {
     /// Optional DDIM scheduler applied to loop-carried edges (treats the
     /// denoiser output as a noise prediction; `None` = identity feedback).
     scheduler: Option<DdimSchedule>,
+    /// CFG conditioning input port zeroed on the unconditional pass (set only
+    /// when guidance is active).
+    cfg_conditioning_input: Option<String>,
     dataflow: Vec<DataflowEdge>,
 }
 
@@ -914,6 +955,17 @@ impl PipelinePlan {
             anyhow::bail!("iterative strategy 'num_steps' must be greater than zero");
         }
 
+        // Classifier-free guidance requires a declared conditioning input to
+        // zero on the unconditional pass.
+        let guidance_active = spec.strategy.guidance_scale.is_some_and(|s| s != 1.0);
+        if guidance_active && spec.strategy.cfg_conditioning_input.is_none() {
+            anyhow::bail!(
+                "classifier-free guidance (guidance_scale != 1.0) requires \
+                 'cfg_conditioning_input' naming the denoiser conditioning port to zero on the \
+                 unconditional pass"
+            );
+        }
+
         // Loop-carried edges are the denoiser's self-referential dataflow edges.
         let mut loop_edges = Vec::new();
         for edge in &spec.dataflow {
@@ -956,6 +1008,7 @@ impl PipelinePlan {
             timestep_input: spec.strategy.timestep_input.clone(),
             timesteps: spec.strategy.timesteps.clone(),
             scheduler: build_scheduler(spec.strategy.scheduler_config.as_ref(), num_steps)?,
+            cfg_conditioning_input: spec.strategy.cfg_conditioning_input.clone(),
             dataflow: spec.dataflow.clone(),
         }))
     }
@@ -1240,6 +1293,7 @@ pipeline:
                 timestep_input: None,
                 timesteps: None,
                 scheduler_config: None,
+                cfg_conditioning_input: None,
                 guidance_scale: None,
                 state: None,
                 stages: vec![
@@ -1260,6 +1314,7 @@ pipeline:
                             timestep_input: None,
                             timesteps: None,
                             scheduler_config: None,
+                            cfg_conditioning_input: None,
                             guidance_scale: None,
                             state: None,
                             stages: vec![],
@@ -1283,6 +1338,7 @@ pipeline:
                             timestep_input: None,
                             timesteps: None,
                             scheduler_config: None,
+                            cfg_conditioning_input: None,
                             guidance_scale: None,
                             state: None,
                             stages: vec![],
