@@ -20,6 +20,7 @@ use onnx_genai_ort::{
     DataType, PipelineModelDirectory, PipelineModels, Session, SessionOptions, Tokenizer, Value,
 };
 use std::collections::{BTreeSet, HashMap};
+use std::sync::Arc;
 use std::path::Path;
 
 /// Named tensors supplied to or produced by pipeline components.
@@ -87,6 +88,16 @@ impl Engine {
     ) -> anyhow::Result<PipelineEngine> {
         PipelineEngine::from_dir_with_config(pipeline_dir, config)
     }
+
+    /// Load a pipeline directory with a custom [`SchedulerRegistry`] so users
+    /// can plug in their own [`Scheduler`] implementations.
+    pub fn from_pipeline_dir_with_schedulers(
+        pipeline_dir: &Path,
+        config: EngineConfig,
+        schedulers: &SchedulerRegistry,
+    ) -> anyhow::Result<PipelineEngine> {
+        PipelineEngine::from_dir_with_schedulers(pipeline_dir, config, schedulers)
+    }
 }
 
 impl PipelineEngine {
@@ -96,6 +107,18 @@ impl PipelineEngine {
     }
 
     pub fn from_dir_with_config(pipeline_dir: &Path, config: EngineConfig) -> anyhow::Result<Self> {
+        Self::from_dir_with_schedulers(pipeline_dir, config, &SchedulerRegistry::builtin())
+    }
+
+    /// Load a pipeline with a **custom [`SchedulerRegistry`]**, so a user can
+    /// plug in their own [`Scheduler`] implementations (referenced by
+    /// `scheduler_config.kind` in the pipeline metadata) alongside the built-in
+    /// `ddim` / `masked_diffusion`.
+    pub fn from_dir_with_schedulers(
+        pipeline_dir: &Path,
+        config: EngineConfig,
+        schedulers: &SchedulerRegistry,
+    ) -> anyhow::Result<Self> {
         if config.decode_backend == EngineDecodeBackend::Native {
             anyhow::bail!("native backend not supported for pipeline models");
         }
@@ -112,7 +135,7 @@ impl PipelineEngine {
         }
         let models = PipelineModels::load_with_options(pipeline_dir, SessionOptions::default())
             .map_err(|e| anyhow::anyhow!("Failed to load pipeline models: {}", e))?;
-        let plan = PipelinePlan::from_spec(&models.directory.spec)?;
+        let plan = PipelinePlan::from_spec(&models.directory.spec, schedulers)?;
         // Only autoregressive pipelines drive a token-by-token decode loop and
         // therefore need a `DecodeState` + KV model info. Single-pass and
         // iterative (diffusion) pipelines run tensors through `run_pipeline`.
@@ -382,10 +405,7 @@ impl PipelineEngine {
                     let sample = sample_in.get(in_port).with_context(|| {
                         format!("missing loop-carried sample for '{}.{in_port}'", plan.denoiser)
                     })?;
-                    let shape = sample.shape().to_vec();
-                    let stepped =
-                        scheduler.step(step, &sample.to_vec_f32()?, &model_output.to_vec_f32()?)?;
-                    Value::from_slice_f32(&stepped, &shape)?
+                    scheduler.step(step, plan.num_steps, sample, model_output)?
                 } else {
                     clone_value(model_output)?
                 };
@@ -818,13 +838,170 @@ struct IterativePlan {
     /// Explicit per-step timestep schedule (length == `num_steps`); when absent
     /// the 0-based step index is fed instead.
     timesteps: Option<Vec<f32>>,
-    /// Optional DDIM scheduler applied to loop-carried edges (treats the
-    /// denoiser output as a noise prediction; `None` = identity feedback).
-    scheduler: Option<DdimSchedule>,
+    /// Optional scheduler applied to loop-carried edges (`None` = identity
+    /// feedback). Built from the registry by `scheduler_config.kind`.
+    scheduler: Option<Arc<dyn Scheduler>>,
     /// CFG conditioning input port zeroed on the unconditional pass (set only
     /// when guidance is active).
     cfg_conditioning_input: Option<String>,
     dataflow: Vec<DataflowEdge>,
+}
+
+/// A loop-carried transform applied to a denoiser's output at each iterative
+/// step. **Implement this trait to plug in a custom scheduler** and register it
+/// with a [`SchedulerRegistry`]; the built-in `ddim` (continuous latents) and
+/// `masked_diffusion` (discrete tokens) are just implementations.
+///
+/// `sample` is the value currently fed to the loop-carried input; `model_output`
+/// is the denoiser's output this step. Return the next loop-carried value.
+pub trait Scheduler: Send + Sync + std::fmt::Debug {
+    fn step(
+        &self,
+        step: usize,
+        num_steps: usize,
+        sample: &Value,
+        model_output: &Value,
+    ) -> anyhow::Result<Value>;
+}
+
+/// Builds a [`Scheduler`] from a declared [`SchedulerSpec`] and the loop length.
+pub type SchedulerFactory =
+    Arc<dyn Fn(&SchedulerSpec, usize) -> anyhow::Result<Arc<dyn Scheduler>> + Send + Sync>;
+
+/// Registry mapping a `scheduler_config.kind` string to a factory. Users extend
+/// it with [`register`](Self::register) to support their own schedulers, then
+/// load a pipeline via [`PipelineEngine::from_pipeline_dir_with_schedulers`].
+#[derive(Clone)]
+pub struct SchedulerRegistry {
+    factories: HashMap<String, SchedulerFactory>,
+}
+
+impl std::fmt::Debug for SchedulerRegistry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SchedulerRegistry")
+            .field("kinds", &self.factories.keys().collect::<Vec<_>>())
+            .finish()
+    }
+}
+
+impl SchedulerRegistry {
+    /// Registry with the built-in `ddim` and `masked_diffusion` schedulers.
+    pub fn builtin() -> Self {
+        let mut factories: HashMap<String, SchedulerFactory> = HashMap::new();
+        factories.insert(
+            "ddim".to_string(),
+            Arc::new(|cfg: &SchedulerSpec, num_steps: usize| {
+                if let Some(prediction) = cfg.prediction_type.as_deref()
+                    && prediction != "epsilon"
+                {
+                    anyhow::bail!(
+                        "unsupported ddim prediction_type '{prediction}' (only 'epsilon')"
+                    );
+                }
+                let sched = DdimSchedule::with_schedule(
+                    cfg.num_train_timesteps.unwrap_or(1000),
+                    cfg.beta_start.unwrap_or(0.00085),
+                    cfg.beta_end.unwrap_or(0.012),
+                    cfg.beta_schedule.as_deref().unwrap_or("linear"),
+                    num_steps,
+                )?;
+                Ok(Arc::new(sched) as Arc<dyn Scheduler>)
+            }),
+        );
+        factories.insert(
+            "masked_diffusion".to_string(),
+            Arc::new(|cfg: &SchedulerSpec, _num_steps: usize| {
+                let mask_token_id = cfg
+                    .mask_token_id
+                    .context("masked_diffusion scheduler requires 'mask_token_id'")?;
+                Ok(Arc::new(MaskedDiffusion { mask_token_id }) as Arc<dyn Scheduler>)
+            }),
+        );
+        Self { factories }
+    }
+
+    /// Register (or override) a scheduler kind with a factory.
+    pub fn register(&mut self, kind: impl Into<String>, factory: SchedulerFactory) {
+        self.factories.insert(kind.into(), factory);
+    }
+
+    fn build(&self, spec: &SchedulerSpec, num_steps: usize) -> anyhow::Result<Arc<dyn Scheduler>> {
+        let factory = self.factories.get(&spec.kind).with_context(|| {
+            format!(
+                "unknown scheduler kind '{}' (registered: {:?})",
+                spec.kind,
+                self.factories.keys().collect::<Vec<_>>()
+            )
+        })?;
+        factory(spec, num_steps)
+    }
+}
+
+impl Default for SchedulerRegistry {
+    fn default() -> Self {
+        Self::builtin()
+    }
+}
+
+/// Masked (discrete) language diffusion: the loop-carried tensor is an int64
+/// token sequence, the denoiser emits `[B, S, V]` logits, and each step commits
+/// the highest-confidence still-masked positions (argmax), unmasking them
+/// progressively so all masked positions are filled by the final step.
+#[derive(Debug, Clone)]
+struct MaskedDiffusion {
+    mask_token_id: i64,
+}
+
+impl Scheduler for MaskedDiffusion {
+    fn step(
+        &self,
+        step: usize,
+        num_steps: usize,
+        tokens: &Value,
+        logits: &Value,
+    ) -> anyhow::Result<Value> {
+        let token_shape = tokens.shape().to_vec();
+        let toks = tokens.to_vec_i64()?;
+        let n = toks.len();
+        let logit_shape = logits.shape();
+        let vocab = *logit_shape
+            .last()
+            .context("masked_diffusion logits must be rank >= 1")? as usize;
+        if vocab == 0 || n == 0 || logits.numel() != n * vocab {
+            anyhow::bail!(
+                "masked_diffusion shape mismatch: tokens {token_shape:?}, logits {logit_shape:?}"
+            );
+        }
+        let lg = logits.to_vec_f32()?;
+        // Per-position argmax + confidence (max logit).
+        let mut pred = vec![0i64; n];
+        let mut conf = vec![f32::MIN; n];
+        for i in 0..n {
+            let row = &lg[i * vocab..(i + 1) * vocab];
+            let mut best = (0usize, f32::MIN);
+            for (j, &x) in row.iter().enumerate() {
+                if x > best.1 {
+                    best = (j, x);
+                }
+            }
+            pred[i] = best.0 as i64;
+            conf[i] = best.1;
+        }
+        // Commit the highest-confidence still-masked positions this step.
+        let mut masked: Vec<usize> = (0..n).filter(|&i| toks[i] == self.mask_token_id).collect();
+        let mut out = toks.clone();
+        if !masked.is_empty() {
+            masked.sort_by(|&a, &b| {
+                conf[b].partial_cmp(&conf[a]).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let remaining_steps = num_steps.saturating_sub(step).max(1);
+            let commit = masked.len().div_ceil(remaining_steps);
+            for &i in masked.iter().take(commit) {
+                out[i] = pred[i];
+            }
+        }
+        Value::from_slice_i64(&out, &token_shape).map_err(Into::into)
+    }
 }
 
 /// DDIM (η = 0, epsilon-prediction) noise schedule, precomputed per inference
@@ -917,8 +1094,23 @@ impl DdimSchedule {
     }
 }
 
+impl Scheduler for DdimSchedule {
+    fn step(
+        &self,
+        step: usize,
+        _num_steps: usize,
+        sample: &Value,
+        model_output: &Value,
+    ) -> anyhow::Result<Value> {
+        let shape = sample.shape().to_vec();
+        let stepped =
+            DdimSchedule::step(self, step, &sample.to_vec_f32()?, &model_output.to_vec_f32()?)?;
+        Value::from_slice_f32(&stepped, &shape).map_err(Into::into)
+    }
+}
+
 impl PipelinePlan {
-    fn from_spec(spec: &PipelineSpec) -> anyhow::Result<Self> {
+    fn from_spec(spec: &PipelineSpec, schedulers: &SchedulerRegistry) -> anyhow::Result<Self> {
         // A composite whose stages contain an autoregressive decoder is treated
         // as an autoregressive text pipeline (unchanged legacy behavior). Pure
         // iterative / single-pass composites are a follow-up.
@@ -927,7 +1119,7 @@ impl PipelinePlan {
         }
         match spec.strategy.kind {
             PipelineStrategyKind::SinglePass => Self::single_pass(spec),
-            PipelineStrategyKind::Iterative => Self::iterative(spec),
+            PipelineStrategyKind::Iterative => Self::iterative(spec, schedulers),
             PipelineStrategyKind::Composite => anyhow::bail!(
                 "composite pipeline strategy without an autoregressive decoder is not yet \
                  supported"
@@ -988,7 +1180,7 @@ impl PipelinePlan {
         }))
     }
 
-    fn iterative(spec: &PipelineSpec) -> anyhow::Result<Self> {
+    fn iterative(spec: &PipelineSpec, schedulers: &SchedulerRegistry) -> anyhow::Result<Self> {
         let denoiser = spec
             .strategy
             .denoiser
@@ -1057,7 +1249,7 @@ impl PipelinePlan {
             loop_edges,
             timestep_input: spec.strategy.timestep_input.clone(),
             timesteps: spec.strategy.timesteps.clone(),
-            scheduler: build_scheduler(spec.strategy.scheduler_config.as_ref(), num_steps)?,
+            scheduler: build_scheduler(spec.strategy.scheduler_config.as_ref(), num_steps, schedulers)?,
             cfg_conditioning_input: spec.strategy.cfg_conditioning_input.clone(),
             dataflow: spec.dataflow.clone(),
         }))
@@ -1108,38 +1300,16 @@ fn prompt_phase_components(spec: &PipelineSpec, primary: &str) -> anyhow::Result
 }
 
 /// Build a DDIM scheduler from the declared config, or `None` when no scheduler
-/// is configured. Only `ddim` + `epsilon` prediction is supported today.
+/// is configured. Delegates to the registry so custom scheduler kinds work.
 fn build_scheduler(
     config: Option<&SchedulerSpec>,
     num_steps: usize,
-) -> anyhow::Result<Option<DdimSchedule>> {
+    registry: &SchedulerRegistry,
+) -> anyhow::Result<Option<Arc<dyn Scheduler>>> {
     let Some(cfg) = config else {
         return Ok(None);
     };
-    if cfg.kind != "ddim" {
-        anyhow::bail!(
-            "unsupported scheduler kind '{}' (only 'ddim' is supported)",
-            cfg.kind
-        );
-    }
-    if let Some(prediction) = cfg.prediction_type.as_deref()
-        && prediction != "epsilon"
-    {
-        anyhow::bail!(
-            "unsupported scheduler prediction_type '{prediction}' (only 'epsilon' is supported)"
-        );
-    }
-    let num_train = cfg.num_train_timesteps.unwrap_or(1000);
-    let beta_start = cfg.beta_start.unwrap_or(0.00085);
-    let beta_end = cfg.beta_end.unwrap_or(0.012);
-    let beta_schedule = cfg.beta_schedule.as_deref().unwrap_or("linear");
-    Ok(Some(DdimSchedule::with_schedule(
-        num_train,
-        beta_start,
-        beta_end,
-        beta_schedule,
-        num_steps,
-    )?))
+    Ok(Some(registry.build(cfg, num_steps)?))
 }
 
 fn autoregressive_decoder(strategy: &PipelineStrategy) -> Option<String> {
@@ -1419,7 +1589,7 @@ pipeline:
             vision: None,
         };
 
-        let plan = PipelinePlan::from_spec(&spec)?;
+        let plan = PipelinePlan::from_spec(&spec, &SchedulerRegistry::builtin())?;
         let ar = plan.autoregressive_plan()?;
         assert_eq!(ar.prompt_components, ["vision_encoder"]);
         assert_eq!(ar.decoder, "decoder");

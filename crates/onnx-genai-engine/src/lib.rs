@@ -48,7 +48,10 @@ pub use onnx_genai_kv::{CachePriority, KvDType, LocalTieredConfig};
 pub use onnx_genai_scheduler::{
     GovernorReconfigureOutcome, GovernorSnapshot, ResourceLimit, ResourceLimits,
 };
-pub use pipeline::{PipelineEngine, PipelineGenerateRequest, PipelineTensors};
+pub use pipeline::{
+    PipelineEngine, PipelineGenerateRequest, PipelineTensors, Scheduler, SchedulerFactory,
+    SchedulerRegistry,
+};
 pub use sampling::{CategoricalSampler, GreedySampler, Sampler};
 pub use speculative::{
     Eagle3Proposer, LinearEmbedder, LinearLmHead, LmHead, MtpProposer, NgramProposer,

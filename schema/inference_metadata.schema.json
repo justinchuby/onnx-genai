@@ -1538,6 +1538,14 @@
           "description": "Scheduler algorithm; `\"ddim\"` is supported.",
           "type": "string"
         },
+        "mask_token_id": {
+          "description": "Mask token id for a `masked_diffusion` (language-diffusion) scheduler:\neach step commits the highest-confidence still-masked positions.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
         "num_train_timesteps": {
           "description": "Training timesteps the noise schedule was defined over (default 1000).",
           "type": [

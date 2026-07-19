@@ -734,6 +734,10 @@ pub struct SchedulerSpec {
 
     /// Model output parameterization; `"epsilon"` is supported (default).
     pub prediction_type: Option<String>,
+
+    /// Mask token id for a `masked_diffusion` (language-diffusion) scheduler:
+    /// each step commits the highest-confidence still-masked positions.
+    pub mask_token_id: Option<i64>,
 }
 
 /// Pipeline execution strategy family.

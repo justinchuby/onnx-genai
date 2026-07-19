@@ -489,3 +489,91 @@ pipeline:
     }
     Ok(())
 }
+
+#[test]
+fn masked_language_diffusion_refines_masked_sequence() -> anyhow::Result<()> {
+    // Synthetic masked-diffusion LM (scripts/build_tiny_masked_diffusion.py):
+    // fixed logits with argmax = [2,3,4,5] and decreasing confidence. The
+    // masked_diffusion scheduler (mask_token_id=1, num_steps=4) unmasks one
+    // highest-confidence position per step, refining the all-mask seed
+    // [1,1,1,1] to [2,3,4,5].
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/tiny-masked-diffusion")
+        .canonicalize()?;
+    let mut engine = Engine::from_pipeline_dir(&dir, EngineConfig::default())?;
+    let request = empty_request()
+        .with_input("denoiser.input_ids", Value::from_slice_i64(&[1, 1, 1, 1], &[1, 4])?);
+    let out = engine.run_pipeline(request)?;
+    let tokens = out
+        .get("denoiser.input_ids")
+        .expect("refined token sequence")
+        .to_vec_i64()?;
+    assert_eq!(tokens, vec![2, 3, 4, 5]);
+    Ok(())
+}
+
+#[test]
+fn custom_user_scheduler_can_be_registered_and_run() -> anyhow::Result<()> {
+    use onnx_genai_engine::{Scheduler, SchedulerRegistry};
+    use onnx_genai_ort::Value as OrtValue;
+    use std::sync::Arc;
+
+    // A user-defined scheduler: next = sample + model_output (proves the trait
+    // + registry are extensible without touching the engine).
+    #[derive(Debug)]
+    struct AddScheduler;
+    impl Scheduler for AddScheduler {
+        fn step(
+            &self,
+            _step: usize,
+            _num_steps: usize,
+            sample: &OrtValue,
+            model_output: &OrtValue,
+        ) -> anyhow::Result<OrtValue> {
+            let s = sample.to_vec_f32()?;
+            let m = model_output.to_vec_f32()?;
+            let out: Vec<f32> = s.iter().zip(&m).map(|(a, b)| a + b).collect();
+            Ok(OrtValue::from_slice_f32(&out, sample.shape())?)
+        }
+    }
+
+    let metadata = "\
+pipeline:
+  models:
+    denoiser:
+      filename: denoiser.onnx
+      type: denoiser
+  dataflow:
+    - from: denoiser.denoised
+      to: denoiser.sample
+  strategy:
+    kind: iterative
+    denoiser: denoiser
+    num_steps: 2
+    scheduler_config:
+      kind: my_adder
+";
+    let dir = fixture_with_metadata("diffusion-custom-sched", &["denoiser.onnx"], metadata)?;
+    let mut registry = SchedulerRegistry::builtin();
+    registry.register(
+        "my_adder",
+        Arc::new(|_cfg, _num_steps| Ok(Arc::new(AddScheduler) as Arc<dyn Scheduler>)),
+    );
+    let mut engine =
+        Engine::from_pipeline_dir_with_schedulers(&dir, EngineConfig::default(), &registry)?;
+
+    // denoiser: denoised = (sample + cond) * 0.5.  With cond=c, custom step is
+    //   next = sample + denoised.   seed sample=0:
+    //   step0: denoised=(0+c)/2=c/2; next=0+c/2=c/2
+    //   step1: denoised=(c/2+c)/2=3c/4; next=c/2+3c/4=5c/4
+    let cond = [4.0f32, 8.0, 12.0, 16.0];
+    let request = empty_request()
+        .with_input("denoiser.sample", Value::from_slice_f32(&[0.0; 4], &[1, 4])?)
+        .with_input("denoiser.cond", Value::from_slice_f32(&cond, &[1, 4])?);
+    let out = engine.run_pipeline(request)?;
+    let sample = out.get("denoiser.sample").unwrap().to_vec_f32()?;
+    for (got, c) in sample.iter().zip(&cond) {
+        assert!((got - c * 1.25).abs() < 1e-5, "{got} != {}", c * 1.25);
+    }
+    Ok(())
+}
