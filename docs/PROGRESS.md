@@ -6,8 +6,15 @@ Tracks implementation status of `docs/DESIGN.md` (§1–§40). Updated as work l
 
 _Last updated: 2026-07-19T20:10Z — CPU-EP op-coverage Batch 4 advanced backend node conformance to 1,012 passing._
 
-**Current `origin/main` implementation HEAD:** `8c2a264`.
+**Current `origin/main` implementation HEAD:** `daa3518`.
 
+
+## 2026-07-19 — GLM-5.2 / DeepSeek E2E
+
+- **GLM-5.2 fp32 E2E ✅ landed (`bd908bf`):** the tiny synthetic `glm_moe_dsa` harness runs MLA + IndexShare DSA + MoE through prefill and eight decode steps. Mobius `1198522` fixed the real exporter bug: the indexer RoPE must rotate the full `index_head_dim`.
+- **GLM-5.2 int4 E2E ✅ landed (`daa3518`):** the quantized harness runs the full graph through prefill and eight decode steps with **34 `com.microsoft::MatMulNBits`** nodes (block-32 asymmetric int4), including every routed and shared expert MLP. No runtime fix was required; Mobius `c5740c4` provides the export helper and UINT8 initializer filling.
+- **DeepSeek-V2 E2E ✅ landed (`0caaf32`):** the shared MLA + MoE path loads and generates eight tokens with the tiny fp32 export; Mobius `2b629cc` provides the exporter helper. DeepSeek-V4 remains blocked upstream because a usable reference configuration/export artifact is unavailable.
+- **Remaining quantized-expert gap:** Mobius still emits per-expert `MatMulNBits`, not fused `QMoE`/`pkg.nxrt::BlockQuantizedMoE`. A fused quantized-expert exporter is required before the runtime QMoE/BQMoE custom kernels can be exercised E2E. These random-weight harnesses establish structural execution, not real-weight semantic correctness.
 
 ## 2026-07-19 — CPU-EP op coverage 975→1,012
 

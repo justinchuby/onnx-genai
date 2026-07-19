@@ -2486,3 +2486,219 @@ Validation passed:
 **By:** Gaff
 **What:** 🟢 APPROVE
 **Why:** Commit scope is exactly the two intended files: `docs/EP_CONFORMANCE.md` and `crates/onnx-runtime-python/conformance/onnx_backend_node_results.txt`; no `.squad/`, kernel, or formatting-only files are part of the commit. The results header reports total/passed/failed/skipped as 3530/1012/753/1765, and tab-separated row counts independently match (1012 passed, 753 failed, 1765 skipped; 3530 total). Arithmetic is consistent. The documentation retains the 360@2026-07-14 and 875/921/936/975 history, adds the dated 2026-07-19 1012/753/1765 entry, and accurately names the Batch-4 Dropout, Split, IsInf, EyeLike, mixed-type Pow, and GridSample coverage.
+
+
+## 2026-07-19 — Scribe inbox merge (18:05Z)
+
+<!-- merged from tyrell-glm-e2e-bringup.md -->
+
+### GLM-5.2 (glm_moe_dsa) tiny synthetic E2E bring-up
+
+- **Date:** 2026-07-19
+- **By:** Tyrell (GLM/MoE integration lead)
+- **What:** Got a tiny synthetic `glm_moe_dsa` (GLM-5.2 MLA + IndexShare DSA + MoE)
+  model running END-TO-END through the onnx-genai engine: mobius export →
+  `Engine::from_dir` → greedy prefill on `[1,2,3,4]` + **8 decode steps → 8
+  in-vocab tokens**, no panics, consistent shapes. Fixed one blocking bug.
+- **Why:** User bar was a structural E2E run ("要能流畅跑起来"). Real trained
+  weights are unavailable, so target was a random-weight tiny model exercising
+  the real graph (MLA attention, DSA indexer, MoE routing).
+
+#### Result
+- ✅ **Runs E2E.** prompt `[1,2,3,4]` → tokens `[216,174,125,49,147,20,31,205]`
+  (random weights, so values are not meaningful — structural success only).
+- Artifact dir: `/home/justinchu/glm-e2e-artifacts/glm-5.2-tiny/`
+  (`model.onnx` + `model.onnx.data` + `inference_metadata.yaml` +
+  `tokenizer.json`). Built by `mobius/export_glm_tiny.py` (untracked helper).
+
+#### Bug found + fixed (1)
+- **mobius** `src/mobius/models/glm_moe_dsa.py:83` (`GlmMoeDsaIndexer.project_key`):
+  passed `rotary_embedding_dim=index_head_dim // 2` (=4) to the opset-24
+  `RotaryEmbedding` op. The indexer shares the model rotary cache (sized
+  `qk_rope_head_dim/2` = 4 = full rotation of the 8-dim key). The op then
+  expected a cos cache of `(4)/2 = 2` and failed at runtime:
+  `Input 'cos_cache' dimension 2 should be same as head_size / 2 or
+  rotary_embedding_dim / 2, got 4`. Fix: `rotary_embedding_dim=0` (full
+  rotation), matching the main MLA q_rope/k_rope calls. + regression test
+  `test_indexer_rotary_uses_full_rotation`.
+
+#### No onnx-genai runtime fixes were needed
+The engine + Microsoft ORT already ran the primitive-op GLM graph correctly
+once the mobius rope bug was fixed. Only artifact added on the onnx-genai side:
+gated E2E test `crates/onnx-genai-engine/tests/glm_tiny_synthetic_e2e.rs`.
+
+#### Important finding: custom pkg.nxrt kernels are NOT exercised
+- The mobius fp32 export emits **only primitive ONNX ops**: `ai.onnx::Attention`
+  (opset-24 MLA), `RMSNormalization`, `RotaryEmbedding`, TopK/Gather/Scatter
+  (DSA indexer), and MatMul/Sigmoid/TopK (MoE routing). It emits **none** of
+  the runtime custom ops (`pkg.nxrt::BlockQuantizedMoE`,
+  `CompressedSparseAttention`, `SparseKvGather`, `BlockQuantizedMatMul`) nor
+  `com.microsoft::QMoE`.
+- The engine runs on the default **ORT decode backend**. The `native-backend`
+  (custom `pkg.nxrt` CPU EP) auto-selects only when the model contains
+  `pkg.nxrt::BlockQuantizedMatMul` (`engine.rs:model_proto_requires_native_backend`),
+  which this graph does not.
+- **Consequence:** exercising BlockQuantizedMoE / CompressedSparseAttention /
+  SparseKvGather end-to-end through the engine is **not currently possible** —
+  it needs a mobius export mode that emits those `pkg.nxrt` op types. That mode
+  does not exist yet. The kernels remain covered by their own unit tests in
+  `crates/onnx-runtime-ep-cpu`. This is the one remaining gap vs. the original
+  stretch goal; the primary "run smoothly E2E" bar is met.
+
+#### Commits (local, NOT pushed)
+- onnx-genai worktree `/home/justinchu/wt-glm` (branch `tyrell/glm-e2e`):
+  `bd908bf` test(engine): add gated tiny synthetic glm_moe_dsa E2E smoke test
+- mobius `/home/justinchu/mobius` (branch `glm5.2-moe-export`):
+  `1198522` fix(glm_moe_dsa): indexer RoPE must rotate full index_head_dim
+
+#### Mobius-side changes needed (for coordinator)
+- Land mobius `1198522` (rope fix + test) — required for any glm_moe_dsa E2E.
+- To later exercise the real custom ops, a mobius export mode emitting
+  `pkg.nxrt` ops (BlockQuantizedMoE / CompressedSparseAttention / SparseKvGather)
+  is required; not yet implemented.
+
+<!-- merged from chew-review-glm-e2e.md -->
+
+# Chew review — GLM-5.2 tiny synthetic E2E
+
+Reviewed 2026-07-19 by Chew (numerics/model-conversion fidelity). No source changes made by this review.
+
+## Mobius `1198522` (`glm5.2-moe-export`): 🟢 APPROVE
+
+- `GlmMoeDsaIndexer.project_key` now emits `rotary_embedding_dim=0` (`src/mobius/models/glm_moe_dsa.py:77-97`). Under the ONNX opset-24 `RotaryEmbedding` contract, zero selects full-head rotation; for `index_head_dim=8`, this makes the required cos/sin cache last dimension `8 / 2 = 4`. This agrees with the shared indexer cache and corrects the prior half-rotation setting, which would require cache dimension `2`.
+- The main MLA `k_rope` path likewise omits the attribute / uses the full-rotation default (`src/mobius/models/glm_moe_dsa.py:272-278`), so the indexer is now consistent with the existing MLA RoPE representation.
+- Regression coverage exports the tiny model, selects indexer-named `RotaryEmbedding` nodes, and asserts an explicit zero or omitted (op default zero) `rotary_embedding_dim` (`src/mobius/models/glm_moe_dsa_test.py:124-156`).
+- Validation: `/home/justinchu/mobius/.venv/bin/python -m pytest src/mobius/models/glm_moe_dsa_test.py -q` — **7 passed**.
+
+## onnx-genai `bd908bf` (`tyrell/glm-e2e`): 🟢 APPROVE
+
+- The sole changed file is the new integration test `crates/onnx-genai-engine/tests/glm_tiny_synthetic_e2e.rs`; no production files, `e2e_mobius_heads.rs`, or `tests/e2e/mobius_heads.json` changed.
+- The test is unconditionally `#[ignore]` (`:19-21`) and additionally treats absent/invalid `GLM_TINY_E2E_DIR` as an explicit skip (`:22-36`), matching the opt-in artifact pattern and preventing missing artifacts from breaking CI.
+- It structurally verifies `Engine::from_dir`, greedy prefill plus eight generated tokens, exact requested length, and in-vocabulary token IDs (`:38-71`), without making semantic claims for random synthetic weights.
+- Validation: `cargo test -p onnx-genai-engine --no-run` — **passed**. With `/home/justinchu/glm-e2e-artifacts/glm-5.2-tiny` present, `GLM_TINY_E2E_DIR=/home/justinchu/glm-e2e-artifacts/glm-5.2-tiny cargo test -p onnx-genai-engine --test glm_tiny_synthetic_e2e -- --ignored --nocapture` — **1 passed**, producing 8 token IDs.
+
+<!-- merged from deckard-deepseek-v2-e2e.md -->
+
+# DeepSeek-V2 tiny MLA + MoE E2E
+
+- Date: 2026-07-19
+- Decision: The synthetic `deepseek_v2` MLA + MoE export is directly consumable by the existing onnx-genai engine; no runtime or metadata changes were required.
+- Evidence: `/home/justinchu/ds-e2e-artifacts/deepseek-v2-tiny` loaded via `Engine::from_dir` and greedily generated eight tokens from `[1, 2, 3, 4]`: `[42, 237, 198, 2, 186, 81, 210, 149]`.
+- Export: Mobius helper `export_deepseek_v2_tiny.py` builds the first `deepseek_v2` test config (MLA plus 4 local experts, 2 selected experts, softmax/group-limited greedy routing, and one shared expert), fills FP32 random weights, and writes ONNX metadata. `tokenizer.json` is copied from the GLM tiny artifact.
+- Validation: `DEEPSEEK_V2_TINY_E2E_DIR=/home/justinchu/ds-e2e-artifacts/deepseek-v2-tiny cargo test -p onnx-genai-engine --test deepseek_e2e -- --ignored --nocapture` passed.
+- Commits: onnx-genai `0caaf32`; mobius `2b629cc`.
+- Note: a full `cargo test -p onnx-genai-engine` had 18 pre-existing fixture failures because `tests/fixtures/tiny-llm/model.onnx` is absent in this worktree; its 122 non-fixture tests passed. The new targeted test passed cleanly.
+
+<!-- merged from gaff-review-deepseek-v2-e2e.md -->
+
+# Gaff review: DeepSeek-V2 tiny synthetic E2E
+
+Date: 2026-07-19
+
+## onnx-genai `0caaf32` — 🟢 APPROVE
+
+- Additive new integration-test file only: `crates/onnx-genai-engine/tests/deepseek_e2e.rs`; it does not touch `e2e_mobius_heads.rs`, the GLM test, production code, or manifests.
+- The test is `#[ignore]` and also accepts its artifact location only through `DEEPSEEK_V2_TINY_E2E_DIR`; an unset or absent directory exits successfully, so ordinary CI does not require artifacts.
+- It loads the model and uses `Engine::generate` with a four-token prompt, which exercises prefill plus the requested eight generated/decode tokens. It verifies exact output count and vocabulary bounds (`< 256`) without asserting random-weight semantics.
+- `cargo test -p onnx-genai-engine --no-run` passed.
+- With the supplied artifacts, `DEEPSEEK_V2_TINY_E2E_DIR=/home/justinchu/ds-e2e-artifacts/deepseek-v2-tiny cargo test -p onnx-genai-engine --test deepseek_e2e -- --ignored --nocapture` passed and produced `[42, 237, 198, 2, 186, 81, 210, 149]`.
+
+## mobius `2b629cc` — 🟢 APPROVE
+
+- Additive standalone exporter only: `export_deepseek_v2_tiny.py`; no existing Mobius model code is modified.
+- The script compiles with `python -m py_compile`, creates the registered `deepseek_v2` tiny graph, deterministically fills non-constant initializers, and writes ONNX plus inference metadata.
+- Relevant existing checks passed: `src/mobius/components/_deepseek_mla_test.py` (21 passed) and `tests/build_graph_test.py -k deepseek_v2` (16 passed, 1284 deselected).
+- The initially suggested `src/mobius/models/deepseek_test.py` does not exist; this commit is a standalone script, so no importable production module was added.
+
+Both diffs pass `git diff --check`. No files were staged or pushed.
+
+<!-- merged from tyrell-glm-quant-e2e.md -->
+
+# Decision note — Quantized tiny GLM (glm_moe_dsa) E2E through onnx-genai
+
+**Author:** Tyrell (GLM/MoE integration lead)
+**Date:** 2026-07-19
+**Status:** ✅ Success (MatMulNBits E2E) · QMoE-for-GLM = documented mobius gap
+
+## (a) Did quantized GLM run E2E?
+
+**Yes — clean on the first run, no runtime fixes required.**
+
+```
+GLM_TINY_Q4_E2E_DIR=/home/justinchu/glm-e2e-artifacts/glm-5.2-tiny-q4 \
+  cargo test -p onnx-genai-engine --test glm_tiny_quant_e2e -- --ignored --nocapture
+```
+
+Output:
+```
+glm_tiny_quant_e2e: prompt=[1, 2, 3, 4] generated 8 tokens: [40, 114, 90, 146, 244, 107, 84, 138]
+test glm_tiny_quant_e2e ... ok
+```
+
+Prefill + 8 decode, no panic, all tokens in-vocab (< 256). Bar「要能流畅跑起来才算成功」met — the real int4 GEMM kernel executes through the full GLM graph (MLA + IndexShare DSA + per-expert MoE MLPs).
+
+## (b) Exact ops / domains emitted (q4 artifact)
+
+Model: `/home/justinchu/glm-e2e-artifacts/glm-5.2-tiny-q4/model.onnx`
+
+- **`com.microsoft::MatMulNBits` × 34** — all int4, `block_size=32`, `bits=4`, **asymmetric (uint8 zero_points on all 34)**. `accuracy_level` not emitted (=0) → runtime takes the default int4 dequant→f32 GEMM path (with zero points). Covers attention projections (q_a/q_b/kv_a/kv_b/o), dense MLP, indexer, MTP, **and every routed + shared MoE expert's gate/up/down**.
+- **`ai.onnx::MatMul` × 4** — unquantized leftovers (router gate / small projections that mobius keeps dense).
+- Attention ×2, RotaryEmbedding ×6, RMSNormalization ×9, LayerNormalization ×2, TopK ×3, plus routing/reshape glue.
+- **`QMoE`: 0. `MoE` (fused): 0.**
+
+MatMulNBits **confirmed present and executed**. QMoE **not** emitted (see (d)).
+
+## (c) Bugs found + fixed
+
+**None in the onnx-genai runtime.** The CPU `MatMulNBits` kernel (`crates/onnx-runtime-ep-cpu/src/kernels/matmul_nbits.rs`) already handles int4 block-32 asymmetric (uint8 zero_points), partial last block (`k.div_ceil(block_size)`), and the MLA/DSA/MoE-decomposed GLM shapes without modification. No new unit test needed because no kernel bug surfaced.
+
+One export-helper detail worth noting: `_fill_random_weights` had to learn `UINT8` (packed int4 weights + bit-packed zero points) — the fp32 helper only handled FLOAT/FLOAT16/INT. Added in `export_glm_tiny_quant.py` (random 0–255 uint8). Without it the packed-weight/zero-point initializers would have been filled as f32.
+
+## (d) Remaining blocker + root cause: QMoE-for-GLM
+
+**QMoE (`com.microsoft::QMoE`) is NOT emitted for GLM — and cannot be without new mobius feature work.** Root cause:
+
+- The GLM/DeepSeek MoE path (`src/mobius/models/deepseek.py` `DeepSeekV3TextModel`, `src/mobius/components/_moe.py` `MoELayer`) builds routed experts as a **`ModuleList` of per-expert `MLP`s**. When quantized, each expert MLP's linears go through `_linear_class(config)` → `QuantizedLinear` → **per-expert MatMulNBits**. There is no fused-expert tensor and no fused MoE op on this path.
+- **mobius has no QMoE emitter anywhere.** Grep across `src/mobius` for `QMoE`/`op.QMoE` = 0 hits. The only fused-MoE emitter is **gemma4** (`src/mobius/models/gemma4.py:1265`), and it emits the **unquantized `com.microsoft::MoE`** (fp) over `fc1_experts_weights`/`fc2_experts_weights` stacked tensors — gated on `ep_capabilities().supports_fused_moe`, with a static per-expert unroll fallback. nemotron_h/granitemoehybrid follow the same fused-**MoE** (not QMoE) shape. So the mission's premise that gemma4/nemotron "already emit QMoE" is inaccurate: they emit fp fused MoE, not quantized QMoE.
+- Note: the **onnx-genai runtime already has a CPU QMoE kernel** (`crates/onnx-runtime-ep-cpu/src/kernels/qmoe.rs`) + CUDA QMoE. So the runtime side is ready; the gap is purely the **mobius emitter**.
+
+### What QMoE-for-GLM would require (scoping)
+1. A fused-expert representation on the GLM/DeepSeek MoE path: stack per-expert gate/up/down into `fc1_experts_weights [E, 2*inter, H]` / `fc2_experts_weights [E, H, inter]` (mirror gemma4's `_remap_moe_expert_weights` + interleave logic), rather than a `ModuleList`.
+2. **Quantized** expert tensors: block-quantize the stacked expert weights to the QMoE layout (per-expert packed int4 weights + per-block scales + optional zero-points, one set per fc1/fc2) and emit `com.microsoft::QMoE` with the SwiGLU schema attrs (`activation_type`, `k`, `normalize_routing_weights`, `swiglu_fusion`, etc.), gated on an EP `supports_fused_qmoe` capability with a per-expert-MatMulNBits fallback.
+3. Reconcile GLM's sigmoid + `noaux_tc` group TopK routing (correction bias, `routed_scaling_factor`, shared expert) with QMoE's internal top-k/normalize semantics — GLM routing is richer than gemma4's plain softmax, so either pre-compute router_probs and pass them in, or extend the router emission.
+4. Cross-check the runtime QMoE kernel's expected weight/scale/zero-point layout (`crates/onnx-runtime-ep-cpu/src/kernels/qmoe.rs`) against whatever mobius emits, and add a gated E2E variant.
+
+This is a real feature (new quantized fused-MoE emitter + routing reconciliation), not a config flip. **Per STEP 6, stopping at MatMulNBits-quantized GLM running E2E** — a genuine win: int4 GEMM is exercised through the entire GLM graph including all MoE experts.
+
+## (e) Commits (local only, NOT pushed)
+
+- **onnx-genai worktree** `/home/justinchu/wt-glmq` (branch `tyrell/glm-quant-e2e`):
+  - `7ca2b8a` test(engine): add gated quantized tiny glm_moe_dsa E2E smoke test
+- **mobius** `/home/justinchu/mobius` (branch `glm5.2-moe-export`):
+  - `c5740c4` tools: add quantized tiny glm_moe_dsa export helper (`export_glm_tiny_quant.py`)
+
+Artifact: `/home/justinchu/glm-e2e-artifacts/glm-5.2-tiny-q4/` (model.onnx + .data, inference_metadata.yaml, tokenizer.json reused from fp32 artifacts).
+
+Both `_linear_class`-driven MatMulNBits emission and the runtime int4 kernel were already correct; the work was (1) a quantized export helper, (2) op inspection to confirm MatMulNBits/no-QMoE, (3) a gated E2E test proving the quantized GLM runs smoothly.
+
+<!-- merged from luv-review-glm-quant-e2e.md -->
+
+# Luv review — quantized GLM E2E
+
+**Reviewed:** 2026-07-19 17:55Z
+**Author:** Tyrell
+
+## onnx-genai `7ca2b8a` — 🟢 APPROVE
+
+- Diff is one new, isolated integration test: `crates/onnx-genai-engine/tests/glm_tiny_quant_e2e.rs`. It does not touch `deepseek_e2e.rs`, `e2e_mobius_heads.rs`, or production code.
+- The test is explicitly `#[ignore]`; it additionally returns success with a clear message if `GLM_TINY_Q4_E2E_DIR` is unset or absent, so normal CI and explicit artifact-less invocations are safe.
+- Structural assertions are appropriate for random weights: model load, generation configured for eight new tokens, exact token count, and IDs below the tiny model's 256-token vocabulary limit.
+- `cargo test -p onnx-genai-engine --no-run` passed.
+- With `GLM_TINY_Q4_E2E_DIR=/home/justinchu/glm-e2e-artifacts/glm-5.2-tiny-q4`, the ignored test passed and generated `[40, 114, 90, 146, 244, 107, 84, 138]`.
+- Direct ONNX inspection found 34 `com.microsoft::MatMulNBits` nodes and no `QMoE` nodes, confirming the stated quantized execution path.
+
+## mobius `c5740c4` — 🟢 APPROVE
+
+- The commit is additive: it creates only the standalone `export_glm_tiny_quant.py` helper. No importable `mobius/` production module or model-graph emission code changed; no mobius regression test was required.
+- The helper independently configures int4/block-32/asymmetric quantization and handles UINT8 initializers for packed quantized weights/zero points. Its generated artifact is validated by the passing engine E2E above.
+- `c5740c4` is present at `origin/glm5.2-moe-export` as claimed.
