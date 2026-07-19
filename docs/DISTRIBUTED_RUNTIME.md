@@ -235,6 +235,33 @@ pub enum ReduceOp {
 }
 ```
 
+> [!IMPORTANT]
+> **Review comment P0 — define asynchronous completion and buffer ownership.**
+> `async Result<()>` does not say whether completion means "submitted to the
+> transport", "visible on the destination stream", or "fully complete". NCCL
+> returns after enqueue while device work remains asynchronous; synchronizing
+> inside every future would also prevent compute/communication overlap. Return a
+> `CommEvent`/completion fence that can be attached as a stream dependency, and
+> define cancellation, timeout, error propagation, and buffer-reuse/free rules.
+> The contract must also preserve the current `DeviceBuffer` invariant that its
+> pointer is meaningful only in its owning EP/context.
+>
+> **Acceptance criteria:** every operation has a precise happens-before contract;
+> buffers cannot be reused or freed before completion; CUDA, host-staged, and
+> InProcess backends implement the same observable semantics without forcing a
+> global synchronization.
+
+> [!IMPORTANT]
+> **Review comment P0 — add variable-size AllToAll for MoE.**
+> One `chunk_sizes` array cannot express independent send/receive counts and
+> offsets for dynamic expert routing. Add `all_to_all_v` with
+> `send_counts/send_offsets` and `recv_counts/recv_offsets`, define whether counts
+> are bytes or elements, and specify the count-exchange/capacity protocol.
+>
+> **Acceptance criteria:** a test where each source routes a different number of
+> tokens to every destination completes without padding to a global maximum and
+> reconstructs token order exactly.
+
 ### 3.2 Communication Groups
 
 Not all ranks need to participate in every collective. Sub-groups enable
@@ -259,6 +286,17 @@ impl dyn Communicator {
     fn sub_group(&self, group: &CommGroup) -> Result<Box<dyn Communicator>>;
 }
 ```
+
+> [!IMPORTANT]
+> **Review comment P0 — make subgroup creation globally ordered.**
+> Communicator creation can itself require participation by all relevant ranks.
+> Arbitrary synchronous `sub_group()` calls can deadlock when ranks create groups
+> in different orders. Compile all groups ahead of execution using stable group
+> IDs, membership validation, and one globally deterministic creation sequence.
+>
+> **Acceptance criteria:** every rank derives the same group table and epoch;
+> duplicate/overlapping groups are deterministic; a rank cannot lazily create a
+> subgroup while another rank is already entering a collective.
 
 ### 3.3 Buffer Location Awareness
 
@@ -481,6 +519,17 @@ pub struct FormatConverter {
 The runtime inserts format conversion nodes at boundaries automatically.
 For example, CUDA EP producing row-major FP16 → MLX EP expecting column-major
 FP16: the converter transposes on whichever device is cheaper.
+
+> [!IMPORTANT]
+> **Review comment P2 — complete the boundary format contract.**
+> `TensorFormat` needs concrete shape/strides, logical and wire dtype,
+> quantization parameters (scale, zero point, block layout/version), alignment,
+> and ownership/lifetime information. Conversion must be selected and compiled
+> into the immutable execution plan, not inserted dynamically after plan freeze.
+>
+> **Acceptance criteria:** a boundary tensor is self-describing enough for either
+> peer to validate allocation size and layout; conversion workspace is budgeted;
+> unsupported conversions fail at plan compilation.
 
 ### 5.3 Heterogeneous Mixing Scenarios
 
@@ -764,6 +813,19 @@ impl DistributedCostModel {
 }
 ```
 
+> [!IMPORTANT]
+> **Review comment P1 — introduce globally stable device identity.**
+> The existing `DeviceId` is a device type plus a local ordinal and cannot be
+> used directly as a cross-node matrix index; local ordinals repeat on every
+> node. Introduce `GlobalDeviceId { node, local_device }` (or equivalent) and an
+> explicit dense topology-index map. Extend the cost model to account for
+> direction, staging/conversion, shared-link contention, and collective
+> algorithm rather than treating every transfer as an isolated point-to-point
+> edge.
+>
+> **Acceptance criteria:** two nodes may both contain `CUDA:0` without identity
+> collision, and all matrix lookups are validated through the topology map.
+
 ### 7.2 Bandwidth Reference
 
 | Interconnect | Bandwidth | Typical Latency | Scenario |
@@ -853,6 +915,18 @@ pub struct RankPlan {
 }
 ```
 
+> [!IMPORTANT]
+> **Review comment P0 — represent dependencies and collective ordering in the plan.**
+> The text promises concurrent steps within a `stage`, but the data model has no
+> stage, dependency edges, stream, completion event, or collective sequence.
+> Replace the ordered list convention with a DAG (or equivalent explicit
+> dependency model) containing `StepId`, rank/group, stream, buffer liveness, and
+> a stable per-group collective sequence.
+>
+> **Acceptance criteria:** plan compilation proves that every rank in a group
+> submits an identical ordered collective signature; independent compute can
+> overlap communication; buffer deallocation follows the final completion event.
+
 ### 8.2 Example: TP Attention + EP MoE (One Transformer Block)
 
 For a 4-GPU setup with 2-way TP and 4-way EP:
@@ -925,6 +999,18 @@ impl DistributedExecutor {
     }
 }
 ```
+
+> [!IMPORTANT]
+> **Review comment P1 — extend `FrozenPlan` instead of creating a second plan model.**
+> `execute_subgraph()` is not part of the current `ExecutionProvider` trait, and
+> `EpId` alone cannot represent EP instance, device, session, and expert shard.
+> Reuse the accepted `FrozenPlan`/`PartitionTarget`/`PartitionId` model and execute
+> compiled partition artifacts. Ensure `sub_comms` is selected by each collective
+> step and make the public `inputs` argument participate in tensor binding.
+>
+> **Acceptance criteria:** distributed and single-device compilation share one
+> immutable plan representation; no executor indexes an arbitrary EP vector with
+> an unvalidated ID; every compute step references a compiled partition.
 
 ---
 
@@ -1005,9 +1091,35 @@ The `DistributedPlan`/`DistributedExecutor` approach (explicit interleaving) is
 the **orchestrated mode** (Mode 2) — more flexible, inspectable, and required
 for heterogeneous EP mixing where collectives can't live inside any single EP.
 
+> [!IMPORTANT]
+> **Review comment P0 — reconcile GPU-native mode with runtime ownership.**
+> Calling NCCL from an ordinary EP custom op contradicts the core decision that
+> communication is runtime-owned, and a multi-rank collective cannot be launched
+> by firing rank 0 alone. Describe this as lowering runtime-owned communication
+> plan ops into CUDA graph-capturable calls, with every rank launching its own
+> rank-local plan in the validated collective order.
+>
+> **Acceptance criteria:** GPU-native mode preserves the same communicator
+> completion/error contract as orchestrated mode, launches all ranks, and does
+> not create an undocumented communication API inside `ExecutionProvider`.
+
 ---
 
 ## 10. Mac Studio Cluster as First-Class Target
+
+> [!IMPORTANT]
+> **Review comment P1 — defer the unpublished K3 target and replace estimates with measurements.**
+> K3 does not yet have a published implementation, so it cannot be a Phase 3
+> acceptance target. The `12 GB/s`, `5 μs`, FP4 capacity, and `150 tokens/sec`
+> figures are unvalidated upper-bound assumptions; the section also labels the
+> same target both interconnect-bound and compute-bound. Keep Thunderbolt 5 RDMA
+> as a supported transport hypothesis, but move this scenario to a deferred
+> validation appendix and benchmark it with a released reproducible model.
+>
+> **Acceptance criteria:** no release milestone depends on K3; theoretical link
+> rate is distinguished from measured payload/collective throughput; estimates
+> include fixed collective latency, topology contention, protocol overhead,
+> quantization metadata, memory bandwidth, and achieved rather than peak compute.
 
 ### 10.1 Reference Configuration
 
@@ -1141,6 +1253,15 @@ fn distributed_matches_single_device() {
 - Fault detection and recovery (node failure)
 - **Target:** K3-class 2.8T on 4× Mac Studio M3 Ultra
 
+> [!IMPORTANT]
+> **Review comment P1 — align Phase 3 with the resolved failure policy.**
+> `MEMORY_ARCHITECTURE.md` resolves Phase 1–3 rank failure as abort-all and
+> restart, while this phase promises fault detection and recovery. State the same
+> policy here and defer partial recovery/degraded execution to Phase 4+.
+>
+> **Acceptance criteria:** both documents use one failure-state machine and
+> define communicator abort, request failure, cleanup, and restart ownership.
+
 ### Phase 4: Heterogeneous EP Mixing
 
 **Goal:** Different EP types in the same distributed session.
@@ -1165,6 +1286,21 @@ fn distributed_matches_single_device() {
 ## 13. Open Questions
 
 > Renumbered from §12; previous items 1-10 preserved, new items 11-13 added.
+
+> [!IMPORTANT]
+> **Review comment P1 — remove decisions already resolved elsewhere.**
+> Rendezvous, failure policy, dynamic membership, backend selection, quantized
+> communication phase, CUDA IPC ownership, KV pool format, and coordinator
+> placement are marked resolved in `MEMORY_ARCHITECTURE.md`. Replace those entries
+> with links to the canonical decisions and keep this section only for genuinely
+> open communicator/execution questions such as async overlap, algorithm
+> selection, speculative dispatch batching, fallback placement, and cooperative
+> memory pressure.
+>
+> **Acceptance criteria:** no issue is simultaneously open and resolved; this
+> document consistently uses `ClusterCoordinator` rather than
+> `MemoryCoordinator`; each remaining open question names its decision owner and
+> target phase.
 
 1. **Rendezvous mechanism.** How do distributed ranks discover each other?
    Options: (a) environment variables like `MASTER_ADDR`/`MASTER_PORT` (PyTorch
