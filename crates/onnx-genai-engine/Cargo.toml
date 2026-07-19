@@ -14,12 +14,17 @@ native-backend = [
     "dep:onnx-runtime-ep-cpu",
     "dep:onnx-runtime-session",
 ]
-# Forwards to `onnx-genai-ort/cuda` so the CUDA execution provider is compiled
-# in. Runtime EP selection still goes through `ONNX_GENAI_EP`; without this
-# feature a `cuda` request silently falls back to CPU.
-cuda = ["onnx-genai-ort/cuda", "onnx-runtime-session?/cuda", "dep:onnx-runtime-ep-cuda"]
-# CUDA API version passthroughs, forwarded to `onnx-genai-ort`. Enable alongside
-# `cuda` to target a newer CUDA runtime; the highest enabled version wins.
+# The native CUDA EP is pinned to CUDA 13.0, so select the same cudarc bindings
+# in `onnx-genai-ort`. Runtime EP selection still goes through `ONNX_GENAI_EP`;
+# without this feature a `cuda` request silently falls back to CPU.
+cuda = [
+    "onnx-genai-ort/cuda",
+    "onnx-genai-ort/cuda-13000",
+    "onnx-runtime-session?/cuda",
+    "dep:onnx-runtime-ep-cuda",
+]
+# Legacy passthroughs for graphs that configure `onnx-genai-ort` separately.
+# Do not combine a 12.x passthrough with `cuda`; the engine CUDA EP requires 13.0.
 cuda-12060 = ["onnx-genai-ort/cuda-12060"]
 cuda-12080 = ["onnx-genai-ort/cuda-12080"]
 cuda-12090 = ["onnx-genai-ort/cuda-12090"]
@@ -30,7 +35,7 @@ onnx-genai-metadata = { workspace = true }
 onnx-genai-genai-config = { workspace = true }
 onnx-genai-kv = { workspace = true }
 onnx-genai-scheduler = { workspace = true }
-onnx-genai-ort = { workspace = true }
+onnx-genai-ort = { path = "../onnx-genai-ort", version = "=0.1.0-dev.2", default-features = false }
 onnx-genai-runtime-config = { workspace = true }
 onnx-runtime-ep-cpu = { workspace = true, optional = true }
 onnx-runtime-ep-cuda = { workspace = true, optional = true }

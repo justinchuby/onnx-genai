@@ -9,7 +9,7 @@ keywords = ["onnx", "runtime", "inference", "ffi"]
 categories = ["api-bindings", "science"]
 
 [features]
-default = []
+default = ["cuda-12060"]
 # `cuda` pulls in `libloading` so the shared-KV grow path can dynamically load
 # cudart and issue device-to-device copies (see `src/cuda_rt.rs`). It is not
 # linked at build time, keeping non-CUDA builds free of a CUDA toolkit.
@@ -18,19 +18,17 @@ default = []
 # CUDA toolkit) so the captured greedy decode can keep logits on-device and run
 # an on-device argmax kernel instead of copying the full vocabulary host-side.
 #
-# The CUDA API version is NOT hard-pinned. `cuda` targets the CUDA 12.6 API set
-# by default, but you can target a newer runtime without editing this crate:
-#   * enable one of the `cuda-*` passthrough features below alongside `cuda`
-#     (cudarc selects the highest enabled version), or
-#   * set `CUDARC_CUDA_VERSION` (e.g. 12080) at build time, which overrides the
-#     feature selection entirely.
-cuda = ["dep:libloading", "dep:cudarc", "cuda-12060"]
-# CUDA API version passthroughs, forwarded to cudarc. Enable alongside `cuda`;
-# the highest enabled version wins. Add more here as cudarc adds support.
-cuda-12060 = ["cudarc/cuda-12060"]
-cuda-12080 = ["cudarc/cuda-12080"]
-cuda-12090 = ["cudarc/cuda-12090"]
-cuda-13000 = ["cudarc/cuda-13000"]
+# `cuda` uses the CUDA 12.6 API set by default through this crate's default
+# features. Downstreams that need another API version must disable default
+# features and enable exactly one `cuda-*` feature alongside `cuda`; cudarc's
+# generated bindings cannot compile with multiple CUDA-version features active.
+cuda = ["dep:libloading", "dep:cudarc"]
+# Weak passthroughs keep selecting a CUDA API version from activating the
+# optional cudarc dependency unless `cuda` is also enabled.
+cuda-12060 = ["cudarc?/cuda-12060"]
+cuda-12080 = ["cudarc?/cuda-12080"]
+cuda-12090 = ["cudarc?/cuda-12090"]
+cuda-13000 = ["cudarc?/cuda-13000"]
 
 [dependencies]
 half = { version = "2", features = ["use-intrinsics"] }
