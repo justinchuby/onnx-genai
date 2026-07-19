@@ -412,16 +412,17 @@ fn ratio4_node(inputs: &[HostTensor]) -> (Graph, NodeId) {
             Some(value)
         })
         .collect();
+    let sequence = inputs[0].shape[1];
+    let total = i64::from_ne_bytes(inputs[9].bytes.as_slice().try_into().unwrap()) as usize;
+    let start = total - sequence;
+    let records = inputs[17].shape[1] + total / RATIO4 - start / RATIO4;
+    let topk = (total / RATIO4).min(512);
     let outputs = vec![
-        graph.create_named_value(
-            "Y",
-            DataType::Float32,
-            static_shape([1, RATIO4_SEQUENCE, 1, DIM]),
-        ),
+        graph.create_named_value("Y", DataType::Float32, static_shape([1, sequence, 1, DIM])),
         graph.create_named_value(
             "present_compressed_kv",
             DataType::Uint8,
-            static_shape([1, 1, STORED_WIDTH]),
+            static_shape([1, records, STORED_WIDTH]),
         ),
         graph.create_named_value(
             "present_compression_carry",
@@ -431,7 +432,7 @@ fn ratio4_node(inputs: &[HostTensor]) -> (Graph, NodeId) {
         graph.create_named_value(
             "present_index_key",
             DataType::Uint8,
-            static_shape([1, 1, RATIO4_INDEX_STORED_WIDTH]),
+            static_shape([1, records, RATIO4_INDEX_STORED_WIDTH]),
         ),
         graph.create_named_value(
             "present_index_carry",
@@ -441,7 +442,7 @@ fn ratio4_node(inputs: &[HostTensor]) -> (Graph, NodeId) {
         graph.create_named_value(
             "selected_indices",
             DataType::Int32,
-            static_shape([1, RATIO4_INDEX_HEADS, RATIO4_SEQUENCE, 1]),
+            static_shape([1, RATIO4_INDEX_HEADS, sequence, topk]),
         ),
     ];
     let mut node = Node::new(
@@ -1069,6 +1070,111 @@ fn ratio4_prefill_claim_and_execute_matches_cpu() {
     assert_eq!(gpu[3], cpu[3], "ratio-4 index cache");
     assert_f32_close(&gpu[4], &cpu[4], 1e-4, "ratio-4 index carry");
     assert_eq!(gpu[5], cpu[5], "ratio-4 selected indices");
+}
+
+fn ratio4_sequence_slice(tensor: &HostTensor, first: usize, count: usize) -> HostTensor {
+    let mut shape = tensor.shape.clone();
+    let row_bytes = tensor.bytes.len() / shape[1];
+    shape[1] = count;
+    HostTensor {
+        dtype: tensor.dtype,
+        shape,
+        bytes: tensor.bytes[first * row_bytes..(first + count) * row_bytes].to_vec(),
+    }
+}
+
+#[test]
+fn ratio4_device_index_stream_matches_cpu_oracle_across_decode_boundary() {
+    let Some(ep) = gpu() else { return };
+    let full = ratio4_inputs();
+    let mut prefill = full.clone();
+    for index in [0usize, 1, 2, 3, 11, 12, 13, 14] {
+        prefill[index] = ratio4_sequence_slice(&full[index], 0, 3);
+    }
+    prefill[8] = HostTensor::i32(&[1], &[2]);
+    prefill[9] = HostTensor::i64(&[], &[3]);
+    let prefill_specs = vec![
+        OutputSpec {
+            dtype: DataType::Float32,
+            shape: vec![1, 3, 1, DIM],
+        },
+        OutputSpec {
+            dtype: DataType::Uint8,
+            shape: vec![1, 0, STORED_WIDTH],
+        },
+        OutputSpec {
+            dtype: DataType::Float32,
+            shape: vec![1, 8, 2, RATIO4_MAIN_WIDTH],
+        },
+        OutputSpec {
+            dtype: DataType::Uint8,
+            shape: vec![1, 0, RATIO4_INDEX_STORED_WIDTH],
+        },
+        OutputSpec {
+            dtype: DataType::Float32,
+            shape: vec![1, 8, 2, RATIO4_INDEX_COMPRESSOR_WIDTH],
+        },
+        OutputSpec {
+            dtype: DataType::Int32,
+            shape: vec![1, RATIO4_INDEX_HEADS, 3, 0],
+        },
+    ];
+    let (prefill_graph, prefill_node) = ratio4_node(&prefill);
+    let prefill_cpu = run_cpu(&prefill_graph, prefill_node, &prefill, &prefill_specs).unwrap();
+    let prefill_gpu = run_gpu(&ep, &prefill_graph, prefill_node, &prefill, &prefill_specs).unwrap();
+    assert_eq!(prefill_gpu[3], prefill_cpu[3], "prefix index key");
+    assert_eq!(prefill_gpu[4], prefill_cpu[4], "prefix index carry");
+
+    let mut decode = full.clone();
+    for index in [0usize, 2, 3, 11, 12, 13, 14] {
+        decode[index] = ratio4_sequence_slice(&full[index], 3, 1);
+    }
+    decode[6] = HostTensor::u8(&[1, 0, STORED_WIDTH], &prefill_cpu[1]);
+    decode[7] = HostTensor::f32(&[1, 8, 2, RATIO4_MAIN_WIDTH], &as_f32(&prefill_cpu[2]));
+    decode[8] = HostTensor::i32(&[1], &[3]);
+    decode[9] = HostTensor::i64(&[], &[4]);
+    decode[17] = HostTensor::u8(&[1, 0, RATIO4_INDEX_STORED_WIDTH], &prefill_cpu[3]);
+    decode[18] = HostTensor::f32(
+        &[1, 8, 2, RATIO4_INDEX_COMPRESSOR_WIDTH],
+        &as_f32(&prefill_cpu[4]),
+    );
+    let decode_specs = vec![
+        OutputSpec {
+            dtype: DataType::Float32,
+            shape: vec![1, 1, 1, DIM],
+        },
+        OutputSpec {
+            dtype: DataType::Uint8,
+            shape: vec![1, 1, STORED_WIDTH],
+        },
+        OutputSpec {
+            dtype: DataType::Float32,
+            shape: vec![1, 8, 2, RATIO4_MAIN_WIDTH],
+        },
+        OutputSpec {
+            dtype: DataType::Uint8,
+            shape: vec![1, 1, RATIO4_INDEX_STORED_WIDTH],
+        },
+        OutputSpec {
+            dtype: DataType::Float32,
+            shape: vec![1, 8, 2, RATIO4_INDEX_COMPRESSOR_WIDTH],
+        },
+        OutputSpec {
+            dtype: DataType::Int32,
+            shape: vec![1, RATIO4_INDEX_HEADS, 1, 1],
+        },
+    ];
+    let (decode_graph, decode_node) = ratio4_node(&decode);
+    let decode_cpu = run_cpu(&decode_graph, decode_node, &decode, &decode_specs).unwrap();
+    let decode_gpu = run_gpu(&ep, &decode_graph, decode_node, &decode, &decode_specs).unwrap();
+    assert_eq!(
+        decode_gpu[3], decode_cpu[3],
+        "device FP4 index key at boundary"
+    );
+    assert_eq!(
+        decode_gpu[4], decode_cpu[4],
+        "device index carry including overlap shift and c=0"
+    );
 }
 
 /// `supports_op` must reject, at claim time, ratio/dtype/attribute combinations

@@ -39,18 +39,19 @@ __device__ __forceinline__ float decode_weight(unsigned char code, unsigned char
     return decode_e2m1(code) * e8m0_scale(scale);
 }
 __device__ __forceinline__ unsigned char quantize_e2m1(float value) {
-    const float values[8] = {0.f, .5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f};
-    const unsigned char sign = value < 0.0f ? 8u : 0u;
-    value = fabsf(value);
+    const float values[16] = {
+        0.f, .5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f,
+        -0.f, -.5f, -1.f, -1.5f, -2.f, -3.f, -4.f, -6.f
+    };
     unsigned char best = 0; float distance = __int_as_float(0x7f800000);
-    for (unsigned char i = 0; i < 8; ++i) {
+    for (unsigned char i = 0; i < 16; ++i) {
         const float candidate = fabsf(value - values[i]);
         if (candidate < distance
             || (candidate == distance && (i & 1u) == 0u && (best & 1u) != 0u)) {
             best = i; distance = candidate;
         }
     }
-    return sign | best;
+    return best;
 }
 __device__ __forceinline__ unsigned char quantize_e4m3fn(float value) {
     const unsigned char sign = __float_as_uint(value) & 0x80000000u ? 0x80u : 0u;
@@ -82,6 +83,21 @@ __device__ __forceinline__ void quantize_fp8_e4m3_block(
     const float scale_value = exp2f((float)scale_power);
     for (int i = 0; i < 64; ++i)
         packed[i] = quantize_e4m3fn(fminf(448.0f, fmaxf(-448.0f, input[i] / scale_value)));
+}
+__device__ __forceinline__ void quantize_fp4_e2m1_block(
+    const float* input, unsigned char* scale, unsigned char* packed) {
+    float amax = 6.0f * 0x1p-126f;
+    for (int i = 0; i < 32; ++i) amax = fmaxf(amax, fabsf(input[i]));
+    const int scale_power = (int)ceilf(log2f(amax / 6.0f));
+    *scale = (unsigned char)(scale_power + 127);
+    const float scale_value = exp2f((float)scale_power);
+    for (int i = 0; i < 16; ++i) {
+        const unsigned char low =
+            quantize_e2m1(fminf(6.0f, fmaxf(-6.0f, input[2 * i] / scale_value)));
+        const unsigned char high =
+            quantize_e2m1(fminf(6.0f, fmaxf(-6.0f, input[2 * i + 1] / scale_value)));
+        packed[i] = low | (high << 4);
+    }
 }
 "#;
 

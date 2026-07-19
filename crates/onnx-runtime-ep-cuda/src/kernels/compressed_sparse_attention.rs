@@ -99,6 +99,8 @@ const ATTENTION_BLOCK: u32 = 256;
 /// short prefill is amortised by the later sparse-attention work.
 const COMPRESSION_MODULE: &str = "csa_ratio128_compression";
 const COMPRESSION_ENTRY: &str = "csa_ratio128_compress";
+const INDEX_COMPRESSION_MODULE: &str = "csa_ratio4_index_compression";
+const INDEX_COMPRESSION_ENTRY: &str = "csa_ratio4_index_compress";
 const COMPRESSION_SOURCE: &str = r#"
 __device__ __forceinline__ unsigned short csa_bf16_bits(float x) {
     unsigned int bits = __float_as_uint(x);
@@ -193,6 +195,113 @@ extern "C" __global__ void csa_ratio128_compress(
                 carry[b * carry_stride + (2 * reset_slot) * dim + d] = 0.0f;
                 carry[b * carry_stride + (2 * reset_slot + 1) * dim + d] = __int_as_float(0xff800000);
             }
+    }
+}
+"#;
+const INDEX_COMPRESSION_SOURCE: &str = r#"
+__device__ __forceinline__ unsigned short csa_index_bf16_bits(float x) {
+    unsigned int bits = __float_as_uint(x);
+    return (unsigned short)((bits + 0x7fffu + ((bits >> 16) & 1u)) >> 16);
+}
+__device__ __forceinline__ float csa_index_bf16(float x) {
+    return __uint_as_float((unsigned int)csa_index_bf16_bits(x) << 16);
+}
+extern "C" __global__ void csa_ratio4_index_compress(
+    const float* kv, const float* gate, const float* ape, const float* norm,
+    const unsigned char* past_key, const float* past_carry,
+    unsigned char* key, float* carry,
+    int batch, int sequence, int dim, int rope_dim, int past_records, int key_records,
+    long long start)
+{
+    const int b = blockIdx.x;
+    if (b >= batch || threadIdx.x != 0) return;
+    const int source_width = 2 * dim;
+    const int carry_stride = 8 * 2 * source_width;
+    for (int i = 0; i < carry_stride; ++i) carry[b * carry_stride + i] = past_carry[b * carry_stride + i];
+    for (int i = 0; i < past_records * 68; ++i)
+        key[(b * key_records) * 68 + i] = past_key[(b * past_records) * 68 + i];
+    const float NEG = __int_as_float(0xff800000);
+    if (start == 0) {
+        for (int slot = 0; slot < 8; ++slot)
+            for (int state = 0; state < 2; ++state)
+                for (int d = 0; d < source_width; ++d)
+                    carry[b * carry_stride + ((slot * 2 + state) * source_width + d)] =
+                        state == 0 ? 0.0f : NEG;
+    }
+    int emitted = 0;
+    for (int s = 0; s < sequence; ++s) {
+        const long long pos = start + s;
+        const int phase = (int)(pos & 3);
+        const int slot = 4 + phase;
+        for (int d = 0; d < source_width; ++d) {
+            carry[b * carry_stride + ((slot * 2) * source_width + d)] =
+                kv[((b * sequence + s) * source_width) + d];
+            carry[b * carry_stride + ((slot * 2 + 1) * source_width + d)] =
+                __fadd_rn(gate[((b * sequence + s) * source_width) + d], ape[phase * source_width + d]);
+        }
+        if (((pos + 1) & 3) != 0) continue;
+
+        float record[128];
+        for (int d = 0; d < dim; ++d) {
+            float maximum = NEG;
+            for (int candidate = 0; candidate < 8; ++candidate) {
+                const int source_dim = candidate < 4 ? d : dim + d;
+                maximum = fmaxf(maximum,
+                    carry[b * carry_stride + ((candidate * 2 + 1) * source_width + source_dim)]);
+            }
+            float numerator = 0.0f, denominator = 0.0f;
+            for (int candidate = 0; candidate < 8; ++candidate) {
+                const int source_dim = candidate < 4 ? d : dim + d;
+                const float score =
+                    carry[b * carry_stride + ((candidate * 2 + 1) * source_width + source_dim)];
+                if (score == NEG) continue;
+                const float weight = (float)exp((double)__fsub_rn(score, maximum));
+                numerator = __fadd_rn(numerator, __fmul_rn(weight,
+                    carry[b * carry_stride + ((candidate * 2) * source_width + source_dim)]));
+                denominator = __fadd_rn(denominator, weight);
+            }
+            record[d] = csa_index_bf16(__fdiv_rn(numerator, denominator));
+        }
+        float square_sum = 0.0f;
+        for (int d = 0; d < dim; ++d)
+            square_sum = __fadd_rn(square_sum, __fmul_rn(record[d], record[d]));
+        const float inverse_rms =
+            __frcp_rn(__fsqrt_rn(__fadd_rn(__fdiv_rn(square_sum, (float)dim), 1.0e-6f)));
+        for (int d = 0; d < dim; ++d)
+            record[d] = csa_index_bf16(__fmul_rn(__fmul_rn(record[d], inverse_rms), norm[d]));
+        for (int pair = 0; pair < rope_dim / 2; ++pair) {
+            const float ramp = fminf(1.0f, fmaxf(0.0f, ((float)pair - 15.0f) / 10.0f));
+            const float base = powf(160000.0f, -((float)(2 * pair)) / (float)rope_dim);
+            const float frequency =
+                __fadd_rn(__fmul_rn(base, 1.0f - ramp), __fmul_rn(base / 16.0f, ramp));
+            float sn, cs; sincosf((float)(pos - 3) * frequency, &sn, &cs);
+            const int d = dim - rope_dim + 2 * pair;
+            const float re = record[d], im = record[d + 1];
+            record[d] = csa_index_bf16(__fsub_rn(__fmul_rn(re, cs), __fmul_rn(im, sn)));
+            record[d + 1] = csa_index_bf16(__fadd_rn(__fmul_rn(re, sn), __fmul_rn(im, cs)));
+        }
+        for (int span = 1; span < dim; span *= 2)
+            for (int base = 0; base < dim; base += 2 * span)
+                for (int offset = 0; offset < span; ++offset) {
+                    const float left = record[base + offset];
+                    const float right = record[base + offset + span];
+                    record[base + offset] = __fadd_rn(left, right);
+                    record[base + offset + span] = __fsub_rn(left, right);
+                }
+        const float hadamard_scale = __frcp_rn(__fsqrt_rn((float)dim));
+        for (int d = 0; d < dim; ++d) record[d] = csa_index_bf16(__fmul_rn(record[d], hadamard_scale));
+        unsigned char* dst = key + (b * key_records + past_records + emitted++) * 68;
+        for (int block = 0; block < 4; ++block)
+            quantize_fp4_e2m1_block(record + 32 * block, dst + 17 * block, dst + 17 * block + 1);
+
+        for (int previous = 0; previous < 4; ++previous)
+            for (int state = 0; state < 2; ++state)
+                for (int d = 0; d < source_width; ++d) {
+                    const int from = ((4 + previous) * 2 + state) * source_width + d;
+                    const int to = (previous * 2 + state) * source_width + d;
+                    carry[b * carry_stride + to] = carry[b * carry_stride + from];
+                    carry[b * carry_stride + from] = state == 0 ? 0.0f : NEG;
+                }
     }
 }
 "#;
@@ -351,6 +460,7 @@ impl KernelFactory for CompressedSparseAttentionFactory {
             .to_string();
         let has_attention_bias = node.inputs.get(19).is_some_and(Option::is_some);
         let device_compression = ratio == 128 && !has_attention_bias;
+        let device_index_compression = ratio == 4;
         let device_attention = ratio == 128 && cache_format == "f32" && !has_attention_bias;
         let configured_scale = node
             .attr("scale")
@@ -359,6 +469,9 @@ impl KernelFactory for CompressedSparseAttentionFactory {
         let mut dispatch = CsaStageDispatch::default();
         if device_compression {
             dispatch.set(CsaPipelineStage::CompressionUpdate, CsaStageMode::Device);
+        }
+        if device_index_compression {
+            dispatch.set(CsaPipelineStage::IndexKeyUpdate, CsaStageMode::Device);
         }
         if device_attention {
             dispatch.set(CsaPipelineStage::CandidateAssembly, CsaStageMode::Device);
@@ -374,7 +487,14 @@ impl KernelFactory for CompressedSparseAttentionFactory {
             device_state,
             dispatch,
             device_compression,
+            device_index_compression,
             device_attention,
+            qk_rope_head_dim: usize::try_from(
+                node.attr("qk_rope_head_dim")
+                    .and_then(|attribute| attribute.as_int())
+                    .expect("CPU factory accepted qk_rope_head_dim"),
+            )
+            .expect("CPU factory accepted positive qk_rope_head_dim"),
             configured_scale,
             golden_capture: CsaGoldenCapture::from_environment(),
         }))
@@ -392,8 +512,12 @@ struct CompressedSparseAttentionKernel {
     /// B2: ratio-128 stage-1 is a device kernel for both f32 and hybrid-FP8
     /// caches.  Ratio-4 remains entirely host-staged.
     device_compression: bool,
+    /// B3: ratio-4 stage-2 index-key compression is independently finalized on
+    /// the device; scoring and attention deliberately remain host-staged.
+    device_index_compression: bool,
     /// B1: ratio-128 f32-cache path runs stage-7 attention on device.
     device_attention: bool,
+    qk_rope_head_dim: usize,
     /// Raw `scale` attribute (0.0 → `1/sqrt(dim)`), resolved at launch.
     configured_scale: f32,
     golden_capture: CsaGoldenCapture,
@@ -719,6 +843,86 @@ impl CompressedSparseAttentionKernel {
         .map_err(|error| driver_err("launch csa_ratio128_compress", error))?;
         self.runtime.synchronize()
     }
+
+    fn run_device_index_compression(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        staged: &[Vec<u8>],
+    ) -> Result<()> {
+        let (batch, sequence) = (inputs[0].shape[0], inputs[0].shape[1]);
+        if batch == 0 || sequence == 0 {
+            return Ok(());
+        }
+        let total_bytes = &staged[9];
+        if total_bytes.len() != 8 {
+            return Err(not_implemented(format!(
+                "{OP}: device index compression expects scalar total_sequence_length"
+            )));
+        }
+        let total = i64::from_ne_bytes(total_bytes.as_slice().try_into().expect("8 bytes"));
+        let start = total.checked_sub(sequence as i64).ok_or_else(|| {
+            not_implemented(format!(
+                "{OP}: total < sequence in device index compression"
+            ))
+        })?;
+        let dim = inputs[16].shape[0];
+        let past_records = inputs[17].shape[1];
+        let key_records = outputs[3].shape[1];
+        let source = format!("{}\n{}", block_quant::source(), INDEX_COMPRESSION_SOURCE);
+        let func = self.runtime.nvrtc_function(
+            INDEX_COMPRESSION_MODULE,
+            &source,
+            INDEX_COMPRESSION_ENTRY,
+        )?;
+        let kv = cuptr(inputs[13].data_ptr::<u8>() as *const c_void);
+        let gate = cuptr(inputs[14].data_ptr::<u8>() as *const c_void);
+        let ape = cuptr(inputs[15].data_ptr::<u8>() as *const c_void);
+        let norm = cuptr(inputs[16].data_ptr::<u8>() as *const c_void);
+        let past_key = cuptr(inputs[17].data_ptr::<u8>() as *const c_void);
+        let past_carry = cuptr(inputs[18].data_ptr::<u8>() as *const c_void);
+        let key = cuptr(outputs[3].data_ptr_mut::<u8>() as *const c_void);
+        let carry = cuptr(outputs[4].data_ptr_mut::<u8>() as *const c_void);
+        let batch_i = i32::try_from(batch).map_err(|_| not_implemented("CSA batch exceeds i32"))?;
+        let sequence_i =
+            i32::try_from(sequence).map_err(|_| not_implemented("CSA sequence exceeds i32"))?;
+        let dim_i =
+            i32::try_from(dim).map_err(|_| not_implemented("CSA index dimension exceeds i32"))?;
+        let rope_i = i32::try_from(self.qk_rope_head_dim)
+            .map_err(|_| not_implemented("CSA RoPE dimension exceeds i32"))?;
+        let past_i =
+            i32::try_from(past_records).map_err(|_| not_implemented("CSA records exceed i32"))?;
+        let records_i =
+            i32::try_from(key_records).map_err(|_| not_implemented("CSA records exceed i32"))?;
+        let mut builder = self.runtime.stream().launch_builder(&func);
+        builder
+            .arg(&kv)
+            .arg(&gate)
+            .arg(&ape)
+            .arg(&norm)
+            .arg(&past_key)
+            .arg(&past_carry)
+            .arg(&key)
+            .arg(&carry)
+            .arg(&batch_i)
+            .arg(&sequence_i)
+            .arg(&dim_i)
+            .arg(&rope_i)
+            .arg(&past_i)
+            .arg(&records_i)
+            .arg(&start);
+        // SAFETY: one serial thread owns each batch row, preserving every
+        // order-dependent oracle reduction and carry transition.
+        unsafe {
+            builder.launch(LaunchConfig {
+                grid_dim: (batch as u32, 1, 1),
+                block_dim: (1, 1, 1),
+                shared_mem_bytes: 0,
+            })
+        }
+        .map_err(|error| driver_err("launch csa_ratio4_index_compress", error))?;
+        self.runtime.synchronize()
+    }
 }
 
 impl Kernel for CompressedSparseAttentionKernel {
@@ -832,6 +1036,12 @@ impl Kernel for CompressedSparseAttentionKernel {
             && outputs[1].dtype == DataType::Uint8
         {
             self.run_device_compression(inputs, outputs, &staged)?;
+        }
+
+        if self.device_index_compression
+            && self.dispatch.mode(CsaPipelineStage::IndexKeyUpdate) == CsaStageMode::Device
+        {
+            self.run_device_index_compression(inputs, outputs, &staged)?;
         }
 
         // B1 device stage-7: recompute `Y` on device for ratio-128 f32-cache,
