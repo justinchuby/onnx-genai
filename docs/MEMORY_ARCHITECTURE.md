@@ -26,7 +26,7 @@
 9. [Hardware Topology Variants](#9-hardware-topology-variants)
 10. [Decision Log](#10-decision-log)
 11. [Phased Implementation](#11-phased-implementation)
-12. [Open Questions](#12-open-questions)
+12. [Resolved Questions](#12-open-questions)
 13. [References](#13-references)
 
 ---
@@ -957,30 +957,71 @@ The runtime inserts format conversion nodes at EP boundaries automatically.
 Different hardware configurations require different governor topologies. The engine
 selects the appropriate topology at startup based on hardware probing.
 
-### 9.1 GovernorTopology Enum
+### 9.1 MemoryTopology (Trait-Based, Not Enum)
+
+The topology is a **struct with trait-object fields**, not a closed enum. This
+ensures new hardware configurations (future NPU architectures, CXL-attached memory,
+etc.) can be added without modifying upper-layer code.
 
 ```rust
-/// Selected at engine startup based on hardware probing.
-/// Upper layers (WeightResidencyManager, sessions, ParallelStrategy) are
-/// topology-agnostic: they call generic request_device_memory() /
-/// request_host_memory() and the topology routes correctly.
-enum GovernorTopology {
-    /// No accelerator. HostGovernor manages all memory.
-    CpuOnly { host: Arc<HostGovernor> },
-    /// Discrete device(s) with separate VRAM + shared host RAM.
-    Discrete {
-        host: Arc<HostGovernor>,
-        devices: Vec<Arc<DeviceGovernor>>,
-    },
-    /// Unified memory (Apple Silicon, DGX Spark). Single governor, logical partitions.
-    Unified { governor: Arc<UnifiedGovernor> },
+/// Engine constructs at startup based on hardware probing.
+/// Upper layers access only via trait methods — never match on TopologyKind.
+struct MemoryTopology {
+    /// Per-device governors. Empty = CPU-only.
+    devices: Vec<Arc<dyn DeviceGovernor>>,
+
+    /// Per-machine shared memory. Always present.
+    host: Arc<dyn HostGovernor>,
+
+    /// Informational only — for logging, metrics, config validation.
+    /// Never use for control flow.
+    kind: TopologyKind,
+}
+
+/// Descriptive, not prescriptive. New variants added freely.
+#[non_exhaustive]
+enum TopologyKind {
+    CpuOnly,
+    SingleGpu,
+    MultiGpuDiscrete,
+    GpuWithNpu,
+    UnifiedMemory,
+    // future variants added without breaking changes...
 }
 ```
 
-**Key design point:** Upper layers (`WeightResidencyManager`, sessions,
-`ParallelStrategy`) don't need to know which topology they're on. They call
-generic `request_device_memory()` / `request_host_memory()` and the topology
-routes correctly.
+**Key design points:**
+
+- **Upper layers use trait methods** (`request_device_memory()`,
+  `request_host_pages()`), never match on `TopologyKind`.
+- **`TopologyKind` is for logging/metrics/config validation only.** Adding a new
+  variant is not a breaking change thanks to `#[non_exhaustive]`.
+- **Unified memory:** `UnifiedGovernor` implements *both* `DeviceGovernor` and
+  `HostGovernor` traits. The same `Arc` is placed in both `devices` and `host`:
+
+```rust
+// Apple Silicon / DGX Spark construction
+let unified = Arc::new(UnifiedGovernor::new(total_mem, recommended_working_set));
+MemoryTopology {
+    devices: vec![unified.clone()],  // it IS a DeviceGovernor
+    host: unified.clone(),           // it IS also a HostGovernor
+    kind: TopologyKind::UnifiedMemory,
+}
+
+// 8×H200 construction
+MemoryTopology {
+    devices: gpu_governors,  // 8 independent DeviceGovernors
+    host: host_governor,     // 1 shared HostGovernor
+    kind: TopologyKind::MultiGpuDiscrete,
+}
+
+// CPU-only construction
+MemoryTopology {
+    devices: vec![],         // no accelerator
+    host: host_governor,     // HostGovernor manages everything
+    kind: TopologyKind::CpuOnly,
+}
+```
 
 ### 9.2 Variant 1: CPU-Only
 
@@ -992,7 +1033,7 @@ routes correctly.
 - Disk spill provides the cold tier.
 
 ```text
-GovernorTopology::CpuOnly
+MemoryTopology::CpuOnly
 └── HostGovernor (manages host RAM as both "device" and "host" memory)
     ├── host_ram_limit: "32GiB"
     └── disk_spill_limit: "100GiB"
@@ -1007,7 +1048,7 @@ GovernorTopology::CpuOnly
 - The simplest discrete topology. No cross-device arbitration needed.
 
 ```text
-GovernorTopology::Discrete
+MemoryTopology::Discrete
 ├── HostGovernor (host RAM + disk)
 └── DeviceGovernor[GPU 0] (VRAM)
 ```
@@ -1023,7 +1064,7 @@ GovernorTopology::Discrete
   expert migration).
 
 ```text
-GovernorTopology::Discrete
+MemoryTopology::Discrete
 ├── HostGovernor (256GB DDR shared across all GPUs)
 ├── DeviceGovernor[GPU 0] (141GB HBM)
 ├── DeviceGovernor[GPU 1] (141GB HBM)
@@ -1044,7 +1085,7 @@ GovernorTopology::Discrete
   evictable offload pages.
 
 ```text
-GovernorTopology::Discrete
+MemoryTopology::Discrete
 ├── HostGovernor (host RAM, with pinned vs pageable tracking)
 ├── DeviceGovernor[GPU] (VRAM: 8GB)
 └── DeviceGovernor[NPU] (on-chip SRAM: 4MB, relies on host DMA)
@@ -1067,7 +1108,7 @@ coherence. Separate DeviceGovernor and HostGovernor would create a false dichoto
 - Apple's `recommendedMaxWorkingSetSize` provides the device partition hint.
 
 ```text
-GovernorTopology::Unified
+MemoryTopology::Unified
 └── UnifiedGovernor (192GB unified pool)
     ├── device_partition: 160GB (GPU working set)
     ├── host_partition: 24GB (CPU working set)
@@ -1095,34 +1136,51 @@ GovernorTopology::Unified
 
 ### 9.8 Topology-Agnostic Upper Layers
 
-The `GovernorTopology` enum exposes a uniform interface so upper layers remain
-topology-unaware:
+Upper layers access `MemoryTopology` via trait methods on the contained governors.
+They never match on `TopologyKind` — the trait dispatch handles routing:
 
 ```rust
-impl GovernorTopology {
-    /// Request device memory (routes to DeviceGovernor or UnifiedGovernor).
-    fn request_device_memory(
-        &self,
-        device: DeviceId,
-        bytes: usize,
-    ) -> Result<DeviceAllocation>;
+/// Upper-layer code — topology-agnostic.
+fn load_weights(topo: &MemoryTopology, device_id: usize, size: usize) -> Result<()> {
+    if let Some(dev) = topo.devices.get(device_id) {
+        // Accelerator present — allocate on device
+        dev.request_device_memory(size)?;
+    } else {
+        // CPU-only — route through host governor
+        topo.host.request_host_pages(DeviceId::CPU, size, Priority::Normal)?;
+    }
+    Ok(())
+}
 
-    /// Request host memory (routes to HostGovernor or UnifiedGovernor).
-    fn request_host_memory(
-        &self,
-        device: DeviceId,
-        bytes: usize,
-        priority: Priority,
-    ) -> Result<HostAllocation>;
+/// Offload from device to host — works identically on discrete and unified.
+fn offload_to_host(
+    topo: &MemoryTopology,
+    device_id: usize,
+    bytes: usize,
+) -> Result<HostAllocation> {
+    topo.host.request_host_pages(
+        DeviceId::Accelerator(device_id),
+        bytes,
+        Priority::Normal,
+    )
+}
 
-    /// Combined snapshot across all governors.
-    fn snapshot(&self) -> TopologySnapshot;
+/// Combined snapshot across all governors.
+fn topology_snapshot(topo: &MemoryTopology) -> TopologySnapshot {
+    TopologySnapshot {
+        devices: topo.devices.iter().map(|d| d.snapshot()).collect(),
+        host: topo.host.snapshot(),
+        kind: topo.kind,
+    }
 }
 ```
 
 This means `WeightResidencyManager`, session scheduling, and `ParallelStrategy`
-never branch on hardware type — they call the same methods regardless of whether
-the system is CPU-only, discrete multi-GPU, unified, or a heterogeneous mix.
+never branch on hardware type — they call the same trait methods regardless of
+whether the system is CPU-only, discrete multi-GPU, unified, or a heterogeneous
+mix. On unified memory, the `DeviceGovernor` and `HostGovernor` trait calls both
+route to the same `UnifiedGovernor` instance, which internally manages logical
+partitions within the single memory pool.
 
 ---
 
@@ -1261,6 +1319,120 @@ If each of N devices independently manages a `host_ram_limit`, they collectively
 claiming N× the available memory. A single HostGovernor with a global view prevents
 this contention and provides fair cross-device arbitration.
 
+### D8: MemoryTopology is trait-based, not a closed enum
+
+**Decision:** `MemoryTopology` is a struct with trait-object fields
+(`Vec<Arc<dyn DeviceGovernor>>` + `Arc<dyn HostGovernor>`) plus a `#[non_exhaustive]`
+`TopologyKind` for logging/metrics. Upper layers never match on topology kind for
+control flow — they use trait methods exclusively.
+
+**Rationale:** A closed enum forces all match sites to update when a new hardware
+topology appears. Trait objects let new topologies (e.g., `UnifiedGovernor`
+implementing both `DeviceGovernor` and `HostGovernor`) slot in without changing
+upper layers. The enum approach would break on every new device class (CXL memory,
+new NPU architectures, disaggregated memory pools).
+
+### D9: Distributed rendezvous is opt-in with token auth
+
+**Decision:** Multi-device interconnect is off by default (`distributed.enabled: false`).
+When enabled, genai-server acts as rendezvous server with pre-shared token
+authentication. Default bind to `127.0.0.1`; multi-machine requires explicit
+network configuration (`listen_addr` + `allowed_cidrs`).
+
+**Security model:**
+- Opt-in: user must explicitly enable distributed mode
+- Token auth: ranks must present a valid pre-shared token to register
+- Network binding: default localhost; multi-machine needs explicit CIDR allowlist
+- Threat: unauthorized rank registration → tensor injection → model poisoning
+- Defense in depth: opt-in + token + binding + CIDR
+
+```yaml
+distributed:
+  enabled: false  # default off
+  rendezvous:
+    listen: "127.0.0.1:18801"
+    auth_token: null  # auto-generate if null when enabled
+  # Multi-machine requires explicit configuration:
+  # listen: "0.0.0.0:18801"
+  # allowed_cidrs: ["10.0.0.0/24"]
+  # auth_token: "user-provided-secret"
+```
+
+**Rationale:** Exposing a rendezvous endpoint without auth would allow unauthorized
+rank registration and potential tensor injection. An attacker joining as a fake rank
+could corrupt all-reduce results or exfiltrate model weights.
+
+### D10: Model metadata hint namespace (`genai.hint.*`)
+
+**Decision:** Runtime-advisory hints are stored in ONNX `metadata_props`
+(`map<string, string>`) on `NodeProto` using a structured namespace:
+
+```
+genai.hint.{category}.{specific}
+```
+
+**Categories:**
+- `placement` — device affinity, shard axis/count, pipeline stage
+- `memory` — tier preference (hot/warm/cold), offload priority, residency hint
+- `expert` — affinity group, activation frequency, prefetch window
+- `compute` — preferred precision, kernel selection hints
+
+**Per-config specialization (optional):**
+```
+genai.hint.config.{config_name}.{category}.{specific}
+```
+
+Allows the same model to carry different hints for different deployment scenarios.
+
+**Example — same model, multiple configs:**
+```
+# Generic (default)
+genai.hint.placement.shard_axis: "0"
+genai.hint.placement.shard_count: "8"
+genai.hint.expert.affinity_group: "routing_cluster_0"
+genai.hint.expert.activation_frequency: "0.73"
+genai.hint.memory.tier: "hot"
+
+# 4×Mac Studio specialization
+genai.hint.config.mac_cluster.placement.shard_count: "4"
+genai.hint.config.mac_cluster.memory.tier: "unified"
+
+# Single-GPU specialization
+genai.hint.config.single_gpu.expert.prefetch_window: "2"
+genai.hint.config.single_gpu.memory.offload_priority: "1"
+```
+
+**Resolution logic:**
+```rust
+fn resolve_hint(
+    node_metadata: &HashMap<String, String>,
+    key: &str,
+    active_config: Option<&str>,
+) -> Option<String> {
+    // 1. Specialized config hint takes priority
+    if let Some(cfg) = active_config {
+        let specialized = format!("genai.hint.config.{cfg}.{key}");
+        if let Some(v) = node_metadata.get(&specialized) {
+            return Some(v.clone());
+        }
+    }
+    // 2. Fallback to generic hint
+    node_metadata.get(&format!("genai.hint.{key}")).cloned()
+}
+```
+
+**Relationship with ONNX native sharding (D6):**
+- ONNX `ShardingSpecProto` → structured TP/PP placement (protobuf fields)
+- `genai.hint.*` → runtime-specific scheduling/memory/precision (metadata_props)
+- Both coexist; ONNX spec handles what it standardizes, `genai.hint.*` handles
+  everything else (expert affinity, precision hints, tier preferences, config
+  specialization)
+
+**Rationale:** Model exporters (Mobius, converter tools) already know deployment-
+relevant information from profiling data. A structured namespace prevents ad-hoc
+key proliferation, supports cross-scenario specialization without model duplication,
+and keeps all hints advisory (runtime always has final say).
+
 ---
 
 ## 11. Phased Implementation
@@ -1300,7 +1472,7 @@ Unified across all design documents:
 - `ClusterCoordinator` Strategy 2 (shared weights + shared KV pool).
 - Expert migration between GPUs based on heat.
 - InProcess `Communicator` for testing.
-- `GovernorTopology::Discrete` with multi-device HostGovernor arbitration.
+- `MemoryTopology::Discrete` with multi-device HostGovernor arbitration.
 
 ### Phase 4: Cross-Node
 
@@ -1312,70 +1484,101 @@ Unified across all design documents:
 
 ---
 
-## 12. Open Questions
+## 12. Resolved Questions
 
-Consolidated from all source documents:
+All questions consolidated from source documents, with decisions.
 
 ### From weight residency / governor (WEIGHT_OFFLOAD.md, DESIGN.md)
 
 1. **Auto mode completeness.** Auto mode must not be considered complete until real
    free/total RAM, filesystem, and device capacity are reported by the EP.
+   **Decision:** Implementation detail. EP interface adds `query_device_info()`.
+   Not an architectural question.
 
 2. **Budget reporting fidelity.** Clean mapped pages (cold tier) are OS page cache,
    not owned bytes. How to distinguish in budget reporting?
+   **Decision:** Implementation detail. Track clean mapped pages separately in
+   budget snapshots. Not an architectural question.
 
 ### From distributed coordination (DISTRIBUTED_RUNTIME.md)
 
 3. **Rendezvous mechanism.** How do distributed ranks discover each other?
-   Options: env vars (`MASTER_ADDR`/`MASTER_PORT`), shared file, TCP rendezvous
-   server, mDNS/Bonjour.
+   **Decision:** genai-server acts as rendezvous server. Off by default. Token
+   auth + localhost binding + CIDR allowlist for multi-machine. Fallback to env
+   vars for compatibility. See D9.
 
-4. **Fault tolerance.** What happens when a rank crashes mid-collective? NCCL
-   aborts all ranks. Is restart-from-scratch acceptable for inference?
+4. **Fault tolerance.** What happens when a rank crashes mid-collective?
+   **Decision:** Phase 1–3: abort all ranks + restart. Optimize for fast reload
+   (weights stay in host RAM, rebuild device state only). Partial degradation
+   deferred to Phase 4+.
 
 5. **Dynamic rank membership.** Can ranks join/leave a live session?
+   **Decision:** Not needed. Topology fixed at startup. Elastic scaling via
+   session group restart. **Closed.**
 
 6. **Communicator selection.** When multiple backends are available, auto-select
    based on topology or user-configured?
+   **Decision:** Auto-select based on hardware detection (NVLink → NCCL, TB5 →
+   Thunderbolt, same process → InProcess). User can override via config.
 
 7. **Quantized communication.** Send FP8/INT8 and up-cast at receiver to halve
    bandwidth?
+   **Decision:** Phase 1 full precision. Phase 3+ add optional FP8 as
+   `Communicator` config flag (no trait signature change). Highest value for
+   cross-node (TB5 40Gb/s bottleneck).
 
 8. **CUDA IPC ownership semantics.** When session 0 allocates shared weights and
-   sessions 1-7 map via IPC, who owns the lifecycle? Options: dedicated weight
-   server process, shared mmap-backed allocations, accept coupling.
+   sessions 1–7 map via IPC, who owns the lifecycle?
+   **Decision:** genai-server manages shared weight lifecycle (reference counting).
+   Session crash doesn't affect weights because genai-server outlives sessions.
 
 9. **KV cache sharing granularity.** Different sessions may quantize KV differently
    (FP16 vs FP8). Enforce uniform format or support conversion at share boundaries?
+   **Decision:** Enforce uniform format within a shared KV prefix pool. Different
+   formats → different pools. Conversion at every cache hit is too expensive.
 
 10. **ClusterCoordinator placement.** In genai-server process or separate daemon?
+    **Decision:** Module inside genai-server. Separate daemon adds operational
+    complexity with no benefit.
 
 ### From MoE / expert parallelism
 
 11. **Expert-aware scheduling across sessions.** When multiple sessions share a device,
-    should the governor prefer expert affinity (co-locate sessions that use
-    complementary expert sets)?
+    should the governor prefer expert affinity?
+    **Decision:** Model export tools (Mobius) annotate expert affinity groups at
+    export time via `genai.hint.expert.affinity_group` (see D10). Runtime uses
+    hints to seed scheduling; no hints → LRU fallback. Phase 3+.
 
 12. **Prefetch speculation budget.** How many speculative prefetch bytes before the
     cost of wrong predictions exceeds the benefit?
+    **Decision:** Start with 5–10% of device memory. Dynamic adjustment based on
+    hit rate. Algorithm-managed, not user-configured.
 
 ### From governor split / topology (§4, §5, §9)
 
 13. **HostGovernor pinned vs pageable allocation.** Should HostGovernor allocate pinned
-    vs pageable host memory separately? Pinned memory is a limited OS resource.
+    vs pageable host memory separately?
+    **Decision:** Bounded pinned pool + pageable overflow. HostGovernor maintains
+    a configurable pinned pool (default: 10% of host RAM). Hot data prioritized
+    into pinned pages; overflow goes pageable. User-configurable at startup and
+    dynamically adjustable at runtime.
 
-14. **Unified memory working set size.** Unified memory devices (Apple Silicon, DGX Spark):
-    DeviceGovernor and HostGovernor collapse into one — the device IS the host. How to
-    define `recommendedMaxWorkingSetSize` equivalent? Apple reports it; NVIDIA unified
-    devices may not.
+14. **Unified memory working set size.** How to define the GPU budget on unified
+    memory devices?
+    **Decision:** Three-tier fallback: (1) OS API available (Apple
+    `recommendedMaxWorkingSetSize`) → use it; (2) no OS API →
+    `total_memory * 0.75`; (3) user override in config → user wins.
 
-15. **NPU DMA pinning.** HostGovernor needs a pin/lease mechanism so host pages being
-    DMA'd by NPU can't be evicted by GPU offload pressure. How to track and
-    enforce DMA pin lifetimes?
+15. **NPU DMA pinning.** How to prevent host pages being DMA’d by NPU from being
+    evicted by GPU offload pressure?
+    **Decision:** Already covered by design. `HostAllocation` returned by
+    `request_host_pages()` acts as a pin/lease. NPU holds allocation during DMA;
+    eviction skips pinned pages. Release after DMA completes. **Closed.**
 
-16. **CPU-only mode.** Should we still instantiate a DeviceGovernor for CPU (treating
-    host RAM as device memory) for API uniformity, or skip it and route everything
-    through HostGovernor?
+16. **CPU-only mode.** Should we instantiate a DeviceGovernor for CPU?
+    **Decision:** No empty-shell DeviceGovernor. `MemoryTopology.devices` is empty.
+    Upper layers check `devices.get(id)` — `None` means route through `host`.
+    `TopologyKind::CpuOnly` is informational only. See D8.
 
 ---
 
