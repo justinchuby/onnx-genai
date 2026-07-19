@@ -1,0 +1,30 @@
+{
+  "models": [
+    {
+      "name": "glm-5.2",
+      "mobius_pr": 404,
+      "mobius_commit": "fb52e7279c8a77bb1862f52a880d3743ca8e081e",
+      "artifact_subdir": "glm-5.2",
+      "required_files": [
+        "model.onnx",
+        "tokenizer.json"
+      ],
+      "prompt": "2 + 2 =",
+      "expected_text_contains": "4",
+      "max_new_tokens": 8
+    },
+    {
+      "name": "deepseek-v4-flash",
+      "mobius_pr": 405,
+      "mobius_commit": "7e26e6eb4e3a8839b311d59160ca947254afff4b",
+      "artifact_subdir": "deepseek-v4-flash",
+      "required_files": [
+        "model.onnx",
+        "tokenizer.json"
+      ],
+      "prompt": "2 + 2 =",
+      "expected_text_contains": "4",
+      "max_new_tokens": 8
+    }
+  ]
+}
