@@ -70,7 +70,9 @@ impl From<GenerateRequest> for PipelineGenerateRequest {
 pub struct PipelineEngine {
     models: PipelineModels,
     plan: PipelinePlan,
-    decoder_state: DecodeState,
+    /// Autoregressive decode state; `None` for non-autoregressive pipelines
+    /// (single-pass, iterative/diffusion) which produce tensors, not tokens.
+    decoder_state: Option<DecodeState>,
     tokenizer_component: String,
 }
 
@@ -111,12 +113,21 @@ impl PipelineEngine {
         let models = PipelineModels::load_with_options(pipeline_dir, SessionOptions::default())
             .map_err(|e| anyhow::anyhow!("Failed to load pipeline models: {}", e))?;
         let plan = PipelinePlan::from_spec(&models.directory.spec)?;
-        let decoder = models
-            .session(&plan.decoder)
-            .with_context(|| format!("pipeline decoder '{}' was not loaded", plan.decoder))?;
-        let _kv_model = infer_kv_model_info(decoder, config.page_size, config.kv_cache_dtype)?;
-        let decoder_state = DecodeState::new(decoder)?;
-        let tokenizer_component = plan.decoder.clone();
+        // Only autoregressive pipelines drive a token-by-token decode loop and
+        // therefore need a `DecodeState` + KV model info. Single-pass and
+        // iterative (diffusion) pipelines run tensors through `run_pipeline`.
+        let (decoder_state, tokenizer_component) = match &plan {
+            PipelinePlan::Autoregressive(ar) => {
+                let decoder = models.session(&ar.decoder).with_context(|| {
+                    format!("pipeline decoder '{}' was not loaded", ar.decoder)
+                })?;
+                let _kv_model =
+                    infer_kv_model_info(decoder, config.page_size, config.kv_cache_dtype)?;
+                (Some(DecodeState::new(decoder)?), ar.decoder.clone())
+            }
+            PipelinePlan::SinglePass(sp) => (None, sp.model.clone()),
+            PipelinePlan::Iterative(it) => (None, it.denoiser.clone()),
+        };
         Ok(Self {
             models,
             plan,
@@ -145,6 +156,18 @@ impl PipelineEngine {
         pipeline_request: PipelineGenerateRequest,
         callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
+        // Guard first: a non-autoregressive pipeline (single-pass / iterative
+        // diffusion) has no token decode loop, so surface the actionable error
+        // before touching the tokenizer or options.
+        let ar = self
+            .plan
+            .autoregressive_plan()
+            .context(
+                "generate() requires an autoregressive pipeline; use run_pipeline() for \
+                 single-pass or iterative (diffusion) pipelines",
+            )?
+            .clone();
+
         let mut options = pipeline_request.request.options.clone();
         options.validate()?;
         if options.eos_token_id.is_none() {
@@ -169,21 +192,22 @@ impl PipelineEngine {
         )?;
 
         let mut tensors = pipeline_request.inputs;
-        self.run_prompt_phase_components(&mut tensors)?;
-        let decoder_extras = self.decoder_extra_inputs(&tensors)?;
+        self.run_prompt_phase_components(&ar.prompt_components, &mut tensors)?;
+        let decoder_extras = self.decoder_extra_inputs(&ar.decoder, &tensors)?;
 
         let chain = build_processor_chain(&options, Some(self.tokenizer()?))?;
-        self.decoder_state = {
-            let decoder = self.models.session(&self.plan.decoder).with_context(|| {
-                format!("pipeline decoder '{}' was not loaded", self.plan.decoder)
-            })?;
+        self.decoder_state = Some({
+            let decoder = self
+                .models
+                .session(&ar.decoder)
+                .with_context(|| format!("pipeline decoder '{}' was not loaded", ar.decoder))?;
             DecodeState::new(decoder)?
-        };
+        });
 
         let decoder = self
             .models
-            .session(&self.plan.decoder)
-            .with_context(|| format!("pipeline decoder '{}' was not loaded", self.plan.decoder))?;
+            .session(&ar.decoder)
+            .with_context(|| format!("pipeline decoder '{}' was not loaded", ar.decoder))?;
         let tokenizer = self
             .models
             .tokenizer_for(&self.tokenizer_component)
@@ -192,7 +216,10 @@ impl PipelineEngine {
             })?;
         let mut backend = PipelineDecodeLoopBackend {
             decoder,
-            decoder_state: &mut self.decoder_state,
+            decoder_state: self
+                .decoder_state
+                .as_mut()
+                .expect("autoregressive pipeline has decode state"),
             decoder_extras: &decoder_extras,
             context_tokens: prompt_tokens,
             prompt_len: 0,
@@ -215,14 +242,153 @@ impl PipelineEngine {
         &self.models.directory.spec
     }
 
+    /// Execute a **non-autoregressive** pipeline (single-pass or iterative /
+    /// diffusion) and return the final named output tensors, keyed by
+    /// `component.output_name`.
+    ///
+    /// This is the tensor-producing counterpart to [`generate`](Self::generate)
+    /// (which drives an autoregressive token loop). Use it for diffusion
+    /// denoisers, VAE decoders, audio vocoders, and other tensor-out models.
+    pub fn run_pipeline(
+        &mut self,
+        request: PipelineGenerateRequest,
+    ) -> anyhow::Result<PipelineTensors> {
+        match &self.plan {
+            PipelinePlan::Iterative(_) => self.run_iterative(request),
+            PipelinePlan::SinglePass(_) => self.run_single_pass(request),
+            PipelinePlan::Autoregressive(_) => anyhow::bail!(
+                "run_pipeline() runs single-pass or iterative pipelines; use generate() for \
+                 autoregressive text pipelines"
+            ),
+        }
+    }
+
+    /// Run a bounded iterative (diffusion) denoise loop.
+    ///
+    /// Semantics: prompt-phase components run once; then the denoiser runs
+    /// `num_steps` times, threading loop-carried state (its self-edges) from one
+    /// step's output into the next step's input while constant conditioning
+    /// (e.g. encoder hidden states) is re-supplied each step; then final-phase
+    /// components run once. `guidance_scale` is carried but not yet applied —
+    /// classifier-free guidance and timestep/sigma schedules are supplied by the
+    /// scheduler-registry follow-up.
+    fn run_iterative(
+        &self,
+        request: PipelineGenerateRequest,
+    ) -> anyhow::Result<PipelineTensors> {
+        let PipelinePlan::Iterative(plan) = &self.plan else {
+            anyhow::bail!("internal error: run_iterative on a non-iterative plan");
+        };
+        // Fail loudly rather than silently produce an unguided result: CFG
+        // requires model-specific conditional/unconditional batching that the
+        // scheduler-registry follow-up supplies. `1.0` (or unset) means "no
+        // guidance" and is safe to run here.
+        if let Some(scale) = plan.guidance_scale
+            && scale != 1.0
+        {
+            anyhow::bail!(
+                "classifier-free guidance (guidance_scale = {scale}) is not yet applied by the \
+                 iterative pipeline seam; it is pending the scheduler-registry follow-up"
+            );
+        }
+        let mut tensors = request.inputs;
+        self.run_prompt_phase_components(&plan.prompt_components, &mut tensors)?;
+
+        let denoiser = self
+            .models
+            .session(&plan.denoiser)
+            .with_context(|| format!("pipeline denoiser '{}' was not loaded", plan.denoiser))?;
+
+        for step in 0..plan.num_steps {
+            let mut inputs: Vec<(String, Value)> = Vec::new();
+            for info in denoiser.inputs() {
+                let port = info.name.as_str();
+                let endpoint = format!("{}.{}", plan.denoiser, port);
+                let value = if let Some((out_port, _)) =
+                    plan.loop_edges.iter().find(|(_, in_port)| in_port == port)
+                {
+                    // Loop-carried: step 0 seeds from the external initial
+                    // tensor; later steps read the previous step's output.
+                    let source = if step == 0 {
+                        endpoint.clone()
+                    } else {
+                        format!("{}.{}", plan.denoiser, out_port)
+                    };
+                    tensors.get(&source).with_context(|| {
+                        format!("missing iterative pipeline input '{source}' at step {step}")
+                    })?
+                } else {
+                    // Constant conditioning: external tensor or routed edge.
+                    let routed = plan
+                        .dataflow
+                        .iter()
+                        .find(|edge| edge.to == endpoint)
+                        .and_then(|edge| tensors.get(&edge.from));
+                    tensors
+                        .get(&endpoint)
+                        .or(routed)
+                        .with_context(|| format!("missing pipeline input '{endpoint}'"))?
+                };
+                inputs.push((port.to_string(), clone_value(value)?));
+            }
+            let refs = inputs
+                .iter()
+                .map(|(name, value)| (name.as_str(), value))
+                .collect::<Vec<_>>();
+            let outputs = denoiser.run(&refs).map_err(|e| {
+                anyhow::anyhow!("ORT denoiser '{}' failed at step {step}: {e}", plan.denoiser)
+            })?;
+            for (name, value) in denoiser.output_names().iter().zip(outputs) {
+                tensors.insert(format!("{}.{}", plan.denoiser, name), value);
+            }
+        }
+
+        self.run_prompt_phase_components(&plan.final_components, &mut tensors)?;
+        Ok(tensors)
+    }
+
+    /// Run a single-pass pipeline: prompt-phase components once, then one
+    /// forward invocation of the strategy `model`.
+    fn run_single_pass(
+        &self,
+        request: PipelineGenerateRequest,
+    ) -> anyhow::Result<PipelineTensors> {
+        let PipelinePlan::SinglePass(plan) = &self.plan else {
+            anyhow::bail!("internal error: run_single_pass on a non-single-pass plan");
+        };
+        let mut tensors = request.inputs;
+        self.run_prompt_phase_components(&plan.prompt_components, &mut tensors)?;
+
+        let model = self
+            .models
+            .session(&plan.model)
+            .with_context(|| format!("pipeline model '{}' was not loaded", plan.model))?;
+        let inputs = self.component_inputs(&plan.model, model, &tensors)?;
+        let refs = inputs
+            .iter()
+            .map(|(name, value)| (name.as_str(), value))
+            .collect::<Vec<_>>();
+        let outputs = model
+            .run(&refs)
+            .map_err(|e| anyhow::anyhow!("ORT pipeline model '{}' failed: {e}", plan.model))?;
+        for (name, value) in model.output_names().iter().zip(outputs) {
+            tensors.insert(format!("{}.{}", plan.model, name), value);
+        }
+        Ok(tensors)
+    }
+
     fn tokenizer(&self) -> anyhow::Result<&Tokenizer> {
         self.models
             .tokenizer_for(&self.tokenizer_component)
             .with_context(|| format!("no tokenizer available for '{}'", self.tokenizer_component))
     }
 
-    fn run_prompt_phase_components(&self, tensors: &mut PipelineTensors) -> anyhow::Result<()> {
-        for component in &self.plan.prompt_components {
+    fn run_prompt_phase_components(
+        &self,
+        components: &[String],
+        tensors: &mut PipelineTensors,
+    ) -> anyhow::Result<()> {
+        for component in components {
             let session = self
                 .models
                 .session(component)
@@ -253,7 +419,7 @@ impl PipelineEngine {
             let endpoint = format!("{component}.{}", info.name);
             let routed = self
                 .plan
-                .dataflow
+                .dataflow()
                 .iter()
                 .find(|edge| edge.to == endpoint)
                 .and_then(|edge| tensors.get(&edge.from));
@@ -268,15 +434,14 @@ impl PipelineEngine {
 
     fn decoder_extra_inputs(
         &self,
+        decoder: &str,
         tensors: &PipelineTensors,
     ) -> anyhow::Result<Vec<(String, Value)>> {
         let mut extras = Vec::new();
         for edge in self
             .plan
-            .edges_to_component(&self.plan.decoder)
-            .filter(|edge| {
-                endpoint_component(&edge.from).is_some_and(|from| from != self.plan.decoder)
-            })
+            .edges_to_component(decoder)
+            .filter(|edge| endpoint_component(&edge.from).is_some_and(|from| from != decoder))
         {
             let (_, input) = parse_endpoint(&edge.to)?;
             let value = tensors
@@ -459,52 +624,209 @@ impl DecodeLoopBackend for PipelineDecodeLoopBackend<'_> {
     }
 }
 
+/// Executable plan for a pipeline, discriminated by strategy family.
+///
+/// Autoregressive pipelines drive a token decode loop (`generate`); single-pass
+/// and iterative (diffusion) pipelines produce tensors (`run_pipeline`).
 #[derive(Debug, Clone)]
-struct PipelinePlan {
+enum PipelinePlan {
+    Autoregressive(AutoregressivePlan),
+    SinglePass(SinglePassPlan),
+    Iterative(IterativePlan),
+}
+
+/// Token-by-token decoder pipeline (optionally with prompt-phase encoders).
+#[derive(Debug, Clone)]
+struct AutoregressivePlan {
     decoder: String,
     prompt_components: Vec<String>,
     dataflow: Vec<DataflowEdge>,
 }
 
+/// One forward invocation of a single model with no runtime-managed loop.
+#[derive(Debug, Clone)]
+struct SinglePassPlan {
+    model: String,
+    /// Components that run once before the model (e.g. an encoder).
+    prompt_components: Vec<String>,
+    dataflow: Vec<DataflowEdge>,
+}
+
+/// Bounded iterative loop (diffusion denoise / other fixed-step refinement).
+#[derive(Debug, Clone)]
+struct IterativePlan {
+    /// The component re-invoked once per step.
+    denoiser: String,
+    /// Number of loop iterations.
+    num_steps: usize,
+    /// Classifier-free-guidance scale, carried for the scheduler follow-up.
+    ///
+    /// Not applied by this seam: CFG requires model-specific conditional /
+    /// unconditional batching supplied by the scheduler registry (follow-up).
+    guidance_scale: Option<f32>,
+    /// Components run once before the loop (e.g. a text/prompt encoder).
+    prompt_components: Vec<String>,
+    /// Components run once after the loop (`final_only`, e.g. a VAE decoder).
+    final_components: Vec<String>,
+    /// Loop-carried edges internal to the denoiser: `(output_port, input_port)`.
+    ///
+    /// Each step i>0 feeds step (i-1)'s `output_port` into `input_port`. Step 0
+    /// reads the seed from the external `denoiser.input_port` tensor.
+    loop_edges: Vec<(String, String)>,
+    dataflow: Vec<DataflowEdge>,
+}
+
 impl PipelinePlan {
     fn from_spec(spec: &PipelineSpec) -> anyhow::Result<Self> {
-        let decoder = autoregressive_decoder(&spec.strategy)
-            .context("pipeline strategy must contain an autoregressive decoder")?;
+        // A composite whose stages contain an autoregressive decoder is treated
+        // as an autoregressive text pipeline (unchanged legacy behavior). Pure
+        // iterative / single-pass composites are a follow-up.
+        if let Some(decoder) = autoregressive_decoder(&spec.strategy) {
+            return Self::autoregressive(spec, decoder);
+        }
+        match spec.strategy.kind {
+            PipelineStrategyKind::SinglePass => Self::single_pass(spec),
+            PipelineStrategyKind::Iterative => Self::iterative(spec),
+            PipelineStrategyKind::Composite => anyhow::bail!(
+                "composite pipeline strategy without an autoregressive decoder is not yet \
+                 supported"
+            ),
+            PipelineStrategyKind::Autoregressive => {
+                anyhow::bail!("autoregressive strategy is missing its 'decoder' component")
+            }
+            PipelineStrategyKind::Other(ref value) => {
+                anyhow::bail!("unsupported pipeline strategy kind '{value}'")
+            }
+        }
+    }
+
+    fn autoregressive(spec: &PipelineSpec, decoder: String) -> anyhow::Result<Self> {
         if !spec.models.contains_key(&decoder) {
             anyhow::bail!("pipeline decoder '{decoder}' is not declared in models");
         }
-
-        let mut prompt_components = Vec::new();
-        for component in topological_components(spec)? {
-            if component == decoder {
-                continue;
-            }
-            match component_phase(spec, &component, &decoder) {
-                PhaseRunOn::PromptOnly => prompt_components.push(component),
-                PhaseRunOn::EveryStep | PhaseRunOn::OnDemand | PhaseRunOn::FinalOnly => {}
-                PhaseRunOn::Other(value) => {
-                    anyhow::bail!(
-                        "unsupported phase '{value}' for pipeline component '{component}'"
-                    )
-                }
-            }
-        }
-
-        Ok(Self {
+        let prompt_components = prompt_phase_components(spec, &decoder)?;
+        Ok(Self::Autoregressive(AutoregressivePlan {
             decoder,
             prompt_components,
             dataflow: spec.dataflow.clone(),
-        })
+        }))
+    }
+
+    fn single_pass(spec: &PipelineSpec) -> anyhow::Result<Self> {
+        let model = spec
+            .strategy
+            .model
+            .clone()
+            .context("single_pass strategy is missing its 'model' component")?;
+        if !spec.models.contains_key(&model) {
+            anyhow::bail!("pipeline model '{model}' is not declared in models");
+        }
+        let prompt_components = prompt_phase_components(spec, &model)?;
+        Ok(Self::SinglePass(SinglePassPlan {
+            model,
+            prompt_components,
+            dataflow: spec.dataflow.clone(),
+        }))
+    }
+
+    fn iterative(spec: &PipelineSpec) -> anyhow::Result<Self> {
+        let denoiser = spec
+            .strategy
+            .denoiser
+            .clone()
+            .context("iterative strategy is missing its 'denoiser' component")?;
+        if !spec.models.contains_key(&denoiser) {
+            anyhow::bail!("pipeline denoiser '{denoiser}' is not declared in models");
+        }
+        let num_steps = spec
+            .strategy
+            .num_steps
+            .context("iterative strategy is missing 'num_steps'")?;
+        if num_steps == 0 {
+            anyhow::bail!("iterative strategy 'num_steps' must be greater than zero");
+        }
+
+        // Loop-carried edges are the denoiser's self-referential dataflow edges.
+        let mut loop_edges = Vec::new();
+        for edge in &spec.dataflow {
+            let (from_component, from_port) = parse_endpoint(&edge.from)?;
+            let (to_component, to_port) = parse_endpoint(&edge.to)?;
+            if from_component == denoiser && to_component == denoiser {
+                loop_edges.push((from_port.to_string(), to_port.to_string()));
+            }
+        }
+
+        // Non-decoder components: prompt-phase (run once before the loop) and
+        // final-phase (run once after the loop).
+        let mut prompt_components = Vec::new();
+        let mut final_components = Vec::new();
+        for component in topological_components(spec)? {
+            if component == denoiser {
+                continue;
+            }
+            match component_phase(spec, &component, &denoiser) {
+                PhaseRunOn::PromptOnly => prompt_components.push(component),
+                PhaseRunOn::FinalOnly => final_components.push(component),
+                PhaseRunOn::EveryStep | PhaseRunOn::OnDemand => {}
+                PhaseRunOn::Other(value) => anyhow::bail!(
+                    "unsupported phase '{value}' for pipeline component '{component}'"
+                ),
+            }
+        }
+
+        Ok(Self::Iterative(IterativePlan {
+            denoiser,
+            num_steps,
+            guidance_scale: spec.strategy.guidance_scale,
+            prompt_components,
+            final_components,
+            loop_edges,
+            dataflow: spec.dataflow.clone(),
+        }))
+    }
+
+    fn autoregressive_plan(&self) -> anyhow::Result<&AutoregressivePlan> {
+        match self {
+            Self::Autoregressive(plan) => Ok(plan),
+            _ => anyhow::bail!("pipeline strategy is not autoregressive"),
+        }
+    }
+
+    fn dataflow(&self) -> &[DataflowEdge] {
+        match self {
+            Self::Autoregressive(plan) => &plan.dataflow,
+            Self::SinglePass(plan) => &plan.dataflow,
+            Self::Iterative(plan) => &plan.dataflow,
+        }
     }
 
     fn edges_to_component<'a>(
         &'a self,
         component: &'a str,
     ) -> impl Iterator<Item = &'a DataflowEdge> + 'a {
-        self.dataflow
+        self.dataflow()
             .iter()
             .filter(move |edge| endpoint_component(&edge.to) == Some(component))
     }
+}
+
+/// Collect the `prompt_only`-phase components (everything except `primary`
+/// defaults to prompt-phase), rejecting unsupported phase strings.
+fn prompt_phase_components(spec: &PipelineSpec, primary: &str) -> anyhow::Result<Vec<String>> {
+    let mut prompt_components = Vec::new();
+    for component in topological_components(spec)? {
+        if component == primary {
+            continue;
+        }
+        match component_phase(spec, &component, primary) {
+            PhaseRunOn::PromptOnly => prompt_components.push(component),
+            PhaseRunOn::EveryStep | PhaseRunOn::OnDemand | PhaseRunOn::FinalOnly => {}
+            PhaseRunOn::Other(value) => {
+                anyhow::bail!("unsupported phase '{value}' for pipeline component '{component}'")
+            }
+        }
+    }
+    Ok(prompt_components)
 }
 
 fn autoregressive_decoder(strategy: &PipelineStrategy) -> Option<String> {
@@ -541,9 +863,15 @@ fn topological_components(spec: &PipelineSpec) -> anyhow::Result<Vec<String>> {
             .iter()
             .find(|component| {
                 spec.dataflow.iter().all(|edge| {
-                    endpoint_component(&edge.to) != Some(component.as_str())
-                        || endpoint_component(&edge.from)
-                            .is_some_and(|from| !remaining.contains(from))
+                    let to = endpoint_component(&edge.to);
+                    let from = endpoint_component(&edge.from);
+                    // The edge does not gate `component` when: it does not feed
+                    // `component`; it is a self-edge (loop-carried, resolved
+                    // temporally, not an ordering dependency); or its source is
+                    // already ordered.
+                    to != Some(component.as_str())
+                        || from == Some(component.as_str())
+                        || from.is_some_and(|f| !remaining.contains(f))
                 })
             })
             .cloned();
@@ -744,8 +1072,9 @@ pipeline:
         };
 
         let plan = PipelinePlan::from_spec(&spec)?;
-        assert_eq!(plan.prompt_components, ["vision_encoder"]);
-        assert_eq!(plan.decoder, "decoder");
+        let ar = plan.autoregressive_plan()?;
+        assert_eq!(ar.prompt_components, ["vision_encoder"]);
+        assert_eq!(ar.decoder, "decoder");
         let routed = plan.edges_to_component("decoder").collect::<Vec<_>>();
         assert_eq!(routed.len(), 1);
         assert_eq!(

@@ -8,6 +8,8 @@ models/
 !tests/fixtures/tiny-mtp-full/mtp/model.onnx
 !tests/fixtures/tiny-whisper/encoder.onnx
 !tests/fixtures/tiny-whisper/decoder.onnx
+!tests/fixtures/tiny-diffusion/denoiser.onnx
+!tests/fixtures/tiny-diffusion/vae.onnx
 !crates/onnx-genai-ort/tests/fixtures/speculator-eagle3/model.onnx
 !tests/fixtures/tiny-gemma4-assistant/model.onnx
 !tests/fixtures/tiny-gemma4-assistant/assistant/model.onnx

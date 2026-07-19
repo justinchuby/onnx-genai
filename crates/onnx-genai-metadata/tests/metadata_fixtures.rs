@@ -190,6 +190,22 @@ fn pipeline_validation_rejects_cycles() {
 }
 
 #[test]
+fn pipeline_validation_accepts_iterative_denoiser_self_edge() {
+    // A denoiser fed its own previous-step output (`denoiser.x -> denoiser.y`)
+    // is a loop-carried temporal dependency, not a same-step DAG cycle, so it
+    // must validate cleanly.
+    let spec = load_pipeline_spec(&crate_fixture("pipeline_iterative_self_edge.yaml"))
+        .expect("iterative pipeline with a denoiser self-edge validates");
+
+    assert!(matches!(
+        spec.strategy.kind,
+        PipelineStrategyKind::Iterative
+    ));
+    assert_eq!(spec.strategy.denoiser.as_deref(), Some("denoiser"));
+    assert_eq!(spec.strategy.num_steps, Some(20));
+}
+
+#[test]
 fn pipeline_vision_config_round_trips_via_json() {
     use onnx_genai_metadata::PipelineVisionConfig;
 

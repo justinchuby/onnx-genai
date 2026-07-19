@@ -124,6 +124,10 @@ pub fn validate_pipeline_spec(spec: &PipelineSpec) -> Result<(), PipelineValidat
             (parse_endpoint(&edge.from), parse_endpoint(&edge.to))
             && spec.models.contains_key(from)
             && spec.models.contains_key(to)
+            // A self-edge (`A.x -> A.y`) is a loop-carried temporal dependency
+            // (e.g. a diffusion denoiser fed its previous step's output), not a
+            // same-step DAG cycle; it is excluded from the acyclic check.
+            && from != to
         {
             adjacency.entry(from).or_default().insert(to);
         }

@@ -1,0 +1,22 @@
+pipeline:
+  models:
+    denoiser:
+      filename: denoiser.onnx
+      type: denoiser
+    vae:
+      filename: vae.onnx
+      type: vae
+  dataflow:
+    - from: denoiser.denoised
+      to: denoiser.sample
+      dtype: fp32
+    - from: denoiser.denoised
+      to: vae.latent
+      dtype: fp32
+  strategy:
+    kind: iterative
+    denoiser: denoiser
+    num_steps: 3
+  phases:
+    vae:
+      run_on: final_only
