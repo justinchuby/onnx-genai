@@ -67,6 +67,16 @@ impl DeviceSampleParams {
 /// already holds — which corrupts ORT's per-id CUDA-graph bookkeeping.
 static NEXT_CAPTURE_GRAPH_ID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(1);
 
+#[cfg(feature = "cuda")]
+fn device_argmax_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("ONNX_GENAI_DEVICE_ARGMAX")
+            .map(|value| value != "0")
+            .unwrap_or(true)
+    })
+}
+
 fn next_capture_graph_id() -> i32 {
     // Ids must be unique across concurrently-live sessions and strictly positive
     // so they never collide with the `-1` no-capture sentinel. Masking off the
@@ -77,6 +87,43 @@ fn next_capture_graph_id() -> i32 {
     match raw & i32::MAX {
         0 => i32::MAX,
         id => id,
+    }
+}
+
+enum CapturedStepError {
+    PreRun(OrtError),
+    RunInvoked(OrtError),
+}
+
+fn retry_pre_run_captured_failure<T>(
+    result: std::result::Result<T, CapturedStepError>,
+    retry: impl FnOnce(OrtError) -> Result<T>,
+) -> Result<T> {
+    match result {
+        Ok(value) => Ok(value),
+        Err(CapturedStepError::PreRun(err)) => retry(err),
+        Err(CapturedStepError::RunInvoked(err)) => Err(err),
+    }
+}
+
+#[cfg(test)]
+mod captured_step_retry_tests {
+    use super::*;
+
+    #[test]
+    fn post_run_sampling_failure_does_not_rerun_model() {
+        let mut model_runs = 1;
+        let sampling_failure = CapturedStepError::RunInvoked(OrtError::InvalidArgument(
+            "injected sampler failure".into(),
+        ));
+
+        let result: Result<()> = retry_pre_run_captured_failure(Err(sampling_failure), |_| {
+            model_runs += 1;
+            Ok(())
+        });
+
+        assert!(result.is_err());
+        assert_eq!(model_runs, 1, "standard fallback must not replay the step");
     }
 }
 
@@ -476,10 +523,7 @@ impl<'a> DecodeSession<'a> {
             let captured = self.mode == DecodeKvMode::SharedBuffer
                 && self.session.graph_capture()
                 && !self.graph_capture_disabled;
-            let device_argmax_enabled = std::env::var("ONNX_GENAI_DEVICE_ARGMAX")
-                .map(|v| v != "0")
-                .unwrap_or(true);
-            let device_logits = device_argmax_enabled
+            let device_logits = device_argmax_enabled()
                 && self.session.cuda_device_id().is_some()
                 && self.kv_allocator.is_some();
             captured && device_logits
@@ -533,26 +577,25 @@ impl<'a> DecodeSession<'a> {
             && new_input_ids.len() == 1
             && self.current_len > 0
         {
-            match self.step_captured(new_input_ids[0], attention_mask, position_ids[0], params)
-            {
-                Ok(logits) => return Ok(logits),
-                Err(err) => {
-                    // The captured decode path failed (e.g. the EP could not
-                    // capture/replay a graph for this session). Degrade
-                    // gracefully: skip the captured path for the rest of this
-                    // generation, drop any partial capture state, and fall
-                    // through to the standard step below. `step_captured`
-                    // advances `current_len` only on success, so no KV progress
-                    // is lost by retrying here.
+            let captured =
+                self.step_captured(new_input_ids[0], attention_mask, position_ids[0], params);
+            return retry_pre_run_captured_failure(captured, |err| {
+                // Failures before ORT starts the graph run cannot have advanced
+                // KV state, so disable capture and retry this step through the
+                // standard path. Once the graph run is invoked, errors propagate
+                // without retry because KV may already have been mutated.
+                {
                     tracing::warn!(
                         error = %err,
-                        "CUDA graph decode step failed; disabling graph capture and \
+                        "CUDA graph decode setup failed; disabling graph capture and \
                          falling back to the standard decode path for the rest of this session"
                     );
                     self.graph_capture_disabled = true;
                     self.capture = None;
                 }
-            }
+                self.step_standard(new_input_ids, attention_mask, position_ids)
+                    .map(StepLogits::Value)
+            });
         }
 
         self.step_standard(new_input_ids, attention_mask, position_ids)
@@ -650,36 +693,42 @@ impl<'a> DecodeSession<'a> {
         attention_mask: &[i64],
         position: i64,
         params: Option<&DeviceSampleParams>,
-    ) -> Result<StepLogits> {
-        self.ensure_capture_state()?;
+    ) -> std::result::Result<StepLogits, CapturedStepError> {
+        self.ensure_capture_state()
+            .map_err(CapturedStepError::PreRun)?;
         // Move the capture buffers out of `self` for the duration of the step so
         // the `&mut self` bind helpers don't alias the borrow; restore on the
         // success path (an error aborts generation and drops the state).
         let mut cap = self.capture.take().expect("capture state initialized");
         let valid_len = attention_mask.len();
         if valid_len > cap.mask_len {
-            return Err(OrtError::InvalidArgument(format!(
-                "attention length {valid_len} exceeds captured mask capacity {}",
-                cap.mask_len
+            return Err(CapturedStepError::PreRun(OrtError::InvalidArgument(
+                format!(
+                    "attention length {valid_len} exceeds captured mask capacity {}",
+                    cap.mask_len
+                ),
             )));
         }
-        cap.input_ids.write_i64_prefix(&[token])?;
-        cap.position_ids.write_i64_prefix(&[position])?;
+        cap.input_ids
+            .write_i64_prefix(&[token])
+            .map_err(CapturedStepError::PreRun)?;
+        cap.position_ids
+            .write_i64_prefix(&[position])
+            .map_err(CapturedStepError::PreRun)?;
         // The mask's valid region only grows within a generation (rewind/reset
         // clear it), and prior entries are already 1, so fill just the newly
         // valid tail — typically a single element — keeping this step O(1) in
         // context rather than rewriting (and heap-allocating) the whole prefix.
         if valid_len > cap.mask_valid_len {
-            cap.attention_mask.fill_i64_range(
-                cap.mask_valid_len,
-                valid_len - cap.mask_valid_len,
-                1,
-            )?;
+            cap.attention_mask
+                .fill_i64_range(cap.mask_valid_len, valid_len - cap.mask_valid_len, 1)
+                .map_err(CapturedStepError::PreRun)?;
         } else if valid_len < cap.mask_valid_len {
             // Defensive: a shrink without an intervening reset — clear the tail
             // that is no longer valid so it does not leak into this step.
             cap.attention_mask
-                .fill_i64_range(valid_len, cap.mask_valid_len - valid_len, 0)?;
+                .fill_i64_range(valid_len, cap.mask_valid_len - valid_len, 0)
+                .map_err(CapturedStepError::PreRun)?;
         }
         cap.mask_valid_len = valid_len;
 
@@ -696,27 +745,39 @@ impl<'a> DecodeSession<'a> {
         // FFI call) removes about half the per-token bind cost.
         let bind_span = crate::prof_span!("ort.bind_inputs");
         if self.capture_bound {
-            self.binding.clear_inputs()?;
-            self.bind_standard_inputs(&cap.input_ids, &cap.attention_mask, &cap.position_ids)?;
-            self.bind_kv_inputs()?;
+            self.binding
+                .clear_inputs()
+                .map_err(CapturedStepError::PreRun)?;
+            self.bind_standard_inputs(&cap.input_ids, &cap.attention_mask, &cap.position_ids)
+                .map_err(CapturedStepError::PreRun)?;
+            self.bind_kv_inputs().map_err(CapturedStepError::PreRun)?;
         } else {
-            self.binding.clear()?;
-            self.bind_standard_inputs(&cap.input_ids, &cap.attention_mask, &cap.position_ids)?;
-            self.bind_kv_inputs()?;
+            self.binding.clear().map_err(CapturedStepError::PreRun)?;
+            self.bind_standard_inputs(&cap.input_ids, &cap.attention_mask, &cap.position_ids)
+                .map_err(CapturedStepError::PreRun)?;
+            self.bind_kv_inputs().map_err(CapturedStepError::PreRun)?;
             for output in self.session.output_names() {
                 if let Some(pair) = self.kv_pairs.iter().find(|pair| pair.present == *output) {
                     let value = self.current_kv.get(&pair.past).ok_or_else(|| {
-                        OrtError::InvalidArgument(format!(
+                        CapturedStepError::PreRun(OrtError::InvalidArgument(format!(
                             "missing shared KV buffer for '{}'",
                             pair.past
-                        ))
+                        )))
                     })?;
-                    self.binding.bind_output(output, value)?;
+                    self.binding
+                        .bind_output(output, value)
+                        .map_err(CapturedStepError::PreRun)?;
                 } else if is_logits_output(output) {
-                    self.binding.bind_output(output, &cap.logits)?;
+                    self.binding
+                        .bind_output(output, &cap.logits)
+                        .map_err(CapturedStepError::PreRun)?;
                 } else {
                     self.binding
-                        .bind_output_to_device(output, &MemoryInfo::cpu()?)?;
+                        .bind_output_to_device(
+                            output,
+                            &MemoryInfo::cpu().map_err(CapturedStepError::PreRun)?,
+                        )
+                        .map_err(CapturedStepError::PreRun)?;
                 }
             }
         }
@@ -728,7 +789,8 @@ impl<'a> DecodeSession<'a> {
                 .capture_graph_id
                 .expect("capture graph id assigned in ensure_capture_state");
             self.session
-                .run_with_binding_graph(&self.binding, graph_id)?;
+                .run_with_binding_graph(&self.binding, graph_id)
+                .map_err(CapturedStepError::RunInvoked)?;
         }
         // A graph is now captured under `capture_graph_id`; mark it so reset /
         // rewind / drop release it before this session's buffers are freed.
@@ -736,7 +798,11 @@ impl<'a> DecodeSession<'a> {
         self.current_len = self
             .current_len
             .checked_add(1)
-            .ok_or_else(|| OrtError::InvalidArgument("decode length overflow".into()))?;
+            .ok_or_else(|| {
+                CapturedStepError::RunInvoked(OrtError::InvalidArgument(
+                    "decode length overflow".into(),
+                ))
+            })?;
 
         // Reduce or copy the persistent logits buffer while it is still live.
         // With `params` set (greedy or non-greedy) the device sampler reads only
@@ -748,7 +814,10 @@ impl<'a> DecodeSession<'a> {
         #[cfg(feature = "cuda")]
         if cap.logits_on_device {
             let dtype = cap.logits.dtype();
-            let ptr = cap.logits.data_ptr_addr()?;
+            let ptr = cap
+                .logits
+                .data_ptr_addr()
+                .map_err(CapturedStepError::RunInvoked)?;
             let device_sampler = self
                 .device_sampler
                 .as_ref()
@@ -762,7 +831,7 @@ impl<'a> DecodeSession<'a> {
                     .map(StepLogits::Value)
             };
             self.capture = Some(cap);
-            return result;
+            return result.map_err(CapturedStepError::RunInvoked);
         }
         // Host logits (no CUDA feature / CPU-allocated output). Greedy reduces to
         // the argmax token; non-greedy cannot sample here, so surface the logits
@@ -773,7 +842,7 @@ impl<'a> DecodeSession<'a> {
             Some(_) => cap.logits.clone_owned().map(StepLogits::Value),
         };
         self.capture = Some(cap);
-        result
+        result.map_err(CapturedStepError::RunInvoked)
     }
 
     /// Lazily allocate the persistent captured-decode I/O buffers.
@@ -830,10 +899,7 @@ impl<'a> DecodeSession<'a> {
         {
             // Default on; `ONNX_GENAI_DEVICE_ARGMAX=0` forces the host argmax
             // path (CPU logits + full-vocab device->host copy) for A/B testing.
-            let device_argmax_enabled = std::env::var("ONNX_GENAI_DEVICE_ARGMAX")
-                .map(|v| v != "0")
-                .unwrap_or(true);
-            if device_argmax_enabled && self.session.cuda_device_id().is_some() {
+            if device_argmax_enabled() && self.session.cuda_device_id().is_some() {
                 if let Some(allocator) = self.kv_allocator.as_ref() {
                     logits = Value::empty_in(&[1, 1, vocab], logits_dtype, allocator)?;
                     logits_on_device = true;
