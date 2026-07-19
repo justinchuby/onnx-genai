@@ -4,9 +4,19 @@ Tracks implementation status of `docs/DESIGN.md` (§1–§40). Updated as work l
 
 **Published:** `onnx-genai` v0.1.0 + 8 sub-crates on crates.io; the `onnx-runtime-*` layer (including `onnx-runtime-tracer`) is released as v0.1.0-dev.1. CI (fmt/build/test/**blocking clippy**) + scheduled `cargo-audit`. Coverage ~77% line.
 
-_Last updated: 2026-07-19T18:20Z — CPU-EP op-coverage wave advanced backend node conformance to 975 passing._
+_Last updated: 2026-07-19T18:20Z — classic Stable Diffusion 1.x renders end-to-end from a from-scratch Mobius package; diffusion demo Image tab is live._
 
 **Current `origin/main` implementation HEAD:** `eef2c81`.
+
+
+## 2026-07-19 — Classic Stable Diffusion 1.x renders end-to-end (from-scratch Mobius package)
+
+Classic Stable Diffusion 1.x (`OFA-Sys/small-stable-diffusion-v0`: `CLIPTextModel` text encoder, `UNet2DConditionModel` denoiser, `AutoencoderKL` VAE, DPM-Solver++ scheduler) now renders a **real image** end-to-end through onnx-genai from a package Mobius authors **entirely from scratch** with `onnx_ir`/`onnxscript` — **no `torch.onnx.export`, no `optimum`** anywhere in the path.
+
+- **Mobius from-scratch SD 1.x integration ✅ (Mobius `2c7a1b8`):** registered `UNet2DConditionModel` (denoiser) and `CLIPTextModel` (text encoder) in the diffusers class map, added a CLIP-text `from_diffusers` config adapter and `.bin`-checkpoint weight remaps, and verified each component's ONNX output numerically against `diffusers`: **text_encoder max|Δ| 3.99e-2 (fp16), UNet 1.0e-4, VAE decoder 4.2e-5**. `python -m mobius build --model OFA-Sys/small-stable-diffusion-v0 --runtime onnx-genai --dtype f16 /tmp/sd-pkg` emits `text_encoder/`, `unet/`, `vae_decoder/`, `inference_metadata.yaml`, and the CLIP `tokenizer.json`.
+- **Engine iterative-diffusion fixes ✅ (`71dc4d1`):** three real bugs fixed so a from-scratch fp16 package runs correctly. (1) **Denoiser timesteps:** added a `Scheduler::timesteps()` trait method + a shared diffusers `_sigma_to_t` interpolation helper, so the DPM++/Euler/DDIM schedulers hand the denoiser the real descending timesteps (e.g. `999…33`) when the metadata omits `strategy.timesteps`, instead of the raw step index. (2) **fp16 execution:** the diffusion path (CFG combine, scheduler math, per-model input feeds) is now fp16-capable via a `coerce_value_to_dtype` cast helper + lossy f32 reads, instead of strict-f32 reads that rejected Float16 tensors. (3) **DPM-Solver++ NaN:** the final step now uses the first-order update whenever the trailing sigma is `0` (`final_sigmas_type="zero"`), not only for `<15` steps — the second-order update divided by an infinite log-SNR step at sigma 0. 16/16 pipeline tests pass (3 new regression tests).
+- **`render_sd` txt2img driver ✅ (`71dc4d1`):** new `crates/onnx-genai/src/bin/render_sd.rs` drives the Mobius package layout: tokenizes the prompt/negative with the packaged CLIP tokenizer, encodes the negative prompt as the CFG unconditional embedding, runs the iterative denoise loop, scales the final latent by `1/scaling_factor`, VAE-decodes to RGB, and writes a PNG (plus a machine-readable JSON timing summary). Verified: `a photograph of an astronaut riding a horse` produces a coherent 512×512 image at both 6 and 25 steps (~0.30 it/s on CPU).
+- **Diffusion demo Image tab ✅ (`ee30c7c`):** `examples/diffusion-demo` `/api/run/image` accepts `{prompt, negative, steps, guidance, seed}`, runs `render_sd` against `ONNX_GENAI_SD_PACKAGE`, and returns the PNG data URL plus per-step latent previews and an it/s perf card (pipeline stages + per-step ms). The Image tab UI gained a prompt box, a negative-prompt field, and steps/guidance/seed controls; it renders straight from the package. The old `scripts/export_sd_package.py` (which used `torch.onnx.export`) was **deleted** and the README now documents the Mobius from-scratch build. `npm run build` (tsc + vite) is clean.
 
 
 ## 2026-07-19 — CPU-EP op coverage 936→975
