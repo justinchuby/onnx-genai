@@ -45,12 +45,44 @@ __device__ __forceinline__ unsigned char quantize_e2m1(float value) {
     unsigned char best = 0; float distance = CUDART_INF_F;
     for (unsigned char i = 0; i < 8; ++i) {
         const float candidate = fabsf(value - values[i]);
-        if (candidate < distance) { best = i; distance = candidate; }
+        if (candidate < distance
+            || (candidate == distance && (i & 1u) == 0u && (best & 1u) != 0u)) {
+            best = i; distance = candidate;
+        }
     }
     return sign | best;
 }
-// FP8 E4M3FN encoding is intentionally a helper seam: B2 supplies the vectorized
-// implementation, while this B0 snippet freezes its decode and scale contract.
+__device__ __forceinline__ unsigned char quantize_e4m3fn(float value) {
+    const unsigned char sign = __float_as_uint(value) & 0x80000000u ? 0x80u : 0u;
+    const float magnitude = fabsf(value);
+    if (magnitude == 0.0f) return sign;
+    if (magnitude >= 448.0f) return sign | 0x7eu;
+    if (magnitude < 0x1p-6f) {
+        const unsigned int mantissa = (unsigned int)__float2int_rn(magnitude * 0x1p9f);
+        if (mantissa == 0u) return sign;
+        return sign | (mantissa >= 8u ? 0x08u : (unsigned char)mantissa);
+    }
+    int exponent = (int)floorf(log2f(magnitude));
+    unsigned int significand =
+        (unsigned int)__float2int_rn(magnitude / exp2f((float)(exponent - 3)));
+    if (significand == 16u) {
+        ++exponent;
+        significand >>= 1;
+    }
+    const unsigned int code =
+        (((unsigned int)(exponent + 7) << 3) | (significand - 8u));
+    return sign | (unsigned char)min(code, 0x7eu);
+}
+__device__ __forceinline__ void quantize_fp8_e4m3_block(
+    const float* input, unsigned char* scale, unsigned char* packed) {
+    float amax = 1.0e-4f;
+    for (int i = 0; i < 64; ++i) amax = fmaxf(amax, fabsf(input[i]));
+    const int scale_power = (int)ceilf(log2f(amax / 448.0f));
+    *scale = (unsigned char)(scale_power + 127);
+    const float scale_value = exp2f((float)scale_power);
+    for (int i = 0; i < 64; ++i)
+        packed[i] = quantize_e4m3fn(fminf(448.0f, fmaxf(-448.0f, input[i] / scale_value)));
+}
 "#;
 
 pub fn source() -> &'static str {
@@ -111,13 +143,18 @@ fn encode_e2m1(value: f32) -> u8 {
     const TABLE: [f32; 16] = [
         0., 0.5, 1., 1.5, 2., 3., 4., 6., -0., -0.5, -1., -1.5, -2., -3., -4., -6.,
     ];
-    (0..16)
-        .min_by(|&a, &b| {
-            (value - TABLE[a])
-                .abs()
-                .total_cmp(&(value - TABLE[b]).abs())
-        })
-        .unwrap() as u8
+    let mut best = 0usize;
+    let mut distance = f32::INFINITY;
+    for (code, &candidate) in TABLE.iter().enumerate() {
+        let candidate_distance = (value - candidate).abs();
+        if candidate_distance < distance
+            || (candidate_distance == distance && code & 1 == 0 && best & 1 != 0)
+        {
+            best = code;
+            distance = candidate_distance;
+        }
+    }
+    best as u8
 }
 
 fn encode_e4m3fn(value: f32) -> u8 {
@@ -154,26 +191,36 @@ mod tests {
     };
 
     #[test]
-    fn fp8_quant_round_trip_uses_cpu_block_dequant() {
-        let input = (0..FP8_BLOCK)
-            .map(|i| (i as f32 - 31.5) * 3.25)
-            .collect::<Vec<_>>();
+    fn fp8_quant_round_trip_has_hand_computed_scale_ties_saturation_and_subnormals() {
+        let mut input = [0.0; FP8_BLOCK];
+        input[..6].copy_from_slice(&[896.0, -896.0, 2.375, -2.375, 3.0 / 512.0, 1.0 / 512.0]);
         let (scale, packed) = quantize_fp8_block(&input).unwrap();
+        let mut expected_packed = [0u8; FP8_BLOCK];
+        expected_packed[..6].copy_from_slice(&[0x7e, 0xfe, 0x3a, 0xba, 0x02, 0x00]);
+        assert_eq!(scale, 128, "amax=896 requires E8M0 scale 2");
+        assert_eq!(packed, expected_packed);
+
         let mut cpu = [0.0; FP8_BLOCK];
         dequantize_fp8_e4m3_block(scale, &packed, &mut cpu).unwrap();
-        assert!(cpu.iter().all(|value| value.is_finite()));
-        assert_eq!(scale, 125);
+        let mut expected = [0.0; FP8_BLOCK];
+        expected[..6].copy_from_slice(&[896.0, -896.0, 2.5, -2.5, 1.0 / 128.0, 0.0]);
+        assert_eq!(cpu, expected);
     }
 
     #[test]
-    fn fp4_quant_round_trip_uses_cpu_block_dequant() {
-        let input = (0..FP4_BLOCK)
-            .map(|i| (i as f32 - 15.5) * 0.75)
-            .collect::<Vec<_>>();
+    fn fp4_quant_round_trip_has_hand_computed_scale_ties_saturation_and_subnormals() {
+        let mut input = [0.0; FP4_BLOCK];
+        input[..6].copy_from_slice(&[12.0, -12.0, 7.0, -7.0, 0.5, 0.75]);
         let (scale, packed) = quantize_fp4_block(&input).unwrap();
+        let mut expected_packed = [0u8; FP4_BLOCK / 2];
+        expected_packed[..3].copy_from_slice(&[0xf7, 0xe6, 0x10]);
+        assert_eq!(scale, 128, "amax=12 requires E8M0 scale 2");
+        assert_eq!(packed, expected_packed);
+
         let mut cpu = [0.0; FP4_BLOCK];
         dequantize_fp4_e2m1_block(scale, &packed, &mut cpu).unwrap();
-        assert!(cpu.iter().all(|value| value.is_finite()));
-        assert_eq!(scale, 128);
+        let mut expected = [0.0; FP4_BLOCK];
+        expected[..6].copy_from_slice(&[12.0, -12.0, 8.0, -8.0, 0.0, 1.0]);
+        assert_eq!(cpu, expected);
     }
 }
