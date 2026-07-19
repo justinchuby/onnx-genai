@@ -1,8 +1,8 @@
 # ONNX backend node-test result set
-# Generated: 2026-07-19T13:42:43+0000
+# Generated: 2026-07-19T14:32:08+0000
 # ONNX: 1.22.0
-# Total: 3530; passed: 921; failed: 844; skipped: 1765
-# CPU: 1765; passed: 921; failed: 844; skipped: 0
+# Total: 3530; passed: 936; failed: 829; skipped: 1765
+# CPU: 1765; passed: 936; failed: 829; skipped: 0
 # CUDA (unsupported by adapter): 1765; passed: 0; failed: 0; skipped: 1765
 # Columns: status, device, test_name (tab-separated)
 passed	CPU	test_abs_cpu
@@ -1665,15 +1665,15 @@ failed	CPU	test_isnan_cpu
 skipped	CUDA	test_isnan_cuda
 failed	CPU	test_isnan_float16_cpu
 skipped	CUDA	test_isnan_float16_cuda
-failed	CPU	test_l1normalization_axis_0_cpu
+passed	CPU	test_l1normalization_axis_0_cpu
 skipped	CUDA	test_l1normalization_axis_0_cuda
-failed	CPU	test_l1normalization_axis_1_cpu
+passed	CPU	test_l1normalization_axis_1_cpu
 skipped	CUDA	test_l1normalization_axis_1_cuda
-failed	CPU	test_l1normalization_axis_last_cpu
+passed	CPU	test_l1normalization_axis_last_cpu
 skipped	CUDA	test_l1normalization_axis_last_cuda
-failed	CPU	test_l2normalization_axis_0_cpu
+passed	CPU	test_l2normalization_axis_0_cpu
 skipped	CUDA	test_l2normalization_axis_0_cuda
-failed	CPU	test_l2normalization_axis_1_cpu
+passed	CPU	test_l2normalization_axis_1_cpu
 skipped	CUDA	test_l2normalization_axis_1_cuda
 passed	CPU	test_layer_normalization_2d_axis0_cpu
 skipped	CUDA	test_layer_normalization_2d_axis0_cuda
@@ -1957,7 +1957,7 @@ failed	CPU	test_loop13_seq_cpu
 skipped	CUDA	test_loop13_seq_cuda
 failed	CPU	test_loop16_seq_none_cpu
 skipped	CUDA	test_loop16_seq_none_cuda
-failed	CPU	test_lpnormalization_default_cpu
+passed	CPU	test_lpnormalization_default_cpu
 skipped	CUDA	test_lpnormalization_default_cuda
 failed	CPU	test_lppool_1d_default_cpu
 skipped	CUDA	test_lppool_1d_default_cuda
@@ -2543,7 +2543,7 @@ passed	CPU	test_reduce_log_sum_negative_axes_cpu
 skipped	CUDA	test_reduce_log_sum_negative_axes_cuda
 failed	CPU	test_reduce_log_sum_negative_axes_expanded_cpu
 skipped	CUDA	test_reduce_log_sum_negative_axes_expanded_cuda
-failed	CPU	test_reduce_max_bool_inputs_cpu
+passed	CPU	test_reduce_max_bool_inputs_cpu
 skipped	CUDA	test_reduce_max_bool_inputs_cuda
 passed	CPU	test_reduce_max_default_axes_keepdim_example_cpu
 skipped	CUDA	test_reduce_max_default_axes_keepdim_example_cuda
@@ -2579,7 +2579,7 @@ passed	CPU	test_reduce_mean_negative_axes_keepdims_example_cpu
 skipped	CUDA	test_reduce_mean_negative_axes_keepdims_example_cuda
 passed	CPU	test_reduce_mean_negative_axes_keepdims_random_cpu
 skipped	CUDA	test_reduce_mean_negative_axes_keepdims_random_cuda
-failed	CPU	test_reduce_min_bool_inputs_cpu
+passed	CPU	test_reduce_min_bool_inputs_cpu
 skipped	CUDA	test_reduce_min_bool_inputs_cuda
 passed	CPU	test_reduce_min_default_axes_keepdims_example_cpu
 skipped	CUDA	test_reduce_min_default_axes_keepdims_example_cuda
@@ -2631,7 +2631,7 @@ passed	CPU	test_reduce_sum_empty_axes_input_noop_example_cpu
 skipped	CUDA	test_reduce_sum_empty_axes_input_noop_example_cuda
 passed	CPU	test_reduce_sum_empty_set_cpu
 skipped	CUDA	test_reduce_sum_empty_set_cuda
-failed	CPU	test_reduce_sum_empty_set_non_reduced_axis_zero_cpu
+passed	CPU	test_reduce_sum_empty_set_non_reduced_axis_zero_cpu
 skipped	CUDA	test_reduce_sum_empty_set_non_reduced_axis_zero_cuda
 passed	CPU	test_reduce_sum_keepdims_example_cpu
 skipped	CUDA	test_reduce_sum_keepdims_example_cuda
@@ -3081,13 +3081,13 @@ failed	CPU	test_sce_sum_log_prob_cpu
 skipped	CUDA	test_sce_sum_log_prob_cuda
 failed	CPU	test_sce_sum_log_prob_expanded_cpu
 skipped	CUDA	test_sce_sum_log_prob_expanded_cuda
-failed	CPU	test_selu_cpu
+passed	CPU	test_selu_cpu
 skipped	CUDA	test_selu_cuda
-failed	CPU	test_selu_default_cpu
+passed	CPU	test_selu_default_cpu
 skipped	CUDA	test_selu_default_cuda
 passed	CPU	test_selu_default_expanded_ver18_cpu
 skipped	CUDA	test_selu_default_expanded_ver18_cuda
-failed	CPU	test_selu_example_cpu
+passed	CPU	test_selu_example_cpu
 skipped	CUDA	test_selu_example_cuda
 passed	CPU	test_selu_example_expanded_ver18_cpu
 skipped	CUDA	test_selu_example_expanded_ver18_cuda
@@ -3393,13 +3393,13 @@ failed	CPU	test_tfidfvectorizer_tf_onlybigrams_skip5_cpu
 skipped	CUDA	test_tfidfvectorizer_tf_onlybigrams_skip5_cuda
 failed	CPU	test_tfidfvectorizer_tf_uniandbigrams_skip5_cpu
 skipped	CUDA	test_tfidfvectorizer_tf_uniandbigrams_skip5_cuda
-failed	CPU	test_thresholdedrelu_cpu
+passed	CPU	test_thresholdedrelu_cpu
 skipped	CUDA	test_thresholdedrelu_cuda
-failed	CPU	test_thresholdedrelu_default_cpu
+passed	CPU	test_thresholdedrelu_default_cpu
 skipped	CUDA	test_thresholdedrelu_default_cuda
 passed	CPU	test_thresholdedrelu_default_expanded_ver18_cpu
 skipped	CUDA	test_thresholdedrelu_default_expanded_ver18_cuda
-failed	CPU	test_thresholdedrelu_example_cpu
+passed	CPU	test_thresholdedrelu_example_cpu
 skipped	CUDA	test_thresholdedrelu_example_cuda
 passed	CPU	test_thresholdedrelu_example_expanded_ver18_cpu
 skipped	CUDA	test_thresholdedrelu_example_expanded_ver18_cuda
