@@ -2,6 +2,7 @@
 models/
 *.onnx
 !tests/fixtures/tiny-llm-scatter/model.onnx
+!tests/fixtures/tiny-llm-shared-kv/model.onnx
 !tests/fixtures/tiny-qwen35-mtp/model.onnx
 !tests/fixtures/tiny-eagle3/model.onnx
 !tests/fixtures/tiny-mtp-full/model.onnx

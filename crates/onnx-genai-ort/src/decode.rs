@@ -1328,6 +1328,17 @@ impl<'a> DecodeSession<'a> {
         let _ = self.reset_captured_mask();
     }
 
+    /// The CUDA-graph annotation id this session currently holds, if any.
+    ///
+    /// Only the captured decode path claims an id; the uncaptured persistent
+    /// path ([`Self::step_persistent`] with `use_graph == false`) must always
+    /// leave this `None`. Exposed for integration tests that assert this
+    /// lifecycle invariant on real hardware; not part of the stable API.
+    #[doc(hidden)]
+    pub fn capture_graph_id_for_test(&self) -> Option<i32> {
+        self.capture_graph_id
+    }
+
     /// Export the current KV cache as owned, session-independent CPU tensors.
     ///
     /// Each entry is `(past_key_values.* input name, materialized Value)` whose
