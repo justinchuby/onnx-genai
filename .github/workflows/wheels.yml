@@ -51,7 +51,7 @@ jobs:
       CIBW_CONFIG_SETTINGS: ${{ matrix.cibw_config_settings }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           submodules: recursive
       - uses: actions/setup-python@v5
@@ -92,7 +92,7 @@ jobs:
       CIBW_CONFIG_SETTINGS: "build-args='--features cuda'"
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           submodules: recursive
       - uses: actions/setup-python@v5
