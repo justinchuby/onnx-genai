@@ -47,7 +47,6 @@ features = ["abi3-py310"]
 default = ["eager", "genai"]
 eager = ["dep:onnx-runtime-eager"]
 genai = ["dep:onnx-genai-engine"]
-onednn = ["onnx-runtime-ep-cpu/onednn"]
 cuda = [
     "dep:onnx-runtime-ep-cuda",
     "dep:onnx-runtime-tracer",

@@ -1,9 +1,13 @@
-# f32 GEMM backend comparison: MLAS, oneDNN, and SimdX86
+# Historical f32 GEMM backend comparison: MLAS, oneDNN, and SimdX86
 
 Measured 2026-07-19 on an Intel Xeon Platinum 8480C (Sapphire Rapids). The host
 supports AVX-512 F/DQ/BW/VL/VNNI/BF16/FP16 and AMX tile/int8/bf16. ORT MLAS and
 oneDNN can therefore dispatch beyond AVX2; the built-in `SimdX86` backend is
 AVX2/FMA-only.
+
+> **Status:** The oneDNN backend discussed here was removed after this benchmark:
+> it did not provide the desired multi-threaded parity and required a CMake and
+> bindgen source build. `SimdX86` remains the default x86 fast path.
 
 ## Result
 
@@ -26,10 +30,10 @@ to 4.87× slower. SimdX86 remains 1.68× to 4.61× slower than MLAS, although it
 lower parallel-call overhead beats oneDNN on the two smaller eight-thread
 shapes.
 
-For an "entirely match MLAS performance" requirement, oneDNN is not a parity
-path on these inference-oriented shapes. Keep oneDNN as an optional native
-backend, but pursue the MLAS AVX-512/AMX kernel/packing strategy (or an
-equivalent specialized implementation) for matched multi-thread performance.
+For an "entirely match MLAS performance" requirement, oneDNN was not a parity
+path on these inference-oriented shapes. It was removed; pursue the MLAS
+AVX-512/AMX kernel/packing strategy (or an equivalent specialized
+implementation) for matched multi-thread performance.
 
 ## Method
 
@@ -61,20 +65,6 @@ MLAS, so it does not explain oneDNN's eight-thread deficit.
 ## Reproduction
 
 ```bash
-git submodule update --init --recursive third_party/onednn
-cargo build --release -p onnx-runtime-ep-cpu --features onednn
-cargo test --release -p onnx-runtime-ep-cpu --features onednn \
-  backend::tests::auto_detect_tracks_onednn_feature -- --exact
-
-OMP_NUM_THREADS=1 OMP_DYNAMIC=FALSE OMP_PROC_BIND=close OMP_PLACES=cores \
-  taskset -c 0 cargo bench -p onnx-runtime-ep-cpu --features onednn \
-  --bench kernels -- 'matmul/.*/f32/threads=1' \
-  --warm-up-time 2 --measurement-time 5 --sample-size 50
-OMP_NUM_THREADS=8 OMP_DYNAMIC=FALSE OMP_PROC_BIND=close OMP_PLACES=cores \
-  taskset -c 0-7 cargo bench -p onnx-runtime-ep-cpu --features onednn \
-  --bench kernels -- 'matmul/.*/f32/threads=8' \
-  --warm-up-time 2 --measurement-time 5 --sample-size 50
-
 RAYON_NUM_THREADS=1 taskset -c 0 cargo bench -p onnx-runtime-ep-cpu \
   --bench kernels -- 'matmul/.*/f32/threads=1' \
   --warm-up-time 2 --measurement-time 5 --sample-size 50
@@ -90,6 +80,9 @@ taskset -c 0-7 python3 crates/onnx-runtime-ep-cpu/benches/ort_baseline.py \
 
 `cargo bench` already uses Cargo's optimized bench profile; this Cargo version
 rejects a redundant `--release` flag for the bench subcommand.
+
+The removed oneDNN configuration is retained only as historical benchmark data;
+it cannot be reproduced from the current source tree.
 
 The Generic backend was not remeasured because the public harness has no
 backend override and changing kernel selection was outside this measurement's

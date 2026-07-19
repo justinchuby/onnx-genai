@@ -372,7 +372,7 @@ Integration points:
 The CPU correctness kernel may initially gather into dense scratch buffers and call
 existing GEMM paths. The performance kernel should avoid dequantizing a whole expert:
 unpack/dequantize blocks inside the dot-product loop and parallelize over active
-experts and token rows without oversubscribing Rayon/oneDNN.
+experts and token rows without oversubscribing Rayon.
 
 ### 6.3 CUDA EP
 

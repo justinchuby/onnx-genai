@@ -18,7 +18,7 @@ plugin EPs (via C ABI bridge) handle them.
 
 | Op | Since Opset | Notes |
 |----|-------------|-------|
-| MatMul | 1 | Core compute. GEMM via cuBLAS/oneDNN. |
+| MatMul | 1 | Core compute. GEMM via cuBLAS or the built-in CPU SIMD backend. |
 | Add | 7 | Residual connections. |
 | Mul | 7 | Scaling (RMSNorm, attention scale). |
 | Sub | 7 | |

@@ -120,15 +120,15 @@ review pass when the first real EP wires memory.
 
 ### C. `onnx-runtime-ep-cpu`  (design §4.4) — **~L**
 
-CPU kernels over oneDNN via C++ FFI (`native-eps/cpu`).
+CPU kernels through the built-in Rust GEMM implementation (`native-eps/cpu`).
 
 | Piece | Deliverable |
 |-------|-------------|
-| FFI build | `build.rs` compiling `native-eps/cpu` (add `cc`), link oneDNN |
+| Native build | No C++ build dependency for the CPU GEMM path |
 | `kernels::*` | One `Kernel` + `KernelFactory` per Phase-1 op: `MatMul, Add, Relu, Reshape, Transpose, Gather, LayerNormalization` (see `kernels::PHASE1_OPS`) |
 | `provider` | Fill `supports_op`, `get_kernel`, `allocate`/`copy` (host, aligned) |
 
-**Risk:** oneDNN FFI + strided-input handling at the kernel boundary. Start with
+**Risk:** strided-input handling at the kernel boundary. Start with
 `MatMul` (GEMM) end-to-end as the vertical slice.
 **Estimate:** Large (C++ interop + per-op ports).
 
@@ -196,7 +196,7 @@ to `ep-api::abi` because it needs `unsafe` FFI + EP types — see open questions
 
 1. **Shape inference rule table** (loader) — breadth of ONNX ops; scope to BERT
    first.
-2. **oneDNN FFI** (ep-cpu) — C++ build, linking, strided-input contract.
+2. **CPU GEMM** (ep-cpu) — SIMD dispatch and strided-input contract.
 3. **C ABI compatibility** (capi) — must match ORT's header/struct layout for a
    true drop-in `libonnxruntime.so`.
 4. **Raw-pointer tensor/buffer safety** (ep-api) — `DeviceBuffer`/`TensorView`

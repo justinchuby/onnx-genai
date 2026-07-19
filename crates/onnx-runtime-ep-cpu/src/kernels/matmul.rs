@@ -14,8 +14,6 @@
 //!   `6×16` AVX2/FMA register microkernel + K/N cache blocking, parallelized
 //!   over column strips. Selected automatically with no cargo feature; falls
 //!   back to Generic when AVX2/FMA is absent.
-//! * **oneDNN** (non-default `onednn` feature): `dnnl_sgemm` via
-//!   [`crate::kernels::onednn`], statically linked.
 //!
 //! The batched / broadcast / 1-D-vector handling in [`matmul_dense`] is
 //! backend-agnostic; only the inner 2-D tile GEMM changes. The session also
@@ -97,9 +95,8 @@ impl KernelFactory for MatMulFactory {
 ///
 /// `a` is `m*k` row-major, `b` is `k*n` row-major, `c` is `m*n` row-major.
 /// Picks the backend via [`CpuBackend::auto_detect`] (`docs/ORT2.md` §25.2):
-/// oneDNN when the `onednn` feature is compiled in, otherwise the pure-Rust
-/// blocked GEMM. The result is bit-plausible across backends within f32
-/// tolerance.
+/// `SimdX86` when supported by the host, otherwise the pure-Rust blocked GEMM.
+/// The result is bit-plausible across backends within f32 tolerance.
 pub(crate) fn gemm(
     a: &[f32],
     b: &[f32],
@@ -109,8 +106,6 @@ pub(crate) fn gemm(
     n: usize,
 ) -> Result<()> {
     match CpuBackend::auto_detect() {
-        #[cfg(feature = "onednn")]
-        CpuBackend::OneDnn => crate::kernels::onednn::sgemm(a, b, c, m, k, n),
         // Built-in MLAS-style packed SIMD backend for AVX2/FMA x86-64 hosts.
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         CpuBackend::SimdX86 => {

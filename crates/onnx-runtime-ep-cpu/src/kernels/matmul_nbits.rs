@@ -9,7 +9,7 @@
 //! dot product. Other int4 accuracy-level-4 shapes keep the weights in int8 and
 //! quantize each activation row to int8. The 2-bit correctness path and default
 //! int4 path dequantize to f32; batched shapes then use the shared CPU GEMM,
-//! including its oneDNN backend.
+//! including its SIMD backend.
 
 use std::sync::OnceLock;
 

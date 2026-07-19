@@ -25,9 +25,8 @@ sequence.
 - The native CPU EP declares its kernel modules and builds one
   [`OpRegistry`](../crates/onnx-runtime-ep-cpu/src/kernels/mod.rs) in
   `build_cpu_registry()`. It currently covers approximately 113 operators (112
-  unique names and 114 domain/name keys). Apart from optional backends such as
-  `onednn`, the kernel modules and registration statements are compiled
-  unconditionally today.
+  unique names and 114 domain/name keys). The kernel modules and registration
+  statements are compiled unconditionally today.
 - The native CUDA EP follows the same registry-oriented architecture, although
   its current coverage differs. Therefore native-EP operator stripping is under
   this project's control; it no longer inherently requires an upstream ORT

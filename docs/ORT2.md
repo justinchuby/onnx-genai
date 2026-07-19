@@ -7,6 +7,11 @@
 **Scope:** This document covers the runtime layer (graph IR, execution, memory, EP integration).
 The GenAI layer (KV cache, batching, speculative decoding, serving) is covered in [DESIGN.md](./DESIGN.md).
 
+> **Implementation update (2026-07-19):** References below to oneDNN describe
+> the original design only. The oneDNN backend, feature, CMake/bindgen build,
+> and submodule were removed. The CPU EP now uses built-in `SimdX86` on
+> supported x86 hosts and Generic as the portable fallback.
+
 ---
 
 ## Table of Contents

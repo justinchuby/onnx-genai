@@ -18,11 +18,8 @@ availability accurately. Missing CUDA must produce either `available == false`
 or an actionable error that says what was missing, why it is needed, and how to
 install/select CPU instead; it must not panic or silently execute on CPU.
 
-Linux, macOS, and Windows `nxrt` wheels bundle a static oneDNN build and enable
-the oneDNN CPU backend by default, following the PyTorch-style wheel model. The
-Cargo/crates.io surface remains pure Rust by default because `onednn` stays a
-non-default feature. Windows initially uses oneDNN's sequential runtime for
-linker robustness; OMP/TBB is a tracked follow-up optimization.
+Linux, macOS, and Windows `nxrt` wheels use the pure-Rust CPU backend. The
+removed oneDNN source build is no longer bundled or configured.
 
 ## Findings
 
@@ -36,7 +33,7 @@ linker robustness; OMP/TBB is a tracked follow-up optimization.
 | 🔴 | CUDA graceful absence | `crates/onnx-runtime-ep-cuda/src/runtime.rs:38-47`; `crates/onnx-runtime-ep-cuda/src/blas.rs:99-103`; `crates/onnx-runtime-ep-cuda/src/error.rs:1-20` | The local API promises `CudaRuntime::new` returns an error when libraries are absent, but cudarc's dynamic loader panics when a required library cannot be loaded. The local `map_err` runs only after symbol loading succeeds, so missing CUDA can unwind instead of becoming an actionable `EpError`. | Replace/patchextend the loader with fallible library acquisition before calling cudarc symbols. Never use `catch_unwind` as the primary design. Report the missing component, searched paths/names, required driver/PyPI package, and CPU fallback option. |
 | 🔴 | Python CUDA availability | `crates/onnx-runtime-python/src/lib.rs:51-82,224-299`; `crates/onnx-runtime-python/Cargo.toml:22-39` | A CUDA-feature build advertises `CUDAExecutionProvider` solely at compile time. Session construction validates the string but always creates the same CPU `RtSession`; requested CUDA is stored and reported without wiring a CUDA EP or probing its libraries/device. This is a silent correctness failure and can misreport CUDA on macOS/driverless hosts. | Wire the requested EP into session creation. Compute availability from a fallible runtime probe, advertise CUDA only on supported OSes with a usable stack, and return a what/why/how-to-fix error if explicitly requested but unavailable. Default remains CPU. |
 | 🔴 | ORT Windows bootstrap | `crates/onnx-genai-ort/ort-sys/build.rs:204-267` | Automatic Windows setup downloads a zip and invokes an external `unzip` executable. `unzip` is not a Windows platform guarantee, so a clean native build can fail before compilation. Existing panic text does not explain how to install the tool or use `ORT_ROOT`. | Extract with a Rust zip crate or a guaranteed platform facility. If an external command remains, include the command, archive path, underlying error, and concrete `ORT_ROOT` workaround per RULES.md #1. |
-| 🟢 | oneDNN Windows feature | `crates/onnx-runtime-ep-cpu/build.rs:72-89,131-169`; `.github/workflows/wheels.yml:28-51`; `crates/onnx-runtime-python/pyproject.toml:67-76` | **RESOLVED:** `build.rs` is MSVC-aware: it emits no `stdc++`/`gomp` for MSVC, relies on automatically linked `msvcprt`/`vcomp`, and supports `ONEDNN_OMP_LIB` for Intel OpenMP. The Windows CPU wheel now builds with `--features onednn`, initially using the SEQ runtime. | Verify the native MSVC oneDNN CMake wheel build in CI. Track Windows OMP/TBB as a follow-up optimization after the sequential configuration is proven. |
+| ✅ | Removed oneDNN Windows feature | The former native GEMM source build and wheel configuration were removed. | The backend did not meet the multi-threaded parity target and added unnecessary CMake/bindgen dependencies. | No follow-up; `SimdX86` and Generic require no platform-specific native build. |
 | 🟡 | ORT target coverage | `crates/onnx-genai-ort/ort-sys/build.rs:274-287` | Automatic ORT download supports Linux x64, macOS x86_64/arm64, and Windows x64 only. Other Linux/Windows architectures hit an unsupported or wrong-target path. | Make the supported target triples explicit in documentation and errors; add archives/checksums for required arm64 targets before claiming those targets. |
 | 🟡 | ORT integrity | `crates/onnx-genai-ort/ort-sys/build.rs:22-35,277-282,290-300` | macOS x86_64 is selectable but has no pinned checksum, so the build warns and continues without archive verification. | Pin the official macOS x86_64 digest and make a missing checksum a hard, actionable build error for every release target. |
 | 🟡 | Python paths | `crates/onnx-runtime-python/src/lib.rs:266-288` | Python path-like values are converted through `str` into a Rust UTF-8 `String`. This is fragile for Windows paths that are not representable as Unicode and does not use Python's filesystem-path protocol directly. | Use `os.fspath`/PyO3 path extraction and retain an `OsString`/`PathBuf` through the Rust boundary where possible. Include the rejected path representation in errors. |
@@ -74,8 +71,8 @@ linker robustness; OMP/TBB is a tracked follow-up optimization.
 
 - [ ] Convert Rust CI to an OS/architecture matrix. At minimum: Ubuntu x86_64,
   Windows x86_64 MSVC, macOS x86_64, and macOS arm64.
-- [ ] Exercise the default CPU workspace everywhere. Add focused oneDNN Windows
-  coverage and CUDA compile/discovery tests on Linux/Windows without requiring a
+- [ ] Exercise the default CPU workspace everywhere. Add CUDA compile/discovery
+  tests on Linux/Windows without requiring a
   GPU; assert CPU-only behavior on macOS.
 - [ ] Configure cibuildwheel for manylinux, Windows, macOS x86_64, and macOS
   arm64. Build `cp310-abi3` plus the separately specified `abi3t` artifacts.

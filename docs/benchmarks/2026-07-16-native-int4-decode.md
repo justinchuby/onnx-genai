@@ -75,9 +75,9 @@ CPU path fairly with llama.cpp.
 `MatMulNBits` now uses the session's initializer-only prepack signal to
 dequantize each constant weight once into output-major `[N, K]` f32 storage.
 M=1 decode uses a bounded-parallel GEMV over that cached matrix; activations are
-never cached. Non-decode shapes retain the shared GEMM/oneDNN path.
+never cached. Non-decode shapes retain the shared GEMM path.
 
-The same release + oneDNN command and model produced:
+The historical native-GEMM benchmark command and model produced:
 
 | Measurement | Before | After |
 |---|---:|---:|

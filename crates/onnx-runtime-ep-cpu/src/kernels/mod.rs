@@ -9,8 +9,7 @@
 //! the GEMM hot spot use naive loops with no FFI or `cc` build dependency. The
 //! MatMul GEMM went through the Phase-1.5 perf pass (`docs/ORT2.md` §25.2): its
 //! default backend is a blocked, register-tiled, rayon-parallelized pure-Rust
-//! kernel, with an optional statically-linked oneDNN (`dnnl_sgemm`) backend
-//! behind the non-default `onednn` feature. Every kernel sits behind the
+//! kernel. Every kernel sits behind the
 //! [`Kernel`] trait, so backends swap in **without touching the EP contract or
 //! the session**. The seam is [`Kernel`] itself; see [`matmul`] for the hot spot
 //! and [`crate::backend`] for backend selection.
@@ -72,8 +71,6 @@ pub mod matmul_nbits;
 pub mod moe;
 pub mod movement_ops;
 pub mod norm_ops;
-#[cfg(feature = "onednn")]
-pub mod onednn;
 pub mod onehot;
 pub mod pad;
 pub mod pooling;

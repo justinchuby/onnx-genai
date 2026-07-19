@@ -163,7 +163,7 @@ These are not textbook claims; they are things that happened while building the 
 
 If we pretend these away, the experts are right to ignore us.
 
-1. **The kernels.** ORT's MLAS, the CUDA/cuDNN kernels, oneDNN, the fused attention kernels — these
+1. **The kernels.** ORT's MLAS, the CUDA/cuDNN kernels, and the fused attention kernels — these
    are the product of many engineer-years of hand-tuned assembly, intrinsics, and vendor libraries.
    Rust has **no MLAS-equivalent** and no mature GEMM/conv kernel ecosystem. Any honest plan **reuses
    these through FFI** and only rewrites a kernel when there is a specific, measured reason. Writing a
