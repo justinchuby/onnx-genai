@@ -96,6 +96,7 @@ pub mod sparse_kv_gather;
 pub mod split;
 pub mod transpose;
 pub mod unary_math;
+pub mod unique;
 pub mod unsqueeze;
 pub mod where_op;
 pub mod window;
@@ -188,6 +189,7 @@ pub const PHASE1_OPS: &[&str] = &[
     "Flatten",
     "Squeeze",
     "Split",
+    "Unique",
     "Pad",
     "ConstantOfShape",
     "Size",
@@ -494,6 +496,10 @@ pub(crate) fn build_cpu_registry_with_weight_offload_cache(
     reg.register(OpKey::new("Slice", "", 1), Box::new(slice::SliceFactory));
     reg.register(OpKey::new("Split", "", 1), Box::new(split::SplitFactory));
     reg.register(OpKey::new("Split", "", 18), Box::new(split::SplitFactory));
+    reg.register(
+        OpKey::new("Unique", "", 11),
+        Box::new(unique::UniqueFactory),
+    );
     reg.register(
         OpKey::new("Dropout", "", 13),
         Box::new(dropout::DropoutFactory),
@@ -1493,6 +1499,7 @@ mod tests {
         assert!(reg.lookup("GlobalLpPool", "", 2).is_some());
         assert!(reg.lookup("SpaceToDepth", "", 13).is_some());
         assert!(reg.lookup("Split", "", 18).is_some());
+        assert!(reg.lookup("Unique", "", 11).is_some());
         assert!(reg.lookup("Dropout", "", 13).is_some());
         assert!(reg.lookup("Dropout", "", 22).is_some());
         assert!(reg.lookup("GridSample", "", 16).is_some());
