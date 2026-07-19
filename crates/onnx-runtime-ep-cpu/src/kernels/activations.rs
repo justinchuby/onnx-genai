@@ -4,7 +4,7 @@ use onnx_runtime_ep_api::{Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ir::{DataType, Node};
 
 use super::check_arity;
-use crate::dtype::{to_dense_f32_widen, write_dense_f32_narrow};
+use crate::dtype::{to_dense_f32_widen, to_dense_float, write_dense_f32_narrow, write_dense_float};
 
 const SELU_ALPHA_DEFAULT: f32 = 1.673_263_2;
 const SELU_GAMMA_DEFAULT: f32 = 1.050_701;
@@ -73,6 +73,54 @@ impl Activation {
             Self::Silu => silu(x),
         }
     }
+
+    fn apply_f64(self, x: f64) -> f64 {
+        match self {
+            Self::Elu { alpha } => {
+                if x >= 0.0 {
+                    x
+                } else {
+                    f64::from(alpha) * x.exp_m1()
+                }
+            }
+            Self::LeakyRelu { alpha } => {
+                if x >= 0.0 {
+                    x
+                } else {
+                    f64::from(alpha) * x
+                }
+            }
+            Self::HardSigmoid { alpha, beta } => {
+                (f64::from(alpha) * x + f64::from(beta)).clamp(0.0, 1.0)
+            }
+            Self::Selu { alpha, gamma } => {
+                f64::from(gamma)
+                    * if x > 0.0 {
+                        x
+                    } else {
+                        f64::from(alpha) * x.exp_m1()
+                    }
+            }
+            Self::ThresholdedRelu { alpha } => {
+                if x > f64::from(alpha) {
+                    x
+                } else {
+                    0.0
+                }
+            }
+            Self::Swish { alpha } => {
+                let z = f64::from(alpha) * x;
+                let s = if z >= 0.0 {
+                    1.0 / (1.0 + (-z).exp())
+                } else {
+                    let e = z.exp();
+                    e / (1.0 + e)
+                };
+                x * s
+            }
+            Self::Silu => silu_f64(x),
+        }
+    }
 }
 
 fn silu(x: f32) -> f32 {
@@ -83,6 +131,15 @@ fn silu(x: f32) -> f32 {
         x / (1.0 + ((-x) as f64).exp() as f32)
     } else {
         let e = (x as f64).exp() as f32;
+        x * e / (1.0 + e)
+    }
+}
+
+fn silu_f64(x: f64) -> f64 {
+    if x >= 0.0 {
+        x / (1.0 + (-x).exp())
+    } else {
+        let e = x.exp();
         x * e / (1.0 + e)
     }
 }
@@ -185,6 +242,13 @@ impl Kernel for ActivationKernel {
             && silu_contiguous_f32(&inputs[0], &mut outputs[0])
         {
             return Ok(());
+        }
+        if inputs[0].dtype == DataType::Float64 {
+            let y = to_dense_float::<f64>(&inputs[0])?
+                .into_iter()
+                .map(|x| self.activation.apply_f64(x))
+                .collect::<Vec<_>>();
+            return write_dense_float::<f64>(&mut outputs[0], &y);
         }
         let y = to_dense_f32_widen(self.activation.name(), &inputs[0])?
             .into_iter()
@@ -348,15 +412,23 @@ mod tests {
             assert!((got - want).abs() < 1e-3, "got {got}, want {want}");
         }
 
-        let x64 = Owned::f64(&[3], &values.map(f64::from));
+        let values64 = [-1.234_567_890_123_f64, 0.0, 2.345_678_901_234];
+        let x64 = Owned::f64(&[3], &values64);
         let mut out64 = Owned::zeros(DataType::Float64, &[3]);
         kernel
             .execute(&[x64.view()], &mut [out64.view_mut()])
             .unwrap();
-        assert_eq!(
-            out64.to_f64(),
-            expected.iter().map(|&x| x as f64).collect::<Vec<_>>()
-        );
+        let expected64 = values64.map(|x| {
+            f64::from(SELU_GAMMA_DEFAULT)
+                * if x > 0.0 {
+                    x
+                } else {
+                    f64::from(SELU_ALPHA_DEFAULT) * x.exp_m1()
+                }
+        });
+        for (got, want) in out64.to_f64().into_iter().zip(expected64) {
+            assert!((got - want).abs() < 1e-12, "got {got}, want {want}");
+        }
 
         let xbf16 = Owned::bf16(&[3], &values);
         let mut outbf16 = Owned::zeros(DataType::BFloat16, &[3]);
@@ -383,12 +455,16 @@ mod tests {
             .unwrap();
         assert_eq!(out16.to_f16_as_f32(), expected);
 
-        let x64 = Owned::f64(&[3], &values.map(f64::from));
+        let values64 = [-1.234_567_890_123_f64, 1.0, 1.234_567_890_123];
+        let x64 = Owned::f64(&[3], &values64);
         let mut out64 = Owned::zeros(DataType::Float64, &[3]);
         kernel
             .execute(&[x64.view()], &mut [out64.view_mut()])
             .unwrap();
-        assert_eq!(out64.to_f64(), expected.map(f64::from));
+        let expected64 = [0.0, 0.0, values64[2]];
+        for (got, want) in out64.to_f64().into_iter().zip(expected64) {
+            assert!((got - want).abs() < 1e-12, "got {got}, want {want}");
+        }
 
         let xbf16 = Owned::bf16(&[3], &values);
         let mut outbf16 = Owned::zeros(DataType::BFloat16, &[3]);
