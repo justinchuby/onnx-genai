@@ -43,6 +43,7 @@ onnx-runtime-ir = { workspace = true }
 onnx-runtime-loader = { workspace = true }
 onnx-runtime-session = { workspace = true, optional = true }
 prost = { version = "0.13" }
+memmap2 = "0.9"
 tokio = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
