@@ -4,7 +4,7 @@ use std::borrow::Cow;
 use std::collections::BTreeMap;
 
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
-use onnx_runtime_ir::{DataType, Node, Shape, as_static_shape};
+use onnx_runtime_ir::{DataType, Node, Shape};
 
 use super::block_quantized_matmul::{BlockFormat, dequantize_weight_kn};
 use super::moe::{MoeAttributes, routing_weights, run_expert};
@@ -469,14 +469,6 @@ fn validate_claim_metadata(
         ));
     }
     validate_partial_claim_shapes(node, shapes)?;
-    if let Some(static_shapes) = shapes
-        .iter()
-        .map(|shape| as_static_shape(shape))
-        .collect::<Option<Vec<_>>>()
-    {
-        let views = static_shapes;
-        validate_static_claim_shapes(node, &views)?;
-    }
     Ok(())
 }
 
@@ -490,11 +482,22 @@ fn validate_partial_claim_shapes(node: &Node, shapes: &[Shape]) -> std::result::
         MoeAttributes::from_block_quantized_node(node).map_err(|err| err.to_string())?;
     let hidden = shapes[0].last().and_then(|dim| dim.as_static());
     let experts = shapes[1][1].as_static();
+    let rows = shapes[0][..shapes[0].len() - 1]
+        .iter()
+        .map(|dim| dim.as_static())
+        .try_fold(Some(1usize), |rows, dim| match (rows, dim) {
+            (Some(rows), Some(dim)) => rows
+                .checked_mul(dim)
+                .map(Some)
+                .ok_or_else(|| "input row count overflow".to_string()),
+            _ => Ok(None),
+        })?;
     if let Some(experts) = experts
         && attributes.k > experts
     {
         return Err(format!("k={} exceeds num_experts={experts}", attributes.k));
     }
+    check_static_axis(shapes, 1, 0, rows, "router_logits rows")?;
     require_same_static_axis(shapes, 2, 0, 1, 1, "fc1 expert count")?;
     require_same_static_axis(shapes, 4, 0, 1, 1, "fc2 expert count")?;
     if let (Some(fc2_hidden), Some(hidden)) = (shapes[4][1].as_static(), hidden)
@@ -531,34 +534,82 @@ fn validate_partial_claim_shapes(node: &Node, shapes: &[Shape]) -> std::result::
     if attributes.swiglu_fusion != 0 && fc1_size.is_some() && inter.is_none() {
         return Err("fused SwiGLU fc1_out must be even".into());
     }
-    if let (Some(blocks), Some(hidden)) = (shapes[2][2].as_static(), hidden) {
-        let expected = hidden.div_ceil(format.qk());
-        if blocks != expected {
-            return Err(format!("fc1 block count {blocks} must equal {expected}"));
-        }
+    if inter == Some(0) {
+        return Err("inferred inter dimension must be non-zero".into());
     }
-    if let (Some(blocks), Some(inter)) = (shapes[4][2].as_static(), inter) {
-        let expected = inter.div_ceil(format.qk());
-        if blocks != expected {
-            return Err(format!("fc2 block count {blocks} must equal {expected}"));
-        }
-    }
+    check_static_packed_shape(shapes, 2, experts, fc1_size, hidden, format)?;
+    check_static_packed_shape(shapes, 4, experts, hidden, inter, format)?;
+    check_static_optional_shape(node, shapes, 3, experts, fc1_size)?;
+    check_static_optional_shape(node, shapes, 5, experts, hidden)?;
+
     let has_fc3 = node.inputs.get(6).is_some_and(Option::is_some);
     if attributes.uses_separate_gate(has_fc3) {
         if !has_fc3 {
             return Err("unfused swiglu requires fc3_experts_weights".into());
         }
-        require_same_static_axis(shapes, 6, 0, 1, 1, "fc3 expert count")?;
-        if let Some(block_bytes) = shapes[6][3].as_static()
-            && block_bytes != format.block_bytes()
-        {
-            return Err(format!(
-                "fc3 block byte width {block_bytes} must equal {}",
-                format.block_bytes()
-            ));
-        }
+        check_static_packed_shape(shapes, 6, experts, inter, hidden, format)?;
+        check_static_optional_shape(node, shapes, 7, experts, inter)?;
     } else if has_fc3 || node.inputs.get(7).is_some_and(Option::is_some) {
         return Err("fc3 inputs are only valid for unfused swiglu or silu gated-GLU".into());
+    }
+    check_static_optional_shape(node, shapes, 8, rows, experts)?;
+    Ok(())
+}
+
+fn check_static_packed_shape(
+    shapes: &[Shape],
+    index: usize,
+    experts: Option<usize>,
+    out_features: Option<usize>,
+    in_features: Option<usize>,
+    format: BlockFormat,
+) -> std::result::Result<(), String> {
+    check_static_axis(shapes, index, 0, experts, "expert count")?;
+    check_static_axis(shapes, index, 1, out_features, "output width")?;
+    check_static_axis(
+        shapes,
+        index,
+        2,
+        in_features.map(|width| width.div_ceil(format.qk())),
+        "block count",
+    )?;
+    check_static_axis(
+        shapes,
+        index,
+        3,
+        Some(format.block_bytes()),
+        "block byte width",
+    )
+}
+
+fn check_static_optional_shape(
+    node: &Node,
+    shapes: &[Shape],
+    index: usize,
+    rows: Option<usize>,
+    width: Option<usize>,
+) -> std::result::Result<(), String> {
+    if node.inputs.get(index).is_some_and(Option::is_some) {
+        check_static_axis(shapes, index, 0, rows, "dimension 0")?;
+        check_static_axis(shapes, index, 1, width, "dimension 1")?;
+    }
+    Ok(())
+}
+
+fn check_static_axis(
+    shapes: &[Shape],
+    index: usize,
+    axis: usize,
+    expected: Option<usize>,
+    name: &str,
+) -> std::result::Result<(), String> {
+    if let (Some(actual), Some(expected)) = (shapes[index][axis].as_static(), expected)
+        && actual != expected
+    {
+        return Err(format!(
+            "input {index} ('{}') {name} {actual} must equal {expected}",
+            INPUT_NAMES[index]
+        ));
     }
     Ok(())
 }
@@ -577,109 +628,6 @@ fn require_same_static_axis(
     ) && left != right
     {
         return Err(format!("{name} {left} must equal {right}"));
-    }
-    Ok(())
-}
-
-fn validate_static_claim_shapes(
-    node: &Node,
-    shapes: &[Vec<usize>],
-) -> std::result::Result<(), String> {
-    let factory = BlockQuantizedMoEFactory;
-    let kernel = factory
-        .create(node, shapes)
-        .map_err(|err| err.to_string())?;
-    let _ = kernel;
-    let format = node
-        .attr("format")
-        .and_then(|attr| attr.as_str())
-        .ok_or_else(|| "missing format".to_string())
-        .and_then(|value| BlockFormat::parse(value).map_err(|err| err.to_string()))?;
-    let input = &shapes[0];
-    let hidden = *input
-        .last()
-        .ok_or_else(|| "input rank is empty".to_string())?;
-    let rows = input[..input.len() - 1]
-        .iter()
-        .try_fold(1usize, |count, &dim| count.checked_mul(dim))
-        .ok_or_else(|| "input row count overflow".to_string())?;
-    if shapes[1][0] != rows {
-        return Err(format!(
-            "router_logits rows {} must equal flattened input rows {rows}",
-            shapes[1][0]
-        ));
-    }
-    let experts = shapes[1][1];
-    if shapes[2][0] != experts || shapes[4][0] != experts {
-        return Err("expert weight counts must equal router expert count".into());
-    }
-    if shapes[4][1] != hidden {
-        return Err(format!("fc2 output width must equal hidden size {hidden}"));
-    }
-    let attrs = MoeAttributes::from_block_quantized_node(node).map_err(|err| err.to_string())?;
-    if attrs.k > experts {
-        return Err(format!("k={} exceeds num_experts={experts}", attrs.k));
-    }
-    let fc1_size = shapes[2][1];
-    let inter = if attrs.swiglu_fusion == 0 {
-        fc1_size
-    } else if fc1_size % 2 == 0 {
-        fc1_size / 2
-    } else {
-        return Err("fused SwiGLU fc1_out must be even".into());
-    };
-    check_claim_packed(&shapes[2], experts, fc1_size, hidden, format, 2)?;
-    check_claim_packed(&shapes[4], experts, hidden, inter, format, 4)?;
-    check_claim_optional_shape(node, shapes, 3, &[experts, fc1_size])?;
-    check_claim_optional_shape(node, shapes, 5, &[experts, hidden])?;
-    let has_fc3 = node.inputs.get(6).is_some_and(Option::is_some);
-    if attrs.uses_separate_gate(has_fc3) {
-        if !has_fc3 {
-            return Err("unfused swiglu requires fc3_experts_weights".into());
-        }
-        check_claim_packed(&shapes[6], experts, inter, hidden, format, 6)?;
-        check_claim_optional_shape(node, shapes, 7, &[experts, inter])?;
-    } else if has_fc3 || node.inputs.get(7).is_some_and(Option::is_some) {
-        return Err("fc3 inputs are only valid for unfused swiglu or silu gated-GLU".into());
-    }
-    check_claim_optional_shape(node, shapes, 8, &[rows, experts])?;
-    Ok(())
-}
-
-fn check_claim_packed(
-    shape: &[usize],
-    experts: usize,
-    out_features: usize,
-    in_features: usize,
-    format: BlockFormat,
-    index: usize,
-) -> std::result::Result<(), String> {
-    let expected = [
-        experts,
-        out_features,
-        in_features.div_ceil(format.qk()),
-        format.block_bytes(),
-    ];
-    if shape != expected {
-        return Err(format!(
-            "input {index} ('{}') shape {shape:?} unsupported; expected {expected:?}",
-            INPUT_NAMES[index]
-        ));
-    }
-    Ok(())
-}
-
-fn check_claim_optional_shape(
-    node: &Node,
-    shapes: &[Vec<usize>],
-    index: usize,
-    expected: &[usize],
-) -> std::result::Result<(), String> {
-    if node.inputs.get(index).is_some_and(Option::is_some) && shapes[index] != expected {
-        return Err(format!(
-            "input {index} ('{}') shape {:?} unsupported; expected {expected:?}",
-            INPUT_NAMES[index], shapes[index]
-        ));
     }
     Ok(())
 }
@@ -751,7 +699,7 @@ mod tests {
     use crate::CpuExecutionProvider;
     use crate::kernels::testutil::Owned;
     use onnx_runtime_ep_api::ExecutionProvider;
-    use onnx_runtime_ir::{Attribute, Graph, NodeId, static_shape};
+    use onnx_runtime_ir::{Attribute, Dim, Graph, NodeId, SymbolId, static_shape};
 
     const H: usize = 32;
     const E: usize = 2;
@@ -856,21 +804,53 @@ mod tests {
         fc2: &[u8],
         router_weights: Option<&[f32]>,
     ) -> Vec<f32> {
+        run_with_attrs(
+            &attrs(activation, k, normalize, swiglu_fusion),
+            input,
+            logits,
+            fc1,
+            fc1_out,
+            fc2,
+            router_weights,
+        )
+    }
+
+    fn run_with_attrs(
+        attrs: &[(&str, Attribute)],
+        input: &[f32],
+        logits: &[f32],
+        fc1: &[u8],
+        fc1_out: usize,
+        fc2: &[u8],
+        router_weights: Option<&[f32]>,
+    ) -> Vec<f32> {
+        run_with_attrs_and_experts(attrs, E, input, logits, fc1, fc1_out, fc2, router_weights)
+    }
+
+    fn run_with_attrs_and_experts(
+        attrs: &[(&str, Attribute)],
+        experts: usize,
+        input: &[f32],
+        logits: &[f32],
+        fc1: &[u8],
+        fc1_out: usize,
+        fc2: &[u8],
+        router_weights: Option<&[f32]>,
+    ) -> Vec<f32> {
         let mut shapes = vec![
             Some((DataType::Float32, vec![1, H])),
-            Some((DataType::Float32, vec![1, E])),
-            Some((DataType::Uint8, vec![E, fc1_out, 1, 17])),
+            Some((DataType::Float32, vec![1, experts])),
+            Some((DataType::Uint8, vec![experts, fc1_out, 1, 17])),
             None,
-            Some((DataType::Uint8, vec![E, H, 1, 17])),
+            Some((DataType::Uint8, vec![experts, H, 1, 17])),
             None,
             None,
             None,
         ];
         if router_weights.is_some() {
-            shapes.push(Some((DataType::Float32, vec![1, E])));
+            shapes.push(Some((DataType::Float32, vec![1, experts])));
         }
-        let attrs = attrs(activation, k, normalize, swiglu_fusion);
-        let (graph, node) = model_node(&shapes, &attrs);
+        let (graph, node) = model_node(&shapes, attrs);
         let kernel = CpuExecutionProvider::new()
             .get_kernel(
                 graph.node(node),
@@ -886,10 +866,10 @@ mod tests {
             )
             .expect("valid BlockQuantizedMoE kernel");
         let input = Owned::f32(&[1, H], input);
-        let logits = Owned::f32(&[1, E], logits);
-        let fc1 = Owned::u8(&[E, fc1_out, 1, 17], fc1);
-        let fc2 = Owned::u8(&[E, H, 1, 17], fc2);
-        let router = router_weights.map(|weights| Owned::f32(&[1, E], weights));
+        let logits = Owned::f32(&[1, experts], logits);
+        let fc1 = Owned::u8(&[experts, fc1_out, 1, 17], fc1);
+        let fc2 = Owned::u8(&[experts, H, 1, 17], fc2);
+        let router = router_weights.map(|weights| Owned::f32(&[1, experts], weights));
         let mut views = vec![
             input.view(),
             logits.view(),
@@ -938,6 +918,35 @@ mod tests {
             None,
         );
         let expected: Vec<f32> = input.iter().map(|value| value * 1.75).collect();
+        assert_close(&actual, &expected);
+    }
+
+    #[test]
+    fn block_quantized_moe_topk_selects_the_highest_scoring_expert() {
+        const EXPERTS: usize = 3;
+        let input: Vec<f32> = (0..H).map(|i| i as f32 / 8.0 - 1.0).collect();
+        let fc1 = packed_matrix(EXPERTS, H, |expert, output, input| {
+            (output == input).then_some([2, 4, 6][expert]).unwrap_or(0)
+        });
+        let fc2 = packed_matrix(EXPERTS, H, |_, output, input| {
+            (output == input).then_some(2).unwrap_or(0)
+        });
+        let actual = run_with_attrs_and_experts(
+            &attrs("identity", 2, true, 0),
+            EXPERTS,
+            &input,
+            &[4.0, -5.0, 3.0],
+            &fc1,
+            H,
+            &fc2,
+            None,
+        );
+        let expert_zero_weight = 1.0 / (1.0 + (-1.0f32).exp());
+        let expert_two_weight = 1.0 - expert_zero_weight;
+        let expected: Vec<f32> = input
+            .iter()
+            .map(|value| value * (expert_zero_weight + 4.0 * expert_two_weight))
+            .collect();
         assert_close(&actual, &expected);
     }
 
@@ -999,6 +1008,53 @@ mod tests {
     }
 
     #[test]
+    fn block_quantized_moe_relu_and_gelu_match_dense_reference() {
+        let input: Vec<f32> = (0..H).map(|i| i as f32 / 8.0 - 2.0).collect();
+        let fc1 = identity_projection([2, 2]);
+        let fc2 = identity_projection([2, 2]);
+        let relu = run(
+            "relu",
+            1,
+            true,
+            0,
+            &input,
+            &[3.0, -3.0],
+            &fc1,
+            H,
+            &fc2,
+            None,
+        );
+        assert_close(
+            &relu,
+            &input.iter().map(|value| value.max(0.0)).collect::<Vec<_>>(),
+        );
+
+        let gelu = run(
+            "gelu",
+            1,
+            true,
+            0,
+            &input,
+            &[3.0, -3.0],
+            &fc1,
+            H,
+            &fc2,
+            None,
+        );
+        let expected: Vec<f32> = input
+            .iter()
+            .map(|&value| {
+                0.5 * value
+                    * (1.0
+                        + (0.797_884_560_802_865_4_f32
+                            * (value + 0.044_715 * value * value * value))
+                            .tanh())
+            })
+            .collect();
+        assert_close(&gelu, &expected);
+    }
+
+    #[test]
     fn block_quantized_moe_fused_swiglu_matches_dense_reference() {
         let input: Vec<f32> = (0..H).map(|i| i as f32 / 32.0 + 0.25).collect();
         let fc1 = packed_matrix(E, 2 * H, |_, output, input| {
@@ -1028,6 +1084,48 @@ mod tests {
             .map(|&value| 2.0 * value * value / (1.0 + (-value).exp()))
             .collect();
         assert_close(&actual, &expected);
+    }
+
+    #[test]
+    fn block_quantized_moe_swiglu_attributes_affect_dense_reference() {
+        let input = vec![1.0f32; H];
+        let fc1 = packed_matrix(E, 2 * H, |_, output, input| {
+            if output < H && output == input {
+                2
+            } else if output >= H && output - H == input {
+                4
+            } else {
+                0
+            }
+        });
+        let fc2 = identity_projection([2, 2]);
+        let default = run(
+            "swiglu",
+            1,
+            true,
+            2,
+            &input,
+            &[2.0, -2.0],
+            &fc1,
+            2 * H,
+            &fc2,
+            None,
+        );
+        let mut custom_attrs = attrs("swiglu", 1, true, 2);
+        custom_attrs.extend([
+            ("activation_alpha", Attribute::Float(2.0)),
+            ("activation_beta", Attribute::Float(1.0)),
+            ("swiglu_limit", Attribute::Float(0.5)),
+        ]);
+        let actual = run_with_attrs(&custom_attrs, &input, &[2.0, -2.0], &fc1, 2 * H, &fc2, None);
+        let expected = 0.5 * (1.0 / (1.0 + (-1.0f32).exp())) * 1.5;
+        assert_close(&actual, &[expected; H]);
+        assert!(
+            actual
+                .iter()
+                .zip(default)
+                .any(|(&actual, default)| actual != default)
+        );
     }
 
     #[test]
@@ -1147,5 +1245,53 @@ mod tests {
         dtypes.truncate(4);
         let rejected = ep.supports_op(graph.node(node), 1, &shapes, &dtypes, &[]);
         assert!(rejected.reason().unwrap().contains("5 to 9"));
+    }
+
+    #[test]
+    fn block_quantized_moe_claim_gate_rejects_static_optional_and_fc3_errors_with_symbolic_dims() {
+        let inputs = vec![
+            Some((DataType::Float32, vec![1, H])),
+            Some((DataType::Float32, vec![1, E])),
+            Some((DataType::Uint8, vec![E, H, 1, 17])),
+            Some((DataType::Float32, vec![E, H])),
+            Some((DataType::Uint8, vec![E, H, 1, 17])),
+            None,
+            Some((DataType::Uint8, vec![E, H, 1, 17])),
+            Some((DataType::Float32, vec![E, H])),
+            Some((DataType::Float32, vec![1, E])),
+        ];
+        let (graph, node) = model_node(&inputs, &attrs("swiglu", 1, false, 0));
+        let mut shapes: Vec<Shape> = inputs
+            .iter()
+            .map(|input| {
+                input
+                    .as_ref()
+                    .map_or_else(Vec::new, |(_, shape)| static_shape(shape.iter().copied()))
+            })
+            .collect();
+        shapes[0][0] = Dim::Symbolic(SymbolId(0));
+        let dtypes = inputs
+            .iter()
+            .map(|input| {
+                input
+                    .as_ref()
+                    .map_or(DataType::Undefined, |(dtype, _)| *dtype)
+            })
+            .collect::<Vec<_>>();
+        let ep = CpuExecutionProvider::new();
+
+        shapes[3][1] = H.saturating_add(1).into();
+        let rejected = ep.supports_op(graph.node(node), 1, &shapes, &dtypes, &[]);
+        assert!(rejected.reason().unwrap().contains("fc1_experts_bias"));
+
+        shapes[3][1] = H.into();
+        shapes[6][1] = H.saturating_add(1).into();
+        let rejected = ep.supports_op(graph.node(node), 1, &shapes, &dtypes, &[]);
+        assert!(rejected.reason().unwrap().contains("fc3_experts_weights"));
+
+        shapes[6][1] = H.into();
+        shapes[8][1] = E.saturating_add(1).into();
+        let rejected = ep.supports_op(graph.node(node), 1, &shapes, &dtypes, &[]);
+        assert!(rejected.reason().unwrap().contains("router_weights"));
     }
 }
