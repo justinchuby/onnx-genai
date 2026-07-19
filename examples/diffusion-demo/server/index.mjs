@@ -121,6 +121,97 @@ function runPipelineWithDump(packageDir, outputEndpoint, inputs) {
   return { frames, timing, stages };
 }
 
+// ---- GPT-2 byte-level tokenizer decode (dependency-free) ----
+// Reverses the standard GPT-2 bytes<->unicode table so we can turn token ids
+// back into human-readable text for the language-diffusion animation.
+function gpt2ByteDecoder() {
+  const bs = [];
+  for (let i = 33; i <= 126; i++) bs.push(i);
+  for (let i = 161; i <= 172; i++) bs.push(i);
+  for (let i = 174; i <= 255; i++) bs.push(i);
+  const cs = bs.slice();
+  let n = 0;
+  for (let b = 0; b < 256; b++) {
+    if (!bs.includes(b)) {
+      bs.push(b);
+      cs.push(256 + n);
+      n++;
+    }
+  }
+  const decoder = new Map(); // unicode codepoint -> original byte
+  for (let i = 0; i < bs.length; i++) decoder.set(cs[i], bs[i]);
+  return decoder;
+}
+
+const tokenizerCache = new Map(); // packageDir -> { idToToken, byteDecoder } | null
+function loadTokenizer(packageDir) {
+  if (tokenizerCache.has(packageDir)) return tokenizerCache.get(packageDir);
+  let entry = null;
+  const path = join(packageDir, "tokenizer.json");
+  if (existsSync(path)) {
+    try {
+      const tk = JSON.parse(readFileSync(path, "utf8"));
+      const vocab = tk?.model?.vocab ?? {};
+      const idToToken = [];
+      for (const [tokenStr, id] of Object.entries(vocab)) idToToken[id] = tokenStr;
+      entry = { idToToken, byteDecoder: gpt2ByteDecoder() };
+    } catch {
+      entry = null;
+    }
+  }
+  tokenizerCache.set(packageDir, entry);
+  return entry;
+}
+
+// Decode a single token id to its display text (byte-level -> UTF-8). Returns
+// null when the tokenizer is missing, the id is unknown, or the token is a
+// special (non-byte-level) token such as <mask>.
+function decodeToken(tokenizer, id) {
+  if (!tokenizer) return null;
+  const s = tokenizer.idToToken[id];
+  if (s === undefined) return null;
+  const bytes = [];
+  for (const ch of s) {
+    const b = tokenizer.byteDecoder.get(ch.codePointAt(0));
+    if (b === undefined) return s; // special token, show verbatim
+    bytes.push(b);
+  }
+  return Buffer.from(bytes).toString("utf8");
+}
+
+// Map an SD-1.5 latent ([1,4,H,W] f32) to a small RGB preview using the
+// well-known linear latent->RGB approximation (as used by ComfyUI/A1111 for
+// live previews). Returns { w, h, rgb } with rgb a base64 raw RGB24 buffer.
+function latentToRgbPreview(data, shape) {
+  const h = shape[shape.length - 2];
+  const w = shape[shape.length - 1];
+  const plane = h * w;
+  const factors = [
+    [0.298, 0.207, 0.208],
+    [0.187, 0.286, 0.173],
+    [-0.158, 0.189, 0.264],
+    [-0.184, -0.271, -0.473],
+  ];
+  const out = Buffer.alloc(plane * 3);
+  for (let p = 0; p < plane; p++) {
+    let r = 0.5;
+    let g = 0.5;
+    let b = 0.5;
+    for (let c = 0; c < 4; c++) {
+      const v = data[c * plane + p];
+      r += v * factors[c][0];
+      g += v * factors[c][1];
+      b += v * factors[c][2];
+    }
+    const o = p * 3;
+    out[o] = Math.max(0, Math.min(255, Math.round(r * 255)));
+    out[o + 1] = Math.max(0, Math.min(255, Math.round(g * 255)));
+    out[o + 2] = Math.max(0, Math.min(255, Math.round(b * 255)));
+  }
+  return { w, h, rgb: out.toString("base64") };
+}
+
+
 // Language diffusion: seed an all-mask sequence and run masked_diffusion.
 function runLanguage() {
   const metaPath = join(LM_PACKAGE, "inference_metadata.yaml");
@@ -136,6 +227,24 @@ function runLanguage() {
   const { frames, timing, stages } = runPipelineWithDump(LM_PACKAGE, "denoiser.input_ids", [
     `denoiser.input_ids:i64:1,${seqLen}:${seedPath}`,
   ]);
+  // Decode token ids -> readable text so the UI can animate real words filling
+  // in (masked positions stay null). Falls back to numeric ids if no tokenizer.
+  const tokenizer = loadTokenizer(LM_PACKAGE);
+  const framesWithText = frames.map((f) => {
+    const data = f.data.slice(-seqLen);
+    const text = data.map((v) => (v === maskId ? null : decodeToken(tokenizer, v)));
+    return { ...f, text };
+  });
+  const finalData = framesWithText.length
+    ? framesWithText[framesWithText.length - 1].data.slice(-seqLen)
+    : [];
+  const decoded = tokenizer
+    ? finalData
+        .filter((v) => v !== maskId)
+        .map((v) => decodeToken(tokenizer, v) ?? "")
+        .join("")
+        .trim()
+    : null;
   const metadata = metaText ? YAML.parse(metaText) : null;
   const perf = timing
     ? {
@@ -151,7 +260,7 @@ function runLanguage() {
         stepMs: frames.map((f) => f.step_ms ?? null),
       }
     : { stages, stepMs: frames.map((f) => f.step_ms ?? null) };
-  return { kind: "language", maskId, numSteps, seqLen, metadata, frames, perf };
+  return { kind: "language", maskId, numSteps, seqLen, metadata, frames: framesWithText, decoded, tokenizer: !!tokenizer, perf };
 }
 
 // Render a full image (text-encode + denoise + VAE decode -> PNG) with
@@ -168,6 +277,7 @@ function runImage() {
     );
   }
   const outPng = join(mkdtempSync(join(tmpdir(), "ogimg-")), "out.png");
+  const dump = mkdtempSync(join(tmpdir(), "ogimgsteps-"));
   const started = Date.now();
   const r = spawnSync(
     bin,
@@ -175,13 +285,25 @@ function runImage() {
     {
       encoding: "utf8",
       maxBuffer: 64 << 20,
-      env: { ...process.env, DYLD_LIBRARY_PATH: `${ortLibDir()}:${process.env.DYLD_LIBRARY_PATH || ""}` },
+      env: {
+        ...process.env,
+        ONNX_GENAI_STEP_DUMP_DIR: dump,
+        DYLD_LIBRARY_PATH: `${ortLibDir()}:${process.env.DYLD_LIBRARY_PATH || ""}`,
+      },
     }
   );
   if (r.status !== 0) throw new Error(r.stderr || "run_comfyui failed");
   const wallMs = Date.now() - started;
   if (!existsSync(outPng)) throw new Error(`run_comfyui reported success but ${outPng} is missing`);
   const image = `data:image/png;base64,${readFileSync(outPng).toString("base64")}`;
+  // Per-step latent previews (noise -> image) for the denoising animation.
+  const frames = readdirSync(dump)
+    .filter((f) => f.startsWith("step_") && f.endsWith(".json"))
+    .sort()
+    .map((f) => {
+      const j = JSON.parse(readFileSync(join(dump, f), "utf8"));
+      return latentToRgbPreview(j.data, j.shape);
+    });
   const renderMatch =
     /\[render\]\s*finite=(\w+)\s*min=([-\d.]+)\s*max=([-\d.]+)\s*mean=([-\d.]+)\s*var=([-\d.]+)/.exec(
       r.stderr || ""
@@ -201,6 +323,7 @@ function runImage() {
     package: SD_PACKAGE,
     metadata: existsSync(metaPath) ? YAML.parse(readFileSync(metaPath, "utf8")) : null,
     image,
+    frames,
     wallMs,
     render,
   };

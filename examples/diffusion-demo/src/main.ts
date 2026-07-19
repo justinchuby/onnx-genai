@@ -36,6 +36,13 @@ interface Frame {
   dtype: string;
   shape: number[];
   data: number[];
+  text?: (string | null)[];
+}
+
+interface ImageFrame {
+  w: number;
+  h: number;
+  rgb: string; // base64 raw RGB24
 }
 
 const el = (tag: string, cls?: string, text?: string): HTMLElement => {
@@ -248,6 +255,9 @@ function renderLanguageRun(container: HTMLElement, frames: Frame[], maskId: numb
   const last = frames[frames.length - 1];
   const seqLen = last.shape[last.shape.length - 1];
 
+  const sentence = el("div", "sentence");
+  container.appendChild(sentence);
+
   const grid = el("div", "tokens");
   const cells: HTMLElement[] = [];
   for (let i = 0; i < seqLen; i++) {
@@ -274,14 +284,19 @@ function renderLanguageRun(container: HTMLElement, frames: Frame[], maskId: numb
   const show = (idx: number) => {
     const f = frames[idx];
     const data = f.data.slice(-seqLen);
+    const text = f.text;
+    const pieces: string[] = [];
     for (let i = 0; i < seqLen; i++) {
       const v = data[i];
       const masked = v === maskId;
       const justFilled = !masked && prev[i] === maskId;
-      cells[i].textContent = masked ? "▒" : String(v);
+      const decoded = text && text[i] != null ? (text[i] as string) : null;
+      cells[i].textContent = masked ? "▒" : decoded ? decoded.trim() || "␣" : String(v);
       cells[i].className = "tok" + (masked ? "" : " filled") + (justFilled ? " just" : "");
+      pieces.push(masked ? "▒" : decoded ?? String(v));
     }
     prev = data;
+    sentence.textContent = pieces.join("");
     const remaining = data.filter((v) => v === maskId).length;
     label.textContent = `step ${f.step + 1}/${frames.length} · ${seqLen - remaining}/${seqLen} unmasked`;
     slider.value = String(idx);
@@ -293,30 +308,142 @@ function renderLanguageRun(container: HTMLElement, frames: Frame[], maskId: numb
   });
 
   let timer: number | undefined;
-  playBtn.addEventListener("click", () => {
-    if (timer) {
-      clearInterval(timer);
-      timer = undefined;
-      playBtn.textContent = "▶ Play";
-      return;
-    }
+  const stop = () => {
+    if (timer) clearInterval(timer);
+    timer = undefined;
+    playBtn.textContent = "▶ Play";
+  };
+  const play = () => {
+    if (timer) return stop();
     playBtn.textContent = "⏸ Pause";
     let idx = 0;
     prev = [];
     show(0);
     timer = window.setInterval(() => {
       idx++;
-      if (idx >= frames.length) {
-        clearInterval(timer);
-        timer = undefined;
-        playBtn.textContent = "▶ Play";
-        return;
-      }
+      if (idx >= frames.length) return stop();
       show(idx);
-    }, 700);
-  });
+    }, 350);
+  };
+  playBtn.addEventListener("click", play);
 
   show(0);
+  play(); // auto-play the un-masking on render
+}
+
+// Animate the image reverse process: draw each per-step latent RGB preview
+// (noise -> structure) on a canvas, then reveal the final crisp VAE-decoded PNG.
+function renderImageRun(
+  container: HTMLElement,
+  frames: ImageFrame[],
+  finalImage: string | null,
+  info: { wallMs?: number; render?: { finite?: boolean }; package?: string }
+) {
+  container.innerHTML = "";
+  const figure = el("div", "image-result");
+  container.appendChild(figure);
+
+  const DISPLAY = 384;
+  const canvas = document.createElement("canvas");
+  canvas.width = DISPLAY;
+  canvas.height = DISPLAY;
+  canvas.className = "denoise-canvas";
+  figure.appendChild(canvas);
+  const ctx = canvas.getContext("2d")!;
+  ctx.imageSmoothingEnabled = true;
+
+  const finalImg = el("img") as HTMLImageElement;
+  finalImg.className = "image-final";
+  finalImg.alt = "rendered image";
+  finalImg.style.display = "none";
+  if (finalImage) finalImg.src = finalImage;
+  figure.appendChild(finalImg);
+
+  const off = document.createElement("canvas");
+  const octx = off.getContext("2d")!;
+  const drawFrame = (fr: ImageFrame) => {
+    off.width = fr.w;
+    off.height = fr.h;
+    const bin = atob(fr.rgb);
+    const img = octx.createImageData(fr.w, fr.h);
+    const n = fr.w * fr.h;
+    for (let p = 0, s = 0; p < n; p++) {
+      img.data[p * 4] = bin.charCodeAt(s++);
+      img.data[p * 4 + 1] = bin.charCodeAt(s++);
+      img.data[p * 4 + 2] = bin.charCodeAt(s++);
+      img.data[p * 4 + 3] = 255;
+    }
+    octx.putImageData(img, 0, 0);
+    ctx.clearRect(0, 0, DISPLAY, DISPLAY);
+    ctx.drawImage(off, 0, 0, DISPLAY, DISPLAY);
+  };
+
+  const showCanvas = () => {
+    canvas.style.display = "";
+    finalImg.style.display = "none";
+  };
+  const showFinal = () => {
+    if (!finalImage) return;
+    canvas.style.display = "none";
+    finalImg.style.display = "";
+  };
+
+  const controls = el("div", "controls");
+  const playBtn = el("button", undefined, "▶ Replay denoising") as HTMLButtonElement;
+  const slider = el("input") as HTMLInputElement;
+  slider.type = "range";
+  slider.min = "0";
+  slider.max = String(frames.length); // last position = final image
+  slider.value = "0";
+  const label = el("div", "note");
+  controls.appendChild(playBtn);
+  controls.appendChild(slider);
+  controls.appendChild(label);
+  container.appendChild(controls);
+
+  const show = (idx: number) => {
+    slider.value = String(idx);
+    if (idx >= frames.length) {
+      showFinal();
+      label.textContent = `final image (VAE-decoded) · ${frames.length} denoising steps`;
+      return;
+    }
+    showCanvas();
+    drawFrame(frames[idx]);
+    label.textContent = `step ${idx + 1}/${frames.length} · latent preview`;
+  };
+
+  slider.addEventListener("input", () => show(Number(slider.value)));
+
+  let timer: number | undefined;
+  const stop = () => {
+    if (timer) clearInterval(timer);
+    timer = undefined;
+    playBtn.textContent = "▶ Replay denoising";
+  };
+  const play = () => {
+    if (timer) return stop();
+    playBtn.textContent = "⏸ Pause";
+    let idx = 0;
+    show(0);
+    timer = window.setInterval(() => {
+      idx++;
+      if (idx > frames.length) return stop();
+      show(idx);
+    }, 120);
+  };
+  playBtn.addEventListener("click", play);
+
+  const meta: string[] = [];
+  if (typeof info.wallMs === "number") meta.push(`${(info.wallMs / 1000).toFixed(1)} s wall`);
+  if (info.render && info.render.finite === false) meta.push("⚠ non-finite output");
+  figure.appendChild(
+    el("div", "note", `text-encode → denoise → VAE decode${meta.length ? " · " + meta.join(" · ") : ""}`)
+  );
+  container.appendChild(el("div", "note", `package: ${info.package ?? "(set ONNX_GENAI_SD_PACKAGE)"}`));
+
+  if (frames.length) play(); // auto-play the denoising on render
+  else showFinal();
 }
 
 // ---- App shell ----
@@ -459,23 +586,11 @@ function render() {
         const res = await postText("/api/run/image", "{}");
         runOut.innerHTML = "";
         if (res.metadata) showViz(res.metadata as Metadata);
-        if (res.image) {
-          const figure = el("div", "image-result");
-          const img = el("img") as HTMLImageElement;
-          img.src = res.image as string;
-          img.alt = "rendered image";
-          figure.appendChild(img);
-          const meta: string[] = [];
-          if (typeof res.wallMs === "number") meta.push(`${(res.wallMs / 1000).toFixed(1)} s wall`);
-          if (res.render && res.render.finite === false) meta.push("⚠ non-finite output");
-          figure.appendChild(el("div", "note", `text-encode → denoise → VAE decode${meta.length ? " · " + meta.join(" · ") : ""}`));
-          runOut.appendChild(figure);
-        } else {
-          runOut.appendChild(el("div", "note", res.note ?? "Image run configured."));
-        }
-        runOut.appendChild(
-          el("div", "note", `package: ${res.package ?? "(set ONNX_GENAI_SD_PACKAGE)"}`)
-        );
+        renderImageRun(runOut, (res.frames as ImageFrame[]) ?? [], (res.image as string) ?? null, {
+          wallMs: res.wallMs,
+          render: res.render,
+          package: res.package,
+        });
       }
     } catch (e) {
       setErr(runErr, String((e as Error).message));

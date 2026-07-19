@@ -73,9 +73,10 @@ button:disabled { opacity: .5; cursor: default; }
 /* token grid */
 .tokens { display: flex; gap: 6px; flex-wrap: wrap; margin: 12px 0; }
 .tok {
-  width: 46px; height: 46px; display: flex; align-items: center; justify-content: center;
+  min-width: 30px; height: 40px; padding: 0 8px;
+  display: flex; align-items: center; justify-content: center;
   border-radius: 8px; background: var(--mask); border: 1px solid var(--border);
-  font-family: ui-monospace, monospace; font-size: 15px; transition: background .3s, transform .2s;
+  font-family: ui-monospace, monospace; font-size: 13px; transition: background .3s, transform .2s;
 }
 .tok.filled { background: var(--fill); color: white; }
 .tok.just { transform: scale(1.15); box-shadow: 0 0 0 2px var(--accent); }
@@ -114,4 +115,19 @@ code { background: var(--bg); padding: 1px 5px; border-radius: 4px; font-size: 1
   border-radius: 8px;
   image-rendering: auto;
   background: var(--mask);
+}
+
+/* running decoded sentence for language diffusion */
+.sentence {
+  background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
+  padding: 12px 14px; margin: 12px 0; min-height: 24px;
+  font-size: 15px; line-height: 1.5; color: var(--text);
+  font-family: ui-monospace, monospace; white-space: pre-wrap; word-break: break-word;
+}
+
+/* image denoising animation */
+.denoise-canvas {
+  width: 384px; max-width: 100%; aspect-ratio: 1 / 1;
+  border: 1px solid var(--border); border-radius: 8px; background: var(--mask);
+  image-rendering: auto; display: block;
 }

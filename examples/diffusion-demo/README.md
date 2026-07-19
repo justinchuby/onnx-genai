@@ -12,9 +12,10 @@ Diffusion). It:
    and their dataflow edges) and the strategy (scheduler, steps, guidance, …),
    so everyone can see exactly what will run.
 3. **Runs it and animates the reverse process** — for language diffusion, the
-   tokens un-masking step by step; for image diffusion, the latent denoising to
-   an image. The image tab renders a **real PNG** (full text-encode → denoise →
-   VAE-decode) and shows it inline with the wall-clock time.
+   tokens un-masking step by step, **decoded to real text** as words fill in; for
+   image diffusion, the latent **denoising animation** (noise → image) followed
+   by a reveal of the final crisp VAE-decoded PNG, shown inline with the
+   wall-clock time.
 
 The backend drives the **real** onnx-genai runtime (the `run_diffusion`,
 `run_comfyui`, and `comfyui_to_metadata` binaries) — nothing is simulated.
