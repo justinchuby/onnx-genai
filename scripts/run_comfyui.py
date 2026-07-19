@@ -95,53 +95,77 @@ def main() -> int:
     print(f"  prompt={prompt!r}  negative={negative!r}  {wf.steps} steps, cfg {wf.cfg}, "
           f"{wf.sampler_name} ({wf.scheduler_kind}{'/karras' if wf.scheduler_spacing == 'karras' else ''})")
 
+    run_params = json.load(open(result.run_params_path))
+    sdxl = bool(run_params.get("sdxl", False))
+    latent_ch = run_params["latent_channels"]
+    sz = wf.height // 8
+
     tokenizer = CLIPTokenizer.from_pretrained(args.checkpoint, subfolder="tokenizer")
 
-    def tok(text: str) -> np.ndarray:
-        return tokenizer(text, padding="max_length", max_length=tokenizer.model_max_length,
-                         truncation=True, return_tensors="np").input_ids.astype(np.int64)
+    def tok(text: str, tk) -> np.ndarray:
+        return tk(text, padding="max_length", max_length=tk.model_max_length,
+                  truncation=True, return_tensors="np").input_ids.astype("<i8")
 
-    ids_pos = tok(prompt)
-    ids_neg = tok(negative)
+    ids_pos = tok(prompt, tokenizer)
+    ids_neg = tok(negative, tokenizer)
 
-    # The pipeline runs the text encoder on the positive prompt; compute the
-    # NEGATIVE-prompt unconditional embedding here from the same exported encoder.
     te = ort.InferenceSession(str(pdir / "text_encoder.onnx"), providers=["CPUExecutionProvider"])
-    te_in = te.get_inputs()[0].name
-    emb_neg = te.run(None, {te_in: ids_neg})[0].astype(np.float32)
-
-    ch = wf.metadata["pipeline"]["models"]["denoiser"]
-    latent_ch = json.load(open(result.run_params_path))["latent_channels"]
-    sz = wf.height // 8
     init_sigma = _diffusers_init_noise_sigma(wf.scheduler_kind, sc, wf.steps)
     rng = np.random.default_rng(wf.seed)
-    latent0 = (rng.standard_normal((1, latent_ch, sz, sz)).astype(np.float32)) * init_sigma
-
-    ids_pos.tofile(pdir / "ids.i64")
+    latent0 = (rng.standard_normal((1, latent_ch, sz, sz)).astype("<f4")) * init_sigma
     latent0.tofile(pdir / "sample.f32")
-    emb_neg.tofile(pdir / "uncond.f32")
-    seq = ids_pos.shape[1]
-    s, d = emb_neg.shape[1], emb_neg.shape[2]
+    ids_pos.tofile(pdir / "ids.i64")
+
+    inputs = [str(RUNNER), str(pdir), "vae.image", str(pdir / "image.f32")]
+
+    if sdxl:
+        # SDXL: two tokenizers + two conditioning inputs + time_ids. The pipeline
+        # runs the dual encoder on the positive prompts; the negative-prompt uncond
+        # (encoder_hidden_states + pooled text_embeds) is computed here.
+        tok2 = CLIPTokenizer.from_pretrained(args.checkpoint, subfolder="tokenizer_2")
+        ids2_pos = tok(prompt, tok2)
+        ids2_neg = tok(negative, tok2)
+        te_ins = [i.name for i in te.get_inputs()]
+        ehs_neg, pooled_neg = te.run(None, {te_ins[0]: ids_neg, te_ins[1]: ids2_neg})
+        ehs_neg = ehs_neg.astype("<f4")
+        pooled_neg = pooled_neg.astype("<f4")
+        time_ids = np.array([[wf.height, wf.width, 0, 0, wf.height, wf.width]], dtype="<f4")
+        ids2_pos.tofile(pdir / "ids2.i64")
+        ehs_neg.tofile(pdir / "ehs_uncond.f32")
+        pooled_neg.tofile(pdir / "pooled_uncond.f32")
+        time_ids.tofile(pdir / "time_ids.f32")
+        inputs += [
+            f"text_encoder.input_ids:i64:1,{ids_pos.shape[1]}:{pdir / 'ids.i64'}",
+            f"text_encoder.input_ids_2:i64:1,{ids2_pos.shape[1]}:{pdir / 'ids2.i64'}",
+            f"denoiser.sample:1,{latent_ch},{sz},{sz}:{pdir / 'sample.f32'}",
+            f"denoiser.time_ids:1,6:{pdir / 'time_ids.f32'}",
+            f"denoiser.encoder_hidden_states.uncond:1,{ehs_neg.shape[1]},{ehs_neg.shape[2]}:{pdir / 'ehs_uncond.f32'}",
+            f"denoiser.text_embeds.uncond:1,{pooled_neg.shape[1]}:{pdir / 'pooled_uncond.f32'}",
+        ]
+    else:
+        emb_neg = te.run(None, {te.get_inputs()[0].name: ids_neg})[0].astype("<f4")
+        emb_neg.tofile(pdir / "uncond.f32")
+        inputs += [
+            f"text_encoder.input_ids:i64:1,{ids_pos.shape[1]}:{pdir / 'ids.i64'}",
+            f"denoiser.sample:1,{latent_ch},{sz},{sz}:{pdir / 'sample.f32'}",
+            f"denoiser.encoder_hidden_states.uncond:1,{emb_neg.shape[1]},{emb_neg.shape[2]}:{pdir / 'uncond.f32'}",
+        ]
 
     env = dict(os.environ)
     env["DYLD_LIBRARY_PATH"] = ort_lib_dir() + ":" + env.get("DYLD_LIBRARY_PATH", "")
-    out_path = pdir / "image.f32"
-    print("rendering through onnx-genai ...", flush=True)
-    subprocess.run(
-        [
-            str(RUNNER), str(pdir), "vae.image", str(out_path),
-            f"text_encoder.input_ids:i64:1,{seq}:{pdir / 'ids.i64'}",
-            f"denoiser.sample:1,{latent_ch},{sz},{sz}:{pdir / 'sample.f32'}",
-            f"denoiser.encoder_hidden_states.uncond:1,{s},{d}:{pdir / 'uncond.f32'}",
-        ],
-        env=env, check=True,
-    )
-    img = np.fromfile(out_path, dtype="<f4").reshape(1, 3, wf.height, wf.width)[0]
+    print(f"rendering through onnx-genai ({'SDXL' if sdxl else 'SD'}) ...", flush=True)
+    subprocess.run(inputs, env=env, check=True)
+    flat = np.fromfile(pdir / "image.f32", dtype="<f4")
+    hw = int(round((flat.size / 3) ** 0.5))
+    img = flat.reshape(1, 3, hw, hw)[0]
+    Path(args.output).parent.mkdir(parents=True, exist_ok=True)
     save_png(img, Path(args.output))
     print(f"saved: {args.output}")
 
-    if args.compare:
+    if args.compare and not sdxl:
         _compare_diffusers(args.checkpoint, wf, sc, latent0, ids_pos, ids_neg, img)
+    elif args.compare and sdxl:
+        print("  (--compare not supported for SDXL here; see scripts/sdxl_e2e.py)")
     return 0
 
 
