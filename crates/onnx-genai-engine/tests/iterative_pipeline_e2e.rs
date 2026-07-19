@@ -243,3 +243,66 @@ pipeline:
     }
     Ok(())
 }
+
+#[test]
+fn iterative_injects_explicit_timestep_schedule() -> anyhow::Result<()> {
+    // Step-aware denoiser: denoised = sample + t. With sample_0 = 0 and loop
+    // edge denoised->sample, the result is the running sum of timesteps.
+    let metadata = "\
+pipeline:
+  models:
+    denoiser:
+      filename: denoiser_step.onnx
+      type: denoiser
+  dataflow:
+    - from: denoiser.denoised
+      to: denoiser.sample
+  strategy:
+    kind: iterative
+    denoiser: denoiser
+    num_steps: 3
+    timestep_input: t
+    timesteps: [10.0, 20.0, 30.0]
+";
+    let dir = fixture_with_metadata("diffusion-timestep", &["denoiser_step.onnx"], metadata)?;
+    let mut engine = Engine::from_pipeline_dir(&dir, EngineConfig::default())?;
+    let request =
+        empty_request().with_input("denoiser.sample", Value::from_slice_f32(&[0.0; 4], &[1, 4])?);
+    let out = engine.run_pipeline(request)?;
+    let denoised = out.get("denoiser.denoised").unwrap().to_vec_f32()?;
+    // 10 + 20 + 30 = 60.
+    for got in &denoised {
+        assert!((got - 60.0).abs() < 1e-4, "{got} != 60");
+    }
+    Ok(())
+}
+
+#[test]
+fn iterative_defaults_timestep_to_step_index() -> anyhow::Result<()> {
+    // No `timesteps`: the loop injects the 0-based step index (0,1,2) -> sum 3.
+    let metadata = "\
+pipeline:
+  models:
+    denoiser:
+      filename: denoiser_step.onnx
+      type: denoiser
+  dataflow:
+    - from: denoiser.denoised
+      to: denoiser.sample
+  strategy:
+    kind: iterative
+    denoiser: denoiser
+    num_steps: 3
+    timestep_input: t
+";
+    let dir = fixture_with_metadata("diffusion-timestep-default", &["denoiser_step.onnx"], metadata)?;
+    let mut engine = Engine::from_pipeline_dir(&dir, EngineConfig::default())?;
+    let request =
+        empty_request().with_input("denoiser.sample", Value::from_slice_f32(&[0.0; 4], &[1, 4])?);
+    let out = engine.run_pipeline(request)?;
+    let denoised = out.get("denoiser.denoised").unwrap().to_vec_f32()?;
+    for got in &denoised {
+        assert!((got - 3.0).abs() < 1e-4, "{got} != 3");
+    }
+    Ok(())
+}

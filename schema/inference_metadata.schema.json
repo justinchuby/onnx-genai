@@ -1126,6 +1126,26 @@
             "null"
           ],
           "items": true
+        },
+        "timestep_input": {
+          "description": "Denoiser input port that receives the per-step timestep/sigma scalar.\n\nWhen set, the iterative loop feeds this input a rank-1 `float32` value\neach step (from `timesteps` when provided, otherwise the 0-based step\nindex), so a step-aware denoiser can condition on the current step.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "timesteps": {
+          "description": "Explicit per-step timestep/sigma schedule for an iterative strategy.\n\nWhen present its length must equal `num_steps`; when absent the loop\nuses the 0-based step index. Requires `timestep_input` to have any effect.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "default": null,
+          "items": {
+            "type": "number",
+            "format": "float"
+          }
         }
       },
       "required": [

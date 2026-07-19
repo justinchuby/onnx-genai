@@ -215,6 +215,15 @@ fn validate_strategy(
                 models,
                 errors,
             );
+            if let (Some(timesteps), Some(num_steps)) =
+                (strategy.timesteps.as_ref(), strategy.num_steps)
+                && timesteps.len() != num_steps
+            {
+                errors.push(format!(
+                    "{path}.timesteps has {} entries but num_steps is {num_steps}",
+                    timesteps.len()
+                ));
+            }
         }
         PipelineStrategyKind::Composite => {
             if strategy.stages.is_empty() {

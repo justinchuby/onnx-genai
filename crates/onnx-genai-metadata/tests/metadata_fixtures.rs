@@ -338,3 +338,32 @@ pipeline:
         }
     );
 }
+
+#[test]
+fn pipeline_validation_rejects_timesteps_length_mismatch() {
+    let yaml = "
+pipeline:
+  models:
+    denoiser:
+      filename: denoiser.onnx
+      type: denoiser
+  dataflow:
+    - from: denoiser.out
+      to: denoiser.sample
+  strategy:
+    kind: iterative
+    denoiser: denoiser
+    num_steps: 3
+    timestep_input: t
+    timesteps: [0.1, 0.2]
+";
+    let metadata: onnx_genai_metadata::InferenceMetadata =
+        serde_yaml::from_str(yaml).expect("parses");
+    let spec = metadata.pipeline.expect("pipeline section");
+    let err = validate_pipeline_spec(&spec).expect_err("timesteps length mismatch is rejected");
+    assert!(
+        err.errors.iter().any(|e| e.contains("timesteps has 2 entries")),
+        "unexpected errors: {:?}",
+        err.errors
+    );
+}

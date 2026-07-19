@@ -655,6 +655,21 @@ pub struct PipelineStrategy {
     #[schemars(range(min = 1))]
     pub num_steps: Option<usize>,
 
+    /// Denoiser input port that receives the per-step timestep/sigma scalar.
+    ///
+    /// When set, the iterative loop feeds this input a rank-1 `float32` value
+    /// each step (from `timesteps` when provided, otherwise the 0-based step
+    /// index), so a step-aware denoiser can condition on the current step.
+    #[serde(default)]
+    pub timestep_input: Option<String>,
+
+    /// Explicit per-step timestep/sigma schedule for an iterative strategy.
+    ///
+    /// When present its length must equal `num_steps`; when absent the loop
+    /// uses the 0-based step index. Requires `timestep_input` to have any effect.
+    #[serde(default)]
+    pub timesteps: Option<Vec<f32>>,
+
     /// Classifier-free guidance scale or equivalent strategy-specific multiplier.
     #[schemars(range(min = 0.0))]
     pub guidance_scale: Option<f32>,

@@ -94,6 +94,28 @@ def build_denoiser_multi(path: Path) -> None:
     save_model(ir.Model(graph, ir_version=8, producer_name="onnx-genai tiny-diffusion"), path)
 
 
+def build_denoiser_step(path: Path) -> None:
+    # Step-aware denoiser: consumes a per-step timestep scalar `t`.
+    #   denoised = sample + t   (t broadcasts over [1,4])
+    # With sample_0 = 0 and loop edge denoised->sample, the result after N steps
+    # is the running sum of the per-step timesteps.
+    sample = tensor_value("sample", ir.DataType.FLOAT, [1, 4])
+    t = tensor_value("t", ir.DataType.FLOAT, [1])
+    add = node("Add", [sample, t], "denoised")
+    add.outputs[0].type = ir.TensorType(ir.DataType.FLOAT)
+    add.outputs[0].shape = ir.Shape([1, 4])
+
+    graph = ir.Graph(
+        [sample, t],
+        [add.outputs[0]],
+        nodes=[add],
+        initializers=[],
+        opset_imports={"": 13},
+        name="tiny_diffusion_denoiser_step",
+    )
+    save_model(ir.Model(graph, ir_version=8, producer_name="onnx-genai tiny-diffusion"), path)
+
+
 def build_vae(path: Path) -> None:
     latent = tensor_value("latent", ir.DataType.FLOAT, [1, 4])
     two = initializer("two", np.array([2.0], dtype=np.float32))
@@ -181,6 +203,7 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     build_denoiser(output_dir / "denoiser.onnx")
     build_denoiser_multi(output_dir / "denoiser_multi.onnx")
+    build_denoiser_step(output_dir / "denoiser_step.onnx")
     build_vae(output_dir / "vae.onnx")
     write_metadata(output_dir / "inference_metadata.yaml")
     if not args.no_validate:

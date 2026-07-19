@@ -305,10 +305,22 @@ impl PipelineEngine {
 
         let mut loop_state: HashMap<String, Value> = HashMap::new();
         for step in 0..plan.num_steps {
+            // Timestep/sigma for this step: explicit schedule when provided,
+            // otherwise the 0-based step index.
+            let timestep = plan
+                .timesteps
+                .as_ref()
+                .map(|ts| ts[step])
+                .unwrap_or(step as f32);
             let mut inputs: Vec<(String, Value)> = Vec::new();
             for info in denoiser.inputs() {
                 let port = info.name.as_str();
                 let endpoint = format!("{}.{}", plan.denoiser, port);
+                // Per-step timestep injection takes precedence for its port.
+                if plan.timestep_input.as_deref() == Some(port) {
+                    inputs.push((port.to_string(), Value::from_slice_f32(&[timestep], &[1])?));
+                    continue;
+                }
                 let value = if let Some((out_port, _)) =
                     plan.loop_edges.iter().find(|(_, in_port)| in_port == port)
                 {
@@ -690,6 +702,11 @@ struct IterativePlan {
     /// Each step i>0 feeds step (i-1)'s `output_port` into `input_port`. Step 0
     /// reads the seed from the external `denoiser.input_port` tensor.
     loop_edges: Vec<(String, String)>,
+    /// Denoiser input port that receives the per-step timestep scalar, if any.
+    timestep_input: Option<String>,
+    /// Explicit per-step timestep schedule (length == `num_steps`); when absent
+    /// the 0-based step index is fed instead.
+    timesteps: Option<Vec<f32>>,
     dataflow: Vec<DataflowEdge>,
 }
 
@@ -820,6 +837,8 @@ impl PipelinePlan {
             prompt_components,
             final_components,
             loop_edges,
+            timestep_input: spec.strategy.timestep_input.clone(),
+            timesteps: spec.strategy.timesteps.clone(),
             dataflow: spec.dataflow.clone(),
         }))
     }
@@ -1048,6 +1067,8 @@ pipeline:
                 denoiser: None,
                 scheduler: None,
                 num_steps: None,
+                timestep_input: None,
+                timesteps: None,
                 guidance_scale: None,
                 state: None,
                 stages: vec![
@@ -1065,6 +1086,8 @@ pipeline:
                             denoiser: None,
                             scheduler: None,
                             num_steps: None,
+                            timestep_input: None,
+                            timesteps: None,
                             guidance_scale: None,
                             state: None,
                             stages: vec![],
@@ -1085,6 +1108,8 @@ pipeline:
                             denoiser: None,
                             scheduler: None,
                             num_steps: None,
+                            timestep_input: None,
+                            timesteps: None,
                             guidance_scale: None,
                             state: None,
                             stages: vec![],
