@@ -116,6 +116,14 @@ def main() -> int:
     sdxl = bool(run_params.get("sdxl", False))
     latent_ch = run_params["latent_channels"]
     sz = wf.height // 8
+    bs = int(run_params.get("batch_size", 1))
+    # Batched generation is wired for the plain SD txt2img path; the variant
+    # branches (SDXL/ControlNet/inpaint) below feed batch-1 constant tensors, so
+    # fall back to a single image there.
+    plain_sd = not sdxl and not run_params.get("controlnet") and not run_params.get("inpaint")
+    if bs > 1 and not plain_sd:
+        print(f"  (batch_size={bs} not yet driven for this variant; rendering 1 image)")
+        bs = 1
 
     tokenizer = CLIPTokenizer.from_pretrained(args.checkpoint, subfolder="tokenizer")
 
@@ -129,9 +137,11 @@ def main() -> int:
     te = ort.InferenceSession(str(pdir / "text_encoder.onnx"), providers=["CPUExecutionProvider"])
     init_sigma = _diffusers_init_noise_sigma(wf.scheduler_kind, sc, wf.steps)
     rng = np.random.default_rng(wf.seed)
-    latent0 = (rng.standard_normal((1, latent_ch, sz, sz)).astype("<f4")) * init_sigma
+    latent0 = (rng.standard_normal((bs, latent_ch, sz, sz)).astype("<f4")) * init_sigma
     latent0.tofile(pdir / "sample.f32")
-    ids_pos.tofile(pdir / "ids.i64")
+    # Repeat the (single) prompt across the batch.
+    ids_pos_b = np.repeat(ids_pos, bs, axis=0) if bs > 1 else ids_pos
+    ids_pos_b.astype("<i8").tofile(pdir / "ids.i64")
 
     inputs = [str(RUNNER), str(pdir), "vae.image", str(pdir / "image.f32")]
 
@@ -161,11 +171,12 @@ def main() -> int:
         ]
     else:
         emb_neg = te.run(None, {te.get_inputs()[0].name: ids_neg})[0].astype("<f4")
-        emb_neg.tofile(pdir / "uncond.f32")
+        emb_neg_b = np.repeat(emb_neg, bs, axis=0) if bs > 1 else emb_neg
+        emb_neg_b.tofile(pdir / "uncond.f32")
         inputs += [
-            f"text_encoder.input_ids:i64:1,{ids_pos.shape[1]}:{pdir / 'ids.i64'}",
-            f"denoiser.sample:1,{latent_ch},{sz},{sz}:{pdir / 'sample.f32'}",
-            f"denoiser.encoder_hidden_states.uncond:1,{emb_neg.shape[1]},{emb_neg.shape[2]}:{pdir / 'uncond.f32'}",
+            f"text_encoder.input_ids:i64:{bs},{ids_pos.shape[1]}:{pdir / 'ids.i64'}",
+            f"denoiser.sample:{bs},{latent_ch},{sz},{sz}:{pdir / 'sample.f32'}",
+            f"denoiser.encoder_hidden_states.uncond:{bs},{emb_neg.shape[1]},{emb_neg.shape[2]}:{pdir / 'uncond.f32'}",
         ]
 
     controlnet = bool(run_params.get("controlnet", False))
@@ -222,14 +233,26 @@ def main() -> int:
     print(f"rendering through onnx-genai ({tag}) ...", flush=True)
     subprocess.run(inputs, env=env, check=True)
     flat = np.fromfile(pdir / "image.f32", dtype="<f4")
-    hw = int(round((flat.size / 3) ** 0.5))
-    img = flat.reshape(1, 3, hw, hw)[0]
+    hw = int(round((flat.size / (3 * bs)) ** 0.5))
+    batch = flat.reshape(bs, 3, hw, hw)
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
-    save_png(img, Path(args.output))
-    print(f"saved: {args.output}")
+    img = batch[0]
+    if bs == 1:
+        save_png(img, Path(args.output))
+        print(f"saved: {args.output}")
+    else:
+        out = Path(args.output)
+        stem, suffix = out.stem, (out.suffix or ".png")
+        for i in range(bs):
+            p = out.with_name(f"{stem}_{i}{suffix}")
+            save_png(batch[i], p)
+            print(f"saved: {p}")
 
     if args.compare and not sdxl:
-        _compare_diffusers(args.checkpoint, wf, sc, latent0, ids_pos, ids_neg, img)
+        if bs == 1:
+            _compare_diffusers(args.checkpoint, wf, sc, latent0, ids_pos, ids_neg, img)
+        else:
+            print("  (--compare not supported for batch_size>1)")
     elif args.compare and sdxl:
         print("  (--compare not supported for SDXL here; see scripts/sdxl_e2e.py)")
     return 0
